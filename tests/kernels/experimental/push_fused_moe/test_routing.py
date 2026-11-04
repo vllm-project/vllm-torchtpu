@@ -7,6 +7,7 @@ import jax
 import jax.numpy as jnp
 import pytest
 
+from vllm_torchtpu.kernels.experimental import decode_preparation as prep
 from vllm_torchtpu.kernels.experimental.push_fused_moe import routing
 
 
@@ -58,7 +59,7 @@ def tpu_v7(monkeypatch):
     )
     monkeypatch.setattr(routing, "fuse_function", stop("fused"))
     monkeypatch.setattr(jax, "default_backend", lambda: "tpu")
-    monkeypatch.setattr(routing, "get_tpu_version", lambda: 7)
+    monkeypatch.setattr(prep, "get_tpu_version", lambda: 7)
 
 
 @pytest.mark.parametrize("tokens", [96, 192, 256, 288, 384])
@@ -100,5 +101,5 @@ def test_dtype_guards(field):
 @pytest.mark.parametrize("backend,version", [("cpu", 7), ("gpu", 7), ("tpu", 6)])
 def test_backend_guards(monkeypatch, backend, version):
     monkeypatch.setattr(jax, "default_backend", lambda: backend)
-    monkeypatch.setattr(routing, "get_tpu_version", lambda: version)
+    monkeypatch.setattr(prep, "get_tpu_version", lambda: version)
     assert not supported()

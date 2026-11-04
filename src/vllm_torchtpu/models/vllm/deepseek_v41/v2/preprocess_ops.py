@@ -253,12 +253,38 @@ def compress_rope(ratio: int, banks: int, eps: float) -> Any:
     )
 
 
-def compress_rope_packed(eps: float) -> Any:
+def _state_records(low: jax.Array, high: jax.Array) -> int:
+    return (low.shape[0] + high.shape[0]) // compress_kernel._RECORD_ROWS
+
+
+def _admit_compressor(region, buckets, x, weight, inputs, *page_tables) -> bool:
+    """One gate for both bridges; token dispatch stays inside JAX."""
+    tokens = inputs[3].shape[0]
+    problem = decode_preparation.compressor_inputs_problem(*inputs, *page_tables)
+    if problem is None and x.shape[0] != tokens:
+        problem = f"x has {x.shape[0]} rows for {tokens} positions"
+    if problem is None and weight.shape != (x.shape[1], 2 * _HEAD_DIM):
+        problem = f"weight {list(weight.shape)} is not [hidden, {2 * _HEAD_DIM}]"
+    if problem is None and tokens in buckets:
+        # The precomputed ring tables cover one whole, unpadded token tile.
+        tile = compress_kernel.select_config(tokens, x.shape[1], 2).token_block
+        if tile != tokens or tokens % compress_kernel._ROW_ALIGN:
+            problem = f"compressor tile {tile} does not cover {tokens} tokens"
+    return decode_preparation.admit(region, problem, tokens=tokens, buckets=buckets)
+
+
+def compress_rope_packed(
+    eps: float,
+    layout: decode_preparation.CompressorLayout = (
+        decode_preparation.DEFAULT_COMPRESSOR_LAYOUT
+    ),
+) -> Any:
     """Registered decode metadata + ratio-2 compressor, with two donated banks."""
     from vllm_torchtpu.kernels.quantized_matmul.tuned_block_sizes import (
         get_tpu_version,
     )
 
+    # Buckets were measured on v7 only.
     if jax.default_backend() != "tpu" or get_tpu_version() != 7:
         return None
 
@@ -276,41 +302,19 @@ def compress_rope_packed(eps: float) -> Any:
             low: jax.Array,
             high: jax.Array,
         ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
-            tokens = positions.shape[0]
-            # T288 keeps its original route; new shapes require one whole tile.
-            packed = tokens == 288 or (
-                tokens in (96, 192, 240, 256)
-                and x.shape == (tokens, 5120)
-                and weight.shape == (5120, 1024)
-                and positions.shape == (tokens,)
-                and all(
-                    value.shape == shape and value.dtype == jnp.int32
-                    for value, shape in zip(
-                        (table, starts, kv_starts, positions, minimum),
-                        ((48, 8), (49,), (49,), (tokens,), (48,)),
-                        strict=True,
-                    )
-                )
-                and compress_kernel.select_config(tokens, 5120, 2).token_block == tokens
-            )
-            if not packed:
+            inputs = (table, starts, kv_starts, positions, minimum)
+            if not _admit_compressor(
+                "compressor_state",
+                decode_preparation.COMPRESSOR_STATE_TOKENS,
+                x,
+                weight,
+                inputs,
+            ):
                 return _compress_native_metadata(
-                    table,
-                    starts,
-                    kv_starts,
-                    positions,
-                    minimum,
-                    x,
-                    weight,
-                    gamma,
-                    rows,
-                    low,
-                    high,
-                    eps,
+                    *inputs, x, weight, gamma, rows, low, high, eps, layout
                 )
-            records = (low.shape[0] + high.shape[0]) // compress_kernel._RECORD_ROWS
             prev, valid, wp, wo, rp, ro = decode_preparation.compressor_state_packed(
-                table, starts, kv_starts, positions, minimum, total_records=records
+                *inputs, total_records=_state_records(low, high), layout=layout
             )
             latent, words, scales, state = compress_kernel.fused_compress_rope(
                 x,
@@ -351,16 +355,26 @@ def compress_rope_packed(eps: float) -> Any:
         return run, fake
 
     return _get(
-        f"compress_rope_packed_c16_s16_o0_w128_e{_tag(eps)}", build, donate=(9, 10)
+        f"compress_rope_packed_{layout.tag}_e{_tag(eps)}", build, donate=(9, 10)
     )
 
 
-def compress_rope_addresses(eps: float) -> Any:
-    """Registered decode state/main/index addresses and ratio-2 compressor."""
+def compress_rope_addresses(
+    eps: float,
+    layout: decode_preparation.CompressorLayout = (
+        decode_preparation.DEFAULT_COMPRESSOR_LAYOUT
+    ),
+) -> Any:
+    """Registered decode state/main/index addresses and ratio-2 compressor.
+
+    Main records are physical rows of the main KV cache; index slots are
+    logical index-cache slots. Both paths return the same contract.
+    """
     from vllm_torchtpu.kernels.quantized_matmul.tuned_block_sizes import (
         get_tpu_version,
     )
 
+    # Buckets were measured on v7 only.
     if jax.default_backend() != "tpu" or get_tpu_version() != 7:
         return None
 
@@ -389,51 +403,32 @@ def compress_rope_addresses(eps: float) -> Any:
             jax.Array,
             jax.Array,
         ]:
-            if positions.shape[0] != 288:
+            inputs = (table, starts, kv_starts, positions, minimum)
+            if not _admit_compressor(
+                "compressor_addresses",
+                decode_preparation.COMPRESSOR_ADDRESS_TOKENS,
+                x,
+                weight,
+                inputs,
+                main,
+                index,
+            ):
                 result = _compress_native_metadata(
-                    table,
-                    starts,
-                    kv_starts,
-                    positions,
-                    minimum,
-                    x,
-                    weight,
-                    gamma,
-                    rows,
-                    low,
-                    high,
-                    eps,
+                    *inputs, x, weight, gamma, rows, low, high, eps, layout
                 )
-                token = jnp.arange(positions.size, dtype=jnp.int32)
-                request = jnp.minimum(
-                    jnp.sum(token[:, None] >= kv_starts[None, 1:], axis=1),
-                    main.shape[0] - 1,
+                return (
+                    *result,
+                    *_native_main_index(
+                        kv_starts, positions, main, index, result[-1], layout
+                    ),
                 )
-
-                def slots(page_table, capacity):
-                    logical = positions // 2
-                    column = jnp.minimum(logical // capacity, page_table.shape[1] - 1)
-                    block = page_table[request, column]
-                    return jnp.where(
-                        token < kv_starts[-1],
-                        block * capacity + logical % capacity,
-                        -1,
-                    )
-
-                main_slots = slots(main, 128)
-                records = jnp.where(result[-1] & (main_slots >= 0), main_slots, -1)
-                return (*result, records, slots(index, 256))
-            records = (low.shape[0] + high.shape[0]) // compress_kernel._RECORD_ROWS
             prev, valid, wp, wo, rp, ro, main_records, index_slots = (
                 decode_preparation.compressor_addresses_packed(
-                    table,
-                    starts,
-                    kv_starts,
-                    positions,
-                    minimum,
+                    *inputs,
                     main,
                     index,
-                    total_records=records,
+                    total_records=_state_records(low, high),
+                    layout=layout,
                 )
             )
             latent, words, scales, state = compress_kernel.fused_compress_rope(
@@ -487,10 +482,28 @@ def compress_rope_addresses(eps: float) -> Any:
         return run, fake
 
     return _get(
-        f"compress_rope_addresses_c16_m128_i256_w128_e{_tag(eps)}",
-        build,
-        donate=(9, 10),
+        f"compress_rope_addresses_{layout.tag}_e{_tag(eps)}", build, donate=(9, 10)
     )
+
+
+def _native_main_index(kv_starts, positions, main, index, valid, layout):
+    """XLA form of the fused address outputs, for any token count."""
+    token = jnp.arange(positions.size, dtype=jnp.int32)
+    request = jnp.minimum(
+        jnp.sum(token[:, None] >= kv_starts[None, 1:], axis=1), main.shape[0] - 1
+    )
+    live = token < kv_starts[-1]
+    logical = positions // 2
+
+    def page(table, capacity):
+        column = jnp.minimum(logical // capacity, table.shape[1] - 1)
+        return table[request, column], logical % capacity
+
+    block, slot = page(main, layout.main_capacity)
+    main_rows = layout.main_offset + block * layout.main_stride + slot
+    records = jnp.where(live & (block >= 0) & valid, main_rows, -1)
+    block, slot = page(index, layout.index_capacity)
+    return records, jnp.where(live, block * layout.index_capacity + slot, -1)
 
 
 def _compress_native_metadata(
@@ -506,10 +519,11 @@ def _compress_native_metadata(
     low,
     high,
     eps,
+    layout,
 ):
     """Keep arbitrary token counts behind the dynamic Torch bridge signature."""
     prev, valid, write, read = decode_preparation._compressor_state_addresses(
-        table, starts, kv_starts, positions, minimum
+        table, starts, kv_starts, positions, minimum, layout
     )
     latent, words, scales, state = _compress(
         2,

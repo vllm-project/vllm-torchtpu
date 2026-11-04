@@ -5,13 +5,14 @@ import jax
 import jax.numpy as jnp
 import pytest
 
+from vllm_torchtpu.kernels.experimental import decode_preparation as prep
 from vllm_torchtpu.kernels.experimental.push_fused_moe import presort
 
 
 @pytest.fixture
 def tpu_v7(monkeypatch):
     monkeypatch.setattr(jax, "default_backend", lambda: "tpu")
-    monkeypatch.setattr(presort, "get_tpu_version", lambda: 7)
+    monkeypatch.setattr(prep, "get_tpu_version", lambda: 7)
 
 
 def inputs(tokens=288):
@@ -35,10 +36,7 @@ def test_approved_tokens(tpu_v7, tokens):
         (0, (1728,), jnp.int16),
         (1, (384,), jnp.int16),
         (1, (383,), jnp.int32),
-        (2, (288, 40, 128), jnp.bfloat16),
-        (2, (288, 40, 128), jnp.float8_e5m2),
-        (2, (288, 20, 128), jnp.float8_e4m3fn),
-        (2, (288, 40, 64), jnp.float8_e4m3fn),
+        (2, (287, 40, 128), jnp.float8_e4m3fn),
         (2, (), jnp.float8_e4m3fn),
     ],
 )
@@ -66,10 +64,21 @@ def test_unapproved_tokens_fall_back(tpu_v7, monkeypatch, tokens):
 @pytest.mark.parametrize("backend,version", [("cpu", 7), ("gpu", 7), ("tpu", 6)])
 def test_backend_guard(monkeypatch, backend, version):
     monkeypatch.setattr(jax, "default_backend", lambda: backend)
-    monkeypatch.setattr(presort, "get_tpu_version", lambda: version)
+    monkeypatch.setattr(prep, "get_tpu_version", lambda: version)
     assert not presort.supports_local_sort(*inputs(), e_total=384, topk=6)
 
 
 @pytest.mark.parametrize("experts,topk", [(128, 6), (384, 4)])
 def test_routing_guard(tpu_v7, experts, topk):
     assert not presort.supports_local_sort(*inputs(), e_total=experts, topk=topk)
+
+
+@pytest.mark.parametrize(
+    "shape,dtype",
+    [((288, 40, 128), jnp.bfloat16), ((288, 20, 128), jnp.float8_e5m2)],
+)
+def test_activation_layout_is_unconstrained(tpu_v7, shape, dtype):
+    """Only pairs/counts enter the fused kernel; q keeps the native gather."""
+    xs = inputs()
+    xs[2] = jax.ShapeDtypeStruct(shape, dtype)
+    assert presort.supports_local_sort(*xs, e_total=384, topk=6)

@@ -11,6 +11,7 @@ if TYPE_CHECKING:
     TPU_DEEPSEEK_V41_IMPL: str = "v2"
     TPU_DEEPSEEK_V41_ENGRAM_CPU_OFFLOAD: bool = False
     TPU_DEEPSEEK_V41_ENGRAM_HBM: str = "auto"
+    TPU_DEEPSEEK_V41_DECODE_FUSION: str = "auto"
     TPU_K3_SP_PREFILL: bool = False
     TPU_INCREMENTAL_BLOCK_TABLE_UPLOAD: bool = True
     TPU_VERIFY_INCREMENTAL_BLOCK_TABLE: bool = False
@@ -393,6 +394,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "TPU_DEEPSEEK_V41_ENGRAM_HBM",
         "auto",
         ["auto", "off", "first", "all"],
+        case_sensitive=False,
+    ),
+    # DSv4.1 decode preparation region fusions (decode_preparation.admit).
+    # "auto" (default): fuse measured decode buckets and log one warning per
+    # unsupported decode-sized region; "off": always take the native paths
+    # (A/B baseline); "require": raise when a decode-sized region cannot fuse.
+    "TPU_DEEPSEEK_V41_DECODE_FUSION": env_with_choices(
+        "TPU_DEEPSEEK_V41_DECODE_FUSION",
+        "auto",
+        ["auto", "off", "require"],
         case_sensitive=False,
     ),
     # Opt in to K3 TP32/EP32 sequence-parallel prefill.

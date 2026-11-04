@@ -333,21 +333,20 @@ def _compact(records, total_records, tiles, tb):
     several us. Out-of-range records drop.
     """
     n = records.shape[0]
-    # Preserve all T288 tilings; other shapes use only measured tile sizes.
-    if (
-        jax.default_backend() == "tpu"
-        and records.shape == (n,)
-        and tiles * tb == n
-        and (
-            n == 288
-            or (n, tb) in ((96, 96), (192, 192), (240, 240), (256, 256), (384, 192))
-        )
-    ):
-        from vllm_torchtpu.kernels.experimental.decode_preparation import (
-            compact_records,
-        )
+    from vllm_torchtpu.kernels.experimental import decode_preparation as prep
 
-        return compact_records(records, total_records, tb)
+    # The fused kernel builds an [n, n] rank match; any tiling of a measured n
+    # is exact because offsets are counted per tile boundary.
+    if prep.admit(
+        "compact_records",
+        prep.first_problem(
+            (records.shape == (n,), f"records are {list(records.shape)}"),
+            (tiles * tb == n, f"{tiles} tiles of {tb} do not cover {n} records"),
+        ),
+        tokens=n,
+        buckets=prep.COMPACT_TOKENS,
+    ):
+        return prep.compact_records(records, total_records, tb)
     valid = (records >= 0) & (records < total_records)
     slots = jnp.where(valid, jnp.cumsum(valid, dtype=jnp.int32) - 1, n)
     pairs = jnp.stack((jnp.arange(n, dtype=jnp.int32), records.astype(jnp.int32)), 1)

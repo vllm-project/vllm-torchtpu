@@ -14,21 +14,34 @@ def supports_sorted_fp8(
     keys: jax.Array,
     page_size: int,
 ) -> bool:
-    return (
-        jax.default_backend() == "tpu"
-        and keys.ndim == 2
-        and keys.shape[0] in (128, 256, 288, 384, 512)
-        and keys.shape[1] == 128
-        and keys.dtype == jnp.bfloat16
-        and records.shape == (keys.shape[0],)
-        and records.dtype == jnp.int32
-        and page_size == 256
-        and len(banks) == 2
-        and all(
-            bank.ndim == 2 and bank.shape[1] == 128 and bank.dtype == jnp.int32
-            for bank in banks
-        )
+    from vllm_torchtpu.kernels.experimental.decode_preparation import (
+        INDEXER_TOKENS,
+        admit,
+        first_problem,
     )
+
+    if keys.ndim != 2:
+        return admit("indexer_fp8", f"keys are {keys.ndim}-D")
+    problem = first_problem(
+        (
+            keys.shape[1] == 128 and keys.dtype == jnp.bfloat16,
+            f"keys {keys.dtype}{list(keys.shape)}, kernel bf16[T,128]",
+        ),
+        (
+            records.shape == (keys.shape[0],) and records.dtype == jnp.int32,
+            f"records {records.dtype}{list(records.shape)} for {keys.shape[0]} keys",
+        ),
+        (page_size == 256, f"index page size {page_size}, kernel 256"),
+        (
+            len(banks) == 2
+            and all(
+                bank.ndim == 2 and bank.shape[1] == 128 and bank.dtype == jnp.int32
+                for bank in banks
+            ),
+            "index cache is not two int32[*,128] banks",
+        ),
+    )
+    return admit("indexer_fp8", problem, tokens=keys.shape[0], buckets=INDEXER_TOKENS)
 
 
 def prepare_sorted_fp8(

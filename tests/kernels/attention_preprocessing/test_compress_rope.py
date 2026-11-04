@@ -251,16 +251,17 @@ def test_scalar_prefetch_size_includes_tiling_padding():
         (256, 256, True),
         (384, 192, True),
         (128, 128, False),
-        (384, 384, False),
-        (96, 48, False),
-        (192, 96, False),
-        (240, 120, False),
-        (256, 128, False),
+        (384, 384, True),
+        (96, 48, True),
+        (192, 96, True),
+        (240, 120, True),
+        (256, 128, True),
+        (512, 256, False),
     ]
     + [(288, tb, True) for tb in range(1, 289) if 288 % tb == 0],
 )
 def test_compact_dispatch_envelope(monkeypatch, backend, n, tb, supported):
-    """CPU stays scatter; TPU expands only measured pairs, retaining all T288."""
+    """CPU stays scatter; TPU fuses any whole tiling of a measured record count."""
     from unittest import mock
 
     from vllm_torchtpu.kernels.experimental import decode_preparation
