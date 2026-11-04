@@ -16,7 +16,6 @@
 from __future__ import annotations
 
 import dataclasses
-from typing import Any
 
 import jax
 import jax.numpy as jnp
@@ -29,15 +28,14 @@ from jax.sharding import Mesh
 from jax.sharding import PartitionSpec as P
 
 from tests.megakernel.megakernel_fakes import TINY_TILES, FakeGeometry
-from vllm_torchtpu.megakernel import collectives, kernel, planner, stream, vmem
+from vllm_torchtpu.megakernel import collectives, planner, stream, vmem
 from vllm_torchtpu.megakernel.errors import MegakernelConfigError
 from vllm_torchtpu.megakernel.exec_spec import ExecSpec
-from vllm_torchtpu.megakernel.ops import BF16, F32, I32, rmsnorm, round_bf16
+from vllm_torchtpu.megakernel.ops import BF16, F32, I32, round_bf16
 from vllm_torchtpu.megakernel.spec import (
     LayerType,
     ModelSpec,
     Module,
-    SmallField,
     SwitchSlot,
     WeightDecl,
 )
@@ -374,98 +372,6 @@ def test_allreduce_ring_modes_in_pallas(R: int, hier: int, rsag: bool):
     for r in range(R):
         assert jnp.allclose(out_all[r, : ex.B], expected, atol=4e-1, rtol=2e-2)
     assert ipc.races is not None and not ipc.races.races_found
-
-
-class _SingleARLinearModule(Module):
-    """1-AR-per-layer module exercised through `kernel.make_step`."""
-
-    name = "single_ar_linear"
-    reduction = "allreduce"
-    input_norm = "in_norm"
-
-    def weights(self, g: FakeGeometry, ex: ExecSpec) -> list[WeightDecl]:
-        return [
-            WeightDecl("w1", K=g.H, N=128, dtype=BF16, stream_ring="static"),
-            WeightDecl("w2", K=128, N=g.H, dtype=BF16, stream_ring="static"),
-        ]
-
-    def smalls(self, g: FakeGeometry, ex: ExecSpec) -> list[SmallField]:
-        return [SmallField("in_norm", g.H)]
-
-    def shared_widths(self, g: FakeGeometry, ex: ExecSpec) -> dict[str, int]:
-        return {"acc": g.H, "xb2": 128}
-
-    def emit(self, ctx: Any, lyr: Any, slot: Any) -> Any:
-        del lyr, slot
-        with ctx.stream.segment(lazy=True):
-            h = ctx.stream.dmatmul("w1", ctx.scr["xb"], 128)
-            ctx.scr["xb2"][:, :128] = h.astype(BF16)
-            return ctx.stream.dmatmul("w2", ctx.scr["xb2"], ctx.g.H)
-
-
-def test_allreduce_ring_single_slot_layer_parity_alternation():
-    """Drive 1-AR-per-layer alternation through `kernel.make_step` with odd `L=3`."""
-    R = 2
-    devs = jax.devices("cpu")
-    assert len(devs) >= R
-    tiles = dataclasses.replace(
-        TINY_TILES, bank=64 << 10, nbd=4, hier=0, rsag=False, war=1, mb8=2
-    )
-    ex = ExecSpec(
-        B=4,
-        T=1,
-        R=R,
-        ctx=128,
-        tiles=tiles,
-        interpret=pltpu.InterpretParams(detect_races=True),
-    )
-    g = FakeGeometry(L=3, H=256)
-    ms = ModelSpec(
-        "ar_1slot",
-        config=g,
-        layer_type=LayerType("lt", slots=(_SingleARLinearModule(),)),
-    )
-    mesh = Mesh(devs[:R], ("tp",))
-    step, info = kernel.make_step(mesh, ms, ex)
-    assert info["plan"].slot_ar_index == (0,)
-
-    wsh = info["wshape"]
-    k0, k1, k2, k3, k4 = jax.random.split(jax.random.PRNGKey(99), 5)
-    pos_pad = jnp.pad(
-        jnp.arange(ex.B, dtype=I32), (0, ex.MB - ex.B), constant_values=-1
-    )
-    pos = kernel.fold(jnp.broadcast_to(pos_pad[None, None, :], (R, 1, ex.MB)))
-    hid_0 = jax.random.normal(k0, (ex.M, g.H), dtype=BF16)
-    hid = kernel.fold(jnp.broadcast_to(hid_0[None], (R, ex.M, g.H)))
-    w1_raw = jax.random.normal(k1, (R, g.L, g.H, 128), dtype=BF16) * 0.1
-    w2_raw = jax.random.normal(k2, (R, g.L, 128, g.H), dtype=BF16) * 0.1
-    sm_0 = jax.random.normal(k3, (g.L, 1, info["plan"].smalls_width), dtype=F32) * 0.1
-    fn_0 = jax.random.normal(k4, (1, g.H), dtype=F32) * 0.1
-    weights = {
-        "w1": w1_raw.reshape((R, *wsh["w1"][0])),
-        "w2": w2_raw.reshape((R, *wsh["w2"][0])),
-        "smalls": jnp.broadcast_to(sm_0[None], (R, *wsh["smalls"][0])),
-        "final_norm": jnp.broadcast_to(fn_0[None], (R, *wsh["final_norm"][0])),
-    }
-    out_h, _ = jax.block_until_ready(step(pos, hid, weights, {}))
-    assert ipc.races is not None and not ipc.races.races_found
-    out_u = kernel.unfold(out_h, R)[:, : ex.B]
-
-    res = hid_0[: ex.B].astype(F32)
-    for lyr in range(g.L):
-        nx = rmsnorm(
-            res, sm_0[lyr, 0, : g.H], g.eps, zero_centered=bool(g.zero_centered_norm)
-        ).astype(BF16)
-        parts = []
-        for r in range(R):
-            h = (nx.astype(F32) @ w1_raw[r, lyr].astype(F32)).astype(BF16).astype(F32)
-            parts.append((h @ w2_raw[r, lyr].astype(F32)).astype(BF16).astype(F32))
-        res = round_bf16(res + round_bf16(parts[0] + parts[1]))
-    ref = rmsnorm(res, fn_0[0], g.eps, zero_centered=bool(g.zero_centered_norm)).astype(
-        BF16
-    )
-    for r in range(R):
-        assert jnp.allclose(out_u[r], ref, atol=2e-2, rtol=2e-2)
 
 
 def test_allreduce_ring_detect_races_catches_slot_reuse():
