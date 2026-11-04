@@ -416,6 +416,7 @@ class TpuPlatform(Platform):
         "MOE_FUSED_EP_KERNEL_IMPL",
         "MOE_FUSED_EP_PUSH_SC_PREPUSH",
         "MOE_FUSED_EP_PUSH_TC_EXCHANGE",
+        "MOE_FUSED_EP_PUSH_TAIL_BARRIER",
     ]
 
     # The "Platform" base class has import_kernels() that tries to import

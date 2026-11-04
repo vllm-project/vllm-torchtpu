@@ -84,6 +84,7 @@ if TYPE_CHECKING:
     MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE: int = 0
     MOE_FUSED_EP_PUSH_SC_PREPUSH: int = 2
     MOE_FUSED_EP_PUSH_TC_EXCHANGE: bool = False
+    MOE_FUSED_EP_PUSH_TAIL_BARRIER: bool = True
     TPU_EXPERT_PLACEMENT: str = ""
     TPU_LATENT_PROJ_INTRA_CHIP_TP: bool = False
     TPU_TOKEN_BUCKET_EXTRA: list[int] = []
@@ -724,6 +725,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # TensorCore remote-DMA kernel instead of XLA's (SparseCore-offloaded)
     # all-gather, keeping it off the SparseCore queue.
     "MOE_FUSED_EP_PUSH_TC_EXCHANGE": env_bool("MOE_FUSED_EP_PUSH_TC_EXCHANGE"),
+    # MOE_FUSED_EP_KERNEL_IMPL=push: keep the all-pairs barrier the expert
+    # kernel runs after its transport drain. 0 drops it; the drain's exact
+    # counts already cover every write a peer makes during the call.
+    "MOE_FUSED_EP_PUSH_TAIL_BARRIER": env_bool(
+        "MOE_FUSED_EP_PUSH_TAIL_BARRIER", default=True
+    ),
     # Shard Kimi K3's latent-MoE down/up projections across the cores of a
     # chip instead of replicating them. They are unquantized [7168, 3584] and
     # [3584, 7168] matmuls run at full HBM bandwidth, ~22% of decode device

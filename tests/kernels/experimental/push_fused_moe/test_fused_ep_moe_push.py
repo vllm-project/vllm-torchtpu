@@ -316,3 +316,91 @@ def test_tc_exchange_all_gather_equals_lax_all_gather(width):
     )(jax.device_put(data, NamedSharding(mesh, P(AXIS))))
     np.testing.assert_array_equal(np.asarray(tc), np.asarray(xla))
     np.testing.assert_array_equal(np.asarray(tc)[0], np.asarray(data).reshape(-1))
+
+
+# The served DSv4.1-Flash expert dims (hidden 5120, inter 2560 holding a
+# logical 2304, fp4 block-512 weights with row-padded flat scale tables) at
+# the DP16 C768 per-shard shapes, on eight shards: the target layers' 25
+# slots, 288 rows and top-6, and the drafter's 9 slots, 240 rows and top-3.
+SERVED_HIDDEN, SERVED_INTER, SERVED_LOGICAL_INTER = 5120, 2560, 2304
+SERVED_SHAPES = {"g25": (25, 288, 6), "g9": (9, 240, 3)}
+
+
+def _served_fp4_weights(mesh, seed, *, e_total):
+    """(w1, w2, w1_scale, w2_scale) in the served operand forms, generated on
+    device (the host copy of the f32 masters would be tens of GB)."""
+    from vllm_torchtpu.kernels.fused_moe.v2.host import fp4_scale_rows
+
+    shard = NamedSharding(mesh, P(AXIS))
+    hidden, inter, logical = SERVED_HIDDEN, SERVED_INTER, SERVED_LOGICAL_INTER
+
+    def one(key, k, n):
+        raw = jax.random.normal(key, (e_total, k, n), jnp.float32) * 0.1
+        if k == inter:
+            raw = jnp.where(jnp.arange(k)[None, :, None] < logical, raw, 0)
+        else:
+            col = jnp.arange(n) % inter
+            raw = jnp.where(col[None, None, :] < logical, raw, 0)
+        grouped = raw.reshape(e_total, k // 512, 512, n)
+        scale = jnp.maximum(jnp.max(jnp.abs(grouped), axis=2) / 6, 1e-12)
+        w = (grouped / scale[:, :, None, :]).reshape(e_total, k, n)
+        rows = fp4_scale_rows(k, 512, padded=True)
+        padded = jnp.zeros((e_total, rows, n), jnp.float32).at[:, : k // 512].set(scale)
+        return w.astype(jnp.float4_e2m1fn), padded.reshape(e_total * rows, n)
+
+    k1, k2 = jax.random.split(jax.random.key(seed))
+    w1, s1 = jax.jit(lambda k: one(k, hidden, 2 * inter), out_shardings=(shard,) * 2)(
+        k1
+    )
+    w2, s2 = jax.jit(lambda k: one(k, inter, hidden), out_shardings=(shard,) * 2)(k2)
+    return w1, w2, s1, s2
+
+
+@pytest.mark.parametrize("shape", sorted(SERVED_SHAPES))
+def test_served_dims_tail_barrier_and_height_rungs_are_bit_exact(shape):
+    """The closing barrier and the tile-height ladder change no arithmetic:
+    the layer drops the barrier and runs one, two or four rungs bit for bit
+    like the four-rung build with the barrier, at the served dims. A score
+    bias makes a few experts hot, so visits span several tiles and every
+    rung of each ladder serves some tail tile."""
+    g_local, rows, topk = SERVED_SHAPES[shape]
+    mesh = _mesh()
+    e_total = EP * g_local
+    weights = _served_fp4_weights(mesh, 61, e_total=e_total)
+    x, gating = _inputs(
+        mesh, 62, hidden=SERVED_HIDDEN, e_logical=e_total, tokens=EP * rows
+    )
+    bias = np.zeros(e_total, np.float32)
+    bias[np.random.default_rng(63).choice(e_total, EP, replace=False)] = 3.0
+    common = dict(
+        topk=topk,
+        renormalize=True,
+        mesh=mesh,
+        capacity=CAPACITY,
+        weight_format=WeightFormat.FP4,
+        rhs_qb=512,
+        sharded_plan=True,
+        scoring_fn="sqrtsoftplus",
+        score_bias=jax.device_put(bias, NamedSharding(mesh, P())),
+        routed_scaling_factor=2.5,
+        act_fn="silu_and_mul_with_clamp",
+        logical_intermediate_size=SERVED_LOGICAL_INTER,
+        sc_prepush=2,
+        tc_exchange=True,
+    )
+    want = np.asarray(
+        fused_ep_moe_push(x, *weights, gating, height_rungs_override=4, **common)
+    )
+    assert np.isfinite(want.astype(np.float32)).all()
+    for kw in (
+        dict(height_rungs_override=4, tail_barrier=False),
+        dict(height_rungs_override=2),
+        dict(height_rungs_override=1),
+        dict(height_rungs_override=2, tail_barrier=False),
+    ):
+        got = fused_ep_moe_push(x, *weights, gating, **kw, **common)
+        np.testing.assert_array_equal(np.asarray(got), want, err_msg=str(kw))
+    wrong = fused_ep_moe_push(
+        x, *_roll(weights), gating, height_rungs_override=4, **common
+    )
+    assert _rel(wrong, want) > CONTROL_BOUND

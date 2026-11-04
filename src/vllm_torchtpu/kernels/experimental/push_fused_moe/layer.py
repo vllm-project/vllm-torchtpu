@@ -204,6 +204,7 @@ def fused_ep_moe_push(
     sc_prepush=2,
     tc_exchange=False,
     height_rungs_override=0,
+    tail_barrier=True,
     expert_slot=None,
     expert_load=None,
 ):
@@ -218,8 +219,10 @@ def fused_ep_moe_push(
     and a value above the experts per shard is clamped to it with a warning.
     `tc_exchange` runs the routing exchange as a TensorCore remote-DMA kernel
     instead of XLA's all-gather. `height_rungs_override` is the tile-height
-    ladder's rung count (0 = the default; see kernel.tile_height_rungs). The
-    caller (layers/adapter/fused_moe_ep.py) reads all three from envs.
+    ladder's rung count (0 = the default; see kernel.tile_height_rungs).
+    `tail_barrier=False` drops the kernel's closing all-pairs barrier (see
+    kernel._build_push_moe_kernel). The caller
+    (layers/adapter/fused_moe_ep.py) reads all four from envs.
 
     `expert_slot` [experts, R] i32 and `expert_load` [e_total] i32 (both
     replicated, optional) are the expert-layout operands dynamic EPLB
@@ -372,6 +375,7 @@ def fused_ep_moe_push(
         n_pre = g_local
     tc_exchange = bool(tc_exchange)
     height_rungs_override = int(height_rungs_override)
+    tail_barrier = bool(tail_barrier)
     kfn = build_push_moe_kernel(
         g_local=g_local,
         capacity=capacity,
@@ -389,6 +393,7 @@ def fused_ep_moe_push(
         push_tokens=t_local,
         sc_prepush=n_pre,
         height_rungs_override=height_rungs_override,
+        tail_barrier=tail_barrier,
     )
 
     layout = _exchange_layout(t_local, topk, e_total, form.quantized_activations)
@@ -804,6 +809,7 @@ def fused_ep_moe_push(
         n_pre,
         tc_exchange,
         height_rungs_override,
+        tail_barrier,
     )
     sm = _LAYER_SM_CACHE.get(key)
     if sm is None:

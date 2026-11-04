@@ -1155,6 +1155,7 @@ def test_build_op_picks_the_push_layer_and_passes_its_knobs(monkeypatch, impl):
     monkeypatch.setattr(envs, "MOE_FUSED_EP_PUSH_SC_PREPUSH", 3)
     monkeypatch.setattr(envs, "MOE_FUSED_EP_PUSH_TC_EXCHANGE", True)
     monkeypatch.setattr(envs, "MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE", 4)
+    monkeypatch.setattr(envs, "MOE_FUSED_EP_PUSH_TAIL_BARRIER", False)
     bridge._build_op(None, 2, True, "silu", None, False)
     x = jnp.ones((8, 8), dtype=jnp.bfloat16)
     operands = (
@@ -1173,10 +1174,16 @@ def test_build_op_picks_the_push_layer_and_passes_its_knobs(monkeypatch, impl):
         assert forwarded["sc_prepush"] == 3
         assert forwarded["tc_exchange"] is True
         assert forwarded["height_rungs_override"] == 4
+        assert forwarded["tail_barrier"] is False
     else:
         push_kernel.assert_not_called()
         forwarded = v2_kernel.call_args.kwargs
-        for knob in ("sc_prepush", "tc_exchange", "height_rungs_override"):
+        for knob in (
+            "sc_prepush",
+            "tc_exchange",
+            "height_rungs_override",
+            "tail_barrier",
+        ):
             assert knob not in forwarded
 
 

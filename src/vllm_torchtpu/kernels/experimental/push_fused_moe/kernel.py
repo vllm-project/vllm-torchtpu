@@ -109,6 +109,7 @@ def _build_push_moe_kernel(
     push_tokens,
     sc_prepush,
     height_rungs_override=0,
+    tail_barrier=True,
 ):
     """Build the pallas_call and the function that invokes it.
 
@@ -133,6 +134,16 @@ def _build_push_moe_kernel(
     viewed per expert. Each slot then stages an expert's whole padded table
     and the FFN reads only its first K / rhs_qb rows, so the result is the
     unpadded build's bit for bit.
+
+    `tail_barrier=False` drops the all-pairs barrier after the transport
+    drain. Every write a peer makes into this shard during the call is
+    counted by an exact wait before that point (dispatch rows per local
+    expert, arrival rows and mirror sublanes), and this shard's own sends are
+    drained, so the barrier waits for nothing this call still owes. A peer
+    that leaves first next writes here only from a kernel that opens with an
+    entry barrier of its own (this kernel's head barrier, the SparseCore
+    pre-push's, the TensorCore routing exchange's), which holds the write
+    until this shard has entered that kernel too.
     """
     if pad_scale_rows and weight_format != host.WeightFormat.FP4:
         raise ValueError(
@@ -1483,7 +1494,8 @@ def _build_push_moe_kernel(
                 _rows_wait(dsend_sem, dispatch_hbm, n_remote)
 
         drain_transport()
-        _all_pairs_barrier(ep)
+        if tail_barrier:
+            _all_pairs_barrier(ep)
 
     hbm = pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM)
     # The VMEM buffers come from the same list the VMEM accounting sums, in
@@ -1609,6 +1621,7 @@ def _build_push_moe_kernel(
             f"{'' if act_fn == 'silu' else '_' + act_fn}"
             f"{bias_tag}"
             f"_g{g_local}_c{capacity}_nb{nbuf}_s{sc_prepush}"
+            f"{'' if tail_barrier else '_notail'}"
         )
         return pl.pallas_call(
             kernel,

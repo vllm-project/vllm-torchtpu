@@ -210,6 +210,7 @@ def _build_op(
             sc_prepush=envs.MOE_FUSED_EP_PUSH_SC_PREPUSH,
             tc_exchange=envs.MOE_FUSED_EP_PUSH_TC_EXCHANGE,
             height_rungs_override=envs.MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE,
+            tail_barrier=envs.MOE_FUSED_EP_PUSH_TAIL_BARRIER,
         )
 
     preprocess_topology = prepare_moe_preprocessing(mesh)
