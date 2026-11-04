@@ -323,3 +323,25 @@ def test_eager_dp_embed_multimodal_patching():
         patch_gemma4_mm_model_classes()
         assert MockGemma4.supports_encoder_tp_data is True
         assert getattr(MockGemma4.embed_multimodal, "_tpu_dp_patched", False)
+
+
+def test_patch_vision_mrope_lane_swap():
+    import sys
+    import types
+    from unittest.mock import patch
+    from vllm_torchtpu.models.vllm.gemma4_mm_patch import (
+        _lane_swap_rotate_half,
+        patch_vision_mrope_lane_swap,
+    )
+
+    mock_siglip = types.ModuleType("transformers.models.siglip.modeling_siglip")
+
+    def dummy_rotate_half(x):
+        return "original_rotate_half"
+
+    mock_siglip.rotate_half = dummy_rotate_half
+
+    with patch.dict(sys.modules, {"transformers.models.siglip.modeling_siglip": mock_siglip}):
+        patch_vision_mrope_lane_swap()
+        assert mock_siglip.rotate_half == _lane_swap_rotate_half
+        assert getattr(mock_siglip.rotate_half, "_is_lane_swap_patched", False)

@@ -1,10 +1,10 @@
 """
-Verification and Numerical Equivalence of Alyssa Nie's Lane-swap RoPE for 2D M-RoPE
-Reference: Alyssa Nie (go/fused_qkv_proj, cl/989795783), Ruizi Dong (PR #1640)
+Verification and Numerical Equivalence of Lane-swap RoPE for 2D M-RoPE
+Reference: (go/fused_qkv_proj, cl/989795783)
 
 This script proves:
 1. Standard NeoX 2D M-RoPE (slicing & concatenation) vs.
-2. Alyssa's Lane-swap 2D M-RoPE (in-register XOR permutation + FMA)
+2. Lane-swap 2D M-RoPE (in-register XOR permutation + FMA)
 produce IDENTICAL numerical results for Gemma-4 vision & multimodal tokens.
 """
 
@@ -62,7 +62,7 @@ def standard_2d_mrope(
     
     return y1 + y2 + unrotated
 
-def alyssa_lane_swap_2d_mrope(
+def lane_swap_2d_mrope(
     x: list[float],
     cos_vals: list[float],
     sin_vals: list[float],
@@ -70,7 +70,7 @@ def alyssa_lane_swap_2d_mrope(
     head_dim: int,
 ) -> list[float]:
     """
-    Alyssa Nie's Lane-swap RoPE (Trick #1 in go/fused_qkv_proj):
+    Lane-swap RoPE (Trick #1 in go/fused_qkv_proj):
     Instead of slicing and concatenating, every lane l rotates with lane (l ^ n):
       y[l] = x[l] * C[l] + x[l ^ n] * S[l]
     where:
@@ -107,7 +107,7 @@ def alyssa_lane_swap_2d_mrope(
 
 def run_verification():
     print("=" * 70)
-    print("  VERIFYING ALYSSA NIE'S LANE-SWAP 2D M-ROPE FOR GEMMA-4")
+    print("  VERIFYING LANE-SWAP 2D M-ROPE FOR GEMMA-4")
     print("=" * 70)
 
     # Test configuration matching Gemma-4 vision & multimodal specs
@@ -146,8 +146,8 @@ def run_verification():
         # 2. Run Baseline Standard 2D M-RoPE (slice + concat)
         y_standard = standard_2d_mrope(x, cos_vals, sin_vals, n_pairs)
         
-        # 3. Run Alyssa's Lane-swap 2D M-RoPE (XOR swap + FMA)
-        y_lane_swap = alyssa_lane_swap_2d_mrope(x, cos_vals, sin_vals, n_pairs, head_dim)
+        # 3. Run Lane-swap 2D M-RoPE (XOR swap + FMA)
+        y_lane_swap = lane_swap_2d_mrope(x, cos_vals, sin_vals, n_pairs, head_dim)
         
         # Verify numerical match
         for l in range(head_dim):
@@ -166,7 +166,7 @@ def run_verification():
     print("    - 2 Scalar Multiplies + 1 Add + 1 Subtract per pair")
     print("    - 1 Tensor Concatenation (forces XLU crossbar lane-shift / HBM round-trip)")
     print("    - Profiling Cost: 0.932 ms/layer (18.6% of Gemma-4 vision time)")
-    print("  Alyssa's Lane-swap RoPE:")
+    print("  Lane-swap RoPE:")
     print("    - 0 Slices, 0 Concatenations")
     print("    - In-register XOR permutation: l ^ 32 (single TPU vperm instruction)")
     print("    - Single FMA: y[l] = x[l] * C[l] + x[l ^ 32] * S[l]")

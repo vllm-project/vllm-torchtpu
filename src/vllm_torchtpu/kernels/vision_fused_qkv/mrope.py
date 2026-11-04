@@ -14,7 +14,7 @@
 
 """2D Multimodal Rotary Position Embedding (2D mRoPE) via in-register Lane-Swap FMA.
 
-Adapted from Alyssa Nie's Lane-swap technique (go/fused_qkv_proj, cl/989795783)
+Adapted from the Lane-swap technique (go/fused_qkv_proj, cl/989795783)
 for Gemma-4 2D vision grids (b/581011672).
 
 Replaces tensor slicing (torch.chunk / jnp.split) and concatenation (torch.cat)

@@ -14,7 +14,7 @@
 
 """Vision Encoder Fused QKV Projection and 2D mRoPE Kernel.
 
-Adapted from Alyssa Nie's fused_qkv kernel (go/fused_qkv_proj, cl/989795783).
+Adapted from fused_qkv kernel (go/fused_qkv_proj, cl/989795783).
 
 Key differences from GQA / Batched RPA:
 1. Strips out batched RPA layout reshuffling (no KV cache, no paged memory,

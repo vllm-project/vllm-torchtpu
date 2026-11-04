@@ -66,7 +66,7 @@ class TestVisionFusedQKV(unittest.TestCase):
                 # Reference slicing NeoX
                 y_ref = reference_neox_2d_mrope(x, cos_vals, sin_vals, spec)
 
-                # Alyssa Lane-swap FMA
+                # Lane-swap FMA
                 y_lane = lane_op.rotate_head_list(x)
 
                 for r, l_val in zip(y_ref, y_lane):
