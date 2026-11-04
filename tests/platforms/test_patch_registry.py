@@ -220,14 +220,16 @@ def test_manifest_preserves_lifecycle_dependencies():
         "_patch_vllm_offload_fine_prefix_alignment",
         "_patch_vllm_hybrid_kv_load_failure_recovery",
         "_patch_vllm_same_step_prefix_hits",
+        "patch_engine_core_deferred_step",
         "patch_disable_eagle_block_drop",
         "_patch_vllm_merge_multimodal_embeddings",
         "patch_block_hash_reuse",
         "patch_send_new_prompt_ids",
     ]
-    assert stages["platform_activation"] == (
-        stages["worker_init"] + stages["model_load"]
-    )
+    engine_core_only = {"patch_engine_core_deferred_step"}
+    assert [
+        name for name in stages["platform_activation"] if name not in engine_core_only
+    ] == (stages["worker_init"] + stages["model_load"])
     assert stages["model_load"] == [
         "maybe_patch_qwen2_5_vl",
         "maybe_patch_qwen3_vl",
