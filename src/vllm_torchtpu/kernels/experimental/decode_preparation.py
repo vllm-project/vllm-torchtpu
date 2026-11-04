@@ -402,10 +402,10 @@ def compressor_state_packed(
     *,
     total_records: int,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
-    """Decode flags and stable ring tables for one 288-token compressor tile."""
+    """Decode flags and stable ring tables for one supported compressor tile."""
     args = (table, starts, kv_starts, positions, minimum)
-    shapes = ((48, 8), (49,), (49,), (288,), (48,))
-    if any(
+    shapes = ((48, 8), (49,), (49,), (positions.size,), (48,))
+    if positions.size not in (96, 192, 240, 256, 288) or any(
         x.shape != shape or x.dtype != jnp.int32
         for x, shape in zip(args, shapes, strict=True)
     ):
