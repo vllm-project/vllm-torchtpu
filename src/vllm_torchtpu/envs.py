@@ -117,6 +117,7 @@ if TYPE_CHECKING:
     TPU_ROPE_CACHE_TRUNCATE: bool = False
     TPU_ROPE_CACHE_ROW_MAJOR: bool = False
     TPU_MOE_HASH_TABLE_ROW_MAJOR: bool = False
+    TPU_RMSNORM_FP32_WEIGHT: bool = False
     TPU_PARALLEL_PRECOMPILE: bool = False
     TPU_PRECOMPILE_BIGGEST_FIRST: bool = False
     TPU_PRECOMPILE_PEER_REPLAY: bool = False
@@ -856,6 +857,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_MOE_HASH_TABLE_ROW_MAJOR": env_bool(
         "TPU_MOE_HASH_TABLE_ROW_MAJOR", default=False
     ),
+    # Store a float32 copy of every RMSNorm weight once at load and pass it to
+    # the RMSNorm IR op, so that no forward step converts the bfloat16 weight
+    # (layers/adapter/layernorm.py). Bit-identical results with the default
+    # `tpu` RMSNorm provider. The copy is not refreshed if the weights are
+    # overwritten after load.
+    "TPU_RMSNORM_FP32_WEIGHT": env_bool("TPU_RMSNORM_FP32_WEIGHT"),
     # Extra token buckets added to the default list of buckets.
     "TPU_TOKEN_BUCKET_EXTRA": lambda: [
         int(v) for v in os.getenv("TPU_TOKEN_BUCKET_EXTRA", "").split(",") if v.strip()

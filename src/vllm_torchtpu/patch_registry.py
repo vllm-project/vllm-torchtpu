@@ -138,6 +138,10 @@ PATCHES = (
     # Out-of-tree FP32 rotary embedding (CUDA numerics). Must be registered
     # before any RotaryEmbedding is constructed at model load.
     Patch("vllm_torchtpu.layers.adapter.rotary_embedding", _ACTIVE),
+    # Out-of-tree RMSNorm that can use a float32 weight copy made at load
+    # (TPU_RMSNORM_FP32_WEIGHT). Must be registered before any RMSNorm is
+    # constructed at model load.
+    Patch("vllm_torchtpu.layers.adapter.layernorm", _ACTIVE),
     # Platform runtime configuration.
     Patch(
         "vllm_torchtpu.platforms.tpu_platform:_configure_torchtpu_eager_mode", _ACTIVE

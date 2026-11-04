@@ -5579,6 +5579,12 @@ class TPUModelRunner(GPUModelRunner):
             # precompiling the draft buckets.
             self._relayout_tables(getattr(self.drafter, "draft_model", None))
 
+        # After the drafter, so that its norms get the float32 copies too.
+        if envs.TPU_RMSNORM_FP32_WEIGHT:
+            from vllm_torchtpu.layers.adapter.layernorm import arm_fp32_weights
+
+            arm_fp32_weights(self.model, getattr(self.drafter, "draft_model", None))
+
         # After the drafter, so its MTP layer is armed too.
         if envs.FUSED_MOE_DECODE_KERNEL:
             from vllm_torchtpu.layers.adapter.fused_moe_decode import arm_runner_models
