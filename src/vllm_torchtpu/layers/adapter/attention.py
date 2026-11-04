@@ -518,13 +518,30 @@ def _pallas_rpa_kernel_batched(
                 ragged_paged_attention_batched, decode_query_size=decode_query_size
             )
             if decode_query_size > 1
-            else ragged_paged_attention_batched
+            else _with_decode_block_override(ragged_paged_attention_batched)
         ),
         sm_scale=sm_scale,
         soft_cap=soft_cap,
         use_causal_mask=use_causal_mask,
         kv_layout=kv_layout,
         block_major=block_major,
+    )
+
+
+def _with_decode_block_override(rpa_func):
+    """Bind TPU_BATCHED_RPA_DECODE_BLOCK as the one-query decode block, if set."""
+    block = envs.TPU_BATCHED_RPA_DECODE_BLOCK
+    if block is None:
+        return rpa_func
+    bkv, batch, buffers = block
+    logger.info_once(
+        "Batched RPA decode block: bkv %d, batch %d, %d buffers", bkv, batch, buffers
+    )
+    return functools.partial(
+        rpa_func,
+        decode_block_sizes=batched_rpa_configs.BlockSizes(
+            bq_sz=1, bq_c_sz=1, bkv_sz=bkv, batch_size=batch, n_buffer=buffers
+        ),
     )
 
 

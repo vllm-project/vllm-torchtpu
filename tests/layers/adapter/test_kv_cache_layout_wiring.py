@@ -595,3 +595,45 @@ def test_default_layout_accepts_a_layout_blind_kernel_entry(nhd, monkeypatch):
     impl._kernel_op_prefix = "pallas::rpa_kernel_local"
     bound = _build_rpa_kernel(impl, monkeypatch)
     assert "kv_layout" not in bound.keywords
+
+
+@pytest.mark.cpu_test
+def test_decode_block_env_binds_the_one_query_decode_block(monkeypatch):
+    """TPU_BATCHED_RPA_DECODE_BLOCK reaches the wrapper as decode_block_sizes."""
+    from vllm_torchtpu.layers.adapter import attention as adapter
+
+    entries = []
+
+    def impl(*args, rpa_func, **kwargs):
+        entries.append(rpa_func)
+
+    monkeypatch.setattr(adapter, "_pallas_rpa_kernel_impl", impl)
+    run = functools.partial(
+        adapter._pallas_rpa_kernel_batched,
+        *([None] * 12),
+        mesh=None,
+        sliding_window=None,
+        skip_kv_update=False,
+        kv_layout=KVLayout.SEQ_ALONG_LANE,
+    )
+
+    monkeypatch.delenv("TPU_BATCHED_RPA_DECODE_BLOCK", raising=False)
+    run()
+    assert entries[-1] is adapter.ragged_paged_attention_batched
+
+    monkeypatch.setenv("TPU_BATCHED_RPA_DECODE_BLOCK", "8192,4,2")
+    run()
+    assert entries[-1].func is adapter.ragged_paged_attention_batched
+    assert entries[-1].keywords == {
+        "decode_block_sizes": batched_rpa_configs.BlockSizes(
+            bq_sz=1, bq_c_sz=1, bkv_sz=8192, batch_size=4, n_buffer=2
+        )
+    }
+    # A multi-token decode keeps the kernel's own block for its query width.
+    run(decode_query_size=4)
+    assert entries[-1].keywords == {"decode_query_size": 4}
+
+    for value in ("8192,4", "8192,0,2", "8192,4,two"):
+        monkeypatch.setenv("TPU_BATCHED_RPA_DECODE_BLOCK", value)
+        with pytest.raises(ValueError, match="TPU_BATCHED_RPA_DECODE_BLOCK"):
+            run()
