@@ -5117,12 +5117,14 @@ def expert_family_slot(family_count, slot):
         return (slot - 3) % 8
     if family_count == 1:
         return jnp.zeros_like(slot)
-    # Down chunks of the split layout (rank_loader.SPLIT_EXPERT_LAYOUT):
-    # 11 (slots 0..10), 16 x 4 (from 11), 8 (as the banks) and 9 (from 83).
+    # Down chunks of the split layouts (rank_loader.expert_layout): 11 (slots
+    # 0..10), 16 x 4 (from 11), then 8 (as the banks) and 9 (from 83), or 17.
     if family_count == 16:
         return (slot - 11) % 16
     if family_count == 9:
         return slot - 83
+    if family_count == 17:  # split6: slots 75..91
+        return slot - 75
     return slot
 
 

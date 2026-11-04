@@ -150,6 +150,7 @@ def test_host_joined_parts_match_the_device_join(preshard):
     [
         {f: rl.EXPERT_BANK_SIZES for f in rl.EXPERT_FAMILIES},
         rl.SPLIT_EXPERT_LAYOUT,
+        {**rl.SPLIT_EXPERT_LAYOUT, "expert_down": (11, 16, 16, 16, 16, 17)},
     ],
 )
 def test_bank_slots_match_the_loader_banks(layout):

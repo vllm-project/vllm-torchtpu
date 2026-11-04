@@ -74,6 +74,8 @@ def expert_layout() -> dict[str, tuple[int, ...]]:
         down = SPLIT_EXPERT_LAYOUT["expert_down"]
         return {"expert_gu": EXPERT_BANK_SIZES, "expert_gus": EXPERT_BANK_SIZES,
                 "expert_down": down, "expert_ds": down}
+    if layout == "split6":  # down's last chunk 17 layers (2.62 GB): 21 buffers
+        return {**SPLIT_EXPERT_LAYOUT, "expert_down": (11, 16, 16, 16, 16, 17)}
     if layout == "split_down_banks":
         return {**SPLIT_EXPERT_LAYOUT, "expert_down": EXPERT_BANK_SIZES}
     raise ValueError(f"unknown expert_layout {layout!r}")
