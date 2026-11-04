@@ -53,7 +53,8 @@ from vllm.model_executor.layers.rotary_embedding import (
 from vllm.model_executor.layers.rotary_embedding.mrope_interleaved import (
     MRotaryEmbeddingInterleaved,
 )
-from vllm.model_executor.model_loader import get_model_loader
+from vllm.model_executor.model_loader import get_model_architecture, get_model_loader
+from vllm.model_executor.models.interfaces import supports_multimodal
 from vllm.multimodal.utils import group_and_batch_mm_kwargs
 from vllm.sequence import IntermediateTensors
 from vllm.utils.math_utils import cdiv
@@ -635,6 +636,12 @@ class TPUModelRunner(GPUModelRunner):
             normalize_draft_config(
                 vllm_config.speculative_config.draft_model_config.hf_config
             )
+        # The parent resolves the multimodal model class, and upstream model
+        # modules annotate with ``torch.cuda.Stream | None``. Import them
+        # before the wrapper aliases torch.cuda.Stream to the torch.tpu.Stream
+        # factory method, which is not a type (google-pytorch/torch_tpu#6158).
+        # TODO: drop once torch-tpu ships torch_tpu#6189 (Stream/Event classes).
+        get_model_architecture(vllm_config.model_config)
         with _torch_tpu_wrapper():
             super().__init__(vllm_config, device)
         self.sequence_layout_planner = sequence_layout_planner
@@ -3472,6 +3479,8 @@ class TPUModelRunner(GPUModelRunner):
                 is_multimodal=is_mm_embed,
             )
 
+            if self.model.requires_raw_input_tokens:
+                return input_ids, inputs_embeds
             return None, inputs_embeds
         else:
             # For text-only models, we use token ids as input.
@@ -7334,7 +7343,12 @@ class TPUModelRunner(GPUModelRunner):
             DeepseekV41ForCausalLM,
         )
 
-        model = self.model
+        # A multimodal wrapper computes logits with its language model's head.
+        model = (
+            self.model.get_language_model()
+            if supports_multimodal(self.model)
+            else self.model
+        )
         spec = self.speculative_config
         if (
             isinstance(model, DeepseekV41ForCausalLM)

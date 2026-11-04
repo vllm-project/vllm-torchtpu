@@ -13,6 +13,8 @@ from vllm.compilation.backends import set_model_tag
 from vllm.compilation.decorators import support_torch_compile
 from vllm.forward_context import override_forward_context
 from vllm.models.deepseek_v41.nvidia import model as upstream
+from vllm.models.deepseek_v41.nvidia import vl_model as upstream_vl
+from vllm.v1.worker.encoder_cudagraph_defs import EncoderCudaGraphConfig
 
 from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v41.deepseek_v41_mhc_op import (
     initialize_shifted_mhc,
@@ -1474,4 +1476,39 @@ class DeepseekV41ForCausalLM(upstream.DeepseekV41LLMForCausalLM):
         # NVIDIA MXFP8 adapter selected by upstream uses weight_scale instead.
         self.hf_to_vllm_mapper = upstream._make_deepseek_v4_weights_mapper(
             getattr(self.config, "expert_dtype", "fp4"), "weight_scale_inv"
+        )
+
+
+class DeepseekV41VLForCausalLM(upstream_vl.DeepseekV41ForCausalLM):
+    """Upstream V4.1 vision tower and preprocessing around the TPU text model."""
+
+    # TODO: route image tokens with gate.bias_vl. Upstream selects their
+    # experts with bias_vl instead of e_score_correction_bias or the hash
+    # table; the TPU fused EP MoE loads bias_vl but routes them like text.
+    def __init__(self, *, vllm_config, prefix=""):
+        # TPU's FP8 linear adapter registers weight_scale_inv, as in the text model.
+        with device_hooks(
+            upstream_vl,
+            DeepseekV41LLMForCausalLM=DeepseekV41ForCausalLM,
+            _linear_scale_param_name=lambda *_: "weight_scale_inv",
+        ):
+            super().__init__(vllm_config=vllm_config, prefix=prefix)
+
+    def get_encoder_cudagraph_config(self) -> EncoderCudaGraphConfig:
+        # Upstream rejects the TORCH_SDPA ViT backend it resolves on TPU, but
+        # TPU runs MMEncoderAttention through the Pallas forward_oot. Default
+        # zero padding of cu_seqlens is safe for its segment ids: trailing
+        # zeros shift every id equally and padding rows keep their own id.
+        return EncoderCudaGraphConfig(
+            modalities=["image"],
+            buffer_keys=[
+                "patches",
+                "vit_cos",
+                "vit_sin",
+                "cu_seqlens",
+                "max_seqlen",
+                "merge_idx",
+                "merge_mask",
+            ],
+            out_hidden_size=self.config.hidden_size,
         )

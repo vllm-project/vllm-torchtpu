@@ -2769,3 +2769,22 @@ def test_bucketed_drafts_preserve_real_request_offsets_across_chunks(verify):
     assert source[indices[1]].tolist() == [8, 22, 22]
     assert rejected.tolist() == ([2, 0, 0, 0, 0, 0] if verify else [0] * 6)
     assert counts == ({0: 2} if verify else {0: 0, 1: 0})
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("raw_tokens", [False, True])
+def test_multimodal_model_inputs_keep_raw_token_ids_when_required(raw_tokens):
+    input_ids = torch.arange(4)
+    embeds = torch.zeros(4, 2)
+    runner = SimpleNamespace(
+        supports_mm_inputs=True,
+        model=SimpleNamespace(
+            requires_raw_input_tokens=raw_tokens,
+            embed_input_ids=lambda ids, multimodal_embeddings, is_multimodal: embeds,
+        ),
+    )
+
+    ids, inputs_embeds = TPUModelRunner._get_model_inputs(runner, input_ids, None)
+
+    assert inputs_embeds is embeds
+    assert ids is (input_ids if raw_tokens else None)
