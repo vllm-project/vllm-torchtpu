@@ -134,6 +134,11 @@ class Qwen4ExpRaidenConnector(TPURaidenConnector):
                 page_tokens=group.block_size,
                 request_state=group.extent is TransferExtent.REQUEST_STATE,
                 positional_state=group.positional_state,
+                speculative_blocks=_speculative_blocks(
+                    config.kv_cache_groups[group.group_index]
+                )
+                if group.extent is TransferExtent.REQUEST_STATE
+                else 0,
             )
             for group in build_transfer_groups(config.kv_cache_groups)
         )
@@ -581,6 +586,20 @@ class Qwen4ExpRaidenWorker(TPURaidenConnectorWorker):
                 f"clips={len(clips)}, tags={num_tags}, grouped={fa_tag_count}"
             )
         return clips
+
+
+def _speculative_blocks(group) -> int:
+    """Speculative state checkpoints of a request-state cache group."""
+    spec = group.kv_cache_spec
+    specs = (
+        tuple(spec.kv_cache_specs.values())
+        if hasattr(spec, "kv_cache_specs")
+        else (spec,)
+    )
+    depths = {int(getattr(s, "num_speculative_blocks", 0) or 0) for s in specs}
+    if len(depths) != 1:
+        raise ValueError("A Qwen PD state group needs one speculative depth")
+    return depths.pop()
 
 
 def _owner_invariant_layout(layout: dict[str, Any]) -> dict[str, Any]:

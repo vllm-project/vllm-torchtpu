@@ -425,7 +425,6 @@ class StagedConsumer:
             RegionSpec,
         )
 
-        from .config import num_speculative_tokens
         from .pd import TransferExtent, build_transfer_groups
         from .pool_layout import pack_compressed_k_enabled, pack_main_kv_enabled, pooled_cache_specs
 
@@ -489,8 +488,9 @@ class StagedConsumer:
             raise ValueError(f"Qwen PD staging lacks producer pages for {sorted(missing)}")
         self._dst_owner = {n: g for n, g in self._dst_owner.items() if n not in missing}
         # A speculative state table holds the committed state, then K
-        # speculative checkpoints: loads land in the committed entry.
-        self._state_entry = -(int(num_speculative_tokens(cfg)) + 1)
+        # speculative checkpoints; the connector hands the repack only the
+        # committed entry (_Stage3TransferGroup.transfer_pages).
+        self._state_entry = 0
         self._gdn_names = [n for n in self._dst_owner if owner_kind(n) == "gdn"]
         self._token_extent = TransferExtent.TOKEN_PAGES
         tp = rank.tp_size

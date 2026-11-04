@@ -212,6 +212,10 @@ class _Stage3TransferGroup:
     # (align-mode Mamba under prefix caching): the running state is the last
     # of ``ceil(num_tokens / page_tokens)`` entries, and only it moves.
     positional_state: bool = False
+    # A request-state group with speculative checkpoints (an MTP decode,
+    # none mode): the table is the committed state then ``K`` speculative
+    # entries, and only the committed one is a transfer target.
+    speculative_blocks: int = 0
 
     def page_count(self, num_tokens: int) -> int:
         if num_tokens < 0:
@@ -225,6 +229,11 @@ class _Stage3TransferGroup:
         moves: the live state page of a positional state table (None if the
         table is not a committed prefix of that length), the table otherwise.
         """
+        if self.request_state and self.speculative_blocks and not self.positional_state:
+            pages = list(ids)
+            if num_tokens <= 0 or len(pages) != self.speculative_blocks + 1:
+                return None
+            return pages[: 1]
         if not self.positional_state:
             return list(ids)
         pages = list(ids)
