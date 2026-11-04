@@ -23,9 +23,11 @@ import pytest
 import torch
 from vllm.config import ParallelConfig
 from vllm.v1.engine.core import EngineCoreProc
+from vllm.v1.pool.late_interaction_runner import LateInteractionRunner
 
 import vllm_torchtpu as plugin
 from vllm_torchtpu import patch_registry, utils
+from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 from vllm_torchtpu.worker.tpu_worker import TPUWorker, _configure_tpu_process_env
 
 
@@ -290,6 +292,23 @@ def test_initialize_from_config_updates_num_gpu_blocks():
 
     assert worker.cache_config.num_gpu_blocks == 2048
     worker.model_runner.initialize_kv_cache.assert_called_once_with(kv_cache_config)
+
+
+def test_reset_encoder_cache_clears_the_runner_caches():
+    runner = TPUModelRunner.__new__(TPUModelRunner)
+    runner.encoder_cache = {"mm_hash": torch.zeros(1)}
+    runner.late_interaction_runner = LateInteractionRunner(enable_flash=False)
+    late = runner.late_interaction_runner
+    late._query_cache["query"] = torch.zeros(1)
+    late._query_uses["query"] = 1
+    late._doc_query_keys["doc"] = "query"
+    worker = TPUWorker.__new__(TPUWorker)
+    worker.model_runner = runner
+
+    worker.reset_encoder_cache()
+
+    assert runner.encoder_cache == {}
+    assert (late._query_cache, late._query_uses, late._doc_query_keys) == ({}, {}, {})
 
 
 def _ep_dp_worker(monkeypatch, dp_size, expert_parallel, local, peer):
