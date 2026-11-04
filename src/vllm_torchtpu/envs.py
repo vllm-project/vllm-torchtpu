@@ -948,11 +948,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # another and most ranks wait. Needs TPU_PARALLEL_PRECOMPILE.
     "TPU_PRECOMPILE_TRACE_FIRST": env_bool("TPU_PRECOMPILE_TRACE_FIRST", default=False),
     # Short-term workaround: reload newly compiled PJRT executables from
-    # serialized bytes in TpuCompilerAdaptor and clear torch_tpu's Tier-1
-    # executable cache so compile-only C++ metadata retained by CompileAndLoad
-    # is freed immediately. Remove once torch_tpu / libtpu releases
-    # compile-time metadata natively during compilation. Listed in
-    # TpuPlatform.additional_env_vars so Ray workers receive it as well.
+    # serialized bytes in TpuCompilerAdaptor, clear leaf `_fast_runner` and
+    # `_executable` handles on `TorchTpuCompiledExecutable` (`torch_tpu==0.2.0`;
+    # switch to `TorchTpuCompiledExecutable.release()` once the `torch_tpu` pin
+    # advances, failing fast if `CompiledArtifact` internals fail to clear), and
+    # evict `torch_tpu`'s Tier-1 cache (`torch.tpu._clear_cache()`) so
+    # compile-only C++ metadata retained by `CompileAndLoad` is freed before
+    # serving. Clearing Tier-1 `per_entry_stats` resets
+    # `VLLM_XLA_CHECK_RECOMPILATION`'s cached-graph counter, and uncached lazy
+    # ops reload from `/dev/shm` Tier-2 or disk Tier-3 caches unless both are
+    # disabled. Remove once `torch_tpu` / `libtpu` releases compile-time
+    # metadata natively. Listed in `TpuPlatform.additional_env_vars` so Ray
+    # workers receive it as well.
     "VLLM_TPU_RELOAD_COMPILED_EXECUTABLE": env_bool(
         "VLLM_TPU_RELOAD_COMPILED_EXECUTABLE", default=False
     ),

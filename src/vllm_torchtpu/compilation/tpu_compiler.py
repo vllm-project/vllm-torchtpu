@@ -41,6 +41,12 @@ import torch._guards
 import torch.fx as fx
 from torch.fx.experimental.symbolic_shapes import ShapeEnv
 from torch_tpu._internal.compile._backend import TpuBackend
+from torch_tpu._internal.compile.split_compiler import _SplitCompiledExecutable
+from torch_tpu._internal.compile.torch_tpu_compiled_executable import (
+    AsyncCompiledArtifact,
+    NoOpCompiledArtifact,
+    TorchTpuCompiledExecutable,
+)
 from vllm.compilation.compiler_interface import CompilerInterface
 from vllm.config import VllmConfig
 from vllm.config.utils import Range
@@ -139,32 +145,45 @@ def _deserialize_entry(entry: Any) -> Callable[..., Any]:
     # `deserialize_bundled_cache_entry` deep-copies `entry` so the runnable can
     # be serialized again. `CompiledArtifact` has no `__deepcopy__`, so the copy
     # goes through `__reduce__` and loads a second PJRT executable per graph.
-    # Return `entry` itself from `__deepcopy__` to reuse the loaded executable,
-    # then drop the lambda so `entry` stays picklable for `_save_handle`.
+    # vllm-torchtpu never re-serializes a replayed runnable, so return `entry`
+    # itself from `__deepcopy__` and reuse the loaded executable.
     with contextlib.suppress(AttributeError, TypeError):
         entry.__deepcopy__ = lambda _memo: entry
-    try:
-        return deserialize_bundled_cache_entry(entry)
-    finally:
-        with contextlib.suppress(AttributeError, TypeError):
-            entry.__dict__.pop("__deepcopy__", None)
+    return deserialize_bundled_cache_entry(entry)
 
 
-def _get_num_compilations() -> int | None:
-    """Return torch_tpu's cumulative CompileAndLoad count, or None if unavailable."""
-    try:
-        return int(torch.tpu._get_cache_stats().num_compilations)
-    except (AttributeError, RuntimeError):
-        return None
+def _get_num_compilations() -> int:
+    """Return torch_tpu's cumulative CompileAndLoad count."""
+    return int(torch.tpu._get_cache_stats().num_compilations)
 
 
 def _clear_tpu_tier1_cache() -> None:
     """Evict torch_tpu's in-memory Tier-1 CompilationCache entries."""
+    if envs.VLLM_XLA_CHECK_RECOMPILATION:
+        logger.warning_once(
+            "[TpuCompilerAdaptor] VLLM_TPU_RELOAD_COMPILED_EXECUTABLE clears "
+            "torch_tpu's Tier-1 CompilationCache (per_entry_stats), which "
+            "resets VLLM_XLA_CHECK_RECOMPILATION's cached-graph counter; "
+            "inspect TpuCompilerAdaptor reload logs or stats.num_compilations "
+            "instead."
+        )
     torch.tpu._clear_cache()
 
 
 def _release_compiled_artifact(artifact: Any, seen: set[int] | None = None) -> None:
-    """Synchronously drop C++ PjRtLoadedExecutable refs on CompiledArtifact leaves."""
+    """Synchronously drop C++ PjRtLoadedExecutable refs on CompiledArtifact leaves.
+
+    Short-term workaround until `torch_tpu` / `libtpu` releases compile-only
+    C++ metadata natively during `CompileAndLoad`.
+
+    TODO: Switch `TorchTpuCompiledExecutable` cleanup to `artifact.release()`
+    (added on `torch_tpu` main) once the `torch_tpu` pin advances past `0.2.0`,
+    and remove the reload path altogether once `torch_tpu` / `libtpu` drops
+    compile-time metadata natively. On `torch_tpu==0.2.0`, `_fast_runner` and
+    `_executable` are cleared directly and verified `None` so any incompatible
+    `torch_tpu` change fails fast before `LoadSerializedExecutable` rather than
+    incurring a silent 2x TPU HBM / host DRAM spike.
+    """
     if artifact is None:
         return
     if seen is None:
@@ -173,23 +192,43 @@ def _release_compiled_artifact(artifact: Any, seen: set[int] | None = None) -> N
     if obj_id in seen:
         return
     seen.add(obj_id)
-    for sub in getattr(artifact, "compiled_executables", None) or ():
-        if sub is not artifact:
-            _release_compiled_artifact(sub, seen)
-    # Clear the C++ handle and bound runner directly so cyclic split
-    # GraphModules do not retain a 2x HBM/DRAM copy until cyclic GC runs.
-    for attr in ("_executable", "_fast_runner"):
-        if hasattr(artifact, attr):
-            with contextlib.suppress(AttributeError, TypeError):
-                setattr(artifact, attr, None)
+
+    if isinstance(artifact, AsyncCompiledArtifact):
+        # `resolve()` blocks on the background compile future and swaps
+        # `artifact.__class__` and `artifact.__dict__` in-place.
+        artifact.resolve()
+
+    if isinstance(artifact, _SplitCompiledExecutable):
+        for sub in artifact.compiled_executables:
+            if sub is not artifact:
+                _release_compiled_artifact(sub, seen)
+        return
+
+    if isinstance(artifact, NoOpCompiledArtifact):
+        return
+
+    if isinstance(artifact, TorchTpuCompiledExecutable):
+        artifact._fast_runner = None
+        artifact._executable = None
+        if artifact._executable is not None or artifact._fast_runner is not None:
+            raise RuntimeError(
+                "Failed to clear TorchTpuCompiledExecutable handles; aborting "
+                "reload before LoadSerializedExecutable to prevent a 2x memory "
+                "spike."
+            )
+        return
+
+    raise TypeError(
+        f"Unsupported CompiledArtifact type {type(artifact).__qualname__!r} "
+        "for VLLM_TPU_RELOAD_COMPILED_EXECUTABLE."
+    )
 
 
 def _release_entry_executables(entry: Any) -> None:
     """Release forward/backward CompiledArtifact wrappers inside a bundled entry."""
-    for attr in ("compiled_fw", "compiled_bw"):
-        loadable = getattr(entry, attr, None)
+    for loadable in (entry.compiled_fw, entry.compiled_bw):
         if loadable is not None:
-            _release_compiled_artifact(getattr(loadable, "result", None))
+            _release_compiled_artifact(loadable.result)
 
 
 _TPU_COMPILE_ENV_IGNORED = {
@@ -642,9 +681,11 @@ class TpuCompilerAdaptor(CompilerInterface):
         )
         with torch._guards.tracing(tracing_ctx):
             compiled_fn = _tpu_backend(graph, example_inputs)
-        after_compilations = (
-            _get_num_compilations() if before_compilations is not None else None
-        )
+        compilations: tuple[int, int] | None = None
+        if before_compilations is not None:
+            after_compilations = _get_num_compilations()
+            if after_compilations > before_compilations:
+                compilations = (before_compilations, after_compilations)
 
         # Read `serialize` off the object TpuBackend returned, before any
         # wrapping: the unwrap below replaces it with a plain closure that does
@@ -661,15 +702,6 @@ class TpuCompilerAdaptor(CompilerInterface):
                     e,
                 )
 
-        compilations = (
-            (before_compilations, after_compilations)
-            if (
-                before_compilations is not None
-                and after_compilations is not None
-                and after_compilations > before_compilations
-            )
-            else None
-        )
         return compiled_fn, entry, compilations
 
     def _reload_compiled(
@@ -708,11 +740,10 @@ class TpuCompilerAdaptor(CompilerInterface):
                 )
                 return compiled_fn, entry, False
 
-        # Drop all C++ shared_ptr owners (leaf _executable/_fast_runner and
-        # Tier-1 CompilationCache) before LoadSerializedExecutable allocates
-        # the replacement program in TPU HBM and host DRAM.
+        # Clear C++ shared_ptr owners in-place on `entry`'s leaves and evict
+        # Tier-1 CompilationCache before LoadSerializedExecutable allocates
+        # the replacement program (callers still hold the outer `entry` shell).
         _release_entry_executables(entry)
-        entry = None
         _clear_tpu_tier1_cache()
 
         if saved_path is not None:
@@ -743,7 +774,7 @@ class TpuCompilerAdaptor(CompilerInterface):
                     before_compilations,
                     after_compilations,
                 )
-                return reloaded_fn, reloaded_entry, True
+                return reloaded_fn, None, True
             except Exception as e:
                 serialized_entry = None
                 logger.warning(
