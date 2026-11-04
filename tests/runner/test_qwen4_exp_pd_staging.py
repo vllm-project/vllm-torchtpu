@@ -250,3 +250,50 @@ def test_without_speculation_drops_only_the_draft_config():
     assert cfg.speculative_config == {"method": "mtp"}
     plain = Cfg(speculative_config=None)
     assert st.without_speculation(plain) is plain
+
+class _Layout:
+    def __init__(self, owners=(), slots=1):
+        self.compressed_owners = tuple(owners)
+        self.compressed_slots = slots
+
+
+def test_compressed_destinations_unpacked_owns_its_group_at_row_zero():
+    dst_owner = {"model.layers.3.compressed_k": 5, "model.layers.3.self_attn": 4}
+    out = st.compressed_destinations(_Layout(), dst_owner, 512, 4)
+    assert out == {"model.layers.3.compressed_k": (5, 0)}
+
+
+def test_compressed_destinations_packed_members_offset_by_slot():
+    owners = [
+        (f"model.layers.{i}", "model.layers.3.compressed_k", s)
+        for s, i in enumerate((3, 7, 11))
+    ]
+    dst_owner = {"model.layers.3.compressed_k": 9}
+    out = st.compressed_destinations(_Layout(owners, 8), dst_owner, 512, 4)
+    # 512 tokens / (2 * 4) = 64 pair rows per member.
+    assert out == {
+        "model.layers.3.compressed_k": (9, 0),
+        "model.layers.7.compressed_k": (9, 64),
+        "model.layers.11.compressed_k": (9, 128),
+    }
+
+
+def test_compressed_destinations_refuse_overflow():
+    owners = [("a", "a.compressed_k", 0)]
+    with pytest.raises(ValueError):
+        st.compressed_destinations(_Layout(owners, 9), {"a.compressed_k": 0}, 512, 4)
+
+
+def test_packed_compressed_rows_match_kernel_pair_addressing():
+    # pooled_qsa writes pair = page * block + slot * (block // (2r)) + (t % block) // (2r).
+    block, ratio, slot = 512, 4, 3
+    dst_pages = [7, 2]
+    s, d = st.compressed_rows(
+        1024, ratio, [1, 2, 3], 3200, dst_pages, block, dst_offset=slot * (block // (2 * ratio))
+    )
+    for q, row in enumerate(d):
+        t = q * 2 * ratio
+        assert row == dst_pages[t // block] * block + slot * (block // (2 * ratio)) + (t % block) // (2 * ratio)
+    # The source rows are those of the unpacked repack.
+    s0, d0 = st.compressed_rows(1024, ratio, [1, 2, 3], 3200, dst_pages, block)
+    assert s == s0 and [x - slot * 64 for x in d] == d0
