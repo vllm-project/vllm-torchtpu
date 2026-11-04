@@ -536,54 +536,36 @@ def fused_ep_moe_push(
             if expert_load_l is None
             else expert_load_l + rows_by_dest.sum(axis=0).astype(jnp.int32)
         )
-        if t_local == 288 and ep == 16 and e_total == 384 and n_pre == 2:
-            from vllm_torchtpu.kernels.experimental.decode_preparation import (
-                dispatch_layout_call,
+        with jax.named_scope("moe_dispatch_tables"):
+            runs = run_tables(rows_by_dest)
+            seg, dmeta, visit_all = push_dispatch_segments(
+                runs[3], runs[2], rows_by_dest, me, seg_start, e_total=e_total, ep=ep
             )
-
-            inputs = (rows_by_dest, seg_start, me.reshape(1))
-            *runs, seg, dmeta, visit, counts_sc = dispatch_layout_call(inputs)(*inputs)
-        else:
-            with jax.named_scope("moe_dispatch_tables"):
-                runs = run_tables(rows_by_dest)
-                seg, dmeta, visit_all = push_dispatch_segments(
-                    runs[3],
-                    runs[2],
-                    rows_by_dest,
-                    me,
-                    seg_start,
-                    e_total=e_total,
-                    ep=ep,
-                )
-                recv_by_e = dmeta[g_local + 1 : 2 * g_local + 1]
-                S = ep * g_local
-                seg_n = jnp.bitwise_and(seg[:S], 65535).reshape(g_local, ep)
-                seg_remote = (jnp.arange(ep)[None, :] != me).astype(jnp.int32)
-                visit = lax.dynamic_slice(visit_all, (me, 0), (1, g_local)).reshape(
-                    g_local
-                )
-                # Rows landing here at each pre-pushed visit position.
-                vis_s = visit[:n_pre]
-                hit_s = (
-                    vis_s[:, None] == jnp.arange(g_local, dtype=jnp.int32)[None, :]
-                ) & (vis_s[:, None] >= 0)
-                rows_at_v = jnp.sum(jnp.where(hit_s, recv_by_e[None, :], 0), axis=1)
-                # The kernel waits only the remote rows IT sends: positions >= n_pre.
-                n_rem_tc = (
-                    jnp.sum(seg_n[n_pre:] * seg_remote).astype(jnp.int32).reshape(1)
-                )
-                dmeta = jnp.concatenate(
-                    [dmeta[: 2 * g_local + 1], n_rem_tc, dmeta[2 * g_local + 2 :]]
-                )
-                # SparseCore core c pushes the positions v with v % 2 == c.
-                counts_sc = jnp.stack(
-                    [
-                        jnp.sum(rows_at_v[0:n_pre:2]),
-                        jnp.sum(rows_at_v[1:n_pre:2]),
-                        jnp.sum(seg_n[0:n_pre:2] * seg_remote),
-                        jnp.sum(seg_n[1:n_pre:2] * seg_remote),
-                    ]
-                ).astype(jnp.int32)
+            recv_by_e = dmeta[g_local + 1 : 2 * g_local + 1]
+            S = ep * g_local
+            seg_n = jnp.bitwise_and(seg[:S], 65535).reshape(g_local, ep)
+            seg_remote = (jnp.arange(ep)[None, :] != me).astype(jnp.int32)
+            visit = lax.dynamic_slice(visit_all, (me, 0), (1, g_local)).reshape(g_local)
+            # Rows landing here at each pre-pushed visit position.
+            vis_s = visit[:n_pre]
+            hit_s = (
+                vis_s[:, None] == jnp.arange(g_local, dtype=jnp.int32)[None, :]
+            ) & (vis_s[:, None] >= 0)
+            rows_at_v = jnp.sum(jnp.where(hit_s, recv_by_e[None, :], 0), axis=1)
+            # The kernel waits only the remote rows IT sends: positions >= n_pre.
+            n_rem_tc = jnp.sum(seg_n[n_pre:] * seg_remote).astype(jnp.int32).reshape(1)
+            dmeta = jnp.concatenate(
+                [dmeta[: 2 * g_local + 1], n_rem_tc, dmeta[2 * g_local + 2 :]]
+            )
+            # SparseCore core c pushes the positions v with v % 2 == c.
+            counts_sc = jnp.stack(
+                [
+                    jnp.sum(rows_at_v[0:n_pre:2]),
+                    jnp.sum(rows_at_v[1:n_pre:2]),
+                    jnp.sum(seg_n[0:n_pre:2] * seg_remote),
+                    jnp.sum(seg_n[1:n_pre:2] * seg_remote),
+                ]
+            ).astype(jnp.int32)
         # Compute the pre-push operands before the routing plan, so XLA
         # launches the SparseCore dispatch ahead of it and the two overlap.
         (
