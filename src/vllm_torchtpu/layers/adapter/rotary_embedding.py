@@ -11,44 +11,59 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""FP32 rotary embedding for TPU as out-of-tree CustomOps.
+"""Tier-1 in-graph & FP32 rotary embedding out-of-tree CustomOps for TPU.
 
-vLLM's CUDA rotary kernel (``csrc/pos_encoding_kernels.cu``) loads the
-(activation-dtype) cos/sin cache entries and the q/k values, upcasts all of
-them to ``float``, rotates, and casts once on store. The PyTorch reference,
-``ApplyRotaryEmb.forward_static``, only does that when
-``enable_fp32_compute=True``; the default is ``False`` and
-``RotaryEmbedding.forward_static`` never passes it, so on TPU the rotation
-``x1 * cos - x2 * sin`` runs in BF16. For RL rollouts the resulting drift in
-q/k shows up as trainer/sampler log-prob mismatch.
+Registers out-of-tree (`@CustomOp.register_oot`) TPU subclasses for:
+* `ApplyRotaryEmb`: forces `enable_fp32_compute=True` (CUDA kernel numerics).
+* Static-forward `RotaryEmbedding` subclasses (`TPU_ROPE_CLASSES`): discovered
+  from the upstream MRO for FP32 rotation, and equipped with the Tier-1 0-row
+  `_compute_cos_sin_cache` stub + `RopeInGraphSpec` on verified classes
+  (`TIER1_STATIC_ROPE_CLASSES`) so `load_model()` allocates `0 B` peak and
+  steady-state HBM when `TPU_ROPE_IN_GRAPH=1`.
+* 3D multimodal `MRotaryEmbedding` subclasses (`TPU_MROPE_CLASSES`:
+  `MRotaryEmbedding`, `MRotaryEmbeddingInterleaved`,
+  `Ernie4_5_VLRotaryEmbedding`, `BailingMRotaryEmbedding`): same Tier-1 0-row
+  cache stub and pure-HLO per-channel modality selection.
 
-Two registrations restore the CUDA numerics, following the vLLM
-device-extension design (``docs/design/custom_op.md``) rather than patching
-vLLM internals. ``CustomOp.__new__`` substitutes an out-of-tree class by the
-upstream class name, so each upstream class that needs the fix gets one entry:
-
-* ``ApplyRotaryEmb``: constructed with ``enable_fp32_compute=True``. Covers
-  every caller that goes through an instance, in particular
-  ``MRotaryEmbedding`` (Qwen3.5 / Qwen3-VL) and its subclasses.
-* ``RotaryEmbedding`` and every upstream subclass that inherits its
-  ``forward_native`` (Llama3, YaRN, NTK, linear, Gemma4 scaling, ...; found by
-  walking the class hierarchy): ``forward_static`` calls
-  ``ApplyRotaryEmb.forward_static`` directly, so the instance flag does not
-  reach it. The TPU subclass replays ``forward_static`` with
-  ``enable_fp32_compute=True`` and strips trailing identity ``(cos=1, sin=0)``
-  pairs from NeoX ``cos_sin_cache`` buffers.
-
-``forward_native`` is overridden as well as ``forward_oot``/``forward_tpu`` so
-the numerics do not depend on ``CompilationConfig.custom_ops`` enabling the op:
-CUDA runs the FP32 kernel in both cases, and so should TPU.
+When `TPU_ROPE_IN_GRAPH=0`, all `Tpu*` classes keep upstream
+`_compute_cos_sin_cache()` and FP32 table-gather rotation, matching legacy
+precomputed-table execution; static NeoX classes also strip trailing identity
+`(cos=1, sin=0)` pairs from `cos_sin_cache`. `forward_native` is overridden as
+well as `forward_oot`/`forward_tpu` so the numerics do not depend on
+`CompilationConfig.custom_ops` enabling the op.
 """
+
+from __future__ import annotations
+
+from collections.abc import Callable
+from typing import Any, cast
 
 import torch
 from vllm.model_executor.custom_op import CustomOp, op_registry_oot
 from vllm.model_executor.layers import rotary_embedding as upstream_rope
-from vllm.model_executor.layers.rotary_embedding import RotaryEmbedding
+from vllm.model_executor.layers.rotary_embedding import (
+    BailingMRotaryEmbedding,
+    DynamicNTKAlphaRotaryEmbedding,
+    DynamicNTKScalingRotaryEmbedding,
+    Gemma4RotaryEmbedding,
+    LinearScalingRotaryEmbedding,
+    Llama3RotaryEmbedding,
+    MRotaryEmbedding,
+    MRotaryEmbeddingInterleaved,
+    NTKScalingRotaryEmbedding,
+    RotaryEmbedding,
+    YaRNScalingRotaryEmbedding,
+)
+from vllm.model_executor.layers.rotary_embedding.bailing_mrope import (
+    _validate_bailing_positions,
+)
+from vllm.model_executor.layers.rotary_embedding.base import RotaryEmbeddingBase
 from vllm.model_executor.layers.rotary_embedding.common import ApplyRotaryEmb
+from vllm.model_executor.layers.rotary_embedding.ernie45_vl_rope import (
+    Ernie4_5_VLRotaryEmbedding,
+)
 
+from vllm_torchtpu import envs, rope_patch
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
@@ -56,14 +71,14 @@ logger = init_logger(__name__)
 
 @CustomOp.register_oot(name="ApplyRotaryEmb")
 class TpuApplyRotaryEmb(ApplyRotaryEmb):
-    """``ApplyRotaryEmb`` that always rotates in FP32, like the CUDA kernel."""
+    """`ApplyRotaryEmb` that always rotates in FP32, like the CUDA kernel."""
 
     def __init__(
         self,
         enforce_enable: bool = False,
         is_neox_style: bool = True,
         enable_fp32_compute: bool = False,
-        **kwargs,
+        **kwargs: Any,
     ) -> None:
         # Mirror the upstream positional signature so callers passing
         # enable_fp32_compute positionally are overridden too, not rejected.
@@ -161,7 +176,7 @@ def _rotary_forward_fp32(
     query: torch.Tensor,
     key: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
-    """``RotaryEmbedding.forward_static`` with ``enable_fp32_compute=True``.
+    """`RotaryEmbedding.forward_static` with `enable_fp32_compute=True`.
 
     The cos/sin cache is still matched to the query dtype first: the CUDA
     kernel reads the activation-dtype cache and upcasts the loaded entries,
@@ -214,6 +229,31 @@ def _rotary_forward_fp32(
     return query, key
 
 
+def _static_tier1_forward(
+    self: RotaryEmbedding,
+    positions: torch.Tensor,
+    query: torch.Tensor,
+    key: torch.Tensor | None = None,
+    offsets: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    if getattr(self, "_in_graph_spec", None) is not None:
+        return rope_patch._in_graph_spec_forward(
+            self, positions, query, key, offsets=offsets
+        )
+    if offsets is not None:
+        positions = positions + offsets
+    return _rotary_forward_fp32(self, positions, query, key)
+
+
+def _tier1_get_cos_sin(
+    self: RotaryEmbeddingBase,
+    seqlen: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if getattr(self, "_in_graph_spec", None) is not None:
+        return rope_patch._in_graph_spec_get_cos_sin(self, seqlen)
+    return RotaryEmbeddingBase.get_cos_sin(self, seqlen)
+
+
 def _all_subclasses(cls: type) -> set[type]:
     out: set[type] = set()
     for sub in cls.__subclasses__():
@@ -223,12 +263,7 @@ def _all_subclasses(cls: type) -> set[type]:
 
 
 def _uses_static_rotary_forward(cls: type[RotaryEmbedding]) -> bool:
-    """True if ``cls.forward_native`` resolves to ``RotaryEmbedding``'s.
-
-    Classes with their own forward_native (MRotaryEmbedding family, FoPE,
-    DeepSeek scaling, ...) do not run the static path; the MRoPE family is
-    covered through TpuApplyRotaryEmb instead.
-    """
+    """True if `cls.forward_native` resolves to `RotaryEmbedding`'s."""
     for c in cls.__mro__:
         if "forward_native" in c.__dict__:
             return c is RotaryEmbedding
@@ -236,12 +271,7 @@ def _uses_static_rotary_forward(cls: type[RotaryEmbedding]) -> bool:
 
 
 def _discover_static_rope_classes() -> tuple[type[RotaryEmbedding], ...]:
-    """Upstream RotaryEmbedding classes whose forward is the static path.
-
-    Discovered from the class hierarchy (``vllm.model_executor.layers.
-    rotary_embedding`` imports every variant), so new upstream scaling
-    variants are picked up without editing this file.
-    """
+    """Upstream RotaryEmbedding classes whose forward is the static path."""
     upstream_prefix = upstream_rope.__name__ + "."
     found = {
         c
@@ -253,7 +283,91 @@ def _discover_static_rope_classes() -> tuple[type[RotaryEmbedding], ...]:
     return (RotaryEmbedding, *sorted(found, key=lambda c: c.__name__))
 
 
+TIER1_STATIC_ROPE_CLASSES: frozenset[type[RotaryEmbedding]] = frozenset(
+    {
+        RotaryEmbedding,
+        Llama3RotaryEmbedding,
+        Gemma4RotaryEmbedding,
+        NTKScalingRotaryEmbedding,
+        LinearScalingRotaryEmbedding,
+        DynamicNTKScalingRotaryEmbedding,
+        DynamicNTKAlphaRotaryEmbedding,
+        YaRNScalingRotaryEmbedding,
+    }
+)
+
+_ORIG_MROPE_CLS: type[MRotaryEmbedding] = cast(
+    type[MRotaryEmbedding],
+    next(
+        (
+            c
+            for c in MRotaryEmbedding.__mro__
+            if c.__name__ == "MRotaryEmbedding" and issubclass(c, RotaryEmbeddingBase)
+        ),
+        MRotaryEmbedding,
+    ),
+)
+
+TIER1_MROPE_CLASSES: tuple[type[MRotaryEmbedding], ...] = tuple(
+    dict.fromkeys(
+        (
+            _ORIG_MROPE_CLS,
+            MRotaryEmbedding,
+            MRotaryEmbeddingInterleaved,
+            Ernie4_5_VLRotaryEmbedding,
+            BailingMRotaryEmbedding,
+        )
+    )
+)
+
 _STATIC_ROPE_CLASSES = _discover_static_rope_classes()
+
+
+def _attach_tier1_lifecycle(
+    attrs: dict[str, Any],
+    base: type[RotaryEmbeddingBase],
+    holder: list[type],
+    table_post_init: Callable[[Any], None] | None = None,
+) -> None:
+    """Adds outermost-`__init__` 0-row cache stub + `_apply` device propagation.
+
+    Args:
+        attrs: Class attributes of the TPU subclass, updated in place.
+        base: Upstream rotary class the TPU subclass derives from.
+        holder: One-element list filled with the TPU subclass after creation.
+        table_post_init: Runs after `base.__init__` when the instance keeps its
+            precomputed `cos_sin_cache` (`TPU_ROPE_IN_GRAPH=0` or a subclass).
+    """
+
+    def __init__(self: Any, *args: Any, **kwargs: Any) -> None:
+        use_tier1 = type(self) is holder[0] and envs.TPU_ROPE_IN_GRAPH
+        if use_tier1:
+            self._tpu_skip_cos_sin_cache_alloc = True
+        try:
+            base.__init__(self, *args, **kwargs)
+        finally:
+            self.__dict__.pop("_tpu_skip_cos_sin_cache_alloc", None)
+        if use_tier1:
+            rope_patch.install_tier1_in_graph_rope(
+                self, device=torch.get_default_device()
+            )
+        elif table_post_init is not None:
+            table_post_init(self)
+
+    def _compute_cos_sin_cache(self: Any) -> torch.Tensor:
+        if getattr(self, "_tpu_skip_cos_sin_cache_alloc", False):
+            return torch.empty((0, self.rotary_dim), dtype=torch.float32, device="cpu")
+        return base._compute_cos_sin_cache(self)
+
+    def _apply(self: Any, fn: Any, recurse: bool = True) -> Any:
+        res = base._apply(self, fn, recurse=recurse)
+        rope_patch.apply_in_graph_cache_transform(self, fn)
+        return res
+
+    attrs["__init__"] = __init__
+    attrs["_compute_cos_sin_cache"] = _compute_cos_sin_cache
+    attrs["_apply"] = _apply
+    attrs["get_cos_sin"] = _tier1_get_cos_sin
 
 
 def _make_tpu_rope_class(base: type[RotaryEmbedding]) -> type[RotaryEmbedding]:
@@ -261,35 +375,143 @@ def _make_tpu_rope_class(base: type[RotaryEmbedding]) -> type[RotaryEmbedding]:
         f"{base.__name__} defines its own forward_native; it needs its own TPU "
         "override instead of the shared RotaryEmbedding.forward_static replay."
     )
+    holder: list[type] = []
+    if base in TIER1_STATIC_ROPE_CLASSES:
+        attrs: dict[str, Any] = {
+            "__module__": __name__,
+            "__doc__": f"`{base.__name__}` in-graph & FP32 RoPE on TPU.",
+            "forward_native": _static_tier1_forward,
+            "forward_oot": _static_tier1_forward,
+            "forward_tpu": _static_tier1_forward,
+        }
+        _attach_tier1_lifecycle(
+            attrs, base, holder, table_post_init=_maybe_compact_neox_rope_cache
+        )
+    else:
 
-    def _tpu_rope_init(self: RotaryEmbedding, *args, **kwargs) -> None:
-        base.__init__(self, *args, **kwargs)
-        _maybe_compact_neox_rope_cache(self)
+        def _tpu_rope_init(self: RotaryEmbedding, *args: Any, **kwargs: Any) -> None:
+            base.__init__(self, *args, **kwargs)
+            _maybe_compact_neox_rope_cache(self)
 
-    tpu_cls = type(
-        f"Tpu{base.__name__}",
-        (base,),
-        {
+        attrs = {
             "__module__": __name__,
             "__doc__": (
-                f"``{base.__name__}`` rotating in FP32 (CUDA numerics), "
+                f"`{base.__name__}` rotating in FP32 (CUDA numerics), "
                 "stripping trailing identity NeoX cos/sin pairs."
             ),
             "__init__": _tpu_rope_init,
             "forward_native": _rotary_forward_fp32,
             "forward_oot": _rotary_forward_fp32,
             "forward_tpu": _rotary_forward_fp32,
-        },
-    )
+        }
+    tpu_cls = type(f"Tpu{base.__name__}", (base,), attrs)
+    holder.append(tpu_cls)
+    return CustomOp.register_oot(name=base.__name__)(tpu_cls)
+
+
+def _make_tpu_mrope_class(base: type[MRotaryEmbedding]) -> type[MRotaryEmbedding]:
+    holder: list[type] = []
+
+    if base is BailingMRotaryEmbedding:
+
+        def _mrope_forward(
+            self: Any,
+            positions: torch.Tensor,
+            query: torch.Tensor,
+            key: torch.Tensor | None = None,
+            offsets: torch.Tensor | None = None,
+        ) -> tuple[torch.Tensor, torch.Tensor | None]:
+            if getattr(self, "_in_graph_spec", None) is not None:
+                if key is None:
+                    raise ValueError("Bailing M-RoPE requires key states")
+                _validate_bailing_positions(positions)
+                return rope_patch._in_graph_spec_forward(
+                    self, positions, query, key, offsets=offsets
+                )
+            return BailingMRotaryEmbedding.forward_native(
+                self, positions, query, key, offsets
+            )
+
+    elif base is MRotaryEmbeddingInterleaved:
+
+        def _mrope_forward(
+            self: Any,
+            positions: torch.Tensor,
+            query: torch.Tensor,
+            key: torch.Tensor | None = None,
+            offsets: torch.Tensor | None = None,
+        ) -> tuple[torch.Tensor, torch.Tensor | None]:
+            if getattr(self, "_in_graph_spec", None) is not None:
+                return rope_patch._in_graph_spec_forward(
+                    self, positions, query, key, offsets=offsets
+                )
+            if offsets is not None:
+                positions = positions + offsets
+            return MRotaryEmbeddingInterleaved.forward(self, positions, query, key)
+
+    elif base is Ernie4_5_VLRotaryEmbedding:
+
+        def _mrope_forward(
+            self: Any,
+            positions: torch.Tensor,
+            query: torch.Tensor,
+            key: torch.Tensor | None = None,
+            offsets: torch.Tensor | None = None,
+        ) -> tuple[torch.Tensor, torch.Tensor | None]:
+            if getattr(self, "_in_graph_spec", None) is not None:
+                assert key is not None
+                return rope_patch._in_graph_spec_forward(
+                    self, positions, query, key, offsets=offsets
+                )
+            if offsets is not None:
+                positions = positions + offsets
+            return Ernie4_5_VLRotaryEmbedding.forward_native(
+                self, positions, query, key
+            )
+
+    else:
+
+        def _mrope_forward(
+            self: Any,
+            positions: torch.Tensor,
+            query: torch.Tensor,
+            key: torch.Tensor | None = None,
+            offsets: torch.Tensor | None = None,
+        ) -> tuple[torch.Tensor, torch.Tensor | None]:
+            if getattr(self, "_in_graph_spec", None) is not None:
+                assert key is not None
+                return rope_patch._in_graph_spec_forward(
+                    self, positions, query, key, offsets=offsets
+                )
+            return MRotaryEmbedding.forward_native(self, positions, query, key, offsets)
+
+    attrs: dict[str, Any] = {
+        "__module__": __name__,
+        "__doc__": f"`{base.__name__}` Tier-1 in-graph M-RoPE on TPU.",
+        "forward_native": _mrope_forward,
+        "forward_oot": _mrope_forward,
+        "forward_tpu": _mrope_forward,
+    }
+    if base is MRotaryEmbeddingInterleaved:
+        # MRotaryEmbeddingInterleaved overrides `forward` directly, bypassing
+        # CustomOp._forward_method.
+        attrs["forward"] = _mrope_forward
+    _attach_tier1_lifecycle(attrs, base, holder)
+    tpu_cls = type(f"Tpu{base.__name__}", (base,), attrs)
+    holder.append(tpu_cls)
     return CustomOp.register_oot(name=base.__name__)(tpu_cls)
 
 
 TPU_ROPE_CLASSES: dict[str, type[RotaryEmbedding]] = {
     base.__name__: _make_tpu_rope_class(base) for base in _STATIC_ROPE_CLASSES
 }
+TPU_MROPE_CLASSES: dict[str, type[MRotaryEmbedding]] = {
+    base.__name__: _make_tpu_mrope_class(base) for base in TIER1_MROPE_CLASSES
+}
 TpuRotaryEmbedding = TPU_ROPE_CLASSES["RotaryEmbedding"]
+TpuMRotaryEmbedding = TPU_MROPE_CLASSES[MRotaryEmbedding.__name__]
 
 logger.info(
-    "Registered FP32 rotary embedding for TPU: ApplyRotaryEmb, %s.",
-    ", ".join(TPU_ROPE_CLASSES),
+    "Registered TPU rotary embeddings: ApplyRotaryEmb, %s.",
+    ", ".join((*TPU_ROPE_CLASSES, *TPU_MROPE_CLASSES)),
 )
