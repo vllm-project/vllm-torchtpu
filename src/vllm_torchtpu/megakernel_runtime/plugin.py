@@ -27,7 +27,7 @@ Stdlib only at import (no torch / jax / vLLM).
 from __future__ import annotations
 
 import dataclasses
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Mapping
 from typing import Any, NamedTuple
 
 from vllm_torchtpu.megakernel.runtime.contract import (
@@ -87,16 +87,14 @@ SHORTHANDS: Mapping[str, Shorthand] = {
 }
 
 
-def _int_or_none(x: Any) -> int | None:
-    return int(x) if x is not None else None
-
-
 class RunnerView:
     """Read-only, named facts about the runner a program may use.
 
-    Each property reads one runner attribute; none runs a collective. The raw
-    vLLM `model` is passed through: a program may mutate it only after
-    agreement #1 (in `load`), and the stock forward must stay valid.
+    Each property reads attributes the TPU model runner always sets (as does
+    `testing.fake_runner`); none runs a collective, and a missing attribute
+    raises rather than falling back to a guess. The raw vLLM `model` is passed
+    through: a program may mutate it only after all TP ranks have agreed to
+    load the program (in `load`), and the stock forward must stay valid.
     """
 
     __slots__ = ("_runner", "_tp_rank")
@@ -107,33 +105,31 @@ class RunnerView:
 
     @property
     def vllm_config(self) -> Any:
-        return getattr(self._runner, "vllm_config", None)
+        return self._runner.vllm_config
 
     @property
     def model(self) -> Any:
-        return getattr(self._runner, "model", None)
+        return self._runner.model
 
     @property
     def device(self) -> Any:
-        return getattr(self._runner, "device", None)
+        return self._runner.device
 
     @property
     def hf_config(self) -> Any:
-        r = self._runner
-        model_cfg = getattr(r, "model_config", None) or getattr(
-            getattr(r, "vllm_config", None), "model_config", None
-        )
-        return getattr(model_cfg, "hf_config", None) if model_cfg is not None else None
+        return self._runner.model_config.hf_config
 
     @property
     def tp_size(self) -> int:
-        p_cfg = getattr(self._runner, "parallel_config", None)
-        tp_size = int(getattr(p_cfg, "tensor_parallel_size", 0) or 0)
-        if tp_size > 0:
-            return tp_size
-        mesh = getattr(self._runner, "mesh", None)
-        devs = getattr(mesh, "devices", None) if mesh is not None else None
-        return int(devs.size) if devs is not None else 0
+        """`parallel_config.tensor_parallel_size` (the runner's own mesh may
+        hold fewer devices than the TP group)."""
+        tp_size = getattr(self._runner.parallel_config, "tensor_parallel_size", None)
+        if not isinstance(tp_size, int) or isinstance(tp_size, bool) or tp_size <= 0:
+            raise RuntimeError(
+                "RunnerView.tp_size: runner.parallel_config.tensor_parallel_size "
+                f"is {tp_size!r}; expected a positive int"
+            )
+        return tp_size
 
     @property
     def tp_rank(self) -> int:
@@ -144,62 +140,59 @@ class RunnerView:
         return int(get_tensor_model_parallel_rank())
 
     @property
-    def speculative_tokens(self) -> int | None:
-        """`num_speculative_tokens` (0 without a draft); `None` if unknown."""
-        if not hasattr(self._runner, "speculative_config"):
-            return None
-        spec_cfg = getattr(self._runner, "speculative_config", None)
-        return int(getattr(spec_cfg, "num_speculative_tokens", 0) or 0)
+    def speculative_tokens(self) -> int:
+        """`num_speculative_tokens` (0 without a draft)."""
+        spec_cfg = self._runner.speculative_config
+        return int(spec_cfg.num_speculative_tokens) if spec_cfg is not None else 0
 
     @property
-    def cache_block_size(self) -> int | None:
-        r = self._runner
-        for cfg in (
-            getattr(getattr(r, "vllm_config", None), "cache_config", None),
-            getattr(r, "cache_config", None),
-        ):
-            bs = getattr(cfg, "block_size", None)
-            if bs:
-                return int(bs)
-        return None
+    def cache_block_size(self) -> int:
+        """`cache_config.block_size`: the KV / state cache block size (the
+        attention kernel's page size can differ; see `max_pages_per_seq`)."""
+        return int(self._runner.cache_config.block_size)
 
     @property
     def token_paddings(self) -> tuple[int, ...]:
-        return tuple(int(x) for x in getattr(self._runner, "num_tokens_paddings", ()))
+        return tuple(int(x) for x in self._runner.num_tokens_paddings)
 
     @property
     def req_block_pairs(self) -> tuple[tuple[int, int], ...]:
-        """`(max reqs, blocks per req)` per attention-kernel shape class."""
-        return tuple(_req_block_pairs(self._runner))
+        """`(max reqs, blocks per req)` per attention-kernel shape class: the
+        max-model-len class, then the most-model-len class if the runner has
+        one and it differs."""
+        shapes = self._runner._attention_kernel_shapes
+        r_max, b_max, _ = shapes(True)
+        pairs = [(int(r_max), int(b_max))]
+        if self._runner.most_model_len is not None:
+            r_most, b_most, _ = shapes(False)
+            if (int(r_most), int(b_most)) not in pairs:
+                pairs.append((int(r_most), int(b_most)))
+        return tuple(pairs)
 
     @property
     def ckpt_window(self) -> int:
-        spec_cfg = getattr(self._runner, "speculative_config", None)
-        k_spec = int(spec_cfg.num_speculative_tokens) if spec_cfg is not None else 0
-        return max(1, int(getattr(self._runner, "_mamba_ckpt_window", k_spec + 1)))
+        return max(1, int(self._runner._mamba_ckpt_window))
 
     @property
     def mamba_slot_read_offsets(self) -> Any:
-        return getattr(self._runner, "mamba_slot_read_offsets", None)
+        return self._runner.mamba_slot_read_offsets
 
     @property
     def uses_mrope(self) -> bool:
-        return bool(getattr(self._runner, "uses_mrope", False))
+        return bool(self._runner.uses_mrope)
 
     @property
     def enforce_eager(self) -> bool:
-        return bool(getattr(self._runner, "enforce_eager", False))
+        return bool(self._runner.enforce_eager)
 
     @property
     def unified_kv_layout(self) -> bool:
-        return bool(getattr(self._runner, "_unified_kv_layout", False))
+        return bool(self._runner._unified_kv_layout)
 
     @property
     def max_pages_per_seq(self) -> int:
-        attn_shapes_fn = getattr(self._runner, "_attention_kernel_shapes", None)
-        if callable(attn_shapes_fn):
-            return int(attn_shapes_fn(True)[1])
-        return int(getattr(self._runner, "max_num_blocks_per_req", 2))
+        """Pages per sequence the attention kernel's max-model-len shape uses."""
+        return int(self._runner._attention_kernel_shapes(True)[1])
 
     @property
     def device_kind(self) -> str:
@@ -213,31 +206,6 @@ class RunnerView:
         import jax
 
         return str(getattr(jax.local_devices()[0], "device_kind", "") or "")
-
-
-def _req_block_pairs(runner: Any) -> Iterator[tuple[int, int]]:
-    pairs: list[tuple[int, int]] = []
-    if runner is None:
-        return iter(pairs)
-    attn_shapes_fn = getattr(runner, "_attention_kernel_shapes", None)
-    if callable(attn_shapes_fn):
-        r_max, b_max, _ = attn_shapes_fn(True)
-        pairs.append((int(r_max), int(b_max)))
-        if getattr(runner, "most_model_len", None) is not None:
-            r_most, b_most, _ = attn_shapes_fn(False)
-            if (int(r_most), int(b_most)) not in pairs:
-                pairs.append((int(r_most), int(b_most)))
-        return iter(pairs)
-    r_max = _int_or_none(getattr(runner, "num_reqs_max_model_len", None))
-    b_max = _int_or_none(getattr(runner, "max_num_blocks_per_req", None))
-    if r_max is not None and b_max is not None:
-        pairs.append((r_max, b_max))
-    if getattr(runner, "most_model_len", None) is not None:
-        r_most = _int_or_none(getattr(runner, "num_reqs_most_model_len", None))
-        b_most = _int_or_none(getattr(runner, "num_blocks_per_most_len_req", None))
-        if r_most is not None and b_most is not None and (r_most, b_most) not in pairs:
-            pairs.append((r_most, b_most))
-    return iter(pairs)
 
 
 @dataclasses.dataclass(slots=True)

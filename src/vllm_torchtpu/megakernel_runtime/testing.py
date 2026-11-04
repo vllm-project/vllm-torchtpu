@@ -13,9 +13,10 @@
 # limitations under the License.
 """Test helpers for megakernel plugins: a CPU stand-in for `TPUModelRunner`.
 
-`fake_runner(...)` carries every attribute `RunnerView` and the runtime's
+`fake_runner(...)` sets every attribute `RunnerView` and the runtime's
 startup checks read, with serving-like defaults (TP=1, no draft, no
 connectors), so a plugin's `create` / `bind` / `decide` can run on CPU.
+`RunnerView` reads them directly: a runner stand-in must set them all.
 """
 
 from __future__ import annotations
@@ -110,6 +111,13 @@ def fake_runner(
         _attention_kernel_shapes=attention_kernel_shapes,
         most_model_len=None if len(pairs) == 1 else 1,
         mamba_slot_read_offsets=mamba_slot_read_offsets,
+        # As TPUModelRunner: the draft's tokens + 1 with the unified KV
+        # layout, else 1.
+        _mamba_ckpt_window=int(
+            ckpt_window
+            if ckpt_window is not None
+            else (int(speculative_tokens) + 1 if unified_kv_layout else 1)
+        ),
         uses_mrope=bool(uses_mrope),
         enforce_eager=bool(enforce_eager),
         _unified_kv_layout=bool(unified_kv_layout),
@@ -122,8 +130,6 @@ def fake_runner(
         _dp_lockstep_enabled=lambda: False,
         _megakernel=None,
     )
-    if ckpt_window is not None:
-        runner._mamba_ckpt_window = int(ckpt_window)
     for k, v in extra.items():
         setattr(runner, k, v)
     return runner

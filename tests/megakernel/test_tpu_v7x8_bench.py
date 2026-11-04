@@ -1092,6 +1092,7 @@ def _assert_driver_created_from_real_qwen35_config(mesh: Mesh, g: Any) -> None:
     import unittest.mock as mock
 
     from vllm_torchtpu.megakernel_runtime import driver as driver_mod
+    from vllm_torchtpu.megakernel_runtime import testing
     from vllm_torchtpu.models.qwen3_5.megakernel.adapter import Qwen35Program
 
     frozen_cfg = load_frozen_qwen35_config_json()
@@ -1107,29 +1108,13 @@ def _assert_driver_created_from_real_qwen35_config(mesh: Mesh, g: Any) -> None:
     model = types.SimpleNamespace(model=backbone)
     fake_dist = types.SimpleNamespace(get_tensor_model_parallel_rank=lambda: 0)
     for hf_cfg in (frozen_cfg, dict_to_namespace(frozen_cfg)):
-        mc = types.SimpleNamespace(hf_config=hf_cfg)
-        runner = types.SimpleNamespace(
+        runner = testing.fake_runner(
             model=model,
-            model_config=mc,
+            hf_config=hf_cfg,
             mesh=mesh,
-            _unified_kv_layout=True,
-            supports_mm_inputs=False,
-            lora_config=None,
-            _pp_is_first=True,
-            _pp_is_last=True,
-            _pcp_enabled=False,
-            _dcp_enabled=False,
-            parallel_config=types.SimpleNamespace(
-                tensor_parallel_size=8,
-                prefill_context_parallel_size=1,
-                decode_context_parallel_size=1,
-            ),
-            _dp_lockstep_enabled=lambda: False,
-            speculative_config=None,
-            vllm_config=types.SimpleNamespace(
-                model_config=mc,
-                additional_config={"megakernel": {"enabled": True}},
-            ),
+            tp_size=8,
+            mamba_ssm_cache_dtype="bfloat16",
+            megakernel={"enabled": True},
         )
         with (
             mock.patch.dict(sys.modules, {"vllm.distributed": fake_dist}),

@@ -57,6 +57,7 @@ from vllm_torchtpu.megakernel.runtime import (
     resolve_step_positions,
     select_bucket,
 )
+from vllm_torchtpu.megakernel_runtime import testing  # noqa: E402
 from vllm_torchtpu.megakernel_runtime.config import (  # noqa: E402
     collect_config,
     resolve_plugin_ref,
@@ -99,6 +100,13 @@ from vllm_torchtpu.models.qwen3_5.megakernel.tests.tiny import (
 )
 
 _REAL_FRAMEWORK_SLOT_FACTS = Qwen35Program._framework_slot_facts
+
+
+def _bind_runner(model: Any, **kw: Any) -> Any:
+    """A fake runner for `bind`: no token paddings, 2 pages per sequence."""
+    return testing.fake_runner(
+        model=model, token_paddings=(), max_pages_per_seq=2, **kw
+    )
 
 
 def _qwen_driver(
@@ -526,7 +534,11 @@ def test_bucket_parsing_and_selection() -> None:
     fake_runner = SimpleNamespace(
         vllm_config=SimpleNamespace(
             additional_config={
-                "megakernel": {"mode": "tp", "buckets": [16, 32], "ab": True}
+                "megakernel": {
+                    "mode": "tp",
+                    "buckets": [16, 32],
+                    "ab": True,
+                }
             }
         )
     )
@@ -1322,12 +1334,12 @@ def test_bind_caches_rejects_compact_mamba_and_non_aliasing_la_cache() -> None:
         verify_buckets=(),
     )
 
-    runner_compact = SimpleNamespace(model=model, _unified_kv_layout=False)
+    runner_compact = _bind_runner(model, unified_kv_layout=False)
     with pytest.raises(ValueError, match="_unified_kv_layout must be True"):
         driver.bind(runner_compact)
 
     backbone.layers[0].linear_attn.kv_cache = []
-    runner_ok = SimpleNamespace(model=model, _unified_kv_layout=True)
+    runner_ok = _bind_runner(model)
     with pytest.raises(ValueError, match="must alias pool"):
         driver.bind(runner_ok)
 
@@ -1346,9 +1358,7 @@ def test_bind_caches_rejects_compact_mamba_and_non_aliasing_la_cache() -> None:
     sliced_pool = raw_pools_t[0][1:]
     assert sliced_pool.storage_offset() > 0
     backbone.layers[3].self_attn.attn.kv_cache = [sliced_pool]
-    runner_fallback = SimpleNamespace(
-        model=model, _unified_kv_layout=True, _megakernel=driver
-    )
+    runner_fallback = _bind_runner(model, _megakernel=driver)
     driver.bind_and_warmup(runner_fallback)
     assert not driver._bound
     declined = runner_fallback._megakernel
@@ -1530,7 +1540,7 @@ def test_bind_caches_fails_closed_on_pool_slot_layout_mismatch(
         monkeypatch.setattr(
             driver.program, "_framework_slot_facts", lambda *_a, _f=fw: _f
         )
-        runner = SimpleNamespace(model=model, _unified_kv_layout=True, _megakernel=0)
+        runner = _bind_runner(model, _megakernel=0)
         with pytest.raises(LayoutDecline) as exc_info:
             driver.bind(runner)
         assert exc_info.value.result.code == code
@@ -1540,14 +1550,14 @@ def test_bind_caches_fails_closed_on_pool_slot_layout_mismatch(
         assert runner._megakernel.decline.code == code
         assert "megakernel=" in runner._megakernel.decline.message
 
-    # Without the framework's layout objects (no cache_config.block_size), the
-    # real framework-side derivation can't run: that declines too.
+    # Without the framework's cache block size, the real framework-side
+    # derivation can't run: that declines too.
     monkeypatch.setattr(
         driver.program,
         "_framework_slot_facts",
         _REAL_FRAMEWORK_SLOT_FACTS.__get__(driver.program),
     )
-    runner = SimpleNamespace(model=model, _unified_kv_layout=True)
+    runner = _bind_runner(model, cache_config=SimpleNamespace(block_size=None))
     with pytest.raises(LayoutDecline) as exc_info:
         driver.bind(runner)
     assert exc_info.value.result.code == "pool_layout_unknown"
@@ -1616,7 +1626,7 @@ def test_bind_caches_adopts_an_fp32_conv_framework_pool(
     fw = dataclasses.replace(bf16, conv_dtype="float32", conv_bytes=2 * bf16.conv_bytes)
     monkeypatch.setattr(driver, "_framework_slot_facts", lambda *_a: fw)
     monkeypatch.setattr(driver, "build", lambda _b: (lambda *_a: None))
-    drv.bind(SimpleNamespace(model=model, _unified_kv_layout=True))
+    drv.bind(_bind_runner(model))
     assert drv._bound and drv.pool_layout_facts == fw
     lay = driver.spec.cache_backend.layout
     assert lay == dataclasses.replace(
@@ -1657,7 +1667,7 @@ def test_bind_caches_budget_overflow_is_config_error() -> None:
         buckets=(2,),
         verify_buckets=(),
     )
-    runner = SimpleNamespace(model=model, _unified_kv_layout=True, _megakernel=driver)
+    runner = _bind_runner(model, _megakernel=driver)
     with pytest.raises(MegakernelConfigError, match="VMEM"):
         driver.bind_and_warmup(runner)
     assert runner._megakernel is driver
@@ -1741,26 +1751,12 @@ def test_maybe_create_disables_on_unsupported_tpu_chip(
     v5_mesh = SimpleNamespace(
         devices=np.array([_UnsupportedTPUDevice() for _ in range(8)], dtype=object)
     )
-    runner = SimpleNamespace(
+    runner = testing.fake_runner(
         model=model,
-        model_config=model_cfg,
+        hf_config=model_cfg.hf_config,
         mesh=v5_mesh,
-        _unified_kv_layout=True,
-        supports_mm_inputs=False,
-        lora_config=None,
-        _pp_is_first=True,
-        _pp_is_last=True,
-        _pcp_enabled=False,
-        _dcp_enabled=False,
-        parallel_config=SimpleNamespace(
-            tensor_parallel_size=8,
-            prefill_context_parallel_size=1,
-            decode_context_parallel_size=1,
-        ),
-        _dp_lockstep_enabled=lambda: False,
-        vllm_config=SimpleNamespace(
-            model_config=model_cfg, additional_config={"megakernel": True}
-        ),
+        tp_size=8,
+        megakernel=True,
     )
     fake_vllm_dist = SimpleNamespace(get_tensor_model_parallel_rank=lambda: 0)
     monkeypatch.setitem(sys.modules, "vllm.distributed", fake_vllm_dist)
@@ -1782,9 +1778,8 @@ def test_maybe_create_disables_on_unsupported_tpu_chip(
     assert "supports chips ('TPU7x',), not 'TPU v5 lite'" in caplog.text
 
     # No template serves an unresolvable arch: maybe_create returns None.
-    unresolvable_runner = SimpleNamespace(
-        model=SimpleNamespace(model=SimpleNamespace(layers=[])),
-        vllm_config=SimpleNamespace(additional_config={"megakernel": True}),
+    unresolvable_runner = testing.fake_runner(
+        model=SimpleNamespace(model=SimpleNamespace(layers=[])), megakernel=True
     )
     assert driver_mod.ProgramDriver.maybe_create(unresolvable_runner) is None
     with pytest.raises(ValueError, match="Cannot locate decoder backbone"):
@@ -1825,28 +1820,13 @@ def test_maybe_create_declines_without_usable_pallas_mesh(
         }
     )
     model_cfg = SimpleNamespace(hf_config=hf_cfg)
-    runner = SimpleNamespace(
+    runner = testing.fake_runner(
         model=SimpleNamespace(model=backbone),
-        model_config=model_cfg,
+        hf_config=model_cfg.hf_config,
         mesh=_cpu_mesh(8),
-        _unified_kv_layout=True,
-        supports_mm_inputs=False,
-        lora_config=None,
-        _pp_is_first=True,
-        _pp_is_last=True,
-        _pcp_enabled=False,
-        _dcp_enabled=False,
-        parallel_config=SimpleNamespace(
-            tensor_parallel_size=8,
-            prefill_context_parallel_size=1,
-            decode_context_parallel_size=1,
-        ),
-        cache_config=SimpleNamespace(mamba_ssm_cache_dtype="bfloat16"),
-        _dp_lockstep_enabled=lambda: False,
-        vllm_config=SimpleNamespace(
-            model_config=model_cfg,
-            additional_config={"megakernel": {"stats_period_s": 0}},
-        ),
+        tp_size=8,
+        mamba_ssm_cache_dtype="bfloat16",
+        megakernel={"stats_period_s": 0},
     )
     fake_vllm_dist = SimpleNamespace(get_tensor_model_parallel_rank=lambda: 0)
     monkeypatch.setitem(sys.modules, "vllm.distributed", fake_vllm_dist)
@@ -1897,29 +1877,15 @@ def test_maybe_create_declines_data_parallel_before_any_collective(
         }
     )
     model_cfg = SimpleNamespace(hf_config=hf_cfg)
-    runner = SimpleNamespace(
+    runner = testing.fake_runner(
         model=SimpleNamespace(model=backbone),
-        model_config=model_cfg,
+        hf_config=model_cfg.hf_config,
         mesh=_cpu_mesh(8),
-        _unified_kv_layout=True,
-        supports_mm_inputs=False,
-        lora_config=None,
-        _pp_is_first=True,
-        _pp_is_last=True,
-        _pcp_enabled=False,
-        _dcp_enabled=False,
-        parallel_config=SimpleNamespace(
-            tensor_parallel_size=8,
-            data_parallel_size=2 if why == "dp_size" else 1,
-            prefill_context_parallel_size=1,
-            decode_context_parallel_size=1,
-        ),
-        cache_config=SimpleNamespace(mamba_ssm_cache_dtype="bfloat16"),
-        _dp_lockstep_enabled=lambda: False,
-        vllm_config=SimpleNamespace(
-            model_config=model_cfg, additional_config={"megakernel": True}
-        ),
+        tp_size=8,
+        mamba_ssm_cache_dtype="bfloat16",
+        megakernel=True,
     )
+    runner.parallel_config.data_parallel_size = 2 if why == "dp_size" else 1
     if why == "dp_env":
         monkeypatch.setenv("TORCH_TPU_DP_SIZE", "4")
     else:
@@ -2010,17 +1976,13 @@ def test_maybe_create_uses_model_default_profile_and_disables_empty_buckets(
         model_default=True,
     )
     register_profile(custom_default, replace=True)
-    runner = SimpleNamespace(
+    runner = testing.fake_runner(
         model=model,
-        model_config=model_cfg,
+        hf_config=model_cfg.hf_config,
         mesh=mesh8,
-        _unified_kv_layout=True,
-        speculative_config=None,
-        cache_config=SimpleNamespace(mamba_ssm_cache_dtype="bfloat16"),
-        vllm_config=SimpleNamespace(
-            model_config=model_cfg,
-            additional_config={"megakernel": {"enabled": True}},
-        ),
+        tp_size=8,
+        mamba_ssm_cache_dtype="bfloat16",
+        megakernel={"enabled": True},
     )
     drv = driver_mod.maybe_create(runner)
     assert isinstance(drv, driver_mod.ProgramDriver)
@@ -2032,17 +1994,13 @@ def test_maybe_create_uses_model_default_profile_and_disables_empty_buckets(
     assert prog.verify_buckets == ()
 
     # 2. Explicit `buckets=0` on a non-speculative runner disables gracefully at INFO.
-    runner_off = SimpleNamespace(
+    runner_off = testing.fake_runner(
         model=model,
-        model_config=model_cfg,
+        hf_config=model_cfg.hf_config,
         mesh=mesh8,
-        _unified_kv_layout=True,
-        speculative_config=None,
-        cache_config=SimpleNamespace(mamba_ssm_cache_dtype="bfloat16"),
-        vllm_config=SimpleNamespace(
-            model_config=model_cfg,
-            additional_config={"megakernel": {"enabled": True, "buckets": []}},
-        ),
+        tp_size=8,
+        mamba_ssm_cache_dtype="bfloat16",
+        megakernel={"enabled": True, "buckets": []},
     )
     caplog.clear()
     with caplog.at_level(logging.INFO):
@@ -2070,6 +2028,7 @@ def test_maybe_create_uses_model_default_profile_and_disables_empty_buckets(
     register_profile(custom_default, replace=True)
     mesh4 = _cpu_mesh(4)
     runner.mesh = mesh4
+    runner.parallel_config.tensor_parallel_size = 4
     monkeypatch.setattr(driver_mod, "_build_tp_rank_mesh", lambda *_a, **_k: mesh4)
     caplog.clear()
     with caplog.at_level(logging.WARNING):
@@ -2171,23 +2130,11 @@ def test_can_run_real_tpu_runner_metadata(monkeypatch: pytest.MonkeyPatch) -> No
     qsl_np = np.zeros(130, dtype=np.int32)
     req_dist_cpu = torch.zeros(3, dtype=torch.int32)
     comb_dist_cpu = torch.zeros(6, dtype=torch.int32)
-    runner = SimpleNamespace(
+    runner = testing.fake_runner(
         model=model,
         mesh=mesh,
-        max_num_blocks_per_req=2,
-        num_tokens_paddings=[2, 4, 8],
-        _unified_kv_layout=True,
-        supports_mm_inputs=False,
-        lora_config=None,
-        _pp_is_first=True,
-        _pp_is_last=True,
-        _pcp_enabled=False,
-        _dcp_enabled=False,
-        parallel_config=SimpleNamespace(
-            prefill_context_parallel_size=1,
-            decode_context_parallel_size=1,
-        ),
-        _dp_lockstep_enabled=lambda: False,
+        max_pages_per_seq=2,
+        token_paddings=(2, 4, 8),
         _attn_metadata_builder_ctx=SimpleNamespace(num_reqs=2),
         _request_distribution_cpu=req_dist_cpu,
         _combined_request_distribution_cpu=comb_dist_cpu,
@@ -2459,19 +2406,13 @@ def test_megakernel_driver_e2e_decode_verify_and_spec_accept(
     req_dist_cpu = torch.zeros(3, dtype=torch.int32)
     comb_dist_cpu = torch.zeros(6, dtype=torch.int32)
     roff_slot_buf = torch.zeros((32,), dtype=torch.int32)
-    runner = SimpleNamespace(
+    runner = testing.fake_runner(
         model=model,
         mesh=mesh,
-        max_num_blocks_per_req=2,
-        num_reqs_max_model_len=4,
-        num_tokens_paddings=[2, 4, 8],
-        speculative_config=SimpleNamespace(num_speculative_tokens=3),
-        _mamba_ckpt_window=4,
-        _unified_kv_layout=True,
-        lora_config=None,
-        _pp_is_first=True,
-        _pp_is_last=True,
-        _dp_lockstep_enabled=lambda: False,
+        req_block_pairs=((4, 2),),
+        token_paddings=(2, 4, 8),
+        speculative_tokens=3,
+        ckpt_window=4,
         _in_dummy_run=False,
         _attn_metadata_builder_ctx=SimpleNamespace(num_reqs=2),
         _request_distribution_cpu=req_dist_cpu,
@@ -3105,7 +3046,7 @@ def test_driver_inspect_step_detail_differential_and_unprepared_call(
         buckets=(2,),
         verify_buckets=(),
     )
-    driver.bind(SimpleNamespace(model=model, _unified_kv_layout=True))
+    driver.bind(_bind_runner(model))
     attn_md_call = SimpleNamespace(
         block_tables=torch.zeros((4,), dtype=torch.int32),
         seq_lens=torch.ones((2,), dtype=torch.int32),

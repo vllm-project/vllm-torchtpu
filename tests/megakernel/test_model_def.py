@@ -1261,15 +1261,13 @@ def test_qwen35_model_def_line_budget_docstrings_and_runtime_registry(
         return obj
 
     def _make_runner(hf_cfg: Any) -> Any:
-        mc = types.SimpleNamespace(hf_config=hf_cfg)
-        vc = types.SimpleNamespace(
-            model_config=mc,
-            parallel_config=types.SimpleNamespace(tensor_parallel_size=8),
-            cache_config=types.SimpleNamespace(mamba_ssm_cache_dtype="bfloat16"),
-            additional_config={"megakernel": {"enabled": True}},
-        )
-        return types.SimpleNamespace(
-            model_config=mc, parallel_config=vc.parallel_config, vllm_config=vc
+        from vllm_torchtpu.megakernel_runtime import testing
+
+        return testing.fake_runner(
+            hf_config=hf_cfg,
+            tp_size=8,
+            mamba_ssm_cache_dtype="bfloat16",
+            megakernel={"enabled": True},
         )
 
     # 1) Realistic nested VLM config with nested rope_parameters succeeds (both dict
