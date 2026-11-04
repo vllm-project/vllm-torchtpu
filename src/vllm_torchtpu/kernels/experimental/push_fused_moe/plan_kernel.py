@@ -226,7 +226,7 @@ def _build(ep, g, n_pre, tile_m, interpret):
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=1,
             in_specs=[vmem, vmem],
-            out_specs=[vmem] * 8,
+            out_specs=[vmem] * N_TABLE_OUTS,
             grid=(),
         ),
         out_shape=_table_out_shapes(ep, g),
@@ -254,18 +254,26 @@ def build_push_tables(rows_by_dest, seg_start_local, me, *, ep, n_pre, tile_m,
         ((0, 0), (0, 0), (0, LANES - g)),
     )
     me_arr = jnp.asarray(me, jnp.int32).reshape(1)
-    seg, small, *kt, counts = _build(ep, g, int(n_pre), int(tile_m), bool(interpret))(
+    outs = _build(ep, g, int(n_pre), int(tile_m), bool(interpret))(
         me_arr, r3, _seg3(seg_start_local, ep, g)
     )
-    return _unpack_tables(seg, small, kt, counts, g)
+    return _unpack_tables(outs)
+
+
+def _small_sizes(g):
+    """Lengths of (meta, visit, pre-push counts, expert rows, slab base)."""
+    return (2 * g + 3, g, 8, g, g)
+
+
+N_TABLE_OUTS = 1 + 5 + 5 + 1
 
 
 def _store_tables(t, outs, *, ep, g):
-    seg_o, small_o, kt_o, counts_o = outs[0], outs[1], outs[2:7], outs[7]
+    seg_o, small_o, kt_o, counts_o = outs[0], outs[1:6], outs[6:11], outs[11]
     for k, part in enumerate(t["seg"]):
         seg_o[k] = part[:g, :ep]
-    for k, part in enumerate(t["small"]):
-        small_o[k : k + 1, :] = part
+    for o, part, n in zip(small_o, t["small"], _small_sizes(g)):
+        o[...] = part[0, :n]
     for o, part in zip(kt_o, t["kernel_tables"]):
         o[...] = part[:g, :ep]
     counts_o[...] = t["counts"][:8, :ep]
@@ -275,22 +283,23 @@ def _table_out_shapes(ep, g):
     i32 = jnp.int32
     return (
         jax.ShapeDtypeStruct((3, g, ep), i32),
-        jax.ShapeDtypeStruct((8, LANES), i32),
+        *(jax.ShapeDtypeStruct((n,), i32) for n in _small_sizes(g)),
         *(jax.ShapeDtypeStruct((g, ep), i32) for _ in range(5)),
         jax.ShapeDtypeStruct((8, ep), i32),
     )
 
 
-def _unpack_tables(seg, small, kt, counts, g):
+def _unpack_tables(outs):
+    seg, meta, visit, counts_sc, expert_rows, slab_base = outs[:6]
     return (
         seg.reshape(-1),
-        small[0, : 2 * g + 3],
-        small[1, :g],
-        small[2, :8],
-        tuple(kt),
-        small[3, :g],
-        small[4, :g],
-        counts,
+        meta,
+        visit,
+        counts_sc,
+        tuple(outs[6:11]),
+        expert_rows,
+        slab_base,
+        outs[11],
     )
 
 
@@ -308,7 +317,8 @@ def _build_exchange_rows_tables(ep, width, n_rows, count_at, g, n_pre, tile_m):
     n_cnt = r_hi - r_lo + 1
 
     def kernel(rank_sm, idx_sm, x_hbm, src_hbm, seg3_vm, out_hbm, dst_hbm, *rest):
-        outs, (send_sem, recv_sem, lsem, gsem, csem, cnt_vm, r3_vm) = rest[:8], rest[8:]
+        outs = rest[:N_TABLE_OUTS]
+        send_sem, recv_sem, lsem, gsem, csem, cnt_vm, r3_vm = rest[N_TABLE_OUTS:]
         me = rank_sm[0]
 
         def copy_rows():
@@ -348,12 +358,12 @@ def _build_exchange_rows_tables(ep, width, n_rows, count_at, g, n_pre, tile_m):
         idx = idx.astype(jnp.int32).reshape(-1)
         r, slab = tx._payload(packed, rank, width)
         vmem = pl.BlockSpec(memory_space=pltpu.MemorySpace.VMEM)
-        out, gathered, seg, small, *kt, counts = pl.pallas_call(
+        out, gathered, *tables = pl.pallas_call(
             kernel,
             grid_spec=pltpu.PrefetchScalarGridSpec(
                 num_scalar_prefetch=2,
                 in_specs=[tx._HBM, tx._HBM, vmem],
-                out_specs=(tx._HBM, tx._HBM) + (vmem,) * 8,
+                out_specs=(tx._HBM, tx._HBM) + (vmem,) * N_TABLE_OUTS,
                 scratch_shapes=(pltpu.SemaphoreType.DMA,) * 5
                 + (
                     pltpu.VMEM((ep, n_cnt, LANES), jnp.int32),
@@ -369,9 +379,7 @@ def _build_exchange_rows_tables(ep, width, n_rows, count_at, g, n_pre, tile_m):
             compiler_params=tx._compiler_params(),
             name=f"moe_tc_routing_exchange_ep{ep}_w{width}_rows{n_rows}_tables",
         )(r, idx, slab, rows, _seg3(seg_start_local, ep, g))
-        return (tx._unpad(out, ep, width), gathered) + _unpack_tables(
-            seg, small, kt, counts, g
-        )
+        return (tx._unpad(out, ep, width), gathered) + _unpack_tables(tables)
 
     return fn
 
