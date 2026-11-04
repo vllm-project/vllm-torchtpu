@@ -14,6 +14,7 @@
 from vllm.model_executor.models.config import VerifyAndUpdateConfig
 
 from vllm_torchtpu.gqa_head_padding import update_gqa_head_padding_config
+from vllm_torchtpu.models import minimax_m3
 
 _KIMI_MODEL = "vllm_torchtpu.models.vllm.kimi_k3:KimiLinearForCausalLM"
 _KIMI_K3_MODEL = "vllm_torchtpu.models.vllm.kimi_k3:KimiK3ForConditionalGeneration"
@@ -64,3 +65,4 @@ def register_models() -> None:
     MODELS_CONFIG_MAP["Qwen4ExpForCausalLM"] = TPUQwen4ExpConfig
     MODELS_CONFIG_MAP["Qwen4ExpForConditionalGeneration"] = TPUQwen4ExpConfig
     MODELS_CONFIG_MAP["Qwen2ForCausalLM"] = _TPUQwen2Config
+    minimax_m3.register()
