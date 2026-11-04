@@ -1,3 +1,4 @@
+import functools
 from collections.abc import Callable
 from threading import Lock
 
@@ -15,6 +16,13 @@ from vllm_torchtpu.kernels.quantized_matmul.buffered import (
 )
 from vllm_torchtpu.kernels.quantized_matmul.buffered import (
     is_supported as is_buffered_matmul_supported,
+)
+from vllm_torchtpu.kernels.quantized_matmul.shared_expert import (
+    fused_shared_expert,
+    silu_and_mul_with_clamp,
+)
+from vllm_torchtpu.kernels.quantized_matmul.shared_expert import (
+    is_supported as is_fused_shared_expert_supported,
 )
 from vllm_torchtpu.kernels.quantized_matmul.util import xla_quantized_matmul
 
@@ -221,6 +229,63 @@ def quantized_matmul_fp4(
     x_2d = x.reshape(-1, x.shape[-1])
     out_2d = _get_quantized_matmul_fp4_op()(x_2d, w_q, w_s)
     return out_2d.reshape(orig_out_shape)
+
+
+def _fp8_swiglu_mlp_jax(
+    x: jax.Array,
+    w13: jax.Array,
+    s13: jax.Array,
+    w2: jax.Array,
+    s2: jax.Array,
+    *,
+    limit: float,
+) -> jax.Array:
+    """``down(silu_and_mul_with_clamp(gate_up(x)))``; one kernel when qualified.
+
+    The token count is concrete only during JAX lowering, so the shape
+    dispatch lives here; other shapes run the same ops unfused.
+    """
+    if is_fused_shared_expert_supported(x, w13, s13, w2, s2):
+        return fused_shared_expert(x, w13, s13, w2, s2, limit=limit)
+    gate, up = jnp.split(_quantized_matmul_jax(x, w13, s13), 2, axis=-1)
+    return _quantized_matmul_jax(silu_and_mul_with_clamp(gate, up, limit), w2, s2)
+
+
+_fp8_swiglu_mlp_ops: dict[float, Callable] = {}
+_fp8_swiglu_mlp_ops_lock = Lock()
+
+
+def _get_fp8_swiglu_mlp_op(limit: float) -> Callable:
+    with _fp8_swiglu_mlp_ops_lock:
+        if limit not in _fp8_swiglu_mlp_ops:
+            tag = f"{limit:g}".replace(".", "p").replace("-", "m")
+            op = pallas.jax_op(
+                f"pallas::fp8_swiglu_mlp_limit_{tag}",
+                functools.partial(_fp8_swiglu_mlp_jax, limit=limit),
+            )
+            op.register_fake(
+                lambda x, w13, s13, w2, s2: x.new_empty((x.shape[0], w2.shape[1]))
+            )
+            _fp8_swiglu_mlp_ops[limit] = op
+        return _fp8_swiglu_mlp_ops[limit]
+
+
+def fp8_swiglu_mlp(
+    x: torch.Tensor,
+    w13: torch.Tensor,
+    s13: torch.Tensor,
+    w2: torch.Tensor,
+    s2: torch.Tensor,
+    limit: float,
+) -> torch.Tensor:
+    """Torch entry for a per-channel FP8 SwiGLU MLP with clamped activation.
+
+    Weights are the canonical (k, n) layout with 1-D per-output-channel
+    scales; `w13` holds the gate columns, then the up columns.
+    """
+    x_2d = x.reshape(-1, x.shape[-1])
+    out = _get_fp8_swiglu_mlp_op(float(limit))(x_2d, w13, s13, w2, s2)
+    return out.reshape(*x.shape[:-1], w2.shape[1])
 
 
 def sharded_quantized_matmul(

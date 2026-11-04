@@ -19,6 +19,7 @@ if TYPE_CHECKING:
     TPU_DEEPSEEK_V41_BLOCKED_ROPE_GATHER: bool = True
     TPU_DEEPSEEK_V41_CSA2_SWA_PLAN: bool = False
     TPU_DEEPSEEK_V41_FUSED_WO_AB: bool = True
+    TPU_DEEPSEEK_V41_FUSED_SHARED_EXPERT: bool = False
     TPU_DEEPSEEK_V41_QB_ROPE_EXACT_ROWS: bool = True
     TPU_DEEPSEEK_V41_CSA2_DEEP_GATHER: bool = True
     TPU_K3_SP_PREFILL: bool = False
@@ -474,6 +475,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # output stays in VMEM). Same arithmetic as the two kernels (bit-exact).
     "TPU_DEEPSEEK_V41_FUSED_WO_AB": env_bool(
         "TPU_DEEPSEEK_V41_FUSED_WO_AB", default=True
+    ),
+    # Shared expert (per-channel FP8 gate/up, clamped SiLU-and-mul, down) as
+    # one decode kernel at the qualified shapes; the intermediate stays in
+    # VMEM. Same arithmetic as the XLA ops (bit-exact).
+    "TPU_DEEPSEEK_V41_FUSED_SHARED_EXPERT": env_bool(
+        "TPU_DEEPSEEK_V41_FUSED_SHARED_EXPERT", default=False
     ),
     # Fused Q-B/RoPE at token counts that are not a multiple of 32 (the DSpark
     # drafter's 240 rows): write only the real rows instead of slicing a padded
