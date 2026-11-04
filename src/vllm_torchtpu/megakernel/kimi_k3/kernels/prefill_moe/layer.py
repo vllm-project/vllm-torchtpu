@@ -15,7 +15,7 @@ from ..prefill_megakernel import (
     MOE_FAMILIES,
     _moe_sp_shared_rows,
     _moe_sp_tail,
-    expert_family_slot,
+    expert_family_layers,
     gmm_v2,
     ring_tables,
     sp_token_index,
@@ -127,8 +127,9 @@ def routed_experts_prepared(
     global_route_max=None,
 ):
     """Consume prepared expert-major metadata with the existing GU/down path."""
-    if expert_layer is not None:
-        expert_layer = expert_family_slot(expert_gate_up.shape[0], expert_layer)
+    expert_layer, down_layer, expert_gate_up_scales, expert_down_scales = expert_family_layers(
+        expert_gate_up, expert_gate_up_scales, expert_down, expert_down_scales, expert_layer
+    )
     tokens = latent.shape[0]
     # The E8M0 exponent bytes go to the GMM as they are (it converts each
     # tile in VMEM): an FP32 [E, blocks, 1, N] copy pads 8x in HBM.
@@ -141,7 +142,7 @@ def routed_experts_prepared(
     )
     options = dict(
         tokens=tokens,
-        layer=expert_layer,
+        layer=down_layer,
         ring_dtype=jnp.dtype(_config().moe_reduce_dtype),
     )
     if tokens == 8192:

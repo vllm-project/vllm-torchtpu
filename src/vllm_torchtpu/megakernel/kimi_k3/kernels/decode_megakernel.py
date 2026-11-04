@@ -111,26 +111,28 @@ def expert_half_windows(name, slot_shape, half):
 # KernelConfig.decode_expert_banks: (family -> its resident bank refs, MoE slot)
 # while a layer's MoE traces; expert copies then read the slot's bank.
 _BANKS: list = []
-EXPERT_BANK_SIZES = (3,) + (8,) * 11 + (1,)  # rank_loader.EXPERT_BANK_SIZES
 
 
-def expert_bank_slot(slot):
-    """The bank holding MoE slot ``slot`` and the slot's index in it."""
-    first, last = EXPERT_BANK_SIZES[0], sum(EXPERT_BANK_SIZES) - EXPERT_BANK_SIZES[-1]
-    group = EXPERT_BANK_SIZES[1]
-    bank = jnp.where(slot < first, 0, jnp.where(slot >= last, len(EXPERT_BANK_SIZES) - 1,
-                                                1 + (slot - first) // group))
-    index = jnp.where(slot < first, slot, jnp.where(slot >= last, 0, (slot - first) % group))
-    return bank, index
+def expert_bank_slot(slot, sizes):
+    """The bank (of ``sizes`` layers, in order) holding MoE slot ``slot`` and
+    the slot's index in it."""
+    bank, first = jnp.int32(0), jnp.int32(0)
+    start = 0
+    for index, size in enumerate(sizes[:-1]):
+        start += size
+        later = slot >= start
+        bank = jnp.where(later, index + 1, bank)
+        first = jnp.where(later, start, first)
+    return bank, slot - first
 
 
 class _BankedCopy:
     """One expert copy from the bank holding the current MoE slot: the start
     branches over the banks; the wait needs only the shape."""
 
-    def __init__(self, build, banks, slot):
+    def __init__(self, build, banks, slot, sizes):
         self.build, self.banks = build, banks
-        self.bank, self.index = expert_bank_slot(slot)
+        self.bank, self.index = expert_bank_slot(slot, sizes)
 
     def start(self):
         for bank, ref in enumerate(self.banks):
@@ -146,8 +148,10 @@ def _expert_source_copy(name, layer, build):
     """``build(layer ref)``: from ``layer``, or from the current MoE slot's bank."""
     if not _BANKS:
         return build(layer)
-    banks, slot = _BANKS[-1]
-    return _BankedCopy(build, banks[name], slot)
+    banks, slot, layout = _BANKS[-1]
+    if len(banks[name]) == 1:  # one resident buffer: index it directly
+        return build(banks[name][0].at[slot])
+    return _BankedCopy(build, banks[name], slot, layout[name])
 
 
 class _CopyPair:
@@ -6953,8 +6957,11 @@ def stack(
     if f"{expert_families[0]}#bank0" in weights:
         # Resident expert banks (KernelConfig.decode_expert_banks): bank zero
         # stands for each family's shape; the banks are extra operands.
+        from vllm_torchtpu.megakernel.kimi_k3.kernels.rank_loader import expert_layout
+
+        bank_layout = expert_layout()
         bank_names = tuple(
-            f"{family}#bank{bank}" for family in expert_families for bank in range(len(EXPERT_BANK_SIZES))
+            f"{family}#bank{bank}" for family in expert_families for bank in range(len(bank_layout[family]))
         )
         bank_operands = tuple(weights[name] for name in bank_names)
         weights = {
@@ -6962,7 +6969,7 @@ def stack(
             **{family: weights[f"{family}#bank0"] for family in expert_families},
         }
     else:
-        bank_operands = ()
+        bank_operands, bank_layout = (), {}
     if include_layer_zero and any(name not in weights for name in DENSE):
         raise ValueError("include_layer_zero needs the dense MLP weights")
     select_state_row = state_row is not None
@@ -7248,10 +7255,12 @@ def stack(
             zip(dense_names, refs[dense_start : dense_start + len(dense_names)], strict=True)
         )
         bank_start = dense_start + len(dense_names)
-        bank_refs = {
-            family: refs[bank_start + i * len(EXPERT_BANK_SIZES) : bank_start + (i + 1) * len(EXPERT_BANK_SIZES)]
-            for i, family in enumerate(expert_families)
-        } if bank_names else None
+        bank_refs = None
+        if bank_names:
+            bank_refs, position = {}, bank_start
+            for family in expert_families:
+                bank_refs[family] = refs[position : position + len(bank_layout[family])]
+                position += len(bank_layout[family])
         state_start = bank_start + len(bank_names)
         state_count = len(states)
         convolution_ref, recurrent_ref = refs[state_start : state_start + 2]
@@ -9053,7 +9062,7 @@ def stack(
                     owned_rows_vmem if moe_token_scatter_output else mixture_vmem
                 )
                 # Banked experts: the copies read the slot's bank (_BANKS).
-                _BANKS[:] = [(bank_refs, layer_index - 1)] if bank_refs else []
+                _BANKS[:] = [(bank_refs, layer_index - 1, bank_layout)] if bank_refs else []
                 expert_layer = 0 if bank_refs else layer_index - 1
                 hot_slots = 0 if REPLICAS else (local_weights["expert_gu"].shape[0] - HOT_LOCAL_EXPERTS) // 2
                 if bank_refs and hot_slots:

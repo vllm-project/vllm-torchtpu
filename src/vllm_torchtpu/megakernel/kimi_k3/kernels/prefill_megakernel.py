@@ -2349,7 +2349,7 @@ def kernel_main(
             rhs_ref, weight=rhs_ref.weight.at[rhs_layer_ref[0]],
         )
         if rhs_ref.scale is not None and rhs_ref.scale.dtype == jnp.uint8 and rhs_ref.scale.ndim == 4:
-            rhs_ref = dataclasses.replace(rhs_ref, scale=rhs_ref.scale.at[rhs_layer_ref[0]])
+            rhs_ref = dataclasses.replace(rhs_ref, scale=rhs_ref.scale.at[rhs_layer_ref[rhs_layer_ref.shape[0] - 1]])
 
     if cfgs.rhs_cfgs.should_unpack:
         rhs_weight = rhs_ref.weight.bitcast(cfgs.rhs_cfgs.quant_dtype)
@@ -2839,8 +2839,9 @@ def gmm_v2(
     scale_family = family and rhs_scale is not None and rhs_scale.dtype == jnp.uint8 and rhs_scale.ndim == 4
     if rhs_layer is None:
         rhs_layer = jnp.zeros((1,), jnp.int32)
-    elif rhs_layer.shape != (1,) or rhs_layer.dtype != jnp.int32:
-        raise ValueError("rhs_layer must have shape (1,) and dtype int32")
+    elif rhs_layer.shape not in ((1,), (2,)) or rhs_layer.dtype != jnp.int32:
+        # (2,): the weight's slot, then its scales' slot.
+        raise ValueError("rhs_layer must have shape (1,) or (2,) and dtype int32")
     cfgs = make_gmm_configs(
         lhs,
         jax.ShapeDtypeStruct(rhs.shape[1:], rhs.dtype) if family else rhs,
@@ -5116,7 +5117,34 @@ def expert_family_slot(family_count, slot):
         return (slot - 3) % 8
     if family_count == 1:
         return jnp.zeros_like(slot)
+    # Down chunks of the split layout (rank_loader.SPLIT_EXPERT_LAYOUT):
+    # 11 (slots 0..10), 16 x 4 (from 11), 8 (as the banks) and 9 (from 83).
+    if family_count == 16:
+        return (slot - 11) % 16
+    if family_count == 9:
+        return slot - 83
     return slot
+
+
+def expert_family_layers(gate_up, gate_up_scales, down, down_scales, expert_layer):
+    """Per-family slots for the unfused paths: ``(gate/up layer, down layer,
+    gate/up scales, down scales)``; a layer is int32[2] (weight slot, scale
+    slot) when the scales are resident in another layout than their weights."""
+    if expert_layer is None:
+        return None, None, gate_up_scales, down_scales
+
+    def slots(weights, scales):
+        slot = expert_family_slot(weights.shape[0], expert_layer)
+        if scales.ndim == 4 and scales.shape[0] != weights.shape[0]:
+            slot = jnp.concatenate((slot, expert_family_slot(scales.shape[0], expert_layer)))
+        return slot
+
+    return (
+        slots(gate_up, gate_up_scales),
+        slots(down, down_scales),
+        gate_up_scales,
+        down_scales,
+    )
 
 
 def routed_experts(
@@ -5143,8 +5171,9 @@ def routed_experts(
     order, ``ragged_gather_reduce`` back, weighting and summing each token's
     top-k contributions in FP32.
     """
-    if expert_layer is not None:
-        expert_layer = expert_family_slot(expert_gate_up.shape[0], expert_layer)
+    expert_layer, down_layer, expert_gate_up_scales, expert_down_scales = expert_family_layers(
+        expert_gate_up, expert_gate_up_scales, expert_down, expert_down_scales, expert_layer
+    )
     tokens, input_width = latent.shape
     local_experts = expert_gate_up.shape[-3]
     if topk_ids.shape != topk_probabilities.shape or topk_ids.shape[0] != tokens:
@@ -5189,7 +5218,7 @@ def routed_experts(
         fuse_act="situ:4:25",
     )
     down = gmm_v2(
-        middle, expert_down, counts, rhs_scale=down_scale, rhs_layer=expert_layer,
+        middle, expert_down, counts, rhs_scale=down_scale, rhs_layer=down_layer,
         rhs_quant_dtype=jnp.float4_e2m1fn,
         maybe_quantize_lhs=False, zero_initialize=False,
     )

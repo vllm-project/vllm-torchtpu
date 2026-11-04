@@ -50,16 +50,38 @@ PREFILL_SHARED = (PREFILL_IO + PREFILL_COMMON
 # final layer. Keeping those resident banks separate avoids addressing a 92-layer
 # expert operand in every fused MoE call. No padding or device-side copies.
 EXPERT_BANK_SIZES = (3,) + (8,) * 11 + (1,)
+# KernelConfig.expert_layout "split": buffers below the fused MoE's ~2.5 GB
+# slow-down threshold with few operands (22): gate/up in the banks, down in
+# chunks at bank boundaries (<= 16 layers, 2.47 GB at EP8/EP16), scales whole.
+SPLIT_EXPERT_LAYOUT = {
+    "expert_gu": EXPERT_BANK_SIZES,
+    "expert_gus": (92,),
+    "expert_down": (11, 16, 16, 16, 16, 8, 9),
+    "expert_ds": (92,),
+}
 
 
-def bank_expert_parts(iterator):
-    """Stream checkpoint parts into exactly one resident copy of each expert."""
+def expert_layout() -> dict[str, tuple[int, ...]]:
+    """Resident bank sizes (layers) per expert family for KernelConfig.expert_layout."""
+    layout = _config().expert_layout
+    if layout == "split":
+        return dict(SPLIT_EXPERT_LAYOUT)
+    if layout == "banks":
+        return {family: EXPERT_BANK_SIZES for family in EXPERT_FAMILIES}
+    raise ValueError(f"unknown expert_layout {layout!r}")
+
+
+def bank_expert_parts(iterator, layout=None):
+    """Stream checkpoint parts into exactly one resident copy of each expert:
+    ``family#bankN`` arrays of ``layout[family]`` layers (default: the banks)."""
+    layout = layout or {family: EXPERT_BANK_SIZES for family in EXPERT_FAMILIES}
     state: dict[str, list[Any]] = {}
     for group, name, value in iterator:
         family, marker, suffix = name.partition("@")
         if family not in EXPERT_FAMILIES:
             yield group, name, value
             continue
+        sizes = layout[family]
         part, parts = map(int, suffix.split("/")) if marker else (0, 1)
         entry = state.setdefault(family, [0, 0, 0, None])
         expected_part, bank, used, buffer = entry
@@ -67,9 +89,9 @@ def bank_expert_parts(iterator):
             raise ValueError(f"Out-of-order expert checkpoint part: {name}")
         offset = 0
         while offset < value.shape[0]:
-            if bank == len(EXPERT_BANK_SIZES):
+            if bank == len(sizes):
                 raise ValueError(f"Too many expert layers for {family}")
-            capacity = EXPERT_BANK_SIZES[bank]
+            capacity = sizes[bank]
             if buffer is None:
                 buffer = np.empty((capacity, *value.shape[1:]), dtype=value.dtype)
             count = min(capacity - used, value.shape[0] - offset)
@@ -80,10 +102,10 @@ def bank_expert_parts(iterator):
                 yield group, f"{family}#bank{bank}", buffer
                 bank, used, buffer = bank + 1, 0, None
         state[family] = [part + 1, bank, used, buffer]
-        if part + 1 == parts and (bank != len(EXPERT_BANK_SIZES) or used):
+        if part + 1 == parts and (bank != len(sizes) or used):
             raise ValueError(f"Incomplete expert checkpoint: {family}")
     if set(state) != set(EXPERT_FAMILIES) or any(
-        bank != len(EXPERT_BANK_SIZES) or used for _, bank, used, _ in state.values()
+        bank != len(layout[f]) or used for f, (_, bank, used, _) in state.items()
     ):
         raise ValueError("Missing expert checkpoint parts")
 

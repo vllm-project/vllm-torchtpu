@@ -70,7 +70,7 @@ def indexed_gate_up(latent, indices, rhs, sizes, scales, layer):
         weights = dataclasses.replace(
             weights,
             weight=weights.weight.at[layer[0]].bitcast(jnp.float4_e2m1fn),
-            scale=weights.scale.at[layer[0]],
+            scale=weights.scale.at[layer[layer.shape[0] - 1]],  # its own slot when given
         )
         ng = k.fill_metadata(counts, offset, metadata, cfgs=cfg)
         (_, ws), ys = k.generate_block_specs(metadata, cfg)

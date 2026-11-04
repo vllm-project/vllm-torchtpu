@@ -134,6 +134,10 @@ def build_program(vllm_config: Any, tp_rank: int) -> MegakernelProgram:
         # K3_AGG_EP16=1: the aggregate's decode and prefill share EP16/TP2
         # experts (the prefill's fused EP16 MoE) instead of EP8/TP4.
         aggregate_ep = 16 if aggregate and os.environ.get("K3_AGG_EP16") == "1" else 8
+        # K3_AGG_EXPERT_BANKS=1: the shared experts in buffers below the fused
+        # MoE's slow-down size (split layout); the decode packs 19 small
+        # families into one operand to stay within torch's 64 op operands.
+        banks = aggregate and os.environ.get("K3_AGG_EXPERT_BANKS") == "1"
         kernel_config.install(
             kernel_config.KernelConfig(
                 attention_dp=config.attention_dp,
@@ -142,8 +146,10 @@ def build_program(vllm_config: Any, tp_rank: int) -> MegakernelProgram:
                 # The aggregate prefill shares the decode's experts.
                 prefill_expert_parallel=aggregate_ep if aggregate else 16,
                 decode_expert_parallel=aggregate_ep,
-                # EP16: the decode holds the experts as the prefill's banks.
-                decode_expert_banks=aggregate_ep == 16,
+                decode_expert_banks=banks,
+                prefill_expert_banks_ep8=banks,
+                expert_layout="split" if banks else "banks",
+                decode_packed_weights=19 if banks else 0,
                 prefill_fused_moe_ep8=aggregate,
                 # Every 8K window's routes on the fused path (no unfused overflow).
                 prefill_moe_capacity_ep8=65536 if aggregate else 32768,

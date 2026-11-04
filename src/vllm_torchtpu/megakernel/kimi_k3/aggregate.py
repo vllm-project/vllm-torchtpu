@@ -160,9 +160,9 @@ class KimiAggregate:
         if self._loaded:
             return
         from vllm_torchtpu.megakernel.kimi_k3.kernels.rank_loader import (
-            EXPERT_BANK_SIZES,
             EXPERT_FAMILIES,
             PREFILL_SHARED,
+            expert_layout,
         )
 
         started = time.perf_counter()
@@ -171,9 +171,9 @@ class KimiAggregate:
         names = list(PREFILL_SHARED)
         if f"{EXPERT_FAMILIES[0]}#bank0" in weights:
             # The decoder's experts are the prefill's resident banks.
-            banks = range(len(EXPERT_BANK_SIZES))
+            layout = expert_layout()
             names = [n for n in names if n not in EXPERT_FAMILIES] + [
-                f"{f}#bank{b}" for f in EXPERT_FAMILIES for b in banks
+                f"{f}#bank{b}" for f in EXPERT_FAMILIES for b in range(len(layout[f]))
             ]
         missing = [n for n in names if n not in weights]
         if missing:

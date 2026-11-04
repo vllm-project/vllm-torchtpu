@@ -145,20 +145,82 @@ def test_host_joined_parts_match_the_device_join(preshard):
         assert joined[name][0] == sum(n for k, n, _ in jobs if k.startswith(name + "@"))
 
 
-def test_bank_slot_matches_the_loader_banks():
-    """MoE slot s is at expert_bank_slot(s) of rank_loader.bank_expert_parts."""
-    assert dm.EXPERT_BANK_SIZES == rl.EXPERT_BANK_SIZES
-    layers = sum(rl.EXPERT_BANK_SIZES)
-    families = {
-        name: np.arange(layers, dtype=np.int32).reshape(layers, 1)
-        for name in rl.EXPERT_FAMILIES
-    }
+@pytest.mark.parametrize(
+    "layout",
+    [
+        {f: rl.EXPERT_BANK_SIZES for f in rl.EXPERT_FAMILIES},
+        rl.SPLIT_EXPERT_LAYOUT,
+    ],
+)
+def test_bank_slots_match_the_loader_banks(layout):
+    """MoE slot s sits at expert_bank_slot (decode) and at expert_family_slot
+    (prefill) of the bank holding it in rank_loader.bank_expert_parts."""
+    from vllm_torchtpu.megakernel.kimi_k3.kernels import prefill_megakernel as pm
+    from vllm_torchtpu.megakernel.kimi_k3.prefill import _OP_FIRST_SLOTS, _bank_holding
+
+    layers = 92
     parts = [
-        ("decode", f"{name}@{i}/2", value[lo:hi])
-        for name, value in families.items()
+        (
+            "decode",
+            f"{name}@{i}/2",
+            np.arange(layers, dtype=np.int32).reshape(layers, 1)[lo:hi],
+        )
+        for name in rl.EXPERT_FAMILIES
         for i, (lo, hi) in enumerate(((0, 40), (40, layers)))
     ]
-    banks = {name: value for _, name, value in rl.bank_expert_parts(parts)}
-    for slot in range(layers):
-        bank, index = (int(x) for x in dm.expert_bank_slot(jnp.int32(slot)))
-        assert banks[f"expert_gu#bank{bank}"][index, 0] == slot
+    banks = {name: value for _, name, value in rl.bank_expert_parts(parts, layout)}
+    for family, sizes in layout.items():
+        assert sum(sizes) == layers
+        for slot in range(layers):
+            bank, index = (int(x) for x in dm.expert_bank_slot(jnp.int32(slot), sizes))
+            assert banks[f"{family}#bank{bank}"][index, 0] == slot
+        # Each prefill op reads its layers from one bank, at its slot rule.
+        ends = list(_OP_FIRST_SLOTS[1:]) + [layers]
+        for first, end in zip(_OP_FIRST_SLOTS, ends):
+            bank = _bank_holding(sizes, first)
+            held = banks[f"{family}#bank{bank}"]
+            for slot in range(first, end):
+                index = int(pm.expert_family_slot(held.shape[0], jnp.int32(slot)))
+                assert held[index, 0] == slot, (family, slot)
+
+
+def test_split_layout_buffers_stay_under_the_threshold():
+    """EP16 (and EP8) bytes per layer: gate/up 308 MB, down 154 MB per rank."""
+    per_layer = {
+        "expert_gu": 308e6,
+        "expert_down": 154e6,
+        "expert_gus": 19.3e6,
+        "expert_ds": 9.7e6,
+    }
+    for family, sizes in rl.SPLIT_EXPERT_LAYOUT.items():
+        assert max(sizes) * per_layer[family] <= 2.5e9, family
+    assert sum(len(s) for s in rl.SPLIT_EXPERT_LAYOUT.values()) == 22
+
+
+def test_packed_weights_unpack_to_the_families():
+
+    import torch
+
+    from vllm_torchtpu.megakernel.kimi_k3.decode_ops import DecodeOps
+
+    ops = object.__new__(DecodeOps)
+    ops.rank = 1
+    ops.weights = {
+        "a": torch.arange(6, dtype=torch.float32).reshape(1, 2, 3),
+        "b": torch.arange(4, dtype=torch.bfloat16).reshape(1, 4),
+        "big": torch.zeros((1, 64, 64), dtype=torch.float32),
+        "expert_gu#bank0": torch.zeros((1, 2), dtype=torch.uint8),
+    }
+    ops.names = tuple(sorted(ops.weights))
+    original = torch.Tensor.to
+    try:
+        torch.Tensor.to = lambda self, *a, **k: self  # no device in the CPU test
+        ops._pack_small_weights(2)
+    finally:
+        torch.Tensor.to = original
+    assert ops.names == ("#packed", "big", "expert_gu#bank0")
+    blob = jnp.asarray(ops.weights["#packed"].numpy()[0])
+    out = ops._unpacked({"#packed": blob, "big": None})
+    np.testing.assert_array_equal(np.asarray(out["a"]), np.arange(6).reshape(2, 3))
+    np.testing.assert_array_equal(np.asarray(out["b"], np.float32), np.arange(4))
+    assert out["b"].dtype == jnp.bfloat16 and "#packed" not in out

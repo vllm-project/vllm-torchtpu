@@ -207,12 +207,15 @@ class DecodeOps:
             attention_dp=self.attention_dp,
         )
         if kernel_config.active().decode_expert_banks:
-            iterator = self.rank_loader.bank_expert_parts(iterator)
+            iterator = self.rank_loader.bank_expert_parts(
+                iterator, self.rank_loader.expert_layout()
+            )
         stats = stream_to_device(
             iterator,
             lambda _group, name, tensor: self.weights.__setitem__(name, tensor),
         )
         self.names = tuple(sorted(self.weights))
+        self._pack_small_weights(kernel_config.active().decode_packed_weights)
         materialize(self.weights[self.names[-1]])
         # Attention DP: bank entry s + k * n holds held shard k's heads of its
         # group's slot s (pools.group_slots).
@@ -238,6 +241,60 @@ class DecodeOps:
             )
         report_load_stats("decode", self.rank, stats)
         return stats["wall"]
+
+    PACKED = "#packed"
+
+    def _pack_small_weights(self, count: int) -> None:
+        """Move the ``count`` smallest dense families into one byte blob
+        operand (``PACKED``; the families stay in ``weights`` for sharing):
+        torch ops take at most 64 operands, and resident expert banks need
+        more. The step bodies unpack it by copies (:meth:`_unpacked`)."""
+        self._packed: list[tuple[str, int, tuple[int, ...], Any]] = []
+        if count <= 0:
+            return
+        dense = [
+            n for n in self.names
+            if not n.startswith("expert_") and n != self.PACKED
+        ]
+        size = {
+            n: self.weights[n].numel() * self.weights[n].element_size() for n in dense
+        }
+        chosen = sorted(dense, key=lambda n: (size[n], n))[:count]
+        parts, offset = [], 0
+        for name in chosen:
+            tensor = self.weights[name]
+            raw = tensor.cpu().contiguous().reshape(-1).view(torch.uint8)
+            dtype = jnp.dtype(str(tensor.dtype).removeprefix("torch."))
+            self._packed.append((name, offset, tuple(tensor.shape[1:]), dtype))
+            parts.append(raw)
+            offset += raw.numel()
+        self.weights[self.PACKED] = torch.cat(parts).reshape(1, -1).to("tpu")
+        self.names = tuple(n for n in sorted(self.weights) if n not in set(chosen))
+        if self.rank == 0:
+            logger.info(
+                "K3 decode: %d small families packed into one %.1f MB operand "
+                "(%d weight operands)",
+                len(chosen),
+                offset / 1e6,
+                len(self.names),
+            )
+
+    def _unpacked(self, weights: dict) -> dict:
+        """``weights`` with the packed families restored from ``PACKED``."""
+        if not getattr(self, "_packed", None):
+            return weights
+        weights = dict(weights)
+        blob = weights.pop(self.PACKED)
+        for name, offset, shape, dtype in self._packed:
+            nbytes = math.prod(shape) * dtype.itemsize
+            raw = blob[offset : offset + nbytes]
+            if dtype.itemsize > 1:
+                raw = raw.reshape(-1, dtype.itemsize)
+                raw = jax.lax.bitcast_convert_type(raw, dtype)
+            else:
+                raw = jax.lax.bitcast_convert_type(raw, dtype)
+            weights[name] = raw.reshape(shape)
+        return weights
 
     def use_unified_pools(
         self,
@@ -312,7 +369,7 @@ class DecodeOps:
         width = self.VERIFY_ROWS
 
         def body(*args):
-            weights = {name: args[i][0] for i, name in enumerate(names)}
+            weights = self._unpacked({name: args[i][0] for i, name in enumerate(names)})
             conv, recurrent = args[count][0], args[count + 1][0]
             pool = args[count + 2 : count + 2 + pools]
             state = args[count + 2 + pools]
@@ -584,7 +641,7 @@ class DecodeOps:
         pools = len(self.unified_pools)
 
         def body(*args):
-            weights = {name: args[i][0] for i, name in enumerate(names)}
+            weights = self._unpacked({name: args[i][0] for i, name in enumerate(names)})
             conv, recurrent = args[count][0], args[count + 1][0]
             pool = args[count + 2 : count + 2 + pools]
             (packet,) = args[count + 2 + pools :]
@@ -706,7 +763,7 @@ class DecodeOps:
             order = np.argsort(placed)
 
         def body(*args):
-            weights = {name: args[i][0] for i, name in enumerate(names)}
+            weights = self._unpacked({name: args[i][0] for i, name in enumerate(names)})
             conv, recurrent = args[count][0], args[count + 1][0]
             pool = args[count + 2 : count + 2 + pools]
             (packet,) = args[count + 2 + pools :]

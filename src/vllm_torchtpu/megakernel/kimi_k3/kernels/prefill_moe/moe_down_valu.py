@@ -266,7 +266,7 @@ def down_valu(
     ):
         if family:
             w = dataclasses.replace(
-                w, weight=w.weight.at[layer[0]], scale=w.scale.at[layer[0]]
+                w, weight=w.weight.at[layer[0]], scale=w.scale.at[layer[layer.shape[0] - 1]]
             )
         w = dataclasses.replace(w, weight=w.weight.bitcast(jnp.float4_e2m1fn))
         active_ng = k.fill_metadata(counts, offset, metadata, cfgs=cfg)

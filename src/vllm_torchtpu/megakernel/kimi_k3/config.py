@@ -39,6 +39,13 @@ class KernelConfig:
     # Decode experts resident as the prefill's per-group banks (rank_loader.
     # bank_expert_parts) so an aggregate prefill shares them banked.
     decode_expert_banks: bool = False
+    # Resident expert banks per family (rank_loader.expert_layout): "banks"
+    # (13 per family) or "split" (gate/up banks, down chunks, whole scales).
+    expert_layout: str = "banks"
+    # Aggregate decode: this many of the smallest dense families travel to the
+    # plain step in one byte blob (unpacked by copies in the op) to free torch
+    # op operands for resident expert banks (0: none).
+    decode_packed_weights: int = 0
     mxfp4_block: int = 2048
     mxfp4_pair_tile: int = 512
     mxfp4_static_tile: int = 0

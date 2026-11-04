@@ -222,6 +222,21 @@ def pack_windows(
     return packed
 
 
+# The first MoE slot of each window op with resident expert banks: the first
+# op (layers 1..3), the eleven group ops (8 layers each) and the final op.
+_OP_FIRST_SLOTS = (0,) + tuple(3 + 8 * k for k in range(11)) + (91,)
+
+
+def _bank_holding(sizes: tuple[int, ...], slot: int) -> int:
+    """The bank (of ``sizes`` layers, in order) holding MoE slot ``slot``."""
+    end = 0
+    for bank, size in enumerate(sizes):
+        end += size
+        if slot < end:
+            return bank
+    raise ValueError(f"MoE slot {slot} is past the banks {sizes}")
+
+
 class PrefillProgram:
     """The prefill stack's device weights and packed-window ops.
 
@@ -269,47 +284,54 @@ class PrefillProgram:
         from .config import active
 
         loader = self._rank_loader
-        families, bank_sizes = loader.EXPERT_FAMILIES, loader.EXPERT_BANK_SIZES
+        families = loader.EXPERT_FAMILIES
         shared = dict(shared or {})
         # The decode's experts arrive as 92-layer families or as resident
-        # banks (``family#bankN``, rank_loader.bank_expert_parts).
-        shared_banks = [
-            {f: shared.pop(f"{f}#bank{b}") for f in families}
-            for b in range(len(bank_sizes))
-            if f"{families[0]}#bank{b}" in shared
-        ]
-        if shared_banks and len(shared_banks) != len(bank_sizes):
-            raise RuntimeError("K3 prefill: the shared expert banks are incomplete")
+        # banks (``family#bankN`` in rank_loader.expert_layout()).
+        family_banks: dict[str, list] = {}
+        if f"{families[0]}#bank0" in shared:
+            layout = loader.expert_layout()
+            try:
+                family_banks = {
+                    f: [shared.pop(f"{f}#bank{b}") for b in range(len(layout[f]))]
+                    for f in families
+                }
+            except KeyError as error:
+                raise RuntimeError(
+                    "K3 prefill: the shared expert banks are incomplete"
+                ) from error
         skip = frozenset(shared)
-        if shared_banks:
+        if family_banks:
             skip |= frozenset(families)
         iterator = loader.iter_prefill_rank(
             presharded, cache, self.rank, split_experts=True, skip=skip
         )
-        self._expert_banks = shared_banks
         kernel = active()
         banked_ep = kernel.prefill_expert_parallel == 16 or (
             kernel.prefill_expert_parallel == 8
             and kernel.prefill_fused_moe_ep8
             and kernel.prefill_expert_banks_ep8
         )
-        if (
+        banking = (
             kernel.prefill_fused_moe
             and banked_ep
             and kernel.prefill_expert_banks
             and not skip & set(families)
-        ):
-            self._expert_banks = [{} for _ in bank_sizes]
-            iterator = loader.bank_expert_parts(iterator)
-        for name, tensor in (shared_banks[0] if shared_banks else {}).items():
-            # Bank zero stands for the family in shape/introspection code.
-            self.weights.setdefault("moe", {})[name] = tensor
+        )
+        if banking:
+            layout = loader.expert_layout()
+            family_banks = {f: [None] * len(layout[f]) for f in families}
+            iterator = loader.bank_expert_parts(iterator, layout)
+        for name, banks in family_banks.items():
+            if banks[0] is not None:
+                # Bank zero stands for the family in shape/introspection code.
+                self.weights.setdefault("moe", {})[name] = banks[0]
 
         def store(group, name, tensor):
             family, marker, index = name.partition("#bank")
             if marker:
                 bank = int(index)
-                self._expert_banks[bank][family] = tensor
+                family_banks[family][bank] = tensor
                 # The default dictionary retains handles to bank zero so common
                 # shape/introspection code still sees every named family.
                 if bank != 0:
@@ -322,10 +344,15 @@ class PrefillProgram:
             for name in names:
                 if name in shared:
                     self.weights.setdefault(group, {})[name] = shared[name]
-        if self._expert_banks and any(
-            set(bank) != set(families) for bank in self._expert_banks
-        ):
+        if any(t is None for banks in family_banks.values() for t in banks):
             raise RuntimeError("K3 prefill: incomplete resident expert banks")
+        # Each op's (first, group pairs, final) expert operands: the bank of
+        # each family holding its layers.
+        layout = loader.expert_layout() if family_banks else {}
+        self._expert_banks = [
+            {f: family_banks[f][_bank_holding(layout[f], start)] for f in families}
+            for start in _OP_FIRST_SLOTS
+        ] if family_banks else []
         for group, names in self.names.items():
             missing = [n for n in names if n not in self.weights.get(group, {})]
             if missing:
@@ -585,7 +612,11 @@ class PrefillProgram:
         return repr(
             (
                 "prefill",
-                "moe-bank8" if self._expert_banks else "moe-global",
+                (
+                    f"moe-bank8-{active().expert_layout}"
+                    if self._expert_banks
+                    else "moe-global"
+                ),
                 op,
                 window,
                 self.capacity,

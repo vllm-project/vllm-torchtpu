@@ -1102,14 +1102,15 @@ def _routed_experts(
         state,
         ring_meta,
     ):
+        # layer: the slots of gate/up, its scales, down and its scales.
         w = dataclasses.replace(
-            w, weight=w.weight.at[layer[0]], scale=w.scale.at[layer[0]]
+            w, weight=w.weight.at[layer[2]], scale=w.scale.at[layer[3]]
         )
         w = dataclasses.replace(w, weight=w.weight.bitcast(jnp.float4_e2m1fn))
         gu = dataclasses.replace(
             gu,
             weight=gu.weight.at[layer[0]].bitcast(jnp.float4_e2m1fn),
-            scale=gu.scale.at[layer[0]],
+            scale=gu.scale.at[layer[1]],
         )
         gu = k.FusedWeightsRef(gate=gu, up=jax.tree.map(lambda r: r.at[..., mid:], gu))
         # Six directed rings: [target, source, 32 local-contribution row bases].
@@ -2210,6 +2211,9 @@ def _layer_kernel(
         # correspond to first/group/final programs with 3/8/1 MoE families.
         family = k.expert_family_slot(expert_gu.shape[0], control[1])
         s["family"][0] = family
+        # Each expert family's slot in its resident bank (layouts may differ).
+        for index, ref in enumerate((gu_scales, expert_down, down_scales), 1):
+            s["family"][index] = k.expert_family_slot(ref.shape[0], control[1])
 
         def count_copy():
             return pltpu.make_async_copy(s["counts_v"], s["counts"], s["count_sem"])
@@ -2342,7 +2346,7 @@ def _layer_kernel(
             maximum=smem((1,), jnp.int32) if tokens == 8192 else None,
             ids=smem((capacity // 128, 128), jnp.int32),
             probs=smem((capacity // 128, 128), jnp.float32),
-            family=smem((1,), jnp.int32),
+            family=smem((4,), jnp.int32),
             offset=smem((1,), jnp.int32),
             count_sem=dma,
             max_sem=dma if tokens == 8192 else None,
