@@ -567,6 +567,51 @@ def _substitute_placeholder_token(
     return input_ids
 
 
+_subtract_num_rejected_tokens_fn: Callable[..., Any] | None = None
+
+
+def _subtract_num_rejected_tokens_compiled(*args):
+    """Run the async-spec rejected-count correction as one compiled program
+    instead of ~10 eager dispatches per step."""
+    global _subtract_num_rejected_tokens_fn
+    if _subtract_num_rejected_tokens_fn is None:
+        from vllm_torchtpu.runner.tpu_runner_async_output import (
+            subtract_num_rejected_tokens,
+        )
+
+        _subtract_num_rejected_tokens_fn = _static_shape_args(
+            torch.compile(
+                subtract_num_rejected_tokens,
+                backend="tpu",
+                fullgraph=True,
+                dynamic=False,
+            )
+        )
+    return _subtract_num_rejected_tokens_fn(*args)
+
+
+def _spec_tail(next_tokens, drafts, draft_lengths, rows, num_reqs, bound):
+    """One async-spec step's substitution source, padded to `bound`, and its
+    per-request rejected count: `assemble_spec_next_tokens`,
+    `compute_num_rejected`, the row fits and the source pad in one function."""
+    from vllm_torchtpu.runner.tpu_runner_async_output import (
+        assemble_spec_next_tokens,
+        compute_num_rejected,
+    )
+    from vllm_torchtpu.spec_decode.utils import fit_rows
+
+    src = assemble_spec_next_tokens(next_tokens, fit_rows(drafts, rows), num_reqs)
+    num_rejected = compute_num_rejected(next_tokens, fit_rows(draft_lengths, rows))
+    if src.shape[0] < bound:
+        src = torch.nn.functional.pad(src, (0, bound - src.shape[0]))
+    return src, num_rejected
+
+
+_spec_tail_compiled = _static_shape_args(
+    torch.compile(_spec_tail, backend="tpu", fullgraph=True, dynamic=False)
+)
+
+
 logger = init_logger(__name__)
 
 
@@ -3068,6 +3113,39 @@ class TPUModelRunner(GPUModelRunner):
         # Bucketed drafters keep the sampler's padded rows (an exact-count slice
         # would compile a program per request count); others keep exact rows.
         bucketed = getattr(getattr(self, "drafter", None), "bucketed_drafts", False)
+        md0 = (
+            state.spec_decode_metadata_list[0]
+            if len(next_tokens_per_chunk) == 1
+            else None
+        )
+        if (
+            md0 is not None
+            and hasattr(self, "max_num_reqs")
+            and self.speculative_config is not None
+        ):
+            # Steady decode (one chunk, drafts verified): build the source and
+            # rejected count in one program, with the source already padded to
+            # the bound `sample_tokens` would pad it to.
+            nt_chunk = next_tokens_per_chunk[0]
+            num_reqs = state.num_reqs_list[0]
+            spec_tail_fn = (
+                _spec_tail_compiled if nt_chunk.device.type == "tpu" else _spec_tail
+            )
+            src, num_rejected = spec_tail_fn(
+                nt_chunk,
+                drafts_per_chunk[0],
+                md0.draft_lengths,
+                nt_chunk.shape[0] if bucketed else num_reqs,
+                None if bucketed else num_reqs,
+                self.max_num_reqs
+                * (1 + self.speculative_config.num_speculative_tokens),
+            )
+            return (
+                [src],
+                {r: r for r in range(num_reqs)},
+                num_rejected,
+                {r: int(md0.draft_lengths_cpu[r]) for r in range(num_reqs)},
+            )
         next_tokens_tpu_chunks: list[torch.Tensor] = []
         next_token_indices: dict[int, int] = {}
         num_rejected_chunks: list[torch.Tensor] = []
@@ -3435,7 +3513,21 @@ class TPUModelRunner(GPUModelRunner):
                     seq_idx_np[i] = pos
                     pos_idx_np[acc : acc + n_sched] = pos
                 acc += n_sched
-            seq_lens, self.position_ids = subtract_num_rejected_tokens(
+            # Use the compiled program only for shapes warmup compiled (steady
+            # decode); prefill/mixed steps keep the eager ops rather than
+            # compiling mid-serve.
+            subtract = (
+                _subtract_num_rejected_tokens_compiled
+                if seq_lens.device.type == "tpu"
+                and (
+                    self._pre_async_results.spec_decode_num_rejected_tokens.shape[0],
+                    self.position_ids.shape[-1],
+                    seq_lens.shape[0],
+                )
+                in self.__dict__.get("_subtract_compiled_shapes", ())
+                else subtract_num_rejected_tokens
+            )
+            seq_lens, self.position_ids = subtract(
                 seq_lens,
                 self.position_ids,
                 self._pre_async_results.spec_decode_num_rejected_tokens,
@@ -7269,6 +7361,8 @@ class TPUModelRunner(GPUModelRunner):
             self._precompile_sampling_subgraphs()
             self._precompile_pooler_subgraphs()
             self._precompile_mamba_rollback_helpers()
+            self._precompile_subtract_rejected()
+            self._precompile_spec_tail()
 
             # Precompile multimodal vision encoder graphs
             self.encoder_cudagraph_manager = maybe_create_mm_encoder_manager(
@@ -7626,6 +7720,82 @@ class TPUModelRunner(GPUModelRunner):
                     )
                     _spec_seed_rows_compiled(offsets, packed, split, out_len)
                     out_len *= 4
+
+    def _precompile_subtract_rejected(self) -> None:
+        """Compile the async-spec rejected-count correction for steady spec
+        decode at every request count (exact and bucketed source rows), this
+        step's request slots, and the token bucket that holds `rows * (1 + K)`
+        verify tokens. Other shapes (a prefill joining) stay on the eager ops;
+        see `_subtract_compiled_shapes`."""
+        if not (
+            self.device.type == "tpu"
+            and self.speculative_config
+            and self.scheduler_config.async_scheduling
+        ):
+            return
+        width = 1 + self.speculative_config.num_speculative_tokens
+        targets = {
+            n for n in (self.num_reqs_max_model_len, self.num_reqs_most_model_len) if n
+        }
+        shapes: set[tuple[int, int, int]] = set()
+        for n in range(1, self.max_num_reqs + 1):
+            if n * width > self.num_tokens_paddings[-1]:
+                break
+            tokens = _get_padded_token_len(self.num_tokens_paddings, n * width)
+            for rows in {
+                n,
+                _get_padded_num_reqs_with_upper_limit(n, self.max_num_reqs),
+            }:
+                for target in targets:
+                    shapes.add((rows, tokens, target))
+        with self._precompile_timed("async-spec rejected-count correction"):
+            for rows, tokens, target in sorted(shapes):
+                synchronize_tensors(
+                    _subtract_num_rejected_tokens_compiled(
+                        torch.zeros(target, dtype=torch.int32).to(self.device),
+                        torch.zeros(tokens, dtype=torch.int32).to(self.device),
+                        torch.zeros(rows, dtype=torch.int32).to(self.device),
+                        torch.full((target,), -1, dtype=torch.int32).to(self.device),
+                        torch.full((tokens,), -1, dtype=torch.int32).to(self.device),
+                    )
+                )
+        self._subtract_compiled_shapes = frozenset(shapes)
+
+    def _precompile_spec_tail(self) -> None:
+        """Compile the one-chunk spec tail for every live request count
+        (exact-count drafts or the sampler's padded rows), so serving never
+        compiles it."""
+        if not (
+            self.device.type == "tpu"
+            and self.speculative_config
+            and self.scheduler_config.async_scheduling
+        ):
+            return
+        k = self.speculative_config.num_speculative_tokens
+        bound = self.max_num_reqs * (1 + k)
+        bucketed = getattr(getattr(self, "drafter", None), "bucketed_drafts", False)
+        with self._precompile_timed("async-spec substitution tail"):
+            for num_reqs in range(1, self.max_num_reqs + 1):
+                rows = _get_padded_num_reqs_with_upper_limit(
+                    num_reqs, self.max_num_reqs
+                )
+                next_tokens = torch.full((rows, k + 1), -1, dtype=torch.int32).to(
+                    self.device
+                )
+                drafts = torch.zeros(
+                    (rows if bucketed else num_reqs, k), dtype=torch.int32
+                ).to(self.device)
+                draft_lengths = torch.zeros(rows, dtype=torch.int32).to(self.device)
+                synchronize_tensors(
+                    _spec_tail_compiled(
+                        next_tokens,
+                        drafts,
+                        draft_lengths,
+                        rows if bucketed else num_reqs,
+                        None if bucketed else num_reqs,
+                        bound,
+                    )
+                )
 
     def _warmup_spec_decode(self) -> None:
         """Warm the real spec-decode dispatch so the first request doesn't recompile.
