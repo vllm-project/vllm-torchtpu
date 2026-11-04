@@ -24,7 +24,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 from ..exec_spec import ExecSpec
-from ..ops import BF16, F32, FP8, I32, U32, rup
+from ..ops import BF16, F32, FP8, I32, U32, round_up
 from .backend import check_ckpt_bounds, kernel_debug_check, resolve_active_seqs
 from .checks import safe_page_base
 from .config import cache_exec
@@ -98,8 +98,8 @@ def gather_gdn_states(
     vh, KD, VD = layout.vh_per_rank(ex.R), layout.KD, layout.VD
     QKV = layout.qkv_per_rank(ex.R)
     taps = layout.conv_taps
-    CR = rup(taps * B, 8)
-    HR = rup(taps + T, 8)
+    CR = round_up(taps * B, 8)
+    HR = round_up(taps + T, 8)
     ngdn = layout.num_recurrent_layers
     conv_shape = (ngdn, CR, QKV) if T == 1 else (ngdn, NS, HR, QKV)
     conv_dt = F32

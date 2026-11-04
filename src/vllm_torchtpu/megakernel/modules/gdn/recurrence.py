@@ -22,7 +22,7 @@ import jax.numpy as jnp
 from jax import lax
 from jax.experimental import pallas as pl
 
-from ...ops import BF16, F32, I32, gdn_gate_act, rnd, rup
+from ...ops import BF16, F32, I32, gdn_gate_act, round_bf16, round_up
 from .params import GDNParams
 from .states import rec_chunk
 
@@ -63,7 +63,7 @@ def gdn_rec(ctx: Any, gp: GDNParams, u: Any, ybuf: Any, slot: Any) -> None:
         q = q * KD**-0.5
         k = k * lax.rsqrt(jnp.sum(k * k, axis=-1, keepdims=True) + l2_eps)
         qc, kc_ = cols(q), cols(k)
-        beta = rnd(jax.nn.sigmoid(ybuf[b, BA : BA + vh]))
+        beta = round_bf16(jax.nn.sigmoid(ybuf[b, BA : BA + vh]))
         a = ybuf[b, A_OFF : A_OFF + vh]
         decay = -jnp.exp(alog) * jax.nn.softplus(a + dtb)
         sb[...] = (
@@ -72,12 +72,12 @@ def gdn_rec(ctx: Any, gp: GDNParams, u: Any, ybuf: Any, slot: Any) -> None:
         pred = jnp.sum(sb[...] * kc_, axis=1)
         delta = (v - pred) * beta[:, None]
         sb[...] = sb[...] + kc_ * delta[:, None, :]
-        out = rnd(jnp.sum(sb[...] * qc, axis=1))
+        out = round_bf16(jnp.sum(sb[...] * qc, axis=1))
         recb[b * vh : (b + 1) * vh] = sb[...].astype(BF16)
         val = out * lax.rsqrt(jnp.mean(out * out, axis=-1, keepdims=True) + gp.eps)
         val = (gnw[None, :] * val.astype(BF16)).astype(F32)
         zz = ybuf[b, QKV : QKV + Z].reshape(vh, VD)
-        scr["mix"][b, :Z] = rnd(val * g_act(zz)).reshape(Z)
+        scr["mix"][b, :Z] = round_bf16(val * g_act(zz)).reshape(Z)
 
 
 def gdn_rec_chunked(ctx: Any, gp: GDNParams, o: Any, slot: Any) -> None:
@@ -116,7 +116,7 @@ def gdn_rec_chunked(ctx: Any, gp: GDNParams, o: Any, slot: Any) -> None:
     hrow = lax.broadcasted_iota(I32, (vh, VD), 0)
 
     def rows(r0, n: int, s):
-        n_pad = rup(n, 8)
+        n_pad = round_up(n, 8)
         uc = ybuf[pl.ds(r0, n_pad), 0:QKV]
         bac = ybuf[pl.ds(r0, n_pad), BA : BA + BA_PAD]
         zc = ybuf[pl.ds(r0, n_pad), QKV : QKV + Z]
@@ -131,7 +131,7 @@ def gdn_rec_chunked(ctx: Any, gp: GDNParams, o: Any, slot: Any) -> None:
             q = q * lax.rsqrt(jnp.sum(q * q, axis=-1, keepdims=True) + l2_eps)
             q = q * KD**-0.5
             k = k * lax.rsqrt(jnp.sum(k * k, axis=-1, keepdims=True) + l2_eps)
-            beta = rnd(jax.nn.sigmoid(bac[bb, 0:vh]))
+            beta = round_bf16(jax.nn.sigmoid(bac[bb, 0:vh]))
             a = bac[bb, A_REL : A_REL + vh]
             decay = -jnp.exp(alog) * jax.nn.softplus(a + dtb)
             src = (
@@ -144,7 +144,7 @@ def gdn_rec_chunked(ctx: Any, gp: GDNParams, o: Any, slot: Any) -> None:
                 pred = jnp.sum(sb[...] * kc_, axis=1)
                 delta = (v - pred) * beta[:, None]
                 sb[...] = sb[...] + kc_ * delta[:, None, :]
-                out = rnd(jnp.sum(sb[...] * qc, axis=1))
+                out = round_bf16(jnp.sum(sb[...] * qc, axis=1))
                 st[h0 : h0 + vh] = sb[...].astype(BF16)
             else:
                 # Head-major recurrence (opt-in `GDNTunables.gdn_head_major`):
@@ -165,11 +165,11 @@ def gdn_rec_chunked(ctx: Any, gp: GDNParams, o: Any, slot: Any) -> None:
                     qc_h = sb[cb + kh + j : cb + kh + j + 1]
                     out_acc = jnp.where(hrow == h, jnp.sum(s_h * qc_h, axis=1), out_acc)
                     st[h0 + h : h0 + h + 1] = s_h.astype(BF16)
-                out = rnd(out_acc)
+                out = round_bf16(out_acc)
             val = out * lax.rsqrt(jnp.mean(out * out, axis=-1, keepdims=True) + gp.eps)
             val = (gnw[None, :] * val.astype(BF16)).astype(F32)
             zz = zc[bb].reshape(vh, VD)
-            row = rnd(val * g_act(zz)).reshape(1, Z)
+            row = round_bf16(val * g_act(zz)).reshape(1, Z)
             blk = jnp.where(row_i == bb, row, blk)
         scr["mix"][pl.ds(r0, n_pad), 0:Z] = blk
 

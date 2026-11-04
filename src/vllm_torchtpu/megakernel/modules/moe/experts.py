@@ -20,7 +20,7 @@ import jax.numpy as jnp
 from jax import lax
 from jax.experimental import pallas as pl
 
-from ...ops import BF16, F32, rnd
+from ...ops import BF16, F32, round_bf16
 from .context import MoEEmit
 from .ring import egive, egive_group, es_wait, etake
 
@@ -31,7 +31,9 @@ def gate_up(m: MoEEmit, i, w13):
     h = stream.mm(scr["xb"][...], w13[...])
     if "es" in m.W:
         h = h * scr["es"][i % NSS, :, : 2 * IR]
-    return rnd(rnd(jax.nn.silu(rnd(h[:, :IR]))) * rnd(h[:, IR:])).astype(BF16)
+    return round_bf16(
+        round_bf16(jax.nn.silu(round_bf16(h[:, :IR]))) * round_bf16(h[:, IR:])
+    ).astype(BF16)
 
 
 def down(m: MoEEmit, i, mid, w2):
@@ -44,7 +46,7 @@ def down(m: MoEEmit, i, mid, w2):
     for j in range(H // CH):
         lo = 2 * IR + j * CH
         y = stream.mm(mid, w2[:, j * CH : (j + 1) * CH])[0:MR]
-        y = rnd(y * scr["es"][s, :, lo : lo + CH]) if has_es else rnd(y)
+        y = round_bf16(y * scr["es"][s, :, lo : lo + CH]) if has_es else round_bf16(y)
         part[0:MR, j * CH : (j + 1) * CH] += wcol * y
 
 
@@ -98,7 +100,9 @@ def expert(m: MoEEmit, l_idx, i, carry):
     has_es = "es" in m.W
     if has_es:
         h = h * scr["es"][s, :, : 2 * IR]
-    mid_ = rnd(rnd(jax.nn.silu(rnd(h[:, :IR]))) * rnd(h[:, IR:]))
+    mid_ = round_bf16(
+        round_bf16(jax.nn.silu(round_bf16(h[:, :IR]))) * round_bf16(h[:, IR:])
+    )
     xb2[:, :IR] = mid_.astype(BF16)
     wcol = jnp.sum(jnp.where(lane_e8 == e, scr["wn"][...], 0.0), axis=1, keepdims=True)
     u2 = base + T13
@@ -108,7 +112,11 @@ def expert(m: MoEEmit, l_idx, i, carry):
         for j in range(H // CH):
             lo = 2 * IR + j * CH
             y = stream.mm(xm, w2[:, j * CH : (j + 1) * CH])[0:MR]
-            y = rnd(y * scr["es"][s, :, lo : lo + CH]) if has_es else rnd(y)
+            y = (
+                round_bf16(y * scr["es"][s, :, lo : lo + CH])
+                if has_es
+                else round_bf16(y)
+            )
             part[0:MR, j * CH : (j + 1) * CH] += wcol * y
         egive(m, u2, l_idx)
     elif not mp.unroll:
@@ -124,9 +132,9 @@ def expert(m: MoEEmit, l_idx, i, carry):
 
         lax.fori_loop(0, T2, b2, 0)
         y = (
-            rnd(acc[0:MR, :H] * scr["es"][s, :, 2 * IR :])
+            round_bf16(acc[0:MR, :H] * scr["es"][s, :, 2 * IR :])
             if has_es
-            else rnd(acc[0:MR, :H])
+            else round_bf16(acc[0:MR, :H])
         )
         part[0:MR, :] += wcol * y
     else:
@@ -149,9 +157,9 @@ def expert(m: MoEEmit, l_idx, i, carry):
             else:
                 egive(m, u, l_idx, T13 + t)
         y = (
-            rnd(acc[0:MR, :H] * scr["es"][s, :, 2 * IR :])
+            round_bf16(acc[0:MR, :H] * scr["es"][s, :, 2 * IR :])
             if has_es
-            else rnd(acc[0:MR, :H])
+            else round_bf16(acc[0:MR, :H])
         )
         part[0:MR, :] += wcol * y
     return carry
@@ -222,7 +230,9 @@ def experts_piped_ep(m: MoEEmit, l_idx, n_hit):
         es_wait(m, 0)
         has_es = "es" in m.W
         h0 = acc13[:, :BN] * scr["es"][0, :, :BN] if has_es else acc13[:, :BN]
-        mid0 = rnd(rnd(jax.nn.silu(rnd(h0[:, :IR]))) * rnd(h0[:, IR:]))
+        mid0 = round_bf16(
+            round_bf16(jax.nn.silu(round_bf16(h0[:, :IR]))) * round_bf16(h0[:, IR:])
+        )
         xb2[:, :IR] = mid0.astype(BF16)
 
         def body_ep(i, _):
@@ -272,9 +282,9 @@ def experts_piped_ep(m: MoEEmit, l_idx, n_hit):
                 keepdims=True,
             )
             y = (
-                rnd(acc[0:MR, :H] * scr["es"][s_cur, :, BN:])
+                round_bf16(acc[0:MR, :H] * scr["es"][s_cur, :, BN:])
                 if has_es
-                else rnd(acc[0:MR, :H])
+                else round_bf16(acc[0:MR, :H])
             )
             part[0:MR, :] += wcol * y
 
@@ -282,7 +292,10 @@ def experts_piped_ep(m: MoEEmit, l_idx, n_hit):
             h_nxt = (
                 acc13[:, :BN] * scr["es"][s_nxt, :, :BN] if has_es else acc13[:, :BN]
             )
-            mid_nxt = rnd(rnd(jax.nn.silu(rnd(h_nxt[:, :IR]))) * rnd(h_nxt[:, IR:]))
+            mid_nxt = round_bf16(
+                round_bf16(jax.nn.silu(round_bf16(h_nxt[:, :IR])))
+                * round_bf16(h_nxt[:, IR:])
+            )
             xb2[:, :IR] = mid_nxt.astype(BF16)
             return 0
 
@@ -320,8 +333,8 @@ def experts_piped_ep(m: MoEEmit, l_idx, n_hit):
             keepdims=True,
         )
         y_last = (
-            rnd(acc[0:MR, :H] * scr["es"][s_last, :, BN:])
+            round_bf16(acc[0:MR, :H] * scr["es"][s_last, :, BN:])
             if has_es
-            else rnd(acc[0:MR, :H])
+            else round_bf16(acc[0:MR, :H])
         )
         part[0:MR, :] += wcol_last * y_last

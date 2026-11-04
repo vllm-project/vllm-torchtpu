@@ -32,7 +32,7 @@ from tests.megakernel.megakernel_fakes import TINY_TILES, FakeGeometry
 from vllm_torchtpu.megakernel import comm, kernel, planner, stream, vmem
 from vllm_torchtpu.megakernel.errors import MegakernelConfigError
 from vllm_torchtpu.megakernel.exec_spec import ExecSpec
-from vllm_torchtpu.megakernel.ops import BF16, F32, I32, rmsnorm, rnd
+from vllm_torchtpu.megakernel.ops import BF16, F32, I32, rmsnorm, round_bf16
 from vllm_torchtpu.megakernel.spec import (
     LayerType,
     ModelSpec,
@@ -370,7 +370,7 @@ def test_allreduce_ring_modes_in_pallas(R: int, hier: int, rsag: bool):
             term = jnp.sum(
                 (x_all[:, : ex.B] * float(mult)).astype(BF16).astype(F32), axis=0
             )
-            expected = rnd(expected + rnd(term))
+            expected = round_bf16(expected + round_bf16(term))
     for r in range(R):
         assert jnp.allclose(out_all[r, : ex.B], expected, atol=4e-1, rtol=2e-2)
     assert ipc.races is not None and not ipc.races.races_found
@@ -460,7 +460,7 @@ def test_allreduce_ring_single_slot_layer_parity_alternation():
         for r in range(R):
             h = (nx.astype(F32) @ w1_raw[r, lyr].astype(F32)).astype(BF16).astype(F32)
             parts.append((h @ w2_raw[r, lyr].astype(F32)).astype(BF16).astype(F32))
-        res = rnd(res + rnd(parts[0] + parts[1]))
+        res = round_bf16(res + round_bf16(parts[0] + parts[1]))
     ref = rmsnorm(res, fn_0[0], g.eps, zero_centered=bool(g.zero_centered_norm)).astype(
         BF16
     )

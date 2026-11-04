@@ -24,7 +24,7 @@ from typing import Any
 from ..cache import should_fuse_pool_io, should_use_pool_gather
 from ..exec_spec import ExecSpec
 from ..modules.gqa import GQAModule, GQATunables
-from ..ops import rup
+from ..ops import round_up
 from ..pool.config import with_cache
 from ..profile import Profile, get_profile, model_default_profile
 from ..spec import ModelSpec
@@ -333,7 +333,7 @@ class BucketPolicy:
 
     def out_rows(self, b: int, m_rows: int | None = None) -> int:
         """Return output row count for bucket `b` given `token_paddings`."""
-        eff_m = max(16, rup(b, 16)) if m_rows is None else int(m_rows)
+        eff_m = max(16, round_up(b, 16)) if m_rows is None else int(m_rows)
         return next((p for p in self.token_paddings if p >= b), eff_m)
 
     def iter_buckets(self) -> Iterator[tuple[int, int]]:

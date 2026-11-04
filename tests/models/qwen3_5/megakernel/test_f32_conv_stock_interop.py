@@ -429,7 +429,7 @@ def _mk_read(raw: jax.Array, slots: Any, T: int = 1) -> tuple[np.ndarray, np.nda
     if T == 1:  # rows j * n + s hold tap j of sequence s
         taps = conv[: TAPS * n].reshape(TAPS, n, DIM).swapaxes(0, 1)
         pad = conv[TAPS * n :]
-    else:  # one (rup(TAPS + T, 8), DIM) window per sequence
+    else:  # one (round_up(TAPS + T, 8), DIM) window per sequence
         taps, pad = conv[:, :TAPS], conv[:, TAPS:]
     assert not pad.any()
     return taps, np.asarray(rec)[0].reshape(n, N_V, D, D)

@@ -22,7 +22,7 @@ import jax.numpy as jnp
 from jax import lax
 from jax.experimental import pallas as pl
 
-from ...ops import F32, I32, rnd
+from ...ops import F32, I32, round_bf16
 from .context import GQAEmit
 
 
@@ -74,7 +74,7 @@ def att_new(cx: GQAEmit) -> None:
                         m_old = jnp.where(upd, m_new, m_old)
                         l_old = jnp.where(upd, l_new, l_old)
                         a_old = jnp.where(upd, a_new, a_old)
-                ob = rnd(a_old / l_old)
+                ob = round_bf16(a_old / l_old)
                 for j in range(NHH):
                     scr["ost"][j, r0 : r0 + QG, :] = ob[:, j * 128 : (j + 1) * 128]
         else:
@@ -122,18 +122,18 @@ def att_new(cx: GQAEmit) -> None:
                     l_tot = l_old * alpha + p_new
                     outb = (a_old * alpha + p_new * scr["vnew"][b : b + 1, :]) / l_tot
                 if QV:
-                    ob = rnd(outb[:nh])
+                    ob = round_bf16(outb[:nh])
                     for j in range(NHH):
                         scr["ost"][j, b * SR : b * SR + nh, :] = ob[
                             :, j * 128 : (j + 1) * 128
                         ]
                     continue
                 for h in range(nh):
-                    oh = rnd(outb[h : h + 1, :])
+                    oh = round_bf16(outb[h : h + 1, :])
                     gh = scr["gate"][b : b + 1, h * HD : (h + 1) * HD]
                     if not SPLIT:
-                        gh = rnd(jax.nn.sigmoid(gh))
-                    scr["mix"][b : b + 1, h * HD : (h + 1) * HD] = rnd(oh * gh)
+                        gh = round_bf16(jax.nn.sigmoid(gh))
+                    scr["mix"][b : b + 1, h * HD : (h + 1) * HD] = round_bf16(oh * gh)
         if QV:
             for h in range(nh):
                 oh = jnp.concatenate(
@@ -145,5 +145,5 @@ def att_new(cx: GQAEmit) -> None:
                 )
                 gh = scr["gate"][:B, h * HD : (h + 1) * HD]
                 if not SPLIT:
-                    gh = rnd(jax.nn.sigmoid(gh))
-                scr["mix"][:B, h * HD : (h + 1) * HD] = rnd(oh * gh)
+                    gh = round_bf16(jax.nn.sigmoid(gh))
+                scr["mix"][:B, h * HD : (h + 1) * HD] = round_bf16(oh * gh)

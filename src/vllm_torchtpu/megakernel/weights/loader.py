@@ -22,7 +22,7 @@ from .. import planner
 from ..decls import HFParamDecl, VLLMAlias
 from ..exec_spec import ExecSpec
 from ..module import Module
-from ..ops import F32, rup
+from ..ops import F32, round_up
 from ..spec import SwitchSlot
 from .eplb import resolve_mapping_ecopy
 from .logical import resolve_spec_and_norms, switch_branch_for_layer
@@ -291,7 +291,7 @@ def load_weights(
 
         parts: list[Any] = []
         for field_name, (_, width) in p.smalls_layout.items():
-            padded_w = rup(width, 128)
+            padded_w = round_up(width, 128)
             v = small_fields.get(field_name)
             if v is None:
                 parts.append(ops.zeros((padded_w,), F32))

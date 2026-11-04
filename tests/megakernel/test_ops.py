@@ -29,19 +29,19 @@ from vllm_torchtpu.megakernel.ops import (
     gdn_gate_act,
     rms_zc,
     rmsnorm,
-    rnd,
     rope_partial,
-    rup,
+    round_bf16,
+    round_up,
     silu_mul,
     validate_gdn_gate,
 )
 
 
 def test_ops_primitives():
-    """Verify `rup`, `rnd`, `rmsnorm`, `rope_partial`, `silu_mul`, and `bswitch`."""
-    assert rup(1, 128) == 128
-    assert rup(128, 128) == 128
-    assert rup(129, 128) == 256
+    """Verify `round_up`, `round_bf16`, `rmsnorm`, `rope_partial`, and `silu_mul`."""
+    assert round_up(1, 128) == 128
+    assert round_up(128, 128) == 128
+    assert round_up(129, 128) == 256
 
     x = jnp.ones((4, 128), dtype=F32)
     w = jnp.zeros((1, 128), dtype=F32)
@@ -60,7 +60,7 @@ def test_ops_primitives():
     cos = jnp.ones((1, 16), dtype=F32)
     sin = jnp.zeros((1, 16), dtype=F32)
     rx = rope_partial(x, cos, sin, 32)
-    assert jnp.allclose(rx, rnd(x))
+    assert jnp.allclose(rx, round_bf16(x))
 
     # SwiGLU and bswitch
     sm = silu_mul(x, x)
@@ -92,7 +92,10 @@ def test_fp32_intermediate_precision_rope_and_swiglu():
     err_fp32 = np.max(np.abs(np.asarray(out_rope[:, :64], dtype=np.float64) - ref_rot))
     x1, x2 = x[:, :32], x[:, 32:64]
     legacy_rot = jnp.concatenate(
-        [rnd(rnd(x1 * cos) - rnd(x2 * sin)), rnd(rnd(x2 * cos) + rnd(x1 * sin))],
+        [
+            round_bf16(round_bf16(x1 * cos) - round_bf16(x2 * sin)),
+            round_bf16(round_bf16(x2 * cos) + round_bf16(x1 * sin)),
+        ],
         axis=-1,
     )
     err_legacy = np.max(np.abs(np.asarray(legacy_rot, dtype=np.float64) - ref_rot))
@@ -121,8 +124,8 @@ def test_default_bf16_rounded_intermediates_rope_and_swiglu():
     x1, x2, rest = x[:, :32], x[:, 32:64], x[:, 64:]
     expected_rope = jnp.concatenate(
         (
-            rnd(rnd(x1 * cos) - rnd(x2 * sin)),
-            rnd(rnd(x2 * cos) + rnd(x1 * sin)),
+            round_bf16(round_bf16(x1 * cos) - round_bf16(x2 * sin)),
+            round_bf16(round_bf16(x2 * cos) + round_bf16(x1 * sin)),
             rest,
         ),
         axis=-1,
@@ -133,7 +136,7 @@ def test_default_bf16_rounded_intermediates_rope_and_swiglu():
     )
 
     out_swiglu = silu_mul(x, up)
-    expected_swiglu = (rnd(jax.nn.silu(x)) * up).astype(BF16)
+    expected_swiglu = (round_bf16(jax.nn.silu(x)) * up).astype(BF16)
     np.testing.assert_array_equal(
         np.asarray(out_swiglu).view(np.uint16),
         np.asarray(expected_swiglu).view(np.uint16),

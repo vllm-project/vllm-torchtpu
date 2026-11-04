@@ -40,7 +40,7 @@ from vllm_torchtpu.megakernel import comm, modules, planner, stream, vmem
 from vllm_torchtpu.megakernel.errors import MegakernelConfigError
 from vllm_torchtpu.megakernel.exec_spec import ExecSpec
 from vllm_torchtpu.megakernel.modules import MoEModule
-from vllm_torchtpu.megakernel.ops import BF16, F32, FP8, I32, rmsnorm, rnd
+from vllm_torchtpu.megakernel.ops import BF16, F32, FP8, I32, rmsnorm, round_bf16
 from vllm_torchtpu.megakernel.spec import LayerType, ModelSpec
 
 MODULES_DIR = pathlib.Path(modules.__file__).resolve().parent
@@ -436,7 +436,10 @@ def test_moe_module_numerical_parity(moe_tp: bool, R: int, pipe: bool):
     for r in range(R):
         g13 = (xb_moe @ sh13[r].astype(F32)) * sh13_s[r]
         mid_sh = (
-            rnd(rnd(jax.nn.silu(rnd(g13[:, :ISR]))) * rnd(g13[:, ISR:]))
+            round_bf16(
+                round_bf16(jax.nn.silu(round_bf16(g13[:, :ISR])))
+                * round_bf16(g13[:, ISR:])
+            )
             .astype(BF16)
             .astype(F32)
         )
@@ -451,11 +454,14 @@ def test_moe_module_numerical_parity(moe_tp: bool, R: int, pipe: bool):
                     r, w_slot
                 ]
                 mid_e = (
-                    rnd(rnd(jax.nn.silu(rnd(h_e[:, :IR]))) * rnd(h_e[:, IR:]))
+                    round_bf16(
+                        round_bf16(jax.nn.silu(round_bf16(h_e[:, :IR])))
+                        * round_bf16(h_e[:, IR:])
+                    )
                     .astype(BF16)
                     .astype(F32)
                 )
-                y_e = rnd((mid_e @ e2[r, w_slot].astype(F32)) * e2_s[r, w_slot])
+                y_e = round_bf16((mid_e @ e2[r, w_slot].astype(F32)) * e2_s[r, w_slot])
                 part_r = part_r.at[b : b + 1].add(top_w[b, k] * y_e)
         partials.append(part_r.astype(BF16).astype(F32))
 

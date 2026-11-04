@@ -22,7 +22,7 @@ import jax
 import jax.numpy as jnp
 
 from ...exec_spec import ExecSpec
-from ...ops import BF16, F32, FP8, rmsnorm, rnd, rope_partial
+from ...ops import BF16, F32, FP8, rmsnorm, rope_partial, round_bf16
 from ...pool.config import cache_exec
 
 
@@ -101,9 +101,9 @@ def gqa_reference(
     for r in range(R):
         w_in = w_att_in_l[r].astype(F32)
         y = (
-            rnd((xb @ w_in) * att_in_s_l[r])
+            round_bf16((xb @ w_in) * att_in_s_l[r])
             if att_in_s_l is not None
-            else rnd(xb @ w_in)
+            else round_bf16(xb @ w_in)
         )
 
         qn = qn_l[r]
@@ -116,11 +116,11 @@ def gqa_reference(
         v_new_r = []
         for b in range(B):
             ang = pos[b].astype(F32) * inv
-            cos, sin = rnd(jnp.cos(ang)), rnd(jnp.sin(ang))
+            cos, sin = round_bf16(jnp.cos(ang)), round_bf16(jnp.sin(ang))
             qb = rmsnorm(qg[b, :, :HD], qn, eps, zero_centered=zc)
             kb = rmsnorm(y[b : b + 1, koff : koff + HD], kn, eps, zero_centered=zc)
             vb = y[b : b + 1, koff + HD : koff + 2 * HD]
-            qb = rnd(
+            qb = round_bf16(
                 rope_partial(qb, cos, sin, ROT, round_intermediates=rope_round)
                 * (HD**-0.5)
             )
@@ -162,9 +162,9 @@ def gqa_reference(
             vals = jnp.concatenate([v_cache, new_v], axis=0)
             probs = jax.nn.softmax(scores, axis=-1)
             out_b = probs @ vals
-            oh = rnd(out_b).reshape(nh * HD)
-            gh = rnd(jax.nn.sigmoid(gate[b]))
-            mix_r.append(rnd(oh * gh))
+            oh = round_bf16(out_b).reshape(nh * HD)
+            gh = round_bf16(jax.nn.sigmoid(gate[b]))
+            mix_r.append(round_bf16(oh * gh))
         mix_r_arr = jnp.stack(mix_r, axis=0).astype(BF16).astype(F32)
         w_out = w_att_out_l[r].astype(F32)
         yo = (

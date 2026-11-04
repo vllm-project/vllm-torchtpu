@@ -24,7 +24,7 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from ...ops import BF16, F32, I32, U32, bswitch, rup
+from ...ops import BF16, F32, I32, U32, bswitch, round_up
 from ...pool.backend import kernel_debug_check
 from ...pool.checks import safe_page_base
 from ...pool.config import cache_exec
@@ -381,13 +381,13 @@ def gdn_pack_logical_states(
     n_layers = conv_l.shape[1]
     if conv_l.ndim == 5 and conv_l.shape[3] == conv_taps:
         if T == 1:
-            cr = rup(conv_taps * B, 8)
+            cr = round_up(conv_taps * B, 8)
             conv_tb = jnp.swapaxes(conv_l, 2, 3).reshape(
                 R, n_layers, conv_taps * B, lay.QKV
             )
             conv_p = jnp.pad(conv_tb, ((0, 0), (0, 0), (0, cr - conv_taps * B), (0, 0)))
         else:
-            hr = rup(conv_taps + T, 8)
+            hr = round_up(conv_taps + T, 8)
             conv_p = jnp.pad(
                 conv_l, ((0, 0), (0, 0), (0, 0), (0, hr - conv_taps), (0, 0))
             )

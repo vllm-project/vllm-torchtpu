@@ -39,7 +39,7 @@ from .module_options import (
     registered_tunables,
     tunables_class,
 )
-from .ops import rup
+from .ops import round_up
 
 _T = TypeVar("_T")
 
@@ -279,11 +279,11 @@ class ExecSpec:
 
     @property
     def MR(self) -> int:
-        return rup(self.B, 8)
+        return round_up(self.B, 8)
 
     @property
     def M(self) -> int:
-        return max(16, rup(self.B, 16))
+        return max(16, round_up(self.B, 16))
 
     @property
     def MB(self) -> int:

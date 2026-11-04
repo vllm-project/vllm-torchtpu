@@ -62,7 +62,7 @@ from vllm_torchtpu.megakernel.modules import (
     MoEModule,
     Norm,
 )
-from vllm_torchtpu.megakernel.ops import BF16, F32, rnd
+from vllm_torchtpu.megakernel.ops import BF16, F32, round_bf16
 from vllm_torchtpu.megakernel.profile import DEFAULT_PROFILE, Profile
 from vllm_torchtpu.models.qwen3_5.megakernel import model as qwen35
 from vllm_torchtpu.models.qwen3_5.megakernel import pool as qwen35_pool
@@ -252,7 +252,10 @@ class _DenseMLPModule(MoEModule):
             )
             g13 = (xb @ sh13_l[r].astype(F32)) * sh13_s_l[r]
             mid = (
-                rnd(rnd(jax.nn.silu(rnd(g13[:, :ISR]))) * rnd(g13[:, ISR:]))
+                round_bf16(
+                    round_bf16(jax.nn.silu(round_bf16(g13[:, :ISR])))
+                    * round_bf16(g13[:, ISR:])
+                )
                 .astype(BF16)
                 .astype(F32)
             )
@@ -1548,7 +1551,7 @@ def test_qwen35_model_def_composed_reference_matches_module_loop(
     gdn_mod = GDNModule(geometry=g)
     moe_mod = MoEModule(geometry=g)
     lay_gdn = GDNModule.lin_in_layout(g, ex)
-    cr, hr = mk.rup(3 * ex.B, 8), mk.rup(3 + ex.T, 8)
+    cr, hr = mk.round_up(3 * ex.B, 8), mk.round_up(3 + ex.T, 8)
     conv_in = st_l["conv"].astype(BF16).astype(F32) if pool_io else st_l["conv"]
     rec_in = st_l["rec"].reshape(
         ex.R, g.NGDN, ex.NS, lay_gdn.vh, lay_gdn.KD, lay_gdn.VD
@@ -1593,12 +1596,12 @@ def test_qwen35_model_def_composed_reference_matches_module_loop(
                 layer_idx=lyr,
                 multi_layer=True,
             )
-        res = rnd(res + d_m)
+        res = round_bf16(res + d_m)
         x_f, _ = post_norm_mod.reference(w_l["post_norm"][lyr], res, g=g)
         d_f, step_state = moe_mod.reference(
             w_l, x_f, step_state, g=g, ex=ex, layer_idx=lyr
         )
-        res = rnd(res + d_f)
+        res = round_bf16(res + d_f)
     out_hand, _ = final_norm_mod.reference(w_l["final_norm"], res, g=g, out_dtype=BF16)
     conv_out = (
         step_state["conv_out"].astype(BF16).astype(F32)

@@ -22,7 +22,7 @@ from jax.experimental.pallas import tpu as pltpu
 
 from ..errors import MegakernelConfigError
 from ..exec_spec import ExecSpec, Tiles
-from ..ops import BF16, col_chunk, rup
+from ..ops import BF16, col_chunk, round_up
 
 
 @dataclass(frozen=True)
@@ -67,7 +67,7 @@ def comm_params(
         )
     HPC = H // PC
     if PR is None:
-        PR = rup(B * HPC, 16)
+        PR = round_up(B * HPC, 16)
     HIER = tiles.hier if R > 1 else 0
     RSAG = tiles.rsag and R > 1 and HIER == 0
     WAR = (

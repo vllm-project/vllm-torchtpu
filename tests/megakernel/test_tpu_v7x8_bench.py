@@ -58,7 +58,7 @@ from vllm_torchtpu.megakernel.ops import (  # noqa: E402
     F32,
     FP8,
     I32,
-    rup,
+    round_up,
 )
 from vllm_torchtpu.models.qwen3_5.megakernel import model as qwen35  # noqa: E402
 from vllm_torchtpu.models.qwen3_5.megakernel.profiles import PROFILES  # noqa: E402
@@ -374,7 +374,9 @@ def _init_bucket_inputs_on_tpu(
     qkv = g.QKV(R)
     vh = g.vh(R)
     conv_shape = (
-        (ngdn, rup(3 * B, 8), qkv) if T == 1 else (ngdn, NS, rup(3 + T, 8), qkv)
+        (ngdn, round_up(3 * B, 8), qkv)
+        if T == 1
+        else (ngdn, NS, round_up(3 + T, 8), qkv)
     )
 
     base_pos = jnp.int32(2048) + jnp.arange(NS, dtype=I32) * jnp.int32(16)
@@ -818,9 +820,9 @@ def test_m2_tpu_v7x8_full_ep_parity_and_latency():
             kc_60 = jnp.tile(kc_15, (4, 1, 1, 1))
             vc_60 = jnp.tile(vc_15, (4, 1, 1, 1))
             conv_0 = (
-                jnp.zeros((1, rup(3 * _b, 8), g.QKV(8)), dtype=F32)
+                jnp.zeros((1, round_up(3 * _b, 8), g.QKV(8)), dtype=F32)
                 if _t == 1
-                else jnp.zeros((1, _b // _t, rup(3 + _t, 8), g.QKV(8)), dtype=F32)
+                else jnp.zeros((1, _b // _t, round_up(3 + _t, 8), g.QKV(8)), dtype=F32)
             )
             rec_0 = jnp.zeros((1, (_b // _t) * g.vh(8), g.KD, g.VD), dtype=BF16)
             return kc_60, vc_60, conv_0, rec_0

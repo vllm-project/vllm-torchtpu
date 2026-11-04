@@ -81,7 +81,7 @@ from jax.experimental.pallas import tpu as pltpu
 
 from ..exec_spec import ExecSpec
 from ..fused_io_hook import FusedPoolIO, register_fused_io
-from ..ops import BF16, F32, FP8, I32, U32, bswitch, gdn_gate_act, rnd, rup
+from ..ops import BF16, F32, FP8, I32, U32, bswitch, gdn_gate_act, round_bf16, round_up
 from ..pool.checks import safe_kv_page, safe_page_base
 from ..pool.config import POOL_STATE_NAME, cache_exec
 from ..pool.layout import LANES
@@ -759,7 +759,9 @@ def gdn_fused_emit(ctx: Any, gp: Any, o: Any, slot: Any) -> Any:
             y = stream.dmatmul("lin_in", scr["xb"], NLI)
             ybuf = scr["ybuf"]
             ybuf[:, :NLI] = (
-                rnd(y * ctx.sm(slot, "in_s", NLI)) if gp.in_scaled else rnd(y)
+                round_bf16(y * ctx.sm(slot, "in_s", NLI))
+                if gp.in_scaled
+                else round_bf16(y)
             )
 
         ow, _ = stream.sp.lay["conv"]
@@ -769,7 +771,9 @@ def gdn_fused_emit(ctx: Any, gp: Any, o: Any, slot: Any) -> Any:
         gnw = ctx.sm(slot, "gnorm")[0, :].astype(BF16)
         expand = vh // kh
         row_iota_conv = lax.broadcasted_iota(I32, (A_conv, QKV), 0)
-        conv_live = rup(3 * qkv_128, 8) if conv_is_f32 else rup(3 * qkv_128, 16)
+        conv_live = (
+            round_up(3 * qkv_128, 8) if conv_is_f32 else round_up(3 * qkv_128, 16)
+        )
         conv_fast = (
             gp.conv_stage
             and QKV % 128 == 0
@@ -851,7 +855,7 @@ def gdn_fused_emit(ctx: Any, gp: Any, o: Any, slot: Any) -> Any:
                     for t in range(T):
                         b = s * T + t
                         x_t = ybuf[b : b + 1, 0:QKV]
-                        u_t = rnd(
+                        u_t = round_bf16(
                             jax.nn.silu(
                                 c0 * taps[0]
                                 + c1 * taps[1]
@@ -873,7 +877,7 @@ def gdn_fused_emit(ctx: Any, gp: Any, o: Any, slot: Any) -> Any:
                         cb = (t % NCB) * 2 * kh
                         sb[cb : cb + kh] = colsk(k)
                         sb[cb + kh : cb + 2 * kh] = colsk(q)
-                        beta = rnd(jax.nn.sigmoid(ybuf[b, BA : BA + vh]))
+                        beta = round_bf16(jax.nn.sigmoid(ybuf[b, BA : BA + vh]))
                         a = ybuf[b, A_OFF : A_OFF + vh]
                         g_dec = -jnp.exp(alog) * jax.nn.softplus(a + dtb)
                         eg = jnp.exp(g_dec)[:, None, None]
@@ -928,7 +932,7 @@ def gdn_fused_emit(ctx: Any, gp: Any, o: Any, slot: Any) -> Any:
                                 ov[h * HR2 : (h + 1) * HR2, :] = pltpu.bitcast(
                                     nb_h.reshape(KD, VD), U32
                                 )
-                        out = rnd(out_acc)
+                        out = round_bf16(out_acc)
                         if interpret:
                             s_bf16 = jnp.concatenate(new_heads, axis=0)
                         val = out * lax.rsqrt(
@@ -937,7 +941,7 @@ def gdn_fused_emit(ctx: Any, gp: Any, o: Any, slot: Any) -> Any:
                         val = (gnw[None, :] * val.astype(BF16)).astype(F32)
                         zz = ybuf[b, QKV : QKV + Z].reshape(vh, VD)
                         g_act = gdn_gate_act(gp.gate)
-                        scr["mix"][b, :Z] = rnd(val * g_act(zz)).reshape(Z)
+                        scr["mix"][b, :Z] = round_bf16(val * g_act(zz)).reshape(Z)
 
                         if interpret:
                             # Convert bf16 row-pairs directly to fp8 bytes without an

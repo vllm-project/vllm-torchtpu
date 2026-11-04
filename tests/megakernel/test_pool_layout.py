@@ -129,7 +129,7 @@ def test_layout_f32_conv_geometry_and_in_kernel_windows():
     """An f32 conv window (the serving framework's pooled conv dtype) keeps the
     slot geometry; its rows are one u32 row each, so a conv page holds 128.
     GPR copies the whole conv page for f32 conv (128 page rows) and fused pool
-    I/O stages `rup(taps + T, 8)` f32 rows, so at Qwen3.5 TP8 both fit up to
+    I/O stages `round_up(taps + T, 8)` f32 rows, so at Qwen3.5 TP8 both fit up to
     T=5 and fail closed past it."""
     import jax.numpy as jnp
 
@@ -149,7 +149,7 @@ def test_layout_f32_conv_geometry_and_in_kernel_windows():
     f32.validate(with_cache(split, pool_gather=True))
     assert (bf16.fused_conv_rows(4, 8), f32.fused_conv_rows(4, 8)) == (192, 96)
     f32.validate(with_cache(split, fused_pool_io=True))  # 8 * 12 <= 128
-    wide = with_cache(_exec(R=8, B=8, T=6), paged_kv=True)  # rup(3 + 6, 8) = 16
+    wide = with_cache(_exec(R=8, B=8, T=6), paged_kv=True)  # round_up(3 + 6, 8) = 16
     assert f32.gpr_conv_rows(6, R=8) == 192 and not f32.gpr_conv_fits(6, R=8)
     with pytest.raises(MegakernelConfigError, match="in-kernel gather"):
         f32.validate(with_cache(wide, pool_gather=True))

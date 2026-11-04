@@ -23,7 +23,7 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from ...ops import BF16, F32, I32, rnd, rup
+from ...ops import BF16, F32, I32, round_bf16, round_up
 from .params import GDNParams
 from .states import (
     conv_out_src,
@@ -75,7 +75,9 @@ def gdn_in(ctx: Any, gp: GDNParams, o: Any, slot: Any) -> Any:
 
         y = stream.dmatmul("lin_in", scr["xb"], NLI)
         ybuf = scr["ybuf"]
-        ybuf[:, :NLI] = rnd(y * ctx.sm(slot, "in_s", NLI)) if gp.in_scaled else rnd(y)
+        ybuf[:, :NLI] = (
+            round_bf16(y * ctx.sm(slot, "in_s", NLI)) if gp.in_scaled else round_bf16(y)
+        )
     return ybuf
 
 
@@ -144,7 +146,7 @@ def conv_step(ctx: Any, gp: GDNParams, o: Any, slot: Any, ybuf: Any) -> Any:
             for s in range(NS):
                 convb[s, 3 : 3 + T, :] = ybuf[s * T : (s + 1) * T, 0:QKV]
                 w = [convb[s, k : k + T, :] for k in range(4)]
-                u_ = rnd(
+                u_ = round_bf16(
                     jax.nn.silu(
                         w[0] * taps[0]
                         + w[1] * taps[1]
@@ -163,7 +165,7 @@ def conv_step(ctx: Any, gp: GDNParams, o: Any, slot: Any, ybuf: Any) -> Any:
             s0 = convb[0:B, :]
             s1 = convb[B : 2 * B, :]
             s2 = convb[2 * B : 3 * B, :]
-            u = rnd(
+            u = round_bf16(
                 jax.nn.silu(s0 * taps[0] + s1 * taps[1] + s2 * taps[2] + x * taps[3])
             )
             convb[0:B, :] = s1
@@ -178,7 +180,7 @@ def conv_step(ctx: Any, gp: GDNParams, o: Any, slot: Any, ybuf: Any) -> Any:
                 sem.at[2],
             ).start()
         if GCH:
-            b_pad = rup(B, 8)
+            b_pad = round_up(B, 8)
             u_pad = jnp.pad(u, ((0, b_pad - B), (0, 0))) if b_pad > B else u
             ybuf[0:b_pad, 0:QKV] = u_pad
     return u

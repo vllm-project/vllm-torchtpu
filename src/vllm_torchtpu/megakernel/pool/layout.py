@@ -54,7 +54,7 @@ import jax.numpy as jnp
 
 from ..decls import KVCacheDecl, RecurrentCacheDecl
 from ..errors import MegakernelConfigError
-from ..ops import BF16, F32, FP8, rup
+from ..ops import BF16, F32, FP8, round_up
 from .config import cache_exec
 
 if TYPE_CHECKING:
@@ -72,7 +72,7 @@ LANES = 128
 # - `rec_pages_per_slot == 4`, `conv_pages_per_slot == 1`: the only slot
 #   geometry exercised on TPU.
 # - `KD == VD == LANES`, `conv_taps == 3`: recurrent rows are one lane-row wide
-#   and the recurrent conv state shapes (`rup(3 * B, 8)`, `rup(3 + T, 8)`)
+#   and the recurrent conv state shapes (`round_up(3 * B, 8)`, `round_up(3 + T, 8)`)
 #   hard-code the 3-tap window.
 VALIDATED_HD = 256
 VALIDATED_PAGE_SIZE = 128
@@ -196,9 +196,9 @@ class PoolLayout:
 
     def gpr_conv_rows(self, T: int, R: int) -> int | None:
         """`(rows, 4, page_size)` fp8 page rows of the in-kernel gather (GPR)
-        conv window `(rup(conv_taps + T, 8), QKV)` per rank, or None when the
+        conv window `(round_up(conv_taps + T, 8), QKV)` per rank, or None when the
         window does not fill whole rows (see `gpr_conv_row_limit`)."""
-        hr = rup(self.conv_taps + T, 8)
+        hr = round_up(self.conv_taps + T, 8)
         conv_bytes = hr * self.qkv_per_rank(R) * self.conv_itemsize
         row_bytes = self.kv_page_shape[2] * self.page_size
         if conv_bytes % row_bytes != 0:
@@ -220,9 +220,9 @@ class PoolLayout:
 
     def fused_conv_rows(self, T: int, R: int) -> int:
         """Conv page rows (`conv_page_rows` units) fused pool I/O stages per
-        rank: `(A, QKV)` with `A = max(16, rup(conv_taps + T, 8))` bf16 rows
-        for bf16 conv, `A = rup(conv_taps + T, 8)` f32 rows for f32 conv."""
-        hr = rup(self.conv_taps + T, 8)
+        rank: `(A, QKV)` with `A = max(16, round_up(conv_taps + T, 8))` bf16 rows
+        for bf16 conv, `A = round_up(conv_taps + T, 8)` f32 rows for f32 conv."""
+        hr = round_up(self.conv_taps + T, 8)
         a_conv = max(16, hr) if self.conv_itemsize == 2 else hr
         return a_conv * (self.qkv_per_rank(R) // LANES)
 
@@ -247,7 +247,7 @@ class PoolLayout:
 
     def conv_rows_pad(self, R: int) -> int:
         """`conv_rows` rounded to the dtype's sublane tile (16 bf16 / 8 f32)."""
-        return rup(self.conv_rows(R), 32 // self.conv_itemsize)
+        return round_up(self.conv_rows(R), 32 // self.conv_itemsize)
 
     def conv_bytes(self, R: int) -> int:
         """Bytes of one sequence's per-rank conv window."""
@@ -350,7 +350,7 @@ class PoolLayout:
             f"per-rank conv window ({conv_rows_pad} rows) exceeds one conv "
             f"page ({self.conv_page_rows} rows)",
         )
-        # In-kernel paths stage the whole `(rup(conv_taps + T, 8), QKV)` verify
+        # In-kernel paths stage the whole `(round_up(conv_taps + T, 8), QKV)` verify
         # window: GPR in the conv page rows it copies (`gpr_conv_fits`), fused
         # pool I/O in the whole conv page (`fused_conv_rows`).
         _need(

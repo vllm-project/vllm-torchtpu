@@ -23,7 +23,7 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from ..ops import BF16, F32, rnd
+from ..ops import BF16, F32, round_bf16
 from .params import CommParams
 
 
@@ -166,7 +166,7 @@ class AllReduceRing:
                 send[slot] = val.astype(BF16)
                 recv[slot, me] = send[slot]
         if not self.comm:
-            return rnd(val)
+            return round_bf16(val)
         with sc("ar_comm"):
             self.ar_round(slot, 0)
         if HIER == 3:
@@ -228,7 +228,7 @@ class AllReduceRing:
                 tot = jnp.concatenate(
                     [tot[j * cp.B : (j + 1) * cp.B] for j in range(cp.HPC)], axis=-1
                 )
-            res[0 : cp.B, :] = rnd(res[0 : cp.B, :] + tot[0 : cp.B])
+            res[0 : cp.B, :] = round_bf16(res[0 : cp.B, :] + tot[0 : cp.B])
 
     def group_copies(self, src, dst, ssem, rsem, G: int):
         """Remote copies `src(off) -> dst` on group peer `me ^ off` (`1..G-1`)."""

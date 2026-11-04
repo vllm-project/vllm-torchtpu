@@ -33,7 +33,7 @@ from ...errors import MegakernelConfigError
 from ...exec_spec import ExecSpec
 from ...fused_io_hook import fused_io
 from ...module import Module
-from ...ops import BF16, F32, FP8, I32, rnd
+from ...ops import BF16, F32, FP8, I32, round_bf16
 from ...pool.config import POOL_STATE_NAME, cache_exec, resolved_max_pages_per_seq
 from ...spec import SmallField, StateDecl, WeightDecl
 from .attention import att_core
@@ -255,8 +255,8 @@ class GQAModule(Module):
             for b in range(ex.B):
                 pf = jnp.where(rows_ == b, pos_ref[b].astype(F32), pf)
             ang_ = pf * inv_
-            scr["rope"][0, :, :half_] = rnd(jnp.cos(ang_))
-            scr["rope"][1, :, :half_] = rnd(jnp.sin(ang_))
+            scr["rope"][0, :, :half_] = round_bf16(jnp.cos(ang_))
+            scr["rope"][1, :, :half_] = round_bf16(jnp.sin(ang_))
 
     def emit(self, ctx: Any, l: Any, slot: Any) -> Any:  # noqa: E741
         ap: GQAParams = ctx.module_params(self.name)

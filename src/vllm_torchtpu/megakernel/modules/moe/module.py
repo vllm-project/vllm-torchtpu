@@ -35,7 +35,7 @@ from ...decls import (
 from ...errors import MegakernelConfigError
 from ...exec_spec import ExecSpec
 from ...module import Module
-from ...ops import BF16, F32, FP8, I32, rnd, rup
+from ...ops import BF16, F32, FP8, I32, round_bf16, round_up
 from ...spec import ExtraInput, SmallField, WeightDecl
 from .context import MoEEmit
 from .decls import (
@@ -252,7 +252,7 @@ class MoEModule(Module):
 
     def scratch(self, g: Any, ex: ExecSpec, plan: Any) -> dict[str, Any]:
         mp: MoEParams = plan.module_params[self.name]
-        nb_picks = rup(ex.B * mp.TOPK, 128)
+        nb_picks = round_up(ex.B * mp.TOPK, 128)
         scr: dict[str, Any] = {
             "wn": pltpu.VMEM((ex.MR, mp.E), F32),
             "sg": pltpu.VMEM((ex.MB, 128), F32),
@@ -360,7 +360,10 @@ class MoEModule(Module):
                 g13 = stream.dmatmul("sh13", scr["xb"], 2 * ISR)
                 if mp.sh13_scaled:
                     g13 = g13 * ctx.sm(slot, "sh13_s")
-                mid = rnd(rnd(jax.nn.silu(rnd(g13[:, :ISR]))) * rnd(g13[:, ISR:]))
+                mid = round_bf16(
+                    round_bf16(jax.nn.silu(round_bf16(g13[:, :ISR])))
+                    * round_bf16(g13[:, ISR:])
+                )
                 scr["xb2"][:, :ISR] = mid.astype(BF16)
                 ysh = stream.dmatmul("sh2", scr["xb2"], H)
                 if mp.sh2_scaled:

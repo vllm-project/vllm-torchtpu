@@ -204,7 +204,7 @@ def _check_scatter(
 
 
 def test_scatter_direct_conv_window_when_the_caller_conv_is_short():
-    """At `T=5` the caller's `rup(3 + T, 8)` conv rows are one short of the
+    """At `T=5` the caller's `round_up(3 + T, 8)` conv rows are one short of the
     `taps + 1 + T` rows of the exact-window direct path (12 lane-rows per rank):
     the scatter falls back to the packed copy instead of failing."""
     lay = replace(_layout(1, num_pools=1), kh=4, vh=4)

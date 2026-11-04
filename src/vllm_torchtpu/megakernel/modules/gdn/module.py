@@ -36,7 +36,7 @@ from ...errors import MegakernelConfigError
 from ...exec_spec import ExecSpec
 from ...fused_io_hook import fused_io
 from ...module import Module
-from ...ops import BF16, F32, FP8, I32, rup
+from ...ops import BF16, F32, FP8, I32, round_up
 from ...pool.config import cache_exec
 from ...spec import SmallField, StateDecl, WeightDecl
 from .conv import conv_step, gdn_in
@@ -247,9 +247,9 @@ class GDNModule(Module):
         lay = self.lin_in_layout(g, ex)
         taps = self.cache_decl(g).conv_taps
         conv_shape = (
-            (rup(taps * ex.B, 8), lay.QKV)
+            (round_up(taps * ex.B, 8), lay.QKV)
             if ex.T == 1
-            else (ex.NS, rup(taps + ex.T, 8), lay.QKV)
+            else (ex.NS, round_up(taps + ex.T, 8), lay.QKV)
         )
         return [
             StateDecl("conv", shape=conv_shape, dtype=F32, access="rw"),
@@ -268,7 +268,7 @@ class GDNModule(Module):
             return [
                 StateDecl(
                     "conv_ckpt",
-                    shape=(ex.NS, rup(taps + ex.T, 8), lay.QKV),
+                    shape=(ex.NS, round_up(taps + ex.T, 8), lay.QKV),
                     dtype=BF16 if (cache_exec(ex).GPR and not conv_is_f32) else F32,
                     access="w",
                 ),
@@ -281,7 +281,7 @@ class GDNModule(Module):
             ]
         return [
             StateDecl(
-                "conv", shape=(rup(taps * ex.B, 8), lay.QKV), dtype=F32, access="w"
+                "conv", shape=(round_up(taps * ex.B, 8), lay.QKV), dtype=F32, access="w"
             ),
             StateDecl(
                 "rec", shape=(ex.B * lay.vh, lay.KD, lay.VD), dtype=BF16, access="w"
@@ -340,7 +340,7 @@ class GDNModule(Module):
         if ex.VER and not gp.GCH:
             scr.update(
                 {
-                    "ub": pltpu.VMEM((ex.NS, rup(ex.T, 8), gp.QKV), F32),
+                    "ub": pltpu.VMEM((ex.NS, round_up(ex.T, 8), gp.QKV), F32),
                     "rin_sem": pltpu.SemaphoreType.DMA((ex.NS,)),
                 }
             )

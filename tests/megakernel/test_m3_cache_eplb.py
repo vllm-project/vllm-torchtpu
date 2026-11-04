@@ -834,7 +834,7 @@ def test_scatter_pool_states_multi_ns_and_from_ckpt(NS: int, att_every: int):
     )
     QKV = g.QKV(ex.R)
     vh = g.vh(ex.R)
-    CR = mk.rup(3 * NS, 8)
+    CR = mk.round_up(3 * NS, 8)
     conv_new = (
         jax.random.normal(k3, (g.NGDN, CR, QKV), dtype=jnp.float32)
         .astype(jnp.bfloat16)
@@ -1759,8 +1759,8 @@ def test_scatter_pool_states_odd_and_even_natt(natt: int, T: int, B: int):
         jax.random.normal(k_v, (ex.R, g.NATT, ex.MR, g.HD), dtype=jnp.float32) * 2.0
     ).astype(mk.ops.FP8)
     lay = mk.GDNModule.lin_in_layout(g, ex)
-    hr = mk.ops.rup(3 + T, 8)
-    cr = mk.ops.rup(3 * B, 8)
+    hr = mk.ops.round_up(3 + T, 8)
+    cr = mk.ops.round_up(3 * B, 8)
     conv_new = (
         jax.random.normal(
             k_c,

@@ -23,7 +23,7 @@ from jax.experimental.pallas import tpu as pltpu
 from ...errors import MegakernelConfigError
 from ...exec_spec import ExecSpec, NumericsClass
 from ...fused_io_hook import fused_io
-from ...ops import BF16, F32, FP8, I32, rup
+from ...ops import BF16, F32, FP8, I32, round_up
 from ...pool.config import cache_exec, resolved_max_pages_per_seq
 
 NN = (((1,), (0,)), ((), ()))
@@ -192,7 +192,7 @@ def derive_params(
     SPLIT = tt.split and G > 1
     assert not SPLIT or (G & (G - 1) == 0), G
     TS = G if SPLIT else 1
-    QR = rup(G * nh, 8) if SPLIT else 8
+    QR = round_up(G * nh, 8) if SPLIT else 8
     TQ = ex.T * QR
     PW = g.HD + 128
     eff_ctx = (
@@ -201,7 +201,7 @@ def derive_params(
         else ex.ctx
     )
     max_nb = -(-eff_ctx // BLK)
-    NWL = rup(ex.NS * -(-max_nb // TS), 8)
+    NWL = round_up(ex.NS * -(-max_nb // TS), 8)
     PACK = (ex.WIDE if tt.pack < 0 else bool(tt.pack)) and SPLIT and nh < 8
     PB = 8 // nh if PACK else 1
     NBP = -(-ex.B // PB)

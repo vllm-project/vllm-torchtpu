@@ -54,7 +54,7 @@ from vllm_torchtpu.megakernel import (
 )
 from vllm_torchtpu.megakernel.modules.gqa import GQATunables
 from vllm_torchtpu.megakernel.modules.transforms import apply_hf_transforms
-from vllm_torchtpu.megakernel.ops import BF16, F32, I32, rmsnorm, rnd, rup
+from vllm_torchtpu.megakernel.ops import BF16, F32, I32, rmsnorm, round_bf16, round_up
 from vllm_torchtpu.megakernel.pool.config import resolved_max_pages_per_seq
 from vllm_torchtpu.megakernel.spec import combined_hf_param_shapes
 from vllm_torchtpu.models.qwen3_5.megakernel import model as qwen35
@@ -616,11 +616,11 @@ def _pack_single_module_step_inputs(
             conv_l = logical_states["conv"]
             qkv = g.QKV(R)
             if ex.T == 1:
-                cr = rup(3 * B, 8)
+                cr = round_up(3 * B, 8)
                 conv_3b = jnp.swapaxes(conv_l, 2, 3).reshape(R, L, 3 * B, qkv)
                 conv_p = jnp.pad(conv_3b, ((0, 0), (0, 0), (0, cr - 3 * B), (0, 0)))
             else:
-                hr = rup(3 + ex.T, 8)
+                hr = round_up(3 + ex.T, 8)
                 conv_p = jnp.pad(conv_l, ((0, 0), (0, 0), (0, 0), (0, hr - 3), (0, 0)))
             states_mk["conv"] = kernel.fold(conv_p.astype(F32))
         elif s_name == "rec":
@@ -713,7 +713,7 @@ def test_gqa_module_reference_matches_kernel_make_step_cpu(T: int, paged_kv: boo
         layer_idx=0,
         paged_kv=paged_kv,
     )
-    res = rnd(res + att_delta)
+    res = round_bf16(res + att_delta)
     ref_out, _ = final_norm_mod.reference(w_l["final_norm"], res, g=g, out_dtype=BF16)
 
     spec = ModelSpec(
@@ -829,7 +829,7 @@ def test_gdn_module_reference_matches_kernel_make_step_cpu(T: int):
         layer_idx=0,
         multi_layer=True,
     )
-    res = rnd(res + gdn_delta)
+    res = round_bf16(res + gdn_delta)
     ref_out, _ = final_norm_mod.reference(w_l["final_norm"], res, g=g, out_dtype=BF16)
 
     spec = ModelSpec(
@@ -888,7 +888,7 @@ def test_moe_module_reference_matches_kernel_make_step_cpu(moe_tp: bool):
         ex=ex,
         layer_idx=0,
     )
-    res = rnd(res + moe_delta)
+    res = round_bf16(res + moe_delta)
     ref_out, _ = final_norm_mod.reference(w_l["final_norm"], res, g=g, out_dtype=BF16)
 
     spec = ModelSpec(

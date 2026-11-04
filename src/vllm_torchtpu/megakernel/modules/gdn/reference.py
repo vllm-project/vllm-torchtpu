@@ -24,7 +24,7 @@ from jax import lax
 
 from ...errors import MegakernelConfigError
 from ...exec_spec import ExecSpec
-from ...ops import BF16, F32, FP8, gdn_gate_act, rnd, rup, validate_gdn_gate
+from ...ops import BF16, F32, FP8, gdn_gate_act, round_bf16, round_up, validate_gdn_gate
 from .params import gdn_lin_in_layout
 
 
@@ -62,7 +62,7 @@ def gdn_reference(
     lay_gdn = gdn_lin_in_layout(g, ex)
     kh, vh, KD, VD = lay_gdn.kh, lay_gdn.vh, lay_gdn.KD, lay_gdn.VD
     QKV, Z, BA, A_OFF = lay_gdn.QKV, lay_gdn.Z, lay_gdn.BA, lay_gdn.A_OFF
-    CR, HR = rup(3 * B, 8), rup(3 + T, 8)
+    CR, HR = round_up(3 * B, 8), round_up(3 + T, 8)
     expand = vh // kh
     eps = float(getattr(g, "eps", 1e-6))
     l2_eps = float(getattr(g, "gdn_l2_eps", 1e-6))
@@ -134,9 +134,9 @@ def gdn_reference(
     for r in range(R):
         w_in = w_lin_in_l[r].astype(F32)
         ybuf = (
-            rnd((xb @ w_in) * lin_in_s_l[r])
+            round_bf16((xb @ w_in) * lin_in_s_l[r])
             if lin_in_s_l is not None
-            else rnd(xb @ w_in)
+            else round_bf16(xb @ w_in)
         )
 
         cw = conv_w_l[r]
@@ -146,7 +146,7 @@ def gdn_reference(
             s1 = conv_in_l[r, :, 1, :]
             s2 = conv_in_l[r, :, 2, :]
             x_c = ybuf[:, :QKV]
-            u = rnd(
+            u = round_bf16(
                 jax.nn.silu(s0 * taps[0] + s1 * taps[1] + s2 * taps[2] + x_c * taps[3])
             )
             conv_next = jnp.concatenate([s1, s2, x_c], axis=0)
@@ -166,7 +166,7 @@ def gdn_reference(
                     conv_out = conv_out.at[r, o_gdn, s_idx].set(hist)
                 else:
                     conv_out = conv_out.at[r, s_idx].set(hist)
-                u_s = rnd(
+                u_s = round_bf16(
                     jax.nn.silu(
                         hist[0:T] * taps[0]
                         + hist[1 : 1 + T] * taps[1]
@@ -199,14 +199,14 @@ def gdn_reference(
             k = k * lax.rsqrt(jnp.sum(k * k, axis=-1, keepdims=True) + l2_eps)
             qc = jnp.repeat(q, expand, axis=0)[:, :, None]
             kc_ = jnp.repeat(k, expand, axis=0)[:, :, None]
-            beta = rnd(jax.nn.sigmoid(ybuf[b, BA : BA + vh]))
+            beta = round_bf16(jax.nn.sigmoid(ybuf[b, BA : BA + vh]))
             a_val = ybuf[b, A_OFF : A_OFF + vh]
             decay = -jnp.exp(alog) * jax.nn.softplus(a_val + dtb)
             st_cur = st_cur * jnp.exp(decay)[:, None, None]
             pred = jnp.sum(st_cur * kc_, axis=1)
             delta = (v - pred) * beta[:, None]
             st_cur = st_cur + kc_ * delta[:, None, :]
-            out_b = rnd(jnp.sum(st_cur * qc, axis=1))
+            out_b = round_bf16(jnp.sum(st_cur * qc, axis=1))
             rec_prev = st_cur.astype(BF16)
             rec_r_list.append(rec_prev)
             val = out_b * lax.rsqrt(
@@ -214,7 +214,7 @@ def gdn_reference(
             )
             val = (gnw[None, :] * val.astype(BF16)).astype(F32)
             zz = ybuf[b, QKV : QKV + Z].reshape(vh, VD)
-            mix_r.append(rnd(val * g_act(zz)).reshape(Z))
+            mix_r.append(round_bf16(val * g_act(zz)).reshape(Z))
 
         rec_cat = jnp.concatenate(rec_r_list, axis=0)
         if has_multi_out:

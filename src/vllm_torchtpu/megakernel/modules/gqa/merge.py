@@ -22,7 +22,7 @@ import jax.numpy as jnp
 from jax import lax
 
 from ...fused_io_hook import fused_io
-from ...ops import I32, rnd
+from ...ops import I32, round_bf16
 from ...pool.config import cache_exec
 from .context import GQAEmit
 
@@ -105,7 +105,7 @@ def split_merge(cx: GQAEmit) -> None:
         with sc("att_kvwr"):
             fused_io().gqa_fused_kv_rmw(ctx, ap, a)
     with sc("att_gate"):
-        scr["gate"][0:B, :] = rnd(jax.nn.sigmoid(scr["gate"][0:B, :]))
+        scr["gate"][0:B, :] = round_bf16(jax.nn.sigmoid(scr["gate"][0:B, :]))
     with sc("att_merge"):
         for d in mx:
             d.wait_recv()

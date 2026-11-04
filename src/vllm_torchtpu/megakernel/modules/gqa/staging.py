@@ -22,7 +22,7 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from ...ops import BF16, F32, FP8, I32, rmsnorm, rnd, rope_partial
+from ...ops import BF16, F32, FP8, I32, rmsnorm, rope_partial, round_bf16
 from ...pool.config import cache_exec
 from .context import GQAEmit
 from .params import GQAParams
@@ -48,7 +48,9 @@ def att_q(cx: GQAEmit, slot: Any) -> tuple[Any, Any, int, int, Any]:
     with sc("att_in"):
         y = stream.dmatmul("att_in", scr["xb"], NAI)
         ybuf = scr["ybuf"]
-        ybuf[:, :NAI] = rnd(y * ctx.sm(slot, "in_s", NAI)) if ap.in_scaled else rnd(y)
+        ybuf[:, :NAI] = (
+            round_bf16(y * ctx.sm(slot, "in_s", NAI)) if ap.in_scaled else round_bf16(y)
+        )
     qn = ctx.sm(slot, "qn")
     kn = ctx.sm(slot, "kn")
     half = ROT // 2
@@ -65,7 +67,7 @@ def att_q(cx: GQAEmit, slot: Any) -> tuple[Any, Any, int, int, Any]:
             for h in range(nh):
                 q0_ = h * 2 * HD
                 qh = rms_zc(ap, ybuf[:B, q0_ : q0_ + HD], qn)
-                qh = rnd(rope(ap, qh, cos, sin) * HD**-0.5)
+                qh = round_bf16(rope(ap, qh, cos, sin) * HD**-0.5)
                 for j in range(NHH):
                     scr["qg"][
                         0 if GQ else gi,
@@ -84,12 +86,12 @@ def att_q(cx: GQAEmit, slot: Any) -> tuple[Any, Any, int, int, Any]:
             for b in range(B):
                 pb = pos_ref[b]
                 ang = pb.astype(F32) * inv
-                cos, sin = rnd(jnp.cos(ang)), rnd(jnp.sin(ang))
+                cos, sin = round_bf16(jnp.cos(ang)), round_bf16(jnp.sin(ang))
                 rcs[0, b : b + 1, :] = cos
                 rcs[1, b : b + 1, :] = sin
                 qg = ybuf[b, :koff].reshape(nh, 2 * HD)
                 q = rms_zc(ap, qg[:, :HD], qn)
-                q = rnd(rope(ap, q, cos, sin) * HD**-0.5)
+                q = round_bf16(rope(ap, q, cos, sin) * HD**-0.5)
                 if PACK:
                     t_, o_ = ap.qrow(b)
                     scr["qg"][gi, t_, o_ : o_ + nh] = q

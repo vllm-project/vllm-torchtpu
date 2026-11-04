@@ -22,7 +22,7 @@ import jax.numpy as jnp
 
 from ...errors import MegakernelConfigError
 from ...exec_spec import ExecSpec, NumericsClass
-from ...ops import F32, rup, validate_gdn_gate
+from ...ops import F32, round_up, validate_gdn_gate
 from ...pool.config import cache_exec
 
 
@@ -181,8 +181,8 @@ def derive_params(
             dim_val,
         )
 
-    CR = rup(3 * B, 8)
-    HR = rup(3 + T, 8)
+    CR = round_up(3 * B, 8)
+    HR = round_up(3 + T, 8)
 
     ngdn = plan.module_layer_counts.get(name, 0)
     GCH = (
@@ -245,7 +245,7 @@ def derive_params(
     ), gconv_rows
 
     qkv_128 = lay.QKV // 128
-    A_conv = rup(3 + T, 8) if conv_is_f32 else max(16, rup(3 + T, 8))
+    A_conv = round_up(3 + T, 8) if conv_is_f32 else max(16, round_up(3 + T, 8))
     conv8_rows = A_conv * qkv_128
     NGI = min(ex.NS, 8) if cache_exec(ex).FUSED else 0
     NGO = min(ex.NS, 2) if cache_exec(ex).FUSED else 0

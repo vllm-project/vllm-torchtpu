@@ -23,7 +23,7 @@ import jax.numpy as jnp
 from jax import lax
 
 from ...exec_spec import ExecSpec
-from ...ops import BF16, F32, FP8, rnd
+from ...ops import BF16, F32, FP8, round_bf16
 
 
 def moe_reference(
@@ -121,7 +121,10 @@ def moe_reference(
             else (xb_moe @ w_sh13)
         )
         mid_sh = (
-            rnd(rnd(jax.nn.silu(rnd(g13[:, :ISR]))) * rnd(g13[:, ISR:]))
+            round_bf16(
+                round_bf16(jax.nn.silu(round_bf16(g13[:, :ISR])))
+                * round_bf16(g13[:, ISR:])
+            )
             .astype(BF16)
             .astype(F32)
         )
@@ -148,14 +151,17 @@ def moe_reference(
                     else (xb_moe[b : b + 1] @ w13_e)
                 )
                 mid_e = (
-                    rnd(rnd(jax.nn.silu(rnd(h_e[:, :IR]))) * rnd(h_e[:, IR:]))
+                    round_bf16(
+                        round_bf16(jax.nn.silu(round_bf16(h_e[:, :IR])))
+                        * round_bf16(h_e[:, IR:])
+                    )
                     .astype(BF16)
                     .astype(F32)
                 )
                 y_e = (
-                    rnd((mid_e @ w2_e) * e2_s_l[w_slot])
+                    round_bf16((mid_e @ w2_e) * e2_s_l[w_slot])
                     if e2_s_l is not None
-                    else rnd(mid_e @ w2_e)
+                    else round_bf16(mid_e @ w2_e)
                 )
                 part_r = part_r.at[b : b + 1].add(top_w[b, k] * y_e)
 

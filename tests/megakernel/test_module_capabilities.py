@@ -28,7 +28,7 @@ from jax.experimental.pallas import tpu as pltpu
 from jax.sharding import Mesh
 
 from vllm_torchtpu import megakernel as mk
-from vllm_torchtpu.megakernel.ops import BF16, F32, rmsnorm, rnd
+from vllm_torchtpu.megakernel.ops import BF16, F32, rmsnorm, round_bf16
 from vllm_torchtpu.models.qwen3_5.megakernel import model as qwen35
 
 
@@ -645,7 +645,7 @@ def test_verify_model_custom_module_skips_loader_and_hf_and_uses_oracle():
                 pos=inputs.pos,
                 include_extra_roles=False,
             )
-            res = rnd(res + delta)
+            res = round_bf16(res + delta)
         out_hid = rmsnorm(
             res,
             w_l["final_norm"],

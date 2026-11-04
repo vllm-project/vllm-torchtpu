@@ -32,7 +32,15 @@ import vllm_torchtpu.megakernel as mk
 from vllm_torchtpu.megakernel import kernel, planner
 from vllm_torchtpu.megakernel.exec_spec import ExecSpec, Tiles
 from vllm_torchtpu.megakernel.modules.gdn import GDNModule
-from vllm_torchtpu.megakernel.ops import BF16, F32, FP8, I32, rmsnorm, rnd, rup
+from vllm_torchtpu.megakernel.ops import (
+    BF16,
+    F32,
+    FP8,
+    I32,
+    rmsnorm,
+    round_bf16,
+    round_up,
+)
 from vllm_torchtpu.megakernel.spec import LayerType, ModelSpec
 from vllm_torchtpu.models.qwen3_5.megakernel import model as qwen35
 from vllm_torchtpu.models.qwen3_5.megakernel.profiles.baseline import (
@@ -212,7 +220,7 @@ def test_m2_gdn_module_standalone_interpret(B: int, T: int, gdn_rows: int):
         lin_lay.BA,
         lin_lay.NLI,
     )
-    CR, HR = rup(3 * B, 8), rup(3 + T, 8)
+    CR, HR = round_up(3 * B, 8), round_up(3 + T, 8)
 
     keys = jax.random.split(jax.random.PRNGKey(42 + B * 10 + T), 16)
     it = iter(keys)
@@ -296,7 +304,7 @@ def test_m2_gdn_module_standalone_interpret(B: int, T: int, gdn_rows: int):
             .astype(BF16)
             .astype(F32)
         )
-        ybuf = rnd((xb @ lin_in[0, lyr].astype(F32)) * lin_in_s[0, lyr])
+        ybuf = round_bf16((xb @ lin_in[0, lyr].astype(F32)) * lin_in_s[0, lyr])
         taps = [conv_w[0, lyr, t * QKV : (t + 1) * QKV] for t in range(4)]
         if T == 1:
             s0, s1, s2 = (
@@ -305,7 +313,7 @@ def test_m2_gdn_module_standalone_interpret(B: int, T: int, gdn_rows: int):
                 conv_l[0, lyr, :, 2, :],
             )
             x_c = ybuf[:, :QKV]
-            u = rnd(
+            u = round_bf16(
                 jax.nn.silu(s0 * taps[0] + s1 * taps[1] + s2 * taps[2] + x_c * taps[3])
             )
             ref_conv = ref_conv.at[lyr, : 3 * B].set(
@@ -319,7 +327,7 @@ def test_m2_gdn_module_standalone_interpret(B: int, T: int, gdn_rows: int):
                 hist = hist.at[3 : 3 + T].set(ybuf[s_idx * T : (s_idx + 1) * T, :QKV])
                 ref_conv = ref_conv.at[lyr, s_idx].set(hist)
                 us.append(
-                    rnd(
+                    round_bf16(
                         jax.nn.silu(
                             hist[0:T] * taps[0]
                             + hist[1 : 1 + T] * taps[1]
@@ -349,14 +357,14 @@ def test_m2_gdn_module_standalone_interpret(B: int, T: int, gdn_rows: int):
             k = k * lax.rsqrt(jnp.sum(k * k, axis=-1, keepdims=True) + gp.l2_eps)
             qc = jnp.repeat(q, expand, axis=0)[:, :, None]
             kc_ = jnp.repeat(k, expand, axis=0)[:, :, None]
-            beta = rnd(jax.nn.sigmoid(ybuf[b, BA : BA + vh]))
+            beta = round_bf16(jax.nn.sigmoid(ybuf[b, BA : BA + vh]))
             a_val = ybuf[b, lin_lay.A_OFF : lin_lay.A_OFF + vh]
             decay = -jnp.exp(alog[0, lyr]) * jax.nn.softplus(a_val + dtb[0, lyr])
             st_cur = st_cur * jnp.exp(decay)[:, None, None]
             pred = jnp.sum(st_cur * kc_, axis=1)
             delta = (v - pred) * beta[:, None]
             st_cur = st_cur + kc_ * delta[:, None, :]
-            out_b = rnd(jnp.sum(st_cur * qc, axis=1))
+            out_b = round_bf16(jnp.sum(st_cur * qc, axis=1))
             rec_prev = st_cur.astype(BF16)
             rec_rows.append(rec_prev)
             val = out_b * lax.rsqrt(
@@ -364,11 +372,11 @@ def test_m2_gdn_module_standalone_interpret(B: int, T: int, gdn_rows: int):
             )
             val = (gnorm[0, lyr].astype(BF16)[None, :] * val.astype(BF16)).astype(F32)
             zz = ybuf[b, QKV : QKV + Z].reshape(vh, VD)
-            mix_rows.append(rnd(val * jax.nn.silu(zz)).reshape(Z))
+            mix_rows.append(round_bf16(val * jax.nn.silu(zz)).reshape(Z))
         ref_rec = ref_rec.at[lyr].set(jnp.concatenate(rec_rows, axis=0))
         mix_arr = jnp.stack(mix_rows, axis=0).astype(BF16).astype(F32)
         yo = (mix_arr @ lin_out[0, lyr].astype(F32)) * lin_out_s[0, lyr]
-        res = rnd(res + yo.astype(BF16).astype(F32))
+        res = round_bf16(res + yo.astype(BF16).astype(F32))
 
     ref_hid = rmsnorm(
         res, final_norm, g.eps, zero_centered=g.zero_centered_norm

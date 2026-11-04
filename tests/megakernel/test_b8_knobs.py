@@ -930,12 +930,12 @@ def test_b7_deferred_minors(monkeypatch: pytest.MonkeyPatch) -> None:
         )
         assert out_auto["conv"].shape == (R, ngdn, NS, taps + T, qkv)
 
-    # Padded kernel layout (`rup(taps + T, 8) = 8` rows) at T=2 and T=4
+    # Padded kernel layout (`round_up(taps + T, 8) = 8` rows) at T=2 and T=4
     for T in (2, 4):
         ex_pad = mk.ExecSpec(R=2, B=2 * T, T=T, ctx=256)
         lay_q = qwen35.GDNModule.lin_in_layout(g_q2, ex_pad)
         taps_q = 3
-        hr = 8  # rup(3 + T, 8) == 8 for both T=2 and T=4
+        hr = 8  # round_up(3 + T, 8) == 8 for both T=2 and T=4
         n_folded = ex_pad.R * g_q2.NGDN
         c_pad = jnp.arange(
             n_folded * ex_pad.NS * hr * lay_q.QKV, dtype=jnp.float32

@@ -20,7 +20,7 @@ from typing import Any, ClassVar
 
 from ...errors import MegakernelConfigError
 from ...exec_spec import ExecSpec, NumericsClass
-from ...ops import col_chunk, rup
+from ...ops import col_chunk, round_up
 
 
 @dataclass(frozen=True)
@@ -161,7 +161,7 @@ def derive_moe_params(
             "topk_packed requires 1 <= E <= 512 ((E - 1).bit_length() <= 9 "
             f"for 9-bit float32 mantissa packing), got E={g.E}"
         )
-    nb_picks = rup(ex.B * g.TOPK, 128)
+    nb_picks = round_up(ex.B * g.TOPK, 128)
     route_vec = bool(
         tt.route_vec
         and ecopy  # redundant-expert placement table active

@@ -28,7 +28,7 @@ from .geometry import ModelGeometry
 from .modules.gdn import GDNModule
 from .modules.gqa import GQAModule
 from .modules.norm import NormModule
-from .ops import BF16, F32, rmsnorm, rnd, rup
+from .ops import BF16, F32, rmsnorm, round_bf16, round_up
 from .pool.config import cache_exec
 from .schedule import ModuleOrBinding, ResolvedSchedule
 from .spec import ModelSpec, Module, SwitchSlot
@@ -67,7 +67,7 @@ def prepare_reference_step_state(
     # reach `reference` / `module_oracle` unmodified; `_compare_state_dict`
     # requires the kernel to return every state key present in `ref_st`.
     step_state: dict[str, Any] = dict(logical_states)
-    CR, HR = rup(3 * B, 8), rup(3 + T, 8)
+    CR, HR = round_up(3 * B, 8), round_up(3 + T, 8)
     vh = KD = VD = 0
     conv_in = rec_in = None
     has_gdn = "conv" in logical_states or "rec" in logical_states
@@ -113,7 +113,7 @@ def finalize_reference_step_state(
 ) -> dict[str, Any]:
     """Finalize output state dict from `step_state` after reference execution."""
     R, T, NS = ex.R, ex.T, ex.NS
-    HR = rup(3 + T, 8)
+    HR = round_up(3 + T, 8)
     out_states: dict[str, Any] = {
         k: v
         for k, v in step_state.items()
@@ -190,7 +190,7 @@ def composed_reference_step(
         mix_delta, step_state = mix_mod.reference(
             logical_weights, x_mix, step_state, g=g, ex=ex, **mix_kw
         )
-        res = rnd(res + mix_delta)
+        res = round_bf16(res + mix_delta)
         post_mod = _make_ref_module(sched.post_norm[lyr], g)
         if post_mod is None:
             raise MegakernelConfigError(
@@ -211,7 +211,7 @@ def composed_reference_step(
         ffn_delta, step_state = ffn_mod.reference(
             logical_weights, x_ffn, step_state, g=g, ex=ex, layer_idx=lyr
         )
-        res = rnd(res + ffn_delta)
+        res = round_bf16(res + ffn_delta)
 
     fn_mod = _make_ref_module(final_norm, g)
     if fn_mod is None:
@@ -288,7 +288,7 @@ def spec_reference_step(
                 logical_weights, x_in, step_state, g=g, ex=ex, **kw
             )
             sub_arr = jnp.asarray(sub_out).astype(F32)
-            res = rnd(res + sub_arr) if mod.reduction == "allreduce" else sub_arr
+            res = round_bf16(res + sub_arr) if mod.reduction == "allreduce" else sub_arr
     fn_w = logical_weights["final_norm"]
     fn_w_0 = fn_w[0] if fn_w.ndim >= 2 else fn_w
     out_b = rmsnorm(

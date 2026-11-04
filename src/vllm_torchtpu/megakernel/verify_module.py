@@ -35,7 +35,7 @@ from .module import Module
 from .module_options import registered_tunables
 from .modules.gdn import GDNModule
 from .modules.gqa import GQAModule
-from .ops import BF16, F32, rmsnorm, rnd
+from .ops import BF16, F32, rmsnorm, round_bf16
 from .pool.config import with_cache
 from .profiles.default import chip_budget
 from .reference import finalize_reference_step_state, prepare_reference_step_state
@@ -61,7 +61,7 @@ ModuleOracle = Callable[..., tuple[jax.Array, Mapping[str, Any]]]
   or un-normed `res0` in `f32` (`(B, H)`) when `mod.input_norm is None` (the
   kernel skips writing `xb` when `input_norm is None`).
 - Return `(out, states)` where `out` is the rank-summed sublayer delta
-  (`mod.reduction == "allreduce"`, to which the harness adds `rnd(res0 + delta)`)
+  (`mod.reduction == "allreduce"`, to which the harness adds `round_bf16(res0 + delta)`)
   or the updated residual (`mod.reduction in ("none", "custom")`), followed by
   `final_norm` in the harness. Note that in-kernel `allreduce` rounds each
   rank's partial contribution to `bf16` before summing (with extra `bf16`
@@ -196,7 +196,7 @@ def run_module_verify(
             w_l, x_in, step_state, g=g1, ex=ex_d, **ref_kw
         )
         sub_arr = jnp.asarray(sub_out).astype(F32)
-        res1 = rnd(res0 + sub_arr) if mod.reduction == "allreduce" else sub_arr
+        res1 = round_bf16(res0 + sub_arr) if mod.reduction == "allreduce" else sub_arr
         fn_w = w_l["final_norm"]
         fn_w_0 = fn_w[0] if fn_w.ndim >= 2 else fn_w
         ref_h = rmsnorm(

@@ -118,7 +118,7 @@ if TYPE_CHECKING:  # eager imports for type checkers and IDEs
         Norm,
         NormModule,
     )
-    from .ops import col_chunk, rup
+    from .ops import col_chunk, round_up
     from .planner import encode_ecopy
     from .pool import (
         POOL_STATE_NAME,
@@ -293,7 +293,7 @@ _LAZY: dict[str, str] = {
     "Norm": ".modules",
     "NormModule": ".modules",
     "col_chunk": ".ops",
-    "rup": ".ops",
+    "round_up": ".ops",
     "encode_ecopy": ".planner",
     "POOL_STATE_NAME": ".pool",
     "CacheExec": ".pool",
@@ -522,7 +522,7 @@ __all__ = [
     "reference",
     "register_model",
     "register_profile",
-    "rup",
+    "round_up",
     "runtime",
     "scatter_pool_states",
     "schedule",
