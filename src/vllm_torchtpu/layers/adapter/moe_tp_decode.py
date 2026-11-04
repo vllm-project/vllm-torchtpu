@@ -17,12 +17,13 @@ Under MoE tensor parallelism vLLM runs the shared expert, scales and adds the
 routed output, and all-reduces the sum over the TP group. For an armed layer
 one torch op does all of it: at the token counts the kernel admits (16, 32 and 64)
 one Pallas call per rank covers routing, the shared expert, the routed experts
-and the all-reduce; every other count runs the usual TP path (router top-k,
-fused_moe_func, the shared expert's linears) and a psum in the same exported
-program. The token count is static there, so one torch op serves every bucket.
-The op's output is reduced, so arming also takes the shared expert and the
-routed scale off the runner, and VllmMoERunner._fused_output_is_reduced turns
-the runner's all-reduce off for that layer.
+and the all-reduce, and a smaller count is padded to 16 rows for it; every
+other count runs the usual TP path (router top-k, fused_moe_func, the shared
+expert's linears) and a psum in the same exported program. The token count is
+static there, so one torch op serves every bucket. The op's output is reduced,
+so arming also takes the shared expert and the routed scale off the runner,
+and VllmMoERunner._fused_output_is_reduced turns the runner's all-reduce off
+for that layer.
 
 `arm` runs once at the end of TPUModelRunner.load_model, when the weights,
 the MTP drafter and the token-padding mask exist. It is collective over the TP
@@ -327,14 +328,36 @@ def _tp_chain(x, scores, bias, is_pad, w13, w2, s13, s2, sw13, ss13, sw2, ss2, s
 
 def _op_body(statics: _OpStatics, n_ranks: int, axis: str):
     """The op's per-rank body under shard_map over `axis`: the fused kernel at
-    the token counts it admits, else this rank's partial from the usual path
-    and a psum."""
+    the token counts it admits (smaller counts padded to its smallest), else
+    this rank's partial from the usual path and a psum."""
 
     def body(x, scores, bias, pad_mask, w13, w2, s13, s2, sw13, ss13, sw2, ss2, rank):
         n = x.shape[0]  # static: torch_tpu exports one program per token count
         is_pad = pad_mask[:n]  # replicated, so n_valid agrees on every rank
         n_valid = n - jnp.sum(is_pad.astype(jnp.int32))
         weights = (w13, w2, s13, s2, sw13, ss13, sw2, ss2)
+        m = kernel.ROW_BUCKETS[0]
+        if n < m:
+            # A decode bucket below the smallest row bucket
+            # (TPU_TOKEN_BUCKET_EXTRA=4,8) runs the kernel on `m` rows. The
+            # kernel skips rows >= n_valid and rows are independent, so the
+            # first n rows are bit for bit the m-row bucket's.
+            xp = jnp.pad(x, ((0, m - n), (0, 0)))
+            sp = jnp.pad(scores, ((0, m - n), (0, 0)))
+            if kernel.can_use_moe_tp_decode(
+                xp, sp, bias, *weights, topk=statics.topk, n_ranks=n_ranks
+            ):
+                return kernel.moe_tp_decode(
+                    xp,
+                    sp,
+                    bias,
+                    n_valid,
+                    rank.reshape(()),
+                    *weights,
+                    routed_scale=statics.routed_scale,
+                    topk=statics.topk,
+                    n_ranks=n_ranks,
+                )[:n]
         if kernel.can_use_moe_tp_decode(
             x, scores, bias, *weights, topk=statics.topk, n_ranks=n_ranks
         ):

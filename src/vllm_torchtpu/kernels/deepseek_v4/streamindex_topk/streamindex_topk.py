@@ -1786,7 +1786,9 @@ def streamindex_topk_dcp(
             f"dcp_size={dcp_size} does not match mesh axis"
             f" {dcp_axis_name!r}={mesh.shape[dcp_axis_name]}."
         )
-    if q.shape[0] % dcp_size != 0:
+    # Only the a2a merge splits the token axis over the DCP ranks, so the
+    # all-gather merge also takes decode buckets smaller than dcp_size.
+    if a2a_merge and q.shape[0] % dcp_size != 0:
         raise ValueError(
             f"padded_num_tokens={q.shape[0]} must be divisible by dcp_size={dcp_size}."
         )
