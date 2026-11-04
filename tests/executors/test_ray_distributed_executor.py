@@ -77,6 +77,7 @@ def backend(monkeypatch):
         device_name="tpu",
         additional_env_vars=[],
         device_control_id_to_physical_device_id=int,
+        update_block_size_for_backend=Mock(),
     )
     monkeypatch.setattr(ray_executor, "ray", backend)
     monkeypatch.setattr(ray_executor, "current_platform", platform)
@@ -200,13 +201,21 @@ def test_worker_rank_environment_and_initialization_order(
         assert invocation.kwargs["num_gpus"] == 0
     assert executor.workers == [actors[1], actors[3], actors[0], actors[2]]
     calls = executor.collective_rpc.call_args_list
-    assert [c.args[0] for c in calls] == [
+    assert [c.args[0] for c in calls[:5]] == [
         "adjust_rank",
         "update_environment_variables",
         "init_worker",
         "init_device",
         "load_model",
     ]
+    assert len(calls) == 6
+    update_block_size_fn = calls[5].args[0]
+    assert callable(update_block_size_fn)
+    worker = SimpleNamespace(vllm_config=executor.vllm_config)
+    update_block_size_fn(worker)
+    ray_executor.current_platform.update_block_size_for_backend.assert_called_once_with(
+        executor.vllm_config
+    )
     assert calls[0].kwargs["args"] == ({1: 0, 3: 1, 0: 2, 2: 3},)
     addresses = "10.0.0.1:8070,10.0.0.1:8071,10.0.0.2:8070,10.0.0.2:8071"
     assert os.environ["TORCH_TPU_SLICEBUILDER_ADDRESSES"] == addresses
