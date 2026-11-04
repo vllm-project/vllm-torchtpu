@@ -12,7 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """The megakernel compile-cache salt: the digest of a plugin's cache-layout
-request (`None` without one), and stock compile keys unchanged."""
+request (`None` without one), the same plugin resolution as the driver, and
+stock compile keys unchanged."""
 
 from __future__ import annotations
 
@@ -31,7 +32,12 @@ import pytest
 import torch
 
 import vllm_torchtpu
+import vllm_torchtpu.megakernel_runtime.agreement as agreement_mod
+import vllm_torchtpu.megakernel_runtime.driver as driver_mod
+from vllm_torchtpu.megakernel_runtime import config as cfg_mod
 from vllm_torchtpu.megakernel_runtime import plugin as plugin_mod
+from vllm_torchtpu.megakernel_runtime import salt as salt_mod
+from vllm_torchtpu.megakernel_runtime import testing, testkit
 from vllm_torchtpu.megakernel_runtime.salt import compile_cache_salt
 
 _SRC = Path(vllm_torchtpu.__file__).resolve().parent.parent
@@ -181,3 +187,43 @@ def test_salt_imports_without_torch_jax_or_vllm() -> None:
         timeout=120,
     )
     assert out.returncode == 0 and out.stdout.strip() == "OK", out.stderr
+
+
+mk_toy_plugin = testkit.mk_toy_plugin
+
+
+def test_driver_and_salt_resolve_the_same_plugin(
+    mk_toy_plugin: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(agreement_mod, "_tp_cpu_group", lambda: None)
+    seen: dict[str, list[Any]] = {"driver": [], "salt": []}
+
+    def spy(who: str) -> Any:
+        def imp(ref: Any) -> Any:
+            seen[who].append((ref.module, ref.attr))
+            return cfg_mod.import_plugin(ref)
+
+        return imp
+
+    monkeypatch.setattr(driver_mod, "import_plugin", spy("driver"))
+    monkeypatch.setattr(salt_mod, "import_plugin", spy("salt"))
+    qwen_arch = SimpleNamespace(architectures=["Qwen3_5MoeForCausalLM"])
+    qwen_type = SimpleNamespace(architectures=None, model_type="qwen3_5_moe")
+    other = SimpleNamespace(architectures=["LlamaForCausalLM"])
+    cases = [
+        (qwen_arch, True),
+        (qwen_type, "qwen35"),
+        (None, {"plugin": "qwen35"}),
+        (other, True),
+        (None, True),
+        (other, {"plugin": "toy_mk_plugin"}),
+    ]
+    for hf, mk in cases:
+        seen["driver"].clear()
+        seen["salt"].clear()
+        model = type("Qwen3_5MoeForCausalLM", (), {})()  # never used to resolve
+        runner = testing.fake_runner(model=model, hf_config=hf, megakernel=mk)
+        driver_mod.ProgramDriver.maybe_create(runner)
+        salt_mod.compile_cache_salt(runner.vllm_config)
+        assert seen["driver"] == seen["salt"], (hf, mk, seen)
+    assert seen["driver"] == [("toy_mk_plugin", "SPEC")]
