@@ -474,8 +474,6 @@ def fused_ep_moe_push(
         raise ValueError("kernel_plan_tables needs table_kernel and sharded_plan")
     if exchange_tables and not (table_kernel and exchange_row_gather):
         raise ValueError("exchange_tables needs table_kernel and exchange_row_gather")
-    if exchange_tables and early_row_gather:
-        raise ValueError("exchange_tables issues the row copies after the pushes")
     if table_kernel and interleave_visits:
         raise ValueError("table_kernel builds the most-rows-first visit order only")
     if early_row_gather and not exchange_row_gather:
@@ -933,6 +931,7 @@ def fused_ep_moe_push(
                     e_total=e_total,
                     n_pre=n_pre,
                     tile_m=capacity,
+                    before_barrier=early_row_gather,
                 )(packed, rank_l[0, 0], q_l, tok, seg_start)
             else:
                 exchange, q_sorted = build_tc_exchange_all_gather_rows(

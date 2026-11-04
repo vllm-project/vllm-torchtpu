@@ -367,7 +367,9 @@ def _seg3(seg_start_local, ep, g):
 
 
 @functools.cache
-def _build_exchange_rows_tables(ep, width, n_rows, count_at, g, n_pre, tile_m):
+def _build_exchange_rows_tables(
+    ep, width, n_rows, count_at, g, n_pre, tile_m, before_barrier
+):
     slab_rows = tx._slab_rows(width)
     r_lo = count_at // LANES
     r_hi = (count_at + ep * g - 1) // LANES
@@ -387,7 +389,17 @@ def _build_exchange_rows_tables(ep, width, n_rows, count_at, g, n_pre, tile_m):
 
             lax.fori_loop(0, n_rows, one, jnp.int32(0), unroll=8)
 
-        tx._exchange(ep, me, x_hbm, out_hbm, send_sem, recv_sem, lsem, copy_rows)
+        tx._exchange(
+            ep,
+            me,
+            x_hbm,
+            out_hbm,
+            send_sem,
+            recv_sem,
+            lsem,
+            (lambda: None) if before_barrier else copy_rows,
+            before=copy_rows if before_barrier else None,
+        )
         # Every peer's row has landed; the row copies may still be in flight,
         # and the tables are built meanwhile from the exchanged counts.
         cp = pltpu.make_async_copy(out_hbm.at[:, pl.ds(r_lo, n_cnt), :], cnt_vm, csem)
@@ -434,22 +446,26 @@ def _build_exchange_rows_tables(ep, width, n_rows, count_at, g, n_pre, tile_m):
             )
             + _table_out_shapes(ep, g),
             compiler_params=tx._compiler_params(),
-            name=f"moe_tc_routing_exchange_ep{ep}_w{width}_rows{n_rows}_tables",
+            name=f"moe_tc_routing_exchange_ep{ep}_w{width}_rows{n_rows}_tables"
+            + ("_early" if before_barrier else ""),
         )(r, idx, slab, rows, _seg3(seg_start_local, ep, g))
         return (tx._unpad(out, ep, width), gathered) + _unpack_tables(tables)
 
     return fn
 
 
-def build_exchange_rows_tables(*, ep, width, n_rows, count_at, e_total, n_pre, tile_m):
-    """tc_exchange.build_tc_exchange_all_gather_rows' kernel that also builds
-    build_push_tables' tables from the exchanged counts (words
-    [count_at, count_at + e_total) of every rank's payload), while its row
-    copies finish. fn(packed, rank, rows, idx, seg_start_local) ->
-    (exchange, rows[idx], *build_push_tables(...))."""
+def build_exchange_rows_tables(
+    *, ep, width, n_rows, count_at, e_total, n_pre, tile_m, before_barrier=False
+):
+    """tc_exchange.build_tc_exchange_all_gather_rows' kernel (row copies
+    issued after the pushes, or before the entry barrier with
+    `before_barrier`) that also builds build_push_tables' tables from the
+    exchanged counts (words [count_at, count_at + e_total) of every rank's
+    payload), while its row copies finish. fn(packed, rank, rows, idx,
+    seg_start_local) -> (exchange, rows[idx], *build_push_tables(...))."""
     g = e_total // ep
     if g > LANES or ep > LANES or 2 * g + 3 > LANES:
         raise ValueError(f"the table kernel takes g_local, ep <= {LANES}")
     return _build_exchange_rows_tables(
-        ep, width, n_rows, count_at, g, int(n_pre), int(tile_m)
+        ep, width, n_rows, count_at, g, int(n_pre), int(tile_m), bool(before_barrier)
     )
