@@ -499,16 +499,22 @@ def pipeline_score_topk_unrolled(
     select: Callable[[jax.Array, jax.Array, int | None], Any],
     write: Callable[[jax.Array, Any, Any], Any],
     output: Any,
+    *,
+    defer_last: bool = False,
 ) -> Any:
     """Leave independent score/selection tiles available to the scheduler.
 
     Use for tuned small-query batches; score lifetimes are not bounded here.
+    ``defer_last`` returns ``(output, last_scores)`` with the last tile scored
+    but not selected, so the caller can select it outside a conditional.
     """
     if num_tiles < 1:
         raise ValueError("The score/top-k pipeline requires at least one tile")
     for tile in range(num_tiles):
         index = jnp.int32(tile)
         scores = score(prepare(index), None)
+        if defer_last and tile == num_tiles - 1:
+            return output, scores
         selected = select(index, scores, None)
         output = write(index, selected, output)
     return output
@@ -521,15 +527,20 @@ def pipeline_score_topk_bounded(
     select: Callable[[jax.Array, jax.Array, int | None], Any],
     write: Callable[[jax.Array, Any, Any], Any],
     output: Any,
+    *,
+    defer_last: bool = False,
 ) -> Any:
     """Bound score lifetime and pair next-tile scoring with current selection.
 
     Callbacks accept an optional scheduling group after their data arguments.
     Each pair gets a program-unique group so the compiler keeps TensorCore
     scoring between SparseCore selection start and completion.
+    ``defer_last`` is as in `pipeline_score_topk_unrolled`.
     """
     if num_tiles < 1:
         raise ValueError("The score/top-k pipeline requires at least one tile")
+    if defer_last and num_tiles > 16:
+        raise ValueError("Deferring the last selection needs an unrolled pipeline")
     if num_tiles > 16:
         return pipeline_score_topk(
             num_tiles,
@@ -562,6 +573,8 @@ def pipeline_score_topk_bounded(
         if previous is not None:
             previous, current = lax.optimization_barrier((previous, current))
             output = write(jnp.int32(num_tiles - 2), previous, output)
+        if defer_last:
+            return output, current
         last = jnp.int32(num_tiles - 1)
         return write(last, select(last, current, None), output)
 

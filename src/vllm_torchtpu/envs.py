@@ -12,6 +12,7 @@ if TYPE_CHECKING:
     TPU_DEEPSEEK_V41_ENGRAM_CPU_OFFLOAD: bool = False
     TPU_DEEPSEEK_V41_ENGRAM_HBM: str = "auto"
     TPU_DEEPSEEK_V41_CSA2_EARLY_GATHER: bool = False
+    TPU_DEEPSEEK_V41_INDEXER_TAIL_OUTSIDE_COND: bool = False
     TPU_K3_SP_PREFILL: bool = False
     TPU_INCREMENTAL_BLOCK_TABLE_UPLOAD: bool = True
     TPU_ONEHOT_TABLE_LOOKUP: bool = False
@@ -399,6 +400,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Scheduling only; outputs are unchanged.
     "TPU_DEEPSEEK_V41_CSA2_EARLY_GATHER": env_bool(
         "TPU_DEEPSEEK_V41_CSA2_EARLY_GATHER", default=False
+    ),
+    # Packed FP8 decode indexer: run the last query chunk's SparseCore top-k
+    # after the pipelined/serial conditional instead of inside it, so the
+    # scheduler can overlap it with work that does not need the indices.
+    # Same kernels on the same scores (bit-exact). Default off until measured.
+    "TPU_DEEPSEEK_V41_INDEXER_TAIL_OUTSIDE_COND": env_bool(
+        "TPU_DEEPSEEK_V41_INDEXER_TAIL_OUTSIDE_COND", default=False
     ),
     # Opt in to K3 TP32/EP32 sequence-parallel prefill.
     "TPU_K3_SP_PREFILL": env_bool("TPU_K3_SP_PREFILL", default=False),
