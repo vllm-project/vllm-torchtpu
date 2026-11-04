@@ -19,7 +19,6 @@ from transformers import PreTrainedConfig
 from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
 from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.forward_context import get_forward_context
-from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.layernorm import GemmaRMSNorm
 from vllm.model_executor.layers.linear import (
     MinimaxM3QKVParallelLinearWithIndexer,
@@ -36,12 +35,17 @@ from vllm_torchtpu.layers.core.owned_kv_cache import TpuOwnedKVCache
 from vllm_torchtpu.models.minimax_m3.ops.msa import get_msa_op
 
 
-class MiniMaxM3IndexCache(nn.Module, TpuOwnedKVCache):
-    """Key-only cache holding one index key per token."""
+class MiniMaxM3Cache(nn.Module, TpuOwnedKVCache):
+    """One row per token in the packed MLA page layout.
 
-    def __init__(self, head_dim: int, dtype: torch.dtype, prefix: str) -> None:
+    Holds ``[K | V]`` rows for the attention cache and index keys for the
+    indexer cache; only the MSA kernels read it, so no attention backend's
+    layout is involved.
+    """
+
+    def __init__(self, row_width: int, dtype: torch.dtype, prefix: str) -> None:
         super().__init__()
-        self.head_dim = head_dim
+        self.row_width = row_width
         self.dtype = dtype
         self.prefix = prefix
         self.kv_cache = torch.tensor([])
@@ -52,16 +56,29 @@ class MiniMaxM3IndexCache(nn.Module, TpuOwnedKVCache):
         static_forward_context[prefix] = self
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
-        # MLAAttentionSpec budgets one vector per token, not K plus V.
+        # MLAAttentionSpec budgets one row of row_width per token.
         return MLAAttentionSpec(
             block_size=vllm_config.cache_config.block_size,
             num_kv_heads=1,
-            head_size=self.head_dim,
+            head_size=self.row_width,
             dtype=self.dtype,
         )
 
     def get_attn_backend(self) -> type[AttentionBackend]:
         return PallasMLAttentionBackend
+
+
+def cache_dtype(cache_config: CacheConfig | None) -> torch.dtype:
+    """Storage dtype of both MSA caches for ``--kv-cache-dtype``."""
+    name = cache_config.cache_dtype if cache_config is not None else "auto"
+    if name in ("auto", "bfloat16"):
+        return torch.bfloat16
+    if name in ("fp8", "fp8_e4m3"):
+        return torch.float8_e4m3fn
+    raise NotImplementedError(
+        f"MiniMax M3 on TPU supports --kv-cache-dtype auto, bfloat16 or fp8, "
+        f"got {name!r}."
+    )
 
 
 def _per_head_norm(x: torch.Tensor, norm: GemmaRMSNorm, head_dim: int) -> torch.Tensor:
@@ -72,9 +89,8 @@ class MiniMaxM3SparseAttention(nn.Module):
     """GQA attention over the KV blocks the lightning indexer selects.
 
     One fused GEMM emits ``[q | k | v | index_q | index_k]``. All four
-    projections get a per-head Gemma RMSNorm and partial NeoX RoPE. The main
-    K/V cache is owned by a plain `Attention` so it is allocated and
-    described like any GQA cache; the index keys live in `index_cache`.
+    projections get a per-head Gemma RMSNorm and partial NeoX RoPE. K/V rows
+    live in `kv_cache`, index keys in `index_cache`.
     """
 
     def __init__(
@@ -130,19 +146,12 @@ class MiniMaxM3SparseAttention(nn.Module):
                 "partial_rotary_factor": config.partial_rotary_factor,
             },
         )
-        self.attn = Attention(
-            self.num_heads,
-            self.head_dim,
-            scaling,
-            num_kv_heads=self.num_kv_heads,
-            cache_config=cache_config,
-            quant_config=quant_config,
-            prefix=f"{prefix}.attn",
+        dtype = cache_dtype(cache_config)
+        self.kv_cache = MiniMaxM3Cache(
+            2 * self.head_dim, dtype, prefix=f"{prefix}.attn"
         )
-        self.index_cache = MiniMaxM3IndexCache(
-            self.index_head_dim,
-            torch.get_default_dtype(),
-            prefix=f"{prefix}.attn.index_cache",
+        self.index_cache = MiniMaxM3Cache(
+            self.index_head_dim, dtype, prefix=f"{prefix}.attn.index_cache"
         )
         self.msa_op = get_msa_op(
             scaling,
@@ -174,12 +183,12 @@ class MiniMaxM3SparseAttention(nn.Module):
 
         num_tokens = hidden_states.shape[0]
         metadata = get_forward_context().attn_metadata
-        kv_cache = self.attn.kv_cache
+        kv_cache = self.kv_cache.kv_cache
         if not isinstance(metadata, dict) or kv_cache.numel() == 0:
             # Memory profiling runs before the caches are bound.
             attn_output = q
         else:
-            layer_metadata = metadata[self.attn.layer_name]
+            layer_metadata = metadata[self.kv_cache.prefix]
             assert isinstance(layer_metadata, AttentionMetadata)
             attn_output = self.msa_op(
                 q.view(num_tokens, self.num_heads, self.head_dim),

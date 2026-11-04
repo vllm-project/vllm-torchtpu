@@ -20,6 +20,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
+from tests.models.minimax_m3.packing import CACHE_DTYPES, pack, rounded, unpack
 from vllm_torchtpu.models.minimax_m3.kernels import msa, msa_indexer
 
 BLOCK = 16
@@ -59,6 +60,7 @@ def _reference(q, k, v, iq, ik, ctx_k, ctx_v, ctx_ik, q_lens, ctx_lens, sm_scale
     return np.stack(outs)
 
 
+@pytest.mark.parametrize("dtype", CACHE_DTYPES)
 @pytest.mark.parametrize("small_chunks", [False, True])
 @pytest.mark.parametrize("jit", [False, True])
 @pytest.mark.parametrize(
@@ -70,7 +72,7 @@ def _reference(q, k, v, iq, ik, ctx_k, ctx_v, ctx_ik, q_lens, ctx_lens, sm_scale
     ],
 )
 def test_msa_forward_matches_dense_reference(
-    q_lens, ctx_lens, jit, small_chunks, monkeypatch
+    q_lens, ctx_lens, jit, small_chunks, dtype, monkeypatch
 ):
     if small_chunks:
         # Several indexer tiles per request and page groups per tile, and
@@ -87,9 +89,6 @@ def test_msa_forward_matches_dense_reference(
     num_heads = Q_PER_KV
     f32 = np.float32
 
-    def bf16(x):
-        return np.asarray(jnp.asarray(x).astype(BF16).astype(jnp.float32))
-
     q = rng.standard_normal((num_tokens, num_heads, HEAD_DIM)).astype(f32)
     k = rng.standard_normal((num_tokens, 1, HEAD_DIM)).astype(f32)
     v = rng.standard_normal((num_tokens, 1, HEAD_DIM)).astype(f32)
@@ -98,8 +97,10 @@ def test_msa_forward_matches_dense_reference(
     ctx_k = rng.standard_normal((num_seqs, 256, HEAD_DIM)).astype(f32)
     ctx_v = rng.standard_normal((num_seqs, 256, HEAD_DIM)).astype(f32)
     ctx_ik = rng.standard_normal((num_seqs, 256, HEAD_DIM)).astype(f32)
-    q, k, v, iq, ik, ctx_k, ctx_v, ctx_ik = map(
-        bf16, (q, k, v, iq, ik, ctx_k, ctx_v, ctx_ik)
+    # Queries stay bf16; keys and values are what the caches store.
+    q, iq = (rounded(x, BF16) for x in (q, iq))
+    k, v, ik, ctx_k, ctx_v, ctx_ik = (
+        rounded(x, dtype) for x in (k, v, ik, ctx_k, ctx_v, ctx_ik)
     )
 
     # Shuffled physical pages; page 0 stays unused.
@@ -107,15 +108,13 @@ def test_msa_forward_matches_dense_reference(
     block_tables = np.zeros((max_num_seqs, pages_per_seq), np.int32)
     block_tables[:num_seqs] = perm[: num_seqs * pages_per_seq].reshape(num_seqs, -1)
 
-    # bf16 packs K and V of the one KV head into each 32-bit word.
-    kv_cache = np.zeros((num_pages, BLOCK, 1, 2, HEAD_DIM), f32)
-    index_cache = np.zeros((num_pages, BLOCK // 2, 2, HEAD_DIM), f32)
+    kv_rows = np.zeros((num_pages, BLOCK, 2 * HEAD_DIM), f32)
+    index_rows = np.zeros((num_pages, BLOCK, HEAD_DIM), f32)
     for r in range(num_seqs):
         for j in range(ctx_lens[r]):
             page = block_tables[r, j // BLOCK]
-            kv_cache[page, j % BLOCK, 0, 0] = ctx_k[r, j]
-            kv_cache[page, j % BLOCK, 0, 1] = ctx_v[r, j]
-            index_cache[page, (j % BLOCK) // 2, j % 2] = ctx_ik[r, j]
+            kv_rows[page, j % BLOCK] = np.concatenate([ctx_k[r, j], ctx_v[r, j]])
+            index_rows[page, j % BLOCK] = ctx_ik[r, j]
 
     seq_lens = np.zeros(max_num_seqs, np.int32)
     seq_lens[:num_seqs] = np.array(ctx_lens) + np.array(q_lens)
@@ -136,7 +135,8 @@ def test_msa_forward_matches_dense_reference(
         forward = jax.jit(forward)
     new_kv, new_idx, out = forward(
         *(jnp.asarray(x).astype(BF16) for x in (q, k, v, iq, ik)),
-        *(jnp.asarray(x).astype(BF16) for x in (kv_cache, index_cache)),
+        pack(kv_rows, dtype),
+        pack(index_rows, dtype),
         *(jnp.asarray(x) for x in (seq_lens, block_tables.reshape(-1), cu_q, dist)),
     )
 
@@ -145,6 +145,7 @@ def test_msa_forward_matches_dense_reference(
     )
     out = np.asarray(out.astype(jnp.float32))
     np.testing.assert_allclose(out[:num_real], expected, atol=3e-2)
+    new_kv, new_idx = unpack(new_kv), unpack(new_idx)
     np.testing.assert_array_equal(out[num_real:], 0)
     start = 0
     for r in range(num_seqs):
@@ -153,18 +154,16 @@ def test_msa_forward_matches_dense_reference(
             page = block_tables[r, p // BLOCK]
             slot = p % BLOCK
             written = {
-                "k": new_kv[page, slot, 0, 0],
-                "v": new_kv[page, slot, 0, 1],
-                "index_k": new_idx[page, slot // 2, slot % 2],
+                "k": new_kv[page, slot, :HEAD_DIM],
+                "v": new_kv[page, slot, HEAD_DIM:],
+                "index_k": new_idx[page, slot],
             }
             expected_rows = {"k": k[start + i, 0], "v": v[start + i, 0]}
             expected_rows["index_k"] = ik[start + i]
             for name, row in written.items():
-                np.testing.assert_array_equal(
-                    np.asarray(row.astype(jnp.float32)), expected_rows[name], name
-                )
+                np.testing.assert_array_equal(row, expected_rows[name], name)
         start += q_lens[r]
-    np.testing.assert_array_equal(np.asarray(new_kv[0].astype(jnp.float32)), 0)
+    np.testing.assert_array_equal(new_kv[0], 0)
 
 
 def test_select_blocks_forces_local_and_pads():

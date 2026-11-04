@@ -19,7 +19,9 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from jax.sharding import AbstractDevice, AbstractMesh, use_abstract_mesh
 
+from tests.models.minimax_m3.packing import CACHE_DTYPES, PACKING, pack, rounded
 from vllm_torchtpu.models.minimax_m3.kernels import msa_attention
 from vllm_torchtpu.models.minimax_m3.kernels.msa_attention import (
     msa_sparse_attention,
@@ -32,7 +34,7 @@ PAGES = 12
 TOPK = 4
 
 
-def _reference(q, kv, selected, local_page, local_limit):
+def _reference(q, kv_rows, selected, local_page, local_limit):
     out = np.zeros_like(q)
     for t in range(q.shape[0]):
         keys, values = [], []
@@ -40,8 +42,8 @@ def _reference(q, kv, selected, local_page, local_limit):
             if page < 0:
                 continue
             visible = local_limit[t] if page == local_page[t] else PAGE
-            keys.append(kv[page, :visible, 0, 0])
-            values.append(kv[page, :visible, 0, 1])
+            keys.append(kv_rows[page, :visible, :HEAD_DIM])
+            values.append(kv_rows[page, :visible, HEAD_DIM:])
         if not keys:
             continue
         s = q[t] @ np.concatenate(keys).T * HEAD_DIM**-0.5
@@ -50,6 +52,7 @@ def _reference(q, kv, selected, local_page, local_limit):
     return out
 
 
+@pytest.mark.parametrize("dtype", CACHE_DTYPES)
 @pytest.mark.parametrize(
     "num_tokens,num_real,tokens_per_call",
     [
@@ -58,16 +61,17 @@ def _reference(q, kv, selected, local_page, local_limit):
         (150, 140, 64),  # several kernel calls (a distinct shape: no jit reuse)
     ],
 )
-def test_matches_dense_reference(num_tokens, num_real, tokens_per_call, monkeypatch):
+def test_matches_dense_reference(
+    num_tokens, num_real, tokens_per_call, dtype, monkeypatch
+):
     if tokens_per_call is not None:
         monkeypatch.setattr(msa_attention, "MAX_TOKENS_PER_CALL", tokens_per_call)
     rng = np.random.default_rng(num_tokens)
     q = jnp.asarray(rng.standard_normal((num_tokens, HEADS, HEAD_DIM))).astype(
         jnp.bfloat16
     )
-    kv = jnp.asarray(rng.standard_normal((PAGES, PAGE, 1, 2, HEAD_DIM))).astype(
-        jnp.bfloat16
-    )
+    kv_rows = rounded(rng.standard_normal((PAGES, PAGE, 2 * HEAD_DIM)), dtype)
+    kv = pack(kv_rows, dtype)
     selected = np.full((num_tokens, TOPK), -1, np.int32)
     local_page = np.full(num_tokens, -1, np.int32)
     local_limit = np.zeros(num_tokens, np.int32)
@@ -89,7 +93,7 @@ def test_matches_dense_reference(num_tokens, num_real, tokens_per_call, monkeypa
 
     expected = _reference(
         np.asarray(q.astype(jnp.float32)),
-        np.asarray(kv.astype(jnp.float32)),
+        kv_rows,
         selected,
         local_page,
         local_limit,
@@ -98,7 +102,7 @@ def test_matches_dense_reference(num_tokens, num_real, tokens_per_call, monkeypa
 
 
 def test_rejects_unsupported_cache():
-    kv = jnp.zeros((2, PAGE, 1, 4, HEAD_DIM), jnp.float8_e4m3fn)
+    kv = jnp.zeros((2, PAGE, 1, 2 * HEAD_DIM), jnp.float32)
     with pytest.raises(NotImplementedError):
         msa_sparse_attention(
             jnp.zeros((16, HEADS, HEAD_DIM), jnp.bfloat16),
@@ -111,16 +115,21 @@ def test_rejects_unsupported_cache():
         )
 
 
-def test_lowers_for_tpu():
+@pytest.mark.parametrize("dtype", CACHE_DTYPES)
+def test_lowers_for_tpu(dtype):
     """Pallas -> Mosaic lowering and verification run without a TPU."""
     tokens, topk = 256, 16
     args = (
         jax.ShapeDtypeStruct((tokens, HEADS, HEAD_DIM), jnp.bfloat16),
-        jax.ShapeDtypeStruct((64, PAGE, 1, 2, HEAD_DIM), jnp.bfloat16),
+        jax.ShapeDtypeStruct(
+            (64, PAGE // PACKING[dtype], PACKING[dtype], 2 * HEAD_DIM), dtype
+        ),
         jax.ShapeDtypeStruct((tokens, topk), jnp.int32),
         jax.ShapeDtypeStruct((tokens,), jnp.int32),
         jax.ShapeDtypeStruct((tokens,), jnp.int32),
     )
     attention = functools.partial(msa_sparse_attention, sm_scale=HEAD_DIM**-0.5)
-    lowered = jax.jit(attention).trace(*args).lower(lowering_platforms=("tpu",))
+    tpu7x = AbstractMesh((), (), (), abstract_device=AbstractDevice("TPU7x", 1, "tpu"))
+    with use_abstract_mesh(tpu7x):
+        lowered = jax.jit(attention).trace(*args).lower(lowering_platforms=("tpu",))
     assert "tpu_custom_call" in lowered.as_text()

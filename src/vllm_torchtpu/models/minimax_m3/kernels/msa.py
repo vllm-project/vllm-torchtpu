@@ -23,7 +23,6 @@ runs over the selected blocks only (`msa_attention.msa_sparse_attention`).
 import jax
 import jax.numpy as jnp
 
-from vllm_torchtpu.kernels.ragged_paged_attention.v3.kernel import merge_kv
 from vllm_torchtpu.models.minimax_m3.kernels import msa_indexer
 from vllm_torchtpu.models.minimax_m3.kernels.msa_attention import (
     msa_sparse_attention,
@@ -59,27 +58,19 @@ def _token_pages(
     return jnp.where(valid, page, _DROPPED_PAGE)
 
 
-def write_kv_cache(
-    kv_cache: jax.Array,
-    k: jax.Array,
-    v: jax.Array,
-    pages: jax.Array,
-    pos: jax.Array,
-) -> jax.Array:
-    """Scatter K/V rows into a ``[pages, page_size, Kx2/pack, pack, D]`` cache."""
-    rows = merge_kv(k.astype(kv_cache.dtype), v.astype(kv_cache.dtype))
-    slot = pos % kv_cache.shape[1]
-    return kv_cache.at[pages, slot].set(rows, mode="drop")
+def page_size(cache: jax.Array) -> int:
+    """Tokens per page of a packed ``[pages, S / p, p, W]`` cache."""
+    return cache.shape[1] * cache.shape[2]
 
 
-def write_index_cache(
-    index_cache: jax.Array, index_k: jax.Array, pages: jax.Array, pos: jax.Array
+def write_rows(
+    cache: jax.Array, rows: jax.Array, pages: jax.Array, pos: jax.Array
 ) -> jax.Array:
-    """Scatter index keys into a ``[pages, page_size/pack, pack, D]`` cache."""
-    packing = index_cache.shape[2]
-    slot = pos % (index_cache.shape[1] * packing)
-    return index_cache.at[pages, slot // packing, slot % packing].set(
-        index_k.astype(index_cache.dtype), mode="drop"
+    """Scatter one row per token into a packed ``[pages, S / p, p, W]`` cache."""
+    packing = cache.shape[2]
+    slot = pos % page_size(cache)
+    return cache.at[pages, slot // packing, slot % packing].set(
+        rows.astype(cache.dtype), mode="drop"
     )
 
 
@@ -127,7 +118,7 @@ def sparse_attention(
             f"{selected.shape[1]}. Use a tensor parallel size of at least "
             "num_key_value_heads."
         )
-    block_size = kv_cache.shape[1]
+    block_size = page_size(kv_cache)
     selected = selected[:, 0]
     pages = block_tables_2d[seq_id[:, None], jnp.maximum(selected, 0)]
     pages = jnp.where((selected >= 0) & valid[:, None], pages, -1)
@@ -163,18 +154,20 @@ def msa_forward(
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Write this step's K/V and index keys, select blocks, attend.
 
-    Shapes: ``q [T, Hq, D]``, ``k``/``v [T, Hkv, D]``, ``index_q [T, Hkv, D]``,
-    ``index_k [T, D]``. Returns ``(kv_cache, index_cache, out [T, Hq, D])``.
+    Shapes: ``q [T, Hq, D]``, ``k``/``v [T, 1, D]``, ``index_q [T, 1, D]``,
+    ``index_k [T, D]``; caches in the packed layout ``[pages, S / p, p, W]``
+    with rows ``[K | V]`` (``W = 2D``) and index keys (``W = D``). Returns
+    ``(kv_cache, index_cache, out [T, Hq, D])``.
     """
     num_tokens = q.shape[0]
-    block_size = kv_cache.shape[1]
+    block_size = page_size(kv_cache)
     max_num_seqs = seq_lens.shape[0]
     block_tables_2d = block_tables.reshape(max_num_seqs, -1)
     seq_id, pos, valid = token_positions(num_tokens, seq_lens, cu_q_lens)
     pages = _token_pages(block_tables_2d, seq_id, pos, valid, block_size)
 
-    kv_cache = write_kv_cache(kv_cache, k, v, pages, pos)
-    index_cache = write_index_cache(index_cache, index_k, pages, pos)
+    kv_cache = write_rows(kv_cache, jnp.concatenate([k, v], axis=-1)[:, 0], pages, pos)
+    index_cache = write_rows(index_cache, index_k, pages, pos)
 
     scores = msa_indexer.block_scores(
         index_q,

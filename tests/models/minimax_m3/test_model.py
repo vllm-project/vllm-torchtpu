@@ -30,7 +30,6 @@ from vllm.model_executor.model_loader.utils import configure_quant_config
 from vllm.model_executor.models import ModelRegistry
 from vllm.model_executor.models.config import MODELS_CONFIG_MAP
 from vllm.transformers_utils.configs.minimax_m3 import MiniMaxM3TextConfig
-from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm.v1.attention.backends.utils import resolve_kv_cache_layout
 
 import vllm_torchtpu.models.minimax_m3.attention as attention_mod
@@ -134,7 +133,6 @@ def _hook_config(**overrides) -> SimpleNamespace:
         block_size=16,
         user_specified_block_size=False,
         speculative_config=None,
-        attention_backend=None,
         indexer_kv_dtype="auto",
     )
     values.update(overrides)
@@ -153,14 +151,17 @@ def _hook_config(**overrides) -> SimpleNamespace:
         ),
         speculative_config=values["speculative_config"],
         attention_config=AttentionConfig(
-            backend=values["attention_backend"],
             indexer_kv_dtype=values["indexer_kv_dtype"],
         ),
     )
 
 
-def test_config_pins_block_size_to_sparse_block() -> None:
-    config = _hook_config()
+@pytest.mark.parametrize(
+    "cache_dtype,indexer_kv_dtype",
+    [("auto", "auto"), ("fp8", "auto"), ("fp8", "fp8"), ("bfloat16", "bf16")],
+)
+def test_config_pins_block_size_to_sparse_block(cache_dtype, indexer_kv_dtype) -> None:
+    config = _hook_config(cache_dtype=cache_dtype, indexer_kv_dtype=indexer_kv_dtype)
     TPUMiniMaxM3Config.verify_and_update_config(config)
     assert config.cache_config.block_size == 128
     assert config.cache_config.user_specified_block_size
@@ -170,10 +171,10 @@ def test_config_pins_block_size_to_sparse_block() -> None:
     "overrides,error",
     [
         (dict(tensor_parallel_size=2), NotImplementedError),
-        (dict(cache_dtype="fp8"), NotImplementedError),
+        (dict(cache_dtype="fp8_e5m2"), NotImplementedError),
+        (dict(cache_dtype="fp8", indexer_kv_dtype="bf16"), NotImplementedError),
         (dict(speculative_config=object()), NotImplementedError),
         (dict(block_size=64, user_specified_block_size=True), ValueError),
-        (dict(attention_backend=AttentionBackendEnum.CUSTOM), NotImplementedError),
         (dict(indexer_kv_dtype="fp8"), NotImplementedError),
     ],
 )
@@ -323,6 +324,16 @@ def test_checkpoint_loads_and_mxfp8_dequantizes(tiny_model, monkeypatch) -> None
     assert isinstance(moe.gate.quant_method, UnquantizedLinearMethod)
     experts = moe.experts.routed_experts
     assert isinstance(experts.quant_method, MiniMaxM3Nvfp4MoEMethod)
+
+    # Both MSA caches are model-owned rows: [K | V] and index keys.
+    specs = {
+        name: cache.get_kv_cache_spec(vllm_config)
+        for name, cache in (("kv", attn.kv_cache), ("index", attn.index_cache))
+    }
+    assert (specs["kv"].head_size, specs["index"].head_size) == (2 * HEAD_DIM, HEAD_DIM)
+    assert {spec.dtype for spec in specs.values()} == {torch.bfloat16}
+    static_forward_context = vllm_config.compilation_config.static_forward_context
+    assert static_forward_context["model.layers.0.self_attn.attn"] is attn.kv_cache
 
     loaded = model.load_weights(ckpt.items())
     params = {name for name, _ in model.named_parameters()}

@@ -18,8 +18,9 @@ page is the max over its tokens of ``index_q . index_k`` (no scale: only the
 order matters). Each request's tokens are cut into query tiles of
 `block_q` rows; a grid step scores one tile against `pages_per_step` pages
 read straight from the paged index cache, so a request's index keys are read
-once per tile. The bf16 cache packs two consecutive tokens per 32-bit word;
-even and odd tokens are scored separately, which a max does not mind.
+once per tile. The cache packs consecutive tokens into 32-bit words
+(`packed_page`); each packing slot is scored separately, which a max does not
+mind.
 
 Scores are produced transposed, ``[pages, tiles * block_q]``, so each output
 block is lane-aligned, and gathered back to ``[tokens, pages]``.
@@ -31,6 +32,11 @@ import jax
 import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
+
+from vllm_torchtpu.models.minimax_m3.kernels.packed_page import (
+    check_page_dtype,
+    unpack_page,
+)
 
 DEFAULT_BLOCK_Q = 128
 DEFAULT_PAGES_PER_STEP = 32
@@ -45,19 +51,15 @@ def _kernel(
     block_tables_ref,  # [max_num_seqs * pages_per_seq]
     # In
     q_ref,  # [Bq, D]
-    *refs,  # G x [1, S/2, 2, D] bf16 index-cache pages, then the output
+    *refs,  # G x [1, S / p, p, D] index-cache pages, then the output
 ):
     pages_per_step = len(refs) - 1
     page_refs, o_ref = refs[:pages_per_step], refs[pages_per_step]
     q = q_ref[...]
     maxima = []
     for page_ref in page_refs:
-        # Same rank in and out: Mosaic bitcasts the packed axis 2 -> 1.
-        packed = page_ref.bitcast(jnp.uint32)[0, :, 0, :]
-        even = pltpu.bitcast((packed & 0xFFFF).astype(jnp.uint16), jnp.bfloat16)
-        odd = pltpu.bitcast((packed >> 16).astype(jnp.uint16), jnp.bfloat16)
         page_max = None
-        for keys in (even, odd):
+        for keys in unpack_page(page_ref):
             s = jax.lax.dot_general(
                 keys, q, (((1,), (1,)), ((), ())), preferred_element_type=jnp.float32
             )
@@ -103,7 +105,7 @@ def block_scores(
 
     Args:
       index_q: ``[T, 1, D]`` index queries (one index head per rank).
-      index_cache: ``[pages, S/2, 2, D]`` bf16 key-only cache.
+      index_cache: ``[pages, S / p, p, D]`` key-only cache (bf16 or fp8).
       seq_lens, block_tables, cu_q_lens, num_seqs: ragged batch metadata.
     Pages past a token's own page hold scores of keys it must not see, and
     pages past its request's last page are not written; callers mask both.
@@ -114,10 +116,7 @@ def block_scores(
             f"MSA indexer scores one index head per rank, got {num_heads}."
         )
     _, rows_per_page, packing, _ = index_cache.shape
-    if (packing, index_cache.dtype) != (2, jnp.bfloat16):
-        raise NotImplementedError(
-            f"MSA indexer supports bf16 index keys, got {index_cache.dtype}."
-        )
+    check_page_dtype(packing, index_cache.dtype)
     page_size = rows_per_page * packing
     max_num_seqs = seq_lens.shape[0]
     pages_per_seq = block_tables.shape[0] // max_num_seqs
@@ -156,7 +155,7 @@ def block_scores(
             )
             return (block_tables[seq * pages_per_seq + col], 0, 0, 0)
 
-        return pl.BlockSpec((1, rows_per_page, 2, head_dim), index_map)
+        return pl.BlockSpec((1, rows_per_page, packing, head_dim), index_map)
 
     grid_spec = pltpu.PrefetchScalarGridSpec(
         num_scalar_prefetch=3,

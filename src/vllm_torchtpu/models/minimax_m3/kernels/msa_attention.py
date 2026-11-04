@@ -22,8 +22,8 @@ tile instead of once per token. The (tile, page group) work list is
 flattened ahead of the kernel and run on a dynamic grid, so empty union
 slots cost nothing.
 
-Layout: one KV head (K and V packed in the bf16 cache's 32-bit words, as the
-ragged paged attention v3 cache stores them), `num_heads` query heads.
+Layout: one KV head per rank; each token's cache row is ``[K | V]`` in the
+packed MLA page layout (`packed_page`), bf16 or fp8. `num_heads` query heads.
 """
 
 import functools
@@ -32,6 +32,12 @@ import jax
 import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
+
+from vllm_torchtpu.models.minimax_m3.kernels.packed_page import (
+    check_page_dtype,
+    slot_ids,
+    unpack_page,
+)
 
 DEFAULT_BLOCK_Q = 64
 DEFAULT_PAGES_PER_STEP = 8
@@ -47,14 +53,6 @@ _MASK_VALUE = -1e30
 _NO_PAGE = jnp.iinfo(jnp.int32).max
 
 
-def _unpack_kv(kv_ref) -> tuple[jax.Array, jax.Array]:
-    # Same rank in and out: Mosaic bitcasts the packed axis 2 -> 1.
-    packed = kv_ref.bitcast(jnp.uint32)[0, :, 0, :]
-    k = pltpu.bitcast((packed & 0xFFFF).astype(jnp.uint16), jnp.bfloat16)
-    v = pltpu.bitcast((packed >> 16).astype(jnp.uint16), jnp.bfloat16)
-    return k, v
-
-
 def _kernel(
     # Scalar prefetch
     work_page_ref,  # [groups * G] page of each group slot, -1 for none
@@ -64,7 +62,7 @@ def _kernel(
     selected_ref,  # [Bq, K] physical pages, -1 padded
     local_page_ref,  # [Bq, 1]
     local_limit_ref,  # [Bq, 1] visible slots of the local page
-    *refs,  # G x [1, S, 2, D] bf16 KV pages, then out and scratch
+    *refs,  # G x [1, S / p, p, 2D] KV pages, then out and scratch
     sm_scale: float,
 ):
     pages_per_step = len(refs) - 4
@@ -73,7 +71,8 @@ def _kernel(
     w = pl.program_id(0)
     meta = work_meta_ref[w]
     num_heads, block_q, head_dim = q_ref.shape
-    page_size = kv_refs[0].shape[1]
+    packing = kv_refs[0].shape[2]
+    page_size = kv_refs[0].shape[1] * packing
 
     @pl.when((meta & _FIRST_BIT) != 0)
     def _init():
@@ -85,9 +84,9 @@ def _kernel(
     selected = selected_ref[...]
     for g, kv_ref in enumerate(kv_refs):
         page = work_page_ref[w * pages_per_step + g]
-        k, v = _unpack_kv(kv_ref)
-        keys.append(k)
-        values.append(v)
+        rows = unpack_page(kv_ref)
+        keys.append(jnp.concatenate([r[:, :head_dim] for r in rows], axis=0))
+        values.append(jnp.concatenate([r[:, head_dim:] for r in rows], axis=0))
         is_selected = jnp.max(
             (selected == page).astype(jnp.int32), axis=1, keepdims=True
         )
@@ -103,7 +102,7 @@ def _kernel(
         q, k, (((1,), (1,)), ((), ())), preferred_element_type=jnp.float32
     )
     s = s * sm_scale
-    slots = jax.lax.broadcasted_iota(jnp.int32, (s.shape[0], page_size), 1)
+    slots = slot_ids(s.shape[0], page_size, packing)
     mask = jnp.concatenate([slots < limit for limit in limits], axis=1)
     s = jnp.where(mask, s, _MASK_VALUE)
 
@@ -181,7 +180,7 @@ def _attention_call(
 ):
     """One kernel call over a token count that is a multiple of block_q."""
     num_tokens, num_heads, head_dim = q.shape
-    page_size = kv_cache.shape[1]
+    _, rows_per_page, packing, row_width = kv_cache.shape
     topk = selected.shape[1]
     pages, meta, num_groups = _work_list(selected, block_q, pages_per_step)
 
@@ -195,7 +194,7 @@ def _attention_call(
         def index_map(w, pages, meta):
             return (jnp.maximum(pages[w * pages_per_step + g], 0), 0, 0, 0)
 
-        return pl.BlockSpec((1, page_size, 2, head_dim), index_map)
+        return pl.BlockSpec((1, rows_per_page, packing, row_width), index_map)
 
     grid_spec = pltpu.PrefetchScalarGridSpec(
         num_scalar_prefetch=2,
@@ -214,7 +213,6 @@ def _attention_call(
             pltpu.VMEM((num_heads * block_q, head_dim), jnp.float32),
         ],
     )
-    kv_pages = kv_cache.reshape(-1, page_size, 2, head_dim)
     out = pl.pallas_call(
         functools.partial(_kernel, sm_scale=sm_scale),
         grid_spec=grid_spec,
@@ -231,7 +229,7 @@ def _attention_call(
         selected,
         local_page[:, None],
         local_limit[:, None],
-        *([kv_pages] * pages_per_step),
+        *([kv_cache] * pages_per_step),
     )
     return out.transpose(1, 0, 2)
 
@@ -255,7 +253,7 @@ def msa_sparse_attention(
 
     Args:
       q: ``[T, H, D]`` queries of one KV head's query heads.
-      kv_cache: ``[pages, S, 1, 2, D]`` bf16 cache (K, V packed per word).
+      kv_cache: ``[pages, S / p, p, 2D]`` packed ``[K | V]`` rows (bf16 or fp8).
       selected: ``[T, K]`` physical pages each token attends, ``-1`` padded.
       local_page: ``[T]`` the page holding the token itself (``-1`` for
         padding tokens).
@@ -263,12 +261,11 @@ def msa_sparse_attention(
     Returns:
       ``[T, H, D]`` outputs; padding tokens get zeros.
     """
-    num_tokens = q.shape[0]
-    _, _, kv_groups, packing, _ = kv_cache.shape
-    if (kv_groups, packing, kv_cache.dtype) != (1, 2, jnp.bfloat16):
-        raise NotImplementedError(
-            "MSA attention supports one bf16 KV head per rank, got cache "
-            f"{kv_cache.shape} {kv_cache.dtype}."
+    num_tokens, _, head_dim = q.shape
+    check_page_dtype(kv_cache.shape[2], kv_cache.dtype)
+    if kv_cache.shape[3] != 2 * head_dim:
+        raise ValueError(
+            f"Cache rows hold [K | V] of width {2 * head_dim}, got {kv_cache.shape}."
         )
     pad = -num_tokens % block_q
     if pad:

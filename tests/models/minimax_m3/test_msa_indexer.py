@@ -19,7 +19,9 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from jax.sharding import AbstractDevice, AbstractMesh, use_abstract_mesh
 
+from tests.models.minimax_m3.packing import CACHE_DTYPES, PACKING, pack, rounded
 from vllm_torchtpu.models.minimax_m3.kernels.msa_indexer import block_scores
 
 PAGE = 128
@@ -29,6 +31,7 @@ MAX_SEQS = 4
 NUM_PAGES = 40
 
 
+@pytest.mark.parametrize("dtype", CACHE_DTYPES)
 @pytest.mark.parametrize(
     "q_lens,ctx_lens,block_q,pages_per_step",
     [
@@ -36,7 +39,7 @@ NUM_PAGES = 40
         ([1, 1], [1000, 5], 128, 2),  # decode only, several page groups
     ],
 )
-def test_matches_reference(q_lens, ctx_lens, block_q, pages_per_step):
+def test_matches_reference(q_lens, ctx_lens, block_q, pages_per_step, dtype):
     rng = np.random.default_rng(len(q_lens))
     num_seqs = len(q_lens)
     num_real = sum(q_lens)
@@ -49,9 +52,8 @@ def test_matches_reference(q_lens, ctx_lens, block_q, pages_per_step):
     tables[:num_seqs] = rng.permutation(np.arange(1, NUM_PAGES))[
         : num_seqs * PAGES_PER_SEQ
     ].reshape(num_seqs, PAGES_PER_SEQ)
-    cache = jnp.asarray(
-        rng.standard_normal((NUM_PAGES, PAGE // 2, 2, HEAD_DIM))
-    ).astype(jnp.bfloat16)
+    keys = rounded(rng.standard_normal((NUM_PAGES, PAGE, HEAD_DIM)), dtype)
+    cache = pack(keys, dtype)
     index_q = jnp.asarray(rng.standard_normal((num_tokens, 1, HEAD_DIM))).astype(
         jnp.bfloat16
     )
@@ -68,7 +70,6 @@ def test_matches_reference(q_lens, ctx_lens, block_q, pages_per_step):
         interpret=True,
     )
 
-    keys = np.asarray(cache.astype(jnp.float32)).reshape(NUM_PAGES, PAGE, HEAD_DIM)
     queries = np.asarray(index_q.astype(jnp.float32))[:, 0]
     scores = np.asarray(scores)[:, 0]
     for r in range(num_seqs):
@@ -79,20 +80,25 @@ def test_matches_reference(q_lens, ctx_lens, block_q, pages_per_step):
                 np.testing.assert_allclose(scores[t, b], expected, rtol=1e-5, atol=1e-4)
 
 
-def test_lowers_for_tpu():
+@pytest.mark.parametrize("dtype", CACHE_DTYPES)
+def test_lowers_for_tpu(dtype):
     """Pallas -> Mosaic lowering and verification run without a TPU."""
     tokens, max_seqs, pages_per_seq = 256, 16, 2048
     args = (
         jax.ShapeDtypeStruct((tokens, 1, HEAD_DIM), jnp.bfloat16),
-        jax.ShapeDtypeStruct((4096, PAGE // 2, 2, HEAD_DIM), jnp.bfloat16),
+        jax.ShapeDtypeStruct(
+            (4096, PAGE // PACKING[dtype], PACKING[dtype], HEAD_DIM), dtype
+        ),
         jax.ShapeDtypeStruct((max_seqs,), jnp.int32),
         jax.ShapeDtypeStruct((max_seqs * pages_per_seq,), jnp.int32),
         jax.ShapeDtypeStruct((max_seqs + 1,), jnp.int32),
         jax.ShapeDtypeStruct((), jnp.int32),
     )
-    lowered = (
-        jax.jit(functools.partial(block_scores))
-        .trace(*args)
-        .lower(lowering_platforms=("tpu",))
-    )
+    tpu7x = AbstractMesh((), (), (), abstract_device=AbstractDevice("TPU7x", 1, "tpu"))
+    with use_abstract_mesh(tpu7x):
+        lowered = (
+            jax.jit(functools.partial(block_scores))
+            .trace(*args)
+            .lower(lowering_platforms=("tpu",))
+        )
     assert "tpu_custom_call" in lowered.as_text()

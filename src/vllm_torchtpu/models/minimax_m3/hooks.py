@@ -16,14 +16,17 @@
 from typing import TYPE_CHECKING
 
 from vllm.model_executor.models.config import VerifyAndUpdateConfig
-from vllm.v1.attention.backends.registry import AttentionBackendEnum
-
-from vllm_torchtpu import envs
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
 
-_SUPPORTED_KV_CACHE_DTYPES = ("auto", "bfloat16")
+# --kv-cache-dtype -> the indexer dtype naming of --attention-config.
+_INDEXER_DTYPE_BY_KV_CACHE_DTYPE = {
+    "auto": "bf16",
+    "bfloat16": "bf16",
+    "fp8": "fp8",
+    "fp8_e4m3": "fp8",
+}
 
 
 class TPUMiniMaxM3Config(VerifyAndUpdateConfig):
@@ -60,29 +63,20 @@ class TPUMiniMaxM3Config(VerifyAndUpdateConfig):
                 f"MiniMax M3 sparse attention on TPU needs one KV head per rank: "
                 f"use --tensor-parallel-size >= {num_kv_heads}, got {tp_size}."
             )
-        if cache_config.cache_dtype not in _SUPPORTED_KV_CACHE_DTYPES:
-            # TODO(minimax-m3): quantize K/V on the MSA cache write.
+        kv_dtype = _INDEXER_DTYPE_BY_KV_CACHE_DTYPE.get(cache_config.cache_dtype)
+        if kv_dtype is None:
             raise NotImplementedError(
-                f"MiniMax M3 on TPU supports --kv-cache-dtype in "
-                f"{_SUPPORTED_KV_CACHE_DTYPES}, got {cache_config.cache_dtype!r}."
+                "MiniMax M3 on TPU supports --kv-cache-dtype in "
+                f"{sorted(_INDEXER_DTYPE_BY_KV_CACHE_DTYPE)}, got "
+                f"{cache_config.cache_dtype!r}."
             )
-        indexer_kv_dtype = vllm_config.attention_config.resolve_indexer_kv_dtype("bf16")
-        if indexer_kv_dtype != "bf16":
-            # TODO(minimax-m3): fp8 index keys.
+        indexer_dtype = vllm_config.attention_config.resolve_indexer_kv_dtype(kv_dtype)
+        if indexer_dtype not in (kv_dtype, "fp8_e4m3" if kv_dtype == "fp8" else None):
+            # TODO(minimax-m3): an index-key dtype independent of the KV cache.
             raise NotImplementedError(
-                "MiniMax M3 on TPU keeps index keys in bf16; drop "
-                f"indexer_kv_dtype={indexer_kv_dtype!r} from --attention-config."
-            )
-        # The MSA op writes and reads the FLASH_ATTN (RPA v3) page layout.
-        backend = vllm_config.attention_config.backend
-        if backend not in (None, AttentionBackendEnum.FLASH_ATTN):
-            raise NotImplementedError(
-                "MiniMax M3 sparse attention on TPU runs on the FLASH_ATTN KV "
-                f"layout; leave --attention-backend unset, got {backend.name}."
-            )
-        if envs.VLLM_TPU_BLOCK_MAJOR_KV:
-            raise NotImplementedError(
-                "MiniMax M3 on TPU does not support VLLM_TPU_BLOCK_MAJOR_KV yet."
+                f"MiniMax M3 on TPU stores index keys in the KV cache dtype "
+                f"({kv_dtype}); set indexer_kv_dtype to {kv_dtype!r} in "
+                f"--attention-config, got {indexer_dtype!r}."
             )
         if vllm_config.speculative_config is not None:
             # TODO(minimax-m3): port the DSpark drafter.
