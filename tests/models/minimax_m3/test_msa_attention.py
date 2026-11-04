@@ -13,6 +13,9 @@
 # limitations under the License.
 """MSA sparse attention kernel (interpret mode) against a dense reference."""
 
+import functools
+
+import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
@@ -102,3 +105,18 @@ def test_rejects_unsupported_cache():
             sm_scale=1.0,
             interpret=True,
         )
+
+
+def test_lowers_for_tpu():
+    """Pallas -> Mosaic lowering and verification run without a TPU."""
+    tokens, topk = 256, 16
+    args = (
+        jax.ShapeDtypeStruct((tokens, HEADS, HEAD_DIM), jnp.bfloat16),
+        jax.ShapeDtypeStruct((64, PAGE, 1, 2, HEAD_DIM), jnp.bfloat16),
+        jax.ShapeDtypeStruct((tokens, topk), jnp.int32),
+        jax.ShapeDtypeStruct((tokens,), jnp.int32),
+        jax.ShapeDtypeStruct((tokens,), jnp.int32),
+    )
+    attention = functools.partial(msa_sparse_attention, sm_scale=HEAD_DIM**-0.5)
+    lowered = jax.jit(attention).trace(*args).lower(lowering_platforms=("tpu",))
+    assert "tpu_custom_call" in lowered.as_text()
