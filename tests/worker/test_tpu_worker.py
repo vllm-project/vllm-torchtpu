@@ -484,16 +484,27 @@ def test_warmup_restores_runtime_threads_without_overriding_user_choice(
         compilation_config=SimpleNamespace(compilation_time=0.0),
         speculative_config=object() if speculative else None,
     )
+    from vllm_torchtpu.runner.tpu_runner import DYNAMO_RECOMPILE_LIMIT
+
     previous_threads = torch.get_num_threads()
     try:
         torch.set_num_threads(2)
         with (
+            torch._dynamo.config.patch(
+                cache_size_limit=8,
+                accumulated_recompile_limit=8,
+            ),
             patch("vllm_torchtpu.worker.tpu_worker.freeze_gc_heap") as freeze,
             patch(
                 "vllm_torchtpu.worker.tpu_worker.maybe_attach_gc_debug_callback"
             ) as gc_debug,
         ):
             result = TPUWorker.compile_or_warm_up_model(worker)
+            assert torch._dynamo.config.cache_size_limit == DYNAMO_RECOMPILE_LIMIT
+            assert (
+                torch._dynamo.config.accumulated_recompile_limit
+                == DYNAMO_RECOMPILE_LIMIT
+            )
         freeze.assert_called_once_with()
         gc_debug.assert_called_once_with()
         # Speculative decoding warms up at the serving thread count; other

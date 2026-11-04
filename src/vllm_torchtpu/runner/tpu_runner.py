@@ -518,6 +518,15 @@ def _build_kv_connector_output(
 # Smallest output size
 MIN_NUM_SEQS = 8
 SAMPLING_EPS = 1e-5
+DYNAMO_RECOMPILE_LIMIT = 1024
+
+
+def configure_dynamo_limits() -> None:
+    """Widen Torch Dynamo recompile limits for static-shape TPU compilation."""
+    if torch._dynamo.config.cache_size_limit < DYNAMO_RECOMPILE_LIMIT:
+        torch._dynamo.config.cache_size_limit = DYNAMO_RECOMPILE_LIMIT
+    if torch._dynamo.config.accumulated_recompile_limit < DYNAMO_RECOMPILE_LIMIT:
+        torch._dynamo.config.accumulated_recompile_limit = DYNAMO_RECOMPILE_LIMIT
 
 
 def _get_sequence_layout_planner_for_runner(runner: Any):
@@ -899,8 +908,7 @@ class TPUModelRunner(GPUModelRunner):
         self.num_xla_graphs = 0
         self._update_num_xla_graphs("init")
         # torchTPU doesn't support SymInt yet, so widen Dynamo cache limits.
-        torch._dynamo.config.cache_size_limit = 1024
-        torch._dynamo.config.accumulated_recompile_limit = 1024
+        configure_dynamo_limits()
 
         # Override parent's kv_cache_dtype with the TPU mapping (handles
         # auto -> bfloat16 for our supported dtype set).

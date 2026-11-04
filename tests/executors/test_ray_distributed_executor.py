@@ -13,13 +13,17 @@
 # limitations under the License.
 
 import os
+import threading
 from types import SimpleNamespace
 from unittest.mock import MagicMock, Mock, call
 
 import pytest
+import torch
 from vllm import platforms
+from vllm.utils.torch_utils import OMP_NUM_THREADS_SET_BY_VLLM
 
 from vllm_torchtpu.executors import ray_distributed_executor as ray_executor
+from vllm_torchtpu.runner.tpu_runner import DYNAMO_RECOMPILE_LIMIT
 
 
 @pytest.fixture
@@ -344,7 +348,15 @@ def worker(monkeypatch):
     worker.worker = SimpleNamespace(model_runner=Mock())
     worker.compiled_dag_cuda_device_set = False
     worker._is_last_rank = Mock(return_value=True)
-    return worker
+    previous_threads = torch.get_num_threads()
+    with torch._dynamo.config.patch(
+        cache_size_limit=torch._dynamo.config.cache_size_limit,
+        accumulated_recompile_limit=torch._dynamo.config.accumulated_recompile_limit,
+    ):
+        try:
+            yield worker
+        finally:
+            torch.set_num_threads(previous_threads)
 
 
 @pytest.mark.parametrize("sample,intermediate", [(True, False), (False, True)])
@@ -391,3 +403,105 @@ def test_worker_device_setup_requires_worker(worker):
     worker.worker = None
     with pytest.raises(AssertionError, match="Worker is not initialized"):
         worker.setup_device_if_necessary()
+
+
+@pytest.mark.parametrize(
+    "initial_limit,expected_limit",
+    [(8, DYNAMO_RECOMPILE_LIMIT), (2048, 2048)],
+)
+def test_worker_device_setup_widens_dynamo_limits_and_runtime_threads(
+    monkeypatch, worker, initial_limit, expected_limit
+):
+    monkeypatch.setenv("OMP_NUM_THREADS", "2")
+    monkeypatch.setenv(OMP_NUM_THREADS_SET_BY_VLLM, "1")
+    observed = []
+
+    def run_on_compiled_dag_thread():
+        with torch._dynamo.config.patch(
+            cache_size_limit=initial_limit,
+            accumulated_recompile_limit=initial_limit,
+        ):
+            torch.set_num_threads(2)
+            worker.setup_device_if_necessary()
+            observed.append(
+                (
+                    torch._dynamo.config.cache_size_limit,
+                    torch._dynamo.config.accumulated_recompile_limit,
+                    torch.get_num_threads(),
+                    worker.compiled_dag_cuda_device_set,
+                )
+            )
+
+    thread = threading.Thread(target=run_on_compiled_dag_thread)
+    thread.start()
+    thread.join()
+
+    assert observed == [(expected_limit, expected_limit, 1, True)]
+
+
+def test_worker_compiled_dag_background_thread_avoids_recompile_limit_hit(
+    monkeypatch, worker
+):
+    monkeypatch.setenv("OMP_NUM_THREADS", "2")
+    monkeypatch.setenv(OMP_NUM_THREADS_SET_BY_VLLM, "1")
+
+    @torch.compile(backend="eager", fullgraph=True, dynamic=False)
+    def compiled_step(x: torch.Tensor) -> torch.Tensor:
+        return x + 1
+
+    worker.worker.model_runner.execute_model.side_effect = (
+        lambda sched, _=None: compiled_step(sched)
+    )
+    torch._dynamo.reset()
+    try:
+        with torch._dynamo.config.patch(
+            cache_size_limit=DYNAMO_RECOMPILE_LIMIT,
+            accumulated_recompile_limit=DYNAMO_RECOMPILE_LIMIT,
+        ):
+            torch.set_num_threads(1)
+            for size in range(1, 7):
+                compiled_step(torch.zeros(size))
+
+            outputs = []
+            thread_state = []
+            errors = []
+
+            def run_compiled_dag_steps():
+                try:
+                    # Simulate a lower recompile limit and unconfigured thread-local
+                    # state on Ray Compiled Graph background execution thread.
+                    with torch._dynamo.config.patch(
+                        cache_size_limit=8,
+                        accumulated_recompile_limit=8,
+                    ):
+                        torch.set_num_threads(2)
+                        for size in range(1, 13):
+                            result_id = worker.execute_model_ray(
+                                (torch.zeros(size), None)
+                            )
+                            outputs.append(
+                                int(
+                                    worker.get_execute_model_output(result_id)
+                                    .sum()
+                                    .item()
+                                )
+                            )
+                        thread_state.append(
+                            (
+                                torch._dynamo.config.cache_size_limit,
+                                torch._dynamo.config.accumulated_recompile_limit,
+                                torch.get_num_threads(),
+                            )
+                        )
+                except Exception as exc:
+                    errors.append(exc)
+
+            thread = threading.Thread(target=run_compiled_dag_steps)
+            thread.start()
+            thread.join()
+
+        assert errors == []
+        assert outputs == list(range(1, 13))
+        assert thread_state == [(DYNAMO_RECOMPILE_LIMIT, DYNAMO_RECOMPILE_LIMIT, 1)]
+    finally:
+        torch._dynamo.reset()

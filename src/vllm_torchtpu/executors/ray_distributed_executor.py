@@ -28,6 +28,7 @@ from vllm.platforms import current_platform
 from vllm.ray.ray_env import get_env_vars_to_copy
 from vllm.sequence import IntermediateTensors
 from vllm.utils.network_utils import get_distributed_init_method, get_ip, get_open_port
+from vllm.utils.torch_utils import set_torch_threads_for_runtime
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.executor.ray_executor import (
     RayDistributedExecutor as RayDistributedExecutorV1,
@@ -41,7 +42,10 @@ from vllm_torchtpu import envs as tpu_envs
 from vllm_torchtpu.distributed.utils import set_node_kv_ip_port
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.platforms.tpu_platform import get_tpu_multihost_topology
-from vllm_torchtpu.runner.tpu_runner import AsyncTPUModelRunnerOutput
+from vllm_torchtpu.runner.tpu_runner import (
+    AsyncTPUModelRunnerOutput,
+    configure_dynamo_limits,
+)
 
 if TYPE_CHECKING:
     from ray.dag.compiled_dag_node import CompiledDAG
@@ -586,7 +590,9 @@ class RayWorkerWrapper(RayWorkerWrapperV1):
         # device.
         # We can remove this API after it is fixed in compiled graph.
         assert self.worker is not None, "Worker is not initialized"
+        configure_dynamo_limits()
         if not self.compiled_dag_cuda_device_set:
+            set_torch_threads_for_runtime()
             self.compiled_dag_cuda_device_set = True
 
     # Override the execute_model method to suppprt async scheduling.
