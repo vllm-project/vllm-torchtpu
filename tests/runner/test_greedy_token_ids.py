@@ -12,6 +12,7 @@ import pytest
 import torch
 import vllm.model_executor.layers.vocab_parallel_embedding as vpe
 
+from vllm_torchtpu.layers.adapter.sample.vocab_parallel import local_argmax_pair
 from vllm_torchtpu.runner.tpu_runner import (
     TPUModelRunner,
     _vocab_parallel_greedy_head,
@@ -117,3 +118,21 @@ def test_spec_tokens_from_token_ids_match_logits_path():
 def test_greedy_sample_passes_token_ids_through():
     ids = torch.tensor([[4], [9]])
     assert TPUModelRunner._greedy_sample(None, ids) is ids
+
+
+@pytest.mark.parametrize("ties", [False, True])
+def test_int32_head_bounds_pick_like_int64(ties):
+    """LM head bounds are int32; the argmax pair matches int64 bounds."""
+    torch.manual_seed(11)
+    logits = torch.randn(6, 64).to(torch.bfloat16)
+    if ties:
+        logits[:, [3, 40]] = 9
+    logits[:, 60:] = float("inf")  # padding columns past the shard end
+    pairs = [
+        local_argmax_pair(
+            logits, torch.tensor(128, dtype=d), torch.tensor(188, dtype=d)
+        )
+        for d in (torch.int32, torch.int64)
+    ]
+    assert torch.equal(pairs[0], pairs[1])
+    assert torch.equal(pairs[0][:, 1].long(), logits[:, :60].argmax(dim=-1) + 128)
