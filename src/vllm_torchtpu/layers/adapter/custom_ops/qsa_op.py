@@ -19,6 +19,7 @@ import hashlib
 import torch
 from torch_tpu._internal import pallas
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk.topk_backend import TopKBackend
 from vllm_torchtpu.kernels.qwen4_exp.pooled_qsa import (
     compact_pooled_qsa_step,
@@ -55,22 +56,31 @@ def build_compact_pooled_qsa_op(
     The TPU compiler binds scheduling_group_namespace per FX call site; zero
     keeps direct native calls safe without cross-call scheduling annotations.
     """
-    return _build_compact_pooled_qsa_op(topk_backend, topk_backend_key, project_output)
+    sc_min_context = envs.environment_variables["VLLM_TPU_QSA_SC_MIN_CONTEXT"]()
+    return _build_compact_pooled_qsa_op(
+        topk_backend, topk_backend_key, project_output, sc_min_context
+    )
 
 
 @functools.cache
 def _build_compact_pooled_qsa_op(
-    topk_backend: TopKBackend | None, topk_backend_key: str | None, project_output: bool
+    topk_backend: TopKBackend | None,
+    topk_backend_key: str | None,
+    project_output: bool,
+    sc_min_context: int | None,
 ):
+    kind = "compact_pooled_qsa_projected_v2" if project_output else "compact_pooled_qsa"
+    if sc_min_context is not None:
+        suffix = hashlib.sha256(str(sc_min_context).encode("utf-8")).hexdigest()
+        kind += f"_sc_min_context_{suffix}"
+    core = functools.partial(
+        compact_pooled_qsa_step,
+        topk_backend=topk_backend,
+        sc_min_context=sc_min_context,
+    )
     op = pallas.jax_op(
-        _op_name(
-            "compact_pooled_qsa_projected_v2"
-            if project_output
-            else "compact_pooled_qsa",
-            topk_backend,
-            topk_backend_key,
-        ),
-        functools.partial(compact_pooled_qsa_step, topk_backend=topk_backend),
+        _op_name(kind, topk_backend, topk_backend_key),
+        core,
         donate_argnums=(10, 11),  # pool, index_pool
     )
 

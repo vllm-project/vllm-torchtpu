@@ -29,10 +29,8 @@ from vllm_torchtpu.kernels.qwen4_exp.block_sparse_gqa_prefill import (
 )
 from vllm_torchtpu.kernels.sparse_gqa_prefill.adaptive import (
     adaptive_prefill,
-    is_supported_by_adaptive_prefill,
+    is_supported_by_sc_window,
 )
-from vllm_torchtpu.kernels.sparse_gqa_prefill.cost_model import prefill_cost_model
-from vllm_torchtpu.kernels.sparse_gqa_prefill.selector import select_sc
 from vllm_torchtpu.kernels.sparse_gqa_prefill.tuned_block_sizes import (
     SC_GATHER_MAX_CACHE_BYTES,
 )
@@ -72,7 +70,7 @@ def _abstract_args(dtype=jnp.bfloat16):
         "hardware",
     ],
 )
-def test_adaptive_envelope_preserves_existing_fallbacks(monkeypatch, fp8, case):
+def test_sc_window_capability_checks_actual_resource_bounds(monkeypatch, fp8, case):
     info = pltpu.get_tpu_info_for_chip(
         pltpu.ChipVersion.TPU_V5E if case == "hardware" else pltpu.ChipVersion.TPU_7X,
         1,
@@ -102,7 +100,8 @@ def test_adaptive_envelope_preserves_existing_fallbacks(monkeypatch, fp8, case):
     if case == "cache_size":
         # Larger than SparseCore's per-tensor gather-source cap while
         # addressable: XLA rejects such a gather parameter at compilation, so
-        # eligibility must route this pool to the TC dispatch path.
+        # this direct gather window is unsupported. Native owners are
+        # staged through owner_window before these capability checks.
         assert cache.size * np.dtype(cache.dtype).itemsize > SC_GATHER_MAX_CACHE_BYTES
         assert cache.shape[0] * rows_per_page < np.iinfo(np.int32).max
     if case == "address_overflow":
@@ -115,7 +114,7 @@ def test_adaptive_envelope_preserves_existing_fallbacks(monkeypatch, fp8, case):
         kwargs["v_scale"] = 2.0
     if case == "dynamic_scale":
         kwargs["k_scale"] = cast(float, jax.ShapeDtypeStruct((), jnp.float32))
-    assert is_supported_by_adaptive_prefill(*args, **kwargs) == (
+    assert is_supported_by_sc_window(*args, **kwargs) == (
         case in ("supported", "ragged", "page", "context", "budget")
     )
 
@@ -161,104 +160,6 @@ def _make_inputs(tokens, context, fp8, sc_first):
     )
 
 
-@pytest.mark.tpu_test
-@pytest.mark.parametrize("fp8", [False, True])
-@pytest.mark.parametrize(
-    "tokens,context,sc_first",
-    [
-        (512, 8192, False),
-        (512, 262144, True),
-        (12288, 262144, True),
-        (8448, 262144, True),
-        (8192, 8192, False),
-        (8192, 262144, True),
-        (16384, 131072, False),
-        (16384, 131072, True),
-        (16640, 131072, True),
-    ],
-)
-def test_adaptive_prefill_preserves_mixed_outputs_with_bounded_memory(
-    tokens, context, sc_first, fp8, record_property
-):
-    if pltpu.get_tpu_info().chip_version != pltpu.ChipVersion.TPU_7X:
-        pytest.skip("Adaptive SparseCore schedule is measured on TPU7x")
-    args = _make_inputs(tokens, context, fp8, sc_first)
-    cache = np.asarray(args[5]).copy()
-    compiled = (
-        jax.jit(functools.partial(adaptive_prefill, kv_heads=2, ratio=4))
-        .lower(*args)
-        .compile()
-    )
-    hlo = compiled.as_text()
-    assert hlo is not None
-    record_property("has_sc_branch", "sc_compact_grouped_prefill" in hlo)
-    memory = compiled.memory_analysis()
-    assert memory is not None
-    temporary = memory.temp_size_in_bytes
-    record_property("compiler_temporary_bytes", temporary)
-    output, returned = compiled(*args)
-    baseline, _ = jax.jit(
-        functools.partial(
-            block_sparse_gqa_attention,
-            kv_heads=2,
-            ratio=4,
-            query_block=256,
-            kv_tile=256,
-        )
-    )(*args)
-    actual, expected = np.asarray(output, np.float32), np.asarray(baseline, np.float32)
-    assert np.isfinite(actual).all()
-    assert np.linalg.norm(actual - expected) / np.linalg.norm(expected) < 0.01
-    np.testing.assert_array_equal(actual[np.asarray(args[3]) == 0], 0)
-    np.testing.assert_array_equal(
-        np.asarray(returned).view(np.uint8), cache.view(np.uint8)
-    )
-    if tokens > 8192:
-        choices = [
-            bool(
-                jax.jit(
-                    functools.partial(
-                        select_sc,
-                        num_tiles=math.ceil(args[4].shape[1] * 1664 / 256),
-                        model=prefill_cost_model(
-                            args[0],
-                            args[2],
-                            args[4],
-                            args[5],
-                            kv_heads=2,
-                            ratio=4,
-                            kv_tile=256,
-                        ),
-                    )
-                )(args[2][i : i + 8192], args[3][i : i + 8192])
-            )
-            for i in range(0, tokens, 8192)
-        ]
-        record_property("standalone_selector_choices", choices)
-    # FP64 independent reference includes partial groups and physical page tails.
-    for row in (1, 32, min(8190, tokens - 2), tokens - 2):
-        length = int(args[3][row])
-        count = min(length // 4, 512)
-        selected = (np.asarray(args[2][row, :count, None]) * 4 + np.arange(4)).reshape(
-            -1
-        )
-        selected = np.concatenate((selected, np.arange(length // 4 * 4, length)))
-        values = cache[np.asarray(args[4][row, selected // 1664]), selected % 1664]
-        values = values.reshape(-1, 4, 256).astype(np.float64)
-        wanted = np.empty((24, 256), np.float64)
-        for head in range(24):
-            logits = (
-                values[:, 2 * (head // 12)]
-                @ np.asarray(args[0][row, head], np.float64)
-                / 16
-            )
-            mass = np.exp(logits - logits.max())
-            wanted[head] = (mass / mass.sum()) @ values[:, 2 * (head // 12) + 1]
-        gate = np.asarray(args[1][row], np.float64)
-        wanted *= 1 / (1 + np.exp(-gate))
-        assert np.linalg.norm(actual[row] - wanted) / np.linalg.norm(wanted) < 0.015
-
-
 @pytest.mark.parametrize(
     "tokens,supported",
     [
@@ -281,9 +182,7 @@ def test_query_bucket_envelope(monkeypatch, tokens, supported):
     for i in range(5):
         args[i] = jax.ShapeDtypeStruct((tokens, *args[i].shape[1:]), args[i].dtype)
     assert (
-        is_supported_by_adaptive_prefill(
-            *args, kv_heads=2, ratio=4, k_scale=1.0, v_scale=1.0
-        )
+        is_supported_by_sc_window(*args, kv_heads=2, ratio=4, k_scale=1.0, v_scale=1.0)
         == supported
     )
 
@@ -354,3 +253,79 @@ def test_output_only_attention_does_not_copy_unused_physical_cache(
             result = line.split("=", 1)[1].split(" copy", 1)[0]
             for shape in re.findall(rf"{dtype}\[([0-9,]+)\]", result):
                 assert math.prod(map(int, shape.split(","))) < args[5].size
+
+
+@pytest.mark.tpu_test
+@pytest.mark.parametrize("fp8", [False, True])
+@pytest.mark.parametrize(
+    "tokens,context,sc_first",
+    [
+        (512, 8192, False),
+        (512, 262144, True),
+        (12288, 262144, True),
+        (8448, 262144, True),
+        (8192, 8192, False),
+        (8192, 262144, True),
+        (16384, 131072, False),
+        (16384, 131072, True),
+        (16640, 131072, True),
+    ],
+)
+def test_adaptive_prefill_preserves_mixed_outputs_with_bounded_memory(
+    tokens, context, sc_first, fp8, record_property
+):
+    if pltpu.get_tpu_info().chip_version != pltpu.ChipVersion.TPU_7X:
+        pytest.skip("Adaptive SparseCore schedule is measured on TPU7x")
+    args = _make_inputs(tokens, context, fp8, sc_first)
+    cache = np.asarray(args[5]).copy()
+    compiled = (
+        jax.jit(functools.partial(adaptive_prefill, kv_heads=2, ratio=4))
+        .lower(*args)
+        .compile()
+    )
+    hlo = compiled.as_text()
+    assert hlo is not None
+    record_property("has_sc_branch", "sc_compact_grouped_prefill" in hlo)
+    memory = compiled.memory_analysis()
+    assert memory is not None
+    temporary = memory.temp_size_in_bytes
+    record_property("compiler_temporary_bytes", temporary)
+    output, returned = compiled(*args)
+    baseline, _ = jax.jit(
+        functools.partial(
+            block_sparse_gqa_attention,
+            kv_heads=2,
+            ratio=4,
+            query_block=256,
+            kv_tile=256,
+        )
+    )(*args)
+    actual, expected = np.asarray(output, np.float32), np.asarray(baseline, np.float32)
+    assert np.isfinite(actual).all()
+    assert np.linalg.norm(actual - expected) / np.linalg.norm(expected) < 0.01
+    np.testing.assert_array_equal(actual[np.asarray(args[3]) == 0], 0)
+    np.testing.assert_array_equal(
+        np.asarray(returned).view(np.uint8), cache.view(np.uint8)
+    )
+    # FP64 independent reference includes partial groups and physical page tails.
+    for row in (1, 32, min(8190, tokens - 2), tokens - 2):
+        length = int(args[3][row])
+        count = min(length // 4, 512)
+        selected = (np.asarray(args[2][row, :count, None]) * 4 + np.arange(4)).reshape(
+            -1
+        )
+        selected = np.concatenate((selected, np.arange(length // 4 * 4, length)))
+        values = cache[np.asarray(args[4][row, selected // 1664]), selected % 1664]
+        values = values.reshape(-1, 4, 256).astype(np.float64)
+        wanted = np.empty((24, 256), np.float64)
+        for head in range(24):
+            logits = (
+                values[:, 2 * (head // 12)]
+                @ np.asarray(args[0][row, head], np.float64)
+                / 16
+            )
+            mass = np.exp(logits - logits.max())
+            wanted[head] = (mass / mass.sum()) @ values[:, 2 * (head // 12) + 1]
+        gate = np.asarray(args[1][row], np.float64)
+        wanted *= 1 / (1 + np.exp(-gate))
+        assert np.linalg.norm(actual[row] - wanted) / np.linalg.norm(wanted) < 0.015

@@ -1,83 +1,66 @@
-# Adaptive sparse GQA prefill
+# Sparse GQA prefill
 
-TensorCore (TC) attention reuses KV across query blocks; SparseCore (SC)
-gathers each query's selected KV before grouped attention. The QSA caller
-supplies rank-local `kv_heads` and the configured compression `ratio`.
-Eligibility checks packed cache layout, dtype, GQA divisibility, alignment,
-unit K/V scales, available VMEM and SparseCore support. Physical page size,
-page-table width and selected-group budget are inputs to the work estimate.
+Normal prefill uses one TC/SC selector with work estimates derived from tensor
+geometry and installed TPU resources. It lazily refines bounds on TC tile-union
+visits and compares the estimated TC and SC costs. `sampled_lower` is a lower
+bound on TC union visits. Ambiguous decisions prepare exact TC metadata once;
+if TC is selected, it consumes that same branch-local metadata bundle.
+Membership certificates preserve TC set semantics for duplicates and invalid,
+future or padded selections. Unsupported schedules retain the TC path.
 
-## Metadata and scheduling
+Set the optional positive integer `VLLM_TPU_QSA_SC_MIN_CONTEXT` to prefer SC
+when the maximum effective causal length among active queries in this prefill
+slice reaches the value, inclusively. Inactive and clipped-out rows do not
+contribute. Below that value, the cost model still chooses either TC or SC.
+All geometry, scale, membership and page-plan safety checks remain; a rejected
+SC path retains TC semantics. Preferring SC can be slower for high-reuse input.
+Unset or empty keeps the default work-based selector.
 
-Callers provide int32 offsets/IDs and nondecreasing request starts from zero.
-Each active query has a unique valid prefix of
-`min(length // ratio, selected_group_budget)` complete groups, followed by -1
-padding; the partial tail is implicit. Inactive rows have zero lengths and
--1 IDs and produce zero even for NaN Q/gate. Repeated padded starts are valid.
+## Bounded SparseCore execution
 
-The adaptive schedule uses TC query blocks of 256 and SC groups of eight.
-The TC KV tile follows the resource-selected geometry; the SC attention tile
-contains 256 KV rows. These are kernel scheduling choices. Ragged TC work
-uses request-local query tiles, bounded packs and source windows. Its cost
-accounts for the resulting calls and padded query rows. SC gathers each
-query's own page table, including requests that start inside a TC block.
-See [admission and dispatch][dispatch].
+The SparseCore path stages request-local live page prefixes into a bounded
+source independent of persistent KV-pool capacity. Device certificates check
+request namespaces, physical page bounds and meaningful selected groups.
+Padding reads an initialized null page; unused staging capacity is not read.
+An uncertified page plan falls back to TC.
 
-## Work model and choice
+Staging windows and metadata slabs must satisfy the SparseCore 16 GiB parameter
+limit and the kernels' VMEM and DMA constraints. An internal workspace ceiling
+includes the null page; it bounds allocation but does not guarantee free HBM.
 
-The [work model][cost] derives byte traffic and QK/PV matrix-product FLOPs
-from actual query heads/dimensions, KV heads, compression ratio, cache packing
-and dtype, selected-group budget, page-table width and scheduled tiles.
-Page size determines the logical tile extent; table width contributes index
-traffic. SC accounting includes padded index/table loads, compact gather
-traffic, packed query/gate/output boundaries and padded attention heads.
-TC accounting includes metadata, mask words, repeated KV-tile loads and
-request-local pack padding.
+Metadata is packed once for the whole query batch. Four SparseCore DMA streams
+produce alternating owned HBM Ref slots. Ref effects enforce write-after-read
+ordering before a slot is reused. Batched QK/PV products keep each query's KV
+list independent, with FP32 accumulation and the original masks. Attention
+rounds to BF16 before the outer FP32 sigmoid/product and final BF16 cast.
 
-Traffic is divided by public TPU memory bandwidth; matrix-product FLOPs are
-divided by public BF16 throughput, using the reported core count. These are
-peak-rate work estimates, not measured latency predictions. They exclude
-runtime launch latency and do not model every compiler allocation or
-non-matrix operation.
+The output-only SC helper keeps the native cache read-only and does not donate
+or return it. The outer pooled custom op still donates `pool` and `index_pool`,
+operands 10 and 11.
 
-The selector chooses SC when estimated TC cost exceeds `1.02 * SC cost`.
-The margin is a policy, not a numerical error bound or measured optimum.
-Nonnegative work terms support lower/upper bounds; exact selected-tile
-unions are computed only when those bounds leave the choice unresolved.
-The model has no fitted coefficient table or calibration-data dependency.
+Hardware peak rates are not achieved latency. Submission costs, efficiency and
+physical SC/TC overlap are not fully modeled; compiler scheduling does not
+guarantee physical overlap.
 
-## Memory and arithmetic
+## Tests
 
-Outer dispatch chunks contain at most 8192 queries. SC microchunks are
-bounded by dtype-specific row ceilings and a soft selected-KV workspace
-target in [the scheduling policy][tuning]; actual geometry can reduce the
-microchunk or use a TC resource fallback. TC metadata and request-local packs
-have separate soft workspace targets. These logical planning estimates are
-not compiler peak-memory guarantees. Compiler memory analysis and measured
-resident memory describe different allocation/resource observations.
-
-FP32 accumulation and explicit BF16 output/gate rounding preserve QSA
-arithmetic. Each query keeps its own softmax. The cache is returned unchanged;
-standalone non-donating JIT returns can still materialize an array. The serving
-custom op donates its pool.
-
-## Checks and benchmark
-
-Run the focused CPU work-model and dispatch tests in the project environment:
+Run from the repository root in the project test environment described in
+[Testing & CI](testing_and_ci.md). The CPU contracts use explicit target-info
+fixtures and mocked kernel calls where hardware is required:
 
 ```bash
-JAX_PLATFORMS=cpu TORCH_DEVICE_BACKEND_AUTOLOAD=0 pytest \
-  tests/kernels/test_sparse_gqa_prefill_work_model.py \
+PYTHONPATH=src:. JAX_PLATFORMS=cpu TORCH_DEVICE_BACKEND_AUTOLOAD=0 \
+  python -m pytest -m "not tpu_test" \
+  tests/kernels/test_qsa_selector.py \
   tests/kernels/test_sparse_gqa_prefill_cost_model.py \
-  tests/kernels/test_sparse_gqa_adaptive_prefill.py -m 'not tpu_test'
-python scripts/benchmark_qsa_prefill.py --help
+  tests/kernels/test_qsa_owner_window.py \
+  tests/kernels/test_qsa_default_dispatch.py
 ```
 
-Hardware tests use the `tpu_test` marker. The benchmark includes
-attention/gating and the selected dispatch/gather path, excluding compilation,
-indexer scoring, cache writes and other model layers. Kernel fixtures are not
-checkpoint or distributed-serving qualification.
+On a supported TPU, run the grouped FP8/BF16 numerical and cache-readonly
+contracts:
 
-[dispatch]: ../../src/vllm_torchtpu/kernels/sparse_gqa_prefill/adaptive.py
-[cost]: ../../src/vllm_torchtpu/kernels/sparse_gqa_prefill/cost_model.py
-[tuning]: ../../src/vllm_torchtpu/kernels/sparse_gqa_prefill/tuned_block_sizes.py
+```bash
+PYTHONPATH=src:. JAX_PLATFORMS=tpu,cpu TORCH_DEVICE_BACKEND_AUTOLOAD=0 \
+  python -m pytest -m tpu_test tests/kernels/test_sparse_gqa_grouped_prefill.py
+```

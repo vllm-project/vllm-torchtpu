@@ -21,6 +21,7 @@ batched RPA compute body.
 
 import functools
 import math
+from typing import Any
 
 import jax
 import jax.numpy as jnp
@@ -236,19 +237,11 @@ def _prefill_attention(
     ratio,
     k_scale=1.0,
     v_scale=1.0,
+    sc_min_context: int | None = None,
 ):
-    from vllm_torchtpu.kernels.qwen4_exp.block_sparse_gqa_prefill import (
-        block_sparse_gqa_attention,
-    )
-    from vllm_torchtpu.kernels.qwen4_exp.prefill_tiles import (
-        get_sparse_prefill_tiles,
-    )
-    from vllm_torchtpu.kernels.sparse_gqa_prefill.adaptive import (
-        adaptive_prefill,
-        is_supported_by_adaptive_prefill,
-    )
+    from vllm_torchtpu.kernels.sparse_gqa_prefill.adaptive import adaptive_prefill
 
-    if is_supported_by_adaptive_prefill(
+    return adaptive_prefill(
         query,
         gate,
         blocks,
@@ -260,18 +253,28 @@ def _prefill_attention(
         ratio=ratio,
         k_scale=k_scale,
         v_scale=v_scale,
-    ):
-        return adaptive_prefill(
-            query,
-            gate,
-            blocks,
-            lengths,
-            table,
-            cache,
-            starts,
-            kv_heads=kv_heads,
-            ratio=ratio,
-        )
+        sc_min_context=sc_min_context,
+    )
+
+
+def _prefill_attention_tc(
+    query,
+    gate,
+    blocks,
+    lengths,
+    table,
+    cache,
+    starts,
+    *,
+    kv_heads,
+    ratio,
+    k_scale=1.0,
+    v_scale=1.0,
+):
+    from vllm_torchtpu.kernels.qwen4_exp.block_sparse_gqa_prefill import (
+        block_sparse_gqa_attention,
+    )
+    from vllm_torchtpu.kernels.qwen4_exp.prefill_tiles import get_sparse_prefill_tiles
 
     mask_tile = ratio * jnp.iinfo(jnp.int32).bits
     if math.gcd(cache.shape[1], mask_tile) % pltpu.get_tpu_info().num_lanes:
@@ -327,6 +330,7 @@ def qsa_attention(
     v_scale=1.0,
     query_prepared=False,
     prepared_cu=None,
+    sc_min_context: int | None = None,
 ):
     """Use Runner order: decode/verify prefix, then prefill in original rows."""
     from vllm_torchtpu.kernels.sparse_gqa_decode.query_layout import planning_query
@@ -340,6 +344,7 @@ def qsa_attention(
     positions = jnp.arange(tokens, dtype=jnp.int32)
     suffix = (positions >= prefix_tokens) & (positions < active_tokens)
     # Neither request segment owns or updates the written cache.
+    prefill_options: dict[str, Any] = dict(options, sc_min_context=sc_min_context)
     prefill, _ = _prefill_attention(
         planning_query(query, query_prepared),
         gate,
@@ -348,7 +353,7 @@ def qsa_attention(
         table,
         cache,
         jnp.clip(starts, prefix_tokens, active_tokens),
-        **options,
+        **prefill_options,
     )
 
     def decode(_: None) -> jax.Array:

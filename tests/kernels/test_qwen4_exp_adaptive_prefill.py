@@ -55,8 +55,7 @@ def test_qwen_dispatch_preserves_existing_paths(monkeypatch, fp8, case):
     packing = 4 if fp8 else 2
     tokens = 1 if case == "decode" else 8448 if case == "tail" else 256
     page = 128 if case == "page" else 1664
-    # "cache" is oversized for SparseCore's 16 GiB per-tensor cap and must
-    # take the block-sparse TC path instead of failing XLA compilation.
+    # Native owner capacity does not exclude the normal dispatch entry.
     cache_page = (page, 4 // packing, packing, 256)
     page_bytes = math.prod(cache_page) * jnp.dtype(dtype).itemsize
     pages = SC_GATHER_MAX_CACHE_BYTES // page_bytes + 1 if case == "cache" else 79
@@ -112,13 +111,7 @@ def test_qwen_dispatch_preserves_existing_paths(monkeypatch, fp8, case):
         if case == "decode"
         else qsa_rpa._prefill_attention(*args, kv_heads=2, ratio=4, v_scale=scale)
     )
-    expected = (
-        "adaptive"
-        if case in ("supported", "slots", "tail", "padded", "page")
-        else "fused_decode"
-        if case == "decode"
-        else "prefill"
-    )
+    expected = "fused_decode" if case == "decode" else "adaptive"
     assert len(calls) == 1 and calls[0][0] == expected
     forwarded = inputs[:-1] if case == "decode" else inputs
     for index, (actual, expected_input) in enumerate(
@@ -129,8 +122,7 @@ def test_qwen_dispatch_preserves_existing_paths(monkeypatch, fp8, case):
         else:
             assert actual is expected_input
     assert output is inputs[0] and cache is inputs[5]
-    if expected != "adaptive":
-        assert calls[0][2]["v_scale"] == scale
+    assert calls[0][2]["v_scale"] == scale
 
 
 @pytest.mark.tpu_test
@@ -183,8 +175,6 @@ def test_qwen_adaptive_entry_masks_padding_and_matches_paired_prefill(fp8, ragge
     assert isinstance(hlo, str)
     assert "fused_qsa_decode" in hlo
     assert "conditional" in hlo
-    if not ragged_tail:
-        assert "sc_compact_grouped_prefill" in hlo
     output, returned = compiled(*args, request_distribution=distribution)
     reference, _ = jax.jit(
         functools.partial(

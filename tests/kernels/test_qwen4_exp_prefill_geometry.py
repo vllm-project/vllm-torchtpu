@@ -27,7 +27,6 @@ from vllm_torchtpu.kernels.qwen4_exp.block_sparse_gqa_prefill import (
 )
 from vllm_torchtpu.kernels.qwen4_exp.prefill_tiles import get_sparse_prefill_tiles
 from vllm_torchtpu.kernels.sparse_gqa_prefill.adaptive import adaptive_prefill
-from vllm_torchtpu.kernels.sparse_gqa_prefill.cost_model import prefill_cost_model
 
 
 @pytest.mark.parametrize("tokens", [17, 256, 512, 4096, 8192, 8448, 16640])
@@ -271,11 +270,6 @@ def test_other_compression_ratio_uses_general_tc():
 @pytest.mark.parametrize("fp8", [False, True])
 def test_aligned_requests_keep_sc_gathers_local_with_padded_slots(fp8, record_property):
     from tests.kernels.test_sparse_gqa_adaptive_prefill import _make_inputs
-    from vllm_torchtpu.kernels.sparse_gqa_prefill.adaptive import (
-        _sc_prefill,
-        _select_sc_for_chunk,
-        _tc_plan,
-    )
 
     args = list(_make_inputs(512, 131072, fp8, True))
     # Distinct request page permutations in one shared pool. An unused NaN
@@ -287,51 +281,21 @@ def test_aligned_requests_keep_sc_gathers_local_with_padded_slots(fp8, record_pr
         (jnp.nan_to_num(args[5]), jnp.full_like(args[5][:1], jnp.nan))
     )
     args[6] = jnp.array([0, 256, 512, 512, 512], jnp.int32)
-    model = prefill_cost_model(
-        args[0], args[2], args[4], args[5], kv_heads=2, ratio=4, kv_tile=256
-    )
-    choose = jax.jit(
-        functools.partial(
-            _select_sc_for_chunk,
-            offset=0,
-            size=len(args[0]),
-            num_tiles=math.ceil(args[4].shape[1] * args[5].shape[1] / 256),
-            dtype=args[5].dtype,
-            plan=_tc_plan(
-                args[0],
-                args[2],
-                args[4],
-                args[5],
-                len(args[0]),
-                kv_heads=2,
-                ratio=4,
-                kv_tile=256,
-                request_capacity=len(args[6]) - 1,
-            ),
-            model=model,
-        )
-    )
-    record_property("adaptive_select_sc", bool(choose(args[2], args[3], args[6])))
     compiled = (
         jax.jit(functools.partial(adaptive_prefill, kv_heads=2, ratio=4))
         .lower(*args)
         .compile()
     )
-    sc_compiled = (
-        jax.jit(
-            functools.partial(
-                _sc_prefill,
-                chunk_size=model.sc_chunk,
-                kv_heads=2,
-                ratio=4,
-                kv_tile=256,
-            )
-        )
-        .lower(*args[:6])
-        .compile()
+    from vllm_torchtpu.kernels.sparse_gqa_prefill.owner_window import (
+        owner_window_attention,
     )
+
+    def sc_entry(*xs):
+        return owner_window_attention(*xs, kv_heads=2, ratio=4), xs[5]
+
+    sc_compiled = jax.jit(sc_entry).lower(*args).compile()
     before = [np.asarray(x).copy() for x in args]
-    for function, inputs in ((compiled, args), (sc_compiled, args[:6])):
+    for function, inputs in ((compiled, args), (sc_compiled, args)):
         output, returned = function(*inputs)
         check_reference(args, output, kv_heads=2, rows=[1, 255, 256, 510])
         np.testing.assert_array_equal(function(*inputs)[0], output)
@@ -347,9 +311,6 @@ def test_aligned_requests_keep_sc_gathers_local_with_padded_slots(fp8, record_pr
 @pytest.mark.tpu_test
 @pytest.mark.parametrize("fp8", [False, True])
 def test_live_tail_smaller_than_sc_microchunk(fp8):
-    from vllm_torchtpu.kernels.sparse_gqa_prefill.selector import select_sc
-    from vllm_torchtpu.kernels.sparse_gqa_prefill.tuned_block_sizes import SC_CHUNK_SIZE
-
     args, _ = inputs(17, 24, 2, 256, fp8)
     args = list(args)
     rng = np.random.default_rng(2018)
@@ -369,22 +330,6 @@ def test_live_tail_smaller_than_sc_microchunk(fp8):
             args[5].dtype
         )
     )(jax.random.key(391))
-    choose = jax.jit(
-        functools.partial(
-            select_sc,
-            num_tiles=math.ceil(pages * 1664 / 256),
-            model=prefill_cost_model(
-                args[0], args[2], args[4], args[5], kv_heads=2, ratio=4, kv_tile=256
-            ),
-            sc_queries=SC_CHUNK_SIZE[jnp.dtype(args[5].dtype)],
-        )
-    )
-    assert bool(
-        choose(
-            jnp.pad(args[2], ((0, 239), (0, 0)), constant_values=-1),
-            jnp.pad(args[3], (0, 239)),
-        )
-    )
     before = [np.asarray(x).copy() for x in args]
     compiled = (
         jax.jit(functools.partial(adaptive_prefill, kv_heads=2, ratio=4))

@@ -91,9 +91,7 @@ def test_mixed_attention_routes_real_request_lengths(
     monkeypatch.setattr(
         tc, "block_sparse_gqa_attention", lambda *a, **kw: attend("prefill", *a, **kw)
     )
-    monkeypatch.setattr(
-        adaptive, "is_supported_by_adaptive_prefill", lambda *a, **kw: False
-    )
+    monkeypatch.setattr(adaptive, "is_supported_by_sc_window", lambda *a, **kw: False)
     pool = jnp.zeros((1, 128, 1, 2, 128), jnp.bfloat16)
     with jax.disable_jit():
         output, owner = qsa_rpa.qsa_attention(

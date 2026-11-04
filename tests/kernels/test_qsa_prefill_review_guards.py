@@ -23,11 +23,9 @@ import pytest
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from tests.kernels.prefill_work_model_helpers import work_model
 from vllm_torchtpu.kernels.qwen4_exp import block_sparse_gqa_prefill as tc
 from vllm_torchtpu.kernels.qwen4_exp import prefill_tiles
 from vllm_torchtpu.kernels.sparse_gqa_prefill import adaptive, grouped
-from vllm_torchtpu.kernels.sparse_gqa_prefill.cost_model import tc_cost
 from vllm_torchtpu.kernels.sparse_gqa_prefill.tuned_block_sizes import (
     SC_GATHER_MAX_CACHE_BYTES,
 )
@@ -166,41 +164,6 @@ def test_ratio8_page1664_general_tile_is_legal(monkeypatch, tpu_info):
     assert int(captured["args"][3][0]) == 0
 
 
-def test_ragged_schedule_may_select_sc_and_counts_request_local_unions():
-    rows = 256
-    lengths = jnp.full(rows, 2048, jnp.int32)
-    ids = jnp.broadcast_to(jnp.arange(512, dtype=jnp.int32), (rows, 512))
-    # Identical logical IDs belong to 256 independent request tables.
-    starts = jnp.arange(rows + 1, dtype=jnp.int32)
-    assert bool(
-        adaptive._select_sc_for_chunk(
-            ids,
-            lengths,
-            starts,
-            0,
-            rows,
-            1024,
-            jnp.bfloat16,
-            tc._ragged_plan(
-                rows, 24, 256, 2048, 65536, 158, 512, 256, request_capacity=rows
-            ),
-            work_model(jnp.bfloat16),
-        )
-    )
-    model = work_model(jnp.bfloat16)
-    one = tc_cost(
-        model, queries=256, num_tiles=1024, tile_visits=jnp.int32(8), launches=1
-    )
-    many = tc_cost(
-        model,
-        queries=256 * rows,
-        num_tiles=1024,
-        tile_visits=jnp.int32(8 * rows),
-        launches=rows,
-    )
-    np.testing.assert_allclose(many, one * rows)
-
-
 def test_ragged_general_tc_uses_bounded_pack_and_each_requests_table(
     monkeypatch, tpu_info
 ):
@@ -250,7 +213,7 @@ def test_adaptive_admission_uses_resources_not_calibration_geometry(
     monkeypatch.setattr(pltpu, "get_tpu_info", lambda: info)
     shape = jax.ShapeDtypeStruct
     q = shape((256, heads, 256), jnp.bfloat16)
-    assert adaptive.is_supported_by_adaptive_prefill(
+    assert adaptive.is_supported_by_sc_window(
         q,
         q,
         shape((256, 512), jnp.int32),
@@ -278,62 +241,6 @@ def test_resource_cap_and_working_set_select_smaller_tiles(monkeypatch, tpu_info
     assert qb < 128
     footprint = prefill_tiles._paired_working_set(48, 4, 256, 2, 2, qb, kt)
     assert footprint <= prefill_tiles.prefill_vmem_limit() < small.vmem_capacity_bytes
-
-
-@pytest.mark.parametrize("tokens", [1, 17, 128])
-def test_tiny_ragged_selector_traces_both_branches(tokens):
-    ids = jnp.full((tokens, 512), -1, jnp.int32)
-    lengths = jnp.zeros(tokens, jnp.int32)
-    starts = jnp.array([0, min(1, tokens), tokens], jnp.int32)
-    choose = jax.jit(
-        functools.partial(
-            adaptive._select_sc_for_chunk,
-            offset=0,
-            size=tokens,
-            num_tiles=1024,
-            dtype=jnp.bfloat16,
-            plan=tc._ragged_plan(
-                tokens, 24, 256, 2048, 65536, 158, 512, 256, request_capacity=tokens
-            ),
-            model=work_model(),
-        )
-    )(ids, lengths, starts)
-    assert choose.shape == ()
-
-
-@pytest.mark.parametrize(
-    "heads,page_size,budget",
-    [(12, 128, 512), (24, 896, 512), (24, 256, 16), (24, 2048, 256)],
-)
-def test_geometry_and_page_use_the_work_model_route(
-    monkeypatch, tpu_info, heads, page_size, budget
-):
-    recorded = []
-
-    def selected(arrays, cache, starts, model):
-        recorded.append(model)
-        return jnp.zeros_like(arrays[0]), cache
-
-    def forbidden(*args, **kwargs):
-        raise AssertionError("Legal geometry bypassed the work model")
-
-    monkeypatch.setattr(tc, "block_sparse_gqa_attention", forbidden)
-    monkeypatch.setattr(adaptive, "_one_chunk", selected)
-    query = jnp.zeros((256, heads, 256), jnp.bfloat16)
-    cache = jnp.zeros((1, page_size, 2, 2, 256), jnp.bfloat16)
-    output, returned = adaptive.adaptive_prefill(
-        query,
-        query,
-        jnp.full((256, budget), -1, jnp.int32),
-        jnp.zeros(256, jnp.int32),
-        jnp.zeros((256, 1), jnp.int32),
-        cache,
-        jnp.array([0, 256], jnp.int32),
-        kv_heads=2,
-        ratio=4,
-    )
-    assert output.shape == query.shape and returned is cache
-    assert len(recorded) == 1 and recorded[0].budget == budget
 
 
 @pytest.mark.parametrize("bf16_io", [False, True])
@@ -366,61 +273,6 @@ def test_tc_hint_counts_cast_boundaries_and_main_matrix_products(
     )
 
 
-def test_sc_indices_keep_row_ownership_and_only_gather_has_a_byte_hint(
-    monkeypatch, tpu_info
-):
-    original_call = pl.pallas_call
-    costs: list[bool | pl.CostEstimate] = []
-
-    def interpreted(kernel, **kwargs):
-        costs.append("cost_estimate" in kwargs)
-        return original_call(kernel, **kwargs, interpret=True)
-
-    def gather(kernel, **kwargs):
-        costs.append(kwargs["cost_estimate"])
-
-        def run(cache, indices):
-            return cache.reshape(-1, *cache.shape[3:])[indices]
-
-        return run
-
-    monkeypatch.setattr(pl, "pallas_call", interpreted)
-    monkeypatch.setattr(pl, "kernel", gather)
-    blocks = jnp.tile(jnp.arange(4, dtype=jnp.int32), (8, 1))
-    lengths = jnp.arange(9, 17, dtype=jnp.int32)
-    table = jnp.arange(8, dtype=jnp.int32)[:, None] % 2
-    cache = jnp.broadcast_to(
-        jnp.array([1, 9], jnp.bfloat16)[:, None, None, None, None], (2, 896, 2, 2, 128)
-    )
-    mesh = jax.sharding.AbstractMesh(
-        (1,),
-        ("device",),
-        abstract_device=jax.sharding.AbstractDevice(
-            device_kind="TPU7x", num_cores=1, platform="tpu"
-        ),
-    )
-    original_mesh = grouped.plsc.VectorSubcoreMesh
-
-    def target_mesh(**kwargs):
-        with jax.sharding.use_abstract_mesh(mesh):
-            return original_mesh(**kwargs)
-
-    monkeypatch.setattr(grouped.plsc, "VectorSubcoreMesh", target_mesh)
-    compact, capacity = grouped.gather_interleaved(
-        blocks, lengths, table, cache, query_group=8, tile_k=256, ratio=4
-    )
-    values = np.asarray(compact).reshape(8, capacity, 2, 2, 128)
-    for row in range(8):
-        np.testing.assert_array_equal(
-            values[row, : int(lengths[row])], 1 if row % 2 == 0 else 9
-        )
-    assert len(costs) == 2 and costs[0] is False
-    gather_cost = costs[1]
-    assert isinstance(gather_cost, pl.CostEstimate)
-    assert gather_cost.flops == gather_cost.transcendentals == 0
-    assert gather_cost.bytes_accessed == compact.nbytes * 2 + compact.shape[0] * 2 * 4
-
-
 def test_sc_attention_hint_separates_score_alpha_and_gate_transcendentals(
     monkeypatch, tpu_info
 ):
@@ -436,109 +288,40 @@ def test_sc_attention_hint_separates_score_alpha_and_gate_transcendentals(
 
         return run
 
-    monkeypatch.setattr(grouped, "gather_interleaved", compact)
     monkeypatch.setattr(pl, "pallas_call", call)
     query = jnp.zeros((8, 12, 128), jnp.bfloat16)
-    output, _ = grouped.sc_grouped_attention(
+    from types import SimpleNamespace
+
+    compact_array = compact()[0]
+    destination = SimpleNamespace(
+        shape=(
+            compact_array.shape[0] * compact_array.shape[1],
+            *compact_array.shape[2:],
+        ),
+        dtype=compact_array.dtype,
+    )
+    output = grouped._attend_compact_ref(
         query,
         query,
-        jnp.zeros((8, 4), jnp.int32),
         jnp.ones(8, jnp.int32),
-        jnp.zeros((8, 1), jnp.int32),
-        jnp.zeros((1, 896, 2, 2, 128), jnp.bfloat16),
+        destination,
         kv_heads=2,
+        ratio=4,
+        query_group=8,
+        source_group=8,
         tile_k=256,
+        capacity=256,
+        budget=4,
     )
     cost, args = captured[0]
-    assert args[1].nbytes > query.nbytes
-    assert cost.flops == 134217728
-    assert cost.transcendentals == 262144 + 128 + 16384
-    assert cost.bytes_accessed == sum(x.nbytes for x in args) + args[1].nbytes
-    assert args[1].dtype == args[2].dtype == output.dtype == jnp.bfloat16
+    assert args[2].nbytes > query.nbytes
+    assert cost.flops == 16777216
+    assert cost.transcendentals == 32768 + 128 + 16384
+    assert cost.bytes_accessed == (
+        sum(x.nbytes for x in args) + compact_array.nbytes + args[2].nbytes
+    )
+    assert args[2].dtype == args[3].dtype == output.dtype == jnp.bfloat16
     assert output.shape == query.shape
-
-
-@pytest.mark.parametrize("dtype", [jnp.bfloat16, jnp.float8_e4m3fn])
-def test_zero_visit_tc_cost_bounds_all_nonnegative_visit_counts(dtype):
-    model = work_model(dtype)
-    assert all(coefficient >= 0 for coefficient in model)
-    launches = jnp.array([0, 1, 3, 256], jnp.int32)
-    visits = jnp.array([0, 1, 23, 1024], jnp.int32)
-    lower = tc_cost(
-        model,
-        queries=256 * launches,
-        num_tiles=1024,
-        tile_visits=jnp.zeros_like(visits),
-        launches=launches,
-    )
-    complete = tc_cost(
-        model,
-        queries=256 * launches,
-        num_tiles=1024,
-        tile_visits=visits,
-        launches=launches,
-    )
-    assert np.all(np.asarray(lower) <= np.asarray(complete))
-
-
-@pytest.mark.parametrize("dtype", [jnp.bfloat16, jnp.float8_e4m3fn])
-@pytest.mark.parametrize(
-    "requests,columns,expected_sc,expected_fine_calls",
-    [(2, 1, False, 0), (2, 16, False, 2), (256, 16, True, 0)],
-)
-def test_ragged_lower_bound_skips_only_resolved_sc_work(
-    monkeypatch, dtype, requests, columns, expected_sc, expected_fine_calls
-):
-    calls = []
-    original = adaptive.active_counts
-
-    def observed(*args, **kwargs):
-        calls.append(1)
-        return original(*args, **kwargs)
-
-    monkeypatch.setattr(adaptive, "active_counts", observed)
-    ids = jnp.full((256, 512), -1, jnp.int32).at[:, :16].set(jnp.arange(16))
-    lengths = jnp.full(256, 64, jnp.int32)
-    starts = (
-        jnp.array([0, 127, 256], jnp.int32)
-        if requests == 2
-        else jnp.arange(257, dtype=jnp.int32)
-    )
-    model = work_model(dtype, columns=columns)
-    num_tiles = (896 * columns + 255) // 256
-    words = ((num_tiles * 2 + 127) // 128) * 128
-    plan = tc._ragged_plan(
-        256, 24, 256, words, 896 * columns // 4, columns, 512, 256, request_capacity=256
-    )
-    tile_count = jnp.sum((jnp.diff(starts) + 255) // 256, dtype=jnp.int32)
-    launches = (tile_count + plan[0] - 1) // plan[0]
-    live_prefix = jnp.concatenate((jnp.zeros(1, jnp.int32), jnp.cumsum(lengths > 0)))
-    live_rows = live_prefix[starts[1:]] - live_prefix[starts[:-1]]
-    minimum_visits = jnp.sum((live_rows + 255) // 256)
-    lower = tc_cost(
-        model,
-        queries=256 * plan[0] * launches,
-        num_tiles=num_tiles,
-        tile_visits=minimum_visits,
-        launches=launches,
-    )
-    target = adaptive.sc_cost(model, lengths) * 1.02
-    assert bool(lower > target) == expected_sc
-    # disable_jit executes the selected branch rather than observing tracing.
-    with jax.disable_jit():
-        actual = adaptive._select_sc_for_chunk(
-            ids,
-            lengths,
-            starts,
-            0,
-            256,
-            num_tiles,
-            dtype,
-            plan,
-            model,
-        )
-    assert bool(actual) == expected_sc
-    assert len(calls) == expected_fine_calls
 
 
 @pytest.mark.parametrize("case", ["at_capacity", "over_capacity", "address_overflow"])
@@ -559,7 +342,7 @@ def test_sparse_gather_admission_uses_packed_row_address_range(tpu_info, case):
     if expected:
         assert cache.size * cache.dtype.itemsize <= SC_GATHER_MAX_CACHE_BYTES
     assert (
-        adaptive.is_supported_by_adaptive_prefill(
+        adaptive.is_supported_by_sc_window(
             q,
             q,
             shape((8, 512), jnp.int32),
@@ -575,13 +358,11 @@ def test_sparse_gather_admission_uses_packed_row_address_range(tpu_info, case):
         is expected
     )
     if case == "address_overflow":
-        with pytest.raises(ValueError, match="row indices must fit int32"):
-            jax.eval_shape(
-                functools.partial(
-                    grouped.gather_interleaved, query_group=8, tile_k=256, ratio=4
-                ),
-                shape((8, 512), jnp.int32),
-                shape((8,), jnp.int32),
-                shape((8, 1), jnp.int32),
-                cache,
-            )
+        assert not grouped._supports_whole_slab(
+            shape((8, 512), jnp.int32),
+            shape((8, 1), jnp.int32),
+            cache,
+            query_group=8,
+            tile_k=256,
+            padding_rows=128,
+        )

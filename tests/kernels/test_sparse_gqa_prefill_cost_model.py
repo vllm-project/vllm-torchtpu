@@ -11,142 +11,94 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Work bounds must not hide dispersed queries or partial groups."""
+"""Default work accounting derives tensor geometry and hardware rates."""
 
-import functools
+from dataclasses import replace
 
 import jax
 import jax.numpy as jnp
-import numpy as np
 import pytest
+from jax.experimental.pallas import tpu as pltpu
 
-from tests.kernels.prefill_work_model_helpers import work_model
-from vllm_torchtpu.kernels.sparse_gqa_prefill.selector import select_sc
-
-
-@pytest.mark.parametrize("fp8", [False, True])
-def test_unsampled_disjoint_queries_cannot_be_mistaken_for_local_work(fp8):
-    """Identical sampled queries must not conceal the work of other rows."""
-    rng = np.random.default_rng(2917)
-    tokens = 512
-    lengths = np.arange(262144 - tokens + 1, 262145, dtype=np.int32)
-    recent = np.stack([np.arange(n // 4 - 512, n // 4) for n in lengths])
-    hidden = np.stack([rng.choice(n // 4, 512, replace=False) for n in lengths])
-    hidden[::32] = recent[::32]
-    np.testing.assert_array_equal(hidden[::32], recent[::32])
-    route = jax.jit(
-        functools.partial(
-            select_sc,
-            num_tiles=1027,
-            model=work_model(jnp.float8_e4m3fn if fp8 else jnp.bfloat16, columns=4096),
-        )
-    )
-    assert not bool(route(jnp.asarray(recent), jnp.asarray(lengths)))
-    assert bool(route(jnp.asarray(hidden), jnp.asarray(lengths)))
+from vllm_torchtpu.kernels.sparse_gqa_prefill.cost_model import CostModel, build
 
 
-@pytest.mark.parametrize("seed", range(4))
-@pytest.mark.parametrize("num_tiles", [33, 257, 1027])
-def test_union_bounds_include_partial_tails_and_inactive_queries(seed, num_tiles):
-    from vllm_torchtpu.kernels.sparse_gqa_prefill.occupancy import (
-        active_counts,
-        bucket_upper_counts,
-        exact_counts,
-        sampled_metadata,
-        span_counts,
+@pytest.fixture(autouse=True)
+def target(monkeypatch):
+    info = pltpu.get_tpu_info_for_chip(pltpu.ChipVersion.TPU_7X, 1)
+    monkeypatch.setattr(pltpu, "get_tpu_info", lambda: info)
+
+
+def shapes(
+    q=8192, heads=24, kv=2, dim=256, dtype=jnp.float8_e4m3fn, pages=15561, budget=512
+):
+    S = jax.ShapeDtypeStruct
+    packing = 4 // jnp.dtype(dtype).itemsize
+    return (
+        S((q, heads, dim), jnp.bfloat16),
+        S((q, budget), jnp.int32),
+        S((q, 158), jnp.int32),
+        S((pages, 1664, (2 * kv + packing - 1) // packing, packing, dim), dtype),
+        S((9,), jnp.int32),
     )
 
-    rng = np.random.default_rng(seed)
-    lengths = rng.integers(0, num_tiles * 256 + 1, 512, dtype=np.int32)
-    lengths[::7] = 0
-    lengths[1::31] = 1
-    ids = np.full((512, 512), -1, np.int32)
-    for row, length in enumerate(lengths):
-        n = min(length // 4, 512)
-        ids[row, :n] = rng.choice(length // 4, n, replace=False)
-    expected = []
-    for start in range(0, 512, 256):
-        tiles = set()
-        for row in range(start, start + 256):
-            tiles.update(int(g) // 64 for g in ids[row] if g >= 0)
-            if lengths[row] % 4:
-                tiles.add(int(lengths[row]) // 256)
-        expected.append(len(tiles))
-    blocks, ls = jnp.asarray(ids), jnp.asarray(lengths)
-    exact = np.asarray(
-        active_counts(blocks, ls, num_tiles=num_tiles, ratio=4, kv_tile=256)
-    )
-    lower = np.asarray(
-        active_counts(
-            *sampled_metadata(blocks, ls),
-            num_tiles=num_tiles,
-            query_block=8,
-            ratio=4,
-            kv_tile=256,
-        )
-    )
-    upper = np.asarray(span_counts(blocks, ls, ratio=4, kv_tile=256))
-    np.testing.assert_array_equal(exact, expected)
-    assert np.all(lower <= exact)
-    assert np.all(exact <= upper)
-    refined = np.asarray(
-        bucket_upper_counts(blocks, ls, num_tiles=num_tiles, ratio=4, kv_tile=256)
-    )
-    assert np.all(exact <= refined)
-    assert np.all(refined <= num_tiles)
-    coverage = np.asarray(
-        exact_counts(blocks, ls, num_tiles=num_tiles, ratio=4, kv_tile=256)
-    )
-    np.testing.assert_array_equal(exact, coverage)
-    assert np.all(coverage <= num_tiles)
+
+def test_six_work_costs_remain_monotone():
+    model = CostModel(1.0, 0.01, 0.1, 2.0, 0.2, 0.3)
+    assert model.tc_ms(128, 4) == 1 + 0.01 * 128 + 0.1 * 4
+    assert model.sc_ms(8, 3) == 2 + 0.2 * 8 + 0.3 * 3
+    assert model.tc_ms(128, 0) <= model.tc_ms(128, 1)
 
 
-def test_exact_bitmap_counts_a_distant_partial_tail():
-    from vllm_torchtpu.kernels.sparse_gqa_prefill.occupancy import (
-        bucket_upper_counts,
-        exact_counts,
+@pytest.mark.parametrize(
+    "q,heads,kv,dim,dtype",
+    [
+        (256, 12, 1, 128, jnp.float8_e4m3fn),
+        (8192, 24, 2, 256, jnp.float8_e4m3fn),
+        (512, 8, 2, 128, jnp.bfloat16),
+    ],
+)
+def test_logical_flops_and_allocation_match_independent_geometry(
+    q, heads, kv, dim, dtype
+):
+    info = pltpu.get_tpu_info_for_chip(pltpu.ChipVersion.TPU_7X, 1)
+    xs = shapes(q, heads, kv, dim, dtype)
+    m = build(*xs, kv_heads=kv, ratio=4, info=info)
+    head_group = ((heads // kv + 7) // 8) * 8
+    assert (
+        m.work["SC_logical_flops_per_group_tile"] == 4 * 8 * kv * head_group * 256 * dim
     )
-
-    ids = jnp.broadcast_to(jnp.arange(512, dtype=jnp.int32), (256, 512))
-    lengths = jnp.full((256,), 262141, jnp.int32)
-    # Eight complete KV256 tiles plus a partial group in tile 1023.
-    np.testing.assert_array_equal(
-        exact_counts(ids, lengths, num_tiles=1027, ratio=4, kv_tile=256), [9]
+    assert m.work["TC_logical_flops_per_visit"] == 4 * 256 * heads * 256 * dim
+    assert (
+        m.work["peak_bandwidth_bytes_per_second"]
+        == info.mem_bw_bytes_per_second * info.num_cores
     )
     assert (
-        int(bucket_upper_counts(ids, lengths, num_tiles=1027, ratio=4, kv_tile=256)[0])
-        >= 9
+        m.work["peak_bf16_ops_per_second"] == info.bf16_ops_per_second * info.num_cores
     )
-    np.testing.assert_array_equal(
-        exact_counts(
-            ids, jnp.zeros_like(lengths), num_tiles=1027, ratio=4, kv_tile=256
-        ),
-        [0],
+    assert m.work["zeroed_slots"] == 2 and m.work["microchunks"] == (q + 63) // 64
+    assert (
+        m.work["page_bytes"]
+        == 1664 * xs[3].shape[2] * xs[3].shape[3] * dim * jnp.dtype(dtype).itemsize
     )
+    assert (
+        m.work["producer_read_write_bytes"]
+        == 2 * m.work["microchunks"] * m.work["slot_bytes"]
+    )
+    assert not m.work["overlap_assumed"]
+    if q == 8192:
+        assert m.work["slot_bytes"] == 144 * 1024**2
 
 
-def test_tail_cost_uses_sc_microchunk_instead_of_tc_padding():
-    rng = np.random.default_rng(2018)
-    blocks = np.full((256, 512), -1, np.int32)
-    for row in range(17):
-        blocks[row] = rng.choice(8192, 512, replace=False)
-    lengths = np.zeros(256, np.int32)
-    lengths[:17] = 262144
-    route = jax.jit(
-        functools.partial(
-            select_sc, num_tiles=1027, model=work_model(jnp.bfloat16, columns=4096)
-        )
+def test_pool_capacity_does_not_change_cost_or_admit_a_workload():
+    info = pltpu.get_tpu_info_for_chip(pltpu.ChipVersion.TPU_7X, 1)
+    a = build(*shapes(pages=79), kv_heads=2, ratio=4, info=info)
+    b = build(*shapes(pages=15561), kv_heads=2, ratio=4, info=info)
+    assert a == b and a.work == b.work
+    slow = build(
+        *shapes(),
+        kv_heads=2,
+        ratio=4,
+        info=replace(info, mem_bw_bytes_per_second=info.mem_bw_bytes_per_second // 2),
     )
-    # The same visibility and coefficients, but TC schedules Q256 whereas
-    # this tail gathers only one SC32 microchunk. Inactive rows still cost
-    # transport up to that microchunk, not all the way to TC's Q256 tile.
-    assert not bool(route(jnp.asarray(blocks), jnp.asarray(lengths)))
-    short = jax.jit(
-        functools.partial(
-            select_sc,
-            num_tiles=1027,
-            model=work_model(jnp.bfloat16, columns=4096),
-            sc_queries=32,
-        )
-    )
-    assert bool(short(jnp.asarray(blocks), jnp.asarray(lengths)))
+    assert slow.sc_fixed_ms > b.sc_fixed_ms and slow.tc_visit_ms > b.tc_visit_ms

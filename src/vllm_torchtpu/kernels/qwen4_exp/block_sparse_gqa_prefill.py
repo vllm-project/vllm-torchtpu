@@ -16,6 +16,7 @@
 import functools
 import math
 from collections.abc import Callable
+from typing import NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -314,16 +315,26 @@ def _selection_bitset(blocks, lengths, *, ratio, groups, words):
     return bits.reshape(rows + padding, words)[:rows]
 
 
+def _selection_validity(blocks, lengths, *, ratio, groups):
+    complete = jnp.minimum(lengths // ratio, groups)
+    tail = lengths // ratio
+    prefix = jnp.arange(blocks.shape[1])[None, :] < jnp.minimum(
+        complete[:, None], blocks.shape[1]
+    )
+    valid = (
+        prefix & (lengths[:, None] > 0) & (blocks >= 0) & (blocks < complete[:, None])
+    )
+    tail_live = (lengths > 0) & (lengths % ratio != 0) & (tail < groups)
+    return valid, tail, tail_live
+
+
 def _selection_bitset_chunk(blocks, lengths, *, ratio, groups, words):
     """Deduplicate complete groups before signed bitmask accumulation."""
     rows, slots = blocks.shape
     if not words or not groups or not rows:
         return jnp.zeros((rows, words), jnp.int32)
-    complete = jnp.minimum(lengths // ratio, groups)
-    tail = lengths // ratio
-    prefix = jnp.arange(slots)[None, :] < jnp.minimum(complete[:, None], slots)
-    valid = (
-        prefix & (lengths[:, None] > 0) & (blocks >= 0) & (blocks < complete[:, None])
+    valid, tail, tail_live = _selection_validity(
+        blocks, lengths, ratio=ratio, groups=groups
     )
     sentinel = jnp.iinfo(jnp.int32).max
     masked_blocks = jnp.where(valid, blocks, sentinel)
@@ -338,7 +349,7 @@ def _selection_bitset_chunk(blocks, lengths, *, ratio, groups, words):
     selected_unique = jnp.concatenate(
         (
             unique,
-            ((lengths > 0) & (lengths % ratio != 0) & (tail < groups))[:, None],
+            tail_live[:, None],
         ),
         axis=1,
     )
@@ -548,6 +559,72 @@ def block_sparse_gqa_prefill(
     )
 
 
+class PreparedTC(NamedTuple):
+    table: jax.Array
+    active_tiles: jax.Array
+    active_counts: jax.Array
+    native_bits: jax.Array
+
+
+def _prepare_prefill_metadata(
+    blocks,
+    lengths,
+    page_table,
+    *,
+    ratio,
+    query_block,
+    kv_tile,
+    physical_page_size,
+    cache_dtype,
+    bitset=None,
+) -> PreparedTC:
+    tokens = lengths.shape[0]
+    groups = page_table.shape[1] * physical_page_size // ratio
+    num_kv_tiles = (groups * ratio + kv_tile - 1) // kv_tile
+    words = _metadata_native_align(num_kv_tiles * (kv_tile // (ratio * 32)))
+    bitset_row_bytes = words * jnp.dtype(jnp.int32).itemsize
+    paired_pages = kv_tile == 256 and physical_page_size % 128 == 0 and ratio == 4
+    if bitset is None and (
+        (paired_pages or cache_dtype == jnp.bfloat16)
+        and query_block == 256
+        and tokens * bitset_row_bytes >= TC_METADATA_BITSET_TARGET_BYTES
+    ):
+        batch = TC_METADATA_MAX_BATCH_BLOCKS
+        while (
+            batch > 1
+            and batch * query_block * bitset_row_bytes
+            >= TC_METADATA_BITSET_TARGET_BYTES
+        ):
+            batch //= 2
+        table, active_tiles, active_counts, block_bits_native = (
+            _prepare_metadata_bounded(
+                blocks,
+                lengths,
+                page_table,
+                ratio=ratio,
+                query_block=query_block,
+                kv_tile=kv_tile,
+                physical_page_size=physical_page_size,
+                batch_size=batch,
+            )
+        )
+    else:
+        if bitset is None:
+            bitset = _selection_bitset(
+                blocks, lengths, ratio=ratio, groups=groups, words=words
+            )
+        table, active_tiles, active_counts, block_bits_native = _metadata_from_bits(
+            bitset,
+            page_table,
+            query_block=query_block,
+            kv_tile=kv_tile,
+            ratio=ratio,
+            physical_page_size=physical_page_size,
+        )
+
+    return PreparedTC(table, active_tiles, active_counts, block_bits_native)
+
+
 def _prefill(
     query,
     blocks,
@@ -563,6 +640,7 @@ def _prefill(
     k_scale,
     v_scale,
     bf16_io,
+    prepared: PreparedTC | None = None,
 ):
     """Run exact selected-group attention with query-block KV reuse."""
     tokens, query_heads, head_dim = query.shape
@@ -613,7 +691,6 @@ def _prefill(
     words_per_tile = kv_tile // (ratio * 32)
     words = _metadata_native_align(num_kv_tiles * words_per_tile)
     nblocks = tokens // query_block
-    bitset_row_bytes = words * jnp.dtype(jnp.int32).itemsize
     native_query_width = _metadata_native_align(query_block)
     live = jnp.clip(
         lengths.reshape(nblocks, query_block).max(axis=1),
@@ -621,43 +698,19 @@ def _prefill(
         page_table.shape[1] * physical_page_size,
     )
     last_page = jnp.maximum((live - 1) // physical_page_size, 0)
-    if bitset is None and (
-        (paired_pages or cache.dtype == jnp.bfloat16)
-        and query_block == 256
-        and tokens * bitset_row_bytes >= TC_METADATA_BITSET_TARGET_BYTES
-    ):
-        batch = TC_METADATA_MAX_BATCH_BLOCKS
-        while (
-            batch > 1
-            and batch * query_block * bitset_row_bytes
-            >= TC_METADATA_BITSET_TARGET_BYTES
-        ):
-            batch //= 2
-        table, active_tiles, active_counts, block_bits_native = (
-            _prepare_metadata_bounded(
-                blocks,
-                lengths,
-                page_table,
-                ratio=ratio,
-                query_block=query_block,
-                kv_tile=kv_tile,
-                physical_page_size=physical_page_size,
-                batch_size=batch,
-            )
-        )
-    else:
-        if bitset is None:
-            bitset = _selection_bitset(
-                blocks, lengths, ratio=ratio, groups=groups, words=words
-            )
-        table, active_tiles, active_counts, block_bits_native = _metadata_from_bits(
-            bitset,
+    if prepared is None:
+        prepared = _prepare_prefill_metadata(
+            blocks,
+            lengths,
             page_table,
+            ratio=ratio,
             query_block=query_block,
             kv_tile=kv_tile,
-            ratio=ratio,
             physical_page_size=physical_page_size,
+            cache_dtype=cache.dtype,
+            bitset=bitset,
         )
+    table, active_tiles, active_counts, block_bits_native = prepared
 
     query_tile = min(query_block, 256)
     state_shape = (

@@ -285,9 +285,7 @@ def test_prefill_dma_layout_selects_bounded_fallback(monkeypatch, info, page, ro
         return expected, cache
 
     starts = jnp.array([0, 1, 1, 3], jnp.int32)
-    monkeypatch.setattr(
-        adaptive, "is_supported_by_adaptive_prefill", lambda *a, **k: False
-    )
+    monkeypatch.setattr(adaptive, "is_supported_by_sc_window", lambda *a, **k: False)
     monkeypatch.setattr(qsa_rpa, "_rpa_attention_in_chunks", rpa)
     monkeypatch.setattr(prefill_tiles, "get_sparse_prefill_tiles", tiles)
     monkeypatch.setattr(block_sparse_gqa_prefill, "block_sparse_gqa_attention", tc)

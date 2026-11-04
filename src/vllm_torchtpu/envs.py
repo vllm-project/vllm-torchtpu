@@ -48,6 +48,7 @@ if TYPE_CHECKING:
     TPU_FP8_LINEAR_W8A16_MAX_ROWS: int = 0
     VLLM_TPU_HC_PREFILL_TILE: int | None = None
     VLLM_TPU_HC_PACKED_MIX: bool = True
+    VLLM_TPU_QSA_SC_MIN_CONTEXT: int | None = None
     MOE_REQUANTIZE_WEIGHT_DTYPE: str = "float8_e4m3fn"
     MOE_REQUANTIZE_BLOCK_SIZE: int | None = None
     TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL: bool | None = None
@@ -415,6 +416,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # post-attention norm and router gate on the token shard, and fold the
     # attention partial sum into the MoE all-reduce. Default MoE path only.
     "TPU_ATTN_MOE_OVERLAP": env_bool("TPU_ATTN_MOE_OVERLAP", default=False),
+    # Prefer SC at this inclusive effective causal length, retaining all safety
+    # certificates. Unset keeps work-based TC/SC selection.
+    "VLLM_TPU_QSA_SC_MIN_CONTEXT": env_positive_int_or_none(
+        "VLLM_TPU_QSA_SC_MIN_CONTEXT"
+    ),
     # HC debug override: auto/unset uses the kernel policy, 0 uses Torch,
     # positive multiples of 128 override tile/profitability for both components.
     "VLLM_TPU_HC_PREFILL_TILE": env_nonnegative_int_or_auto("VLLM_TPU_HC_PREFILL_TILE"),

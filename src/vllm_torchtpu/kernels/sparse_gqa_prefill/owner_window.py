@@ -69,7 +69,7 @@ def is_supported_by_owner_window(
     if capacity == 0:
         return False
     bounded = jax.ShapeDtypeStruct((capacity + 1, *cache.shape[1:]), cache.dtype)
-    return adaptive.is_supported_by_adaptive_prefill(
+    return adaptive.is_supported_by_sc_window(
         query,
         gate,
         blocks,
@@ -293,7 +293,7 @@ def owner_window_attention(
         return jnp.zeros_like(query)
     data_pages = window_data_pages(cache, starts, table, workspace_bytes)
     window_shape = jax.ShapeDtypeStruct((data_pages + 1, *cache.shape[1:]), cache.dtype)
-    if data_pages == 0 or not adaptive.is_supported_by_adaptive_prefill(
+    if data_pages == 0 or not adaptive.is_supported_by_sc_window(
         query,
         gate,
         blocks,

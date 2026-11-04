@@ -15,6 +15,7 @@
 """QSA decode output projection with measured BF16 weight prefetch."""
 
 import dataclasses
+from typing import Any
 
 import jax
 import jax.numpy as jnp
@@ -54,6 +55,7 @@ def projected_attention(
     hc_min_tokens: int = 1024,
     query_prepared: bool = False,
     prepared_cu: jax.Array | None = None,
+    sc_min_context: int | None = None,
 ) -> tuple[jax.Array, jax.Array]:
     """Return projected HC output and donated cache, retaining a generic fallback."""
     from vllm_torchtpu.kernels.sparse_gqa_decode.query_layout import planning_query
@@ -91,6 +93,7 @@ def projected_attention(
     )
 
     def fallback():
+        prefill_options: dict[str, Any] = dict(sc_min_context=sc_min_context)
         attended, _ = qsa_attention(
             query,
             gate,
@@ -106,6 +109,7 @@ def projected_attention(
             ratio=ratio,
             k_scale=k_scale,
             v_scale=v_scale,
+            **prefill_options,
         )
         matrix = (
             original_weight

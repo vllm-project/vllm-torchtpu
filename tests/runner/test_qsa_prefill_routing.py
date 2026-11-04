@@ -141,7 +141,6 @@ def test_runner_adapter_to_pooled_qsa_bridge_executes_prefill(
 ):
     from vllm_torchtpu.kernels.qwen4_exp.pooled_qsa import compact_pooled_qsa_step
     from vllm_torchtpu.kernels.qwen4_exp.qsa import produce
-    from vllm_torchtpu.kernels.sparse_gqa_prefill.selector import select_sc
     from vllm_torchtpu.layers.adapter.custom_ops.qsa_op import (
         build_compact_pooled_qsa_op,
     )
@@ -361,36 +360,6 @@ def test_runner_adapter_to_pooled_qsa_bridge_executes_prefill(
         )
         block_ids = selections[:, :2048:4] // 4
         block_ids = np.where(selections[:, :2048:4] >= 0, block_ids, -1)
-        if fp8 and local_heads == 24:
-            from vllm_torchtpu.kernels.qwen4_exp.prefill_tiles import (
-                get_sparse_prefill_tiles,
-            )
-            from vllm_torchtpu.kernels.sparse_gqa_prefill.cost_model import (
-                prefill_cost_model,
-            )
-
-            cache_spec = jax.ShapeDtypeStruct(cache.shape, cache.dtype)
-            _, kv_tile = get_sparse_prefill_tiles(
-                query, cache_spec, kv_heads=kv_heads, ratio=options["compress_ratio"]
-            )
-            model = prefill_cost_model(
-                query,
-                jax.ShapeDtypeStruct(block_ids.shape, jnp.int32),
-                jax.ShapeDtypeStruct((len(query), len(main_table)), jnp.int32),
-                cache_spec,
-                kv_heads=kv_heads,
-                ratio=options["compress_ratio"],
-                kv_tile=kv_tile,
-            )
-            assert bool(
-                jax.jit(
-                    functools.partial(
-                        select_sc,
-                        num_tiles=math.ceil(len(main_table) * cache.shape[1] / kv_tile),
-                        model=model,
-                    )
-                )(jnp.asarray(block_ids), jnp.asarray(lengths))
-            )
         errors = []
         for row in (0, 128, tokens - 4):
             ids = selections[row]

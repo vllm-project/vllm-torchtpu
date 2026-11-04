@@ -89,7 +89,7 @@ def test_unsupported_does_not_pack_and_preserves_original_kwargs(
     seen = []
     marker = object()
     monkeypatch.setattr(
-        owner_window.adaptive, "is_supported_by_adaptive_prefill", lambda *a, **k: True
+        owner_window.adaptive, "is_supported_by_sc_window", lambda *a, **k: True
     )
     monkeypatch.setattr(
         owner_window.adaptive, "_tc", lambda *a, **k: seen.append((a, k)) or marker

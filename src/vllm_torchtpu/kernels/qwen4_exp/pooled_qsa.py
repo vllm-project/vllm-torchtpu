@@ -641,6 +641,7 @@ def compact_pooled_qsa_step(
     scheduling_group_namespace: int = 0,
     *,
     topk_backend: TopKBackend | None = None,
+    sc_min_context: int | None = None,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
     # Keep the persisted custom-op parameter name while naming its main owner.
     main_pool = pool
@@ -851,6 +852,7 @@ def compact_pooled_qsa_step(
         ratio=compress_ratio,
         k_scale=k_scale if fp8 else 1.0,
         v_scale=v_scale if fp8 else 1.0,
+        sc_min_context=sc_min_context,
     )
     result = (
         main_pool,
