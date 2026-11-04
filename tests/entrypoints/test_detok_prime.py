@@ -304,3 +304,24 @@ def test_prime_ids_edges():
     tail = prime_ids(t, ids + [special] * 10, True, 4)
     assert len(tail) == 16
     assert prime_ids(t, ids + [special] * 10, False, 4) == [special] * 4
+
+
+def test_prime_ids_widening_is_capped():
+    """A prompt no tail can prime stops widening at 512 and uses the whole prompt."""
+
+    class _Counting:
+        def __init__(self):
+            self.lengths = []
+
+        def decode(self, ids, skip_special_tokens=True):
+            self.lengths.append(len(ids))
+            return ""
+
+    tok = _Counting()
+    ids = list(range(100_000))
+    assert prime_ids(tok, ids, True, 32) is ids
+    assert tok.lengths == [32, 64, 128, 256, 512]
+
+    tok = _Counting()
+    assert prime_ids(tok, ids, True, 1024) is ids
+    assert tok.lengths == [1024]

@@ -28,7 +28,7 @@ byte-fallback and metaspace decoders is bounded by one UTF-8 character. The
 stream treats two primed texts specially, and the tail is widened past both:
 an empty text (the next token becomes sequence start, so a metaspace decoder
 strips its space) and a text ending in U+FFFD (no prefix is recorded). If no
-tail short of the whole prompt qualifies, the whole prompt is used.
+tail of up to 512 tokens qualifies, the whole prompt is used.
 
 Upstream vLLM primed with a 4-24 token suffix until #34217 (2026-02) switched
 to the whole prompt; open PRs #51281 (32 tokens) and #57330 (128) restore a tail.
@@ -43,6 +43,8 @@ from vllm_torchtpu.logger import init_logger
 logger = init_logger(__name__)
 
 _REPLACEMENT = "�"
+# Longest tail tried before falling back to the whole prompt.
+_MAX_TAIL_TOKENS = 512
 
 
 def prime_ids(
@@ -57,7 +59,8 @@ def prime_ids(
     if not prompt_ids or num_tokens <= 0 or len(prompt_ids) <= num_tokens:
         return prompt_ids
     n = num_tokens
-    while n < len(prompt_ids):
+    max_tail = max(_MAX_TAIL_TOKENS, num_tokens)
+    while n < len(prompt_ids) and n <= max_tail:
         tail = prompt_ids[-n:]
         try:
             text = tokenizer.decode(tail, skip_special_tokens=skip_special_tokens)
