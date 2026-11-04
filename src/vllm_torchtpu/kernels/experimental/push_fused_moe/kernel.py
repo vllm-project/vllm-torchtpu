@@ -47,7 +47,6 @@ from vllm_torchtpu.kernels.fused_moe.v2.kernel import (
     COMBINE_GROUP,
     COMBINE_LEAD,
     COMBINE_PARITIES,
-    HEIGHT_RUNGS,
     N_PREFETCH,
     N_PUSH_TABLES,
     N_SCALE_TABLES,
@@ -74,10 +73,17 @@ logger = init_logger(__name__)
 # Two more scalar-prefetch tables than v2: the dispatch segment table and its
 # meta row (host.push_dispatch_segments).
 N_DISPATCH_TABLES = 2
+# Tile heights the FFN body is emitted at (v2's HEIGHT_RUNGS, chosen for
+# this build). Each rung is a full copy of the body in the program text: at
+# the DP16 g25 shape four rungs are 47.0k LLO bundles and two 25.7k, and the
+# larger program costs more than the rows the finer ladder saves (kernel
+# slope at the served g25 / g9 shapes on eight shards: 271 -> 257 and
+# 130 -> 116 us a call, bit-exact).
+HEIGHT_RUNGS = 2
 
 
 def tile_height_rungs(tile_m, override=0):
-    """v2's equally spaced tile-height ladder, emitted on every build.
+    """v2's equally spaced tile-height ladder at this build's HEIGHT_RUNGS.
 
     v2 emits the ladder only where a routed expert is expected to fit in one
     tile (rows_alloc <= ep * g_local * tile_m); this build always emits it,
