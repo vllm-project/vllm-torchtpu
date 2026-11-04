@@ -5106,12 +5106,35 @@ def _counting_sort_positions(keys, buckets):
     return positions.reshape(-1)[:size].astype(jnp.int32), counts.astype(jnp.int32)
 
 
+def expert_chunk_starts():
+    """{chunk layers: first layer} of KernelConfig.prefill_expert_chunks."""
+    spec = _config().prefill_expert_chunks
+    if not spec:
+        return {}
+    banks = (3,) + (8,) * 11 + (1,)
+    counts = [int(c) for c in spec.split(",")]
+    if sum(counts) != len(banks):
+        raise ValueError("prefill_expert_chunks must cover the 13 expert banks")
+    starts, bank, layer = {}, 0, 0
+    for count in counts:
+        size = sum(banks[bank:bank + count])
+        if size in starts:
+            raise ValueError("prefill_expert_chunks needs distinct chunk sizes")
+        starts[size] = layer
+        bank += count
+        layer += size
+    return starts
+
+
 def expert_family_slot(family_count, slot):
     """Map a global MoE slot to the resident first/group/final expert bank.
 
     Dense families keep their global slots. Only the expert weights are split
     into banks; the legacy complete family and replay-only shapes stay global.
     """
+    starts = expert_chunk_starts()
+    if starts:
+        return slot - starts[family_count]
     if family_count == 8:
         return (slot - 3) % 8
     if family_count == 1:

@@ -104,6 +104,10 @@ class KernelConfig:
     prefill_expert_banks_ep8: bool = False
     # Diagnostic: the prefill ops take bank-sized views of one-tensor families.
     prefill_expert_bank_views: bool = False
+    # Diagnostics: resident expert chunks of consecutive banks instead of the 13
+    # banks, as comma-separated bank counts (e.g. "6,7"; chunk sizes in layers
+    # must differ). Empty: the banks.
+    prefill_expert_chunks: str = ""
     # Packed dispatch/shared overlap and fused down/combine/reduce-scatter.
     # EP16: FP32 at all serving windows, BF16 at 4K/8K only.
     # False: the unfused SparseCore gather/combine.

@@ -255,6 +255,7 @@ class PrefillProgram:
         }
         self.weights: dict[str, dict[str, torch.Tensor]] = {}
         self._expert_banks: list[dict[str, torch.Tensor]] = []
+        self._unit_chunk: list[int] = []
         self._ops: dict[Any, dict[str, Any]] = {}
         self._pairs: list[torch.Tensor] = []
         self._state_ops: dict[tuple[str, int], Any] = {}
@@ -299,8 +300,18 @@ class PrefillProgram:
             and kernel.prefill_expert_banks
             and not skip & set(families)
         ):
-            self._expert_banks = [{} for _ in bank_sizes]
-            iterator = loader.bank_expert_parts(iterator)
+            if kernel.prefill_expert_chunks:
+                counts = [int(c) for c in kernel.prefill_expert_chunks.split(",")]
+                self._unit_chunk, sizes, bank = [], [], 0
+                for chunk, count in enumerate(counts):
+                    sizes.append(sum(bank_sizes[bank:bank + count]))
+                    self._unit_chunk += [chunk] * count
+                    bank += count
+                self._expert_banks = [{} for _ in sizes]
+                iterator = loader.bank_expert_parts(iterator, tuple(sizes))
+            else:
+                self._expert_banks = [{} for _ in bank_sizes]
+                iterator = loader.bank_expert_parts(iterator)
         for name, tensor in (shared_banks[0] if shared_banks else {}).items():
             # Bank zero stands for the family in shape/introspection code.
             self.weights.setdefault("moe", {})[name] = tensor
@@ -355,6 +366,8 @@ class PrefillProgram:
         report_load_stats("prefill", self.rank, stats)
 
     def _flat(self, *groups: str, expert_bank: int = 0) -> list[torch.Tensor]:
+        if self._unit_chunk:
+            expert_bank = self._unit_chunk[expert_bank]
         experts = self._expert_banks[expert_bank] if self._expert_banks else {}
         return [
             experts[n] if g == "moe" and n in experts else self.weights[g][n]
@@ -588,12 +601,19 @@ class PrefillProgram:
     def _op_name(self, base: str, window: int) -> str:
         return f"pallas::{base}_w{window}_c{self.capacity}"
 
+    @staticmethod
+    def _config_chunks() -> str:
+        from .config import active
+
+        return active().prefill_expert_chunks
+
     def _export_key(self, op: str, window: int) -> str:
         """The static configuration a window op's trace bakes in (export cache)."""
         return repr(
             (
                 "prefill",
-                "moe-bank8" if self._expert_banks else "moe-global",
+                ("moe-chunks" + self._config_chunks()) if self._unit_chunk
+                else "moe-bank8" if self._expert_banks else "moe-global",
                 op,
                 window,
                 self.capacity,

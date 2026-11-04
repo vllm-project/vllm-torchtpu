@@ -52,8 +52,10 @@ PREFILL_SHARED = (PREFILL_IO + PREFILL_COMMON
 EXPERT_BANK_SIZES = (3,) + (8,) * 11 + (1,)
 
 
-def bank_expert_parts(iterator):
-    """Stream checkpoint parts into exactly one resident copy of each expert."""
+def bank_expert_parts(iterator, sizes=EXPERT_BANK_SIZES):
+    """Stream checkpoint parts into exactly one resident copy of each expert
+    (banks of ``sizes`` layers)."""
+    EXPERT_BANK_SIZES = sizes  # noqa: N806 (the banks this call builds)
     state: dict[str, list[Any]] = {}
     for group, name, value in iterator:
         family, marker, suffix = name.partition("@")
