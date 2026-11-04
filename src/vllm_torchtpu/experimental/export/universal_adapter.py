@@ -125,6 +125,45 @@ def _min_smem_page_size(
     return 1 << (min_page - 1).bit_length()
 
 
+def _attention_backends(vllm_config: Any) -> list[Any]:
+    """The distinct attention backends of the model's attention layers."""
+    from vllm.model_executor.layers.attention import Attention
+
+    ctx = getattr(
+        getattr(vllm_config, "compilation_config", None), "static_forward_context", {}
+    )
+    return list(
+        {
+            layer.attn_backend
+            for layer in (ctx or {}).values()
+            if isinstance(layer, Attention) and getattr(layer, "attn_backend", None)
+        }
+    )
+
+
+def _min_kernel_block_size(vllm_config: Any) -> int:
+    """The smallest page size every attention backend runs at, or 0 if unknown.
+
+    `update_block_size_for_backend` leaves a hybrid model's block size at vLLM's
+    default (16) because serving sizes those blocks from the unified block pool.
+    The export keeps recurrent states in their own pools, so such a block is
+    smaller than any kernel page (128 for RPA) and cannot be split into pages;
+    the block size is raised to the smallest page every backend supports.
+    """
+    backends = _attention_backends(vllm_config)
+    if not backends:
+        return 0
+    from vllm.config import set_current_vllm_config
+
+    with set_current_vllm_config(vllm_config):
+        per_backend = [
+            {s for s in b.get_supported_kernel_block_sizes(None) if isinstance(s, int)}
+            for b in backends
+        ]
+    common = set.intersection(*per_backend)
+    return min(common) if common else 0
+
+
 def _kernel_block_size(vllm_config: Any, block_size: int) -> int:
     """The page size the attention kernels run at for KV blocks of `block_size`.
 
@@ -136,18 +175,7 @@ def _kernel_block_size(vllm_config: Any, block_size: int) -> int:
     RPA kernel does not reject an unsupported page size, it computes wrong
     attention.
     """
-    from vllm.model_executor.layers.attention import Attention
-
-    ctx = getattr(
-        getattr(vllm_config, "compilation_config", None), "static_forward_context", {}
-    )
-    backends = list(
-        {
-            layer.attn_backend
-            for layer in (ctx or {}).values()
-            if isinstance(layer, Attention) and getattr(layer, "attn_backend", None)
-        }
-    )
+    backends = _attention_backends(vllm_config)
     if not backends:
         return block_size
     from vllm.config import set_current_vllm_config
@@ -314,6 +342,12 @@ def build_export_config_from_vllm(
     block_size = max(
         block_size, _min_smem_page_size(parallel_cfg, max_num_seqs, max_model_len)
     )
+    if not getattr(cache_cfg, "user_specified_block_size", False):
+        min_page = _min_kernel_block_size(vllm_config)
+        if block_size < min_page:
+            # Same KV capacity in tokens, in blocks of one kernel page.
+            num_blocks = -(-num_blocks * block_size // min_page)
+            block_size = min_page
     kernel_block_size = _kernel_block_size(vllm_config, block_size)
     num_blocks *= block_size // kernel_block_size
     block_size = kernel_block_size
@@ -1199,6 +1233,7 @@ class UniversalVllmExportableLLM(api.ExportableTextOnlyLLM):
         from vllm_torchtpu.kv_cache_spec_normalizer import (
             normalize_kv_cache_specs_for_tpu,
         )
+        from vllm_torchtpu.layers.adapter.attention import PallasAttentionBackend
         from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
 
         named_layers = self._named_attention_layers()
@@ -1239,7 +1274,10 @@ class UniversalVllmExportableLLM(api.ExportableTextOnlyLLM):
             specs = normalize_kv_cache_specs_for_tpu(
                 specs,
                 tpu_lowering.torch_dtype(per_layer[0][0].dtype),
-                attention_backend=TpuPlatform._find_non_ssm_backend(self._vllm_config),
+                attention_backend=cast(
+                    "type[PallasAttentionBackend] | None",
+                    TpuPlatform._find_non_ssm_backend(self._vllm_config),
+                ),
             )
             groups = get_kv_cache_groups(self._vllm_config, specs)
         if len(groups) <= 1:

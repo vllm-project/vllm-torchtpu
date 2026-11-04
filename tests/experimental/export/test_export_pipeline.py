@@ -1021,6 +1021,49 @@ def test_build_export_config_pages_kv_at_the_attention_kernels_block_size(
         build(cfg(1000))
 
 
+def test_build_export_config_raises_a_default_block_to_one_kernel_page(
+    tmp_path: Path,
+) -> None:
+    from vllm.model_executor.layers.attention import Attention
+
+    class RpaBackend:
+        @staticmethod
+        def get_supported_kernel_block_sizes(kv_cache_spec: Any = None) -> list[int]:
+            return [128, 256]
+
+        @staticmethod
+        def get_name() -> str:
+            return "RPA"
+
+    attn = object.__new__(Attention)
+    attn.attn_backend = RpaBackend
+
+    def cfg(block_size: int, user_specified: bool) -> Any:
+        return SimpleNamespace(
+            model_config=SimpleNamespace(
+                model=str(tmp_path), dtype="bfloat16", max_model_len=2048
+            ),
+            cache_config=SimpleNamespace(
+                block_size=block_size,
+                num_gpu_blocks_override=64,
+                user_specified_block_size=user_specified,
+            ),
+            scheduler_config=SimpleNamespace(max_num_seqs=8),
+            compilation_config=SimpleNamespace(
+                static_forward_context={"layers.3.self_attn.attn": attn}
+            ),
+        )
+
+    build = universal_adapter.build_export_config_from_vllm
+    # A hybrid model keeps vLLM's default block of 16 tokens, smaller than any
+    # RPA page: the export pages it at 128 and keeps the 64 x 16 token capacity.
+    paged = build(cfg(16, user_specified=False))
+    assert (paged.block_size, paged.num_blocks) == (128, 8)
+    # An explicit --block-size is never changed.
+    with pytest.raises(ValueError, match="No common block size"):
+        build(cfg(16, user_specified=True))
+
+
 def test_build_export_config_req_buckets_cover_speculative_verify_rows(
     tmp_path: Path,
 ) -> None:
