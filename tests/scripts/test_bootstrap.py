@@ -98,22 +98,20 @@ class TestBootstrapUnits(unittest.TestCase):
 
         cls.addClassCleanup(_cleanup_modules)
 
-    def test_build_kind_priorities_and_is_gated(self) -> None:
+    def test_build_context_properties_and_priorities(self) -> None:
         bp = self.bp
         ctx = bp.BuildContext.from_env
 
-        for env, expected_kind, expected_prio, expected_gated in (
+        for env, expected_kind, expected_prio in (
             (
                 {"NIGHTLY": "1", "BUILDKITE_SOURCE": "schedule"},
                 "nightly",
                 (1, None),
-                False,
             ),
             (
                 {"TORCHTPU_NIGHTLY": "1", "BUILDKITE_SOURCE": "schedule"},
                 "nightly",
                 (1, None),
-                False,
             ),
             (
                 {
@@ -122,50 +120,72 @@ class TestBootstrapUnits(unittest.TestCase):
                 },
                 "oncall-fix",
                 (12, "oncall-fix"),
-                False,
             ),
             (
                 {"BUILDKITE_PULL_REQUEST": "123"},
                 "pre-merge",
                 (6, "pre-merge"),
-                True,
             ),
             (
                 {"BUILDKITE_BRANCH": "main", "BUILDKITE_SOURCE": "webhook"},
                 "post-merge",
                 (11, "post-merge"),
-                True,
             ),
             (
                 {"BUILDKITE_BRANCH": "release/v1"},
                 "other",
                 (2, None),
-                True,
             ),
             (
                 {"BUILDKITE_TAG": "v0.32.0"},
                 "other",
                 (2, None),
-                False,
-            ),
-            (
-                {"BUILDKITE_TAG": "0.32.0rc1"},
-                "other",
-                (2, None),
-                False,
             ),
             (
                 {"BUILDKITE_PIPELINE_SLUG": "vllm-torchtpu-integration"},
                 "other",
                 (2, None),
-                False,
             ),
         ):
             build_ctx = ctx(env)
             kind = bp.build_kind(build_ctx)
             self.assertEqual(kind, expected_kind)
             self.assertEqual(bp.PRIORITIES[kind], expected_prio)
-            self.assertEqual(bp.is_gated(build_ctx), expected_gated)
+
+        # BuildContext named properties (labels, extras, runs_nightly_steps).
+        pr_ctx = ctx(
+            {
+                "BUILDKITE_PULL_REQUEST": "42",
+                "BUILDKITE_PULL_REQUEST_LABELS": (
+                    "ready,run-full-ci,run-perf-eval,skip-tpu-ci,oncall-fix"
+                ),
+            }
+        )
+        self.assertTrue(pr_ctx.is_pr)
+        self.assertTrue(pr_ctx.is_oncall_fix)
+        self.assertTrue(pr_ctx.skips_tpu)
+        self.assertEqual(pr_ctx.extras, frozenset({"nightly-suite", "perf-eval"}))
+        self.assertTrue(pr_ctx.runs_nightly_steps)
+
+        post_merge_ctx = ctx(
+            {"BUILDKITE_BRANCH": "main", "BUILDKITE_SOURCE": "webhook"},
+            merged_labels=("skip-tpu-ci", "run-full-ci", "run-perf-eval"),
+        )
+        self.assertFalse(post_merge_ctx.is_pr)
+        self.assertFalse(post_merge_ctx.is_oncall_fix)
+        self.assertTrue(post_merge_ctx.skips_tpu)
+        self.assertEqual(post_merge_ctx.extras, frozenset())
+        self.assertFalse(post_merge_ctx.runs_nightly_steps)
+
+        post_merge_full_label_ctx = ctx(
+            {"BUILDKITE_BRANCH": "main", "BUILDKITE_SOURCE": "webhook"},
+            merged_labels=("run-full-ci", "run-perf-eval"),
+        )
+        self.assertEqual(post_merge_full_label_ctx.extras, frozenset())
+        self.assertFalse(post_merge_full_label_ctx.runs_nightly_steps)
+        self.assertEqual(
+            bp.choose_suite(post_merge_full_label_ctx), bp.SUITES["default"]
+        )
 
     def test_skip_docs_vllm_pin_and_merged_pr_parsing(self) -> None:
         bp = self.bp
@@ -202,12 +222,49 @@ class TestBootstrapUnits(unittest.TestCase):
         )
         self.assertEqual(rendered, 'priority: 12\nif: \'"1" == "1"\'\n')
 
-    def test_choose_suite_and_suites_table(self) -> None:
+    def test_choose_suite_pr_suite_and_suites_table(self) -> None:
         bp = self.bp
         ctx = bp.BuildContext.from_env
 
-        # 1. One test per branch of choose_suite (first match wins).
-        # Branch 1: CI_SUITE override beats integration, skip-tpu-ci, and labels.
+        # 1. pr_suite with each extras combination.
+        for raw_labels, expected_name, expected_tpu in (
+            ("ready", "pr", ("tests", "integration", "verify")),
+            (
+                "ready,run-perf-eval",
+                "pr+perf-eval",
+                ("tests", "integration", "perf", "verify"),
+            ),
+            (
+                "ready,run-full-ci",
+                "pr+nightly-suite",
+                ("tests", "integration", "perf", "verify"),
+            ),
+            (
+                "ready,run-perf-eval,run-full-ci",
+                "pr+nightly-suite+perf-eval",
+                ("tests", "integration", "perf", "verify"),
+            ),
+        ):
+            suite = bp.pr_suite(
+                ctx(
+                    {
+                        "BUILDKITE_PULL_REQUEST": "10",
+                        "BUILDKITE_PULL_REQUEST_LABELS": raw_labels,
+                    }
+                )
+            )
+            self.assertEqual(
+                suite,
+                bp.Suite(
+                    expected_name,
+                    "PR: TPU waits for the CPU checks",
+                    stages=(("build", "cpu"), expected_tpu),
+                ),
+            )
+
+        # 2. One test per branch of choose_suite (first match wins).
+        # Branch 1: CI_SUITE override beats integration, skip-tpu-ci, and PR labels;
+        # unknown CI_SUITE raises listing the valid suite names.
         self.assertEqual(
             bp.choose_suite(
                 ctx(
@@ -219,17 +276,25 @@ class TestBootstrapUnits(unittest.TestCase):
                     }
                 )
             ),
-            "perf",
+            bp.SUITES["perf"],
         )
+        with self.assertRaisesRegex(
+            bp.BootstrapError,
+            r"ERROR: unknown CI_SUITE 'bogus'; "
+            r"suites are: default full perf cpu-only integration",
+        ):
+            bp.choose_suite(ctx({"CI_SUITE": "bogus"}))
+
         # Branch 2: vllm-torchtpu-integration pipeline.
         self.assertEqual(
             bp.choose_suite(
                 ctx({"BUILDKITE_PIPELINE_SLUG": "vllm-torchtpu-integration"})
             ),
-            "integration",
+            bp.SUITES["integration"],
         )
+
         # Branch 3: skip-tpu-ci (PR label or post-merge merged_labels)
-        # beats run-full-ci and run-perf-eval.
+        # beats PR and full/perf extras.
         self.assertEqual(
             bp.choose_suite(
                 ctx(
@@ -241,111 +306,80 @@ class TestBootstrapUnits(unittest.TestCase):
                     }
                 )
             ),
-            "cpu-only",
+            bp.SUITES["cpu-only"],
         )
         self.assertEqual(
             bp.choose_suite(
-                ctx({"BUILDKITE_BRANCH": "main", "BUILDKITE_SOURCE": "webhook"}),
-                merged_labels=("skip-tpu-ci",),
+                ctx(
+                    {"BUILDKITE_BRANCH": "main", "BUILDKITE_SOURCE": "webhook"},
+                    merged_labels=("skip-tpu-ci",),
+                )
             ),
-            "cpu-only",
+            bp.SUITES["cpu-only"],
         )
-        # Branch 4: NIGHTLY=1, run-full-ci, or run-perf-eval -> "full".
+
+        # Branch 4: PR without oncall-fix -> pr_suite(ctx).
+        for raw_labels, expected_name in (
+            ("ready", "pr"),
+            ("ready,run-perf-eval", "pr+perf-eval"),
+            ("ready,run-full-ci", "pr+nightly-suite"),
+            ("ready,run-perf-eval,run-full-ci", "pr+nightly-suite+perf-eval"),
+        ):
+            self.assertEqual(
+                bp.choose_suite(
+                    ctx(
+                        {
+                            "BUILDKITE_PULL_REQUEST": "10",
+                            "BUILDKITE_PULL_REQUEST_LABELS": raw_labels,
+                        }
+                    )
+                ).name,
+                expected_name,
+            )
+
+        # Branch 5a: NIGHTLY=1 or oncall-fix PR with extras -> SUITES["full"].
         for full_env in (
             {"NIGHTLY": "1"},
             {
                 "BUILDKITE_PULL_REQUEST": "10",
-                "BUILDKITE_PULL_REQUEST_LABELS": "ready,run-full-ci",
+                "BUILDKITE_PULL_REQUEST_LABELS": "oncall-fix,run-full-ci",
             },
             {
                 "BUILDKITE_PULL_REQUEST": "10",
-                "BUILDKITE_PULL_REQUEST_LABELS": "ready,run-perf-eval",
+                "BUILDKITE_PULL_REQUEST_LABELS": "oncall-fix,run-perf-eval",
             },
         ):
-            self.assertEqual(bp.choose_suite(ctx(full_env)), "full")
-        # Branch 5: default for vllm-torchtpu-ci, torchtpu-nightly, main, unknown slug.
+            self.assertEqual(bp.choose_suite(ctx(full_env)), bp.SUITES["full"])
+
+        # Branch 5b: default for main, oncall-fix PR without extras, tags,
+        # torchtpu-nightly, and other builds.
         for default_env in (
-            {"BUILDKITE_PIPELINE_SLUG": "vllm-torchtpu-ci"},
+            {"BUILDKITE_BRANCH": "main", "BUILDKITE_SOURCE": "webhook"},
+            {
+                "BUILDKITE_PULL_REQUEST": "10",
+                "BUILDKITE_PULL_REQUEST_LABELS": "ready,oncall-fix",
+            },
+            {"BUILDKITE_TAG": "v0.32.0"},
             {
                 "BUILDKITE_PIPELINE_SLUG": "vllm-torchtpu-torchtpu-nightly",
                 "TORCHTPU_NIGHTLY": "1",
             },
-            {"BUILDKITE_BRANCH": "main", "BUILDKITE_SOURCE": "webhook"},
-            {"BUILDKITE_PIPELINE_SLUG": "custom-pipeline"},
+            {"BUILDKITE_PIPELINE_SLUG": "vllm-torchtpu-ci"},
         ):
-            self.assertEqual(bp.choose_suite(ctx(default_env)), "default")
+            self.assertEqual(bp.choose_suite(ctx(default_env)), bp.SUITES["default"])
 
-        # 2. Every suite in SUITES maps to existing .buildkite/pipeline_<lane>.yml,
-        # and every dependency names a lane inside its own suite with no cycles.
+        # 3. Every suite in SUITES maps to existing .buildkite/pipeline_<lane>.yml.
         self.assertEqual(
-            bp.SUITES,
-            {
-                "default": {
-                    "build": [],
-                    "cpu": [],
-                    "tests": ["cpu"],
-                    "integration": ["cpu"],
-                    "verify": ["cpu"],
-                },
-                "full": {
-                    "build": [],
-                    "cpu": [],
-                    "tests": ["cpu"],
-                    "integration": ["cpu"],
-                    "perf": ["cpu"],
-                    "verify": ["cpu"],
-                },
-                "perf": {
-                    "build": [],
-                    "perf": [],
-                },
-                "cpu-only": {
-                    "build": [],
-                    "cpu": [],
-                },
-                "integration": {
-                    "build": [],
-                    "cpu": [],
-                    "tests": ["cpu"],
-                    "integration": ["cpu"],
-                    "perf": ["cpu"],
-                    "verify": ["cpu"],
-                    "promote": [],
-                },
-            },
+            set(bp.SUITES),
+            {"default", "full", "perf", "cpu-only", "integration"},
         )
-        self.assertEqual(
-            bp.phases(bp.SUITES["default"]),
-            (("build", "cpu"), ("tests", "integration", "verify")),
-        )
-        self.assertEqual(
-            bp.phases(bp.SUITES["full"]),
-            (("build", "cpu"), ("tests", "integration", "perf", "verify")),
-        )
-        self.assertEqual(bp.phases(bp.SUITES["perf"]), (("build", "perf"),))
-        self.assertEqual(bp.phases(bp.SUITES["cpu-only"]), (("build", "cpu"),))
-        self.assertEqual(
-            bp.phases(bp.SUITES["default"], gated=False),
-            (tuple(bp.SUITES["default"]),),
-        )
-        self.assertEqual(bp.phases({}), ())
-        with self.assertRaisesRegex(
-            bp.BootstrapError,
-            r"lane 'perf' depends on 'cpu', which is not in the suite",
-        ):
-            bp.phases({"build": [], "perf": ["cpu"]})
-        with self.assertRaisesRegex(
-            bp.BootstrapError, r"dependency cycle in lanes: cpu tests"
-        ):
-            bp.phases({"build": [], "cpu": ["tests"], "tests": ["cpu"]})
-        for suite_lanes in bp.SUITES.values():
-            bp.phases(suite_lanes)
-            for lane, deps in suite_lanes.items():
-                self.assertTrue(
-                    (_REPO_ROOT / f".buildkite/pipeline_{lane}.yml").is_file()
-                )
-                for dep in deps:
-                    self.assertIn(dep, suite_lanes)
+        for suite in bp.SUITES.values():
+            self.assertEqual(len(suite.stages), 1)
+            for stage in suite.stages:
+                for lane in stage:
+                    self.assertTrue(
+                        (_REPO_ROOT / f".buildkite/pipeline_{lane}.yml").is_file()
+                    )
 
     def test_github_labels_resilience(self) -> None:
         bp = self.bp
@@ -568,15 +602,14 @@ class TestBootstrapUnits(unittest.TestCase):
                 missing.stdout,
             )
 
-            # 6. `bootstrap.py upload-phase <suite> <k>` CLI uploads a phase.
+            # 6. `bootstrap.py upload-stages <stage> [<stage> ...]` CLI uploads a stage.
             log_path.unlink()
             upload_cli = subprocess.run(
                 [
                     sys.executable,
                     str(_SCRIPTS_DIR / "bootstrap.py"),
-                    "upload-phase",
-                    "cpu-only",
-                    "0",
+                    "upload-stages",
+                    "build,cpu",
                 ],
                 cwd=_REPO_ROOT,
                 env={**env, "JOB_PRIORITY": "6"},
@@ -591,20 +624,23 @@ class TestBootstrapUnits(unittest.TestCase):
             )
             for bad_args, expected_err in (
                 (
-                    ["upload-phase"],
-                    "Usage: bootstrap.py [dev | vllm-pin | upload-phase <suite> <k>]",
+                    ["upload-stages"],
+                    "Usage: bootstrap.py "
+                    "[dev | vllm-pin | upload-stages <stage> [<stage> ...]]",
                 ),
                 (
-                    ["upload-phase", "default", "not-an-int"],
-                    "ERROR: invalid phase index 'not-an-int'; expected an integer.",
+                    ["upload-stages", ""],
+                    "Usage: bootstrap.py "
+                    "[dev | vllm-pin | upload-stages <stage> [<stage> ...]]",
                 ),
                 (
-                    ["upload-phase", "default", "9"],
-                    "ERROR: phase 9 out of range for suite 'default' (0..1)",
+                    ["upload-stages", "bogus"],
+                    "ERROR: lane file '.buildkite/pipeline_bogus.yml' not found",
                 ),
                 (
-                    ["upload-phase", "bogus", "0"],
-                    "ERROR: unknown CI_SUITE 'bogus'",
+                    ["bogus-cmd"],
+                    "Usage: bootstrap.py "
+                    "[dev | vllm-pin | upload-stages <stage> [<stage> ...]]",
                 ),
             ):
                 bad_proc = subprocess.run(
@@ -626,8 +662,7 @@ class TestBootstrapUnits(unittest.TestCase):
             (_REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8")
         )
         tags = (
-            ("upload_phase_1", "upload_phase_1"),
-            ("upload_phase_2", "upload_phase_2"),
+            ("upload_stages", "upload-stages "),
             ("promote", "promote_lkg"),
             ("verify", "Support matrices and verified commit"),
             ("perf", "Perf and Eval on TPU"),
@@ -654,7 +689,7 @@ class TestBootstrapUnits(unittest.TestCase):
                 self.files = ["src/vllm_torchtpu/envs.py"] if files is None else files
                 self.labels = labels
                 self.meta: list[tuple[str, str]] = []
-                self.annotations: list[str] = []
+                self.annotations: list[tuple[str, str]] = []
                 self.uploads: list[tuple[str, str, dict[str, str]]] = []
 
             def agent(
@@ -669,7 +704,7 @@ class TestBootstrapUnits(unittest.TestCase):
                 if args[:2] == ("meta-data", "set"):
                     self.meta.append((args[2], args[3]))
                 elif args[:1] == ("annotate",):
-                    self.annotations.append(args[4])
+                    self.annotations.append((args[4], args[5]))
                 elif args[:2] == ("pipeline", "upload") and input_text is not None:
                     if "--dry-run" in args:
                         doc = yaml.safe_load(expand_env(input_text, env_map)) or {}
@@ -725,35 +760,20 @@ class TestBootstrapUnits(unittest.TestCase):
                 self.assertEqual(bp.run_bootstrap(env, repo_root=_REPO_ROOT), 0)
             return rec
 
-        def run_next_phase(
-            prev: RunRecorder,
-            *,
-            expected_idx: int = 1,
-            expected_deps: list[str] | None = None,
-        ) -> RunRecorder:
-            expected_key = f"upload_phase_{expected_idx}"
-            self.assertEqual(prev.uploads[0][0], expected_key)
+        def run_next_stage(prev: RunRecorder) -> RunRecorder:
+            self.assertEqual(prev.uploads[0][0], "upload_stages")
             uploader = json.loads(prev.uploads[0][1])
-            step = uploader["steps"][0]
-            self.assertEqual(step["key"], expected_key)
-            self.assertEqual(
-                step["depends_on"],
-                ["cpu"] if expected_deps is None else expected_deps,
-            )
+            self.assertEqual(uploader["steps"][0], "wait")
+            step = uploader["steps"][1]
             self.assertEqual(step["agents"], {"queue": "cpu"})
-            prefix = "python3 .buildkite/scripts/bootstrap.py upload-phase "
+            prefix = "python3 .buildkite/scripts/bootstrap.py upload-stages "
             self.assertTrue(step["command"].startswith(prefix))
-            suite_arg, phase_arg = step["command"].removeprefix(prefix).split()
-            self.assertEqual(int(phase_arg), expected_idx)
+            raw_args = step["command"].removeprefix(prefix).split()
+            stages = tuple(bp._split_labels(arg) for arg in raw_args)
             rec = RunRecorder()
             with mock.patch.object(bp, "_agent", side_effect=rec.agent):
                 self.assertEqual(
-                    bp.upload_phase(
-                        suite_arg,
-                        int(phase_arg),
-                        step["env"],
-                        repo_root=_REPO_ROOT,
-                    ),
+                    bp.upload_stages(stages, step["env"], repo_root=_REPO_ROOT),
                     0,
                 )
             return rec
@@ -777,8 +797,8 @@ class TestBootstrapUnits(unittest.TestCase):
         ):
             run({"SKIP_TPU_CI": "1"})
 
-        # PR default: priority 6, phase 0 uploads upload_phase_1 + cpu + build;
-        # phase 1 uploads verify + integration + tests after cpu passes.
+        # PR default: priority 6, stage 0 uploads upload_stages (wait + uploader)
+        # + cpu + build; stage 1 uploads verify + integration + tests.
         pr = run(
             {
                 "BUILDKITE_PULL_REQUEST": "42",
@@ -793,74 +813,78 @@ class TestBootstrapUnits(unittest.TestCase):
                 ("VLLM_COMMIT_HASH", pinned),
             ],
         )
-        self.assertEqual(pr.annotations, [])
+        self.assertEqual(
+            pr.annotations,
+            [("ci-suite", "CI suite: pr: PR: TPU waits for the CPU checks")],
+        )
         self.assertEqual(
             [u[0] for u in pr.uploads],
-            ["upload_phase_1", "cpu", "build"],
+            ["upload_stages", "cpu", "build"],
         )
         self.assertIn(
-            ":pipeline: Upload tests, integration, verify (after cpu passed)",
+            ":pipeline: Upload tests, integration, verify",
             pr.uploads[0][1],
         )
         self.assertNotIn("CPU_GATE", pr.uploads[1][2])
         self.assertNotIn("SKIP_TPU_CI", pr.uploads[1][2])
         self.assertEqual(pr.uploads[2][2]["OMNI_IMAGE_SKIP"], "")
         self.assertNotIn("tpu-pr/alice@example.com", pr.uploads[1][1])
-        pr_phase2 = run_next_phase(pr)
+        pr_stage1 = run_next_stage(pr)
         self.assertEqual(
-            [u[0] for u in pr_phase2.uploads],
+            [u[0] for u in pr_stage1.uploads],
             ["verify", "integration", "tests"],
         )
-        self.assertIn("tpu-pr/alice@example.com", pr_phase2.uploads[2][1])
+        self.assertIn("tpu-pr/alice@example.com", pr_stage1.uploads[2][1])
 
-        # 3-level suite dict (cpu -> tests -> verify) chains phases 0 -> 1 -> 2.
-        three_level_suite = {
-            "build": [],
-            "cpu": [],
-            "tests": ["cpu"],
-            "integration": ["cpu"],
-            "verify": ["tests"],
-        }
-        with mock.patch.dict(bp.SUITES, {"default": three_level_suite}):
-            chain_p0 = run({"BUILDKITE_PULL_REQUEST": "42"})
+        # 3-stage test-only suite chains stages 0 -> 1 -> 2 via upload-stages.
+        three_stage_suite = bp.Suite(
+            "three-stage",
+            "3-stage test suite",
+            stages=(("build", "cpu"), ("tests", "integration"), ("verify",)),
+        )
+        with mock.patch.dict(bp.SUITES, {"three-stage": three_stage_suite}):
+            chain_s0 = run({"CI_SUITE": "three-stage"})
             self.assertEqual(
-                [u[0] for u in chain_p0.uploads],
-                ["upload_phase_1", "cpu", "build"],
+                [u[0] for u in chain_s0.uploads],
+                ["upload_stages", "cpu", "build"],
             )
             self.assertIn(
-                ":pipeline: Upload tests, integration (after cpu passed)",
-                chain_p0.uploads[0][1],
+                ":pipeline: Upload tests, integration",
+                chain_s0.uploads[0][1],
             )
-            chain_p1 = run_next_phase(chain_p0, expected_idx=1, expected_deps=["cpu"])
+            chain_s1 = run_next_stage(chain_s0)
             self.assertEqual(
-                [u[0] for u in chain_p1.uploads],
-                ["upload_phase_2", "integration", "tests"],
+                [u[0] for u in chain_s1.uploads],
+                ["upload_stages", "integration", "tests"],
             )
             self.assertIn(
-                ":pipeline: Upload verify (after tests passed)",
-                chain_p1.uploads[0][1],
+                ":pipeline: Upload verify",
+                chain_s1.uploads[0][1],
             )
-            chain_p2 = run_next_phase(chain_p1, expected_idx=2, expected_deps=["tests"])
-            self.assertEqual([u[0] for u in chain_p2.uploads], ["verify"])
+            chain_s2 = run_next_stage(chain_s1)
+            self.assertEqual([u[0] for u in chain_s2.uploads], ["verify"])
 
-        # PR run-perf-eval: gated full suite, NIGHTLY unset, perf-eval annotation.
+        # PR run-perf-eval: pr+perf-eval suite, NIGHTLY unset.
         perf_eval_pr = run(
             {
                 "BUILDKITE_PULL_REQUEST": "42",
                 "BUILDKITE_PULL_REQUEST_LABELS": "ready,run-perf-eval",
             }
         )
-        self.assertEqual(perf_eval_pr.annotations, ["perf-eval"])
+        self.assertEqual(
+            perf_eval_pr.annotations,
+            [("ci-suite", "CI suite: pr+perf-eval: PR: TPU waits for the CPU checks")],
+        )
         self.assertEqual(
             [u[0] for u in perf_eval_pr.uploads],
-            ["upload_phase_1", "cpu", "build"],
+            ["upload_stages", "cpu", "build"],
         )
-        perf_eval_phase2 = run_next_phase(perf_eval_pr)
+        perf_eval_stage1 = run_next_stage(perf_eval_pr)
         self.assertEqual(
-            [u[0] for u in perf_eval_phase2.uploads],
+            [u[0] for u in perf_eval_stage1.uploads],
             ["verify", "perf", "integration", "tests"],
         )
-        self.assertNotIn("NIGHTLY", perf_eval_phase2.uploads[0][2])
+        self.assertNotIn("NIGHTLY", perf_eval_stage1.uploads[0][2])
 
         # PR skip-tpu-ci & post-merge main webhook upload ONLY ["cpu", "build"].
         for fx, prio, wprio in (
@@ -889,10 +913,41 @@ class TestBootstrapUnits(unittest.TestCase):
         ):
             self.assertIn(("JOB_PRIORITY", prio), fx.meta)
             self.assertIn(("WORKLOAD_PRIORITY", wprio), fx.meta)
-            self.assertEqual(fx.annotations, ["skip-tpu-ci"])
+            self.assertEqual(
+                fx.annotations,
+                [("ci-suite", "CI suite: cpu-only: CPU checks only (skip-tpu-ci)")],
+            )
             self.assertEqual([u[0] for u in fx.uploads], ["cpu", "build"])
             self.assertTrue(bool(fx.uploads[1][2]["OMNI_IMAGE_SKIP"]))
             self.assertLessEqual(len(fx.uploads[1][2]["OMNI_IMAGE_SKIP"]), 70)
+
+        # main post-merge (even when merged PR had run-full-ci / run-perf-eval)
+        # runs default suite in one stage without NIGHTLY.
+        main_pm = run(
+            {
+                "BUILDKITE_BRANCH": "main",
+                "BUILDKITE_SOURCE": "webhook",
+                "BUILDKITE_MESSAGE": "feat: land change (#100)",
+            },
+            labels=("run-full-ci", "run-perf-eval"),
+        )
+        self.assertIn(("JOB_PRIORITY", "11"), main_pm.meta)
+        self.assertIn(("WORKLOAD_PRIORITY", "post-merge"), main_pm.meta)
+        self.assertEqual(
+            main_pm.annotations,
+            [
+                (
+                    "ci-suite",
+                    "CI suite: default: "
+                    "main, oncall-fix PRs, release tags, torchtpu-nightly",
+                )
+            ],
+        )
+        self.assertEqual(
+            [u[0] for u in main_pm.uploads],
+            ["verify", "integration", "tests", "cpu", "build"],
+        )
+        self.assertNotIn("NIGHTLY", main_pm.uploads[0][2])
 
         # CI_SUITE=perf (with transitional CI_LANES) uploads ONLY ["perf", "build"].
         perf_sched = run(
@@ -912,7 +967,7 @@ class TestBootstrapUnits(unittest.TestCase):
         self.assertEqual(skip_full.uploads[0][2]["NIGHTLY"], "1")
         self.assertNotIn('build.env("NIGHTLY")', skip_full.uploads[0][1])
 
-        # PR run-full-ci + oncall-fix & scheduled Nightly (both ungated).
+        # PR run-full-ci + oncall-fix & scheduled Nightly (both 1-stage full suite).
         full = run(
             {
                 "BUILDKITE_PULL_REQUEST": "42",
@@ -921,7 +976,20 @@ class TestBootstrapUnits(unittest.TestCase):
         )
         self.assertIn(("JOB_PRIORITY", "12"), full.meta)
         self.assertIn(("WORKLOAD_PRIORITY", "oncall-fix"), full.meta)
-        self.assertEqual(full.annotations, ["oncall-fix", "full-ci"])
+        self.assertEqual(
+            full.annotations,
+            [
+                (
+                    "oncall-fix",
+                    "Runs at on-call priority (`oncall-fix` label): "
+                    "ahead of every other build, including main.",
+                ),
+                (
+                    "ci-suite",
+                    "CI suite: full: Nightly schedule, or oncall-fix PRs with extras",
+                ),
+            ],
+        )
         nightly = run(
             {
                 "NIGHTLY": "1",
@@ -940,7 +1008,7 @@ class TestBootstrapUnits(unittest.TestCase):
             for _, content, _ in fx.uploads:
                 self.assertNotIn('build.env("NIGHTLY")', content)
 
-        # torchtpu-nightly schedule runs default suite at priority 1 (ungated).
+        # torchtpu-nightly schedule runs default suite at priority 1 (one stage).
         torchtpu_nightly = run(
             {
                 "BUILDKITE_PIPELINE_SLUG": "vllm-torchtpu-torchtpu-nightly",
@@ -958,8 +1026,7 @@ class TestBootstrapUnits(unittest.TestCase):
             ["verify", "integration", "tests", "cpu", "build"],
         )
 
-        # Release tag is ungated; integration pipeline is always ungated and uploads
-        # promote first.
+        # Release tag is 1-stage default; integration pipeline is 1-stage integration.
         tag_fx = run({"BUILDKITE_TAG": "v0.32.0", "BUILDKITE_BRANCH": "v0.32.0"})
         self.assertEqual(
             [u[0] for u in tag_fx.uploads],
@@ -992,7 +1059,7 @@ class TestBootstrapUnits(unittest.TestCase):
         # order: reversed(uploads)), and nightly_report.sh's step-key scan.
         bk_bin = shutil.which("bk")
         if bk_bin is not None:
-            for lane in bp.SUITES["integration"]:
+            for lane in bp.SUITES["integration"].stages[0]:
                 subprocess.run(
                     [
                         bk_bin,
@@ -1015,11 +1082,12 @@ class TestBootstrapUnits(unittest.TestCase):
             with tempfile.TemporaryDirectory() as tmp:
                 tmp_dir = pathlib.Path(tmp)
                 for name, uploads in (
-                    ("pr_phase1", list(reversed(pr.uploads))),
+                    ("pr_stage0", list(reversed(pr.uploads))),
                     (
-                        "pr_both_phases",
-                        [*reversed(pr.uploads), *reversed(pr_phase2.uploads)],
+                        "pr_both_stages",
+                        [*reversed(pr.uploads), *reversed(pr_stage1.uploads)],
                     ),
+                    ("main_post_merge", list(reversed(main_pm.uploads))),
                     ("skip_tpu_ci", list(reversed(skip_fx.uploads))),
                     ("ci_suite_perf", list(reversed(perf_sched.uploads))),
                     ("nightly", list(reversed(nightly.uploads))),
@@ -1055,7 +1123,7 @@ class TestBootstrapUnits(unittest.TestCase):
                 "grep -hoE '^[[:space:]]*key:[[:space:]]*\"?[A-Za-z0-9_-]+' "
                 ".buildkite/pipeline_cpu.yml .buildkite/pipeline_tests.yml "
                 "| sed -E 's/.*key:[[:space:]]*\"?//' "
-                "| grep -Ev '(_pr|^cpu)$'",
+                "| grep -Ev '(_pr|^cpu_checks)$'",
             ],
             cwd=_REPO_ROOT,
             check=True,
