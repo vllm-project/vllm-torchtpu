@@ -15,6 +15,13 @@
 
 from collections.abc import Callable
 
+import torch
+import torch.nn.functional as F
+from vllm.distributed import get_dp_group, get_ep_group, get_tp_group
+from vllm.model_executor.layers.fused_moe.moe_output import UnfinalizedMoEOutput
+from vllm.model_executor.layers.fused_moe.router.zero_expert_router import (
+    ZeroExpertRouter,
+)
 from vllm.model_executor.layers.fused_moe.runner import moe_runner as _moe_runner
 from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner
 
@@ -101,6 +108,10 @@ class VllmMoERunner(MoERunner):
         # Not super()._fused_output_is_reduced: under torch.compile dynamo
         # reads that as truthy, and the routed output then skips its TP
         # all-reduce.
+        #
+        # The single EP combine returns the final sum, shared expert included.
+        if self._single_ep_combine_armed():
+            return True
         if not envs.USE_MOE_FUSED_EP_KERNEL or getattr(
             self.moe_config, "skip_final_all_reduce", False
         ):
@@ -142,4 +153,51 @@ class VllmMoERunner(MoERunner):
             if self.shared_experts is not None:
                 return shared_output, hidden_states
             return hidden_states
+        if self._single_ep_combine_armed():
+            return self._single_ep_combine(shared_output, hidden_states)
         return super()._maybe_combine(shared_output, hidden_states)
+
+    def _single_ep_combine_armed(self) -> bool:
+        """Whether one EP all-reduce replaces the naive combine and the final
+        TP all-reduce (TPU_MOE_FUSED_COMBINE).
+
+        Every rank of the EP group then holds a partial sum for every token
+        of its DP group, so summing over the EP group gives what the DP
+        reduce-scatter followed by the TP all-reduce gives. Refused where
+        forward() would still touch the output between those two steps.
+        """
+        if not envs.TPU_MOE_FUSED_COMBINE or not self.do_naive_dispatch_combine:
+            return False
+        config = self.moe_config
+        return (
+            not config.is_sequence_parallel
+            and config.pcp_size == 1
+            and not getattr(config, "skip_final_all_reduce", False)
+            and self.routed_output_transform is None
+            and self.routed_scaling_factor == 1.0
+            and not isinstance(self.router, ZeroExpertRouter)
+            and get_ep_group().world_size
+            == get_dp_group().world_size * get_tp_group().world_size
+        )
+
+    def _single_ep_combine(
+        self, shared_output: torch.Tensor | None, hidden_states: torch.Tensor
+    ):
+        if isinstance(hidden_states, UnfinalizedMoEOutput):
+            raise RuntimeError(
+                "Naive expert-parallel combine cannot consume a deferred MoE output."
+            )
+        dp = get_dp_group()
+        rows = hidden_states.shape[0] // dp.world_size
+        start = dp.rank_in_group * rows
+        if shared_output is not None:
+            # Only this DP rank's TP group adds its tokens' shared expert
+            # partials; the other ranks add zeros to those rows.
+            hidden_states = hidden_states + F.pad(
+                shared_output, (0, 0, start, hidden_states.shape[0] - start - rows)
+            )
+        combined = get_ep_group().all_reduce(hidden_states)[start : start + rows]
+        if self.shared_experts is not None:
+            # The shared output is inside the sum; forward() adds nothing more.
+            return None, combined
+        return combined

@@ -82,6 +82,7 @@ if TYPE_CHECKING:
     TPU_MOE_SKIP_PADDED_TOKENS: bool = False
     TPU_MOE_HIERARCHICAL_EP: bool = False
     TPU_MOE_PACKED_DISPATCH: bool = False
+    TPU_MOE_FUSED_COMBINE: bool = False
     TPU_MOE_ROUTER_TOPK: str = "rowmax"
     TPU_MOE_HOT_SET_SIZE: int = 16
     TPU_MOE_HOT_SET_RATE: float = 0.3
@@ -666,6 +667,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # in one all-gather (packed side by side along the last dim) instead of
     # one all-gather each. Exact: the packing only moves bytes.
     "TPU_MOE_PACKED_DISPATCH": env_bool("TPU_MOE_PACKED_DISPATCH"),
+    # Under DP + EP, finish each MoE layer with one all-reduce over the EP
+    # group instead of the DP reduce-scatter followed by the TP all-reduce:
+    # the shared expert's TP-partial output joins the routed partial on this
+    # rank's own token rows, and each rank keeps those rows of the sum. The
+    # values summed are the same; only the order of the additions changes.
+    "TPU_MOE_FUSED_COMBINE": env_bool("TPU_MOE_FUSED_COMBINE"),
     # MoE router top-k implementation: "rowmax" (default) is the sort-free
     # k-pass selection, "sort" is torch.topk, kept as an escape hatch.
     "TPU_MOE_ROUTER_TOPK": env_with_choices(

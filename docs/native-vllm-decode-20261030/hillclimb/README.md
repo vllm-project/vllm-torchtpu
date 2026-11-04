@@ -84,6 +84,7 @@ LAYOUT=tp32dcp8 GLOBAL_SEQS=96 "$PYTHON_BIN" bench_sweep.py --stage <arm> --inpu
 | `FUSED_DRAFT` | 0 | `1` = draft steps 1..K-1 as one compiled program instead of two programs per step; single-engine layouts only (the switch does not support EP across data-parallel engines) |
 | `FAST_SUBST` | 0 | `1` = steady-state fast token substitution (skips the substitution kernel and per-step index uploads) |
 | `PACKED_DISPATCH` | 0 | `1`: under DP + EP, gather each token's hidden state and router logits in one MoE dispatch all-gather per layer instead of two (`TPU_MOE_PACKED_DISPATCH`); exact |
+| `FUSED_COMBINE` | 0 | `1`: under DP + EP, finish each MoE layer with one all-reduce over the EP group (shared expert folded in, each rank keeps its own tokens' rows) instead of the DP reduce-scatter plus the TP all-reduce (`TPU_MOE_FUSED_COMBINE`); same values, different addition order |
 | `WEIGHTS` | dummy | `real` loads the checkpoint at `MODEL_PATH` |
 | `KV_MODE` | synthetic | `normal` = real prefill with prefix caching (required with real weights; measure with `../benchmark_window.py`) |
 | `EXTRA_ARGS` | | appended to `vllm serve` |
