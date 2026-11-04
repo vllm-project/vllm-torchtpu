@@ -29,6 +29,8 @@ WINDOW = 1024
 # i's matmul, so each refill has WINDOW_DEPTH - 1 windows of compute to land.
 WINDOW_DEPTH = 3
 QUANT_ROWS = 32
+# MXU RHS tile edge; the hand-scheduled wo_a matmul works in these tiles.
+MXU_TILE = 256
 # wo_b window 0 runs on row chunks of about T / B0_CHUNKS (rounded down to
 # QUANT_ROWS) as each is quantized. v7 T288, 100 interleaved calls: 2 chunks
 # 37.96 us, 3 chunks 37.98 us, unchunked 38.28 us, 4 chunks 42.68 us.
@@ -72,19 +74,20 @@ def _kernel(
     wb,  # [8192, 5120] fp8
     sb,  # [5120] f32
     out,  # [T, 5120] bf16
-    # VMEM scratch
-    xb,  # [GROUP_DEPTH, T, 8, 512] bf16
+    # VMEM scratch; with manual_a, P is T rounded up to QUANT_ROWS, else T.
+    # Padding rows of xb stay zero, so they quantize and project to zeros.
+    xb,  # [GROUP_DEPTH, P, 8, 512] bf16
     wab,  # [GROUP_DEPTH, 4096, 1024] fp8
-    qa,  # [2, T, 4096] fp8, quantized wo_a input of groups g and g + 1
-    ia,  # [2, T, 1] f32, their BF16 inverse scales
-    y,  # [T, 8192] bf16, wo_a output
-    ya,  # [T, 1] f32, running row amax of y
-    qb,  # [T, 8192] fp8, quantized wo_b input
-    xs,  # [T, 1] f32, its row scales
+    qa,  # [2, P, 4096] fp8, quantized wo_a input of groups g and g + 1
+    ia,  # [2, P, 1] f32, their BF16 inverse scales
+    y,  # [P, 8192] bf16, wo_a output
+    ya,  # [P, 1] f32, running row amax of y
+    qb,  # [P, 8192] fp8, quantized wo_b input
+    xs,  # [P, 1] f32, its row scales
     wbb,  # [WINDOW_DEPTH, 8192, WINDOW] fp8
     sav,  # [1, 8192] f32
     sbv,  # [5120] f32
-    ob,  # [2, T, WINDOW] bf16
+    ob,  # [2, P, WINDOW] bf16
     xsem,
     wsem,
     bsem,
@@ -93,8 +96,10 @@ def _kernel(
     *,
     b_issue: tuple[int, ...],
     weight_priority: int,
+    manual_a: bool,
+    peel_a: bool,
 ):
-    tokens = x.shape[0]
+    tokens, rows_p = x.shape[0], y.shape[0]
     groups = x.shape[1] // HEADS_PER_GROUP
     width = wa.shape[1] // groups
     windows = wb.shape[1] // WINDOW
@@ -110,7 +115,7 @@ def _kernel(
     def x_copy(g, slot):
         return pltpu.make_async_copy(
             x.at[:, pl.ds(g * HEADS_PER_GROUP, HEADS_PER_GROUP), :],
-            xb.at[slot],
+            xb.at[slot, pl.ds(0, tokens)],
             xsem.at[slot],
         )
 
@@ -130,7 +135,9 @@ def _kernel(
 
     def out_copy(i):
         return pltpu.make_async_copy(
-            ob.at[i % 2], out.at[:, pl.ds(i * WINDOW, WINDOW)], osem.at[i % 2]
+            ob.at[i % 2, pl.ds(0, tokens)],
+            out.at[:, pl.ds(i * WINDOW, WINDOW)],
+            osem.at[i % 2],
         )
 
     sa_copy = pltpu.make_async_copy(sa, sav, ssem.at[0])
@@ -140,17 +147,133 @@ def _kernel(
     # slot as a Python int: with a traced index the compiler cannot tell the
     # slots apart and keeps one group's quantize stores ahead of the other
     # group's matmul loads.
-    def quantize_a(xslot, slot):
-        # Same operations as wo_a_projection's quantized _kernel body.
-        v = xb[xslot].reshape(tokens, -1)
+    def quantize_a(xslot, slot, rows=None):
+        # Same operations as wo_a_projection's quantized _kernel body. Rows
+        # are independent, so a row chunk gives the same bits as the whole.
+        rows = pl.ds(0, rows_p) if rows is None else rows
+        v = xb[xslot, rows].reshape(rows.size, -1)
         amax = jnp.max(jnp.abs(v), axis=1, keepdims=True)
         inv = (FP8_E4M3_MAX / jnp.maximum(amax, jnp.bfloat16(1e-30))).astype(
             jnp.bfloat16
         )
-        qa[slot] = (v * inv).astype(qa.dtype)
-        ia[slot] = inv.astype(jnp.float32)
+        qa[slot, rows] = (v * inv).astype(qa.dtype)
+        ia[slot, rows] = inv.astype(jnp.float32)
+
+    def aligned(start, size):
+        if not isinstance(start, int):
+            start = pl.multiple_of(start, size)
+        return pl.ds(start, size)
+
+    # With manual_a every matmul is hand-scheduled (Mosaic does not mix MXU
+    # primitives with dot_general), CSA2-style: a 1024-column output is four
+    # 256-column blocks, MXU mx owning blocks 2 * mx + p for pairs p = 0, 1,
+    # with one [QUANT_ROWS, 256] accumulator per row chunk. K tiles stream
+    # through two RHS staging registers; pair 0 pops while pair 1 streams.
+    # Each output column is still one full-K MXU accumulation.
+    chunks = rows_p // QUANT_ROWS
+    if manual_a:
+        assert rows_p % QUANT_ROWS == 0
+        accs = tuple(
+            tuple(
+                tuple(
+                    jax.empty_ref(
+                        jax.ShapeDtypeStruct((QUANT_ROWS, MXU_TILE), jnp.float32),
+                        memory_space=pltpu.ACC(mx),
+                    )
+                    for _ in range(chunks)
+                )
+                for _ in range(2)
+            )
+            for mx in range(2)
+        )
+
+    def mxu_matmul(lhs, rhs, k_tiles, rows, epilogue, quant=None):
+        """lhs(rows, ks) @ rhs(ks, cols) for the row chunks in `rows`.
+
+        epilogue(p, mx, m, value) consumes each popped [QUANT_ROWS, 256]
+        block. quant(c), c in [0, chunks), is one vector work item; the
+        items are spread evenly over the K-tile pairs of both block pairs.
+        """
+        pairs = k_tiles // 2
+
+        def push(p, kb, stage):
+            for mx in range(2):
+                block = pl.ds((2 * mx + p) * MXU_TILE, MXU_TILE)
+                pltpu.matmul_push_rhs(
+                    rhs(aligned(kb * MXU_TILE, MXU_TILE), block), stage, mx
+                )
+
+        def acc(p, kb, stage):
+            for i, m in enumerate(rows):
+                part = lhs(
+                    pl.ds(m * QUANT_ROWS, QUANT_ROWS), aligned(kb * MXU_TILE, MXU_TILE)
+                )
+                for mx in range(2):
+                    pltpu.matmul_acc_lhs(
+                        accs[mx][p][m], part, load_staged_rhs=stage if i == 0 else None
+                    )
+
+        def two(p, kb, following):
+            # Tiles kb (staged in 0) and kb + 1; stage `following` behind.
+            push(p, kb + 1, 1)
+            acc(p, kb, 0)
+            if following is not None:
+                fp, fkb = following
+                push(fp, fkb, 0)
+            acc(p, kb + 1, 1)
+
+        def pop(p):
+            for mx in range(2):
+                for m in rows:
+                    epilogue(p, mx, m, pltpu.matmul_pop(accs[mx][p][m]))
+
+        # Fully unrolled: a loop around the K-tile pairs refills the MXU
+        # pipeline every iteration (v7 T288 wo_a group, VMEM-resident: fori
+        # 2.60 us vs unrolled 2.15 us with the quantize interleaved).
+        seq = [(p, 2 * j) for p in range(2) for j in range(pairs)]
+        at = {}
+        if quant is not None:
+            for c in range(chunks):
+                at.setdefault(c * len(seq) // chunks, []).append(c)
+        # Block pair 0 pops right after pair 1's first K-tile pair, so its
+        # epilogue runs beside pair 1's MXU work (v7 T288 wo_a group,
+        # VMEM-resident, quantize interleaved: 2.11 us vs 2.51 us popping
+        # both pairs at the end).
+        push(0, 0, 0)
+        for i, (p, kb) in enumerate(seq):
+            two(p, kb, seq[i + 1] if i + 1 < len(seq) else None)
+            if quant is not None:
+                for c in at.get(i, ()):
+                    quant(c)
+            if i == pairs:
+                pop(0)
+        pop(1)
+
+    def manual_project_a(g, wslot, slot, quant=None):
+        def epilogue(p, mx, m, r):
+            rows = pl.ds(m * QUANT_ROWS, QUANT_ROWS)
+            cols = aligned(g * width + (2 * mx + p) * MXU_TILE, MXU_TILE)
+            v = ((r * (1.0 / ia[slot, rows])) * sav[:, cols]).astype(y.dtype)
+            y[rows, cols] = v
+            # wo_b's row amax, exact: max is order independent.
+            ya[rows] = jnp.maximum(
+                ya[rows],
+                jnp.max(jnp.abs(v.astype(jnp.float32)), axis=1, keepdims=True),
+            )
+
+        mxu_matmul(
+            lambda r, k: qa[slot, r, k],
+            lambda k, c: wab[wslot, k, c],
+            wab.shape[1] // MXU_TILE,
+            range(chunks),
+            epilogue,
+            quant,
+        )
 
     def project_a(g, wslot, slot):
+        if manual_a:
+            manual_project_a(g, wslot, slot)
+            return
         partial = jax.lax.dot_general(
             qa[slot],
             wab[wslot],
@@ -189,6 +312,10 @@ def _kernel(
         for g in range(1, group_depth):
             wa_copy(g, g).start(priority=weight_priority)
         ya[...] = jnp.zeros(ya.shape, ya.dtype)
+        if rows_p > tokens:
+            xb[:, tokens:] = jnp.zeros(
+                (group_depth, rows_p - tokens, *xb.shape[2:]), xb.dtype
+            )
         x_copy(0, 0).wait()
         quantize_a(0, 0)
         sa_copy.wait()
@@ -203,10 +330,22 @@ def _kernel(
         with jax.named_scope("op_a_group"):
             # Both waits first: the scheduler does not move vector work
             # across a DMA wait, so a wait between the two would serialize them.
-            x_copy(g + 1, nxt).wait()
-            wa_copy(g, cur).wait()
-            quantize_a(nxt, 1 - slot)
-            project_a(g, cur, slot)
+            with jax.named_scope("op_a_wait"):
+                x_copy(g + 1, nxt).wait()
+                wa_copy(g, cur).wait()
+            if manual_a:
+                # Group g + 1's quantize, one row chunk per K-tile pair.
+                manual_project_a(
+                    g,
+                    cur,
+                    slot,
+                    lambda j: quantize_a(
+                        nxt, 1 - slot, aligned(j * QUANT_ROWS, QUANT_ROWS)
+                    ),
+                )
+            else:
+                quantize_a(nxt, 1 - slot)
+                project_a(g, cur, slot)
 
         if isinstance(g, int):
             if g + group_depth < groups:
@@ -241,9 +380,25 @@ def _kernel(
         g = 2 * p + 1
         return step(g + 1, 0, step(g, 1, cur))
 
-    jax.lax.fori_loop(0, pairs, pair, jnp.int32(1))
-    for g in range(1 + 2 * pairs, groups - 1):
-        step(g, g % 2, g % group_depth)
+    if peel_a:
+        # Group 1 straight-line ahead of the loop; the loop then covers
+        # groups 2 .. 2 * pairs - 1 two at a time, the rest straight-line.
+        # With manual_a, v7 100 interleaved calls vs the dot_general kernel:
+        # T288 36.5 us vs 37.4 us, T240 33.9 us vs 36.5 us.
+        step(1, 1, 1)
+        peeled = (groups - 3) // 2
+
+        def pair2(p, cur):
+            g = 2 * p + 2
+            return step(g + 1, 1, step(g, 0, cur))
+
+        jax.lax.fori_loop(0, peeled, pair2, jnp.int32(2 % group_depth))
+        for g in range(2 + 2 * peeled, groups - 1):
+            step(g, g % 2, g % group_depth)
+    else:
+        jax.lax.fori_loop(0, pairs, pair, jnp.int32(1))
+        for g in range(1 + 2 * pairs, groups - 1):
+            step(g, g % 2, g % group_depth)
 
     with jax.named_scope("op_a_last"):
         last = groups - 1
@@ -265,6 +420,26 @@ def _kernel(
                 qb[rows, cols] = jnp.clip(a / scale, -448.0, 448.0).astype(qb.dtype)
 
     def project_b(i, slot, rows):
+        if manual_a:
+            assert rows.start % QUANT_ROWS == 0 and rows.size % QUANT_ROWS == 0
+            first = rows.start // QUANT_ROWS
+
+            def epilogue(p, mx, m, z):
+                r = pl.ds(m * QUANT_ROWS, QUANT_ROWS)
+                block = (2 * mx + p) * MXU_TILE
+                scale = sbv[aligned(i * WINDOW + block, MXU_TILE)][None, :]
+                ob[i % 2, r, pl.ds(block, MXU_TILE)] = ((z * xs[r]) * scale).astype(
+                    out.dtype
+                )
+
+            mxu_matmul(
+                lambda r, k: qb[r, k],
+                lambda k, c: wbb[slot, k, c],
+                qb.shape[1] // MXU_TILE,
+                range(first, first + rows.size // QUANT_ROWS),
+                epilogue,
+            )
+            return
         z = jax.lax.dot_general(
             qb[rows, :],
             wbb[slot, ...],
@@ -285,13 +460,13 @@ def _kernel(
     # quantized rows. Rows are independent, so window 0 runs on each row chunk
     # as soon as it is quantized, beside the next chunk's quantize. Chunk
     # bounds are static, so the two touch provably disjoint rows of qb.
-    chunk = -(-tokens // B0_CHUNKS) // QUANT_ROWS * QUANT_ROWS
+    chunk = -(-rows_p // B0_CHUNKS) // QUANT_ROWS * QUANT_ROWS
     with jax.named_scope("op_b_quant"):
         wb_copy(0, 0).wait()
         sb_copy.wait()
         done = None
-        for start in range(0, tokens, chunk):
-            size = min(chunk, tokens - start)
+        for start in range(0, rows_p, chunk):
+            size = min(chunk, rows_p - start)
             for r in range(start, start + size, QUANT_ROWS):
                 quantize_rows(r, min(QUANT_ROWS, start + size - r))
             if done is not None:
@@ -310,7 +485,7 @@ def _kernel(
             def _():
                 out_copy(i - 2).wait()
 
-            project_b(i, slot, pl.ds(0, tokens))
+            project_b(i, slot, pl.ds(0, rows_p))
 
         refill_and_store(i, slot)
         return succ(slot, window_depth)
@@ -322,7 +497,15 @@ def _kernel(
         out_copy(windows - 1).wait()
 
 
-@functools.partial(jax.jit, static_argnames=("b_issue", "weight_priority"))
+@functools.partial(
+    jax.jit,
+    static_argnames=(
+        "b_issue",
+        "weight_priority",
+        "manual_a",
+        "peel_a",
+    ),
+)
 def fused_output_projection(
     x: jax.Array,  # [T, 64, 512] bf16
     wa: jax.Array,  # [4096, 8192] fp8
@@ -332,6 +515,8 @@ def fused_output_projection(
     *,
     b_issue: tuple[int, ...] = B_ISSUE,
     weight_priority: int = WEIGHT_PRIORITY,
+    manual_a: bool = True,
+    peel_a: bool = True,
 ) -> jax.Array:
     """``wo_b(wo_a(x))`` for the qualified decode shapes, see ``is_supported``."""
     if not is_supported(x, wa, sa, wb, sb):
@@ -341,6 +526,9 @@ def fused_output_projection(
     groups = heads // HEADS_PER_GROUP
     width = features // groups
     k, n = wb.shape
+    # fp8 matmul_acc_lhs takes QUANT_ROWS-row multiples: pad the rows held
+    # in VMEM; only the first `tokens` rows travel to and from HBM.
+    rows = -(-tokens // QUANT_ROWS) * QUANT_ROWS if manual_a else tokens
     group_depth, window_depth = GROUP_DEPTH, WINDOW_DEPTH
     assert len(b_issue) == window_depth and all(0 <= at < groups for at in b_issue)
     assert group_depth < groups
@@ -357,23 +545,25 @@ def fused_output_projection(
             _kernel,
             b_issue=b_issue,
             weight_priority=weight_priority,
+            manual_a=manual_a,
+            peel_a=peel_a,
         ),
         out_shape=jax.ShapeDtypeStruct((tokens, n), x.dtype),
         in_specs=(pl.BlockSpec(memory_space=hbm),) * 5,
         out_specs=pl.BlockSpec(memory_space=hbm),
         scratch_shapes=(
-            pltpu.VMEM((group_depth, tokens, HEADS_PER_GROUP, head_dim), x.dtype),
+            pltpu.VMEM((group_depth, rows, HEADS_PER_GROUP, head_dim), x.dtype),
             pltpu.VMEM((group_depth, reduction, width), fp8),
-            pltpu.VMEM((2, tokens, reduction), fp8),
-            pltpu.VMEM((2, tokens, 1), f32),
-            pltpu.VMEM((tokens, features), x.dtype),
-            pltpu.VMEM((tokens, 1), f32),
-            pltpu.VMEM((tokens, k), fp8),
-            pltpu.VMEM((tokens, 1), f32),
+            pltpu.VMEM((2, rows, reduction), fp8),
+            pltpu.VMEM((2, rows, 1), f32),
+            pltpu.VMEM((rows, features), x.dtype),
+            pltpu.VMEM((rows, 1), f32),
+            pltpu.VMEM((rows, k), fp8),
+            pltpu.VMEM((rows, 1), f32),
             pltpu.VMEM((window_depth, k, WINDOW), fp8),
             pltpu.VMEM((1, features), f32),
             pltpu.VMEM((n,), f32),
-            pltpu.VMEM((2, tokens, WINDOW), x.dtype),
+            pltpu.VMEM((2, rows, WINDOW), x.dtype),
             pltpu.SemaphoreType.DMA((group_depth,)),
             pltpu.SemaphoreType.DMA((group_depth,)),
             pltpu.SemaphoreType.DMA((window_depth,)),
