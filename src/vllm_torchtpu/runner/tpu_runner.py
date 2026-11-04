@@ -355,7 +355,8 @@ def _verify_fused_impl(
     max_draft_tokens: int,
     synthetic_mode: bool,
     topk_candidates: int,
-) -> torch.Tensor:
+    num_reqs: torch.Tensor | None = None,
+):
     """Non-greedy spec verify of one chunk as one program
     (VLLM_TPU_VERIFY_FUSED): the bonus/target logit gathers, the bonus-token
     sample, the per-position sampling-parameter gathers and the rejection
@@ -367,7 +368,7 @@ def _verify_fused_impl(
     bonus_token_ids = _sample_from_logits_impl(
         bonus_logits, temperatures, bonus_u, top_k, top_p, topk_candidates
     ).view(-1)
-    return _random_rejection_sample_impl(
+    next_tokens = _random_rejection_sample_impl(
         draft_token_ids,
         target_logits,
         draft_lengths,
@@ -384,6 +385,14 @@ def _verify_fused_impl(
         synthetic_mode,
         topk_candidates,
     )
+    if num_reqs is None:
+        return next_tokens
+    # Per-row read offsets (`_update_read_offsets_impl` before its group
+    # pad/scatter): rows past num_reqs take 0.
+    num_valid = (next_tokens != INVALID_TOKEN_ID).sum(dim=1)
+    valid = torch.arange(next_tokens.shape[0], device=next_tokens.device) < num_reqs
+    row_offsets = torch.where(valid, (num_valid - 1).clamp(min=0), 0)
+    return next_tokens, row_offsets
 
 
 # Strip any dynamic-dim marks a caller's tensor carries (see eagle3).
@@ -1408,7 +1417,10 @@ class TPUModelRunner(GPUModelRunner):
         self._verify_fused_checks_left = envs.VLLM_TPU_VERIFY_FUSED_CHECK
         self._verify_fused_checks_done = 0
         self._verify_fused_mismatches: torch.Tensor | None = None
+        self._verify_fused_ro_mismatches: torch.Tensor | None = None
         self._num_reqs_device: dict[int, torch.Tensor] = {}
+        self._fused_read_offsets: tuple = (None, 0)
+        self._fused_read_offsets_applied = False
         # Drafting and verification happen where sampling happens, on the
         # last pipeline stage; the other stages keep the config for the KV
         # cache spec and the scheduler, and nothing else.
@@ -4804,7 +4816,52 @@ class TPUModelRunner(GPUModelRunner):
             self.rejection_sampler.synthetic_mode,
             topk_candidates,
         )
-        out = _verify_fused_compiled(*args)
+        ro_groups, ro_num_reqs = self._fused_read_offsets
+        slot_offsets = self.mamba_slot_read_offsets
+        fold_ro = (
+            slot_offsets is not None
+            and bool(ro_groups)
+            and envs.VLLM_TPU_FUSED_READ_OFFSET_UPDATE
+            and slot_offsets.device.type == "tpu"
+        )
+        if fold_ro and slot_offsets is not None:
+            out, row_offsets = _verify_fused_compiled(
+                *args, self._num_reqs_tensor(ro_num_reqs)
+            )
+            # Pad/truncate to the slot groups' width and scatter eagerly, instead
+            # of a compiled program that mutates the slot buffer (and its aot
+            # mutation epilogue). Padded rows' slots are the null block.
+            groups = list(ro_groups)
+            width = groups[0].shape[0]
+            rows = row_offsets.shape[0]
+            vals = (
+                row_offsets[:width]
+                if rows >= width
+                else torch.nn.functional.pad(row_offsets, (0, width - rows))
+            ).to(slot_offsets.dtype)
+            if len(groups) > 1:
+                idx = torch.cat(groups, dim=0).long()
+                vals = vals.repeat(len(groups))
+            else:
+                idx = groups[0].long()
+            ref_buf = (
+                slot_offsets.clone() if self._verify_fused_checks_left > 0 else None
+            )
+            slot_offsets.index_put_((idx,), vals)
+            self._fused_read_offsets_applied = True
+            if ref_buf is not None:
+                # Check: the separate program's scatter on a copy must match.
+                _update_read_offsets_impl(
+                    ref_buf, groups, out, self._num_reqs_tensor(ro_num_reqs)
+                )
+                ro_mism = (ref_buf != slot_offsets).sum()
+                self._verify_fused_ro_mismatches = (
+                    ro_mism
+                    if self._verify_fused_ro_mismatches is None
+                    else self._verify_fused_ro_mismatches + ro_mism
+                )
+        else:
+            out = _verify_fused_compiled(*args)
         if self._verify_fused_checks_left > 0:
             self._check_verify_fused(out, args)
         return out
@@ -4891,9 +4948,14 @@ class TPUModelRunner(GPUModelRunner):
             or self._verify_fused_checks_left == 0
         ):
             clean, caught = self._verify_fused_mismatches.tolist()
+            ro = (
+                -1
+                if self._verify_fused_ro_mismatches is None
+                else int(self._verify_fused_ro_mismatches.item())
+            )
             logger.info(
                 "VERIFY_FUSED_CHECK checks=%d clean_mismatched_positions=%d "
-                "faulted_checks=%d faulted_caught=%d",
+                "faulted_checks=%d faulted_caught=%d read_offset_mismatches=%d",
                 self._verify_fused_checks_done,
                 clean,
                 min(
@@ -4901,6 +4963,7 @@ class TPUModelRunner(GPUModelRunner):
                     envs.VLLM_TPU_VERIFY_FUSED_CHECK_FAULT,
                 ),
                 caught,
+                ro,
             )
 
     @_pp_step
@@ -4983,6 +5046,8 @@ class TPUModelRunner(GPUModelRunner):
                 cur_end_idx = cur_start_idx + num_reqs
                 if md is not None:
                     host_phases.mark("sample_setup")
+                    self._fused_read_offsets = (mamba_indices, num_reqs)
+                    self._fused_read_offsets_applied = False
                     with self._stage_timing.stage("sample"):
                         next_tokens = self._sample_spec_verify_chunk(
                             logits,
@@ -4999,9 +5064,10 @@ class TPUModelRunner(GPUModelRunner):
                     combined_selected_tokens.append(next_tokens)
                     combined_selected_tokens_real_lens.append(num_reqs)
                     next_tokens_per_chunk.append(next_tokens)
-                    self._update_mamba_slot_read_offsets(
-                        mamba_indices, next_tokens, num_reqs
-                    )
+                    if not self._fused_read_offsets_applied:
+                        self._update_mamba_slot_read_offsets(
+                            mamba_indices, next_tokens, num_reqs
+                        )
                     host_phases.mark("spec_verify_and_read_offsets")
                     if needs_logprobs:
                         # Raw verify logits, one row per draft slot and bonus
@@ -6804,7 +6870,36 @@ class TPUModelRunner(GPUModelRunner):
         candidates = [0]
         if blocks := self._topk_candidate_blocks():
             candidates.append(blocks)
+        # With the read-offset fold on, only the num_reqs variant runs.
+        fold_ro = bool(
+            envs.VLLM_TPU_FUSED_READ_OFFSET_UPDATE
+            and self.mamba_slot_read_offsets is not None
+        )
         for topk_candidates in candidates:
+            if fold_ro:
+                synchronize_tensors(
+                    _verify_fused_compiled(
+                        dummy_logits,
+                        bonus_logits_indices,
+                        target_logits_indices,
+                        temps,
+                        top_k,
+                        top_p,
+                        bonus_u,
+                        warm_accept_u,
+                        warm_recover_u,
+                        draft_token_ids,
+                        draft_lengths,
+                        segment_ids,
+                        group_indices,
+                        self.rejection_sampler.synthetic_conditional_rates,
+                        self.speculative_config.num_speculative_tokens,
+                        self.rejection_sampler.synthetic_mode,
+                        topk_candidates,
+                        self._num_reqs_tensor(1),
+                    )
+                )
+                continue
             out = _verify_fused_compiled(
                 dummy_logits,
                 bonus_logits_indices,
