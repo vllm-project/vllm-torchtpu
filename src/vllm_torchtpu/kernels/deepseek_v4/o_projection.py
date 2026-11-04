@@ -26,7 +26,11 @@ from vllm_torchtpu.kernels.deepseek_v4.rope import (
     _rotate_gptj,
 )
 from vllm_torchtpu.kernels.deepseek_v4.tuned_block_sizes import OUTPUT_PROJECTION_TUNING
-from vllm_torchtpu.kernels.quantized_matmul.tuned_block_sizes import get_tpu_version
+from vllm_torchtpu.kernels.quantized_matmul import buffered
+from vllm_torchtpu.kernels.quantized_matmul.tuned_block_sizes import (
+    BUFFERED_MATMUL_TUNING,
+    get_tpu_version,
+)
 from vllm_torchtpu.layers.core.quantization import FP8_E4M3_MAX
 
 DEFAULT_VMEM_LIMIT_BYTES = 100 * 1024 * 1024
@@ -345,6 +349,191 @@ def _buffered_projection(
         compiler_params=pltpu.CompilerParams(vmem_limit_bytes=vmem_budget),
         name=f"{name}_buffered",
     )(x, w, scale)
+
+
+def _fused_ab_kernel(
+    x, wa, sa, wb, sb, out, xab, wab, sab, oa, q, xs, wbb, sbb, ob,
+    xsem, wasem, sasem, wbsem, sbsem, osem, *, depth, width_b, quant_rows,
+):  # fmt: skip
+    """``_buffered_kernel`` into VMEM, then ``buffered._kernel`` on that tile."""
+    groups = x.shape[1] // SUBLANE
+    width_a = wa.shape[1] // groups
+    windows = wb.shape[1] // width_b
+
+    def a_inputs(i):
+        return (
+            pltpu.make_async_copy(
+                x.at[:, pl.ds(i * SUBLANE, SUBLANE), :],
+                xab.at[i % depth],
+                xsem.at[i % depth],
+            ),
+            pltpu.make_async_copy(
+                wa.at[:, pl.ds(i * width_a, width_a)],
+                wab.at[i % depth],
+                wasem.at[i % depth],
+            ),
+        )
+
+    def b_weight(i):
+        return pltpu.make_async_copy(
+            wb.at[:, pl.ds(i * width_b, width_b)], wbb.at[i % 2], wbsem.at[i % 2]
+        )
+
+    def b_output(i):
+        return pltpu.make_async_copy(
+            ob.at[i % 2], out.at[:, pl.ds(i * width_b, width_b)], osem.at[i % 2]
+        )
+
+    with jax.named_scope("oab_dma_startup"):
+        pltpu.make_async_copy(sa, sab, sasem).start()
+        pltpu.make_async_copy(sb, sbb, sbsem).start()
+        for i in range(depth):
+            for copy in a_inputs(i):
+                copy.start()
+        pltpu.make_async_copy(sa, sab, sasem).wait()
+
+    @pl.loop(0, groups, unroll=False)
+    def a_body(i):
+        with jax.named_scope("oab_a_input_wait"):
+            for copy in a_inputs(i):
+                copy.wait()
+        with jax.named_scope("oab_a_compute"):
+            columns = pl.ds(pl.multiple_of(i * width_a, width_a), width_a)
+            _kernel(
+                xab.at[i % depth],
+                wab.at[i % depth],
+                sab.at[:, columns],
+                None,
+                oa.at[:, columns],
+                tile_t=x.shape[0],
+                num_sub_t=1,
+                quantize_activations=True,
+                head_dim=x.shape[2],
+            )
+
+        @pl.when(i + depth < groups)
+        def refill():
+            for copy in a_inputs(i + depth):
+                copy.start()
+
+        # wo_b's first windows queue behind wo_a's last groups.
+        @pl.when(i == groups - depth)
+        def _():
+            b_weight(0).start()
+
+        @pl.when(i == groups - depth + 1)
+        def _():
+            b_weight(1).start()
+
+    with jax.named_scope("oab_quant"):
+        buffered._quantize_rows(oa, q, xs, rows=quant_rows)
+    pltpu.make_async_copy(sb, sbb, sbsem).wait()
+
+    @pl.loop(0, windows, unroll=False)
+    def b_body(i):
+        b_weight(i).wait()
+
+        @pl.when(i >= 2)
+        def recycle():
+            b_output(i - 2).wait()
+
+        with jax.named_scope("oab_b_gemm_scale"):
+            z = jax.lax.dot_general(
+                q[...],
+                wbb[i % 2, ...],
+                (((1,), (0,)), ((), ())),
+                preferred_element_type=jnp.float32,
+            )
+            z = (z * xs[...]) * sbb[pl.ds(i * width_b, width_b)][None, :]
+            ob[i % 2, ...] = z.astype(out.dtype)
+
+        @pl.when(i + 2 < windows)
+        def refill():
+            b_weight(i + 2).start()
+
+        b_output(i).start()
+
+    with jax.named_scope("oab_drain"):
+        b_output(windows - 2).wait()
+        b_output(windows - 1).wait()
+
+
+def is_fused_ab_supported(
+    x: jax.Array,
+    wo_a: jax.Array,
+    wo_a_scale: jax.Array,
+    wo_b: jax.Array,
+    wo_b_scale: jax.Array,
+) -> bool:
+    """Whether wo_a and wo_b both have a buffered decode kernel for these inputs."""
+    flat_scale = jax.ShapeDtypeStruct((wo_a_scale.size,), wo_a_scale.dtype)
+    wo_b_input = jax.ShapeDtypeStruct((x.shape[0], wo_a.shape[1]), x.dtype)
+    return is_buffered_projection_supported(
+        x, wo_a, flat_scale
+    ) and buffered.is_supported(wo_b_input, wo_b, wo_b_scale)
+
+
+def fused_ab_projection(
+    x: jax.Array,  # [T, 64, 512] bf16, already inverse-rotated
+    wo_a: jax.Array,  # [4096, 8192] fp8
+    wo_a_scale: jax.Array,  # [8192] f32
+    wo_b: jax.Array,  # [8192, 5120] fp8, (k, n)
+    wo_b_scale: jax.Array,  # [5120] f32
+    *,
+    name: str = "wo_ab_projection_buffered",
+) -> jax.Array:
+    """``buffered_matmul(wo_a_projection(x, ...), wo_b, wo_b_scale)`` in one kernel.
+
+    The wo_a output stays in VMEM (bf16, as the two-kernel chain rounds it)
+    and is row-quantized there exactly as ``buffered_matmul`` does, so the
+    result is bitwise the chain's.
+    """
+    if not is_fused_ab_supported(x, wo_a, wo_a_scale, wo_b, wo_b_scale):
+        raise ValueError("Fused wo_a/wo_b requires qualified v7 decode inputs")
+    tokens, heads, head_dim = x.shape
+    reduction, out_a = wo_a.shape
+    out_b = wo_b.shape[1]
+    depth, _ = OUTPUT_PROJECTION_TUNING[
+        (get_tpu_version(), tokens, heads, head_dim, reduction, out_a)
+    ]
+    width_b, quant_rows, _ = BUFFERED_MATMUL_TUNING[
+        (get_tpu_version(), tokens, out_a, out_b)
+    ]
+    width_a = out_a // (heads // SUBLANE)
+    hbm = pltpu.HBM
+    x = pltpu.with_memory_space_constraint(x, hbm)
+    wo_a = pltpu.with_memory_space_constraint(wo_a, hbm)
+    wo_b = pltpu.with_memory_space_constraint(wo_b, hbm)
+    wo_a_scale = pltpu.with_memory_space_constraint(wo_a_scale.reshape(1, out_a), hbm)
+    wo_b_scale = pltpu.with_memory_space_constraint(wo_b_scale, hbm)
+    return pl.pallas_call(
+        functools.partial(
+            _fused_ab_kernel, depth=depth, width_b=width_b, quant_rows=quant_rows
+        ),
+        out_shape=jax.ShapeDtypeStruct((tokens, out_b), x.dtype),
+        in_specs=(pl.BlockSpec(memory_space=hbm),) * 5,
+        out_specs=pl.BlockSpec(memory_space=hbm),
+        scratch_shapes=(
+            pltpu.VMEM((depth, tokens, SUBLANE, head_dim), x.dtype),
+            pltpu.VMEM((depth, reduction, width_a), wo_a.dtype),
+            pltpu.VMEM((1, out_a), jnp.float32),
+            pltpu.VMEM((tokens, out_a), x.dtype),
+            pltpu.VMEM((tokens, out_a), wo_b.dtype),
+            pltpu.VMEM((tokens, 1), jnp.float32),
+            pltpu.VMEM((2, out_a, width_b), wo_b.dtype),
+            pltpu.VMEM((out_b,), jnp.float32),
+            pltpu.VMEM((2, tokens, width_b), x.dtype),
+            pltpu.SemaphoreType.DMA((depth,)),
+            pltpu.SemaphoreType.DMA((depth,)),
+            pltpu.SemaphoreType.DMA,
+            pltpu.SemaphoreType.DMA((2,)),
+            pltpu.SemaphoreType.DMA,
+            pltpu.SemaphoreType.DMA((2,)),
+        ),
+        # 46 MB of scratch at T=288 (depth 3, 1024-column wo_b windows).
+        compiler_params=pltpu.CompilerParams(vmem_limit_bytes=62 * 1024**2),
+        name=name,
+    )(x, wo_a, wo_a_scale, wo_b, wo_b_scale)
 
 
 @functools.partial(

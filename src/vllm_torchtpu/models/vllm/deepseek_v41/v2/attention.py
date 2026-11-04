@@ -2156,10 +2156,37 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                 "(TP1, FP8 KV) " + "; ".join(problems)
             )
 
+    def _check_fusable_wo_b(self):
+        """wo_b must be what the fused op computes: unsharded per-channel FP8 (k, n)."""
+        layer = self.wo_b
+        scale = getattr(layer, "weight_scale", None)
+        if not (
+            getattr(layer, WEIGHT_FLIPPED_ATTR, False)
+            and layer.weight.dtype == torch.float8_e4m3fn
+            and scale is not None
+            and scale.dtype == torch.float32
+            and scale.shape == (layer.weight.shape[1],)
+            and getattr(layer, "bias", None) is None
+            and getattr(layer, "tp_size", 1) == 1
+        ):
+            raise NotImplementedError(
+                f"{self.prefix}: TPU_DEEPSEEK_V41_FUSED_WO_AB needs an unsharded, "
+                "bias-free, per-channel FP8 wo_b in (k, n) layout"
+            )
+
     def _o_proj(self, output, positions):
         assert output.dtype == torch.bfloat16
         assert output.shape[1:] == (self.n_local_heads, self.head_dim)
         if self._csa2:
+            if envs.TPU_DEEPSEEK_V41_FUSED_WO_AB:
+                self._check_fusable_wo_b()
+                return csa2_adapter.project_wo(
+                    output,
+                    self.wo_a.weight,
+                    self.wo_a.weight_scale,
+                    self.wo_b.weight,
+                    self.wo_b.weight_scale,
+                )
             projected = csa2_adapter.project(
                 output, self.wo_a.weight, self.wo_a.weight_scale
             )
