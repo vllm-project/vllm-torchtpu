@@ -7,7 +7,7 @@ import jax
 import jax.numpy as jnp
 
 from .cache import gather_csa2_kv_sc
-from .csa2 import csa2
+from .csa2 import _decode_scale_rounding, csa2
 
 
 def csa2_gather_chunk_size(num_tokens: int) -> int:
@@ -56,6 +56,12 @@ def csa2_pipeline(
     if records.shape != (q.shape[0], 512) or counts.shape != q.shape[:1]:
         raise ValueError("CSA2 pipeline requires [T,512] records and [T] counts")
 
+    round_scales = _decode_scale_rounding(
+        starts,
+        positions,
+        num_banks=len(swa) if isinstance(swa, tuple) else 1,
+        non_causal=bounds is not None,
+    )
     word_chunks, scale_chunks = [], []
     output = jnp.empty_like(q)
     previous = None
@@ -82,10 +88,17 @@ def csa2_pipeline(
         chunk_words, chunk_scales = current
         word_chunks.append(chunk_words)
         scale_chunks.append(chunk_scales)
+        # Chunk boundaries can split a six-query request. Decide precision
+        # from the full batch and preserve original scales for later reuse.
+        attention_scales = jnp.where(
+            round_scales,
+            chunk_scales.astype(jnp.bfloat16).astype(jnp.float32),
+            chunk_scales,
+        )
         previous = csa2(
             q[offset:end],
             chunk_words,
-            chunk_scales,
+            attention_scales,
             swa,
             jnp.clip(starts - offset, 0, end - offset),
             positions[offset:end],
@@ -97,6 +110,7 @@ def csa2_pipeline(
             scale=scale,
             compress_ratio=compress_ratio,
             bq=bq,
+            round_scales=False,
         )
         if following is not None:
             current = following

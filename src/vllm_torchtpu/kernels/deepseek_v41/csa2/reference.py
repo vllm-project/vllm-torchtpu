@@ -21,8 +21,11 @@ def prefill_reference(
     main_lengths: jax.Array,
     swa_bounds: jax.Array | None = None,
     scale: float = 512**-0.5,
+    round_scales: bool = False,
 ) -> jax.Array:
     """Independent attention math for validating either SWA visibility mode."""
+    if round_scales:
+        scales = scales.astype(jnp.bfloat16).astype(jnp.float32)
     banks = swa_kv if isinstance(swa_kv, tuple) else (swa_kv,)
     pages, bounds, lengths = swa_metadata, swa_bounds, main_lengths
     tokens = q.shape[0]

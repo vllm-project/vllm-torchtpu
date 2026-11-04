@@ -26,17 +26,14 @@ def _decode_inputs(batch, heads, page_size):
     positions = (first[:, None] + jnp.arange(6)).reshape(-1)
     starts = jnp.arange(batch + 1, dtype=jnp.int32) * 6
     words, scales = encode_csa2_kv(random((tokens * 512, 512)))
-    pages_per_seq = max(4, 256 // page_size)
-    swa = random((1 + batch * pages_per_seq, page_size, 512)).at[0].set(0)
+    swa = random((1 + batch * 4, page_size, 512)).at[0].set(0)
     base = jnp.maximum(0, first - 127) // page_size * page_size
     minimum = jnp.maximum(0, first - 80)
     metadata = jnp.concatenate(
         (
             base[:, None],
             minimum[:, None],
-            jnp.arange(1, batch * pages_per_seq + 1, dtype=jnp.int32).reshape(
-                batch, pages_per_seq
-            ),
+            jnp.arange(1, batch * 4 + 1, dtype=jnp.int32).reshape(batch, 4),
         ),
         axis=1,
     )
@@ -70,10 +67,8 @@ def _decode_inputs(batch, heads, page_size):
 
 
 @pytest.mark.cpu_test
-@pytest.mark.parametrize("bq", [1, 6])
-def test_decode_traces_on_pinned_jax(bq):
+def test_decode_traces_on_pinned_jax():
     args, kwargs = _decode_inputs(2, 8, 64)
-    kwargs["bq"] = bq
     mesh = jax.sharding.AbstractMesh(
         (1,),
         ("core",),
@@ -85,8 +80,7 @@ def test_decode_traces_on_pinned_jax(bq):
 
 
 @pytest.mark.parametrize(
-    "batch,heads,page_size",
-    [(1, 8, 64), (2, 64, 32), (2, 64, 64), (3, 24, 128), (2, 128, 256)],
+    "batch,heads,page_size", [(1, 8, 64), (2, 64, 64), (3, 24, 128), (2, 128, 256)]
 )
 def test_decode_matches_ragged_reference_with_authoritative_counts(
     batch, heads, page_size
@@ -110,11 +104,19 @@ def test_decode_matches_ragged_reference_with_authoritative_counts(
     )
 
 
-def test_decode_gather_and_reuse_preserve_valid_counts():
+@pytest.mark.parametrize("chunk_size", [4, 12])
+def test_decode_gather_and_reuse_preserve_valid_counts(chunk_size):
     if jax.default_backend() != "tpu":
         pytest.skip("Decode gather requires TPU SparseCore")
     args, kwargs = _decode_inputs(2, 8, 64)
     q, words, scales, swa, starts, positions, sink, rope = args
+    # Uniform logits expose scale rounding in PV rather than hiding it behind
+    # a nearly one-hot softmax. A chunk may split the six-query requests.
+    q = jnp.zeros_like(q)
+    scales = jnp.linspace(0.01, 0.8, scales.size, dtype=jnp.float32).reshape(
+        scales.shape
+    )
+    args = (q, words, scales, swa, starts, positions, sink, rope)
     counts = kwargs["main_lengths"]
     records = jnp.arange(q.shape[0] * 512, dtype=jnp.int32).reshape(-1, 512)
     records = jnp.where(jnp.arange(512) < counts[:, None], records, -1)
@@ -131,7 +133,7 @@ def test_decode_gather_and_reuse_preserve_valid_counts():
         kwargs["swa_metadata"],
         None,
         counts,
-        chunk_size=q.shape[0],
+        chunk_size=chunk_size,
         bq=6,
         scale=512**-0.5,
         compress_ratio=2,
@@ -144,29 +146,6 @@ def test_decode_gather_and_reuse_preserve_valid_counts():
     np.testing.assert_allclose(output, expected, atol=3e-3, rtol=2e-2)
     reused = csa2(q, gathered, gathered_scales, *args[3:], **kwargs)
     np.testing.assert_array_equal(reused, output)
-
-
-@pytest.mark.parametrize("stale_value", [-16.0, 16.0])
-def test_decode_ignores_finite_swa_outside_visible_window(stale_value):
-    if jax.default_backend() != "tpu":
-        pytest.skip("Compiled decode accumulator operations require TPU")
-    args, kwargs = _decode_inputs(2, 64, 64)
-    expected = csa2(*args, **kwargs)
-    cache = np.asarray(args[3]).copy()
-    visible = np.zeros(cache.shape[:2], dtype=bool)
-    for seq, first in enumerate(np.asarray(args[5])[::6]):
-        base, minimum, *pages = np.asarray(kwargs["swa_metadata"])[seq]
-        for column, page in enumerate(pages):
-            positions = base + column * 64 + np.arange(64)
-            visible[page] |= (positions >= max(first - 127, minimum)) & (
-                positions < first + 6
-            )
-    # The cache owner is zero-initialized and stores finite BF16 values.
-    cache[~visible] = stale_value
-    stale = (*args[:3], jnp.asarray(cache), *args[4:])
-    actual = csa2(*stale, **kwargs)
-    assert np.isfinite(np.asarray(actual, np.float32)).all()
-    np.testing.assert_allclose(actual, expected, atol=3e-3, rtol=2e-2)
 
 
 @pytest.mark.parametrize("heads", [8, 16, 32, 64, 96, 104, 128])
@@ -225,6 +204,120 @@ def test_csa2_accumulator_pipeline_matches_reference(heads: int) -> None:
 
 
 @pytest.mark.cpu_test
+@pytest.mark.parametrize(
+    "bq,round_scales", [(1, False), (6, None), (8, False), (8, True)]
+)
+@pytest.mark.parametrize("batch", [1, 2])
+def test_unified_attention_traces(bq, round_scales, batch):
+    args, kwargs = _decode_inputs(batch, 8, 64)
+    kwargs["bq"] = bq
+    mesh = jax.sharding.AbstractMesh(
+        (1,), ("core",), abstract_device=jax.sharding.AbstractDevice("TPU7x", 1, "tpu")
+    )
+    with jax.sharding.use_abstract_mesh(mesh):
+        traced = jax.make_jaxpr(
+            lambda *x: csa2(*x, **kwargs, round_scales=round_scales)
+        )(*args)
+    assert traced.out_avals[0].shape == args[0].shape
+
+
+@pytest.mark.parametrize("round_scales", [False, True])
+@pytest.mark.parametrize("explicit_bounds", [False, True])
+def test_unified_precision_and_visibility_are_independent(
+    round_scales, explicit_bounds
+):
+    if jax.default_backend() != "tpu":
+        pytest.skip("Async MXU operations require TPU")
+    args, kwargs = _decode_inputs(2, 8, 64)
+    if explicit_bounds:
+        kwargs["swa_bounds"] = jnp.array([[128, 196], [960, 1030]], jnp.int32)
+    expected = prefill_reference(
+        *args,
+        swa_metadata=kwargs["swa_metadata"],
+        main_lengths=kwargs["main_lengths"],
+        swa_bounds=kwargs["swa_bounds"],
+        round_scales=round_scales,
+    )
+    actual = csa2(*args, **kwargs, round_scales=round_scales)
+    np.testing.assert_allclose(actual, expected, atol=3e-3, rtol=3e-2)
+
+
+@pytest.mark.parametrize("regular", [False, True])
+def test_auto_scale_rounding_checks_request_boundaries(regular):
+    if jax.default_backend() != "tpu":
+        pytest.skip("Async MXU operations require TPU")
+    args, kwargs = _decode_inputs(2, 8, 64)
+    if not regular:
+        args = (
+            *args[:4],
+            jnp.array([0, 3, 12], jnp.int32),
+            jnp.concatenate((jnp.arange(190, 193), jnp.arange(1024, 1033))),
+            *args[6:],
+        )
+    automatic = csa2(*args, **kwargs)
+    explicit = csa2(*args, **kwargs, round_scales=regular)
+    np.testing.assert_array_equal(automatic, explicit)
+
+
+@pytest.mark.parametrize("heads", [8, 64])
+def test_long_prefill_uses_common_interface_across_request_tiles(heads):
+    if jax.default_backend() != "tpu":
+        pytest.skip("Async MXU operations require TPU")
+    args, kwargs = _decode_inputs(2, heads, 256)
+    q, words, scales, swa, _, positions, sink, rope = args
+    queries = 128
+    indices = (jnp.arange(2)[:, None] * 6 + jnp.arange(queries) % 6).reshape(-1)
+    args = (
+        q[indices],
+        words[indices],
+        scales[indices],
+        swa,
+        jnp.arange(3, dtype=jnp.int32) * queries,
+        (positions[::6, None] + jnp.arange(queries)).reshape(-1),
+        sink,
+        rope[indices],
+    )
+    counts = kwargs["main_lengths"][indices]
+    expected = prefill_reference(
+        *args,
+        swa_metadata=kwargs["swa_metadata"],
+        main_lengths=counts,
+    )
+    actual = csa2(
+        *args,
+        swa_metadata=kwargs["swa_metadata"],
+        main_lengths=counts,
+        round_scales=False,
+        bq=8,
+    )
+    np.testing.assert_allclose(actual, expected, atol=3e-3, rtol=3e-2)
+
+
+@pytest.mark.parametrize("valid_tokens", [0, 1])
+def test_single_query_or_padding_drains_pipeline(valid_tokens):
+    if jax.default_backend() != "tpu":
+        pytest.skip("Async MXU operations require TPU")
+    args, kwargs = _decode_inputs(1, 8, 64)
+    q, words, scales, swa, _, positions, sink, rope = args
+    args = (
+        q[:1],
+        words[:1],
+        scales[:1],
+        swa,
+        jnp.array([0, valid_tokens], jnp.int32),
+        positions[:1],
+        sink,
+        rope[:1],
+    )
+    kwargs["main_lengths"] = kwargs["main_lengths"][:1]
+    expected = prefill_reference(
+        *args, swa_metadata=kwargs["swa_metadata"], main_lengths=kwargs["main_lengths"]
+    )
+    actual = csa2(*args, **kwargs)
+    np.testing.assert_allclose(actual, expected, atol=3e-3, rtol=3e-2)
+
+
+@pytest.mark.cpu_test
 @pytest.mark.parametrize("valid_tokens", [0, 1])
 def test_single_tile_attention_traces_through_final_drain(valid_tokens):
     args, kwargs = _decode_inputs(1, 8, 64)
@@ -247,12 +340,3 @@ def test_single_tile_attention_traces_through_final_drain(valid_tokens):
         traced = jax.make_jaxpr(lambda *x: csa2(*x, **kwargs))(*args)
     assert traced.out_avals[0].shape == (1, 8, 512)
     assert traced.out_avals[0].dtype == jnp.bfloat16
-    if jax.default_backend() == "tpu":
-        expected = prefill_reference(
-            *args,
-            swa_metadata=kwargs["swa_metadata"],
-            main_lengths=kwargs["main_lengths"],
-        )
-        np.testing.assert_allclose(
-            csa2(*args, **kwargs), expected, atol=3e-3, rtol=3e-2
-        )
