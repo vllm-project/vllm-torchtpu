@@ -263,6 +263,7 @@ def fused_ep_moe_push(
     matmul_scale_repeat=False,
     exchange_row_gather=False,
     bf16_sort_counts=False,
+    slim_prepush_barrier=False,
     expert_slot=None,
     expert_load=None,
 ):
@@ -289,10 +290,11 @@ def fused_ep_moe_push(
     with `_repeat_bits` instead of jnp.repeat, and `exchange_row_gather`
     (with `tc_exchange`) has the routing-exchange kernel also copy the
     expert-sorted activation rows, while it waits on its peers, instead of a
-    TensorCore gather after it, and `bf16_sort_counts` finds the
-    expert-sorted token order with two single-pass bf16 matmuls
-    (host._sorted_tokens_by_count). The caller (layers/adapter/fused_moe_ep.py)
-    reads all eleven from envs.
+    TensorCore gather after it, `bf16_sort_counts` finds the expert-sorted
+    token order with two single-pass bf16 matmuls
+    (host._sorted_tokens_by_count), and `slim_prepush_barrier` keeps the run
+    tables out of the pre-push barrier. The caller
+    (layers/adapter/fused_moe_ep.py) reads all twelve from envs.
 
     `expert_slot` [experts, R] i32 and `expert_load` [e_total] i32 (both
     replicated, optional) are the expert-layout operands dynamic EPLB
@@ -664,6 +666,9 @@ def fused_ep_moe_push(
             ).astype(jnp.int32)
         # Compute the pre-push operands before the routing plan, so XLA
         # launches the SparseCore dispatch ahead of it and the two overlap.
+        # The plan reads pairs_g, so it follows the barrier either way; the
+        # run tables only add a layout copy at it (`slim_prepush_barrier`).
+        barriered_runs = () if slim_prepush_barrier else tuple(runs)
         (
             q_sorted,
             seg,
@@ -672,10 +677,13 @@ def fused_ep_moe_push(
             visit,
             pairs_g,
             scale_bits_g,
-            *runs,
+            *barriered_runs,
         ) = lax.optimization_barrier(
-            (q_sorted, seg, counts_sc, dmeta, visit, pairs_g, scale_bits_g, *runs)
+            (q_sorted, seg, counts_sc, dmeta, visit, pairs_g, scale_bits_g)
+            + barriered_runs
         )
+        if not slim_prepush_barrier:
+            runs = barriered_runs
         slab = sc_dispatch_chunk_2core(
             q_sorted,
             seg,
@@ -932,6 +940,7 @@ def fused_ep_moe_push(
         bool(matmul_scale_repeat),
         exchange_row_gather,
         bool(bf16_sort_counts),
+        bool(slim_prepush_barrier),
     )
     sm = _LAYER_SM_CACHE.get(key)
     if sm is None:

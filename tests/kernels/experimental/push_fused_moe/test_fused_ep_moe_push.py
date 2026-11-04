@@ -456,6 +456,7 @@ FRONT_SWITCHES = (
     "matmul_scale_repeat",
     "exchange_row_gather",
     "bf16_sort_counts",
+    "slim_prepush_barrier",
 )
 
 
