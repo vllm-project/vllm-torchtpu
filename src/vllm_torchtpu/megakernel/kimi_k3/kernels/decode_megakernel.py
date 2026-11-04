@@ -4633,7 +4633,7 @@ def kda(
                                 slice(first, first + chunk), history_chunk, state_chunk
                             )
                             state_stream.release(index)
-                if state_stream is not None and not rolled and batch_size != 32:
+                if state_stream is not None and not rolled and attended_out is not None:
                     state_stream.finish()
                 attended = attended_vmem[...]
         else:
@@ -4724,7 +4724,7 @@ def kda(
                             )
                         attended_vmem[base : base + chunk] = jnp.concatenate(rows, axis=0)
                         state_stream.release(index)
-                if batch_size != 32:  # B32 drains after the output work (below)
+                if attended_out is not None:  # B32/B64 DP1 drains after the output work (below)
                     state_stream.finish()
                 attended = attended_vmem[...]
         _phase_end(kda_scope.pop())
@@ -4804,7 +4804,7 @@ def kda(
             else ()
         ),
     )
-    if state_stream is not None and not rolled and batch_size == 32:
+    if state_stream is not None and not rolled and attended_out is None:
         state_stream.finish()
 
 
@@ -5882,18 +5882,19 @@ def _dense_scatter_rows(partial, output, local, hosts, sends, recvs, owners):
     """Reduce the dense layer directly to its token owners.
 
     Preserve the original BF16 wire format, local eight-rank sum and four-host
-    sum, including their rounding points. Each owner consumes eight rows per
-    round instead of every rank reducing the entire batch and discarding most
-    rows. Pack each owner's source once; the two ranks in each owner pair send
-    and receive identical logical row ranges.
+    sum, including their rounding points. Each owner consumes up to eight rows
+    per round instead of every rank reducing the entire batch and discarding
+    most rows. Pack each owner's source once; the two ranks in each owner pair
+    send and receive identical logical row ranges.
     """
     rank = jax.lax.axis_index("tp")
     lane, host = rank % 8, rank // 8
     owned_rows = partial.shape[0] // owners
+    chunk = min(8, owned_rows)
     hidden = partial.shape[1]
-    wire_rows = 8 * hidden // 128
+    wire_rows = chunk * hidden // 128
     payload = wire_rows // 2
-    assert owned_rows % 8 == 0 and 8 % owners == 0
+    assert owned_rows % chunk == 0 and 8 % owners == 0 and payload % 8 == 0
     assert payload <= local.shape[1] and payload <= hosts.shape[1]
 
     def reduce_owned(wires):
@@ -5907,14 +5908,14 @@ def _dense_scatter_rows(partial, output, local, hosts, sends, recvs, owners):
             unpacked = tpu.bitcast(
                 jax.lax.bitcast_convert_type(value, jnp.uint32), jnp.bfloat16
             ).astype(jnp.float32)
-            return jnp.sum(unpacked, axis=0).reshape(8, hidden)
+            return jnp.sum(unpacked, axis=0).reshape(chunk, hidden)
 
-        for first in range(0, owned_rows, 8):
+        for first in range(0, owned_rows, chunk):
             if first:
                 collectives32.barrier()
             for owner in range(owners):
                 start = owner * owned_rows + first
-                wires[owner] = encode(partial[start : start + 8])
+                wires[owner] = encode(partial[start : start + chunk])
             local[lane, :payload] = wires[lane // (8 // owners)]
             copies = []
             for offset in range(7, 0, -1):
@@ -5946,7 +5947,7 @@ def _dense_scatter_rows(partial, output, local, hosts, sends, recvs, owners):
                 copies.append(copy)
             for copy in copies:
                 copy.wait()
-            output[first : first + 8] = decode(hosts[:, :payload]).astype(jnp.bfloat16)
+            output[first : first + chunk] = decode(hosts[:, :payload]).astype(jnp.bfloat16)
 
     pl.run_scoped(reduce_owned, tpu.VMEM((owners, payload, 128), jnp.float32))
 
@@ -6740,8 +6741,8 @@ SHARD_ROUTING = _config().shard_routing
 
 def kda_inplace_writes(*, batch_size, attention_dp, sequence_rows, slot_reads, state_row):
     """Whether the stack writes KDA post-states into their bank slots itself
-    (KernelConfig.e2_kda_inplace: DP2 plain decode, streamed states, slot reads)."""
-    return (_config().kda_inplace_writes and slot_reads and attention_dp == 2 and batch_size > 16
+    (KernelConfig.e2_kda_inplace: DP1/DP2 plain decode, streamed states, slot reads)."""
+    return (_config().kda_inplace_writes and slot_reads and attention_dp in (1, 2) and batch_size > 16
             and sequence_rows == 1 and state_row is None)
 
 
@@ -8417,6 +8418,7 @@ def stack(
                             chunks=batch_size // kda_row_chunk,
                             slots=slots_ref if slot_reads else None,
                             sequence_rows=sequence_rows,
+                            inplace_period=kda_inplace_period,
                         )
                         state_stream.prime()
                         kda(
@@ -8945,8 +8947,11 @@ def stack(
                     after_experts=after_experts,
                     after_routing_scores=after_routing_scores,
                     overlap_router_latent=(attention_dp == 2 and batch_size == 128 and sequence_rows == 1),
-                    # Verify steps of 64 rows overlap it too; at 128 verify rows it is slower.
-                    overlap_shared_reduction=(attention_dp == 2 and (batch_size == 64 or batch_size == 128 and sequence_rows == 1)),
+                    # B16..B64 overlap it at any attention DP; at 128 verify rows it is slower.
+                    overlap_shared_reduction=(
+                        batch_size in (16, 32, 64)
+                        or (attention_dp == 2 and batch_size == 128 and sequence_rows == 1)
+                    ),
                     token_scatter_output=moe_token_scatter_output,
                     routed_reduce_scatter=moe_routed_reduce_scatter,
                     token_pipeline=moe_token_pipeline,
@@ -9107,8 +9112,8 @@ def stack(
                         communication_workspace.receive_semaphores,
                     )
 
-                if (moe_token_scatter_output and attention_dp == 2
-                        and sp_owners == 4 and batch_size in (64, 128) and sequence_rows == 1):
+                if (moe_token_scatter_output and sp_owners == 4 and sequence_rows == 1
+                        and batch_size in (16, 32, 64, 128)):
                     _dense_scatter_rows(accumulator,owned_rows_vmem,
                         communication_workspace.shared_local_reduction_vmem,
                         communication_workspace.shared_host_reduction_vmem,
