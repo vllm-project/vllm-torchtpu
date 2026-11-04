@@ -82,6 +82,14 @@ class OProjectionTest(parameterized.TestCase):
             num_groups=8,
             lora_rank=1024,
         ),
+        dict(  # Several sub-tiles per grid step and several token tiles.
+            testcase_name="dsv4_flash_sub_tiles",
+            num_tokens=256,
+            num_groups=8,
+            lora_rank=1024,
+            tile_t=128,
+            sub_t=32,
+        ),
         dict(  # The benchmarked shape: activations [1024, 128, 512].
             testcase_name="dsv4_pro",
             num_tokens=1024,

@@ -160,41 +160,65 @@ def gather_cos_sin(
     )(positions, cos_sin_cache)
 
 
-def _rope_heads(x: jax.Array, cos_sin: jax.Array, *, head_dim: int) -> jax.Array:
-    """apply RoPE to the last rope dim of head dim of ``x``."""
+def _load_head_pair(
+    x_ref: jax.Ref, *, t0: int, sub_t: int, pair: int
+) -> tuple[jax.Array, jax.Array]:
+    """Heads ``2 * pair`` and ``2 * pair + 1`` of one lane chunk, token-major f32.
+
+    ``x_ref`` is a ``(tile_t, H, LANE)`` bf16 lane chunk. Its u32 view holds a
+    token's heads ``(2p, 2p + 1)`` in one word row, so one sublane-strided load
+    puts tokens on sublanes and the heads never pass through a sublane-to-lane
+    relayout. The even head is the word's low half; each half widens to f32
+    exactly by a shift or a mask.
+    """
+    pairs = x_ref.shape[1] // 2
+    words = x_ref.bitcast(jnp.uint32).reshape(-1, LANE)
+    w = words[pl.ds(t0 * pairs + pair, sub_t, stride=pairs), :]
+    first = pltpu.bitcast(w << 16, jnp.float32)
+    second = pltpu.bitcast(w & jnp.uint32(0xFFFF0000), jnp.float32)
+    return first, second
+
+
+def _rope_tail(tail: jax.Array, cos_sin: jax.Array) -> jax.Array:
+    """Apply RoPE to one head's last ``LANE`` lanes, ``tail`` f32 ``(t, LANE)``."""
     cos = cos_sin[:, :LANE]
     sin = cos_sin[:, LANE:]
-    lo = head_dim - LANE
-    tail = x[:, :, lo:].astype(jnp.float32)
-    roped = tail * cos[:, None, :] + _rotate_gptj(tail) * sin[:, None, :]
-    return jnp.concatenate([x[:, :, :lo], roped.astype(x.dtype)], axis=-1)
+    return tail * cos + _rotate_gptj(tail) * sin
 
 
 def _kernel(
-    # inputs
-    x_ref: jax.Ref,  # VMEM (tile_t, H, head_dim) bf16
-    w_ref: jax.Ref,  # VMEM (D, tile_r) fp8
-    scale_ref: jax.Ref,  # VMEM (1, tile_r) f32
-    cos_sin_ref: jax.Ref,  # VMEM (tile_t, 2 * LANE) f32
-    # output
-    out_ref: jax.Ref,  # VMEM (tile_t, tile_r) out_dtype
-    *,
+    *refs: jax.Ref,
     tile_t: int,
     num_sub_t: int,
     quantize_activations: bool,
-    head_dim: int,
 ) -> None:
+    # Inputs, all VMEM: one (tile_t, H, LANE) bf16 x block per LANE chunk of
+    # head_dim, w (D, tile_r) fp8, scale (1, tile_r) f32 and cos_sin
+    # (tile_t, 2 * LANE) f32. Output: out (tile_t, tile_r) in x's dtype.
+    *x_refs, w_ref, scale_ref, cos_sin_ref, out_ref = refs
     rhs = w_ref[...]
     scale = scale_ref[...]
-    cos_sin = cos_sin_ref[...]
     sub_t = tile_t // num_sub_t
-    out_dtype = x_ref.dtype
+    num_heads = x_refs[0].shape[1]
+    out_dtype = x_refs[0].dtype
     for s in range(num_sub_t):
         # Subchunk the tile to allow more Instruction level parallelism
         # opportunities to be exploited by the LLO compiler.
-        rows = slice(s * sub_t, (s + 1) * sub_t)
-        x = _rope_heads(x_ref[rows], cos_sin[rows], head_dim=head_dim)
-        x = x.reshape(sub_t, -1)
+        t0 = s * sub_t
+        rows = pl.ds(t0, sub_t)
+        cos_sin = cos_sin_ref[rows, :]
+        heads = [[] for _ in range(num_heads)]
+        for c, x_ref in enumerate(x_refs):
+            for pair in range(num_heads // 2):
+                for h, chunk in zip(
+                    (2 * pair, 2 * pair + 1),
+                    _load_head_pair(x_ref, t0=t0, sub_t=sub_t, pair=pair),
+                ):
+                    if c == len(x_refs) - 1:
+                        chunk = _rope_tail(chunk, cos_sin)
+                    heads[h].append(chunk.astype(out_dtype))
+        # Lane-aligned: the heads' chunks land in lanes without data movement.
+        x = jnp.concatenate([chunk for chunks in heads for chunk in chunks], axis=1)
         inv = None
         if quantize_activations:
             amax = jnp.max(jnp.abs(x), axis=1, keepdims=True)
@@ -290,6 +314,7 @@ def wo_a_projection(
     assert tile_t % sub_t == 0
     num_t_tiles = num_tokens // tile_t
     num_r_tiles = lora_rank // tile_r
+    num_lane_chunks = head_dim // LANE
 
     return pl.pallas_call(
         functools.partial(
@@ -297,14 +322,18 @@ def wo_a_projection(
             tile_t=tile_t,
             num_sub_t=tile_t // sub_t,
             quantize_activations=quantize_activations,
-            head_dim=head_dim,
         ),
         out_shape=jax.ShapeDtypeStruct((num_tokens, out_features), x.dtype),
         grid=(num_groups, num_t_tiles, num_r_tiles),
         in_specs=[
-            # x: one group's heads, [t, g, 0] over [T, G * H, head_dim].
-            pl.BlockSpec(
-                (tile_t, heads_per_group, head_dim), lambda g, t, r: (t, g, 0)
+            # x: one group's heads, [t, g, c] over [T, G * H, head_dim], one
+            # LANE-wide chunk c per operand: strided loads need a LANE-wide ref.
+            *(
+                pl.BlockSpec(
+                    (tile_t, heads_per_group, LANE),
+                    functools.partial(lambda g, t, r, c: (t, g, c), c=c),
+                )
+                for c in range(num_lane_chunks)
             ),
             # wo_a: the whole reduction, column block g * R + r * tile_r.
             pl.BlockSpec((reduction, tile_r), lambda g, t, r: (0, g * num_r_tiles + r)),
@@ -321,7 +350,7 @@ def wo_a_projection(
             disable_bounds_checks=True,
         ),
         name=name,
-    )(x, wo_a, wo_a_scale.reshape(1, out_features), cos_sin)
+    )(*[x] * num_lane_chunks, wo_a, wo_a_scale.reshape(1, out_features), cos_sin)
 
 
 @functools.partial(
