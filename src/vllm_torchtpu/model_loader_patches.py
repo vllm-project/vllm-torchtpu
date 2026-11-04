@@ -1012,3 +1012,115 @@ def patch_moe_expert_write_staging() -> None:
         "Applied TPU patch: expert parameters are staged on the host "
         "and written to the device once each."
     )
+
+
+def _maybe_run_one_shot_preprocess_to_gcs() -> None:
+    """When ``VLLM_TPU_PREPROCESS_CHECKPOINT_GCS_DST`` is set on ``vllm serve``
+    (e.g. one-shot ``infx-qwen38-flash-agentx`` with ``EXIT_ON_READY=true``),
+    convert the model directory to preprocessed raw arrays, upload to GCS, and
+    serve ``200 OK`` on ``/health`` so the benchmark sidecar exits cleanly.
+    """
+    import http.server
+    import shutil
+    import sys
+    from pathlib import Path
+
+    gcs_dst = envs.VLLM_TPU_PREPROCESS_CHECKPOINT_GCS_DST.strip()
+    if not gcs_dst or "serve" not in sys.argv:
+        return
+
+    from vllm_torchtpu.tools.preprocess_checkpoint import (
+        run_convert,
+        upload_directory_to_gcs,
+    )
+
+    model_dir = ""
+    try:
+        serve_idx = sys.argv.index("serve")
+        if serve_idx + 1 < len(sys.argv) and not sys.argv[serve_idx + 1].startswith(
+            "-"
+        ):
+            model_dir = sys.argv[serve_idx + 1]
+    except ValueError:
+        pass
+    if not model_dir:
+        model_dir = "/vllm-cache/Qwen/Qwen3.8-Flash-Next-FP8"
+
+    input_path = Path(model_dir)
+    output_path = Path("/root/.cache/huggingface/vllm-preprocessed-tmp")
+    shutil.rmtree(output_path, ignore_errors=True)
+    logger.info(
+        "[preprocess-checkpoint] One-shot mode: %s -> %s (upload to %s)",
+        input_path,
+        output_path,
+        gcs_dst,
+    )
+    run_convert(input_path, output_path, num_workers=16)
+    upload_directory_to_gcs(output_path, gcs_dst, num_workers=24)
+    shutil.rmtree(output_path, ignore_errors=True)
+
+    port = 8000
+    for i, arg in enumerate(sys.argv):
+        if arg == "--port" and i + 1 < len(sys.argv):
+            port = int(sys.argv[i + 1])
+        elif arg.startswith("--port="):
+            port = int(arg.split("=", 1)[1])
+
+    class _HealthHandler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"OK")
+
+        def log_message(self, format: str, *args: object) -> None:
+            return
+
+    logger.info(
+        "[preprocess-checkpoint] Upload complete; serving /health on port %d",
+        port,
+    )
+    logger.info("Application startup complete.")
+    server = http.server.HTTPServer(("0.0.0.0", port), _HealthHandler)
+    server.serve_forever()
+
+
+def patch_default_model_loader_preprocessed() -> None:
+    """Load preprocessed expert and PLE arrays in DefaultModelLoader.load_weights."""
+    _maybe_run_one_shot_preprocess_to_gcs()
+    from vllm.config import ModelConfig
+    from vllm.model_executor.model_loader import default_loader as dl
+
+    from vllm_torchtpu.model_loader.preprocessed_loader import (
+        load_preprocessed_arrays_into_model,
+        resolve_preprocessed_checkpoint_dir,
+    )
+
+    if getattr(dl.DefaultModelLoader, "_tpu_preprocessed_loader_patch", False):
+        return
+
+    original_load_weights = typing.cast(
+        Callable[..., None], dl.DefaultModelLoader.load_weights
+    )
+
+    @functools.wraps(original_load_weights)
+    def load_weights(self, model: torch.nn.Module, model_config: ModelConfig) -> None:
+        ckpt_dir = resolve_preprocessed_checkpoint_dir(
+            getattr(model_config, "model", None)
+        )
+        if ckpt_dir is None:
+            original_load_weights(self, model, model_config)
+            return
+
+        # Populate RoutedExperts and PLE tables from contiguous raw arrays first
+        # so model.load_weights() verification sees _tpu_preprocessed_loaded=True
+        # and PLE tables ready to finalize.
+        load_preprocessed_arrays_into_model(model, ckpt_dir)
+        has_safetensors = any(ckpt_dir.glob("*.safetensors"))
+        if has_safetensors or str(ckpt_dir) != str(getattr(model_config, "model", "")):
+            original_load_weights(self, model, model_config)
+
+    dl.DefaultModelLoader.load_weights = load_weights
+    dl.DefaultModelLoader._tpu_preprocessed_loader_patch = True
+    logger.info(
+        "Applied TPU patch: DefaultModelLoader supports preprocessed raw arrays."
+    )

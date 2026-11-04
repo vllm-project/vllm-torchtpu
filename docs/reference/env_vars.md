@@ -69,6 +69,7 @@ All environment variables read by `vllm-torchtpu` are declared and validated in 
 | `MOE_REQUANTIZE_WEIGHT_DTYPE` | `"float8_e4m3fn"` | Target weight dtype for load-time MoE expert weight requantization (e.g., `"fp4"`). |
 | `MOE_REQUANTIZE_BLOCK_SIZE` | `None` | Target block size for load-time MoE expert weight requantization. |
 | `VLLM_TPU_MXFP4_DEVICE_DEQUANT` | `True` | Performs MXFP4 weight dequantization on TPU device during load rather than on CPU. |
+| `VLLM_TPU_PREPROCESSED_IO_THREADS` | `8` | Number of I/O threads per rank used by `PreprocessedModelLoader` (`--load-format preprocessed` or auto-detected via `vllm_preprocess_manifest.json`) to read pre-stacked MoE expert and PLE array slices in parallel. |
 
 ---
 

@@ -127,6 +127,10 @@ PATCHES = (
         "vllm_torchtpu.model_loader_patches:patch_default_model_loader_page_cache",
         _ACTIVE,
     ),
+    Patch(
+        "vllm_torchtpu.model_loader_patches:patch_default_model_loader_preprocessed",
+        _ACTIVE,
+    ),
     Patch("vllm_torchtpu.model_loader_patches:patch_moe_expert_write_staging", _ACTIVE),
     Patch("vllm_torchtpu:_patch_vllm_vocab_parallel_embedding", _ACTIVE),
     Patch(

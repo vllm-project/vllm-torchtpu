@@ -996,44 +996,68 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
         self._use_adaptive_fused_moe = envs.MOE_FUSED_EP_KERNEL_IMPL == "adaptive"
         activation_str = self._set_tpu_activation(layer)
 
-        is_fp8_serialized = self.quant_config.is_checkpoint_fp8_serialized
-        if is_fp8_serialized:
-            moe_block_shape = getattr(self, "moe_block_shape", self.weight_block_size)
-            weight_block_size = (
-                cast("tuple[int, int]", tuple(moe_block_shape))
-                if moe_block_shape is not None
-                else None
+        if getattr(layer, "_tpu_preprocessed_loaded", False):
+            # Weights and 4D scales were already dequantized, requantized,
+            # transposed to K-major [E, K, N], and uploaded to device by the
+            # preprocessed checkpoint loader.
+            _, _, requant_block_size = _get_moe_quant_config(
+                "[MoE preprocessed]: using pre-quantized K-major MoE weights"
             )
-            (w13, w13_scale, w2, w2_scale, requant_dtype_name, requant_block_size) = (
-                _process_fp8_moe_weights(
+        else:
+            is_fp8_serialized = self.quant_config.is_checkpoint_fp8_serialized
+            if is_fp8_serialized:
+                moe_block_shape = getattr(
+                    self, "moe_block_shape", self.weight_block_size
+                )
+                weight_block_size = (
+                    cast("tuple[int, int]", tuple(moe_block_shape))
+                    if moe_block_shape is not None
+                    else None
+                )
+                (
+                    w13,
+                    w13_scale,
+                    w2,
+                    w2_scale,
+                    requant_dtype_name,
+                    requant_block_size,
+                ) = _process_fp8_moe_weights(
                     layer,
                     weight_block_size=weight_block_size,
                     activation=activation_str,
                 )
-            )
-        else:
-            (w13, w13_scale, w2, w2_scale, requant_dtype_name, requant_block_size) = (
-                _quantize_bf16_moe_weights(
+            else:
+                (
+                    w13,
+                    w13_scale,
+                    w2,
+                    w2_scale,
+                    requant_dtype_name,
+                    requant_block_size,
+                ) = _quantize_bf16_moe_weights(
                     layer,
                     activation=activation_str,
                 )
+
+            # Remove placeholder checkpoint scales before assigning runtime inverse
+            # scales to prevent nn.Module parameter re-assignment errors and free
+            # state dict memory.
+            # Note: RoutedExperts universally names its parameters w13 (gate+up) and
+            # w2 (down); hasattr is True for serialized FP8 checkpoints and False for
+            # unquantized BF16.
+            if hasattr(layer, f"w13_{self.weight_scale_name}"):
+                delattr(layer, f"w13_{self.weight_scale_name}")
+            if hasattr(layer, f"w2_{self.weight_scale_name}"):
+                delattr(layer, f"w2_{self.weight_scale_name}")
+
+            layer.w13_weight = torch.nn.Parameter(w13, requires_grad=False)
+            layer.w2_weight = torch.nn.Parameter(w2, requires_grad=False)
+            layer.w13_weight_scale_inv = torch.nn.Parameter(
+                w13_scale, requires_grad=False
             )
-
-        # Remove placeholder checkpoint scales before assigning runtime inverse scales
-        # to prevent nn.Module parameter re-assignment errors and free
-        # state dict memory.
-        # Note: RoutedExperts universally names its parameters w13 (gate+up) and
-        # w2 (down); hasattr is True for serialized FP8 checkpoints and False for
-        # unquantized BF16.
-        if hasattr(layer, f"w13_{self.weight_scale_name}"):
-            delattr(layer, f"w13_{self.weight_scale_name}")
-        if hasattr(layer, f"w2_{self.weight_scale_name}"):
-            delattr(layer, f"w2_{self.weight_scale_name}")
-
-        layer.w13_weight = torch.nn.Parameter(w13, requires_grad=False)
-        layer.w2_weight = torch.nn.Parameter(w2, requires_grad=False)
-        layer.w13_weight_scale_inv = torch.nn.Parameter(w13_scale, requires_grad=False)
-        layer.w2_weight_scale_inv = torch.nn.Parameter(w2_scale, requires_grad=False)
+            layer.w2_weight_scale_inv = torch.nn.Parameter(
+                w2_scale, requires_grad=False
+            )
 
         # Eagerly materialize weights to avoid OOM during vLLM memory probing.
         # Without this, lazy tensors accumulate and the profiling run OOMs.

@@ -206,6 +206,9 @@ if TYPE_CHECKING:
     VLLM_TPU_SRPT_MAX_CONSECUTIVE_HOLDS: int = 8
     VLLM_TPU_SRPT_ATTN_WORK_CAP: int = 0
     VLLM_TPU_SRPT_ATTN_TILE_TOKENS: int = 32
+    VLLM_TPU_PREPROCESSED_CHECKPOINT_DIR: str = ""
+    VLLM_TPU_ENABLE_PREPROCESSED_LOADER: bool = True
+    VLLM_TPU_PREPROCESS_CHECKPOINT_GCS_DST: str = ""
 
 
 def env_with_choices(
@@ -1251,6 +1254,23 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # tile).
     "VLLM_TPU_SRPT_ATTN_TILE_TOKENS": env_nonnegative_int(
         "VLLM_TPU_SRPT_ATTN_TILE_TOKENS", 32
+    ),
+    # Optional override directory containing preprocessed raw checkpoint arrays
+    # (experts/array_*, misc/array_*, and vllm_preprocess_manifest.json). When
+    # unset, DefaultModelLoader auto-detects whether model_config.model is a
+    # preprocessed checkpoint directory.
+    "VLLM_TPU_PREPROCESSED_CHECKPOINT_DIR": lambda: os.getenv(
+        "VLLM_TPU_PREPROCESSED_CHECKPOINT_DIR", ""
+    ),
+    # Enable fast-path loading from preprocessed raw checkpoint arrays.
+    "VLLM_TPU_ENABLE_PREPROCESSED_LOADER": env_bool(
+        "VLLM_TPU_ENABLE_PREPROCESSED_LOADER", True
+    ),
+    # Optional gs:// URI. When set on a vllm serve job (e.g. with
+    # EXIT_ON_READY=true in infx-qwen38-flash-agentx), converts MODEL_DIR into
+    # preprocessed raw arrays, uploads to this GCS URI, and serves /health.
+    "VLLM_TPU_PREPROCESS_CHECKPOINT_GCS_DST": lambda: os.getenv(
+        "VLLM_TPU_PREPROCESS_CHECKPOINT_GCS_DST", ""
     ),
 }
 
