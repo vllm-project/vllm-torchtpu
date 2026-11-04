@@ -744,6 +744,52 @@ def test_mla_weight_layout_is_restored_on_error(layout):
     torch.testing.assert_close(getattr(attention.kv_b_proj, parameter_name), weight)
 
 
+@pytest.mark.parametrize("with_scale", [False, True])
+def test_qrep_gather_replaces_the_parameter_upstream_registers(with_scale):
+    """Under qrep, upstream MLAAttention.process_weights_after_loading leaves
+    W_UK_T_dcp_qrep registered as a Parameter; the TPU gather must replace it
+    with one, since a module refuses a plain tensor under that name."""
+    attention = VllmMLAAttention.__new__(VllmMLAAttention)
+    torch.nn.Module.__init__(attention)
+    attention.dcp_q_replicate = True
+    w_uk_t = torch.arange(24, dtype=torch.float32).reshape(2, 3, 4)
+    attention.W_UK_T = torch.nn.Parameter(w_uk_t, requires_grad=False)
+    if with_scale:
+        attention.W_UK_T_scale = torch.nn.Parameter(
+            torch.ones(2, 1, 4), requires_grad=False
+        )
+    # What upstream's replace_parameter leaves behind.
+    attention.W_UK_T_dcp_qrep = torch.nn.Parameter(
+        torch.zeros(4, 3, 4), requires_grad=False
+    )
+    group = SimpleNamespace(
+        world_size=2, all_gather=lambda t, dim: torch.cat([t, t + 100], dim=dim)
+    )
+    with patch(
+        "vllm_torchtpu.layers.adapter.custom_ops.mla_attention_op.get_dcp_group",
+        return_value=group,
+    ):
+        attention._gather_dcp_qrep_weights()
+    assert isinstance(attention.W_UK_T_dcp_qrep, torch.nn.Parameter)
+    torch.testing.assert_close(
+        attention.W_UK_T_dcp_qrep, torch.cat([w_uk_t, w_uk_t + 100])
+    )
+    if with_scale:
+        assert isinstance(attention.W_UK_T_dcp_qrep_scale, torch.nn.Parameter)
+        assert attention.W_UK_T_dcp_qrep_scale.shape == (4, 1, 4)
+    else:
+        assert attention.W_UK_T_dcp_qrep_scale is None
+
+
+def test_no_qrep_leaves_no_replicated_weights():
+    attention = VllmMLAAttention.__new__(VllmMLAAttention)
+    torch.nn.Module.__init__(attention)
+    attention.dcp_q_replicate = False
+    attention._gather_dcp_qrep_weights()
+    assert attention.W_UK_T_dcp_qrep is None
+    assert attention.W_UK_T_dcp_qrep_scale is None
+
+
 def test_mla_flipped_projection_requires_weight():
     attention = VllmMLAAttention.__new__(VllmMLAAttention)
     torch.nn.Module.__init__(attention)
