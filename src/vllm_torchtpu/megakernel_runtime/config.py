@@ -320,18 +320,29 @@ def select_plugin(
     return cfg, (resolve_plugin_ref(cfg, hf_config) if cfg.enabled else None)
 
 
+def _is_package_or_parent(name: str | None, module: str) -> bool:
+    """Whether `name` is `module` itself or one of its parent packages."""
+    return name is not None and (module == name or module.startswith(name + "."))
+
+
 def missing_template(ref: PluginRef, hf_config: Any = None) -> str | None:
     """The log line when `ref` is a shorthand template whose module isn't
     installed (`None` otherwise). Shorthands are imported by string, so the
     runtime works without the model folders; then the megakernel stays off.
-    An explicit plugin reference that doesn't import is an error instead."""
+    An explicit plugin reference that doesn't import is an error instead.
+
+    `find_spec` imports the parent packages, so a `ModuleNotFoundError` from
+    a broken import inside one of them (a module other than the template
+    package or its parents) is re-raised rather than read as "not installed".
+    """
     if ref.shorthand is None:
         return None
     try:
         if importlib.util.find_spec(ref.module) is not None:
             return None
-    except ModuleNotFoundError:
-        pass
+    except ModuleNotFoundError as exc:
+        if not _is_package_or_parent(exc.name, ref.module):
+            raise
     archs = ", ".join(_hf_arch_candidates(hf_config)[:1]) or ref.shorthand
     return (
         f"Megakernel: no megakernel template for arch {archs} "

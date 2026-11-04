@@ -383,3 +383,26 @@ def test_missing_shorthand_template_is_named(
     with pytest.raises(MegakernelConfigError, match="failed to import"):
         cfg_mod.import_plugin(explicit)
     assert cfg_mod.missing_template(cfg_mod.PluginRef("json", shorthand="x")) is None
+
+
+def test_missing_template_reraises_a_broken_import_in_a_parent(
+    mod_dir: Path,
+) -> None:
+    """`find_spec` imports the parent packages: a missing module imported by
+    a parent is a real error, not "template not installed"."""
+    _write(mod_dir / "mk_broken_parent" / "__init__.py", "import mk_no_such_dep\n")
+    _write(mod_dir / "mk_broken_parent" / "megakernel" / "__init__.py", "")
+    ref = cfg_mod.PluginRef("mk_broken_parent.megakernel", shorthand="x")
+    importlib.invalidate_caches()
+    with pytest.raises(ModuleNotFoundError) as exc:
+        cfg_mod.missing_template(ref, _ARCH_HF)
+    assert exc.value.name == "mk_no_such_dep"
+    # A missing parent package (or the package itself) is "not installed".
+    for module in ("mk_no_such_parent.megakernel", "mk_broken_parent.missing"):
+        sys.modules.pop("mk_broken_parent", None)
+        _write(mod_dir / "mk_broken_parent" / "__init__.py", "")
+        importlib.invalidate_caches()
+        msg = cfg_mod.missing_template(
+            cfg_mod.PluginRef(module, shorthand="x"), _ARCH_HF
+        )
+        assert msg is not None and f"({module} is not installed)" in msg
