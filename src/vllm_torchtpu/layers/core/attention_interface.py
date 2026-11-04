@@ -1209,6 +1209,9 @@ def sparse_mla_attention_dcp(
             and num_local_tokens % chunk == 0
             and chunk % 8 == 0
             and (chunk % 128 == 0 or chunk == num_local_tokens)
+            # The kernel maps virtual pages with `% kv_cache_nope.shape[0]`;
+            # the KV write above uses `nope_spec.num_pages`. They must agree.
+            and kv_cache_nope.shape[0] == nope_spec.num_pages
         ):
             # One preparation kernel replaces the owner fix-up below, the kv_len
             # reduction, the index relayouts and the lse owner mask: a row
