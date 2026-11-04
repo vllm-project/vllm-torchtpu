@@ -223,6 +223,7 @@ def _build_op(
             early_row_gather=envs.MOE_FUSED_EP_PUSH_EARLY_ROW_GATHER,
             table_kernel=envs.MOE_FUSED_EP_PUSH_TABLE_KERNEL,
             exchange_tables=envs.MOE_FUSED_EP_PUSH_EXCHANGE_TABLES,
+            kernel_plan_tables=envs.MOE_FUSED_EP_PUSH_KERNEL_PLAN_TABLES,
             staging_slots=envs.MOE_FUSED_EP_PUSH_STAGING_SLOTS,
         )
 

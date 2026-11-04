@@ -97,6 +97,7 @@ if TYPE_CHECKING:
     MOE_FUSED_EP_PUSH_EARLY_ROW_GATHER: bool = False
     MOE_FUSED_EP_PUSH_TABLE_KERNEL: bool = False
     MOE_FUSED_EP_PUSH_EXCHANGE_TABLES: bool = False
+    MOE_FUSED_EP_PUSH_KERNEL_PLAN_TABLES: bool = False
     MOE_FUSED_EP_PUSH_STAGING_SLOTS: int = 0
     TPU_EXPERT_PLACEMENT: str = ""
     TPU_LATENT_PROJ_INTRA_CHIP_TP: bool = False
@@ -798,6 +799,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # the routing-exchange kernel while its row copies finish.
     "MOE_FUSED_EP_PUSH_EXCHANGE_TABLES": env_bool(
         "MOE_FUSED_EP_PUSH_EXCHANGE_TABLES"
+    ),
+    # With TABLE_KERNEL=1: the routing plan's small tables come from the
+    # table kernel too; XLA keeps only the per-pair lookups.
+    "MOE_FUSED_EP_PUSH_KERNEL_PLAN_TABLES": env_bool(
+        "MOE_FUSED_EP_PUSH_KERNEL_PLAN_TABLES"
     ),
     # MOE_FUSED_EP_KERNEL_IMPL=push without HBM staging: VMEM slots the expert
     # kernel stages result tiles in for the wire (0 = the default two).

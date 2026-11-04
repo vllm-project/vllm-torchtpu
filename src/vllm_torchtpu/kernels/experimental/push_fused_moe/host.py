@@ -512,3 +512,59 @@ def build_routing_tables_sharded(
         n_tokens=T,
         topk=K,
     )
+
+
+def routing_pairs_from_tables(
+    me,
+    gathered,
+    recv_base_me,
+    mirror_base,
+    run_base,
+    *,
+    e_total,
+    ep,
+    t_local,
+    block,
+    shard_stride,
+):
+    """build_routing_tables_sharded's per-pair tables -- (pos, mirror_pos,
+    slab_row rebased as local_slab_rows rebases it) -- from the small tables
+    plan_kernel.build_push_tables already built: this shard's arrival base
+    recv_base_me [e_total] (the plan's my_recv_base), mirror_base [e_total]
+    (the mirror table less my_off) and run_base [ep, g_local] (the slab row
+    each (source, local expert) run starts at, in this shard's own slab).
+    Same values as the sharded plan's."""
+    T, K = gathered.n_tokens, gathered.topk
+    n = T * K
+    g_local = e_total // ep
+    n_blocks = n // block
+    blocks_per_dest = (t_local * K) // block
+    expert_blocks = gathered.expert_blocks
+    bins = jnp.arange(e_total, dtype=jnp.int32)
+    window = rank_window(block, blocks_per_dest * block)
+    my_blocks, my_hist = gathered.local_blocks, gathered.block_hist
+    my_off = jnp.cumsum(my_hist, axis=0) - my_hist
+    my_rank = _rank_within_block(my_blocks, block)
+    pos = (
+        _lookup_per_pair(my_off + recv_base_me[None, :], my_blocks, bins) + my_rank
+    ).reshape(t_local, K)
+    mirror_pos = (
+        _lookup_per_pair(my_off + mirror_base[None, :], my_blocks, bins) + my_rank
+    ).reshape(t_local, K)
+    first = me * g_local
+    my_experts = first + jnp.arange(g_local, dtype=jnp.int32)
+    win_hist = _window_hist(expert_blocks, my_experts, window)
+    hist_mine = _over_sub_blocks(win_hist)
+    by_source = hist_mine.reshape(ep, blocks_per_dest, g_local)
+    off_in_source = jnp.cumsum(by_source, axis=1) - by_source
+    row_table = _window_table(
+        (off_in_source + run_base[:, None, :]).reshape(n_blocks, g_local), win_hist
+    )
+    on_me = (expert_blocks >= first) & (expert_blocks < first + g_local)
+    my_row = _lookup_per_sub_pair(
+        row_table, expert_blocks, my_experts, window
+    ) + _rank_within_window(expert_blocks, window)
+    # The sharded plan's off-shard sentinel, rebased like local_slab_rows.
+    off_shard = off_shard_slab_row(shard_stride, ep) - me * shard_stride
+    slab_row = jnp.where(on_me, my_row, off_shard).reshape(-1)
+    return pos, mirror_pos, slab_row

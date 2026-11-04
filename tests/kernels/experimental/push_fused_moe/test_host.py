@@ -405,7 +405,7 @@ def test_table_kernel_matches_the_xla_tables(n_pre, skew):
             rows_by_dest, seg_start, jnp.int32(me), ep=ep, n_pre=n_pre,
             tile_m=kw["tile_m"], interpret=True,
         )  # fmt: skip
-        seg, meta, visit, sc, kt, er, sb, cnt = (
+        seg, meta, visit, sc, kt, er, sb, cnt, _ = (
             jax.tree.map(np.asarray, x) for x in got
         )
         np.testing.assert_array_equal(seg, np.asarray(want_seg))
@@ -417,3 +417,44 @@ def test_table_kernel_matches_the_xla_tables(n_pre, skew):
         np.testing.assert_array_equal(er, np.asarray(want_er))
         np.testing.assert_array_equal(sb, np.asarray(want_sb))
         np.testing.assert_array_equal(cnt, np.asarray(want_counts))
+
+
+@pytest.mark.parametrize("skew", [False, True], ids=["uniform", "skewed"])
+def test_plan_from_kernel_tables_matches_the_sharded_plan(skew):
+    """routing_pairs_from_tables, fed the table kernel's plan tables
+    (interpret mode), gives the sharded plan's pos, mirror_pos and
+    local_slab_rows exactly, at the DP16 geometry."""
+    from vllm_torchtpu.kernels.experimental.push_fused_moe.plan_kernel import (
+        build_push_tables,
+    )
+
+    ep, t_local, g_local, topk = 16, 288, 25, 6
+    idx, kw = _routing(ep, t_local, g_local, topk, skew=skew, seed=13)
+    for me in (0, 7, ep - 1):
+        gathered = _gathered(idx, me, kw)
+        rows_by_dest = gathered.rows_by_dest
+        want = push_host.build_routing_tables_sharded(
+            jnp.int32(me), gathered, push_host.run_tables(rows_by_dest), **kw
+        )
+        want_slab = host.local_slab_rows(want, me, shard_stride=kw["shard_stride"])
+        counts = np.asarray(rows_by_dest)[me]
+        seg_start = jnp.asarray(np.cumsum(counts) - counts)
+        tables = build_push_tables(
+            rows_by_dest, seg_start, jnp.int32(me), ep=ep, n_pre=2,
+            tile_m=kw["tile_m"], interpret=True,
+        )[8]  # fmt: skip
+        pos, mirror_pos, slab_row = push_host.routing_pairs_from_tables(
+            jnp.int32(me),
+            gathered,
+            *tables,
+            e_total=kw["e_total"],
+            ep=ep,
+            t_local=t_local,
+            block=kw["block"],
+            shard_stride=kw["shard_stride"],
+        )
+        np.testing.assert_array_equal(np.asarray(pos), np.asarray(want.pos))
+        np.testing.assert_array_equal(
+            np.asarray(mirror_pos), np.asarray(want.mirror_pos)
+        )
+        np.testing.assert_array_equal(np.asarray(slab_row), np.asarray(want_slab))

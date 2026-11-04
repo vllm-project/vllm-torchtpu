@@ -46,6 +46,7 @@ from vllm_torchtpu.kernels.experimental.push_fused_moe.host import (
     local_sort_tokens,
     push_dispatch_segments,
     push_dispatch_tables,
+    routing_pairs_from_tables,
     run_tables,
 )
 from vllm_torchtpu.kernels.experimental.push_fused_moe.kernel import (
@@ -273,6 +274,7 @@ def fused_ep_moe_push(
     early_row_gather=False,
     table_kernel=False,
     exchange_tables=False,
+    kernel_plan_tables=False,
     staging_slots=0,
     expert_slot=None,
     expert_load=None,
@@ -312,8 +314,10 @@ def fused_ep_moe_push(
     that many result staging slots (see the kernel), and `table_kernel`
     builds the dispatch and shard tables in one TensorCore kernel
     (plan_kernel.build_push_tables) -- inside the routing-exchange kernel,
-    while its row copies finish, with `exchange_tables`. The caller
-    (layers/adapter/fused_moe_ep.py) reads all seventeen from envs.
+    while its row copies finish, with `exchange_tables`; with
+    `kernel_plan_tables` the plan's small tables come from that kernel too
+    (host.routing_pairs_from_tables). The caller
+    (layers/adapter/fused_moe_ep.py) reads all eighteen from envs.
 
     `expert_slot` [experts, R] i32 and `expert_load` [e_total] i32 (both
     replicated, optional) are the expert-layout operands dynamic EPLB
@@ -466,6 +470,8 @@ def fused_ep_moe_push(
         n_pre = g_local
     tc_exchange = bool(tc_exchange)
     exchange_row_gather = bool(exchange_row_gather)
+    if kernel_plan_tables and not (table_kernel and sharded_plan):
+        raise ValueError("kernel_plan_tables needs table_kernel and sharded_plan")
     if exchange_tables and not (table_kernel and exchange_row_gather):
         raise ValueError("exchange_tables needs table_kernel and exchange_row_gather")
     if exchange_tables and early_row_gather:
@@ -765,6 +771,7 @@ def fused_ep_moe_push(
             tile_m=capacity,
             shard_stride=ragged_stride,
         )
+        gathered = None
         if sharded_plan:
             gathered = GatheredPairs(
                 expert_blocks=pairs_g.reshape(T * topk // block, block),
@@ -774,13 +781,30 @@ def fused_ep_moe_push(
                 n_tokens=T,
                 topk=topk,
             )
-            routing = build_routing_tables_sharded(me, gathered, runs, **plan_kw)
+        pair_tables = None
+        if kernel_plan_tables:
+            # The table kernel built the plan's small tables; only the
+            # per-pair lookups are left.
+            pair_tables = routing_pairs_from_tables(
+                me,
+                gathered,
+                *shard_tables[4],
+                e_total=e_total,
+                ep=ep,
+                t_local=t_local,
+                block=block,
+                shard_stride=ragged_stride,
+            )
+            slab_row = pair_tables[2]
         else:
-            routing = build_routing_tables(pairs_g.reshape(T, topk), **plan_kw)
-        # Both slab tables scatter onto this shard's own slab. The rows of
-        # the other shards are dropped where they are computed rather than
-        # built into a replicated slab and sliced away afterwards.
-        slab_row = local_slab_rows(routing, me, shard_stride=ragged_stride)
+            if sharded_plan:
+                routing = build_routing_tables_sharded(me, gathered, runs, **plan_kw)
+            else:
+                routing = build_routing_tables(pairs_g.reshape(T, topk), **plan_kw)
+            # Both slab tables scatter onto this shard's own slab. The rows of
+            # the other shards are dropped where they are computed rather than
+            # built into a replicated slab and sliced away afterwards.
+            slab_row = local_slab_rows(routing, me, shard_stride=ragged_stride)
         # Keep the scale-slab scatter (a SparseCore offload) behind the
         # pre-push on the SparseCore queue.
         slab_row, scale_bits_g, slab = lax.optimization_barrier(
@@ -804,7 +828,7 @@ def fused_ep_moe_push(
         else:
             scale_slab = None
         if shard_tables is not None:
-            kernel_tables, expert_rows, slab_base, counts = shard_tables
+            kernel_tables, expert_rows, slab_base, counts, _ = shard_tables
         else:
             block_tables = shard_transport_tables_in_blocks(
                 routing, me, e_total=e_total, ep=ep
@@ -842,7 +866,9 @@ def fused_ep_moe_push(
 
         # The destination's own table: one arrival row per selection slot.
         pos = (
-            cast(ShardRoutingTables, routing).pos
+            pair_tables[0]
+            if pair_tables is not None
+            else cast(ShardRoutingTables, routing).pos
             if sharded_plan
             else lax.dynamic_slice(
                 cast(RoutingTables, routing).arrival_row,
@@ -851,7 +877,9 @@ def fused_ep_moe_push(
             )
         )
         mirror_pos = (
-            cast(ShardRoutingTables, routing).mirror_pos
+            pair_tables[1]
+            if pair_tables is not None
+            else cast(ShardRoutingTables, routing).mirror_pos
             if sharded_plan
             else lax.dynamic_slice(
                 cast(RoutingTables, routing).mirror_row,
@@ -1030,6 +1058,7 @@ def fused_ep_moe_push(
         int(staging_slots),
         bool(table_kernel),
         bool(exchange_tables),
+        bool(kernel_plan_tables),
     )
     sm = _LAYER_SM_CACHE.get(key)
     if sm is None:

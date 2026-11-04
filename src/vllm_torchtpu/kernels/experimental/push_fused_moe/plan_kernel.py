@@ -59,6 +59,22 @@ def _sel(cond, x):
     return jnp.where(cond, x, 0)
 
 
+def _flatten_rows(x, g, n):
+    """[rows, 128] with g live lanes per row -> the n = rows * g words laid
+    end to end, as ceil(n / 128) [1, 128] rows."""
+    lane = lax.broadcasted_iota(jnp.int32, (1, LANES), 1)
+    flat = [jnp.zeros((1, LANES), x.dtype) for _ in range(-(-n // LANES))]
+    for d in range(x.shape[0]):
+        r, off = divmod(d * g, LANES)
+        if r >= len(flat):
+            break
+        piece = pltpu.roll(x[d : d + 1], off, 1) if off else x[d : d + 1]
+        flat[r] = flat[r] + _sel((lane >= off) & (lane < off + g), piece)
+        if off + g > LANES:
+            flat[r + 1] = flat[r + 1] + _sel(lane < off + g - LANES, piece)
+    return flat
+
+
 def _tables(r3, seg3, me, *, ep, g, n_pre, tile_m):
     """All tables from r3 [ep (s), ep (d), 128] (rows_by_dest[s, d*g+e] on
     lane e, zero past g), seg3 [ep (d), 128] (segment starts, same lanes)
@@ -199,6 +215,28 @@ def _tables(r3, seg3, me, *, ep, g, n_pre, tile_m):
         counts = jnp.where(lane == j, col, counts)
     counts_t = _transpose(counts)  # [count, d]
 
+    # Inputs of the plan's per-pair tables (host.routing_pairs_from_tables):
+    # this shard's arrival base per global expert, the mirror base, and the
+    # slab row each (source, local expert) run starts at.
+    rs_src = jnp.sum(_sel(real, ar_src_me), 1, keepdims=True)  # [d, 1]
+    above = jnp.zeros((ep, 1), i32)
+    acc_d = jnp.zeros((1, 1), i32)
+    for d in range(ep):
+        above = jnp.where(row[:, :1] == d, acc_d, above)
+        acc_d = acc_d + rs_src[d : d + 1]
+    my_recv_base = _sel(real, above + _lane_excl_cumsum(ar_src_me))  # [d, e]
+    mir_base = _sel(
+        real,
+        ((my_recv_base >> shift) + 2 * (row * g + lane)) * tile_m
+        + (run_me & (tile_m - 1)),
+    )
+    run_start_se = zero  # [s, e] = sum over sources above s of ar_dme
+    acc = jnp.zeros((1, LANES), i32)
+    for x in range(ep):
+        run_start_se = jnp.where(row == x, acc, run_start_se)
+        acc = acc + ar_dme[x : x + 1]
+    run_base = run_start_se + slab_base
+
     return dict(
         seg=(_transpose(seg_a), _transpose(src_off), _transpose(seg_c)),
         small=(meta, my_visit, counts_sc, expert_rows, slab_base),
@@ -210,6 +248,11 @@ def _tables(r3, seg3, me, *, ep, g, n_pre, tile_m):
             true_rows_t,
         ),
         counts=counts_t,
+        plan=(
+            _flatten_rows(my_recv_base, g, ep * g),
+            _flatten_rows(mir_base, g, ep * g),
+            run_base,
+        ),
     )
 
 
@@ -240,10 +283,13 @@ def build_push_tables(rows_by_dest, seg_start_local, me, *, ep, n_pre, tile_m,
     """The push layer's dispatch and shard tables in one kernel.
 
     Returns (seg, dmeta, visit, counts_sc, kernel_tables, expert_rows,
-    slab_base, counts) equal to host.push_dispatch_tables(..., n_pre)'s
-    (seg, meta, my_visit, counts_sc) and, for the same routing, v2's
-    shard_transport_tables_in_blocks [:3] + [5], shard_push_tables_in_rows
-    [0], shard_expert_slabs and shard_count_vector.
+    slab_base, counts, plan_tables) equal to host.push_dispatch_tables(...,
+    n_pre)'s (seg, meta, my_visit, counts_sc) and, for the same routing,
+    v2's shard_transport_tables_in_blocks [:3] + [5],
+    shard_push_tables_in_rows [0], shard_expert_slabs and
+    shard_count_vector; plan_tables = (arrival base [e_total], mirror base
+    [e_total], run slab base [ep, g_local]) for
+    host.routing_pairs_from_tables.
     """
     e_total = rows_by_dest.shape[1]
     g = e_total // ep
@@ -265,7 +311,7 @@ def _small_sizes(g):
     return (2 * g + 3, g, 8, g, g)
 
 
-N_TABLE_OUTS = 1 + 5 + 5 + 1
+N_TABLE_OUTS = 1 + 5 + 5 + 1 + 3
 
 
 def _store_tables(t, outs, *, ep, g):
@@ -277,6 +323,13 @@ def _store_tables(t, outs, *, ep, g):
     for o, part in zip(kt_o, t["kernel_tables"]):
         o[...] = part[:g, :ep]
     counts_o[...] = t["counts"][:8, :ep]
+    pos_o, mir_o, run_o = outs[12:15]
+    n = ep * g
+    for o, flat in ((pos_o, t["plan"][0]), (mir_o, t["plan"][1])):
+        for r, part in enumerate(flat):
+            w = min(LANES, n - r * LANES)
+            o[pl.ds(r * LANES, w)] = part[0, :w]
+    run_o[...] = t["plan"][2][:ep, :g]
 
 
 def _table_out_shapes(ep, g):
@@ -286,6 +339,9 @@ def _table_out_shapes(ep, g):
         *(jax.ShapeDtypeStruct((n,), i32) for n in _small_sizes(g)),
         *(jax.ShapeDtypeStruct((g, ep), i32) for _ in range(5)),
         jax.ShapeDtypeStruct((8, ep), i32),
+        jax.ShapeDtypeStruct((ep * g,), i32),
+        jax.ShapeDtypeStruct((ep * g,), i32),
+        jax.ShapeDtypeStruct((ep, g), i32),
     )
 
 
@@ -300,6 +356,7 @@ def _unpack_tables(outs):
         expert_rows,
         slab_base,
         outs[11],
+        tuple(outs[12:15]),
     )
 
 
