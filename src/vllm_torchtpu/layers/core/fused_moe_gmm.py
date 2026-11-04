@@ -87,9 +87,11 @@ _ONEHOT_AUTO_CAP = 512
 # Fixed at import, like the other MoE algorithm selectors.
 _DENSE_EXPERT_THRESHOLD = envs.TPU_MOE_DENSE_EXPERT_THRESHOLD
 # Smallest EP token count whose v2 combine runs on the TensorCore (0: never).
-# On DSv4-Flash DP8 the static estimate at 2048 tokens is ~45 us (kernel plus
-# routing tables) against ~90 us of SparseCore v2 plus convert; decode at the
-# 1024-token bucket keeps v2. A decode step of 2048 tokens takes it too.
+# On DSv4-Flash DP8 decode (512 and 1024 gathered tokens) the TensorCore waits
+# 13-64 us per MoE layer for SparseCore v2 and then converts its f32 output
+# for another 10-18 us; the TensorCore kernel writes bf16 itself, at ~2 us per
+# 128-token block (measured at 8192 tokens) plus ~2 us of route tables.
+# Smaller counts are unmeasured (the one-hot path takes up to 511 routes).
 TC_COMBINE_MIN_TOKENS = envs.TPU_MOE_TC_COMBINE_MIN_TOKENS
 # From this EP token count, the dispatch moves rows quantized ahead
 # (dispatches_quantized_rows).
@@ -823,9 +825,9 @@ def moe_gmm(
             )
             return (combine @ gmm2_res).astype(dtype)
         if _runs_tc_combine(gmm2_res, topk_weights_flat, num_tokens, topk):
-            # Same result as v2's SparseCore kernel (v2 falls back to XLA only
-            # for inputs far smaller than this). The TensorCore would otherwise
-            # idle while the SparseCore runs v2, and it sums the rows sooner.
+            # Same result as v2's SparseCore kernel; v2's XLA fallback (sources
+            # under 0.3x VMEM) may round differently. The TensorCore would
+            # otherwise idle while the SparseCore runs v2, and it sums sooner.
             return gather_unpermute(
                 gmm2_res,
                 argsort_revert_indices,

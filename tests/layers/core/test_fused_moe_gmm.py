@@ -301,11 +301,12 @@ def test_moe_gmm_uses_selected_ragged_gather_reduce(
     "configured_version,min_tokens,num_tokens,expected_path",
     [
         ("v2", 2048, 2048, "tensorcore"),
+        ("v2", 512, 1024, "tensorcore"),
         ("v2", 2048, 1024, "ep"),
         ("v2", 0, 2048, "ep"),
         ("v3", 2048, 2048, "ep"),
     ],
-    ids=["v2-prefill", "v2-decode", "v2-disabled", "v3-kept"],
+    ids=["v2-prefill", "v2-decode", "v2-below-min", "v2-disabled", "v3-kept"],
 )
 def test_moe_gmm_runs_large_v2_combine_on_tensorcore(
     monkeypatch, configured_version, min_tokens, num_tokens, expected_path
