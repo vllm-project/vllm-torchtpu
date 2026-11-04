@@ -32,6 +32,14 @@ SPEC = TpuMonoSpec(
     parallelism=frozenset({"tp", "ep_in_tp"}),
     features=frozenset({"spec_decode", "mrope", "prefix_caching", "kv_offload"}),
     requires={"mamba_ssm_cache_dtype": "bfloat16"},
+    # The checkpoints this folder serves (the runtime picks it by these).
+    architectures=(
+        "Qwen3_5MoeForConditionalGeneration",
+        "Qwen3_5ForConditionalGeneration",
+        "Qwen3_5MoeForCausalLM",
+        "Qwen3_5ForCausalLM",
+    ),
+    model_types=("qwen3_5_moe", "qwen3_5", "qwen3_5_moe_text"),
     # Of the default profile (qwen35-candidate30-fused); qwen35-baseline is
     # exact. The program logs the resolved profile's numerics at bind.
     numerics="approx",

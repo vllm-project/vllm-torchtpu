@@ -41,7 +41,7 @@ from typing import Any
 
 from vllm_torchtpu.megakernel.errors import MegakernelConfigError
 
-from .plugin import API_VERSION, SHORTHANDS, TpuMonoSpec
+from .plugin import API_VERSION, SHORTHANDS, Shorthand, TpuMonoSpec, shorthands
 
 RUNTIME_KEYS = frozenset({"plugin", "options", "enabled", "ab", "stats_period_s"})
 _LEGACY_KEYS = frozenset().union(*(s.legacy_keys for s in SHORTHANDS.values()))
@@ -272,13 +272,45 @@ def _hf_arch_candidates(hf_config: Any) -> list[str]:
     return cands
 
 
+def _hf_field_value(hf_config: Any, key: str) -> Any:
+    """`key` of the HF config, else of its `text_config` (`None` if neither)."""
+    text_cfg = (
+        hf_config.get("text_config")
+        if isinstance(hf_config, Mapping)
+        else getattr(hf_config, "text_config", None)
+    )
+    for root in (hf_config, text_cfg):
+        if root is None:
+            continue
+        val = root.get(key) if isinstance(root, Mapping) else getattr(root, key, None)
+        if val is not None:
+            return val
+    return None
+
+
+def _matches_hf_fields(sh: Shorthand, hf_config: Any) -> bool:
+    if not sh.hf_fields:
+        return True
+    if hf_config is None:
+        return False
+    return all(_hf_field_value(hf_config, k) == v for k, v in sh.hf_fields)
+
+
 def shorthand_for_arch(hf_config: Any) -> str | None:
-    """The shorthand template that serves this checkpoint's arch, if any (from
-    the HF config's `architectures` / `model_type` only)."""
-    for cand in _hf_arch_candidates(hf_config):
-        for name, sh in SHORTHANDS.items():
-            if cand in sh.architectures or cand in sh.model_types:
-                return name
+    """The shorthand that serves this checkpoint, if any: an entry listing
+    one of the HF config's `architectures` or its `model_type` (also of its
+    `text_config`) whose `hf_fields` all match. Entries with `hf_fields` are
+    tried first; `SHORTHANDS` before the discovered model folders."""
+    entries = shorthands()
+    candidates = _hf_arch_candidates(hf_config)
+    for with_fields in (True, False):
+        for cand in candidates:
+            for name, sh in entries.items():
+                if bool(sh.hf_fields) != with_fields:
+                    continue
+                claims = cand in sh.architectures or cand in sh.model_types
+                if claims and _matches_hf_fields(sh, hf_config):
+                    return name
     return None
 
 
@@ -286,11 +318,14 @@ def resolve_plugin_ref(
     cfg: MegakernelConfig, hf_config: Any = None
 ) -> tuple[PluginRef, dict[str, Any]] | None:
     """Resolve the plugin and its `options` (`None` if no template matches the
-    arch). Top-level template keys are forwarded into `options` only for a
+    arch): a shorthand name (`SHORTHANDS` or a discovered model folder), a
+    `module[:attr]` reference, or the shorthand claiming the checkpoint.
+    Top-level template keys are forwarded into `options` only for a
     shorthand template that lists them."""
-    if cfg.plugin is not None and cfg.plugin.lower() in SHORTHANDS:
+    entries = shorthands()
+    if cfg.plugin is not None and cfg.plugin.lower() in entries:
         name = cfg.plugin.lower()
-        ref = PluginRef(SHORTHANDS[name].module, shorthand=name)
+        ref = PluginRef(entries[name].module, shorthand=name)
     elif cfg.plugin is not None:
         mod, _, attr = cfg.plugin.partition(":")
         ref = PluginRef(mod.strip(), attr.strip() or "SPEC")
@@ -298,10 +333,10 @@ def resolve_plugin_ref(
         name = shorthand_for_arch(hf_config)
         if name is None:
             return None
-        ref = PluginRef(SHORTHANDS[name].module, shorthand=name)
+        ref = PluginRef(entries[name].module, shorthand=name)
     options = dict(cfg.options)
     if cfg.legacy:
-        allowed = SHORTHANDS[ref.shorthand].legacy_keys if ref.shorthand else ()
+        allowed = entries[ref.shorthand].legacy_keys if ref.shorthand else ()
         if bad := sorted(k for k in cfg.legacy if k not in allowed):
             raise MegakernelConfigError(
                 f"megakernel config: unknown key {bad[0]!r} for plugin "

@@ -262,6 +262,13 @@ class TpuMonoSpec:
     default profile) is logged and part of the fingerprint, not a gate.
     `collective_domain` names the ranks the kernel's collectives span (see
     `COLLECTIVE_DOMAINS`); the runtime's agreements run over that group.
+
+    `architectures` / `model_types` are the checkpoints the folder serves:
+    the runtime picks a folder under `vllm_torchtpu.models` whose `SPEC`
+    lists a checkpoint's HF `architectures` entry or `model_type` (also of
+    its `text_config`), and `hf_fields` (`(field, value)` pairs, read from the
+    HF config or its `text_config`) narrows that to configs with those
+    values; a folder with `hf_fields` is preferred when both match.
     """
 
     name: str
@@ -278,6 +285,9 @@ class TpuMonoSpec:
     decline_codes: tuple[str, ...] = ()
     source_root: str | None = None
     api_version: int = API_VERSION
+    architectures: tuple[str, ...] = ()
+    model_types: tuple[str, ...] = ()
+    hf_fields: tuple[tuple[str, Any], ...] = ()
 
     def __post_init__(self) -> None:
         def fix(name: str, value: Any) -> None:
@@ -317,6 +327,11 @@ class TpuMonoSpec:
                 f"{where}: collective_domain={self.collective_domain!r}; "
                 f"expected one of {sorted(COLLECTIVE_DOMAINS)}"
             )
+        fix("architectures", tuple(str(a) for a in self.architectures))
+        fix("model_types", tuple(str(m) for m in self.model_types))
+        fields = self.hf_fields
+        pairs = fields.items() if isinstance(fields, Mapping) else fields
+        fix("hf_fields", tuple((str(k), v) for k, v in pairs))
 
 
 __all__ = [

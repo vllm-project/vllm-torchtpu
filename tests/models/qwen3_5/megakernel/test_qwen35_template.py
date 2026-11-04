@@ -46,7 +46,11 @@ from vllm_torchtpu.megakernel import profile as profile_mod
 from vllm_torchtpu.megakernel.runtime import EligibilityResult, facts_from_pool_layout
 from vllm_torchtpu.megakernel_runtime import testing
 from vllm_torchtpu.megakernel_runtime.hooks import StepContext
-from vllm_torchtpu.megakernel_runtime.plugin import SHORTHANDS, RunnerView
+from vllm_torchtpu.megakernel_runtime.plugin import (
+    SHORTHANDS,
+    RunnerView,
+    discovered_shorthands,
+)
 from vllm_torchtpu.models.qwen3_5 import megakernel as qwen_plugin
 from vllm_torchtpu.models.qwen3_5.megakernel import adapter
 from vllm_torchtpu.models.qwen3_5.megakernel import model as qwen35
@@ -68,6 +72,12 @@ def test_shorthand_table_matches_the_template() -> None:
     assert sh.architectures == qwen35.Qwen35.hf_architectures
     assert sh.model_types == qwen35.Qwen35.hf_model_type
     assert sh.legacy_keys == adapter.OPTION_KEYS
+    # The SPEC declares the same checkpoints, so the folder is also found
+    # without the table (the table adds the top-level template keys).
+    assert qwen_plugin.SPEC.architectures == sh.architectures
+    assert qwen_plugin.SPEC.model_types == sh.model_types
+    found = discovered_shorthands()["qwen35"]
+    assert (found.module, found.legacy_keys) == (_MODULE, frozenset())
     assert qwen_plugin.SPEC.name == "qwen35"
     assert qwen_plugin.SPEC.create == ".adapter:create"
     assert qwen_plugin.SPEC.features == frozenset(
