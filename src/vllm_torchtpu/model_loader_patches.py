@@ -1026,3 +1026,44 @@ def patch_moe_expert_write_staging() -> None:
         "Applied TPU patch: expert parameters are staged on the host "
         "and written to the device once each."
     )
+
+
+def patch_default_model_loader_preprocessed() -> None:
+    """Load preprocessed expert and PLE arrays in DefaultModelLoader.load_weights."""
+    from vllm.config import ModelConfig
+    from vllm.model_executor.model_loader import default_loader as dl
+
+    from vllm_torchtpu.model_loader.preprocessed_loader import (
+        load_preprocessed_arrays_into_model,
+        resolve_preprocessed_checkpoint_dir,
+    )
+
+    if getattr(dl.DefaultModelLoader, "_tpu_preprocessed_loader_patch", False):
+        return
+
+    original_load_weights = typing.cast(
+        Callable[..., None], dl.DefaultModelLoader.load_weights
+    )
+
+    @functools.wraps(original_load_weights)
+    def load_weights(self, model: torch.nn.Module, model_config: ModelConfig) -> None:
+        ckpt_dir = resolve_preprocessed_checkpoint_dir(
+            getattr(model_config, "model", None)
+        )
+        if ckpt_dir is None:
+            original_load_weights(self, model, model_config)
+            return
+
+        # Populate RoutedExperts and PLE tables from contiguous raw arrays first
+        # so model.load_weights() verification sees _tpu_preprocessed_loaded=True
+        # and PLE tables ready to finalize.
+        load_preprocessed_arrays_into_model(model, ckpt_dir)
+        has_safetensors = any(ckpt_dir.glob("*.safetensors"))
+        if has_safetensors or str(ckpt_dir) != str(getattr(model_config, "model", "")):
+            original_load_weights(self, model, model_config)
+
+    dl.DefaultModelLoader.load_weights = load_weights
+    dl.DefaultModelLoader._tpu_preprocessed_loader_patch = True
+    logger.info(
+        "Applied TPU patch: DefaultModelLoader supports preprocessed raw arrays."
+    )

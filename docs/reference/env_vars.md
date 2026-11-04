@@ -72,6 +72,8 @@ At startup, `vllm-torchtpu` reports set environment variables that neither vLLM 
 | `MOE_REQUANTIZE_WEIGHT_DTYPE` | `"float8_e4m3fn"` | Target weight dtype for load-time MoE expert weight requantization (e.g., `"fp4"`). |
 | `MOE_REQUANTIZE_BLOCK_SIZE` | `None` | Target block size for load-time MoE expert weight requantization. |
 | `VLLM_TPU_MXFP4_DEVICE_DEQUANT` | `True` | Performs MXFP4 weight dequantization on TPU device during load rather than on CPU. |
+| `VLLM_TPU_ENABLE_PREPROCESSED_LOADER` | `True` | Enables rank-local contiguous `pread` loading of pre-quantized MoE expert (`experts/array_*`) and PLE n-gram (`misc/array_*`) arrays when the model directory (or `VLLM_TPU_PREPROCESSED_CHECKPOINT_DIR`) is a preprocessed checkpoint. |
+| `VLLM_TPU_PREPROCESSED_CHECKPOINT_DIR` | `""` | Optional directory override containing preprocessed raw checkpoint arrays (`experts/array_*`, `misc/array_*`, and `vllm_preprocess_manifest.json`); unset auto-detects from `model_config.model`. |
 
 ---
 

@@ -114,6 +114,9 @@ omni = [
     "torchaudio==2.11.0",
 ]
 
+[project.scripts]
+vllm-tpu-preprocess-checkpoint = "vllm_torchtpu.tools.preprocess_checkpoint:main"
+
 [project.entry-points."vllm.platform_plugins"]
 # Standard vLLM out-of-tree platform plugin discovery. The function returns
 # the dotted class path when this platform should activate, else None. See
@@ -230,6 +233,7 @@ ignore = [
 # command-line tools print to the terminal on purpose.
 "!src/**" = ["T20"]
 "src/vllm_torchtpu/tools/merge_xplane.py" = ["T20"]
+"src/vllm_torchtpu/tools/preprocess_checkpoint.py" = ["T20"]
 
 [tool.ruff.format]
 docstring-code-format = true
