@@ -315,6 +315,67 @@ class SparseMLAScatterTest(parameterized.TestCase):
                 err_msg=f"{key}: valid tokens corrupted by the padded tail",
             )
 
+    @parameterized.named_parameters(*_SCENARIOS)
+    def test_fused_nope_rope_matches_two_scatters(
+        self, num_seqs, tokens_per_seq, max_seq_len, num_pages
+    ):
+        """One SparseCore call for the nope and rope caches writes the same
+        bytes as one `scatter` call per cache, including dropped tokens.
+
+        Every fourth token is dropped (`SKIP_ROW`), one token points past the
+        last row, and a padded tail of `SKIP_ROW` tokens with nonzero values
+        follows the valid tokens.
+        """
+        inp = self._generate_inputs(num_seqs, tokens_per_seq, max_seq_len, num_pages)
+        nope_spec, rope_spec = inp["specs"]["nope_sc"], inp["specs"]["rope_sc"]
+        num_pad = 7
+
+        dst_rows = np.asarray(
+            kv_cache_utils._dst_rows(
+                jnp.asarray(inp["page"]), jnp.asarray(inp["slot"]), PAGE_SIZE
+            )
+        ).copy()
+        dst_rows[::4] = SKIP_ROW
+        dst_rows[1] = nope_spec.num_pages * PAGE_SIZE
+        dst_rows = jnp.asarray(
+            np.concatenate([dst_rows, np.full(num_pad, SKIP_ROW, np.int32)])
+        )
+
+        def _pad(values):
+            # On the uint8 view: a float8 concatenate canonicalizes NaN bytes.
+            raw = jax.lax.bitcast_convert_type(values, jnp.uint8)
+            tail = jnp.full((num_pad, raw.shape[1]), 0xAB, jnp.uint8)
+            return jax.lax.bitcast_convert_type(
+                jnp.concatenate([raw, tail], axis=0), values.dtype
+            )
+
+        kv_c, k_pe = _pad(inp["kv_c_normed"]), _pad(inp["k_pe"])
+        # Nonzero initial caches, so a missing write is visible too.
+        caches = tuple(
+            jax.random.randint(
+                jax.random.PRNGKey(7 + i), s.shape, 0, 2**31 - 1, jnp.int32
+            ).astype(jnp.uint32)
+            for i, s in enumerate((nope_spec, rope_spec))
+        )
+
+        got = scatter.scatter_sparsecore_caches(
+            caches, (kv_c, k_pe), (nope_spec, rope_spec), dst_rows
+        )
+        want = (
+            scatter.scatter(caches[0], kv_c, nope_spec, dst_rows=dst_rows),
+            scatter.scatter(caches[1], k_pe, rope_spec, dst_rows=dst_rows),
+        )
+        for name, g, w, before in zip(("nope", "rope"), got, want, caches):
+            np.testing.assert_array_equal(
+                np.asarray(g),
+                np.asarray(w),
+                err_msg=f"fused {name} cache differs from the single-cache scatter",
+            )
+            self.assertFalse(
+                np.array_equal(np.asarray(g), np.asarray(before)),
+                f"fused {name} cache was not written at all",
+            )
+
     @parameterized.named_parameters(
         dict(
             testcase_name=f"nope_{nope.value}_rope_{rope.value}",

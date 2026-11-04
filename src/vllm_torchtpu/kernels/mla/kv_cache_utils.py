@@ -440,7 +440,8 @@ def _scatter_caches(
     """Write both caches at (`page`, `slot`), with Pallas wherever it can.
 
     Both nope layouts and rope/SPARSECORE go through the SparseCore Pallas
-    writer; rope/TENSORCORE falls back to the XLA scatter. Shared by the
+    writer; rope/TENSORCORE falls back to the XLA scatter. When both caches
+    are SPARSECORE, one SparseCore call writes both. Shared by the
     unsharded and DCP writers, which differ only in how they derive
     (`page`, `slot`).
     """
@@ -448,6 +449,19 @@ def _scatter_caches(
     from vllm_torchtpu.kernels.mla import scatter
 
     dst_rows = _dst_rows(page, slot, nope_spec.page_size)
+    if (
+        nope_spec.layout is KVCacheLayout.SPARSECORE
+        and rope_spec.layout is KVCacheLayout.SPARSECORE
+    ):
+        # One SparseCore call for both caches: each call has a fixed cost of
+        # several microseconds, and the row DMAs of a decode step are far
+        # shorter than that.
+        return scatter.scatter_sparsecore_caches(
+            (kv_cache_nope, kv_cache_rope),
+            (kv_c_normed, k_pe),
+            (nope_spec, rope_spec),
+            dst_rows,
+        )
     kv_cache_nope = scatter.scatter(
         kv_cache_nope, kv_c_normed, nope_spec, dst_rows=dst_rows
     )

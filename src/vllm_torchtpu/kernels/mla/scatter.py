@@ -70,3 +70,50 @@ def scatter(
         dst_rows,
         name=f"scatter_{spec.cache_type.value}_{spec.layout.value}_cache",
     )
+
+
+def scatter_sparsecore_caches(
+    caches: tuple[jax.Array, ...],
+    values: tuple[jax.Array, ...],
+    specs: tuple[kv_cache_utils.SparseMLAKVCacheSpec, ...],
+    dst_rows: jax.Array,
+) -> tuple[jax.Array, ...]:
+    """Packs and scatters several SPARSECORE caches in one SparseCore call.
+
+    The result is the same as one `scatter` call per cache with the same
+    `dst_rows`. The single call avoids the fixed per-call SparseCore cost of
+    the second and later caches.
+
+    Args:
+      caches: paged KV caches in HBM, cache `t` allocated as `specs[t].shape`
+        / `specs[t].jax_dtype`.
+      values: [num_tokens, unpadded head_dim] fp8 values, one array per cache
+        (`kv_c_normed` for a NOPE cache, `k_pe` for a ROPE one).
+      specs: SPARSECORE layout descriptors the caches were allocated from. All
+        specs have the same page size, so one row index addresses every cache.
+      dst_rows: [num_tokens] destination row per token; negative or out of
+        range drops the token.
+
+    Returns:
+      The updated caches, same shapes and dtypes as `caches`.
+    """
+    for cache, spec in zip(caches, specs, strict=True):
+        assert spec.layout is kv_cache_utils.KVCacheLayout.SPARSECORE, (
+            f"{spec.cache_type.value} spec has layout {spec.layout.value}, not"
+            " sparsecore"
+        )
+        assert cache.shape == spec.shape and cache.dtype == spec.jax_dtype, (
+            f"cache {cache.shape} {cache.dtype} does not match spec"
+            f" {spec.shape} {spec.jax_dtype}"
+        )
+        assert spec.page_size == specs[0].page_size, (
+            f"page sizes differ: {spec.page_size} != {specs[0].page_size}"
+        )
+    srcs = [
+        kv_cache_utils.pack_tokens(v, spec.token_bytes)
+        for v, spec in zip(values, specs, strict=True)
+    ]
+    types = "_".join(spec.cache_type.value for spec in specs)
+    return scatter_utils.scatter_rows_multi(
+        caches, srcs, dst_rows, name=f"scatter_{types}_sparsecore_cache"
+    )
