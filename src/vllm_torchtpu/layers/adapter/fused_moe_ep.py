@@ -233,6 +233,7 @@ def _build_op(
             exchange_tables=envs.MOE_FUSED_EP_PUSH_EXCHANGE_TABLES,
             kernel_plan_tables=envs.MOE_FUSED_EP_PUSH_KERNEL_PLAN_TABLES,
             i32_scale_slab=envs.MOE_FUSED_EP_PUSH_I32_SCALE_SLAB,
+            vmem_combine=envs.MOE_FUSED_EP_PUSH_VMEM_COMBINE,
             staging_slots=envs.MOE_FUSED_EP_PUSH_STAGING_SLOTS,
         )
 

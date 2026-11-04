@@ -1398,6 +1398,7 @@ def test_build_op_picks_the_push_layer_and_passes_its_knobs(monkeypatch, impl):
     monkeypatch.setitem(vars(envs), "MOE_FUSED_EP_PUSH_EXCHANGE_TABLES", True)
     monkeypatch.setitem(vars(envs), "MOE_FUSED_EP_PUSH_KERNEL_PLAN_TABLES", True)
     monkeypatch.setitem(vars(envs), "MOE_FUSED_EP_PUSH_I32_SCALE_SLAB", True)
+    monkeypatch.setitem(vars(envs), "MOE_FUSED_EP_PUSH_VMEM_COMBINE", True)
     monkeypatch.setitem(vars(envs), "MOE_FUSED_EP_PUSH_STAGING_SLOTS", 24)
     bridge._build_op(None, 2, True, "silu", None, False)
     x = jnp.ones((8, 8), dtype=jnp.bfloat16)
@@ -1432,6 +1433,7 @@ def test_build_op_picks_the_push_layer_and_passes_its_knobs(monkeypatch, impl):
         assert forwarded["exchange_tables"] is True
         assert forwarded["kernel_plan_tables"] is True
         assert forwarded["i32_scale_slab"] is True
+        assert forwarded["vmem_combine"] is True
         assert forwarded["staging_slots"] == 24
     else:
         push_kernel.assert_not_called()
@@ -1455,6 +1457,7 @@ def test_build_op_picks_the_push_layer_and_passes_its_knobs(monkeypatch, impl):
             "exchange_tables",
             "kernel_plan_tables",
             "i32_scale_slab",
+            "vmem_combine",
             "staging_slots",
         ):
             assert knob not in forwarded

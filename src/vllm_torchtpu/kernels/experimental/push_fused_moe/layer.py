@@ -40,6 +40,10 @@ import jax
 import jax.numpy as jnp
 from jax import lax
 
+from vllm_torchtpu.kernels.experimental.push_fused_moe.combine_vmem import (
+    build_combine_vmem_kernel,
+    combine_vmem_applies,
+)
 from vllm_torchtpu.kernels.experimental.push_fused_moe.host import (
     build_routing_tables_sharded,
     local_sort_activations,
@@ -80,6 +84,7 @@ from vllm_torchtpu.kernels.fused_moe.v2.host import (
     fp4_scale_rows,
     local_slab_rows,
     pair_block_hist,
+    pow2_shift,
     ragged_stride_bound,
     routing_block,
     shard_count_vector,
@@ -135,14 +140,38 @@ def _pack_routing_exchange(pairs, scale_bits, counts, layout):
 
 
 def _combine_arrivals_fs(
-    arrivals, arrival_scales, pos, mirror_pos, topk_weights, out_dtype
+    arrivals, arrival_scales, pos, mirror_pos, topk_weights, out_dtype, *, vmem=False
 ):
     """v2's `_combine_arrivals`, with the arrival-scale lookup done inside the
     combine kernel (see kernel._build_combine_fs_kernel) where that kernel
-    applies; v2's XLA epilogue everywhere else."""
+    applies; v2's XLA epilogue everywhere else, or with `vmem` where the
+    arrival buffer fits VMEM, the VMEM-resident combine
+    (combine_vmem.build_combine_vmem_kernel), which computes the epilogue's
+    arithmetic in its order."""
     t_local, topk = pos.shape
     recv_rows, lane_blocks, lanes = arrivals.shape
     mirror_sublanes, tile_m = arrival_scales.shape
+    if (
+        vmem
+        and not combine_step_tokens(t_local)
+        and combine_vmem_applies(t_local, arrivals.shape, arrivals.dtype)
+    ):
+        # The epilogue's coefficient, computed exactly as _combine_arrivals
+        # computes it.
+        shift = pow2_shift(tile_m, "the mirror's lane count")
+        scl = jnp.minimum(mirror_pos, mirror_sublanes * tile_m - 1)
+        row_scales = arrival_scales[jnp.right_shift(scl, shift), scl & (tile_m - 1)]
+        coef = row_scales * topk_weights.astype(jnp.float32)
+        combine = build_combine_vmem_kernel(
+            t_local=t_local,
+            topk=topk,
+            recv_rows=recv_rows,
+            lane_blocks=lane_blocks,
+            lanes=lanes,
+            wire_dtype=arrivals.dtype,
+            out_dtype=out_dtype,
+        )
+        return combine(arrivals, coef, jnp.minimum(pos, recv_rows - 1))
     if not combine_step_tokens(t_local):
         return _combine_arrivals(
             arrivals, arrival_scales, pos, mirror_pos, topk_weights, out_dtype
@@ -277,6 +306,7 @@ def fused_ep_moe_push(
     exchange_tables=False,
     kernel_plan_tables=False,
     i32_scale_slab=False,
+    vmem_combine=False,
     staging_slots=0,
     expert_slot=None,
     expert_load=None,
@@ -321,8 +351,10 @@ def fused_ep_moe_push(
     while its row copies finish, with `exchange_tables`; with
     `kernel_plan_tables` the plan's small tables come from that kernel too
     (host.routing_pairs_from_tables); `i32_scale_slab` hands the expert
-    kernel the scale slab's i32 bit patterns to bitcast in VMEM. The caller
-    (layers/adapter/fused_moe_ep.py) reads all nineteen from envs.
+    kernel the scale slab's i32 bit patterns to bitcast in VMEM, and
+    `vmem_combine` combines the arrivals with the buffer resident in VMEM
+    where it fits (see `_combine_arrivals_fs`). The caller
+    (layers/adapter/fused_moe_ep.py) reads all twenty from envs.
 
     `expert_slot` [experts, R] i32 and `expert_load` [e_total] i32 (both
     replicated, optional) are the expert-layout operands dynamic EPLB
@@ -918,7 +950,13 @@ def fused_ep_moe_push(
             )
         )
         combined = _combine_arrivals_fs(
-            arrivals, arrival_scales, pos, mirror_pos, topk_weights, out_dtype
+            arrivals,
+            arrival_scales,
+            pos,
+            mirror_pos,
+            topk_weights,
+            out_dtype,
+            vmem=vmem_combine,
         )
         # A row that routed nowhere read arrival rows nobody wrote; its weight is
         # zero, but zero times an unwritten NaN is not.
@@ -1106,6 +1144,7 @@ def fused_ep_moe_push(
         bool(i32_scale_slab),
         has_shared and tuple((a.shape, a.dtype) for a in shared_args),
         has_shared and float(shared_limit),
+        bool(vmem_combine),
     )
     out_specs = (P(ax),) + ((P(),) if has_expert_load else ()) + ((P(ax),) * has_shared)
     out_specs = out_specs if len(out_specs) > 1 else out_specs[0]

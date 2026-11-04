@@ -116,6 +116,7 @@ if TYPE_CHECKING:
     MOE_FUSED_EP_PUSH_EXCHANGE_TABLES: bool = True
     MOE_FUSED_EP_PUSH_KERNEL_PLAN_TABLES: bool = True
     MOE_FUSED_EP_PUSH_I32_SCALE_SLAB: bool = False
+    MOE_FUSED_EP_PUSH_VMEM_COMBINE: bool = False
     MOE_FUSED_EP_PUSH_STAGING_SLOTS: int = 0
     MOE_FUSED_EP_PUSH_SHARED_EXPERT: bool = False
     TPU_EXPERT_PLACEMENT: str = ""
@@ -932,6 +933,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # MOE_FUSED_EP_KERNEL_IMPL=push: hand the expert kernel the activation
     # scale slab as i32 bit patterns and bitcast each tile's column in VMEM.
     "MOE_FUSED_EP_PUSH_I32_SCALE_SLAB": env_bool("MOE_FUSED_EP_PUSH_I32_SCALE_SLAB"),
+    # MOE_FUSED_EP_KERNEL_IMPL=push: where the shard's arrival buffer fits
+    # VMEM, combine with it resident there instead of XLA's gather epilogue.
+    "MOE_FUSED_EP_PUSH_VMEM_COMBINE": env_bool("MOE_FUSED_EP_PUSH_VMEM_COMBINE"),
     # MOE_FUSED_EP_KERNEL_IMPL=push without HBM staging: VMEM slots the expert
     # kernel stages result tiles in for the wire (0 = the default two).
     "MOE_FUSED_EP_PUSH_STAGING_SLOTS": env_int("MOE_FUSED_EP_PUSH_STAGING_SLOTS", 0),
