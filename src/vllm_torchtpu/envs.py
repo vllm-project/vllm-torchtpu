@@ -13,6 +13,7 @@ if TYPE_CHECKING:
     TPU_DEEPSEEK_V41_ENGRAM_HBM: str = "auto"
     TPU_DEEPSEEK_V41_CSA2_EARLY_GATHER: bool = False
     TPU_DEEPSEEK_V41_INDEXER_TAIL_OUTSIDE_COND: bool = False
+    TPU_DEEPSEEK_V41_MHC_RESIDENT_GATES: bool = False
     TPU_K3_SP_PREFILL: bool = False
     TPU_INCREMENTAL_BLOCK_TABLE_UPLOAD: bool = True
     TPU_ONEHOT_TABLE_LOOKUP: bool = False
@@ -407,6 +408,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Same kernels on the same scores (bit-exact). Default off until measured.
     "TPU_DEEPSEEK_V41_INDEXER_TAIL_OUTSIDE_COND": env_bool(
         "TPU_DEEPSEEK_V41_INDEXER_TAIL_OUTSIDE_COND", default=False
+    ),
+    # Shifted mHC: emit the next layer's gates T tokens wide (not padded to a
+    # multiple of 128) and read them as compiler-managed VMEM inputs, so the
+    # gates pass between layers without slice/transpose ops. Layout only;
+    # outputs are unchanged.
+    "TPU_DEEPSEEK_V41_MHC_RESIDENT_GATES": env_bool(
+        "TPU_DEEPSEEK_V41_MHC_RESIDENT_GATES", default=False
     ),
     # Opt in to K3 TP32/EP32 sequence-parallel prefill.
     "TPU_K3_SP_PREFILL": env_bool("TPU_K3_SP_PREFILL", default=False),
