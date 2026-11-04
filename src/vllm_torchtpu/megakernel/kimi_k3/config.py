@@ -95,6 +95,8 @@ class KernelConfig:
     # EP16 fused MoE: expert families resident as per-group banks (False: one
     # 92-layer family each, as when the aggregate shares the decode's EP16 experts).
     prefill_expert_banks: bool = True
+    # Diagnostic: the banks at EP8 too (the fused EP8 MoE; not with a shared decode).
+    prefill_expert_banks_ep8: bool = False
     # Packed dispatch/shared overlap and fused down/combine/reduce-scatter.
     # EP16: FP32 at all serving windows, BF16 at 4K/8K only.
     # False: the unfused SparseCore gather/combine.

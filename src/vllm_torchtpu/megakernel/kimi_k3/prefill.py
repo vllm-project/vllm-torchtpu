@@ -318,9 +318,14 @@ class PrefillProgram:
         self._expert_banks = []
         # The decode's experts (aggregate) are one 92-layer family each.
         kernel = active()
+        banked_ep = kernel.prefill_expert_parallel == 16 or (
+            kernel.prefill_expert_parallel == 8
+            and kernel.prefill_fused_moe_ep8
+            and kernel.prefill_expert_banks_ep8
+        )
         if (
             kernel.prefill_fused_moe
-            and kernel.prefill_expert_parallel == 16
+            and banked_ep
             and kernel.prefill_expert_banks
             and not set(shared) & set(_EXPERT_FAMILIES)
         ):
