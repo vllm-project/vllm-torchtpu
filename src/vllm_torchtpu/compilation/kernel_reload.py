@@ -1,4 +1,16 @@
-# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Live kernel hot-reload for kernel-iteration mode (TPU_KERNEL_ITER_MODE=1).
 
 Kernel developers iterating on a Pallas kernel normally pay a full server
@@ -76,9 +88,17 @@ class _KernelDispatch:
     directly.
     """
 
-    _COPY_ATTRS = ("__name__", "__qualname__", "__module__", "__doc__",
-                   "__globals__", "__annotations__", "__signature__",
-                   "__defaults__", "__kwdefaults__")
+    _COPY_ATTRS = (
+        "__name__",
+        "__qualname__",
+        "__module__",
+        "__doc__",
+        "__globals__",
+        "__annotations__",
+        "__signature__",
+        "__defaults__",
+        "__kwdefaults__",
+    )
 
     def __init__(self, name: str, template: Callable) -> None:
         self._name = name
@@ -131,8 +151,7 @@ def reload_kernels(modules: Sequence[str] | None = None) -> dict:
         if mod is not None:
             importlib.reload(mod)
         else:
-            logger.warning("Reload module %s is not imported; skipping.",
-                           mod_name)
+            logger.warning("Reload module %s is not imported; skipping.", mod_name)
     reimport_s = time.perf_counter() - t0
 
     t0 = time.perf_counter()
@@ -143,8 +162,12 @@ def reload_kernels(modules: Sequence[str] | None = None) -> dict:
     rebuild_s = time.perf_counter() - t0
 
     logger.info(
-        "Kernel hot-reload: re-imported %d modules (%.3fs), rebuilt "
-        "ops %s (%.3fs).", len(module_names), reimport_s, rebuilt, rebuild_s)
+        "Kernel hot-reload: re-imported %d modules (%.3fs), rebuilt ops %s (%.3fs).",
+        len(module_names),
+        reimport_s,
+        rebuilt,
+        rebuild_s,
+    )
     return {
         "reimport_s": round(reimport_s, 3),
         "rebuild_s": round(rebuild_s, 3),

@@ -1,4 +1,18 @@
 #!/bin/bash
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 # shellcheck disable=SC2034  # Variables are sourced by run_benchmarks.sh
 # Full benchmark sweep for Qwen3-Coder-480B-A35B-Instruct-FP8 with TP=8, EP.
 MODEL="Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8"
@@ -16,7 +30,9 @@ RANDOM_RANGE_RATIO="0.8"
 RANGE_RATIO_STYLE="min"
 MAX_MODEL_LEN=16384
 MAX_NUM_BATCHED_TOKENS=8192
-MAX_NUM_SEQS=512
+# Perf-only config (no lm-eval) at concurrency 64; 128..512 sequence buckets
+# are compiled at boot and never used.
+MAX_NUM_SEQS=64
 GPU_MEMORY_UTILIZATION=0.95
 KV_CACHE_DTYPE="fp8"
 

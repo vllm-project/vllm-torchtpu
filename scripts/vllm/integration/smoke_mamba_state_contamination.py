@@ -19,6 +19,7 @@ the cache either way; only a real state restore makes the continuation match
 the uncached one. Comparing token ids rather than an expected answer means a
 wrong state shows up even when it does not change the final answer.
 """
+
 import argparse
 import json
 import os
@@ -31,23 +32,31 @@ def build_prefix(tag: str, lines: int) -> str:
     # Distinct content per tag so the two states can never be interchangeable.
     body = "\n".join(
         f"{tag} record {i:04d}: quantity {(i * 7 + len(tag)) % 97}"
-        for i in range(lines))
-    return (f"Inventory ledger {tag}. Read every record before answering.\n"
-            f"{body}\n")
+        for i in range(lines)
+    )
+    return f"Inventory ledger {tag}. Read every record before answering.\n{body}\n"
 
 
-def complete(url: str, model: str, prompt: str, max_tokens: int,
-             timeout: int) -> dict:
+def complete(
+    url: str,
+    model: str,
+    prompt: str,
+    max_tokens: int,
+    timeout: int,
+    headers: dict | None = None,
+) -> dict:
     req = urllib.request.Request(
         f"{url}/v1/completions",
-        data=json.dumps({
-            "model": model,
-            "prompt": prompt,
-            "max_tokens": max_tokens,
-            "temperature": 0,
-            "return_token_ids": True,
-        }).encode(),
-        headers={"Content-Type": "application/json"},
+        data=json.dumps(
+            {
+                "model": model,
+                "prompt": prompt,
+                "max_tokens": max_tokens,
+                "temperature": 0,
+                "return_token_ids": True,
+            }
+        ).encode(),
+        headers={"Content-Type": "application/json", **(headers or {})},
     )
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         body = json.load(resp)
@@ -71,14 +80,23 @@ def main() -> int:
     p.add_argument("--rounds", type=int, default=4)
     p.add_argument("--max-tokens", type=int, default=64)
     p.add_argument("--timeout", type=int, default=600)
+    p.add_argument(
+        "--data-parallel-rank",
+        type=int,
+        help="Hold every request to this DP rank of the engine, with vLLM's "
+        "X-data-parallel-rank header; through a P/D proxy, of both engines. "
+        "Replicas differ slightly in greedy output, and this compares tokens.",
+    )
     a = p.parse_args()
     url = f"http://{a.host}:{a.port}"
+    headers = {}
+    if a.data_parallel_rank is not None:
+        headers["X-data-parallel-rank"] = str(a.data_parallel_rank)
 
     tags = ["ALPHA", "BRAVO"]
     prompts = {
-        t:
-        build_prefix(t, a.lines) +
-        "\nSummarise the ledger above in one sentence, then state the final "
+        t: build_prefix(t, a.lines)
+        + "\nSummarise the ledger above in one sentence, then state the final "
         "record's quantity.\n"
         for t in tags
     }
@@ -90,11 +108,11 @@ def main() -> int:
     for rnd in range(1, a.rounds + 1):
         for tag in tags:  # interleaved: the slot last held the other prefix
             try:
-                r = complete(url, a.model, prompts[tag], a.max_tokens,
-                             a.timeout)
+                r = complete(
+                    url, a.model, prompts[tag], a.max_tokens, a.timeout, headers
+                )
             except (urllib.error.URLError, TimeoutError) as exc:
-                print(
-                    f"STATE_CONTAMINATION_REQUEST_FAILED {tag} r{rnd}: {exc}")
+                print(f"STATE_CONTAMINATION_REQUEST_FAILED {tag} r{rnd}: {exc}")
                 return 1
 
             if tag not in reference:
@@ -107,16 +125,20 @@ def main() -> int:
                     hit_rounds += 1
                     if not same:
                         failures += 1
-                verdict = ("match" if same else "DIVERGED")
-            print(json.dumps({
-                "round": rnd,
-                "prefix": tag,
-                "prompt_tokens": r["prompt_tokens"],
-                "cached_tokens": r["cached_tokens"],
-                "verdict": verdict,
-                "text": r["text"][:80],
-            }),
-                  flush=True)
+                verdict = "match" if same else "DIVERGED"
+            print(
+                json.dumps(
+                    {
+                        "round": rnd,
+                        "prefix": tag,
+                        "prompt_tokens": r["prompt_tokens"],
+                        "cached_tokens": r["cached_tokens"],
+                        "verdict": verdict,
+                        "text": r["text"][:80],
+                    }
+                ),
+                flush=True,
+            )
 
     print(f"STATE_CONTAMINATION_CACHED_ROUNDS {hit_rounds}")
     print(f"STATE_CONTAMINATION_DIVERGENCES {failures}")

@@ -1,6 +1,18 @@
-# SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
+import argparse
 import json
 
 from vllm import LLM, EngineArgs
@@ -20,11 +32,13 @@ def create_parser():
 
     # Add sampling params
     sampling_group = parser.add_argument_group("Sampling parameters")
-    sampling_group.add_argument("--prompt",
-                                type=str,
-                                nargs="+",
-                                default=None,
-                                help="Custom prompt(s) for offline inference.")
+    sampling_group.add_argument(
+        "--prompt",
+        type=str,
+        nargs="+",
+        default=None,
+        help="Custom prompt(s) for offline inference.",
+    )
     sampling_group.add_argument("--max-tokens", type=int)
     sampling_group.add_argument("--temperature", type=float, default=0.0)
     sampling_group.add_argument("--top-p", type=float)
@@ -32,12 +46,17 @@ def create_parser():
 
     # Chat params
     chat_group = parser.add_argument_group("Chat parameters")
-    chat_group.add_argument("--use-chat-template", action="store_true")
+    chat_group.add_argument(
+        "--use-chat-template",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Apply the model's chat template via LLM.chat instead of sending "
+        "raw prompts to LLM.generate. Defaults to True when the tokenizer "
+        "defines a chat template.",
+    )
     # A few models (like Qwen3.5) can use this to disable thinking using,
     # `--chat-template-kwargs='{"enable_thinking": false}'`
-    chat_group.add_argument('--chat-template-kwargs',
-                            type=json.loads,
-                            default={})
+    chat_group.add_argument("--chat-template-kwargs", type=json.loads, default={})
 
     return parser
 
@@ -51,13 +70,15 @@ def main(args: dict):
     top_k = args.pop("top_k")
 
     use_chat_template = args.pop("use_chat_template")
-    chat_template_kwargs = args.pop('chat_template_kwargs')
+    chat_template_kwargs = args.pop("chat_template_kwargs")
     # Safeguard in case the user doesn't provide use_chat_template
-    if chat_template_kwargs != {}:
+    if use_chat_template is None and chat_template_kwargs != {}:
         use_chat_template = True
 
     # Create an LLM
     llm = LLM(**args)
+    if use_chat_template is None:
+        use_chat_template = bool(getattr(llm.get_tokenizer(), "chat_template", None))
 
     # Create a sampling params object
     sampling_params = llm.get_default_sampling_params()
@@ -116,15 +137,15 @@ def main(args: dict):
         llm.start_profile()
     if use_chat_template:
         logger.info(
-            f"Using LLM chat API for inference with extra chat kwargs: {chat_template_kwargs}"
+            "Using LLM chat API for inference with extra chat kwargs: %s",
+            chat_template_kwargs,
         )
-        conversations = [[{
-            "role": "user",
-            "content": prompt
-        }] for prompt in prompts]
-        outputs = llm.chat(messages=conversations,
-                           sampling_params=sampling_params,
-                           chat_template_kwargs=chat_template_kwargs)
+        conversations = [[{"role": "user", "content": prompt}] for prompt in prompts]
+        outputs = llm.chat(
+            messages=conversations,
+            sampling_params=sampling_params,
+            chat_template_kwargs=chat_template_kwargs,
+        )
     else:
         logger.info("Using LLM generate API for inference")
         outputs = llm.generate(prompts, sampling_params)

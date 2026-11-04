@@ -1,3 +1,16 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """
 End-to-end tests for vLLM LLM generation API with MoE models on TPU.
 
@@ -41,16 +54,20 @@ def _print_generation_outputs(test_name: str, outputs) -> None:
         print(f"Generated: {output.outputs[0].text!r}")
 
 
-def _run_moe_generation(async_scheduling: bool,
-                        enable_expert_parallel: bool = False):
+def _run_moe_generation(async_scheduling: bool, enable_expert_parallel: bool = False):
     tp_size = _get_local_tpu_chip_count()
     if tp_size < 8:
-        pytest.skip(f"MoE TP test expects an 8-chip agent, found {tp_size} "
-                    "chips; running here would silently reduce TP coverage")
+        pytest.skip(
+            f"MoE TP test expects an 8-chip agent, found {tp_size} "
+            "chips; running here would silently reduce TP coverage"
+        )
 
+    # Four ~6-token prompts and 4 output tokens: 8 sequences is the only
+    # request bucket a step uses; the default compiles them up to 64.
     llm = LLM(
         model=MOE_MODEL_NAME,
         max_num_batched_tokens=64,
+        max_num_seqs=8,
         max_model_len=64,
         tensor_parallel_size=tp_size,
         enable_expert_parallel=enable_expert_parallel,
@@ -64,9 +81,9 @@ def _run_moe_generation(async_scheduling: bool,
     try:
         outputs = llm.generate(
             MOE_PROMPTS,
-            sampling_params=SamplingParams(temperature=0.0,
-                                           max_tokens=4,
-                                           ignore_eos=True),
+            sampling_params=SamplingParams(
+                temperature=0.0, max_tokens=4, ignore_eos=True
+            ),
         )
     finally:
         del llm
@@ -76,14 +93,18 @@ def _run_moe_generation(async_scheduling: bool,
 
 
 @pytest.mark.timeout(1800)
-@pytest.mark.parametrize("async_scheduling", [
-    pytest.param(False, marks=pytest.mark.nightly, id="sync"),
-    pytest.param(True, id="async"),
-])
+@pytest.mark.parametrize(
+    "async_scheduling",
+    [
+        pytest.param(False, marks=pytest.mark.nightly, id="sync"),
+        pytest.param(True, marks=pytest.mark.nightly, id="async"),
+    ],
+)
 def test_moe_generate_with_tp_equal_local_tpu_count(async_scheduling: bool):
     tp_size, outputs = _run_moe_generation(async_scheduling=async_scheduling)
     _print_generation_outputs(
-        f"MoE TP ({'async' if async_scheduling else 'sync'})", outputs)
+        f"MoE TP ({'async' if async_scheduling else 'sync'})", outputs
+    )
 
     assert tp_size >= 2
     assert len(outputs) == len(MOE_PROMPTS)
@@ -91,26 +112,32 @@ def test_moe_generate_with_tp_equal_local_tpu_count(async_scheduling: bool):
     assert all(output.outputs[0].text.strip() for output in outputs)
     # Greedy decoding of "The capital of France is" must produce "Paris";
     # catches MoE channel-misalignment bugs that yield non-empty token salad.
-    assert "paris" in outputs[0].outputs[0].text.lower(), \
+    assert "paris" in outputs[0].outputs[0].text.lower(), (
         f"incoherent MoE output: {outputs[0].outputs[0].text!r}"
+    )
 
 
 @pytest.mark.timeout(1800)
-@pytest.mark.parametrize("async_scheduling", [
-    pytest.param(False, marks=pytest.mark.nightly, id="sync"),
-    pytest.param(True, id="async"),
-])
+@pytest.mark.parametrize(
+    "async_scheduling",
+    [
+        pytest.param(False, marks=pytest.mark.nightly, id="sync"),
+        pytest.param(True, marks=pytest.mark.nightly, id="async"),
+    ],
+)
 def test_moe_generate_with_ep_equal_local_tpu_count(async_scheduling: bool):
     tp_size, outputs = _run_moe_generation(
         async_scheduling=async_scheduling,
         enable_expert_parallel=True,
     )
     _print_generation_outputs(
-        f"MoE EP ({'async' if async_scheduling else 'sync'})", outputs)
+        f"MoE EP ({'async' if async_scheduling else 'sync'})", outputs
+    )
 
     assert tp_size >= 2
     assert len(outputs) == len(MOE_PROMPTS)
     assert all(len(output.outputs) == 1 for output in outputs)
     assert all(output.outputs[0].text.strip() for output in outputs)
-    assert "paris" in outputs[0].outputs[0].text.lower(), \
+    assert "paris" in outputs[0].outputs[0].text.lower(), (
         f"incoherent MoE output: {outputs[0].outputs[0].text!r}"
+    )

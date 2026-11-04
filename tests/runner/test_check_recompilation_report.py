@@ -56,10 +56,12 @@ def make_runner():
 
 
 def set_cache(monkeypatch, entries):
-    stats = SimpleNamespace(per_entry_stats=list(entries),
-                            num_cache_reqs=len(entries),
-                            num_cache_hits=0)
-    monkeypatch.setattr(torch.tpu, "_get_cache_stats", lambda: stats)
+    stats = SimpleNamespace(
+        per_entry_stats=list(entries), num_cache_reqs=len(entries), num_cache_hits=0
+    )
+    monkeypatch.setattr(
+        torch, "tpu", SimpleNamespace(_get_cache_stats=lambda: stats), raising=False
+    )
 
 
 @contextlib.contextmanager
@@ -160,9 +162,7 @@ def test_a_cache_hit_is_counted_but_costs_no_compile_time(monkeypatch):
     set_cache(monkeypatch, [entry(0, read_count=3)])
     capture(runner, "init")
 
-    set_cache(monkeypatch,
-              [entry(0, read_count=3),
-               entry(60, compile_secs=0.0)])
+    set_cache(monkeypatch, [entry(0, read_count=3), entry(60, compile_secs=0.0)])
     text = capture(runner, "decoding_step")
 
     assert "new: 1" in text
@@ -174,17 +174,21 @@ def test_the_costliest_compiles_are_described_first(monkeypatch):
     set_cache(monkeypatch, [entry(0, read_count=2)])
     capture(runner, "init")
 
-    set_cache(monkeypatch, [
-        entry(0, read_count=2),
-        entry(10, compile_secs=0.1),
-        entry(11, compile_secs=9.5),
-        entry(12, compile_secs=2.0),
-    ])
+    set_cache(
+        monkeypatch,
+        [
+            entry(0, read_count=2),
+            entry(10, compile_secs=0.1),
+            entry(11, compile_secs=9.5),
+            entry(12, compile_secs=2.0),
+        ],
+    )
     text = capture(runner, "decoding_step")
 
     order = [
         float(line.split("compilation_duration=0:00:0")[1].split()[0])
-        for line in text.splitlines() if "compilation_duration=" in line
+        for line in text.splitlines()
+        if "compilation_duration=" in line
     ]
     assert order == sorted(order, reverse=True), order
 
@@ -199,8 +203,7 @@ def test_long_reports_are_capped_but_say_so(monkeypatch):
     assert "... 7 more not shown" in text
 
 
-def test_a_shrinking_cache_resynchronizes_instead_of_going_negative(
-        monkeypatch):
+def test_a_shrinking_cache_resynchronizes_instead_of_going_negative(monkeypatch):
     runner = make_runner()
     set_cache(monkeypatch, [entry(i, read_count=2) for i in range(5)])
     capture(runner, "init")
@@ -214,9 +217,7 @@ def test_a_shrinking_cache_resynchronizes_instead_of_going_negative(
 
 
 def test_describe_survives_entries_it_cannot_read():
-
     class Hostile:
-
         @property
         def explodes(self):
             raise RuntimeError("needs a live device")
@@ -244,8 +245,12 @@ def test_describe_falls_back_to_repr_for_fieldless_entries():
 
 def test_compile_seconds_tolerate_a_missing_field():
     assert TPUModelRunner._xla_graph_compile_secs(SimpleNamespace()) == 0.0
-    assert TPUModelRunner._xla_graph_compile_secs(
-        SimpleNamespace(compilation_duration=None)) == 0.0
+    assert (
+        TPUModelRunner._xla_graph_compile_secs(
+            SimpleNamespace(compilation_duration=None)
+        )
+        == 0.0
+    )
 
 
 @pytest.mark.parametrize("check,eager", [(False, False), (True, True)])
@@ -257,5 +262,7 @@ def test_disabled_paths_do_not_touch_the_cache(check, eager, monkeypatch):
     def boom():
         raise AssertionError("_get_cache_stats must not be called")
 
-    monkeypatch.setattr(torch.tpu, "_get_cache_stats", boom)
+    monkeypatch.setattr(
+        torch, "tpu", SimpleNamespace(_get_cache_stats=boom), raising=False
+    )
     runner._update_num_xla_graphs("init")

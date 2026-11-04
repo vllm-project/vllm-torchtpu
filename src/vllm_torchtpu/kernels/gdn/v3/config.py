@@ -14,7 +14,7 @@
 
 import dataclasses
 import enum
-from typing import Any
+from typing import Any, ClassVar
 
 import jax
 import jax.numpy as jnp
@@ -48,48 +48,6 @@ class Dtypes:
     conv_state: jnp.dtype
 
 
-@dataclasses.dataclass(frozen=True)
-class StateRegion:
-    """Copy-plan for one state region of an indexed external state source.
-
-    A slot's region spans ``nblocks`` consecutive source blocks starting
-    ``kb0`` blocks into the slot's window, rows ``[row0, row0 + nrows)``
-    of each — one contiguous DMA per slot. The raw bytes are accessed
-    through a typed view (``view_dtype`` elements, ``lane_split``-way
-    128-lane split); the leading ``rows_used`` typed rows carry the
-    state, the rest is zero padding.
-    """
-    kb0: int
-    nblocks: int
-    row0: int
-    nrows: int
-    view_dtype: jnp.dtype
-    lane_split: int
-    rows_used: int
-    # Optional static typed-row permutation between the pool's stored row
-    # order and the kernel's logical row order: logical_rows[i] is stored
-    # at typed row rows_perm[i].  None or the identity means the stored
-    # order IS the logical order.  Used by the QK pair-blocked conv layout,
-    # where full-width states interleave Q and K row-pairs per tap so that
-    # one whole pool token holds one head-pair's Q and K rows.
-    rows_perm: tuple[int, ...] | None = None
-
-
-@dataclasses.dataclass(frozen=True)
-class StateSourcePlan:
-    """States live in an indexed external source instead of dense per-slot
-    tensors: each state index owns a window of ``stride`` consecutive
-    source blocks holding both state regions.
-
-    The plan describes one checkpoint's geometry. With speculative
-    decoding every checkpoint is an independent source block named by
-    ``MetadataRef.s_idx_to_ckpt_indices`` and reuses this same geometry,
-    so nothing here varies with the verify window."""
-    stride: int
-    conv: StateRegion
-    recurrent: StateRegion
-
-
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True)
 class GDNConfig:
@@ -108,7 +66,6 @@ class GDNConfig:
     # unbounded one; see `fused_conv1d_gdn` for the two and their validation.
     gate_lower_bound: float | None = None
     num_buffers: int = 2
-    state_plan: StateSourcePlan | None = None
     # Max tokens per speculative verify window (= num_speculative_tokens + 1),
     # which is also the number of state checkpoints kept per sequence. The
     # kernel reads a sequence's initial state from
@@ -119,6 +76,25 @@ class GDNConfig:
     # shapes and loops can be sized off it unconditionally and the extra axis
     # / iterations fold away in the non-speculative paths.
     window_size: int = 1
+    # Indicate the use of unified pool.
+    is_shared: bool = False
+
+    @property
+    def conv_hbm_offset(self) -> int:
+        if self.is_shared:
+            # In Unified pool. Conv state is stored after recurrent state.
+            # Offset is calculated via recurrent state size.
+            lane_bytes = pltpu.get_tpu_info().num_lanes * 4
+            lane_elements = (
+                lane_bytes // jnp.dtype(self.dtypes.recurrent_state).itemsize
+            )
+            num_elements = self.v_dim_size * self.kq_head_dim
+            return num_elements // lane_elements
+        return 0
+
+    @property
+    def recurrent_hbm_offset(self) -> int:
+        return 0
 
     @property
     def chunk_size(self) -> int:
@@ -164,12 +140,20 @@ class GDNConfig:
         moves work from MXU to XLU. More value heads already means more
         XLU work, hence the smaller blocks there.
         """
-        # TODO(alynie): create a better heuristic to tune this value.
-        if self.num_v_heads == 64:
+        # Within-block forward substitution issues head_groups * B / 2 broadcasts
+        # per token. At 1 head group (<= 8 heads), B = 16 is optimal.
+        # - GDN issues O(1 / B) between-block solver matmuls per token, so scale
+        #   B inversely with head_groups (head_groups * B <= 16).
+        # - KDA also tiles Aqk and L into O(1 / B^2) sub-block matmuls per token,
+        #   so scale B^2 inversely with head_groups (head_groups * B**2 <= 16**2).
+        head_groups = pl.cdiv(self.num_v_heads, 8)
+        if self.is_kda:
+            for b in (16, 8, 4):
+                if head_groups * b * b <= 256:
+                    return b
             return 2
-        if self.num_v_heads == 32:
-            return 8
-        return 16
+        # GDN: between-block updates scale as 1 / B.
+        return max(2, min(16, 16 // head_groups))
 
     @property
     def use_recurrent(self) -> bool:
@@ -204,8 +188,10 @@ class GDNConfig:
         suffix = f"_w{self.window_size}" if self.window_size > 1 else ""
         if self.is_kda and self.gate_lower_bound is not None:
             suffix += "_bounded"
-        return (f"fused_conv1d_{self.attention_mode.value}"
-                f"_{self.mode.value}{suffix}")
+        return (
+            f"fused_conv1d_{self.attention_mode.value}_{self.mode.value}"
+            f"_b{self.seq_tile_size}_c{self.chunk_size}{suffix}"
+        )
 
     def get_metadata(self) -> dict[str, str | int | float]:
         cfgs_dict = dataclasses.asdict(self)
@@ -225,20 +211,21 @@ class GDNConfig:
 
     # Fraction of VMEM the kernel may use. A multi-token window holds one
     # state checkpoint per position in VMEM, so for large-head models the
-    # default 0.7 budget is not enough; those get a higher limit and the
+    # default 0.80 budget is not enough; those get a higher limit and the
     # wrapper sizes the tile against the same factor.
-    DEFAULT_VMEM_FRACTION = 0.7
-    WINDOWED_VMEM_FRACTION = 0.9
+    DEFAULT_VMEM_FRACTION: ClassVar[float] = 0.80
+    WINDOWED_VMEM_FRACTION: ClassVar[float] = 0.90
 
-    def get_vmem_limit_bytes(self) -> int:
-        tpu_info = pltpu.get_tpu_info()
-        fraction = (self.WINDOWED_VMEM_FRACTION
-                    if self.window_size > 1 else self.DEFAULT_VMEM_FRACTION)
-        return int(fraction * tpu_info.vmem_capacity_bytes)
+    @classmethod
+    def get_vmem_limit_bytes(cls, window_size: int = 1) -> int:
+        """Returns the VMEM limit for a kernel keeping window_size checkpoints."""
+        fraction = (
+            cls.WINDOWED_VMEM_FRACTION if window_size > 1 else cls.DEFAULT_VMEM_FRACTION
+        )
+        return int(fraction * pltpu.get_tpu_info().vmem_capacity_bytes)
 
     def get_scratch_shape_dict(self) -> dict[str, Any]:
-        conv_shape = (self.seq_tile_size, self.prev_kernel_size, 1,
-                      self.dim_size)
+        conv_shape = (self.seq_tile_size, self.prev_kernel_size, 1, self.dim_size)
         recurrent_shape = (
             self.seq_tile_size,
             self.num_v_heads,

@@ -1,4 +1,18 @@
 #!/bin/bash
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 # shellcheck disable=SC2034  # Variables are sourced by run_benchmarks.sh
 # Nightly perf benchmark for GLM-5.2-FP8 on TPU v7x-16: attention-DP
 # layout TP=1 x DP=16 with EP — every device runs its own chip-local
@@ -61,15 +75,11 @@ KV_CACHE_DTYPE="fp8"
 # FLASH_ATTN_MLA whenever use_mla is set.
 
 # Parser flags for tool call / reasoning compatibility.
-# --api-server-count=1: with DP, vllm defaults one API frontend per DP
-# rank and the frontends race resolving the gs:// model into the
-# streamer cache (empty config.json read -> pydantic error, dev build
-# 164).
 # --enable-ep-weight-filter: with EP + the runai gs:// path, each rank
 # streams only the byte ranges of its own experts plus dense weights
 # (model_loader_patches.py, #373) instead of the full 761GB checkpoint
 # (validated: 16/256 experts per rank, dev build 184).
-EXTRA_SERVE_ARGS="${EXTRA_SERVE_ARGS:+$EXTRA_SERVE_ARGS }--enable-ep-weight-filter --api-server-count=1 --safetensors-load-strategy=prefetch --tool-call-parser glm47 --enable-auto-tool-choice --reasoning-parser glm45"
+EXTRA_SERVE_ARGS="${EXTRA_SERVE_ARGS:+$EXTRA_SERVE_ARGS }--enable-ep-weight-filter --safetensors-load-strategy=prefetch --tool-call-parser glm47 --enable-auto-tool-choice --reasoning-parser glm45"
 
 # MoE headroom analysis note:
 # FORCE_MOE_RANDOM_ROUTING=1 can be set in the environment for headroom analysis
@@ -78,3 +88,7 @@ EXTRA_SERVE_ARGS="${EXTRA_SERVE_ARGS:+$EXTRA_SERVE_ARGS }--enable-ep-weight-filt
 # Greedy decoding for bench requests.
 BENCHMARK_TEMPERATURE="0"
 EVAL_TOLERANCE="0.025"
+LM_EVAL_TASKS="mmlu_pro"
+MMLU_PRO_DISABLE_MULTITURN_ARGS=true
+EXTRA_LM_EVAL_MODEL_ARGS="num_concurrent=32,timeout=7200"
+LM_EVAL_GEN_KWARGS="until=['<|im_end|>']"

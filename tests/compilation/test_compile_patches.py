@@ -21,9 +21,11 @@ import vllm.compilation.wrapper as wrapper_mod
 from vllm.compilation.piecewise_backend import PiecewiseBackend
 from vllm.compilation.wrapper import TorchCompileWithNoGuardsWrapper
 
-from vllm_torchtpu import (_patch_vllm_compile_prefix_isolation,
-                           _patch_vllm_piecewise_backend,
-                           _patch_vllm_reset_compile_wrapper)
+from vllm_torchtpu import (
+    _patch_vllm_compile_prefix_isolation,
+    _patch_vllm_piecewise_backend,
+    _patch_vllm_reset_compile_wrapper,
+)
 
 
 class _Wrapped(torch.nn.Module, TorchCompileWithNoGuardsWrapper):
@@ -57,8 +59,7 @@ class TestResetCompileWrapperRecursion:
         # own reset unwraps only one level before giving up.
         model = torch.nn.Module()
         model.model = torch.nn.Module()
-        model.model.layers = torch.nn.ModuleList(
-            [_Wrapped() for _ in range(3)])
+        model.model.layers = torch.nn.ModuleList([_Wrapped() for _ in range(3)])
         model.model.head = _Wrapped()
 
         wrapper_mod.reset_compile_wrapper(model)
@@ -104,10 +105,9 @@ class TestPiecewiseBackendDispatch:
     def _backend(sym_shape_indices):
         """A backend with two compiled buckets, keyed by the shape asked for."""
         entries = {
-            n:
-            SimpleNamespace(compiled=True,
-                            compile_range=(n, n),
-                            runnable=lambda *a, n=n, **k: n)
+            n: SimpleNamespace(
+                compiled=True, compile_range=(n, n), runnable=lambda *a, n=n, **k: n
+            )
             for n in (16, 128)
         }
         return SimpleNamespace(
@@ -162,7 +162,8 @@ class TestCompilePrefixIsolation:
     def test_distinct_prefixes_stay_distinct(self, prefixes):
         for i in (0, 1):
             TorchCompileWithNoGuardsWrapper.__init__(
-                _Wrapped(prefix=f"model.layers.{i}"))
+                _Wrapped(prefix=f"model.layers.{i}")
+            )
         assert prefixes == ["model.layers.0", "model.layers.1"]
 
     def test_missing_prefix_falls_back_to_a_unique_counter(self, prefixes):
@@ -172,8 +173,9 @@ class TestCompilePrefixIsolation:
         assert len(set(prefixes)) == 2
 
     def test_explicit_prefix_is_left_alone(self, prefixes):
-        TorchCompileWithNoGuardsWrapper.__init__(_Wrapped(prefix="ignored"),
-                                                 compile_prefix="caller")
+        TorchCompileWithNoGuardsWrapper.__init__(
+            _Wrapped(prefix="ignored"), compile_prefix="caller"
+        )
         assert prefixes == ["caller"]
 
     def test_encoder_keeps_the_shared_prefix(self, prefixes):

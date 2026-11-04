@@ -1,4 +1,17 @@
 #!/bin/bash
+# Copyright 2025 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 # shellcheck disable=all
 set -e
@@ -9,7 +22,7 @@ wait_for_server() {
   local port=$1
   local pid=$2
   timeout 1200 bash -c "
-    until curl -s localhost:${port}/health > /dev/null; do
+    until curl -s 127.0.0.1:${port}/health > /dev/null; do
       if ! kill -0 $pid 2>/dev/null; then
         echo \"Error: vLLM server on port $port (PID $pid) crashed or failed to start!\" >&2
         exit 1
@@ -89,6 +102,12 @@ INPUT_LEN=${INPUT_LEN:=512}
 OUTPUT_LEN=${OUTPUT_LEN:=128}
 NUM_PROMPTS=${NUM_PROMPTS:=200}
 REQUEST_RATE=${REQUEST_RATE:=4}
+# Extra `vllm serve` flags per role, word-split into arrays without pathname
+# globbing (supports flags without spaces in their values). Empty by default;
+# CI uses them to stop each role compiling shapes this benchmark never runs
+# (see the disagg-single-host step in .buildkite/pipeline_integration.yml).
+read -ra PREFILL_EXTRA <<< "${PREFILL_EXTRA_ARGS:-}"
+read -ra DECODE_EXTRA <<< "${DECODE_EXTRA_ARGS:-}"
 
 NUM_PREFILL_INSTANCES=1
 NUM_DECODE_INSTANCES=1
@@ -135,10 +154,11 @@ for i in $(seq 0 $((NUM_PREFILL_INSTANCES-1))); do
     --gpu-memory-utilization 0.2 \
     --tensor-parallel-size $PREFILLER_TP_SIZE \
     --attention-backend CUSTOM \
+    "${PREFILL_EXTRA[@]}" \
     --kv-transfer-config "{\"kv_connector\":\"TPUConnector\",\"kv_connector_module_path\":\"vllm_torchtpu.distributed.kv_transfer.tpu_connector\",\"kv_role\":\"kv_producer\"}" \
     > $LOG_DIR/prefill_$i.txt 2>&1 &
 
-    PREFILL_HOSTS+=("localhost")
+    PREFILL_HOSTS+=("127.0.0.1")
     PREFILL_PORTS+=($PORT)
     PREFILL_PIDS+=($!)
 done
@@ -166,10 +186,11 @@ for i in $(seq 0 $((NUM_DECODE_INSTANCES-1))); do
     --gpu-memory-utilization 0.2 \
     --tensor-parallel-size $DECODER_TP_SIZE \
     --attention-backend CUSTOM \
+    "${DECODE_EXTRA[@]}" \
     --kv-transfer-config "{\"kv_connector\":\"TPUConnector\",\"kv_connector_module_path\":\"vllm_torchtpu.distributed.kv_transfer.tpu_connector\",\"kv_role\":\"kv_consumer\"}" \
     > $LOG_DIR/decode_$i.txt 2>&1 &
 
-    DECODE_HOSTS+=("localhost")
+    DECODE_HOSTS+=("127.0.0.1")
     DECODE_PORTS+=($PORT)
     DECODE_PIDS+=($!)
 done
@@ -192,7 +213,7 @@ echo "starting proxy server"
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)
 # Start proxy server
 python $SCRIPT_DIR/toy_proxy_server.py \
---host localhost \
+--host 127.0.0.1 \
 --port 8000 \
 --prefiller-hosts ${PREFILL_HOSTS[@]} \
 --prefiller-ports ${PREFILL_PORTS[@]} \
@@ -214,7 +235,7 @@ vllm bench serve \
   --random-output-len=${OUTPUT_LEN} \
   --num-prompts=${NUM_PROMPTS} \
   --ignore-eos \
-  --host=localhost \
+  --host=127.0.0.1 \
   --port 8000 \
   --request-rate=${REQUEST_RATE} \
   >> $LOG_FILE 2>&1

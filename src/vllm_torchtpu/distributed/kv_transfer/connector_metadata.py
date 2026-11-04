@@ -1,4 +1,16 @@
-# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Scheduler->worker metadata contract shared by the TPU KV connectors.
 
 These dataclasses are the connector-neutral request bookkeeping (what to
@@ -8,10 +20,8 @@ live here rather than inside either transport module.
 """
 
 from dataclasses import dataclass, field
-from typing import Optional
 
-from vllm.distributed.kv_transfer.kv_connector.v1.base import \
-    KVConnectorMetadata
+from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata
 
 ReqId = str
 
@@ -20,6 +30,7 @@ ReqId = str
 class SendMeta:
     uuid: int
     local_block_ids: list[int]
+    # Unix timestamp in seconds, compared by workers on different hosts.
     expiration_time: float
     # Exact transfer extent for controller-planned PCP striping. Legacy send
     # paths leave this unset.
@@ -28,16 +39,27 @@ class SendMeta:
     # ordinal (the block holding the final recurrent state); None for FA-only
     # Stage-3 models and all legacy paths.
     mamba_state_block_ids: list[int] | None = None
+    # One block table per transferred kv-cache group, in Stage-3 transfer-plan
+    # order. Only DSv4 sets it, because its groups page at different sizes;
+    # single-group models leave it None and use local_block_ids.
+    group_block_ids: list[list[int]] | None = None
+    # The prompt token the producer dropped for the consumer to compute; a
+    # prefill-only drafter seeds its boundary row with it.
+    next_prompt_token_id: int | None = None
+    # Published in the step that completes the prompt, ahead of the finish:
+    # the worker registration starts finish_pending (no TTL, no status
+    # probe) until finished_req_ids names the request.
+    registered_ahead: bool = False
 
 
 @dataclass
 class LoadMeta:
     uuid: int
-    local_block_ids: list[int]
-    remote_block_ids: list[int]
+    local_block_ids: list[int] | None
+    remote_block_ids: list[int] | None
     remote_host: str | list[str]
     remote_port: int | list[int]
-    remote_side_channel_port: Optional[int] = None
+    remote_side_channel_port: int | None = None
     # Whether the worker reports this load's completion to the scheduler as
     # finished_recving. False when this connector doesn't own the request's
     # load state (the request is not WAITING_FOR_REMOTE_KVS here, e.g. a full
@@ -45,9 +67,14 @@ class LoadMeta:
     # report would trip the scheduler's assert or prematurely resume the
     # request.
     report_completion: bool = True
+    # The scheduler rejected this load after allocation.
+    fail_only: bool = False
 
 
 @dataclass
 class TPUConnectorMetadata(KVConnectorMetadata):
     reqs_to_send: dict[ReqId, SendMeta] = field(default_factory=dict)
     reqs_to_load: dict[ReqId, LoadMeta] = field(default_factory=dict)
+    # Producer request id -> transfer uuid whose ahead-of-finish request-block
+    # registration every pipeline stage retires.
+    reqs_to_release: dict[ReqId, int] = field(default_factory=dict)

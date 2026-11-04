@@ -1,5 +1,19 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 from unittest.mock import patch
 
+import pytest
 from vllm.v1.core.sched.async_scheduler import AsyncScheduler
 from vllm.v1.core.sched.interface import PauseState
 
@@ -9,7 +23,7 @@ from vllm_torchtpu.core.tpu_scheduler import TpuDpScheduler
 def _make_scheduler(waiting=(), drain_prefill=False):
     scheduler = TpuDpScheduler.__new__(TpuDpScheduler)
     scheduler.waiting = list(waiting)
-    scheduler.skipped_waiting = []
+    scheduler.kv_holding_waiting = []
     scheduler._pause_state = PauseState.UNPAUSED
     scheduler._drain_prefill = drain_prefill
     scheduler.prefill_capacity_bound = False
@@ -20,8 +34,7 @@ def test_unthrottled_step_opens_drain_window():
     scheduler = _make_scheduler(waiting=[object()])
     expected = object()
 
-    with patch.object(AsyncScheduler, "schedule",
-                      return_value=expected) as schedule:
+    with patch.object(AsyncScheduler, "schedule", return_value=expected) as schedule:
         result = scheduler.schedule(throttle_prefills=False)
 
     assert result is expected
@@ -40,8 +53,7 @@ def test_throttled_step_pauses_new_requests():
         seen["pause_state"] = scheduler._pause_state
         return expected
 
-    with patch.object(AsyncScheduler, "schedule",
-                      side_effect=capture) as schedule:
+    with patch.object(AsyncScheduler, "schedule", side_effect=capture) as schedule:
         result = scheduler.schedule(throttle_prefills=True)
 
     assert result is expected
@@ -77,10 +89,10 @@ def test_drain_spans_throttled_steps_until_queue_empties():
 def test_pause_state_restored_when_schedule_raises():
     scheduler = _make_scheduler(waiting=[object()])
 
-    with patch.object(AsyncScheduler, "schedule", side_effect=RuntimeError):
-        try:
-            scheduler.schedule(throttle_prefills=True)
-        except RuntimeError:
-            pass
+    with (
+        patch.object(AsyncScheduler, "schedule", side_effect=RuntimeError),
+        pytest.raises(RuntimeError),
+    ):
+        scheduler.schedule(throttle_prefills=True)
 
     assert scheduler._pause_state is PauseState.UNPAUSED

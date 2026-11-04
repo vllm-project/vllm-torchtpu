@@ -15,8 +15,8 @@
 
 ``VllmConfig.compute_hash()`` folds the whole ``additional_config`` dict in,
 and that hash feeds both the AOT compile cache key and the piecewise cache dir.
-The phased profiler's remaining ``additional_config`` knob only steers
-profiling, so letting it into the hash would force needless recompiles.
+The phased profiler's remaining ``additional_config`` knobs only steer
+profiling, so letting them into the hash would force needless recompiles.
 """
 
 from types import SimpleNamespace
@@ -27,24 +27,29 @@ from vllm.config import VllmConfig
 from vllm_torchtpu import _patch_vllm_config_hash_ignore_diagnostics
 from vllm_torchtpu.runner.utils import (
     HASH_IGNORED_ADDITIONAL_CONFIG_KEYS,
-    PHASED_PROFILER_DECODE_ONLY_KV_LEN_THRESHOLD_KEY)
+    PHASED_PROFILER_DECODE_ONLY_KV_LEN_THRESHOLD_KEY,
+    PHASED_PROFILER_PREFILL_ONLY_KV_LEN_THRESHOLD_KEY,
+)
 
 KEY = PHASED_PROFILER_DECODE_ONLY_KV_LEN_THRESHOLD_KEY
+PREFILL_KEY = PHASED_PROFILER_PREFILL_ONLY_KV_LEN_THRESHOLD_KEY
 
 # Class attributes the patch stamps onto VllmConfig, which monkeypatch cannot
 # roll back on its own because they did not exist beforehand.
-_PATCH_STAMPS = ("_tpu_additional_config_hash_patch",
-                 "_tpu_upstream_compute_hash")
+_PATCH_STAMPS = ("_tpu_additional_config_hash_patch", "_tpu_upstream_compute_hash")
 
 
 def _upstream_compute_hash():
     """The genuine implementation, whether or not the patch already ran.
 
     Another test may have built a VllmConfig, which runs
-    ``TpuPlatform.check_and_update_config()`` -> ``apply_tpu_patches()``.
+    ``TpuPlatform.check_and_update_config()`` ->
+    ``patch_registry.apply("platform_activation")``.
     """
-    return getattr(VllmConfig, "_tpu_upstream_compute_hash",
-                   None) or VllmConfig.__dict__["compute_hash"]
+    return (
+        getattr(VllmConfig, "_tpu_upstream_compute_hash", None)
+        or VllmConfig.__dict__["compute_hash"]
+    )
 
 
 class _StubVllmConfig:
@@ -52,14 +57,16 @@ class _StubVllmConfig:
 
     A real VllmConfig needs a fully materialized ModelConfig to construct.
     ``compute_hash()`` guards every sub-config with ``if self.x:``, so ``None``
-    sends them all down the "absent" branch -- except ``observability_config``,
-    which is dereferenced unconditionally.
+    sends them all down the "absent" branch -- except ``observability_config``
+    and ``aux_output_config``, which are dereferenced unconditionally.
     """
 
     def __init__(self, additional_config=None):
         self.additional_config = additional_config
         self.observability_config = SimpleNamespace(
-            compute_hash=lambda: "observability")
+            compute_hash=lambda: "observability"
+        )
+        self.aux_output_config = SimpleNamespace(compute_hash=lambda: "aux_output")
 
     def __getattr__(self, name):
         # Let dunders (``__setstate__``/``__deepcopy__``/...) miss normally so
@@ -75,7 +82,7 @@ def apply_patch_over(monkeypatch):
 
     def _apply(trunk):
         monkeypatch.setattr(VllmConfig, "compute_hash", trunk)
-        # apply_tpu_patches() may already have run in this process; the patch
+        # Platform activation may already have run in this process; the patch
         # is idempotent by design, so clear its stamps to re-wrap the trunk.
         for stamp in _PATCH_STAMPS:
             monkeypatch.delattr(VllmConfig, stamp, raising=False)
@@ -96,18 +103,19 @@ def patched_compute_hash(apply_patch_over):
 
 def test_unpatched_hash_changes_with_the_threshold():
     """Guards the premise: without the carve-out this busts the cache."""
-    assert (_upstream_compute_hash()(_StubVllmConfig({KEY: 128}))
-            != _upstream_compute_hash()(_StubVllmConfig({KEY: 256})))
+    assert _upstream_compute_hash()(
+        _StubVllmConfig({KEY: 128})
+    ) != _upstream_compute_hash()(_StubVllmConfig({KEY: 256}))
 
 
 def test_threshold_no_longer_changes_the_hash(patched_compute_hash):
     """Retuning a profiling threshold must not force a recompile."""
-    assert (patched_compute_hash(_StubVllmConfig(
-        {KEY: 128})) == patched_compute_hash(_StubVllmConfig({KEY: 256})))
+    assert patched_compute_hash(_StubVllmConfig({KEY: 128})) == patched_compute_hash(
+        _StubVllmConfig({KEY: 256})
+    )
 
 
-def test_setting_the_threshold_reuses_the_unprofiled_cache(
-        patched_compute_hash):
+def test_setting_the_threshold_reuses_the_unprofiled_cache(patched_compute_hash):
     """Adding the knob at all must not invalidate a cache built without it."""
     baseline = patched_compute_hash(_StubVllmConfig())
 
@@ -116,21 +124,41 @@ def test_setting_the_threshold_reuses_the_unprofiled_cache(
 
 def test_non_diagnostic_keys_still_change_the_hash(patched_compute_hash):
     """Only the profiling knob is carved out; the rest still count."""
-    assert (patched_compute_hash(
-        _StubVllmConfig({
-            "some_plugin_knob": 1,
-            KEY: 128,
-        })) != patched_compute_hash(
-            _StubVllmConfig({
+    assert patched_compute_hash(
+        _StubVllmConfig(
+            {
+                "some_plugin_knob": 1,
+                KEY: 128,
+            }
+        )
+    ) != patched_compute_hash(
+        _StubVllmConfig(
+            {
                 "some_plugin_knob": 2,
                 KEY: 128,
-            })))
+            }
+        )
+    )
 
 
 def test_untouched_configs_keep_their_upstream_hash(patched_compute_hash):
     config = _StubVllmConfig({"some_plugin_knob": 1})
 
     assert patched_compute_hash(config) == _upstream_compute_hash()(config)
+
+
+@pytest.mark.parametrize("additional_config", [None, {"option": 1}, {KEY: 128}])
+@pytest.mark.parametrize("include_version", [False, True])
+def test_hash_forwards_include_version(
+    patched_compute_hash, additional_config, include_version
+):
+    config = _StubVllmConfig(additional_config)
+    filtered = _StubVllmConfig(
+        {} if additional_config == {KEY: 128} else additional_config
+    )
+    expected = _upstream_compute_hash()(filtered, include_version=include_version)
+    assert patched_compute_hash(config, include_version=include_version) == expected
+    assert patched_compute_hash(config, include_version) == expected
 
 
 def test_additional_config_is_restored_after_hashing(patched_compute_hash):
@@ -143,8 +171,7 @@ def test_additional_config_is_restored_after_hashing(patched_compute_hash):
 
 
 def test_additional_config_is_restored_when_hashing_raises(apply_patch_over):
-
-    def exploding_compute_hash(self):
+    def exploding_compute_hash(self, include_version=True):
         raise RuntimeError("boom")
 
     compute_hash = apply_patch_over(exploding_compute_hash)
@@ -173,4 +200,4 @@ def test_patch_is_idempotent(patched_compute_hash):
 
 
 def test_ignored_keys_match_the_keys_the_runner_reads():
-    assert HASH_IGNORED_ADDITIONAL_CONFIG_KEYS == {KEY}
+    assert {KEY, PREFILL_KEY} == HASH_IGNORED_ADDITIONAL_CONFIG_KEYS

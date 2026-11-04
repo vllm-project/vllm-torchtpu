@@ -13,11 +13,15 @@
 # limitations under the License.
 """DeepSeek-V4 mixture-of-experts layer."""
 
+from typing import cast
+
 import torch
 import torch.nn as nn
 from vllm.config import VllmConfig
-from vllm.distributed import (get_tensor_model_parallel_rank,
-                              get_tensor_model_parallel_world_size)
+from vllm.distributed import (
+    get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size,
+)
 from vllm.model_executor.layers.fused_moe import FusedMoEFactory
 from vllm.model_executor.layers.fused_moe.router.gate_linear import GateLinear
 from vllm.model_executor.models.utils import extract_layer_index
@@ -39,8 +43,7 @@ class DeepseekV4MoE(nn.Module):
         quant_config = vllm_config.quant_config
         self.prefix = prefix
 
-        self.routed_scaling_factor = getattr(config, "routed_scaling_factor",
-                                             1.0)
+        self.routed_scaling_factor = getattr(config, "routed_scaling_factor", 1.0)
         self.hidden_size = config.hidden_size
         self.n_routed_experts = config.n_routed_experts
         self.swiglu_limit = config.swiglu_limit
@@ -104,8 +107,10 @@ class DeepseekV4MoE(nn.Module):
             prefix=f"{prefix}.experts",
             scoring_func=self.scoring_func,
             routed_scaling_factor=self.routed_scaling_factor,
-            e_score_correction_bias=self.gate.e_score_correction_bias,
-            hash_indices_table=self.gate.tid2eid,
+            e_score_correction_bias=cast(
+                torch.Tensor | None, self.gate.e_score_correction_bias
+            ),
+            hash_indices_table=cast(torch.Tensor | None, self.gate.tid2eid),
             swiglu_limit=self.swiglu_limit,
             router_logits_dtype=torch.float32,
             apply_routed_scale_to_output=True,
@@ -119,30 +124,36 @@ class DeepseekV4MoE(nn.Module):
         # `FusedMoEFactory` above only reaches the router object, so mirror it
         # onto the experts layer.
         if self.gate.tid2eid is not None:
-            object.__setattr__(self.experts.routed_experts,
-                               "hash_indices_table", self.gate.tid2eid)
+            object.__setattr__(
+                self.experts.routed_experts, "hash_indices_table", self.gate.tid2eid
+            )
 
-    def forward(self,
-                hidden_states: torch.Tensor,
-                input_ids: torch.Tensor | None = None) -> torch.Tensor:
+    @property
+    def routes_dp_gathered_tokens(self) -> bool:
+        """Whether the experts see the DP-gathered batch or this rank's rows.
+
+        Hash routing indexes its table by token id, so the ids handed down
+        have to line up row-for-row with the hidden states the experts get.
+        The runner gathers them only while the quant method does not own its
+        own dispatch; an armed fused-EP layer does, and then the experts --
+        and the ids -- stay local. Asked of the layer rather than assumed,
+        because arming is decided per layer at weight load.
+        """
+        return self.experts.do_naive_dispatch_combine
+
+    def forward(
+        self, hidden_states: torch.Tensor, input_ids: torch.Tensor | None = None
+    ) -> torch.Tensor:
         """Forward pass executing router gate and fused expert computation."""
         if self.gate.tid2eid is not None and input_ids is None:
-            raise ValueError(
-                "DeepSeek V4 hash MoE routing requires input_ids.")
+            raise ValueError("DeepSeek V4 hash MoE routing requires input_ids.")
 
         org_shape = hidden_states.shape
-        if self.experts.is_internal_router:
-            final_hidden_states = self.experts(
-                hidden_states=hidden_states,
-                router_logits=hidden_states,
-                input_ids=input_ids,
-            )
-        else:
-            router_logits, _ = self.gate(hidden_states)
-            final_hidden_states = self.experts(
-                hidden_states=hidden_states,
-                router_logits=router_logits,
-                input_ids=input_ids,
-            )
+        # FusedMoEFactory gives the runner our gate, so it computes the logits.
+        final_hidden_states = self.experts(
+            hidden_states=hidden_states,
+            router_logits=hidden_states,
+            input_ids=input_ids,
+        )
 
         return final_hidden_states.view(org_shape)

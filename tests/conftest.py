@@ -14,10 +14,10 @@
 """Shared pytest configuration for all tests."""
 
 import os
+import sys
 
 # Keep TP collectives compiled in-graph (no graph break) for fullgraph TP.
-os.environ.setdefault("TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS",
-                      "false")
+os.environ.setdefault("TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS", "false")
 os.environ.setdefault("TORCHINDUCTOR_AUTOGRAD_CACHE", "0")
 
 # Forking after TorchTPU/JAX/PyTorch background threads have started can
@@ -34,6 +34,31 @@ import pytest
 import torch
 
 
+def pytest_collection_modifyitems(items):
+    """Run whole-slice worker-spawning tests before in-process TPU tests.
+
+    Once the pytest process itself initializes the TPU runtime (any test that
+    runs jax/torch_tpu in-process), a test that later spawns a fresh
+    ``torch.distributed.run`` worker group can no longer bootstrap the slice:
+    the workers fail with "PjRtClient is not initialized" and libtpu may tear
+    down the whole session with SLICE_FAILURE_SW_INJECT_ERROR. libtpu exposes
+    no release API, so the only safe ordering is spawn-first.
+
+    Within each group, files run in path order, whatever order they were
+    passed in. Tests that start an engine in a subprocess (tests/entrypoints)
+    need the TPU free, so they must run before the in-process tests under
+    tests/kernels and tests/layers, and a sharded run receives its files in
+    the planner's order. The sort is stable, so tests within a file keep
+    their order.
+    """
+    items.sort(
+        key=lambda item: (
+            0 if item.get_closest_marker("spawns_tpu_workers") else 1,
+            item.nodeid.split("::")[0],
+        )
+    )
+
+
 def pytest_addoption(parser):
     """Add --use-tpu command line option."""
     parser.addoption(
@@ -42,6 +67,82 @@ def pytest_addoption(parser):
         default=True,
         help="Run tests on TPU device instead of CPU",
     )
+
+
+@pytest.fixture(autouse=True)
+def _reset_warning_once():
+    """`warning_once` dedups by message for the life of the process, so without
+    this a test passes or fails depending on what ran before it."""
+    try:
+        import vllm.logger
+    except ImportError:
+        yield
+        return
+
+    vllm.logger._print_warning_once.cache_clear()
+    yield
+    vllm.logger._print_warning_once.cache_clear()
+
+
+@pytest.fixture
+def vllm_config_context():
+    """Run backend helpers with the same resolved layout as worker startup."""
+    from vllm.config import VllmConfig, set_current_vllm_config
+    from vllm.v1.attention.backends.utils import resolve_kv_cache_layout
+
+    config = VllmConfig()
+    resolve_kv_cache_layout(config, [["LBNHC", "LBHNC"]])
+    with set_current_vllm_config(config):
+        yield
+
+
+@pytest.fixture(scope="module")
+def dist_ctx():
+    """Single-rank gloo world and model-parallel groups for one test module.
+
+    Destroys only the groups this fixture created, so later test modules
+    start without a default process group. Groups that already existed when
+    the fixture ran stay in place.
+
+    Defined here rather than in tests/models/vllm/conftest.py: pytest 9.1 drops
+    a subdirectory conftest's fixtures when the file arguments go back into that
+    directory after a file directly under tests/, and sharded CI passes files in
+    any order.
+    """
+    import torch.distributed as dist
+    from vllm.config import VllmConfig, set_current_vllm_config
+    from vllm.distributed import (
+        destroy_distributed_environment,
+        destroy_model_parallel,
+        ensure_model_parallel_initialized,
+        init_distributed_environment,
+    )
+    from vllm.distributed.parallel_state import model_parallel_is_initialized
+
+    owns_world = not dist.is_initialized()
+    owns_model_parallel = False
+    if owns_world:
+        import portpicker
+
+        port = portpicker.pick_unused_port()
+        init_distributed_environment(
+            world_size=1,
+            rank=0,
+            local_rank=0,
+            distributed_init_method=f"tcp://127.0.0.1:{port}",
+            backend="gloo",
+        )
+    try:
+        owns_model_parallel = not model_parallel_is_initialized()
+        # GroupCoordinator construction consults the current vLLM config.
+        with set_current_vllm_config(VllmConfig()):
+            ensure_model_parallel_initialized(1, 1)
+        yield
+    finally:
+        if owns_model_parallel:
+            destroy_model_parallel()
+        if owns_world:
+            destroy_distributed_environment()
 
 
 @pytest.fixture
@@ -56,9 +157,45 @@ def device(request):
     if use_tpu:
         try:
             import torch_tpu  # noqa: F401
+
             return torch.device("tpu")
         except ImportError:
             pytest.skip("torch_tpu not available")
         except Exception as e:
             pytest.fail(f"TPU requested but failed to initialize: {e}")
     return torch.device("cpu")
+
+
+def pytest_collection_finish(session):
+    """Fail fast if collecting the suite claimed the accelerator.
+
+    libtpu is process-exclusive. A PJRT client built in the pytest PARENT locks
+    out every child, and vLLM's engine and workers run in spawned children (see
+    VLLM_WORKER_MULTIPROC_METHOD above), so every engine-starting test in the
+    run then dies with "pjrt client not initialized" -- far from the module
+    that actually claimed the device.
+
+    Collection is import-time, so anything evaluated at module scope counts:
+    the usual culprit is a `pytest.mark.skipif(jax.device_count() < N)`, which
+    builds a client to answer and does so even when the marker goes on to
+    deselect every test in the file. Put that check in a fixture instead; a
+    fixture runs at setup, after deselection.
+
+    Checked here rather than left to CI because the failure is invisible to any
+    run that does not collect the offending file and an engine test together.
+    """
+    if "jax" not in sys.modules:
+        return
+    from jax._src import xla_bridge
+
+    if not xla_bridge.backends_are_initialized():
+        return
+    raise pytest.UsageError(
+        "A JAX backend was initialized during test collection, which claims "
+        "the TPU for this process and makes every spawned engine/worker child "
+        "fail with 'pjrt client not initialized'. Some test module touches the "
+        "accelerator at import time -- most often a module-level "
+        "`jax.device_count()` in a `skipif`. Move it into a fixture. To find "
+        "the module: bisect with `pytest --collect-only <subset>` and check "
+        "`jax._src.xla_bridge.backends_are_initialized()` after each."
+    )

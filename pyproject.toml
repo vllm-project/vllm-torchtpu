@@ -3,13 +3,16 @@ requires = ["setuptools>=61.0.0", "wheel", "setuptools_scm[toml]>=8.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "vllm_torchtpu"
+name = "vllm-torchtpu-core"
 dynamic = ["version"]
 description = ""
 readme = "README.md"
-requires-python = ">=3.12"
+# 3.12 only: every tpu-raiden-torch wheel is cp312-only, so any other interpreter
+# fails to resolve. Stating it here makes that an up-front error rather than an
+# unsatisfiable-requirements failure partway through a Docker build.
+requires-python = ">=3.12,<3.13"
 authors = [
-    { name = "vllm_torchtpu Contributors" }
+    { name = "vLLM TorchTPU Contributors" }
 ]
 classifiers = [
     "Development Status :: 3 - Alpha",
@@ -24,54 +27,59 @@ dependencies = [
     "tpu-info",
     "portpicker",
     "pathwaysutils",
-    # Note: we **intentionally** build vllm from source, see README.
-    # vllm==0.27.0 is required for Kimi K3 compatibility
-    "vllm @ git+https://github.com/vllm-project/vllm.git@v0.27.0",
+    # vllm: see the `vllm` dependency group below.
     "torch==2.13.0",
     # Some multimodal checkpoints dynamically invoke torchvision at class-definition
-    # time in their HF processors. We must explicitly pin torchvision statically
-    # matching our torch==2.13.0 constraint to prevent the CI Docker base image
-    # from leaking structurally incompatible pre-compiled nms operators!
+    # time in their HF processors. torchvision's pre-compiled ops (nms and friends)
+    # are built against a specific torch ABI, so this stays pinned in lockstep with
+    # torch==2.13.0 above; a mismatched pair fails at operator-registration time,
+    # not at install time.
     "torchvision==0.28.0",
-    "torch-tpu==0.1.1.dev20260813160135",
+    "torch_tpu==0.2.0",
     # High-bandwidth PJRT raw-transfer / KV-cache DMA engine backing the
-    # raiden KV connector (disaggregated serving) and host KV offload. The
-    # wheel bundles one extension per supported torch ABI and dispatches to
-    # the variant matching the installed torch at import time.
-    "tpu-raiden-torch==0.0.1.dev20260819190323",
+    # raiden KV connector (disaggregated serving) and host KV offload; the
+    # import name is `tpu_sync`. The wheel bundles one extension per
+    # supported torch ABI and dispatches to the variant matching the
+    # installed torch at import time. Published to PyPI as nightly .dev
+    # pre-releases, so it needs no registry source below.
+    "tpu-sync-torch==0.0.1.dev20261012084241",
+    # Imported directly by src/vllm_torchtpu/models/vllm/qwen3_vl_patch.py and
+    # qwen4_exp/, so declared here rather than leaned on as a vLLM transitive.
+    #
+    # qwen4_exp/ takes Qwen4ExpTextConfig from transformers, which relabels the
+    # checkpoint's full_attention layers on load:
+    # * before v5.18: qwen_sparse_attention
+    # * from v5.18 on: indexed_attention
+    #   (https://github.com/huggingface/transformers/pull/48974)
+    # qwen4_exp/ accepts only indexed_attention, hence the floor. vLLM 0.32.0
+    # and vllm-omni 0.32.0rc1 both take transformers>=5.16.1,<5.20.0. No upper
+    # bound in base dependencies, so upstream vLLM HEAD canary builds
+    # (vllm-torchtpu-integration) can resolve. Monitored for potential
+    # structured-output spec-decode divergence (#1093) on transformers>=5.17.
+    "transformers>=5.18.0",
     # Required for N-gram speculative decoding
     # vLLM only lists it in its per-platform requirements/*.txt files (cuda.txt,
     # cpu.txt, ...) except tpu.txt, so it's missing
     # when installing vllm as a plain PyPI dependency for our TPU platform.
     "numba==0.65.0",
+    # sentencepiece 0.2.2 wheel is not available in the transient torch-tpu registry
+    "sentencepiece<0.2.2",
     # See the JAX fori-loop lowering monkey-patch in
     # src/vllm_torchtpu/env_override.py; it works around a Pallas remainder-loop
     # bloat this JAX pin regresses on (validated on Qwen3.5-397B DP=8 EP).
-    "jax==0.10.2",
-    "jaxlib==0.10.2",
-    # This libtpu pin needs the workarounds in src/vllm_torchtpu/env_override.py
-    # (SC-offload threshold gate) and the per-config LIBTPU_INIT_ARGS additions
-    # under scripts/vllm/benchmarking/configs/. Re-verify those runs before
-    # bumping.
-    "libtpu==0.0.44.1",
+    "jax==0.11.2",
+    "jaxlib==0.11.2",
+    # tpu-sync-torch requires libtpu>=0.0.47. The workarounds in
+    # src/vllm_torchtpu/env_override.py (SC-offload threshold gate) and the
+    # per-config LIBTPU_INIT_ARGS additions under
+    # scripts/vllm/benchmarking/configs/ were tuned against an earlier libtpu;
+    # re-verify those runs when bumping.
+    "libtpu==0.0.50",
     "ray[default]",
     "ray[data]",
 ]
 
 [project.optional-dependencies]
-# Required for running tests
-test = [
-    "pytest",
-    "pytest-mock",
-    "pytest-timeout",
-    "parameterized",
-]
-
-# Dev tools (linting, formatting)
-dev = [
-    "yapf>=0.43.0",
-]
-
 # These are required for running any benchmarking
 # See more information at scripts/vllm/benchmarking/README.md
 benchmarking = [
@@ -85,12 +93,24 @@ benchmarking = [
     "evalscope==1.10.0",
     # Stream gs:// checkpoints via --load-format runai_streamer (multihost
     # v7x-16 hosts have no disk for an HF download).
-    "runai-model-streamer[gcs]",
+    # model_loader_patches.py and
+    # tests/model_loader/test_ep_sharded_runai_streaming.py use the 0.17
+    # FileChunks API (FileChunks.contiguous, parallel offset/size lists).
+    "runai-model-streamer[gcs]>=0.17",
 ]
 
-# vLLM-Omni optional dependency
+# vLLM-Omni optional dependency. vllm-omni keeps major.minor aligned with vLLM.
+# 0.32.0rc1 is not on PyPI yet; until it is, add the `omni-git` dependency
+# group below, which supplies it from its git tag.
 omni = [
-    "vllm-omni==0.27.0rc1",
+    "vllm-omni==0.32.0rc1",
+    # vllm-omni pulls torchaudio through s3tokenizer. The PyPI torchaudio is a
+    # CUDA build that fails to load libcudart, and transformers imports
+    # torchaudio whenever it is installed, so every vLLM import would fail.
+    # Take the CPU build instead (see [tool.uv.sources]). 2.11.0 is the newest
+    # torchaudio release; it declares no torch requirement and imports against
+    # torch 2.13.0.
+    "torchaudio==2.11.0",
 ]
 
 [project.entry-points."vllm.platform_plugins"]
@@ -105,36 +125,160 @@ torchtpu = "vllm_torchtpu.omni:register_omni_tpu_platform"
 [project.entry-points."vllm.general_plugins"]
 torchtpu_layers = "vllm_torchtpu.layers:register_layers"
 
+# Dev / CI / Docker only. These are PEP 735 dependency groups, not extras:
+# groups are never written into the built wheel's metadata, so their git URLs
+# do not block a PyPI upload (PyPI rejects direct-URL requirements, even in
+# extras). Install with `--group <name>` (uv, or pip >= 25.1).
+[dependency-groups]
+# vLLM built from source. Deliberately NOT in `dependencies`: the combined
+# `vllm-torchtpu` wheel already provides vLLM, and installing the real `vllm`
+# on top would overwrite it. Opt in with `pip install -e . --group vllm`.
+vllm = [
+    # Note: we **intentionally** build vllm from source, see README.
+    # Keep vllm_test_utils on the same upstream tag below.
+    "vllm @ git+https://github.com/vllm-project/vllm.git@v0.32.0",
+]
+
+# Source for the `omni` extra's vllm-omni==0.32.0rc1 while that release is not
+# on PyPI: install `--extra omni --group omni-git`. Drop this group, and the
+# flag, once it is.
+omni-git = [
+    "vllm-omni @ git+https://github.com/vllm-project/vllm-omni.git@v0.32.0rc1",
+]
+
+# Required for running tests
+test = [
+    # tests/kernels/ and tests/layers/ use absl.testing.
+    "absl-py",
+    "pytest",
+    "pytest-mock",
+    "pytest-timeout",
+    "pytest-cov",
+    "parameterized",
+    # Not published on PyPI; lives in vLLM's tests/ directory.
+    "vllm_test_utils @ git+https://github.com/vllm-project/vllm.git@v0.32.0#subdirectory=tests/vllm_test_utils",
+]
+
 [tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
 markers = [
+    "tpu_test: tests that require TPU hardware; CI runs them on a single-host TPU agent",
     "nightly: tests that only run in the nightly CI workflow",
     "multichip: tests that need more than 2 TPU chips; CI runs them on an 8-chip agent",
+    "spawns_tpu_workers: tests that spawn a torch.distributed.run worker group spanning the TPU slice; must run before any in-process TPU test in the same pytest session",
+    "omni: tests that run omni multimodal and diffusion models",
 ]
+
+[tool.ruff]
+# Without this, ruff ignores its `exclude` lists for any path named directly
+# on the command line, which is exactly how pre-commit invokes it. Setting it
+# makes `exclude` hold for both `ruff format .` and the hook.
+force-exclude = true
+
+# protoc writes this file; see scripts/update_xplane_proto.sh. Reformatting it
+# would make every regeneration produce a spurious diff.
+exclude = ["src/vllm_torchtpu/tools/xplane_pb2.py"]
+
+[tool.ruff.lint]
+# E pycodestyle, F pyflakes, I import sorting, UP outdated syntax, B likely
+# bugs, SIM needless complexity, G logging calls, ISC string concatenation,
+# T20 print calls, S110 `except: pass`, TID251 banned imports.
+# E501 fails a line longer than 88 characters, the width `ruff format` wraps
+# code at. The formatter does not split comments or strings, so wrap those by
+# hand.
+select = ["E", "F", "I", "UP", "B", "SIM", "G", "ISC", "T20", "S110", "TID251"]
+
+ignore = [
+    # Off on purpose, matching upstream vllm.
+    "B905",   # zip() without an explicit strict=
+    "B007",   # loop control variable not used in the body
+    "UP032",  # .format() that could be an f-string
+]
+
+# Banned in src/vllm_torchtpu/kernels/ and src/vllm_torchtpu/megakernel/ only;
+# see per-file-ignores below.
+[tool.ruff.lint.flake8-tidy-imports.banned-api]
+"torch".msg = "kernels/ is JAX and Pallas only. Put torch code in a vllm_adapter.py."
+"torch_tpu".msg = "kernels/ is JAX and Pallas only. Use it in a vllm_adapter.py."
+"vllm".msg = "kernels/ does not import vLLM. Pass the values in as arguments."
+
+[tool.ruff.lint.per-file-ignores]
+# Kernels must not import torch, torch_tpu or vLLM directly. Adapter files
+# bridge a kernel to torch. The three files listed after them already import
+# torch or vLLM and have not been split yet.
+"!src/vllm_torchtpu/{kernels,megakernel}/**" = ["TID251"]
+"src/vllm_torchtpu/kernels/**/vllm_adapter.py" = ["TID251"]
+"src/vllm_torchtpu/kernels/mla/kv_cache_utils.py" = ["TID251"]
+"src/vllm_torchtpu/kernels/partial_kv_update.py" = ["TID251"]
+"src/vllm_torchtpu/kernels/pool_adapters.py" = ["TID251"]
+
+# Pallas runs a kernel closure the moment it is defined: `pl.when` and
+# `pl.loop` trace the body during the decorator call, inside the iteration
+# that built it. B023 warns that a closure outliving its loop sees the last
+# value of the loop variable, which cannot happen to a body that never
+# outlives the iteration.
+#
+# Switching the rule off here would also hide a capture that does escape, so
+# tools/check_b023_baseline.py counts the findings per file and fails when a
+# file gains one. Both move together.
+"src/vllm_torchtpu/kernels/**" = ["B023"]
+
+# Library code logs through vllm_torchtpu.logger. Tests, scripts and
+# command-line tools print to the terminal on purpose.
+"!src/**" = ["T20"]
+"src/vllm_torchtpu/tools/merge_xplane.py" = ["T20"]
+
+[tool.ruff.format]
+docstring-code-format = true
+
+[tool.pymarkdown]
+# The docs site (Python-Markdown) only nests a list indented by 4 spaces. MD007
+# would rewrite nested lists to 2 spaces (or to the parent's text column under
+# a numbered item), which renders them flat.
+plugins.md007.enabled = false
 
 [tool.pyrefly]
 project-includes = ["src"]
 
-# Start at `basic`, which covers unambiguous mistakes (undefined names, bad
-# unpacking, wrong keyword arguments). Raising this to `default` adds ~300 more
-# findings, mostly attribute and argument types on the JAX/torch boundary;
-# that is worth doing as follow-up work, not as part of enabling the checker.
-preset = "basic"
+# Errors listed in the baseline file do not fail the check; any error not
+# listed does. To retire an entry, fix the code and delete the entry, or
+# regenerate the file with `pyrefly check --update-baseline`.
+preset = "default"
+baseline = ".pyrefly-baseline.json"
 
-# CI runs pre-commit without installing our dependencies, and `vllm` is
-# installed as an editable package behind a custom path hook that no static
-# checker can resolve. Listing these makes an unresolved import degrade to
-# `Any` instead of erroring, so local and CI runs agree. `ignore-missing-imports`
-# only applies when the module is genuinely unresolvable - when a package is
-# installed with type information, it is still checked normally.
+# Entries match on file, error kind, and message text, so a baselined error
+# keeps matching when lines move. pyrefly lets one entry cover every repeat of
+# its message in a file; both checks run through tools/check_pyrefly_baseline.py,
+# which also requires one entry per error.
+baseline-matching-mode = "concise-description"
+baseline-format = "minimal"
+
+# Never consult a Python environment. Every third-party import resolves to
+# `Any`, so the pre-commit hook, its CI job, and a bare `pyrefly check`
+# report the same errors and the baseline above matches in all three.
+# tools/typecheck_full.sh passes the CI image's site-packages explicitly and
+# uses .pyrefly-baseline-full.json, so calls into torch, jax and vllm are
+# checked there against their real signatures.
+# With no interpreter to ask, the Python version must be stated too, or
+# pyrefly assumes its own default and stdlib stubs drift between runners.
+skip-interpreter-query = true
+python-version = "3.12"
+
+# With no environment to query, every import below is unresolvable. Listing
+# them makes an unresolved import degrade to `Any` instead of erroring.
 ignore-missing-imports = [
     "compressed_tensors", "compressed_tensors.*",
     "einops", "einops.*",
+    "fastapi", "fastapi.*",
+    "google.protobuf", "google.protobuf.*",
     "jax", "jax.*",
     "jaxlib", "jaxlib.*",
     "numpy", "numpy.*",
     "packaging", "packaging.*",
     "pathwaysutils", "pathwaysutils.*",
     "portpicker", "portpicker.*",
+    "prometheus_client", "prometheus_client.*",
     "ray", "ray.*",
     "requests", "requests.*",
     "sympy", "sympy.*",
@@ -162,16 +306,16 @@ include = ["vllm_torchtpu*"]
 
 [tool.setuptools_scm]
 
-[tool.uv]
-keyring-provider = "subprocess"
-
+# Default PyPI serves Linux x86_64 wheels of torch and torchvision built with
+# CUDA, which pulls gigabytes of unnecessary nvidia-* runtime dependencies onto
+# TPU hosts. Pin them to the official PyTorch CPU index while resolving all
+# other packages (including torch-tpu, libtpu, and tpu-sync-torch) from PyPI.
 [[tool.uv.index]]
-name = "torch-tpu-registry"
-# torch-tpu-virtual-registry is a virtual registry that combines the PyTorch CPU index, Torch TPU index,
-# and the PyPI index. It priortizes package installs as such: PyTorch CPU index > Torch TPU index > PyPI index.
-url = "https://us-python.pkg.dev/ml-oss-artifacts-transient/torch-tpu-virtual-registry/simple/"
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
 explicit = true
 
 [tool.uv.sources]
-torch-tpu = { index = "torch-tpu-registry" }
-tpu-raiden-torch = { index = "torch-tpu-registry" }
+torch = { index = "pytorch-cpu" }
+torchvision = { index = "pytorch-cpu" }
+torchaudio = { index = "pytorch-cpu" }

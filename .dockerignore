@@ -31,4 +31,31 @@ share/python-wheels/
 .installed.cfg
 *.egg
 MANIFEST
+# Git repository
 .git
+
+# Test caches & coverage
+.pytest_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+
+# Non-runtime files excluded from container images (Fixes #820)
+docs/
+.buildkite/
+# ...except what the kube pods exec at runtime: the engine and benchmark
+# scripts, and parse_gke_results.py, which the benchmark calls to load its
+# results into BigQuery. The release tooling and the lane files are kept for
+# their unit tests in tests/scripts, which load them from the image:
+# test_bootstrap.py runs bootstrap.sh, which uploads .buildkite/pipeline_*.yml.
+!.buildkite/kubernetes/
+!.buildkite/scripts/
+!.buildkite/release/
+!.buildkite/pipeline_*.yml
+.github/
+mkdocs.yml
+.readthedocs.yaml
+.pre-commit-config.yaml
+# .coveragerc stays in the image: the coverage pipeline runs pytest --cov
+# inside the container and needs it for branch, parallel and subprocess
+# measurement.

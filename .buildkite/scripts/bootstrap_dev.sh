@@ -32,12 +32,19 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=/dev/null
 source "${SCRIPT_DIR}/configs/pipeline_config.sh"
 
+#Resolve and publish Version Metadata for developer pipeline
+VLLM_COMMIT_HASH=$(get_vllm_commit_hash)
+buildkite-agent meta-data set "VLLM_COMMIT_HASH" "${VLLM_COMMIT_HASH}"
+echo "Using vLLM commit: ${VLLM_COMMIT_HASH}"
+
 # Dev builds are experiments — they must never outrank real CI on a shared
 # queue. Default to PRIORITY_DEFAULT (1); override per build with
 # DEV_JOB_PRIORITY if an experiment needs to jump ahead of nightlies only.
 JOB_PRIORITY="${DEV_JOB_PRIORITY:-$PRIORITY_DEFAULT}"
 export JOB_PRIORITY
 buildkite-agent meta-data set "JOB_PRIORITY" "$JOB_PRIORITY"
+# No WORKLOAD_PRIORITY either: on kube an unclassed workload is ordered at 0,
+# ahead of the nightlies and behind every other kind of build.
 echo "--- Dev build priority: ${JOB_PRIORITY}"
 
 # Which pipeline to upload. Defaults to the demo pipeline_dev.yml; set

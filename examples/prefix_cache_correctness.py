@@ -1,3 +1,16 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """End-to-end prefix-cache correctness check for the unified KV pool.
 
 Prefix caching must be transparent: a request's output must not depend on
@@ -27,6 +40,7 @@ batched-RPA (``E2E_ATTN_BACKEND=CUSTOM``) pooled paths.
 
 Success = PREFIX_CACHE_OK. Any mismatch prints the offending tokens for triage.
 """
+
 import os
 import sys
 
@@ -40,7 +54,8 @@ _PARA = (
     "takes place mainly in the chloroplasts, using the green pigment "
     "chlorophyll to capture sunlight. The overall reaction combines carbon "
     "dioxide from the air with water drawn up from the roots, and releases the "
-    "products back into the environment. ")
+    "products back into the environment. "
+)
 SHARED_PREFIX = _PARA * 24  # ~1.5k tokens => several blocks at any block size
 
 # (question, substring the correct answer must contain). Answers are single
@@ -67,15 +82,11 @@ def main() -> int:
         max_num_batched_tokens=2048,
         quantization="fp8",
         kv_cache_dtype=os.environ.get("E2E_KVDTYPE", "auto"),
-        gpu_memory_utilization=float(os.environ.get("E2E_GPU_MEM_UTIL",
-                                                    "0.8")),
+        gpu_memory_utilization=float(os.environ.get("E2E_GPU_MEM_UTIL", "0.8")),
         enable_prefix_caching=True,
         enable_expert_parallel=os.environ.get("E2E_EP", "1") == "1",
         language_model_only=True,
-        limit_mm_per_prompt={
-            "image": 0,
-            "video": 0
-        },
+        limit_mm_per_prompt={"image": 0, "video": 0},
     )
     backend = os.environ.get("E2E_ATTN_BACKEND")
     if backend:
@@ -98,19 +109,21 @@ def main() -> int:
 
     unstable = [i for i in range(len(QA)) if cold_t[i] != warm_t[i]]
     wrong = [
-        i for i, (_, a) in enumerate(QA) if a.lower() not in cold_x[i].lower()
-        or a.lower() not in warm_x[i].lower()
+        i
+        for i, (_, a) in enumerate(QA)
+        if a.lower() not in cold_x[i].lower() or a.lower() not in warm_x[i].lower()
     ]
 
     for i in unstable:
         print(
             f"  UNSTABLE req{i}: cold={list(cold_t[i])} warm={list(warm_t[i])}",
-            flush=True)
+            flush=True,
+        )
     for i in wrong:
         print(
-            f"  WRONG req{i} want={QA[i][1]!r} "
-            f"cold={cold_x[i]!r} warm={warm_x[i]!r}",
-            flush=True)
+            f"  WRONG req{i} want={QA[i][1]!r} cold={cold_x[i]!r} warm={warm_x[i]!r}",
+            flush=True,
+        )
 
     if not unstable and not wrong:
         print("PREFIX_CACHE_OK", flush=True)

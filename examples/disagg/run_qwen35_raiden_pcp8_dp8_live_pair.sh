@@ -29,7 +29,6 @@ readonly DEFAULT_EXPECTED_VLLM_VERSION="0.26.1rc0"
 readonly DEFAULT_STARTUP_TIMEOUT=2400
 readonly DEFAULT_REQUEST_TIMEOUT=1800
 readonly DEFAULT_MAX_MODEL_LEN=65536
-readonly DEFAULT_BLOCK_SIZE=8192
 readonly DEFAULT_PREFILL_API_PORT=8400
 readonly DEFAULT_DECODE_API_PORT=9400
 readonly DEFAULT_PREFILL_CONTROLLER_PORT=27000
@@ -71,9 +70,9 @@ Options:
   --startup-timeout SEC    Server compilation/startup timeout (default: 2400).
   --request-timeout SEC    Each HTTP request timeout (default: 1800).
   --max-model-len TOKENS   Server model length (default: 65536).
-  --block-size TOKENS      Shared P/D page size (default: 8192). The explicit
-                           r20 geometry is required after main's physical-slot
-                           sizing change.
+  --block-size TOKENS      Optional shared P/D page-size floor. When omitted,
+                           each role derives its own page size from its pooled
+                           GDN state and attention-backend constraints.
   --ssh-option OPTION      Append one OpenSSH -o option; may be repeated.
   --preflight-only         Check both installed environments and free ports.
   --no-performance-gate    Report golden metrics without enforcing the r20
@@ -92,7 +91,7 @@ Advanced port overrides:
   --side-channel-port PORT         Connector side-channel base (9600)
 
 Both machines need an 8-chip TPU host, the exact model snapshot, and matching
-installed vllm, vllm-torchtpu, torch-tpu, and Torch tpu-raiden environments.
+installed vllm, vllm-torchtpu, torch-tpu, and tpu-sync-torch environments.
 The routable host values are not necessarily the SSH names. Raiden advertises
 dynamic worker endpoints, so the hosts need bidirectional TCP reachability.
 
@@ -425,7 +424,7 @@ print(json.dumps({
     "vllm_torchtpu_file": vllm_torchtpu.__file__,
     "torch_version": torch.__version__,
     "torch_tpu_version": dist_version("torch-tpu"),
-    "tpu_raiden_torch_version": dist_version("tpu-raiden-torch"),
+    "tpu_raiden_torch_version": dist_version("tpu-sync-torch"),
     "raiden_native_file": _tpu_raiden_torch.__file__,
     "vllm_torchtpu_fingerprint": package_fingerprint(vllm_torchtpu, {".py", ".so"}),
     "tpu_raiden_fingerprint": package_fingerprint(tpu_sync, {".py", ".so"}),
@@ -509,6 +508,18 @@ configure_role_environment() {
   export HUGGINGFACE_HUB_CACHE=/mnt/disk/hub
 
   export TPU_RAIDEN_CONTROLLER_ADDRESS="${controller_address}"
+  # TEST-ONLY: latest tpu-sync removed the Python pool-reshard path
+  # (RaidenController._start_pool_reshard_transfer), so the in-engine C++
+  # reshard store is the only control plane that still works. Store mode
+  # needs the role's routable address to advertise.
+  export TPU_RAIDEN_RESHARD_IMPL=store
+  export TPU_RAIDEN_ADVERTISE_HOST="${role_host}"
+  # The in-engine store binds RESHARD_PORT_BASE+dp_rank and
+  # STORE_DISPATCH_PORT_BASE+dp_rank. Offset both off this role's controller
+  # port so they cannot collide with the standalone controller this script
+  # still starts on ${controller_port}.
+  export TPU_RAIDEN_RESHARD_PORT_BASE=$((controller_port + 200))
+  export TPU_RAIDEN_STORE_DISPATCH_PORT_BASE=$((controller_port + 300))
   export JAX_PLATFORMS=tpu,cpu
   export PJRT_DEVICE=TPU
   export TPU_BACKEND_TYPE=jax
@@ -528,7 +539,6 @@ configure_role_environment() {
   export TPU_RAIDEN_QWEN35_ADMISSION=1
   export TPU_KV_RESHARD_TRANSPORT=raiden
   export TPU_RAIDEN_TRANSFER_PARALLELISM=8
-  export TPU_GDN_CONV_QK_PAIR_LAYOUT=1
 
   export XLA_PYTHON_CLIENT_PREALLOCATE=false
   export VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
@@ -559,6 +569,13 @@ configure_role_environment() {
   export TPU_KV_TRANSFER_NAMESPACE="${namespace}"
   export TPU_RAIDEN_JOB_NAME="${role}"
   export TPU_RAIDEN_ENGINE_ID="${run_id}-${role}-engine"
+
+  # Caller-specified role environment entries (--role-env KEY=VALUE), applied
+  # last so they can override the launcher defaults above.
+  local _role_env
+  for _role_env in ${ROLE_ENVS[@]+"${ROLE_ENVS[@]}"}; do
+    export "${_role_env?}"
+  done
 }
 
 record_child() {
@@ -798,7 +815,6 @@ PY
     --trust-remote-code
     --seed 42
     --max-model-len "${MAX_MODEL_LEN}"
-    --block-size "${BLOCK_SIZE}"
     --enable-expert-parallel
     --disable-custom-all-reduce
     --gpu-memory-utilization 0.9
@@ -813,6 +829,16 @@ PY
     --no-async-scheduling
     --tensor-parallel-size 1
   )
+  # TEST-ONLY: an empty --block-size means "let each role derive its own page
+  # size" (tpu_block_size_utils), instead of pinning the r20 8192 geometry.
+  # --num-gpu-blocks-override 64 belongs to that same pinned geometry: it is a
+  # fixed block *count*, sized so 64 x 8192 tokens covers max_num_seqs x
+  # max_model_len. It cannot survive a different page size, so it is applied
+  # only when the page size is pinned too; otherwise the runner's own
+  # compact-mamba sizing picks the count.
+  if [[ -n "${BLOCK_SIZE}" ]]; then
+    common_args+=(--block-size "${BLOCK_SIZE}" --num-gpu-blocks-override 64)
+  fi
   if [[ "${model}" != /* && -n "${MODEL_REVISION}" ]]; then
     common_args+=(--revision "${MODEL_REVISION}")
   fi
@@ -825,7 +851,6 @@ PY
       --long-prefill-token-threshold 32768
       --max-num-seqs 8
       --compilation-config "${prefill_compilation_config}"
-      --num-gpu-blocks-override 64
       --prefill-context-parallel-size 8
       --cp-kv-cache-interleave-size 256
       --kv-transfer-config '{"kv_connector":"TPURaidenConnector","kv_connector_module_path":"vllm_torchtpu.distributed.kv_transfer.tpu_connector","kv_role":"kv_producer","kv_port":'"${kv_port}"'}'
@@ -837,7 +862,6 @@ PY
       --max-num-batched-tokens 4384
       --max-num-seqs 32
       --compilation-config "${decode_compilation_config}"
-      --num-gpu-blocks-override 64
       --prefill-context-parallel-size 1
       --data-parallel-size 8
       --data-parallel-size-local 8
@@ -1661,6 +1685,9 @@ RESHARD_SIDECAR_BIN="${RESHARD_SIDECAR_BIN:-}"
 # being root-caused upstream). The summary carries an explicit marker; a
 # skipped-oracle run is NEVER a golden accuracy verification.
 SKIP_ACCURACY_ORACLE=0
+# Extra KEY=VALUE environment entries exported into both role processes
+# (forwarded verbatim to the internal-role invocations on each host).
+ROLE_ENVS=()
 PREFILL_HOST=""
 DECODE_HOST=""
 MODEL="${DEFAULT_MODEL}"
@@ -1674,7 +1701,7 @@ EXPECTED_VLLM_VERSION="${DEFAULT_EXPECTED_VLLM_VERSION}"
 STARTUP_TIMEOUT="${DEFAULT_STARTUP_TIMEOUT}"
 REQUEST_TIMEOUT="${DEFAULT_REQUEST_TIMEOUT}"
 MAX_MODEL_LEN="${DEFAULT_MAX_MODEL_LEN}"
-BLOCK_SIZE="${DEFAULT_BLOCK_SIZE}"
+BLOCK_SIZE=""
 PREFILL_API_PORT="${DEFAULT_PREFILL_API_PORT}"
 DECODE_API_PORT="${DEFAULT_DECODE_API_PORT}"
 PREFILL_CONTROLLER_PORT="${DEFAULT_PREFILL_CONTROLLER_PORT}"
@@ -1714,8 +1741,14 @@ while (($#)); do
     --side-channel-port) SIDE_CHANNEL_PORT="${2:?missing value for $1}"; shift 2 ;;
     --ssh-option) SSH_OPTIONS+=(-o "${2:?missing value for $1}"); shift 2 ;;
     --reshard-controller-impl) RESHARD_CONTROLLER_IMPL="${2:?missing value for $1}"; shift 2 ;;
-    --reshard-sidecar-bin) RESHARD_SIDECAR_BIN="${2:?missing value for $1}"; shift 2 ;;
+    # Forwarded to the internal roles verbatim; empty means "no sidecar"
+    # (store / python modes), so an empty value must parse.
+    --reshard-sidecar-bin) RESHARD_SIDECAR_BIN="${2-}"; shift 2 ;;
     --skip-accuracy-oracle) SKIP_ACCURACY_ORACLE=1; shift ;;
+    --role-env)
+      [[ "${2:?missing value for $1}" == *=* ]] \
+        || die "--role-env requires KEY=VALUE, got: $2"
+      ROLE_ENVS+=("$2"); shift 2 ;;
     --preflight-only) PREFLIGHT_ONLY=1; shift ;;
     --no-performance-gate) PERFORMANCE_GATE=0; shift ;;
     --keep-cache) KEEP_CACHE=1; shift ;;
@@ -1736,9 +1769,11 @@ done
 is_positive_integer "${STARTUP_TIMEOUT}" || die "startup timeout must be positive"
 is_positive_integer "${REQUEST_TIMEOUT}" || die "request timeout must be positive"
 is_positive_integer "${MAX_MODEL_LEN}" || die "max model length must be positive"
-is_positive_integer "${BLOCK_SIZE}" || die "block size must be positive"
-((BLOCK_SIZE <= MAX_MODEL_LEN)) \
-  || die "block size cannot exceed max model length"
+if [[ -n "${BLOCK_SIZE}" ]]; then
+  is_positive_integer "${BLOCK_SIZE}" || die "block size must be positive"
+  ((BLOCK_SIZE <= MAX_MODEL_LEN)) \
+    || die "block size cannot exceed max model length"
+fi
 if ((MAX_MODEL_LEN < 65536)); then
   die "the golden benchmark requires --max-model-len at least 65536"
 fi
@@ -1793,6 +1828,15 @@ fi
   || die "--decode-host must be routable from the prefill host"
 
 SCRIPT_PATH="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
+# TEST-ONLY: forward selected caller env to the remote prefill role (it
+# otherwise sees only its own login-shell environment).
+REMOTE_ENV_PREFIX=()
+for _v in TPU_PREMAPPED_BUFFER_SIZE TPU_RAIDEN_POOL_STAGING_LEASES; do
+  if [[ -n "${!_v:-}" ]]; then
+    if ((${#REMOTE_ENV_PREFIX[@]} == 0)); then REMOTE_ENV_PREFIX=(env); fi
+    REMOTE_ENV_PREFIX+=("${_v}=${!_v}")
+  fi
+done
 LOCAL_RUN_DIR="${RUN_ROOT}/${RUN_ID}"
 DECODE_ROLE_DIR="${LOCAL_RUN_DIR}/decode"
 PREFILL_ROLE_DIR="${RUN_ROOT}/${RUN_ID}/prefill"
@@ -1811,7 +1855,6 @@ remote_args_common=(
   --run-id "${RUN_ID}"
   --expected-vllm-version "${EXPECTED_VLLM_VERSION}"
   --max-model-len "${MAX_MODEL_LEN}"
-  --block-size "${BLOCK_SIZE}"
   --prefill-api-port "${PREFILL_API_PORT}"
   --decode-api-port "${DECODE_API_PORT}"
   --prefill-controller-port "${PREFILL_CONTROLLER_PORT}"
@@ -1820,7 +1863,6 @@ remote_args_common=(
   --transfer-port "${TRANSFER_PORT}"
   --side-channel-port "${SIDE_CHANNEL_PORT}"
   --reshard-controller-impl "${RESHARD_CONTROLLER_IMPL}"
-  --reshard-sidecar-bin "${RESHARD_SIDECAR_BIN}"
 )
 local_args_common=(
   --role-kind decode
@@ -1834,7 +1876,6 @@ local_args_common=(
   --run-id "${RUN_ID}"
   --expected-vllm-version "${EXPECTED_VLLM_VERSION}"
   --max-model-len "${MAX_MODEL_LEN}"
-  --block-size "${BLOCK_SIZE}"
   --prefill-api-port "${PREFILL_API_PORT}"
   --decode-api-port "${DECODE_API_PORT}"
   --prefill-controller-port "${PREFILL_CONTROLLER_PORT}"
@@ -1843,16 +1884,31 @@ local_args_common=(
   --transfer-port "${TRANSFER_PORT}"
   --side-channel-port "${SIDE_CHANNEL_PORT}"
   --reshard-controller-impl "${RESHARD_CONTROLLER_IMPL}"
-  --reshard-sidecar-bin "${RESHARD_SIDECAR_BIN}"
 )
+for _role_env in ${ROLE_ENVS[@]+"${ROLE_ENVS[@]}"}; do
+  remote_args_common+=(--role-env "${_role_env}")
+  local_args_common+=(--role-env "${_role_env}")
+done
 
+# TEST-ONLY: the internal-role parser rejects an EMPTY --reshard-sidecar-bin
+# value (${2:?...}), so only forward it when one was given.
+if [[ -n "${RESHARD_SIDECAR_BIN}" ]]; then
+  remote_args_common+=(--reshard-sidecar-bin "${RESHARD_SIDECAR_BIN}")
+  local_args_common+=(--reshard-sidecar-bin "${RESHARD_SIDECAR_BIN}")
+fi
 log "checking installed decode environment"
+# TEST-ONLY: forward --block-size to both roles only when the caller set one.
+if [[ -n "${BLOCK_SIZE}" ]]; then
+  remote_args_common+=(--block-size "${BLOCK_SIZE}")
+  local_args_common+=(--block-size "${BLOCK_SIZE}")
+fi
+
 "${SCRIPT_PATH}" --internal-role preflight "${local_args_common[@]}" \
   >"${RESULT_DIR}/decode.preflight.json" \
   2>"${RESULT_DIR}/decode.preflight.stderr"
 
 log "checking installed prefill environment through ${PREFILL_SSH}"
-remote_preflight_command="$(quote_command bash -s -- --internal-role preflight \
+remote_preflight_command="$(quote_command "${REMOTE_ENV_PREFIX[@]}" bash -s -- --internal-role preflight \
   "${remote_args_common[@]}")"
 # quote_command has already shell-escaped every argument for the remote shell.
 # shellcheck disable=SC2029
@@ -1951,7 +2007,7 @@ orchestrator_cleanup() {
     fi
   fi
   if [[ -n "${remote_ssh_pid}" ]]; then
-    remote_stop_command="$(quote_command bash -s -- --internal-role stop \
+    remote_stop_command="$(quote_command "${REMOTE_ENV_PREFIX[@]}" bash -s -- --internal-role stop \
       --role-dir "${PREFILL_ROLE_DIR}")"
     # quote_command has already shell-escaped every argument for the remote shell.
     # shellcheck disable=SC2029
@@ -2018,7 +2074,7 @@ trap 'exit 143' TERM HUP
 log "starting remote PCP8 prefill role"
 # --wait keeps the SSH channel (and therefore its stdin) alive if setsid must
 # fork. Without it, scripts larger than the pipe buffer can be truncated.
-remote_serve_command="$(quote_command setsid --wait bash -s -- --internal-role serve \
+remote_serve_command="$(quote_command "${REMOTE_ENV_PREFIX[@]}" setsid --wait bash -s -- --internal-role serve \
   "${remote_args_common[@]}")"
 # quote_command has already shell-escaped every argument for the remote shell.
 # shellcheck disable=SC2029

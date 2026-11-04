@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import functools
+from typing import cast
 
 import jax
 import jax.numpy as jnp
@@ -20,31 +21,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.kernels.deepseek_v4.mhc import utils
-
-# bf16 tiles are (16, 128); keep token blocks sublane-aligned.
-_SUBLANE = 16
-
-# Explicit scoped-VMEM budget, repo convention (mla/v1, deepseek_v4 and
-# fused_moe use the same constant).
-DEFAULT_VMEM_LIMIT_BYTES = 100 * 1024 * 1024
-
-
-def _round_up(x: int, multiple: int) -> int:
-    return (x + multiple - 1) // multiple * multiple
-
-
-def _split_fn3(fn: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array]:
-    """3-chunk bf16 split of fn (8 mantissa bits each = f32's 24).
-
-    Chunks MUST be built with reduce_precision, not dtype round-trips:
-    XLA's excess-precision simplification folds f32->bf16->f32 into the
-    identity, which silently zeroes the mid/lo chunks.
-    """
-    fn_hi = jax.lax.reduce_precision(fn, 8, 7)
-    rem = fn - fn_hi
-    fn_mid = jax.lax.reduce_precision(rem, 8, 7)
-    fn_lo = jax.lax.reduce_precision(rem - fn_mid, 8, 7)
-    return tuple(t.astype(jnp.bfloat16) for t in (fn_hi, fn_mid, fn_lo))
+from vllm_torchtpu.kernels.deepseek_v4.mhc.utils import DEFAULT_VMEM_LIMIT_BYTES
 
 
 def _dot3(x, fn_hi_ref, fn_mid_ref, fn_lo_ref):
@@ -52,20 +29,18 @@ def _dot3(x, fn_hi_ref, fn_mid_ref, fn_lo_ref):
     bf16 passes against the resident fn chunks reproduce HIGHEST. The
     dimension numbers contract x dim 1 with fn dim 1 (i.e. x @ fn.T) so
     fn needs no transpose on the host side."""
-    dn = (((1, ), (1, )), ((), ()))
-    acc = jax.lax.dot_general(x,
-                              fn_hi_ref[...],
-                              dn,
-                              preferred_element_type=jnp.float32)
+    dn = (((1,), (1,)), ((), ()))
+    acc = jax.lax.dot_general(x, fn_hi_ref[...], dn, preferred_element_type=jnp.float32)
     acc = acc + jax.lax.dot_general(
-        x, fn_mid_ref[...], dn, preferred_element_type=jnp.float32)
+        x, fn_mid_ref[...], dn, preferred_element_type=jnp.float32
+    )
     acc = acc + jax.lax.dot_general(
-        x, fn_lo_ref[...], dn, preferred_element_type=jnp.float32)
+        x, fn_lo_ref[...], dn, preferred_element_type=jnp.float32
+    )
     return acc
 
 
-def _mixes_kernel(x_ref, fn_hi_ref, fn_mid_ref, fn_lo_ref, mixes_ref,
-                  sqrsum_ref):
+def _mixes_kernel(x_ref, fn_hi_ref, fn_mid_ref, fn_lo_ref, mixes_ref, sqrsum_ref):
     """One token block: 3-pass exact GEMM against resident fn chunks."""
     x = x_ref[...]
     mixes_ref[...] = _dot3(x, fn_hi_ref, fn_mid_ref, fn_lo_ref)
@@ -73,9 +48,22 @@ def _mixes_kernel(x_ref, fn_hi_ref, fn_mid_ref, fn_lo_ref, mixes_ref,
     sqrsum_ref[...] = jnp.sum(xf * xf, axis=-1, keepdims=True)
 
 
-def _mixes_collapse_kernel(x_ref, fn_hi_ref, fn_mid_ref, fn_lo_ref, sc_ref,
-                           hb_ref, mixes_ref, sqrsum_ref, layer_ref, *,
-                           hc_mult, hidden_size, rms_eps, hc_pre_eps):
+def _mixes_collapse_kernel(
+    x_ref,
+    fn_hi_ref,
+    fn_mid_ref,
+    fn_lo_ref,
+    sc_ref,
+    hb_ref,
+    mixes_ref,
+    sqrsum_ref,
+    layer_ref,
+    *,
+    hc_mult,
+    hidden_size,
+    rms_eps,
+    hc_pre_eps,
+):
     """Mixes kernel plus the in-block collapse.
 
     The collapse's weights are ``pre_mix`` — the sigmoid read gates,
@@ -92,16 +80,14 @@ def _mixes_collapse_kernel(x_ref, fn_hi_ref, fn_mid_ref, fn_lo_ref, sc_ref,
     sqrsum_ref[...] = sqr
     # Same op order as utils.mhc_pre_gates for bit-level agreement.
     scaled = acc[:, :m] * jax.lax.rsqrt(sqr / (m * h) + rms_eps)
-    pre_mix = jax.nn.sigmoid(scaled * sc_ref[0, 0] + hb_ref[:, :m]) + \
-        hc_pre_eps
+    pre_mix = jax.nn.sigmoid(scaled * sc_ref[0, 0] + hb_ref[:, :m]) + hc_pre_eps
     lay = pre_mix[:, 0:1] * xf[:, :h]
     for i in range(1, m):
-        lay = lay + pre_mix[:, i:i + 1] * xf[:, i * h:(i + 1) * h]
+        lay = lay + pre_mix[:, i : i + 1] * xf[:, i * h : (i + 1) * h]
     layer_ref[...] = lay.astype(jnp.bfloat16)
 
 
-@functools.partial(jax.jit,
-                   static_argnames=("token_block_size", "vmem_limit_bytes"))
+@functools.partial(jax.jit, static_argnames=("token_block_size", "vmem_limit_bytes"))
 def mhc_pre_mixes(
     x2d: jax.Array,
     fn: jax.Array,
@@ -132,30 +118,30 @@ def mhc_pre_mixes(
         # Double-buffered bf16 x block, transient f32 copy for the squared
         # sum, resident bf16 fn chunks; x2 headroom for spills/scratch
         # (quantized_matmul-style safety factor).
-        return 2 * (tb * hc_hidden *
-                    (2 * 2 + 4) + 3 * hc_mult3 * hc_hidden * 2)
+        return 2 * (tb * hc_hidden * (2 * 2 + 4) + 3 * hc_mult3 * hc_hidden * 2)
 
-    tb = min(token_block_size, _round_up(num_tokens, _SUBLANE))
-    while tb > _SUBLANE and _vmem_need(tb) > vmem_limit_bytes:
-        # Degrade to a smaller block instead of a compile-time VMEM OOM.
-        tb //= 2
-    padded_tokens = _round_up(num_tokens, tb)
-    if padded_tokens != num_tokens:
-        # Zero rows are safe: they produce zero mixes/sqrsum and are
-        # sliced off below.
-        x2d = jnp.pad(x2d, ((0, padded_tokens - num_tokens), (0, 0)))
+    tb, padded_tokens = utils.select_token_block(
+        num_tokens,
+        token_block_size,
+        vmem_need=_vmem_need,
+        vmem_limit_bytes=vmem_limit_bytes,
+    )
+    # Zero rows are safe: they produce zero mixes/sqrsum and are sliced
+    # off below.
+    (x2d,) = utils.pad_to(padded_tokens, x2d)
 
-    # Split in XLA outside the kernel; the chunks stay VMEM-resident.
-    fn_hi, fn_mid, fn_lo = _split_fn3(fn)
+    fn_hi, fn_mid, fn_lo = utils.split_fn3(fn)
 
-    compiler_params = pltpu.CompilerParams(dimension_semantics=("parallel", ),
-                                           vmem_limit_bytes=vmem_limit_bytes,
-                                           disable_bounds_checks=True)
+    compiler_params = pltpu.CompilerParams(
+        dimension_semantics=("parallel",),
+        vmem_limit_bytes=vmem_limit_bytes,
+        disable_bounds_checks=True,
+    )
 
     resident = pl.BlockSpec((hc_mult3, hc_hidden), lambda i: (0, 0))
     mixes, sqrsum = pl.pallas_call(
         _mixes_kernel,
-        grid=(padded_tokens // tb, ),
+        grid=(padded_tokens // tb,),
         in_specs=[
             pl.BlockSpec((tb, hc_hidden), lambda i: (i, 0)),
             resident,
@@ -173,15 +159,13 @@ def mhc_pre_mixes(
         compiler_params=compiler_params,
     )(x2d, fn_hi, fn_mid, fn_lo)
 
-    if padded_tokens != num_tokens:
-        mixes = mixes[:num_tokens]
-        sqrsum = sqrsum[:num_tokens]
-    return mixes, sqrsum
+    return cast(tuple[jax.Array, jax.Array], utils.trim_to(num_tokens, mixes, sqrsum))
 
 
-@functools.partial(jax.jit,
-                   static_argnames=("rms_eps", "hc_pre_eps",
-                                    "token_block_size", "vmem_limit_bytes"))
+@functools.partial(
+    jax.jit,
+    static_argnames=("rms_eps", "hc_pre_eps", "token_block_size", "vmem_limit_bytes"),
+)
 def mhc_pre_mixes_collapse(
     x2d: jax.Array,
     fn: jax.Array,
@@ -207,38 +191,45 @@ def mhc_pre_mixes_collapse(
     hc_mult = next(m for m in range(1, 64) if m * (m + 2) == hc_mult3)
     hidden_size = hc_hidden // hc_mult
 
-    fn_hi, fn_mid, fn_lo = _split_fn3(fn)
+    fn_hi, fn_mid, fn_lo = utils.split_fn3(fn)
     sc2d = hc_scale.reshape(1, 3).astype(jnp.float32)
     hb2d = hc_base.reshape(1, hc_mult3).astype(jnp.float32)
 
     def _vmem_need(tb: int) -> int:
         # Double-buffered bf16 x block + layer output, transient f32
         # copy, resident bf16 fn chunks; x2 spill/scratch headroom.
-        return 2 * (tb * hc_hidden * (2 * 2 + 4) + tb * hidden_size * 2 * 2 +
-                    3 * hc_mult3 * hc_hidden * 2)
+        return 2 * (
+            tb * hc_hidden * (2 * 2 + 4)
+            + tb * hidden_size * 2 * 2
+            + 3 * hc_mult3 * hc_hidden * 2
+        )
 
-    tb = min(token_block_size, _round_up(num_tokens, _SUBLANE))
-    while tb > _SUBLANE and _vmem_need(tb) > vmem_limit_bytes:
-        # Degrade to a smaller block instead of a compile-time VMEM OOM.
-        tb //= 2
-    padded_tokens = _round_up(num_tokens, tb)
-    if padded_tokens != num_tokens:
-        # Zero rows are safe: they produce zero mixes/sqrsum/layer rows
-        # and are sliced off below.
-        x2d = jnp.pad(x2d, ((0, padded_tokens - num_tokens), (0, 0)))
+    tb, padded_tokens = utils.select_token_block(
+        num_tokens,
+        token_block_size,
+        vmem_need=_vmem_need,
+        vmem_limit_bytes=vmem_limit_bytes,
+    )
+    # Zero rows are safe: they produce zero mixes/sqrsum/layer rows and
+    # are sliced off below.
+    (x2d,) = utils.pad_to(padded_tokens, x2d)
 
-    compiler_params = pltpu.CompilerParams(dimension_semantics=("parallel", ),
-                                           vmem_limit_bytes=vmem_limit_bytes,
-                                           disable_bounds_checks=True)
+    compiler_params = pltpu.CompilerParams(
+        dimension_semantics=("parallel",),
+        vmem_limit_bytes=vmem_limit_bytes,
+        disable_bounds_checks=True,
+    )
 
     resident = pl.BlockSpec((hc_mult3, hc_hidden), lambda i: (0, 0))
     mixes, sqrsum, layer2d = pl.pallas_call(
-        functools.partial(_mixes_collapse_kernel,
-                          hc_mult=hc_mult,
-                          hidden_size=hidden_size,
-                          rms_eps=rms_eps,
-                          hc_pre_eps=hc_pre_eps),
-        grid=(padded_tokens // tb, ),
+        functools.partial(
+            _mixes_collapse_kernel,
+            hc_mult=hc_mult,
+            hidden_size=hidden_size,
+            rms_eps=rms_eps,
+            hc_pre_eps=hc_pre_eps,
+        ),
+        grid=(padded_tokens // tb,),
         in_specs=[
             pl.BlockSpec((tb, hc_hidden), lambda i: (i, 0)),
             resident,
@@ -260,11 +251,10 @@ def mhc_pre_mixes_collapse(
         compiler_params=compiler_params,
     )(x2d, fn_hi, fn_mid, fn_lo, sc2d, hb2d)
 
-    if padded_tokens != num_tokens:
-        mixes = mixes[:num_tokens]
-        sqrsum = sqrsum[:num_tokens]
-        layer2d = layer2d[:num_tokens]
-    return mixes, sqrsum, layer2d
+    return cast(
+        tuple[jax.Array, jax.Array, jax.Array],
+        utils.trim_to(num_tokens, mixes, sqrsum, layer2d),
+    )
 
 
 def mhc_pre(
@@ -309,9 +299,21 @@ def mhc_pre(
         vmem_limit_bytes=vmem_limit_bytes,
     )
     _, post_mix, comb_mix = utils.mhc_pre_gates(
-        mixes, sqrsum, hc_mult, hidden_size, hc_scale, hc_base, rms_eps,
-        hc_pre_eps, hc_sinkhorn_eps, hc_post_mult_value, sinkhorn_repeat)
+        mixes,
+        sqrsum,
+        hc_mult,
+        hidden_size,
+        hc_scale,
+        hc_base,
+        rms_eps,
+        hc_pre_eps,
+        hc_sinkhorn_eps,
+        hc_post_mult_value,
+        sinkhorn_repeat,
+    )
 
-    return (post_mix.reshape(*outer_shape, hc_mult, 1),
-            comb_mix.reshape(*outer_shape, hc_mult, hc_mult),
-            layer2d.reshape(*outer_shape, hidden_size))
+    return (
+        post_mix.reshape(*outer_shape, hc_mult, 1),
+        comb_mix.reshape(*outer_shape, hc_mult, hc_mult),
+        layer2d.reshape(*outer_shape, hidden_size),
+    )

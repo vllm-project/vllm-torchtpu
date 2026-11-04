@@ -13,52 +13,83 @@
 # limitations under the License.
 
 import contextlib
+import copy
 import inspect
+import weakref
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import numpy as np
 import pytest
 import torch
-from vllm.config import (CacheConfig, ModelConfig, ParallelConfig,
-                         SchedulerConfig, VllmConfig)
+from vllm.config import (
+    CacheConfig,
+    ModelConfig,
+    ParallelConfig,
+    SchedulerConfig,
+    VllmConfig,
+)
 from vllm.distributed.kv_transfer import kv_transfer_state
-from vllm.model_executor.layers.attention import Attention, MLAAttention
-from vllm.model_executor.layers.mamba.abstract import MambaBase
-from vllm.v1.attention.backend import AttentionType
-from vllm.v1.kv_cache_interface import (FullAttentionSpec, KVCacheConfig,
-                                        KVCacheGroupSpec, KVCacheTensor,
-                                        MambaSpec, MLAAttentionSpec)
+from vllm.distributed.kv_transfer.kv_connector.v1.base import (
+    KVConnectorTransferResults,
+)
+from vllm.distributed.kv_transfer.kv_connector.v1.multi_connector import (
+    MultiKVConnectorStats,
+)
+from vllm.distributed.kv_transfer.kv_connector.v1.offloading.metrics import (
+    OffloadingConnectorStats,
+)
+from vllm.v1.kv_cache_interface import (
+    FullAttentionSpec,
+    MambaSpec,
+    UniformTypeKVCacheSpecs,
+)
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
-from vllm.v1.worker.utils import AttentionGroup
 
-from vllm_torchtpu.layers.common.attention_metadata import (
-    AttentionMetadata, AttentionMetadataBuilder,
-    AttentionMetadataBuilderContext)
-from vllm_torchtpu.layers.vllm.attention import (PallasAttentionBackend,
-                                                 PallasMLAttentionBackend)
+from vllm_torchtpu.distributed.kv_transfer.tpu_connector_stats import (
+    TpuKVConnectorStats,
+)
+from vllm_torchtpu.kernels.mla import dispatch as mla_dispatch
+from vllm_torchtpu.layers.adapter.attention import PallasAttentionBackend
+from vllm_torchtpu.layers.core.attention_metadata import (
+    AttentionMetadata,
+    AttentionMetadataBuilder,
+    AttentionMetadataBuilderContext,
+    _noop_release,
+    stage_h2d_upload,
+    zeros_h2d_source,
+)
 from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
 from vllm_torchtpu.runner import tpu_runner
 from vllm_torchtpu.runner import utils as runner_utils_module
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
-from vllm_torchtpu.runner.tpu_runner_async_output import INVALID_TOKEN_ID
+from vllm_torchtpu.runner.tpu_runner_async_output import (
+    INVALID_TOKEN_ID,
+    AsyncPreResults,
+)
 
 
-def _attention_layer_mock():
-    """An `Attention` mock whose `get_attn_backend()` returns a real backend.
-
-    `get_kv_cache_spec` measures page padding through the backend the layer
-    reports. A bare `MagicMock` returns a mock shape, which iterates as empty
-    and silently makes that arithmetic meaningless.
-    """
-    layer = MagicMock(spec=Attention)
-    layer.get_attn_backend.return_value = PallasAttentionBackend
-    return layer
+def test_idle_dp_rank_encodes_before_decoder_pairing():
+    order = []
+    runner = SimpleNamespace(
+        _is_dspark_pd_producer=False,
+        _execute_dp_mm_encoder=lambda: order.append("encoder"),
+        _run_dp_dummy_chunk=lambda bucket: order.append(("decoder", bucket)),
+        speculative_config=SimpleNamespace(use_eagle=lambda: True),
+        _is_async_drafter=True,
+        _async_drafter=SimpleNamespace(
+            run_dp_dummy_draft=lambda chunks: order.append(("draft", chunks))
+        ),
+    )
+    TPUModelRunner._run_dp_idle_pairing(runner, 8, 2)
+    assert runner._dp_target_bucket == 8
+    assert order == ["encoder", ("decoder", 8), ("decoder", 8), ("draft", 2)]
 
 
 def test_spec_warmup_all_token_ids_matches_current_sequence_lengths():
     all_token_ids = tpu_runner._spec_warmup_all_token_ids(
-        ["request-0", "request-1"], [7, 12])
+        ["request-0", "request-1"], [7, 12]
+    )
 
     assert all_token_ids == {
         "request-0": [0] * 8,
@@ -66,14 +97,279 @@ def test_spec_warmup_all_token_ids_matches_current_sequence_lengths():
     }
 
 
+@pytest.mark.parametrize("dcp_size,expected_blocks", [(1, 65), (8, 9)])
+def test_spec_warmup_request_counts_blocks_in_block_table_units(
+    dcp_size, expected_blocks
+):
+    spec = FullAttentionSpec(
+        block_size=128, num_kv_heads=1, head_size=128, dtype=torch.bfloat16
+    )
+    config = SimpleNamespace(
+        parallel_config=SimpleNamespace(decode_context_parallel_size=dcp_size)
+    )
+    captured = []
+    runner = SimpleNamespace(
+        max_model_len=40960,
+        speculative_config=SimpleNamespace(num_speculative_tokens=3),
+        kv_cache_config=SimpleNamespace(
+            num_blocks=4096, kv_cache_groups=[SimpleNamespace(kv_cache_spec=spec)]
+        ),
+        vllm_config=config,
+        execute_model=lambda so: captured.append(so),
+        sample_tokens=lambda _: None,
+        take_draft_token_ids=lambda: None,
+        _warmup_spec_decode_cleanup=lambda rids: True,
+    )
+
+    assert TPUModelRunner._warmup_one_spec_request(runner, 8192, idx=0)
+
+    (block_ids,) = captured[0].scheduled_new_reqs[0].block_ids
+    # Five decode steps of 1 + K tokens follow the 8192-token prefill, so the
+    # request reaches position 8200; a row of the DCP8 block table covers
+    # 40960 tokens in 40 entries of 1024, and the ids must fit that row.
+    assert block_ids == list(range(1, 1 + expected_blocks))
+    assert len(block_ids) <= spec.max_num_blocks_per_req(config, 40960)
+
+
+class _BlockTables(list):
+    """A list of block tables with `MultiGroupBlockTable.block_tables`."""
+
+    @property
+    def block_tables(self):
+        return self
+
+
+def _smem_runner(dcp_size=8, kernel_page_size=384, most_model_len=65536):
+    spec = FullAttentionSpec(
+        block_size=384, num_kv_heads=1, head_size=128, dtype=torch.bfloat16
+    )
+    config = SimpleNamespace(
+        parallel_config=SimpleNamespace(decode_context_parallel_size=dcp_size)
+    )
+    split = 384 // kernel_page_size
+    pages = spec.max_num_blocks_per_req(config, 1048576) * split
+    table = SimpleNamespace(
+        block_size=384,
+        max_num_blocks_per_req=pages,
+        blocks_per_kv_block=split,
+        get_cpu_tensor=lambda: torch.zeros((64, pages), dtype=torch.int32),
+    )
+    runner = SimpleNamespace(
+        max_model_len=1048576,
+        max_num_reqs=64,
+        max_num_tokens=256,
+        block_size=384,
+        max_num_blocks_per_req=pages,
+        most_model_len=most_model_len,
+        input_batch=SimpleNamespace(block_table=_BlockTables([table])),
+        kv_cache_config=SimpleNamespace(
+            kv_cache_groups=[SimpleNamespace(kv_cache_spec=spec)]
+        ),
+        vllm_config=config,
+        _attention_capacity={"stale": object()},
+        _decode_device_cache_key=("stale",),
+        _attention_kernel_block_size=kernel_page_size,
+        _attention_kv_cache_group_id=0,
+    )
+    runner._refresh_smem_request_caps = (
+        TPUModelRunner._refresh_smem_request_caps.__get__(runner)
+    )
+    return runner
+
+
+@pytest.mark.parametrize(
+    "dcp_size,kernel_page_size,expected_cap,expected_pages,most_pages",
+    [(1, 384, 47, 2731, 171), (8, 384, 64, 342, 22), (8, 16, 15, 8208, 528)],
+)
+@pytest.mark.parametrize("uniform_group", [False, True])
+def test_smem_caps_match_metadata_and_schedule_geometry(
+    dcp_size, kernel_page_size, expected_cap, expected_pages, most_pages, uniform_group
+):
+    runner = _smem_runner(dcp_size, kernel_page_size)
+    if uniform_group:
+        group = runner.kv_cache_config.kv_cache_groups[0]
+        group.kv_cache_spec = UniformTypeKVCacheSpecs(
+            block_size=384, kv_cache_specs={"attn.0": group.kv_cache_spec}
+        )
+    runner._refresh_smem_request_caps()
+    assert runner.num_reqs_max_model_len == expected_cap
+    assert runner.num_reqs_most_model_len == 64
+    assert runner.num_blocks_per_most_len_req == most_pages
+    assert runner._attention_capacity == {}
+    assert runner._decode_device_cache_key is None
+
+    builder = AttentionMetadataBuilder(
+        runner.kv_cache_config.kv_cache_groups[0].kv_cache_spec,
+        ["attn.0"],
+        runner.vllm_config,
+        torch.device("cpu"),
+        runner,
+        0,
+    )
+    for use_max, pages in [(True, expected_pages), (False, most_pages)]:
+        _, metadata_pages = builder._block_table_geometry(
+            SimpleNamespace(use_max_model_len=use_max)
+        )
+        assert metadata_pages == pages
+        seqs, schedule_pages, page_size = TPUModelRunner._attention_kernel_shapes(
+            runner, use_max
+        )
+        assert schedule_pages == metadata_pages
+        assert page_size == kernel_page_size
+        assert seqs == (expected_cap if use_max else 64)
+
+
+def test_smem_caps_follow_widest_attention_group():
+    runner = _smem_runner()
+    runner.input_batch.block_table.extend(
+        [
+            SimpleNamespace(max_num_blocks_per_req=4096),
+            SimpleNamespace(max_num_blocks_per_req=100000),
+        ]
+    )
+    runner.kv_cache_config.kv_cache_groups.extend(
+        [
+            SimpleNamespace(
+                kv_cache_spec=runner.kv_cache_config.kv_cache_groups[0].kv_cache_spec
+            ),
+            SimpleNamespace(
+                kv_cache_spec=MambaSpec(
+                    block_size=384, shapes=((1, 128),), dtypes=(torch.float32,)
+                )
+            ),
+        ]
+    )
+    runner._refresh_smem_request_caps()
+    assert runner.num_reqs_max_model_len == 32
+
+
+def test_smem_caps_refresh_after_placeholder_table_rebuild(monkeypatch):
+    runner = _smem_runner(most_model_len=None)
+    final_table = runner.input_batch.block_table[0]
+    runner.input_batch.block_table[0] = SimpleNamespace(
+        block_size=384, max_num_blocks_per_req=2731
+    )
+    runner.max_num_blocks_per_req = 2731
+    runner.block_table_cpu = torch.zeros((64, 2731), dtype=torch.int32)
+    runner._refresh_smem_request_caps()
+    assert runner.num_reqs_max_model_len == 47
+
+    def rebuild(_self, _config):
+        runner.input_batch.block_table[0] = final_table
+
+    monkeypatch.setattr(GPUModelRunner, "may_reinitialize_input_batch", rebuild)
+    # super() requires a TPUModelRunner instance, but no device initialization.
+    real_runner = object.__new__(TPUModelRunner)
+    real_runner.__dict__.update(runner.__dict__)
+    real_runner._refresh_smem_request_caps = (
+        TPUModelRunner._refresh_smem_request_caps.__get__(real_runner)
+    )
+    TPUModelRunner.may_reinitialize_input_batch(
+        real_runner, runner.kv_cache_config, [384]
+    )
+    assert real_runner.num_reqs_max_model_len == 64
+    assert real_runner.max_num_blocks_per_req == 342
+    assert real_runner.block_table_cpu.shape == (64, 342)
+    assert real_runner.num_reqs_most_model_len is None
+
+
+def test_smem_caps_refresh_after_backend_block_size_update():
+    runner = SimpleNamespace(
+        max_model_len=32768,
+        max_num_reqs=256,
+        max_num_tokens=8192,
+        block_size=16,
+        max_num_blocks_per_req=2048,
+        most_model_len=16384,
+        num_blocks_per_most_len_req=1024,
+        num_reqs_max_model_len=64,
+        num_reqs_most_model_len=128,
+        cache_config=SimpleNamespace(block_size=264),
+        kv_cache_config=None,
+        _attention_capacity={"stale": object()},
+        _decode_device_cache_key=("stale",),
+    )
+    runner._refresh_smem_request_caps = (
+        TPUModelRunner._refresh_smem_request_caps.__get__(runner)
+    )
+    runner._refresh_smem_request_caps()
+    assert runner.block_size == 264
+    assert runner.max_num_blocks_per_req == 125
+    assert runner.num_reqs_max_model_len == 256
+    assert runner.num_blocks_per_most_len_req == 63
+    assert runner.num_reqs_most_model_len == 256
+    assert runner._attention_capacity == {}
+    assert runner._decode_device_cache_key is None
+
+
+def test_smem_caps_refresh_keeps_block_table_width_when_block_size_unchanged():
+    """With no final cache groups yet and an unchanged block size, the refresh
+    must keep `max_num_blocks_per_req` as synced from the placeholder block
+    table in `__init__` (which may be wider than `cdiv(max_model_len,
+    block_size)`), not re-derive it."""
+    runner = SimpleNamespace(
+        max_model_len=1000,
+        max_num_reqs=256,
+        max_num_tokens=8192,
+        block_size=16,
+        max_num_blocks_per_req=64,  # placeholder table width, > cdiv(1000, 16)
+        most_model_len=None,
+        num_blocks_per_most_len_req=None,
+        num_reqs_max_model_len=0,
+        num_reqs_most_model_len=None,
+        cache_config=SimpleNamespace(block_size=16),
+        kv_cache_config=None,
+        _attention_capacity={},
+        _decode_device_cache_key=None,
+    )
+    TPUModelRunner._refresh_smem_request_caps(runner)
+    assert runner.block_size == 16
+    assert runner.max_num_blocks_per_req == 64
+    assert runner.num_reqs_max_model_len == min(
+        PallasAttentionBackend.get_max_num_seqs_for_pages(64), 256, 8192
+    )
+
+
+def test_smem_caps_refresh_keeps_block_size_until_platform_finalizes_it():
+    """`cache_config.block_size` is unset until the platform picks one (and
+    lightweight harnesses omit it); the runner must keep its own value."""
+    runner = SimpleNamespace(
+        max_model_len=32768,
+        max_num_reqs=256,
+        max_num_tokens=8192,
+        block_size=384,
+        max_num_blocks_per_req=86,
+        most_model_len=None,
+        num_blocks_per_most_len_req=None,
+        num_reqs_max_model_len=0,
+        num_reqs_most_model_len=None,
+        cache_config=SimpleNamespace(block_size=None),
+        kv_cache_config=None,
+        _attention_capacity={},
+        _decode_device_cache_key=None,
+    )
+    TPUModelRunner._refresh_smem_request_caps(runner)
+    assert runner.block_size == 384
+    assert runner.max_num_blocks_per_req == 86
+
+
+def test_may_reinitialize_input_batch_requires_kernel_block_sizes():
+    # Without them, split groups would hand manager block ids to the kernels.
+    runner = object.__new__(TPUModelRunner)
+    with pytest.raises(ValueError, match="kernel_block_sizes is required"):
+        TPUModelRunner.may_reinitialize_input_batch(runner, SimpleNamespace())
+
+
 def test_suspend_kv_transfer_group_restores_agent_after_failure():
     connector = object()
 
     with patch.object(kv_transfer_state, "_KV_CONNECTOR_AGENT", connector):
-        with pytest.raises(RuntimeError, match="synthetic warmup failed"):
-            with tpu_runner._suspend_kv_transfer_group():
-                assert kv_transfer_state._KV_CONNECTOR_AGENT is None
-                raise RuntimeError("synthetic warmup failed")
+        with (
+            pytest.raises(RuntimeError, match="synthetic warmup failed"),
+            tpu_runner._suspend_kv_transfer_group(),
+        ):
+            assert kv_transfer_state._KV_CONNECTOR_AGENT is None
+            raise RuntimeError("synthetic warmup failed")
 
         assert kv_transfer_state._KV_CONNECTOR_AGENT is connector
 
@@ -85,36 +381,378 @@ def test_suspend_kv_transfer_group_restores_agent_after_failure():
         ([False, False], True),
     ],
 )
-def test_pcp_mtp_prefill_warmup_retries_once(outcomes, raises_after_retry):
+def test_mtp_prefill_warmup_retries_once(outcomes, raises_after_retry):
     attempts = MagicMock(side_effect=outcomes)
     runner = SimpleNamespace(
         enforce_eager=False,
-        _is_async_drafter=True,
+        speculative_config=object(),
+        parallel_config=SimpleNamespace(
+            pipeline_parallel_size=1, prefill_context_parallel_size=1
+        ),
+        scheduler_config=SimpleNamespace(max_num_batched_tokens=4096),
         input_batch=SimpleNamespace(num_reqs=0),
         num_tokens_paddings=[4096],
         max_model_len=262144,
         num_xla_graphs=7,
         _precompile_timed=lambda _label: contextlib.nullcontext(),
-        _warmup_one_pcp_mtp_prefill=attempts,
+        _warmup_one_mtp_prefill=attempts,
     )
 
-    expectation = (pytest.raises(
-        RuntimeError, match="PCP MTP prefill warmup failed after retry")
-                   if raises_after_retry else contextlib.nullcontext())
-    with patch.object(tpu_runner,
-                      "_suspend_kv_transfer_group",
-                      return_value=contextlib.nullcontext()), expectation:
-        TPUModelRunner._warmup_pcp_mtp_prefill(runner)
+    expectation = (
+        pytest.raises(
+            RuntimeError, match="MTP prefill warmup failed at P=4096 after retry"
+        )
+        if raises_after_retry
+        else contextlib.nullcontext()
+    )
+    with (
+        patch.object(
+            tpu_runner,
+            "_suspend_kv_transfer_group",
+            return_value=contextlib.nullcontext(),
+        ),
+        expectation,
+    ):
+        TPUModelRunner._warmup_mtp_prefill(runner)
 
     assert attempts.call_args_list == [
-        ((4096, ), {
-            "quiet": True
-        }),
-        ((4096, ), {}),
+        ((4096,), {"quiet": True}),
+        ((4096,), {}),
     ]
 
 
-def test_one_pcp_mtp_warmup_builds_prefill_without_decode():
+@pytest.mark.parametrize("succeeds", [True, False])
+def test_mtp_prefill_warmup_on_a_pipeline_runs_once_on_every_stage(succeeds):
+    # Every stage runs the synthetic prefill through the hand-off in step,
+    # so a stage never retries on its own, and settles the burst after its
+    # forward so the launches that carry the prefill on are issued.
+    attempts = MagicMock(return_value=succeeds)
+    wave = MagicMock()
+    runner = SimpleNamespace(
+        enforce_eager=False,
+        speculative_config=object(),
+        parallel_config=SimpleNamespace(
+            pipeline_parallel_size=4, prefill_context_parallel_size=1
+        ),
+        scheduler_config=SimpleNamespace(max_num_batched_tokens=4096),
+        _pp_wave=wave,
+        input_batch=SimpleNamespace(num_reqs=0),
+        num_tokens_paddings=[4096],
+        max_model_len=262144,
+        num_xla_graphs=7,
+        _precompile_timed=lambda _label: contextlib.nullcontext(),
+        _warmup_one_mtp_prefill=attempts,
+    )
+    expectation = (
+        contextlib.nullcontext()
+        if succeeds
+        else pytest.raises(RuntimeError, match="MTP prefill warmup failed")
+    )
+    with (
+        patch.object(
+            tpu_runner,
+            "_suspend_kv_transfer_group",
+            return_value=contextlib.nullcontext(),
+        ),
+        expectation,
+    ):
+        TPUModelRunner._warmup_mtp_prefill(runner)
+
+    assert attempts.call_args_list == [((4096,), {})]
+    assert wave.settle.call_count == 1
+
+
+def test_mtp_prefill_warmup_fills_every_bucket():
+    # Buckets are per rank: a PCP8 prompt of 8 x 512 tokens pads to 512 per
+    # rank. Prompts above one scheduler step collapse onto its size.
+    attempts = MagicMock(return_value=True)
+    wave = MagicMock()
+    runner = SimpleNamespace(
+        enforce_eager=False,
+        speculative_config=object(),
+        parallel_config=SimpleNamespace(
+            pipeline_parallel_size=4, prefill_context_parallel_size=8
+        ),
+        scheduler_config=SimpleNamespace(max_num_batched_tokens=32768),
+        _pp_wave=wave,
+        input_batch=SimpleNamespace(num_reqs=0),
+        num_tokens_paddings=[512, 1024, 1536, 2048, 4096, 8192],
+        max_model_len=262144,
+        num_xla_graphs=7,
+        _precompile_timed=lambda _label: contextlib.nullcontext(),
+        _warmup_one_mtp_prefill=attempts,
+    )
+    with patch.object(
+        tpu_runner, "_suspend_kv_transfer_group", return_value=contextlib.nullcontext()
+    ):
+        TPUModelRunner._warmup_mtp_prefill(runner)
+
+    assert attempts.call_args_list == [
+        ((4096,), {}),
+        ((8192,), {}),
+        ((12288,), {}),
+        ((16384,), {}),
+        ((32768,), {}),
+    ]
+    assert wave.settle.call_count == 5
+
+
+@pytest.mark.parametrize("async_scheduling", [True, False])
+def test_spec_decode_warmup_sweeps_batches_at_the_shortest_and_longest_prompt(
+    async_scheduling,
+):
+    one = MagicMock(return_value=True)
+    batch = MagicMock()
+    runner = SimpleNamespace(
+        enforce_eager=False,
+        _is_async_drafter=True,
+        input_batch=SimpleNamespace(num_reqs=0),
+        num_tokens_paddings=[16, 32, 64, 128, 4096, 8192, 16384],
+        num_reqs_paddings=[1, 8, 16, 32],
+        max_model_len=8192,
+        scheduler_config=SimpleNamespace(
+            max_num_seqs=32, async_scheduling=async_scheduling
+        ),
+        num_xla_graphs=3,
+        _precompile_timed=lambda _label: contextlib.nullcontext(),
+        _warmup_one_spec_request=one,
+        _warmup_spec_batch=batch,
+    )
+    with (
+        patch.object(tpu_runner.envs, "SPEC_WARMUP", True),
+        patch.object(
+            tpu_runner,
+            "_suspend_kv_transfer_group",
+            return_value=contextlib.nullcontext(),
+        ),
+    ):
+        TPUModelRunner._warmup_spec_decode(runner)
+
+    # One request per prompt bucket within max_model_len, greedy and not.
+    assert [c.args[0] for c in one.call_args_list] == [
+        P for P in (16, 32, 64, 128, 4096, 8192) for _ in range(2)
+    ]
+    # Every request count (async) or the request paddings (sync) at the
+    # shortest prompt bucket, then the paddings at the longest one, nr > 1.
+    counts = range(2, 33) if async_scheduling else (8, 16, 32)
+    assert batch.call_args_list == [
+        ((R, 16), {"greedy": greedy}) for R in counts for greedy in (True, False)
+    ] + [
+        ((R, 8192), {"greedy": greedy}) for R in (8, 16, 32) for greedy in (True, False)
+    ]
+
+
+def _runner(K: int, block: int, max_seqs: int, budget: int, paddings: list[int]):
+    return SimpleNamespace(
+        speculative_config=SimpleNamespace(num_speculative_tokens=K),
+        drafter=SimpleNamespace(block_size=block),
+        scheduler_config=SimpleNamespace(max_num_seqs=max_seqs),
+        # As in TPUModelRunner.__init__: raised to MIN_NUM_SEQS for padding.
+        max_num_reqs=max(max_seqs, tpu_runner.MIN_NUM_SEQS),
+        max_num_tokens=budget,
+        num_tokens_paddings=paddings,
+    )
+
+
+def _step_keys(runner, R: int, mixed: bool) -> set[tuple]:
+    """The program buckets of a verify step with R decoders (and, with
+    ``mixed``, one more request prefilling a token), as the runner keys them."""
+    K = runner.speculative_config.num_speculative_tokens
+    block = runner.drafter.block_size
+    pads = runner.num_tokens_paddings
+    max_seqs = runner.scheduler_config.max_num_seqs
+    max_reqs = runner.max_num_reqs
+
+    def tok_bucket(n: int) -> int:
+        return tpu_runner._get_padded_token_len(pads, n) if n <= pads[-1] else pads[-1]
+
+    keys = set()
+    if runner.max_num_tokens >= R * (1 + K):
+        keys.add(
+            (
+                "decode",
+                tpu_runner._get_padded_num_reqs_with_upper_limit(R, max_reqs),
+                tok_bucket(R * (1 + K)),
+                tok_bucket(R * block),
+            )
+        )
+    if mixed and max_seqs >= R + 1 and runner.max_num_tokens >= R * (1 + K) + 1:
+        keys.add(
+            (
+                "mixed",
+                tpu_runner._get_padded_num_reqs_with_upper_limit(R + 1, max_reqs),
+                tok_bucket(R * (1 + K) + 1),
+                tok_bucket((R + 1) * block),
+            )
+        )
+    return keys
+
+
+FLASH = dict(
+    K=5, block=5, max_seqs=64, budget=1024, paddings=[16, 32, 64, 128, 256, 512, 1024]
+)
+AGENTX = dict(K=5, block=5, max_seqs=8, budget=256, paddings=[16, 32, 64, 128, 256])
+# 8 decoders x 6 rows = 48 > a 32-token budget: counts above 5 have no step.
+TIGHT = dict(K=5, block=5, max_seqs=8, budget=32, paddings=[16, 32])
+# The nightly DSpark bs4 engine: max_num_seqs sits below MIN_NUM_SEQS, so the
+# runner's padded request bound (8) is above any count a step can hold.
+DSPARK_BS4 = dict(K=7, block=7, max_seqs=4, budget=256, paddings=[16, 32, 64, 128, 256])
+
+
+@pytest.mark.parametrize(
+    "cfg",
+    [FLASH, AGENTX, TIGHT, DSPARK_BS4],
+    ids=["flash", "agentx", "tight", "dspark-bs4"],
+)
+@pytest.mark.parametrize("mixed", [False, True])
+def test_grid_covers_every_bucket_combination_once(cfg, mixed):
+    runner = _runner(**cfg)
+    grid = TPUModelRunner._spec_warmup_bucket_grid(runner, mixed=mixed)
+
+    assert grid == sorted(set(grid))
+    assert all(1 <= R <= cfg["max_seqs"] for R in grid)
+    # Every bucket combination a serving step can take is warmed ...
+    covered = set().union(*(_step_keys(runner, R, mixed) for R in grid))
+    needed = set().union(
+        *(_step_keys(runner, R, mixed) for R in range(1, cfg["max_seqs"] + 1))
+    )
+    assert covered == needed
+    # ... by one count each: every grid entry brings a bucket no earlier one had.
+    seen: set[tuple] = set()
+    for R in grid:
+        keys = _step_keys(runner, R, mixed)
+        assert keys - seen, f"count {R} adds no new bucket"
+        seen |= keys
+
+
+@pytest.mark.parametrize("R", [1, 2, 3])
+def test_spec_batch_warmup_holds_at_most_max_num_seqs_requests(R):
+    # The input batch holds max_num_seqs requests, below the runner's padded
+    # max_num_reqs here. The mixed steps add one, then two, prefill requests
+    # beside the R decoders; a step past max_num_seqs fails add_request.
+    spec = FullAttentionSpec(
+        block_size=16, num_kv_heads=1, head_size=128, dtype=torch.bfloat16
+    )
+    live: set[str] = set()
+    sizes: list[int] = []
+
+    def execute_model(so):
+        live.difference_update(so.finished_req_ids)
+        live.update(r.req_id for r in so.scheduled_new_reqs)
+        sizes.append(len(live))
+
+    runner = SimpleNamespace(
+        max_model_len=256,
+        max_num_tokens=256,
+        max_num_reqs=tpu_runner.MIN_NUM_SEQS,
+        scheduler_config=SimpleNamespace(max_num_seqs=4),
+        speculative_config=SimpleNamespace(num_speculative_tokens=7),
+        kv_cache_config=SimpleNamespace(
+            num_blocks=4096, kv_cache_groups=[SimpleNamespace(kv_cache_spec=spec)]
+        ),
+        vllm_config=SimpleNamespace(
+            parallel_config=SimpleNamespace(decode_context_parallel_size=1)
+        ),
+        execute_model=execute_model,
+        sample_tokens=lambda _: None,
+        take_draft_token_ids=lambda: None,
+        _warmup_spec_decode_cleanup=lambda rids: True,
+    )
+
+    TPUModelRunner._warmup_spec_batch(runner, R, 16, short=True, mixed=True)
+
+    # Each mixed variant that fits ran: the peak is R decoders plus two
+    # prefills, capped at max_num_seqs, so a swallowed failure shows here too.
+    assert max(sizes) == min(R + 2, 4)
+
+
+def test_mtp_prefill_warmup_retries_each_bucket_without_a_pipeline():
+    attempts = MagicMock(side_effect=[False, True, True])
+    runner = SimpleNamespace(
+        enforce_eager=False,
+        speculative_config=object(),
+        parallel_config=SimpleNamespace(
+            pipeline_parallel_size=1, prefill_context_parallel_size=16
+        ),
+        scheduler_config=SimpleNamespace(max_num_batched_tokens=65536),
+        input_batch=SimpleNamespace(num_reqs=0),
+        num_tokens_paddings=[512, 4096],
+        max_model_len=139264,
+        num_xla_graphs=7,
+        _precompile_timed=lambda _label: contextlib.nullcontext(),
+        _warmup_one_mtp_prefill=attempts,
+    )
+    with patch.object(
+        tpu_runner, "_suspend_kv_transfer_group", return_value=contextlib.nullcontext()
+    ):
+        TPUModelRunner._warmup_mtp_prefill(runner)
+
+    assert attempts.call_args_list == [
+        ((8192,), {"quiet": True}),
+        ((8192,), {}),
+        ((65536,), {"quiet": True}),
+    ]
+
+
+def _spec(method="mtp", eagle=True):
+    return SimpleNamespace(method=method, use_eagle=lambda: eagle)
+
+
+@pytest.mark.parametrize(
+    "pp, pcp, mtp, expected",
+    [
+        (1, False, True, False),
+        (1, True, True, True),
+        (4, False, True, True),
+        (4, False, False, False),
+    ],
+)
+def test_prefill_only_mtp_follows_context_or_pipeline_parallelism(
+    pp, pcp, mtp, expected
+):
+    parallel_config = SimpleNamespace(pipeline_parallel_size=pp)
+    assert TPUModelRunner._prefill_only_mtp(parallel_config, pcp, mtp) is expected
+
+
+def test_only_the_last_pipeline_stage_hosts_a_drafter():
+    spec = _spec()
+    # A non-DSv4 model: the static verify length stays None either way.
+    vllm_config = SimpleNamespace(speculative_config=spec, model_config=None)
+    last = SimpleNamespace(speculative_config=spec, _pp_is_last=True)
+    middle = SimpleNamespace(
+        speculative_config=spec, _pp_is_last=False, vllm_config=vllm_config
+    )
+    assert TPUModelRunner._is_async_drafter.fget(last) is True
+    assert TPUModelRunner._is_async_drafter.fget(middle) is False
+
+    TPUModelRunner._init_speculative_decoding(middle)
+    assert middle.drafter is None and middle.rejection_sampler is None
+    assert middle._static_verify_q_len is None
+
+
+def test_dp_idle_pairing_replays_the_draft_only_where_a_drafter_lives():
+    def runner(is_drafter):
+        return SimpleNamespace(
+            _is_dspark_pd_producer=False,
+            _execute_dp_mm_encoder=MagicMock(),
+            _run_dp_dummy_chunk=MagicMock(),
+            _is_async_drafter=is_drafter,
+            _async_drafter=MagicMock(),
+            speculative_config=_spec(),
+            drafter=None,
+        )
+
+    middle = runner(False)
+    TPUModelRunner._run_dp_idle_pairing(middle, 1024, 3)
+    assert middle._run_dp_dummy_chunk.call_count == 3
+    middle._async_drafter.run_dp_dummy_draft.assert_not_called()
+
+    last = runner(True)
+    TPUModelRunner._run_dp_idle_pairing(last, 1024, 3)
+    last._async_drafter.run_dp_dummy_draft.assert_called_once_with(3)
+
+
+def test_one_mtp_prefill_warmup_builds_prefill_without_decode():
     executed = []
     runner = SimpleNamespace(
         max_model_len=64,
@@ -131,22 +769,21 @@ def test_one_pcp_mtp_warmup_builds_prefill_without_decode():
         _warmup_spec_decode_cleanup=MagicMock(return_value=True),
     )
 
-    assert TPUModelRunner._warmup_one_pcp_mtp_prefill(runner, 31) is True
+    assert TPUModelRunner._warmup_one_mtp_prefill(runner, 31) is True
 
     assert len(executed) == 1
     scheduler_output = executed[0]
     assert scheduler_output.total_num_scheduled_tokens == 31
-    assert scheduler_output.num_scheduled_tokens == {"__pcp_mtp_warmup__": 31}
+    assert scheduler_output.num_scheduled_tokens == {"__mtp_prefill_warmup__": 31}
     assert len(scheduler_output.scheduled_new_reqs) == 1
     request = scheduler_output.scheduled_new_reqs[0]
-    assert request.req_id == "__pcp_mtp_warmup__"
+    assert request.req_id == "__mtp_prefill_warmup__"
     assert len(request.prompt_token_ids) == 31
     assert request.block_ids == ([98, 99], [96, 97, 98, 99])
     assert scheduler_output.scheduled_cached_reqs.req_ids == []
     runner.sample_tokens.assert_called_once_with(None)
     runner.take_draft_token_ids.assert_called_once_with()
-    runner._warmup_spec_decode_cleanup.assert_called_once_with(
-        "__pcp_mtp_warmup__")
+    runner._warmup_spec_decode_cleanup.assert_called_once_with("__mtp_prefill_warmup__")
 
 
 def _sub_indices(req_id_to_index_copy, req_ids, num_scheduled, spec_k=None):
@@ -156,17 +793,20 @@ def _sub_indices(req_id_to_index_copy, req_ids, num_scheduled, spec_k=None):
     fake = SimpleNamespace(
         _pre_async_results=SimpleNamespace(
             req_id_to_index_copy=req_id_to_index_copy,
-            spec_decode_num_rejected_tokens=(None
-                                             if spec_k is None else object())),
-        speculative_config=(None if spec_k is None else SimpleNamespace(
-            num_speculative_tokens=spec_k)),
+            spec_decode_num_rejected_tokens=(None if spec_k is None else object()),
+        ),
+        speculative_config=(
+            None if spec_k is None else SimpleNamespace(num_speculative_tokens=spec_k)
+        ),
         _last_sequence_layout_plan=None,
-        input_batch=SimpleNamespace(req_ids=req_ids))
+        input_batch=SimpleNamespace(req_ids=req_ids),
+    )
     cur, src = TPUModelRunner._prepare_async_token_substitution_indices(
         fake,
         start_index=0,
         num_reqs=len(req_ids),
-        num_scheduled_tokens_per_req=np.array(num_scheduled, dtype=np.int32))
+        num_scheduled_tokens_per_req=np.array(num_scheduled, dtype=np.int32),
+    )
     return cur.tolist(), src.tolist()
 
 
@@ -194,69 +834,179 @@ def test_async_sub_indices_skips_new_req():
     assert src == [0, 1, 2, 3]
 
 
-def test_get_finished_kv_transfers_drains_invalid_block_ids():
+def _spec_bucket_runner(spec_k):
+    return SimpleNamespace(
+        speculative_config=SimpleNamespace(num_speculative_tokens=spec_k),
+        num_tokens_paddings=[32, 64, 128, 256, 384, 512, 768],
+        num_reqs_paddings=[8, 16, 32, 64, 128, 192],
+    )
+
+
+@pytest.mark.parametrize("spec_k", [1, 3, 7])
+def test_spec_verify_bucket_reachable_keeps_every_real_step(spec_k):
+    # n requests sample between n and n * (K + 1) logits positions; the
+    # padded bucket pair of every such step must survive the pruning.
+    runner = _spec_bucket_runner(spec_k)
+
+    def pad(value, paddings):
+        return next((p for p in paddings if p >= value), None)
+
+    for n in range(1, runner.num_reqs_paddings[-1] + 1):
+        for length in range(n, n * (spec_k + 1) + 1):
+            num_tokens = pad(length, runner.num_tokens_paddings)
+            if num_tokens is None:
+                break
+            num_reqs = pad(n, runner.num_reqs_paddings)
+            assert TPUModelRunner._spec_verify_bucket_reachable(
+                runner, num_tokens, num_reqs
+            ), (n, length, num_tokens, num_reqs)
+
+
+def test_spec_verify_bucket_reachable_prunes_impossible_pairs():
+    runner = _spec_bucket_runner(3)
+    reachable = {
+        num_tokens: [
+            num_reqs
+            for num_reqs in runner.num_reqs_paddings
+            if TPUModelRunner._spec_verify_bucket_reachable(
+                runner, num_tokens, num_reqs
+            )
+        ]
+        for num_tokens in runner.num_tokens_paddings
+    }
+    assert reachable == {
+        32: [8, 16, 32],
+        64: [16, 32, 64],
+        128: [32, 64, 128],
+        256: [64, 128, 192],
+        384: [128, 192],
+        512: [128, 192],
+        768: [192],
+    }
+
+
+@pytest.mark.parametrize(
+    "stats_type", [None, OffloadingConnectorStats, TpuKVConnectorStats]
+)
+@pytest.mark.parametrize("nested", [False, True])
+@pytest.mark.parametrize("has_samples", [False, True])
+def test_get_finished_kv_transfers_drains_invalid_block_ids(
+    stats_type, nested, has_samples
+):
+    leaf_stats = stats_type() if stats_type is not None else None
+    if isinstance(leaf_stats, OffloadingConnectorStats):
+        leaf_stats.increase_counter("offload_transfers", 1)
+    unrelated_stats = OffloadingConnectorStats()
+    unrelated_stats.increase_counter("offload_transfers", 2)
+    original_unrelated_data = copy.deepcopy(unrelated_stats.data)
+    stats = leaf_stats
+    if nested:
+        stats = MultiKVConnectorStats(
+            data={
+                "MultiConnector": MultiKVConnectorStats(
+                    data={"child": leaf_stats} if leaf_stats is not None else {}
+                ),
+                "OffloadingConnector": unrelated_stats,
+            }
+        )
+    original_stats = copy.deepcopy(stats)
+    cpu_samples = [("0", "main_forward", 0.1)] if has_samples else []
+    device_samples = [("0", "main_forward", 0.2)] if has_samples else []
     connector = MagicMock()
-    connector.get_finished.return_value = ({"sent"}, {"loaded"})
+    connector.get_transfer_results.return_value = KVConnectorTransferResults(
+        finished_sending={"sent"},
+        finished_recving={"loaded", "failed"},
+        failed_recving={"failed"},
+    )
     connector.get_block_ids_with_load_errors.return_value = {41, 43}
     connector.get_block_ids_with_load_errors_group_index.return_value = 2
     connector.build_connector_worker_meta.return_value = {"jobs": []}
-    connector.get_kv_connector_stats.return_value = None
-    runner = SimpleNamespace()
+    connector.get_kv_connector_stats.return_value = stats
+    runner = SimpleNamespace(_stage_timing=MagicMock())
+    runner._stage_timing.take_samples.return_value = (cpu_samples, device_samples)
     scheduler_output = SimpleNamespace(finished_req_ids={"finished"})
 
-    with patch("vllm_torchtpu.runner.tpu_runner.has_kv_transfer_group",
-               return_value=True), patch(
-                   "vllm_torchtpu.runner.tpu_runner.get_kv_transfer_group",
-                   return_value=connector):
-        result = TPUModelRunner.get_finished_kv_transfers(
-            runner, scheduler_output)
+    with (
+        patch(
+            "vllm_torchtpu.runner.tpu_runner.has_kv_transfer_group", return_value=True
+        ),
+        patch(
+            "vllm_torchtpu.runner.tpu_runner.get_kv_transfer_group",
+            return_value=connector,
+        ),
+    ):
+        result = TPUModelRunner.get_finished_kv_transfers(runner, scheduler_output)
 
-    assert result == ({"sent"}, {"loaded"}, {"jobs": []}, {41, 43}, 2, None)
-    connector.get_finished.assert_called_once_with({"finished"})
-    connector.get_block_ids_with_load_errors.assert_called_once_with()
-    connector.get_block_ids_with_load_errors_group_index.assert_called_once_with(
+    assert result == (
+        {"sent"},
+        {"loaded", "failed"},
+        {"failed"},
+        {"jobs": []},
+        {41, 43},
+        2,
+        stats,
     )
+    assert result[-1] is stats
+    if isinstance(leaf_stats, TpuKVConnectorStats):
+        assert leaf_stats.data["runner_cpu_issue_seconds"] == cpu_samples
+        assert leaf_stats.data["runner_device_elapsed_seconds"] == device_samples
+    else:
+        assert stats == original_stats
+    assert unrelated_stats.data == original_unrelated_data
+    runner._stage_timing.take_samples.assert_called_once_with()
+    connector.get_transfer_results.assert_called_once_with({"finished"})
+    connector.get_finished.assert_not_called()
+    connector.get_block_ids_with_load_errors.assert_called_once_with()
+    connector.get_block_ids_with_load_errors_group_index.assert_called_once_with()
     connector.clear_connector_metadata.assert_called_once_with()
 
 
 def test_no_forward_output_preserves_invalid_block_ids():
     runner = SimpleNamespace(
         maybe_setup_kv_connector=MagicMock(),
-        get_finished_kv_transfers=MagicMock(return_value=(set(),
-                                                          {"failed-load"},
-                                                          None, {41, 43}, 2,
-                                                          None)),
+        get_finished_kv_transfers=MagicMock(
+            return_value=(
+                set(),
+                {"failed-load"},
+                {"failed-load"},
+                None,
+                {41, 43},
+                2,
+                None,
+            )
+        ),
     )
     scheduler_output = SimpleNamespace()
     vllm_config = SimpleNamespace()
 
     with patch(
-            "vllm_torchtpu.runner.tpu_runner.dist_utils.get_raiden_inline_load",
-            return_value=False):
-        if not tpu_runner._KV_CONNECTOR_OUTPUT_SUPPORTS_INVALID_BLOCK_GROUP:
-            with pytest.raises(RuntimeError,
-                               match="cache-group-scoped KV load failure"):
-                TPUModelRunner.kv_connector_no_forward(runner,
-                                                       scheduler_output,
-                                                       vllm_config)
-            return
+        "vllm_torchtpu.runner.tpu_runner.dist_utils.get_raiden_inline_load",
+        return_value=False,
+    ):
         output = TPUModelRunner.kv_connector_no_forward(
-            runner, scheduler_output, vllm_config)
+            runner, scheduler_output, vllm_config
+        )
 
     assert output.kv_connector_output.finished_recving == {"failed-load"}
+    assert output.kv_connector_output.failed_recving == {"failed-load"}
     assert output.kv_connector_output.invalid_block_ids == {41, 43}
-    assert output.kv_connector_output.invalid_block_group_index == 2
+    if tpu_runner._KV_CONNECTOR_OUTPUT_SUPPORTS_INVALID_BLOCK_GROUP:
+        assert output.kv_connector_output.invalid_block_group_index == 2
 
 
-def test_build_kv_connector_output_supports_vllm_023():
-    with patch.object(
+def test_build_kv_connector_output_omits_unsupported_group_index():
+    with (
+        patch.object(
             tpu_runner,
             "_KV_CONNECTOR_OUTPUT_SUPPORTS_INVALID_BLOCK_GROUP",
             False,
-    ), patch.object(tpu_runner, "KVConnectorOutput") as output_cls:
+        ),
+        patch.object(tpu_runner, "KVConnectorOutput") as output_cls,
+    ):
         tpu_runner._build_kv_connector_output(
             finished_sending={"sent"},
             finished_recving=None,
+            failed_recving=set(),
             kv_connector_worker_meta=None,
             invalid_block_ids=set(),
             invalid_block_group_index=None,
@@ -265,44 +1015,54 @@ def test_build_kv_connector_output_supports_vllm_023():
     output_cls.assert_called_once_with(
         finished_sending={"sent"},
         finished_recving=None,
+        failed_recving=set(),
         kv_connector_worker_meta=None,
         invalid_block_ids=set(),
         kv_connector_stats=None,
     )
 
 
-def test_build_kv_connector_output_rejects_ambiguous_vllm_023_failure():
+def test_build_kv_connector_output_forwards_invalid_block_ids_for_hybrid_recovery():
     with patch.object(
-            tpu_runner,
-            "_KV_CONNECTOR_OUTPUT_SUPPORTS_INVALID_BLOCK_GROUP",
-            False,
-    ), pytest.raises(RuntimeError, match="cache-group-scoped KV load failure"):
-        tpu_runner._build_kv_connector_output(
+        tpu_runner,
+        "_KV_CONNECTOR_OUTPUT_SUPPORTS_INVALID_BLOCK_GROUP",
+        False,
+    ):
+        out = tpu_runner._build_kv_connector_output(
             finished_sending=None,
             finished_recving={"failed-load"},
+            failed_recving=set(),
             kv_connector_worker_meta=None,
             invalid_block_ids={41, 43},
             invalid_block_group_index=2,
         )
+        assert out.finished_recving == {"failed-load"}
+        assert out.invalid_block_ids == {41, 43}
 
 
-def _fake_phased_runner(additional_config=None,
-                        torch_profiler_dir="/tmp/phased",
-                        max_iterations=0,
-                        delay_iterations=0,
-                        profiler_rank=2,
-                        profiler_world_size=4):
+def _fake_phased_runner(
+    additional_config=None,
+    torch_profiler_dir="/tmp/phased",
+    max_iterations=0,
+    delay_iterations=0,
+    profiler_rank=2,
+    profiler_world_size=4,
+):
     """A stand-in for TPUModelRunner carrying only what phased profiling reads.
 
     No parallel_config: the phased profiler must not reach for it.
     """
     return SimpleNamespace(
-        vllm_config=SimpleNamespace(additional_config=additional_config
-                                    if additional_config is not None else {},
-                                    profiler_config=SimpleNamespace(
-                                        torch_profiler_dir=torch_profiler_dir,
-                                        max_iterations=max_iterations,
-                                        delay_iterations=delay_iterations)),
+        vllm_config=SimpleNamespace(
+            additional_config=additional_config
+            if additional_config is not None
+            else {},
+            profiler_config=SimpleNamespace(
+                torch_profiler_dir=torch_profiler_dir,
+                max_iterations=max_iterations,
+                delay_iterations=delay_iterations,
+            ),
+        ),
         _profiler_rank=profiler_rank,
         _profiler_world_size=profiler_world_size,
     )
@@ -368,7 +1128,7 @@ class TestStartStopPhasedProfiling:
         """Phased mode is on, but there is nowhere to write traces."""
         runner = _init_phased_runner(monkeypatch, torch_profiler_dir="")
         with patch(
-                "vllm_torchtpu.runner.tpu_runner.runner_utils.PhaseBasedProfiler"
+            "vllm_torchtpu.runner.tpu_runner.runner_utils.PhaseBasedProfiler"
         ) as mock_profiler_cls:
             TPUModelRunner.start_phased_profiling(runner)
 
@@ -380,12 +1140,13 @@ class TestStartStopPhasedProfiling:
             monkeypatch,
             additional_config={
                 "phased_profiler_decode_only_kv_len_threshold": 128,
+                "phased_profiler_prefill_only_kv_len_threshold": 4096,
             },
             max_iterations=20,
             delay_iterations=3,
         )
         with patch(
-                "vllm_torchtpu.runner.tpu_runner.runner_utils.PhaseBasedProfiler"
+            "vllm_torchtpu.runner.tpu_runner.runner_utils.PhaseBasedProfiler"
         ) as mock_profiler_cls:
             TPUModelRunner.start_phased_profiling(runner)
 
@@ -396,15 +1157,16 @@ class TestStartStopPhasedProfiling:
             num_steps_to_profile_for=20,
             num_decode_steps_to_skip=3,
             decode_kv_len_threshold=128,
+            prefill_kv_len_threshold=4096,
             standard_opts={
-                'host_tracer_level': 2,
-                'device_tracer_level': 1,
-                'python_tracer_level': 1
+                "host_tracer_level": 2,
+                "device_tracer_level": 1,
+                "python_tracer_level": 1,
             },
             advanced_opts={
-                'tpu_trace_mode': 'TRACE_COMPUTE',
-                'tpu_num_sparse_cores_to_trace': 1,
-                'tpu_num_sparse_core_tiles_to_trace': 1
+                "tpu_trace_mode": "TRACE_COMPUTE",
+                "tpu_num_sparse_cores_to_trace": 1,
+                "tpu_num_sparse_core_tiles_to_trace": 1,
             },
         )
         assert runner.phase_based_profiler is mock_profiler_cls.return_value
@@ -414,18 +1176,44 @@ class TestStartStopPhasedProfiling:
         it names the run, and the phase subdirectories sit beneath it."""
         runner = _init_phased_runner(monkeypatch)
         with patch(
-                "vllm_torchtpu.runner.tpu_runner.runner_utils.PhaseBasedProfiler"
+            "vllm_torchtpu.runner.tpu_runner.runner_utils.PhaseBasedProfiler"
         ) as mock_profiler_cls:
             TPUModelRunner.start_phased_profiling(runner, "decode")
 
         assert mock_profiler_cls.call_args.args[0] == "/tmp/phased/decode"
+
+    def test_profiler_kwargs_overrides_options(self, monkeypatch):
+        runner = _init_phased_runner(monkeypatch)
+        with patch(
+            "vllm_torchtpu.runner.tpu_runner.runner_utils.PhaseBasedProfiler"
+        ) as mock_profiler_cls:
+            TPUModelRunner.start_phased_profiling(
+                runner,
+                "decode",
+                profiler_kwargs={
+                    "host_tracer_level": 3,
+                    "e2e_enable_fw_throttle_event": True,
+                },
+            )
+
+        assert mock_profiler_cls.call_args.args[0] == "/tmp/phased/decode"
+        assert (
+            mock_profiler_cls.call_args.kwargs["standard_opts"]["host_tracer_level"]
+            == 3
+        )
+        assert (
+            mock_profiler_cls.call_args.kwargs["advanced_opts"][
+                "e2e_enable_fw_throttle_event"
+            ]
+            is True
+        )
 
     def test_start_twice_is_a_noop(self, monkeypatch):
         """Already armed; a second /start_profile must not replace it and
         lose the phases it has already marked as seen."""
         runner = _init_phased_runner(monkeypatch)
         with patch(
-                "vllm_torchtpu.runner.tpu_runner.runner_utils.PhaseBasedProfiler"
+            "vllm_torchtpu.runner.tpu_runner.runner_utils.PhaseBasedProfiler"
         ) as mock_profiler_cls:
             TPUModelRunner.start_phased_profiling(runner)
             first_profiler = runner.phase_based_profiler
@@ -438,11 +1226,11 @@ class TestStartStopPhasedProfiling:
         """parallel_config.rank is TPxPP-scoped: every DP replica calls itself
         rank 0, so their traces would collide. The worker passes the
         slice-global rank instead, and it is the only source."""
-        runner = _init_phased_runner(monkeypatch,
-                                     profiler_rank=9,
-                                     profiler_world_size=16)
+        runner = _init_phased_runner(
+            monkeypatch, profiler_rank=9, profiler_world_size=16
+        )
         with patch(
-                "vllm_torchtpu.runner.tpu_runner.runner_utils.PhaseBasedProfiler"
+            "vllm_torchtpu.runner.tpu_runner.runner_utils.PhaseBasedProfiler"
         ) as mock_profiler_cls:
             TPUModelRunner.start_phased_profiling(runner)
 
@@ -450,26 +1238,27 @@ class TestStartStopPhasedProfiling:
         assert mock_profiler_cls.call_args.kwargs["world_size"] == 16
 
     def test_falls_back_to_default_num_steps_when_max_iterations_unset(
-            self, monkeypatch):
-        runner = _init_phased_runner(monkeypatch,
-                                     max_iterations=0,
-                                     delay_iterations=0)
+        self, monkeypatch
+    ):
+        runner = _init_phased_runner(monkeypatch, max_iterations=0, delay_iterations=0)
         with patch(
-                "vllm_torchtpu.runner.tpu_runner.runner_utils.PhaseBasedProfiler"
+            "vllm_torchtpu.runner.tpu_runner.runner_utils.PhaseBasedProfiler"
         ) as mock_profiler_cls:
             TPUModelRunner.start_phased_profiling(runner)
 
         assert (
-            mock_profiler_cls.call_args.kwargs["num_steps_to_profile_for"] ==
-            runner_utils_module.PHASED_PROFILER_NUM_STEPS_TO_PROFILE_FOR)
+            mock_profiler_cls.call_args.kwargs["num_steps_to_profile_for"]
+            == runner_utils_module.PHASED_PROFILER_NUM_STEPS_TO_PROFILE_FOR
+        )
         assert (
-            mock_profiler_cls.call_args.kwargs["decode_kv_len_threshold"] ==
-            runner_utils_module.PHASED_PROFILER_DECODE_ONLY_KV_LEN_THRESHOLD)
+            mock_profiler_cls.call_args.kwargs["decode_kv_len_threshold"]
+            == runner_utils_module.PHASED_PROFILER_DECODE_ONLY_KV_LEN_THRESHOLD
+        )
 
     def test_stop_finishes_and_clears_the_profiler(self, monkeypatch):
         runner = _init_phased_runner(monkeypatch)
         with patch(
-                "vllm_torchtpu.runner.tpu_runner.runner_utils.PhaseBasedProfiler"
+            "vllm_torchtpu.runner.tpu_runner.runner_utils.PhaseBasedProfiler"
         ) as mock_profiler_cls:
             TPUModelRunner.start_phased_profiling(runner)
             armed_profiler = mock_profiler_cls.return_value
@@ -487,46 +1276,10 @@ class TestStartStopPhasedProfiling:
         assert runner.phase_based_profiler is None
 
 
-class DummyMamba(MambaBase):
-
-    def __init__(self):
-        super().__init__()
-
-    def get_kv_cache_spec(self, vllm_config):
-        return MambaSpec(
-            block_size=16,
-            shapes=[(4, 128), (8, 64, 32)],
-            dtypes=[torch.bfloat16, torch.float32],
-            page_size_padded=vllm_config.cache_config.mamba_page_size_padded,
-        )
-
-    def get_state_dtype(self):
-        return (torch.bfloat16, torch.float32)
-
-    def get_state_shape(self):
-        return ((4, 128), (8, 64, 32))
-
-    @property
-    def mamba_type(self):
-        return "dummy"
-
-
-class _FakeReserveSpec:
-    """Offloading-spec stand-in resolved via kv_connector_extra_config by
-    utils.estimate_kv_connector_hbm_reserve (same lookup as vLLM's
-    OffloadingSpecFactory)."""
-
-    RESERVE_BYTES = 1024 * 1024 * 1024  # 1 GiB
-
-    @classmethod
-    def estimate_hbm_reserve_bytes(cls, vllm_config):
-        return cls.RESERVE_BYTES
-
-
+@pytest.mark.tpu_test
 class TestTPURunner:
-
     def setup_method(self):
-        self.mock_device = torch.device('cpu')
+        self.mock_device = torch.device("cpu")
 
         model_config = ModelConfig(
             tokenizer_mode="auto",
@@ -571,149 +1324,16 @@ class TestTPURunner:
         self.runner.max_num_tokens = 2048
         self.runner.pin_memory = False
         self.runner.model_config = vllm_config.model_config
-        self.runner.shared_kv_cache_layers = {}
-        self.runner.runner_only_attn_layers = set()
         self.runner.enforce_eager = False
         self.runner.speculative_config = None
-        # Slots per request in the mamba pool (1 without spec decode).
-        self.runner._mamba_slot_stride = 1
-
-        # Bind the actual methods to our mock
-        self.runner._update_mamba_page_size_padded = TPUModelRunner._update_mamba_page_size_padded.__get__(
-            self.runner)
-        self.runner._maybe_set_num_blocks_override = TPUModelRunner._maybe_set_num_blocks_override.__get__(
-            self.runner)
-        self.runner._maybe_set_compact_mamba_num_blocks_override = (
-            TPUModelRunner._maybe_set_compact_mamba_num_blocks_override.
-            __get__(self.runner))
-        # Both override paths read the budget through this helper; bind the
-        # real one so the mock runner exercises the actual budget math
-        # (compute_hbm_budget minus the KV-connector HBM reserve).
-        self.runner._available_kv_cache_hbm = (
-            TPUModelRunner._available_kv_cache_hbm.__get__(self.runner))
-        # Compact-mamba state starts unset (matches real __init__).
-        self.runner._mamba_num_blocks = None
-        self.runner._uniform_mamba_layout = (vllm_config.kv_transfer_config
-                                             is not None)
-        self.runner._unified_kv_layout = False
-        self.runner.kv_cache_raw_tensors = []
-        self.runner.get_kv_cache_spec = TPUModelRunner.get_kv_cache_spec.__get__(
-            self.runner)
-        self.runner.initialize_kv_cache = TPUModelRunner.initialize_kv_cache.__get__(
-            self.runner)
-        self.runner._validate_shared_kv_cache_layout = (
-            TPUModelRunner._validate_shared_kv_cache_layout)
-        self.runner._maybe_add_kv_sharing_layers_to_kv_cache_groups = (
-            TPUModelRunner._maybe_add_kv_sharing_layers_to_kv_cache_groups.
-            __get__(self.runner))
-        self.runner._add_shared_kv_cache_aliases = (
-            TPUModelRunner._add_shared_kv_cache_aliases.__get__(self.runner))
 
         self._find_non_ssm_backend_patcher = patch.object(
-            TpuPlatform,
-            '_find_non_ssm_backend',
-            return_value=PallasAttentionBackend)
+            TpuPlatform, "_find_non_ssm_backend", return_value=PallasAttentionBackend
+        )
         self._find_non_ssm_backend_patcher.start()
 
     def teardown_method(self):
         self._find_non_ssm_backend_patcher.stop()
-
-    @patch(
-        'vllm_torchtpu.runner.tpu_runner.PallasAttentionBackend.get_kv_cache_page_size_bytes',
-        return_value=4096)
-    @patch('vllm_torchtpu.utils.torch.accelerator.get_memory_info',
-           return_value=(10 * 1024 * 1024 * 1024, 10 * 1024 * 1024 * 1024))
-    def test_update_mamba_page_size_padded(self, mock_mem_info,
-                                           mock_get_page_size):
-        layers = {}
-        for i in range(1):
-            mock_attn = _attention_layer_mock()
-            mock_attn.num_kv_heads = 2
-            mock_attn.head_size = 128
-            layers[f'attn_{i}'] = mock_attn
-
-        for i in range(3):
-            layers[f'mamba_{i}'] = DummyMamba()
-
-        self.runner._update_mamba_page_size_padded(layers)
-
-        # Mamba unpadded size:
-        # (4 * 128 * 2) + (8 * 64 * 32 * 4) = 1024 + 65536 = 66560
-        # uniform size = (1 * 4096) + (3 * 66560) = 4096 + 199680 = 203776
-        assert self.runner._hybrid_uniform_page_size_bytes == 203776
-        assert self.runner.cache_config.mamba_page_size_padded == 203776
-
-        # Compact-mamba sizing runs first and wins (it can read HBM here).
-        # It caps mamba at max_num_reqs + 1 = 17 recurrent slots and gives the
-        # rest of the budget to the attention pool.
-        #   1 attn + 3 mamba layers -> group_size=min=1 (3 < 1*1.5 is False),
-        #   num_attn_groups=1, num_mamba_groups=3.
-        #   avail = 10GB * 0.9 = 9,663,676,416 (headroom pinned to 0)
-        #   avail_per_tensor = avail // 1 = 9,663,676,416
-        #   mamba_per_tensor = 3 * 17 * 66560 = 3,394,560
-        #   attn_num_blocks =
-        #       (9,663,676,416 - 3,394,560) // (1 * 4096) = 2,358,467
-        mock_mem_info.assert_called_once()
-        assert self.runner._mamba_num_blocks == 17
-        assert self.runner.cache_config.num_gpu_blocks_override == 2358467
-
-    @patch(
-        'vllm_torchtpu.runner.tpu_runner.PallasAttentionBackend.get_kv_cache_page_size_bytes',
-        return_value=4096)
-    @patch('vllm_torchtpu.utils.torch.accelerator.get_memory_info',
-           return_value=(3 * 1024 * 1024, 3 * 1024 * 1024))
-    def test_compact_mamba_sizing_raises_when_mamba_exceeds_budget(
-            self, mock_mem_info, mock_get_page_size):
-        """Mamba slots alone (3 * 17 * 66560 = 3,394,560 B) exceed the 3 MiB
-        KV budget, so compact sizing cannot fit. Raise instead of falling back
-        to the uniform layout, which pads every block to the mamba page and
-        silently shrinks the block pool ~50x."""
-        layers = {}
-        mock_attn = _attention_layer_mock()
-        mock_attn.num_kv_heads = 2
-        mock_attn.head_size = 128
-        layers['attn_0'] = mock_attn
-        for i in range(3):
-            layers[f'mamba_{i}'] = DummyMamba()
-
-        with pytest.raises(ValueError, match="does not fit"):
-            self.runner._update_mamba_page_size_padded(layers)
-
-    @patch(
-        'vllm_torchtpu.runner.tpu_runner.PallasAttentionBackend.get_kv_cache_page_size_bytes',
-        return_value=4096)
-    @patch('vllm_torchtpu.utils.torch.accelerator.get_memory_info',
-           return_value=(10 * 1024 * 1024 * 1024, 10 * 1024 * 1024 * 1024))
-    def test_kv_connector_reserve_shrinks_num_blocks_override(
-            self, mock_mem_info, mock_get_page_size):
-        """The KV-connector HBM reserve (e.g. the offload H2D staging pool)
-        must come out of the budget the block-count overrides size against,
-        or the pinned blocks fill the reserve back up and defeat the
-        worker-side subtraction. End-to-end through the same
-        kv_connector_extra_config spec lookup the worker uses."""
-        kv_tc = MagicMock()
-        kv_tc.kv_connector_extra_config = {
-            "spec_name": _FakeReserveSpec.__name__,
-            "spec_module_path": _FakeReserveSpec.__module__,
-        }
-        self.runner.vllm_config.kv_transfer_config = kv_tc
-
-        layers = {}
-        mock_attn = _attention_layer_mock()
-        mock_attn.num_kv_heads = 2
-        mock_attn.head_size = 128
-        layers['attn_0'] = mock_attn
-        for i in range(3):
-            layers[f'mamba_{i}'] = DummyMamba()
-
-        self.runner._update_mamba_page_size_padded(layers)
-
-        # Same sizing as test_update_mamba_page_size_padded, but avail is
-        # reduced by the 1 GiB reserve:
-        #   avail = 10 GiB * 0.9 - 1 GiB = 8,589,934,592
-        #   attn_num_blocks = (8,589,934,592 - 3 * 17 * 66560) // 4096
-        #                   = 2,096,323  (vs 2,358,467 with no reserve)
-        assert self.runner.cache_config.num_gpu_blocks_override == 2096323
 
     def test_maybe_setup_kv_connector_fences_preemptions_before_bind(self):
         """Upstream parity: handle_preemptions must run before
@@ -721,539 +1341,33 @@ class TestTPURunner:
         saves (OffloadingConnector jobs_to_flush) can fence in-flight
         stores before the forward overwrites their source blocks."""
         self.runner.maybe_setup_kv_connector = (
-            TPUModelRunner.maybe_setup_kv_connector.__get__(self.runner))
+            TPUModelRunner.maybe_setup_kv_connector.__get__(self.runner)
+        )
         connector = MagicMock()
         scheduler_output = MagicMock()
         meta = scheduler_output.kv_connector_metadata
 
-        with patch('vllm_torchtpu.runner.tpu_runner.has_kv_transfer_group',
-                   return_value=True), \
-                patch('vllm_torchtpu.runner.tpu_runner.get_kv_transfer_group',
-                      return_value=connector):
+        with (
+            patch(
+                "vllm_torchtpu.runner.tpu_runner.has_kv_transfer_group",
+                return_value=True,
+            ),
+            patch(
+                "vllm_torchtpu.runner.tpu_runner.get_kv_transfer_group",
+                return_value=connector,
+            ),
+        ):
             self.runner.maybe_setup_kv_connector(scheduler_output)
 
         connector.handle_preemptions.assert_called_once_with(meta)
         connector.bind_connector_metadata.assert_called_once_with(meta)
         connector.start_load_kv.assert_called_once_with(None)
         names = [c[0] for c in connector.mock_calls]
-        assert names.index('handle_preemptions') < names.index(
-            'bind_connector_metadata') < names.index('start_load_kv')
-
-    @patch(
-        'vllm_torchtpu.runner.tpu_runner.PallasAttentionBackend.get_kv_cache_shape',
-        return_value=(100, 16, 2, 1, 128))
-    @patch(
-        'vllm_torchtpu.runner.tpu_runner.PallasAttentionBackend.get_kv_cache_page_size_bytes',
-        return_value=4096)
-    @patch('vllm_torchtpu.utils.tpu_bind_kv_cache')
-    @patch('vllm_torchtpu.runner.tpu_runner.has_kv_transfer_group',
-           return_value=False)
-    @patch('vllm.v1.worker.gpu_input_batch.InputBatch')
-    def test_initialize_kv_cache_hybrid_duplication(self, mock_input_batch,
-                                                    mock_has_kv_transfer,
-                                                    mock_bind_kv_cache,
-                                                    mock_get_page_size,
-                                                    mock_get_shape):
-        num_blocks = 100
-        uniform_size = 203776
-        tensor_size = uniform_size * num_blocks
-
-        attn_spec = FullAttentionSpec(block_size=16,
-                                      num_kv_heads=2,
-                                      head_size=128,
-                                      dtype=torch.bfloat16,
-                                      page_size_padded=uniform_size)
-        mamba_spec = MambaSpec(block_size=16,
-                               shapes=[(4, 128), (8, 64, 32)],
-                               dtypes=[torch.bfloat16, torch.float32],
-                               page_size_padded=uniform_size)
-
-        layer_names = ["attn.0", "mamba.0", "mamba.1", "mamba.2"]
-
-        kv_cache_groups = [
-            KVCacheGroupSpec(layer_names=["attn.0"], kv_cache_spec=attn_spec),
-            KVCacheGroupSpec(layer_names=["mamba.0"],
-                             kv_cache_spec=mamba_spec),
-            KVCacheGroupSpec(layer_names=["mamba.1"],
-                             kv_cache_spec=mamba_spec),
-            KVCacheGroupSpec(layer_names=["mamba.2"],
-                             kv_cache_spec=mamba_spec),
-        ]
-
-        kv_cache_tensors = [
-            KVCacheTensor(size=tensor_size, shared_by=layer_names)
-        ]
-        kv_cache_config = KVCacheConfig(num_blocks=num_blocks,
-                                        kv_cache_tensors=kv_cache_tensors,
-                                        kv_cache_groups=kv_cache_groups)
-
-        self.runner.vllm_config.compilation_config.static_forward_context = {}
-        self.runner.block_table_cpu = torch.zeros((1, 1), dtype=torch.int32)
-
-        # One block table per kv_cache_group (the per-group dtype check
-        # introduced with multi-group support iterates over every group).
-        mock_block_tables = []
-        for _ in kv_cache_groups:
-            mock_bt = MagicMock()
-            mock_bt.max_num_blocks_per_req = 1
-            mock_bt.get_cpu_tensor.return_value = torch.zeros(
-                (1, 1), dtype=torch.int32)
-            mock_block_tables.append(mock_bt)
-        mock_input_batch.return_value.block_table = mock_block_tables
-
-        self.runner.input_batch = mock_input_batch.return_value
-        self.runner.kv_caches = []
-        # Compact-mamba sizing not exercised here (initialize_kv_cache is
-        # called directly with a fixed config): mamba shares the uniform
-        # num_blocks. _mamba_num_blocks=None selects that fallback path.
-        self.runner._mamba_num_blocks = None
-        self.runner.initialize_kv_cache(kv_cache_config)
-
-        mock_bind_kv_cache.assert_called_once()
-        created_caches = mock_bind_kv_cache.call_args[0][0]
-
-        assert len(created_caches) == 4
-
-        # Mamba shares the uniform num_blocks (compact sizing not applied).
-        for name in ["mamba.0", "mamba.1", "mamba.2"]:
-            assert isinstance(created_caches[name], tuple)
-            assert len(created_caches[name]) == 2
-            assert created_caches[name][0].shape == (num_blocks, 4, 128)
-            assert created_caches[name][1].shape == (num_blocks, 8, 64, 32)
-
-        # Slot pool initialized to the (uniform) mamba block count.
-        self.runner._init_mamba_slot_pool.assert_called_once_with(num_blocks)
-
-        assert isinstance(created_caches["attn.0"], torch.Tensor)
-        assert created_caches["attn.0"].shape == (100, 16, 2, 1, 128)
-
-    @patch(
-        'vllm_torchtpu.runner.tpu_runner.PallasAttentionBackend.get_kv_cache_shape',
-        return_value=(100, 16, 2, 1, 128))
-    @patch(
-        'vllm_torchtpu.runner.tpu_runner.PallasAttentionBackend.get_kv_cache_page_size_bytes',
-        return_value=4096)
-    @patch('vllm_torchtpu.utils.tpu_bind_kv_cache')
-    @patch('vllm_torchtpu.runner.tpu_runner.has_kv_transfer_group',
-           return_value=False)
-    @patch('vllm.v1.worker.gpu_input_batch.InputBatch')
-    def test_initialize_kv_cache_compact_mamba(self, mock_input_batch,
-                                               mock_has_kv_transfer,
-                                               mock_bind_kv_cache,
-                                               mock_get_page_size,
-                                               mock_get_shape):
-        """Compact-mamba: when _mamba_num_blocks is set, mamba layers allocate
-        exactly that many recurrent slots while attention keeps num_blocks, and
-        the slot pool is initialized to _mamba_num_blocks."""
-        num_blocks = 100
-        mamba_num_blocks = 17  # max_num_reqs(16) + 1
-        uniform_size = 203776
-        tensor_size = uniform_size * num_blocks
-
-        attn_spec = FullAttentionSpec(block_size=16,
-                                      num_kv_heads=2,
-                                      head_size=128,
-                                      dtype=torch.bfloat16,
-                                      page_size_padded=uniform_size)
-        mamba_spec = MambaSpec(block_size=16,
-                               shapes=[(4, 128), (8, 64, 32)],
-                               dtypes=[torch.bfloat16, torch.float32],
-                               page_size_padded=uniform_size)
-        layer_names = ["attn.0", "mamba.0", "mamba.1", "mamba.2"]
-        kv_cache_groups = [
-            KVCacheGroupSpec(layer_names=["attn.0"], kv_cache_spec=attn_spec),
-            KVCacheGroupSpec(layer_names=["mamba.0"],
-                             kv_cache_spec=mamba_spec),
-            KVCacheGroupSpec(layer_names=["mamba.1"],
-                             kv_cache_spec=mamba_spec),
-            KVCacheGroupSpec(layer_names=["mamba.2"],
-                             kv_cache_spec=mamba_spec),
-        ]
-        kv_cache_config = KVCacheConfig(num_blocks=num_blocks,
-                                        kv_cache_tensors=[
-                                            KVCacheTensor(
-                                                size=tensor_size,
-                                                shared_by=layer_names)
-                                        ],
-                                        kv_cache_groups=kv_cache_groups)
-
-        self.runner.vllm_config.compilation_config.static_forward_context = {}
-        self.runner.block_table_cpu = torch.zeros((1, 1), dtype=torch.int32)
-        mock_block_tables = []
-        for _ in kv_cache_groups:
-            mock_bt = MagicMock()
-            mock_bt.max_num_blocks_per_req = 1
-            mock_bt.get_cpu_tensor.return_value = torch.zeros(
-                (1, 1), dtype=torch.int32)
-            mock_block_tables.append(mock_bt)
-        mock_input_batch.return_value.block_table = mock_block_tables
-        self.runner.input_batch = mock_input_batch.return_value
-        self.runner.kv_caches = []
-        self.runner._mamba_num_blocks = mamba_num_blocks
-        self.runner.initialize_kv_cache(kv_cache_config)
-
-        created_caches = mock_bind_kv_cache.call_args[0][0]
-        # Mamba: only mamba_num_blocks slots; attention: full num_blocks.
-        for name in ["mamba.0", "mamba.1", "mamba.2"]:
-            assert created_caches[name][0].shape == (mamba_num_blocks, 4, 128)
-            assert created_caches[name][1].shape == (mamba_num_blocks, 8, 64,
-                                                     32)
-        assert created_caches["attn.0"].shape == (100, 16, 2, 1, 128)
-        # Slot pool sized to the compact mamba block count.
-        self.runner._init_mamba_slot_pool.assert_called_once_with(
-            mamba_num_blocks)
-
-    @patch('vllm_torchtpu.runner.tpu_runner.get_layers_from_vllm_config')
-    @patch(
-        'vllm_torchtpu.runner.tpu_runner.PallasAttentionBackend.get_kv_cache_page_size_bytes',
-        return_value=4096)
-    @patch('vllm_torchtpu.utils.torch.accelerator.get_memory_info',
-           return_value=(10 * 1024 * 1024 * 1024, 10 * 1024 * 1024 * 1024))
-    def test_get_kv_cache_spec_hybrid_padded_size(self, mock_mem_info,
-                                                  mock_get_page_size,
-                                                  mock_get_layers):
-        layers = {}
-
-        mock_attn = _attention_layer_mock()
-        mock_attn.attn_type = AttentionType.DECODER
-        mock_attn.num_kv_heads = 2
-        mock_attn.head_size = 128
-        mock_attn.kv_sharing_target_layer_name = None
-        mock_attn.sliding_window = None
-        layers['attn_0'] = mock_attn
-
-        for i in range(3):
-            layers[f'mamba_{i}'] = DummyMamba()
-
-        mock_get_layers.return_value = layers
-
-        # Call the method
-        kv_cache_specs = self.runner.get_kv_cache_spec()
-
-        # Mamba unpadded size: (4 * 128 * 2) + (8 * 64 * 32 * 4) = 66560
-        # uniform size = (1 * 4096) + (3 * 66560) = 203776
-        expected_padded_size = 203776
-
-        # Verify specs
-        assert 'attn_0' in kv_cache_specs
-        attn_spec = kv_cache_specs['attn_0']
-        assert isinstance(attn_spec, FullAttentionSpec)
-        assert attn_spec.page_size_padded == expected_padded_size
-
-        for i in range(3):
-            layer_name = f'mamba_{i}'
-            assert layer_name in kv_cache_specs
-            mamba_spec = kv_cache_specs[layer_name]
-            assert isinstance(mamba_spec, MambaSpec)
-            assert mamba_spec.page_size_padded == expected_padded_size
-
-    @patch.object(TpuPlatform,
-                  '_find_non_ssm_backend',
-                  return_value=PallasMLAttentionBackend)
-    @patch('vllm_torchtpu.runner.tpu_runner.get_layers_from_vllm_config')
-    @patch(
-        'vllm_torchtpu.runner.tpu_runner.PallasMLAttentionBackend.get_kv_cache_page_size_bytes',
-        return_value=8192)
-    @patch('vllm_torchtpu.utils.torch.accelerator.get_memory_info',
-           return_value=(10 * 1024 * 1024 * 1024, 10 * 1024 * 1024 * 1024))
-    def test_get_kv_cache_spec_mla_mamba_hybrid(self, mock_mem_info,
-                                                mock_get_page_size,
-                                                mock_get_layers,
-                                                mock_find_non_ssm_backend):
-        mock_mla = MagicMock(spec=MLAAttention)
-        mock_mla.num_kv_heads = 1
-        mock_mla.head_size = 576
-        layers = {'mla_0': mock_mla}
-        for i in range(3):
-            layers[f'mamba_{i}'] = DummyMamba()
-        mock_get_layers.return_value = layers
-
-        kv_cache_specs = self.runner.get_kv_cache_spec()
-
-        # uniform size = one 8192-byte MLA page + three 66560-byte states
-        expected_padded_size = 207872
-        assert isinstance(kv_cache_specs['mla_0'], MLAAttentionSpec)
-        assert kv_cache_specs['mla_0'].page_size_padded == expected_padded_size
-        for i in range(3):
-            assert (kv_cache_specs[f'mamba_{i}'].page_size_padded ==
-                    expected_padded_size)
-        mock_get_page_size.assert_called()
-
-    @patch('vllm_torchtpu.runner.tpu_runner.get_layers_from_vllm_config')
-    @patch(
-        'vllm_torchtpu.runner.tpu_runner.PallasAttentionBackend.get_kv_cache_page_size_bytes',
-        return_value=4096)
-    def test_get_kv_cache_spec_pure_attention_no_cache_config_updates(
-            self, mock_get_page_size, mock_get_layers):
-        mock_attn = _attention_layer_mock()
-        mock_attn.attn_type = AttentionType.DECODER
-        mock_attn.num_kv_heads = 2
-        mock_attn.head_size = 128
-        mock_attn.kv_sharing_target_layer_name = None
-        mock_attn.sliding_window = None
-
-        layers = {'layer.0': mock_attn}
-        mock_get_layers.return_value = layers
-
-        with patch.object(self.runner,
-                          '_update_mamba_page_size_padded') as mock_update:
-            self.runner.get_kv_cache_spec()
-            mock_update.assert_not_called()
-
-    @patch('vllm_torchtpu.runner.tpu_runner.get_layers_from_vllm_config')
-    @patch(
-        'vllm_torchtpu.runner.tpu_runner.PallasAttentionBackend.get_kv_cache_page_size_bytes',
-        return_value=4096)
-    def test_get_kv_cache_spec_records_shared_layers(self, mock_get_page_size,
-                                                     mock_get_layers):
-        owner = _attention_layer_mock()
-        owner.attn_type = AttentionType.DECODER
-        owner.num_kv_heads = 2
-        owner.head_size = 128
-        owner.kv_sharing_target_layer_name = None
-        owner.sliding_window = None
-        owner.impl = SimpleNamespace(kv_cache_quantized_dtype=None)
-
-        shared = _attention_layer_mock()
-        shared.attn_type = AttentionType.DECODER
-        shared.num_kv_heads = 2
-        shared.head_size = 128
-        shared.kv_sharing_target_layer_name = "layer.0"
-        shared.sliding_window = None
-        shared.impl = SimpleNamespace(kv_cache_quantized_dtype=None)
-
-        mock_get_layers.return_value = {
-            "layer.0": owner,
-            "layer.1": shared,
-        }
-
-        kv_cache_specs = self.runner.get_kv_cache_spec()
-
-        assert set(kv_cache_specs) == {"layer.0"}
-        assert self.runner.shared_kv_cache_layers == {"layer.1": "layer.0"}
-
-    def _make_shared_pair(self, attn_window, target_window):
-        attn = _attention_layer_mock()
-        attn.attn_type = AttentionType.DECODER
-        attn.num_kv_heads = 2
-        attn.head_size = 128
-        attn.sliding_window = attn_window
-        attn.impl = SimpleNamespace(kv_cache_quantized_dtype=None)
-
-        target = _attention_layer_mock()
-        target.attn_type = AttentionType.DECODER
-        target.num_kv_heads = 2
-        target.head_size = 128
-        target.sliding_window = target_window
-        target.impl = SimpleNamespace(kv_cache_quantized_dtype=None)
-        return attn, target
-
-    def test_validate_shared_layout_skips_sliding_window_when_hma_disabled(
-            self):
-        # HMA disabled: specs are unified to full attention, so a window
-        # mismatch is harmless and must not raise.
-        attn, target = self._make_shared_pair(attn_window=512,
-                                              target_window=None)
-        TPUModelRunner._validate_shared_kv_cache_layout("layer.1",
-                                                        attn,
-                                                        "layer.0",
-                                                        target,
-                                                        hma_enabled=False)
-
-    def test_validate_shared_layout_enforces_sliding_window_when_hma_enabled(
-            self):
-        # HMA enabled: sliding-window layers keep a smaller window-sized cache,
-        # so a window mismatch means the layers disagree on storage -> raise.
-        attn, target = self._make_shared_pair(attn_window=512,
-                                              target_window=None)
-        with pytest.raises(ValueError, match="sliding_window"):
-            TPUModelRunner._validate_shared_kv_cache_layout("layer.1",
-                                                            attn,
-                                                            "layer.0",
-                                                            target,
-                                                            hma_enabled=True)
-
-    def test_validate_shared_layout_matching_window_ok_when_hma_enabled(self):
-        # HMA enabled but windows match: no mismatch, no raise.
-        attn, target = self._make_shared_pair(attn_window=512,
-                                              target_window=512)
-        TPUModelRunner._validate_shared_kv_cache_layout("layer.1",
-                                                        attn,
-                                                        "layer.0",
-                                                        target,
-                                                        hma_enabled=True)
-
-    def _make_fp8_shared_pair(self,
-                              attn_quant,
-                              target_quant,
-                              attn_scale=1.0,
-                              target_scale=1.0):
-        attn = _attention_layer_mock()
-        attn.attn_type = AttentionType.DECODER
-        attn.num_kv_heads = 2
-        attn.head_size = 128
-        attn.sliding_window = None
-        attn._k_scale_float = attn_scale
-        attn._v_scale_float = attn_scale
-        attn.impl = MagicMock(kv_cache_quantized_dtype=attn_quant)
-
-        target = _attention_layer_mock()
-        target.attn_type = AttentionType.DECODER
-        target.num_kv_heads = 2
-        target.head_size = 128
-        target.sliding_window = None
-        target._k_scale_float = target_scale
-        target._v_scale_float = target_scale
-        target.impl = MagicMock(kv_cache_quantized_dtype=target_quant)
-        return attn, target
-
-    def test_validate_shared_layout_fp8_matching_ok(self):
-        # Both sides fp8 with matching scales/dtype: no raise.
-        attn, target = self._make_fp8_shared_pair("fp8_e4m3", "fp8_e4m3")
-        TPUModelRunner._validate_shared_kv_cache_layout("layer.1",
-                                                        attn,
-                                                        "layer.0",
-                                                        target,
-                                                        hma_enabled=False)
-
-    def test_validate_shared_layout_fp8_mismatched_scales_raises(self):
-        # Both fp8 but scales differ: dequantizing with the wrong scales
-        # corrupts attention -> raise.
-        attn, target = self._make_fp8_shared_pair("fp8_e4m3",
-                                                  "fp8_e4m3",
-                                                  attn_scale=1.0,
-                                                  target_scale=2.0)
-        with pytest.raises(ValueError, match="k/v scales"):
-            TPUModelRunner._validate_shared_kv_cache_layout("layer.1",
-                                                            attn,
-                                                            "layer.0",
-                                                            target,
-                                                            hma_enabled=False)
-
-    def test_validate_shared_layout_fp8_target_only_raises(self):
-        # Asymmetric: target is fp8, shared layer is not. The shared layer would
-        # read the target's packed fp8 bytes as bf16 -> silent garbage. Must
-        # raise instead of being skipped.
-        attn, target = self._make_fp8_shared_pair(None, "fp8_e4m3")
-        with pytest.raises(ValueError, match="kv cache"):
-            TPUModelRunner._validate_shared_kv_cache_layout("layer.1",
-                                                            attn,
-                                                            "layer.0",
-                                                            target,
-                                                            hma_enabled=False)
-
-    def test_validate_shared_layout_fp8_attn_only_raises(self):
-        # Asymmetric the other way: shared layer is fp8, target is not.
-        attn, target = self._make_fp8_shared_pair("fp8_e4m3", None)
-        with pytest.raises(ValueError, match="kv cache"):
-            TPUModelRunner._validate_shared_kv_cache_layout("layer.1",
-                                                            attn,
-                                                            "layer.0",
-                                                            target,
-                                                            hma_enabled=False)
-
-    @patch(
-        'vllm_torchtpu.runner.tpu_runner.PallasAttentionBackend.get_kv_cache_shape',
-        return_value=(100, 16, 2, 1, 128))
-    @patch('vllm_torchtpu.utils.tpu_bind_kv_cache')
-    @patch('vllm_torchtpu.runner.tpu_runner.has_kv_transfer_group',
-           return_value=False)
-    @patch('vllm.v1.worker.gpu_input_batch.InputBatch')
-    def test_initialize_kv_cache_binds_shared_layer_to_target_cache(
-            self, mock_input_batch, mock_has_kv_transfer, mock_bind_kv_cache,
-            mock_get_shape):
-        attn_spec = FullAttentionSpec(block_size=16,
-                                      num_kv_heads=2,
-                                      head_size=128,
-                                      dtype=torch.bfloat16,
-                                      page_size_padded=16384)
-        kv_cache_config = KVCacheConfig(
-            num_blocks=100,
-            kv_cache_tensors=[
-                KVCacheTensor(size=16384 * 100, shared_by=["layer.0"])
-            ],
-            kv_cache_groups=[
-                KVCacheGroupSpec(layer_names=["layer.0"],
-                                 kv_cache_spec=attn_spec)
-            ],
+        assert (
+            names.index("handle_preemptions")
+            < names.index("bind_connector_metadata")
+            < names.index("start_load_kv")
         )
-
-        self.runner.shared_kv_cache_layers = {"layer.1": "layer.0"}
-        self.runner.vllm_config.compilation_config.static_forward_context = {}
-        self.runner.block_table_cpu = torch.zeros((1, 1), dtype=torch.int32)
-        self.runner.kv_caches = []
-        mock_bt = MagicMock()
-        mock_bt.max_num_blocks_per_req = 1
-        mock_bt.get_cpu_tensor.return_value = torch.zeros((1, 1),
-                                                          dtype=torch.int32)
-        mock_input_batch.return_value.block_table = [mock_bt]
-        self.runner.input_batch = mock_input_batch.return_value
-
-        self.runner.initialize_kv_cache(kv_cache_config)
-
-        created_caches = mock_bind_kv_cache.call_args[0][0]
-        assert set(created_caches) == {"layer.0", "layer.1"}
-        assert created_caches["layer.1"] is created_caches["layer.0"]
-        group_names = self.runner.kv_cache_config.kv_cache_groups[
-            0].layer_names
-        assert group_names == ["layer.0", "layer.1"]
-        assert self.runner.attn_groups[0][0].layer_names == [
-            "layer.0", "layer.1"
-        ]
-        assert kv_cache_config.kv_cache_groups[0].layer_names == ["layer.0"]
-
-    @patch('vllm_torchtpu.runner.tpu_runner.has_kv_transfer_group',
-           return_value=False)
-    @patch('vllm.v1.worker.gpu_input_batch.InputBatch')
-    def test_initialize_kv_cache_rejects_missing_shared_target(
-            self, mock_input_batch, mock_has_kv_transfer):
-        attn_spec = FullAttentionSpec(block_size=16,
-                                      num_kv_heads=2,
-                                      head_size=128,
-                                      dtype=torch.bfloat16,
-                                      page_size_padded=16384)
-        kv_cache_config = KVCacheConfig(
-            num_blocks=1,
-            kv_cache_tensors=[
-                KVCacheTensor(size=16384, shared_by=["layer.0"])
-            ],
-            kv_cache_groups=[
-                KVCacheGroupSpec(layer_names=["layer.0"],
-                                 kv_cache_spec=attn_spec)
-            ],
-        )
-        self.runner.shared_kv_cache_layers = {"layer.1": "missing.layer"}
-
-        with pytest.raises(ValueError, match="target layer is missing"):
-            self.runner.initialize_kv_cache(kv_cache_config)
-
-    @patch('vllm_torchtpu.runner.tpu_runner.has_kv_transfer_group',
-           return_value=False)
-    @patch('vllm.v1.worker.gpu_input_batch.InputBatch')
-    def test_initialize_kv_cache_rejects_duplicate_shared_allocation(
-            self, mock_input_batch, mock_has_kv_transfer):
-        attn_spec = FullAttentionSpec(block_size=16,
-                                      num_kv_heads=2,
-                                      head_size=128,
-                                      dtype=torch.bfloat16,
-                                      page_size_padded=16384)
-        kv_cache_config = KVCacheConfig(
-            num_blocks=1,
-            kv_cache_tensors=[
-                KVCacheTensor(size=16384, shared_by=["layer.0"]),
-                KVCacheTensor(size=16384, shared_by=["layer.1"]),
-            ],
-            kv_cache_groups=[
-                KVCacheGroupSpec(layer_names=["layer.0"],
-                                 kv_cache_spec=attn_spec),
-                KVCacheGroupSpec(layer_names=["layer.1"],
-                                 kv_cache_spec=attn_spec),
-            ],
-        )
-        self.runner.shared_kv_cache_layers = {"layer.1": "layer.0"}
-
-        with pytest.raises(ValueError, match="independent KV cache"):
-            self.runner.initialize_kv_cache(kv_cache_config)
 
     def test_mrope_positions_buffer_is_int32(self):
         """Run the real TPUModelRunner.__init__ (with parent's __init__ and
@@ -1265,213 +1379,33 @@ class TestTPURunner:
         self.runner.uses_mrope = True
         self.runner.supports_mm_inputs = False
         self.runner.vllm_config.compilation_config.compile_sizes = [16, 2048]
-        self.runner._make_buffer = GPUModelRunner._make_buffer.__get__(
-            self.runner)
+        self.runner._make_buffer = GPUModelRunner._make_buffer.__get__(self.runner)
 
-        with patch.object(GPUModelRunner, '__init__', return_value=None), \
-             patch('vllm_torchtpu.runner.tpu_runner._torch_tpu_wrapper',
-                   side_effect=lambda: contextlib.nullcontext()), \
-             patch('vllm_torchtpu.runner.tpu_runner._validate_libtpu_version'
-                   ), \
-             patch.object(TPUModelRunner,
-                          '_create_mesh_for_parallelism',
-                          return_value=MagicMock()):
-            TPUModelRunner.__init__(self.runner,
-                                    self.runner.vllm_config,
-                                    self.mock_device,
-                                    profiler_rank=0,
-                                    profiler_world_size=1)
+        with (
+            patch.object(GPUModelRunner, "__init__", return_value=None),
+            patch(
+                "vllm_torchtpu.runner.tpu_runner._torch_tpu_wrapper",
+                side_effect=lambda: contextlib.nullcontext(),
+            ),
+            patch("vllm_torchtpu.runner.tpu_runner._validate_libtpu_version"),
+            patch.object(
+                TPUModelRunner, "_create_mesh_for_parallelism", return_value=MagicMock()
+            ),
+        ):
+            TPUModelRunner.__init__(
+                self.runner,
+                self.runner.vllm_config,
+                self.mock_device,
+                profiler_rank=0,
+                profiler_world_size=1,
+            )
 
         assert self.runner.mrope_positions.cpu.dtype == torch.int32
         assert self.runner.mrope_positions.cpu.shape == (
-            3, self.runner.max_num_tokens + 1)
+            3,
+            self.runner.max_num_tokens + 1,
+        )
         assert self.runner.mrope_positions.np.dtype == np.int32
-
-    def test_initialize_kv_cache_multi_group(self):
-        """Multi-group initialize_kv_cache: verify the three new behaviors
-        added with the builder migration: (1) attn_groups gets one shared
-        TPU builder per kv_cache_group, (2) may_reinitialize_input_batch is
-        called with per-group block_sizes, (3) empty_slot_mappings has one
-        entry per group (consumed by upstream _build_attention_metadata)."""
-        attn_spec = FullAttentionSpec(block_size=16,
-                                      num_kv_heads=2,
-                                      head_size=128,
-                                      dtype=torch.bfloat16,
-                                      page_size_padded=16384)
-        kv_cache_groups = [
-            KVCacheGroupSpec(layer_names=["attn.0"], kv_cache_spec=attn_spec),
-            KVCacheGroupSpec(layer_names=["attn.1"], kv_cache_spec=attn_spec),
-        ]
-        kv_cache_config = KVCacheConfig(
-            num_blocks=1,
-            kv_cache_tensors=[
-                KVCacheTensor(size=16384, shared_by=["attn.0"]),
-                KVCacheTensor(size=16384, shared_by=["attn.1"]),
-            ],
-            kv_cache_groups=kv_cache_groups,
-        )
-
-        self.runner.vllm_config.compilation_config.static_forward_context = {}
-        self.runner.block_table_cpu = torch.zeros((1, 1), dtype=torch.int32)
-        self.runner.kv_caches = []
-
-        mock_input_batch = MagicMock()
-        mock_block_tables = []
-        for _ in kv_cache_groups:
-            mock_bt = MagicMock()
-            mock_bt.max_num_blocks_per_req = 4
-            mock_bt.get_cpu_tensor.return_value = torch.zeros(
-                (1, 1), dtype=torch.int32)
-            mock_block_tables.append(mock_bt)
-        mock_input_batch.block_table = mock_block_tables
-        self.runner.input_batch = mock_input_batch
-
-        with patch(
-                'vllm_torchtpu.runner.tpu_runner.PallasAttentionBackend.get_kv_cache_shape',
-                return_value=(1, 16, 2, 1, 128)
-        ), patch('vllm_torchtpu.utils.tpu_bind_kv_cache'), patch(
-                'vllm_torchtpu.runner.tpu_runner.has_kv_transfer_group',
-                return_value=False):
-            self.runner.initialize_kv_cache(kv_cache_config)
-
-        # (1) One shared TPU builder per group, in the parent's
-        # list-of-list-of-AttentionGroup layout.
-        assert len(self.runner.attn_groups) == len(kv_cache_groups)
-        for gid, group_list in enumerate(self.runner.attn_groups):
-            assert len(group_list) == 1
-            grp = group_list[0]
-            assert isinstance(grp, AttentionGroup)
-            assert grp.backend is None
-            assert grp.kv_cache_group_id == gid
-            assert len(grp.metadata_builders) == 1
-            assert isinstance(grp.metadata_builders[0],
-                              AttentionMetadataBuilder)
-            assert grp.metadata_builders[0].kv_cache_group_id == gid
-
-        # (2) may_reinitialize_input_batch saw the per-group block_sizes
-        # list (replacing the old explicit single-group InputBatch reinit).
-        self.runner.may_reinitialize_input_batch.assert_called_once_with(
-            kv_cache_config, [16, 16])
-
-        # (3) empty_slot_mappings: one zero-element tensor per kv_cache_group.
-        assert set(self.runner.empty_slot_mappings.keys()) == {0, 1}
-        for tensor in self.runner.empty_slot_mappings.values():
-            assert tensor.numel() == 0
-
-    def test_initialize_kv_cache_composite_specs(self):
-        """Verify composite kv_cache_specs unpacking when a group's spec wraps
-        a dictionary of individual per-layer specs."""
-        layer_spec = FullAttentionSpec(block_size=16,
-                                       num_kv_heads=2,
-                                       head_size=128,
-                                       dtype=torch.bfloat16,
-                                       page_size_padded=16384)
-        composite_spec = MagicMock()
-        composite_spec.kv_cache_specs = {"attn.0": layer_spec}
-
-        kv_cache_groups = [
-            KVCacheGroupSpec(layer_names=["attn.0"],
-                             kv_cache_spec=composite_spec),
-        ]
-        kv_cache_config = KVCacheConfig(
-            num_blocks=1,
-            kv_cache_tensors=[
-                KVCacheTensor(size=16384, shared_by=["attn.0"]),
-            ],
-            kv_cache_groups=kv_cache_groups,
-        )
-
-        self.runner.vllm_config.compilation_config.static_forward_context = {}
-        self.runner.block_table_cpu = torch.zeros((1, 1), dtype=torch.int32)
-        self.runner.kv_caches = []
-
-        mock_input_batch = MagicMock()
-        mock_bt = MagicMock()
-        mock_bt.max_num_blocks_per_req = 4
-        mock_bt.get_cpu_tensor.return_value = torch.zeros((1, 1),
-                                                          dtype=torch.int32)
-        mock_input_batch.block_table = [mock_bt]
-        self.runner.input_batch = mock_input_batch
-
-        with patch(
-                'vllm_torchtpu.runner.tpu_runner.PallasAttentionBackend.get_kv_cache_shape',
-                return_value=(1, 16, 2, 1, 128)
-        ), patch('vllm_torchtpu.utils.tpu_bind_kv_cache') as mock_bind, patch(
-                'vllm_torchtpu.runner.tpu_runner.has_kv_transfer_group',
-                return_value=False):
-            self.runner.initialize_kv_cache(kv_cache_config)
-
-        mock_bind.assert_called_once()
-        created_caches = mock_bind.call_args[0][0]
-        assert "attn.0" in created_caches
-        assert created_caches["attn.0"].shape == (1, 16, 2, 1, 128)
-
-    def test_initialize_kv_cache_num_blocks_override(self):
-        """Verify explicit num_blocks override on kv_cache_config."""
-        attn_spec = FullAttentionSpec(block_size=16,
-                                      num_kv_heads=2,
-                                      head_size=128,
-                                      dtype=torch.bfloat16,
-                                      page_size_padded=16384)
-        kv_cache_groups = [
-            KVCacheGroupSpec(layer_names=["attn.0"], kv_cache_spec=attn_spec),
-        ]
-
-        # num_blocks explicitly provided on kv_cache_config
-        kv_cache_config_explicit = KVCacheConfig(
-            num_blocks=10,
-            kv_cache_tensors=[
-                KVCacheTensor(size=16384 * 10 + 123, shared_by=["attn.0"]),
-            ],
-            kv_cache_groups=kv_cache_groups,
-        )
-
-        self.runner.vllm_config.compilation_config.static_forward_context = {}
-        self.runner.block_table_cpu = torch.zeros((1, 1), dtype=torch.int32)
-        self.runner.kv_caches = []
-
-        mock_input_batch = MagicMock()
-        mock_bt = MagicMock()
-        mock_bt.max_num_blocks_per_req = 4
-        mock_bt.get_cpu_tensor.return_value = torch.zeros((1, 1),
-                                                          dtype=torch.int32)
-        mock_input_batch.block_table = [mock_bt]
-        self.runner.input_batch = mock_input_batch
-
-        with patch(
-                'vllm_torchtpu.runner.tpu_runner.PallasAttentionBackend.get_kv_cache_shape',
-                return_value=(10, 16, 2, 1, 128)) as mock_get_shape, patch(
-                    'vllm_torchtpu.utils.tpu_bind_kv_cache'
-                ), patch(
-                    'vllm_torchtpu.runner.tpu_runner.has_kv_transfer_group',
-                    return_value=False):
-            self.runner.initialize_kv_cache(kv_cache_config_explicit)
-            mock_get_shape.assert_called_once_with(10, attn_spec.block_size,
-                                                   attn_spec.num_kv_heads,
-                                                   attn_spec.head_size,
-                                                   attn_spec.dtype)
-
-    def test_initialize_kv_cache_rejects_unresolved_num_blocks(self):
-        # num_blocks is resolved by the scheduler before reaching the runner;
-        # an unresolved config must fail loudly instead of being recomputed.
-        attn_spec = FullAttentionSpec(block_size=16,
-                                      num_kv_heads=2,
-                                      head_size=128,
-                                      dtype=torch.bfloat16,
-                                      page_size_padded=16384)
-        kv_cache_config = KVCacheConfig(
-            num_blocks=None,
-            kv_cache_tensors=[
-                KVCacheTensor(size=16384 * 5, shared_by=["attn.0"]),
-            ],
-            kv_cache_groups=[
-                KVCacheGroupSpec(layer_names=["attn.0"],
-                                 kv_cache_spec=attn_spec),
-            ],
-        )
-
-        with pytest.raises(AssertionError, match="num_blocks"):
-            self.runner.initialize_kv_cache(kv_cache_config)
 
 
 class TestAttentionMetadataBuilder:
@@ -1479,43 +1413,54 @@ class TestAttentionMetadataBuilder:
     runner-state path used in _prepare_inputs and the position_ids_override
     path used in _dummy_run."""
 
-    def _make_runner_mock(self,
-                          most_model_len=None,
-                          num_groups=1,
-                          max_num_blocks_per_req=4,
-                          max_num_reqs=4):
+    def _make_runner_mock(
+        self,
+        most_model_len=None,
+        num_groups=1,
+        max_num_blocks_per_req=4,
+        max_num_reqs=4,
+    ):
         runner = MagicMock()
         runner.device = torch.device("cpu")
         runner.block_size = 16
         runner.max_num_reqs = max_num_reqs
         runner.most_model_len = most_model_len
         runner._unified_kv_layout = False
-        runner.position_ids = torch.full((8, ), 42, dtype=torch.int32)
+        runner.position_ids = torch.full((8,), 42, dtype=torch.int32)
+        runner._unfenced_h2d_sources = []
+        runner._free_h2d_sources = {}
+        runner._registered_h2d_sources = set()
 
         block_tables = []
         for gid in range(num_groups):
             bt = MagicMock()
             bt.max_num_blocks_per_req = max_num_blocks_per_req
+            bt.blocks_per_kv_block = 1
             bt.get_cpu_tensor.return_value = (
-                torch.arange(max_num_reqs * max_num_blocks_per_req,
-                             dtype=torch.int32).reshape(
-                                 max_num_reqs, max_num_blocks_per_req) +
-                gid * 100)
+                torch.arange(
+                    max_num_reqs * max_num_blocks_per_req, dtype=torch.int32
+                ).reshape(max_num_reqs, max_num_blocks_per_req)
+                + gid * 100
+            )
             block_tables.append(bt)
         runner.input_batch.block_table = block_tables
         return runner
 
     def _make_builder(self, runner, kv_cache_group_id=0, spec=None):
         if spec is None:
-            spec = FullAttentionSpec(block_size=16,
-                                     num_kv_heads=2,
-                                     head_size=128,
-                                     dtype=torch.bfloat16,
-                                     page_size_padded=16384)
+            spec = FullAttentionSpec(
+                block_size=16,
+                num_kv_heads=2,
+                head_size=128,
+                dtype=torch.bfloat16,
+                page_size_padded=16384,
+            )
+        config = MagicMock()
+        config.parallel_config.decode_context_parallel_size = 1
         return AttentionMetadataBuilder(
             kv_cache_spec=spec,
             layer_names=["attn.0"],
-            vllm_config=MagicMock(),
+            vllm_config=config,
             device=runner.device,
             runner=runner,
             kv_cache_group_id=kv_cache_group_id,
@@ -1552,8 +1497,8 @@ class TestAttentionMetadataBuilder:
         )
 
         meta = builder.build(
-            common_prefix_len=0,
-            common_attn_metadata=self._make_cm(target_num_reqs))
+            common_prefix_len=0, common_attn_metadata=self._make_cm(target_num_reqs)
+        )
 
         assert isinstance(meta, AttentionMetadata)
         assert meta.input_positions is runner.position_ids
@@ -1567,17 +1512,18 @@ class TestAttentionMetadataBuilder:
 
         # Flattened (target_num_reqs * max_num_blocks_per_req,); first
         # num_reqs rows from the source slice, rest zero-padded.
-        max_num_blocks = runner.input_batch.block_table[
-            1].max_num_blocks_per_req
-        block_tables_2d = meta.block_tables.reshape(target_num_reqs,
-                                                    max_num_blocks)
+        max_num_blocks = runner.input_batch.block_table[1].max_num_blocks_per_req
+        block_tables_2d = meta.block_tables.reshape(target_num_reqs, max_num_blocks)
         src = runner.input_batch.block_table[1].get_cpu_tensor.return_value
-        assert torch.equal(block_tables_2d[:num_reqs],
-                           src[start_index:start_index + num_reqs])
+        assert torch.equal(
+            block_tables_2d[:num_reqs], src[start_index : start_index + num_reqs]
+        )
         assert torch.equal(
             block_tables_2d[num_reqs:],
-            torch.zeros((target_num_reqs - num_reqs, max_num_blocks),
-                        dtype=torch.int32))
+            torch.zeros(
+                (target_num_reqs - num_reqs, max_num_blocks), dtype=torch.int32
+            ),
+        )
 
     def test_build_position_ids_override(self):
         """_dummy_run path: position_ids_override is forwarded as-is and the
@@ -1590,26 +1536,23 @@ class TestAttentionMetadataBuilder:
             num_reqs=4,
             start_index=0,
             use_max_model_len=True,
-            seq_lens=torch.ones((4, ), dtype=torch.int32),
+            seq_lens=torch.ones((4,), dtype=torch.int32),
             query_start_loc=torch.arange(5, dtype=torch.int32),
             request_distribution=torch.tensor([4, 4, 4], dtype=torch.int32),
             position_ids_override=override,
         )
 
-        meta = builder.build(common_prefix_len=0,
-                             common_attn_metadata=self._make_cm(4))
+        meta = builder.build(common_prefix_len=0, common_attn_metadata=self._make_cm(4))
 
         assert meta.input_positions is override
         runner.input_batch.block_table[0].get_cpu_tensor.assert_not_called()
-        assert torch.equal(meta.block_tables,
-                           torch.zeros((4 * 4, ), dtype=torch.int32))
+        assert torch.equal(meta.block_tables, torch.zeros((4 * 4,), dtype=torch.int32))
 
     def test_build_most_model_len_shrinks_block_table(self):
         """When use_max_model_len is False, target_num_blocks =
         cdiv(most_model_len, block_size) — smaller than the per-group
         max_num_blocks_per_req, so the H2D copy is shorter."""
-        runner = self._make_runner_mock(most_model_len=32,
-                                        max_num_blocks_per_req=8)
+        runner = self._make_runner_mock(most_model_len=32, max_num_blocks_per_req=8)
         builder = self._make_builder(runner)
 
         runner._attn_metadata_builder_ctx = AttentionMetadataBuilderContext(
@@ -1621,11 +1564,10 @@ class TestAttentionMetadataBuilder:
             request_distribution=torch.tensor([2, 2, 2], dtype=torch.int32),
         )
 
-        meta = builder.build(common_prefix_len=0,
-                             common_attn_metadata=self._make_cm(4))
+        meta = builder.build(common_prefix_len=0, common_attn_metadata=self._make_cm(4))
 
         # cdiv(32, 16) = 2; flattened length = target_num_reqs * 2 = 8.
-        assert meta.block_tables.shape == (4 * 2, )
+        assert meta.block_tables.shape == (4 * 2,)
 
     def test_unified_mamba_state_indices_derive_from_block_table(self):
         runner = self._make_runner_mock(max_num_blocks_per_req=4)
@@ -1647,11 +1589,11 @@ class TestAttentionMetadataBuilder:
             request_distribution=torch.tensor([2, 2, 2], dtype=torch.int32),
         )
 
-        meta = builder.build(common_prefix_len=0,
-                             common_attn_metadata=self._make_cm(4))
+        meta = builder.build(common_prefix_len=0, common_attn_metadata=self._make_cm(4))
 
-        assert torch.equal(meta.mamba_state_indices,
-                           torch.tensor([0, 6, 0, 0], dtype=torch.int32))
+        assert torch.equal(
+            meta.mamba_state_indices, torch.tensor([0, 6, 0, 0], dtype=torch.int32)
+        )
 
     def test_unified_mamba_state_indices_use_cp_adjusted_block_size(self):
         runner = self._make_runner_mock(max_num_blocks_per_req=4)
@@ -1663,12 +1605,9 @@ class TestAttentionMetadataBuilder:
             page_size_padded=256,
         )
         with patch(
-                "vllm_torchtpu.layers.common.attention_metadata.get_dcp_group"
-        ) as mock_dcp, patch(
-                "vllm_torchtpu.layers.common.attention_metadata.get_pcp_group"
+            "vllm_torchtpu.layers.core.attention_metadata.get_pcp_group"
         ) as mock_pcp:
-            mock_dcp.return_value.world_size = 4
-            mock_pcp.return_value.world_size = 1
+            mock_pcp.return_value.world_size = 4
             builder = self._make_builder(runner, spec=mamba_spec)
 
         runner._attn_metadata_builder_ctx = AttentionMetadataBuilderContext(
@@ -1680,12 +1619,34 @@ class TestAttentionMetadataBuilder:
             request_distribution=torch.tensor([2, 2, 2], dtype=torch.int32),
         )
 
-        meta = builder.build(common_prefix_len=0,
-                             common_attn_metadata=self._make_cm(4))
+        meta = builder.build(common_prefix_len=0, common_attn_metadata=self._make_cm(4))
 
         assert builder.target_block_size == 64
-        assert torch.equal(meta.mamba_state_indices,
-                           torch.tensor([0, 5, 0, 0], dtype=torch.int32))
+        assert torch.equal(
+            meta.mamba_state_indices, torch.tensor([0, 5, 0, 0], dtype=torch.int32)
+        )
+
+    def test_unified_mamba_state_indices_dcp_does_not_scale_block_size(self):
+        """Regression test for #1233: DCP must not scale mamba target_block_size."""
+        runner = self._make_runner_mock(max_num_blocks_per_req=4)
+        runner._unified_kv_layout = True
+        mamba_spec = MambaSpec(
+            block_size=16,
+            shapes=[(2, 8)],
+            dtypes=[torch.bfloat16],
+            page_size_padded=256,
+        )
+        with (
+            patch("vllm.distributed.get_dcp_group") as mock_dcp,
+            patch(
+                "vllm_torchtpu.layers.core.attention_metadata.get_pcp_group"
+            ) as mock_pcp,
+        ):
+            mock_dcp.return_value.world_size = 4
+            mock_pcp.return_value.world_size = 1
+            builder = self._make_builder(runner, spec=mamba_spec)
+
+        assert builder.target_block_size == 16
 
 
 class TestCompactMambaSlotPool:
@@ -1699,32 +1660,34 @@ class TestCompactMambaSlotPool:
         runner.max_num_reqs = max_num_reqs
         # Slots per request: 1 without spec decode, num_spec + 1 with it.
         runner._mamba_slot_stride = slot_stride
-        runner.mamba_state_indices_cpu = torch.zeros(max_num_reqs,
-                                                     dtype=torch.int32)
+        runner._mamba_offset_seeded = set()
+        runner._unfenced_h2d_sources = []
+        runner._free_h2d_sources = {}
+        runner._registered_h2d_sources = set()
         runner.input_batch = MagicMock()
         # Bind the real methods.
-        runner._init_mamba_slot_pool = (
-            TPUModelRunner._init_mamba_slot_pool.__get__(runner))
+        runner._init_mamba_slot_pool = TPUModelRunner._init_mamba_slot_pool.__get__(
+            runner
+        )
         runner._build_mamba_state_indices = (
-            TPUModelRunner._build_mamba_state_indices.__get__(runner))
+            TPUModelRunner._build_mamba_state_indices.__get__(runner)
+        )
         return runner
 
     def _set_batch(self, runner, req_ids):
         """Set the persistent batch to the given ordered req_ids."""
+        runner.requests = {rid: object() for rid in req_ids}
         runner.input_batch.req_ids = list(req_ids)
-        runner.input_batch.req_id_to_index = {
-            r: i
-            for i, r in enumerate(req_ids)
-        }
+        runner.input_batch.req_id_to_index = {r: i for i, r in enumerate(req_ids)}
 
     def test_unique_slots_and_null_tail(self):
         runner = self._make_runner(max_num_reqs=4, mamba_num_blocks=5)
         runner._init_mamba_slot_pool(5)  # usable slots 1..4, slot 0 = null
         self._set_batch(runner, ["a", "b"])
 
-        idx = runner._build_mamba_state_indices(start_index=0,
-                                                num_reqs=2,
-                                                target_num_reqs=4).cpu()
+        idx = runner._build_mamba_state_indices(
+            start_index=0, num_reqs=2, target_num_reqs=4
+        ).cpu()
         # Two active requests get distinct non-null slots.
         assert idx[0] != 0 and idx[1] != 0
         assert idx[0] != idx[1]
@@ -1745,9 +1708,9 @@ class TestCompactMambaSlotPool:
         runner._init_mamba_slot_pool(5)
         self._set_batch(runner, [])  # idle rank: nothing scheduled
 
-        idx = runner._build_mamba_state_indices(start_index=0,
-                                                num_reqs=4,
-                                                target_num_reqs=4).cpu()
+        idx = runner._build_mamba_state_indices(
+            start_index=0, num_reqs=4, target_num_reqs=4
+        ).cpu()
         # Every position is the null slot: no real request to address, and
         # the dummy forward must not touch a live request's state.
         assert [int(v) for v in idx] == [0, 0, 0, 0]
@@ -1793,31 +1756,49 @@ class TestCompactMambaSlotPool:
         idx1 = runner._build_mamba_state_indices(0, 1, 4).cpu()
         assert 1 <= int(idx1[0]) <= 4
 
+    @pytest.mark.parametrize("stride", [1, 4])
+    def test_unscheduled_request_keeps_state_at_full_capacity(self, stride):
+        runner = self._make_runner(max_num_reqs=2, slot_stride=stride)
+        runner._init_mamba_slot_pool(1 + 2 * stride)
+        owners = {rid: object() for rid in ("a", "b")}
+        state = torch.zeros(1 + 2 * stride)
+        for step, (rid, value) in enumerate([("a", 11), ("b", 22), ("a", 11)]):
+            self._set_batch(runner, [rid])
+            runner.requests = owners
+            slot = int(runner._build_mamba_state_indices(0, 1, 2)[0])
+            if step == 2:
+                assert state[slot] == value
+            state[slot] = value
+        assert len(runner._mamba_slot_by_req_id) == 2
+        assert runner._free_mamba_slots == []
+
     def test_chunked_build_allocates_all(self):
         """Two chunks in one step: each chunk allocates its own requests; all
-        get distinct slots."""
+        get distinct slots, uploaded from distinct host buffers."""
         runner = self._make_runner(max_num_reqs=4, mamba_num_blocks=5)
         runner._init_mamba_slot_pool(5)
         self._set_batch(runner, ["a", "b", "c", "d"])
 
-        # clone: the result aliases a reused staging buffer (no copy on CPU).
-        idx_chunk0 = runner._build_mamba_state_indices(0, 2, 4).clone()
-        idx_chunk1 = runner._build_mamba_state_indices(2, 2, 4).clone()
+        idx_chunk0 = runner._build_mamba_state_indices(0, 2, 4)
+        idx_chunk1 = runner._build_mamba_state_indices(2, 2, 4)
         slots = {
             int(idx_chunk0[0]),
             int(idx_chunk0[1]),
             int(idx_chunk1[0]),
-            int(idx_chunk1[1])
+            int(idx_chunk1[1]),
         }
         assert slots == {1, 2, 3, 4}
+        # No shared staging buffer: the second chunk must not overwrite the
+        # first chunk's in-flight upload, and both stay alive until the fence.
+        assert idx_chunk0.data_ptr() != idx_chunk1.data_ptr()
+        assert runner._unfenced_h2d_sources[0][0] is idx_chunk0
+        assert runner._unfenced_h2d_sources[1][0] is idx_chunk1
 
     def test_spec_decode_stride_allocates_group_bases(self):
         """With speculative decoding each request owns a group of `stride`
         consecutive slots; the pool hands out only the group *bases*."""
         # num_spec = 2 -> stride 3; max_num_reqs = 3 -> 3*3 + 1 = 10 blocks.
-        runner = self._make_runner(max_num_reqs=3,
-                                   mamba_num_blocks=10,
-                                   slot_stride=3)
+        runner = self._make_runner(max_num_reqs=3, mamba_num_blocks=10, slot_stride=3)
         runner._init_mamba_slot_pool(10)
         # Group bases are 1, 4, 7 (slot 0 is the null block); the interior
         # checkpoint slots (2,3,5,6,8,9) are never handed out directly.
@@ -1829,9 +1810,7 @@ class TestCompactMambaSlotPool:
 
     def test_spec_decode_stride_one_matches_plain_layout(self):
         """stride 1 (spec decode disabled) reproduces the dense layout."""
-        runner = self._make_runner(max_num_reqs=4,
-                                   mamba_num_blocks=5,
-                                   slot_stride=1)
+        runner = self._make_runner(max_num_reqs=4, mamba_num_blocks=5, slot_stride=1)
         runner._init_mamba_slot_pool(5)
         assert sorted(runner._free_mamba_slots) == [1, 2, 3, 4]
 
@@ -1842,28 +1821,35 @@ class TestReorderBatchForRpa:
     returned (num_decode, num_windowed) split is fed to both RPA (decode-only
     front) and the GDN windowed kernel (decode + verify)."""
 
-    def _make_runner(self):
+    def _make_runner(self, groups_requests=False):
         runner = MagicMock(spec=TPUModelRunner)
         runner.input_batch = MagicMock()
-        runner._reorder_batch_for_rpa = (
-            TPUModelRunner._reorder_batch_for_rpa.__get__(runner))
+        runner._masked_dense_groups_requests = groups_requests
+        runner._reorder_batch_for_rpa = TPUModelRunner._reorder_batch_for_rpa.__get__(
+            runner
+        )
         return runner
 
-    def _batch(self, runner, req_ids):
+    def _batch(self, runner, req_ids, computed=None):
         ib = runner.input_batch
         ib.req_ids = list(req_ids)
         ib.num_reqs = len(req_ids)
+        ib.num_computed_tokens_cpu = list(computed or [0] * len(req_ids))
 
         def swap_states(i, j):
             ib.req_ids[i], ib.req_ids[j] = ib.req_ids[j], ib.req_ids[i]
+            ib.num_computed_tokens_cpu[i], ib.num_computed_tokens_cpu[j] = (
+                ib.num_computed_tokens_cpu[j],
+                ib.num_computed_tokens_cpu[i],
+            )
 
         ib.swap_states.side_effect = swap_states
 
     def _sched(self, num_scheduled, spec_reqs=()):
         return SimpleNamespace(
             num_scheduled_tokens=num_scheduled,
-            scheduled_spec_decode_tokens={r: object()
-                                          for r in spec_reqs})
+            scheduled_spec_decode_tokens={r: object() for r in spec_reqs},
+        )
 
     def test_empty_batch(self):
         runner = self._make_runner()
@@ -1888,14 +1874,9 @@ class TestReorderBatchForRpa:
         runner = self._make_runner()
         self._batch(runner, ["pf", "vr", "dc", "vr2", "dc2"])
         # dc, dc2: 1-token decode; vr, vr2: multi-token spec verify; pf: prefill
-        sched = self._sched({
-            "pf": 16,
-            "vr": 3,
-            "dc": 1,
-            "vr2": 3,
-            "dc2": 1
-        },
-                            spec_reqs=("vr", "vr2"))
+        sched = self._sched(
+            {"pf": 16, "vr": 3, "dc": 1, "vr2": 3, "dc2": 1}, spec_reqs=("vr", "vr2")
+        )
         num_decode, num_windowed = runner._reorder_batch_for_rpa(sched)
         assert num_decode == 2
         assert num_windowed == 4
@@ -1909,17 +1890,245 @@ class TestReorderBatchForRpa:
         windowed segment covers all verify requests."""
         runner = self._make_runner()
         self._batch(runner, ["pf", "vr", "vr2"])
-        sched = self._sched({
-            "pf": 10,
-            "vr": 3,
-            "vr2": 3
-        },
-                            spec_reqs=("vr", "vr2"))
+        sched = self._sched({"pf": 10, "vr": 3, "vr2": 3}, spec_reqs=("vr", "vr2"))
         num_decode, num_windowed = runner._reorder_batch_for_rpa(sched)
         assert num_decode == 0
         assert num_windowed == 2
         assert set(runner.input_batch.req_ids[:2]) == {"vr", "vr2"}
         assert runner.input_batch.req_ids[2] == "pf"
+
+    def test_static_verify_windows_lead_verify_segment(self):
+        """With a static verify length (DeepSeek-V4, 1 + K), full-length
+        windows lead the verify segment and are counted; a short window
+        (fewer drafts scheduled) stays behind them."""
+        runner = self._make_runner()
+        runner._static_verify_q_len = 4
+        self._batch(runner, ["pf", "short", "dc", "full", "full2"])
+        sched = self._sched(
+            {"pf": 16, "short": 2, "dc": 1, "full": 4, "full2": 4},
+            spec_reqs=("short", "full", "full2"),
+        )
+        num_decode, num_windowed = runner._reorder_batch_for_rpa(sched)
+        assert (num_decode, num_windowed) == (1, 4)
+        assert runner._num_static_verify_reqs == 2
+        ids = runner.input_batch.req_ids
+        assert ids[0] == "dc"
+        assert set(ids[1:3]) == {"full", "full2"}
+        assert ids[3] == "short"
+        assert ids[4] == "pf"
+
+    def test_no_static_verify_without_static_length(self):
+        runner = self._make_runner()
+        self._batch(runner, ["vr", "dc"])
+        sched = self._sched({"vr": 4, "dc": 1}, spec_reqs=("vr",))
+        assert runner._reorder_batch_for_rpa(sched) == (1, 2)
+        assert runner._num_static_verify_reqs == 0
+
+    def test_masked_dense_orders_by_kv_length(self):
+        runner = self._make_runner(groups_requests=True)
+        self._batch(
+            runner,
+            ["short", "long", "decode", "medium"],
+            computed=[1000, 7000, 9000, 3000],
+        )
+        sched = self._sched(
+            {
+                "short": 512,
+                "long": 32,
+                "decode": 1,
+                "medium": 256,
+            }
+        )
+        assert runner._reorder_batch_for_rpa(sched) == (1, 1)
+        assert runner.input_batch.req_ids == ["decode", "long", "medium", "short"]
+
+    def test_ordering_moves_request_state_and_keeps_ties(self):
+        runner = self._make_runner(groups_requests=True)
+        self._batch(
+            runner,
+            ["short", "decode", "tie_a", "tie_b"],
+            computed=[2500, 9000, 3900, 3400],
+        )
+        sched = self._sched(
+            {
+                "short": 100,
+                "decode": 1,
+                "tie_a": 100,
+                "tie_b": 600,
+            }
+        )
+        assert runner._reorder_batch_for_rpa(sched) == (1, 1)
+        ids = runner.input_batch.req_ids
+        assert ids[0] == "decode"
+        assert ids[-1] == "short"
+        assert set(ids[1:3]) == {"tie_a", "tie_b"}
+        assert dict(zip(ids, runner.input_batch.num_computed_tokens_cpu)) == {
+            "short": 2500,
+            "decode": 9000,
+            "tie_a": 3900,
+            "tie_b": 3400,
+        }
+
+    @pytest.mark.parametrize("groups_requests", [False, None])
+    def test_order_kept_unless_grouping_applies(self, groups_requests):
+        runner = self._make_runner(groups_requests=groups_requests)
+        self._batch(runner, ["short", "long"], computed=[1000, 7000])
+        assert runner._reorder_batch_for_rpa(
+            self._sched({"short": 512, "long": 32})
+        ) == (0, 0)
+        assert runner.input_batch.req_ids == ["short", "long"]
+
+    def test_speculative_step_keeps_existing_segments(self):
+        runner = self._make_runner(groups_requests=True)
+        self._batch(runner, ["short", "verify", "long"], computed=[1000, 9000, 7000])
+        sched = self._sched(
+            {"short": 32, "verify": 3, "long": 32}, spec_reqs=("verify",)
+        )
+        assert runner._reorder_batch_for_rpa(sched) == (0, 1)
+        assert runner.input_batch.req_ids == ["verify", "short", "long"]
+
+    def test_speculative_configuration_keeps_order_without_spec_tokens(self):
+        """Admission rejects a speculative configuration outright, so even a
+        step that schedules no draft tokens keeps its request order."""
+        hf_config = SimpleNamespace(
+            model_type="glm_moe_dsa",
+            architectures=["GlmMoeDsaForCausalLM"],
+            num_attention_heads=64,
+            kv_lora_rank=512,
+            qk_rope_head_dim=64,
+            index_topk=2048,
+        )
+        parallel_config = SimpleNamespace(
+            tensor_parallel_size=1,
+            pipeline_parallel_size=1,
+            decode_context_parallel_size=1,
+            prefill_context_parallel_size=1,
+        )
+        layer = SimpleNamespace(
+            num_heads=64,
+            kv_lora_rank=512,
+            qk_rope_head_dim=64,
+            indexer=SimpleNamespace(topk_tokens=2048),
+        )
+        specs = [SimpleNamespace(layout=SimpleNamespace(value="tensorcore"))] * 2
+        runner = self._make_runner(groups_requests=None)
+        self._batch(runner, ["short", "long"], computed=[1000, 7000])
+        with (
+            patch.object(tpu_runner.envs, "TPU_MLA_MASKED_DENSE_ENABLED", True),
+            patch.object(mla_dispatch, "masked_dense_limits", return_value=(0, 6144)),
+        ):
+            for speculative_config in (None, object()):
+                runner.vllm_config = SimpleNamespace(
+                    model_config=SimpleNamespace(hf_config=hf_config),
+                    parallel_config=parallel_config,
+                    cache_config=SimpleNamespace(kv_offloading_size=None),
+                    speculative_config=speculative_config,
+                    kv_transfer_config=None,
+                )
+                runner._masked_dense_groups_requests = None
+                mla_dispatch.admit_layer(runner, layer, specs, 1024)
+                assert runner._masked_dense_groups_requests is (
+                    speculative_config is None
+                )
+            assert runner._reorder_batch_for_rpa(
+                self._sched({"short": 512, "long": 32})
+            ) == (0, 0)
+        assert runner.input_batch.req_ids == ["short", "long"]
+
+
+class TestInitializeAttentionKernelsThreshold:
+    """`reorder_batch_threshold` is the smallest DECODE query width across all
+    target and draft kernels `_initialize_attention_kernels` builds.
+
+    The drafter's first pass (`step_idx == 0`) reuses the target's
+    `request_distribution`, so every draft layer must be at least as wide as
+    `reorder_batch_threshold`. Sharded drafts keep their K+1-wide decode tile;
+    replicated (`draft_tensor_parallel_size == 1`) drafts relocated to the
+    local RPA kernel are pinned to 1, which pulls the shared threshold down
+    to 1."""
+
+    def _make_runner(self, widths, draft_names=(), draft_tp=2):
+        from vllm_torchtpu.layers.adapter.attention import PallasAttentionBackendImpl
+
+        runner = MagicMock(spec=TPUModelRunner)
+        runner._attention_kernels_initialized = False
+        runner.model = None
+        runner.mesh = MagicMock()
+        runner.vllm_config = MagicMock()
+        runner.reorder_batch_threshold = 1
+        runner.drafter = SimpleNamespace(_draft_attn_layer_names=set(draft_names))
+        runner.speculative_config = SimpleNamespace(draft_tensor_parallel_size=draft_tp)
+        runner._initialize_attention_kernels = (
+            TPUModelRunner._initialize_attention_kernels.__get__(runner)
+        )
+        layers = {}
+        for name, width in widths.items():
+            impl = MagicMock(spec=PallasAttentionBackendImpl)
+            impl.decode_query_size = width
+            layers[name] = SimpleNamespace(impl=impl)
+        return runner, layers
+
+    def _run(self, runner, layers):
+        with (
+            patch(
+                "vllm_torchtpu.runner.tpu_runner.get_layers_from_vllm_config",
+                return_value=layers,
+            ),
+            patch("vllm_torchtpu.runner.tpu_runner.set_vllm_model_wrapper_context"),
+        ):
+            runner._initialize_attention_kernels()
+
+    def test_uniform_width(self):
+        runner, layers = self._make_runner({"a": 4, "b": 4})
+        self._run(runner, layers)
+        assert runner.reorder_batch_threshold == 4
+        for layer in layers.values():
+            layer.impl.initialize_kernel.assert_called_once()
+
+    def test_min_across_layers(self):
+        runner, layers = self._make_runner({"a": 4, "b": 1})
+        self._run(runner, layers)
+        assert runner.reorder_batch_threshold == 1
+
+    def test_replicated_draft_relocated_and_pinned_to_one_token(self):
+        runner, layers = self._make_runner(
+            {"target": 4, "draft": 4}, draft_names=("draft",), draft_tp=1
+        )
+        self._run(runner, layers)
+        assert layers["draft"].impl.decode_query_size == 1
+        assert layers["target"].impl.decode_query_size == 4
+        # The drafter's first pass attends with the target's distribution, so
+        # a 1-wide draft must hold the threshold at 1: K+1-token verify windows
+        # must not reach its DECODE stage.
+        assert runner.reorder_batch_threshold == 1
+
+    def test_sharded_draft_keeps_verify_width(self):
+        """Regression: pinning a sharded draft to 1 while the threshold stayed
+        at K+1 sent K+1-token verify windows into the draft's 1-wide DECODE
+        stage on the drafter's first pass (it reuses the target's
+        request_distribution). Qwen3.5 DCP4 + MTP3 acceptance fell to ~0.5%."""
+        runner, layers = self._make_runner(
+            {"target": 4, "draft": 4}, draft_names=("draft",), draft_tp=2
+        )
+        self._run(runner, layers)
+        assert layers["draft"].impl.decode_query_size == 4
+        assert layers["target"].impl.decode_query_size == 4
+        assert runner.reorder_batch_threshold == 4
+
+    def test_narrow_draft_caps_threshold(self):
+        """A draft whose tile is narrower than the target's (e.g. an impl that
+        never widens) caps the threshold at the draft's width."""
+        runner, layers = self._make_runner(
+            {"target": 4, "draft": 1}, draft_names=("draft",), draft_tp=2
+        )
+        self._run(runner, layers)
+        assert layers["target"].impl.decode_query_size == 4
+        assert runner.reorder_batch_threshold == 1
+
+    def test_no_pallas_layers(self):
+        runner, layers = self._make_runner({})
+        self._run(runner, layers)
+        assert runner.reorder_batch_threshold == 1
 
 
 class TestMambaSlotReadOffsets:
@@ -1928,10 +2137,10 @@ class TestMambaSlotReadOffsets:
 
     def _make_runner(self, num_blocks=8):
         runner = MagicMock(spec=TPUModelRunner)
-        runner.mamba_slot_read_offsets = torch.zeros(num_blocks,
-                                                     dtype=torch.int32)
+        runner.mamba_slot_read_offsets = torch.zeros(num_blocks, dtype=torch.int32)
         runner._update_mamba_slot_read_offsets = (
-            TPUModelRunner._update_mamba_slot_read_offsets.__get__(runner))
+            TPUModelRunner._update_mamba_slot_read_offsets.__get__(runner)
+        )
         return runner
 
     def test_noop_when_offsets_disabled(self):
@@ -1939,10 +2148,12 @@ class TestMambaSlotReadOffsets:
         runner = MagicMock(spec=TPUModelRunner)
         runner.mamba_slot_read_offsets = None
         runner._update_mamba_slot_read_offsets = (
-            TPUModelRunner._update_mamba_slot_read_offsets.__get__(runner))
+            TPUModelRunner._update_mamba_slot_read_offsets.__get__(runner)
+        )
         # Must not raise even with real-looking args.
-        runner._update_mamba_slot_read_offsets([torch.tensor([1, 4])],
-                                               torch.tensor([[10, -1]]), 2)
+        runner._update_mamba_slot_read_offsets(
+            [torch.tensor([1, 4])], torch.tensor([[10, -1]]), 2
+        )
 
     def test_verify_offsets_are_num_accepted_minus_one(self):
         """offset = (#valid tokens) - 1: full accept -> k, all-rejected -> 0."""
@@ -1950,8 +2161,9 @@ class TestMambaSlotReadOffsets:
         state_indices = torch.tensor([1, 4], dtype=torch.int32)
         # req at slot 1 accepted 3 tokens (2 drafts + bonus); req at slot 4
         # accepted only the bonus (both drafts rejected).
-        next_tokens = torch.tensor([[10, 11, 12],
-                                    [20, INVALID_TOKEN_ID, INVALID_TOKEN_ID]])
+        next_tokens = torch.tensor(
+            [[10, 11, 12], [20, INVALID_TOKEN_ID, INVALID_TOKEN_ID]]
+        )
         runner._update_mamba_slot_read_offsets([state_indices], next_tokens, 2)
         assert int(runner.mamba_slot_read_offsets[1]) == 2  # 3 valid - 1
         assert int(runner.mamba_slot_read_offsets[4]) == 0  # 1 valid - 1
@@ -1963,7 +2175,8 @@ class TestMambaSlotReadOffsets:
         runner.mamba_slot_read_offsets[1] = 2
         runner.mamba_slot_read_offsets[4] = 1
         runner._update_mamba_slot_read_offsets(
-            [torch.tensor([1, 4], dtype=torch.int32)], None, 2)
+            [torch.tensor([1, 4], dtype=torch.int32)], None, 2
+        )
         assert int(runner.mamba_slot_read_offsets[1]) == 0
         assert int(runner.mamba_slot_read_offsets[4]) == 0
 
@@ -1974,8 +2187,7 @@ class TestMambaSlotReadOffsets:
         runner.mamba_slot_read_offsets[1] = 2
         # num_reqs = 1 active (slot 1); position 1 is padding -> slot 0.
         state_indices = torch.tensor([1, 0], dtype=torch.int32)
-        next_tokens = torch.tensor([[10, 11],
-                                    [INVALID_TOKEN_ID, INVALID_TOKEN_ID]])
+        next_tokens = torch.tensor([[10, 11], [INVALID_TOKEN_ID, INVALID_TOKEN_ID]])
         runner._update_mamba_slot_read_offsets([state_indices], next_tokens, 1)
         assert int(runner.mamba_slot_read_offsets[1]) == 1  # 2 valid - 1
         # Null slot only ever gets 0; active groups untouched by the tail.
@@ -1987,10 +2199,10 @@ class TestMambaSlotReadOffsets:
         runner = self._make_runner(num_blocks=16)
         group0 = torch.tensor([3, 7], dtype=torch.int32)
         group1 = torch.tensor([11, 5], dtype=torch.int32)
-        next_tokens = torch.tensor([[10, 11, 12],
-                                    [20, INVALID_TOKEN_ID, INVALID_TOKEN_ID]])
-        runner._update_mamba_slot_read_offsets([group0, group1], next_tokens,
-                                               2)
+        next_tokens = torch.tensor(
+            [[10, 11, 12], [20, INVALID_TOKEN_ID, INVALID_TOKEN_ID]]
+        )
+        runner._update_mamba_slot_read_offsets([group0, group1], next_tokens, 2)
         for block, expected in ((3, 2), (7, 0), (11, 2), (5, 0)):
             assert int(runner.mamba_slot_read_offsets[block]) == expected
 
@@ -2011,17 +2223,19 @@ class TestReadOffsetsClearedOnReallocation:
     the previous conversation: silent GDN state corruption, no crash.
     """
 
-    def _make_runner(self, num_blocks=8, width=2):
+    def _make_runner(self, num_blocks=8, width=2, lockstep=False):
         runner = MagicMock(spec=TPUModelRunner)
-        runner.mamba_slot_read_offsets = torch.zeros(num_blocks,
-                                                     dtype=torch.int32)
+        runner.mamba_slot_read_offsets = torch.zeros(num_blocks, dtype=torch.int32)
         runner._mamba_offset_seeded = set()
         runner._read_offset_scratch = {}
+        runner._dp_lockstep_enabled = lambda: lockstep
         runner.input_batch = MagicMock()
         runner._mamba_state_index_groups = (
-            TPUModelRunner._mamba_state_index_groups.__get__(runner))
+            TPUModelRunner._mamba_state_index_groups.__get__(runner)
+        )
         runner._read_offset_reset_scratch = (
-            TPUModelRunner._read_offset_reset_scratch.__get__(runner))
+            TPUModelRunner._read_offset_reset_scratch.__get__(runner)
+        )
         runner._reset_read_offsets_for_new_requests = (
             TPUModelRunner._reset_read_offsets_for_new_requests.__get__(runner)
         )
@@ -2029,13 +2243,10 @@ class TestReadOffsetsClearedOnReallocation:
 
     def _set_batch(self, runner, req_ids, state_indices):
         runner.input_batch.req_ids = list(req_ids)
-        runner.input_batch.req_id_to_index = {
-            r: i
-            for i, r in enumerate(req_ids)
-        }
+        runner.input_batch.req_id_to_index = {r: i for i, r in enumerate(req_ids)}
+        runner.requests = dict.fromkeys(req_ids)
         ctx = MagicMock()
-        ctx.mamba_state_indices = torch.tensor(state_indices,
-                                               dtype=torch.int32)
+        ctx.mamba_state_indices = torch.tensor(state_indices, dtype=torch.int32)
         ctx.unified_mamba_state_indices = None
         runner._attn_metadata_builder_ctx = ctx
 
@@ -2052,7 +2263,8 @@ class TestReadOffsetsClearedOnReallocation:
         runner._reset_read_offsets_for_new_requests(0, 1)
 
         assert int(runner.mamba_slot_read_offsets[5]) == 0, (
-            "new request inherited the previous request's checkpoint")
+            "new request inherited the previous request's checkpoint"
+        )
 
     def test_continuing_request_keeps_its_offset(self):
         """The reset must not clobber a request still mid-window."""
@@ -2079,6 +2291,46 @@ class TestReadOffsetsClearedOnReallocation:
         assert int(runner.mamba_slot_read_offsets[6]) == 0  # cleared
         assert int(runner.mamba_slot_read_offsets[0]) == 0  # null stays 0
 
+    @pytest.mark.parametrize("lockstep", [False, True])
+    def test_all_seen_batch_skips_device_work_unless_lockstep(
+        self, monkeypatch, lockstep
+    ):
+        """A batch with no new request has nothing to reset. One engine's TP
+        ranks all see that batch, so they skip the upload and launches
+        together. Under EP-DP lockstep, where "new" is rank-local, every rank
+        still issues them."""
+        calls = []
+        real = tpu_runner._reset_read_offsets
+
+        def counting(*args):
+            calls.append(args)
+            real(*args)
+
+        monkeypatch.setattr(tpu_runner, "_reset_read_offsets", counting)
+        runner = self._make_runner(lockstep=lockstep)
+        self._set_batch(runner, ["a"], [5, 0])
+        runner._reset_read_offsets_for_new_requests(0, 1)
+        runner._reset_read_offsets_for_new_requests(0, 1)
+        assert len(calls) == (2 if lockstep else 1)
+
+        # A new request is always reset.
+        self._set_batch(runner, ["a", "b"], [5, 6])
+        runner._reset_read_offsets_for_new_requests(0, 2)
+        assert len(calls) == (3 if lockstep else 2)
+
+        # "a" leaves; the all-old batch is skipped without lockstep.
+        self._set_batch(runner, ["b"], [6, 0])
+        runner._reset_read_offsets_for_new_requests(0, 1)
+        assert len(calls) == (4 if lockstep else 2)
+
+        # "a" comes back on a recycled slot carrying a stale offset. It was
+        # forgotten when it left, so it counts as new and its slot is cleared.
+        runner.mamba_slot_read_offsets[5] = 2
+        self._set_batch(runner, ["b", "a"], [6, 5])
+        runner._reset_read_offsets_for_new_requests(0, 2)
+        assert len(calls) == (5 if lockstep else 3)
+        assert int(runner.mamba_slot_read_offsets[5]) == 0
+
 
 class TestUnifiedReadOffsetMigration:
     """The align-mode seed-copy collector must migrate the per-block read
@@ -2091,23 +2343,17 @@ class TestUnifiedReadOffsetMigration:
     that is covered in tests/runner/test_mamba_state_seed_copies.py.
     """
 
-    def _make_runner(self,
-                     *,
-                     block_table,
-                     computed,
-                     scheduled,
-                     block_size=4,
-                     ckpt_window=1):
+    def _make_runner(
+        self, *, block_table, computed, scheduled, block_size=4, ckpt_window=1
+    ):
         runner = MagicMock(spec=TPUModelRunner)
         runner.cache_config = MagicMock()
         runner.cache_config.block_size = block_size
         runner._mamba_ckpt_window = ckpt_window
         runner._bucket_len = TPUModelRunner._bucket_len
         runner._pad_to_bucket = TPUModelRunner._pad_to_bucket
-        for name in ("_pad_dev_to_bucket", "_expand_pool_split",
-                     "_spec_seed_sources"):
-            setattr(runner, name,
-                    getattr(TPUModelRunner, name).__get__(runner))
+        for name in ("_pad_dev_to_bucket", "_expand_pool_split", "_spec_seed_sources"):
+            setattr(runner, name, getattr(TPUModelRunner, name).__get__(runner))
         # The collector strides the mamba block tables by the mamba groups'
         # spec block size (times the cp world), not by the attention block
         # size; with cp=1 the two coincide here.
@@ -2115,38 +2361,42 @@ class TestUnifiedReadOffsetMigration:
         runner.device = torch.device("cpu")
         runner.mamba_slot_read_offsets = torch.zeros(16, dtype=torch.int32)
         runner._mamba_state_pos = {}
+        runner.scheduler_config = SimpleNamespace(async_scheduling=False)
+        runner.speculative_config = None
+        runner._pre_async_results = None
         runner._pool_block_split = 1
         runner._pending_mamba_state_copies = []
+        runner._unfenced_h2d_sources = []
+        runner._registered_h2d_sources = set()
         raw = torch.zeros(16, 2)
         runner._mamba_copy_plan = [(0, [raw])]
         runner.input_batch = MagicMock()
         req_ids = [f"r{i}" for i in range(len(computed))]
+        runner.requests = {rid: object() for rid in req_ids}
+        runner._mamba_offset_seeded = set(req_ids)
         runner.input_batch.req_ids = req_ids
-        runner.input_batch.req_id_to_index = {
-            rid: i
-            for i, rid in enumerate(req_ids)
-        }
+        runner.input_batch.req_id_to_index = {rid: i for i, rid in enumerate(req_ids)}
         runner.input_batch.num_computed_tokens_cpu = np.array(computed)
         bt_obj = MagicMock()
-        bt_obj.get_cpu_tensor.return_value = torch.tensor(block_table,
-                                                          dtype=torch.int32)
+        bt_obj.get_cpu_tensor.return_value = torch.tensor(
+            block_table, dtype=torch.int32
+        )
         runner.input_batch.block_table = {0: bt_obj}
         runner._collect_mamba_state_seed_copies = (
-            TPUModelRunner._collect_mamba_state_seed_copies.__get__(runner))
+            TPUModelRunner._collect_mamba_state_seed_copies.__get__(runner)
+        )
         scheduler_output = MagicMock()
         scheduler_output.num_scheduled_tokens = {
-            rid: s
-            for rid, s in zip(req_ids, scheduled)
+            rid: s for rid, s in zip(req_ids, scheduled)
         }
         return runner, scheduler_output
 
     def test_offsets_follow_state_block_on_crossing(self):
         # block_size=4: req r0 computed=7 scheduled=2 -> state block moves
         # from position 1 (block id 5) to position 2 (block id 9).
-        runner, scheduler_output = self._make_runner(block_table=[[2, 5, 9,
-                                                                   0]],
-                                                     computed=[7],
-                                                     scheduled=[2])
+        runner, scheduler_output = self._make_runner(
+            block_table=[[2, 5, 9, 0]], computed=[7], scheduled=[2]
+        )
         runner.mamba_slot_read_offsets[5] = 3
         runner._collect_mamba_state_seed_copies(scheduler_output, 0, 1)
         assert int(runner.mamba_slot_read_offsets[9]) == 3
@@ -2154,12 +2404,17 @@ class TestUnifiedReadOffsetMigration:
         assert len(runner._pending_mamba_state_copies) == 1
         _, src_t, dst_t = runner._pending_mamba_state_copies[0]
         assert int(src_t[0]) == 5 and int(dst_t[0]) == 9
+        # Both offset migration and seed copy tensors were staged via stage_h2d_upload.
+        assert len(runner._unfenced_h2d_sources) == 4
+        assert runner._unfenced_h2d_sources[-2][0] is src_t
+        assert runner._unfenced_h2d_sources[-1][0] is dst_t
+        assert runner._unfenced_h2d_sources[-2][1] is _noop_release
+        assert runner._unfenced_h2d_sources[-1][1] is _noop_release
 
     def test_no_crossing_leaves_offsets_alone(self):
-        runner, scheduler_output = self._make_runner(block_table=[[2, 5, 9,
-                                                                   0]],
-                                                     computed=[5],
-                                                     scheduled=[2])
+        runner, scheduler_output = self._make_runner(
+            block_table=[[2, 5, 9, 0]], computed=[5], scheduled=[2]
+        )
         runner.mamba_slot_read_offsets[5] = 3
         runner._collect_mamba_state_seed_copies(scheduler_output, 0, 1)
         assert int(runner.mamba_slot_read_offsets[5]) == 3
@@ -2173,10 +2428,8 @@ class TestUnifiedReadOffsetMigration:
         # resuming one checkpoint late. It lands as checkpoint 0, so the
         # offset resets.
         runner, scheduler_output = self._make_runner(
-            block_table=[[2, 5, 9, 11]],
-            computed=[7],
-            scheduled=[2],
-            ckpt_window=3)
+            block_table=[[2, 5, 9, 11]], computed=[7], scheduled=[2], ckpt_window=3
+        )
         # Pre-crossing group is columns 1..3 = blocks (5, 9, 11).
         runner.mamba_slot_read_offsets[5] = 2
         runner._collect_mamba_state_seed_copies(scheduler_output, 0, 1)
@@ -2188,340 +2441,13 @@ class TestUnifiedReadOffsetMigration:
         # A rejected verify window can pull the state position back into the
         # previous block: prev tracked position 2 (block 9), current step
         # lands in position 1 (block 5) -> offsets follow backward.
-        runner, scheduler_output = self._make_runner(block_table=[[2, 5, 9,
-                                                                   0]],
-                                                     computed=[6],
-                                                     scheduled=[1])
+        runner, scheduler_output = self._make_runner(
+            block_table=[[2, 5, 9, 0]], computed=[6], scheduled=[1]
+        )
         runner._mamba_state_pos["r0"] = 2
         runner.mamba_slot_read_offsets[9] = 1
         runner._collect_mamba_state_seed_copies(scheduler_output, 0, 1)
         assert int(runner.mamba_slot_read_offsets[5]) == 1
-
-
-def test_dsv4_layer_classification():
-    """Every DSv4 layer is sorted by the kernel that reads its array.
-
-    Mirrors the reference (`tpu_inference/runner/kv_cache_manager.py`):
-    MLAAttentionSpec layers anchor the overlays, `*.compressor.state_cache`
-    layers are placed afterwards, and SWA layers stay grouped because layers
-    of one cache group share a block table. A layer matching none of the
-    three is a layout change the overlay plan cannot absorb, so it raises
-    rather than being silently left without an array.
-    """
-    from vllm.v1.kv_cache_interface import SlidingWindowMLASpec
-
-    def mla(compress_ratio, head_size=640):
-        return MLAAttentionSpec(block_size=1024,
-                                num_kv_heads=1,
-                                head_size=head_size,
-                                dtype=torch.uint8,
-                                compress_ratio=compress_ratio,
-                                alignment=None)
-
-    def swa():
-        return SlidingWindowMLASpec(block_size=128,
-                                    num_kv_heads=1,
-                                    head_size=640,
-                                    dtype=torch.uint8,
-                                    sliding_window=128,
-                                    alignment=None)
-
-    specs = {
-        "m.layers.0.attn": mla(4),
-        "m.layers.1.attn": mla(128),
-        "m.layers.0.attn.indexer.k_cache": mla(4, head_size=256),
-        "m.layers.0.attn.compressor.state_cache": swa(),
-        "m.layers.0.attn.swa_cache": swa(),
-        "m.layers.1.attn.swa_cache": swa(),
-    }
-    groups = [
-        SimpleNamespace(layer_names=[
-            "m.layers.0.attn", "m.layers.1.attn",
-            "m.layers.0.attn.indexer.k_cache",
-            "m.layers.0.attn.compressor.state_cache"
-        ]),
-        SimpleNamespace(layer_names=[
-            "m.layers.0.attn.swa_cache", "m.layers.1.attn.swa_cache"
-        ]),
-    ]
-
-    runner = MagicMock()
-    runner.shared_kv_cache_layers = {}
-    runner._is_ds_v4_swa_layer = TPUModelRunner._is_ds_v4_swa_layer
-    runner._DS_V4_STATE_CACHE_SUFFIX = TPUModelRunner._DS_V4_STATE_CACHE_SUFFIX
-
-    mla_names, swa_groups, state_names = TPUModelRunner._classify_ds_v4_layers(
-        runner, SimpleNamespace(kv_cache_groups=groups), specs.__getitem__)
-
-    assert mla_names == [
-        "m.layers.0.attn", "m.layers.1.attn", "m.layers.0.attn.indexer.k_cache"
-    ]
-    assert state_names == ["m.layers.0.attn.compressor.state_cache"]
-    # Grouped, not flattened: position within the group picks the host array.
-    assert swa_groups == [[
-        "m.layers.0.attn.swa_cache", "m.layers.1.attn.swa_cache"
-    ]]
-
-    stray = SimpleNamespace(layer_names=["m.layers.0.mystery"])
-    with pytest.raises(ValueError, match="no known role"):
-        TPUModelRunner._classify_ds_v4_layers(
-            runner, SimpleNamespace(kv_cache_groups=groups + [stray]), {
-                **specs, "m.layers.0.mystery": swa()
-            }.__getitem__)
-
-
-def test_dsv4_swa_overlay_shares_hosts_across_groups():
-    """SWA caches take a host by position *within* their own cache group.
-
-    Mirrors the reference: `swa_host_indices[position]` with `position`
-    restarting at 0 for every group, so the one-SWA-layer-per-group layout
-    vLLM actually produces puts every SWA cache on the *same* CSA NoPE array.
-    That is safe -- distinct cache groups never own the same block ID at the
-    same time -- and it is why `_validate_ds_v4_overlay` checks for collisions
-    within a group only. An earlier design forced globally distinct hosts,
-    which allocated arrays the reference does not.
-    """
-    csa_a = torch.zeros(4, 8, 4, 128, dtype=torch.uint8)
-    csa_b = torch.zeros(4, 8, 4, 128, dtype=torch.uint8)
-
-    # The MLA layers form one cache group; each SWA cache is its own group,
-    # which is the shape vLLM actually produces here. A CSA layer and the SWA
-    # cache overlaying its NoPE array therefore never share a block table.
-    groups = [
-        SimpleNamespace(layer_names=[f"m.layers.{i}.attn" for i in range(3)]),
-    ] + [
-        SimpleNamespace(layer_names=[f"m.layers.{i}.attn.swa_cache"])
-        for i in range(3)
-    ]
-    # Positional-within-group assignment: every group's sole SWA layer is at
-    # position 0, so all three share the first CSA NoPE array.
-    kv_caches = {
-        "m.layers.0.attn": (csa_a, torch.zeros(4, 2, 4, 128,
-                                               dtype=torch.uint8)),
-        "m.layers.1.attn": (csa_b, torch.zeros(4, 2, 4, 128,
-                                               dtype=torch.uint8)),
-        "m.layers.2.attn": torch.zeros(4, 16, 4, 128, dtype=torch.uint8),
-        "m.layers.0.attn.swa_cache": csa_a,
-        "m.layers.1.attn.swa_cache": csa_a,
-        "m.layers.2.attn.swa_cache": csa_a,
-    }
-    TPUModelRunner._validate_ds_v4_overlay(
-        SimpleNamespace(kv_cache_groups=groups), kv_caches)
-
-    # Two layers of ONE group on one array is the case that does corrupt:
-    # they share a block table, so they would write each other's pages.
-    one_group = [
-        SimpleNamespace(layer_names=[
-            "m.layers.0.attn.swa_cache", "m.layers.1.attn.swa_cache"
-        ])
-    ]
-    with pytest.raises(ValueError, match="same array"):
-        TPUModelRunner._validate_ds_v4_overlay(
-            SimpleNamespace(kv_cache_groups=one_group), kv_caches)
-
-
-def test_dsv4_specs_are_exempt_from_tpu_normalization():
-    """DSv4 specs must reach vLLM verbatim.
-
-    Without the exemption these specs get a `page_size_padded` derived from the
-    logical 1024-token `block_size` rather than `storage_block_size`. (The
-    packed `uint8` dtype is separately preserved by `_normalize_one_spec`'s
-    integer-MLA carve-out, so dtype alone does not distinguish the two paths.)
-    """
-    from vllm.v1.kv_cache_interface import SlidingWindowMLASpec
-
-    from vllm_torchtpu.kv_cache_spec_normalizer import \
-        normalize_kv_cache_specs_for_tpu
-
-    # A DSv4-shaped compressed main-latent spec: 1024-token logical block
-    # compressed 4:1, packed as uint8.
-    ds_v4_spec = MLAAttentionSpec(
-        block_size=1024,
-        num_kv_heads=1,
-        head_size=640,
-        dtype=torch.uint8,
-        compress_ratio=4,
-        alignment=None,
-    )
-    ds_v4_swa_spec = SlidingWindowMLASpec(
-        block_size=256,
-        num_kv_heads=1,
-        head_size=640,
-        dtype=torch.uint8,
-        sliding_window=128,
-        alignment=None,
-    )
-    specs = {
-        "model.layers.0.attn": ds_v4_spec,
-        "model.layers.0.attn.swa_cache": ds_v4_swa_spec,
-    }
-
-    out = normalize_kv_cache_specs_for_tpu(
-        specs,
-        torch.float8_e4m3fn,
-        exempt_layers=set(specs),
-    )
-
-    for name, original in specs.items():
-        assert out[name] is original, f"{name} was normalized"
-        assert out[name].dtype == torch.uint8
-        assert out[name].page_size_padded is None
-
-    # Without the exemption the same specs are rewritten -- guards against the
-    # exemption silently becoming a no-op.
-    unexempt = normalize_kv_cache_specs_for_tpu(specs, torch.float8_e4m3fn)
-    assert unexempt["model.layers.0.attn"] is not ds_v4_spec
-    assert unexempt["model.layers.0.attn"].page_size_padded is not None
-    # A page sized from the logical block, not from the compressed rows: this
-    # is exactly the over-allocation the exemption avoids.
-    assert (unexempt["model.layers.0.attn"].page_size_padded
-            > ds_v4_spec.block_size // ds_v4_spec.compress_ratio * 640)
-
-
-def test_dsv4_groups_are_uniform_type_with_mixed_block_sizes():
-    """vLLM hands DSv4 its groups wrapped in `UniformTypeKVCacheSpecs`.
-
-    Two consequences for `initialize_kv_cache`, both exercised here: the group
-    spec must be unwrapped before any `isinstance` type test, and block size is
-    not uniform across groups, so it cannot be asserted equal.
-    """
-    from vllm.v1.core.kv_cache_utils import group_and_unify_kv_cache_specs
-    from vllm.v1.kv_cache_interface import (AttentionSpec, MambaSpec,
-                                            SlidingWindowMLASpec,
-                                            UniformTypeKVCacheSpecs)
-
-    # DSv4's real shape: a 1024-token main latent block compressed 4:1, and
-    # SWA caches whose block size is that compressed row count (256), capped
-    # by the window. Two window sizes give two distinct SWA groups.
-    specs: dict = {}
-    for i in range(2):
-        specs[f"m.layers.{i}.attn"] = MLAAttentionSpec(
-            block_size=1024,
-            num_kv_heads=1,
-            head_size=640,
-            dtype=torch.uint8,
-            compress_ratio=4,
-            cache_dtype_str="fp8_ds_mla",
-            model_version="deepseek_v4",
-            alignment=None)
-        for window, block in ((256, 256), (128, 128)):
-            specs[f"m.layers.{i}.attn.swa_cache_w{window}"] = (
-                SlidingWindowMLASpec(block_size=block,
-                                     num_kv_heads=1,
-                                     head_size=640,
-                                     dtype=torch.uint8,
-                                     sliding_window=window,
-                                     cache_dtype_str="fp8_ds_mla",
-                                     model_version="deepseek_v4",
-                                     alignment=None))
-
-    grouped = group_and_unify_kv_cache_specs(specs)
-    assert grouped is not None, (
-        "vLLM did not take its DeepseekV4 grouping path for DSv4-shaped specs")
-    assert all(
-        isinstance(g, UniformTypeKVCacheSpecs)
-        for g in grouped), (f"expected UniformTypeKVCacheSpecs groups, got "
-                            f"{[type(g).__name__ for g in grouped]}")
-
-    # A bare isinstance test against the group spec sees neither AttentionSpec
-    # nor MambaSpec, which is why the representative spec is peeked at.
-    assert not any(isinstance(g, (AttentionSpec, MambaSpec)) for g in grouped)
-
-    block_sizes = {g.block_size for g in grouped}
-    assert len(block_sizes) > 1, (
-        f"expected mixed block sizes across DSv4 groups, got {block_sizes}")
-
-
-def test_dsv4_is_cache_for_ds_v4_predicate():
-    """The exemption must cover all four DSv4 cache-owning module types."""
-    from vllm.models.deepseek_v4.attention import (DeepseekV4Attention,
-                                                   DeepseekV4IndexerCache)
-    from vllm.models.deepseek_v4.compressor import CompressorStateCache
-    from vllm.v1.attention.backends.mla.sparse_swa import DeepseekV4SWACache
-
-    from vllm_torchtpu.runner.tpu_runner import is_cache_for_ds_v4
-
-    for cls in (DeepseekV4Attention, DeepseekV4SWACache,
-                DeepseekV4IndexerCache, CompressorStateCache):
-        assert is_cache_for_ds_v4(MagicMock(spec=cls)), cls.__name__
-
-    assert not is_cache_for_ds_v4(MagicMock(spec=Attention))
-    assert not is_cache_for_ds_v4(MagicMock(spec=MLAAttention))
-
-
-def test_dsv4_compressor_state_cache_overlay_target():
-    """A compressor state cache is named after the layer whose records it joins.
-
-    Mirrors how vLLM wires `DeepseekCompressor.k_cache_prefix`: the main
-    compressor's state rides on its own attention layer's array, the indexer
-    compressor's on the indexer's `k_cache`. The mapping is derived from the
-    layer NAME before anything is allocated -- an overlaid cache that gets its
-    own array still costs its HBM at peak, even if aliased away afterwards.
-    """
-    assert TPUModelRunner._ds_v4_compressed_kv_layer_name(
-        "model.layers.0.self_attn.compressor.state_cache"
-    ) == "model.layers.0.self_attn"
-
-    assert TPUModelRunner._ds_v4_compressed_kv_layer_name(
-        "model.layers.0.attn.indexer.compressor.state_cache"
-    ) == "model.layers.0.attn.indexer.k_cache"
-
-    # A renamed state cache would otherwise derive a host that does not exist
-    # and overlay onto whatever happened to be there.
-    with pytest.raises(ValueError, match="unexpected layer"):
-        TPUModelRunner._ds_v4_compressed_kv_layer_name(
-            "model.layers.0.self_attn.compressor.state")
-
-
-def test_dsv4_state_cache_overlays_its_own_compressed_kv_array():
-    """CSA / indexer states share their own layer's array; HCA states do not.
-
-    An HCA page holds two token states, far too small to host the f32 state
-    rows, so those overlay a CSA NoPE array instead. Both cases must survive
-    the group collision check: the state cache and its compressed-KV layer are
-    in *different* cache groups, which is what makes sharing one array safe.
-    """
-    csa_nope = torch.zeros(4, 8, 4, 128, dtype=torch.uint8)
-    csa_rope = torch.zeros(4, 2, 4, 128, dtype=torch.uint8)
-    indexer = torch.zeros(4, 2, 4, 256, dtype=torch.uint8)
-    hca = torch.zeros(4, 16, 4, 128, dtype=torch.uint8)
-
-    kv_caches = {
-        "m.layers.0.attn": (csa_nope, csa_rope),
-        "m.layers.0.attn.indexer.k_cache": indexer,
-        "m.layers.1.attn": hca,
-        # CSA and indexer states: their own layer's array.
-        "m.layers.0.attn.compressor.state_cache": csa_nope,
-        "m.layers.0.attn.indexer.compressor.state_cache": indexer,
-        # HCA state: a CSA NoPE array, its own page being too small.
-        "m.layers.1.attn.compressor.state_cache": csa_nope,
-    }
-    groups = [
-        SimpleNamespace(layer_names=[
-            "m.layers.0.attn", "m.layers.0.attn.indexer.k_cache",
-            "m.layers.1.attn"
-        ]),
-        SimpleNamespace(layer_names=[
-            "m.layers.0.attn.compressor.state_cache",
-            "m.layers.0.attn.indexer.compressor.state_cache",
-        ]),
-        SimpleNamespace(
-            layer_names=["m.layers.1.attn.compressor.state_cache"]),
-    ]
-    TPUModelRunner._validate_ds_v4_overlay(
-        SimpleNamespace(kv_cache_groups=groups), kv_caches)
-
-    # The CSA layer is matched on its NoPE array, not its RoPE companion, so a
-    # same-group layer landing on that NoPE array is still caught.
-    clash = [
-        SimpleNamespace(
-            layer_names=["m.layers.0.attn", "m.layers.0.attn.swa_cache"])
-    ]
-    with pytest.raises(ValueError, match="same array"):
-        TPUModelRunner._validate_ds_v4_overlay(
-            SimpleNamespace(kv_cache_groups=clash), {
-                **kv_caches, "m.layers.0.attn.swa_cache": csa_nope
-            })
 
 
 def _block_size_for(architecture, backend_page_size=256, preferred=None):
@@ -2548,16 +2474,59 @@ def _block_size_for(architecture, backend_page_size=256, preferred=None):
     backend_mock = MagicMock()
     backend_mock.get_min_page_size.return_value = 1
     backend_mock.get_page_size.return_value = backend_page_size
-    backend_mock.get_preferred_block_size.side_effect = ((
-        lambda d: preferred) if preferred is not None else (lambda d: d))
-    with patch.object(TpuPlatform,
-                      "_find_non_ssm_backend",
-                      return_value=backend_mock):
+    backend_mock.get_preferred_block_size.side_effect = (
+        (lambda d: preferred) if preferred is not None else (lambda d: d)
+    )
+    with patch.object(TpuPlatform, "_find_non_ssm_backend", return_value=backend_mock):
         TpuPlatform.update_block_size_for_backend(vllm_config)
     return vllm_config.cache_config.block_size
 
 
-def test_tpu_platform_block_size_override_is_dsv4_only():
+def test_block_size_resolution_needs_no_ambient_config(monkeypatch):
+    """`update_block_size_for_backend` runs before vLLM makes the config
+    current, so anything it reaches that resolves the KV layout has to
+    establish the context itself.
+
+    Deliberately takes no `vllm_config_context` and uses the real backend
+    rather than a MagicMock: with either of those in place the call resolves
+    the layout against an ambient config and the gap stays hidden. Missing it
+    both ways is what let this reach CI as an `AssertionError: Current vLLM
+    config is not set` at server startup."""
+    from vllm.config import CacheConfig
+    from vllm.v1.attention.backends.utils import resolve_kv_cache_layout
+
+    from vllm_torchtpu.layers.adapter.attention import PallasBatchedRPAAttentionBackend
+
+    monkeypatch.delenv("VLLM_KV_CACHE_LAYOUT", raising=False)
+    vllm_config = SimpleNamespace(
+        cache_config=CacheConfig(),
+        model_config=SimpleNamespace(
+            use_mla=False,
+            is_hybrid=False,
+            max_model_len=1024,
+            architecture="Qwen3ForCausalLM",
+            get_head_size=lambda: 128,
+            hf_config=SimpleNamespace(architectures=["Qwen3ForCausalLM"]),
+        ),
+        scheduler_config=SimpleNamespace(max_num_seqs=8),
+        parallel_config=ParallelConfig(
+            pipeline_parallel_size=1,
+            tensor_parallel_size=1,
+        ),
+        kv_transfer_config=None,
+    )
+    resolve_kv_cache_layout(vllm_config, [["LBNHC", "LBHNC"]])
+    with patch.object(
+        TpuPlatform,
+        "_find_non_ssm_backend",
+        return_value=PallasBatchedRPAAttentionBackend,
+    ):
+        TpuPlatform.update_block_size_for_backend(vllm_config)
+    assert vllm_config.cache_config.block_size in (128, 256)
+
+
+@pytest.mark.tpu_test
+def test_tpu_platform_block_size_override_is_dsv4_only(vllm_config_context):
     """Only DSv4 takes the MLA page size; other MLA models keep vLLM's path.
 
     DSv4's own backend does not define get_page_size, so its size comes from
@@ -2587,19 +2556,15 @@ def test_spec_token_room_guard_caps_writes_at_context_limit():
         input_batch=SimpleNamespace(
             token_ids_cpu=np.zeros((4, 2048), dtype=np.int32),
             num_tokens_no_spec=np.array([10, 2038, 2048, 0], dtype=np.int32),
-            req_id_to_index={
-                "roomy": 0,
-                "edge": 1,
-                "full": 2
-            },
+            req_id_to_index={"roomy": 0, "edge": 1, "full": 2},
             spec_token_ids=[[] for _ in range(4)],
         ),
         requests={},
     )
     calls = []
-    runner.input_batch.update_req_spec_token_ids = (
-        lambda request, scheduled: calls.append(
-            (request.req_id, list(scheduled[request.req_id]))))
+    runner.input_batch.update_req_spec_token_ids = lambda request, scheduled: (
+        calls.append((request.req_id, list(scheduled[request.req_id])))
+    )
     TPUModelRunner._install_spec_token_room_guard(runner)
 
     scheduled = {"roomy": [1] * 15, "edge": [2] * 15, "full": [3] * 15}
@@ -2611,84 +2576,22 @@ def test_spec_token_room_guard_caps_writes_at_context_limit():
         runner.input_batch.update_req_spec_token_ids(requests[rid], scheduled)
 
     # Only what fits is staged into token_ids_cpu.
-    assert [(r, len(ids)) for r, ids in calls] \
-        == [("roomy", 15), ("edge", 10), ("full", 0)]
+    assert [(r, len(ids)) for r, ids in calls] == [
+        ("roomy", 15),
+        ("edge", 10),
+        ("full", 0),
+    ]
     # ...and the clamped write keeps the first drafts, not the last.
     assert calls[1][1] == [2] * 10
     # The scheduler's counts are restored, so the verify window stays aligned
     # with num_scheduled_tokens.
-    assert [len(scheduled[r]) for r in ("roomy", "edge", "full")] \
-        == [15, 15, 15]
-    assert [requests[r].prev_num_draft_len
-            for r in ("roomy", "edge", "full")] == [0, 15, 15]
-    assert [len(runner.input_batch.spec_token_ids[i]) for i in (1, 2)] \
-        == [15, 15]
-
-
-class TestUpdateAttentionPageSizePadded:
-    """_update_attention_page_size_padded must size pages with the caller's
-    block_size instead of self.block_size, which is initialized at __init__
-    time. This is because for hybrid models the update is skipped during that
-    time. It only gets updated after the model is loaded, so using
-    self.block_size will cause the unify_kv_cache_spec_page_size
-    `page_size_padded >= real_page_size_bytes` assertion.
-    """
-
-    @pytest.fixture(autouse=True)
-    def mock_non_ssm_backend(self):
-        with patch.object(TpuPlatform,
-                          '_find_non_ssm_backend',
-                          return_value=PallasAttentionBackend):
-            yield
-
-    @staticmethod
-    def _attn(num_kv_heads, head_size):
-        layer = MagicMock(spec=Attention)
-        layer.num_kv_heads = num_kv_heads
-        layer.head_size = head_size
-        return layer
-
-    @staticmethod
-    def _stub(stale_block_size=16):
-        return SimpleNamespace(
-            block_size=stale_block_size,
-            kv_cache_dtype=torch.bfloat16,
-            cache_config=SimpleNamespace(mamba_page_size_padded=None),
-            _hybrid_uniform_page_size_bytes=None,
-            vllm_config=MagicMock(),
-        )
-
-    def test_uses_caller_block_size_not_stale_snapshot(self):
-        # gemma-4 E4B geometry: sliding head_dim 256 vs global head_dim 512.
-        layers = {
-            "sliding": self._attn(num_kv_heads=2, head_size=256),
-            "full": self._attn(num_kv_heads=2, head_size=512),
-        }
-        stub = self._stub(stale_block_size=16)
-
-        TPUModelRunner._update_attention_page_size_padded(stub, layers, 256)
-
-        expected = PallasAttentionBackend.get_kv_cache_page_size_bytes(
-            256, 2, 512, torch.bfloat16)
-        stale = PallasAttentionBackend.get_kv_cache_page_size_bytes(
-            16, 2, 512, torch.bfloat16)
-        assert stub._hybrid_uniform_page_size_bytes == expected
-        assert stub._hybrid_uniform_page_size_bytes != stale
-        assert stub.cache_config.mamba_page_size_padded == expected
-
-    def test_uniform_layers_leave_pinning_unset(self):
-        layers = {
-            "a": self._attn(num_kv_heads=2, head_size=256),
-            "b": self._attn(num_kv_heads=2, head_size=256),
-        }
-        stub = self._stub()
-
-        TPUModelRunner._update_attention_page_size_padded(stub, layers, 256)
-
-        assert stub._hybrid_uniform_page_size_bytes is None
-        assert stub.cache_config.mamba_page_size_padded == \
-            PallasAttentionBackend.get_kv_cache_page_size_bytes(
-                256, 2, 256, torch.bfloat16)
+    assert [len(scheduled[r]) for r in ("roomy", "edge", "full")] == [15, 15, 15]
+    assert [requests[r].prev_num_draft_len for r in ("roomy", "edge", "full")] == [
+        0,
+        15,
+        15,
+    ]
+    assert [len(runner.input_batch.spec_token_ids[i]) for i in (1, 2)] == [15, 15]
 
 
 class TestBuildAttentionMetadataForLayers:
@@ -2698,9 +2601,9 @@ class TestBuildAttentionMetadataForLayers:
     def _group(gid, layer_names):
         builder = MagicMock()
         builder.build.return_value = SimpleNamespace(tag=gid)
-        return SimpleNamespace(layer_names=layer_names,
-                               kv_cache_group_id=gid,
-                               metadata_builders=[builder])
+        return SimpleNamespace(
+            layer_names=layer_names, kv_cache_group_id=gid, metadata_builders=[builder]
+        )
 
     def _runner(self, groups):
         runner = MagicMock()
@@ -2713,7 +2616,8 @@ class TestBuildAttentionMetadataForLayers:
         runner = self._runner([wanted, other])
 
         out = TPUModelRunner.build_attention_metadata_for_layers(
-            runner, {"draft.0", "draft.1"}, 8)
+            runner, {"draft.0", "draft.1"}, 8
+        )
 
         assert set(out) == {"draft.0", "draft.1"}
         # One build per group, shared by that group's layers.
@@ -2726,8 +2630,7 @@ class TestBuildAttentionMetadataForLayers:
         group = self._group(0, ["draft.0"])
         runner = self._runner([group])
 
-        TPUModelRunner.build_attention_metadata_for_layers(
-            runner, ["draft.0"], 32)
+        TPUModelRunner.build_attention_metadata_for_layers(runner, ["draft.0"], 32)
 
         kwargs = group.metadata_builders[0].build.call_args.kwargs
         assert kwargs["common_attn_metadata"].num_reqs == 32
@@ -2739,8 +2642,7 @@ class TestBuildAttentionMetadataForLayers:
         group = self._group(0, ["draft.0", "draft.1"])
         runner = self._runner([group])
 
-        out = TPUModelRunner.build_attention_metadata_for_layers(
-            runner, {"draft.0"}, 8)
+        out = TPUModelRunner.build_attention_metadata_for_layers(runner, {"draft.0"}, 8)
 
         assert set(out) == {"draft.0"}
 
@@ -2748,8 +2650,1003 @@ class TestBuildAttentionMetadataForLayers:
         group = self._group(0, ["target.0"])
         runner = self._runner([group])
 
-        out = TPUModelRunner.build_attention_metadata_for_layers(
-            runner, {"draft.0"}, 8)
+        out = TPUModelRunner.build_attention_metadata_for_layers(runner, {"draft.0"}, 8)
 
         assert out == {}
         group.metadata_builders[0].build.assert_not_called()
+
+
+class _FakeTpuEvent:
+    instances: list["_FakeTpuEvent"] = []
+
+    def __init__(self):
+        self.recorded = False
+        self.synchronized = 0
+        _FakeTpuEvent.instances.append(self)
+
+    def record(self):
+        self.recorded = True
+
+    def synchronize(self):
+        self.synchronized += 1
+
+
+class TestInputStagingFence:
+    """A chunk records a fence after uploading from the reusable host staging
+    tensors; the next chunk synchronizes on it before rewriting them, once."""
+
+    def test_record_then_wait_synchronizes_once(self, monkeypatch):
+        _FakeTpuEvent.instances.clear()
+        monkeypatch.setattr(
+            torch, "tpu", SimpleNamespace(Event=_FakeTpuEvent), raising=False
+        )
+        runner = SimpleNamespace(
+            _input_staging_fence=None,
+            _unfenced_h2d_sources=[],
+            _fenced_h2d_sources=[],
+            _free_h2d_sources={},
+            _registered_h2d_sources=set(),
+        )
+        TPUModelRunner._record_input_staging_fence(runner)
+        fence = runner._input_staging_fence
+        assert fence is _FakeTpuEvent.instances[-1]
+        assert fence.recorded
+        TPUModelRunner._wait_input_staging_fence(runner)
+        assert fence.synchronized == 1
+        assert runner._input_staging_fence is None
+        TPUModelRunner._wait_input_staging_fence(runner)
+        assert fence.synchronized == 1
+
+    def test_wait_without_fence_is_noop(self, monkeypatch):
+        monkeypatch.setattr(
+            torch, "tpu", SimpleNamespace(Event=_FakeTpuEvent), raising=False
+        )
+        runner = SimpleNamespace(_input_staging_fence=None)
+        TPUModelRunner._wait_input_staging_fence(runner)
+        assert runner._input_staging_fence is None
+
+    def test_staged_h2d_sources_live_until_their_fence_is_waited(self, monkeypatch):
+        """A host source uploaded before a record is released by the wait on
+        that fence via its tuple callback (recycling registered `zeros_h2d_source`
+        buffers into `_free_h2d_sources` and using a no-op callback for one-off
+        tensors); one uploaded after it (a draft walk) must survive that wait
+        and only go with the next fence cycle."""
+        monkeypatch.setattr(
+            torch, "tpu", SimpleNamespace(Event=_FakeTpuEvent), raising=False
+        )
+        runner = SimpleNamespace(
+            device=torch.device("cpu"),
+            _input_staging_fence=None,
+            _unfenced_h2d_sources=[],
+            _fenced_h2d_sources=[],
+            _free_h2d_sources={},
+            _registered_h2d_sources=set(),
+        )
+        target_buf = zeros_h2d_source(runner, 4).fill_(1)
+        assert id(target_buf) in runner._registered_h2d_sources
+        target = stage_h2d_upload(runner, target_buf)
+        target_ptr = target.data_ptr()
+
+        one_off_buf = torch.tensor([1, 2, 3], dtype=torch.long)
+        assert id(one_off_buf) not in runner._registered_h2d_sources
+        one_off = stage_h2d_upload(runner, one_off_buf)
+
+        TPUModelRunner._record_input_staging_fence(runner)
+        draft_buf = zeros_h2d_source(runner, 4).fill_(2)
+        draft = stage_h2d_upload(runner, draft_buf)
+
+        assert len(runner._fenced_h2d_sources) == 2
+        assert runner._fenced_h2d_sources[0][0] is target
+        assert runner._fenced_h2d_sources[0][1] is not _noop_release
+        assert runner._fenced_h2d_sources[1] == (one_off, _noop_release)
+        assert runner._unfenced_h2d_sources[0][0] is draft
+
+        TPUModelRunner._wait_input_staging_fence(runner)
+        assert runner._fenced_h2d_sources == []
+        # Only the registered `zeros_h2d_source` buffer is recycled into
+        # `_free_h2d_sources`; the one-off tensor's dummy callback is a no-op.
+        assert runner._free_h2d_sources == {(4, torch.int32): [target]}
+        assert runner._unfenced_h2d_sources[0][0] is draft
+
+        reused = zeros_h2d_source(runner, 4, torch.int32)
+        assert reused.data_ptr() == target_ptr
+        assert reused.tolist() == [0, 0, 0, 0]
+        assert runner._free_h2d_sources[(4, torch.int32)] == []
+
+        TPUModelRunner._record_input_staging_fence(runner)
+        TPUModelRunner._wait_input_staging_fence(runner)
+        assert runner._fenced_h2d_sources == []
+        assert runner._unfenced_h2d_sources == []
+        assert runner._free_h2d_sources[(4, torch.int32)] == [draft]
+
+    def test_wait_input_staging_fence_executes_tuple_callbacks_directly(
+        self, monkeypatch
+    ):
+        """`_wait_input_staging_fence` only invokes each fenced entry's callback
+        and clears `_fenced_h2d_sources`, without inspecting the buffer."""
+        monkeypatch.setattr(
+            torch, "tpu", SimpleNamespace(Event=_FakeTpuEvent), raising=False
+        )
+        called: list[str] = []
+        buf_a = torch.zeros(2, dtype=torch.int32)
+        buf_b = torch.zeros(3, dtype=torch.int64)
+        runner = SimpleNamespace(
+            _input_staging_fence=None,
+            _unfenced_h2d_sources=[
+                (buf_a, lambda: called.append("a")),
+                (buf_b, lambda: called.append("b")),
+            ],
+            _fenced_h2d_sources=[],
+        )
+        TPUModelRunner._record_input_staging_fence(runner)
+        assert runner._unfenced_h2d_sources == []
+        assert len(runner._fenced_h2d_sources) == 2
+
+        TPUModelRunner._wait_input_staging_fence(runner)
+        assert called == ["a", "b"]
+        assert runner._fenced_h2d_sources == []
+
+    def test_zeros_h2d_source_max_buffers_evicts_lru_and_unregisters(self, monkeypatch):
+        """When `max_buffers` is reached, `zeros_h2d_source` pops the
+        least-recently-used buffer from `_free_h2d_sources`, removes its
+        registration from `_registered_h2d_sources`, and registers the new
+        buffer."""
+        monkeypatch.setattr(
+            torch, "tpu", SimpleNamespace(Event=_FakeTpuEvent), raising=False
+        )
+        runner = SimpleNamespace(
+            device=torch.device("cpu"),
+            _input_staging_fence=None,
+            _unfenced_h2d_sources=[],
+            _fenced_h2d_sources=[],
+            _free_h2d_sources={},
+            _registered_h2d_sources=set(),
+        )
+        # Step 1: allocate and recycle 2 buffers (reaching max_buffers=2).
+        b1 = zeros_h2d_source(runner, 4, max_buffers=2)
+        b2 = zeros_h2d_source(runner, 8, max_buffers=2)
+        stage_h2d_upload(runner, b1)
+        stage_h2d_upload(runner, b2)
+        TPUModelRunner._record_input_staging_fence(runner)
+        TPUModelRunner._wait_input_staging_fence(runner)
+        assert runner._registered_h2d_sources == {id(b1), id(b2)}
+        assert list(runner._free_h2d_sources.keys()) == [
+            (4, torch.int32),
+            (8, torch.int32),
+        ]
+
+        # Step 2: reuse b1 (shape 4) so b2 (shape 8) becomes the oldest free
+        # buffer after the fence wait.
+        reused_b1 = zeros_h2d_source(runner, 4, max_buffers=2)
+        assert reused_b1 is b1
+        stage_h2d_upload(runner, reused_b1)
+        TPUModelRunner._record_input_staging_fence(runner)
+        TPUModelRunner._wait_input_staging_fence(runner)
+        assert list(runner._free_h2d_sources.keys()) == [
+            (8, torch.int32),
+            (4, torch.int32),
+        ]
+
+        # Step 3: allocate a new shape (16) with max_buffers=2 -> evicts and
+        # unregisters b2 (the LRU buffer in _free_h2d_sources), and registers b3.
+        b3 = zeros_h2d_source(runner, 16, max_buffers=2)
+        assert id(b2) not in runner._registered_h2d_sources
+        assert (8, torch.int32) not in runner._free_h2d_sources
+        assert runner._registered_h2d_sources == {id(b1), id(b3)}
+
+        stage_h2d_upload(runner, b3)
+        TPUModelRunner._record_input_staging_fence(runner)
+        TPUModelRunner._wait_input_staging_fence(runner)
+        assert runner._free_h2d_sources == {
+            (4, torch.int32): [b1],
+            (16, torch.int32): [b3],
+        }
+
+    def test_dummy_run_fences_its_uploads_before_the_forward(self, monkeypatch):
+        """Warmup and idle-DP dummy runs stage block tables too: each run must
+        release the previous run's host sources and fence its own before the
+        forward, so repeated runs neither accumulate buffers nor make the next
+        wait block on a dummy forward."""
+        _FakeTpuEvent.instances.clear()
+        monkeypatch.setattr(
+            torch, "tpu", SimpleNamespace(Event=_FakeTpuEvent), raising=False
+        )
+        monkeypatch.setattr(tpu_runner, "synchronize_tensors", lambda *a, **kw: None)
+        for name in ("set_forward_context", "set_vllm_model_wrapper_context"):
+            monkeypatch.setattr(
+                tpu_runner, name, lambda *a, **kw: contextlib.nullcontext()
+            )
+        from vllm_torchtpu.layers.core.sequence_layout import (
+            DEFAULT_SEQUENCE_LAYOUT_DESCRIPTOR,
+        )
+
+        def forward_model(**kw):
+            # The fence must already cover this run's uploads.
+            assert runner._input_staging_fence is _FakeTpuEvent.instances[-1]
+            assert runner._unfenced_h2d_sources == []
+            return torch.zeros((4, 8), dtype=torch.float32), None
+
+        runner = SimpleNamespace(
+            device=torch.device("cpu"),
+            max_model_len=64,
+            max_num_tokens=64,
+            max_num_reqs=4,
+            max_num_blocks_per_req=4,
+            most_model_len=None,
+            block_size=16,
+            uses_mrope=False,
+            supports_mm_inputs=False,
+            _pp_is_first=True,
+            _pp_wave=None,
+            _pp_topk_buffer=None,
+            _kv_cache_bundle=None,
+            lora_config=None,
+            vllm_config=MagicMock(),
+            mesh=MagicMock(),
+            kv_cache_config=SimpleNamespace(kv_cache_groups=[]),
+            _has_mamba_state=False,
+            mamba_slot_read_offsets=None,
+            _mamba_ckpt_window=1,
+            _unified_kv_layout=False,
+            empty_slot_mappings={},
+            position_ids=torch.zeros(64, dtype=torch.int32),
+            _input_staging_fence=None,
+            _unfenced_h2d_sources=[],
+            _fenced_h2d_sources=[],
+            _free_h2d_sources={},
+            _registered_h2d_sources=set(),
+            _token_padding_state=None,
+            sequence_layout_planner=SimpleNamespace(
+                prepare_dummy=lambda **kw: SimpleNamespace(
+                    descriptor=DEFAULT_SEQUENCE_LAYOUT_DESCRIPTOR
+                )
+            ),
+            maybe_select_dummy_loras=lambda *a, **kw: contextlib.nullcontext(),
+            _dp_num_tokens_across_dp=lambda n: None,
+            forward_model=forward_model,
+            compute_selected_logits=lambda out, idx: out,
+        )
+        for name in (
+            "_build_attention_metadata",
+            "_record_input_staging_fence",
+            "_wait_input_staging_fence",
+            "_pp_take_topk_indices",
+        ):
+            setattr(runner, name, getattr(TPUModelRunner, name).__get__(runner))
+        bt = MagicMock()
+        bt.max_num_blocks_per_req = 4
+        bt.get_cpu_tensor.return_value = torch.zeros((4, 4), dtype=torch.int32)
+        runner.input_batch = SimpleNamespace(block_table=[bt])
+        builder = AttentionMetadataBuilder(
+            kv_cache_spec=FullAttentionSpec(
+                block_size=16,
+                num_kv_heads=2,
+                head_size=128,
+                dtype=torch.bfloat16,
+                page_size_padded=16384,
+            ),
+            layer_names=["attn.0"],
+            vllm_config=MagicMock(),
+            device=runner.device,
+            runner=runner,
+            kv_cache_group_id=0,
+        )
+        group = MagicMock()
+        group.metadata_builders = [builder]
+        group.layer_names = ["attn.0"]
+        runner.attn_groups = [[group]]
+
+        for dp_lockstep in (False, True, False):
+            TPUModelRunner._dummy_run(
+                runner, num_tokens=16, num_reqs=4, num_blocks=4, dp_lockstep=dp_lockstep
+            )
+            # Only this run's staged table is still held, by its own fence.
+            assert runner._unfenced_h2d_sources == []
+            assert len(runner._fenced_h2d_sources) == 1
+            assert runner._input_staging_fence is _FakeTpuEvent.instances[-1]
+        assert len(_FakeTpuEvent.instances) == 3
+        assert all(fence.synchronized == 1 for fence in _FakeTpuEvent.instances[:-1])
+
+        # With through_handoff=True, the fence must be recorded before
+        # _pp_wave.start_forward so the next wait never blocks on the receive.
+        handoff_checked = []
+
+        def start_forward(n):
+            assert runner._input_staging_fence is _FakeTpuEvent.instances[-1]
+            assert runner._unfenced_h2d_sources == []
+            handoff_checked.append(n)
+            return None
+
+        runner._pp_wave = SimpleNamespace(
+            step=contextlib.nullcontext,
+            start_forward=start_forward,
+            end_forward=lambda *a: None,
+        )
+        TPUModelRunner._dummy_run(
+            runner, num_tokens=16, num_reqs=4, num_blocks=4, through_handoff=True
+        )
+        assert handoff_checked == [16]
+
+
+class TestAsyncSpecDecodeTokenAccounting:
+    """Verifies that async speculative decoding token accounting properly rolls
+    back optimistic draft counts, writes accepted tokens contiguously to token_ids_cpu
+    without holes or overwriting prior tokens, and prevents runaway drift of
+    num_tokens_no_spec across multi-step sequences."""
+
+    def _setup_runner(self, max_num_reqs=4, max_model_len=64):
+        runner = MagicMock()
+        runner.max_model_len = max_model_len
+        runner.input_batch = SimpleNamespace(
+            token_ids_cpu=np.zeros((max_num_reqs, max_model_len), dtype=np.int32),
+            num_tokens_no_spec=np.zeros((max_num_reqs,), dtype=np.int32),
+            req_id_to_index={},
+        )
+        runner.requests = {}
+        return runner
+
+    def test_single_request_multi_step_acceptance_and_rejection(self):
+        """Simulate a 4-step sequence:
+        Step 0: Prefill 10 tokens -> proposes K=3 drafts. Prefill bonus 100 sampled.
+        Step 1: Prefill token committed (100). Step 1 proposes K=3 drafts.
+        Step 2: Step 1 drafts verified -> 2 drafts accepted (101, 102) +
+            1 bonus (103) = 3 tokens committed.
+        Step 3: Step 2 drafts verified -> all drafts rejected, 1 bonus (108) committed.
+        """
+        runner = self._setup_runner()
+        req_id = "req-0"
+        prompt_len = 10
+        prompt_tokens = list(range(1, 11))
+
+        req_state = SimpleNamespace(
+            req_id=req_id,
+            output_token_ids=[],
+            num_computed_tokens=prompt_len,
+        )
+        runner.requests[req_id] = req_state
+        runner.input_batch.req_id_to_index[req_id] = 0
+        runner.input_batch.num_tokens_no_spec[0] = prompt_len
+        runner.input_batch.token_ids_cpu[0, :prompt_len] = prompt_tokens
+
+        # Step 0: Prefill proposes K=3 drafts for the next step, but verifies
+        # none in this step: only its sampled bonus gets an output placeholder.
+        request_seq_lens_0 = [(0, req_state, prompt_len, req_id)]
+        num_draft_0 = {0: 0}
+        next_token_indices = {0: 0}
+        TPUModelRunner._update_placeholder(
+            runner,
+            discard_sampled_tokens_req_indices=[],
+            request_seq_lens=request_seq_lens_0,
+            next_token_indices=next_token_indices,
+            num_draft_per_req=num_draft_0,
+        )
+        assert runner.input_batch.num_tokens_no_spec[0] == 11
+        assert req_state.output_token_ids == [0]
+
+        # Step 1: Start of Decode Step 1. _modify_prev_results for Prefill result.
+        # Prefill only had 1 sampled bonus token: [100].
+        copy_mock_0 = MagicMock()
+        copy_mock_0.wait_for_copy.return_value = torch.tensor(
+            [[100]], dtype=torch.int32
+        )
+        runner._pre_async_results = SimpleNamespace(
+            req_ids=[req_id],
+            request_seq_lens=request_seq_lens_0,
+            discard_sampled_tokens_req_indices=[],
+            num_draft_per_req=num_draft_0,
+            wait_for_copy=copy_mock_0.wait_for_copy,
+        )
+        TPUModelRunner._modify_prev_results(runner)
+
+        # Rollback check:
+        # Replace the single placeholder with the sampled bonus.
+        assert req_state.output_token_ids == [100]
+        # num_tokens_no_spec stays at 11 - 1 + 1 = 11.
+        assert runner.input_batch.num_tokens_no_spec[0] == 11
+        # token_ids_cpu slot 10 should be 100
+        assert runner.input_batch.token_ids_cpu[0, 10] == 100
+        assert np.array_equal(
+            runner.input_batch.token_ids_cpu[0, :11], prompt_tokens + [100]
+        )
+
+        # Step 1: End of Decode Step 1. _update_placeholder called with K=3 drafts
+        request_seq_lens_1 = [(0, req_state, 14, req_id)]
+        num_draft_1 = {0: 3}
+        TPUModelRunner._update_placeholder(
+            runner,
+            discard_sampled_tokens_req_indices=[],
+            request_seq_lens=request_seq_lens_1,
+            next_token_indices=next_token_indices,
+            num_draft_per_req=num_draft_1,
+        )
+        # num_tokens_no_spec should advance from committed (11) + 4 = 15,
+        # NOT seq_len (14) + 4 = 18!
+        assert runner.input_batch.num_tokens_no_spec[0] == 15
+        assert req_state.output_token_ids == [100, 0, 0, 0, 0]
+
+        # Step 2: Start of Decode Step 2. _modify_prev_results for Step 1 result.
+        # Step 1 accepted 2 drafts (101, 102) + bonus (103) = 3 tokens.
+        copy_mock_1 = MagicMock()
+        copy_mock_1.wait_for_copy.return_value = torch.tensor(
+            [[101, 102, 103, INVALID_TOKEN_ID]], dtype=torch.int32
+        )
+        runner._pre_async_results = SimpleNamespace(
+            req_ids=[req_id],
+            request_seq_lens=request_seq_lens_1,
+            discard_sampled_tokens_req_indices=[],
+            num_draft_per_req=num_draft_1,
+            wait_for_copy=copy_mock_1.wait_for_copy,
+        )
+        TPUModelRunner._modify_prev_results(runner)
+
+        # Rollback check:
+        # output_token_ids should drop 4 zeros and add [101, 102, 103]
+        assert req_state.output_token_ids == [100, 101, 102, 103]
+        # num_tokens_no_spec: 15 - 4 + 3 = 14
+        assert runner.input_batch.num_tokens_no_spec[0] == 14
+        # token_ids_cpu should have contiguous committed tokens at [10, 11, 12, 13]
+        # Previous token 100 at index 10 MUST NOT BE OVERWRITTEN!
+        # Slots 11, 12, 13 must contain 101, 102, 103!
+        expected_committed = prompt_tokens + [100, 101, 102, 103]
+        assert np.array_equal(
+            runner.input_batch.token_ids_cpu[0, :14], expected_committed
+        )
+
+        # Step 2: End of Decode Step 2. _update_placeholder with K=3 drafts
+        request_seq_lens_2 = [(0, req_state, 18, req_id)]
+        num_draft_2 = {0: 3}
+        TPUModelRunner._update_placeholder(
+            runner,
+            discard_sampled_tokens_req_indices=[],
+            request_seq_lens=request_seq_lens_2,
+            next_token_indices=next_token_indices,
+            num_draft_per_req=num_draft_2,
+        )
+        # Advance from committed 14 + 4 = 18
+        assert runner.input_batch.num_tokens_no_spec[0] == 18
+        assert req_state.output_token_ids == [100, 101, 102, 103, 0, 0, 0, 0]
+
+        # Step 3: Start of Decode Step 3. _modify_prev_results for Step 2 result.
+        # Step 2 rejected all 3 drafts, only bonus token produced: [108].
+        copy_mock_2 = MagicMock()
+        copy_mock_2.wait_for_copy.return_value = torch.tensor(
+            [[108, INVALID_TOKEN_ID, INVALID_TOKEN_ID, INVALID_TOKEN_ID]],
+            dtype=torch.int32,
+        )
+        runner._pre_async_results = SimpleNamespace(
+            req_ids=[req_id],
+            request_seq_lens=request_seq_lens_2,
+            discard_sampled_tokens_req_indices=[],
+            num_draft_per_req=num_draft_2,
+            wait_for_copy=copy_mock_2.wait_for_copy,
+        )
+        TPUModelRunner._modify_prev_results(runner)
+
+        # Rollback check:
+        # output_token_ids: drops 4 zeros and adds [108]
+        assert req_state.output_token_ids == [100, 101, 102, 103, 108]
+        # num_tokens_no_spec: 18 - 4 + 1 = 15
+        assert runner.input_batch.num_tokens_no_spec[0] == 15
+        # token_ids_cpu slots 10..15 must be [100, 101, 102, 103, 108]
+        expected_committed_step3 = prompt_tokens + [100, 101, 102, 103, 108]
+        assert np.array_equal(
+            runner.input_batch.token_ids_cpu[0, :15], expected_committed_step3
+        )
+
+    def test_multi_request_concurrency_accounting(self):
+        """Test two requests in flight with different acceptance lengths."""
+        runner = self._setup_runner(max_num_reqs=2)
+        req_id_0 = "req-0"
+        req_id_1 = "req-1"
+
+        state_0 = SimpleNamespace(req_id=req_id_0, output_token_ids=[0] * 4)
+        state_1 = SimpleNamespace(req_id=req_id_1, output_token_ids=[0] * 4)
+
+        runner.requests = {req_id_0: state_0, req_id_1: state_1}
+        runner.input_batch.req_id_to_index = {req_id_0: 0, req_id_1: 1}
+        # Both staged at 14
+        runner.input_batch.num_tokens_no_spec[0] = 14
+        runner.input_batch.num_tokens_no_spec[1] = 14
+
+        # Req 0 accepted 4 tokens [10, 11, 12, 13]
+        # Req 1 accepted 1 token [20]
+        copy_mock = MagicMock()
+        copy_mock.wait_for_copy.return_value = torch.tensor(
+            [
+                [10, 11, 12, 13],
+                [20, INVALID_TOKEN_ID, INVALID_TOKEN_ID, INVALID_TOKEN_ID],
+            ],
+            dtype=torch.int32,
+        )
+
+        runner._pre_async_results = SimpleNamespace(
+            req_ids=[req_id_0, req_id_1],
+            request_seq_lens=[(0, state_0, 10, req_id_0), (1, state_1, 10, req_id_1)],
+            discard_sampled_tokens_req_indices=[],
+            num_draft_per_req={0: 3, 1: 3},
+            wait_for_copy=copy_mock.wait_for_copy,
+        )
+
+        TPUModelRunner._modify_prev_results(runner)
+
+        assert runner.input_batch.num_tokens_no_spec[0] == 14  # 14 - 4 + 4
+        assert runner.input_batch.num_tokens_no_spec[1] == 11  # 14 - 4 + 1
+        assert np.array_equal(
+            runner.input_batch.token_ids_cpu[0, 10:14], [10, 11, 12, 13]
+        )
+        assert np.array_equal(runner.input_batch.token_ids_cpu[1, 10:11], [20])
+
+    def test_non_spec_async_decode_preserved(self):
+        """Test non-speculative async single-token decode is preserved."""
+        runner = self._setup_runner(max_num_reqs=1)
+        req_id = "req-0"
+        state = SimpleNamespace(req_id=req_id, output_token_ids=[0])
+        runner.requests = {req_id: state}
+        runner.input_batch.req_id_to_index = {req_id: 0}
+        runner.input_batch.num_tokens_no_spec[0] = 11
+
+        copy_mock = MagicMock()
+        copy_mock.wait_for_copy.return_value = torch.tensor([[42]], dtype=torch.int32)
+        runner._pre_async_results = SimpleNamespace(
+            req_ids=[req_id],
+            request_seq_lens=[(0, state, 10, req_id)],
+            discard_sampled_tokens_req_indices=[],
+            num_draft_per_req=None,
+            wait_for_copy=copy_mock.wait_for_copy,
+        )
+
+        TPUModelRunner._modify_prev_results(runner)
+
+        assert state.output_token_ids == [42]
+        assert runner.input_batch.num_tokens_no_spec[0] == 11
+        assert runner.input_batch.token_ids_cpu[0, 10] == 42
+
+        # Staging next non-spec placeholder
+        TPUModelRunner._update_placeholder(
+            runner,
+            discard_sampled_tokens_req_indices=[],
+            request_seq_lens=[(0, state, 11, req_id)],
+            next_token_indices={0: 0},
+            num_draft_per_req=None,
+        )
+        assert runner.input_batch.num_tokens_no_spec[0] == 12
+        assert state.output_token_ids == [42, 0]
+
+    def test_request_row_reordering_across_steps(self):
+        """Test a request changing row index in input_batch across decode steps."""
+        runner = self._setup_runner(max_num_reqs=2)
+        req_id = "req-dynamic"
+        prompt_len = 10
+        prompt_tokens = list(range(1, 11))
+
+        req_state = SimpleNamespace(
+            req_id=req_id,
+            output_token_ids=[],
+            num_computed_tokens=prompt_len,
+        )
+        runner.requests[req_id] = req_state
+
+        # Step 0: Request starts at row 0
+        runner.input_batch.req_id_to_index = {req_id: 0}
+        runner.input_batch.num_tokens_no_spec[0] = prompt_len
+        runner.input_batch.token_ids_cpu[0, :prompt_len] = prompt_tokens
+
+        # Prefill finishes, stages 4 placeholders at row 0
+        TPUModelRunner._update_placeholder(
+            runner,
+            discard_sampled_tokens_req_indices=[],
+            request_seq_lens=[(0, req_state, prompt_len, req_id)],
+            next_token_indices={0: 0},
+            num_draft_per_req={0: 3},
+        )
+        assert runner.input_batch.num_tokens_no_spec[0] == 14
+
+        # Step 1: Request moves to row 1 (another request was assigned row 0)
+        # Prefill token 100 commits
+        runner.input_batch.req_id_to_index = {req_id: 1, "other-req": 0}
+        runner.input_batch.num_tokens_no_spec[1] = 14
+        runner.input_batch.token_ids_cpu[1, :prompt_len] = prompt_tokens
+
+        copy_mock = MagicMock()
+        copy_mock.wait_for_copy.return_value = torch.tensor([[100]], dtype=torch.int32)
+        runner._pre_async_results = SimpleNamespace(
+            req_ids=[req_id],
+            request_seq_lens=[(0, req_state, prompt_len, req_id)],  # pre_req_idx was 0
+            discard_sampled_tokens_req_indices=[],
+            num_draft_per_req={0: 3},
+            wait_for_copy=copy_mock.wait_for_copy,
+        )
+        TPUModelRunner._modify_prev_results(runner)
+
+        # Committed correctly at row 1, NOT row 0
+        assert runner.input_batch.num_tokens_no_spec[1] == 11
+        assert runner.input_batch.token_ids_cpu[1, 10] == 100
+        assert np.array_equal(
+            runner.input_batch.token_ids_cpu[1, :11], prompt_tokens + [100]
+        )
+        assert runner.input_batch.num_tokens_no_spec[0] == 14
+        assert runner.input_batch.token_ids_cpu[0, 10] == 0
+
+        # Stage next step at row 1 (req_idx in request_seq_lens is now 1)
+        TPUModelRunner._update_placeholder(
+            runner,
+            discard_sampled_tokens_req_indices=[],
+            request_seq_lens=[(1, req_state, 14, req_id)],
+            next_token_indices={1: 0},
+            num_draft_per_req={1: 3},
+        )
+        assert runner.input_batch.num_tokens_no_spec[1] == 15
+
+
+@pytest.mark.tpu_test
+def test_upload_unless_unchanged_reuses_only_identical_values(device):
+    """Spec steps reuse the previous upload of a small tensor while its values
+    repeat. New values, dtype or shape upload again, and slots never share an
+    entry."""
+    runner = SimpleNamespace(device=device, _h2d_reuse={})
+
+    def upload(slot, host):
+        return TPUModelRunner._upload_unless_unchanged(runner, slot, host)
+
+    a = upload("qsl", torch.tensor([0, 4, 8, 8], dtype=torch.int32))
+    assert upload("qsl", torch.tensor([0, 4, 8, 8], dtype=torch.int32)) is a
+    b = upload("qsl", torch.tensor([0, 4, 8, 12], dtype=torch.int32))
+    assert b is not a
+    assert torch.equal(b.cpu(), torch.tensor([0, 4, 8, 12], dtype=torch.int32))
+    assert upload("idx", torch.tensor([0, 4, 8, 12], dtype=torch.int32)) is not b
+
+    # Same bytes, different dtype or shape: not a match.
+    z = upload("z", torch.zeros(4, dtype=torch.int32))
+    zf = upload("z", torch.zeros(4, dtype=torch.float32))
+    assert zf is not z and zf.dtype == torch.float32
+    z22 = upload("z", torch.zeros(2, 2, dtype=torch.float32))
+    assert z22 is not zf and tuple(z22.shape) == (2, 2)
+
+
+def test_relayout_tables_reaches_the_draft_model(monkeypatch):
+    """The draft shares the target's cached Pallas ops, which are traced
+    against the target's relayouted tables; the draft's own tables must get
+    the same layout (a column-major draft rope cache fails the shared op
+    with RuntimeProgramInputMismatch while precompiling the draft buckets).
+    """
+    from vllm_torchtpu import envs
+
+    monkeypatch.setattr(envs, "TPU_ROPE_CACHE_ROW_MAJOR", True)
+    monkeypatch.setattr(envs, "TPU_MOE_HASH_TABLE_ROW_MAJOR", True)
+    seen = []
+    monkeypatch.setattr(
+        runner_utils_module,
+        "relayout_rope_caches",
+        lambda model: seen.append(("rope", model)),
+    )
+    monkeypatch.setattr(
+        runner_utils_module,
+        "relayout_hash_tables",
+        lambda model: seen.append(("hash", model)),
+    )
+    runner = MagicMock(spec=TPUModelRunner)
+    draft_model = object()
+
+    TPUModelRunner._relayout_tables(runner, draft_model)
+    assert seen == [("rope", draft_model), ("hash", draft_model)]
+
+    # No draft (ngram) or flags off: nothing to relayout.
+    seen.clear()
+    TPUModelRunner._relayout_tables(runner, None)
+    monkeypatch.setattr(envs, "TPU_ROPE_CACHE_ROW_MAJOR", False)
+    monkeypatch.setattr(envs, "TPU_MOE_HASH_TABLE_ROW_MAJOR", False)
+    TPUModelRunner._relayout_tables(runner, draft_model)
+    assert seen == []
+
+
+def test_torch_tpu_wrapper_accelerator_aliases(monkeypatch):
+    from vllm_torchtpu.runner.tpu_runner import _torch_tpu_wrapper
+
+    monkeypatch.setattr(torch.accelerator, "current_device_index", lambda: 42)
+    monkeypatch.setattr(torch.accelerator, "set_device_index", lambda d: f"set_{d}")
+    monkeypatch.setattr(torch.accelerator, "is_available", lambda: True)
+    monkeypatch.setattr(torch.accelerator, "device_count", lambda: 8)
+    fake_stream = object()
+    monkeypatch.setattr(
+        torch.accelerator, "current_stream", lambda dev=None: fake_stream
+    )
+    monkeypatch.setattr(torch.accelerator, "set_stream", lambda s: f"set_stream_{s}")
+    monkeypatch.setattr(
+        torch.accelerator, "synchronize", lambda dev=None: "synchronized"
+    )
+
+    with _torch_tpu_wrapper():
+        assert torch.cuda.current_device() == 42
+        assert torch.cuda.set_device(0) == "set_0"
+        assert torch.cuda.is_available() is True
+        assert torch.cuda.device_count() == 8
+        assert torch.cuda.current_stream() is fake_stream
+        assert torch.cuda.set_stream(fake_stream) == "set_stream_" + str(fake_stream)
+        assert torch.cuda.synchronize() == "synchronized"
+
+
+def test_flush_keeps_zero_token_async_results_until_waited():
+    """A step that committed no tokens still leaves its D2H copy in flight.
+
+    On TP ranks other than the executor's output rank, vLLM may drop the
+    AsyncTPUModelRunnerOutput when the RPC returns, so _pre_async_results is
+    the copy's only owner. execute_model() must neither free it before the
+    copy is waited on (#985) nor block on it ahead of the forward;
+    sample_tokens() waits on it in _modify_prev_results() before replacing it.
+    """
+    events = []
+
+    class FakeCopyState:
+        sampled_token_ids_cpu = torch.tensor([[7]], dtype=torch.int32)
+
+        def wait(self):
+            events.append("wait")
+
+    copy_state = FakeCopyState()
+    weakref.finalize(copy_state, events.append, "freed")
+    runner = SimpleNamespace(
+        input_batch=SimpleNamespace(num_reqs=1, req_ids=["req-prefill"]),
+        _pre_async_results=AsyncPreResults(
+            req_ids=["req-prefill"],
+            next_tokens_tpu=torch.tensor([7], dtype=torch.int32),
+            request_seq_lens=[],
+            discard_sampled_tokens_req_indices=[0],
+            req_id_to_index_copy={},
+            copy_state=copy_state,
+        ),
+    )
+    # A flush that rolls back calls self._modify_prev_results().
+    runner._modify_prev_results = lambda: TPUModelRunner._modify_prev_results(runner)
+    del copy_state  # The runner now holds the only reference.
+
+    # execute_model(): neither wait on the copy nor free it.
+    TPUModelRunner._flush_disjoint_async_results(runner)
+    assert events == []
+
+    # sample_tokens(): wait on the copy before the results are replaced.
+    TPUModelRunner._modify_prev_results(runner)
+    assert events == ["wait"]
+
+
+def test_flush_disjoint_async_results_still_flushes_nonempty_prev_batch():
+    """A disjoint previous batch that sampled tokens must still be rolled back."""
+    runner = SimpleNamespace(
+        input_batch=SimpleNamespace(num_reqs=1, req_ids=["req-new"]),
+        _pre_async_results=SimpleNamespace(req_id_to_index_copy={"req-old": 0}),
+        _modify_prev_results=MagicMock(),
+    )
+
+    TPUModelRunner._flush_disjoint_async_results(runner)
+    runner._modify_prev_results.assert_called_once()
+    assert runner._pre_async_results is None
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("max_logprobs", [0, 3])
+def test_gather_logprobs_preserves_normalization_precision(dtype, max_logprobs):
+    """Covers bf16 and fp32 inputs, large-offset logits, a sampled token outside
+    the top-k, and a row with a single finite logit."""
+    runner = SimpleNamespace(model_config=SimpleNamespace(max_logprobs=max_logprobs))
+    logits = torch.tensor(
+        [
+            [20, 16, 15, 13, 12],
+            [84, 80, 79, 77, 76],
+            [20, -float("inf"), -float("inf"), -float("inf"), -float("inf")],
+        ],
+        dtype=dtype,
+    )
+    original_logits = logits.clone()
+    sampled_tokens = torch.tensor([[0], [4], [0]])
+
+    with torch.compiler.set_stance("force_eager"):
+        result = TPUModelRunner.gather_logprobs(runner, logits, sampled_tokens)
+
+    # log(1 + exp(-4) + exp(-5) + exp(-7) + exp(-8)), independently in FP64.
+    log_normalizer = 0.02596100830585109
+    expected = torch.tensor(
+        [
+            [-log_normalizer - gap for gap in [0, 4, 5, 7, 8]],
+            [-log_normalizer - gap for gap in [0, 4, 5, 7, 8]],
+            [0, -float("inf"), -float("inf"), -float("inf"), -float("inf")],
+        ],
+        dtype=torch.float64,
+    )
+    assert result.logprobs.dtype == torch.float32
+    assert result.logprobs.shape == (3, max_logprobs + 1)
+    assert result.logprob_token_ids[:, 0].tolist() == [0, 4, 0]
+    assert result.selected_token_ranks.tolist() == [1, 5, 1]
+    if max_logprobs:
+        assert result.logprob_token_ids[:2, 1:].tolist() == [[0, 1, 2], [0, 1, 2]]
+    torch.testing.assert_close(
+        result.logprobs.double(),
+        expected.gather(-1, result.logprob_token_ids.long()),
+        rtol=1e-6,
+        atol=1e-5,
+    )
+    torch.testing.assert_close(logits, original_logits, rtol=0, atol=0)
+
+
+def test_sample_from_logits_float32_noise_preserves_gumbel_tail():
+    """Uniform noise `u` in float32 preserves the upper Gumbel tail above the
+    bfloat16 ceiling (-log(-log(1 - 2^-7)) ~= 4.85) when logits are bfloat16."""
+    runner = SimpleNamespace()
+    runner._apply_temperature = TPUModelRunner._apply_temperature.__get__(runner)
+    sample_fn = TPUModelRunner.sample_from_logits.__wrapped__
+
+    logits = torch.tensor([[6.0, 0.0]], dtype=torch.bfloat16)
+    temperatures = torch.tensor([[1.0]], dtype=torch.bfloat16)
+    top_k = torch.tensor([[0]], dtype=torch.int32)
+    top_p = torch.tensor([[1.0]], dtype=torch.float32)
+
+    # With float32 u = 0.9995, -log(-log(0.9995)) ~= 7.60 > 6.0 + 0.37, so
+    # token 1 is sampled. In bfloat16, 1 - eps = 0.9921875 clamps Gumbel noise
+    # to <= 4.85, making token 1 impossible to sample.
+    u_fp32 = torch.tensor([[0.5, 0.9995]], dtype=torch.float32)
+    out_fp32 = sample_fn(runner, logits, temperatures, u_fp32, top_k, top_p)
+    assert int(out_fp32.item()) == 1
+
+    u_bf16 = u_fp32.to(torch.bfloat16)
+    out_bf16 = sample_fn(runner, logits, temperatures, u_bf16, top_k, top_p)
+    assert int(out_bf16.item()) == 0
+
+
+def test_runner_sampling_paths_draw_float32_uniform_noise(monkeypatch):
+    """All TPUModelRunner call sites into sample_from_logits_func must draw
+    uniform random noise `u` in float32 even when logits are bfloat16."""
+    monkeypatch.setattr(
+        torch, "tpu", SimpleNamespace(Event=_FakeTpuEvent), raising=False
+    )
+    monkeypatch.setattr(tpu_runner, "synchronize_tensors", lambda *a, **k: None)
+    monkeypatch.setattr(
+        tpu_runner, "has_kv_transfer_group", lambda: False, raising=False
+    )
+
+    seen_u_dtypes: list[torch.dtype] = []
+
+    def fake_sample_from_logits(
+        logits,
+        temperatures,
+        u,
+        top_k,
+        top_p,
+        all_greedy=False,
+        topk_candidates=0,
+        apply_topk_topp=True,
+    ):
+        seen_u_dtypes.append(u.dtype)
+        return torch.zeros((logits.shape[0], 1), dtype=torch.int32)
+
+    bf16_logits = torch.zeros((2, 16), dtype=torch.bfloat16)
+    sampling_params = (
+        torch.ones((2, 1), dtype=torch.bfloat16),
+        torch.zeros((2, 1), dtype=torch.int32),
+        torch.ones((2, 1), dtype=torch.float32),
+    )
+
+    # 1. _precompile_sample_from_logits: two graphs without speculative
+    # decoding, plus the no-top-k/top-p graph with it.
+    for speculative_config, num_graphs in ((None, 2), (SimpleNamespace(), 3)):
+        precompile_runner = SimpleNamespace(
+            num_reqs_paddings=[2],
+            _hidden_states_dtype=torch.bfloat16,
+            device=torch.device("cpu"),
+            _dummy_logits=lambda n: torch.zeros((n, 16), dtype=torch.bfloat16),
+            _topk_candidate_blocks=lambda: 0,
+            _precompile_timed=lambda _name: contextlib.nullcontext(),
+            sample_from_logits_func=fake_sample_from_logits,
+            speculative_config=speculative_config,
+        )
+        TPUModelRunner._precompile_sample_from_logits(precompile_runner)
+        assert seen_u_dtypes == [torch.float32] * num_graphs
+        seen_u_dtypes.clear()
+
+    # 2. _sample_spec_verify_chunk (bonus_u and recover_u)
+    seen_recover_dtypes: list[torch.dtype] = []
+
+    def fake_rejection_sampler(**kwargs):
+        seen_recover_dtypes.append(kwargs["recover_u"].dtype)
+        return torch.zeros((2, 2), dtype=torch.int32)
+
+    spec_runner = SimpleNamespace(
+        spec_gather_bonus_and_target_logits=lambda logits, b_idx, t_idx: (
+            bf16_logits,
+            bf16_logits,
+        ),
+        _build_padded_sampling_params=lambda start, end, logits: sampling_params,
+        _sampler_topk_candidates=lambda start, end, grammar: 0,
+        _sampler_applies_topk_topp=lambda: True,
+        sample_from_logits_func=fake_sample_from_logits,
+        speculative_config=SimpleNamespace(num_speculative_tokens=1),
+    )
+    spec_runner.rejection_sampler = MagicMock(side_effect=fake_rejection_sampler)
+    spec_runner.rejection_sampler.synthetic_mode = False
+    md = SimpleNamespace(
+        bonus_logits_indices=torch.tensor([0, 1], dtype=torch.int32),
+        target_logits_indices=torch.tensor([0, 1], dtype=torch.int32),
+        draft_token_ids=torch.zeros((2,), dtype=torch.int32),
+        draft_lengths=torch.ones((2,), dtype=torch.int32),
+        segment_ids=torch.tensor([0, 1], dtype=torch.int32),
+        group_indices=torch.tensor([[0], [1]], dtype=torch.int32),
+    )
+    TPUModelRunner._sample_spec_verify_chunk(
+        spec_runner,
+        bf16_logits,
+        md,
+        cur_start_idx=0,
+        cur_end_idx=2,
+        all_greedy=False,
+        grammar_output=None,
+        scheduler_output=SimpleNamespace(),
+        sampling_generator=None,
+    )
+    assert seen_u_dtypes == [torch.float32]
+    assert seen_recover_dtypes == [torch.float32]
+    seen_u_dtypes.clear()
+
+    # 3 & 4. sample_tokens (both non-speculative and speculative non-verify chunk)
+    for spec_method in (None, "ngram"):
+        scheduler_output = SimpleNamespace(
+            num_scheduled_tokens={"r0": 1, "r1": 1},
+            finished_req_ids=set(),
+            has_structured_output_requests=False,
+        )
+        runner = SimpleNamespace(
+            _pp_wave=None,
+            execute_model_state=SimpleNamespace(
+                scheduler_output=scheduler_output,
+                draft_chunks=[],
+                logits_list=[bf16_logits],
+                num_reqs_list=[2],
+                spec_decode_metadata_list=[None],
+                mamba_state_indices_list=None,
+                pooler_output_list=[],
+                top_tokens=False,
+                kv_save_nan_check=None,
+            ),
+            input_batch=SimpleNamespace(
+                max_num_logprobs=None,
+                num_reqs=2,
+                req_ids=["r0", "r1"],
+                req_id_to_index={"r0": 0, "r1": 1},
+                all_greedy=False,
+                num_tokens_no_spec=[1, 1],
+                token_ids_cpu=np.zeros((2, 8), dtype=np.int32),
+            ),
+            requests={
+                "r0": SimpleNamespace(
+                    num_computed_tokens=0, num_tokens=1, output_token_ids=[]
+                ),
+                "r1": SimpleNamespace(
+                    num_computed_tokens=0, num_tokens=1, output_token_ids=[]
+                ),
+            },
+            speculative_config=(
+                None
+                if spec_method is None
+                else SimpleNamespace(method=spec_method, num_speculative_tokens=1)
+            ),
+            scheduler_config=SimpleNamespace(async_scheduling=False),
+            _is_async_drafter=False,
+            _is_dspark_pd_producer=False,
+            _fence_spec_kv_under_token_copy=False,
+            is_pooling_model=False,
+            drafter=SimpleNamespace(),
+            spec_decode_manager=SimpleNamespace(
+                propose_draft_token_ids=lambda **kw: None
+            ),
+            _get_sampling_generator=lambda: None,
+            _build_padded_sampling_params=lambda start, end, logits: sampling_params,
+            _sampler_topk_candidates=lambda start, end, grammar: 0,
+            _sampler_applies_topk_topp=lambda: True,
+            sample_from_logits_func=fake_sample_from_logits,
+            _update_mamba_slot_read_offsets=lambda *_args: None,
+            _update_num_xla_graphs=lambda *_args: None,
+            _stage_timing=MagicMock(),
+        )
+        runner._stage_timing.take_samples.return_value = ([], [])
+        for name in ("maybe_wait_for_kv_save", "get_finished_kv_transfers"):
+            setattr(runner, name, getattr(TPUModelRunner, name).__get__(runner))
+
+        TPUModelRunner.sample_tokens(runner, None)
+
+    assert seen_u_dtypes == [torch.float32, torch.float32]

@@ -43,37 +43,35 @@ def test_profile_session_id_falls_back_to_parent_pid(monkeypatch):
 def test_rank_capture_dir_is_not_dp_specific(tmp_path):
     """The rank is slice-global, so the sandbox name must not say "dp"."""
     assert profiler_trace.rank_capture_dir(str(tmp_path), 3) == os.path.join(
-        str(tmp_path), "rank_3")
+        str(tmp_path), "rank_3"
+    )
 
 
-def test_resolve_canonical_dst_ts_publishes_and_is_read_by_other_ranks(
-        tmp_path):
+def test_resolve_canonical_dst_ts_publishes_and_is_read_by_other_ranks(tmp_path):
     """Rank 0 publishes a ts; the other ranks pick up the same one."""
-    ts = profiler_trace.resolve_canonical_dst_ts(str(tmp_path),
-                                                 0,
-                                                 session_key="key")
+    ts = profiler_trace.resolve_canonical_dst_ts(str(tmp_path), 0, session_key="key")
 
     marker = tmp_path / ".canonical_ts_key"
     assert marker.read_text().strip() == ts
     datetime.datetime.strptime(ts, profiler_trace.CANONICAL_TS_FORMAT)
 
     for rank in (1, 7):
-        assert profiler_trace.resolve_canonical_dst_ts(str(tmp_path),
-                                                       rank,
-                                                       session_key="key") == ts
+        assert (
+            profiler_trace.resolve_canonical_dst_ts(
+                str(tmp_path), rank, session_key="key"
+            )
+            == ts
+        )
 
 
-def test_resolve_canonical_dst_ts_is_scoped_by_session_key(
-        tmp_path, monkeypatch):
+def test_resolve_canonical_dst_ts_is_scoped_by_session_key(tmp_path, monkeypatch):
     """A marker from an earlier start/stop cycle is not reused."""
     (tmp_path / ".canonical_ts_key_0").write_text("1999_01_01_00_00_00")
     # This rank is meant to time out; do not wait the production window.
     monkeypatch.setattr(profiler_trace, "CANONICAL_TS_POLL_TIMEOUT_S", 0.1)
     monkeypatch.setattr(profiler_trace, "CANONICAL_TS_POLL_INTERVAL_S", 0.02)
 
-    ts = profiler_trace.resolve_canonical_dst_ts(str(tmp_path),
-                                                 1,
-                                                 session_key="key_1")
+    ts = profiler_trace.resolve_canonical_dst_ts(str(tmp_path), 1, session_key="key_1")
 
     # No marker for this cycle -> own fallback ts, not the stale one.
     assert ts != "1999_01_01_00_00_00"
@@ -81,9 +79,7 @@ def test_resolve_canonical_dst_ts_is_scoped_by_session_key(
 
 
 def test_clear_canonical_ts_marker_is_idempotent(tmp_path):
-    profiler_trace.resolve_canonical_dst_ts(str(tmp_path),
-                                            0,
-                                            session_key="key")
+    profiler_trace.resolve_canonical_dst_ts(str(tmp_path), 0, session_key="key")
 
     profiler_trace.clear_canonical_ts_marker(str(tmp_path), "key")
     profiler_trace.clear_canonical_ts_marker(str(tmp_path), "key")
@@ -103,11 +99,9 @@ def test_merge_rank_capture_ignores_dp_env_vars(tmp_path, monkeypatch):
     capture_dir.mkdir()
     _stage_capture(capture_dir, "pt_ts", "t1v-n-host-w-0.xplane.pb", "data_0")
 
-    profiler_trace.merge_rank_capture(str(capture_dir),
-                                      str(tmp_path),
-                                      "ts",
-                                      0,
-                                      world_size=1)
+    profiler_trace.merge_rank_capture(
+        str(capture_dir), str(tmp_path), "ts", 0, world_size=1
+    )
 
     dst = tmp_path / "plugins" / "profile" / "ts"
     assert (dst / "t1v-n-host-w-0.xplane.pb").read_text() == "data_0"
@@ -116,11 +110,13 @@ def test_merge_rank_capture_ignores_dp_env_vars(tmp_path, monkeypatch):
 def test_merge_rank_capture_single_worker_keeps_filenames(tmp_path):
     capture_dir = tmp_path / "rank_0"
     capture_dir.mkdir()
-    _stage_capture(capture_dir, "2026_05_06_04_47_36_pt",
-                   "t1v-n-host-w-0.xplane.pb", "data_0")
+    _stage_capture(
+        capture_dir, "2026_05_06_04_47_36_pt", "t1v-n-host-w-0.xplane.pb", "data_0"
+    )
 
-    profiler_trace.merge_rank_capture(str(capture_dir), str(tmp_path),
-                                      "2026_05_06_04_47_36", 0)
+    profiler_trace.merge_rank_capture(
+        str(capture_dir), str(tmp_path), "2026_05_06_04_47_36", 0
+    )
 
     dst = tmp_path / "plugins" / "profile" / "2026_05_06_04_47_36"
     assert (dst / "t1v-n-host-w-0.xplane.pb").read_text() == "data_0"
@@ -148,18 +144,21 @@ def test_merge_rank_capture_multi_worker_prefixes_and_unifies(tmp_path):
     for rank in range(4):
         capture_dir = tmp_path / f"rank_{rank}"
         capture_dir.mkdir()
-        _stage_capture(capture_dir, f"pt_ts_{rank}",
-                       "t1v-n-host-w-0.xplane.pb", f"rank_{rank}_xplane")
-        profiler_trace.merge_rank_capture(str(capture_dir),
-                                          str(tmp_path),
-                                          canonical_ts,
-                                          rank,
-                                          world_size=4)
+        _stage_capture(
+            capture_dir,
+            f"pt_ts_{rank}",
+            "t1v-n-host-w-0.xplane.pb",
+            f"rank_{rank}_xplane",
+        )
+        profiler_trace.merge_rank_capture(
+            str(capture_dir), str(tmp_path), canonical_ts, rank, world_size=4
+        )
 
     dst = tmp_path / "plugins" / "profile" / canonical_ts
     for rank in range(4):
-        assert (dst / f"rank{rank}_t1v-n-host-w-0.xplane.pb"
-                ).read_text() == f"rank_{rank}_xplane"
+        assert (
+            dst / f"rank{rank}_t1v-n-host-w-0.xplane.pb"
+        ).read_text() == f"rank_{rank}_xplane"
 
 
 def test_merge_rank_capture_without_capture_is_noop(tmp_path):

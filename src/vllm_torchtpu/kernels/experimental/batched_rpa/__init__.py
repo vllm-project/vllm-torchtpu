@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-#NOTE: all of the code in this directory is experimental and not fully tested!
+# NOTE: all of the code in this directory is experimental and not fully tested!
 # To enable usage of this kernel in a full run, pass `--attention-backend CUSTOM`
 # to vLLM. `TpuPlatform.pre_register_and_update` registers
 # `PallasBatchedRPAAttentionBackend` under `AttentionBackendEnum.CUSTOM`.

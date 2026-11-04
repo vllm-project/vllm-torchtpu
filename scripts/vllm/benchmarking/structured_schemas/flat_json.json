@@ -1,0 +1,25 @@
+{
+  "structured_outputs": {
+    "json": {
+      "type": "object",
+      "properties": {
+        "users": {
+          "type": "array",
+          "minItems": 10,
+          "items": {
+            "type": "object",
+            "properties": {
+              "name": {"type": "string"},
+              "age": {"type": "integer"},
+              "email": {"type": "string"},
+              "is_active": {"type": "boolean"},
+              "role": {"type": "string", "enum": ["admin", "user", "guest"]}
+            },
+            "required": ["name", "age", "email", "is_active", "role"]
+          }
+        }
+      },
+      "required": ["users"]
+    }
+  }
+}

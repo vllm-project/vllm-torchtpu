@@ -16,21 +16,24 @@
 set -euo pipefail
 
 # Every docker removal below is best-effort and tolerates failure. An agent
-# runs one job at a time, but run_in_docker.sh starts the test container with
-# `docker run --rm`, and the daemon removes it asynchronously -- after
+# runs one job at a time, but a container started with `docker run --rm` is
+# removed by the daemon asynchronously -- after
 # `docker run` has already returned and the job has finished. So the next job
 # on that agent can reach this cleanup while the previous container is still
 # being torn down: `docker ps -a` still lists it, and `docker rm -f` then
 # fails with "removal ... is already in progress". Under `set -e` that aborts
 # the caller before any test runs, turning housekeeping into a red build.
 # A resource that is already being removed is the outcome we wanted.
-TARGET_IMAGES=("vllm-torchtpu" "torchtpu-vllm-local")
+# TODO: after 11/31/2026, remove torchtpu-vllm and torchtpu-vllm-local
+TARGET_IMAGES=("vllm-torchtpu" "torchtpu-vllm" "vllm-torchtpu-local" "torchtpu-vllm-local")
 
 echo "=== Starting Docker resource cleanup ==="
 echo "Target images: ${TARGET_IMAGES[*]}"
 
 for IMG in "${TARGET_IMAGES[@]}"; do
-  echo "----------------------------------------"
+  # Not "---...": Buildkite reads a leading `---` as a log group header, so a
+  # plain dashed rule silently opens three anonymous groups per run.
+  echo "========================================"
   echo "Cleaning up images matching: ${IMG}"
 
   # Get image IDs matching either exact name or registry repository name
@@ -52,14 +55,14 @@ for IMG in "${TARGET_IMAGES[@]}"; do
     fi
 
     echo "Removing old ${IMG} image(s)..."
-    echo "$OLD_IMAGES" | xargs -r docker rmi -f || true
+    echo "$OLD_IMAGES" | xargs -r docker rmi -f >/dev/null 2>&1 || true
   else
     echo "No images matching ${IMG} found to clean up."
   fi
 done
 
-echo "----------------------------------------"
+echo "========================================"
 echo "Pruning old Docker build cache..."
-docker builder prune -f || true
+docker builder prune -f >/dev/null 2>&1 || true
 
 echo "=== Cleanup complete ==="

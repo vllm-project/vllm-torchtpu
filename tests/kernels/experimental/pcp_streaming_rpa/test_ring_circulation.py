@@ -74,7 +74,7 @@ def _ring_circulation_kernel(
             dst_ref=kv_vmem_ref.at[dst_slot],
             send_sem=remote_send_sems.at[round_idx - 1],
             recv_sem=remote_recv_sems.at[round_idx - 1],
-            device_id=(next_rank, ),
+            device_id=(next_rank,),
             device_id_type=pl.DeviceIdType.MESH,
         )
         remote_op.start()
@@ -102,11 +102,11 @@ def _ring_circulation_call(local_page, *, pcp_size):
             out_specs=pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM),
             scratch_shapes=(
                 pltpu.SemaphoreType.DMA,
-                pltpu.SemaphoreType.DMA((pcp_size - 1, )),
-                pltpu.SemaphoreType.DMA((pcp_size - 1, )),
+                pltpu.SemaphoreType.DMA((pcp_size - 1,)),
+                pltpu.SemaphoreType.DMA((pcp_size - 1,)),
                 pltpu.VMEM((2, PAGE_SIZE, WIDTH), local_page.dtype),
             ),
-            grid=(1, ),
+            grid=(1,),
         ),
         compiler_params=pltpu.CompilerParams(
             collective_id=11,
@@ -117,7 +117,7 @@ def _ring_circulation_call(local_page, *, pcp_size):
 
 
 def _run_ring_circulation(local_pages):
-    mesh = jax.sharding.Mesh(jax.local_devices()[:PCP_SIZE], (AXIS, ))
+    mesh = jax.sharding.Mesh(jax.local_devices()[:PCP_SIZE], (AXIS,))
     fn = jax.jit(
         jax.shard_map(
             functools.partial(_ring_circulation_call, pcp_size=PCP_SIZE),
@@ -125,7 +125,8 @@ def _run_ring_circulation(local_pages):
             in_specs=P(AXIS, None, None),
             out_specs=P(AXIS, None, None, None),
             check_vma=False,
-        ))
+        )
+    )
     return fn(local_pages)
 
 
@@ -163,7 +164,7 @@ def _ring_capture_kernel(
                 dst_ref=kv_vmem_ref.at[next_slot],
                 send_sem=remote_send_sems.at[round_idx],
                 recv_sem=remote_recv_sems.at[round_idx],
-                device_id=(next_rank, ),
+                device_id=(next_rank,),
                 device_id_type=pl.DeviceIdType.MESH,
             )
             remote_op.start()
@@ -187,19 +188,18 @@ def _ring_capture_kernel(
 def _ring_capture_call(local_page, *, pcp_size):
     return pl.pallas_call(
         functools.partial(_ring_capture_kernel, pcp_size=pcp_size),
-        out_shape=jax.ShapeDtypeStruct((1, PAGE_SIZE, WIDTH),
-                                       local_page.dtype),
+        out_shape=jax.ShapeDtypeStruct((1, PAGE_SIZE, WIDTH), local_page.dtype),
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=0,
             in_specs=[pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM)],
             out_specs=pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM),
             scratch_shapes=(
                 pltpu.SemaphoreType.DMA,
-                pltpu.SemaphoreType.DMA((pcp_size - 1, )),
-                pltpu.SemaphoreType.DMA((pcp_size - 1, )),
+                pltpu.SemaphoreType.DMA((pcp_size - 1,)),
+                pltpu.SemaphoreType.DMA((pcp_size - 1,)),
                 pltpu.VMEM((2, PAGE_SIZE, WIDTH), local_page.dtype),
             ),
-            grid=(1, ),
+            grid=(1,),
         ),
         compiler_params=pltpu.CompilerParams(
             collective_id=13,
@@ -210,7 +210,7 @@ def _ring_capture_call(local_page, *, pcp_size):
 
 
 def _run_ring_capture(local_pages):
-    mesh = jax.sharding.Mesh(jax.local_devices()[:CAPTURE_PCP_SIZE], (AXIS, ))
+    mesh = jax.sharding.Mesh(jax.local_devices()[:CAPTURE_PCP_SIZE], (AXIS,))
     fn = jax.jit(
         jax.shard_map(
             functools.partial(_ring_capture_call, pcp_size=CAPTURE_PCP_SIZE),
@@ -218,7 +218,8 @@ def _run_ring_capture(local_pages):
             in_specs=P(AXIS, None, None),
             out_specs=P(AXIS, None, None),
             check_vma=False,
-        ))
+        )
+    )
     return fn(local_pages)
 
 
@@ -231,7 +232,8 @@ def _require_tpu_devices(min_count, reason):
 
 def test_vmem_pages_can_circulate_through_ring(release_jax_backend):
     _require_tpu_devices(
-        PCP_SIZE, "PCP ring circulation smoke test requires four TPU devices.")
+        PCP_SIZE, "PCP ring circulation smoke test requires four TPU devices."
+    )
     local_pages = jnp.arange(
         PCP_SIZE * PAGE_SIZE * WIDTH,
         dtype=jnp.int32,
@@ -245,12 +247,12 @@ def test_vmem_pages_can_circulate_through_ring(release_jax_backend):
     for rank in range(PCP_SIZE):
         for round_idx in range(PCP_SIZE):
             src_rank = (rank - round_idx) % PCP_SIZE
-            np.testing.assert_array_equal(out_np[rank, round_idx],
-                                          local_np[src_rank])
+            np.testing.assert_array_equal(out_np[rank, round_idx], local_np[src_rank])
 
 
 def test_ring_can_capture_kv_on_owner_without_changing_communication(
-        release_jax_backend):
+    release_jax_backend,
+):
     _require_tpu_devices(
         CAPTURE_PCP_SIZE,
         "PCP ring owner capture smoke test requires eight TPU devices.",
@@ -267,5 +269,4 @@ def test_ring_can_capture_kv_on_owner_without_changing_communication(
     local_np = np.asarray(jax.device_get(local_pages))
     for cache_rank in range(CAPTURE_PCP_SIZE):
         source_rank = (cache_rank - 1) % CAPTURE_PCP_SIZE
-        np.testing.assert_array_equal(captured_np[cache_rank],
-                                      local_np[source_rank])
+        np.testing.assert_array_equal(captured_np[cache_rank], local_np[source_rank])

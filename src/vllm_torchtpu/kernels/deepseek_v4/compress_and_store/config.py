@@ -22,19 +22,30 @@ Modes:
 
   CSA:
     - State Bytes: 2048 (dim) x 4 (bytes per fp32) = 8192 bytes
-    - Head Dim:    448 fp8 + 7 scale = 462 bytes -> 512 bytes
+    - Head Dim:    448 fp8 + 64 lane-periodic scales = 512 bytes
     - Cache:       [num_pages, _, 4, 128] uint8 (where _ = state_block_size * 16
-    or kv_block_size)
+    or kv_block_size), allocated as [num_pages, _, 128] int32
+    - RoPE Cache:  64 bf16 = 128 bytes, [num_pages, kv_block_size // 4, 4, 128]
+    uint8, allocated as [num_pages, kv_block_size // 4, 128] int32 (see
+    `csa_cache_layout`)
 
   CSA-Indexer:
     - State Bytes: 512 (dim) x 4 (bytes per fp32) = 2048 bytes
     - Head Dim:    128 fp8 + 1 scale = 129 bytes -> 256 bytes
-    - Cache:       [num_pages, _, 4, 256] uint8 (where _ = state_block_size * 2
-    or kv_block_size // 8)
+    - Cache:       [num_pages, _, 4, 256] uint8 (where _ = state_block_size * 4
+    or kv_block_size // 4).
+
+  CSA-Indexer, SEQ_ALONG_LANE (`seq_along_lane=True`):
+    - Cache:       [num_pages, 128 // 4 + 1, 4, 256] uint8: token `t` of a page
+    is lane `t`, its 128 fp8 bytes the first 32 sublane groups and its UE8M0
+    scale byte 0 of the last one (see `streamindex_topk.KVLayout`), i.e. 132
+    bytes per token. Only a 256-token page is supported: the f32 state, which
+    shares this array, is then still addressed as `(33, 4, 256)` rows.
 """
 
 import dataclasses
 import enum
+from typing import Any
 
 import jax
 import jax.numpy as jnp
@@ -46,6 +57,10 @@ SLOT_PACK = 4  # sub-slots packed into one physical HBM slot row
 N_FIELDS = 2  # values stored per token: kv + score
 FP32_BYTES = 4
 CSA_COMPRESS_RATIO = 4  # the compress ratio that selects Mode.CSA
+# SEQ_ALONG_LANE indexer cache: tokens per page (one per lane of the 256-byte
+# rows the f32 state is addressed in), and sublane groups per page.
+SAL_PAGE_SIZE = 2 * LANE
+SAL_SUBLANE_GROUPS = LANE // SLOT_PACK + 1
 
 
 class Mode(enum.Enum):
@@ -54,9 +69,8 @@ class Mode(enum.Enum):
     CSA_INDEXER = "csa_indexer"
 
 
-_MODE_DEFAULTS = {
-    Mode.HCA:
-    dict(
+_MODE_DEFAULTS: dict[Mode, dict[str, Any]] = {
+    Mode.HCA: dict(
         head_dim=512,
         rope_head_dim=64,
         compress_ratio=128,
@@ -64,8 +78,7 @@ _MODE_DEFAULTS = {
         overlap=False,
         has_rope_cache=False,
     ),
-    Mode.CSA:
-    dict(
+    Mode.CSA: dict(
         head_dim=512,
         rope_head_dim=64,
         compress_ratio=4,
@@ -73,8 +86,7 @@ _MODE_DEFAULTS = {
         overlap=True,
         has_rope_cache=True,
     ),
-    Mode.CSA_INDEXER:
-    dict(
+    Mode.CSA_INDEXER: dict(
         head_dim=128,
         rope_head_dim=64,
         compress_ratio=4,
@@ -92,8 +104,23 @@ def select_mode(head_dim: int, overlap: bool) -> Mode:
     return Mode.CSA if overlap else Mode.HCA
 
 
-def physical_page_size(mode: Mode, kv_cache_block_size: int,
-                       compress_ratio: int) -> int:
+def check_seq_along_lane_page_size(storage_block_size: int) -> None:
+    """Raises unless `storage_block_size` is exactly `SAL_PAGE_SIZE`."""
+    if storage_block_size != SAL_PAGE_SIZE:
+        raise ValueError(
+            "The SEQ_ALONG_LANE indexer cache needs exactly "
+            f"{SAL_PAGE_SIZE} compressed tokens per page (one per lane of the "
+            "256-byte rows its compressor state is addressed in), got "
+            f"{storage_block_size}."
+        )
+
+
+def physical_page_size(
+    mode: Mode,
+    kv_cache_block_size: int,
+    compress_ratio: int,
+    seq_along_lane: bool = False,
+) -> int:
     """Rows per page of the uint8 cache array allocated for `mode`.
 
     This must mirror the shapes ``KVCacheManager._create_dsv4_kv_caches``
@@ -101,10 +128,17 @@ def physical_page_size(mode: Mode, kv_cache_block_size: int,
     geometry from ``cache.shape[1]``. Anything that computes slot indices for
     that array (the compressor wrapper's state-cache ``block_size``, and
     ``derive_metadata``) has to agree with it or writes land on the wrong page.
+
+    `seq_along_lane` selects the SEQ_ALONG_LANE indexer layout; the other modes
+    ignore it.
     """
     # Compressed KV tokens per page (vLLM's ``spec.storage_block_size``).
     storage_block_size = kv_cache_block_size // compress_ratio
     if mode is Mode.CSA_INDEXER:
+        if seq_along_lane:
+            # (N, 33, 4, T) u8, T == 256
+            check_seq_along_lane_page_size(storage_block_size)
+            return SAL_SUBLANE_GROUPS
         # (N, T // 4, 4, 256) u8
         return storage_block_size // SLOT_PACK
     if mode is Mode.CSA:
@@ -114,20 +148,97 @@ def physical_page_size(mode: Mode, kv_cache_block_size: int,
     return storage_block_size * 2
 
 
-def state_host_page_size(mode: Mode, kv_cache_block_size: int,
-                         compress_ratio: int) -> int:
-    """Rows per page of the array that *hosts* ``mode``'s f32 compressor state.
-    """
+def state_host_page_size(
+    mode: Mode,
+    kv_cache_block_size: int,
+    compress_ratio: int,
+    seq_along_lane: bool = False,
+) -> int:
+    """Rows per page of the array that *hosts* ``mode``'s f32 compressor state."""
     if mode is Mode.HCA:
-        return physical_page_size(Mode.CSA, kv_cache_block_size,
-                                  CSA_COMPRESS_RATIO)
-    return physical_page_size(mode, kv_cache_block_size, compress_ratio)
+        return physical_page_size(Mode.CSA, kv_cache_block_size, CSA_COMPRESS_RATIO)
+    return physical_page_size(mode, kv_cache_block_size, compress_ratio, seq_along_lane)
+
+
+def last_dim_size(mode: Mode) -> int:
+    """Size of the last HBM cache dimension in bytes."""
+    return 2 * LANE if mode is Mode.CSA_INDEXER else LANE
+
+
+def row_size_bytes(mode: Mode) -> int:
+    """Size of one physical HBM row in bytes."""
+    return SLOT_PACK * last_dim_size(mode)
+
+
+def state_width(head_dim: int, overlap: bool) -> int:
+    """Width of one stored field: head_dim, doubled when windows overlap."""
+    # Overlapping windows keep two copies per token: prev + curr.
+    return (1 + int(overlap)) * head_dim
+
+
+def state_rows_per_token(mode: Mode, head_dim: int, overlap: bool) -> int:
+    """Physical HBM rows one token's full state (kv + score) occupies."""
+    state_bytes = N_FIELDS * state_width(head_dim, overlap) * FP32_BYTES
+    return state_bytes // row_size_bytes(mode)
+
+
+def _state_page_capacity(
+    mode: Mode,
+    kv_cache_block_size: int,
+    compress_ratio: int | None = None,
+    head_dim: int | None = None,
+    indexer_seq_along_lane: bool = False,
+) -> int:
+    """Token states one page of `mode`'s host array physically holds."""
+    defaults = _MODE_DEFAULTS[mode]
+    compress_ratio = (
+        defaults["compress_ratio"] if compress_ratio is None else compress_ratio
+    )
+    head_dim = defaults["head_dim"] if head_dim is None else head_dim
+    page_rows = state_host_page_size(
+        mode, kv_cache_block_size, compress_ratio, indexer_seq_along_lane
+    )
+    return page_rows // state_rows_per_token(mode, head_dim, defaults["overlap"])
+
+
+def state_block_size(
+    mode: Mode,
+    kv_cache_block_size: int,
+    compress_ratio: int | None = None,
+    head_dim: int | None = None,
+    indexer_seq_along_lane: bool = False,
+) -> int:
+    """Token states vLLM should page `mode`'s state cache at.
+
+    vLLM buckets DeepSeek-V4 cache groups by ``(block_size, sliding_window)``,
+    we let CSA attention and the indexer's compressor state to have same block
+    size to land in the kv cache group.
+
+    `indexer_seq_along_lane` selects the SEQ_ALONG_LANE indexer cache. Its
+    33-row page holds half the states of the HEAD_ALONG_SUBLANE one, which is
+    exactly CSA's capacity, so the shared block size does not change.
+    """
+    own = _state_page_capacity(
+        mode, kv_cache_block_size, compress_ratio, head_dim, indexer_seq_along_lane
+    )
+    # CSA and the indexer are each other's peer; HCA has none and pages alone.
+    peer_mode = {
+        Mode.CSA: Mode.CSA_INDEXER,
+        Mode.CSA_INDEXER: Mode.CSA,
+    }.get(mode)
+    if peer_mode is None:
+        return own
+    peer = _state_page_capacity(
+        peer_mode, kv_cache_block_size, indexer_seq_along_lane=indexer_seq_along_lane
+    )
+    return min(own, peer)
 
 
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True)
 class TileSizes:
     """Tile sizes for the kernel."""
+
     tile_n: int
 
 
@@ -143,10 +254,13 @@ class Dimensions:
     compress_ratio: int
     physical_page_size: int
     state_physical_page_size: int
+    state_block_size: int = dataclasses.field(metadata=dict(static=True))
     quant_block: int
     overlap: bool
     has_rope_cache: bool
     rms_eps: float = 1e-6
+    # CSA_INDEXER only: the compressed-KV array is SEQ_ALONG_LANE.
+    seq_along_lane: bool = dataclasses.field(default=False, metadata=dict(static=True))
 
     cos_sin_dtype: jax.typing.DTypeLike = jnp.float32
     rope_width: int = 128
@@ -172,6 +286,7 @@ class Dimensions:
 @dataclasses.dataclass(frozen=True)
 class Configs:
     """Configuration for the kernel."""
+
     tile_sizes: TileSizes
     dims: Dimensions
 
@@ -183,6 +298,7 @@ class Configs:
         *,
         size_n,
         physical_page_size,
+        state_block_size,
         state_physical_page_size=None,
         rms_eps=1e-6,
         tile_n=4,
@@ -196,14 +312,29 @@ class Configs:
         actual_overrides = {**_MODE_DEFAULTS[mode], **overrides}
         if mode == Mode.HCA:
             actual_overrides["quant_block"] = 0
+        if actual_overrides.get("seq_along_lane", False):
+            if mode is not Mode.CSA_INDEXER or actual_overrides["head_dim"] != LANE:
+                raise ValueError(
+                    "seq_along_lane is only supported for the CSA indexer "
+                    f"(head_dim {LANE}), got mode={mode.value}, "
+                    f"head_dim={actual_overrides['head_dim']}."
+                )
+            if physical_page_size != SAL_SUBLANE_GROUPS:
+                raise ValueError(
+                    "A SEQ_ALONG_LANE indexer cache page must have exactly "
+                    f"{SAL_SUBLANE_GROUPS} rows, got {physical_page_size}."
+                )
 
         dims = Dimensions(
             mode=mode,
             size_n=size_n,
             physical_page_size=physical_page_size,
-            state_physical_page_size=(physical_page_size
-                                      if state_physical_page_size is None else
-                                      state_physical_page_size),
+            state_block_size=state_block_size,
+            state_physical_page_size=(
+                physical_page_size
+                if state_physical_page_size is None
+                else state_physical_page_size
+            ),
             rms_eps=rms_eps,
             **actual_overrides,
         )
@@ -218,7 +349,7 @@ class Configs:
     @property
     def state_width(self) -> int:
         """Width of one stored field (head_dim, doubled when overlapping)."""
-        return self.overlap_factor * self.dims.head_dim
+        return state_width(self.dims.head_dim, self.dims.overlap)
 
     @property
     def head_tiles(self) -> int:
@@ -239,8 +370,11 @@ class Configs:
     @property
     def nope_store_dim(self) -> int:
         """Dimension of the nope storage (contains rope if no separate rope cache)."""
-        return (self.dims.head_dim - self.dims.rope_head_dim
-                if self.dims.has_rope_cache else self.dims.head_dim)
+        return (
+            self.dims.head_dim - self.dims.rope_head_dim
+            if self.dims.has_rope_cache
+            else self.dims.head_dim
+        )
 
     @property
     def half_rope(self) -> int:
@@ -270,7 +404,7 @@ class Configs:
     @property
     def row_size_bytes(self) -> int:
         """Size of one physical HBM row in bytes."""
-        return self.hbm_pack * self.last_dim_size
+        return row_size_bytes(self.dims.mode)
 
     @property
     def hbm_pack(self) -> int:
@@ -280,9 +414,7 @@ class Configs:
     @property
     def last_dim_size(self) -> int:
         """Size of the last HBM cache dimension in bytes."""
-        if self.dims.mode == Mode.CSA_INDEXER:
-            return 2 * LANE
-        return LANE
+        return last_dim_size(self.dims.mode)
 
     @property
     def cache_last_dims(self) -> tuple[int, ...]:
@@ -315,9 +447,11 @@ class Configs:
 
     @property
     def state_rows_per_token(self) -> int:
-        """Number of physical HBM rows occupied by one token's full state (kv + score)."""
-        state_bytes = N_FIELDS * self.state_width * FP32_BYTES
-        return state_bytes // self.row_size_bytes
+        """Number of physical HBM rows occupied by one token's full state
+        (kv + score)."""
+        return state_rows_per_token(
+            self.dims.mode, self.dims.head_dim, self.dims.overlap
+        )
 
     @property
     def field_rows(self) -> int:
@@ -326,13 +460,20 @@ class Configs:
         return pl.cdiv(field_bytes, self.row_size_bytes)
 
     @property
+    def state_page_capacity(self) -> int:
+        """Number of token states one page of the state array physically holds."""
+        return self.state_physical_page_size // self.state_rows_per_token
+
+    @property
     def state_block_size(self) -> int:
         """Number of state tokens per page of the state array."""
-        return self.state_physical_page_size // self.state_rows_per_token
+        return self.dims.state_block_size
 
     @property
     def kv_block_size(self) -> int:
         """Number of compressed KV tokens per page."""
+        if self.dims.seq_along_lane:
+            return SAL_PAGE_SIZE
         page_bytes = self.physical_page_size * self.row_size_bytes
         return page_bytes // self.record_bytes
 
@@ -358,12 +499,12 @@ class Configs:
     def window_bytes_shape(self) -> tuple[int, ...]:
         """uint8 view of the window scratch; each f32 lane -> FP32_BYTES rows.
 
-    Note: that trailing FP32_BYTES (4) is bytes-per-f32, NOT the HBM SLOT_PACK
-    (also 4) -- they're numerically equal but mean different things.
+        Note: that trailing FP32_BYTES (4) is bytes-per-f32, NOT the HBM SLOT_PACK
+        (also 4) -- they're numerically equal but mean different things.
 
-    Returns:
-      The shape of the window bytes scratch.
-    """
+        Returns:
+          The shape of the window bytes scratch.
+        """
         return (
             N_FIELDS,
             self._tile_n,
@@ -376,6 +517,18 @@ class Configs:
     def output_shape(self) -> tuple[int, ...]:
         """Packed output tile / VMEM block: (tile, record_rows) + cache_last_dims."""
         return (self._tile_n, self.record_rows) + self.cache_last_dims
+
+    def records_t_shape(self) -> tuple[int, ...]:
+        """SEQ_ALONG_LANE: VMEM staging of every token's record, as cache lanes.
+
+        `(SAL_SUBLANE_GROUPS, SLOT_PACK, padded_tokens)` = `(33, 4, padded_tokens)`
+        uint8 (32 fp8 sublane groups of 4 bytes + 1 scale group): token `t` is
+        lane `t`, laid out like a cache page (see `compute.stage_sal_columns`),
+        so the final store is a lane-tile copy.
+        """
+        assert self.dims.seq_along_lane
+        padded = pl.cdiv(max(self.dims.size_n, 1), LANE) * LANE
+        return (SAL_SUBLANE_GROUPS, SLOT_PACK, padded)
 
     def page_buffer_shape(self) -> tuple[int, ...]:
         """Page-buffer VMEM block: (tile, pages, state page rows) + cache_last_dims.
@@ -399,15 +552,18 @@ class Configs:
         return (self._tile_n, self.dims.rope_head_dim)
 
     def cache_shape(self, num_pages: int) -> tuple[int, ...]:
-        """Shape of the global HBM KV cache."""
+        """Shape of the global HBM KV cache, as uint8 slabs.
+
+        CSA's arrays are allocated as ``(num_pages, rows, 128)`` int32
+        (`csa_cache_layout`), the same bytes as this shape.
+        """
         return (num_pages, self.physical_page_size) + self.cache_last_dims
 
     def state_cache_shape(self, num_pages: int) -> tuple[int, ...]:
         """Shape of the global HBM array hosting the f32 compressor state."""
-        return (num_pages,
-                self.state_physical_page_size) + self.cache_last_dims
+        return (num_pages, self.state_physical_page_size) + self.cache_last_dims
 
     def rope_cache_shape(self, num_pages: int) -> tuple[int, ...]:
-        """Shape of the global HBM RoPE cache."""
+        """Shape of the global HBM RoPE cache, as uint8 slabs."""
         assert self.dims.has_rope_cache
         return (num_pages, self.rope_page_size, 4, 128)
