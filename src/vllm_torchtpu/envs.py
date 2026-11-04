@@ -299,6 +299,7 @@ if TYPE_CHECKING:
     VLLM_TPU_SEGMENT_TOKENIZE_FASTOKENS: bool = False
     VLLM_TPU_DETOK_SUFFIX_PRIME: bool = False
     VLLM_TPU_SEGMENT_TOKENIZE_PREFIX_PROMPTS: int = 0
+    VLLM_TPU_SEGMENT_TOKENIZE_SHARED_DIR: str = ""
     VLLM_TPU_BLOCK_HASH_REUSE_PROMPTS: int = 0
     VLLM_TPU_SKIP_TOKENIZER_ID_RANGE_CHECK: bool = False
     VLLM_TPU_SEND_NEW_PROMPT_IDS: int = 0
@@ -2166,6 +2167,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # split and looked up piece by piece.
     "VLLM_TPU_SEGMENT_TOKENIZE_PREFIX_PROMPTS": env_int(
         "VLLM_TPU_SEGMENT_TOKENIZE_PREFIX_PROMPTS", 0
+    ),
+    # Directory (e.g. /dev/shm/vllm-tpu-pieces) where every API server process
+    # of the container shares the segment tokenizer's encoded pieces, so a turn
+    # served by another process than its session's previous turn reuses the
+    # history's ids. Empty: each process keeps its own cache only.
+    "VLLM_TPU_SEGMENT_TOKENIZE_SHARED_DIR": lambda: os.getenv(
+        "VLLM_TPU_SEGMENT_TOKENIZE_SHARED_DIR", ""
     ),
     # Engine core: the number of recent prompts whose block hashes a new prompt
     # reuses for the blocks it shares with them (core/block_hash_reuse.py).
