@@ -120,6 +120,9 @@ def main() -> None:
     # Development iterations only: compile caches keyed by program content cut
     # the ~23 min startup compile to the changed programs. Formal runs omit it.
     parser.add_argument("--compile-cache", type=Path)
+    # Development iterations only: extra `vllm serve` arguments appended last,
+    # so they override the launcher's defaults (e.g. --gpu-memory-utilization).
+    parser.add_argument("--serve-arg", action="append", default=[])
     args = parser.parse_args()
     multihost = args.scenario == "decode_dp16"
     worker = multihost and args.host_rank == 1
@@ -225,6 +228,7 @@ def main() -> None:
     ]
     if decode and not worker:
         server_command += ["--enable-log-requests", "--max-log-len", "0"]
+    server_command += args.serve_arg
     if multihost:
         # Native MP owns bootstrap; do not inherit a single-host SliceBuilder.
         for key in (
