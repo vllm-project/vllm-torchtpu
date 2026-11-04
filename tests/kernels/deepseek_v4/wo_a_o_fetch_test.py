@@ -98,13 +98,13 @@ class WoAOFetchTest(parameterized.TestCase):
             rng.integers(0, MAX_POSITION, 2 * num_tokens), jnp.int32
         )
         cache = jnp.asarray(make_cos_sin_cache(MAX_POSITION, ROTARY_DIM))
+        cos_sin = cache[positions]
         got = _per_chiplet(
             functools.partial(
                 fused_reverse_rope_wo_a_projection_o_fetch, head_dim=HEAD_DIM
             ),
             o,
-            (positions, positions),
-            (cache, cache),
+            (cos_sin, cos_sin),
             wo_a,
             scale,
             *_neighbor_and_chiplet_index(),
@@ -113,7 +113,7 @@ class WoAOFetchTest(parameterized.TestCase):
             heads_r = slice(r * half, (r + 1) * half)
             o_half = jnp.concatenate([o[0][:, heads_r], o[1][:, heads_r]])
             want = fused_reverse_rope_wo_a_projection(
-                o_half, positions, cache, wo_a[r], scale[r], head_dim=HEAD_DIM
+                o_half, cos_sin, wo_a[r], scale[r], head_dim=HEAD_DIM
             )
             np.testing.assert_array_equal(got[r], np.asarray(want), err_msg=f"{r=}")
 
@@ -122,8 +122,7 @@ class WoAOFetchTest(parameterized.TestCase):
         with self.assertRaisesRegex(AssertionError, "multiple of 8"):
             fused_reverse_rope_wo_a_projection_o_fetch(
                 jnp.zeros((20, NUM_HEADS, HEAD_DIM), jnp.bfloat16),
-                jnp.zeros((40,), jnp.int32),
-                jnp.zeros((MAX_POSITION, ROTARY_DIM), jnp.float32),
+                jnp.zeros((40, ROTARY_DIM), jnp.float32),
                 jnp.zeros((8 * HEAD_DIM, groups * LORA_RANK), jnp.float8_e4m3fn),
                 jnp.ones((groups * LORA_RANK,), jnp.float32),
                 jnp.asarray([1], jnp.int32),

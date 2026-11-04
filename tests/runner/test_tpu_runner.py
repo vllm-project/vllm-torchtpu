@@ -3483,7 +3483,7 @@ def test_relayout_tables_reaches_the_draft_model(monkeypatch):
 def test_patch_rope_in_graph_honors_env_and_skips_none_model(monkeypatch):
     from vllm_torchtpu import envs, rope_patch
 
-    seen: list[tuple[torch.nn.Module, set[int] | None]] = []
+    seen: list[torch.nn.Module] = []
     drop_calls: list[torch.nn.Module] = []
     orig_drop = rope_patch.drop_unused_rope_cache_aliases
 
@@ -3491,9 +3491,9 @@ def test_patch_rope_in_graph_honors_env_and_skips_none_model(monkeypatch):
         drop_calls.append(model)
         orig_drop(model)
 
-    def fake_patch(model: torch.nn.Module, *, _skip_ids=None) -> int:
+    def fake_patch(model: torch.nn.Module) -> int:
         rope_patch.drop_unused_rope_cache_aliases(model)
-        seen.append((model, _skip_ids))
+        seen.append(model)
         return 2
 
     monkeypatch.setattr(rope_patch, "drop_unused_rope_cache_aliases", spy_drop)
@@ -3505,7 +3505,7 @@ def test_patch_rope_in_graph_honors_env_and_skips_none_model(monkeypatch):
 
     monkeypatch.setattr(envs, "TPU_ROPE_IN_GRAPH", True)
     TPUModelRunner._patch_rope_in_graph(runner, target_model, None, draft_model)
-    assert [m for m, _ in seen] == [target_model, draft_model]
+    assert seen == [target_model, draft_model]
     assert drop_calls == [target_model, draft_model]
     assert "_rope_cos_sin_cache" not in draft_model.__dict__
 

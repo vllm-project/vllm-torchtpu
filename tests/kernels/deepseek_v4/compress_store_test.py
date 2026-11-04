@@ -305,8 +305,10 @@ class CompressStoreTest(jtu.JaxTestCase):
         rms_weight = jax.random.normal(k4, (head_dim,))
 
         max_pos = int(jnp.max(positions)) + 1 if len(positions) > 0 else 0
-        cos_sin_cache_len = max(max_pos, num_tokens)
+        cos_sin_cache_len = max(max_pos, num_tokens, 1)
         cos_sin_cache = jax.random.normal(k5, (cos_sin_cache_len, rope_head_dim))
+        compressed_pos = jnp.maximum((positions // compress_ratio) * compress_ratio, 0)
+        cos_sin = cos_sin_cache[compressed_pos]
 
         if cfgs.dims.has_rope_cache:
             num_rope_pages, rope_rows, _, lanes = cfgs.rope_cache_shape(num_pages)
@@ -346,7 +348,7 @@ class CompressStoreTest(jtu.JaxTestCase):
             token_to_req_indices=token_to_req_indices,
             kv_slot_mapping=kv_slot_mapping,
             rms_weight=rms_weight,
-            cos_sin_cache=cos_sin_cache,
+            cos_sin=cos_sin,
             block_table_stride=block_table_stride,
             state_block_size=state_block_size,
             head_dim=head_dim,
@@ -375,7 +377,7 @@ class CompressStoreTest(jtu.JaxTestCase):
             state_block_size=state_block_size,
             state_cache=(jnp.copy(populated_state_cache) if separate_state else None),
             rope_cache=jnp.copy(init_rope_cache),
-            cos_sin_cache=cos_sin_cache,
+            cos_sin=cos_sin,
             compress_ratio=cfgs.dims.compress_ratio,
             overlap=cfgs.dims.overlap,
             quant_block=cfgs.dims.quant_block,
@@ -434,7 +436,7 @@ class CompressStoreTest(jtu.JaxTestCase):
                 state_block_size=state_block_size,
                 state_cache=poisoned_state_cache,
                 rope_cache=jnp.copy(init_rope_cache),
-                cos_sin_cache=cos_sin_cache,
+                cos_sin=cos_sin,
                 compress_ratio=cfgs.dims.compress_ratio,
                 overlap=cfgs.dims.overlap,
                 quant_block=cfgs.dims.quant_block,
@@ -848,6 +850,9 @@ class CompressStoreTest(jtu.JaxTestCase):
         cos_sin_cache = jax.random.normal(
             k5, (max(int(positions_np.max()) + 1, num_tokens), rope_head_dim)
         )
+        boundary_cos_sin = cos_sin_cache[
+            jnp.maximum((boundary_positions // compress_ratio) * compress_ratio, 0)
+        ]
 
         def run(cache, seq_along_lane):
             out, _ = compress_store.compress_norm_rope_store(
@@ -860,7 +865,7 @@ class CompressStoreTest(jtu.JaxTestCase):
                 block_table_stride=table.shape[1],
                 state_block_size=state_block_size,
                 rope_cache=jnp.zeros((num_pages, 1, 1, 128), dtype=jnp.uint8),
-                cos_sin_cache=cos_sin_cache,
+                cos_sin=boundary_cos_sin,
                 compress_ratio=compress_ratio,
                 overlap=True,
                 quant_block=quant_block,

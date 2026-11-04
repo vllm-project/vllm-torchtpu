@@ -1512,10 +1512,8 @@ class TPUModelRunner(GPUModelRunner):
                 "TPU_ROPE_IN_GRAPH=0: keeping precomputed rotary cos/sin tables."
             )
             return
-        skip_ids = rope_patch._collect_deepseek_v4_pallas_ropes(*live_models)
         patched = sum(
-            rope_patch.patch_in_graph_rotary_embedding(m, _skip_ids=skip_ids)
-            for m in live_models
+            rope_patch.patch_in_graph_rotary_embedding(m) for m in live_models
         )
         tier1_count = len(
             {

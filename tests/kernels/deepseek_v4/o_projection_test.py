@@ -19,7 +19,7 @@ from absl.testing import absltest, parameterized
 
 from vllm_torchtpu.kernels.deepseek_v4.o_projection import (
     LANE,
-    gather_cos_sin,
+    expand_cos_sin,
     wo_a_projection,
 )
 
@@ -113,7 +113,7 @@ class OProjectionTest(parameterized.TestCase):
         cos_sin_cache = jnp.asarray(
             make_cos_sin_cache(MAX_POSITION, ROTARY_DIM), dtype=jnp.float32
         )
-        cos_sin = gather_cos_sin(positions, cos_sin_cache, inverse=True)
+        cos_sin = expand_cos_sin(cos_sin_cache[positions], inverse=True)
         self.assertEqual(cos_sin.shape, (num_tokens, 2 * LANE))
         out = wo_a_projection(
             activations,
