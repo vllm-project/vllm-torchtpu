@@ -46,6 +46,9 @@ export TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS=false
 export XLA_FLAGS=--xla_enable_hlo_sharding_v3=false
 export USE_BATCHED_RPA_LONGCTX=1
 export TPU_ROPE_CACHE_TRUNCATE=1
+# Keep the rotary table row-major on device: the position gather reads it
+# that way, and max-model-len 1M leaves truncation nothing to cut.
+export TPU_ROPE_CACHE_ROW_MAJOR=${TPU_ROPE_CACHE_ROW_MAJOR:-1}
 export VLLM_TARGET_DEVICE=tpu
 export VLLM_WORKER_MULTIPROC_METHOD=spawn
 export VLLM_KV_CACHE_LAYOUT=HND
