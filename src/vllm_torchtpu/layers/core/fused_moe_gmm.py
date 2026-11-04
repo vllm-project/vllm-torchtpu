@@ -113,6 +113,14 @@ DISPATCH_HEAD_ROWS = 0
 # The dtype an EP batch's rows may arrive quantized to, as int32 words
 # (quantize_dispatch_rows), as the fused MLP's gate/up leg quantizes them.
 DISPATCH_QUANT_DTYPE = jnp.float8_e4m3fn
+# Largest EP token count whose padding rows route to no expert
+# (skips_padded_tokens). On DSv4-Flash DP8 decode (up to 1024 gathered tokens)
+# about a third of the rows are padding, which repeat one token and so route
+# alike: a few experts on one or two ranks get hundreds of extra rows, and
+# those ranks run the expert MLP and the combine longest while the combine's
+# reduce-scatter waits for them. Prefill chunks keep their routes: they fill
+# the token budget, so they carry little padding to drop.
+SKIP_PADDED_MAX_TOKENS = 1024
 # Fixed at import: build the MoE permutation from one packed sort.
 _SINGLE_SORT = envs.TPU_MOE_SINGLE_SORT
 # Above 2,048 routed rows, the inverse-permutation scatter costs more than
@@ -207,6 +215,23 @@ def dispatches_quantized_rows(
         and num_tokens >= DISPATCH_SPLIT_MIN_TOKENS
         and num_routes > onehot_moe_permute_threshold
         and token_rows_fit_smem(num_routes, QUANTIZE_ROWS_ALIGN, ROWS_PER_WORD)
+    )
+
+
+def skips_padded_tokens(
+    num_local_tokens: int, world_size: int, topk: int, onehot_moe_permute_threshold: int
+) -> bool:
+    """Whether an EP batch of num_local_tokens rows per rank, over world_size
+    ranks, routes its padding rows to no expert: they reach fused_moe_func
+    with zero routing weights, under skip_padded_tokens. Every other token's
+    output keeps its bits, which needs a combine that sums each token's own
+    routes in route order: not the one-hot unpermute, one matmul over all
+    routes. Integer arithmetic only: callers ask it of a traced token count.
+    """
+    num_tokens = num_local_tokens * world_size
+    return (
+        num_tokens <= SKIP_PADDED_MAX_TOKENS
+        and num_tokens * topk > onehot_moe_permute_threshold
     )
 
 

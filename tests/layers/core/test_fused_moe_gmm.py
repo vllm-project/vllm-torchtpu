@@ -1240,6 +1240,86 @@ def test_fused_moe_token_rows_match_gathered_rows(monkeypatch, local_ranks):
     )
 
 
+def test_padding_rows_skip_only_decode_sized_ep_batches():
+    # DSv4-Flash DP8 (top-6, one-hot up to 511 routes): decode buckets of 16
+    # to 128 tokens per rank, and a prefill chunk of 1024.
+    for local_tokens in (16, 64, 128):
+        assert fused_moe_gmm.skips_padded_tokens(local_tokens, 8, 6, 511)
+    assert not fused_moe_gmm.skips_padded_tokens(1024, 8, 6, 511)
+    # The one-hot unpermute sums all routes in one matmul.
+    assert not fused_moe_gmm.skips_padded_tokens(8, 8, 6, 511)
+
+
+@pytest.mark.tpu_test
+# The two decode buckets of DSv4-Flash DP8, and a warmup step (all padding).
+@pytest.mark.parametrize(
+    "num_tokens,all_padding", [(512, False), (1024, False), (1024, True)]
+)
+def test_fused_moe_skipped_padding_rows_keep_real_outputs(num_tokens, all_padding):
+    """Padding rows with zero weights under skip_padded_tokens reach no
+    expert, and every other token's output keeps its bits."""
+    _require_tpu()
+
+    ranks, hidden_size, inter_size = 8, 1024, 512
+    num_experts, topk, quant_block = 4, 6, 512
+    keys = jax.random.split(jax.random.key(5), 8)
+    hidden_states = jax.random.normal(keys[0], (num_tokens, hidden_size), jnp.bfloat16)
+    topk_ids = jax.random.randint(keys[1], (num_tokens, topk), 0, ranks * num_experts)
+    topk_weights = jax.random.uniform(keys[2], (num_tokens, topk), jnp.float32, 0.1)
+    # Each rank's rows end in padding: one repeated row, routed alike and
+    # mostly to this rank's experts.
+    local_tokens = num_tokens // ranks
+    real = jax.random.randint(keys[7], (ranks, 1), 0, local_tokens)
+    if all_padding:
+        real = jnp.zeros_like(real)
+    is_padding = (jnp.arange(local_tokens)[None] >= real).reshape(-1, 1)
+    hidden_states = jnp.where(is_padding, jnp.bfloat16(0.5), hidden_states)
+    topk_ids = jnp.where(is_padding, jnp.array([0, 1, 2, 3, 9, 17]), topk_ids)
+    w1 = jax.random.randint(
+        keys[3], (num_experts, hidden_size // 2, 2 * inter_size), 0, 256
+    ).astype(jnp.uint8)
+    w2 = jax.random.randint(
+        keys[4], (num_experts, inter_size // 2, hidden_size), 0, 256
+    ).astype(jnp.uint8)
+    w1_scale = jax.random.uniform(
+        keys[5], (num_experts, hidden_size // quant_block, 2 * inter_size)
+    )
+    w2_scale = jax.random.uniform(
+        keys[6], (num_experts, inter_size // quant_block, hidden_size)
+    )
+    common = dict(
+        hidden_states=fused_moe_gmm.quantize_dispatch_rows(hidden_states),
+        w1=w1,
+        w2=w2,
+        w1_scale=w1_scale,
+        w2_scale=w2_scale,
+        w1_bias=None,
+        w2_bias=None,
+        topk_ids=topk_ids.astype(jnp.int32),
+        experts_start=jnp.array(0, jnp.int32),
+        topk=topk,
+        activation="silu_and_mul_with_clamp",
+        use_ep=True,
+        use_sparse_core=True,
+        onehot_moe_permute_threshold=fused_moe_gmm.resolve_onehot_permute_threshold(),
+        rhs_quant_dtype=jnp.float4_e2m1fn,
+    )
+    expected = np.asarray(fused_moe_func(topk_weights=topk_weights, **common))
+    actual = np.asarray(
+        fused_moe_func(
+            topk_weights=jnp.where(is_padding, 0.0, topk_weights),
+            skip_padded_tokens=True,
+            **common,
+        )
+    )
+
+    real_rows = ~np.asarray(is_padding)[:, 0]
+    np.testing.assert_array_equal(
+        actual[real_rows].view(np.uint16), expected[real_rows].view(np.uint16)
+    )
+    assert not actual[~real_rows].any()
+
+
 def _fake_tpu_info(sparse_core):
     return types.SimpleNamespace(sparse_core=sparse_core)
 

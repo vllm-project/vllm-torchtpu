@@ -39,6 +39,7 @@ from vllm_torchtpu.layers.core.fused_moe_gmm import (
     quantizes_dispatch_rows,
     requant_unpack_kmajor,
     resolve_onehot_permute_threshold,
+    skips_padded_tokens,
     unpack_fp4_to_e2m1,
 )
 
@@ -219,6 +220,34 @@ def dispatches_quantized(
     return vllm_compilation_backends.model_tag == "backbone" and (
         dispatches_quantized_rows(
             num_tokens, group.world_size, topk, onehot_moe_permute_threshold
+        )
+    )
+
+
+def drops_padded_routes(
+    num_tokens: int,
+    topk: int,
+    is_sequence_parallel: bool,
+    onehot_moe_permute_threshold: int,
+) -> bool:
+    """Whether an EP dispatch of num_tokens rows per rank zeroes the routing
+    weights of the step's padding rows (token_padding) and runs the experts
+    with skip_padded_tokens, so those rows reach no expert. The threshold is
+    the one the fused MoE op was built with (resolve_onehot_permute_threshold).
+
+    DP dispatch only: the padding mask describes this rank's rows of the
+    step, which a sequence-parallel slice is not. Only the backbone, whose
+    rows the runner marks before each forward. Integer arithmetic only: the
+    count is dynamic in the trace.
+    """
+    return (
+        not is_sequence_parallel
+        and vllm_compilation_backends.model_tag == "backbone"
+        and skips_padded_tokens(
+            num_tokens,
+            get_dp_group().world_size,
+            topk,
+            onehot_moe_permute_threshold,
         )
     )
 
