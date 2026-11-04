@@ -12,6 +12,7 @@ from torch.utils._pytree import tree_leaves
 from vllm.compilation.backends import set_model_tag
 from vllm.compilation.decorators import support_torch_compile
 from vllm.forward_context import override_forward_context
+from vllm.model_executor.models.utils import AutoWeightsLoader
 from vllm.models.deepseek_v41.nvidia import model as upstream
 from vllm.models.deepseek_v41.nvidia import vl_model as upstream_vl
 from vllm.v1.worker.encoder_cudagraph_defs import EncoderCudaGraphConfig
@@ -1493,6 +1494,30 @@ class DeepseekV41VLForCausalLM(upstream_vl.DeepseekV41ForCausalLM):
             _linear_scale_param_name=lambda *_: "weight_scale_inv",
         ):
             super().__init__(vllm_config=vllm_config, prefix=prefix)
+
+    def load_weights(self, weights):
+        # Upstream sorts every weight so the language model, which finalizes
+        # inside its load_weights, gets one contiguous delegation. Sorting
+        # holds the whole checkpoint shard in host memory and defeats the
+        # EP-sharded loader's streaming window. Hand the language model its
+        # weights as one stream instead, and load the few tower weights after.
+        prefix = "language_model."
+        rest = []
+
+        def language_weights():
+            for name, tensor in self.hf_to_vllm_mapper.apply(weights):
+                if name.startswith(prefix):
+                    yield name.removeprefix(prefix), tensor
+                else:
+                    rest.append((name, tensor))
+
+        loaded = {
+            prefix + name
+            for name in self.language_model.load_weights(language_weights())
+        }
+        loaded |= AutoWeightsLoader(self).load_weights(rest)
+        self._weights_finalized = True
+        return loaded
 
     def get_encoder_cudagraph_config(self) -> EncoderCudaGraphConfig:
         # Upstream rejects the TORCH_SDPA ViT backend it resolves on TPU, but

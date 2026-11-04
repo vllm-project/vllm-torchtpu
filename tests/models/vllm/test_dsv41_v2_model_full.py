@@ -2014,3 +2014,53 @@ def test_vision_wrapper_encoder_cudagraph_config_skips_cuda_backend_gate():
     assert config.out_hidden_size == 8
     assert "cu_seqlens" in config.buffer_keys
     assert "cu_seqlens" not in config.padding_logics
+
+
+@pytest.mark.cpu_test
+def test_vision_wrapper_streams_language_weights_in_one_delegation(monkeypatch):
+    from vllm.model_executor.models.utils import WeightsMapper
+
+    from vllm_torchtpu.models.vllm.deepseek_v41.v2 import model as v2_model
+
+    pulled = []
+
+    def checkpoint():
+        for name in ("layers.0.w", "vision.w", "layers.1.w", "aligner.w"):
+            pulled.append(name)
+            yield name, torch.zeros(1)
+
+    calls = []
+
+    class LanguageModel(torch.nn.Module):
+        def load_weights(self, weights):
+            assert not isinstance(weights, list)
+            names = []
+            for name, _ in weights:
+                # Lazy: each weight is consumed as soon as it is read.
+                assert pulled[-1].endswith(name.removeprefix("model."))
+                names.append(name)
+            calls.append(names)
+            return set(names)
+
+    tower = MagicMock()
+    tower.return_value.load_weights.side_effect = lambda w: {n for n, _ in w}
+    monkeypatch.setattr(v2_model, "AutoWeightsLoader", tower)
+
+    model = DeepseekV41VLForCausalLM.__new__(DeepseekV41VLForCausalLM)
+    torch.nn.Module.__init__(model)
+    model.language_model = LanguageModel()
+    model.hf_to_vllm_mapper = WeightsMapper(
+        orig_to_new_prefix={"layers.": "language_model.model.layers."}
+    )
+
+    loaded = model.load_weights(checkpoint())
+
+    assert calls == [["model.layers.0.w", "model.layers.1.w"]]
+    tower.return_value.load_weights.assert_called_once()
+    assert loaded == {
+        "language_model.model.layers.0.w",
+        "language_model.model.layers.1.w",
+        "vision.w",
+        "aligner.w",
+    }
+    assert model._weights_finalized
