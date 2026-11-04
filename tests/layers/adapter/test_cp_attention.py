@@ -228,3 +228,63 @@ def test_dcp_block_table_keeps_the_rank_local_columns(
     expected = table.reshape(num_seqs, pages_per_seq)[:, :columns].reshape(-1)
     assert local.shape == (num_seqs * columns,)
     assert bool(jnp.all(local == expected))
+
+
+@pytest.mark.parametrize(
+    "scope,layout,decode_query_size,bkv",
+    [
+        (AttentionScope.NEW_TOKENS_ONLY, KVLayout.SEQ_ALONG_LANE, 1, 256),
+        (AttentionScope.NEW_TOKENS_ONLY, KVLayout.SEQ_ALONG_LANE, 4, None),
+        (AttentionScope.NEW_TOKENS_ONLY, KVLayout.HEAD_ALONG_SUBLANE, 1, None),
+        (AttentionScope.CACHE_ONLY, KVLayout.SEQ_ALONG_LANE, 1, None),
+    ],
+)
+def test_dcp_new_token_pass_uses_one_mxu_wide_decode_block(
+    monkeypatch, scope, layout, decode_query_size, bkv
+):
+    import jax.numpy as jnp
+
+    from vllm_torchtpu.kernels.experimental.batched_rpa.configs import BlockSizes
+
+    seen = {}
+
+    def fake_rpa(**kwargs):
+        seen.update(kwargs)
+        return kwargs["queries"], kwargs["kv_cache"], kwargs["queries"][..., 0]
+
+    monkeypatch.setattr(
+        cp_attention._batched_rpa_wrapper, "ragged_paged_attention", fake_rpa
+    )
+    monkeypatch.setattr(
+        cp_attention.pltpu, "get_tpu_info", lambda: SimpleNamespace(mxu_column_size=256)
+    )
+    kv_cache = jnp.zeros(
+        (4, 2, 1, 4, 128) if layout == KVLayout.SEQ_ALONG_LANE else (4, 128, 1, 4, 256)
+    )
+    query = jnp.zeros((2, 8, 256))
+    cp_attention._pallas_rpa_kernel_dcp(
+        kv_cache,
+        query,
+        query[:, :1],
+        query[:, :1],
+        jnp.array([5, 6], dtype=jnp.int32),
+        jnp.zeros((4,), dtype=jnp.int32),
+        jnp.array([0, 1, 2], dtype=jnp.int32),
+        jnp.array([2, 2, 2], dtype=jnp.int32),
+        None,
+        1.0,
+        1.0,
+        sliding_window=None,
+        cp_group_size=2,
+        cp_rank_val=0,
+        attention_scope=scope,
+        kv_layout=layout,
+        decode_query_size=decode_query_size,
+    )
+    expected = (
+        None
+        if bkv is None
+        else BlockSizes(bq_sz=1, bq_c_sz=1, bkv_sz=bkv, batch_size=8, n_buffer=2)
+    )
+    assert seen["decode_block_sizes"] == expected
+    assert seen["attention_scope"] == scope

@@ -34,6 +34,7 @@ import functools
 
 import jax
 import torch
+from jax.experimental.pallas import tpu as pltpu
 from torch_tpu._internal import pallas
 from vllm.utils.math_utils import cdiv, round_up
 
@@ -152,6 +153,19 @@ def _rank_local_block_tables(
     return block_tables.reshape(num_seqs, pages_per_seq)[:, :columns].reshape(-1)
 
 
+def _new_tokens_decode_block(page_size: int) -> _batched_rpa_configs.BlockSizes:
+    """Decode block of the NEW_TOKENS_ONLY pass: one MXU-wide KV block.
+
+    Each sequence attends only its new token, and the block that writes it
+    also fetches this rank's cached pages of that block, so the narrowest
+    block keeps that to at most one page per sequence.
+    """
+    bkv = max(page_size, pltpu.get_tpu_info().mxu_column_size)
+    return _batched_rpa_configs.BlockSizes(
+        bq_sz=1, bq_c_sz=1, bkv_sz=bkv, batch_size=8, n_buffer=2
+    )
+
+
 def _pallas_rpa_kernel_dcp(
     kv_cache: jax.Array,
     query: jax.Array,
@@ -186,6 +200,7 @@ def _pallas_rpa_kernel_dcp(
     write on the right physical page of this rank's DCP-interleaved
     kv_cache (its own write offset is otherwise global, not rank-local).
     max_model_len, if set, bounds the block-table columns passed on.
+    A one-token NEW_TOKENS_ONLY decode pass uses _new_tokens_decode_block.
     """
     import jax.numpy as jnp
 
@@ -199,6 +214,13 @@ def _pallas_rpa_kernel_dcp(
             decode_query_size,
             cp_group_size,
         )
+    decode_block_sizes = None
+    if (
+        attention_scope == _batched_rpa_configs.AttentionScope.NEW_TOKENS_ONLY
+        and decode_query_size == 1
+        and kv_layout == _batched_rpa_configs.KVLayout.SEQ_ALONG_LANE
+    ):
+        decode_block_sizes = _new_tokens_decode_block(page_size)
     cp_rank_arr = jnp.array([cp_rank_val], dtype=jnp.int32)
     output, new_kv_cache, lse = _batched_rpa_wrapper.ragged_paged_attention(
         queries=query,
@@ -219,6 +241,7 @@ def _pallas_rpa_kernel_dcp(
         cp_rank=cp_rank_arr,
         attention_scope=attention_scope,
         decode_query_size=decode_query_size,
+        decode_block_sizes=decode_block_sizes,
         return_lse=True,
         kv_layout=kv_layout,
     )
