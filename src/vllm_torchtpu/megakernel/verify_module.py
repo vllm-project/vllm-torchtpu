@@ -44,6 +44,7 @@ from .verify_checks import (
     _allclose,
     _compare_state_dict,
     _spec_state_decls,
+    _stat_result,
     err_metrics,
 )
 
@@ -273,7 +274,7 @@ def run_module_verify(
     st: Literal["passed", "failed"] = "passed" if not failed else "failed"
     tols = {"hidden_atol": h_atol, "hidden_min_cos": h_cos}
     det, rsn = {"module": mod.name, "metrics": per_mode_t}, "; ".join(failed)
-    return res_cls(check_name, st, *stats, tols, rsn, det)
+    return _stat_result(res_cls, check_name, st, stats, tols, rsn, det)
 
 
 def _resolve_verify_module(module: Module | ModuleBinding, g1: Any) -> Module:
@@ -316,9 +317,7 @@ def verify_module(
         nonlocal m_name, mod, g1, spec
         # `ModelGeometry.check` requires `L % att_every == 0`, so reducing `L`
         # to `1` for single-layer module verification also sets `att_every=1`.
-        g1_kw: dict[str, Any] = {"L": 1}
-        if hasattr(g, "att_every"):
-            g1_kw["att_every"] = 1
+        g1_kw = {"L": 1, **({"att_every": 1} if hasattr(g, "att_every") else {})}
         g1 = dataclasses.replace(g, **g1_kw)
         mod = _resolve_verify_module(module, g1)
         m_name = mod.name

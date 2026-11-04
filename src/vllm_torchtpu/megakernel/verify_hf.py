@@ -50,7 +50,7 @@ from .verify_checks import (
     err_metrics,
     prof_exec,
 )
-from .verify_metrics import CheckResult, ToleranceSpec
+from .verify_metrics import CheckResult, ToleranceSpec, _stat_result
 from .weights.logical import (
     resolve_spec_and_norms,
     switch_branch_for_layer,
@@ -389,7 +389,7 @@ def run_kernel_vs_oracle(
     st: Literal["passed", "failed"] = "passed" if not failed else "failed"
     tols = {"hidden_atol": h_atol, "hidden_min_cos": h_cos}
     det, rsn = {"profile": prof.name, "metrics": per_mode_t}, "; ".join(failed)
-    return res_cls("kernel_vs_oracle", st, *stats, tols, rsn, det)
+    return _stat_result(res_cls, "kernel_vs_oracle", st, stats, tols, rsn, det)
 
 
 __all__ = [

@@ -41,6 +41,7 @@ from .verify_metrics import (
     _allclose,
     _compare_state_dict,
     _spec_state_decls,
+    _stat_result,
     err_metrics,
 )
 from .weights.logical import resolve_spec_and_norms
@@ -171,7 +172,7 @@ def check_loader_parity(
     st: Literal["passed", "failed"] = "passed" if ok else "failed"
     rsn = "" if ok else f"loader mismatch (ulp={stats[2]}, abs={stats[0]:.4g})"
     det = {"num_flat_tensors": total_tensors, "moe_tp_modes": modes}
-    return res_cls("loader_parity", st, *stats, {"max_ulp": 0}, rsn, det)
+    return _stat_result(res_cls, "loader_parity", st, stats, {"max_ulp": 0}, rsn, det)
 
 
 def run_kernel_vs_ref(
@@ -319,4 +320,4 @@ def run_kernel_vs_ref(
     st: Literal["passed", "failed"] = "passed" if not failed else "failed"
     tols = {"hidden_atol": h_atol, "hidden_min_cos": h_cos}
     det, rsn = {"profile": prof.name, "metrics": per_mode_t}, "; ".join(failed)
-    return res_cls(check_name, st, *stats, tols, rsn, det)
+    return _stat_result(res_cls, check_name, st, stats, tols, rsn, det)

@@ -148,7 +148,14 @@ def verify_model(
     `reference_vs_hf` (when `hf=True` or `oracle is not None`).
     """
     m_name = str(getattr(target, "name", target))
-    m_def = g = prof = spec = vc = ex_t1 = w_hf_q = w_log = None
+    m_def: Any = None
+    g: Any = None
+    prof: Any = None
+    spec: Any = None
+    vc: Any = None
+    ex_t1: Any = None
+    w_hf_q: Any = None
+    w_log: Any = None
     all_have_hf = all_have_ref = True
 
     def _run_setup() -> CheckResult:
@@ -195,6 +202,8 @@ def verify_model(
         return VerificationReport(model_name=m_name, geometry=g, checks=(setup_res,))
     no_hf_mod = next((m for m in spec.all_modules() if not m.has_hf_params), None)
     no_ref_mod = next((m for m in spec.all_modules() if not m.has_reference), None)
+    no_hf_nm = getattr(no_hf_mod, "name", "")
+    no_ref_nm = getattr(no_ref_mod, "name", "")
     checks = [
         setup_res,
         _safe_run(
@@ -209,7 +218,7 @@ def verify_model(
             else CheckResult(
                 "loader_parity",
                 "skipped",
-                reason=f"Module {no_hf_mod.name!r} does not declare hf_params",
+                reason=f"Module {no_hf_nm!r} does not declare hf_params",
             )
         ),
     ]
@@ -230,8 +239,7 @@ def verify_model(
         )
         if eff_ora is not None and callable(eff_ora):
             rsn_no_ref = (
-                f"Module {no_ref_mod.name!r} has no reference; "
-                "verified via kernel_vs_oracle"
+                f"Module {no_ref_nm!r} has no reference; verified via kernel_vs_oracle"
             )
             checks.append(
                 CheckResult("kernel_vs_reference", "skipped", reason=rsn_no_ref)
@@ -246,7 +254,7 @@ def verify_model(
             )
         else:
             rsn_fail = (
-                f"Module {no_ref_mod.name!r} implements no reference() "
+                f"Module {no_ref_nm!r} implements no reference() "
                 "and no usable oracle was provided"
             )
             checks.append(CheckResult("kernel_vs_reference", "failed", reason=rsn_fail))
@@ -254,7 +262,7 @@ def verify_model(
         ap_all = [m_def.get_profile(nm) for nm in list_profiles()]
         ap_l = [p for p in ap_all if p.model == m_def.name and p.numerics == "approx"]
         if not all_have_ref:
-            rsn_ap = f"Module {no_ref_mod.name!r} has no reference"
+            rsn_ap = f"Module {no_ref_nm!r} has no reference"
             checks.append(CheckResult("approx_profiles", "skipped", reason=rsn_ap))
         elif ap_l:
 
@@ -281,14 +289,12 @@ def verify_model(
     if hf or oracle is not None:
         if not all_have_ref:
             rsn_skip = (
-                f"Module {no_ref_mod.name!r} has no reference; "
-                "verified via kernel_vs_oracle"
+                f"Module {no_ref_nm!r} has no reference; verified via kernel_vs_oracle"
             )
             checks.append(CheckResult("reference_vs_hf", "skipped", reason=rsn_skip))
         elif not all_have_hf and oracle is None:
             rsn_no_hf = (
-                f"Module {no_hf_mod.name!r} does not declare hf_params; "
-                "HF oracle skipped"
+                f"Module {no_hf_nm!r} does not declare hf_params; HF oracle skipped"
             )
             checks.append(CheckResult("reference_vs_hf", "skipped", reason=rsn_no_hf))
         else:

@@ -293,9 +293,7 @@ class Schedule:
     ffn: Any
     pre_norm: ModuleOrBinding | None = None
     post_norm: ModuleOrBinding | None = None
-    overrides: Mapping[int, Mapping[str, Any]] = dataclasses.field(
-        default_factory=FrozenDict
-    )
+    overrides: Mapping[int, Mapping[str, Any]] = dataclasses.field(default_factory=dict)
 
     def __post_init__(self) -> None:
         _validate_slot_spec(self.mixer, "mixer", allow_none=False)

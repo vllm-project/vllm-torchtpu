@@ -133,7 +133,7 @@ def _validate_pool_metadata_host(
                 continue
             active_kv_pages.add(p_id)
 
-    if c3 is None:
+    if ck is None or c3 is None:
         return
 
     K = int(c3.shape[2])
@@ -160,7 +160,7 @@ def _validate_pool_metadata_host(
                     f"checkpoint write slots at sub={sub}, seq={s} (got {cols})"
                 )
             for t, slot in enumerate(cols):
-                pb = int(layout.page_base(slot, sub, ck.ndim))
+                pb = int(layout.page_base(slot, sub, int(ck.ndim)))
                 if slot <= 0 or pb < layout.reserved_pages or pb + pps > num_pages:
                     if check_bounds:
                         raise ValueError(
@@ -190,7 +190,7 @@ def _validate_pool_metadata_host(
                             )
                         continue
                     r_slot = int(c_sub[s, r_val])
-                    r_pb = int(layout.page_base(r_slot, sub, ck.ndim))
+                    r_pb = int(layout.page_base(r_slot, sub, int(ck.ndim)))
                     if (
                         r_slot <= 0
                         or r_pb < layout.reserved_pages

@@ -16,7 +16,7 @@
 from __future__ import annotations
 
 import dataclasses
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Literal
 
@@ -114,6 +114,28 @@ class VerificationReport:
         if bad:
             pts = [f"{c.name}({c.status}: {c.reason!r})" for c in bad]
             raise AssertionError(f"verify_model({self.model_name!r}): {pts}")
+
+
+def _stat_result(
+    res_cls: type[CheckResult],
+    name: str,
+    status: Literal["passed", "failed", "skipped"],
+    stats: Sequence[Any],
+    tolerance: Mapping[str, float | int],
+    reason: str,
+    details: Mapping[str, Any],
+) -> CheckResult:
+    return res_cls(
+        name,
+        status,
+        float(stats[0]),
+        float(stats[1]),
+        int(stats[2]),
+        float(stats[3]),
+        tolerance,
+        reason,
+        details,
+    )
 
 
 def err_metrics(got: Any, ref: Any) -> tuple[float, float, int, float]:

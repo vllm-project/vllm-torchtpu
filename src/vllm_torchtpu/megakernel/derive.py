@@ -77,7 +77,7 @@ def derive_model_geometry(
 ) -> ModelGeometry:
     """Derive hybrid GQA/GDN + MoE `ModelGeometry` from `cls` and `hf_config`."""
     if isinstance(hf_config, ModelGeometry):
-        rep = {
+        rep: dict[str, Any] = {
             k: fn(v)
             for k, v, fn in (("moe_tp", moe_tp, bool), ("e_slots", e_slots, int))
             if v is not None
@@ -276,6 +276,7 @@ def derive_model_spec(
             branches.append(mod)
             counts.append(1)
     mixer_slot = SwitchSlot("mixer", tuple(branches), tuple(counts))
+    assert canon_ffn is not None
     ffn_mod = instantiate_spec_module(canon_ffn)
     own_lt = cls.__dict__.get("layer_type_name") if isinstance(cls, type) else None
     lt_name = own_lt or (
@@ -346,7 +347,7 @@ def hf_config_for_geometry(
                 updates[hf_k] = min(v_sz, int(max_vocab))
     sched = cls.resolve_schedule(g)
     gqa_m = {"heads": int(g.NH), "kv_heads": int(g.NKV), "head_dim": int(g.HD)}
-    gdn_m = {
+    gdn_m: dict[str, Any] = {
         "k_heads": int(g.KH),
         "v_heads": int(g.VH),
         "k_dim": int(g.KD),
