@@ -332,13 +332,22 @@ def _compact(records, total_records, tiles, tb):
     One scatter and no gather: on TPU each lowers to a SparseCore offload of
     several us. Out-of-range records drop.
     """
-    if jax.default_backend() == "tpu" and records.shape == (288,) and tiles * tb == 288:
+    n = records.shape[0]
+    # Preserve all T288 tilings; other shapes use only measured tile sizes.
+    if (
+        jax.default_backend() == "tpu"
+        and records.shape == (n,)
+        and tiles * tb == n
+        and (
+            n == 288
+            or (n, tb) in ((96, 96), (192, 192), (240, 240), (256, 256), (384, 192))
+        )
+    ):
         from vllm_torchtpu.kernels.experimental.decode_preparation import (
             compact_records,
         )
 
         return compact_records(records, total_records, tb)
-    n = records.shape[0]
     valid = (records >= 0) & (records < total_records)
     slots = jnp.where(valid, jnp.cumsum(valid, dtype=jnp.int32) - 1, n)
     pairs = jnp.stack((jnp.arange(n, dtype=jnp.int32), records.astype(jnp.int32)), 1)
