@@ -8,14 +8,56 @@ import jax
 import jax.numpy as jnp
 
 from vllm_torchtpu.kernels.experimental.decode_preparation import (
+    ROUTING_TOKENS,
+    admit,
+    first_problem,
     fuse_function,
     prefix_sum,
+    tpu_version_problem,
 )
 from vllm_torchtpu.kernels.experimental.push_fused_moe.host import (
     build_routing_tables_sharded,
 )
 from vllm_torchtpu.kernels.fused_moe.v2 import host
-from vllm_torchtpu.kernels.quantized_matmul.tuned_block_sizes import get_tpu_version
+
+# The kernel's static group slices and [destination, expert] tables were
+# lowered and checked for this routing geometry: (topk, experts, ep, tile_m).
+ROUTING_GEOMETRY = (6, 384, 16, 128)
+
+
+def routing_problem(
+    gathered, runs, me, *, e_total, ep, t_local, block, tile_m, shard_stride
+) -> str | None:
+    """First violated contract of the fused routing kernel, or None."""
+    geometry = (gathered.topk, e_total, ep, tile_m)
+    return (
+        first_problem(
+            (
+                geometry == ROUTING_GEOMETRY,
+                f"(topk, experts, ep, tile_m)={geometry}, kernel {ROUTING_GEOMETRY}",
+            ),
+            (gathered.n_tokens == t_local * ep, "tokens are not t_local * ep"),
+            (
+                block == host.routing_block(t_local, gathered.topk),
+                f"routing block {block} is not the derived block",
+            ),
+            (
+                shard_stride
+                == host.ragged_stride_bound(
+                    gathered.n_tokens, gathered.topk, e_total, tile_m
+                ),
+                f"shard stride {shard_stride} is not the ragged stride bound",
+            ),
+            (
+                all(
+                    x.dtype == jnp.int32
+                    for x in (*runs, gathered.local_blocks, gathered.block_hist, me)
+                ),
+                "routing tables are not int32",
+            ),
+        )
+        or tpu_version_problem()
+    )
 
 
 class RoutingInputs(NamedTuple):
@@ -155,20 +197,21 @@ def prepare_routing(
         shard_stride=shard_stride,
     )
     slab_row = host.local_slab_rows(routing, me, shard_stride=shard_stride)
-    supported = (
-        fuse_metadata
-        and t_local in (96, 192, 256, 288, 384)
-        and (gathered.topk, e_total, ep, tile_m) == (6, 384, 16, 128)
-        and gathered.n_tokens == t_local * ep
-        and block == host.routing_block(t_local, gathered.topk)
-        and shard_stride
-        == host.ragged_stride_bound(gathered.n_tokens, gathered.topk, e_total, tile_m)
-        and all(
-            x.dtype == jnp.int32
-            for x in (*runs, gathered.local_blocks, gathered.block_hist, me)
-        )
-        and jax.default_backend() == "tpu"
-        and get_tpu_version() == 7
+    supported = fuse_metadata and admit(
+        "moe_routing",
+        routing_problem(
+            gathered,
+            runs,
+            me,
+            e_total=e_total,
+            ep=ep,
+            t_local=t_local,
+            block=block,
+            tile_m=tile_m,
+            shard_stride=shard_stride,
+        ),
+        tokens=t_local,
+        buckets=ROUTING_TOKENS,
     )
     if not supported:
         blocks = host.shard_transport_tables_in_blocks(

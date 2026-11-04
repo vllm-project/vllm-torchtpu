@@ -5,11 +5,18 @@ import jax
 import jax.numpy as jnp
 
 from vllm_torchtpu.kernels.experimental.decode_preparation import (
+    PRESORT_TOKENS,
+    admit,
+    first_problem,
     fuse_function,
     prefix_sum,
+    tpu_version_problem,
 )
 from vllm_torchtpu.kernels.experimental.push_fused_moe import host
-from vllm_torchtpu.kernels.quantized_matmul.tuned_block_sizes import get_tpu_version
+
+# (experts, topk) the metadata kernel was checked for; its BF16 base-256
+# one-hot reconstruction is exact while per-expert counts stay below 2**16.
+PRESORT_GEOMETRY = (384, 6)
 
 
 def _metadata(pairs, counts):
@@ -41,6 +48,35 @@ def _metadata(pairs, counts):
     return (order, start)
 
 
+def local_sort_problem(pairs, counts, q, *, e_total, topk) -> str | None:
+    """First violated contract of the fused metadata kernel, or None.
+
+    Only ``pairs`` and ``counts`` enter the kernel; ``q`` is gathered by the
+    native path, so its trailing shape and dtype are not constrained.
+    """
+    if q.ndim < 1:
+        return "activations are a scalar"
+    tokens = q.shape[0]
+    return (
+        first_problem(
+            (
+                (e_total, topk) == PRESORT_GEOMETRY,
+                f"(experts, topk)={(e_total, topk)}, kernel {PRESORT_GEOMETRY}",
+            ),
+            (
+                pairs.shape == (tokens * topk,),
+                f"pairs {pairs.shape} for {tokens} tokens",
+            ),
+            (
+                counts.shape == (e_total,),
+                f"counts {counts.shape} for {e_total} experts",
+            ),
+            (pairs.dtype == counts.dtype == jnp.int32, "pairs/counts are not int32"),
+        )
+        or tpu_version_problem()
+    )
+
+
 def supports_local_sort(
     pairs: jax.Array,
     counts: jax.Array,
@@ -49,16 +85,12 @@ def supports_local_sort(
     e_total: int,
     topk: int,
 ) -> bool:
-    """Limit fusion to the measured v7 FP8 decode contract."""
-    return (
-        (e_total, topk) == (384, 6)
-        and q.shape in tuple((t, 40, 128) for t in (96, 192, 256, 288, 384))
-        and pairs.shape == (q.shape[0] * 6,)
-        and counts.shape == (384,)
-        and pairs.dtype == counts.dtype == jnp.int32
-        and q.dtype == jnp.float8_e4m3fn
-        and jax.default_backend() == "tpu"
-        and get_tpu_version() == 7
+    """Whether the fused presort metadata path is admitted for these inputs."""
+    return admit(
+        "moe_presort",
+        local_sort_problem(pairs, counts, q, e_total=e_total, topk=topk),
+        tokens=q.shape[0] if q.ndim else None,
+        buckets=PRESORT_TOKENS,
     )
 
 

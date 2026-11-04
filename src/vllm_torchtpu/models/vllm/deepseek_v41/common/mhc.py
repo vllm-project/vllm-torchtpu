@@ -167,6 +167,23 @@ def _packed_mixes(x: jax.Array, weight: jax.Array, mixes: int) -> jax.Array:
     )
 
 
+def _admit_balanced_pre(tokens, mult, dim, dtype) -> bool:
+    """The balanced Pallas pre path: one 96-row tile grid plus padded gates."""
+    from vllm_torchtpu.kernels.experimental import decode_preparation as prep
+
+    return prep.admit(
+        "mhc_pre",
+        prep.first_problem(
+            (mult == 4, f"hc_mult {mult}, kernel 4 (balanced pairwise sum)"),
+            (dtype == jnp.bfloat16, f"residual dtype {dtype}"),
+            (dim % 128 == 0, f"hidden size {dim} is not lane aligned"),
+        ),
+        tokens=tokens,
+        buckets=prep.MHC_TOKENS,
+        report=False,
+    )
+
+
 def _flat_pre_sums(flat, weight, previous_pre, mixes, tile, *, balanced=False):
     """One pass over ``flat [T, M*D]``: mix logits, square sums, collapse."""
     from jax.experimental import pallas as pl
@@ -298,7 +315,7 @@ def delayed_pre_flat_jax(
     dim = width // mult
     constants = (rms_eps, pre_eps, sinkhorn_eps, post_multiplier, repeats)
     mixes = mult * (mult + 2)
-    if tokens == 288 and mult == 4 and dim == 5120 and flat.dtype == jnp.bfloat16:
+    if _admit_balanced_pre(tokens, mult, dim, flat.dtype):
         from vllm_torchtpu.kernels.deepseek_v41.mhc.shifted_post_pre_rms import (
             _pre_gates as gate_kernel,
         )

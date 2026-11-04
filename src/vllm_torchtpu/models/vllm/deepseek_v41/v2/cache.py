@@ -1033,16 +1033,15 @@ def gather_cache_pieces(
         -1
     )
     words = _gather_raw_rows(cache, rows).reshape(chunks, records.size, ROW_WORDS)
-    if (
-        jax.default_backend() == "tpu"
-        and chunks == 2
-        and records.size in (12288, 36864)
-    ):
-        from vllm_torchtpu.kernels.experimental.decode_preparation import (
-            unpack_cache_words,
-        )
+    from vllm_torchtpu.kernels.experimental import decode_preparation as prep
 
-        return unpack_cache_words(words)
+    if prep.admit(
+        "cache_unpack",
+        None if chunks == 2 else f"{chunks} word rows per record, kernel 2",
+        tokens=records.size,
+        buckets=prep.CACHE_UNPACK_RECORDS,
+    ):
+        return prep.unpack_cache_words(words)
     even, odd = _split_words(words)
     return jnp.stack([even, odd], axis=1).reshape(2 * chunks, records.size, ROW_WORDS)
 

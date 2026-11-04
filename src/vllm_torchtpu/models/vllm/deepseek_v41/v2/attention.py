@@ -21,9 +21,7 @@ from vllm.models.deepseek_v41 import attention as upstream
 from vllm.models.deepseek_v41 import compressor as compressor_upstream
 from vllm.v1.attention.backends.mla.sparse_swa import DeepseekV4SWACache
 
-from vllm_torchtpu.kernels.experimental.decode_preparation import (
-    supports_compressor_state_packed,
-)
+from vllm_torchtpu.kernels.experimental import decode_preparation
 from vllm_torchtpu.layers.adapter.linear_common import (
     KEEP_VLLM_LAYOUT_ATTR,
     WEIGHT_FLIPPED_ATTR,
@@ -834,6 +832,30 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
             version_key = ("candidate_index_version", indexer.k_cache.prefix)
             stage_cache[version_key] = stage_cache.get(version_key, 0) + 1
 
+    def _compressor_layout_admitted(
+        self, region, state_cache, main_cache=None, index_cache=None
+    ) -> bool:
+        """Compare the bound cache geometry with the registered kernel layout."""
+        fields = dict(
+            state_capacity=state_cache.shape[1],
+            state_stride=state_cache.page_stride,
+            state_offset=state_cache.row_offset,
+            window=self.window_size,
+        )
+        if main_cache is not None and index_cache is not None:
+            fields.update(
+                main_capacity=main_cache.shape[1],
+                main_stride=main_cache.page_stride,
+                main_offset=main_cache.row_offset,
+                index_capacity=index_cache.shape[1],
+            )
+        layout = dataclasses.replace(
+            decode_preparation.DEFAULT_COMPRESSOR_LAYOUT, **fields
+        )
+        return decode_preparation.admit(
+            region, decode_preparation.compressor_layout_problem(layout), backend=False
+        )
+
     def _write_csa2_global_kv(self, hidden_states, positions):
         """Fused compressor: one kernel projects, pools (reading and writing the
         ratio-2 state ring), normalizes, rotates and CSA2-encodes the records."""
@@ -854,55 +876,31 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
         ]
         state_meta = metadata[compressor.state_cache.prefix] if ratio == 2 else None
         state_cache = compressor.state_cache.kv_cache if ratio == 2 else None
+        # Only structural, non-token conditions are checked here. Token count,
+        # request count and table widths are dispatched inside the JAX bridge
+        # (decode_preparation.admit), so Dynamo keeps the token dim dynamic.
         packed = (
             self._packed_compressor_op is not None
             and state_meta is not None
             and isinstance(state_cache, PagedCacheRows)
             and state_cache.raw_hi is not None
             and starts is not None
-            and starts.shape == (48,)
-            and kv_meta.query_start_loc.shape == (49,)
-            and state_meta.query_start_loc.shape == (49,)
             and state_meta.seq_lens.numel() > 0
-            and hidden_states.shape[1] == 5120
-            and supports_compressor_state_packed(
-                288,  # Token dispatch happens inside the shape-specialized JAX op.
-                tuple(_block_table(state_meta).shape),
-                state_cache.shape[1],
-                state_cache.page_stride,
-                state_cache.row_offset,
-                self.window_size,
-            )
-            and all(
-                x.dtype == torch.int32
-                for x in (
-                    _block_table(state_meta),
-                    state_meta.query_start_loc,
-                    kv_meta.query_start_loc,
-                    positions,
-                    starts,
-                )
-            )
+            and self._compressor_layout_admitted("compressor_state", state_cache)
         )
         index_meta = metadata[index_k.prefix]
         addresses = (
             packed
-            and state_cache is not None
-            and state_cache.raw_hi is not None
             and self._address_compressor_op is not None
             and isinstance(self.kv_cache, PagedCacheRows)
             and isinstance(index_k.kv_cache, PackedFP8IndexCacheRows)
-            and self.kv_cache.shape[1] == self.kv_cache.page_stride == 128
-            and self.kv_cache.row_offset == 0
-            and index_k.kv_cache.shape[1] == 256
             and index_k.compress_ratio == 2
+            # One shared request mapping: the kernel derives both caches'
+            # requests from kv query_start_loc.
             and index_meta.query_start_loc is kv_meta.query_start_loc
-            and _block_table(kv_meta).shape == (48, 386)
-            and _block_table(index_meta).shape == (48, 193)
-            and _block_table(kv_meta).dtype == torch.int32
-            and _block_table(index_meta).dtype == torch.int32
-            and state_cache.raw.shape == (33423360, 128)
-            and state_cache.raw_hi.shape == (28652288, 128)
+            and self._compressor_layout_admitted(
+                "compressor_addresses", state_cache, self.kv_cache, index_k.kv_cache
+            )
         )
         compressed_slots = index_slots = records = None
         if not addresses:

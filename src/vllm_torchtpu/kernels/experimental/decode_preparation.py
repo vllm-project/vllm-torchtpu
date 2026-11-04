@@ -1,15 +1,164 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Experimental decode preparation boundaries validated at T=288.
+"""Experimental decode preparation boundaries for measured decode buckets.
 
 These functions keep communication and SparseCore producers outside the
 TensorCore preparation call. Callers retain their general-shape paths.
+
+Every fused region asks `admit` before taking its fused path. Token buckets
+below are the counts whose fused lowering and native parity were measured on
+v7; layout contracts are checked by the region and passed in as a problem
+string. `configure` selects the policy once, before the model is traced.
 """
+
+import dataclasses
+import enum
+import logging
 
 import jax
 import jax.numpy as jnp
 from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
+
+from vllm_torchtpu.kernels.quantized_matmul.tuned_block_sizes import get_tpu_version
+
+# Stdlib logging under vLLM's namespace: kernels/ must not import vLLM
+# (R-2.1), yet vLLM's handlers still format these records when present.
+logger = logging.getLogger("vllm." + __name__)
+
+
+class FusionMode(enum.Enum):
+    AUTO = "auto"  # fuse where admitted, otherwise fall back and log once
+    OFF = "off"  # always take the native path (A/B baseline)
+    REQUIRE = "require"  # raise when a decode-sized call cannot fuse
+
+
+# Measured buckets per region. A count above a region's largest bucket is a
+# prefill-sized call and falls back silently, even under REQUIRE.
+ROUTING_TOKENS = frozenset({96, 192, 256, 288, 384})  # per-shard t_local
+PRESORT_TOKENS = ROUTING_TOKENS
+COMPACT_TOKENS = frozenset({96, 192, 240, 256, 288, 384})
+COMPRESSOR_STATE_TOKENS = frozenset({96, 192, 240, 256, 288})
+COMPRESSOR_ADDRESS_TOKENS = frozenset({288})
+INDEXER_TOKENS = frozenset({128, 256, 288, 384, 512})
+MHC_TOKENS = frozenset({288})
+CACHE_UNPACK_RECORDS = frozenset({12288, 36864})
+SWA_PACK_TOKENS = frozenset({96, 192, 288})
+# (tokens, requests): both regions build token x request matrices.
+SWA_BATCHES = frozenset({(96, 16), (192, 32), (288, 32), (288, 48)})
+MAIN_RECORD_BATCHES = SWA_BATCHES
+# The main-record kernel's one-hot gather costs O(T * requests * columns);
+# smaller page tables than the largest measured one are strictly cheaper.
+MAIN_RECORD_MAX_COLUMNS = 772
+MEASURED_TPU_VERSION = 7
+
+
+@dataclasses.dataclass(frozen=True)
+class CompressorLayout:
+    """Cache geometry the compressor address kernel is specialized for."""
+
+    state_capacity: int = 16  # rows per compressor state ring page
+    state_stride: int = 16
+    state_offset: int = 0
+    window: int = 128  # SWA bounded-replay window
+    main_capacity: int = 128  # compressed records per main KV page
+    main_stride: int = 128
+    main_offset: int = 0
+    index_capacity: int = 256  # records per FP8 index page
+
+    @property
+    def tag(self) -> str:
+        return "_".join(str(v) for v in dataclasses.astuple(self))
+
+
+DEFAULT_COMPRESSOR_LAYOUT = CompressorLayout()
+
+_mode = FusionMode.AUTO
+_mode_used = False
+_reported: set[tuple[str, str]] = set()
+
+
+def configure(mode: str | FusionMode) -> None:
+    """Select the policy; it must not change once a region has been traced."""
+    global _mode
+    mode = FusionMode(mode.lower() if isinstance(mode, str) else mode)
+    if _mode_used and mode is not _mode:
+        raise RuntimeError(
+            f"Decode fusion mode is already {_mode.value} in traced graphs; set "
+            "TPU_DEEPSEEK_V41_DECODE_FUSION before the model is compiled"
+        )
+    _mode = mode
+
+
+def admit(
+    region: str,
+    problem: str | None = None,
+    *,
+    tokens: int | tuple[int, ...] | None = None,
+    buckets: frozenset | None = None,
+    backend: bool = True,
+    report: bool = True,
+) -> bool:
+    """Whether ``region`` takes its fused path.
+
+    ``problem`` names a violated layout contract. ``tokens`` is checked
+    against ``buckets``; any hashable bucket key works, with ``tokens`` an
+    int or a tuple whose first item is the token count. ``backend`` requires
+    a TPU. Under AUTO a decode-sized miss is logged once per reason.
+    ``report=False`` marks a region whose miss takes another tuned path, so
+    it neither logs nor raises.
+    """
+    global _mode_used
+    _mode_used = True
+    if _mode is FusionMode.OFF:
+        return False
+    if backend and jax.default_backend() != "tpu":
+        return False  # interpret/CPU runs always take the native path
+    if problem is None and buckets is not None and tokens not in buckets:
+        count = tokens[0] if isinstance(tokens, tuple) else tokens
+        largest = max(b[0] if isinstance(b, tuple) else b for b in buckets)
+        if count is not None and count > largest:
+            return False
+        problem = f"{tokens} is not a measured bucket {sorted(buckets)}"
+    if problem is None:
+        return True
+    if not report:
+        return False
+    if _mode is FusionMode.REQUIRE:
+        raise NotImplementedError(
+            f"DSv4.1 decode fusion '{region}' is required but unavailable: "
+            f"{problem}. Add a measured bucket or set "
+            "TPU_DEEPSEEK_V41_DECODE_FUSION=auto to allow the native path."
+        )
+    if (region, problem) not in _reported:
+        _reported.add((region, problem))
+        logger.warning("DSv4.1 decode fusion '%s' falls back: %s", region, problem)
+    return False
+
+
+def first_problem(*checks: tuple[bool, str]) -> str | None:
+    """Description of the first failed ``(ok, description)`` layout check."""
+    return next((description for ok, description in checks if not ok), None)
+
+
+def tpu_version_problem(version: int = MEASURED_TPU_VERSION) -> str | None:
+    """Buckets were measured on one TPU generation; others keep native paths."""
+    if jax.default_backend() != "tpu":
+        return None  # `admit` reports the backend itself, silently
+    actual = get_tpu_version()
+    return None if actual == version else f"TPU v{actual} (measured on v{version})"
+
+
+def compressor_layout_problem(
+    actual: CompressorLayout, expected: CompressorLayout = DEFAULT_COMPRESSOR_LAYOUT
+) -> str | None:
+    """Fields where the bound cache differs from the registered kernel."""
+    diffs = [
+        f"{f.name}={getattr(actual, f.name)} (kernel {getattr(expected, f.name)})"
+        for f in dataclasses.fields(CompressorLayout)
+        if getattr(actual, f.name) != getattr(expected, f.name)
+    ]
+    return "cache layout " + ", ".join(diffs) if diffs else None
 
 
 def take_along(values, indices, axis):
@@ -63,11 +212,15 @@ def fuse_function(fn, args, *, name, interpret=False):
         out_shape=tuple(leaves),
         name=name,
         interpret=interpret,
-        compiler_params=pltpu.CompilerParams(
-            vmem_limit_bytes=pltpu.get_tpu_info().vmem_capacity_bytes // 2
-        ),
+        compiler_params=None if interpret else _half_vmem(),
     )
     return lambda *xs: jax.tree.unflatten(tree, call(*xs))
+
+
+def _half_vmem() -> pltpu.CompilerParams:
+    return pltpu.CompilerParams(
+        vmem_limit_bytes=pltpu.get_tpu_info().vmem_capacity_bytes // 2
+    )
 
 
 def metadata_matrix(table, starts, positions, minimum):
@@ -281,11 +434,10 @@ def swa_prepare_publish(banks, table, starts, positions, minimum, values):
 
     # Shape dispatch belongs inside the JAX bridge. A Torch-side equality
     # specializes dimensions that the model explicitly marks dynamic.
-    if (positions.shape, table.shape[0]) not in (
-        ((288,), 48),
-        ((96,), 16),
-        ((192,), 32),
-        ((288,), 32),
+    if not admit(
+        "swa_prepare",
+        tokens=(positions.shape[0], table.shape[0]),
+        buckets=SWA_BATCHES,
     ):
         from vllm_torchtpu.kernels.deepseek_v41.csa2.cache import prepare_swa_metadata
 
@@ -330,27 +482,41 @@ def swa_prepare_publish(banks, table, starts, positions, minimum, values):
     return (*owners, metadata, bounds, records)
 
 
-def supports_compressor_state_packed(
-    tokens: int,
-    table_shape: tuple[int, ...],
-    capacity: int,
-    page_stride: int,
-    row_offset: int,
-    window: int,
-) -> bool:
-    """Measured decode envelope; other geometries retain native metadata."""
-    return (tokens, table_shape, capacity, page_stride, row_offset, window) == (
-        288,
-        (48, 8),
-        16,
-        16,
-        0,
-        128,
+def compressor_inputs_problem(
+    table, starts, kv_starts, positions, minimum, *page_tables
+) -> str | None:
+    """Shape/dtype contract shared by both compressor metadata kernels.
+
+    Request and token counts come from the arguments; nothing is fixed to one
+    batch. Every input is INT32: the kernels never cast metadata.
+    """
+    requests = table.shape[0] if table.ndim == 2 else -1
+    expected = (
+        (table, "table", (requests, max(table.shape[-1], 1))),
+        (starts, "query_start_loc", (requests + 1,)),
+        (kv_starts, "kv query_start_loc", (requests + 1,)),
+        (positions, "positions", (positions.shape[0],) if positions.ndim else ()),
+        (minimum, "window_starts", (requests,)),
+        *((t, "page table", (requests, max(t.shape[-1], 1))) for t in page_tables),
     )
+    for value, name, shape in expected:
+        if value.shape != shape or not shape or value.dtype != jnp.int32:
+            return (
+                f"{name} is {value.dtype}{list(value.shape)}, needs int32{list(shape)}"
+            )
+    if requests < 1:
+        return "no requests"
+    return None
 
 
-def _compressor_state_addresses(table, starts, kv_starts, positions, minimum):
-    capacity, stride, offset = 16, 16, 0
+def _compressor_state_addresses(
+    table, starts, kv_starts, positions, minimum, layout: CompressorLayout
+):
+    capacity, stride, offset = (
+        layout.state_capacity,
+        layout.state_stride,
+        layout.state_offset,
+    )
     tokens, requests = positions.size, table.shape[0]
     rows = jnp.arange(tokens, dtype=jnp.int32)
     r = jnp.arange(requests, dtype=jnp.int32)[:, None]
@@ -378,7 +544,7 @@ def _compressor_state_addresses(table, starts, kv_starts, positions, minimum):
     replay = (
         (replay_start > 0)
         & (positions >= replay_start)
-        & (positions < replay_start + 128)
+        & (positions < replay_start + layout.window)
     )
     valid = (rows < kv_starts[-1]) & ((positions + 1) % 2 == 0) & ~replay
 
@@ -393,6 +559,25 @@ def _compressor_state_addresses(table, starts, kv_starts, positions, minimum):
     )
 
 
+def _compact_ring(records, total_records):
+    """Stable ``(token, record)`` pairs and ``[0, count)`` for one whole tile."""
+    n = records.size
+    r = records.reshape(1, n)
+    valid = (r >= 0) & (r < total_records)
+    rank = prefix_sum(valid.astype(jnp.int32), axis=1) - 1
+    match = valid & (rank == jnp.arange(n, dtype=jnp.int32)[:, None])
+    token = jnp.sum(jnp.where(match, jnp.arange(n)[None, :], 0), axis=1)
+    record = jnp.sum(jnp.where(match, r, 0), axis=1)
+    count = jnp.sum(valid, dtype=jnp.int32)
+    return jnp.stack((token, record), axis=1), jnp.stack((jnp.int32(0), count))
+
+
+def _check_compressor_inputs(*args):
+    problem = compressor_inputs_problem(*args)
+    if problem is not None:
+        raise ValueError(f"Packed compressor metadata: {problem}")
+
+
 def compressor_state_packed(
     table: jax.Array,
     starts: jax.Array,
@@ -401,32 +586,24 @@ def compressor_state_packed(
     minimum: jax.Array,
     *,
     total_records: int,
+    layout: CompressorLayout = DEFAULT_COMPRESSOR_LAYOUT,
+    interpret: bool = False,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
-    """Decode flags and stable ring tables for one supported compressor tile."""
+    """Decode flags and stable ring tables for one whole compressor tile."""
     args = (table, starts, kv_starts, positions, minimum)
-    shapes = ((48, 8), (49,), (49,), (positions.size,), (48,))
-    if positions.size not in (96, 192, 240, 256, 288) or any(
-        x.shape != shape or x.dtype != jnp.int32
-        for x, shape in zip(args, shapes, strict=True)
-    ):
-        raise ValueError("Packed compressor metadata requires INT32 decode shapes")
-
-    def compact(records):
-        n = records.size
-        r = records.reshape(1, n)
-        valid = (r >= 0) & (r < total_records)
-        rank = prefix_sum(valid.astype(jnp.int32), axis=1) - 1
-        match = valid & (rank == jnp.arange(n, dtype=jnp.int32)[:, None])
-        token = jnp.sum(jnp.where(match, jnp.arange(n)[None, :], 0), axis=1)
-        record = jnp.sum(jnp.where(match, r, 0), axis=1)
-        count = jnp.sum(valid, dtype=jnp.int32)
-        return jnp.stack((token, record), axis=1), jnp.stack((jnp.int32(0), count))
+    _check_compressor_inputs(*args)
 
     def kernel(*refs):
+        state, ss, ks, pos, mins = (r[...] for r in refs[:5])
         prev, valid, write, read = _compressor_state_addresses(
-            *(r[...] for r in refs[:5])
+            state, ss, ks, pos, mins, layout
         )
-        outputs = (prev, valid, *compact(write), *compact(read))
+        outputs = (
+            prev,
+            valid,
+            *_compact_ring(write, total_records),
+            *_compact_ring(read, total_records),
+        )
         for ref, value in zip(refs[5:], outputs, strict=True):
             ref[...] = value
 
@@ -438,9 +615,8 @@ def compressor_state_packed(
             for s in ((n,), (n,), (n, 2), (2,), (n, 2), (2,))
         ),
         name="dsv41_compressor_state_packed",
-        compiler_params=pltpu.CompilerParams(
-            vmem_limit_bytes=pltpu.get_tpu_info().vmem_capacity_bytes // 2
-        ),
+        interpret=interpret,
+        compiler_params=None if interpret else _half_vmem(),
     )(*args)
     return (
         outputs[0][:, None],
@@ -462,6 +638,8 @@ def compressor_addresses_packed(
     index: jax.Array,
     *,
     total_records: int,
+    layout: CompressorLayout = DEFAULT_COMPRESSOR_LAYOUT,
+    interpret: bool = False,
 ) -> tuple[
     jax.Array,
     jax.Array,
@@ -472,53 +650,58 @@ def compressor_addresses_packed(
     jax.Array,
     jax.Array,
 ]:
-    """Decode state, stable ring tables and ratio-2 main/index addresses."""
-    args = (table, starts, kv_starts, positions, minimum, main, index)
-    shapes = ((48, 8), (49,), (49,), (288,), (48,), (48, 386), (48, 193))
-    if any(
-        x.shape != shape or x.dtype != jnp.int32
-        for x, shape in zip(args, shapes, strict=True)
-    ):
-        raise ValueError("Packed compressor addresses require INT32 decode shapes")
+    """Decode state, stable ring tables and ratio-2 main/index addresses.
 
-    def compact(records):
-        r = records.reshape(1, 288)
-        valid = (r >= 0) & (r < total_records)
-        rank = prefix_sum(valid.astype(jnp.int32), axis=1) - 1
-        match = valid & (rank == jnp.arange(288, dtype=jnp.int32)[:, None])
-        token = jnp.sum(jnp.where(match, jnp.arange(288)[None, :], 0), axis=1)
-        record = jnp.sum(jnp.where(match, r, 0), axis=1)
-        return jnp.stack((token, record), axis=1), jnp.stack(
-            (jnp.int32(0), jnp.sum(valid, dtype=jnp.int32))
-        )
+    Main records are physical rows (``main_offset + page * main_stride +
+    slot``), matching ``PagedCacheRows.row_indices``; index slots stay
+    logical, matching the native ``_cache_slots``.
+    """
+    args = (table, starts, kv_starts, positions, minimum, main, index)
+    _check_compressor_inputs(*args)
+    n, requests = positions.shape[0], table.shape[0]
 
     def kernel(*refs):
         state, ss, ks, pos, mins, mt, it = (r[...] for r in refs[:7])
-        prev, valid, write, read = _compressor_state_addresses(state, ss, ks, pos, mins)
-        rows = jnp.arange(288, dtype=jnp.int32)
-        request = jnp.minimum(jnp.sum(rows[None, :] >= ks[1:, None], axis=0), 47)
-        selected = request[None, :] == jnp.arange(48)[:, None]
+        prev, valid, write, read = _compressor_state_addresses(
+            state, ss, ks, pos, mins, layout
+        )
+        rows = jnp.arange(n, dtype=jnp.int32)
+        request = jnp.minimum(
+            jnp.sum(rows[None, :] >= ks[1:, None], axis=0), requests - 1
+        )
+        selected = request[None, :] == jnp.arange(requests)[:, None]
 
         def slots(page_table, capacity):
+            # Returns (page, slot within page), -1 page past the last request.
             logical = pos // 2
             col = jnp.minimum(logical // capacity, page_table.shape[1] - 1)
             col = jnp.where(col < 0, col + page_table.shape[1], col)
-            indices = jnp.broadcast_to((col % 128)[None, :], (48, 288))
+            indices = jnp.broadcast_to((col % 128)[None, :], (requests, n))
             chunks = (page_table.shape[1] + 127) // 128
             padded = jnp.pad(
                 page_table, ((0, 0), (0, chunks * 128 - page_table.shape[1]))
             )
-            per_request = jnp.zeros((48, 288), jnp.int32)
+            per_request = jnp.zeros((requests, n), jnp.int32)
             for chunk in range(chunks):
                 tile = padded[:, chunk * 128 : (chunk + 1) * 128]
                 gathered = take_along(tile, indices, axis=1)
                 per_request += jnp.where(col[None, :] // 128 == chunk, gathered, 0)
             blocks = jnp.sum(jnp.where(selected, per_request, 0), axis=0)
-            return jnp.where(rows < ks[-1], blocks * capacity + logical % capacity, -1)
+            return rows < ks[-1], blocks, logical % capacity
 
-        main_slots, index_slots = slots(mt, 128), slots(it, 256)
-        records = jnp.where((valid != 0) & (main_slots >= 0), main_slots, -1)
-        outputs = (prev, valid, *compact(write), *compact(read), records, index_slots)
+        live, block, slot = slots(mt, layout.main_capacity)
+        main_rows = layout.main_offset + block * layout.main_stride + slot
+        records = jnp.where(live & (block >= 0) & (valid != 0), main_rows, -1)
+        live, block, slot = slots(it, layout.index_capacity)
+        index_slots = jnp.where(live, block * layout.index_capacity + slot, -1)
+        outputs = (
+            prev,
+            valid,
+            *_compact_ring(write, total_records),
+            *_compact_ring(read, total_records),
+            records,
+            index_slots,
+        )
         for ref, value in zip(refs[7:], outputs, strict=True):
             ref[...] = value
 
@@ -526,16 +709,20 @@ def compressor_addresses_packed(
         kernel,
         out_shape=tuple(
             jax.ShapeDtypeStruct(s, jnp.int32)
-            for s in ((288,), (288,), (288, 2), (2,), (288, 2), (2,), (288,), (288,))
+            for s in ((n,), (n,), (n, 2), (2,), (n, 2), (2,), (n,), (n,))
         ),
-        name="dsv41_compressor_addresses_packed_c128_i256",
-        compiler_params=pltpu.CompilerParams(vmem_limit_bytes=16 * 1024 * 1024),
-    )(table, starts, kv_starts, positions, minimum, main, index)
+        name=(
+            "dsv41_compressor_addresses_packed"
+            f"_c{layout.main_capacity}_i{layout.index_capacity}"
+        ),
+        interpret=interpret,
+        compiler_params=None if interpret else _half_vmem(),
+    )(*args)
     return tuple(
         x.reshape(s)
         for x, s in zip(
             outputs,
-            ((288, 1), (288, 1), (576,), (2,), (576,), (2,), (288,), (288,)),
+            ((n, 1), (n, 1), (2 * n,), (2,), (2 * n,), (2,), (n,), (n,)),
             strict=True,
         )
     )
