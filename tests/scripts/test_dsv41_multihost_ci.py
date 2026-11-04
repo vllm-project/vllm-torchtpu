@@ -56,6 +56,7 @@ def write_hosts(root):
                     "moe_kernel": "push",
                     "moe_push_sc_prepush": 2,
                     "moe_push_tc_exchange": True,
+                    "moe_eplb_dynamic": True,
                     "moe_preprocess": "topology",
                     "allocator": "glibc",
                     "reclaim_compile_memory": True,
@@ -118,9 +119,14 @@ def test_peer_failure_cannot_publish_valid_metrics(tmp_path, invalid):
 
 @pytest.mark.parametrize(
     "key,value",
-    [("moe_kernel", "v2"), ("moe_push_sc_prepush", 1), ("moe_push_tc_exchange", False)],
+    [
+        ("moe_kernel", "v2"),
+        ("moe_push_sc_prepush", 1),
+        ("moe_push_tc_exchange", False),
+        ("moe_eplb_dynamic", False),
+    ],
 )
-def test_host_audit_rejects_a_different_push_recipe(tmp_path, key, value):
+def test_host_audit_rejects_a_different_decode_recipe(tmp_path, key, value):
     write_hosts(tmp_path)
     path = tmp_path / "worker/benchmark/manifest.json"
     data = json.loads(path.read_text())

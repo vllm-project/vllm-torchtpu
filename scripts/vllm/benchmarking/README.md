@@ -151,7 +151,7 @@ FP8 KV, CED, Engram CPU offload and DSpark K5:
   buckets are `[128,2048]`. The model-default serving context limit and automatic KV
   sizing are retained.
 - Steady decode: DP16 on eight physical chips, C768 (48 requests per DP),
-  L1 Engram HBM, 98,304 input tokens and 512 output
+  push MoE with dynamic EPLB, L1 Engram HBM, 98,304 input tokens and 512 output
   tokens, 2,048-token chunks, one warmup and one formal window. The serving
   context limit is 98,816; compile buckets are `[288,2048]`.
 
