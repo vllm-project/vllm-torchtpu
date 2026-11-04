@@ -31,6 +31,11 @@ DEFAULT_VMEM_LIMIT_BYTES = 100 * 1024 * 1024
 
 SUBLANE = 8
 
+# Token rows per grid step, and per sub-tile matmul within it: each weight
+# tile pushed to the MXU is reused across a sub-tile's rows.
+TILE_T_CAP = 1024
+SUB_T_CAP = 256
+
 
 def _largest_divisor(x: int, cap: int) -> int:
     """Largest divisor of ``x`` that is <= ``cap``."""
@@ -305,10 +310,9 @@ def wo_a_projection(
     if tile_r is None:
         tile_r = lora_rank
     if tile_t is None:
-        tile_t = _largest_divisor(num_tokens, cap=1024)
+        tile_t = _largest_divisor(num_tokens, cap=TILE_T_CAP)
     if sub_t is None:
-        # 128 is chosen based on large batch size (t) microbenchmarks
-        sub_t = _largest_divisor(tile_t, cap=128)
+        sub_t = _largest_divisor(tile_t, cap=SUB_T_CAP)
     assert lora_rank % tile_r == 0
     assert num_tokens % tile_t == 0
     assert tile_t % sub_t == 0
