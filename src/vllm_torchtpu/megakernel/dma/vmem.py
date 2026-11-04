@@ -24,7 +24,7 @@ import jax.numpy as jnp
 from jax.experimental.pallas import tpu as pltpu
 
 from .. import exec_spec
-from ..comm.params import CommParams, comm_params, ring_scratch, stage_scratch
+from ..collectives.params import CommParams, comm_params, ring_scratch, stage_scratch
 from ..errors import MegakernelConfigError
 from ..exec_spec import ExecSpec
 from ..ops import BF16, F32, FP8

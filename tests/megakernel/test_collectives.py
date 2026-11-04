@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Standalone Pallas interpret tests for `vllm_torchtpu.megakernel.comm`."""
+"""Standalone Pallas interpret tests for `vllm_torchtpu.megakernel.collectives`."""
 
 from __future__ import annotations
 
@@ -30,7 +30,7 @@ from jax.experimental.pallas import tpu as pltpu
 from jax.sharding import Mesh
 from jax.sharding import PartitionSpec as P
 
-from vllm_torchtpu.megakernel import AllReduceRing, comm
+from vllm_torchtpu.megakernel import AllReduceRing, collectives
 from vllm_torchtpu.megakernel.errors import MegakernelConfigError
 from vllm_torchtpu.megakernel.exec_spec import ExecSpec, Tiles
 from vllm_torchtpu.megakernel.ops import BF16, F32, I32
@@ -80,7 +80,7 @@ def _spawn_with_cpu_devices(R: int, tag: str) -> None:
     assert out.returncode == 0, out.stdout[-2000:] + out.stderr[-4000:]
 
 
-def _stage_round_count(cp: comm.CommParams) -> int:
+def _stage_round_count(cp: collectives.CommParams) -> int:
     """Count intermediate BF16 roundings inside one `AllReduceRing.allreduce`."""
     if cp.HIER == 3:
         return cp.N_HIER3 - 1
@@ -122,9 +122,7 @@ def _execute_2layer_2slot_ring(
     heavy_tail: bool = False,
     traced_slot: bool = False,
     ring_cls: type[AllReduceRing] = AllReduceRing,
-) -> tuple[
-    np.ndarray, np.ndarray, np.ndarray, ExecSpec, comm.CommParams, dict[str, object]
-]:
+):
     """Run a 2-layer, 2-slot alternating schedule and drain all sends."""
     devs = jax.devices("cpu")
     assert len(devs) >= R, f"Expected >= {R} CPU devices, found {len(devs)}"
@@ -132,11 +130,11 @@ def _execute_2layer_2slot_ring(
     tiles = dataclasses.replace(_TINY_TILES, hier=hier, rsag=rsag, war=war, mb8=2)
     ex = ExecSpec(B=B, T=1, R=R, ctx=128, tiles=tiles, interpret=True)
     pc = H // 2 if war == 0 else None
-    cp = comm.comm_params(ex, tiles, H=H, PC=pc)
+    cp = collectives.comm_params(ex, tiles, H=H, PC=pc)
     scratch = {
         "res": pltpu.VMEM((ex.MB, H), F32),
-        **comm.ring_scratch(cp),
-        **comm.stage_scratch(cp),
+        **collectives.ring_scratch(cp),
+        **collectives.stage_scratch(cp),
     }
     s_names = list(scratch.keys())
 
@@ -288,7 +286,7 @@ def _check_r2_traced_slot_and_group_copies_in_process() -> None:
     devs = jax.devices("cpu")[:2]
     tiles = dataclasses.replace(_TINY_TILES, hier=0, rsag=False, war=1, mb8=2)
     ex = ExecSpec(B=4, T=1, R=2, ctx=128, tiles=tiles, interpret=True)
-    cp = comm.comm_params(ex, tiles, H=256)
+    cp = collectives.comm_params(ex, tiles, H=256)
     scr_shapes = [
         pltpu.VMEM((8, 128), BF16),
         pltpu.VMEM((8, 128), BF16),
@@ -380,13 +378,13 @@ def test_comm_params_invalid_raises_config_error() -> None:
     tiles = dataclasses.replace(_TINY_TILES, hier=0, rsag=True, war=1, mb8=2)
     ex = ExecSpec(B=4, T=1, R=8, ctx=128, tiles=tiles, interpret=True)
     with pytest.raises(MegakernelConfigError, match="multiple of 128"):
-        comm.comm_params(ex, tiles, H=512, PR=4, PC=512)
+        collectives.comm_params(ex, tiles, H=512, PR=4, PC=512)
     for bad_r in (3, 6):
         for rsag in (False, True):
             t_bad = dataclasses.replace(_TINY_TILES, hier=0, rsag=rsag, war=1, mb8=2)
             ex_bad = ExecSpec(B=bad_r, T=1, R=bad_r, ctx=128, tiles=t_bad)
             with pytest.raises(MegakernelConfigError, match="unsupported all-reduce"):
-                comm.comm_params(ex_bad, t_bad, H=768)
+                collectives.comm_params(ex_bad, t_bad, H=768)
 
 
 if __name__ == "__main__":

@@ -29,7 +29,7 @@ from jax.sharding import Mesh
 from jax.sharding import PartitionSpec as P
 
 from tests.megakernel.megakernel_fakes import TINY_TILES, FakeGeometry
-from vllm_torchtpu.megakernel import comm, kernel, planner, stream, vmem
+from vllm_torchtpu.megakernel import collectives, kernel, planner, stream, vmem
 from vllm_torchtpu.megakernel.errors import MegakernelConfigError
 from vllm_torchtpu.megakernel.exec_spec import ExecSpec
 from vllm_torchtpu.megakernel.ops import BF16, F32, I32, rmsnorm, round_bf16
@@ -309,7 +309,7 @@ def test_allreduce_ring_modes_in_pallas(R: int, hier: int, rsag: bool):
     def pallas_body(x_ref, out_ref, *scr_refs):
         scr = dict(zip(s_names, scr_refs))
         me = lax.axis_index("tp").astype(I32)
-        ar = comm.AllReduceRing(cp.comm, scr, me)
+        ar = collectives.AllReduceRing(cp.comm, scr, me)
 
         if R > 1:
             barrier = pltpu.get_barrier_semaphore()
@@ -485,7 +485,7 @@ def test_allreduce_ring_detect_races_catches_slot_reuse():
     def racy_body(x_ref, out_ref, *scr_refs):
         scr = dict(zip(s_names, scr_refs))
         me = lax.axis_index("tp").astype(I32)
-        ar = comm.AllReduceRing(cp.comm, scr, me)
+        ar = collectives.AllReduceRing(cp.comm, scr, me)
         barrier = pltpu.get_barrier_semaphore()
         pl.semaphore_signal(
             barrier, 1, device_id=(me ^ 1,), device_id_type=pl.DeviceIdType.MESH

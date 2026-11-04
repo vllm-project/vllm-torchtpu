@@ -26,7 +26,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 from jax.sharding import PartitionSpec as P
 
-from .comm import AllReduceRing
+from .collectives import AllReduceRing
 from .dma.stream import TwoRing
 from .dma.vmem import CorePlan, build_scratch, fit_default_tiles
 from .errors import MegakernelConfigError

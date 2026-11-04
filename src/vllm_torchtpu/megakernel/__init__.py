@@ -24,7 +24,7 @@ if TYPE_CHECKING:  # eager imports for type checkers and IDEs
     from . import (
         cache,
         cache_experimental,
-        comm,
+        collectives,
         decls,
         derive,
         dma,
@@ -69,7 +69,7 @@ if TYPE_CHECKING:  # eager imports for type checkers and IDEs
         make_flat_fused_pooled_step,
         make_fused_pooled_step,
     )
-    from .comm import AllReduceRing
+    from .collectives import AllReduceRing
     from .dma import (
         TwoRing,
         fit_default_tiles,
@@ -209,7 +209,7 @@ _SUBMODULES = frozenset(
     {
         "cache",
         "cache_experimental",
-        "comm",
+        "collectives",
         "decls",
         "derive",
         "dma",
@@ -252,7 +252,7 @@ _LAZY: dict[str, str] = {
     "check_fused_pooled_step_hlo": ".cache_experimental",
     "make_flat_fused_pooled_step": ".cache_experimental",
     "make_fused_pooled_step": ".cache_experimental",
-    "AllReduceRing": ".comm",
+    "AllReduceRing": ".collectives",
     "EligibilityResult": ".errors",
     "MegakernelConfigError": ".errors",
     "MegakernelLayoutError": ".errors",
@@ -459,7 +459,7 @@ __all__ = [
     "check_fused_pooled_step_hlo",
     "check_pooled_step_hlo",
     "col_chunk",
-    "comm",
+    "collectives",
     "conv_to_raw_page",
     "decls",
     "default_eplb_cores",

@@ -23,7 +23,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 from tests.megakernel.megakernel_fakes import TINY_TILES, FakeGeometry, MiniCtx
-from vllm_torchtpu.megakernel import comm, planner, stream, vmem
+from vllm_torchtpu.megakernel import collectives, planner, stream, vmem
 from vllm_torchtpu.megakernel.exec_spec import ExecSpec
 from vllm_torchtpu.megakernel.modules import GQAModule, MoEModule
 from vllm_torchtpu.megakernel.ops import BF16, F32, I32
@@ -95,7 +95,7 @@ def test_gqa_module_declarations_and_emit_in_pallas_interpret(fake_ex: ExecSpec)
         scr = dict(zip(s_names, rest[n_w + n_s + n_o :]))
         me = jnp.int32(0)
         ring = stream.TwoRing(cp.stream, W, scr, me, interpret=True)
-        ar = comm.AllReduceRing(cp.comm, scr, me)
+        ar = collectives.AllReduceRing(cp.comm, scr, me)
         ctx = MiniCtx(
             g=g,
             ex=ex,

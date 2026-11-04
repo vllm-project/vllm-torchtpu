@@ -36,7 +36,7 @@ from tests.megakernel.megakernel_fakes import (
     FakeMixerModule,
     MiniCtx,
 )
-from vllm_torchtpu.megakernel import comm, modules, planner, stream, vmem
+from vllm_torchtpu.megakernel import collectives, modules, planner, stream, vmem
 from vllm_torchtpu.megakernel.errors import MegakernelConfigError
 from vllm_torchtpu.megakernel.exec_spec import ExecSpec
 from vllm_torchtpu.megakernel.modules import MoEModule
@@ -162,7 +162,7 @@ def test_moe_module_declarations_and_emit_in_pallas_interpret(fake_ex: ExecSpec)
         scr = dict(zip(s_names, rest[n_w + n_o :]))
         me = jnp.int32(0)
         ring = stream.TwoRing(cp.stream, W, scr, me, interpret=True)
-        ar = comm.AllReduceRing(cp.comm, scr, me)
+        ar = collectives.AllReduceRing(cp.comm, scr, me)
         ctx = MiniCtx(
             g=g,
             ex=ex,
@@ -345,7 +345,7 @@ def test_moe_module_numerical_parity(moe_tp: bool, R: int, pipe: bool):
             pl.semaphore_wait(barrier, R - 1)
 
         ring = stream.TwoRing(cp.stream, W, scr, me, interpret=True)
-        ar = comm.AllReduceRing(cp.comm, scr, me)
+        ar = collectives.AllReduceRing(cp.comm, scr, me)
         ctx = MiniCtx(
             g=g,
             ex=ex,
@@ -955,7 +955,7 @@ def test_moe_dynamic_dma_race_invariants(
             pl.semaphore_wait(barrier, R - 1)
 
             ring = stream.TwoRing(cp.stream, W, scr, me, interpret=True)
-            ar = comm.AllReduceRing(cp.comm, scr, me)
+            ar = collectives.AllReduceRing(cp.comm, scr, me)
             ctx = MiniCtx(
                 g=g,
                 ex=ex,

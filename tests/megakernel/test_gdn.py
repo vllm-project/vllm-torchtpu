@@ -30,7 +30,7 @@ from tests.megakernel.megakernel_fakes import (
     FakeGeometry,
     MiniCtx,
 )
-from vllm_torchtpu.megakernel import comm, planner
+from vllm_torchtpu.megakernel import collectives, planner
 from vllm_torchtpu.megakernel.dma import stream, vmem
 from vllm_torchtpu.megakernel.errors import MegakernelConfigError
 from vllm_torchtpu.megakernel.exec_spec import ExecSpec
@@ -176,7 +176,7 @@ def test_gdn_emit_in_pallas_interpret_matches_reference(T: int, B: int, chunked:
         scr = dict(zip(s_names, rest[n_w + n_s + n_o :]))
         me = jnp.int32(0)
         ring = stream.TwoRing(cp.stream, W, scr, me, interpret=True)
-        ar = comm.AllReduceRing(cp.comm, scr, me)
+        ar = collectives.AllReduceRing(cp.comm, scr, me)
         ctx = MiniCtx(
             g=g,
             ex=ex,

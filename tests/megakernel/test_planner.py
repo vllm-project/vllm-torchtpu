@@ -373,7 +373,9 @@ def test_planner_transitive_imports_exclude_vmem_kernel_and_cache():
             "kernel.py",
             "stream.py",
             "dma/stream.py",
-            "comm.py",
+            "collectives/__init__.py",
+            "collectives/params.py",
+            "collectives/ring.py",
         }
         or Path(r).name.startswith("cache")
     }
