@@ -83,6 +83,7 @@ import os
 import socket
 import threading
 import time
+from collections import defaultdict
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, cast
@@ -303,6 +304,26 @@ class FinishedJob:
     success: bool
     req_id: str | None = None
     failed_device_block_ids: list[int] = field(default_factory=list)
+
+
+@dataclass
+class _ReadBatch:
+    """The arguments of one read_remote call, index-aligned: the sub-hashes,
+    the slices naming where each lives, and each one's destination block."""
+
+    hashes: list[bytes] = field(default_factory=list)
+    slices: list[object] = field(default_factory=list)
+    device_ids: list[int] = field(default_factory=list)
+
+    def add(self, sub_hash: bytes, block: object, device_id: int) -> None:
+        self.hashes.append(sub_hash)
+        self.slices.append(block)
+        self.device_ids.append(device_id)
+
+    def extend(self, other: _ReadBatch) -> None:
+        self.hashes.extend(other.hashes)
+        self.slices.extend(other.slices)
+        self.device_ids.extend(other.device_ids)
 
 
 class RaidenOffloadingManager(OffloadingManager):
@@ -1059,33 +1080,30 @@ class RaidenOffloadingManager(OffloadingManager):
         # destination is one of this instance's HBM blocks. The destination
         # lists are disjoint subsequences of `device_ids`, each preserving its
         # batch's hash-to-block pairing, because load() and read_remote() both
-        # require block_hashes[i] to line up with device_block_ids[i]. One
-        # read_remote call takes a single peer's slices, plus any storage
-        # slices, so the remote sub-hashes go out in one batch per peer, the
-        # storage slices with the first.
-        remote_hashes: list[bytes] = []
-        remote_batches: list[tuple[list[bytes], list[object], list[int]]] = []
-        peer_batch_index: dict[object, int] = {}
+        # require block_hashes[i] to line up with device_block_ids[i].
+        peer_batches: defaultdict[object, _ReadBatch] = defaultdict(_ReadBatch)
+        storage_batch = _ReadBatch()
         local_hashes: list[bytes] = []
         dst_device_ids_for_local: list[int] = []
         for sub_hash, dev_id in zip(sub_hashes, device_ids):
-            block = self._pending_remote_slices.pop(sub_hash, None)
+            block: Any = self._pending_remote_slices.pop(sub_hash, None)
             if block is None:
                 local_hashes.append(sub_hash)
                 dst_device_ids_for_local.append(dev_id)
-                continue
-            remote_hashes.append(sub_hash)
-            index = 0
-            if cast(Any, block).status == self._block_status.REMOTE:
-                index = peer_batch_index.setdefault(
-                    cast(Any, block).raiden_id, len(peer_batch_index)
-                )
-            if index == len(remote_batches):
-                remote_batches.append(([], [], []))
-            batch = remote_batches[index]
-            batch[0].append(sub_hash)
-            batch[1].append(block)
-            batch[2].append(dev_id)
+            elif block.status == self._block_status.REMOTE:
+                peer_batches[block.raiden_id].add(sub_hash, block, dev_id)
+            else:  # SHARED_STORAGE
+                storage_batch.add(sub_hash, block, dev_id)
+        # One read_remote call takes a single peer's slices; storage slices
+        # may join any call, so they go with the first peer's, or alone when
+        # no peer is involved.
+        remote_batches = list(peer_batches.values())
+        if storage_batch.hashes:
+            if remote_batches:
+                remote_batches[0].extend(storage_batch)
+            else:
+                remote_batches.append(storage_batch)
+        remote_hashes = [h for batch in remote_batches for h in batch.hashes]
 
         def _fail_launch(
             what: str, failed_hashes: list[bytes], in_flight: list[bytes]
@@ -1135,9 +1153,9 @@ class RaidenOffloadingManager(OffloadingManager):
             _fail_launch("load()", local_hashes, [])
             return
         in_flight = list(local_hashes)
-        for batch_hashes, batch_slices, batch_device_ids in remote_batches:
+        for batch in remote_batches:
             if not self._store.read_remote(
-                batch_hashes, batch_slices, batch_device_ids
+                batch.hashes, batch.slices, batch.device_ids
             ):
                 launched = set(in_flight)
                 _fail_launch(
@@ -1146,7 +1164,7 @@ class RaidenOffloadingManager(OffloadingManager):
                     in_flight,
                 )
                 return
-            in_flight.extend(batch_hashes)
+            in_flight.extend(batch.hashes)
         admission = Admission(
             job_id=job_id,
             op=AdmissionOp.LOAD,
