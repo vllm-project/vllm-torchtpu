@@ -221,6 +221,7 @@ def _build_op(
             slim_prepush_barrier=envs.MOE_FUSED_EP_PUSH_SLIM_PREPUSH_BARRIER,
             fused_dispatch_meta=envs.MOE_FUSED_EP_PUSH_FUSED_DISPATCH_META,
             early_row_gather=envs.MOE_FUSED_EP_PUSH_EARLY_ROW_GATHER,
+            table_kernel=envs.MOE_FUSED_EP_PUSH_TABLE_KERNEL,
             staging_slots=envs.MOE_FUSED_EP_PUSH_STAGING_SLOTS,
         )
 

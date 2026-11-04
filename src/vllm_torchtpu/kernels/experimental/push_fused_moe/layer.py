@@ -52,6 +52,9 @@ from vllm_torchtpu.kernels.experimental.push_fused_moe.kernel import (
     build_combine_fs_kernel,
     build_push_moe_kernel,
 )
+from vllm_torchtpu.kernels.experimental.push_fused_moe.plan_kernel import (
+    build_push_tables,
+)
 from vllm_torchtpu.kernels.experimental.push_fused_moe.sc_dispatch import (
     sc_dispatch_chunk_2core,
 )
@@ -267,6 +270,7 @@ def fused_ep_moe_push(
     slim_prepush_barrier=False,
     fused_dispatch_meta=False,
     early_row_gather=False,
+    table_kernel=False,
     staging_slots=0,
     expert_slot=None,
     expert_load=None,
@@ -302,9 +306,11 @@ def fused_ep_moe_push(
     count with the dispatch segments (host.push_dispatch_tables) instead of
     decoding them back out of them, and `early_row_gather` (with
     `exchange_row_gather`) issues the exchange kernel's row copies before
-    its entry barrier, and `staging_slots` gives the VMEM-staged expert
-    kernel that many result staging slots (see the kernel). The caller
-    (layers/adapter/fused_moe_ep.py) reads all fifteen from envs.
+    its entry barrier, `staging_slots` gives the VMEM-staged expert kernel
+    that many result staging slots (see the kernel), and `table_kernel`
+    builds the dispatch and shard tables in one TensorCore kernel
+    (plan_kernel.build_push_tables). The caller
+    (layers/adapter/fused_moe_ep.py) reads all sixteen from envs.
 
     `expert_slot` [experts, R] i32 and `expert_load` [e_total] i32 (both
     replicated, optional) are the expert-layout operands dynamic EPLB
@@ -457,6 +463,8 @@ def fused_ep_moe_push(
         n_pre = g_local
     tc_exchange = bool(tc_exchange)
     exchange_row_gather = bool(exchange_row_gather)
+    if table_kernel and interleave_visits:
+        raise ValueError("table_kernel builds the most-rows-first visit order only")
     if early_row_gather and not exchange_row_gather:
         raise ValueError("early_row_gather needs exchange_row_gather")
     if exchange_row_gather and not tc_exchange:
@@ -642,7 +650,17 @@ def fused_ep_moe_push(
         )
         with jax.named_scope("moe_dispatch_tables"):
             runs = run_tables(rows_by_dest)
-            if fused_dispatch_meta:
+            shard_tables = None
+            if table_kernel:
+                seg, dmeta, visit, counts_sc, *shard_tables = build_push_tables(
+                    rows_by_dest,
+                    seg_start,
+                    me,
+                    ep=ep,
+                    n_pre=n_pre,
+                    tile_m=capacity,
+                )
+            elif fused_dispatch_meta:
                 seg, dmeta, _, visit, counts_sc = push_dispatch_tables(
                     runs[3],
                     runs[2],
@@ -755,10 +773,6 @@ def fused_ep_moe_push(
         slab_row, scale_bits_g, slab = lax.optimization_barrier(
             (slab_row, scale_bits_g, slab)
         )
-        block_tables = shard_transport_tables_in_blocks(
-            routing, me, e_total=e_total, ep=ep
-        )
-        row_tables = shard_push_tables_in_rows(routing, me, e_total=e_total, ep=ep)
         # The activation row scale, scattered onto the slab row each routed
         # pair computes on (v2's scale slab; see there).
         if form.quantized_activations:
@@ -776,12 +790,25 @@ def fused_ep_moe_push(
             ).reshape(scale_rows, HIDDEN_LANE_BLOCK)
         else:
             scale_slab = None
-        expert_rows, slab_base = shard_expert_slabs(routing, me, e_total=e_total, ep=ep)
+        if shard_tables is not None:
+            kernel_tables, expert_rows, slab_base, counts = shard_tables
+        else:
+            block_tables = shard_transport_tables_in_blocks(
+                routing, me, e_total=e_total, ep=ep
+            )
+            row_tables = shard_push_tables_in_rows(
+                routing, me, e_total=e_total, ep=ep
+            )
+            expert_rows, slab_base = shard_expert_slabs(
+                routing, me, e_total=e_total, ep=ep
+            )
+            counts = shard_count_vector(
+                routing, expert_rows, me, e_total=e_total, ep=ep
+            )
+            kernel_tables = (*block_tables[:3], block_tables[5], row_tables[0])
         recv_rows = align_up(t_local * topk + (ROWBLK - 1) * e_total, ROWBLK)
         w1b_k = next(bias_it).reshape(g_local, 2 * inter) if has_w1_bias else None
         w2b_k = next(bias_it).reshape(g_local, hidden) if has_w2_bias else None
-        counts = shard_count_vector(routing, expert_rows, me, e_total=e_total, ep=ep)
-        kernel_tables = (*block_tables[:3], block_tables[5], row_tables[0])
         arrivals, arrival_scales = kfn(
             kernel_tables,
             expert_rows,
@@ -977,6 +1004,7 @@ def fused_ep_moe_push(
         bool(fused_dispatch_meta),
         bool(early_row_gather),
         int(staging_slots),
+        bool(table_kernel),
     )
     sm = _LAYER_SM_CACHE.get(key)
     if sm is None:

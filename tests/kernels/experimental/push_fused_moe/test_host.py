@@ -373,3 +373,47 @@ def test_dispatch_tables_match_the_decoded_segments(n_pre, skew):
             0,
         ]
         np.testing.assert_array_equal(counts_sc, want_sc)
+
+
+@pytest.mark.parametrize("n_pre", [1, 2, 25])
+@pytest.mark.parametrize("skew", [False, True], ids=["uniform", "skewed"])
+def test_table_kernel_matches_the_xla_tables(n_pre, skew):
+    """plan_kernel.build_push_tables (interpret mode) gives exactly the XLA
+    dispatch and shard tables at the DP16 geometry, for several ranks."""
+    from vllm_torchtpu.kernels.experimental.push_fused_moe.plan_kernel import (
+        build_push_tables,
+    )
+
+    ep, t_local, g_local, topk = 16, 288, 25, 6
+    idx, kw = _routing(ep, t_local, g_local, topk, skew=skew, seed=11)
+    e_total = kw["e_total"]
+    rows_by_dest = jnp.asarray(_counts(idx, ep, t_local, e_total))
+    runs = push_host.run_tables(rows_by_dest)
+    plan = host.build_routing_tables(jnp.asarray(idx), **kw)
+    for me in (0, 3, ep - 1):
+        counts = np.asarray(rows_by_dest)[me]
+        seg_start = jnp.asarray(np.cumsum(counts) - counts)
+        want_seg, want_meta, _, want_visit, want_sc = push_host.push_dispatch_tables(
+            runs[3], runs[2], rows_by_dest, jnp.int32(me), seg_start,
+            e_total=e_total, ep=ep, n_pre=n_pre,
+        )  # fmt: skip
+        blocks = host.shard_transport_tables_in_blocks(plan, me, e_total=e_total, ep=ep)
+        rows_t = host.shard_push_tables_in_rows(plan, me, e_total=e_total, ep=ep)
+        want_er, want_sb = host.shard_expert_slabs(plan, me, e_total=e_total, ep=ep)
+        want_counts = host.shard_count_vector(plan, want_er, me, e_total=e_total, ep=ep)
+        got = build_push_tables(
+            rows_by_dest, seg_start, jnp.int32(me), ep=ep, n_pre=n_pre,
+            tile_m=kw["tile_m"], interpret=True,
+        )  # fmt: skip
+        seg, meta, visit, sc, kt, er, sb, cnt = (
+            jax.tree.map(np.asarray, x) for x in got
+        )
+        np.testing.assert_array_equal(seg, np.asarray(want_seg))
+        np.testing.assert_array_equal(meta, np.asarray(want_meta))
+        np.testing.assert_array_equal(visit, np.asarray(want_visit))
+        np.testing.assert_array_equal(sc, np.asarray(want_sc))
+        for k, want in enumerate((*blocks[:3], blocks[5], rows_t[0])):
+            np.testing.assert_array_equal(kt[k], np.asarray(want), err_msg=str(k))
+        np.testing.assert_array_equal(er, np.asarray(want_er))
+        np.testing.assert_array_equal(sb, np.asarray(want_sb))
+        np.testing.assert_array_equal(cnt, np.asarray(want_counts))

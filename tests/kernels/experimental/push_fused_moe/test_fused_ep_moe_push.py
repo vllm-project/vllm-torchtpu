@@ -461,6 +461,7 @@ FRONT_SWITCHES = (
     "slim_prepush_barrier",
     "fused_dispatch_meta",
     "exchange_row_gather+early_row_gather",
+    "table_kernel",
 )
 
 
