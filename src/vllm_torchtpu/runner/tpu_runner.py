@@ -1887,6 +1887,42 @@ class TPUModelRunner(GPUModelRunner):
             else:
                 self._aux_routing_staging = None
 
+            # On TPU under torch.compile(..., fullgraph=True), upstream
+            # RoutedExpertsCapturer.capture() breaks because it reads
+            # ctx.dp_metadata via .item() and data-dependent branching.
+            # On TPU with static token bucketing, each DP rank occupies a
+            # deterministic slice of the all-gathered tokens:
+            # topk_ids[dp_rank * B : (dp_rank + 1) * B] where
+            # B = topk_ids.shape[0] // dp_size.
+            # Rebind each layer's capture_fn to a fullgraph-compatible
+            # static slice that writes directly into capturer.device_buffer
+            # without touching dp_metadata.
+            dp_lockstep = self._dp_lockstep_enabled()
+            dp_size = utils.get_dp_size(self.parallel_config)
+            dp_rank = getattr(self.parallel_config, "data_parallel_rank", 0)
+
+            def _tpu_capture(layer_id: int, topk_ids: torch.Tensor) -> None:
+                if dp_lockstep:
+                    b = topk_ids.shape[0] // dp_size
+                    local_ids = topk_ids[dp_rank * b : (dp_rank + 1) * b]
+                    capturer.device_buffer[:b, layer_id] = local_ids
+                else:
+                    b = topk_ids.shape[0]
+                    capturer.device_buffer[:b, layer_id] = topk_ids
+
+            from functools import partial
+
+            from vllm.model_executor.layers.fused_moe.layer import MoERunner
+            from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
+                RoutedExpertsCaptureSource,
+            )
+
+            for module in self.model.modules():
+                if isinstance(module, (RoutedExpertsCaptureSource, MoERunner)):
+                    layer_id = getattr(module, "layer_id", None)
+                    if layer_id is not None:
+                        module.capture_fn = partial(_tpu_capture, layer_id)
+
     def _aux_stage_chunk_routing(
         self, row_offset: int, num_tokens: int, target_num_chunks: int = 1
     ) -> None:
@@ -5853,15 +5889,46 @@ class TPUModelRunner(GPUModelRunner):
     def aux_output_hbm_reserve_bytes(self) -> int:
         """HBM occupied by the capturer's device buffer and the step staging
         buffer on the output TP rank."""
-        if self.aux_output_connector is None:
+        if getattr(self, "_is_shutdown", False):
             return 0
-        capturer = getattr(self.aux_output_connector, "_capturer", None)
-        if capturer is None or not hasattr(capturer, "device_buffer"):
+        if self.aux_output_connector is not None:
+            capturer = getattr(self.aux_output_connector, "_capturer", None)
+            if capturer is not None and hasattr(capturer, "device_buffer"):
+                res = capturer.device_buffer.nbytes
+                if self._aux_routing_staging is not None:
+                    res += self._aux_routing_staging.nbytes
+                return res
+
+        aux_config = getattr(self.vllm_config, "aux_output_config", None)
+        if aux_config is None or not getattr(aux_config, "enabled", False):
             return 0
-        res = capturer.device_buffer.nbytes
-        if self._aux_routing_staging is not None:
-            res += self._aux_routing_staging.nbytes
-        return res
+        model_config = getattr(self.vllm_config, "model_config", None)
+        if model_config is None:
+            return 0
+        try:
+            num_layers = model_config.get_total_num_hidden_layers()
+            num_experts = model_config.get_num_experts() or 0
+            num_experts_per_tok = model_config.get_num_experts_per_tok() or 0
+        except (AttributeError, TypeError, ValueError):
+            return 0
+        if num_layers <= 0 or num_experts <= 0 or num_experts_per_tok <= 0:
+            return 0
+
+        max_tokens = getattr(self, "max_num_tokens", None)
+        if not isinstance(max_tokens, int) or max_tokens <= 0:
+            scheduler_config = getattr(self.vllm_config, "scheduler_config", None)
+            max_tokens = (
+                getattr(scheduler_config, "max_num_batched_tokens", 0)
+                if scheduler_config
+                else 0
+            )
+        if not isinstance(max_tokens, int) or max_tokens <= 0:
+            return 0
+
+        # Sized for capturer.device_buffer (int32: 4 bytes) and
+        # _aux_routing_staging (int32: 4 bytes)
+        single_buffer_bytes = max_tokens * num_layers * num_experts_per_tok * 4
+        return 2 * single_buffer_bytes
 
     def post_profile_hbm_reserves(self) -> utils.HbmReserves:
         """HBM that profile_run does not see, which the KV cache budget must
@@ -5872,11 +5939,15 @@ class TPUModelRunner(GPUModelRunner):
         reserve added to only one of them would let the other fill that HBM
         with KV blocks.
         """
+        aux_fn = getattr(self, "aux_output_hbm_reserve_bytes", None)
+        aux_bytes = aux_fn() if callable(aux_fn) else 0
+        if not isinstance(aux_bytes, int):
+            aux_bytes = 0
         return utils.HbmReserves(
             kv_connector=utils.estimate_kv_connector_hbm_reserve(self.vllm_config),
             lora_slot_write=self.lora_slot_write_hbm_bytes(),
             pp_handoff=self.pp_handoff_hbm_reserve_bytes(),
-            aux_output=self.aux_output_hbm_reserve_bytes(),
+            aux_output=aux_bytes,
         )
 
     def _initialize_pallas_kernels(self):
@@ -6207,7 +6278,13 @@ class TPUModelRunner(GPUModelRunner):
                 num_tokens, zeros=not profiling, random=profiling
             )
             self._pp_take_topk_indices(intermediate_tensors, num_tokens)
-        use_dp = dp_lockstep or self._dp_lockstep_enabled()
+        dp_enabled = getattr(self, "_dp_lockstep_enabled", None)
+        use_dp = dp_lockstep or (dp_enabled() if callable(dp_enabled) else False)
+        num_tokens_across_dp = (
+            self._dp_num_tokens_across_dp(num_tokens)
+            if use_dp and hasattr(self, "_dp_num_tokens_across_dp")
+            else None
+        )
         with (
             self.maybe_select_dummy_loras(
                 self.lora_config, np.array([num_tokens], dtype=np.int32)
@@ -6216,9 +6293,7 @@ class TPUModelRunner(GPUModelRunner):
                 per_layer_attn_metadata,
                 self.vllm_config,
                 num_tokens=num_tokens if use_dp else 0,
-                num_tokens_across_dp=self._dp_num_tokens_across_dp(num_tokens)
-                if use_dp
-                else None,
+                num_tokens_across_dp=num_tokens_across_dp,
             ),
             set_vllm_model_wrapper_context(
                 mesh=self.mesh,
@@ -8761,6 +8836,7 @@ class TPUModelRunner(GPUModelRunner):
 
     def shutdown(self) -> None:
         """Release runner resources and background threads."""
+        self._is_shutdown = True
         aux_output_connector = getattr(self, "aux_output_connector", None)
         if aux_output_connector is not None:
             aux_output_connector.close()

@@ -32,7 +32,16 @@ def _make_fake_runner(
     runner._pcp_enabled = False
     runner.max_num_tokens = max_num_tokens
     runner.model = MagicMock()
-    runner.parallel_config = SimpleNamespace(pipeline_parallel_size=1)
+    runner.parallel_config = SimpleNamespace(
+        pipeline_parallel_size=1,
+        data_parallel_size=1,
+        data_parallel_rank=0,
+        enable_expert_parallel=False,
+    )
+    runner._dp_lockstep_enabled = lambda: (
+        runner.parallel_config.data_parallel_size > 1
+        and runner.parallel_config.enable_expert_parallel
+    )
     runner.vllm_config = SimpleNamespace(
         scheduler_config=SimpleNamespace(max_num_batched_tokens=max_num_tokens),
         kv_transfer_config=None,
@@ -194,3 +203,60 @@ def test_aux_output_hbm_reserves_and_shutdown():
     assert runner.aux_output_connector is None
     assert runner._aux_routing_staging is None
     assert runner.aux_output_hbm_reserve_bytes() == 0
+
+
+def test_aux_output_hbm_reserves_before_connector_initialized():
+    """HBM reserve is non-zero before initialize_kv_cache allocates buffers."""
+    runner = _make_fake_runner(max_num_tokens=100)
+    runner.vllm_config.aux_output_config = SimpleNamespace(enabled=True)
+    runner.vllm_config.model_config = SimpleNamespace(
+        get_total_num_hidden_layers=lambda: 2,
+        get_num_experts=lambda: 8,
+        get_num_experts_per_tok=lambda: 4,
+    )
+    # Expected: 2 * (max_tokens=100 * num_layers=2 * topk=4 * 4 bytes) = 6400 bytes
+    expected = 2 * (100 * 2 * 4 * 4)
+    assert runner.aux_output_connector is None
+    assert runner.aux_output_hbm_reserve_bytes() == expected
+
+
+def test_initialize_aux_output_connector_rebinds_capture_fn_dp_lockstep():
+    """Under EP+DP, capture_fn slices the static per-rank bucket without dp_metadata."""
+    runner = _make_fake_runner(max_num_tokens=128)
+    runner.parallel_config.data_parallel_size = 2
+    runner.parallel_config.data_parallel_rank = 1
+    runner.parallel_config.enable_expert_parallel = True
+
+    device_buffer = torch.zeros((128, 2, 4), dtype=torch.int32)
+    fake_capturer = SimpleNamespace(
+        device_buffer=device_buffer,
+        shape_per_token=(2, 4),
+    )
+    fake_connector = SimpleNamespace(
+        _capturer=fake_capturer,
+        _buffer=SimpleNamespace(),
+    )
+
+    from vllm.model_executor.layers.fused_moe.layer import MoERunner
+
+    fake_moe_module = MagicMock(spec=MoERunner)
+    fake_moe_module.layer_id = 0
+    fake_moe_module.capture_fn = None
+    runner.model.modules.return_value = [fake_moe_module]
+
+    with patch(
+        "vllm.distributed.aux_output_connector.worker.get_aux_output_connector",
+        return_value=fake_connector,
+    ):
+        runner._initialize_aux_output_connector(MagicMock())
+
+    assert callable(fake_moe_module.capture_fn)
+
+    # Simulated gathered topk_ids across 2 DP ranks (total 32 tokens, 16 per rank)
+    topk_ids = torch.arange(32 * 4, dtype=torch.int32).reshape(32, 4)
+    # Call the bound capture function without setting forward context / dp_metadata
+    fake_moe_module.capture_fn(topk_ids)
+
+    # Rank 1 should capture topk_ids[16:32] into rows 0..15 of layer 0
+    expected = topk_ids[16:32]
+    assert torch.equal(device_buffer[:16, 0], expected)

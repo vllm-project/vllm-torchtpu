@@ -108,6 +108,7 @@ def _routing_layer(topk=10, renormalize=True):
         e_score_correction_bias=None,
         routed_scaling_factor=1.0,
         moe_config=SimpleNamespace(experts_per_token=topk),
+        capture_fn=None,
     )
 
 
@@ -347,15 +348,13 @@ def test_route_hands_topk_ids_to_the_layer_capture_fn(monkeypatch):
 
 
 def test_route_skips_capture_when_unbound(monkeypatch):
-    """A layer without capture_fn, or with it unset, routes untouched."""
+    """A layer with capture_fn=None routes untouched."""
     import torch
 
     monkeypatch.setattr(moe_routing, "_ROUTER_TOPK", "sort")
     hidden = torch.ones(2, 4)
     logits = torch.tensor([[1.0, 2.0, 3.0, 4.0], [4.0, 3.0, 2.0, 1.0]])
-    absent = _routing_layer(topk=2)
-    unset = _routing_layer(topk=2)
-    unset.capture_fn = None
-    _, absent_ids = moe_routing.route(absent, hidden, logits)
-    _, unset_ids = moe_routing.route(unset, hidden, logits)
-    assert torch.equal(absent_ids, unset_ids)
+    layer = _routing_layer(topk=2)
+    assert layer.capture_fn is None
+    _, topk_ids = moe_routing.route(layer, hidden, logits)
+    assert topk_ids.shape == (2, 2)

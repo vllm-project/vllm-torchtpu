@@ -197,7 +197,7 @@ def route(
                 layer=layer,
                 input_ids=input_ids,
             )
-    capture_fn = getattr(layer, "capture_fn", None)
+    capture_fn = layer.capture_fn
     if capture_fn is not None:
         capture_fn(topk_ids)
     return topk_weights, topk_ids
