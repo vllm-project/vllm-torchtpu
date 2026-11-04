@@ -93,6 +93,24 @@ def sparse_mla_chunk_kwargs() -> dict[str, int]:
     return {"gather_and_attention_chunk_size": chunk}
 
 
+def _resolve_sparse_mla_split_q(ql_nope: jax.Array, q_pe: jax.Array) -> bool:
+    """Whether to pass `q_pe` separately to `sparse_ragged_paged_attention`."""
+    if not envs.TPU_MLA_SPARSE_SPLIT_Q:
+        return False
+    if sparse_mla_kernel.supports_split_q(ql_nope, q_pe):
+        return True
+    logger.warning_once(
+        "TPU_MLA_SPARSE_SPLIT_Q=1 requires 128-aligned q_nope dim and packed "
+        "per-device query heads, got ql_nope (heads, dim)=%s/%s and q_pe "
+        "(heads, dim)=%s/%s; falling back to [ql_nope, q_pe] concat.",
+        tuple(ql_nope.shape[1:]),
+        ql_nope.dtype,
+        tuple(q_pe.shape[1:]),
+        q_pe.dtype,
+    )
+    return False
+
+
 def sharded_flash_attention(
     mesh: Mesh,
     causal: bool = True,
@@ -917,9 +935,14 @@ def sparse_mla_attention(
         - The sparse attention output (`[num_tokens, num_heads, lkv_dim]`).
 
     Contract notes:
-      * The kernel takes a SINGLE `q` of shape (T, N, nope+rope) in
-        token-major order -- no separate rope argument, and no head-major
-        transpose (the v2 kernel wants (N, T, L); this one does not).
+      * By default (`TPU_MLA_SPARSE_SPLIT_Q=0`), the kernel takes a single
+        concatenated `q` of shape (T, N, nope+rope) in token-major order;
+        when `TPU_MLA_SPARSE_SPLIT_Q=1`, `ql_nope` and `q_pe` are passed
+        separately if `supports_split_q(ql_nope, q_pe)` holds (packed
+        per-device heads and `lkv_dim % 128 == 0`), and otherwise fall back
+        to the concatenated path with a `warning_once`. (Note: layers routed
+        through `mla_dispatch.attention_from_parts` under `allow_masked_dense`
+        do not call this wrapper and still concatenate `[ql_nope, q_pe]`.)
       * `q` must be bf16 (pre-quantization): the kernel dequantizes the
         gathered KV to bf16 and has no q-scale plumbing.
       * Fused KV-cache insert: writes current step's `kv_c_normed` and `k_pe`
@@ -967,6 +990,7 @@ def sparse_mla_attention(
         )
     cache_layout = nope_spec.layout.value
     chunk_kwargs = sparse_mla_chunk_kwargs()
+    split_q = _resolve_sparse_mla_split_q(ql_nope, q_pe)
 
     def _sparse_mla_ragged_paged_attention(
         ql_nope,
@@ -1012,7 +1036,10 @@ def sparse_mla_attention(
             )
             return output, kv_cache_nope, kv_cache_rope
 
-        q = jnp.concatenate([ql_nope, q_pe], axis=-1)
+        if split_q:
+            q, split_kwargs = ql_nope, {"q_pe": q_pe}
+        else:
+            q, split_kwargs = jnp.concatenate([ql_nope, q_pe], axis=-1), {}
         output = sparse_mla_ragged_paged_attention(
             q,
             kv_cache_nope,
@@ -1025,12 +1052,13 @@ def sparse_mla_attention(
             k_scale=dequant_scale,
             cache_layout=cache_layout,
             **chunk_kwargs,
+            **split_kwargs,
         )
 
         lkv_dim = ql_nope.shape[-1]
-        # The kernel's output is lkv_dim + rope_dim wide because it attends
-        # over concatenated (nope + rope) keys. Only the nope part is the MLA
-        # value (P @ latent); drop the rope tail before the W_UV projection.
+        # On the concat path, the kernel's output is lkv_dim + rope_dim wide
+        # (on the split-q path it is already lkv_dim wide); drop any rope tail
+        # before the W_UV projection.
         return output[..., :lkv_dim], kv_cache_nope, kv_cache_rope
 
     output, new_kv_cache_nope, new_kv_cache_rope = jax.jit(
@@ -1165,6 +1193,7 @@ def sparse_mla_attention_dcp(
             f"got {nope_spec.layout.value} and {rope_spec.layout.value}"
         )
     cache_layout = nope_spec.layout.value
+    split_q = _resolve_sparse_mla_split_q(ql_nope, q_pe)
 
     def _local(
         ql_nope,
@@ -1206,7 +1235,7 @@ def sparse_mla_attention_dcp(
         # Split q: the kernel joins q_nope and q_pe in VMEM (no padded
         # [T, H, 640] concat). The merge below needs the lse, so it also comes
         # out lane-dense as f32[T, H] rather than f32[T, H, 1].
-        if envs.TPU_MLA_SPARSE_SPLIT_Q:
+        if split_q:
             q, split_kwargs = ql_nope, {"q_pe": q_pe, "lse_lane_dense": True}
         else:
             q, split_kwargs = jnp.concatenate([ql_nope, q_pe], axis=-1), {}

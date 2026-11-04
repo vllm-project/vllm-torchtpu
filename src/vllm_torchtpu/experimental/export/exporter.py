@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import dataclasses
+import fnmatch
 import json
 import math
 import os
@@ -45,6 +46,9 @@ _USER_INPUT_NAMES = (
     "req_dist",
 )
 _NUM_USER_INPUTS = len(_USER_INPUT_NAMES)
+# `mtp_draft_bucket{B}` takes the forward's user inputs, `input_ids` shifted by
+# one token, and then the row of each request's last accepted token.
+_MTP_LAST_TOKEN_INDICES = "last_token_indices"
 
 # Mesh axes of the artifact. Expert parallelism runs on the tensor-parallel
 # devices, so expert dimensions are split over `model` too.
@@ -56,6 +60,85 @@ _MESH_AXIS_BY_ALIAS = {"dp": "data", "tp": "model", "ep": "model"}
 _MLIR_SHAPES = "shard_local"
 
 Sharding = list[str | list[str] | None]
+
+# Files outside the serving contract: the runtime reads nothing here unless a
+# debug mode asks for it, and the validator does not check it.
+ASSETS_EXTRA_DIR = "assets.extra"
+# Debug-tap modules and their manifest (`export(debug_taps=...)`).
+DEBUG_TAPS_DIR = f"{ASSETS_EXTRA_DIR}/debug"
+DEBUG_TAPS_MANIFEST = "taps.json"
+
+
+@dataclasses.dataclass
+class _DebugTaps:
+    """Modules whose outputs the debug variants of `forward` and `mtp_draft`
+    return, and the manifest entries those variants add."""
+
+    forward: dict[str, Any]
+    mtp_draft: dict[str, Any]
+    output_dir: str
+    functions: dict[str, dict[str, Any]] = dataclasses.field(default_factory=dict)
+
+    def write(
+        self, function: str, bucket: int, mlir: str, names: Sequence[str], base: int
+    ) -> None:
+        """Writes `function`'s debug module for `bucket` and its manifest entry:
+        results from `base` on are the taps `names`."""
+        file = f"{function}_debug_bucket{bucket}.mlir"
+        os.makedirs(os.path.join(self.output_dir, DEBUG_TAPS_DIR), exist_ok=True)
+        with open(os.path.join(self.output_dir, DEBUG_TAPS_DIR, file), "w") as f:
+            f.write(mlir)
+        _, outs = validator.parse_mlir_main_signature(mlir)
+        self.functions.setdefault(function, {})[str(bucket)] = {
+            "file_path": f"{DEBUG_TAPS_DIR}/{file}",
+            "num_outputs": base,
+            "taps": [
+                {
+                    "name": name,
+                    "output_index": base + i,
+                    "shape": [int(d) for d in outs[base + i]["shape"]],
+                    "dtype": tpu_lowering.dtype_name(outs[base + i]["dtype"]),
+                }
+                for i, name in enumerate(names)
+            ],
+        }
+
+
+def _debug_tap_modules(
+    model: api.ExportableTextOnlyLLM, patterns: Sequence[str]
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """The target's and the MTP draft's modules matching the glob `patterns`.
+
+    Target modules are named as in the wrapped model's `named_modules()`; the
+    draft's as in the checkpoint, `mtp.` for its `model.`.
+    """
+    from vllm_torchtpu.experimental.export import universal_adapter
+
+    # The wrapped `nn.Module`; a model that wraps none is one itself.
+    target: Any = getattr(model, "model", model)
+    draft = getattr(target, universal_adapter.MTP_DRAFT_ATTR, None)
+    named = {n: m for n, m in target.named_modules() if n}
+    draft_named = (
+        {"mtp." + n.removeprefix("model."): m for n, m in draft.named_modules() if n}
+        if draft is not None
+        else {}
+    )
+    forward: dict[str, Any] = {}
+    mtp: dict[str, Any] = {}
+    for pattern in patterns:
+        hits = {n: m for n, m in named.items() if fnmatch.fnmatchcase(n, pattern)}
+        draft_hits = {
+            n: m for n, m in draft_named.items() if fnmatch.fnmatchcase(n, pattern)
+        }
+        if not hits and not draft_hits:
+            sample = ", ".join(list(named)[:8] + list(draft_named)[:4])
+            raise ValueError(
+                f"debug tap {pattern!r} matches no module; modules are named like "
+                f"{sample}"
+            )
+        forward.update(hits)
+        mtp.update(draft_hits)
+    return forward, mtp
 
 
 def _xla_option_overrides() -> dict[str, bool | int | float | str]:
@@ -253,8 +336,16 @@ def _io_entry(
     return entry
 
 
+def _req_dist_len(model: api.ExportableTextOnlyLLM) -> int:
+    """Elements of `req_dist`: 3 for the attention kernel, and 3 more for the
+    recurrent kernels of a speculating recurrent model, whose windowed segment
+    also takes the verify windows that attention runs as mixed sequences."""
+    recurrent = any(n == "mamba_state_indices" for n, _ in _extra_user_inputs(model))
+    return 6 if recurrent and model.export_config.recurrent_window > 1 else 3
+
+
 def _user_inputs(
-    cfg: api.TextOnlyLLMExportConfig, bucket_size: int
+    cfg: api.TextOnlyLLMExportConfig, bucket_size: int, req_dist_len: int = 3
 ) -> list[tuple[str, tuple[int, ...]]]:
     """Returns `(name, shape)` of the int32 user inputs of `forward_bucket{B}`."""
     pos_shape = (
@@ -266,7 +357,7 @@ def _user_inputs(
         (cfg.max_num_seqs,),
         (cfg.max_num_pages,),
         (cfg.max_cu_seqs,),
-        (3,),
+        (req_dist_len,),
     )
     return list(zip(_USER_INPUT_NAMES, shapes, strict=True))
 
@@ -437,7 +528,8 @@ def _recurrent_serving_config(model: api.ExportableTextOnlyLLM) -> dict[str, int
     cfg = model.export_config
     if cfg.num_state_slots == cfg.num_blocks:
         raise ValueError(
-            f"num_blocks ({cfg.num_blocks}) equals num_state_slots (max_num_seqs + 1), "
+            f"num_blocks ({cfg.num_blocks}) equals num_state_slots "
+            f"(max_num_seqs x {cfg.recurrent_window} + 1), "
             "so the runtime could not tell KV pools from recurrent state pools; pass "
             "another --num-blocks"
         )
@@ -474,7 +566,7 @@ def _params_read_by_forward(
     bucket = min(cfg.token_buckets)
     mlir_text = tpu_lowering.lower_torch_forward_to_mlir(
         model,
-        user_inputs=_user_inputs(cfg, bucket),
+        user_inputs=_user_inputs(cfg, bucket, _req_dist_len(model)),
         forward_names=names,
         params_map=_norm_params(params_map),
         state_specs=_state_specs(model),
@@ -486,6 +578,72 @@ def _params_read_by_forward(
     return {n: s for n, s in params_map.items() if n == lm_head_name or n in kept}
 
 
+def _mtp_requested(cfg: api.TextOnlyLLMExportConfig) -> bool:
+    """Whether the artifact declares MTP drafting (`speculative_config`)."""
+    return bool(cfg.speculative_config) and (
+        cfg.speculative_config.get("method") == "mtp"
+    )
+
+
+# A model that drafts with MTP lists the MTP layer's own weights among its
+# `abstract_params`, named as in the checkpoint.
+_MTP_PARAM_PREFIX = "mtp."
+
+
+def _mtp_user_inputs(
+    model: api.ExportableTextOnlyLLM, bucket_size: int
+) -> list[tuple[str, tuple[int, ...]]]:
+    """`(name, shape)` of the int32 user inputs of `mtp_draft_bucket{B}`."""
+    cfg = model.export_config
+    return [
+        *_user_inputs(cfg, bucket_size, _req_dist_len(model)),
+        (_MTP_LAST_TOKEN_INDICES, (cfg.max_num_seqs,)),
+    ]
+
+
+@trace("export.mtp_params")
+def _mtp_params(
+    model: api.ExportableTextOnlyLLM, params: Mapping[str, Any]
+) -> tuple[dict[str, Any], list[str]]:
+    """The MTP layer's own weights, and every weight `mtp_draft` reads, in order.
+
+    The own weights are the `mtp.` ones of `params`, the model's
+    `abstract_params`. The target weights `mtp_draft` shares (embedding, LM
+    head) are read off its graph: the smallest bucket is lowered once with every
+    candidate, as for the forward. A shared weight binds the target's slot, so
+    the artifact stores it once.
+    """
+    for method in ("mtp_abstract_states", "mtp_draft"):
+        if not callable(getattr(model, method, None)):
+            raise ValueError(
+                f"speculative_config method 'mtp' needs a model with {method}()"
+            )
+    own = {n: s for n, s in params.items() if n.startswith(_MTP_PARAM_PREFIX)}
+    if not own:
+        raise ValueError(
+            "speculative_config method 'mtp' needs the MTP layer's weights among "
+            "abstract_params(), but it has no 'mtp.' parameters"
+        )
+    cfg = model.export_config
+    bucket = min(cfg.token_buckets)
+    user_inputs = _mtp_user_inputs(model, bucket)
+    names = [n for n in params if n not in own] + list(own)
+    mlir_text = tpu_lowering.lower_torch_mtp_draft_to_mlir(
+        model,
+        user_inputs=user_inputs,
+        weight_names=names,
+        params_map=_norm_params(params),
+        state_specs=list(model.mtp_abstract_states()),  # type: ignore[attr-defined]
+        hidden_states=api.ShapeDtypeStruct(
+            (bucket, cfg.hidden_size), tpu_lowering.dtype_name(cfg.dtype)
+        ),
+        bucket_size=bucket,
+    )
+    read = _main_args_read(mlir_text)
+    names = [n for i, n in enumerate(names) if len(user_inputs) + i in read]
+    return {n: own[n] for n in names if n in own}, names
+
+
 def _export_text_only_llm_functions(
     model: api.ExportableTextOnlyLLM,
     params_map: Mapping[str, Any],
@@ -495,8 +653,13 @@ def _export_text_only_llm_functions(
     *,
     constants: frozenset[str] = frozenset(),
     subdir: str = "subgraphs",
+    mtp_weight_names: Sequence[str] = (),
+    mtp_own: frozenset[str] = frozenset(),
+    debug_taps: _DebugTaps | None = None,
 ) -> dict[str, dict[str, Any]]:
-    """Lowers `forward`, `compute_logits`, and the samplers across all buckets."""
+    """Lowers `forward`, `compute_logits`, the samplers and, with MTP drafting,
+    `mtp_draft` across all buckets, plus `debug_taps`' variants of `forward`
+    and `mtp_draft` for the smallest bucket."""
     cfg: api.TextOnlyLLMExportConfig = model.export_config
     act_dtype_str = tpu_lowering.dtype_name(cfg.dtype)
     tp_size = cfg.tensor_parallel_size
@@ -506,7 +669,9 @@ def _export_text_only_llm_functions(
     os.makedirs(target_dir, exist_ok=True)
 
     lm_head_name = _lm_head_name(params_map)
-    forward_names = [n for n in params_map if n != lm_head_name] or list(params_map)
+    forward_names = [
+        n for n in params_map if n != lm_head_name and n not in mtp_own
+    ] or list(params_map)
     lm_head_spec = params_map[lm_head_name]
     lm_head_entry = _weight_input_entry(
         lm_head_name,
@@ -535,7 +700,7 @@ def _export_text_only_llm_functions(
 
     forward_variants: dict[str, Any] = {}
     for b_idx, bucket_size in enumerate(cfg.token_buckets):
-        user_inputs = _user_inputs(cfg, bucket_size)
+        user_inputs = _user_inputs(cfg, bucket_size, _req_dist_len(model))
         fwd_mlir = tpu_lowering.lower_torch_forward_to_mlir(
             model,
             user_inputs=user_inputs,
@@ -550,6 +715,23 @@ def _export_text_only_llm_functions(
         fwd_rel = f"{subdir}/{fwd_file}" if subdir else fwd_file
         with open(os.path.join(target_dir, fwd_file), "w") as f:
             f.write(fwd_mlir)
+        if debug_taps is not None and debug_taps.forward and b_idx == 0:
+            tap_names: list[str] = []
+            debug_mlir = tpu_lowering.lower_torch_forward_to_mlir(
+                model,
+                user_inputs=user_inputs,
+                forward_names=forward_names,
+                params_map=lowered,
+                state_specs=state_specs,
+                bucket_size=bucket_size,
+                weight_reshapes=reshapes,
+                trailing_user_inputs=extra_inputs,
+                taps=debug_taps.forward,
+                tap_names=tap_names,
+            )
+            debug_taps.write(
+                "forward", bucket_size, debug_mlir, tap_names, len(state_specs) + 1
+            )
 
         fwd_inputs: list[dict[str, Any]] = [
             _io_entry(
@@ -706,11 +888,183 @@ def _export_text_only_llm_functions(
         for function, variant in samplers.items():
             sampler_variants.setdefault(function, {})[str(req_size)] = variant
 
-    return {
+    functions: dict[str, dict[str, Any]] = {
         "forward": forward_variants,
         "compute_logits": logits_variants,
         **sampler_variants,
     }
+    if mtp_weight_names:
+        functions["mtp_draft"] = _export_mtp_draft(
+            model,
+            params_map,
+            layouts,
+            weight_slots,
+            target_dir,
+            subdir,
+            mtp_weight_names=mtp_weight_names,
+            first_state_index=len(state_entries),
+            constants=constants,
+            debug_taps=debug_taps,
+        )
+    return functions
+
+
+def _export_mtp_draft(
+    model: api.ExportableTextOnlyLLM,
+    params_map: Mapping[str, Any],
+    layouts: Mapping[str, _TensorLayout],
+    weight_slots: Mapping[str, int],
+    target_dir: str,
+    subdir: str,
+    *,
+    mtp_weight_names: Sequence[str],
+    first_state_index: int,
+    constants: frozenset[str],
+    debug_taps: _DebugTaps | None = None,
+) -> dict[str, Any]:
+    """Lowers `mtp_draft_bucket{B}` for every forward bucket, and `debug_taps`'
+    variant for the smallest.
+
+    Inputs: the forward's user inputs with `input_ids` shifted by one token,
+    `last_token_indices`, the weights `mtp_draft` reads (shared ones bound to
+    the target's slots), the MTP layer's paged KV (states numbered after the
+    target's, each donated) and the forward's `hidden_states` intermediate.
+    Outputs: the updated states and `draft_tokens` `[max_num_seqs, k]`.
+    """
+    cfg: api.TextOnlyLLMExportConfig = model.export_config
+    act_dtype_str = tpu_lowering.dtype_name(cfg.dtype)
+    axis_sizes = _axis_sizes(cfg)
+    k = int(cfg.speculative_config["num_speculative_tokens"])  # type: ignore[index]
+    state_specs = list(model.mtp_abstract_states())  # type: ignore[attr-defined]
+    state_entries = []
+    for spec in state_specs:
+        sharding = (
+            _state_sharding(spec.shape, cfg.tensor_parallel_size)
+            if spec.sharding is None
+            else list(spec.sharding)
+        )
+        state_entries.append(
+            (_global_shape(spec.shape, sharding, axis_sizes), sharding, spec.dtype)
+        )
+    lowered = _lowered_params(params_map, layouts)
+    reshapes = _weight_reshapes(layouts)
+
+    variants: dict[str, Any] = {}
+    for b_idx, bucket_size in enumerate(cfg.token_buckets):
+        user_inputs = _mtp_user_inputs(model, bucket_size)
+        hidden = api.ShapeDtypeStruct((bucket_size, cfg.hidden_size), act_dtype_str)
+        mlir = tpu_lowering.lower_torch_mtp_draft_to_mlir(
+            model,
+            user_inputs=user_inputs,
+            weight_names=mtp_weight_names,
+            params_map=lowered,
+            state_specs=state_specs,
+            hidden_states=hidden,
+            bucket_size=bucket_size,
+            weight_reshapes=reshapes,
+        )
+        file = f"mtp_draft_bucket{bucket_size}.mlir"
+        rel = f"{subdir}/{file}" if subdir else file
+        with open(os.path.join(target_dir, file), "w") as f:
+            f.write(mlir)
+        if debug_taps is not None and debug_taps.mtp_draft and b_idx == 0:
+            tap_names: list[str] = []
+            debug_mlir = tpu_lowering.lower_torch_mtp_draft_to_mlir(
+                model,
+                user_inputs=user_inputs,
+                weight_names=mtp_weight_names,
+                params_map=lowered,
+                state_specs=state_specs,
+                hidden_states=hidden,
+                bucket_size=bucket_size,
+                weight_reshapes=reshapes,
+                taps=debug_taps.mtp_draft,
+                tap_names=tap_names,
+            )
+            debug_taps.write(
+                "mtp_draft", bucket_size, debug_mlir, tap_names, len(state_specs) + 1
+            )
+
+        inputs: list[dict[str, Any]] = [
+            _io_entry(
+                arg_index=i,
+                index=i,
+                name=name,
+                shape=shape,
+                dtype="i32",
+                argument_type="user_io",
+            )
+            for i, (name, shape) in enumerate(user_inputs)
+        ]
+        weight_start = len(user_inputs)
+        for w_i, w_name in enumerate(mtp_weight_names):
+            inputs.append(
+                _weight_input_entry(
+                    w_name,
+                    params_map[w_name],
+                    layouts[w_name],
+                    arg_index=weight_start + w_i,
+                    slot=weight_slots[w_name],
+                    buffer_donor=False,
+                    constant=w_name in constants,
+                )
+            )
+        state_start = weight_start + len(mtp_weight_names)
+        for s_i, (s_shape, s_sharding, s_dtype) in enumerate(state_entries):
+            inputs.append(
+                _io_entry(
+                    arg_index=state_start + s_i,
+                    index=first_state_index + s_i,
+                    name=f"mtp_kv_cache_layer_{s_i}",
+                    shape=s_shape,
+                    dtype=s_dtype,
+                    argument_type="state",
+                    sharding=s_sharding,
+                    buffer_donor=True,
+                )
+            )
+        inputs.append(
+            _io_entry(
+                arg_index=state_start + len(state_entries),
+                index=0,
+                name="hidden_states",
+                shape=[bucket_size, cfg.hidden_size],
+                dtype=act_dtype_str,
+                argument_type="intermediate",
+            )
+        )
+        outputs: list[dict[str, Any]] = [
+            _io_entry(
+                arg_index=s_i,
+                index=first_state_index + s_i,
+                name=f"mtp_kv_cache_out_layer_{s_i}",
+                shape=s_shape,
+                dtype=s_dtype,
+                argument_type="state",
+                sharding=s_sharding,
+                is_input=False,
+            )
+            for s_i, (s_shape, s_sharding, s_dtype) in enumerate(state_entries)
+        ]
+        outputs.append(
+            _io_entry(
+                arg_index=len(state_entries),
+                index=0,
+                name="draft_tokens",
+                shape=[cfg.max_num_seqs, k],
+                dtype="i32",
+                argument_type="user_io",
+                is_input=False,
+            )
+        )
+        variants[str(bucket_size)] = {
+            "file_path": rel,
+            "subgraph_index": b_idx,
+            "compile_size": bucket_size,
+            "inputs": inputs,
+            "outputs": outputs,
+        }
+    return variants
 
 
 def _emit_model_companion_files(
@@ -811,6 +1165,7 @@ def export(
     output_dir: str,
     *,
     subdir: str = "subgraphs",
+    debug_taps: Sequence[str] = (),
 ) -> None:
     """Exports an `ExportableTextOnlyLLM` to a serving artifact directory.
 
@@ -818,6 +1173,10 @@ def export(
         model: The model to export.
         output_dir: Artifact directory; created if missing.
         subdir: Subdirectory of `output_dir` for `.mlir` files (default `'subgraphs'`).
+        debug_taps: Glob patterns of module names. For the smallest token bucket,
+            `forward` and `mtp_draft` are also exported with the matching
+            modules' outputs as extra results, under `assets.extra/debug/` with a
+            `taps.json` manifest; the serving artifact itself is unchanged.
     """
     if not isinstance(model, api.ExportableTextOnlyLLM):
         raise TypeError(
@@ -832,10 +1191,43 @@ def export(
             f"got {type(cfg).__name__}"
         )
 
+    taps = None
+    if debug_taps:
+        forward_taps, mtp_taps = _debug_tap_modules(model, debug_taps)
+        taps = _DebugTaps(forward_taps, mtp_taps, output_dir)
+
     tp_size = cfg.tensor_parallel_size
     dp_size = int(getattr(cfg, "data_parallel_size", 1) or 1)
     pp_size = int(getattr(cfg, "pipeline_parallel_size", 1) or 1)
-    params_map = _params_read_by_forward(model, model.abstract_params())
+    all_params = model.abstract_params()
+    if cfg.speculative_config:
+        # Verify rows are some of a step's tokens.
+        k = int(cfg.speculative_config["num_speculative_tokens"])
+        rows = min(cfg.max_num_seqs * (k + 1), max(cfg.token_buckets))
+        if max(cfg.req_buckets) < rows:
+            raise ValueError(
+                f"the largest request bucket ({max(cfg.req_buckets)}) is below the "
+                f"{rows} LM-head rows a speculative step can take (max_num_seqs x "
+                "(num_speculative_tokens + 1), within the largest token bucket); "
+                "pass larger --req-buckets"
+            )
+    mtp_requested = _mtp_requested(cfg)
+    params_map = _params_read_by_forward(
+        model,
+        {
+            n: s
+            for n, s in all_params.items()
+            if not (mtp_requested and n.startswith(_MTP_PARAM_PREFIX))
+        },
+    )
+    mtp_own: dict[str, Any] = {}
+    mtp_weight_names: list[str] = []
+    if mtp_requested:
+        mtp_own, mtp_weight_names = _mtp_params(model, all_params)
+        # Every weight mtp_draft reads needs a slot, a shared one the forward
+        # does not read included.
+        for name in mtp_weight_names:
+            params_map.setdefault(name, all_params[name])
     constant_names_fn = getattr(model, "constant_names", None)
     constants = frozenset(
         constant_names_fn() if callable(constant_names_fn) else ()
@@ -862,8 +1254,27 @@ def export(
         output_dir,
         constants=constants,
         subdir=subdir,
+        mtp_weight_names=mtp_weight_names,
+        mtp_own=frozenset(mtp_own),
+        debug_taps=taps,
     )
     functions_dict.update(llm_funcs)
+    if taps is not None:
+        # Each debug variant takes its serving variant's inputs
+        # (`metadata.json` `functions.<function>.<bucket>.inputs`).
+        os.makedirs(os.path.join(output_dir, DEBUG_TAPS_DIR), exist_ok=True)
+        with open(
+            os.path.join(output_dir, DEBUG_TAPS_DIR, DEBUG_TAPS_MANIFEST), "w"
+        ) as f:
+            json.dump(
+                {
+                    "format_version": 1,
+                    "mlir_shapes": _MLIR_SHAPES,
+                    "functions": taps.functions,
+                },
+                f,
+                indent=2,
+            )
     # `serving_config` holds only what the runtime reads: the capacities the
     # executables were exported with, then the companion files. Token buckets are
     # the `functions.forward` variants and are not repeated here.

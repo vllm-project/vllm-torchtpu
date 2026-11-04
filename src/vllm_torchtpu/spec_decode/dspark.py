@@ -33,13 +33,25 @@ Gumbel-coupled sampling is not implemented.
 
 from __future__ import annotations
 
+from typing import NamedTuple
+
 import torch
 from vllm.config import VllmConfig
 
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.spec_decode.dflash import DFlashProposer
+from vllm_torchtpu.spec_decode.utils import DraftChunkInputs
 
 logger = init_logger(__name__)
+
+
+class DraftConfidences(NamedTuple):
+    """One proposal's per-chunk ``[rows, K]`` acceptance confidences at the
+    chunk's bucketed rows, and each chunk's ``(start_index, num_reqs)`` span
+    of the input batch."""
+
+    chunks: list[torch.Tensor]
+    spans: list[tuple[int, int]]
 
 
 class DSparkProposer(DFlashProposer):
@@ -71,6 +83,10 @@ class DSparkProposer(DFlashProposer):
                 spec.enable_adaptive_verification,
                 spec.dspark_draft_topk,
             )
+        # Whether the compiled draft step scores its drafts; it traces against
+        # this, and nothing turns it on until a caller takes the confidences.
+        self.use_confidence_head = False
+        self._draft_confidences: DraftConfidences | None = None
         # The query block follows K, not the block length the checkpoint was
         # trained at; upstream vLLM likewise only enforces K == block for
         # Qwen3-Omni DSpark. The checkpoint's block is a query-block length in
@@ -121,6 +137,23 @@ class DSparkProposer(DFlashProposer):
                     "Qwen3DSpark/Gemma4DSpark-family model."
                 )
 
+    def _observe_draft_aux(
+        self, aux: torch.Tensor, chunk_index: int, chunk: DraftChunkInputs
+    ) -> None:
+        if not self.use_confidence_head:
+            return
+        if chunk_index == 0:
+            self._draft_confidences = DraftConfidences([], [])
+        confidences = self._draft_confidences
+        assert confidences is not None
+        confidences.chunks.append(aux)
+        confidences.spans.append((chunk.start_index, chunk.num_reqs))
+
+    def take_draft_confidences(self) -> DraftConfidences | None:
+        """The last proposal's confidences; None once taken."""
+        confidences, self._draft_confidences = self._draft_confidences, None
+        return confidences
+
     @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
     def _dflash_forward_and_sample(
         self,
@@ -136,6 +169,11 @@ class DSparkProposer(DFlashProposer):
         the K mask slots (1..block_size-1) are sampled. Either way the Markov
         chain seeds from the anchor input id and runs a static K-iteration
         loop: embedding gather + rank-r bias + argmax.
+
+        With ``use_confidence_head`` the second output is each sampled slot's
+        acceptance confidence ``[padded_num_reqs, K]`` instead of the hidden
+        states. A slot's confidence reads its hidden state and the previous
+        token, never the token it drafts.
         """
         assert self.draft_model is not None
         hidden = self.draft_model.model(
@@ -156,14 +194,26 @@ class DSparkProposer(DFlashProposer):
         )
         prev = ids_3d[:, 0]
         draft_tokens = []
+        markov_embeds = []
         sample_start = 0 if self.sample_from_anchor else 1
         for i in range(sample_start, block_size):
-            bias = self.draft_model.markov_bias(self.draft_model.markov_embed(prev))
+            markov_embed = self.draft_model.markov_embed(prev)
+            bias = self.draft_model.markov_bias(markov_embed)
             step = self.draft_model.map_draft_to_target(
                 (logits_3d[:, i] + bias).argmax(dim=-1)
             )
             draft_tokens.append(step)
+            markov_embeds.append(markov_embed)
             prev = step
         draft_tokens_chunk = torch.stack(draft_tokens, dim=1)
 
-        return draft_tokens_chunk, hidden
+        if not self.use_confidence_head:
+            return draft_tokens_chunk, hidden
+        sampled_hidden = valid_hidden.view(padded_num_reqs, block_size, -1)[
+            :, sample_start:
+        ]
+        confidence = self.draft_model.compute_confidence(
+            sampled_hidden.flatten(0, 1),
+            torch.stack(markov_embeds, dim=1).flatten(0, 1),
+        )
+        return draft_tokens_chunk, confidence.view(padded_num_reqs, -1)

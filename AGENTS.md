@@ -2,6 +2,9 @@
 
 ## Repository standards
 
+Every change must follow these documents. Reviewers, including the review bot,
+check PRs against them.
+
 - `docs/developers_guide/coding_guidance.md` (R-1.x through R-8.x coding style
   and hygiene)
 - `docs/developers_guide/optimization_best_practices.md` (TPU performance and
