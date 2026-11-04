@@ -330,9 +330,13 @@ def test_spec_decode_metadata_deferred_draft_token_ids(device):
             nd, cu, 4
         )
         assert ref.deferred_draft_token_ids_cpu is None
-        uploaded = md.upload_deferred_draft_token_ids(device)
+        staged_before = len(manager.runner._unfenced_h2d_sources)
+        uploaded = md.upload_deferred_draft_token_ids(manager.runner)
         assert uploaded.device.type == device.type
         assert torch.equal(uploaded.cpu(), ref.draft_token_ids.cpu())
+        # The runner holds the host drafts until a staging fence covers them.
+        ((host, _),) = manager.runner._unfenced_h2d_sources[staged_before:]
+        assert np.shares_memory(host.numpy(), md.deferred_draft_token_ids_cpu)
 
 
 @pytest.mark.tpu_test

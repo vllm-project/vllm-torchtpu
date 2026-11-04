@@ -56,6 +56,7 @@ from vllm_torchtpu.layers.core.attention_metadata import (
     stage_h2d_upload,
     zeros_h2d_source,
 )
+from vllm_torchtpu.layers.core.sequence_layout import DEFAULT_SEQUENCE_LAYOUT_DESCRIPTOR
 from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
 from vllm_torchtpu.runner import tpu_runner
 from vllm_torchtpu.runner import utils as runner_utils_module
@@ -2648,9 +2649,6 @@ class TestInputStagingFence:
             monkeypatch.setattr(
                 tpu_runner, name, lambda *a, **kw: contextlib.nullcontext()
             )
-        from vllm_torchtpu.layers.core.sequence_layout import (
-            DEFAULT_SEQUENCE_LAYOUT_DESCRIPTOR,
-        )
 
         def forward_model(**kw):
             # The fence must already cover this run's uploads.

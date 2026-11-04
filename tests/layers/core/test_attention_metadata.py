@@ -673,6 +673,50 @@ class TestAttentionMetadataBuilderPlumbing:
         assert source.call_count == calls + 2
 
     @patch.dict(os.environ, {"VLLM_TPU_BLOCK_TABLE_UPLOAD_REUSE": "1"})
+    def test_content_reuse_returns_the_packed_buffer_to_the_pool(self):
+        """A walk whose re-packed tables equal the previous upload reuses that
+        upload; the pooled buffer it packed into is never uploaded, so it must
+        go back on the free list instead of leaking a registered id."""
+        from vllm_torchtpu.layers.core import attention_metadata as am
+
+        runner = self._make_runner_mock(num_groups=1)
+        builder = self._make_builder(runner, kv_cache_group_id=0)
+        self._make_attn_groups(runner, [builder])
+
+        def walk():
+            c = AttentionMetadataBuilderContext(
+                num_reqs=2,
+                start_index=0,
+                use_max_model_len=True,
+                seq_lens=torch.ones((4,), dtype=torch.int32),
+                query_start_loc=torch.arange(5, dtype=torch.int32),
+                request_distribution=torch.tensor([2, 2, 2], dtype=torch.int32),
+            )
+            runner._attn_metadata_builder_ctx = c
+            stage_block_table_uploads(runner, c, 4)
+            return c
+
+        key = (4 * 4, torch.int32)
+        first = walk()
+        assert len(runner._unfenced_h2d_sources) == 1
+        uploaded = runner._unfenced_h2d_sources[0][0]
+
+        # A version bump with unchanged contents re-packs, then reuses.
+        am._BLOCK_TABLE_VERSION[0] += 1
+        second = walk()
+        assert torch.equal(second.staged_block_tables[0], first.staged_block_tables[0])
+        assert len(runner._unfenced_h2d_sources) == 1  # no second upload
+        (packed,) = runner._free_h2d_sources[key]
+        assert packed is not uploaded
+        assert id(packed) in runner._registered_h2d_sources
+
+        # The next reused walk packs into that same buffer again.
+        am._BLOCK_TABLE_VERSION[0] += 1
+        walk()
+        assert runner._free_h2d_sources[key] == [packed]
+        assert runner._registered_h2d_sources == {id(uploaded), id(packed)}
+
+    @patch.dict(os.environ, {"VLLM_TPU_BLOCK_TABLE_UPLOAD_REUSE": "1"})
     def test_reused_upload_reuses_tables_and_rederives_mamba_indices(self):
         """A reused upload keeps the previous walk's table outputs but must
         re-derive the mamba indices from the new seq_lens."""

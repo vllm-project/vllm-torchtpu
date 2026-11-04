@@ -327,6 +327,26 @@ def _noop_release() -> None:
     pass
 
 
+def _recycle_h2d_source(runner: Any, host: torch.Tensor) -> None:
+    """Put a registered `zeros_h2d_source` buffer back on the free list."""
+    key = (host.numel(), host.dtype)
+    free = runner._free_h2d_sources.pop(key, None)
+    if free is None:
+        free = []
+    free.append(host)
+    runner._free_h2d_sources[key] = free
+
+
+def release_unstaged_h2d_source(runner: Any, host: torch.Tensor) -> None:
+    """Return a `zeros_h2d_source` buffer that was filled but never uploaded.
+
+    No transfer reads it, so it goes back on the free list right away instead
+    of waiting for a fence. Unregistered buffers are simply dropped.
+    """
+    if id(host) in runner._registered_h2d_sources:
+        _recycle_h2d_source(runner, host)
+
+
 def stage_h2d_upload(runner: Any, host: torch.Tensor) -> torch.Tensor:
     """`host.to(runner.device, non_blocking=True)`, keeping `host` alive until
     the runner's next input-staging fence has been synchronized.
@@ -343,14 +363,9 @@ def stage_h2d_upload(runner: Any, host: torch.Tensor) -> torch.Tensor:
     assert host.is_contiguous()
     recycle = id(host) in runner._registered_h2d_sources
     if recycle:
-        key = (host.numel(), host.dtype)
 
         def release_cb() -> None:
-            free = runner._free_h2d_sources.pop(key, None)
-            if free is None:
-                free = []
-            free.append(host)
-            runner._free_h2d_sources[key] = free
+            _recycle_h2d_source(runner, host)
     else:
         release_cb = _noop_release
     runner._unfenced_h2d_sources.append((host, release_cb))
@@ -791,13 +806,19 @@ def _pack_and_upload(runner, ctx, entries, num_reqs_padded, table_geom, stage_ke
         and prev[0] == table_geom
         and torch.equal(prev[1], flat)
     ):
+        reused = True
         staged_dev = prev[2]
     else:
+        reused = False
         staged_dev = stage_h2d_upload(runner, flat)
     if envs.VLLM_TPU_BLOCK_TABLE_UPLOAD_REUSE:
         # Dummy runs (zero-filled) never key a reuse.
         key = stage_key if ctx.position_ids_override is None else None
         runner._block_table_stage_prev = (table_geom, flat.clone(), staged_dev, key)
+    if reused:
+        # Nothing uploads `flat`: return it to the pool now rather than leak
+        # a registered buffer on every reused walk.
+        release_unstaged_h2d_source(runner, flat)
     return staged_dev
 
 

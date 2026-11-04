@@ -50,10 +50,15 @@ class SpecDecodeMetadata:
     # uploads this only for a chunk with nothing substituted.
     deferred_draft_token_ids_cpu: np.ndarray | None = None
 
-    def upload_deferred_draft_token_ids(self, device: torch.device) -> torch.Tensor:
+    def upload_deferred_draft_token_ids(self, runner: TPUModelRunner) -> torch.Tensor:
+        """Upload the deferred host drafts through `stage_h2d_upload`.
+
+        The runner then owns the host array until a staging fence covers the
+        copy, independent of how long this metadata object stays alive.
+        """
         assert self.deferred_draft_token_ids_cpu is not None
-        return torch.from_numpy(self.deferred_draft_token_ids_cpu).to(
-            device, non_blocking=True
+        return stage_h2d_upload(
+            runner, torch.from_numpy(self.deferred_draft_token_ids_cpu)
         )
 
 

@@ -4039,7 +4039,7 @@ class TPUModelRunner(GPUModelRunner):
             ):
                 # Nothing substituted this chunk, so the host drafts are real.
                 spec_decode_metadata.draft_token_ids = (
-                    spec_decode_metadata.upload_deferred_draft_token_ids(self.device)
+                    spec_decode_metadata.upload_deferred_draft_token_ids(self)
                 )
             draft_input_ids_src = input_ids
 
