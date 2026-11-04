@@ -99,7 +99,7 @@ def test_toy_plugin_serves_through_try_forward(
     runner._megakernel = drv
     drv.bind_and_warmup(runner)
     assert prog.events == ["load", "bind", ("buckets", (16, 32, 64))]
-    # H2: the program hook runs from the worker's on_warmup_done, once per bind.
+    # The program hook runs from the worker's on_warmup_done, once per bind.
     drv.on_warmup_done(runner)
     drv.on_warmup_done(runner)
     assert prog.events[-1] == "warm" and prog.events.count("warm") == 1
@@ -202,7 +202,7 @@ def test_pre_agreement_failures_vote_before_raising(
     toy: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Every rank-local failure from the plugin import to the mesh joins
-    agreement #1 as create_error (token 0 before the fingerprint exists), so
+    the startup agreement as create_error (token 0 before the fingerprint exists), so
     the peers decline instead of waiting."""
     from vllm_torchtpu.megakernel_runtime.errors import MegakernelPluginError
 
@@ -711,7 +711,7 @@ def _record_agreements(monkeypatch: pytest.MonkeyPatch) -> tuple[Any, list[Any]]
 def test_agreements_run_over_the_declared_domain_group(
     toy: Path, monkeypatch: pytest.MonkeyPatch, options: dict[str, Any]
 ) -> None:
-    """Agreement #1 and the bind agreement (serving or declined driver) use
+    """The startup and bind agreements (serving or declined driver) use
     the group `agreement_group` resolves for the spec's domain."""
     group, log = _record_agreements(monkeypatch)
     runner = _runner(options)

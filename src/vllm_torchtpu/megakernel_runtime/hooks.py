@@ -53,10 +53,10 @@ class StepContext:
 def suppressed(runner: Any) -> Iterator[None]:
     """Force the stock model forward for every step of `runner` in this scope.
 
-    The runner wraps its dummy / precompile / profile forwards in this, so
-    every stock graph those runs compile is compiled at startup even when the
-    megakernel could have served the bucket. Nests; `runner` may be any object
-    that accepts attributes.
+    Callers (such as a model runner's dummy / precompile / profile forwards)
+    can wrap forwards in this scope so every stock graph those runs compile is
+    compiled at startup even when the megakernel could have served the
+    bucket. Nests; `runner` may be any object that accepts attributes.
     """
     depth = _suppress_depth(runner)
     setattr(runner, _SUPPRESS_ATTR, depth + 1)

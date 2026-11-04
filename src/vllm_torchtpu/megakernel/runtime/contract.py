@@ -216,8 +216,8 @@ class MonoProgram(Protocol):
     `ForwardView`. Optional methods (looked up with `getattr`):
     `warmup_session()` (a context manager around warmup),
     `check_compiled_ir(debug, bucket)`, `attach_draft(drafter)` /
-    `detach_draft()`, `on_warmup_done()` (called once per bind from the
-    runtime's H2 `on_warmup_done(runner)`, after the worker's whole warmup).
+    `detach_draft()`, `on_warmup_done()` (called once per bind, after the
+    worker finishes its whole warmup).
     `decide` may return `None` for a step it doesn't see (no metadata): stock,
     not counted in the step mix.
     """

@@ -143,7 +143,8 @@ class _LatencySeries:
 
 
 class MKABCalibrator:
-    """Deterministic per-key MK vs stock alternation and latency accumulator."""
+    """Deterministic per-key megakernel (MK) vs stock alternation and latency
+    accumulator."""
 
     def __init__(
         self, enabled: bool = False, period_s: float = 60.0, cap: int = 4000

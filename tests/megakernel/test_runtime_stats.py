@@ -16,6 +16,8 @@ tracker and the A/B latency calibrator."""
 
 from __future__ import annotations
 
+import json
+
 import numpy as np
 import pytest
 
@@ -114,12 +116,53 @@ def test_step_mix_tracker_and_ab_calibrator() -> None:
     assert run_ok is True
     assert snap is not None and snap[1] == 1 and snap[4] == {"mk_t1_b8": 1}
 
-    ab = MKABCalibrator(enabled=True, period_s=60.0)
+    # A/B: alternate megakernel / stock per key; with `period_s=0` every
+    # record returns `(elapsed_s, window_json, cumulative_json)`.
+    ab = MKABCalibrator(enabled=True, period_s=0.0, cap=3)
     run0, k0, d0 = ab.choose("mk_t1_b8", True)
-    run1, k1, d1 = ab.choose("mk_t1_b8", True)
     assert (run0, k0, d0) == (True, "mk_t1_b8_ab_mk", "mk")
+    res = ab.record(1.0, padded_tokens=8)
+    assert res is not None and res[0] >= 0.0
+    win, cum = json.loads(res[1]), json.loads(res[2])
+    assert win == cum == {"mk_t1_b8_p8": {"mk": [1, 1.0, 1.0, 1.0, 1.0]}}
+    run1, k1, d1 = ab.choose("mk_t1_b8", True)
     assert (run1, k1, d1) == (False, "mk_t1_b8_ab_stock", "stock")
-    ab.record(1.2, padded_tokens=8)
+    res = ab.record(5.0, padded_tokens=8)
+    assert res is not None
+    win, cum = json.loads(res[1]), json.loads(res[2])
+    # The window restarts after each summary; the cumulative store keeps all.
+    assert win == {"mk_t1_b8_p8": {"stock": [1, 5.0, 5.0, 5.0, 5.0]}}
+    assert cum["mk_t1_b8_p8"]["d_mean_ms"] == -4.0
+    for mk_ms, stock_ms in ((2.0, 6.0), (3.0, 7.0), (10.0, 8.0)):
+        for arm, dt in (("mk", mk_ms), ("stock", stock_ms)):
+            assert ab.choose("mk_t1_b8", True)[2] == arm
+            res = ab.record(dt, padded_tokens=8)
+    assert res is not None
+    win, cum = json.loads(res[1]), json.loads(res[2])
+    assert win == {"mk_t1_b8_p8": {"stock": [1, 8.0, 8.0, 8.0, 8.0]}}
+    # 4 samples per arm past `cap=3`: exact count and mean, quantiles over the
+    # ring's last 3 samples ([10, 2, 3] and [8, 6, 7]).
+    assert cum == {
+        "mk_t1_b8_p8": {
+            "mk": [4, 4.0, 2.2, 3.0, 8.6],
+            "stock": [4, 6.5, 6.2, 7.0, 7.8],
+            "d_mean_ms": -2.5,
+            "d_p50_ms": -4.0,
+        }
+    }
+    # Without a padded token count the key has no `_p<N>` suffix.
+    ab.choose("mk_t4_b16", True)
+    res = ab.record(2.0)
+    assert res is not None and "mk_t4_b16" in json.loads(res[2])
+    # A long period returns no summary until it elapses.
+    slow = MKABCalibrator(enabled=True, period_s=3600.0)
+    slow.choose("mk_t1_b8", True)
+    assert slow.record(1.0, padded_tokens=8) is None
+    # Disabled: no alternation, nothing recorded.
+    off = MKABCalibrator(enabled=False, period_s=0.0)
+    assert off.choose("mk_t1_b8", True) == (True, "mk_t1_b8", "mk")
+    assert off.choose("stock_big", False) == (False, "stock_big", "stock")
+    assert off.record(1.0, padded_tokens=8) is None
 
 
 def _reference_batch_shape(

@@ -117,7 +117,7 @@ def agree_on_decline(
     every rank declines with `bucket_set_mismatch`. A rank-local decline while
     the other ranks run the megakernel's collectives would hang the job.
 
-    With `mismatch_code` (startup agreement #1: the token is the plugin
+    With `mismatch_code` (the startup agreement: the token is the plugin
     fingerprint), differing tokens win over votes, since the ranks may not
     even share a vote table, and every rank declines with that code.
     """

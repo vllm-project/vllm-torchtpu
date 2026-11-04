@@ -354,7 +354,8 @@ def _check_create_result(out: Any, ref: Any) -> EligibilityResult | None:
 def _vote_startup_failure(
     token: int, codes: Sequence[str], domain: str, runner: Any
 ) -> None:
-    """Join agreement #1 as `create_error` from a rank that is about to raise."""
+    """Join the startup agreement as `create_error` from a rank that is
+    about to raise."""
     try:
         agree_on_decline(
             EligibilityResult(False, "create_error", "startup failed"),
@@ -430,7 +431,7 @@ class ProgramDriver:
         `DeclinedDriver` when `create`, the mesh or the plugin fingerprint
         agreement declines on any rank. Any rank-local
         failure from the plugin import to the mesh votes `create_error` in
-        agreement #1 before it propagates, so the other ranks decline
+        the startup agreement before it propagates, so the other ranks decline
         instead of waiting for it.
         """
         add_cfg = getattr(
@@ -493,7 +494,8 @@ class ProgramDriver:
         except BaseException:
             _vote_startup_failure(token, codes, domain, runner)
             raise
-        # Agreement #1: the first collective; it also compares fingerprints.
+        # The startup agreement: the first collective; it also compares
+        # fingerprints.
         decline = agree_on_decline(
             decline,
             group=group,
@@ -533,7 +535,7 @@ class ProgramDriver:
         if msg:
             (logger.info if el.level == "info" else logger.warning)("%s", msg)
 
-    # --- bind, agreement #2, warmup (steps 10-13) ---------------------------
+    # --- bind, bind agreement, warmup -------------------------------------
 
     def _compile(self, step: StepFn, bucket: Bucket) -> StepFn:
         if not isinstance(step, types.FunctionType):
@@ -645,9 +647,9 @@ class ProgramDriver:
             self.warmup(runner)
 
     def on_warmup_done(self, runner: Any) -> None:
-        """H2: the worker's warmup is over (after `capture_model`, i.e. after
-        the stock precompile too); calls the program's optional
-        `on_warmup_done()` once per bind."""
+        """The worker's warmup is over (after `capture_model`, i.e. after the
+        stock precompile too); calls the program's optional `on_warmup_done()`
+        once per bind."""
         del runner
         done = getattr(self.program, "on_warmup_done", None)
         if self._bound and not self._warmup_done and callable(done):

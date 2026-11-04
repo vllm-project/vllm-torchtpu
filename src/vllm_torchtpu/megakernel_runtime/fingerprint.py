@@ -189,7 +189,8 @@ def plugin_fingerprint(
 
 
 def agreement_token(fingerprint: str, runtime_src: str) -> int:
-    """Agreement #1 token: 60 bits, so `-token` fits the int64 vote tensor."""
+    """The startup rank-agreement token: 60 bits, so `-token` fits the int64
+    vote tensor."""
     digest = hashlib.sha256((fingerprint + runtime_src).encode("ascii")).hexdigest()
     return int(digest[:15], 16)
 
