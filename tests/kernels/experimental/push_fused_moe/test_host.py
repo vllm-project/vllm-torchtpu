@@ -279,14 +279,19 @@ def test_local_sort_paths_agree(monkeypatch, t_local, e_total, topk, skew):
     rows = np.arange(t_local, dtype=np.float32)[:, None, None] * np.ones((1, 1, 128))
     args = (jnp.asarray(mine.reshape(-1)), jnp.asarray(counts), jnp.asarray(rows))
     results = []
-    for threshold in (t_local, t_local - 1):  # count path, then argsort path
+    # count path, its bf16-count form, then the argsort path
+    for threshold, bf16 in ((t_local, False), (t_local, True), (t_local - 1, False)):
         monkeypatch.setattr(push_host, "ARGSORT_MIN_TOKENS", threshold)
         results.append(
-            push_host.local_sort_activations(*args, e_total=e_total, topk=topk)
+            push_host.local_sort_activations(
+                *args, e_total=e_total, topk=topk, bf16_counts=bf16
+            )
         )
-    (q_count, s_count), (q_sort, s_sort) = results
+    (q_count, s_count), (q_bf16, s_bf16), (q_sort, s_sort) = results
     np.testing.assert_array_equal(np.asarray(q_sort), np.asarray(q_count))
     np.testing.assert_array_equal(np.asarray(s_sort), np.asarray(s_count))
+    np.testing.assert_array_equal(np.asarray(q_bf16), np.asarray(q_count))
+    np.testing.assert_array_equal(np.asarray(s_bf16), np.asarray(s_count))
     want = [t for e in range(e_total) for t in range(t_local) if e in mine[t]]
     np.testing.assert_array_equal(np.asarray(q_sort)[: len(want), 0, 0], want)
 

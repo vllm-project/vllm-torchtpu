@@ -262,6 +262,7 @@ def fused_ep_moe_push(
     interleave_visits=False,
     matmul_scale_repeat=False,
     exchange_row_gather=False,
+    bf16_sort_counts=False,
     expert_slot=None,
     expert_load=None,
 ):
@@ -288,8 +289,10 @@ def fused_ep_moe_push(
     with `_repeat_bits` instead of jnp.repeat, and `exchange_row_gather`
     (with `tc_exchange`) has the routing-exchange kernel also copy the
     expert-sorted activation rows, while it waits on its peers, instead of a
-    TensorCore gather after it. The caller (layers/adapter/fused_moe_ep.py)
-    reads all ten from envs.
+    TensorCore gather after it, and `bf16_sort_counts` finds the
+    expert-sorted token order with two single-pass bf16 matmuls
+    (host._sorted_tokens_by_count). The caller (layers/adapter/fused_moe_ep.py)
+    reads all eleven from envs.
 
     `expert_slot` [experts, R] i32 and `expert_load` [e_total] i32 (both
     replicated, optional) are the expert-layout operands dynamic EPLB
@@ -810,7 +813,11 @@ def fused_ep_moe_push(
             # The sorted rows are copied by the exchange kernel itself.
             with jax.named_scope("moe_early_qsort"):
                 tok, seg_start = local_sort_tokens(
-                    local_blocks.reshape(-1), my_counts, e_total=e_total, topk=topk
+                    local_blocks.reshape(-1),
+                    my_counts,
+                    e_total=e_total,
+                    topk=topk,
+                    bf16_counts=bf16_sort_counts,
                 )
             exchange, q_sorted = build_tc_exchange_all_gather_rows(
                 ep=ep, width=layout[-1], n_rows=tok.shape[0]
@@ -825,7 +832,12 @@ def fused_ep_moe_push(
             exchange = exchange_all_gather(packed, rank_l).reshape(ep, layout[-1])
             with jax.named_scope("moe_early_qsort"):
                 q_sorted, seg_start = local_sort_activations(
-                    local_blocks.reshape(-1), my_counts, q_l, e_total=e_total, topk=topk
+                    local_blocks.reshape(-1),
+                    my_counts,
+                    q_l,
+                    e_total=e_total,
+                    topk=topk,
+                    bf16_counts=bf16_sort_counts,
                 )
         exchange, q_sorted, seg_start = lax.optimization_barrier(
             (exchange, q_sorted, seg_start)
@@ -919,6 +931,7 @@ def fused_ep_moe_push(
         bool(interleave_visits),
         bool(matmul_scale_repeat),
         exchange_row_gather,
+        bool(bf16_sort_counts),
     )
     sm = _LAYER_SM_CACHE.get(key)
     if sm is None:

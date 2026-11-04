@@ -217,6 +217,7 @@ def _build_op(
             interleave_visits=envs.MOE_FUSED_EP_PUSH_INTERLEAVE_VISITS,
             matmul_scale_repeat=envs.MOE_FUSED_EP_PUSH_MATMUL_SCALE_REPEAT,
             exchange_row_gather=envs.MOE_FUSED_EP_PUSH_EXCHANGE_ROW_GATHER,
+            bf16_sort_counts=envs.MOE_FUSED_EP_PUSH_BF16_SORT_COUNTS,
         )
 
     preprocess_topology = prepare_moe_preprocessing(mesh)

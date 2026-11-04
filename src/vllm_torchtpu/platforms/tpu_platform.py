@@ -423,6 +423,7 @@ class TpuPlatform(Platform):
         "MOE_FUSED_EP_PUSH_INTERLEAVE_VISITS",
         "MOE_FUSED_EP_PUSH_MATMUL_SCALE_REPEAT",
         "MOE_FUSED_EP_PUSH_EXCHANGE_ROW_GATHER",
+        "MOE_FUSED_EP_PUSH_BF16_SORT_COUNTS",
     ]
 
     # The "Platform" base class has import_kernels() that tries to import

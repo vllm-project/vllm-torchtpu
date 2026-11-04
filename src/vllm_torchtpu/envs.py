@@ -91,6 +91,7 @@ if TYPE_CHECKING:
     MOE_FUSED_EP_PUSH_INTERLEAVE_VISITS: bool = False
     MOE_FUSED_EP_PUSH_MATMUL_SCALE_REPEAT: bool = False
     MOE_FUSED_EP_PUSH_EXCHANGE_ROW_GATHER: bool = False
+    MOE_FUSED_EP_PUSH_BF16_SORT_COUNTS: bool = False
     TPU_EXPERT_PLACEMENT: str = ""
     TPU_LATENT_PROJ_INTRA_CHIP_TP: bool = False
     TPU_TOKEN_BUCKET_EXTRA: list[int] = []
@@ -763,6 +764,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # while it waits on its peers.
     "MOE_FUSED_EP_PUSH_EXCHANGE_ROW_GATHER": env_bool(
         "MOE_FUSED_EP_PUSH_EXCHANGE_ROW_GATHER"
+    ),
+    # MOE_FUSED_EP_KERNEL_IMPL=push: find the expert-sorted token order with
+    # two single-pass bf16 matmuls instead of a cumsum and a HIGHEST matmul.
+    "MOE_FUSED_EP_PUSH_BF16_SORT_COUNTS": env_bool(
+        "MOE_FUSED_EP_PUSH_BF16_SORT_COUNTS"
     ),
     # Shard Kimi K3's latent-MoE down/up projections across the cores of a
     # chip instead of replicating them. They are unquantized [7168, 3584] and

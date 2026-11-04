@@ -70,20 +70,40 @@ def _take_small(table, idx):
 ARGSORT_MIN_TOKENS = 512
 
 
-def _sorted_tokens_by_count(pid, seg_start_local, seg_end, *, e_total, t_local, topk):
-    """Token of each expert-sorted row via per-expert running counts (decode)."""
+def _sorted_tokens_by_count(
+    pid, seg_start_local, seg_end, *, e_total, t_local, topk, bf16_counts=False
+):
+    """Token of each expert-sorted row via per-expert running counts (decode).
+
+    `bf16_counts` reads the running counts as two single-pass bf16 matmuls
+    over 0/1 operands (the selection of row j's expert, then a prefix sum
+    over tokens) instead of a cumsum and a HIGHEST-precision matmul over the
+    counts; every product is 0 or 1 and every sum at most t_local, exact in
+    the f32 accumulator, so the tokens are the same."""
     n = pid.shape[0]
     sel = jnp.any(
         pid.reshape(t_local, topk)[:, :, None] == jnp.arange(e_total)[None, None, :],
         axis=1,
     )
-    C = jnp.cumsum(sel.astype(jnp.int32), axis=0)  # [t_local, e_total]
     jj = jnp.arange(n, dtype=jnp.int32)
     ge_j = jnp.minimum(
         jnp.sum(seg_end[None, :] <= jj[:, None], axis=1).astype(jnp.int32),
         e_total - 1,
     )
     m_j = jj - _take_small(seg_start_local, ge_j)
+    if bf16_counts:
+        onehot = (ge_j[:, None] == jnp.arange(e_total)[None, :]).astype(jnp.bfloat16)
+        hits = jnp.dot(
+            onehot, sel.T.astype(jnp.bfloat16), preferred_element_type=jnp.float32
+        ).astype(jnp.bfloat16)  # [n, t_local] = sel[:, ge_j]
+        tri = (
+            jnp.arange(t_local)[:, None] <= jnp.arange(t_local)[None, :]
+        ).astype(jnp.bfloat16)
+        col = jnp.dot(hits, tri, preferred_element_type=jnp.float32).astype(jnp.int32)
+        return jnp.minimum(
+            jnp.sum(col <= m_j[:, None], axis=1).astype(jnp.int32), t_local - 1
+        )
+    C = jnp.cumsum(sel.astype(jnp.int32), axis=0)  # [t_local, e_total]
     # The token of row j is the m_j-th token selecting expert ge_j: a count
     # over C's column ge_j, read through a one-hot matmul (exact in f32 at
     # these sizes, Precision.HIGHEST) rather than a gather.
@@ -106,9 +126,10 @@ def _sorted_tokens_by_argsort(pid, seg_end, *, t_local, topk):
     return jnp.where(jj < seg_end[-1], order // topk, jnp.int32(t_local - 1))
 
 
-def local_sort_tokens(my_pairs, my_counts, *, e_total, topk):
+def local_sort_tokens(my_pairs, my_counts, *, e_total, topk, bf16_counts=False):
     """`local_sort_activations` without the row gather: `(tok, seg_start)`,
-    tok [t_local * topk] the source row of each expert-sorted row."""
+    tok [t_local * topk] the source row of each expert-sorted row
+    (`bf16_counts`: see _sorted_tokens_by_count)."""
     n = my_pairs.shape[0]
     t_local = n // topk
     my_pairs = my_pairs.astype(jnp.int32)
@@ -121,12 +142,20 @@ def local_sort_tokens(my_pairs, my_counts, *, e_total, topk):
         tok_j = _sorted_tokens_by_argsort(pid, seg_end, t_local=t_local, topk=topk)
     else:
         tok_j = _sorted_tokens_by_count(
-            pid, seg_start_local, seg_end, e_total=e_total, t_local=t_local, topk=topk
+            pid,
+            seg_start_local,
+            seg_end,
+            e_total=e_total,
+            t_local=t_local,
+            topk=topk,
+            bf16_counts=bf16_counts,
         )
     return tok_j, seg_start_local
 
 
-def local_sort_activations(my_pairs, my_counts, q_l, *, e_total, topk):
+def local_sort_activations(
+    my_pairs, my_counts, q_l, *, e_total, topk, bf16_counts=False
+):
     """Sort this shard's rows `q_l` by global expert, tokens ascending within.
 
     `my_pairs` [t_local * topk] are this shard's selections (e_total = routes
@@ -138,7 +167,7 @@ def local_sort_activations(my_pairs, my_counts, q_l, *, e_total, topk):
     by counting; above ARGSORT_MIN_TOKENS a stable argsort (same result).
     """
     tok_j, seg_start_local = local_sort_tokens(
-        my_pairs, my_counts, e_total=e_total, topk=topk
+        my_pairs, my_counts, e_total=e_total, topk=topk, bf16_counts=bf16_counts
     )
     return q_l[tok_j], seg_start_local
 

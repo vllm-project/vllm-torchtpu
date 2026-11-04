@@ -452,7 +452,11 @@ def test_served_dims_program_knobs_are_bit_exact(shape):
 
 
 # The MoE-front switches change no arithmetic.
-FRONT_SWITCHES = ("matmul_scale_repeat", "exchange_row_gather")
+FRONT_SWITCHES = (
+    "matmul_scale_repeat",
+    "exchange_row_gather",
+    "bf16_sort_counts",
+)
 
 
 @pytest.mark.parametrize("switch", FRONT_SWITCHES)
