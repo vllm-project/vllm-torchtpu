@@ -224,31 +224,33 @@ def dispatches_quantized(
     )
 
 
-def drops_padded_routes(
-    num_tokens: int,
-    topk: int,
-    is_sequence_parallel: bool,
-    onehot_moe_permute_threshold: int,
-) -> bool:
-    """Whether an EP dispatch of num_tokens rows per rank zeroes the routing
-    weights of the step's padding rows (token_padding) and runs the experts
-    with skip_padded_tokens, so those rows reach no expert. The threshold is
-    the one the fused MoE op was built with (resolve_onehot_permute_threshold).
+def zeroes_padding_routes(is_sequence_parallel: bool) -> bool:
+    """Whether an EP dispatch zeroes the routing weights of the step's
+    padding rows (token_padding), which changes only those rows' outputs.
 
-    DP dispatch only: the padding mask describes this rank's rows of the
-    step, which a sequence-parallel slice is not. Only the backbone, whose
-    rows the runner marks before each forward. Integer arithmetic only: the
-    count is dynamic in the trace.
+    Decided without the token count, so every bucket's trace reads the mask:
+    the backbone is traced once per bucket group and the traces hand buckets
+    to one another only when their graphs take the same inputs
+    (compilation/shape_variants.py). DP dispatch only: the padding mask
+    describes this rank's rows of the step, which a sequence-parallel slice
+    is not. Only the backbone, whose rows the runner marks before each forward.
     """
     return (
-        not is_sequence_parallel
-        and vllm_compilation_backends.model_tag == "backbone"
-        and skips_padded_tokens(
-            num_tokens,
-            get_dp_group().world_size,
-            topk,
-            onehot_moe_permute_threshold,
-        )
+        not is_sequence_parallel and vllm_compilation_backends.model_tag == "backbone"
+    )
+
+
+def drops_padded_routes(
+    num_tokens: int, topk: int, onehot_moe_permute_threshold: int
+) -> bool:
+    """Whether an EP dispatch of num_tokens rows per rank, whose padding rows
+    carry zero routing weights (zeroes_padding_routes), runs the experts with
+    skip_padded_tokens, so those rows reach no expert. The threshold is the
+    one the fused MoE op was built with (resolve_onehot_permute_threshold).
+    Integer arithmetic only: the count is dynamic in the trace.
+    """
+    return skips_padded_tokens(
+        num_tokens, get_dp_group().world_size, topk, onehot_moe_permute_threshold
     )
 
 

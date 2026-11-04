@@ -76,6 +76,7 @@ from vllm_torchtpu.layers.adapter.fused_moe import (
     quantize_moe_dispatch_rows,
     quantize_native_fp4_kmajor,
     quantizes_moe_dispatch_rows,
+    zeroes_padding_routes,
 )
 from vllm_torchtpu.layers.adapter.pipelined_fused_moe import (
     enable_pipelined_collective_and_compute,
@@ -332,9 +333,9 @@ class VllmMxfp4MoEMethod(TpuMoEActivationMixin, Mxfp4MoEMethod):
     # was built with; both decided at weight load (dispatches_quantized).
     _quantized_dispatch: bool = False
     _onehot_moe_permute_threshold: int = 0
-    # Whether a dispatch may drop the routes of the step's padding rows
-    # (drops_padded_routes), for which the runner keeps token_padding's mask;
-    # decided at weight load.
+    # Whether a dispatch zeroes and may drop the routes of the step's padding
+    # rows (zeroes_padding_routes, drops_padded_routes), for which the runner
+    # keeps token_padding's mask; decided at weight load.
     reads_token_padding_mask: bool = False
 
     def _forward_monolithic_tpu(
@@ -367,18 +368,20 @@ class VllmMxfp4MoEMethod(TpuMoEActivationMixin, Mxfp4MoEMethod):
         )
         skip_padded_tokens = None
         if dispatches_routes:
-            if self.reads_token_padding_mask and drops_padded_routes(
-                x.shape[0],
-                layer.moe_config.experts_per_token,
-                self.moe.is_sequence_parallel,
-                self._onehot_moe_permute_threshold,
+            if self.reads_token_padding_mask and zeroes_padding_routes(
+                self.moe.is_sequence_parallel
             ):
-                # No expert computes a padding row and the combine sums
-                # nothing for it; the other tokens' outputs are unchanged.
                 topk_ids, topk_weights = token_padding.zero_routing_weights_for_padding(
                     topk_ids, topk_weights, is_local_tensor=True
                 )
-                skip_padded_tokens = True
+                if drops_padded_routes(
+                    x.shape[0],
+                    layer.moe_config.experts_per_token,
+                    self._onehot_moe_permute_threshold,
+                ):
+                    # No expert computes a padding row and the combine sums
+                    # nothing for it; the other tokens' outputs are unchanged.
+                    skip_padded_tokens = True
             if (
                 self._quantized_dispatch
                 and x.dtype == torch.bfloat16
