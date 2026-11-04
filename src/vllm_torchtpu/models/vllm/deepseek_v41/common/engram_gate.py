@@ -46,8 +46,8 @@ def supports_engram_gate(hidden, kv, qw, kw, mask, eps, clamp) -> bool:
         _gate_op is not None
         and eps == kernel.EPS
         and clamp == kernel.CLAMP
-        and hidden.shape == (kernel.TOKENS, kernel.MULT, kernel.DIM)
-        and kv.shape == (kernel.TOKENS, (kernel.MULT + 1) * kernel.DIM)
+        and hidden.shape[1:] == (kernel.MULT, kernel.DIM)
+        and kv.shape == (hidden.shape[0], (kernel.MULT + 1) * kernel.DIM)
         and qw.shape == kw.shape == (kernel.MULT, kernel.DIM)
         and all(
             tensor.device.type == "tpu"
@@ -58,7 +58,7 @@ def supports_engram_gate(hidden, kv, qw, kw, mask, eps, clamp) -> bool:
         and (
             mask is None
             or (
-                mask.shape == (kernel.TOKENS,)
+                mask.shape == (hidden.shape[0],)
                 and mask.dtype == torch.float32
                 and mask.device == hidden.device
             )

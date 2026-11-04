@@ -276,6 +276,21 @@ def compress_rope_packed(eps: float) -> Any:
             low: jax.Array,
             high: jax.Array,
         ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
+            if positions.shape[0] != 288:
+                return _compress_native_metadata(
+                    table,
+                    starts,
+                    kv_starts,
+                    positions,
+                    minimum,
+                    x,
+                    weight,
+                    gamma,
+                    rows,
+                    low,
+                    high,
+                    eps,
+                )
             records = (low.shape[0] + high.shape[0]) // compress_kernel._RECORD_ROWS
             prev, valid, wp, wo, rp, ro = decode_preparation.compressor_state_packed(
                 table, starts, kv_starts, positions, minimum, total_records=records
@@ -357,6 +372,40 @@ def compress_rope_addresses(eps: float) -> Any:
             jax.Array,
             jax.Array,
         ]:
+            if positions.shape[0] != 288:
+                result = _compress_native_metadata(
+                    table,
+                    starts,
+                    kv_starts,
+                    positions,
+                    minimum,
+                    x,
+                    weight,
+                    gamma,
+                    rows,
+                    low,
+                    high,
+                    eps,
+                )
+                token = jnp.arange(positions.size, dtype=jnp.int32)
+                request = jnp.minimum(
+                    jnp.sum(token[:, None] >= kv_starts[None, 1:], axis=1),
+                    main.shape[0] - 1,
+                )
+
+                def slots(page_table, capacity):
+                    logical = positions // 2
+                    column = jnp.minimum(logical // capacity, page_table.shape[1] - 1)
+                    block = page_table[request, column]
+                    return jnp.where(
+                        token < kv_starts[-1],
+                        block * capacity + logical % capacity,
+                        -1,
+                    )
+
+                main_slots = slots(main, 128)
+                records = jnp.where(result[-1] & (main_slots >= 0), main_slots, -1)
+                return (*result, records, slots(index, 256))
             records = (low.shape[0] + high.shape[0]) // compress_kernel._RECORD_ROWS
             prev, valid, wp, wo, rp, ro, main_records, index_slots = (
                 decode_preparation.compressor_addresses_packed(
@@ -425,3 +474,38 @@ def compress_rope_addresses(eps: float) -> Any:
         build,
         donate=(9, 10),
     )
+
+
+def _compress_native_metadata(
+    table,
+    starts,
+    kv_starts,
+    positions,
+    minimum,
+    x,
+    weight,
+    gamma,
+    rows,
+    low,
+    high,
+    eps,
+):
+    """Keep arbitrary token counts behind the dynamic Torch bridge signature."""
+    prev, valid, write, read = decode_preparation._compressor_state_addresses(
+        table, starts, kv_starts, positions, minimum
+    )
+    latent, words, scales, state = _compress(
+        2,
+        eps,
+        x,
+        weight,
+        gamma,
+        rows,
+        prev[:, None],
+        valid[:, None],
+        (low, high),
+        write,
+        read,
+    )
+    assert isinstance(state, tuple)
+    return latent, words, scales, *state, valid != 0
