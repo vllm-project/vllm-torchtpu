@@ -182,6 +182,7 @@ def test_log_stats(llm: LLM):
 
 
 def test_reset_encoder_cache(llm: LLM):
+    baseline = llm.generate(PROMPTS[:1], sampling_params=GREEDY_SAMPLING_PARAMS)
     llm.llm_engine.reset_encoder_cache()
     outputs = llm.generate(PROMPTS[:1], sampling_params=GREEDY_SAMPLING_PARAMS)
-    assert len(outputs) == 1
+    assert outputs[0].outputs[0].token_ids == baseline[0].outputs[0].token_ids

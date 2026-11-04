@@ -287,13 +287,6 @@ def test_reset_encoder_cache_delegates_to_model_runner():
     worker.model_runner.reset_encoder_cache.assert_called_once_with()
 
 
-def test_reset_encoder_cache_noop_without_model_runner():
-    worker = TPUWorker.__new__(TPUWorker)
-    worker.model_runner = None
-
-    worker.reset_encoder_cache()
-
-
 def test_initialize_from_config_updates_num_gpu_blocks():
     worker = TPUWorker.__new__(TPUWorker)
     worker.cache_config = MagicMock(num_gpu_blocks=None)

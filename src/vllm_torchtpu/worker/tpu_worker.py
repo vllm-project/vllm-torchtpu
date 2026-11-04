@@ -845,9 +845,7 @@ class TPUWorker(WorkerBase):
         return self.model_runner.get_kv_cache_spec()
 
     def reset_encoder_cache(self) -> None:
-        reset_fn = getattr(self.model_runner, "reset_encoder_cache", None)
-        if reset_fn is not None:
-            reset_fn()
+        self.model_runner.reset_encoder_cache()
 
     def add_lora(self, lora_request: LoRARequest) -> bool:
         return self.model_runner.add_lora(lora_request)
