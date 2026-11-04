@@ -29,6 +29,10 @@ WINDOW = 1024
 # i's matmul, so each refill has WINDOW_DEPTH - 1 windows of compute to land.
 WINDOW_DEPTH = 3
 QUANT_ROWS = 32
+# wo_b window 0 runs on row chunks of about T / B0_CHUNKS (rounded down to
+# QUANT_ROWS) as each is quantized. v7 T288, 100 interleaved calls: 2 chunks
+# 37.96 us, 3 chunks 37.98 us, unchunked 38.28 us, 4 chunks 42.68 us.
+B0_CHUNKS = 2
 # wo_a loop iterations at which the first WINDOW_DEPTH wo_b windows start;
 # the last iteration index means just before the final group's matmul. v7
 # T288 XPlane, 100 interleaved calls: (5, 6, 7) 39.09 us, (4, 5, 6) 39.90 us,
@@ -260,13 +264,41 @@ def _kernel(
                 a = y[rows, cols].astype(jnp.float32)
                 qb[rows, cols] = jnp.clip(a / scale, -448.0, 448.0).astype(qb.dtype)
 
-        @pl.loop(0, tokens // QUANT_ROWS, unroll=False)
-        def _(i):
-            quantize_rows(pl.multiple_of(i * QUANT_ROWS, QUANT_ROWS), QUANT_ROWS)
+    def project_b(i, slot, rows):
+        z = jax.lax.dot_general(
+            qb[rows, :],
+            wbb[slot, ...],
+            (((1,), (0,)), ((), ())),
+            preferred_element_type=jnp.float32,
+        )
+        z = (z * xs[rows]) * sbv[pl.ds(i * WINDOW, WINDOW)][None, :]
+        ob[i % 2, rows] = z.astype(out.dtype)
 
-        if tokens % QUANT_ROWS:
-            quantize_rows(tokens // QUANT_ROWS * QUANT_ROWS, tokens % QUANT_ROWS)
+    def refill_and_store(i, slot):
+        @pl.when(i + window_depth < windows)
+        def _():
+            wb_copy(i + window_depth, slot).start(priority=weight_priority)
+
+        out_copy(i).start()
+
+    # Window 0's weights land during wo_a, so its matmul only waits for the
+    # quantized rows. Rows are independent, so window 0 runs on each row chunk
+    # as soon as it is quantized, beside the next chunk's quantize. Chunk
+    # bounds are static, so the two touch provably disjoint rows of qb.
+    chunk = -(-tokens // B0_CHUNKS) // QUANT_ROWS * QUANT_ROWS
+    with jax.named_scope("op_b_quant"):
+        wb_copy(0, 0).wait()
         sb_copy.wait()
+        done = None
+        for start in range(0, tokens, chunk):
+            size = min(chunk, tokens - start)
+            for r in range(start, start + size, QUANT_ROWS):
+                quantize_rows(r, min(QUANT_ROWS, start + size - r))
+            if done is not None:
+                project_b(0, 0, done)
+            done = pl.ds(start, size)
+        project_b(0, 0, done)
+    refill_and_store(0, 0)
 
     # Same operations as buffered._kernel's window loop. slot is window i's
     # ring slot, which window i + window_depth refills; returns i + 1's slot.
@@ -278,23 +310,12 @@ def _kernel(
             def _():
                 out_copy(i - 2).wait()
 
-            z = jax.lax.dot_general(
-                qb[...],
-                wbb[slot, ...],
-                (((1,), (0,)), ((), ())),
-                preferred_element_type=jnp.float32,
-            )
-            z = (z * xs[...]) * sbv[pl.ds(i * WINDOW, WINDOW)][None, :]
-            ob[i % 2, ...] = z.astype(out.dtype)
+            project_b(i, slot, pl.ds(0, tokens))
 
-        @pl.when(i + window_depth < windows)
-        def _():
-            wb_copy(i + window_depth, slot).start(priority=weight_priority)
-
-        out_copy(i).start()
+        refill_and_store(i, slot)
         return succ(slot, window_depth)
 
-    jax.lax.fori_loop(0, windows, window, jnp.int32(0))
+    jax.lax.fori_loop(1, windows, window, jnp.int32(1))
 
     with jax.named_scope("op_drain"):
         out_copy(windows - 2).wait()
