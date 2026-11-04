@@ -30,14 +30,15 @@ None (use the usual all-reduce) unless:
   meshes must span the world) and has 2 to TPU_SMALL_ALL_REDUCE_MAX_RANKS
   ranks (default 8: the size whose speed was measured);
 - the tensor is bf16 with a last dimension the kernel can split into n
-  lane-aligned chunks (a multiple of n x 128), and, when its row count is a
-  plain int, at most TPU_SMALL_ALL_REDUCE_MAX_BYTES bytes.
+  lane-aligned chunks (a multiple of n x 128).
 
-The torch op it calls is one exported JAX program per shape. Inside it the
-row count is static, so the size check is repeated there and a larger
-tensor runs `lax.psum` (XLA's all-reduce) in the same program. That keeps a
-graph traced once for several token counts (the MTP drafter) correct for
-every count.
+The torch op it calls takes the tensor alone and is one exported JAX program
+per shape. The size choice happens inside it, where the row count is static:
+at most TPU_SMALL_ALL_REDUCE_MAX_BYTES bytes runs the kernel, a larger tensor
+runs `lax.psum` (XLA's all-reduce) in the same program. The torch graph
+therefore has the same structure and inputs for every token bucket and for
+every traced model (target, MTP drafter), which vllm-torchtpu's per-bucket
+compile (compilation/shape_variants.py) requires.
 
 `arm()` runs once after model load, on every rank (collective over the TP
 group). It builds the mesh, runs the kernel once on inputs whose sum is
@@ -51,7 +52,6 @@ import traceback
 from typing import Any
 
 import jax
-import jax.numpy as jnp
 import numpy as np
 import torch
 from jax import lax
@@ -75,7 +75,7 @@ class _Context:
     n: int
     algo: str
     max_bytes: int
-    rank_tensor: torch.Tensor  # int32 [1, 1] holding `index`
+    device: torch.device  # this rank's TPU device (self-test inputs)
     op: Any
 
 
@@ -148,36 +148,36 @@ def _get_op(mesh, n: int, algo: str, max_bytes: int):
             f"mesh axis {axis!r}: torch_tpu jax_op needs a one-letter name"
         )
     spec = P(axis)
-    specs = (spec, spec)
 
-    def body(x, rank):
+    # The kernel reads its rank from the mesh (lax.axis_index inside the
+    # kernel), so the op's only operand is the tensor: a rank tensor would be
+    # an extra graph input that every trace of every model must agree on.
+    # The size choice is made here, where the row count is static per
+    # exported program, and never in the torch graph: a branch on the token
+    # count while tracing would leave a shape guard that splits the compile
+    # buckets between traces.
+    def body(x):
         rows, h = x.shape  # static: torch_tpu exports one program per shape
         if _eligible(n, rows, h, algo, max_bytes):
-            call = kernel.build(kernel.Plan(n, rows, h, algo))
-            return call(rank.reshape(1).astype(jnp.int32), x)
+            return kernel.build(kernel.Plan(n, rows, h, algo, axis=axis))(x)
         return lax.psum(x, axis)
 
     sharded = jax.shard_map(
-        body, mesh=mesh, in_specs=specs, out_specs=spec, check_vma=False
+        body, mesh=mesh, in_specs=(spec,), out_specs=spec, check_vma=False
     )
 
     # torch_tpu reads the operand types from these annotations.
-    def fn(x: jax.Array, rank: jax.Array) -> jax.Array:
-        return sharded(
-            *(
-                jax.device_put(a, NamedSharding(mesh, s))
-                for a, s in zip((x, rank), specs)
-            )
-        )
+    def fn(x: jax.Array) -> jax.Array:
+        return sharded(jax.device_put(x, NamedSharding(mesh, spec)))
 
     from torch_tpu._internal import pallas
 
     name = "pallas::small_all_reduce" + (f"_{len(_OPS)}" if _OPS else "")
     # pyrefly: ignore[no-matching-overload]
     op = pallas.jax_op(
-        name, fn, mesh=mesh, input_partition_specs=specs, output_partition_specs=spec
+        name, fn, mesh=mesh, input_partition_specs=(spec,), output_partition_specs=spec
     )
-    op.register_fake(lambda x, rank: torch.empty_like(x))
+    op.register_fake(lambda x: torch.empty_like(x))
     _OPS[key] = op
     return op
 
@@ -194,10 +194,9 @@ def maybe_all_reduce(communicator: Any, x: torch.Tensor) -> torch.Tensor | None:
     h = x.shape[-1]
     if not isinstance(h, int) or not kernel.supported(ctx.n, 16, h, ctx.algo):
         return None
-    rows = x.numel() // h
-    if isinstance(rows, int) and not _eligible(ctx.n, rows, h, ctx.algo, ctx.max_bytes):
-        return None
-    y = ctx.op(x.reshape(-1, h), ctx.rank_tensor)
+    # No branch on the row count here (see _get_op): the op takes every row
+    # count and runs XLA's all-reduce inside for the large ones.
+    y = ctx.op(x.reshape(-1, h))
     return y.reshape(x.shape)
 
 
@@ -216,7 +215,7 @@ def _selftest(ctx: _Context, device) -> list[str]:
         x = (((d + 1) * 3 + r * 5 + (c // 128) * 7 + d * c) % 11 - 5).astype(np.float32)
         want = x.sum(0)
         mine = torch.from_numpy(x[ctx.index]).to(torch.bfloat16).to(device)
-        got = ctx.op(mine, ctx.rank_tensor).float().cpu().numpy()
+        got = ctx.op(mine).float().cpu().numpy()
         if not np.array_equal(got, want):
             failures.append(
                 f"rows={rows} h={h} max_abs_err={float(np.abs(got - want).max())}"
@@ -243,17 +242,17 @@ def group_refusal(tp_ranks: tuple[int, ...], world: int, max_ranks: int) -> str 
 
 
 def _build_context() -> _Context | str:
-    """The mesh, rank operand and op for this rank, or a refusal reason."""
+    """The mesh, index and op for this rank, or a refusal reason."""
     got = _mesh_for_world()
     if isinstance(got, str):
         return got
     mesh, index = got
     n = int(mesh.size)
     algo = _choose_algo()
-    rank_tensor = torch.tensor([[index]], dtype=torch.int32, device="tpu")
+    device = torch.empty((), device="tpu").device
     max_bytes = int(envs.TPU_SMALL_ALL_REDUCE_MAX_BYTES)
     op = _get_op(mesh, n, algo, max_bytes)
-    return _Context(mesh, index, n, algo, max_bytes, rank_tensor, op)
+    return _Context(mesh, index, n, algo, max_bytes, device, op)
 
 
 def arm() -> bool:
@@ -290,7 +289,7 @@ def arm() -> bool:
     if ctx is not None:
         faulthandler.dump_traceback_later(SELFTEST_TIMEOUT_S, exit=True)
         try:
-            failures = _selftest(ctx, ctx.rank_tensor.device)
+            failures = _selftest(ctx, ctx.device)
         except Exception:  # noqa: BLE001 - reported and agreed on below
             failures = [traceback.format_exc()[-1500:]]
         finally:

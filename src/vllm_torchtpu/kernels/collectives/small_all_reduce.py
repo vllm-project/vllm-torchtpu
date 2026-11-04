@@ -77,6 +77,9 @@ class Plan:
     skip: str = ""  # removal arm (timing only): "ag", "ic", "d2d"
     fault: str | None = None
     interpret: bool = False
+    # Mesh axis to read this device's rank from inside the kernel
+    # (lax.axis_index). None: the rank is an int32[1] scalar-prefetch operand.
+    axis: str | None = None
 
     @property
     def half(self) -> int:
@@ -343,14 +346,27 @@ def vmem_bytes(p: Plan) -> int:
 
 
 def build(p: Plan):
-    """pallas_call(rank int32[1], x bf16[t, h]) -> bf16[t, h] (the sum)."""
+    """The all-reduce as a pallas_call: x bf16[t, h] -> bf16[t, h] (the sum).
+
+    With `p.axis` set, the call takes x alone and reads its rank inside the
+    kernel as `lax.axis_index(p.axis)`, which Mosaic lowers to the device id
+    in the mesh, so the rank needs no operand and every rank runs one program.
+    Without it, the call is `call(rank int32[1], x)`.
+    """
     if not supported(p.n, p.t, p.h, p.algo):
         raise ValueError(f"unsupported all-reduce {p}")
     body = _flat2 if p.algo == "flat2" else _hier
     scratch = _flat2_scratch(p) if p.algo == "flat2" else _hier_scratch(p)
 
-    def kernel(rank_ref, x_ref, o_ref, *scr):
-        body(p, rank_ref[0], x_ref, o_ref, *scr)
+    if p.axis is None:
+
+        def kernel(rank_ref, x_ref, o_ref, *scr):
+            body(p, rank_ref[0], x_ref, o_ref, *scr)
+
+    else:
+
+        def kernel(x_ref, o_ref, *scr):
+            body(p, lax.axis_index(p.axis), x_ref, o_ref, *scr)
 
     vmem = pl.BlockSpec(memory_space=pltpu.VMEM)
     skip = f"-skip_{p.skip}" if p.skip else ""
@@ -360,7 +376,7 @@ def build(p: Plan):
         kernel,
         out_shape=jax.ShapeDtypeStruct((p.t, p.h), jnp.bfloat16),
         grid_spec=pltpu.PrefetchScalarGridSpec(
-            num_scalar_prefetch=1,
+            num_scalar_prefetch=0 if p.axis else 1,
             in_specs=[vmem],
             out_specs=vmem,
             scratch_shapes=scratch,
@@ -373,16 +389,19 @@ def build(p: Plan):
     )
 
 
-def make_factory(algo, skip="", interpret=False, max_t=256):
+def make_factory(algo, skip="", interpret=False, max_t=256, axis=None):
     """test_accuracy / bench factory: make(n, t, h, fault=None) -> fn(x, rank),
-    or None above max_t rows (the size dispatch keeps XLA's all-reduce there)."""
+    or None above max_t rows (the size dispatch keeps XLA's all-reduce there).
+    With `axis`, the kernel reads its rank from the mesh and `rank` is unused."""
 
     def make(n, t, h, fault=None):
         if fault is not None and fault not in FAULTS:
             raise NotImplementedError(fault)
         if t > max_t or not supported(n, t, h, algo):
             return None
-        call = build(Plan(n, t, h, algo, skip, fault, interpret))
+        call = build(Plan(n, t, h, algo, skip, fault, interpret, axis))
+        if axis is not None:
+            return lambda x, rank: call(x)
         return lambda x, rank: call(rank.reshape(1).astype(jnp.int32), x)
 
     return make

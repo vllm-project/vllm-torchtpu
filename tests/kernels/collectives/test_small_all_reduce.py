@@ -117,14 +117,18 @@ def _worker() -> dict:
     devs = jax.devices()
     report = {"cells": [], "faults": []}
 
-    def run(algo, n, t, x, fault=None, reps=1):
+    def run(algo, n, t, x, fault=None, reps=1, axis=None):
         mesh = Mesh(np.asarray(devs[:n]), ("x",))
-        call = k.build(k.Plan(n, t, H, algo, fault=fault, interpret=True))
+        call = k.build(k.Plan(n, t, H, algo, fault=fault, interpret=True, axis=axis))
 
         def body(xs, rank):
             outs, carry = [], jnp.zeros((), xs.dtype)
             for i in range(reps):
-                y = call(rank.reshape(1), xs[i] + carry)
+                y = (
+                    call(xs[i] + carry)
+                    if axis
+                    else call(rank.reshape(1), xs[i] + carry)
+                )
                 carry = y[0, 0] * 0  # serialize the calls
                 outs.append(y)
             return jnp.stack(outs)
@@ -183,6 +187,22 @@ def _worker() -> dict:
                     algo=algo, n=n, t=t, kind=kind, reps=reps, ok=ok, err=err, same=same
                 )
             )
+        # The production form: the rank comes from the mesh inside the kernel.
+        x = inputs(8, 16, "int", 2)
+        ok, err, same = check(run(algo, 8, 16, x, reps=2, axis="x"), x, "int")
+        report["cells"].append(
+            dict(
+                algo=algo,
+                n=8,
+                t=16,
+                kind="int",
+                reps=2,
+                axis="x",
+                ok=ok,
+                err=err,
+                same=same,
+            )
+        )
         for n in (8, 2):
             for fault in FAULTS:
                 x = inputs(n, 16, "int")
