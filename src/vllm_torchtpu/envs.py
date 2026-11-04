@@ -106,6 +106,8 @@ if TYPE_CHECKING:
     MOE_FUSED_EP_V2_SHARDED_PLAN: bool = False
     MOE_FUSED_EP_SORTED_GATHER: bool = False
     MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE: int = 0
+    TPU_MOE_EXPERT_COUNT_TAP_DIR: str = ""
+    TPU_MOE_EXPERT_COUNT_TAP_EVERY: int = 1000
     TPU_LATENT_PROJ_INTRA_CHIP_TP: bool = False
     TPU_DSV4_ATTN_INTRA_CHIP_TP: bool = False
     TPU_TOKEN_BUCKET_EXTRA: list[int] = []
@@ -838,6 +840,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # ascending device-id order, so the SparseCore gather gets its
     # N-dimensional algorithm without moving the program's DeviceAssignment.
     "MOE_FUSED_EP_SORTED_GATHER": env_bool("MOE_FUSED_EP_SORTED_GATHER"),
+    # Directory the per-layer routed-expert counts are written to
+    # (layers/adapter/expert_count_tap.py), every TPU_MOE_EXPERT_COUNT_TAP_EVERY
+    # steps. Empty disables the tap and leaves the program unchanged. $VARs
+    # expand here, since pod specs pass e.g. "$CDK_OUTPUT_DIR/moe_counts".
+    "TPU_MOE_EXPERT_COUNT_TAP_DIR": lambda: os.path.expandvars(
+        env_str("TPU_MOE_EXPERT_COUNT_TAP_DIR", "")()
+    ),
+    "TPU_MOE_EXPERT_COUNT_TAP_EVERY": env_int("TPU_MOE_EXPERT_COUNT_TAP_EVERY", 1000),
     # How many copies of the FFN body fused EP MoE v2 emits, standing in for
     # kernel.HEIGHT_RUNGS. A tile runs the shortest of them that covers its
     # live rows, so one is the ladder off. Zero leaves the choice to the

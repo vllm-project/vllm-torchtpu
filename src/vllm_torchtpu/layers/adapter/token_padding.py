@@ -109,6 +109,13 @@ def zero_routing_weights_for_padding(
     return topk_ids, topk_weights
 
 
+def local_padding_mask(num_tokens: int) -> torch.Tensor | None:
+    """This rank's [num_tokens] padding mask, or None when none is tracked."""
+    if _padding_state is None:
+        return None
+    return _padding_state.get_local_padding_mask(num_tokens)
+
+
 def mask_router_logits_for_padding(router_logits: torch.Tensor) -> torch.Tensor:
     """Replace padded rows of local router_logits with NaN.
 
