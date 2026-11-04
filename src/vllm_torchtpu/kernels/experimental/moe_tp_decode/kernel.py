@@ -87,8 +87,12 @@ _N_CHUNK = 512
 # columns of x (its quant_block_size).
 _Q_BLOCK = 512
 # Weight ring depth. One slot holds the expert whose first matmul is in
-# flight, so num_buffers - 2 transfers run ahead of compute.
+# flight, so num_buffers - 2 transfers run ahead of compute. At wider chunk
+# widths (TPU_MOE_TP_DECODE_I_CHUNK) the ring steps down as far as
+# _MIN_BUFFERS (and then halves the chunk width back toward _I_CHUNK) so the
+# larger decode buckets still fit VMEM without giving up overlap.
 _NUM_BUFFERS = 6
+_MIN_BUFFERS = 3
 # Intermediate columns per ring item (one MXU-wide gate and up chunk).
 _I_CHUNK = 128
 
@@ -131,9 +135,10 @@ def _i_chunk(i):
 
 
 def _vmem_plan(m, h, i, num_experts, shared_inter, info, spec):
-    """(need_bytes, vmem_limit_bytes), or None if the limit would exceed
-    VMEM_FRACTION of the capacity. Whole-array blocks (grid=()), tiles padded.
-    `i` is the ring item's column count (_i_chunk of the rank's I)."""
+    """(nb, need_bytes, vmem_limit_bytes) for the deepest ring (from
+    _NUM_BUFFERS down to _MIN_BUFFERS) whose limit stays within VMEM_FRACTION
+    of capacity, or None if even _MIN_BUFFERS exceeds it. Whole-array blocks
+    (grid=()), tiles padded. `i` is the ring item's column count."""
     t = functools.partial(all_reduce.tiled_bytes, info=info)
     e_pad = pl.cdiv(num_experts, info.num_lanes) * info.num_lanes
     f32, bf16 = jnp.float32, jnp.bfloat16
@@ -152,21 +157,55 @@ def _vmem_plan(m, h, i, num_experts, shared_inter, info, spec):
         + t((1, e_pad), jnp.int32)  # hits_v
     )
     slot = t((h, 2 * i), FP8) + t((i, h), FP8) + t((1, 2 * i), f32) + t((1, h), f32)
-    need = fixed + _NUM_BUFFERS * slot + all_reduce.vmem_bytes(spec, info)
-    limit = int(need * VMEM_HEADROOM)
-    if limit > int(info.vmem_capacity_bytes * VMEM_FRACTION):
-        return None
-    return need, min(limit, info.vmem_capacity_bytes)
+    ar_bytes = all_reduce.vmem_bytes(spec, info)
+    budget = int(info.vmem_capacity_bytes * VMEM_FRACTION)
+    for nb in range(_NUM_BUFFERS, _MIN_BUFFERS - 1, -1):
+        need = fixed + nb * slot + ar_bytes
+        limit = int(need * VMEM_HEADROOM)
+        if limit <= budget:
+            return nb, need, min(limit, info.vmem_capacity_bytes)
+    return None
+
+
+def _plan_ring(m, h, i, num_experts, shared_inter, info, spec):
+    """(ic, nb, need_bytes, vmem_limit_bytes) at `m` rows for a rank holding
+    `i` intermediate columns, stepping down from _i_chunk(i) by powers of two
+    toward _I_CHUNK if needed so larger row buckets still fit VMEM."""
+    ic = _i_chunk(i)
+    floor = min(i, _I_CHUNK)
+    while ic >= floor:
+        if ic % PAIR == 0 and i % ic == 0:
+            plan = _vmem_plan(m, h, ic, num_experts, shared_inter, info, spec)
+            if plan is not None:
+                nb, need, limit = plan
+                return ic, nb, need, limit
+        if ic == floor or ic % 2:
+            break
+        ic //= 2
+    return None
 
 
 def kernel_name(
-    experts, m, h, i, shared_inter, n_ranks, num_experts=None, fast=False
+    experts,
+    m,
+    h,
+    i,
+    shared_inter,
+    n_ranks,
+    num_experts=None,
+    fast=False,
+    *,
+    nb=None,
+    ic=None,
 ) -> str:
+    if nb is None:
+        nb = _NUM_BUFFERS
+    if ic is None:
+        ic = _i_chunk(i)
     name = (
         f"moe_tp_decode-e_{experts}-m_{m}-h_{h}-i_{i}-fs_{shared_inter}"
-        f"-nb_{_NUM_BUFFERS}-n_{n_ranks}"
+        f"-nb_{nb}-n_{n_ranks}"
     )
-    ic = _i_chunk(i)
     if ic != min(i, _I_CHUNK):
         name += f"-ic_{ic}"
     if _split_meta():
@@ -244,7 +283,7 @@ def can_use_moe_tp_decode(
     if not all_reduce.supported(n_ranks, m, h, info):
         return False
     spec = all_reduce.make_spec(n_ranks, m, h)
-    plan = _vmem_plan(m, h, _i_chunk(i), num_experts, shared_inter, info, spec)
+    plan = _plan_ring(m, h, i, num_experts, shared_inter, info, spec)
     return plan is not None
 
 
@@ -456,7 +495,7 @@ def _kernel(
     i = w2_hbm.shape[1]  # this rank's I
     ic = w2_ref.shape[1]  # columns per ring item; i == ic * n_chunks
     nc = n_chunks
-    nb = _NUM_BUFFERS
+    nb = w1_ref.shape[0]
     n_valid = meta_ref[0]
     rank = meta_ref[1]
     # First global expert this rank holds (0 under plain TP).
@@ -803,12 +842,10 @@ def moe_tp_decode(
     shared_inter = shared_w2.shape[0]
     info = pltpu.get_tpu_info()
     ar_spec = all_reduce.make_spec(n_ranks, m, h)
-    ic = _i_chunk(i)
-    plan = _vmem_plan(m, h, ic, num_experts, shared_inter, info, ar_spec)
+    plan = _plan_ring(m, h, i, num_experts, shared_inter, info, ar_spec)
     if plan is None:
         raise ValueError("moe_tp_decode does not fit VMEM; check can_use_moe_tp_decode")
-    _, limit = plan
-    nb = _NUM_BUFFERS
+    ic, nb, _, limit = plan
     # Lane-dense routing table. Padded experts never win: their biased score
     # is -inf, clamped to ROUTER_NEG, and every real column has a lower index.
     e_pad = pl.cdiv(num_experts, info.num_lanes) * info.num_lanes
@@ -893,7 +930,18 @@ def moe_tp_decode(
         compiler_params=pltpu.CompilerParams(
             vmem_limit_bytes=limit, collective_id=all_reduce.COLLECTIVE_ID
         ),
-        name=kernel_name(experts, m, h, i, shared_inter, n_ranks, num_experts, fast),
+        name=kernel_name(
+            experts,
+            m,
+            h,
+            i,
+            shared_inter,
+            n_ranks,
+            num_experts,
+            fast,
+            nb=nb,
+            ic=ic,
+        ),
     )(
         *metas,
         x,
