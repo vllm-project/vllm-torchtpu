@@ -10,6 +10,7 @@ import jax.numpy as jnp
 import torch
 
 from vllm_torchtpu import envs
+from vllm_torchtpu.kernels.attention_preprocessing import rope_gather
 from vllm_torchtpu.kernels.deepseek_v4.o_projection import (
     fused_ab_projection,
     is_fused_ab_supported,
@@ -80,7 +81,11 @@ def _publish_swa_banked(
 
 def _inverse_rope(cos_sin: jax.Array, positions: jax.Array) -> jax.Array:
     # Q/K already carry RoPE; CSA2 consumes this small inverse-rotation table.
-    table = cos_sin[positions].astype(jnp.float32)
+    table = rope_gather.by_row_blocks(
+        lambda rows: cos_sin[rows],
+        positions,
+        envs.TPU_DEEPSEEK_V41_BLOCKED_ROPE_GATHER,
+    ).astype(jnp.float32)
     cos = jnp.concatenate(
         (jnp.ones((positions.shape[0], 64)), jnp.repeat(table[:, :32], 2, axis=1)),
         axis=1,

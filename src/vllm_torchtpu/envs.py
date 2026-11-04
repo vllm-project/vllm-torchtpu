@@ -16,6 +16,7 @@ if TYPE_CHECKING:
     TPU_DEEPSEEK_V41_INDEXER_ISSUE_DEPTH: int | None = None
     TPU_DEEPSEEK_V41_INDEXER_PUBLISH_ISSUE_DEPTH: int | None = None
     TPU_DEEPSEEK_V41_MHC_RESIDENT_GATES: bool = False
+    TPU_DEEPSEEK_V41_BLOCKED_ROPE_GATHER: bool = False
     TPU_DEEPSEEK_V41_CSA2_SWA_PLAN: bool = False
     TPU_DEEPSEEK_V41_FUSED_WO_AB: bool = False
     TPU_DEEPSEEK_V41_QB_ROPE_EXACT_ROWS: bool = False
@@ -430,6 +431,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # outputs are unchanged.
     "TPU_DEEPSEEK_V41_MHC_RESIDENT_GATES": env_bool(
         "TPU_DEEPSEEK_V41_MHC_RESIDENT_GATES", default=False
+    ),
+    # Gather RoPE table rows (attention preprocessing, CSA2 inverse RoPE) as
+    # 256-row gathers when a step has 257..1024 rows
+    # (`rope_gather.by_row_blocks`). Data movement only; outputs unchanged.
+    "TPU_DEEPSEEK_V41_BLOCKED_ROPE_GATHER": env_bool(
+        "TPU_DEEPSEEK_V41_BLOCKED_ROPE_GATHER", default=False
     ),
     # CSA2 layers: build the SWA metadata and write plan once per stage at row
     # offset 0 and shift them per layer, instead of re-deriving them in every
