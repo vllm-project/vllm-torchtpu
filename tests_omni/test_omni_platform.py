@@ -1012,3 +1012,54 @@ def test_ltx2_split_rope_tables_reused_for_coords_views(ltx2, table_syncs, infer
 def test_supports_talker_mtp_graph_capture_disabled():
     assert OmniTpuPlatform.supports_talker_mtp_graph_capture() is False
     assert OmniTpuPlatform().supports_talker_mtp_graph_capture() is False
+
+
+def test_omni_mrope_alias_registered_for_tier1_in_graph(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vllm.config import DeviceConfig, VllmConfig, set_current_vllm_config
+    from vllm.model_executor.custom_op import op_registry_oot
+    from vllm.model_executor.layers import rotary_embedding as upstream_rope
+
+    from vllm_torchtpu import envs, rope_in_graph
+    from vllm_torchtpu.layers.adapter import rotary_embedding as tpu_rope
+
+    omni_cls = upstream_rope.MRotaryEmbedding
+    assert omni_cls.__name__ == "OmniMRotaryEmbedding"
+    assert rope_in_graph.mrope_aliases(omni_cls)[-1] is not omni_cls
+    assert omni_cls in tpu_rope.TIER1_MROPE_CLASSES
+    tpu_cls = op_registry_oot[omni_cls.__name__]
+    assert rope_in_graph.Tier1InGraphRopeMixin in tpu_cls.__bases__
+
+    monkeypatch.setattr(upstream_rope, "_ROPE_DICT", {})
+    cfg = VllmConfig(device_config=DeviceConfig(device="cpu"))
+    rope_params = {"rope_type": "default", "mrope_section": [8, 12, 12]}
+    with set_current_vllm_config(cfg):
+        monkeypatch.setattr(envs, "TPU_ROPE_IN_GRAPH", False)
+        ref = upstream_rope.get_rope(
+            64,
+            max_position=128,
+            is_neox_style=True,
+            rope_parameters=dict(rope_params),
+            dtype=torch.float32,
+        )
+        upstream_rope._ROPE_DICT.clear()
+        monkeypatch.setattr(envs, "TPU_ROPE_IN_GRAPH", True)
+        uut = upstream_rope.get_rope(
+            64,
+            max_position=128,
+            is_neox_style=True,
+            rope_parameters=dict(rope_params),
+            dtype=torch.float32,
+        )
+
+    assert type(uut) is tpu_cls
+    assert isinstance(uut.cos_sin_cache, rope_in_graph.InGraphCosSinCache)
+    pos = torch.tensor([[0, 1, 2, 3], [0, 4, 5, 6], [0, 7, 8, 9]], dtype=torch.int64)
+    q = torch.randn(4, 4 * 64, dtype=torch.float32)
+    k = torch.randn(4, 2 * 64, dtype=torch.float32)
+    ref_q, ref_k = ref(pos, q.clone(), k.clone())
+    out_q, out_k = uut(pos, q.clone(), k.clone())
+    torch.testing.assert_close(out_q, ref_q, rtol=1e-6, atol=1e-6)
+    assert ref_k is not None and out_k is not None
+    torch.testing.assert_close(out_k, ref_k, rtol=1e-6, atol=1e-6)
