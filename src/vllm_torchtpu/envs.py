@@ -109,6 +109,8 @@ if TYPE_CHECKING:
     VLLM_TPU_QSA_PREFILL_BF16_MXU: bool = False
     VLLM_TPU_QSA_PREFILL_LEAN: bool = False
     VLLM_TPU_QSA_MAIN_KV_DCP: int = 0
+    VLLM_TPU_QSA_DCP_PREFILL_QUERY_BLOCK: int = 1024
+    VLLM_TPU_QSA_DCP_PREFILL_QUERY_TILE: int = 256
     VLLM_TPU_QSA_MTP_KV_DCP: bool = False
     VLLM_TPU_QSA_COMPRESSED_DCP: bool = False
     VLLM_TPU_QSA_DECODE_SHARED_SCHEDULE: bool = False
@@ -736,6 +738,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # KV head (2; 0/1 = off): each rank stores and attends half the tokens,
     # the pair's partial attention is LSE-combined.
     "VLLM_TPU_QSA_MAIN_KV_DCP": env_nonnegative_int("VLLM_TPU_QSA_MAIN_KV_DCP", 0),
+    # Main-KV DCP prefill (owned-page walk): query block / subtile; 0 keeps
+    # the tile table's.
+    "VLLM_TPU_QSA_DCP_PREFILL_QUERY_BLOCK": env_nonnegative_int(
+        "VLLM_TPU_QSA_DCP_PREFILL_QUERY_BLOCK", 1024
+    ),
+    "VLLM_TPU_QSA_DCP_PREFILL_QUERY_TILE": env_nonnegative_int(
+        "VLLM_TPU_QSA_DCP_PREFILL_QUERY_TILE", 256
+    ),
     # With VLLM_TPU_QSA_MAIN_KV_DCP: the MTP draft layers' main KV split the
     # same way (otherwise the draft keeps whole pages).
     "VLLM_TPU_QSA_MTP_KV_DCP": env_bool("VLLM_TPU_QSA_MTP_KV_DCP"),
