@@ -329,3 +329,107 @@ def test_dcp_fp8_pass_matches_reference(
     # Exact because writes only copy already-quantized values. Comparing the
     # entire pool also catches changes to old tokens, other owners and padding.
     np.testing.assert_array_equal(cache, expected_cache)
+
+
+@pytest.mark.parametrize("layout,pre_gathered_q", [("NHD", False), ("HND", True)])
+def test_dcp_fp8_duplicate_o_proj_adapter_forward(
+    layout, pre_gathered_q, monkeypatch, vllm_config_context
+):
+    dcp_size, own_q_heads = 2, 16 // _TP_SIZE
+    get_current_vllm_config().cache_config.kv_cache_layout = (
+        "LBHNC" if layout == "HND" else "LBNHC"
+    )
+    c_scope, n_scope = (
+        configs.AttentionScope.CACHE_ONLY,
+        configs.AttentionScope.NEW_TOKENS_ONLY,
+    )
+    cache_cases = [
+        _make_case(layout, r, c_scope, dcp_size=dcp_size, own_q_heads=own_q_heads)
+        for r in range(dcp_size)
+    ]
+    new_cases = [
+        _make_case(layout, r, n_scope, dcp_size=dcp_size, own_q_heads=own_q_heads)
+        for r in range(dcp_size)
+    ]
+    ref_merged = [
+        cp_attention.merge_dcp_new_into_ctx(
+            torch.from_numpy(cache_cases[r][1]),
+            torch.from_numpy(cache_cases[r][2]),
+            torch.from_numpy(new_cases[r][1]),
+            torch.from_numpy(new_cases[r][2]),
+            r,
+            dcp_size,
+        )
+        for r in range(dcp_size)
+    ]
+    ref_lses = torch.stack([m[1] for m in ref_merged], dim=0)
+    ref_global_lse = torch.logsumexp(ref_lses, dim=0)
+    expected_full_out = sum(
+        ref_merged[r][0] * torch.exp(ref_merged[r][1] - ref_global_lse).unsqueeze(-1)
+        for r in range(dcp_size)
+    ).numpy()
+
+    rank_outs = []
+    cfg = SimpleNamespace(
+        parallel_config=SimpleNamespace(
+            tensor_parallel_size=_TP_SIZE,
+            prefill_context_parallel_size=1,
+            decode_context_parallel_size=dcp_size,
+        )
+    )
+    for r in range(dcp_size):
+        grp = SimpleNamespace(
+            rank_in_group=r,
+            world_size=dcp_size,
+            all_gather=lambda t, dim=0: (
+                cache_cases[0][0][1] if dim == 1 else ref_lses
+            ).to(t.device),
+            reduce_scatter=lambda *_a, **_k: (_ for _ in ()).throw(
+                AssertionError("reduce_scatter called")
+            ),
+        )
+        monkeypatch.setattr(attention, "_get_dcp_group", lambda g=grp: g)
+        monkeypatch.setattr(cp_attention, "get_dcp_group", lambda g=grp: g)
+        monkeypatch.setattr(cp_attention, "_DCP_KERNEL_REGISTRY", {})
+        monkeypatch.setattr(cp_attention.envs, "TPU_DCP_DUPLICATE_O_PROJ", True)
+
+        impl = attention.PallasBatchedRPAAttentionBackendImpl(
+            num_heads=own_q_heads,
+            head_size=_HEAD_DIM,
+            scale=_HEAD_DIM**-0.5,
+            num_kv_heads=1,
+            alibi_slopes=None,
+            sliding_window=None,
+            kv_cache_dtype="fp8",
+        )
+        layer = SimpleNamespace(
+            _k_scale_float=_K_SCALE, _v_scale_float=_V_SCALE, dcp_duplicate_o_proj=True
+        )
+        with set_vllm_model_wrapper_context(mesh=None, vllm_config=cfg):
+            impl.initialize_kernel(layer)
+            cache, q_full, k, v, sl, bt, qsl, rd = cache_cases[r][0]
+            q_arg = (
+                q_full.view(-1, own_q_heads, _HEAD_DIM).contiguous()
+                if pre_gathered_q
+                else q_full[:, r * own_q_heads : (r + 1) * own_q_heads].contiguous()
+            )
+            meta = SimpleNamespace(
+                seq_lens=sl.to("tpu"),
+                block_tables=bt.to("tpu"),
+                query_start_loc=qsl.to("tpu"),
+                request_distribution=rd.to("tpu"),
+            )
+            cache_tpu = cache.to("tpu")
+            out = impl.forward(
+                layer=layer,
+                query=q_arg.to("tpu"),
+                key=(k.float() * _K_SCALE).to(torch.bfloat16).to("tpu"),
+                value=(v.float() * _V_SCALE).to(torch.bfloat16).to("tpu"),
+                kv_cache=cache_tpu,
+                attn_metadata=meta,
+            )
+            rank_outs.append(out.cpu().float().numpy())
+            np.testing.assert_array_equal(
+                cache_tpu.cpu().float().numpy(), new_cases[r][3]
+            )
+    np.testing.assert_allclose(sum(rank_outs), expected_full_out, atol=5e-3, rtol=1e-2)

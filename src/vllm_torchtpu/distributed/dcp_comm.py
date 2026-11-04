@@ -109,3 +109,41 @@ def cp_lse_ag_out_rs(
     heads = merged.shape[1]
     start = int(group.rank_in_group) * heads
     return merged, merged_lse[:, start : start + heads]
+
+
+@overload
+def cp_lse_ag_out_scale(
+    output: torch.Tensor,
+    lse: torch.Tensor,
+    group: Any | None,
+    return_lse: Literal[False] = False,
+) -> torch.Tensor: ...
+
+
+@overload
+def cp_lse_ag_out_scale(
+    output: torch.Tensor,
+    lse: torch.Tensor,
+    group: Any | None,
+    return_lse: Literal[True],
+) -> tuple[torch.Tensor, torch.Tensor]: ...
+
+
+def cp_lse_ag_out_scale(
+    output: torch.Tensor,
+    lse: torch.Tensor,
+    group: Any | None,
+    return_lse: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    """Rescale partial attention outputs by global merged LSE without reduce-scatter."""
+    if group is None or int(group.world_size) == 1:
+        return (output, lse) if return_lse else output
+
+    lse_f32 = lse.to(torch.float32)
+    lses = group.all_gather(lse_f32.unsqueeze(0).contiguous(), dim=0)
+    merged_lse = torch.logsumexp(lses, dim=0)
+    weight = torch.exp(lse_f32 - merged_lse).unsqueeze(-1)
+    scaled = torch.where(weight > 0, output.to(torch.float32) * weight, 0.0).to(
+        output.dtype
+    )
+    return (scaled, merged_lse) if return_lse else scaled
