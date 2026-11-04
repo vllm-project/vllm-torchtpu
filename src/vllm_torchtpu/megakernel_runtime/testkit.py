@@ -45,7 +45,7 @@ from types import ModuleType, SimpleNamespace
 from typing import Any
 from unittest import mock
 
-import pytest
+import pytest  # pyrefly: ignore[missing-import]
 
 from .plugin import TpuMonoSpec
 from .testing import fake_runner
@@ -148,7 +148,7 @@ def route_lazy_loggers(monkeypatch: pytest.MonkeyPatch, *packages: str) -> None:
         if not name.startswith(prefixes):
             continue
         lazy = getattr(sys.modules[name], "logger", None)
-        if not callable(getattr(lazy, "_resolve", None)):
+        if lazy is None or not callable(getattr(lazy, "_resolve", None)):
             continue
         try:
             lazy._resolve()
@@ -253,8 +253,8 @@ class CpuE2EResult:
 
 def _set_plugin(runner: Any, plugin: str | ModuleType | None, options: Any) -> None:
     add_cfg = runner.vllm_config.additional_config
-    mk_cfg = add_cfg.get("megakernel")
-    mk_cfg = dict(mk_cfg) if isinstance(mk_cfg, Mapping) else {}
+    raw = add_cfg.get("megakernel")
+    mk_cfg: dict[str, Any] = dict(raw) if isinstance(raw, Mapping) else {}
     if plugin is not None:
         mod, attr = _plugin_ref(plugin)
         mk_cfg["plugin"] = mod if attr == "SPEC" else f"{mod}:{attr}"

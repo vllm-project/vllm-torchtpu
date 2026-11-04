@@ -30,7 +30,7 @@ from types import SimpleNamespace
 from typing import Any
 
 import numpy as np
-import pytest
+import pytest  # pyrefly: ignore[missing-import]
 import torch
 
 from vllm_torchtpu.megakernel.runtime import (
@@ -48,7 +48,7 @@ from .tiny import (
     tiny_geom,
 )
 
-FOLDER = __package__.rpartition(".")[0]
+FOLDER = (__package__ or "").rpartition(".")[0]
 
 
 @pytest.fixture

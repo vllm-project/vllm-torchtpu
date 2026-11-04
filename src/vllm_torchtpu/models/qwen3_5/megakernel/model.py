@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import dataclasses
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, cast
 
 from vllm_torchtpu.megakernel import cache, kernel
 from vllm_torchtpu.megakernel.exec_spec import ExecSpec
@@ -157,15 +157,16 @@ def register() -> type[Qwen35]:
     are left as they are (a profile may have been replaced since)."""
     if find_model(Qwen35.name) is Qwen35:
         return Qwen35
-    return register_model(
+    registered = register_model(
         name=Qwen35.name,
         hf_architectures=Qwen35.hf_architectures,
         hf_model_type=Qwen35.hf_model_type,
     )(Qwen35)
+    return cast("type[Qwen35]", registered)
 
 
 MKConfig = Qwen35Geometry
-FULL = Qwen35.derive_geometry(DEFAULT_HF_CONFIG, moe_tp=True)
+FULL = cast(Qwen35Geometry, Qwen35.derive_geometry(DEFAULT_HF_CONFIG, moe_tp=True))
 FULL_EP = dataclasses.replace(FULL, moe_tp=False)
 TINY = dataclasses.replace(Qwen35.shrink(DEFAULT_HF_CONFIG, periods=1), moe_tp=True)
 TINY_EP = dataclasses.replace(TINY, moe_tp=False)

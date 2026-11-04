@@ -15,7 +15,7 @@
 
 from __future__ import annotations
 
-import pytest
+import pytest  # pyrefly: ignore[missing-import]
 
 from vllm_torchtpu.megakernel_runtime.testkit import mk_fake_runner as mk_fake_runner
 from vllm_torchtpu.megakernel_runtime.testkit import route_lazy_loggers
@@ -25,4 +25,4 @@ from vllm_torchtpu.megakernel_runtime.testkit import route_lazy_loggers
 def _std_loggers(monkeypatch: pytest.MonkeyPatch) -> None:
     """Route the runtime's and this folder's lazy vLLM loggers to `logging`
     when vLLM is absent (CPU)."""
-    route_lazy_loggers(monkeypatch, __package__.rpartition(".")[0])
+    route_lazy_loggers(monkeypatch, (__package__ or "").rpartition(".")[0])

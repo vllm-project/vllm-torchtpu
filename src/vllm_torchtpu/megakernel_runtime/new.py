@@ -214,17 +214,18 @@ def _plan_renames(
     spec_node = _spec_name_node(trees[init])
     if spec_node is None:
         raise ScaffoldError(f"{init}: no `SPEC = TpuMonoSpec(name=...)` string")
-    old_spec = spec_node.value
+    old_spec = str(spec_node.value)
     renames = {old_spec: name}
     edits[init][id(spec_node)] = (spec_node, name)
 
     profile_re = re.compile(rf"^{re.escape(old_spec)}-[A-Za-z0-9_.-]+$")
     for path, tree in trees.items():
         for const in _plain_str_consts(tree):
-            if profile_re.match(const.value):
-                new = name + const.value[len(old_spec) :]
+            value = str(const.value)
+            if profile_re.match(value):
+                new = name + value[len(old_spec) :]
                 edits[path][id(const)] = (const, new)
-                renames[const.value] = new
+                renames[value] = new
 
     assigns = {
         ident: (path, const)
@@ -239,7 +240,7 @@ def _plan_renames(
                 site = assigns[expr.id]
             else:
                 raise ScaffoldError(f"{path}: can't resolve the ModelDef name")
-            renames[site[1].value] = model_name
+            renames[str(site[1].value)] = model_name
             edits[site[0]][id(site[1])] = (site[1], model_name)
     old_models = {k for k, v in renames.items() if v == model_name}
     for path, tree in trees.items():

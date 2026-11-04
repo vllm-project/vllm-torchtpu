@@ -115,6 +115,11 @@ def populate_qwen35_hf_experts(
     return {gup_k, dn_k}
 
 
+def _split_start(decl: Any) -> int:
+    """Where a split declaration's slice starts (its fused key's order)."""
+    return decl.transform.split_slice[0]
+
+
 def _populate_qwen35_hf_state_dict(
     m_def: Any,
     g: ModelGeometry,
@@ -178,7 +183,7 @@ def _populate_qwen35_hf_state_dict(
                 hf_k = _resolve_layer_hf_key(lyr, raw_k)
                 if hf_k not in sd:
                     raise KeyError(f"HF state_dict missing fused split key {hf_k!r}")
-                s_sorted = sorted(s_decls, key=lambda x: x.transform.split_slice[0])
+                s_sorted = sorted(s_decls, key=_split_start)
                 parts = [
                     _dequantize_decl_to_torch(
                         d, by_name, w_hf_q, torch_mod, ord_idx=ord_idx

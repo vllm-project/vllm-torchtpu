@@ -255,7 +255,7 @@ class VLLMWeightSource:
         if hasattr(proj_or_parent, "weight"):
             for s_attr in ("weight_scale_inv", "weight_scale"):
                 s = getattr(proj_or_parent, s_attr, None)
-                if isinstance(s, torch.Tensor):
+                if s is not None and isinstance(s, torch.Tensor):
                     return s.data
         if alias.scale_source is not None:
             res = _walk_attr(layer, alias.scale_source)
