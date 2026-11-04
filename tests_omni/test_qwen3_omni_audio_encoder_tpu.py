@@ -66,7 +66,7 @@ from vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_moe_thinker import (
 )
 
 from tests_omni.omni_test_utils import assert_numerical_parity
-from vllm_torchtpu.models.vllm.qwen3omni_thinker_patch import (
+from vllm_torchtpu.omni.qwen3omni_thinker_patch import (
     _AUDIO_CHUNK_LENGTHS_PATCHED,
     maybe_patch_qwen3_omni_thinker,
 )
