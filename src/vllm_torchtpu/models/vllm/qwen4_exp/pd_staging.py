@@ -25,6 +25,7 @@ Mosaic bitcasts, which pack the 4 sublanes at a lane into one 32-bit word, low
 byte first (``kernels/typed_ldst.py``, ``megakernel_runtime/qwen38_gdn_state``).
 """
 
+import copy
 import dataclasses
 import math
 from collections.abc import Sequence
@@ -71,6 +72,15 @@ class RankSlice:
     @property
     def dcp_rank(self) -> int:
         return self.tp_rank % self.main_dcp
+
+
+def without_speculation(cfg):
+    """A shallow copy of ``cfg`` with speculative decoding off (a peer's plan)."""
+    if getattr(cfg, "speculative_config", None) is None:
+        return cfg
+    out = copy.copy(cfg)
+    object.__setattr__(out, "speculative_config", None)
+    return out
 
 
 def owner_kind(name: str) -> str:
@@ -415,6 +425,7 @@ class StagedConsumer:
             RegionSpec,
         )
 
+        from .config import num_speculative_tokens
         from .pd import TransferExtent, build_transfer_groups
         from .pool_layout import pack_compressed_k_enabled, pack_main_kv_enabled, pooled_cache_specs
 
@@ -426,8 +437,13 @@ class StagedConsumer:
         self.cfg, self.rank, self.pool = cfg, rank, pool
         self.dst_layout = decode_layout
         self.dst_groups = decode_groups
-        # The producer: TP1 stages, no main-KV DCP, the same packing flags.
-        self.src_layout, src_specs = pooled_cache_specs(cfg, tp=1, main_dcp=1)
+        # The producer: TP1 stages, no main-KV DCP, the same packing flags,
+        # and no MTP draft: a decode-only draft (this engine's
+        # speculative_config) adds draft owners and speculative state blocks
+        # the producer's plan does not have.
+        self.src_layout, src_specs = pooled_cache_specs(
+            without_speculation(cfg), tp=1, main_dcp=1
+        )
         self.src_groups = build_transfer_groups(get_kv_cache_groups(cfg, dict(src_specs)))
         self.src_block, self.dst_block = self.src_layout.block_size, decode_layout.block_size
         self.ratio = int(cfg.model_config.hf_text_config.indexer_compress_ratio)
@@ -466,6 +482,15 @@ class StagedConsumer:
         )
         self._src_owner = {n: g.group_index for g in self.src_groups for n in g.layer_names}
         self._dst_owner = {n: g.group_index for g in self.dst_groups for n in g.layer_names}
+        # Decode-only MTP: the draft layer's owners have no producer pages;
+        # its prompt KV starts empty (synthetic acceptance does not read it).
+        missing = set(self._dst_owner) - set(self._src_owner)
+        if any(not n.startswith("mtp.") for n in missing):
+            raise ValueError(f"Qwen PD staging lacks producer pages for {sorted(missing)}")
+        self._dst_owner = {n: g for n, g in self._dst_owner.items() if n not in missing}
+        # A speculative state table holds the committed state, then K
+        # speculative checkpoints: loads land in the committed entry.
+        self._state_entry = -(int(num_speculative_tokens(cfg)) + 1)
         self._gdn_names = [n for n in self._dst_owner if owner_kind(n) == "gdn"]
         self._token_extent = TransferExtent.TOKEN_PAGES
         tp = rank.tp_size
@@ -579,13 +604,14 @@ class StagedConsumer:
                 copy_s += s
                 copy_d += d
             elif kind in ("ring", "ple"):
-                s, d = page_prefix_rows(src[0], self.src_block, dst[0], self.dst_block,
+                entry = dst[self._state_entry] if kind == "ple" else dst[0]
+                s, d = page_prefix_rows(src[0], self.src_block, entry, self.dst_block,
                                         min(self.src_block, self.dst_block))
                 copy_s += s
                 copy_d += d
         for name in self._gdn_names:
             gdn_s.append(src_pages[self._src_owner[name]][0])
-            gdn_d.append(dst_tables[self._dst_owner[name]][0])
+            gdn_d.append(dst_tables[self._dst_owner[name]][self._state_entry])
         return main_s, main_d, copy_s, copy_d, gdn_s, gdn_d
 
     def repack(self, uuid: int, dst_tables, num_tokens: int) -> None:

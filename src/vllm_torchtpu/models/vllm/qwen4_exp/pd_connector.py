@@ -76,12 +76,28 @@ class Qwen4ExpRaidenConnector(TPURaidenConnector):
         # running state of its align-mode state tables (and ordinary, possibly
         # shared, token pages); a consumer adopts its local prefix and pulls
         # the suffix (supports_stage3_grouped_prefix_loads).
+        # MTP is admitted on a consumer behind TP1 pipeline stages only: the
+        # staging repack builds the producer's plan without the draft and
+        # lands states in the committed entry of a speculative table. The
+        # producer ships no draft KV, so the draft's prompt KV starts empty
+        # (meant for synthetic rejection sampling).
+        transfer = vllm_config.kv_transfer_config
+        decode_only_mtp = (
+            vllm_config.speculative_config is not None
+            and transfer is not None
+            and not transfer.is_kv_producer
+            and _use_per_layer_pool_tags()
+            and parallel.pipeline_parallel_size == 1
+            and parallel.tensor_parallel_size > 1
+        )
         if (
             parallel.prefill_context_parallel_size != 1
             or parallel.decode_context_parallel_size != 1
-            or vllm_config.speculative_config is not None
+            or (vllm_config.speculative_config is not None and not decode_only_mtp)
         ):
-            raise NotImplementedError("Qwen PD first requires CP1 and MTP off")
+            raise NotImplementedError(
+                "Qwen PD first requires CP1, and MTP only on a staged TP>1 decode"
+            )
         # A pipeline producer (Qwen3.5's prefill shape): each TP1 stage ships
         # its own layers' pages whole, paired with a TP1 consumer's pools by
         # per-layer tag, so both peers hold the same per-layer page encoding.
@@ -411,7 +427,10 @@ class Qwen4ExpRaidenWorker(TPURaidenConnectorWorker):
             not units
             or parallel.prefill_context_parallel_size != 1
             or parallel.decode_context_parallel_size != 1
-            or self.vllm_config.speculative_config is not None
+            or (
+                self.vllm_config.speculative_config is not None
+                and (self.is_producer or self.tp_size == 1)
+            )
         ):
             raise ValueError(
                 "Qwen PD requires matching TP (or a TP1 pipeline producer with "
