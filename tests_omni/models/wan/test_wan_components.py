@@ -21,15 +21,13 @@ Tiers:
 2. Tiny transformers (random weights, one per architecture class: T2V, I2V+CLIP,
    I2V-A14B (36ch, no CLIP), TI2V (2-D timestep), VACE). vllm-omni loads the
    diffusers state dict, so weight mapping and numerics are both covered.
-   Both vllm-omni fp32 and bf16 errors are bounded relative to diffusers' own
-   bf16 error, which isolates precision-policy differences (fp32
-   modulation/residuals) from expected bf16 truncation.
+   vllm-omni runs in fp32 and bf16, each gated on fixed rel_l2 / max_abs
+   limits against the diffusers CPU fp32 output.
 3. Tiny VAEs (random weights, Wan2.1 and Wan2.2 layouts): encode (posterior
-   mode, as the pipelines use) and decode, with the same relative error budget
-   as 2.
+   mode, as the pipelines use) and decode, gated as in 2.
 4. Tiny encoders (random weights): the Hugging Face UMT5 text encoder and CLIP
    vision encoder that the pipelines run on TPU, against the same modules on
-   CPU, with the same relative error budget as 2.
+   CPU, gated as in 2.
 
 All random inputs come from CPU generators so TPU and CPU see identical data.
 Real-checkpoint accuracy is out of scope here and belongs to the end-to-end

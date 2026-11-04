@@ -58,7 +58,7 @@ def assert_parity(
     - ``max_rel_l2``: ``||actual - reference|| / ||reference||`` upper bound.
     - ``max_abs``: largest elementwise absolute difference upper bound.
 
-    Metrics are computed in fp64.
+    At least one gate is required. Metrics are computed in fp64.
     """
     assert max_rel_l2 is not None or max_abs is not None, f"{name}: no gate given"
     assert actual.shape == reference.shape, (

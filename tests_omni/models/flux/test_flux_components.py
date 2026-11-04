@@ -51,7 +51,7 @@ GQA_ATTN_MAX_ABS = (7.2e-3, 1.3e-2)
 LONG_SEQ_ATTN_MAX_REL_L2 = (3.5e-3, 5.4e-3)
 LONG_SEQ_ATTN_MAX_ABS = (6.9e-4, 2.2e-3)
 # FIXME: masked calls take the TPU SDPA path, which currently returns wrong values
-# (fp32 rel_l2 0.60, bf16 NaN), so the masked test is a strict xfail. These reuse
+# (fp32 rel_l2 0.60, bf16 NaN), so the masked parity test is a strict xfail. These reuse
 # the standard-attention limits; recalibrate them when the fix removes the xfail.
 MASKED_ATTN_MAX_REL_L2 = STANDARD_ATTN_MAX_REL_L2
 MASKED_ATTN_MAX_ABS = STANDARD_ATTN_MAX_ABS
