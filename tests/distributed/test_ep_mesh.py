@@ -26,6 +26,7 @@ from vllm_torchtpu.distributed import ep_mesh as ep
 @pytest.fixture(autouse=True)
 def mesh_cache(monkeypatch):
     monkeypatch.setattr(ep, "_MESH_CACHE", {})
+    monkeypatch.setattr(ep, "_DEVICE_IDS_CACHE", {})
     monkeypatch.setattr(ep, "_TOKEN_GROUP_CACHE", {})
     monkeypatch.setattr(ep, "get_pcp_world_size", lambda: 1)
     monkeypatch.setattr(ep, "get_dcp_world_size", lambda: 1)
