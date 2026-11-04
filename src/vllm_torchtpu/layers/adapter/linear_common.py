@@ -255,7 +255,12 @@ _fp8_swiglu_mlp_ops: dict[float, Callable] = {}
 _fp8_swiglu_mlp_ops_lock = Lock()
 
 
-def _get_fp8_swiglu_mlp_op(limit: float) -> Callable:
+def get_fp8_swiglu_mlp_op(limit: float) -> Callable:
+    """The cached torch op for `limit`; build it before tracing (dynamo cannot
+    enter the lock)."""
+    op = _fp8_swiglu_mlp_ops.get(limit)
+    if op is not None:
+        return op
     with _fp8_swiglu_mlp_ops_lock:
         if limit not in _fp8_swiglu_mlp_ops:
             tag = f"{limit:g}".replace(".", "p").replace("-", "m")
@@ -284,7 +289,7 @@ def fp8_swiglu_mlp(
     scales; `w13` holds the gate columns, then the up columns.
     """
     x_2d = x.reshape(-1, x.shape[-1])
-    out = _get_fp8_swiglu_mlp_op(float(limit))(x_2d, w13, s13, w2, s2)
+    out = get_fp8_swiglu_mlp_op(float(limit))(x_2d, w13, s13, w2, s2)
     return out.reshape(*x.shape[:-1], w2.shape[1])
 
 

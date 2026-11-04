@@ -89,6 +89,12 @@ class DeepseekV4MLP(nn.Module):
             self.act_fn = SiluAndMulWithClamp(swiglu_limit)
         else:
             self.act_fn = SiluAndMul()
+        if envs.TPU_DEEPSEEK_V41_FUSED_SHARED_EXPERT and swiglu_limit is not None:
+            from vllm_torchtpu.layers.adapter.linear_common import (
+                get_fp8_swiglu_mlp_op,
+            )
+
+            get_fp8_swiglu_mlp_op(float(swiglu_limit))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if envs.TPU_DEEPSEEK_V41_FUSED_SHARED_EXPERT:

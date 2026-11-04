@@ -58,9 +58,14 @@ def compiled():
     from vllm.model_executor.layers.activation import SiluAndMulWithClamp
 
     from vllm_torchtpu.layers.adapter.linear_common import (
+        _get_quantized_matmul_op,
         fp8_swiglu_mlp,
+        get_fp8_swiglu_mlp_op,
         quantized_matmul,
     )
+
+    _get_quantized_matmul_op()
+    get_fp8_swiglu_mlp_op(LIMIT)
 
     with set_current_vllm_config(VllmConfig()):
         act = SiluAndMulWithClamp(LIMIT)
