@@ -531,7 +531,7 @@ def patch_cos_sin_cache_buffers(model: nn.Module) -> int:
             setattr(
                 module,
                 buf_name,
-                InGraphCosSinCache(segments, buf.dtype, *buf.shape),
+                InGraphCosSinCache(segments, buf.dtype, buf.shape[0], buf.shape[1]),
             )
             patched = True
         num_patched += patched
