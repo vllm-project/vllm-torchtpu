@@ -20,6 +20,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
+from vllm_torchtpu.models.minimax_m3.kernels import msa_attention
 from vllm_torchtpu.models.minimax_m3.kernels.msa_attention import (
     msa_sparse_attention,
 )
@@ -50,13 +51,16 @@ def _reference(q, kv, selected, local_page, local_limit):
 
 
 @pytest.mark.parametrize(
-    "num_tokens,num_real",
+    "num_tokens,num_real,tokens_per_call",
     [
-        (37, 35),  # last tile part padding, token count not a tile multiple
-        (48, 20),  # one tile entirely padding
+        (37, 35, None),  # last tile part padding, token count not a tile multiple
+        (48, 20, None),  # one tile entirely padding
+        (40, 33, 16),  # several kernel calls (a distinct shape: no jit reuse)
     ],
 )
-def test_matches_dense_reference(num_tokens, num_real):
+def test_matches_dense_reference(num_tokens, num_real, tokens_per_call, monkeypatch):
+    if tokens_per_call is not None:
+        monkeypatch.setattr(msa_attention, "MAX_TOKENS_PER_CALL", tokens_per_call)
     rng = np.random.default_rng(num_tokens)
     q = jnp.asarray(rng.standard_normal((num_tokens, HEADS, HEAD_DIM))).astype(
         jnp.bfloat16

@@ -33,16 +33,20 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 DEFAULT_BLOCK_Q = 16
+# Tokens per kernel call. The work list lives in SMEM, sized for the worst
+# case of tokens * topk pages: two int32 entries per pair.
+MAX_TOKENS_PER_CALL = 2048
+_FIRST_BIT = 1
+_LAST_BIT = 2
+_TILE_SHIFT = 2
 _MASK_VALUE = -1e30
 _NO_PAGE = jnp.iinfo(jnp.int32).max
 
 
 def _kernel(
     # Scalar prefetch
-    work_tile_ref,
-    work_page_ref,
-    work_first_ref,
-    work_last_ref,
+    work_page_ref,  # page of each work item
+    work_meta_ref,  # tile << _TILE_SHIFT | last and first bits
     # In
     q_ref,  # [H, Bq, D]
     selected_ref,  # [Bq, K] physical pages, -1 padded
@@ -63,7 +67,9 @@ def _kernel(
     num_heads, block_q, head_dim = q_ref.shape
     page_size = kv_ref.shape[1]
 
-    @pl.when(work_first_ref[w] == 1)
+    meta = work_meta_ref[w]
+
+    @pl.when((meta & _FIRST_BIT) != 0)
     def _init():
         m_ref[...] = jnp.full_like(m_ref, _MASK_VALUE)
         l_ref[...] = jnp.zeros_like(l_ref)
@@ -104,7 +110,7 @@ def _kernel(
     )
     m_ref[...] = m_new
 
-    @pl.when(work_last_ref[w] == 1)
+    @pl.when((meta & _LAST_BIT) != 0)
     def _finalize():
         denom = l_ref[...]
         out = jnp.where(denom > 0, acc_ref[...] / jnp.where(denom > 0, denom, 1.0), 0.0)
@@ -132,9 +138,66 @@ def _work_list(selected: jax.Array, block_q: int):
     )
     idx = w - (ends[tile] - count[tile])
     page = union[tile, jnp.clip(idx, 0, block_q * topk - 1)]
-    first = (idx == 0).astype(jnp.int32)
-    last = (idx == count[tile] - 1).astype(jnp.int32)
-    return tile, page, first, last, total
+    meta = (
+        (tile << _TILE_SHIFT)
+        | jnp.where(idx == 0, _FIRST_BIT, 0)
+        | jnp.where(idx == count[tile] - 1, _LAST_BIT, 0)
+    )
+    return page, meta.astype(jnp.int32), total
+
+
+def _attention_call(
+    q, kv_cache, selected, local_page, local_limit, *, sm_scale, block_q, interpret
+):
+    """One kernel call over a token count that is a multiple of block_q."""
+    num_tokens, num_heads, head_dim = q.shape
+    page_size = kv_cache.shape[1]
+    topk = selected.shape[1]
+    page, meta, total = _work_list(selected, block_q)
+
+    def tile_block(w, page, meta):
+        return (meta[w] >> _TILE_SHIFT, 0)
+
+    def head_major_block(w, page, meta):
+        return (0, meta[w] >> _TILE_SHIFT, 0)
+
+    grid_spec = pltpu.PrefetchScalarGridSpec(
+        num_scalar_prefetch=2,
+        grid=(total,),
+        in_specs=[
+            pl.BlockSpec((num_heads, block_q, head_dim), head_major_block),
+            pl.BlockSpec((block_q, topk), tile_block),
+            pl.BlockSpec((block_q, 1), tile_block),
+            pl.BlockSpec((block_q, 1), tile_block),
+            pl.BlockSpec(
+                (1, page_size, 2, head_dim),
+                lambda w, page, meta: (page[w], 0, 0, 0),
+            ),
+        ],
+        out_specs=pl.BlockSpec((num_heads, block_q, head_dim), head_major_block),
+        scratch_shapes=[
+            pltpu.VMEM((num_heads * block_q, 1), jnp.float32),
+            pltpu.VMEM((num_heads * block_q, 1), jnp.float32),
+            pltpu.VMEM((num_heads * block_q, head_dim), jnp.float32),
+        ],
+    )
+    out = pl.pallas_call(
+        functools.partial(_kernel, sm_scale=sm_scale),
+        grid_spec=grid_spec,
+        out_shape=jax.ShapeDtypeStruct((num_heads, num_tokens, head_dim), q.dtype),
+        compiler_params=pltpu.CompilerParams(dimension_semantics=("arbitrary",)),
+        interpret=interpret,
+        name="minimax_m3_msa_sparse_attention",
+    )(
+        page,
+        meta,
+        q.transpose(1, 0, 2),
+        selected,
+        local_page[:, None],
+        local_limit[:, None],
+        kv_cache.reshape(-1, page_size, 2, head_dim),
+    )
+    return out.transpose(1, 0, 2)
 
 
 @functools.partial(jax.jit, static_argnames=("sm_scale", "block_q", "interpret"))
@@ -161,67 +224,31 @@ def msa_sparse_attention(
     Returns:
       ``[T, H, D]`` outputs; padding tokens get zeros.
     """
-    num_tokens, num_heads, head_dim = q.shape
-    _, page_size, kv_groups, packing, _ = kv_cache.shape
+    num_tokens = q.shape[0]
+    _, _, kv_groups, packing, _ = kv_cache.shape
     if (kv_groups, packing, kv_cache.dtype) != (1, 2, jnp.bfloat16):
         raise NotImplementedError(
             "MSA attention supports one bf16 KV head per rank, got cache "
             f"{kv_cache.shape} {kv_cache.dtype}."
         )
-    topk = selected.shape[1]
     pad = -num_tokens % block_q
     if pad:
         q = jnp.pad(q, ((0, pad), (0, 0), (0, 0)))
         selected = jnp.pad(selected, ((0, pad), (0, 0)), constant_values=-1)
         local_page = jnp.pad(local_page, (0, pad), constant_values=-1)
         local_limit = jnp.pad(local_limit, (0, pad))
-    padded_tokens = num_tokens + pad
-    tile, page, first, last, total = _work_list(selected, block_q)
-
-    def tile_block(w, tile, *_):
-        return (tile[w], 0)
-
-    grid_spec = pltpu.PrefetchScalarGridSpec(
-        num_scalar_prefetch=4,
-        grid=(total,),
-        in_specs=[
-            pl.BlockSpec(
-                (num_heads, block_q, head_dim),
-                lambda w, tile, *_: (0, tile[w], 0),
-            ),
-            pl.BlockSpec((block_q, topk), tile_block),
-            pl.BlockSpec((block_q, 1), tile_block),
-            pl.BlockSpec((block_q, 1), tile_block),
-            pl.BlockSpec(
-                (1, page_size, 2, head_dim),
-                lambda w, tile, page, *_: (page[w], 0, 0, 0),
-            ),
-        ],
-        out_specs=pl.BlockSpec(
-            (num_heads, block_q, head_dim), lambda w, tile, *_: (0, tile[w], 0)
-        ),
-        scratch_shapes=[
-            pltpu.VMEM((num_heads * block_q, 1), jnp.float32),
-            pltpu.VMEM((num_heads * block_q, 1), jnp.float32),
-            pltpu.VMEM((num_heads * block_q, head_dim), jnp.float32),
-        ],
+    call = functools.partial(
+        _attention_call, sm_scale=sm_scale, block_q=block_q, interpret=interpret
     )
-    out = pl.pallas_call(
-        functools.partial(_kernel, sm_scale=sm_scale),
-        grid_spec=grid_spec,
-        out_shape=jax.ShapeDtypeStruct((num_heads, padded_tokens, head_dim), q.dtype),
-        compiler_params=pltpu.CompilerParams(dimension_semantics=("arbitrary",)),
-        interpret=interpret,
-        name="minimax_m3_msa_sparse_attention",
-    )(
-        tile,
-        page,
-        first,
-        last,
-        q.transpose(1, 0, 2),
-        selected,
-        local_page[:, None],
-        local_limit[:, None],
-        kv_cache.reshape(-1, page_size, 2, head_dim),
-    )
-    return out.transpose(1, 0, 2)[:num_tokens]
+    step = MAX_TOKENS_PER_CALL - MAX_TOKENS_PER_CALL % block_q
+    outputs = [
+        call(
+            q[start : start + step],
+            kv_cache,
+            selected[start : start + step],
+            local_page[start : start + step],
+            local_limit[start : start + step],
+        )
+        for start in range(0, num_tokens + pad, step)
+    ]
+    return jnp.concatenate(outputs, axis=0)[:num_tokens]
