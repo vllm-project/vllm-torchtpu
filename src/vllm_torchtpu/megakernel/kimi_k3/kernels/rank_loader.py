@@ -68,6 +68,14 @@ def expert_layout() -> dict[str, tuple[int, ...]]:
         return dict(SPLIT_EXPERT_LAYOUT)
     if layout == "banks":
         return {family: EXPERT_BANK_SIZES for family in EXPERT_FAMILIES}
+    # Diagnostics: the split layout with the scales in their weights' layout,
+    # and with down in the banks too (scales whole).
+    if layout == "split_scales":
+        down = SPLIT_EXPERT_LAYOUT["expert_down"]
+        return {"expert_gu": EXPERT_BANK_SIZES, "expert_gus": EXPERT_BANK_SIZES,
+                "expert_down": down, "expert_ds": down}
+    if layout == "split_down_banks":
+        return {**SPLIT_EXPERT_LAYOUT, "expert_down": EXPERT_BANK_SIZES}
     raise ValueError(f"unknown expert_layout {layout!r}")
 
 
