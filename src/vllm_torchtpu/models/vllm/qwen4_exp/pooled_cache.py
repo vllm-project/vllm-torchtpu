@@ -285,6 +285,45 @@ class Qwen4ExpPooledCache:
             required,
         )
 
+    def _bind_stage_page_map(self, config):
+        """Install the stage's block-ID -> page map; return the physical plan.
+
+        Only a pipeline stage under QWEN4_EXP_PP_LOGICAL_BLOCKS_FACTOR plans
+        a scheduler pool larger than its own; anything else is a plan
+        mismatch.
+        """
+        from .config import pp_logical_block_factor
+        from .stage_pages import StagePageMap
+
+        cfg = self.runner.vllm_config
+        native = self.native_config
+        factor = pp_logical_block_factor(cfg)
+        if factor <= 1 or config.num_blocks != native.num_blocks * factor:
+            raise AssertionError(
+                "Qwen4Exp native pool plan changed after profiling: scheduler "
+                f"{config.num_blocks} blocks, stage {native.num_blocks}"
+            )
+        if [g.layer_names for g in config.kv_cache_groups] != [
+            g.layer_names for g in native.kv_cache_groups
+        ] or [g.kv_cache_spec for g in config.kv_cache_groups] != [
+            g.kv_cache_spec for g in native.kv_cache_groups
+        ]:
+            raise AssertionError("Qwen4Exp scheduler and stage cache groups differ")
+        own = [gid for gid, g in enumerate(native.kv_cache_groups) if g.layer_names]
+        self.runner.qwen4_stage_page_map = StagePageMap(
+            native.num_blocks, config.num_blocks, own, len(native.kv_cache_groups)
+        )
+        logger.info(
+            "Qwen4Exp stage pages: %d scheduler block IDs on %d pages "
+            "(factor %d), own groups %s of %d",
+            config.num_blocks,
+            native.num_blocks,
+            factor,
+            own,
+            len(native.kv_cache_groups),
+        )
+        return native
+
     def bind_draft(self) -> None:
         """Bind the MTP draft's QSA layers once both they and the pool exist.
 
@@ -321,10 +360,15 @@ class Qwen4ExpPooledCache:
             self._materialize(config.num_blocks, final=True)
         else:
             self.allocate()
+        runner = self.runner
+        runner.qwen4_stage_page_map = None
+        if config.num_blocks != self.native_config.num_blocks:
+            # The scheduler plans more block IDs than this stage has pages;
+            # the stage maps its own groups' IDs onto its pool.
+            config = self._bind_stage_page_map(config)
         assert config == self.native_config, (
             "Qwen4Exp native pool plan changed after profiling"
         )
-        runner = self.runner
         runner.kv_cache_config = config
         runner.empty_slot_mappings = {
             gid: torch.empty(0, device=runner.device) for gid in range(len(self.groups))

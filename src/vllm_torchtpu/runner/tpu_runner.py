@@ -2682,6 +2682,11 @@ class TPUModelRunner(GPUModelRunner):
         input_batch._tpu_spec_room_guard = True
 
     def _update_states(self, scheduler_output: "SchedulerOutput") -> Any:
+        page_map = getattr(self, "qwen4_stage_page_map", None)
+        if page_map is not None:
+            # A pipeline stage behind a larger scheduler block-ID space: this
+            # stage's own groups address its pool through the stage map.
+            scheduler_output = page_map.translate(scheduler_output)
         invalidated_req_ids = (
             scheduler_output.finished_req_ids
             | (scheduler_output.preempted_req_ids or set())

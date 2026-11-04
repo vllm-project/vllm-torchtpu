@@ -448,7 +448,14 @@ class Qwen4ExpRaidenWorker(TPURaidenConnectorWorker):
         self, req_meta: SendMeta, num_tokens: int
     ) -> tuple[tuple[tuple[int, ...], ...], list[PoolSpanRegistration]]:
         plan = self._page_plan()
-        pages = plan.request_pages(req_meta.group_block_ids, num_tokens)
+        # A pipeline stage behind a larger scheduler block-ID space reads its
+        # own groups' pages through the stage map; the request's tables, the
+        # controller's block list and every replay check stay in block IDs.
+        translate = getattr(
+            getattr(self, "runner", None), "qwen4_stage_page_map", None
+        )
+        translate = None if translate is None else translate.lookup
+        pages = plan.request_pages(req_meta.group_block_ids, num_tokens, translate)
         if tuple(req_meta.local_block_ids) != pages[0]:
             raise ValueError("Qwen PD primary pages differ from the full group table")
         # A producer serving a caching decode declares its token pages in the
@@ -460,6 +467,8 @@ class Qwen4ExpRaidenWorker(TPURaidenConnectorWorker):
         spans = []
         for pool, group_index in plan.pool_groups():
             ids = pages[group_index]
+            if translate is not None:
+                ids = translate(group_index, ids)
             global_space = (
                 clippable
                 and plan.groups[group_index].extent is TransferExtent.TOKEN_PAGES
@@ -626,8 +635,13 @@ class QwenPagePlan:
         return tuple((pool, owners[pool.layer_name]) for pool in self.manifest.pools)
 
     def request_pages(
-        self, tables: list[list[int]] | None, num_tokens: int
+        self,
+        tables: list[list[int]] | None,
+        num_tokens: int,
+        translate=None,
     ) -> tuple[tuple[int, ...], ...]:
+        """The committed block IDs per group; ``translate(group, ids)``, when
+        given, maps a group's IDs to the pages checked against the carrier."""
         if tables is None or num_tokens <= 0:
             raise ValueError("Qwen PD requires complete committed group tables")
         # The scheduler verifies actual computed == published before emitting
@@ -637,7 +651,10 @@ class QwenPagePlan:
         )
         occupied: set[tuple[int, int]] = set()
         for pool, group_index in self.pool_groups():
-            for page in pages[group_index]:
+            ids = pages[group_index]
+            if translate is not None:
+                ids = translate(group_index, ids)
+            for page in ids:
                 if page >= pool.num_blocks:
                     raise ValueError("Qwen PD page is outside its native carrier")
                 key = (pool.storage_index, page)
