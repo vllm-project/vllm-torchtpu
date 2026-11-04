@@ -19,6 +19,7 @@ import pytest
 
 from vllm_torchtpu.layers.adapter import quantization
 from vllm_torchtpu.layers.adapter.quantization.configs import VllmQuantConfig
+from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
 
 
 class _ConfigA(VllmQuantConfig):
@@ -32,7 +33,16 @@ class _ConfigB(VllmQuantConfig):
 @pytest.fixture
 def registry(monkeypatch):
     monkeypatch.setattr(quantization, "_MODEL_QUANT_CONFIGS", {})
+    monkeypatch.setattr(
+        TpuPlatform, "supported_quantization", list(TpuPlatform.supported_quantization)
+    )
     return quantization._MODEL_QUANT_CONFIGS
+
+
+def test_registered_method_passes_platform_check(registry) -> None:
+    quantization.register_tpu_quant_config("model_fmt", _ConfigA)
+    quantization.register_tpu_quant_config("model_fmt", _ConfigA)
+    assert TpuPlatform.supported_quantization.count("model_fmt") == 1
 
 
 def test_registered_method_is_dispatched(registry, monkeypatch) -> None:
