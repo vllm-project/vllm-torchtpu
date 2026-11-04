@@ -840,11 +840,11 @@ class TestKVCacheManager:
     ):
         """GDN specs reach vLLM as RunnerSlotMambaSpec by default when
         compact-mamba sizing gave the runner its own GDN slots;
-        SKIP_MAMBA_SCHEDULER_BLOCKS=0 opts out."""
+        TPU_SKIP_MAMBA_SCHEDULER_BLOCKS=0 opts out."""
         if env_value is None:
-            monkeypatch.delenv("SKIP_MAMBA_SCHEDULER_BLOCKS", raising=False)
+            monkeypatch.delenv("TPU_SKIP_MAMBA_SCHEDULER_BLOCKS", raising=False)
         else:
-            monkeypatch.setenv("SKIP_MAMBA_SCHEDULER_BLOCKS", env_value)
+            monkeypatch.setenv("TPU_SKIP_MAMBA_SCHEDULER_BLOCKS", env_value)
         self.runner._uniform_mamba_layout = uniform_mamba_layout
 
         mock_attn = _attention_layer_mock()

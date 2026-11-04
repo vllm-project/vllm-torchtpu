@@ -32,7 +32,7 @@ That holds on the compact layout (the unified pool stores GDN state in those
 very blocks), for GDN layers, with mamba cache mode "none", no speculative
 decoding and no KV connector. It is derived from the config, so it is on by
 default; everything else keeps vLLM's MambaSpec and MambaManager.
-SKIP_MAMBA_SCHEDULER_BLOCKS=0 is a debug escape hatch back to the stock
+TPU_SKIP_MAMBA_SCHEDULER_BLOCKS=0 is a debug escape hatch back to the stock
 accounting, which charges blocks the runner never reads.
 
 ``check_runner_slot_groups`` guards the invariant this creates: a
@@ -43,9 +43,11 @@ Port of vllm-project/tpu-inference#3736.
 """
 
 import dataclasses
+from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
+from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_utils import KVCacheBlock
 from vllm.v1.core.single_type_kv_cache_manager import MambaManager
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec, MambaSpec
@@ -73,24 +75,39 @@ class RunnerSlotMambaSpec(MambaSpec):
 class RunnerSlotMambaManager(MambaManager):
     """A MambaManager that allocates no blocks.
 
-    The overrides take *args/**kwargs so they keep matching vLLM's signatures
-    across releases. Freeing and skipped-block removal need no override: they
-    walk the request's block list, which stays empty. KV-connector allocation
-    is never reached: the spec is not swapped when a connector is configured.
+    The overrides keep vLLM's MambaManager signatures, so the type checker
+    flags any signature change in a vLLM upgrade. Freeing and skipped-block
+    removal need no override: they walk the request's block list, which stays
+    empty. KV-connector allocation is never reached: the spec is not swapped
+    when a connector is configured.
     """
 
-    def __init__(self, kv_cache_spec: MambaSpec, block_pool, **kwargs) -> None:
+    def __init__(
+        self, kv_cache_spec: MambaSpec, block_pool: BlockPool, **kwargs
+    ) -> None:
         super().__init__(kv_cache_spec, block_pool, **kwargs)
         logger.info_once(
             "[runner_slot_mamba] GDN groups take no scheduler blocks: the "
-            "runner owns their state slots. SKIP_MAMBA_SCHEDULER_BLOCKS=0 "
+            "runner owns their state slots. TPU_SKIP_MAMBA_SCHEDULER_BLOCKS=0 "
             "restores vLLM's accounting."
         )
 
-    def get_num_blocks_to_allocate(self, *args, **kwargs) -> int:
+    def get_num_blocks_to_allocate(
+        self,
+        request_id: str,
+        num_tokens: int,
+        new_computed_blocks: Sequence[KVCacheBlock],
+        total_computed_tokens: int,
+        num_local_computed_tokens: int,
+        num_tokens_main_model: int,
+        apply_admission_cap: bool = False,
+        prefill_end: int = 0,
+    ) -> int:
         return 0
 
-    def allocate_new_blocks(self, *args, **kwargs) -> list[KVCacheBlock]:
+    def allocate_new_blocks(
+        self, request_id: str, num_tokens: int, num_tokens_main_model: int
+    ) -> list[KVCacheBlock]:
         return []
 
 
@@ -108,7 +125,10 @@ def _ineligible_reason(
         return f"its spec is {type(spec).__name__}, not MambaSpec"
     if spec.mamba_type != MambaAttentionBackendEnum.GDN_ATTN:
         return f"it applies to GDN layers only, not {spec.mamba_type.name}"
-    # The spec's own mamba_cache_mode is copied from this config by vLLM.
+    # The spec's own mamba_cache_mode is copied from this config. The mode
+    # tracks prefix caching: vLLM sets "align" for hybrid models whenever
+    # caching is on and "none" when it is off (MambaModelConfig), and
+    # TpuPlatform rejects caching on hybrid models off the unified pool.
     mode = vllm_config.cache_config.mamba_cache_mode
     if mode != "none":
         return f"mamba cache mode is {mode!r}, not 'none' (prefix caching)"
@@ -123,14 +143,14 @@ def maybe_runner_slot_mamba_spec(
     spec: KVCacheSpec, vllm_config: "VllmConfig", *, runner_owns_slots: bool
 ) -> KVCacheSpec:
     """Returns `spec` as a RunnerSlotMambaSpec when the runner owns its state
-    slots, otherwise `spec` unchanged. SKIP_MAMBA_SCHEDULER_BLOCKS=0 keeps
+    slots, otherwise `spec` unchanged. TPU_SKIP_MAMBA_SCHEDULER_BLOCKS=0 keeps
     every spec unchanged.
 
     `runner_owns_slots`: the runner indexes GDN state by its own per-request
     slot ids (the compact-mamba layout), so the layer's scheduler blocks are
     never read.
     """
-    if not envs.SKIP_MAMBA_SCHEDULER_BLOCKS or not isinstance(spec, MambaSpec):
+    if not envs.TPU_SKIP_MAMBA_SCHEDULER_BLOCKS or not isinstance(spec, MambaSpec):
         return spec
     reason = _ineligible_reason(spec, vllm_config, runner_owns_slots)
     if reason is not None:
@@ -173,7 +193,7 @@ def check_runner_slot_groups(
             "(RunnerSlotMambaSpec), but this runner has no compact mamba slot "
             "pool to index their state. The spec gate in get_kv_cache_spec and "
             "the slot-pool setup in initialize_kv_cache disagree; set "
-            "SKIP_MAMBA_SCHEDULER_BLOCKS=0 to work around it."
+            "TPU_SKIP_MAMBA_SCHEDULER_BLOCKS=0 to work around it."
         )
 
 

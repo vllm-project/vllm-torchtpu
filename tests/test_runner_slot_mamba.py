@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """GDN groups that take no scheduler blocks (core/runner_slot_mamba.py): the
-gate and its SKIP_MAMBA_SCHEDULER_BLOCKS=0 opt-out, the slot-pool check,
+gate and its TPU_SKIP_MAMBA_SCHEDULER_BLOCKS=0 opt-out, the slot-pool check,
 vLLM's registry and layer grouping, and admission / decode / free through
 vLLM's own KVCacheManager. No model weights or TPU execution."""
 
@@ -21,6 +21,8 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
+import vllm.platforms
+from vllm.v1 import kv_cache_spec_registry
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 from vllm.v1.core.kv_cache_coordinator import KVCacheCoordinatorNoPrefixCache
 from vllm.v1.core.kv_cache_manager import KVCacheManager
@@ -35,6 +37,7 @@ from vllm.v1.kv_cache_interface import (
 from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
 from vllm.v1.request import Request
 
+from vllm_torchtpu.compilation import tpu_compiler
 from vllm_torchtpu.core import runner_slot_mamba
 from vllm_torchtpu.core.runner_slot_mamba import (
     RunnerSlotMambaManager,
@@ -89,12 +92,12 @@ def _vllm_config(
 
 @pytest.fixture
 def flag_default(monkeypatch):
-    monkeypatch.delenv("SKIP_MAMBA_SCHEDULER_BLOCKS", raising=False)
+    monkeypatch.delenv("TPU_SKIP_MAMBA_SCHEDULER_BLOCKS", raising=False)
 
 
 @pytest.fixture
 def opt_out(monkeypatch):
-    monkeypatch.setenv("SKIP_MAMBA_SCHEDULER_BLOCKS", "0")
+    monkeypatch.setenv("TPU_SKIP_MAMBA_SCHEDULER_BLOCKS", "0")
 
 
 @pytest.fixture
@@ -117,9 +120,9 @@ class TestGate:
     @pytest.mark.parametrize("env_value", [None, "1"], ids=["unset", "explicit"])
     def test_swaps_gdn_spec_by_default(self, monkeypatch, env_value):
         if env_value is None:
-            monkeypatch.delenv("SKIP_MAMBA_SCHEDULER_BLOCKS", raising=False)
+            monkeypatch.delenv("TPU_SKIP_MAMBA_SCHEDULER_BLOCKS", raising=False)
         else:
-            monkeypatch.setenv("SKIP_MAMBA_SCHEDULER_BLOCKS", env_value)
+            monkeypatch.setenv("TPU_SKIP_MAMBA_SCHEDULER_BLOCKS", env_value)
         spec = _gdn_spec()
         out = maybe_runner_slot_mamba_spec(spec, _vllm_config(), runner_owns_slots=True)
         assert type(out) is RunnerSlotMambaSpec
@@ -213,23 +216,40 @@ class TestSlotGroupCheck:
 
 
 class TestRegistration:
-    def test_platform_hook_maps_spec_to_manager(self):
-        # Looking up a built-in spec loads vLLM's registrations, which end by
-        # calling the platform hook.
-        assert KVCacheSpecRegistry.get_manager_class(_gdn_spec()) is MambaManager
-        # The hook may run again (another process, another config).
-        TpuPlatform.register_custom_kv_cache_specs(MagicMock())
-        TpuPlatform.register_custom_kv_cache_specs(MagicMock())
+    def test_first_lookup_runs_platform_hook(self, monkeypatch):
+        """A process's first manager lookup, as EngineCore makes it, loads
+        vLLM's built-in specs and then calls the platform hook. The test never
+        calls the hook itself."""
+        monkeypatch.setattr(kv_cache_spec_registry, "_REGISTRY_KVCACHESPEC_LIST", {})
+        monkeypatch.setattr(kv_cache_spec_registry, "_REGISTRY_ROLE_MANAGERS", {})
+        monkeypatch.setattr(vllm.platforms, "_current_platform", TpuPlatform)
+        hook = MagicMock(wraps=TpuPlatform.register_custom_kv_cache_specs)
+        monkeypatch.setattr(TpuPlatform, "register_custom_kv_cache_specs", hook)
 
         spec = _gdn_spec(RunnerSlotMambaSpec)
         assert KVCacheSpecRegistry.get_manager_class(spec) is RunnerSlotMambaManager
+        hook.assert_called_once()
         assert KVCacheSpecRegistry.get_uniform_type_base_spec(spec) is MambaSpec
         assert KVCacheSpecRegistry.get_manager_class(_gdn_spec()) is MambaManager
+
+    def test_platform_hook_is_idempotent(self):
+        # The hook may run again (another process, another config).
+        KVCacheSpecRegistry.get_manager_class(_attn_spec())
+        TpuPlatform.register_custom_kv_cache_specs(MagicMock())
+        TpuPlatform.register_custom_kv_cache_specs(MagicMock())
+        spec = _gdn_spec(RunnerSlotMambaSpec)
+        assert KVCacheSpecRegistry.get_manager_class(spec) is RunnerSlotMambaManager
+
+    def test_flag_stays_out_of_compile_cache_key(self):
+        # It changes scheduler accounting only; the compiled graph is the same.
+        name = "TPU_SKIP_MAMBA_SCHEDULER_BLOCKS"
+        assert name in tpu_compiler._TPU_COMPILE_ENV_IGNORED
+        assert name not in tpu_compiler._tpu_compile_env_factors()
 
     def test_flag_reaches_ray_workers(self):
         # The flag is read by the runner on every host; Ray copies only VLLM_*
         # and the platform's additional_env_vars to remote workers.
-        assert "SKIP_MAMBA_SCHEDULER_BLOCKS" in TpuPlatform.additional_env_vars
+        assert "TPU_SKIP_MAMBA_SCHEDULER_BLOCKS" in TpuPlatform.additional_env_vars
 
     def test_grouping_keeps_spec_class(self):
         # A spec that lost its subclass while vLLM groups the layers would
