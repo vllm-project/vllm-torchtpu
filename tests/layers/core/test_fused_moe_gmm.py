@@ -1110,11 +1110,13 @@ def test_fused_moe_func_int4_packed_matches_reference():
 
 
 @pytest.mark.tpu_test
-def test_fused_moe_quantized_dispatch_rows_match_bf16_rows():
+# A prefill-sized batch and the smallest decode-sized one that dispatches words.
+@pytest.mark.parametrize("num_tokens", [4096, 512])
+def test_fused_moe_quantized_dispatch_rows_match_bf16_rows(num_tokens):
     """quantize_dispatch_rows words give the bf16 rows' output bit for bit."""
     _require_tpu()
 
-    num_tokens, hidden_size, inter_size = 4096, 1024, 512
+    hidden_size, inter_size = 1024, 512
     num_experts, topk, quant_block = 8, 2, 512
     keys = jax.random.split(jax.random.key(3), 7)
     hidden_states = jax.random.normal(keys[0], (num_tokens, hidden_size), jnp.bfloat16)

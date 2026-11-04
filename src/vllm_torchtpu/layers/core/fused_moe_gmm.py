@@ -94,8 +94,10 @@ _DENSE_EXPERT_THRESHOLD = envs.TPU_MOE_DENSE_EXPERT_THRESHOLD
 # Smaller counts are unmeasured (the one-hot path takes up to 511 routes).
 TC_COMBINE_MIN_TOKENS = envs.TPU_MOE_TC_COMBINE_MIN_TOKENS
 # From this EP token count, the dispatch moves rows quantized ahead
-# (dispatches_quantized_rows).
-DISPATCH_SPLIT_MIN_TOKENS = 4096
+# (dispatches_quantized_rows). This takes in the decode buckets (512 and 1024
+# gathered tokens on DSv4-Flash DP8), whose bf16 rows otherwise all-gather in
+# twice the bytes and are then relaid out for the fused MLP's token rows.
+DISPATCH_SPLIT_MIN_TOKENS = 512
 # From this EP token count, the expert MLP reads the routed rows straight
 # from the tokens' rows (gmm_v2_fused_mlp's token_rows), past the first
 # DISPATCH_HEAD_ROWS that the SparseCore gathers ahead. 0 admits every
