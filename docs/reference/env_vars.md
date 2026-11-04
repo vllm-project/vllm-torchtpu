@@ -115,6 +115,12 @@ Both are off by default; set both (`--additional-config '{"tpu_moe_topk_weights_
 | `TPU_SPARSE_MLA_CHUNK_TOKENS` | `None` | Query-token chunk size for Sparse MLA attention (each chunk gathers its tokens' top-k KV rows into one buffer and attends over it; unset keeps the kernel default of `64`). |
 | `USE_RPA_PIPELINED_DMA_STAGING` | `False` | Enables pipelined DMA staging in Ragged Paged Attention. |
 
+### In-graph RoPE
+
+`--additional-config '{"tpu_rope_in_graph": true}'` (default `false`) computes rotary `cos`/`sin` in-graph from positions instead of indexing a precomputed `[max_position, rotary_dim]` HBM table. DeepSeek-V4 Pallas rotary kernels keep the precomputed table until migrated. A non-bool value fails at startup.
+
+The in-graph `cos`/`sin` are not bit-identical to the table, and K is rotated before the KV cache stores it. Instances that exchange KV pages (disaggregated prefill/decode, KV transfer) must therefore all use the same value.
+
 ---
 
 ## 5. Disaggregated Serving (Raiden & KV Transfer)

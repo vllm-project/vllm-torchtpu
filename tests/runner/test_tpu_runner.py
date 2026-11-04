@@ -3513,6 +3513,39 @@ def test_relayout_tables_reaches_the_draft_model(monkeypatch):
     assert seen == []
 
 
+def test_patch_rope_in_graph_skips_none_and_counts_shared_tier1_once(
+    monkeypatch, caplog
+):
+    import logging
+
+    from vllm_torchtpu import rope_patch
+
+    seen: list[torch.nn.Module] = []
+
+    def fake_patch(model: torch.nn.Module, *, allow_table_recovery: bool) -> int:
+        # Serving converts only classes with a spec, never recovered tables.
+        assert allow_table_recovery is False
+        seen.append(model)
+        return 1
+
+    monkeypatch.setattr(rope_patch, "patch_in_graph_rotary_embedding", fake_patch)
+    runner = MagicMock(spec=TPUModelRunner)
+    shared_tier1 = torch.nn.Module()
+    shared_tier1._tpu_in_graph_tier1 = True
+    target_model = torch.nn.ModuleDict({"shared": shared_tier1})
+    draft_model = torch.nn.ModuleDict({"shared": shared_tier1})
+
+    with caplog.at_level(logging.INFO, logger="vllm.vllm_torchtpu.runner.tpu_runner"):
+        TPUModelRunner._patch_rope_in_graph(runner, target_model, None, draft_model)
+
+    assert seen == [target_model, draft_model]
+    assert "1 Tier-1 and 2 Tier-2 rotary module(s)" in caplog.text
+
+    seen.clear()
+    TPUModelRunner._patch_rope_in_graph(runner, None)
+    assert seen == []
+
+
 def test_torch_tpu_wrapper_accelerator_aliases(monkeypatch):
     from vllm_torchtpu.runner.tpu_runner import _torch_tpu_wrapper
 
@@ -4394,6 +4427,62 @@ def test_load_model_eagerly_initializes_sampling_generator_before_transfers(
     assert isinstance(runner._sampling_generator, torch.Generator)
     assert runner._sampling_generator.initial_seed() == 42
     assert TPUModelRunner._get_sampling_generator(runner) is runner._sampling_generator
+
+
+def test_truncate_rope_caches_suppresses_warning_when_in_graph_enabled(
+    monkeypatch, caplog
+):
+    """When `tpu_rope_in_graph` removes raw tensor caches, skip the warning."""
+    import logging
+
+    from vllm.model_executor.layers.rotary_embedding import RotaryEmbedding
+
+    from vllm_torchtpu import rope_in_graph
+
+    rope = _bare_rope(RotaryEmbedding, 128)
+    rope._buffers.pop("cos_sin_cache", None)
+    rope.cos_sin_cache = rope_in_graph.InGraphCosSinCache(
+        [rope_in_graph.CosSinSegment(0, 128, (1.0, 0.5, 0.25, 0.125))],
+        torch.float32,
+        128,
+        8,
+    )
+    model = torch.nn.ModuleDict({"rope": rope})
+
+    runner = TPUModelRunner.__new__(TPUModelRunner)
+    runner.model = model
+    runner.speculative_config = None
+    runner.model_config = SimpleNamespace(
+        is_multimodal_model=False, multimodal_config=None, max_model_len=32
+    )
+
+    runner.vllm_config = SimpleNamespace(additional_config={"tpu_rope_in_graph": True})
+    with caplog.at_level(
+        logging.WARNING, logger="vllm.vllm_torchtpu.runner.tpu_runner"
+    ):
+        runner._truncate_rope_caches(model)
+    assert "no position-indexed rope cache" not in caplog.text
+
+    caplog.clear()
+    runner.vllm_config = SimpleNamespace(additional_config={})
+    with caplog.at_level(
+        logging.WARNING, logger="vllm.vllm_torchtpu.runner.tpu_runner"
+    ):
+        runner._truncate_rope_caches(model)
+    assert "no position-indexed rope cache" in caplog.text
+
+
+def test_iter_unique_modules_visits_shared_modules_once():
+    shared = torch.nn.Linear(2, 2, bias=False)
+    a = torch.nn.ModuleDict({"shared": shared, "only_a": torch.nn.Identity()})
+    b = torch.nn.ModuleDict({"shared": shared, "only_b": torch.nn.Identity()})
+
+    visited = list(runner_utils_module.iter_unique_modules(a, b))
+    ids = [id(mod) for _, mod in visited]
+    assert len(ids) == len(set(ids))
+    assert id(shared) in ids
+    assert id(a["only_a"]) in ids
+    assert id(b["only_b"]) in ids
 
 
 class TestLogitsAtDpVocabRows:

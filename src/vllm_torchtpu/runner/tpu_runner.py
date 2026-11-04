@@ -88,7 +88,7 @@ from vllm.v1.spec_decode.ngram_proposer import NgramProposer
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 from vllm.v1.worker.kv_connector_model_runner_mixin import KVConnectorOutput
 
-from vllm_torchtpu import envs, utils
+from vllm_torchtpu import envs, rope_in_graph_flag, rope_patch, utils
 from vllm_torchtpu.block_major_pool import BlockMajorPoolLayout
 from vllm_torchtpu.compilation import shape_variants
 from vllm_torchtpu.distributed import utils as dist_utils
@@ -1531,6 +1531,27 @@ class TPUModelRunner(GPUModelRunner):
                     f"{self.speculative_config.method}"
                 )
 
+    def _patch_rope_in_graph(self, *models: torch.nn.Module | None) -> None:
+        """Replace position-indexed rotary cache buffers on ``models`` in-graph."""
+        live_models = [m for m in models if m is not None]
+        if not live_models:
+            return
+        patched = sum(
+            rope_patch.patch_in_graph_rotary_embedding(m, allow_table_recovery=False)
+            for m in live_models
+        )
+        tier1_count = sum(
+            1
+            for _, sub in runner_utils.iter_unique_modules(*live_models)
+            if getattr(sub, "_tpu_in_graph_tier1", False)
+        )
+        if tier1_count or patched:
+            logger.info(
+                "Enabled in-graph RoPE on %d Tier-1 and %d Tier-2 rotary module(s).",
+                tier1_count,
+                patched,
+            )
+
     def _relayout_tables(self, model: torch.nn.Module | None) -> None:
         """Give ``model`` the table shapes and row-major layouts the env knobs ask for.
 
@@ -1617,7 +1638,7 @@ class TPUModelRunner(GPUModelRunner):
                 num_eligible,
                 len(truncated_by_id),
             )
-        else:
+        elif not rope_in_graph_flag.in_graph_enabled(self.vllm_config):
             logger.warning(
                 "TPU_ROPE_CACHE_TRUNCATE is set but the model has no "
                 "position-indexed rope cache, nothing was truncated"
@@ -6345,6 +6366,13 @@ class TPUModelRunner(GPUModelRunner):
                         dtype=torch.float32,
                         device=self.device,
                     )
+
+        if rope_in_graph_flag.in_graph_enabled(self.vllm_config):
+            # After any draft loads, so the sweep also covers the draft model.
+            self._patch_rope_in_graph(
+                self.model,
+                self._async_drafter.draft_model if self._is_async_drafter else None,
+            )
 
         # After the drafter: every placed MoE layer, the drafter's too, must
         # have had its router renumbered with its experts.
