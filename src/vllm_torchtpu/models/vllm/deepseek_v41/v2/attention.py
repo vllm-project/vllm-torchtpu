@@ -1193,8 +1193,13 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
             elif (window_starts := _window_starts()) is not None:
                 minimum = window_starts
             minimum = minimum[: swa_table.shape[0]]
+            # SWA layers are split across several KV-cache groups, assigned
+            # round-robin (upstream `layers[i::num_groups]`). Keying on the
+            # group's table keeps one entry per group, so adjacent layers of
+            # different groups no longer evict each other on every layer.
             meta_key = (
                 "csa2_swa",
+                id(swa.block_tables),
                 rows_per_page,
                 swa_cache.page_stride,
                 swa_cache.row_offset,
