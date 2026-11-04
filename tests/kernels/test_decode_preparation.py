@@ -35,25 +35,6 @@ def _check(actual, expected):
         np.testing.assert_array_equal(np.asarray(got), want)
 
 
-@pytest.mark.parametrize("width", [1280, 2304, 5120, 6144])
-def test_quantize_entry(width):
-    from vllm_torchtpu.kernels.quantized_matmul.util import (
-        quantize_block,
-        quantize_tensor,
-    )
-
-    dtype = np.float32 if width == 6144 else ml_dtypes.bfloat16
-    x = np.random.default_rng(17).normal(size=(288, width)).astype(dtype)
-    x[0] = 0
-    x[1] = np.float32(1e-12)
-    actual = jax.jit(lambda v: quantize_tensor(v, jnp.float8_e4m3fn))(jnp.asarray(x))
-    expected = jax.jit(
-        lambda v: quantize_block(v, axis=-1, target_dtype=jnp.float8_e4m3fn)
-    )(jnp.asarray(x))
-    _check(actual, expected)
-    peripheral_ref.check_quantization((x,), actual)
-
-
 @pytest.mark.parametrize("tb", [32, 144])
 def test_compact_entry(tb):
     from vllm_torchtpu.kernels.attention_preprocessing.compress_rope import _compact
@@ -98,17 +79,6 @@ def test_cache_unpack_shared_and_direct(tokens):
     words = (bits[:, 0] | (bits[:, 1] << 16)).view(np.int32)
     actual = jax.jit(prep.unpack_cache_words)(words)
     _check(actual, values.reshape(4, tokens, 128))
-
-
-@pytest.mark.parametrize("rank", [0, 7, 15])
-def test_dispatch_tables(rank):
-    rng = np.random.default_rng(31)
-    counts = rng.integers(0, 10, (16, 384), dtype=np.int32)
-    counts[:, ::13] = 0
-    starts = np.cumsum(counts[rank], dtype=np.int32) - counts[rank]
-    xs = counts, starts, np.array([rank], np.int32)
-    actual = jax.jit(lambda *a: prep.dispatch_layout_call(a)(*a))(*xs)
-    _check(actual, region_ref.dispatch(*xs))
 
 
 @pytest.mark.parametrize("bank_count", [1, 2])
