@@ -16,7 +16,7 @@ from vllm.config import (
     get_current_vllm_config,
     get_current_vllm_config_or_none,
 )
-from vllm.utils.math_utils import cdiv, next_power_of_2
+from vllm.utils.math_utils import cdiv, next_power_of_2, round_up
 from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionImpl,
@@ -497,9 +497,22 @@ def _pallas_rpa_kernel_batched(
     kv_layout: batched_rpa_configs.KVLayout,
     decode_query_size: int = 1,
     block_major: bool = False,
+    max_model_len: int | None = None,
 ) -> tuple[jax.Array, jax.Array]:
     """Batched-RPA Pallas kernel entry — used by
-    `PallasBatchedRPAAttentionBackendImpl`."""
+    `PallasBatchedRPAAttentionBackendImpl`. max_model_len, if set, bounds the
+    block-table columns passed to the kernel."""
+    rpa_func = (
+        functools.partial(
+            ragged_paged_attention_batched, decode_query_size=decode_query_size
+        )
+        if decode_query_size > 1
+        else _with_decode_block_override(ragged_paged_attention_batched)
+    )
+    if max_model_len is not None:
+        rpa_func = _with_addressable_page_table(
+            rpa_func, max_model_len, decode_query_size
+        )
     return _pallas_rpa_kernel_impl(
         kv_cache,
         query,
@@ -516,19 +529,53 @@ def _pallas_rpa_kernel_batched(
         mesh=mesh,
         sliding_window=sliding_window,
         skip_kv_update=skip_kv_update,
-        rpa_func=(
-            functools.partial(
-                ragged_paged_attention_batched, decode_query_size=decode_query_size
-            )
-            if decode_query_size > 1
-            else _with_decode_block_override(ragged_paged_attention_batched)
-        ),
+        rpa_func=rpa_func,
         sm_scale=sm_scale,
         soft_cap=soft_cap,
         use_causal_mask=use_causal_mask,
         kv_layout=kv_layout,
         block_major=block_major,
     )
+
+
+def _with_addressable_page_table(rpa_func, max_model_len: int, decode_query_size: int):
+    """Pass the batched kernel only the block-table columns a sequence can address.
+
+    A sequence spans at most cdiv(max_model_len + decode_query_size - 1, page)
+    kernel pages; the table is wider because blocks are rounded up (8194
+    columns at 1M tokens with 2176-token blocks of 128-token pages). Once the
+    table outgrows the kernel's SMEM budget, the kernel streams it in row
+    groups, padding rows whose width has no aligned group, and every page
+    lookup then divides by that width. Rounded up to 128, the narrower table
+    streams unpadded, and a power-of-two width makes the lookup shifts and
+    masks. The pages and their order are unchanged, so outputs are identical.
+    """
+
+    def call(queries, keys, values, kv_cache, kv_lens, page_indices, *args, **kwargs):
+        layout = kwargs.get(
+            "kv_layout", batched_rpa_configs.KVLayout.HEAD_ALONG_SUBLANE
+        )
+        if layout == batched_rpa_configs.KVLayout.SEQ_ALONG_LANE:
+            page_size = kv_cache.shape[4]
+        else:
+            page_size = kv_cache.shape[1]
+        num_seqs = kv_lens.shape[0]
+        pages_per_seq = page_indices.shape[0] // num_seqs
+        max_len = max_model_len + decode_query_size - 1
+        columns = round_up(cdiv(max_len, page_size), 128)
+        if columns < pages_per_seq:
+            logger.info_once(
+                "Batched RPA page table: %d of %d columns per sequence",
+                columns,
+                pages_per_seq,
+            )
+            page_indices = page_indices.reshape(num_seqs, pages_per_seq)
+            page_indices = page_indices[:, :columns].reshape(-1)
+        return rpa_func(
+            queries, keys, values, kv_cache, kv_lens, page_indices, *args, **kwargs
+        )
+
+    return call
 
 
 def _with_decode_block_override(rpa_func):
@@ -1035,6 +1082,8 @@ class PallasAttentionBackendImpl(AttentionImpl):
                 )
             if "decode_query_size" in entry_params:
                 entry_kwargs["decode_query_size"] = self.decode_query_size
+            if "max_model_len" in entry_params and vllm_config is not None:
+                entry_kwargs["max_model_len"] = vllm_config.model_config.max_model_len
             if block_major:
                 if "block_major" not in entry_params:
                     raise NotImplementedError(
