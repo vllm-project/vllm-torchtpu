@@ -1,0 +1,69 @@
+{
+  "schema": "advisor.measurements.v1",
+  "source": {
+    "kind": "xplane",
+    "file": "tpu7x_qwen3_30b_a3b_fp8_tp8_ep8",
+    "chip": "tpu7x",
+    "phase": "decode",
+    "model": "Qwen/Qwen3-30B-A3B-FP8",
+    "tp": 8,
+    "ep": 8,
+    "ranks": 8
+  },
+  "collectives": [
+    {
+      "op": "all-gather",
+      "group_size": 8,
+      "bytes": 0,
+      "latency_us": 24.2954,
+      "hop_latency_us": 8.0985,
+      "n": 416
+    },
+    {
+      "op": "all-reduce",
+      "group_size": 8,
+      "bytes": 0,
+      "latency_us": 11.7838,
+      "hop_latency_us": 3.9279,
+      "n": 40336
+    }
+  ],
+  "step_time_us": {
+    "p50": 6082.88,
+    "spread": 2581.08,
+    "n": 2
+  },
+  "prefill": {
+    "phase": "prefill",
+    "batch": 1,
+    "isl": 4096,
+    "launch_gap_us": {
+      "p50": 0.0073,
+      "p90": 0.0085,
+      "n": 170320
+    },
+    "collectives": [
+      {
+        "op": "all-gather",
+        "group_size": 8,
+        "bytes": 0,
+        "latency_us": 15.2047,
+        "hop_latency_us": 5.0682,
+        "n": 32
+      },
+      {
+        "op": "all-reduce",
+        "group_size": 8,
+        "bytes": 0,
+        "latency_us": 25.3333,
+        "hop_latency_us": 8.4444,
+        "n": 3104
+      }
+    ],
+    "step_time_us": {
+      "p50": 17638.26,
+      "spread": 552.22,
+      "n": 3
+    }
+  }
+}

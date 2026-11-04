@@ -1,0 +1,317 @@
+{
+  "schema": "advisor.validation.v1",
+  "description": "TPU v7x step-latency validation corpus across Qwen3.5-397B, Qwen3.8-2.4T-A95B, and Qwen3-30B-A3B (reproducible OSS TPU v7x measurements and public calibration runs)",
+  "points": [
+    {
+      "id": "qwen35_397b_pp8_prefill_8k",
+      "model": "qwen3.5-397b",
+      "chip": "tpu7x",
+      "scope": "layer_group",
+      "measured_step_us": 136010.0,
+      "measured_spread_us": 2445.0,
+      "provenance_kind": "oss_tpu_measurement",
+      "workload_description": "Qwen3.5-397B PP8 x TP1 x EP1 8K causal chunk prefill stage at 95K effective context on TPU v7x",
+      "workload": {
+        "phase": "prefill",
+        "batch": 1,
+        "isl": 8192,
+        "chunk_size": 8192,
+        "context": 95232,
+        "pp": 8,
+        "tp": 1,
+        "ep": 1,
+        "moe_mode": "grouped_on_chip"
+      }
+    },
+    {
+      "id": "qwen35_397b_tp8_verify_r4",
+      "model": "qwen3.5-397b",
+      "chip": "tpu7x",
+      "scope": "whole_step",
+      "measured_step_us": 5280.0,
+      "measured_spread_us": 150.0,
+      "provenance_kind": "oss_tpu_measurement",
+      "workload_description": "Qwen3.5-397B TP8 x DCP4 x EP8 60-layer MTP-3 speculative verify step with 4 active rows (1 sequence x 4 tokens) on TPU v7x",
+      "workload": {
+        "phase": "verify",
+        "spec_tokens": 3,
+        "batch": 1,
+        "isl": 512,
+        "context": 512,
+        "tp": 8,
+        "ep": 8,
+        "dcp": 4,
+        "moe_mode": "grouped_on_chip"
+      }
+    },
+    {
+      "id": "qwen35_397b_tp8_verify_r8",
+      "model": "qwen3.5-397b",
+      "chip": "tpu7x",
+      "scope": "whole_step",
+      "measured_step_us": 5510.0,
+      "measured_spread_us": 150.0,
+      "provenance_kind": "oss_tpu_measurement",
+      "workload_description": "Qwen3.5-397B TP8 x DCP4 x EP8 60-layer MTP-3 speculative verify step with 8 active rows (2 sequences x 4 tokens) on TPU v7x",
+      "workload": {
+        "phase": "verify",
+        "spec_tokens": 3,
+        "batch": 2,
+        "isl": 512,
+        "context": 512,
+        "tp": 8,
+        "ep": 8,
+        "dcp": 4,
+        "moe_mode": "grouped_on_chip"
+      }
+    },
+    {
+      "id": "qwen35_397b_tp8_verify_r16",
+      "model": "qwen3.5-397b",
+      "chip": "tpu7x",
+      "scope": "whole_step",
+      "measured_step_us": 5900.0,
+      "measured_spread_us": 180.0,
+      "provenance_kind": "oss_tpu_measurement",
+      "workload_description": "Qwen3.5-397B TP8 x DCP4 x EP8 60-layer MTP-3 speculative verify step with 16 active rows (4 sequences x 4 tokens) on TPU v7x",
+      "workload": {
+        "phase": "verify",
+        "spec_tokens": 3,
+        "batch": 4,
+        "isl": 512,
+        "context": 512,
+        "tp": 8,
+        "ep": 8,
+        "dcp": 4,
+        "moe_mode": "grouped_on_chip"
+      }
+    },
+    {
+      "id": "qwen35_397b_tp8_verify_r32",
+      "model": "qwen3.5-397b",
+      "chip": "tpu7x",
+      "scope": "whole_step",
+      "measured_step_us": 6820.0,
+      "measured_spread_us": 220.0,
+      "provenance_kind": "oss_tpu_measurement",
+      "workload_description": "Qwen3.5-397B TP8 x DCP4 x EP8 60-layer MTP-3 speculative verify step with 32 active rows (8 sequences x 4 tokens) on TPU v7x",
+      "workload": {
+        "phase": "verify",
+        "spec_tokens": 3,
+        "batch": 8,
+        "isl": 512,
+        "context": 512,
+        "tp": 8,
+        "ep": 8,
+        "dcp": 4,
+        "moe_mode": "grouped_on_chip"
+      }
+    },
+    {
+      "id": "qwen38_2_4t_tp32_dcp8_mk_b4",
+      "model": "qwen3.8-2.4t",
+      "chip": "tpu7x",
+      "scope": "whole_step",
+      "measured_step_us": 17258.28,
+      "measured_spread_us": 50.0,
+      "provenance_kind": "oss_tpu_measurement",
+      "workload_description": "Qwen3.8-2.4T TP32 x DCP8 x EP32 92-layer whole-step decode at batch 4 on TPU v7x",
+      "workload": {
+        "phase": "decode",
+        "batch": 4,
+        "isl": 1024,
+        "osl": 1024,
+        "context": 1536,
+        "tp": 32,
+        "ep": 32,
+        "dcp": 8,
+        "moe_mode": "grouped_on_chip"
+      }
+    },
+    {
+      "id": "qwen38_2_4t_tp32_dcp8_mk_b8",
+      "model": "qwen3.8-2.4t",
+      "chip": "tpu7x",
+      "scope": "whole_step",
+      "measured_step_us": 19579.44,
+      "measured_spread_us": 60.0,
+      "provenance_kind": "oss_tpu_measurement",
+      "workload_description": "Qwen3.8-2.4T TP32 x DCP8 x EP32 92-layer whole-step decode at batch 8 on TPU v7x",
+      "workload": {
+        "phase": "decode",
+        "batch": 8,
+        "isl": 1024,
+        "osl": 1024,
+        "context": 1536,
+        "tp": 32,
+        "ep": 32,
+        "dcp": 8,
+        "moe_mode": "grouped_on_chip"
+      }
+    },
+    {
+      "id": "qwen38_2_4t_tp32_dcp8_mk_b16",
+      "model": "qwen3.8-2.4t",
+      "chip": "tpu7x",
+      "scope": "whole_step",
+      "measured_step_us": 24930.16,
+      "measured_spread_us": 80.0,
+      "provenance_kind": "oss_tpu_measurement",
+      "workload_description": "Qwen3.8-2.4T TP32 x DCP8 x EP32 92-layer whole-step decode at batch 16 on TPU v7x",
+      "workload": {
+        "phase": "decode",
+        "batch": 16,
+        "isl": 1024,
+        "osl": 1024,
+        "context": 1536,
+        "tp": 32,
+        "ep": 32,
+        "dcp": 8,
+        "moe_mode": "grouped_on_chip"
+      }
+    },
+    {
+      "id": "qwen38_2_4t_tp32_dcp8_mk_b32",
+      "model": "qwen3.8-2.4t",
+      "chip": "tpu7x",
+      "scope": "whole_step",
+      "measured_step_us": 32580.88,
+      "measured_spread_us": 100.0,
+      "provenance_kind": "oss_tpu_measurement",
+      "workload_description": "Qwen3.8-2.4T TP32 x DCP8 x EP32 92-layer whole-step decode at batch 32 on TPU v7x",
+      "workload": {
+        "phase": "decode",
+        "batch": 32,
+        "isl": 1024,
+        "osl": 1024,
+        "context": 1536,
+        "tp": 32,
+        "ep": 32,
+        "dcp": 8,
+        "moe_mode": "grouped_on_chip"
+      }
+    },
+    {
+      "id": "qwen38_2_4t_tp32_dcp8_mk_b64",
+      "model": "qwen3.8-2.4t",
+      "chip": "tpu7x",
+      "scope": "whole_step",
+      "measured_step_us": 39977.68,
+      "measured_spread_us": 120.0,
+      "provenance_kind": "oss_tpu_measurement",
+      "workload_description": "Qwen3.8-2.4T TP32 x DCP8 x EP32 92-layer whole-step decode at batch 64 on TPU v7x",
+      "workload": {
+        "phase": "decode",
+        "batch": 64,
+        "isl": 1024,
+        "osl": 1024,
+        "context": 1536,
+        "tp": 32,
+        "ep": 32,
+        "dcp": 8,
+        "moe_mode": "grouped_on_chip"
+      }
+    },
+    {
+      "id": "qwen38_2_4t_tp32_dcp8_mk_b256",
+      "model": "qwen3.8-2.4t",
+      "chip": "tpu7x",
+      "scope": "whole_step",
+      "measured_step_us": 55090.52,
+      "measured_spread_us": 180.0,
+      "provenance_kind": "oss_tpu_measurement",
+      "workload_description": "Qwen3.8-2.4T TP32 x DCP8 x EP32 92-layer whole-step decode at batch 256 on TPU v7x",
+      "workload": {
+        "phase": "decode",
+        "batch": 256,
+        "isl": 1024,
+        "osl": 1024,
+        "context": 1536,
+        "tp": 32,
+        "ep": 32,
+        "dcp": 8,
+        "moe_mode": "grouped_on_chip"
+      }
+    },
+    {
+      "id": "qwen38_2_4t_tp32_dcp8_per_op_b64",
+      "model": "qwen3.8-2.4t",
+      "chip": "tpu7x",
+      "scope": "per_op",
+      "measured_step_us": 48468.36,
+      "measured_spread_us": 200.0,
+      "provenance_kind": "oss_tpu_measurement",
+      "workload_description": "Qwen3.8-2.4T TP32 x DCP8 x EP32 92-layer per-operator decode baseline at batch 64 on TPU v7x",
+      "workload": {
+        "phase": "decode",
+        "batch": 64,
+        "isl": 1024,
+        "osl": 1024,
+        "context": 1536,
+        "tp": 32,
+        "ep": 32,
+        "dcp": 8,
+        "moe_mode": "grouped_on_chip"
+      }
+    },
+    {
+      "id": "qwen38_2_4t_tp32_dcp8_per_op_b256",
+      "model": "qwen3.8-2.4t",
+      "chip": "tpu7x",
+      "scope": "per_op",
+      "measured_step_us": 72468.4,
+      "measured_spread_us": 300.0,
+      "provenance_kind": "oss_tpu_measurement",
+      "workload_description": "Qwen3.8-2.4T TP32 x DCP8 x EP32 92-layer per-operator decode baseline at batch 256 on TPU v7x",
+      "workload": {
+        "phase": "decode",
+        "batch": 256,
+        "isl": 1024,
+        "osl": 1024,
+        "context": 1536,
+        "tp": 32,
+        "ep": 32,
+        "dcp": 8,
+        "moe_mode": "grouped_on_chip"
+      }
+    },
+    {
+      "id": "qwen3_30b_a3b_tp8_ep8_decode_b16",
+      "model": "Qwen/Qwen3-30B-A3B-FP8",
+      "chip": "tpu7x",
+      "scope": "per_op",
+      "measured_step_us": 6082.88,
+      "measured_spread_us": 2581.08,
+      "provenance_kind": "public_calibration_run",
+      "workload_description": "Qwen3-30B-A3B-FP8 TP8 x EP8 48-layer per-operator decode calibration at batch 16 (ISL 64, OSL 24) on TPU v7x",
+      "workload": {
+        "phase": "decode",
+        "batch": 16,
+        "isl": 64,
+        "osl": 24,
+        "context": 88,
+        "tp": 8,
+        "ep": 8
+      }
+    },
+    {
+      "id": "qwen3_30b_a3b_tp8_ep8_prefill_4k",
+      "model": "Qwen/Qwen3-30B-A3B-FP8",
+      "chip": "tpu7x",
+      "scope": "per_op",
+      "measured_step_us": 17638.26,
+      "measured_spread_us": 552.22,
+      "provenance_kind": "public_calibration_run",
+      "workload_description": "Qwen3-30B-A3B-FP8 TP8 x EP8 48-layer per-operator 4K prefill calibration at batch 1 on TPU v7x",
+      "workload": {
+        "phase": "prefill",
+        "batch": 1,
+        "isl": 4096,
+        "chunk_size": 4096,
+        "context": 4096,
+        "tp": 8,
+        "ep": 8
+      }
+    }
+  ]
+}
