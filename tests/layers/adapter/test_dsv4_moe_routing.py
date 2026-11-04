@@ -69,6 +69,7 @@ def test_classic_topk_sqrtsoftplus_scoring():
     layer.e_score_correction_bias = bias
     layer.routed_scaling_factor = 1.0
     layer.hash_indices_table = None
+    layer.bias_vl = None
 
     weights, ids = select_experts(
         hidden,
@@ -116,6 +117,7 @@ def test_classic_topk_multi_token_batch():
     layer.e_score_correction_bias = bias
     layer.routed_scaling_factor = 1.0
     layer.hash_indices_table = None
+    layer.bias_vl = None
 
     weights, ids = select_experts(
         hidden,

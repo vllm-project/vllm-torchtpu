@@ -468,6 +468,16 @@ def select_experts(
     if e_score_correction_bias is not None:
         bias_shape = [1] * (scores.dim() - 1) + [-1]
         bias = e_score_correction_bias.float().view(bias_shape)
+        # Set by DeepseekV41MoE on vision checkpoints: image tokens select
+        # with bias_vl, as upstream's router does.
+        bias_vl = getattr(layer, "bias_vl", None)
+        if bias_vl is not None:
+            assert layer is not None and input_ids is not None
+            # One id per scored row; raises if the ids were not gathered with
+            # the hidden states.
+            ids = input_ids.reshape(*scores.shape[:-1], 1)
+            image = (ids >= layer.image_sentinel_lo) & (ids < layer.image_sentinel_hi)
+            bias = torch.where(image, bias_vl.float().view(bias_shape), bias)
         scores_for_choice = scores + bias
         _, topk_ids = _topk(scores_for_choice, topk)
         topk_weights = _gather_expert_scores(scores, topk_ids)
