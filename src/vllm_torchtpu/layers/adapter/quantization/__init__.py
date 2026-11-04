@@ -37,7 +37,10 @@ from vllm_torchtpu.layers.adapter.quantization.configs import VllmQuantConfig
 from vllm_torchtpu.layers.adapter.quantization.deepseek_v4_fp8 import (
     VllmDeepseekV4Fp8Config,
 )
-from vllm_torchtpu.layers.adapter.quantization.fp8 import VllmFp8Config
+from vllm_torchtpu.layers.adapter.quantization.fp8 import (
+    VllmFp8Config,
+    VllmFp8MoEConfig,
+)
 from vllm_torchtpu.layers.adapter.quantization.mxfp4 import VllmMxfp4Config
 from vllm_torchtpu.layers.adapter.quantization.nvfp4 import VllmNvfp4Config
 from vllm_torchtpu.layers.adapter.quantization.online_fp8 import attach_online_fp8
@@ -46,6 +49,28 @@ from vllm_torchtpu.layers.core import quant_methods
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
+
+
+def _is_linear_quantization_disabled(quant_config: object | None) -> bool:
+    """Return True if linear layers are unquantized in quantization_config."""
+    if quant_config is None:
+        return False
+    if isinstance(quant_config, dict):
+        if "linear" not in quant_config:
+            return "moe" in quant_config
+        linear = quant_config.get("linear")
+        if linear is None:
+            return True
+        if isinstance(linear, dict):
+            return linear.get("weight") is None and linear.get("activation") is None
+        return False
+    if hasattr(quant_config, "linear"):
+        linear = quant_config.linear
+        if linear is None:
+            return getattr(quant_config, "moe", None) is not None
+        if hasattr(linear, "weight") and hasattr(linear, "activation"):
+            return linear.weight is None and linear.activation is None
+    return False
 
 
 def get_tpu_quantization_config(
@@ -72,6 +97,7 @@ def get_tpu_quantization_config(
     method_to_config: dict[str | None, type[VllmQuantConfig]] = {
         None: VllmUnquantizedConfig,
         quant_methods.FP8: VllmFp8Config,
+        quant_methods.FP8_PER_CHANNEL: VllmFp8Config,
         quant_methods.MXFP4: VllmMxfp4Config,
         quant_methods.NVFP4: VllmNvfp4Config,
         quant_methods.COMPRESSED_TENSORS: VllmCompressedTensorsConfig,
@@ -87,6 +113,17 @@ def get_tpu_quantization_config(
         )
 
     quant_config_cls = method_to_config[model_config.quantization]
+
+    # If FP8 is requested with linear quantization disabled (MoE-only scope),
+    # route to VllmFp8MoEConfig.
+    if model_config.quantization in (
+        quant_methods.FP8,
+        quant_methods.FP8_PER_CHANNEL,
+    ) and _is_linear_quantization_disabled(
+        getattr(model_config, "quantization_config", None)
+    ):
+        quant_config_cls = VllmFp8MoEConfig
+
     assert issubclass(quant_config_cls, VllmQuantConfig)
 
     # Set global config for this quantization class

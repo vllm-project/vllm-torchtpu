@@ -15,6 +15,8 @@ UNQUANTIZED = "unquantized"
 MXFP4 = "mxfp4"
 AWQ = "awq"
 FP8 = "fp8"
+FP8_PER_CHANNEL = "fp8_per_channel"
+FP8_MOE = "fp8_moe"
 COMPRESSED_TENSORS = "compressed-tensors"
 # vLLM's native detection name for ModelOpt NVFP4 checkpoints
 # (ModelOptNvFp4Config.get_name()).

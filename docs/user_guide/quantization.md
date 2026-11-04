@@ -15,7 +15,7 @@
 | `awq` | `int4` (packed) | `bf16` | Linear | Weight-only 4-bit AWQ checkpoints. |
 | `gptq` | `int4` / `int8` | `bf16` | Linear | Weight-only GPTQ checkpoints. |
 | `deepseek_v4_fp8` | `float8_e4m3fn` (with optional `fp4` MoE requantization) | `float8_e4m3fn` | Linear, MLA, Fused MoE | Specialized FP8 + W4A8 MoE path for `DeepSeek-V4`. |
-| `online_fp8` | `bf16` checkpoint -> quantized to `float8_e4m3fn` at load time | `float8_e4m3fn` | Linear, Fused MoE | Quantizes unquantized `bf16` checkpoints to FP8 on the fly during weight loading. |
+| `fp8_per_channel` | `float8_e4m3fn` | `float8_e4m3fn` or `bf16` | Linear, Fused MoE | Online per-channel FP8 quantization from BF16 checkpoints at load time. Use `--quantization-config '{"linear": {"activation": null, "weight": null}}'` to quantize only routed experts (leaving dense linear layers in BF16). |
 
 > [!TIP]
 > **Self-Describing Checkpoints**: When a Hugging Face checkpoint's `config.json` already contains a `quantization_config` section (such as `compressed-tensors`, `fp8`, or `mxfp4`), vLLM detects the format automatically—you do not need to pass `--quantization` unless overriding or enabling online load-time quantization.

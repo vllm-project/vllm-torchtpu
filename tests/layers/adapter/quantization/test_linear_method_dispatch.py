@@ -99,6 +99,16 @@ class TestUnquantizedFallbackDispatch:
         )
         assert isinstance(method, VllmUnquantizedLinearMethod)
 
+    def test_fp8_moe_uses_kn_for_every_linear_layer(self, linear_layer):
+        """fp8_moe quantizes only MoE, so all linear layers take this path."""
+        from vllm_torchtpu.layers.adapter.quantization.fp8 import VllmFp8MoEConfig
+
+        cfg = VllmFp8MoEConfig.from_config({})
+        method = cfg.get_quant_method(
+            linear_layer, prefix="model.layers.0.self_attn.qkv_proj"
+        )
+        assert isinstance(method, VllmUnquantizedLinearMethod)
+
     def test_unquantized_config_uses_kn(self, linear_layer):
         from vllm_torchtpu.layers.adapter.quantization.unquantized import (
             VllmUnquantizedConfig,

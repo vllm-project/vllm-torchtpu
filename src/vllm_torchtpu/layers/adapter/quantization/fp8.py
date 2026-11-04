@@ -103,7 +103,7 @@ from vllm_torchtpu.layers.adapter.quantization.online_fp8 import (
     map_online_fp8,
     quantize_online_fp8,
 )
-from vllm_torchtpu.layers.core.quant_methods import FP8, get_tpu_quant_method
+from vllm_torchtpu.layers.core.quant_methods import FP8, FP8_MOE, get_tpu_quant_method
 from vllm_torchtpu.layers.core.quantization import dequantize_tensor, quantize_tensor
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.utils import fresh_buffer, synchronize_tensors
@@ -765,6 +765,49 @@ class VllmFp8Config(Fp8Config, VllmQuantConfig):
         if isinstance(layer, Attention):
             return None
 
+        return None
+
+
+@register_quantization_config(get_tpu_quant_method(FP8_MOE))
+class VllmFp8MoEConfig(VllmFp8Config):
+    """TPU FP8 MoE quantization configuration.
+
+    Applies FP8 quantization only to MoE routed experts, leaving dense linear
+    layers and attention unquantized. Supports both pre-quantized FP8 MoE
+    checkpoints (is_checkpoint_fp8_serialized=True) and online load-time
+    quantization from BF16 checkpoints (is_checkpoint_fp8_serialized=False).
+    """
+
+    @classmethod
+    def get_name(cls) -> QuantizationMethods:
+        return cast(QuantizationMethods, FP8_MOE)
+
+    @classmethod
+    def from_config(cls, config: dict) -> VllmFp8MoEConfig:
+        instance = cast(VllmFp8MoEConfig, super().from_config(config))
+        instance.is_checkpoint_fp8_serialized = config.get(
+            "is_checkpoint_fp8_serialized", False
+        )
+        return instance
+
+    def _get_checkpoint_quant_method(
+        self,
+        layer: torch.nn.Module,
+        prefix: str,
+    ) -> QuantizeMethodBase | None:
+        if isinstance(layer, RoutedExperts):
+            return super()._get_checkpoint_quant_method(layer, prefix)
+
+        # All dense linear layers remain unquantized. LinearBase requires a
+        # non-None quant method, so return the explicit unquantized method.
+        if isinstance(layer, LinearBase):
+            from vllm_torchtpu.layers.adapter.quantization.unquantized import (
+                VllmUnquantizedLinearMethod,
+            )
+
+            return VllmUnquantizedLinearMethod()
+
+        # Attention and everything else: no quantization.
         return None
 
 
