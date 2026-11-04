@@ -125,3 +125,29 @@ def test_vmem_phase_overlay_and_conflict(fake_ex: ExecSpec):
     ex_unset = dataclasses.replace(fake_ex, tiles=None)
     fp = vmem.fitted_plan(custom_ms, ex_unset)
     assert fp.ex.tiles is not None
+
+
+def test_fit_default_tiles_on_fake_model_spec(monkeypatch):
+    """`fit_default_tiles` shrinks ring depths into budget on `make_fake_model_spec`."""
+    from vllm_torchtpu.megakernel import exec_spec as exec_spec_mod
+    from vllm_torchtpu.megakernel.profiles import default as default_chip
+
+    ms_large = make_fake_model_spec(L=60, att_every=4, H=4096, moe_tp=False)
+    default_64 = dataclasses.replace(exec_spec_mod.default_tiles(64, R=2), vmem_mib=24)
+    monkeypatch.setattr(exec_spec_mod, "default_tiles", lambda B, **kw: default_64)
+    ex_64 = ExecSpec(B=64, T=1, R=2, ctx=4096)
+    fitted = vmem.fit_default_tiles(ms_large, ex_64)
+    assert fitted.tiles is not None
+    assert (fitted.tiles.nbd, fitted.tiles.nbe) != (default_64.nbd, default_64.nbe)
+    assert fitted.tiles.nbd <= default_64.nbd and fitted.tiles.nbe <= default_64.nbe
+    cp, _ = vmem.build_scratch(ms_large, fitted)
+    assert cp.vmem_bytes <= vmem.fit_vmem_budget_bytes(fitted.tiles)
+
+    ex_explicit = ExecSpec(B=64, T=1, R=2, ctx=4096, tiles=default_64)
+    assert vmem.fit_default_tiles(ms_large, ex_explicit) is ex_explicit
+
+    tight = dataclasses.replace(default_64, vmem_mib=4)
+    monkeypatch.setattr(exec_spec_mod, "default_tiles", lambda B, **kw: tight)
+    with pytest.raises(MegakernelConfigError, match="do not fit"):
+        vmem.fit_default_tiles(ms_large, ExecSpec(B=4, T=1, R=2, ctx=4096))
+    assert default_chip.TPU_V7X.vmem_mib == 62

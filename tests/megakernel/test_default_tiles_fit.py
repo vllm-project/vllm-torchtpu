@@ -19,7 +19,7 @@ import dataclasses
 
 import pytest
 
-from tests.megakernel.megakernel_fakes import synth_full_scale_spec, synth_hybrid_spec
+from tests.megakernel.megakernel_synth import synth_full_scale_spec, synth_hybrid_spec
 from vllm_torchtpu import megakernel as mk
 from vllm_torchtpu.megakernel import exec_spec as exec_spec_mod
 from vllm_torchtpu.megakernel.dma import vmem

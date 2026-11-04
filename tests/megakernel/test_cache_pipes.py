@@ -24,12 +24,17 @@ import pytest
 from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 
-from tests.megakernel.megakernel_fakes import (
-    TINY_TILES,
-    SynthHybrid,
-    synth_hybrid_spec,
+from tests.megakernel.megakernel_fakes import TINY_TILES, make_fake_model_spec
+from tests.megakernel.megakernel_synth import SynthHybrid, synth_hybrid_spec
+from vllm_torchtpu.megakernel import (
+    _builtins,
+    cache,
+    decls,
+    fused_io_hook,
+    planner,
+    pool,
 )
-from vllm_torchtpu.megakernel import cache, planner, pool
+from vllm_torchtpu.megakernel.errors import MegakernelConfigError
 from vllm_torchtpu.megakernel.exec_spec import ExecSpec
 from vllm_torchtpu.megakernel.modules.gdn import GDNModule
 from vllm_torchtpu.megakernel.ops import F32
@@ -202,3 +207,38 @@ def test_check_pooled_step_hlo_and_eplb_helpers():
     assert len(e_cores) == 2 and len(e_cores[0]) == 2 and len(e_cores[0][0]) == 10
     ecopy = encode_eplb_ecopy(g_eplb, 2, e_cores)
     assert ecopy.shape == (2, 16)
+
+
+def test_resolve_pool_layout_from_standalone_model_spec():
+    """`cache._resolve_pool_layout` falls back to `ms.cache_backend.layout`."""
+    play = pool.derive_pool_layout(
+        [decls.KVCacheDecl(hd=256, kvh=1, page_size=128)], R=2
+    )
+    pb = pool.make_pool_backend(play)
+    ms = dataclasses.replace(
+        make_fake_model_spec(L=1, att_every=1),
+        name="unregistered_standalone_spec",
+        cache_backend=pb,
+    )
+    ex = ExecSpec(B=4, T=1, R=2, ctx=256)
+    assert cache._resolve_pool_layout(ms, ex) is play
+    pt, ckpt, roff, min_pages = cache.default_pool_layout(ms, ex)
+    assert pt.shape == (4, 2) and ckpt.shape == (1, 4, 1) and roff.shape == (1, 4)
+    assert min_pages >= 8
+
+
+def test_should_fuse_pool_io_with_and_without_registered_hook(monkeypatch):
+    """`should_fuse_pool_io` checks `fused_io_available` for `auto` and `True`."""
+    spec = synth_hybrid_spec(L=2, att_every=2, R=2)
+    ex = _make_paged_ex(B=8, T=1, R=2)
+    assert fused_io_hook.fused_io_available()
+    assert cache.should_fuse_pool_io(spec, ex, fused_pool_io="auto") is True
+    assert cache.should_fuse_pool_io(spec, ex, fused_pool_io=True) is True
+
+    monkeypatch.setattr(_builtins, "_LOADED", set(_builtins.BUILTINS))
+    monkeypatch.setattr(fused_io_hook, "_REGISTRY", {})
+    assert not fused_io_hook.fused_io_available()
+    assert cache.should_fuse_pool_io(spec, ex, fused_pool_io="auto") is False
+    assert cache.should_fuse_pool_io(spec, ex, fused_pool_io=False) is False
+    with pytest.raises(MegakernelConfigError, match="fused pool I/O"):
+        cache.should_fuse_pool_io(spec, ex, fused_pool_io=True)

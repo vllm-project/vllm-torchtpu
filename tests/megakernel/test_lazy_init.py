@@ -137,9 +137,10 @@ from vllm_torchtpu import megakernel as mk
 # The first lookup can be a profile one: `profile` builds DEFAULT_PROFILE
 # (a module-tunables lookup) while it is itself being imported.
 assert mk.get_profile("default").numerics == "exact"
-from vllm_torchtpu.models.qwen3_5.megakernel import model
-model.register()
-assert mk.get_profile("qwen35-candidate30-fused").numerics == "approx"
+mk.register_profile(
+    mk.Profile(name="test-approx-profile", numerics="approx", fused_pool_io=True)
+)
+assert mk.get_profile("test-approx-profile").numerics == "approx"
 print("OK")
 """
 
