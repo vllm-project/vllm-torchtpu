@@ -21,8 +21,8 @@ import inspect
 import itertools
 import math
 import os
-from collections.abc import Mapping, Sequence
-from typing import Any
+from collections.abc import Callable, Mapping, Sequence
+from typing import Any, cast
 
 import torch
 import torch.nn as nn
@@ -566,9 +566,11 @@ def _load_mtp_draft(vllm_config: Any, target: nn.Module) -> nn.Module | None:
     draft_model_config = copy.copy(spec.draft_model_config)
     draft_model_config.runner_type = "draft"
     with trace("export.load_mtp_draft"), set_current_vllm_config(draft_vllm_config):
-        draft = get_model_loader(vllm_config.load_config).load_model(
-            vllm_config=draft_vllm_config, model_config=draft_model_config
+        loader = cast(
+            Callable[..., torch.nn.Module],
+            get_model_loader(vllm_config.load_config).load_model,
         )
+        draft = loader(vllm_config=draft_vllm_config, model_config=draft_model_config)
     _share_embedding_and_lm_head(draft, target)
     return draft
 
@@ -1374,7 +1376,7 @@ class UniversalVllmExportableLLM(api.ExportableTextOnlyLLM):
             forward_metadata = {name: metadata for name, _ in layers}
             prev = getattr(draft, "do_not_compile", None)
             if prev is not None:
-                draft.do_not_compile = True
+                object.__setattr__(draft, "do_not_compile", True)
             try:
                 with contextlib.ExitStack() as stack:
                     if self._vllm_config is not None:
@@ -1404,7 +1406,7 @@ class UniversalVllmExportableLLM(api.ExportableTextOnlyLLM):
                     )
             finally:
                 if prev is not None:
-                    draft.do_not_compile = prev
+                    object.__setattr__(draft, "do_not_compile", prev)
 
         def greedy(hidden: Any) -> Any:
             return self.greedy_tokens(hidden, lm_head)

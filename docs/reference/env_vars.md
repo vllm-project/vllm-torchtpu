@@ -11,7 +11,7 @@ All environment variables read by `vllm-torchtpu` are declared and validated in 
 | `VLLM_XLA_CACHE_PATH` | `~/.cache/vllm/xla_cache` | Directory path (or `gs://` URI) for persistent XLA/PJRT compilation cache artifacts. See [Compilation & Warmup Cache](../user_guide/compilation_cache.md). |
 | `VLLM_XLA_CHECK_RECOMPILATION` | `False` | Logs or raises when an unexpected XLA graph recompilation occurs after warmup. |
 | `TPU_PARALLEL_PRECOMPILE` | `False` | Enables parallel compilation during model warmup. |
-| `TPU_PRECOMPILE_PEER_REPLAY` | `False` | With `TPU_PARALLEL_PRECOMPILE`, each compile range is compiled by one rank of the host and replayed by the others from vLLM's compile cache. Requires the compile cache: startup fails with `VLLM_DISABLE_COMPILE_CACHE=1` (point `VLLM_CACHE_ROOT` at a temporary directory for a cold start with nothing kept across runs). |
+| `TPU_PRECOMPILE_PEER_REPLAY` | `False` | With `TPU_PARALLEL_PRECOMPILE`, each compile range is compiled by one rank of the host and replayed by the others from vLLM's compile cache. Requires the compile cache: startup fails with `VLLM_DISABLE_COMPILE_CACHE=1` (point `VLLM_CACHE_ROOT` at a temporary directory for a cold start with nothing kept across runs). A rank waits up to `TPU_PRECOMPILE_PEER_WAIT_S` for a range's owner to save it. An owner that compiles a range but cannot save it (a failed save, nothing serializable) leaves a `<key>.failed` marker in its compile cache dir, and the waiting ranks then compile the range at once, so the wait only runs out for an owner that died. Markers from an earlier run are ignored. |
 | `TPU_PRECOMPILE_PEER_WAIT_S` | `600` | With `TPU_PRECOMPILE_PEER_REPLAY`, seconds a rank waits for a range's owner to save it before compiling the range itself (`0`: check once, then compile). Must be finite and `>= 0`. The default leaves room over the biggest Qwen3.5-397B range at DP8 (about 165 s with every rank of the host compiling); raise it if your biggest range compiles in longer, since a waiter that times out compiles concurrently with the owner. |
 | `TPU_PRECOMPILE_TRACE_FIRST` | `False` | With `TPU_PARALLEL_PRECOMPILE` and shape-specialized backbone traces, traces every token-bucket group before compiling any bucket, then compiles all buckets across all traces in one pass (incompatible with `VLLM_USE_MEGA_AOT_ARTIFACT=1`). |
 | `TPU_MULTIHOST_BACKEND` | `""` (`mp` default, or `"ray"`) | Selects the multi-host execution backend (`"ray"` uses `RayDistributedExecutor`; unset uses native multiprocessing `mp`). See [Multi-Host Serving](../user_guide/multihost.md). |
@@ -46,7 +46,7 @@ All environment variables read by `vllm-torchtpu` are declared and validated in 
 
 | Variable | Default | Description |
 | :--- | :--- | :--- |
-| `USE_MOE_SPARSE_CORE` | `True` | Enables TPU SparseCore offload for MoE token permutation and ragged gather/reduce. |
+| `USE_MOE_SPARSE_CORE` | `True` | Enables TPU SparseCore offload for MoE token permutation and ragged gather/reduce. The SparseCore kernels are validated on TPU v5p, v6e, 7, and 7x; other chips fall back to TensorCore. |
 | `ONEHOT_MOE_PERMUTE_THRESHOLD` | `None` | Token threshold for switching between one-hot matmul and SparseCore sort/permute in MoE routing. |
 | `USE_MOE_FUSED_EP_KERNEL` | `False` | Enables the fused Expert-Parallel (`EP`) Pallas MoE kernel. |
 | `MOE_FUSED_EP_KERNEL_IMPL` | `None` | Selects a specific fused EP MoE kernel implementation (`"v1"` or `"v2"`). |
@@ -65,6 +65,7 @@ All environment variables read by `vllm-torchtpu` are declared and validated in 
 | `REQUANTIZE_WEIGHT_DTYPE` | `"float8_e4m3fn"` | Target weight dtype for load-time linear weight requantization. |
 | `REQUANTIZE_BLOCK_SIZE` | `None` | Target subchannel block size for load-time linear weight requantization. |
 | `TPU_FP8_LINEAR_W8A16_MAX_ROWS` | `0` | Opt-in. FP8 dense-linear steps whose padded token bucket has at most this many rows keep bf16 activations (W8A16) instead of quantizing them to FP8. Per-channel path with FP8 weights only; measured on v7x. |
+| `TPU_GDN_QKVZ_KERNEL_LAYOUT` | `False` | Opt-in. Stores the GDN `in_proj_qkvz` weight in the matmul's (k, n) layout instead of vLLM's [n_out, n_in], removing a per-step weight copy on the per-block FP8 path. Ignored with prefill context parallelism; the experimental AOT export rejects it at TP > 1. |
 | `MOE_REQUANTIZE_WEIGHT_DTYPE` | `"float8_e4m3fn"` | Target weight dtype for load-time MoE expert weight requantization (e.g., `"fp4"`). |
 | `MOE_REQUANTIZE_BLOCK_SIZE` | `None` | Target block size for load-time MoE expert weight requantization. |
 | `VLLM_TPU_MXFP4_DEVICE_DEQUANT` | `True` | Performs MXFP4 weight dequantization on TPU device during load rather than on CPU. |
