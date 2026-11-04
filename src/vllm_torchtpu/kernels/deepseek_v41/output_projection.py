@@ -32,9 +32,10 @@ QUANT_ROWS = 32
 # MXU RHS tile edge; the hand-scheduled wo_a matmul works in these tiles.
 MXU_TILE = 256
 # wo_b window 0 runs on row chunks of about T / B0_CHUNKS (rounded down to
-# QUANT_ROWS) as each is quantized. v7 T288, 100 interleaved calls: 2 chunks
-# 37.96 us, 3 chunks 37.98 us, unchunked 38.28 us, 4 chunks 42.68 us.
-B0_CHUNKS = 2
+# QUANT_ROWS) as each is quantized. With the hand-scheduled MXU work, v7 40
+# interleaved calls, two runs: T288 1 chunk 36.00 us, 2 chunks 36.70 us,
+# 3 chunks 36.85 us, 4 chunks 39.2 us; T240 1 and 2 chunks both 34.1 us.
+B0_CHUNKS = 1
 # wo_a loop iterations at which the first WINDOW_DEPTH wo_b windows start;
 # the last iteration index means just before the final group's matmul. v7
 # T288 XPlane, 100 interleaved calls: (5, 6, 7) 39.09 us, (4, 5, 6) 39.90 us,
