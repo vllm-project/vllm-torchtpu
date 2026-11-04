@@ -58,11 +58,6 @@ from vllm.distributed.kv_transfer.kv_connector.v1.multi_connector import (
 from vllm.forward_context import set_forward_context
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.mamba.abstract import MambaBase
-from vllm.model_executor.layers.rotary_embedding import (
-    DeepseekScalingRotaryEmbedding,
-    MRotaryEmbedding,
-    RotaryEmbedding,
-)
 from vllm.model_executor.model_loader import get_model_loader
 from vllm.model_executor.models import supports_lora
 from vllm.model_executor.models.interfaces_base import VllmModelForPooling
@@ -1508,8 +1503,11 @@ class TPUModelRunner(GPUModelRunner):
             for m in live_models:
                 rope_patch.drop_unused_rope_cache_aliases(m)
                 rope_patch.materialize_model_cos_sin_caches(m)
-            logger.info_once(
-                "TPU_ROPE_IN_GRAPH=0: keeping precomputed rotary cos/sin tables."
+            logger.warning_once(
+                "[RoPE] TPU_ROPE_IN_GRAPH=0 keeps full precomputed rotary cache "
+                "tables resident in HBM without truncation or row-major layout "
+                "mitigation (TPU_ROPE_CACHE_TRUNCATE and TPU_ROPE_CACHE_ROW_MAJOR "
+                "have been removed)."
             )
             return
         patched = sum(
@@ -1531,105 +1529,17 @@ class TPUModelRunner(GPUModelRunner):
             )
 
     def _relayout_tables(self, *models: torch.nn.Module | None) -> None:
-        """Give ``models`` the table shapes and row-major layouts the env knobs ask for.
+        """Give ``models`` the row-major table layouts the env knobs ask for.
 
         Target and draft feed the same cached Pallas ops and must share table
-        shapes and layouts; passing them together deduplicates modules and
-        buffers shared across both models.
+        layouts; passing them together deduplicates modules and buffers shared
+        across both models.
         """
         live_models = [m for m in models if m is not None]
         if not live_models:
             return
-        if envs.TPU_ROPE_CACHE_TRUNCATE:
-            self._truncate_rope_caches(*live_models)
-        if envs.TPU_ROPE_CACHE_ROW_MAJOR:
-            runner_utils.relayout_rope_caches(*live_models)
         if envs.TPU_MOE_HASH_TABLE_ROW_MAJOR:
             runner_utils.relayout_hash_tables(*live_models)
-
-    def _truncate_rope_caches(self, *models: torch.nn.Module) -> None:
-        """Slice rotary cos_sin caches to max_model_len (plus speculative slack)
-        which can reduce the overhead of xla layout data copy. Applicable to text-only.
-        """
-        if not models:
-            return
-        multimodal_config = self.model_config.multimodal_config
-        if self.model_config.is_multimodal_model and not (
-            multimodal_config is not None and multimodal_config.language_model_only
-        ):
-            logger.warning(
-                "TPU_ROPE_CACHE_TRUNCATE skipped, multimodal positions are "
-                "not bounded by max_model_len"
-            )
-            return
-        spec_cfg = self.speculative_config
-        spec_tokens = int(getattr(spec_cfg, "num_speculative_tokens", 0) or 0)
-        max_len = self.model_config.max_model_len
-        if spec_tokens > 0:
-            # K > 1 MTP/EAGLE draft steps advance positions past max_model_len - 1
-            # without clamping; keep speculative slack rounded up to an 8-row
-            # sublane multiple so unchecked Pallas HBM DMAs (e.g. DeepSeek-V4
-            # RoPE) stay in bounds and sublane-aligned.
-            max_len = cdiv(max_len + spec_tokens, 8) * 8
-        num_eligible = 0
-        num_truncated = 0
-        # Share one truncated tensor across modules/models that share a buffer,
-        # and visit get_rope()-shared module instances once across models.
-        seen_modules: set[int] = set()
-        truncated_by_id: dict[int, torch.Tensor] = {}
-        for model in models:
-            for name, module in model.named_modules():
-                if id(module) in seen_modules:
-                    continue
-                seen_modules.add(id(module))
-                # isinstance, not an exact type match: on TPU these are the
-                # out-of-tree subclasses from layers/adapter/rotary_embedding.py
-                # and layers/adapter/custom_ops/mla_attention_op.py. DeepSeek
-                # scaling (YaRN for MLA models, and DeepSeek-V4's subclass)
-                # derives from RotaryEmbeddingBase, not RotaryEmbedding.
-                if not isinstance(
-                    module,
-                    (
-                        RotaryEmbedding,
-                        MRotaryEmbedding,
-                        DeepseekScalingRotaryEmbedding,
-                    ),
-                ):
-                    continue
-                for buf_name in ("cos_sin_cache", "cos_sin_cache_bf16"):
-                    buf = getattr(module, buf_name, None)
-                    if buf is None or not isinstance(buf, torch.Tensor):
-                        continue
-                    num_eligible += 1
-                    if buf.ndim >= 1 and buf.shape[0] > max_len:
-                        buf_id = id(buf)
-                        truncated = truncated_by_id.get(buf_id)
-                        if truncated is None:
-                            truncated = buf[:max_len].clone(
-                                memory_format=torch.contiguous_format
-                            )
-                            truncated_by_id[buf_id] = truncated
-                        setattr(module, buf_name, truncated)
-                        num_truncated += 1
-                        logger.info(
-                            "Truncated rope cache %s.%s rows %d -> %d",
-                            name,
-                            buf_name,
-                            buf.shape[0],
-                            max_len,
-                        )
-        if num_eligible:
-            logger.info(
-                "Truncated %d of %d rope caches (%d unique buffers)",
-                num_truncated,
-                num_eligible,
-                len(truncated_by_id),
-            )
-        else:
-            logger.warning(
-                "TPU_ROPE_CACHE_TRUNCATE is set but the model has no "
-                "position-indexed rope cache, nothing was truncated"
-            )
 
     def _create_mesh_for_parallelism(self) -> Mesh:
         local_devices = list(jax.local_devices())

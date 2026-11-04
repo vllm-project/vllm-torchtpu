@@ -22,7 +22,6 @@ from typing import Any
 import torch
 import torch.profiler
 from torch_tpu._internal.profiler import TpuProfilerConfig
-from vllm.model_executor.layers.rotary_embedding.base import RotaryEmbeddingBase
 from vllm.v1.core.sched.output import SchedulerOutput as VllmSchedulerOutput
 
 from vllm_torchtpu import profiler_trace
@@ -435,51 +434,6 @@ def _to_row_major(tensor: torch.Tensor) -> torch.Tensor:
         device_tensor = host.to(tensor.device)
     _PINNED_ENTRY_LAYOUTS[(tensor.dtype, tuple(tensor.shape))] = [1, 0]
     return device_tensor
-
-
-def relayout_rope_caches(*models: torch.nn.Module) -> None:
-    """Re-materialize every rope cache with a row-major device layout."""
-    if not models:
-        return
-    # Share one relayouted device tensor across modules/models that share a
-    # buffer, and visit get_rope()-shared module instances once across models.
-    seen_modules: set[int] = set()
-    relayouted_by_id: dict[int, torch.Tensor] = {}
-    num_changed = 0
-    for model in models:
-        for name, module in model.named_modules():
-            if id(module) in seen_modules:
-                continue
-            seen_modules.add(id(module))
-            if not isinstance(module, RotaryEmbeddingBase):
-                continue
-            # The buffers on a rotary module that are indexed by position.
-            caches: list[tuple[str, Any]] = [
-                (buf_name, getattr(module, buf_name, None))
-                for buf_name in ("cos_sin_cache", "cos_sin_cache_bf16")
-            ]
-            caches = [(n, b) for n, b in caches if isinstance(b, torch.Tensor)]
-            if not caches:
-                continue
-            if any(b.ndim != 2 for _, b in caches):
-                continue
-            for buf_name, buf in caches:
-                buf_id = id(buf)
-                relayouted = relayouted_by_id.get(buf_id)
-                if relayouted is None:
-                    relayouted = _to_row_major(buf)
-                    relayouted_by_id[buf_id] = relayouted
-                setattr(module, buf_name, relayouted)
-            num_changed += 1
-            logger.info(
-                "Relayouted rope cache %s to {1,0} (shape %s)",
-                name,
-                tuple(caches[0][1].shape),
-            )
-
-    if num_changed:
-        _install_entry_layout_pin()
-    logger.info("Row-major relayouted %d rope caches", num_changed)
 
 
 def relayout_hash_tables(*models: torch.nn.Module) -> None:

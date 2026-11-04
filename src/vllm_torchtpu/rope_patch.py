@@ -1380,11 +1380,7 @@ def patch_in_graph_rotary_embedding(model: nn.Module) -> int:
             module.__dict__.pop(buf_name, None)
         module.__dict__.pop("_tpu_compact_rope_angles", None)
         num_patched += 1
-    return (
-        num_patched
-        + patch_cos_sin_cache_buffers(model)
-        + patch_cos_sin_table_pairs(model)
-    )
+    return num_patched + patch_cos_sin_buffers(model)
 
 
 def _call_compute_inv_freq(module: Any) -> torch.Tensor | None:
@@ -1708,12 +1704,13 @@ def _recover_rope_segment_from_table(
     )
 
 
-def patch_cos_sin_cache_buffers(model: nn.Module) -> int:
-    """Replaces remaining rotary `cos_sin_cache` buffers with `InGraphCosSinCache`.
+def patch_cos_sin_buffers(model: nn.Module) -> int:
+    """Replaces remaining rotary `cos_sin_cache` and paired `cos`/`sin` buffers.
 
     Matches `vLLM` rotary modules strictly via exact-class `spec_from_module` +
     sampled CPU verification, and gates content-based `_recover_rope_segment_from_table`
-    strictly to `not isinstance(module, RotaryEmbeddingBase)` (model-local buffers).
+    strictly to `not isinstance(module, RotaryEmbeddingBase)` (model-local buffers,
+    including paired `[max_len, d / 2]` `cos`/`sin` buffers).
     """
     num_patched = 0
     verified_memo: dict[Any, list[CosSinSegment]] = {}
@@ -1784,42 +1781,26 @@ def patch_cos_sin_cache_buffers(model: nn.Module) -> int:
                 ),
             )
             patched = True
-        num_patched += patched
-    return num_patched
 
-
-def patch_cos_sin_table_pairs(model: nn.Module) -> int:
-    """Replaces paired `cos`/`sin` rotary table buffers with in-graph rows.
-
-    For rotary modules that keep the two halves as separate `[max_len, d / 2]`
-    buffers (Muse Spark's), indexed by position: each pair that
-    `_recover_rope_segment_from_table` recognizes becomes two
-    `InGraphCosSinCache` halves, so `@main` takes no table input. Returns the
-    number of modules patched.
-    """
-    num_patched = 0
-    for _, module in model.named_modules():
-        if _is_vllm_rotary_base_instance(module):
-            continue
         cos, sin = module._buffers.get("cos"), module._buffers.get("sin")
-        if cos is None or sin is None:
-            continue
-        segment = _recover_rope_segment_from_table(cos, sin)
-        if segment is None:
-            continue
-        for half, buf in (("cos", cos), ("sin", sin)):
-            del module._buffers[half]
-            setattr(
-                module,
-                half,
-                InGraphCosSinCache(
-                    [segment],
-                    buf.dtype,
-                    *buf.shape,
-                    half=half,
-                    device=buf.device,
-                    cache_dtype=buf.dtype,
-                ),
-            )
-        num_patched += 1
+        if cos is not None and sin is not None:
+            segment = _recover_rope_segment_from_table(cos, sin)
+            if segment is not None:
+                for half, buf in (("cos", cos), ("sin", sin)):
+                    del module._buffers[half]
+                    setattr(
+                        module,
+                        half,
+                        InGraphCosSinCache(
+                            [segment],
+                            buf.dtype,
+                            *buf.shape,
+                            half=half,
+                            device=buf.device,
+                            cache_dtype=buf.dtype,
+                        ),
+                    )
+                patched = True
+
+        num_patched += patched
     return num_patched

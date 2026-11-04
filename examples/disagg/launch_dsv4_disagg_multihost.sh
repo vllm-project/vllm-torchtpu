@@ -428,7 +428,6 @@ common_env_exports=(
   "export MODEL_IMPL_TYPE=vllm"
   "export MOE_REQUANTIZE_WEIGHT_DTYPE=fp4"
   "export MOE_REQUANTIZE_BLOCK_SIZE=512"
-  "export TPU_ROPE_CACHE_ROW_MAJOR=1"
   "export TPU_MOE_HASH_TABLE_ROW_MAJOR=1"
   "export VLLM_USE_BREAKABLE_CUDAGRAPH=0"
   "export VLLM_USE_AOT_COMPILE=0"
