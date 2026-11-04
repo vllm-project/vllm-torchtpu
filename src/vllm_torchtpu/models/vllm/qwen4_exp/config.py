@@ -836,6 +836,23 @@ def validate_mtp_config(cfg):
     if p.data_parallel_size != 1:
         raise ValueError("Qwen4Exp TPU MTP currently requires data_parallel_size=1")
     if pd_transfer_enabled(cfg):
-        raise ValueError("Qwen4Exp PD requires MTP off")
+        # Decode-only MTP: a staged TP>1 consumer behind TP1 pipeline stages
+        # (pd_staging builds the producer's plan without the draft). The
+        # producer ships no draft KV; the draft's prompt KV starts empty, so
+        # this is meant for synthetic rejection sampling. Its state tables
+        # must be the none mode (decode prefix caching off).
+        transfer = cfg.kv_transfer_config
+        if (
+            transfer.is_kv_producer
+            or p.pipeline_parallel_size != 1
+            or p.tensor_parallel_size < 2
+            or cfg.cache_config.enable_prefix_caching
+            or not envs.TPU_RAIDEN_POOL_TAGS_PER_LAYER
+        ):
+            raise ValueError(
+                "Qwen4Exp PD runs MTP only on a staged TP>1 decode behind "
+                "pipeline stages (TPU_RAIDEN_POOL_TAGS_PER_LAYER=1), with "
+                "decode prefix caching off"
+            )
     if getattr(cfg.cache_config, "mamba_cache_mode", "none") not in ("none", "align"):
         raise ValueError("Qwen4Exp MTP requires mamba_cache_mode 'none' or 'align'")
