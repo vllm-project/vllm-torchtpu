@@ -40,6 +40,7 @@ if TYPE_CHECKING:
 
 from vllm_torchtpu.kernels.deepseek_v4 import rope as rope_kernel
 from vllm_torchtpu.kernels.deepseek_v4.o_projection import (
+    cos_sin_table,
     fused_reverse_rope_wo_a_projection,
 )
 from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4.deepseek_v4_attention_op import (  # noqa: E501
@@ -99,7 +100,7 @@ def _rope_jax(
 def _o_proj_jax(
     x: jax.Array,
     positions: jax.Array,
-    cos_sin_cache: jax.Array,
+    o_proj_cos_sin_table: jax.Array,
     wo_a: jax.Array,
     wo_a_scale: jax.Array,
     *,
@@ -109,11 +110,10 @@ def _o_proj_jax(
     return fused_reverse_rope_wo_a_projection(
         x,
         positions,
-        cos_sin_cache,
+        o_proj_cos_sin_table,
         wo_a,
         wo_a_scale.reshape(-1),
         head_dim=head_dim,
-        inverse=True,
         quantize_activations=True,
     )
 
@@ -123,7 +123,7 @@ def _fake_rope(x, positions, cos_sin_cache, *args, **kwargs):
     return torch.empty_like(x)
 
 
-def _fake_o_proj(x, positions, cos_sin_cache, wo_a, wo_a_scale, *args, **kwargs):
+def _fake_o_proj(x, positions, cos_sin_table, wo_a, wo_a_scale, *args, **kwargs):
     """Abstract implementation for PyTorch Dynamo graph tracing."""
     return torch.empty((x.shape[0], wo_a.shape[-1]), dtype=x.dtype, device=x.device)
 
@@ -220,6 +220,9 @@ class VllmDeepseekV4MLAAttention(
         object.__setattr__(
             self, "attn_out_dim", hf_config.num_attention_heads * hf_config.head_dim
         )
+        # The o-projection's cos/sin table stops at max_model_len: no real
+        # token reaches it, and a draft token past it reads the last row.
+        self._max_model_len = vllm_config.model_config.max_model_len
         self.num_layers = hf_config.num_hidden_layers
 
         # Register submodules into static forward context for torch.compile tracking.
@@ -794,7 +797,7 @@ class VllmDeepseekV4MLAAttention(
                 input_partition_specs=(
                     P(None, "model", None),  # o
                     P(),  # positions
-                    P(),  # cos_sin_cache
+                    P(),  # o_proj_cos_sin_table
                     P(),  # wo_a
                     P(),  # wo_a_scale
                 ),
@@ -810,6 +813,7 @@ class VllmDeepseekV4MLAAttention(
                   self.n_local_groups * self.o_lora_rank).
         """
         del act_dtype
+        self._build_o_proj_cos_sin_table()
         weight = cast(torch.Tensor, self.wo_a.weight)
         transposed = (
             self.n_local_heads * self.head_dim // self.n_local_groups,
@@ -825,6 +829,27 @@ class VllmDeepseekV4MLAAttention(
 
         out = fresh_buffer(weight.data.t())
         self.wo_a.weight = torch.nn.Parameter(out, requires_grad=False)
+
+    def _build_o_proj_cos_sin_table(self) -> None:
+        """Build the fused o-projection's inverse-RoPE cos/sin table once per
+        rotary embedding, so layers that share the embedding share the table
+        and the per-step gather of its rows."""
+        rotary_emb = self.rotary_emb
+        if hasattr(rotary_emb, "o_proj_cos_sin_table"):
+            return
+        cache = cast(torch.Tensor, rotary_emb.cos_sin_cache)
+        num_positions = min(cache.shape[0], self._max_model_len)
+        op_name = f"pallas::deepseek_v4_o_proj_cos_sin_table_p{num_positions}"
+        op = _pallas_op_cache.get(op_name)
+        if op is None:
+            op = pallas.jax_op(
+                op_name,
+                functools.partial(
+                    cos_sin_table, inverse=True, num_positions=num_positions
+                ),
+            )
+            _pallas_op_cache[op_name] = op
+        rotary_emb.register_buffer("o_proj_cos_sin_table", op(cache), persistent=False)
 
     def _assert_o_proj_supported(self) -> None:
         """Check what the fused `wo_a` kernel requires.
@@ -893,7 +918,7 @@ class VllmDeepseekV4MLAAttention(
         z = self.o_proj_op(
             o,
             positions,
-            self.rotary_emb.cos_sin_cache,
+            self.rotary_emb.o_proj_cos_sin_table,
             self.wo_a.weight,
             self.wo_a.weight_scale,
         )

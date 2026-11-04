@@ -19,6 +19,7 @@ from absl.testing import absltest, parameterized
 
 from vllm_torchtpu.kernels.deepseek_v4.o_projection import (
     LANE,
+    cos_sin_table,
     gather_cos_sin,
     wo_a_projection,
 )
@@ -73,6 +74,53 @@ def make_inputs(
     return activations, wo_a, wo_a_scale
 
 
+def cos_sin_ref_impl(positions, cos_sin_cache, *, inverse):
+    """``gather_cos_sin``'s rows: identity on the NoPE lanes, repeated cos/sin."""
+    rows = np.asarray(cos_sin_cache)[np.asarray(positions)]
+    num_tokens, rotary_dim = rows.shape
+    half = rotary_dim // 2
+    cos = np.ones((num_tokens, LANE), np.float32)
+    sin = np.zeros((num_tokens, LANE), np.float32)
+    cos[:, LANE - rotary_dim :] = np.repeat(rows[:, :half], 2, axis=-1)
+    sin[:, LANE - rotary_dim :] = np.repeat(rows[:, half:], 2, axis=-1)
+    if inverse:
+        sin = -sin
+    return np.concatenate([cos, sin], axis=-1)
+
+
+class GatherCosSinTest(parameterized.TestCase):
+    @parameterized.named_parameters(
+        dict(testcase_name="one_chunk", num_tokens=128),
+        dict(testcase_name="unaligned", num_tokens=36),
+        dict(testcase_name="eight_chunks", num_tokens=1024),
+    )
+    def test_matches_reference(self, *, num_tokens):
+        """Runs of consecutive positions, gaps, padding and the table's end."""
+        rng = np.random.default_rng(0)
+        num_positions = MAX_POSITION // 2
+        runs = [
+            rng.integers(0, num_positions, size=5),  # decode tokens
+            np.arange(num_positions - 4, num_positions + 12),  # past the end
+            np.arange(100, 400),
+            np.arange(3, 253),  # a run starting mid-group
+            np.array([57, 58, 59, 61, 62, 63, 64, 65]),  # one gap in a group
+            np.arange(num_positions - 96, num_positions),
+        ]
+        positions = np.concatenate(runs)[:num_tokens]
+        positions = np.pad(positions, (0, num_tokens - positions.size))
+        cos_sin_cache = jnp.asarray(
+            make_cos_sin_cache(MAX_POSITION, ROTARY_DIM), dtype=jnp.float32
+        )
+        table = cos_sin_table(cos_sin_cache, inverse=True, num_positions=num_positions)
+        out = gather_cos_sin(jnp.asarray(positions, dtype=jnp.int32), table)
+        # A position past the table reads its last row.
+        clamped = np.minimum(positions, num_positions - 1)
+        np.testing.assert_array_equal(
+            np.asarray(out),
+            cos_sin_ref_impl(clamped, cos_sin_cache, inverse=True),
+        )
+
+
 # TODO: improve test coverage.
 class OProjectionTest(parameterized.TestCase):
     @parameterized.named_parameters(
@@ -81,6 +129,14 @@ class OProjectionTest(parameterized.TestCase):
             num_tokens=256,
             num_groups=8,
             lora_rank=1024,
+        ),
+        dict(  # Several sub-tiles per grid step and several token tiles.
+            testcase_name="dsv4_flash_sub_tiles",
+            num_tokens=256,
+            num_groups=8,
+            lora_rank=1024,
+            tile_t=128,
+            sub_t=32,
         ),
         dict(  # The benchmarked shape: activations [1024, 128, 512].
             testcase_name="dsv4_pro",
@@ -113,7 +169,8 @@ class OProjectionTest(parameterized.TestCase):
         cos_sin_cache = jnp.asarray(
             make_cos_sin_cache(MAX_POSITION, ROTARY_DIM), dtype=jnp.float32
         )
-        cos_sin = gather_cos_sin(positions, cos_sin_cache, inverse=True)
+        table = cos_sin_table(cos_sin_cache, inverse=True, num_positions=MAX_POSITION)
+        cos_sin = gather_cos_sin(positions, table)
         self.assertEqual(cos_sin.shape, (num_tokens, 2 * LANE))
         out = wo_a_projection(
             activations,
