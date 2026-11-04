@@ -34,6 +34,11 @@ class OmniTPUARModelRunner(OmniTPUModelRunner):
         so the signals have to live on the wrapped ``ModelRunnerOutput``
         (upstream GPUARModelRunner sets them on the output before wrapping it),
         not on the wrapper, where they would be dropped.
+
+        ``attach_omni_connector_output`` returns its argument untouched when
+        there are no signals and otherwise copies it before setting
+        ``omni_connector_output``, so the shared ``EMPTY_MODEL_RUNNER_OUTPUT``
+        that a zero-token step returns is never written to.
         """
         if output is None or not self._omni_connector_initialized:
             return output

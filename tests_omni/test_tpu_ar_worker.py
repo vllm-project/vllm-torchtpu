@@ -13,7 +13,9 @@
 # limitations under the License.
 """Unit tests for src/vllm_torchtpu/omni/tpu_ar_worker.py."""
 
+import ast
 import inspect
+import textwrap
 
 import pytest
 from vllm_omni.worker.mixins import OmniWorkerMixin
@@ -42,8 +44,21 @@ def test_tpu_ar_worker_hierarchy_and_runner_cls():
 
 
 def test_tpu_worker_builds_runner_from_model_runner_cls():
-    # init_device() needs a TPU, so check the construction site statically:
-    # the worker must build its runner through the overridable class attribute.
-    source = inspect.getsource(TPUWorker.init_device)
-    assert "self.model_runner_cls(" in source
-    assert "= TPUModelRunner(" not in source
+    """init_device() needs a TPU, so check the construction site in the AST.
+
+    The worker must build its runner through the overridable class attribute
+    and must not name TPUModelRunner directly. Parsing the source survives
+    reformatting, which a text match would not.
+    """
+    tree = ast.parse(textwrap.dedent(inspect.getsource(TPUWorker.init_device)))
+    called = [node.func for node in ast.walk(tree) if isinstance(node, ast.Call)]
+    assert any(
+        isinstance(func, ast.Attribute)
+        and func.attr == "model_runner_cls"
+        and isinstance(func.value, ast.Name)
+        and func.value.id == "self"
+        for func in called
+    )
+    assert not any(
+        isinstance(func, ast.Name) and func.id == "TPUModelRunner" for func in called
+    )
