@@ -222,49 +222,6 @@ def pack_windows(
     return packed
 
 
-# Expert families follow the first (layers 1..3), eleven regular groups, and
-# final layer. Keeping those resident banks separate avoids addressing a 92-layer
-# expert operand in every fused MoE call. No padding or device-side copies.
-_EXPERT_FAMILIES = ("expert_gu", "expert_gus", "expert_down", "expert_ds")
-_EXPERT_BANK_SIZES = (3,) + (8,) * 11 + (1,)
-
-
-def _bank_expert_weights(iterator):
-    """Stream checkpoint parts into exactly one resident copy of each expert."""
-    state: dict[str, list[Any]] = {}
-    for group, name, value in iterator:
-        family, marker, suffix = name.partition("@")
-        if group != "moe" or family not in _EXPERT_FAMILIES:
-            yield group, name, value
-            continue
-        part, parts = map(int, suffix.split("/")) if marker else (0, 1)
-        entry = state.setdefault(family, [0, 0, 0, None])
-        expected_part, bank, used, buffer = entry
-        if part != expected_part:
-            raise ValueError(f"Out-of-order expert checkpoint part: {name}")
-        offset = 0
-        while offset < value.shape[0]:
-            if bank == len(_EXPERT_BANK_SIZES):
-                raise ValueError(f"Too many expert layers for {family}")
-            capacity = _EXPERT_BANK_SIZES[bank]
-            if buffer is None:
-                buffer = np.empty((capacity, *value.shape[1:]), dtype=value.dtype)
-            count = min(capacity - used, value.shape[0] - offset)
-            buffer[used : used + count] = value[offset : offset + count]
-            used += count
-            offset += count
-            if used == capacity:
-                yield group, f"{family}#bank{bank}", buffer
-                bank, used, buffer = bank + 1, 0, None
-        state[family] = [part + 1, bank, used, buffer]
-        if part + 1 == parts and (bank != len(_EXPERT_BANK_SIZES) or used):
-            raise ValueError(f"Incomplete expert checkpoint: {family}")
-    if set(state) != set(_EXPERT_FAMILIES) or any(
-        bank != len(_EXPERT_BANK_SIZES) or used for _, bank, used, _ in state.values()
-    ):
-        raise ValueError("Missing expert checkpoint parts")
-
-
 class PrefillProgram:
     """The prefill stack's device weights and packed-window ops.
 
@@ -311,12 +268,25 @@ class PrefillProgram:
         cache = presharded / "prefill-sp-cache"
         from .config import active
 
+        loader = self._rank_loader
+        families, bank_sizes = loader.EXPERT_FAMILIES, loader.EXPERT_BANK_SIZES
         shared = dict(shared or {})
-        iterator = self._rank_loader.iter_prefill_rank(
-            presharded, cache, self.rank, split_experts=True, skip=frozenset(shared)
+        # The decode's experts arrive as 92-layer families or as resident
+        # banks (``family#bankN``, rank_loader.bank_expert_parts).
+        shared_banks = [
+            {f: shared.pop(f"{f}#bank{b}") for f in families}
+            for b in range(len(bank_sizes))
+            if f"{families[0]}#bank{b}" in shared
+        ]
+        if shared_banks and len(shared_banks) != len(bank_sizes):
+            raise RuntimeError("K3 prefill: the shared expert banks are incomplete")
+        skip = frozenset(shared)
+        if shared_banks:
+            skip |= frozenset(families)
+        iterator = loader.iter_prefill_rank(
+            presharded, cache, self.rank, split_experts=True, skip=skip
         )
-        self._expert_banks = []
-        # The decode's experts (aggregate) are one 92-layer family each.
+        self._expert_banks = shared_banks
         kernel = active()
         banked_ep = kernel.prefill_expert_parallel == 16 or (
             kernel.prefill_expert_parallel == 8
@@ -327,10 +297,13 @@ class PrefillProgram:
             kernel.prefill_fused_moe
             and banked_ep
             and kernel.prefill_expert_banks
-            and not set(shared) & set(_EXPERT_FAMILIES)
+            and not skip & set(families)
         ):
-            self._expert_banks = [{} for _ in _EXPERT_BANK_SIZES]
-            iterator = _bank_expert_weights(iterator)
+            self._expert_banks = [{} for _ in bank_sizes]
+            iterator = loader.bank_expert_parts(iterator)
+        for name, tensor in (shared_banks[0] if shared_banks else {}).items():
+            # Bank zero stands for the family in shape/introspection code.
+            self.weights.setdefault("moe", {})[name] = tensor
 
         def store(group, name, tensor):
             family, marker, index = name.partition("#bank")
@@ -350,7 +323,7 @@ class PrefillProgram:
                 if name in shared:
                     self.weights.setdefault(group, {})[name] = shared[name]
         if self._expert_banks and any(
-            set(bank) != set(_EXPERT_FAMILIES) for bank in self._expert_banks
+            set(bank) != set(families) for bank in self._expert_banks
         ):
             raise RuntimeError("K3 prefill: incomplete resident expert banks")
         for group, names in self.names.items():

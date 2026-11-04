@@ -159,15 +159,26 @@ class KimiAggregate:
     def load_weights(self) -> None:
         if self._loaded:
             return
-        from vllm_torchtpu.megakernel.kimi_k3.kernels.rank_loader import PREFILL_SHARED
+        from vllm_torchtpu.megakernel.kimi_k3.kernels.rank_loader import (
+            EXPERT_BANK_SIZES,
+            EXPERT_FAMILIES,
+            PREFILL_SHARED,
+        )
 
         started = time.perf_counter()
         self.decoder.load_weights()
         weights = self.decoder.ops.weights
-        missing = [n for n in PREFILL_SHARED if n not in weights]
+        names = list(PREFILL_SHARED)
+        if f"{EXPERT_FAMILIES[0]}#bank0" in weights:
+            # The decoder's experts are the prefill's resident banks.
+            banks = range(len(EXPERT_BANK_SIZES))
+            names = [n for n in names if n not in EXPERT_FAMILIES] + [
+                f"{f}#bank{b}" for f in EXPERT_FAMILIES for b in banks
+            ]
+        missing = [n for n in names if n not in weights]
         if missing:
             raise RuntimeError(f"K3 aggregate: the decoder holds no {missing}")
-        self.prefiller.load_weights({n: weights[n] for n in PREFILL_SHARED})
+        self.prefiller.load_weights({n: weights[n] for n in names})
         self._loaded = True
         if self.rank == 0:
             logger.info(

@@ -200,13 +200,16 @@ class DecodeOps:
         if self.weights:
             return 0.0
         presharded = self.presharded
+        iterator = self.rank_loader.iter_decode_rank(
+            presharded,
+            self.rank,
+            split_experts=True,
+            attention_dp=self.attention_dp,
+        )
+        if kernel_config.active().decode_expert_banks:
+            iterator = self.rank_loader.bank_expert_parts(iterator)
         stats = stream_to_device(
-            self.rank_loader.iter_decode_rank(
-                presharded,
-                self.rank,
-                split_experts=True,
-                attention_dp=self.attention_dp,
-            ),
+            iterator,
             lambda _group, name, tensor: self.weights.__setitem__(name, tensor),
         )
         self.names = tuple(sorted(self.weights))

@@ -142,6 +142,8 @@ def build_program(vllm_config: Any, tp_rank: int) -> MegakernelProgram:
                 # The aggregate prefill shares the decode's experts.
                 prefill_expert_parallel=aggregate_ep if aggregate else 16,
                 decode_expert_parallel=aggregate_ep,
+                # EP16: the decode holds the experts as the prefill's banks.
+                decode_expert_banks=aggregate_ep == 16,
                 prefill_fused_moe_ep8=aggregate,
                 # Every 8K window's routes on the fused path (no unfused overflow).
                 prefill_moe_capacity_ep8=65536 if aggregate else 32768,

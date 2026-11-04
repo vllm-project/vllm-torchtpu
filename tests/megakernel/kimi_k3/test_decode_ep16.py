@@ -143,3 +143,22 @@ def test_host_joined_parts_match_the_device_join(preshard):
     for name in SHAPES:
         np.testing.assert_array_equal(joined[name][1], _decode_family(root, 3, name))
         assert joined[name][0] == sum(n for k, n, _ in jobs if k.startswith(name + "@"))
+
+
+def test_bank_slot_matches_the_loader_banks():
+    """MoE slot s is at expert_bank_slot(s) of rank_loader.bank_expert_parts."""
+    assert dm.EXPERT_BANK_SIZES == rl.EXPERT_BANK_SIZES
+    layers = sum(rl.EXPERT_BANK_SIZES)
+    families = {
+        name: np.arange(layers, dtype=np.int32).reshape(layers, 1)
+        for name in rl.EXPERT_FAMILIES
+    }
+    parts = [
+        ("decode", f"{name}@{i}/2", value[lo:hi])
+        for name, value in families.items()
+        for i, (lo, hi) in enumerate(((0, 40), (40, layers)))
+    ]
+    banks = {name: value for _, name, value in rl.bank_expert_parts(parts)}
+    for slot in range(layers):
+        bank, index = (int(x) for x in dm.expert_bank_slot(jnp.int32(slot)))
+        assert banks[f"expert_gu#bank{bank}"][index, 0] == slot

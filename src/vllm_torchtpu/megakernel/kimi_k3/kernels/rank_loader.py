@@ -25,6 +25,7 @@ import threading
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 
@@ -43,6 +44,48 @@ PREFILL_SHARED = (PREFILL_IO + PREFILL_COMMON
                   + tuple(n for n in PREFILL_KDA if n != "k_o")
                   + tuple(n for n in PREFILL_MLA if n != "m_o")
                   + PREFILL_MOE_DENSE + EXPERT_FAMILIES)
+
+
+# Expert families follow the first (layers 1..3), eleven regular groups, and
+# final layer. Keeping those resident banks separate avoids addressing a 92-layer
+# expert operand in every fused MoE call. No padding or device-side copies.
+EXPERT_BANK_SIZES = (3,) + (8,) * 11 + (1,)
+
+
+def bank_expert_parts(iterator):
+    """Stream checkpoint parts into exactly one resident copy of each expert."""
+    state: dict[str, list[Any]] = {}
+    for group, name, value in iterator:
+        family, marker, suffix = name.partition("@")
+        if family not in EXPERT_FAMILIES:
+            yield group, name, value
+            continue
+        part, parts = map(int, suffix.split("/")) if marker else (0, 1)
+        entry = state.setdefault(family, [0, 0, 0, None])
+        expected_part, bank, used, buffer = entry
+        if part != expected_part:
+            raise ValueError(f"Out-of-order expert checkpoint part: {name}")
+        offset = 0
+        while offset < value.shape[0]:
+            if bank == len(EXPERT_BANK_SIZES):
+                raise ValueError(f"Too many expert layers for {family}")
+            capacity = EXPERT_BANK_SIZES[bank]
+            if buffer is None:
+                buffer = np.empty((capacity, *value.shape[1:]), dtype=value.dtype)
+            count = min(capacity - used, value.shape[0] - offset)
+            buffer[used : used + count] = value[offset : offset + count]
+            used += count
+            offset += count
+            if used == capacity:
+                yield group, f"{family}#bank{bank}", buffer
+                bank, used, buffer = bank + 1, 0, None
+        state[family] = [part + 1, bank, used, buffer]
+        if part + 1 == parts and (bank != len(EXPERT_BANK_SIZES) or used):
+            raise ValueError(f"Incomplete expert checkpoint: {family}")
+    if set(state) != set(EXPERT_FAMILIES) or any(
+        bank != len(EXPERT_BANK_SIZES) or used for _, bank, used, _ in state.values()
+    ):
+        raise ValueError("Missing expert checkpoint parts")
 
 
 def _dtype(name: str) -> np.dtype:
