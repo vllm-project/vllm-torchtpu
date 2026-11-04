@@ -108,6 +108,48 @@ def expert_half_windows(name, slot_shape, half):
     return [(0, half * rows, rows, 0)]
 
 
+# KernelConfig.decode_expert_banks: (family -> its resident bank refs, MoE slot)
+# while a layer's MoE traces; expert copies then read the slot's bank.
+_BANKS: list = []
+EXPERT_BANK_SIZES = (3,) + (8,) * 11 + (1,)  # rank_loader.EXPERT_BANK_SIZES
+
+
+def expert_bank_slot(slot):
+    """The bank holding MoE slot ``slot`` and the slot's index in it."""
+    first, last = EXPERT_BANK_SIZES[0], sum(EXPERT_BANK_SIZES) - EXPERT_BANK_SIZES[-1]
+    group = EXPERT_BANK_SIZES[1]
+    bank = jnp.where(slot < first, 0, jnp.where(slot >= last, len(EXPERT_BANK_SIZES) - 1,
+                                                1 + (slot - first) // group))
+    index = jnp.where(slot < first, slot, jnp.where(slot >= last, 0, (slot - first) % group))
+    return bank, index
+
+
+class _BankedCopy:
+    """One expert copy from the bank holding the current MoE slot: the start
+    branches over the banks; the wait needs only the shape."""
+
+    def __init__(self, build, banks, slot):
+        self.build, self.banks = build, banks
+        self.bank, self.index = expert_bank_slot(slot)
+
+    def start(self):
+        for bank, ref in enumerate(self.banks):
+            @pl.when(self.bank == bank)
+            def start(ref=ref):
+                self.build(ref.at[self.index]).start()
+
+    def wait(self):
+        self.build(self.banks[0].at[0]).wait()
+
+
+def _expert_source_copy(name, layer, build):
+    """``build(layer ref)``: from ``layer``, or from the current MoE slot's bank."""
+    if not _BANKS:
+        return build(layer)
+    banks, slot = _BANKS[-1]
+    return _BankedCopy(build, banks[name], slot)
+
+
 class _CopyPair:
     """Two DMAs started and waited together."""
 
@@ -2459,43 +2501,25 @@ class MixtureOfExpertsWeights:
     ) -> SimpleNamespace:
         if EXPERT_HALVES == 2:
             return self._make_expert_half_copies(expert, slot, gate_up=gate_up, down=down)
+
+        def family(name, source, destination, semaphore, wanted):
+            if not wanted:
+                return None
+            return _expert_source_copy(
+                name, source,
+                lambda layer: tpu.make_async_copy(layer.at[expert], destination.at[slot], semaphore),
+            )
+
+        semaphores = self.expert_copy_semaphores
         return SimpleNamespace(
-            gate_up=(
-                tpu.make_async_copy(
-                    self.expert_gate_up_projection.at[expert],
-                    self.expert_gate_up_projection_vmem.at[slot],
-                    self.expert_copy_semaphores.at[slot, 0],
-                )
-                if gate_up
-                else None
-            ),
-            gate_up_scales=(
-                tpu.make_async_copy(
-                    self.expert_gate_up_scales.at[expert],
-                    self.expert_gate_up_scales_vmem.at[slot],
-                    self.expert_copy_semaphores.at[slot, 1],
-                )
-                if gate_up
-                else None
-            ),
-            down=(
-                tpu.make_async_copy(
-                    self.expert_down_projection.at[expert],
-                    self.expert_down_projection_vmem.at[slot],
-                    self.expert_copy_semaphores.at[slot, 2],
-                )
-                if down
-                else None
-            ),
-            down_scales=(
-                tpu.make_async_copy(
-                    self.expert_down_scales.at[expert],
-                    self.expert_down_scales_vmem.at[slot],
-                    self.expert_copy_semaphores.at[slot, 3],
-                )
-                if down
-                else None
-            ),
+            gate_up=family("expert_gu", self.expert_gate_up_projection,
+                           self.expert_gate_up_projection_vmem, semaphores.at[slot, 0], gate_up),
+            gate_up_scales=family("expert_gus", self.expert_gate_up_scales,
+                                  self.expert_gate_up_scales_vmem, semaphores.at[slot, 1], gate_up),
+            down=family("expert_down", self.expert_down_projection,
+                        self.expert_down_projection_vmem, semaphores.at[slot, 2], down),
+            down_scales=family("expert_ds", self.expert_down_scales,
+                               self.expert_down_scales_vmem, semaphores.at[slot, 3], down),
         )
 
     def _make_expert_half_copies(self, expert, slot, *, gate_up, down):
@@ -2503,19 +2527,23 @@ class MixtureOfExpertsWeights:
         ``expert // 2``: its gate and up column halves, its down row half."""
         physical, half = expert // 2, expert % 2
 
-        def copy(name, source, destination, semaphore):
+        def copy(name, layer, destination, semaphore):
             copies = []
             for axis, start, size, offset in expert_half_windows(name, destination.shape[1:], half):
                 if axis == 1:
-                    window = (source.at[physical, :, pl.ds(start, size)],
+                    window = (layer.at[physical, :, pl.ds(start, size)],
                               destination.at[slot, :, pl.ds(offset, size)])
                 else:
-                    window = (source.at[physical, pl.ds(start, size)], destination.at[slot])
+                    window = (layer.at[physical, pl.ds(start, size)], destination.at[slot])
                 copies.append(tpu.make_async_copy(*window, semaphore))
             return copies[0] if len(copies) == 1 else _CopyPair(*copies)
 
         def family(name, source, destination, semaphore, wanted):
-            return copy(name, source, destination, semaphore) if wanted else None
+            if not wanted:
+                return None
+            return _expert_source_copy(
+                name, source, lambda layer: copy(name, layer, destination, semaphore)
+            )
 
         semaphores = self.expert_copy_semaphores
         return SimpleNamespace(
@@ -6920,6 +6948,21 @@ def stack(
     """
     if not 1 <= batch_size <= MAX_BATCH:
         raise ValueError(f"The fused decoder stack supports batch sizes from 1 to {MAX_BATCH}")
+    expert_families = ("expert_gu", "expert_gus", "expert_down", "expert_ds")
+    bank_names = ()
+    if f"{expert_families[0]}#bank0" in weights:
+        # Resident expert banks (KernelConfig.decode_expert_banks): bank zero
+        # stands for each family's shape; the banks are extra operands.
+        bank_names = tuple(
+            f"{family}#bank{bank}" for family in expert_families for bank in range(len(EXPERT_BANK_SIZES))
+        )
+        bank_operands = tuple(weights[name] for name in bank_names)
+        weights = {
+            **{name: value for name, value in weights.items() if name not in bank_names},
+            **{family: weights[f"{family}#bank0"] for family in expert_families},
+        }
+    else:
+        bank_operands = ()
     if include_layer_zero and any(name not in weights for name in DENSE):
         raise ValueError("include_layer_zero needs the dense MLP weights")
     select_state_row = state_row is not None
@@ -7204,7 +7247,12 @@ def stack(
         dense_refs = dict(
             zip(dense_names, refs[dense_start : dense_start + len(dense_names)], strict=True)
         )
-        state_start = dense_start + len(dense_names)
+        bank_start = dense_start + len(dense_names)
+        bank_refs = {
+            family: refs[bank_start + i * len(EXPERT_BANK_SIZES) : bank_start + (i + 1) * len(EXPERT_BANK_SIZES)]
+            for i, family in enumerate(expert_families)
+        } if bank_names else None
+        state_start = bank_start + len(bank_names)
         state_count = len(states)
         convolution_ref, recurrent_ref = refs[state_start : state_start + 2]
         raw_pool_refs = refs[state_start + 2 : state_start + state_count]
@@ -9004,7 +9052,12 @@ def stack(
                 mixture_output_vmem = (
                     owned_rows_vmem if moe_token_scatter_output else mixture_vmem
                 )
+                # Banked experts: the copies read the slot's bank (_BANKS).
+                _BANKS[:] = [(bank_refs, layer_index - 1)] if bank_refs else []
+                expert_layer = 0 if bank_refs else layer_index - 1
                 hot_slots = 0 if REPLICAS else (local_weights["expert_gu"].shape[0] - HOT_LOCAL_EXPERTS) // 2
+                if bank_refs and hot_slots:
+                    raise ValueError("hot-expert copies need unbanked experts")
                 if hot_slots > 16:
                     raise ValueError("hot-expert copies: at most 16 slots (local ids < 128)")
                 _HOT[:] = (
@@ -9028,16 +9081,16 @@ def stack(
                         layer_weights["shared_gu"].at[layer_index - 1],
                         layer_weights["shared_down"].at[layer_index - 1],
                         (layer_weights["expert_gu"].at[layer_index - 1, :HOT_LOCAL_EXPERTS] if hot_slots > 0
-                         else layer_weights["expert_gu"].at[layer_index - 1]),
+                         else layer_weights["expert_gu"].at[expert_layer]),
                         gate_up_vmem,
                         (layer_weights["expert_gus"].at[layer_index - 1, :HOT_LOCAL_EXPERTS] if hot_slots > 0
-                         else layer_weights["expert_gus"].at[layer_index - 1]),
+                         else layer_weights["expert_gus"].at[expert_layer]),
                         gate_up_scales_vmem,
                         (layer_weights["expert_down"].at[layer_index - 1, :HOT_LOCAL_EXPERTS] if hot_slots > 0
-                         else layer_weights["expert_down"].at[layer_index - 1]),
+                         else layer_weights["expert_down"].at[expert_layer]),
                         down_vmem,
                         (layer_weights["expert_ds"].at[layer_index - 1, :HOT_LOCAL_EXPERTS] if hot_slots > 0
-                         else layer_weights["expert_ds"].at[layer_index - 1]),
+                         else layer_weights["expert_ds"].at[expert_layer]),
                         down_scales_vmem,
                         expert_semaphores,
                     ),
@@ -9446,6 +9499,7 @@ def stack(
         prefix,
         embedding,
         *(weights[name] for name in NAMES + EPILOGUE + dense_names),
+        *bank_operands,
         *states,
     )
     state_row_scalar = (

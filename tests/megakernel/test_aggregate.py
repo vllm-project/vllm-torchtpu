@@ -314,6 +314,27 @@ def test_aggregate_hands_the_decoders_tensors_to_the_prefill():
     assert len(calls) == 2
 
 
+def test_aggregate_hands_the_decoders_expert_banks_to_the_prefill():
+    banks = [
+        f"{f}#bank{b}"
+        for f in rank_loader.EXPERT_FAMILIES
+        for b in range(len(rank_loader.EXPERT_BANK_SIZES))
+    ]
+    shared = [
+        n for n in rank_loader.PREFILL_SHARED if n not in rank_loader.EXPERT_FAMILIES
+    ]
+    weights = {name: object() for name in shared + banks + ["k_o"]}
+    calls = []
+    aggregate = object.__new__(KimiAggregate)
+    aggregate.decoder = types.SimpleNamespace(
+        load_weights=lambda: None, ops=types.SimpleNamespace(weights=weights)
+    )
+    aggregate.prefiller = types.SimpleNamespace(load_weights=calls.append)
+    aggregate.rank, aggregate._loaded = 1, False
+    aggregate.load_weights()
+    assert set(calls[0]) == set(shared) | set(banks)
+
+
 def test_aggregate_caches_prompt_tokens_only():
     from vllm_torchtpu import _cache_only_prefill_tokens
 

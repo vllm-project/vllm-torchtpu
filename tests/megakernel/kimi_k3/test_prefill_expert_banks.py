@@ -8,7 +8,9 @@ import pytest
 from vllm_torchtpu.megakernel.kimi_k3.kernels.prefill_megakernel import (
     expert_family_slot,
 )
-from vllm_torchtpu.megakernel.kimi_k3.prefill import _bank_expert_weights
+from vllm_torchtpu.megakernel.kimi_k3.kernels.rank_loader import (
+    bank_expert_parts as _bank_expert_weights,
+)
 
 pytestmark = pytest.mark.cpu_test
 FAMILIES = ("expert_gu", "expert_gus", "expert_down", "expert_ds")
