@@ -427,6 +427,12 @@ def update_sparse_mla_kv_cache(
     )
 
 
+# Largest step, in tokens, whose two KV-cache writes go through one fused
+# SparseCore call (`_scatter_caches`). Decode steps are at most a few dozen
+# tokens; prefill and mixed steps (thousands of tokens) keep two calls.
+FUSED_SCATTER_MAX_TOKENS = 256
+
+
 def _scatter_caches(
     kv_cache_nope: jax.Array,
     kv_cache_rope: jax.Array,
@@ -452,10 +458,14 @@ def _scatter_caches(
     if (
         nope_spec.layout is KVCacheLayout.SPARSECORE
         and rope_spec.layout is KVCacheLayout.SPARSECORE
+        and kv_c_normed.shape[0] <= FUSED_SCATTER_MAX_TOKENS
     ):
         # One SparseCore call for both caches: each call has a fixed cost of
         # several microseconds, and the row DMAs of a decode step are far
-        # shorter than that.
+        # shorter than that. Larger steps keep the two calls: in the GLM-5.2
+        # microbenchmark the fused write of a 4096-token mixed step was
+        # followed by a 0.5-1% slower sparse MLA attention in the same layer,
+        # while decode steps gained about 3 us per layer.
         return scatter.scatter_sparsecore_caches(
             (kv_cache_nope, kv_cache_rope),
             (kv_c_normed, k_pe),
