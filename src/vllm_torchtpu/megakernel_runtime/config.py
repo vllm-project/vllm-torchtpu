@@ -35,6 +35,7 @@ import dataclasses
 import importlib
 import importlib.util
 import json
+import math
 from collections.abc import Callable, Mapping
 from types import ModuleType
 from typing import Any
@@ -109,6 +110,134 @@ def _parse_plugin_ref(val: Any) -> str:
     return s
 
 
+def _parse_stats_period_s(val: Any) -> float:
+    """Parse `stats_period_s`: a finite number of seconds, `>= 0` (`0` logs
+    every step). Bools, negatives, NaN and inf are errors."""
+    if isinstance(val, bool):
+        raise MegakernelConfigError(
+            f"megakernel config: stats_period_s={val!r} must be a number of "
+            "seconds, not a bool"
+        )
+    try:
+        period = float(val)
+    except (TypeError, ValueError) as exc:
+        raise MegakernelConfigError(
+            f"megakernel config: invalid stats_period_s={val!r}"
+        ) from exc
+    if not math.isfinite(period) or period < 0:
+        raise MegakernelConfigError(
+            f"megakernel config: stats_period_s={val!r} must be finite and >= 0"
+        )
+    return period
+
+
+@dataclasses.dataclass
+class _ParseState:
+    """What `parse_config` has gathered from the sources so far."""
+
+    runtime: dict[str, Any] = dataclasses.field(
+        default_factory=lambda: {
+            "plugin": None,
+            "options": {},
+            "ab": False,
+            "stats_period_s": DEFAULT_STATS_PERIOD_S,
+        }
+    )
+    template_keys: dict[str, Any] = dataclasses.field(default_factory=dict)
+    # The last explicit on / off, and whether any source configured anything.
+    explicit_enabled: bool | None = None
+    configured: bool = False
+
+
+def _merge_template_settings(
+    state: _ParseState, options: dict[str, Any], template_keys: dict[str, Any]
+) -> None:
+    """Merge one source's template settings: a key it sets at top level or in
+    `options` replaces that key from every earlier source."""
+    if clash := sorted(set(template_keys) & set(options)):
+        raise MegakernelConfigError(
+            f"megakernel config: {clash} set both at top level and in 'options'"
+        )
+    merged = state.runtime["options"]
+    for k in options:
+        state.template_keys.pop(k, None)
+    for k in template_keys:
+        merged.pop(k, None)
+    state.runtime["options"] = {**merged, **options}
+    state.template_keys.update(template_keys)
+
+
+def _apply_mapping_source(state: _ParseState, source: Mapping[str, Any]) -> None:
+    """Apply one mapping source (a dict, a JSON object or parsed `k=v` pairs)."""
+    options: dict[str, Any] = {}
+    template_keys: dict[str, Any] = {}
+    for k, v in source.items():
+        k = str(k)
+        if k not in RUNTIME_KEYS and k not in _LEGACY_KEYS:
+            raise MegakernelConfigError(
+                f"megakernel config: unknown key {k!r}; runtime keys are "
+                f"{sorted(RUNTIME_KEYS)} and template settings go in 'options'"
+            )
+        if v is None:
+            continue
+        state.configured = True
+        if k == "enabled":
+            state.explicit_enabled = parse_bool(v)
+        elif k == "plugin":
+            state.runtime["plugin"] = _parse_plugin_ref(v)
+            if source.get("enabled") is None:
+                state.explicit_enabled = True
+        elif k == "options":
+            options.update(_parse_options(v))
+        elif k == "ab":
+            state.runtime["ab"] = parse_bool(v, key="ab")
+        elif k == "stats_period_s":
+            state.runtime["stats_period_s"] = _parse_stats_period_s(v)
+        else:
+            template_keys[k] = v
+    _merge_template_settings(state, options, template_keys)
+
+
+def _apply_string_source(state: _ParseState, raw: str) -> None:
+    """Apply one string source: an on / off word, `ep` / `tp`, a shorthand
+    name, a JSON object or `k=v,k=v`."""
+    s, sl = raw.strip(), raw.strip().lower()
+    if not sl:
+        return  # an empty string (an unset variable) is no source
+    if sl in _FALSE_STRS:
+        state.explicit_enabled = False
+    elif sl in _TRUE_STRS:
+        state.explicit_enabled = True
+    elif sl in ("ep", "tp"):
+        state.explicit_enabled = True
+        _merge_template_settings(state, {"mode": sl}, {})
+    elif sl in SHORTHANDS:
+        state.explicit_enabled = True
+        state.runtime["plugin"] = sl
+    elif s.startswith("{"):
+        try:
+            parsed = json.loads(s)
+        except json.JSONDecodeError as exc:
+            raise MegakernelConfigError(
+                f"megakernel config: invalid JSON {s!r}: {exc}"
+            ) from exc
+        if not isinstance(parsed, dict):
+            raise MegakernelConfigError(
+                f"megakernel config: expected a JSON object in {s!r}"
+            )
+        _apply_mapping_source(state, parsed)
+    else:
+        pairs: dict[str, Any] = {}
+        for part in (p.strip() for p in s.split(",") if p.strip()):
+            if "=" not in part:
+                raise MegakernelConfigError(
+                    f"Invalid megakernel config entry {part!r} in {s!r}"
+                )
+            k, v = part.split("=", 1)
+            pairs[k.strip()] = v.strip()
+        _apply_mapping_source(state, pairs)
+
+
 def parse_config(*sources: Any, raw_env: Any = None) -> MegakernelConfig:
     """Parse config sources (str, bool or mapping; `None` skipped) in order.
 
@@ -125,117 +254,28 @@ def parse_config(*sources: Any, raw_env: Any = None) -> MegakernelConfig:
     settings a later source adds, unless that source turns it on explicitly,
     and `ab=1` alone turns it on.
     """
-    st: dict[str, Any] = {
-        "enabled": False,
-        "plugin": None,
-        "options": {},
-        "ab": False,
-        "stats_period_s": DEFAULT_STATS_PERIOD_S,
-    }
-    legacy: dict[str, Any] = {}
-    # The last explicit on / off, and whether any source configured anything.
-    explicit: list[bool] = []
-    configured = False
-
-    def set_enabled(on: bool) -> None:
-        explicit[:] = [on]
-
-    def merge(src_options: dict[str, Any], src_legacy: dict[str, Any]) -> None:
-        # One source's template settings: a key it sets at top level or in
-        # `options` replaces that key from every earlier source.
-        if clash := sorted(set(src_legacy) & set(src_options)):
-            raise MegakernelConfigError(
-                f"megakernel config: {clash} set both at top level and in 'options'"
-            )
-        for k in src_options:
-            legacy.pop(k, None)
-        for k in src_legacy:
-            st["options"].pop(k, None)
-        st["options"] = {**st["options"], **src_options}
-        legacy.update(src_legacy)
-
-    def apply_dict(d: Mapping[str, Any]) -> None:
-        nonlocal configured
-        src_options: dict[str, Any] = {}
-        src_legacy: dict[str, Any] = {}
-        for k, v in d.items():
-            k = str(k)
-            if k not in RUNTIME_KEYS and k not in _LEGACY_KEYS:
-                raise MegakernelConfigError(
-                    f"megakernel config: unknown key {k!r}; runtime keys are "
-                    f"{sorted(RUNTIME_KEYS)} and template settings go in 'options'"
-                )
-            if v is None:
-                continue
-            configured = True
-            if k == "enabled":
-                set_enabled(parse_bool(v))
-            elif k == "plugin":
-                st["plugin"] = _parse_plugin_ref(v)
-                if d.get("enabled") is None:
-                    set_enabled(True)
-            elif k == "options":
-                src_options.update(_parse_options(v))
-            elif k == "ab":
-                st["ab"] = parse_bool(v, key="ab")
-            elif k == "stats_period_s":
-                try:
-                    st["stats_period_s"] = float(v)
-                except (TypeError, ValueError) as exc:
-                    raise MegakernelConfigError(
-                        f"megakernel config: invalid stats_period_s={v!r}"
-                    ) from exc
-            else:
-                src_legacy[k] = v
-        merge(src_options, src_legacy)
-
+    state = _ParseState()
     for src in sources:
         if src is None:
             continue
         if isinstance(src, bool):
-            set_enabled(src)
+            state.explicit_enabled = src
         elif isinstance(src, Mapping):
-            apply_dict(src)
+            _apply_mapping_source(state, src)
         else:
-            s, sl = str(src).strip(), str(src).strip().lower()
-            if not sl:
-                continue  # an empty string (an unset variable) is no source
-            if sl in _FALSE_STRS:
-                set_enabled(False)
-            elif sl in _TRUE_STRS:
-                set_enabled(True)
-            elif sl in ("ep", "tp"):
-                set_enabled(True)
-                merge({"mode": sl}, {})
-            elif sl in SHORTHANDS:
-                set_enabled(True)
-                st["plugin"] = sl
-            elif s.startswith("{"):
-                try:
-                    parsed = json.loads(s)
-                except json.JSONDecodeError as exc:
-                    raise MegakernelConfigError(
-                        f"megakernel config: invalid JSON {s!r}: {exc}"
-                    ) from exc
-                if not isinstance(parsed, dict):
-                    raise MegakernelConfigError(
-                        f"megakernel config: expected a JSON object in {s!r}"
-                    )
-                apply_dict(parsed)
-            else:
-                kv: dict[str, Any] = {}
-                for part in (p.strip() for p in s.split(",") if p.strip()):
-                    if "=" not in part:
-                        raise MegakernelConfigError(
-                            f"Invalid megakernel config entry {part!r} in {s!r}"
-                        )
-                    k, v = part.split("=", 1)
-                    kv[k.strip()] = v.strip()
-                apply_dict(kv)
-
-    st["enabled"] = explicit[0] if explicit else configured
+            _apply_string_source(state, str(src))
+    enabled = (
+        state.explicit_enabled
+        if state.explicit_enabled is not None
+        else state.configured
+    )
     raw = "" if raw_env is None else str(raw_env)
-    return MegakernelConfig(**st, legacy=legacy, raw_env=raw)
+    return MegakernelConfig(
+        enabled=enabled,
+        **state.runtime,
+        legacy=state.template_keys,
+        raw_env=raw,
+    )
 
 
 def collect_config(env_raw: Any, additional_config: Any) -> MegakernelConfig:

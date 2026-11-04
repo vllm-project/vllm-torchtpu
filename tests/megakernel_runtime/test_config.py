@@ -259,6 +259,31 @@ def test_enabled_follows_the_last_explicit_source() -> None:
     assert not cfg_mod.parse_config({"plugin": "my.pkg"}, "0").enabled
 
 
+@pytest.mark.parametrize(
+    "src",
+    [
+        {"stats_period_s": True},
+        '{"stats_period_s": false}',
+        "stats_period_s=-1",
+        {"stats_period_s": -0.5},
+        "stats_period_s=nan",
+        {"stats_period_s": float("inf")},
+        "stats_period_s=-inf",
+        "stats_period_s=soon",
+        {"stats_period_s": [3]},
+    ],
+)
+def test_invalid_stats_period_s_raises(src: Any) -> None:
+    with pytest.raises(MegakernelConfigError, match="stats_period_s"):
+        cfg_mod.parse_config(src)
+
+
+def test_stats_period_s_accepts_finite_non_negative_numbers() -> None:
+    assert cfg_mod.parse_config("stats_period_s=0").stats_period_s == 0.0
+    assert cfg_mod.parse_config({"stats_period_s": 2}).stats_period_s == 2.0
+    assert cfg_mod.parse_config('{"stats_period_s": "1.5"}').stats_period_s == 1.5
+
+
 def test_mode_overrides_across_sources() -> None:
     cfg = cfg_mod.parse_config("ep", {"options": {"mode": "tp"}})
     assert cfg.enabled and dict(cfg.options) == {"mode": "tp"} and not cfg.legacy
