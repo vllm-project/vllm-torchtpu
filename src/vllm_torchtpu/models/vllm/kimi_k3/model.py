@@ -75,7 +75,6 @@ from vllm.transformers_utils.configs.kimi_k3 import KimiK3Config
 from vllm.transformers_utils.configs.kimi_linear import KimiLinearConfig
 
 from vllm_torchtpu import envs
-from vllm_torchtpu.gdn_pool_layout import unified_kv_layout_enabled_for_architecture
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.utils import fresh_buffer, synchronize_tensors
 
@@ -242,13 +241,6 @@ class KimiModel(nn.Module):
         dsa = kimi_dsa_config(config)
         self.topk_indices_buffer = None
         if dsa is not None:
-            if unified_kv_layout_enabled_for_architecture(
-                vllm_config.model_config.architecture
-            ):
-                raise ValueError(
-                    "Kimi DSA layers have no unified KV pool layout; set "
-                    "TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL=0"
-                )
             self.topk_indices_buffer = torch.full(
                 (vllm_config.scheduler_config.max_num_batched_tokens, dsa.index_topk),
                 -1,

@@ -1866,6 +1866,55 @@ class PallasMLAttentionBackend(AttentionBackend):
         return (0, 1, 2, 3)
 
 
+class PallasSparseMLAPoolBackend(PallasMLAttentionBackend):
+    """Unified-pool page layout of sparse MLA layers on hybrid models.
+
+    The pool shared with the Mamba-style state pages is born as the sparse
+    NoPE latent cache, so the NoPE half of a sparse MLA layer is the pool
+    itself. The RoPE half and the layer's DSA indexer K cache are arrays of
+    their own indexed by the same block ids: the layer's scheduler page covers
+    all three, while only the NoPE bytes alias state pages.
+    """
+
+    @staticmethod
+    def get_supported_kernel_block_sizes(
+        kv_cache_spec: KVCacheSpec | None = None,
+    ) -> list[int | MultipleOf]:
+        # The kernel page is the whole scheduler block: the pooled state
+        # adapters read regions that fit in one kernel page or span whole
+        # pages, and the state regions are sized against the scheduler block.
+        # The default SEQ_ALONG_LANE indexer layout needs a multiple of 128.
+        return [MultipleOf(128)]
+
+    @staticmethod
+    def get_kv_cache_shape(
+        num_blocks: int,
+        block_size: int,
+        num_kv_heads: int,
+        head_size: int,
+        cache_dtype_str: str | torch.dtype = "auto",
+        **kwargs: Any,
+    ) -> tuple[int, ...]:
+        del num_kv_heads, kwargs
+        nope_spec, _ = PallasMLAttentionBackend.get_sparse_kv_cache_specs(
+            num_blocks, block_size, head_size, cache_dtype_str
+        )
+        return tuple(nope_spec.shape)
+
+    @staticmethod
+    def get_kv_cache_page_size_bytes(
+        block_size: int,
+        num_kv_heads: int,
+        head_size: int,
+        cache_dtype_str: str | torch.dtype = "auto",
+    ) -> int:
+        del num_kv_heads
+        nope_spec, _ = PallasMLAttentionBackend.get_sparse_kv_cache_specs(
+            1, block_size, head_size, cache_dtype_str
+        )
+        return math.prod(nope_spec.shape) * nope_spec.torch_dtype.itemsize
+
+
 class VllmTPUDeepseekV32IndexerBackend(DeepseekV32IndexerBackend):
     """Indexer backend for TPU.
 

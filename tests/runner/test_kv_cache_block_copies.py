@@ -136,6 +136,7 @@ def test_page_local_copy_expands_split_and_updates_every_pool(monkeypatch):
     before = [raw.clone() for raw in raw_tensors]
     fake = SimpleNamespace(
         kv_cache_raw_tensors=raw_tensors,
+        kv_cache_side_tensors=[],
         _unified_kv_layout=True,
         is_unified_pool_used=lambda: True,
         _pool_block_split=3,
@@ -167,6 +168,46 @@ def test_page_local_copy_expands_split_and_updates_every_pool(monkeypatch):
     for raw, old in zip(raw_tensors, before):
         torch.testing.assert_close(raw[21:24], old[18:21])
         torch.testing.assert_close(raw[24], old[24])
+
+
+def test_apply_kv_cache_block_copies_covers_side_tensors(monkeypatch):
+    """Arrays held outside the pool under the same block ids (the RoPE and
+    indexer caches of folded sparse MLA layers) get the same CoW pairs."""
+    raw_tensors = [torch.zeros(8, 4)]
+    side_tensors = [
+        torch.arange(8 * 2, dtype=torch.int32).reshape(8, 2),
+        torch.arange(8 * 3, dtype=torch.uint8).reshape(8, 3),
+    ]
+    before = [side.clone() for side in side_tensors]
+    fake = SimpleNamespace(
+        kv_cache_raw_tensors=raw_tensors,
+        kv_cache_side_tensors=side_tensors,
+        _unified_kv_layout=True,
+        is_unified_pool_used=lambda: True,
+        _pool_block_split=1,
+        _pad_to_bucket=TPUModelRunner._pad_to_bucket,
+        device="cpu",
+        mamba_slot_read_offsets=None,
+        bm_pool_layout=None,
+    )
+    fake._copy_mamba_state_blocks = TPUModelRunner._copy_mamba_state_blocks.__get__(
+        fake
+    )
+
+    def cpu_page_copy(pools, src, dst):
+        for pool in pools:
+            pool[dst.long()] = pool[src.long()]
+
+    monkeypatch.setattr(runner_mod, "copy_mamba_state_blocks", cpu_page_copy)
+    monkeypatch.setattr(runner_mod, "copy_pool_blocks", cpu_page_copy)
+
+    TPUModelRunner._apply_kv_cache_block_copies(
+        fake, [KVCacheBlockCopy(src_block_id=2, dst_block_id=5)]
+    )
+
+    for side, old in zip(side_tensors, before):
+        torch.testing.assert_close(side[5], old[2])
+        torch.testing.assert_close(side[3], old[3])
 
 
 def test_tpu_bind_kv_cache_unpacks_lists():
@@ -214,6 +255,7 @@ def test_apply_kv_cache_block_copies_migrates_mamba_offsets(monkeypatch):
     offsets = torch.arange(10, dtype=torch.long)
     fake = SimpleNamespace(
         kv_cache_raw_tensors=raw_tensors,
+        kv_cache_side_tensors=[],
         _unified_kv_layout=True,
         is_unified_pool_used=lambda: True,
         mamba_slot_read_offsets=offsets,
@@ -259,6 +301,7 @@ def test_precompile_mamba_state_seed_copies_covers_all_groups_and_raw_tensors(
     fake = SimpleNamespace(
         _mamba_copy_plan=copy_plan,
         kv_cache_raw_tensors=kv_raw,
+        kv_cache_side_tensors=[],
         kv_cache_config=SimpleNamespace(kv_cache_groups=[object(), object()]),
         max_num_reqs=3,
         _pool_block_split=2,

@@ -719,7 +719,9 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
         attn_metadata = get_forward_context().attn_metadata
         metadata = None
         if isinstance(attn_metadata, dict):
-            metadata = attn_metadata.get(self.k_cache.prefix)
+            metadata = attn_metadata.get(
+                self.k_cache.metadata_layer_name or self.k_cache.prefix
+            )
         if not isinstance(metadata, AttentionMetadata):
             return self.topk_indices_buffer
 
@@ -785,6 +787,11 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
 
 class VllmTPUIndexerCache(DeepseekV32IndexerCache):
     """Indexer K cache retyped onto the TPU backend. See `VllmTPUIndexer`."""
+
+    # The layer whose attention metadata the indexer reads: set to the MLA
+    # layer when the cache is folded into that layer's pages (one KV cache
+    # group for both), else None for the cache's own.
+    metadata_layer_name: str | None = None
 
     def get_attn_backend(self) -> type[DeepseekV32IndexerBackend]:
         return VllmTPUDeepseekV32IndexerBackend

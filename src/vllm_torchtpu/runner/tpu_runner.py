@@ -869,6 +869,9 @@ class TPUModelRunner(GPUModelRunner):
         # block-table blocks in one attention-shaped pool per cache tensor.
         self._unified_kv_layout: bool = unified_kv_layout_enabled(self.vllm_config)
         self.kv_cache_raw_tensors: list[torch.Tensor] = []
+        # Per-layer arrays indexed by the pool's block ids but held outside
+        # it (`PallasSparseMLAPoolBackend`); block copies cover them too.
+        self.kv_cache_side_tensors: list[torch.Tensor] = []
         # Populated by `_initialize_unified_kv_cache` when `VLLM_TPU_BLOCK_MAJOR_KV`
         # merges unified pools into a single block-major pool; `None` when each
         # layer region uses a separate pool (see `vllm_torchtpu.block_major_pool`).
@@ -1998,9 +2001,13 @@ class TPUModelRunner(GPUModelRunner):
         kv_cache_config: KVCacheConfig,
         layer_to_raw: dict[str, torch.Tensor],
         bm_pool_layout: BlockMajorPoolLayout | None,
+        pool_side_page_bytes: int = 0,
     ) -> None:
         """Map each mamba kv-cache group to the raw pool buffers hosting its
         layers, for the per-step state-block seed copies.
+
+        `pool_side_page_bytes` is the part of each manager page held outside
+        the pool (see `PoolPageLayout`).
 
         Seed copies only exist in mamba align mode, where the state block
         follows the request's last token through the block table. In any
@@ -2052,11 +2059,13 @@ class TPUModelRunner(GPUModelRunner):
                 # page-size function. The divisibility assert is the guard.
                 pool_block_bytes = math.prod(raw.shape[1:]) * raw.element_size()
                 assert manager_page_bytes is not None
-                assert manager_page_bytes % pool_block_bytes == 0, (
+                manager_pool_bytes = manager_page_bytes - pool_side_page_bytes
+                assert manager_pool_bytes % pool_block_bytes == 0, (
                     manager_page_bytes,
+                    pool_side_page_bytes,
                     pool_block_bytes,
                 )
-                self._pool_block_split = manager_page_bytes // pool_block_bytes
+                self._pool_block_split = manager_pool_bytes // pool_block_bytes
                 break
 
     def _collect_mamba_state_seed_copies(
@@ -2413,6 +2422,10 @@ class TPUModelRunner(GPUModelRunner):
             self.device, non_blocking=True
         )
         self._copy_mamba_state_blocks(self.kv_cache_raw_tensors, src_t, dst_t)
+        if self.kv_cache_side_tensors:
+            # Side tensors are indexed by scheduler block, like a split-1 pool.
+            assert split == 1, split
+            copy_pool_blocks(self.kv_cache_side_tensors, src_t, dst_t)
 
     def _dense_kv_copy_supported(self) -> bool:
         """Whether CoW copies run on the per-layer KV cache tensors.
@@ -7449,9 +7462,13 @@ class TPUModelRunner(GPUModelRunner):
                 dst = torch.zeros(n, dtype=torch.int32).to(self.device)
                 for raws in raw_sets.values():
                     self._copy_mamba_state_blocks(raws, src, dst)
+                if self.kv_cache_side_tensors:
+                    copy_pool_blocks(self.kv_cache_side_tensors, src, dst)
                 n *= 4
             for raws in raw_sets.values():
                 synchronize_tensors(raws)
+            if self.kv_cache_side_tensors:
+                synchronize_tensors(self.kv_cache_side_tensors)
 
     def _precompile_mamba_rollback_helpers(self) -> None:
         """Warm the compiled rollback scatters at every bucket length.
