@@ -1195,6 +1195,46 @@ def sparse_mla_attention_dcp(
             interleave_size=interleave_size,
         )
 
+        topk_cap = envs.TPU_DCP_MLA_TOPK_CAP
+        num_local_tokens, topk_width = topk_idx.shape
+        chunk = min(envs.TPU_DCP_MLA_TOPK_CAP_CHUNK, num_local_tokens)
+        if (
+            envs.TPU_DCP_MLA_PREP_KERNEL
+            and envs.TPU_MLA_SPARSE_SPLIT_Q
+            and topk_cap
+            and cache_layout == sparse_mla_kernel.SPARSECORE_CACHE_LAYOUT
+            and topk_width > topk_cap
+            and topk_width % topk_cap == 0
+            and topk_cap % 128 == 0
+            and num_local_tokens % chunk == 0
+            and chunk % 8 == 0
+            and (chunk % 128 == 0 or chunk == num_local_tokens)
+        ):
+            # One preparation kernel replaces the owner fix-up below, the kv_len
+            # reduction, the index relayouts and the lse owner mask: a row
+            # owning nothing gets output 0 and lse -inf from the kernel.
+            # `block_tables_` holds virtual page ordinals; the kernel maps
+            # them with `% num_pages`, like `local_block_tables` below.
+            output, lse = sparse_mla_kernel.dcp_sparse_mla_attention(
+                ql_nope,
+                q_pe,
+                kv_cache_nope,
+                kv_cache_rope,
+                topk_idx,
+                block_tables_,
+                query_start_loc_,
+                request_distribution_,
+                sm_scale=sm_scale or 1.0,
+                k_scale=dequant_scale,
+                topk_cap=topk_cap,
+                chunk_size=envs.TPU_DCP_MLA_TOPK_CAP_CHUNK,
+                small_chunk_batch_size=4,
+                split_dots=True,
+                bias_mask=True,
+                exact_division=True,
+            )
+            return (kv_cache_nope, kv_cache_rope, output, lse)
+
         # A rank owning none of a token's top-k still has to be handed one
         # valid entry: the kernel derives `kv_len` from the `-1` tail and
         # requires `kv_len >= 1`. Position 0 always exists, so it is the

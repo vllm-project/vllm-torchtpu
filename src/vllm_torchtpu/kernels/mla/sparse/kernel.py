@@ -431,7 +431,41 @@ def _attention_kernel(
     capped_windows: int | None = None,
     split_q: bool = False,
     lse_lane_dense: bool = False,
+    tile_order: bool = False,
+    empty_row_lse_neg_inf: bool = False,
+    bias_mask: bool = False,
+    exact_division: bool = False,
+    split_dots: bool = False,
+    remove_softmax: bool = False,
 ):
+    # Stage-A options (all default off, so existing callers are unchanged):
+    #
+    # `tile_order`: the gathered buffers are in the byte order of a
+    #   `T(8,128)`-tiled i32 `[W * C, topk_cap]` index array, which is the order
+    #   `prepare_dcp_sparse_mla_inputs` writes and the SparseCore gather follows.
+    #   The NOPE buffer is `[W * C // 8, H, 8, 128, 128]` u32 and the ROPE buffer
+    #   `[W * C // 8, H, 8, 32, 128]` u32, where `H = topk_cap // 128` is the
+    #   number of 128-slot parts of a window. Token `t` of window `w` is
+    #   `buf[w * C // 8 + t // 8, :, t % 8]`; its parts are concatenated along
+    #   the slot axis before use. Example: C = 16, topk_cap = 256, token 9 of
+    #   window 0 is `buf[1, :, 1]`, two `(128, 128)` NOPE parts.
+    # `empty_row_lse_neg_inf`: a token with `kv_len == 0` stores lse = -inf
+    #   (its output is 0, because every key is masked and zeroed). The caller
+    #   then needs neither a dummy index nor an owner mask.
+    # `bias_mask` (split_q only): dead slots are removed by an additive bias
+    #   through pad column `nope + rope + 1` of the joined q/kv rows (q holds
+    #   2**20 there, a dead kv row holds -256), instead of a select on the
+    #   scores. A dead score becomes -2**28 * sm_scale (about -1.7e7 at
+    #   sm_scale 0.0625), so its exp underflows to exactly 0; a live row holds
+    #   0 in that column and its score is unchanged.
+    # `exact_division`: normalize only the `o_dim` value columns, with exact
+    #   division instead of the approximate reciprocal.
+    # `split_dots` (split_q only): QK as a NOPE dot (K = nope) plus a ROPE dot
+    #   (K = 128, the ROPE slot width), and PV against the NOPE columns only,
+    #   so no concat or pad of the kv rows is built.
+    # `remove_softmax`: TIMING ONLY, gives wrong results. The softmax and the
+    #   normalization are replaced by a cast, to measure their cost.
+    #
     # Split-q mode (`split_q`): `q_hbm_ref` holds q_nope only and the rope
     # part arrives as a separate input `q_pe_hbm_ref` (first of `refs`), with
     # its own VMEM double buffer (last scratch ref). The two are joined and
@@ -497,11 +531,30 @@ def _attention_kernel(
         head_dim = align_to(head_dim + q_pe_hbm_ref.shape[-1], 128)
     nope_dim = kv_cache_utils.WORD_BYTES * kv_cache_utils.TILE_LANE_BYTES
     assert kv_lens_ref.shape[0] == num_tokens
-    bkv_sz = (
-        cache_kv_nope_hbm_ref.shape[1]
-        if sparsecore_layout
-        else cache_kv_nope_hbm_ref.shape[1] // kv_cache_utils.WORD_BYTES
-    )
+    if tile_order:
+        assert sparsecore_layout
+        # [W * C // 8, parts, 8, part_slots, 128]; a token's window is `parts`
+        # runs of `part_slots` slots.
+        num_parts = cache_kv_nope_hbm_ref.shape[1]
+        part_slots = cache_kv_nope_hbm_ref.shape[3]
+        bkv_sz = num_parts * part_slots
+    else:
+        bkv_sz = (
+            cache_kv_nope_hbm_ref.shape[1]
+            if sparsecore_layout
+            else cache_kv_nope_hbm_ref.shape[1] // kv_cache_utils.WORD_BYTES
+        )
+    if bias_mask or split_dots:
+        assert split_q and sparsecore_layout
+    rope_dim = q_pe_hbm_ref.shape[-1] if split_q else 0
+    # Pad column carrying the additive mask bias (bias_mask): the first pad
+    # column after the joined NOPE and ROPE data, plus one.
+    bias_col = nope_dim + rope_dim + 1
+    # q holds bias_q there and a dead kv row bias_kv, so a dead score gets
+    # bias_q * bias_kv = -2**28 before the softmax scale. Both are exact in
+    # their dtypes (bf16 and fp8 e4m3fn).
+    bias_q = 2.0**20
+    bias_kv = -256.0
 
     q_dtype = q_hbm_ref.dtype
     q_packing = get_dtype_packing(q_dtype)
@@ -520,30 +573,41 @@ def _attention_kernel(
     batch_end_seq_idx = batch_start_seq_idx + batch_size - 1
 
     def attention_step1_qk_softmax(
-        q,  # [num_q_heads, head_dim]
-        kv,  # [bkv_sz, head_dim] <- Correspond to data from bkv_*_x2_ref
+        q,  # [num_q_heads, head_dim], or (q_nope, q_rope) with split_dots
+        kv,  # [bkv_sz, head_dim], or (kv_nope, kv_rope) with split_dots
         kv_len,  # i32[] number of valid (non "-1") top-k rows in kv
     ):
-        assert len(q.shape) == 2
-        assert len(kv.shape) == 2
-        assert q.shape[0] % num_q_heads == 0
-        assert q.shape[1] == head_dim
-        assert kv.shape == (bkv_sz, head_dim)
+        if split_dots:
+            s = jnp.einsum(
+                "nd,md->nm", q[0], kv[0], preferred_element_type=jnp.float32
+            ) + jnp.einsum("nd,md->nm", q[1], kv[1], preferred_element_type=jnp.float32)
+        else:
+            assert len(q.shape) == 2
+            assert len(kv.shape) == 2
+            assert q.shape[0] % num_q_heads == 0
+            assert q.shape[1] == head_dim
+            assert kv.shape == (bkv_sz, head_dim)
 
-        # Single-block softmax: each query attends exactly one gathered kv
-        # block, so no FlashAttention running-max/rescale state (GLM-5.2 DSA
-        # has no SWA or sinks). The step1/step2 split only interleaves VPU
-        # and MXU work across batch entries.
-        s = jnp.einsum("nd,md->nm", q, kv, preferred_element_type=jnp.float32)
+            # Single-block softmax: each query attends exactly one gathered kv
+            # block, so no FlashAttention running-max/rescale state (GLM-5.2 DSA
+            # has no SWA or sinks). The step1/step2 split only interleaves VPU
+            # and MXU work across batch entries.
+            s = jnp.einsum("nd,md->nm", q, kv, preferred_element_type=jnp.float32)
         s *= sm_scale
         if k_scale != 1.0:
             s *= k_scale
 
-        # Mask scores past kv_len (the "-1" tail): zeroing the keys alone is
-        # not enough -- a zeroed key still scores 0 and inflates the softmax
-        # denominator whenever kv_len << topk.
-        kv_span = lax.broadcasted_iota(jnp.int32, s.shape, 1)
-        s = jnp.where(kv_span < kv_len, s, jnp.finfo(jnp.float32).min)
+        if not bias_mask:
+            # Mask scores past kv_len (the "-1" tail): zeroing the keys alone
+            # is not enough -- a zeroed key still scores 0 and inflates the
+            # softmax denominator whenever kv_len << topk.
+            kv_span = lax.broadcasted_iota(jnp.int32, s.shape, 1)
+            s = jnp.where(kv_span < kv_len, s, jnp.finfo(jnp.float32).min)
+
+        if remove_softmax:
+            # Timing only: no max, exp or sum.
+            ones = jnp.ones((s.shape[0], 1), jnp.float32)
+            return s, ones, ones
 
         m = jnp.max(s, axis=1, keepdims=True)
         p = jnp.exp(s - m)
@@ -558,6 +622,8 @@ def _attention_kernel(
         kv,
         l_sum,
     ):
+        if split_dots:
+            kv = kv[0]
         pv = jnp.einsum("nm,md->nd", p, kv, preferred_element_type=jnp.float32)
 
         # We use `k_scale` for the PV step as well since MLA uses a shared
@@ -567,6 +633,10 @@ def _attention_kernel(
         if k_scale != 1.0:
             pv *= k_scale
 
+        if remove_softmax:
+            return pv[:, :o_dim].astype(q_dtype)
+        if exact_division:
+            return lax.div(pv[:, :o_dim], l_sum).astype(q_dtype)
         out = (
             lax.div(pv, l_sum)
             if q_dtype == jnp.float32
@@ -591,7 +661,30 @@ def _attention_kernel(
         # The index into cache_kv_hbm_ref should be relative to the current
         # chunk.
         page_idx_start = seq_idx_start - start_seq_idx
-        if not wait:
+        if not wait and tile_order:
+            # Buffers are [G, parts, TB, part_slots, 128]: G groups of 8
+            # tokens when the batch is a multiple of 8, else one group holding
+            # TB = batch_size tokens that start at `page_idx_start % 8`.
+            group = lax.shift_right_logical(page_idx_start, 3)
+            groups, tokens_in_group = (
+                bkv_nope_vmem_ref.shape[0],
+                bkv_nope_vmem_ref.shape[2],
+            )
+            if tokens_in_group == 8:
+                src_idx = (pl.ds(group, groups),)
+            else:
+                src_idx = (
+                    pl.ds(group, 1),
+                    slice(None),
+                    pl.ds(page_idx_start & 7, tokens_in_group),
+                )
+            _async_copy(
+                cache_kv_nope_hbm_ref.at[src_idx], bkv_nope_vmem_ref, sem_nope, wait
+            )
+            _async_copy(
+                cache_kv_rope_hbm_ref.at[src_idx], bkv_rope_vmem_ref, sem_rope, wait
+            )
+        elif not wait:
             _async_copy(
                 cache_kv_nope_hbm_ref.at[pl.ds(page_idx_start, batch_size)],
                 bkv_nope_vmem_ref,
@@ -695,8 +788,33 @@ def _attention_kernel(
     def wait_send_bo_batch(seq_idx_start, bo_sem_idx):
         return _send_bo_batch(seq_idx_start, bo_sem_idx, wait=True)
 
-    def load_bq(bq_sem_idx, batch_idx):
+    def q_pad_block(rows):
+        """The q columns after q_nope and q_pe up to a 128 multiple."""
+        width = (
+            align_to(rope_dim, 128) - rope_dim
+            if split_dots
+            else (head_dim - nope_dim - rope_dim)
+        )
+        if not bias_mask:
+            return jnp.zeros((rows, width), q_dtype)
+        col = lax.broadcasted_iota(jnp.int32, (rows, width), 1)
+        return jnp.where(col == bias_col - nope_dim - rope_dim, bias_q, 0.0).astype(
+            q_dtype
+        )
+
+    def load_bq(bq_sem_idx, batch_idx, dep=None):
+        """q for one token; `dep` (the previous output) only orders the MXU work."""
         q = bq_x2_ref.at[bq_sem_idx, batch_idx][...]
+        if dep is not None:
+            # Artificial dependency to force MXU/VPU interleaving by limiting
+            # LLO's QK runahead. prev_out won't be inf in practice.
+            q = jnp.where(dep[:, : q.shape[-1]] == jnp.inf, dep[:, : q.shape[-1]], q)
+        if split_dots or bias_mask:
+            q_pe = bq_pe_x2_ref.at[bq_sem_idx, batch_idx][...]
+            pad = q_pad_block(q.shape[0])
+            if split_dots:
+                return q, jnp.concatenate([q_pe, pad], -1)
+            return jnp.concatenate([q, q_pe, pad], -1)
         if split_q:
             # The caller's concat + zero pad, rebuilt in VMEM.
             q = jnp.concatenate([q, bq_pe_x2_ref.at[bq_sem_idx, batch_idx][...]], -1)
@@ -728,15 +846,41 @@ def _attention_kernel(
             pick = lax.broadcasted_iota(jnp.int32, tile_ref.shape, 0) == batch_idx
             tile_ref[...] = jnp.where(pick, row, tile_ref[...])
 
+    def join_parts(ref, lead, token):
+        """One token's window from a tile-order ref: parts `ref[*lead, k, token]`."""
+        return jnp.concatenate(
+            [ref[(*lead, k, token)] for k in range(num_parts)], axis=0
+        )
+
     def load_bkv(bkv_sem_idx, batch_idx):
+        def get_kv_len():
+            return kv_lens_ref[batch_start_seq_idx + batch_idx]
+
+        if tile_order:
+            g, tl = divmod(batch_idx, bkv_nope_x2_ref.shape[3])
+            return unpack_bkv_values(
+                join_parts(bkv_nope_x2_ref, (bkv_sem_idx, g), tl),
+                join_parts(bkv_rope_x2_ref, (bkv_sem_idx, g), tl),
+                get_kv_len,
+            )
         return unpack_bkv(
             bkv_nope_x2_ref.at[bkv_sem_idx, batch_idx],
             bkv_rope_x2_ref.at[bkv_sem_idx, batch_idx],
-            lambda: kv_lens_ref[batch_start_seq_idx + batch_idx],
+            get_kv_len,
         )
 
     def unpack_bkv(bkv_nope_ref, bkv_rope_ref, get_kv_len):
-        bkv_nope = bkv_nope_ref[...]
+        return unpack_bkv_values(bkv_nope_ref[...], bkv_rope_ref[...], get_kv_len)
+
+    def dead_rows(shape):
+        """Replacement for kv rows past kv_len: zero, plus the mask bias."""
+        if not bias_mask:
+            return None
+        col = lax.broadcasted_iota(jnp.int32, shape, 1)
+        target = bias_col if shape[-1] == head_dim else bias_col - nope_dim
+        return jnp.where(col == target, bias_kv, 0.0).astype(jnp.float8_e4m3fn)
+
+    def unpack_bkv_values(bkv_nope, bkv_rope, get_kv_len):
         if sparsecore_layout:
             # Native SC returns one uint32[128] row per token. Bitcasting
             # expands the packed byte lanes before folding them into the
@@ -745,7 +889,6 @@ def _attention_kernel(
         bkv_nope = bkv_nope.reshape(bkv_sz, nope_dim)
         bkv_nope = pltpu.bitcast(bkv_nope, jnp.float8_e4m3fn)
 
-        bkv_rope = bkv_rope_ref[...]
         if sparsecore_layout:
             # The native gather's delta-swap produces four-token grouped
             # uint32[128] rows. Expanding their byte lanes recovers one
@@ -753,6 +896,16 @@ def _attention_kernel(
             bkv_rope = pltpu.bitcast(bkv_rope, jnp.uint8)
             bkv_rope = bkv_rope.reshape(bkv_sz, 128)
         bkv_rope = pltpu.bitcast(bkv_rope, jnp.float8_e4m3fn)
+        if split_dots:
+            # Zero keys beyond kv_len in both parts (NaN safety, as below); the
+            # ROPE part also carries the mask bias when bias_mask is set.
+            kv_len = get_kv_len()
+            span = lax.broadcasted_iota(jnp.int32, bkv_nope.shape, 0)
+            bkv_nope = jnp.where(span < kv_len, bkv_nope, 0)
+            span = lax.broadcasted_iota(jnp.int32, bkv_rope.shape, 0)
+            dead = dead_rows(bkv_rope.shape)
+            bkv_rope = jnp.where(span < kv_len, bkv_rope, 0 if dead is None else dead)
+            return bkv_nope, bkv_rope
         bkv = jnp.concatenate([bkv_nope, bkv_rope], axis=-1)
 
         # Pad kv (576) to q's 128-aligned head_dim (640); the padded dims are
@@ -765,7 +918,8 @@ def _attention_kernel(
         # but 0 * NaN = NaN in the PV einsum, so the data must be finite too.
         kv_len = get_kv_len()
         k_span = lax.broadcasted_iota(jnp.int32, bkv.shape, 0)
-        bkv = jnp.where(k_span < kv_len, bkv, 0)
+        dead = dead_rows(bkv.shape)
+        bkv = jnp.where(k_span < kv_len, bkv, 0 if dead is None else dead)
         return bkv
 
     def fixup_capped_overflow(bi_sem_idx, bo_sem_idx):
@@ -787,7 +941,15 @@ def _attention_kernel(
         chunk_rows = cache_kv_nope_hbm_ref.shape[0] // capped_windows
 
         def window_copies(local_idx, j, slot):
-            row = j * chunk_rows + local_idx
+            if tile_order:
+                # chunk_rows counts 8-token groups here.
+                row = (
+                    j * chunk_rows + lax.shift_right_logical(local_idx, 3),
+                    slice(None),
+                    local_idx & 7,
+                )
+            else:
+                row = j * chunk_rows + local_idx
             return (
                 pltpu.make_async_copy(
                     cache_kv_nope_hbm_ref.at[row],
@@ -802,7 +964,15 @@ def _attention_kernel(
             )
 
         def accumulate(q, kv, rem):
-            s = jnp.einsum("nd,md->nm", q, kv, preferred_element_type=jnp.float32)
+            if split_dots:
+                s = jnp.einsum(
+                    "nd,md->nm", q[0], kv[0], preferred_element_type=jnp.float32
+                ) + jnp.einsum(
+                    "nd,md->nm", q[1], kv[1], preferred_element_type=jnp.float32
+                )
+                kv = kv[0]
+            else:
+                s = jnp.einsum("nd,md->nm", q, kv, preferred_element_type=jnp.float32)
             s *= sm_scale
             if k_scale != 1.0:
                 s *= k_scale
@@ -832,15 +1002,22 @@ def _attention_kernel(
                 fix_m_ref[...] = jnp.full(fix_m_ref.shape, f32_min, jnp.float32)
                 fix_l_ref[...] = jnp.zeros(fix_l_ref.shape, jnp.float32)
                 fix_acc_ref[...] = jnp.zeros(fix_acc_ref.shape, jnp.float32)
-                accumulate(
-                    q,
-                    unpack_bkv(
+                if tile_order:
+                    tokens_in_group = bkv_nope_x2_ref.shape[3]
+                    g = lax.div(batch_idx, tokens_in_group)
+                    tl = lax.rem(batch_idx, tokens_in_group)
+                    window0 = unpack_bkv_values(
+                        join_parts(bkv_nope_x2_ref, (bi_sem_idx, g), tl),
+                        join_parts(bkv_rope_x2_ref, (bi_sem_idx, g), tl),
+                        lambda: kv_len,
+                    )
+                else:
+                    window0 = unpack_bkv(
                         bkv_nope_x2_ref.at[bi_sem_idx, batch_idx],
                         bkv_rope_x2_ref.at[bi_sem_idx, batch_idx],
                         lambda: kv_len,
-                    ),
-                    kv_len,
-                )
+                    )
+                accumulate(q, window0, kv_len)
 
                 def window(j, window_carry):
                     slot = lax.rem(j, 2)
@@ -853,9 +1030,20 @@ def _attention_kernel(
                     for cp in window_copies(local_idx, j, slot):
                         cp.wait()
                     rem = kv_len - j * bkv_sz
-                    kv = unpack_bkv(
-                        fix_nope_ref.at[slot], fix_rope_ref.at[slot], lambda: rem
-                    )
+                    if tile_order:
+                        kv = unpack_bkv_values(
+                            jnp.concatenate(
+                                [fix_nope_ref[slot, k] for k in range(num_parts)], 0
+                            ),
+                            jnp.concatenate(
+                                [fix_rope_ref[slot, k] for k in range(num_parts)], 0
+                            ),
+                            lambda: rem,
+                        )
+                    else:
+                        kv = unpack_bkv(
+                            fix_nope_ref.at[slot], fix_rope_ref.at[slot], lambda: rem
+                        )
                     accumulate(q, kv, rem)
                     return window_carry
 
@@ -864,11 +1052,14 @@ def _attention_kernel(
                 pv = fix_acc_ref[...]
                 if k_scale != 1.0:
                     pv *= k_scale
-                out = (
-                    lax.div(pv, l_sum)
-                    if q_dtype == jnp.float32
-                    else (pv * pl.reciprocal(l_sum, approx=True)).astype(q_dtype)
-                )
+                if exact_division:
+                    out = lax.div(pv[:, :o_dim], l_sum).astype(q_dtype)
+                else:
+                    out = (
+                        lax.div(pv, l_sum)
+                        if q_dtype == jnp.float32
+                        else (pv * pl.reciprocal(l_sum, approx=True)).astype(q_dtype)
+                    )
                 bo_x2_ref.at[bo_sem_idx, batch_idx][...] = out[:, :o_dim]
                 if return_lse:
                     store_blse(bo_sem_idx, batch_idx, fix_m_ref[...] + jnp.log(l_sum))
@@ -910,7 +1101,15 @@ def _attention_kernel(
             # o = sum_r softmax(lse_r) * o_r without knowing our max.
             if not return_lse:
                 return
-            store_blse(bo_sem_idx, batch_idx, m + jnp.log(l_sum))
+            lse_col = m + jnp.log(l_sum)
+            if empty_row_lse_neg_inf:
+                # All rows true iff kv_len >= 1 (the iota-vs-scalar compare
+                # form used for the kv masks above).
+                kv_len = kv_lens_ref[batch_start_seq_idx + batch_idx]
+                rows = lax.broadcasted_iota(jnp.int32, lse_col.shape, 0)
+                live = rows < jnp.minimum(kv_len, 1) * lse_col.shape[0]
+                lse_col = jnp.where(live, lse_col, -jnp.inf)
+            store_blse(bo_sem_idx, batch_idx, lse_col)
 
         # Wait for cur blocks if not ready yet
         wait_fetch_bq_batch(batch_start_seq_idx, bi_sem_idx)
@@ -931,14 +1130,17 @@ def _attention_kernel(
         for batch_idx in range(batch_size):
             kv_len = kv_lens_ref[batch_start_seq_idx + batch_idx]
             bkv = load_bkv(bi_sem_idx, batch_idx)
-            bq = load_bq(bi_sem_idx, batch_idx)
+            if split_dots or bias_mask or exact_division or remove_softmax:
+                bq = load_bq(bi_sem_idx, batch_idx, dep=prev_out)
+            else:
+                bq = load_bq(bi_sem_idx, batch_idx)
 
-            if prev_out is not None:
-                # Artificial dependency to force MXU/VPU interleaving by limiting
-                # LLO's QK runahead
-                # We use jnp.where to prevent XLA from optimizing the dependency away.
-                # prev_out won't be inf in practice.
-                bq = jnp.where(prev_out == jnp.inf, prev_out, bq)
+                if prev_out is not None:
+                    # Artificial dependency to force MXU/VPU interleaving by
+                    # limiting LLO's QK runahead. We use jnp.where to prevent
+                    # XLA from optimizing the dependency away. prev_out won't
+                    # be inf in practice.
+                    bq = jnp.where(prev_out == jnp.inf, prev_out, bq)
 
             p, l_sum, m = attention_step1_qk_softmax(bq, bkv, kv_len)
 
@@ -1816,3 +2018,637 @@ def sparse_attention_chunk(
         kernel_batch_size=kernel_batch_size,
         lse=lse,
     )
+
+
+# ---------------------------------------------------------------------------
+# DCP sparse MLA with one preparation kernel.
+#
+# `dcp_sparse_mla_attention` is the per-device sparse MLA of a decode-context
+# parallel (DCP) rank: each rank holds a slice of every token's top-k (its own
+# cache rows, `-1` padded) and returns a partial output and its log-sum-exp for
+# the cross-rank merge. It runs one TensorCore preparation kernel
+# (`prepare_dcp_sparse_mla_inputs`) and then, per chunk of tokens, the
+# SparseCore gather and the attention kernel. The preparation kernel replaces
+# the XLA ops of the generic path (owner fix-up, kv_len reduction, live-window
+# count, page-table row gather, index relayouts, lse init and owner mask).
+# ---------------------------------------------------------------------------
+
+# One (8, 128) i32 tile of SparseCore live-vector data per chunk: lanes [0, 16)
+# hold the live logical-batch count, lanes [16, 32) the per-owner trip count.
+_LIVE_TILE_ROWS = 8
+_LIVE_TILE_WORDS = _LIVE_TILE_ROWS * 128
+
+
+def _log2_exact(x: int, what: str) -> int:
+    if x <= 0 or x & (x - 1):
+        raise ValueError(f"{what} ({x}) must be a power of two")
+    return x.bit_length() - 1
+
+
+def _dcp_prep_kernel(
+    cu_q_lens_ref,  # SMEM i32[max_num_seqs + 1]
+    distribution_ref,  # SMEM i32[3]
+    page_table_ref,  # VMEM i32[max_num_seqs, padded_pps] virtual page ordinals
+    topk_ref,  # VMEM i32[chunk, topk] this chunk's top-k rows
+    idx_hbm_ref,  # HBM i32[num_chunks * W * chunk // 8, parts, 8, 128]
+    kv_lens_ref,  # VMEM i32[1, chunk]
+    lse_ref,  # VMEM f32[chunk, num_heads]
+    live_ref,  # VMEM i32[8, 128]
+    idx_buf,  # VMEM i32[3, chunk // 8, parts, 8, 128]
+    sems,  # DMA semaphores [3]
+    *,
+    chunk: int,
+    topk: int,
+    topk_cap: int,
+    page_size: int,
+    pages_per_seq: int,
+    total_num_pages: int,
+    attention_batch: int,
+    gather_batch_rows: int,
+    gather_batches: int,
+    num_owners: int,
+):
+    """Prepares one chunk of `chunk` tokens for the gather and the attention.
+
+    Per token t of the chunk it computes
+      * kv_len[t]: the number of non-negative top-k entries (0 if the rank
+        owns none of the token's top-k);
+      * the physical cache row of every slot of every window the chunk needs
+        (window w = slots [w * topk_cap, (w + 1) * topk_cap)); a `-1` slot is
+        hashed to a scattered row exactly as `_capped_window_indices_kernel`
+        does, so the gather never hits one row repeatedly;
+      * lse = -inf (rows the attention grid visits are overwritten).
+    and per chunk the SparseCore live vector.
+
+    Window w of the chunk is stored at rows `[(c * W + w) * chunk // 8, ...)`
+    of `idx_hbm_ref` in tile order: entry (t, j) of the window goes to
+    `[t // 8, j // 128, t % 8, j % 128]`. Window 0 is always written; window
+    w >= 1 only if some token of the chunk the attention grid visits has more
+    than `w * topk_cap` entries, because the gather reads exactly those
+    windows (its live bound).
+    """
+    c = pl.program_id(0)
+    num_chunks = pl.num_programs(0)
+    num_windows = topk // topk_cap
+    num_parts = topk_cap // 128
+    groups = chunk // 8
+
+    # Live tokens: real tokens of this chunk rounded up to the attention grid
+    # step, as the attention grid walks them (`batch_end`).
+    token_end = cu_q_lens_ref[distribution_ref[2]]
+    live_tokens = jnp.clip(token_end - c * chunk, 0, chunk)
+    step_bits = _log2_exact(attention_batch, "attention batch")
+    live_tokens = lax.shift_left(
+        lax.shift_right_logical(live_tokens + (attention_batch - 1), step_bits),
+        step_bits,
+    )
+    live_tokens8 = lax.shift_left(lax.shift_right_logical(live_tokens + 7, 3), 3)
+
+    # kv_len per token, exact over the whole row.
+    acc = jnp.zeros((chunk, 128), jnp.int32)
+    for k in range(topk // 128):
+        acc += (topk_ref[:, k * 128 : (k + 1) * 128] >= 0).astype(jnp.int32)
+    kv_len = jnp.sum(acc, axis=1, keepdims=True)  # [chunk, 1]
+
+    # Lane-dense kv_len row: each column of the masked [chunk, chunk] tile
+    # holds one live entry (the form `store_blse` uses for the lse).
+    eye = lax.broadcasted_iota(jnp.int32, (chunk, chunk), 0) == (
+        lax.broadcasted_iota(jnp.int32, (chunk, chunk), 1)
+    )
+    kv_lens_ref[...] = jnp.max(
+        jnp.where(eye, jnp.broadcast_to(kv_len, (chunk, chunk)), 0),
+        axis=0,
+        keepdims=True,
+    )
+    lse_ref[...] = jnp.full(lse_ref.shape, -jnp.inf, jnp.float32)
+
+    # Windows the chunk needs: the most any visited token needs, >= 1.
+    cap_bits = _log2_exact(topk_cap, "topk_cap")
+    row_iota = lax.broadcasted_iota(jnp.int32, (chunk, 1), 0)
+    token_windows = jnp.where(
+        row_iota < live_tokens,
+        lax.shift_right_logical(jnp.maximum(kv_len, 1) + (topk_cap - 1), cap_bits),
+        1,
+    )
+    live_windows_tile = jnp.broadcast_to(
+        jnp.clip(jnp.max(token_windows, axis=0, keepdims=True), 1, num_windows),
+        (8, 128),
+    )
+    live_windows = live_windows_tile[0, 0]
+
+    # SparseCore live vector (see `dsa_gather_native_sc(live_vector=...)`):
+    # the gather covers windows [0, live_windows - 1) for all tokens and the
+    # last window for the first live_tokens8 tokens (whole 8-token groups,
+    # because of the tile order).
+    num_live = (live_windows - 1) * (chunk * topk_cap) + live_tokens8 * topk_cap
+    batch_bits = _log2_exact(gather_batch_rows, "gather batch rows")
+    live_batches = jnp.clip(
+        lax.shift_right_logical(num_live + (gather_batch_rows - 1), batch_bits),
+        0,
+        gather_batches,
+    )
+    owner_bits = _log2_exact(num_owners, "SparseCore owners")
+    owner_batches = lax.shift_right_logical(live_batches + (num_owners - 1), owner_bits)
+    lane = lax.broadcasted_iota(jnp.int32, (8, 128), 1)
+    live_ref[...] = jnp.where(
+        lane < 16, live_batches, jnp.where(lane < 32, owner_batches, 0)
+    )
+
+    # Physical page per (token, virtual page) of each token's sequence.
+    num_seqs = page_table_ref.shape[0]
+    padded_pps = page_table_ref.shape[1]
+    _, page_table = _floor_divmod_const(page_table_ref[...], total_num_pages)
+    token = c * chunk + lax.broadcasted_iota(jnp.int32, (chunk, padded_pps), 0)
+    seq = jnp.zeros((chunk, padded_pps), jnp.int32)
+    for s in range(1, num_seqs):
+        seq += (token >= cu_q_lens_ref[s]).astype(jnp.int32)
+    windows = jnp.zeros((chunk, padded_pps), jnp.int32)
+    for s in range(num_seqs):
+        windows = jnp.where(seq == s, page_table[s : s + 1, :], windows)
+
+    def translate(w):
+        """Physical rows of window w, [chunk, topk_cap]."""
+        idx = topk_ref[:, w * topk_cap : (w + 1) * topk_cap]
+        is_padding = idx == -1
+        seq_page, token_offset = _floor_divmod_const(idx, page_size)
+        logical = jnp.clip(seq_page, 0, pages_per_seq - 1)
+        page = jnp.zeros_like(logical)
+        for pc in range(padded_pps // _GATHER_PAGE_CHUNK):
+            window_chunk = windows[
+                :, pc * _GATHER_PAGE_CHUNK : (pc + 1) * _GATHER_PAGE_CHUNK
+            ]
+            local = logical - pc * _GATHER_PAGE_CHUNK
+            gathered = jnp.take_along_axis(
+                window_chunk, jnp.clip(local, 0, _GATHER_PAGE_CHUNK - 1), axis=1
+            )
+            page = jnp.where(
+                (local >= 0) & (local < _GATHER_PAGE_CHUNK), gathered, page
+            )
+        # Same flat element index and primes as `_capped_window_indices_kernel`.
+        row = c * chunk + lax.broadcasted_iota(jnp.int32, idx.shape, 0)
+        col = w * topk_cap + lax.broadcasted_iota(jnp.int32, idx.shape, 1)
+        flat_element_index = row * topk + col
+        _, scattered_page = _floor_divmod_const(
+            flat_element_index * 104729, total_num_pages
+        )
+        _, scattered_offset = _floor_divmod_const(
+            flat_element_index * 15485863, page_size
+        )
+        page = jnp.where(is_padding, scattered_page, page)
+        token_offset = jnp.where(is_padding, scattered_offset, token_offset)
+        return page * page_size + token_offset
+
+    def window_copy(w, slot):
+        dst_row = (c * num_windows + w) * groups
+        return pltpu.make_async_copy(
+            idx_buf.at[slot], idx_hbm_ref.at[pl.ds(dst_row, groups)], sems.at[slot]
+        )
+
+    def emit(w, slot):
+        rows = translate(w)
+        for k in range(num_parts):
+            idx_buf[slot, :, k] = rows[:, k * 128 : (k + 1) * 128].reshape(
+                groups, 8, 128
+            )
+        copy = window_copy(w, slot)
+        copy.start()
+        return copy
+
+    # Window 0 alternates between buffer slots 0 and 1; the copy of the
+    # previous step is waited here, before its slot is reused next step.
+    @pl.when(c > 0)
+    def _wait_previous():
+        window_copy(0, lax.rem(c + 1, 2)).wait()
+
+    copy0 = emit(0, lax.rem(c, 2))
+
+    for w in range(1, num_windows):
+
+        @pl.when(live_windows > w)
+        def _overflow_window(w=w):
+            emit(w, 2).wait()
+
+    @pl.when(c == num_chunks - 1)
+    def _wait_last():
+        copy0.wait()
+
+
+def prepare_dcp_sparse_mla_inputs(
+    topk_indices: jax.Array,  # i32[num_tokens, topk], rank-local, -1 padded
+    block_tables: jax.Array,  # i32[max_num_seqs * pages_per_seq] virtual pages
+    cu_q_lens: jax.Array,  # i32[max_num_seqs + 1]
+    distribution: jax.Array,  # i32[3]
+    *,
+    num_heads: int,
+    chunk_size: int,
+    topk_cap: int,
+    page_size: int,
+    total_num_pages: int,
+    attention_batch: int,
+    gather_batch_rows: int,
+    num_owners: int,
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+    """Runs `_dcp_prep_kernel` over all chunks.
+
+    `block_tables` holds virtual page ordinals; the kernel maps them to this
+    rank's physical pages with `% total_num_pages`, as the DCP KV write does.
+
+    Returns:
+      indices: i32[num_chunks * W * chunk_size // 8, topk_cap // 128, 8, 128],
+        the window-major physical rows in tile order (see `_dcp_prep_kernel`).
+      kv_lens: i32[1, num_tokens].
+      lse_init: f32[num_tokens, num_heads], all -inf.
+      live: i32[num_chunks * 8, 128], one live-vector tile per chunk.
+    """
+    num_tokens, topk = topk_indices.shape
+    if num_tokens % chunk_size or chunk_size % 8:
+        raise ValueError(
+            f"num_tokens ({num_tokens}) must be a multiple of chunk_size "
+            f"({chunk_size}), itself a multiple of 8"
+        )
+    if chunk_size % 128 and chunk_size != num_tokens:
+        # The lane-dense kv_len block (1, chunk_size) must tile the lanes.
+        raise ValueError(
+            f"chunk_size ({chunk_size}) must be a multiple of 128 or equal "
+            f"num_tokens ({num_tokens})"
+        )
+    if topk % topk_cap or topk_cap % 128 or topk % 128:
+        raise ValueError(f"topk ({topk}) and topk_cap ({topk_cap}) must tile by 128")
+    num_chunks = num_tokens // chunk_size
+    num_windows = topk // topk_cap
+    num_parts = topk_cap // 128
+    max_num_seqs = cu_q_lens.shape[0] - 1
+    pages_per_seq = block_tables.shape[0] // max_num_seqs
+    padded_pps = align_to(pages_per_seq, _GATHER_PAGE_CHUNK)
+    page_table = block_tables.reshape(max_num_seqs, pages_per_seq)
+    if padded_pps != pages_per_seq:
+        page_table = jnp.pad(page_table, ((0, 0), (0, padded_pps - pages_per_seq)))
+    groups = chunk_size // 8
+    kernel = functools.partial(
+        _dcp_prep_kernel,
+        chunk=chunk_size,
+        topk=topk,
+        topk_cap=topk_cap,
+        page_size=page_size,
+        pages_per_seq=pages_per_seq,
+        total_num_pages=total_num_pages,
+        attention_batch=attention_batch,
+        gather_batch_rows=gather_batch_rows,
+        gather_batches=chunk_size * topk // gather_batch_rows,
+        num_owners=num_owners,
+    )
+    return pl.pallas_call(
+        kernel,
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=2,
+            in_specs=[
+                pl.BlockSpec((max_num_seqs, padded_pps), lambda c, cu, d: (0, 0)),
+                pl.BlockSpec((chunk_size, topk), lambda c, cu, d: (c, 0)),
+            ],
+            out_specs=[
+                pl.BlockSpec(memory_space=pltpu.HBM),
+                pl.BlockSpec((1, chunk_size), lambda c, cu, d: (0, c)),
+                pl.BlockSpec((chunk_size, num_heads), lambda c, cu, d: (c, 0)),
+                pl.BlockSpec((_LIVE_TILE_ROWS, 128), lambda c, cu, d: (c, 0)),
+            ],
+            grid=(num_chunks,),
+            scratch_shapes=[
+                pltpu.VMEM((3, groups, num_parts, 8, 128), jnp.int32),
+                pltpu.SemaphoreType.DMA((3,)),
+            ],
+        ),
+        out_shape=[
+            jax.ShapeDtypeStruct(
+                (num_chunks * num_windows * groups, num_parts, 8, 128), jnp.int32
+            ),
+            jax.ShapeDtypeStruct((1, num_tokens), jnp.int32),
+            jax.ShapeDtypeStruct((num_tokens, num_heads), jnp.float32),
+            jax.ShapeDtypeStruct((num_chunks * _LIVE_TILE_ROWS, 128), jnp.int32),
+        ],
+        compiler_params=pltpu.CompilerParams(
+            dimension_semantics=("arbitrary",),
+            vmem_limit_bytes=48 * 1024 * 1024,
+            disable_bounds_checks=True,
+        ),
+        name="dcp_sparse_mla_prep",
+    )(
+        cu_q_lens.astype(jnp.int32),
+        distribution.astype(jnp.int32),
+        page_table,
+        topk_indices,
+    )
+
+
+def _dcp_attention_chunk(
+    q: jax.Array,  # [num_tokens, num_heads, nope] (aliased with the output)
+    q_pe: jax.Array,  # [num_tokens, num_heads, rope]
+    gathered_nope: jax.Array,  # u32[W * chunk // 8, parts, 8, 128, 128]
+    gathered_rope: jax.Array,  # u32[W * chunk // 8, parts, 8, 32, 128]
+    kv_lens: jax.Array,  # i32[num_tokens]
+    lse: jax.Array,  # f32[num_tokens, num_heads] (aliased with the lse output)
+    start_seq_idx: int,
+    end_seq_idx: jax.Array,  # i32
+    *,
+    batch_size: int,
+    num_windows: int,
+    sm_scale: float,
+    k_scale: float,
+    vmem_limit_bytes: int,
+    bias_mask: bool,
+    exact_division: bool,
+    split_dots: bool,
+    remove_softmax: bool,
+    owner_mask: bool = True,
+):
+    """The attention kernel over one chunk's tile-order gathered rows."""
+    _, num_q_heads, o_dim = q.shape
+    head_dim = align_to(o_dim + q_pe.shape[-1], 128)
+    num_parts = gathered_nope.shape[1]
+    if batch_size % 8 and 8 % batch_size:
+        raise ValueError(
+            f"attention batch ({batch_size}) must divide or be a multiple of 8"
+        )
+    groups = max(1, batch_size // 8)
+    tokens_in_group = min(batch_size, 8)
+    end_seq_idx = jnp.maximum(start_seq_idx, end_seq_idx)
+    grid = (cdiv(end_seq_idx - start_seq_idx, batch_size),)
+    hbm = pl.BlockSpec(memory_space=pltpu.HBM)
+    in_specs = [hbm, hbm, hbm, hbm, hbm]  # q, nope, rope, q_pe, lse
+    out_specs = [hbm, hbm]
+    nope_tile = gathered_nope.shape[3:]
+    rope_tile = gathered_rope.shape[3:]
+    scratch_shapes = [
+        pltpu.VMEM((2, groups, num_parts, tokens_in_group, *nope_tile), jnp.uint32),
+        pltpu.VMEM((2, groups, num_parts, tokens_in_group, *rope_tile), jnp.uint32),
+        pltpu.VMEM((2, batch_size, num_q_heads, o_dim), q.dtype),  # bq
+        pltpu.VMEM((2, batch_size, num_q_heads, o_dim), q.dtype),  # bo
+        pltpu.VMEM((2, batch_size, num_q_heads), jnp.float32),  # blse
+        pltpu.SemaphoreType.DMA((5, 2)),
+        # Overflow fix-up: window slots, running max / sum / accumulator.
+        pltpu.VMEM((2, num_parts, *nope_tile), jnp.uint32),
+        pltpu.VMEM((2, num_parts, *rope_tile), jnp.uint32),
+        pltpu.VMEM((num_q_heads, 1), jnp.float32),
+        pltpu.VMEM((num_q_heads, 1), jnp.float32),
+        pltpu.VMEM((num_q_heads, o_dim if split_dots else head_dim), jnp.float32),
+        pltpu.SemaphoreType.DMA((2, 2)),
+        pltpu.VMEM((2, batch_size, num_q_heads, q_pe.shape[-1]), q_pe.dtype),
+    ]
+    scalar_prefetches = (
+        kv_lens,
+        jnp.stack([jnp.int32(start_seq_idx), end_seq_idx.astype(jnp.int32)]),
+        jnp.zeros((2,), jnp.int32),
+    )
+    kernel_body = functools.partial(
+        _attention_kernel,
+        sm_scale=sm_scale,
+        k_scale=k_scale,
+        batch_size=batch_size,
+        return_lse=True,
+        sparsecore_layout=True,
+        capped_windows=num_windows,
+        split_q=True,
+        lse_lane_dense=True,
+        tile_order=True,
+        empty_row_lse_neg_inf=owner_mask,
+        bias_mask=bias_mask,
+        exact_division=exact_division,
+        split_dots=split_dots,
+        remove_softmax=remove_softmax,
+    )
+    scope_name = (
+        f"MLA-dcp-tile-p_{gathered_rope.shape[3]}-bz_{batch_size}-"
+        f"gcz_{gathered_nope.shape[0]}-capw_{num_windows}"
+    )
+    num_prefetch = len(scalar_prefetches)
+    kernel = jax.named_scope(scope_name)(
+        pl.pallas_call(
+            kernel_body,
+            grid_spec=pltpu.PrefetchScalarGridSpec(
+                num_scalar_prefetch=num_prefetch,
+                in_specs=in_specs,
+                out_specs=out_specs,
+                grid=grid,
+                scratch_shapes=scratch_shapes,
+            ),
+            compiler_params=pltpu.CompilerParams(
+                dimension_semantics=("arbitrary",),
+                vmem_limit_bytes=vmem_limit_bytes,
+                disable_bounds_checks=True,
+            ),
+            out_shape=[
+                jax.ShapeDtypeStruct(q.shape, q.dtype),
+                jax.ShapeDtypeStruct(lse.shape, lse.dtype),
+            ],
+            # Operand indices count the scalar prefetches: q -> output 0,
+            # lse -> output 1.
+            input_output_aliases={num_prefetch: 0, num_prefetch + 4: 1},
+            name=scope_name,
+        )
+    )
+    return kernel(*scalar_prefetches, q, gathered_nope, gathered_rope, q_pe, lse)
+
+
+def dcp_sparse_mla_chunk_config(
+    num_tokens: int,
+    topk: int,
+    *,
+    chunk_size: int,
+    attention_kernel_batch_size: int,
+    small_chunk_tokens: int,
+    small_chunk_batch_size: int | None,
+    small_chunk_gather_atoms: int,
+    sparsecore_atoms_per_batch: int,
+) -> tuple[int, int, int, int]:
+    """Static per-call sizes: (chunk, attention batch, gather atoms, owners)."""
+    chunk = min(chunk_size, num_tokens)
+    small_chunk, attention_batch = _chunk_kernel_batch_size(
+        chunk, attention_kernel_batch_size, small_chunk_tokens, small_chunk_batch_size
+    )
+    atoms = small_chunk_gather_atoms if small_chunk else sparsecore_atoms_per_batch
+    tpu_info = pltpu.get_tpu_info()
+    sc_info = tpu_info.sparse_core if tpu_info is not None else None
+    num_owners = (
+        sc_info.num_cores * sc_info.num_subcores
+        if sc_info is not None
+        else native_sc_gather.NUM_CORES * native_sc_gather.NUM_SUBCORES
+    )
+    # The gather clamps its atoms the same way.
+    max_atoms = chunk * topk // (num_owners * native_sc_gather.OCCURRENCES_PER_ATOM)
+    if atoms > max_atoms > 0:
+        atoms = max_atoms
+    return chunk, attention_batch, atoms, num_owners
+
+
+@functools.partial(
+    jax.jit,
+    static_argnames=(
+        "sm_scale",
+        "k_scale",
+        "topk_cap",
+        "chunk_size",
+        "attention_kernel_batch_size",
+        "small_chunk_tokens",
+        "small_chunk_batch_size",
+        "small_chunk_gather_atoms",
+        "sparsecore_atoms_per_batch",
+        "sparsecore_gather_wait_mode",
+        "sparsecore_gather_pipelined",
+        "vmem_limit_bytes",
+        "bias_mask",
+        "exact_division",
+        "split_dots",
+        "remove_softmax",
+        "owner_mask",
+    ),
+)
+def dcp_sparse_mla_attention(
+    q_nope: jax.Array,  # bf16[num_tokens, num_heads, nope]
+    q_pe: jax.Array,  # bf16[num_tokens, num_heads, rope]
+    cache_kv_nope: jax.Array,  # u32[pages, page_size, 128] (SparseCore layout)
+    cache_kv_rope: jax.Array,  # u32[pages, rope_rows, 128] (SparseCore layout)
+    topk_indices: jax.Array,  # i32[num_tokens, topk], rank-local, -1 padded
+    block_tables: jax.Array,  # i32[max_num_seqs * pages_per_seq] virtual pages
+    cu_q_lens: jax.Array,  # i32[max_num_seqs + 1]
+    distribution: jax.Array,  # i32[3]
+    prepared: tuple[jax.Array, jax.Array, jax.Array, jax.Array] | None = None,
+    *,
+    sm_scale: float,
+    k_scale: float = 1.0,
+    topk_cap: int = 256,
+    chunk_size: int = 256,
+    attention_kernel_batch_size: int = DEFAULT_ATTENTION_KERNEL_BATCH_SIZE,
+    small_chunk_tokens: int = 16,
+    small_chunk_batch_size: int | None = 4,
+    small_chunk_gather_atoms: int = 1,
+    sparsecore_atoms_per_batch: int = 16,
+    sparsecore_gather_wait_mode: str = "overlap_rope",
+    sparsecore_gather_pipelined: bool = True,
+    vmem_limit_bytes: int = DEFAULT_VMEM_LIMIT_BYTES,
+    bias_mask: bool = False,
+    exact_division: bool = False,
+    split_dots: bool = False,
+    remove_softmax: bool = False,
+    owner_mask: bool = True,
+) -> tuple[jax.Array, jax.Array]:
+    """Per-rank DCP sparse MLA: partial output and log-sum-exp.
+
+    Computes, for every token, softmax attention of `[q_nope, q_pe]` over the
+    cache rows its top-k slice names, with the latent (NOPE) part as value.
+    Same math as `sparse_ragged_paged_attention(..., topk_cap=topk_cap,
+    return_lse=True, cache_layout="sparsecore", q_pe=q_pe,
+    lse_lane_dense=True)` on rows that own at least one entry. A row that owns
+    none gets output 0 and lse -inf, so no dummy index and no owner mask are
+    needed by the caller.
+
+    Args:
+      q_nope, q_pe: the split query; `nope` is a multiple of 128.
+      cache_kv_nope, cache_kv_rope: this rank's SparseCore-layout caches.
+      topk_indices: rank-local cache indices (sequence coordinates), packed
+        into a prefix and padded with -1.
+      block_tables: virtual page ordinals; mapped to physical pages with
+        `% pages`, like the DCP KV write.
+      cu_q_lens, distribution: ragged batch description, as for
+        `sparse_ragged_paged_attention`.
+      prepared: the outputs of `prepare_dcp_sparse_mla_inputs`, computed by
+        the caller (used by benchmarks to time the gather and attention
+        alone); None runs the preparation kernel here.
+      topk_cap: slots per window (multiple of 128 dividing topk); rows with
+        more live entries take the in-kernel overflow pass.
+      chunk_size: tokens per gather/attention chunk (multiple of 8).
+      small_chunk_batch_size: attention grid step of a chunk of at most
+        `small_chunk_tokens` tokens (the decode bucket). A power of two.
+      bias_mask, exact_division, split_dots, remove_softmax: attention kernel
+        options, see `_attention_kernel`. remove_softmax is timing only.
+      owner_mask: store lse = -inf for rows owning no entry. False exists
+        only for the accuracy test's owner-mask fault control.
+
+    Returns:
+      (output bf16[num_tokens, num_heads, nope], lse f32[num_tokens, num_heads]).
+    """
+    num_tokens, num_heads, nope = q_nope.shape
+    topk = topk_indices.shape[-1]
+    if q_pe.shape[:2] != q_nope.shape[:2] or q_pe.dtype != q_nope.dtype:
+        raise ValueError("q_pe must match q_nope in tokens, heads and dtype")
+    if nope % 128 or num_heads % get_dtype_packing(q_nope.dtype):
+        raise ValueError(f"split q needs a 128-multiple nope dim, got {q_nope.shape}")
+    if cache_kv_nope.dtype != jnp.uint32 or cache_kv_nope.shape[-1] != 128:
+        raise ValueError("NOPE cache must be uint32[pages, page_size, 128]")
+    page_size = cache_kv_nope.shape[1]
+    rope_rows = cache_kv_rope.shape[1]
+    if page_size % rope_rows or 128 // (page_size // rope_rows) != 16:
+        raise ValueError("ROPE cache must pack 8 tokens of 64 bytes per 128-word row")
+    chunk, attention_batch, atoms, num_owners = dcp_sparse_mla_chunk_config(
+        num_tokens,
+        topk,
+        chunk_size=chunk_size,
+        attention_kernel_batch_size=attention_kernel_batch_size,
+        small_chunk_tokens=small_chunk_tokens,
+        small_chunk_batch_size=small_chunk_batch_size,
+        small_chunk_gather_atoms=small_chunk_gather_atoms,
+        sparsecore_atoms_per_batch=sparsecore_atoms_per_batch,
+    )
+    gather_batch_rows = atoms * native_sc_gather.OCCURRENCES_PER_ATOM
+    if prepared is None:
+        prepared = prepare_dcp_sparse_mla_inputs(
+            topk_indices,
+            block_tables,
+            cu_q_lens,
+            distribution,
+            num_heads=num_heads,
+            chunk_size=chunk,
+            topk_cap=topk_cap,
+            page_size=page_size,
+            total_num_pages=cache_kv_nope.shape[0],
+            attention_batch=attention_batch,
+            gather_batch_rows=gather_batch_rows,
+            num_owners=num_owners,
+        )
+    indices, kv_lens, lse, live = prepared
+    num_windows = topk // topk_cap
+    num_parts = topk_cap // 128
+    indices = indices.reshape(-1)
+    kv_lens = kv_lens.reshape(-1)
+    live = live.reshape(-1)
+    token_end = cu_q_lens[distribution[2]]
+    out_size = chunk * topk
+    q = q_nope
+    for c in range(num_tokens // chunk):
+        start = c * chunk
+        valid_rows = jnp.clip(token_end - start, 0, chunk)
+        batch_end = start + cdiv(valid_rows, attention_batch) * attention_batch
+        gathered_nope, gathered_rope = native_sc_gather.dsa_gather_native_sc(
+            cache_kv_nope,
+            cache_kv_rope,
+            indices,
+            out_size=out_size,
+            atoms_per_batch=atoms,
+            wait_mode=sparsecore_gather_wait_mode,
+            serve_pipelined=sparsecore_gather_pipelined,
+            index_offset=c * out_size,
+            live_vector=live,
+            live_offset=c * _LIVE_TILE_WORDS,
+        )
+        groups = num_windows * chunk // 8
+        q, lse = _dcp_attention_chunk(
+            q,
+            q_pe,
+            gathered_nope.reshape(groups, num_parts, 8, 128, 128),
+            gathered_rope.reshape(
+                groups, num_parts, 8, 128 // native_sc_gather.ROPE_PACKING, 128
+            ),
+            kv_lens,
+            lse,
+            start,
+            batch_end,
+            batch_size=attention_batch,
+            num_windows=num_windows,
+            sm_scale=sm_scale,
+            k_scale=k_scale,
+            vmem_limit_bytes=vmem_limit_bytes,
+            bias_mask=bias_mask,
+            exact_division=exact_division,
+            split_dots=split_dots,
+            remove_softmax=remove_softmax,
+            owner_mask=owner_mask,
+        )
+    return q, lse

@@ -89,6 +89,9 @@ def _kernel(
     live_hbm_ref: Any = None,
     guard_tail: bool = False,
     rope_words: int = ROPE_WORDS,
+    index_batch_offset: int = 0,
+    live_offset: int = 0,
+    flat_indices: bool = False,
 ):
     owner = lax.axis_index((core_axis_name, subcore_axis_name))
     live_batches = None
@@ -98,7 +101,10 @@ def _kernel(
         # only at rank 0 (jax/_src/pallas/mosaic/sc_lowering.py), so the count is
         # DMA'd into a VMEM vector and lane 0 extracted -- the same shape as the
         # in-repo dsa_gather.py:90 (`valid_ref[pl.ds(0, 16)][0]`).
-        cp = pltpu.make_async_copy(live_hbm_ref, live_vmem_ref, live_sem_ref.at[0])
+        live_src = live_hbm_ref
+        if live_offset or live_hbm_ref.shape[0] != 2 * NUM_LANES:
+            live_src = live_hbm_ref.at[pl.ds(live_offset, 2 * NUM_LANES)]
+        cp = pltpu.make_async_copy(live_src, live_vmem_ref, live_sem_ref.at[0])
         cp.start()
         cp.wait()
         # Lanes [0,16) broadcast the live logical-batch count, lanes [16,32)
@@ -111,6 +117,12 @@ def _kernel(
         occurrence_base = logical_batch * atoms_per_batch * OCCURRENCES_PER_ATOM
 
         def values(atom, stream):
+            if flat_indices:
+                # 1-D block of one logical batch: stream s of atom a is lanes
+                # [(a * ROPE_PACKING + s) * 16, +16), as in tokamax csa_gather.
+                return indices_ref[
+                    pl.ds((atom * ROPE_PACKING + stream) * NUM_LANES, NUM_LANES)
+                ]
             return indices_ref[0, atom, stream, :]
 
         def destinations(atom, stream):
@@ -208,10 +220,16 @@ def _kernel(
         else:
             run_inner()
 
-    indices_spec = pl.BlockSpec(
-        (1, atoms_per_batch, ROPE_PACKING, NUM_LANES),
-        lambda batch: (owner + batch * num_owners, 0, 0, 0),
-    )
+    if flat_indices:
+        indices_spec = pl.BlockSpec(
+            (atoms_per_batch * OCCURRENCES_PER_ATOM,),
+            lambda batch: (index_batch_offset + owner + batch * num_owners,),
+        )
+    else:
+        indices_spec = pl.BlockSpec(
+            (1, atoms_per_batch, ROPE_PACKING, NUM_LANES),
+            lambda batch: (index_batch_offset + owner + batch * num_owners, 0, 0, 0),
+        )
     if live_batches is None:
         pltpu.emit_pipeline(
             serve_batch,
@@ -246,6 +264,8 @@ def _kernel(
         "wait_mode",
         "serve_pipelined",
         "live_multiple",
+        "index_offset",
+        "live_offset",
     ),
 )
 def dsa_gather_native_sc(
@@ -259,6 +279,9 @@ def dsa_gather_native_sc(
     serve_pipelined: bool = True,
     num_live_indices: jax.Array | None = None,
     live_multiple: int = 1,
+    index_offset: int = 0,
+    live_vector: jax.Array | None = None,
+    live_offset: int = 0,
 ) -> tuple[jax.Array, jax.Array]:
     """Gather explicit native-SC ``uint32`` NOPE and ROPE cache rows.
 
@@ -274,6 +297,23 @@ def dsa_gather_native_sc(
     unwritten. ``live_multiple`` is a static promise that ``num_live_indices``
     is a multiple of it; when that multiple covers whole owner rounds the
     per-owner tail guard is dropped.
+
+    ``index_offset`` (static) gathers ``indices.reshape(-1)[index_offset :
+    index_offset + out_size]`` without slicing ``indices`` in XLA, so several
+    calls can share one index array. It must be a multiple of the logical
+    batch (``atoms_per_batch * 64`` indices).
+
+    With ``live_vector`` the kernel reads ``indices`` as a flat 1-D i32 array
+    (the tokamax csa_gather form), so a caller that writes a 128-lane i32
+    array (row-major under the TensorCore ``T(8,128)`` tiling) hands it over
+    without an XLA relayout of the index array.
+
+    ``live_vector`` (traced i32, optional) replaces ``num_live_indices`` with
+    the live vector the kernel reads, precomputed by the caller:
+    ``live_vector[live_offset : live_offset + 16]`` = live logical batches,
+    ``live_vector[live_offset + 16 : live_offset + 32]`` = per-owner trip
+    count ``cdiv(live batches, num_cores * num_subcores)``, each broadcast
+    over 16 lanes. ``live_offset`` (static) is a multiple of 16.
     """
     if wait_mode not in ("overlap_rope", "before_rope"):
         raise ValueError(f"unknown {wait_mode=}")
@@ -281,10 +321,17 @@ def dsa_gather_native_sc(
         raise ValueError("native-SC NOPE must be explicit uint32[...,128]")
     if rope_cache.dtype != jnp.uint32 or rope_cache.shape[-1] != 128:
         raise ValueError("native-SC ROPE must be banded uint32[...,128]")
-    if indices.dtype != jnp.int32 or indices.ndim != 2:
-        raise ValueError("indices must be int32[query, topk]")
-    if indices.size != out_size:
+    if indices.dtype != jnp.int32:
+        raise ValueError("indices must be int32")
+    if index_offset == 0 and live_vector is None and indices.size != out_size:
         raise ValueError(f"indices has {indices.size} values, expected {out_size}")
+    if indices.size < index_offset + out_size:
+        raise ValueError(
+            f"indices has {indices.size} values, fewer than index_offset "
+            f"({index_offset}) + out_size ({out_size})"
+        )
+    if live_vector is not None and num_live_indices is not None:
+        raise ValueError("pass num_live_indices or live_vector, not both")
 
     nope_rows_view = nope_cache.reshape(-1, 128)
     num_tokens = nope_rows_view.shape[0]
@@ -330,15 +377,35 @@ def dsa_gather_native_sc(
         )
     num_batches = out_size // occurrences_per_batch
     batches_per_owner = num_batches // num_owners
-    live = num_live_indices is not None
+    if index_offset % occurrences_per_batch or indices.size % occurrences_per_batch:
+        raise ValueError(
+            f"index_offset ({index_offset}) and indices.size ({indices.size}) must "
+            f"be multiples of the logical batch ({occurrences_per_batch})"
+        )
+    live = num_live_indices is not None or live_vector is not None
     scratch_types = {"sem_ref": pltpu.SemaphoreType.DMA((ROPE_PACKING,))}
+    flat_indices = live_vector is not None
     operands = [
         nope_rows_view,
         rope_rows_view,
-        indices.reshape(num_batches, atoms_per_batch, ROPE_PACKING, NUM_LANES),
+        indices.reshape(-1)
+        if flat_indices
+        else indices.reshape(-1, atoms_per_batch, ROPE_PACKING, NUM_LANES),
     ]
     guard_tail = False
-    if live:
+    if live_vector is not None:
+        if live_vector.dtype != jnp.int32 or live_vector.ndim != 1:
+            raise ValueError("live_vector must be int32[n]")
+        if (
+            live_offset % NUM_LANES
+            or live_vector.shape[0] < live_offset + 2 * NUM_LANES
+        ):
+            raise ValueError(f"bad live_offset {live_offset} for {live_vector.shape}")
+        operands.append(live_vector)
+        scratch_types["live_vmem_ref"] = pltpu.VMEM((2 * NUM_LANES,), jnp.int32)
+        scratch_types["live_sem_ref"] = pltpu.SemaphoreType.DMA((1,))
+        guard_tail = True
+    elif live:
         # Live logical batches = cdiv(num_live_indices, occurrences/batch),
         # clamped to the static count; per-owner trip = cdiv(live, num_owners).
         live_b = jnp.clip(
@@ -380,6 +447,9 @@ def dsa_gather_native_sc(
         serve_pipelined=serve_pipelined,
         guard_tail=guard_tail,
         rope_words=rope_words,
+        index_batch_offset=index_offset // occurrences_per_batch,
+        live_offset=live_offset,
+        flat_indices=flat_indices,
     )
     if live:
         inner = body
