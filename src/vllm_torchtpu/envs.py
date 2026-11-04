@@ -176,6 +176,9 @@ if TYPE_CHECKING:
     KDA_FWD_MB: int | None = None
     TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT: str = ""
     SC_ALLREDUCE_ALLGATHER_OFFLOAD_MIN_BYTES: int | None = None
+    TPU_SMALL_ALL_REDUCE_KERNEL: bool = True
+    TPU_SMALL_ALL_REDUCE_MAX_BYTES: int = 589824
+    TPU_SMALL_ALL_REDUCE_ALGO: str = "auto"
     SPEC_WARMUP: bool = True
     RAIDEN_DISABLE_SINGLETON_WORKER: bool = True
     RAIDEN_SHM_KEY: str = ""
@@ -1188,6 +1191,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # env_override.py resolves it from the chip family. 0 sets no flag.
     "SC_ALLREDUCE_ALLGATHER_OFFLOAD_MIN_BYTES": env_nonnegative_int_or_auto(
         "SC_ALLREDUCE_ALLGATHER_OFFLOAD_MIN_BYTES"
+    ),
+    # Sum small bf16 tensor-parallel all-reduces (at most
+    # TPU_SMALL_ALL_REDUCE_MAX_BYTES, TP group = the whole world) with the
+    # Pallas kernel in kernels/collectives/small_all_reduce.py instead of
+    # XLA's all-reduce. Armed once after model load
+    # (distributed/small_all_reduce.py); larger tensors keep XLA's all-reduce.
+    "TPU_SMALL_ALL_REDUCE_KERNEL": env_bool("TPU_SMALL_ALL_REDUCE_KERNEL", True),
+    "TPU_SMALL_ALL_REDUCE_MAX_BYTES": env_int("TPU_SMALL_ALL_REDUCE_MAX_BYTES", 589824),
+    # Kernel algorithm: "flat2" (two-shot over all ranks; what "auto" picks),
+    # "hier1" or "hier2" (die-to-die first, then across chips).
+    "TPU_SMALL_ALL_REDUCE_ALGO": env_with_choices(
+        "TPU_SMALL_ALL_REDUCE_ALGO", "auto", ["auto", "flat2", "hier1", "hier2"]
     ),
     # Enables steady-state fast path token substitution (direct device slicing
     # and persistent index caching) in TPUModelRunner._apply_async_token_substitution.

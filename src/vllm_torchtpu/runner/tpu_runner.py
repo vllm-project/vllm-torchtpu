@@ -5625,6 +5625,13 @@ class TPUModelRunner(GPUModelRunner):
             draft = self._async_drafter.draft_model if self._is_async_drafter else None
             arm(self.model, draft)
 
+        # Collective over the TP group, so it runs on every rank after load and
+        # before any graph is traced (see distributed/small_all_reduce.py).
+        if envs.TPU_SMALL_ALL_REDUCE_KERNEL:
+            from vllm_torchtpu.distributed import small_all_reduce
+
+            small_all_reduce.arm()
+
     def load_lora_model(
         self,
         model: torch.nn.Module,

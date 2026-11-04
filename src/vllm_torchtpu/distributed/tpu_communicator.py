@@ -27,6 +27,8 @@ from vllm.distributed.device_communicators.base_device_communicator import (
 )
 from vllm.distributed.parallel_state import get_dp_group, get_ep_group
 
+from vllm_torchtpu.distributed import small_all_reduce
+
 
 class TpuNullAll2AllManager(All2AllManagerBase):
     """Probe-only stub; TPU EP dispatch/combine never goes through it."""
@@ -41,6 +43,15 @@ class TpuDeviceCommunicator(DeviceCommunicatorBase):
         # (support_fault_tolerance=False); it is never used for compute.
         if self.use_all2all:
             self.all2all_manager = TpuNullAll2AllManager(self.cpu_group)
+
+    def all_reduce(self, input_: torch.Tensor) -> torch.Tensor:
+        # Small bf16 all-reduces over a world-spanning group (the decode TP
+        # all-reduce) use the Pallas kernel once arm() has prepared this
+        # group; everything else keeps XLA's all-reduce.
+        out = small_all_reduce.maybe_all_reduce(self, input_)
+        if out is not None:
+            return out
+        return super().all_reduce(input_)
 
     def _moe_group(self, is_sequence_parallel: bool):
         group = get_ep_group() if is_sequence_parallel else get_dp_group()
