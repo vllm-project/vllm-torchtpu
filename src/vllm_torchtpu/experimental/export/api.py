@@ -77,11 +77,16 @@ class TextOnlyLLMExportConfig(ModelExportConfig):
         token_buckets: Token bucket sizes; one forward_bucket{B}.mlir each.
         req_buckets: Request bucket sizes; one compute_logits_req{R}.mlir and
             sample_tokens_req{R}.mlir each.
-        architectures: HuggingFace architecture names written to config.json.
         emit_byte_tokenizer: Whether to emit a synthetic byte-level tokenizer.json
             (valid only for vocab_size <= 256 in small test models).
         hf_checkpoint_dir: Optional path to the HuggingFace checkpoint directory
-            containing config.json, tokenizer.json, and safetensors headers.
+            containing tokenizer.json, generation_config.json, and safetensors
+            headers.
+        speculative_config: Speculative decoding the runtime runs, recorded as
+            `serving_config.speculative_config` (vLLM's field names); None for none.
+        max_verify_tokens: The draft tokens a step can verify beyond the drafter's,
+            such as tokens a grammar forces: a recurrent model keeps a checkpoint per
+            verify token, as it does per draft token. 0 for only the drafter's.
     """
 
     vocab_size: int = 151936
@@ -98,17 +103,24 @@ class TextOnlyLLMExportConfig(ModelExportConfig):
     dtype: str = "bf16"
     token_buckets: tuple[int, ...] = (16, 32, 64, 128, 256)
     req_buckets: tuple[int, ...] = (8, 16, 32, 64)
-    architectures: tuple[str, ...] = ("Qwen3ForCausalLM",)
     emit_byte_tokenizer: bool = False
     hf_checkpoint_dir: str | None = None
     uses_mrope: bool = False
+    speculative_config: dict[str, Any] | None = None
+    max_verify_tokens: int = 0
 
     def __post_init__(self) -> None:
-        if not self.architectures:
+        if self.max_verify_tokens < 0:
             raise ValueError(
-                f"{type(self).__name__}.architectures must name the model "
-                "architecture written to config.json"
+                f"max_verify_tokens must be >= 0, got {self.max_verify_tokens}"
             )
+        if self.max_verify_tokens and self.speculative_config:
+            k = int(self.speculative_config["num_speculative_tokens"])
+            if self.max_verify_tokens <= k:
+                raise ValueError(
+                    f"max_verify_tokens ({self.max_verify_tokens}) must exceed "
+                    f"num_speculative_tokens ({k}), which the window already covers"
+                )
         if self.emit_byte_tokenizer and self.vocab_size > 256:
             raise ValueError(
                 f"emit_byte_tokenizer requires vocab_size <= 256, got {self.vocab_size}"
@@ -126,6 +138,28 @@ class TextOnlyLLMExportConfig(ModelExportConfig):
     def max_cu_seqs(self) -> int:
         """Length of query_start_loc: one cumulative offset per sequence plus 1."""
         return self.max_num_seqs + 1
+
+    @property
+    def recurrent_window(self) -> int:
+        """Consecutive recurrent state slots a sequence holds: its state slot,
+        then one checkpoint per draft token a step can verify (the speculative
+        draft tokens, or `max_verify_tokens` when larger), so a verify step that
+        rejects drafts resumes from the accepted token's state.
+        """
+        drafted = 0
+        if self.speculative_config:
+            drafted = int(self.speculative_config["num_speculative_tokens"])
+        return max(drafted, self.max_verify_tokens) + 1
+
+    @property
+    def num_state_slots(self) -> int:
+        """Slots of each recurrent state pool: `recurrent_window` per sequence
+        plus null slot 0.
+
+        A recurrent layer's state is fixed-size per sequence, so its pool is sized
+        by `max_num_seqs`, not by the paged KV `num_blocks`.
+        """
+        return self.max_num_seqs * self.recurrent_window + 1
 
 
 @runtime_checkable

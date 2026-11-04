@@ -235,7 +235,12 @@ def states_to_pool(
     rec_st: Any = None
     if G_PER_ATT > 0:
         assert ckpt_indices is not None
-        check_ckpt_bounds(ckpt_indices, cache_exec(ex).num_pages, layout)
+        check_ckpt_bounds(
+            ckpt_indices,
+            cache_exec(ex).num_pages,
+            layout,
+            read_offsets=read_offsets,
+        )
         ckpt = np.asarray(ckpt_indices)
         ckpt_is_3d = ckpt.ndim == 3
         if read_offsets is None:
@@ -335,7 +340,9 @@ def pool_to_states(
         ckpt = np.asarray(ckpt_indices)
         ckpt_is_3d = ckpt.ndim == 3
         ckpt_k = ckpt.shape[-1]
-        ckpt_t_off = 0 if ckpt_k == T else 1
+        if ckpt_k < T:
+            raise ValueError(f"ckpt_indices last dim K={ckpt_k} must be >= T ({T})")
+        ckpt_t_off = ckpt_k - T
         vh, KD, VD = layout.vh_per_rank(R), layout.KD, layout.VD
         QKV = layout.qkv_per_rank(R)
         ngdn = layout.num_recurrent_layers

@@ -13,23 +13,35 @@
 # limitations under the License.
 """Core declarations, execution config, VMEM pool aliasing, and numeric primitives."""
 
-from . import decls, errors, exec_spec, ops, pool_alias, profiles, spec
+from . import (
+    decls,
+    errors,
+    exec_spec,
+    module,
+    module_options,
+    ops,
+    planner,
+    pool_alias,
+    profiles,
+    spec,
+)
 from .errors import MegakernelConfigError, MegakernelLayoutError
 from .exec_spec import DebugOptions, ExecSpec, Tiles, default_tiles
 from .ops import rup
+from .planner import encode_ecopy
 from .spec import (
     REQUIRED,
-    Block,
-    BlockBinding,
     ExtraInput,
     FrozenDict,
     HFParamDecl,
     KVCacheDecl,
     LayerType,
     ModelSpec,
+    Module,
+    ModuleBinding,
     ParamTransform,
     RecurrentCacheDecl,
-    ResolvedBlockGeometry,
+    ResolvedModuleGeometry,
     ScratchReq,
     SmallField,
     Spec,
@@ -41,8 +53,6 @@ from .spec import (
 
 __all__ = [
     "REQUIRED",
-    "Block",
-    "BlockBinding",
     "DebugOptions",
     "ExecSpec",
     "ExtraInput",
@@ -53,9 +63,11 @@ __all__ = [
     "MegakernelConfigError",
     "MegakernelLayoutError",
     "ModelSpec",
+    "Module",
+    "ModuleBinding",
     "ParamTransform",
     "RecurrentCacheDecl",
-    "ResolvedBlockGeometry",
+    "ResolvedModuleGeometry",
     "ScratchReq",
     "SmallField",
     "Spec",
@@ -66,9 +78,13 @@ __all__ = [
     "WeightDecl",
     "decls",
     "default_tiles",
+    "encode_ecopy",
     "errors",
     "exec_spec",
+    "module",
+    "module_options",
     "ops",
+    "planner",
     "pool_alias",
     "profiles",
     "rup",

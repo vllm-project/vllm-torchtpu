@@ -12,8 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
 from dataclasses import dataclass
 from types import SimpleNamespace
+from unittest import mock
 
 import numpy as np
 import pytest
@@ -1029,3 +1031,183 @@ def test_random_rejection_sample_with_candidate_blocks_matches_full_vocab(device
     expected = sampler(**kwargs)
     result = sampler(**kwargs, topk_candidates=64)
     torch.testing.assert_close(result, expected)
+
+
+def test_rejection_sampler_random_draft_probs_ratio_and_residual(device):
+    """Probabilistic drafting: accept iff u < p(x) / q(x); recover from
+    max(0, p - q) rather than from p with x removed."""
+    sampler = RejectionSampler()
+    draft_token_ids = torch.tensor([1, 2, 3], dtype=torch.int32, device=device)
+    num_draft_tokens = torch.tensor([3], dtype=torch.int32, device=device)
+    # Slot 0: p(1) = 0.5, q(1) = 0.25 -> ratio 2 -> accepted even at u = 0.9.
+    # Slot 1: p(2) = 0.25, q(2) = 1.0 -> ratio 0.25 -> rejected at u = 0.5.
+    #   Residual max(0, p - q) = p with token 2 removed = [0.25, 0, 0, 0.5,
+    #   0, 0] (token 3 has twice the mass of token 0, while the one-hot
+    #   recovery p\{2} would be the same here), so recovered_u picks 3.
+    target_logits = torch.full((3, 6), -1e9, device=device)
+    target_logits[0, 1] = 0.0
+    target_logits[0, 4] = 0.0  # p = [0, .5, 0, 0, .5, 0]
+    target_logits[1, 0] = 0.0
+    target_logits[1, 2] = 0.0
+    target_logits[1, 3] = math.log(2.0)  # p = [.25, 0, .25, .5, 0, 0]
+    target_logits[2, 3] = 0.0
+    draft_probs = torch.zeros((3, 6), dtype=torch.float32, device=device)
+    draft_probs[0, 1] = 0.25
+    draft_probs[0, 4] = 0.75
+    draft_probs[1, 2] = 1.0
+    draft_probs[2, 3] = 1.0
+    bonus_token_ids = torch.tensor([5], dtype=torch.int32, device=device)
+    segment_ids = torch.tensor([0, 0, 0], dtype=torch.int64, device=device)
+    group_indices = torch.tensor([0, 1, 2], dtype=torch.int64, device=device)
+    temperatures = torch.ones((3, 1), dtype=torch.float32, device=device)
+    top_k = torch.zeros((3, 1), dtype=torch.int32, device=device)
+    top_p = torch.ones((3, 1), dtype=torch.float32, device=device)
+    accept_u = torch.tensor([0.9, 0.5, 0.0], dtype=torch.float32, device=device)
+    # Equal recovery noise everywhere: the residual's largest entry wins.
+    recover_u = torch.full_like(target_logits, 0.5)
+
+    output = sampler(
+        draft_token_ids=draft_token_ids,
+        num_draft_tokens=num_draft_tokens,
+        target_logits=target_logits,
+        bonus_token_ids=bonus_token_ids,
+        segment_ids=segment_ids,
+        group_indices=group_indices,
+        max_draft_tokens=3,
+        temperatures=temperatures,
+        top_k=top_k,
+        top_p=top_p,
+        accept_u=accept_u,
+        recover_u=recover_u,
+        do_sampling=True,
+        draft_probs=draft_probs,
+    )
+    expected = torch.tensor([[1, 3, -1, -1]], dtype=torch.int32, device=device)
+    assert torch.equal(output, expected)
+
+    # The same inputs without draft_probs treat the draft as one-hot:
+    # slot 0 then needs u < p(1) = 0.5 and is rejected at u = 0.9; recovery
+    # from p with token 1 removed gives token 4.
+    output = sampler(
+        draft_token_ids=draft_token_ids,
+        num_draft_tokens=num_draft_tokens,
+        target_logits=target_logits,
+        bonus_token_ids=bonus_token_ids,
+        segment_ids=segment_ids,
+        group_indices=group_indices,
+        max_draft_tokens=3,
+        temperatures=temperatures,
+        top_k=top_k,
+        top_p=top_p,
+        accept_u=accept_u,
+        recover_u=recover_u,
+        do_sampling=True,
+    )
+    expected = torch.tensor([[4, -1, -1, -1]], dtype=torch.int32, device=device)
+    assert torch.equal(output, expected)
+
+
+def test_rejection_sampler_random_draft_probs_residual_subtracts_q(device):
+    """A residual where the one-hot and the p - q recoveries differ."""
+    sampler = RejectionSampler()
+    draft_token_ids = torch.tensor([0], dtype=torch.int32, device=device)
+    num_draft_tokens = torch.tensor([1], dtype=torch.int32, device=device)
+    # p = [.1, .6, .3]; q = [.3, .6, .1]. Draft 0: ratio 1/3, u = 0.5 rejects.
+    # One-hot recovery (p without 0) peaks at token 1; p - q = [0, 0, .2]
+    # peaks at token 2.
+    target_logits = torch.log(torch.tensor([[0.1, 0.6, 0.3]], device=device))
+    draft_probs = torch.tensor([[0.3, 0.6, 0.1]], dtype=torch.float32, device=device)
+    common = dict(
+        draft_token_ids=draft_token_ids,
+        num_draft_tokens=num_draft_tokens,
+        target_logits=target_logits,
+        bonus_token_ids=torch.tensor([9], dtype=torch.int32, device=device),
+        segment_ids=torch.tensor([0], dtype=torch.int64, device=device),
+        group_indices=torch.tensor([0], dtype=torch.int64, device=device),
+        max_draft_tokens=1,
+        temperatures=torch.ones((1, 1), dtype=torch.float32, device=device),
+        top_k=torch.zeros((1, 1), dtype=torch.int32, device=device),
+        top_p=torch.ones((1, 1), dtype=torch.float32, device=device),
+        accept_u=torch.tensor([0.5], dtype=torch.float32, device=device),
+        recover_u=torch.full_like(target_logits, 0.5),
+        do_sampling=True,
+    )
+    with_q = sampler(**common, draft_probs=draft_probs)
+    assert with_q.tolist() == [[2, -1]]
+    one_hot = sampler(**common)
+    assert one_hot.tolist() == [[1, -1]]
+
+
+def test_rejection_sampler_random_draft_probs_zero_q_rejects(device):
+    """q(x) == 0 rejects instead of dividing by zero, as upstream."""
+    sampler = RejectionSampler()
+    target_logits = torch.zeros((1, 3), device=device)  # p uniform
+    draft_probs = torch.tensor([[0.0, 1.0, 0.0]], dtype=torch.float32, device=device)
+    recover_u = torch.full_like(target_logits, 0.5)
+    recover_u[0, 2] = 1.0 - 1e-7  # recovery picks token 2
+    output = sampler(
+        draft_token_ids=torch.tensor([0], dtype=torch.int32, device=device),
+        num_draft_tokens=torch.tensor([1], dtype=torch.int32, device=device),
+        target_logits=target_logits,
+        bonus_token_ids=torch.tensor([9], dtype=torch.int32, device=device),
+        segment_ids=torch.tensor([0], dtype=torch.int64, device=device),
+        group_indices=torch.tensor([0], dtype=torch.int64, device=device),
+        max_draft_tokens=1,
+        temperatures=torch.ones((1, 1), dtype=torch.float32, device=device),
+        top_k=torch.zeros((1, 1), dtype=torch.int32, device=device),
+        top_p=torch.ones((1, 1), dtype=torch.float32, device=device),
+        accept_u=torch.tensor([0.0], dtype=torch.float32, device=device),
+        recover_u=recover_u,
+        do_sampling=True,
+        draft_probs=draft_probs,
+    )
+    assert output.tolist() == [[2, -1]]
+
+
+@pytest.mark.parametrize("q_shape", [(1, 3), (1, 2, 3), (2, 1)])
+def test_rejection_sampler_random_draft_probs_shape_mismatch_raises(device, q_shape):
+    """q not shaped like target_logits raises eagerly. Unpadded rows and
+    [batch, k, vocab] would otherwise fail inside the compiled graph with an
+    opaque error; [rows, 1] would broadcast and return wrong tokens."""
+    sampler = RejectionSampler()
+    target_logits = torch.zeros((2, 3), device=device)
+    with pytest.raises(ValueError, match="does not match target_logits"):
+        sampler(
+            draft_token_ids=torch.tensor([0, 1], dtype=torch.int32, device=device),
+            num_draft_tokens=torch.tensor([2], dtype=torch.int32, device=device),
+            target_logits=target_logits,
+            bonus_token_ids=torch.tensor([9], dtype=torch.int32, device=device),
+            segment_ids=torch.tensor([0, 0], dtype=torch.int64, device=device),
+            group_indices=torch.tensor([0, 1], dtype=torch.int64, device=device),
+            max_draft_tokens=2,
+            temperatures=torch.ones((2, 1), dtype=torch.float32, device=device),
+            top_k=torch.zeros((2, 1), dtype=torch.int32, device=device),
+            top_p=torch.ones((2, 1), dtype=torch.float32, device=device),
+            accept_u=torch.full((2,), 0.5, dtype=torch.float32, device=device),
+            recover_u=torch.full_like(target_logits, 0.5),
+            do_sampling=True,
+            draft_probs=torch.full(q_shape, 1 / 3, device=device),
+        )
+
+
+def test_rejection_sampler_greedy_path_ignores_draft_probs(device):
+    """As upstream: the greedy path verifies by argmax match, so draft_probs
+    does not change its decision; the caller is warned once."""
+    sampler = RejectionSampler()
+    kwargs = dict(
+        draft_token_ids=torch.tensor([1, 2], dtype=torch.int32, device=device),
+        num_draft_tokens=torch.tensor([2], dtype=torch.int32, device=device),
+        target_logits=torch.tensor([[0.0, 5.0, 0.0], [0.0, 0.0, 5.0]], device=device),
+        bonus_token_ids=torch.tensor([0], dtype=torch.int32, device=device),
+        segment_ids=torch.tensor([0, 0], dtype=torch.int64, device=device),
+        group_indices=torch.tensor([0, 1], dtype=torch.int64, device=device),
+        max_draft_tokens=2,
+    )
+    expected = sampler(**kwargs)
+    with mock.patch(
+        "vllm_torchtpu.layers.adapter.sample.rejection_sampler.logger"
+    ) as log:
+        output = sampler(**kwargs, draft_probs=torch.ones((2, 3), device=device) / 3)
+    assert torch.equal(output, expected)
+    log.warning_once.assert_called_once()
+    assert "ignored" in log.warning_once.call_args.args[0]

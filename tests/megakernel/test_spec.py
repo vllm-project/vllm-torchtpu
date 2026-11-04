@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Unit tests for `spec` (model declarations, `Block`, `SwitchSlot`, `ModelSpec`)."""
+"""Unit tests for `spec` (model declarations, `Module`, `SwitchSlot`, `ModelSpec`)."""
 
 from __future__ import annotations
 
@@ -22,15 +22,16 @@ from pathlib import Path
 
 import pytest
 
-from vllm_torchtpu.megakernel import block_options, decls, exec_spec
+from vllm_torchtpu.megakernel import decls, exec_spec, module_options
+from vllm_torchtpu.megakernel import module as module_mod
 from vllm_torchtpu.megakernel import spec as spec_mod
 from vllm_torchtpu.megakernel.exec_spec import ExecSpec, Tiles
 from vllm_torchtpu.megakernel.ops import BF16, F32, FP8
 from vllm_torchtpu.megakernel.spec import (
-    Block,
     ExtraInput,
     LayerType,
     ModelSpec,
+    Module,
     ScratchReq,
     SmallField,
     Spec,
@@ -41,11 +42,12 @@ from vllm_torchtpu.megakernel.spec import (
 
 
 def test_spec_imports_only_exec_spec_lazily_or_under_type_checking():
-    """`decls.py` is stdlib-only at runtime; `spec.py` only imports `decls` at top level
-    and `exec_spec` lazily / under `TYPE_CHECKING`."""
+    """`decls.py` is stdlib-only at runtime; `module.py` and `spec.py` only import
+    `decls`/`module` at top level and `exec_spec` lazily / under `TYPE_CHECKING`."""
     for mod_obj, top_rel, all_rel in (
-        (decls, set(), {"spec"}),
-        (spec_mod, {"decls"}, {"decls", "exec_spec"}),
+        (decls, set(), {"module"}),
+        (module_mod, {"decls"}, {"decls", "exec_spec", "spec"}),
+        (spec_mod, {"decls", "module"}, {"decls", "module"}),
     ):
         path = Path(mod_obj.__file__)
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
@@ -97,11 +99,11 @@ def test_spec_declaration_dataclasses_and_defaults():
     assert scr.phase == "persistent"
 
 
-def test_block_subclass_tunables_registration_and_default_hooks(monkeypatch):
-    tunables_copy = dict(block_options._TUNABLES)
-    debug_copy = dict(block_options._DEBUG)
-    monkeypatch.setattr(block_options, "_TUNABLES", tunables_copy)
-    monkeypatch.setattr(block_options, "_DEBUG", debug_copy)
+def test_module_subclass_tunables_registration_and_default_hooks(monkeypatch):
+    tunables_copy = dict(module_options._TUNABLES)
+    debug_copy = dict(module_options._DEBUG)
+    monkeypatch.setattr(module_options, "_TUNABLES", tunables_copy)
+    monkeypatch.setattr(module_options, "_DEBUG", debug_copy)
 
     @dataclasses.dataclass(frozen=True)
     class _CustomTunables:
@@ -113,40 +115,40 @@ def test_block_subclass_tunables_registration_and_default_hooks(monkeypatch):
     class _CustomDebug:
         force_path: bool = False
 
-    class _CustomBlock(Block):
-        name = "test_spec_custom_block"
+    class _CustomModule(Module):
+        name = "test_spec_custom_module"
         Tunables = _CustomTunables
         Debug = _CustomDebug
 
-    assert exec_spec.tunables_class("test_spec_custom_block") is _CustomTunables
-    blk = _CustomBlock()
+    assert exec_spec.tunables_class("test_spec_custom_module") is _CustomTunables
+    mod = _CustomModule()
     ex = ExecSpec(B=4, T=1, R=2)
-    assert blk.tunables(ex) == _CustomTunables()
-    assert blk.debug_flags(ex) == _CustomDebug()
+    assert mod.tunables(ex) == _CustomTunables()
+    assert mod.debug_flags(ex) == _CustomDebug()
     ex_override = ExecSpec(
         B=4,
         T=1,
         R=2,
-        tiles=Tiles().with_blocks({"test_spec_custom_block": {"tile_k": 256}}),
+        tiles=Tiles().with_modules({"test_spec_custom_module": {"tile_k": 256}}),
         debug=exec_spec.DebugOptions(
-            blocks={"test_spec_custom_block": _CustomDebug(force_path=True)}
+            modules={"test_spec_custom_module": _CustomDebug(force_path=True)}
         ),
     )
-    assert blk.tunables(ex_override).tile_k == 256
-    assert blk.debug_flags(ex_override).force_path is True
+    assert mod.tunables(ex_override).tile_k == 256
+    assert mod.debug_flags(ex_override).force_path is True
     with pytest.raises(TypeError, match="_CustomDebug"):
-        blk.debug_flags(
+        mod.debug_flags(
             ExecSpec(
                 B=4,
                 T=1,
                 R=2,
                 debug=exec_spec.DebugOptions(
-                    blocks={"test_spec_custom_block": _CustomTunables(tile_k=256)}
+                    modules={"test_spec_custom_module": _CustomTunables(tile_k=256)}
                 ),
             )
         )
 
-    plain = Block()
+    plain = Module()
     with pytest.raises(AssertionError, match="declares no Tunables"):
         plain.tunables(ex)
     with pytest.raises(AssertionError, match="declares no Debug"):
@@ -168,15 +170,15 @@ def test_block_subclass_tunables_registration_and_default_hooks(monkeypatch):
         plain.emit(None, 0, 0)
 
 
-def test_switch_slot_and_model_spec_all_blocks():
-    class _BranchA(Block):
+def test_switch_slot_and_model_spec_all_modules():
+    class _BranchA(Module):
         name = "branch_a"
 
-    class _BranchB(Block):
+    class _BranchB(Module):
         name = "branch_b"
 
-    class _FFN(Block):
-        name = "ffn_block"
+    class _FFN(Module):
+        name = "ffn_module"
 
     a, b, ffn = _BranchA(), _BranchB(), _FFN()
     sw_default = SwitchSlot("mixer", branches=(a, b))
@@ -196,7 +198,14 @@ def test_switch_slot_and_model_spec_all_blocks():
         config=None,
         layer_type=LayerType("toy_layer", slots=(sw_filtered, ffn, b)),
     )
-    assert ms.all_blocks() == [b, ffn]
+    assert ms.all_modules() == [b, ffn]
+
+    with pytest.raises(ValueError, match="distinct modules sharing name"):
+        ModelSpec(
+            name="dup_model",
+            config=None,
+            layer_type=LayerType("dup_layer", slots=(_BranchA(), _BranchA())),
+        ).all_modules()
 
     with pytest.raises(AssertionError):
         SwitchSlot("bad", branches=(a, b), branch_counts=(1,))

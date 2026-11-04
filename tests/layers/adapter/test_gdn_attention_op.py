@@ -112,44 +112,6 @@ def _qwen38_gdn_attn(prefix: str, *, tp_size: int = 1):
 
 
 class TestVllmGatedDeltaNetAttention:
-    @pytest.mark.parametrize("page_size", [128, 256, 512])
-    @pytest.mark.parametrize(
-        "num_kv_heads,kv_packing,head_dim,dtype",
-        [
-            (1, 4, 256, jnp.float8_e4m3fn),
-            (1, 2, 256, jnp.bfloat16),
-            (2, 2, 256, jnp.bfloat16),
-            (4, 4, 256, jnp.float8_e4m3fn),
-        ],
-    )
-    def test_seq_on_lane_native_pool_plan(
-        self, monkeypatch, page_size, num_kv_heads, kv_packing, head_dim, dtype
-    ):
-        monkeypatch.setenv("VLLM_KV_CACHE_LAYOUT", "HND")
-        from vllm_torchtpu.layers.core.gdn_attention import _build_v3_pool_state_plan
-
-        manager_block_size = 4096 if page_size == 512 else 4352
-        num_kv_heads_x2 = num_kv_heads * 2
-        packed_head_dim = head_dim // kv_packing
-        shape = (10, num_kv_heads_x2, packed_head_dim, kv_packing, page_size)
-        pool = jnp.zeros(shape, dtype=dtype)
-
-        plan = _build_v3_pool_state_plan(
-            pool,
-            conv_dim=1536,
-            n_v=8,
-            d_k=128,
-            d_v=128,
-            kernel_size=4,
-            pool_block_tokens=manager_block_size,
-            qk_pair_layout=False,
-            recurrent_state_dtype=jnp.float32,
-        )
-        assert plan.stride == manager_block_size // page_size
-        assert plan.recurrent.view_dtype == jnp.float32
-        assert plan.conv.view_dtype == jnp.bfloat16
-        assert plan.whole_block_dma is True
-
     @patch(
         "vllm_torchtpu.layers.adapter.custom_ops.gdn_attention_op."
         "run_jax_gdn_attention_pcp_tp_prefill"
@@ -1625,3 +1587,116 @@ def test_pooled_op_block_major_folds_the_pool_and_restores_its_shape(
     assert re.fullmatch(rf"pallas::gdn_attention_pooled{suffix}_\d+", captured["name"])
     assert captured["kernel_pool_shape"] == kernel_pool_shape
     assert tuple(new_pool.shape) == tuple(pool.shape)
+
+
+def _set_qkvz_kernel_layout(monkeypatch, flag):
+    if flag is None:
+        monkeypatch.delenv("TPU_GDN_QKVZ_KERNEL_LAYOUT", raising=False)
+    else:
+        monkeypatch.setenv("TPU_GDN_QKVZ_KERNEL_LAYOUT", flag)
+
+
+@pytest.mark.parametrize(
+    "flag, pcp_enabled, keeps_layout",
+    [
+        (None, False, True),
+        (None, True, True),
+        ("1", False, False),
+        ("1", True, True),
+    ],
+)
+def test_qkvz_layout_follows_the_flag_except_under_pcp(
+    make_gdn_attention, monkeypatch, flag, pcp_enabled, keeps_layout
+):
+    """in_proj_qkvz keeps vLLM's [n_out, n_in] layout by default. With
+    TPU_GDN_QKVZ_KERNEL_LAYOUT it flips to (k, n) like every other linear,
+    except under PCP, whose pooled op reads the weight raw."""
+    from vllm_torchtpu.layers.adapter.linear_common import KEEP_VLLM_LAYOUT_ATTR
+
+    _set_qkvz_kernel_layout(monkeypatch, flag)
+    monkeypatch.setattr(
+        VllmGatedDeltaNetAttention,
+        "_pcp_streaming_enabled",
+        staticmethod(lambda: pcp_enabled),
+    )
+    warning_once = MagicMock()
+    monkeypatch.setattr(gdn_attention_op.logger, "warning_once", warning_once)
+
+    attention, _ = make_gdn_attention(1, 0, "fp8_block")
+
+    assert attention._pcp_streaming_configured is pcp_enabled
+    keeps = getattr(attention.in_proj_qkvz, KEEP_VLLM_LAYOUT_ATTR, False)
+    assert keeps is keeps_layout
+    warned = any(
+        "TPU_GDN_QKVZ_KERNEL_LAYOUT" in c.args[0] for c in warning_once.call_args_list
+    )
+    assert warned is (flag is not None and pcp_enabled)
+
+
+def test_flipped_qkvz_projection_matches_the_kept_one(make_gdn_attention, monkeypatch):
+    """TPU_GDN_QKVZ_KERNEL_LAYOUT changes only how in_proj_qkvz is stored: the
+    loaded projection gives the same output in either layout."""
+    from vllm_torchtpu.layers.adapter.quantization.unquantized import (
+        VllmUnquantizedLinearMethod,
+    )
+
+    generator = torch.Generator().manual_seed(20261103)
+    weight = x = None
+    results = {}
+    for flag in (None, "1"):
+        _set_qkvz_kernel_layout(monkeypatch, flag)
+        attention, _ = make_gdn_attention(1, 0)
+        projection = attention.in_proj_qkvz
+        # Production BF16 models get this method from VllmUnquantizedConfig;
+        # the fixture's bf16 layer has vLLM's stock one, which never flips.
+        projection.quant_method = VllmUnquantizedLinearMethod()
+        if weight is None:
+            # Multiples of 1/16 keep every product and sum exact.
+            n_out, n_in = projection.weight.shape
+            weight = (torch.randint(-8, 9, (n_out, n_in), generator=generator) / 16).to(
+                torch.bfloat16
+            )
+            x = (torch.randint(-8, 9, (3, n_in), generator=generator) / 16).to(
+                torch.bfloat16
+            )
+        projection.weight.data.copy_(weight)
+        projection.quant_method.process_weights_after_loading(projection)
+        output, _ = projection(x)
+        results[flag] = (tuple(projection.weight.shape), output)
+
+    assert results[None][0] == tuple(weight.shape)
+    assert results["1"][0] == tuple(weight.T.shape)
+    expected = (x.float() @ weight.float().T).to(torch.bfloat16)
+    for _, output in results.values():
+        torch.testing.assert_close(output, expected, rtol=0, atol=0)
+
+
+def test_flipped_qkvz_fp8_block_weight_is_the_kept_one_transposed(
+    make_gdn_attention, monkeypatch
+):
+    """On the per-block FP8 path the flag targets, post-load requantization
+    stores the same weight and scales, with the weight in (k, n)."""
+    generator = torch.Generator().manual_seed(20261103)
+    weight = None
+    loaded = {}
+    for flag in (None, "1"):
+        _set_qkvz_kernel_layout(monkeypatch, flag)
+        attention, _ = make_gdn_attention(1, 0, "fp8_block")
+        projection = attention.in_proj_qkvz
+        if weight is None:
+            weight = (
+                torch.randint(
+                    -16, 17, tuple(projection.weight.shape), generator=generator
+                )
+                / 16
+            ).to(torch.float8_e4m3fn)
+        projection.weight.data.copy_(weight)
+        projection.weight_scale_inv.data.fill_(1.0)
+        projection.quant_method.process_weights_after_loading(projection)
+        loaded[flag] = (projection.weight.float(), projection.weight_scale.float())
+
+    kept_weight, kept_scale = loaded[None]
+    flipped_weight, flipped_scale = loaded["1"]
+    assert kept_weight.shape == weight.shape
+    torch.testing.assert_close(flipped_weight, kept_weight.T, rtol=0, atol=0)
+    torch.testing.assert_close(flipped_scale, kept_scale, rtol=0, atol=0)

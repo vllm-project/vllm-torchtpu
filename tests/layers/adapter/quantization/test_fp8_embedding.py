@@ -98,7 +98,7 @@ def test_fp8_embedding_and_lm_head_numerics(monkeypatch):
 
     monkeypatch.setattr(
         "vllm_torchtpu.layers.adapter.quantization.fp8.quantized_matmul",
-        lambda x, w, s: (x.float() @ (w.float() * s.unsqueeze(0))).to(x.dtype),
+        lambda x, w, s, **_: (x.float() @ (w.float() * s.unsqueeze(0))).to(x.dtype),
     )
     got_logits = method.apply(lm_head, hidden)
     assert got_logits.shape == (6, 128)

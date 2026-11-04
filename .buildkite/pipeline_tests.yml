@@ -86,12 +86,18 @@ steps:
     key: "unit_tests_cpu_pr"
     <<: *cpu_unit_test_defaults
     if: 'build.env("NIGHTLY") != "1"'
+    # bktec splits the files across the shards by recorded timing. It does not
+    # know the marker filter, so a shard can get only TPU-marked files and
+    # collect nothing; exit 5 (no tests collected) is tolerated per shard, as
+    # in the TPU steps.
+    parallelism: 3
+    commands:
+      - .buildkite/kubernetes/run.sh bash -c 'bktec run || [ $$? -eq 5 ]'
     plugins:
       - *kube_plugin
       - tests#v1.0.0:
           <<: *tests_plugin_defaults
           test-file-pattern: "tests/**/{test_*,*_test}.py"
-          fail-on-no-tests: true
           test-cmd: "pytest -sv --timeout=600 -m 'not tpu_test and not multichip and not nightly' --junit-xml={{resultPath}} {{testExamples}}"
 
   - label: "Unit Tests - CPU (Nightly)"
@@ -107,6 +113,10 @@ steps:
           test-cmd: "pytest -sv --timeout=600 -m 'not tpu_test and not multichip' --junit-xml={{resultPath}} {{testExamples}}"
 
   - group: "Unit Tests on TPU"
+    # Set by bootstrap.sh for skip-tpu-ci and filled in when this file is
+    # uploaded; build.env() would not see it, since it reads only the
+    # environment the build was created with.
+    if: '"${SKIP_TPU_CI:-0}" != "1"'
     steps:
       # test_speculative_decoding.py gets steps of its own so it runs on its
       # own chips rather than serializing behind everything else; the general
@@ -201,7 +211,7 @@ steps:
               <<: *tests_plugin_defaults
               test-file-pattern: "tests_omni/**/{test_*,*_test}.py"
               fail-on-no-tests: true
-              test-cmd: "pytest -sv --timeout=1200 -m 'not nightly and omni' --junit-xml={{resultPath}} {{testExamples}}"
+              test-cmd: "pytest -sv --timeout=1200 -m 'not nightly' --junit-xml={{resultPath}} {{testExamples}}"
 
       - label: "Unit Tests - Speculative Decoding (Nightly)"
         key: "unit_tests_spec_decode_nightly"
@@ -248,6 +258,7 @@ steps:
         key: "unit_tests_general_nightly"
         <<: *tpu_step
         if: 'build.env("NIGHTLY") == "1"'
+        parallelism: 3
         env:
           SHAPE: *shape_single
         plugins:
@@ -286,4 +297,22 @@ steps:
               <<: *tests_plugin_defaults
               test-file-pattern: "tests_omni/**/{test_*,*_test}.py"
               fail-on-no-tests: true
-              test-cmd: "pytest -sv --timeout=1800 -m 'nightly and omni' --junit-xml={{resultPath}} {{testExamples}}"
+              test-cmd: "pytest -sv --timeout=1800 -m 'not multichip' --junit-xml={{resultPath}} {{testExamples}}"
+
+      - label: "Unit Tests - Omni Multichip (Nightly)"
+        key: "unit_tests_omni_multichip_nightly"
+        <<: *tpu_step
+        depends_on: "build_docker_omni"
+        if: 'build.env("NIGHTLY") == "1"'
+        env:
+          SHAPE: *shape_multi
+          DOCKER_IMAGE_SUFFIX: "-omni"
+        commands:
+          - *omni_test
+        plugins:
+          - *kube_plugin
+          - tests#v1.0.0:
+              <<: *tests_plugin_defaults
+              test-file-pattern: "tests_omni/**/{test_*,*_test}.py"
+              fail-on-no-tests: true
+              test-cmd: "pytest -sv --timeout=1800 -m 'multichip' --junit-xml={{resultPath}} {{testExamples}}"

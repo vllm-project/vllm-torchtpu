@@ -30,6 +30,7 @@ from vllm.v1.request import Request, RequestStatus
 from vllm.v1.worker import gpu_model_runner
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 
+from vllm_torchtpu.runner.min_tokens import MinTokensTracker
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 from vllm_torchtpu.runner.tpu_runner_async_output import (
     AsyncPreResults,
@@ -63,6 +64,7 @@ def request_state(req_id, block, output=()):
 
 def make_runner(device, monkeypatch, k):
     runner = object.__new__(TPUModelRunner)
+    runner._min_tokens = MinTokensTracker()
     runner.device = device
     runner.speculative_config = (
         SimpleNamespace(num_speculative_tokens=k, use_ngram_gpu=lambda: False)
@@ -173,7 +175,9 @@ def test_mamba_read_offset_follows_storage_owner(
     runner.cache_config = SimpleNamespace(block_size=256)
     runner._pending_mamba_state_copies = []
     runner._mamba_slot_stride = 4
-    runner.mamba_state_indices_cpu = torch.zeros(2, dtype=torch.int32)
+    runner._unfenced_h2d_sources = []
+    runner._free_h2d_sources = {}
+    runner._registered_h2d_sources = set()
     runner._init_mamba_slot_pool(9)
     if layout == "compact":
         runner._mamba_copy_plan = []

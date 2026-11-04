@@ -183,9 +183,9 @@ We welcome the responsible use of AI tools to enhance engineering productivity, 
 
 ```text
 Signed-off-by: Your Name <your.email@example.com>
-Co-authored-by: Claude <claude@anthropic.com>
-Co-authored-by: GitHub Copilot <copilot@github.com>
-Co-authored-by: Antigravity <antigravity@google.com>
+Co-authored-by: Claude <noreply@anthropic.com>
+Co-authored-by: GitHub Copilot <noreply@github.com>
+Co-authored-by: Antigravity <noreply@google.com>
 ```
 
 ---

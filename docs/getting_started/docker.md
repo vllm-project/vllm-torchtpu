@@ -24,10 +24,10 @@ Release images are built from the `--target prod` Dockerfile stage and contain a
   docker pull vllm/vllm-torchtpu:latest
   ```
 
-* **Pinned Version Release** (`:vX.Y.Z`, e.g., `v0.29.0`):
+* **Pinned Version Release** (`:vX.Y.Z`, e.g., `v0.32.0`):
 
   ```bash
-  docker pull vllm/vllm-torchtpu:v0.29.0
+  docker pull vllm/vllm-torchtpu:v0.32.0
   ```
 
 ### Nightly Images (`--target dev`)
@@ -43,7 +43,7 @@ Nightly images are built automatically every night from the `main` branch (`--ta
 * **Date- and Commit-Pinned Nightly Tags** (`:nightly-YYYYMMDD-<commit>-<vllm-version>`):
 
   ```bash
-  docker pull vllm/vllm-torchtpu:nightly-20261019-88534b8-v0.31.0
+  docker pull vllm/vllm-torchtpu:nightly-20261029-1689a6b-v0.32.0
   ```
 
 Browse all available release and nightly tags at [`https://hub.docker.com/r/vllm/vllm-torchtpu/tags`](https://hub.docker.com/r/vllm/vllm-torchtpu/tags).

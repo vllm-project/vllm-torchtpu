@@ -83,6 +83,7 @@ import os
 import socket
 import threading
 import time
+from collections import defaultdict
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, cast
@@ -105,6 +106,7 @@ from vllm.v1.kv_offload.base import (
     RequestOffloadingContext,
     ScheduleEndContext,
     TransferResult,
+    get_offload_group_idx,
 )
 from vllm.v1.kv_offload.config import OffloadingConfig
 
@@ -131,7 +133,29 @@ _DRAIN_TIMEOUT_S = envs.VLLM_TPU_OFFLOAD_WAIT_TIMEOUT_S
 # be reused, so re-reading them would ship garbage.
 _SAVE_RETRIES = envs.VLLM_TPU_OFFLOAD_SAVE_RETRIES
 
-_DEFAULT_CONTROLLER_PORT = 51515
+# Keep the default controller port below Linux's default ephemeral range
+# (net.ipv4.ip_local_port_range = 32768..60999) so kernel-assigned client
+# sockets cannot claim the port or trigger TCP loopback self-connects while
+# workers poll before KVCacheStore binds.
+_DEFAULT_CONTROLLER_PORT = 27800
+_IP_LOCAL_PORT_RANGE_PATH = "/proc/sys/net/ipv4/ip_local_port_range"
+_DEFAULT_EPHEMERAL_PORT_RANGE = (32768, 60999)
+
+
+def _get_ephemeral_port_range(
+    path: str = _IP_LOCAL_PORT_RANGE_PATH,
+) -> tuple[int, int]:
+    """Read the host kernel's ephemeral port range (low, high) from procfs."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            low_str, high_str = f.read().split()[:2]
+        low, high = int(low_str), int(high_str)
+        if 0 < low <= high <= 65535:
+            return low, high
+    except (OSError, ValueError):
+        pass
+    return _DEFAULT_EPHEMERAL_PORT_RANGE
+
 
 # Host bytes behind one offloaded block, summed over every worker rank, as
 # recorded from the per-worker KV cache configs before the offloading spec is
@@ -250,8 +274,9 @@ class Admission:
     # success may cover torn bytes. The finalizer treats the admission as
     # failed regardless of the poll verdict.
     poisoned: bool = False
-    # Loads only: owning request and destination device block IDs, reported
-    # through get_block_ids_with_load_errors on failure.
+    # Loads only: owning request and destination device block IDs. A failed
+    # load reaches vLLM by req_id (failed_recving); the block IDs only fill
+    # FinishedJob.failed_device_block_ids, the record of what it left unwritten.
     req_id: str | None = None
     dst_device_block_ids: list[int] = field(default_factory=list)
     # Loads only: the sub-hashes fetched via read_remote — from a peer or the
@@ -281,6 +306,26 @@ class FinishedJob:
     failed_device_block_ids: list[int] = field(default_factory=list)
 
 
+@dataclass
+class _ReadBatch:
+    """The arguments of one read_remote call, index-aligned: the sub-hashes,
+    the slices naming where each lives, and each one's destination block."""
+
+    hashes: list[bytes] = field(default_factory=list)
+    slices: list[object] = field(default_factory=list)
+    device_ids: list[int] = field(default_factory=list)
+
+    def add(self, sub_hash: bytes, block: object, device_id: int) -> None:
+        self.hashes.append(sub_hash)
+        self.slices.append(block)
+        self.device_ids.append(device_id)
+
+    def extend(self, other: _ReadBatch) -> None:
+        self.hashes.extend(other.hashes)
+        self.slices.extend(other.slices)
+        self.device_ids.extend(other.device_ids)
+
+
 class RaidenOffloadingManager(OffloadingManager):
     """Scheduler-side OffloadingManager backed by raiden's KVCacheStore.
 
@@ -305,6 +350,7 @@ class RaidenOffloadingManager(OffloadingManager):
         # Storage tier behind the host DRAM pool: raiden BackendConfigs from
         # `build_store_storage_backend_config`. Empty keeps the store DRAM-only.
         secondary_backend_configs: Sequence[object] = (),
+        dp_rank: int = 0,
         # Test overrides: allow injecting mock store instance and type bindings.
         store: Any = None,
         store_types: Any = None,
@@ -312,6 +358,11 @@ class RaidenOffloadingManager(OffloadingManager):
         assert kernel_physical_blocks_capacity == (
             offload_logical_blocks_capacity * device_block_size_factor
         )
+        if dp_rank < 0:
+            raise ValueError(
+                "TPURaidenOffloadingConnector: dp_rank must be non-negative "
+                f"(from parallel_config.data_parallel_index), got {dp_rank}."
+            )
         self._capacity_keys = offload_logical_blocks_capacity
         self._device_block_size_factor = device_block_size_factor
         self._key_namespace = key_namespace
@@ -352,7 +403,9 @@ class RaidenOffloadingManager(OffloadingManager):
             )
             store = store_types.KVCacheStore(
                 capacity=kernel_physical_blocks_capacity,
-                raiden_id=store_types.RaidenId(raiden_job_name, "0", "kv_cache", 0),
+                raiden_id=store_types.RaidenId(
+                    raiden_job_name, "0", "kv_cache", dp_rank
+                ),
                 # Transfer fanout is dynamically driven by registered workers.
                 num_shards=1,
                 shard_size_bytes=1,
@@ -424,6 +477,15 @@ class RaidenOffloadingManager(OffloadingManager):
         # holds nothing for the key. Every other store/skip/touch decision
         # probes the directory itself.
         self._inflight_store_keys: set[OffloadKey] = set()
+
+        # Per request: keys whose load failed (could not pin, or the transfer
+        # failed). That request's lookups answer MISS for them so it
+        # recomputes instead of retrying the same failing load every step.
+        self._unloadable: dict[str, set[OffloadKey]] = {}
+        # Requests between on_new_request and on_request_finished. A load can
+        # finalize after its request finished (vLLM signals the finish while
+        # transfers are still in flight); recording that failure would leak.
+        self._live_req_ids: set[str] = set()
 
         # Peer and storage-tier location slices cached from lookups and
         # consumed during `prepare_load`.
@@ -561,9 +623,16 @@ class RaidenOffloadingManager(OffloadingManager):
     # -- OffloadingManager contract --------------------------------------
 
     def on_new_request(self, req_context: ReqContext) -> RequestOffloadingContext:
+        self._live_req_ids.add(req_context.req_id)
         return RequestOffloadingContext()
 
+    def on_request_finished(self, req_context: ReqContext) -> None:
+        self._live_req_ids.discard(req_context.req_id)
+        self._unloadable.pop(req_context.req_id, None)
+
     def lookup(self, key: OffloadKey, req_context: ReqContext) -> LookupResult:
+        if key in self._unloadable.get(req_context.req_id, ()):
+            return LookupResult.MISS
         if key in self._inflight_store_keys:
             return LookupResult.HIT_PENDING
         sub_hashes = self._sub_hashes(key)
@@ -712,13 +781,20 @@ class RaidenOffloadingManager(OffloadingManager):
                 # cleanly and the blocks recompute.
                 if local_hashes:
                     self._store.release(local_hashes)
+                lost_key = keys[idx // self._device_block_size_factor]
+                num_unloadable = self._record_unloadable(
+                    req_context.req_id, keys, {lost_key}
+                )
                 logger.warning(
                     "TPURaidenOffloadingConnector: prepare_load lost sub-block "
                     "%d of %d for request %s to eviction; the load job will fail "
-                    "cleanly and the blocks recompute",
+                    "cleanly, the blocks recompute, and this request is not "
+                    "offered %d of its %d keys again",
                     idx + 1,
                     len(sub_hashes),
                     req_context.req_id,
+                    num_unloadable,
+                    len(keys),
                 )
                 return RaidenLoadStoreSpec(keys, pinned=False)
             idx = resolved_to
@@ -867,6 +943,30 @@ class RaidenOffloadingManager(OffloadingManager):
         account for fails the job closed (rollback + recompute).
         """
         assert len(keys) == len(device_block_ids), (len(keys), len(device_block_ids))
+        # A live load (a peer or storage-tier read) owns these sub-hashes in
+        # `_hash_to_admission`; admitting them would steal its completions.
+        held_keys = {
+            key
+            for key in keys
+            if any(
+                sub_hash in self._hash_to_admission
+                for sub_hash in self._sub_hashes(key)
+            )
+        }
+        if held_keys:
+            self._inflight_store_keys.difference_update(held_keys)
+            kept = [
+                (key, block_id)
+                for key, block_id in zip(keys, device_block_ids)
+                if key not in held_keys
+            ]
+            keys = [key for key, _ in kept]
+            device_block_ids = [block_id for _, block_id in kept]
+            if not keys:
+                self._finished.append(
+                    FinishedJob(job_id=job_id, op=AdmissionOp.STORE, success=True)
+                )
+                return
         with self._eviction_lock:
             for key in keys:
                 self._evicted_sub_hashes.pop(key, None)
@@ -977,30 +1077,38 @@ class RaidenOffloadingManager(OffloadingManager):
         # pinned in the local host pool. The slice is the only record of a peer
         # block — read_remote writes nothing to the local directory, so no live
         # probe could rediscover it. Only the BYTES are non-local: every
-        # destination is one of this instance's HBM blocks. The two destination
+        # destination is one of this instance's HBM blocks. The destination
         # lists are disjoint subsequences of `device_ids`, each preserving its
         # batch's hash-to-block pairing, because load() and read_remote() both
-        # require block_hashes[i] to line up with device_block_ids[i]. One
-        # read_remote call takes a peer's slices and storage slices together.
-        remote_hashes: list[bytes] = []
-        remote_slices: list[object] = []
-        dst_device_ids_for_remote: list[int] = []
+        # require block_hashes[i] to line up with device_block_ids[i].
+        peer_batches: defaultdict[object, _ReadBatch] = defaultdict(_ReadBatch)
+        storage_batch = _ReadBatch()
         local_hashes: list[bytes] = []
         dst_device_ids_for_local: list[int] = []
         for sub_hash, dev_id in zip(sub_hashes, device_ids):
-            block = self._pending_remote_slices.pop(sub_hash, None)
-            if block is not None:
-                remote_hashes.append(sub_hash)
-                remote_slices.append(block)
-                dst_device_ids_for_remote.append(dev_id)
-            else:
+            block: Any = self._pending_remote_slices.pop(sub_hash, None)
+            if block is None:
                 local_hashes.append(sub_hash)
                 dst_device_ids_for_local.append(dev_id)
+            elif block.status == self._block_status.REMOTE:
+                peer_batches[block.raiden_id].add(sub_hash, block, dev_id)
+            else:  # SHARED_STORAGE
+                storage_batch.add(sub_hash, block, dev_id)
+        # One read_remote call takes a single peer's slices; storage slices
+        # may join any call, so they go with the first peer's, or alone when
+        # no peer is involved.
+        remote_batches = list(peer_batches.values())
+        if storage_batch.hashes:
+            if remote_batches:
+                remote_batches[0].extend(storage_batch)
+            else:
+                remote_batches.append(storage_batch)
+        remote_hashes = [h for batch in remote_batches for h in batch.hashes]
 
         def _fail_launch(
             what: str, failed_hashes: list[bytes], in_flight: list[bytes]
         ) -> None:
-            # failed_hashes is the batch whose launch failed.
+            # failed_hashes: the refused batch and every batch not yet launched.
             logger.error(
                 "TPURaidenOffloadingConnector: load job %d (req %s): %s launch failed "
                 "(%d local, %d remote sub-blocks)",
@@ -1023,16 +1131,19 @@ class RaidenOffloadingManager(OffloadingManager):
                 failed_sub_hashes=list(failed_hashes),
             )
             if in_flight:
-                # The other launch already succeeded: the job must stay
-                # non-terminal until its transfer resolves, then the
-                # finalizer runs the failure cleanup exactly once.
+                # Earlier launches succeeded: the job must stay non-terminal
+                # until their transfers resolve, then the finalizer runs the
+                # failure cleanup exactly once. Like a launched job, it holds
+                # every sub-hash the finalizer will release, launched or not,
+                # so no other job admits one in the meantime.
                 self._admissions[job_id] = admission
-                for sub_hash in in_flight:
+                for sub_hash in sub_hashes:
                     self._hash_to_admission[sub_hash] = admission
                 return
             # Nothing in flight: immediately terminal. The finalizer keeps
             # HOST entries intact, deletes freshly installed REMOTE entries
             # (landing blocks freed, the registry keeps the peer mapping),
+            # and marks the failed keys unloadable for this request,
             # matching a polled failure.
             self._finalize(admission)
 
@@ -1041,11 +1152,19 @@ class RaidenOffloadingManager(OffloadingManager):
         ):
             _fail_launch("load()", local_hashes, [])
             return
-        if remote_hashes and not self._store.read_remote(
-            remote_hashes, remote_slices, dst_device_ids_for_remote
-        ):
-            _fail_launch("read_remote()", remote_hashes, local_hashes)
-            return
+        in_flight = list(local_hashes)
+        for batch in remote_batches:
+            if not self._store.read_remote(
+                batch.hashes, batch.slices, batch.device_ids
+            ):
+                launched = set(in_flight)
+                _fail_launch(
+                    "read_remote()",
+                    [h for h in remote_hashes if h not in launched],
+                    in_flight,
+                )
+                return
+            in_flight.extend(batch.hashes)
         admission = Admission(
             job_id=job_id,
             op=AdmissionOp.LOAD,
@@ -1094,6 +1213,8 @@ class RaidenOffloadingManager(OffloadingManager):
                 )
             )
         else:
+            if admission.failed:
+                self._mark_unloadable(admission)
             self._finished.append(
                 FinishedJob(
                     job_id=admission.job_id,
@@ -1105,6 +1226,70 @@ class RaidenOffloadingManager(OffloadingManager):
                     ),
                 )
             )
+
+    def _mark_unloadable(self, admission: Admission) -> None:
+        """Stop offering this load's failed keys to the request that owns it.
+
+        Starts from the keys with a failed sub-hash (see `_record_unloadable`
+        for what else is recorded). A poisoned-only admission is not marked;
+        its source was fine, its destination was reclaimed.
+        """
+        failed = set(admission.failed_sub_hashes)
+        failed_keys = {
+            key
+            for key in admission.keys
+            if any(sub_hash in failed for sub_hash in self._sub_hashes(key))
+        }
+        if not failed_keys:
+            return
+        num_unloadable = self._record_unloadable(
+            admission.req_id, admission.keys, failed_keys
+        )
+        if not num_unloadable:
+            return
+        logger.warning(
+            "TPURaidenOffloadingConnector: load job %d failed; request %s is not "
+            "offered %d of its %d keys again and recomputes them",
+            admission.job_id,
+            admission.req_id,
+            num_unloadable,
+            len(admission.keys),
+        )
+
+    def _record_unloadable(
+        self,
+        req_id: str | None,
+        keys: list[OffloadKey],
+        failed_keys: set[OffloadKey],
+    ) -> int:
+        """Record a failed load's keys as unloadable for `req_id`.
+
+        `keys` is the load as the offloading scheduler built it: each KV cache
+        group's chunks in order. A group with a failed key is recorded from
+        that key to the end of the group. The keys before it stay loadable, so
+        on the retry step the request reloads that prefix (the scheduler frees
+        the blocks this load landed) and recomputes from the failure. The keys
+        after it are recorded too: a sliding-window group's load can start one
+        chunk before the window its lookup checked, and recording only that
+        chunk would leave the checked window a hit, offering the same load
+        again. Groups without a failed key, and other requests, keep hitting.
+
+        Nothing is recorded once the request finished: no on_request_finished
+        would come to clear it. Returns the number of keys recorded.
+        """
+        if req_id is None or req_id not in self._live_req_ids:
+            return 0
+        failed_groups: set[int] = set()
+        unloadable: list[OffloadKey] = []
+        for key in keys:
+            group_idx = get_offload_group_idx(key)
+            if key in failed_keys:
+                failed_groups.add(group_idx)
+            if group_idx in failed_groups:
+                unloadable.append(key)
+        if unloadable:
+            self._unloadable.setdefault(req_id, set()).update(unloadable)
+        return len(unloadable)
 
     def _poll_once(self) -> None:
         if not self._admissions:
@@ -1282,6 +1467,7 @@ def derive_offload_namespace(
     num_kv_cache_tensors: int,
     cp_geometry: tuple[int, ...] = (),
     block_major_contract: BlockMajorContract | None = None,
+    offloaded_group_ids: tuple[int, ...] | None = None,
 ) -> bytes:
     """Derive a deterministic compatibility namespace prefixed to every store and
     registry key.
@@ -1290,7 +1476,8 @@ def derive_offload_namespace(
     hashing all configuration parameters that alter binary KV cache layout:
     - Model identity: model name, revision, quantization.
     - KV cache geometry: KV data type, kernel block size, per-block tensor shape,
-      device block size, and cache group/tensor counts.
+      device block size, cache group/tensor counts, and which groups are
+      offloaded when that is not all of them.
     - Distributed topology: world size (TP/PP) and context parallelism geometry
       (pcp_size, dcp_size, interleave_size) which alters rank-local token placement.
     - Hash scheme: prefix caching algorithm and namespace version salt.
@@ -1339,6 +1526,13 @@ def derive_offload_namespace(
             block_major_contract.bundle_row_bytes,
             block_major_contract.logical_fingerprint,
         )
+    if offloaded_group_ids is not None and offloaded_group_ids != tuple(
+        range(num_kv_cache_groups)
+    ):
+        # vLLM offloads only the prefix-cacheable groups; an engine that skips
+        # a group never stores its keys, so a peer expecting them would miss
+        # on every block.
+        material_fields += ("tpu-raiden-offload-ns3-groups", offloaded_group_ids)
     material = repr(material_fields)
     return hashlib.sha256(material.encode()).digest()[:16]
 
@@ -1697,8 +1891,13 @@ class RaidenStoreOffloadingWorker(OffloadingWorker):
         host, _, port = self._controller_address.rpartition(":")
         host = host.strip("[]")
         try:
-            with socket.create_connection((host, int(port)), timeout=1.0):
-                return True
+            with socket.create_connection((host, int(port)), timeout=1.0) as sock:
+                # Guard against TCP simultaneous-open loopback self-connect:
+                # if the target port lies inside the kernel's ephemeral range
+                # and no server is listening yet, the kernel can assign the
+                # destination port as the probe socket's own source port and
+                # connect the socket to itself.
+                return sock.getsockname() != sock.getpeername()
         except OSError:
             return False
 
@@ -2087,13 +2286,27 @@ class StorageRankCoords:
                 )
 
     @property
-    def storage_rank(self) -> int:
-        """Which of a block's shard files this rank writes."""
+    def engine_rank(self) -> int:
+        """This rank's index among its engine's workers, in [0, world_size).
+
+        vLLM lays an engine's ranks out PP x PCP x TP, so that is the group
+        coordinates in the same order. The store registers the worker under
+        it (node_id) and pairs P2P transfers on it -- this replica's worker k
+        reads from the peer's worker k -- so it must name the same KV shard
+        on every replica. The world rank does not: under data parallelism
+        with expert parallelism the torch.distributed world spans every
+        replica, making it `dp_rank * world_size + k`.
+        """
         return (
             self.pp_rank * (self.pcp_size * self.tp_size)
             + self.pcp_rank * self.tp_size
             + self.tp_rank
         )
+
+    @property
+    def storage_rank(self) -> int:
+        """Which of a block's shard files this rank writes: its engine rank."""
+        return self.engine_rank
 
     @property
     def storage_size(self) -> int:
@@ -2104,8 +2317,8 @@ class StorageRankCoords:
 def worker_storage_rank_coords() -> StorageRankCoords:
     """This worker's storage coordinates, read from its TP, PCP, and PP groups.
 
-    Not from the world rank: with data parallelism that counts the ranks of
-    every replica, while storage paths are per TP, PCP, and PP rank.
+    Not from the world rank, which under data parallelism counts every
+    replica's ranks; see `StorageRankCoords.engine_rank`.
     """
     from vllm.distributed import parallel_state
 
@@ -2253,7 +2466,10 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
         # Verify CP scaling invariant: scheduler chunks at the logical all-CP-rank
         # block span, whereas KV cache specs are rank-local. Ensure tokens_per_block
         # scales by pcp_size * dcp_size so OffloadKey spans match scheduler blocks.
-        for group_config, group in zip(config.groups, kv_cache_config.kv_cache_groups):
+        # config.groups holds only the offloaded groups (vLLM leaves out groups
+        # that are not prefix-cacheable), so pair them by group id.
+        for group_config in config.groups:
+            group = kv_cache_config.kv_cache_groups[group_config.group_id]
             if isinstance(group.kv_cache_spec, AttentionSpec):
                 expected_cp_scale = parallel.pcp_size * parallel.dcp_size
                 assert group_config.tokens_per_block == (
@@ -2332,6 +2548,7 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
             num_kv_cache_tensors=len(kv_cache_config.kv_cache_tensors),
             cp_geometry=cp_geometry,
             block_major_contract=self.block_major_contract,
+            offloaded_group_ids=tuple(group.group_id for group in config.groups),
         )
 
         # Shared-memory host pools (RAIDEN_SHM_KEY) are currently unsupported.
@@ -2360,16 +2577,37 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
         dp_rank_local = vllm_config.parallel_config.data_parallel_rank_local
         if dp_rank_local is None:
             dp_rank_local = dp_rank
-        self.raiden_controller_port = dp_rank_local + int(
+        self.dp_rank = vllm_config.parallel_config.data_parallel_index
+        base_controller_port = int(
             self.extra_config.get("raiden_controller_port", _DEFAULT_CONTROLLER_PORT)
         )
+        self.raiden_controller_port = dp_rank_local + base_controller_port
+        if isinstance(self.raiden_controller_port, int):
+            ephemeral_low, ephemeral_high = _get_ephemeral_port_range()
+            if ephemeral_low <= self.raiden_controller_port <= ephemeral_high:
+                logger.warning(
+                    "TPURaidenOffloadingConnector: raiden_controller_port %d "
+                    "(base=%d + dp_rank_local=%d) falls inside the host "
+                    "ephemeral port range %d..%d (%s); a client socket on this "
+                    "host may claim the port before KVCacheStore binds it. Set "
+                    "'raiden_controller_port' in kv_connector_extra_config "
+                    "outside ip_local_port_range (for example, < %d such as %d).",
+                    self.raiden_controller_port,
+                    base_controller_port,
+                    dp_rank_local,
+                    ephemeral_low,
+                    ephemeral_high,
+                    _IP_LOCAL_PORT_RANGE_PATH,
+                    ephemeral_low,
+                    _DEFAULT_CONTROLLER_PORT,
+                )
         self.raiden_job_name = str(
             self.extra_config.get("raiden_job_name", f"vllm-offload-{config.engine_id}")
         )
         # Suffix by global DP rank to ensure distinct RaidenId and registry
         # entries across multi-node data parallel replicas.
-        if dp_rank:
-            self.raiden_job_name = f"{self.raiden_job_name}-dp{dp_rank}"
+        if self.dp_rank:
+            self.raiden_job_name = f"{self.raiden_job_name}-dp{self.dp_rank}"
 
         self._manager: RaidenOffloadingManager | None = None
         self._worker: RaidenStoreOffloadingWorker | None = None
@@ -2423,14 +2661,30 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
                 kv_pool_group=self.kv_pool_group,
                 key_namespace=self.key_namespace,
                 secondary_backend_configs=secondary_backend_configs,
+                dp_rank=self.dp_rank,
             )
         return self._manager
 
     def get_worker(self, kv_caches: CanonicalKVCaches) -> OffloadingWorker:
         if self._worker is None:
-            from vllm.distributed import parallel_state
-
-            rank = parallel_state.get_world_group().rank_in_group
+            # The worker's index within its engine, not its world rank: see
+            # StorageRankCoords.engine_rank.
+            coords = worker_storage_rank_coords()
+            # The store expects node ids in [0, world_size) and, with a
+            # storage tier, looks for a block's files under the shard count
+            # from the config; a worker that disagreed would register out of
+            # range or write where the store never looks.
+            assert (coords.tp_size, coords.pcp_size, coords.pp_size) == (
+                self.tp_size,
+                self.pcp_size,
+                self.pp_size,
+            ), (
+                "TPURaidenOffloadingConnector: worker group sizes TP="
+                f"{coords.tp_size}, PCP={coords.pcp_size}, PP={coords.pp_size} != "
+                f"configured TP={self.tp_size}, PCP={self.pcp_size}, "
+                f"PP={self.pp_size}"
+            )
+            rank = coords.engine_rank
             # Direct workers to dial the controller on store_server_ip when configured
             # (bind-and-advertise), falling back to loopback (127.0.0.1) for local runs.
             controller_address = (
@@ -2440,30 +2694,15 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
             if self.storage_config is not None:
                 from tpu_sync.api.torch.kv_cache_manager import _torch_impl
 
-                coords = worker_storage_rank_coords()
-                # The store looks for a block's files under the shard count
-                # from the config; a worker that disagreed would write where
-                # the store never looks.
-                assert (coords.tp_size, coords.pcp_size, coords.pp_size) == (
-                    self.tp_size,
-                    self.pcp_size,
-                    self.pp_size,
-                ), (
-                    "TPURaidenOffloadingConnector: worker group sizes TP="
-                    f"{coords.tp_size}, PCP={coords.pcp_size}, PP={coords.pp_size} != "
-                    f"configured TP={self.tp_size}, PCP={self.pcp_size}, "
-                    f"PP={self.pp_size}"
-                )
                 backend_configs.append(
                     build_worker_storage_backend_config(
                         _torch_impl(), self.storage_config, coords
                     )
                 )
                 logger.info(
-                    "TPURaidenOffloadingConnector: rank %d writes storage shard "
-                    "%d of %d (TP rank %d, PCP rank %d, PP rank %d) under %s",
+                    "TPURaidenOffloadingConnector: worker %d of %d writes its "
+                    "storage shard (TP rank %d, PCP rank %d, PP rank %d) under %s",
                     rank,
-                    coords.storage_rank,
                     coords.storage_size,
                     coords.tp_rank,
                     coords.pcp_rank,
