@@ -8,6 +8,7 @@ import importlib.metadata
 import json
 import time
 import types
+from functools import partial
 from pathlib import Path
 
 import jax
@@ -21,17 +22,52 @@ ROOT = Path(__file__).resolve().parents[2]
 LAYER = ROOT / "src/vllm_torchtpu/kernels/experimental/push_fused_moe/layer.py"
 
 
-def load_routing(path):
-    """Load a routing.py snapshot as its own module (baseline A/B side)."""
-    import importlib.util
+ROUTING = LAYER.with_name("routing.py")
+TOKEN_CHOICES = (96, 192, 256, 288, 384)
+ROUTING_CALL = "dsv41_routing_position_metadata"
+BASELINE_ROUTING = Path(__file__).with_name("_routing_baseline_09b82cc91.py")
+BASELINE_SHA256 = "08aba11b235b2ce31e45cf2d0272e8796f6c9af527c13dbbb0c917269567e5af"
 
-    spec = importlib.util.spec_from_file_location("baseline_routing", path)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+
+def load_production_baseline(path: Path = BASELINE_ROUTING):
+    """Load the byte-validated production snapshot without requiring Git."""
+    if hashlib.sha256(path.read_bytes()).hexdigest() != BASELINE_SHA256:
+        raise ValueError("Frozen routing baseline does not match revision 09b82cc91")
+    return load_routing(path)
+
+
+def load_routing(path: Path, *, shape_candidate: bool = False):
+    """Execute a private snapshot so its functions share private module globals."""
+    source = path.read_text()
+    if shape_candidate:
+        gate = "(t_local, gathered.topk, e_total, ep, tile_m) == (288, 6, 384, 16, 128)"
+        if source.count(gate) != 1:
+            raise ValueError("Routing shape gate changed; review exploratory patch")
+        source = source.replace(
+            gate,
+            f"t_local in {TOKEN_CHOICES!r} "
+            "and (gathered.topk, e_total, ep, tile_m) == (6, 384, 16, 128)",
+        )
+    module = types.ModuleType(
+        "shape_candidate_routing" if shape_candidate else "snapshot_routing"
+    )
+    module.__file__ = str(path)
+    exec(compile(source, str(path), "exec"), vars(module))
+    module.source_sha256 = hashlib.sha256(source.encode()).hexdigest()
     return module
 
 
-def extract(path, stride, out, routing=None, tag=None):
+def configure_shape(tokens: int, *, fallback: bool = False) -> None:
+    """Set every fixture-dependent dimension before constructing any arrays."""
+    bench.TOKENS = tokens
+    bench.BLOCK = bench.host.routing_block(tokens, 6)
+    bench.STRIDE = bench.host.ragged_stride_bound(16 * tokens, 6, 384, 128)
+    if fallback:
+        bench.STRIDE += 128
+    bench.meta.STRIDE = bench.STRIDE
+
+
+def extract(path, stride, out, routing=None, tag=None, *, native=False):
     source = path.read_text()
     compute = next(
         n
@@ -69,7 +105,9 @@ def extract(path, stride, out, routing=None, tag=None):
     (out / ((tag or path.stem) + "-extracted.py")).write_text(text)
     namespace = dict(vars(layer))
     if routing is not None:
-        namespace["prepare_routing"] = routing.prepare_routing
+        namespace["prepare_routing"] = partial(
+            routing.prepare_routing, fuse_metadata=not native
+        )
     namespace.update(
         build_routing_tables_sharded=bench.push.build_routing_tables_sharded,
         RoutingTables=bench.host.RoutingTables,
@@ -133,8 +171,20 @@ def smem_consumer(fn):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--out", type=Path, required=True)
-    parser.add_argument("--baseline-source", type=Path, required=True)
+    parser.add_argument("--baseline-source", type=Path)
+    parser.add_argument(
+        "--mode",
+        choices=("exploratory", "integrated"),
+        default="exploratory",
+        help="integrated: actual production versus frozen 09b82cc91 routing",
+    )
     parser.add_argument("--samples", type=int, default=200)
+    parser.add_argument("--tokens", type=int, choices=TOKEN_CHOICES, default=288)
+    parser.add_argument(
+        "--shape-candidate",
+        action="store_true",
+        help="exploratory private routing gate; does not change production support",
+    )
     parser.add_argument("--profile", action="store_true")
     parser.add_argument("--fallback", action="store_true")
     parser.add_argument(
@@ -149,29 +199,48 @@ def main():
     )
     args = parser.parse_args()
     args.out.mkdir(parents=True, exist_ok=True)
-    if args.fallback:
-        bench.STRIDE += 128
-        bench.meta.STRIDE = bench.STRIDE
+    configure_shape(args.tokens, fallback=args.fallback)
     funcs, hashes = {}, {}
+    integrated = args.mode == "integrated"
+    if integrated and (args.shape_candidate or args.baseline_source):
+        parser.error("integrated mode uses the unmodified candidate and shared layer")
+    if not integrated and args.baseline_source is None:
+        parser.error("exploratory mode requires --baseline-source")
+    baseline_path = args.baseline_routing or BASELINE_ROUTING
     baseline_routing = (
-        load_routing(args.baseline_routing) if args.baseline_routing else None
+        load_production_baseline(baseline_path)
+        if integrated
+        else load_routing(baseline_path)
     )
+    candidate_routing = load_routing(
+        BASELINE_ROUTING if args.shape_candidate else ROUTING,
+        shape_candidate=args.shape_candidate,
+    )
+    baseline_layer = LAYER if integrated else args.baseline_source
     for name, path, routing in (
-        ("baseline", args.baseline_source, baseline_routing),
-        ("candidate", LAYER, None),
+        ("baseline", baseline_layer, baseline_routing),
+        ("candidate", LAYER, candidate_routing),
     ):
         funcs[name], hashes[name] = extract(
-            path, bench.STRIDE, args.out, routing=routing, tag=name
+            path,
+            bench.STRIDE,
+            args.out,
+            routing=routing,
+            tag=name,
+            native=not integrated and name == "baseline",
         )
-    if args.baseline_routing:
-        hashes["baseline_routing"] = hashlib.sha256(
-            args.baseline_routing.read_bytes()
-        ).hexdigest()
-        hashes["candidate_routing"] = hashlib.sha256(
-            (
-                ROOT
-                / "src/vllm_torchtpu/kernels/experimental/push_fused_moe/routing.py"
-            ).read_bytes()
+    hashes.update(
+        baseline_routing=baseline_routing.source_sha256,
+        candidate_routing=candidate_routing.source_sha256,
+        production_routing=hashlib.sha256(ROUTING.read_bytes()).hexdigest(),
+        harness=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+        decode_preparation=hashlib.sha256(
+            Path(bench.prep.__file__).read_bytes()
+        ).hexdigest(),
+    )
+    for module in (bench, bench.meta, bench.meta.original, bench.host, bench.push):
+        hashes[module.__name__] = hashlib.sha256(
+            Path(module.__file__).read_bytes()
         ).hexdigest()
     if args.consumer:
         funcs = {name: smem_consumer(fn) for name, fn in funcs.items()}
@@ -196,9 +265,28 @@ def main():
             "runtime": {
                 p: importlib.metadata.version(p) for p in ("jax", "jaxlib", "libtpu")
             },
+            "mode": args.mode,
+            "baseline_revision": "09b82cc91" if integrated else None,
             "fallback": args.fallback,
             "consumer": args.consumer,
+            "shape_candidate": args.shape_candidate,
+            "shape": {
+                "tokens": bench.TOKENS,
+                "ep": bench.EP,
+                "topk": bench.TOPK,
+                "experts": bench.EXPERTS,
+            },
+            "block": bench.BLOCK,
             "stride": bench.STRIDE,
+            "source_paths": {
+                "baseline": str(baseline_layer.resolve()),
+                "baseline_routing": str(baseline_path.resolve()),
+                "candidate": str(LAYER),
+                "candidate_routing": str(ROUTING),
+            },
+            "compile": {},
+            "profiles": {},
+            "passed": False,
             "scope": (
                 "actual routing caller and scale scatter; supplied prepush slab; "
                 "before TC MoE/communication/combine"
@@ -207,12 +295,45 @@ def main():
             "timings": {},
         },
     )
+
+    def save_results():
+        (args.out / "results.json").write_text(json.dumps(results, indent=2) + "\n")
+
+    save_results()
     for name, fn in funcs.items():
-        lowered = jax.jit(fn, donate_argnums=(9,)).lower(*xs)
-        (args.out / f"{name}.stablehlo.txt").write_text(lowered.as_text())
-        compiled[name] = lowered.compile()
-        (args.out / f"{name}.hlo.txt").write_text(compiled[name].as_text())
-        results[name + "_memory"] = str(compiled[name].memory_analysis())
+        start = time.perf_counter()
+        try:
+            lowered = jax.jit(fn, donate_argnums=(9,)).lower(*xs)
+            stablehlo = lowered.as_text()
+            (args.out / f"{name}.stablehlo.txt").write_text(stablehlo)
+            compiled[name] = lowered.compile()
+            hlo = compiled[name].as_text()
+            (args.out / f"{name}.hlo.txt").write_text(hlo)
+            hit = any(
+                ROUTING_CALL in line and "custom-call" in line
+                for line in hlo.splitlines()
+            )
+            expected = not args.fallback and (
+                name == "candidate" or (integrated and args.tokens == 288)
+            )
+            assert hit == expected, (
+                f"{name}: routing Pallas call present={hit}, expected={expected}"
+            )
+            results["compile"][name] = {
+                "passed": True,
+                "seconds": time.perf_counter() - start,
+                "routing_pallas_call": hit,
+            }
+            results[name + "_memory"] = str(compiled[name].memory_analysis())
+        except Exception as exc:
+            results["compile"][name] = {
+                "passed": False,
+                "seconds": time.perf_counter() - start,
+                "error": repr(exc),
+            }
+            raise
+        finally:
+            save_results()
     labels = (*bench.LABELS[:2], *bench.LABELS[3:], "scale_slab")
     for case in ("uniform", "skew", "empty", "edge"):
         for rank in (0, 7, 15):
@@ -257,11 +378,14 @@ def main():
     results["passed"] = True
     (args.out / "results.json").write_text(json.dumps(results, indent=2) + "\n")
     if args.profile:
-        with jax.profiler.trace(str(args.out / "profile-routing")):
-            for _ in range(16):
-                for fn in compiled.values():
+        for name, fn in compiled.items():
+            profile = args.out / f"profile-{name}-t{bench.TOKENS}-b{bench.BLOCK}"
+            with jax.profiler.trace(str(profile)):
+                for _ in range(16):
                     outputs = jax.block_until_ready(fn(*xs))
                     xs = (*xs[:-1], outputs[-1])
+            results["profiles"][name] = str(profile.resolve())
+        save_results()
     print(
         {
             name: {k: v for k, v in timing.items() if k != "raw_us"}
