@@ -199,7 +199,6 @@ def test_split_layout_buffers_stay_under_the_threshold():
 
 
 def test_packed_weights_unpack_to_the_families():
-
     import torch
 
     from vllm_torchtpu.megakernel.kimi_k3.decode_ops import DecodeOps
@@ -209,6 +208,7 @@ def test_packed_weights_unpack_to_the_families():
     ops.weights = {
         "a": torch.arange(6, dtype=torch.float32).reshape(1, 2, 3),
         "b": torch.arange(4, dtype=torch.bfloat16).reshape(1, 4),
+        "c": torch.arange(300, dtype=torch.float32).reshape(1, 3, 100),
         "big": torch.zeros((1, 64, 64), dtype=torch.float32),
         "expert_gu#bank0": torch.zeros((1, 2), dtype=torch.uint8),
     }
@@ -216,12 +216,19 @@ def test_packed_weights_unpack_to_the_families():
     original = torch.Tensor.to
     try:
         torch.Tensor.to = lambda self, *a, **k: self  # no device in the CPU test
-        ops._pack_small_weights(2)
+        ops._pack_small_weights(3)
     finally:
         torch.Tensor.to = original
-    assert ops.names == ("#packed", "big", "expert_gu#bank0")
-    blob = jnp.asarray(ops.weights["#packed"].numpy()[0])
-    out = ops._unpacked({"#packed": blob, "big": None})
+    assert ops.names == ("#packedbfloat16", "#packedfloat32", "big", "expert_gu#bank0")
+    assert tuple(ops.weights["#packedfloat32"].shape) == (1, 4, 128)
+    blobs = {
+        "#packedfloat32": jnp.asarray(ops.weights["#packedfloat32"].numpy()[0]),
+        "#packedbfloat16": jnp.asarray(
+            ops.weights["#packedbfloat16"].float().numpy()[0], jnp.bfloat16
+        ),
+    }
+    out = ops._unpacked({**blobs, "big": None})
     np.testing.assert_array_equal(np.asarray(out["a"]), np.arange(6).reshape(2, 3))
+    np.testing.assert_array_equal(np.asarray(out["c"]), np.arange(300).reshape(3, 100))
     np.testing.assert_array_equal(np.asarray(out["b"], np.float32), np.arange(4))
-    assert out["b"].dtype == jnp.bfloat16 and "#packed" not in out
+    assert out["b"].dtype == jnp.bfloat16 and not any(k.startswith("#") for k in out)

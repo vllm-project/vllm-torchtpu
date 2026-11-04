@@ -242,58 +242,62 @@ class DecodeOps:
         report_load_stats("decode", self.rank, stats)
         return stats["wall"]
 
-    PACKED = "#packed"
+    PACKED = "#packed"  # + dtype: one [rows, 128] operand per dtype
 
     def _pack_small_weights(self, count: int) -> None:
-        """Move the ``count`` smallest dense families into one byte blob
-        operand (``PACKED``; the families stay in ``weights`` for sharing):
-        torch ops take at most 64 operands, and resident expert banks need
-        more. The step bodies unpack it by copies (:meth:`_unpacked`)."""
-        self._packed: list[tuple[str, int, tuple[int, ...], Any]] = []
+        """Move the ``count`` smallest dense families into one ``[rows, 128]``
+        operand per dtype (``PACKED<dtype>``, each family from a row boundary;
+        the families stay in ``weights`` for sharing): torch ops take at most 64
+        operands, and resident expert banks need more. The step bodies unpack
+        them by copies (:meth:`_unpacked`); no bitcasts, so the copies run at
+        HBM speed."""
+        self._packed: list[tuple[str, str, int, tuple[int, ...]]] = []
         if count <= 0:
             return
         dense = [
             n for n in self.names
-            if not n.startswith("expert_") and n != self.PACKED
+            if not n.startswith("expert_") and not n.startswith(self.PACKED)
         ]
         size = {
             n: self.weights[n].numel() * self.weights[n].element_size() for n in dense
         }
         chosen = sorted(dense, key=lambda n: (size[n], n))[:count]
-        parts, offset = [], 0
+        parts: dict[str, list[torch.Tensor]] = {}
+        rows: dict[str, int] = {}
         for name in chosen:
-            tensor = self.weights[name]
-            raw = tensor.cpu().contiguous().reshape(-1).view(torch.uint8)
-            dtype = jnp.dtype(str(tensor.dtype).removeprefix("torch."))
-            self._packed.append((name, offset, tuple(tensor.shape[1:]), dtype))
-            parts.append(raw)
-            offset += raw.numel()
-        self.weights[self.PACKED] = torch.cat(parts).reshape(1, -1).to("tpu")
+            tensor = self.weights[name].cpu().contiguous()
+            dtype = str(tensor.dtype).removeprefix("torch.")
+            flat = tensor.reshape(-1)
+            pad = -flat.numel() % 128
+            if pad:
+                flat = torch.cat((flat, flat.new_zeros(pad)))
+            key = self.PACKED + dtype
+            self._packed.append((name, key, rows.get(key, 0), tuple(tensor.shape[1:])))
+            parts.setdefault(key, []).append(flat.reshape(-1, 128))
+            rows[key] = rows.get(key, 0) + flat.numel() // 128
+        for key, blocks in parts.items():
+            self.weights[key] = torch.cat(blocks)[None].to("tpu")
         self.names = tuple(n for n in sorted(self.weights) if n not in set(chosen))
         if self.rank == 0:
             logger.info(
-                "K3 decode: %d small families packed into one %.1f MB operand "
-                "(%d weight operands)",
+                "K3 decode: %d small families packed into %d operands "
+                "(%.1f MB; %d weight operands)",
                 len(chosen),
-                offset / 1e6,
+                len(parts),
+                sum(size[n] for n in chosen) / 1e6,
                 len(self.names),
             )
 
     def _unpacked(self, weights: dict) -> dict:
-        """``weights`` with the packed families restored from ``PACKED``."""
+        """``weights`` with the packed families restored from ``PACKED*``."""
         if not getattr(self, "_packed", None):
             return weights
         weights = dict(weights)
-        blob = weights.pop(self.PACKED)
-        for name, offset, shape, dtype in self._packed:
-            nbytes = math.prod(shape) * dtype.itemsize
-            raw = blob[offset : offset + nbytes]
-            if dtype.itemsize > 1:
-                raw = raw.reshape(-1, dtype.itemsize)
-                raw = jax.lax.bitcast_convert_type(raw, dtype)
-            else:
-                raw = jax.lax.bitcast_convert_type(raw, dtype)
-            weights[name] = raw.reshape(shape)
+        blobs = {k: weights.pop(k) for k in list(weights) if k.startswith(self.PACKED)}
+        for name, key, row, shape in self._packed:
+            count = math.prod(shape)
+            block = blobs[key][row : row + -(-count // 128)]
+            weights[name] = block.reshape(-1)[:count].reshape(shape)
         return weights
 
     def use_unified_pools(
