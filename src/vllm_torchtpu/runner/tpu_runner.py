@@ -7769,6 +7769,7 @@ class TPUModelRunner(GPUModelRunner):
                 inputs_embeds=inputs_embeds,
                 **kwargs,
             )
+        assert out is not None
         # A stage before the last returns the tensors the next stage
         # consumes rather than hidden states to sample from.
         if isinstance(out, IntermediateTensors):
