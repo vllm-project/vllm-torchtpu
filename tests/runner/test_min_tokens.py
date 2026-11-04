@@ -14,7 +14,6 @@
 """min_tokens on the TPU sampler: the requests the runner tracks, the
 stop-token mask built for them, and where the runner applies it."""
 
-import functools
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -988,16 +987,13 @@ def _verify(
                 structured_output_request_ids=["r0", "r1"],
                 num_acceptable_drafts=num_acceptable_drafts,
             )
-            manager = SimpleNamespace(
-                runner=SimpleNamespace(
-                    input_batch=SimpleNamespace(
-                        req_id_to_index={"r0": start, "r1": start + 1}
-                    )
+            manager = StructuredDecodingManager.__new__(StructuredDecodingManager)
+            manager.runner = SimpleNamespace(
+                input_batch=SimpleNamespace(
+                    req_id_to_index={"r0": start, "r1": start + 1}
                 )
             )
-            mask_invalid_draft_tokens = functools.partial(
-                StructuredDecodingManager.mask_invalid_draft_tokens, manager
-            )
+            mask_invalid_draft_tokens = manager.mask_invalid_draft_tokens
         runner.structured_decoding_manager = SimpleNamespace(
             mask_spec_logits=mask_spec_logits,
             mask_invalid_draft_tokens=mask_invalid_draft_tokens,

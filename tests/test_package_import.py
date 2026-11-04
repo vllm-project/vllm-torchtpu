@@ -17,28 +17,22 @@ import sys
 import pytest
 
 
-def test_package_imports_before_vllm():
+def _run_python(code: str, timeout: int = 60) -> None:
     result = subprocess.run(
-        [sys.executable, "-c", "import vllm_torchtpu; import vllm"],
+        [sys.executable, "-c", code],
         capture_output=True,
         text=True,
-        timeout=30,
+        timeout=timeout,
     )
     assert result.returncode == 0, result.stderr
+
+
+def test_package_imports_before_vllm():
+    _run_python("import vllm_torchtpu; import vllm")
 
 
 def test_submodule_imports_before_vllm_initialization_completes():
-    result = subprocess.run(
-        [
-            sys.executable,
-            "-c",
-            "import vllm_torchtpu.layers.adapter.quantization.fp8; import vllm",
-        ],
-        capture_output=True,
-        text=True,
-        timeout=30,
-    )
-    assert result.returncode == 0, result.stderr
+    _run_python("import vllm_torchtpu.layers.adapter.quantization.fp8; import vllm")
 
 
 @pytest.mark.parametrize(
@@ -57,65 +51,35 @@ def test_submodule_imports_before_vllm_initialization_completes():
     ids=["utils_first", "planning_first"],
 )
 def test_sitecustomize_cold_import_kv_cache_configs_subprocess(imports: str):
-    result = subprocess.run(
-        [
-            sys.executable,
-            "-c",
-            (
-                "import sys; "
-                f"{imports}"
-                "assert 'vllm.entrypoints.launchers.cli_args' not in sys.modules; "
-                "assert get_kv_cache_configs is kv_cache_planning.get_kv_cache_configs"
-            ),
-        ],
-        capture_output=True,
-        text=True,
-        timeout=30,
+    _run_python(
+        "import sys; "
+        f"{imports}"
+        "assert 'vllm.entrypoints.launchers.cli_args' not in sys.modules; "
+        "assert get_kv_cache_configs is kv_cache_planning.get_kv_cache_configs"
     )
-    assert result.returncode == 0, result.stderr
 
 
 def test_sitecustomize_cold_import_launchers_cli_args_subprocess():
-    result = subprocess.run(
-        [
-            sys.executable,
-            "-c",
-            (
-                "import sys; "
-                "import vllm.entrypoints.launchers as launchers_pkg; "
-                "from vllm.entrypoints.launchers.cli_args import FrontendArgs; "
-                "from vllm.entrypoints.common import cli_args as common_cli_args; "
-                "assert FrontendArgs is common_cli_args.FrontendArgs; "
-                "mod = sys.modules['vllm.entrypoints.launchers.cli_args']; "
-                "assert mod is common_cli_args; "
-                "assert launchers_pkg.cli_args is common_cli_args; "
-                "spec_name = common_cli_args.__spec__.name; "
-                "assert spec_name == 'vllm.entrypoints.common.cli_args'"
-            ),
-        ],
-        capture_output=True,
-        text=True,
-        timeout=30,
+    _run_python(
+        "import sys; "
+        "import vllm.entrypoints.launchers as launchers_pkg; "
+        "from vllm.entrypoints.launchers.cli_args import FrontendArgs; "
+        "from vllm.entrypoints.common import cli_args as common_cli_args; "
+        "assert FrontendArgs is common_cli_args.FrontendArgs; "
+        "mod = sys.modules['vllm.entrypoints.launchers.cli_args']; "
+        "assert mod is common_cli_args; "
+        "assert launchers_pkg.cli_args is common_cli_args; "
+        "spec_name = common_cli_args.__spec__.name; "
+        "assert spec_name == 'vllm.entrypoints.common.cli_args'"
     )
-    assert result.returncode == 0, result.stderr
 
 
 def test_sitecustomize_cold_import_serve_api_utils_subprocess():
-    result = subprocess.run(
-        [
-            sys.executable,
-            "-c",
-            (
-                "from vllm.entrypoints.serve.utils.api_utils import "
-                "VLLM_SUBCMD_PARSER_EPILOG, cli_env_setup; "
-                "from vllm.entrypoints.common import startup; "
-                "epilog = startup.VLLM_SUBCMD_PARSER_EPILOG; "
-                "assert VLLM_SUBCMD_PARSER_EPILOG is epilog; "
-                "assert cli_env_setup is startup.cli_env_setup"
-            ),
-        ],
-        capture_output=True,
-        text=True,
-        timeout=30,
+    _run_python(
+        "from vllm.entrypoints.serve.utils.api_utils import "
+        "VLLM_SUBCMD_PARSER_EPILOG, cli_env_setup; "
+        "from vllm.entrypoints.common import startup; "
+        "epilog = startup.VLLM_SUBCMD_PARSER_EPILOG; "
+        "assert VLLM_SUBCMD_PARSER_EPILOG is epilog; "
+        "assert cli_env_setup is startup.cli_env_setup"
     )
-    assert result.returncode == 0, result.stderr

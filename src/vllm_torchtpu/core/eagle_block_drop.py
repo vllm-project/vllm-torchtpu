@@ -48,6 +48,7 @@ from functools import wraps
 from typing import Any, cast
 
 from vllm.logger import init_logger
+from vllm.v1.core.single_type_kv_cache_manager import MambaManager
 
 from vllm_torchtpu import envs
 
@@ -57,16 +58,20 @@ logger = init_logger(__name__)
 def clear_eagle_block_drop(kv_cache_manager) -> None:
     """Clear every EAGLE drop flag in a built KV cache manager.
 
-    ``use_eagle=False`` already keeps the coordinator from dropping a block in
-    any group; this also clears the groups marked from ``KVCacheSpec.is_draft``
-    (DSpark, DeepseekV4) and every per-group flag.
+    Covers the state ``use_eagle=True`` sets on the coordinator
+    (``drop_eagle_group_ids``) and on its managers (``use_eagle``, Mamba's
+    ``drop_eagle_checkpoint_block``), and the groups marked from
+    ``KVCacheSpec.is_draft`` (DSpark, DeepseekV4).
     """
     kv_cache_manager.use_eagle = False
     coordinator = kv_cache_manager.coordinator
     if hasattr(coordinator, "eagle_group_ids"):
         coordinator.eagle_group_ids = set()
+        coordinator.drop_eagle_group_ids = set()
     for manager in coordinator.single_type_managers:
         manager.use_eagle = False
+        if isinstance(manager, MambaManager):
+            manager.drop_eagle_checkpoint_block = False
     groups = getattr(coordinator, "attention_groups", None)
     if groups:
         coordinator.attention_groups = [g._replace(use_eagle=False) for g in groups]
@@ -98,8 +103,7 @@ def patch_disable_eagle_block_drop() -> None:
         finally:
             scheduler_module.KVCacheManager = manager_cls
         clear_eagle_block_drop(self.kv_cache_manager)
-        self.use_eagle_block_drop = False
-        if self.use_eagle:
+        if self.use_eagle_block_drop:
             logger.warning(
                 "VLLM_TPU_DISABLE_EAGLE_BLOCK_DROP: EAGLE/MTP trailing "
                 "prefix-cache block drop is disabled (use_eagle=True, "
@@ -107,6 +111,7 @@ def patch_disable_eagle_block_drop() -> None:
                 "acceptance may change.",
                 self.block_size,
             )
+        self.use_eagle_block_drop = False
 
     @wraps(original_split)
     def split(self, *args, **kwargs):

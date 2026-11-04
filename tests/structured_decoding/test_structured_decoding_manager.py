@@ -768,6 +768,11 @@ class TestMaskLogitsWithTrace:
 
 
 class TestMaskInvalidDraftTokens:
+    @pytest.fixture(autouse=True)
+    def _run_pinning_eagerly(self):
+        with torch.compiler.set_stance("force_eager"):
+            yield
+
     def test_fast_path_when_all_drafts_acceptable(self):
         manager = make_manager(
             num_spec_tokens=3, req_id_to_index={"req0": 0, "req1": 1}

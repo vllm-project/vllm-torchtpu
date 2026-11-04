@@ -12,10 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
+import pytest
 import vllm.v1.core.sched.scheduler as scheduler_module
 from vllm.v1.core.kv_cache_coordinator import SpecGroup
 from vllm.v1.core.sched.scheduler import Scheduler
+from vllm.v1.core.single_type_kv_cache_manager import MambaManager
 
 from vllm_torchtpu.core import eagle_block_drop
 
@@ -76,6 +79,9 @@ def test_patched_split_skips_eagle_back_off(monkeypatch):
 
 def test_patched_init_builds_manager_without_eagle(monkeypatch):
     seen = {}
+    mamba = MambaManager.__new__(MambaManager)
+    mamba.use_eagle = True
+    mamba.drop_eagle_checkpoint_block = True
 
     def fake_manager(**kwargs):
         seen.update(kwargs)
@@ -84,13 +90,15 @@ def test_patched_init_builds_manager_without_eagle(monkeypatch):
             use_eagle=kwargs["use_eagle"],
             coordinator=SimpleNamespace(
                 eagle_group_ids={0},
-                single_type_managers=[SimpleNamespace(use_eagle=True)],
+                drop_eagle_group_ids={0},
+                single_type_managers=[SimpleNamespace(use_eagle=True), mamba],
                 attention_groups=groups,
             ),
         )
 
     def fake_init(self):
         self.use_eagle = True
+        self.use_eagle_block_drop = True
         self.block_size = BLOCK
         self.kv_cache_manager = scheduler_module.KVCacheManager(use_eagle=True)
 
@@ -102,9 +110,32 @@ def test_patched_init_builds_manager_without_eagle(monkeypatch):
     assert scheduler_module.KVCacheManager is fake_manager  # restored
     coordinator = sched.kv_cache_manager.coordinator
     assert coordinator.eagle_group_ids == set()
+    assert coordinator.drop_eagle_group_ids == set()
     assert not coordinator.single_type_managers[0].use_eagle
+    assert not mamba.use_eagle
+    assert not mamba.drop_eagle_checkpoint_block
     assert not coordinator.attention_groups[0].use_eagle
     assert sched.use_eagle is True
+    assert sched.use_eagle_block_drop is False
+
+
+@pytest.mark.parametrize("drop_was_on", [True, False])
+def test_patched_init_warns_only_when_it_disables_a_drop(monkeypatch, drop_was_on):
+    def fake_init(self):
+        # Lookahead block hashes leave use_eagle set and the drop already off.
+        self.use_eagle = True
+        self.use_eagle_block_drop = drop_was_on
+        self.block_size = BLOCK
+        self.kv_cache_manager = SimpleNamespace(
+            coordinator=SimpleNamespace(single_type_managers=[])
+        )
+
+    warning = MagicMock()
+    monkeypatch.setattr(eagle_block_drop.logger, "warning", warning)
+    _install(monkeypatch, fake_init)
+    sched = Scheduler.__new__(Scheduler)
+    Scheduler.__init__(sched)
+    assert warning.called is drop_was_on
     assert sched.use_eagle_block_drop is False
 
 

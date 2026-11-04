@@ -398,6 +398,12 @@ class StructuredDecodingManager:
         invalid_mask = torch.from_numpy(invalid_mask_np).to(
             device=draft_token_ids.device
         )
+        return self.pin_invalid_draft_tokens(invalid_mask, draft_token_ids)
+
+    @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+    def pin_invalid_draft_tokens(
+        self, invalid_mask: torch.Tensor, draft_token_ids: torch.Tensor
+    ) -> torch.Tensor:
         return torch.where(invalid_mask, -1, draft_token_ids)
 
     @torch.compile(backend="tpu", fullgraph=True, dynamic=False)

@@ -6455,6 +6455,11 @@ class TPUModelRunner(GPUModelRunner):
                     arange,
                 )
                 synchronize_tensors(out)
+                out = self.structured_decoding_manager.pin_invalid_draft_tokens(
+                    torch.zeros((num_tokens,), dtype=torch.bool).to(self.device),
+                    torch.zeros((num_tokens,), dtype=torch.int32).to(self.device),
+                )
+                synchronize_tensors(out)
                 logger.info("  -- target_logits_length: %d", num_tokens)
 
     def _verify_logits_paddings(self) -> list[int]:
