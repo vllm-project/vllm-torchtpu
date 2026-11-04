@@ -51,6 +51,7 @@ def _qb_rope_kernel(
     post_fragment,
     token_offset,
     aliased,
+    last_rows,
 ):
     if aliased:
         refs = refs[1:]  # the aliased input is read and written as the output
@@ -113,15 +114,30 @@ def _qb_rope_kernel(
         coeff_ref[0, pl.ds(token_start, tb), :] = cos_lanes
         coeff_ref[1, pl.ds(token_start, tb), :] = sin_lanes
 
-    def copy(g):
-        """Output DMA of global pair g (dst address only matters for start)."""
+    def copy(g, size=tb):
+        """Output DMA of global pair g's first ``size`` rows (dst matters for start)."""
         t, q = g // pairs, g % pairs
-        rows = pl.ds(pl.multiple_of(token_offset + (t % tiles) * tb, _ROW_ALIGN), tb)
+        start = pl.multiple_of(token_offset + (t % tiles) * tb, _ROW_ALIGN)
         return pltpu.make_async_copy(
-            obuf_ref.at[g % slots],
-            out_words.at[rows, (t // tiles) * pairs + q, :],
+            obuf_ref.at[g % slots, pl.ds(0, size)],
+            out_words.at[pl.ds(start, size), (t // tiles) * pairs + q, :],
             sems.at[g % slots],
         )
+
+    def dma(g, action):
+        """Start or wait pair g's output DMA (a ragged last tile copies fewer rows)."""
+        if last_rows == tb:
+            getattr(copy(g), action)()
+            return
+        last = (g // pairs) % tiles == tiles - 1
+
+        @pl.when(last)
+        def _():
+            getattr(copy(g, last_rows), action)()
+
+        @pl.when(jnp.logical_not(last))
+        def _():
+            getattr(copy(g), action)()
 
     def reclaim(*targets):
         """Wait for the DMAs that last used the slots of pairs ``targets``."""
@@ -129,7 +145,7 @@ def _qb_rope_kernel(
 
             @pl.when(g - slots >= 0)
             def _(g=g):
-                copy(g - slots).wait()
+                dma(g - slots, "wait")
 
     def matmul(pair, parity):
         """FP32 products of this step's head pair into its parity buffer."""
@@ -195,7 +211,7 @@ def _qb_rope_kernel(
 
         @pl.when(valid)
         def _():
-            copy(g).start()
+            dma(g, "start")
 
     first = step * pairs  # global index of this step's pair 0
 
@@ -222,7 +238,7 @@ def _qb_rope_kernel(
         reclaim(last)
         post(last, 1)
         for back in range(slots):
-            copy(last - back).wait()
+            dma(last - back, "wait")
 
 
 def vmem_bytes(config: QBRopeConfig, segment, rank, heads, head_dim=512):
@@ -321,6 +337,7 @@ def _segment_call(
     offset,
     segment,
     head_dim,
+    out_tokens,
 ):
     tokens, rank = qr.shape
     heads = weight.shape[1] // head_dim
@@ -365,6 +382,7 @@ def _segment_call(
             pltpu.SemaphoreType.DMA((2, hb // 2)),
         ),
     )
+    last_rows = min(tb, out_tokens - (offset + segment - tb))
     kernel = functools.partial(
         _qb_rope_kernel,
         head_dim=head_dim,
@@ -374,11 +392,12 @@ def _segment_call(
         post_fragment=config.post_fragment,
         token_offset=offset,
         aliased=out is not None,
+        last_rows=last_rows,
     )
     return pl.pallas_call(
         kernel,
         grid_spec=grid_spec,
-        out_shape=jax.ShapeDtypeStruct((tokens, heads, head_dim), jnp.bfloat16),
+        out_shape=jax.ShapeDtypeStruct((out_tokens, heads, head_dim), jnp.bfloat16),
         input_output_aliases=aliases,
         compiler_params=pltpu.CompilerParams(
             dimension_semantics=("arbitrary", "arbitrary"),
@@ -396,6 +415,7 @@ def fused_qb_rope(
     *,
     head_dim: int = 512,
     config: QBRopeConfig | None = None,
+    exact_rows: bool = False,
 ) -> jax.Array:
     """Return BF16 Q[tokens, heads, head_dim] for normalized BF16 ``qr``.
 
@@ -403,7 +423,8 @@ def fused_qb_rope(
     layout with one FP32 scale per column. ``rope_rows`` is the per-step
     ``[tokens, rotary_dim]`` FP32 ``rope_gather.gather_rows`` of the model's
     packed cos/sin cache. Token counts that are not a multiple of 32 are
-    zero-padded internally.
+    zero-padded internally; ``exact_rows`` writes only the real rows instead of
+    slicing a padded result (same values, one copy fewer).
     """
     _check_projection_shapes(qr, weight, weight_scale)
     if head_dim <= 0 or weight.shape[1] % head_dim or head_dim % _LANE:
@@ -420,6 +441,8 @@ def fused_qb_rope(
     segment = _segment_tokens(config, padded, rank, heads, head_dim)
     check_config(config, segment, heads)
     weight_scale = weight_scale.reshape(-1)
+    # Output DMAs move whole (8, 128) tiles of rows.
+    out_tokens = tokens if exact_rows and tokens % 8 == 0 else padded
     out = None
     for offset in range(0, padded, segment):
         out = _segment_call(
@@ -432,9 +455,10 @@ def fused_qb_rope(
             offset=offset,
             segment=segment,
             head_dim=head_dim,
+            out_tokens=out_tokens,
         )
     assert out is not None
-    return out if padded == tokens else out[:tokens]
+    return out if out_tokens == tokens else out[:tokens]
 
 
 def _check_projection_shapes(qr, weight, scale):

@@ -3,13 +3,15 @@
 """Packed FP8 indexer: candidate preparation, scoring, selection and op registration."""
 
 import functools
-from typing import TYPE_CHECKING, Any
+from collections.abc import Callable
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 import jax
 import jax.numpy as jnp
 import torch
 from jax.experimental import xla_metadata
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.deepseek_v41 import (
     indexer,
 )
@@ -319,7 +321,18 @@ def _select_candidate_tokens(
     return jnp.where(logical < sentinel, logical, -1)
 
 
-def _score_and_select_candidates(
+class _CandidateTiles(NamedTuple):
+    """Query-chunk pipeline pieces of the prepared-candidate scorer."""
+
+    k: int
+    num_tiles: int
+    chunk: int
+    score: Callable[[jax.Array, int | None], jax.Array]
+    select: Callable[[jax.Array, jax.Array, int | None], jax.Array]
+    write: Callable[[jax.Array, jax.Array, jax.Array], jax.Array]
+
+
+def _candidate_tiles(
     q,
     weights,
     lengths,
@@ -328,7 +341,7 @@ def _score_and_select_candidates(
     candidate_block_size,
     unordered,
     context_width,
-):
+) -> _CandidateTiles:
     (
         candidate_keys,
         candidate_block_ids,
@@ -373,45 +386,73 @@ def _score_and_select_candidates(
             else xla_metadata.set_xla_metadata(scores, _scheduling_group_id=group)
         )
 
-    if unordered:
-
-        def select(tile, scores, group):
+    def select(tile, scores, group):
+        if not unordered:
             return _select_candidate_tokens(
                 scores,
-                jax.lax.dynamic_slice_in_dim(
-                    candidate_block_ids, tile * query_chunk_size, query_chunk_size
-                ),
+                candidate_block_ids,
                 k=k,
                 block_size=candidate_block_size,
-                unordered=True,
-                valid_lengths=jax.lax.dynamic_slice_in_dim(
-                    candidate_token_counts, tile * query_chunk_size, query_chunk_size
-                ),
-                scheduling_group_id=group,
+                unordered=False,
             )
-
-        selected = indexer.pipeline_score_topk_unrolled(
-            num_queries // query_chunk_size,
-            lambda tile: tile * query_chunk_size,
-            score,
-            select,
-            lambda tile, src, dst: jax.lax.dynamic_update_slice_in_dim(
-                dst, src, tile * query_chunk_size, axis=0
-            ),
-            jnp.full((num_queries, k), -1, jnp.int32),
-        )
-    else:
-        scores = score(jnp.int32(0), None)
-        selected = _select_candidate_tokens(
+        return _select_candidate_tokens(
             scores,
-            candidate_block_ids,
+            jax.lax.dynamic_slice_in_dim(
+                candidate_block_ids, tile * query_chunk_size, query_chunk_size
+            ),
             k=k,
             block_size=candidate_block_size,
-            unordered=False,
+            unordered=True,
+            valid_lengths=jax.lax.dynamic_slice_in_dim(
+                candidate_token_counts, tile * query_chunk_size, query_chunk_size
+            ),
+            scheduling_group_id=group,
         )
+
+    def write(tile, src, dst):
+        return jax.lax.dynamic_update_slice_in_dim(
+            dst, src, tile * query_chunk_size, axis=0
+        )
+
+    return _CandidateTiles(
+        k, num_queries // query_chunk_size, query_chunk_size, score, select, write
+    )
+
+
+def _score_and_select_candidates(
+    q,
+    weights,
+    lengths,
+    gathered_candidates,
+    topk,
+    candidate_block_size,
+    unordered,
+    context_width,
+):
+    tiles = _candidate_tiles(
+        q,
+        weights,
+        lengths,
+        gathered_candidates,
+        topk,
+        candidate_block_size,
+        unordered,
+        context_width,
+    )
+    if unordered:
+        selected = indexer.pipeline_score_topk_unrolled(
+            tiles.num_tiles,
+            lambda tile: tile * tiles.chunk,
+            tiles.score,
+            tiles.select,
+            tiles.write,
+            jnp.full((q.shape[0], tiles.k), -1, jnp.int32),
+        )
+    else:
+        selected = tiles.select(jnp.int32(0), tiles.score(jnp.int32(0), None), None)
     return jnp.pad(
         selected,
-        ((0, 0), (0, min(topk, context_width) - k)),
+        ((0, 0), (0, min(topk, context_width) - tiles.k)),
         constant_values=-1,
     )
 
@@ -636,65 +677,69 @@ def _select_fp8_indexer_jax(
     if not stream_select or chunk_rows is None or chunk_rows > rows or padded != tokens:
         return select_serial()
 
-    def select_pipelined():
-        def score(start, group):
-            return block(start, chunk_rows, inputs, score_only=True, group=group)
+    def score(start, group):
+        return block(start, chunk_rows, inputs, score_only=True, group=group)
 
-        def select(tile, scores, group):
-            block_scores = None
-            if fuse_publication:
-                scores, block_scores = scores
-            row_lengths = jax.lax.dynamic_slice_in_dim(
-                inputs[2], tile * chunk_rows, chunk_rows
-            )
-            selected = select_topk(
+    def select(tile, scores, group):
+        block_scores = None
+        if fuse_publication:
+            scores, block_scores = scores
+        row_lengths = jax.lax.dynamic_slice_in_dim(
+            inputs[2], tile * chunk_rows, chunk_rows
+        )
+        selected = select_topk(
+            scores,
+            valid_lengths=row_lengths,
+            scheduling_group_id=group,
+        )
+        if publish_rows:
+            return selected, _publish_candidate_blocks(
                 scores,
-                valid_lengths=row_lengths,
+                row_lengths,
+                candidates.shape[1],
+                block_size,
+                unordered,
+                block_scores=block_scores,
                 scheduling_group_id=group,
             )
-            if publish_rows:
-                return selected, _publish_candidate_blocks(
-                    scores,
-                    row_lengths,
-                    candidates.shape[1],
-                    block_size,
-                    unordered,
-                    block_scores=block_scores,
-                    scheduling_group_id=group,
-                )
-            return selected
+        return selected
 
-        def write(tile, selected, output):
-            if publish_rows:
-                return tuple(
-                    jax.lax.dynamic_update_slice_in_dim(dst, src, tile * size, axis=0)
-                    for dst, src, size in zip(
-                        output, selected, (chunk_rows, chunk_rows)
-                    )
-                )
-            return jax.lax.dynamic_update_slice_in_dim(
-                output, selected, tile * chunk_rows, axis=0
+    def write(tile, selected, output):
+        if publish_rows:
+            return tuple(
+                jax.lax.dynamic_update_slice_in_dim(dst, src, tile * size, axis=0)
+                for dst, src, size in zip(output, selected, (chunk_rows, chunk_rows))
             )
+        return jax.lax.dynamic_update_slice_in_dim(
+            output, selected, tile * chunk_rows, axis=0
+        )
 
+    num_tiles = padded // chunk_rows
+    pipeline = (
+        indexer.pipeline_score_topk_bounded
+        if prefill_chunk_rows is not None or publish_rows
+        else indexer.pipeline_score_topk_unrolled
+    )
+
+    def run_pipeline(defer_last=False):
         output = jnp.full((tokens, topk), -1, jnp.int32)
         if publish_rows:
             output = (
                 output,
                 jnp.full(candidates.shape, -1, jnp.int32),
             )
-        pipeline = (
-            indexer.pipeline_score_topk_bounded
-            if prefill_chunk_rows is not None or publish_rows
-            else indexer.pipeline_score_topk_unrolled
-        )
-        selected = pipeline(
-            padded // chunk_rows,
+        return pipeline(
+            num_tiles,
             lambda tile: tile * chunk_rows,
             score,
             select,
             write,
             output,
+            defer_last=defer_last,
         )
+
+    def select_pipelined():
+        selected = run_pipeline()
         if publish_rows:
             selected, published = selected
             return selected, jnp.where(valid_requests[:, None], published, -1)
@@ -710,7 +755,40 @@ def _select_fp8_indexer_jax(
         if prefill_chunk_rows is not None
         else jnp.all(counts % query_tile == 0)
     )
-    return jax.lax.cond(grouped & complete & ~short, select_pipelined, select_serial)
+    pipelined = grouped & complete & ~short
+    if (
+        prefill_chunk_rows is not None
+        or not envs.TPU_DEEPSEEK_V41_INDEXER_TAIL_OUTSIDE_COND
+    ):
+        return jax.lax.cond(pipelined, select_pipelined, select_serial)
+
+    # The last tile's SparseCore selection runs after the conditional, where
+    # the scheduler can overlap it with work that does not need the indices.
+    last = jnp.int32(num_tiles - 1)
+    last_scores = jax.eval_shape(lambda: score(last * chunk_rows, None))
+
+    def deferred_pipelined():
+        partial, scores = run_pipeline(defer_last=True)
+        return (partial if publish_rows else (partial, candidates)), scores
+
+    def deferred_serial():
+        return select_serial(), jax.tree.map(
+            lambda x: jnp.full(x.shape, -jnp.inf, x.dtype), last_scores
+        )
+
+    (selected, published), scores = jax.lax.cond(
+        pipelined, deferred_pipelined, deferred_serial
+    )
+    tail = select(last, scores, None)
+    if publish_rows:
+        done, done_published = write(last, tail, (selected, published))
+        done_published = jnp.where(valid_requests[:, None], done_published, -1)
+    else:
+        done, done_published = write(last, tail, selected), published
+    return (
+        jnp.where(pipelined, done, selected),
+        jnp.where(pipelined, done_published, published),
+    )
 
 
 def select_fp8_indexer_jax(
@@ -824,17 +902,56 @@ def _select_from_prepared_candidates(
         )
         return jnp.where(ids < lengths[:, None], ids, -1)
 
-    return jax.lax.cond(
-        jnp.max(lengths) <= topk,
-        short,
-        lambda: _score_and_select_candidates(
-            q,
-            weights,
-            lengths,
-            gathered_candidates,
-            topk,
-            candidate_block_size,
-            unordered,
-            context_width,
-        ),
+    is_short = jnp.max(lengths) <= topk
+    capacity = gathered_candidates.candidate_block_ids.shape[1] * candidate_block_size
+    if not (
+        envs.TPU_DEEPSEEK_V41_INDEXER_TAIL_OUTSIDE_COND
+        and unordered
+        and capacity >= min(topk, context_width)
+    ):
+        return jax.lax.cond(
+            is_short,
+            short,
+            lambda: _score_and_select_candidates(
+                q,
+                weights,
+                lengths,
+                gathered_candidates,
+                topk,
+                candidate_block_size,
+                unordered,
+                context_width,
+            ),
+        )
+
+    # As in `_select_fp8_indexer_jax`: select the last tile after the conditional.
+    tiles = _candidate_tiles(
+        q,
+        weights,
+        lengths,
+        gathered_candidates,
+        topk,
+        candidate_block_size,
+        unordered,
+        context_width,
     )
+    last = jnp.int32(tiles.num_tiles - 1)
+    last_scores = jax.eval_shape(lambda: tiles.score(last * tiles.chunk, None))
+
+    def scored():
+        return indexer.pipeline_score_topk_unrolled(
+            tiles.num_tiles,
+            lambda tile: tile * tiles.chunk,
+            tiles.score,
+            tiles.select,
+            tiles.write,
+            jnp.full((q.shape[0], tiles.k), -1, jnp.int32),
+            defer_last=True,
+        )
+
+    def skipped():
+        return short(), jnp.full(last_scores.shape, -jnp.inf, last_scores.dtype)
+
+    selected, scores = jax.lax.cond(is_short, skipped, scored)
+    done = tiles.write(last, tiles.select(last, scores, None), selected)
+    return jnp.where(is_short, selected, done)

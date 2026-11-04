@@ -36,13 +36,19 @@ def encode_csa2_kv(latent: jax.Array) -> tuple[jax.Array, jax.Array]:
     return jax.lax.bitcast_convert_type(words, jnp.int32), scales
 
 
-@jax.jit
+@functools.partial(jax.jit, static_argnames=("deep",))
 def gather_csa2_kv_sc(
     words: jax.Array | tuple[jax.Array, jax.Array],
     scales: jax.Array | tuple[jax.Array, jax.Array],
     records: jax.Array,
+    *,
+    deep: bool = False,
 ) -> tuple[jax.Array, jax.Array]:
-    """SparseCore producer; invalid rows are zeroed once before any reuse."""
+    """SparseCore producer; invalid rows are zeroed once before any reuse.
+
+    ``deep`` keeps three staging slots in flight and zeroes invalid rows with
+    a masked DMA instead of clearing every slot with vector stores.
+    """
     banks = words if isinstance(words, tuple) else (words,)
     scale_banks = scales if isinstance(scales, tuple) else (scales,)
     if len(banks) not in (1, 2) or len(banks) != len(scale_banks):
@@ -62,6 +68,8 @@ def gather_csa2_kv_sc(
         return jnp.zeros((*records.shape, 128), jnp.int32), jnp.zeros(
             records.shape, jnp.float32
         )
+    if deep:
+        return _gather_sc_banked_deep(banks, scale_banks, records)
     return _gather_sc_banked(banks, scale_banks, records)
 
 
@@ -205,6 +213,170 @@ def _gather_sc_banked(words, scales, records):
     )
 
 
+def _gather_sc_banked_deep(words, scales, records):
+    """``_gather_sc_banked`` with three slots and DMA-zeroed invalid rows.
+
+    The gather for step i + 2 is issued while step i's rows are written, so
+    two gathers are in flight instead of one. Each 16-id stream is filled by
+    one masked gather per bank plus a masked gather of a zero row for negative
+    ids, so every staged row has exactly one writer and no slot is cleared.
+    Copies of one slot and stream share a semaphore; with one semaphore per
+    source, kind and slot, three- and four-slot versions hung on v7x.
+    """
+    from jax.experimental import pallas as pl
+    from jax.experimental.pallas import tpu as pltpu
+    from jax.experimental.pallas import tpu_sc as plsc
+
+    info = pltpu.get_tpu_info().sparse_core
+    assert info is not None
+    lanes = info.num_lanes
+    cores = info.num_cores * info.num_subcores
+    streams, subchunks, slots = (4 if len(words) == 1 else 2), 512 // lanes, 3
+    block = cores * lanes * subchunks
+    count = records.size
+    padding = -count % block
+    indices = jnp.pad(records.reshape(-1), (0, padding), constant_values=-1)
+    zero_words = jnp.zeros((8, 128), jnp.int32)
+    zero_scales = jnp.zeros((8,), jnp.float32)
+    mesh = plsc.VectorSubcoreMesh(
+        num_cores=info.num_cores,
+        num_subcores=info.num_subcores,
+        core_axis_name="core",
+        subcore_axis_name="subcore",
+    )
+
+    def kernel(
+        word_refs,
+        scale_refs,
+        zero_word_ref,
+        zero_scale_ref,
+        ids_ref,
+        word_out,
+        scale_out,
+        word_buf,
+        scale_buf,
+        read_sem,
+        write_sem,
+    ):
+        core = jax.lax.axis_index((mesh.core_axis_name, mesh.subcore_axis_name))
+        split = word_refs[0].shape[0]
+        steps = subchunks // streams
+
+        def outer(ids):
+            base = (pl.program_id(0) * cores + core) * subchunks * lanes
+
+            def gather(step, wait=False):
+                slot = step % slots
+                for stream in range(streams):
+                    selected = ids[pl.ds((step * streams + stream) * lanes, lanes)]
+                    targets = []
+                    for bank in range(len(words)):
+                        own = (selected >= 0) & (
+                            selected >= split if bank else selected < split
+                        )
+                        local = selected - split if bank else selected
+                        targets.append(
+                            (
+                                word_refs[bank],
+                                scale_refs[bank],
+                                jnp.where(own, local, -1),
+                            )
+                        )
+                    targets.append(
+                        (zero_word_ref, zero_scale_ref, jnp.where(selected < 0, 0, -1))
+                    )
+                    for word_src, scale_src, rows in targets:
+                        indexed = plsc.Indices(rows, ignored_value=-1)
+                        for kind, (src, dst) in enumerate(
+                            ((word_src, word_buf), (scale_src, scale_buf))
+                        ):
+                            copy = pltpu.make_async_copy(
+                                src.at[indexed],
+                                dst.at[slot, stream],
+                                read_sem.at[slot, stream],
+                            )
+                            if wait:
+                                copy.wait()
+                            else:
+                                copy.start()
+
+            def write(step, wait=False):
+                slot = step % slots
+                for stream in range(streams):
+                    offset = base + (step * streams + stream) * lanes
+                    for kind, (src, dst) in enumerate(
+                        ((word_buf, word_out), (scale_buf, scale_out))
+                    ):
+                        copy = pltpu.make_async_copy(
+                            src.at[slot, stream],
+                            dst.at[pl.ds(offset, lanes)],
+                            write_sem.at[slot, stream],
+                        )
+                        if wait:
+                            copy.wait()
+                        else:
+                            copy.start()
+
+            gather(jnp.int32(0))
+            gather(jnp.int32(1))
+
+            def step(index, _):
+                gather(index, wait=True)
+
+                # Slot (index + 2) % 3 last held step index - 1, whose writes
+                # were waited at the end of that step.
+                @pl.when(index + 2 < steps)
+                def prefetch():
+                    gather(index + 2)
+
+                write(index)
+                write(index, wait=True)
+
+            jax.lax.fori_loop(0, steps, step, None)
+
+        pltpu.emit_pipeline(
+            outer,
+            grid=((count + padding) // block,),
+            in_specs=(
+                pl.BlockSpec((lanes * subchunks,), lambda b: (b * cores + core,)),
+            ),
+        )(ids_ref)
+
+    out, scale_out = cast(
+        tuple[jax.Array, jax.Array],
+        pl.kernel(
+            kernel,
+            out_type=(
+                jax.ShapeDtypeStruct((count + padding, 128), jnp.int32),
+                jax.ShapeDtypeStruct((count + padding,), jnp.float32),
+            ),
+            scratch_types=(
+                pltpu.VMEM((slots, streams, lanes, 128), jnp.int32),
+                pltpu.VMEM((slots, streams, lanes), jnp.float32),
+                pltpu.SemaphoreType.DMA((slots, streams)),
+                pltpu.SemaphoreType.DMA((slots, streams)),
+            ),
+            compiler_params=pltpu.CompilerParams(
+                use_tc_tiling_on_sc=False,
+                needs_layout_passes=True,
+                disable_bounds_checks=True,
+            ),
+            mesh=mesh,
+            name="csa2_banked_word_scale_gather",
+        )(
+            words,
+            # pyrefly: ignore[bad-argument-count]
+            scales,
+            zero_words,
+            zero_scales,
+            indices,
+        ),
+    )
+    return out[:count].reshape(*records.shape, 128), scale_out[:count].reshape(
+        records.shape
+    )
+
+
 @functools.partial(jax.jit, donate_argnums=(0, 1))
 def publish_csa2_kv(
     words: jax.Array | tuple[jax.Array, jax.Array],
@@ -324,17 +496,36 @@ def publish_csa2_kv(
     return (out_words, out_scales) if banked else (out_words[0], out_scales[0])
 
 
-def _requests(starts: jax.Array, tokens: int) -> jax.Array:
-    return jnp.repeat(
-        jnp.arange(starts.shape[0] - 1, dtype=jnp.int32),
-        starts[1:] - starts[:-1],
-        total_repeat_length=tokens,
-    )
+def _requests(starts: jax.Array, tokens: int, *, onehot: bool) -> jax.Array:
+    """Request of each of ``tokens`` rows under contiguous ``starts`` [R + 1],
+    padded with the last request past ``starts[-1]`` as ``jnp.repeat`` pads.
+
+    ``onehot`` compares every row against all request ends in one vector op;
+    the repeat lowers to a gather from a short table, which XLA:TPU expands
+    into a select chain over scalar operands.
+    """
+    requests = starts.shape[0] - 1
+    if not onehot:
+        return jnp.repeat(
+            jnp.arange(requests, dtype=jnp.int32),
+            starts[1:] - starts[:-1],
+            total_repeat_length=tokens,
+        )
+    ends = starts[1:] - starts[0]
+    rows = jnp.arange(tokens, dtype=ends.dtype)
+    count = jnp.sum(ends[None, :] <= rows[:, None], axis=1, dtype=jnp.int32)
+    return jnp.minimum(count, requests - 1)
 
 
 @functools.partial(
     jax.jit,
-    static_argnames=("page_size", "page_stride", "row_offset", "non_causal"),
+    static_argnames=(
+        "page_size",
+        "page_stride",
+        "row_offset",
+        "non_causal",
+        "onehot_requests",
+    ),
 )
 def prepare_swa_metadata(
     block_table: jax.Array,
@@ -346,6 +537,7 @@ def prepare_swa_metadata(
     page_stride: int,
     row_offset: int,
     non_causal: bool = False,
+    onehot_requests: bool = False,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Return request page metadata, explicit bounds, and physical write records.
 
@@ -356,6 +548,84 @@ def prepare_swa_metadata(
     Bounds are passed to csa2 ONLY for noncausal calls; causal visibility stays
     query-dependent. Padding records are -1. Empty requests have empty bounds.
     """
+    return _swa_metadata(
+        block_table,
+        starts,
+        positions,
+        minimum_visible,
+        page_size=page_size,
+        page_stride=page_stride,
+        row_offset=row_offset,
+        non_causal=non_causal,
+        onehot_requests=onehot_requests,
+    )[:3]
+
+
+@functools.partial(
+    jax.jit,
+    static_argnames=("page_size", "page_stride", "non_causal", "onehot_requests"),
+)
+def prepare_swa_metadata_base(
+    block_table: jax.Array,
+    starts: jax.Array,
+    positions: jax.Array,
+    minimum_visible: jax.Array,
+    *,
+    page_size: int,
+    page_stride: int,
+    non_causal: bool = False,
+    onehot_requests: bool = False,
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
+    """``prepare_swa_metadata`` at row offset 0, plus the INT32 page visibility
+    [B, C] and token validity [T] that ``offset_swa_metadata`` needs.
+
+    Layers sharing a block table differ only in their row offset, so one call
+    serves every layer of a stage.
+    """
+    return _swa_metadata(
+        block_table,
+        starts,
+        positions,
+        minimum_visible,
+        page_size=page_size,
+        page_stride=page_stride,
+        row_offset=0,
+        non_causal=non_causal,
+        onehot_requests=onehot_requests,
+    )
+
+
+@functools.partial(jax.jit, static_argnames=("page_size", "row_offset"))
+def offset_swa_metadata(
+    metadata: jax.Array,
+    visible: jax.Array,
+    records: jax.Array,
+    valid: jax.Array,
+    *,
+    page_size: int,
+    row_offset: int,
+) -> tuple[jax.Array, jax.Array]:
+    """Shift ``prepare_swa_metadata_base`` outputs to ``row_offset``: equal to
+    ``prepare_swa_metadata(..., row_offset=row_offset)``'s metadata and records."""
+    if row_offset % page_size:
+        raise ValueError("CSA2 requires whole-page SWA row offsets")
+    pages = jnp.where(visible != 0, metadata[:, 2:] + row_offset // page_size, 0)
+    shifted = jnp.where(valid != 0, records + row_offset, -1)
+    return jnp.concatenate((metadata[:, :2], pages), axis=1), shifted
+
+
+def _swa_metadata(
+    block_table,
+    starts,
+    positions,
+    minimum_visible,
+    *,
+    page_size,
+    page_stride,
+    row_offset,
+    non_causal,
+    onehot_requests,
+):
     tokens = positions.shape[0]
     requests = block_table.shape[0]
     if (
@@ -397,22 +667,30 @@ def prepare_swa_metadata(
         ),
         axis=1,
     ).astype(jnp.int32)
-    req = _requests(starts, tokens)
+    req = _requests(starts, tokens, onehot=onehot_requests)
     current_blocks = block_table[
         req, jnp.minimum(positions // page_size, block_table.shape[1] - 1)
     ]
     records = row_offset + current_blocks * page_stride + positions % page_size
-    records = jnp.where(jnp.arange(tokens) < starts[-1], records, -1)
-    return metadata, jnp.stack((left, right), axis=1), records.astype(jnp.int32)
+    valid = jnp.arange(tokens) < starts[-1]
+    records = jnp.where(valid, records, -1)
+    return (
+        metadata,
+        jnp.stack((left, right), axis=1),
+        records.astype(jnp.int32),
+        visible.astype(jnp.int32),
+        valid.astype(jnp.int32),
+    )
 
 
-@functools.partial(jax.jit, static_argnames=("page_size",))
+@functools.partial(jax.jit, static_argnames=("page_size", "onehot_requests"))
 def prepare_main_records(
     selected: jax.Array,
     physical_pages: jax.Array,
     starts: jax.Array,
     *,
     page_size: int,
+    onehot_requests: bool = False,
 ) -> tuple[jax.Array, jax.Array]:
     """Resolve already-compacted logical selections; preserve stage gather reuse.
 
@@ -424,7 +702,7 @@ def prepare_main_records(
     if selected.ndim != 2 or selected.shape[1] > 512 or page_size < 1:
         raise ValueError("CSA2 main selection width must be at most 512")
     tokens, width = selected.shape
-    req = _requests(starts, tokens)
+    req = _requests(starts, tokens, onehot=onehot_requests)
     valid = (selected >= 0) & (jnp.arange(tokens)[:, None] < starts[-1])
     logical = jnp.maximum(selected, 0)
     if jax.default_backend() == "tpu":

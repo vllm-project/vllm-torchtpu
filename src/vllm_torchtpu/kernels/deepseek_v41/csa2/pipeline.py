@@ -27,7 +27,15 @@ def csa2_gather_chunk_size(num_tokens: int) -> int:
 
 
 @functools.partial(
-    jax.jit, static_argnames=("chunk_size", "bq", "scale", "compress_ratio")
+    jax.jit,
+    static_argnames=(
+        "chunk_size",
+        "bq",
+        "scale",
+        "compress_ratio",
+        "early_gather",
+        "deep_gather",
+    ),
 )
 def csa2_pipeline(
     q: jax.Array,
@@ -47,6 +55,8 @@ def csa2_pipeline(
     bq: int,
     scale: float,
     compress_ratio: int,
+    early_gather: bool = False,
+    deep_gather: bool = False,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Return attention and contiguous gathered KV for subsequent layer reuse.
 
@@ -61,6 +71,12 @@ def csa2_pipeline(
     chunks are still joined.
     Only query boundaries become chunk-relative; SWA metadata and noncausal
     bounds retain their absolute positions, including future draft tokens.
+
+    ``early_gather`` joins Q and the RoPE table into the first gather's
+    barrier. Their producers do not depend on the gather, so the scheduler can
+    run them while the first gather is in flight instead of after it.
+    ``deep_gather`` selects the three-slot SparseCore gather
+    (``gather_csa2_kv_sc(deep=True)``).
     """
     if chunk_size < 1 or not q.shape[0]:
         raise ValueError("CSA2 pipeline requires nonempty queries and positive chunks")
@@ -74,7 +90,13 @@ def csa2_pipeline(
         bq=bq,
     )
     if q.shape[0] <= chunk_size:
-        gathered_words, gathered_scales = gather_csa2_kv_sc(words, scales, records)
+        gathered_words, gathered_scales = gather_csa2_kv_sc(
+            words, scales, records, deep=deep_gather
+        )
+        if early_gather:
+            gathered_words, gathered_scales, q, rope = jax.lax.optimization_barrier(
+                (gathered_words, gathered_scales, q, rope)
+            )
         output = csa2(
             q,
             gathered_words,
@@ -96,7 +118,7 @@ def csa2_pipeline(
     # the two in-place writers stay disjoint.
     owners = None
     previous = None
-    current = gather_csa2_kv_sc(words, scales, records[:chunk_size])
+    current = gather_csa2_kv_sc(words, scales, records[:chunk_size], deep=deep_gather)
     for offset in range(0, q.shape[0], chunk_size):
         end = min(offset + chunk_size, q.shape[0])
         next_ids = records[end : end + chunk_size]
@@ -109,9 +131,16 @@ def csa2_pipeline(
         elif end < q.shape[0]:
             # Otherwise the scheduler can gather chunk 1 before chunk 0 and
             # wait for both before starting the first attention invocation.
-            current, next_ids = jax.lax.optimization_barrier((current, next_ids))
+            if early_gather:
+                current, next_ids, q, rope = jax.lax.optimization_barrier(
+                    (current, next_ids, q, rope)
+                )
+            else:
+                current, next_ids = jax.lax.optimization_barrier((current, next_ids))
         following = (
-            gather_csa2_kv_sc(words, scales, next_ids) if end < q.shape[0] else None
+            gather_csa2_kv_sc(words, scales, next_ids, deep=deep_gather)
+            if end < q.shape[0]
+            else None
         )
         chunk_words, chunk_scales = current
         scale_chunks.append(chunk_scales)

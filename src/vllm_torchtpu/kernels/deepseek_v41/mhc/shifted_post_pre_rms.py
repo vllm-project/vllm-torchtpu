@@ -65,6 +65,7 @@ def shifted_post_pre_rms(
     constrain_activations_to_hbm: bool = True,
     norm_weight: jax.Array | None = None,
     norm_eps: float = 1e-06,
+    unpadded_gates: bool = False,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
     """Update residuals and collapse with incoming pre; predict gates separately.
 
@@ -77,6 +78,9 @@ def shifted_post_pre_rms(
         (residual [T,M*D], next_post [T,M,1], next_comb [T,M,M],
         value [T,D], next_pre [T,M]). Value includes RMSNorm when
         norm_weight [D] is supplied. Other keyword arguments are JIT-static.
+        ``unpadded_gates`` emits the gates T tokens wide instead of padded to a
+        multiple of 128 (T <= 1024), so that between layers the [T,M] views
+        are transposes of the next call's [M,T] gate inputs, not slices.
     """
     t, d = x.shape
     token_tile = 128 if t % 128 == 0 else 96 if t % 96 == 0 else 32
@@ -452,6 +456,7 @@ def shifted_post_pre_rms(
         hc_sinkhorn_eps=hc_sinkhorn_eps,
         hc_post_mult_value=hc_post_mult_value,
         sinkhorn_repeat=sinkhorn_repeat,
+        tokens=t if unpadded_gates and gate_tokens <= 1024 else None,
     )
     return (residual, new_post[:t, :, None], new_comb[:t], value, new_pre[:t])
 
@@ -479,8 +484,12 @@ def _pre_gates(
     hc_sinkhorn_eps: float = 1e-06,
     hc_post_mult_value: float = 2.0,
     sinkhorn_repeat: int = 20,
+    tokens: int | None = None,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
-    """FP32 gates from logits [M*(M+2),T] and square sums [1,T]; hidden_size=D."""
+    """FP32 gates from logits [M*(M+2),T] and square sums [1,T]; hidden_size=D.
+
+    ``tokens`` (single-block T only) keeps the first ``tokens`` gate columns.
+    """
     mixes, t = mix.shape
     m = math.isqrt(mixes + 1) - 1
     assert m > 0 and mixes == m * (m + 2), "Expected M*(M+2) mix logits"
@@ -493,6 +502,8 @@ def _pre_gates(
     assert mix.dtype == square.dtype == scale.dtype == base.dtype == jnp.float32
     if not isinstance(sinkhorn_repeat, int) or sinkhorn_repeat < 1:
         raise ValueError("sinkhorn_repeat must be a positive static integer")
+    width = t if tokens is None else tokens
+    assert width == t or (block == t and 0 < width < t)
 
     def gate_kernel(mr, sr, scr, br, pre_out, post_out, comb_out):
         mixed = mr[...] * jax.lax.rsqrt(sr[...] / (m * hidden_size) + rms_eps)
@@ -516,9 +527,9 @@ def _pre_gates(
             comb_mix = comb_mix / (
                 jnp.sum(comb_mix, axis=0, keepdims=True) + hc_sinkhorn_eps
             )
-        pre_out[...] = pre_mix
-        post_out[...] = post_mix
-        comb_out[...] = comb_mix
+        pre_out[...] = pre_mix[..., :width]
+        post_out[...] = post_mix[..., :width]
+        comb_out[...] = comb_mix[..., :width]
 
     pre, post, comb = pl.pallas_call(
         gate_kernel,
@@ -530,13 +541,13 @@ def _pre_gates(
             pl.BlockSpec((mixes,), lambda i: (0,)),
         ],
         out_specs=[
-            pl.BlockSpec((m, block), lambda i: (0, i)),
-            pl.BlockSpec((m, block), lambda i: (0, i)),
-            pl.BlockSpec((m, m, block), lambda i: (0, 0, i)),
+            pl.BlockSpec((m, min(block, width)), lambda i: (0, i)),
+            pl.BlockSpec((m, min(block, width)), lambda i: (0, i)),
+            pl.BlockSpec((m, m, min(block, width)), lambda i: (0, 0, i)),
         ],
         out_shape=[
             jax.ShapeDtypeStruct(shape, jnp.float32)
-            for shape in ((m, t), (m, t), (m, m, t))
+            for shape in ((m, width), (m, width), (m, m, width))
         ],
         compiler_params=pltpu.CompilerParams(dimension_semantics=("parallel",)),
     )(mix, square, scale, base)

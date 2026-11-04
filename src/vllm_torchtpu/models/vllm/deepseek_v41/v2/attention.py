@@ -21,10 +21,12 @@ from vllm.models.deepseek_v41 import attention as upstream
 from vllm.models.deepseek_v41 import compressor as compressor_upstream
 from vllm.v1.attention.backends.mla.sparse_swa import DeepseekV4SWACache
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.layers.adapter.linear_common import (
     KEEP_VLLM_LAYOUT_ATTR,
     WEIGHT_FLIPPED_ATTR,
 )
+from vllm_torchtpu.layers.core import table_lookup
 from vllm_torchtpu.utils import synchronize_tensors
 
 from . import csa2_adapter, preprocess_ops
@@ -155,7 +157,7 @@ def _block_table(metadata):
 
 def _token_requests(metadata, positions):
     rows = torch.arange(positions.shape[0], device=positions.device)
-    return torch.bucketize(rows, metadata.query_start_loc[1:], right=True)
+    return table_lookup.bucketize_right(rows, metadata.query_start_loc[1:])
 
 
 def _window_starts():
@@ -166,7 +168,7 @@ def _window_starts():
 def _replayed(metadata, positions, starts, window):
     """Tokens a prefix hit replays: their prefix-cached KV must stay as is."""
     requests = _token_requests(metadata, positions).clamp(max=starts.shape[0] - 1)
-    start = starts[requests]
+    start = table_lookup.take(starts, requests)
     return (start > 0) & (positions >= start) & (positions < start + window)
 
 
@@ -225,8 +227,8 @@ def save_compress_norm(
         cache = state_cache
         rows = torch.arange(kv_score.shape[0], device=kv_score.device)
         requests = token_to_req_indices.long().clamp(max=query_start_loc.numel() - 2)
-        starts = query_start_loc[requests]
-        ends = query_start_loc[requests + 1]
+        starts = table_lookup.take(query_start_loc, requests)
+        ends = table_lookup.take(query_start_loc, requests + 1)
         previous_slots = (
             slot_mapping.clamp(min=0) // capacity * capacity
             + (positions - 1) % capacity
@@ -876,11 +878,12 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
             )
             # A request's first row pools with the ring's stored predecessor;
             # only its last ring-capacity rows are stored.
-            has_prev = rows != starts_loc[requests]
+            has_prev = rows != table_lookup.take(starts_loc, requests)
             slots = _cache_slots(state_cache, state_meta, positions, ring=True)
             previous = _cache_slots(state_cache, state_meta, positions - 1, ring=True)
             stored = (slots >= 0) & (
-                rows >= starts_loc[requests + 1] - state_cache.shape[1]
+                rows
+                >= table_lookup.take(starts_loc, requests + 1) - state_cache.shape[1]
             )
             args += [
                 has_prev[:, None].int(),
@@ -1084,7 +1087,7 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
             if non_causal
             else self.window_size
         )
-        csa2_metadata = csa2_bounds = csa2_write_records = None
+        csa2_metadata = csa2_bounds = csa2_write_records = csa2_swa_base = None
         if self._csa2:
             if not isinstance(swa_cache, PagedCacheRows):
                 raise ValueError("CSA2 requires a native shared word-row cache")
@@ -1096,16 +1099,39 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
             elif (window_starts := _window_starts()) is not None:
                 minimum = window_starts
             minimum = minimum[: swa_table.shape[0]]
+            # With a shared plan, layers differ only in their row offset, which
+            # is applied per layer below; otherwise every offset is its own key.
+            shared_plan = envs.TPU_DEEPSEEK_V41_CSA2_SWA_PLAN
             meta_key = (
                 "csa2_swa",
                 rows_per_page,
                 swa_cache.page_stride,
-                swa_cache.row_offset,
+                None if shared_plan else swa_cache.row_offset,
                 non_causal,
                 self._ced_decoder,
             )
             cached = stage_cache.get(meta_key) if stage_cache is not None else None
-            if cached is None or cached[0] is not swa.block_tables:
+            if shared_plan:
+                if cached is None or cached[0] is not swa.block_tables:
+                    cached = (
+                        swa.block_tables,
+                        csa2_adapter.prepare_swa_base(
+                            swa_table,
+                            swa.query_start_loc,
+                            positions,
+                            minimum,
+                            swa_cache,
+                            non_causal,
+                        ),
+                    )
+                    if stage_cache is not None:
+                        stage_cache[meta_key] = cached
+                csa2_swa_base = cached[1]
+                csa2_bounds = csa2_swa_base[1]
+                csa2_metadata, csa2_write_records = csa2_adapter.offset_swa(
+                    csa2_swa_base, swa_cache
+                )
+            elif cached is None or cached[0] is not swa.block_tables:
                 csa2_metadata, csa2_bounds, csa2_write_records = (
                     csa2_adapter.prepare_swa(
                         swa_table,
@@ -1170,11 +1196,10 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                     pos_rem = positions % rows_per_page
                     if non_causal:
                         req_idx = requests.clamp(max=swa.seq_lens.shape[0] - 1)
-                        end_pos = swa.seq_lens[req_idx]
-                        query_len = (
-                            swa.query_start_loc[req_idx + 1]
-                            - swa.query_start_loc[req_idx]
-                        )
+                        end_pos = table_lookup.take(swa.seq_lens, req_idx)
+                        query_len = table_lookup.take(
+                            swa.query_start_loc, req_idx + 1
+                        ) - table_lookup.take(swa.query_start_loc, req_idx)
                         prefix_len = (end_pos - query_len).clamp(min=0)
                         start_pos = (prefix_len - self.window_size).clamp(min=0)
                         logical = (
@@ -1201,7 +1226,8 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                             "deepseek_v41_replay_starts"
                         ]
                         base_valid_window = base_valid_window & (
-                            logical >= replay_starts[requests, None]
+                            logical
+                            >= table_lookup.take(replay_starts, requests)[:, None]
                         )
                     if use_3page_swa:
                         safe = logical.clamp(
@@ -1302,10 +1328,10 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                 )
                 if non_causal and swa.seq_lens.numel() > 0:
                     req_idx = requests.clamp(max=swa.seq_lens.shape[0] - 1)
-                    end_pos = swa.seq_lens[req_idx]
-                    query_len = (
-                        swa.query_start_loc[req_idx + 1] - swa.query_start_loc[req_idx]
-                    )
+                    end_pos = table_lookup.take(swa.seq_lens, req_idx)
+                    query_len = table_lookup.take(
+                        swa.query_start_loc, req_idx + 1
+                    ) - table_lookup.take(swa.query_start_loc, req_idx)
                     prefix_len = (end_pos - query_len).clamp(min=0)
                     start_pos = (prefix_len - self.window_size).clamp(min=0)
                     logical = (
@@ -1332,7 +1358,7 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                         "deepseek_v41_replay_starts"
                     ]
                     valid_window = valid_window & (
-                        logical >= replay_starts[requests, None]
+                        logical >= table_lookup.take(replay_starts, requests)[:, None]
                     )
                 raw_row_slots = (
                     _row_slots(swa_cache, swa_table, requests, logical)
@@ -1350,7 +1376,10 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
             if not self._ced_decoder and (starts := _window_starts()) is not None:
                 # Apply before records are built, including the tiled/local-Q path.
                 valid_window = valid_window & (
-                    logical >= starts[requests.clamp(max=starts.shape[0] - 1), None]
+                    logical
+                    >= table_lookup.take(
+                        starts, requests.clamp(max=starts.shape[0] - 1)
+                    )[:, None]
                 )
             records = (
                 (
@@ -1402,7 +1431,14 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
             kv = self._rotate(kv, positions)
         if self._csa2:
             assert csa2_write_records is not None
-            csa2_adapter.publish_swa(swa_cache, csa2_write_records, kv.reshape(-1, 512))
+            if csa2_swa_base is not None:
+                csa2_adapter.publish_swa_planned(
+                    swa_cache, csa2_swa_base[5:], kv.reshape(-1, 512)
+                )
+            else:
+                csa2_adapter.publish_swa(
+                    swa_cache, csa2_write_records, kv.reshape(-1, 512)
+                )
         else:
             _insert(swa_cache, swa_slots, kv, swa_valid)
         weights = None
@@ -2120,10 +2156,37 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                 "(TP1, FP8 KV) " + "; ".join(problems)
             )
 
+    def _check_fusable_wo_b(self):
+        """wo_b must be what the fused op computes: unsharded per-channel FP8 (k, n)."""
+        layer = self.wo_b
+        scale = getattr(layer, "weight_scale", None)
+        if not (
+            getattr(layer, WEIGHT_FLIPPED_ATTR, False)
+            and layer.weight.dtype == torch.float8_e4m3fn
+            and scale is not None
+            and scale.dtype == torch.float32
+            and scale.shape == (layer.weight.shape[1],)
+            and getattr(layer, "bias", None) is None
+            and getattr(layer, "tp_size", 1) == 1
+        ):
+            raise NotImplementedError(
+                f"{self.prefix}: TPU_DEEPSEEK_V41_FUSED_WO_AB needs an unsharded, "
+                "bias-free, per-channel FP8 wo_b in (k, n) layout"
+            )
+
     def _o_proj(self, output, positions):
         assert output.dtype == torch.bfloat16
         assert output.shape[1:] == (self.n_local_heads, self.head_dim)
         if self._csa2:
+            if envs.TPU_DEEPSEEK_V41_FUSED_WO_AB:
+                self._check_fusable_wo_b()
+                return csa2_adapter.project_wo(
+                    output,
+                    self.wo_a.weight,
+                    self.wo_a.weight_scale,
+                    self.wo_b.weight,
+                    self.wo_b.weight_scale,
+                )
             projected = csa2_adapter.project(
                 output, self.wo_a.weight, self.wo_a.weight_scale
             )
