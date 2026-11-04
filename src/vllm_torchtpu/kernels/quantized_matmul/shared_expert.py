@@ -91,6 +91,16 @@ def silu_and_mul_with_clamp(gate, up, limit):
     return (gate * sig.astype(gate.dtype)) * up
 
 
+def _silu_and_mul_with_clamp_f32(gate, up, limit):
+    """`silu_and_mul_with_clamp` as XLA computes it inside one fusion: the bf16
+    roundings between its elementwise ops are dropped (excess precision), so
+    only the result is rounded."""
+    gate = jnp.minimum(gate, jnp.asarray(limit, gate.dtype)).astype(jnp.float32)
+    up = jnp.clip(up, jnp.asarray(-limit, up.dtype), jnp.asarray(limit, up.dtype))
+    sig = 1.0 / (jnp.exp(-gate) + 1.0)
+    return ((gate * sig) * up.astype(jnp.float32)).astype(up.dtype)
+
+
 def _kernel(
     x,
     w13,
@@ -121,6 +131,7 @@ def _kernel(
     width,
     down_width,
     depth,
+    split,
     quant_rows,
     limit,
 ):
@@ -129,28 +140,29 @@ def _kernel(
     n_down = w2.shape[1] // down_width
     n_stream = n_up + n_down
 
-    # One weight stream, gate/up windows then down windows, `depth` deep.
+    # One weight stream, gate/up windows then down windows, `depth` deep; each
+    # window moves as `split` row-chunk DMAs so more descriptors are in flight.
+    def chunks(src, dst, sem):
+        rows = src.shape[0] // split
+        return tuple(
+            pltpu.make_async_copy(
+                src.at[pl.ds(c * rows, rows)], dst.at[pl.ds(c * rows, rows)], sem
+            )
+            for c in range(split)
+        )
+
     def stream(i):
         if i < n_up:
             slot = i % depth
-            return (
-                pltpu.make_async_copy(
-                    w13.at[:, pl.ds(i * width, width)], gb.at[slot], gsem.at[slot]
-                ),
-                pltpu.make_async_copy(
-                    w13.at[:, pl.ds(inter + i * width, width)],
-                    ub.at[slot],
-                    usem.at[slot],
-                ),
+            return chunks(
+                w13.at[:, pl.ds(i * width, width)], gb.at[slot], gsem.at[slot]
+            ) + chunks(
+                w13.at[:, pl.ds(inter + i * width, width)], ub.at[slot], usem.at[slot]
             )
         j = i - n_up
         slot = j % depth
-        return (
-            pltpu.make_async_copy(
-                w2.at[:, pl.ds(j * down_width, down_width)],
-                w2b.at[slot],
-                w2sem.at[slot],
-            ),
+        return chunks(
+            w2.at[:, pl.ds(j * down_width, down_width)], w2b.at[slot], w2sem.at[slot]
         )
 
     def start(i):
@@ -199,7 +211,7 @@ def _kernel(
                 )
                 z = (z * xs[...]) * s13b[pl.ds(col, width)][None, :]
                 zs.append(z.astype(x.dtype))
-            a = silu_and_mul_with_clamp(*zs, limit)
+            a = _silu_and_mul_with_clamp_f32(*zs, limit)
             h[:, pl.ds(i * width, width)] = a
             m = jnp.max(jnp.abs(a.astype(jnp.float32)), axis=1, keepdims=True)
             hmax[...] = m if i == 0 else jnp.maximum(hmax[...], m)
@@ -243,14 +255,14 @@ def fused_shared_expert(
     s2: jax.Array,
     *,
     limit: float,
-    tuning: tuple[int, int, int, int, int] | None = None,
+    tuning: tuple[int, int, int, int, int, int] | None = None,
 ) -> jax.Array:
     """``down(silu_and_mul_with_clamp(gate_up(x)))`` for per-channel FP8 weights.
 
     `w13` is the merged gate/up weight `[k, 2 * inter]` (gate columns first),
     `w2` the down weight `[inter, k]`, both (k, n) with per-output-channel f32
-    scales. `tuning` = (width, down_width, depth, quant_rows, vmem_bytes)
-    overrides the table (for measurement only).
+    scales. `tuning` = (width, down_width, depth, split, quant_rows,
+    vmem_bytes) overrides the table (for measurement only).
     """
     if not is_supported(x, w13, s13, w2, s2):
         raise ValueError("Fused shared expert requires qualified v7 decode inputs")
@@ -258,8 +270,8 @@ def fused_shared_expert(
     inter = w2.shape[0]
     if tuning is None:
         tuning = SHARED_EXPERT_TUNING[(get_tpu_version(), t, k, inter)]
-    width, down_width, depth, quant_rows, vmem_budget = tuning
-    if inter % width or k % down_width:
+    width, down_width, depth, split, quant_rows, vmem_budget = tuning
+    if inter % width or k % down_width or inter % split or k % split:
         raise ValueError(f"{tuning=} does not tile {inter=} / {k=}")
     x, w13, s13, w2, s2 = (
         pltpu.with_memory_space_constraint(a, pltpu.HBM) for a in (x, w13, s13, w2, s2)
@@ -270,6 +282,7 @@ def fused_shared_expert(
             width=width,
             down_width=down_width,
             depth=depth,
+            split=split,
             quant_rows=quant_rows,
             limit=limit,
         ),

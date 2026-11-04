@@ -54,6 +54,7 @@ def test_envelope_rejects_other_dims(monkeypatch):
 
 @pytest.fixture(scope="module")
 def compiled():
+    from vllm.config import VllmConfig, set_current_vllm_config
     from vllm.model_executor.layers.activation import SiluAndMulWithClamp
 
     from vllm_torchtpu.layers.adapter.linear_common import (
@@ -61,13 +62,18 @@ def compiled():
         quantized_matmul,
     )
 
-    act = SiluAndMulWithClamp(LIMIT)
+    with set_current_vllm_config(VllmConfig()):
+        act = SiluAndMulWithClamp(LIMIT)
 
-    def both(x, w13, s13, w2, s2):
+    def both(x, w13, s13, w2, s2, routed, mask):
+        # The served layer adds the masked, scaled routed output to the shared
+        # expert's result, and XLA fuses that add with the down projection.
+        routed = torch.where(mask[:, None], routed, 0) * 1.5
         reference = quantized_matmul(
             act.forward_native(quantized_matmul(x, w13, s13)), w2, s2
         )
-        return reference, fp8_swiglu_mlp(x, w13, s13, w2, s2, LIMIT)
+        actual = fp8_swiglu_mlp(x, w13, s13, w2, s2, LIMIT)
+        return reference, actual, reference + routed, actual + routed
 
     return torch.compile(both, backend="tpu", fullgraph=True)
 
@@ -110,7 +116,15 @@ def test_fused_shared_expert_is_bitwise_equal(compiled, tokens, pattern, seed):
     elif pattern == "mixed":
         x *= torch.rand(tokens, 1, generator=gen).mul(8).sub(4).exp()
         x[:16] = 0
-    reference, actual = compiled(x.to(torch.bfloat16).to("tpu"), *_weights(seed))
-    reference, actual = reference.cpu(), actual.cpu()
+    routed = torch.randn(tokens, HIDDEN, generator=gen).mul(3).to(torch.bfloat16)
+    mask = torch.rand(tokens, generator=gen) > 0.05
+    outs = compiled(
+        x.to(torch.bfloat16).to("tpu"),
+        *_weights(seed),
+        routed.to("tpu"),
+        mask.to("tpu"),
+    )
+    reference, actual, ref_layer, actual_layer = (t.cpu() for t in outs)
     assert torch.isfinite(actual).all()
     assert torch.equal(reference.view(torch.int16), actual.view(torch.int16))
+    assert torch.equal(ref_layer.view(torch.int16), actual_layer.view(torch.int16))
