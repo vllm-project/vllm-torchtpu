@@ -20,6 +20,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
+from vllm_torchtpu.megakernel.errors import MegakernelConfigError
 from vllm_torchtpu.megakernel.ops import (
     BF16,
     F32,
@@ -147,6 +148,10 @@ def test_col_chunk():
     assert col_chunk(1536, 1024) == 768
     assert col_chunk(2048, 1024) == 1024
     assert col_chunk(1024, 384) == 256
+    assert col_chunk(1024, 128) == 128
     for bad in (0, -128, 100, 192):
         with pytest.raises(ValueError, match="positive multiple of 128"):
             col_chunk(bad)
+    for bad_cap in (127, 64, 0, -128):
+        with pytest.raises(MegakernelConfigError, match="cap="):
+            col_chunk(512, bad_cap)
