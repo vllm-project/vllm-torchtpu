@@ -40,7 +40,11 @@ class TokenPaddingState:
         self.local_padding_mask.copy_(host)
 
     def get_local_padding_mask(self, num_tokens: int) -> torch.Tensor:
-        return self.local_padding_mask[:num_tokens]
+        # A gather, not a slice: slicing the max-sized buffer guards
+        # num_tokens <= its length, which pins a trace taken at the largest
+        # bucket to that one size (ConstraintViolationError on the token dim).
+        rows = torch.arange(num_tokens, device=self.local_padding_mask.device)
+        return self.local_padding_mask.index_select(0, rows)
 
 
 def set_padding_state(state: "TokenPaddingState | None") -> None:
