@@ -1055,7 +1055,7 @@ class VllmTPUMLAAttention(MLAAttention):
                 delattr(self.kv_b_proj, key)
 
         if self.W_UK_T.device.type == "tpu":
-            tensors = [self.W_UK_T, self.W_UV]
+            tensors: list[torch.Tensor] = [self.W_UK_T, self.W_UV]
             if hasattr(self, "W_UK_T_scale"):
                 tensors.extend([self.W_UK_T_scale, self.W_UV_scale])
             tensors.extend(
