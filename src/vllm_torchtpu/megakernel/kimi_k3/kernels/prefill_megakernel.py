@@ -5118,9 +5118,10 @@ def expert_chunk_starts():
     starts, bank, layer = {}, 0, 0
     for count in counts:
         size = sum(banks[bank:bank + count])
-        if size in starts:
+        if size in starts and size not in (1, 8):
             raise ValueError("prefill_expert_chunks needs distinct chunk sizes")
-        starts[size] = layer
+        if size not in (1, 8):  # single banks keep their own slot rule
+            starts[size] = layer
         bank += count
         layer += size
     return starts
@@ -5133,7 +5134,7 @@ def expert_family_slot(family_count, slot):
     into banks; the legacy complete family and replay-only shapes stay global.
     """
     starts = expert_chunk_starts()
-    if starts:
+    if family_count in starts:
         return slot - starts[family_count]
     if family_count == 8:
         return (slot - 3) % 8
