@@ -16,6 +16,7 @@ types, and the framework-free import of `megakernel.runtime`."""
 
 from __future__ import annotations
 
+import dataclasses
 import subprocess
 import sys
 from pathlib import Path
@@ -58,6 +59,42 @@ def test_spec_validates_and_normalizes() -> None:
 def test_invalid_spec_fields_raise(kw: dict[str, Any], match: str) -> None:
     with pytest.raises(errors.MegakernelConfigError, match=match):
         _spec(**kw)
+
+
+@pytest.mark.parametrize(
+    "field", ["chips", "tp_sizes", "parallelism", "features", "decline_codes"]
+)
+def test_bare_string_for_a_tuple_field_raises(field: str) -> None:
+    # "TPU7x" must not split into characters ("T" would match every TPU).
+    with pytest.raises(errors.MegakernelConfigError, match=f"{field} must be a tuple"):
+        _spec(**{field: "TPU7x"})
+    with pytest.raises(errors.MegakernelConfigError, match=f"{field} must be a tuple"):
+        _spec(**{field: 4})
+
+
+def test_tuple_fields_keep_whole_items() -> None:
+    spec = _spec(chips=["TPU7x"], tp_sizes=[4, "8"], decline_codes=["a"])
+    assert spec.chips == ("TPU7x",) and spec.tp_sizes == (4, 8)
+    assert spec.decline_codes == ("a",)
+
+
+def test_requires_is_frozen_and_lowercase() -> None:
+    src = {"mamba_ssm_cache_dtype": "BFloat16", "enable_prefix_caching": False}
+    spec = _spec(requires=src)
+    assert spec.requires == {
+        "enable_prefix_caching": "false",
+        "mamba_ssm_cache_dtype": "bfloat16",
+    }
+    assert list(spec.requires) == sorted(src)
+    with pytest.raises(TypeError):
+        spec.requires["block_size"] = "16"  # type: ignore[index]
+    src["block_size"] = 16  # the caller's dict is copied, not aliased
+    assert "block_size" not in spec.requires
+    assert dataclasses.replace(spec, requires={}).requires == {}
+    with pytest.raises(
+        errors.MegakernelConfigError, match="requires must be a mapping"
+    ):
+        _spec(requires=[("block_size", "16")])
 
 
 def test_decline_types_and_one_eligibility_result() -> None:

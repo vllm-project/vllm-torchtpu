@@ -23,7 +23,8 @@ imports no jax / torch / vLLM.
 from __future__ import annotations
 
 import dataclasses
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
+from types import MappingProxyType
 from typing import Any, Protocol
 
 from ..errors import MegakernelConfigError, MegakernelLayoutError
@@ -241,8 +242,15 @@ class MonoProgram(Protocol):
     def forward(self, decision: StepDecision | None, ctx: Any, fwd: Any) -> Any: ...
 
 
-def _frozen_strs(values: Any) -> frozenset[str]:
-    return frozenset(str(v) for v in values)
+def _items(where: str, field: str, values: Any) -> tuple[Any, ...]:
+    # A bare string is a common slip for a one-item tuple (`chips="TPU7x"`
+    # would otherwise split into characters, and "T" matches every TPU).
+    if isinstance(values, (str, bytes)) or not isinstance(values, Iterable):
+        raise MegakernelConfigError(
+            f"{where}: {field} must be a tuple / set of items, not "
+            f"{values!r}; write ({values!r},) for one item"
+        )
+    return tuple(values)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -258,8 +266,10 @@ class TpuMonoSpec:
     only, no collective): `chips` (device_kind prefixes; `()` = any),
     `tp_sizes` (`()` = any), `parallelism` (kinds served; "tp" is required),
     `features` (framework features served) and `requires` (server settings,
-    keys from `REQUIRES_KEYS`). `numerics` ("exact" | "approx", of the
-    default profile) is logged and part of the fingerprint, not a gate.
+    keys from `REQUIRES_KEYS`; stored read-only, values lowercase). The
+    tuple / set fields take a sequence of items; a bare string is an error.
+    `numerics` ("exact" | "approx", of the default profile) is logged and part
+    of the fingerprint, not a gate.
     `collective_domain` names the ranks the kernel's collectives span (see
     `COLLECTIVE_DOMAINS`); the runtime's agreements run over that group.
     """
@@ -285,13 +295,20 @@ class TpuMonoSpec:
 
         if not isinstance(self.name, str) or not self.name:
             raise MegakernelConfigError("TpuMonoSpec.name must be non-empty")
-        fix("chips", tuple(str(c) for c in self.chips))
-        fix("tp_sizes", tuple(int(t) for t in self.tp_sizes))
-        fix("parallelism", _frozen_strs(self.parallelism))
-        fix("features", _frozen_strs(self.features))
-        fix("requires", {str(k): str(v) for k, v in dict(self.requires).items()})
-        fix("decline_codes", tuple(self.decline_codes))
         where = f"TpuMonoSpec {self.name!r}"
+        fix("chips", tuple(str(c) for c in _items(where, "chips", self.chips)))
+        fix("tp_sizes", tuple(int(t) for t in _items(where, "tp_sizes", self.tp_sizes)))
+        for field in ("parallelism", "features"):
+            values = _items(where, field, getattr(self, field))
+            fix(field, frozenset(str(v) for v in values))
+        fix("decline_codes", _items(where, "decline_codes", self.decline_codes))
+        if not isinstance(self.requires, Mapping):
+            raise MegakernelConfigError(
+                f"{where}: requires must be a mapping, not {self.requires!r}"
+            )
+        # Read-only, keys sorted, values lowercase (as the runtime compares them).
+        requires = {str(k): str(v).lower() for k, v in self.requires.items()}
+        fix("requires", MappingProxyType(dict(sorted(requires.items()))))
         if unknown := sorted(self.features - FEATURES):
             raise MegakernelConfigError(
                 f"{where}: unknown features {unknown}; known: {sorted(FEATURES)}"
