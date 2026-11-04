@@ -21,7 +21,7 @@ import numpy as np
 import pytest
 
 from tests.models.minimax_m3.packing import CACHE_DTYPES, pack, rounded, unpack
-from vllm_torchtpu.models.minimax_m3.kernels import msa, msa_indexer
+from vllm_torchtpu.models.minimax_m3.kernels import msa, msa_indexer, msa_select
 
 BLOCK = 16
 HEAD_DIM = 128
@@ -170,15 +170,36 @@ def test_msa_forward_matches_dense_reference(
 def test_select_blocks_forces_local_and_pads():
     scores = jnp.array([[[5.0, 1.0, 9.0, 2.0, 7.0]]])
     pos = jnp.array([2 * BLOCK + 3])  # local block 2; blocks 3, 4 not visible
-    picked = msa.select_blocks(
-        scores, pos, block_size=BLOCK, topk=4, init_blocks=0, local_blocks=1
+    picked = msa_select.select_blocks(
+        scores,
+        pos,
+        block_size=BLOCK,
+        topk=4,
+        init_blocks=0,
+        local_blocks=1,
+        block_rows=8,
+        interpret=True,
     )
     np.testing.assert_array_equal(np.asarray(picked), [[[0, 1, 2, -1]]])
-    picked = msa.select_blocks(
-        scores, pos, block_size=BLOCK, topk=2, init_blocks=0, local_blocks=1
+    picked = msa_select.select_blocks(
+        scores,
+        pos,
+        block_size=BLOCK,
+        topk=2,
+        init_blocks=0,
+        local_blocks=1,
+        block_rows=8,
+        interpret=True,
     )
     np.testing.assert_array_equal(np.asarray(picked), [[[0, 2]]])
-    picked = msa.select_blocks(
-        scores, pos, block_size=BLOCK, topk=2, init_blocks=1, local_blocks=1
+    picked = msa_select.select_blocks(
+        scores,
+        pos,
+        block_size=BLOCK,
+        topk=2,
+        init_blocks=1,
+        local_blocks=1,
+        block_rows=8,
+        interpret=True,
     )
     np.testing.assert_array_equal(np.asarray(picked), [[[0, 2]]])

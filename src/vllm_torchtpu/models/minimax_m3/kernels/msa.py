@@ -23,14 +23,12 @@ runs over the selected blocks only (`msa_attention.msa_sparse_attention`).
 import jax
 import jax.numpy as jnp
 
-from vllm_torchtpu.models.minimax_m3.kernels import msa_indexer
-from vllm_torchtpu.models.minimax_m3.kernels.msa_attention import (
-    msa_sparse_attention,
+from vllm_torchtpu.models.minimax_m3.kernels import (
+    msa_attention,
+    msa_indexer,
+    msa_select,
 )
 
-_NEG_INF = float("-inf")
-_FORCED_LOCAL_SCORE = 1e29
-_FORCED_INIT_SCORE = 1e30
 _DROPPED_PAGE = 2**30
 
 
@@ -79,37 +77,6 @@ def write_rows(
     )
 
 
-def select_blocks(
-    scores: jax.Array,
-    pos: jax.Array,
-    *,
-    block_size: int,
-    topk: int,
-    init_blocks: int,
-    local_blocks: int,
-) -> jax.Array:
-    """Selected logical blocks ``[T, H, topk]``, ascending, ``-1`` padded."""
-    blocks = jnp.arange(scores.shape[-1], dtype=jnp.int32)
-    num_visible = (pos // block_size + 1)[:, None, None]
-    visible = blocks < num_visible
-    s = jnp.where(visible, scores, _NEG_INF)
-    s = jnp.where(
-        visible & (blocks >= num_visible - local_blocks), _FORCED_LOCAL_SCORE, s
-    )
-    s = jnp.where(visible & (blocks < init_blocks), _FORCED_INIT_SCORE, s)
-    # topk rounds of argmax-and-mask: lax.top_k sorts each row on TPU, which
-    # takes tens of ms per layer for an 8K-token chunk over every block.
-    no_block = jnp.iinfo(jnp.int32).max
-    picked = []
-    for _ in range(topk):
-        best = jnp.argmax(s, axis=-1).astype(jnp.int32)
-        found = jnp.max(s, axis=-1) > _NEG_INF
-        picked.append(jnp.where(found, best, no_block))
-        s = jnp.where(blocks == best[..., None], _NEG_INF, s)
-    top_blocks = jnp.sort(jnp.stack(picked, axis=-1), axis=-1)
-    return jnp.where(top_blocks == no_block, -1, top_blocks)
-
-
 def sparse_attention(
     q: jax.Array,
     kv_cache: jax.Array,
@@ -134,13 +101,15 @@ def sparse_attention(
     selected = selected[:, 0]
     pages = block_tables_2d[seq_id[:, None], jnp.maximum(selected, 0)]
     pages = jnp.where((selected >= 0) & valid[:, None], pages, -1)
-    return msa_sparse_attention(
+    return msa_attention.msa_sparse_attention(
         q,
         kv_cache,
         pages,
         jnp.where(valid, token_pages, -1),
         pos % block_size + 1,
         sm_scale=sm_scale,
+        block_q=msa_attention.DEFAULT_BLOCK_Q,
+        pages_per_step=msa_attention.DEFAULT_PAGES_PER_STEP,
         interpret=interpret,
     )
 
@@ -193,13 +162,14 @@ def msa_forward(
         pages_per_step=msa_indexer.DEFAULT_PAGES_PER_STEP,
         interpret=interpret,
     )
-    selected = select_blocks(
+    selected = msa_select.select_blocks(
         scores,
         pos,
         block_size=block_size,
         topk=topk,
         init_blocks=init_blocks,
         local_blocks=local_blocks,
+        interpret=interpret,
     )
     out = sparse_attention(
         q,
