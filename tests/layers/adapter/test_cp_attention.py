@@ -200,3 +200,31 @@ def test_dcp_hnd_rejects_backends_that_allocate_nhd(
         pytest.raises(NotImplementedError, match="DCP with HND requires"),
     ):
         impl.initialize_kernel(layer)
+
+
+@pytest.mark.parametrize(
+    "page_size,pages_per_seq,decode_query_size,columns",
+    [
+        (128, 4104, 1, 4096),  # 1M tokens, DCP2: 1152-token blocks round up
+        (128, 4104, 4, 4104),  # verify window may reach column 4096: keep all
+        (256, 2048, 1, 2048),  # already exact
+    ],
+)
+def test_dcp_block_table_keeps_the_rank_local_columns(
+    page_size, pages_per_seq, decode_query_size, columns
+):
+    import jax.numpy as jnp
+
+    num_seqs = 3
+    table = jnp.arange(num_seqs * pages_per_seq, dtype=jnp.int32)
+    local = cp_attention._rank_local_block_tables(
+        table,
+        num_seqs,
+        page_size,
+        max_model_len=1 << 20,
+        decode_query_size=decode_query_size,
+        cp_group_size=2,
+    )
+    expected = table.reshape(num_seqs, pages_per_seq)[:, :columns].reshape(-1)
+    assert local.shape == (num_seqs * columns,)
+    assert bool(jnp.all(local == expected))
