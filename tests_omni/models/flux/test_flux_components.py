@@ -50,11 +50,13 @@ GQA_ATTN_MAX_REL_L2 = (3.1e-3, 4.1e-3)
 GQA_ATTN_MAX_ABS = (7.2e-3, 1.3e-2)
 LONG_SEQ_ATTN_MAX_REL_L2 = (3.5e-3, 5.4e-3)
 LONG_SEQ_ATTN_MAX_ABS = (6.9e-4, 2.2e-3)
-# FIXME: masked calls take the TPU SDPA path, which currently returns wrong values
-# (fp32 rel_l2 0.60, bf16 NaN), so the masked parity test is a strict xfail. These reuse
-# the standard-attention limits; recalibrate them when the fix removes the xfail.
-MASKED_ATTN_MAX_REL_L2 = STANDARD_ATTN_MAX_REL_L2
-MASKED_ATTN_MAX_ABS = STANDARD_ATTN_MAX_ABS
+# Masked calls run TpuSDPAImpl on the math SDPA backend; torch_tpu's default SDPA
+# lowering returns wrong values for any attn_mask (fp32 rel_l2 0.60, bf16 NaN).
+MASKED_ATTN_MAX_REL_L2 = (3.6e-3, 4.5e-3)
+MASKED_ATTN_MAX_ABS = (8.0e-3, 6.4e-3)
+# Masked TpuSDPAImpl at the LTX-2 Ulysses key-padding shapes, bf16 only.
+MASKED_SDPA_BF16_MAX_REL_L2 = 4.6e-3
+MASKED_SDPA_BF16_MAX_ABS = 1.6e-2
 ROPE_MAX_REL_L2 = (3.9e-8, 2.3e-3)
 ROPE_MAX_ABS = (4.0e-7, 2.8e-2)
 # The RoPE tables are float64 on TPU whatever the configured dtype.
@@ -306,6 +308,63 @@ class TestFluxTpuSDPAAttention:
             max_abs=LONG_SEQ_ATTN_MAX_ABS[limit_index],
         )
 
+    @pytest.mark.parametrize(
+        "batch_size,q_len,kv_len,valid_len,mask_kind",
+        [
+            (1, 128, 128, 126, "2d"),
+            (2, 128, 128, 126, "b11k"),
+            # LTX-2.3 audio_to_video_attn under Ulysses 4: a local video
+            # shard against SP-padded audio keys (126 -> 128).
+            (2, 1536, 128, 126, "b11k"),
+            (2, 1536, 128, 128, "b11k"),
+        ],
+    )
+    def test_masked_sdpa_numeric_parity_on_tpu(
+        self, batch_size, q_len, kv_len, valid_len, mask_kind
+    ):
+        """Masked TpuSDPAImpl matches a float64 masked reference on TPU.
+
+        torch_tpu's default SDPA lowering returned max abs errors of ~2 (and
+        sometimes NaN) for any attn_mask, which blanked LTX-2.3 video and
+        turned its audio into NaN under Ulysses.
+        """
+        torch.manual_seed(7)
+        num_heads, head_size = 32, 64
+        scale = 1.0 / math.sqrt(head_size)
+        impl = TpuSDPAImpl(
+            num_heads=num_heads, head_size=head_size, softmax_scale=scale
+        )
+        query_cpu = torch.randn(
+            batch_size, q_len, num_heads, head_size, dtype=torch.bfloat16
+        )
+        key_cpu = torch.randn(
+            batch_size, kv_len, num_heads, head_size, dtype=torch.bfloat16
+        )
+        value_cpu = torch.randn(
+            batch_size, kv_len, num_heads, head_size, dtype=torch.bfloat16
+        )
+        keep = torch.arange(kv_len) < valid_len
+        keep_2d = keep[None, :].expand(batch_size, -1)
+        mask_cpu = keep_2d if mask_kind == "2d" else keep_2d[:, None, None, :]
+
+        ref_out = _sdpa_reference(
+            query_cpu, key_cpu, value_cpu, scale, key_mask=keep_2d
+        )
+        tpu_out = impl.forward(
+            query_cpu.to("tpu"),
+            key_cpu.to("tpu"),
+            value_cpu.to("tpu"),
+            SimpleNamespace(attn_mask=mask_cpu.to("tpu")),
+        ).cpu()
+        assert torch.all(torch.isfinite(tpu_out))
+        assert_parity(
+            tpu_out,
+            ref_out,
+            name=f"masked TpuSDPAImpl {mask_kind} b{batch_size} q{q_len} kv{kv_len}",
+            max_rel_l2=MASKED_SDPA_BF16_MAX_REL_L2,
+            max_abs=MASKED_SDPA_BF16_MAX_ABS,
+        )
+
     @DTYPES
     def test_flux_masked_attention_falls_back_to_sdpa_on_tpu(
         self, monkeypatch, dtype, limit_index
@@ -349,11 +408,6 @@ class TestFluxTpuSDPAAttention:
             "attn_mask is not None",
         )
 
-    @pytest.mark.xfail(
-        strict=True,
-        raises=AssertionError,
-        reason="Masked SDPA on TPU returns wrong values (fp32 rel_l2 0.60, bf16 NaN)",
-    )
     @DTYPES
     def test_flux_masked_attention_numeric_parity_on_tpu(self, dtype, limit_index):
         """Test masked TpuFlashAttentionImpl output against the float64 reference."""

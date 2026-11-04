@@ -16,7 +16,8 @@
 ``TpuFlashAttentionBackend`` (the default) runs unmasked, non-causal
 bf16 attention through a Pallas flash kernel tuned for diffusion
 sequence lengths. Masked, causal, or non-bf16 calls fall back with a
-one-time warning to ``TpuSDPAImpl`` (PyTorch SDPA).
+one-time warning to ``TpuSDPAImpl`` (PyTorch SDPA). ``TpuSDPAImpl`` runs
+masked calls on the math SDPA backend.
 """
 
 from functools import cache as run_once
@@ -24,6 +25,7 @@ from typing import Any
 
 import jax
 import torch
+from torch.nn.attention import SDPBackend, sdpa_kernel
 from torch_tpu._internal import pallas
 from vllm_omni.diffusion.attention.backends.sdpa import SDPABackend, SDPAImpl
 
@@ -43,9 +45,29 @@ class TpuSDPAImpl(SDPAImpl):
         value: torch.Tensor,
         attn_metadata: Any | None = None,
     ) -> torch.Tensor:
-        return self._forward_impl(
-            query, key, value, attn_metadata, mask_mode="broadcast_k"
-        )
+        if getattr(attn_metadata, "attn_mask", None) is None:
+            return self._forward_impl(
+                query, key, value, attn_metadata, mask_mode="broadcast_k"
+            )
+        # ---------------------------------------------------------------------
+        # TODO: Remove the math-backend pin once torch_tpu's default
+        # scaled_dot_product_attention lowering honours attn_mask.
+        #
+        # Problem: with any attn_mask (bool or float, e.g. a (B, 1, 1, K) key
+        #   padding mask), the default lowering is wrong: max abs error ~2
+        #   against a float64 reference, even for a mask that keeps every key,
+        #   and NaN for some shapes. The math backend matches the reference.
+        # Effect: LTX-2 under Ulysses pads the audio latents to a multiple of
+        #   the SP size and sends a key-padding mask to audio self-attention
+        #   and audio-to-video attention. At per-rank batch >= 2 (LTX-2.3
+        #   multi-guidance at CFG-parallel 2) audio-to-video attention
+        #   produced a NaN row, so the video came out blank and the audio
+        #   NaN; at batch 1 the audio was finite but wrong.
+        # ---------------------------------------------------------------------
+        with sdpa_kernel(SDPBackend.MATH):
+            return self._forward_impl(
+                query, key, value, attn_metadata, mask_mode="broadcast_k"
+            )
 
 
 class TpuSDPABackend(SDPABackend):
