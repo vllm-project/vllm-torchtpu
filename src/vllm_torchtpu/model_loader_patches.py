@@ -72,6 +72,10 @@ logger = init_logger(__name__)
 # (``ffn.experts.<e>.w1.scale``), 47 GiB across all 384 experts.
 _EXPERT_WEIGHT_SUFFIXES = (".weight", ".weight_packed", ".weight_scale", ".scale")
 
+# Set to ``source.is_unused_weight`` while ``DefaultModelLoader._get_weights_iterator``
+# runs, so ``_should_skip_weight_tpu`` skips those tensors before ``get_tensor``.
+_unused_weight_predicate: Callable[[str], bool] | None = None
+
 
 def _should_skip(name: str, local_expert_ids: set[int]) -> bool:
     from vllm.model_executor.model_loader.ep_weight_filter import parse_expert_id
@@ -92,10 +96,16 @@ def _should_skip_weight_tpu(
     Same contract as upstream (``local_expert_ids=None`` means no
     filtering), but the suffix allowlist also covers the compressed-tensors
     MXFP4 ``.weight_packed`` and ``.weight_scale`` names, so non-local
-    experts are skipped before their bytes are read.
+    experts are skipped before their bytes are read. Also skips weights
+    marked unused by the loading model's ``is_unused_checkpoint_weight``.
     """
+    if _unused_weight_predicate is not None and _unused_weight_predicate(weight_name):
+        # Unused by the loading model (e.g. MTP draft). Used tensors still
+        # go through the EP check below.
+        return True
     if local_expert_ids is None:
         return False
+    # EP weight filter: non-local expert.
     return _should_skip(weight_name, local_expert_ids)
 
 
@@ -485,6 +495,13 @@ def patch_default_loader_ep_weight_filter() -> None:
     predicate by value, so both module references are replaced. Inert when
     the EP weight filter is off: ``safetensors_weights_iterator`` then
     passes ``local_expert_ids=None`` and the predicate keeps everything.
+
+    The same predicate also skips tensors the loading model marks unused
+    (``model.is_unused_checkpoint_weight``, e.g. an MTP draft's main-model
+    weights). Upstream only uses that hook to drop whole shards and reads
+    every tensor of the shards it keeps. ``safetensors_weights_iterator``
+    does not take the hook, so ``_get_weights_iterator`` is wrapped to hold
+    it in ``_unused_weight_predicate`` while its iterator runs.
     """
     from vllm.model_executor.model_loader import (
         default_loader,
@@ -527,6 +544,10 @@ def patch_default_loader_ep_weight_filter() -> None:
                 ),
             )
             safetensors_load_strategy = "lazy"
+        elif safetensors_load_strategy is None and _unused_weight_predicate is not None:
+            # Auto mode prefetches whole files on NFS/Lustre, unused tensors
+            # included. Lazy reads only the tensors that are not skipped.
+            safetensors_load_strategy = "lazy"
         return original_iterator(
             hf_weights_files,
             use_tqdm_on_load,
@@ -535,12 +556,35 @@ def patch_default_loader_ep_weight_filter() -> None:
             **kwargs,
         )
 
+    original_get_weights_iterator = (
+        default_loader.DefaultModelLoader._get_weights_iterator
+    )
+
+    @functools.wraps(original_get_weights_iterator)
+    def _get_weights_iterator(self, source):
+        is_unused = source.is_unused_weight
+        if is_unused is None:
+            return original_get_weights_iterator(self, source)
+
+        def _iter_skipping_unused():
+            global _unused_weight_predicate
+            prev = _unused_weight_predicate
+            _unused_weight_predicate = is_unused
+            try:
+                yield from original_get_weights_iterator(self, source)
+            finally:
+                _unused_weight_predicate = prev
+
+        return _iter_skipping_unused()
+
     weight_utils.safetensors_weights_iterator = safetensors_weights_iterator
     default_loader.safetensors_weights_iterator = safetensors_weights_iterator
+    default_loader.DefaultModelLoader._get_weights_iterator = _get_weights_iterator
     weight_utils._tpu_ep_filter_patch = True
     logger.info(
         "Applied TPU patch: EP weight filter covers "
-        ".weight_packed/.weight_scale/.scale, and prefetch reads only "
+        ".weight_packed/.weight_scale/.scale, skips unused checkpoint "
+        "tensors before read, and prefetch reads only "
         "local tensors (DefaultModelLoader)."
     )
 
@@ -869,6 +913,7 @@ class ExpertParamStager:
     def flush_all(self) -> None:
         for param, _ in list(self._staged.values()):
             self.flush(param)
+        self._pool.clear()
 
     def __len__(self) -> int:
         return len(self._staged)
@@ -966,4 +1011,45 @@ def patch_moe_expert_write_staging() -> None:
     logger.info(
         "Applied TPU patch: expert parameters are staged on the host "
         "and written to the device once each."
+    )
+
+
+def patch_default_model_loader_preprocessed() -> None:
+    """Load preprocessed expert and PLE arrays in DefaultModelLoader.load_weights."""
+    from vllm.config import ModelConfig
+    from vllm.model_executor.model_loader import default_loader as dl
+
+    from vllm_torchtpu.model_loader.preprocessed_loader import (
+        load_preprocessed_arrays_into_model,
+        resolve_preprocessed_checkpoint_dir,
+    )
+
+    if getattr(dl.DefaultModelLoader, "_tpu_preprocessed_loader_patch", False):
+        return
+
+    original_load_weights = typing.cast(
+        Callable[..., None], dl.DefaultModelLoader.load_weights
+    )
+
+    @functools.wraps(original_load_weights)
+    def load_weights(self, model: torch.nn.Module, model_config: ModelConfig) -> None:
+        ckpt_dir = resolve_preprocessed_checkpoint_dir(
+            getattr(model_config, "model", None)
+        )
+        if ckpt_dir is None:
+            original_load_weights(self, model, model_config)
+            return
+
+        # Populate RoutedExperts and PLE tables from contiguous raw arrays first
+        # so model.load_weights() verification sees _tpu_preprocessed_loaded=True
+        # and PLE tables ready to finalize.
+        load_preprocessed_arrays_into_model(model, ckpt_dir)
+        has_safetensors = any(ckpt_dir.glob("*.safetensors"))
+        if has_safetensors or str(ckpt_dir) != str(getattr(model_config, "model", "")):
+            original_load_weights(self, model, model_config)
+
+    dl.DefaultModelLoader.load_weights = load_weights
+    dl.DefaultModelLoader._tpu_preprocessed_loader_patch = True
+    logger.info(
+        "Applied TPU patch: DefaultModelLoader supports preprocessed raw arrays."
     )

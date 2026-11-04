@@ -266,6 +266,8 @@ if TYPE_CHECKING:
     VLLM_TPU_SRPT_MAX_CONSECUTIVE_HOLDS: int = 8
     VLLM_TPU_MEGAKERNEL: str = ""
     VLLM_TPU_MK_OWN_OPERANDS: bool = True
+    VLLM_TPU_PREPROCESSED_CHECKPOINT_DIR: str = ""
+    VLLM_TPU_ENABLE_PREPROCESSED_LOADER: bool = True
 
 
 def env_with_choices(
@@ -1619,6 +1621,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # re-materializes a buffer with an in-place slice write or a dtype view on
     # every call (~22 as_strided/step, ~1 ms); exact, so on by default.
     "VLLM_TPU_MK_OWN_OPERANDS": env_bool("VLLM_TPU_MK_OWN_OPERANDS", True),
+    # Optional override directory containing preprocessed raw array directories
+    # (experts/array_*, misc/array_*). When empty, auto-detected from model_config.model.
+    "VLLM_TPU_PREPROCESSED_CHECKPOINT_DIR": env_str(
+        "VLLM_TPU_PREPROCESSED_CHECKPOINT_DIR", ""
+    ),
+    # Enable fast rank-local loading from preprocessed raw array checkpoints.
+    "VLLM_TPU_ENABLE_PREPROCESSED_LOADER": env_bool(
+        "VLLM_TPU_ENABLE_PREPROCESSED_LOADER", True
+    ),
 }
 
 
