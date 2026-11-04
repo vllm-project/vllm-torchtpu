@@ -27,9 +27,9 @@ from typing import Any, cast
 import torch
 import torch.nn as nn
 
+from vllm_torchtpu import rope_patch
 from vllm_torchtpu.experimental.export import (
     api,
-    rope_patch,
     sampling,
     tpu_lowering,
     weight_mapper,
