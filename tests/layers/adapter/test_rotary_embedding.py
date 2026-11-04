@@ -176,3 +176,51 @@ def test_apply_rotary_emb_instance_forward_is_fp32():
     ref = ApplyRotaryEmb.forward_static(x, cos, sin, True, enable_fp32_compute=True)
     torch.testing.assert_close(emb(x, cos, sin), ref, rtol=0, atol=0)
     torch.testing.assert_close(emb.forward_native(x, cos, sin), ref, rtol=0, atol=0)
+
+
+def _bits(t: torch.Tensor) -> torch.Tensor:
+    """The raw bit pattern, so that NaN payloads and -0.0 also compare."""
+    int_dtype = {2: torch.int16, 4: torch.int32}[t.element_size()]
+    return t.contiguous().view(int_dtype)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
+@pytest.mark.parametrize("rotary_dim", [2, 64, 128])
+def test_rolled_gptj_rotation_is_bitwise_identical(dtype, rotary_dim):
+    g = torch.Generator().manual_seed(3)
+    x = (4.0 * torch.randn(16, 8, rotary_dim, generator=g)).to(dtype)
+    # Special values must take the same path through both formulas.
+    x.view(-1)[:6] = torch.tensor(
+        [0.0, -0.0, float("inf"), -float("inf"), 1e-30, -1e-30]
+    ).to(dtype)
+    cos = torch.randn(16, rotary_dim // 2, generator=g).to(dtype)
+    sin = torch.randn(16, rotary_dim // 2, generator=g).to(dtype)
+    expected = ApplyRotaryEmb.forward_static(
+        x, cos, sin, is_neox_style=False, enable_fp32_compute=True
+    )
+    actual = tpu_rope._rotate_gptj_fp32_rolled(x, cos, sin)
+    assert actual.dtype == expected.dtype == dtype
+    assert torch.equal(_bits(actual), _bits(expected))
+
+
+@pytest.mark.parametrize("is_neox_style", [False, True])
+def test_rope_gptj_roll_flag_keeps_results(monkeypatch, is_neox_style):
+    """The flag changes the formula only, never the output, for both styles."""
+    from vllm_torchtpu import envs
+
+    rope_dim = 64
+    rope = RotaryEmbedding(
+        rope_dim, rope_dim, MAX_POS, 8_000_000.0, is_neox_style, torch.bfloat16
+    )
+    g = torch.Generator().manual_seed(4)
+    positions = torch.randint(0, MAX_POS, (16,), generator=g)
+    # GLM-5.2 MLA shapes: q_pe [tokens, heads, 64], k_pe [tokens, 1, 64].
+    q = torch.randn(16, 32, rope_dim, generator=g).to(torch.bfloat16)
+    k = torch.randn(16, 1, rope_dim, generator=g).to(torch.bfloat16)
+
+    monkeypatch.setattr(envs, "TPU_ROPE_GPTJ_ROLL", False)
+    ref_q, ref_k = rope.forward_native(positions, q.clone(), k.clone())
+    monkeypatch.setattr(envs, "TPU_ROPE_GPTJ_ROLL", True)
+    out_q, out_k = rope.forward_native(positions, q.clone(), k.clone())
+    assert torch.equal(_bits(out_q), _bits(ref_q))
+    assert torch.equal(_bits(out_k), _bits(ref_k))

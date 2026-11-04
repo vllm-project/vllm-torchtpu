@@ -48,6 +48,7 @@ from vllm.model_executor.layers import rotary_embedding as upstream_rope
 from vllm.model_executor.layers.rotary_embedding import RotaryEmbedding
 from vllm.model_executor.layers.rotary_embedding.common import ApplyRotaryEmb
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
@@ -82,6 +83,74 @@ class TpuApplyRotaryEmb(ApplyRotaryEmb):
     forward_tpu = forward_oot  # pyrefly: ignore[bad-override]
 
 
+def _rotate_gptj_fp32_rolled(
+    x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
+) -> torch.Tensor:
+    """GPT-J style rotation in float32 without splitting the pair axis.
+
+    Computes the same values as ``ApplyRotaryEmb.forward_static(x, cos, sin,
+    is_neox_style=False, enable_fp32_compute=True)``, bit for bit.
+
+    The upstream code reads the even and odd elements with strided slices
+    (``x[..., ::2]``, ``x[..., 1::2]``) and interleaves the results with
+    ``stack(..., dim=-1)``. XLA on TPU lays such a tensor out with the pair
+    axis of size 2 away from the lanes, and then copies the result back to the
+    row-major layout that the attention kernel reads. In a GLM-5.2 decode step
+    the q_pe relayouts cost about 1.3 us per layer. This function keeps the
+    tensor as ``[..., rotary_dim]`` and gets each element's pair partner with
+    two lane rolls.
+
+    For element ``j`` of a pair, with ``c`` and ``s`` the cos and sin of the
+    pair ``j // 2``:
+
+    * even ``j``: upstream computes ``x[j] * c - x[j + 1] * s``. This function
+      computes ``x[j] * c + (-x[j + 1]) * s``. Negation is exact and
+      ``a + (-b) == a - b`` in IEEE arithmetic, so the results are equal.
+    * odd ``j``: both compute ``x[j] * c + x[j - 1] * s``.
+
+    Example with one pair, ``x = [1, 2]``, ``c = 0.5``, ``s = 0.25``: upstream
+    returns ``[1 * 0.5 - 2 * 0.25, 2 * 0.5 + 1 * 0.25] = [0, 1.25]``; here the
+    partner tensor is ``[-2, 1]`` and ``[1, 2] * 0.5 + [-2, 1] * 0.25`` is the
+    same ``[0, 1.25]``.
+
+    Args:
+      x: ``[..., num_heads, rotary_dim]`` rotary part of q or k, any float
+        dtype. ``rotary_dim`` is even.
+      cos: ``[num_tokens, rotary_dim // 2]`` cos entries for each token, in
+        the dtype that upstream would use (the cache matched to ``x.dtype``).
+      sin: ``[num_tokens, rotary_dim // 2]`` sin entries, same convention.
+
+    Returns:
+      The rotated ``x`` in ``x.dtype``.
+    """
+    origin_dtype = x.dtype
+    x = x.float()
+    # [num_tokens, 1, rotary_dim]: entry j holds the value of pair j // 2.
+    cos = torch.repeat_interleave(cos.unsqueeze(-2).to(x.dtype), 2, dim=-1)
+    sin = torch.repeat_interleave(sin.unsqueeze(-2).to(x.dtype), 2, dim=-1)
+    rotary_dim = x.shape[-1]
+    even = torch.arange(rotary_dim, device=x.device) % 2 == 0
+    # torch.roll(x, -1)[j] == x[j + 1] and torch.roll(x, 1)[j] == x[j - 1];
+    # the wrapped-around end elements are never selected.
+    partner = torch.where(even, -torch.roll(x, -1, dims=-1), torch.roll(x, 1, dims=-1))
+    return (x * cos + partner * sin).to(origin_dtype)
+
+
+def _apply_rotary_fp32(
+    x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, is_neox_style: bool
+) -> torch.Tensor:
+    """``ApplyRotaryEmb.forward_static`` in float32, with the rolled GPT-J path.
+
+    ``TPU_ROPE_GPTJ_ROLL`` selects ``_rotate_gptj_fp32_rolled`` for GPT-J style
+    rotations. NeoX style rotations always take the upstream code.
+    """
+    if not is_neox_style and envs.TPU_ROPE_GPTJ_ROLL:
+        return _rotate_gptj_fp32_rolled(x, cos, sin)
+    return ApplyRotaryEmb.forward_static(
+        x, cos, sin, is_neox_style, enable_fp32_compute=True
+    )
+
+
 def _rotary_forward_fp32(
     self: RotaryEmbedding,
     positions: torch.Tensor,
@@ -104,9 +173,7 @@ def _rotary_forward_fp32(
     query = query.view(num_tokens, -1, self.head_size)
     query_rot = query[..., : self.rotary_dim]
     query_pass = query[..., self.rotary_dim :]
-    query_rot = ApplyRotaryEmb.forward_static(
-        query_rot, cos, sin, self.is_neox_style, enable_fp32_compute=True
-    )
+    query_rot = _apply_rotary_fp32(query_rot, cos, sin, self.is_neox_style)
     query = torch.cat((query_rot, query_pass), dim=-1).reshape(query_shape)
 
     if key is not None:
@@ -114,9 +181,7 @@ def _rotary_forward_fp32(
         key = key.view(num_tokens, -1, self.head_size)
         key_rot = key[..., : self.rotary_dim]
         key_pass = key[..., self.rotary_dim :]
-        key_rot = ApplyRotaryEmb.forward_static(
-            key_rot, cos, sin, self.is_neox_style, enable_fp32_compute=True
-        )
+        key_rot = _apply_rotary_fp32(key_rot, cos, sin, self.is_neox_style)
         key = torch.cat((key_rot, key_pass), dim=-1).reshape(key_shape)
     return query, key
 

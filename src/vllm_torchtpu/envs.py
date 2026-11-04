@@ -118,6 +118,7 @@ if TYPE_CHECKING:
     TPU_ROPE_CACHE_ROW_MAJOR: bool = False
     TPU_MOE_HASH_TABLE_ROW_MAJOR: bool = False
     TPU_RMSNORM_FP32_WEIGHT: bool = False
+    TPU_ROPE_GPTJ_ROLL: bool = False
     TPU_PARALLEL_PRECOMPILE: bool = False
     TPU_PRECOMPILE_BIGGEST_FIRST: bool = False
     TPU_PRECOMPILE_PEER_REPLAY: bool = False
@@ -863,6 +864,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # `tpu` RMSNorm provider. The copy is not refreshed if the weights are
     # overwritten after load.
     "TPU_RMSNORM_FP32_WEIGHT": env_bool("TPU_RMSNORM_FP32_WEIGHT"),
+    # Rotate GPT-J style (interleaved) rotary embeddings with lane rolls on the
+    # unsplit [tokens, heads, rotary_dim] tensor instead of strided even/odd
+    # slices, which XLA lays out with the pair axis major and then copies back
+    # (layers/adapter/rotary_embedding.py). Bit-identical results.
+    "TPU_ROPE_GPTJ_ROLL": env_bool("TPU_ROPE_GPTJ_ROLL"),
     # Extra token buckets added to the default list of buckets.
     "TPU_TOKEN_BUCKET_EXTRA": lambda: [
         int(v) for v in os.getenv("TPU_TOKEN_BUCKET_EXTRA", "").split(",") if v.strip()
