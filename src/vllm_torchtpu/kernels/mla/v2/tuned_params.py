@@ -13,6 +13,7 @@
 # limitations under the License.
 
 from dataclasses import dataclass
+from functools import partial
 
 from vllm_torchtpu.logger import init_logger
 
@@ -1343,6 +1344,51 @@ tuned_params_mapping: dict[TuningKey, TunableParams] = {
         q_split=2,
     ),
 }
+
+
+# Kimi K3 TP32 8K with FP8 KV, per KV layout and server size. Decode stays at two
+# rows per block: with an odd live row count, one row, not several, then takes the
+# single-row path.
+def _k3_tp32_fp8_8k_params() -> tuple[
+    dict[TuningKey, TunableParams], dict[TuningKey, TunableParams]
+]:
+    decode_params, mixed_params = {}, {}
+    for page, pages_per_seq, max_num_seqs, decode_kv_pages, q_split, mixed_kv_pages in (
+        (4, 640, 32, 192, 8, 256),  # Per-layer KDA caches: 16-token pages.
+        (85, 32, 8, 16, 2, 8),  # Unified pool: 340-token pages.
+        (85, 32, 32, 16, 2, 8),
+    ):
+        key = partial(
+            TuningKey,
+            actual_num_q_heads=3,
+            actual_lkv_dim=512,
+            actual_r_dim=64,
+            q_dtype="bfloat16",
+            page_size_per_kv_packing=page,
+            max_num_seqs=max_num_seqs,
+            pages_per_seq=pages_per_seq,
+        )
+        for max_num_tokens in (1, 2, 4, 8, 16, 32, 8192):
+            decode_params[key(case="batched_decode", max_num_tokens=max_num_tokens)] = (
+                TunableParams(
+                    decode_batch_size=2,
+                    num_kv_pages_per_block=decode_kv_pages,
+                    num_queries_per_block=1,
+                    vmem_limit_bytes=62914560,
+                )
+            )
+        mixed_params[key(case="mixed", max_num_tokens=8192)] = TunableParams(
+            q_split=q_split,
+            num_kv_pages_per_block=mixed_kv_pages,
+            num_queries_per_block=512,
+            vmem_limit_bytes=62914560,
+        )
+    return decode_params, mixed_params
+
+
+# Decode tiles looked up by live shapes. Other decode lookups use the model-config key.
+live_keyed_decode_params, _k3_tp32_fp8_8k_mixed_params = _k3_tp32_fp8_8k_params()
+tuned_params_mapping.update(_k3_tp32_fp8_8k_mixed_params)
 
 
 def get_tuned_params(tuning_key: TuningKey) -> TunableParams:
