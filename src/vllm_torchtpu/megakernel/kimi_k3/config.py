@@ -168,6 +168,8 @@ class KernelConfig:
     diag_ballast_gb: float = 0.0
     diag_ballast_chunk_gb: float = 0.0
     diag_ballast_first: bool = False
+    # Fused MoE diagnostics: scalar ops inserted at the kernel start (code layout).
+    diag_code_pad: int = 0
     # Hot-expert fp8 copies (off when empty): an npz whose ``experts``
     # [92, 8, S] holds the global expert id in copy slot j of EP group g
     # per MoE layer (-1: empty). A bare name loads from kimi_k3/data.

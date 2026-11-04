@@ -2205,7 +2205,20 @@ def _layer_kernel(
     vmem, smem, dma = pltpu.VMEM, pltpu.SMEM, pltpu.SemaphoreType.DMA
 
     def body(s):
+        pad = k._config().diag_code_pad
+        if pad:
+            # Diagnostics: a dependent scalar chain of ``pad`` ops shifts the
+            # code layout of everything after it (instruction placement test).
+            value = control[0]
+            for _ in range(pad):
+                value = value * 3 + (value >> 7)
+            s["pad"][0] = value
         s["offset"][0] = 0
+        if pad:
+
+            @pl.when(s["pad"][0] == 123456789)
+            def unlikely():
+                s["offset"][0] = 1
         # Dense projections retain global family indices. Resident expert banks
         # correspond to first/group/final programs with 3/8/1 MoE families.
         family = k.expert_family_slot(expert_gu.shape[0], control[1])
@@ -2344,6 +2357,7 @@ def _layer_kernel(
             probs=smem((capacity // 128, 128), jnp.float32),
             family=smem((1,), jnp.int32),
             offset=smem((1,), jnp.int32),
+            pad=smem((1,), jnp.int32),
             count_sem=dma,
             max_sem=dma if tokens == 8192 else None,
             index_sem=dma,
