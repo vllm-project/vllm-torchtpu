@@ -719,7 +719,9 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
         attn_metadata = get_forward_context().attn_metadata
         metadata = None
         if isinstance(attn_metadata, dict):
-            metadata = attn_metadata.get(self.k_cache.prefix)
+            metadata = attn_metadata.get(
+                self.k_cache.metadata_layer_name or self.k_cache.prefix
+            )
         if not isinstance(metadata, AttentionMetadata):
             return self.topk_indices_buffer
 
@@ -785,6 +787,11 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
 
 class VllmTPUIndexerCache(DeepseekV32IndexerCache):
     """Indexer K cache retyped onto the TPU backend. See `VllmTPUIndexer`."""
+
+    # The layer whose attention metadata the indexer reads: set to the MLA
+    # layer when the cache is folded into that layer's pages (one KV cache
+    # group for both), else None for the cache's own.
+    metadata_layer_name: str | None = None
 
     def get_attn_backend(self) -> type[DeepseekV32IndexerBackend]:
         return VllmTPUDeepseekV32IndexerBackend
@@ -1150,10 +1157,11 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
         # `Indexer` has no `register_oot` hook and is fully built by
         # `DeepseekV2MLAAttention` before this wrapper runs, so retype it in
         # place. The mutation is visible through every reference to the object,
-        # including `DeepseekV2MLAAttention.indexer`.
+        # including `DeepseekV2MLAAttention.indexer`. Indexers a TPU model
+        # builds itself are not `Indexer`s and are used as given.
         indexer = mla_modules.indexer
-        if indexer is not None:
-            indexer = VllmTPUIndexer.rebind(cast(Indexer, indexer))
+        if isinstance(indexer, Indexer):
+            indexer = VllmTPUIndexer.rebind(indexer)
         self.indexer = indexer
         self.indexer_rope_emb = mla_modules.indexer_rotary_emb
         self.is_sparse = mla_modules.is_sparse

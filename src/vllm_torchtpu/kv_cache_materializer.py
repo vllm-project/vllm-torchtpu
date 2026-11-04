@@ -14,7 +14,7 @@
 import math
 from collections.abc import Sequence
 from dataclasses import dataclass, field
-from typing import Any, cast
+from typing import Any, NamedTuple, cast
 
 import torch
 from vllm.v1.kv_cache_interface import (
@@ -32,7 +32,17 @@ from vllm_torchtpu.block_major_pool import BlockMajorPoolLayout
 
 _FP8_DTYPES = (torch.float8_e4m3fn, torch.float8_e5m2)
 
-type LayerKVCache = torch.Tensor | list[torch.Tensor]
+type LayerKVCache = (
+    torch.Tensor | list[torch.Tensor] | tuple[torch.Tensor, torch.Tensor]
+)
+
+
+class PoolPageLayout(NamedTuple):
+    """A unified pool page when attention layers keep part of each scheduler
+    page in arrays of their own, as the sparse MLA layers do."""
+
+    dtype: torch.dtype
+    side_page_bytes: int
 
 
 @dataclass(frozen=True)
@@ -84,6 +94,7 @@ def format_kv_cache_layout_summary(
     kv_caches: dict[str, LayerKVCache],
     raw_tensors: Sequence[torch.Tensor],
     attn_groups: Sequence[Sequence[AttentionGroup]] | None = None,
+    side_tensors: Sequence[torch.Tensor] = (),
 ) -> str:
     """Format stable KV/mamba cache layout diagnostics for TPU validation."""
     group_backend_names: dict[int, str] = {}
@@ -102,6 +113,11 @@ def format_kv_cache_layout_summary(
         lines.append(
             f"  raw[{idx}]: shape={tuple(raw.shape)} dtype={raw.dtype} "
             f"numel={raw.numel()} nbytes={raw.nbytes}"
+        )
+    if side_tensors:
+        lines.append(
+            f"  side_tensors: count={len(side_tensors)} "
+            f"nbytes={sum(side.nbytes for side in side_tensors)}"
         )
 
     for gid, group in enumerate(kv_cache_config.kv_cache_groups):
@@ -125,6 +141,10 @@ def format_kv_cache_layout_summary(
                     f"    {layer_name}: attention "
                     f"{_tensor_layout_summary(cache, raw_tensors)}"
                 )
+            elif isinstance(cache, tuple):
+                lines.append(f"    {layer_name}: sparse MLA (nope, rope)")
+                for part in cache:
+                    lines.append(f"      {_tensor_layout_summary(part, raw_tensors)}")
             else:
                 lines.append(f"    {layer_name}: mamba states={len(cache)}")
                 for state_idx, state in enumerate(cache):
@@ -240,15 +260,19 @@ def allocate_raw_kv_cache_tensors(
     pool_geometry: tuple[AttentionSpec, Any, int],
     cache_dtype: str | torch.dtype = "auto",
     block_major: bool = False,
+    pool_page: PoolPageLayout | None = None,
 ) -> tuple[dict[str, torch.Tensor], list[torch.Tensor], BlockMajorPoolLayout | None]:
     layer_to_raw: dict[str, torch.Tensor] = {}
     raw_tensors: list[torch.Tensor] = []
-    pool_page_bytes = max(
+    manager_page_bytes = max(
         group.kv_cache_spec.page_size_bytes for group in kv_cache_config.kv_cache_groups
     )
     pool_indices = layer_to_pool_index(kv_cache_config)
-    pool_bytes = kv_cache_config.num_blocks * pool_page_bytes
-    num_pools = kv_cache_config.kv_cache_tensors[0].size // pool_bytes
+    num_pools = kv_cache_config.kv_cache_tensors[0].size // (
+        kv_cache_config.num_blocks * manager_page_bytes
+    )
+    side_page_bytes = 0 if pool_page is None else pool_page.side_page_bytes
+    pool_page_bytes = manager_page_bytes - side_page_bytes
     # The unified pool is born as the stock attention-shaped KV cache.
     # Attention consumes it natively; Mamba adapters address their byte
     # regions inside each manager page without creating typed aliases.
@@ -268,8 +292,9 @@ def allocate_raw_kv_cache_tensors(
             cache_dtype_str=cache_dtype,
         )
     )
+    pool_dtype = spec.dtype if pool_page is None else pool_page.dtype
     page_shape = region_shape[1:]
-    fa_page_bytes = math.prod(page_shape) * spec.dtype.itemsize
+    fa_page_bytes = math.prod(page_shape) * pool_dtype.itemsize
     if fa_page_bytes * split != pool_page_bytes:
         group_pages = [
             (
@@ -282,6 +307,7 @@ def allocate_raw_kv_cache_tensors(
         raise AssertionError(
             f"pool page mismatch: fa_page_bytes={fa_page_bytes} "
             f"split={split} pool_page_bytes={pool_page_bytes} "
+            f"side_page_bytes={side_page_bytes} "
             f"kernel_block_size={kernel_block_size} "
             f"region_shape={region_shape} group_pages={group_pages}"
         )
@@ -296,10 +322,10 @@ def allocate_raw_kv_cache_tensors(
     else:
         shapes = [region_shape] * num_pools
     for shape in shapes:
-        if spec.dtype in _FP8_DTYPES:
-            raw = torch.empty(shape, dtype=spec.dtype, device=device)
+        if pool_dtype in _FP8_DTYPES:
+            raw = torch.empty(shape, dtype=pool_dtype, device=device)
         else:
-            raw = torch.zeros(shape, dtype=spec.dtype, device=device)
+            raw = torch.zeros(shape, dtype=pool_dtype, device=device)
         raw_tensors.append(raw)
     for layer_name, pool_index in pool_indices.items():
         layer_to_raw[layer_name] = raw_tensors[0 if block_major else pool_index]
@@ -468,6 +494,7 @@ def materialize_kv_cache_tensors(
     device: torch.device,
     cache_dtype: str | torch.dtype,
     block_major: bool = False,
+    pool_page: PoolPageLayout | None = None,
 ) -> MaterializedKVCache:
     kernel_block_size_by_gid = build_kernel_block_size_by_group_id(
         kv_cache_config=kv_cache_config,
@@ -539,6 +566,7 @@ def materialize_kv_cache_tensors(
         pool_geometry=pool_geometry,
         cache_dtype=cache_dtype,
         block_major=block_major,
+        pool_page=pool_page,
     )
     kv_caches: dict[str, LayerKVCache] = {}
 

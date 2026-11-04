@@ -44,6 +44,9 @@ POOLED_GDN_ARCHITECTURES = QWEN_GDN_ARCHITECTURES | frozenset(
         # pool.
         "KimiLinearForCausalLM",
         "KimiK3ForConditionalGeneration",
+        # Kimi-K3.1 adds DSA to Kimi-K3's MLA layers; each layer's indexer K
+        # cache is folded into its MLA pages (`folded_dsa_indexer_caches`).
+        "KimiK31ForConditionalGeneration",
     }
 )
 

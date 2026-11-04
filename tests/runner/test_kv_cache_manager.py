@@ -32,6 +32,7 @@ from vllm.config import (
 )
 from vllm.model_executor.layers.attention import Attention, MLAAttention
 from vllm.model_executor.layers.mamba.abstract import MambaBase
+from vllm.model_executor.models.deepseek_v2 import DeepseekV32IndexerCache
 from vllm.v1.attention.backend import AttentionType
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
@@ -45,6 +46,7 @@ from vllm.v1.kv_cache_interface import (
 from vllm.v1.worker.utils import AttentionGroup
 
 from vllm_torchtpu import utils
+from vllm_torchtpu.kv_cache_materializer import PoolPageLayout
 from vllm_torchtpu.layers.adapter.attention import (
     PallasAttentionBackend,
     PallasBatchedRPAAttentionBackend,
@@ -227,6 +229,232 @@ def test_get_kv_cache_spec_sparse_mla(monkeypatch, layout):
     assert spec.num_head_slots == 1
 
 
+def _spec_runner(unified: bool):
+    runner = MagicMock(spec=TPUModelRunner)
+    runner.block_size = 256
+    runner.kv_cache_dtype = torch.float8_e4m3fn
+    runner.device = torch.device("cpu")
+    runner.vllm_config = MagicMock()
+    runner.vllm_config.speculative_config = None
+    runner.cache_config = runner.vllm_config.cache_config = CacheConfig(
+        block_size=256, gpu_memory_utilization=0.9, cache_dtype="fp8"
+    )
+    runner.scheduler_config = runner.vllm_config.scheduler_config = SimpleNamespace(
+        disable_hybrid_kv_cache_manager=False
+    )
+    runner.vllm_config.attention_config = None
+    runner.use_spmd = False
+    runner._hybrid_uniform_page_size_bytes = None
+    runner._unified_kv_layout = unified
+    runner._mamba_num_blocks = None
+    runner._uniform_mamba_layout = False
+    runner.shared_kv_cache_layers = {}
+    runner.runner_only_attn_layers = set()
+    runner.speculative_config = None
+    runner.kv_cache_manager = KVCacheManager(runner)
+    runner.get_kv_cache_spec = TPUModelRunner.get_kv_cache_spec.__get__(runner)
+    return runner
+
+
+def test_get_kv_cache_spec_folds_indexer_cache_into_mla_page():
+    """On the unified pool a sparse MLA layer's spec covers its (nope, rope)
+    latents and its indexer K rows (576 + 132 B/token); the indexer cache has
+    no spec of its own, so the pair is one KV cache group. Runs on CPU."""
+    runner = _spec_runner(unified=True)
+    k_cache = MagicMock(spec=DeepseekV32IndexerCache)
+    k_cache.prefix = "model.layers.3.self_attn.indexer.k_cache"
+    k_cache.head_dim = 129
+    mla = MagicMock(spec=MLAAttention)
+    mla.num_kv_heads = 1
+    mla.head_size = 576
+    mla.use_sparse = True
+    layers = {
+        k_cache.prefix: k_cache,
+        "model.layers.3.self_attn.attn": mla,
+        "model.layers.4.self_attn": DummyMamba(),
+    }
+    with (
+        patch.object(
+            TpuPlatform, "_find_non_ssm_backend", return_value=PallasMLAttentionBackend
+        ),
+        patch(
+            "vllm_torchtpu.runner.kv_cache_manager.get_layers_from_vllm_config",
+            return_value=layers,
+        ),
+        patch(
+            "vllm_torchtpu.runner.kv_cache_manager.folded_dsa_indexer_caches",
+            return_value={"model.layers.3.self_attn.attn": k_cache},
+        ),
+    ):
+        specs = runner.get_kv_cache_spec()
+
+    assert set(specs) == {"model.layers.3.self_attn.attn", "model.layers.4.self_attn"}
+    spec = specs["model.layers.3.self_attn.attn"]
+    assert isinstance(spec, MLAAttentionSpec)
+    assert spec.page_size_bytes == (576 + 132) * 256
+    assert specs["model.layers.4.self_attn"].page_size_bytes == spec.page_size_bytes
+
+
+def test_folded_dsa_pool_page_holds_the_nope_latents():
+    runner = _spec_runner(unified=True)
+    k_cache = SimpleNamespace(head_dim=129)
+    spec = MLAAttentionSpec(
+        block_size=256,
+        num_kv_heads=1,
+        head_size=576,
+        dtype=torch.float8_e4m3fn,
+        page_size_padded=(576 + 132) * 256,
+    )
+    group = SimpleNamespace(layer_names=["mla.3"], kv_cache_spec=spec)
+    pool_page = runner.kv_cache_manager._folded_dsa_pool_page(
+        SimpleNamespace(kv_cache_groups=[group]), {"mla.3": k_cache}, {0: 256}
+    )
+    assert pool_page == PoolPageLayout(torch.uint32, (64 + 132) * 256)
+
+
+def test_bind_folded_dsa_caches_gives_rope_and_indexer_arrays():
+    """The pool is the NoPE cache; the RoPE half and the indexer K cache get
+    arrays over the same kernel pages, and the indexer reads the MLA layer's
+    attention metadata."""
+    runner = _spec_runner(unified=True)
+    block_size, num_blocks = 256, 3
+    nope_spec, rope_spec = PallasMLAttentionBackend.get_sparse_kv_cache_specs(
+        num_blocks, block_size, 576, torch.float8_e4m3fn
+    )
+    pool = torch.zeros(nope_spec.shape, dtype=nope_spec.torch_dtype)
+    k_cache = SimpleNamespace(
+        prefix="model.layers.3.self_attn.indexer.k_cache",
+        head_dim=129,
+        metadata_layer_name=None,
+    )
+    mla = SimpleNamespace(head_size=576)
+    runner.vllm_config.compilation_config.static_forward_context = {
+        "model.layers.3.self_attn.attn": mla
+    }
+    kv_caches = {"model.layers.3.self_attn.attn": pool}
+    with patch("vllm_torchtpu.runner.kv_cache_manager.synchronize_tensors"):
+        runner.kv_cache_manager._bind_folded_dsa_caches(
+            kv_caches,
+            SimpleNamespace(
+                num_blocks=num_blocks,
+                kv_cache_groups=[
+                    SimpleNamespace(layer_names=["model.layers.3.self_attn.attn"])
+                ],
+            ),
+            {"model.layers.3.self_attn.attn": k_cache},
+        )
+
+    bound_pool, rope = kv_caches["model.layers.3.self_attn.attn"]
+    assert bound_pool is pool
+    assert tuple(rope.shape) == tuple(rope_spec.shape)
+    assert rope.dtype == rope_spec.torch_dtype
+    indexer = kv_caches[k_cache.prefix]
+    assert indexer.dtype == torch.uint8
+    assert indexer.shape[0] == num_blocks
+    assert indexer[0].numel() == 132 * block_size
+    assert mla.mla_kv_spec == (nope_spec, rope_spec)
+    assert k_cache.metadata_layer_name == "model.layers.3.self_attn.attn"
+    assert runner.kv_cache_side_tensors == [rope, indexer]
+
+
+def _dense_draft_layer() -> MagicMock:
+    draft = MagicMock(spec=MLAAttention)
+    draft.num_kv_heads = 1
+    draft.head_size = 576
+    draft.use_sparse = False
+    return draft
+
+
+def test_get_kv_cache_spec_budgets_dense_draft_arrays_on_folded_pool():
+    """A dense draft layer joins the sparse layers' group. The page spreads
+    all off-pool bytes over the regions: one folded layer (64 + 132 B/token)
+    plus one dense layer (640 B/token) over two regions, on 512 B/token rows."""
+    runner = _spec_runner(unified=True)
+    k_cache = MagicMock(spec=DeepseekV32IndexerCache)
+    k_cache.prefix = "model.layers.3.self_attn.indexer.k_cache"
+    k_cache.head_dim = 129
+    mla = MagicMock(spec=MLAAttention)
+    mla.num_kv_heads = 1
+    mla.head_size = 576
+    mla.use_sparse = True
+    layers = {
+        k_cache.prefix: k_cache,
+        "model.layers.3.self_attn.attn": mla,
+        "draft.layers.0.self_attn.attn": _dense_draft_layer(),
+        "model.layers.4.self_attn": DummyMamba(),
+    }
+    with (
+        patch.object(
+            TpuPlatform, "_find_non_ssm_backend", return_value=PallasMLAttentionBackend
+        ),
+        patch(
+            "vllm_torchtpu.runner.kv_cache_manager.get_layers_from_vllm_config",
+            return_value=layers,
+        ),
+        patch(
+            "vllm_torchtpu.runner.kv_cache_manager.folded_dsa_indexer_caches",
+            return_value={"model.layers.3.self_attn.attn": k_cache},
+        ),
+    ):
+        specs = runner.get_kv_cache_spec()
+
+    sparse = specs["model.layers.3.self_attn.attn"]
+    assert sparse == specs["draft.layers.0.self_attn.attn"]
+    assert sparse.page_size_bytes == (512 + (196 + 640) // 2) * 256
+
+
+def test_bind_folded_dsa_caches_gives_dense_draft_layer_its_own_array():
+    """A dense draft layer keeps the dense kernel layout, addressed by the
+    pool's block ids, and scheduler-block copies cover it."""
+    runner = _spec_runner(unified=True)
+    runner.parallel_config = SimpleNamespace(decode_context_parallel_size=1)
+    runner.kv_cache_dtype = torch.float8_e4m3fn
+    block_size, num_blocks = runner.cache_config.block_size, 3
+    nope_spec, _ = PallasMLAttentionBackend.get_sparse_kv_cache_specs(
+        num_blocks, block_size, 576, torch.float8_e4m3fn
+    )
+    pool = torch.zeros(nope_spec.shape, dtype=nope_spec.torch_dtype)
+    k_cache = SimpleNamespace(
+        prefix="model.layers.3.self_attn.indexer.k_cache",
+        head_dim=129,
+        metadata_layer_name=None,
+    )
+    names = ["model.layers.3.self_attn.attn", "draft.layers.0.self_attn.attn"]
+    runner.vllm_config.compilation_config.static_forward_context = {
+        names[0]: SimpleNamespace(head_size=576)
+    }
+    kv_caches = {name: pool for name in names}
+    group = SimpleNamespace(
+        layer_names=names, kv_cache_spec=SimpleNamespace(head_size=576)
+    )
+    with patch("vllm_torchtpu.runner.kv_cache_manager.synchronize_tensors"):
+        runner.kv_cache_manager._bind_folded_dsa_caches(
+            kv_caches,
+            SimpleNamespace(num_blocks=num_blocks, kv_cache_groups=[group]),
+            {names[0]: k_cache},
+        )
+
+    dense = kv_caches[names[1]]
+    assert dense.dtype == torch.float8_e4m3fn
+    assert tuple(dense.shape) == tuple(
+        PallasMLAttentionBackend.get_kv_cache_shape(
+            num_blocks, block_size, 1, 576, torch.float8_e4m3fn
+        )
+    )
+    assert any(t is dense for t in runner.kv_cache_side_tensors)
+
+    runner.parallel_config.decode_context_parallel_size = 8
+    with (
+        patch("vllm_torchtpu.runner.kv_cache_manager.synchronize_tensors"),
+        pytest.raises(NotImplementedError, match="no DCP"),
+    ):
+        runner.kv_cache_manager._bind_folded_dsa_caches(
+            {name: pool for name in names},
+            SimpleNamespace(num_blocks=num_blocks, kv_cache_groups=[group]),
+            {names[0]: k_cache},
+        )
+
+
 @pytest.mark.tpu_test
 class TestKVCacheManager:
     def setup_method(self):
@@ -381,6 +609,44 @@ class TestKVCacheManager:
         self.runner.kv_cache_manager._update_mamba_page_size_padded(layers)
 
         mock_get_page_size.assert_called_once_with(264, 2, 128, torch.bfloat16)
+
+    @patch(
+        "vllm_torchtpu.runner.kv_cache_manager.VllmTPUDeepseekV32IndexerBackend.get_kv_cache_page_size_bytes",
+        return_value=1024,
+    )
+    @patch(
+        "vllm_torchtpu.runner.tpu_runner.PallasAttentionBackend.get_kv_cache_page_size_bytes",
+        return_value=4096,
+    )
+    @patch(
+        "vllm_torchtpu.utils.torch.accelerator.get_memory_info",
+        return_value=(10 * 1024 * 1024 * 1024, 10 * 1024 * 1024 * 1024),
+    )
+    def test_update_mamba_page_size_padded_counts_indexer_caches(
+        self, mock_mem_info, mock_get_page_size, mock_indexer_page_size
+    ):
+        layers = {"attn_0": _attention_layer_mock()}
+        layers["attn_0"].num_kv_heads = 2
+        layers["attn_0"].head_size = 128
+        indexer = MagicMock(spec=DeepseekV32IndexerCache)
+        indexer.head_dim = 129
+        indexer.dtype = torch.uint8
+        layers["indexer_0"] = indexer
+        for i in range(3):
+            layers[f"mamba_{i}"] = DummyMamba()
+
+        self.runner.kv_cache_manager._update_mamba_page_size_padded(layers)
+
+        # The indexer caches are their own vLLM group in every region:
+        # uniform = 1 x 4096 (attn) + 1 x 1024 (indexer) + 3 x 66560 (mamba).
+        assert self.runner._hybrid_uniform_page_size_bytes == 204800
+        mock_indexer_page_size.assert_called_once_with(
+            self.runner.vllm_config.cache_config.block_size, 1, 129, torch.uint8
+        )
+        # Attention blocks are sized against both block-indexed layers:
+        #   (9,663,676,416 - 3 * 17 * 66560) // (4096 + 1024) = 1,886,773
+        assert self.runner._mamba_num_blocks == 17
+        assert self.runner.cache_config.num_gpu_blocks_override == 1886773
 
     def test_available_kv_cache_hbm_is_min_across_ep_dp(self, monkeypatch):
         """Pinned block counts must be sized from the DP-wide minimum budget."""

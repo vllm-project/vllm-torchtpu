@@ -20,16 +20,21 @@ from vllm.v1.kv_cache_interface import (
     KVCacheGroupSpec,
     KVCacheTensor,
     MambaSpec,
+    MLAAttentionSpec,
 )
 from vllm.v1.worker.utils import AttentionGroup
 
 from vllm_torchtpu.distributed.kv_transfer.raiden import pool_manifest as rpm
 from vllm_torchtpu.kv_cache_materializer import (
+    PoolPageLayout,
     format_kv_cache_layout_summary,
     materialize_kv_cache_tensors,
 )
 from vllm_torchtpu.kv_cache_spec_normalizer import normalize_kv_cache_specs_for_tpu
-from vllm_torchtpu.layers.adapter.attention import PallasAttentionBackend
+from vllm_torchtpu.layers.adapter.attention import (
+    PallasAttentionBackend,
+    PallasSparseMLAPoolBackend,
+)
 
 
 class FakeAttentionBackend:
@@ -383,6 +388,89 @@ def test_materialization_rejects_mismatched_kernel_block_size_count(kernel_block
             device=torch.device("cpu"),
             cache_dtype=torch.bfloat16,
         )
+
+
+def test_hybrid_sparse_mla_pool_is_born_as_the_nope_cache():
+    """A sparse MLA layer with a folded indexer cache: the scheduler page
+    covers nope + rope + indexer bytes (512 + 64 + 132 per token), the pool
+    holds only the NoPE latents, and the state layer shares that pool."""
+    block_size, num_blocks = 256, 4
+    page_size = block_size * (512 + 64 + 132)
+    side_bytes = block_size * (64 + 132)
+    attn_spec = MLAAttentionSpec(
+        block_size=block_size,
+        num_kv_heads=1,
+        head_size=576,
+        dtype=torch.float8_e4m3fn,
+        page_size_padded=page_size,
+    )
+    mamba_spec = MambaSpec(
+        block_size=block_size,
+        shapes=((2, 8), (2, 4, 8)),
+        dtypes=(torch.bfloat16, torch.float32),
+        page_size_padded=page_size,
+    )
+    names = ["model.layers.0.self_attn.attn", "model.layers.1.mamba"]
+    cfg = KVCacheConfig(
+        num_blocks=num_blocks,
+        kv_cache_tensors=[
+            KVCacheTensor(
+                size=page_size * num_blocks,
+                layers=[name],
+                layer_stride=page_size * num_blocks,
+                block_stride=page_size,
+            )
+            for name in names
+        ],
+        kv_cache_groups=[
+            KVCacheGroupSpec(layer_names=[names[0]], kv_cache_spec=attn_spec),
+            KVCacheGroupSpec(layer_names=[names[1]], kv_cache_spec=mamba_spec),
+        ],
+    )
+    groups = [
+        [
+            AttentionGroup(
+                backend=PallasSparseMLAPoolBackend,
+                layer_names=[names[0]],
+                kv_cache_spec=attn_spec,
+                kv_cache_group_id=0,
+            )
+        ],
+        [
+            AttentionGroup(
+                backend=FakeAttentionBackend,
+                layer_names=[names[1]],
+                kv_cache_spec=mamba_spec,
+                kv_cache_group_id=1,
+            )
+        ],
+    ]
+
+    materialized = materialize_kv_cache_tensors(
+        kv_cache_config=cfg,
+        attn_groups=groups,
+        kernel_block_sizes=[block_size, block_size],
+        device=torch.device("cpu"),
+        cache_dtype="fp8",
+        pool_page=PoolPageLayout(torch.uint32, side_bytes),
+    )
+
+    (pool,) = materialized.raw_tensors
+    assert pool.dtype == torch.uint32
+    assert tuple(pool.shape) == (num_blocks, block_size, 128)
+    assert materialized.kv_caches[names[0]] is pool
+    assert materialized.kv_caches[names[1]] == [pool]
+
+    rope = torch.zeros(num_blocks, block_size, 64, dtype=torch.uint8)
+    summary = format_kv_cache_layout_summary(
+        kv_cache_config=cfg,
+        kv_caches={**materialized.kv_caches, names[0]: (pool, rope)},
+        raw_tensors=materialized.raw_tensors,
+        attn_groups=groups,
+        side_tensors=[rope],
+    )
+    assert f"{names[0]}: sparse MLA (nope, rope)" in summary
+    assert f"side_tensors: count=1 nbytes={rope.nbytes}" in summary
 
 
 def _hybrid_groups(cfg: KVCacheConfig) -> list[list[AttentionGroup]]:
