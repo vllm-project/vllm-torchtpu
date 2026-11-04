@@ -225,6 +225,7 @@ def fused_ep_moe_push(
     height_rungs_override=0,
     tail_barrier=True,
     onehot_slots=False,
+    hbm_staging=False,
     expert_slot=None,
     expert_load=None,
 ):
@@ -241,9 +242,10 @@ def fused_ep_moe_push(
     instead of XLA's all-gather. `height_rungs_override` is the tile-height
     ladder's rung count (0 = the default; see kernel.tile_height_rungs).
     `tail_barrier=False` drops the kernel's closing all-pairs barrier (see
-    kernel._build_push_moe_kernel), and `onehot_slots` maps the layout's
-    slots without gathers (see `_to_slots`). The caller
-    (layers/adapter/fused_moe_ep.py) reads all five from envs.
+    kernel._build_push_moe_kernel), `onehot_slots` maps the layout's
+    slots without gathers (see `_to_slots`), and `hbm_staging` ships result
+    tiles through the HBM contribution slab (see the kernel). The caller
+    (layers/adapter/fused_moe_ep.py) reads all six from envs.
 
     `expert_slot` [experts, R] i32 and `expert_load` [e_total] i32 (both
     replicated, optional) are the expert-layout operands dynamic EPLB
@@ -397,6 +399,7 @@ def fused_ep_moe_push(
     tc_exchange = bool(tc_exchange)
     height_rungs_override = int(height_rungs_override)
     tail_barrier = bool(tail_barrier)
+    hbm_staging = bool(hbm_staging)
     kfn = build_push_moe_kernel(
         g_local=g_local,
         capacity=capacity,
@@ -415,6 +418,7 @@ def fused_ep_moe_push(
         sc_prepush=n_pre,
         height_rungs_override=height_rungs_override,
         tail_barrier=tail_barrier,
+        hbm_staging=hbm_staging,
     )
 
     layout = _exchange_layout(t_local, topk, e_total, form.quantized_activations)
@@ -836,6 +840,7 @@ def fused_ep_moe_push(
         height_rungs_override,
         tail_barrier,
         bool(onehot_slots),
+        hbm_staging,
     )
     sm = _LAYER_SM_CACHE.get(key)
     if sm is None:

@@ -116,6 +116,7 @@ def _build_push_moe_kernel(
     sc_prepush,
     height_rungs_override=0,
     tail_barrier=True,
+    hbm_staging=False,
 ):
     """Build the pallas_call and the function that invokes it.
 
@@ -150,6 +151,14 @@ def _build_push_moe_kernel(
     entry barrier of its own (this kernel's head barrier, the SparseCore
     pre-push's, the TensorCore routing exchange's), which holds the write
     until this shard has entered that kernel too.
+
+    `hbm_staging=True` ships result tiles the two-hop way even where a tile
+    could ship straight out of `out_vm`: each tile is committed to the HBM
+    contribution slab and every (expert, destination) run is pushed once the
+    visit's tiles are committed. Same bytes to the same places; what changes
+    is that the remote pushes no longer hold a VMEM staging slot, so when the
+    fabric is the busy resource the tile loop runs ahead of it instead of
+    waiting at the slot-reuse guard.
     """
     if pad_scale_rows and weight_format != host.WeightFormat.FP4:
         raise ValueError(
@@ -393,7 +402,7 @@ def _build_push_moe_kernel(
     #
     # This subsumes the deferred commit drain the same bound used to select:
     # deferring a wait one visit is worth nothing once the wait is gone.
-    push_from_vmem = ragged_rows_alloc <= ep * g_local * tile_m
+    push_from_vmem = not hbm_staging and ragged_rows_alloc <= ep * g_local * tile_m
     ls_window_rows = host.act_scale_window_rows(tile_m)
     # A segment word packs dest << 24 | local expert << 16 | rows.
     if push_tokens >= 1 << 16 or ep > 128 or g_local > 256:
@@ -1628,6 +1637,7 @@ def _build_push_moe_kernel(
             f"{bias_tag}"
             f"_g{g_local}_c{capacity}_nb{nbuf}_s{sc_prepush}"
             f"{'' if tail_barrier else '_notail'}"
+            f"{'_hbmst' if hbm_staging else ''}"
         )
         return pl.pallas_call(
             kernel,

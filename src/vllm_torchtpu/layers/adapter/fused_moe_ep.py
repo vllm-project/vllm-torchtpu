@@ -212,6 +212,7 @@ def _build_op(
             height_rungs_override=envs.MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE,
             tail_barrier=envs.MOE_FUSED_EP_PUSH_TAIL_BARRIER,
             onehot_slots=envs.MOE_FUSED_EP_PUSH_ONEHOT_SLOTS,
+            hbm_staging=envs.MOE_FUSED_EP_PUSH_HBM_STAGING,
         )
 
     preprocess_topology = prepare_moe_preprocessing(mesh)
