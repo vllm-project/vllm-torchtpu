@@ -13,6 +13,8 @@ if TYPE_CHECKING:
     TPU_DEEPSEEK_V41_ENGRAM_HBM: str = "auto"
     TPU_DEEPSEEK_V41_CSA2_EARLY_GATHER: bool = False
     TPU_DEEPSEEK_V41_INDEXER_TAIL_OUTSIDE_COND: bool = False
+    TPU_DEEPSEEK_V41_INDEXER_ISSUE_DEPTH: int | None = None
+    TPU_DEEPSEEK_V41_INDEXER_PUBLISH_ISSUE_DEPTH: int | None = None
     TPU_DEEPSEEK_V41_MHC_RESIDENT_GATES: bool = False
     TPU_DEEPSEEK_V41_CSA2_SWA_PLAN: bool = False
     TPU_DEEPSEEK_V41_FUSED_WO_AB: bool = False
@@ -411,6 +413,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Same kernels on the same scores (bit-exact). Default off until measured.
     "TPU_DEEPSEEK_V41_INDEXER_TAIL_OUTSIDE_COND": env_bool(
         "TPU_DEEPSEEK_V41_INDEXER_TAIL_OUTSIDE_COND", default=False
+    ),
+    # Packed FP8 dense indexer scorer: fragments in flight between the QK
+    # matmul and the head reduction (unset: the tuned 10). The second applies
+    # to the scorer with fused candidate publication. Scheduling only: the
+    # head-sum split stays keyed to the tuned depth (bit-exact).
+    "TPU_DEEPSEEK_V41_INDEXER_ISSUE_DEPTH": env_positive_int_or_none(
+        "TPU_DEEPSEEK_V41_INDEXER_ISSUE_DEPTH"
+    ),
+    "TPU_DEEPSEEK_V41_INDEXER_PUBLISH_ISSUE_DEPTH": env_positive_int_or_none(
+        "TPU_DEEPSEEK_V41_INDEXER_PUBLISH_ISSUE_DEPTH"
     ),
     # Shifted mHC: emit the next layer's gates T tokens wide (not padded to a
     # multiple of 128) and read them as compiler-managed VMEM inputs, so the
