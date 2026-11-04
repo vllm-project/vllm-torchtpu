@@ -227,7 +227,7 @@ def main() -> None:
             TORCH_TPU_BASE_PORT="19000",
             HOST="127.0.0.1",
             HEADLESS=str(int(worker)),
-            TPU_DEEPSEEK_V41_ENGRAM_HBM="first",
+            TPU_DEEPSEEK_V41_ENGRAM_HBM="all",
             MOE_FUSED_EP_KERNEL_IMPL="push",
             MOE_FUSED_EP_PUSH_SC_PREPUSH="2",
             MOE_FUSED_EP_PUSH_TC_EXCHANGE="1",
@@ -257,12 +257,15 @@ def main() -> None:
                 }
             ),
         ]
+    # Host channels need one Engram DP group spanning every rank; multi-host
+    # serves every Engram layer from its HBM copy instead.
+    engram_transfer = "hbm" if multihost else "native_host_channel"
     manifest = {
         "scenario": args.scenario,
         "compile_sizes": buckets,
         "cache_mode": "disabled",
         "serialization": "enabled",
-        "engram_transfer": "raw_dma",
+        "engram_transfer": engram_transfer,
         "tier2": "disabled (public and internal)",
         "packages": {
             name: importlib.metadata.version(name)
@@ -274,7 +277,7 @@ def main() -> None:
         manifest.update(
             host_rank=args.host_rank,
             hostname=socket.gethostname(),
-            engram_hbm="first",
+            engram_hbm="all",
             engram_dp_shared_memory=False,
             moe_kernel=env["MOE_FUSED_EP_KERNEL_IMPL"],
             moe_push_sc_prepush=int(env["MOE_FUSED_EP_PUSH_SC_PREPUSH"]),
@@ -288,7 +291,7 @@ def main() -> None:
     model = Path(env["MODEL_PATH"])
     identity = {
         "scenario": args.scenario,
-        "engram_transfer": "raw_dma",
+        "engram_transfer": engram_transfer,
         "compile_sizes": buckets,
         "packages": manifest["packages"],
         "torchtpu": source_identity(

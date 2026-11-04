@@ -1,14 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
-"""100% full-module line and branch coverage tests for DeepSeek-V4.1
-v2/model.py and v2/host_engram.py.
-
-Covers all lines and branch decision points in:
-- src/vllm_torchtpu/models/vllm/deepseek_v41/v2/host_engram.py (lines 1-82)
-- src/vllm_torchtpu/models/vllm/deepseek_v41/v2/model.py (lines 1-758)
-"""
+"""Full-module line and branch coverage tests for DeepSeek-V4.1 v2/model.py."""
 
 from __future__ import annotations
 
+import contextlib
 import ctypes
 import os
 import sys
@@ -17,7 +12,6 @@ from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock, patch
 
-import numpy as np
 import pytest
 import torch
 
@@ -27,14 +21,7 @@ os.environ.setdefault("TPU_SKIP_MDS_QUERY", "true")
 
 from vllm.config import CompilationMode
 
-from vllm_torchtpu.layers.core.sequence_layout import SequenceLayoutKind
 from vllm_torchtpu.models.vllm.deepseek_v41.v2.ced import DecoderReplayPlan
-from vllm_torchtpu.models.vllm.deepseek_v41.v2.host_engram import (
-    HOST_ENGRAM_KEY,
-    HostEngramInputs,
-    capture_host_engram_inputs,
-    install_host_engram_inputs,
-)
 from vllm_torchtpu.models.vllm.deepseek_v41.v2.model import (
     DeepseekV41DecoderLayer,
     DeepseekV41DecoderStage,
@@ -46,7 +33,6 @@ from vllm_torchtpu.models.vllm.deepseek_v41.v2.model import (
     _StageBase,
     _use_sequence_parallel,
 )
-from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 
 # ==============================================================================
 # Helper Mock Factories
@@ -67,26 +53,6 @@ class _FakeAttnMeta:
     query_start_loc: Any = None
     seq_lens: Any = None
     block_tables: Any = None
-
-
-def _mock_runner(
-    seq_lens: list[int],
-    num_prompt: list[int],
-    kind: SequenceLayoutKind = SequenceLayoutKind.ALL,
-    has_plan: bool = True,
-) -> SimpleNamespace:
-    plan = SimpleNamespace(kind=kind) if has_plan else None
-    return SimpleNamespace(
-        _last_sequence_layout_plan=plan,
-        input_batch=SimpleNamespace(num_prompt_tokens=np.array(num_prompt)),
-        seq_lens_np=np.array(seq_lens),
-        input_ids_cpu=torch.tensor([1, 2, 3, 4], dtype=torch.int32),
-        positions_cpu=torch.tensor([0, 1, 2, 3], dtype=torch.int64),
-        query_start_loc_cpu=torch.tensor([0, 2, 4], dtype=torch.int32),
-        lookback_token_ids=SimpleNamespace(
-            cpu=torch.tensor([[10, 11], [20, 21]], dtype=torch.int32)
-        ),
-    )
 
 
 def _mock_vllm_config(
@@ -129,102 +95,6 @@ def _mock_vllm_config(
         speculative_config=speculative_config,
         kernel_config=kernel_config,
     )
-
-
-# ==============================================================================
-# 1. Tests for host_engram.py
-# ==============================================================================
-
-
-class TestHostEngram:
-    def test_host_engram_inputs_dataclass(self) -> None:
-        inputs = HostEngramInputs(
-            input_ids=torch.tensor([1, 2]),
-            positions=torch.tensor([0, 1]),
-            query_start_loc=torch.tensor([0, 2]),
-            lookback_token_ids=torch.tensor([[10]]),
-            all_prompt=True,
-        )
-        assert inputs.all_prompt is True
-        assert inputs.input_ids.shape == (2,)
-
-    def test_capture_host_engram_inputs_none_when_no_plan(self) -> None:
-        runner = _mock_runner([2, 2], [5, 5], has_plan=False)
-        assert capture_host_engram_inputs(runner, 2) is None
-
-    def test_capture_host_engram_inputs_none_when_kind_not_all(self) -> None:
-        other_kind = next(
-            k for k in SequenceLayoutKind if k is not SequenceLayoutKind.ALL
-        )
-        runner = _mock_runner([2, 2], [5, 5], kind=other_kind)
-        assert capture_host_engram_inputs(runner, 2) is None
-
-    def test_capture_host_engram_inputs_all_prompt_true_and_false(self) -> None:
-        runner_prompt = _mock_runner([2, 3], [5, 5])
-        captured_prompt = capture_host_engram_inputs(runner_prompt, 2)
-        assert captured_prompt is not None
-        assert captured_prompt.all_prompt is True
-        assert torch.equal(captured_prompt.input_ids, runner_prompt.input_ids_cpu)
-        assert torch.equal(captured_prompt.positions, runner_prompt.positions_cpu)
-        assert torch.equal(
-            captured_prompt.query_start_loc, runner_prompt.query_start_loc_cpu
-        )
-        assert torch.equal(
-            captured_prompt.lookback_token_ids, runner_prompt.lookback_token_ids.cpu
-        )
-
-        runner_decode = _mock_runner([6, 3], [5, 5])
-        captured_decode = capture_host_engram_inputs(runner_decode, 2)
-        assert captured_decode is not None
-        assert captured_decode.all_prompt is False
-
-    def test_install_host_engram_inputs_lifecycle_and_idempotency(self) -> None:
-        orig_fn = TPUModelRunner._prepare_lookback_token_ids
-
-        def dummy_prepare(self: object, num_reqs: int) -> torch.Tensor:
-            return torch.tensor([123])
-
-        try:
-            TPUModelRunner._prepare_lookback_token_ids = dummy_prepare
-
-            mock_ctx = SimpleNamespace(additional_kwargs={})
-            mock_runner_inst = _mock_runner([2], [5])
-            mock_is_avail = MagicMock(return_value=True)
-
-            with (
-                patch(
-                    "vllm_torchtpu.models.vllm.deepseek_v41.v2.host_engram.is_forward_context_available",
-                    mock_is_avail,
-                ),
-                patch(
-                    "vllm_torchtpu.models.vllm.deepseek_v41.v2.host_engram.get_forward_context",
-                    return_value=mock_ctx,
-                ),
-            ):
-                # First install
-                install_host_engram_inputs()
-                wrapped = TPUModelRunner._prepare_lookback_token_ids
-                assert getattr(wrapped, "_deepseek_v41_host_engram", False) is True
-
-                # Idempotent second install does not re-wrap
-                install_host_engram_inputs()
-                assert TPUModelRunner._prepare_lookback_token_ids is wrapped
-
-                # Execution with forward context available
-                res = TPUModelRunner._prepare_lookback_token_ids(mock_runner_inst, 1)
-                assert torch.equal(res, torch.tensor([123]))
-                assert HOST_ENGRAM_KEY in mock_ctx.additional_kwargs
-                assert isinstance(
-                    mock_ctx.additional_kwargs[HOST_ENGRAM_KEY], HostEngramInputs
-                )
-
-                # Execution without forward context available (covers 74->78 branch)
-                mock_is_avail.return_value = False
-                res2 = TPUModelRunner._prepare_lookback_token_ids(mock_runner_inst, 1)
-                assert torch.equal(res2, torch.tensor([123]))
-
-        finally:
-            TPUModelRunner._prepare_lookback_token_ids = orig_fn
 
 
 # ==============================================================================
@@ -496,9 +366,6 @@ class TestModelEngramMethods:
         hash_state.lookback_depth = 2
         hash_state.multipliers = torch.zeros((4,))
         hash_state.ensure_cache = MagicMock(return_value=True)
-        hash_state.hash_on_host = MagicMock(
-            return_value=torch.ones((2, 4, 1), dtype=torch.int32)
-        )
         hash_state.return_value = torch.ones((2, 4, 1), dtype=torch.int32)
         hash_state.dummy_hashes = MagicMock(
             return_value=(
@@ -521,393 +388,133 @@ class TestModelEngramMethods:
         model_no_engram.layers = [SimpleNamespace()]
         assert model_no_engram._has_cpu_offloaded_engram() is False
 
-    def test_host_hash_inputs_branches(self) -> None:
-        model = self._create_mock_model(cpu_offload=True)
-        input_ids = torch.tensor([1, 2], dtype=torch.int32)
+    @contextlib.contextmanager
+    def _context(self):
         swa_meta = SimpleNamespace(
-            query_start_loc=torch.tensor([0, 2], dtype=torch.int32),
+            query_start_loc=torch.tensor([0, 2]),
+            seq_lens=torch.tensor([2]),
             block_tables=None,
         )
-        lookback = torch.tensor([[10, 11]], dtype=torch.int32)
+        ctx = SimpleNamespace(attn_metadata={"swa_0": swa_meta}, additional_kwargs={})
+        prefix = "vllm_torchtpu.models.vllm.deepseek_v41.v2.model"
+        with contextlib.ExitStack() as stack:
+            for name, value in (
+                ("upstream.is_forward_context_available", True),
+                ("upstream.get_forward_context", ctx),
+                ("_cache_slots", None),
+                ("_block_table", None),
+            ):
+                stack.enter_context(patch(f"{prefix}.{name}", return_value=value))
+            # The fixtures' engrams are namespaces; accept them as Engram layers.
+            stack.enter_context(patch(f"{prefix}.Engram", SimpleNamespace))
+            yield
 
-        # 1. lookback is None
-        assert model._host_hash_inputs(input_ids, swa_meta, None) is None
-
-        # 2. torch.compiler.is_compiling() is True
-        with patch("torch.compiler.is_compiling", return_value=True):
-            assert model._host_hash_inputs(input_ids, swa_meta, lookback) is None
-
-        # 3. Not cpu offloaded
-        with patch.object(model, "_has_cpu_offloaded_engram", return_value=False):
-            assert model._host_hash_inputs(input_ids, swa_meta, lookback) is None
-
-        # 4. host is None
-        mock_ctx = SimpleNamespace(additional_kwargs={})
-        with patch(
-            "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.upstream.get_forward_context",
-            return_value=mock_ctx,
-        ):
-            assert model._host_hash_inputs(input_ids, swa_meta, lookback) is None
-
-        # 5. host is not all_prompt
-        mock_ctx.additional_kwargs[HOST_ENGRAM_KEY] = HostEngramInputs(
-            input_ids=input_ids,
-            positions=torch.tensor([0, 1]),
-            query_start_loc=swa_meta.query_start_loc,
-            lookback_token_ids=lookback,
-            all_prompt=False,
-        )
-        with patch(
-            "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.upstream.get_forward_context",
-            return_value=mock_ctx,
-        ):
-            assert model._host_hash_inputs(input_ids, swa_meta, lookback) is None
-
-        # 6. Valid host inputs
-        mock_ctx.additional_kwargs[HOST_ENGRAM_KEY] = HostEngramInputs(
-            input_ids=input_ids,
-            positions=torch.tensor([0, 1]),
-            query_start_loc=swa_meta.query_start_loc,
-            lookback_token_ids=lookback,
-            all_prompt=True,
-        )
-        with patch(
-            "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.upstream.get_forward_context",
-            return_value=mock_ctx,
-        ):
-            res = model._host_hash_inputs(input_ids, swa_meta, lookback)
-            assert res is not None
-            assert len(res) == 6
-            assert torch.equal(res[0], input_ids)
-
-    def test_prepare_engram_early_exits_and_skip_lookup(self) -> None:
+    def test_prepare_engram_early_exits(self) -> None:
         model = self._create_mock_model(cpu_offload=True)
         pos = torch.tensor([0, 1], dtype=torch.int64)
-
-        # 1. stage == "decoder"
-        assert model._prepare_engram(
-            torch.tensor([1, 2]), pos, None, stage="decoder"
-        ) == (None, None)
-
-        # 2. input_ids is None
-        assert model._prepare_engram(None, pos, None, stage="full") == (None, None)
-
-        # 3. is_forward_context_available is False
+        hidden = torch.ones(2, 4)
+        ids = torch.tensor([1, 2])
+        assert model._prepare_engram(ids, pos, None, hidden, stage="decoder") == (
+            None,
+            None,
+            hidden,
+        )
+        assert model._prepare_engram(None, pos, None, hidden) == (None, None, hidden)
         with patch(
             "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.upstream.is_forward_context_available",
             return_value=False,
         ):
-            assert model._prepare_engram(
-                torch.tensor([1, 2]), pos, None, stage="full"
-            ) == (None, None)
-
-        # 4. engram_hash is None
-        model_no_hash = self._create_mock_model()
-        model_no_hash.engram_hash = None
-        assert model_no_hash._prepare_engram(
-            torch.tensor([1, 2]), pos, None, stage="full"
-        ) == (None, None)
-
-        # 5. skip_lookup is True
-        input_ids = torch.tensor([1, 2], dtype=torch.int32)
-        swa_meta = SimpleNamespace(
-            query_start_loc=torch.tensor([0, 2]),
-            seq_lens=torch.tensor([2]),
-            block_tables=None,
-        )
-        mock_ctx = SimpleNamespace(
-            attn_metadata={"swa_0": swa_meta}, additional_kwargs={}
-        )
-        with (
-            patch(
-                "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.upstream.is_forward_context_available",
-                return_value=True,
-            ),
-            patch(
-                "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.upstream.get_forward_context",
-                return_value=mock_ctx,
-            ),
-        ):
-            hashes, mask = model._prepare_engram(
-                input_ids, pos, None, stage="full", skip_lookup=True
+            assert model._prepare_engram(ids, pos, None, hidden) == (
+                None,
+                None,
+                hidden,
             )
-            assert hashes is not None
-            assert hashes.shape == (2, 4, 1)
-            assert mask is not None
+        model.engram_hash = None
+        assert model._prepare_engram(ids, pos, None, hidden) == (None, None, hidden)
 
-    def test_prepare_engram_lookback_handling_and_dp_dummy_hashes(self) -> None:
-        model = self._create_mock_model(cpu_offload=True)
+    def test_prepare_engram_device_table_uses_gathered_hashes(self) -> None:
+        model = self._create_mock_model(cpu_offload=False)
         pos = torch.tensor([0, 1], dtype=torch.int64)
-        input_ids = torch.tensor([1, 2], dtype=torch.int32)
-        swa_meta = SimpleNamespace(
-            query_start_loc=torch.tensor([0, 2]),
-            seq_lens=torch.tensor([2]),
-            block_tables=None,
-        )
-        mock_ctx = SimpleNamespace(
-            attn_metadata={"swa_0": swa_meta}, additional_kwargs={}
-        )
-
-        # 1. lookback is None with use_slot_cache=False -> raises NotImplementedError
-        model.engram_hash.use_slot_cache = False
+        ids = torch.tensor([1, 2], dtype=torch.int32)
+        gathered = torch.full((2, 4, 1), 7, dtype=torch.int32)
         with (
-            patch(
-                "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.upstream.is_forward_context_available",
-                return_value=True,
-            ),
-            patch(
-                "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.upstream.get_forward_context",
-                return_value=mock_ctx,
-            ),
-            pytest.raises(
-                NotImplementedError, match="engram needs `lookback_token_ids`"
-            ),
-        ):
-            model._prepare_engram(input_ids, pos, None, stage="full")
-
-        # 2. lookback is None with use_slot_cache=True -> creates dummy
-        # lookback and calls hash
-        model.engram_hash.use_slot_cache = True
-        with (
-            patch(
-                "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.upstream.is_forward_context_available",
-                return_value=True,
-            ),
-            patch(
-                "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.upstream.get_forward_context",
-                return_value=mock_ctx,
-            ),
-            patch(
-                "vllm_torchtpu.models.vllm.deepseek_v41.v2.model._block_table",
-                return_value=None,
-            ),
-            patch(
-                "vllm_torchtpu.models.vllm.deepseek_v41.v2.model._cache_slots",
-                return_value=None,
-            ),
+            self._context(),
             patch(
                 "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.upstream.gather_engram_hashes",
-                return_value=torch.zeros((2, 4, 1)),
+                return_value=gathered,
             ),
         ):
-            hashes, mask = model._prepare_engram(input_ids, pos, None, stage="full")
-            assert hashes is not None
-            model.layers[0].engram.prepare_embeddings.assert_called_once()
-
-        # 3. attn_metadata is a list (ubatch wrapper)
-        mock_ctx_list = SimpleNamespace(
-            attn_metadata=[{"swa_0": swa_meta}], additional_kwargs={}
-        )
-        with (
-            patch(
-                "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.upstream.is_forward_context_available",
-                return_value=True,
-            ),
-            patch(
-                "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.upstream.get_forward_context",
-                return_value=mock_ctx_list,
-            ),
-            patch(
-                "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.upstream.dbo_current_ubatch_id",
-                return_value=0,
-            ),
-            patch(
-                "vllm_torchtpu.models.vllm.deepseek_v41.v2.model._block_table",
-                return_value=None,
-            ),
-            patch(
-                "vllm_torchtpu.models.vllm.deepseek_v41.v2.model._cache_slots",
-                return_value=None,
-            ),
-            patch(
-                "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.upstream.gather_engram_hashes",
-                return_value=torch.zeros((2, 4, 1)),
-            ),
-        ):
-            hashes, mask = model._prepare_engram(
-                input_ids, pos, torch.tensor([[10, 11]]), stage="full"
-            )
-            assert hashes is not None
-
-        # 4. ensure_cache() returns False with engram_dp_shared_memory=False
-        # and dp_size > 1
-        model.engram_hash.ensure_cache.return_value = False
-        model.engram_dp_shared_memory = False
-        with (
-            patch(
-                "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.upstream.is_forward_context_available",
-                return_value=True,
-            ),
-            patch(
-                "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.upstream.get_forward_context",
-                return_value=mock_ctx,
-            ),
-            patch(
-                "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.upstream.get_engram_dp_size",
-                return_value=2,
-            ),
-            patch(
-                "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.upstream.gather_engram_hashes",
-                return_value=torch.zeros((2, 4, 1)),
-            ),
-        ):
-            hashes, mask = model._prepare_engram(input_ids, pos, None, stage="full")
-            assert hashes is not None
-            model.engram_hash.dummy_hashes.assert_called_once()
-
-        # 5. The host collective already returns CPU hashes; do not copy again.
-        model.engram_hash.ensure_cache.return_value = True
-        gathered_hashes = torch.zeros((2, 4, 1), dtype=torch.int32)
+            hashes, mask, out = model._prepare_engram(ids, pos, None, torch.ones(2, 4))
+        assert hashes.shape == (2, 4, 1) and mask is not None
+        # No lookback from the runner: one dead row per request.
+        assert model.engram_hash.call_args.args[4].shape == (1, 2)
         prepared = model.layers[0].engram.prepare_embeddings
-        prepared.reset_mock()
-        with (
-            patch(
-                "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.upstream.is_forward_context_available",
-                return_value=True,
-            ),
-            patch(
-                "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.upstream.get_forward_context",
-                return_value=mock_ctx,
-            ),
-            patch(
-                "vllm_torchtpu.models.vllm.deepseek_v41.v2.model._block_table",
-                return_value=None,
-            ),
-            patch(
-                "vllm_torchtpu.models.vllm.deepseek_v41.v2.model._cache_slots",
-                return_value=None,
-            ),
-            patch(
-                "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.upstream.gather_engram_hashes",
-                return_value=gathered_hashes,
-            ),
-            patch.object(
-                gathered_hashes, "to", wraps=gathered_hashes.to
-            ) as gathered_to,
-        ):
-            model._prepare_engram(
-                input_ids, pos, torch.tensor([[10, 11]]), stage="full"
-            )
-            gathered_to.assert_not_called()
-            prepared.assert_called_once()
-            torch.testing.assert_close(
-                prepared.call_args.args[0], gathered_hashes[:, 0]
+        prepared.assert_called_once()
+        torch.testing.assert_close(prepared.call_args.args[0], gathered[:, 0])
+
+    def test_prepare_engram_starts_host_channels_in_layer_order(self) -> None:
+        model = self._create_mock_model(cpu_offload=True)
+        order = []
+
+        def engram(index):
+            def start(local, host, hidden):
+                order.append((index, local.shape, host.shape))
+                return hidden + 1
+
+            return SimpleNamespace(
+                embed_tokens=SimpleNamespace(host_offload=True),
+                layer_hash_index=index,
+                host_channel=object(),
+                start_host_embeddings=start,
             )
 
-        # 6. host is not None calls hash_on_host (line 270) and layer with no
-        # engram (branch 303->301)
-        model_host = self._create_mock_model(cpu_offload=True)
-        model_host.layers.append(SimpleNamespace(engram=None))
-        model_host.end_layer = 2
-        model_host._host_hash_inputs = MagicMock(
-            return_value=(
-                input_ids,
-                pos,
-                swa_meta.query_start_loc,
-                None,
-                torch.tensor([[10, 11]]),
-                None,
-            )
-        )
+        model.layers = [SimpleNamespace(engram=engram(0)), SimpleNamespace(engram=None)]
+        model.layers.append(SimpleNamespace(engram=engram(1)))
+        model.end_layer = 3
+        pos = torch.tensor([0, 1], dtype=torch.int64)
+        ids = torch.tensor([1, 2], dtype=torch.int32)
+        model.engram_hash.return_value = torch.ones((2, 2, 3), dtype=torch.int32)
         with (
+            self._context(),
             patch(
-                "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.upstream.is_forward_context_available",
-                return_value=True,
-            ),
-            patch(
-                "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.upstream.get_forward_context",
-                return_value=mock_ctx,
-            ),
-            patch(
-                "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.upstream.gather_engram_hashes",
-                return_value=torch.zeros((2, 4, 1)),
-            ),
+                "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.engram_host_channel_op.gather_hashes",
+                side_effect=lambda h: torch.cat([h, h]),
+            ) as gather,
         ):
-            h_host, m_host = model_host._prepare_engram(
-                input_ids, pos, torch.tensor([[10, 11]]), stage="full"
+            _, _, out = model._prepare_engram(
+                ids, pos, torch.tensor([[3, 4]]), torch.zeros(2, 4)
             )
-            model_host.engram_hash.hash_on_host.assert_called_once()
-            assert h_host is not None
+        gather.assert_called_once()  # one ICI all-gather for every channel
+        assert order == [(0, (2, 3), (4, 3)), (1, (2, 3), (4, 3))]
+        # The hidden states are ordered after both requests.
+        assert torch.equal(out, torch.full((2, 4), 2.0))
 
-        # 7. ensure_cache False with engram_dp_shared_memory=True (branch 286->290)
-        model_shm = self._create_mock_model()
-        model_shm.engram_hash.ensure_cache.return_value = False
-        model_shm.engram_dp_shared_memory = True
+    def test_prepare_engram_dummy_hashes_join_dp_lookups(self) -> None:
+        model = self._create_mock_model(cpu_offload=False)
+        model.engram_dp_shared_memory = False
+        model.engram_hash.ensure_cache.return_value = False
+        pos = torch.tensor([0, 1], dtype=torch.int64)
+        ids = torch.tensor([1, 2], dtype=torch.int32)
         with (
-            patch(
-                "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.upstream.is_forward_context_available",
-                return_value=True,
-            ),
-            patch(
-                "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.upstream.get_forward_context",
-                return_value=mock_ctx,
-            ),
-        ):
-            h_shm, m_shm = model_shm._prepare_engram(input_ids, pos, None, stage="full")
-            assert h_shm is None
-            assert m_shm is None
-
-        # 8. dummy_hashes with skip_lookup=True (branch 290->307)
-        model_dummy = self._create_mock_model()
-        model_dummy.engram_hash.ensure_cache.return_value = False
-        model_dummy.engram_dp_shared_memory = False
-        with (
-            patch(
-                "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.upstream.is_forward_context_available",
-                return_value=True,
-            ),
-            patch(
-                "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.upstream.get_forward_context",
-                return_value=mock_ctx,
-            ),
+            self._context(),
             patch(
                 "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.upstream.get_engram_dp_size",
-                return_value=2,
-            ),
-        ):
-            h_dum, m_dum = model_dummy._prepare_engram(
-                input_ids, pos, None, stage="full", skip_lookup=True
-            )
-            assert h_dum is not None
-            assert m_dum is not None
-
-        # 9. stage == "encoder" scopes layer iteration to _ced_boundary
-        model_enc = self._create_mock_model(cpu_offload=True)
-        dec_engram = SimpleNamespace(
-            embed_tokens=SimpleNamespace(host_offload=True),
-            layer_hash_index=0,
-            prepare_embeddings=MagicMock(),
-        )
-        model_enc.layers.append(SimpleNamespace(engram=dec_engram))
-        model_enc.end_layer = 2
-        model_enc._ced_boundary = 1
-        with (
-            patch(
-                "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.upstream.is_forward_context_available",
-                return_value=True,
-            ),
-            patch(
-                "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.upstream.get_forward_context",
-                return_value=mock_ctx,
-            ),
-            patch(
-                "vllm_torchtpu.models.vllm.deepseek_v41.v2.model._block_table",
-                return_value=None,
-            ),
-            patch(
-                "vllm_torchtpu.models.vllm.deepseek_v41.v2.model._cache_slots",
-                return_value=None,
+                return_value=8,
             ),
             patch(
                 "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.upstream.gather_engram_hashes",
-                return_value=torch.zeros((2, 4, 1)),
+                side_effect=lambda h, **_: h,
             ),
         ):
-            model_enc._prepare_engram(
-                input_ids, pos, torch.tensor([[10, 11]]), stage="encoder"
-            )
-            model_enc.layers[0].engram.prepare_embeddings.assert_called_once()
-            dec_engram.prepare_embeddings.assert_not_called()
+            hashes, mask, _ = model._prepare_engram(ids, pos, None, torch.ones(2, 4))
+        model.engram_hash.dummy_hashes.assert_called_once()
+        assert hashes is not None and mask is not None
+        model.layers[0].engram.prepare_embeddings.assert_called_once()
+
+        # A shared table needs no collective, so an idle replica skips it.
+        model.engram_dp_shared_memory = True
+        with self._context():
+            assert model._prepare_engram(ids, pos, None, torch.ones(2, 4))[0] is None
 
 
 # ==============================================================================
@@ -936,7 +543,9 @@ class TestModelForward:
         model.config = SimpleNamespace(hidden_size=64)
         model._engram_prepared_outside_stage = False
         model._has_cpu_offloaded_engram = MagicMock(return_value=cpu_offload)
-        model._prepare_engram = MagicMock(return_value=(None, None))
+        model._prepare_engram = MagicMock(
+            side_effect=lambda *a, **kw: (None, None, a[3])
+        )
         return model
 
     def test_forward_non_ced_path(self) -> None:
@@ -950,17 +559,6 @@ class TestModelForward:
         upload.assert_not_called()
         assert res.shape == (4, 64)
         model.full_stage.assert_called_once()
-
-    def test_forward_offload_engram_mega_moe_int64(self) -> None:
-        model = self._create_model(
-            ced_enabled=False, cpu_offload=True, use_native_mega_moe=True
-        )
-        model.full_stage = MagicMock(return_value=torch.zeros((2, 64)))
-        inp = torch.tensor([1, 2], dtype=torch.int32)
-        model.forward(inp, torch.tensor([0, 1]))
-        model._prepare_engram.assert_called_once()
-        prep_inp = model._prepare_engram.call_args[0][0]
-        assert prep_inp.dtype == torch.int64
 
     def test_forward_ced_incomplete_prefill_early_exit(self) -> None:
         model = self._create_model(ced_enabled=True)
@@ -1083,7 +681,9 @@ class TestModelForwardStage:
         model.use_native_mega_moe = use_native_mega_moe
         model._engram_prepared_outside_stage = False
         model._has_cpu_offloaded_engram = MagicMock(return_value=False)
-        model._prepare_engram = MagicMock(return_value=(None, None))
+        model._prepare_engram = MagicMock(
+            side_effect=lambda *a, **kw: (None, None, a[3])
+        )
         model.aux_hidden_state_layers = [1, 2]
         model.embed_input_ids = MagicMock(
             side_effect=lambda x: torch.ones((x.shape[0], 64))
@@ -1770,7 +1370,7 @@ class TestDeepseekV41ForCausalLM:
         ("dp_size", "engram_dp_size"),
         [(8, 8), (16, 8), (24, 8), (32, 8), (64, 8), (12, 4)],
     )
-    def test_dp_accepts_both_host_table_layouts(
+    def test_dp_uses_per_rank_host_tables(
         self,
         shared_memory: bool,
         resolved_shared_memory: bool,
@@ -1783,8 +1383,9 @@ class TestDeepseekV41ForCausalLM:
         )
 
         def init(self, *, vllm_config, prefix=""):
-            # Upstream may disable sharing when /dev/shm is too small.
-            vllm_config.engram_config.dp_shared_memory = resolved_shared_memory
+            # Upstream may only disable sharing (e.g. /dev/shm is too small).
+            if vllm_config.engram_config.dp_shared_memory:
+                vllm_config.engram_config.dp_shared_memory = resolved_shared_memory
             self.config = SimpleNamespace(expert_dtype="fp4")
 
         with (
@@ -1793,9 +1394,6 @@ class TestDeepseekV41ForCausalLM:
                 "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.upstream.get_engram_dp_size",
                 return_value=engram_dp_size,
             ),
-            patch(
-                "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.install_host_engram_inputs"
-            ) as mock_host_engram,
             patch(
                 "vllm.models.deepseek_v41.nvidia.model.DeepseekV41LLMForCausalLM.__init__",
                 init,
@@ -1808,9 +1406,9 @@ class TestDeepseekV41ForCausalLM:
             model = DeepseekV41ForCausalLM.__new__(DeepseekV41ForCausalLM)
             model.__init__(vllm_config=cfg)
 
-        assert cfg.engram_config.dp_shared_memory is resolved_shared_memory
+        # Host channels need per-rank head shards, whatever upstream resolved.
+        assert cfg.engram_config.dp_shared_memory is False
         assert model.hf_to_vllm_mapper == "mock_mapper"
-        mock_host_engram.assert_called_once()
 
     @pytest.mark.cpu_test
     @pytest.mark.parametrize("engram_dp_size", [1, 3, 32])
@@ -1846,14 +1444,12 @@ class TestDeepseekV41ForCausalLM:
 
     def test_init_hooks_and_weight_mapper(self) -> None:
         cfg = _mock_vllm_config(async_scheduling=True)
+        cfg.engram_config = SimpleNamespace(cpu_offload=True, dp_shared_memory=None)
         with (
             patch.dict(os.environ, {"TPU_DEEPSEEK_V41_ENGRAM_CPU_OFFLOAD": "1"}),
             patch(
                 "vllm_torchtpu.models.vllm.deepseek_v41.v2.async_fence.install_lookback_fence"
             ) as mock_fence,
-            patch(
-                "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.install_host_engram_inputs"
-            ) as mock_host_engram,
             patch(
                 "vllm.models.deepseek_v41.nvidia.model.DeepseekV41LLMForCausalLM.__init__",
                 return_value=None,
@@ -1867,7 +1463,7 @@ class TestDeepseekV41ForCausalLM:
             model_inst.config = SimpleNamespace(expert_dtype="fp4")
             model_inst.__init__(vllm_config=cfg)
             mock_fence.assert_called_once()
-            mock_host_engram.assert_called_once()
+            assert cfg.engram_config.dp_shared_memory is False
             mock_make_mapper.assert_called_once_with("fp4", "weight_scale_inv")
             assert model_inst.hf_to_vllm_mapper == "mock_mapper"
 
@@ -1878,9 +1474,6 @@ class TestDeepseekV41ForCausalLM:
             patch(
                 "vllm_torchtpu.models.vllm.deepseek_v41.v2.async_fence.install_lookback_fence"
             ) as mock_fence,
-            patch(
-                "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.install_host_engram_inputs"
-            ) as mock_host_engram,
             patch(
                 "vllm.models.deepseek_v41.nvidia.model.DeepseekV41LLMForCausalLM.__init__",
                 return_value=None,
@@ -1894,7 +1487,6 @@ class TestDeepseekV41ForCausalLM:
             model_inst.config = SimpleNamespace()
             model_inst.__init__(vllm_config=cfg_sync)
             mock_fence.assert_not_called()
-            mock_host_engram.assert_not_called()
 
     def test_forward_ensure_cache_branches(self) -> None:
         model_inst = DeepseekV41ForCausalLM.__new__(DeepseekV41ForCausalLM)

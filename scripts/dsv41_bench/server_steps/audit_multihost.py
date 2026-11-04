@@ -23,7 +23,7 @@ def audit(root: Path) -> dict:
         for key, expected in {
             "compile_sizes": [288, 2048],
             "cache_mode": "disabled",
-            "engram_hbm": "first",
+            "engram_hbm": "all",
             "engram_dp_shared_memory": False,
             "moe_kernel": "push",
             "moe_push_sc_prepush": 2,

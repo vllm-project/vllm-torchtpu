@@ -230,30 +230,25 @@ def test_prepare_engram_early_exits(monkeypatch: pytest.MonkeyPatch):
     )
     pos = torch.zeros(4, dtype=torch.int32)
     ids = torch.zeros(4, dtype=torch.int32)
+    hidden = torch.ones(4, 2)
+
+    def prepare(input_ids, stage="full"):
+        return v2_model.DeepseekV41Model._prepare_engram(
+            model, input_ids, pos, None, hidden, stage=stage
+        )
 
     # stage == 'decoder'
-    assert v2_model.DeepseekV41Model._prepare_engram(
-        model, ids, pos, None, stage="decoder"
-    ) == (None, None)
-
+    assert prepare(ids, stage="decoder") == (None, None, hidden)
     # engram_hash is None
-    assert v2_model.DeepseekV41Model._prepare_engram(
-        model, ids, pos, None, stage="full"
-    ) == (None, None)
-
+    assert prepare(ids) == (None, None, hidden)
     # input_ids is None
     model.engram_hash = SimpleNamespace()
-    assert v2_model.DeepseekV41Model._prepare_engram(
-        model, None, pos, None, stage="full"
-    ) == (None, None)
-
+    assert prepare(None) == (None, None, hidden)
     # forward context unavailable
     monkeypatch.setattr(
         v2_model.upstream, "is_forward_context_available", lambda: False
     )
-    assert v2_model.DeepseekV41Model._prepare_engram(
-        model, ids, pos, None, stage="full"
-    ) == (None, None)
+    assert prepare(ids) == (None, None, hidden)
 
 
 def test_prepare_engram_full_path(monkeypatch: pytest.MonkeyPatch):
@@ -270,8 +265,12 @@ def test_prepare_engram_full_path(monkeypatch: pytest.MonkeyPatch):
 
     prepared_embeddings: list[torch.Tensor] = []
 
-    class _FakeEngram:
-        layer_hash_index = 0
+    class _FakeEngram(v2_model.Engram):
+        def __init__(self):
+            torch.nn.Module.__init__(self)
+            self.layer_hash_index = 0
+            self.embed_tokens = SimpleNamespace(host_offload=False)
+            self.host_channel = None
 
         def prepare_embeddings(self, h: torch.Tensor) -> None:
             prepared_embeddings.append(h)
@@ -287,7 +286,7 @@ def test_prepare_engram_full_path(monkeypatch: pytest.MonkeyPatch):
             return True
 
         def dummy_hashes(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-            return torch.zeros((x.shape[0], 3, 1)), torch.ones(
+            return torch.zeros((x.shape[0], 3, 1)), torch.zeros(
                 x.shape[0], dtype=torch.bool
             )
 
@@ -301,9 +300,6 @@ def test_prepare_engram_full_path(monkeypatch: pytest.MonkeyPatch):
         start_layer=0,
         end_layer=1,
         layers=[SimpleNamespace(engram=_FakeEngram())],
-        _has_cpu_offloaded_engram=lambda: True,
-        # Device hash path; the host path is covered by test_dsv41_v2_host_engram.
-        _host_hash_inputs=lambda *args: None,
     )
 
     monkeypatch.setattr(v2_model.upstream, "is_forward_context_available", lambda: True)
@@ -326,53 +322,37 @@ def test_prepare_engram_full_path(monkeypatch: pytest.MonkeyPatch):
 
     ids = torch.arange(4, dtype=torch.int32)
     pos = torch.arange(4, dtype=torch.int32)
+    hidden = torch.ones(4, 2)
 
-    # 1. skip_lookup=True
-    h, m = v2_model.DeepseekV41Model._prepare_engram(
-        model, ids, pos, None, skip_lookup=True
-    )
-    assert h is not None and h.shape == (4, 3, 1)
-    assert m is not None
-
-    # 2. skip_lookup=False, lookback_token_ids=None, use_slot_cache=False
-    model.engram_hash.use_slot_cache = False
-    with pytest.raises(NotImplementedError, match="lookback_token_ids"):
-        v2_model.DeepseekV41Model._prepare_engram(
-            model, ids, pos, None, skip_lookup=False
+    def prepare(lookback):
+        return v2_model.DeepseekV41Model._prepare_engram(
+            model, ids, pos, lookback, hidden
         )
 
-    # 3. skip_lookup=False, lookback_token_ids=None, use_slot_cache=True
+    # 1. lookback_token_ids=None needs the slot cache.
+    model.engram_hash.use_slot_cache = False
+    with pytest.raises(NotImplementedError, match="lookback_token_ids"):
+        prepare(None)
+
+    # 2. lookback_token_ids=None with the slot cache hashes on device.
     model.engram_hash.use_slot_cache = True
-    h, m = v2_model.DeepseekV41Model._prepare_engram(
-        model, ids, pos, None, skip_lookup=False
-    )
+    h, m, out = prepare(None)
     assert h is not None and h.shape == (4, 3, 1)
+    assert m is not None and m.all()
+    assert out is hidden
     assert len(prepared_embeddings) == 1
 
-    # 4. Fallback dummy_hashes collective branch (ensure_cache() is False, DP size > 1)
+    # 3. An idle replica of a DP-sharded table joins the collective lookup.
     model.engram_hash.ensure_cache = lambda: False
     monkeypatch.setattr(v2_model.upstream, "get_engram_dp_size", lambda: 2)
-    h_dummy, m_dummy = v2_model.DeepseekV41Model._prepare_engram(
-        model, ids, pos, None, skip_lookup=False
-    )
-    assert h_dummy is not None and m_dummy is not None
+    h_dummy, m_dummy, _ = prepare(None)
+    assert h_dummy is not None and m_dummy is not None and not m_dummy.any()
+    assert len(prepared_embeddings) == 2
 
-    # 5. lookback_token_ids already provided (not None)
+    # 4. Given lookback ids and dict metadata, device tables use the gathered
+    # hashes and layers without Engram are skipped.
     model.engram_hash.ensure_cache = lambda: True
-    lookback = torch.zeros((1, 4), dtype=torch.int32)
-    h_lookback, _ = v2_model.DeepseekV41Model._prepare_engram(
-        model, ids, pos, lookback, skip_lookup=False
-    )
-    assert h_lookback is not None
-
-    # 6. attn_metadata is direct dict (not list)
     ctx.attn_metadata = {"swa": meta}
-    h_dict, _ = v2_model.DeepseekV41Model._prepare_engram(
-        model, ids, pos, lookback, skip_lookup=False
-    )
-    assert h_dict is not None
-
-    # 7. Use the CPU collective result and skip layers without Engram.
     gathered_hashes = torch.arange(12, dtype=torch.int32).view(4, 3, 1)
     monkeypatch.setattr(
         v2_model.upstream,
@@ -381,19 +361,15 @@ def test_prepare_engram_full_path(monkeypatch: pytest.MonkeyPatch):
     )
     model.layers.append(SimpleNamespace(engram=None))
     model.end_layer = len(model.layers)
-    h_cpu, _ = v2_model.DeepseekV41Model._prepare_engram(
-        model, ids, pos, lookback, skip_lookup=False
-    )
+    lookback = torch.zeros((1, 4), dtype=torch.int32)
+    h_cpu, _, _ = prepare(lookback)
     assert h_cpu is not None
     torch.testing.assert_close(prepared_embeddings[-1], gathered_hashes[:, 0])
 
-    # 8. engram_dp_shared_memory=True when ensure_cache() is False
+    # 5. A shared table needs no collective, so an idle replica skips it.
     model.engram_hash.ensure_cache = lambda: False
     model.engram_dp_shared_memory = True
-    h_none, m_none = v2_model.DeepseekV41Model._prepare_engram(
-        model, ids, pos, lookback, skip_lookup=False
-    )
-    assert h_none is None and m_none is None
+    assert prepare(lookback) == (None, None, hidden)
 
 
 # ---------------------------------------------------------------------------
@@ -492,7 +468,7 @@ def test_model_forward_full_and_ced_paths(monkeypatch: pytest.MonkeyPatch):
             return False
 
         def _prepare_engram(self, *args, **kwargs):
-            return None, None
+            return None, None, args[3]
 
         def full_stage(self, *args, **kwargs):
             return torch.ones((4, 16), dtype=torch.bfloat16)
@@ -629,7 +605,7 @@ def test_forward_stage_decoder_and_encoder_paths(monkeypatch: pytest.MonkeyPatch
         end_layer=4,
         _stage_uses_sequence_parallel=lambda stage: False,
         use_native_mega_moe=False,
-        _prepare_engram=lambda *a, **kw: (None, None),
+        _prepare_engram=lambda *a, **kw: (None, None, a[3]),
         aux_hidden_state_layers=set(),
         layers=[_FakeCallableLayer() for _ in range(4)],
         norm=lambda x: x,
@@ -745,7 +721,7 @@ def test_forward_stage_pipeline_parallel_and_aux_hidden_states(
         end_layer=2,
         _stage_uses_sequence_parallel=lambda stage: True,
         use_native_mega_moe=True,
-        _prepare_engram=lambda *a, **kw: (None, None),
+        _prepare_engram=lambda *a, **kw: (None, None, a[3]),
         aux_hidden_state_layers={1, 2},
         layers=[_FakeAuxLayer(), _FakeAuxLayer()],
         norm=lambda x: x,
@@ -1065,414 +1041,7 @@ def test_deepseek_v41_causal_lm(monkeypatch: pytest.MonkeyPatch):
         v2_model.DeepseekV41ForCausalLM(vllm_config=vllm_cfg)
 
 
-def test_select_engram_split_layer(monkeypatch: pytest.MonkeyPatch):
-    def layer(host_offload):
-        if host_offload is None:
-            return SimpleNamespace(engram=None)
-        return SimpleNamespace(
-            engram=SimpleNamespace(
-                embed_tokens=SimpleNamespace(host_offload=host_offload)
-            )
-        )
-
-    model = SimpleNamespace(
-        start_layer=0,
-        _ced_boundary=6,
-        _tp_size=1,
-        use_sequence_parallel=True,
-        aux_hidden_state_layers=(8,),
-        layers=[layer(None), layer(True), layer(None), layer(False), layer(True)]
-        + [layer(None)] * 3,
-    )
-    select = v2_model.DeepseekV41Model._select_engram_split_layer
-    # The last host-offloaded Engram layer before the CED boundary.
-    assert select(model) == 4
-    # Sequence parallel shards encoder rows only at TP > 1.
-    model._tp_size = 2
-    assert select(model) is None
-    model._tp_size = 1
-    # Encoder aux hidden states would cross the head/tail boundary.
-    model.aux_hidden_state_layers = (3,)
-    assert select(model) is None
-    model.aux_hidden_state_layers = ()
-    model.layers[4] = layer(None)
-    model.layers[1] = layer(None)
-    assert select(model) is None
-
-
-def test_split_encoder_stages_tail_engram_after_head_dispatch(monkeypatch):
-    class TpuTensor(torch.Tensor):
-        @property
-        def device(self):
-            return SimpleNamespace(type="tpu")
-
-    order = []
-    carry = tuple(torch.ones(4, 16).as_subclass(TpuTensor) for _ in range(5))
-
-    def head(*args):
-        order.append("head")
-        return carry
-
-    def middle(ids, positions, *got):
-        assert all(a is b for a, b in zip(got, carry, strict=True))
-        order.append("middle")
-        return carry
-
-    hashes = object()
-
-    def stage_engram(start, end, gathered):
-        assert gathered is hashes
-        assert (start, end) in ((1, 14), (14, 20))
-        order.append((start, end))
-
-    def dispatch(tensors, wait):
-        assert wait is False
-        assert all(a is b for a, b in zip(tensors, carry, strict=True))
-        order.append("dispatch")
-
-    def tail(ids, positions, hidden, residual, post_mix, res_mix, pre_mix):
-        order.append("tail")
-        got = (hidden, residual, post_mix, res_mix, pre_mix)
-        assert all(a is b for a, b in zip(got, carry, strict=True))
-        return "encoded"
-
-    monkeypatch.setattr(v2_model, "synchronize_tensors", dispatch)
-    model = _model_stub(
-        start_layer=0,
-        encoder_head_stage=head,
-        encoder_middle_stage=middle,
-        encoder_tail_stage=tail,
-        _engram_first_split_layer=1,
-        _engram_split_layer=14,
-        _ced_boundary=20,
-        _engram_prepared_outside_stage=True,
-        _gathered_engram_hashes=hashes,
-        _stage_engram_layers=stage_engram,
-    )
-    out = v2_model.DeepseekV41Model._forward_split_encoder(
-        model, torch.arange(4), torch.arange(4), None, None, None
-    )
-    assert out == "encoded"
-    assert order == [
-        "head",
-        "dispatch",
-        (1, 14),
-        "middle",
-        "dispatch",
-        (14, 20),
-        "tail",
-    ]
-
-
 class _TpuTensor(torch.Tensor):
     @property
     def device(self):
         return SimpleNamespace(type="tpu")
-
-
-def test_split_encoder_downloads_deferred_hashes_after_head_dispatch(monkeypatch):
-    # A deferred device hash is downloaded only after the head is enqueued,
-    # and the downloaded hashes feed both later Engram segments.
-    order = []
-    carry = tuple(torch.ones(4, 16).as_subclass(_TpuTensor) for _ in range(5))
-    pending, gathered = object(), object()
-
-    def stage(name):
-        def call(*args):
-            order.append(name)
-            return "encoded" if name == "tail" else carry
-
-        return call
-
-    def download(hashes):
-        assert hashes is pending
-        order.append("download")
-        return gathered
-
-    def stage_engram(start, end, hashes):
-        assert hashes is gathered
-        order.append((start, end))
-
-    monkeypatch.setattr(
-        v2_model, "synchronize_tensors", lambda tensors, wait: order.append("dispatch")
-    )
-    model = _model_stub(
-        start_layer=0,
-        _engram_first_split_layer=1,
-        _engram_split_layer=14,
-        _ced_boundary=20,
-        _engram_prepared_outside_stage=True,
-        encoder_head_stage=stage("head"),
-        encoder_middle_stage=stage("middle"),
-        encoder_tail_stage=stage("tail"),
-        _pending_engram_hashes=pending,
-        _gathered_engram_hashes=None,
-        _gather_engram_hashes=download,
-        _stage_engram_layers=stage_engram,
-    )
-    out = v2_model.DeepseekV41Model._forward_split_encoder(
-        model, torch.arange(4), torch.arange(4), None, None, None
-    )
-    assert out == "encoded"
-    assert order == [
-        "head",
-        "dispatch",
-        "download",
-        (1, 14),
-        "middle",
-        "dispatch",
-        (14, 20),
-        "tail",
-    ]
-    assert model._pending_engram_hashes is None
-
-
-def test_defers_hash_download_only_before_an_engram_free_head():
-    device_hashes = torch.zeros(4, 3, 1).as_subclass(_TpuTensor)
-    model = _model_stub(
-        start_layer=0,
-        _engram_first_split_layer=2,
-        _engram_split_layer=4,
-        engram_dp_shared_memory=True,
-        layers=[SimpleNamespace(engram=None) for _ in range(6)],
-        _has_cpu_offloaded_engram=lambda: True,
-    )
-    defers = model._defers_hash_download
-    assert defers(device_hashes, "encoder")
-    # Host (prefill) hashes and unsplit stages keep the eager download.
-    assert not defers(torch.zeros(4, 3, 1), "encoder")
-    assert not defers(device_hashes, "full")
-    # A DP-sharded table gathers hashes with a collective every replica joins.
-    model.engram_dp_shared_memory = False
-    assert not defers(device_hashes, "encoder")
-    model.engram_dp_shared_memory = True
-    # A head layer with Engram needs the hashes before it runs.
-    model.layers[1] = SimpleNamespace(engram=object())
-    assert not defers(device_hashes, "encoder")
-    model.layers[1] = SimpleNamespace(engram=None)
-    model._engram_split_layer = None
-    assert not defers(device_hashes, "encoder")
-
-
-def test_prepare_engram_enqueues_deferred_device_hashes(monkeypatch):
-    device_hashes = torch.ones(4, 3, 1, dtype=torch.int32).as_subclass(_TpuTensor)
-
-    class Hash:
-        swa_cache_module = SimpleNamespace(kv_cache=None)
-
-        def ensure_cache(self):
-            return True
-
-        def __call__(self, *args):
-            return device_hashes
-
-    def no_download(hashes):
-        raise AssertionError("the head must dispatch before the hash download")
-
-    meta = SimpleNamespace(
-        seq_lens=torch.tensor([4]), query_start_loc=torch.tensor([0, 4])
-    )
-    ctx = SimpleNamespace(attn_metadata={"swa": meta})
-    monkeypatch.setattr(v2_model.upstream, "is_forward_context_available", lambda: True)
-    monkeypatch.setattr(v2_model.upstream, "get_forward_context", lambda: ctx)
-    monkeypatch.setattr(
-        v2_model.upstream,
-        "image_sentinel_mask",
-        lambda t: torch.zeros(t.shape, dtype=torch.bool),
-    )
-    monkeypatch.setattr(v2_model, "_cache_slots", lambda *a: None)
-    monkeypatch.setattr(v2_model, "_block_table", lambda *a: None)
-    synced = []
-    monkeypatch.setattr(
-        v2_model,
-        "synchronize_tensors",
-        lambda tensors, wait: synced.append((tensors, wait)),
-    )
-    model = _model_stub(
-        engram_hash=Hash(),
-        engram_swa_prefix="swa",
-        engram_dp_shared_memory=True,
-        start_layer=0,
-        end_layer=6,
-        _engram_first_split_layer=2,
-        _engram_split_layer=4,
-        layers=[SimpleNamespace(engram=None) for _ in range(6)],
-        _has_cpu_offloaded_engram=lambda: True,
-        _host_hash_inputs=lambda *args: None,
-        _hash_download=SimpleNamespace(copy_to_host=no_download),
-    )
-    ids = torch.arange(4, dtype=torch.int32)
-    hashes, mask = v2_model.DeepseekV41Model._prepare_engram(
-        model, ids, ids, torch.zeros((1, 4), dtype=torch.int32), stage="encoder"
-    )
-    assert hashes is device_hashes and mask is not None
-    assert model._pending_engram_hashes is device_hashes
-    assert len(synced) == 1
-    assert synced[0][0][0] is device_hashes and synced[0][1] is False
-
-
-@pytest.mark.parametrize("rows", [1, 5, 288, 2048])
-def test_early_split_preserves_delayed_carry(monkeypatch, rows):
-    monkeypatch.setattr(
-        v2_model.upstream,
-        "get_pp_group",
-        lambda: SimpleNamespace(is_first_rank=True, is_last_rank=True),
-    )
-    monkeypatch.setattr(
-        v2_model.upstream, "is_forward_context_available", lambda: False
-    )
-    model = object.__new__(v2_model.DeepseekV41Model)
-    torch.nn.Module.__init__(model)
-    model.start_layer, model.end_layer, model._ced_boundary = 0, 4, 3
-    model._engram_split_layer = 2
-    model.use_sequence_parallel = False
-    model.use_native_mega_moe = False
-    model.aux_hidden_state_layers = ()
-    model._engram_prepared_outside_stage = True
-    model._prepare_engram = lambda *args, **kwargs: (None, None)
-
-    class CarryLayer(torch.nn.Module):
-        def __init__(self, index):
-            super().__init__()
-            self.index = index
-            self.attn_norm = torch.nn.Identity()
-            self.attn = SimpleNamespace(write_encoder_global_kv=lambda *a, **kw: None)
-
-        def forward(
-            self,
-            hidden,
-            positions,
-            ids,
-            pre_mix,
-            post_mix,
-            res_mix,
-            residual,
-            hashes,
-            mask,
-            capture_previous_aux=False,
-        ):
-            if residual is None:
-                residual = hidden[:, None, :].expand(-1, 2, -1)
-            else:
-                residual = v2_model.post(hidden, residual, post_mix, res_mix)
-            if self.index in (1, 2):
-                residual = residual + ids[:, None, None] / (11 + self.index)
-            pre_mix = torch.sigmoid(residual.mean(-1))
-            hidden = torch.tanh(v2_model.collapse(residual, pre_mix))
-            post_mix = torch.full_like(pre_mix[..., None], 0.3)
-            res_mix = torch.eye(2)[None].expand(hidden.shape[0], -1, -1) * 0.7
-            return hidden, residual, post_mix, res_mix, pre_mix, None
-
-    model.layers = torch.nn.ModuleList(CarryLayer(i) for i in range(4))
-    ids, positions = torch.arange(rows), torch.arange(rows)
-    embeds = torch.arange(rows * 4).reshape(rows, 4).float() / 13
-
-    def run(first_split):
-        model._engram_first_split_layer = first_split
-        carry = model._forward_stage(ids, positions, None, embeds, stage="encoder_head")
-        if first_split is not None:
-            carry = model._forward_stage(
-                ids,
-                positions,
-                None,
-                carry[0],
-                encoder_carry=carry[1:4],
-                encoder_pre_mix=carry[4],
-                stage="encoder_middle",
-            )
-        return model._forward_stage(
-            ids,
-            positions,
-            None,
-            carry[0],
-            encoder_carry=carry[1:4],
-            encoder_pre_mix=carry[4],
-            stage="encoder_tail",
-        )
-
-    expected = run(None)
-    actual = run(1)
-    for value, reference in zip(actual, expected, strict=True):
-        torch.testing.assert_close(value, reference, rtol=0, atol=0)
-
-
-@pytest.mark.parametrize(
-    ("tail_split", "host_layers", "expected"),
-    [
-        (None, (1, 4), None),
-        (4, (1, 4), 1),
-        (4, (0, 1, 4), None),
-        (4, (4,), None),
-        (4, (2, 4), 2),
-    ],
-)
-def test_first_engram_split_follows_host_placement(tail_split, host_layers, expected):
-    model = SimpleNamespace(
-        start_layer=0,
-        _engram_split_layer=tail_split,
-        layers=[
-            SimpleNamespace(
-                engram=SimpleNamespace(embed_tokens=SimpleNamespace(host_offload=True))
-                if i in host_layers
-                else None
-            )
-            for i in range(5)
-        ],
-    )
-    assert v2_model.DeepseekV41Model._select_engram_first_split_layer(model) == expected
-
-
-def test_early_split_enqueues_before_host_lookup(monkeypatch):
-    class TpuTensor(torch.Tensor):
-        @property
-        def device(self):
-            return SimpleNamespace(type="tpu")
-
-    order = []
-    carry = tuple(torch.ones(2, 4).as_subclass(TpuTensor) for _ in range(5))
-
-    def stage(name):
-        def call(*args):
-            order.append(name)
-            return carry
-
-        return call
-
-    def enqueue(tensors, wait):
-        assert wait is False
-        assert all(a is b for a, b in zip(tensors, carry, strict=True))
-        order.append("enqueue")
-
-    monkeypatch.setattr(v2_model, "synchronize_tensors", enqueue)
-
-    hashes = object()
-
-    def stage_engram(start, end, gathered):
-        assert gathered is hashes
-        assert (start, end) in ((1, 14), (14, 20))
-        order.append("l1 lookup" if start == 1 else "l14 lookup")
-
-    model = _model_stub(
-        start_layer=0,
-        _engram_first_split_layer=1,
-        _engram_split_layer=14,
-        _ced_boundary=20,
-        _engram_prepared_outside_stage=True,
-        encoder_head_stage=stage("l0"),
-        encoder_middle_stage=stage("middle"),
-        encoder_tail_stage=stage("tail"),
-        _gathered_engram_hashes=hashes,
-        _stage_engram_layers=stage_engram,
-    )
-    v2_model.DeepseekV41Model._forward_split_encoder(
-        model, torch.arange(2), torch.arange(2), None, None, None
-    )
-    assert order == [
-        "l0",
-        "enqueue",
-        "l1 lookup",
-        "middle",
-        "enqueue",
-        "l14 lookup",
-        "tail",
-    ]

@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""TPU_DEEPSEEK_V41_ENGRAM_HBM device lookup against the host exchange's layout.
+"""TPU_DEEPSEEK_V41_ENGRAM_HBM device lookup: head-shard order and gating.
 
 The SPMD lookup check needs 8 devices; without them it reruns itself in a
 subprocess on 8 forced CPU devices, so it also runs on the CPU lane.
@@ -33,7 +33,7 @@ def _reference(raw, scale):
     return np.where(invalid, 0.0, values * power).astype(ml_dtypes.bfloat16)
 
 
-def test_lookup_matches_host_exchange_layout():
+def test_lookup_returns_rows_in_head_shard_order():
     if len(jax.devices()) >= WORLD:
         _check_lookup()
         return
@@ -79,9 +79,7 @@ def _check_lookup():
     hashes[3, 1, 5] = -1  # a dead n-gram reads as zeros
 
     mesh = Mesh(np.array(jax.devices()[:WORLD]), (engram_hbm._AXIS,))
-    lookup = engram_hbm.make_lookup(
-        mesh, TOKENS, COLS, PART_COLS, rows, DIM, BLOCK, NODE, meta
-    )
+    lookup = engram_hbm.make_lookup(mesh, COLS, PART_COLS, rows, DIM, BLOCK, NODE, meta)
     out = lookup(
         jnp.asarray(hashes.reshape(WORLD * TOKENS, COLS)),
         jnp.asarray(table),
@@ -124,20 +122,20 @@ def _gate(monkeypatch, mode, *, ep=16, explicit=False, tp=1, **kw):
         monkeypatch.setenv("TPU_DEEPSEEK_V41_ENGRAM_HBM", mode)
     else:
         monkeypatch.delenv("TPU_DEEPSEEK_V41_ENGRAM_HBM", raising=False)
-    staged = SimpleNamespace(device=SimpleNamespace(type=kw.pop("dev", "tpu")))
-    args = dict(staged_raw=staged, dp_size=8, layer_hash_index=0) | kw
+    args = dict(host_offload=True, dp_size=8, layer_hash_index=0) | kw
     return engram_hbm.should_use_hbm_lookup(**args)
 
 
-def test_default_is_auto_and_enables_first_from_ep16(monkeypatch):
+def test_auto_selects_all_when_ep_spans_several_engram_groups(monkeypatch):
     from vllm_torchtpu import envs
 
     monkeypatch.delenv("TPU_DEEPSEEK_V41_ENGRAM_HBM", raising=False)
     assert envs.environment_variables["TPU_DEEPSEEK_V41_ENGRAM_HBM"]() == "auto"
-    assert engram_hbm.AUTO_MIN_EP_SIZE == 16
+    # Several hosts: Host channels cannot exchange rows, so every layer is HBM.
     assert _gate(monkeypatch, "auto", ep=16) is True
     assert _gate(monkeypatch, "auto", ep=32) is True
-    assert _gate(monkeypatch, "auto", ep=16, layer_hash_index=1) is False
+    assert _gate(monkeypatch, "auto", ep=16, layer_hash_index=1) is True
+    # One host: every layer uses its Host channel.
     assert _gate(monkeypatch, "auto", ep=8) is False
     assert _gate(monkeypatch, "auto", ep=None) is False
     # auto falls back (warns) instead of raising when the layout cannot apply.
@@ -151,7 +149,7 @@ def test_explicit_modes_and_gating(monkeypatch):
     assert _gate(monkeypatch, "all", ep=8, explicit=True) is True
     assert _gate(monkeypatch, "all", explicit=True, layer_hash_index=1) is True
     assert _gate(monkeypatch, "off", explicit=True) is False
-    for kw in ({"dev": "cpu"}, {"dp_size": 1}, {"tp": 2}, {"ep": None}):
+    for kw in ({"host_offload": False}, {"dp_size": 1}, {"tp": 2}, {"ep": None}):
         with pytest.raises(ValueError, match="cannot apply"):
             _gate(monkeypatch, "first", explicit=True, **kw)
     # A layer the mode does not select never raises.
@@ -172,115 +170,42 @@ def test_upload_table_pads_with_invalid_scale():
     assert (table_scales[3:] == 255).all()
 
 
-def _hbm_engram(monkeypatch, *, capacity: int = 8):
-    """A host-offload Engram with HBM state preset and the lookup op faked."""
+def test_start_host_embeddings_hbm_layer_runs_lookup_in_graph(monkeypatch):
+    """An HBM layer looks up its rows from the local hashes; no Host channel."""
     from vllm_torchtpu.models.vllm.deepseek_v41.common import engram as common
 
-    seen: list[torch.Tensor] = []
+    calls = []
 
-    def build_lookup_op(layer, num_tokens, n_cols, part_cols, rows, dim, *rest):
+    def build_lookup_op(layer, n_cols, part_cols, rows, dim, block, node, meta):
+        calls.append((layer, n_cols, part_cols, rows, dim, block, node, meta))
+
         def op(hashes, table, scales, rank):
-            seen.append(hashes)
-            # Row t of token t, so slicing back to local tokens is visible.
-            return (
-                torch.arange(num_tokens, dtype=torch.bfloat16)
-                .reshape(-1, 1, 1)
-                .expand(num_tokens, part_cols * NODE, dim)
-                .clone()
-            )
+            return torch.ones((hashes.shape[0], part_cols * node, dim))
 
         return op
 
     monkeypatch.setattr(engram_hbm, "build_lookup_op", build_lookup_op)
-    monkeypatch.setattr("vllm_torchtpu.distributed.ep_mesh.ep_mesh_index", lambda: 0)
     e = common.Engram.__new__(common.Engram)
     torch.nn.Module.__init__(e)
-    e.layer_hash_index = 0
+    e.layer_hash_index = 1
     e.embed_tokens = SimpleNamespace(
-        n_hash_cols=COLS, part_n_hash_cols=PART_COLS, block_size=BLOCK, dp_size=NODE
+        host_offload=True,
+        n_hash_cols=COLS,
+        part_n_hash_cols=PART_COLS,
+        dim=DIM,
+        block_size=BLOCK,
+        dp_size=NODE,
     )
-    e._staged_raw = torch.zeros(1)
-    e._host_raw = torch.zeros((capacity, COLS, DIM), dtype=torch.uint8)
-    e._active_upload = None
+    e.host_channel = None
+    e._host_pending = None
     e._uses_hbm = True
-    e._hbm_rank = None
-    e._hbm_rows = None
+    e._hbm_rank = torch.zeros((1, 1), dtype=torch.int32)
     table = torch.zeros((HEAD_ROWS, DIM), dtype=torch.uint8)
-    e._hbm_table = (table, table, (), HEAD_ROWS)
-    return e, seen
-
-
-def _dp_sizes(monkeypatch, sizes):
-    import vllm.forward_context as fc
-
-    monkeypatch.setattr(fc, "is_forward_context_available", lambda: True)
-    monkeypatch.setattr(
-        fc,
-        "get_forward_context",
-        lambda: SimpleNamespace(
-            additional_kwargs={"tpu_num_tokens_across_dp_cpu": tuple(sizes)}
-        ),
-    )
-
-
-def test_hbm_prepare_pads_to_dp_max_and_slices_back(monkeypatch):
-    from vllm.models.deepseek_v41.common.engram import DEAD_ID
-
-    e, seen = _hbm_engram(monkeypatch)
-    _dp_sizes(monkeypatch, (3, 5, 1, 2))
-    e._hbm_prepare(torch.ones((3, COLS), dtype=torch.int32))
-    (hashes,) = seen
-    assert hashes.shape == (5, COLS)  # every rank runs the DP-wide max
-    assert (hashes[:3] == 1).all() and (hashes[3:] == DEAD_ID).all()
-    rows = e._ready_rows(3)
-    assert rows.shape == (3, COLS, DIM)
-    assert torch.equal(rows[:, 0, 0], torch.arange(3, dtype=torch.bfloat16))
-
-
-def test_hbm_prepare_idle_rank_still_joins_lookup(monkeypatch):
-    e, seen = _hbm_engram(monkeypatch)
-    _dp_sizes(monkeypatch, (0, 4, 0, 0))
-    e._hbm_prepare(torch.ones((0, COLS), dtype=torch.int32))
-    assert seen[0].shape == (4, COLS)  # the collective needs every rank
-    assert e._ready_rows(0).shape == (0, COLS, DIM)
-
-    seen.clear()
-    _dp_sizes(monkeypatch, (0, 0, 0, 0))
-    e._hbm_prepare(torch.ones((0, COLS), dtype=torch.int32))
-    assert not seen and e._ready_rows(0).shape == (0, COLS, DIM)
-
-
-def test_step_hashes_gathers_host_layers_once():
-    from vllm_torchtpu.models.vllm.deepseek_v41.v2.engram import Engram
-    from vllm_torchtpu.models.vllm.deepseek_v41.v2.model import _StepHashes
-
-    def engram(uses_hbm: bool) -> Engram:
-        e = Engram.__new__(Engram)
-        torch.nn.Module.__init__(e)
-        e._uses_hbm = uses_hbm
-        return e
-
-    calls: list[torch.Tensor] = []
-    device = torch.arange(4)
-    step = _StepHashes(device, lambda h: calls.append(h) or h + 100, eager=False)
-    assert step.for_layer(engram(True)) is device
-    assert not calls  # no D2H/gather while only HBM layers ran
-    host = step.for_layer(engram(False))
-    assert torch.equal(host, device + 100)
-    assert step.for_layer(engram(False)) is host and len(calls) == 1
-
-
-def test_step_hashes_eager_gathers_up_front():
-    from vllm_torchtpu.models.vllm.deepseek_v41.v2.engram import Engram
-    from vllm_torchtpu.models.vllm.deepseek_v41.v2.model import _StepHashes
-
-    host_layer = Engram.__new__(Engram)
-    torch.nn.Module.__init__(host_layer)
-    host_layer._uses_hbm = False
-    calls: list[torch.Tensor] = []
-    device = torch.arange(4)
-    step = _StepHashes(device, lambda h: calls.append(h) or h + 100, eager=True)
-    assert len(calls) == 1  # gathered before any layer is staged
-    host = step.for_layer(host_layer)
-    assert torch.equal(host, device + 100)
-    assert step.for_layer(host_layer) is host and len(calls) == 1
+    e._hbm_table = (table, table, ("meta",), HEAD_ROWS)
+    hidden = torch.zeros(TOKENS, 4)
+    hashes = torch.zeros((TOKENS, COLS), dtype=torch.int32)
+    assert e.start_host_embeddings(hashes, None, hidden) is hidden
+    assert calls == [(1, COLS, PART_COLS, HEAD_ROWS, DIM, BLOCK, NODE, ("meta",))]
+    assert e._host_pending is None
+    rows = e._ready_rows(TOKENS - 1)
+    assert rows.shape == (TOKENS - 1, COLS, DIM)

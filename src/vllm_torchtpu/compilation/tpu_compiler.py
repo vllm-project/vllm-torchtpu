@@ -171,6 +171,8 @@ _RUNTIME_CACHE_KEY_PATHS = (
     "vllm_torchtpu/layers/adapter/attention.py",
     "vllm_torchtpu/layers/adapter/cp_attention.py",
     "vllm_torchtpu/layers/adapter/custom_ops",
+    # The Engram Host channel protocol is shared by the kernels and worker.
+    "vllm_torchtpu/csrc/engram_host_channel.cc",
     "vllm_torchtpu/layers/adapter/fused_moe.py",
     # The fused EP MoE op and the helper that registers it. Both sit behind a
     # torch custom-op boundary Dynamo cannot see through, and the kernel they

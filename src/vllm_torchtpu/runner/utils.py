@@ -455,8 +455,8 @@ def relayout_rope_caches(model: torch.nn.Module):
     logger.info("Row-major relayouted %d rope caches", num_changed)
 
 
-def relayout_rope_tables(model: torch.nn.Module):
-    """Re-materialize model-owned RoPE tables (`_tpu_rope_cache`) row-major.
+def relayout_rope_tables(model: torch.nn.Module, *, row_major: bool = True):
+    """Set matching physical and compiled-entry layouts for compact RoPE tables.
 
     DeepSeek V4.1 attentions own compact copies of their rotary tables
     (shared across layers), which `relayout_rope_caches` does not see. Left
@@ -465,12 +465,21 @@ def relayout_rope_tables(model: torch.nn.Module):
     Unlike the full rotary caches (up to [1048576, 64]), these tables only
     span max_model_len rows, so the row-major padding stays small.
     """
+    from torch_tpu._internal.compile import tpu_torch_compile as ttc
+
     # id(original) -> (original, row-major copy); holding the original keeps
     # its id from being reused while the map is live.
     relaid: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
     for name, module in model.named_modules():
         table = getattr(module, "_tpu_rope_cache", None)
-        if not isinstance(table, torch.Tensor) or table.ndim != 2:
+        if table is None or not isinstance(table, torch.Tensor) or table.ndim != 2:
+            continue
+        if not row_major:
+            # The pinned-HOST compiler path currently ignores nondefault entry
+            # layouts. Keep the default allocation and pin the same contract for
+            # graphs without HOST inputs (decoder and draft).
+            layout, _, _ = ttc.get_default_layout(table.dtype, table.shape)
+            _PINNED_ENTRY_LAYOUTS[(table.dtype, tuple(table.shape))] = layout
             continue
         if id(table) not in relaid:
             relaid[id(table)] = (table, _to_row_major(table))
@@ -480,7 +489,7 @@ def relayout_rope_tables(model: torch.nn.Module):
                 tuple(table.shape),
             )
         module._tpu_rope_cache = relaid[id(table)][1]
-    if relaid:
+    if relaid or not row_major:
         _install_entry_layout_pin()
 
 

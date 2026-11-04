@@ -1939,6 +1939,7 @@ class TestV1Model:
             parallel_config=_ParallelConfig(),
             speculative_config=None,
             scheduler_config=SimpleNamespace(async_scheduling=False),
+            engram_config=SimpleNamespace(cpu_offload=False),
         )
 
         with (
@@ -1958,6 +1959,11 @@ class TestV1Model:
             v1_model.DeepseekV41ForCausalLM.__init__(lm, vllm_config=vllm_config)
             assert lm.hf_to_vllm_mapper == "mapper"
             mock_mapper.assert_called_once()
+
+            # Host channels exist only in v2.
+            vllm_config.engram_config.cpu_offload = True
+            with pytest.raises(NotImplementedError, match="CPU offload"):
+                v1_model.DeepseekV41ForCausalLM.__init__(lm, vllm_config=vllm_config)
 
 
 # ==============================================================================

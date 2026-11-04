@@ -334,7 +334,7 @@ def test_ced_aux_hidden_states_propagation(monkeypatch: pytest.MonkeyPatch):
         _stage_uses_sequence_parallel=lambda stage: False,
         use_native_mega_moe=False,
         _has_cpu_offloaded_engram=lambda: False,
-        _prepare_engram=lambda *a, **kw: (None, None),
+        _prepare_engram=lambda *a, **kw: (None, None, a[3]),
         aux_hidden_state_layers=(1, 2, 3),
         layers=[_FakeStageLayer(float(i + 10)) for i in range(4)],
         norm=lambda x: x,

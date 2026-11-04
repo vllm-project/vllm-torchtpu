@@ -2,14 +2,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Engram tables in HBM, looked up on device across the node-local DP group.
 
-With ``TPU_DEEPSEEK_V41_ENGRAM_HBM=first`` (only the first Engram layer, which
-only layer 0 can hide; later layers keep the host path, overlapped with the
-layers before them; the default ``auto`` selects it on EP groups of >= 16
-ranks) or ``all``, each DP rank uploads the head shard of the
-node-local Engram table that the host-offload path already loads into its host
-memory (``ParallelEngramEmbedding`` with ``dp_size`` = node-local Engram DP
-size) into HBM once, and every step's lookup becomes one SPMD op over the EP
-mesh:
+With ``TPU_DEEPSEEK_V41_ENGRAM_HBM=first`` (only the first Engram layer) or
+``all``, each DP rank uploads its head shard of the node-local Engram table
+into HBM once, and every step's lookup becomes one SPMD op over the EP mesh
+inside the compiled forward:
 
 1. all-gather of the node's n-gram hashes (``axis_index_groups`` = node),
 2. each rank gathers its heads' FP8 bytes / E8M0 scale bytes for every token
@@ -17,11 +13,10 @@ mesh:
 3. all-to-all back, so each rank holds every head of its own tokens in head
    shard order, dequantized to bf16 -- the rows ``Engram._ready_rows`` returns.
 
-The host path's D2H of the hashes, its two gloo collectives (hash all-gather,
-row all-to-all), the host gather and the H2D upload all leave the step; the
-device lookup costs ~0.1 ms per Engram layer at 288 decode tokens per rank.
-The tables take HBM away from the KV cache (~11.8 GiB per DeepSeek-V4.1-Flash
-Engram layer per rank with an 8-rank node).
+Other Host layers use native Host channels (``host_channel.py``), which need
+one Engram DP group spanning every rank. ``auto`` therefore selects ``all``
+when the EP group spans several hosts and ``off`` on a single host. Each HBM
+layer costs ~11.8 GiB per rank with an 8-rank node.
 """
 
 import os
@@ -43,9 +38,6 @@ logger = init_logger(__name__)
 # Single character: torch_tpu's local-shape helper iterates a spec entry.
 _AXIS = "d"
 _ENV = "TPU_DEEPSEEK_V41_ENGRAM_HBM"
-# ``auto`` enables ``first`` from this EP size: measured faster at EP16; at EP8
-# the 11.8 GiB table costs ~37% of the KV pool.
-AUTO_MIN_EP_SIZE = 16
 
 
 def _tp_size() -> int:
@@ -59,16 +51,17 @@ def _tp_size() -> int:
 
 def should_use_hbm_lookup(
     *,
-    staged_raw: torch.Tensor | None,
+    host_offload: bool,
     dp_size: int,
     layer_hash_index: int,
 ) -> bool:
     """Whether an Engram layer should serve its rows from HBM.
 
     Engram layers call this once and cache the answer. ``auto`` acts as
-    ``first`` on EP groups of at least ``AUTO_MIN_EP_SIZE`` ranks and as
-    ``off`` otherwise. An explicitly set mode that cannot apply raises; the
-    default falls back to the host path with a warning naming the reason.
+    ``all`` when the EP group spans more than one Engram DP group (several
+    hosts), where native Host channels cannot exchange rows, and as ``off``
+    otherwise. An explicitly set mode that cannot apply raises; ``auto``
+    falls back to the Host channel with a warning naming the reason.
     """
     mode = envs.TPU_DEEPSEEK_V41_ENGRAM_HBM.lower()
     explicit = _ENV in os.environ and mode != "auto"
@@ -77,14 +70,14 @@ def should_use_hbm_lookup(
     group = get_ep_group()
     if mode == "auto":
         ep_size = int(group.world_size) if group is not None else 1
-        if ep_size < AUTO_MIN_EP_SIZE:
+        if ep_size <= dp_size:
             return False
-        mode = "first"
+        mode = "all"
     if mode == "off" or (mode == "first" and layer_hash_index != 0):
         return False
 
-    if staged_raw is None or staged_raw.device.type != "tpu":
-        reason = "Engram CPU offload with TPU staging is not active"
+    if not host_offload:
+        reason = "Engram CPU offload is not active"
     elif dp_size <= 1:
         reason = (
             "the host tables are not head-sharded across a node-local DP "
@@ -160,7 +153,6 @@ def dequant(raw: jax.Array, scale: jax.Array, block_size: int) -> jax.Array:
 
 def make_lookup(
     mesh,
-    num_tokens: int,
     n_cols: int,
     part_cols: int,
     rows: int,
@@ -190,6 +182,7 @@ def make_lookup(
         # A rank operand rather than lax.axis_index, which lowers to
         # partition-id and is rejected on this SPMD path.
         me = rank[0, 0]
+        num_tokens = h.shape[0]
         hashes = jax.lax.all_gather(
             h, _AXIS, axis=0, tiled=False, axis_index_groups=groups
         )  # [node, T, C]
@@ -230,12 +223,11 @@ def make_lookup(
     return lookup
 
 
-# One entry per (layer, token bucket); never evict, or a rebuilt op would
-# re-register the same op name while serving.
+# One entry per layer; never evict, or a rebuilt op would re-register the
+# same op name while serving.
 @cache
 def build_lookup_op(
     layer: int,
-    num_tokens: int,
     n_cols: int,
     part_cols: int,
     rows: int,
@@ -244,7 +236,11 @@ def build_lookup_op(
     node_size: int,
     meta: tuple[tuple[int, int, int, int], ...],
 ):
-    """Torch op for ``make_lookup`` over the EP mesh, one per layer and shape."""
+    """Torch op for ``make_lookup`` over the EP mesh, one per layer.
+
+    DP lockstep runs every rank at the same token bucket, so the per-rank token
+    count comes from the traced hash shape.
+    """
     from torch_tpu._internal.pallas import jax_op
 
     from vllm_torchtpu.distributed.ep_mesh import build_ep_mesh
@@ -253,25 +249,25 @@ def build_lookup_op(
     if mesh is None:
         raise RuntimeError("Engram HBM lookup needs an expert-parallel mesh")
     lookup = make_lookup(
-        mesh, num_tokens, n_cols, part_cols, rows, dim, block_size, node_size, meta
+        mesh, n_cols, part_cols, rows, dim, block_size, node_size, meta
     )
     cols = part_cols * node_size
     op = jax_op(
-        f"pallas::dsv41_engram_hbm_l{layer}_t{num_tokens}",
+        f"pallas::dsv41_engram_hbm_l{layer}",
         lookup,
         mesh=mesh,
         input_partition_specs=(P(_AXIS, None),) * 4,
         output_partition_specs=P(_AXIS, None, None),
     )
 
+    # The default fake kernel rejects vLLM's symbolic token axis.
     def fake(h, w, s, rank):
-        return h.new_empty((num_tokens, cols, dim), dtype=torch.bfloat16)
+        return h.new_empty((h.shape[0], cols, dim), dtype=torch.bfloat16)
 
     op.register_fake(fake)
     logger.info(
-        "[DSV41] Engram HBM lookup: layer=%d tokens=%d heads=%d rows/rank=%d",
+        "[DSV41] Engram HBM lookup: layer=%d heads=%d rows/rank=%d",
         layer,
-        num_tokens,
         cols,
         rows,
     )

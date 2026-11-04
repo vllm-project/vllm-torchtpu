@@ -290,7 +290,7 @@ DSpark K5. Local target/draft shapes remain 288/240 rows and the target
 compile buckets remain `[288,2048]`. KV sizing is automatic at memory
 utilization 0.85, with FP8 KV/indexer, block size 64 and max model length 98816.
 
-Both hosts use `TPU_DEEPSEEK_V41_ENGRAM_HBM=first`, Engram `cpu_offload=true`
+Both hosts use `TPU_DEEPSEEK_V41_ENGRAM_HBM=all`, Engram `cpu_offload=true`
 and `dp_shared_memory=false`, `MOE_FUSED_EP_KERNEL_IMPL=push`,
 `MOE_FUSED_EP_PUSH_SC_PREPUSH=2`, and `MOE_FUSED_EP_PUSH_TC_EXCHANGE=1`.
 This uses the push-dispatch implementation from #2519. The recipe retains

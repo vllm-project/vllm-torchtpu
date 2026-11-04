@@ -375,16 +375,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_DEEPSEEK_V41_ENGRAM_CPU_OFFLOAD": env_bool(
         "TPU_DEEPSEEK_V41_ENGRAM_CPU_OFFLOAD", default=False
     ),
-    # With Engram CPU offload and head-sharded host tables (dp_shared_memory
-    # off, or its /dev/shm fallback), serve Engram layers from an HBM copy of
-    # each rank's host head shard, looked up on device across the node-local
-    # DP group (common/engram_hbm.py), instead of the per-step host gather and
-    # gloo exchange. DP-shared host tables need no exchange and keep the host
-    # path. "first": only the first Engram layer (layer 1, which only layer 0
-    # can hide; later layers keep the host path, overlapped with the layers
-    # before them); "all": every Engram layer; "off": keep all layers on the
-    # host path; "auto" (default): "first" when the EP group has >= 16 ranks,
-    # else "off". Each HBM layer costs ~11.8 GiB per rank at 8 ranks per node.
+    # With Engram CPU offload, serve Engram layers from an HBM copy of each
+    # rank's host head shard, looked up on device across the node-local DP
+    # group (common/engram_hbm.py), instead of the native Host channel
+    # (common/host_channel.py). "first": only the first Engram layer; "all":
+    # every Engram layer; "off": every layer uses a Host channel; "auto"
+    # (default): "all" when the EP group spans several hosts (Host channels
+    # need one node-local group spanning all ranks), else "off". Each HBM
+    # layer costs ~11.8 GiB per rank at 8 ranks per node.
     "TPU_DEEPSEEK_V41_ENGRAM_HBM": env_with_choices(
         "TPU_DEEPSEEK_V41_ENGRAM_HBM",
         "auto",

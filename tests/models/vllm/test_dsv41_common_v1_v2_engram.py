@@ -20,8 +20,6 @@ from vllm_torchtpu.models.vllm.deepseek_v41.common import engram as common_engra
 from vllm_torchtpu.models.vllm.deepseek_v41.v1 import engram as v1_engram
 from vllm_torchtpu.models.vllm.deepseek_v41.v2 import engram as v2_engram
 
-pytestmark = pytest.mark.usefixtures("cpu_engram_transfer")
-
 
 @pytest.mark.parametrize("tokens", [1, 17, 288, 2048])
 @pytest.mark.parametrize("heads", [3, 24])
@@ -40,30 +38,23 @@ def test_ready_rows_packed_scales_match_tpu_and_cpu(tokens, heads):
         120, 132, (tokens, heads, 8), generator=generator, dtype=torch.uint8
     )
     scale[10::11] = 255
-    packed = torch.cat((raw.flatten(), scale.flatten())).view(torch.int32)
-    packed = packed.reshape(tokens, -1).to("tpu")
+    # Host channel row layout: 256 FP8 bytes then 8 scale bytes per head.
+    packed = torch.cat((raw, scale), -1).view(torch.int32).to("tpu")
     holder = SimpleNamespace(
-        _staged_raw=packed,
-        _active_raw=packed,
-        _host_raw=raw,
-        _host_scale=scale,
-        embed_tokens=SimpleNamespace(block_size=32),
+        _host_rows=packed,
+        uses_hbm_lookup=False,
+        embed_tokens=SimpleNamespace(host_offload=True, dim=256, block_size=32),
     )
 
     def candidate(data):
-        holder._active_raw = data
+        holder._host_rows = data
         return common_engram.Engram._ready_rows(holder, tokens)
 
     def baseline(data):
-        words = data.view(heads * (256 + 8) // 4, tokens)
-        raw_bytes = common_engram._unpack_bytes(
-            words[: heads * 256 // 4].flatten(), raw.numel()
-        )
-        scale_bytes = common_engram._unpack_bytes(
-            words[heads * 256 // 4 :].flatten(), scale.numel()
-        )
+        data = common_engram._unpack_bytes(data.flatten(), data.numel() * 4)
+        data = data.reshape(tokens, heads, 256 + 8)
         return common_engram.dequant_fp8_rows(
-            raw_bytes.reshape(raw.shape), scale_bytes.reshape(scale.shape), 32
+            data[..., :256].contiguous(), data[..., 256:].contiguous(), 32
         )
 
     original = torch.compile(baseline, backend="tpu", fullgraph=True, dynamic=False)
@@ -278,57 +269,6 @@ class TestCommonNgramHashState:
         )
         assert out_with_cache.shape == (2, 2, 8)
 
-    def test_common_hash_on_host_empty_tokens(self):
-        state = _build_common_hash_state()
-        ids = torch.empty(0, dtype=torch.int32)
-        pos = torch.empty(0, dtype=torch.int64)
-        qsl = torch.tensor([0], dtype=torch.int32)
-        dead = torch.empty(0, dtype=torch.bool)
-        lookback = torch.full((1, 4), -1, dtype=torch.int32)
-        dead_lb = torch.zeros((1, 4), dtype=torch.bool)
-
-        res = state.hash_on_host(ids, pos, qsl, dead, lookback, dead_lb)
-        layers, ngram = state.multipliers.shape
-        assert res.shape == (0, layers, (ngram - 1) * state.primes.shape[-1])
-        assert res.dtype == torch.int32
-
-    def test_common_hash_on_host_caching_and_execution(self):
-        state = _build_common_hash_state()
-        ids = torch.tensor([1, 2, 3, 4], dtype=torch.int32)
-        pos = torch.tensor([0, 1, 2, 3], dtype=torch.int64)
-        qsl = torch.tensor([0, 4], dtype=torch.int32)
-        dead = torch.zeros(4, dtype=torch.bool)
-        lookback = torch.full((1, 4), -1, dtype=torch.int32)
-        dead_lb = torch.zeros((1, 4), dtype=torch.bool)
-
-        assert not hasattr(state, "_host_tables")
-        out1 = state.hash_on_host(ids, pos, qsl, dead, lookback, dead_lb)
-        assert hasattr(state, "_host_tables")
-        cached_tables = state._host_tables
-
-        out2 = state.hash_on_host(ids, pos, qsl, dead, lookback, dead_lb)
-        assert state._host_tables is cached_tables
-        assert torch.equal(out1, out2)
-
-    def test_common_hash_dead_mask_and_window_branches(self):
-        state = _build_common_hash_state()
-        ids = torch.tensor([1, 2, 3, 4], dtype=torch.int32)
-        # Shift past > chunk_positions and past < chunk_positions
-        pos = torch.tensor([0, 1, 5, 6], dtype=torch.int64)
-        qsl = torch.tensor([0, 2, 4], dtype=torch.int32)
-        dead = torch.tensor([True, False, False, True], dtype=torch.bool)
-        # Valid lookback tokens in window
-        lookback = torch.tensor([[10, 11, -1, 13], [20, -1, 22, 23]], dtype=torch.int32)
-        dead_lb = torch.tensor(
-            [
-                [False, True, False, False],
-                [True, False, False, False],
-            ],
-            dtype=torch.bool,
-        )
-        out = state.hash_on_host(ids, pos, qsl, dead, lookback, dead_lb)
-        assert out.shape == (4, 2, 8)
-
 
 # ==============================================================================
 # 2. ParallelEngramEmbedding and helpers tests (lines 210-391)
@@ -515,44 +455,6 @@ class TestParallelEngramEmbedding:
         emb.lookup(mock_indices, out)
         mock_indices.to.assert_called_once_with(weight.device)
 
-    def test_gather_raw_device_transfer_and_computation(self):
-        emb = object.__new__(common_engram.ParallelEngramEmbedding)
-        emb.head_start = 0
-        emb.part_n_hash_cols = 2
-        emb.n_hash_cols = 4
-        emb.vocab_start_idx = 0
-        emb.vocab_end_idx = 100
-        emb.part_num_embeddings = 100
-        emb.dim = 32
-        emb.block_size = 16
-
-        weight = torch.ones((100, 32), dtype=torch.uint8)
-        scale = torch.full((100, 2), 127, dtype=torch.uint8)
-        emb._storage = lambda: (weight, scale)
-
-        indices = torch.tensor([[10, 20, 200, 300]], dtype=torch.int32)
-        raw_out = torch.zeros((1, 2, 32), dtype=torch.uint8)
-        scale_out = torch.zeros((1, 2, 2), dtype=torch.uint8)
-
-        # Valid heads
-        emb.gather_raw(indices, raw_out, scale_out)
-        assert torch.all(raw_out[0, 0] == 1)
-        assert torch.all(raw_out[0, 1] == 1)
-        assert torch.all(scale_out == 127)
-
-        # Invalid indices (masked with _INVALID_SCALE)
-        invalid_indices = torch.tensor([[200, 300, 400, 500]], dtype=torch.int32)
-        emb.gather_raw(invalid_indices, raw_out, scale_out)
-        assert torch.all(scale_out == common_engram._INVALID_SCALE)
-
-        # Device mismatch: tests indices.to(work_device) branch (line 319)
-        mock_indices = MagicMock(
-            wraps=torch.tensor([[10, 20, 200, 300]], dtype=torch.int32)
-        )
-        mock_indices.device = torch.device("meta")
-        emb.gather_raw(mock_indices, raw_out, scale_out)
-        mock_indices.to.assert_called_once_with(weight.device)
-
     def test_dequant_fp8_rows_and_unpack_bytes(self):
         # 1. dequant_fp8_rows with valid scale (127 -> 1.0, 128 -> 2.0)
         raw_val = torch.tensor([1.0], dtype=torch.float8_e4m3fn).view(torch.uint8)
@@ -645,134 +547,6 @@ class TestEngramModule:
             emb.part_num_embeddings,
         )
 
-    def test_engram_staging_init_offload_true_and_false(
-        self, monkeypatch: pytest.MonkeyPatch
-    ):
-        engram = object.__new__(common_engram.Engram)
-        mock_super_init = MagicMock()
-        monkeypatch.setattr(
-            common_engram.upstream.Engram, "_init_staging", mock_super_init
-        )
-
-        # 1. cpu_offload is False
-        engram.embed_tokens = SimpleNamespace(host_offload=False)
-        common_engram.Engram._init_staging(engram, 16, 32)
-        mock_super_init.assert_called_once_with(16, 32)
-        assert engram._staged_raw is None
-
-        # 2. cpu_offload is True
-        engram.embed_tokens = SimpleNamespace(
-            host_offload=True, part_n_hash_cols=2, block_size=16, dp_size=1
-        )
-        common_engram.Engram._init_staging(engram, 16, 32)
-        assert engram._staged_raw is not None
-        assert engram._host_raw.shape == (16, 2, 32)
-
-    def test_engram_prepare_embeddings_branches(self, monkeypatch: pytest.MonkeyPatch):
-        cols, dim, block_size = 1, 16, 16
-        max_tokens = 8
-
-        def make_engram(cpu_offload: bool):
-            engram = object.__new__(common_engram.Engram)
-            mock_emb = MagicMock()
-            mock_emb.host_offload = cpu_offload
-            mock_emb.dp_size = 1
-            mock_emb.part_n_hash_cols = cols
-            mock_emb.block_size = block_size
-            mock_emb.dim = dim
-            mock_emb.gather_raw = lambda hids, r_out, s_out: (
-                r_out.fill_(1),
-                s_out.fill_(129),
-            )
-            engram.embed_tokens = mock_emb
-            monkeypatch.setattr(
-                common_engram.upstream.Engram, "_init_staging", lambda self, m, h: None
-            )
-            common_engram.Engram._init_staging(engram, max_tokens, dim)
-            return engram
-
-        engram = make_engram(cpu_offload=True)
-
-        # 1. Partial tokens with scale_bytes % 4 != 0 (num_tokens=3, cols=1, blocks=1)
-        engram._host_scale_buf.fill_(99)
-        hash_ids_partial = torch.zeros(3, cols, dtype=torch.int32)
-        engram.prepare_embeddings(hash_ids_partial)
-        assert torch.all(engram._host_scale[:3] == 129)
-        assert engram._host_scale_buf[3].item() == common_engram._INVALID_SCALE
-        staged_raw_3 = engram._staged_by_tokens[3]
-        assert staged_raw_3.shape == (3 * (cols * dim // 4 + 1),)
-        assert engram._active_raw.shape == (3, cols * dim // 4 + 1)
-
-        # Repeated calls alternate the two immutable DMA destinations.
-        engram.prepare_embeddings(hash_ids_partial)
-        assert engram._staged_by_tokens[3] is not staged_raw_3
-        assert engram._staged_views(3) is engram._active_raw
-        assert engram._staged_by_tokens[max_tokens] is engram._staged_raw
-
-        # 1b. Single token (num_tokens=1 < 2 skips mark_dynamic)
-        engram.prepare_embeddings(torch.zeros(1, cols, dtype=torch.int32))
-        assert engram._active_raw.shape == (1, cols * dim // 4 + 1)
-
-        # 2. Exact tokens: scale_bytes % 4 == 0 (skips tail word byte pad)
-        hash_ids_full = torch.zeros(max_tokens, cols, dtype=torch.int32)
-        engram.prepare_embeddings(hash_ids_full)
-        assert torch.all(engram._host_scale == 129)
-
-        # 3. Fallback: hash_ids tokens > max_tokens or cpu_offload is False
-        fallback_calls = []
-        monkeypatch.setattr(
-            common_engram.upstream.Engram,
-            "prepare_embeddings",
-            lambda self, hids: fallback_calls.append(self),
-        )
-        with pytest.raises(ValueError, match="staging slots"):
-            engram.prepare_embeddings(
-                torch.zeros(max_tokens + 2, cols, dtype=torch.int32)
-            )
-        engram_no_offload = make_engram(cpu_offload=False)
-        engram_no_offload.prepare_embeddings(hash_ids_partial)
-        assert fallback_calls == [engram_no_offload]
-
-    def test_engram_ready_rows_staged_and_unstaged(
-        self, monkeypatch: pytest.MonkeyPatch
-    ):
-        cols, dim, block_size = 2, 16, 8
-        max_tokens = 4
-
-        engram = object.__new__(common_engram.Engram)
-        # 1. unstaged -> delegates to super
-        engram._staged_raw = None
-        super_ready = []
-        monkeypatch.setattr(
-            common_engram.upstream.Engram,
-            "_ready_rows",
-            lambda self, n: super_ready.append(n) or torch.zeros(n, cols, dim),
-        )
-        out_unstaged = engram._ready_rows(max_tokens)
-        assert out_unstaged.shape == (max_tokens, cols, dim)
-        assert super_ready == [max_tokens]
-
-        # 2. staged -> unpacks and dequants
-        mock_emb = MagicMock()
-        mock_emb.host_offload = True
-        mock_emb.dp_size = 1
-        mock_emb.part_n_hash_cols = cols
-        mock_emb.block_size = block_size
-        mock_emb.dim = dim
-        mock_emb.gather_raw = lambda hids, r_out, s_out: (
-            r_out.fill_(0x38),  # 1.0 in float8_e4m3fn
-            s_out.fill_(127),  # 1.0 multiplier
-        )
-        engram.embed_tokens = mock_emb
-        common_engram.Engram._init_staging(engram, max_tokens, dim)
-        engram.prepare_embeddings(torch.zeros(max_tokens, cols, dtype=torch.int32))
-        rows = engram._ready_rows(max_tokens)
-        assert rows.shape == (max_tokens, cols, dim)
-        assert rows.dtype == torch.bfloat16
-        assert torch.isclose(
-            rows.float(), torch.ones_like(rows.float()), atol=1e-3
-        ).all()
-
     @pytest.mark.parametrize("num_tokens", [6, 7])
     @pytest.mark.parametrize("tp_size", [1, 2])
     def test_engram_sp_embed_and_forward(
@@ -800,6 +574,7 @@ class TestEngramModule:
         mock_embed = MagicMock()
         mock_embed.tp_size = tp_size
         mock_embed.n_hash_cols = cols
+        mock_embed.host_offload = False
         engram.embed_tokens = mock_embed
 
         staged = torch.randn(num_tokens, cols, dim, dtype=torch.bfloat16)

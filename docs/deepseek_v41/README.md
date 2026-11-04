@@ -47,9 +47,8 @@ quality reference. Existing target compilation buckets are unchanged: a 24-row
 bucket is not padded to 48 to obtain a preferred kernel shape.
 
 Sequence parallelism follows upstream's topology policy. Local-Q follows the
-actual attention path and its weight/layout contracts. Encoder splitting derives
-from the last host-offloaded Engram layer and row ownership; these are not
-independent serving switches. The old TP-only SP opt-in has been removed.
+actual attention path and its weight/layout contracts; neither is an independent
+serving switch. The old TP-only SP opt-in has been removed.
 
 ## Migration
 
@@ -62,11 +61,14 @@ launchers have migrated rather than maintaining two permanent interfaces.
 `TPU_DEEPSEEK_V41_IMPL=v1` is rejected; remove the implementation selector.
 Runtime settings such as `LIBTPU_INIT_ARGS` remain environment variables.
 
-TP1/DP>1 requires EP and CPU Engram placement. The existing
-`engram_config.dp_shared_memory` controls whether node-local replicas share a
-host table or hold/exchange head shards. Shared tables require a shared IPC
-namespace and approximately 190 GiB of `/dev/shm` for Flash, plus runtime space.
-The host-placement choice does not change the checkpoint's numeric format.
+TP1/DP>1 requires EP and CPU Engram placement. Each node-local rank holds one
+head shard in pinned host memory, and a native Host channel per layer serves its
+rows (`dp_shared_memory` is forced off). The channel library is built per
+environment with `python tools/build_engram_host_channel.py --xla-source
+<xla-COMMIT>`, where the commit is `torch_tpu/include/XLA_COMMIT`. When EP spans
+several hosts, `TPU_DEEPSEEK_V41_ENGRAM_HBM=auto` serves every layer from HBM
+instead. CPU placement with TP>1 is rejected. The host-placement choice does not
+change the checkpoint's numeric format.
 
 ## Benchmarks and CI
 
@@ -90,7 +92,7 @@ expert count rather than the target's.
 ## Validation limits
 
 Tuning measurements in the kernel tables identify the runtime they were measured
-on. The epic upgrade to JAX 0.11.2 / libtpu 0.0.50 / TorchTPU 0.2.0rc1 requires
+on. The epic upgrade to JAX 0.11.2 / libtpu 0.0.51 / TorchTPU 0.2.0rc1 requires
 fresh accelerator validation; old measurements are not evidence for these pins.
 The configuration convergence is a draft until its current-head CI, quality and
 performance results have been reviewed. Kernel correctness at long context does

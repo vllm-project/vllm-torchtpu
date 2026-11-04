@@ -5073,7 +5073,14 @@ class TPUModelRunner(GPUModelRunner):
             self._truncate_rope_caches()
         if envs.TPU_ROPE_CACHE_ROW_MAJOR:
             runner_utils.relayout_rope_caches(self.model)
-        runner_utils.relayout_rope_tables(self.model)
+        row_major_rope = True
+        if self._is_deepseek_v41:
+            from vllm_torchtpu.models.vllm.deepseek_v41.config import (
+                engram_cpu_offload,
+            )
+
+            row_major_rope = not engram_cpu_offload(self.vllm_config)
+        runner_utils.relayout_rope_tables(self.model, row_major=row_major_rope)
         if envs.TPU_MOE_HASH_TABLE_ROW_MAJOR:
             runner_utils.relayout_hash_tables(self.model)
 
@@ -5083,10 +5090,8 @@ class TPUModelRunner(GPUModelRunner):
             self._async_drafter.load_model(self.model)
             draft_model = getattr(self._async_drafter, "draft_model", None)
             if draft_model is not None:
-                # Draft layers own compact RoPE tables too; executables are
-                # compiled against row-major tables, so a {0,1} draft table
-                # fails at launch with RuntimeProgramInputMismatch.
-                runner_utils.relayout_rope_tables(draft_model)
+                # The entry-layout registry is shared by target and draft.
+                runner_utils.relayout_rope_tables(draft_model, row_major=row_major_rope)
 
         # After the drafter: an MTP draft re-reads the target checkpoint.
         from vllm_torchtpu.model_loader_patches import evict_loaded_weights_page_cache

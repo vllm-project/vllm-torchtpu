@@ -6,7 +6,6 @@ from dataclasses import replace
 from itertools import islice
 
 import torch
-from torch.utils._pytree import tree_leaves
 from vllm.compilation.backends import set_model_tag
 from vllm.compilation.decorators import support_torch_compile
 from vllm.forward_context import override_forward_context
@@ -31,7 +30,6 @@ from vllm_torchtpu.layers.adapter.upstream_bindings import (
     device_hooks,
 )
 from vllm_torchtpu.logger import init_logger
-from vllm_torchtpu.utils import synchronize_tensors
 
 from ..common.mhc import (
     collapse,
@@ -42,6 +40,7 @@ from ..common.mhc import (
     pre,
     shifted_post_pre,
 )
+from ..config import engram_cpu_offload
 from .attention import DeepseekV41Attention
 from .engram import Engram, NgramHashState
 from .ops import compact_rope_caches
@@ -148,7 +147,6 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
                 inputs_embeds,
                 lookback_token_ids,
             )
-            self._record_engram_consumers(self.start_layer, self.end_layer, output)
             return output
         context = upstream.get_forward_context()
         metadata = context.attn_metadata
@@ -167,7 +165,6 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
             inputs_embeds,
             lookback_token_ids,
         )
-        self._record_engram_consumers(self.start_layer, self._ced_boundary, encoded)
         # Match the runner's convention for compiled backends that wrap the
         # model result in a single-element output list.
         if isinstance(encoded, (list, tuple)) and len(encoded) == 1:
@@ -236,7 +233,6 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
                 inputs_embeds=decoder_hidden,
                 encoder_pre_mix=decoder_mix,
             )
-        self._record_engram_consumers(self._ced_boundary, self.end_layer, output)
         if isinstance(output, (list, tuple)) and len(output) == 1:
             output = output[0]
         if indices is None:
@@ -244,27 +240,6 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
         result = output.new_zeros((positions.shape[0] + 1, output.shape[-1]))
         return result.index_copy_(0, indices, output)[:-1]
 
-    def _record_engram_consumers(self, start: int, end: int, output) -> None:
-        uploads = [
-            layer.engram._active_upload
-            for layer in islice(self.layers, start, end)
-            if isinstance(getattr(layer, "engram", None), Engram)
-            and layer.engram._active_upload is not None
-            and layer.engram._active_upload.needs_consumer
-        ]
-        if not uploads:
-            return
-        if isinstance(output, upstream.IntermediateTensors):
-            output = output.tensors
-        tensors = [
-            value for value in tree_leaves(output) if isinstance(value, torch.Tensor)
-        ]
-        synchronize_tensors(tensors, wait=False)
-        for upload in uploads:
-            upload.record_consumers(tensors)
-
-    # Keep the upstream forward order; adapt its Engram metadata access here,
-    # alongside attention/compressor adapters, so the runner stays model-neutral.
     def _forward_stage(
         self,
         input_ids: torch.Tensor,
@@ -578,6 +553,11 @@ class DeepseekV41ForCausalLM(upstream.DeepseekV41LLMForCausalLM):
         ):
             raise NotImplementedError(
                 "V4.1 TPU currently requires synchronous scheduling without speculation"
+            )
+        if engram_cpu_offload(vllm_config):
+            # Host channels exchange rows over the DP ICI mesh (v2 only).
+            raise NotImplementedError(
+                "V4.1 TPU v1 does not support Engram CPU offload; use v2"
             )
         super().__init__(vllm_config=vllm_config, prefix=prefix)
         # TPU's existing FP8 linear adapter registers weight_scale_inv; the

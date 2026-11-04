@@ -71,7 +71,9 @@ dependencies = [
     # per-config LIBTPU_INIT_ARGS additions under
     # scripts/vllm/benchmarking/configs/ were tuned against an earlier libtpu;
     # re-verify those runs when bumping.
-    "libtpu==0.0.50",
+    # DSV41 Engram Host channels need 0.0.51: 0.0.50 rejects the request
+    # kernel's HBM operand.
+    "libtpu==0.0.51",
     "ray[default]",
     "ray[data]",
 ]

@@ -1,5 +1,7 @@
 """CPU checks for the DeepSeek V4.1 FP8 main-KV record and RoPE companion."""
 
+from types import SimpleNamespace
+
 import jax.numpy as jnp
 import ml_dtypes
 import numpy as np
@@ -14,8 +16,6 @@ from vllm_torchtpu.models.vllm.deepseek_v41.v2.cache import (
     encode_fp8_kv,
     scatter_cache_values,
 )
-
-pytestmark = pytest.mark.usefixtures("cpu_engram_transfer")
 
 
 def _latent(n, seed=0):
@@ -218,29 +218,31 @@ def test_parallel_engram_embedding_cpu_offload_and_row_slice(monkeypatch):
     emb_cpu.lookup(indices, out_cpu)
     assert torch.equal(out_dev, out_cpu)
 
-    # Also exercise Engram._init_staging + Engram.prepare_embeddings: the host
-    # gathers raw FP8/scale bytes (invalid rows get the sentinel scale;
-    # invalid raw bytes may contain FP8 NaN 0x7F) and _ready_rows
-    # unpacks the int32 staging and dequantizes it, bitwise equal to the
-    # host-dequant lookup.
+    # Host channel rows hold each head's FP8 bytes then its E8M0 bytes as int32
+    # words; an invalid head has zero bytes and the invalid scale, as
+    # engram_host_channel_op._INVALID_ROW writes. _ready_rows unpacks and
+    # dequantizes them like the host lookup; invalid heads read as zeros.
     from vllm_torchtpu.models.vllm.deepseek_v41.v2.engram import _INVALID_SCALE
 
-    engram_stub = object.__new__(Engram)
-    torch.nn.Module.__init__(engram_stub)
-    engram_stub.embed_tokens = emb_cpu
-    Engram._init_staging(engram_stub, max_tokens=5, head_dim=dim)
-    assert engram_stub._staged_raw is not None
-    engram_stub._host_packed_buf.fill_(0x7F)
-    engram_stub._host_scale.fill_(200)
-    packed_bytes = indices.shape[0] * emb_cpu.part_n_hash_cols * (dim + dim // 32)
-    untouched_tail = engram_stub._host_packed_buf[packed_bytes:].clone()
-    engram_stub.prepare_embeddings(indices)
-    got = engram_stub._ready_rows(indices.shape[0])
-    assert torch.equal(got.view(torch.int16), out_cpu.view(torch.int16))
-    assert engram_stub._active_raw.shape[0] == indices.shape[0]
-    assert torch.all(engram_stub._host_scale[2, 1] == _INVALID_SCALE)
-    assert engram_stub._host_scale.shape[0] == indices.shape[0]
-    assert torch.equal(engram_stub._host_packed_buf[packed_bytes:], untouched_tail)
+    block = 16  # 64 + 4 bytes keeps each row word-aligned
+    raw = torch.randint(0, 256, (3, 4, dim), generator=rng, dtype=torch.uint8)
+    raw[(raw & 127) == 127] = 0  # valid rows never hold FP8 NaN
+    scale = torch.randint(
+        120, 134, (3, 4, dim // block), generator=rng, dtype=torch.uint8
+    )
+    raw[2, 1], scale[2, 1] = 0, _INVALID_SCALE
+    stub = SimpleNamespace(
+        _host_rows=torch.cat((raw, scale), -1).view(torch.int32),
+        uses_hbm_lookup=False,
+        embed_tokens=SimpleNamespace(host_offload=True, dim=dim, block_size=block),
+    )
+    got = Engram._ready_rows(stub, 3)
+    want = raw.view(torch.float8_e4m3fn).float() * (
+        (scale.float() - 127).exp2().repeat_interleave(block, -1)
+    )
+    want[2, 1] = 0
+    assert torch.equal(got.view(torch.int16), want.to(torch.bfloat16).view(torch.int16))
+    assert torch.equal(Engram._ready_rows(stub, 2), got[:2])
 
 
 def test_dequant_fp8_rows_matches_exp2_lookup_bitwise():

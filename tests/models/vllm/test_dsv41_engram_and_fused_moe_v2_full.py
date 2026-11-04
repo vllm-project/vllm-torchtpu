@@ -3,29 +3,21 @@
 
 Covers all lines and branches in:
 1. src/vllm_torchtpu/models/vllm/deepseek_v41/common/engram.py
-   (240 stmts, 56 branches, 100%)
-2. src/vllm_torchtpu/models/vllm/deepseek_v41/v2/host_engram.py
-   (120 stmts, 42 branches, 100%)
-3. src/vllm_torchtpu/models/vllm/deepseek_v41/v2/model.py
-   (diff lines 274, 294, 296-297, 345-349)
-4. src/vllm_torchtpu/kernels/fused_moe/v2/router_ops.py (32 stmts, 4 branches, 100%)
-5. src/vllm_torchtpu/kernels/fused_moe/v2/token_parallel.py
-   (41 stmts, 14 branches, 100%)
-6. src/vllm_torchtpu/kernels/fused_moe/v2/host.py (481 stmts, 80 branches, 100%)
-7. src/vllm_torchtpu/kernels/fused_moe/v2/layer.py (219 stmts, 84 branches, 100%)
-8. src/vllm_torchtpu/kernels/fused_moe/v2/kernel.py (744 stmts, 178 branches, 100%)
+2. src/vllm_torchtpu/kernels/fused_moe/v2/router_ops.py
+3. src/vllm_torchtpu/kernels/fused_moe/v2/token_parallel.py
+4. src/vllm_torchtpu/kernels/fused_moe/v2/host.py
+5. src/vllm_torchtpu/kernels/fused_moe/v2/layer.py
+6. src/vllm_torchtpu/kernels/fused_moe/v2/kernel.py
 """
 
 from __future__ import annotations
 
-import contextlib
 import os
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import jax
 import jax.numpy as jnp
-import numpy as np
 import pytest
 import torch
 import torch.nn as nn
@@ -100,20 +92,7 @@ from vllm_torchtpu.kernels.fused_moe.v2.layer import (
 )
 from vllm_torchtpu.kernels.fused_moe.v2.router_ops import pallas_select
 from vllm_torchtpu.kernels.fused_moe.v2.token_parallel import TokenReplicaLayout
-from vllm_torchtpu.layers.core.sequence_layout import SequenceLayoutKind
 from vllm_torchtpu.models.vllm.deepseek_v41.common import engram as common_engram
-from vllm_torchtpu.models.vllm.deepseek_v41.v2.host_engram import (
-    HOST_ENGRAM_KEY,
-    HostEngramInputs,
-    _async_source_tokens_cpu,
-    _resolve_decode_lookback_cpu,
-    capture_host_engram_inputs,
-    gather_host_engram_hashes,
-    install_host_engram_inputs,
-)
-from vllm_torchtpu.models.vllm.deepseek_v41.v2.model import DeepseekV41Model
-
-pytestmark = pytest.mark.usefixtures("cpu_engram_transfer")
 
 # ==============================================================================
 # Helper Mock Objects
@@ -310,43 +289,6 @@ class TestCommonNgramHashStateFull:
         )
         assert out_no_cache.shape[0] == 2
 
-    def test_common_hash_on_host_and_caching(self):
-        state = _build_common_hash_state(use_slot_cache=True)
-        tokens = torch.tensor([10, 20], dtype=torch.int32)
-        pos = torch.tensor([0, 1], dtype=torch.int64)
-        q_start = torch.tensor([0, 2], dtype=torch.int64)
-        dead_mask = torch.tensor([False, True], dtype=torch.bool)
-        lookback = torch.tensor([[5, -1, -1, -1], [-1, -1, -1, -1]], dtype=torch.int32)
-        lb_dead_mask = torch.tensor(
-            [[False, False, False, False], [True, False, False, False]],
-            dtype=torch.bool,
-        )
-
-        # count == 0
-        empty = state.hash_on_host(
-            torch.empty(0, dtype=torch.int32),
-            torch.empty(0, dtype=torch.int64),
-            q_start,
-            torch.empty(0, dtype=torch.bool),
-            lookback,
-            lb_dead_mask,
-        )
-        assert empty.shape == (0, 2, 8)
-
-        # First call populates _host_tables
-        assert not hasattr(state, "_host_tables")
-        out1 = state.hash_on_host(
-            tokens, pos, q_start, dead_mask, lookback, lb_dead_mask
-        )
-        assert hasattr(state, "_host_tables")
-        assert out1.shape[0] == 2
-
-        # Second call reuses _host_tables
-        out2 = state.hash_on_host(
-            tokens, pos, q_start, dead_mask, lookback, lb_dead_mask
-        )
-        assert torch.equal(out1, out2)
-
     def test_load_local_rows(self):
         # 1. uint8 param
         p_u8 = torch.zeros(4, 8, dtype=torch.uint8)
@@ -444,7 +386,7 @@ class TestCommonNgramHashStateFull:
         ):
             assert emb2._allocate_weights() == ("w", "s")
 
-        # lookup and gather_raw
+        # lookup
         emb.part_num_embeddings = 32
         emb.dim = 16
         emb.block_size = 8
@@ -464,13 +406,6 @@ class TestCommonNgramHashStateFull:
         out = torch.zeros(2, 2, 16, dtype=torch.bfloat16)
         emb.lookup(indices, out)
         assert out.shape == (2, 2, 16)
-
-        # gather_raw
-        raw_out = torch.zeros(2, 2, 16, dtype=torch.uint8)
-        scale_out = torch.zeros(2, 2, 2, dtype=torch.uint8)
-        emb.gather_raw(indices, raw_out, scale_out)
-        assert raw_out.shape == (2, 2, 16)
-        assert scale_out.shape == (2, 2, 2)
 
     def test_dequant_unpack_gather_rows(self):
         # dequant_fp8_rows with valid and invalid sentinel scale
@@ -528,56 +463,53 @@ class TestCommonNgramHashStateFull:
             assert created is mock_emb
             assert mock_reg.call_count == 2
 
-        # _init_staging with cpu_offload=True and False
+        # _init_staging: device tables keep upstream staging; Host tables only
+        # size their channel requests.
         engram.embed_tokens = SimpleNamespace(
-            part_n_hash_cols=2,
-            block_size=8,
-            cpu_offload=True,
-            host_offload=True,
-            dp_size=1,
+            part_n_hash_cols=2, host_offload=False, dp_size=1
         )
-        with patch.object(common_engram.upstream.Engram, "_init_staging"):
+        with patch.object(common_engram.upstream.Engram, "_init_staging") as init:
             engram._init_staging(max_tokens=4, head_dim=16)
-            assert engram._staged_raw is not None
-            assert engram._host_raw.shape == (4, 2, 16)
-
-            engram.embed_tokens.host_offload = False
+            init.assert_called_once()
+            engram.embed_tokens.host_offload = True
+            engram.embed_tokens.dp_size = 8
             engram._init_staging(max_tokens=4, head_dim=16)
-            assert engram._staged_raw is None
+            init.assert_called_once()
+        assert engram._host_capacity == 4 * 8 * 2
+        assert engram.host_channel is None and engram._host_pending is None
 
-            engram.embed_tokens = SimpleNamespace(
-                gather_raw=lambda h, r, s: None,
-                part_n_hash_cols=2,
-                block_size=8,
-                cpu_offload=True,
-                host_offload=True,
-                dp_size=1,
-                n_hash_cols=2,
-                tp_size=1,
+        # _ready_rows: packed Host channel words -> dequantized bf16 rows.
+        # 16 FP8 bytes of 1.0 and 4 unit scale bytes per row: five words.
+        engram.embed_tokens = SimpleNamespace(
+            host_offload=True, dim=16, block_size=4, n_hash_cols=2, tp_size=1
+        )
+        engram._uses_hbm = False
+        row = torch.cat(
+            (
+                torch.ones(16, dtype=torch.float8_e4m3fn).view(torch.uint8),
+                torch.full((4,), common_engram._UNIT_SCALE, dtype=torch.uint8),
             )
-            engram._init_staging(max_tokens=4, head_dim=16)
-
-        hash_ids = torch.tensor([[0, 1], [2, 3]])
-        engram.prepare_embeddings(hash_ids)
+        )
+        engram._host_rows = row.repeat(3, 2, 1).view(torch.int32)
         ready = engram._ready_rows(2)
-        assert ready.shape == (2, 2, 16)
+        assert ready.shape == (2, 2, 16) and ready.dtype == torch.bfloat16
+        assert torch.equal(ready, torch.ones(2, 2, 16, dtype=torch.bfloat16))
 
-        # Fallback to super().prepare_embeddings and super()._ready_rows
-        engram._staged_raw = None
-        with (
-            patch.object(
-                common_engram.upstream.Engram, "prepare_embeddings"
-            ) as mock_prep,
-            patch.object(
-                common_engram.upstream.Engram,
-                "_ready_rows",
-                return_value=torch.zeros(2, 2, 16),
-            ) as mock_ready,
-        ):
-            engram.prepare_embeddings(hash_ids)
-            mock_prep.assert_called_once()
+        # HBM rows arrive dequantized; device tables use upstream staging.
+        engram._uses_hbm = True
+        engram._host_rows = torch.zeros(3, 2, 16, dtype=torch.bfloat16)
+        assert engram._ready_rows(2).shape == (2, 2, 16)
+        engram.embed_tokens.host_offload = False
+        with patch.object(
+            common_engram.upstream.Engram,
+            "_ready_rows",
+            return_value=torch.zeros(2, 2, 16),
+        ) as mock_ready:
             assert engram._ready_rows(2).shape == (2, 2, 16)
             mock_ready.assert_called_once()
+        engram.embed_tokens.host_offload = True
+        engram._host_pending = None
+        hash_ids = torch.tensor([[0, 1], [2, 3]])
 
         # _sp_embed: tp == 1 vs tp > 1
         engram._ready_rows = lambda n: torch.ones(n, 2, 16, dtype=torch.bfloat16)
@@ -627,468 +559,6 @@ class TestCommonNgramHashStateFull:
             assert sp_out1.shape[0] == 1
             sp_out2 = engram.forward(h_chunk, hash_ids, token_mask=None)
             assert sp_out2.shape[0] == 1
-
-
-# ==============================================================================
-# Section 2: deepseek_v41/v2/host_engram.py Full Coverage
-# ==============================================================================
-
-
-class TestV2HostEngramFull:
-    def test_host_engram_inputs_dataclass(self):
-        # host_ready is None with all_prompt True / False
-        h_true = HostEngramInputs(
-            input_ids=torch.tensor([1, 2]),
-            positions=torch.tensor([0, 1]),
-            query_start_loc=torch.tensor([0, 2]),
-            lookback_token_ids=torch.tensor([[1], [2]]),
-            all_prompt=True,
-            host_ready=None,
-        )
-        assert h_true.can_hash_on_host is True
-
-        h_false = HostEngramInputs(
-            input_ids=torch.tensor([1, 2]),
-            positions=torch.tensor([0, 1]),
-            query_start_loc=torch.tensor([0, 2]),
-            lookback_token_ids=torch.tensor([[1], [2]]),
-            all_prompt=False,
-            host_ready=None,
-        )
-        assert h_false.can_hash_on_host is False
-
-        # host_ready explicitly set
-        h_hr_true = HostEngramInputs(
-            input_ids=torch.tensor([1, 2]),
-            positions=torch.tensor([0, 1]),
-            query_start_loc=torch.tensor([0, 2]),
-            lookback_token_ids=torch.tensor([[1], [2]]),
-            all_prompt=False,
-            host_ready=True,
-        )
-        assert h_hr_true.can_hash_on_host is True
-
-        h_hr_false = HostEngramInputs(
-            input_ids=torch.tensor([1, 2]),
-            positions=torch.tensor([0, 1]),
-            query_start_loc=torch.tensor([0, 2]),
-            lookback_token_ids=torch.tensor([[1], [2]]),
-            all_prompt=True,
-            host_ready=False,
-        )
-        assert h_hr_false.can_hash_on_host is False
-
-    def test_async_source_tokens_cpu_branches(self):
-        # 1. wait_for_copy returning Tensor
-        p1 = SimpleNamespace(wait_for_copy=lambda: torch.tensor([[1, 2], [3, 4]]))
-        assert _async_source_tokens_cpu(p1).tolist() == [1, 2, 3, 4]
-
-        # 2. copy_state with 1 chunk
-        p2 = SimpleNamespace(
-            copy_state=SimpleNamespace(chunks_cpu=[torch.tensor([5, 6])])
-        )
-        assert _async_source_tokens_cpu(p2).tolist() == [5, 6]
-
-        # 3. copy_state with multiple chunks
-        p3 = SimpleNamespace(
-            copy_state=SimpleNamespace(
-                chunks_cpu=[torch.tensor([7]), torch.tensor([8])]
-            )
-        )
-        assert _async_source_tokens_cpu(p3).tolist() == [7, 8]
-
-        # 4. next_tokens_tpu Tensor
-        p4 = SimpleNamespace(next_tokens_tpu=torch.tensor([9, 10]))
-        assert _async_source_tokens_cpu(p4).tolist() == [9, 10]
-
-        # 5. Fallback None
-        assert _async_source_tokens_cpu(SimpleNamespace()) is None
-
-    def test_resolve_decode_lookback_cpu(self):
-        runner = SimpleNamespace(
-            lookback_token_ids=SimpleNamespace(
-                cpu=torch.full((4, 2), -1, dtype=torch.int64)
-            )
-        )
-        batch = SimpleNamespace(
-            num_computed_tokens_cpu=np.array([2, 3]),
-            token_ids_cpu=np.array([[10, 20, 30, 40], [50, 60, 70, 80]]),
-        )
-        # num_reqs <= 0
-        lb_zero = _resolve_decode_lookback_cpu(runner, batch, num_reqs=0, start_index=0)
-        assert lb_zero.shape == (4, 2)
-
-        # num_reqs > 0
-        lb = _resolve_decode_lookback_cpu(runner, batch, num_reqs=2, start_index=0)
-        assert lb.shape == (4, 2)
-        assert lb[0].tolist() == [20, 10]
-        assert lb[1].tolist() == [70, 60]
-
-    def test_capture_host_engram_inputs_all_branches(self):
-        runner = SimpleNamespace(
-            _last_sequence_layout_plan=None,
-            input_batch=SimpleNamespace(num_prompt_tokens=np.array([2, 2])),
-            seq_lens_np=np.array([2, 2]),
-            input_ids_cpu=torch.tensor([1, 2, 3, 4]),
-            positions_cpu=torch.tensor([0, 1, 0, 1]),
-            query_start_loc_cpu=torch.tensor([0, 2, 4]),
-            lookback_token_ids=SimpleNamespace(
-                cpu=torch.full((2, 2), -1, dtype=torch.int64)
-            ),
-        )
-
-        # 1. plan is None
-        assert capture_host_engram_inputs(runner, num_reqs=2) is None
-
-        # 2. plan is not SequenceLayoutKind.ALL
-        runner._last_sequence_layout_plan = SimpleNamespace(kind="OTHER")
-        assert capture_host_engram_inputs(runner, num_reqs=2) is None
-
-        # 3. all_prompt and start_index == 0 -> host_ready=True
-        runner._last_sequence_layout_plan = SimpleNamespace(
-            kind=SequenceLayoutKind.ALL, start_index=0, num_reqs=2
-        )
-        inp1 = capture_host_engram_inputs(runner, num_reqs=2)
-        assert inp1 is not None
-        assert inp1.all_prompt is True
-        assert inp1.host_ready is True
-
-        # 4. not all_prompt, speculative decode active -> host_ready=False
-        runner.input_batch.num_prompt_tokens = np.array([1, 1])
-        runner._pre_async_results = SimpleNamespace(spec_decode_num_rejected_tokens=0)
-        inp2 = capture_host_engram_inputs(runner, num_reqs=2)
-        assert inp2 is not None
-        assert inp2.all_prompt is False
-        assert inp2.host_ready is False
-
-        # 5. not all_prompt, missing token_ids_cpu -> host_ready=False
-        runner._pre_async_results = None
-        runner.input_batch.num_computed_tokens_cpu = None
-        runner.input_batch.token_ids_cpu = None
-        inp3 = capture_host_engram_inputs(runner, num_reqs=2)
-        assert inp3 is not None
-        assert inp3.host_ready is False
-
-        # 6. decode step with matched reqs and flat_src is None -> host_ready=False
-        runner.input_batch.num_computed_tokens_cpu = np.array([2, 2])
-        runner.input_batch.token_ids_cpu = np.array([[10, 20], [30, 40]])
-        runner.input_batch.req_ids = ["req0", "req1"]
-        runner._pre_async_results = SimpleNamespace(req_id_to_index_copy={"req0": 0})
-        inp4 = capture_host_engram_inputs(runner, num_reqs=2)
-        assert inp4 is not None
-        assert inp4.host_ready is False
-
-        # 7. decode step with matched reqs and flat_src provided -> host_ready=True
-        runner._pre_async_results.copy_state = SimpleNamespace(
-            chunks_cpu=[torch.tensor([99, 100])]
-        )
-        inp5 = capture_host_engram_inputs(runner, num_reqs=2)
-        assert inp5 is not None
-        assert inp5.host_ready is True
-        assert inp5.input_ids[0].item() == 99
-
-        # 8. decode step without matched reqs -> host_ready=True
-        runner._pre_async_results = SimpleNamespace(req_id_to_index_copy={})
-        inp6 = capture_host_engram_inputs(runner, num_reqs=2)
-        assert inp6 is not None
-        assert inp6.host_ready is True
-
-    def test_gather_host_engram_hashes_branches(self):
-        hashes_cpu = torch.ones((2, 2, 1), dtype=torch.int32, device="cpu")
-
-        # 1. CPU, not dp_shared_memory, dp_group with world_size > 1 and cpu_group
-        mock_cpu_group = MagicMock()
-        mock_dp_group = SimpleNamespace(world_size=2, cpu_group=mock_cpu_group)
-        mock_ctx = SimpleNamespace(dp_metadata=SimpleNamespace())
-
-        with (
-            patch(
-                "vllm_torchtpu.models.vllm.deepseek_v41.v2.host_engram.get_engram_dp_group",
-                return_value=mock_dp_group,
-            ),
-            patch(
-                "vllm_torchtpu.models.vllm.deepseek_v41.v2.host_engram.is_forward_context_available",
-                return_value=True,
-            ),
-            patch(
-                "vllm_torchtpu.models.vllm.deepseek_v41.v2.host_engram.get_forward_context",
-                return_value=mock_ctx,
-            ),
-            patch(
-                "vllm_torchtpu.models.vllm.deepseek_v41.v2.host_engram.engram_gathered_num_tokens",
-                return_value=4,
-            ),
-            patch("torch.distributed.all_gather_into_tensor") as mock_all_gather,
-        ):
-            out = gather_host_engram_hashes(hashes_cpu, dp_shared_memory=False)
-            assert out.shape == (8, 2, 1)
-            mock_all_gather.assert_called_once()
-
-            # Exceeds slot -> raises ValueError
-            with (
-                patch(
-                    "vllm_torchtpu.models.vllm.deepseek_v41.v2.host_engram.engram_gathered_num_tokens",
-                    return_value=1,
-                ),
-                pytest.raises(ValueError, match="exceeds the DP token slot"),
-            ):
-                gather_host_engram_hashes(hashes_cpu, dp_shared_memory=False)
-
-        # 2. gather_fn provided
-        called_fn = []
-        gather_host_engram_hashes(
-            hashes_cpu,
-            dp_shared_memory=True,
-            gather_fn=lambda h, dp_shared_memory: called_fn.append(
-                (h.shape, dp_shared_memory)
-            ),
-        )
-        assert called_fn == [((2, 2, 1), True)]
-
-        # 3. Fallback to upstream gather_engram_hashes
-        with patch(
-            "vllm.models.deepseek_v41.common.engram.gather_engram_hashes",
-            return_value=torch.ones((4, 2, 1)),
-        ) as mock_up_gather:
-            out3 = gather_host_engram_hashes(hashes_cpu, dp_shared_memory=True)
-            assert out3.shape == (4, 2, 1)
-            mock_up_gather.assert_called_once()
-
-    def test_install_host_engram_inputs(self):
-        class MockRunner:
-            def _prepare_lookback_token_ids(self, num_reqs: int):
-                return torch.tensor([num_reqs])
-
-        with patch("vllm_torchtpu.runner.tpu_runner.TPUModelRunner", MockRunner):
-            install_host_engram_inputs()
-            assert (
-                getattr(
-                    MockRunner._prepare_lookback_token_ids,
-                    "_deepseek_v41_host_engram",
-                    False,
-                )
-                is True
-            )
-
-            # Second call early returns
-            install_host_engram_inputs()
-
-            runner_inst = MockRunner()
-            runner_inst._last_sequence_layout_plan = None
-            runner_inst.input_batch = None
-            # Outside forward context
-            with patch(
-                "vllm_torchtpu.models.vllm.deepseek_v41.v2.host_engram.is_forward_context_available",
-                return_value=False,
-            ):
-                assert runner_inst._prepare_lookback_token_ids(3).item() == 3
-
-            # Inside forward context
-            mock_ctx = SimpleNamespace(additional_kwargs={})
-            with (
-                patch(
-                    "vllm_torchtpu.models.vllm.deepseek_v41.v2.host_engram.is_forward_context_available",
-                    return_value=True,
-                ),
-                patch(
-                    "vllm_torchtpu.models.vllm.deepseek_v41.v2.host_engram.get_forward_context",
-                    return_value=mock_ctx,
-                ),
-            ):
-                assert runner_inst._prepare_lookback_token_ids(3).item() == 3
-                assert HOST_ENGRAM_KEY in mock_ctx.additional_kwargs
-
-
-# ==============================================================================
-# Section 3: deepseek_v41/v2/model.py Diff Lines Coverage
-# ==============================================================================
-
-
-class TestV2ModelHostEngramStaging:
-    def test_model_host_engram_skip_lookup(self):
-        """Cover line 274: skip_lookup=True -> engram_mask."""
-        model = object.__new__(DeepseekV41Model)
-        model.engram_hash = SimpleNamespace(
-            multipliers=torch.ones((2, 3)),
-            ensure_cache=lambda: True,
-        )
-        model.engram_swa_prefix = "swa"
-        input_ids = torch.tensor([10, 20], dtype=torch.int32)
-        mock_ctx = SimpleNamespace(
-            attn_metadata={"swa": SimpleNamespace(seq_lens=torch.tensor([2]))}
-        )
-        with (
-            patch(
-                "vllm.forward_context.is_forward_context_available", return_value=True
-            ),
-            patch("vllm.forward_context.get_forward_context", return_value=mock_ctx),
-            patch(
-                "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.upstream.is_forward_context_available",
-                return_value=True,
-            ),
-            patch(
-                "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.upstream.get_forward_context",
-                return_value=mock_ctx,
-            ),
-            patch(
-                "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.upstream.image_sentinel_mask",
-                return_value=torch.zeros(2, dtype=torch.bool),
-            ),
-        ):
-            hashes, mask = model._prepare_engram(
-                input_ids, torch.tensor([0, 1]), None, skip_lookup=True
-            )
-            assert hashes.shape == (2, 2, 1)
-            assert mask.shape == (2,)
-
-    def test_model_host_engram_host_not_none(self):
-        """Cover line 294: host is not None -> engram_mask."""
-        model = object.__new__(DeepseekV41Model)
-        model.engram_hash = SimpleNamespace(
-            use_slot_cache=True,
-            lookback_depth=2,
-            ensure_cache=lambda: True,
-            hash_on_host=lambda *h: torch.ones((2, 2, 1)),
-        )
-        model.engram_swa_prefix = "swa"
-        model._host_hash_inputs = lambda inp, seq, layer_idx: (
-            torch.tensor([1, 2]),
-            torch.tensor([0, 1]),
-        )
-        model.engram_dp_shared_memory = False
-        model._has_cpu_offloaded_engram = lambda: False
-        model.layers = []
-        model.start_layer = 0
-        model.end_layer = 0
-        input_ids = torch.tensor([10, 20])
-        swa = SimpleNamespace(seq_lens=torch.tensor([2]))
-        mock_ctx = SimpleNamespace(attn_metadata={"swa": swa})
-        with (
-            patch(
-                "vllm.forward_context.is_forward_context_available", return_value=True
-            ),
-            patch("vllm.forward_context.get_forward_context", return_value=mock_ctx),
-            patch(
-                "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.upstream.is_forward_context_available",
-                return_value=True,
-            ),
-            patch(
-                "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.upstream.get_forward_context",
-                return_value=mock_ctx,
-            ),
-            patch(
-                "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.upstream.image_sentinel_mask",
-                return_value=torch.zeros(2, dtype=torch.bool),
-            ),
-            patch(
-                "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.gather_host_engram_hashes",
-                return_value=torch.ones((2, 2, 1)),
-            ),
-        ):
-            hashes, mask = model._prepare_engram(
-                input_ids, torch.tensor([0, 1]), torch.tensor([[0, 1]])
-            )
-            assert hashes.shape == (2, 2, 1)
-            assert mask.shape == (2,)
-
-    def test_model_host_engram_host_none(self):
-        """Cover lines 296-297: host is None -> image_mask calculation."""
-        model = object.__new__(DeepseekV41Model)
-        model.engram_hash = MagicMock(return_value=torch.ones((2, 2, 1)))
-        model.engram_hash.use_slot_cache = True
-        model.engram_hash.lookback_depth = 2
-        model.engram_hash.ensure_cache = lambda: True
-        model.engram_hash.swa_cache_module = SimpleNamespace(kv_cache=torch.zeros(1))
-        model.engram_swa_prefix = "swa"
-        model._host_hash_inputs = lambda inp, seq, layer_idx: None
-        model.engram_dp_shared_memory = False
-        model._has_cpu_offloaded_engram = lambda: False
-        model.layers = []
-        model.start_layer = 0
-        model.end_layer = 0
-        input_ids = torch.tensor([10, 20])
-        swa = SimpleNamespace(
-            seq_lens=torch.tensor([2]), query_start_loc=torch.tensor([0, 2])
-        )
-        mock_ctx = SimpleNamespace(attn_metadata={"swa": swa})
-        with (
-            patch(
-                "vllm.forward_context.is_forward_context_available", return_value=True
-            ),
-            patch("vllm.forward_context.get_forward_context", return_value=mock_ctx),
-            patch(
-                "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.upstream.is_forward_context_available",
-                return_value=True,
-            ),
-            patch(
-                "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.upstream.get_forward_context",
-                return_value=mock_ctx,
-            ),
-            patch(
-                "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.upstream.image_sentinel_mask",
-                return_value=torch.zeros(2, dtype=torch.bool),
-            ),
-            patch(
-                "vllm_torchtpu.models.vllm.deepseek_v41.v2.model._cache_slots",
-                return_value=None,
-            ),
-            patch(
-                "vllm_torchtpu.models.vllm.deepseek_v41.v2.model._block_table",
-                return_value=None,
-            ),
-            patch(
-                "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.gather_host_engram_hashes",
-                return_value=torch.ones((2, 2, 1)),
-            ),
-        ):
-            hashes, mask = model._prepare_engram(
-                input_ids, torch.tensor([0, 1]), torch.tensor([[0, 1]])
-            )
-            assert hashes.shape == (2, 2, 1)
-            assert mask.shape == (2,)
-
-    def test_model_host_engram_forward_offload_mega_moe(self):
-        """Cover lines 345-349: offload_mega_moe input_ids int64 casting."""
-        model = object.__new__(DeepseekV41Model)
-        model._has_cpu_offloaded_engram = lambda: True
-        model._ced_enabled = False
-        model.full_stage = lambda *args, **kwargs: torch.tensor([42])
-
-        prep_called = []
-        model._prepare_engram = lambda ids, p, layer_idx, stage: prep_called.append(
-            (ids.dtype if ids is not None else None, stage)
-        )
-
-        # Case 1: self.use_native_mega_moe=True and input_ids on cpu
-        model.use_native_mega_moe = True
-        input_ids = torch.tensor([1, 2], dtype=torch.int32, device="cpu")
-        model.forward(input_ids, torch.tensor([0, 1]))
-        assert prep_called[-1] == (torch.int64, "full")
-
-        # Case 2: self.use_native_mega_moe=False -> input_ids kept as-is
-        model.use_native_mega_moe = False
-        input_ids = torch.tensor([1, 2], dtype=torch.int32, device="cpu")
-        model.forward(input_ids, torch.tensor([0, 1]))
-        assert prep_called[-1] == (torch.int32, "full")
-
-        # Case 3: input_ids is None -> kept as-is
-        model.use_native_mega_moe = True
-        model.forward(None, None)
-        assert prep_called[-1] == (None, "full")
-
-        # Case 4: input_ids device is not cpu (mocked cuda/tpu device)
-        model.use_native_mega_moe = True
-        cuda_ids = MagicMock()
-        cuda_ids.device.type = "cuda"
-        cuda_ids.dtype = torch.int32
-        model.forward(cuda_ids, torch.tensor([0, 1]))
-        assert prep_called[-1] == (torch.int32, "full")
-
-        # Stage with _ced_enabled True
-        model._ced_enabled = True
-        with contextlib.suppress(Exception):
-            model.forward(input_ids, torch.tensor([0, 1]))
-        assert prep_called[-1] == (torch.int64, "encoder")
 
 
 # ==============================================================================

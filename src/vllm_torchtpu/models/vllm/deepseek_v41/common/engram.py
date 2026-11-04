@@ -5,19 +5,14 @@ subclasses ``NgramHashState`` to bind its own slot-cache write op and, when
 its SWA cache module differs, the cache lifetime in ``ensure_cache``.
 """
 
-import mmap
-import tempfile
-from contextlib import ExitStack
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, cast
 
-import numpy as np
 import torch
 from vllm.config import get_current_vllm_config_or_none
 from vllm.models.deepseek_v41.common import engram as upstream
 
 from vllm_torchtpu import envs
-from vllm_torchtpu.layers.adapter.custom_ops.packed_suffix_op import packed_suffix
 from vllm_torchtpu.layers.adapter.upstream_bindings import (
     bind_device_ops,
     device_hooks,
@@ -26,11 +21,9 @@ from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.model_loader_patches import register_row_slice
 
 from ..config import engram_cpu_offload
-from .host_exchange import start_exchange_rows
-from .host_gather import gather_weight_scale
 
 if TYPE_CHECKING:
-    from .host_transfer import PreparedEngramUpload
+    from .host_channel import HostChannel
 
 logger = init_logger(__name__)
 
@@ -122,78 +115,6 @@ class NgramHashState(upstream.NgramHashState):
             fallback,
         )
 
-    def hash_on_host(
-        self,
-        input_ids,
-        positions,
-        query_start_loc,
-        dead_mask,
-        lookback_token_ids,
-        lookback_dead_mask,
-    ):
-        """``forward`` on CPU tensors, for steps whose tokens are all prompt.
-
-        Every n-gram source of a real prompt row is then either in the chunk
-        or in ``lookback_token_ids`` (the runner fills it from the prompt), so
-        the generated-token slot cache is never consulted and is not written:
-        prompt history is always re-supplied by lookback, and decode steps
-        (which do need the cache) keep the device path. Padded rows read
-        ``pad_id`` here instead of an arbitrary cache slot; their outputs are
-        never consumed. Integer math, so hashes equal the device path's.
-        """
-        count = input_ids.numel()
-        layers, ngram = self.multipliers.shape
-        if count == 0:
-            return input_ids.new_empty(
-                (0, layers, (ngram - 1) * self.primes.shape[-1]), dtype=torch.int32
-            )
-        tables = getattr(self, "_host_tables", None)
-        if tables is None:
-            tables = tuple(
-                np.asarray(t.to("cpu"), dtype=np.int64)
-                for t in (self.token_map, self.multipliers, self.primes, self.offsets)
-            )
-            self._host_tables = tables
-        token_map_np, mult_np, primes_np, offsets_np = tables
-        ids_np = np.asarray(input_ids, dtype=np.int64)
-        pos_np = np.asarray(positions, dtype=np.int64)
-        qsl_np = np.asarray(query_start_loc, dtype=np.int64)
-        dead_np = np.asarray(dead_mask, dtype=np.bool_)
-        lb_np = np.asarray(lookback_token_ids, dtype=np.int64)
-        lb_dead_np = np.asarray(lookback_dead_mask, dtype=np.bool_)
-        rows = np.arange(count, dtype=np.int64)
-        reqs = np.minimum(
-            np.searchsorted(qsl_np[1:], rows, side="right"),
-            lb_np.shape[0] - 1,
-        )
-        starts = np.minimum(qsl_np[reqs], count - 1)
-        chunk_positions = pos_np[starts]
-        shifts = np.arange(ngram, dtype=np.int64)
-        past = pos_np[:, None] - shifts
-        in_chunk = past >= chunk_positions[:, None]
-        indices = np.maximum(rows[:, None] - shifts, 0)
-        mapped_batch = token_map_np[ids_np].copy()
-        mapped_batch[dead_np] = upstream.DEAD_ID
-        batch = mapped_batch[indices]
-        cols = chunk_positions[:, None] - 1 - past
-        in_window = (~in_chunk) & (cols >= 0) & (cols < self.lookback_depth)
-        cols_clamped = np.clip(cols, 0, self.lookback_depth - 1)
-        reqs_col = reqs[:, None]
-        window_ids = lb_np[reqs_col, cols_clamped]
-        known = in_window & (window_ids >= 0)
-        mapped_lb = token_map_np[np.maximum(lb_np, 0)].copy()
-        mapped_lb[lb_dead_np] = upstream.DEAD_ID
-        window = mapped_lb[reqs_col, cols_clamped]
-        source = np.where(in_chunk, batch, np.where(known, window, int(self.pad_id)))
-        blocked = np.cumsum((past < 0) | (source == upstream.DEAD_ID), axis=1) > 0
-        source = np.where(blocked, int(self.pad_id), source)
-        terms = source[:, None, :] * mult_np[None, :, :]
-        rolled = np.bitwise_xor.accumulate(terms, axis=2)[:, :, 1:]
-        hashed = (rolled[:, :, :, None] % primes_np[None, :, :, :]).reshape(
-            count, layers, -1
-        ) + offsets_np[None, :, :]
-        return torch.from_numpy(np.ascontiguousarray(hashed, dtype=np.int32))
-
     def _hash(
         self,
         tables,
@@ -266,96 +187,13 @@ def _load_local_rows(param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
     param.data.copy_(loaded_weight)
 
 
-def _shared_row_range(num_rows: int, group) -> tuple[int, int]:
-    """First row and row count this EDP rank loads into a shared table."""
-    chunk = -(-num_rows // group.world_size)
-    start = min(group.rank_in_group * chunk, num_rows)
-    return start, min(chunk, num_rows - start)
-
-
-class DPSharedEngramStorage(upstream.DPSharedEngramStorage):
-    """Upstream's /dev/shm table shared by a node-local DP group, for TPU.
-
-    TPU lookups gather on the host (``gather_raw``), so the mapping needs
-    neither CUDA registration nor an accelerator view. Each EDP rank loads a
-    disjoint row range; the barrier after every tensor publishes all ranges.
-    """
-
-    def _allocate(self, num_bytes: int) -> torch.Tensor:
-        group = self.group
-        with ExitStack() as stack:
-            path = error = None
-            if group.rank_in_group == 0:
-                try:
-                    upstream.check_shm_free_space(
-                        num_bytes, upstream.SHM_PATH, allocation_name="Engram tables"
-                    )
-                    backing_file = stack.enter_context(
-                        tempfile.NamedTemporaryFile(
-                            prefix="vllm_engram_", dir=upstream.SHM_PATH
-                        )
-                    )
-                    backing_file.truncate(num_bytes)
-                    path = backing_file.name
-                except Exception as exc:
-                    error = f"{type(exc).__name__}: {exc}"
-            path, error = group.broadcast_object((path, error))
-            if error is not None:
-                raise RuntimeError(
-                    "Engram shared-memory creation failed on EDP rank 0: " + error
-                )
-
-            tensor = None
-            try:
-                with open(path, "r+b") as file:
-                    mapping = mmap.mmap(file.fileno(), num_bytes, flags=mmap.MAP_SHARED)
-                # The tensor keeps the array, and the array the mapping.
-                tensor = torch.from_numpy(np.frombuffer(mapping, dtype=np.uint8))
-            except Exception as exc:
-                error = f"{type(exc).__name__}: {exc}"
-
-            # Also fences peer mappings before the leader unlinks the file.
-            errors: list[str | None] = [None] * group.world_size
-            torch.distributed.all_gather_object(errors, error, group=group.cpu_group)
-            failures = "; ".join(
-                f"EDP rank {rank}: {error}"
-                for rank, error in enumerate(errors)
-                if error is not None
-            )
-            if failures:
-                raise RuntimeError(
-                    "Engram shared-memory initialization failed: " + failures
-                )
-            assert tensor is not None
-            return tensor
-
-    def load_weight(
-        self, param: torch.nn.Parameter, loaded_weight: torch.Tensor
-    ) -> None:
-        start, rows = _shared_row_range(param.shape[0], self.group)
-        if loaded_weight.shape[0] != rows:
-            # A full table, rather than the row slice the Run:AI stream
-            # registered for this rank (see Engram._create_embedding).
-            loaded_weight = loaded_weight.narrow(
-                0, param.engram_vocab_start + start, rows
-            )
-        _load_local_rows(param.data.narrow(0, start, rows), loaded_weight)
-        # Every rank loads each tensor once, so barrier counts match.
-        torch.distributed.barrier(group=self.group.cpu_group)
-
-    def get_views(
-        self, weight: torch.Tensor, scales: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        if (weight.data_ptr(), scales.data_ptr()) != (
-            self.weight.data_ptr(),
-            self.weight_scale_inv.data_ptr(),
-        ):
-            raise RuntimeError("Shared Engram parameter storage must not be replaced")
-        return self.weight, self.weight_scale_inv
-
-
 class ParallelEngramEmbedding(upstream.ParallelEngramEmbedding):
-    """Reuse upstream head sharding and checkpoint loaders; support Host DRAM."""
+    """Reuse upstream head sharding and checkpoint loaders; support Host DRAM.
+
+    Host-offloaded shards stay in CPU memory and are served by a native
+    Host channel (``host_channel.py``) or, for ``TPU_DEEPSEEK_V41_ENGRAM_HBM``
+    layers, by an HBM copy (``engram_hbm.py``).
+    """
 
     @staticmethod
     def _weight_loader(param, loaded_weight):
@@ -376,13 +214,7 @@ class ParallelEngramEmbedding(upstream.ParallelEngramEmbedding):
         loader(stager.host_param(param), loaded_weight)
         stager.flush(param)
 
-    def __init__(
-        self,
-        *args,
-        cpu_offload: bool | None = None,
-        dp_shared_memory: bool = False,
-        **kwargs,
-    ):
+    def __init__(self, *args, cpu_offload: bool | None = None, **kwargs):
         # Upstream's own `cpu_offload` means a pinned table read through UVA
         # (CUDA only) and it resets the attribute in `__init__`; keep it False
         # and track the TPU host table separately.
@@ -394,11 +226,6 @@ class ParallelEngramEmbedding(upstream.ParallelEngramEmbedding):
                 else envs.TPU_DEEPSEEK_V41_ENGRAM_CPU_OFFLOAD
             )
         self.host_offload = bool(cpu_offload)
-        # Co-located DP replicas map one host table from /dev/shm and each
-        # looks up only its own tokens, so heads stay TP-sharded only.
-        self.tpu_dp_shared_memory = bool(dp_shared_memory)
-        if self.tpu_dp_shared_memory and not self.host_offload:
-            raise ValueError("dp_shared_memory requires Engram CPU offload")
         # Upstream asks for the SM count solely to size its Triton lookup grid.
         # The TPU lookup below does not use that launch property.
         with device_hooks(
@@ -406,33 +233,13 @@ class ParallelEngramEmbedding(upstream.ParallelEngramEmbedding):
             get_device_properties=lambda _: SimpleNamespace(multi_processor_count=0),
         ):
             super().__init__(*args, cpu_offload=False, **kwargs)
-        if self.tpu_dp_shared_memory:
-            self.dp_size = 1
         upstream.set_weight_attrs(self.weight, {"dummy_weight_value": 1.0})
         if self.weight_scale_inv is not None:
             upstream.set_weight_attrs(
                 self.weight_scale_inv, {"dummy_weight_value": 127}
             )
 
-    def _get_shard_info(self) -> tuple[int, int]:
-        if self.tpu_dp_shared_memory:
-            return self.tp_size, upstream.get_tensor_model_parallel_rank()
-        return super()._get_shard_info()
-
     def _allocate_weights(self) -> tuple[torch.Tensor, torch.Tensor]:
-        if self.tpu_dp_shared_memory:
-            group = upstream.get_engram_dp_group()
-            if group is None or group.world_size <= 1:
-                raise ValueError(
-                    "dp_shared_memory requires a node-local Engram DP group "
-                    "with size > 1"
-                )
-            storage = DPSharedEngramStorage(
-                self.part_num_embeddings, self.dim, self.block_size, group
-            )
-            self._shared_memory = storage
-            self._weight_loader = storage.load_weight
-            return storage.weight, storage.weight_scale_inv
         if not self.host_offload:
             return super()._allocate_weights()
         return (
@@ -473,67 +280,11 @@ class ParallelEngramEmbedding(upstream.ParallelEngramEmbedding):
         )
         out.copy_((values * scale).masked_fill(~valid[:, :, None], 0).to(out.dtype))
 
-    def gather_raw(self, indices, raw_out, scale_out):
-        """Gather local heads' raw FP8 bytes and E8M0 scale bytes (no dequant).
-
-        ``raw_out`` is ``[T, local_heads, dim]`` uint8 and ``scale_out`` is
-        ``[T, local_heads, dim // block_size]`` uint8, both on the table's
-        device. Rows outside this shard (or padded heads) get the
-        ``_INVALID_SCALE`` sentinel in every scale block; their raw bytes are
-        left as gathered (masking them too cost ~11 ms per 8192-token step on
-        the host). ``dequant_fp8_rows`` maps sentinel blocks to +0,
-        exactly the zero rows that ``lookup`` writes for them.
-        Unsharded shared tables require in-range hash IDs.
-        """
-        weight, scales = self._storage()
-        if self.tpu_dp_shared_memory and self.tp_size == 1:
-            rows = indices
-            valid = None
-        else:
-            work_device = weight.device
-            heads_cache = getattr(self, "_gather_heads_cache", None)
-            if heads_cache is None or heads_cache[0].device != work_device:
-                heads = (
-                    torch.arange(self.part_n_hash_cols, device=work_device)
-                    + self.head_start
-                )
-                heads_cache = (
-                    heads.clamp(max=self.n_hash_cols - 1),
-                    (heads < self.n_hash_cols)[None, :],
-                )
-                self._gather_heads_cache = heads_cache
-            heads_clamped, heads_valid = heads_cache
-            selected = indices[:, heads_clamped].long()
-            valid = (
-                heads_valid
-                & (selected >= self.vocab_start_idx)
-                & (selected < self.vocab_end_idx)
-            )
-            rows = (selected - self.vocab_start_idx).clamp(
-                min=0, max=self.part_num_embeddings - 1
-            )
-        raw_rows = raw_out.view(-1, self.dim)
-        scale_rows = scale_out.view(-1, self.dim // self.block_size)
-        if weight.device.type == "cpu":
-            gather_weight_scale(
-                weight.view(torch.uint8),
-                scales,
-                rows,
-                raw_rows,
-                scale_rows,
-            )
-        else:
-            flat = rows.flatten()
-            torch.index_select(weight.view(torch.uint8), 0, flat, out=raw_rows)
-            torch.index_select(scales, 0, flat, out=scale_rows)
-        if valid is not None and not bool(valid.all()):
-            scale_out.masked_fill_(~valid[:, :, None], _INVALID_SCALE)
-
 
 # E8M0 scale byte for 2**0. Scale bytes encode 2**(byte - 127).
 _UNIT_SCALE = 127
-# E8M0 byte 255 is NaN and never appears in a real table; staging uses it to
-# mark rows outside the shard, padded heads and the unused tail.
+# E8M0 byte 255 is NaN and never appears in a real table; it marks rows
+# outside the shard and padded heads, which dequantize to zero.
 _INVALID_SCALE = 255
 
 
@@ -560,8 +311,7 @@ def _unpack_bytes(words, num_bytes):
     """Little-endian bytes of int32 ``words`` (1-D) -> first ``num_bytes`` uint8.
 
     Inverse of the host's ``uint8_buffer.view(torch.int32)`` on a
-    little-endian host. Staging crosses H2D as 1-D int32 because TorchTPU only
-    takes the fast linearizer path for 1-D 32-bit tensors.
+    little-endian host: Host channels gather packed rows as int32 words.
     """
     shifts = torch.arange(0, 32, 8, dtype=torch.int32, device=words.device)
     unpacked = (words.unsqueeze(-1) >> shifts) & 0xFF
@@ -581,245 +331,106 @@ def _gather_engram_rows(rows, dim):
 
 
 class Engram(upstream.Engram):
-    """Inherit projections, staging and collective head gather from upstream."""
+    """Inherit projections and collective head gather from upstream.
+
+    Host-offloaded tables are looked up inside the compiled forward:
+    ``start_host_embeddings`` (before layer 0) requests this step's rows and
+    ``forward`` waits for them, so the gather and upload overlap the layers
+    in between. No step leaves the device for Engram.
+    """
 
     embed = bind_device_ops(
         upstream.Engram.embed, tensor_model_parallel_all_gather=_gather_engram_rows
     )
+    # Set by publish_host_table on Host-offloaded layers only.
+    host_channel: "HostChannel | None" = None
 
     def _create_embedding(self, layout, layer_hash_index):
-        vllm_config = get_current_vllm_config_or_none()
-        engram_config = getattr(vllm_config, "engram_config", None)
-        dp_shared_memory = bool(getattr(engram_config, "dp_shared_memory", False))
         embedding = ParallelEngramEmbedding(
             layout.num_embeddings[layer_hash_index],
             layout.head_dim,
             tuple(size for order in layout.primes[layer_hash_index] for size in order),
-            dp_shared_memory=dp_shared_memory,
         )
         # Each table is ~98 GB in one tensor, over the Run:AI streamer's
         # per-tensor memory limit, and a rank keeps only its heads' rows.
-        # A DP-shared table is loaded by its EDP ranks in disjoint ranges.
-        start, rows = 0, embedding.part_num_embeddings
-        if dp_shared_memory:
-            start, rows = _shared_row_range(rows, upstream.get_engram_dp_group())
         layer_id = layout.layer_ids[layer_hash_index]
-        for leaf in ("weight", "scale"):
-            if rows:
+        if embedding.part_num_embeddings:
+            for leaf in ("weight", "scale"):
                 register_row_slice(
                     f"layers.{layer_id}.engram.embed.{leaf}",
-                    embedding.vocab_start_idx + start,
-                    rows,
+                    embedding.vocab_start_idx,
+                    embedding.part_num_embeddings,
                 )
         return embedding
 
     def _init_staging(self, max_tokens: int, head_dim: int) -> None:
-        if not self.embed_tokens.host_offload:
+        table = self.embed_tokens
+        if not table.host_offload:
             super()._init_staging(max_tokens, head_dim)
-        else:
-            # Packed host staging replaces the upstream BF16 device buffer.
-            self._prefetch_stream = None
-            self._prefetch_done = None
-        self._staged_raw: torch.Tensor | None = None
-        self._active_raw: torch.Tensor | None = None
-        self._staged_by_tokens: dict[int, torch.Tensor] = {}
-        self._staged_views_by_tokens: dict[int, torch.Tensor] = {}
-        self._prepared_uploads: dict[int, list[PreparedEngramUpload]] | None = None
-        self._active_upload: PreparedEngramUpload | None = None
-        # TPU_DEEPSEEK_V41_ENGRAM_HBM state (``engram_hbm``), set on first use.
+            return
+        self._prefetch_stream = None
+        self._prefetch_done = None
+        # Every DP rank's tokens reach every owner, one row per local head.
+        self._host_capacity = max_tokens * table.dp_size * table.part_n_hash_cols
+        self.host_channel: HostChannel | None = None
         self._uses_hbm: bool | None = None
         self._hbm_table: tuple | None = None
         self._hbm_rank: torch.Tensor | None = None
-        self._hbm_rows: torch.Tensor | None = None
-        if getattr(self.embed_tokens, "host_offload", False):
-            # Host DRAM tables: the host only gathers raw FP8 bytes and scale
-            # bytes (a memcpy-bound index_select); dequantization runs inside
-            # the compiled graph (`_ready_rows`). Dequantizing on the host cost
-            # ~86 ms/layer per 8192-token chunk single-threaded vs ~16 ms for the
-            # raw gather.
-            # Both buffers cross H2D packed into a single 1-D int32 tensor per
-            # layer (`_unpack_bytes`): a 3-D uint8 `copy_()` takes TorchTPU's
-            # slow XlaLinearize path (~9.75 vs ~0.59 ms/layer),
-            # and packing raw + scale halves PJRT H2D transfers per step.
-            cols = self.embed_tokens.part_n_hash_cols * self.embed_tokens.dp_size
-            blocks = head_dim // self.embed_tokens.block_size
-            assert head_dim % 4 == 0, head_dim
-            raw_words_per_tok = (cols * head_dim) // 4
-            scale_words_per_tok = -(-(cols * blocks) // 4)
-            words_per_tok = raw_words_per_tok + scale_words_per_tok
-            self._host_packed_buf = torch.zeros(
-                max_tokens * words_per_tok * 4, dtype=torch.uint8, device="cpu"
-            )
-            self._host_raw = self._host_packed_buf[
-                : max_tokens * raw_words_per_tok * 4
-            ].view(max_tokens, cols, head_dim)
-            scale_bytes = max_tokens * cols * blocks
-            self._host_scale_buf = self._host_packed_buf[
-                max_tokens * raw_words_per_tok * 4 :
-            ]
-            self._host_scale_buf.fill_(_INVALID_SCALE)
-            self._host_scale = self._host_scale_buf[:scale_bytes].view(
-                max_tokens, cols, blocks
-            )
-            self._staged_raw = torch.zeros(
-                max_tokens * words_per_tok, dtype=torch.int32
-            )
-            # -1 is four `_INVALID_SCALE` bytes, matching `_host_scale_buf`.
-            self._staged_raw[max_tokens * raw_words_per_tok :].fill_(-1)
-            self._staged_by_tokens[max_tokens] = self._staged_raw
-            self._active_raw = self._staged_views(max_tokens)
-            self._prepared_uploads = {}
-
-    def _reserve_upload(self, num_tokens: int) -> "PreparedEngramUpload":
-        from .host_transfer import PreparedEngramUpload
-
-        uploads = cast(dict[int, list[PreparedEngramUpload]], self._prepared_uploads)
-        for tokens, slots in uploads.items():
-            if tokens != num_tokens:
-                for slot in slots:
-                    slot.release_consumers()
-        slots = uploads.get(num_tokens)
-        if slots is None:
-            cols, dim = self._host_raw.shape[1:]
-            blocks = dim // self.embed_tokens.block_size
-            words = num_tokens * (cols * dim // 4 + -(-(cols * blocks) // 4))
-            device = cast(torch.Tensor, self._staged_raw).device
-            slots = [PreparedEngramUpload(words, device) for _ in range(2)]
-            uploads[num_tokens] = slots
-            logger.info(
-                "[DSV41] raw_dma Engram: layer=%d tokens=%d slots=2 bytes=%d",
-                self.layer_hash_index,
-                num_tokens,
-                slots[0].host_buffer.size_bytes,
-            )
-        return next(slot for slot in slots if slot is not self._active_upload)
-
-    def start_prepared_embeddings(
-        self, hash_ids: torch.Tensor
-    ) -> "PreparedEngramUpload":
-        num_tokens = hash_ids.shape[0]
-        if num_tokens > self._host_raw.shape[0]:
-            raise ValueError("Engram hashes exceed the configured staging capacity")
-        upload = self._reserve_upload(num_tokens)
-        packed = upload.acquire().view(torch.uint8)
-        cols, dim = self._host_raw.shape[1:]
-        blocks = dim // self.embed_tokens.block_size
-        raw_bytes = num_tokens * cols * dim
-        scale_bytes = num_tokens * cols * blocks
-        raw = packed[:raw_bytes].view(num_tokens, cols, dim)
-        scales = packed[raw_bytes : raw_bytes + scale_bytes].view(
-            num_tokens, cols, blocks
-        )
-        packed[raw_bytes + scale_bytes :].fill_(_INVALID_SCALE)
-        self.embed_tokens.gather_raw(hash_ids, raw, scales)
-        upload.start()
-        return upload
-
-    def activate_prepared_embeddings(
-        self, num_tokens: int, upload: "PreparedEngramUpload"
-    ) -> None:
-        upload.activate()
-        self._active_upload = upload
-        self._staged_by_tokens[num_tokens] = upload.device
-        self._staged_views_by_tokens.pop(num_tokens, None)
-        self._active_raw = self._staged_views(num_tokens)
-
-    def _staged_views(self, num_tokens: int) -> torch.Tensor:
-        view = self._staged_views_by_tokens.get(num_tokens)
-        if view is None:
-            _, cols, head_dim = self._host_raw.shape
-            blocks = self._host_scale.shape[-1]
-            raw_words_per_tok = (cols * head_dim) // 4
-            scale_words_per_tok = -(-(cols * blocks) // 4)
-            staged = self._staged_by_tokens[num_tokens]
-            view = staged.view(num_tokens, raw_words_per_tok + scale_words_per_tok)
-            if num_tokens >= 2:
-                torch._dynamo.mark_dynamic(view, 0)
-            self._staged_views_by_tokens[num_tokens] = view
-        return view
-
-    def prepare_embeddings(self, hash_ids: torch.Tensor) -> None:
-        """Look up rows, redistribute local tokens, and upload packed data."""
-        if self._staged_raw is None:
-            super().prepare_embeddings(hash_ids)
-            return
-        if self.uses_hbm_lookup:
-            self._hbm_prepare(hash_ids)
-            return
-        dp_size = self.embed_tokens.dp_size
-        num_tokens, remainder = divmod(hash_ids.shape[0], dp_size)
-        if remainder or num_tokens > self._host_raw.shape[0]:
-            raise ValueError("Engram hashes exceed the configured DP staging slots")
-        _, cols, head_dim = self._host_raw.shape
-        blocks = self._host_scale.shape[-1]
-        raw_words = num_tokens * ((cols * head_dim) // 4)
-        scale_bytes = num_tokens * cols * blocks
-        scale_words = num_tokens * (-(-(cols * blocks) // 4))
-        if not num_tokens:
-            self._active_upload = None
-            self._active_raw = self._staged_raw[:0].view(
-                0, cols * head_dim // 4 + -(-(cols * blocks) // 4)
-            )
-            return
-        # Scale rows follow this call's raw prefix, not the maximum-capacity raw region.
-        self._host_scale_buf = self._host_packed_buf[
-            raw_words * 4 : (raw_words + scale_words) * 4
-        ]
-        self._host_scale = self._host_scale_buf[:scale_bytes].view(
-            num_tokens, cols, blocks
-        )
-        if dp_size > 1:
-            # Lookup and redistribution stay on CPU. A device all-gather
-            # here would materialize DP copies of every replica's rows.
-            cols = self.embed_tokens.part_n_hash_cols
-            raw = torch.empty(
-                (hash_ids.shape[0], cols, self._host_raw.shape[-1]),
-                dtype=torch.uint8,
-                device="cpu",
-            )
-            scales = torch.empty(
-                (hash_ids.shape[0], cols, self._host_scale.shape[-1]),
-                dtype=torch.uint8,
-                device="cpu",
-            )
-            self.embed_tokens.gather_raw(hash_ids, raw, scales)
-            group = upstream.get_engram_dp_group()
-            assert group is not None and group.world_size == dp_size
-            exchange = start_exchange_rows(raw, scales, group.cpu_group, dp_size)
-            raw, scales = exchange.wait()
-            self._host_raw[:num_tokens].copy_(raw)
-            self._host_scale[:num_tokens].copy_(scales)
-        else:
-            self.embed_tokens.gather_raw(
-                hash_ids, self._host_raw[:num_tokens], self._host_scale[:num_tokens]
-            )
-        if scale_words * 4 > scale_bytes:
-            self._host_scale_buf[scale_bytes : scale_words * 4].fill_(_INVALID_SCALE)
-        host_words = self._host_packed_buf.view(torch.int32)
-        upload = self._reserve_upload(num_tokens)
-        upload.copy_from(host_words[: raw_words + scale_words])
-        self.activate_prepared_embeddings(num_tokens, upload)
+        self._host_pending: tuple[torch.Tensor, torch.Tensor] | None = None
+        self._host_rows: torch.Tensor | None = None
 
     @property
     def uses_hbm_lookup(self) -> bool:
-        """``TPU_DEEPSEEK_V41_ENGRAM_HBM``: rows come from the HBM copy of the host
-        head shard through ``engram_hbm`` instead of the host exchange.
-        Decided once, after staging and the EP group exist."""
+        """``TPU_DEEPSEEK_V41_ENGRAM_HBM``: serve rows from an HBM copy of the
+        host head shard instead of the Host channel. Decided once."""
         if self._uses_hbm is None:
             from .engram_hbm import should_use_hbm_lookup
 
             self._uses_hbm = should_use_hbm_lookup(
-                staged_raw=self._staged_raw,
+                host_offload=self.embed_tokens.host_offload,
                 dp_size=int(self.embed_tokens.dp_size),
                 layer_hash_index=int(self.layer_hash_index),
             )
         return self._uses_hbm
+
+    def publish_host_table(
+        self, predecessor: "HostChannel | None"
+    ) -> "HostChannel | None":
+        """After loading: place the HBM copy or start the Host channel.
+
+        Returns this layer's channel, or ``predecessor`` if it has none, so a
+        later layer's worker gathers only after the earlier upload landed and
+        the two never compete for Host bandwidth while L1 is waiting.
+        """
+        if not self.embed_tokens.host_offload:
+            return predecessor
+        if self.uses_hbm_lookup:
+            self.upload_hbm_table()
+            return predecessor
+        if self.host_channel is None:
+            from .host_channel import HostChannel
+
+            self.host_channel = HostChannel(
+                self.embed_tokens, self._host_capacity, predecessor
+            )
+            logger.info(
+                "[DSV41] Engram Host channel: layer=%d heads=[%d, %d) rows=%d "
+                "capacity=%d",
+                self.layer_hash_index,
+                self.embed_tokens.head_start,
+                self.embed_tokens.head_start + self.embed_tokens.part_n_hash_cols,
+                self.embed_tokens.part_num_embeddings,
+                self._host_capacity,
+            )
+        return self.host_channel
 
     def upload_hbm_table(self):
         """Copy this rank's host head shard to HBM once; returns
         (table, scales, shard metadata, rows per rank)."""
         if self._hbm_table is not None:
             return self._hbm_table
+        from vllm_torchtpu.distributed.ep_mesh import ep_mesh_index
+
         from .engram_hbm import gather_shard_meta, upload_table
 
         emb = self.embed_tokens
@@ -831,8 +442,11 @@ class Engram(upstream.Engram):
             int(weight.shape[0]),
         )
         rows = max(m[3] for m in meta)
-        device = cast(torch.Tensor, self._staged_raw).device
+        device = torch.device("tpu")
         table, table_scales = upload_table(weight, scales, device, rows)
+        self._hbm_rank = torch.tensor(
+            [[cast(int, ep_mesh_index())]], dtype=torch.int32, device=device
+        )
         self._hbm_table = (table, table_scales, meta, rows)
         logger.info(
             "[DSV41] Engram HBM table: layer=%d rows/rank=%d bytes=%d",
@@ -842,92 +456,70 @@ class Engram(upstream.Engram):
         )
         return self._hbm_table
 
-    def _hbm_prepare(self, hash_ids: torch.Tensor) -> None:
-        """Look this rank's tokens up on device; ``_ready_rows`` returns them."""
-        from vllm.forward_context import (
-            get_forward_context,
-            is_forward_context_available,
-        )
-        from vllm.models.deepseek_v41.common.engram import DEAD_ID
+    def start_host_embeddings(
+        self,
+        local_hashes: torch.Tensor,
+        gathered_hashes: torch.Tensor | None,
+        hidden_states: torch.Tensor,
+    ) -> torch.Tensor:
+        """Request this step's rows; returns ``hidden_states`` ordered after it.
 
-        from vllm_torchtpu.distributed.ep_mesh import ep_mesh_index
+        ``local_hashes``/``gathered_hashes``: this rank's and the DP group's
+        hashes of this layer; HBM layers need only the local ones. Call in
+        layer order, as channels were published.
+        """
+        if self.uses_hbm_lookup:
+            from .engram_hbm import build_lookup_op
 
-        from .engram_hbm import build_lookup_op
+            table, table_scales, meta, rows = self.upload_hbm_table()
+            emb = self.embed_tokens
+            op = build_lookup_op(
+                int(self.layer_hash_index),
+                int(emb.n_hash_cols),
+                int(emb.part_n_hash_cols),
+                rows,
+                int(emb.dim),
+                int(emb.block_size),
+                int(emb.dp_size),
+                meta,
+            )
+            self._host_rows = op(local_hashes, table, table_scales, self._hbm_rank)
+            return hidden_states
+        channel = self.host_channel
+        assert channel is not None, "publish_host_table runs before tracing"
+        assert gathered_hashes is not None
+        receipt, hidden_states = channel.start(gathered_hashes, hidden_states)
+        self._host_pending = (gathered_hashes, receipt)
+        return hidden_states
 
-        table, table_scales, meta, rows = self.upload_hbm_table()
-        emb = self.embed_tokens
-        num_tokens = int(hash_ids.shape[0])
-        if is_forward_context_available():
-            sizes = get_forward_context().additional_kwargs.get(
-                "tpu_num_tokens_across_dp_cpu"
-            )
-            if sizes:
-                num_tokens = max(num_tokens, *(int(s) for s in sizes))
-        if num_tokens > self._host_raw.shape[0]:
-            raise ValueError("Engram hashes exceed the configured staging capacity")
-        if not num_tokens:
-            cols = int(emb.part_n_hash_cols) * int(emb.dp_size)
-            self._active_upload = None
-            self._hbm_rows = table.new_empty(
-                (0, cols, int(self._host_raw.shape[-1])), dtype=torch.bfloat16
-            )
-            return
-        if hash_ids.shape[0] < num_tokens:
-            pad = hash_ids.new_full(
-                (num_tokens - hash_ids.shape[0], *hash_ids.shape[1:]), DEAD_ID
-            )
-            hash_ids = torch.cat((hash_ids, pad), dim=0)
-        op = build_lookup_op(
-            int(self.layer_hash_index),
-            num_tokens,
-            int(emb.n_hash_cols),
-            int(emb.part_n_hash_cols),
-            rows,
-            int(self._host_raw.shape[-1]),
-            int(emb.block_size),
-            int(emb.dp_size),
-            meta,
-        )
-        if self._hbm_rank is None:
-            self._hbm_rank = torch.tensor(
-                [[cast(int, ep_mesh_index())]], dtype=torch.int32, device=table.device
-            )
-        rank = self._hbm_rank
-        hashes = hash_ids.to(device=table.device, dtype=torch.int32)
-        embedded = op(hashes, table, table_scales, rank)
-        if num_tokens >= 2:
-            torch._dynamo.mark_dynamic(embedded, 0)
-        self._active_upload = None
-        self._hbm_rows = embedded
+    def _finish_host_embeddings(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if self._host_pending is None:
+            return hidden_states
+        channel = self.host_channel
+        assert channel is not None
+        hashes, receipt = self._host_pending
+        self._host_pending = None
+        self._host_rows, hidden_states = channel.finish(hashes, receipt, hidden_states)
+        return hidden_states
 
     def _ready_rows(self, num_tokens: int) -> torch.Tensor:
-        if self._staged_raw is None:
+        if not self.embed_tokens.host_offload:
             return super()._ready_rows(num_tokens)
-        # Set only by ``_hbm_prepare``; a plain attribute read keeps the gating
-        # out of the compiled stage. getattr: the packed-scale parity test calls
-        # this on a bare holder without HBM state.
-        hbm_rows = getattr(self, "_hbm_rows", None)
-        if hbm_rows is not None:
+        rows = self._host_rows
+        assert rows is not None, "start_host_embeddings precedes the layer"
+        if self.uses_hbm_lookup:
             # The device lookup already dequantized this step's rows.
-            return hbm_rows[:num_tokens]
-        local_num_tokens = num_tokens
-        assert self._active_raw is not None
-        num_tokens = self._active_raw.shape[0]
-        _, cols, head_dim = self._host_raw.shape
-        blocks = self._host_scale.shape[-1]
-        raw_words_per_tok = (cols * head_dim) // 4
-        scale_words_per_tok = -(-(cols * blocks) // 4)
-        raw_bytes = num_tokens * cols * head_dim
-        scale_bytes = num_tokens * cols * blocks
-        words = self._active_raw.flatten()
-        raw = _unpack_bytes(words[: num_tokens * raw_words_per_tok], raw_bytes)
-        scale_words = packed_suffix(words, num_tokens * scale_words_per_tok)
-        scale = _unpack_bytes(scale_words.flatten(), scale_bytes)
+            return rows[:num_tokens]
+        table = self.embed_tokens
+        packed = rows[:num_tokens]
+        data = _unpack_bytes(packed.flatten(), packed.numel() * 4).reshape(
+            *packed.shape[:-1], packed.shape[-1] * 4
+        )
         return dequant_fp8_rows(
-            raw.reshape(num_tokens, cols, head_dim),
-            scale.reshape(num_tokens, cols, blocks),
-            self.embed_tokens.block_size,
-        )[:local_num_tokens]
+            data[..., : table.dim].contiguous(),
+            data[..., table.dim :].contiguous(),
+            table.block_size,
+        )
 
     def _sp_embed(self, hash_ids):
         """Rows for this rank's SP token chunk with all hash heads.
@@ -952,6 +544,8 @@ class Engram(upstream.Engram):
         return local.transpose(0, 1).flatten(1, 2)[:, :cols]
 
     def forward(self, hidden_states, hash_ids, token_mask=None):
+        if self.embed_tokens.host_offload:
+            hidden_states = self._finish_host_embeddings(hidden_states)
         if self.use_sequence_parallel:
             tp = self.embed_tokens.tp_size
             chunk = -(-hash_ids.shape[0] // tp)

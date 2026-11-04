@@ -245,7 +245,7 @@ def test_ci_launch_and_optional_profile_share_one_server(
         if scenario == "decode_dp16":
             assert env["HEADLESS"] == "0"
             assert env["HOST"] == "127.0.0.1"
-            assert env["TPU_DEEPSEEK_V41_ENGRAM_HBM"] == "first"
+            assert env["TPU_DEEPSEEK_V41_ENGRAM_HBM"] == "all"
             assert env["MOE_FUSED_EP_KERNEL_IMPL"] == "push"
             assert env["MOE_FUSED_EP_PUSH_SC_PREPUSH"] == "2"
             assert env["MOE_FUSED_EP_PUSH_TC_EXCHANGE"] == "1"
@@ -306,8 +306,9 @@ def test_ci_launch_and_optional_profile_share_one_server(
         assert manifest["moe_push_sc_prepush"] == 2
         assert manifest["moe_push_tc_exchange"] is True
     assert manifest["serialization"] == "enabled"
-    assert manifest["engram_transfer"] == "raw_dma"
-    assert manifest["identity"]["engram_transfer"] == "raw_dma"
+    transfer = "hbm" if scenario == "decode_dp16" else "native_host_channel"
+    assert manifest["engram_transfer"] == transfer
+    assert manifest["identity"]["engram_transfer"] == transfer
     assert manifest["identity"]["model_weights"] == (model_uri or str(tmp_path))
     command = starts[0]
     assert json.loads(command[command.index("--compilation-config") + 1]) == {

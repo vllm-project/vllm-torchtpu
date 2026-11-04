@@ -210,3 +210,7 @@ csrc/moe/marlin_moe_wna16/kernel_*
 # Benchmark results
 benchmark_runs/
 .dsv41_bench/
+
+# Engram Host channel, built per environment (tools/build_engram_host_channel.py).
+src/vllm_torchtpu/csrc/_engram_host_channel.so
+src/vllm_torchtpu/csrc/_engram_host_channel.json

@@ -406,7 +406,6 @@ class ServerStepWorker:
         global _ACTIVE, _INSTALLED
         from vllm_torchtpu.models.vllm.deepseek_v41.v2.model import (
             DeepseekV41DecoderStage,
-            DeepseekV41EncoderHeadStage,
             DeepseekV41EncoderStage,
         )
 
@@ -441,9 +440,6 @@ class ServerStepWorker:
         if not _INSTALLED:
             for cls, stage in [
                 (DeepseekV41EncoderStage, "encoder"),
-                # A split encoder (derived from host Engram placement) opens each
-                # forward with its head stage; the tail adds no host rows.
-                (DeepseekV41EncoderHeadStage, "encoder"),
                 (DeepseekV41DecoderStage, "decoder"),
             ]:
                 cls.__call__ = _stage_wrapper(cls.__call__, stage)
