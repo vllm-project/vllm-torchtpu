@@ -109,3 +109,18 @@ def test_substitute_placeholder_token_rejects_mismatched_lengths():
             torch.zeros(4, dtype=torch.int32),
             torch.zeros(2, dtype=torch.int32),
         )
+
+
+def test_substitute_placeholder_token_strips_dynamic_dim_marks():
+    x = torch.tensor([-1, 10, -1, 20], dtype=torch.int32)
+    torch._dynamo.mark_dynamic(x, 0)
+    assert hasattr(x, "_dynamo_dynamic_indices")
+
+    cur_idx = torch.tensor([0, 2, 1, 3], dtype=torch.int64)
+    pre_idx = torch.tensor([0, 1, -1, -1], dtype=torch.int64)
+    next_tok = torch.tensor([101, 202], dtype=torch.int64)
+    with torch.compiler.set_stance("force_eager"):
+        out = _substitute_placeholder_token(x, cur_idx, pre_idx, next_tok)
+    assert out is not x
+    assert out.tolist() == [101, 10, 202, 20]
+    assert not hasattr(out, "_dynamo_dynamic_indices")
