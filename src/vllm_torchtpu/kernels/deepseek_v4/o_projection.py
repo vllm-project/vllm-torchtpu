@@ -21,7 +21,6 @@ from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.kernels.deepseek_v4.rope import (
     LANE,
-    CosSinRef,
     _cos_sin_lanes,
     _rotate_gptj,
 )
@@ -36,6 +35,10 @@ SUBLANE = 8
 TILE_T_CAP = 1024
 SUB_T_CAP = 256
 
+# Tokens per gather_cos_sin chunk: a chunk is laid out and written back while
+# the row DMAs of later chunks land.
+GATHER_CHUNK = 128
+
 
 def _largest_divisor(x: int, cap: int) -> int:
     """Largest divisor of ``x`` that is <= ``cap``."""
@@ -45,124 +48,128 @@ def _largest_divisor(x: int, cap: int) -> int:
     return 1
 
 
-def _cos_sin_body(
-    cos_sin_ref: jax.Ref,
-    out_ref: jax.Ref,
+@functools.partial(jax.jit, static_argnames=("inverse", "num_positions"))
+def cos_sin_table(
+    cos_sin_cache: jax.Array,  # [max_position, rotary_dim] float32
     *,
-    rotary_dim: int,
     inverse: bool,
-    out_dtype: jnp.dtype,
-) -> None:
-    """Expand a ``(tile_n, rotary_dim)`` block to ``(tile_n, 2 * LANE)``."""
-    cos, sin = _cos_sin_lanes(cos_sin_ref[...], rotary_dim=rotary_dim, inverse=inverse)
-    out_ref[...] = jnp.concatenate([cos, sin], axis=-1).astype(out_dtype)
+    num_positions: int,
+) -> jax.Array:
+    """``gather_cos_sin``'s ``[2 * num_positions, LANE]`` table, built at load.
+
+    Position ``p``'s cache row widened to the full lane block
+    (``_cos_sin_lanes``) is row ``2p`` (cos) and row ``2p + 1`` (sin). A
+    ``LANE``-wide ``(8, 128)``-tiled array is row-major, so consecutive
+    positions are one contiguous run that one DMA copies from any offset.
+    It costs 1 KiB per position.
+    """
+    assert cos_sin_cache.ndim == 2
+    assert num_positions <= cos_sin_cache.shape[0]
+    rotary_dim = cos_sin_cache.shape[1]
+    assert rotary_dim % 2 == 0 and rotary_dim <= LANE
+    cos, sin = _cos_sin_lanes(
+        cos_sin_cache[:num_positions], rotary_dim=rotary_dim, inverse=inverse
+    )
+    table = jnp.stack([cos, sin], axis=1).reshape(2 * num_positions, LANE)
+    return table.astype(jnp.float32)
 
 
 def _cos_sin_kernel(
     # scalar prefetch
     positions_ref: jax.Ref,
     # HBM input
-    cos_sin_cache_hbm_ref: jax.Ref,
+    table_hbm_ref: jax.Ref,
     # HBM output
     out_hbm_ref: jax.Ref,
+    # scratch
+    rows_ref: jax.Ref,
+    out_ref: jax.Ref,
+    gather_sems: jax.Ref,
+    writeback_sems: jax.Ref,
     *,
-    num_tiles: int,
-    tile_n: int,
-    rotary_dim: int,
-    inverse: bool,
-    cos_sin_dtype: jnp.dtype,
-    out_dtype: jnp.dtype,
+    chunk: int,
 ) -> None:
-    cos_sin_spec = pl.BlockSpec(
-        block_shape=(tile_n, rotary_dim),
-        memory_space=pltpu.VMEM,
-        index_map=lambda i: (i, 0),
-    )
-    out_spec = pl.BlockSpec(
-        block_shape=(tile_n, 2 * LANE),
-        memory_space=pltpu.VMEM,
-        index_map=lambda i: (i, 0),
-    )
-    # The per-token row gather; one buffer of lookahead hides its DMAs.
-    cos_sin_alloc = CosSinRef.create(
-        spec=cos_sin_spec, dtype=cos_sin_dtype, buffer_count=2, tile_n=tile_n
-    )
+    """Copies each token's two table rows, then lays them out side by side.
 
-    pipeline = pltpu.emit_pipeline(
-        functools.partial(
-            _cos_sin_body,
-            rotary_dim=rotary_dim,
-            inverse=inverse,
-            out_dtype=out_dtype,
-        ),
-        grid=(num_tiles,),
-        in_specs=[cos_sin_spec],
-        out_specs=[out_spec],
-    )
-    allocations = (
-        cos_sin_alloc,
-        pltpu.BufferedRef.output(out_spec, out_dtype, buffer_count=2),
-    )
+    All row DMAs are issued up front; each ``chunk`` of tokens is laid out and
+    written back once its own DMAs land.
+    """
+    num_chunks = out_ref.shape[0] // chunk
+    last_position = table_hbm_ref.shape[0] // 2 - 1
 
-    @pl.with_scoped(allocations=allocations)
-    def _run(allocations):
-        pipeline(
-            (cos_sin_cache_hbm_ref, positions_ref),
-            out_hbm_ref,
-            allocations=allocations,
+    def fetch_chunk(c: int) -> None:
+        sem = gather_sems.at[c]
+
+        @pl.loop(c * chunk, (c + 1) * chunk)
+        def _(token):
+            position = jnp.minimum(positions_ref[token], last_position)
+            pltpu.make_async_copy(
+                table_hbm_ref.at[pl.ds(2 * position, 2)],
+                rows_ref.at[pl.ds(2 * token, 2)],
+                sem,
+            ).start()
+
+    for c in range(num_chunks):
+        fetch_chunk(c)
+
+    def writeback(c: int):
+        tokens = pl.ds(c * chunk, chunk)
+        return pltpu.make_async_copy(
+            out_ref.at[tokens], out_hbm_ref.at[tokens], writeback_sems.at[c]
         )
 
-    _run()
+    for c in range(num_chunks):
+        rows = rows_ref.at[pl.ds(2 * c * chunk, 2 * chunk)]
+        # One wait covers the chunk's row DMAs: they share its semaphore.
+        pltpu.make_async_copy(rows, rows, gather_sems.at[c]).wait()
+        tokens = pl.ds(c * chunk, chunk)
+        out_ref[tokens, :LANE] = rows[pl.ds(0, chunk, stride=2), :]
+        out_ref[tokens, LANE:] = rows[pl.ds(1, chunk, stride=2), :]
+        writeback(c).start()
+    for c in range(num_chunks):
+        writeback(c).wait()
 
 
-@functools.partial(
-    jax.jit,
-    static_argnames=("inverse", "out_dtype", "name"),
-)
+@functools.partial(jax.jit, static_argnames=("name",))
 def gather_cos_sin(
     positions: jax.Array,  # [T] int
-    cos_sin_cache: jax.Array,  # [max_position, rotary_dim] float32
+    table: jax.Array,  # [2 * num_positions, LANE] float32
     *,
-    inverse: bool = False,
-    out_dtype: jnp.dtype = jnp.float32,
     name: str = "gather_cos_sin",
 ) -> jax.Array:
-    """Builds ``wo_a_projection``'s ``[T, 2 * LANE]`` cos/sin table.
+    """Gathers ``wo_a_projection``'s ``[T, 2 * LANE]`` cos/sin rows.
 
-    Gathers ``cos_sin_cache[positions]`` based on the token positions, expands
-    each row to ``[2 * LANE]``
+    ``table`` is ``cos_sin_table(...)``'s. A position at or past its
+    ``num_positions`` (a draft token past max_model_len, whose output is
+    discarded) reads the last position's rows rather than past the table.
     """
     assert positions.ndim == 1
-    assert cos_sin_cache.ndim == 2
+    assert table.ndim == 2 and table.shape[1] == LANE
 
     num_tokens = positions.shape[0]
-    rotary_dim = cos_sin_cache.shape[1]
-    assert rotary_dim % 2 == 0 and rotary_dim <= LANE
-
-    tile_n = _largest_divisor(num_tokens, cap=128)
-
+    chunk = _largest_divisor(num_tokens, cap=GATHER_CHUNK)
+    num_chunks = num_tokens // chunk
+    dtype = table.dtype
     return pl.pallas_call(
-        functools.partial(
-            _cos_sin_kernel,
-            num_tiles=num_tokens // tile_n,
-            tile_n=tile_n,
-            rotary_dim=rotary_dim,
-            inverse=inverse,
-            cos_sin_dtype=cos_sin_cache.dtype,
-            out_dtype=out_dtype,
-        ),
-        out_shape=jax.ShapeDtypeStruct((num_tokens, 2 * LANE), out_dtype),
+        functools.partial(_cos_sin_kernel, chunk=chunk),
+        out_shape=jax.ShapeDtypeStruct((num_tokens, 2 * LANE), dtype),
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=1,
             in_specs=(pl.BlockSpec(memory_space=pltpu.HBM),),
             out_specs=pl.BlockSpec(memory_space=pltpu.HBM),
+            scratch_shapes=(
+                pltpu.VMEM((2 * num_tokens, LANE), dtype),
+                pltpu.VMEM((num_tokens, 2 * LANE), dtype),
+                pltpu.SemaphoreType.DMA((num_chunks,)),
+                pltpu.SemaphoreType.DMA((num_chunks,)),
+            ),
         ),
         compiler_params=pltpu.CompilerParams(
             vmem_limit_bytes=DEFAULT_VMEM_LIMIT_BYTES,
             disable_bounds_checks=True,
         ),
         name=name,
-    )(positions, cos_sin_cache)
+    )(positions, pltpu.with_memory_space_constraint(table, pltpu.HBM))
 
 
 def _load_head_pair(
@@ -361,7 +368,6 @@ def wo_a_projection(
     jax.jit,
     static_argnames=(
         "head_dim",
-        "inverse",
         "tile_t",
         "tile_r",
         "sub_t",
@@ -372,26 +378,28 @@ def wo_a_projection(
 def fused_reverse_rope_wo_a_projection(
     x: jax.Array,  # [T, G * H, head_dim] bf16
     positions: jax.Array,  # [T] int
-    cos_sin_cache: jax.Array,  # [max_position, rotary_dim] float32
+    table: jax.Array,  # [2 * num_positions, LANE] float32
     wo_a: jax.Array,  # [D, G * R] fp8
     wo_a_scale: jax.Array,  # [G * R] float32
     *,
     head_dim: int,
-    inverse: bool = True,
     tile_t: int | None = None,
     tile_r: int | None = None,
     sub_t: int | None = None,
     quantize_activations: bool = True,
     name: str = "wo_a_projection",
 ) -> jax.Array:
-    """``The RoPE-fused ``wo_a_projection``."""
+    """``The RoPE-fused ``wo_a_projection``.
+
+    ``table`` is ``cos_sin_table(cos_sin_cache, ...)``, whose ``inverse``
+    picks the rotation's direction.
+    """
     assert x.ndim == 3
     assert x.shape[2] == head_dim
 
     cos_sin = gather_cos_sin(
         positions,
-        cos_sin_cache,
-        inverse=inverse,
+        table,
         name=f"{name}_gather_cos_sin",
     )
     return wo_a_projection(
