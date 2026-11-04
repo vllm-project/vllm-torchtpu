@@ -1150,10 +1150,11 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
         # `Indexer` has no `register_oot` hook and is fully built by
         # `DeepseekV2MLAAttention` before this wrapper runs, so retype it in
         # place. The mutation is visible through every reference to the object,
-        # including `DeepseekV2MLAAttention.indexer`.
+        # including `DeepseekV2MLAAttention.indexer`. Indexers a TPU model
+        # builds itself are not `Indexer`s and are used as given.
         indexer = mla_modules.indexer
-        if indexer is not None:
-            indexer = VllmTPUIndexer.rebind(cast(Indexer, indexer))
+        if isinstance(indexer, Indexer):
+            indexer = VllmTPUIndexer.rebind(indexer)
         self.indexer = indexer
         self.indexer_rope_emb = mla_modules.indexer_rotary_emb
         self.is_sparse = mla_modules.is_sparse

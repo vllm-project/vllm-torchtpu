@@ -64,6 +64,7 @@ from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.utils import fresh_buffer
 
 from .collective_ops import FusedPrefillCollectives
+from .indexer import KimiDSAConfig, KimiDSAIndexer
 
 logger = init_logger(__name__)
 
@@ -206,6 +207,8 @@ class MultiHeadLatentAttention(nn.Module):
         *,
         use_rope: bool = False,
         non_causal_multi_token_decode: bool = False,
+        dsa: KimiDSAConfig | None = None,
+        topk_indices_buffer: torch.Tensor | None = None,
     ) -> None:
         if not use_rope and not config.mla_use_nope:
             raise ValueError("The TPU Kimi model supports NoPE MLA only")
@@ -345,6 +348,17 @@ class MultiHeadLatentAttention(nn.Module):
         self.prefill_group = (
             FusedPrefillCollectives(prefix) if envs.TPU_K3_SP_PREFILL else None
         )
+        indexer = None
+        if dsa is not None:
+            assert topk_indices_buffer is not None
+            indexer = KimiDSAIndexer(
+                vllm_config,
+                config,
+                dsa,
+                topk_indices_buffer,
+                prefix=f"{prefix}.indexer",
+            )
+        self.indexer = indexer
         mla_modules = MLAModules(
             g_proj=self.g_proj,
             kv_a_layernorm=self.kv_a_layernorm,
@@ -356,9 +370,9 @@ class MultiHeadLatentAttention(nn.Module):
             q_a_layernorm=self.q_a_layernorm,
             q_b_proj=self.q_b_proj,
             q_proj=self.q_proj,
-            indexer=None,
-            is_sparse=False,
-            topk_indices_buffer=None,
+            indexer=indexer,
+            is_sparse=indexer is not None,
+            topk_indices_buffer=topk_indices_buffer if indexer is not None else None,
         )
         self.mla_attn = MultiHeadLatentAttentionWrapper(
             config.hidden_size,
