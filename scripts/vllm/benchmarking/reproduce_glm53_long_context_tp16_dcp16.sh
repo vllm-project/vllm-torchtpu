@@ -94,12 +94,11 @@ export_glm53_env() {
   default_libtpu_args='--xla_tpu_enable_diagnostic_coordinator=false --xla_tpu_sparse_core_reduce_scatter_offload_min_size_in_bytes=1048576 --xla_tpu_msa_sort_order_overrides=overrides{hlo_position_matcher{instruction_regex:".*parameter.*",size_gte:16121856,size_lte:16121856},override_options{assign_first:true}} --xla_tpu_preferred_prefetch_overrides=overrides{hlo_operand_filter{size_gte:16121856,size_lte:16121856,operand_number:1},override_options{prefetch_eagerness:0.5}},overrides{hlo_operand_filter{size_gte:6291456,size_lte:6291456,operand_number:3},override_options{prefetch_eagerness:0.5}},overrides{hlo_operand_filter{instruction_name_regex:"multiply_reduce_fusion.*",size_gte:196608,size_lte:196608,operand_number:1},override_options{prefetch_eagerness:0.5}},overrides{hlo_operand_filter{instruction_name_regex:"fusion.*x_ref",size_gte:12288,size_lte:12288,operand_number:3},override_options{prefetch_eagerness:0.5}} --xla_tpu_enable_sparse_core_hierarchical_all_reduce=true --xla_tpu_sparse_core_all_reduce_offload_min_size_in_bytes=8388608'
   export LIBTPU_INIT_ARGS="${LIBTPU_INIT_ARGS:-${default_libtpu_args}}"
 
-  if [[ "${LIBTPU_INIT_ARGS}" == *"dvfs_p_state"* ]]; then
-    echo "FATAL: dvfs_p_state is strictly prohibited." >&2
-    return 1
+  if [[ -n "${TPU_DVFS_P_STATE:-}" && "${LIBTPU_INIT_ARGS}" != *"xla_tpu_dvfs_p_state"* ]]; then
+    export LIBTPU_INIT_ARGS="${LIBTPU_INIT_ARGS} --xla_tpu_dvfs_p_state=${TPU_DVFS_P_STATE}"
   fi
 
-  # MoE flags (hybrid decode MoE: moe_tp_decode for <=16 tokens + fused_moe_decode for 32..64 + EP=16 sequence-parallel FP8-wire prefill MoE)
+  # MoE flags (EP8xTP2 w1-first moe_tp_decode for <=64 tokens + double-buffered peer DMA fused_ep_moe_v2 + EP8xTP2 sequence-parallel FP8-wire prefill MoE)
   export FUSED_MOE_DECODE_KERNEL="${FUSED_MOE_DECODE_KERNEL:-0}"
   export FUSED_MOE_PREFILL_KERNEL="${FUSED_MOE_PREFILL_KERNEL:-0}"
   export ONEHOT_MOE_PERMUTE_THRESHOLD=2048
@@ -107,10 +106,10 @@ export_glm53_env() {
   export USE_MOE_TP_DECODE_KERNEL="${USE_MOE_TP_DECODE_KERNEL:-1}"
   export TPU_MOE_TP_DECODE_FAST="${TPU_MOE_TP_DECODE_FAST:-1}"
   export TPU_MOE_TP_DECODE_HBM_OPERANDS="${TPU_MOE_TP_DECODE_HBM_OPERANDS:-all}"
-  export TPU_MOE_TP_DECODE_MAX_TOKENS="${TPU_MOE_TP_DECODE_MAX_TOKENS:-16}"
-  export TPU_MOE_TP_DECODE_I_CHUNK="${TPU_MOE_TP_DECODE_I_CHUNK:-256}"
-  export TPU_MOE_TP_DECODE_FALLBACK_FUSED="${TPU_MOE_TP_DECODE_FALLBACK_FUSED:-1}"
-  export TPU_MOE_EP_TP_SIZE="${TPU_MOE_EP_TP_SIZE:-1}"
+  export TPU_MOE_TP_DECODE_MAX_TOKENS="${TPU_MOE_TP_DECODE_MAX_TOKENS:-64}"
+  export TPU_MOE_TP_DECODE_I_CHUNK="${TPU_MOE_TP_DECODE_I_CHUNK:-128}"
+  export TPU_MOE_TP_DECODE_FALLBACK_FUSED="${TPU_MOE_TP_DECODE_FALLBACK_FUSED:-0}"
+  export TPU_MOE_EP_TP_SIZE="${TPU_MOE_EP_TP_SIZE:-2}"
   export TPU_MOE_FUSED_EP_ASYNC_ROW_GATHER=0
   export TPU_MOE_ONEHOT_SORTFREE=1
   export TPU_MOE_ROUTER_TOPK_BIAS=1
@@ -290,6 +289,17 @@ run_serve() {
   mkdir -p "${OUT_DIR}"
   env | grep -E "^(TPU_|VLLM_|LIBTPU_|KERNEL_|FUSED_|USE_MOE|ONEHOT|ENABLE_PAW|PYTHONHASHSEED)" | sort >"${OUT_DIR}/server.env"
 
+  local extra_dist_args=()
+  if [[ "${TPU_MULTIHOST_BACKEND}" == "mp" ]]; then
+    extra_dist_args=(
+      --distributed-executor-backend mp
+      --nnodes "${NNODES:-2}"
+      --node-rank "${NODE_RANK:-0}"
+      --master-addr "${HEAD_IP:?Set HEAD_IP when TPU_MULTIHOST_BACKEND=mp}"
+      --master-port "${MASTER_PORT:-29500}"
+    )
+  fi
+
   local cmd=(
     vllm serve "${MODEL_URI}"
     --served-model-name "${SERVED_MODEL_NAME}"
@@ -297,6 +307,7 @@ run_serve() {
     --trust-remote-code
     --host "${HOST}"
     --port "${PORT}"
+    "${extra_dist_args[@]}"
     --load-format "${LOAD_FORMAT}"
     --safetensors-load-strategy prefetch
     --data-parallel-size 1
