@@ -223,6 +223,11 @@ ignore = [
 # tools/check_b023_baseline.py counts the findings per file and fails when a
 # file gains one. Both move together.
 "src/vllm_torchtpu/kernels/**" = ["B023"]
+# The Kimi-K3 megakernel is moved as-is from its source branch: closures traced
+# inside one Pallas program (B023, same ratchet as above), short index names,
+# long derivation comments, and the bring-up tools' prints. Its kernels keep
+# their dense layout, so `ruff format` skips them (see [tool.ruff.format]).
+"src/vllm_torchtpu/models/kimi_k3/megakernel/**" = ["B023", "E501", "E701", "E702", "E741", "S110", "T20"]
 
 # Library code logs through vllm_torchtpu.logger. Tests, scripts and
 # command-line tools print to the terminal on purpose.
@@ -231,6 +236,10 @@ ignore = [
 
 [tool.ruff.format]
 docstring-code-format = true
+exclude = [
+    "src/vllm_torchtpu/models/kimi_k3/megakernel/common/**",
+    "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/**",
+]
 
 [tool.pymarkdown]
 # The docs site (Python-Markdown) only nests a list indented by 4 spaces. MD007
