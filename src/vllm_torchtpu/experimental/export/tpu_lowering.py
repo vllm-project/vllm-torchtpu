@@ -15,10 +15,11 @@
 
 from __future__ import annotations
 
+import contextlib
 import copy
 import dataclasses
 import re
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from typing import Any
 
 import torch
@@ -201,6 +202,48 @@ def fx_graph_to_mlir_text(
     return normalize_mlir_text(exported_mlir.serialize_text())
 
 
+@contextlib.contextmanager
+def record_module_outputs(
+    modules: Mapping[str, torch.nn.Module],
+) -> Iterator[list[tuple[str, torch.Tensor]]]:
+    """Records the tensors each of `modules` returns while the block runs.
+
+    Yields a list that fills with `(name, tensor)` in call order: a module
+    returning several tensors records `name.{i}` for the `i`-th, and a module
+    called more than once records `name#{call}` from its second call on. Each
+    tensor is cloned, so later in-place ops on it do not change the recorded
+    value. Debug export taps (`exporter.export(debug_taps=...)`) return them as
+    extra results.
+    """
+    recorded: list[tuple[str, torch.Tensor]] = []
+    calls: dict[str, int] = {}
+
+    def hook(name: str) -> Callable[..., None]:
+        def record(_module: Any, _args: Any, output: Any) -> None:
+            call = calls.get(name, 0)
+            calls[name] = call + 1
+            base = name if call == 0 else f"{name}#{call}"
+            tensors = (
+                [output]
+                if isinstance(output, torch.Tensor)
+                else [t for t in output if isinstance(t, torch.Tensor)]
+                if isinstance(output, (tuple, list))
+                else []
+            )
+            for i, t in enumerate(tensors):
+                key = base if len(tensors) == 1 else f"{base}.{i}"
+                recorded.append((key, t.clone()))
+
+        return record
+
+    handles = [m.register_forward_hook(hook(n)) for n, m in modules.items()]
+    try:
+        yield recorded
+    finally:
+        for h in handles:
+            h.remove()
+
+
 def lower_torch_callable_to_mlir(
     fn: Callable[..., Any],
     arg_specs: Sequence[api.ShapeDtypeStruct],
@@ -291,6 +334,8 @@ def lower_torch_forward_to_mlir(
     bucket_size: int,
     weight_reshapes: Mapping[str, tuple[int, ...]] | None = None,
     trailing_user_inputs: Sequence[tuple[str, tuple[int, ...] | int]] = (),
+    taps: Mapping[str, torch.nn.Module] | None = None,
+    tap_names: list[str] | None = None,
 ) -> str:
     """Lowers `model.forward` for `bucket_size` to StableHLO MLIR text via TorchTPU.
 
@@ -299,6 +344,10 @@ def lower_torch_forward_to_mlir(
     user inputs. `weight_reshapes` gives the shape `model.forward` expects for
     weights whose argument is lowered with another shape (a per-device constant
     is a `[1, ...]` shard of its global array). State `i` is donated to result `i`.
+
+    With `taps`, `@main` also returns what each tapped module returns
+    (`record_module_outputs`), after the forward's own results; their names go
+    to `tap_names`, in result order.
     """
     reshapes = dict(weight_reshapes or {})
     num_user = len(user_inputs)
@@ -346,18 +395,96 @@ def lower_torch_forward_to_mlir(
             if name in w_dict:
                 w_dict[name] = w_dict[name].reshape(shape)
         kv_caches = list(args[state_start:trailing_start])
-        updated_kvs, hidden_states = model.forward(
-            w_dict,
-            kv_caches,
-            **user_args,
-        )
-        return (*updated_kvs, hidden_states)
+        with record_module_outputs(taps or {}) as recorded:
+            updated_kvs, hidden_states = model.forward(
+                w_dict,
+                kv_caches,
+                **user_args,
+            )
+        if tap_names is not None:
+            tap_names[:] = [n for n, _ in recorded]
+        return (*updated_kvs, hidden_states, *(t for _, t in recorded))
 
     mlir_text = lower_torch_callable_to_mlir(
         _torch_forward_entry,
         all_specs,
         donate_argnums=donate_argnums,
-        module_name=f"forward_bucket{bucket_size}",
+        module_name=f"forward{'_debug' if taps else ''}_bucket{bucket_size}",
+    )
+    return set_aliasing_outputs(
+        mlir_text, {arg: i for i, arg in enumerate(donate_argnums)}
+    )
+
+
+def lower_torch_mtp_draft_to_mlir(
+    model: api.ExportableTextOnlyLLM,
+    *,
+    user_inputs: Sequence[tuple[str, tuple[int, ...] | int]],
+    weight_names: Sequence[str],
+    params_map: Mapping[str, api.ShapeDtypeStruct],
+    state_specs: Sequence[api.ShapeDtypeStruct],
+    hidden_states: api.ShapeDtypeStruct,
+    bucket_size: int,
+    weight_reshapes: Mapping[str, tuple[int, ...]] | None = None,
+    taps: Mapping[str, torch.nn.Module] | None = None,
+    tap_names: list[str] | None = None,
+) -> str:
+    """Lowers `model.mtp_draft` for `bucket_size` to StableHLO MLIR text.
+
+    `@main` takes the user inputs (the forward controls, the shifted
+    `input_ids` and `last_token_indices`), the weights, the MTP layer's states
+    and then `hidden_states`, the forward's intermediate output. It returns the
+    updated states, each donated by its input, and `draft_tokens`, then the
+    `taps`' results as in `lower_torch_forward_to_mlir`.
+    """
+    reshapes = dict(weight_reshapes or {})
+    num_user = len(user_inputs)
+    num_weights = len(weight_names)
+    state_start = num_user + num_weights
+    num_states = len(state_specs)
+    donate_argnums = tuple(range(state_start, state_start + num_states))
+    hidden_arg = state_start + num_states
+
+    all_specs = [
+        *(
+            api.ShapeDtypeStruct(
+                (shape,) if isinstance(shape, int) else tuple(shape), "i32"
+            )
+            for _, shape in user_inputs
+        ),
+        *(
+            api.ShapeDtypeStruct(
+                tuple(int(d) for d in params_map[n].shape),
+                dtype_name(params_map[n].dtype),
+            )
+            for n in weight_names
+        ),
+        *state_specs,
+        hidden_states,
+    ]
+
+    def _torch_mtp_entry(*args: torch.Tensor) -> tuple[torch.Tensor, ...]:
+        user_args = {name: args[i] for i, (name, _) in enumerate(user_inputs)}
+        w_dict = {weight_names[i]: args[num_user + i] for i in range(num_weights)}
+        for name, shape in reshapes.items():
+            if name in w_dict:
+                w_dict[name] = w_dict[name].reshape(shape)
+        with record_module_outputs(taps or {}) as recorded:
+            updated_kvs, draft_tokens = model.mtp_draft(  # type: ignore[attr-defined]
+                w_dict,
+                list(args[state_start:hidden_arg]),
+                hidden_states=args[hidden_arg],
+                **user_args,
+            )
+        if tap_names is not None:
+            tap_names[:] = [n for n, _ in recorded]
+        return (*updated_kvs, draft_tokens, *(t for _, t in recorded))
+
+    mlir_text = lower_torch_callable_to_mlir(
+        _torch_mtp_entry,
+        all_specs,
+        donate_argnums=donate_argnums,
+        module_name=f"mtp_draft{'_debug' if taps else ''}_bucket{bucket_size}",
     )
     return set_aliasing_outputs(
         mlir_text, {arg: i for i, arg in enumerate(donate_argnums)}

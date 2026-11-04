@@ -86,10 +86,20 @@ _tpu_backend = TpuBackend()
 
 # How often a rank looks for the artifact of the rank of its host that compiles
 # a bucket. How long it waits is TPU_PRECOMPILE_PEER_WAIT_S (default 600 s):
-# the wait is bounded for a peer that never saves the artifact (its serialize()
-# failed, it crashed, or it does not exist); the rank then compiles the bucket
-# itself, so a timeout costs one redundant compile rather than a stalled start.
+# an owner that compiles a bucket but cannot save it leaves a marker (below),
+# so the wait only runs out for an owner that died, does not exist, or could
+# not write the marker either; the rank then compiles the bucket itself, so a
+# timeout costs one redundant compile rather than a stalled start.
 _PEER_POLL_S = 0.5
+# Suffix of the marker a rank leaves next to an artifact it compiled but could
+# not save (save failed, nothing serializable), so the ranks waiting for that
+# artifact stop waiting at once instead of after TPU_PRECOMPILE_PEER_WAIT_S.
+# It holds the graph fingerprint, so only a waiter tracing the same graph
+# stops. Markers older than this process are left over from an earlier run and
+# are ignored; one written this run is minutes newer than the process start,
+# so clock skew between the host and a shared cache filesystem does not matter.
+_FAILED_SUFFIX = ".failed"
+_PROCESS_START = time.time()
 # get_attr tensors up to this size are hashed by value; bigger ones, which are
 # weights rather than constants, by dtype and shape.
 _FINGERPRINT_MAX_NUMEL = 1 << 16
@@ -320,6 +330,8 @@ _RUNTIME_CACHE_KEY_PATHS = (
     "vllm_torchtpu/layers/adapter/quantization",
     "vllm_torchtpu/layers/adapter/vision_attention.py",
     "vllm_torchtpu/models/vllm/deepseek_v4/attention.py",
+    # Builds the chip-pair wo_a o-fetch Pallas op.
+    "vllm_torchtpu/models/vllm/deepseek_v4/attn_intra_chip.py",
     # `get_pallas_op_mesh` decides whether the DSv4 Pallas ops are built with
     # the wrapper mesh or with none, like `build_ep_mesh` above.
     "vllm_torchtpu/models/vllm/vllm_model_wrapper_context.py",
@@ -754,6 +766,44 @@ class TpuCompilerAdaptor(CompilerInterface):
         mine = os.path.join(own, key)
         return sorted(p for p in glob.glob(pattern) if p != mine)
 
+    def _mark_failed(self, key: str, fingerprint: str) -> None:
+        """Tell this host's waiting ranks that this rank will not save `key`.
+
+        The marker holds `fingerprint`, so only ranks tracing the same graph
+        stop waiting. Writing it (not just opening it) also refreshes the mtime
+        of a marker left by an earlier run.
+        """
+        assert self.cache_dir is not None
+        marker = os.path.join(self.cache_dir, key + _FAILED_SUFFIX)
+        try:
+            os.makedirs(self.cache_dir, exist_ok=True)
+            with open(marker, "w") as f:
+                f.write(fingerprint)
+        except OSError as e:
+            logger.warning(
+                "[TpuCompilerAdaptor] Could not write %s; ranks waiting for this "
+                "range will wait out TPU_PRECOMPILE_PEER_WAIT_S: %s",
+                marker,
+                e,
+            )
+
+    def _clear_failed(self, key: str) -> None:
+        """Drop a marker an earlier run left for `key`, now that it is saved."""
+        assert self.cache_dir is not None
+        with contextlib.suppress(OSError):
+            os.remove(os.path.join(self.cache_dir, key + _FAILED_SUFFIX))
+
+    def _peer_failed(self, key: str, fingerprint: str) -> str | None:
+        """A marker another rank tracing this graph left this run for `key`."""
+        for path in self._peer_paths(key + _FAILED_SUFFIX):
+            with contextlib.suppress(OSError):
+                if os.path.getmtime(path) < _PROCESS_START:
+                    continue
+                with open(path) as f:
+                    if f.read() == fingerprint:
+                        return path
+        return None
+
     def _replay_from_peer(
         self,
         key: str,
@@ -765,12 +815,21 @@ class TpuCompilerAdaptor(CompilerInterface):
 
         Waits for one to appear inside `wait_for_peer_artifact`. Returns the
         runnable and the peer's path, or None to compile: nothing appeared in
-        time, or what appeared was built from a different graph -- then the
-        ranks do not trace the same program and waiting on would not help.
+        time, a rank compiling this graph left a marker saying it will not save
+        it, or what appeared was built from a different graph -- then the ranks
+        do not trace the same program and waiting on would not help.
         """
         deadline = time.monotonic() + getattr(_peer_wait, "timeout_s", 0.0)
         paths = self._peer_paths(key)
         while not paths and time.monotonic() < deadline:
+            failed = self._peer_failed(key, fingerprint)
+            if failed is not None:
+                logger.info(
+                    "[TpuCompilerAdaptor] %s: its owner could not save it; "
+                    "compiling it here instead of waiting",
+                    failed,
+                )
+                return None
             time.sleep(_PEER_POLL_S)
             paths = self._peer_paths(key)
         if not paths:
@@ -913,6 +972,14 @@ class TpuCompilerAdaptor(CompilerInterface):
                 "it will be recompiled on the next start",
                 compile_range,
             )
+        # Under peer replay, other ranks of the host may be waiting for this
+        # artifact: say so when it will not come, so they compile it now.
+        if fingerprint is not None:
+            assert key is not None
+            if handle is None:
+                self._mark_failed(key, fingerprint)
+            else:
+                self._clear_failed(key)
 
         # Offer this bucket to later traces of the same model, so a graph that
         # refuses it reuses this runnable instead of building a second
