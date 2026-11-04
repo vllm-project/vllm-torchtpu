@@ -63,6 +63,7 @@ _SPAWN_SYMBOLS: frozenset[str] = frozenset(
         "set_tpu_launch_env",
         "run_in_isolated_process",
         "run_tpu_worker_session",
+        "call_with_tpu_session_retry",
     }
 )
 
@@ -429,7 +430,7 @@ def main(argv: list[str] | None = None) -> int:
 
     has_vfio = has_tpu_vfio_devices()
     has_pytest_timeout = importlib.util.find_spec("pytest_timeout") is not None
-    settle_s = float(os.environ.get("PYTEST_CHUNK_TPU_SETTLE_SECONDS", "6.0"))
+    settle_s = float(os.environ.get("PYTEST_CHUNK_TPU_SETTLE_SECONDS", "15.0"))
     chunks = plan_chunks(
         files,
         args.chunk_size,

@@ -181,6 +181,47 @@ def run_tpu_worker_session[T](
     return last_result
 
 
+def call_with_tpu_session_retry[T](
+    fn: Callable[[int], T],
+    *,
+    cleanup_fn: Callable[[], None] | None = None,
+    max_attempts: int = 2,
+    backoff_s: float = 15.0,
+    settle_s: float = 10.0,
+) -> T:
+    """Invoke an in-process launcher with transient TPU session retry.
+
+    When a child ``EngineCoreProc`` hits a transient GCE ``START_SESSION failed``
+    race after a preceding whole-slice test, ``SyncMPClient`` raises
+    ``RuntimeError('Engine core initialization failed...')``. Waiting for VFIO
+    release and retrying once avoids false multichip CI failures while still
+    surfacing deterministic errors immediately.
+    """
+    if max_attempts < 1:
+        raise ValueError(
+            f"max_attempts must be >= 1, got {max_attempts}; pass e.g. max_attempts=2."
+        )
+    for attempt in range(max_attempts):
+        wait_for_vfio_idle(settle_s=0.0)
+        try:
+            return fn(attempt)
+        except Exception as exc:
+            msg = str(exc)
+            transient = is_transient_tpu_session_error(msg) or (
+                isinstance(exc, RuntimeError)
+                and "Engine core initialization failed" in msg
+            )
+            if cleanup_fn is not None:
+                cleanup_fn()
+            wait_for_vfio_idle(settle_s=settle_s)
+            if attempt + 1 < max_attempts and transient:
+                if backoff_s > 0:
+                    time.sleep(backoff_s * (attempt + 1))
+                continue
+            raise
+    raise AssertionError("unreachable")
+
+
 def _isolated_test_worker(target: Callable[[], None], result_queue: Any) -> None:
     try:
         target()

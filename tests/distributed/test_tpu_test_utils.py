@@ -239,3 +239,50 @@ def test_kill_process_group_reaps_grandchild_in_session(tmp_path: Path) -> None:
     assert child.poll() is not None
     with contextlib.suppress(ProcessLookupError):
         os.kill(grandchild_pid, 0)
+
+
+def test_call_with_tpu_session_retry_handles_engine_init_and_negative_controls() -> (
+    None
+):
+    from tests.distributed.tpu_test_utils import call_with_tpu_session_retry
+
+    attempts: list[int] = []
+    cleanups: list[int] = []
+
+    def engine_init_then_ok(attempt: int) -> str:
+        attempts.append(attempt)
+        if attempt == 0:
+            raise RuntimeError(
+                "Engine core initialization failed. See root cause above."
+            )
+        return f"engine_ok_{attempt}"
+
+    result = call_with_tpu_session_retry(
+        engine_init_then_ok,
+        cleanup_fn=lambda: cleanups.append(len(attempts)),
+        max_attempts=2,
+        backoff_s=0.0,
+        settle_s=0.0,
+    )
+    assert result == "engine_ok_1"
+    assert attempts == [0, 1]
+    assert cleanups == [1]
+
+    # Negative control: non-transient RuntimeError / ValueError must NOT retry.
+    bad_calls: list[int] = []
+
+    def deterministic_runtime_error(attempt: int) -> str:
+        bad_calls.append(attempt)
+        raise RuntimeError("Unsupported model architecture")
+
+    with pytest.raises(RuntimeError, match="Unsupported model architecture"):
+        call_with_tpu_session_retry(
+            deterministic_runtime_error,
+            max_attempts=3,
+            backoff_s=0.0,
+            settle_s=0.0,
+        )
+    assert bad_calls == [0]
+
+    with pytest.raises(ValueError, match="max_attempts must be >= 1"):
+        call_with_tpu_session_retry(lambda _a: "ok", max_attempts=0)

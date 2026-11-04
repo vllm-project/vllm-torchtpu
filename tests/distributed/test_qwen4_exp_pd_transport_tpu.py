@@ -316,7 +316,7 @@ def test_qwen_all_owner_pages_over_native_reshard(tmp_path, ssm_dtype):
         print(f"TORCHRUN LOG TAIL (attempt {attempt + 1})\n" + log_text[-32000:])
         return rc, log_text, attempt_dir
 
-    rc, log_text, attempt_dir = run_tpu_worker_session(_run_attempt)
+    rc, log_text, attempt_dir = run_tpu_worker_session(_run_attempt, settle_s=18.0)
     assert rc != 124, "Native P/D process deadline\n" + log_text[-12000:]
     assert rc == 0, log_text[-12000:]
     records = [_receive(attempt_dir / f"{role}-done.json") for role in roles]

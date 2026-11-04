@@ -55,15 +55,20 @@ def test_generate_with_tp_equal_local_tpu_count(async_scheduling: bool):
             "running here would silently reduce TP coverage"
         )
 
-    llm = LLM(
-        model=MODEL_NAME,
-        max_num_batched_tokens=64,
-        max_model_len=64,
-        tensor_parallel_size=tp_size,
-        async_scheduling=async_scheduling,
-        gpu_memory_utilization=0.6,
-        enforce_eager=False,
-        disable_log_stats=False,
+    from tests.distributed.tpu_test_utils import call_with_tpu_session_retry
+
+    llm = call_with_tpu_session_retry(
+        lambda _attempt: LLM(
+            model=MODEL_NAME,
+            max_num_batched_tokens=64,
+            max_model_len=64,
+            tensor_parallel_size=tp_size,
+            async_scheduling=async_scheduling,
+            gpu_memory_utilization=0.6,
+            enforce_eager=False,
+            disable_log_stats=False,
+        ),
+        cleanup_fn=cleanup_dist_env_and_memory,
     )
 
     try:

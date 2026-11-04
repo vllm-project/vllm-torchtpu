@@ -443,13 +443,29 @@ def assert_merge_results(results: list[dict]) -> None:
 
 
 def test_all_to_all_merge_on_real_collectives(tmp_path):
-    result_dir = tmp_path / "dcp_merge"
-    result_dir.mkdir()
+    from tests.distributed.tpu_test_utils import run_tpu_worker_session
+
     extra = []
     if os.environ.get("DCP_MERGE_BENCH_TOKENS"):
         extra = ["--bench-tokens", os.environ["DCP_MERGE_BENCH_TOKENS"]]
-    completed = _launch(result_dir, extra)
-    results = _results(result_dir, WORLD_SIZE)
+
+    def _run_attempt(
+        attempt: int,
+    ) -> tuple[int, str, tuple[subprocess.CompletedProcess[str], list[dict]]]:
+        result_dir = tmp_path / f"dcp_merge_{attempt}"
+        result_dir.mkdir(parents=True, exist_ok=True)
+        completed = _launch(result_dir, extra)
+        results = _results(result_dir, WORLD_SIZE)
+        err_lines = "\n".join(str(r.get("error", "")) for r in results if "error" in r)
+        log_text = (completed.stdout or "") + ("\n" + err_lines if err_lines else "")
+        rc = (
+            completed.returncode
+            if completed.returncode != 0
+            else (1 if err_lines else 0)
+        )
+        return rc, log_text, (completed, results)
+
+    _, _, (completed, results) = run_tpu_worker_session(_run_attempt)
     for line in (completed.stdout or "").splitlines():
         if line.startswith("BENCH "):
             print(line)

@@ -62,13 +62,18 @@ def test_classify_and_plan_chunks_tpu_spawn_first_and_negative_controls(
         tmp_path / "tests" / "layers" / "test_torchrun.py",
         "import sys\nCMD = [sys.executable, '-m', 'torch.distributed.run']\n",
     )
+    helper_spawn_test = _write_file(
+        tmp_path / "tests" / "layers" / "test_retry_helper.py",
+        "from tests.distributed.tpu_test_utils import call_with_tpu_session_retry\n"
+        "def test_retry():\n    call_with_tpu_session_retry(lambda _a: 1)\n",
+    )
 
     # Negative control: comments, docstring, and plain string mentioning spawn/pallas.
     lookalike_batch = _write_file(
         tmp_path / "tests" / "layers" / "test_lookalike_plain.py",
-        "# spawns_tpu_workers prepare_tpu_environment torch.distributed.run pallas\n"
-        '"""Mentions spawns_tpu_workers, pooled_qsa, and torch.distributed.run."""\n'
-        'MSG = "spawns_tpu_workers torch.distributed.run pallas"\n'
+        "# call_with_tpu_session_retry torch.distributed.run pallas\n"
+        '"""Mentions call_with_tpu_session_retry and torch.distributed.run."""\n'
+        'MSG = "call_with_tpu_session_retry torch.distributed.run pallas"\n'
         "def test_plain():\n    assert MSG\n",
     )
     batch_b = _write_file(
@@ -86,16 +91,18 @@ def test_classify_and_plan_chunks_tpu_spawn_first_and_negative_controls(
         str(marker_spawn_test),
         str(batch_a),
         str(entrypoint_test),
+        str(helper_spawn_test),
         str(torchrun_test),
     ]
     chunks = run_pytest_chunked.plan_chunks(
         selectors, chunk_size=2, has_vfio=True, repo_root=tmp_path
     )
 
-    # All 3 spawn_isolated files come first in 1-file chunks (sorted by rel path),
+    # All 4 spawn_isolated files come first in 1-file chunks (sorted by rel path),
     # while lookalike_batch stays in batch chunks after all spawn files!
     assert chunks == [
         [str(entrypoint_test)],
+        [str(helper_spawn_test)],
         [str(torchrun_test)],
         [str(marker_spawn_test)],
         [str(batch_a), str(lookalike_batch)],
@@ -454,4 +461,4 @@ def test_signal_exit_normalization_and_vfio_settle_transitions(
     # Chunk 1 returned rc=5 (no tests collected) so VFIO settle skipped;
     # Chunk 2 returned -9 (active failure before final chunk) so VFIO settle ran once;
     # Chunk 3 was final chunk so no trailing settle.
-    assert mock_wait.call_count == 1
+    mock_wait.assert_called_once_with(timeout_s=30.0, settle_s=15.0)
