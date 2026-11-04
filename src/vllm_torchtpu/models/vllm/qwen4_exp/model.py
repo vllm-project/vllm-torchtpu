@@ -112,12 +112,16 @@ def verify_moe_checkpoint(mlp, prefix, source, moe_mapper, label):
     checkpoint tensor names), ending with ``.mlp.``.
     """
     experts = mlp.experts.routed_experts
-    required = {
-        prefix + weight_name + field
-        for _, weight_name, expert_id, _ in experts.get_expert_mapping()
-        if experts._map_global_expert_id_to_local_expert_id(expert_id) >= 0
-        for field in ("weight", "weight_scale_inv")
-    }
+    required = (
+        set()
+        if getattr(experts, "_tpu_preprocessed_loaded", False)
+        else {
+            prefix + weight_name + field
+            for _, weight_name, expert_id, _ in experts.get_expert_mapping()
+            if experts._map_global_expert_id_to_local_expert_id(expert_id) >= 0
+            for field in ("weight", "weight_scale_inv")
+        }
+    )
     required.update(
         prefix + name
         for name in (

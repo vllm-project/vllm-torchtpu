@@ -318,6 +318,9 @@ if TYPE_CHECKING:
     QWEN4_EXP_POOL_HEADROOM_BYTES: int = 6 * 1024**3
     QWEN4_EXP_PACK_COMPRESSED_K: bool = False
     QWEN4_EXP_PACK_MAIN_KV: bool = False
+    VLLM_TPU_PREPROCESSED_CHECKPOINT_DIR: str = ""
+    VLLM_TPU_ENABLE_PREPROCESSED_LOADER: bool = True
+    VLLM_TPU_PREPROCESS_CHECKPOINT_GCS_DST: str = ""
 
 
 def env_with_choices(
@@ -1867,6 +1870,21 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "QWEN4_EXP_PACK_COMPRESSED_K", default=False
     ),
     "QWEN4_EXP_PACK_MAIN_KV": env_bool("QWEN4_EXP_PACK_MAIN_KV", default=False),
+    # Optional override directory containing preprocessed raw array directories
+    # (experts/array_*, misc/array_*). When empty, auto-detected from model_config.model.
+    "VLLM_TPU_PREPROCESSED_CHECKPOINT_DIR": env_str(
+        "VLLM_TPU_PREPROCESSED_CHECKPOINT_DIR", ""
+    ),
+    # Enable fast rank-local loading from preprocessed raw array checkpoints.
+    "VLLM_TPU_ENABLE_PREPROCESSED_LOADER": env_bool(
+        "VLLM_TPU_ENABLE_PREPROCESSED_LOADER", True
+    ),
+    # Optional gs:// URI. When set on a vllm serve job (e.g. with
+    # EXIT_ON_READY=true in infx-qwen38-flash-agentx), converts MODEL_DIR into
+    # preprocessed raw arrays, uploads to this GCS URI, and serves /health.
+    "VLLM_TPU_PREPROCESS_CHECKPOINT_GCS_DST": env_str(
+        "VLLM_TPU_PREPROCESS_CHECKPOINT_GCS_DST", ""
+    ),
 }
 
 
