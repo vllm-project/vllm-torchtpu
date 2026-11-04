@@ -1410,9 +1410,7 @@ class Eagle3Proposer:
             torch.cat((aux0, aux1, aux2), dim=-1)
         )
 
-    @_static_shape_args
-    @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
-    def _draft_seed_input_ids(
+    def _draft_seed_input_ids_impl(
         self,
         input_ids: torch.Tensor,
         last_token_indices: torch.Tensor,
@@ -1432,6 +1430,32 @@ class Eagle3Proposer:
             shifted = torch.cat((input_ids[1:], input_ids[-1:]), dim=0)
         return shifted.index_put(
             (last_token_indices,), next_token_ids.to(input_ids.dtype)
+        )
+
+    @_static_shape_args
+    @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+    def _draft_seed_input_ids_compiled(
+        self,
+        input_ids: torch.Tensor,
+        last_token_indices: torch.Tensor,
+        next_token_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        return self._draft_seed_input_ids_impl(
+            input_ids, last_token_indices, next_token_ids
+        )
+
+    def _draft_seed_input_ids(
+        self,
+        input_ids: torch.Tensor,
+        last_token_indices: torch.Tensor,
+        next_token_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        if input_ids.device.type == "tpu":
+            return self._draft_seed_input_ids_compiled(
+                input_ids, last_token_indices, next_token_ids
+            )
+        return self._draft_seed_input_ids_impl(
+            input_ids, last_token_indices, next_token_ids
         )
 
     def propose(
@@ -1932,7 +1956,6 @@ class Eagle3Proposer:
                 # Seed, input shift/scatter and gather pad in one program.
                 extras = (
                     self._draft_rows
-                    and envs.VLLM_TPU_DRAFT_SEED_EXTRAS
                     and getattr(chunk.sequence_layout_plan, "descriptor", None)
                     == DEFAULT_SEQUENCE_LAYOUT_DESCRIPTOR
                 )
@@ -2115,13 +2138,12 @@ class Eagle3Proposer:
             gather_indices = last_token_indices
         else:
             # Async: the seed scatter runs at the sampler's padded request
-            # width (bucket-shaped, see above). Bootstrap: it stays real
-            # [num_reqs]. Pad just the returned gather index.
+            # width (bucket-shaped, see above). Bootstrap: pad to the loop
+            # bucket p so the scatter hits a precompiled (T, p) key.
             bootstrap_ref = None
             if (
-                envs.VLLM_TPU_DRAFT_SEED_BOOTSTRAP_PAD
-                and next_tokens_device is None
-                and num_reqs < p <= chunk.input_ids.shape[0]
+                next_tokens_device is None
+                and 0 < num_reqs < p <= chunk.input_ids.shape[0]
             ):
                 if envs.VLLM_TPU_VERIFY_FUSED_CHECK:
                     bootstrap_ref = (last_token_indices, next_token_ids)
@@ -2233,7 +2255,7 @@ class Eagle3Proposer:
         last_token_indices: torch.Tensor,
         next_token_ids: torch.Tensor,
     ) -> None:
-        """VLLM_TPU_VERIFY_FUSED_CHECK for VLLM_TPU_DRAFT_SEED_BOOTSTRAP_PAD:
+        """VLLM_TPU_VERIFY_FUSED_CHECK for prefill-bootstrap draft seed padding:
         rerun the bootstrap seed scatter at the real request width and count
         mismatching entries on device (first VLLM_TPU_VERIFY_FUSED_CHECK_FAULT
         checks perturbed, as a positive control)."""
@@ -2932,11 +2954,7 @@ class Eagle3Proposer:
                             qsl = torch.zeros(q, dtype=torch.int32).to(runner.device)
                             n_dev = torch.tensor(1, dtype=torch.int64).to(runner.device)
                             ids = torch.zeros(T, dtype=torch.int32).to(runner.device)
-                            num_rows = (
-                                q - 1
-                                if self._draft_rows and envs.VLLM_TPU_DRAFT_SEED_EXTRAS
-                                else 0
-                            )
+                            num_rows = q - 1 if self._draft_rows else 0
                             out = _async_seed_inputs_compiled(
                                 nt, nd, qsl, n_dev, ids, p, num_rows
                             )
