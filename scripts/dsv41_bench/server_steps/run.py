@@ -231,6 +231,7 @@ def main() -> None:
             MOE_FUSED_EP_KERNEL_IMPL="push",
             MOE_FUSED_EP_PUSH_SC_PREPUSH="2",
             MOE_FUSED_EP_PUSH_TC_EXCHANGE="1",
+            TPU_MOE_EPLB_DYNAMIC="1",
             TPU_RECLAIM_COMPILE_MEMORY="1",
             LD_PRELOAD="",
             ENGRAM_CONFIG='{"cpu_offload":true,"dp_shared_memory":false}',
@@ -266,7 +267,14 @@ def main() -> None:
         "tier2": "disabled (public and internal)",
         "packages": {
             name: importlib.metadata.version(name)
-            for name in ["torch", "torch-tpu", "jax", "jaxlib", "libtpu"]
+            for name in [
+                "torch",
+                "torch-tpu",
+                "jax",
+                "jaxlib",
+                "libtpu",
+                "tpu-sync-torch",
+            ]
         },
         "startup_scope": "server launch through HTTP health readiness",
     }
@@ -279,6 +287,7 @@ def main() -> None:
             moe_kernel=env["MOE_FUSED_EP_KERNEL_IMPL"],
             moe_push_sc_prepush=int(env["MOE_FUSED_EP_PUSH_SC_PREPUSH"]),
             moe_push_tc_exchange=env["MOE_FUSED_EP_PUSH_TC_EXCHANGE"] == "1",
+            moe_eplb_dynamic=env["TPU_MOE_EPLB_DYNAMIC"] == "1",
             moe_preprocess=env["MOE_FUSED_EP_PREPROCESS_BACKEND"],
             allocator="glibc",
             reclaim_compile_memory=True,

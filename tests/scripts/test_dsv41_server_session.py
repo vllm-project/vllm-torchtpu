@@ -228,6 +228,7 @@ def test_ci_launch_and_optional_profile_share_one_server(
         monkeypatch.setenv("MOE_FUSED_EP_KERNEL_IMPL", "v2")
         monkeypatch.setenv("MOE_FUSED_EP_PUSH_SC_PREPUSH", "1")
         monkeypatch.setenv("MOE_FUSED_EP_PUSH_TC_EXCHANGE", "0")
+        monkeypatch.setenv("TPU_MOE_EPLB_DYNAMIC", "0")
     compiler_roots = []
     starts, clients, stopped, audits = [], [], [], []
     server = SimpleNamespace(poll=lambda: None)
@@ -249,6 +250,7 @@ def test_ci_launch_and_optional_profile_share_one_server(
             assert env["MOE_FUSED_EP_KERNEL_IMPL"] == "push"
             assert env["MOE_FUSED_EP_PUSH_SC_PREPUSH"] == "2"
             assert env["MOE_FUSED_EP_PUSH_TC_EXCHANGE"] == "1"
+            assert env["TPU_MOE_EPLB_DYNAMIC"] == "1"
             assert env["MOE_FUSED_EP_PREPROCESS_BACKEND"] == "topology"
             assert env["MAX_SEQS"] == "48"
             assert env["MAX_MODEL_LEN"] == "98816"
@@ -305,6 +307,8 @@ def test_ci_launch_and_optional_profile_share_one_server(
         assert manifest["moe_kernel"] == "push"
         assert manifest["moe_push_sc_prepush"] == 2
         assert manifest["moe_push_tc_exchange"] is True
+        assert manifest["moe_eplb_dynamic"] is True
+        assert manifest["packages"]["tpu-sync-torch"] == "1"
     assert manifest["serialization"] == "enabled"
     assert manifest["engram_transfer"] == "raw_dma"
     assert manifest["identity"]["engram_transfer"] == "raw_dma"
@@ -344,6 +348,7 @@ def test_dp16_ci_launch_keeps_local_shapes_and_selects_hbm(tmp_path, monkeypatch
 def test_dp16_worker_waits_for_shutdown_and_never_runs_client(
     tmp_path, monkeypatch, early_exit
 ):
+    monkeypatch.setenv("TPU_MOE_EPLB_DYNAMIC", "0")
     monkeypatch.setenv("MODEL_PATH", str(tmp_path))
     (tmp_path / "config.json").write_text("{}")
     monkeypatch.setitem(sys.modules, "vllm", SimpleNamespace(__file__=__file__))
@@ -383,6 +388,7 @@ def test_dp16_worker_waits_for_shutdown_and_never_runs_client(
         assert env["MOE_FUSED_EP_KERNEL_IMPL"] == "push"
         assert env["MOE_FUSED_EP_PUSH_SC_PREPUSH"] == "2"
         assert env["MOE_FUSED_EP_PUSH_TC_EXCHANGE"] == "1"
+        assert env["TPU_MOE_EPLB_DYNAMIC"] == "1"
         assert command[command.index("--data-parallel-start-rank") + 1] == "8"
         return server
 
