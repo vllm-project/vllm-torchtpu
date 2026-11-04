@@ -28,6 +28,8 @@ from vllm_torchtpu.model_loader_patches import (
     _compute_local_expert_ids,
     _sharded_runai_weights_iterator,
     _should_skip,
+    _unused_checkpoint_tensor_predicate,
+    unused_checkpoint_weight_hook,
 )
 
 # ---------------------------------------------------------------------------
@@ -128,6 +130,89 @@ def test_keeps_fused_expert_tensors_without_numeric_id():
 
 
 # ---------------------------------------------------------------------------
+# Tensors the loading model discards
+# ---------------------------------------------------------------------------
+
+
+def _pipeline_stage_model():
+    """A stage that owns every layer but layer 1, and not the head."""
+    import torch
+    from vllm.model_executor.models.utils import PPMissingLayer, WeightsMapper
+
+    class Stage(torch.nn.Module):
+        hf_to_vllm_mapper = WeightsMapper(
+            orig_to_new_prefix={"model.language_model.": "model.", "mtp.": None}
+        )
+
+        def __init__(self):
+            super().__init__()
+            self.model = torch.nn.Module()
+            self.model.layers = torch.nn.ModuleList(
+                [
+                    PPMissingLayer() if i == 1 else torch.nn.Linear(1, 1)
+                    for i in range(12)
+                ]
+            )
+            self.model.embed_tokens = torch.nn.Embedding(2, 1)
+            self.lm_head = PPMissingLayer()
+
+    return Stage()
+
+
+def test_unused_tensors_follow_pipeline_stage_and_mapper():
+    is_unused = _unused_checkpoint_tensor_predicate(_pipeline_stage_model())
+    assert is_unused is not None
+    for name in (
+        "model.layers.1.mlp.experts.3.up_proj.weight",
+        "model.language_model.layers.1.linear_attn.A_log",
+        "lm_head.weight",
+        "mtp.layers.0.mlp.gate.weight",
+    ):
+        assert is_unused(name), name
+    for name in (
+        "model.layers.0.self_attn.q_proj.weight",
+        # Layer 11 shares layer 1's leading characters.
+        "model.layers.11.mlp.gate.weight",
+        "model.language_model.layers.0.linear_attn.A_log",
+        "model.embed_tokens.weight",
+    ):
+        assert not is_unused(name), name
+
+
+def test_unused_tensor_predicate_honors_the_models_hook():
+    """vLLM's ``is_unused_checkpoint_weight`` (an MTP draft reads only its
+    ``mtp.`` tensors) is applied on top of the stage filter: upstream drafts
+    keep a ``PPMissingLayer`` head off the last stage."""
+    import torch
+    from vllm.model_executor.models.utils import PPMissingLayer
+
+    class Draft(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.lm_head = PPMissingLayer()
+
+        def is_unused_checkpoint_weight(self, name: str) -> bool:
+            return not name.startswith("mtp.") and "lm_head" not in name
+
+    model = Draft()
+    assert unused_checkpoint_weight_hook(model) is not None
+    assert unused_checkpoint_weight_hook(torch.nn.Linear(1, 1)) is None
+    is_unused = _unused_checkpoint_tensor_predicate(model)
+    assert is_unused is not None
+    assert is_unused("model.layers.0.self_attn.q_proj.weight")
+    # The hook accepts the head; the stage does not host it.
+    assert is_unused("lm_head.weight")
+    assert not is_unused("mtp.fc.weight")
+
+
+def test_no_unused_tensor_predicate_without_stage_or_mapper():
+    import torch
+
+    assert _unused_checkpoint_tensor_predicate(None) is None
+    assert _unused_checkpoint_tensor_predicate(torch.nn.Linear(1, 1)) is None
+
+
+# ---------------------------------------------------------------------------
 # Request-plan construction
 # ---------------------------------------------------------------------------
 
@@ -208,6 +293,73 @@ def test_request_plan_groups_contiguous_kept_runs():
     ]
     total_requested = sum(sum(r.sizes) for r in requests)
     assert total_requested == 19  # 31 bytes in file, 12 skipped
+
+
+def test_request_plan_drops_tensors_the_model_does_not_load():
+    """Tensors the pipeline stage discards (another stage's layer, a name its
+    mapper drops) split runs like skipped experts, and the layer finisher
+    only waits on the tensors that are fetched."""
+    pytest.importorskip("runai_model_streamer")
+    import runai_model_streamer.safetensors_streamer.safetensors_pytorch as sp
+    from runai_model_streamer.safetensors_streamer import safetensors_streamer
+
+    from vllm_torchtpu import model_loader_patches as mlp
+
+    file_meta = _fake_file_meta(
+        offset=0,
+        names_and_sizes=[
+            ("model.language_model.layers.0.dense.weight", 4),  # kept   @0
+            ("model.language_model.layers.1.dense.weight", 8),  # other stage @4
+            ("model.language_model.layers.11.dense.weight", 2),  # kept   @12
+            ("mtp.fc.weight", 6),  # mapper drops it @14
+        ],
+    )
+    captured = {}
+
+    class FakeStreamer:
+        def __init__(self):
+            self.file_streamer = self
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return None
+
+        def stream_files(self, requests, credentials, device, is_distributed):
+            captured["requests"] = requests
+
+        def get_chunks(self):
+            return iter(())
+
+    class FakeFinisher:
+        def __init__(self, model, names):
+            captured["finisher_names"] = names
+
+    fake_metadata = MagicMock()
+    fake_metadata.from_files.return_value = [file_meta]
+    with (
+        patch.object(safetensors_streamer, "SafetensorsStreamer", FakeStreamer),
+        patch.object(sp, "SafetensorsMetadata", fake_metadata),
+        patch.object(mlp, "_OnlineFp8LayerFinisher", FakeFinisher),
+    ):
+        list(
+            _sharded_runai_weights_iterator(
+                ["gs://bucket/file0.safetensors"],
+                local_expert_ids=set(),
+                use_tqdm_on_load=False,
+                model=_pipeline_stage_model(),
+            )
+        )
+
+    assert [(r.offsets, r.sizes) for r in captured["requests"]] == [
+        ([0], [4]),
+        ([12], [2]),
+    ]
+    assert captured["finisher_names"] == [
+        "model.language_model.layers.0.dense.weight",
+        "model.language_model.layers.11.dense.weight",
+    ]
 
 
 def test_zero_size_kept_tensor_bypasses_fetch_plan():
