@@ -436,6 +436,7 @@ class PrefillProgram:
             mla_flash_tile=256,
             segments=count,
             prefix_capacity=self.capacity,
+            compute_logits=self.compute_logits,
         )
         logits_op = (
             self._kernels.make_prefill_logits_sp(
