@@ -421,6 +421,7 @@ class TpuPlatform(Platform):
         "MOE_FUSED_EP_PUSH_HBM_STAGING",
         "MOE_FUSED_EP_PUSH_DISPATCH_AHEAD",
         "MOE_FUSED_EP_PUSH_INTERLEAVE_VISITS",
+        "MOE_FUSED_EP_PUSH_MATMUL_SCALE_REPEAT",
     ]
 
     # The "Platform" base class has import_kernels() that tries to import

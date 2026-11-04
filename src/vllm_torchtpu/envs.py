@@ -89,6 +89,7 @@ if TYPE_CHECKING:
     MOE_FUSED_EP_PUSH_HBM_STAGING: bool = False
     MOE_FUSED_EP_PUSH_DISPATCH_AHEAD: int = 1
     MOE_FUSED_EP_PUSH_INTERLEAVE_VISITS: bool = False
+    MOE_FUSED_EP_PUSH_MATMUL_SCALE_REPEAT: bool = False
     TPU_EXPERT_PLACEMENT: str = ""
     TPU_LATENT_PROJ_INTRA_CHIP_TP: bool = False
     TPU_TOKEN_BUCKET_EXTRA: list[int] = []
@@ -750,6 +751,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # heaviest and lightest instead of most rows first (output unchanged).
     "MOE_FUSED_EP_PUSH_INTERLEAVE_VISITS": env_bool(
         "MOE_FUSED_EP_PUSH_INTERLEAVE_VISITS"
+    ),
+    # MOE_FUSED_EP_KERNEL_IMPL=push: build the scale slab's per-pair row
+    # scales with a one-hot matmul instead of jnp.repeat.
+    "MOE_FUSED_EP_PUSH_MATMUL_SCALE_REPEAT": env_bool(
+        "MOE_FUSED_EP_PUSH_MATMUL_SCALE_REPEAT"
     ),
     # Shard Kimi K3's latent-MoE down/up projections across the cores of a
     # chip instead of replicating them. They are unquantized [7168, 3584] and

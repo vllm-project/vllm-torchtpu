@@ -215,6 +215,7 @@ def _build_op(
             hbm_staging=envs.MOE_FUSED_EP_PUSH_HBM_STAGING,
             dispatch_ahead=envs.MOE_FUSED_EP_PUSH_DISPATCH_AHEAD,
             interleave_visits=envs.MOE_FUSED_EP_PUSH_INTERLEAVE_VISITS,
+            matmul_scale_repeat=envs.MOE_FUSED_EP_PUSH_MATMUL_SCALE_REPEAT,
         )
 
     preprocess_topology = prepare_moe_preprocessing(mesh)

@@ -411,3 +411,42 @@ def test_served_dims_program_knobs_are_bit_exact(shape):
         x, *_roll(weights), gating, height_rungs_override=4, **common
     )
     assert _rel(wrong, want) > CONTROL_BOUND
+
+
+# The MoE-front switches change no arithmetic.
+FRONT_SWITCHES = ("matmul_scale_repeat",)
+
+
+@pytest.mark.parametrize("switch", FRONT_SWITCHES)
+@pytest.mark.parametrize("shape", sorted(SERVED_SHAPES))
+def test_served_dims_front_switches_are_bit_exact(shape, switch):
+    """Each front switch gives the default layer's output bit for bit at the
+    served dims, with the served exchange and pre-push."""
+    g_local, rows, topk = SERVED_SHAPES[shape]
+    mesh = _mesh()
+    e_total = EP * g_local
+    weights = _served_fp4_weights(mesh, 71, e_total=e_total)
+    x, gating = _inputs(
+        mesh, 72, hidden=SERVED_HIDDEN, e_logical=e_total, tokens=EP * rows
+    )
+    common = dict(
+        topk=topk,
+        renormalize=True,
+        mesh=mesh,
+        capacity=CAPACITY,
+        weight_format=WeightFormat.FP4,
+        rhs_qb=512,
+        sharded_plan=True,
+        scoring_fn="sqrtsoftplus",
+        routed_scaling_factor=2.5,
+        act_fn="silu_and_mul_with_clamp",
+        logical_intermediate_size=SERVED_LOGICAL_INTER,
+        sc_prepush=2,
+        tc_exchange=True,
+    )
+    want = np.asarray(fused_ep_moe_push(x, *weights, gating, **common))
+    assert np.isfinite(want.astype(np.float32)).all()
+    got = fused_ep_moe_push(x, *weights, gating, **{switch: True}, **common)
+    np.testing.assert_array_equal(np.asarray(got), want)
+    wrong = fused_ep_moe_push(x, *_roll(weights), gating, **common)
+    assert _rel(wrong, want) > CONTROL_BOUND

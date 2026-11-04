@@ -305,3 +305,14 @@ def test_interleave_visits_alternates_heaviest_and_lightest(live):
     np.testing.assert_array_equal(got[:live], want)
     np.testing.assert_array_equal(got[live:], visit[live:])
     assert sorted(got[:live]) == sorted(visit[:live])
+@pytest.mark.parametrize("n,repeats", [(4608, 6), (3840, 3), (2304, 6), (200, 6)])
+def test_repeat_bits_equals_jnp_repeat(n, repeats):
+    """Every i32 bit pattern (negatives, NaN and inf f32 patterns among them)
+    comes back exactly, at the served scale-slab sizes and a ragged one."""
+    from vllm_torchtpu.kernels.experimental.push_fused_moe.layer import _repeat_bits
+
+    rng = np.random.default_rng(n)
+    bits = rng.integers(-(2**31), 2**31, n, dtype=np.int64).astype(np.int32)
+    bits[:4] = np.array([np.nan, np.inf, -np.inf, -0.0], np.float32).view(np.int32)
+    got = np.asarray(_repeat_bits(jnp.asarray(bits), repeats))
+    np.testing.assert_array_equal(got, np.repeat(bits, repeats))

@@ -187,6 +187,36 @@ def _to_slots(topk_idx, expert_slot, row_base, *, onehot=False):
     return slot.reshape(topk_idx.shape).astype(jnp.int32)
 
 
+def _repeat_bits(bits, repeats):
+    """jnp.repeat(bits, repeats) for i32 `bits` [n] as one one-hot matmul
+    over the four bytes of each word.
+
+    XLA spells the repeat as a [n, repeats] broadcast (one word in each
+    128-lane row) and then flattens it; this builds the lane-dense
+    [n / 128, 128 * repeats] result directly. Exact for any bit pattern: each
+    output is one byte (< 256, exact in bf16) times 1.0, summed with zeros in
+    f32.
+    """
+    (n_in,) = bits.shape
+    lanes = HIDDEN_LANE_BLOCK
+    n = align_up(n_in, lanes)
+    bits = jnp.pad(bits, (0, n - n_in))
+    shifts = 8 * jnp.arange(4, dtype=jnp.int32)[:, None, None]
+    planes = (jnp.right_shift(bits.reshape(1, n // lanes, lanes), shifts) & 255).reshape(
+        4 * n // lanes, lanes
+    )
+    spread = (
+        jnp.arange(lanes * repeats, dtype=jnp.int32)[None, :] // repeats
+        == jnp.arange(lanes, dtype=jnp.int32)[:, None]
+    ).astype(jnp.bfloat16)
+    out = jnp.dot(
+        planes.astype(jnp.bfloat16), spread, preferred_element_type=jnp.float32
+    ).astype(jnp.int32)
+    out = out.reshape(4, n // lanes, lanes * repeats)
+    word = out[0] | (out[1] << 8) | (out[2] << 16) | (out[3] << 24)
+    return word.reshape(n * repeats)[: n_in * repeats]
+
+
 _LAYER_SM_CACHE = {}
 _LAYER_SM_CACHE_LOCK = threading.Lock()
 
@@ -228,6 +258,7 @@ def fused_ep_moe_push(
     hbm_staging=False,
     dispatch_ahead=1,
     interleave_visits=False,
+    matmul_scale_repeat=False,
     expert_slot=None,
     expert_load=None,
 ):
@@ -248,10 +279,11 @@ def fused_ep_moe_push(
     slots without gathers (see `_to_slots`), `hbm_staging` ships result
     tiles through the HBM contribution slab and `dispatch_ahead` is how many
     visit positions the TensorCore's dispatch pushes run ahead of its compute
-    (see the kernel), and `interleave_visits` alternates every shard's
-    heaviest and lightest experts in its visit order
-    (host.interleave_visits). The caller (layers/adapter/fused_moe_ep.py)
-    reads all eight from envs.
+    (see the kernel), `interleave_visits` alternates every shard's heaviest
+    and lightest experts in its visit order (host.interleave_visits), and
+    `matmul_scale_repeat` builds the scale slab's per-pair activation scales
+    with `_repeat_bits` instead of jnp.repeat. The caller
+    (layers/adapter/fused_moe_ep.py) reads all nine from envs.
 
     `expert_slot` [experts, R] i32 and `expert_load` [e_total] i32 (both
     replicated, optional) are the expert-layout operands dynamic EPLB
@@ -678,7 +710,11 @@ def fused_ep_moe_push(
         # The activation row scale, scattered onto the slab row each routed
         # pair computes on (v2's scale slab; see there).
         if form.quantized_activations:
-            scale_bits = jnp.repeat(cast(jax.Array, scale_bits_g), topk)
+            scale_bits = (
+                _repeat_bits(cast(jax.Array, scale_bits_g), topk)
+                if matmul_scale_repeat
+                else jnp.repeat(cast(jax.Array, scale_bits_g), topk)
+            )
             scale_rows = act_scale_slab_rows(ragged_stride)
             scale_slab = lax.bitcast_convert_type(
                 jnp.zeros((scale_rows * HIDDEN_LANE_BLOCK,), jnp.int32)
@@ -859,6 +895,7 @@ def fused_ep_moe_push(
         hbm_staging,
         dispatch_ahead,
         bool(interleave_visits),
+        bool(matmul_scale_repeat),
     )
     sm = _LAYER_SM_CACHE.get(key)
     if sm is None:
