@@ -21,6 +21,7 @@ DETOK_PRIME_TEST_MODELS) and skipped when unavailable; DETOK_PRIME_TEST_GLM poin
 
 import os
 import random
+import zlib
 from types import SimpleNamespace
 
 import pytest
@@ -49,6 +50,7 @@ MODELS = [
     m for m in os.environ.get("DETOK_PRIME_TEST_MODELS", "").split(",") if m
 ] or list(DEFAULT_MODELS)
 CASES = int(os.environ.get("DETOK_PRIME_TEST_CASES", "400"))
+SEED = int(os.environ.get("DETOK_PRIME_TEST_SEED", "0"))
 
 CORPUS = [
     "To be, or not to be, that is the question:",
@@ -143,6 +145,7 @@ def _gen_case(rng, tok):
     specials = _specials(tok)
     vocab = len(tok)
     prompt = tok.encode(_random_text(rng, rng.randint(3, 25)), add_special_tokens=False)
+    prompt = prompt or [rng.randrange(vocab)]
     kind = rng.choice(
         ["text", "random", "split", "specials", "trailing_specials", "cut"]
     )
@@ -210,7 +213,7 @@ def _check(tok, prompt, out, params, n, rng):
 @pytest.mark.parametrize("name", ["toy", *MODELS])
 def test_tail_priming_matches_full_priming(name):
     tok = _load(name)
-    rng = random.Random(hash(name) & 0xFFFF)
+    rng = random.Random(zlib.crc32(name.encode()) + SEED)
     shortened = 0
     for case in range(CASES):
         prompt, out, _ = _gen_case(rng, tok)
