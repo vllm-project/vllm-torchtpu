@@ -135,6 +135,24 @@ def local_sort_activations(my_pairs, my_counts, q_l, *, e_total, topk):
     return q_sorted, seg_start_local
 
 
+def interleave_visits(visit, n_visit):
+    """Alternate the heaviest and lightest of a most-rows-first visit list.
+
+    `visit` [g_local] is expert_visit_list's order (live experts first,
+    most rows first) and `n_visit` its live count; the result visits the
+    same live experts as heaviest, lightest, second heaviest, second
+    lightest, ..., and keeps the empty tail. Each expert's tiles are
+    independent, so the order changes no output -- only how the visits'
+    compute, weight stream and transport line up in time.
+    """
+    g_local = visit.shape[0]
+    q = jnp.arange(g_local, dtype=jnp.int32)
+    n = n_visit.reshape(()).astype(jnp.int32)
+    src = jnp.where(q % 2 == 0, q // 2, n - 1 - q // 2)
+    src = jnp.where(q < n, src, q)
+    return jnp.take(visit, jnp.clip(src, 0, g_local - 1))
+
+
 def push_dispatch_segments(
     expert_rows_aligned,
     run_start_aligned,
@@ -144,6 +162,7 @@ def push_dispatch_segments(
     *,
     e_total,
     ep,
+    interleave=False,
 ):
     """The dispatch segment table of shard `me`: (seg, meta, visit).
 
@@ -155,11 +174,15 @@ def push_dispatch_segments(
     seg = [dest << 24 | expert << 16 | rows (S), source row (S),
     destination slab row (S)], S = ep * g_local. meta = [g_local + 1 unused,
     receive pair count per local expert (g_local), remote rows sent (1),
-    rows sent (1)]. visit [ep, g_local] is every shard's visit list.
+    rows sent (1)]. visit [ep, g_local] is every shard's visit list, most
+    rows first, or alternating heaviest and lightest with `interleave`
+    (interleave_visits).
     """
     g_local = e_total // ep
     rows_sh = expert_rows_aligned.astype(jnp.int32).reshape(ep, g_local)
     visit, n_visit = jax.vmap(lambda r: expert_visit_list(r, g_local))(rows_sh)
+    if interleave:
+        visit = jax.vmap(interleave_visits)(visit, n_visit)
     pos = jnp.arange(g_local, dtype=jnp.int32)[None, :]
     live = pos < n_visit.reshape(ep, 1)
     # Segment grid in (visit position, destination) order.

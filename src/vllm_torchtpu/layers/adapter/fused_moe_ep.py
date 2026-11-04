@@ -214,6 +214,7 @@ def _build_op(
             onehot_slots=envs.MOE_FUSED_EP_PUSH_ONEHOT_SLOTS,
             hbm_staging=envs.MOE_FUSED_EP_PUSH_HBM_STAGING,
             dispatch_ahead=envs.MOE_FUSED_EP_PUSH_DISPATCH_AHEAD,
+            interleave_visits=envs.MOE_FUSED_EP_PUSH_INTERLEAVE_VISITS,
         )
 
     preprocess_topology = prepare_moe_preprocessing(mesh)

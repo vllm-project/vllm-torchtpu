@@ -289,3 +289,19 @@ def test_local_sort_paths_agree(monkeypatch, t_local, e_total, topk, skew):
     np.testing.assert_array_equal(np.asarray(s_sort), np.asarray(s_count))
     want = [t for e in range(e_total) for t in range(t_local) if e in mine[t]]
     np.testing.assert_array_equal(np.asarray(q_sort)[: len(want), 0, 0], want)
+
+
+@pytest.mark.parametrize("live", [0, 1, 2, 7, 24, 25])
+def test_interleave_visits_alternates_heaviest_and_lightest(live):
+    g_local = 25
+    rows = np.zeros(g_local, np.int32)
+    rows[np.random.default_rng(live).permutation(g_local)[:live]] = (
+        np.arange(live, 0, -1) * 8
+    )
+    visit, n_visit = host.expert_visit_list(jnp.asarray(rows), g_local)
+    got = np.asarray(push_host.interleave_visits(visit, n_visit))
+    visit = np.asarray(visit)
+    want = [visit[(q // 2) if q % 2 == 0 else live - 1 - q // 2] for q in range(live)]
+    np.testing.assert_array_equal(got[:live], want)
+    np.testing.assert_array_equal(got[live:], visit[live:])
+    assert sorted(got[:live]) == sorted(visit[:live])

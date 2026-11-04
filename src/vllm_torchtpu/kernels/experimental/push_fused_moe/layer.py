@@ -227,6 +227,7 @@ def fused_ep_moe_push(
     onehot_slots=False,
     hbm_staging=False,
     dispatch_ahead=1,
+    interleave_visits=False,
     expert_slot=None,
     expert_load=None,
 ):
@@ -247,8 +248,10 @@ def fused_ep_moe_push(
     slots without gathers (see `_to_slots`), `hbm_staging` ships result
     tiles through the HBM contribution slab and `dispatch_ahead` is how many
     visit positions the TensorCore's dispatch pushes run ahead of its compute
-    (see the kernel). The caller (layers/adapter/fused_moe_ep.py) reads all
-    seven from envs.
+    (see the kernel), and `interleave_visits` alternates every shard's
+    heaviest and lightest experts in its visit order
+    (host.interleave_visits). The caller (layers/adapter/fused_moe_ep.py)
+    reads all eight from envs.
 
     `expert_slot` [experts, R] i32 and `expert_load` [e_total] i32 (both
     replicated, optional) are the expert-layout operands dynamic EPLB
@@ -579,7 +582,14 @@ def fused_ep_moe_push(
         with jax.named_scope("moe_dispatch_tables"):
             runs = run_tables(rows_by_dest)
             seg, dmeta, visit_all = push_dispatch_segments(
-                runs[3], runs[2], rows_by_dest, me, seg_start, e_total=e_total, ep=ep
+                runs[3],
+                runs[2],
+                rows_by_dest,
+                me,
+                seg_start,
+                e_total=e_total,
+                ep=ep,
+                interleave=interleave_visits,
             )
             recv_by_e = dmeta[g_local + 1 : 2 * g_local + 1]
             S = ep * g_local
@@ -848,6 +858,7 @@ def fused_ep_moe_push(
         bool(onehot_slots),
         hbm_staging,
         dispatch_ahead,
+        bool(interleave_visits),
     )
     sm = _LAYER_SM_CACHE.get(key)
     if sm is None:
