@@ -541,6 +541,8 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
             and self.n_local_heads == 64
         )
         self._csa2 = bool(self.compress_ratio) and csa2_supported
+        # Set after weight loading, once wo_b's runtime layout is known.
+        self._fused_wo_b = False
         self._fused_preprocess = csa2_supported
         self.swa_cache_layer.native_pages = self._csa2
         if self.compress_ratio:
@@ -2049,6 +2051,22 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
             self._q_projection_rope_op = initialize_projection_rope()
         if self.wo_a.weight.device.type == "tpu":
             _ = self.o_proj_op
+        # wo_b joins wo_a in one call when it is a plain TP1 per-channel FP8
+        # linear on the canonical (k, n) layout, which is what wo_b's own
+        # quantized_matmul would consume.
+        wo_b_scale = getattr(self.wo_b, "weight_scale", None)
+        self._fused_wo_b = (
+            self._csa2
+            and tp_size == 1
+            and getattr(self.wo_b, "bias", None) is None
+            and getattr(self.wo_b, WEIGHT_FLIPPED_ATTR, False)
+            and self.wo_b.weight.dtype == torch.float8_e4m3fn
+            and self.wo_b.weight.shape
+            == (self.n_groups * self.o_lora_rank, self.hidden_size)
+            and wo_b_scale is not None
+            and wo_b_scale.dtype == torch.float32
+            and wo_b_scale.shape == (self.hidden_size,)
+        )
 
     def _flip_compressor_weight(self):
         """Store the compressor projection as (k, n) for the fused kernel.
@@ -2124,6 +2142,14 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
         assert output.dtype == torch.bfloat16
         assert output.shape[1:] == (self.n_local_heads, self.head_dim)
         if self._csa2:
+            if self._fused_wo_b:
+                return csa2_adapter.project_out(
+                    output,
+                    self.wo_a.weight,
+                    self.wo_a.weight_scale,
+                    self.wo_b.weight,
+                    self.wo_b.weight_scale,
+                )
             projected = csa2_adapter.project(
                 output, self.wo_a.weight, self.wo_a.weight_scale
             )

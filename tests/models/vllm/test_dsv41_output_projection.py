@@ -101,6 +101,28 @@ def test_buffered_projection_traces_memory_space_boundary(monkeypatch, tokens):
     assert "wo_a_projection_buffered" in graph
 
 
+@pytest.mark.cpu_test
+@pytest.mark.parametrize(
+    "tokens,generation,fused",
+    [(240, 7, True), (288, 7, True), (256, 7, False), (288, 6, False)],
+)
+def test_project_out_dispatch(monkeypatch, tokens, generation, fused):
+    from vllm_torchtpu.kernels.deepseek_v41 import output_projection as fo
+    from vllm_torchtpu.models.vllm.deepseek_v41.v2.csa2_adapter import _project_out
+
+    for module in (oa, ob, fo):
+        monkeypatch.setattr(module, "get_tpu_version", lambda: generation)
+    # make_jaxpr reuses jit's trace cache, which would replay another
+    # generation's dispatch for the same shapes.
+    jax.clear_caches()
+    graph = str(jax.make_jaxpr(_project_out)(*_abstract_inputs(tokens)))
+    # The fused kernel replaces both buffered kernels; the other shapes run
+    # the unspecialized chain.
+    assert ("fused_output_projection" in graph) is fused
+    assert "wo_a_projection_buffered" not in graph
+    assert "buffered_per_channel_matmul" not in graph
+
+
 def _reference_a(x: jax.Array, w: jax.Array, scale: jax.Array) -> jax.Array:
     # Reproduce the pre-specialization defaults, bypassing automatic dispatch.
     tile_t = next(n for n in range(min(x.shape[0], 1024), 0, -1) if x.shape[0] % n == 0)
