@@ -81,6 +81,7 @@ if TYPE_CHECKING:
     TPU_GDN_CONV_QK_PAIR_LAYOUT: bool = False
     TPU_MOE_SKIP_PADDED_TOKENS: bool = False
     TPU_MOE_HIERARCHICAL_EP: bool = False
+    TPU_MOE_PACKED_DISPATCH: bool = False
     TPU_MOE_ROUTER_TOPK: str = "rowmax"
     TPU_MOE_HOT_SET_SIZE: int = 16
     TPU_MOE_HOT_SET_RATE: float = 0.3
@@ -661,6 +662,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # weight-bandwidth bound and the per-device expert load is badly
     # imbalanced. See K3_HIERARCHICAL_EP_PLAN.md.
     "TPU_MOE_HIERARCHICAL_EP": env_bool("TPU_MOE_HIERARCHICAL_EP"),
+    # Under DP + EP, gather the DP group's hidden states and router logits
+    # in one all-gather (packed side by side along the last dim) instead of
+    # one all-gather each. Exact: the packing only moves bytes.
+    "TPU_MOE_PACKED_DISPATCH": env_bool("TPU_MOE_PACKED_DISPATCH"),
     # MoE router top-k implementation: "rowmax" (default) is the sort-free
     # k-pass selection, "sort" is torch.topk, kept as an escape hatch.
     "TPU_MOE_ROUTER_TOPK": env_with_choices(

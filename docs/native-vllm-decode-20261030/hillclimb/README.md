@@ -83,6 +83,7 @@ LAYOUT=tp32dcp8 GLOBAL_SEQS=96 "$PYTHON_BIN" bench_sweep.py --stage <arm> --inpu
 | `ATTN_BLOCK` | | `long`: decode attention block of 8192 KV tokens, 4 sequences, 2 buffers (`TPU_BATCHED_RPA_DECODE_BLOCK`) instead of the kernel default; for >= 64K tokens per sequence (one KV head per core, one core: -2..-9% per layer at 64-128K, +6% at 24 x 32K); also the DCP cache pass; multi-token verify passes keep the default |
 | `FUSED_DRAFT` | 0 | `1` = draft steps 1..K-1 as one compiled program instead of two programs per step; single-engine layouts only (the switch does not support EP across data-parallel engines) |
 | `FAST_SUBST` | 0 | `1` = steady-state fast token substitution (skips the substitution kernel and per-step index uploads) |
+| `PACKED_DISPATCH` | 0 | `1`: under DP + EP, gather each token's hidden state and router logits in one MoE dispatch all-gather per layer instead of two (`TPU_MOE_PACKED_DISPATCH`); exact |
 | `WEIGHTS` | dummy | `real` loads the checkpoint at `MODEL_PATH` |
 | `KV_MODE` | synthetic | `normal` = real prefill with prefix caching (required with real weights; measure with `../benchmark_window.py`) |
 | `EXTRA_ARGS` | | appended to `vllm serve` |

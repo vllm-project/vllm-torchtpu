@@ -21,6 +21,7 @@
 #                 per sequence (faster at 64-128K, slower at 24 x 32K; one KV head per core, measured)
 #   FUSED_DRAFT   1 = draft steps 1..K-1 as one compiled program (VLLM_TPU_FUSED_DRAFT_LOOP); single-engine layouts only
 #   FAST_SUBST    1 = steady-state fast token substitution (VLLM_TPU_FAST_TOKEN_SUBSTITUTION)
+#   PACKED_DISPATCH 1 = one MoE dispatch all-gather per layer for hidden states + router logits (TPU_MOE_PACKED_DISPATCH)
 #   WEIGHTS       dummy (default) | real: real checkpoint at MODEL_PATH
 #   KV_MODE       synthetic (default, needs dummy weights) | normal: real prefill with prefix caching
 #   EXTRA_ARGS    appended verbatim to vllm serve
@@ -39,6 +40,7 @@ EXPERT_BLOCK=${EXPERT_BLOCK:-}
 ATTN_BLOCK=${ATTN_BLOCK:-}
 FUSED_DRAFT=${FUSED_DRAFT:-0}
 FAST_SUBST=${FAST_SUBST:-0}
+PACKED_DISPATCH=${PACKED_DISPATCH:-0}
 WEIGHTS=${WEIGHTS:-dummy}
 KV_MODE=${KV_MODE:-synthetic}
 read -r -a EXTRA_ARGV <<< "${EXTRA_ARGS:-}"
@@ -50,6 +52,11 @@ if [[ "$FUSED_DRAFT" == 1 ]]; then
   export VLLM_TPU_FUSED_DRAFT_LOOP=1
 fi
 [[ "$FAST_SUBST" == 1 ]] && export VLLM_TPU_FAST_TOKEN_SUBSTITUTION=1
+case "$PACKED_DISPATCH" in
+  0) ;;
+  1) export TPU_MOE_PACKED_DISPATCH=1 ;;
+  *) echo "PACKED_DISPATCH must be 0 or 1" >&2; exit 2 ;;
+esac
 [[ -n "$EXPERT_BLOCK" ]] && export MOE_REQUANTIZE_BLOCK_SIZE="$EXPERT_BLOCK"
 case "$ATTN_BLOCK" in
   "") ;;
@@ -90,7 +97,7 @@ elif [[ -n "$HOT_SET" ]]; then
   [[ "${HS_SPREAD:-}" == spread ]] && export TPU_MOE_HOT_SET_SPREAD=1
 fi
 export TORCH_TPU_TIER2_COMPILATION_CACHE="native_decode_${LAYOUT}_${POD_IP}"
-echo "HILLCLIMB layout=$LAYOUT host=$HOST_RANK engines=$ENGINES seqs/engine=$SEQS_PER_ENGINE mtp=$MTP_K mnbt=$MNBT compile=$COMPILE_SIZES kv=$KV_BYTES async=$ASYNC_SCHED fused_ep=$FUSED_EP w4a8=$W4A8 expert_block=${EXPERT_BLOCK:-16} attn_block=${ATTN_BLOCK:-default} fused_draft=$FUSED_DRAFT fast_subst=$FAST_SUBST weights=$WEIGHTS kv_mode=$KV_MODE hot_set=${HOT_SET:-none} headless=${HEADLESS_ARGS[*]:-no}"
+echo "HILLCLIMB layout=$LAYOUT host=$HOST_RANK engines=$ENGINES seqs/engine=$SEQS_PER_ENGINE mtp=$MTP_K mnbt=$MNBT compile=$COMPILE_SIZES kv=$KV_BYTES async=$ASYNC_SCHED fused_ep=$FUSED_EP w4a8=$W4A8 expert_block=${EXPERT_BLOCK:-16} attn_block=${ATTN_BLOCK:-default} fused_draft=$FUSED_DRAFT fast_subst=$FAST_SUBST packed_dispatch=$PACKED_DISPATCH weights=$WEIGHTS kv_mode=$KV_MODE hot_set=${HOT_SET:-none} headless=${HEADLESS_ARGS[*]:-no}"
 
 exec numactl --interleave=all "$VLLM_BIN" serve \
   --pipeline-parallel-size 1 \
