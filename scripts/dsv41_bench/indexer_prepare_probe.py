@@ -1,10 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Compile proof and three-way byte-exact preparation checks before writer A/B."""
+"""Three-way FP8 preparation checks and optional synchronized A/B on TPU.
+
+Default: --out results (288 tokens, correctness only).
+Sweep: --out results --tokens 128 256 288 384 512 --diagnose --iterations 100
+The candidate calls preparation directly without changing guards. Timings include
+scale production and preparation, not sorting or cache writes.
+"""
 
 import argparse
 import functools
 import json
 import sys
+import time
 import types
 from pathlib import Path
 
@@ -25,6 +32,8 @@ from vllm_torchtpu.kernels.deepseek_v41.index_selection.fp8.prepare import (  # 
 
 
 def native(keys, columns, order, scales=None):
+    tokens = keys.shape[0]
+    padding = -tokens % 128
     if scales is None:
         q, s, _ = cache.quantize_index_rows(keys)
     else:
@@ -33,7 +42,7 @@ def native(keys, columns, order, scales=None):
     bits = (
         jax.lax.bitcast_convert_type(q, jnp.uint8)
         .astype(jnp.uint32)
-        .reshape(288, 32, 4)
+        .reshape(tokens, 32, 4)
     )
     words = (
         bits[:, :, 0] | bits[:, :, 1] << 8 | bits[:, :, 2] << 16 | bits[:, :, 3] << 24
@@ -42,10 +51,14 @@ def native(keys, columns, order, scales=None):
         (words.astype(jnp.int32), jax.lax.bitcast_convert_type(s, jnp.int32)[:, None]),
         axis=1,
     )
-    return jnp.pad(columns[order], (0, 96)), jnp.pad(values[order].T, ((0, 0), (0, 96)))
+    return jnp.pad(columns[order], (0, padding)), jnp.pad(
+        values[order].T, ((0, 0), (0, padding))
+    )
 
 
 def reference(keys, columns, order, scales=None):
+    tokens = keys.shape[0]
+    padding = -tokens % 128
     values = keys.astype(np.float32)
     exponent = np.ceil(
         np.log2(np.maximum(np.abs(values).max(1), np.float32(1e-4)) / np.float32(448))
@@ -56,25 +69,24 @@ def reference(keys, columns, order, scales=None):
         (values / scales[:, None])
         .astype(ml_dtypes.float8_e4m3fn)
         .view(np.uint8)
-        .reshape(288, 32, 4)
+        .reshape(tokens, 32, 4)
         .astype(np.uint32)
     )
     words = (
         bits[:, :, 0] | bits[:, :, 1] << 8 | bits[:, :, 2] << 16 | bits[:, :, 3] << 24
     )
     packed = np.c_[words.view(np.int32), scales.view(np.int32)]
-    return np.pad(columns[order], (0, 96)), np.pad(packed[order].T, ((0, 0), (0, 96)))
+    return np.pad(columns[order], (0, padding)), np.pad(
+        packed[order].T, ((0, 0), (0, padding))
+    )
 
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--out", type=Path, required=True)
-    parser.add_argument("--diagnose", action="store_true")
-    args = parser.parse_args()
-    args.out.mkdir(parents=True, exist_ok=True)
+def run_prepare_probe(
+    tokens: int, out: Path, diagnose: bool, iterations: int, warmup: int
+) -> list[dict]:
     rng = np.random.default_rng(137)
-    columns = rng.integers(0, 256, 288, dtype=np.int32)
-    order = rng.permutation(288).astype(np.int32)
+    columns = rng.integers(0, 256, tokens, dtype=np.int32)
+    order = rng.permutation(tokens).astype(np.int32)
 
     def candidate(keys, columns, order):
         _, scales, _ = cache.quantize_index_rows(keys)
@@ -92,7 +104,7 @@ def main():
         "ties",
         "subnormal_edges",
     ):
-        keys = rng.normal(size=(288, 128))
+        keys = rng.normal(size=(tokens, 128))
         if kind == "zero":
             keys[:] = 0
         elif kind == "tiny":
@@ -101,13 +113,13 @@ def main():
             keys *= 1e9
         elif kind == "powers":
             keys = np.broadcast_to(
-                np.exp2(np.arange(288) % 40 - 20)[:, None], (288, 128)
+                np.exp2(np.arange(tokens) % 40 - 20)[:, None], (tokens, 128)
             ).copy()
         elif kind == "scale_edges":
-            maximum = np.array([446, 448, 450])[np.arange(288) % 3] * np.exp2(
-                np.arange(288) % 41 - 20
+            maximum = np.array([446, 448, 450])[np.arange(tokens) % 3] * np.exp2(
+                np.arange(tokens) % 41 - 20
             )
-            keys = rng.uniform(-0.99, 0.99, (288, 128)) * maximum[:, None]
+            keys = rng.uniform(-0.99, 0.99, (tokens, 128)) * maximum[:, None]
             keys[:, 0] = maximum
         elif kind == "ties":
             values = (
@@ -117,15 +129,21 @@ def main():
             )
             values = np.unique(values[np.isfinite(values)])
             midpoints = (values[:-1] + values[1:]) / 2
-            keys = midpoints[np.arange(288 * 128).reshape(288, 128) % midpoints.size]
+            keys = midpoints[
+                np.arange(tokens * 128).reshape(tokens, 128) % midpoints.size
+            ]
             keys[:, 0] = 448
-            keys *= np.exp2(np.arange(288) % 41 - 20)[:, None]
+            keys *= np.exp2(np.arange(tokens) % 41 - 20)[:, None]
         elif kind == "subnormal_edges":
-            keys = np.zeros((288, 128), np.float32)
+            keys = np.zeros((tokens, 128), np.float32)
             keys[:, 0] = 448
             keys[:, 1:7] = np.array([1, 2, 3, -1, -2, -3]) * (2.0**-9)
-            keys *= np.exp2(np.arange(288) % 41 - 20)[:, None]
+            keys *= np.exp2(np.arange(tokens) % 41 - 20)[:, None]
         keys = keys.astype(ml_dtypes.bfloat16)
+        if kind == "normal":
+            timing_inputs = jax.block_until_ready(
+                (jnp.asarray(keys), jnp.asarray(columns), jnp.asarray(order))
+            )
         expected = reference(keys, columns, order)
         outputs = {}
         for name, fn in functions.items():
@@ -133,7 +151,7 @@ def main():
                 fn(jnp.asarray(keys), jnp.asarray(columns), jnp.asarray(order))
             )
             outputs[name] = tuple(np.asarray(a) for a in actual)
-            if not args.diagnose:
+            if not diagnose:
                 for a, e in zip(actual, expected, strict=True):
                     np.testing.assert_array_equal(
                         np.asarray(a), e, err_msg=f"{kind}/{name}"
@@ -146,6 +164,7 @@ def main():
             for name, value in outputs.items()
         }
         result = {
+            "tokens": tokens,
             "case": kind,
             "three_way_byte_exact": not any(sum(x) for x in mismatches.values()),
             "mismatches_to_reference": mismatches,
@@ -158,8 +177,8 @@ def main():
         # scale-producer boundary rounding. New work is checked independently
         # at its explicit (keys, columns, order, scales) contract below.
         assert result["native_candidate_mismatches"] == [0, 0], result
-        fixture_scales = np.empty(288, np.float32)
-        fixture_scales[order] = expected[1][32, :288].copy().view(np.float32)
+        fixture_scales = np.empty(tokens, np.float32)
+        fixture_scales[order] = expected[1][32, :tokens].copy().view(np.float32)
         for factor in (1, 2):
             provided = fixture_scales * factor
             expected_cut = reference(keys, columns, order, provided)
@@ -179,16 +198,16 @@ def main():
         if not result["three_way_byte_exact"]:
 
             def decode(words):
-                payload = words[:32, :288].T.astype(np.uint32)
+                payload = words[:32, :tokens].T.astype(np.uint32)
                 bits = ((payload[..., None] >> (np.arange(4) * 8)) & 255).astype(
                     np.uint8
                 )
                 values = (
-                    bits.reshape(288, 128)
+                    bits.reshape(tokens, 128)
                     .view(ml_dtypes.float8_e4m3fn)
                     .astype(np.float32)
                 )
-                return values * words[32, :288].copy().view(np.float32)[:, None]
+                return values * words[32, :tokens].copy().view(np.float32)[:, None]
 
             decoded = {name: decode(value[1]) for name, value in outputs.items()}
             wanted = decode(expected[1])
@@ -208,7 +227,7 @@ def main():
                 for name, value in outputs.items()
             }
             np.savez(
-                args.out / f"{kind}-mismatch.npz",
+                out / f"{kind}-mismatch.npz",
                 keys=keys.astype(np.float32),
                 order=order,
                 columns=columns,
@@ -217,11 +236,76 @@ def main():
                 candidate=outputs["candidate"][1],
             )
         results.append(result)
-        (args.out / "probe.json").write_text(json.dumps(results, indent=2) + "\n")
+        (out / "probe.json").write_text(json.dumps(results, indent=2) + "\n")
         print(results[-1], flush=True)
 
+    if iterations:
+        samples = {name: [] for name in functions}
+        for _ in range(warmup):
+            for fn in functions.values():
+                jax.block_until_ready(fn(*timing_inputs))
+        names = tuple(functions)
+        for iteration in range(iterations):
+            # Alternate A/B and B/A to reduce order-dependent host/device bias.
+            for name in names[:: 1 if iteration % 2 == 0 else -1]:
+                start = time.perf_counter_ns()
+                jax.block_until_ready(functions[name](*timing_inputs))
+                samples[name].append((time.perf_counter_ns() - start) / 1000)
+        medians = {name: float(np.median(value)) for name, value in samples.items()}
+        timing = {
+            "tokens": tokens,
+            "scope": "scale_production_and_sorted_preparation",
+            "timing": "host_dispatch_plus_device_synchronized",
+            "input_case": "normal",
+            "candidate_path": "direct_prepare_sorted_fp8",
+            "backend": jax.default_backend(),
+            "devices": [str(device) for device in jax.devices()],
+            "jax_version": jax.__version__,
+            "iterations": iterations,
+            "warmup": warmup,
+            "samples_us": samples,
+            "median_us": medians,
+            "native_over_candidate": medians["native"] / medians["candidate"],
+        }
+        (out / "timing.json").write_text(json.dumps(timing, indent=2) + "\n")
+        print(timing, flush=True)
+    return results
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--out", type=Path, required=True)
+    parser.add_argument("--diagnose", action="store_true")
+    parser.add_argument("--tokens", type=int, nargs="+", default=[288])
+    parser.add_argument(
+        "--iterations",
+        type=int,
+        default=0,
+        help="Synchronized A/B pairs per shape; zero skips timing",
+    )
+    parser.add_argument("--warmup", type=int, default=10)
+    args = parser.parse_args()
+    if any(tokens <= 0 for tokens in args.tokens):
+        parser.error("--tokens must contain only positive counts")
+    if len(set(args.tokens)) != len(args.tokens):
+        parser.error("--tokens must not contain duplicates")
+    if args.iterations < 0 or args.warmup < 0:
+        parser.error("--iterations and --warmup must be nonnegative")
+    if jax.default_backend() != "tpu":
+        parser.error("This probe requires a TPU backend for the Pallas candidate")
+    args.out.mkdir(parents=True, exist_ok=True)
+    results = []
+    for tokens in args.tokens:
+        # Preserve the original single-T288 artifact paths by default.
+        out = args.out if args.tokens == [288] else args.out / f"t{tokens}"
+        out.mkdir(parents=True, exist_ok=True)
+        results.extend(
+            run_prepare_probe(tokens, out, args.diagnose, args.iterations, args.warmup)
+        )
+    rng = np.random.default_rng(137)
+
     for tokens, dtype, page_size, num_banks, offset in (
-        (256, jnp.bfloat16, 256, 2, 0),
+        (257, jnp.bfloat16, 256, 2, 0),
         (288, jnp.float32, 256, 2, 0),
         (288, jnp.bfloat16, 128, 2, 0),
         (288, jnp.bfloat16, 256, 1, 0),

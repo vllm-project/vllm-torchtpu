@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Sorted D128 FP8 preparation for the verified 288-token decode boundary."""
+"""Sorted D128 FP8 preparation for verified bounded decode token counts."""
 
 import jax
 import jax.numpy as jnp
@@ -16,9 +16,11 @@ def supports_sorted_fp8(
 ) -> bool:
     return (
         jax.default_backend() == "tpu"
-        and keys.shape == (288, 128)
+        and keys.ndim == 2
+        and keys.shape[0] in (128, 256, 288, 384, 512)
+        and keys.shape[1] == 128
         and keys.dtype == jnp.bfloat16
-        and records.shape == (288,)
+        and records.shape == (keys.shape[0],)
         and records.dtype == jnp.int32
         and page_size == 256
         and len(banks) == 2
