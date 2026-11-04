@@ -24,7 +24,7 @@ from jax.experimental.pallas import tpu as pltpu
 from vllm_torchtpu.kernels.qwen4_exp.block_sparse_gqa_prefill import (
     block_sparse_gqa_attention,
 )
-from vllm_torchtpu.kernels.sparse_gqa_prefill.grouped import sc_grouped_attention
+from vllm_torchtpu.kernels.sparse_gqa_prefill.owner_window import owner_window_attention
 
 
 @pytest.mark.tpu_test
@@ -52,9 +52,9 @@ def test_grouped_prefill_masks_poisoned_padding_and_preserves_cache(fp8):
     query = query.at[31].set(jnp.nan)
     gate = gate.at[0].set(jnp.nan)
     args = (query, gate, jnp.asarray(blocks), jnp.asarray(lengths), table, cache)
-    actual, returned = jax.jit(
-        functools.partial(sc_grouped_attention, kv_heads=2, tile_k=256)
-    )(*args)
+    actual = jax.jit(functools.partial(owner_window_attention, kv_heads=2, ratio=4))(
+        *args, jnp.array([0, 32], jnp.int32)
+    )
     expected, _ = jax.jit(
         functools.partial(
             block_sparse_gqa_attention,
@@ -68,4 +68,4 @@ def test_grouped_prefill_masks_poisoned_padding_and_preserves_cache(fp8):
     assert np.isfinite(actual).all()
     np.testing.assert_array_equal(actual[lengths == 0], 0)
     assert np.linalg.norm(actual - expected) / np.linalg.norm(expected) < 0.01
-    np.testing.assert_array_equal(np.asarray(returned).view(np.uint8), before)
+    np.testing.assert_array_equal(np.asarray(cache).view(np.uint8), before)
