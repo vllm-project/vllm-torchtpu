@@ -27,7 +27,7 @@ from typing import Any, cast
 import torch
 import torch.nn as nn
 
-from vllm_torchtpu import rope_patch
+from vllm_torchtpu import rope_in_graph, rope_patch
 from vllm_torchtpu.experimental.export import (
     api,
     draft_model,
@@ -981,12 +981,14 @@ class UniversalVllmExportableLLM(api.ExportableTextOnlyLLM):
         self._mtp_draft = getattr(model, MTP_DRAFT_ATTR, None)
         self._draft_model = getattr(model, draft_model.DRAFT_MODEL_ATTR, None)
         self._patched_rope_modules = rope_patch.patch_in_graph_rotary_embedding(
-            self._model
+            self._model, allow_table_recovery=True
         )
         for draft in (self._mtp_draft, self._draft_model):
             if draft is not None:
                 self._patched_rope_modules += (
-                    rope_patch.patch_in_graph_rotary_embedding(draft)
+                    rope_patch.patch_in_graph_rotary_embedding(
+                        draft, allow_table_recovery=True
+                    )
                 )
         _patch_row_parallel_input_split(self._model)
         for draft in (self._mtp_draft, self._draft_model):
@@ -994,8 +996,7 @@ class UniversalVllmExportableLLM(api.ExportableTextOnlyLLM):
                 # Kept off the target's module tree, like the RoPE patch above.
                 _patch_row_parallel_input_split(draft)
         if not self._export_config.uses_mrope and any(
-            getattr(m, "_in_graph_rope_dim_modalities", None) is not None
-            or rope_patch.compute_mrope_dim_modalities(m) is not None
+            rope_in_graph.compute_mrope_dim_modalities(m) is not None
             for _, m in self._model.named_modules()
         ):
             self._export_config = dataclasses.replace(

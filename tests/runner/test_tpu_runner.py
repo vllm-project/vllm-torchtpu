@@ -3513,6 +3513,40 @@ def test_relayout_tables_reaches_the_draft_model(monkeypatch):
     assert seen == []
 
 
+def test_patch_rope_in_graph_skips_none_and_counts_shared_tier1_once(
+    monkeypatch, caplog
+):
+    import logging
+
+    from vllm_torchtpu import rope_patch
+
+    seen: list[torch.nn.Module] = []
+
+    def fake_patch(model: torch.nn.Module) -> int:
+        rope_patch.drop_unused_rope_cache_aliases(model)
+        seen.append(model)
+        return 1
+
+    monkeypatch.setattr(rope_patch, "patch_in_graph_rotary_embedding", fake_patch)
+    runner = MagicMock(spec=TPUModelRunner)
+    shared_tier1 = torch.nn.Module()
+    shared_tier1._tpu_in_graph_tier1 = True
+    target_model = torch.nn.ModuleDict({"shared": shared_tier1})
+    draft_model = torch.nn.ModuleDict({"shared": shared_tier1})
+    draft_model._rope_cos_sin_cache = torch.ones(4, 4)
+
+    with caplog.at_level(logging.INFO, logger="vllm.vllm_torchtpu.runner.tpu_runner"):
+        TPUModelRunner._patch_rope_in_graph(runner, target_model, None, draft_model)
+
+    assert seen == [target_model, draft_model]
+    assert "_rope_cos_sin_cache" not in draft_model.__dict__
+    assert "1 Tier-1 and 2 Tier-2 rotary module(s)" in caplog.text
+
+    seen.clear()
+    TPUModelRunner._patch_rope_in_graph(runner, None)
+    assert seen == []
+
+
 def test_torch_tpu_wrapper_accelerator_aliases(monkeypatch):
     from vllm_torchtpu.runner.tpu_runner import _torch_tpu_wrapper
 
@@ -4252,6 +4286,86 @@ def test_truncate_rope_caches_keeps_speculative_slack(monkeypatch):
         draft_model["draft_rope"].cos_sin_cache[draft_positions],
         untruncated[draft_positions],
     )
+
+
+def test_truncate_rope_caches_suppresses_warning_when_in_graph_enabled(
+    monkeypatch, caplog
+):
+    """When TPU_ROPE_IN_GRAPH=1 removes raw tensor caches, skip the warning."""
+    import logging
+
+    from vllm.model_executor.layers.rotary_embedding import RotaryEmbedding
+
+    from vllm_torchtpu import envs, rope_in_graph
+
+    rope = _bare_rope(RotaryEmbedding, 128)
+    rope._buffers.pop("cos_sin_cache", None)
+    rope.cos_sin_cache = rope_in_graph.InGraphCosSinCache(
+        [rope_in_graph.CosSinSegment(0, 128, (1.0, 0.5, 0.25, 0.125))],
+        torch.float32,
+        128,
+        8,
+    )
+    model = torch.nn.ModuleDict({"rope": rope})
+
+    runner = TPUModelRunner.__new__(TPUModelRunner)
+    runner.model = model
+    runner.speculative_config = None
+    runner.model_config = SimpleNamespace(
+        is_multimodal_model=False, multimodal_config=None, max_model_len=32
+    )
+
+    monkeypatch.setattr(envs, "TPU_ROPE_IN_GRAPH", True)
+    with caplog.at_level(logging.WARNING, logger="vllm_torchtpu.runner.tpu_runner"):
+        runner._truncate_rope_caches(model)
+    assert "no position-indexed rope cache" not in caplog.text
+
+    caplog.clear()
+    monkeypatch.setattr(envs, "TPU_ROPE_IN_GRAPH", False)
+    with caplog.at_level(logging.WARNING, logger="vllm_torchtpu.runner.tpu_runner"):
+        runner._truncate_rope_caches(model)
+    assert "no position-indexed rope cache" in caplog.text
+
+
+def test_require_cos_sin_table_rope_is_truncated_when_in_graph_enabled(monkeypatch):
+    """Tier-1 ropes marked with `require_cos_sin_table` are truncated post-load."""
+    from vllm.config import DeviceConfig, set_current_vllm_config
+    from vllm.model_executor.layers.rotary_embedding import RotaryEmbedding
+
+    import vllm_torchtpu.layers.adapter.rotary_embedding  # noqa: F401
+    from vllm_torchtpu import envs, rope_in_graph
+
+    monkeypatch.setattr(envs, "TPU_ROPE_IN_GRAPH", True)
+    with set_current_vllm_config(VllmConfig(device_config=DeviceConfig(device="cpu"))):
+        rope = RotaryEmbedding(8, 8, 128, 10000.0, False, torch.float32)
+    assert isinstance(rope, rope_in_graph.Tier1InGraphRopeMixin)
+    assert isinstance(rope.cos_sin_cache, rope_in_graph.InGraphCosSinCache)
+    rope_in_graph.require_cos_sin_table(rope)
+    model = torch.nn.ModuleDict({"rope": rope})
+
+    runner = TPUModelRunner.__new__(TPUModelRunner)
+    runner.model = model
+    runner.speculative_config = None
+    runner.model_config = SimpleNamespace(
+        is_multimodal_model=False, multimodal_config=None, max_model_len=32
+    )
+
+    runner._truncate_rope_caches(model)
+    assert isinstance(rope.cos_sin_cache, torch.Tensor)
+    assert rope.cos_sin_cache.shape == (32, 8)
+
+
+def test_iter_unique_modules_visits_shared_modules_once():
+    shared = torch.nn.Linear(2, 2, bias=False)
+    a = torch.nn.ModuleDict({"shared": shared, "only_a": torch.nn.Identity()})
+    b = torch.nn.ModuleDict({"shared": shared, "only_b": torch.nn.Identity()})
+
+    visited = list(runner_utils_module.iter_unique_modules(a, b))
+    ids = [id(mod) for _, mod in visited]
+    assert len(ids) == len(set(ids))
+    assert id(shared) in ids
+    assert id(a["only_a"]) in ids
+    assert id(b["only_b"]) in ids
 
 
 class TestLogitsAtDpVocabRows:
