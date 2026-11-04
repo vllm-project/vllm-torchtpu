@@ -140,6 +140,7 @@ if TYPE_CHECKING:
     TPU_GREEDY_TOP_TOKENS: bool = False
     DP_SCHED_ENABLED: bool = False
     TPU_SHORT_PREFILL_FIRST_TOKENS: int = 0
+    TPU_DEFER_STEP: bool = False
     MLA_XPOSE_N_TILE_SIZE: int = 160
     MIXED_Q_SPLIT: int | None = None
     MIXED_NUM_QUERIES_PER_BLOCK: int | None = None
@@ -1481,6 +1482,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_SHORT_PREFILL_FIRST_TOKENS": env_nonnegative_int(
         "TPU_SHORT_PREFILL_FIRST_TOKENS", 0
     ),
+    # Behind a step in flight with prefill tokens, choose the next step shortly
+    # before that step is expected to end instead of at its start
+    # (core/deferred_step.py).
+    "TPU_DEFER_STEP": env_bool("TPU_DEFER_STEP"),
     # Tile size for MLA transpose pipeline.
     "MLA_XPOSE_N_TILE_SIZE": lambda: int(os.getenv("MLA_XPOSE_N_TILE_SIZE", "160")),
     "MIXED_Q_SPLIT": env_optional_int("MIXED_Q_SPLIT"),
