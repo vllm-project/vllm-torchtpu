@@ -95,6 +95,7 @@ if TYPE_CHECKING:
     MOE_FUSED_EP_PUSH_SLIM_PREPUSH_BARRIER: bool = False
     MOE_FUSED_EP_PUSH_FUSED_DISPATCH_META: bool = False
     MOE_FUSED_EP_PUSH_EARLY_ROW_GATHER: bool = False
+    MOE_FUSED_EP_PUSH_STAGING_SLOTS: int = 0
     TPU_EXPERT_PLACEMENT: str = ""
     TPU_LATENT_PROJ_INTRA_CHIP_TP: bool = False
     TPU_TOKEN_BUCKET_EXTRA: list[int] = []
@@ -788,6 +789,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "MOE_FUSED_EP_PUSH_EARLY_ROW_GATHER": env_bool(
         "MOE_FUSED_EP_PUSH_EARLY_ROW_GATHER"
     ),
+    # MOE_FUSED_EP_KERNEL_IMPL=push without HBM staging: VMEM slots the expert
+    # kernel stages result tiles in for the wire (0 = the default two).
+    "MOE_FUSED_EP_PUSH_STAGING_SLOTS": env_int("MOE_FUSED_EP_PUSH_STAGING_SLOTS", 0),
     # Shard Kimi K3's latent-MoE down/up projections across the cores of a
     # chip instead of replicating them. They are unquantized [7168, 3584] and
     # [3584, 7168] matmuls run at full HBM bandwidth, ~22% of decode device

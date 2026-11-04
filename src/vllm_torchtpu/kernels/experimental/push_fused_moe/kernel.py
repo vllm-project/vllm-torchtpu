@@ -118,6 +118,7 @@ def _build_push_moe_kernel(
     tail_barrier=True,
     hbm_staging=False,
     dispatch_ahead=1,
+    staging_slots=0,
 ):
     """Build the pallas_call and the function that invokes it.
 
@@ -164,7 +165,16 @@ def _build_push_moe_kernel(
     waiting at the slot-reuse guard. A staged build also pushes each visit's
     runs at the end of the NEXT visit, so the commits it waits for there have
     had a whole visit to land.
+
+    `staging_slots=N` (N > OUT_PARITIES; 0 = the default two) gives a build
+    that ships tiles straight from VMEM N staging slots instead of two, so
+    the tile loop can run N tiles ahead of the fabric before a slot-reuse
+    guard waits, with no HBM round trip. The activation slots stay two.
     """
+    if staging_slots and hbm_staging:
+        raise ValueError("staging_slots stages in VMEM; hbm_staging stages in HBM")
+    deep_staging = staging_slots > OUT_PARITIES
+    out_slots = staging_slots if deep_staging else OUT_PARITIES
     if dispatch_ahead < 1:
         raise ValueError(
             f"dispatch_ahead {dispatch_ahead} must be at least 1: a visit "
@@ -556,6 +566,8 @@ def _build_push_moe_kernel(
             send_sems, recv_sem = (next(it) for _ in range(2))
             # Scale-mirror DMAs need their own sems: waits are per-buffer.
             send_scl_sems, recv_scl_sem = (next(it) for _ in range(2))
+            if deep_staging:
+                shipped_rows_sm, shipped_subs_sm = next(it), next(it)
             commit_sems = commit_scl_sems = None
             mehop_sem = mehop_scl_sem = None
         else:
@@ -1123,11 +1135,19 @@ def _build_push_moe_kernel(
                 live_blocks = live_rows // ROWBLK
                 tile_block_base = t * tile_blocks  # expert-local block base
                 parity = lax.rem(tile_count, jnp.int32(OUT_PARITIES))
+                # The staging slot: the parity, or one of the deep slots.
+                stage = (
+                    lax.rem(tile_count, jnp.int32(out_slots))
+                    if deep_staging
+                    else parity
+                )
 
                 # out_vm[parity] reuse guard. Predicated on the outstanding
                 # count rather than on the tile count, because the drain
                 # zeroes them.
-                if push_from_vmem:
+                if deep_staging:
+                    wait_shipped(stage, shipped_rows_sm[stage], shipped_subs_sm[stage])
+                elif push_from_vmem:
                     wait_shipped(
                         parity,
                         jnp.where(parity == 0, carried[1], carried[2]),
@@ -1297,6 +1317,17 @@ def _build_push_moe_kernel(
                                 wire_scales_staged
                             )
 
+                    if deep_staging:
+                        # A dynamic slot index stores as well as a static
+                        # one; one store instead of a branch per slot.
+                        if full:
+                            out_vm[stage] = wire_rows_staged
+                            oscl_vm[stage] = wire_scales_staged
+                        else:
+                            out_vm[stage, pl.ds(0, height)] = wire_rows_staged
+                            oscl_vm[stage, :, pl.ds(0, height)] = wire_scales_staged
+                        return
+
                     # Store slots must be static, so these branches stay
                     # static.
                     @pl.when(parity == 0)
@@ -1319,6 +1350,13 @@ def _build_push_moe_kernel(
                         def _(rung=rung):
                             compute_tile(rung)
 
+                if deep_staging:
+                    rows_out, subs_out = ship_tile(
+                        stage, t, tile_block_base, live_blocks
+                    )
+                    shipped_rows_sm[stage] = rows_out
+                    shipped_subs_sm[stage] = subs_out
+                    return (tile_count + 1, *carried[1:])
                 if push_from_vmem:
                     rows_out, subs_out = ship_tile(
                         parity, t, tile_block_base, live_blocks
@@ -1381,6 +1419,10 @@ def _build_push_moe_kernel(
             tile two later on its parity, so these are the only sends left
             and their counts are the whole of the send semaphores' credit.
             """
+            if deep_staging:
+                for k in range(out_slots):
+                    wait_shipped(k, shipped_rows_sm[k], shipped_subs_sm[k])
+                return
             for p in range(host.OUT_PARITIES):
                 wait_shipped(p, carried[1 + p], carried[3 + p])
 
@@ -1504,6 +1546,10 @@ def _build_push_moe_kernel(
 
             return carry
 
+        if deep_staging:
+            for k in range(out_slots):
+                shipped_rows_sm[k] = jnp.int32(0)
+                shipped_subs_sm[k] = jnp.int32(0)
         carry0 = tuple(jnp.int32(0) for _ in range(5 if push_from_vmem else 3))
         carry_end = lax.fori_loop(0, n_visit, visit_step, carry0)
         if hbm_staging:
@@ -1564,8 +1610,13 @@ def _build_push_moe_kernel(
     # ls_vm where the activations are quantized, out_vm, oscl_vm.
     scratch = (
         [
-            pltpu.VMEM(shape, dtype)
-            for _, shape, dtype in host.vmem_scratch_arrays(
+            pltpu.VMEM(
+                (out_slots, *shape[1:])
+                if deep_staging and name in ("out_vm", "oscl_vm")
+                else shape,
+                dtype,
+            )
+            for name, shape, dtype in host.vmem_scratch_arrays(
                 g_local,
                 capacity,
                 hidden,
@@ -1602,11 +1653,15 @@ def _build_push_moe_kernel(
         ]
         + (
             [
-                pltpu.SemaphoreType.DMA((OUT_PARITIES,)),  # send_sems
+                pltpu.SemaphoreType.DMA((out_slots,)),  # send_sems
                 pltpu.SemaphoreType.DMA,  # recv_sem
-                pltpu.SemaphoreType.DMA((OUT_PARITIES,)),  # send_scl_sems
+                pltpu.SemaphoreType.DMA((out_slots,)),  # send_scl_sems
                 pltpu.SemaphoreType.DMA,  # recv_scl_sem
             ]
+            + (
+                # Per staging slot: rows and mirror sublanes still on the wire.
+                [pltpu.SMEM((out_slots,), jnp.int32)] * 2 if deep_staging else []
+            )
             if push_from_vmem
             else [
                 pltpu.SemaphoreType.DMA((OUT_PARITIES,)),  # commit_sems
@@ -1684,6 +1739,7 @@ def _build_push_moe_kernel(
             f"{'' if tail_barrier else '_notail'}"
             f"{'_hbmst' if hbm_staging else ''}"
             f"{'' if dispatch_ahead == 1 else f'_da{dispatch_ahead}'}"
+            f"{f'_st{out_slots}' if deep_staging else ''}"
         )
         return pl.pallas_call(
             kernel,

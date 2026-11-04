@@ -398,12 +398,12 @@ def _served_fp4_weights(mesh, seed, *, e_total):
 
 @pytest.mark.parametrize("shape", sorted(SERVED_SHAPES))
 def test_served_dims_program_knobs_are_bit_exact(shape):
-    """The closing barrier, the tile-height ladder, the HBM result staging,
-    the dispatch run-ahead and the visit order change no arithmetic: every
-    build matches the four-rung build with the barrier bit for bit at the
-    served dims. A score
-    bias makes a few experts hot, so visits span several tiles and every rung
-    of each ladder serves some tail tile."""
+    """The closing barrier, the tile-height ladder, the HBM and the deep VMEM
+    result staging, the dispatch run-ahead and the visit order change no
+    arithmetic: every build matches the four-rung build with the barrier bit
+    for bit at the served dims. A score bias makes a few experts hot, so
+    visits span several tiles and every rung of each ladder serves some tail
+    tile."""
     g_local, rows, topk = SERVED_SHAPES[shape]
     mesh = _mesh()
     e_total = EP * g_local
@@ -442,6 +442,8 @@ def test_served_dims_program_knobs_are_bit_exact(shape):
         dict(height_rungs_override=2, dispatch_ahead=3),
         dict(height_rungs_override=2, hbm_staging=True, dispatch_ahead=g_local),
         dict(height_rungs_override=2, interleave_visits=True),
+        dict(height_rungs_override=2, staging_slots=24, dispatch_ahead=9),
+        dict(height_rungs_override=2, staging_slots=4),
     ):
         got = fused_ep_moe_push(x, *weights, gating, **kw, **common)
         np.testing.assert_array_equal(np.asarray(got), want, err_msg=str(kw))

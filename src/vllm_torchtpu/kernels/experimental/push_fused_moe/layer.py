@@ -267,6 +267,7 @@ def fused_ep_moe_push(
     slim_prepush_barrier=False,
     fused_dispatch_meta=False,
     early_row_gather=False,
+    staging_slots=0,
     expert_slot=None,
     expert_load=None,
 ):
@@ -301,8 +302,9 @@ def fused_ep_moe_push(
     count with the dispatch segments (host.push_dispatch_tables) instead of
     decoding them back out of them, and `early_row_gather` (with
     `exchange_row_gather`) issues the exchange kernel's row copies before
-    its entry barrier. The caller (layers/adapter/fused_moe_ep.py) reads all
-    fourteen from envs.
+    its entry barrier, and `staging_slots` gives the VMEM-staged expert
+    kernel that many result staging slots (see the kernel). The caller
+    (layers/adapter/fused_moe_ep.py) reads all fifteen from envs.
 
     `expert_slot` [experts, R] i32 and `expert_load` [e_total] i32 (both
     replicated, optional) are the expert-layout operands dynamic EPLB
@@ -486,6 +488,7 @@ def fused_ep_moe_push(
         tail_barrier=tail_barrier,
         hbm_staging=hbm_staging,
         dispatch_ahead=dispatch_ahead,
+        staging_slots=int(staging_slots),
     )
 
     layout = _exchange_layout(t_local, topk, e_total, form.quantized_activations)
@@ -973,6 +976,7 @@ def fused_ep_moe_push(
         bool(slim_prepush_barrier),
         bool(fused_dispatch_meta),
         bool(early_row_gather),
+        int(staging_slots),
     )
     sm = _LAYER_SM_CACHE.get(key)
     if sm is None:
