@@ -19,6 +19,11 @@ export LIBTPU_INIT_ARGS='--xla_tpu_sparse_core_all_gather_offload_min_size_in_by
 if [[ "${MOE_FUSED_EP_PREPROCESS_BACKEND:-native}" == topology ]]; then
   export LIBTPU_INIT_ARGS="$LIBTPU_INIT_ARGS --xla_mosaic_unsafe_allow_multicore_remote_dma=true"
 fi
+# Extra compiler flags under test, comma-separated so they pass through
+# whitespace-split environment plumbing (e.g. "--flag_a=true,--flag_b=1").
+if [[ -n "${DSV41_EXTRA_LIBTPU_ARGS:-}" ]]; then
+  export LIBTPU_INIT_ARGS="$LIBTPU_INIT_ARGS ${DSV41_EXTRA_LIBTPU_ARGS//,/ }"
+fi
 export VLLM_SERVER_DEV_MODE=1
 # Cache roots, when supplied, must be keyed by source/runtime/topology/buckets.
 server_args=(--gpu-memory-utilization 0.85)
