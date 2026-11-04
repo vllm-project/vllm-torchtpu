@@ -141,6 +141,7 @@ if TYPE_CHECKING:
     DP_SCHED_ENABLED: bool = False
     TPU_SHORT_PREFILL_FIRST_TOKENS: int = 0
     TPU_DEFER_STEP: bool = False
+    VLLM_TPU_FOLLOW_SHARED_PREFIX: bool = False
     MLA_XPOSE_N_TILE_SIZE: int = 160
     MIXED_Q_SPLIT: int | None = None
     MIXED_NUM_QUERIES_PER_BLOCK: int | None = None
@@ -1488,6 +1489,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # before that step is expected to end instead of at its start
     # (core/deferred_step.py).
     "TPU_DEFER_STEP": env_bool("TPU_DEFER_STEP"),
+    # PrefixAwareScheduler: a running prefill whose next chunk another request
+    # has already cached waits instead of computing it, then takes the cached
+    # tokens (core/prefix_aware_scheduler.py). Exact; off computes every chunk.
+    "VLLM_TPU_FOLLOW_SHARED_PREFIX": env_bool("VLLM_TPU_FOLLOW_SHARED_PREFIX"),
     # Tile size for MLA transpose pipeline.
     "MLA_XPOSE_N_TILE_SIZE": lambda: int(os.getenv("MLA_XPOSE_N_TILE_SIZE", "160")),
     "MIXED_Q_SPLIT": env_optional_int("MIXED_Q_SPLIT"),

@@ -3,6 +3,7 @@
 # other modules are imported.
 import vllm_torchtpu.env_override  # noqa: F401
 from vllm_torchtpu import envs
+from vllm_torchtpu.block_pool_marks import BLOCKS_HASHED_THIS_STEP
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
@@ -2032,7 +2033,7 @@ def _patch_vllm_same_step_prefix_hits() -> None:
     original_schedule = Scheduler.schedule
 
     def unwritten_block_ids(pool) -> set[int]:
-        return pool.__dict__.setdefault("_tpu_unwritten_block_ids", set())
+        return pool.__dict__.setdefault(BLOCKS_HASHED_THIS_STEP, set())
 
     # Every path that makes a block hittable (full blocks, partial blocks,
     # re-pointed hashes) goes through here.
@@ -2044,7 +2045,7 @@ def _patch_vllm_same_step_prefix_hits() -> None:
     @functools.wraps(original_get_cached_block)
     def get_cached_block(self, block_hash, kv_cache_group_ids):
         blocks = original_get_cached_block(self, block_hash, kv_cache_group_ids)
-        unwritten = self.__dict__.get("_tpu_unwritten_block_ids")
+        unwritten = self.__dict__.get(BLOCKS_HASHED_THIS_STEP)
         if (
             blocks
             and unwritten
