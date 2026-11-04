@@ -549,6 +549,14 @@ def _pooled_kda_core(
     conv_shard_heads: int | None = None,
     num_spec_tokens: int = 0,
 ) -> tuple[jax.Array, jax.Array]:
+    if not num_spec_tokens:
+        # A batch of T tokens spans at most T live requests, which come first;
+        # the rest of the static slot table is null-slot padding that would
+        # otherwise be gathered and scattered on every step.
+        num_live = min(state_indices.shape[0], mixed_qkv.shape[0])
+        state_indices = state_indices[:num_live]
+        seq_lens = seq_lens[:num_live]
+        query_start_loc = query_start_loc[: num_live + 1]
     num_reqs = state_indices.shape[0]
     window = num_spec_tokens + 1
     dense_offsets = None

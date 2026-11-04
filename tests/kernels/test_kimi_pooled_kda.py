@@ -516,6 +516,33 @@ def test_pooled_kda_manager_block_split():
 
 
 @pytest.mark.tpu_test
+def test_pooled_kda_skips_padded_slots():
+    """Slots a batch's token count cannot reach are neither read nor written."""
+    rng = np.random.default_rng(0)
+    inputs = _inputs(rng, [1, 1], [5, 7])
+    padded = dict(
+        inputs,
+        query_start_loc=jnp.asarray([0, 1, 2, 2, 2], dtype=jnp.int32),
+        seq_lens=jnp.asarray([5, 7, 0, 0], dtype=jnp.int32),
+    )
+    conv_init, ssm_init = _initial_states(rng, 2)
+    pool = _pack_pool(conv_init, ssm_init, [1, 2])
+    distribution = jnp.asarray([2, 2, 2], dtype=jnp.int32)
+    pool_block_tokens = BLOCK_SIZE * PACK
+
+    out, after = _run_pooled(inputs, pool, [1, 2], distribution, pool_block_tokens)
+    out_padded, after_padded = _run_pooled(
+        padded, pool, [1, 2, 0, 0], distribution, pool_block_tokens
+    )
+
+    np.testing.assert_array_equal(
+        np.asarray(out_padded, np.float32), np.asarray(out, np.float32)
+    )
+    np.testing.assert_array_equal(_raw(after_padded), _raw(after))
+    np.testing.assert_array_equal(_raw(after_padded)[0], _raw(pool)[0])
+
+
+@pytest.mark.tpu_test
 def test_pooled_kda_multistep_state_evolution():
     """State must round-trip the pool across a chunked prefill and decodes.
 
