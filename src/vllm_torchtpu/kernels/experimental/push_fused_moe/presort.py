@@ -28,7 +28,7 @@ def _metadata(pairs, counts):
     expert = jnp.minimum(jnp.sum(end[None, :] <= jj[:, None], axis=1), experts - 1)
     onehot = expert[:, None] == bins[None, :]
     offset = jj - jnp.sum(jnp.where(onehot, start[None, :], 0), axis=1)
-    # Each one-hot row selects one integer in [0, 288]. Base-256 digits
+    # Each one-hot row selects one integer in [0, 384]. Base-256 digits
     # are exact in BF16, so FP32 accumulation and reconstruction are exact.
     hot = onehot.astype(jnp.bfloat16)
     low = (cumulative & 255).T.astype(jnp.bfloat16)
@@ -52,9 +52,9 @@ def supports_local_sort(
     """Limit fusion to the measured v7 FP8 decode contract."""
     return (
         (e_total, topk) == (384, 6)
-        and pairs.shape == (1728,)
+        and q.shape in tuple((t, 40, 128) for t in (96, 192, 256, 288, 384))
+        and pairs.shape == (q.shape[0] * 6,)
         and counts.shape == (384,)
-        and q.shape == (288, 40, 128)
         and pairs.dtype == counts.dtype == jnp.int32
         and q.dtype == jnp.float8_e4m3fn
         and jax.default_backend() == "tpu"
