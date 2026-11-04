@@ -276,7 +276,24 @@ def compress_rope_packed(eps: float) -> Any:
             low: jax.Array,
             high: jax.Array,
         ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
-            if positions.shape[0] != 288:
+            tokens = positions.shape[0]
+            # T288 keeps its original route; new shapes require one whole tile.
+            packed = tokens == 288 or (
+                tokens in (96, 192, 240, 256)
+                and x.shape == (tokens, 5120)
+                and weight.shape == (5120, 1024)
+                and positions.shape == (tokens,)
+                and all(
+                    value.shape == shape and value.dtype == jnp.int32
+                    for value, shape in zip(
+                        (table, starts, kv_starts, positions, minimum),
+                        ((48, 8), (49,), (49,), (tokens,), (48,)),
+                        strict=True,
+                    )
+                )
+                and compress_kernel.select_config(tokens, 5120, 2).token_block == tokens
+            )
+            if not packed:
                 return _compress_native_metadata(
                     table,
                     starts,
