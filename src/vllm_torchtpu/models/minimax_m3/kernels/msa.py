@@ -20,25 +20,15 @@ blocks) into the selection, and keeps the ``topk`` best blocks. Attention then
 runs over the selected blocks only (`msa_attention.msa_sparse_attention`).
 """
 
-import functools
-from collections.abc import Callable
-
 import jax
 import jax.numpy as jnp
 
 from vllm_torchtpu.kernels.ragged_paged_attention.v3.kernel import merge_kv
+from vllm_torchtpu.models.minimax_m3.kernels import msa_indexer
 from vllm_torchtpu.models.minimax_m3.kernels.msa_attention import (
     msa_sparse_attention,
 )
 
-# Query windows the block scorer tries, smallest first; the step's token
-# bucket is always the last tier.
-SCORE_WINDOW_TIERS = (16, 256)
-# Pages one scoring iteration covers. Decode-sized windows take bigger chunks:
-# fewer serial iterations over a long context, at the cost of reading up to
-# one chunk past the request's last page.
-_PAGES_PER_CHUNK = 16
-_SMALL_WINDOW_PAGES_PER_CHUNK = 64
 _NEG_INF = float("-inf")
 _FORCED_LOCAL_SCORE = 1e29
 _FORCED_INIT_SCORE = 1e30
@@ -91,121 +81,6 @@ def write_index_cache(
     return index_cache.at[pages, slot // packing, slot % packing].set(
         index_k.astype(index_cache.dtype), mode="drop"
     )
-
-
-def _score_request(
-    window: int,
-    index_q_padded: jax.Array,
-    index_cache: jax.Array,
-    page_row: jax.Array,
-    q_start: jax.Array,
-    num_pages: jax.Array,
-    pages_per_chunk: int,
-) -> jax.Array:
-    """Block-max scores ``[window, H, P]`` of one request's query window."""
-    num_heads = index_q_padded.shape[1]
-    num_padded_pages = page_row.shape[0]
-    _, rows_per_page, packing, head_dim = index_cache.shape
-    block_size = rows_per_page * packing
-    iq = jax.lax.dynamic_slice_in_dim(index_q_padded, q_start, window, axis=0)
-
-    def body(chunk, scores):
-        pages = jax.lax.dynamic_slice_in_dim(
-            page_row, chunk * pages_per_chunk, pages_per_chunk
-        )
-        keys = index_cache[pages].reshape(pages_per_chunk * block_size, head_dim)
-        s = jnp.einsum("whd,kd->whk", iq, keys, preferred_element_type=jnp.float32)
-        s = s.reshape(window, num_heads, pages_per_chunk, block_size).max(axis=-1)
-        return jax.lax.dynamic_update_slice_in_dim(
-            scores, s, chunk * pages_per_chunk, axis=2
-        )
-
-    scores = jnp.full((window, num_heads, num_padded_pages), _NEG_INF, jnp.float32)
-    num_chunks = (num_pages + pages_per_chunk - 1) // pages_per_chunk
-    return jax.lax.fori_loop(0, num_chunks, body, scores)
-
-
-def pages_per_chunk(window: int) -> int:
-    """Pages one scoring iteration covers for a query window."""
-    if window <= SCORE_WINDOW_TIERS[0]:
-        return _SMALL_WINDOW_PAGES_PER_CHUNK
-    return _PAGES_PER_CHUNK
-
-
-def block_scores(
-    index_q: jax.Array,
-    index_cache: jax.Array,
-    seq_lens: jax.Array,
-    block_tables: jax.Array,
-    cu_q_lens: jax.Array,
-    num_seqs: jax.Array,
-) -> jax.Array:
-    """Block-max index scores ``[T, H, P]`` (``P`` padded to the chunk).
-
-    Requests are scored one at a time against their own pages, so each index
-    key is read once per step regardless of how many query tokens use it.
-    Blocks past a token's own block hold scores of keys it must not see;
-    ``select_blocks`` masks them.
-    """
-    num_tokens, num_heads, _ = index_q.shape
-    max_num_seqs = seq_lens.shape[0]
-    pages_per_seq = block_tables.shape[0] // max_num_seqs
-    block_size = index_cache.shape[1] * index_cache.shape[2]
-    windows = sorted({w for w in SCORE_WINDOW_TIERS if w < num_tokens} | {num_tokens})
-    chunks = {w: pages_per_chunk(w) for w in windows}
-    # The chunk sizes divide each other, so this is a multiple of all of them.
-    largest_chunk = max(chunks.values())
-    num_padded_pages = -(-pages_per_seq // largest_chunk) * largest_chunk
-    page_rows = jnp.pad(
-        block_tables.reshape(max_num_seqs, pages_per_seq),
-        ((0, 0), (0, num_padded_pages - pages_per_seq)),
-    )
-    index_q_padded = jnp.pad(index_q, ((0, num_tokens), (0, 0), (0, 0)))
-    row_ids = jnp.arange(num_tokens, dtype=jnp.int32)
-
-    def body(seq, scores):
-        q_start = cu_q_lens[seq]
-        q_len = cu_q_lens[seq + 1] - q_start
-        num_pages = (seq_lens[seq] + block_size - 1) // block_size
-        branches = [
-            functools.partial(
-                _merge_window,
-                functools.partial(
-                    _score_request,
-                    window,
-                    index_q_padded,
-                    index_cache,
-                    page_rows[seq],
-                    q_start,
-                    num_pages,
-                    chunks[window],
-                ),
-                q_start,
-                q_len,
-                row_ids[:window],
-            )
-            for window in windows
-        ]
-        tier = jnp.searchsorted(jnp.asarray(windows), q_len, side="left")
-        return jax.lax.switch(tier, branches, scores)
-
-    scores = jnp.full(
-        (2 * num_tokens, num_heads, num_padded_pages), _NEG_INF, jnp.float32
-    )
-    return jax.lax.fori_loop(0, num_seqs, body, scores)[:num_tokens]
-
-
-def _merge_window(
-    score_fn: Callable[[], jax.Array],
-    q_start: jax.Array,
-    q_len: jax.Array,
-    rows: jax.Array,
-    scores: jax.Array,
-) -> jax.Array:
-    window_scores = score_fn()
-    old = jax.lax.dynamic_slice_in_dim(scores, q_start, rows.shape[0], axis=0)
-    merged = jnp.where((rows < q_len)[:, None, None], window_scores, old)
-    return jax.lax.dynamic_update_slice_in_dim(scores, merged, q_start, axis=0)
 
 
 def select_blocks(
@@ -301,8 +176,16 @@ def msa_forward(
     kv_cache = write_kv_cache(kv_cache, k, v, pages, pos)
     index_cache = write_index_cache(index_cache, index_k, pages, pos)
 
-    scores = block_scores(
-        index_q, index_cache, seq_lens, block_tables, cu_q_lens, distribution[2]
+    scores = msa_indexer.block_scores(
+        index_q,
+        index_cache,
+        seq_lens,
+        block_tables,
+        cu_q_lens,
+        distribution[2],
+        block_q=msa_indexer.DEFAULT_BLOCK_Q,
+        pages_per_step=msa_indexer.DEFAULT_PAGES_PER_STEP,
+        interpret=interpret,
     )
     selected = select_blocks(
         scores,

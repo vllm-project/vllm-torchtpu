@@ -20,7 +20,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from vllm_torchtpu.models.minimax_m3.kernels import msa
+from vllm_torchtpu.models.minimax_m3.kernels import msa, msa_indexer
 
 BLOCK = 16
 HEAD_DIM = 128
@@ -73,9 +73,10 @@ def test_msa_forward_matches_dense_reference(
     q_lens, ctx_lens, jit, small_chunks, monkeypatch
 ):
     if small_chunks:
-        # Several scoring iterations per request, and padding past the table.
-        monkeypatch.setattr(msa, "_PAGES_PER_CHUNK", 2)
-        monkeypatch.setattr(msa, "_SMALL_WINDOW_PAGES_PER_CHUNK", 4)
+        # Several indexer tiles per request and page groups per tile, and
+        # several attention tiles and page groups per step.
+        monkeypatch.setattr(msa_indexer, "DEFAULT_BLOCK_Q", 16)
+        monkeypatch.setattr(msa_indexer, "DEFAULT_PAGES_PER_STEP", 2)
     rng = np.random.default_rng(0)
     num_seqs = len(q_lens)
     max_num_seqs = num_seqs + 1
