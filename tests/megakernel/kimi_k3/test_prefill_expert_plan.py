@@ -111,9 +111,28 @@ def test_random_plan_places_each_expert(preshard, rank, name):
 
 
 def test_shipped_serving_plan_is_valid():
+    for name in ("plan_prefill_serve.npz", "plan_ep8_real_hotfirst.npz"):
+        path = os.path.join(os.path.dirname(rl.__file__), "..", "data", name)
+        order = np.load(path)["order"]
+        assert order.shape == (92, 896)
+        assert all(sorted(row) == list(range(896)) for row in order.tolist())
+
+
+def test_shipped_ep8_replica_plan_is_valid():
     path = os.path.join(
-        os.path.dirname(rl.__file__), "..", "data", "plan_prefill_serve.npz"
+        os.path.dirname(rl.__file__),
+        "..",
+        "data",
+        "replica_plan_ep8_real_plain4.npz",
     )
-    order = np.load(path)["order"]
-    assert order.shape == (92, 896)
-    assert all(sorted(row) == list(range(896)) for row in order.tolist())
+    data = np.load(path)
+    experts = data["experts"]
+    order = data["order"]
+    assert experts.shape == (92, 8, 4)
+    assert order.shape == (92, 32)
+    for layer in range(92):
+        assert sorted(order[layer].tolist()) == list(range(32))
+        for group in range(8):
+            row = experts[layer, group].tolist()
+            assert len(set(row)) == 4
+            assert all(0 <= e < 896 and e // 112 != group for e in row)
