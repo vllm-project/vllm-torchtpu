@@ -45,6 +45,7 @@ from vllm_torchtpu.kernels.experimental.push_fused_moe.host import (
     local_sort_activations,
     local_sort_tokens,
     push_dispatch_segments,
+    push_dispatch_tables,
     run_tables,
 )
 from vllm_torchtpu.kernels.experimental.push_fused_moe.kernel import (
@@ -264,6 +265,7 @@ def fused_ep_moe_push(
     exchange_row_gather=False,
     bf16_sort_counts=False,
     slim_prepush_barrier=False,
+    fused_dispatch_meta=False,
     expert_slot=None,
     expert_load=None,
 ):
@@ -293,8 +295,11 @@ def fused_ep_moe_push(
     TensorCore gather after it, `bf16_sort_counts` finds the expert-sorted
     token order with two single-pass bf16 matmuls
     (host._sorted_tokens_by_count), and `slim_prepush_barrier` keeps the run
-    tables out of the pre-push barrier. The caller
-    (layers/adapter/fused_moe_ep.py) reads all twelve from envs.
+    tables out of the pre-push barrier, and `fused_dispatch_meta` builds the
+    pre-push counts, this shard's visit list and the kernel's remote-row
+    count with the dispatch segments (host.push_dispatch_tables) instead of
+    decoding them back out of them. The caller
+    (layers/adapter/fused_moe_ep.py) reads all thirteen from envs.
 
     `expert_slot` [experts, R] i32 and `expert_load` [e_total] i32 (both
     replicated, optional) are the expert-layout operands dynamic EPLB
@@ -629,41 +634,58 @@ def fused_ep_moe_push(
         )
         with jax.named_scope("moe_dispatch_tables"):
             runs = run_tables(rows_by_dest)
-            seg, dmeta, visit_all = push_dispatch_segments(
-                runs[3],
-                runs[2],
-                rows_by_dest,
-                me,
-                seg_start,
-                e_total=e_total,
-                ep=ep,
-                interleave=interleave_visits,
-            )
-            recv_by_e = dmeta[g_local + 1 : 2 * g_local + 1]
-            S = ep * g_local
-            seg_n = jnp.bitwise_and(seg[:S], 65535).reshape(g_local, ep)
-            seg_remote = (jnp.arange(ep)[None, :] != me).astype(jnp.int32)
-            visit = lax.dynamic_slice(visit_all, (me, 0), (1, g_local)).reshape(g_local)
-            # Rows landing here at each pre-pushed visit position.
-            vis_s = visit[:n_pre]
-            hit_s = (
-                vis_s[:, None] == jnp.arange(g_local, dtype=jnp.int32)[None, :]
-            ) & (vis_s[:, None] >= 0)
-            rows_at_v = jnp.sum(jnp.where(hit_s, recv_by_e[None, :], 0), axis=1)
-            # The kernel waits only the remote rows IT sends: positions >= n_pre.
-            n_rem_tc = jnp.sum(seg_n[n_pre:] * seg_remote).astype(jnp.int32).reshape(1)
-            dmeta = jnp.concatenate(
-                [dmeta[: 2 * g_local + 1], n_rem_tc, dmeta[2 * g_local + 2 :]]
-            )
-            # SparseCore core c pushes the positions v with v % 2 == c.
-            counts_sc = jnp.stack(
-                [
-                    jnp.sum(rows_at_v[0:n_pre:2]),
-                    jnp.sum(rows_at_v[1:n_pre:2]),
-                    jnp.sum(seg_n[0:n_pre:2] * seg_remote),
-                    jnp.sum(seg_n[1:n_pre:2] * seg_remote),
-                ]
-            ).astype(jnp.int32)
+            if fused_dispatch_meta:
+                seg, dmeta, _, visit, counts_sc = push_dispatch_tables(
+                    runs[3],
+                    runs[2],
+                    rows_by_dest,
+                    me,
+                    seg_start,
+                    e_total=e_total,
+                    ep=ep,
+                    n_pre=n_pre,
+                    interleave=interleave_visits,
+                )
+            else:
+                seg, dmeta, visit_all = push_dispatch_segments(
+                    runs[3],
+                    runs[2],
+                    rows_by_dest,
+                    me,
+                    seg_start,
+                    e_total=e_total,
+                    ep=ep,
+                    interleave=interleave_visits,
+                )
+                recv_by_e = dmeta[g_local + 1 : 2 * g_local + 1]
+                S = ep * g_local
+                seg_n = jnp.bitwise_and(seg[:S], 65535).reshape(g_local, ep)
+                seg_remote = (jnp.arange(ep)[None, :] != me).astype(jnp.int32)
+                visit = lax.dynamic_slice(visit_all, (me, 0), (1, g_local)).reshape(
+                    g_local
+                )
+                # Rows landing here at each pre-pushed visit position.
+                vis_s = visit[:n_pre]
+                hit_s = (
+                    vis_s[:, None] == jnp.arange(g_local, dtype=jnp.int32)[None, :]
+                ) & (vis_s[:, None] >= 0)
+                rows_at_v = jnp.sum(jnp.where(hit_s, recv_by_e[None, :], 0), axis=1)
+                # The kernel waits only the remote rows IT sends: positions >= n_pre.
+                n_rem_tc = (
+                    jnp.sum(seg_n[n_pre:] * seg_remote).astype(jnp.int32).reshape(1)
+                )
+                dmeta = jnp.concatenate(
+                    [dmeta[: 2 * g_local + 1], n_rem_tc, dmeta[2 * g_local + 2 :]]
+                )
+                # SparseCore core c pushes the positions v with v % 2 == c.
+                counts_sc = jnp.stack(
+                    [
+                        jnp.sum(rows_at_v[0:n_pre:2]),
+                        jnp.sum(rows_at_v[1:n_pre:2]),
+                        jnp.sum(seg_n[0:n_pre:2] * seg_remote),
+                        jnp.sum(seg_n[1:n_pre:2] * seg_remote),
+                    ]
+                ).astype(jnp.int32)
         # Compute the pre-push operands before the routing plan, so XLA
         # launches the SparseCore dispatch ahead of it and the two overlap.
         # The plan reads pairs_g, so it follows the barrier either way; the
@@ -941,6 +963,7 @@ def fused_ep_moe_push(
         exchange_row_gather,
         bool(bf16_sort_counts),
         bool(slim_prepush_barrier),
+        bool(fused_dispatch_meta),
     )
     sm = _LAYER_SM_CACHE.get(key)
     if sm is None:

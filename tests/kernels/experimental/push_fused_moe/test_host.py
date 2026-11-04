@@ -310,6 +310,8 @@ def test_interleave_visits_alternates_heaviest_and_lightest(live):
     np.testing.assert_array_equal(got[:live], want)
     np.testing.assert_array_equal(got[live:], visit[live:])
     assert sorted(got[:live]) == sorted(visit[:live])
+
+
 @pytest.mark.parametrize("n,repeats", [(4608, 6), (3840, 3), (2304, 6), (200, 6)])
 def test_repeat_bits_equals_jnp_repeat(n, repeats):
     """Every i32 bit pattern (negatives, NaN and inf f32 patterns among them)
@@ -321,3 +323,53 @@ def test_repeat_bits_equals_jnp_repeat(n, repeats):
     bits[:4] = np.array([np.nan, np.inf, -np.inf, -0.0], np.float32).view(np.int32)
     got = np.asarray(_repeat_bits(jnp.asarray(bits), repeats))
     np.testing.assert_array_equal(got, np.repeat(bits, repeats))
+
+
+@pytest.mark.parametrize("n_pre", [1, 2, 3, 25])
+@pytest.mark.parametrize("skew", [False, True], ids=["uniform", "skewed"])
+def test_dispatch_tables_match_the_decoded_segments(n_pre, skew):
+    """push_dispatch_tables' extra outputs equal what the layer decodes out
+    of push_dispatch_segments' tables, at the DP16 geometry (ep 16, 25 slots,
+    288 rows, top-6) for every rank parity."""
+    ep, t_local, g_local, topk = 16, 288, 25, 6
+    idx, kw = _routing(ep, t_local, g_local, topk, skew=skew, seed=5)
+    e_total = kw["e_total"]
+    n_pre = min(n_pre, g_local)
+    rows_by_dest = jnp.asarray(_counts(idx, ep, t_local, e_total))
+    runs = push_host.run_tables(rows_by_dest)
+    for me in (0, 1, ep - 1):
+        counts = np.asarray(rows_by_dest)[me]
+        seg_start = jnp.asarray(np.cumsum(counts) - counts)
+        args = (runs[3], runs[2], rows_by_dest, jnp.int32(me), seg_start)
+        seg0, meta0, visit0 = (
+            np.asarray(a)
+            for a in push_host.push_dispatch_segments(*args, e_total=e_total, ep=ep)
+        )
+        seg, meta, visit_all, my_visit, counts_sc = (
+            np.asarray(a)
+            for a in push_host.push_dispatch_tables(
+                *args, e_total=e_total, ep=ep, n_pre=n_pre
+            )
+        )
+        np.testing.assert_array_equal(seg, seg0)
+        np.testing.assert_array_equal(visit_all, visit0)
+        np.testing.assert_array_equal(my_visit, visit0[me])
+        S = ep * g_local
+        seg_n = (seg0[:S] & 65535).reshape(g_local, ep)
+        remote = seg_n * (np.arange(ep)[None, :] != me)
+        want_meta = meta0.copy()
+        want_meta[2 * g_local + 1] = remote[n_pre:].sum()
+        np.testing.assert_array_equal(meta, want_meta)
+        recv = meta0[g_local + 1 : 2 * g_local + 1]
+        rows_at_v = recv[visit0[me][:n_pre]]
+        want_sc = [
+            rows_at_v[0::2].sum(),
+            rows_at_v[1::2].sum(),
+            remote[0:n_pre:2].sum(),
+            remote[1:n_pre:2].sum(),
+            0,
+            0,
+            0,
+            0,
+        ]
+        np.testing.assert_array_equal(counts_sc, want_sc)

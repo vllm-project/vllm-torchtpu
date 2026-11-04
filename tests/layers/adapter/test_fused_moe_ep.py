@@ -1164,6 +1164,7 @@ def test_build_op_picks_the_push_layer_and_passes_its_knobs(monkeypatch, impl):
     monkeypatch.setattr(envs, "MOE_FUSED_EP_PUSH_EXCHANGE_ROW_GATHER", True)
     monkeypatch.setattr(envs, "MOE_FUSED_EP_PUSH_BF16_SORT_COUNTS", True)
     monkeypatch.setattr(envs, "MOE_FUSED_EP_PUSH_SLIM_PREPUSH_BARRIER", True)
+    monkeypatch.setattr(envs, "MOE_FUSED_EP_PUSH_FUSED_DISPATCH_META", True)
     bridge._build_op(None, 2, True, "silu", None, False)
     x = jnp.ones((8, 8), dtype=jnp.bfloat16)
     operands = (
@@ -1191,6 +1192,7 @@ def test_build_op_picks_the_push_layer_and_passes_its_knobs(monkeypatch, impl):
         assert forwarded["exchange_row_gather"] is True
         assert forwarded["bf16_sort_counts"] is True
         assert forwarded["slim_prepush_barrier"] is True
+        assert forwarded["fused_dispatch_meta"] is True
     else:
         push_kernel.assert_not_called()
         forwarded = v2_kernel.call_args.kwargs
@@ -1207,6 +1209,7 @@ def test_build_op_picks_the_push_layer_and_passes_its_knobs(monkeypatch, impl):
             "exchange_row_gather",
             "bf16_sort_counts",
             "slim_prepush_barrier",
+            "fused_dispatch_meta",
         ):
             assert knob not in forwarded
 

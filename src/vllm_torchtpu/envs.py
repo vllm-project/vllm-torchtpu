@@ -93,6 +93,7 @@ if TYPE_CHECKING:
     MOE_FUSED_EP_PUSH_EXCHANGE_ROW_GATHER: bool = False
     MOE_FUSED_EP_PUSH_BF16_SORT_COUNTS: bool = False
     MOE_FUSED_EP_PUSH_SLIM_PREPUSH_BARRIER: bool = False
+    MOE_FUSED_EP_PUSH_FUSED_DISPATCH_META: bool = False
     TPU_EXPERT_PLACEMENT: str = ""
     TPU_LATENT_PROJ_INTRA_CHIP_TP: bool = False
     TPU_TOKEN_BUCKET_EXTRA: list[int] = []
@@ -775,6 +776,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # that orders the SparseCore pre-push ahead of the routing plan.
     "MOE_FUSED_EP_PUSH_SLIM_PREPUSH_BARRIER": env_bool(
         "MOE_FUSED_EP_PUSH_SLIM_PREPUSH_BARRIER"
+    ),
+    # MOE_FUSED_EP_KERNEL_IMPL=push: build the pre-push counts and the
+    # kernel's remote-row count with the dispatch segments, in fewer ops.
+    "MOE_FUSED_EP_PUSH_FUSED_DISPATCH_META": env_bool(
+        "MOE_FUSED_EP_PUSH_FUSED_DISPATCH_META"
     ),
     # Shard Kimi K3's latent-MoE down/up projections across the cores of a
     # chip instead of replicating them. They are unquantized [7168, 3584] and

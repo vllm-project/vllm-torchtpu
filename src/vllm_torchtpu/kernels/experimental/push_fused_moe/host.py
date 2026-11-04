@@ -96,9 +96,9 @@ def _sorted_tokens_by_count(
         hits = jnp.dot(
             onehot, sel.T.astype(jnp.bfloat16), preferred_element_type=jnp.float32
         ).astype(jnp.bfloat16)  # [n, t_local] = sel[:, ge_j]
-        tri = (
-            jnp.arange(t_local)[:, None] <= jnp.arange(t_local)[None, :]
-        ).astype(jnp.bfloat16)
+        tri = (jnp.arange(t_local)[:, None] <= jnp.arange(t_local)[None, :]).astype(
+            jnp.bfloat16
+        )
         col = jnp.dot(hits, tri, preferred_element_type=jnp.float32).astype(jnp.int32)
         return jnp.minimum(
             jnp.sum(col <= m_j[:, None], axis=1).astype(jnp.int32), t_local - 1
@@ -218,6 +218,44 @@ def push_dispatch_segments(
     (interleave_visits).
     """
     g_local = e_total // ep
+    seg, visit, _, cnt, recv, d_grid = _segment_grids(
+        expert_rows_aligned,
+        run_start_aligned,
+        rows_by_dest,
+        me,
+        seg_start_local,
+        e_total=e_total,
+        ep=ep,
+        interleave=interleave,
+    )
+    n_remote = jnp.sum(jnp.where(d_grid != me, cnt, 0)).astype(jnp.int32).reshape(1)
+    n_sent = jnp.sum(cnt).astype(jnp.int32).reshape(1)
+    # Words [0, g_local] are not read by anyone: they are padding that puts
+    # `recv` at g_local + 1 and the two counts at 2 * g_local + 1 / + 2, the
+    # fixed offsets the kernel reads its scalar-prefetched `dmeta_sm` at (and
+    # layer.py slices). Dropping them would mean shifting those offsets in
+    # the kernel, which this table's consumers were compiled and measured
+    # with, so the layout stays as is.
+    meta = jnp.concatenate(
+        [jnp.zeros((g_local + 1,), jnp.int32), recv, n_remote, n_sent]
+    )
+    return seg, meta, visit
+
+
+def _segment_grids(
+    expert_rows_aligned,
+    run_start_aligned,
+    rows_by_dest,
+    me,
+    seg_start_local,
+    *,
+    e_total,
+    ep,
+    interleave,
+):
+    """(seg, visit, hit_v, cnt, recv, d_grid): the segment table and the
+    (visit position, destination) grids it is built from."""
+    g_local = e_total // ep
     rows_sh = expert_rows_aligned.astype(jnp.int32).reshape(ep, g_local)
     visit, n_visit = jax.vmap(lambda r: expert_visit_list(r, g_local))(rows_sh)
     if interleave:
@@ -251,18 +289,73 @@ def push_dispatch_segments(
     recv = lax.dynamic_slice(
         rows_by_dest.astype(jnp.int32), (0, me * g_local), (ep, g_local)
     ).sum(axis=0)
-    n_remote = jnp.sum(jnp.where(d_grid != me, cnt, 0)).astype(jnp.int32).reshape(1)
-    n_sent = jnp.sum(cnt).astype(jnp.int32).reshape(1)
-    # Words [0, g_local] are not read by anyone: they are padding that puts
-    # `recv` at g_local + 1 and the two counts at 2 * g_local + 1 / + 2, the
-    # fixed offsets the kernel reads its scalar-prefetched `dmeta_sm` at (and
-    # layer.py slices). Dropping them would mean shifting those offsets in
-    # the kernel, which this table's consumers were compiled and measured
-    # with, so the layout stays as is.
-    meta = jnp.concatenate(
-        [jnp.zeros((g_local + 1,), jnp.int32), recv, n_remote, n_sent]
+    return seg, visit, hit_v, cnt, recv, d_grid
+
+
+def push_dispatch_tables(
+    expert_rows_aligned,
+    run_start_aligned,
+    rows_by_dest,
+    me,
+    seg_start_local,
+    *,
+    e_total,
+    ep,
+    n_pre,
+    interleave=False,
+):
+    """push_dispatch_segments' (seg, meta, visit) plus what the layer hands
+    the SparseCore pre-push of visit positions [0, n_pre) and the
+    TensorCore kernel, built from the same grids rather than decoded back
+    out of seg and meta: (seg, meta, visit, my_visit [g_local], counts_sc
+    i32[8]).
+
+    meta's remote-rows word counts only the positions >= n_pre (the rows
+    the TensorCore kernel itself sends). counts_sc = [rows landing here at
+    the pre-pushed positions v with v % 2 == 0, with v % 2 == 1, remote rows
+    this shard sends at those even / odd positions, 0 x 4]: SparseCore core
+    c pushes the positions v with v % 2 == c.
+    """
+    g_local = e_total // ep
+    seg, visit, hit_v, cnt, recv, d_grid = _segment_grids(
+        expert_rows_aligned,
+        run_start_aligned,
+        rows_by_dest,
+        me,
+        seg_start_local,
+        e_total=e_total,
+        ep=ep,
+        interleave=interleave,
     )
-    return seg, meta, visit
+    remote = jnp.where(d_grid != me, cnt, 0)  # [g_local (v), ep (d)]
+    me_row = jnp.arange(ep, dtype=jnp.int32)[:, None] == me
+    my_visit = jnp.sum(jnp.where(me_row, visit, 0), axis=0).astype(jnp.int32)
+    # Rows landing here at each of my visit positions.
+    rows_at_v = jnp.sum(
+        jnp.where(me_row[:, :, None] & hit_v, recv[None, None, :], 0), axis=(0, 2)
+    )
+    # Every count is one row of a single [8, g_local] reduction: a sum that
+    # ends in a vector, rather than a stack of reductions to scalars.
+    v = jnp.arange(g_local, dtype=jnp.int32)
+    pre, odd = v < n_pre, (v & 1) == 1
+    remote_v = remote.sum(axis=1)
+    zero = jnp.zeros_like(rows_at_v)
+    counts = jnp.stack(
+        [
+            jnp.where(pre & ~odd, rows_at_v, 0),
+            jnp.where(pre & odd, rows_at_v, 0),
+            jnp.where(pre & ~odd, remote_v, 0),
+            jnp.where(pre & odd, remote_v, 0),
+            jnp.where(v >= n_pre, remote_v, 0),
+            cnt.sum(axis=1),
+            zero,
+            zero,
+        ]
+    ).sum(axis=1, dtype=jnp.int32)
+    counts_sc = jnp.concatenate([counts[:4], jnp.zeros((4,), jnp.int32)])
+    # meta as push_dispatch_segments lays it out (see there).
+    meta = jnp.concatenate([jnp.zeros((g_local + 1,), jnp.int32), recv, counts[4:6]])
+    return seg, meta, visit, my_visit, counts_sc
 
 
 def _rank_within_window(expert_blocks, window):

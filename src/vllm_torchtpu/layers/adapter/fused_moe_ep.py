@@ -219,6 +219,7 @@ def _build_op(
             exchange_row_gather=envs.MOE_FUSED_EP_PUSH_EXCHANGE_ROW_GATHER,
             bf16_sort_counts=envs.MOE_FUSED_EP_PUSH_BF16_SORT_COUNTS,
             slim_prepush_barrier=envs.MOE_FUSED_EP_PUSH_SLIM_PREPUSH_BARRIER,
+            fused_dispatch_meta=envs.MOE_FUSED_EP_PUSH_FUSED_DISPATCH_META,
         )
 
     preprocess_topology = prepare_moe_preprocessing(mesh)

@@ -457,6 +457,7 @@ FRONT_SWITCHES = (
     "exchange_row_gather",
     "bf16_sort_counts",
     "slim_prepush_barrier",
+    "fused_dispatch_meta",
 )
 
 
