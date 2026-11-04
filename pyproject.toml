@@ -70,6 +70,9 @@ dependencies = [
     # bloat this JAX pin regresses on (validated on Qwen3.5-397B DP=8 EP).
     "jax==0.11.2",
     "jaxlib==0.11.2",
+    # The routing MoE kernel (USE_ROUTING_MOE, layers/adapter/routing_moe.py) is
+    # tokamax's; imported only on that path.
+    "tokamax==0.0.18.dev20261103",
     # tpu-sync-torch requires libtpu>=0.0.47. The workarounds in
     # src/vllm_torchtpu/env_override.py (SC-offload threshold gate) and the
     # per-config LIBTPU_INIT_ARGS additions under

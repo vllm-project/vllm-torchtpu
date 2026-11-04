@@ -28,6 +28,7 @@ from vllm_torchtpu.kernels.experimental.adaptive_fused_moe.vllm_adapter import (
 from vllm_torchtpu.layers.adapter import expert_placement
 from vllm_torchtpu.layers.adapter.fused_moe_ep import fused_moe_ep_supported
 from vllm_torchtpu.layers.adapter.moe_tp_decode import moe_tp_decode_supported
+from vllm_torchtpu.layers.adapter.routing_moe import routing_moe_supported
 
 # Taken once at import, outside any trace: the MoE forward is traced by
 # torch.compile, and reading the upstream property from inside the trace does
@@ -125,17 +126,19 @@ class VllmMoERunner(MoERunner):
             self.moe_config, "skip_final_all_reduce", False
         ):
             return True
-        if not envs.USE_MOE_FUSED_EP_KERNEL or getattr(
+        if not (envs.USE_MOE_FUSED_EP_KERNEL or envs.USE_ROUTING_MOE) or getattr(
             self.moe_config, "skip_final_all_reduce", False
         ):
             return _upstream_fused_output_is_reduced(self)
         # Asked of this layer's quant method, because arming is per layer: a
         # model whose layers do not all qualify must not have one armed layer
-        # answer for the rest.
+        # answer for the rest. routing_moe, too, returns this rank's tokens
+        # combined over all experts.
         owner = self._quant_method
         return (
             fused_moe_ep_supported(owner)
             or adaptive_fused_moe_supported(owner)
+            or routing_moe_supported(owner)
             or _upstream_fused_output_is_reduced(self)
         )
 

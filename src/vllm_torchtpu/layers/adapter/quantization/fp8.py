@@ -821,7 +821,8 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
           overlap the compute;
         - fp8 all-gather quantizes the activations before the gather, which
           is only ours to do if we are the one issuing it;
-        - the fused EP kernel does the exchange inside its own program.
+        - the fused EP kernel, or the routing MoE kernel, does the exchange
+          inside its own program.
 
         The fused half asks `fused_moe_ep_supported` about this method, not
         `envs.USE_MOE_FUSED_EP_KERNEL`: the env var only says the operator
@@ -832,11 +833,13 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
         a weight or routing layout the kernel cannot serve.
         """
         from vllm_torchtpu.layers.adapter.fused_moe_ep import fused_moe_ep_supported
+        from vllm_torchtpu.layers.adapter.routing_moe import routing_moe_supported
 
         return (
             enable_pipelined_collective_and_compute()
             or fused_moe_ep_supported(self)
             or adaptive_moe.adaptive_fused_moe_supported(self)
+            or routing_moe_supported(self)
             or envs.TPU_MOE_FP8_ALL_GATHER
         )
 
@@ -1112,6 +1115,21 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
             # 'score_bias'`. Passing the operand at the call site is not
             # sufficient on its own; it has to exist.
             register_score_bias_buffer(layer)
+        from vllm_torchtpu.layers.adapter.routing_moe import (
+            ROUTING_MOE_OP_ATTR,
+            prebuild_routing_moe,
+        )
+
+        setattr(
+            self,
+            ROUTING_MOE_OP_ATTR,
+            prebuild_routing_moe(
+                layer,
+                topk=layer.moe_config.experts_per_token,
+                renormalize=layer.renormalize,
+                activation=activation_str,
+            ),
+        )
 
     def apply_monolithic(
         self,
@@ -1168,6 +1186,23 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
                 layer.w2_weight_scale_inv,
                 router_logits,
                 score_bias_operand(layer),
+            )
+        from vllm_torchtpu.layers.adapter.routing_moe import (
+            routing_moe,
+            routing_moe_supported,
+        )
+
+        if routing_moe_supported(self):
+            # Like the fused EP kernel: this rank's tokens in, this rank's
+            # tokens out, routing included.
+            return routing_moe(
+                self,
+                x,
+                layer.w13_weight,
+                layer.w2_weight,
+                layer.w13_weight_scale_inv,
+                layer.w2_weight_scale_inv,
+                router_logits,
             )
         from vllm_torchtpu.layers.adapter.moe_tp_decode import (
             moe_tp_decode_forward,
