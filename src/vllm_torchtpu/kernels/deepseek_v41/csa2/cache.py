@@ -376,6 +376,84 @@ def prepare_swa_metadata(
     Bounds are passed to csa2 ONLY for noncausal calls; causal visibility stays
     query-dependent. Padding records are -1. Empty requests have empty bounds.
     """
+    return _swa_metadata(
+        block_table,
+        starts,
+        positions,
+        minimum_visible,
+        page_size=page_size,
+        page_stride=page_stride,
+        row_offset=row_offset,
+        non_causal=non_causal,
+        onehot_requests=onehot_requests,
+    )[:3]
+
+
+@functools.partial(
+    jax.jit,
+    static_argnames=("page_size", "page_stride", "non_causal", "onehot_requests"),
+)
+def prepare_swa_metadata_base(
+    block_table: jax.Array,
+    starts: jax.Array,
+    positions: jax.Array,
+    minimum_visible: jax.Array,
+    *,
+    page_size: int,
+    page_stride: int,
+    non_causal: bool = False,
+    onehot_requests: bool = False,
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
+    """``prepare_swa_metadata`` at row offset 0, plus the INT32 page visibility
+    [B, C] and token validity [T] that ``offset_swa_metadata`` needs.
+
+    Layers sharing a block table differ only in their row offset, so one call
+    serves every layer of a stage.
+    """
+    return _swa_metadata(
+        block_table,
+        starts,
+        positions,
+        minimum_visible,
+        page_size=page_size,
+        page_stride=page_stride,
+        row_offset=0,
+        non_causal=non_causal,
+        onehot_requests=onehot_requests,
+    )
+
+
+@functools.partial(jax.jit, static_argnames=("page_size", "row_offset"))
+def offset_swa_metadata(
+    metadata: jax.Array,
+    visible: jax.Array,
+    records: jax.Array,
+    valid: jax.Array,
+    *,
+    page_size: int,
+    row_offset: int,
+) -> tuple[jax.Array, jax.Array]:
+    """Shift ``prepare_swa_metadata_base`` outputs to ``row_offset``: equal to
+    ``prepare_swa_metadata(..., row_offset=row_offset)``'s metadata and records."""
+    if row_offset % page_size:
+        raise ValueError("CSA2 requires whole-page SWA row offsets")
+    pages = jnp.where(visible != 0, metadata[:, 2:] + row_offset // page_size, 0)
+    shifted = jnp.where(valid != 0, records + row_offset, -1)
+    return jnp.concatenate((metadata[:, :2], pages), axis=1), shifted
+
+
+def _swa_metadata(
+    block_table,
+    starts,
+    positions,
+    minimum_visible,
+    *,
+    page_size,
+    page_stride,
+    row_offset,
+    non_causal,
+    onehot_requests,
+):
     tokens = positions.shape[0]
     requests = block_table.shape[0]
     if (
@@ -422,8 +500,15 @@ def prepare_swa_metadata(
         req, jnp.minimum(positions // page_size, block_table.shape[1] - 1)
     ]
     records = row_offset + current_blocks * page_stride + positions % page_size
-    records = jnp.where(jnp.arange(tokens) < starts[-1], records, -1)
-    return metadata, jnp.stack((left, right), axis=1), records.astype(jnp.int32)
+    valid = jnp.arange(tokens) < starts[-1]
+    records = jnp.where(valid, records, -1)
+    return (
+        metadata,
+        jnp.stack((left, right), axis=1),
+        records.astype(jnp.int32),
+        visible.astype(jnp.int32),
+        valid.astype(jnp.int32),
+    )
 
 
 @functools.partial(jax.jit, static_argnames=("page_size", "onehot_requests"))

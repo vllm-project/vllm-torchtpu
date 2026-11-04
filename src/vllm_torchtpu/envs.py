@@ -14,6 +14,7 @@ if TYPE_CHECKING:
     TPU_DEEPSEEK_V41_CSA2_EARLY_GATHER: bool = False
     TPU_DEEPSEEK_V41_INDEXER_TAIL_OUTSIDE_COND: bool = False
     TPU_DEEPSEEK_V41_MHC_RESIDENT_GATES: bool = False
+    TPU_DEEPSEEK_V41_CSA2_SWA_PLAN: bool = False
     TPU_K3_SP_PREFILL: bool = False
     TPU_INCREMENTAL_BLOCK_TABLE_UPLOAD: bool = True
     TPU_ONEHOT_TABLE_LOOKUP: bool = False
@@ -415,6 +416,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # outputs are unchanged.
     "TPU_DEEPSEEK_V41_MHC_RESIDENT_GATES": env_bool(
         "TPU_DEEPSEEK_V41_MHC_RESIDENT_GATES", default=False
+    ),
+    # CSA2 layers: build the SWA metadata and write plan once per stage at row
+    # offset 0 and shift them per layer, instead of re-deriving them in every
+    # layer (csa2/cache.py, mla/paged_swa.py). Cache contents are unchanged.
+    "TPU_DEEPSEEK_V41_CSA2_SWA_PLAN": env_bool(
+        "TPU_DEEPSEEK_V41_CSA2_SWA_PLAN", default=False
     ),
     # Opt in to K3 TP32/EP32 sequence-parallel prefill.
     "TPU_K3_SP_PREFILL": env_bool("TPU_K3_SP_PREFILL", default=False),

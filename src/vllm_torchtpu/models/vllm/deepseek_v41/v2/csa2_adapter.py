@@ -12,8 +12,10 @@ import torch
 from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.deepseek_v4.o_projection import wo_a_projection
 from vllm_torchtpu.kernels.deepseek_v41.csa2.cache import (
+    offset_swa_metadata,
     prepare_main_records,
     prepare_swa_metadata,
+    prepare_swa_metadata_base,
     publish_csa2_kv,
 )
 from vllm_torchtpu.kernels.deepseek_v41.csa2.csa2 import csa2
@@ -21,7 +23,12 @@ from vllm_torchtpu.kernels.deepseek_v41.csa2.pipeline import (
     csa2_gather_chunk_size,
     csa2_pipeline,
 )
-from vllm_torchtpu.kernels.mla.paged_swa import write_swa_pages
+from vllm_torchtpu.kernels.mla.paged_swa import (
+    plan_swa_writes,
+    swa_write_block_rows,
+    write_swa_pages,
+    write_swa_pages_planned,
+)
 
 if TYPE_CHECKING:
     from .cache import PagedCacheRows
@@ -209,6 +216,91 @@ def _fake_metadata(table, starts, positions, minimum, page_size, *_):
     )
 
 
+def _metadata_base(
+    table: jax.Array,
+    starts: jax.Array,
+    positions: jax.Array,
+    minimum: jax.Array,
+    page_size: int,
+    page_stride: int,
+    non_causal: bool,
+) -> tuple[jax.Array, ...]:
+    """Stage-shared SWA metadata at row offset 0 and its write plan."""
+    metadata, bounds, records, visible, valid = prepare_swa_metadata_base(
+        table,
+        starts,
+        positions,
+        minimum,
+        page_size=page_size,
+        page_stride=page_stride,
+        non_causal=non_causal,
+        onehot_requests=envs.TPU_ONEHOT_TABLE_LOOKUP,
+    )
+    plan = plan_swa_writes(records, valid != 0, block_rows=swa_write_block_rows())
+    return metadata, bounds, records, visible, valid, *plan
+
+
+def _fake_metadata_base(table, starts, positions, minimum, page_size, *_):
+    metadata, bounds, records = _fake_metadata(
+        table, starts, positions, minimum, page_size
+    )
+    rows = positions.shape[0]
+    padded = rows + -rows % swa_write_block_rows()
+    return (
+        metadata,
+        bounds,
+        records,
+        metadata.new_empty((metadata.shape[0], metadata.shape[1] - 2)),
+        records.new_empty(records.shape),
+        records.new_empty(records.shape),
+        records.new_empty(records.shape),
+        records.new_empty(records.shape),
+        records.new_empty((padded, 512)),
+    )
+
+
+def _metadata_offset(
+    metadata: jax.Array,
+    visible: jax.Array,
+    records: jax.Array,
+    valid: jax.Array,
+    page_size: int,
+    row_offset: int,
+) -> tuple[jax.Array, jax.Array]:
+    return offset_swa_metadata(
+        metadata, visible, records, valid, page_size=page_size, row_offset=row_offset
+    )
+
+
+def _publish_swa_planned(
+    raw: jax.Array,
+    order: jax.Array,
+    ids: jax.Array,
+    flags: jax.Array,
+    masks: jax.Array,
+    values: jax.Array,
+    row_offset: int,
+) -> jax.Array:
+    return write_swa_pages_planned(
+        raw, (order, ids, flags, masks), values, row_offset=row_offset
+    )
+
+
+def _publish_swa_planned_banked(
+    raw: jax.Array,
+    high: jax.Array,
+    order: jax.Array,
+    ids: jax.Array,
+    flags: jax.Array,
+    masks: jax.Array,
+    values: jax.Array,
+    row_offset: int,
+) -> tuple[jax.Array, jax.Array]:
+    return write_swa_pages_planned(
+        (raw, high), (order, ids, flags, masks), values, row_offset=row_offset
+    )
+
+
 def _project(output: jax.Array, weight: jax.Array, scales: jax.Array) -> jax.Array:
     return wo_a_projection(output, weight, scales.reshape(-1), None)
 
@@ -245,6 +337,30 @@ def initialize_csa2_ops() -> None:
     mesh = get_vllm_model_wrapper_context().mesh
     definitions = (
         ("metadata", _metadata, (P(),) * 4 + (None,) * 4, _fake_metadata),
+        (
+            "metadata_base",
+            _metadata_base,
+            (P(),) * 4 + (None,) * 3,
+            _fake_metadata_base,
+        ),
+        (
+            "metadata_offset",
+            _metadata_offset,
+            (P(),) * 4 + (None,) * 2,
+            lambda m, v, r, *_: (torch.empty_like(m), torch.empty_like(r)),
+        ),
+        (
+            "publish_swa_planned",
+            _publish_swa_planned,
+            (P(),) * 6 + (None,),
+            lambda r, *_: torch.empty_like(r),
+        ),
+        (
+            "publish_swa_planned_banked",
+            _publish_swa_planned_banked,
+            (P(),) * 7 + (None,),
+            lambda r, h, *_: (torch.empty_like(r), torch.empty_like(h)),
+        ),
         (
             "publish_main",
             _publish_main,
@@ -290,6 +406,9 @@ def initialize_csa2_ops() -> None:
     )
     output_counts = {
         "metadata": 3,
+        "metadata_base": 9,
+        "metadata_offset": 2,
+        "publish_swa_planned_banked": 2,
         "publish_main": 2,
         "publish_main_banked": 4,
         "publish_swa_banked": 2,
@@ -300,6 +419,8 @@ def initialize_csa2_ops() -> None:
         "publish_main_banked": (0, 1, 2, 3),
         "publish_swa": (0,),
         "publish_swa_banked": (0, 1),
+        "publish_swa_planned": (0,),
+        "publish_swa_planned_banked": (0, 1),
     }
     for name, function, specs, fake in definitions:
         count = output_counts.get(name, 1)
@@ -352,6 +473,22 @@ def publish_swa(
     else:
         low, high = _ops["publish_swa_banked"](
             cache.raw, cache.raw_hi, records.int(), values
+        )
+        cache.raw.copy_(low)
+        cache.raw_hi.copy_(high)
+
+
+def publish_swa_planned(
+    cache: "PagedCacheRows", plan: tuple[torch.Tensor, ...], values: torch.Tensor
+) -> None:
+    """``publish_swa`` from a stage-shared ``prepare_swa_base`` write plan."""
+    if cache.raw_hi is None:
+        cache.raw.copy_(
+            _ops["publish_swa_planned"](cache.raw, *plan, values, cache.row_offset)
+        )
+    else:
+        low, high = _ops["publish_swa_planned_banked"](
+            cache.raw, cache.raw_hi, *plan, values, cache.row_offset
         )
         cache.raw.copy_(low)
         cache.raw_hi.copy_(high)
@@ -468,4 +605,35 @@ def prepare_swa(
         cache.page_stride,
         cache.row_offset,
         non_causal,
+    )
+
+
+def prepare_swa_base(
+    table: torch.Tensor,
+    starts: torch.Tensor,
+    positions: torch.Tensor,
+    minimum: torch.Tensor,
+    cache: "PagedCacheRows",
+    non_causal: bool,
+) -> tuple[torch.Tensor, ...]:
+    """``prepare_swa`` at row offset 0 for every layer sharing ``table``:
+    (metadata, bounds, records, visible, valid, *write plan)."""
+    return _ops["metadata_base"](
+        table.int(),
+        starts.int(),
+        positions.int(),
+        minimum.int(),
+        cache.shape[1],
+        cache.page_stride,
+        non_causal,
+    )
+
+
+def offset_swa(
+    base: tuple[torch.Tensor, ...], cache: "PagedCacheRows"
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """This layer's (metadata, records) from ``prepare_swa_base`` outputs."""
+    metadata, _, records, visible, valid = base[:5]
+    return _ops["metadata_offset"](
+        metadata, visible, records, valid, cache.shape[1], cache.row_offset
     )

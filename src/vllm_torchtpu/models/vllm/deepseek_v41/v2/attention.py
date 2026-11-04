@@ -21,6 +21,7 @@ from vllm.models.deepseek_v41 import attention as upstream
 from vllm.models.deepseek_v41 import compressor as compressor_upstream
 from vllm.v1.attention.backends.mla.sparse_swa import DeepseekV4SWACache
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.layers.adapter.linear_common import (
     KEEP_VLLM_LAYOUT_ATTR,
     WEIGHT_FLIPPED_ATTR,
@@ -1086,7 +1087,7 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
             if non_causal
             else self.window_size
         )
-        csa2_metadata = csa2_bounds = csa2_write_records = None
+        csa2_metadata = csa2_bounds = csa2_write_records = csa2_swa_base = None
         if self._csa2:
             if not isinstance(swa_cache, PagedCacheRows):
                 raise ValueError("CSA2 requires a native shared word-row cache")
@@ -1098,16 +1099,39 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
             elif (window_starts := _window_starts()) is not None:
                 minimum = window_starts
             minimum = minimum[: swa_table.shape[0]]
+            # With a shared plan, layers differ only in their row offset, which
+            # is applied per layer below; otherwise every offset is its own key.
+            shared_plan = envs.TPU_DEEPSEEK_V41_CSA2_SWA_PLAN
             meta_key = (
                 "csa2_swa",
                 rows_per_page,
                 swa_cache.page_stride,
-                swa_cache.row_offset,
+                None if shared_plan else swa_cache.row_offset,
                 non_causal,
                 self._ced_decoder,
             )
             cached = stage_cache.get(meta_key) if stage_cache is not None else None
-            if cached is None or cached[0] is not swa.block_tables:
+            if shared_plan:
+                if cached is None or cached[0] is not swa.block_tables:
+                    cached = (
+                        swa.block_tables,
+                        csa2_adapter.prepare_swa_base(
+                            swa_table,
+                            swa.query_start_loc,
+                            positions,
+                            minimum,
+                            swa_cache,
+                            non_causal,
+                        ),
+                    )
+                    if stage_cache is not None:
+                        stage_cache[meta_key] = cached
+                csa2_swa_base = cached[1]
+                csa2_bounds = csa2_swa_base[1]
+                csa2_metadata, csa2_write_records = csa2_adapter.offset_swa(
+                    csa2_swa_base, swa_cache
+                )
+            elif cached is None or cached[0] is not swa.block_tables:
                 csa2_metadata, csa2_bounds, csa2_write_records = (
                     csa2_adapter.prepare_swa(
                         swa_table,
@@ -1407,7 +1431,14 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
             kv = self._rotate(kv, positions)
         if self._csa2:
             assert csa2_write_records is not None
-            csa2_adapter.publish_swa(swa_cache, csa2_write_records, kv.reshape(-1, 512))
+            if csa2_swa_base is not None:
+                csa2_adapter.publish_swa_planned(
+                    swa_cache, csa2_swa_base[5:], kv.reshape(-1, 512)
+                )
+            else:
+                csa2_adapter.publish_swa(
+                    swa_cache, csa2_write_records, kv.reshape(-1, 512)
+                )
         else:
             _insert(swa_cache, swa_slots, kv, swa_valid)
         weights = None
