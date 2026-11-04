@@ -47,7 +47,7 @@ def check_qsl_uniform(qsl: Any, num_reqs: int) -> BatchShape:
     for i in range(1, num_reqs):
         if int(vals[i + 1]) - int(vals[i]) != q0:
             return BatchShape(False, num_reqs, 0, "stock_mixed")
-    if q0 in (1, 4):
+    if q0 >= 1:
         return BatchShape(True, num_reqs, q0, "ok")
     return BatchShape(False, num_reqs, 0, f"stock_q{q0}")
 

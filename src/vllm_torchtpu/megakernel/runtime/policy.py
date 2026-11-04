@@ -276,11 +276,12 @@ def select_bucket(num_tokens: int, buckets: Sequence[int] = DEFAULT_BUCKETS) -> 
 
 @dataclass(frozen=True)
 class BucketPolicy:
-    """Resolved `T=1` decode and `T=4` verify buckets and output-padding rules."""
+    """Resolved `T=1` decode and multi-token verify buckets and output padding."""
 
     buckets: tuple[int, ...] = DEFAULT_BUCKETS
     verify_buckets: tuple[int, ...] = DEFAULT_VERIFY_BUCKETS
     token_paddings: tuple[int, ...] = ()
+    verify_tokens: tuple[int, ...] = (MTP_VERIFY_TOKENS,)
 
     @property
     def max_bucket(self) -> int:
@@ -301,31 +302,33 @@ class BucketPolicy:
         buckets_explicit: bool | None = None,
         verify_buckets_explicit: bool | None = None,
         token_paddings: Sequence[int] = (),
+        verify_tokens: Sequence[int] = (MTP_VERIFY_TOKENS,),
     ) -> BucketPolicy:
         """Resolve `(buckets, verify_buckets)` from explicit args or `profile`."""
         def_b = DEFAULT_BUCKETS if profile.buckets is None else profile.buckets
         p_ver = profile.verify_buckets
         def_v = DEFAULT_VERIFY_BUCKETS if p_ver is None else p_ver
         eff_b = def_b if buckets is None else buckets
-        eff_v = def_v if verify_buckets is None else verify_buckets
+        eff_v = map(int, def_v if verify_buckets is None else verify_buckets)
         b_sorted = tuple(sorted(int(x) for x in eff_b))
-        v_sorted = tuple(sorted(int(x) for x in eff_v))
+        vt = tuple(int(t) for t in verify_tokens)
+        v_sorted = tuple(sorted(x for x in eff_v if not any(x % t for t in vt)))
         if speculative_tokens is not None:
             b_ok = buckets is not None
             v_ok = verify_buckets is not None
             b_exp = b_ok if buckets_explicit is None else buckets_explicit
             v_exp = v_ok if verify_buckets_explicit is None else verify_buckets_explicit
-            if speculative_tokens == MTP_SPECULATIVE_TOKENS and not b_exp:
+            if speculative_tokens + 1 in vt and not b_exp:
                 b_sorted = ()
-            elif speculative_tokens != MTP_SPECULATIVE_TOKENS and not v_exp:
+            elif speculative_tokens + 1 not in vt and not v_exp:
                 v_sorted = ()
-        return cls(b_sorted, v_sorted, tuple(int(x) for x in token_paddings))
+        return cls(b_sorted, v_sorted, tuple(int(x) for x in token_paddings), vt)
 
     def select(
         self, active_rows: int, tokens_per_seq: int = 1, *, clamp: bool = False
     ) -> int:
         """Select the smallest bucket for `(tokens_per_seq, active_rows)`."""
-        is_v = tokens_per_seq == MTP_VERIFY_TOKENS
+        is_v = tokens_per_seq in self.verify_tokens
         b_list = self.verify_buckets if is_v else self.buckets
         max_b = self.max_verify_bucket if is_v else self.max_bucket
         target = max(tokens_per_seq, min(active_rows, max_b)) if clamp else active_rows
@@ -340,8 +343,7 @@ class BucketPolicy:
         """Yield `(tokens_per_seq, bucket_t)` across decode and verify buckets."""
         for b in self.buckets:
             yield (1, b)
-        for b in self.verify_buckets:
-            yield (MTP_VERIFY_TOKENS, b)
+        yield from ((t, b) for t in self.verify_tokens for b in self.verify_buckets)
 
 
 def align_cache_exec(
