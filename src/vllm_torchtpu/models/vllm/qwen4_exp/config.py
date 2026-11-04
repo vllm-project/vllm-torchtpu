@@ -200,6 +200,27 @@ def native_cache_capacity(cfg, specs=None):
     return pages
 
 
+def pp_logical_block_factor(cfg) -> int:
+    """Scheduler block IDs per physical pool page on each pipeline stage.
+
+    Greater than 1 only for a pipeline engine with the unified pool, static
+    pool sizing and prefix caching, where a stage writes only its own groups'
+    pages of the shared block-ID space (stage_pages.py).
+    """
+    factor = int(envs.QWEN4_EXP_PP_LOGICAL_BLOCKS_FACTOR)
+    if factor < 1:
+        raise ValueError("QWEN4_EXP_PP_LOGICAL_BLOCKS_FACTOR must be at least 1")
+    if (
+        factor == 1
+        or int(getattr(cfg.parallel_config, "pipeline_parallel_size", 1) or 1) <= 1
+        or not use_unified_pool()
+        or not cfg.cache_config.enable_prefix_caching
+        or hbm_pool_sizing(cfg)
+    ):
+        return 1
+    return factor
+
+
 # Default reserve beside the pool (and its graph-time copies) for
 # activations and the program regions of every compiled bucket. The
 # 8192-token profiling forward needs ~1.3 GiB of non-pool temporaries; with
@@ -363,7 +384,9 @@ class TPUQwen4ExpConfig(VerifyAndUpdateConfig):
                 # Workers report the pool budget after profiling
                 # (Qwen4ExpPooledCache.memory_budget); vLLM plans the blocks.
                 return
-            pages = native_cache_capacity(vllm_config, specs)
+            pages = native_cache_capacity(vllm_config, specs) * pp_logical_block_factor(
+                vllm_config
+            )
         else:
             pages = native_cache_capacity(vllm_config)
         if vllm_config.cache_config.num_gpu_blocks_override not in (None, pages):

@@ -77,6 +77,7 @@ if TYPE_CHECKING:
     TPU_QWEN4_HC_DECODE_FUSED: bool = False
     QWEN4_EXP_PREFILL_SP: bool = False
     QWEN4_EXP_PD_STAGING_BYTES: int = 8 << 30
+    QWEN4_EXP_PP_LOGICAL_BLOCKS_FACTOR: int = 1
     QWEN4_EXP_PREFILL_SP_MIN_TOKENS: int = 1024
     QWEN4_EXP_PREFILL_SP_MOE: bool = False
     QWEN4_EXP_PREFILL_SP_SHARED_LOCAL: bool = False
@@ -1071,6 +1072,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # (models/vllm/qwen4_exp/pd_staging.py). Bytes of that carrier per rank;
     # a load that does not fit recomputes on the decode.
     "QWEN4_EXP_PD_STAGING_BYTES": env_int("QWEN4_EXP_PD_STAGING_BYTES", 8 << 30),
+    # A Qwen4Exp pipeline engine with prefix caching gives the scheduler this
+    # many block IDs per physical pool page. Every stage shares the block-ID
+    # space but writes only its own groups' pages (2-4 of a block's 24), so
+    # each stage maps a block ID to a page of its pool only while one of its
+    # own groups holds it (models/vllm/qwen4_exp/stage_pages.py). 1 is off.
+    "QWEN4_EXP_PP_LOGICAL_BLOCKS_FACTOR": env_int(
+        "QWEN4_EXP_PP_LOGICAL_BLOCKS_FACTOR", 1
+    ),
     "QWEN4_EXP_PREFILL_SP_MIN_TOKENS": env_int(
         "QWEN4_EXP_PREFILL_SP_MIN_TOKENS", 1024
     ),
