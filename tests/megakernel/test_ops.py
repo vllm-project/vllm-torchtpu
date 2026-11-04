@@ -20,20 +20,17 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from vllm_torchtpu.megakernel.errors import MegakernelConfigError
 from vllm_torchtpu.megakernel.ops import (
     BF16,
     F32,
     bswitch,
     col_chunk,
-    gdn_gate_act,
     rms_zc,
     rmsnorm,
     rope_partial,
     round_bf16,
     round_up,
     silu_mul,
-    validate_gdn_gate,
 )
 
 
@@ -153,21 +150,3 @@ def test_col_chunk():
     for bad in (0, -128, 100, 192):
         with pytest.raises(ValueError, match="positive multiple of 128"):
             col_chunk(bad)
-
-
-def test_gdn_gate_act_and_validate_gdn_gate():
-    """Verify `validate_gdn_gate` and `gdn_gate_act` for valid and invalid gates."""
-    assert validate_gdn_gate("silu") == "silu"
-    assert validate_gdn_gate("sigmoid") == "sigmoid"
-    assert gdn_gate_act("silu") is jax.nn.silu
-    assert gdn_gate_act("sigmoid") is jax.nn.sigmoid
-
-    x = jnp.array([-1.0, 0.0, 2.0], dtype=F32)
-    np.testing.assert_allclose(gdn_gate_act("silu")(x), jax.nn.silu(x))
-    np.testing.assert_allclose(gdn_gate_act("sigmoid")(x), jax.nn.sigmoid(x))
-
-    for bad in ("relu", "", None, 123):
-        with pytest.raises(ValueError, match="'silu' or 'sigmoid'"):
-            validate_gdn_gate(bad)
-        with pytest.raises(MegakernelConfigError, match="'silu' or 'sigmoid'"):
-            gdn_gate_act(bad, err_cls=MegakernelConfigError)

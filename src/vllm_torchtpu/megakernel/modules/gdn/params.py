@@ -22,8 +22,9 @@ import jax.numpy as jnp
 
 from ...errors import MegakernelConfigError
 from ...exec_spec import ExecSpec, NumericsClass
-from ...ops import F32, round_up, validate_gdn_gate
+from ...ops import F32, round_up
 from ...pool.config import cache_exec
+from .gate import validate_gdn_gate
 
 
 @dataclass(frozen=True)

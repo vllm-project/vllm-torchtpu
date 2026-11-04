@@ -24,7 +24,8 @@ from jax import lax
 
 from ...errors import MegakernelConfigError
 from ...exec_spec import ExecSpec
-from ...ops import BF16, F32, FP8, gdn_gate_act, round_bf16, round_up, validate_gdn_gate
+from ...ops import BF16, F32, FP8, round_bf16, round_up
+from .gate import gdn_gate_act, validate_gdn_gate
 from .params import gdn_lin_in_layout
 
 

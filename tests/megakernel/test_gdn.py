@@ -35,9 +35,33 @@ from vllm_torchtpu.megakernel.dma import stream, vmem
 from vllm_torchtpu.megakernel.errors import MegakernelConfigError
 from vllm_torchtpu.megakernel.exec_spec import ExecSpec
 from vllm_torchtpu.megakernel.modules.gdn import GDNModule
+from vllm_torchtpu.megakernel.modules.gdn.gate import (
+    GDN_GATE_ACTS,
+    gdn_gate_act,
+    validate_gdn_gate,
+)
 from vllm_torchtpu.megakernel.modules.gdn.states import gdn_accept
 from vllm_torchtpu.megakernel.ops import BF16, F32, FP8, rmsnorm
 from vllm_torchtpu.megakernel.spec import LayerType, ModelSpec, SwitchSlot
+
+
+def test_gdn_gate_act_and_validate_gdn_gate():
+    """Verify `validate_gdn_gate` and `gdn_gate_act` for valid and invalid gates."""
+    assert set(GDN_GATE_ACTS) == {"silu", "sigmoid"}
+    assert validate_gdn_gate("silu") == "silu"
+    assert validate_gdn_gate("sigmoid") == "sigmoid"
+    assert gdn_gate_act("silu") is jax.nn.silu
+    assert gdn_gate_act("sigmoid") is jax.nn.sigmoid
+
+    x = jnp.array([-1.0, 0.0, 2.0], dtype=F32)
+    np.testing.assert_allclose(gdn_gate_act("silu")(x), jax.nn.silu(x))
+    np.testing.assert_allclose(gdn_gate_act("sigmoid")(x), jax.nn.sigmoid(x))
+
+    for bad in ("relu", "", None, 123):
+        with pytest.raises(ValueError, match="'silu' or 'sigmoid'"):
+            validate_gdn_gate(bad)
+        with pytest.raises(MegakernelConfigError, match="'silu' or 'sigmoid'"):
+            gdn_gate_act(bad, err_cls=MegakernelConfigError)
 
 
 def test_gdn_module_declarations_bind_and_options():

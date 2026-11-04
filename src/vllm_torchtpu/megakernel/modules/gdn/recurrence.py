@@ -22,7 +22,8 @@ import jax.numpy as jnp
 from jax import lax
 from jax.experimental import pallas as pl
 
-from ...ops import BF16, F32, I32, gdn_gate_act, round_bf16, round_up
+from ...ops import BF16, F32, I32, round_bf16, round_up
+from .gate import gdn_gate_act
 from .params import GDNParams
 from .states import rec_chunk
 

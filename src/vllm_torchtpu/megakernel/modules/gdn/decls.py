@@ -32,8 +32,8 @@ from ...decls import (
 )
 from ...errors import MegakernelConfigError
 from ...ops import BF16, F32, FP8
-from ...ops import GDN_GATE_ACTS as GDN_GATE_ACTS
-from ...ops import validate_gdn_gate as _validate_gdn_gate
+from .gate import GDN_GATE_ACTS as GDN_GATE_ACTS
+from .gate import validate_gdn_gate as _validate_gdn_gate
 from .params import gdn_lin_in_layout
 
 GDN_WEIGHT_NAMES: tuple[str, ...] = ("lin_in", "lin_out")

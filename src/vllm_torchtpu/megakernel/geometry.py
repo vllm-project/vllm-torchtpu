@@ -24,7 +24,8 @@ from .decls import REQUIRED, FrozenDict, _resolve_field_spec
 from .errors import MegakernelConfigError
 from .exec_spec import MAX_BATCH_ROWS, ExecSpec
 from .modules.gdn import GDNModule
-from .ops import col_chunk, validate_gdn_gate
+from .modules.gdn.gate import validate_gdn_gate
+from .ops import col_chunk
 from .pool.config import cache_exec, resolved_max_pages_per_seq
 from .spec import ModelSpec
 

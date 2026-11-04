@@ -81,7 +81,8 @@ from jax.experimental.pallas import tpu as pltpu
 
 from ..exec_spec import ExecSpec
 from ..fused_io_hook import FusedPoolIO, register_fused_io
-from ..ops import BF16, F32, FP8, I32, U32, bswitch, gdn_gate_act, round_bf16, round_up
+from ..modules.gdn.gate import gdn_gate_act
+from ..ops import BF16, F32, FP8, I32, U32, bswitch, round_bf16, round_up
 from ..pool.checks import safe_kv_page, safe_page_base
 from ..pool.config import POOL_STATE_NAME, cache_exec
 from ..pool.layout import LANES
