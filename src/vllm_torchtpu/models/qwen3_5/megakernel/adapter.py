@@ -1005,7 +1005,7 @@ class Qwen35Program:
             return None
 
         bs = fwd.batch_shape(attn_md, m0)
-        active_rows = bs.num_reqs * bs.tokens_per_seq
+        active_rows = bs.num_reqs * bs.tokens_per_req
         mrope_ok = True
         if bs.eligible and bs.num_reqs > 0 and positions is not None:
             if positions.ndim == 2:
@@ -1058,9 +1058,9 @@ class Qwen35Program:
             bs = fwd.batch_shape(attn_md, m_mds[0])
             # The batch shape reports any uniform step size; serve only the
             # decode / verify sizes this program compiles (else decode).
-            served = bs.tokens_per_seq in (1, mk_rt.MTP_VERIFY_TOKENS)
+            served = bs.tokens_per_req in (1, mk_rt.MTP_VERIFY_TOKENS)
             num_reqs = bs.num_reqs
-            tokens_per_seq = bs.tokens_per_seq if served else 1
+            tokens_per_seq = bs.tokens_per_req if served else 1
             active_rows = max(tokens_per_seq, num_reqs * tokens_per_seq)
             bkt = self.bucket_policy.select(active_rows, tokens_per_seq, clamp=True)
             step_fn = fwd.steps[(tokens_per_seq, bkt)]

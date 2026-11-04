@@ -45,7 +45,7 @@ from vllm_torchtpu.megakernel.runtime import (
     JaxStepMetaOps,
     MKABCalibrator,
     check_post_mesh_eligibility,
-    check_qsl_uniform,
+    check_query_start_loc_uniform,
     explicit_profile_settings,
     facts_from_pool_layout,
     ir_required_buckets,
@@ -2252,7 +2252,7 @@ def test_can_run_real_tpu_runner_metadata(monkeypatch: pytest.MonkeyPatch) -> No
     assert driver.can_run(ids_4, pos_4, runner=runner)
 
     # Exercise the fallback path with a non-CPU (`device="meta"`) 3-element
-    # `mamba_request_distribution` tensor and no runner `qsl`/distribution:
+    # `mamba_request_distribution` tensor and no runner `query_start_loc`/distribution:
     # must neither raise `Boolean value of Tensor...` nor sync, and fail closed.
     meta_dist_3 = torch.empty((3,), dtype=torch.int32, device="meta")
     mamba_mds[0].mamba_request_distribution = meta_dist_3
@@ -2918,8 +2918,8 @@ def _base_driver_inspect_step_detail_ref(
         if qsl_host is None:
             qsl_host = getattr(runner, "query_start_loc_cpu", None)
         if qsl_host is not None and num_reqs is not None:
-            bs = check_qsl_uniform(qsl_host, num_reqs)
-            if bs.eligible and not has_runner_roff and bs.tokens_per_seq != 1:
+            bs = check_query_start_loc_uniform(qsl_host, num_reqs)
+            if bs.eligible and not has_runner_roff and bs.tokens_per_req != 1:
                 return BatchShape(False, bs.num_reqs, 0, "stock_prefill")
             return bs
 
@@ -2966,7 +2966,7 @@ def _base_driver_inspect_step_detail_ref(
         ):
             qsl_md = qsl_dev
     if qsl_md is not None and num_reqs is not None:
-        return check_qsl_uniform(qsl_md, num_reqs)
+        return check_query_start_loc_uniform(qsl_md, num_reqs)
 
     return BatchShape(False, 0, 0, "stock_no_qsl")
 
@@ -3028,7 +3028,7 @@ def test_driver_inspect_step_detail_differential_and_unprepared_call(
                                 assert got == exp
 
     # Also verify direct `driver(...)` without prior `can_run()` when
-    # `_inspect_step_detail` returns an ineligible shape (`tokens_per_seq=0`)
+    # `_inspect_step_detail` returns an ineligible shape (`tokens_per_req=0`)
     # falls back to `tokens_per_seq = 1` instead of raising `KeyError: (0, ...)`.
     mesh = _cpu_mesh(1)
     g = _tiny_geom(L=4, att_every=4)

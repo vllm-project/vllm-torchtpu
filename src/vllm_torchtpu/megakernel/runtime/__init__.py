@@ -83,7 +83,7 @@ if TYPE_CHECKING:  # eager imports for type checkers and IDEs
         MKABCalibrator,
         StepMixTracker,
         check_mrope_uniform,
-        check_qsl_uniform,
+        check_query_start_loc_uniform,
         inspect_batch_shape,
     )
     from .step_meta import (
@@ -130,7 +130,7 @@ _LAZY: dict[str, str] = {
     "MKABCalibrator": ".stats",
     "StepMixTracker": ".stats",
     "check_mrope_uniform": ".stats",
-    "check_qsl_uniform": ".stats",
+    "check_query_start_loc_uniform": ".stats",
     "inspect_batch_shape": ".stats",
     "PoolScheduleInfo": ".checks",
     "SentinelVariantPlan": ".checks",
@@ -214,7 +214,7 @@ __all__ = [
     "check_compile_hlo_mesh",
     "check_mrope_uniform",
     "check_post_mesh_eligibility",
-    "check_qsl_uniform",
+    "check_query_start_loc_uniform",
     "check_startup_eligibility",
     "check_step_eligibility",
     "checks",

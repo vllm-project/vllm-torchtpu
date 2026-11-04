@@ -26,21 +26,29 @@ from vllm_torchtpu.megakernel.runtime.stats import (
     MKABCalibrator,
     StepMixTracker,
     check_mrope_uniform,
-    check_qsl_uniform,
+    check_query_start_loc_uniform,
     inspect_batch_shape,
 )
 
 
-def test_qsl_and_mrope_uniformity() -> None:
-    assert check_qsl_uniform([0, 1, 2, 3], 3) == BatchShape(True, 3, 1, "ok")
-    assert check_qsl_uniform([0, 4, 8], 2) == BatchShape(True, 2, 4, "ok")
-    assert check_qsl_uniform([0, 1, 5], 2) == BatchShape(False, 2, 0, "stock_mixed")
+def test_query_start_loc_and_mrope_uniformity() -> None:
+    assert check_query_start_loc_uniform([0, 1, 2, 3], 3) == BatchShape(
+        True, 3, 1, "ok"
+    )
+    assert check_query_start_loc_uniform([0, 4, 8], 2) == BatchShape(True, 2, 4, "ok")
+    assert check_query_start_loc_uniform([0, 1, 5], 2) == BatchShape(
+        False, 2, 0, "stock_mixed"
+    )
     # Any uniform positive step size is reported; the program decides what it
     # serves (Qwen3.5 serves T=1 and T=4, but the stats don't know that).
-    assert check_qsl_uniform([0, 8], 1) == BatchShape(True, 1, 8, "ok")
-    assert check_qsl_uniform([0, 2, 4, 6], 3) == BatchShape(True, 3, 2, "ok")
-    assert check_qsl_uniform([0], 2) == BatchShape(False, 0, 0, "stock_n0")
-    assert check_qsl_uniform([0, 0], 1) == BatchShape(False, 1, 0, "stock_q0")
+    assert check_query_start_loc_uniform([0, 8], 1) == BatchShape(True, 1, 8, "ok")
+    assert check_query_start_loc_uniform([0, 2, 4, 6], 3) == BatchShape(
+        True, 3, 2, "ok"
+    )
+    assert check_query_start_loc_uniform([0], 2) == BatchShape(False, 0, 0, "stock_n0")
+    assert check_query_start_loc_uniform([0, 0], 1) == BatchShape(
+        False, 1, 0, "stock_q0"
+    )
 
     mrope_ok = np.array([[1, 2], [1, 2], [1, 2]], dtype=np.int32)
     mrope_bad = np.array([[1, 2], [1, 3], [1, 2]], dtype=np.int32)
@@ -52,58 +60,60 @@ def test_inspect_batch_shape_runner_and_fallback_paths() -> None:
     # Runner path vs fallback path in inspect_batch_shape
     bs_runner = inspect_batch_shape(
         num_reqs=2,
-        has_roff=True,
+        has_slot_read_offsets=True,
         decode_and_total_reqs=(2, 2),
-        qsl=np.array([0, 4, 8], dtype=np.int32),
+        query_start_loc=np.array([0, 4, 8], dtype=np.int32),
     )
     assert bs_runner == BatchShape(True, 2, 4, "ok")
 
     # num_reqs=0 is not None -> fails closed with stock_n0 (no fallback_num_seqs)
     bs_n0 = inspect_batch_shape(
         num_reqs=0,
-        has_roff=False,
+        has_slot_read_offsets=False,
         decode_and_total_reqs=None,
-        qsl=np.array([0, 1, 2, 3], dtype=np.int32),
+        query_start_loc=np.array([0, 1, 2, 3], dtype=np.int32),
         fallback_decode_and_total_reqs=(3, 3),
         fallback_num_seqs=3,
-        fallback_qsl=np.array([0, 1, 2, 3], dtype=np.int32),
+        fallback_query_start_loc=np.array([0, 1, 2, 3], dtype=np.int32),
     )
     assert bs_n0 == BatchShape(False, 0, 0, "stock_n0")
 
-    # Fallback path when num_reqs is None and runner qsl/dist are None
+    # Fallback path when num_reqs is None and the runner has no query_start_loc
+    # or distribution
     bs_fb = inspect_batch_shape(
         num_reqs=None,
-        has_roff=False,
+        has_slot_read_offsets=False,
         decode_and_total_reqs=None,
-        qsl=None,
+        query_start_loc=None,
         fallback_decode_and_total_reqs=(3, 3),
         fallback_num_seqs=3,
-        fallback_qsl=np.array([0, 1, 2, 3], dtype=np.int32),
+        fallback_query_start_loc=np.array([0, 1, 2, 3], dtype=np.int32),
     )
     assert bs_fb == BatchShape(True, 3, 1, "ok")
 
-    # Missing both qsl and fallback_qsl fails closed with stock_no_qsl
+    # Missing both query_start_loc sources fails closed with stock_no_qsl
     bs_no_qsl = inspect_batch_shape(
         num_reqs=3,
-        has_roff=False,
+        has_slot_read_offsets=False,
         decode_and_total_reqs=(3, 3),
-        qsl=None,
+        query_start_loc=None,
     )
     assert bs_no_qsl == BatchShape(False, 0, 0, "stock_no_qsl")
 
-    # Primary qsl without roff rejects T=4 (stock_prefill); fallback_qsl allows T=4
+    # The runner's query_start_loc without slot read offsets rejects T=4
+    # (stock_prefill); the fallback query_start_loc allows T=4
     bs_no_roff_q4 = inspect_batch_shape(
         num_reqs=2,
-        has_roff=False,
-        qsl=np.array([0, 4, 8], dtype=np.int32),
+        has_slot_read_offsets=False,
+        query_start_loc=np.array([0, 4, 8], dtype=np.int32),
     )
     assert bs_no_roff_q4 == BatchShape(False, 2, 0, "stock_prefill")
     bs_fb_q4 = inspect_batch_shape(
         num_reqs=None,
-        has_roff=False,
-        qsl=None,
+        has_slot_read_offsets=False,
+        query_start_loc=None,
         fallback_num_seqs=2,
-        fallback_qsl=np.array([0, 4, 8], dtype=np.int32),
+        fallback_query_start_loc=np.array([0, 4, 8], dtype=np.int32),
     )
     assert bs_fb_q4 == BatchShape(True, 2, 4, "ok")
 
@@ -213,8 +223,8 @@ def _reference_batch_shape(
                 "stock_prefill" if num_windowed == 0 else "stock_mixed",
             )
     if qsl_host is not None and num_reqs is not None:
-        bs = check_qsl_uniform(qsl_host, num_reqs)
-        if bs.eligible and not has_roff and bs.tokens_per_seq != 1:
+        bs = check_query_start_loc_uniform(qsl_host, num_reqs)
+        if bs.eligible and not has_roff and bs.tokens_per_req != 1:
             return BatchShape(False, bs.num_reqs, 0, "stock_prefill")
         return bs
 
@@ -234,7 +244,7 @@ def _reference_batch_shape(
     if num_reqs is None and fb_nseq is not None:
         num_reqs = int(fb_nseq)
     if qsl_md is not None and num_reqs is not None:
-        return check_qsl_uniform(qsl_md, num_reqs)
+        return check_query_start_loc_uniform(qsl_md, num_reqs)
     return BatchShape(False, 0, 0, "stock_no_qsl")
 
 
@@ -260,12 +270,12 @@ def test_inspect_batch_shape_matches_the_reference_exhaustively() -> None:
                                 total_checked += 1
                                 got = inspect_batch_shape(
                                     num_reqs=nr,
-                                    has_roff=hr,
+                                    has_slot_read_offsets=hr,
                                     decode_and_total_reqs=cw,
-                                    qsl=qh,
+                                    query_start_loc=qh,
                                     fallback_decode_and_total_reqs=dt,
                                     fallback_num_seqs=fn,
-                                    fallback_qsl=qm,
+                                    fallback_query_start_loc=qm,
                                 )
                                 exp = _reference_batch_shape(nr, hr, cw, qh, dt, fn, qm)
                                 assert got == exp, (

@@ -27,33 +27,37 @@ import numpy as np
 
 @dataclass(frozen=True)
 class BatchShape:
-    """Framework-free description of the current forward step's batch shape."""
+    """Framework-free description of the current forward step's batch shape:
+    whether it is a uniform step, its request count, the tokens each request
+    carries this step (`tokens_per_req`) and the reason when it isn't."""
 
     eligible: bool
     num_reqs: int = 0
-    tokens_per_seq: int = 0
+    tokens_per_req: int = 0
     reason: str = "stock_early"
 
 
-def check_qsl_uniform(qsl: Any, num_reqs: int) -> BatchShape:
-    """Check whether `qsl[:num_reqs + 1]` has a uniform, positive step size.
+def check_query_start_loc_uniform(query_start_loc: Any, num_reqs: int) -> BatchShape:
+    """Check whether `query_start_loc[:num_reqs + 1]` (the requests' token
+    offsets) has a uniform, positive step size: every request carries the same
+    number of tokens this step.
 
     Any uniform step size is eligible here; whether a program serves it (for
     example, which `T` its buckets cover) is the program's decision.
     """
-    if num_reqs <= 0 or len(qsl) <= num_reqs:
+    if num_reqs <= 0 or len(query_start_loc) <= num_reqs:
         return BatchShape(False, 0, 0, "stock_n0")
-    s = qsl[: num_reqs + 1]
+    s = query_start_loc[: num_reqs + 1]
     vals = s.tolist() if hasattr(s, "tolist") else [int(x) for x in s]
     if int(vals[0]) != 0:
         return BatchShape(False, num_reqs, 0, "stock_mixed")
-    q0 = int(vals[1]) - int(vals[0])
+    tokens_per_req = int(vals[1]) - int(vals[0])
     for i in range(1, num_reqs):
-        if int(vals[i + 1]) - int(vals[i]) != q0:
+        if int(vals[i + 1]) - int(vals[i]) != tokens_per_req:
             return BatchShape(False, num_reqs, 0, "stock_mixed")
-    if q0 > 0:
-        return BatchShape(True, num_reqs, q0, "ok")
-    return BatchShape(False, num_reqs, 0, f"stock_q{q0}")
+    if tokens_per_req > 0:
+        return BatchShape(True, num_reqs, tokens_per_req, "ok")
+    return BatchShape(False, num_reqs, 0, f"stock_q{tokens_per_req}")
 
 
 def check_mrope_uniform(mrope_3xN: Any, active_rows: int) -> bool:
@@ -71,15 +75,21 @@ def check_mrope_uniform(mrope_3xN: Any, active_rows: int) -> bool:
 def inspect_batch_shape(
     *,
     num_reqs: int | None = None,
-    has_roff: bool = False,
+    has_slot_read_offsets: bool = False,
     decode_and_total_reqs: tuple[int, int] | None = None,
-    qsl: Any | None = None,
+    query_start_loc: Any | None = None,
     fallback_decode_and_total_reqs: tuple[int, int] | None = None,
     fallback_num_seqs: int | None = None,
-    fallback_qsl: Any | None = None,
+    fallback_query_start_loc: Any | None = None,
 ) -> BatchShape:
-    """Determine `(eligible, num_reqs, tokens_per_seq, reason)` from host metadata."""
-    if has_roff and decode_and_total_reqs is not None:
+    """Determine `(eligible, num_reqs, tokens_per_req, reason)` from host metadata.
+
+    `has_slot_read_offsets`: the runner has per-request recurrent-state slot
+    read offsets (MTP verify); without them a multi-token step is a prefill.
+    `query_start_loc` / `fallback_query_start_loc`: host copies of the
+    requests' token offsets, from the runner and from the attention metadata.
+    """
+    if has_slot_read_offsets and decode_and_total_reqs is not None:
         num_windowed, dist_reqs = map(int, decode_and_total_reqs)
         if num_reqs is None:
             num_reqs = dist_reqs
@@ -89,9 +99,9 @@ def inspect_batch_shape(
             reason = "stock_prefill" if num_windowed == 0 else "stock_mixed"
             return BatchShape(False, num_reqs, 0, reason)
 
-    if qsl is not None and num_reqs is not None:
-        bs = check_qsl_uniform(qsl, num_reqs)
-        if bs.eligible and not has_roff and bs.tokens_per_seq != 1:
+    if query_start_loc is not None and num_reqs is not None:
+        bs = check_query_start_loc_uniform(query_start_loc, num_reqs)
+        if bs.eligible and not has_slot_read_offsets and bs.tokens_per_req != 1:
             return BatchShape(False, bs.num_reqs, 0, "stock_prefill")
         return bs
 
@@ -107,8 +117,8 @@ def inspect_batch_shape(
 
     if num_reqs is None and fallback_num_seqs is not None:
         num_reqs = int(fallback_num_seqs)
-    if fallback_qsl is not None and num_reqs is not None:
-        return check_qsl_uniform(fallback_qsl, num_reqs)
+    if fallback_query_start_loc is not None and num_reqs is not None:
+        return check_query_start_loc_uniform(fallback_query_start_loc, num_reqs)
     return BatchShape(False, 0, 0, "stock_no_qsl")
 
 
@@ -263,6 +273,6 @@ __all__ = [
     "MKABCalibrator",
     "StepMixTracker",
     "check_mrope_uniform",
-    "check_qsl_uniform",
+    "check_query_start_loc_uniform",
     "inspect_batch_shape",
 ]

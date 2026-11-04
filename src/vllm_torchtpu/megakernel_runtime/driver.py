@@ -223,13 +223,13 @@ def _inspect_step_detail(
         if runner_decides:
             return _stats.inspect_batch_shape(
                 num_reqs=num_reqs,
-                has_roff=has_roff,
+                has_slot_read_offsets=has_roff,
                 decode_and_total_reqs=comb_wt,
-                qsl=qsl_host,
+                query_start_loc=qsl_host,
             )
 
     # Fallback for unit tests passing CPU metadata without a full runner instance.
-    # Never read device tensors on TPU; fail closed if host/CPU qsl is absent.
+    # Never read device tensors on TPU; fail closed if no host query_start_loc.
     dist_dt: tuple[int, int] | None = None
     dist: Any = getattr(m0, "mamba_request_distribution", None)
     if dist is None:
@@ -259,12 +259,12 @@ def _inspect_step_detail(
 
     return _stats.inspect_batch_shape(
         num_reqs=num_reqs,
-        has_roff=has_roff,
+        has_slot_read_offsets=has_roff,
         decode_and_total_reqs=comb_wt,
-        qsl=qsl_host,
+        query_start_loc=qsl_host,
         fallback_decode_and_total_reqs=dist_dt,
         fallback_num_seqs=fb_nseq,
-        fallback_qsl=qsl_md,
+        fallback_query_start_loc=qsl_md,
     )
 
 

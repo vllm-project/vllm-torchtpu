@@ -31,7 +31,7 @@ from .stats import (
     MKABCalibrator,
     StepMixTracker,
     check_mrope_uniform,
-    check_qsl_uniform,
+    check_query_start_loc_uniform,
     inspect_batch_shape,
 )
 
@@ -167,9 +167,9 @@ def check_step_eligibility(
             False,
             batch_shape.reason,
             batch_shape.num_reqs,
-            batch_shape.tokens_per_seq,
+            batch_shape.tokens_per_req,
         )
-    num_reqs, T = batch_shape.num_reqs, batch_shape.tokens_per_seq
+    num_reqs, T = batch_shape.num_reqs, batch_shape.tokens_per_req
     if T not in (1, MTP_VERIFY_TOKENS):
         return StepDecision(False, f"stock_q{T}", num_reqs, T)
     if not mrope_ok:
@@ -196,7 +196,7 @@ __all__ = [
     "StepMixTracker",
     "check_mrope_uniform",
     "check_post_mesh_eligibility",
-    "check_qsl_uniform",
+    "check_query_start_loc_uniform",
     "check_startup_eligibility",
     "check_step_eligibility",
     "inspect_batch_shape",
