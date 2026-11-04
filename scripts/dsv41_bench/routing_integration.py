@@ -21,7 +21,17 @@ ROOT = Path(__file__).resolve().parents[2]
 LAYER = ROOT / "src/vllm_torchtpu/kernels/experimental/push_fused_moe/layer.py"
 
 
-def extract(path, stride, out):
+def load_routing(path):
+    """Load a routing.py snapshot as its own module (baseline A/B side)."""
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("baseline_routing", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def extract(path, stride, out, routing=None, tag=None):
     source = path.read_text()
     compute = next(
         n
@@ -56,8 +66,10 @@ def extract(path, stride, out):
         + "\n    return (pos, mirror_pos, *kernel_tables, expert_rows, slab_base, "
         "counts, scale_slab, slab)\n"
     )
-    (out / (path.stem + "-extracted.py")).write_text(text)
+    (out / ((tag or path.stem) + "-extracted.py")).write_text(text)
     namespace = dict(vars(layer))
+    if routing is not None:
+        namespace["prepare_routing"] = routing.prepare_routing
     namespace.update(
         build_routing_tables_sharded=bench.push.build_routing_tables_sharded,
         RoutingTables=bench.host.RoutingTables,
@@ -77,6 +89,47 @@ def extract(path, stride, out):
     return namespace["call"], hashlib.sha256(source.encode()).hexdigest()
 
 
+def smem_consumer(fn):
+    """Feed the five kernel tables through scalar prefetch, as kfn does.
+
+    The push MoE kernel reads them from SMEM, which pins a row-major
+    operand layout; returning them straight from jit would not, and hides
+    any relayout the producer leaves behind. Values pass through unchanged.
+    """
+    from jax import lax
+    from jax.experimental import pallas as pl
+    from jax.experimental.pallas import tpu as pltpu
+
+    def consume(*tables):
+        n = len(tables)
+
+        def kernel(*refs):
+            for src, dst in zip(refs[:n], refs[n:], strict=True):
+                rows, cols = src.shape
+
+                def body(k, carry, src=src, dst=dst, cols=cols):
+                    dst[k // cols, k % cols] = src[k // cols, k % cols]
+                    return carry
+
+                lax.fori_loop(0, rows * cols, body, jnp.int32(0))
+
+        smem = pl.BlockSpec(memory_space=pltpu.MemorySpace.SMEM)
+        return pl.pallas_call(
+            kernel,
+            grid_spec=pltpu.PrefetchScalarGridSpec(
+                num_scalar_prefetch=n, in_specs=[], out_specs=[smem] * n, grid=()
+            ),
+            out_shape=[jax.ShapeDtypeStruct(t.shape, t.dtype) for t in tables],
+            name="routing_tables_smem_consumer",
+        )(*tables)
+
+    def call(*inputs):
+        outputs = fn(*inputs)
+        return (*outputs[:2], *consume(*outputs[2:7]), *outputs[7:])
+
+    return call
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--out", type=Path, required=True)
@@ -84,14 +137,44 @@ def main():
     parser.add_argument("--samples", type=int, default=200)
     parser.add_argument("--profile", action="store_true")
     parser.add_argument("--fallback", action="store_true")
+    parser.add_argument(
+        "--consumer",
+        action="store_true",
+        help="route the kernel tables through an SMEM scalar-prefetch consumer",
+    )
+    parser.add_argument(
+        "--baseline-routing",
+        type=Path,
+        help="routing.py snapshot for the baseline; the layer source is shared",
+    )
     args = parser.parse_args()
     args.out.mkdir(parents=True, exist_ok=True)
     if args.fallback:
         bench.STRIDE += 128
         bench.meta.STRIDE = bench.STRIDE
     funcs, hashes = {}, {}
-    for name, path in (("baseline", args.baseline_source), ("candidate", LAYER)):
-        funcs[name], hashes[name] = extract(path, bench.STRIDE, args.out)
+    baseline_routing = (
+        load_routing(args.baseline_routing) if args.baseline_routing else None
+    )
+    for name, path, routing in (
+        ("baseline", args.baseline_source, baseline_routing),
+        ("candidate", LAYER, None),
+    ):
+        funcs[name], hashes[name] = extract(
+            path, bench.STRIDE, args.out, routing=routing, tag=name
+        )
+    if args.baseline_routing:
+        hashes["baseline_routing"] = hashlib.sha256(
+            args.baseline_routing.read_bytes()
+        ).hexdigest()
+        hashes["candidate_routing"] = hashlib.sha256(
+            (
+                ROOT
+                / "src/vllm_torchtpu/kernels/experimental/push_fused_moe/routing.py"
+            ).read_bytes()
+        ).hexdigest()
+    if args.consumer:
+        funcs = {name: smem_consumer(fn) for name, fn in funcs.items()}
     # Same shape as the actual FP8 q_sorted/prepush slab; payload is supplied
     # at this cut. No collective or SC prepush body is part of the timing.
     # The cut carries ownership forward; donation avoids a synthetic 144MB copy.
@@ -114,6 +197,7 @@ def main():
                 p: importlib.metadata.version(p) for p in ("jax", "jaxlib", "libtpu")
             },
             "fallback": args.fallback,
+            "consumer": args.consumer,
             "stride": bench.STRIDE,
             "scope": (
                 "actual routing caller and scale scatter; supplied prepush slab; "

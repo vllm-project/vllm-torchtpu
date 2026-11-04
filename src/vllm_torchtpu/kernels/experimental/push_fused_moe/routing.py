@@ -122,7 +122,11 @@ def _position_metadata(true, aligned, starts, rows, rank, local, hist, *, shard_
     )
     pos = host._lookup_per_pair(pos_table, local, bins) + within
     mirror = host._lookup_per_pair(mirror_table, local, bins) + within
-    return pos, mirror, tables[2], *(tables[i] for i in (3, 4, 5, 8, 10, 13, 14, 15))
+    # The kernel reads its transport tables as [expert, destination] SMEM
+    # arrays; emitting that orientation here removes one XLA transpose copy
+    # per table after the call.
+    transport = tuple(tables[i].T for i in (3, 4, 5, 8, 10))
+    return pos, mirror, *transport, *(tables[i] for i in (13, 14, 15))
 
 
 def prepare_routing(
@@ -197,12 +201,12 @@ def prepare_routing(
     outputs = fuse_function(function, inputs, name="dsv41_routing_position_metadata")(
         *inputs
     )
-    pos, mirror, _, *tables = outputs
+    pos, mirror, *tables = outputs
     return RoutingInputs(
         pos.reshape(t_local, gathered.topk),
         mirror.reshape(t_local, gathered.topk),
         slab_row,
-        tuple(table.T for table in tables[:5]),
+        tuple(tables[:5]),
         tables[5].reshape(-1),
         tables[6].reshape(-1),
         tables[7],
