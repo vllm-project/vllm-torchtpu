@@ -91,12 +91,16 @@ _DENSE_EXPERT_THRESHOLD = envs.TPU_MOE_DENSE_EXPERT_THRESHOLD
 # routing tables) against ~90 us of SparseCore v2 plus convert; decode at the
 # 1024-token bucket keeps v2. A decode step of 2048 tokens takes it too.
 TC_COMBINE_MIN_TOKENS = envs.TPU_MOE_TC_COMBINE_MIN_TOKENS
+# From this EP token count, the dispatch moves rows quantized ahead
+# (dispatches_quantized_rows).
+DISPATCH_SPLIT_MIN_TOKENS = 4096
 # From this EP token count, the expert MLP reads the routed rows straight
 # from the tokens' rows (gmm_v2_fused_mlp's token_rows), past the first
-# DISPATCH_HEAD_ROWS that the SparseCore gathers ahead. Below it the full
-# SparseCore gather is short and the TensorCore has other work to hide it
-# behind.
-DISPATCH_SPLIT_MIN_TOKENS = 4096
+# DISPATCH_HEAD_ROWS that the SparseCore gathers ahead. 0 admits every
+# batch; a larger value has the SparseCore gather all rows of smaller ones
+# first (to compare the two paths). At most DISPATCH_SPLIT_MIN_TOKENS: only
+# this path reads quantized rows.
+TOKEN_ROWS_MIN_TOKENS = 0
 # Whole 2048-row ragged_gather_v2 blocks, and whole 16-row sublane blocks as
 # gmm_v2_fused_mlp's head must be, or 0 (the default): no SparseCore gather,
 # the MLP fetches every row. A head can only start once the dispatch
@@ -978,14 +982,15 @@ def fused_moe_func(
         return _piece_major(out, piece_rows) if piece_rows else out
 
     num_routes = num_tokens * topk
-    # Large batches (prefill chunks; the count is of tokens gathered across
-    # EP ranks): the fused MLP fetches the routed rows itself, past a head of
-    # DISPATCH_HEAD_ROWS the SparseCore gathers first if that is not 0.
+    # The fused MLP fetches the routed rows itself (the count is of tokens
+    # gathered across EP ranks), past a head of DISPATCH_HEAD_ROWS the
+    # SparseCore gathers first if that is not 0.
     dispatch_head_only = (
         use_ep
         and use_sparse_core
-        and num_tokens >= DISPATCH_SPLIT_MIN_TOKENS
+        and num_tokens >= TOKEN_ROWS_MIN_TOKENS
         and num_routes > onehot_moe_permute_threshold
+        and num_routes >= DISPATCH_HEAD_ROWS
         and padded_hidden_size == hidden_size
         # Whole 32-bit words of rows (two bf16 or four fp8 rows each).
         and num_tokens % (4 // jnp.dtype(row_dtype).itemsize) == 0

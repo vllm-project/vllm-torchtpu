@@ -1173,6 +1173,70 @@ def test_fused_moe_quantized_dispatch_rows_match_bf16_rows():
     )
 
 
+@pytest.mark.tpu_test
+@pytest.mark.parametrize("local_ranks", [1, 0], ids=["ep8", "no-local-routes"])
+def test_fused_moe_token_rows_match_gathered_rows(monkeypatch, local_ranks):
+    """A decode-sized EP batch gives the same bits whether the fused MLP
+    reads the token rows itself or the SparseCore gathers them first."""
+    _require_tpu()
+
+    num_tokens, hidden_size, inter_size = 1024, 1024, 512
+    num_experts, topk, quant_block = 8, 6, 512
+    keys = jax.random.split(jax.random.key(4), 7)
+    hidden_states = jax.random.normal(keys[0], (num_tokens, hidden_size), jnp.bfloat16)
+    # Seven of eight routes go to experts of other ranks, as at EP8, or all.
+    topk_ids = jax.random.randint(keys[1], (num_tokens, topk), 0, 8 * num_experts)
+    topk_ids += (1 - local_ranks) * num_experts
+    topk_weights = jax.random.uniform(keys[2], (num_tokens, topk), jnp.float32)
+    w1 = jax.random.randint(
+        keys[3], (num_experts, hidden_size // 2, 2 * inter_size), 0, 256
+    ).astype(jnp.uint8)
+    w2 = jax.random.randint(
+        keys[4], (num_experts, inter_size // 2, hidden_size), 0, 256
+    ).astype(jnp.uint8)
+    w1_scale = jax.random.uniform(
+        keys[5], (num_experts, hidden_size // quant_block, 2 * inter_size)
+    )
+    w2_scale = jax.random.uniform(
+        keys[6], (num_experts, inter_size // quant_block, hidden_size)
+    )
+    common = dict(
+        hidden_states=hidden_states,
+        w1=w1,
+        w2=w2,
+        w1_scale=w1_scale,
+        w2_scale=w2_scale,
+        w1_bias=None,
+        w2_bias=None,
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
+        experts_start=jnp.array(0, jnp.int32),
+        topk=topk,
+        activation="silu_and_mul_with_clamp",
+        use_ep=True,
+        use_sparse_core=True,
+        onehot_moe_permute_threshold=fused_moe_gmm.resolve_onehot_permute_threshold(),
+        rhs_quant_dtype=jnp.float4_e2m1fn,
+    )
+
+    def gathers_rows() -> bool:
+        jaxpr = jax.make_jaxpr(lambda: fused_moe_func(**common))()
+        return "sc_ragged_gather_v2" in str(jaxpr)
+
+    assert not gathers_rows()
+    actual = fused_moe_func(**common)
+
+    # TOKEN_ROWS_MIN_TOKENS is read at trace time.
+    jax.clear_caches()
+    monkeypatch.setattr(fused_moe_gmm, "TOKEN_ROWS_MIN_TOKENS", num_tokens + 1)
+    assert gathers_rows()
+    expected = fused_moe_func(**common)
+
+    np.testing.assert_array_equal(
+        np.asarray(actual).view(np.uint16), np.asarray(expected).view(np.uint16)
+    )
+
+
 def _fake_tpu_info(sparse_core):
     return types.SimpleNamespace(sparse_core=sparse_core)
 
