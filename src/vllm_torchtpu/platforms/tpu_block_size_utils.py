@@ -14,7 +14,7 @@
 
 import math
 from collections.abc import Sequence
-from typing import TYPE_CHECKING, Protocol, TypedDict, cast
+from typing import TYPE_CHECKING, Any, Protocol, TypedDict, cast
 
 import torch
 
@@ -31,6 +31,10 @@ from vllm_torchtpu.logger import init_logger
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
+
+    from vllm_torchtpu.layers.adapter.custom_ops.mla_attention_op import (
+        VllmTPUIndexerCache,
+    )
 
     class _HybridMambaModel(Protocol):
         """Typing-only view of the mamba state classmethods on a hybrid model."""
@@ -63,6 +67,40 @@ def unified_kv_layout_enabled(vllm_config: "VllmConfig") -> bool:
     return unified_kv_layout_enabled_for_architecture(
         vllm_config.model_config.architecture
     )
+
+
+def folded_dsa_indexer_caches(
+    vllm_config: "VllmConfig",
+) -> dict[str, "VllmTPUIndexerCache"]:
+    """Sparse MLA layer name -> the DSA indexer K cache folded into its pages.
+
+    On the unified pool of a hybrid model each sparse MLA layer carries its
+    indexer's K cache in its own scheduler page, so the pair is one KV cache
+    group. Empty for attention-only models and the per-layer layout, where the
+    indexer cache stays a layer of its own.
+    """
+    if not (
+        vllm_config.model_config.is_hybrid and unified_kv_layout_enabled(vllm_config)
+    ):
+        return {}
+    from vllm.config import get_layers_from_vllm_config
+    from vllm.model_executor.layers.attention import MLAAttention
+
+    layers = get_layers_from_vllm_config(vllm_config, MLAAttention)
+    return {
+        name: cast(Any, layer.indexer).k_cache
+        for name, layer in layers.items()
+        if layer.use_sparse and layer.indexer is not None
+    }
+
+
+def unified_pool_backend(vllm_config: "VllmConfig", backend_cls):
+    """The backend whose page layout the unified pool is born with."""
+    if folded_dsa_indexer_caches(vllm_config):
+        from vllm_torchtpu.layers.adapter.attention import PallasSparseMLAPoolBackend
+
+        return PallasSparseMLAPoolBackend
+    return backend_cls
 
 
 _TPU_CACHE_DTYPE_TO_TORCH_DTYPE = {

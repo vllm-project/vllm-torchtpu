@@ -19,8 +19,10 @@ import pytest
 import torch
 from vllm.config import CacheConfig, ModelConfig, VllmConfig
 
+from vllm_torchtpu.layers.adapter.attention import PallasSparseMLAPoolBackend
 from vllm_torchtpu.platforms.tpu_block_size_utils import (
     _hybrid_mamba_state_layout,
+    folded_dsa_indexer_caches,
     update_tpu_block_size_and_slot_config,
 )
 
@@ -501,3 +503,65 @@ def test_hybrid_gdn_pcp_rejects_non_sharding_shape_calculator(vllm_config):
         update_tpu_block_size_and_slot_config(
             vllm_config, FakeBatchedRPAAttentionBackend
         )
+
+
+class _SparseMLAPoolBackend(PallasSparseMLAPoolBackend):
+    @staticmethod
+    def get_min_page_size(_vllm_config):
+        return 64
+
+
+def test_folded_dsa_pool_fits_state_in_nope_rows(vllm_config):
+    """Kimi-K3.1 TP8 on the unified pool: the KDA state regions are measured
+    in 512 B sparse NoPE rows (one token each), and the manager block rounds
+    up to a multiple of 128 tokens."""
+    vllm_config.model_config.is_hybrid = True
+    vllm_config.model_config.architecture = "KimiK31ForConditionalGeneration"
+    vllm_config.model_config.get_head_size.return_value = 576
+    vllm_config.cache_config.block_size = 16
+    vllm_config.cache_config.mamba_block_size = 16
+    vllm_config.cache_config.mamba_cache_mode = "align"
+    vllm_config.cache_config.cache_dtype = "fp8"
+    vllm_config.parallel_config.tensor_parallel_size = 8
+
+    _update(
+        vllm_config, backend_cls=_SparseMLAPoolBackend, model_cls=FakeKimiLinearModel
+    )
+
+    # SSM 2^18 B = 512 rows + fp32 conv pow2(ceil(18432 / 512)) = 64 rows:
+    # 576 tokens, rounded up to 640.
+    assert vllm_config.cache_config.block_size == 640
+    assert vllm_config.cache_config.mamba_block_size == 640
+    assert vllm_config.cache_config.mamba_page_size_padded == 640 * 512
+
+
+@pytest.mark.parametrize(
+    ("is_hybrid", "unified", "use_sparse", "expected"),
+    [
+        (True, True, True, True),
+        (False, True, True, False),
+        (True, False, True, False),
+        (True, True, False, False),
+    ],
+)
+def test_folded_dsa_indexer_caches(
+    vllm_config, is_hybrid, unified, use_sparse, expected
+):
+    vllm_config.model_config.is_hybrid = is_hybrid
+    k_cache = object()
+    layer = SimpleNamespace(
+        use_sparse=use_sparse, indexer=SimpleNamespace(k_cache=k_cache)
+    )
+    dense = SimpleNamespace(use_sparse=False, indexer=None)
+    with (
+        patch(
+            "vllm_torchtpu.platforms.tpu_block_size_utils.unified_kv_layout_enabled",
+            return_value=unified,
+        ),
+        patch(
+            "vllm.config.get_layers_from_vllm_config",
+            return_value={"mla.3": layer, "mla.7": dense},
+        ),
+    ):
+        folded = folded_dsa_indexer_caches(vllm_config)
+    assert folded == ({"mla.3": k_cache} if expected else {})

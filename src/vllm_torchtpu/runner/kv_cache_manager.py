@@ -68,6 +68,8 @@ from vllm_torchtpu.block_major_pool import (
 )
 from vllm_torchtpu.kernels.mla import dispatch as mla_dispatch
 from vllm_torchtpu.kv_cache_materializer import (
+    LayerKVCache,
+    PoolPageLayout,
     build_kernel_block_size_by_group_id,
     can_share_attention_cache,
     format_kv_cache_layout_summary,
@@ -78,6 +80,7 @@ from vllm_torchtpu.kv_cache_spec_normalizer import normalize_kv_cache_specs_for_
 from vllm_torchtpu.layers.adapter.attention import (
     PallasAttentionBackend,
     PallasMLAttentionBackend,
+    PallasSparseMLAPoolBackend,
     VllmTPUDeepseekV32IndexerBackend,
 )
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadataBuilder
@@ -85,12 +88,16 @@ from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
     set_vllm_model_wrapper_context,
 )
+from vllm_torchtpu.platforms.tpu_block_size_utils import folded_dsa_indexer_caches
 from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
 from vllm_torchtpu.runner.kv_cache_dsv4 import DsV4KVCacheAllocator
 from vllm_torchtpu.utils import synchronize_tensors
 
 if TYPE_CHECKING:
     from vllm_torchtpu.layers.adapter.attention import PallasAttentionBackendImpl
+    from vllm_torchtpu.layers.adapter.custom_ops.mla_attention_op import (
+        VllmTPUIndexerCache,
+    )
     from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 
     class _TpuKVCacheBackend(Protocol):
@@ -157,6 +164,24 @@ def indexer_page_size_bytes(k_cache: DeepseekV32IndexerCache, block_size: int) -
     return VllmTPUDeepseekV32IndexerBackend.get_kv_cache_page_size_bytes(
         block_size, 1, k_cache.head_dim, torch.uint8
     )
+
+
+def folded_dsa_side_page_size_bytes(
+    k_cache: DeepseekV32IndexerCache,
+    block_size: int,
+    head_size: int,
+    kv_cache_dtype: torch.dtype,
+) -> int:
+    """Bytes per page a folded sparse MLA layer keeps outside the unified pool.
+
+    The pool holds the NoPE latents (`PallasSparseMLAPoolBackend`); the RoPE
+    half and the indexer K cache are the layer's own arrays.
+    """
+    _, rope_spec = PallasMLAttentionBackend.get_sparse_kv_cache_specs(
+        1, block_size, head_size, kv_cache_dtype
+    )
+    rope_bytes = math.prod(rope_spec.shape) * rope_spec.torch_dtype.itemsize
+    return rope_bytes + indexer_page_size_bytes(k_cache, block_size)
 
 
 def check_kv_caches_cover_block_ids(
@@ -259,6 +284,10 @@ class KVCacheManager:
                 self._update_mamba_page_size_padded(layers, block_size)
 
         hma_enabled = not self.runner.scheduler_config.disable_hybrid_kv_cache_manager
+        folded_indexer_caches = folded_dsa_indexer_caches(self.runner.vllm_config)
+        folded_indexer_names = {
+            k_cache.prefix for k_cache in folded_indexer_caches.values()
+        }
 
         kv_cache_spec: dict[str, KVCacheSpec] = {}
         # DSv4 layers whose specs must reach vLLM verbatim; see
@@ -379,6 +408,24 @@ class KVCacheManager:
             elif isinstance(attn_module, MLAAttention):
                 if layer_name in kv_cache_spec:
                     continue
+                if layer_name in folded_indexer_caches:
+                    # One scheduler page holds the layer's (nope, rope) latents
+                    # and its indexer K rows, as one KV cache group.
+                    k_cache = folded_indexer_caches[layer_name]
+                    latent_page_size = sparse_mla_page_size_bytes(
+                        attn_module, block_size, self.runner.kv_cache_dtype
+                    )
+                    assert latent_page_size is not None
+                    kv_cache_spec[layer_name] = MLAAttentionSpec(
+                        block_size=block_size,
+                        num_kv_heads=1,
+                        head_size=attn_module.head_size,
+                        dtype=self.runner.kv_cache_dtype,
+                        cache_dtype_str=cache_dtype_str,
+                        page_size_padded=latent_page_size
+                        + indexer_page_size_bytes(k_cache, block_size),
+                    )
+                    continue
                 sparse_page_size = (
                     None
                     if self.runner._hybrid_uniform_page_size_bytes is not None
@@ -420,6 +467,8 @@ class KVCacheManager:
                     page_size_padded=page_size_padded,
                 )
             elif isinstance(attn_module, DeepseekV32IndexerCache):
+                if layer_name in folded_indexer_names:
+                    continue
                 # DSA indexer K cache: the module declares its own uint8 spec
                 # (head_dim fp8 bytes + 1 e8m0 scale byte per token).
                 indexer_spec = attn_module.get_kv_cache_spec(self.runner.vllm_config)
@@ -870,8 +919,7 @@ class KVCacheManager:
         )
         # Bytes per block of every block-table-indexed layer in one region.
         attn_region_page_size_bytes = (
-            num_attn_groups * attn_page_size_bytes
-            + num_indexer_groups * indexer_page
+            num_attn_groups * attn_page_size_bytes + num_indexer_groups * indexer_page
         )
 
         uniform_page_size_bytes = (
@@ -1163,12 +1211,15 @@ class KVCacheManager:
             cw.spec.prewarm_shape(p)
 
     def _initialize_unified_kv_cache(self, kv_cache_config: KVCacheConfig) -> None:
+        folded_indexer_caches = folded_dsa_indexer_caches(self.runner.vllm_config)
         self.runner.attn_groups = []
         for gid, group in enumerate(kv_cache_config.kv_cache_groups):
             layer_names = list(group.layer_names)
             backend = self.runner._resolve_tpu_group_backend(
                 layer_names, group.kv_cache_spec
             )
+            if folded_indexer_caches.keys() & set(layer_names):
+                backend = PallasSparseMLAPoolBackend
             if isinstance(group.kv_cache_spec, AttentionSpec) and self.runner.use_spmd:
                 num_kv_heads = group.kv_cache_spec.num_kv_heads
                 parallel_config = self.runner.parallel_config
@@ -1242,6 +1293,9 @@ class KVCacheManager:
         block_major = unified_block_major_enabled(self.runner.vllm_config)
         if block_major:
             self._check_block_major_pool_supported()
+        pool_page = self._folded_dsa_pool_page(
+            kv_cache_config, folded_indexer_caches, kernel_block_size_by_gid
+        )
         materialized = materialize_kv_cache_tensors(
             kv_cache_config=kv_cache_config,
             attn_groups=self.runner.attn_groups,
@@ -1249,6 +1303,7 @@ class KVCacheManager:
             device=self.runner.device,
             cache_dtype=self.runner.kv_cache_dtype,
             block_major=block_major,
+            pool_page=pool_page,
         )
         kv_caches = materialized.kv_caches
         self.runner.kv_cache_raw_tensors = materialized.raw_tensors
@@ -1264,7 +1319,14 @@ class KVCacheManager:
             )
         if self.runner._unified_kv_layout:
             self.runner._build_mamba_copy_plan(
-                kv_cache_config, materialized.layer_to_raw, materialized.bm_pool_layout
+                kv_cache_config,
+                materialized.layer_to_raw,
+                materialized.bm_pool_layout,
+                pool_side_page_bytes=pool_page.side_page_bytes if pool_page else 0,
+            )
+        if pool_page is not None:
+            self._bind_folded_dsa_caches(
+                kv_caches, kv_cache_config, folded_indexer_caches
             )
 
         for layer_name, target_layer_name in self.runner.shared_kv_cache_layers.items():
@@ -1290,6 +1352,7 @@ class KVCacheManager:
                 kv_caches=kv_caches,
                 raw_tensors=self.runner.kv_cache_raw_tensors,
                 attn_groups=self.runner.attn_groups,
+                side_tensors=self.runner.kv_cache_side_tensors,
             ),
         )
 
@@ -1330,6 +1393,95 @@ class KVCacheManager:
 
         if not self.runner.enforce_eager:
             self.runner._precompile_substitute_placeholder_token()
+
+    def _folded_dsa_pool_page(
+        self,
+        kv_cache_config: KVCacheConfig,
+        folded_indexer_caches: dict[str, VllmTPUIndexerCache],
+        kernel_block_size_by_gid: dict[int, int],
+    ) -> PoolPageLayout | None:
+        """The pool page of the folded sparse MLA layers, or None without any."""
+        if not folded_indexer_caches:
+            return None
+        for gid, group in enumerate(kv_cache_config.kv_cache_groups):
+            names = folded_indexer_caches.keys() & set(group.layer_names)
+            if not names:
+                continue
+            spec = group.kv_cache_spec
+            assert isinstance(spec, MLAAttentionSpec), spec
+            # `PallasSparseMLAPoolBackend` runs the whole scheduler block.
+            assert kernel_block_size_by_gid[gid] == spec.block_size, (
+                kernel_block_size_by_gid[gid],
+                spec.block_size,
+            )
+            nope_spec, _ = PallasMLAttentionBackend.get_sparse_kv_cache_specs(
+                1, spec.block_size, spec.head_size, spec.dtype
+            )
+            return PoolPageLayout(
+                dtype=nope_spec.torch_dtype,
+                side_page_bytes=folded_dsa_side_page_size_bytes(
+                    folded_indexer_caches[min(names)],
+                    spec.block_size,
+                    spec.head_size,
+                    spec.dtype,
+                ),
+            )
+        raise AssertionError(
+            f"folded sparse MLA layers {sorted(folded_indexer_caches)} are in "
+            "no KV cache group"
+        )
+
+    def _bind_folded_dsa_caches(
+        self,
+        kv_caches: dict[str, LayerKVCache],
+        kv_cache_config: KVCacheConfig,
+        folded_indexer_caches: dict[str, VllmTPUIndexerCache],
+    ) -> None:
+        """Give each folded sparse MLA layer its (pool, rope) pair and its
+        indexer cache its own array, all over the same pages."""
+        block_size = self.runner.cache_config.block_size
+        num_pages = kv_cache_config.num_blocks
+        forward_context = (
+            self.runner.vllm_config.compilation_config.static_forward_context
+        )
+        side_caches: list[torch.Tensor] = []
+        for layer_name, k_cache in folded_indexer_caches.items():
+            attn_module = forward_context[layer_name]
+            pool = kv_caches[layer_name]
+            assert isinstance(pool, torch.Tensor)
+            specs = PallasMLAttentionBackend.get_sparse_kv_cache_specs(
+                num_pages,
+                block_size,
+                attn_module.head_size,
+                self.runner.kv_cache_dtype,
+            )
+            nope_spec, rope_spec = specs
+            assert (
+                tuple(pool.shape) == tuple(nope_spec.shape)
+                and pool.dtype == nope_spec.torch_dtype
+            ), (layer_name, tuple(pool.shape), pool.dtype, nope_spec)
+            rope = torch.zeros(
+                rope_spec.shape,
+                dtype=rope_spec.torch_dtype,
+                device=self.runner.device,
+            )
+            indexer = torch.zeros(
+                VllmTPUDeepseekV32IndexerBackend.get_kv_cache_shape(
+                    num_pages, block_size, 1, k_cache.head_dim
+                ),
+                dtype=torch.uint8,
+                device=self.runner.device,
+            )
+            mla_dispatch.admit_layer(self.runner, attn_module, specs, block_size)
+            attn_module.mla_kv_spec = specs
+            kv_caches[layer_name] = (pool, rope)
+            kv_caches[k_cache.prefix] = indexer
+            # The indexer reads its block tables from the MLA layer's group.
+            k_cache.metadata_layer_name = layer_name
+            side_caches += [rope, indexer]
+        # Same reason as the pool flush below: donated buffers must be quiescent.
+        synchronize_tensors(side_caches)
+        self.runner.kv_cache_side_tensors = side_caches
 
     def _check_block_major_pool_supported(self) -> None:
         """Refuses execution features the block-major unified pool cannot index.

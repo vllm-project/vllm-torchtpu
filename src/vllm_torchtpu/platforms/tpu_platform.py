@@ -36,6 +36,7 @@ from vllm_torchtpu.platforms.pcp_validation import PcpStaticSupportValidator
 from vllm_torchtpu.platforms.pp_validation import validate_pipeline_parallel_config
 from vllm_torchtpu.platforms.tpu_block_size_utils import (
     unified_kv_layout_enabled,
+    unified_pool_backend,
     update_tpu_block_size_and_slot_config,
 )
 
@@ -1303,7 +1304,9 @@ class TpuPlatform(Platform):
                         backend_cls.get_preferred_block_size(default)
                     )
             if unified_kv_layout_enabled(vllm_config):
-                update_tpu_block_size_and_slot_config(vllm_config, backend_cls)
+                update_tpu_block_size_and_slot_config(
+                    vllm_config, unified_pool_backend(vllm_config, backend_cls)
+                )
 
             min_page_size = backend_cls.get_min_page_size(vllm_config)
             if min_page_size > cache_config.block_size:
