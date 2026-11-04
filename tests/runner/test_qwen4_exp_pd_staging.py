@@ -234,3 +234,19 @@ def test_prefix_aware_compressed_rows_are_the_full_repack_tail(num_tokens, skip)
 def test_prefix_aware_compressed_rows_refuse_a_split_pair():
     with pytest.raises(ValueError, match="compressed pair"):
         st.compressed_rows(100, 4, [1], 384, [1], 128, start=12)
+
+
+def test_without_speculation_drops_only_the_draft_config():
+    import dataclasses as dc
+
+    @dc.dataclass
+    class Cfg:
+        speculative_config: object
+        other: int = 3
+
+    cfg = Cfg(speculative_config={"method": "mtp"})
+    peer = st.without_speculation(cfg)
+    assert peer.speculative_config is None and peer.other == 3
+    assert cfg.speculative_config == {"method": "mtp"}
+    plain = Cfg(speculative_config=None)
+    assert st.without_speculation(plain) is plain

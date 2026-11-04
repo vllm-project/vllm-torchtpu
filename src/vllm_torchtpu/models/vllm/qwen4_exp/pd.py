@@ -104,13 +104,15 @@ def build_transfer_groups(
                 # "none": one persistent state block per request. "align"
                 # (prefix caching): one state block per block column, the
                 # running state in the last; the transfer still carries one.
-                if spec.num_speculative_blocks or spec.mamba_cache_mode not in (
-                    "none",
-                    "align",
+                # Speculative state blocks (a decode-only MTP draft) follow
+                # the committed state in the table; the transfer still moves
+                # one committed state (pd_staging lands it there).
+                if spec.mamba_cache_mode not in ("none", "align") or (
+                    spec.num_speculative_blocks and spec.mamba_cache_mode != "none"
                 ):
                     raise NotImplementedError(
-                        "Qwen PD request-state transfer requires MTP off and "
-                        "the none or align Mamba cache mode"
+                        "Qwen PD request-state transfer requires the none or "
+                        "align Mamba cache mode, and none with MTP"
                     )
                 extents.add(TransferExtent.REQUEST_STATE)
                 positional.add(spec.mamba_cache_mode == "align")
