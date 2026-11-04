@@ -143,3 +143,26 @@ def test_dispatch_and_combine_with_sequence_parallel(
             assert invocation.kwargs == {"dim": 0}
         assert ep_group.all_gather.call_count == count
         ep_group.reduce_scatter.assert_not_called()
+
+
+def test_all_reduce_goes_through_the_small_all_reduce_bridge(monkeypatch, communicator):
+    base = Mock(return_value=torch.tensor([7.0]))
+    monkeypatch.setattr(comm.DeviceCommunicatorBase, "all_reduce", base)
+    bridge = Mock(side_effect=lambda x, ranks, fallback: fallback(x))
+    monkeypatch.setattr(comm.small_all_reduce_op, "all_reduce_or", bridge)
+    communicator.ranks = [0, 1]
+    x = torch.ones(2, 4)
+    assert communicator.all_reduce(x) is base.return_value
+    (block, ranks, _), _ = bridge.call_args
+    assert block is x and ranks == [0, 1]
+    base.assert_called_once_with(x)
+
+
+def test_all_reduce_unarmed_is_the_base_all_reduce(monkeypatch, communicator):
+    base = Mock(return_value=torch.tensor([7.0]))
+    monkeypatch.setattr(comm.DeviceCommunicatorBase, "all_reduce", base)
+    monkeypatch.setattr(comm.small_all_reduce_op, "_AR_OP", None)
+    communicator.ranks = [0, 1]
+    x = torch.ones(2, 4, dtype=torch.bfloat16)
+    assert communicator.all_reduce(x) is base.return_value
+    base.assert_called_once_with(x)
