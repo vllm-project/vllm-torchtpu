@@ -105,6 +105,40 @@ def _collect_rank_to_device_id(
     return rank_to_device_id
 
 
+def world_device_assignment() -> tuple[int, ...] | None:
+    """The world group's rank -> global device id table, or None in one process.
+
+    This is the table torch_tpu compiles mesh and subgroup executables for, read
+    from torch_tpu itself rather than gathered here, so no collective and no
+    call ordering is involved.
+    """
+    if not torch.distributed.is_initialized():
+        return None
+    from vllm.distributed.parallel_state import get_world_group
+
+    group = get_world_group()
+    if group.world_size <= 1:
+        return None
+    device_ids = _torch_tpu_device_assignment(group.device_group)
+    if len(device_ids) != group.world_size:
+        raise RuntimeError(
+            f"torch_tpu returned {len(device_ids)} device ids for a world of "
+            f"{group.world_size} ranks; the compile cache cannot be keyed by "
+            "placement. torch_tpu answers [] when the group's TPU backend is "
+            "missing or rejects the query: check that the world group uses the "
+            "tpu_dist backend and that torch-tpu matches the version pinned in "
+            "pyproject.toml."
+        )
+    return tuple(device_ids)
+
+
+def _torch_tpu_device_assignment(device_group: Any) -> list[int]:
+    # A seam for CPU tests, which run without a TPU process group.
+    from torch_tpu._internal.distributed.device_mesh import get_device_assignment
+
+    return get_device_assignment(device_group)
+
+
 def get_cp_group_layout(group: Any | None) -> CpGroupLayout:
     """Return `group`'s rank order and the matching TPU device-id order.
 
