@@ -19,6 +19,8 @@
 #   EXPERT_BLOCK  "" (served block-16 scales) | 256 | 512: requantize expert scales so the matmul scales after the MXU
 #   ATTN_BLOCK    "" (kernel default) | long: decode attention block bkv 8192, batch 4, 2 buffers, for >= 64K tokens
 #                 per sequence (faster at 64-128K, slower at 24 x 32K; one KV head per core, measured)
+#   VERIFY_BLOCK  "" (kernel default) | window: MTP verify-window attention computes the whole window per KV block
+#                 (kernel default block, bit-identical) | long: the same with bkv 8192, batch 4, 2 buffers
 #   FUSED_DRAFT   1 = draft steps 1..K-1 as one compiled program (VLLM_TPU_FUSED_DRAFT_LOOP); single-engine layouts only
 #   FAST_SUBST    1 = steady-state fast token substitution (VLLM_TPU_FAST_TOKEN_SUBSTITUTION)
 #   PACKED_DISPATCH 1 = one MoE dispatch all-gather per layer for hidden states + router logits (TPU_MOE_PACKED_DISPATCH)
@@ -41,6 +43,7 @@ EXPERT_BLOCK=${EXPERT_BLOCK:-}
 ATTN_BLOCK=${ATTN_BLOCK:-}
 MOE_A2A=${MOE_A2A:-0}
 A2A_SC_OFFLOAD=${A2A_SC_OFFLOAD:-}
+VERIFY_BLOCK=${VERIFY_BLOCK:-}
 FUSED_DRAFT=${FUSED_DRAFT:-0}
 FAST_SUBST=${FAST_SUBST:-0}
 PACKED_DISPATCH=${PACKED_DISPATCH:-0}
@@ -82,6 +85,12 @@ case "$ATTN_BLOCK" in
   long) export TPU_BATCHED_RPA_DECODE_BLOCK=8192,4,2 ;;
   *) echo "ATTN_BLOCK must be empty or long" >&2; exit 2 ;;
 esac
+case "$VERIFY_BLOCK" in
+  "") ;;
+  window) export TPU_BATCHED_RPA_VERIFY_BLOCK=window ;;
+  long) export TPU_BATCHED_RPA_VERIFY_BLOCK=8192,4,2 ;;
+  *) echo "VERIFY_BLOCK must be empty, window or long" >&2; exit 2 ;;
+esac
 LOAD_ARGS=(--load-format dummy)
 [[ "$WEIGHTS" == real ]] && LOAD_ARGS=()
 case "$KV_MODE" in
@@ -116,7 +125,7 @@ elif [[ -n "$HOT_SET" ]]; then
   [[ "${HS_SPREAD:-}" == spread ]] && export TPU_MOE_HOT_SET_SPREAD=1
 fi
 export TORCH_TPU_TIER2_COMPILATION_CACHE="native_decode_${LAYOUT}_${POD_IP}"
-echo "HILLCLIMB layout=$LAYOUT host=$HOST_RANK engines=$ENGINES seqs/engine=$SEQS_PER_ENGINE mtp=$MTP_K mnbt=$MNBT compile=$COMPILE_SIZES kv=$KV_BYTES async=$ASYNC_SCHED fused_ep=$FUSED_EP w4a8=$W4A8 expert_block=${EXPERT_BLOCK:-16} attn_block=${ATTN_BLOCK:-default} moe_a2a=$MOE_A2A a2a_sc_offload=${A2A_SC_OFFLOAD:-default} fused_draft=$FUSED_DRAFT fast_subst=$FAST_SUBST packed_dispatch=$PACKED_DISPATCH fused_combine=$FUSED_COMBINE weights=$WEIGHTS kv_mode=$KV_MODE hot_set=${HOT_SET:-none} headless=${HEADLESS_ARGS[*]:-no}"
+echo "HILLCLIMB layout=$LAYOUT host=$HOST_RANK engines=$ENGINES seqs/engine=$SEQS_PER_ENGINE mtp=$MTP_K mnbt=$MNBT compile=$COMPILE_SIZES kv=$KV_BYTES async=$ASYNC_SCHED fused_ep=$FUSED_EP w4a8=$W4A8 expert_block=${EXPERT_BLOCK:-16} attn_block=${ATTN_BLOCK:-default} verify_block=${VERIFY_BLOCK:-default} moe_a2a=$MOE_A2A a2a_sc_offload=${A2A_SC_OFFLOAD:-default} fused_draft=$FUSED_DRAFT fast_subst=$FAST_SUBST packed_dispatch=$PACKED_DISPATCH fused_combine=$FUSED_COMBINE weights=$WEIGHTS kv_mode=$KV_MODE hot_set=${HOT_SET:-none} headless=${HEADLESS_ARGS[*]:-no}"
 
 exec numactl --interleave=all "$VLLM_BIN" serve \
   --pipeline-parallel-size 1 \
