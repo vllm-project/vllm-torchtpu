@@ -194,3 +194,10 @@ def test_mixed_window_lengths_keep_the_verify_kernel(monkeypatch):
     hist = {s: _HIST[s] for s in range(6)}
     q_lens = {s: 1 + (s == 2) for s in hist}
     _check(monkeypatch, "window", hist, q_lens, _NUM_SEQS, False)
+
+
+def test_sequences_past_the_compact_table_keep_the_verify_kernel(monkeypatch):
+    # 3328 compact columns hold 425,984 tokens; a longer sequence must take the
+    # verify-window kernel, whose kernel streams the whole table.
+    hist = {0: 131068, 1: 500000, 2: 3071}
+    _check(monkeypatch, "window", hist, {s: 1 for s in hist}, _NUM_SEQS, False)

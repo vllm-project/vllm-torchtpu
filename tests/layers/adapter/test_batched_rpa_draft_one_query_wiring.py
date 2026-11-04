@@ -70,6 +70,7 @@ def test_one_query_steps_switch_on_the_query_counts(
 
     def one_query(q, k, v, cache, kv_lens, table, cu, dist, **kwargs):
         seen["one_query"] = kwargs
+        seen["one_query_table"] = table.shape
         return jnp.ones(q.shape, q.dtype), cache
 
     def blocks(model_cfgs, serve_cfgs, vmem_limit_bytes, decode_query_size):
@@ -79,18 +80,21 @@ def test_one_query_steps_switch_on_the_query_counts(
 
     monkeypatch.setattr(adapter, "ragged_paged_attention_batched", one_query)
     monkeypatch.setattr(adapter.rpa_batched_wrapper, "calculate_block_sizes", blocks)
+    monkeypatch.setattr(
+        adapter.pltpu, "get_tpu_info", lambda: SimpleNamespace(num_lanes=128)
+    )
     monkeypatch.setenv("TPU_BATCHED_RPA_VERIFY_BLOCK", verify_block)
     fn = adapter._with_one_query_steps(verify, 4)
     num_seqs = 12
     cache = jnp.zeros((10, 2, 64, 4, 128), jnp.uint8)
-    kv_lens = jnp.zeros(num_seqs, jnp.int32)
     table = jnp.zeros(num_seqs * 8192, jnp.int32)
 
-    def ran_one_query(q_lens, decode=None, tokens=num_seqs):
+    def ran_one_query(q_lens, decode=None, tokens=num_seqs, kv_len=131072):
         """True if the call ran the one-query kernel."""
         live = len(q_lens)
         lens = np.zeros(num_seqs, np.int32)
         lens[:live] = q_lens
+        kv_lens = jnp.asarray(np.where(np.arange(num_seqs) < live, kv_len, 0))
         cu = jnp.asarray(np.concatenate(([0], np.cumsum(lens))), jnp.int32)
         dist = jnp.asarray([live if decode is None else decode, live, live], jnp.int32)
         q = jnp.zeros((tokens, 16, 256), jnp.bfloat16)
@@ -109,6 +113,10 @@ def test_one_query_steps_switch_on_the_query_counts(
         "vmem_limit_bytes": 1 << 26,
     }
     assert seen["verify"] == {"kv_layout": _LANE, "vmem_limit_bytes": 1 << 26}
+    # The one-query call gets the compact table: 160 KiB of 12 rows, 3328 columns.
+    assert seen["one_query_table"] == (num_seqs * 3328,)
+    assert ran_one_query([1] * 12, kv_len=3328 * 128)
+    assert not ran_one_query([1] * 12, kv_len=3328 * 128 + 1)
     assert not ran_one_query([4] * 3)  # verify windows
     assert not ran_one_query([1, 1, 2, 1, 1, 1])
     assert not ran_one_query([1, 0, 1])  # a live sequence without a query
@@ -117,6 +125,20 @@ def test_one_query_steps_switch_on_the_query_counts(
     seen.clear()
     assert not ran_one_query([1] * 12, tokens=4 * num_seqs)
     assert "one_query" not in seen
+
+
+@pytest.mark.cpu_test
+def test_compact_page_columns_follow_the_kernel_rule(monkeypatch):
+    monkeypatch.setattr(
+        adapter.pltpu, "get_tpu_info", lambda: SimpleNamespace(num_lanes=128)
+    )
+    # 1M-token table at 128-token pages: 160 KiB of rows.
+    assert adapter._compact_page_columns(12, 8320, 4) == 3328
+    assert adapter._compact_page_columns(10, 8192, 4) == 4096
+    assert adapter._compact_page_columns(256, 8192, 4) == 128
+    # Tables the kernel keeps in SMEM whole.
+    assert adapter._compact_page_columns(12, 1152, 4) == 0
+    assert adapter._compact_page_columns(10, 4096, 4) == 0
 
 
 @pytest.mark.cpu_test

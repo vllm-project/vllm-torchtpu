@@ -703,6 +703,18 @@ def _with_verify_block_override(rpa_func, decode_query_size: int):
     return call
 
 
+def _compact_page_columns(num_seqs: int, pages_per_seq: int, itemsize: int) -> int:
+    """Columns of the compact page table the batched kernel switches to for a
+    decode batch whose sequences fit them, or 0 when it keeps the whole table
+    in SMEM (rpa_batched_wrapper.ragged_paged_attention's own rule)."""
+    limit = 160 * 1024 if pages_per_seq >= 4096 else 512 * 1024
+    if num_seqs * pages_per_seq * itemsize <= limit:
+        return 0
+    lanes = pltpu.get_tpu_info().num_lanes
+    columns = min(160 * 1024 // itemsize // num_seqs, pages_per_seq) // lanes * lanes
+    return columns if columns < pages_per_seq else 0
+
+
 def _with_one_query_steps(verify_func, decode_query_size: int):
     """Run calls whose sequences all carry one query through the one-query kernel.
 
@@ -713,7 +725,9 @@ def _with_one_query_steps(verify_func, decode_query_size: int):
     device when every live sequence decodes exactly one token. The KV block
     fixes each row's accumulation order and query rows are independent, so
     the outputs and KV cache are identical to the verify-window kernel's.
-    Programs with room for full verify windows skip the switch.
+    The one-query call passes the compact page table the kernel would select
+    at run time, which skips its compact/streamed switch. Programs with room
+    for full verify windows skip the switch.
     """
     block = envs.TPU_BATCHED_RPA_VERIFY_BLOCK
     if block is None:
@@ -773,11 +787,32 @@ def _with_one_query_steps(verify_func, decode_query_size: int):
         one_query = (distribution[0] == distribution[2]) & jnp.all(
             jnp.where(live, q_lens == 1, True)
         )
+        pages_per_seq = page_indices.shape[0] // num_seqs
+        columns = _compact_page_columns(
+            num_seqs, pages_per_seq, page_indices.dtype.itemsize
+        )
+        if columns:
+            # The table columns the kernel keeps in SMEM for a decode batch that
+            # fits them; longer sequences take the verify-window kernel.
+            layout = kwargs.get(
+                "kv_layout", batched_rpa_configs.KVLayout.HEAD_ALONG_SUBLANE
+            )
+            page_size = kv_cache.shape[
+                4 if layout == batched_rpa_configs.KVLayout.SEQ_ALONG_LANE else 1
+            ]
+            one_query &= jnp.all(jnp.where(live, kv_lens <= columns * page_size, True))
+
+        def one_query_call(q, k, v, cache, lens, table, cu, dist):
+            if columns:
+                table = table.reshape(num_seqs, pages_per_seq)[:, :columns].reshape(-1)
+            return ragged_paged_attention_batched(
+                q, k, v, cache, lens, table, cu, dist,
+                decode_block_sizes=one_query_block, **kwargs,
+            )  # fmt: skip
+
         return jax.lax.cond(
             one_query,
-            lambda *a: ragged_paged_attention_batched(
-                *a, decode_block_sizes=one_query_block, **kwargs
-            ),
+            one_query_call,
             lambda *a: verify_func(*a, **kwargs),
             *args,
         )
