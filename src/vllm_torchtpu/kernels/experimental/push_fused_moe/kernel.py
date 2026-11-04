@@ -161,7 +161,9 @@ def _build_push_moe_kernel(
     visit's tiles are committed. Same bytes to the same places; what changes
     is that the remote pushes no longer hold a VMEM staging slot, so when the
     fabric is the busy resource the tile loop runs ahead of it instead of
-    waiting at the slot-reuse guard.
+    waiting at the slot-reuse guard. A staged build also pushes each visit's
+    runs at the end of the NEXT visit, so the commits it waits for there have
+    had a whole visit to land.
     """
     if dispatch_ahead < 1:
         raise ValueError(
@@ -1473,12 +1475,44 @@ def _build_push_moe_kernel(
             if push_from_vmem:
                 # Each tile shipped itself; there is nothing left to flush.
                 return carry
-            carry = drain_commits(carry)
-            push_expert(e)
+            if not hbm_staging:
+                carry = drain_commits(carry)
+                push_expert(e)
+                return carry
+            # A staged build pushes the PREVIOUS visit's runs here, so this
+            # visit's last commits land while the next visit computes. Of the
+            # previous visit, only its last tile can still owe commits: it
+            # sits on the parity this visit did not end on, which this
+            # visit's tiles reused (and so waited) unless it ran one tile.
+            other = jnp.int32(1) - lax.rem(carry[0] - 1, jnp.int32(OUT_PARITIES))
+            for q in range(OUT_PARITIES):
+                pend_q = carry[1 + q]
+
+                @pl.when(jnp.logical_and(other == q, pend_q > 0))
+                def _(q=q, pend_q=pend_q):
+                    wait_commits(q, pend_q)
+
+            carry = (
+                carry[0],
+                jnp.where(other == 0, 0, carry[1]),
+                jnp.where(other == 1, 0, carry[2]),
+            )
+
+            @pl.when(visit_i > 0)
+            def _():
+                push_expert(visit_sm[visit_i - 1])
+
             return carry
 
         carry0 = tuple(jnp.int32(0) for _ in range(5 if push_from_vmem else 3))
         carry_end = lax.fori_loop(0, n_visit, visit_step, carry0)
+        if hbm_staging:
+            # The last visit's runs, deferred past the loop.
+            carry_end = drain_commits(carry_end)
+
+            @pl.when(n_visit > 0)
+            def _():
+                push_expert(visit_sm[n_visit - 1])
 
         def drain_transport():
             """Consume the pushes and the commits the per-tile waits left."""
