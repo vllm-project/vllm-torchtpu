@@ -199,8 +199,8 @@ def build_scratch(
 ) -> tuple[CorePlan, dict[str, Any]]:
     """Build `CorePlan` and allocate all core and module VMEM scratch buffers.
 
-    `ex.tiles=None` uses the default tiles fitted to the model's VMEM budget,
-    as `kernel.build` does (`fit_default_tiles`).
+    `ex.tiles=None` uses the default tiles fitted to the model's VMEM budget
+    (`fit_default_tiles`).
     """
     ex = fit_default_tiles(model_spec, ex)
     if p is None or p.ex != ex:
