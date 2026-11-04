@@ -325,6 +325,7 @@ def outer_kernel(
         "compute_precision",
         "recurrent_dtype",
         "conv_dtype",
+        "conv_hbm_offset",
         "attention_mode",
         "gate_lower_bound",
         "kernel_act_dtype",
@@ -358,6 +359,7 @@ def fused_conv1d_gdn(
     gate_lower_bound: float | None = None,
     recurrent_dtype: jnp.dtype | None = None,
     conv_dtype: jnp.dtype | None = None,
+    conv_hbm_offset: int | None = None,
     num_spec_tokens: int = 0,
     batched_only: bool = False,
     prefill_only: bool = False,
@@ -429,6 +431,9 @@ def fused_conv1d_gdn(
             `gate_lower_bound * sigmoid(exp(A_log) * (g + dt_bias))` (every K3
             variant, at -5.0). Different functions of the same weights, so a
             mismatch with the model's KDA config silently changes the decay.
+        conv_hbm_offset: Granule offset of the conv region in a pool block whose
+            recurrent region is padded to whole pool rows. None when the conv
+            region directly follows the recurrent state.
         num_spec_tokens: Number of speculative draft tokens (0 gives the
             plain 1-token-per-sequence decode path).
         batched_only: Run only the leading decode/verify segment.
@@ -682,6 +687,7 @@ def fused_conv1d_gdn(
                 conv_state=conv_dtype,
             ),
             is_shared=is_shared,
+            pool_conv_hbm_offset=conv_hbm_offset,
         )
 
         # Step 6: Metadata preprocessing. Will be executed multiple times per-layer

@@ -13,14 +13,13 @@
 # limitations under the License.
 """Pooled (unified-KV-pool) KDA path against the dense two-cache path.
 
-Phase 1.1 of KIMI_LINEAR_POOLED_APC_PLAN.md: the pooled op gathers each
-request's conv/SSM regions out of its pool block into dense batch-local
-buffers, runs the fused conv1d + GDN v3 kernel, and scatters the updated
-states back. The dense reference is the same fused core with identity
-indices over null-slot-prepended buffers: identical values into the same
-kernel, so the paths agree up to any reassociation XLA applies around the
-gather-fed buffers (the conv state update is pure data movement and stays
-bitwise exact).
+The pooled op runs the fused conv1d + GDN v3 kernel on each request's conv/SSM
+regions: in the pool directly for ordinary decode and prefill, and through dense
+batch-local buffers for speculative windows and rank-blocked conv state. The
+dense reference is the same fused core with identity indices over
+null-slot-prepended buffers: identical values into the same kernel, so the paths
+agree up to any reassociation XLA applies around the buffers (the conv state
+update is pure data movement and stays bitwise exact).
 """
 
 import jax.numpy as jnp
@@ -239,7 +238,8 @@ def _run_pooled(
         inputs["raw_gate"],
         inputs["beta"],
         inputs["output_gate"],
-        pool,
+        # The in-place kernel donates the pool; callers compare against theirs.
+        jnp.array(pool),
         inputs["conv_weight"],
         inputs["a_log"],
         inputs["dt_bias"],
@@ -516,23 +516,38 @@ def test_pooled_kda_manager_block_split():
 
 
 @pytest.mark.tpu_test
-def test_pooled_kda_skips_padded_slots():
-    """Slots a batch's token count cannot reach are neither read nor written."""
+@pytest.mark.parametrize(
+    ("query_lens", "decode_end", "conv_shard_heads"),
+    [([1, 1], 2, None), ([1, 1], 2, 1), ([1, 2], 1, None)],
+    ids=["truncated", "truncated-rank-blocked", "null-slot-survives"],
+)
+def test_pooled_kda_skips_padded_slots(query_lens, decode_end, conv_shard_heads):
+    """Padded slots do not change the output or any pool byte.
+
+    With rank-blocked conv state, a padded slot reaching the gather and scatter
+    would zero-fill the null block's padding rows. With 3 tokens over 2 requests,
+    one null slot stays in the table and the in-place kernel must skip it.
+    """
     rng = np.random.default_rng(0)
-    inputs = _inputs(rng, [1, 1], [5, 7])
+    inputs = _inputs(rng, query_lens, [5, 7])
+    total = sum(query_lens)
     padded = dict(
         inputs,
-        query_start_loc=jnp.asarray([0, 1, 2, 2, 2], dtype=jnp.int32),
+        query_start_loc=jnp.asarray(
+            [0, query_lens[0], total, total, total], dtype=jnp.int32
+        ),
         seq_lens=jnp.asarray([5, 7, 0, 0], dtype=jnp.int32),
     )
     conv_init, ssm_init = _initial_states(rng, 2)
-    pool = _pack_pool(conv_init, ssm_init, [1, 2])
-    distribution = jnp.asarray([2, 2, 2], dtype=jnp.int32)
+    pool = _pack_pool(conv_init, ssm_init, [1, 2], conv_shard_heads)
+    distribution = jnp.asarray([decode_end, 2, 2], dtype=jnp.int32)
     pool_block_tokens = BLOCK_SIZE * PACK
 
-    out, after = _run_pooled(inputs, pool, [1, 2], distribution, pool_block_tokens)
+    out, after = _run_pooled(
+        inputs, pool, [1, 2], distribution, pool_block_tokens, conv_shard_heads
+    )
     out_padded, after_padded = _run_pooled(
-        padded, pool, [1, 2, 0, 0], distribution, pool_block_tokens
+        padded, pool, [1, 2, 0, 0], distribution, pool_block_tokens, conv_shard_heads
     )
 
     np.testing.assert_array_equal(
@@ -540,6 +555,26 @@ def test_pooled_kda_skips_padded_slots():
     )
     np.testing.assert_array_equal(_raw(after_padded), _raw(after))
     np.testing.assert_array_equal(_raw(after_padded)[0], _raw(pool)[0])
+    np.testing.assert_array_equal(_raw(after_padded)[3:], _raw(pool)[3:])
+
+
+@pytest.mark.tpu_test
+def test_pooled_kda_in_place_checks_operands():
+    """The in-place path enforces the same operand contract as the gather path."""
+    rng = np.random.default_rng(0)
+    inputs = _inputs(rng, [1, 1], [5, 7])
+    conv_init, ssm_init = _initial_states(rng, 2)
+    pool = _pack_pool(conv_init, ssm_init, [1, 2])
+    mismatched = dict(inputs, beta=inputs["beta"].astype(jnp.float32))
+
+    with pytest.raises(TypeError, match="one common dtype"):
+        _run_pooled(
+            mismatched,
+            pool,
+            [1, 2],
+            jnp.asarray([2, 2, 2], dtype=jnp.int32),
+            BLOCK_SIZE * PACK,
+        )
 
 
 @pytest.mark.tpu_test
