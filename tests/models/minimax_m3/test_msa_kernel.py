@@ -83,6 +83,7 @@ def _reference(q, k, v, iq, ik, ctx_k, ctx_v, ctx_ik, q_lens, ctx_lens, sm_scale
     return np.stack(outs)
 
 
+@pytest.mark.parametrize("small_chunks", [False, True])
 @pytest.mark.parametrize("jit", [False, True])
 @pytest.mark.parametrize(
     "q_lens,ctx_lens",
@@ -92,7 +93,13 @@ def _reference(q, k, v, iq, ik, ctx_k, ctx_v, ctx_ik, q_lens, ctx_lens, sm_scale
         ([1, 37, 3], [129, 60, 17]),  # mixed batch
     ],
 )
-def test_msa_forward_matches_dense_reference(q_lens, ctx_lens, jit):
+def test_msa_forward_matches_dense_reference(
+    q_lens, ctx_lens, jit, small_chunks, monkeypatch
+):
+    if small_chunks:
+        # Several scoring iterations per request, and padding past the table.
+        monkeypatch.setattr(msa, "_PAGES_PER_CHUNK", 2)
+        monkeypatch.setattr(msa, "_SMALL_WINDOW_PAGES_PER_CHUNK", 4)
     rng = np.random.default_rng(0)
     num_seqs = len(q_lens)
     max_num_seqs = num_seqs + 1

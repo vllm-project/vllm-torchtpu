@@ -37,6 +37,11 @@ MAX_ROWS_PER_ATTENTION_CALL = 2048
 # Query windows the block scorer tries, smallest first; the step's token
 # bucket is always the last tier.
 SCORE_WINDOW_TIERS = (16, 256)
+# Pages one scoring iteration covers. Decode-sized windows take bigger chunks:
+# fewer serial iterations over a long context, at the cost of reading up to
+# one chunk past the request's last page.
+_PAGES_PER_CHUNK = 16
+_SMALL_WINDOW_PAGES_PER_CHUNK = 64
 _NEG_INF = float("-inf")
 _FORCED_LOCAL_SCORE = 1e29
 _FORCED_INIT_SCORE = 1e30
@@ -123,6 +128,13 @@ def _score_request(
     return jax.lax.fori_loop(0, num_chunks, body, scores)
 
 
+def pages_per_chunk(window: int) -> int:
+    """Pages one scoring iteration covers for a query window."""
+    if window <= SCORE_WINDOW_TIERS[0]:
+        return _SMALL_WINDOW_PAGES_PER_CHUNK
+    return _PAGES_PER_CHUNK
+
+
 def block_scores(
     index_q: jax.Array,
     index_cache: jax.Array,
@@ -130,8 +142,6 @@ def block_scores(
     block_tables: jax.Array,
     cu_q_lens: jax.Array,
     num_seqs: jax.Array,
-    *,
-    pages_per_chunk: int = 16,
 ) -> jax.Array:
     """Block-max index scores ``[T, H, P]`` (``P`` padded to the chunk).
 
@@ -144,12 +154,15 @@ def block_scores(
     max_num_seqs = seq_lens.shape[0]
     pages_per_seq = block_tables.shape[0] // max_num_seqs
     block_size = index_cache.shape[1] * index_cache.shape[2]
-    num_padded_pages = -(-pages_per_seq // pages_per_chunk) * pages_per_chunk
+    windows = sorted({w for w in SCORE_WINDOW_TIERS if w < num_tokens} | {num_tokens})
+    chunks = {w: pages_per_chunk(w) for w in windows}
+    # The chunk sizes divide each other, so this is a multiple of all of them.
+    largest_chunk = max(chunks.values())
+    num_padded_pages = -(-pages_per_seq // largest_chunk) * largest_chunk
     page_rows = jnp.pad(
         block_tables.reshape(max_num_seqs, pages_per_seq),
         ((0, 0), (0, num_padded_pages - pages_per_seq)),
     )
-    windows = sorted({w for w in SCORE_WINDOW_TIERS if w < num_tokens} | {num_tokens})
     index_q_padded = jnp.pad(index_q, ((0, num_tokens), (0, 0), (0, 0)))
     row_ids = jnp.arange(num_tokens, dtype=jnp.int32)
 
@@ -168,7 +181,7 @@ def block_scores(
                     page_rows[seq],
                     q_start,
                     num_pages,
-                    pages_per_chunk,
+                    chunks[window],
                 ),
                 q_start,
                 q_len,
