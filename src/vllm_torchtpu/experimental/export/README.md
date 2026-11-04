@@ -26,7 +26,11 @@ explicitly rather than relying on the exporter's defaults:
 
 - `--block-size`: defaults to the platform's choice after loading the model
   (`update_block_size_for_backend`, as in `vllm serve`), raised to fit the
-  block table in SMEM. `vllm serve` logs `Using KV cache block size: N`.
+  block table in SMEM, and raised to the attention kernel's smallest page
+  (128 for RPA) when smaller, keeping the KV capacity in tokens. A hybrid model
+  keeps vLLM's default of 16 there, because serving sizes its blocks from the
+  unified block pool. An explicit `--block-size` is never changed.
+  `vllm serve` logs `Using KV cache block size: N`.
 - `--num-blocks`: defaults to the size computed from `--kv-cache-memory-bytes`,
   or else from `--gpu-memory-utilization` (see below). `vllm serve` logs
   `TPU KV cache size: T tokens`; `--num-blocks` = T / block size.
