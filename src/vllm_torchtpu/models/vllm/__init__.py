@@ -57,10 +57,18 @@ class _TPUKimiK31Config(_TPUKimiK3Config):
 
         model_config = vllm_config.model_config
         config = model_config.hf_text_config
-        if vllm_config.speculative_config is not None:
-            # TODO: add DSpark context-cache writes and draft attention.
+        speculative_config = vllm_config.speculative_config
+        if speculative_config is not None and speculative_config.method != "dspark":
             raise NotImplementedError(
-                "Kimi K3.1 speculative decoding is not implemented on TPU yet."
+                "Kimi K3.1 speculative decoding on TPU supports only DSpark."
+            )
+        if (
+            speculative_config is not None
+            and vllm_config.parallel_config.decode_context_parallel_size > 1
+        ):
+            raise NotImplementedError(
+                "The Kimi K3.1 DSpark draft runs dense MLA, which has no decode "
+                "context parallel path. Unset --decode-context-parallel-size."
             )
         if envs.TPU_K3_SP_PREFILL:
             raise NotImplementedError(
