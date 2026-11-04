@@ -38,10 +38,15 @@ CHIPS=16
 
 mkdir -p "${RESULT_DIR}" /dev/shm/jax_cache /dev/shm/tier3_cache
 
-# Strict hardware-default P3: NEVER pass --xla_tpu_dvfs_p_state=7
+# Default P3 (TPU_DVFS_P_STATE=3); set TPU_DVFS_P_STATE=7 to enable P-state 7
+export TPU_DVFS_P_STATE="${TPU_DVFS_P_STATE:-3}"
 export LIBTPU_INIT_ARGS="${LIBTPU_INIT_ARGS:---xla_tpu_enable_diagnostic_coordinator=false --tpu_hbm_report_enable=false --enable_runtime_uptime_telemetry=false}"
-if [[ "${LIBTPU_INIT_ARGS}" == *"xla_tpu_dvfs_p_state=7"* ]]; then
-  echo "ERROR: xla_tpu_dvfs_p_state=7 is forbidden in strict default P3 reproduction." >&2
+if [[ "${TPU_DVFS_P_STATE}" == "7" ]]; then
+  if [[ "${LIBTPU_INIT_ARGS}" != *"xla_tpu_dvfs_p_state=7"* ]]; then
+    export LIBTPU_INIT_ARGS="${LIBTPU_INIT_ARGS} --xla_tpu_dvfs_p_state=7"
+  fi
+elif [[ "${LIBTPU_INIT_ARGS}" == *"xla_tpu_dvfs_p_state=7"* ]]; then
+  echo "ERROR: xla_tpu_dvfs_p_state=7 is forbidden in strict default P3 reproduction (set TPU_DVFS_P_STATE=7 to enable P7)." >&2
   exit 1
 fi
 
@@ -78,7 +83,8 @@ export K3_PREFILL_SJF="${K3_PREFILL_SJF:-1}"
 export K3_PREFILL_PREFIX_FP8="${K3_PREFILL_PREFIX_FP8:-1}"
 export K3_AGGREGATE_EP16="${K3_AGGREGATE_EP16:-0}"
 export K3_PREFILL_EXPERT_PLAN="${K3_PREFILL_EXPERT_PLAN:-plan_ep8_real_hotfirst.npz}"
-export K3_REPLICA_PLAN="${K3_REPLICA_PLAN:-replica_plan_ep8_real_plain4.npz}"
+export K3_REPLICA_PLAN="${K3_REPLICA_PLAN:-none}"
+export K3_DECODE_FP8_STAGED_ALL="${K3_DECODE_FP8_STAGED_ALL:-1}"
 export K3_SERIAL_PREFILL="${K3_SERIAL_PREFILL:-1}"
 export K3_MAX_PREFILL_STEP_TOKENS="${K3_MAX_PREFILL_STEP_TOKENS:-16384}"
 MAX_BATCHED_TOKENS="${MAX_BATCHED_TOKENS:-16448}"
