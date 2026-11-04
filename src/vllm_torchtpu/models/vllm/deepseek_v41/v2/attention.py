@@ -1181,6 +1181,7 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
             else self.window_size
         )
         csa2_metadata = csa2_bounds = csa2_write_records = None
+        meta_key: tuple | None = None
         swa_published = False
         if self._csa2:
             if not isinstance(swa_cache, PagedCacheRows):
@@ -1519,8 +1520,27 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
         if self._csa2:
             assert csa2_write_records is not None
             if not swa_published:
+                # Records are shared by every layer of this SWA group, so the
+                # value-independent sort/pair plan is built once per stage.
+                plan = None
+                if stage_cache is not None:
+                    # Per-layer private pools share geometry, not storage.
+                    plan_key = (
+                        "csa2_swa_plan",
+                        meta_key,
+                        tuple(swa_cache.raw.shape),
+                        None
+                        if swa_cache.raw_hi is None
+                        else tuple(swa_cache.raw_hi.shape),
+                    )
+                    cached_plan = stage_cache.get(plan_key)
+                    if cached_plan is not None and cached_plan[0] is csa2_write_records:
+                        plan = cached_plan[1]
+                    else:
+                        plan = csa2_adapter.plan_swa(swa_cache, csa2_write_records)
+                        stage_cache[plan_key] = (csa2_write_records, plan)
                 csa2_adapter.publish_swa(
-                    swa_cache, csa2_write_records, kv.reshape(-1, 512)
+                    swa_cache, csa2_write_records, kv.reshape(-1, 512), plan
                 )
         else:
             _insert(swa_cache, swa_slots, kv, swa_valid)

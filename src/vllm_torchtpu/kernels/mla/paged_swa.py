@@ -12,6 +12,84 @@ from jax.experimental.pallas import tpu as pltpu
 from jax.experimental.pallas import tpu_sc as plsc
 
 
+def plan_swa_bank(
+    records: jax.Array, *, base: int, capacity: int, page_size: int
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """Value-independent part of one bank's publication.
+
+    Depends only on ``records`` and the bank geometry, so layers sharing one
+    SWA KV-cache group's records can compute it once per step. Returns
+    unpadded INT32 [N] arrays: the stable sort ``order``, the word-row
+    ``destinations`` (-1 when not the pair's first writer) and a ``code``
+    (bit 0: row is even, bit 1: the word's high half is written).
+    """
+    valid = (records >= max(base, page_size)) & (records < base + capacity)
+    local = jnp.where(valid, records - base, capacity)
+    order = jnp.argsort(local, stable=True)
+    ids = local[order]
+    next_ids = jnp.concatenate((ids[1:], jnp.array([capacity], jnp.int32)))
+    # TC BF16 tiles pack adjacent token rows into one physical word row.
+    pairs = ids // 2
+    boundary = (ids < capacity) & jnp.concatenate(
+        (jnp.ones(1, jnp.bool_), pairs[1:] != pairs[:-1])
+    )
+    even = ids % 2 == 0
+    has_odd = (~even) | (next_ids // 2 == pairs)
+    code = even.astype(jnp.int32) | (has_odd.astype(jnp.int32) << 1)
+    return (
+        order.astype(jnp.int32),
+        jnp.where(boundary, pairs, -1).astype(jnp.int32),
+        code,
+    )
+
+
+def apply_swa_bank_plan(
+    plan: tuple[jax.Array, jax.Array, jax.Array],
+    values: jax.Array,
+    padded: int,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """Per-layer part: permute and pack this layer's BF16 values into words."""
+    order, destinations, code = plan
+    even, has_odd = (code & 1) != 0, (code & 2) != 0
+    bits = jax.lax.bitcast_convert_type(values[order], jnp.uint16).astype(jnp.uint32)
+    next_bits = jnp.concatenate((bits[1:], jnp.zeros((1, 512), jnp.uint32)))
+    low = jnp.where(even[:, None], bits, jnp.uint32(0))
+    high = jnp.where(even[:, None], next_bits, bits)
+    high = jnp.where(has_odd[:, None], high, jnp.uint32(0))
+    words = jax.lax.bitcast_convert_type(low | (high << 16), jnp.int32)
+    masks = jnp.where(even, jnp.int32(65535), jnp.int32(0)) | jnp.where(
+        has_odd, jnp.int32(-65536), jnp.int32(0)
+    )
+    padding = padded - values.shape[0]
+    # SC cannot reshape a lane vector for a column broadcast in the kernel.
+    return (
+        jnp.pad(destinations, (0, padding), constant_values=-1),
+        jnp.broadcast_to(jnp.pad(masks, (0, padding))[:, None], (padded, 512)),
+        jnp.pad(words, ((0, padding), (0, 0))),
+    )
+
+
+def swa_bank_capacities(
+    pages: jax.Array | tuple[jax.Array, jax.Array],
+) -> tuple[int, ...]:
+    banks = pages if isinstance(pages, tuple) else (pages,)
+    return tuple(bank.shape[0] * bank.shape[1] for bank in banks)
+
+
+@functools.partial(jax.jit, static_argnames=("capacities", "page_size"))
+def plan_swa_pages(
+    records: jax.Array, *, capacities: tuple[int, ...], page_size: int
+) -> tuple:
+    """Per-bank publication plans for ``write_swa_pages(..., plan=...)``."""
+    plans, base = [], 0
+    for capacity in capacities:
+        plans.append(
+            plan_swa_bank(records, base=base, capacity=capacity, page_size=page_size)
+        )
+        base += capacity
+    return tuple(plans)
+
+
 @functools.partial(jax.jit, donate_argnums=(0,))
 def write_swa_pages(
     pages: jax.Array | tuple[jax.Array, jax.Array],
@@ -19,6 +97,7 @@ def write_swa_pages(
     values: jax.Array,
     *,
     prepared: tuple | None = None,
+    plan: tuple | None = None,
 ) -> jax.Array | tuple[jax.Array, jax.Array]:
     """Write physical token records, preserving adjacent BF16 rows and null page.
 
@@ -56,7 +135,7 @@ def write_swa_pages(
         core_axis_name="core",
         subcore_axis_name="subcore",
     )
-    if prepared is None:
+    if prepared is None and plan is None:
         from vllm_torchtpu.kernels.experimental import decode_preparation as prep
 
         if prep.admit(
@@ -66,44 +145,23 @@ def write_swa_pages(
             buckets=prep.SWA_PACK_TOKENS,
         ):
             prepared = prep.swa_pack(banks, records, values)
+    padded = records.size + (-records.size % (lanes * cores))
     result, base = [], 0
     for bank in banks:
         capacity = bank.shape[0] * page_size
         if prepared is not None:
             destinations, masks, words = prepared[len(result)]
         else:
-            valid = (records >= max(base, page_size)) & (records < base + capacity)
-            local = jnp.where(valid, records - base, capacity)
-            order = jnp.argsort(local, stable=True)
-            ids = local[order]
-            next_ids = jnp.concatenate((ids[1:], jnp.array([capacity], jnp.int32)))
-            # TC BF16 tiles pack adjacent token rows into one physical word row.
-            pairs = ids // 2
-            boundary = (ids < capacity) & jnp.concatenate(
-                (jnp.ones(1, jnp.bool_), pairs[1:] != pairs[:-1])
+            # A step-level plan carries the value-independent sort; otherwise
+            # derive it here. Both paths pack values identically.
+            bank_plan = (
+                plan[len(result)]
+                if plan is not None
+                else plan_swa_bank(
+                    records, base=base, capacity=capacity, page_size=page_size
+                )
             )
-            even = ids % 2 == 0
-            has_odd = (~even) | (next_ids // 2 == pairs)
-            bits = jax.lax.bitcast_convert_type(values[order], jnp.uint16).astype(
-                jnp.uint32
-            )
-            next_bits = jnp.concatenate((bits[1:], jnp.zeros((1, 512), jnp.uint32)))
-            low = jnp.where(even[:, None], bits, jnp.uint32(0))
-            high = jnp.where(even[:, None], next_bits, bits)
-            high = jnp.where(has_odd[:, None], high, jnp.uint32(0))
-            words = jax.lax.bitcast_convert_type(low | (high << 16), jnp.int32)
-            masks = jnp.where(even, jnp.int32(65535), jnp.int32(0)) | jnp.where(
-                has_odd, jnp.int32(-65536), jnp.int32(0)
-            )
-            padding = -records.size % (lanes * cores)
-            destinations = jnp.pad(
-                jnp.where(boundary, pairs, -1), (0, padding), constant_values=-1
-            )
-            # SC cannot reshape a lane vector for a column broadcast in the kernel.
-            masks = jnp.broadcast_to(
-                jnp.pad(masks, (0, padding))[:, None], (records.size + padding, 512)
-            )
-            words = jnp.pad(words, ((0, padding), (0, 0)))
+            destinations, masks, words = apply_swa_bank_plan(bank_plan, values, padded)
         # Keep the page-shaped owner: reshaping the whole pool can break aliasing.
         owner = jax.new_ref(bank)
 
