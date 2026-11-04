@@ -894,6 +894,111 @@ class TPUWorker(WorkerBase):
             reshard_fn=reshard_fn,
         )
 
+    # ------------------------------------------------------------------
+    # RL weight synchronization over Raiden (tpu-sync). Same worker-side
+    # method set as tpu-inference's TPUWorker, so tunix's RLVllmSampler /
+    # VllmSamplerAdapter drive both engines identically through
+    # collective_rpc. See vllm_torchtpu/rl/raiden_worker_sync.py.
+    # ------------------------------------------------------------------
+    _raiden_rl_weight_sync: Any = None
+    _weight_update_active: bool = False
+
+    def init_weight_transfer_engine(self, init_info: dict[str, Any]) -> None:
+        """vLLM 0.32 RL weight-transfer entry point; binds Raiden in-process."""
+        init_info = init_info or {}
+        logger.info("init_weight_transfer_engine: %s", sorted(init_info))
+        self.bind_raiden_sync(
+            worker_index=int(init_info.get("worker_index", 0)),
+            parallelism=int(init_info.get("parallelism", 4)),
+            job_name=str(init_info.get("job_name", "rollout")),
+        )
+
+    def start_weight_update(self, free_kv_cache: bool = True) -> None:
+        """Opens a weight update session.
+
+        vllm-torchtpu has no runtime KV-cache free/realloc; Raiden writes the
+        new weights in place into the live parameter buffers, so the KV pool
+        stays allocated and only the scheduler-side prefix cache (reset by the
+        caller) is invalidated. `free_kv_cache` is accepted for API parity.
+        """
+        if self._weight_update_active:
+            raise RuntimeError(
+                "start_weight_update called while an update is already active;"
+                " call finish_weight_update first."
+            )
+        if free_kv_cache:
+            logger.info(
+                "start_weight_update(free_kv_cache=True): KV cache is kept"
+                " allocated on torch_tpu (weights are updated in place)."
+            )
+        self._weight_update_active = True
+
+    def update_weights(self, update_info: dict[str, Any]) -> None:
+        """No-op: Raiden's receiver lands the weights out of band."""
+        logger.info("update_weights is a no-op on torch_tpu (%s).", sorted(update_info or {}))
+
+    def finish_weight_update(self) -> None:
+        self._weight_update_active = False
+
+    def _require_raiden_sync(self, op: str) -> Any:
+        sync = self._raiden_rl_weight_sync
+        if sync is None:
+            raise RuntimeError(f"bind_raiden_sync must run before {op}.")
+        return sync
+
+    def bind_raiden_sync(
+        self,
+        worker_index: int = 0,
+        parallelism: int = 4,
+        job_name: str = "rollout",
+        auto_h2d: bool | None = None,
+    ) -> dict:
+        """Binds this TP rank's live weights to Raiden; returns wire-safe metadata."""
+        from vllm_torchtpu.rl import raiden_worker_sync
+
+        model = self.model_runner.get_model()
+        tp_rank = int(get_tensor_model_parallel_rank())
+        tp_size = int(self.parallel_config.tensor_parallel_size)
+        if self._raiden_rl_weight_sync is None:
+            self._raiden_rl_weight_sync = raiden_worker_sync.RaidenWorkerSync(
+                job_name=job_name,
+                worker_index=int(worker_index),
+                tp_rank=tp_rank,
+                tp_size=tp_size,
+                parallelism=int(parallelism),
+                auto_h2d=auto_h2d,
+            )
+        else:
+            self._raiden_rl_weight_sync.job_name = job_name
+            self._raiden_rl_weight_sync.worker_index = int(worker_index)
+        self._raiden_rl_weight_sync.bind(model, auto_h2d=auto_h2d)
+        if os.getenv("VERIFY_WEIGHTS", "").lower() == "true":
+            logger.info("raiden bound variables:\n%s", self._raiden_rl_weight_sync.describe())
+        return self._raiden_rl_weight_sync.metadata_dict()
+
+    def refresh_model_state_leaves(self) -> None:
+        """torch params are updated in place; only re-bind if buffers moved."""
+        sync = self._raiden_rl_weight_sync
+        if sync is not None:
+            sync.refresh_if_moved(self.model_runner.get_model())
+
+    def get_raiden_metadata(self) -> dict:
+        return self._require_raiden_sync("get_raiden_metadata").metadata_dict()
+
+    def raiden_h2d(self, uuid: int | None = None) -> dict:
+        """Blocks until the transfer that just landed is visible on device."""
+        sync = self._require_raiden_sync("raiden_h2d")
+        sync.h2d(uuid=uuid)
+        if os.getenv("VERIFY_WEIGHTS", "").lower() == "true":
+            return sync.checksums()
+        return {}
+
+    def raiden_metrics(self) -> dict:
+        return self._require_raiden_sync("raiden_metrics").metrics()
+
+    def raiden_describe(self) -> str:
+        return self._require_raiden_sync("raiden_describe").describe()
+
     def get_kv_connector_handshake_metadata(self) -> dict | None:
         if not has_kv_transfer_group():
             return None
