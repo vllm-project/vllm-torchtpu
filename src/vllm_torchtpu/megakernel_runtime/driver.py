@@ -71,7 +71,6 @@ from vllm_torchtpu.megakernel_runtime.guards import (
     check_runner_features,
     check_spec,
     detect_parallelism,
-    kv_connector_is_offloading,
     kv_connector_names,
 )
 from vllm_torchtpu.megakernel_runtime.hooks import StepContext, is_suppressed
@@ -629,8 +628,9 @@ class ProgramDriver:
                 if callable(detach):
                     detach()
                 logger.warning(
-                    "Disabling %s megakernel due to incompatible KV cache layout: %s",
+                    "Disabling %s megakernel at bind (%s): %s",
                     self._display_name,
+                    decline.code,
                     decline.message,
                 )
                 self._bound = False
@@ -756,8 +756,10 @@ class ProgramDriver:
             return False
         if not decision.eligible:
             return self._note_step(decision.reason, False)
-        self._pending = (decision, fwd, ctx)
-        return self._note_step(decision.reason, True)
+        run = self._note_step(decision.reason, True)
+        # The A/B calibrator may send an eligible step to the stock arm.
+        self._pending = (decision, fwd, ctx) if run else None
+        return run
 
     def _note_step(self, key: str, run: bool) -> bool:
         actual_run, summary = self.step_mix_tracker.note_step(
@@ -885,7 +887,6 @@ __all__ = [
     "check_runner_features",
     "check_spec",
     "detect_parallelism",
-    "kv_connector_is_offloading",
     "kv_connector_names",
     "loaded_numerics_note",
     "maybe_create",

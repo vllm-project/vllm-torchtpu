@@ -62,7 +62,7 @@ hashes, the reference checks, the vLLM integration tests).
 The folder's test uses the runtime's plugin test kit,
 `vllm_torchtpu.megakernel_runtime.testkit`:
 
-- `check_spec("<package>")`: `SPEC` is valid, `create` is a lazy
+- `check_plugin_spec("<package>")`: `SPEC` is valid, `create` is a lazy
   `"module:attr"` string, and the package imports with torch / jax / vLLM
   blocked;
 - `run_cpu_e2e(plugin, runner, steps, metadata=...)`: startup, bind and

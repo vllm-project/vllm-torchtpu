@@ -60,26 +60,26 @@ def make_pkg(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Any:
             sys.modules.pop(mod)
 
 
-def test_check_spec_accepts_the_toy_and_a_lazy_package(
+def test_check_plugin_spec_accepts_the_toy_and_a_lazy_package(
     mk_toy_plugin: Path, make_pkg: Any
 ) -> None:
-    spec = testkit.check_spec(testkit.TOY_MODULE)
+    spec = testkit.check_plugin_spec(testkit.TOY_MODULE)
     assert spec.name == "toy" and spec is sys.modules["toy_mk_plugin"].SPEC
-    assert testkit.check_spec(make_pkg("mk_ok_pkg")).create == ".adapter:create"
-    assert testkit.check_spec(spec, lazy_create=False) is spec
+    assert testkit.check_plugin_spec(make_pkg("mk_ok_pkg")).create == ".adapter:create"
+    assert testkit.check_plugin_spec(spec, lazy_create=False) is spec
 
 
-def test_check_spec_rejects_eager_create_heavy_imports_and_bad_refs(
+def test_check_plugin_spec_rejects_eager_create_heavy_imports_and_bad_refs(
     mk_toy_plugin: Path, make_pkg: Any
 ) -> None:
     with pytest.raises(AssertionError, match="lazy 'module:attr'"):
-        testkit.check_spec(testkit.TOY_MODULE, lazy_create=True)
+        testkit.check_plugin_spec(testkit.TOY_MODULE, lazy_create=True)
     with pytest.raises(AssertionError, match="blocked"):
-        testkit.check_spec(make_pkg("mk_heavy_pkg", extra="import torch"))
+        testkit.check_plugin_spec(make_pkg("mk_heavy_pkg", extra="import torch"))
     with pytest.raises(MegakernelConfigError, match="can't resolve create"):
-        testkit.check_spec(make_pkg("mk_bad_ref_pkg", create=".adapter:nope"))
+        testkit.check_plugin_spec(make_pkg("mk_bad_ref_pkg", create=".adapter:nope"))
     with pytest.raises(MegakernelConfigError, match="not a TpuMonoSpec"):
-        testkit.check_spec(f"{testkit.TOY_MODULE}:ToyProgram")
+        testkit.check_plugin_spec(f"{testkit.TOY_MODULE}:ToyProgram")
 
 
 def test_run_cpu_e2e_serves_the_toy(mk_toy_plugin: Path, mk_fake_runner: Any) -> None:

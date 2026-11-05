@@ -37,7 +37,7 @@ from vllm_torchtpu.megakernel.runtime import (
     EligibilityResult,
     facts_from_pool_layout,
 )
-from vllm_torchtpu.megakernel_runtime.testkit import check_spec, run_cpu_e2e
+from vllm_torchtpu.megakernel_runtime.testkit import check_plugin_spec, run_cpu_e2e
 
 from .. import adapter, model, profiles
 from .tiny import (
@@ -125,7 +125,7 @@ def _metadata(prog: Any) -> dict[str, Any]:
 
 
 def test_spec_loads_without_registering_anything() -> None:
-    spec = check_spec(FOLDER)
+    spec = check_plugin_spec(FOLDER)
     assert spec is importlib.import_module(FOLDER).SPEC
     assert spec.create == ".adapter:create"
     assert profiles.DEFAULT_PROFILE.name in profiles.PROFILES

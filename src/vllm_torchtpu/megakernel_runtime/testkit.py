@@ -13,9 +13,9 @@
 # limitations under the License.
 """Test kit for megakernel model folders and plugins (CPU, no TPU).
 
-- `check_spec(plugin)`: the plugin's `SPEC` is valid, its `create` is a lazy
-  `"module:attr"` string, and importing the plugin module loads no torch /
-  jax / vLLM.
+- `check_plugin_spec(plugin)`: the plugin's `SPEC` is valid, its `create` is a
+  lazy `"module:attr"` string, and importing the plugin module loads no torch
+  / jax / vLLM.
 - `run_cpu_e2e(plugin, runner, steps)`: what the runner does at startup and
   per step, on a fake runner: `maybe_create`, `bind_and_warmup`, then one
   `try_forward` per step; returns the outputs and the step mix.
@@ -156,7 +156,7 @@ def route_lazy_loggers(monkeypatch: pytest.MonkeyPatch, *packages: str) -> None:
             monkeypatch.setattr(lazy, "_logger", logging.getLogger(lazy._name))
 
 
-# --- check_spec -----------------------------------------------------------------
+# --- check_plugin_spec ----------------------------------------------------------
 
 _IMPORT_PROBE = """
 import importlib, json, sys
@@ -164,7 +164,6 @@ heavy, module = json.loads(sys.argv[1]), sys.argv[2]
 for name in heavy:
     sys.modules[name] = None
 importlib.import_module(module)
-print(json.dumps(sorted(n for n in heavy if sys.modules.get(n) is not None)))
 """
 
 
@@ -175,7 +174,7 @@ def _plugin_ref(plugin: str | ModuleType) -> tuple[str, str]:
     return mod, attr or "SPEC"
 
 
-def check_spec(
+def check_plugin_spec(
     plugin: str | ModuleType | TpuMonoSpec, *, lazy_create: bool | None = None
 ) -> TpuMonoSpec:
     """Check a plugin's `SPEC` (a module name, `"module:attr"`, the module or
@@ -475,7 +474,7 @@ __all__ = [
     "TOY_PLUGIN",
     "CpuE2EResult",
     "assert_rank_uniform_declines",
-    "check_spec",
+    "check_plugin_spec",
     "mk_fake_runner",
     "mk_toy_plugin",
     "route_lazy_loggers",
