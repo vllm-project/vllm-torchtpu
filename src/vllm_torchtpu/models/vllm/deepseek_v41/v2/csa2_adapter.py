@@ -10,7 +10,11 @@ import jax.numpy as jnp
 import torch
 
 from vllm_torchtpu import envs
-from vllm_torchtpu.kernels.deepseek_v4.o_projection import wo_a_projection
+from vllm_torchtpu.kernels.deepseek_v4.o_projection import (
+    fused_ab_projection,
+    is_fused_ab_supported,
+    wo_a_projection,
+)
 from vllm_torchtpu.kernels.deepseek_v41.csa2.cache import (
     prepare_main_records,
     prepare_swa_metadata,
@@ -213,6 +217,23 @@ def _project(output: jax.Array, weight: jax.Array, scales: jax.Array) -> jax.Arr
     return wo_a_projection(output, weight, scales.reshape(-1), None)
 
 
+def _project_wo(
+    output: jax.Array,
+    wo_a: jax.Array,
+    wo_a_scales: jax.Array,
+    wo_b: jax.Array,
+    wo_b_scales: jax.Array,
+) -> jax.Array:
+    """``wo_b(project(output))``; one kernel at the qualified decode shapes."""
+    from vllm_torchtpu.layers.adapter.linear_common import _quantized_matmul_jax
+
+    if is_fused_ab_supported(output, wo_a, wo_a_scales, wo_b, wo_b_scales):
+        return fused_ab_projection(
+            output, wo_a, wo_a_scales.reshape(-1), wo_b, wo_b_scales
+        )
+    return _quantized_matmul_jax(_project(output, wo_a, wo_a_scales), wo_b, wo_b_scales)
+
+
 def _manual_bridge(function, mesh, tensor_args, out_specs):
     from jax.sharding import PartitionSpec as P
 
@@ -286,6 +307,12 @@ def initialize_csa2_ops() -> None:
             _project,
             (P(),) * 3,
             lambda x, w, *_: x.new_empty((x.shape[0], w.shape[1])),
+        ),
+        (
+            "project_wo",
+            _project_wo,
+            (P(),) * 5,
+            lambda x, wa, sa, wb, *_: x.new_empty((x.shape[0], wb.shape[1])),
         ),
     )
     output_counts = {
@@ -449,6 +476,17 @@ def project(
     output: torch.Tensor, weight: torch.Tensor, scales: torch.Tensor
 ) -> torch.Tensor:
     return _ops["project"](output, weight, scales)
+
+
+def project_wo(
+    output: torch.Tensor,
+    wo_a: torch.Tensor,
+    wo_a_scales: torch.Tensor,
+    wo_b: torch.Tensor,
+    wo_b_scales: torch.Tensor,
+) -> torch.Tensor:
+    """``project`` followed by the per-channel FP8 ``wo_b`` (canonical (k, n))."""
+    return _ops["project_wo"](output, wo_a, wo_a_scales, wo_b, wo_b_scales)
 
 
 def prepare_swa(

@@ -101,6 +101,32 @@ def test_buffered_projection_traces_memory_space_boundary(monkeypatch, tokens):
     assert "wo_a_projection_buffered" in graph
 
 
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("tokens", [1, 240, 256, 288, 2048])
+def test_fused_ab_dispatch_follows_both_envelopes(monkeypatch, tokens):
+    from vllm_torchtpu.models.vllm.deepseek_v41.v2.csa2_adapter import _project_wo
+
+    monkeypatch.setattr(oa, "get_tpu_version", lambda: 7)
+    monkeypatch.setattr(ob, "get_tpu_version", lambda: 7)
+    inputs = _abstract_inputs(tokens)
+    fused = tokens in (240, 288)
+    assert oa.is_fused_ab_supported(*inputs) is fused
+    graph = str(jax.make_jaxpr(_project_wo)(*inputs))
+    assert ("wo_ab_projection_buffered" in graph) is fused
+    assert "wo_a_projection_buffered" not in graph  # never the two-kernel chain
+
+
+@pytest.mark.cpu_test
+def test_fused_ab_rejects_unbuffered_wo_b(monkeypatch):
+    monkeypatch.setattr(oa, "get_tpu_version", lambda: 7)
+    monkeypatch.setattr(ob, "get_tpu_version", lambda: 7)
+    x, wa, sa, wb, sb = _abstract_inputs()
+    narrow = jax.ShapeDtypeStruct((8192, 4096), jnp.float8_e4m3fn)
+    assert not oa.is_fused_ab_supported(x, wa, sa, narrow, sb)
+    with pytest.raises(ValueError):
+        oa.fused_ab_projection(x, wa, sa, narrow, sb)
+
+
 def _reference_a(x: jax.Array, w: jax.Array, scale: jax.Array) -> jax.Array:
     # Reproduce the pre-specialization defaults, bypassing automatic dispatch.
     tile_t = next(n for n in range(min(x.shape[0], 1024), 0, -1) if x.shape[0] % n == 0)
@@ -151,6 +177,7 @@ def projection_ops():
             actual_a,
             ref_b(reference_a, wb, sb),
             quantized_matmul(actual_a, wb, sb),
+            csa2_adapter.project_wo(x, wa, sa, wb, sb),
         )
 
     gen = torch.Generator().manual_seed(4919)
@@ -200,8 +227,14 @@ def test_output_projection_bridge_is_bitwise_equal(projection_ops, tokens, patte
         activations[:32] = 0
         activations[32:96] *= 0.0001
         activations[96:192] *= 100
-    ref_a, actual_a, ref_chain, actual_chain = compiled(activations.to("tpu"), *weights)
-    for reference, actual in ((ref_a, actual_a), (ref_chain, actual_chain)):
+    ref_a, actual_a, ref_chain, actual_chain, fused = compiled(
+        activations.to("tpu"), *weights
+    )
+    for reference, actual in (
+        (ref_a, actual_a),
+        (ref_chain, actual_chain),
+        (actual_chain, fused),
+    ):
         reference, actual = reference.cpu(), actual.cpu()
         assert torch.isfinite(actual).all()
         assert torch.equal(reference.view(torch.int16), actual.view(torch.int16))

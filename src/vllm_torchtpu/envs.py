@@ -11,6 +11,7 @@ if TYPE_CHECKING:
     TPU_DEEPSEEK_V41_IMPL: str = "v2"
     TPU_DEEPSEEK_V41_ENGRAM_CPU_OFFLOAD: bool = False
     TPU_DEEPSEEK_V41_ENGRAM_HBM: str = "auto"
+    TPU_DEEPSEEK_V41_FUSED_WO_AB: bool = True
     TPU_DEEPSEEK_V41_CSA2_DEEP_GATHER: bool = True
     TPU_K3_SP_PREFILL: bool = False
     TPU_INCREMENTAL_BLOCK_TABLE_UPLOAD: bool = True
@@ -413,6 +414,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "auto",
         ["auto", "off", "first", "all"],
         case_sensitive=False,
+    ),
+    # CSA2 layers: run wo_a and wo_b as one buffered decode kernel (the wo_a
+    # output stays in VMEM). Same arithmetic as the two kernels (bit-exact).
+    "TPU_DEEPSEEK_V41_FUSED_WO_AB": env_bool(
+        "TPU_DEEPSEEK_V41_FUSED_WO_AB", default=True
     ),
     # CSA2 SparseCore word/scale gather: three staging slots in flight and
     # DMA-zeroed invalid rows instead of two slots cleared by vector stores
