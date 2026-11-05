@@ -59,6 +59,7 @@ if TYPE_CHECKING:
     TPU_DCP_MERGE_CHUNKED_SMALL: int = 2
     TPU_DCP_MLA_MERGE_PIECES: int = 2
     TPU_DCP_MLA_MERGE_PIECES_MIN_TOKENS: int = 2048
+    TPU_DCP_MLA_PIECE_ORDER: str = "barrier"
     TPU_DCP_MERGE_WEIGHTED_HM: bool = True
     TPU_DCP_MERGE_WEIGHTED_HM_MIN_TOKENS: int = 2048
     TPU_MLA_DECODE_BODY_LEVERS: str = "1"
@@ -753,6 +754,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_DCP_MLA_MERGE_PIECES_MIN_TOKENS": env_int(
         "TPU_DCP_MLA_MERGE_PIECES_MIN_TOKENS", 2048
     ),
+    # Merge-piece attention order (sparse_mla.PIECE_ORDERS); "edge" survives XLA.
+    "TPU_DCP_MLA_PIECE_ORDER": env_str("TPU_DCP_MLA_PIECE_ORDER", "barrier"),
     # The chunked reduce-scatter merge (TPU_DCP_MERGE_CHUNKED) builds each
     # chunk's weighted operand heads-major in one TensorCore Pallas kernel
     # (`kernels/lse_rescale.py`, as `cp_lse_ag_out_rs`) instead of a
