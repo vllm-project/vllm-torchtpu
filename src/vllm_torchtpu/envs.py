@@ -170,6 +170,7 @@ if TYPE_CHECKING:
     TPU_MOE_EP_TP_SIZE: int = 1
     TPU_MOE_ROUTER_TOPK: str = "rowmax"
     TPU_MOE_ROUTER_TOPK_BIAS: bool = True
+    TPU_MOE_EXPERT_PLACEMENT: str = ""
     USE_MOE_FUSED_EP_KERNEL: bool = False
     MOE_FUSED_EP_KERNEL_IMPL: str | None = None
     MOE_FUSED_EP_ENABLE_W4A8: bool = False
@@ -1649,6 +1650,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # the separate scores.gather (one gather fusion per MoE layer) goes away.
     # Ids and weights are bit-identical to the gather path.
     "TPU_MOE_ROUTER_TOPK_BIAS": env_bool("TPU_MOE_ROUTER_TOPK_BIAS", True),
+    # Per-layer expert placement table (moe_expert_placement): experts are
+    # renumbered at load so linear EP gives each rank equal expected routed
+    # rows. "" keeps checkpoint order; "glm52-ep16-prefill" is GLM-5.2's
+    # table for EP over 16 ranks, chosen from prefill routing.
+    # Migration switch, one value per table: delete it, applying a model's
+    # table whenever its layers and EP size match, once a serving run of each
+    # model with a table shows no topline worse than checkpoint order.
+    "TPU_MOE_EXPERT_PLACEMENT": env_str("TPU_MOE_EXPERT_PLACEMENT", ""),
     # Run the whole expert-parallel MoE layer -- top-k, dispatch, both expert
     # matmuls, combine, and the cross-rank transport -- as one SPMD Pallas
     # program, instead of bracketing the per-rank compute with vLLM's
