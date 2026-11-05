@@ -164,6 +164,24 @@ def _rotate_gptj(x: jax.Array) -> jax.Array:
     return _lane_gather(x, lane ^ 1) * sign
 
 
+def _rope_rows(x: jax.Array, cos: jax.Array, sin: jax.Array) -> jax.Array:
+    """Rotates an f32 chunk by ``_cos_sin_lanes``' ``cos``/``sin``, broadcast to
+    its shape."""
+    rotated = _rotate_gptj(x)
+    return x * cos + rotated * sin
+
+
+def _scale_rows(y: jax.Array, quant_dtype: jnp.dtype) -> tuple[jax.Array, jax.Array]:
+    """``y`` divided by its per-row scale, ready to cast to ``quant_dtype``, and
+    that ``[..., 1]`` scale."""
+    qmax = dtype_max(quant_dtype)
+    # One scale per row, i.e. over the whole ``LANE``-wide channel axis.
+    abs_max = jnp.max(jnp.abs(y), axis=-1, keepdims=True)
+    scale = abs_max / qmax
+    scale_inv = jnp.where(abs_max == 0.0, 0.0, 1.0 / scale)
+    return y * scale_inv, scale
+
+
 def _rope_lanes(
     x: jax.Array, cos_sin: jax.Array, *, rotary_dim: int, inverse: bool
 ) -> jax.Array:
@@ -172,7 +190,7 @@ def _rope_lanes(
     if x.ndim == 3:  # [tokens, heads, lanes]: cos/sin are per token
         cos = cos[:, None, :]
         sin = sin[:, None, :]
-    return x * cos + _rotate_gptj(x) * sin
+    return _rope_rows(x, cos, sin)
 
 
 def _rope_body(
@@ -202,12 +220,8 @@ def _rope_body(
         return
 
     q_ref, scale_ref = out_refs
-    qmax = dtype_max(quant_dtype)
-    # One scale per row, i.e. over the whole ``LANE``-wide channel axis.
-    abs_max = jnp.max(jnp.abs(y), axis=-1, keepdims=True)
-    scale = abs_max / qmax
-    scale_inv = jnp.where(abs_max == 0.0, 0.0, 1.0 / scale)
-    q_ref[...] = (y * scale_inv).astype(quant_dtype)
+    scaled, scale = _scale_rows(y, quant_dtype)
+    q_ref[...] = scaled.astype(quant_dtype)
     scale_ref[...] = scale.reshape(scale_ref.shape)
 
 
