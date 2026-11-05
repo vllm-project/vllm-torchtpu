@@ -3685,9 +3685,10 @@ class TPUModelRunner(GPUModelRunner):
         input_error = None
         try:
             if scheduler_output is not None:
-                mm_hashes, mm_kwargs, _ = self._batch_mm_inputs_from_scheduler(
-                    scheduler_output
-                )
+                with TraceAnnotation("MMEncoder.BatchInputs"):
+                    mm_hashes, mm_kwargs, _ = self._batch_mm_inputs_from_scheduler(
+                        scheduler_output
+                    )
                 if mm_kwargs:
                     if self.lora_config or any(m != "image" for m, _ in mm_kwargs):
                         raise ValueError(
@@ -3706,15 +3707,17 @@ class TPUModelRunner(GPUModelRunner):
         except (KeyError, TypeError, ValueError) as exc:
             input_error = str(exc)
         synchronize_tensors(wait=False)
-        outputs = manager.execute_dp_coordinated(kwargs, input_error=input_error)
+        with TraceAnnotation("MMEncoder.ExecuteDPCoordinated"):
+            outputs = manager.execute_dp_coordinated(kwargs, input_error=input_error)
         if scheduler_output is not None:
-            for mm_hash, output in zip(mm_hashes, outputs, strict=True):
-                self._cache_encoder_output(
-                    mm_hash,
-                    output,
-                    scheduler_output.ec_manager_metadata,
-                    scheduler_output.free_encoder_mm_hashes,
-                )
+            with TraceAnnotation("MMEncoder.CacheOutputs"):
+                for mm_hash, output in zip(mm_hashes, outputs, strict=True):
+                    self._cache_encoder_output(
+                        mm_hash,
+                        output,
+                        scheduler_output.ec_manager_metadata,
+                        scheduler_output.free_encoder_mm_hashes,
+                    )
 
     def _run_dp_dummy_chunk(self, bucket: int) -> None:
         self._dummy_run(
@@ -3818,13 +3821,14 @@ class TPUModelRunner(GPUModelRunner):
         # explicitly, otherwise the encoder never runs, image placeholder
         # tokens get plain text embeddings, and the model produces garbage.
         if self.supports_mm_inputs and self._pp_is_first:
-            if self._dp_lockstep_enabled():
-                self._execute_dp_mm_encoder(scheduler_output)
-            else:
-                has_encoder_inputs = bool(scheduler_output.scheduled_encoder_inputs)
-                if has_encoder_inputs:
-                    synchronize_tensors(wait=False)
-                self._execute_mm_encoder(scheduler_output)
+            with TraceAnnotation("Runner.MMEncoder"):
+                if self._dp_lockstep_enabled():
+                    self._execute_dp_mm_encoder(scheduler_output)
+                else:
+                    has_encoder_inputs = bool(scheduler_output.scheduled_encoder_inputs)
+                    if has_encoder_inputs:
+                        synchronize_tensors(wait=False)
+                    self._execute_mm_encoder(scheduler_output)
 
         # Profile the current batch composition (prefill vs decode) if phased profiling
         # is enabled.
@@ -3853,11 +3857,13 @@ class TPUModelRunner(GPUModelRunner):
         mm_tok_cumsum = None
         mm_cumsum_np = None
         if self.supports_mm_inputs and self._pp_is_first:
-            mm_embeds_list, is_mm_embed_full = self._gather_mm_embeddings(
-                scheduler_output
-            )
+            with TraceAnnotation("Runner.GatherMMEmbeddings"):
+                mm_embeds_list, is_mm_embed_full = self._gather_mm_embeddings(
+                    scheduler_output
+                )
             if mm_embeds_list:
-                mm_embeds_flat = torch.cat(mm_embeds_list)
+                with TraceAnnotation("Runner.ConcatMMEmbeddings"):
+                    mm_embeds_flat = torch.cat(mm_embeds_list)
             req_tok = np.array(
                 [
                     scheduler_output.num_scheduled_tokens[r]
@@ -3892,7 +3898,10 @@ class TPUModelRunner(GPUModelRunner):
 
         # NOTE: setup current batch's metadata for kv connector.
         # Verified with TPURaidenConnector, TPUConnector, OffloadingConnector
-        with set_forward_context(None, self.vllm_config):
+        with (
+            TraceAnnotation("Runner.KVConnectorSetup"),
+            set_forward_context(None, self.vllm_config),
+        ):
             # Raiden overlap: block the worker main thread on the KV load only
             # in inline mode. In the default async mode the load (network pull
             # + DMA H2D into the cache) runs entirely on the Raiden C++
@@ -3917,32 +3926,35 @@ class TPUModelRunner(GPUModelRunner):
                 chunk_index += 1
                 continue
 
-            (
-                attn_metadata,
-                logits_indices,
-                padded_num_reqs,
-                num_reqs,
-                end_index,
-                cur_input_indices,
-                pre_next_tokens_indices,
-                spec_decode_metadata,
-                request_major_input_ids,
-                draft_sequence_layout_plan,
-            ) = self._prepare_inputs(
-                scheduler_output, start_index, num_decode_reqs, num_windowed_reqs
-            )
+            with TraceAnnotation("Runner.PrepareInputs"):
+                (
+                    attn_metadata,
+                    logits_indices,
+                    padded_num_reqs,
+                    num_reqs,
+                    end_index,
+                    cur_input_indices,
+                    pre_next_tokens_indices,
+                    spec_decode_metadata,
+                    request_major_input_ids,
+                    draft_sequence_layout_plan,
+                ) = self._prepare_inputs(
+                    scheduler_output, start_index, num_decode_reqs, num_windowed_reqs
+                )
 
-            # Seed newly-advanced mamba state blocks before the forward reads
-            # them (chunk boundaries, decode crossings, prefix-cache resumes).
-            self._flush_mamba_state_seed_copies()
+            with TraceAnnotation("Runner.PreForwardStaging"):
+                # Seed newly-advanced mamba state blocks before the forward
+                # reads them (chunk boundaries, decode crossings, prefix-cache
+                # resumes).
+                self._flush_mamba_state_seed_copies()
 
-            # A recycled slot/block still carries the previous request's read
-            # offset; clear it before this chunk's forward gathers it.
-            self._reset_read_offsets_for_new_requests(start_index, num_reqs)
+                # A recycled slot/block still carries the previous request's
+                # read offset; clear it before this chunk's forward gathers it.
+                self._reset_read_offsets_for_new_requests(start_index, num_reqs)
 
-            input_ids = self._apply_async_token_substitution(
-                self.input_ids, cur_input_indices, pre_next_tokens_indices
-            )
+                input_ids = self._apply_async_token_substitution(
+                    self.input_ids, cur_input_indices, pre_next_tokens_indices
+                )
             # Async spec: the drafts the target verifies live in the substituted
             # input_ids (host input_ids_cpu holds placeholders), so re-source the
             # rejection sampler's draft_token_ids from the device.
@@ -3994,9 +4006,10 @@ class TPUModelRunner(GPUModelRunner):
 
             self._record_input_staging_fence()
             if self._pp_is_first:
-                input_ids, inputs_embeds = self._get_model_inputs(
-                    input_ids, chunk_mm_inputs
-                )
+                with TraceAnnotation("Runner.EmbedInputs"):
+                    input_ids, inputs_embeds = self._get_model_inputs(
+                        input_ids, chunk_mm_inputs
+                    )
             else:
                 # Later stages start from the previous stage's hidden
                 # states; the token ids only size the forward.
