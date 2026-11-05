@@ -57,7 +57,11 @@ from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4.deepseek_v4_compressor 
 from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4.deepseek_v4_indexer import (
     VllmDeepseekV4Indexer,
 )
-from vllm_torchtpu.layers.adapter.quantization.fp8 import apply_fp8_linear_pair
+from vllm_torchtpu.layers.adapter.quantization.fp8 import (
+    apply_fp8_linear_keep_input,
+    apply_fp8_linear_pair,
+    is_fp8_per_channel_linear,
+)
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
     get_pallas_op_mesh,
@@ -570,17 +574,27 @@ class VllmDeepseekV4MLAAttention(
         out: torch.Tensor | None,
     ) -> torch.Tensor:
         """Execute indexing, state compression, and kernel attention dispatch."""
-        # The indexer projects the same qr: one op quantizes it for both.
-        indexer_q = None
-        pair = (
-            None
-            if self.indexer is None
-            else apply_fp8_linear_pair(self.wq_b, self.indexer.wq_b, qr)
-        )
-        if pair is None:
-            q = self.wq_b(qr)
+        # The indexer projects the same qr. It takes qr as wq_b quantized it
+        # and projects it inside its own op, or one op quantizes qr for both.
+        indexer_q = quantized_qr = None
+        if (
+            self.indexer is not None
+            and qr.dtype == torch.bfloat16
+            and is_fp8_per_channel_linear(self.wq_b)
+            and is_fp8_per_channel_linear(self.indexer.wq_b)
+        ):
+            q, qr_q, qr_scale = apply_fp8_linear_keep_input(self.wq_b, qr)
+            quantized_qr = (qr_q, qr_scale)
         else:
-            q, indexer_q = pair
+            pair = (
+                None
+                if self.indexer is None
+                else apply_fp8_linear_pair(self.wq_b, self.indexer.wq_b, qr)
+            )
+            if pair is None:
+                q = self.wq_b(qr)
+            else:
+                q, indexer_q = pair
         q = q.view(qr.shape[0], self.mla_attn.n_local_heads, self.mla_attn.head_dim)
         q = self.qnorm_rope(q, positions)
         kv = self.kv_rope(kv, positions)
@@ -612,6 +626,7 @@ class VllmDeepseekV4MLAAttention(
                 indexer_emb,
                 compress=not paired,
                 projected_q=indexer_q,
+                quantized_query=quantized_qr,
             )
         if compressor is not None and not paired:
             compressor(hidden_states, positions, self.mla_attn.rotary_emb)
