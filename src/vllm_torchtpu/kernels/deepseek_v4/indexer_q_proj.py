@@ -18,7 +18,7 @@ compute, but the bf16 projection never leaves VMEM. Each grid step projects a
 tile of tokens through the resident weight, one column chunk at a time, and
 rotates and scales each head's rows in the dot's own layout, tokens on
 sublanes: every head of a token tile shares one cos/sin tile, and each row's
-scale lands in its lane of the ``[T, H]`` scales by a select. The scaled rows
+scale is stored straight into its lane of the ``[T, H]`` scales. The scaled rows
 go to VMEM through stores strided by a tile, which put each token's heads on
 sublanes, and are cast to the ``[T, H, LANE]`` fp8 query from there.
 """
@@ -155,8 +155,6 @@ def _kernel(
     cos, sin = _cos_sin_lanes(
         cos_sin_ref[slot], rotary_dim=cos_sin_ref.shape[-1], inverse=False
     )
-    lane = jax.lax.broadcasted_iota(jnp.int32, (TILE_T, LANE), 1)
-    scales = jnp.zeros((TILE_T, LANE), jnp.float32)
     for c in range(num_chunks):
 
         @pl.when(step == 0)
@@ -185,8 +183,7 @@ def _kernel(
                 stride=SUBLANE,
             )
             scaled_ref[rows, :] = scaled
-            scales = jnp.where(lane == head, scale, scales)
-    scale_ref[...] = scales[:, :num_heads]
+            scale_ref[:, pl.ds(head, 1)] = scale
 
     # Each FP8_SUBLANES-head tile of the query is FP8_SUBLANES // SUBLANE
     # consecutive SUBLANE-head blocks of `scaled_ref`.
