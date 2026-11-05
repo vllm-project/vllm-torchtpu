@@ -28,6 +28,19 @@ RUN --mount=type=cache,target=/opt/cargo/registry \
     install -m 0755 target/release/vllm-router /usr/local/bin/vllm-router && \
     vllm-router --version
 
+# vllm-rs, vLLM's Rust frontend, taken from the vLLM wheel published for the
+# commit the image installs (see docker/fetch_vllm_rs.py): PyPI's for a release
+# tag, wheels.vllm.ai's for a commit. vLLM's own install builds it only when
+# cargo is present, and compiling it here would add minutes to every image
+# build. A commit with no published wheel yet, like the upstream HEAD of an
+# integration run, gets none. A run uses it only with VLLM_USE_RUST_FRONTEND=1.
+FROM python:3.12-slim-bookworm AS vllm-rs
+
+ARG VLLM_COMMIT_HASH
+COPY docker/fetch_vllm_rs.py /tmp/fetch_vllm_rs.py
+RUN python /tmp/fetch_vllm_rs.py "${VLLM_COMMIT_HASH}" /out && \
+    if [ -e /out/vllm-rs ]; then /out/vllm-rs --version; fi
+
 # Variant 1: The Runtime (Base Image with pre-installed dependencies)
 # This variant provides the core runtime environment with all external dependencies
 # (including torch-tpu) pre-installed.
@@ -37,10 +50,11 @@ RUN --mount=type=cache,target=/opt/cargo/registry \
 FROM python:3.12-slim-bookworm AS base
 
 # curl for health checks, git so uv can clone the vllm source dependency, the
-# toolchain for packages that build from source, and libgoogle-perftools4 for
-# the tcmalloc allocator enabled below. build-essential already pulls in gcc,
-# g++, make and libc6-dev.
-RUN apt-get update && apt-get install -y curl git build-essential cmake ninja-build libgoogle-perftools4 && rm -rf /var/lib/apt/lists/*
+# toolchain for packages that build from source, libgoogle-perftools4 for the
+# tcmalloc allocator enabled below, and numactl for vLLM's --numa-bind, which
+# launches each worker under it. build-essential already pulls in gcc, g++,
+# make and libc6-dev.
+RUN apt-get update && apt-get install -y curl git build-essential cmake ninja-build libgoogle-perftools4 numactl && rm -rf /var/lib/apt/lists/*
 
 # tcmalloc for every derived image. Set after the install above, so that
 # intermediate steps do not fail preloading a library that is not there yet.
@@ -76,6 +90,17 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     uv pip install --system \
       -r pyproject.toml \
       --group vllm
+
+# The Rust frontend, when the vllm-rs stage found one: on PATH, and inside the
+# vllm package, where vLLM's build would install it and where
+# VLLM_RUST_FRONTEND_PATH=auto (the default) looks, so VLLM_USE_RUST_FRONTEND=1
+# alone selects it. The path is not set here: vLLM warns about it whenever it
+# reads its env vars without the frontend enabled.
+COPY --from=vllm-rs /out/ /usr/local/bin/
+RUN if [ -e /usr/local/bin/vllm-rs ]; then \
+      ln -s /usr/local/bin/vllm-rs \
+        "$(python -c 'import importlib.util, os; print(os.path.dirname(importlib.util.find_spec("vllm").origin))')/vllm-rs"; \
+    fi
 
 
 # Variant 2: The CI Environment (CI/CD Variant)
