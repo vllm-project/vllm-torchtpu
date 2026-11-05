@@ -61,6 +61,9 @@ _CI_MERGE_MARKER_RE = re.compile(
 _CI_MERGE_ACTOR_RE = re.compile(
     r"^<!-- ?ci-merge-actor: ?([A-Za-z0-9_.\[\]-]+) ?-->$", re.MULTILINE
 )
+_CI_MERGE_SHA_RE = re.compile(
+    r"^<!-- ?ci-merge-sha: ?([0-9a-fA-F]{7,64}) ?-->$", re.MULTILINE
+)
 
 
 class BootstrapError(Exception):
@@ -100,7 +103,7 @@ class BuildContext:
     merge_queue_base_commit: str = ""
     ci_run_tpu: bool = False
     ci_precheck: bool = False
-    ci_pr_tpu_opt_in: bool = False
+    ci_pr_push_cpu_only: bool = False
     ci_extras: tuple[str, ...] = ()
     mq_extras: tuple[str, ...] = ()
 
@@ -193,7 +196,7 @@ class BuildContext:
         if "skip-tpu-ci" in self.labels:
             return False
         # after cutover, PR pushes are CPU-only
-        return not (self.is_pr and self.ci_pr_tpu_opt_in)
+        return not (self.is_pr and self.ci_pr_push_cpu_only)
 
     @classmethod
     def from_env(cls, env: Mapping[str, str]) -> BuildContext:
@@ -250,7 +253,7 @@ class BuildContext:
             merge_queue_base_commit=env.get("BUILDKITE_MERGE_QUEUE_BASE_COMMIT", ""),
             ci_run_tpu=_env_or(env, "CI_RUN_TPU", "0") == "1",
             ci_precheck=_env_or(env, "CI_PRECHECK", "0") == "1",
-            ci_pr_tpu_opt_in=_env_or(env, "CI_PR_TPU_OPT_IN", "0") == "1",
+            ci_pr_push_cpu_only=_env_or(env, "CI_PR_PUSH_CPU_ONLY", "0") == "1",
             ci_extras=ci_extras,
         )
 
@@ -436,7 +439,7 @@ def read_pinned_vllm_commit(repo_root: pathlib.Path = _REPO_ROOT) -> str:
 
 
 def parse_merge_queue_comments_page(
-    items: object, *, head_committed_at: str = ""
+    items: object, *, head_sha: str = ""
 ) -> tuple[bool, tuple[str, ...], str]:
     """Extract the last valid `/ci merge` bot marker from a comments page."""
     if not isinstance(items, list):
@@ -445,27 +448,24 @@ def parse_merge_queue_comments_page(
     for c in items:
         user = c.get("user") if isinstance(c, dict) else None
         body = c.get("body") if isinstance(c, dict) else None
-        created_at = c.get("created_at") if isinstance(c, dict) else None
         if (
             not isinstance(user, dict)
             or user.get("type") != "Bot"
             or user.get("login") != _CI_MERGE_BOT_LOGIN
             or not isinstance(body, str)
-            or (
-                head_committed_at
-                and (not isinstance(created_at, str) or created_at < head_committed_at)
-            )
         ):
             continue
         actor_m = _CI_MERGE_ACTOR_RE.search(body)
         c_actor = actor_m.group(1) if actor_m else ""
+        sha_m = _CI_MERGE_SHA_RE.search(body)
+        c_sha = sha_m.group(1) if sha_m else ""
         for match in _CI_MERGE_MARKER_RE.finditer(body):
             parts = tuple(p.strip() for p in match.group(1).split(",") if p.strip())
             if bad := [p for p in parts if p not in _VALID_MERGE_EXTRAS]:
                 raise ValueError(f"unknown extra {bad[0]!r}")
             if "precheck-only" in parts and len(parts) > 1:
                 raise ValueError("precheck-only cannot be combined with other extras")
-            if parts and not c_actor:
+            if parts and (not c_actor or not c_sha or (head_sha and c_sha != head_sha)):
                 continue
             found, latest_extras, latest_actor = (
                 True,
@@ -713,33 +713,30 @@ def _merge_queue_pr_extras(
             ) as fallback_exc:
                 return None, _format_request_error(fallback_exc)
 
-    head_committed_at: str | None = None
+    head_sha: str | None = None
     latest_extras: tuple[str, ...] = ()
     latest_actor = ""
     for page in range(1, 51):
         raw, err = _fetch(f"issues/{pr_number}/comments?per_page=100&page={page}")
         if err is not None or raw is None:
             return (), "", err
-        if head_committed_at is None and "ci-merge-extras:" in raw:
-            commit_raw, err = _fetch(f"commits/refs/pull/{pr_number}/head")
-            if err is not None or commit_raw is None:
+        if head_sha is None and "ci-merge-extras:" in raw:
+            pr_raw, err = _fetch(f"pulls/{pr_number}")
+            if err is not None or pr_raw is None:
                 return (), "", err
             try:
-                commit_obj = json.loads(commit_raw)
+                pr_obj = json.loads(pr_raw)
             except ValueError as exc:
                 return (), "", (" ".join(str(exc).split()) or "invalid JSON")
-            committer = (
-                commit_obj.get("commit", {}).get("committer", {})
-                if isinstance(commit_obj, dict)
-                and isinstance(commit_obj.get("commit"), dict)
-                else {}
-            )
-            date = committer.get("date") if isinstance(committer, dict) else None
-            head_committed_at = date if isinstance(date, str) else ""
+            head = pr_obj.get("head") if isinstance(pr_obj, dict) else None
+            sha = head.get("sha") if isinstance(head, dict) else None
+            if not isinstance(sha, str) or not sha:
+                return (), "", "missing PR head SHA"
+            head_sha = sha
         try:
             items = json.loads(raw)
             found, p_extras, p_actor = parse_merge_queue_comments_page(
-                items, head_committed_at=head_committed_at or ""
+                items, head_sha=head_sha or ""
             )
         except ValueError as exc:
             return (), "", (" ".join(str(exc).split()) or "invalid JSON")
@@ -747,6 +744,8 @@ def _merge_queue_pr_extras(
             latest_extras, latest_actor = p_extras, p_actor
         if len(items) < 100:
             break
+    else:
+        return (), "", "comment history exceeds 5000 comments"
     return latest_extras, latest_actor, None
 
 

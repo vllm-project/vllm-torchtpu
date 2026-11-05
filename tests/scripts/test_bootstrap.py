@@ -484,7 +484,7 @@ class TestBootstrapUnits(unittest.TestCase):
         )
 
         # `/ci merge` bot marker parser (trusts only github-actions[bot], whole-line
-        # markers, non-empty actor for non-empty extras, and comments >= head commit).
+        # markers, non-empty actor + matching ci-merge-sha for non-empty extras).
         with self.assertRaises(ValueError):
             bp.parse_merge_queue_comments_page({"not": "a-list"})
         gh_bot = {"type": "Bot", "login": "github-actions[bot]"}
@@ -494,7 +494,8 @@ class TestBootstrapUnits(unittest.TestCase):
                 "user": {"type": "Bot", "login": "other-app[bot]"},
                 "body": (
                     "<!-- ci-merge-extras: precheck-only -->\n"
-                    "<!-- ci-merge-actor: mallory -->"
+                    "<!-- ci-merge-actor: mallory -->\n"
+                    "<!-- ci-merge-sha: abcdef1234 -->"
                 ),
             },
             {
@@ -510,42 +511,51 @@ class TestBootstrapUnits(unittest.TestCase):
             },
             {
                 "user": gh_bot,
-                "created_at": "2026-11-05T10:05:00Z",
                 "body": (
-                    "Queued.\n\n"
-                    "<!-- ci-merge-extras: perf-eval, nightly-suite -->\n"
+                    "<!-- ci-merge-extras: precheck-only -->\n"
                     "<!-- ci-merge-actor: alice -->"
                 ),
             },
             {
                 "user": gh_bot,
-                "created_at": "2026-11-05T10:06:00Z",
+                "body": (
+                    "Queued.\n\n"
+                    "<!-- ci-merge-extras: perf-eval, nightly-suite -->\n"
+                    "<!-- ci-merge-actor: alice -->\n"
+                    "<!-- ci-merge-sha: abcdef1234 -->"
+                ),
+            },
+            {
+                "user": gh_bot,
                 "body": ("<!-- ci-merge-extras:  -->\n<!-- ci-merge-actor: bob -->"),
             },
         ]
         self.assertEqual(
-            bp.parse_merge_queue_comments_page(comments[:4]),
+            bp.parse_merge_queue_comments_page(comments[:5], head_sha="abcdef1234"),
             (False, (), ""),
         )
         self.assertEqual(
-            bp.parse_merge_queue_comments_page(comments[:5]),
+            bp.parse_merge_queue_comments_page(comments[:6], head_sha="abcdef1234"),
             (True, ("perf-eval", "nightly-suite"), "alice"),
         )
-        self.assertEqual(bp.parse_merge_queue_comments_page(comments), (True, (), ""))
-        # Stale marker before a new push is ignored when head_committed_at is newer.
+        self.assertEqual(
+            bp.parse_merge_queue_comments_page(comments, head_sha="abcdef1234"),
+            (True, (), ""),
+        )
+        # Stale marker before a new push (different head_sha) is ignored.
         self.assertEqual(
             bp.parse_merge_queue_comments_page(
                 [
                     {
                         "user": gh_bot,
-                        "created_at": "2026-11-05T09:55:00Z",
                         "body": (
                             "<!-- ci-merge-extras: precheck-only -->\n"
-                            "<!-- ci-merge-actor: alice -->"
+                            "<!-- ci-merge-actor: alice -->\n"
+                            "<!-- ci-merge-sha: oldsha0000 -->"
                         ),
                     }
                 ],
-                head_committed_at="2026-11-05T10:00:00Z",
+                head_sha="newsha1111",
             ),
             (False, (), ""),
         )
@@ -704,14 +714,14 @@ class TestBootstrapUnits(unittest.TestCase):
                 "pr+perf-eval",
             ),
             (
-                {"BUILDKITE_PULL_REQUEST": "10", "CI_PR_TPU_OPT_IN": "1"},
+                {"BUILDKITE_PULL_REQUEST": "10", "CI_PR_PUSH_CPU_ONLY": "1"},
                 (),
                 "pr+cpu-only",
             ),
             (
                 {
                     "BUILDKITE_PULL_REQUEST": "10",
-                    "CI_PR_TPU_OPT_IN": "1",
+                    "CI_PR_PUSH_CPU_ONLY": "1",
                     "CI_RUN_TPU": "1",
                 },
                 (),
@@ -802,15 +812,13 @@ class TestBootstrapUnits(unittest.TestCase):
                 if "comments" in self.path:
                     if mode == "bad_json":
                         self.wfile.write(b"{not-json")
-                    elif mode == "page_full" and self.path.endswith("page=1"):
+                    elif mode == "cap_50_pages" or (
+                        mode == "page_full" and self.path.endswith("page=1")
+                    ):
                         items = [{"user": {"type": "User"}, "body": "x"}] * 100
                         self.wfile.write(json.dumps(items).encode("utf-8"))
                     else:
-                        created = (
-                            "2026-11-05T09:55:00Z"
-                            if mode == "stale_marker"
-                            else "2026-11-05T10:05:00Z"
-                        )
+                        sha = "oldsha0000" if mode == "stale_marker" else "deadbeef1234"
                         extra = (
                             "precheck-only" if mode == "stale_marker" else "perf-eval"
                         )
@@ -820,18 +828,16 @@ class TestBootstrapUnits(unittest.TestCase):
                                     "type": "Bot",
                                     "login": "github-actions[bot]",
                                 },
-                                "created_at": created,
                                 "body": (
                                     f"<!-- ci-merge-extras: {extra} -->\n"
-                                    "<!-- ci-merge-actor: alice -->"
+                                    "<!-- ci-merge-actor: alice -->\n"
+                                    f"<!-- ci-merge-sha: {sha} -->"
                                 ),
                             }
                         ]
                         self.wfile.write(json.dumps(payload).encode("utf-8"))
-                elif "commits/" in self.path:
-                    self.wfile.write(
-                        b'{"commit": {"committer": {"date": "2026-11-05T10:00:00Z"}}}'
-                    )
+                elif "pulls/" in self.path:
+                    self.wfile.write(b'{"head": {"sha": "deadbeef1234"}}')
                 else:
                     self.wfile.write(b'[{"name": "skip-tpu-ci"}]')
 
@@ -871,6 +877,11 @@ class TestBootstrapUnits(unittest.TestCase):
                     self.assertEqual(
                         bp._merge_queue_pr_extras("42", env={}),
                         ((), "", None),
+                    )
+                    mode = "cap_50_pages"
+                    self.assertEqual(
+                        bp._merge_queue_pr_extras("42", env={}),
+                        ((), "", "comment history exceeds 5000 comments"),
                     )
                     mode = "bad_json"
                     self.assertIsNotNone(bp._merge_queue_pr_extras("42", env={})[2])
@@ -1461,7 +1472,7 @@ class TestBootstrapUnits(unittest.TestCase):
         self.assertTrue(bool(pre.uploads[1][2]["OMNI_IMAGE_SKIP"]))
 
         # Merge queue on main: priority 11 (post-merge), ignores PR labels and
-        # CI_PR_TPU_OPT_IN, diffs against BUILDKITE_MERGE_QUEUE_BASE_COMMIT, and
+        # CI_PR_PUSH_CPU_ONLY, diffs against BUILDKITE_MERGE_QUEUE_BASE_COMMIT, and
         # runs 2-stage pr suite uncapped.
         mq_main = self._run_bootstrap(
             {
@@ -1473,7 +1484,7 @@ class TestBootstrapUnits(unittest.TestCase):
                 "BUILDKITE_PULL_REQUEST_LABELS": "skip-tpu-ci,oncall-fix",
                 "BUILDKITE_BUILD_AUTHOR_EMAIL": "Alice@Example.com",
                 "BUILDKITE_MESSAGE": "feat: x [skip ci]",
-                "CI_PR_TPU_OPT_IN": "1",
+                "CI_PR_PUSH_CPU_ONLY": "1",
             }
         )
         self.assertEqual(
@@ -1565,24 +1576,26 @@ class TestBootstrapUnits(unittest.TestCase):
                     ["upload_stages", "cpu", "build"],
                 )
 
-        # Merge queue warning annotation on comment API failure, then default gate.
-        mq_warn = self._run_bootstrap(
-            {
-                "BUILDKITE_BRANCH": "gh-readonly-queue/main/pr-42-deadbeef",
-                "BUILDKITE_MERGE_QUEUE_BASE_BRANCH": "main",
-            },
-            mq_marker=((), "", "HTTP 500"),
-        )
-        self.assertEqual(
-            mq_warn.annotations[0],
-            (
-                "warning",
-                "ci-merge-extras",
-                "could not read /ci merge extras for PR #42: HTTP 500; "
-                "ran the default gate",
-            ),
-        )
-        self.assertTrue(mq_warn.annotations[1][2].startswith("CI suite: pr: "))
+        # Merge queue warning annotation on comment API failure or >5000 comments,
+        # then default gate.
+        for mq_err in ("HTTP 500", "comment history exceeds 5000 comments"):
+            mq_warn = self._run_bootstrap(
+                {
+                    "BUILDKITE_BRANCH": "gh-readonly-queue/main/pr-42-deadbeef",
+                    "BUILDKITE_MERGE_QUEUE_BASE_BRANCH": "main",
+                },
+                mq_marker=((), "", mq_err),
+            )
+            self.assertEqual(
+                mq_warn.annotations[0],
+                (
+                    "warning",
+                    "ci-merge-extras",
+                    f"could not read /ci merge extras for PR #42: {mq_err}; "
+                    "ran the default gate",
+                ),
+            )
+            self.assertTrue(mq_warn.annotations[1][2].startswith("CI suite: pr: "))
 
         # Docs-only merge-queue build posts docs-only info annotation and skips upload.
         mq_docs = self._run_bootstrap(
@@ -1716,7 +1729,7 @@ class TestBootstrapUnits(unittest.TestCase):
                     (
                         {
                             "BUILDKITE_PULL_REQUEST": "42",
-                            "CI_PR_TPU_OPT_IN": "1",
+                            "CI_PR_PUSH_CPU_ONLY": "1",
                             **author,
                         },
                         (),
