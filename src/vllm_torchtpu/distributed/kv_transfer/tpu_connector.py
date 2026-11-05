@@ -5202,6 +5202,26 @@ class TPURaidenConnectorWorker:
                     )
                 continue
             existing = self._stage3_registered_sends.get(req_id)
+            if (
+                existing is not None
+                and existing.finish_pending
+                and existing.uuid != uuid
+            ):
+                # The scheduler minted a fresh send at the finish (its group
+                # pages differed from the send published ahead) and releases
+                # the ahead uuid; that release can trail this registration.
+                # Retire the ahead registration here.
+                del self._stage3_registered_sends[req_id]
+                self._stage3_status_probe_next.pop(req_id, None)
+                facade.release_request_blocks(req_id=req_id, uuid=existing.uuid)
+                logger.info(
+                    "Stage-3 replaced the ahead registration of req_id=%s "
+                    "(uuid %d -> %d)",
+                    req_id,
+                    existing.uuid,
+                    uuid,
+                )
+                existing = None
             if existing is not None:
                 if (
                     existing.uuid != uuid
