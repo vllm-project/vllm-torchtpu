@@ -55,8 +55,8 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-# Rows of the decode programs this serves (4, 8, 16, 32, 48, 64).
-MAX_ROWS = 64
+# Rows of the decode programs this serves (4, 8, 16, 32, 48, 64, 80, 96).
+MAX_ROWS = 96
 # K-slab rows and ring depth: fp8_skinny's measured config for this weight
 # ((6144, 2688) -> ("k", 1024, 3)).
 TILE_K = 1024

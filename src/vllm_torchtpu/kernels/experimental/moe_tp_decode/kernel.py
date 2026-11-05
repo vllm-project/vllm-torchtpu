@@ -76,7 +76,7 @@ from vllm_torchtpu.kernels.quantized_matmul.util import quantize_block
 
 FP8 = jnp.float8_e4m3fn
 FP8_MAX = float(jnp.finfo(FP8).max)
-ROW_BUCKETS = (16, 32, 64)
+ROW_BUCKETS = (16, 32, 64, 80, 96)
 # router_topk's clamp floor, above the finfo.min that masks a pick.
 ROUTER_NEG = -3.0e38
 # _route_fast: routing keys are positive normal f32 bit patterns from here.

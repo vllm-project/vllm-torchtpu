@@ -47,15 +47,15 @@ COLLECTIVE_ID = 5
 LANES = 128
 MAX_M = 16
 # The largest block any caller may allow (VMEM: the 6 MB weight ring plus 16 receive
-# slots and the output at 64 rows fit the scoped limit).
-LIMIT_M = 64
+# slots and the output through 96 rows fit the scoped limit).
+LIMIT_M = 96
 # (k, n) -> (tile, nbuf): fp8_skinny's measured o_proj ring ("n", 2048, 3).
 TUNED = {(1024, 6144): (2048, 3)}
 
 
 def supports(m: int, k: int, n: int, num_cores: int, max_m: int = MAX_M) -> bool:
     """Whether a [m, k] x [k, n] row-parallel block over num_cores ranks takes the
-    kernel: a measured (k, n), m <= max_m (16 unless the caller allows up to 64),
+    kernel: a measured (k, n), m <= max_m (16 unless the caller allows up to 96),
     and owner chunks of whole lane groups."""
     return (
         m <= min(max_m, LIMIT_M)

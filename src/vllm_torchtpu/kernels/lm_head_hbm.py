@@ -35,7 +35,7 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-MAX_M = 64
+MAX_M = 96
 TILE = 512
 NBUF = 3
 MAX_K = 8192  # ring = NBUF x TILE x k x 2 B <= 24 MiB
