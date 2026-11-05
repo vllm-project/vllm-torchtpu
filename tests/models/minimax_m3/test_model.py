@@ -137,6 +137,7 @@ def _hook_config(**overrides) -> SimpleNamespace:
         prefill_context_parallel_size=1,
         decode_context_parallel_size=1,
         cp_kv_cache_interleave_size=1,
+        disable_hybrid_kv_cache_manager=None,
     )
     values.update(overrides)
     return SimpleNamespace(
@@ -154,6 +155,9 @@ def _hook_config(**overrides) -> SimpleNamespace:
             cp_kv_cache_interleave_size=values["cp_kv_cache_interleave_size"],
         ),
         speculative_config=values["speculative_config"],
+        scheduler_config=SimpleNamespace(
+            disable_hybrid_kv_cache_manager=values["disable_hybrid_kv_cache_manager"]
+        ),
         attention_config=AttentionConfig(
             indexer_kv_dtype=values["indexer_kv_dtype"],
         ),
@@ -184,8 +188,8 @@ def test_config_pins_block_size_to_sparse_block(cache_dtype, indexer_kv_dtype) -
         (dict(block_size=64, user_specified_block_size=True), ValueError),
         (dict(indexer_kv_dtype="fp8"), NotImplementedError),
         (dict(prefill_context_parallel_size=2), NotImplementedError),
-        # DCP needs whole sparse blocks per rank, splits KV-head replicas only
-        # and does not run the DSpark draft yet.
+        # DCP needs whole sparse blocks per rank, splits KV-head replicas only,
+        # and runs the DSpark draft only in the unified KV cache group.
         (
             dict(
                 tensor_parallel_size=8,
@@ -200,6 +204,7 @@ def test_config_pins_block_size_to_sparse_block(cache_dtype, indexer_kv_dtype) -
                 tensor_parallel_size=8,
                 decode_context_parallel_size=2,
                 speculative_config=SimpleNamespace(method="dspark"),
+                disable_hybrid_kv_cache_manager=False,
             ),
             NotImplementedError,
         ),
@@ -218,6 +223,23 @@ def test_config_dcp_keeps_whole_blocks_per_rank(interleave) -> None:
         cp_kv_cache_interleave_size=interleave,
     )
     TPUMiniMaxM3Config.verify_and_update_config(config)
+    assert config.parallel_config.cp_kv_cache_interleave_size == 128
+
+
+def test_config_dcp_accepts_dspark(monkeypatch) -> None:
+    import vllm_torchtpu.models.minimax_m3.dspark as dspark_mod
+
+    seen = []
+    monkeypatch.setattr(dspark_mod, "configure_dspark_draft", seen.append)
+    speculative_config = SimpleNamespace(method="dspark")
+    config = _hook_config(
+        tensor_parallel_size=8,
+        decode_context_parallel_size=2,
+        speculative_config=speculative_config,
+        disable_hybrid_kv_cache_manager=True,
+    )
+    TPUMiniMaxM3Config.verify_and_update_config(config)
+    assert seen == [speculative_config]
     assert config.parallel_config.cp_kv_cache_interleave_size == 128
 
 

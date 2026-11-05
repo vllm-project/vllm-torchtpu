@@ -118,10 +118,14 @@ def _verify_dcp(vllm_config: "VllmConfig", block_size: int) -> None:
             f"--cp-kv-cache-interleave-size {block_size} (or leave it unset), "
             f"got {interleave}."
         )
-    if vllm_config.speculative_config is not None:
-        # TODO(minimax-m3): the DSpark draft's sliding-window GQA cache under
-        # DCP (vLLM's sliding-window manager rejects DCP-sharded specs).
+    if (
+        vllm_config.speculative_config is not None
+        and vllm_config.scheduler_config.disable_hybrid_kv_cache_manager is False
+    ):
+        # The DSpark draft keeps its sliding-window KV whole on every DCP rank
+        # inside the target's KV cache group (`kv_cache_manager.
+        # dcp_replicated_page_tokens`), which needs the unified group.
         raise NotImplementedError(
-            "MiniMax M3 on TPU does not combine --decode-context-parallel-size "
-            "with speculative decoding yet."
+            "MiniMax M3 DSpark with --decode-context-parallel-size needs "
+            "--disable-hybrid-kv-cache-manager."
         )
