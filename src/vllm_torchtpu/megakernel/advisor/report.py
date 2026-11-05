@@ -732,7 +732,7 @@ def _resolve_facts_card_data(sweep: AdvisorSweepReport) -> _FactsCardData:
     chip_spec = sweep.chip_spec
     model_prof = sweep.model_profile
 
-    chip_sources = dict(sweep.chip_sources or chip_spec.sources)
+    chip_sources = dict(sweep.chip_sources or chip_spec.sources or {})
     model_sources = dict(sweep.model_sources or {})
 
     first_entry = sweep.regimes[0] if sweep.regimes else None

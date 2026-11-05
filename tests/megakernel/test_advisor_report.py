@@ -266,3 +266,15 @@ def test_decision_table_verdict_tie_and_objective_split(
     assert len(rows) == 2
     assert expected_tag in rows[0]
     assert expected_sub in rows[0]
+
+
+def test_render_advisor_html_handles_chip_spec_without_sources() -> None:
+    """Verify render_advisor_html does not crash when ChipSpec.sources is None."""
+    profile = advisor.resolve_model_profile("Qwen/Qwen3-30B-A3B-FP8")
+    chip_no_sources = dataclasses.replace(
+        advisor.resolve_chip_spec("tpu7x"),
+        sources=None,
+    )
+    sweep = advisor.advise_regimes(profile, chip_no_sources)
+    html_out = advisor.render_advisor_html(sweep)
+    assert "<!DOCTYPE html>" in html_out or "<html" in html_out
