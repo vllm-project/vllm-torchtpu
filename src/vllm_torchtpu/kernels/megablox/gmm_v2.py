@@ -1466,7 +1466,7 @@ class MlpConfigs:
     down: GmmConfigs  # down projection
     num_parts: int  # column parts of the gate/up weights per expert
     down_parts: int  # column parts of the down weights per expert
-    bucket_ms: tuple[int, ...]  # row buckets of the matmuls, ascending to tile_m
+    bucket_ms: tuple[int, ...]  # row buckets of the matmuls, ascending, last = tile_m
 
     @property
     def size_inter(self) -> int:
@@ -1543,9 +1543,9 @@ def make_mlp_configs(
     tile_m = up.tiles.tile_m
     if buckets is None:
         # Decode steps route a few rows to each expert: most tiles fit 32 rows.
-        buckets = (
-            (DEFAULT_MLP_BUCKET, tile_m) if tile_m > DEFAULT_MLP_BUCKET else (tile_m,)
-        )
+        buckets = (DEFAULT_MLP_BUCKET,)
+    # Buckets of the row tile or larger collapse into the tile.
+    buckets = tuple(sorted({b for b in buckets if b < tile_m})) + (tile_m,)
     cfgs = MlpConfigs(
         up=up,
         down=down,
@@ -1573,9 +1573,7 @@ def make_mlp_configs(
         or (2 * cfgs.part_size) % mxu_size
         or cfgs.part_size % num_lanes
         or cfgs.down_part_size % mxu_size
-        or buckets[-1] != tile_m
-        or list(buckets) != sorted(set(buckets))
-        or any(b % up.dims.size_lhs_sublane for b in buckets)
+        or any(b <= 0 or b % up.dims.size_lhs_sublane for b in buckets)
     ):
         return None
     return cfgs
