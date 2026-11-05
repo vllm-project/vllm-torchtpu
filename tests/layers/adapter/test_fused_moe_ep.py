@@ -1109,10 +1109,14 @@ def test_explicit_policy_keeps_hardware_and_placement_checks():
 
 
 @pytest.mark.parametrize("required", [False, True])
-def test_mxfp4_explicit_backend_never_silently_changes_to_gmm(required):
+def test_mxfp4_explicit_backend_never_silently_changes_to_gmm(required, monkeypatch):
     from vllm_torchtpu.layers.adapter.quantization.mxfp4 import (
         VllmDeepseekV4Mxfp4MoEMethod,
     )
+
+    # The subject is the REQUIRED policy's error; the in-op shared expert
+    # (on by default on this measurement branch) adds its own prebuild step.
+    monkeypatch.setitem(vars(envs), "MOE_FUSED_EP_PUSH_SHARED_EXPERT", False)
 
     method = object.__new__(VllmDeepseekV4Mxfp4MoEMethod)
     method.fused_ep = required
@@ -1446,3 +1450,86 @@ def test_build_op_picks_the_push_layer_and_passes_its_knobs(monkeypatch, impl):
             "kernel_plan_tables",
         ):
             assert knob not in forwarded
+
+
+def test_shared_expert_operands_reach_the_push_layer(monkeypatch):
+    """A shared limit adds four replicated operands, hands them to the push
+    layer as `shared_expert`, and keys its own op."""
+    from vllm_torchtpu.kernels.experimental import push_fused_moe
+
+    monkeypatch.setenv("MOE_FUSED_EP_KERNEL_IMPL", "push")
+    monkeypatch.setattr(bridge, "_OPS", {})
+    built = []
+
+    def build(name, fn, **kwargs):
+        built.append((fn, kwargs))
+        return MagicMock()
+
+    monkeypatch.setattr(bridge, "jax_op", build)
+    kernel = MagicMock(side_effect=lambda x, *a, **kw: (x, x))
+    monkeypatch.setattr(push_fused_moe, "fused_ep_moe_push", kernel)
+    args = (None, 2, True, "silu", None, True)
+    plain = bridge._build_op(*args)
+    shared = bridge._build_op(*args, shared_limit=10.0)
+    assert shared is not plain
+    fn, kwargs = built[-1]
+    assert kwargs["input_partition_specs"][-4:] == (bridge.PartitionSpec(),) * 4
+    # Two outputs, two specs: one spec fails Dynamo's output pytree at compile.
+    out_specs = kwargs["output_partition_specs"]
+    assert isinstance(out_specs, tuple) and len(out_specs) == 2
+    x = jnp.ones((8, 8), dtype=jnp.bfloat16)
+    weights = tuple(jnp.full((2,), i, jnp.float32) for i in range(4))
+    operands = (x, None, None, None, None, jnp.zeros((8, 4)), jnp.zeros((1, 1)))
+    fn(*operands, *weights)
+    forwarded = kernel.call_args.kwargs
+    assert forwarded["shared_limit"] == 10.0
+    for got, want in zip(forwarded["shared_expert"], weights, strict=True):
+        assert got is want
+
+
+def test_shared_expert_needs_the_push_kernel(monkeypatch):
+    monkeypatch.setenv("MOE_FUSED_EP_KERNEL_IMPL", "v2")
+    monkeypatch.setattr(bridge, "_OPS", {})
+    monkeypatch.setattr(bridge, "jax_op", lambda *a, **kw: MagicMock())
+    with pytest.raises(ValueError, match="push"):
+        bridge._build_op(None, 2, True, "silu", None, True, shared_limit=10.0)
+
+
+def _runner_with_shared(limit, shared_limit=10.0):
+    routed = SimpleNamespace()
+    calls = []
+
+    def forward(layer, x, logits, input_ids, shared):
+        calls.append(shared)
+        return "routed", "shared"
+
+    routed.quant_method = SimpleNamespace(
+        shared_expert_limit=limit, forward_monolithic_with_shared_expert=forward
+    )
+    mlp = SimpleNamespace(
+        fused_operands=lambda: ("w13", "s13", "w2", "s2", shared_limit)
+    )
+    runner = SimpleNamespace(
+        _quant_method=routed.quant_method, routed_experts=routed, _tpu_shared_mlp=mlp
+    )
+    return runner, calls
+
+
+def test_runner_takes_the_shared_expert_from_the_fused_op():
+    runner, calls = _runner_with_shared(10.0)
+    hidden = torch.zeros(2, 4)
+    out = VllmMoERunner._apply_quant_method(runner, hidden, torch.zeros(2, 3), hidden)
+    assert out == ("shared", "routed")
+    assert calls == [("w13", "s13", "w2", "s2")]
+
+
+def test_runner_refuses_a_shared_expert_the_op_was_not_built_for():
+    runner, _ = _runner_with_shared(10.0, shared_limit=7.0)
+    hidden = torch.zeros(2, 4)
+    with pytest.raises(ValueError, match="swiglu limit"):
+        VllmMoERunner._apply_quant_method(runner, hidden, torch.zeros(2, 3), hidden)
+    runner, _ = _runner_with_shared(10.0)
+    with pytest.raises(NotImplementedError):
+        VllmMoERunner._apply_quant_method(
+            runner, hidden, torch.zeros(2, 3), hidden.clone()
+        )

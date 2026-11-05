@@ -504,3 +504,84 @@ def test_served_dims_front_switches_are_bit_exact(shape, switch):
     np.testing.assert_array_equal(np.asarray(got), want)
     wrong = fused_ep_moe_push(x, *_roll(weights), gating, **common)
     assert _rel(wrong, want) > CONTROL_BOUND
+
+
+def _shared_expert_weights(mesh, seed):
+    """A per-channel FP8 shared expert at the served dims, replicated."""
+    from vllm_torchtpu.kernels.quantized_matmul.shared_expert import _FP8_MAX
+
+    rng = np.random.default_rng(seed)
+    repl = NamedSharding(mesh, P())
+    k, n = SERVED_HIDDEN, SERVED_LOGICAL_INTER
+
+    def w(shape):
+        raw = np.clip(rng.normal(0, 64, shape), -_FP8_MAX, _FP8_MAX)
+        return jax.device_put(jnp.asarray(raw, jnp.float32).astype(FP8), repl)
+
+    def s(size):
+        return jax.device_put(
+            rng.uniform(0.5, 1.5, size).astype(np.float32) * 1e-3, repl
+        )
+
+    return w((k, 2 * n)), s(2 * n), w((n, k)), s(k)
+
+
+# The served program is compiled through torch_tpu, which keeps the bf16
+# roundings between fused elementwise ops; compile these the same way.
+_AS_SERVED = {"xla_allow_excess_precision": False}
+
+
+@pytest.mark.parametrize("shape", sorted(SERVED_SHAPES))
+def test_served_dims_shared_expert_inside_is_bit_exact(shape):
+    """With the shared expert inside the layer, the routed output is the
+    layer's without it bit for bit, and the shared output is the standalone
+    shared expert's on each shard's rows (the fused kernel at g25's 288 rows,
+    the unfused ops at the drafter's 240)."""
+    from vllm_torchtpu.kernels.quantized_matmul.shared_expert import fp8_swiglu_mlp
+
+    g_local, rows, topk = SERVED_SHAPES[shape]
+    mesh = _mesh()
+    e_total = EP * g_local
+    weights = _served_fp4_weights(mesh, 81, e_total=e_total)
+    x, gating = _inputs(
+        mesh, 82, hidden=SERVED_HIDDEN, e_logical=e_total, tokens=EP * rows
+    )
+    shared = _shared_expert_weights(mesh, 83)
+    common = dict(
+        topk=topk,
+        renormalize=True,
+        mesh=mesh,
+        capacity=CAPACITY,
+        weight_format=WeightFormat.FP4,
+        rhs_qb=512,
+        sharded_plan=True,
+        scoring_fn="sqrtsoftplus",
+        routed_scaling_factor=2.5,
+        act_fn="silu_and_mul_with_clamp",
+        logical_intermediate_size=SERVED_LOGICAL_INTER,
+        sc_prepush=2,
+        tc_exchange=True,
+    )
+
+    def layer(x, gating, *operands):
+        kw = dict(shared_expert=operands, shared_limit=10.0) if operands else {}
+        return fused_ep_moe_push(x, *weights, gating, **kw, **common)
+
+    want = np.asarray(jax.jit(layer, compiler_options=_AS_SERVED)(x, gating))
+    routed, got_shared = jax.jit(layer, compiler_options=_AS_SERVED)(x, gating, *shared)
+    np.testing.assert_array_equal(np.asarray(routed), want)
+    want_shared = jax.jit(
+        jax.shard_map(
+            lambda xl, *w: fp8_swiglu_mlp(xl, *w, limit=10.0),
+            mesh=mesh,
+            in_specs=(P(AXIS),) + (P(),) * 4,
+            out_specs=P(AXIS),
+            check_vma=False,
+        ),
+        compiler_options=_AS_SERVED,
+    )(x, *shared)
+    got_shared = np.asarray(got_shared)
+    assert np.isfinite(got_shared.astype(np.float32)).all()
+    np.testing.assert_array_equal(
+        got_shared.view(np.uint16), np.asarray(want_shared).view(np.uint16)
+    )
