@@ -91,9 +91,50 @@ def test_gate_needs_step8():
 def test_gate_cap():
     assert not _applies(8, TPU_DCP_MLA_SEND_SMALL_A2A_MAX_TOKENS="4")
     assert _applies(4, TPU_DCP_MLA_SEND_SMALL_A2A_MAX_TOKENS="4")
-    # A cap above the step8 step would leave a two-step grid: off everywhere.
-    assert not _applies(4, TPU_DCP_MLA_SEND_SMALL_A2A_MAX_TOKENS="16")
+    # A cap above the step: buckets up to the step stay fused, the larger
+    # ones keep the small all-to-all after the kernel.
+    assert _applies(4, TPU_DCP_MLA_SEND_SMALL_A2A_MAX_TOKENS="32")
+    assert _applies(8, TPU_DCP_MLA_SEND_SMALL_A2A_MAX_TOKENS="32")
+    assert not _applies(16, TPU_DCP_MLA_SEND_SMALL_A2A_MAX_TOKENS="32")
     assert not _applies(4, TPU_DCP_MLA_SMALL_CHUNK_TOKENS="4")
+
+
+def test_gate_step32():
+    # "step32": buckets of up to 32 tokens are one grid step.
+    levers = "tr,zu,pv512,noinf,quad,fxskip,lrows,step32"
+    env = dict(
+        TPU_DCP_MLA_SEND_SMALL_A2A_MAX_TOKENS="32", TPU_MLA_DECODE_BODY_LEVERS=levers
+    )
+    assert [t for t in (4, 8, 16, 32, 64) if _applies(t, **env)] == [4, 8, 16, 32]
+    assert [
+        t for t in (4, 8, 16, 32) if _applies(t, TPU_MLA_DECODE_BODY_LEVERS=levers)
+    ] == [4, 8]
+
+
+def test_gate_xchg_max_tokens():
+    # TPU_MLA_FUSED_XCHG_MAX_TOKENS: buckets above the step, up to it (within
+    # the small all-to-all's cap), run the exchange over the grid steps.
+    env = dict(
+        TPU_DCP_MLA_SEND_SMALL_A2A_MAX_TOKENS="32", TPU_MLA_FUSED_SMALL_A2A_MERGE="1"
+    )
+    buckets = (1, 2, 4, 8, 16, 32, 64)
+    assert [t for t in buckets if _applies(t, **env)] == [1, 2, 4, 8]
+    on = dict(env, TPU_MLA_FUSED_XCHG_MAX_TOKENS="32")
+    assert [t for t in buckets if _applies(t, **on)] == [1, 2, 4, 8, 16, 32]
+    sixteen = dict(env, TPU_MLA_FUSED_XCHG_MAX_TOKENS="16")
+    assert [t for t in buckets if _applies(t, **sixteen)] == [1, 2, 4, 8, 16]
+    # Capped by the small all-to-all, and only with the in-kernel merge.
+    assert not _applies(16, **dict(on, TPU_DCP_MLA_SEND_SMALL_A2A_MAX_TOKENS="8"))
+    assert not _applies(16, **dict(on, TPU_MLA_FUSED_SMALL_A2A_MERGE="0"))
+    assert _applies(8, **dict(on, TPU_MLA_FUSED_SMALL_A2A_MERGE="0"))
+
+
+def test_step_lever_tokens():
+    assert sparse_mla.decode_step_tokens(sparse_mla.DECODE_BODY_DEFAULT) == 8
+    assert sparse_mla.decode_step_tokens(("tr", "step32")) == 32
+    assert sparse_mla.decode_step_tokens(("tr", "quad")) == 0
+    with pytest.raises(ValueError):
+        sparse_mla.decode_step_tokens(("step8", "step16"))
 
 
 def test_gate_compares_tokens_once():
@@ -160,6 +201,14 @@ def test_bucket_config():
     assert cfg(4, TPU_MLA_FUSED_SMALL_A2A_BUCKETS="4=none@20") == (False, 20)
     with pytest.raises(ValueError):
         cfg(4, TPU_MLA_FUSED_SMALL_A2A_BUCKETS="4=weights@16")
+    # A multi-step bucket (TPU_MLA_FUSED_XCHG_MAX_TOKENS) the spec does not
+    # list pins only the gathered KV at VMEM_MIB; a listed one takes its entry.
+    with mock.patch.dict(os.environ, {}, clear=False):
+        os.environ.pop("TPU_MLA_FUSED_SMALL_A2A_BUCKETS", None)
+        assert ai.fused_small_a2a_bucket_config(16, steps=True) == (("kv",), 16)
+        assert ai.fused_small_a2a_bucket_config(32, steps=True) == (("kv",), 16)
+    with mock.patch.dict(os.environ, {"TPU_MLA_FUSED_SMALL_A2A_BUCKETS": "16=none@16"}):
+        assert ai.fused_small_a2a_bucket_config(16, steps=True) == (False, 16)
 
 
 def test_pin_roles_cover_every_operand_class():
@@ -188,3 +237,6 @@ def test_merge_mode_constants():
     with mock.patch.dict(os.environ, {}, clear=False):
         os.environ.pop("TPU_MLA_FUSED_SMALL_A2A_MERGE_MAX_TOKENS", None)
         assert envs.TPU_MLA_FUSED_SMALL_A2A_MERGE_MAX_TOKENS == 4
+    with mock.patch.dict(os.environ, {}, clear=False):
+        os.environ.pop("TPU_MLA_FUSED_XCHG_MAX_TOKENS", None)
+        assert envs.TPU_MLA_FUSED_XCHG_MAX_TOKENS == 0  # off by default

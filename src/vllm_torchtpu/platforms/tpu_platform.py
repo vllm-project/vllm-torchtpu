@@ -1029,6 +1029,9 @@ class TpuPlatform(Platform):
                     parallel_config.data_parallel_size,
                 )
 
+        if envs.TPU_SHORT_PREFILL_FIRST_TOKENS > 0:
+            _configure_short_prefill_first(scheduler_config)
+
         kv_transfer_config = vllm_config.kv_transfer_config
         if kv_transfer_config is not None:
             _TPU_SUPPORTED_KV_CONNECTORS = {
@@ -1235,6 +1238,31 @@ def _get_linear_token_paddings(max_token_size: int, longest_pass: int) -> list[i
             len(paddings),
         )
     return paddings
+
+
+def _configure_short_prefill_first(scheduler_config) -> None:
+    """Install the scheduler that serves short waiting prompts before running
+    prefill chunks. Off when another scheduler is configured, or when async
+    scheduling is: the scheduler is an AsyncScheduler, and its draft-token
+    placeholders assume the async engine step."""
+    from vllm_torchtpu.core.short_prefill_first_scheduler import SCHEDULER_CLS
+
+    if not scheduler_config.async_scheduling:
+        logger.warning(
+            "Short-prompt-first scheduling is off: async scheduling is disabled."
+        )
+        return
+    if scheduler_config.scheduler_cls not in (None, SCHEDULER_CLS):
+        logger.warning(
+            "Short-prompt-first scheduling is off: scheduler %s is configured.",
+            scheduler_config.scheduler_cls,
+        )
+        return
+    scheduler_config.scheduler_cls = SCHEDULER_CLS
+    logger.info(
+        "Enabled ShortPrefillFirstScheduler for prompts of at most %d uncached tokens.",
+        envs.TPU_SHORT_PREFILL_FIRST_TOKENS,
+    )
 
 
 def _configure_pipeline_chunks(vllm_config: VllmConfig) -> None:
