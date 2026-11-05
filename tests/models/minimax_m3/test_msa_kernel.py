@@ -180,7 +180,7 @@ def test_select_blocks_forces_local_and_pads():
         block_rows=8,
         interpret=True,
     )
-    np.testing.assert_array_equal(np.asarray(picked), [[[0, 1, 2, -1]]])
+    np.testing.assert_array_equal(np.asarray(picked), [[[2, 0, 1, -1]]])
     picked = msa_select.select_blocks(
         scores,
         pos,
@@ -191,7 +191,7 @@ def test_select_blocks_forces_local_and_pads():
         block_rows=8,
         interpret=True,
     )
-    np.testing.assert_array_equal(np.asarray(picked), [[[0, 2]]])
+    np.testing.assert_array_equal(np.asarray(picked), [[[2, 0]]])
     picked = msa_select.select_blocks(
         scores,
         pos,

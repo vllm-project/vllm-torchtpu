@@ -78,7 +78,10 @@ def select_blocks(
     block_rows: int = DEFAULT_BLOCK_ROWS,
     interpret: bool = False,
 ) -> jax.Array:
-    """Selected logical blocks ``[T, 1, topk]``, ascending, ``-1`` padded.
+    """Selected logical blocks ``[T, 1, topk]``, ``-1`` padded at the end.
+
+    Blocks come in selection order (forced blocks, then by score), not sorted:
+    the attention matches pages by value, so ordering would only add a sort.
 
     Args:
       scores: ``[T, 1, P]`` block scores (one index head per rank).
@@ -113,6 +116,4 @@ def select_blocks(
         interpret=interpret,
         name="minimax_m3_msa_select_blocks",
     )(s, p)[:num_tokens]
-    no_block = jnp.iinfo(jnp.int32).max
-    picked = jnp.sort(jnp.where(picked < 0, no_block, picked), axis=-1)
-    return jnp.where(picked == no_block, -1, picked)[:, None, :]
+    return picked[:, None, :]

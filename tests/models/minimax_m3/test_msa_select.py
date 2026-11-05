@@ -35,7 +35,7 @@ def _reference(scores, pos, topk, init_blocks, local_blocks):
         s[: min(init_blocks, visible)] = 1e30
         # Stable descending order: ties go to the lower block, like argmax.
         order = np.argsort(-s, kind="stable")[:topk]
-        out[t, : len(order)] = np.sort(order)
+        out[t, : len(order)] = order
     return out
 
 
