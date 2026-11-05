@@ -38,6 +38,7 @@ from jax.sharding import PartitionSpec as P
 from vllm_torchtpu.kernels.experimental.push_fused_moe import fused_ep_moe_push
 from vllm_torchtpu.kernels.experimental.push_fused_moe.tc_exchange import (
     build_tc_exchange_all_gather,
+    build_tc_exchange_all_gather_rows,
 )
 from vllm_torchtpu.kernels.fused_moe.v2 import AXIS, WeightFormat, fused_ep_moe_v2
 
@@ -244,7 +245,8 @@ def _contiguous_plus_one(experts, ep):
     return np.asarray(slot_expert, np.int32), np.asarray(table, np.int32)
 
 
-def test_expert_layout_serves_the_same_tokens_and_counts_its_rows():
+@pytest.mark.parametrize("onehot_slots", [False, True], ids=["gather", "onehot"])
+def test_expert_layout_serves_the_same_tokens_and_counts_its_rows(onehot_slots):
     """A replicated layout (R = 2): the weights in slot order, gating per
     logical expert. The output must be the unplaced layer's (every copy holds
     the same weights, so only where the rows run changes), and the load
@@ -278,6 +280,7 @@ def test_expert_layout_serves_the_same_tokens_and_counts_its_rows():
         gating,
         expert_slot=jax.device_put(jnp.asarray(table), replicated),
         expert_load=jax.device_put(load0, replicated),
+        onehot_slots=onehot_slots,
         **common,
     )
     plain = fused_ep_moe_push(x, *logical, gating, **common)
@@ -316,3 +319,188 @@ def test_tc_exchange_all_gather_equals_lax_all_gather(width):
     )(jax.device_put(data, NamedSharding(mesh, P(AXIS))))
     np.testing.assert_array_equal(np.asarray(tc), np.asarray(xla))
     np.testing.assert_array_equal(np.asarray(tc)[0], np.asarray(data).reshape(-1))
+
+
+def test_tc_exchange_row_gather_equals_take():
+    """The exchange kernel's row copy is rows[idx] (repeats and every row
+    of the source included) and leaves the exchange itself unchanged."""
+    mesh = _mesh()
+    width, n_src, n = 384, 48, 96
+    fn = build_tc_exchange_all_gather_rows(ep=EP, width=width, n_rows=n)
+
+    def local(p, rows, idx):
+        flat = p.reshape(-1)
+        tc, got = fn(flat, lax.axis_index(AXIS), rows[0], idx.reshape(-1))
+        xla = lax.all_gather(flat, AXIS, axis=0, tiled=True)
+        return tc[None], xla[None], got[None]
+
+    rng = np.random.default_rng(3)
+    data = (jnp.arange(EP * width, dtype=jnp.int32) * 7 - 3).reshape(EP, width)
+    rows = rng.normal(0, 1, (EP, n_src, 40, 128)).astype(np.float32)
+    rows = jnp.asarray(rows).astype(jnp.float8_e4m3fn)
+    idx = np.stack([rng.permutation(np.repeat(np.arange(n_src), 2)) for _ in range(EP)])
+    shard = NamedSharding(mesh, P(AXIS))
+    tc, xla, got = jax.jit(
+        jax.shard_map(
+            local,
+            mesh=mesh,
+            in_specs=(P(AXIS),) * 3,
+            out_specs=(P(AXIS),) * 3,
+            check_vma=False,
+        )
+    )(
+        jax.device_put(data, shard),
+        jax.device_put(rows, shard),
+        jax.device_put(jnp.asarray(idx, jnp.int32), shard),
+    )
+    np.testing.assert_array_equal(np.asarray(tc), np.asarray(xla))
+    want = np.stack([np.asarray(rows[d])[idx[d]] for d in range(EP)])
+    np.testing.assert_array_equal(np.asarray(got).view(np.uint8), want.view(np.uint8))
+
+
+# The served DSv4.1-Flash expert dims (hidden 5120, inter 2560 holding a
+# logical 2304, fp4 block-512 weights with row-padded flat scale tables) at
+# the DP16 C768 per-shard shapes, on eight shards: the target layers' 25
+# slots, 288 rows and top-6, and the drafter's 9 slots, 240 rows and top-3.
+SERVED_HIDDEN, SERVED_INTER, SERVED_LOGICAL_INTER = 5120, 2560, 2304
+SERVED_SHAPES = {"g25": (25, 288, 6), "g9": (9, 240, 3)}
+
+
+def _served_fp4_weights(mesh, seed, *, e_total):
+    """(w1, w2, w1_scale, w2_scale) in the served operand forms, generated on
+    device (the host copy of the f32 masters would be tens of GB)."""
+    from vllm_torchtpu.kernels.fused_moe.v2.host import fp4_scale_rows
+
+    shard = NamedSharding(mesh, P(AXIS))
+    hidden, inter, logical = SERVED_HIDDEN, SERVED_INTER, SERVED_LOGICAL_INTER
+
+    def one(key, k, n):
+        raw = jax.random.normal(key, (e_total, k, n), jnp.float32) * 0.1
+        if k == inter:
+            raw = jnp.where(jnp.arange(k)[None, :, None] < logical, raw, 0)
+        else:
+            col = jnp.arange(n) % inter
+            raw = jnp.where(col[None, None, :] < logical, raw, 0)
+        grouped = raw.reshape(e_total, k // 512, 512, n)
+        scale = jnp.maximum(jnp.max(jnp.abs(grouped), axis=2) / 6, 1e-12)
+        w = (grouped / scale[:, :, None, :]).reshape(e_total, k, n)
+        rows = fp4_scale_rows(k, 512, padded=True)
+        padded = jnp.zeros((e_total, rows, n), jnp.float32).at[:, : k // 512].set(scale)
+        return w.astype(jnp.float4_e2m1fn), padded.reshape(e_total * rows, n)
+
+    k1, k2 = jax.random.split(jax.random.key(seed))
+    w1, s1 = jax.jit(lambda k: one(k, hidden, 2 * inter), out_shardings=(shard,) * 2)(
+        k1
+    )
+    w2, s2 = jax.jit(lambda k: one(k, inter, hidden), out_shardings=(shard,) * 2)(k2)
+    return w1, w2, s1, s2
+
+
+@pytest.mark.parametrize("shape", sorted(SERVED_SHAPES))
+def test_served_dims_program_knobs_are_bit_exact(shape):
+    """The closing barrier, the tile-height ladder, the HBM result staging and
+    the dispatch run-ahead change no arithmetic: every build matches the
+    four-rung build with the barrier bit for bit at the served dims. A score
+    bias makes a few experts hot, so visits span several tiles and every rung
+    of each ladder serves some tail tile."""
+    g_local, rows, topk = SERVED_SHAPES[shape]
+    mesh = _mesh()
+    e_total = EP * g_local
+    weights = _served_fp4_weights(mesh, 61, e_total=e_total)
+    x, gating = _inputs(
+        mesh, 62, hidden=SERVED_HIDDEN, e_logical=e_total, tokens=EP * rows
+    )
+    bias = np.zeros(e_total, np.float32)
+    bias[np.random.default_rng(63).choice(e_total, EP, replace=False)] = 3.0
+    common = dict(
+        topk=topk,
+        renormalize=True,
+        mesh=mesh,
+        capacity=CAPACITY,
+        weight_format=WeightFormat.FP4,
+        rhs_qb=512,
+        sharded_plan=True,
+        scoring_fn="sqrtsoftplus",
+        score_bias=jax.device_put(bias, NamedSharding(mesh, P())),
+        routed_scaling_factor=2.5,
+        act_fn="silu_and_mul_with_clamp",
+        logical_intermediate_size=SERVED_LOGICAL_INTER,
+        sc_prepush=2,
+        tc_exchange=True,
+    )
+    want = np.asarray(
+        fused_ep_moe_push(x, *weights, gating, height_rungs_override=4, **common)
+    )
+    assert np.isfinite(want.astype(np.float32)).all()
+    for kw in (
+        dict(height_rungs_override=4, tail_barrier=False),
+        dict(height_rungs_override=2),
+        dict(height_rungs_override=1),
+        dict(height_rungs_override=2, tail_barrier=False),
+        dict(height_rungs_override=2, hbm_staging=True),
+        dict(height_rungs_override=2, dispatch_ahead=3),
+        dict(height_rungs_override=2, hbm_staging=True, dispatch_ahead=g_local),
+    ):
+        got = fused_ep_moe_push(x, *weights, gating, **kw, **common)
+        np.testing.assert_array_equal(np.asarray(got), want, err_msg=str(kw))
+    wrong = fused_ep_moe_push(
+        x, *_roll(weights), gating, height_rungs_override=4, **common
+    )
+    assert _rel(wrong, want) > CONTROL_BOUND
+
+
+# The MoE-front switches change no arithmetic.
+FRONT_SWITCHES = (
+    "matmul_scale_repeat",
+    "exchange_row_gather",
+    "bf16_sort_counts",
+    "slim_prepush_barrier",
+    "fused_dispatch_meta",
+    "table_kernel",
+    "exchange_row_gather+table_kernel+exchange_tables",
+    "table_kernel+kernel_plan_tables",
+    "exchange_row_gather+table_kernel+exchange_tables+light_prepush",
+    "table_kernel+kernel_plan_tables+light_prepush",
+    "exchange_row_gather+table_kernel+exchange_tables+light_prepush=2",
+    "exchange_row_gather+table_kernel+exchange_tables+single_barrier",
+    "single_barrier",
+)
+
+
+@pytest.mark.parametrize("switch", FRONT_SWITCHES)
+@pytest.mark.parametrize("shape", sorted(SERVED_SHAPES))
+def test_served_dims_front_switches_are_bit_exact(shape, switch):
+    """Each front switch gives the default layer's output bit for bit at the
+    served dims, with the served exchange and pre-push."""
+    g_local, rows, topk = SERVED_SHAPES[shape]
+    mesh = _mesh()
+    e_total = EP * g_local
+    weights = _served_fp4_weights(mesh, 71, e_total=e_total)
+    x, gating = _inputs(
+        mesh, 72, hidden=SERVED_HIDDEN, e_logical=e_total, tokens=EP * rows
+    )
+    common = dict(
+        topk=topk,
+        renormalize=True,
+        mesh=mesh,
+        capacity=CAPACITY,
+        weight_format=WeightFormat.FP4,
+        rhs_qb=512,
+        sharded_plan=True,
+        scoring_fn="sqrtsoftplus",
+        routed_scaling_factor=2.5,
+        act_fn="silu_and_mul_with_clamp",
+        logical_intermediate_size=SERVED_LOGICAL_INTER,
+        sc_prepush=2,
+        tc_exchange=True,
+    )
+    want = np.asarray(fused_ep_moe_push(x, *weights, gating, **common))
+    assert np.isfinite(want.astype(np.float32)).all()
+    on = {
+        name: int(value) if value else True
+        for name, _, value in (item.partition("=") for item in switch.split("+"))
+    }
+    got = fused_ep_moe_push(x, *weights, gating, **on, **common)
+    np.testing.assert_array_equal(np.asarray(got), want)
+    wrong = fused_ep_moe_push(x, *_roll(weights), gating, **common)
+    assert _rel(wrong, want) > CONTROL_BOUND

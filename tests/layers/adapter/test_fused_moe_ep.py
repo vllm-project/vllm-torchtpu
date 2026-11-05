@@ -1383,6 +1383,18 @@ def test_build_op_picks_the_push_layer_and_passes_its_knobs(monkeypatch, impl):
     monkeypatch.setitem(vars(envs), "MOE_FUSED_EP_PUSH_SC_PREPUSH", 3)
     monkeypatch.setitem(vars(envs), "MOE_FUSED_EP_PUSH_TC_EXCHANGE", True)
     monkeypatch.setitem(vars(envs), "MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE", 4)
+    monkeypatch.setitem(vars(envs), "MOE_FUSED_EP_PUSH_TAIL_BARRIER", False)
+    monkeypatch.setitem(vars(envs), "MOE_FUSED_EP_PUSH_ONEHOT_SLOTS", True)
+    monkeypatch.setitem(vars(envs), "MOE_FUSED_EP_PUSH_HBM_STAGING", True)
+    monkeypatch.setitem(vars(envs), "MOE_FUSED_EP_PUSH_DISPATCH_AHEAD", 25)
+    monkeypatch.setitem(vars(envs), "MOE_FUSED_EP_PUSH_MATMUL_SCALE_REPEAT", True)
+    monkeypatch.setitem(vars(envs), "MOE_FUSED_EP_PUSH_EXCHANGE_ROW_GATHER", True)
+    monkeypatch.setitem(vars(envs), "MOE_FUSED_EP_PUSH_BF16_SORT_COUNTS", True)
+    monkeypatch.setitem(vars(envs), "MOE_FUSED_EP_PUSH_SLIM_PREPUSH_BARRIER", True)
+    monkeypatch.setitem(vars(envs), "MOE_FUSED_EP_PUSH_FUSED_DISPATCH_META", True)
+    monkeypatch.setitem(vars(envs), "MOE_FUSED_EP_PUSH_TABLE_KERNEL", True)
+    monkeypatch.setitem(vars(envs), "MOE_FUSED_EP_PUSH_EXCHANGE_TABLES", True)
+    monkeypatch.setitem(vars(envs), "MOE_FUSED_EP_PUSH_KERNEL_PLAN_TABLES", True)
     bridge._build_op(None, 2, True, "silu", None, False)
     x = jnp.ones((8, 8), dtype=jnp.bfloat16)
     operands = (
@@ -1401,8 +1413,36 @@ def test_build_op_picks_the_push_layer_and_passes_its_knobs(monkeypatch, impl):
         assert forwarded["sc_prepush"] == 3
         assert forwarded["tc_exchange"] is True
         assert forwarded["height_rungs_override"] == 4
+        assert forwarded["tail_barrier"] is False
+        assert forwarded["onehot_slots"] is True
+        assert forwarded["hbm_staging"] is True
+        assert forwarded["dispatch_ahead"] == 25
+        assert forwarded["matmul_scale_repeat"] is True
+        assert forwarded["exchange_row_gather"] is True
+        assert forwarded["bf16_sort_counts"] is True
+        assert forwarded["slim_prepush_barrier"] is True
+        assert forwarded["fused_dispatch_meta"] is True
+        assert forwarded["table_kernel"] is True
+        assert forwarded["exchange_tables"] is True
+        assert forwarded["kernel_plan_tables"] is True
     else:
         push_kernel.assert_not_called()
         forwarded = v2_kernel.call_args.kwargs
-        for knob in ("sc_prepush", "tc_exchange", "height_rungs_override"):
+        for knob in (
+            "sc_prepush",
+            "tc_exchange",
+            "height_rungs_override",
+            "tail_barrier",
+            "onehot_slots",
+            "hbm_staging",
+            "dispatch_ahead",
+            "matmul_scale_repeat",
+            "exchange_row_gather",
+            "bf16_sort_counts",
+            "slim_prepush_barrier",
+            "fused_dispatch_meta",
+            "table_kernel",
+            "exchange_tables",
+            "kernel_plan_tables",
+        ):
             assert knob not in forwarded
