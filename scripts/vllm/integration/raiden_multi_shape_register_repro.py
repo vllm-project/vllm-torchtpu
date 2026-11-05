@@ -237,29 +237,28 @@ def _run(cfg: dict, port: int) -> None:
 
 def main() -> None:
     if len(sys.argv) > 3 and sys.argv[1] in ("--run", "--store"):
+        import faulthandler
+
+        faulthandler.enable()
         fn = _run if sys.argv[1] == "--run" else _store
         fn(json.loads(sys.argv[2]), int(sys.argv[3]))
         return
     names = sys.argv[1:] or list(VARIANTS)
+    # As the connector sets before any Raiden call (raiden_connector.py).
+    env = {**os.environ, "RAIDEN_DISABLE_SINGLETON_WORKER": "1"}
     results = {}
     for i, name in enumerate(names):
         cfg = {**BASE, **VARIANTS[name]}
         print(f"=== {name}: {cfg}", flush=True)
+        # Stream the child's output; keep only its stdout to find the verdict.
         proc = subprocess.run(
             [sys.executable, __file__, "--run", json.dumps(cfg), str(28700 + i)],
-            capture_output=True,
+            stdout=subprocess.PIPE,
             text=True,
             timeout=1200,
-            env=os.environ,
+            env=env,
         )
-        lines = (proc.stdout + proc.stderr).strip().splitlines()
-        keep = [
-            line
-            for line in lines
-            if not line.startswith(("I0000", "I1", "W0000"))
-            and "compilation_cache" not in line
-        ]
-        print("\n".join(keep[-40:]), flush=True)
+        print(proc.stdout, flush=True)
         verdict = "OK" if "ROUNDTRIP OK" in proc.stdout else "FAIL"
         results[name] = f"{verdict} rc={proc.returncode}"
     print("=== SUMMARY", json.dumps(results, indent=1), flush=True)
