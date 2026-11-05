@@ -102,6 +102,7 @@ from vllm_torchtpu.layers.core.quantization import quantize_kv
 from vllm_torchtpu.layers.core.sequence_layout import (
     is_pcp_streaming_attention_metadata,
 )
+from vllm_torchtpu.layers.core.turboquant import TURBOQUANT_KV_CACHE_DTYPES
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
     get_vllm_model_wrapper_context,
@@ -149,6 +150,7 @@ TPU_STR_DTYPE_TO_TORCH_DTYPE = {
     "fp8_ds_mla": torch.uint8,
     "int8": torch.int8,
     "uint8": torch.uint8,
+    **dict.fromkeys(TURBOQUANT_KV_CACHE_DTYPES, torch.uint8),
 }
 
 
