@@ -101,7 +101,15 @@ def test_hard_floor_is_max_of_resources() -> None:
     assert sf.hard_floor_s == max(sf.hbm_s, sf.mm_s, sf.ici_s)
     assert sf.binding == "hbm"
     assert sf.hbm_s == pytest.approx(3_859_025_920 / 3.7e12, rel=1e-12)
-    assert sf.mm_s == pytest.approx(6.91932419228308e-06, rel=1e-9)
+    sf_unpad = step_floor(
+        geom,
+        replace(CHIPS["tpu7x"], mxu_m_tile=1),
+        Parallel(tp=8),
+        StepShape(batch=1, rows_per_seq=1, context=90036),
+        DOC_DTYPES,
+    )
+    assert sf_unpad.mm_s == pytest.approx(6.91932419228308e-06, rel=1e-9)
+    assert sf.mm_s == pytest.approx(0.00021617862158358742, rel=1e-9)
 
     tiny_mm = ChipSpec("tiny_mm", 100, 1e18, 1e6, 1e6, 100)
     sf_mm = step_floor(
@@ -376,8 +384,50 @@ def test_pcp_dcp_mutual_exclusion_and_mixed_step() -> None:
         ),
         dt=EXAMPLE_FP8_DTYPES,
     )
-    assert sf_hit.mm_s < sf_miss.mm_s * 0.20
-    assert sf_pcp.mm_s < sf_miss.mm_s * 0.40
+    chip_unpad = replace(chip, mxu_m_tile=1)
+    sf_miss_u = step_floor(
+        geom,
+        chip_unpad,
+        par_p1,
+        StepShape(
+            batch=0,
+            rows_per_seq=0,
+            state_writes=0,
+            prefill_tokens=8192,
+            prefix_hit_rate=0.0,
+        ),
+        dt=EXAMPLE_FP8_DTYPES,
+    )
+    sf_hit_u = step_floor(
+        geom,
+        chip_unpad,
+        par_p1,
+        StepShape(
+            batch=0,
+            rows_per_seq=0,
+            state_writes=0,
+            prefill_tokens=8192,
+            prefix_hit_rate=0.92,
+        ),
+        dt=EXAMPLE_FP8_DTYPES,
+    )
+    sf_pcp_u = step_floor(
+        geom,
+        chip_unpad,
+        par_p4,
+        StepShape(
+            batch=0,
+            rows_per_seq=0,
+            state_writes=0,
+            prefill_tokens=8192,
+            prefix_hit_rate=0.0,
+        ),
+        dt=EXAMPLE_FP8_DTYPES,
+    )
+    assert sf_hit_u.mm_s < sf_miss_u.mm_s * 0.20
+    assert sf_pcp_u.mm_s < sf_miss_u.mm_s * 0.40
+    assert sf_hit.mm_s < sf_miss.mm_s
+    assert sf_pcp.mm_s < sf_miss.mm_s
 
     sf_dec = step_floor(
         geom,
@@ -597,3 +647,85 @@ def test_hf_loader_dtype_validations() -> None:
                 "quantization_config": {"bits": 4, "group_size": 32},
             }
         )
+
+
+def test_block_parallel_and_multilayer_mtp_draft_cost() -> None:
+    synth_moe_mtp_cfg = {
+        "hidden_size": 4096,
+        "num_hidden_layers": 8,
+        "num_attention_heads": 32,
+        "num_key_value_heads": 8,
+        "head_dim": 128,
+        "num_experts": 64,
+        "num_experts_per_tok": 4,
+        "moe_intermediate_size": 1024,
+        "mtp_num_hidden_layers": 2,
+        "mtp_intermediate_size": 6144,
+        "block_parallel": True,
+        "vocab_size": 64000,
+    }
+    geom_bp = from_hf_config(synth_moe_mtp_cfg)
+    geom_seq = replace(geom_bp, block_parallel=1)
+    assert geom_bp.block_parallel == 2
+    assert geom_bp.mtp_inter == 6144
+
+    par = Parallel(tp=8)
+    dt = Dtypes()
+    mods_seq = pass_costs(geom_seq, par, StepShape(batch=4, rows_per_seq=1), dt)
+    mods_bp = pass_costs(geom_bp, par, StepShape(batch=4, rows_per_seq=1), dt)
+    # Block-parallel collapses the 8 FFN moe_ar all-reduces into the 8
+    # block out_ar calls.
+    assert (
+        sum(m.n_collectives for m in mods_seq) - sum(m.n_collectives for m in mods_bp)
+        == 8
+    )
+
+    cyc_dense_mtp = spec_cycle_floor(
+        geom_bp, CHIPS["tpu7x"], par, batch=4, context=2048, k=2, dt=dt
+    )
+    cyc_moe_mtp = spec_cycle_floor(
+        replace(geom_bp, mtp_inter=0),
+        CHIPS["tpu7x"],
+        par,
+        batch=4,
+        context=2048,
+        k=2,
+        dt=dt,
+    )
+    assert any(m.name == "draft_mlp" for m in cyc_dense_mtp.modules)
+    assert not any(m.name == "draft_moe" for m in cyc_dense_mtp.modules)
+    assert any(m.name == "draft_moe" for m in cyc_moe_mtp.modules)
+
+    # Each draft step executes 1 MTP predictor layer (spec_step_idx % num_mtp_layers),
+    # while all mtp_layers predictor weights remain resident in HBM.
+    cyc_mtp1 = spec_cycle_floor(
+        replace(geom_bp, mtp_layers=1),
+        CHIPS["tpu7x"],
+        par,
+        batch=4,
+        context=2048,
+        k=2,
+        dt=dt,
+    )
+    draft_mlp_2 = next(m for m in cyc_dense_mtp.modules if m.name == "draft_mlp")
+    draft_mlp_1 = next(m for m in cyc_mtp1.modules if m.name == "draft_mlp")
+    draft_fc_2 = next(m for m in cyc_dense_mtp.modules if m.name == "draft_fc")
+    draft_fc_1 = next(m for m in cyc_mtp1.modules if m.name == "draft_fc")
+    assert draft_mlp_2.hbm_bytes == pytest.approx(draft_mlp_1.hbm_bytes, rel=1e-9)
+    assert draft_fc_2.hbm_bytes == pytest.approx(draft_fc_1.hbm_bytes, rel=1e-9)
+
+    bd_mtp2 = rf.hbm_breakdown_per_core_bytes(geom_bp, dt, par, 1, 1024)
+    bd_mtp1 = rf.hbm_breakdown_per_core_bytes(
+        replace(geom_bp, mtp_layers=1), dt, par, 1, 1024
+    )
+    bd_mtp0 = rf.hbm_breakdown_per_core_bytes(
+        replace(geom_bp, mtp_layers=0), dt, par, 1, 1024
+    )
+    assert (bd_mtp2.weights - bd_mtp0.weights) == pytest.approx(
+        2.0 * (bd_mtp1.weights - bd_mtp0.weights), rel=1e-9
+    )
+
+    bd_moe = rf.hbm_breakdown_per_core_bytes(
+        replace(geom_bp, mtp_inter=0), dt, par, 1, 1024
+    )
+    assert bd_mtp2.weights < bd_moe.weights

@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import Literal
 
 from .collectives import Algo, Collective, make, padded_rows
@@ -86,9 +87,14 @@ class ModuleCost:
     bf16_flops: float
     collectives: tuple[Collective, ...] = ()
     hbm_bytes_min: float | None = None
+    unique_collectives: tuple[tuple[Collective, int], ...] | None = None
 
     @property
     def ici_bytes(self) -> float:
+        if self.unique_collectives is not None:
+            return sum(
+                c.wire_bytes * c.offchip * cnt for c, cnt in self.unique_collectives
+            )
         return sum(c.wire_bytes * c.offchip for c in self.collectives)
 
     @property
@@ -104,6 +110,7 @@ class ModuleCost:
         return self.hbm_bytes if self.hbm_bytes_min is None else self.hbm_bytes_min
 
 
+@lru_cache(maxsize=32768)
 def experts_touched(num_experts: int, top_k: int, rows: int) -> float:
     """Expected distinct routed experts touched under uniform routing."""
     if num_experts <= 0 or top_k <= 0 or rows <= 0:
@@ -113,6 +120,7 @@ def experts_touched(num_experts: int, top_k: int, rows: int) -> float:
     return float(num_experts) * (1.0 - (1.0 - top_k / num_experts) ** rows)
 
 
+@lru_cache(maxsize=32768)
 def ep_busiest_experts(num_experts: int, top_k: int, rows: int, ranks: int) -> float:
     """Expected distinct routed experts on the busiest rank under uniform EP."""
     if num_experts <= 0 or top_k <= 0 or rows <= 0 or ranks <= 0:
@@ -123,6 +131,8 @@ def ep_busiest_experts(num_experts: int, top_k: int, rows: int, ranks: int) -> f
     if n <= 0:
         return float(math.ceil(min(num_experts, top_k) / ranks))
     p = 1.0 if top_k >= num_experts else 1.0 - (1.0 - top_k / num_experts) ** rows
+    if p >= 1.0 - 1e-15:
+        return float(n)
     cdf = 0.0
     acc = 0.0
     for x in range(n):
@@ -144,6 +154,7 @@ def _split_matmul_flops(
     return (0.0, flops)
 
 
+@lru_cache(maxsize=32768)
 def _embed_collectives(rows: int, hidden: int, par: Parallel) -> tuple[Collective, ...]:
     if par.tp <= 1 or hidden <= 0:
         return ()
@@ -159,6 +170,78 @@ def _embed_collectives(rows: int, hidden: int, par: Parallel) -> tuple[Collectiv
     )
 
 
+def _repeat_colls(
+    base: tuple[Collective, ...], count: int
+) -> tuple[tuple[Collective, ...], tuple[tuple[Collective, int], ...]]:
+    if not base or count <= 0:
+        return (), ()
+    return base * count, tuple((c, count) for c in base)
+
+
+@lru_cache(maxsize=256)
+def _classify_layers(
+    layer_types: tuple[str, ...],
+    compress_ratios: tuple[float, ...],
+    kv_lora_rank: int,
+    index_topk: int,
+) -> tuple[int, int, int, int, int, int, float, float, float, float]:
+    n_gqa = 0
+    n_mla = 0
+    n_dsa = 0
+    n_swa = 0
+    n_gdn = 0
+    n_kda = 0
+    kv_n_gqa = 0.0
+    kv_n_mla = 0.0
+    kv_n_dsa = 0.0
+    kv_n_swa = 0.0
+    n_cr = len(compress_ratios)
+    for idx, tok in enumerate(layer_types):
+        r = compress_ratios[idx] if idx < n_cr else 1.0
+        kv_ret = (1.0 / r) if r > 1.0 else r
+        if tok in ("mla", "mla_attention"):
+            n_mla += 1
+            kv_n_mla += kv_ret
+        elif tok in ("dsa", "dsa_attention", "sparse_mla"):
+            n_dsa += 1
+            kv_n_dsa += kv_ret
+        elif tok in ("sliding_attention", "swa", "sliding_window_attention"):
+            n_swa += 1
+            kv_n_swa += kv_ret
+        elif tok in ("kda", "kimi_linear", "kda_attention"):
+            n_kda += 1
+        elif tok in ("linear_attention", "gdn", "gated_deltanet", "mamba"):
+            n_gdn += 1
+        elif tok == "ffn_only":
+            continue
+        elif tok == "gqa":
+            n_gqa += 1
+            kv_n_gqa += kv_ret
+        elif tok in ("full_attention", "attention"):
+            if kv_lora_rank > 0 and index_topk > 0:
+                n_dsa += 1
+                kv_n_dsa += kv_ret
+            elif kv_lora_rank > 0:
+                n_mla += 1
+                kv_n_mla += kv_ret
+            else:
+                n_gqa += 1
+                kv_n_gqa += kv_ret
+    return (
+        n_gqa,
+        n_mla,
+        n_dsa,
+        n_swa,
+        n_gdn,
+        n_kda,
+        kv_n_gqa,
+        kv_n_mla,
+        kv_n_dsa,
+        kv_n_swa,
+    )
+
+
+@lru_cache(maxsize=32768)
 def _attn_layer_collectives(
     batch: int,
     rows_per_seq: int,
@@ -169,6 +252,7 @@ def _attn_layer_collectives(
     *,
     is_full_attention: bool,
     extra_rows: int = 0,
+    block_parallel: int = 1,
 ) -> tuple[Collective, ...]:
     rows = batch * rows_per_seq + extra_rows
     mp = padded_rows(rows, par.tp, par.residual)
@@ -197,16 +281,17 @@ def _attn_layer_collectives(
                     par.ranks_per_chip,
                 )
             )
-            colls.append(
-                make(
-                    "out_rs",
-                    "rs",
-                    s_bytes,
-                    par.tp,
-                    par.ar_algo,
-                    par.ranks_per_chip,
+            if block_parallel <= 1:
+                colls.append(
+                    make(
+                        "out_rs",
+                        "rs",
+                        s_bytes,
+                        par.tp,
+                        par.ar_algo,
+                        par.ranks_per_chip,
+                    )
                 )
-            )
     if is_full_attention and par.kv_split > 1:
         g = par.kv_split
         dec_rows = batch * rows_per_seq
@@ -267,12 +352,15 @@ def _attn_layer_collectives(
     return tuple(colls)
 
 
+@lru_cache(maxsize=32768)
 def _moe_layer_collectives(
     rows: int,
     hidden: int,
     num_experts: int,
     top_k: int,
     par: Parallel,
+    *,
+    block_parallel: int = 1,
 ) -> tuple[Collective, ...]:
     ep_ranks = par.ep if par.ep > 1 else par.tp
     if par.tp <= 1 and ep_ranks <= 1:
@@ -317,7 +405,7 @@ def _moe_layer_collectives(
                 par.ranks_per_chip,
             )
         )
-        if par.residual == "replicated" and tp > 1:
+        if par.residual == "replicated" and tp > 1 and block_parallel <= 1:
             ar_rows = rows
             colls.append(
                 make(
@@ -389,16 +477,17 @@ def _moe_layer_collectives(
     )
     if par.residual == "replicated":
         if par.moe_dispatch == "allreduce":
-            colls.append(
-                make(
-                    "moe_ar",
-                    "ar",
-                    s_bytes,
-                    tp,
-                    par.ar_algo,
-                    par.ranks_per_chip,
+            if block_parallel <= 1:
+                colls.append(
+                    make(
+                        "moe_ar",
+                        "ar",
+                        s_bytes,
+                        tp,
+                        par.ar_algo,
+                        par.ranks_per_chip,
+                    )
                 )
-            )
         else:
             colls.append(
                 make(
@@ -433,16 +522,17 @@ def _moe_layer_collectives(
                 )
     else:
         if par.moe_dispatch == "allreduce":
-            colls.append(
-                make(
-                    "dispatch_ag",
-                    "ag",
-                    s_bytes,
-                    tp,
-                    par.ar_algo,
-                    par.ranks_per_chip,
+            if block_parallel <= 1:
+                colls.append(
+                    make(
+                        "dispatch_ag",
+                        "ag",
+                        s_bytes,
+                        tp,
+                        par.ar_algo,
+                        par.ranks_per_chip,
+                    )
                 )
-            )
             colls.append(
                 make(
                     "logits_ag",
@@ -487,6 +577,7 @@ def _moe_layer_collectives(
     return tuple(colls)
 
 
+@lru_cache(maxsize=32768)
 def _lm_head_collectives(
     rows: int, hidden: int, vocab: int, par: Parallel
 ) -> tuple[Collective, ...]:
@@ -521,11 +612,14 @@ def _lm_head_collectives(
     return tuple(colls)
 
 
+@lru_cache(maxsize=32768)
 def pass_costs(
     geom: ModelGeometry,
     par: Parallel,
     shape: StepShape,
     dt: Dtypes,
+    *,
+    mxu_m_tile: int = 1,
 ) -> tuple[ModuleCost, ...]:
     """Compute per-module resource work for one decode, prefill, or mixed pass."""
     tp = par.tp
@@ -575,40 +669,33 @@ def pass_costs(
     )
     rows = decode_rows + eff_prefill
 
-    n_gqa = 0
-    n_mla = 0
-    n_dsa = 0
-    n_swa = 0
-    n_gdn = 0
-    n_kda = 0
-    for tok in geom.layer_types:
-        if tok in ("mla", "mla_attention"):
-            n_mla += 1
-        elif tok in ("dsa", "dsa_attention", "sparse_mla"):
-            n_dsa += 1
-        elif tok in ("sliding_attention", "swa", "sliding_window_attention"):
-            n_swa += 1
-        elif tok in ("kda", "kimi_linear", "kda_attention"):
-            n_kda += 1
-        elif tok in ("linear_attention", "gdn", "gated_deltanet", "mamba"):
-            n_gdn += 1
-        elif tok == "gqa":
-            n_gqa += 1
-        elif tok in ("full_attention", "attention"):
-            if geom.kv_lora_rank > 0 and geom.index_topk > 0:
-                n_dsa += 1
-            elif geom.kv_lora_rank > 0:
-                n_mla += 1
-            else:
-                n_gqa += 1
+    (
+        n_gqa,
+        n_mla,
+        n_dsa,
+        n_swa,
+        n_gdn,
+        n_kda,
+        kv_n_gqa,
+        kv_n_mla,
+        kv_n_dsa,
+        kv_n_swa,
+    ) = _classify_layers(
+        geom.layer_types,
+        geom.compress_ratios,
+        geom.kv_lora_rank,
+        geom.index_topk,
+    )
 
+    emb_colls, emb_ucolls = _repeat_colls(_embed_collectives(rows, geom.hidden, par), 1)
     out: list[ModuleCost] = [
         ModuleCost(
             name="embed",
             hbm_bytes=0.0,
             fp8_flops=0.0,
             bf16_flops=0.0,
-            collectives=_embed_collectives(rows, geom.hidden, par),
+            collectives=emb_colls,
+            unique_collectives=emb_ucolls,
         )
     ]
 
@@ -620,53 +707,44 @@ def pass_costs(
     # 1. GQA full attention
     if n_gqa > 0:
         n_eff = n_gqa * pp_scale
+        gqa_hd = geom.global_head_dim if geom.global_head_dim > 0 else geom.head_dim
+        gqa_q_out = geom.num_heads * gqa_hd * q_mult
         att_w_elems = float(
             n_eff
             * (
-                geom.hidden * (q_out // tp)
-                + 2 * geom.hidden * kvh * geom.head_dim
-                + (geom.num_heads // tp) * geom.head_dim * geom.hidden
+                geom.hidden * (gqa_q_out // tp)
+                + 2 * geom.hidden * kvh * gqa_hd
+                + (geom.num_heads // tp) * gqa_hd * geom.hidden
             )
         )
-        kv_dec_tokens = float(shape.batch * shape.context) / par.kv_split
+        gqa_kv_scale = (kv_n_gqa / float(n_gqa)) if geom.compress_ratios else 1.0
+        kv_dec_tokens = float(shape.batch * shape.context) * gqa_kv_scale / par.kv_split
         kv_pre_tokens = float(cached_prefix + eff_prefill)
         kv_bytes = (
-            float(kvh * geom.head_dim * 2)
-            * n_eff
-            * (kv_dec_tokens + kv_pre_tokens)
-            * dt.kv
+            float(kvh * gqa_hd * 2) * n_eff * (kv_dec_tokens + kv_pre_tokens) * dt.kv
         )
         att_fp8, att_bf16 = _split_matmul_flops(rows, att_w_elems, dt.w_dense, dt.act)
         dec_scores = float(
-            decode_rows
-            * 4
-            * shape.context
-            * geom.head_dim
-            * (geom.num_heads // tp)
-            * n_eff
+            decode_rows * 4 * shape.context * gqa_hd * (geom.num_heads // tp) * n_eff
         )
         pre_ctx_eff = cached_prefix + 0.5 * eff_prefill * par.pcp
         pre_scores = float(
-            eff_prefill
-            * 4
-            * pre_ctx_eff
-            * geom.head_dim
-            * (geom.num_heads // tp)
-            * n_eff
+            eff_prefill * 4 * pre_ctx_eff * gqa_hd * (geom.num_heads // tp) * n_eff
         )
         n_colls_layers = max(1, round(n_eff))
-        att_colls = (
+        att_colls, att_ucolls = _repeat_colls(
             _attn_layer_collectives(
                 shape.batch,
                 shape.rows_per_seq,
                 geom.hidden,
                 geom.num_heads // tp,
-                geom.head_dim,
+                gqa_hd,
                 par,
                 is_full_attention=True,
                 extra_rows=eff_prefill,
-            )
-            * n_colls_layers
+                block_parallel=geom.block_parallel,
+            ),
+            n_colls_layers,
         )
         out.append(
             ModuleCost(
@@ -675,6 +753,7 @@ def pass_costs(
                 fp8_flops=att_fp8,
                 bf16_flops=att_bf16 + dec_scores + pre_scores,
                 collectives=att_colls,
+                unique_collectives=att_ucolls,
             )
         )
 
@@ -691,7 +770,8 @@ def pass_costs(
                 + nq * geom.head_dim * geom.hidden
             )
         )
-        kv_tokens = float(shape.batch * eff_ctx) / par.kv_split + float(
+        swa_kv_scale = (kv_n_swa / float(n_swa)) if geom.compress_ratios else 1.0
+        kv_tokens = float(shape.batch * eff_ctx) * swa_kv_scale / par.kv_split + float(
             min(cached_prefix + eff_prefill, sw_cap) if eff_prefill > 0 else 0
         )
         swa_kv_bytes = float(kvh * geom.head_dim * 2) * n_eff * kv_tokens * dt.kv
@@ -703,16 +783,20 @@ def pass_costs(
             * nq
             * n_eff
         )
-        swa_colls = _attn_layer_collectives(
-            shape.batch,
-            shape.rows_per_seq,
-            geom.hidden,
-            nq,
-            geom.head_dim,
-            par,
-            is_full_attention=True,
-            extra_rows=eff_prefill,
-        ) * max(1, round(n_eff))
+        swa_colls, swa_ucolls = _repeat_colls(
+            _attn_layer_collectives(
+                shape.batch,
+                shape.rows_per_seq,
+                geom.hidden,
+                nq,
+                geom.head_dim,
+                par,
+                is_full_attention=True,
+                extra_rows=eff_prefill,
+                block_parallel=geom.block_parallel,
+            ),
+            max(1, round(n_eff)),
+        )
         out.append(
             ModuleCost(
                 name="swa",
@@ -720,11 +804,15 @@ def pass_costs(
                 fp8_flops=swa_fp8,
                 bf16_flops=swa_bf16 + swa_scores,
                 collectives=swa_colls,
+                unique_collectives=swa_ucolls,
             )
         )
 
     # 3 & 4. Multi-head Latent Attention (MLA) and Dynamic Sparse Attention (DSA)
-    for fam_name, n_fam, is_sparse in (("mla", n_mla, False), ("dsa", n_dsa, True)):
+    for fam_name, n_fam, kv_n_fam, is_sparse in (
+        ("mla", n_mla, kv_n_mla, False),
+        ("dsa", n_dsa, kv_n_dsa, True),
+    ):
         if n_fam <= 0:
             continue
         n_eff = n_fam * pp_scale
@@ -736,7 +824,7 @@ def pass_costs(
             raise ValueError(
                 f"{fam_name.upper()} layer requires config field 'qk_nope_head_dim'"
             )
-        if geom.qk_rope_head_dim <= 0:
+        if geom.qk_rope_head_dim < 0:
             raise ValueError(
                 f"{fam_name.upper()} layer requires config field 'qk_rope_head_dim'"
             )
@@ -767,7 +855,8 @@ def pass_costs(
             else shape.context
         )
         latent_width = kv_lora + rope_d
-        kv_tokens = float(shape.batch * att_ctx) / par.kv_split + float(
+        fam_kv_scale = (kv_n_fam / float(n_fam)) if geom.compress_ratios else 1.0
+        kv_tokens = float(shape.batch * att_ctx) * fam_kv_scale / par.kv_split + float(
             cached_prefix + eff_prefill
         )
         mla_kv_bytes = n_eff * kv_tokens * float(latent_width) * dt.kv
@@ -775,6 +864,7 @@ def pass_costs(
             mla_kv_bytes += (
                 n_eff
                 * float(shape.batch * shape.context * geom.index_head_dim)
+                * fam_kv_scale
                 * dt.kv
                 / par.kv_split
             )
@@ -789,16 +879,20 @@ def pass_costs(
             * (kv_lora + rope_d + kv_lora)
             * n_eff
         )
-        mla_colls = _attn_layer_collectives(
-            shape.batch,
-            shape.rows_per_seq,
-            geom.hidden,
-            nq,
-            kv_lora,
-            par,
-            is_full_attention=True,
-            extra_rows=eff_prefill,
-        ) * max(1, round(n_eff))
+        mla_colls, mla_ucolls = _repeat_colls(
+            _attn_layer_collectives(
+                shape.batch,
+                shape.rows_per_seq,
+                geom.hidden,
+                nq,
+                kv_lora,
+                par,
+                is_full_attention=True,
+                extra_rows=eff_prefill,
+                block_parallel=geom.block_parallel,
+            ),
+            max(1, round(n_eff)),
+        )
         out.append(
             ModuleCost(
                 name=fam_name,
@@ -806,6 +900,7 @@ def pass_costs(
                 fp8_flops=mla_fp8,
                 bf16_flops=mla_bf16 + mla_scores,
                 collectives=mla_colls,
+                unique_collectives=mla_ucolls,
             )
         )
 
@@ -836,16 +931,20 @@ def pass_costs(
         gdn_rec_flops = float(
             rows * 4 * vh * geom.linear_k_dim * geom.linear_v_dim * n_eff
         )
-        gdn_colls = _attn_layer_collectives(
-            shape.batch,
-            shape.rows_per_seq,
-            geom.hidden,
-            geom.num_heads // tp,
-            geom.head_dim,
-            par,
-            is_full_attention=False,
-            extra_rows=eff_prefill,
-        ) * max(1, round(n_eff))
+        gdn_colls, gdn_ucolls = _repeat_colls(
+            _attn_layer_collectives(
+                shape.batch,
+                shape.rows_per_seq,
+                geom.hidden,
+                geom.num_heads // tp,
+                geom.head_dim,
+                par,
+                is_full_attention=False,
+                extra_rows=eff_prefill,
+                block_parallel=geom.block_parallel,
+            ),
+            max(1, round(n_eff)),
+        )
         out.append(
             ModuleCost(
                 name="gdn",
@@ -857,6 +956,7 @@ def pass_costs(
                 fp8_flops=dense_fp8 + aux_fp8,
                 bf16_flops=dense_bf16 + aux_bf16 + gdn_rec_flops,
                 collectives=gdn_colls,
+                unique_collectives=gdn_ucolls,
             )
         )
 
@@ -877,16 +977,20 @@ def pass_costs(
         kda_state_bytes = float(seq_count * (1 + sw_count)) * kda_rec
         kda_fp8, kda_bf16 = _split_matmul_flops(rows, kda_w_elems, dt.w_dense, dt.act)
         kda_rec_flops = float(rows * 4 * vh * kd * vd * n_eff)
-        kda_colls = _attn_layer_collectives(
-            shape.batch,
-            shape.rows_per_seq,
-            geom.hidden,
-            nq,
-            vd,
-            par,
-            is_full_attention=False,
-            extra_rows=eff_prefill,
-        ) * max(1, round(n_eff))
+        kda_colls, kda_ucolls = _repeat_colls(
+            _attn_layer_collectives(
+                shape.batch,
+                shape.rows_per_seq,
+                geom.hidden,
+                nq,
+                vd,
+                par,
+                is_full_attention=False,
+                extra_rows=eff_prefill,
+                block_parallel=geom.block_parallel,
+            ),
+            max(1, round(n_eff)),
+        )
         out.append(
             ModuleCost(
                 name="kda",
@@ -894,13 +998,22 @@ def pass_costs(
                 fp8_flops=kda_fp8,
                 bf16_flops=kda_bf16 + kda_rec_flops,
                 collectives=kda_colls,
+                unique_collectives=kda_ucolls,
             )
         )
 
     # 7 & 8. Dense MLP and Routed MoE FFN layers
     if geom.num_experts > 0:
-        n_dense_ffn = min(geom.num_layers, geom.first_k_dense_replace)
-        n_moe_ffn = geom.num_layers - n_dense_ffn
+        if geom.n_moe_layers is not None:
+            n_moe_ffn = min(geom.num_layers, max(0, geom.n_moe_layers))
+            n_dense_ffn = (
+                geom.n_dense_layers
+                if geom.n_dense_layers is not None
+                else (geom.num_layers - n_moe_ffn)
+            )
+        else:
+            n_dense_ffn = min(geom.num_layers, geom.first_k_dense_replace)
+            n_moe_ffn = geom.num_layers - n_dense_ffn
         if n_dense_ffn > 0 and geom.dense_inter > 0:
             n_d_eff = n_dense_ffn * pp_scale
             mlp_inter = geom.dense_inter // tp
@@ -913,8 +1026,11 @@ def pass_costs(
                 ranks_per_chip=par.ranks_per_chip,
                 moe="ep" if par.residual == "sp" else "tp_slice",
             )
-            mlp_colls = _moe_layer_collectives(rows, geom.hidden, 0, 0, d_par) * max(
-                1, round(n_d_eff)
+            mlp_colls, mlp_ucolls = _repeat_colls(
+                _moe_layer_collectives(
+                    rows, geom.hidden, 0, 0, d_par, block_parallel=geom.block_parallel
+                ),
+                max(1, round(n_d_eff)),
             )
             out.append(
                 ModuleCost(
@@ -923,6 +1039,7 @@ def pass_costs(
                     fp8_flops=mlp_fp8,
                     bf16_flops=mlp_bf16,
                     collectives=mlp_colls,
+                    unique_collectives=mlp_ucolls,
                 )
             )
         if n_moe_ffn > 0:
@@ -985,13 +1102,33 @@ def pass_costs(
             r_fp8, r_bf16 = _split_matmul_flops(
                 routed_rows, routed_act_elems, dt.w_expert, dt.act
             )
+            if mxu_m_tile > 1 and routed_rows > 0 and ed > 0.0 and geom.top_k > 0:
+                ed_global = (
+                    experts_touched(geom.num_experts, geom.top_k, routed_rows)
+                    if par.moe == "ep"
+                    else ed
+                )
+                m_per_touched = float(routed_rows * geom.top_k) / max(1.0, ed_global)
+                if m_per_touched > 0.0:
+                    m_pad = float(math.ceil(m_per_touched / mxu_m_tile) * mxu_m_tile)
+                    pad_mult = m_pad / m_per_touched
+                    r_fp8 *= pad_mult
+                    r_bf16 *= pad_mult
             s_fp8, s_bf16 = _split_matmul_flops(
                 sh_rows, shared_elems, dt.w_dense, dt.act
             )
             rt_fp8, rt_bf16 = _split_matmul_flops(rows, router_elems, dt.router, dt.act)
-            moe_colls = _moe_layer_collectives(
-                rows, geom.hidden, geom.num_experts, geom.top_k, par
-            ) * max(1, round(n_m_eff))
+            moe_colls, moe_ucolls = _repeat_colls(
+                _moe_layer_collectives(
+                    rows,
+                    geom.hidden,
+                    geom.num_experts,
+                    geom.top_k,
+                    par,
+                    block_parallel=geom.block_parallel,
+                ),
+                max(1, round(n_m_eff)),
+            )
             out.append(
                 ModuleCost(
                     name="moe",
@@ -1000,6 +1137,7 @@ def pass_costs(
                     bf16_flops=r_bf16 + s_bf16 + rt_bf16,
                     collectives=moe_colls,
                     hbm_bytes_min=moe_w_bytes_min,
+                    unique_collectives=moe_ucolls,
                 )
             )
     else:
@@ -1007,8 +1145,11 @@ def pass_costs(
         mlp_inter = geom.dense_inter // tp
         mlp_elems = float(n_d_eff * 3 * geom.hidden * mlp_inter)
         mlp_fp8, mlp_bf16 = _split_matmul_flops(rows, mlp_elems, dt.w_dense, dt.act)
-        mlp_colls = _moe_layer_collectives(rows, geom.hidden, 0, 0, par) * max(
-            1, round(n_d_eff)
+        mlp_colls, mlp_ucolls = _repeat_colls(
+            _moe_layer_collectives(
+                rows, geom.hidden, 0, 0, par, block_parallel=geom.block_parallel
+            ),
+            max(1, round(n_d_eff)),
         )
         out.append(
             ModuleCost(
@@ -1017,6 +1158,7 @@ def pass_costs(
                 fp8_flops=mlp_fp8,
                 bf16_flops=mlp_bf16,
                 collectives=mlp_colls,
+                unique_collectives=mlp_ucolls,
             )
         )
 
@@ -1056,14 +1198,17 @@ def pass_costs(
 
     lm_elems = float(geom.vocab * geom.hidden // tp) / float(max(1, par.pp))
     lm_fp8, lm_bf16 = _split_matmul_flops(rows, lm_elems, dt.lm_head, dt.act)
+    lm_colls, lm_ucolls = _repeat_colls(
+        _lm_head_collectives(rows, geom.hidden, geom.vocab, par) + pp_colls, 1
+    )
     out.append(
         ModuleCost(
             name="lm_head",
             hbm_bytes=lm_elems * dt.lm_head,
             fp8_flops=lm_fp8,
             bf16_flops=lm_bf16,
-            collectives=_lm_head_collectives(rows, geom.hidden, geom.vocab, par)
-            + pp_colls,
+            collectives=lm_colls,
+            unique_collectives=lm_ucolls,
         )
     )
     return tuple(out)
