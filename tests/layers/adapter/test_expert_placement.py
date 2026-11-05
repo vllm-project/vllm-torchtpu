@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Host-side checks for TPU_EXPERT_PLACEMENT (vllm_torchtpu/expert_placement.py)."""
+"""Host-side checks for TPU_EXPERT_PLACEMENT (layers/adapter/expert_placement.py)."""
 
 import json
 import subprocess
@@ -20,8 +20,8 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from vllm_torchtpu import expert_placement
-from vllm_torchtpu.layers.adapter import moe_routing
+from vllm_torchtpu import model_loader_patches
+from vllm_torchtpu.layers.adapter import expert_placement, moe_routing
 
 # Rank 0 holds experts 7, 0, 5, 2 in slots 0-3; rank 1 holds 1, 6, 3, 4 in
 # slots 4-7.
@@ -47,8 +47,14 @@ def _fresh_state(monkeypatch):
 def _target_has_six_layers(monkeypatch):
     import vllm.config
 
+    # Laid out like a multimodal config (Qwen3.5-MoE, for example): the depth
+    # is on the text config only.
+    text_config = SimpleNamespace(num_hidden_layers=6)
     config = SimpleNamespace(
-        model_config=SimpleNamespace(hf_config=SimpleNamespace(num_hidden_layers=6))
+        model_config=SimpleNamespace(
+            hf_config=SimpleNamespace(text_config=text_config),
+            hf_text_config=text_config,
+        )
     )
     monkeypatch.setattr(vllm.config, "get_current_vllm_config", lambda: config)
     expert_placement._target_layers.cache_clear()
@@ -156,11 +162,56 @@ def test_a_table_that_is_not_a_permutation_is_refused(layers):
         expert_placement.parse(_table(layers=layers))
 
 
+_RANKS = [list(ORDER[:4]), list(ORDER[4:])]
+
+
+@pytest.mark.parametrize(
+    "table, reason",
+    [
+        ({"experts": 8, "shards": 0, "layers": {}}, "must be positive"),
+        ({"experts": 0, "shards": 2, "layers": {}}, "must be positive"),
+        ({"experts": -8, "shards": 2, "layers": {}}, "must be positive"),
+        (_table(layers={"-1": _RANKS}), "negative"),
+        (_table(layers={"3": _RANKS, "03": _RANKS}), "listed twice"),
+        (_table(layers={"x": _RANKS}), "not a layer index"),
+    ],
+)
+def test_a_malformed_table_is_refused(table, reason):
+    with pytest.raises(ValueError, match=reason):
+        expert_placement.parse(table)
+
+
+def test_a_table_file_that_repeats_a_key_is_refused(tmp_path, monkeypatch):
+    path = tmp_path / "placement.json"
+    path.write_text(
+        '{"experts": 8, "shards": 2, "layers": '
+        '{"3": [[7, 0, 5, 2], [1, 6, 3, 4]], "3": [[0, 1, 2, 3], [4, 5, 6, 7]]}}'
+    )
+    monkeypatch.setenv("TPU_EXPERT_PLACEMENT", str(path))
+    with pytest.raises(ValueError, match="appears twice"):
+        expert_placement.current()
+
+
 def test_layer_index_reads_module_prefixes_and_checkpoint_names():
     assert expert_placement.layer_index("model.layers.12.ffn.experts") == 12
     assert expert_placement.layer_index("layers.3.ffn.experts.17.w1.weight") == 3
-    assert expert_placement.layer_index("mtp.0.ffn.experts.1.w1.weight") is None
     assert expert_placement.layer_index("model.sublayers.3.x") is None
+    # A drafter's MoE layer i is layer 6 + i after the 6-layer target: DSpark's
+    # module `layers.7` and checkpoint `mtp.1.*`, and Qwen3.5 / Qwen3-Next MTP's
+    # module and checkpoint `mtp.layers.1.*`.
+    assert expert_placement.layer_index("model.layers.7.ffn.experts") == 7
+    assert expert_placement.layer_index("mtp.1.ffn.experts.1.w1.weight") == 7
+    assert expert_placement.layer_index("mtp.layers.1.mlp.experts") == 7
+    name = "mtp.layers.1.mlp.experts.3.gate_proj.weight"
+    assert expert_placement.layer_index(name) == 7
+
+
+def test_the_target_depth_is_read_from_the_text_config():
+    import vllm.config
+
+    model_config = vllm.config.get_current_vllm_config().model_config
+    assert not hasattr(model_config.hf_config, "num_hidden_layers")
+    assert expert_placement._target_layers() == 6
 
 
 def test_apply_maps_slots_and_gates_the_fetch_filter(placement_file):
@@ -185,6 +236,26 @@ def test_the_fetch_filter_follows_the_rank_the_map_was_built_for(placement_file)
     assert expert_placement.fetch_filter_ids(
         "layers.3.ffn.experts.5.w2.weight"
     ) == frozenset({7, 0, 5, 2})
+
+
+def test_the_checkpoint_fetch_skips_by_placement_only_in_placed_layers(
+    placement_file,
+):
+    skip = model_loader_patches._should_skip
+    contiguous = {0, 1, 2, 3}  # rank 0's block without a placement
+    # Nothing applied yet: the contiguous block decides.
+    assert skip("model.layers.3.ffn.experts.7.w1.weight", contiguous)
+    assert expert_placement.apply(_Runner("model.layers.3.ffn.experts", rank=0))
+    # Placed layer 3: rank 0 holds 7, 0, 5, 2.
+    assert not skip("model.layers.3.ffn.experts.7.w1.weight", contiguous)
+    assert skip("model.layers.3.ffn.experts.1.w1.weight", contiguous)
+    assert not skip("model.layers.3.ffn.experts.2.w2.weight_scale", contiguous)
+    # Unplaced layer 4: the contiguous block still decides.
+    assert not skip("model.layers.4.ffn.experts.1.w1.weight", contiguous)
+    assert skip("model.layers.4.ffn.experts.7.w1.weight", contiguous)
+    # Only per-expert weight suffixes are ever skipped.
+    assert not skip("model.layers.3.ffn.experts.1.w1.input_scale", contiguous)
+    assert not skip("model.layers.3.ffn.gate.weight", contiguous)
 
 
 def test_unlisted_and_unplaced_layers_are_untouched(placement_file, monkeypatch):
@@ -244,6 +315,26 @@ def test_drafter_layers_take_their_mtp_tensors(tmp_path, monkeypatch):
     name = "mtp.1.ffn.experts.0.w1.weight"
     assert expert_placement.fetch_filter_ids(name) == frozenset({1, 6, 3, 4})
     assert expert_placement.fetch_filter_ids("mtp.0.ffn.experts.0.w1") is None
+
+
+def test_an_mtp_layers_drafter_is_layer_n_not_target_layer_0(tmp_path, monkeypatch):
+    # Qwen3.5 / Qwen3-Next MTP: module and checkpoint `mtp.layers.0.*` are
+    # layer 6 of the 6-layer target's table, not target layer 0.
+    path = tmp_path / "drafter.json"
+    layers = {
+        "0": [[0, 1, 2, 3], [4, 5, 6, 7]],
+        "6": [list(ORDER[:4]), list(ORDER[4:])],
+    }
+    path.write_text(json.dumps(_table(layers=layers)))
+    monkeypatch.setenv("TPU_EXPERT_PLACEMENT", str(path))
+    runner = _Runner("mtp.layers.0.mlp.experts", rank=1)
+    assert expert_placement.apply(runner)
+    assert expert_placement.expert_order(runner.routed_experts) == ORDER
+    assert runner.routed_experts._expert_map.tolist() == [-1, 0, -1, 2, 3, -1, 1, -1]
+    name = "mtp.layers.0.mlp.experts.1.gate_proj.weight"
+    assert expert_placement.fetch_filter_ids(name) == frozenset({1, 6, 3, 4})
+    # Target layer 0 was never applied in this process.
+    assert expert_placement.fetch_filter_ids("model.layers.0.mlp.experts.1.w1") is None
 
 
 @pytest.mark.parametrize("bias", [False, True])
@@ -417,3 +508,16 @@ def test_a_gs_table_without_gcloud_says_so(monkeypatch):
     monkeypatch.setattr(subprocess, "run", missing)
     with pytest.raises(RuntimeError, match="gcloud"):
         expert_placement._read("gs://bucket/placement.json")
+
+
+def test_a_stalled_gs_read_times_out(monkeypatch):
+    calls = []
+
+    def stalled(cmd, **kwargs):
+        calls.append(kwargs)
+        raise subprocess.TimeoutExpired(cmd, kwargs["timeout"])
+
+    monkeypatch.setattr(subprocess, "run", stalled)
+    with pytest.raises(RuntimeError, match="gs://bucket/placement.json.*timed out"):
+        expert_placement._read("gs://bucket/placement.json")
+    assert 0 < calls[0]["timeout"] < float("inf")

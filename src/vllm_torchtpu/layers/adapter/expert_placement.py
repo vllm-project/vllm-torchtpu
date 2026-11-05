@@ -68,9 +68,13 @@ logger = init_logger(__name__)
 # `model.layers.7.ffn.experts` (a module prefix) and `layers.7.ffn.experts.3.w1`
 # (a checkpoint tensor) both name layer 7.
 _LAYER_RE = re.compile(r"(?:^|\.)layers\.(\d+)\.")
-# A DSpark drafter's MoE layers are modules `layers.{n + i}` of an n-layer
-# target, built from the checkpoint's `mtp.{i}.*` tensors.
-_DRAFTER_TENSOR_RE = re.compile(r"^mtp\.(\d+)\.")
+# A drafter's MoE layer i is layer n + i of an n-layer target. A DSpark
+# drafter builds it as module `layers.{n + i}` from the checkpoint's
+# `mtp.{i}.*` tensors; Qwen3.5 and Qwen3-Next MTP name both the module and the
+# tensors `mtp.layers.{i}.*`.
+_DRAFTER_RE = re.compile(r"(?:^|\.)mtp\.(?:layers\.)?(\d+)\.")
+# A stalled GCS or metadata endpoint must not hang model init on every rank.
+_GCS_READ_TIMEOUT_S = 120
 
 # The attribute a placed RoutedExperts layer holds its slot order under:
 # entry s is the checkpoint's id of the expert in slot s.
@@ -116,6 +120,11 @@ def parse(table: dict, source: str = "<dict>") -> Placement:
     the ranks, experts / shards to a rank."""
     experts = int(table["experts"])
     shards = int(table["shards"])
+    if experts <= 0 or shards <= 0:
+        raise ValueError(
+            f"expert placement {source}: experts and shards must be positive, "
+            f"not {experts} and {shards}"
+        )
     if experts % shards:
         raise ValueError(
             f"expert placement {source}: {experts} experts do not divide over "
@@ -124,6 +133,18 @@ def parse(table: dict, source: str = "<dict>") -> Placement:
     per_rank = experts // shards
     layers = {}
     for key, ranks in table["layers"].items():
+        try:
+            layer = int(key)
+        except ValueError:
+            raise ValueError(
+                f"expert placement {source}: layer key {key!r} is not a layer index"
+            ) from None
+        if layer < 0:
+            raise ValueError(f"expert placement {source}: layer {key} is negative")
+        if layer in layers:
+            raise ValueError(
+                f"expert placement {source}: layer {layer} is listed twice"
+            )
         if len(ranks) != shards or any(len(held) != per_rank for held in ranks):
             raise ValueError(
                 f"expert placement {source}: layer {key} must list {shards} "
@@ -135,7 +156,7 @@ def parse(table: dict, source: str = "<dict>") -> Placement:
                 f"expert placement {source}: layer {key} must hold each of the "
                 f"{experts} experts exactly once"
             )
-        layers[int(key)] = ranks
+        layers[layer] = ranks
     return Placement(experts=experts, shards=shards, layers=layers)
 
 
@@ -147,11 +168,17 @@ def _read(uri: str) -> str:
                 check=True,
                 capture_output=True,
                 text=True,
+                timeout=_GCS_READ_TIMEOUT_S,
             ).stdout
         except FileNotFoundError as e:
             raise RuntimeError(
                 f"TPU_EXPERT_PLACEMENT={uri} is read with the gcloud CLI, which "
                 "this image does not have; copy the table to a local path"
+            ) from e
+        except subprocess.TimeoutExpired as e:
+            raise RuntimeError(
+                f"TPU_EXPERT_PLACEMENT={uri}: gcloud storage cat timed out after "
+                f"{_GCS_READ_TIMEOUT_S} s"
             ) from e
         except subprocess.CalledProcessError as e:
             raise RuntimeError(
@@ -162,11 +189,26 @@ def _read(uri: str) -> str:
         return f.read()
 
 
+def _unique_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    """A JSON object as a dict, refusing a key it repeats (json.loads would
+    silently keep the last)."""
+    seen = set()
+    for key, _ in pairs:
+        if key in seen:
+            raise ValueError(f"key {key!r} appears twice")
+        seen.add(key)
+    return dict(pairs)
+
+
 @functools.cache
 def _load(path: str) -> Placement:
     """The table, read once per process: the expert maps, the fetch filter and
     the routers all follow the same read, even if the file is rewritten."""
-    return parse(json.loads(_read(path)), path)
+    try:
+        table = json.loads(_read(path), object_pairs_hook=_unique_keys)
+    except ValueError as e:  # also json.JSONDecodeError
+        raise ValueError(f"expert placement {path}: {e}") from e
+    return parse(table, path)
 
 
 def clear_cache() -> None:
@@ -181,7 +223,12 @@ def current() -> Placement | None:
 
 
 def layer_index(name: str) -> int | None:
-    """The decoder layer a module prefix or checkpoint tensor name belongs to."""
+    """The table layer a module prefix or checkpoint tensor name belongs to:
+    its decoder layer, or n + i for a drafter's MoE layer i (an n-layer
+    target)."""
+    drafter = _DRAFTER_RE.search(name)
+    if drafter is not None:
+        return _target_layers() + int(drafter.group(1))
     m = _LAYER_RE.search(name)
     return int(m.group(1)) if m else None
 
@@ -208,9 +255,6 @@ def fetch_filter_ids(name: str) -> frozenset[int] | None:
     fetch and the expert map cannot pick different ranks.
     """
     layer = layer_index(name)
-    drafter = _DRAFTER_TENSOR_RE.match(name)
-    if drafter is not None:
-        layer = _target_layers() + int(drafter.group(1))
     placement = current()
     if placement is None or layer is None or layer not in _APPLIED_LAYERS:
         return None
@@ -307,7 +351,10 @@ def apply(runner) -> bool:
 def _target_layers() -> int:
     from vllm.config import get_current_vllm_config
 
-    return get_current_vllm_config().model_config.hf_config.num_hidden_layers
+    # hf_text_config: a multimodal config (Qwen3.5-MoE, for example) keeps
+    # num_hidden_layers on its text config.
+    model_config = get_current_vllm_config().model_config
+    return model_config.hf_text_config.num_hidden_layers
 
 
 def expert_order(layer) -> tuple[int, ...] | None:

@@ -862,10 +862,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "MOE_FUSED_EP_SORTED_GATHER": env_bool("MOE_FUSED_EP_SORTED_GATHER"),
     # A static expert placement for expert parallelism: a JSON table naming,
     # per MoE layer, which global experts each EP rank holds and in what slot
-    # order -- a permutation, experts / ranks to a rank (expert_placement.py).
-    # Applied at weight load, to the experts and the router alike, so every MoE
-    # kernel serves it unchanged. A local path or a gs:// URI. Empty: the
-    # checkpoint's contiguous blocks.
+    # order -- a permutation, experts / ranks to a rank
+    # (layers/adapter/expert_placement.py). Applied at weight load, to the
+    # experts and the router alike, so every MoE kernel serves it unchanged. A
+    # local path or a gs:// URI. Empty: the checkpoint's contiguous blocks.
     "TPU_EXPERT_PLACEMENT": env_str("TPU_EXPERT_PLACEMENT", ""),
     # How many copies of the FFN body fused EP MoE v2 emits, standing in for
     # kernel.HEIGHT_RUNGS. A tile runs the shortest of them that covers its
