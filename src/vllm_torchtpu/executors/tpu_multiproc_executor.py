@@ -12,6 +12,7 @@ from vllm.logger import init_logger
 from vllm.v1.executor.multiproc_executor import MultiprocExecutor
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.executors.kv_block_override import reconcile_num_gpu_blocks_override
 
 logger = init_logger(__name__)
@@ -85,6 +86,13 @@ class TpuMultiprocExecutor(MultiprocExecutor):
         if os.environ.get("VLLM_TPU_PARALLEL_WORKER_SPAWN", "0") in ("1", "true"):
             _patch_spawn_pipe_size()
         super()._init_executor()
+
+    def _can_start_workers_concurrently(self, inherited_fds: list[int] | None) -> bool:
+        # Off: start workers one after another in rank order, as without the
+        # large spawn pipes (executors/worker_spawn.py).
+        if not envs.TPU_PARALLEL_WORKER_SPAWN:
+            return False
+        return super()._can_start_workers_concurrently(inherited_fds)
 
     def get_kv_cache_specs(self) -> list[dict[str, KVCacheSpec]]:
         specs = super().get_kv_cache_specs()

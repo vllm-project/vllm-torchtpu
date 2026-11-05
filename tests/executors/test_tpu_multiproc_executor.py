@@ -38,6 +38,18 @@ def _make_executor(engine_override, worker_overrides, pipeline_parallel_size=1):
     return executor
 
 
+@pytest.mark.parametrize("parallel_spawn", ["1", "0"])
+def test_worker_starts_follow_the_parallel_spawn_switch(monkeypatch, parallel_spawn):
+    """On: vLLM decides (concurrent starts, each returning at once with the
+    large spawn pipes). Off: one after another in rank order."""
+    monkeypatch.setenv("TPU_PARALLEL_WORKER_SPAWN", parallel_spawn)
+    executor = TpuMultiprocExecutor.__new__(TpuMultiprocExecutor)
+    with patch.object(
+        MultiprocExecutor, "_can_start_workers_concurrently", return_value=True
+    ):
+        assert executor._can_start_workers_concurrently(None) is (parallel_spawn == "1")
+
+
 @patch.object(MultiprocExecutor, "get_kv_cache_specs", return_value=_SPECS)
 def test_copies_override_from_workers_when_engine_unset(mock_super):
     """Engine override is None -> copy the agreed worker value to the engine."""
