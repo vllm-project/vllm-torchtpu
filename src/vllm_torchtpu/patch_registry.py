@@ -100,6 +100,7 @@ PATCHES = (
     Patch("vllm_torchtpu:_patch_vllm_offload_fine_prefix_alignment", _ENGINE),
     Patch("vllm_torchtpu:_patch_vllm_hybrid_kv_load_failure_recovery", _ENGINE),
     Patch("vllm_torchtpu:_patch_vllm_block_pool_lifo_free", _ACTIVE),
+    Patch("vllm_torchtpu:_patch_vllm_dp_lb_exact_inflight", _ACTIVE),
     Patch("vllm_torchtpu:_patch_vllm_abort_on_preemption", _ENGINE),
     Patch("vllm_torchtpu:_patch_vllm_raiden_pd_completion", _ENGINE),
     Patch("vllm_torchtpu:_patch_vllm_same_step_prefix_hits", _ENGINE),

@@ -165,6 +165,7 @@ from vllm_torchtpu.runner.mm_encoder_manager import (
     maybe_create_mm_encoder_manager,
 )
 from vllm_torchtpu.runner.mm_video_chunking import chunked_video_encoding
+from vllm_torchtpu.runner.prompt_rows import cache_prompt_rows
 from vllm_torchtpu.runner.speculative_decoding_manager import (
     SpecDecodeMetadata,
     SpeculativeDecodingManager,
@@ -1415,6 +1416,8 @@ class TPUModelRunner(GPUModelRunner):
             runner_utils.relayout_rope_caches(model)
         if envs.TPU_MOE_HASH_TABLE_ROW_MAJOR:
             runner_utils.relayout_hash_tables(model)
+        if envs.TPU_NORM_WEIGHTS_FP32:
+            runner_utils.upcast_norm_weights(model)
 
     def _truncate_rope_caches(self, model: torch.nn.Module) -> None:
         """Slice rotary cos_sin caches to max_model_len (plus speculative slack)
@@ -2810,6 +2813,12 @@ class TPUModelRunner(GPUModelRunner):
             else scheduler_output
         )
         result = super()._update_states(base_output)
+        if envs.VLLM_TPU_SOLO_PREFILL_OVER_TOKENS > 0:
+            cache_prompt_rows(
+                self.requests,
+                self.input_batch,
+                (new_req.req_id for new_req in scheduler_output.scheduled_new_reqs),
+            )
         self._min_tokens.discard(scheduler_output.finished_req_ids)
         for new_req in scheduler_output.scheduled_new_reqs:
             self._min_tokens.add(new_req.req_id, new_req.sampling_params)
@@ -5686,6 +5695,8 @@ class TPUModelRunner(GPUModelRunner):
             runner_utils.relayout_rope_caches(self.model)
         if envs.TPU_MOE_HASH_TABLE_ROW_MAJOR:
             runner_utils.relayout_hash_tables(self.model)
+        if envs.TPU_NORM_WEIGHTS_FP32:
+            runner_utils.upcast_norm_weights(self.model)
         if (
             envs.TPU_GREEDY_TOP_TOKENS
             and self._pp_is_last

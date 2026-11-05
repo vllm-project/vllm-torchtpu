@@ -1970,6 +1970,12 @@ def _patch_vllm_block_pool_lifo_free() -> None:
     logger.info("Applied LIFO free-block patch (pre-vllm#48017 order) to BlockPool")
 
 
+def _patch_vllm_dp_lb_exact_inflight() -> None:
+    from vllm_torchtpu.core.dp_lb_exact_inflight import patch_dp_lb_client
+
+    patch_dp_lb_client()
+
+
 def _patch_vllm_abort_on_preemption() -> None:
     from vllm_torchtpu.core.abort_on_preemption import patch_scheduler_init
 
