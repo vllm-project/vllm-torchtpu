@@ -211,6 +211,36 @@ def test_unreused_reply_loss_and_thinking_suffix_boundary():
     assert res_no_think.total_tokens == len(t2_no_think)
 
 
+    # 3. When reasoning tokens are dropped on Turn 2 (carried-back reply shorter than generated reply):
+    # unreused_reply_loss stops at the first <|im_end|> (151645) after the divergence point
+    # so subsequent new user/tool tokens are attributed to new_input rather than unreused_reply_loss.
+    t1_think_on = list(range(150))
+    t1_long_reasoning_output = list(range(2000, 2220))  # 220 generated tokens (e.g. 200 reasoning + 20 reply)
+    tracker.record_turn_completion(
+        "sess-dropped-reasoning", t1_think_on, t1_long_reasoning_output, turn_id=1
+    )
+    # Turn 2 carries back only 19 assistant tokens + <|im_end|> (151645) = 20 tokens [150..170),
+    # followed by 120 new user/tool tokens [170..290).
+    t2_carried_reply = list(range(3000, 3019)) + [151645]
+    t2_new_user_turn = list(range(4000, 4120))
+    t2_dropped_prompt = t1_think_on + t2_carried_reply + t2_new_user_turn
+    res_dropped = tracker.classify_prefill(
+        t2_dropped_prompt,
+        num_cached_tokens=128,
+        session_id="sess-dropped-reasoning",
+        turn_id=2,
+    )
+    # 22 prompt tokens [128..150) sharing block 2 + 20 carried-back reply tokens [150..170) = 42 unreused_reply_loss
+    assert res_dropped == TokenBreakdown(
+        cache_hit=128,
+        unreused_reply_loss=42,
+        prefix_mutation_loss=0,
+        new_input=120,
+        mutation_offset_token_idx=None,
+    )
+    assert res_dropped.total_tokens == len(t2_dropped_prompt)
+
+
 def test_negative_category_raises():
     with pytest.raises(ValueError, match="must be >= 0"):
         TokenBreakdown(cache_hit=-1)

@@ -132,6 +132,9 @@ def _compute_tail_hash(tokens: Sequence[int], block_size: int) -> int:
     return hash(tuple(tokens[rem_start:]))
 
 
+_IM_END_TOKEN_ID = 151645
+
+
 def _detect_reply_start_idx(prompt_token_ids: Sequence[int]) -> int:
     """Return the token index where the assistant reply / thinking suffix starts.
 
@@ -150,6 +153,27 @@ def _detect_reply_start_idx(prompt_token_ids: Sequence[int]) -> int:
     ):
         return p_len - 4
     return p_len
+
+
+def _find_reply_end_idx(
+    prompt_token_ids: Sequence[int],
+    search_start: int,
+    fallback_end: int,
+) -> int:
+    """Return the token index just after the first `<|im_end|>` from `search_start`.
+
+    When prior reasoning tokens are dropped before the assistant reply is
+    carried back into the next turn's prompt, the carried-back reply in
+    `prompt_token_ids` ends earlier than `prior.tokens` at `<|im_end|>`
+    (`151645`). Stopping `unreused_reply_loss` at that `<|im_end|>` prevents
+    subsequent new user/tool tokens from being counted as unreused reply.
+    """
+    total = len(prompt_token_ids)
+    start = min(max(0, search_start), total)
+    for idx in range(start, total):
+        if prompt_token_ids[idx] == _IM_END_TOKEN_ID:
+            return idx + 1
+    return fallback_end
 
 
 def compute_rolling_block_hashes(
@@ -287,11 +311,19 @@ class SessionTurnTracker:
             prior.reply_start_idx if prior.reply_start_idx > 0 else len(prior.tokens)
         )
         if diverge_idx >= reply_boundary:
+            search_start = max(
+                diverge_idx,
+                prior.reply_start_idx if prior.reply_start_idx > 0 else diverge_idx,
+            )
+            reply_end = max(
+                block_base,
+                _find_reply_end_idx(prompt_token_ids, search_start, expected_prefix),
+            )
             return TokenBreakdown(
                 cache_hit=hit,
                 affinity_honored_eviction=block_base - hit,
-                unreused_reply_loss=loss_tokens,
-                new_input=new_input,
+                unreused_reply_loss=reply_end - block_base,
+                new_input=total - reply_end,
                 mutation_offset_token_idx=None,
                 parent_session_id=parent_session_id,
             )
@@ -353,11 +385,19 @@ class SessionTurnTracker:
             else prior.seq_len
         )
         if diverge_idx >= reply_boundary:
+            search_start = max(
+                diverge_idx,
+                prior.reply_start_idx if prior.reply_start_idx > 0 else diverge_idx,
+            )
+            reply_end = max(
+                block_base,
+                _find_reply_end_idx(prompt_token_ids, search_start, expected_prefix),
+            )
             return TokenBreakdown(
                 cache_hit=hit,
                 affinity_honored_eviction=block_base - hit,
-                unreused_reply_loss=loss_tokens,
-                new_input=new_input,
+                unreused_reply_loss=reply_end - block_base,
+                new_input=total - reply_end,
                 mutation_offset_token_idx=None,
                 parent_session_id=parent_session_id,
             )
