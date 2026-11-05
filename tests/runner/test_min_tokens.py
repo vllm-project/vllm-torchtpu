@@ -614,6 +614,7 @@ def _plain_step_runner(num_output, logits, req_id="r0"):
         _is_async_drafter=False,
         _fence_spec_kv_under_token_copy=False,
         _is_dspark_pd_producer=False,
+        _adaptive_verification=None,
         is_pooling_model=False,
         _get_sampling_generator=lambda: None,
         _greedy_sample=lambda x: torch.argmax(x, dim=-1),
