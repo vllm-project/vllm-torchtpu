@@ -1759,6 +1759,19 @@ def resolve_kernel_geometry(
     return kernel_block_size, per_block_shape, spec0.dtype, spec0.block_size
 
 
+def is_host_pinning_failure(exc: BaseException) -> bool:
+    """Whether a Raiden KVCacheManager construction failed to pin (DMA-map)
+    its host pool, as opposed to a controller hiccup worth retrying.
+
+    Raiden reports it as a RuntimeError naming the host allocator or the
+    DmaMap call; there is no exception type for it.
+    """
+    message = str(exc)
+    return isinstance(exc, RuntimeError) and (
+        "Host allocator failed" in message or "DmaMap failed" in message
+    )
+
+
 class RaidenStoreOffloadingWorker(OffloadingWorker):
     """Worker-side endpoint that registers local TPU HBM device buffers with
     the Controller.
@@ -1948,10 +1961,11 @@ class RaidenStoreOffloadingWorker(OffloadingWorker):
         """Background registration: wait for the controller server to come up
         (it is created scheduler-side after this worker), then register.
 
-        Retries with backoff until it succeeds or shutdown() stops it. The
-        verdict lives scheduler-side: KVCacheStore construction blocks until
-        every rank has registered and fails engine startup on timeout, so
-        this loop only has to keep trying, never to give up or escalate.
+        Retries with backoff until it succeeds or shutdown() stops it, except
+        after a host pinning failure (`is_host_pinning_failure`), which a
+        retry turns into a segfault. The verdict lives scheduler-side:
+        KVCacheStore construction blocks until every rank has registered and
+        fails engine startup on timeout, so this loop never escalates.
         """
         delay = 0.5
         next_note = time.monotonic() + 30.0
@@ -1989,7 +2003,25 @@ class RaidenStoreOffloadingWorker(OffloadingWorker):
                         ", storage tier on" if self._backend_configs else "",
                     )
                     return
-                except Exception:
+                except Exception as exc:
+                    if is_host_pinning_failure(exc):
+                        # Raiden could not pin the host pool. Constructing
+                        # another KVCacheManager in this process after that
+                        # segfaults the worker (and can fault the TPU), which
+                        # hides this error, so stop here; the scheduler's
+                        # construction barrier then fails engine startup.
+                        logger.error(
+                            "TPURaidenOffloadingConnector: rank %d cannot pin "
+                            "its host KV pool (%d host kernel blocks): %s. "
+                            "Raiden pins and DMA-maps its host buffers; the "
+                            "recipes where it works run the server container "
+                            "privileged with IPC_LOCK. Check the container's "
+                            "securityContext. Not retrying.",
+                            self._rank,
+                            self._host_blocks_to_allocate,
+                            exc,
+                        )
+                        return
                     # A persistent failure escalates via the
                     # scheduler's construction barrier timeout.
                     logger.warning(
