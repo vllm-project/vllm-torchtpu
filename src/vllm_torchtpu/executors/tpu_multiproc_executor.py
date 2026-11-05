@@ -21,6 +21,7 @@ instead of all 14 shapes sharing a single window and timing out.
 from vllm.v1.executor.multiproc_executor import MultiprocExecutor
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.executors.kv_block_override import (
     adopt_worker_num_gpu_blocks_override,
 )
@@ -35,9 +36,11 @@ class TpuMultiprocExecutor(MultiprocExecutor):
         super()._init_executor()
 
     def _can_start_workers_concurrently(self, inherited_fds: list[int] | None) -> bool:
-        # The rank-binding patch writes each worker's binding into os.environ
-        # right before spawning it, so the starts must not overlap.
-        return False
+        # Off: start workers one after another in rank order, as without the
+        # large spawn pipes (executors/worker_spawn.py).
+        if not envs.TPU_PARALLEL_WORKER_SPAWN:
+            return False
+        return super()._can_start_workers_concurrently(inherited_fds)
 
     def get_kv_cache_specs(self) -> list[dict[str, KVCacheSpec]]:
         specs = super().get_kv_cache_specs()
