@@ -2624,10 +2624,11 @@ def test_mtp_draft_follows_the_contract(tmp_path) -> None:
     out_dir = _export_mtp(tmp_path)
     meta = json.loads(Path(out_dir, "metadata.json").read_text())
     functions = meta["functions"]
-    assert set(functions["mtp_draft"]) == set(functions["forward"]) == {"8", "16"}
+    assert set(functions["draft"]) == set(functions["forward"]) == {"8", "16"}
     assert meta["serving_config"]["speculative_config"]["method"] == "mtp"
 
-    variant = functions["mtp_draft"]["16"]
+    variant = functions["draft"]["16"]
+    assert variant["file_path"].endswith("draft_bucket16.mlir"), variant["file_path"]
     by_name = {i["name"]: i for i in variant["inputs"]}
     assert Path(out_dir, variant["file_path"]).is_file()
     # The forward's controls, shifted input_ids, then the last accepted rows.
@@ -2720,7 +2721,7 @@ def test_debug_taps_export_tapped_variants_under_assets_extra(tmp_path) -> None:
     # The smallest token bucket only, after the serving variant's own results:
     # the forward's one state and hidden_states, the draft's state and drafts.
     forward = functions["forward"]["8"]
-    assert set(functions["forward"]) == set(functions["mtp_draft"]) == {"8"}
+    assert set(functions["forward"]) == set(functions["draft"]) == {"8"}
     assert forward["num_outputs"] == 2
     assert forward["taps"] == [
         {"name": "final", "output_index": 2, "shape": [8, 16], "dtype": "bf16"}
@@ -2728,7 +2729,7 @@ def test_debug_taps_export_tapped_variants_under_assets_extra(tmp_path) -> None:
     assert Path(out_dir, forward["file_path"]).is_file()
     assert forward["file_path"].startswith("assets.extra/debug/")
     # A module the chain calls twice records each call.
-    draft_taps = [t["name"] for t in functions["mtp_draft"]["8"]["taps"]]
+    draft_taps = [t["name"] for t in functions["draft"]["8"]["taps"]]
     assert draft_taps == ["mtp.fc_act", "mtp.fc_act#1"]
     # The serving artifact does not name the debug modules.
     meta = Path(out_dir, "metadata.json").read_text()
@@ -2788,17 +2789,22 @@ def test_mtp_needs_the_mtp_layer_among_the_parameters(tmp_path) -> None:
         _export_mtp(tmp_path, model_cls=_TinyMtpWithoutWeights)
 
 
-def test_validator_rejects_mtp_draft_missing_a_bucket(tmp_path) -> None:
+@pytest.mark.parametrize("method", validator.DRAFTER_METHODS)
+def test_validator_rejects_a_draft_missing_a_bucket(tmp_path, method) -> None:
+    # Every drafter method holds the artifact to the same `draft` contract.
     out_dir = _export_mtp(tmp_path)
     meta_path = Path(out_dir, "metadata.json")
     meta = json.loads(meta_path.read_text())
-    del meta["functions"]["mtp_draft"]["8"]
+    meta["serving_config"]["speculative_config"]["method"] = method
+    meta_path.write_text(json.dumps(meta))
+    validator.validate_exported_model_dir(out_dir)
+    del meta["functions"]["draft"]["8"]
     meta_path.write_text(json.dumps(meta))
     with pytest.raises(ValueError, match="differ from forward buckets"):
         validator.validate_exported_model_dir(out_dir)
-    del meta["functions"]["mtp_draft"]
+    del meta["functions"]["draft"]
     meta_path.write_text(json.dumps(meta))
-    with pytest.raises(ValueError, match="exports no mtp_draft"):
+    with pytest.raises(ValueError, match="exports no draft"):
         validator.validate_exported_model_dir(out_dir)
 
 
