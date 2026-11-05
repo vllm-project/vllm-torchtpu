@@ -23,7 +23,6 @@ from math import log2
 from pathlib import Path
 from typing import TYPE_CHECKING, TypedDict
 
-from ...tools import merge_xplane, xplane_pb2
 from .. import errors
 
 if TYPE_CHECKING:
@@ -394,6 +393,8 @@ def _discover_xplane_files(path: Path) -> list[Path]:
     """Discover `.xplane.pb` files from a single path or profile directory."""
     if path.is_file():
         return [path]
+    from ...tools import merge_xplane
+
     sessions = merge_xplane.discover_sessions([str(path)])
     if len(sessions) > 1:
         dirs = ", ".join(str(s.directory) for s in sessions)
@@ -409,6 +410,8 @@ def _discover_xplane_files(path: Path) -> list[Path]:
 
 def _parse_xplane_target(path: Path) -> _ParsedTrace:
     """Parse one or more `.xplane.pb` files using `vllm_torchtpu.tools.xplane_pb2`."""
+    from ...tools import xplane_pb2
+
     files = _discover_xplane_files(path)
     if not files:
         msg = f"No .xplane.pb files found under {path}"
