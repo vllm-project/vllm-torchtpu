@@ -16,7 +16,7 @@ python -m vllm_torchtpu.megakernel.advisor estimate \
 
 ### 2. Trace-Measured Evaluation (`--measurements`)
 
-Pass an `advisor.measurements.v1` JSON file containing trace-measured launch gaps, collective hop latencies, step coverage, or DCN bandwidth to promote `ASSUMED` inputs to `MEASURED` and settle `tie(measure: <input>)` verdicts:
+Pass an `advisor.measurements.v1` JSON file containing trace-measured launch gaps, collective hop latencies, step coverage, or DCN bandwidth to promote `ASSUMED` inputs to `MEASURED` and settle `tie(measure: <input>)` verdicts. You may also pass `--measurements bundled` (or `--measurements auto`) to load bundled public chip priors (such as `tpu7x_public.json`):
 
 ```json
 {
@@ -52,7 +52,7 @@ Hardware specifications (`vmem_capacity_bytes`, `hbm_bw_bytes_per_s`, `bf16_flop
 | --- | --- |
 | `--model` / `--config` | Registered preset name, HuggingFace repo ID, local directory, or `config.json` path. |
 | `--chip` / `--chip-spec` | Built-in TPU target (`tpu7x`, `v6e`, `v5p`, `v5e`, `v4`, `auto`) or path to a custom JSON chip spec. |
-| `--measurements` | Path to an `advisor.measurements.v1` JSON file. |
+| `--measurements` | Path to an `advisor.measurements.v1` JSON file, or `bundled`/`auto` for packaged chip priors. |
 | `--objective` | `step` (minimize step latency), `throughput` (maximize `tok/s/chip`), or `both` (flag objective splits). |
 | `--explain` / `--unresolved` | Print per-metric provenance tags or list unresolved `ASSUMED` inputs ranked by step-time sensitivity. |
 | `--json [out.json]` | Write JSON output to stdout (when path omitted) or to `out.json`. |

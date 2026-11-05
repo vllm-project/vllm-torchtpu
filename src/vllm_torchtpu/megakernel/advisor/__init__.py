@@ -185,10 +185,20 @@ def load_measurements(
         payload: Mapping[str, object] = target
         file_label = "inline_mapping"
     else:
-        path = Path(str(target))
-        if not path.is_file():
-            msg = f"Missing measurements file: {path}"
-            raise errors.MegakernelConfigError(msg)
+        target_str = str(target).strip()
+        if target_str in ("bundled", "auto"):
+            from . import chips
+
+            bundled_path = chips.public_calibration_path("tpu7x")
+            if bundled_path is None or not bundled_path.is_file():
+                msg = "No default bundled public calibration found for chip 'tpu7x'"
+                raise errors.MegakernelConfigError(msg)
+            path = bundled_path
+        else:
+            path = Path(target_str)
+            if not path.is_file():
+                msg = f"Missing measurements file: {path}"
+                raise errors.MegakernelConfigError(msg)
         payload = json.loads(path.read_text("utf-8"))
         file_label = path.name
     if payload.get("schema") != _MEASUREMENTS_SCHEMA:

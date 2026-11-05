@@ -172,3 +172,38 @@ def test_validation_corpus_provenance_and_tie_overlap(
     monkeypatch.setattr(chips, "_CALIBRATION_DIR", tmp_path)
     with pytest.raises(errors.MegakernelConfigError, match="Expected JSON object"):
         chips.load_public_calibration("tpu7x")
+
+
+def test_advisor_cli_with_bundled_measurements(tmp_path: Path) -> None:
+    """Verify CLI with --measurements bundled resolves public priors.
+
+    Also asserts that the resulting report produces bounded confidence.
+    """
+    out_json = tmp_path / "bundled_out.json"
+    rc = advisor.main(
+        [
+            "estimate",
+            "--model",
+            "Qwen/Qwen3-30B-A3B-FP8",
+            "--chip",
+            "tpu7x",
+            "--phase",
+            "decode",
+            "--batch",
+            "16",
+            "--tp",
+            "8",
+            "--ep",
+            "8",
+            "--measurements",
+            "bundled",
+            "--json",
+            str(out_json),
+        ]
+    )
+    assert rc == 0
+    assert out_json.is_file()
+    payload = json.loads(out_json.read_text(encoding="utf-8"))
+    assert payload["confidence"] == "bounded"
+    assert payload["metrics"]["collective_latency_us"]["tag"] == "MEASURED"
+    assert payload["metrics"]["launch_gap_us"]["tag"] == "ASSUMED"
