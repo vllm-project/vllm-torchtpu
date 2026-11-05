@@ -1554,6 +1554,11 @@
       "path": "src/vllm_torchtpu/worker/tpu_worker.py",
       "name": "missing-attribute",
       "concise_description": "Object of class `TPUModelRunner` has no attribute `_sync_weights`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/runtime_shim/backend.py",
+      "name": "missing-module-attribute",
+      "concise_description": "Could not import `program` from `vllm_torchtpu.models.kimi_k3.megakernel`"
     }
   ]
 }

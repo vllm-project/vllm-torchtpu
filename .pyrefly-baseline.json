@@ -394,6 +394,11 @@
       "path": "src/vllm_torchtpu/tpu_info.py",
       "name": "bad-return",
       "concise_description": "Returned type `None` is not assignable to declared return type `str`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/runtime_shim/backend.py",
+      "name": "missing-module-attribute",
+      "concise_description": "Could not import `program` from `vllm_torchtpu.models.kimi_k3.megakernel`"
     }
   ]
 }
