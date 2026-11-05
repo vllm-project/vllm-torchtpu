@@ -29,13 +29,18 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from jax import lax
+from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 
 import vllm_torchtpu.envs as envs
 from vllm_torchtpu.kernels.experimental import moe_tp_decode_nvfp4 as kernel
+from vllm_torchtpu.kernels.experimental.moe_tp_decode import all_reduce
 from vllm_torchtpu.kernels.experimental.moe_tp_decode import kernel as fp8_kernel_impl
+from vllm_torchtpu.kernels.experimental.moe_tp_decode_nvfp4 import (
+    kernel as nvfp4_kernel_impl,
+)
 from vllm_torchtpu.kernels.quantized_matmul.util import quantize_block
 
 FP4 = jnp.float4_e2m1fn
@@ -514,13 +519,19 @@ def test_admits_decode_buckets(monkeypatch, cfg, rows, admitted):
 
 
 def test_group_size_and_kernel_name():
-    assert kernel.group_size(256, 256) == 4
-    assert kernel.group_size(512, 128) == 2
-    assert kernel.group_size(256, 2) == 2
+    assert kernel.group_size(256, 256) == 2
+    assert kernel.group_size(512, 128) == 1
+    assert kernel.group_size(128, 256) == 4
+    assert kernel.group_size(256, 1) == 1
     tp8_name = kernel.kernel_name(256, 16, 6144, 256, 256, 8, 256, fast=True)
     ep_name = kernel.kernel_name(128, 16, 6144, 512, 256, 8, 256, fast=True)
-    assert "-g_4-" in tp8_name and "-ne_" not in tp8_name and tp8_name.endswith("-fast")
-    assert "-g_2-" in ep_name and "-ne_256" in ep_name
+    assert (
+        "-g_2-" in tp8_name
+        and "-nb_4-" in tp8_name
+        and "-ne_" not in tp8_name
+        and tp8_name.endswith("-fast")
+    )
+    assert "-g_1-" in ep_name and "-nb_4-" in ep_name and "-ne_256" in ep_name
 
 
 @pytest.mark.parametrize(
@@ -583,6 +594,593 @@ def test_refuses_misaligned_w2_n_chunk(monkeypatch):
     assert "-nc_6144" in kernel.kernel_name(
         256, 16, 6144, 256, 256, N_RANKS, w2_n_chunk=6144
     )
+
+
+def test_tuning_levers_admission_vmem_and_kernel_name(monkeypatch):
+    info = _tpu7x()
+    monkeypatch.setattr(pltpu, "get_tpu_info", lambda: info)
+
+    # New defaults: g=2 at TP8 (I=256), g=1 at EP2xTP4 (I=512), nb=4.
+    assert kernel.group_size(256, 256) == 2
+    assert kernel.group_size(256, 256, max_group=1) == 1
+    assert kernel.group_size(512, 128) == 1
+    assert kernel.group_size(256, 256, group_cols=2048) == 4
+    assert kernel.group_size(512, 128, group_cols=2048) == 2
+    with pytest.raises(ValueError, match="max_group"):
+        kernel.group_size(512, 128, max_group=0)
+    with pytest.raises(ValueError, match="group_cols"):
+        kernel.group_size(512, 128, group_cols=0)
+
+    default_ep = kernel.kernel_name(128, 16, 6144, 512, 256, N_RANKS, 256, fast=True)
+    assert default_ep == (
+        "moe_tp_decode_nvfp4-e_128-m_16-h_6144-i_512-g_1-fs_256-nb_4-n_8-sm-ne_256-fast"
+    )
+    default_tp8 = kernel.kernel_name(256, 16, 6144, 256, 256, N_RANKS, 256, fast=True)
+    assert default_tp8 == (
+        "moe_tp_decode_nvfp4-e_256-m_16-h_6144-i_256-g_2-fs_256-nb_4-n_8-sm-fast"
+    )
+    legacy_ep = kernel.kernel_name(
+        128,
+        16,
+        6144,
+        512,
+        256,
+        N_RANKS,
+        256,
+        fast=True,
+        group_cols=2048,
+        num_buffers=3,
+    )
+    assert legacy_ep == (
+        "moe_tp_decode_nvfp4-e_128-m_16-h_6144-i_512-g_2-fs_256-nb_3-n_8-sm-ne_256-fast"
+    )
+    tuned_tp8 = kernel.kernel_name(
+        256,
+        16,
+        6144,
+        256,
+        256,
+        N_RANKS,
+        256,
+        fast=True,
+        contig_dma=True,
+        overlap_schedule=True,
+        skip_tail=True,
+    )
+    assert "-g_2-" in tuned_tp8 and "-nb_4-" in tuned_tp8
+    assert tuned_tp8.endswith("-fast-cdma-ovlp-stail")
+
+    # VMEM plan & admission across EP2xTP4 (g=1, nb=4) and TP8 (g=2, nb=4) at
+    # m=16,32,64 with >12 MiB headroom below the 56 MiB cap, plus legacy
+    # (group_cols=2048, num_buffers=3) admission and contig_dma zero-byte delta.
+    cap_bytes = int(info.vmem_capacity_bytes * nvfp4_kernel_impl.VMEM_FRACTION)
+    for cfg, exp_g, legacy_g in ((GLM52_EP2TP4, 1, 2), (GLM52_TP8, 2, 4)):
+        g_def = kernel.group_size(cfg["i"], cfg["e"] // cfg["ep"])
+        assert g_def == exp_g
+        g_leg = kernel.group_size(cfg["i"], cfg["e"] // cfg["ep"], group_cols=2048)
+        assert g_leg == legacy_g
+        b13 = cfg["h"] // cfg["b13"]
+        b2 = cfg["i"] // cfg["b2"]
+        for rows in kernel.ROW_BUCKETS:
+            shps = _shapes(rows, cfg)
+            spec = all_reduce.make_spec(N_RANKS, rows, cfg["h"])
+            plan_def = nvfp4_kernel_impl._vmem_plan(
+                rows,
+                cfg["h"],
+                cfg["i"],
+                b13,
+                b2,
+                g_def,
+                cfg["e"],
+                cfg["fs"],
+                info,
+                spec,
+            )
+            plan_cdma = nvfp4_kernel_impl._vmem_plan(
+                rows,
+                cfg["h"],
+                cfg["i"],
+                b13,
+                b2,
+                g_def,
+                cfg["e"],
+                cfg["fs"],
+                info,
+                spec,
+                contig_dma=True,
+            )
+            assert plan_def is not None and plan_cdma == plan_def
+            assert cap_bytes - plan_def[1] >= 12 * 2**20
+            plan_leg = nvfp4_kernel_impl._vmem_plan(
+                rows,
+                cfg["h"],
+                cfg["i"],
+                b13,
+                b2,
+                g_leg,
+                cfg["e"],
+                cfg["fs"],
+                info,
+                spec,
+                num_buffers=3,
+            )
+            plan_leg_cdma = nvfp4_kernel_impl._vmem_plan(
+                rows,
+                cfg["h"],
+                cfg["i"],
+                b13,
+                b2,
+                g_leg,
+                cfg["e"],
+                cfg["fs"],
+                info,
+                spec,
+                num_buffers=3,
+                contig_dma=True,
+            )
+            assert plan_leg is not None and plan_leg_cdma == plan_leg
+            assert kernel.can_use_moe_tp_decode_nvfp4(
+                *shps, topk=cfg["topk"], n_ranks=N_RANKS
+            )
+            assert kernel.can_use_moe_tp_decode_nvfp4(
+                *shps, topk=cfg["topk"], n_ranks=N_RANKS, contig_dma=True
+            )
+            assert kernel.can_use_moe_tp_decode_nvfp4(
+                *shps,
+                topk=cfg["topk"],
+                n_ranks=N_RANKS,
+                group_cols=2048,
+                num_buffers=3,
+            )
+            # Legacy wide group (g=2/4) with 4 buffers exceeds the 56 MiB VMEM cap.
+            assert not kernel.can_use_moe_tp_decode_nvfp4(
+                *shps,
+                topk=cfg["topk"],
+                n_ranks=N_RANKS,
+                group_cols=2048,
+                num_buffers=4,
+            )
+
+    shps16 = _shapes(16, GLM52_EP2TP4)
+    assert not kernel.can_use_moe_tp_decode_nvfp4(
+        *shps16, topk=8, n_ranks=N_RANKS, max_group=0
+    )
+    assert not kernel.can_use_moe_tp_decode_nvfp4(
+        *shps16, topk=8, n_ranks=N_RANKS, group_cols=0
+    )
+    assert not kernel.can_use_moe_tp_decode_nvfp4(
+        *shps16, topk=8, n_ranks=N_RANKS, num_buffers=1
+    )
+
+
+def test_tuning_levers_tpu7x_lowering(monkeypatch):
+    monkeypatch.setattr(pltpu, "get_tpu_info", _tpu7x)
+    devs = jax.devices()[:1]
+    mesh = Mesh(np.asarray(devs), ("d",))
+    sds = jax.ShapeDtypeStruct
+    specs = (P("d"), P("d"), P(), P(), P("d"), P("d")) + (P("d"),) * 8
+
+    def lower_case(cfg: dict, rows: int, **kw) -> str:
+        shps = _shapes(rows, cfg)
+        abstract_args = (
+            shps[0],
+            shps[1],
+            shps[2],
+            sds((1,), jnp.int32),
+            sds((1, 1), jnp.int32),
+            sds((1, 1), jnp.int32),
+            *shps[3:],
+        )
+
+        def body(x_s, s_s, b_s, nv_s, r_s, e0_s, *ws_s):
+            return kernel.moe_tp_decode_nvfp4(
+                x_s,
+                s_s,
+                b_s,
+                nv_s[0],
+                r_s.reshape(()),
+                *ws_s,
+                e0_s.reshape(()),
+                routed_scale=ROUTED_SCALE,
+                topk=cfg["topk"],
+                n_ranks=N_RANKS,
+                hbm_operands=True,
+                **kw,
+            )
+
+        fn = jax.jit(
+            jax.shard_map(
+                body, mesh=mesh, in_specs=specs, out_specs=P("d"), check_vma=False
+            )
+        )
+        return fn.trace(*abstract_args).lower(lowering_platforms=("tpu",)).as_text()
+
+    for cfg, def_tag, leg_tag in (
+        (GLM52_EP2TP4, "-g_1-fs_256-nb_4-", "-g_2-fs_256-nb_3-"),
+        (GLM52_TP8, "-g_2-fs_256-nb_4-", "-g_4-fs_256-nb_3-"),
+    ):
+        hlo_def = lower_case(cfg, 16, fast=True)
+        assert "tpu_custom_call" in hlo_def and def_tag in hlo_def
+        hlo_leg = lower_case(cfg, 16, fast=True, group_cols=2048, num_buffers=3)
+        assert "tpu_custom_call" in hlo_leg and leg_tag in hlo_leg
+        kw_cases: tuple[dict[str, Any], ...] = (
+            dict(fast=True, contig_dma=True),
+            dict(fast=True, overlap_schedule=True),
+            dict(fast=True, skip_tail=True),
+            dict(
+                fast=True,
+                contig_dma=True,
+                overlap_schedule=True,
+                skip_tail=True,
+            ),
+            dict(
+                fast=False,
+                contig_dma=True,
+                overlap_schedule=True,
+                skip_tail=True,
+            ),
+            dict(
+                fast=True,
+                max_group=1,
+                overlap_schedule=True,
+            ),
+        )
+        for kw in kw_cases:
+            hlo = lower_case(cfg, 16, **kw)
+            assert "tpu_custom_call" in hlo
+
+
+def test_tuning_levers_cpu_kernel_bitwise_and_dma_invariants(monkeypatch):
+    """Execute ``_kernel`` directly on CPU across partial/tail active counts,
+    verifying 0-ULP bitwise identity vs default, clean semaphore pairing, and
+    exact ``4 * active_count`` routed DMAs under ``skip_tail=True``."""
+    info = _tpu7x()
+    monkeypatch.setattr(pltpu, "get_tpu_info", lambda: info)
+
+    def pack_fp4_u32(arr: np.ndarray) -> np.ndarray:
+        a = jnp.asarray(arr, FP4)
+        *lead, rows, cols = a.shape
+        return np.asarray(
+            lax.bitcast_convert_type(
+                a.reshape(*lead, rows // 8, 8, cols).swapaxes(-2, -1), jnp.uint32
+            )
+        )
+
+    def unpack_u32_fp4(u32: Any) -> jax.Array:
+        u = jnp.asarray(u32, jnp.uint32)
+        rows, cols = u.shape
+        return lax.bitcast_convert_type(u, FP4).swapaxes(-2, -1).reshape(rows * 8, cols)
+
+    def norm_idx(idx: Any) -> Any:
+        if idx is Ellipsis:
+            return slice(None)
+        if not isinstance(idx, tuple):
+            idx = (idx,)
+        out: list[Any] = []
+        for it in idx:
+            if isinstance(it, pl.Slice):
+                start = int(np.asarray(it.start))
+                size = int(np.asarray(it.size))
+                out.append(slice(start, start + size))
+            elif isinstance(it, slice) or it is Ellipsis:
+                out.append(it)
+            else:
+                out.append(int(np.asarray(it)))
+        return tuple(out)
+
+    class _FakeRef:
+        def __init__(self, buf: np.ndarray):
+            self._buf = buf
+
+        @property
+        def shape(self) -> tuple[int, ...]:
+            return self._buf.shape
+
+        @property
+        def dtype(self) -> Any:
+            return self._buf.dtype
+
+        @property
+        def at(self) -> Any:
+            parent = self
+
+            class _At:
+                def __getitem__(self, sub: Any) -> Any:
+                    return _FakeRef(parent._buf[norm_idx(sub)])
+
+            return _At()
+
+        def __getitem__(self, sub: Any) -> jax.Array:
+            return jnp.asarray(self._buf[norm_idx(sub)])
+
+        def __setitem__(self, sub: Any, val: Any) -> None:
+            self._buf[norm_idx(sub)] = np.asarray(val, dtype=self.dtype)
+
+        def bitcast(self, target_dtype: Any) -> Any:
+            assert target_dtype == jnp.uint32
+            return _FakeRef(pack_fp4_u32(self._buf))
+
+    class _FakeSem:
+        def __init__(self, shape: tuple[int, ...]):
+            self.pending: dict[
+                tuple[Any, ...], list[tuple[np.ndarray, np.ndarray]]
+            ] = {}
+            self.shape = shape
+            self.routed_dmas = 0
+
+        @property
+        def at(self) -> Any:
+            parent = self
+
+            class _At:
+                def __getitem__(self, sub: Any) -> tuple[Any, tuple[Any, ...]]:
+                    k = norm_idx(sub)
+                    if not isinstance(k, tuple):
+                        k = (k,)
+                    return (parent, k)
+
+            return _At()
+
+    class _FakeCopy:
+        def __init__(
+            self,
+            src: _FakeRef,
+            dst: _FakeRef,
+            sem_slot: tuple[_FakeSem, tuple[Any, ...]],
+        ):
+            self.src = src
+            self.dst = dst
+            self.sem, self.key = sem_slot
+
+        def start(self) -> None:
+            payload = np.array(self.src._buf, copy=True)
+            q = self.sem.pending.setdefault(self.key, [])
+            assert len(q) == 0, f"double start on busy semaphore {self.key}"
+            q.append((self.dst._buf, payload))
+            if len(self.sem.shape) == 2:
+                self.sem.routed_dmas += 1
+
+        def wait(self) -> None:
+            q = self.sem.pending.get(self.key, [])
+            assert len(q) == 1, f"wait on unstarted semaphore {self.key}"
+            dst_view, payload = q.pop(0)
+            dst_view[...] = payload
+
+    orig_bitcast = pltpu.bitcast
+
+    def fake_fori_loop(lo: Any, hi: Any, body: Any, init: Any) -> Any:
+        carry = init
+        for step in range(int(np.asarray(lo)), int(np.asarray(hi))):
+            carry = body(jnp.int32(step), carry)
+        return carry
+
+    def fake_epilogue(
+        spec: Any, rank: Any, nv: Any, partial: jax.Array, out_ref: _FakeRef, scr: Any
+    ) -> None:
+        del spec, rank, scr
+        nv_i = int(np.asarray(nv))
+        arr = np.array(partial.astype(BF16), copy=True)
+        arr[nv_i:] = jnp.zeros((arr.shape[0] - nv_i, arr.shape[1]), BF16)
+        out_ref[...] = arr
+
+    monkeypatch.setattr(
+        pl, "when", lambda cond: (lambda fn: fn() if bool(np.asarray(cond)) else None)
+    )
+    monkeypatch.setattr(lax, "fori_loop", fake_fori_loop)
+    monkeypatch.setattr(
+        pltpu, "make_async_copy", lambda src, dst, sem: _FakeCopy(src, dst, sem)
+    )
+    monkeypatch.setattr(
+        pltpu,
+        "bitcast",
+        lambda x, dt: unpack_u32_fp4(x) if dt == FP4 else orig_bitcast(x, dt),
+    )
+    monkeypatch.setattr(all_reduce, "prologue", lambda spec: None)
+    monkeypatch.setattr(all_reduce, "epilogue", fake_epilogue)
+
+    m, h, fs, topk = 16, 1024, 128, 4
+    b13, b2 = h // Q_BLOCK, 1
+    for cfg_i, el, counts in (
+        (512, 8, (-1, 0, 1, 3, 5, 7)),
+        (256, 16, (-1, 0, 1, 3, 5, 11, 13)),
+    ):
+        e = 2 * el
+        rng = np.random.default_rng(42 + cfg_i)
+        x_raw = rng.standard_normal((m, h)).astype(np.float32)
+        x_raw[14:] = np.nan
+        x_bf16 = np.array(jnp.asarray(x_raw, BF16), copy=True)
+        w1 = np.array(
+            jnp.asarray(rng.standard_normal((el, h, 2 * cfg_i), np.float32) * 0.3, FP4),
+            copy=True,
+        )
+        w2 = np.array(
+            jnp.asarray(rng.standard_normal((el, cfg_i, h), np.float32) * 0.3, FP4),
+            copy=True,
+        )
+        s1 = np.abs(rng.standard_normal((el, b13, 2 * cfg_i), np.float32)) * 0.05
+        s2 = np.abs(rng.standard_normal((el, b2, h), np.float32)) * 0.05
+        sw13 = np.array(
+            jnp.asarray(rng.standard_normal((h, 2 * fs), np.float32) * 0.3, FP8),
+            copy=True,
+        )
+        ss13 = np.abs(rng.standard_normal((1, 2 * fs), np.float32)) * 0.05
+        sw2 = np.array(
+            jnp.asarray(rng.standard_normal((fs, h), np.float32) * 0.3, FP8),
+            copy=True,
+        )
+        ss2 = np.abs(rng.standard_normal((1, h), np.float32)) * 0.05
+        spec = all_reduce.make_spec(N_RANKS, m, h)
+
+        def run_one(
+            count_target: int,
+            *,
+            tied: bool = False,
+            fast: bool = True,
+            max_group: int = 4,
+            group_cols: int = 1024,
+            num_buffers: int = 4,
+            contig_dma: bool = False,
+            overlap_schedule: bool = False,
+            skip_tail: bool = False,
+            _el: int = el,
+            _e: int = e,
+            _i: int = cfg_i,
+            _x: np.ndarray = x_bf16,
+            _w1: np.ndarray = w1,
+            _w2: np.ndarray = w2,
+            _s1: np.ndarray = s1,
+            _s2: np.ndarray = s2,
+            _sw13: np.ndarray = sw13,
+            _ss13: np.ndarray = ss13,
+            _sw2: np.ndarray = sw2,
+            _ss2: np.ndarray = ss2,
+            _spec: Any = spec,
+        ) -> tuple[np.ndarray, int]:
+            g = kernel.group_size(_i, _el, max_group=max_group, group_cols=group_cols)
+            scores = np.full((m, _e), 0.01, np.float32)
+            bias = np.zeros((_e,), np.float32)
+            nv = 0 if count_target == -1 else 14
+            if tied:
+                rng_t = np.random.default_rng(99)
+                scores = (rng_t.integers(0, 4, size=(m, _e)) / 4.0).astype(np.float32)
+            elif count_target >= 0:
+                for r in range(nv):
+                    n_loc = min(topk, count_target)
+                    loc_picks = (
+                        (np.arange(n_loc) + r * n_loc) % count_target
+                        if n_loc > 0
+                        else np.array([], np.int32)
+                    )
+                    rem_picks = _el + np.arange(topk - n_loc)
+                    picks = np.concatenate([loc_picks, rem_picks]).astype(np.int32)
+                    scores[r, picks] = np.linspace(0.95, 0.75, topk, dtype=np.float32)
+            scores[nv:] = np.nan
+
+            e_pad = 128
+            scores_pad = np.pad(scores, ((0, 0), (0, e_pad - _e)))
+            bias_pad = np.pad(bias, (0, e_pad - _e), constant_values=-np.inf).reshape(
+                1, e_pad
+            )
+            use_cdma = contig_dma and g > 1
+            w1_scr = np.zeros(
+                (num_buffers, g, h // 8, 2 * _i)
+                if use_cdma
+                else (num_buffers, h // 8, g * 2 * _i),
+                np.uint32,
+            )
+            s1_scr = np.zeros(
+                (num_buffers, g, b13, 2 * _i)
+                if use_cdma
+                else (num_buffers, b13, g * 2 * _i),
+                np.float32,
+            )
+            out = np.array(jnp.full((m, h), -1.0, dtype=BF16), copy=True)
+            ring_sem = _FakeSem((num_buffers, 4 * g))
+            shared_sem = _FakeSem((4,))
+            hit_sem = _FakeSem((1,))
+
+            nvfp4_kernel_impl._kernel(
+                _FakeRef(np.array([nv, 0, 0], np.int32)),
+                _FakeRef(_x),
+                _FakeRef(scores_pad),
+                _FakeRef(bias_pad),
+                _FakeRef(_w1),
+                _FakeRef(_w2),
+                _FakeRef(_s1),
+                _FakeRef(_s2),
+                _FakeRef(_sw13),
+                _FakeRef(_ss13),
+                _FakeRef(_sw2),
+                _FakeRef(_ss2),
+                _FakeRef(out),
+                _FakeRef(w1_scr),
+                _FakeRef(np.zeros((num_buffers, g, _i // 8, h), np.uint32)),
+                _FakeRef(s1_scr),
+                _FakeRef(np.zeros((num_buffers, g, b2, h), np.float32)),
+                _FakeRef(np.array(jnp.zeros((h, 2 * fs), FP8), copy=True)),
+                _FakeRef(np.zeros((1, 2 * fs), np.float32)),
+                _FakeRef(np.array(jnp.zeros((fs, h), FP8), copy=True)),
+                _FakeRef(np.zeros((1, h), np.float32)),
+                _FakeRef(np.array(jnp.zeros((m, h), FP8), copy=True)),
+                _FakeRef(np.array(jnp.zeros((m, h), FP8), copy=True)),
+                _FakeRef(np.zeros((h // Q_BLOCK, m, 128), np.float32)),
+                _FakeRef(np.zeros((m, h), np.float32)),
+                _FakeRef(np.zeros((m, h), np.float32)),
+                _FakeRef(np.zeros((m, e_pad), np.float32)),
+                _FakeRef(np.zeros((4 if fast else 1, e_pad), np.int32)),
+                _FakeRef(np.zeros((4 if fast else 1, e_pad), np.int32)),
+                _FakeRef(np.zeros((max(1, ((_el + g - 1) // g) * g),), np.int32)),
+                ring_sem,
+                shared_sem,
+                hit_sem,
+                local_experts=_el,
+                group=g,
+                bk2=_i // b2,
+                topk=topk,
+                routed_scale=ROUTED_SCALE,
+                ar_spec=_spec,
+                fast=fast,
+                w2_n_chunk=512,
+                num_buffers=num_buffers,
+                contig_dma=contig_dma,
+                overlap_schedule=overlap_schedule,
+                skip_tail=skip_tail,
+            )
+            for sem in (ring_sem, shared_sem, hit_sem):
+                for key, queue in sem.pending.items():
+                    assert len(queue) == 0, f"unwaited DMA on {key}"
+            assert not np.any(np.isnan(out.astype(np.float32)))
+            assert np.all(out[max(nv, 0) :].view(np.uint16) == 0)
+            return out, ring_sem.routed_dmas
+
+        kw_cases: tuple[dict[str, Any], ...] = (
+            dict(fast=True, contig_dma=True),
+            dict(fast=True, overlap_schedule=True),
+            dict(fast=True, skip_tail=True),
+            dict(
+                fast=True,
+                contig_dma=True,
+                overlap_schedule=True,
+                skip_tail=True,
+            ),
+            dict(
+                fast=False,
+                contig_dma=True,
+                overlap_schedule=True,
+                skip_tail=True,
+            ),
+            dict(fast=True, group_cols=2048, num_buffers=3),
+            dict(fast=True, group_cols=2048, num_buffers=3, skip_tail=True),
+            dict(
+                fast=True,
+                group_cols=2048,
+                num_buffers=3,
+                contig_dma=True,
+                overlap_schedule=True,
+                skip_tail=True,
+            ),
+        )
+        for cnt in counts:
+            base, base_dmas = run_one(cnt, fast=True)
+            base_bits = base.view(np.uint16)
+            if cfg_i == 512 and cnt >= 0:
+                assert base_dmas == 4 * cnt
+            for kw in kw_cases:
+                got, dmas = run_one(cnt, **kw)
+                assert np.array_equal(got.view(np.uint16), base_bits)
+                if kw.get("skip_tail") and cnt >= 0:
+                    assert dmas == 4 * cnt
+
+        base_tied, _ = run_one(4, tied=True, fast=True)
+        got_tied, _ = run_one(
+            4,
+            tied=True,
+            fast=True,
+            contig_dma=True,
+            overlap_schedule=True,
+            skip_tail=True,
+        )
+        assert np.array_equal(got_tied.view(np.uint16), base_tied.view(np.uint16))
 
 
 @pytest.mark.parametrize(
@@ -886,6 +1484,12 @@ def _run_kernel_case(
     hbm_operands: bool = False,
     split_meta: bool = True,
     w2_n_chunk: int = 2048,
+    max_group: int = 4,
+    group_cols: int = 1024,
+    num_buffers: int = 4,
+    contig_dma: bool = False,
+    overlap_schedule: bool = False,
+    skip_tail: bool = False,
 ) -> np.ndarray:
     specs = (P("d"), P("d"), P(), P(), P("d"), P("d")) + (P("d"),) * 8
     ranks = jnp.arange(N_RANKS, dtype=jnp.int32).reshape(N_RANKS, 1)
@@ -900,6 +1504,10 @@ def _run_kernel_case(
             topk=cfg["topk"],
             n_ranks=N_RANKS,
             w2_n_chunk=w2_n_chunk,
+            max_group=max_group,
+            group_cols=group_cols,
+            num_buffers=num_buffers,
+            contig_dma=contig_dma,
         )
         return kernel.moe_tp_decode_nvfp4(
             x_s,
@@ -916,6 +1524,12 @@ def _run_kernel_case(
             hbm_operands=hbm_operands,
             split_meta=split_meta,
             w2_n_chunk=w2_n_chunk,
+            max_group=max_group,
+            group_cols=group_cols,
+            num_buffers=num_buffers,
+            contig_dma=contig_dma,
+            overlap_schedule=overlap_schedule,
+            skip_tail=skip_tail,
         )
 
     fn = jax.jit(
@@ -1217,6 +1831,64 @@ def test_fast_hbm_operands_and_split_meta_are_bitwise(mode: str):
     assert np.array_equal(got_nosm.view(np.uint16), b_slow)
     assert np.array_equal(got_nc512.view(np.uint16), b_slow)
     assert np.array_equal(got_nc6144.view(np.uint16), b_slow)
+
+
+@pytest.mark.tpu_test
+@pytest.mark.parametrize(
+    "cfg_name, cfg",
+    [
+        ("small_ep2tp4", SMALL_EP2TP4),
+        ("small_tp8", SMALL_TP8),
+    ],
+)
+@pytest.mark.parametrize(
+    "mode",
+    [
+        "uniform",
+        "concentrated_tail",
+        "concentrated_sub_group",
+        "concentrated_ep0",
+        "ties",
+    ],
+)
+def test_tuning_levers_tpu_bitwise_vs_default(cfg_name: str, cfg: dict, mode: str):
+    del cfg_name
+    if mode == "concentrated_ep0" and cfg["ep"] == 1:
+        pytest.skip("concentrated_ep0 requires EP > 1")
+    mesh = _require_tpu_mesh()
+    ws = _build_sharded_weights(mesh, cfg, seed=17)
+    x, scores, bias = _make_routing_inputs(16, cfg, mode=mode, seed=707)
+    x = x.at[12:].set(jnp.nan)
+    scores = scores.at[12:].set(jnp.nan)
+    base = _run_kernel_case(mesh, cfg, ws, x, scores, bias, 12, fast=True)
+    b_base = base.view(np.uint16)
+    kw_cases: tuple[dict[str, Any], ...] = (
+        dict(fast=True, contig_dma=True),
+        dict(fast=True, overlap_schedule=True),
+        dict(fast=False, overlap_schedule=True),
+        dict(fast=True, skip_tail=True),
+        dict(fast=False, skip_tail=True),
+        dict(
+            fast=True,
+            group_cols=2048,
+            num_buffers=3,
+        ),
+        dict(
+            fast=True,
+            contig_dma=True,
+            overlap_schedule=True,
+            skip_tail=True,
+        ),
+        dict(
+            fast=False,
+            contig_dma=True,
+            overlap_schedule=True,
+            skip_tail=True,
+        ),
+    )
+    for kw in kw_cases:
+        got = _run_kernel_case(mesh, cfg, ws, x, scores, bias, 12, **kw)
+        assert np.array_equal(got.view(np.uint16), b_base), kw
 
 
 # ---------------------------------------------------------------------------
