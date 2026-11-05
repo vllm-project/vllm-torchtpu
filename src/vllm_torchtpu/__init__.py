@@ -1326,7 +1326,17 @@ def _patch_raiden_identity_keeps_cp_interleave() -> None:
     @wraps(original)
     def adjust_dcp_kv_cache_interleave_size(self, kv_cache_config) -> None:
         transfer = self.kv_transfer_config
-        if transfer is None or _raiden_children(transfer) is None:
+        # Standalone TPURaidenOffloadingConnector stores rank-local pages under
+        # GLM DCP identity, matching TPUMultiConnector on disaggregated legs.
+        keep_interleave = transfer is not None and (
+            _raiden_children(transfer) is not None
+            or (
+                envs.use_raiden_glm_admission()
+                and envs.TPU_RAIDEN_GLM_DCP_IDENTITY
+                and transfer.kv_connector in _RAIDEN_IDENTITY_COMPANIONS
+            )
+        )
+        if not keep_interleave:
             return original(self, kv_cache_config)
         parallel = self.parallel_config
         if parallel.decode_context_parallel_size <= 1:
@@ -1337,6 +1347,12 @@ def _patch_raiden_identity_keeps_cp_interleave() -> None:
             != parallel.dcp_kv_cache_interleave_size
         ):
             parallel.cp_kv_cache_interleave_size = parallel.dcp_kv_cache_interleave_size
+        logger.info(
+            "[guard] Raiden GLM DCP identity kept cp_kv_cache_interleave_size=%d "
+            "(connector=%s)",
+            parallel.cp_kv_cache_interleave_size,
+            transfer.kv_connector,
+        )
 
     VllmConfig.adjust_dcp_kv_cache_interleave_size = adjust_dcp_kv_cache_interleave_size
     VllmConfig._tpu_raiden_keep_interleave_patch = True
