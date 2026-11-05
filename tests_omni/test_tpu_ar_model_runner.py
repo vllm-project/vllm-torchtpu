@@ -11,18 +11,18 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Unit tests for src/vllm_torchtpu/omni/worker/tpu_ar_model_runner.py.
-
-``OmniTPUModelRunner`` only records the stage it serves, so it is covered
-through the AR runner here.
-"""
+"""Unit tests for src/vllm_torchtpu/omni/worker/tpu_ar_model_runner.py."""
 
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import numpy as np
 import pytest
 import torch
 from vllm_omni.config import OmniModelConfig
+from vllm_omni.distributed.omni_connectors.kv_transfer_manager import (
+    OmniKVTransferManager,
+)
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.worker.omni_connector_model_runner_mixin import (
     OmniConnectorModelRunnerMixin,
@@ -32,6 +32,7 @@ from vllm_torchtpu.omni.worker import tpu_ar_model_runner as ar_runner_mod
 from vllm_torchtpu.omni.worker.tpu_ar_model_runner import TPUARModelRunner
 from vllm_torchtpu.omni.worker.tpu_model_runner import OmniTPUModelRunner
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
+from vllm_torchtpu.runner.tpu_runner_async_output import AsyncTPUModelRunnerOutput
 
 pytestmark = pytest.mark.omni
 
@@ -61,6 +62,12 @@ def _build(model_config) -> TPUARModelRunner:
         return TPUARModelRunner(SimpleNamespace(model_config=model_config), "tpu")
 
 
+def _async_output(inner) -> AsyncTPUModelRunnerOutput:
+    out = AsyncTPUModelRunnerOutput.__new__(AsyncTPUModelRunnerOutput)
+    out._model_runner_output = inner
+    return out
+
+
 def test_tpu_ar_model_runner_inheritance():
     # Same shape as upstream GPUARModelRunner: the connector mixin sits on the
     # leaf runner, not on the shared OmniTPUModelRunner base.
@@ -71,10 +78,12 @@ def test_tpu_ar_model_runner_inheritance():
     assert OmniConnectorModelRunnerMixin not in OmniTPUModelRunner.__mro__
 
 
-def test_thinker_stage_is_accepted():
-    runner = _build(_stage_config(model_stage="thinker", stage_id=0))
-    assert runner.model_stage == "thinker"
-    assert runner.stage_id == 0
+@pytest.mark.parametrize(("stage", "stage_id"), [("thinker", 0), ("talker", 1)])
+def test_supported_stages_are_accepted(stage: str, stage_id: int):
+    runner = _build(_stage_config(model_stage=stage, stage_id=stage_id))
+    assert runner.model_stage == stage
+    assert runner.stage_id == stage_id
+    assert runner.model_intermediate_buffer == {}
 
 
 def test_plain_vllm_config_is_accepted():
@@ -84,22 +93,69 @@ def test_plain_vllm_config_is_accepted():
     assert runner.stage_id is None
 
 
-def test_talker_stage_is_refused_at_construction():
-    with pytest.raises(NotImplementedError, match="talker_mtp"):
-        _build(_stage_config(model_stage="talker", stage_id=1))
+def test_unsupported_stage_is_refused_at_construction():
+    with pytest.raises(NotImplementedError, match="code2wav"):
+        _build(_stage_config(model_stage="code2wav", stage_id=2))
 
 
-def test_multi_stage_thinker_is_refused_at_construction():
-    # The thinker of a multi-stage pipeline hands its output to the next stage
-    # (custom_process_next_stage_input_func is set), which needs connectors.
-    with pytest.raises(NotImplementedError, match="connectors"):
-        _build(
-            _stage_config(
-                model_stage="thinker",
-                stage_id=0,
-                custom_process_next_stage_input_func="pkg.mod.thinker2talker",
-            )
-        )
+def test_multi_stage_runner_initializes_connectors_in_init():
+    cfg = _stage_config(
+        model_stage="thinker",
+        stage_id=0,
+        custom_process_next_stage_input_func="pkg.mod.thinker2talker",
+    )
+    fake_kv_mgr = object()
+    with (
+        patch.object(
+            OmniKVTransferManager, "from_vllm_config", return_value=fake_kv_mgr
+        ) as mock_from_cfg,
+        patch.object(TPUARModelRunner, "init_omni_connectors") as mock_init_conn,
+    ):
+        runner = _build(cfg)
+
+    mock_from_cfg.assert_called_once_with(runner.vllm_config, cfg)
+    mock_init_conn.assert_called_once_with(
+        model_config=cfg,
+        kv_transfer_manager=fake_kv_mgr,
+    )
+    assert runner.kv_transfer_manager is fake_kv_mgr
+
+
+def test_update_states_cleans_finished_requests_and_populates_buffer():
+    runner = _build(_stage_config(model_stage="talker", stage_id=1))
+    runner._omni_connector_initialized = True
+    runner.cleanup_finished_request = MagicMock()
+    runner.model = SimpleNamespace(gpu_resident_buffer_keys={("hidden_states", "last")})
+    runner.model_intermediate_buffer = {"req-done": {"meta": {"step": 1}}}
+
+    new_req = SimpleNamespace(
+        req_id="req-new",
+        additional_information={"speaker": "ethan"},
+        model_intermediate_buffer={
+            "hidden_states": {"last": torch.ones(2, 4)},
+            "embed": {"prefill": torch.zeros(3, 4)},
+        },
+    )
+    cached_reqs = SimpleNamespace(
+        req_ids=["req-new"],
+        additional_information={"req-new": {"meta": {"decode_flag": True}}},
+    )
+    sched_out = SimpleNamespace(
+        finished_req_ids=["req-done"],
+        scheduled_new_reqs=[new_req],
+        scheduled_cached_reqs=cached_reqs,
+    )
+
+    with patch.object(TPUModelRunner, "_update_states", return_value=True):
+        assert runner._update_states(sched_out) is True
+
+    runner.cleanup_finished_request.assert_called_once_with("req-done")
+    assert "req-done" not in runner.model_intermediate_buffer
+    buf = runner.model_intermediate_buffer["req-new"]
+    assert buf["speaker"] == "ethan"
+    assert buf["meta"] == {"decode_flag": True}
+    assert torch.equal(buf["hidden_states"]["last"], torch.ones(2, 4))
+    assert torch.equal(buf["embed"]["prefill"], torch.zeros(3, 4))
 
 
 def test_tpu_ar_model_runner_mixed_dim_mm_slicing():
@@ -181,6 +237,7 @@ def test_tpu_ar_model_runner_capture_model_precompiles_mm_buckets():
 
 def test_tpu_ar_model_runner_forward_model_unwraps_omni_output():
     runner = _build(_stage_config(model_stage="thinker", stage_id=0))
+    runner.model = SimpleNamespace()
     expected_hs = torch.ones(3, 8)
     omni_out = OmniOutput(text_hidden_states=expected_hs)
     with patch.object(
@@ -191,3 +248,77 @@ def test_tpu_ar_model_runner_forward_model_unwraps_omni_output():
         )
     assert hs is expected_hs
     assert aux is None
+
+
+def test_tpu_ar_model_runner_talker_preprocess_mtp_postprocess_and_output():
+    runner = _build(_stage_config(model_stage="talker", stage_id=1))
+    runner.supports_mm_inputs = False
+    runner.device = torch.device("cpu")
+    runner.input_batch = SimpleNamespace(
+        req_ids=["req-0"],
+        num_reqs=1,
+        num_computed_tokens_cpu=np.array([4], dtype=np.int32),
+    )
+    runner.query_start_loc_np = np.array([0, 1], dtype=np.int32)
+
+    class DummyTalkerStage:
+        has_preprocess = True
+        has_postprocess = True
+        gpu_resident_buffer_keys = {("hidden_states", "last"), ("codes", "audio")}
+
+        def preprocess(self, input_ids, input_embeds=None, **req_info):
+            assert req_info["_omni_num_computed_tokens"] == 4
+            assert req_info["_omni_is_prefill"] is False
+            return (
+                input_ids,
+                torch.ones(1, 8),
+                {"mtp_inputs": (torch.full((1, 8), 2.0), torch.full((1, 8), 3.0))},
+            )
+
+        def talker_mtp(self, input_ids, input_embeds, last_hidden, text_step):
+            return input_embeds + last_hidden + text_step, torch.arange(16).unsqueeze(0)
+
+        def postprocess(self, hidden_states, **kwargs):
+            return {"hidden_states": {"last": hidden_states[-1].detach()}}
+
+        def make_omni_output(self, model_outputs, model_intermediate_buffer=None):
+            codes = [b["codes"]["audio"] for b in model_intermediate_buffer]
+            return OmniOutput(
+                text_hidden_states=model_outputs,
+                multimodal_outputs={"codes": {"audio": torch.cat(codes, dim=0)}},
+            )
+
+    runner.model = DummyTalkerStage()
+    out_ids, out_embeds = runner._get_model_inputs(
+        torch.tensor([42], dtype=torch.long), None
+    )
+    assert out_ids is None
+    assert torch.equal(out_embeds, torch.full((1, 8), 6.0))
+    assert torch.equal(
+        runner.model_intermediate_buffer["req-0"]["codes"]["audio"],
+        torch.arange(16).unsqueeze(0),
+    )
+
+    hidden = torch.full((1, 8), 9.0)
+    with patch.object(OmniTPUModelRunner, "forward_model", return_value=(hidden, None)):
+        fwd_out, fwd_aux = runner.forward_model(None, torch.arange(1), out_embeds)
+    assert torch.equal(fwd_out, hidden)
+    assert fwd_aux is None
+    assert torch.equal(
+        runner.model_intermediate_buffer["req-0"]["hidden_states"]["last"],
+        torch.full((8,), 9.0),
+    )
+
+    inner_out = SimpleNamespace(req_ids=["req-0"], inter_stage_outputs=None)
+    runner._omni_connector_initialized = True
+    runner.attach_omni_connector_output = MagicMock(side_effect=lambda x: x)
+    with patch.object(
+        OmniTPUModelRunner, "sample_tokens", return_value=_async_output(inner_out)
+    ):
+        runner.sample_tokens()
+    assert len(inner_out.inter_stage_outputs) == 1
+    assert torch.equal(
+        inner_out.inter_stage_outputs[0]["codes"]["audio"],
+        torch.arange(16).unsqueeze(0),
+    )
+    runner.attach_omni_connector_output.assert_called_once_with(inner_out)
