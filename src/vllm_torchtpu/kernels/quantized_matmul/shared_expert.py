@@ -318,5 +318,19 @@ def fused_shared_expert(
             pltpu.SemaphoreType.DMA((2,)),
         ),
         compiler_params=pltpu.CompilerParams(vmem_limit_bytes=vmem_budget),
+        # Without a cost the scheduler treats the call as free and placed it
+        # after the routed expert kernel (DP16 C768, ledger ag5xm86g-53),
+        # where nothing overlaps it, instead of under the SparseCore pre-push
+        # the XLA gate/up matmul it replaces used to cover.
+        cost_estimate=pl.CostEstimate(
+            flops=2 * t * (k * 2 * inter + inter * k),
+            transcendentals=t * inter,
+            bytes_accessed=(
+                w13.size * w13.dtype.itemsize
+                + w2.size * w2.dtype.itemsize
+                + 2 * t * k * x.dtype.itemsize
+                + 4 * (s13.size + s2.size)
+            ),
+        ),
         name="fused_shared_expert_fp8",
     )(x, w13, s13, w2, s2)
