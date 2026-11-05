@@ -11,16 +11,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""`build_jax_step_op`: a JAX step as a torch callable, run by JAX on CPU,
-and a toy plugin whose `StepFn` is one, serving through the runtime."""
+"""`build_jax_step_op`: a JAX step as a torch callable, run by JAX on CPU;
+its fake kernel's shapes with sharded specs; the typed step wrapper; and a
+toy plugin whose `StepFn` is one, serving through the runtime."""
 
 from __future__ import annotations
 
-import importlib
-import logging
-import sys
+import inspect
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any
 
 import jax
@@ -29,17 +27,27 @@ import numpy as np
 import pytest
 import torch
 from jax.sharding import PartitionSpec as P
+from torch._subclasses.fake_tensor import FakeTensorMode
 
-import vllm_torchtpu.megakernel_runtime.agreement as agreement_mod
-import vllm_torchtpu.megakernel_runtime.driver as driver_mod
-from vllm_torchtpu.megakernel_runtime import fingerprint as fp
-from vllm_torchtpu.megakernel_runtime import testing
-from vllm_torchtpu.megakernel_runtime.hooks import StepContext
-from vllm_torchtpu.megakernel_runtime.jax_bridge import build_jax_step_op
+from vllm_torchtpu.megakernel_runtime import testkit
+from vllm_torchtpu.megakernel_runtime.jax_bridge import (
+    build_jax_step_op,
+    jax_to_torch_cpu,
+    make_typed_step_wrapper,
+    torch_cpu_to_jax,
+)
 
 
-def _mesh() -> jax.sharding.Mesh:
-    return jax.sharding.Mesh(np.asarray(jax.devices()[:1]), ("tp",))
+def _mesh(n: int = 1) -> jax.sharding.Mesh:
+    return jax.sharding.Mesh(np.asarray(jax.devices()[:n]), ("tp",))
+
+
+@pytest.fixture
+def tp2() -> jax.sharding.Mesh:
+    """A 2-device `("tp",)` mesh (the suite's CPU devices)."""
+    if len(jax.devices()) < 2:
+        pytest.skip(f"needs 2 JAX devices, found {len(jax.devices())}")
+    return _mesh(2)
 
 
 def test_cpu_round_trip_copies_donated_outputs_back_in_place() -> None:
@@ -73,15 +81,13 @@ def test_single_output_spec_returns_a_tensor_and_traces_with_a_fake() -> None:
     a = torch.ones(3, 5)
     out = step(a)
     assert isinstance(out, torch.Tensor) and torch.equal(out, torch.full((5,), 3.0))
-    from torch._subclasses.fake_tensor import FakeTensorMode
-
     with FakeTensorMode():
         fake = step.op([torch.empty(7, 2, dtype=torch.float32)])
     assert [tuple(t.shape) for t in fake] == [(2,)]
 
 
 def test_bad_donate_and_cpu_interpret_off() -> None:
-    with pytest.raises(ValueError, match="out of range"):
+    with pytest.raises(ValueError, match="output 0 to input 1: out of range"):
         build_jax_step_op(
             lambda a: a, mesh=_mesh(), in_specs=(P(),), out_specs=P(), donate={0: 1}
         )
@@ -94,6 +100,125 @@ def test_bad_donate_and_cpu_interpret_off() -> None:
     )
     with pytest.raises(RuntimeError, match="interpret_on_cpu=False"):
         step(torch.ones(2))
+
+
+def _shapes(outs: Any) -> list[tuple[int, ...]]:
+    return [tuple(t.shape) for t in outs]
+
+
+@pytest.mark.parametrize(
+    "in_spec, out_spec, local_out, global_out",
+    [(P(), P("tp"), (4,), (8,)), (P("tp"), P(), (16,), (8,))],
+    ids=["replicated_in_sharded_out", "sharded_in_replicated_out"],
+)
+def test_fake_kernel_follows_the_specs(
+    tp2: jax.sharding.Mesh,
+    in_spec: P,
+    out_spec: P,
+    local_out: tuple[int, ...],
+    global_out: tuple[int, ...],
+) -> None:
+    """At TP=2 on an (8,) operand: a TPU rank passes and gets its shards, so
+    the fake kernel scales the operand to the global array by `in_specs` and
+    shrinks the output by `out_specs`; with CPU tensors the op runs over the
+    whole mesh in one process, so the operands and outputs are global."""
+    step = build_jax_step_op(
+        lambda x: x, mesh=tp2, in_specs=(in_spec,), out_specs=out_spec
+    )
+    with FakeTensorMode():
+        rank = step.op([torch.empty(8, device="meta")])
+        whole = step.op([torch.empty(8)])
+    assert _shapes(rank) == [local_out]
+    assert _shapes(whole) == [global_out]
+    # The CPU path returns what its fake promises.
+    out = step(torch.arange(8, dtype=torch.float32))
+    assert tuple(out.shape) == global_out
+    assert torch.equal(out, torch.arange(8, dtype=torch.float32))
+
+
+def test_fake_kernel_with_multi_axis_and_trailing_dims() -> None:
+    if len(jax.devices()) < 4:
+        pytest.skip(f"needs 4 JAX devices, found {len(jax.devices())}")
+    mesh = jax.sharding.Mesh(np.asarray(jax.devices()[:4]).reshape(2, 2), ("a", "b"))
+
+    def fn(x: jax.Array, w: jax.Array) -> tuple[Any, Any]:
+        return x.sum(axis=1), jnp.concatenate([w, w])
+
+    step = build_jax_step_op(
+        fn,
+        mesh=mesh,
+        in_specs=(P(("a", "b")), P("a")),
+        out_specs=(P("b"), P(None)),
+    )
+    with FakeTensorMode():
+        out = step.op(
+            [torch.empty(3, 5, device="meta"), torch.empty(2, 6, device="meta")]
+        )
+    # Global x (12, 5), w (4, 6): sum (12,) over "b" -> 6; concat (8, 6).
+    assert _shapes(out) == [(6,), (8, 6)]
+    # An output this rank can't hold an equal shard of names the mismatch.
+    odd = build_jax_step_op(
+        lambda x: x[:3], mesh=mesh, in_specs=(P(),), out_specs=P("b")
+    )
+    with (
+        pytest.raises(
+            ValueError, match="dimension 3 is not divisible by mesh factor 2"
+        ),
+        FakeTensorMode(),
+    ):
+        odd.op([torch.empty(8, device="meta")])
+
+
+def test_every_build_registers_its_own_op() -> None:
+    """The driver builds a step per bucket and again on each bind, so even a
+    full `namespace::op` name gets a per-op suffix."""
+    names = set()
+    for name in ("mk_tests::same_op", "mk_tests::same_op", "plain", None):
+        step = build_jax_step_op(
+            lambda a: a + 1, mesh=_mesh(), in_specs=(P(),), out_specs=P(), name=name
+        )
+        assert torch.equal(step(torch.zeros(2)), torch.ones(2))
+        names.add(step.op_name)
+    assert len(names) == 4
+    assert {n.rsplit("_", 1)[0] for n in names} == {
+        "mk_tests::same_op",
+        "megakernel_runtime::plain",
+        "megakernel_runtime::jax_step",
+    }
+
+
+def test_typed_step_wrapper_signature() -> None:
+    """The wrapper `JaxCallable` inspects: fixed positional `jax.Array`
+    parameters and a tuple of `jax.Array` results, calling the step."""
+    seen: list[tuple[Any, ...]] = []
+
+    def step(*args: Any) -> tuple[Any, ...]:
+        seen.append(args)
+        return args[::-1]
+
+    typed = make_typed_step_wrapper("mk_step_t1_b8", step, 3, 2)
+    sig = inspect.signature(typed, eval_str=True)
+    assert typed.__name__ == "mk_step_t1_b8"
+    assert list(sig.parameters) == ["x0", "x1", "x2"]
+    for param in sig.parameters.values():
+        assert param.kind is inspect.Parameter.POSITIONAL_OR_KEYWORD
+        assert param.annotation is jax.Array
+        assert param.default is inspect.Parameter.empty
+    assert sig.return_annotation == tuple[jax.Array, jax.Array]
+    assert typed(1, 2, 3) == (3, 2, 1) and seen == [(1, 2, 3)]
+    assert inspect.signature(make_typed_step_wrapper("f", step, 1, 1)).return_annotation
+
+
+@pytest.mark.parametrize(
+    "dtype", [torch.float32, torch.bfloat16, torch.float8_e4m3fn, torch.int32]
+)
+def test_cpu_conversions_round_trip_bit_exactly(dtype: torch.dtype) -> None:
+    src = torch.linspace(-3, 3, 12).reshape(3, 4).to(dtype)
+    arr = torch_cpu_to_jax(src)
+    assert arr.shape == (3, 4)
+    back = jax_to_torch_cpu(arr, src)
+    assert back.dtype == dtype
+    assert torch.equal(back.view(torch.uint8), src.view(torch.uint8))
 
 
 JAX_TOY_PLUGIN = '''
@@ -152,39 +277,21 @@ SPEC = TpuMonoSpec("jax_toy", "1", create=create)
 '''
 
 
-@pytest.fixture
-def jax_toy(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Any:
-    (tmp_path / "jax_toy_mk_plugin.py").write_text(JAX_TOY_PLUGIN, encoding="utf-8")
-    monkeypatch.syspath_prepend(str(tmp_path))
-    monkeypatch.delenv("VLLM_TPU_MEGAKERNEL", raising=False)
-    for lazy in (driver_mod.logger, agreement_mod.logger):
-        try:
-            lazy._resolve()
-        except ModuleNotFoundError:
-            monkeypatch.setattr(lazy, "_logger", logging.getLogger(lazy._name))
-    sys.modules.pop("jax_toy_mk_plugin", None)
-    importlib.invalidate_caches()
-    fp.clear_caches()
-    yield
-    sys.modules.pop("jax_toy_mk_plugin", None)
-    fp.clear_caches()
-
-
 def test_jax_toy_plugin_serves_through_try_forward(
-    jax_toy: None, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, mk_fake_runner: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(agreement_mod, "_tp_cpu_group", lambda: None)
-    ctx = SimpleNamespace(attn_metadata={})
-    monkeypatch.setattr(driver_mod, "get_forward_context", lambda: ctx)
-    runner = testing.fake_runner(
-        megakernel={"plugin": "jax_toy_mk_plugin", "options": {"scale": 3.0}}
-    )
-    drv = driver_mod.ProgramDriver.maybe_create(runner)
-    assert isinstance(drv, driver_mod.ProgramDriver) and drv.serving
-    runner._megakernel = drv
-    drv.bind_and_warmup(runner)
-    assert runner._megakernel is drv and sorted(drv._steps) == [(1, 4), (1, 8)]
+    testkit.write_plugin(tmp_path, JAX_TOY_PLUGIN, "jax_toy_mk_plugin")
+    monkeypatch.syspath_prepend(str(tmp_path))
     ids = torch.arange(6, dtype=torch.int32)
-    hit, out = drv.try_forward(runner, StepContext(ids, torch.zeros(6)))
-    assert hit and torch.equal(out, ids.float() * 3.0 + 8)
-    assert drv.step_mix_tracker.counts == {"mk_t1_b8": 1}
+    res = testkit.run_cpu_e2e(
+        "jax_toy_mk_plugin",
+        mk_fake_runner,
+        [(ids, torch.zeros(6))],
+        options={"scale": 3.0},
+    )
+    assert sorted(res.driver._steps) == [(1, 4), (1, 8)]
+    assert res.hits == [True] and torch.equal(res.outputs[0], ids.float() * 3.0 + 8)
+    assert res.step_mix == {"mk_t1_b8": 1}
+
+
+mk_fake_runner = testkit.mk_fake_runner
