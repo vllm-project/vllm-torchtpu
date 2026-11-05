@@ -118,6 +118,7 @@ class AllReduceRing:
         ]
 
     def ar_round(self, slot, rnd_i: int):
+        """Start remote copies for round `rnd_i` on `slot` and wait on `wait_recv()`."""
         descs = self.ar_copies(slot, rnd_i)
         for d in descs:
             d.start()
@@ -247,6 +248,7 @@ class AllReduceRing:
 
     @staticmethod
     def exchange(descs):
+        """Start `descs` and wait on both `wait_recv()` and `wait_send()`."""
         for d in descs:
             d.start()
         for d in descs:

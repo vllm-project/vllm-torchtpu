@@ -27,27 +27,37 @@ from ..ops import BF16, col_chunk, round_up
 
 @dataclass(frozen=True)
 class CommParams:
-    """Core all-reduce and inter-rank collective parameters."""
+    """Core all-reduce and inter-rank collective parameters.
 
-    R: int
-    B: int
-    M: int
-    MR: int
-    MB: int
-    H: int
-    PR: int
-    PC: int
-    HPC: int
-    HIER: int
-    RSAG: bool
-    WAR: bool
-    AR_R: int
-    AR_C: int
-    CW: int
-    HC2: int
-    AR_ROUNDS: tuple[int, ...]
-    AR_PEERS: int
-    N_HIER3: int = 3
+    Supported `HIER` modes (`comm_params`):
+    - `HIER == 0`: flat ring (`RSAG=False`, 1 round) or 2-round reduce-scatter +
+      all-gather (`RSAG=True`), accepted for any power-of-two `R >= 1`.
+    - `HIER == 1`: 2-stage 8-rank pair-reduce + 4-way all-gather (`R == 8`).
+    - `HIER == 2`: 3-stage 8-rank half-column pair-reduce + 4-way all-gather +
+      pair all-gather (`R == 8`, requires `HC2 % 128 == 0`).
+    - `HIER == 3`: `N_HIER3 = log2(R)`-round recursive halving/doubling butterfly,
+      accepted for any power-of-two `R >= 2`.
+    """
+
+    R: int  # Number of tensor-parallel ranks in the mesh.
+    B: int  # Active token rows per rank before folding.
+    MR: int  # Per-rank padded token rows (`round_up(M, 8*mb8)`).
+    H: int  # Full hidden dimension (columns).
+    PR: int  # Folded payload rows (`round_up(B * HPC, 16)`) when `WAR=False`.
+    PC: int  # Folded payload column chunk width (`H // HPC`) when `WAR=False`.
+    HPC: int  # Number of column chunks (`H // PC`) folded into rows when `WAR=False`.
+    HIER: int  # Collective topology mode (`0`, `1`, `2`, or `3`).
+    RSAG: bool  # True when `HIER == 0` uses 2-round reduce-scatter + all-gather.
+    WAR: bool  # True when payload stays wide `[MR, H]` instead of folded `[PR, PC]`.
+    AR_R: int  # All-reduce buffer row count (`MR` if `WAR` else `PR`, in rows).
+    AR_C: int  # All-reduce buffer column width (`H` if `WAR` else `PC`, in columns).
+    CW: int  # Per-rank column slice width (`AR_C // R`, in columns) for `RSAG`.
+    HC2: int  # Half-column width (`AR_C // 2`, in columns) for `HIER == 2`.
+    AR_ROUNDS: tuple[
+        int, ...
+    ]  # Active round indices (`(0,)` .. `tuple(range(N_HIER3))`).
+    AR_PEERS: int  # Remote peer DMA descriptors per round per slot.
+    N_HIER3: int  # Number of butterfly rounds (`max(1, log2(R))`) for `HIER == 3`.
 
 
 def comm_params(
@@ -58,7 +68,7 @@ def comm_params(
     PC: int | None = None,
 ) -> CommParams:
     """Derive the all-reduce mode, payload layout, rounds, and peers for `ex`."""
-    R, B, M, MR, MB = ex.R, ex.B, ex.M, ex.MR, ex.MB
+    R, B, MR = ex.R, ex.B, ex.MR
     if PC is None:
         PC = col_chunk(H)
     if H % PC != 0:
@@ -68,6 +78,11 @@ def comm_params(
     HPC = H // PC
     if PR is None:
         PR = round_up(B * HPC, 16)
+    elif PR < B * HPC:
+        raise MegakernelConfigError(
+            f"all-reduce folded rows PR={PR} must be >= B * HPC = {B * HPC} "
+            f"(B={B}, HPC={HPC})"
+        )
     HIER = tiles.hier if R > 1 else 0
     RSAG = tiles.rsag and R > 1 and HIER == 0
     WAR = (
@@ -104,9 +119,7 @@ def comm_params(
     return CommParams(
         R=R,
         B=B,
-        M=M,
         MR=MR,
-        MB=MB,
         H=H,
         PR=PR,
         PC=PC,

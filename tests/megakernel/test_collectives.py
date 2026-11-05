@@ -25,6 +25,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from jax import lax
+from jax._src.pallas.mosaic.interpret import interpret_pallas_call as ipc
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 from jax.sharding import Mesh
@@ -121,6 +122,7 @@ def _execute_2layer_2slot_ring(
     seed: int = 42,
     heavy_tail: bool = False,
     traced_slot: bool = False,
+    skip: frozenset[str] = frozenset(),
     ring_cls: type[AllReduceRing] = AllReduceRing,
 ):
     """Run a 2-layer, 2-slot alternating schedule and drain all sends."""
@@ -141,9 +143,9 @@ def _execute_2layer_2slot_ring(
     def pallas_body(x0_ref, x1_ref, out_ref, *scr_refs):
         scr = dict(zip(s_names, scr_refs))
         me = lax.axis_index("tp").astype(I32)
-        ar = ring_cls(cp, scr, me)
+        ar = ring_cls(cp, scr, me, skip=skip)
 
-        if R > 1:
+        if ar.comm:
             barrier = pltpu.get_barrier_semaphore()
             for off in range(1, R):
                 pl.semaphore_signal(
@@ -258,6 +260,18 @@ def _check_r8_modes_in_process() -> None:
             bound = _bf16_2layer_2slot_bound(x0_f64, x1_f64, _stage_round_count(cp))
             for r in range(8):
                 assert float(np.max(np.abs(out_f64[r] - host_sum_f64))) <= bound
+    for hier, rsag, war, H in (
+        (0, False, 1, 1024),
+        (0, True, 1, 1024),
+        (3, False, 1, 1024),
+    ):
+        x0_f64, x1_f64, out_f64, _, cp, _ = _execute_2layer_2slot_ring(
+            4, hier=hier, rsag=rsag, war=war, H=H, seed=23, heavy_tail=True
+        )
+        host_sum_f64 = 2.0 * (np.sum(x0_f64, axis=0) + np.sum(x1_f64, axis=0))
+        bound = _bf16_2layer_2slot_bound(x0_f64, x1_f64, _stage_round_count(cp))
+        for r in range(4):
+            assert float(np.max(np.abs(out_f64[r] - host_sum_f64))) <= bound
 
 
 def _check_negative_control_in_process() -> None:
@@ -325,9 +339,85 @@ def _check_r2_traced_slot_and_group_copies_in_process() -> None:
     np.testing.assert_array_equal(got[0], exp[1])
     np.testing.assert_array_equal(got[1], exp[0])
 
+    # Negative control: reusing slot 0 on every layer triggers a DMA race.
+    racy_scr = {
+        "res": pltpu.VMEM((ex.MB, 256), F32),
+        **collectives.ring_scratch(cp),
+        **collectives.stage_scratch(cp),
+    }
+    racy_names = list(racy_scr.keys())
+
+    def _racy_body(x_ref, out_ref, *scr_refs):
+        scr = dict(zip(racy_names, scr_refs))
+        me = lax.axis_index("tp").astype(I32)
+        ar = AllReduceRing(cp, scr, me)
+        barrier = pltpu.get_barrier_semaphore()
+        pl.semaphore_signal(
+            barrier, 1, device_id=(me ^ 1,), device_id_type=pl.DeviceIdType.MESH
+        )
+        pl.semaphore_wait(barrier, 1)
+        scr["res"][...] = jnp.zeros((ex.MB, 256), F32)
+
+        def _layer_fn(lyr, _):
+            val = (x_ref[...] * (lyr + 1).astype(F32)).astype(BF16).astype(F32)
+            tot = ar.allreduce(0, val, lyr == 0)
+            ar.add_residual(tot)
+            return 0
+
+        lax.fori_loop(0, 2, _layer_fn, 0)
+        ar.drain_sends()
+        out_ref[...] = scr["res"][...]
+
+    racy_call = pl.pallas_call(
+        _racy_body,
+        out_shape=jax.ShapeDtypeStruct((ex.MB, 256), F32),
+        in_specs=[pl.BlockSpec(memory_space=pltpu.VMEM)],
+        out_specs=pl.BlockSpec(memory_space=pltpu.VMEM),
+        scratch_shapes=[racy_scr[k] for k in racy_names],
+        compiler_params=pltpu.CompilerParams(collective_id=0),
+        interpret=pltpu.InterpretParams(detect_races=True),
+    )
+    racy_step = jax.jit(
+        jax.shard_map(
+            lambda x: racy_call(x[0])[None],
+            mesh=Mesh(devs, ("tp",)),
+            in_specs=(P("tp"),),
+            out_specs=P("tp"),
+            check_vma=False,
+        )
+    )
+    x_racy = jax.random.normal(jax.random.PRNGKey(11), (2, ex.MB, 256), dtype=BF16)
+    _ = jax.block_until_ready(racy_step(x_racy.astype(F32)))
+    assert ipc.races is not None and ipc.races.races_found
+
+
+def test_allreduce_ring_r1_and_skip_comm():
+    """Verify `not self.comm` path (`R=1` and `skip={'comm'}`) rounds in-process."""
+    for war in (1, 0):
+        x0_f64, x1_f64, out_f64, _, cp, _ = _execute_2layer_2slot_ring(
+            1, hier=0, rsag=False, war=war, H=512, B=3, seed=13
+        )
+        host_sum_f64 = 2.0 * (x0_f64[0] + x1_f64[0])
+        bound = _bf16_2layer_2slot_bound(x0_f64, x1_f64, _stage_round_count(cp))
+        assert float(np.max(np.abs(out_f64[0] - host_sum_f64))) <= bound
+
+    x0_skip, x1_skip, out_skip, _, cp_skip, _ = _execute_2layer_2slot_ring(
+        1,
+        hier=0,
+        rsag=False,
+        war=1,
+        H=512,
+        B=4,
+        seed=19,
+        skip=frozenset({"comm"}),
+    )
+    host_sum_skip = 2.0 * (x0_skip[0] + x1_skip[0])
+    bound_skip = _bf16_2layer_2slot_bound(x0_skip, x1_skip, _stage_round_count(cp_skip))
+    assert float(np.max(np.abs(out_skip[0] - host_sum_skip))) <= bound_skip
+
 
 def test_allreduce_ring_modes_vs_float64_host_sum():
-    """Verify flat, RS+AG, and hier 1/2/3 at R=8 against `numpy.float64` host sum."""
+    """Verify flat, RS+AG, and hier 1/2/3 at R=4 and R=8 against `numpy.float64`."""
     if len(jax.devices("cpu")) < 8:
         _spawn_with_cpu_devices(8, "r8_modes")
         return
@@ -343,7 +433,7 @@ def test_allreduce_ring_wrong_peer_offset_negative_control():
 
 
 def test_allreduce_traced_slot_parity_and_group_copies():
-    """Verify traced `slot` parity with Python `slot` and 2-rank `group_copies`."""
+    """Verify traced `slot` parity, 2-rank `group_copies`, and slot-reuse race check."""
     if len(jax.devices("cpu")) < 2:
         _spawn_with_cpu_devices(2, "r2_checks")
         return
@@ -351,11 +441,12 @@ def test_allreduce_traced_slot_parity_and_group_copies():
 
 
 def test_comm_module_import_preserves_host_xla_flags():
-    """Importing `test_comm` must not mutate `os.environ['XLA_FLAGS']` in parent."""
+    """Importing `collectives` or `test_collectives` must not mutate `XLA_FLAGS`."""
     sentinel = "--xla_cpu_enable_fast_math=false"
     env = dict(os.environ, JAX_PLATFORMS="cpu", XLA_FLAGS=sentinel)
     code = (
         "import importlib.util, os, sys; "
+        "import vllm_torchtpu.megakernel.collectives; "
         "p = sys.argv[1]; "
         "spec = importlib.util.spec_from_file_location('tc_probe', p); "
         "assert spec is not None and spec.loader is not None; "
@@ -374,17 +465,38 @@ def test_comm_module_import_preserves_host_xla_flags():
     assert out.returncode == 0, out.stdout + out.stderr
 
 
-def test_comm_params_invalid_raises_config_error() -> None:
-    tiles = dataclasses.replace(_TINY_TILES, hier=0, rsag=True, war=1, mb8=2)
-    ex = ExecSpec(B=4, T=1, R=8, ctx=128, tiles=tiles, interpret=True)
-    with pytest.raises(MegakernelConfigError, match="multiple of 128"):
-        collectives.comm_params(ex, tiles, H=512, PR=4, PC=512)
-    for bad_r in (3, 6):
-        for rsag in (False, True):
-            t_bad = dataclasses.replace(_TINY_TILES, hier=0, rsag=rsag, war=1, mb8=2)
-            ex_bad = ExecSpec(B=bad_r, T=1, R=bad_r, ctx=128, tiles=t_bad)
-            with pytest.raises(MegakernelConfigError, match="unsupported all-reduce"):
-                collectives.comm_params(ex_bad, t_bad, H=768)
+@pytest.mark.parametrize(
+    "R,hier,rsag,war,H,PR,PC,match",
+    [
+        (8, 0, True, 1, 512, 4, 512, "multiple of 128"),
+        (8, 0, True, 0, 512, None, None, "multiple of 128"),
+        (3, 0, False, 1, 768, None, None, "unsupported all-reduce"),
+        (3, 0, True, 1, 768, None, None, "unsupported all-reduce"),
+        (6, 0, False, 1, 768, None, None, "unsupported all-reduce"),
+        (6, 3, False, 1, 768, None, None, "unsupported all-reduce"),
+        (4, 1, False, 1, 1024, None, None, "unsupported all-reduce"),
+        (4, 2, False, 1, 1024, None, None, "unsupported all-reduce"),
+        (8, -1, False, 1, 1024, None, None, "unsupported all-reduce"),
+        (8, 99, False, 1, 1024, None, None, "unsupported all-reduce"),
+        (8, 2, False, 1, 128, None, None, "hier=2 requires HC2=64 divisible by 128"),
+        (8, 0, False, 1, 512, None, 300, "divisible by column chunk PC=300"),
+        (8, 0, False, 0, 1024, 4, 512, "folded rows PR=4 must be >= B \\* HPC = 8"),
+    ],
+)
+def test_comm_params_invalid_raises_config_error(
+    R: int,
+    hier: int,
+    rsag: bool,
+    war: int,
+    H: int,
+    PR: int | None,
+    PC: int | None,
+    match: str,
+) -> None:
+    tiles = dataclasses.replace(_TINY_TILES, hier=hier, rsag=rsag, war=war, mb8=2)
+    ex = ExecSpec(B=4, T=1, R=R, ctx=128, tiles=tiles, interpret=True)
+    with pytest.raises(MegakernelConfigError, match=match):
+        collectives.comm_params(ex, tiles, H=H, PR=PR, PC=PC)
 
 
 if __name__ == "__main__":
