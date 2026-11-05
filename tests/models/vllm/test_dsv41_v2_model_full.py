@@ -26,8 +26,10 @@ os.environ.setdefault("JAX_PLATFORMS", "cpu")
 os.environ.setdefault("TPU_SKIP_MDS_QUERY", "true")
 
 from vllm.config import CompilationMode
+from vllm.models.deepseek_v41.nvidia import vl_model as upstream_vl
 
 from vllm_torchtpu.layers.core.sequence_layout import SequenceLayoutKind
+from vllm_torchtpu.models.vllm import register_models
 from vllm_torchtpu.models.vllm.deepseek_v41.v2.ced import DecoderReplayPlan
 from vllm_torchtpu.models.vllm.deepseek_v41.v2.host_engram import (
     HOST_ENGRAM_KEY,
@@ -42,6 +44,7 @@ from vllm_torchtpu.models.vllm.deepseek_v41.v2.model import (
     DeepseekV41ForCausalLM,
     DeepseekV41FullStage,
     DeepseekV41Model,
+    DeepseekV41VLForCausalLM,
     _ced_config,
     _StageBase,
     _use_sequence_parallel,
@@ -1966,3 +1969,98 @@ def test_dp_embeddings_materialized_before_stage(monkeypatch, dp_size, supplied)
     assert events == (
         ["lookup", "enqueue", "stage"] if dp_size > 1 and not supplied else ["stage"]
     )
+
+
+@pytest.mark.cpu_test
+def test_v41_architecture_registers_vision_wrapper():
+    with patch("vllm.model_executor.models.ModelRegistry.register_model") as register:
+        register_models()
+    calls = {call.args[0]: call.args[1] for call in register.call_args_list}
+    assert calls["DeepseekV41ForCausalLM"] == (
+        "vllm_torchtpu.models.vllm.deepseek_v41.v2.model:DeepseekV41VLForCausalLM"
+    )
+
+
+@pytest.mark.cpu_test
+def test_vision_wrapper_builds_tpu_language_model_with_scale_inv(monkeypatch):
+    seen = {}
+
+    def upstream_init(self, *, vllm_config, prefix=""):
+        torch.nn.Module.__init__(self)
+        seen["language_model_cls"] = upstream_vl.DeepseekV41LLMForCausalLM
+        seen["scale_name"] = upstream_vl._linear_scale_param_name(vllm_config, "fp4")
+
+    monkeypatch.setattr(upstream_vl.DeepseekV41ForCausalLM, "__init__", upstream_init)
+    original = upstream_vl.DeepseekV41LLMForCausalLM
+
+    DeepseekV41VLForCausalLM(vllm_config=SimpleNamespace())
+
+    assert seen == {
+        "language_model_cls": DeepseekV41ForCausalLM,
+        "scale_name": "weight_scale_inv",
+    }
+    assert upstream_vl.DeepseekV41LLMForCausalLM is original
+
+
+@pytest.mark.cpu_test
+def test_vision_wrapper_encoder_cudagraph_config_skips_cuda_backend_gate():
+    model = DeepseekV41VLForCausalLM.__new__(DeepseekV41VLForCausalLM)
+    torch.nn.Module.__init__(model)
+    model.config = SimpleNamespace(hidden_size=8)
+
+    config = model.get_encoder_cudagraph_config()
+
+    assert config.modalities == ["image"]
+    assert config.out_hidden_size == 8
+    assert "cu_seqlens" in config.buffer_keys
+    assert "cu_seqlens" not in config.padding_logics
+
+
+@pytest.mark.cpu_test
+def test_vision_wrapper_streams_language_weights_in_one_delegation(monkeypatch):
+    from vllm.model_executor.models.utils import WeightsMapper
+
+    from vllm_torchtpu.models.vllm.deepseek_v41.v2 import model as v2_model
+
+    pulled = []
+
+    def checkpoint():
+        for name in ("layers.0.w", "vision.w", "layers.1.w", "aligner.w"):
+            pulled.append(name)
+            yield name, torch.zeros(1)
+
+    calls = []
+
+    class LanguageModel(torch.nn.Module):
+        def load_weights(self, weights):
+            assert not isinstance(weights, list)
+            names = []
+            for name, _ in weights:
+                # Lazy: each weight is consumed as soon as it is read.
+                assert pulled[-1].endswith(name.removeprefix("model."))
+                names.append(name)
+            calls.append(names)
+            return set(names)
+
+    tower = MagicMock()
+    tower.return_value.load_weights.side_effect = lambda w: {n for n, _ in w}
+    monkeypatch.setattr(v2_model, "AutoWeightsLoader", tower)
+
+    model = DeepseekV41VLForCausalLM.__new__(DeepseekV41VLForCausalLM)
+    torch.nn.Module.__init__(model)
+    model.language_model = LanguageModel()
+    model.hf_to_vllm_mapper = WeightsMapper(
+        orig_to_new_prefix={"layers.": "language_model.model.layers."}
+    )
+
+    loaded = model.load_weights(checkpoint())
+
+    assert calls == [["model.layers.0.w", "model.layers.1.w"]]
+    tower.return_value.load_weights.assert_called_once()
+    assert loaded == {
+        "language_model.model.layers.0.w",
+        "language_model.model.layers.1.w",
+        "vision.w",
+        "aligner.w",
+    }
+    assert model._weights_finalized
