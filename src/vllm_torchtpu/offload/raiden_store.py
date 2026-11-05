@@ -89,7 +89,12 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, cast
 
 from vllm.config import VllmConfig
-from vllm.v1.kv_cache_interface import AttentionSpec, FullAttentionSpec, KVCacheConfig
+from vllm.v1.kv_cache_interface import (
+    AttentionSpec,
+    FullAttentionSpec,
+    KVCacheConfig,
+    KVCacheSpec,
+)
 from vllm.v1.kv_offload.base import (
     CanonicalKVCaches,
     LoadStoreSpec,
@@ -1552,38 +1557,70 @@ def is_multi_shapes_geometry(per_block_shape: object) -> bool:
     return isinstance(per_block_shape, (set, frozenset))
 
 
+def multi_shapes_leaf_block_shape(leaf: KVCacheSpec) -> tuple[int, ...] | None:
+    """Per-block shape one leaf spec adds to a multi-shape KV layout.
+
+    - MLA cache: ``(num_states, num_kv_heads, head_size)``, one row per token.
+    - Any other full-attention cache (a speculative drafter's K/V layers):
+      ``(block_size, 2, num_kv_heads, head_size)``. The TPU attention backends
+      allocate K and V fused in one array whose leading dimension is the
+      block, so the leaf is still one array registered as whole pages; its
+      padded page size is `leaf.page_size_bytes`.
+    - Sliding-window MLA caches (DSv4) add no shape: they ride on the MLA
+      anchor block.
+
+    Raises AssertionError for a leaf the per-array path cannot register.
+    """
+    from vllm.v1.kv_cache_interface import MLAAttentionSpec, SlidingWindowMLASpec
+
+    if isinstance(leaf, SlidingWindowMLASpec):
+        return None
+    if isinstance(leaf, MLAAttentionSpec):
+        return (leaf.num_states, leaf.num_kv_heads, leaf.head_size)
+    assert isinstance(leaf, FullAttentionSpec), (
+        "TPURaidenOffloadingConnector: a multi-shape KV layout supports "
+        "MLA-family and full-attention layers only; got "
+        f"{type(leaf).__name__} (a sliding-window layer needs "
+        "--disable-hybrid-kv-cache-manager to share the full-attention group)"
+    )
+    assert leaf.head_size_v == leaf.head_size, (
+        "TPURaidenOffloadingConnector: a full-attention leaf in a multi-shape "
+        f"KV layout needs equal K/V widths; got head_size={leaf.head_size}, "
+        f"head_size_v={leaf.head_size_v}"
+    )
+    return (leaf.block_size, 2, leaf.num_kv_heads, leaf.head_size)
+
+
 def _resolve_multi_shapes_kv_geometry(
     kv_cache_config: KVCacheConfig,
 ) -> tuple[int, set[tuple[int, ...]], set[object], int]:
-    from vllm.v1.kv_cache_interface import MLAAttentionSpec, SlidingWindowMLASpec
-
-    groups = kv_cache_config.kv_cache_groups
-    for group in groups:
-        for leaf in iter_leaf_kv_cache_specs(group.kv_cache_spec):
-            assert isinstance(leaf, (MLAAttentionSpec, SlidingWindowMLASpec)), (
-                "TPURaidenOffloadingConnector: an aliased KV "
-                "layout has only MLA-family layers; got "
-                f"{type(leaf).__name__}"
-            )
-
-    mla_leaves = [
+    leaves = [
         leaf
-        for group in groups
+        for group in kv_cache_config.kv_cache_groups
         for leaf in iter_leaf_kv_cache_specs(group.kv_cache_spec)
-        if isinstance(leaf, MLAAttentionSpec)
     ]
-    assert mla_leaves
-    anchor_block_sizes = sorted({leaf.block_size for leaf in mla_leaves})
-    assert len(anchor_block_sizes) == 1
-    block_size = anchor_block_sizes[0]
-
-    # One entry per full-attention MLA cache.
+    # One entry per full-attention cache (MLA or K/V); validates every leaf.
     per_block_shapes: set[tuple[int, ...]] = set()
     kv_dtypes: set[object] = set()
-    for leaf in mla_leaves:
-        shape = (leaf.num_states, leaf.num_kv_heads, leaf.head_size)
-        per_block_shapes.add(shape)
-        kv_dtypes.add(leaf.dtype)
+    for leaf in leaves:
+        shape = multi_shapes_leaf_block_shape(leaf)
+        if shape is not None:
+            per_block_shapes.add(shape)
+            kv_dtypes.add(leaf.dtype)
+
+    # Full-attention leaves (MLA ones included) anchor the block size; the
+    # scheduler sees one of them per group, the workers all of them.
+    anchors = [leaf for leaf in leaves if isinstance(leaf, FullAttentionSpec)]
+    assert anchors, (
+        "TPURaidenOffloadingConnector: a multi-shape KV layout has no "
+        "full-attention layer"
+    )
+    anchor_block_sizes = sorted({leaf.block_size for leaf in anchors})
+    assert len(anchor_block_sizes) == 1, (
+        "TPURaidenOffloadingConnector: full-attention layers of a multi-shape "
+        f"KV layout disagree on block size: {anchor_block_sizes}"
+    )
+    block_size = anchor_block_sizes[0]
     return block_size, per_block_shapes, kv_dtypes, block_size
 
 
