@@ -468,8 +468,15 @@ def test_exchange_capacity_sizes():
         240,
         256,
     )
-    # Above the one-hot threshold the routes are not bounded.
-    kw = dict(topk=10, local_num_experts=64, onehot_moe_permute_threshold=511)
+    # 4 hosts dp8 x tp4 with 3 drafts at 22 requests per engine: 400 rows carry
+    # 4000 routed rows, over the one-hot cap, but the 512 bounded routes fit it.
+    kw = dict(topk=10, local_num_experts=16, onehot_moe_permute_threshold=3840)
+    assert ra_capacity(dp_size=8, tp_size=4, num_tokens=88, factor=2.0, **kw) == (
+        400,
+        512,
+    )
+    # Bounded routes above the one-hot threshold are not bounded.
+    kw = dict(topk=10, local_num_experts=64, onehot_moe_permute_threshold=255)
     assert ra_capacity(dp_size=2, tp_size=4, num_tokens=48, factor=2.0, **kw) == (
         96,
         960,
@@ -638,6 +645,55 @@ def test_capacity_overflow_matches_brute_force(dp_size, tp_size, topk):
         )
         want = _overflow_reference(ids, tp_size, local, rows, routes)
         assert (np.asarray(got) == want).all(), (rows, routes)
+
+
+@pytest.mark.multichip
+@pytest.mark.parametrize(
+    "num_tokens,max_local_routes,threshold",
+    [
+        (400, 512, 3840),  # 4-host rank at 22 requests per engine, 3 drafts
+        (96, 256, 512),  # proxy-sized rank, threshold below all 960 routes
+    ],
+)
+def test_local_routes_bound_above_threshold_matches_sparse_core(
+    num_tokens, max_local_routes, threshold
+):
+    """With all routes over the one-hot threshold but the local bound under it,
+    the local-routes path gives the SparseCore path's output bitwise."""
+    assert max_local_routes <= threshold < num_tokens * TOPK
+    devices = _require_eight_tpu_devices()
+    num_experts, local = 64, 8
+    x, w1, w2, s1, s2, weights, ids, _ = _inputs(
+        8, 1, num_tokens, num_experts, skew=False
+    )
+    x, weights, ids = x[:num_tokens], weights[:num_tokens], ids[:num_tokens]
+    # Rank 0 hosts experts 0..7; keep the local routes within the bound.
+    ids_np = np.array(ids)
+    local_rows = np.nonzero((ids_np < local).any(axis=1))[0]
+    drop = local_rows[
+        np.cumsum((ids_np[local_rows] < local).sum(axis=1)) > max_local_routes
+    ]
+    ids_np[drop] = np.where(ids_np[drop] < local, ids_np[drop] + local, ids_np[drop])
+    ids = jnp.asarray(ids_np)
+    assert (ids_np < local).sum() <= max_local_routes
+    kw = dict(
+        experts_start=jnp.int32(0),
+        topk=TOPK,
+        activation="silu",
+        use_ep=True,
+        use_sparse_core=True,
+        onehot_moe_permute_threshold=threshold,
+    )
+    args = (x, w1[:local], w2[:local], s1[:local], s2[:local], None, None, weights, ids)
+    with jax.default_device(devices[0]):
+        want = jax.jit(functools.partial(fused_moe_func, **kw))(*args)
+        got = jax.jit(
+            functools.partial(fused_moe_func, max_local_routes=max_local_routes, **kw)
+        )(*args)
+    want = np.asarray(want)
+    assert np.isfinite(want.astype(np.float32)).all()
+    assert np.abs(want.astype(np.float32)).max() > 0
+    np.testing.assert_array_equal(np.asarray(got).view(np.uint16), want.view(np.uint16))
 
 
 @pytest.mark.multichip

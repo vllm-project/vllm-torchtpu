@@ -171,7 +171,7 @@ def exchange_capacity(
     the routes hitting its local experts: ``factor`` times their mean under
     uniform routing, rounded up to whole tiles and capped at the sizes that
     always fit (``dp_size * num_tokens`` rows, ``topk`` routes per row). The
-    route bound only applies where the local MoE runs one-hot matmuls.
+    route bound only applies where the bounded routes fit the one-hot path.
     """
     slots = dp_size * num_tokens
     if factor <= 0:
@@ -183,11 +183,11 @@ def exchange_capacity(
         miss *= max(num_experts - local_num_experts - i, 0) / (num_experts - i)
     rows = -(-math.ceil(factor * slots * (1 - miss)) // _ROW_TILE) * _ROW_TILE
     rows = min(rows, slots)
-    if not (use_sparse_core and rows * topk <= onehot_moe_permute_threshold):
-        return rows, rows * topk
     routes = math.ceil(factor * slots * topk / num_ranks)
-    routes = -(-routes // _ROUTE_TILE) * _ROUTE_TILE
-    return rows, min(routes, rows * topk)
+    routes = min(-(-routes // _ROUTE_TILE) * _ROUTE_TILE, rows * topk)
+    if not (use_sparse_core and routes <= onehot_moe_permute_threshold):
+        return rows, rows * topk
+    return rows, routes
 
 
 def _capacity_overflow(

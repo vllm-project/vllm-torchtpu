@@ -729,7 +729,19 @@ def fused_moe_func(
     # callers return FP32 weights and would otherwise promote downstream.
     topk_weights = topk_weights.astype(hidden_states.dtype)
 
-    if use_ep and use_sparse_core and num_tokens * topk <= onehot_moe_permute_threshold:
+    num_routes = num_tokens * topk
+    # The local-routes path materializes only the routes it is promised, so
+    # those (not all routes) decide whether its one-hot matmuls are cheap.
+    local_routes = min(max_local_routes or num_routes, num_routes)
+    local_routes_path = (
+        use_ep
+        and use_sparse_core
+        and local_routes <= onehot_moe_permute_threshold
+        and envs.TPU_MOE_OWNER_OUTPUT_MODE.lower() != "on"
+    )
+    if (
+        use_ep and use_sparse_core and num_routes <= onehot_moe_permute_threshold
+    ) or local_routes_path:
         # The one-hot permute and unpermute are matmuls across all tokens, and
         # 0 * NaN == NaN: one token with a non-finite hidden state or routing
         # weight would turn every token's output into NaN. Zero those values
@@ -762,12 +774,7 @@ def fused_moe_func(
             hidden_states, w1, w2, w1_scale, w2_scale, topk_weights, topk_ids
         )
 
-    if (
-        use_ep
-        and use_sparse_core
-        and num_tokens * topk <= onehot_moe_permute_threshold
-        and envs.TPU_MOE_OWNER_OUTPUT_MODE.lower() != "on"
-    ):
+    if local_routes_path:
         return onehot_moe_local_routes(
             hidden_states,
             w1,
@@ -778,9 +785,7 @@ def fused_moe_func(
             w2_bias,
             topk_weights,
             topk_ids,
-            max_local_routes=min(
-                max_local_routes or num_tokens * topk, num_tokens * topk
-            ),
+            max_local_routes=local_routes,
             padded_hidden_size=padded_hidden_size,
             activation=activation,
             rhs_quant_dtype=rhs_quant_dtype,
