@@ -49,13 +49,9 @@ import sys
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 BASELINE_PATH = REPO_ROOT / "tools" / "b023_baseline.txt"
 
-# The directories B023 is switched off for. Mirrors the per-file-ignores
-# entries in pyproject.toml; the two move together.
-KERNELS = (
-    "src/vllm_torchtpu/kernels",
-    "src/vllm_torchtpu/models/kimi_k3/megakernel/common",
-    "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels",
-)
+# The directory B023 is switched off for. Mirrors the per-file-ignores entry
+# in pyproject.toml; the two move together.
+KERNELS = "src/vllm_torchtpu/kernels"
 
 
 def count_findings() -> dict[str, int]:
@@ -76,7 +72,7 @@ def count_findings() -> dict[str, int]:
             "lint.per-file-ignores={}",
             "--output-format",
             "json",
-            *KERNELS,
+            KERNELS,
         ],
         cwd=REPO_ROOT,
         stdout=subprocess.PIPE,

@@ -7,7 +7,3 @@ src/vllm_torchtpu/kernels/experimental/adaptive_fused_moe/kernel.py: 13
 src/vllm_torchtpu/kernels/fused_moe/v2/kernel.py: 13
 src/vllm_torchtpu/kernels/kimi_k3/collectives.py: 107
 src/vllm_torchtpu/kernels/sparse_core/ragged_gather_reduce_v3.py: 2
-src/vllm_torchtpu/models/kimi_k3/megakernel/common/vmem_pool.py: 3
-src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py: 10
-src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/load.py: 2
-src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/prefill_megakernel.py: 84
