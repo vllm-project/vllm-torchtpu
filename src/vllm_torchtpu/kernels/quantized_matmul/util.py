@@ -101,27 +101,47 @@ def xla_quantized_matmul(
         Output of the quantized matmul.
     """
     if quantize_activation:
-        acc_dtype = jnp.float32
-        if quantize_activation and jnp.issubdtype(w_q.dtype, jnp.integer):
-            acc_dtype = jnp.int32
-
         x_q, x_scale = quantize_tensor(x, w_q.dtype)
-        out = jax.lax.dot_general(
-            x_q,
-            w_q,
-            dimension_numbers=(((1,), (0,)), ((), ())),
-            preferred_element_type=acc_dtype,
-        ).astype(jnp.float32)
-        out *= x_scale
-    else:
-        out = jax.lax.dot_general(
-            x,
-            w_q,
-            dimension_numbers=(((1,), (0,)), ((), ())),
-            preferred_element_type=jnp.float32,
-        )
+        return xla_prequantized_matmul(x_q, x_scale, w_q, w_scale, x.dtype)
+    out = jax.lax.dot_general(
+        x,
+        w_q,
+        dimension_numbers=(((1,), (0,)), ((), ())),
+        preferred_element_type=jnp.float32,
+    )
     out *= jnp.expand_dims(w_scale, 0)
     return out.astype(x.dtype)
+
+
+def xla_prequantized_matmul(
+    x_q: jax.Array,
+    x_scale: jax.Array,
+    w_q: jax.Array,
+    w_scale: jax.Array,
+    out_dtype: jnp.dtype,
+) -> jax.Array:
+    """Per-channel quantized matmul on already-quantized activations.
+
+    Args:
+        x_q: Quantized activation ``[num_tokens, n_input_features]``.
+        x_scale: Per-token float32 scale ``[num_tokens, 1]``.
+        w_q: Quantized weight ``[n_input_features, n_output_features]``.
+        w_scale: Per-channel weight scale ``[n_output_features]``.
+        out_dtype: Output floating-point dtype.
+
+    Returns:
+        Matmul result in ``out_dtype``.
+    """
+    acc_dtype = jnp.int32 if jnp.issubdtype(w_q.dtype, jnp.integer) else jnp.float32
+    out = jax.lax.dot_general(
+        x_q,
+        w_q,
+        dimension_numbers=(((1,), (0,)), ((), ())),
+        preferred_element_type=acc_dtype,
+    ).astype(jnp.float32)
+    out *= x_scale
+    out *= jnp.expand_dims(w_scale, 0)
+    return out.astype(out_dtype)
 
 
 def xla_quantized_batched_matmul(

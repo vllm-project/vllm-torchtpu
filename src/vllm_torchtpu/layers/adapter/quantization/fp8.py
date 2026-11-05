@@ -88,6 +88,8 @@ from vllm_torchtpu.layers.adapter.fused_moe import (
 from vllm_torchtpu.layers.adapter.linear_common import (
     KEEP_VLLM_LAYOUT_ATTR,
     WEIGHT_FLIPPED_ATTR,
+    prequantized_matmul,
+    quantize_activation,
     quantized_matmul,
 )
 from vllm_torchtpu.layers.adapter.pipelined_fused_moe import (
@@ -1685,6 +1687,43 @@ class VllmFp8LinearMethodTPU(Fp8LinearMethod):
                 layer.weight_scale,
                 w8a16_max_rows=self.w8a16_max_rows,
             )
+        if bias is not None:
+            out = out + bias
+        return out
+
+    def supports_quantized_input(self, layer: torch.nn.Module, rows: int) -> bool:
+        """Return whether ``apply`` quantizes ``rows`` input rows per token."""
+        layer = cast("TpuLinear", layer)
+        return (
+            layer.weight_scale.dim() == 1
+            and not getattr(layer, KEEP_VLLM_LAYOUT_ATTR, False)
+            and not isinstance(layer, VocabParallelEmbedding)
+            and layer.params_dtype == torch.bfloat16
+            and rows > self.w8a16_max_rows
+        )
+
+    def quantize_input(
+        self, layer: torch.nn.Module, x: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Quantize ``x`` per row using ``layer``'s runtime weight dtype."""
+        layer = cast("TpuLinear", layer)
+        return quantize_activation(x, layer.weight)
+
+    def apply_quantized_input(
+        self,
+        layer: torch.nn.Module,
+        x_q: torch.Tensor,
+        x_scale: torch.Tensor,
+        bias: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Apply the linear contraction to pre-quantized rows and scales."""
+        layer = cast("TpuLinear", layer)
+        out = prequantized_matmul(
+            x_q,
+            x_scale,
+            layer.weight,
+            layer.weight_scale,
+        )
         if bias is not None:
             out = out + bias
         return out

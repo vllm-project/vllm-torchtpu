@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import functools
 from collections.abc import Callable
 from threading import Lock
 
@@ -22,8 +23,16 @@ from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 from torch_tpu._internal import pallas
 
+from vllm_torchtpu.kernels.gelu_quant import (
+    COLUMN_ALIGNMENT as _GELU_QUANT_COLUMN_ALIGNMENT,
+)
+from vllm_torchtpu.kernels.gelu_quant import gelu_and_mul_quantize
 from vllm_torchtpu.kernels.megablox.gmm_v2 import gmm_v2
-from vllm_torchtpu.kernels.quantized_matmul.util import xla_quantized_matmul
+from vllm_torchtpu.kernels.quantized_matmul.util import (
+    quantize_tensor,
+    xla_prequantized_matmul,
+    xla_quantized_matmul,
+)
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
@@ -183,6 +192,169 @@ def quantized_matmul(
     x_2d = x.reshape(-1, x.shape[-1])
     out_2d = _get_quantized_matmul_op()(x_2d, w_q, w_s, w8a16_max_rows)
     return out_2d.reshape(orig_out_shape)
+
+
+_ACTIVATION_QUANT_DTYPES = (torch.float8_e4m3fn, torch.float8_e5m2, torch.int8)
+
+
+def _quantize_activation_jax(
+    x: jax.Array, *, quant_dtype: jnp.dtype
+) -> tuple[jax.Array, jax.Array]:
+    return quantize_tensor(x, quant_dtype)
+
+
+def _make_quantize_activation_op(quant_dtype: torch.dtype) -> Callable:
+    name = str(quant_dtype).removeprefix("torch.")
+    op = pallas.jax_op(
+        f"pallas::quantize_activation_{name}",
+        functools.partial(_quantize_activation_jax, quant_dtype=jnp.dtype(name)),
+    )
+
+    def _fake(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        return (
+            torch.empty(x.shape, dtype=quant_dtype, device=x.device),
+            torch.empty((x.shape[0], 1), dtype=torch.float32, device=x.device),
+        )
+
+    op.register_fake(_fake)
+    return op
+
+
+# Registered at import because Dynamo cannot build custom ops while tracing.
+_quantize_activation_ops = {
+    dtype: _make_quantize_activation_op(dtype) for dtype in _ACTIVATION_QUANT_DTYPES
+}
+
+
+def _prequantized_matmul_bf16_jax(
+    x_q: jax.Array,
+    x_scale: jax.Array,
+    w_q: jax.Array,
+    w_s: jax.Array,
+) -> jax.Array:
+    return xla_prequantized_matmul(x_q, x_scale, w_q, w_s, jnp.bfloat16)
+
+
+_prequantized_matmul_bf16_op = pallas.jax_op(
+    "pallas::prequantized_matmul_bf16",
+    _prequantized_matmul_bf16_jax,
+)
+
+
+def _fake_prequantized_matmul_bf16(
+    x_q: torch.Tensor,
+    x_scale: torch.Tensor,
+    w_q: torch.Tensor,
+    w_s: torch.Tensor,
+) -> torch.Tensor:
+    del x_scale, w_s
+    return torch.empty(
+        x_q.shape[0], w_q.shape[-1], dtype=torch.bfloat16, device=x_q.device
+    )
+
+
+_prequantized_matmul_bf16_op.register_fake(_fake_prequantized_matmul_bf16)
+
+
+def quantize_activation(
+    x: torch.Tensor, w_q: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize ``x`` per row to match ``quantized_matmul(x, w_q, w_s)``."""
+    if x.ndim < 2:
+        raise ValueError(f"Expected at least 2-D activation, got {tuple(x.shape)}")
+    op = _quantize_activation_ops.get(w_q.dtype)
+    if op is None:
+        raise ValueError(f"Unsupported weight dtype for activation quant: {w_q.dtype}")
+    orig_prefix = x.shape[:-1]
+    x_2d = x.reshape(-1, x.shape[-1])
+    x_q_2d, x_scale_2d = op(x_2d)
+    return x_q_2d.reshape(*orig_prefix, x.shape[-1]), x_scale_2d.reshape(
+        *orig_prefix, 1
+    )
+
+
+def prequantized_matmul(
+    x_q: torch.Tensor,
+    x_scale: torch.Tensor,
+    w_q: torch.Tensor,
+    w_s: torch.Tensor,
+) -> torch.Tensor:
+    """Complete a per-channel bf16 quantized matmul from ``quantize_activation``."""
+    if x_q.ndim < 2:
+        raise ValueError(
+            f"Expected at least 2-D quantized activation, got {tuple(x_q.shape)}"
+        )
+    if w_s.dim() != 1:
+        raise ValueError(f"Expected 1-D per-channel weight scale, got {w_s.shape}")
+    if x_q.shape[-1] != w_q.shape[0]:
+        raise ValueError(
+            f"Input hidden dim {x_q.shape[-1]} must match weight hidden dim "
+            f"{w_q.shape[0]}."
+        )
+    orig_prefix = x_q.shape[:-1]
+    x_q_2d = x_q.reshape(-1, x_q.shape[-1])
+    rows = x_q_2d.shape[0]
+    if x_scale.shape not in ((*orig_prefix, 1), (rows, 1)):
+        raise ValueError(
+            f"Scale shape {tuple(x_scale.shape)} does not match quantized input "
+            f"shape {tuple(x_q.shape)}."
+        )
+    out_2d = _prequantized_matmul_bf16_op(x_q_2d, x_scale.reshape(rows, 1), w_q, w_s)
+    return out_2d.reshape(*orig_prefix, w_q.shape[-1])
+
+
+def _gelu_and_mul_quantize_jax(
+    gate_up: jax.Array,
+) -> tuple[jax.Array, jax.Array]:
+    return gelu_and_mul_quantize(gate_up, jnp.float8_e4m3fn)
+
+
+_gelu_and_mul_quantize_pallas_op = pallas.jax_op(
+    "pallas::gelu_and_mul_quantize",
+    _gelu_and_mul_quantize_jax,
+)
+
+
+def _fake_gelu_and_mul_quantize(
+    gate_up: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    d = gate_up.shape[-1] // 2
+    return (
+        torch.empty(
+            (*gate_up.shape[:-1], d),
+            dtype=torch.float8_e4m3fn,
+            device=gate_up.device,
+        ),
+        torch.empty(
+            (*gate_up.shape[:-1], 1),
+            dtype=torch.float32,
+            device=gate_up.device,
+        ),
+    )
+
+
+_gelu_and_mul_quantize_pallas_op.register_fake(_fake_gelu_and_mul_quantize)
+
+
+def gelu_and_mul_quantize_op(
+    gate_up: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Fused tanh GeGLU activation and per-token FP8 quantization custom op."""
+    if gate_up.ndim < 2:
+        raise ValueError(
+            f"Expected at least 2-D gate_up tensor, got {tuple(gate_up.shape)}"
+        )
+    if gate_up.dtype != torch.bfloat16:
+        raise ValueError(
+            f"gelu_and_mul_quantize_op requires bfloat16 input, got {gate_up.dtype}"
+        )
+    width = gate_up.shape[-1]
+    if width <= 0 or width % (2 * _GELU_QUANT_COLUMN_ALIGNMENT) != 0:
+        raise ValueError(
+            f"gate_up trailing dim {width} must be a positive multiple of "
+            f"{2 * _GELU_QUANT_COLUMN_ALIGNMENT}"
+        )
+    return _gelu_and_mul_quantize_pallas_op(gate_up)
 
 
 def _quantized_matmul_fp4_jax(
