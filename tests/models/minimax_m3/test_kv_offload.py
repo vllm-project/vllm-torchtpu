@@ -354,7 +354,7 @@ def test_sliding_window_leaf_needs_the_hybrid_manager_off():
         raiden_store.multi_shapes_leaf_block_shape(spec)
 
 
-def _offloading_spec(kv_cache_config, *, world_size: int = 4):
+def _offloading_spec(kv_cache_config, *, world_size: int = 4, extra=None):
     """The real connector spec over stub engine configs; only the geometry,
     host sizing and namespace inputs are real."""
     from unittest.mock import MagicMock
@@ -362,7 +362,10 @@ def _offloading_spec(kv_cache_config, *, world_size: int = 4):
     raiden_store._all_ranks_kv_bytes_per_block = None
     bytes_per_block = raiden_store._worker_kv_bytes_per_block(kv_cache_config)
     config = SimpleNamespace(
-        extra_config={"cpu_bytes_to_use": 100 * world_size * bytes_per_block},
+        extra_config={
+            "cpu_bytes_to_use": 100 * world_size * bytes_per_block,
+            **(extra or {}),
+        },
         enable_kv_cache_events=False,
         groups=[SimpleNamespace(group_id=0, tokens_per_block=BLOCK_SIZE)],
         cache=SimpleNamespace(tokens_per_hash=BLOCK_SIZE, blocks_per_chunk=1),
@@ -406,3 +409,89 @@ def test_dspark_connector_spec_builds_in_scheduler_and_workers():
         ).key_namespace
         != specs[1].key_namespace
     )
+
+
+def test_draft_kv_layer_names_are_the_promoted_drafter_leaves():
+    worker_config = _dspark_worker_kv_cache_config()
+    names = raiden_store.draft_kv_layer_names(worker_config)
+    assert names == set(_draft_layer_specs())
+    # No drafter, nothing to skip.
+    assert raiden_store.draft_kv_layer_names(_worker_kv_cache_config()) == set()
+    assert raiden_store._worker_draft_kv_bytes_per_block(worker_config) == (
+        NUM_DRAFT_LAYERS * _draft_page_bytes()
+    )
+
+
+def test_dspark_worker_skips_draft_arrays_with_skip_draft_kv():
+    worker_config = _dspark_worker_kv_cache_config()
+    kv_caches = _allocate_like_tpu_runner(worker_config)
+    captured = []
+    connector = SimpleNamespace(
+        connector_worker=SimpleNamespace(
+            kv_cache_config=worker_config, _init_worker=captured.append
+        ),
+        _skip_draft_kv=True,
+    )
+    TPURaidenOffloadingConnector.register_kv_caches(connector, kv_caches)
+    (canonical,) = captured
+    assert len(canonical.tensors) == 2 * NUM_LAYERS
+    assert sum(t.page_size_bytes for t in canonical.tensors) == (
+        raiden_store._worker_kv_bytes_per_block(worker_config)
+        - raiden_store._worker_draft_kv_bytes_per_block(worker_config)
+    )
+    target_ptrs = {
+        cache.untyped_storage().data_ptr()
+        for name, cache in kv_caches.items()
+        if not name.startswith("draft_model.")
+    }
+    assert {t.tensor.untyped_storage().data_ptr() for t in canonical.tensors} == (
+        target_ptrs
+    )
+
+
+def test_skip_draft_kv_sizes_host_pool_without_the_drafter():
+    worker_config = _dspark_worker_kv_cache_config()
+    scheduler_config = generate_scheduler_kv_cache_config([worker_config])
+    world = 4
+    full = raiden_store._worker_kv_bytes_per_block(worker_config)
+    draft = raiden_store._worker_draft_kv_bytes_per_block(worker_config)
+    for cfg in (worker_config, scheduler_config):
+        base = _offloading_spec(cfg, world_size=world)
+        # Record as the engine core / workers do before the spec is built.
+        raiden_store.record_all_ranks_kv_bytes_per_block([worker_config] * world)
+        spec = _offloading_spec_recorded(cfg, world, {"skip_draft_kv": True})
+        assert base.skip_draft_kv is False and spec.skip_draft_kv is True
+        assert spec.offload_logical_blocks_capacity == (
+            100 * world * full // (world * (full - draft))
+        )
+        assert (
+            spec.key_namespace
+            != _offloading_spec_recorded(cfg, world, {}).key_namespace
+        )
+
+
+def test_skip_draft_kv_needs_a_drafter():
+    worker_config = _worker_kv_cache_config()
+    raiden_store.record_all_ranks_kv_bytes_per_block([worker_config] * 4)
+    with pytest.raises(ValueError, match="no drafter"):
+        _offloading_spec_recorded(worker_config, 4, {"skip_draft_kv": "true"})
+
+
+def _offloading_spec_recorded(kv_cache_config, world_size, extra):
+    """`_offloading_spec` without resetting the recorded all-ranks bytes."""
+    saved = raiden_store._all_ranks_kv_bytes_per_block
+    saved_draft = raiden_store._all_ranks_draft_kv_bytes_per_block
+    orig = raiden_store.TPURaidenStoreOffloadingSpec
+
+    def build(config, vllm_config, kv_cache_config):
+        raiden_store._all_ranks_kv_bytes_per_block = saved
+        raiden_store._all_ranks_draft_kv_bytes_per_block = saved_draft
+        return orig(config, vllm_config, kv_cache_config)
+
+    from unittest.mock import patch
+
+    with patch.object(raiden_store, "TPURaidenStoreOffloadingSpec", build):
+        spec = _offloading_spec(kv_cache_config, world_size=world_size, extra=extra)
+    if extra.get("skip_draft_kv") not in (None, False, "false"):
+        assert spec.vllm_config.speculative_config is not None
+    return spec
