@@ -48,6 +48,7 @@ from vllm.v1.worker.worker_base import CompilationTimes, WorkerBase
 import vllm_torchtpu.distributed.utils as dist_utils
 from vllm_torchtpu import envs, profiler_trace, utils
 from vllm_torchtpu.distributed.pcp_rank_order import pcp_topology_order
+from vllm_torchtpu.distributed.tcp_store_wait import wait_for_store_port
 from vllm_torchtpu.layers.adapter.attention import TPU_STR_DTYPE_TO_TORCH_DTYPE
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.runner.tpu_pooling import compute_pooling_kv_cache_cap_bytes
@@ -433,7 +434,7 @@ class TPUWorker(WorkerBase):
         tpu_platform = cast(TpuPlatform, current_platform)
         dist_backend = tpu_platform.get_worker_distributed_backend(dist_world_size)
 
-        with set_current_vllm_config(self.vllm_config):
+        with set_current_vllm_config(self.vllm_config), wait_for_store_port():
             init_distributed_environment(
                 world_size=init_world,
                 rank=init_rank,
@@ -474,10 +475,17 @@ class TPUWorker(WorkerBase):
         is_last_rank = pp_group.is_last_rank
 
         # TODO: Fix device assignment
+        runner_cls = TPUModelRunner
+        from vllm_torchtpu.megakernel import backend as megakernel
+
+        if megakernel.role(self.vllm_config) is not None:
+            from vllm_torchtpu.megakernel.runner import MegakernelModelRunner
+
+            runner_cls = MegakernelModelRunner
         # WorkerBase declares `nn.Module | None`; this worker always holds a
         # TPUModelRunner from here on.
         # pyrefly: ignore[bad-override-mutable-attribute]
-        self.model_runner: TPUModelRunner = TPUModelRunner(
+        self.model_runner: TPUModelRunner = runner_cls(
             self.vllm_config,
             self.devices[0],
             profiler_rank=self.profile_rank,

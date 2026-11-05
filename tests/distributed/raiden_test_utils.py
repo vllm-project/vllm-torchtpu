@@ -71,22 +71,36 @@ class FakeTensor:
 KIMI_KV_ITEMSIZE = {"bfloat16": 2, "float8_e4m3fn": 1}
 
 
-def kimi_pool_manifest(heads, pool=None, kv_dtype="bfloat16"):
-    """The stock full K3 unified pool for a local KDA head count.
+def kimi_pool_manifest(
+    heads,
+    pool=None,
+    kv_dtype="bfloat16",
+    *,
+    sub_blocks=1,
+    per_layer_tags=False,
+    rows=None,
+    index=None,
+):
+    """The stock full K3 unified pool for a local KDA head count; with
+    ``sub_blocks``, blocks stacking that many such blocks.
 
     ``kv_dtype`` is the pool's attention KV dtype. The KDA state regions are
     sized the same for either: conv stays bf16 and SSM stays f32.
+    ``rows``: pool rows per decode-sized block (default: the KDA state's).
+    ``index``: Kimi-K3.1 index-key caches by name, bound beside the pool and
+    registered as raw tensors.
     """
     from vllm_torchtpu.distributed.kv_transfer.raiden import pool_manifest as rpm
     from vllm_torchtpu.gdn_pool_layout import derive_pooled_gdn_state_layout
 
-    state_shape = ((3, 3, heads, 128), (heads, 128, 128))
+    stacked = heads * sub_blocks
+    state_shape = ((3, 3, stacked, 128), (stacked, 128, 128))
     layout = derive_pooled_gdn_state_layout(
         ssm_bytes=heads * 128 * 128 * 4,
         conv_bytes=3 * 3 * heads * 128 * 4,
         token_bytes=2560,
     )
-    rows = layout.required_tokens
+    rows = (layout.required_tokens if rows is None else rows) * sub_blocks
     if pool is None:
         itemsize = KIMI_KV_ITEMSIZE[kv_dtype]
         pool = FakeTensor(
@@ -110,11 +124,14 @@ def kimi_pool_manifest(heads, pool=None, kv_dtype="bfloat16"):
             ),
         ),
     ]
+    index = dict(index or {})
     return rpm.build_kimi_k3_pool_manifest(
-        named_kv_caches={state_layer: [pool], fa_layer: pool},
+        named_kv_caches={state_layer: [pool], fa_layer: pool, **index},
         kv_cache_groups=groups,
-        raw_tensors=[pool],
+        raw_tensors=[pool, *{id(t): t for t in index.values()}.values()],
         mamba_group_ordinal_by_layer={state_layer: 0},
+        per_layer_tags=per_layer_tags,
+        sub_blocks=sub_blocks,
     )
 
 

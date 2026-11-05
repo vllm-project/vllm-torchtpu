@@ -52,6 +52,18 @@ if TYPE_CHECKING:
     TPU_RAIDEN_KIMIK3_ADMISSION: bool = False
     TPU_RAIDEN_GLM_ADMISSION: bool = False
     TPU_RAIDEN_DSV4_ADMISSION: bool = False
+    TPU_K3_MOE_REDUCE_DTYPE: str = "float32"
+    TPU_K3_MLA_SPARSE_PREFILL: str = "off"
+    TPU_K3_DSA_SELECT_PACK16: bool = False
+    TPU_K3_DCP_HOST_COMBINE: bool = False
+    TPU_K3_DSA_SELECT_SORT: bool = False
+    TPU_K3_DSA_SELECT_STOP: bool = False
+    TPU_K3_KDA_BRANCH_FIRST: bool = False
+    TPU_K3_DSA_SCORE_BLOCK_MAJOR: bool = False
+    TPU_K3_DSA_SELECT_DIGIT_BITS: int = 0
+    TPU_K3_DSA_SELECT_COUNT_UNROLL: int = 1
+    TPU_K3_DSA_SELECT_PACKED_UNROLL: int = 0
+    TPU_K3_DCP_QUERY_WIRE: str = "bf16"
     TPU_KV_RESHARD_TRANSPORT: str = "zmq"
     TPU_RAIDEN_CONTROLLER_ADDRESS: str = ""
     TPU_RAIDEN_JOB_NAME: str = ""
@@ -561,6 +573,58 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # indexer, HCA, SWA and the compressor states. Every other model here has
     # exactly one.
     "TPU_RAIDEN_DSV4_ADMISSION": env_bool("TPU_RAIDEN_DSV4_ADMISSION"),
+    # Running sum dtype of both Kimi-K3 prefill MoE reduce-scatter rings:
+    # float32 (default) or bfloat16, which halves ring bytes but rounds every hop.
+    "TPU_K3_MOE_REDUCE_DTYPE": env_str("TPU_K3_MOE_REDUCE_DTYPE", "float32"),
+    # Kimi-K3.1 prefill MLA attention: off (default: the masked flash over the
+    # whole context) or rows (each rank attends its own rows at every head over
+    # their selected keys, gathered on the SparseCore; short contexts keep the
+    # masked flash); rows_fast also selects with the head-major head sums, the
+    # per-lane bisection and 32-row steps where they fit (the same words as the
+    # decoder-order selection).
+    "TPU_K3_MLA_SPARSE_PREFILL": env_with_choices(
+        "TPU_K3_MLA_SPARSE_PREFILL",
+        "off",
+        ["off", "rows", "rows_fast"],
+        case_sensitive=False,
+    ),
+    # Kimi-K3.1 decode: the eight-row select sends its digit counts as
+    # 16-bit halves of int32 lanes in one flat exchange (half the bytes);
+    # the selection is unchanged. Set it on the decode engine.
+    "TPU_K3_DSA_SELECT_PACK16": env_bool("TPU_K3_DSA_SELECT_PACK16", default=False),
+    # Kimi-K3 decode: the chunked DCP attention calls (more than eight rows a
+    # DCP group: DCP32, or attention DP2's DCP16) combine their partials in two
+    # stages, merging each host's eight before the exchange across hosts (one
+    # more BF16 rounding of the partials). Set it on the decode engine.
+    "TPU_K3_DCP_HOST_COMBINE": env_bool("TPU_K3_DCP_HOST_COMBINE", default=False),
+    # Kimi-K3.1 decode: the select's virtual rows in position order at 16
+    # rows and up (one permutation a step), so each 8-row block's passes run
+    # to bounds of similar rows; the selection is unchanged (off under
+    # attention DP). Set it on the decode engine.
+    "TPU_K3_DSA_SELECT_SORT": env_bool("TPU_K3_DSA_SELECT_SORT", default=False),
+    # Kimi-K3.1 decode: the select stops its rounds once every row is
+    # decided (its count at or above its bin's lower edge is exactly k); the
+    # selection is unchanged. Set it on the decode engine.
+    "TPU_K3_DSA_SELECT_STOP": env_bool("TPU_K3_DSA_SELECT_STOP", default=False),
+    "TPU_K3_KDA_BRANCH_FIRST": env_bool("TPU_K3_KDA_BRANCH_FIRST", default=False),
+    "TPU_K3_DSA_SCORE_BLOCK_MAJOR": env_bool("TPU_K3_DSA_SCORE_BLOCK_MAJOR", default=False),
+    # Kimi-K3.1 decode: the eight-row select's digit width (6, 7 or 8 bits a
+    # round; 0 keeps 8); the selection is unchanged. Set it on the decode engine.
+    "TPU_K3_DSA_SELECT_DIGIT_BITS": env_int("TPU_K3_DSA_SELECT_DIGIT_BITS", 0),
+    # Kimi-K3.1 decode: the select's count pass at eight rows and below, key
+    # planes a loop trip (1, 2 or 4); the selection is unchanged. Set it on the
+    # decode engine.
+    "TPU_K3_DSA_SELECT_COUNT_UNROLL": env_int("TPU_K3_DSA_SELECT_COUNT_UNROLL", 1),
+    # Kimi-K3.1 decode: the select at 16 and 32 rows counts in packed 8-bit
+    # counters, this many key planes a loop trip (0: a compare per threshold;
+    # 2 or 4); the selection is unchanged. Set it on the decode engine.
+    "TPU_K3_DSA_SELECT_PACKED_UNROLL": env_int("TPU_K3_DSA_SELECT_PACKED_UNROLL", 0),
+    # Kimi-K3 decode: the DCP query all-gathers' wire (KernelConfig.dcp_query_wire):
+    # bf16 (default; each receiver quantizes to FP8 exactly as the sender would)
+    # or fp8 (FP8 query/scale packets).
+    "TPU_K3_DCP_QUERY_WIRE": env_with_choices(
+        "TPU_K3_DCP_QUERY_WIRE", "bf16", ["bf16", "fp8"], case_sensitive=False
+    ),
     # Controller-driven PCP->DP pool resharding. The default preserves
     # the existing v1 connector protocol; selecting ``raiden`` enables
     # the fail-closed controller path.

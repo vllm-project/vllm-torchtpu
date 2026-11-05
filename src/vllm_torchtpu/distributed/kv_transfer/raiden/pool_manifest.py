@@ -632,6 +632,8 @@ def _pooled_kda_regions(
     spec: Any,
     row_bytes: int,
     page_bytes: int,
+    extra_conv_rows: int = 0,
+    sub_blocks: int = 1,
 ) -> dict[str, tuple[int, tuple[RegionSpec, ...]]]:
     """Expose KDA's live state through Qwen's two state pool tags.
 
@@ -642,6 +644,15 @@ def _pooled_kda_regions(
     retains aligned, padded source-head shards in rank order. The KDA pool
     adapter restores logical tap/QKV/head order on load and reverses it on
     store, so each source shard transfers as one contiguous byte range.
+
+    ``extra_conv_rows`` extends the convolution region over that many rows
+    after its taps: the megakernel's DSpark draft ring
+    (``megakernel.kimi_k3.layout``), carried with the state.
+
+    ``sub_blocks``: the page stacks that many equal state blocks, each laid
+    out as above over an equal share of the spec's state (a prefill rank
+    holding the states of several decode ranks); each region then has one
+    unit per stacked block.
     """
     shapes = tuple(getattr(spec, "shapes", ()))
     dtypes = tuple(getattr(spec, "dtypes", ()))
@@ -651,6 +662,18 @@ def _pooled_kda_regions(
     try:
         conv_bytes = math.prod(shapes[0]) * pooled_gdn_state_itemsize(conv_dtype)
         ssm_bytes = math.prod(shapes[1]) * pooled_gdn_state_itemsize(ssm_dtype)
+        if (
+            sub_blocks <= 0
+            or conv_bytes % sub_blocks
+            or ssm_bytes % sub_blocks
+            or page_bytes % (sub_blocks * row_bytes)
+        ):
+            raise ValueError(
+                f"KDA state and page do not split into {sub_blocks} state blocks"
+            )
+        conv_bytes //= sub_blocks
+        ssm_bytes //= sub_blocks
+        page_bytes //= sub_blocks
         layout = derive_pooled_gdn_state_layout(
             ssm_bytes=ssm_bytes,
             conv_bytes=conv_bytes,
@@ -658,27 +681,27 @@ def _pooled_kda_regions(
         )
     except ValueError as exc:
         raise ManifestError(str(exc)) from exc
-    if layout.required_bytes > page_bytes:
+    if layout.required_bytes + extra_conv_rows * row_bytes > page_bytes:
         raise ManifestError(
             "KDA state exceeds its pooled page: "
             f"state={layout.required_bytes}, "
+            f"extra={extra_conv_rows * row_bytes}, "
             f"page={page_bytes}"
         )
     if str(ssm_dtype) != "torch.float32" or row_bytes % 4:
         raise ManifestError("KDA transfer requires f32 SSM and word-aligned pool rows")
+    conv_rows = layout.conv_tokens + extra_conv_rows
+    if sub_blocks == 1:
+        ssm = RegionSpec("gdn_ssm", 0, ssm_bytes, ssm_bytes, 1)
+        conv = RegionSpec("kda_conv_rank_blocks", 0, row_bytes, row_bytes, conv_rows)
+    else:
+        ssm = RegionSpec("gdn_ssm", 0, page_bytes, ssm_bytes, sub_blocks)
+        conv = RegionSpec(
+            "kda_conv_rank_blocks", 0, page_bytes, conv_rows * row_bytes, sub_blocks
+        )
     return {
-        TAG_GDN_SSM: (
-            0,
-            (RegionSpec("gdn_ssm", 0, ssm_bytes, ssm_bytes, 1),),
-        ),
-        TAG_GDN_CONV: (
-            layout.ssm_tokens * row_bytes,
-            (
-                RegionSpec(
-                    "kda_conv_rank_blocks", 0, row_bytes, row_bytes, layout.conv_tokens
-                ),
-            ),
-        ),
+        TAG_GDN_SSM: (0, (ssm,)),
+        TAG_GDN_CONV: (layout.ssm_tokens * row_bytes, (conv,)),
     }
 
 
@@ -986,6 +1009,13 @@ def build_qwen35_pool_manifest(
 # own dtypes inside the pool (gdn_pool_layout), whichever of these it has.
 _KIMI_POOL_DTYPE_TAGS = frozenset({"bfloat16", "float8_e4m3fn"})
 
+# Kimi-K3.1's index-key cache: one block-major uint8 tensor bound under every
+# MLA layer's index name, outside the KV cache groups.
+KIMI_INDEX_SUFFIX = ".self_attn.indexer.k_cache"
+# A decode index page: its tokens' 128-byte keys, then 32 rows of scales.
+KIMI_INDEX_ROW_BYTES = 128
+KIMI_INDEX_SCALE_ROWS = 32
+
 
 def build_kimi_k3_pool_manifest(
     *,
@@ -993,12 +1023,33 @@ def build_kimi_k3_pool_manifest(
     kv_cache_groups: Sequence[Any],
     raw_tensors: Sequence[Any],
     mamba_group_ordinal_by_layer: Mapping[str, int] | None = None,
+    extra_state_rows: int = 0,
+    per_layer_tags: bool = False,
+    sub_blocks: int = 1,
 ) -> PoolManifest:
     """Describe K3's packed MLA/KDA rows using the shared hybrid pool tags.
 
     Only the layout differs from Qwen: storage binding, pool admission and
     Stage-3 transfers all use the same model-independent machinery.
+    ``extra_state_rows``: state-block rows after the conv taps that travel
+    with them (see ``_pooled_kda_regions``); both peers must agree.
+    ``per_layer_tags`` suffixes every tag with the layer index, as in
+    ``build_qwen35_pool_manifest``. ``sub_blocks``: every block stacks that
+    many decode-sized blocks (see ``_pooled_kda_regions``). Kimi-K3.1's
+    index-key cache adds one ``dsa.idx`` pool per MLA layer (see
+    ``_kimi_index_entries``).
     """
+    index_caches = {
+        name: cache
+        for name, cache in named_kv_caches.items()
+        if name.endswith(KIMI_INDEX_SUFFIX)
+    }
+    named_kv_caches = {
+        name: cache
+        for name, cache in named_kv_caches.items()
+        if name not in index_caches
+    }
+    fa_block_sizes: set[int] = set()
     entries: list[tuple[Any, PoolEntry]] = []
     for layer_name in _ordered_layers(named_kv_caches):
         cache = named_kv_caches[layer_name]
@@ -1021,7 +1072,12 @@ def build_kimi_k3_pool_manifest(
         num_blocks, rows, packing, width = shape
         # The packing axis fills one 32-bit word, so a packed row is
         # 4 * width bytes for either dtype and only its token count differs.
-        if min(shape) <= 0 or packing * _element_size(tensor) != 4:
+        if (
+            min(shape) <= 0
+            or packing * _element_size(tensor) != 4
+            or sub_blocks <= 0
+            or rows % sub_blocks
+        ):
             raise ManifestError(
                 f"Kimi cache {layer_name} has invalid packed-row geometry"
             )
@@ -1045,7 +1101,11 @@ def build_kimi_k3_pool_manifest(
             )
         if is_state:
             layouts = _pooled_kda_regions(
-                spec=spec, row_bytes=row_bytes, page_bytes=page_bytes
+                spec=spec,
+                row_bytes=row_bytes,
+                page_bytes=page_bytes,
+                extra_conv_rows=extra_state_rows,
+                sub_blocks=sub_blocks,
             )
             suffix = _state_tag_suffix(layer_name, mamba_group_ordinal_by_layer)
             tags = (TAG_GDN_CONV, TAG_GDN_SSM)
@@ -1055,6 +1115,7 @@ def build_kimi_k3_pool_manifest(
             }
             suffix = ""
             tags = (TAG_FA,)
+            fa_block_sizes.add(rows * packing)
         for tag in tags:
             offset, regions = layouts[tag]
             entries.append(
@@ -1072,7 +1133,96 @@ def build_kimi_k3_pool_manifest(
                     ),
                 )
             )
+    if index_caches:
+        if len(fa_block_sizes) != 1:
+            raise ManifestError(
+                "Kimi-K3.1's index-key cache needs one MLA block size, found "
+                f"{sorted(fa_block_sizes)}"
+            )
+        (fa_block_size,) = fa_block_sizes
+        entries += _kimi_index_entries(
+            index_caches,
+            raw_tensors,
+            fa_page_tokens=fa_block_size // sub_blocks,
+            sub_blocks=sub_blocks,
+            num_blocks=entries[0][1].num_blocks,
+        )
+    if per_layer_tags:
+        tagged = []
+        for tensor, entry in entries:
+            layer_index = layer_index_from_name(entry.layer_name)
+            if layer_index is None:
+                raise ManifestError(
+                    f"per-layer pool tags need a layer index in {entry.layer_name}"
+                )
+            entry = dataclasses.replace(entry, tag=layer_tag(entry.tag, layer_index))
+            tagged.append((tensor, entry))
+        entries = tagged
     return _bind_pool_manifest(entries, raw_tensors)
+
+
+def _kimi_index_entries(
+    index_caches: Mapping[str, Any],
+    raw_tensors: Sequence[Any],
+    fa_page_tokens: int,
+    sub_blocks: int,
+    num_blocks: int,
+) -> list[tuple[Any, PoolEntry]]:
+    """One ``dsa.idx`` pool per MLA layer of Kimi-K3.1's index-key cache.
+
+    The cache is one ``[blocks, layers, sub_blocks * (P + 32), 128]`` uint8
+    tensor: block ``b``'s row holds each layer's ``sub_blocks`` decode pages
+    of ``P = fa_page_tokens`` key rows and 32 scale rows, in layer order.
+    """
+    names = _ordered_layers(index_caches)
+    tensors = {id(cache): cache for cache in index_caches.values()}
+    if len(tensors) != 1:
+        raise ManifestError(
+            "Kimi-K3.1's index-key cache must be one tensor under every MLA "
+            f"layer, found {len(tensors)}"
+        )
+    (tensor,) = tensors.values()
+    if _raw_index_for(tensor, raw_tensors) is None:
+        raise ManifestError(
+            "Kimi-K3.1's index-key cache is not among the raw KV tensors"
+        )
+    shape = tuple(int(dim) for dim in getattr(tensor, "shape", ()))
+    page_rows = fa_page_tokens + KIMI_INDEX_SCALE_ROWS
+    expected = (
+        num_blocks,
+        len(names),
+        sub_blocks * page_rows,
+        KIMI_INDEX_ROW_BYTES,
+    )
+    if (
+        fa_page_tokens <= 0
+        or _dtype_tag(tensor) != "uint8"
+        or _element_size(tensor) != 1
+        or shape != expected
+    ):
+        raise ManifestError(
+            f"Kimi-K3.1's index-key cache must be uint8 {list(expected)}, "
+            f"got {_dtype_tag(tensor)} {list(shape)}"
+        )
+    rows = shape[2]
+    page_bytes = page_rows * KIMI_INDEX_ROW_BYTES
+    region = RegionSpec("idx_pages", 0, page_bytes, page_bytes, sub_blocks)
+    return [
+        (
+            tensor,
+            PoolEntry(
+                tag=TAG_DSA_IDX,
+                layer_name=name,
+                storage_index=-1,
+                base_offset_bytes=slot * rows * KIMI_INDEX_ROW_BYTES,
+                block_stride_bytes=len(names) * rows * KIMI_INDEX_ROW_BYTES,
+                num_blocks=num_blocks,
+                regions=(region,),
+                dtype_tag="uint8",
+            ),
+        )
+        for slot, name in enumerate(names)
+    ]
 
 
 def _pool_layer_index(

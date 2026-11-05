@@ -1,0 +1,390 @@
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Kimi-K3 as a megakernel program: the prefill role's :class:`KimiPrefiller`
+or the decode role's :class:`KimiDecoder`, and what they support.
+
+The K3 programs have no vLLM dependencies; ``megakernel.runner`` builds them
+from vLLM's configuration and the standalone tools build them directly.
+"""
+
+from __future__ import annotations
+
+import importlib
+from pathlib import Path
+from typing import Any
+
+from vllm_torchtpu.megakernel.config import MegakernelEngineConfig
+from vllm_torchtpu.megakernel.program import Capabilities
+
+TP_SIZE = 32
+DCP_SIZE = 32
+HIDDEN_SIZE = 7168
+VOCAB = 163840  # tokens; vocabulary-sharded 5120 per TP rank
+DRAFT_TOKENS = 7  # DSpark: the verify is the anchor and 7 drafts
+SPEC_BATCHES = (1, 2, 4, 8, 16)  # the batched speculation's compiled request counts
+# Attention DP2's compiled request counts: half of each are one group's.
+DP_SPEC_BATCHES = (2, 4, 8, 16, 32)
+MAX_STEP_TOKENS = 8192  # the prefill's largest window
+# The prefill as pipeline stages: one host's 8 cores per stage (kimi_k3.stage).
+STAGES = 4
+STAGE_CORES = 8
+# Sampling parameters the ops implement (beyond greedy): temperature, top-p,
+# top-k and a per-request seed, on both roles.
+SAMPLING = frozenset({"temperature", "top_p", "top_k", "seed"})
+
+_SPEC_SUPPORT = (
+    f"3 or {DRAFT_TOKENS} drafts at batches 1-8, and 3 at batches "
+    f"9-{max(SPEC_BATCHES)} (attention DP2: 9-{max(DP_SPEC_BATCHES)}) through "
+    f"the compiled speculation batches {SPEC_BATCHES} (attention DP2: "
+    f"{DP_SPEC_BATCHES}; up to --max-num-seqs), 0 anywhere"
+)
+
+
+def kernel_modules(*names: str) -> list[Any]:
+    """Import ``vllm_torchtpu.megakernel.kimi_k3.kernels.<name>`` for each name."""
+    return [
+        importlib.import_module(f"vllm_torchtpu.megakernel.kimi_k3.kernels.{name}")
+        for name in names
+    ]
+
+
+def supports_spec_tokens(batch: int, drafts: int, attention_dp: int = 1) -> bool:
+    """Widths supported by the single and batched verifier/drafter (under
+    attention DP2 three drafts up to 32 requests: a 128-row verify, drafted
+    in parts)."""
+    largest = max(DP_SPEC_BATCHES if attention_dp > 1 else SPEC_BATCHES)
+    return drafts == 0 or (
+        1 <= batch <= largest
+        and (drafts == 3 or (batch <= 8 and drafts == DRAFT_TOKENS))
+    )
+
+
+def spec_tokens_per_batch(config: MegakernelEngineConfig) -> tuple[int, ...] | None:
+    """The drafts vLLM schedules at every decoding batch size: a dense table
+    whose index ``b`` holds batch size ``b``'s count (``[0]`` unused), or
+    None when the decoder does not speculate.
+
+    vLLM's own schedule semantics (``build_dynamic_sd_schedule_lookup``): a
+    range covers its batch sizes, a gap or the tail carries the previous
+    range's count forward, every count clamps to ``num_speculative_tokens``,
+    and without a schedule every batch size gets ``num_speculative_tokens``.
+    Raises ``NotImplementedError`` for a schedule the kernels can't run.
+    """
+    if config.role != "decode" or not config.num_speculative_tokens:
+        return None
+    schedule = config.num_speculative_tokens_per_batch_size
+    num_spec, max_seqs = config.num_speculative_tokens, config.max_num_seqs
+    dense = [0] * (max_seqs + 1)
+    if schedule is None:
+        for b in range(1, max_seqs + 1):
+            dense[b] = num_spec
+    else:
+        entries = sorted((int(lo), int(hi), int(k)) for lo, hi, k in schedule)
+        previous_end = 0
+        for lo, hi, k in entries:
+            if lo <= 0 or hi < lo or k < 0:
+                raise NotImplementedError(
+                    "num_speculative_tokens_per_batch_size entries are "
+                    f"(min_batch, max_batch, drafts) with 1 <= min <= max and "
+                    f"drafts >= 0, not ({lo}, {hi}, {k})"
+                )
+            if lo <= previous_end:
+                raise NotImplementedError(
+                    "num_speculative_tokens_per_batch_size ranges must be "
+                    f"non-overlapping: ({lo}, {hi}, {k})"
+                )
+            previous_end = hi
+        if entries[0][0] != 1:
+            raise NotImplementedError(
+                "num_speculative_tokens_per_batch_size's first range must "
+                f"start at batch size 1: {entries[0]}"
+            )
+        next_b, last_k = 1, 0
+        for lo, hi, k in entries:
+            for b in range(next_b, min(lo, max_seqs + 1)):  # a gap carries forward
+                dense[b] = min(num_spec, last_k)
+            for b in range(max(lo, next_b), min(hi, max_seqs) + 1):
+                dense[b] = min(num_spec, k)
+            next_b, last_k = max(next_b, hi + 1), k
+            if next_b > max_seqs:
+                break
+        for b in range(next_b, max_seqs + 1):  # and so does the tail
+            dense[b] = min(num_spec, last_k)
+    for b in range(1, max_seqs + 1):
+        k = dense[b]
+        if k == 0:
+            continue
+        supported = supports_spec_tokens(b, k, config.attention_dp)
+        if b > 1 and supported and config.attention_dp == 1:
+            # A batched verify holds b requests only through a compiled
+            # speculation batch, itself no wider than --max-num-seqs. (Attention
+            # DP's plan rows, a DP batch size, hold every DP_SPEC_BATCHES entry
+            # up to --max-num-seqs.)
+            supported = any(b <= s <= max_seqs for s in SPEC_BATCHES)
+        if not supported:
+            given = (
+                "None: num_speculative_tokens everywhere"
+                if schedule is None
+                else str(schedule)
+            )
+            raise NotImplementedError(
+                f"DSpark on the K3 decoder supports {_SPEC_SUPPORT}; the "
+                f"schedule gives {k} drafts at batch size {b} "
+                f"(num_speculative_tokens_per_batch_size={given}; "
+                f"--max-num-seqs {max_seqs})"
+            )
+    return tuple(dense)
+
+
+def recurrent_state_dtype(cache_dtype: str) -> str:
+    """Decode bank storage; auto preserves FP32 independently of model dtype.
+
+    Prefill and the connector retain their FP32 state format. The importer
+    casts that state once to the decoder bank's dtype.
+    """
+    if cache_dtype not in ("auto", "float32", "bfloat16"):
+        raise ValueError(
+            "K3 megakernel --mamba-ssm-cache-dtype supports auto, float32, "
+            f"or bfloat16, not {cache_dtype!r}"
+        )
+    return "float32" if cache_dtype == "auto" else cache_dtype
+
+
+def check(config: MegakernelEngineConfig) -> None:
+    """Raise ``NotImplementedError`` for a configuration the K3 programs
+    do not implement."""
+    recurrent_state_dtype(config.mamba_ssm_cache_dtype)
+    if config.dsa is not None:
+        if config.synthetic_indexer is None and not config.presharded_indexer:
+            raise NotImplementedError(
+                "Kimi-K3.1 needs indexer weights: a pre-shard with the "
+                "indexer families, or synthetic_indexer in "
+                "--model-loader-extra-config"
+            )
+        if config.attention_dp > 2:
+            raise NotImplementedError("Kimi-K3.1 (DSA) decodes at attention DP1 or DP2")
+        drafts = config.num_speculative_tokens or 0
+        rows = config.max_num_seqs * (1 + drafts)
+        most = 128 if 0 < drafts <= 3 else 64
+        if config.attention_dp > 1 and (rows > most or 64 < rows < 128):
+            # Verify rows count as rows: a DP group's 64 verify rows of up to
+            # 4 a sequence select in two passes. B96's 48 group rows are not a
+            # scorer batch class.
+            raise NotImplementedError(
+                "Kimi-K3.1 (DSA) decodes at most 64 rows at attention DP2 "
+                "(128 with 1-3 drafts)"
+            )
+    if config.role == "prefill" and config.mamba_ssm_cache_dtype == "bfloat16":
+        raise NotImplementedError(
+            "K3 megakernel --mamba-ssm-cache-dtype bfloat16 is decode-only; "
+            "the prefill worker requires auto or float32 for its FP32 state "
+            "and transfer format"
+        )
+    if config.role not in ("prefill", "decode"):
+        raise NotImplementedError(
+            f"the K3 megakernel serves one role of a P/D pair, not {config.role!r}"
+        )
+    if config.pipeline_parallel_size > 1:
+        _check_stage(config)
+        return
+    if config.tensor_parallel_size != TP_SIZE:
+        raise NotImplementedError(
+            f"the K3 megakernel needs --tensor-parallel-size {TP_SIZE}"
+        )
+    if config.attention_dp not in (1, 2) or (
+        config.attention_dp > 1 and config.role != "decode"
+    ):
+        raise NotImplementedError(
+            "the K3 decoder runs attention_dp 1 or 2; the prefill runs 1"
+        )
+    dcp = DCP_SIZE // config.attention_dp
+    if config.decode_context_parallel_size != dcp:
+        raise NotImplementedError(
+            f"the K3 megakernel needs --decode-context-parallel-size {dcp}"
+            + (f" under attention_dp {config.attention_dp}" if dcp != DCP_SIZE else "")
+        )
+    from vllm_torchtpu.megakernel.kimi_k3.layout import cache_layout
+
+    layout = cache_layout(config.kv_cache_dtype)
+    if config.block_size != layout.tokens_per_block:
+        raise NotImplementedError(
+            f"the K3 megakernel with cache dtype {config.kv_cache_dtype} requires "
+            f"--block-size {layout.tokens_per_block}"
+        )
+    if config.cp_kv_cache_interleave_size not in (None, layout.tokens_per_block):
+        raise NotImplementedError(
+            f"the K3 megakernel requires --cp-kv-cache-interleave-size "
+            f"{layout.tokens_per_block} with cache dtype {config.kv_cache_dtype}"
+        )
+    if config.role == "prefill" and config.max_num_batched_tokens > MAX_STEP_TOKENS:
+        raise NotImplementedError(
+            f"the K3 prefill takes at most {MAX_STEP_TOKENS} tokens per step: "
+            f"--max-num-batched-tokens <= {MAX_STEP_TOKENS}"
+        )
+    if config.role == "decode" and config.num_speculative_tokens not in (
+        0,
+        3,
+        DRAFT_TOKENS,
+    ):
+        raise NotImplementedError(
+            "DSpark on the K3 decoder supports "
+            f"num_speculative_tokens=0, 3 or {DRAFT_TOKENS}"
+        )
+    dense = spec_tokens_per_batch(config)  # validates the per-batch-size schedule
+    if config.synthetic_acceptance_rates_by_width is not None:
+        by_width = dict(config.synthetic_acceptance_rates_by_width)
+        missing = sorted({k for k in dense or () if k} - set(by_width))
+        if missing:
+            raise NotImplementedError(
+                f"synthetic_acceptance_lengths gives no length for the {missing} "
+                f"draft widths the schedule runs (it has {sorted(by_width)})"
+            )
+        own = by_width.get(config.num_speculative_tokens)
+        if own is not None and own != config.synthetic_acceptance_rates:
+            raise NotImplementedError(
+                f"synthetic_acceptance_lengths' {config.num_speculative_tokens}-draft "
+                f"rates {list(own)} differ from --speculative-config's "
+                f"{list(config.synthetic_acceptance_rates or ())}"
+            )
+    if config.role == "decode" and not config.async_scheduling:
+        raise NotImplementedError(
+            "the K3 decoder needs async scheduling (it keeps each request's next "
+            "input on the device)"
+        )
+
+
+def _check_stage(config: MegakernelEngineConfig) -> None:
+    """:func:`check` for the prefill's pipeline stages."""
+    from vllm_torchtpu.megakernel.kimi_k3.layout import STAGE_SPLIT, cache_layout
+
+    if config.role != "prefill" or (
+        config.pipeline_parallel_size,
+        config.prefill_context_parallel_size,
+        config.tensor_parallel_size,
+        config.decode_context_parallel_size,
+    ) != (STAGES, STAGE_CORES, 1, 1):
+        raise NotImplementedError(
+            f"the K3 prefill runs as {STAGES} pipeline stages: "
+            f"--pipeline-parallel-size {STAGES} --prefill-context-parallel-size "
+            f"{STAGE_CORES} --tensor-parallel-size 1 (a decoder runs one stage)"
+        )
+    # A stage core's block is the decoder's blocks of its four TP32 head shards.
+    tokens = STAGE_SPLIT * cache_layout(config.kv_cache_dtype).tokens_per_block
+    if config.block_size != tokens or config.cp_kv_cache_interleave_size != tokens:
+        raise NotImplementedError(
+            f"the K3 prefill stages with cache dtype {config.kv_cache_dtype} require "
+            f"--block-size {tokens} and --cp-kv-cache-interleave-size {tokens}"
+        )
+    if config.max_num_batched_tokens > MAX_STEP_TOKENS:
+        raise NotImplementedError(
+            f"the K3 prefill takes at most {MAX_STEP_TOKENS} tokens per step: "
+            f"--max-num-batched-tokens <= {MAX_STEP_TOKENS}"
+        )
+    if config.async_scheduling:
+        raise NotImplementedError(
+            "the K3 prefill stages run without async scheduling (--no-async-scheduling)"
+        )
+
+
+def capabilities(config: MegakernelEngineConfig) -> Capabilities:
+    check(config)
+    dense = spec_tokens_per_batch(config)
+    speculating = dense is not None and any(dense)
+    return Capabilities(
+        roles=frozenset({config.role}),
+        sampling=SAMPLING,
+        speculation="dspark" if speculating else None,
+        num_speculative_tokens=config.num_speculative_tokens if speculating else 0,
+        max_step_tokens=MAX_STEP_TOKENS
+        if config.role == "prefill"
+        else config.max_num_batched_tokens,
+        page_aligned_chunks=config.role == "prefill",
+        block_copies=config.role == "prefill",
+        # The decoder's plain op masks its logits (the prefill discards its
+        # first tokens, so it only accepts the requests). DSpark's verify ops
+        # do not mask: a step with a structured request runs plain instead.
+        structured_outputs=True,
+        pipeline=config.pipeline_parallel_size > 1,
+    )
+
+
+def build(
+    config: MegakernelEngineConfig,
+    presharded: Path,
+    draft_checkpoint: Path | None = None,
+    *,
+    tp_rank: int,
+):
+    """The program for ``config.role`` on TP rank ``tp_rank`` (the order the KV
+    connector pairs devices in; ``draft_checkpoint``: the DSpark speculator --
+    the prefill computes its ring, the decoder drafts with it and imports the
+    ring the prefill wrote)."""
+    check(config)
+    if config.role == "prefill":
+        from vllm_torchtpu.megakernel.kimi_k3.prefill import KimiPrefiller
+
+        return KimiPrefiller(config, presharded, draft_checkpoint, tp_rank=tp_rank)
+    from vllm_torchtpu.megakernel.kimi_k3.decode import KimiDecoder
+    from vllm_torchtpu.megakernel.kimi_k3.decode_ops import (
+        Control,
+        DecodeOps,
+        decode_batch_sizes,
+    )
+
+    dense = spec_tokens_per_batch(config)
+    draft = None
+    if draft_checkpoint is not None and dense is not None and any(dense):
+        from vllm_torchtpu.megakernel.kimi_k3.draft import draft_class
+
+        draft = draft_class(draft_checkpoint)(
+            max_position=config.max_model_len + 16,
+            checkpoint=str(draft_checkpoint),
+            presharded=Path(presharded),
+            synthetic_rates=config.synthetic_acceptance_rates,
+            synthetic_rates_by_width=dict(config.synthetic_acceptance_rates_by_width)
+            if config.synthetic_acceptance_rates_by_width is not None
+            else None,
+        )
+    # Speculative post-states are temporary; acceptance commits one state
+    # into each regular request slot (decode_ops.Control).
+    sub_base = 2 * config.max_num_seqs + 1
+    ops = DecodeOps(
+        presharded,
+        num_slots=Control.total_slots(sub_base) if draft else sub_base,
+        batch_sizes=decode_batch_sizes(config.max_num_seqs),
+        mamba_ssm_cache_dtype=config.mamba_ssm_cache_dtype,
+        dsa=config.dsa,
+        synthetic_indexer=config.synthetic_indexer,
+    )
+    return KimiDecoder(config, ops, draft, tp_rank=tp_rank)
+
+
+def build_stage(
+    config: MegakernelEngineConfig,
+    presharded: Path,
+    *,
+    stage: int,
+    mesh: Any,
+    core: int,
+    draft: Path | None = None,
+):
+    """The prefill's pipeline stage ``stage`` (:class:`kimi_k3.stage.KimiPrefillStage`)
+    on its cores' ``mesh``, this worker being ``core``; ``draft``: the MLA
+    DSpark draft whose context latents the stages compute."""
+    check(config)
+    from vllm_torchtpu.megakernel.kimi_k3.stage import KimiPrefillStage
+
+    return KimiPrefillStage(
+        config, presharded, stage=stage, mesh=mesh, core=core, draft=draft
+    )

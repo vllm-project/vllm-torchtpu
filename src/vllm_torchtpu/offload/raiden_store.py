@@ -32,7 +32,10 @@ Key components and mechanisms:
 - Model and parallelism support: Supports dense full-attention (single KV group)
   and hybrid attention+Mamba models on the TPU unified block pool. Supports
   Prefill Context Parallelism (PCP) across ranks and Data Parallelism (DP)
-  with independent per-engine controller ports and job names.
+  with independent per-engine controller ports and job names. Kimi-K3.1's
+  index-key cache, a block-major tensor beside the unified pools under the
+  MLA block ids, is one more block array: a block's index pages are stored and
+  loaded with its latent pages (``KimiIndexGeometry``).
 
 - Two-phase admission: `insert` atomically pins the whole batch, then a
   post-admission `lookup` (stable under the job's own pins) picks out the
@@ -211,6 +214,61 @@ def iter_leaf_kv_cache_specs(kv_cache_spec):
             yield from iter_leaf_kv_cache_specs(leaf)
     else:
         yield kv_cache_spec
+
+
+KIMI_K31_ARCHITECTURE = "KimiK31ForConditionalGeneration"
+# A row of Kimi-K3.1's index-key cache: one token's FP8 key, or 128 scale bytes.
+KIMI_INDEX_ROW_BYTES = 128
+
+
+@dataclass(frozen=True)
+class KimiIndexGeometry:
+    """Kimi-K3.1's index-key cache per block: ``layers`` MLA layers of the
+    model, each an index page of ``rows`` 128-byte rows per rank-local block
+    (``megakernel.kimi_k3.pools.index_cache_rows``). A rank holds the pages
+    of its pipeline stage's MLA layers."""
+
+    rows: int
+    layers: int
+
+    @property
+    def layer_bytes(self) -> int:
+        return self.rows * KIMI_INDEX_ROW_BYTES
+
+    def all_ranks_bytes_per_block(self, world_size: int, pp_size: int) -> int:
+        """Index bytes behind one block on all ranks: each of a stage's
+        ``world_size / pp_size`` ranks holds a page of every MLA layer of the
+        stage, and the stages split the model's MLA layers."""
+        return world_size // pp_size * self.layers * self.layer_bytes
+
+
+def kimi_index_geometry(
+    vllm_config: VllmConfig, kv_cache_config: KVCacheConfig
+) -> KimiIndexGeometry | None:
+    """Kimi-K3.1's index-key cache geometry, from the configs alone (the
+    scheduler sees no tensors); None for every other model."""
+    if vllm_config.model_config.architecture != KIMI_K31_ARCHITECTURE:
+        return None
+    from vllm.v1.kv_cache_interface import MLAAttentionSpec
+
+    from vllm_torchtpu.megakernel.kimi_k3 import pools
+
+    block_sizes = {
+        int(leaf.block_size)
+        for group in kv_cache_config.kv_cache_groups
+        for leaf in iter_leaf_kv_cache_specs(group.kv_cache_spec)
+        if isinstance(leaf, MLAAttentionSpec)
+    }
+    if len(block_sizes) != 1:
+        raise ValueError(
+            "TPURaidenOffloadingConnector: Kimi-K3.1's index-key cache needs one "
+            f"MLA block size, found {sorted(block_sizes)}"
+        )
+    (block_size,) = block_sizes
+    return KimiIndexGeometry(
+        rows=pools.index_cache_rows(block_size, vllm_config.cache_config.cache_dtype),
+        layers=pools.MLA_LAYERS,
+    )
 
 
 def has_multi_shapes_kv_caches(vllm_config: VllmConfig) -> bool:
@@ -914,6 +972,34 @@ class RaidenOffloadingManager(OffloadingManager):
         account for fails the job closed (rollback + recompute).
         """
         assert len(keys) == len(device_block_ids), (len(keys), len(device_block_ids))
+        # A peer read leaves no local entry, so `prepare_store` can offer a
+        # key that another request is still reading from a peer. That load
+        # owns the key's sub-hashes in `_hash_to_admission`; admitting them
+        # here would take over its completions and the load would never
+        # finish. Leave such keys to the load; they are offered again on
+        # their next appearance.
+        held_keys = {
+            key
+            for key in keys
+            if any(
+                sub_hash in self._hash_to_admission
+                for sub_hash in self._sub_hashes(key)
+            )
+        }
+        if held_keys:
+            self._inflight_store_keys.difference_update(held_keys)
+            kept = [
+                (key, block_id)
+                for key, block_id in zip(keys, device_block_ids)
+                if key not in held_keys
+            ]
+            keys = [key for key, _ in kept]
+            device_block_ids = [block_id for _, block_id in kept]
+            if not keys:
+                self._finished.append(
+                    FinishedJob(job_id=job_id, op=AdmissionOp.STORE, success=True)
+                )
+                return
         with self._eviction_lock:
             for key in keys:
                 self._evicted_sub_hashes.pop(key, None)
@@ -1024,30 +1110,46 @@ class RaidenOffloadingManager(OffloadingManager):
         # pinned in the local host pool. The slice is the only record of a peer
         # block — read_remote writes nothing to the local directory, so no live
         # probe could rediscover it. Only the BYTES are non-local: every
-        # destination is one of this instance's HBM blocks. The two destination
+        # destination is one of this instance's HBM blocks. The destination
         # lists are disjoint subsequences of `device_ids`, each preserving its
         # batch's hash-to-block pairing, because load() and read_remote() both
-        # require block_hashes[i] to line up with device_block_ids[i]. One
-        # read_remote call takes a peer's slices and storage slices together.
+        # require block_hashes[i] to line up with device_block_ids[i]. A
+        # read_remote call's peer slices must all name one peer, so each peer
+        # gets its own call; storage slices join the first one.
         remote_hashes: list[bytes] = []
-        remote_slices: list[object] = []
-        dst_device_ids_for_remote: list[int] = []
+        remote_batches: dict[object, tuple[list[bytes], list[object], list[int]]] = {}
         local_hashes: list[bytes] = []
         dst_device_ids_for_local: list[int] = []
         for sub_hash, dev_id in zip(sub_hashes, device_ids):
             block = self._pending_remote_slices.pop(sub_hash, None)
             if block is not None:
                 remote_hashes.append(sub_hash)
-                remote_slices.append(block)
-                dst_device_ids_for_remote.append(dev_id)
+                peer = (
+                    cast(Any, block).raiden_id
+                    if cast(Any, block).status == self._block_status.REMOTE
+                    else None
+                )
+                batch = remote_batches.setdefault(peer, ([], [], []))
+                batch[0].append(sub_hash)
+                batch[1].append(block)
+                batch[2].append(dev_id)
             else:
                 local_hashes.append(sub_hash)
                 dst_device_ids_for_local.append(dev_id)
+        storage = remote_batches.pop(None, None)
+        if storage is not None:
+            first = next(iter(remote_batches.values()), None)
+            if first is None:
+                remote_batches[None] = storage
+            else:
+                first[0].extend(storage[0])
+                first[1].extend(storage[1])
+                first[2].extend(storage[2])
 
         def _fail_launch(
             what: str, failed_hashes: list[bytes], in_flight: list[bytes]
         ) -> None:
-            # failed_hashes is the batch whose launch failed.
+            # failed_hashes includes rejected and unlaunched batches.
             logger.error(
                 "TPURaidenOffloadingConnector: load job %d (req %s): %s launch failed "
                 "(%d local, %d remote sub-blocks)",
@@ -1070,11 +1172,11 @@ class RaidenOffloadingManager(OffloadingManager):
                 failed_sub_hashes=list(failed_hashes),
             )
             if in_flight:
-                # The other launch already succeeded: the job must stay
-                # non-terminal until its transfer resolves, then the
+                # Earlier launches succeeded: the job must stay
+                # non-terminal until their transfers resolve, then the
                 # finalizer runs the failure cleanup exactly once.
                 self._admissions[job_id] = admission
-                for sub_hash in in_flight:
+                for sub_hash in sub_hashes:
                     self._hash_to_admission[sub_hash] = admission
                 return
             # Nothing in flight: immediately terminal. The finalizer keeps
@@ -1089,11 +1191,17 @@ class RaidenOffloadingManager(OffloadingManager):
         ):
             _fail_launch("load()", local_hashes, [])
             return
-        if remote_hashes and not self._store.read_remote(
-            remote_hashes, remote_slices, dst_device_ids_for_remote
-        ):
-            _fail_launch("read_remote()", remote_hashes, local_hashes)
-            return
+        in_flight = list(local_hashes)
+        for peer_hashes, peer_slices, peer_device_ids in remote_batches.values():
+            if not self._store.read_remote(peer_hashes, peer_slices, peer_device_ids):
+                launched = set(in_flight)
+                _fail_launch(
+                    "read_remote()",
+                    [h for h in remote_hashes if h not in launched],
+                    in_flight,
+                )
+                return
+            in_flight.extend(peer_hashes)
         admission = Admission(
             job_id=job_id,
             op=AdmissionOp.LOAD,
@@ -1397,6 +1505,7 @@ def derive_offload_namespace(
     cp_geometry: tuple[int, ...] = (),
     block_major_contract: BlockMajorContract | None = None,
     offloaded_group_ids: tuple[int, ...] | None = None,
+    kimi_index: KimiIndexGeometry | None = None,
 ) -> bytes:
     """Derive a deterministic compatibility namespace prefixed to every store and
     registry key.
@@ -1411,6 +1520,7 @@ def derive_offload_namespace(
       (pcp_size, dcp_size, interleave_size) which alters rank-local token placement.
     - Hash scheme: prefix caching algorithm and namespace version salt.
     - Layout contract: block-major layout version, row bytes, and logical fingerprint.
+    - Kimi-K3.1's index-key cache: its page rows and layers, when stored.
 
     Returns:
         A 16-byte SHA-256 digest unique to this engine and layout configuration.
@@ -1462,6 +1572,14 @@ def derive_offload_namespace(
         # a group never stores its keys, so a peer expecting them would miss
         # on every block.
         material_fields += ("tpu-raiden-offload-ns3-groups", offloaded_group_ids)
+    if kimi_index is not None:
+        # Entries without the index pages must never load into an engine
+        # that selects with them.
+        material_fields += (
+            "tpu-raiden-offload-ns4-kimi-index",
+            kimi_index.rows,
+            kimi_index.layers,
+        )
     material = repr(material_fields)
     return hashlib.sha256(material.encode()).digest()[:16]
 
@@ -1645,6 +1763,32 @@ def resolve_kernel_geometry(
     return kernel_block_size, per_block_shape, spec0.dtype, spec0.block_size
 
 
+def view_on_current_storage(
+    view: torch.Tensor, source: torch.Tensor | None
+) -> torch.Tensor:
+    """``view`` rebuilt on the current storage of ``source``, the runner's
+    tensor for the pool ``view`` covers (from offset 0). A runner that donates
+    its pools to every op re-binds ``source`` to each fresh buffer with
+    ``Tensor.set_``; ``view`` stays on the buffer it was built from, which the
+    first op deletes."""
+    if source is None:
+        return view
+    import torch
+
+    storage = source.untyped_storage()
+    assert view.storage_offset() == 0, view.storage_offset()
+    assert view.numel() * view.element_size() == storage.nbytes(), (
+        "registered view does not cover its pool storage: "
+        f"view_bytes={view.numel() * view.element_size()}, "
+        f"storage_bytes={storage.nbytes()}"
+    )
+    return (
+        torch.empty(0, dtype=view.dtype, device=source.device)
+        .set_(storage)
+        .view(view.shape)
+    )
+
+
 class RaidenStoreOffloadingWorker(OffloadingWorker):
     """Worker-side endpoint that registers local TPU HBM device buffers with
     the Controller.
@@ -1675,6 +1819,10 @@ class RaidenStoreOffloadingWorker(OffloadingWorker):
         controller_address: str,
         rank: int,
         block_major_contract: BlockMajorContract | None = None,
+        pool_sources: list[torch.Tensor] | None = None,
+        # Canonical arrays outside the unified pools (Kimi-K3.1's index-key
+        # cache): whole scheduler blocks of their own row width.
+        index_arrays: Sequence[int] = (),
         # This rank's storage-tier config, from
         # `build_worker_storage_backend_config`. Empty registers no storage
         # backend, which is right only when the store has no storage tier:
@@ -1684,6 +1832,7 @@ class RaidenStoreOffloadingWorker(OffloadingWorker):
         import numpy as np
         import torch
 
+        self._pool_sources = list(pool_sources or ())
         # Set before either branch below starts the registration thread.
         self._backend_configs = list(backend_configs)
 
@@ -1693,7 +1842,9 @@ class RaidenStoreOffloadingWorker(OffloadingWorker):
         assert device_block_size % kernel_block_size == 0
         device_block_size_factor = device_block_size // kernel_block_size
 
+        index_array_set = set(index_arrays)
         if is_multi_shapes_geometry(per_block_shape):
+            assert not index_array_set, "index arrays are unified-pool companions"
             # Branch for models whose kv cache consists of multiple tensors
             # with different shapes. The resolved shapes describe those
             # arrays but do not tile a common row, so registration walks the
@@ -1726,6 +1877,11 @@ class RaidenStoreOffloadingWorker(OffloadingWorker):
         )
 
         if block_major_contract is not None:
+            if index_array_set:
+                raise NotImplementedError(
+                    "TPURaidenOffloadingConnector: Kimi-K3.1's index-key cache "
+                    "has no block-major bundle"
+                )
             # Block-major registration: Register the entire multi-layer bundle as a
             # single canonical storage ([kernel_blocks, F, *R]). Raiden views the bundle
             # as 1 block array, executing 1 hardware DMA per block transfer rather than
@@ -1753,7 +1909,29 @@ class RaidenStoreOffloadingWorker(OffloadingWorker):
         # Rebuild typed tensor views shaped by physical kernel blocks from the
         # underlying storage, ensuring leading dimensions match DMA tile layouts.
         device_tensors: list[torch.Tensor] = []
-        for kv_cache_tensor in kv_caches.tensors:
+        for array, kv_cache_tensor in enumerate(kv_caches.tensors):
+            if array in index_array_set:
+                # The same block ids, at its own row width: kernel row k of
+                # scheduler block b is bytes [k, k + 1) / factor of b's row.
+                int8_view = kv_cache_tensor.tensor
+                page_size_bytes = kv_cache_tensor.page_size_bytes
+                assert page_size_bytes % device_block_size_factor == 0, (
+                    f"index page of {page_size_bytes} bytes does not split into "
+                    f"{device_block_size_factor} kernel rows"
+                )
+                assert (
+                    int8_view.numel() * int8_view.element_size()
+                    == int8_view.shape[0] * page_size_bytes
+                ), "index array is not whole scheduler blocks"
+                device_tensors.append(
+                    torch.empty(0, dtype=torch.int8, device=int8_view.device)
+                    .set_(int8_view.untyped_storage())
+                    .view(
+                        int8_view.shape[0] * device_block_size_factor,
+                        page_size_bytes // device_block_size_factor,
+                    )
+                )
+                continue
             # Verify that one canonical scheduler page equals exactly
             # device_block_size_factor physical kernel rows. For hybrid models
             # using the unified pool, this confirms that all group pages are
@@ -1802,6 +1980,14 @@ class RaidenStoreOffloadingWorker(OffloadingWorker):
         # Hold strong references to ensure PyTorch tensors remain allocated
         # while Raiden C++ retains raw pointers to their underlying storage.
         self._device_tensors = [[t] for t in device_tensors]
+        # Each view's pool tensor, matched while both still share a storage:
+        # registration rebuilds the views on the pools' storage at that time.
+        source_of = {int(s.untyped_storage().data_ptr()): s for s in self._pool_sources}
+        self._view_sources = (
+            [source_of.get(int(t.untyped_storage().data_ptr())) for t in device_tensors]
+            if source_of
+            else [None] * len(device_tensors)
+        )
         self._host_blocks_to_allocate = host_blocks_to_allocate
         self._controller_address = controller_address
         self._rank = rank
@@ -1846,6 +2032,12 @@ class RaidenStoreOffloadingWorker(OffloadingWorker):
                 try:
                     from tpu_sync.api.torch import kv_cache_manager as _kcm
 
+                    self._device_tensors = [
+                        [view_on_current_storage(view, source)]
+                        for [view], source in zip(
+                            self._device_tensors, self._view_sources, strict=True
+                        )
+                    ]
                     # Registers the storage backend this rank writes its
                     # shards through; omitted when there is no storage tier.
                     # Any, not the inferred list type: a type checker matches
@@ -2391,6 +2583,10 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
         self.block_major_contract = resolve_block_major_contract(
             vllm_config, kv_cache_config
         )
+        # Kimi-K3.1's index-key cache travels as one more block array (see
+        # KimiIndexGeometry); the connector names its canonical array.
+        self.kimi_index = kimi_index_geometry(vllm_config, kv_cache_config)
+        self.index_arrays: list[int] = []
 
         # Verify CP scaling invariant: scheduler chunks at the logical all-CP-rank
         # block span, whereas KV cache specs are rank-local. Ensure tokens_per_block
@@ -2438,6 +2634,11 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
             bytes_per_block_all_ranks = (
                 config.worker_kv_bytes_per_block * self.world_size
             )
+        if self.kimi_index is not None:
+            # The index-key cache is outside the KV cache tensors vLLM sizes.
+            bytes_per_block_all_ranks += self.kimi_index.all_ranks_bytes_per_block(
+                self.world_size, parallel.pp_size
+            )
         assert bytes_per_block_all_ranks > 0
         self.offload_logical_blocks_capacity = int(
             int(cpu_bytes_to_use) // bytes_per_block_all_ranks
@@ -2478,6 +2679,7 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
             cp_geometry=cp_geometry,
             block_major_contract=self.block_major_contract,
             offloaded_group_ids=tuple(group.group_id for group in config.groups),
+            kimi_index=self.kimi_index,
         )
 
         # Shared-memory host pools (RAIDEN_SHM_KEY) are currently unsupported.
@@ -2539,6 +2741,9 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
 
         self._manager: RaidenOffloadingManager | None = None
         self._worker: RaidenStoreOffloadingWorker | None = None
+        # The runner's tensor per KV pool storage (set by the connector before
+        # the worker is built); see RaidenStoreOffloadingWorker.
+        self.pool_sources: list[torch.Tensor] = []
 
     def get_manager(self) -> OffloadingManager:
         if self._manager is None:
@@ -2644,6 +2849,8 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
                 controller_address=controller_address,
                 rank=rank,
                 block_major_contract=self.block_major_contract,
+                pool_sources=self.pool_sources,
+                index_arrays=self.index_arrays,
                 backend_configs=backend_configs,
             )
         return self._worker

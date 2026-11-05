@@ -22,7 +22,7 @@ import copy
 import dataclasses
 import math
 from collections.abc import Callable, Iterable
-from typing import TYPE_CHECKING, Protocol, cast
+from typing import TYPE_CHECKING, Any, Protocol, cast
 
 import torch
 from vllm.config import get_layers_from_vllm_config, set_current_vllm_config
@@ -202,6 +202,22 @@ def _warn_if_kv_cache_is_padded(
         dtype,
         backend.get_name(),
     )
+
+
+def _add_extra_kv_caches(
+    runner: Any, kv_caches: dict, kv_cache_config: KVCacheConfig
+) -> None:
+    """Bind a runner's own KV tensors (Kimi-K3.1's index-key cache) beside
+    the materialized pools, as raw tensors the KV connector registers."""
+    extra = getattr(runner, "extra_kv_cache_tensors", None)
+    if extra is None:
+        return
+    tensors = extra(kv_cache_config)
+    fresh = list({id(t): t for t in tensors.values()}.values())
+    if fresh:
+        synchronize_tensors(fresh)
+    kv_caches.update(tensors)
+    runner.kv_cache_raw_tensors.extend(fresh)
 
 
 class KVCacheManager:
@@ -1203,6 +1219,7 @@ class KVCacheManager:
             # Same rule for the seed-copy program: compile it while the pools
             # are quiescent, before any dummy forward leaves writes pending.
             self.runner._precompile_mamba_state_seed_copies()
+        _add_extra_kv_caches(self.runner, kv_caches, kv_cache_config)
 
         logger.info(
             "%s",

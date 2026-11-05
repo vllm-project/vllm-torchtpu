@@ -428,7 +428,7 @@ def test_a_launch_count_off_by_one_is_caught(stages):
         w._check_count()
 
 
-def test_the_hand_off_always_carries_hidden_states_and_residual(monkeypatch):
+def test_the_hand_off_always_carries_hidden_states(monkeypatch):
     from vllm.distributed import parallel_state
 
     monkeypatch.setattr(pp_wave, "get_or_create_pp_mesh", lambda: None)
@@ -438,16 +438,16 @@ def test_the_hand_off_always_carries_hidden_states_and_residual(monkeypatch):
         "get_pp_group",
         lambda: SimpleNamespace(rank_in_group=0, world_size=2),
     )
-    with pytest.raises(ValueError, match="hidden_states and residual"):
+    with pytest.raises(ValueError, match="carries hidden_states"):
         pp_wave.PPWave(
             torch.device("cpu"),
             MAX_ROWS,
             {
-                "hidden_states": ((HIDDEN,), torch.float32),
+                "residual": ((HIDDEN,), torch.float32),
                 "other": ((HIDDEN,), torch.float32),
             },
         )
-    with pytest.raises(ValueError, match="one dtype"):
+    with pytest.raises(ValueError, match="same shape and dtype"):
         pp_wave.PPWave(
             torch.device("cpu"),
             MAX_ROWS,
@@ -466,6 +466,47 @@ def test_the_hand_off_always_carries_hidden_states_and_residual(monkeypatch):
                 SIDE: ((2, SIDE_WIDTH), torch.int32),
             },
         )
+
+
+def test_a_single_residual_stream_is_handed_on_as_is(monkeypatch):
+    """A model that keeps one residual stream hands on hidden_states alone:
+    nothing is summed into it and the receiving stage gets no residual."""
+    _, waves = _build_stages(
+        monkeypatch, {"hidden_states": ((HIDDEN,), torch.float32)}, size=3
+    )
+    rows = 16
+    results, errors = [], []
+
+    def stage(wave):
+        try:
+            wave.warmup()
+            for g in range(4):
+                received = wave.start_forward(rows)
+                if wave.rank == 0:
+                    h = torch.full((rows, HIDDEN), float(g))
+                else:
+                    assert set(received.tensors) == {"hidden_states"}
+                    h = received["hidden_states"] + 1
+                if wave.rank == wave.last:
+                    results.append((g, h))
+                    wave.end_forward(None, rows)
+                else:
+                    wave.end_forward({"hidden_states": h}, rows)
+            wave.push()
+            wave.settle()
+        except BaseException as exc:  # reported by the test thread
+            errors.append((wave.rank, exc))
+
+    threads = [threading.Thread(target=stage, args=(w,), daemon=True) for w in waves]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=60)
+    assert not any(t.is_alive() for t in threads), "a stage never finished"
+    assert not errors, errors
+    assert [g for g, _ in results] == [0, 1, 2, 3]
+    for g, h in results:
+        assert torch.equal(h, torch.full((rows, HIDDEN), g + 2.0))
 
 
 def test_a_side_tensor_is_self_tested_on_every_stage(monkeypatch):

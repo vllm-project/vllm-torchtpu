@@ -17,6 +17,9 @@ from vllm_torchtpu.gqa_head_padding import update_gqa_head_padding_config
 
 _KIMI_MODEL = "vllm_torchtpu.models.vllm.kimi_k3:KimiLinearForCausalLM"
 _KIMI_K3_MODEL = "vllm_torchtpu.models.vllm.kimi_k3:KimiK3ForConditionalGeneration"
+_KIMI_K31_MODEL = (
+    "vllm_torchtpu.models.vllm.kimi_k3.k31:KimiK31ForConditionalGeneration"
+)
 _DSV4_MODEL = "vllm_torchtpu.models.vllm.deepseek_v4:DeepseekV4ForCausalLM"
 _K3_DSPARK_MODEL = "vllm_torchtpu.models.vllm.kimi_k3:K3DSparkForCausalLM"
 _DSV4_DSPARK_MODEL = (
@@ -45,11 +48,14 @@ class _TPUQwen2Config(VerifyAndUpdateConfig):
 def register_models() -> None:
     from vllm.model_executor.models import ModelRegistry
     from vllm.model_executor.models.config import MODELS_CONFIG_MAP
+    from vllm.transformers_utils.config import _CONFIG_REGISTRY
 
+    from vllm_torchtpu.models.vllm.kimi_k3.k31_config import KimiK31Config
     from vllm_torchtpu.models.vllm.qwen4_exp.config import TPUQwen4ExpConfig
 
     ModelRegistry.register_model("KimiLinearForCausalLM", _KIMI_MODEL)
     ModelRegistry.register_model("KimiK3ForConditionalGeneration", _KIMI_K3_MODEL)
+    ModelRegistry.register_model("KimiK31ForConditionalGeneration", _KIMI_K31_MODEL)
     ModelRegistry.register_model("DeepseekV4ForCausalLM", _DSV4_MODEL)
     ModelRegistry.register_model("K3DSparkModel", _K3_DSPARK_MODEL)
     ModelRegistry.register_model("DSparkDraftModel", _DSV4_DSPARK_MODEL)
@@ -61,6 +67,8 @@ def register_models() -> None:
     # the text-only model.
     ModelRegistry.register_model("Qwen4ExpForConditionalGeneration", _QWEN4_EXP_MODEL)
     MODELS_CONFIG_MAP["KimiK3ForConditionalGeneration"] = _TPUKimiK3Config
+    MODELS_CONFIG_MAP["KimiK31ForConditionalGeneration"] = _TPUKimiK3Config
     MODELS_CONFIG_MAP["Qwen4ExpForCausalLM"] = TPUQwen4ExpConfig
     MODELS_CONFIG_MAP["Qwen4ExpForConditionalGeneration"] = TPUQwen4ExpConfig
     MODELS_CONFIG_MAP["Qwen2ForCausalLM"] = _TPUQwen2Config
+    _CONFIG_REGISTRY["kimi_k31"] = KimiK31Config

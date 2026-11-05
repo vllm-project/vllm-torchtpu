@@ -632,6 +632,7 @@ def test_register_kv_caches_canonicalizes_the_merged_pool():
     fake = SimpleNamespace(
         connector_worker=SimpleNamespace(
             kv_cache_config=cfg,
+            spec=SimpleNamespace(),
             _init_worker=lambda canonical: captured.setdefault("c", canonical),
         )
     )

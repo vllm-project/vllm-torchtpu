@@ -25,7 +25,7 @@ from contextlib import asynccontextmanager
 from typing import Any
 
 import httpx
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.background import BackgroundTask
 
@@ -699,6 +699,32 @@ async def handle_completions(request: Request):
 @app.post("/v1/chat/completions")
 async def handle_chat_completions(request: Request):
     return await _handle_completions("/v1/chat/completions", request)
+
+
+async def _passthrough_to_prefill(path: str, request: Request):
+    """Forward a tokenize/detokenize request to the first prefill instance
+    verbatim: benchmark clients such as vllm-bench call /tokenize to check
+    prompt lengths."""
+    client_info = app.state.prefill_clients[0]
+    headers = {"Content-Type": "application/json"}
+    response = await client_info["client"].post(
+        path, content=await request.body(), headers=headers
+    )
+    return Response(
+        content=response.content,
+        status_code=response.status_code,
+        media_type=response.headers.get("content-type"),
+    )
+
+
+@app.post("/tokenize")
+async def tokenize(request: Request):
+    return await _passthrough_to_prefill("/tokenize", request)
+
+
+@app.post("/detokenize")
+async def detokenize(request: Request):
+    return await _passthrough_to_prefill("/detokenize", request)
 
 
 @app.get("/v1/models")

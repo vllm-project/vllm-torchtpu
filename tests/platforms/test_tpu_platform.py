@@ -558,6 +558,23 @@ class TestTpuPlatform:
 
         TpuPlatform.check_and_update_config(vllm_config)
 
+    @pytest.mark.parametrize(("role", "retention"), [("decode", 0), ("prefill", None)])
+    @patch("vllm_torchtpu.patch_registry.apply")
+    @patch(
+        "vllm_torchtpu.platforms.tpu_platform.TpuPlatform._prepare_singlehost_tpu_env"
+    )
+    def test_megakernel_decode_retains_only_replay_checkpoints(
+        self, mock_prepare_env, mock_apply_patches, vllm_config, role, retention
+    ):
+        # Dense: what vLLM resolves for a hybrid model with an EAGLE-style drafter.
+        vllm_config.cache_config.prefix_cache_retention_interval = None
+        with (
+            patch("vllm_torchtpu.megakernel.backend.role", return_value=role),
+            patch("vllm_torchtpu.megakernel.backend.capabilities", return_value=None),
+        ):
+            TpuPlatform.check_and_update_config(vllm_config)
+        assert vllm_config.cache_config.prefix_cache_retention_interval == retention
+
     @pytest.mark.parametrize(
         ("compile_sizes", "shapes_type", "expected_type"),
         [

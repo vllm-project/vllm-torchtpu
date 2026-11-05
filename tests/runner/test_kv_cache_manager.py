@@ -2363,3 +2363,26 @@ class TestUpdateAttentionPageSizePadded:
                 256, 2, 256, torch.bfloat16
             )
         )
+
+
+def test_extra_kv_caches_join_the_named_caches_and_the_raw_tensors(monkeypatch):
+    from vllm_torchtpu.runner import kv_cache_manager
+
+    synced = []
+    monkeypatch.setattr(kv_cache_manager, "synchronize_tensors", synced.extend)
+    index = torch.zeros((4, 24, 544, 128), dtype=torch.uint8)
+    runner = SimpleNamespace(
+        extra_kv_cache_tensors=lambda config: {
+            "a.indexer.k_cache": index,
+            "b.indexer.k_cache": index,
+        },
+        kv_cache_raw_tensors=["pool"],
+    )
+    kv_caches = {"a.attn": "pool"}
+    kv_cache_manager._add_extra_kv_caches(runner, kv_caches, SimpleNamespace())
+    assert kv_caches["a.indexer.k_cache"] is index
+    assert kv_caches["b.indexer.k_cache"] is index
+    assert runner.kv_cache_raw_tensors == ["pool", index] and synced == [index]
+    plain = SimpleNamespace(kv_cache_raw_tensors=[])
+    kv_cache_manager._add_extra_kv_caches(plain, {}, SimpleNamespace())
+    assert plain.kv_cache_raw_tensors == []

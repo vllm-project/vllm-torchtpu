@@ -994,7 +994,7 @@ def test_no_forward_output_preserves_invalid_block_ids():
         assert output.kv_connector_output.invalid_block_group_index == 2
 
 
-def test_build_kv_connector_output_omits_unsupported_group_index():
+def test_make_kv_connector_output_omits_unsupported_group_index():
     with (
         patch.object(
             tpu_runner,
@@ -1003,7 +1003,7 @@ def test_build_kv_connector_output_omits_unsupported_group_index():
         ),
         patch.object(tpu_runner, "KVConnectorOutput") as output_cls,
     ):
-        tpu_runner._build_kv_connector_output(
+        tpu_runner._make_kv_connector_output(
             finished_sending={"sent"},
             finished_recving=None,
             failed_recving=set(),
@@ -1022,13 +1022,13 @@ def test_build_kv_connector_output_omits_unsupported_group_index():
     )
 
 
-def test_build_kv_connector_output_forwards_invalid_block_ids_for_hybrid_recovery():
+def test_make_kv_connector_output_forwards_invalid_block_ids_for_hybrid_recovery():
     with patch.object(
         tpu_runner,
         "_KV_CONNECTOR_OUTPUT_SUPPORTS_INVALID_BLOCK_GROUP",
         False,
     ):
-        out = tpu_runner._build_kv_connector_output(
+        out = tpu_runner._make_kv_connector_output(
             finished_sending=None,
             finished_recving={"failed-load"},
             failed_recving=set(),
@@ -3644,7 +3644,11 @@ def test_runner_sampling_paths_draw_float32_uniform_noise(monkeypatch):
             _stage_timing=MagicMock(),
         )
         runner._stage_timing.take_samples.return_value = ([], [])
-        for name in ("maybe_wait_for_kv_save", "get_finished_kv_transfers"):
+        for name in (
+            "maybe_wait_for_kv_save",
+            "get_finished_kv_transfers",
+            "_build_kv_connector_output",
+        ):
             setattr(runner, name, getattr(TPUModelRunner, name).__get__(runner))
 
         TPUModelRunner.sample_tokens(runner, None)

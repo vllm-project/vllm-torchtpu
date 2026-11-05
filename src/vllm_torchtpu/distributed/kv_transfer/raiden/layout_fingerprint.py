@@ -30,6 +30,8 @@ from typing import Any
 from vllm_torchtpu import envs as tpu_envs
 
 from .pool_manifest import (
+    KIMI_INDEX_ROW_BYTES,
+    KIMI_INDEX_SCALE_ROWS,
     TAG_DSA_IDX,
     TAG_FA,
     TAG_GDN_CONV,
@@ -232,13 +234,18 @@ def measured_kimi_k3_layout_fingerprint(
     state_fragments: int,
     layout_getter: Callable[[Any], Any] | None = None,
     package_version: Callable[[str], str] | None = None,
+    sub_blocks: int = 1,
 ) -> tuple[str, dict[str, Any]]:
-    """Normalize the existing packed-row fingerprint across Kimi TP sizes."""
+    """Normalize the existing packed-row fingerprint across Kimi TP sizes.
+
+    ``sub_blocks``: decode pages per block of Kimi-K3.1's index-key cache
+    (a pipeline stage's block holds those of several decode ranks).
+    """
     if state_fragment_heads <= 0:
         raise ValueError("state_fragment_heads must be positive")
     if state_fragments <= 0:
         raise ValueError("state_fragments must be positive")
-    if not any(pool.tag == TAG_FA for pool in manifest.pools):
+    if not any(class_tag(pool.tag) == TAG_FA for pool in manifest.pools):
         raise ValueError("Kimi layout fingerprint requires an FA pool")
     version = package_version or importlib.metadata.version
     payload: dict[str, Any] = {
@@ -252,6 +259,7 @@ def measured_kimi_k3_layout_fingerprint(
             page_tokens=page_tokens,
             layout_getter=layout_getter,
             include_page_shape=False,
+            index_sub_blocks=sub_blocks,
         ),
     }
 
@@ -348,6 +356,7 @@ def _measure_packed_row_layouts(
     page_tokens: int | None,
     layout_getter: Callable[[Any], Any] | None,
     include_page_shape: bool,
+    index_sub_blocks: int | None = None,
 ) -> dict[str, Any]:
     """Validate live packed-row storage for the model-specific fingerprints.
 
@@ -359,6 +368,10 @@ def _measure_packed_row_layouts(
     Pass ``page_tokens`` when every tag shares one page, which GLM and Kimi do
     and DSv4 does not. DSv4's CSA arrays are rank-3 int32 word rows instead,
     checked as packing-1 rows under one full-width tile level.
+
+    ``index_sub_blocks`` (Kimi-K3.1) measures the ``dsa.idx`` pools as the
+    index-key cache, ``index_sub_blocks`` decode pages per block (see
+    ``_kimi_index_layout``).
     """
     if not isinstance(manifest, PoolManifest):
         raise TypeError("manifest must be a PoolManifest")
@@ -390,6 +403,14 @@ def _measure_packed_row_layouts(
             raise RuntimeError(
                 f"admitted {pool.tag} storage has no materialized TPU layout"
             )
+        if index_sub_blocks is not None and tag == TAG_DSA_IDX:
+            assert page_tokens is not None
+            measured = _kimi_index_layout(
+                pool, tensor, layout, page_tokens, index_sub_blocks
+            )
+            if per_tag.setdefault(tag, measured) != measured:
+                raise RuntimeError(f"admitted {tag} storages disagree on layout")
+            continue
         raw_minor_to_major, raw_tiles, _ = layout
         minor_to_major = tuple(int(dim) for dim in raw_minor_to_major)
         tiles = tuple(tuple(int(dim) for dim in tile) for tile in raw_tiles)
@@ -445,3 +466,55 @@ def _measure_packed_row_layouts(
         if include_page_shape:
             measured["page_shape"] = [rows, packing, width]
     return per_tag
+
+
+def _kimi_index_layout(
+    pool: Any, tensor: Any, layout: Any, page_tokens: int, sub_blocks: int
+) -> dict[str, Any]:
+    """Kimi-K3.1's index-key cache ``[blocks, layers, sub_blocks * (P + 32),
+    128]`` uint8, ``P = page_tokens // sub_blocks``.
+
+    A decode page moves as one byte range, which needs whole tiles of full
+    rows along it. Hashed per decode page, so a pipeline stage stacking
+    several matches the decoder holding one.
+    """
+    shape = tuple(int(dim) for dim in tensor.shape)
+    if sub_blocks <= 0 or page_tokens % sub_blocks:
+        raise RuntimeError(
+            f"{pool.tag} blocks of {page_tokens} tokens do not split into "
+            f"{sub_blocks} decode pages"
+        )
+    page_rows = page_tokens // sub_blocks + KIMI_INDEX_SCALE_ROWS
+    dtype = str(getattr(tensor, "dtype", "")).removeprefix("torch.")
+    if (
+        dtype != "uint8"
+        or int(tensor.element_size()) != 1
+        or shape[-1] != KIMI_INDEX_ROW_BYTES
+        or shape[2] != sub_blocks * page_rows
+    ):
+        raise RuntimeError(
+            f"admitted {pool.tag} index-key cache must be uint8 "
+            f"[blocks, layers, {sub_blocks * page_rows}, {KIMI_INDEX_ROW_BYTES}]: "
+            f"dtype={dtype}, shape={shape}"
+        )
+    raw_minor_to_major, raw_tiles, _ = layout
+    minor_to_major = tuple(int(dim) for dim in raw_minor_to_major)
+    tiles = tuple(tuple(int(dim) for dim in tile) for tile in raw_tiles)
+    if (
+        minor_to_major != ROW_CACHE_MINOR_TO_MAJOR
+        or not tiles
+        or len(tiles[0]) != 2
+        or tiles[0][1] != KIMI_INDEX_ROW_BYTES
+        or page_rows % tiles[0][0]
+    ):
+        raise RuntimeError(
+            "index-key pages must be whole row-major tiles: "
+            f"tag={pool.tag}, minor_to_major={minor_to_major}, tiles={tiles}"
+        )
+    return {
+        "dtype": dtype,
+        "row_bytes": KIMI_INDEX_ROW_BYTES,
+        "page_rows": page_rows,
+        "minor_to_major": list(minor_to_major),
+        "tiles": [list(tile) for tile in tiles],
+    }

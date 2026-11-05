@@ -33,6 +33,14 @@ if envs.TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT:
         "TORCH_TPU_INTERNAL_TIER2_COMPILATION_CACHE", "tpu_tier2_cache"
     )
 
+# Pallas kernels serialize their source locations into the compiled module,
+# and so into the compile cache key. Keep only the path from the package down,
+# so the same source run from another checkout reuses the cached executable.
+# JAX reads this when it is first imported.
+os.environ.setdefault(
+    "JAX_HLO_SOURCE_FILE_CANONICALIZATION_REGEX", r".*/(?=vllm_torchtpu/)"
+)
+
 # Default VLLM_CACHE_ROOT to ~/.cache/vllm if unset, ensuring a writable default path
 os.environ.setdefault("VLLM_CACHE_ROOT", os.path.expanduser("~/.cache/vllm"))
 

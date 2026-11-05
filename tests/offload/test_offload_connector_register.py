@@ -45,6 +45,7 @@ def _fake_connector(num_groups: int, offloaded_group_ids=None):
             prefix_cacheable_group_ids=offloaded_group_ids,
         ),
         _init_worker=captured.append,
+        spec=SimpleNamespace(pool_sources=[]),
     )
     return SimpleNamespace(connector_worker=worker), captured
 
@@ -134,3 +135,128 @@ def test_register_kv_caches_ds_v4_alias_groups():
     # Aliases collapse: four layer entries, three distinct arrays.
     assert len(canonical.tensors) == 3
     assert [t.page_size_bytes for t in canonical.tensors] == [256, 64, 128]
+
+
+def test_registration_follows_pools_rebound_in_place():
+    """The connector hands the worker and its save fences the runner's own pool
+    tensors, so registered views follow pools re-bound with `Tensor.set_` (see
+    `view_on_current_storage`)."""
+    from vllm_torchtpu.offload.raiden_store import view_on_current_storage
+
+    pool = torch.zeros(8, 16, dtype=torch.float32)
+    kv_caches = {
+        "model.layers.0.attn": pool,
+        "model.layers.1.mamba": [pool],
+    }
+    fake, captured = _fake_connector(num_groups=2)
+    TPURaidenOffloadingConnector.register_kv_caches(fake, kv_caches)
+
+    assert fake._pool_sync_tensors == [pool]
+    assert fake._pool_sync_tensors[0] is pool
+    assert fake.connector_worker.spec.pool_sources[0] is pool
+    registered = captured[0].tensors[0].tensor
+
+    fresh = torch.ones(8, 16, dtype=torch.float32)
+    pool.set_(fresh)
+    assert registered.untyped_storage().data_ptr() != pool.untyped_storage().data_ptr()
+
+    rebuilt = view_on_current_storage(registered, pool)
+    assert rebuilt.shape == registered.shape
+    assert rebuilt.dtype == registered.dtype
+    assert rebuilt.untyped_storage().data_ptr() == fresh.untyped_storage().data_ptr()
+    pool.view(torch.int8)[0, 0] = 7
+    assert rebuilt[0, 0].item() == 7
+    assert view_on_current_storage(registered, None) is registered
+
+
+def _kimi_connector(rows: int, layers: int, pp_size: int = 1, architecture=None):
+    """A Kimi-K3.1 connector stand-in: the spec sized for an index-key cache
+    of ``layers`` MLA layers and ``rows`` rows per page."""
+    from vllm_torchtpu.offload.raiden_store import KimiIndexGeometry
+
+    fake, captured = _fake_connector(num_groups=2)
+    fake._vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            architecture=architecture or "KimiK31ForConditionalGeneration"
+        )
+    )
+    fake.connector_worker.spec = SimpleNamespace(
+        pool_sources=[],
+        kimi_index=KimiIndexGeometry(rows=rows, layers=layers),
+        pp_size=pp_size,
+    )
+    return fake, captured
+
+
+def _kimi_caches(layers: int, rows: int):
+    """Two unified pools, then the index-key cache under each MLA layer's
+    index name, as the megakernel runner binds them."""
+    pool0 = torch.zeros(NUM_BLOCKS, 32, dtype=torch.float32)
+    pool1 = torch.zeros(NUM_BLOCKS, 32, dtype=torch.float32)
+    index = torch.zeros(NUM_BLOCKS, layers, rows, 128, dtype=torch.uint8)
+    kv_caches = {
+        "model.layers.3.self_attn.mla_attn.attn": pool0,
+        "model.layers.0.self_attn": [pool0],
+        "model.layers.7.self_attn.mla_attn.attn": pool1,
+        "model.layers.4.self_attn": [pool1],
+    }
+    for layer in (3, 7)[:layers]:
+        kv_caches[f"model.layers.{layer}.self_attn.indexer.k_cache"] = index
+    return kv_caches, (pool0, pool1, index)
+
+
+def test_register_kv_caches_adds_kimi_index_array():
+    # Kimi-K3.1: the index-key cache is one more canonical array of its own
+    # row (every layer's page of a block), under the same block ids, and its
+    # writes are fenced before a store like the pools'.
+    kv_caches, (pool0, pool1, index) = _kimi_caches(layers=2, rows=3)
+    fake, captured = _kimi_connector(rows=3, layers=2)
+    TPURaidenOffloadingConnector.register_kv_caches(fake, kv_caches)
+
+    canonical = captured[0]
+    assert [t.page_size_bytes for t in canonical.tensors] == [128, 128, 2 * 3 * 128]
+    assert fake.connector_worker.spec.index_arrays == [2]
+    entry = canonical.tensors[2]
+    assert entry.tensor.shape == (NUM_BLOCKS, 2 * 3 * 128)
+    assert (
+        entry.tensor.untyped_storage().data_ptr() == index.untyped_storage().data_ptr()
+    )
+    index[1, 1, 2, 5] = 9  # block 1, layer slot 1, row 2, byte 5
+    assert entry.tensor[1, (1 * 3 + 2) * 128 + 5].item() == 9
+    assert any(t is index for t in fake._pool_sync_tensors)
+    for refs in canonical.group_data_refs:
+        assert [r.tensor_idx for r in refs] == [0, 1, 2]
+
+
+def test_register_kv_caches_kimi_stage_holds_its_layers():
+    # A prefill stage holds the index pages of its own MLA layers: the spec's
+    # model-wide layer count over the pipeline stages.
+    kv_caches, _ = _kimi_caches(layers=1, rows=4)
+    fake, captured = _kimi_connector(rows=4, layers=4, pp_size=4)
+    TPURaidenOffloadingConnector.register_kv_caches(fake, kv_caches)
+    assert captured[0].tensors[2].page_size_bytes == 4 * 128
+
+
+def test_register_kv_caches_refuses_an_unsized_kimi_index():
+    import pytest
+
+    kv_caches, _ = _kimi_caches(layers=2, rows=3)
+    # The spec sized the host pool for pages of 4 rows, the runner made 3.
+    fake, _ = _kimi_connector(rows=4, layers=2)
+    with pytest.raises(ValueError, match="index-key cache must be"):
+        TPURaidenOffloadingConnector.register_kv_caches(fake, kv_caches)
+    fake, _ = _kimi_connector(rows=3, layers=2)
+    fake.connector_worker.spec.kimi_index = None
+    with pytest.raises(ValueError, match="sized by the spec"):
+        TPURaidenOffloadingConnector.register_kv_caches(fake, kv_caches)
+
+
+def test_register_kv_caches_other_indexers_are_not_index_arrays():
+    # GLM's indexer shares the cache name but is a layer of its own geometry.
+    kv_caches, _ = _kimi_caches(layers=2, rows=3)
+    fake, captured = _kimi_connector(
+        rows=3, layers=2, architecture="GlmMoeDsaForCausalLM"
+    )
+    TPURaidenOffloadingConnector.register_kv_caches(fake, kv_caches)
+    assert fake.connector_worker.spec.index_arrays == []
+    assert len(captured[0].tensors) == 3

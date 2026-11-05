@@ -95,6 +95,7 @@ PATCHES = (
         refresh="vllm_torchtpu:_patch_vllm_dcp_fine_prefix_hits",
     ),
     Patch("vllm_torchtpu:_patch_vllm_mamba_split_scheduler_block_size", _ENGINE),
+    Patch("vllm_torchtpu:_patch_vllm_megakernel_prefix_hits", _ENGINE),
     Patch("vllm_torchtpu:_patch_vllm_offloading_config_build", _ENGINE),
     Patch("vllm_torchtpu:_patch_vllm_offload_all_ranks_kv_bytes", _ENGINE),
     Patch("vllm_torchtpu:_patch_vllm_offload_fine_prefix_alignment", _ENGINE),
@@ -107,6 +108,7 @@ PATCHES = (
         _ENGINE,
     ),
     Patch("vllm_torchtpu:_patch_dflash_drafting_slot_budget", _ENGINE),
+    Patch("vllm_torchtpu.megakernel.dp_blocks:install", _ENGINE),
     Patch("vllm_torchtpu:_patch_vllm_kimi_kda_layer_counts", _ACTIVE),
     # Process setup and runner selection.
     Patch("vllm_torchtpu:_patch_multiproc_worker_global_rank_env", _ACTIVE),

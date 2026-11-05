@@ -29,7 +29,8 @@ dtype as the new residual. Given the rounded sum and a zero residual, the
 norm keeps the identical residual but normalizes a sum rounded once more
 than in a single-stage model: a relative difference of at most 2^-8 per
 element for bfloat16. Sending the sum halves the bytes on the link; sending
-both tensors would reproduce the single-stage arithmetic exactly.
+both tensors would reproduce the single-stage arithmetic exactly. A model
+that keeps a single residual stream (a megakernel stage) hands it on as is.
 
 A model may need side data to travel with the activations: a sparse-attention
 model whose later layers reuse the top-k indices an earlier layer chose has to
@@ -221,16 +222,18 @@ class PPWave:
         self.column = get_pcp_rank()
         self.columns = get_pcp_world_size()
         extras = [key for key in template if key not in (HIDDEN_STATES, RESIDUAL)]
+        # Without a residual, hidden_states is the whole residual stream.
+        self.residual = RESIDUAL in template
         if (
-            set(template) != {HIDDEN_STATES, RESIDUAL, *extras}
-            or template[HIDDEN_STATES] != template[RESIDUAL]
+            HIDDEN_STATES not in template
+            or (self.residual and template[HIDDEN_STATES] != template[RESIDUAL])
             or any(len(template[key][0]) != 1 for key in (HIDDEN_STATES, *extras))
         ):
             raise ValueError(
-                "the pipeline hand-off carries hidden_states and residual, "
-                "two [tokens, hidden] tensors of one dtype, plus any number "
-                "of [tokens, width] side tensors; the model's intermediate "
-                f"tensors are {template}"
+                "the pipeline hand-off carries hidden_states and, unless it is "
+                "the whole residual stream, a residual of the same shape and "
+                "dtype ([tokens, hidden]), plus any number of [tokens, width] "
+                f"side tensors; the model's intermediate tensors are {template}"
             )
         # The first is the activation sum; the rest are side data a stage
         # passes on unchanged. Every stage builds from the same template,
@@ -414,8 +417,10 @@ class PPWave:
     def _pad(
         self, carried: tuple[torch.Tensor, ...], rows: int
     ) -> tuple[torch.Tensor, ...]:
+        # The launch reads only buffers the wave owns: a forward's output
+        # tensor itself, sent as is, can arrive corrupted on the next stage.
         if rows == self.max_rows:
-            return carried
+            return tuple(torch.empty_like(t).copy_(t) for t in carried)
         return tuple(torch.cat([t, z[rows:]]) for t, z in zip(carried, self.zeros))
 
     def warmup(self) -> None:
@@ -473,7 +478,8 @@ class PPWave:
         # Copies: the next launch overwrites the received buffers. The
         # residual is zero: the sum arrived as the hidden states.
         tensors = {key: x[:rows].clone() for key, x in zip(self.carried, out)}
-        tensors[RESIDUAL] = self.zero[:rows].clone()
+        if self.residual:
+            tensors[RESIDUAL] = self.zero[:rows].clone()
         return IntermediateTensors(tensors)
 
     def end_forward(self, tensors: dict[str, torch.Tensor] | None, rows: int) -> None:
@@ -491,7 +497,9 @@ class PPWave:
                 f"{missing} to hand on"
             )
         # Summed in the model dtype; see the module docstring.
-        total = tensors[HIDDEN_STATES] + tensors[RESIDUAL]
+        total = tensors[HIDDEN_STATES]
+        if self.residual:
+            total = total + tensors[RESIDUAL]
         outgoing = (total, *(tensors[key] for key in self.carried[1:]))
         padded = self._pad(outgoing, rows)
         if self.rank != 0:

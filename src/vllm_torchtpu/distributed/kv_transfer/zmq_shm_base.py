@@ -476,6 +476,14 @@ class ZmqShmKvConnectorBase:
 
     # ---- Bring-up -------------------------------------------------------
     def register_runner(self, runner: Any):
+        if (
+            getattr(self.vllm_config.model_config, "architecture", None)
+            == "KimiK31ForConditionalGeneration"
+        ):
+            raise NotImplementedError(
+                "the ZMQ KV transfer does not carry Kimi-K3.1's index-key "
+                "cache; use the Raiden Stage-3 transfer"
+            )
         self.runner = runner
         self.device = runner.device
 

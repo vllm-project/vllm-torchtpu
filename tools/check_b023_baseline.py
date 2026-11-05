@@ -14,11 +14,11 @@
 # limitations under the License.
 """Fail when a kernel file gains a closure that captures a loop variable.
 
-Ruff's B023 is selected for the whole tree except ``src/vllm_torchtpu/kernels``,
-where ``pl.when`` and ``pl.loop`` call the decorated body immediately and the
-rule has no way to tell that apart from a closure that escapes its loop. Every
-finding there today is one of those, so the rule is turned off for that
-directory in pyproject.toml.
+Ruff's B023 is selected for the whole tree except the kernel directories
+(``KERNELS`` below), where ``pl.when`` and ``pl.loop`` call the decorated body
+immediately and the rule has no way to tell that apart from a closure that
+escapes its loop. Every finding there today is one of those, so the rule is
+turned off for those directories in pyproject.toml.
 
 That exemption on its own would let real captures in later unnoticed. This is
 a ratchet: ``tools/b023_baseline.txt`` records how many findings each kernel
@@ -29,7 +29,8 @@ A count says a file gained a finding, not which closure is new. Run ruff
 directly to see the sites:
 
     ruff check --select B023 --config 'lint.per-file-ignores={}' \\
-        src/vllm_torchtpu/kernels
+        src/vllm_torchtpu/kernels src/vllm_torchtpu/megakernel/common \\
+        src/vllm_torchtpu/megakernel/kimi_k3/kernels
 
 Run directly to see the current state:
 
@@ -49,9 +50,13 @@ import sys
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 BASELINE_PATH = REPO_ROOT / "tools" / "b023_baseline.txt"
 
-# The directory B023 is switched off for. Mirrors the per-file-ignores entry
-# in pyproject.toml; the two move together.
-KERNELS = "src/vllm_torchtpu/kernels"
+# The directories B023 is switched off for. Mirrors the per-file-ignores
+# entries in pyproject.toml; the two move together.
+KERNELS = (
+    "src/vllm_torchtpu/kernels",
+    "src/vllm_torchtpu/megakernel/common",
+    "src/vllm_torchtpu/megakernel/kimi_k3/kernels",
+)
 
 
 def count_findings() -> dict[str, int]:
@@ -72,7 +77,7 @@ def count_findings() -> dict[str, int]:
             "lint.per-file-ignores={}",
             "--output-format",
             "json",
-            KERNELS,
+            *KERNELS,
         ],
         cwd=REPO_ROOT,
         stdout=subprocess.PIPE,
