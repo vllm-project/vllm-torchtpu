@@ -865,9 +865,14 @@ class TestAttentionMetadataBuilderPlumbing:
         for name in ref:
             a, b = fast[name], ref[name]
             for f in (
-                "input_positions", "block_tables", "seq_lens", "query_start_loc",
-                "request_distribution", "mamba_state_indices",
-                "mamba_slot_read_offsets", "mamba_ckpt_indices",
+                "input_positions",
+                "block_tables",
+                "seq_lens",
+                "query_start_loc",
+                "request_distribution",
+                "mamba_state_indices",
+                "mamba_slot_read_offsets",
+                "mamba_ckpt_indices",
                 "mamba_request_distribution",
             ):
                 x, y = getattr(a, f), getattr(b, f)

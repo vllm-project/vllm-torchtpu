@@ -408,9 +408,11 @@ def test_spec_tail_matches_per_chunk_assembly(monkeypatch, bucketed):
         [[11, 12, -1, -1], [21, -1, -1, -1], [31, 32, 33, 34], [-1, -1, -1, -1]],
         dtype=torch.int32,
     )
-    drafts = torch.arange(100, 100 + (rows if bucketed else num_reqs) * k).reshape(
-        -1, k
-    ).to(torch.int32)
+    drafts = (
+        torch.arange(100, 100 + (rows if bucketed else num_reqs) * k)
+        .reshape(-1, k)
+        .to(torch.int32)
+    )
     state = SimpleNamespace(
         num_reqs_list=[num_reqs],
         spec_decode_metadata_list=[
