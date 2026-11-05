@@ -1,0 +1,240 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""The query's fp8 projection with its per-head RMSNorm and RoPE fused in.
+
+Computes what ``fused_quantize_matmul`` followed by ``rope.qnorm_rope``
+compute, but the un-normalized bf16 query never goes to HBM and back. The
+matmul is ``fused_quantize_matmul``'s: the first grid step quantizes the
+resident activation and every step multiplies it by one output tile of the
+weight, here a whole number of heads. Each head's columns are rounded to bf16
+as the plain matmul stores them, then normed and rotated by ``qnorm_rope``'s
+own ops. The first step also gathers every token's cos/sin row and widens it
+to lanes, once for all steps.
+"""
+
+import functools
+
+import jax
+import jax.numpy as jnp
+from jax.experimental import pallas as pl
+from jax.experimental.pallas import tpu as pltpu
+
+from vllm_torchtpu.kernels.deepseek_v4.rope import (
+    LANE,
+    _cos_sin_lanes,
+    _qnorm_rope_rows,
+)
+from vllm_torchtpu.kernels.quantized_matmul import fused_quantize_matmul
+from vllm_torchtpu.kernels.quantized_matmul.tuned_block_sizes import (
+    get_device_vmem_limit,
+)
+
+# Token rows per cos/sin DMA issue loop iteration.
+COS_SIN_UNROLL = 8
+
+
+def _tile_n(m: int, k: int, n: int, itemsize: int, head_dim: int) -> int | None:
+    """``fused_quantize_matmul``'s output tile width, in whole heads."""
+    # The gathered cos/sin rows (lane-padded) and their cos and sin lanes, f32.
+    cos_sin_bytes = 3 * m * LANE * 4
+    return fused_quantize_matmul.output_tile_n(
+        m,
+        k,
+        n,
+        itemsize,
+        get_device_vmem_limit(),
+        multiple_of=head_dim,
+        extra_vmem_bytes=cos_sin_bytes,
+    )
+
+
+def applies(
+    x: jax.Array,
+    w_q: jax.Array,
+    w_scale: jax.Array,
+    cos_sin_cache: jax.Array,
+    head_dim: int,
+) -> bool:
+    """Whether ``q_proj_norm_rope`` takes these operands, the projection's
+    output being heads of ``head_dim`` side by side."""
+    m, k = x.shape
+    n = w_q.shape[1]
+    rotary_dim = cos_sin_cache.shape[1]
+    return (
+        fused_quantize_matmul.applies(x, w_q, w_scale)
+        and head_dim % LANE == 0
+        and n % head_dim == 0
+        and rotary_dim % 2 == 0
+        and rotary_dim <= LANE
+        and _tile_n(m, k, n, x.dtype.itemsize, head_dim) is not None
+    )
+
+
+def _kernel(
+    # scalar prefetch
+    positions_ref: jax.Ref,  # (M,) SMEM
+    # inputs
+    x_hbm_ref: jax.Ref,  # (M, K) bf16, HBM
+    w_ref: jax.Ref,  # (K, tile_n) fp8
+    w_scale_ref: jax.Ref,  # (N,) f32, resident
+    cos_sin_hbm_ref: jax.Ref,  # (max_position, rotary_dim), HBM
+    # outputs
+    out_ref: jax.Ref,  # (M, tile_n)
+    *refs: jax.Ref,
+    head_dim: int,
+    eps: float,
+    return_quantized: bool,
+):
+    if return_quantized:
+        # The (M, K) fp8 and (M, 1) f32 outputs, and their (2,) DMA semaphores.
+        x_q_out_ref, x_scale_out_ref, *refs, out_sems = refs
+    # cos_sin_ref: (M, rotary_dim) gathered rows; cos_ref, sin_ref: (M, LANE)
+    # f32, ``_cos_sin_lanes`` of them.
+    x_ref, x_q_ref, x_scale_ref, sems, cos_sin_ref, cos_ref, sin_ref, cos_sin_sem = refs
+    step = pl.program_id(0)
+
+    def quantized_copies():
+        return [
+            pltpu.make_async_copy(x_q_ref, x_q_out_ref, out_sems.at[0]),
+            pltpu.make_async_copy(x_scale_ref, x_scale_out_ref, out_sems.at[1]),
+        ]
+
+    @pl.when(step == 0)
+    def _():
+        copies = fused_quantize_matmul.start_activation_copies(x_hbm_ref, x_ref, sems)
+
+        # The row DMAs land while the activation is quantized.
+        @pl.loop(0, x_ref.shape[0], unroll=COS_SIN_UNROLL)
+        def _(t):
+            pltpu.make_async_copy(
+                cos_sin_hbm_ref.at[positions_ref[t]], cos_sin_ref.at[t], cos_sin_sem
+            ).start()
+
+        fused_quantize_matmul.quantize_activation(x_ref, x_q_ref, x_scale_ref, copies)
+        if return_quantized:
+            # Written back under the remaining steps' matmuls.
+            for copy in quantized_copies():
+                copy.start()
+        # One wait for all the row DMAs: the same byte count.
+        pltpu.make_async_copy(cos_sin_ref, cos_sin_ref, cos_sin_sem).wait()
+        cos, sin = _cos_sin_lanes(
+            cos_sin_ref[...], rotary_dim=cos_sin_ref.shape[1], inverse=False
+        )
+        cos_ref[...] = cos
+        sin_ref[...] = sin
+
+    tile_n = out_ref.shape[1]
+    for h in range(tile_n // head_dim):
+        # fused_quantize_matmul's dot and scaling, one head's columns at a time.
+        cols = pl.ds(h * head_dim, head_dim)
+        acc = jax.lax.dot_general(
+            x_q_ref[...],
+            w_ref[:, cols],
+            (((1,), (0,)), ((), ())),
+            preferred_element_type=jnp.float32,
+        )
+        acc = acc * x_scale_ref[...]
+        first = pl.multiple_of(step * tile_n + h * head_dim, LANE)
+        acc = acc * w_scale_ref[pl.ds(first, head_dim)][None, :]
+        # The bf16 query the plain matmul stores, read back as qnorm_rope does.
+        q = acc.astype(out_ref.dtype).astype(jnp.float32)
+        y = _qnorm_rope_rows(q, cos_ref[...], sin_ref[...], eps=eps)
+        out_ref[:, cols] = y.astype(out_ref.dtype)
+
+    if return_quantized:
+
+        @pl.when(step == pl.num_programs(0) - 1)
+        def _():
+            for copy in quantized_copies():
+                copy.wait()
+
+
+@functools.partial(jax.jit, static_argnames=("head_dim", "eps", "return_quantized"))
+def q_proj_norm_rope(
+    x: jax.Array,  # [M, K] bf16
+    w_q: jax.Array,  # [K, N] fp8
+    w_scale: jax.Array,  # [N]
+    positions: jax.Array,  # [M] int
+    cos_sin_cache: jax.Array,  # [max_position, rotary_dim]
+    *,
+    head_dim: int,
+    eps: float,
+    return_quantized: bool = False,
+) -> jax.Array | tuple[jax.Array, jax.Array, jax.Array]:
+    """``qnorm_rope(fused_quantize_matmul(x, w_q, w_scale).reshape(M, -1,
+    head_dim), positions, cos_sin_cache, eps=eps).reshape(M, N)`` where
+    ``applies`` holds.
+
+    With ``return_quantized``, also returns the fp8 activation and its (M, 1)
+    row scales, as ``fused_quantize_matmul`` does.
+    """
+    assert applies(x, w_q, w_scale, cos_sin_cache, head_dim), (
+        x.shape,
+        w_q.shape,
+        cos_sin_cache.shape,
+        head_dim,
+    )
+    m, k = x.shape
+    n = w_q.shape[1]
+    rotary_dim = cos_sin_cache.shape[1]
+    tile_n = _tile_n(m, k, n, x.dtype.itemsize, head_dim)
+    assert tile_n is not None
+    w_scale = w_scale.astype(jnp.float32)
+    out_shape = [jax.ShapeDtypeStruct((m, n), x.dtype)]
+    out_specs = [pl.BlockSpec((m, tile_n), lambda j, _: (0, j))]
+    scratch_shapes = [
+        pltpu.VMEM((m, k), x.dtype),
+        pltpu.VMEM((m, k), w_q.dtype),
+        pltpu.VMEM((m, 1), jnp.float32),
+        pltpu.SemaphoreType.DMA((m // fused_quantize_matmul.SUB_M,)),
+        pltpu.VMEM((m, rotary_dim), cos_sin_cache.dtype),
+        pltpu.VMEM((m, LANE), jnp.float32),
+        pltpu.VMEM((m, LANE), jnp.float32),
+        pltpu.SemaphoreType.DMA(()),
+    ]
+    if return_quantized:
+        out_shape += [
+            jax.ShapeDtypeStruct((m, k), w_q.dtype),
+            jax.ShapeDtypeStruct((m, 1), jnp.float32),
+        ]
+        out_specs += [pl.BlockSpec(memory_space=pltpu.HBM)] * 2
+        scratch_shapes.append(pltpu.SemaphoreType.DMA((2,)))
+    grid_spec = pltpu.PrefetchScalarGridSpec(
+        num_scalar_prefetch=1,
+        grid=(n // tile_n,),
+        in_specs=[
+            pl.BlockSpec(memory_space=pltpu.HBM),
+            pl.BlockSpec((k, tile_n), lambda j, _: (0, j)),
+            # Whole: a rank-1 block must be a power of two or 1024-aligned.
+            pl.BlockSpec((n,), lambda j, _: (0,)),
+            pl.BlockSpec(memory_space=pltpu.HBM),
+        ],
+        out_specs=out_specs,
+        scratch_shapes=scratch_shapes,
+    )
+    outs = pl.pallas_call(
+        functools.partial(
+            _kernel, head_dim=head_dim, eps=eps, return_quantized=return_quantized
+        ),
+        out_shape=out_shape,
+        grid_spec=grid_spec,
+        compiler_params=pltpu.CompilerParams(
+            # Steps after the first read the activation and cos/sin the first
+            # one wrote.
+            dimension_semantics=("arbitrary",),
+            vmem_limit_bytes=get_device_vmem_limit(),
+        ),
+        name="q_proj_norm_rope",
+    )(positions, x, w_q, w_scale, cos_sin_cache)
+    return tuple(outs) if return_quantized else outs[0]
