@@ -74,6 +74,7 @@ from vllm_torchtpu.kernels.experimental.fused_moe_prefill.fused_moe_prefill_kern
     gather_routes,
     gather_rows,
     own_rows,
+    rotated_scatter_rows,
     scatter_rows,
 )
 from vllm_torchtpu.kernels.experimental.moe_tp_decode import all_reduce
@@ -128,6 +129,9 @@ _E0_BUFFERS: dict[tuple[str, int], torch.Tensor] = {}
 # TPU_MOE_PREFILL_ROTATED_COLLECTIVES: (chip coords, core on chip) per mesh
 # index of each op mesh the rotated collectives run over (None: XLA's).
 _ROTATED_PLACES: dict[Any, list | None] = {}
+# TPU_PREFILL_SEQ_PARALLEL_EP_ROTATED_SCATTER: the same per EP op mesh, found
+# by arm_token_split_op (None: XLA's reduce-scatter).
+_EP_SCATTER_PLACES: dict[Any, list | None] = {}
 _SELFTEST_DONE = False
 
 
@@ -704,7 +708,7 @@ def _split_body(statics: _OpStatics, n_ranks: int, axis: str, rotated=None):
     return body
 
 
-def _ep_split_body(statics: _OpStatics, n_ranks: int, axis: str):
+def _ep_split_body(statics: _OpStatics, n_ranks: int, axis: str, rs_table=None):
     """The op's per-rank body for TPU_PREFILL_SEQ_PARALLEL_EP on an
     expert-parallel layer: x and scores hold this core's rows of the step
     (`own_rows`), and so does the output. Each core routes its own rows; the
@@ -712,7 +716,11 @@ def _ep_split_body(statics: _OpStatics, n_ranks: int, axis: str):
     experts and its slice of the shared expert run on every row as in
     _op_body's psum path, and the partials are reduce-scattered to each core's
     rows instead of all-reduced. Every row's routing and every sum's terms are
-    the ones _op_body computes for it."""
+    the ones _op_body computes for it. `rs_table`
+    (TPU_PREFILL_SEQ_PARALLEL_EP_ROTATED_SCATTER): the rotated reduce-scatter's
+    peer table over the op's mesh, numpy int32; the reduce-scatter then runs as
+    one rotated kernel per combine chunk, the core's mesh index from `rank`,
+    and a shape the kernel does not take keeps XLA's."""
 
     def body(
         x,
@@ -755,6 +763,8 @@ def _ep_split_body(statics: _OpStatics, n_ranks: int, axis: str):
             statics,
             e0.reshape(()),
         )
+        if rs_table is not None:
+            return rotated_scatter_rows(partial, rank.reshape(1), rs_table, axis)
         return scatter_rows(partial, axis)
 
     return body
@@ -775,7 +785,13 @@ def _get_op(mesh, statics: _OpStatics, prequant: bool = False, split: bool = Fal
     specs = (P(axis), P(axis), P(), P()) + (P(axis),) * (12 if prequant else 10)
     if split and statics.use_ep:
         assert not prequant
-        body = _ep_split_body(statics, int(mesh.size), axis)
+        places = _EP_SCATTER_PLACES.get(mesh)
+        rs_table = (
+            None
+            if places is None
+            else rotated_collectives.peer_table(places, "reduce_scatter")
+        )
+        body = _ep_split_body(statics, int(mesh.size), axis, rs_table)
     elif split:
         body = _split_body(statics, int(mesh.size), axis, _rotated_tables(mesh))
     else:
@@ -974,6 +990,25 @@ def _rotated_places(topo: _Topology) -> list | None:
         "TPU_MOE_PREFILL_ROTATED_COLLECTIVES",
         "the split MoE op's fp8 row all-gather and last reduce-scatter",
         _gather,
+    )
+
+
+def _ep_scatter_places(mesh) -> list | None:
+    """TPU_PREFILL_SEQ_PARALLEL_EP_ROTATED_SCATTER: the EP op mesh's chip
+    places over the EP group, as prefill_token_split finds them for
+    TPU_PREFILL_ROTATED_COLLECTIVES (small_all_reduce_op.rotated_places), or
+    None and XLA's reduce-scatter."""
+    if (index := ep_mesh_index()) is None:
+        logger.warning(
+            "TPU_PREFILL_SEQ_PARALLEL_EP_ROTATED_SCATTER: there is no EP group; "
+            "XLA's collectives"
+        )
+        return None
+    return small_all_reduce_op.rotated_places(
+        mesh,
+        index,
+        "TPU_PREFILL_SEQ_PARALLEL_EP_ROTATED_SCATTER",
+        "the split EP MoE's reduce-scatters",
     )
 
 
@@ -1231,7 +1266,18 @@ def arm_token_split_op(layer: Any, slot: Any) -> tuple[Any, int, torch.Tensor] |
     operand (int32 [1, 1]), or None when the layer is not armed or has no
     stage-A prefill kernel (FUSED_MOE_PREFILL_KERNEL_V2). An expert-parallel
     layer arms under TPU_PREFILL_SEQ_PARALLEL_EP, above the kernel's largest
-    token count, where its op runs the EP path."""
+    token count, where its op runs the EP path; with
+    TPU_PREFILL_SEQ_PARALLEL_EP_ROTATED_SCATTER the first such layer finds
+    its mesh's chip places (collective) for the rotated reduce-scatter, which
+    needs TPU_PREFILL_SEQ_PARALLEL_EP."""
+    if (
+        envs.TPU_PREFILL_SEQ_PARALLEL_EP_ROTATED_SCATTER
+        and not envs.TPU_PREFILL_SEQ_PARALLEL_EP
+    ):
+        raise ValueError(
+            "TPU_PREFILL_SEQ_PARALLEL_EP_ROTATED_SCATTER needs "
+            "TPU_PREFILL_SEQ_PARALLEL_EP=1"
+        )
     op = getattr(layer.quant_method, _OP_ATTR, None)
     if op is None:
         return None
@@ -1242,6 +1288,11 @@ def arm_token_split_op(layer: Any, slot: Any) -> tuple[Any, int, torch.Tensor] |
     if statics.use_ep:
         if not envs.TPU_PREFILL_SEQ_PARALLEL_EP:
             return None
+        if (
+            envs.TPU_PREFILL_SEQ_PARALLEL_EP_ROTATED_SCATTER
+            and mesh not in _EP_SCATTER_PLACES
+        ):
+            _EP_SCATTER_PLACES[mesh] = _ep_scatter_places(mesh)
         setattr(layer.quant_method, _OP_SPLIT_ATTR, _get_op(mesh, statics, split=True))
         setattr(layer, TOKEN_SPLIT_MOE_ATTR, slot)
         return mesh, max(kernel.ROW_BUCKETS), layer._moe_tp_decode_rank
