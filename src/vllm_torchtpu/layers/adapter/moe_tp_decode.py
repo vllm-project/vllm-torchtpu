@@ -67,11 +67,14 @@ from vllm_torchtpu.kernels.experimental.fused_moe_prefill import (
     row_all_gather,
 )
 from vllm_torchtpu.kernels.experimental.fused_moe_prefill.fused_moe_prefill_kernel_v2 import (  # noqa: E501
+    _as_words,
+    _from_words,
     _quantize_rows,
     fused_moe_prefill_stage_a,
     gather_routes,
     gather_rows,
     own_rows,
+    scatter_rows,
 )
 from vllm_torchtpu.kernels.experimental.moe_tp_decode import all_reduce
 from vllm_torchtpu.kernels.quantized_matmul.util import xla_quantized_matmul
@@ -701,6 +704,62 @@ def _split_body(statics: _OpStatics, n_ranks: int, axis: str, rotated=None):
     return body
 
 
+def _ep_split_body(statics: _OpStatics, n_ranks: int, axis: str):
+    """The op's per-rank body for TPU_PREFILL_SEQ_PARALLEL_EP on an
+    expert-parallel layer: x and scores hold this core's rows of the step
+    (`own_rows`), and so does the output. Each core routes its own rows; the
+    rows and their routes are all-gathered back in token order, this rank's
+    experts and its slice of the shared expert run on every row as in
+    _op_body's psum path, and the partials are reduce-scattered to each core's
+    rows instead of all-reduced. Every row's routing and every sum's terms are
+    the ones _op_body computes for it."""
+
+    def body(
+        x,
+        scores,
+        bias,
+        pad_mask,
+        w13,
+        w2,
+        s13,
+        s2,
+        sw13,
+        ss13,
+        sw2,
+        ss2,
+        rank,
+        e0,
+    ):
+        n = x.shape[0] * n_ranks
+        logger.info("moe_tp_decode: split EP MoE traced for %d tokens", n)
+        # The rank operand, not lax.axis_index: its partition-id is refused by
+        # XLA's SPMD partitioner in the model's whole-graph compile.
+        is_pad = own_rows(pad_mask[:n], rank.reshape(()), n_ranks)
+        w, ids = _route(x, scores, bias, is_pad, statics)
+        topk = ids.shape[1]
+        routes = gather_rows(
+            jnp.concatenate([ids.astype(jnp.int32), _as_words(w)], 1), axis
+        )
+        partial = _routed_partial(
+            gather_rows(x, axis),
+            _from_words(routes[:, topk:], w.dtype),
+            routes[:, :topk],
+            w13,
+            w2,
+            s13,
+            s2,
+            sw13,
+            ss13,
+            sw2,
+            ss2,
+            statics,
+            e0.reshape(()),
+        )
+        return scatter_rows(partial, axis)
+
+    return body
+
+
 def _get_op(mesh, statics: _OpStatics, prequant: bool = False, split: bool = False):
     """One jax_op per distinct closure; built at arming, never in a trace.
     `prequant`: the variant with two more per-rank operands, x_q [T, h/128,
@@ -714,7 +773,10 @@ def _get_op(mesh, statics: _OpStatics, prequant: bool = False, split: bool = Fal
     # Operands as moe_tp_decode_forward passes them; bias and the padding mask
     # are replicated, everything else is per rank.
     specs = (P(axis), P(axis), P(), P()) + (P(axis),) * (12 if prequant else 10)
-    if split:
+    if split and statics.use_ep:
+        assert not prequant
+        body = _ep_split_body(statics, int(mesh.size), axis)
+    elif split:
         body = _split_body(statics, int(mesh.size), axis, _rotated_tables(mesh))
     else:
         body = _op_body(statics, int(mesh.size), axis)
@@ -1167,9 +1229,9 @@ def arm_token_split_op(layer: Any, slot: Any) -> tuple[Any, int, torch.Tensor] |
     decoder layer fills to ask for them. Returns the op's mesh, the token
     count above which its prefill kernel runs and this rank's mesh index
     operand (int32 [1, 1]), or None when the layer is not armed or has no
-    stage-A prefill kernel (FUSED_MOE_PREFILL_KERNEL_V2)."""
-    if not envs.FUSED_MOE_PREFILL_KERNEL_V2:
-        return None
+    stage-A prefill kernel (FUSED_MOE_PREFILL_KERNEL_V2). An expert-parallel
+    layer arms under TPU_PREFILL_SEQ_PARALLEL_EP, above the kernel's largest
+    token count, where its op runs the EP path."""
     op = getattr(layer.quant_method, _OP_ATTR, None)
     if op is None:
         return None
@@ -1177,7 +1239,13 @@ def arm_token_split_op(layer: Any, slot: Any) -> tuple[Any, int, torch.Tensor] |
     if entry is None:
         return None
     (mesh, statics, _, _), _ = entry
-    if statics.prefill_above is None or statics.use_ep:
+    if statics.use_ep:
+        if not envs.TPU_PREFILL_SEQ_PARALLEL_EP:
+            return None
+        setattr(layer.quant_method, _OP_SPLIT_ATTR, _get_op(mesh, statics, split=True))
+        setattr(layer, TOKEN_SPLIT_MOE_ATTR, slot)
+        return mesh, max(kernel.ROW_BUCKETS), layer._moe_tp_decode_rank
+    if not envs.FUSED_MOE_PREFILL_KERNEL_V2 or statics.prefill_above is None:
         return None
     method = layer.quant_method
     setattr(method, _OP_SPLIT_ATTR, _get_op(mesh, statics, split=True))
