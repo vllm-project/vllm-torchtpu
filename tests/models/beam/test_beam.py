@@ -154,6 +154,7 @@ def test_config_accepts_released_model(clean_check_flags):
     assert config.cache_config.sliding_window is None
 
 
+_LINEAR_ROPE = {"rope_type": "linear", "rope_theta": 10000.0, "factor": 2.0}
 REJECTED_CONFIGS = {  # id: (overrides, error match)
     "dtype": ({"dtype": torch.float16}, "--dtype bfloat16"),
     "spec": ({"speculative_config": object()}, "--speculative-config"),
@@ -165,6 +166,7 @@ REJECTED_CONFIGS = {  # id: (overrides, error match)
     # Divides the 48 Q heads but not the 8 KV heads.
     "tp": ({"tensor_parallel_size": 3}, r"use one of \[1, 2, 4, 8\], got 3"),
     "hidden_act": ({"hidden_act": "gelu"}, "hidden_act='silu'"),
+    "rope_type": ({"rope_parameters": _LINEAR_ROPE}, "rope_type='default'"),
     "tied_embeddings": ({"tie_word_embeddings": True}, "tie_word_embeddings=False"),
 }
 
