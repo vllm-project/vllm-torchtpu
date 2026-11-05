@@ -13,6 +13,7 @@ if TYPE_CHECKING:
     TPU_DEEPSEEK_V41_ENGRAM_HBM: str = "auto"
     TPU_DEEPSEEK_V41_BLOCKED_ROPE_GATHER: bool = True
     TPU_DEEPSEEK_V41_FUSED_WO_AB: bool = True
+    TPU_DEEPSEEK_V41_QB_ROPE_EXACT_ROWS: bool = True
     TPU_DEEPSEEK_V41_CSA2_DEEP_GATHER: bool = True
     TPU_K3_SP_PREFILL: bool = False
     TPU_INCREMENTAL_BLOCK_TABLE_UPLOAD: bool = True
@@ -426,6 +427,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # output stays in VMEM). Same arithmetic as the two kernels (bit-exact).
     "TPU_DEEPSEEK_V41_FUSED_WO_AB": env_bool(
         "TPU_DEEPSEEK_V41_FUSED_WO_AB", default=True
+    ),
+    # [256, 64, 512] result. Same values (bit-exact).
+    "TPU_DEEPSEEK_V41_QB_ROPE_EXACT_ROWS": env_bool(
+        "TPU_DEEPSEEK_V41_QB_ROPE_EXACT_ROWS", default=True
     ),
     # CSA2 SparseCore word/scale gather: three staging slots in flight and
     # DMA-zeroed invalid rows instead of two slots cleared by vector stores
