@@ -50,3 +50,44 @@ def test_resident_gates_are_bitwise_identical(tokens):
             np.ascontiguousarray(r).view(np.uint8),
             np.ascontiguousarray(g).view(np.uint8),
         )
+
+
+@pytest.mark.skipif("jax.default_backend() != 'tpu'", reason="TPU7x mHC kernel")
+@pytest.mark.parametrize("tokens", [96, 288, 2048])
+def test_early_prep_is_bitwise_identical(tokens):
+    args = _inputs(tokens)
+    resident = {
+        "unpadded_gates": True,
+        "gate_input_mode": mhc.GateInputMode.COMPILER,
+    }
+    ref = jax.jit(lambda *a: _layers(resident, *a))(*args)
+    got = jax.jit(lambda *a: _layers({**resident, "early_prep": True}, *a))(*args)
+    for r, g in zip(ref, got, strict=True):
+        np.testing.assert_array_equal(
+            np.ascontiguousarray(r).view(np.uint8),
+            np.ascontiguousarray(g).view(np.uint8),
+        )
+
+
+@pytest.mark.skipif("jax.default_backend() != 'tpu'", reason="TPU7x mHC kernel")
+def test_t240_matches_unfused_fallback_within_rounding(monkeypatch):
+    from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v41 import (
+        deepseek_v41_mhc_op as op,
+    )
+
+    x, flat, post, comb, pre, weight, scale, base, norm = _inputs(240)
+    consts = (1e-20, 1e-6, 1e-6, 2.0, 20, 1e-6)
+
+    def layer(*args):
+        return op._post_pre_rms_jax(*args, *consts)
+
+    args = (x, flat, post, comb, weight, scale, base, pre, norm)
+    monkeypatch.setenv("TPU_DEEPSEEK_V41_MHC_SHIFTED_T16", "0")
+    ref = jax.jit(layer)(*args)
+    monkeypatch.setenv("TPU_DEEPSEEK_V41_MHC_SHIFTED_T16", "1")
+    got = jax.jit(layer)(*args)
+    # residual, value: one BF16 rounding step; gates: FP32 reassociation.
+    for r, g, rtol in zip(ref, got, (2.0**-7, 1e-4, 1e-4, 2.0**-6, 1e-4)):
+        r, g = np.asarray(r, np.float32), np.asarray(g, np.float32)
+        bound = np.maximum(np.abs(r), np.abs(g)) * rtol + 1e-6
+        assert np.all(np.abs(r - g) <= bound)

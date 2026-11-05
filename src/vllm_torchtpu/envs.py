@@ -16,6 +16,9 @@ if TYPE_CHECKING:
     TPU_DEEPSEEK_V41_INDEXER_ISSUE_DEPTH: int | None = 8
     TPU_DEEPSEEK_V41_INDEXER_PUBLISH_ISSUE_DEPTH: int | None = 7
     TPU_DEEPSEEK_V41_MHC_RESIDENT_GATES: bool = True
+    TPU_DEEPSEEK_V41_MHC_EARLY_PREP: bool = True
+    TPU_DEEPSEEK_V41_MHC_SHIFTED_T16: bool = True
+    TPU_DEEPSEEK_V41_DSPARK_PALLAS_LOGITS: bool = True
     TPU_DEEPSEEK_V41_BLOCKED_ROPE_GATHER: bool = True
     TPU_DEEPSEEK_V41_CSA2_SWA_PLAN: bool = False
     TPU_DEEPSEEK_V41_FUSED_WO_AB: bool = True
@@ -190,6 +193,9 @@ if TYPE_CHECKING:
     VLLM_TPU_FAST_TOKEN_SUBSTITUTION: bool = False
     VLLM_TPU_FUSED_DRAFT_LOOP: bool = False
     MM_ENCODER_FRAME_CHUNK_PATCH_SIZE: int = 0
+    TPU_GC_POLICY: str = "default"
+    TPU_GC_COLLECT_EVERY: int = 1000
+    TPU_GC_TRACE: bool = False
 
 
 def env_with_choices(
@@ -461,6 +467,24 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # outputs are unchanged.
     "TPU_DEEPSEEK_V41_MHC_RESIDENT_GATES": env_bool(
         "TPU_DEEPSEEK_V41_MHC_RESIDENT_GATES", default=True
+    ),
+    # Shifted mHC: build the first tile's gate coefficients while the first
+    # activation tiles are still in flight (scheduling only; outputs unchanged).
+    "TPU_DEEPSEEK_V41_MHC_EARLY_PREP": env_bool(
+        "TPU_DEEPSEEK_V41_MHC_EARLY_PREP", default=True
+    ),
+    # Shifted mHC: also run token counts that are a multiple of 16 but not 32
+    # (the DSpark drafter's 240 rows) through the fused kernel, with 16-token
+    # mix groups, instead of the unfused post + delayed-pre fallback. Changes
+    # only the drafter's rounding.
+    "TPU_DEEPSEEK_V41_MHC_SHIFTED_T16": env_bool(
+        "TPU_DEEPSEEK_V41_MHC_SHIFTED_T16", default=True
+    ),
+    # DSpark decode sampler: compute the drafter's BF16 base logits with the
+    # Pallas full-K head (kernels/logits_head.py) instead of the XLA dot.
+    # Changes only the draft logits' rounding (FP32 accumulation order).
+    "TPU_DEEPSEEK_V41_DSPARK_PALLAS_LOGITS": env_bool(
+        "TPU_DEEPSEEK_V41_DSPARK_PALLAS_LOGITS", default=True
     ),
     # Gather RoPE table rows (attention preprocessing, CSA2 inverse RoPE) as
     # 256-row gathers when a step has 257..1024 rows
@@ -1171,6 +1195,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "MM_ENCODER_FRAME_CHUNK_PATCH_SIZE": env_nonnegative_int(
         "MM_ENCODER_FRAME_CHUNK_PATCH_SIZE", 0
     ),
+    # How the Python cyclic collector is run while serving (gc_policy.py).
+    # 'freeze' takes the post-warmup heap out of its reach and replaces
+    # automatic collection with one explicit collection every
+    # TPU_GC_COLLECT_EVERY DP-coordinated steps, which every rank reaches
+    # together; 0 never collects. 'default' leaves CPython's own cadence.
+    "TPU_GC_POLICY": env_with_choices(
+        "TPU_GC_POLICY", "default", ["default", "freeze"]
+    ),
+    "TPU_GC_COLLECT_EVERY": env_nonnegative_int("TPU_GC_COLLECT_EVERY", 1000),
+    # Log every cyclic collection of 2 ms or more in the model runner and the
+    # engine core (generation, duration, wall-clock ns), to line stalls up
+    # with collections in the step records. Independent of TPU_GC_POLICY.
+    "TPU_GC_TRACE": env_bool("TPU_GC_TRACE", default=False),
 }
 
 

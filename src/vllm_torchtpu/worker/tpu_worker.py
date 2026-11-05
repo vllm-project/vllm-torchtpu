@@ -31,7 +31,7 @@ from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.worker.worker_base import CompilationTimes, WorkerBase
 
 import vllm_torchtpu.distributed.utils as dist_utils
-from vllm_torchtpu import envs, profiler_trace, utils
+from vllm_torchtpu import envs, gc_policy, profiler_trace, utils
 from vllm_torchtpu.distributed.pcp_rank_order import pcp_topology_order
 from vllm_torchtpu.layers.adapter.attention import TPU_STR_DTYPE_TO_TORCH_DTYPE
 from vllm_torchtpu.logger import init_logger
@@ -735,6 +735,7 @@ class TPUWorker(WorkerBase):
         compilation_time = time.perf_counter() - start
         self.compilation_config.compilation_time = compilation_time
         set_torch_threads_for_runtime()
+        gc_policy.arm_after_warmup()
         return CompilationTimes(language_model=compilation_time, encoder=0.0)
 
     def reload_kernels(self, modules: list[str] | None = None) -> dict:

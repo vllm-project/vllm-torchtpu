@@ -43,7 +43,15 @@ def _truncate_bf16(values: jax.Array) -> jax.Array:
 
 
 def is_supported_shape(t: int, m: int, d: int) -> bool:
-    return t > 0 and t % 32 == 0 and m == 4 and d == 5120
+    return t > 0 and t % 16 == 0 and m == 4 and d == 5120
+
+
+def _token_tile(t: int) -> int:
+    """Tokens per pipelined tile: 32-token mix groups, else 16 (T % 32 != 0)."""
+    for tile in (128, 96, 32, 80, 48, 16):
+        if t % tile == 0:
+            return tile
+    raise ValueError(f"T={t} is not a multiple of 16")
 
 
 def shifted_post_pre_rms(
@@ -66,10 +74,12 @@ def shifted_post_pre_rms(
     norm_weight: jax.Array | None = None,
     norm_eps: float = 1e-06,
     unpadded_gates: bool = False,
+    early_prep: bool = False,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
     """Update residuals and collapse with incoming pre; predict gates separately.
 
-    TPU7x: M=4, D=5120, positive local T divisible by 32.
+    TPU7x: M=4, D=5120, positive local T divisible by 16 (by 32 uses 32-token
+    mix groups; otherwise 16-token groups, e.g. T=240 in 80-token tiles).
     Activations are BF16; gates are FP32. Weight is packed BF16 [20480,128].
     Three-component mixing and BF16 residual/collapse rounding are retained;
     streamed square sums change the reference reduction order.
@@ -81,9 +91,11 @@ def shifted_post_pre_rms(
         ``unpadded_gates`` emits the gates T tokens wide instead of padded to a
         multiple of 128 (T <= 1024), so that between layers the [T,M] views
         are transposes of the next call's [M,T] gate inputs, not slices.
+        ``early_prep`` builds tile 0's gate coefficients while the first
+        activation tiles are still in flight instead of after they land.
     """
     t, d = x.shape
-    token_tile = 128 if t % 128 == 0 else 96 if t % 96 == 0 else 32
+    token_tile = _token_tile(t)
     num_tiles = t // token_tile
     input_buffers = min(3, num_tiles)
     output_buffers = min(2, num_tiles)
@@ -97,7 +109,9 @@ def shifted_post_pre_rms(
     mixes = m * (m + 2)
     assert is_supported_shape(t, m, d)
     gate_tokens = (t + 127) // 128 * 128
-    tuning = PostPreTuning(token_tile, 32, 256, 50 * 1024 * 1024)
+    tuning = PostPreTuning(
+        token_tile, 32 if token_tile % 32 == 0 else 16, 256, 50 * 1024 * 1024
+    )
     tile, group, columns = (
         tuning.token_tile,
         tuning.mix_group,
@@ -264,11 +278,13 @@ def shifted_post_pre_rms(
         def run_tile(tile_index, xr, rr, yr, vr):
             previous_projected = projection_buf[...]
 
-            @pl.when(tile_index == 0)
-            def wait_gates():
-                for copy in copies[:-1]:
-                    copy.wait()
-                prepare(0, 0)
+            if not early_prep:
+
+                @pl.when(tile_index == 0)
+                def wait_gates():
+                    for copy in copies[:-1]:
+                        copy.wait()
+                    prepare(0, 0)
 
             pre_tile = load_gate(pr, tile_index)
             slot = tile_index % 2
@@ -350,6 +366,10 @@ def shifted_post_pre_rms(
                 copy.start()
             if index == 0:
                 copies[-1].start()
+        if early_prep:
+            for copy in copies[:-1]:
+                copy.wait()
+            prepare(0, 0)
 
         def body(tile_index, unused):
             for copy in input_copies(tile_index):
