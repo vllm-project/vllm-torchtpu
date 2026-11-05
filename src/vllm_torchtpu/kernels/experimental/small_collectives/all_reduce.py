@@ -19,8 +19,25 @@
                each owner its columns; the owner sums them and pushes the sum
                back to everyone.
 
-Both forms start with a barrier so remote scratch is ready, sum in float32 and
-round once to the input dtype.
+Every form starts with a barrier so remote scratch is ready and sums in
+float32; one-shot and two-shot round once to the input dtype.
+
+    pairs      Two-shot by chip pairs (``pair_rows``): mesh indices 2i and
+               2i + 1 must be the two cores of chip i
+               (moe_tp_decode.all_reduce.check_chip_pairs).
+               Core 2i + p owns column chunk p * n / 2 + i, so the cores of
+               parity p own half p of the columns. Each core first sends its
+               chip-mate the mate's half over the on-chip link and adds the
+               two cores' values of its own half, rounded to the input dtype:
+               one chip sum per chunk. It sends each chip sum to the chunk's
+               owner on the other chips (n / 2 - 1 copies over ICI instead of
+               n - 1); the owner sums the n / 2 chip sums in float32 in chip
+               order and rounds once. Each owner sends its sum to the cores
+               of its parity on the other chips and to its mate, and every
+               core forwards the chunks of its parity to its mate as they
+               land, so a chunk crosses ICI once per chip. Same math as
+               two-shot, different rounding order: each chip's pair of
+               values is rounded once before the sum over chips.
 
 Valid rows (``n_valid``, data): a padded decode block (a batch-1 MTP step pads
 4 rows to 16) need not move its padding. With ``n_valid`` the two-shot form
@@ -35,6 +52,7 @@ the plain two-shot's.
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
@@ -58,8 +76,11 @@ ONE_SHOT_MAX_BYTES = 32 * 1024
 COLLECTIVE_ID = 5
 
 
-def form_for(rows, hidden, itemsize):
-    """The form for a block of rows x hidden elements of itemsize bytes."""
+def form_for(rows, hidden, itemsize, pair_rows=0):
+    """The form for a block of rows x hidden elements of itemsize bytes: by
+    chip pairs from pair_rows rows (0: never)."""
+    if 0 < pair_rows <= rows:
+        return "pairs"
     return "oneshot" if rows * hidden * itemsize <= ONE_SHOT_MAX_BYTES else "twoshot"
 
 
@@ -154,6 +175,119 @@ def _twoshot(x, n, axis, rank, collective_id):
         collective_id,
         f"small_all_reduce_twoshot_r{rows}",
     )
+
+
+def _twoshot_pairs(x, n, axis, rank, collective_id):
+    rows, hidden = x.shape
+    chips, own, half = n // 2, hidden // n, hidden // 2
+    dict_ids = rank is not None
+
+    def kernel(*refs):
+        me, refs = split_rank(refs, dict_ids, axis)
+        x_ref, o_ref, mates, chip_sums, send0, recv0, *refs = refs
+        slices, gathered, send1, recv1, send2, recv2 = refs
+        parity, chip, mate = lax.rem(me, 2), lax.div(me, 2), lax.bitwise_xor(me, 1)
+        mine = parity * chips + chip
+        barrier(n, axis, dict_ids)
+        # round 0: my mate's half of the columns into its `mates`
+        for p in range(2):
+
+            @pl.when(parity == p)
+            def _(p=p):
+                cols = pl.ds((1 - p) * half, half)
+                push(x_ref.at[:, cols], mates, send0, recv0, mate, axis, dict_ids)
+
+        wait_bytes_of(mates, recv0)
+        for p in range(2):
+
+            @pl.when(parity == p)
+            def _(p=p):
+                for i in range(chips):
+                    chip_sums[i] = (
+                        x_ref[:, pl.ds(p * half + i * own, own)].astype(jnp.float32)
+                        + mates[:, pl.ds(i * own, own)].astype(jnp.float32)
+                    ).astype(chip_sums.dtype)
+
+        # round 1: chip sum i into slot `chip` of the owner of my parity on chip i
+        for k in range(1, chips):
+            to = lax.rem(chip + k, chips)
+            push(
+                chip_sums.at[to],
+                slices.at[chip],
+                send1,
+                recv1,
+                2 * to + parity,
+                axis,
+                dict_ids,
+            )
+        slices[pl.ds(chip, 1)] = chip_sums[pl.ds(chip, 1)]
+        wait_bytes_of(slices.at[pl.ds(0, chips - 1)], recv1)
+        gathered[pl.ds(mine, 1)] = sum_slots(slices, chips).astype(gathered.dtype)[None]
+
+        # round 2: my sum to my parity on the other chips and to my mate, then
+        # each chunk of my parity on to my mate as it lands
+        def send(c, to):
+            push(gathered.at[c], gathered.at[c], send2, recv2.at[c], to, axis, dict_ids)
+
+        def landed(c):
+            wait_bytes_of(gathered.at[c], recv2.at[c])
+
+        for k in range(1, chips):
+            send(mine, 2 * lax.rem(chip + k, chips) + parity)
+        send(mine, mate)
+        for k in range(1, chips):
+            c = parity * chips + lax.rem(chip + chips - k, chips)
+            landed(c)
+            send(c, mate)
+        for i in range(chips):
+            landed((1 - parity) * chips + i)
+        for j in range(n):
+            o_ref[:, pl.ds(j * own, own)] = gathered[j]
+        wait_bytes_of(mates, send0)
+        wait_bytes_of(slices.at[pl.ds(0, chips - 1)], send1)
+        wait_bytes_of(gathered.at[pl.ds(0, n - 1)], send2)
+
+    scratch = [
+        pltpu.VMEM((rows, half), x.dtype),
+        pltpu.VMEM((chips, rows, own), x.dtype),
+        *[pltpu.SemaphoreType.DMA] * 2,
+        pltpu.VMEM((chips, rows, own), x.dtype),
+        pltpu.VMEM((n, rows, own), x.dtype),
+        *[pltpu.SemaphoreType.DMA] * 3,
+        pltpu.SemaphoreType.DMA((n,)),
+    ]
+    return call(
+        kernel,
+        x,
+        rows,
+        rank,
+        scratch,
+        collective_id,
+        f"small_all_reduce_pairs_r{rows}",
+    )
+
+
+def selftest_blocks(num_cores, rows, hidden):
+    """[num_cores, rows, hidden] float32 blocks whose chip sums and sums are
+    integers exact in bf16 and differ between lane blocks: core 0 holds its
+    lane-block index modulo 256 - 6 (n - 1), core d >= 1 holds
+    ((d + 1) 3 + 5 row + 7 block) % 11 - 5. A chunk that lands in the wrong
+    columns or skips a core changes the sum."""
+    big = 2 ** (jnp.finfo(jnp.bfloat16).nmant + 1) - 6 * (num_cores - 1)
+    if big < 2:
+        raise ValueError(f"the self-test sums are not exact in bf16 on {num_cores}")
+    d = np.arange(num_cores)[:, None, None]
+    r = np.arange(rows)[None, :, None]
+    c = np.arange(hidden)[None, None, :] // LANES
+    x = (((d + 1) * 3 + r * 5 + c * 7) % 11 - 5).astype(np.float32)
+    x[0] = np.broadcast_to((c[0] % big).astype(np.float32), (rows, hidden))
+    return x
+
+
+def selftest_ok(blocks, out) -> bool:
+    """Whether one core's all-reduce of selftest_blocks is the exact sum."""
+    want = np.asarray(blocks, np.float32).sum(0)
+    return bool(np.array_equal(np.asarray(out, np.float32).reshape(want.shape), want))
 
 
 def fold_geometry(rows, hidden, num_cores, tile_rows):
@@ -330,7 +464,14 @@ def small_all_reduce_valid_rows(
 
 
 def small_all_reduce(
-    x, *, num_cores, axis, rank=None, form=None, collective_id=COLLECTIVE_ID
+    x,
+    *,
+    num_cores,
+    axis,
+    rank=None,
+    form=None,
+    collective_id=COLLECTIVE_ID,
+    pair_rows=0,
 ):
     """The sum of ``x`` over the ``num_cores`` cores of mesh axis ``axis``,
     inside a shard_map over that axis.
@@ -340,13 +481,18 @@ def small_all_reduce(
         num_cores * LANES.
       rank: int32 [1], this core's index on the axis as data (the torch
         bridge), or None to read it from the axis.
-      form: "oneshot" or "twoshot"; by default ``form_for`` the block.
+      form: "oneshot", "twoshot" or "pairs"; by default ``form_for`` the
+        block.
+      pair_rows: blocks of at least this many rows take the pairs form by
+        default (0: none).
     """
     rows, hidden = x.shape
     if hidden % (num_cores * LANES):
         raise ValueError(
             f"hidden {hidden} is not a multiple of {num_cores} cores x {LANES} lanes"
         )
-    form = form or form_for(rows, hidden, jnp.dtype(x.dtype).itemsize)
-    build = {"oneshot": _oneshot, "twoshot": _twoshot}[form]
+    form = form or form_for(rows, hidden, jnp.dtype(x.dtype).itemsize, pair_rows)
+    if form == "pairs" and num_cores % 2:
+        raise ValueError(f"the pairs form needs an even core count, not {num_cores}")
+    build = {"oneshot": _oneshot, "twoshot": _twoshot, "pairs": _twoshot_pairs}[form]
     return build(x, num_cores, axis, rank, collective_id)

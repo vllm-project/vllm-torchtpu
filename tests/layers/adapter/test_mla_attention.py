@@ -852,6 +852,7 @@ def test_streamidx_op_is_shared_by_layers_with_one_kernel_config(monkeypatch):
         "skip_empty_decode_chunked",
         "mixed_bkvp",
         "decode_pack",
+        "decode_ring",
         "shared_meta",
         "topk",
     }

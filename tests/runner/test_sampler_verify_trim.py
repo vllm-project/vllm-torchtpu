@@ -243,7 +243,8 @@ def test_positive_control_trimmed_draw_shape_is_caught(dev):
     ],
 )
 def test_verify_trim_rows_gate(padded, drafts, flag, expect):
-    r = SimpleNamespace(_sampler_verify_trim=flag)
+    r = SimpleNamespace(_sampler_verify_trim=flag, _sampler_verify_trim_rows=())
+    r._verify_trim_buckets = lambda n: TPUModelRunner._verify_trim_buckets(r, n)
     got = TPUModelRunner._verify_trim_rows(r, padded, np.asarray(drafts))
     assert got == expect
     assert tpu_runner._VERIFY_TRIM_ROWS == 8

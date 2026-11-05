@@ -51,9 +51,29 @@ from vllm_torchtpu.kernels.mla.sparse import native_sc_gather  # noqa: E402
 pytestmark = pytest.mark.tpu_test
 
 FLAG = "TPU_MLA_KV_WRITE_IN_GATHER"
+MAX_TOKENS_FLAG = "TPU_MLA_KV_WRITE_IN_GATHER_MAX_TOKENS"
 OUT_SIZE = 4 * 2048  # 4 query tokens x topk 2048 (decode-sized gather)
 NUM_OWNERS = 32
-_WRITE_CELLS = tuple(n for n, (_, t) in tcw._CELLS.items() if t <= 32)
+# The writer cells, and MTP steps of 16 sequences that start mid-chunk: the
+# 64-token bucket, four write rounds sharing one semaphore set.
+_CELLS = {
+    **tcw._CELLS,
+    "straddle_chunk_t64": (
+        [
+            (tcw._rank_chunk(r, c) + off, 4)
+            for r, c, off in zip(
+                (0, 3, 7, 15, 9, 11, 2, 14, 1, 4, 5, 6, 8, 10, 12, 13),
+                (0, 5, 17, 63, 70, 100, 129, 150, 33, 41, 88, 120, 160, 175, 12, 190),
+                (1, 2, 3, 1, 2, 3, 2, 1, 3, 1, 2, 3, 1, 2, 3, 1),
+            )
+        ],
+        64,
+    ),
+}
+_WRITE_CELLS = tuple(
+    n for n, (_, t) in _CELLS.items() if t <= native_sc_gather.MAX_WRITE_TOKENS
+)
+_CONTROL_CELLS = (*tcw._CONTROL_CELLS, "straddle_chunk_t64")
 
 
 def _require_tpu():
@@ -136,7 +156,7 @@ def _compare(got, want, num_live):
 @pytest.mark.parametrize("cell", _WRITE_CELLS)
 def test_gather_write_matches_writer_then_gather(cell, num_live):
     _require_tpu()
-    seqs, num_tokens = tcw._CELLS[cell]
+    seqs, num_tokens = _CELLS[cell]
     inp = tcw._inputs(seqs, num_tokens)
     owned = 0
     for rank in range(tcw.DCP_SIZE):
@@ -153,7 +173,7 @@ def test_packed_rope_gather_write_matches_writer_then_gather(cell, num_live):
     """TPU_SPARSE_MLA_PACKED_ROPE: the write phase DMAs 16-word rope tokens
     (eight to a cache row) and the gather reads them back padded."""
     _require_tpu()
-    seqs, num_tokens = tcw._CELLS[cell]
+    seqs, num_tokens = _CELLS[cell]
     inp = tcw._inputs(seqs, num_tokens, packed_rope=True)
     for rank in range(tcw.DCP_SIZE):
         got, want, _ = _run_rank(inp, rank, num_live)
@@ -179,13 +199,13 @@ def test_packed_rope_gather_write_positive_control_fails(fault):
 @pytest.mark.parametrize(
     "fault", ["wrong_row", "skip_write", "ignore_owner", "no_fence", "late_write"]
 )
-@pytest.mark.parametrize("cell", tcw._CONTROL_CELLS)
+@pytest.mark.parametrize("cell", _CONTROL_CELLS)
 def test_gather_write_positive_control_fails(cell, fault):
     """Every rank that owns a row must go red (ignore_owner: every rank
     that does not own all of them); no_fence must at least change a gathered
     row somewhere, or the fence is not shown to matter."""
     _require_tpu()
-    seqs, num_tokens = tcw._CELLS[cell]
+    seqs, num_tokens = _CELLS[cell]
     inp = tcw._inputs(seqs, num_tokens)
     owning = caught = gathered_caught = 0
     # no_fence is a race (hit on 0-2 of ~10 owning ranks per pass, j-a5040f59
@@ -218,10 +238,14 @@ def test_gather_write_positive_control_fails(cell, fault):
 # --- DCP: sparse_mla_attention_dcp, caches + partials on every rank --------
 
 
-def _dcp(dcp, flag, kv_write_fault=None, packed_rope=False):
+def _dcp(
+    dcp, flag, kv_write_fault=None, packed_rope=False, bucket64=False, max_tokens=None
+):
     env = dict(prologue.PROD_ENV, TPU_MLA_DECODE_PROLOGUE="1")
     if flag:
         env[FLAG] = "1"
+    if max_tokens is not None:
+        env[MAX_TOKENS_FLAG] = str(max_tokens)
     from vllm_torchtpu.kernels.mla import tc_scatter
 
     jax.clear_caches()  # the spies below count traces
@@ -238,8 +262,12 @@ def _dcp(dcp, flag, kv_write_fault=None, packed_rope=False):
     ):
         if not flag:
             os.environ.pop(FLAG, None)
+        if max_tokens is None:
+            os.environ.pop(MAX_TOKENS_FLAG, None)
         extra = {} if kv_write_fault is None else {"kv_write_fault": kv_write_fault}
-        res = prologue._dcp_run(dcp, candidate=True, packed_rope=packed_rope, **extra)
+        res = prologue._dcp_run(
+            dcp, candidate=True, packed_rope=packed_rope, bucket64=bucket64, **extra
+        )
         writes_in_gather = sum(
             c.kwargs.get("kv_write") is not None for c in gather_spy.call_args_list
         )
@@ -266,6 +294,24 @@ def test_dcp_caches_partials_and_lse_bit_identical():
             np.testing.assert_array_equal(b[k], a[k], err_msg=f"step {i} {k}")
         lse = a["lse"].view(np.float32).reshape(dcp, -1, prologue.HEADS)
         assert np.isfinite(lse).any(axis=0)[: a["real"]].all(), f"step {i}"
+
+
+def test_dcp_bucket64_writes_in_the_live_group_gather():
+    """TPU_MLA_KV_WRITE_IN_GATHER_MAX_TOKENS=64: the 64-token mixed bucket, a
+    one-chunk live-group call, writes its rows in its gather (four rounds)
+    instead of the SparseCore cache scatters; caches, partials and lse stay
+    bit-identical, and the 256-token bucket keeps its writer."""
+    _require_tpu()
+    dcp = _dcp_size()
+    if dcp < 2:
+        pytest.skip("DCP needs at least 2 devices")
+    ref, ref_tc, ref_kvw = _dcp(dcp, flag=False, bucket64=True)
+    got, got_tc, got_kvw = _dcp(dcp, flag=True, bucket64=True, max_tokens=64)
+    assert (ref_tc, ref_kvw) == (2, 0), (ref_tc, ref_kvw)
+    assert (got_tc, got_kvw) == (0, 3), (got_tc, got_kvw)
+    for i, (a, b) in enumerate(zip(ref, got)):
+        for k in ("nope", "rope", "out", "lse"):
+            np.testing.assert_array_equal(b[k], a[k], err_msg=f"step {i} {k}")
 
 
 def _rope_tokens(words, token_words):
@@ -346,7 +392,54 @@ def test_flag_defaults_off():
 
     with mock.patch.dict(os.environ):
         os.environ.pop(FLAG, None)
+        os.environ.pop(MAX_TOKENS_FLAG, None)
         assert not envs.TPU_MLA_KV_WRITE_IN_GATHER
+        assert envs.TPU_MLA_KV_WRITE_IN_GATHER_MAX_TOKENS == 32
+
+
+def test_write_semaphore_sets():
+    """Up to two rounds each round keeps its own set (the 16- and 32-token
+    kernels as before); three to six rounds and the single-writer control share
+    one, the three semaphores of a one-round write."""
+    sets = native_sc_gather.write_semaphore_sets
+    assert [sets(t, None) for t in (16, 32, 48, 64, 80, 96)] == [1, 2, 1, 1, 1, 1]
+    assert sets(32, "no_fence") == sets(64, "no_fence") == sets(80, "no_fence") == 1
+
+
+def test_kv_write_in_gather_max_tokens():
+    """The 64-, 80- and 96-token buckets take the write only under the knob,
+    and no knob value takes a bucket past six write rounds."""
+    from vllm_torchtpu.layers.core import attention_interface
+
+    nope_spec, rope_spec = tcw._specs()
+    supported = attention_interface.kv_write_in_gather_supported
+    env = {"TPU_DCP_MLA_TOPK_CAP": "512"}
+    with mock.patch.dict(os.environ, env):
+        os.environ.pop(MAX_TOKENS_FLAG, None)
+        assert supported(nope_spec, rope_spec, 32, 2048)
+        assert not supported(nope_spec, rope_spec, 64, 2048)
+    with mock.patch.dict(os.environ, {**env, MAX_TOKENS_FLAG: "64"}):
+        assert supported(nope_spec, rope_spec, 64, 2048)
+        assert not supported(nope_spec, rope_spec, 80, 2048)
+    with mock.patch.dict(os.environ, {**env, MAX_TOKENS_FLAG: "96"}):
+        assert supported(nope_spec, rope_spec, 80, 2048)
+        assert supported(nope_spec, rope_spec, 96, 2048)
+    with mock.patch.dict(os.environ, {**env, MAX_TOKENS_FLAG: "128"}):
+        assert not supported(nope_spec, rope_spec, 128, 2048)
+
+
+def test_one_capped_gather_takes_the_one_chunk_live_group_bucket():
+    """Under the production chunking the 64-, 80- and 96-token buckets are
+    one live-group chunk (one gather); a bucket of two chunks is not."""
+    from vllm_torchtpu.layers.core import attention_interface
+
+    with mock.patch.dict(os.environ, prologue.PROD_ENV):
+        assert attention_interface.one_capped_gather(32, 512)
+        assert attention_interface.one_capped_gather(64, 512)
+        assert attention_interface.one_capped_gather(80, 512)
+        assert attention_interface.one_capped_gather(96, 512)
+        assert not attention_interface.one_capped_gather(512, 512)
+        assert not attention_interface.one_capped_gather(64, None)
 
 
 @pytest.mark.parametrize("cell", _WRITE_CELLS)
@@ -355,7 +448,7 @@ def test_lane_dense_pack_is_pack_tokens(cell):
     zeros after), on raw random bytes."""
     from vllm_torchtpu.layers.core import attention_interface
 
-    seqs, num_tokens = tcw._CELLS[cell]
+    seqs, num_tokens = _CELLS[cell]
     inp = tcw._inputs(seqs, num_tokens)
     for values, spec in zip(("kv_c_normed", "k_pe"), tcw._specs()):
         want = np.asarray(kv_cache_utils.pack_tokens(inp[values], spec.token_bytes))
@@ -367,11 +460,11 @@ def test_lane_dense_pack_is_pack_tokens(cell):
         assert not got[:, want.shape[1] :].any()
 
 
-def test_live_rows_with_two_round_write_is_rejected():
+@pytest.mark.parametrize("tokens", [32, 64])
+def test_live_rows_with_two_round_write_is_rejected(tokens):
     """row_live_atoms with a kv_write of more than 16 tokens (two write rounds)
     hangs the kernel on v7x; the wrapper refuses it before launching."""
     _require_tpu()
-    tokens = 32
     out_size = tokens * 2048
     write = native_sc_gather.pack_write_rows(
         jnp.full((tokens,), -1, jnp.int32),

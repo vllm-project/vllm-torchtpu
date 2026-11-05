@@ -1048,6 +1048,24 @@ def dcp_mla_topk_cap(dcp_size: int) -> int:
     return topk_cap
 
 
+def dcp_small_chunk_gather_atoms(num_tokens: int) -> int:
+    """TPU_DCP_MLA_SMALL_CHUNK_GATHER_ATOMS: the small-chunk SparseCore gather's
+    atoms per batch at a bucket of `num_tokens` (static: the JAX op's shape),
+    from its `T=<atoms>` entries; a bucket it does not list takes 1."""
+    spec = envs.TPU_DCP_MLA_SMALL_CHUNK_GATHER_ATOMS.strip()
+    for entry in filter(None, (e.strip() for e in spec.split(","))):
+        tokens, _, atoms = entry.partition("=")
+        if int(tokens) != num_tokens:
+            continue
+        if int(atoms) < 1 or num_tokens % int(atoms):
+            raise ValueError(
+                f"TPU_DCP_MLA_SMALL_CHUNK_GATHER_ATOMS: {entry!r} needs atoms "
+                f"dividing the {num_tokens}-token bucket"
+            )
+        return int(atoms)
+    return 1
+
+
 def _mixed_body_levers(value: str, kernel_v2: bool = False) -> tuple[str, ...]:
     """TPU_DCP_MLA_MIXED_BODY -> the live body's lever tuple ("1" = default set),
     plus the stage-A levers with TPU_DCP_MLA_MIXED_KERNEL_V2."""
@@ -1062,6 +1080,16 @@ def _mixed_body_levers(value: str, kernel_v2: bool = False) -> tuple[str, ...]:
             v for v in sparse_mla_kernel.MIXED_KERNEL_V2_LEVERS if v not in levers
         )
     return levers
+
+
+def _mixed_body_small_levers(value: str) -> tuple[str, ...]:
+    """TPU_DCP_MLA_MIXED_BODY_SMALL -> the small live buckets' lever tuple
+    ("1" = `MIXED_BODY_SMALL_DEFAULT`, else a comma list; empty / "0" = off)."""
+    if not value or value == "0":
+        return ()
+    if value == "1":
+        return sparse_mla_kernel.MIXED_BODY_SMALL_DEFAULT
+    return tuple(v.strip() for v in value.split(",") if v.strip())
 
 
 def _decode_body_levers(value: str) -> tuple[str, ...]:
@@ -1104,12 +1132,15 @@ def kv_write_in_gather_supported(
     num_tokens: int,
     topk: int,
 ) -> bool:
-    """Whether TPU_MLA_KV_WRITE_IN_GATHER can take this decode step.
+    """Whether TPU_MLA_KV_WRITE_IN_GATHER can take this step's caches and size.
 
-    The fused-prep capped gather must run (SparseCore caches, a top-k wider
-    than TPU_DCP_MLA_TOPK_CAP), a nope token must be one 128-word row and a
-    rope token one 32-word SparseCore row (16 words under packed rope), and
-    the step at most 32 tokens (two subcore rounds; `FUSED_PREP_MAX_TOKENS`).
+    A capped gather must run (SparseCore caches, a top-k wider than
+    TPU_DCP_MLA_TOPK_CAP), a nope token must be one 128-word row and a rope
+    token one 32-word SparseCore row (16 words under packed rope), and the
+    step at most TPU_MLA_KV_WRITE_IN_GATHER_MAX_TOKENS tokens (32 by default:
+    the fused-prep decode buckets, two subcore rounds) and never more than
+    `native_sc_gather.MAX_WRITE_TOKENS` (four rounds). Whether one gather
+    serves the call is `one_capped_gather`.
     """
     topk_cap = envs.TPU_DCP_MLA_TOPK_CAP
     rope_words = (
@@ -1117,8 +1148,11 @@ def kv_write_in_gather_supported(
         if rope_spec.packed_rope
         else native_sc_gather.ROPE_WORDS
     )
+    max_tokens = min(
+        envs.TPU_MLA_KV_WRITE_IN_GATHER_MAX_TOKENS, native_sc_gather.MAX_WRITE_TOKENS
+    )
     return (
-        0 < num_tokens <= sparse_mla_kernel.FUSED_PREP_MAX_TOKENS
+        0 < num_tokens <= max_tokens
         and bool(topk_cap)
         and topk > topk_cap
         and nope_spec.layout is kv_cache_utils.KVCacheLayout.SPARSECORE
@@ -1130,13 +1164,40 @@ def kv_write_in_gather_supported(
     )
 
 
-def fused_small_a2a_bucket_config(num_tokens: int) -> tuple[bool | tuple, int]:
+def one_capped_gather(num_tokens: int, topk_cap: int | None) -> bool:
+    """Whether one capped SparseCore gather serves a DCP attention call of
+    `num_tokens` tokens, so it can write the call's KV rows itself: the
+    fused-prep decode path (TPU_DCP_MLA_MASK_IN_KERNEL and
+    TPU_DCP_MLA_FUSED_PREP), or a live-group call (TPU_DCP_MLA_MIXED_LIVE) of
+    one TPU_DCP_MLA_TOPK_CAP_CHUNK chunk. `topk_cap` is the cap the call
+    takes, None when it takes none."""
+    if num_tokens <= sparse_mla_kernel.FUSED_PREP_MAX_TOKENS:
+        return bool(envs.TPU_DCP_MLA_MASK_IN_KERNEL and envs.TPU_DCP_MLA_FUSED_PREP)
+    return bool(
+        envs.TPU_DCP_MLA_MIXED_LIVE
+        and sparse_mla_kernel.live_group_one_gather(
+            num_tokens,
+            topk_cap,
+            envs.TPU_DCP_MLA_TOPK_CAP_CHUNK,
+            envs.TPU_DCP_MLA_SMALL_CHUNK_TOKENS,
+            envs.TPU_DCP_MLA_SMALL_CHUNK_BATCH,
+        )
+    )
+
+
+def fused_small_a2a_bucket_config(
+    num_tokens: int, steps: bool = False
+) -> tuple[bool | tuple, int]:
     """TPU_MLA_FUSED_SMALL_A2A: (operands pinned to HBM, scoped VMEM MiB) of the
     fused call at a decode bucket of `num_tokens` (static: the JAX op's shape).
     TPU_MLA_FUSED_SMALL_A2A_BUCKETS, when set, gives it per bucket as
     `T=<pins>@<MiB>` entries (`<pins>`: all | none | roles of
     `sparse_mla_kernel.SEND_EXCHANGE_PIN_ROLES` joined by `+`); a bucket it does
-    not list, or an empty knob, takes PIN_MIN_TOKENS / PIN_VMEM_MIB / VMEM_MIB."""
+    not list, or an empty knob, takes PIN_MIN_TOKENS / PIN_VMEM_MIB / VMEM_MIB;
+    a multi-step bucket (`steps`, TPU_MLA_FUSED_XCHG_MAX_TOKENS) it does not
+    list pins only the gathered KV at VMEM_MIB (unpinned, XLA stages it into
+    VMEM and the kernel's DMAs of it compile to vector copies: 2.2x the
+    code)."""
     spec = (envs.TPU_MLA_FUSED_SMALL_A2A_BUCKETS or "").strip()
     for entry in filter(None, (e.strip() for e in spec.split(","))):
         tokens, _, rest = entry.partition("=")
@@ -1156,6 +1217,8 @@ def fused_small_a2a_bucket_config(num_tokens: int) -> tuple[bool | tuple, int]:
                     f"TPU_MLA_FUSED_SMALL_A2A_BUCKETS: unknown roles {bad}"
                 )
         return pin, int(mib) if mib.strip() else envs.TPU_MLA_FUSED_SMALL_A2A_VMEM_MIB
+    if steps:
+        return ("kv",), envs.TPU_MLA_FUSED_SMALL_A2A_VMEM_MIB
     pin = num_tokens >= envs.TPU_MLA_FUSED_SMALL_A2A_PIN_MIN_TOKENS
     vmem_mib = (
         envs.TPU_MLA_FUSED_SMALL_A2A_PIN_VMEM_MIB
@@ -1246,8 +1309,10 @@ def sparse_mla_attention_dcp(
         merge's chunks. False for a caller that reads it whole: joining the
         pieces is a copy.
 
-    TPU_MLA_KV_WRITE_IN_GATHER: on fused-prep decode buckets the step's KV
-    write is not a kernel of its own; the SparseCore gather that feeds the
+    TPU_MLA_KV_WRITE_IN_GATHER: on buckets one capped gather serves
+    (`one_capped_gather`: fused-prep decode buckets, and one-chunk live-group
+    buckets up to TPU_MLA_KV_WRITE_IN_GATHER_MAX_TOKENS) the step's KV write
+    is not a kernel of its own; the SparseCore gather that feeds the
     attention kernel writes the packed rows (same owner mask, same bytes)
     and fences before it gathers.
 
@@ -1388,23 +1453,39 @@ def sparse_mla_attention_dcp(
             )
         # TPU_MLA_FUSED_SMALL_A2A_MERGE_MAX_TOKENS: buckets above it keep the
         # kernel's exchange but merge in the op (jnp), same result schema.
+        # TPU_MLA_FUSED_XCHG_MAX_TOKENS: a fused bucket above the decode step
+        # runs the exchange over several grid steps and merges in the kernel.
+        step_tokens = sparse_mla_kernel.decode_step_tokens(
+            _decode_body_levers(envs.TPU_MLA_DECODE_BODY_LEVERS)
+        )
+        xchg_steps = bool(fuse_here and step_tokens and topk_idx.shape[0] > step_tokens)
         merge_here = bool(
             fused_merge
-            and topk_idx.shape[0] <= envs.TPU_MLA_FUSED_SMALL_A2A_MERGE_MAX_TOKENS
+            and (
+                topk_idx.shape[0] <= envs.TPU_MLA_FUSED_SMALL_A2A_MERGE_MAX_TOKENS
+                or xchg_steps
+            )
         )
         if dcp_rank_ids is not None:
             dcp_rank = extra_[int(q_rope)][0]
         else:
             dcp_rank = streamindex_topk.cp_rank_as_data(dcp_axis_name, dcp_size)
         decode_bucket = topk_idx.shape[0] <= sparse_mla_kernel.FUSED_PREP_MAX_TOKENS
+        # The capped path (and its chunk) applies only where the kernel takes
+        # it: SparseCore caches and a top-k wider than the cap.
+        topk_cap = dcp_mla_topk_cap(dcp_size)
+        if not (
+            topk_cap
+            and cache_layout == sparse_mla_kernel.SPARSECORE_CACHE_LAYOUT
+            and topk_idx.shape[-1] > topk_cap
+        ):
+            topk_cap = None
         kv_in_gather = (
             envs.TPU_MLA_KV_WRITE_IN_GATHER
-            and envs.TPU_DCP_MLA_MASK_IN_KERNEL
-            and envs.TPU_DCP_MLA_FUSED_PREP
-            and decode_bucket
             and kv_write_in_gather_supported(
                 nope_spec, rope_spec, kv_c_normed.shape[0], topk_idx.shape[-1]
             )
+            and one_capped_gather(topk_idx.shape[0], topk_cap)
         )
         kv_write = None
         if kv_in_gather:
@@ -1484,7 +1565,9 @@ def sparse_mla_attention_dcp(
                     split_kwargs["send_world"] = dcp_size
                 if fused_exchange and fuse_here:
                     # Static per bucket (the JAX op's shape, not a torch gate).
-                    pin, vmem_mib = fused_small_a2a_bucket_config(num_tokens)
+                    pin, vmem_mib = fused_small_a2a_bucket_config(
+                        num_tokens, steps=xchg_steps
+                    )
                     split_kwargs["send_exchange"] = (
                         dcp_axis_name,
                         lane_axis,
@@ -1500,15 +1583,6 @@ def sparse_mla_attention_dcp(
                     split_kwargs["send_peer"] = jnp.stack(peer)
         else:
             q, split_kwargs = jnp.concatenate([ql_nope, q_pe], axis=-1), {}
-        # The capped path (and its chunk) applies only where the kernel takes
-        # it: SparseCore caches and a top-k wider than the cap.
-        topk_cap = dcp_mla_topk_cap(dcp_size)
-        if not (
-            topk_cap
-            and cache_layout == sparse_mla_kernel.SPARSECORE_CACHE_LAYOUT
-            and topk_idx.shape[-1] > topk_cap
-        ):
-            topk_cap = None
         chunk_kwargs = (
             {
                 "gather_and_attention_chunk_size": envs.TPU_DCP_MLA_TOPK_CAP_CHUNK,
@@ -1572,6 +1646,8 @@ def sparse_mla_attention_dcp(
             # Largest chunk (tokens) that takes the small-chunk path (16 =
             # kernel default).
             small_chunk_tokens=small_chunk_tokens,
+            small_chunk_gather_atoms=dcp_small_chunk_gather_atoms(topk_idx.shape[0]),
+            sparsecore_gather_early_dma=envs.TPU_MLA_GATHER_EARLY_DMA and decode_bucket,
             lse_mask_empty=mask_in_kernel,
             fused_window_prep=fused_prep,
             mixed_live_gather=envs.TPU_DCP_MLA_MIXED_LIVE,
@@ -1580,6 +1656,9 @@ def sparse_mla_attention_dcp(
             ),
             mixed_body_levers=_mixed_body_levers(
                 envs.TPU_DCP_MLA_MIXED_BODY, envs.TPU_DCP_MLA_MIXED_KERNEL_V2
+            ),
+            mixed_body_small_levers=_mixed_body_small_levers(
+                envs.TPU_DCP_MLA_MIXED_BODY_SMALL
             ),
             kv_write=kv_write,
             kv_write_fault=None if kv_write_fault == "wrong_owner" else kv_write_fault,
@@ -1592,9 +1671,29 @@ def sparse_mla_attention_dcp(
             decode_body_levers=_decode_body_levers(envs.TPU_MLA_DECODE_BODY_LEVERS),
             out_pieces=out_pieces,
             out_pieces_gather_first=envs.TPU_DCP_MLA_MERGE_PIECES >= 3,
+            out_vmem=(
+                envs.TPU_DCP_MLA_OUT_VMEM_MIB * 1024 * 1024
+                if topk_idx.shape[0] <= envs.TPU_DCP_MLA_OUT_VMEM_MAX_TOKENS
+                else 0
+            ),
             **chunk_kwargs,
             **split_kwargs,
             **packed_rope_kwargs,
+            **(
+                {"packed_gather": True}
+                if envs.TPU_SPARSE_MLA_GATHER_PACKED_ROPE
+                and cache_layout == sparse_mla_kernel.SPARSECORE_CACHE_LAYOUT
+                and topk_idx.shape[0]
+                > envs.bucket_gate_edge(
+                    envs.TPU_SPARSE_MLA_GATHER_PACKED_ROPE_MIN_TOKENS
+                )
+                else {}
+            ),
+            **(
+                {"gather_window_cache": True}
+                if envs.TPU_PREFILL_GATHER_WINDOW_CACHE and not decode_bucket
+                else {}
+            ),
         )
         output, lse = attn[:2]
         if kv_write is not None:
