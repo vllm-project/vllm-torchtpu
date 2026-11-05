@@ -236,7 +236,7 @@ def test_should_fuse_pool_io_with_and_without_registered_hook(monkeypatch):
     assert cache.should_fuse_pool_io(spec, ex, fused_pool_io=True) is True
 
     monkeypatch.setattr(_builtins, "_LOADED", set(_builtins.BUILTINS))
-    monkeypatch.setattr(fused_io_hook, "_REGISTRY", {})
+    monkeypatch.setattr(fused_io_hook, "_IMPL", None)
     assert not fused_io_hook.fused_io_available()
     assert cache.should_fuse_pool_io(spec, ex, fused_pool_io="auto") is False
     assert cache.should_fuse_pool_io(spec, ex, fused_pool_io=False) is False
