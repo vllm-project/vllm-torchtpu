@@ -298,6 +298,12 @@ def fp8_skinny_matmul_stacked(
     return out
 
 
+def window_supports(k: int, n: int, width: int) -> bool:
+    """Whether `TUNED` has an `'n'`-split tiling of `(k, n)` that divides `width`."""
+    config = TUNED.get((k, n))
+    return config is not None and config[0] == "n" and width % config[1] == 0
+
+
 # Sites where TPU_FP8_SKINNY_SCALE_DMA is used in the model: those whose XLA scale
 # copy was measured exposed on GLM-5.2-FP8 decode (twin j-69560162 / j-dae7fb62:
 # o_proj's f32[6144] copy sits one instruction before the call, ~0.8 us per layer).
