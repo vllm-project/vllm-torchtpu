@@ -62,15 +62,24 @@ PRIORITY_KERNEL_TUNING = -9
 PR_TPU_JOBS_PER_AUTHOR = 40
 
 # The suite's lanes, in upload order. Lane <lane> is
-# .buildkite/pipeline_<lane>.yml; no other file is uploaded as a lane. CI_LANES
-# picks a subset - a scheduled pipeline names its own lane. Without it a build
-# runs every lane but perf, which has scheduled builds of its own; nightly
-# builds still run perf, and so does the integration pipeline, whose LKG
-# promotion waits on two perf steps. A PR whose change needs perf/eval coverage
-# asks for it with the run-perf-eval label, or the full nightly suite across
-# every lane with run-full-ci; adding either label to a ready PR starts a build.
+# .buildkite/pipeline_<lane>.yml, or the files LANE_FILES names for it; no
+# other file is uploaded as a lane. CI_LANES picks a subset - a scheduled
+# pipeline names its own lane. Without it a build runs every lane but perf,
+# which has scheduled builds of its own; nightly builds still run perf, and so
+# does the integration pipeline, whose LKG promotion waits on two perf steps. A
+# PR whose change needs perf/eval coverage asks for it with the run-perf-eval
+# label, or the full nightly suite across every lane with run-full-ci; adding
+# either label to a ready PR starts a build.
 ALL_LANES: tuple[str, ...] = ("verify", "perf", "integration", "tests")
 DEFAULT_LANES: tuple[str, ...] = ("verify", "integration", "tests")
+# The files of a lane that has more than one, in upload order. The tests lane
+# keeps its CPU steps, which do not depend on the TPU generation, apart from its
+# TPU steps. Each upload goes in right after the bootstrap step, so the file
+# uploaded last shows (and queues) first: the CPU steps stay ahead of the TPU
+# ones, as when the two shared a file.
+LANE_FILES: Mapping[str, tuple[str, ...]] = {
+    "tests": (".buildkite/pipeline_tests.yml", ".buildkite/pipeline_tests_cpu.yml"),
+}
 DEFAULT_INTEGRATION_SLUG = "vllm-torchtpu-integration"
 DEFAULT_DEV_PIPELINE_FILE = ".buildkite/pipeline_dev.yml"
 VLLM_UPSTREAM_REPO = "https://github.com/vllm-project/vllm.git"
@@ -368,6 +377,11 @@ def resolve_vllm_commit_hash(base_hash: str, override: str) -> str:
     return override if override else base_hash
 
 
+def files_for_lane(lane: str) -> tuple[str, ...]:
+    """Return the pipeline files lane `lane` uploads, in upload order."""
+    return LANE_FILES.get(lane, (f".buildkite/pipeline_{lane}.yml",))
+
+
 def plan_uploads(
     ctx: BuildContext,
     *,
@@ -444,11 +458,11 @@ def plan_uploads(
         for lane in ALL_LANES:
             if lane not in requested_lanes:
                 continue
-            rel_path = f".buildkite/pipeline_{lane}.yml"
-            if rel_path in existing_lane_files:
-                lane_files.append(rel_path)
-            else:
-                missing.append(rel_path)
+            for rel_path in files_for_lane(lane):
+                if rel_path in existing_lane_files:
+                    lane_files.append(rel_path)
+                else:
+                    missing.append(rel_path)
 
     post_annotations: list[Annotation] = []
     missing_error: str | None = None
@@ -856,9 +870,10 @@ def run_bootstrap(
             merged_labels = effects.merged_pr_labels(pr_num, env=child_env)
 
     existing_lanes = {
-        f".buildkite/pipeline_{lane}.yml"
+        rel_path
         for lane in ALL_LANES
-        if (repo_root / f".buildkite/pipeline_{lane}.yml").is_file()
+        for rel_path in files_for_lane(lane)
+        if (repo_root / rel_path).is_file()
     }
     upload_plan = plan_uploads(
         ctx,

@@ -4,7 +4,8 @@ CI runs on the Kueue fleet: `bootstrap.sh` uploads the `pipeline_<lane>.yml`
 lanes (`tests`, `integration`, `perf`, `verify`), and every step runs in a pod
 through `.buildkite/kubernetes/run.sh`.
 
-`pipeline_tests.yml` runs unmarked unit tests in `tests/` in CPU pods and
+The `tests` lane is two files. `pipeline_tests_cpu.yml` runs the type check and
+unmarked unit tests in `tests/` in CPU pods, and `pipeline_tests.yml` runs
 tests marked `tpu_test` (or `multichip`) on TPU v7x slices (1x1x1 and 2x2x1).
 PR steps exclude `nightly` tests; nightly steps include them. Both use the CI
 image built by `pipeline_build.yml`. The CPU steps set `JAX_PLATFORMS=cpu` so
@@ -26,7 +27,8 @@ A PR labeled `skip-tpu-ci` (it still needs `ready`) runs only the `tests` lane
 and the image build, and the lane's `Unit Tests on TPU` group is skipped through
 `SKIP_TPU_CI`, so what runs is the type check and the CPU unit tests. The
 post-merge build of such a PR does the same: `bootstrap.sh` reads the merged
-PR's labels from GitHub. Keep TPU steps of the `tests` lane inside that group.
+PR's labels from GitHub. Keep TPU steps of the `tests` lane inside that group,
+and its CPU steps in `pipeline_tests_cpu.yml`.
 
 Releases and nightly images are published by the `vllm-torchtpu-release`
 pipeline in the TPU Release cluster; [`release/README.md`](https://github.com/vllm-project/vllm-torchtpu/blob/main/.buildkite/release/README.md)

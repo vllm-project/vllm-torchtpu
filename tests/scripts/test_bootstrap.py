@@ -35,9 +35,10 @@ from unittest import mock
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
 _SCRIPTS_DIR = _REPO_ROOT / ".buildkite" / "scripts"
 
+# Every file a lane uploads: one per lane, and the tests lane's CPU steps.
 _ALL_LANE_FILES = frozenset(
-    f".buildkite/pipeline_{lane}.yml"
-    for lane in ("verify", "perf", "integration", "tests")
+    f".buildkite/pipeline_{name}.yml"
+    for name in ("verify", "perf", "integration", "tests", "tests_cpu")
 )
 
 _FAKE_AGENT_BODY = """
@@ -188,6 +189,16 @@ class TestBootstrapUnits(unittest.TestCase):
             existing_lane_files=_ALL_LANE_FILES,
         )
         self.assertEqual(default_plan.lanes, ("verify", "integration", "tests"))
+        # The tests lane is two files, TPU then CPU, so the CPU steps show first.
+        self.assertEqual(
+            default_plan.lane_files,
+            (
+                ".buildkite/pipeline_verify.yml",
+                ".buildkite/pipeline_integration.yml",
+                ".buildkite/pipeline_tests.yml",
+                ".buildkite/pipeline_tests_cpu.yml",
+            ),
+        )
         self.assertEqual(default_plan.omni_image_skip, "")
 
         # run-full-ci + oncall-fix turns on NIGHTLY and all four lanes.
@@ -220,6 +231,10 @@ class TestBootstrapUnits(unittest.TestCase):
         )
         self.assertTrue(skip_plan.skip_tpu_ci)
         self.assertEqual(skip_plan.lanes, ("tests",))
+        self.assertEqual(
+            skip_plan.lane_files,
+            (".buildkite/pipeline_tests.yml", ".buildkite/pipeline_tests_cpu.yml"),
+        )
         self.assertLessEqual(len(skip_plan.omni_image_skip), 70)
 
         # Post-merge webhook honors merged PR's skip-tpu-ci label; CI_LANES=perf
@@ -264,6 +279,16 @@ class TestBootstrapUnits(unittest.TestCase):
             existing_lane_files={".buildkite/pipeline_tests.yml"},
         )
         self.assertIsNotNone(gap_err.missing_ci_lanes_error)
+
+        # The tests lane's CPU file has to exist too when the lane is named.
+        no_cpu_file = bp.plan_uploads(
+            bp.BuildContext.from_env({"CI_LANES": "tests"}),
+            merged_labels=(),
+            existing_lane_files={".buildkite/pipeline_tests.yml"},
+        )
+        self.assertIn(
+            "pipeline_tests_cpu.yml", no_cpu_file.missing_ci_lanes_error or ""
+        )
 
         rendered = bp.prepare_upload_yaml(
             'if: \'build.env("NIGHTLY") == "1"\'\n', job_priority=12, nightly=True
@@ -534,6 +559,7 @@ class TestBootstrapUnits(unittest.TestCase):
             ("perf", "Perf and Eval on TPU"),
             ("integration", "integration_tpu"),
             ("tests", "Unit Tests on TPU"),
+            ("tests_cpu", "Unit Tests - CPU (PR)"),
             ("build", "build_docker_group"),
         )
 
@@ -600,7 +626,7 @@ class TestBootstrapUnits(unittest.TestCase):
             self.assertEqual(bp.run_bootstrap(env, repo_root=_REPO_ROOT, effects=fx), 0)
             return fx
 
-        # PR default: priority 6, pre-merge class, 4 uploads, SKIP_TPU_CI=0.
+        # PR default: priority 6, pre-merge class, 5 uploads, SKIP_TPU_CI=0.
         pr = run(
             {
                 "BUILDKITE_PULL_REQUEST": "42",
@@ -617,11 +643,14 @@ class TestBootstrapUnits(unittest.TestCase):
         )
         self.assertEqual(pr.annotations, [])
         self.assertEqual(
-            [u[0] for u in pr.uploads], ["verify", "integration", "tests", "build"]
+            [u[0] for u in pr.uploads],
+            ["verify", "integration", "tests", "tests_cpu", "build"],
         )
         self.assertEqual(pr.uploads[2][2]["SKIP_TPU_CI"], "0")
-        self.assertEqual(pr.uploads[3][2]["OMNI_IMAGE_SKIP"], "")
+        self.assertEqual(pr.uploads[-1][2]["OMNI_IMAGE_SKIP"], "")
         self.assertIn("tpu-pr/alice@example.com", pr.uploads[2][1])
+        # The CPU steps hold no chips, so they stay out of the author's TPU cap.
+        self.assertNotIn("tpu-pr/alice@example.com", pr.uploads[3][1])
 
         # PR skip-tpu-ci & post-merge main webhook honoring merged PR skip-tpu-ci.
         for fx, prio, wprio in (
@@ -651,9 +680,11 @@ class TestBootstrapUnits(unittest.TestCase):
             self.assertIn(("JOB_PRIORITY", prio), fx.meta)
             self.assertIn(("WORKLOAD_PRIORITY", wprio), fx.meta)
             self.assertEqual(fx.annotations, ["skip-tpu-ci"])
-            self.assertEqual([u[0] for u in fx.uploads], ["tests", "build"])
+            self.assertEqual(
+                [u[0] for u in fx.uploads], ["tests", "tests_cpu", "build"]
+            )
             self.assertEqual(fx.uploads[0][2]["SKIP_TPU_CI"], "1")
-            self.assertTrue(bool(fx.uploads[1][2]["OMNI_IMAGE_SKIP"]))
+            self.assertTrue(bool(fx.uploads[-1][2]["OMNI_IMAGE_SKIP"]))
 
         # PR run-full-ci + oncall-fix & scheduled Nightly (no WORKLOAD_PRIORITY).
         full = run(
@@ -678,7 +709,7 @@ class TestBootstrapUnits(unittest.TestCase):
         for fx in (full, nightly):
             self.assertEqual(
                 [u[0] for u in fx.uploads],
-                ["verify", "perf", "integration", "tests", "build"],
+                ["verify", "perf", "integration", "tests", "tests_cpu", "build"],
             )
             for _, content, _ in fx.uploads:
                 self.assertNotIn('build.env("NIGHTLY")', content)
@@ -688,7 +719,7 @@ class TestBootstrapUnits(unittest.TestCase):
         self.assertIn(("VLLM_COMMIT_HASH", "upstream999"), integ.meta)
         self.assertEqual(
             [u[0] for u in integ.uploads],
-            ["promote", "verify", "perf", "integration", "tests", "build"],
+            ["promote", "verify", "perf", "integration", "tests", "tests_cpu", "build"],
         )
         self.assertEqual(run({"BUILDKITE_MESSAGE": "doc [skip ci]"}).uploads, [])
         self.assertEqual(
