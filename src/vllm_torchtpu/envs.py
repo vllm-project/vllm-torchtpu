@@ -84,6 +84,7 @@ if TYPE_CHECKING:
     TPU_KERNEL_ITER_MODE: bool = False
     TPU_KERNEL_RELOAD_MODULES: str = ""
     TPU_GREEDY_TOP_TOKENS: bool = False
+    TPU_FP8_ATTENTION: bool = False
     DP_SCHED_ENABLED: bool = False
     MLA_XPOSE_N_TILE_SIZE: int = 160
     MIXED_Q_SPLIT: int | None = None
@@ -911,6 +912,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_PP_RING_DEPTH": env_int("TPU_PP_RING_DEPTH", 2),
     # Enable pre-compile rotation to speed up the startup time.
     "TPU_PARALLEL_PRECOMPILE": env_bool("TPU_PARALLEL_PRECOMPILE", default=False),
+    # Opt in to FP8 QK/PV compute in batched RPA prefill on compatible FP8 KV layers.
+    "TPU_FP8_ATTENTION": env_bool("TPU_FP8_ATTENTION", default=False),
     # Under TPU_PARALLEL_PRECOMPILE, take a subgraph's ranges biggest first,
     # so local rank 0 starts on the biggest one. Off keeps vLLM's order.
     "TPU_PRECOMPILE_BIGGEST_FIRST": env_bool(

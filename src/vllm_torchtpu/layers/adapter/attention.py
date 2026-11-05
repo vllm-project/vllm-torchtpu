@@ -21,6 +21,7 @@ from typing import Any, ClassVar, cast
 
 import jax
 import torch
+from jax.experimental.pallas import tpu as pltpu
 from jax.sharding import PartitionSpec as P
 from torch_tpu._internal import pallas
 from vllm.compilation import backends as vllm_compilation_backends
@@ -554,9 +555,15 @@ def _pallas_rpa_kernel_batched(
     kv_layout: batched_rpa_configs.KVLayout,
     decode_query_size: int = 1,
     block_major: bool = False,
+    fp8_compute: bool = False,
 ) -> tuple[jax.Array, jax.Array]:
     """Batched-RPA Pallas kernel entry — used by
     `PallasBatchedRPAAttentionBackendImpl`."""
+    rpa_kwargs: dict[str, Any] = {}
+    if decode_query_size > 1:
+        rpa_kwargs["decode_query_size"] = decode_query_size
+    if fp8_compute:
+        rpa_kwargs["fp8_compute"] = True
     return _pallas_rpa_kernel_impl(
         kv_cache,
         query,
@@ -574,10 +581,8 @@ def _pallas_rpa_kernel_batched(
         sliding_window=sliding_window,
         skip_kv_update=skip_kv_update,
         rpa_func=(
-            functools.partial(
-                ragged_paged_attention_batched, decode_query_size=decode_query_size
-            )
-            if decode_query_size > 1
+            functools.partial(ragged_paged_attention_batched, **rpa_kwargs)
+            if rpa_kwargs
             else ragged_paged_attention_batched
         ),
         sm_scale=sm_scale,
@@ -948,6 +953,7 @@ class PallasAttentionBackendImpl(AttentionImpl):
         # `(pool_index, layout)` identifying this layer's region in the merged
         # block-major unified pool; populated by `set_block_major_pool()`.
         self._bm_region: tuple[int, BlockMajorPoolLayout] | None = None
+        self.fp8_compute: bool = False
 
     def set_block_major_pool(
         self, pool_index: int, layout: BlockMajorPoolLayout
@@ -971,7 +977,9 @@ class PallasAttentionBackendImpl(AttentionImpl):
         use_pcp_streaming: bool = False,
         cp_kv_cache_interleave_size: int = 0,
         block_major: bool = False,
+        fp8_compute: bool | None = None,
     ):
+        use_fp8_compute = self.fp8_compute if fp8_compute is None else fp8_compute
         ctx = get_vllm_model_wrapper_context()
         vllm_config = cast("VllmConfig | None", ctx.vllm_config)
         max_model_len = (
@@ -996,6 +1004,7 @@ class PallasAttentionBackendImpl(AttentionImpl):
             pcp_kv_layout,
             self.decode_query_size,
             block_major,
+            use_fp8_compute,
         )
         existing = self._kernel_config_cache.get(config_key)
         if existing is not None:
@@ -1038,6 +1047,7 @@ class PallasAttentionBackendImpl(AttentionImpl):
             pcp_kv_layout,
             self.decode_query_size,
             block_major,
+            use_fp8_compute,
         )
         existing = self._kernel_registry.get(registry_key)
         if existing is not None:
@@ -1078,6 +1088,8 @@ class PallasAttentionBackendImpl(AttentionImpl):
                 )
             if "decode_query_size" in entry_params:
                 entry_kwargs["decode_query_size"] = self.decode_query_size
+            if use_fp8_compute and "fp8_compute" in entry_params:
+                entry_kwargs["fp8_compute"] = True
             if block_major:
                 if "block_major" not in entry_params:
                     raise NotImplementedError(
@@ -1387,6 +1399,15 @@ class PallasAttentionBackendImpl(AttentionImpl):
             parallel_config is not None
             and parallel_config.prefill_context_parallel_size > 1
         )
+        dcp_configured = (
+            parallel_config is not None
+            and getattr(parallel_config, "decode_context_parallel_size", 1) > 1
+        )
+        if self.fp8_compute and (pcp_configured or dcp_configured):
+            raise NotImplementedError(
+                "TPU_FP8_ATTENTION: PCP streaming and DCP attention kernels "
+                "do not support fp8_compute."
+            )
         if pcp_configured:
             self._validate_pcp_streaming_support(skip_kv_update)
             self.decode_query_size = 1
@@ -1441,7 +1462,20 @@ class PallasAttentionBackendImpl(AttentionImpl):
             v_scale,
             skip_kv_update=skip_kv_update,
             block_major=self._bm_kernel,
+            fp8_compute=self.fp8_compute,
         )
+        if self.fp8_compute:
+            # Also pre-register the non-FP8 variant so layers with padded KV
+            # page heads (`kv_page_head_padding > 0`) never route padded heads
+            # into `fp8_compute` and never trace op creation inside Dynamo.
+            self._build_rpa_kernel(
+                q_scale,
+                k_scale,
+                v_scale,
+                skip_kv_update=skip_kv_update,
+                block_major=self._bm_kernel,
+                fp8_compute=False,
+            )
 
     def runs_batched_rpa_schedule(self) -> bool:
         return False
@@ -1622,6 +1656,7 @@ class PallasAttentionBackendImpl(AttentionImpl):
             use_pcp_streaming=use_pcp_streaming,
             cp_kv_cache_interleave_size=cp_kv_cache_interleave_size,
             block_major=self._bm_kernel,
+            fp8_compute=self.fp8_compute and pad_size == 0,
         )
 
         # TODO (geyuhao) the support of this API is pending discussion.
@@ -1706,6 +1741,42 @@ class PallasBatchedRPAAttentionBackendImpl(PallasAttentionBackendImpl):
         # head_dim 64 is rerouted to the hd64 kernel.
         if spec is not None and self.head_size != 64:
             self.decode_query_size = spec.num_speculative_tokens + 1
+        if envs.TPU_FP8_ATTENTION:
+            self.fp8_compute = self._fp8_compute_supported()
+            logger.info_once(
+                "TPU_FP8_ATTENTION: %s for layers with %d q heads, %d kv heads, "
+                "head size %d, sliding window %s, kv cache %s",
+                "fp8 QK/PV prefill" if self.fp8_compute else "bf16 query path",
+                self.num_heads,
+                self.num_kv_heads,
+                self.head_size,
+                self.sliding_window,
+                self.kv_cache_quantized_dtype,
+            )
+
+    def _fp8_compute_supported(
+        self, num_heads: int | None = None, num_kv_heads: int | None = None
+    ) -> bool:
+        """Return whether `fp8_compute=True` supports this layer."""
+        if self.kv_cache_quantized_dtype != torch.float8_e4m3fn:
+            return False
+        if (num_heads is None) != (num_kv_heads is None):
+            raise ValueError("Pass both head counts or neither.")
+        if num_heads is None or num_kv_heads is None:
+            num_heads, num_kv_heads = self.num_heads, self.num_kv_heads
+        packing = get_dtype_packing(self.kv_cache_quantized_dtype)
+        try:
+            chip = pltpu.get_tpu_info_for_chip(get_chip_version(), 1)
+        except Exception:
+            return False
+        if chip is None:
+            return False
+        return (
+            chip.fp8_ops_per_second > chip.bf16_ops_per_second
+            and self.head_size != 64
+            and (num_heads // num_kv_heads) % packing == 0
+            and self.sinks is None
+        )
 
 
 @register_backend(AttentionBackendEnum.FLASH_ATTN_MLA)
