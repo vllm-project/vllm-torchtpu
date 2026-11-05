@@ -27,6 +27,7 @@ from vllm_torchtpu.layers.adapter.linear_common import (
 )
 from vllm_torchtpu.utils import synchronize_tensors
 
+from ..common import request_table
 from . import csa2_adapter, preprocess_ops
 from .attention_kernels import (
     gathered_kv_cache_scope,
@@ -166,7 +167,7 @@ def _window_starts():
 def _replayed(metadata, positions, starts, window):
     """Tokens a prefix hit replays: their prefix-cached KV must stay as is."""
     requests = _token_requests(metadata, positions).clamp(max=starts.shape[0] - 1)
-    start = starts[requests]
+    start = request_table.per_request(starts, requests)
     return (start > 0) & (positions >= start) & (positions < start + window)
 
 
@@ -225,8 +226,8 @@ def save_compress_norm(
         cache = state_cache
         rows = torch.arange(kv_score.shape[0], device=kv_score.device)
         requests = token_to_req_indices.long().clamp(max=query_start_loc.numel() - 2)
-        starts = query_start_loc[requests]
-        ends = query_start_loc[requests + 1]
+        starts = request_table.per_request(query_start_loc, requests)
+        ends = request_table.per_request(query_start_loc, requests + 1)
         previous_slots = (
             slot_mapping.clamp(min=0) // capacity * capacity
             + (positions - 1) % capacity
@@ -878,11 +879,13 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
             )
             # A request's first row pools with the ring's stored predecessor;
             # only its last ring-capacity rows are stored.
-            has_prev = rows != starts_loc[requests]
+            has_prev = rows != request_table.per_request(starts_loc, requests)
             slots = _cache_slots(state_cache, state_meta, positions, ring=True)
             previous = _cache_slots(state_cache, state_meta, positions - 1, ring=True)
             stored = (slots >= 0) & (
-                rows >= starts_loc[requests + 1] - state_cache.shape[1]
+                rows
+                >= request_table.per_request(starts_loc, requests + 1)
+                - state_cache.shape[1]
             )
             args += [
                 has_prev[:, None].int(),
