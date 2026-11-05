@@ -154,9 +154,12 @@ def _block_table(metadata):
     return metadata.block_tables.reshape(metadata.seq_lens.shape[0], -1)
 
 
-def _token_requests(metadata, positions):
-    rows = torch.arange(positions.shape[0], device=positions.device)
-    return torch.bucketize(rows, metadata.query_start_loc[1:], right=True)
+def _token_requests(metadata, positions, out_int32=False):
+    dtype = torch.int32 if out_int32 else torch.int64
+    rows = torch.arange(positions.shape[0], device=positions.device, dtype=dtype)
+    return table_lookup.bucketize_right(
+        rows, metadata.query_start_loc[1:], out_int32=out_int32
+    )
 
 
 def _window_starts():
@@ -178,15 +181,17 @@ def _cache_slots(
     *,
     compress_ratio=1,
     ring=False,
+    wide=True,
     offset=0,
 ):
     """Addresses of ``positions + offset`` from the shared TPU metadata contract.
 
+    ``wide=False`` computes in int32, for a cache whose slots fit in it.
     Layers of one cache group read the same tables, so a stage computes each
     address set once (~4 us of lookups per call).
     """
     stage_cache = _active_stage_attn_cache
-    key = ("cache_slots", cache.shape[1], compress_ratio, ring, offset)
+    key = ("cache_slots", cache.shape[1], compress_ratio, ring, wide, offset)
     if stage_cache is not None:
         for tables, starts, cached_positions, slots in stage_cache.get(key, ()):
             if (
@@ -201,6 +206,7 @@ def _cache_slots(
         positions + offset if offset else positions,
         compress_ratio=compress_ratio,
         ring=ring,
+        wide=wide,
     )
     if stage_cache is not None:
         entry = (metadata.block_tables, metadata.query_start_loc, positions, slots)
@@ -208,19 +214,26 @@ def _cache_slots(
     return slots
 
 
-def _compute_cache_slots(cache, metadata, positions, *, compress_ratio, ring):
+def _compute_cache_slots(cache, metadata, positions, *, compress_ratio, ring, wide):
     if metadata.seq_lens.numel() == 0:
         return torch.full_like(positions, -1)
     table = _block_table(metadata)
-    requests = _token_requests(metadata, positions).clamp(max=table.shape[0] - 1)
+    requests = _token_requests(metadata, positions, out_int32=not wide).clamp(
+        max=table.shape[0] - 1
+    )
     rows_per_page = cache.shape[1]
     logical = positions // compress_ratio
     columns = torch.zeros_like(logical) if ring else logical // rows_per_page
-    blocks = table[requests, columns.clamp(max=table.shape[1] - 1).long()].long()
+    columns = columns.clamp(max=table.shape[1] - 1)
+    blocks = table[requests, columns.long() if wide else columns]
+    if wide:
+        blocks = blocks.long()
     slots = blocks * rows_per_page + logical % rows_per_page
     # Padded request boundaries repeat the last real token offset. Keep the
     # mask on device, including dummy runs and batches with no active tokens.
     rows = torch.arange(positions.shape[0], device=positions.device)
+    if not wide:
+        rows = rows.int()
     return slots.masked_fill(rows >= metadata.query_start_loc[-1], -1)
 
 
