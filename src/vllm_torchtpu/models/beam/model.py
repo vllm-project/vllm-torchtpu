@@ -317,6 +317,10 @@ class BeamModel(nn.Module):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()
         config = _beam_config(vllm_config)
+        # Names the compile cache directory (see
+        # _patch_vllm_compile_prefix_isolation); without it the plugin falls
+        # back to an order-dependent counter and warns.
+        self.prefix = prefix
         self.rms_norm_eps = config.rms_norm_eps
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
