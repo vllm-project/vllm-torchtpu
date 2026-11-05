@@ -77,7 +77,7 @@ from vllm.v1.spec_decode.ngram_proposer import NgramProposer
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 from vllm.v1.worker.kv_connector_model_runner_mixin import KVConnectorOutput
 
-from vllm_torchtpu import envs, expert_relayout, utils
+from vllm_torchtpu import envs, expert_relayout, gc_policy, utils
 from vllm_torchtpu.block_major_pool import BlockMajorPoolLayout
 from vllm_torchtpu.compilation import shape_variants
 from vllm_torchtpu.distributed import utils as dist_utils
@@ -3576,6 +3576,10 @@ class TPUModelRunner(GPUModelRunner):
     ) -> "tuple[int | None, int]":
         """Return the DP-wide padded token bucket and forward chunk count."""
         self._draft_proposals_needed = needs_draft_proposals
+        # Every rank reaches this point once per step, dummy steps included,
+        # which is what makes a step-cadenced collection land on all of them
+        # at once instead of 32 independent pauses.
+        gc_policy.on_coordinated_step()
         if not self._dp_lockstep_enabled():
             return None, local_num_chunks
         from vllm.distributed.parallel_state import get_dp_group

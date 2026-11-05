@@ -193,6 +193,9 @@ if TYPE_CHECKING:
     VLLM_TPU_FAST_TOKEN_SUBSTITUTION: bool = False
     VLLM_TPU_FUSED_DRAFT_LOOP: bool = False
     MM_ENCODER_FRAME_CHUNK_PATCH_SIZE: int = 0
+    TPU_GC_POLICY: str = "freeze"
+    TPU_GC_COLLECT_EVERY: int = 500
+    TPU_GC_TRACE: bool = False
 
 
 def env_with_choices(
@@ -1202,6 +1205,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "MM_ENCODER_FRAME_CHUNK_PATCH_SIZE": env_nonnegative_int(
         "MM_ENCODER_FRAME_CHUNK_PATCH_SIZE", 0
     ),
+    # How the Python cyclic collector is run while serving (gc_policy.py).
+    # 'freeze' takes the post-warmup heap out of its reach and replaces
+    # automatic collection with one explicit collection every
+    # TPU_GC_COLLECT_EVERY DP-coordinated steps, which every rank reaches
+    # together; 0 never collects. 'default' leaves CPython's own cadence.
+    "TPU_GC_POLICY": env_with_choices(
+        "TPU_GC_POLICY", "freeze", ["default", "freeze"]
+    ),
+    "TPU_GC_COLLECT_EVERY": env_nonnegative_int("TPU_GC_COLLECT_EVERY", 500),
+    # Log every cyclic collection of 2 ms or more in the model runner and the
+    # engine core (generation, duration, wall-clock ns), to line stalls up
+    # with collections in the step records. Independent of TPU_GC_POLICY.
+    "TPU_GC_TRACE": env_bool("TPU_GC_TRACE", default=False),
 }
 
 
