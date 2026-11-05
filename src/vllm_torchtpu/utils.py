@@ -23,6 +23,26 @@ _megacore = False
 logger = init_logger(__name__)
 
 
+def lookup_small_table(values: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:
+    """``values[indices]`` for a small 1-D table, such as one entry per request.
+
+    XLA expands a gather from a table this small into a chain of selects over
+    scalars it keeps in HBM: ~30 us per lookup on v7 (a 49-entry table, 288
+    indices). A one-hot sum is one vector compare and a lane reduction (~1 us)
+    and exact: every row adds one table entry to zeros.
+
+    Args:
+      values: [n] table.
+      indices: any shape, each in [0, n).
+
+    Returns:
+      ``values[indices]``, with ``indices``' shape and ``values``' dtype.
+    """
+    entries = torch.arange(values.shape[0], device=values.device)
+    hits = indices.unsqueeze(-1) == entries
+    return torch.where(hits, values, 0).sum(-1, dtype=values.dtype)
+
+
 def align_to(unpadded_dim, pad_multiple):
     return (unpadded_dim + pad_multiple - 1) // pad_multiple * pad_multiple
 

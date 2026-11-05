@@ -29,8 +29,8 @@ from vllm.models.deepseek_v41.nvidia import model as upstream
 
 from vllm_torchtpu.layers.adapter.quantization.deepseek_v41 import DeepseekV41MoE
 from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.utils import lookup_small_table
 
-from ..common import request_table
 from ..common.mhc import (
     collapse,
     initialize_delayed_mhc,
@@ -122,7 +122,7 @@ def _insert_context_kv(
             )
             offsets = (
                 positions
-                - request_table.per_request(metadata.seq_lens, requests)
+                - lookup_small_table(metadata.seq_lens, requests)
                 + attn.window_size
             )
             swa_valid = (swa_slots >= 0) & (offsets >= 0) & (offsets < attn.window_size)

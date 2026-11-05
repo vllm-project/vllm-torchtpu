@@ -11,6 +11,8 @@ from vllm.v1.outputs import (
     ModelRunnerOutput,
 )
 
+from vllm_torchtpu.utils import lookup_small_table
+
 INVALID_TOKEN_ID = -1
 
 
@@ -284,14 +286,14 @@ def subtract_num_rejected_tokens(
     zero = num_rejected.new_zeros(())
     seq_subtract = torch.where(
         seq_lens_subtract_indices >= 0,
-        num_rejected[seq_lens_subtract_indices.clamp(min=0)],
+        lookup_small_table(num_rejected, seq_lens_subtract_indices.clamp(min=0)),
         zero,
     )
     seq_lens = seq_lens - seq_subtract
 
     pos_subtract = torch.where(
         positions_subtract_indices >= 0,
-        num_rejected[positions_subtract_indices.clamp(min=0)],
+        lookup_small_table(num_rejected, positions_subtract_indices.clamp(min=0)),
         zero,
     )
     if positions.ndim == 2:  # mrope (out of text-MVP scope; kept for parity)

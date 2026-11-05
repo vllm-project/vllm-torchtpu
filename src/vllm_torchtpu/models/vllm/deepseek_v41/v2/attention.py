@@ -25,9 +25,8 @@ from vllm_torchtpu.layers.adapter.linear_common import (
     KEEP_VLLM_LAYOUT_ATTR,
     WEIGHT_FLIPPED_ATTR,
 )
-from vllm_torchtpu.utils import synchronize_tensors
+from vllm_torchtpu.utils import lookup_small_table, synchronize_tensors
 
-from ..common import request_table
 from . import csa2_adapter, preprocess_ops
 from .attention_kernels import (
     gathered_kv_cache_scope,
@@ -167,7 +166,7 @@ def _window_starts():
 def _replayed(metadata, positions, starts, window):
     """Tokens a prefix hit replays: their prefix-cached KV must stay as is."""
     requests = _token_requests(metadata, positions).clamp(max=starts.shape[0] - 1)
-    start = request_table.per_request(starts, requests)
+    start = lookup_small_table(starts, requests)
     return (start > 0) & (positions >= start) & (positions < start + window)
 
 
@@ -226,8 +225,8 @@ def save_compress_norm(
         cache = state_cache
         rows = torch.arange(kv_score.shape[0], device=kv_score.device)
         requests = token_to_req_indices.long().clamp(max=query_start_loc.numel() - 2)
-        starts = request_table.per_request(query_start_loc, requests)
-        ends = request_table.per_request(query_start_loc, requests + 1)
+        starts = lookup_small_table(query_start_loc, requests)
+        ends = lookup_small_table(query_start_loc, requests + 1)
         previous_slots = (
             slot_mapping.clamp(min=0) // capacity * capacity
             + (positions - 1) % capacity
@@ -879,13 +878,12 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
             )
             # A request's first row pools with the ring's stored predecessor;
             # only its last ring-capacity rows are stored.
-            has_prev = rows != request_table.per_request(starts_loc, requests)
+            has_prev = rows != lookup_small_table(starts_loc, requests)
             slots = _cache_slots(state_cache, state_meta, positions, ring=True)
             previous = _cache_slots(state_cache, state_meta, positions - 1, ring=True)
             stored = (slots >= 0) & (
                 rows
-                >= request_table.per_request(starts_loc, requests + 1)
-                - state_cache.shape[1]
+                >= lookup_small_table(starts_loc, requests + 1) - state_cache.shape[1]
             )
             args += [
                 has_prev[:, None].int(),
@@ -1175,11 +1173,10 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                     pos_rem = positions % rows_per_page
                     if non_causal:
                         req_idx = requests.clamp(max=swa.seq_lens.shape[0] - 1)
-                        end_pos = swa.seq_lens[req_idx]
-                        query_len = (
-                            swa.query_start_loc[req_idx + 1]
-                            - swa.query_start_loc[req_idx]
-                        )
+                        end_pos = lookup_small_table(swa.seq_lens, req_idx)
+                        query_len = lookup_small_table(
+                            swa.query_start_loc, req_idx + 1
+                        ) - lookup_small_table(swa.query_start_loc, req_idx)
                         prefix_len = (end_pos - query_len).clamp(min=0)
                         start_pos = (prefix_len - self.window_size).clamp(min=0)
                         logical = (
@@ -1307,10 +1304,10 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                 )
                 if non_causal and swa.seq_lens.numel() > 0:
                     req_idx = requests.clamp(max=swa.seq_lens.shape[0] - 1)
-                    end_pos = swa.seq_lens[req_idx]
-                    query_len = (
-                        swa.query_start_loc[req_idx + 1] - swa.query_start_loc[req_idx]
-                    )
+                    end_pos = lookup_small_table(swa.seq_lens, req_idx)
+                    query_len = lookup_small_table(
+                        swa.query_start_loc, req_idx + 1
+                    ) - lookup_small_table(swa.query_start_loc, req_idx)
                     prefix_len = (end_pos - query_len).clamp(min=0)
                     start_pos = (prefix_len - self.window_size).clamp(min=0)
                     logical = (
