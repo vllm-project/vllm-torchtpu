@@ -106,7 +106,7 @@ PATCHES = (
     Patch("vllm_torchtpu:_patch_vllm_hybrid_kv_load_failure_recovery", _ENGINE),
     Patch("vllm_torchtpu:_patch_vllm_abort_on_preemption", _ENGINE),
     Patch("vllm_torchtpu:_patch_vllm_raiden_pd_completion", _ENGINE),
-    Patch("vllm_torchtpu:_patch_vllm_kv_cache_group_size", _ACTIVE),
+    Patch("vllm_torchtpu:_patch_vllm_kv_cache_group_size", _ENGINE),
     Patch("vllm_torchtpu:_patch_vllm_same_step_prefix_hits", _ENGINE),
     Patch(
         "vllm_torchtpu.core.mamba_checkpoint_retention:"

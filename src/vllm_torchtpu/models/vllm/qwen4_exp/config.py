@@ -175,6 +175,17 @@ def native_cache_specs(cfg, tp: int | None = None) -> dict[str, KVCacheSpec]:
     return specs
 
 
+def ensure_kv_group_size_rule() -> None:
+    """Install the TPU KV cache group size rule in this process now.
+
+    The platform installs it at activation, but the config hook can plan
+    the pool earlier; every planner of this model must group alike.
+    """
+    from vllm_torchtpu import _patch_vllm_kv_cache_group_size
+
+    _patch_vllm_kv_cache_group_size()
+
+
 def native_cache_capacity(cfg, specs=None):
     """Size scheduler block IDs with the same upstream planner used at runtime."""
     from vllm.v1.core.kv_cache_utils import (
@@ -182,6 +193,7 @@ def native_cache_capacity(cfg, specs=None):
         get_kv_cache_groups,
     )
 
+    ensure_kv_group_size_rule()
     specs = native_cache_specs(cfg) if specs is None else specs
     groups = get_kv_cache_groups(cfg, specs)
     blocks_per_request = sum(

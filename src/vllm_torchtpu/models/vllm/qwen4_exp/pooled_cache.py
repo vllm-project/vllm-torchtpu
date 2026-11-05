@@ -55,6 +55,9 @@ class Qwen4ExpPooledCache:
     def __init__(self, runner, model):
         self.runner, self.model = runner, model
         cfg = runner.vllm_config
+        from .config import ensure_kv_group_size_rule
+
+        ensure_kv_group_size_rule()
         # The page layout always describes the whole model, so every
         # pipeline stage shares one page geometry and block ID space.
         self.layout, model_specs = pooled_cache_specs(cfg)
