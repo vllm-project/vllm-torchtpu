@@ -97,7 +97,9 @@ def test_physical_slot_sort_matches_native(monkeypatch, tokens, experts, interpr
     rng = np.random.default_rng(17)
     slots_per_rank = experts // 16
     active_per_rank = slots_per_rank - (2 if experts == 432 else 0)
-    active = np.flatnonzero(np.arange(experts) % slots_per_rank < active_per_rank)
+    slots = np.arange(experts)
+    local_slot = slots % slots_per_rank + slots // slots_per_rank % 2 * 5
+    active = np.flatnonzero(local_slot % slots_per_rank < active_per_rank)
     pairs = np.stack([rng.choice(active, 6, replace=False) for _ in range(tokens)])
     pairs[: tokens * 3 // 4] = active[-6:]
     pairs[-3:] = experts

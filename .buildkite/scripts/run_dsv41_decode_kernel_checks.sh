@@ -13,3 +13,7 @@ python -m pytest -q tests/models/vllm/test_dsv41_decode_indexer_route.py \
   --junitxml="$results/kernel-routes.xml"
 python -m pytest -q tests/kernels/fused_moe/test_fused_ep_moe_v2.py \
   -k row_padded_flat_scales --junitxml="$results/kernel-scales.xml"
+python -m pytest -q \
+  tests/kernels/experimental/push_fused_moe/test_presort.py \
+  tests/kernels/experimental/push_fused_moe/test_routing.py \
+  -k 'physical_slot and False' --junitxml="$results/kernel-moe-metadata.xml"
