@@ -16,6 +16,7 @@ import functools
 import jax
 import jax.numpy as jnp
 import numpy as np
+from jax._src.pallas.mosaic.primitives import AsyncCopyDescriptor
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
@@ -51,13 +52,23 @@ def _vmem_bytes(m: int, k: int, n: int, tile_n: int, itemsize: int) -> int:
     return resident + tiles + 2 * m * tile_n * 4  # f32 dot result, epilogue
 
 
-def _tile_n(m: int, k: int, n: int, itemsize: int, vmem_limit: int) -> int | None:
-    """Widest multiple of LANE dividing n that fits the tile and VMEM budgets."""
+def output_tile_n(
+    m: int,
+    k: int,
+    n: int,
+    itemsize: int,
+    vmem_limit: int,
+    *,
+    multiple_of: int = LANE,
+    extra_vmem_bytes: int = 0,
+) -> int | None:
+    """Widest multiple of `multiple_of` dividing n that fits the tile and VMEM
+    budgets, with `extra_vmem_bytes` of the VMEM budget held by the caller."""
     cap = min(W_TILE_BYTES // k, OUT_TILE_BYTES // (m * itemsize), n)
-    for tile_n in range(cap - cap % LANE, 0, -LANE):
+    for tile_n in range(cap - cap % multiple_of, 0, -multiple_of):
         if (
             n % tile_n == 0
-            and _vmem_bytes(m, k, n, tile_n, itemsize)
+            and _vmem_bytes(m, k, n, tile_n, itemsize) + extra_vmem_bytes
             <= VMEM_BUDGET_FRACTION * vmem_limit
         ):
             return tile_n
@@ -77,7 +88,8 @@ def applies(x: jax.Array, w_q: jax.Array, w_scale: jax.Array) -> bool:
         and k % QUANT_LANES == 0
         # The kernel's fp8 x fp8 dot needs an MXU that multiplies fp8.
         and pltpu.get_tpu_info().fp8_ops_per_second > 0
-        and _tile_n(m, k, n, x.dtype.itemsize, get_device_vmem_limit()) is not None
+        and output_tile_n(m, k, n, x.dtype.itemsize, get_device_vmem_limit())
+        is not None
     )
 
 
@@ -104,6 +116,47 @@ def _quantize_rows(x_ref: jax.Ref, x_q_ref: jax.Ref, scale: jax.Array, rows: pl.
         ).astype(x_q_ref.dtype)
 
 
+def start_activation_copies(
+    x_hbm_ref: jax.Ref,  # (M, K), HBM
+    x_ref: jax.Ref,  # (M, K), VMEM
+    sems: jax.Ref,  # (M // SUB_M,) DMA
+) -> list[AsyncCopyDescriptor]:
+    """Starts copying the activation into VMEM, one DMA per SUB_M rows."""
+    copies = [
+        pltpu.make_async_copy(
+            x_hbm_ref.at[pl.ds(s * SUB_M, SUB_M)],
+            x_ref.at[pl.ds(s * SUB_M, SUB_M)],
+            sems.at[s],
+        )
+        for s in range(x_ref.shape[0] // SUB_M)
+    ]
+    for copy in copies:
+        copy.start()
+    return copies
+
+
+def quantize_activation(
+    x_ref: jax.Ref,  # (M, K)
+    x_q_ref: jax.Ref,  # (M, K) quantized
+    x_scale_ref: jax.Ref,  # (M, 1) f32
+    copies: list[AsyncCopyDescriptor],
+) -> None:
+    """`util.quantize_tensor` of the activation `start_activation_copies` is
+    copying in, each chunk quantized as it lands."""
+    num_sub = len(copies)
+    # Chunk s+1's row scales are reduced while chunk s is cast, which
+    # hides the cross-lane reduction's latency.
+    chunks = [pl.ds(s * SUB_M, SUB_M) for s in range(num_sub)]
+    copies[0].wait()
+    scales = [_row_scale(x_ref, chunks[0], x_q_ref.dtype)]
+    for s in range(num_sub):
+        if s + 1 < num_sub:
+            copies[s + 1].wait()
+            scales.append(_row_scale(x_ref, chunks[s + 1], x_q_ref.dtype))
+        _quantize_rows(x_ref, x_q_ref, scales[s], chunks[s])
+        x_scale_ref[chunks[s], :] = scales[s]
+
+
 def _kernel(
     x_hbm_ref: jax.Ref,  # (M, K) bf16, HBM
     w_ref: jax.Ref,  # (K, tile_n) fp8
@@ -116,7 +169,6 @@ def _kernel(
         # The (M, K) fp8 and (M, 1) f32 outputs, and their (2,) DMA semaphores.
         x_q_out_ref, x_scale_out_ref, *refs, out_sems = refs
     x_ref, x_q_ref, x_scale_ref, sems = refs
-    num_sub = x_ref.shape[0] // SUB_M
 
     def quantized_copies():
         return [
@@ -126,27 +178,8 @@ def _kernel(
 
     @pl.when(pl.program_id(0) == 0)
     def _():
-        copies = [
-            pltpu.make_async_copy(
-                x_hbm_ref.at[pl.ds(s * SUB_M, SUB_M)],
-                x_ref.at[pl.ds(s * SUB_M, SUB_M)],
-                sems.at[s],
-            )
-            for s in range(num_sub)
-        ]
-        for copy in copies:
-            copy.start()
-        # Chunk s+1's row scales are reduced while chunk s is cast, which
-        # hides the cross-lane reduction's latency.
-        chunks = [pl.ds(s * SUB_M, SUB_M) for s in range(num_sub)]
-        copies[0].wait()
-        scales = [_row_scale(x_ref, chunks[0], x_q_ref.dtype)]
-        for s in range(num_sub):
-            if s + 1 < num_sub:
-                copies[s + 1].wait()
-                scales.append(_row_scale(x_ref, chunks[s + 1], x_q_ref.dtype))
-            _quantize_rows(x_ref, x_q_ref, scales[s], chunks[s])
-            x_scale_ref[chunks[s], :] = scales[s]
+        copies = start_activation_copies(x_hbm_ref, x_ref, sems)
+        quantize_activation(x_ref, x_q_ref, x_scale_ref, copies)
         if return_quantized:
             # Written back under the remaining steps' matmuls.
             for copy in quantized_copies():
@@ -190,7 +223,7 @@ def fused_quantize_matmul(
     m, k = x.shape
     n = w_q.shape[1]
     vmem_limit = get_device_vmem_limit()
-    tile_n = _tile_n(m, k, n, x.dtype.itemsize, vmem_limit)
+    tile_n = output_tile_n(m, k, n, x.dtype.itemsize, vmem_limit)
     assert tile_n is not None
     w_scale = w_scale.astype(jnp.float32)
     out_shape = [jax.ShapeDtypeStruct((m, n), x.dtype)]
