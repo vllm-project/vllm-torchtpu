@@ -450,3 +450,23 @@ def test_calibrate_rejects_multi_session_and_unannotated_collectives(
     assert len(tp_payload["collectives"]) == 1
     assert tp_payload["collectives"][0]["group_size"] == _EXPECTED_FALLBACK_TP
     assert tp_payload["collectives"][0]["hop_latency_us"] == pytest.approx(4.5)
+
+
+def test_steady_state_steps_drops_compilation_warmup_outlier() -> None:
+    """Verifies 2-step trace drops step 0 if it is a severe compilation outlier."""
+    from vllm_torchtpu.megakernel.advisor import calibrate
+    step0 = calibrate._StepWindow(start_us=0.0, end_us=30000.0, dur_us=30000.0)
+    step1 = calibrate._StepWindow(start_us=30000.0, end_us=35000.0, dur_us=5000.0)
+    filtered = calibrate._steady_state_steps([step0, step1])
+    assert len(filtered) == 1
+    assert filtered[0].start_us == 30000.0
+
+
+def test_steady_state_steps_keeps_normal_two_step_trace() -> None:
+    """Verifies 2-step trace preserves step 0 if within normal variation."""
+    from vllm_torchtpu.megakernel.advisor import calibrate
+    step0 = calibrate._StepWindow(start_us=0.0, end_us=5200.0, dur_us=5200.0)
+    step1 = calibrate._StepWindow(start_us=5200.0, end_us=10200.0, dur_us=5000.0)
+    filtered = calibrate._steady_state_steps([step0, step1])
+    assert len(filtered) == 2
+    assert filtered[0].start_us == 0.0

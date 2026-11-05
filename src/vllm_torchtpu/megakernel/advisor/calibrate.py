@@ -136,6 +136,7 @@ _NS_PER_US = 1_000.0
 _MAX_INTRA_STEP_GAP_US = 500.0
 _MIN_COLLECTIVE_GROUP_SIZE = 2
 _MIN_STEPS_FOR_WARMUP_DROP = 3
+_WARMUP_OUTLIER_RATIO: float = 2.0
 _MIN_EVENTS_FOR_WARMUP_DROP = 4
 _COLLECTIVE_PREFIXES: tuple[tuple[str, str], ...] = (
     ("all-reduce", "all-reduce"),
@@ -433,9 +434,19 @@ def _parse_xplane_target(path: Path) -> _ParsedTrace:
 
 
 def _steady_state_steps(steps: Sequence[_StepWindow]) -> list[_StepWindow]:
-    """Sort step windows and drop warmup step 0 when at least 3 steps exist."""
+    """Sort step windows and drop warmup step 0 when at least 3 steps exist.
+
+    Also drops step 0 when at least 2 steps exist if step 0 is a severe compilation
+    outlier exceeding _WARMUP_OUTLIER_RATIO times the minimum duration of subsequent steps.
+    """
     ordered = sorted(steps, key=lambda sw: sw.start_us)
-    return ordered[1:] if len(ordered) >= _MIN_STEPS_FOR_WARMUP_DROP else ordered
+    if len(ordered) >= 2:
+        min_steady_step_dur_us = min(s.dur_us for s in ordered[1:])
+        if ordered[0].dur_us > _WARMUP_OUTLIER_RATIO * min_steady_step_dur_us:
+            return ordered[1:]
+        if len(ordered) >= _MIN_STEPS_FOR_WARMUP_DROP:
+            return ordered[1:]
+    return ordered
 
 
 def _scan_event_window(
