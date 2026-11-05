@@ -267,11 +267,11 @@ def test_select_experts_grouped_sigmoid_topk_matches_reference(monkeypatch, scal
     from vllm.model_executor.layers.fused_moe.router import grouped_topk_router
 
     # Platform activation strips upstream's @torch.compile(dynamic=True), which
-    # the TPU backend refuses (tpu_platform._DYNAMIC_COMPILE_TARGETS).
+    # the TPU backend refuses (tpu_platform._DYNAMIC_COMPILE_TARGETS); strip it
+    # here too unless an engine started earlier in this process already did.
+    fn = grouped_topk_router.grouped_topk
     monkeypatch.setattr(
-        grouped_topk_router,
-        "grouped_topk",
-        grouped_topk_router.grouped_topk.__wrapped__,
+        grouped_topk_router, "grouped_topk", getattr(fn, "__wrapped__", fn)
     )
     torch.manual_seed(0)
     n_experts, n_group, topk_group, topk = 256, 8, 4, 8
