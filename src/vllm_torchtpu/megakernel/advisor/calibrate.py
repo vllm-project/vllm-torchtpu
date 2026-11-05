@@ -436,8 +436,9 @@ def _parse_xplane_target(path: Path) -> _ParsedTrace:
 def _steady_state_steps(steps: Sequence[_StepWindow]) -> list[_StepWindow]:
     """Sort step windows and drop warmup step 0 when at least 3 steps exist.
 
-    Also drops step 0 when at least 2 steps exist if step 0 is a severe compilation
-    outlier exceeding _WARMUP_OUTLIER_RATIO times the minimum duration of subsequent steps.
+    Also drops step 0 when at least 2 steps exist if step 0 is a severe
+    compilation outlier exceeding _WARMUP_OUTLIER_RATIO times the minimum
+    duration of subsequent steps.
     """
     ordered = sorted(steps, key=lambda sw: sw.start_us)
     if len(ordered) >= 2:
@@ -605,6 +606,31 @@ def calibrate_trace(
         sw for rk in sorted(steady_by_rank) for sw in steady_by_rank[rk]
     ]
 
+    if phase != "mixed":
+        allowed_phases = ("decode", "verify") if phase == "decode" else (phase,)
+        phase_steps_by_rank = {
+            rk: [sw for sw in steps if sw.phase is None or sw.phase in allowed_phases]
+            for rk, steps in steady_by_rank.items()
+        }
+        matched_steps = [sw for steps in phase_steps_by_rank.values() for sw in steps]
+        if not matched_steps and any(steady_by_rank.values()):
+            found_phases = {
+                sw.phase
+                for steps in steady_by_rank.values()
+                for sw in steps
+                if sw.phase is not None
+            }
+            msg = (
+                f"No steps match requested phase '{phase}'; found phases: "
+                f"{sorted(found_phases)}"
+            )
+            raise errors.MegakernelConfigError(msg)
+        eval_steps_by_rank = phase_steps_by_rank
+        eval_steady_steps = matched_steps
+    else:
+        eval_steps_by_rank = steady_by_rank
+        eval_steady_steps = all_steady_steps
+
     all_gaps: list[float] = []
     all_collectives: list[_ComputeEvent] = []
     for stream_key in sorted(parsed.events_by_stream):
@@ -613,7 +639,7 @@ def calibrate_trace(
             continue
         rk = evs[0].rank_key
         gaps, colls = _collect_stream_gaps_and_collectives(
-            evs, steady_by_rank.get(rk, [])
+            evs, eval_steps_by_rank.get(rk, [])
         )
         all_gaps.extend(gaps)
         all_collectives.extend(colls)
@@ -640,8 +666,8 @@ def calibrate_trace(
     if cov is not None:
         payload["step_coverage"] = cov
 
-    if all_steady_steps:
-        step_durs = sorted(sw.dur_us for sw in all_steady_steps)
+    if eval_steady_steps:
+        step_durs = sorted(sw.dur_us for sw in eval_steady_steps)
         payload["step_time_us"] = {
             "p50": _percentile(step_durs, 0.5),
             "p90": _percentile(step_durs, 0.9),

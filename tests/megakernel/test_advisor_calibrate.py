@@ -17,6 +17,8 @@ from __future__ import annotations
 
 import importlib
 import json
+import os
+import tempfile
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -68,13 +70,16 @@ _PERFETTO_FIXTURE = (
     Path(__file__).resolve().parent / "data" / "advisor" / "synthetic_perfetto.json.gz"
 )
 _PS_PER_US = 1_000_000
-_EXPECTED_SINGLE_GAPS = 12
-_EXPECTED_MULTI_GAPS = 24
+_EXPECTED_SINGLE_GAPS = 9
+_EXPECTED_MULTI_GAPS = 18
 _EXPECTED_GROUP_SIZE = 8
 _EXPECTED_FALLBACK_TP = 4
 _EXPECTED_AR_BYTES = 32768
 _EXPECTED_A2A_BYTES = 65536
-_EXPECTED_STEADY_STEPS = 4
+_EXPECTED_STEADY_STEPS = 3
+_EXPECTED_MIXED_SINGLE_GAPS = 12
+_EXPECTED_MIXED_MULTI_GAPS = 24
+_EXPECTED_MIXED_STEADY_STEPS = 4
 _EXPECTED_BATCH = 16
 _EXPECTED_TP = 8
 
@@ -455,6 +460,7 @@ def test_calibrate_rejects_multi_session_and_unannotated_collectives(
 def test_steady_state_steps_drops_compilation_warmup_outlier() -> None:
     """Verifies 2-step trace drops step 0 if it is a severe compilation outlier."""
     from vllm_torchtpu.megakernel.advisor import calibrate
+
     step0 = calibrate._StepWindow(start_us=0.0, end_us=30000.0, dur_us=30000.0)
     step1 = calibrate._StepWindow(start_us=30000.0, end_us=35000.0, dur_us=5000.0)
     filtered = calibrate._steady_state_steps([step0, step1])
@@ -465,8 +471,83 @@ def test_steady_state_steps_drops_compilation_warmup_outlier() -> None:
 def test_steady_state_steps_keeps_normal_two_step_trace() -> None:
     """Verifies 2-step trace preserves step 0 if within normal variation."""
     from vllm_torchtpu.megakernel.advisor import calibrate
+
     step0 = calibrate._StepWindow(start_us=0.0, end_us=5200.0, dur_us=5200.0)
     step1 = calibrate._StepWindow(start_us=5200.0, end_us=10200.0, dur_us=5000.0)
     filtered = calibrate._steady_state_steps([step0, step1])
     assert len(filtered) == 2
     assert filtered[0].start_us == 0.0
+
+
+def test_calibrate_trace_filters_by_requested_phase() -> None:
+    """Verifies calibrate_trace isolates step metrics by requested phase."""
+    from vllm_torchtpu.megakernel.advisor import calibrate
+
+    perfetto_events = [
+        {
+            "ph": "X",
+            "name": "Step 0",
+            "cat": "ModelStep",
+            "ts": 1000,
+            "dur": 2000,
+            "pid": 1,
+            "tid": 1,
+            "args": {"step_num": 0, "phase": "decode"},
+        },
+        {
+            "ph": "X",
+            "name": "Step 1",
+            "cat": "ModelStep",
+            "ts": 5000,
+            "dur": 2000,
+            "pid": 1,
+            "tid": 1,
+            "args": {"step_num": 1, "phase": "decode"},
+        },
+        {
+            "ph": "X",
+            "name": "Step 2",
+            "cat": "ModelStep",
+            "ts": 8000,
+            "dur": 2100,
+            "pid": 1,
+            "tid": 1,
+            "args": {"step_num": 2, "phase": "decode"},
+        },
+        {
+            "ph": "X",
+            "name": "Step 3",
+            "cat": "ModelStep",
+            "ts": 12000,
+            "dur": 8000,
+            "pid": 1,
+            "tid": 1,
+            "args": {"step_num": 3, "phase": "prefill"},
+        },
+    ]
+    with tempfile.NamedTemporaryFile(suffix=".json", mode="w", delete=False) as f:
+        json.dump(perfetto_events, f)
+        trace_file = f.name
+
+    try:
+        cal_decode = calibrate.calibrate_trace(trace_file, phase="decode")
+        assert "step_time_us" in cal_decode
+        assert cal_decode["step_time_us"]["n"] == 2
+        assert cal_decode["step_time_us"]["p50"] == pytest.approx(2050.0)
+        assert cal_decode["source"]["phase"] == "decode"
+
+        cal_prefill = calibrate.calibrate_trace(trace_file, phase="prefill")
+        assert "step_time_us" in cal_prefill
+        assert cal_prefill["step_time_us"]["n"] == 1
+        assert cal_prefill["step_time_us"]["p50"] == pytest.approx(8000.0)
+        assert cal_prefill["source"]["phase"] == "prefill"
+
+        cal_mixed = calibrate.calibrate_trace(trace_file, phase="mixed")
+        assert "step_time_us" in cal_mixed
+        assert cal_mixed["step_time_us"]["n"] == 3
+        assert cal_mixed["source"]["phase"] == "mixed"
+
+        with pytest.raises(errors.MegakernelConfigError, match="found phases:"):
+            calibrate.calibrate_trace(trace_file, phase="saturation")
+    finally:
+        os.unlink(trace_file)
