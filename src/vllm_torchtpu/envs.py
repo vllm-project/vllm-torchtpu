@@ -112,6 +112,7 @@ if TYPE_CHECKING:
     TPU_MOE_COLLECTION_CHUNK_SIZE: int = 0
     TPU_MOE_RAGGED_A2A: bool = False
     TPU_MOE_A2A_CAPACITY: float = 2.0
+    TPU_MOE_ROUTING_REPLAY: str = ""
     PCP_FA_KERNEL_BLOCK_SIZE: int | None = None
     PCP_GDN_COMM_CHUNK_SIZE: int | None = None
     TPU_PCP_TOPOLOGY_AWARE_MESH: bool = True
@@ -816,6 +817,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # at this many times their uniform-routing mean (exact: a step that does
     # not fit runs the full-size exchange). 0 = always full size.
     "TPU_MOE_A2A_CAPACITY": env_float("TPU_MOE_A2A_CAPACITY", 2.0),
+    # Profiling only: the router emits the expert ids captured in this .npz
+    # (ids [layers, windows, positions, topk]); see
+    # layers/adapter/routing_replay.py. Model output is meaningless.
+    "TPU_MOE_ROUTING_REPLAY": lambda: os.getenv("TPU_MOE_ROUTING_REPLAY", ""),
     # Override the PCP full-attention kernel page without changing KV manager pages.
     "PCP_FA_KERNEL_BLOCK_SIZE": env_positive_int_or_none("PCP_FA_KERNEL_BLOCK_SIZE"),
     # GDN stage/projection budget; token ownership still follows PCP interleave.
