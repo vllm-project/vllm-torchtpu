@@ -155,6 +155,14 @@
 /tests/kernels/deepseek_v4/ @gxd3 @patemotter @annyan09023 @gpolovets1 @jrplatin
 /tests/**/test_dsv4_*.py @gxd3 @patemotter @annyan09023 @gpolovets1 @jrplatin
 
+# Kernels & Models: DeepSeek v4.1
+/src/vllm_torchtpu/kernels/experimental/deepseek_v41/ @yuyanpeng-google @fro11o @wenqini
+/src/vllm_torchtpu/layers/adapter/custom_ops/deepseek_v41/ @yuyanpeng-google @fro11o @wenqini
+/src/vllm_torchtpu/models/vllm/deepseek_v41/ @yuyanpeng-google @fro11o @wenqini
+/tests/kernels/experimental/deepseek_v41/ @yuyanpeng-google @fro11o @wenqini
+/tests/layers/adapter/custom_ops/deepseek_v41/ @yuyanpeng-google @fro11o @wenqini
+/tests/models/vllm/deepseek_v41/ @yuyanpeng-google @fro11o @wenqini
+
 # Megakernel (Framework-Free JAX/Pallas)
 /src/vllm_torchtpu/megakernel/ @caojx-google @annyan09023 @weinan1997 @hhb @brianseung-google
 /tests/megakernel/ @caojx-google @annyan09023 @weinan1997 @hhb @brianseung-google
