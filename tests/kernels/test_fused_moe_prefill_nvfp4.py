@@ -2015,6 +2015,21 @@ def test_fused_moe_prefill_nvfp4_env_flag_parsing(monkeypatch: pytest.MonkeyPatc
     with pytest.raises(ValueError, match="FUSED_MOE_PREFILL_NVFP4_MIN_TOKENS"):
         _ = envs_mod.FUSED_MOE_PREFILL_NVFP4_MIN_TOKENS
 
+    monkeypatch.delenv("FUSED_MOE_PREFILL_NVFP4_ACT_MODE", raising=False)
+    assert envs_mod.FUSED_MOE_PREFILL_NVFP4_ACT_MODE == "w4a16"
+    assert envs.is_set("FUSED_MOE_PREFILL_NVFP4_ACT_MODE") is False
+
+    for raw in ("w4a16", "w4a8"):
+        monkeypatch.setenv("FUSED_MOE_PREFILL_NVFP4_ACT_MODE", raw)
+        got = envs_mod.FUSED_MOE_PREFILL_NVFP4_ACT_MODE
+        assert got == raw
+        assert envs.is_set("FUSED_MOE_PREFILL_NVFP4_ACT_MODE") is True
+
+    for bad in ("", "W4A8", "fp8", "w4a4", "invalid"):
+        monkeypatch.setenv("FUSED_MOE_PREFILL_NVFP4_ACT_MODE", bad)
+        with pytest.raises(ValueError, match="FUSED_MOE_PREFILL_NVFP4_ACT_MODE"):
+            _ = envs_mod.FUSED_MOE_PREFILL_NVFP4_ACT_MODE
+
 
 def _load_nvfp4_adapter_for_test(monkeypatch: pytest.MonkeyPatch) -> Any:
     """Load ``layers/adapter/moe_tp_decode_nvfp4.py`` with lightweight stubs."""
@@ -2399,7 +2414,7 @@ def test_adapter_flag_off_unchanged_and_flag_on_admission(
     )
     adm_off = adapter._admit(runner, N_RANKS)
     assert not isinstance(adm_off, str), adm_off
-    assert adm_off.rows == (16, 32, 64)
+    assert adm_off.rows == adapter.kernel.ROW_BUCKETS
     assert adm_off.statics.prefill_above is None
     assert probe_calls == []
 
@@ -2407,7 +2422,7 @@ def test_adapter_flag_off_unchanged_and_flag_on_admission(
     monkeypatch.setenv("FUSED_MOE_PREFILL_NVFP4_KERNEL", "1")
     adm_on = adapter._admit(runner, N_RANKS)
     assert not isinstance(adm_on, str), adm_on
-    assert adm_on.rows == (16, 32, 64)
+    assert adm_on.rows == adapter.kernel.ROW_BUCKETS
     assert adm_on.statics.prefill_above == 2047
     assert len(probe_calls) == 1
 
@@ -2420,7 +2435,7 @@ def test_adapter_flag_off_unchanged_and_flag_on_admission(
     )
     adm_refused = adapter._admit(runner, N_RANKS)
     assert not isinstance(adm_refused, str), adm_refused
-    assert adm_refused.rows == (16, 32, 64)
+    assert adm_refused.rows == adapter.kernel.ROW_BUCKETS
     assert adm_refused.statics.prefill_above is None
 
 
@@ -2583,9 +2598,9 @@ def test_adapter_op_body_flag_off_vs_flag_on_dispatch_small_shapes(
         jnp.asarray(rng.uniform(-0.05, 0.05, size=(e,)).astype(np.float32)), rep
     )
 
-    # 1. Decode buckets (n = 8 < 16 and n = 16 in ROW_BUCKETS) inside fn_on
-    #    still hit moe_tp_decode_nvfp4 (never prefill, never _tp_chain).
-    for n_dec in (8, 16):
+    # 1. Decode buckets (n = 4 < ROW_BUCKETS[0] and n = 16 in ROW_BUCKETS) inside
+    #    fn_on still hit moe_tp_decode_nvfp4 (never prefill, never _tp_chain).
+    for n_dec in (4, 16):
         x_dec = jax.device_put(
             jnp.asarray(rng.standard_normal((n_dec, h)).astype(np.float32), BF16), rep
         )
@@ -2612,7 +2627,7 @@ def test_adapter_op_body_flag_off_vs_flag_on_dispatch_small_shapes(
             )
         ).reshape(N_RANKS, n_dec, h)
         assert np.all(out_dec == 7.0)
-    assert decode_calls == [16, 16]
+    assert decode_calls == [adapter.kernel.ROW_BUCKETS[0], 16]
     assert prefill_calls == []
     assert tp_chain_calls == []
 
@@ -2763,3 +2778,210 @@ def test_adapter_op_body_flag_off_vs_flag_on_dispatch_small_shapes(
         np.testing.assert_array_equal(got_on_all[0], got_on_all[r])
     assert _rel_l2(got_on_all[0, :n_valid], got_off_all[0, :n_valid]) <= 5e-3
     assert _cos_sim(got_on_all[0, :n_valid], got_off_all[0, :n_valid]) >= 0.9999
+
+
+@pytest.mark.parametrize(
+    "cfg", [GLM52_EP2TP4, GLM52_TP8, ADAPTER_SMALL_EP2TP4, ADAPTER_SMALL_TP8]
+)
+def test_adapter_prefill_act_mode_admission(
+    monkeypatch: pytest.MonkeyPatch,
+    cfg: dict[str, int],
+):
+    """FUSED_MOE_PREFILL_NVFP4_ACT_MODE populates _OpStatics.prefill_act_mode."""
+    _install_mock_tpu7x(monkeypatch)
+    monkeypatch.setenv("FUSED_MOE_DECODE_KERNEL", "0")
+    monkeypatch.setenv("TPU_MOE_FP8_ALL_GATHER", "0")
+    rt = _load_nvfp4_adapter_for_test(monkeypatch)
+    adapter = rt.adapter
+    runner = _make_stub_runner(rt, cfg)
+
+    probed_modes: list[str] = []
+    orig_can = adapter.prefill_nvfp4.can_use_fused_moe_prefill_nvfp4
+
+    def spy_can(*a: Any, **kw: Any) -> bool:
+        probed_modes.append(kw.get("act_mode", "w4a16"))
+        return orig_can(*a, **kw)
+
+    monkeypatch.setattr(
+        adapter.prefill_nvfp4, "can_use_fused_moe_prefill_nvfp4", spy_can
+    )
+
+    # 1. Flag off ignores FUSED_MOE_PREFILL_NVFP4_ACT_MODE completely.
+    monkeypatch.delenv("FUSED_MOE_PREFILL_NVFP4_KERNEL", raising=False)
+    monkeypatch.setenv("FUSED_MOE_PREFILL_NVFP4_ACT_MODE", "invalid_when_off")
+    adm_off = adapter._admit(runner, N_RANKS)
+    assert not isinstance(adm_off, str), adm_off
+    assert adm_off.statics.prefill_above is None
+    assert adm_off.statics.prefill_act_mode == "w4a16"
+    assert probed_modes == []
+
+    # 2. Flag on default -> min_tokens=2048 (prefill_above=2047), act_mode="w4a16".
+    monkeypatch.setenv("FUSED_MOE_PREFILL_NVFP4_KERNEL", "1")
+    monkeypatch.delenv("FUSED_MOE_PREFILL_NVFP4_MIN_TOKENS", raising=False)
+    monkeypatch.delenv("FUSED_MOE_PREFILL_NVFP4_ACT_MODE", raising=False)
+    adm_def = adapter._admit(runner, N_RANKS)
+    assert not isinstance(adm_def, str), adm_def
+    assert adm_def.statics.prefill_above == 2047
+    assert adm_def.statics.prefill_act_mode == "w4a16"
+    assert probed_modes[-1] == "w4a16"
+
+    # 3. Flag on with MIN_TOKENS=512 + ACT_MODE=w4a8 -> prefill_above=511, w4a8.
+    monkeypatch.setenv("FUSED_MOE_PREFILL_NVFP4_MIN_TOKENS", "512")
+    monkeypatch.setenv("FUSED_MOE_PREFILL_NVFP4_ACT_MODE", "w4a8")
+    adm_w4a8 = adapter._admit(runner, N_RANKS)
+    assert not isinstance(adm_w4a8, str), adm_w4a8
+    assert adm_w4a8.statics.prefill_above == 511
+    assert adm_w4a8.statics.prefill_act_mode == "w4a8"
+    assert probed_modes[-1] == "w4a8"
+    assert adm_w4a8.statics != adm_def.statics
+
+    # 4. Invalid ACT_MODE when flag is on raises ValueError (via envs).
+    for bad in ("W4A8", "fp8"):
+        monkeypatch.setenv("FUSED_MOE_PREFILL_NVFP4_ACT_MODE", bad)
+        with pytest.raises(ValueError, match="FUSED_MOE_PREFILL_NVFP4_ACT_MODE"):
+            adapter._admit(runner, N_RANKS)
+
+
+@pytest.mark.parametrize("cfg", [ADAPTER_SMALL_EP2TP4, ADAPTER_SMALL_TP8])
+def test_adapter_op_body_w4a8_min_tokens_512_dispatch_small_shapes(
+    monkeypatch: pytest.MonkeyPatch,
+    cfg: dict[str, int],
+):
+    """MIN_TOKENS=512 + ACT_MODE=w4a8 keeps 128 on _tp_chain and runs w4a8 at 512."""
+    _install_mock_tpu7x(monkeypatch)
+    _install_cpu_expert_emulator(monkeypatch)
+    monkeypatch.setenv("FUSED_MOE_DECODE_KERNEL", "0")
+    monkeypatch.setenv("TPU_MOE_FP8_ALL_GATHER", "0")
+    monkeypatch.setenv("FUSED_MOE_PREFILL_NVFP4_KERNEL", "1")
+    monkeypatch.setenv("FUSED_MOE_PREFILL_NVFP4_MIN_TOKENS", "512")
+    monkeypatch.setenv("FUSED_MOE_PREFILL_NVFP4_ACT_MODE", "w4a8")
+    rt = _load_nvfp4_adapter_for_test(monkeypatch)
+    adapter = rt.adapter
+
+    mesh = _cpu_or_any_mesh()
+    rep = NamedSharding(mesh, P())
+    shd = NamedSharding(mesh, P("d"))
+    w1, w2, s1, s2, sw1, ss1, sw2, ss2, e0 = _build_small_sharded_weights(
+        mesh, cfg, seed=311
+    )
+    ranks = jax.device_put(
+        jnp.arange(N_RANKS, dtype=jnp.int32).reshape(N_RANKS, 1), shd
+    )
+
+    prefill_calls: list[tuple[int, str]] = []
+    tp_chain_calls: list[int] = []
+    orig_prefill_stage_a = adapter.prefill_nvfp4.fused_moe_prefill_nvfp4_stage_a
+    orig_tp_chain = rt.fp8_decode._tp_chain
+
+    def spy_prefill(*a: Any, **kw: Any):
+        prefill_calls.append((int(a[0].shape[0]), str(kw.get("act_mode", "w4a16"))))
+        return orig_prefill_stage_a(*a, **kw)
+
+    def spy_tp_chain(*a: Any, **kw: Any):
+        tp_chain_calls.append(int(a[0].shape[0]))
+        return orig_tp_chain(*a, **kw)
+
+    monkeypatch.setattr(
+        adapter.prefill_nvfp4, "fused_moe_prefill_nvfp4_stage_a", spy_prefill
+    )
+    monkeypatch.setattr(rt.fp8_decode, "_tp_chain", spy_tp_chain)
+
+    runner = _make_stub_runner(rt, cfg)
+    adm_w4a8 = adapter._admit(runner, N_RANKS)
+    assert not isinstance(adm_w4a8, str), adm_w4a8
+    assert adm_w4a8.statics.prefill_above == 511
+    assert adm_w4a8.statics.prefill_act_mode == "w4a8"
+
+    monkeypatch.delenv("FUSED_MOE_PREFILL_NVFP4_KERNEL", raising=False)
+    adm_off = adapter._admit(runner, N_RANKS)
+    assert not isinstance(adm_off, str), adm_off
+
+    specs = (
+        P(),
+        P(),
+        P(),
+        P(),
+        P("d"),
+        P("d"),
+        P("d"),
+        P("d"),
+        P("d"),
+        P("d"),
+        P("d"),
+        P("d"),
+        P("d"),
+        P("d"),
+    )
+    fn_w4a8 = jax.jit(
+        jax.shard_map(
+            adapter._op_body(adm_w4a8.statics, N_RANKS, "d"),
+            mesh=mesh,
+            in_specs=specs,
+            out_specs=P("d"),
+            check_vma=False,
+        )
+    )
+    fn_off = jax.jit(
+        jax.shard_map(
+            adapter._op_body(adm_off.statics, N_RANKS, "d"),
+            mesh=mesh,
+            in_specs=specs,
+            out_specs=P("d"),
+            check_vma=False,
+        )
+    )
+
+    rng = np.random.default_rng(312 + cfg["ep"])
+    h, e = cfg["h"], cfg["e"]
+    bias = jax.device_put(
+        jnp.asarray(rng.uniform(-0.05, 0.05, size=(e,)).astype(np.float32)), rep
+    )
+
+    # 1. n=128 (< 512) stays on _tp_chain.
+    x_128 = jax.device_put(
+        jnp.asarray((rng.standard_normal((128, h)) * 0.2).astype(np.float32), BF16), rep
+    )
+    sc_128 = jax.device_put(
+        jnp.asarray(
+            (1.0 / (1.0 + np.exp(-rng.standard_normal((128, e))))).astype(np.float32)
+        ),
+        rep,
+    )
+    pm_128 = jax.device_put(jnp.zeros((128,), dtype=jnp.bool_), rep)
+    _ = np.asarray(
+        fn_w4a8(
+            x_128, sc_128, bias, pm_128, w1, w2, s1, s2, sw1, ss1, sw2, ss2, ranks, e0
+        )
+    )
+    assert tp_chain_calls == [128]
+    assert prefill_calls == []
+
+    # 2. n=512 (>= 512) dispatches to fused_moe_prefill_nvfp4_stage_a (act_mode="w4a8").
+    n_pre = 512
+    n_valid = 500
+    x_np = (rng.standard_normal((n_pre, h)) * 0.2).astype(np.float32)
+    sc_np = (1.0 / (1.0 + np.exp(-rng.standard_normal((n_pre, e))))).astype(np.float32)
+    pm_np = np.zeros((n_pre,), dtype=bool)
+    pm_np[n_valid:] = True
+    x_pre = jax.device_put(jnp.asarray(x_np, BF16), rep)
+    sc_pre = jax.device_put(jnp.asarray(sc_np, F32), rep)
+    pm_pre = jax.device_put(jnp.asarray(pm_np), rep)
+
+    got_w4a8 = np.asarray(
+        fn_w4a8(
+            x_pre, sc_pre, bias, pm_pre, w1, w2, s1, s2, sw1, ss1, sw2, ss2, ranks, e0
+        )
+    ).reshape(N_RANKS, n_pre, h)
+    got_ref = np.asarray(
+        fn_off(
+            x_pre, sc_pre, bias, pm_pre, w1, w2, s1, s2, sw1, ss1, sw2, ss2, ranks, e0
+        )
+    ).reshape(N_RANKS, n_pre, h)
+
+    assert prefill_calls == [(512, "w4a8")]
+    assert tp_chain_calls == [128, 512]
+    assert np.isfinite(got_w4a8).all()
+    for r in range(1, N_RANKS):
+        np.testing.assert_array_equal(got_w4a8[0], got_w4a8[r])
+    assert _rel_l2(got_w4a8[0, :n_valid], got_ref[0, :n_valid]) <= 0.08
+    assert _cos_sim(got_w4a8[0, :n_valid], got_ref[0, :n_valid]) >= 0.998

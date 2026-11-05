@@ -120,6 +120,7 @@ if TYPE_CHECKING:
     USE_MOE_TP_DECODE_NVFP4_KERNEL: bool = False
     FUSED_MOE_PREFILL_NVFP4_KERNEL: bool = False
     FUSED_MOE_PREFILL_NVFP4_MIN_TOKENS: int = 2048
+    FUSED_MOE_PREFILL_NVFP4_ACT_MODE: str = "w4a16"
     RAGGED_GATHER_REDUCE_VERSION: str = "v2"
     USE_PHASED_PROFILER: bool = False
     TPU_KERNEL_ITER_MODE: bool = False
@@ -1223,6 +1224,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Default 2048.
     "FUSED_MOE_PREFILL_NVFP4_MIN_TOKENS": env_int(
         "FUSED_MOE_PREFILL_NVFP4_MIN_TOKENS", 2048
+    ),
+    # Activation mode for fused_moe_prefill_nvfp4 when
+    # FUSED_MOE_PREFILL_NVFP4_KERNEL=1: "w4a16" (default, BF16 activations and
+    # BF16 x BF16 MXU dots) or "w4a8" (per-row FP8 activations and FP8 x FP8
+    # MXU dots, e.g. when lowering FUSED_MOE_PREFILL_NVFP4_MIN_TOKENS=512).
+    "FUSED_MOE_PREFILL_NVFP4_ACT_MODE": env_with_choices(
+        "FUSED_MOE_PREFILL_NVFP4_ACT_MODE", "w4a16", ["w4a16", "w4a8"]
     ),
     # SparseCore MoE gather-reduce (combine) kernel version used by
     # fused_moe_gmm. "v2" is the default; "v1" selects the legacy kernel and
