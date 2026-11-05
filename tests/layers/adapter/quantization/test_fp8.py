@@ -31,8 +31,10 @@ import numpy as np
 import pytest
 import torch
 
+from vllm_torchtpu.kernels.quantized_matmul.util import quantize_tensor
 from vllm_torchtpu.layers.adapter.linear_common import (
     _quantized_matmul_jax,
+    _quantized_matmul_keep_input_jax,
     _quantized_matmul_pair_jax,
 )
 from vllm_torchtpu.layers.adapter.quantization.fp8 import (
@@ -1161,6 +1163,29 @@ def test_quantized_matmul_pair_matches_two_calls():
 def test_quantized_matmul_pair_shares_fused_quantize():
     """The second matmul of the fused kernel's quantized activation."""
     _assert_pair_matches_two_calls(*_pair_operands(1024, 1024, 32768, 8192))
+
+
+def _assert_keep_input_matches(x, w_q, w_s) -> None:
+    got = _quantized_matmul_keep_input_jax(x, w_q, w_s)
+    expected = (_quantized_matmul_jax(x, w_q, w_s), *quantize_tensor(x, w_q.dtype))
+    for g, e in zip(got, expected, strict=True):
+        assert g.dtype == e.dtype and g.shape == e.shape
+        np.testing.assert_array_equal(
+            np.asarray(g).view(np.uint8), np.asarray(e).view(np.uint8)
+        )
+
+
+def test_quantized_matmul_keep_input_matches():
+    """Below the fused kernel's rows the matmul and quantize take XLA's path."""
+    x, w_q, w_s, _, _ = _pair_operands(16, 256, 384, 128)
+    _assert_keep_input_matches(x, w_q, w_s)
+
+
+@pytest.mark.tpu_test
+def test_quantized_matmul_keep_input_fused():
+    """The fused kernel's output and the activation it quantized."""
+    x, w_q, w_s, _, _ = _pair_operands(1024, 1024, 32768, 8192)
+    _assert_keep_input_matches(x, w_q, w_s)
 
 
 @pytest.mark.tpu_test

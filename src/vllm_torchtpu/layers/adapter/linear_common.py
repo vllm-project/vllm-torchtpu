@@ -25,6 +25,7 @@ from torch_tpu._internal import pallas
 from vllm_torchtpu.kernels.megablox.gmm_v2 import gmm_v2
 from vllm_torchtpu.kernels.quantized_matmul import fused_quantize_matmul
 from vllm_torchtpu.kernels.quantized_matmul.util import (
+    quantize_tensor,
     xla_prequantized_matmul,
     xla_quantized_matmul,
 )
@@ -251,6 +252,66 @@ def quantized_matmul_pair(
         out_a.reshape(*x.shape[:-1], w_q_a.shape[-1]),
         out_b.reshape(*x.shape[:-1], w_q_b.shape[-1]),
     )
+
+
+def _quantized_matmul_keep_input_jax(
+    x: jax.Array, w_q: jax.Array, w_s: jax.Array
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """`_quantized_matmul_jax` of a per-channel weight, and `x` as it was
+    quantized for it: `util.quantize_tensor(x, w_q.dtype)`'s rows and their
+    (M, 1) scales, so another matmul of `x` can skip its quantize."""
+    if w_s.ndim != 1:
+        raise ValueError(f"Expected a per-channel weight scale, got {w_s.shape=}")
+    if fused_quantize_matmul.applies(x, w_q, w_s):
+        return fused_quantize_matmul.fused_quantize_matmul(
+            x, w_q, w_s, return_quantized=True
+        )
+    x_q, x_scale = quantize_tensor(x, w_q.dtype)
+    return xla_prequantized_matmul(x_q, x_scale, w_q, w_s, x.dtype), x_q, x_scale
+
+
+_quantized_matmul_keep_input_op: Callable | None = None
+_quantized_matmul_keep_input_op_lock = Lock()
+
+
+def _get_quantized_matmul_keep_input_op() -> Callable:
+    global _quantized_matmul_keep_input_op
+    if _quantized_matmul_keep_input_op is not None:
+        return _quantized_matmul_keep_input_op
+
+    with _quantized_matmul_keep_input_op_lock:
+        if _quantized_matmul_keep_input_op is not None:
+            return _quantized_matmul_keep_input_op
+
+        op = pallas.jax_op(
+            "pallas::quantized_matmul_keep_input_kernel",
+            _quantized_matmul_keep_input_jax,
+        )
+
+        def _fake_quantized_matmul_keep_input(
+            x: torch.Tensor, w_q: torch.Tensor, w_s: torch.Tensor
+        ):
+            del w_s
+            return (
+                x.new_empty((x.shape[0], w_q.shape[-1])),
+                x.new_empty(x.shape, dtype=w_q.dtype),
+                x.new_empty((x.shape[0], 1), dtype=torch.float32),
+            )
+
+        op.register_fake(_fake_quantized_matmul_keep_input)
+        _quantized_matmul_keep_input_op = op
+        return op
+
+
+def quantized_matmul_keep_input(
+    x: torch.Tensor, w_q: torch.Tensor, w_s: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """`quantized_matmul(x, w_q, w_s)` for a 2-D `x` and a per-channel
+    `w_s`, and `x` quantized as it was for it: its `w_q.dtype` rows and their
+    `[M, 1]` float32 scales."""
+    if x.ndim != 2 or x.shape[-1] != w_q.shape[0]:
+        raise ValueError(f"Expected x [M, {w_q.shape[0]}], got {tuple(x.shape)}.")
+    return _get_quantized_matmul_keep_input_op()(x, w_q, w_s)
 
 
 def _quantized_matmul_fp4_jax(
