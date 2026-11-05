@@ -12,6 +12,8 @@ if TYPE_CHECKING:
     TPU_DEEPSEEK_V41_ENGRAM_CPU_OFFLOAD: bool = False
     TPU_DEEPSEEK_V41_ENGRAM_HBM: str = "auto"
     TPU_DEEPSEEK_V41_DECODE_FUSION: str = "auto"
+    TPU_DEEPSEEK_V41_INDEXER_ISSUE_DEPTH: int | None = 8
+    TPU_DEEPSEEK_V41_INDEXER_PUBLISH_ISSUE_DEPTH: int | None = 7
     TPU_DEEPSEEK_V41_BLOCKED_ROPE_GATHER: bool = True
     TPU_DEEPSEEK_V41_QB_ROPE_EXACT_ROWS: bool = True
     TPU_DEEPSEEK_V41_CSA2_DEEP_GATHER: bool = True
@@ -368,15 +370,19 @@ def env_optional_int(env_name: str) -> Callable[[], int | None]:
     return _get_optional_int_env
 
 
-def env_positive_int_or_none(env_name: str) -> Callable[[], int | None]:
+def env_positive_int_or_none(
+    env_name: str, default: int | None = None
+) -> Callable[[], int | None]:
     """Optional size knob that must be greater than zero when it is set.
 
-    Unset or empty reads as ``None``, meaning the feature is off.
+    Unset or empty reads as ``default`` (``None`` means the feature is off).
     """
     parse_int = env_optional_int(env_name)
 
     def _get_positive_int_or_none_env() -> int | None:
         value = parse_int()
+        if value is None:
+            value = default
         if value is not None and value <= 0:
             raise ValueError(f"Invalid value '{value}' for {env_name}: must be > 0.")
         return value
@@ -425,6 +431,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "auto",
         ["auto", "off", "require"],
         case_sensitive=False,
+    ),
+    # Packed FP8 dense indexer scorer: fragments in flight between the QK
+    # matmul and the head reduction (unset: the tuned 10). The second applies
+    # to the scorer with fused candidate publication. Scheduling only: the
+    # head-sum split stays keyed to the tuned depth (bit-exact).
+    "TPU_DEEPSEEK_V41_INDEXER_ISSUE_DEPTH": env_positive_int_or_none(
+        "TPU_DEEPSEEK_V41_INDEXER_ISSUE_DEPTH", default=8
+    ),
+    "TPU_DEEPSEEK_V41_INDEXER_PUBLISH_ISSUE_DEPTH": env_positive_int_or_none(
+        "TPU_DEEPSEEK_V41_INDEXER_PUBLISH_ISSUE_DEPTH", default=7
     ),
     # Gather RoPE table rows (attention preprocessing, CSA2 inverse RoPE) as
     # 256-row gathers when a step has 257..1024 rows
