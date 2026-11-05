@@ -26,8 +26,8 @@ lives on rank ``b % dcp``, whole, and every block-level step stays local:
    ``(score, block)`` under the selection's own order (forced blocks first,
    then score, ties to the lower block). The global top-k is a subset of the
    union of the ranks' local top-k, so exchanging ``dcp * topk`` candidates
-   per token (an all-gather of ``[T, 2 * topk]`` f32) gives the exact
-   non-DCP selection.
+   per token (an all-gather of ``[T, 2 * topk]`` f32, block ids as values)
+   gives the exact non-DCP selection.
 2. `msa_attend_dcp`: each rank merges the candidates into that selection,
    attends every query head of the KV head over the selected blocks it
    holds and returns the partial output with its log-sum-exp; the caller
@@ -189,11 +189,15 @@ def local_candidates(
 
 
 def pack_candidates(scores: jax.Array, blocks: jax.Array) -> jax.Array:
-    """``[T, 2 * topk]`` f32: scores, then the block ids bitcast to f32, so
-    one all-gather moves both."""
-    return jnp.concatenate(
-        [scores, jax.lax.bitcast_convert_type(blocks, jnp.float32)], axis=-1
-    )
+    """``[T, 2 * topk]`` f32: scores, then the block ids as f32 values, so one
+    all-gather moves both.
+
+    The ids travel as values (exact below 2**24; a block id is below
+    max_model_len / block_size), not bitcast: a bitcast id is a subnormal
+    f32 (and -1 a NaN), which a TPU collective may flush to zero or
+    canonicalize, and every id would decode as block 0.
+    """
+    return jnp.concatenate([scores, blocks.astype(jnp.float32)], axis=-1)
 
 
 def merge_candidates(candidates: jax.Array, topk: int) -> jax.Array:
@@ -202,7 +206,7 @@ def merge_candidates(candidates: jax.Array, topk: int) -> jax.Array:
     order: score descending, ties to the lower block."""
     dcp, num_tokens, _ = candidates.shape
     scores = candidates[..., :topk]
-    blocks = jax.lax.bitcast_convert_type(candidates[..., topk:], jnp.int32)
+    blocks = candidates[..., topk:].astype(jnp.int32)
     s = scores.transpose(1, 0, 2).reshape(num_tokens, dcp * topk)
     b = blocks.transpose(1, 0, 2).reshape(num_tokens, dcp * topk)
     no_block = jnp.iinfo(jnp.int32).max
