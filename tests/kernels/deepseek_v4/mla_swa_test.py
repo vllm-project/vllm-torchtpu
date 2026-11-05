@@ -522,6 +522,57 @@ class CorrectnessTest(parameterized.TestCase):
         for one, fetched in zip(run(1), run(mla_swa.Q_BLOCKS_PER_FETCH), strict=True):
             np.testing.assert_array_equal(np.asarray(one), np.asarray(fetched))
 
+    def test_new_kv_words_are_bit_exact(self):
+        """Prepacked int32 new-KV words give exactly the bf16 path's results."""
+        # Context first, so the windows below read cached and new tokens.
+        new_kv_lens = jnp.full((self.batch_size,), self.sliding_window, jnp.int32)
+        cu_q_lens = jnp.concatenate(
+            [jnp.array([0]), jnp.cumulative_sum(new_kv_lens, dtype=jnp.int32)]
+        )
+        self.kv_lens += new_kv_lens
+        total_tokens = jnp.sum(new_kv_lens)
+        q = self.gen_random((total_tokens, self.num_heads, self.head_dim), self.q_dtype)
+        new_kv = self.gen_random((total_tokens, self.head_dim), self.kv_dtype)
+        distribution = jnp.array([0, 0, self.batch_size], dtype=jnp.int32)
+        self.run_and_compare_outputs(q, new_kv, self.kv_lens, cu_q_lens, distribution)
+
+        # Half the sequences decode (batched decode kernel), half prefill.
+        num_decode = self.batch_size // 2
+        prefill_lens = [3, 37, 8, 5, 24, 49, 16, 2][: self.batch_size - num_decode]
+        new_kv_lens = jnp.array([1] * num_decode + prefill_lens, dtype=jnp.int32)
+        cu_q_lens = jnp.concatenate(
+            [jnp.array([0]), jnp.cumulative_sum(new_kv_lens, dtype=jnp.int32)]
+        )
+        self.kv_lens += new_kv_lens
+        total_tokens = int(jnp.sum(new_kv_lens))
+        q = self.gen_random((total_tokens, self.num_heads, self.head_dim), self.q_dtype)
+        new_kv = self.gen_random((total_tokens, self.head_dim), self.kv_dtype)
+        distribution = jnp.array(
+            [num_decode, num_decode, self.batch_size], dtype=jnp.int32
+        )
+        rows = mla_swa.prepare_kv_inputs(new_kv).reshape(total_tokens, -1, 4, 128)
+        words = csa_cache_layout.slabs_to_words(rows)
+
+        def run(kv):
+            return mla_swa.mla_sliding_window_ragged_paged_attention(
+                q,
+                kv,
+                self.to_host(jnp.array(self.swc_cache)),
+                self.kv_lens,
+                self.swc_page_indices,
+                cu_q_lens,
+                distribution,
+                self.attention_sinks,
+                sliding_window=self.sliding_window,
+                num_queries_per_block=8,
+                num_kv_pages_per_block=2,
+                q_compute_block_size=2,
+                logical_page_size=self.page_size,
+            )
+
+        for bf16, packed in zip(run(new_kv), run(words), strict=True):
+            np.testing.assert_array_equal(np.asarray(bf16), np.asarray(packed))
+
     @parameterized.named_parameters(
         # bq >= block: the block sits in one query block.
         ("one_bq_block", 8, 2),

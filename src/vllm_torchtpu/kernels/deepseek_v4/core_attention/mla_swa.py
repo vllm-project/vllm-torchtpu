@@ -229,7 +229,8 @@ def _mla_sliding_window_ragged_paged_attention_kernel(
     # Input
     attention_sinks_ref,  # float32[num_q_heads]
     q_hbm_ref,  # [max_num_tokens, num_q_heads, head_dim]
-    new_kv_hbm_ref,  # [max_num_tokens, token_bytes // 128, 128] uint8
+    # [max_num_tokens, token_bytes // 128, 128] uint8, or its int32 words
+    new_kv_hbm_ref,
     # [total_num_pages, physical_page_size_per_kv_packing, kv_packing, lkv_dim]
     cache_kv_hbm_ref,
     in_output_hbm_ref,  # [max_num_tokens, num_q_heads, head_dim]
@@ -272,6 +273,7 @@ def _mla_sliding_window_ragged_paged_attention_kernel(
     # An int32 CSA host array is viewed as the uint8 slabs it holds.
     cache_kv_hbm_ref = csa_cache_layout.as_u8_slabs(cache_kv_hbm_ref)
     updated_cache_kv_hbm_ref = csa_cache_layout.as_u8_slabs(updated_cache_kv_hbm_ref)
+    new_kv_hbm_ref = _as_u8_rows(new_kv_hbm_ref)
     total_num_pages, physical_page_size_per_kv_packing, kv_packing, lkv_dim = (
         cache_kv_hbm_ref.shape
     )
@@ -1028,6 +1030,19 @@ def prepare_kv_inputs(kv: jax.Array):
     return interleaved.reshape(tokens, head_dim * 2)
 
 
+def _as_u8_rows(ref):
+    """View new KV words ``[tokens, rows, 128]`` as uint8 ``[tokens, 4 * rows, 128]``.
+
+    Mosaic packs 4 consecutive uint8 sub-rows into one 32-bit row, little
+    endian, so word ``(r, l)`` holding bf16 ``256 r + l`` in its low half and
+    ``256 r + 128 + l`` in its high half (`rope.rope_kv_words`) views as the
+    `prepare_kv_inputs` rows. uint8 refs pass through unchanged.
+    """
+    if ref.dtype == jnp.uint8:
+        return ref
+    return ref.bitcast(jnp.uint8)
+
+
 def prepare_outputs(
     out,  # [max_num_tokens, num_q_heads, head_dim]
     actual_num_q_heads: int,
@@ -1067,7 +1082,8 @@ def _mla_batched_decode_kernel(
     # Input
     attention_sinks_ref,  # float32[num_q_heads]
     q_hbm_ref,  # [max_num_tokens, num_q_heads, head_dim]
-    new_kv_hbm_ref,  # [max_num_tokens, token_bytes // 128, 128] uint8
+    # [max_num_tokens, token_bytes // 128, 128] uint8, or its int32 words
+    new_kv_hbm_ref,
     # [total_num_pages, physical_page_size_per_kv_packing, kv_packing, lkv_dim]
     cache_kv_hbm_ref,
     in_output_hbm_ref,  # [max_num_tokens, num_q_heads, head_dim]
@@ -1108,6 +1124,7 @@ def _mla_batched_decode_kernel(
     # An int32 CSA host array is viewed as the uint8 slabs it holds.
     cache_kv_hbm_ref = csa_cache_layout.as_u8_slabs(cache_kv_hbm_ref)
     updated_cache_kv_hbm_ref = csa_cache_layout.as_u8_slabs(updated_cache_kv_hbm_ref)
+    new_kv_hbm_ref = _as_u8_rows(new_kv_hbm_ref)
     total_num_pages, physical_page_size_per_kv_packing, kv_packing, lkv_dim = (
         cache_kv_hbm_ref.shape
     )
@@ -1654,7 +1671,8 @@ def mla_sliding_window_ragged_paged_attention(
 
     Args:
       q: concatenated all sequences' queries.
-      new_kv: concatenated all sequences' kv values
+      new_kv: concatenated all sequences' kv values: bf16, or the int32 words
+        `rope.rope_kv_words` packs them into.
       cache_kv: the current kv cache: uint8 slabs, or an int32
         [total_num_pages, rows, 128] CSA host array holding the same bytes
         (see `csa_cache_layout`).
@@ -1709,7 +1727,6 @@ def mla_sliding_window_ragged_paged_attention(
         (0, q.shape[1] - actual_num_q_heads),
         constant_values=jnp.finfo(attention_sinks.dtype).min,
     )
-    assert new_kv.dtype == jnp.bfloat16
     # The SWA KV cache overlay onto the compressed kv cache of CSA, whose
     # size is (num_pages, page_size, 2, 128) uint8.
     #
@@ -1727,13 +1744,19 @@ def mla_sliding_window_ragged_paged_attention(
     )
 
     slot_bytes = kv_packing * lkv_dim
-    token_bytes = head_dim * get_dtype_bitwidth(new_kv.dtype) // 8
+    token_bytes = head_dim * get_dtype_bitwidth(jnp.bfloat16) // 8
     assert token_bytes % slot_bytes == 0
     slots_per_token = token_bytes // slot_bytes
     phys_tokens_per_page = physical_page_size_per_kv_packing // slots_per_token
 
-    new_kv = prepare_kv_inputs(new_kv)  # [max_num_tokens, token_bytes] uint8
-    new_kv = new_kv.reshape(new_kv.shape[0], slots_per_token * kv_packing, lkv_dim)
+    if new_kv.dtype == jnp.int32:
+        # Already packed by `rope.rope_kv_words`; the kernels view the words as
+        # the uint8 rows (`_as_u8_rows`).
+        assert new_kv.shape == (q.shape[0], token_bytes // (4 * lkv_dim), lkv_dim)
+    else:
+        assert new_kv.dtype == jnp.bfloat16
+        new_kv = prepare_kv_inputs(new_kv)  # [max_num_tokens, token_bytes] uint8
+        new_kv = new_kv.reshape(new_kv.shape[0], slots_per_token * kv_packing, lkv_dim)
     assert logical_page_size <= phys_tokens_per_page
 
     _, num_q_heads, _ = q.shape
