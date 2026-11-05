@@ -624,5 +624,5 @@ BUFFERED_MATMUL_TUNING = {
 # (gate/up window, down window, stream depth, DMAs per window, quant rows,
 #  vmem bytes)
 SHARED_EXPERT_TUNING = {
-    (7, 288, 5120, 2304): (384, 512, 3, 4, 32, 48 * 1024**2),
+    (7, 288, 5120, 2304): (256, 1024, 3, 2, 32, 56 * 1024**2),
 }

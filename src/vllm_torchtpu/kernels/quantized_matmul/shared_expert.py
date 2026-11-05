@@ -121,6 +121,8 @@ def _kernel(
     w2b,
     s2b,
     ob,
+    zb,
+    zd,
     xsem,
     ssem,
     gsem,
@@ -196,26 +198,50 @@ def _kernel(
     for c in scales:
         c.wait()
 
-    for i in range(n_up):
-        slot = i % depth
-        with jax.named_scope("se_gate_up_wait"):
-            wait(i)
-        with jax.named_scope("se_gate_up"):
-            zs = []
-            for buf, col in ((gb, i * width), (ub, inter + i * width)):
-                z = jax.lax.dot_general(
-                    q[...],
-                    buf[slot, ...],
-                    (((1,), (0,)), ((), ())),
-                    preferred_element_type=jnp.float32,
-                )
-                z = (z * xs[...]) * s13b[pl.ds(col, width)][None, :]
-                zs.append(z.astype(x.dtype))
-            a = _silu_and_mul_with_clamp_f32(*zs, limit)
-            h[:, pl.ds(i * width, width)] = a
-            m = jnp.max(jnp.abs(a.astype(jnp.float32)), axis=1, keepdims=True)
-            hmax[...] = m if i == 0 else jnp.maximum(hmax[...], m)
+    def dot(a, b):
+        return jax.lax.dot_general(
+            a, b, (((1,), (0,)), ((), ())), preferred_element_type=jnp.float32
+        )
+
+    # Software-pipelined: window i + 1's matmuls are issued before window i's
+    # epilogue, in one basic block, so the scheduler overlaps MXU and VPU work.
+    # The raw f32 products park in VMEM between the two (exact).
+    def gate_up_dots(i):
+        wait(i)
+        zb[i % 2, 0] = dot(q[...], gb[i % depth])
+        zb[i % 2, 1] = dot(q[...], ub[i % depth])
         start(i + depth)
+
+    def gate_up_epilogue(i):
+        zs = [
+            ((zb[i % 2, c] * xs[...]) * s13b[pl.ds(col, width)][None, :]).astype(
+                x.dtype
+            )
+            for c, col in enumerate((i * width, inter + i * width))
+        ]
+        a = _silu_and_mul_with_clamp_f32(*zs, limit)
+        h[:, pl.ds(i * width, width)] = a
+        m = jnp.max(jnp.abs(a.astype(jnp.float32)), axis=1, keepdims=True)
+        hmax[...] = m if i == 0 else jnp.maximum(hmax[...], m)
+
+    def down_dot(j):
+        wait(n_up + j)
+        zd[j % 2] = dot(hq[...], w2b[j % depth])
+        start(n_up + j + depth)
+
+    def down_epilogue(j):
+        if j >= 2:
+            output(j - 2).wait()
+        z = (zd[j % 2] * hs[...]) * s2b[pl.ds(j * down_width, down_width)][None, :]
+        ob[j % 2] = z.astype(out.dtype)
+        output(j).start()
+
+    with jax.named_scope("se_gate_up"):
+        gate_up_dots(0)
+        for i in range(n_up):
+            if i + 1 < n_up:
+                gate_up_dots(i + 1)
+            gate_up_epilogue(i)
 
     with jax.named_scope("se_quant_h"):
         s = _row_scale(hmax[...])
@@ -224,23 +250,12 @@ def _kernel(
             hq.dtype
         )
 
-    for j in range(n_down):
-        i = n_up + j
-        with jax.named_scope("se_down_wait"):
-            wait(i)
-        if j >= 2:
-            output(j - 2).wait()
-        with jax.named_scope("se_down"):
-            z = jax.lax.dot_general(
-                hq[...],
-                w2b[j % depth, ...],
-                (((1,), (0,)), ((), ())),
-                preferred_element_type=jnp.float32,
-            )
-            z = (z * hs[...]) * s2b[pl.ds(j * down_width, down_width)][None, :]
-            ob[j % 2, ...] = z.astype(out.dtype)
-        start(i + depth)
-        output(j).start()
+    with jax.named_scope("se_down"):
+        down_dot(0)
+        for j in range(n_down):
+            if j + 1 < n_down:
+                down_dot(j + 1)
+            down_epilogue(j)
 
     with jax.named_scope("se_drain"):
         for j in range(max(n_down - 2, 0), n_down):
@@ -303,6 +318,8 @@ def fused_shared_expert(
             pltpu.VMEM((depth, inter, down_width), w2.dtype),  # w2b
             pltpu.VMEM((k,), jnp.float32),  # s2b
             pltpu.VMEM((2, t, down_width), x.dtype),  # ob
+            pltpu.VMEM((2, 2, t, width), jnp.float32),  # zb
+            pltpu.VMEM((2, t, down_width), jnp.float32),  # zd
             pltpu.SemaphoreType.DMA,
             pltpu.SemaphoreType.DMA((2,)),
             pltpu.SemaphoreType.DMA((depth,)),
