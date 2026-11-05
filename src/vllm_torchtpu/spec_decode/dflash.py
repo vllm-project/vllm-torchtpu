@@ -40,6 +40,7 @@ from vllm_torchtpu.runner.tpu_runner_async_output import INVALID_TOKEN_ID
 from vllm_torchtpu.spec_decode.utils import (
     DraftChunkInputs,
     _force_draft_tp1,
+    dp_lockstep_num_reqs,
     fit_rows,
     maybe_share_embeddings,
     maybe_share_lm_head,
@@ -89,6 +90,15 @@ class DFlashProposer:
         self.dflash_config = normalize_draft_config(hf_config)
         self.mask_token_id = self.dflash_config["mask_token_id"]
         self._target_layer_ids = list(self.dflash_config.get("target_layer_ids", []))
+        # TODO: Derive default target layers from the target model's
+        # `get_eagle3_default_aux_hidden_state_layers()` in `load_model` and/or
+        # support `use_aux_hidden_state=False` to match upstream DFlash.
+        if not self._target_layer_ids:
+            raise ValueError(
+                "DFlash/DSpark requires target layer ids in the draft config "
+                "(one of eagle_aux_hidden_state_layer_ids, dspark_target_layer_ids, "
+                "target_layer_ids, or dflash_config.target_layer_ids)."
+            )
 
         draft_tp = self.speculative_config.draft_tensor_parallel_size
         target_tp = self.vllm_config.parallel_config.tensor_parallel_size
@@ -178,6 +188,12 @@ class DFlashProposer:
         """Query tokens per request: 1 anchor + K mask slots. DSpark's dense
         layout overrides this to K (the anchor is the first prediction)."""
         return K + 1
+
+    def _observe_draft_aux(
+        self, aux: torch.Tensor, chunk_index: int, chunk: DraftChunkInputs
+    ) -> None:
+        """Receives the second output of a chunk's
+        `_dflash_forward_and_sample`; `chunk_index` 0 starts a `propose`."""
 
     def load_model(self, target_model) -> None:
         """Load the draft model, share embeddings, and tag target layers."""
@@ -411,14 +427,9 @@ class DFlashProposer:
             # all-reduce that sizes the target bucket
             # (`_dp_coordinated_step`); run_dp_dummy_draft replays the same
             # shape on idle ranks.
-            padded_len = self._dp_draft_bucket()
-            # The coordinated max is an exact per-chunk bound
-            # (_count_input_chunks); a shortfall here would silently
-            # truncate draft inputs via negative F.pad, so fail loudly.
-            assert padded_len >= total_draft_tokens, (
-                f"lockstep draft bucket {padded_len} < local chunk's "
-                f"{total_draft_tokens} draft tokens"
-            )
+            # A shortfall would silently truncate draft inputs via negative
+            # F.pad; dp_lockstep_num_reqs fails loudly instead.
+            padded_len = self._dp_draft_bucket(num_reqs)
         else:
             padded_len = self._get_padded_len(total_draft_tokens)
 
@@ -513,7 +524,16 @@ class DFlashProposer:
             draft_md_list.append(md)
         return tuple(draft_md_list)
 
-    def _update_draft_kv_cache_from_target(self, chunk) -> None:
+    @staticmethod
+    def _require_aux_hidden_states(chunk: DraftChunkInputs) -> None:
+        if not chunk.aux_hidden_states:
+            raise RuntimeError(
+                "DFlash context KV update requires non-empty target "
+                "aux_hidden_states; ensure the target model returns auxiliary "
+                "hidden states for the configured target_layer_ids."
+            )
+
+    def _update_draft_kv_cache_from_target(self, chunk: DraftChunkInputs) -> None:
         """
         Projects the target model's hidden states into the draft model's KV cache.
 
@@ -522,15 +542,10 @@ class DFlashProposer:
         It applies RoPE to the target's hidden states and scatters the tokens directly
         into the draft KV cache.
         """
-        if chunk.aux_hidden_states is None:
-            return
+        self._require_aux_hidden_states(chunk)
 
         target_hidden = chunk.aux_hidden_states
-        aux_hidden = (
-            target_hidden[0]
-            if isinstance(target_hidden, (list, tuple))
-            else target_hidden
-        )
+        aux_hidden = target_hidden[0]
         num_tokens = aux_hidden.shape[0]
 
         positions = chunk.position_ids
@@ -548,6 +563,8 @@ class DFlashProposer:
 
     def _update_context_kv(self, chunks: list[DraftChunkInputs]) -> int:
         """Update all context chunks before any draft forward (DP lockstep)."""
+        for chunk in chunks:
+            self._require_aux_hidden_states(chunk)
         extra_chunks = 0
         if self._dp_lockstep_sharded():
             extra_chunks = max(0, self.runner._dp_step_num_chunks - len(chunks))
@@ -651,11 +668,12 @@ class DFlashProposer:
                     mesh=self.runner.mesh, vllm_config=self.vllm_config
                 ),
             ):
-                draft_tokens_chunk, _ = self._dflash_forward_and_sample(
+                draft_tokens_chunk, draft_aux = self._dflash_forward_and_sample(
                     input_ids, positions, block_size
                 )
 
             draft_logits_per_chunk.append(draft_tokens_chunk)
+            self._observe_draft_aux(draft_aux, i, chunk)
         for _ in range(extra_chunks):
             self._dp_dummy_forward()
 
@@ -878,10 +896,10 @@ class DFlashProposer:
             )
             synchronize_tensors(draft_tokens_chunk, wait=sync)
 
-    def _dp_draft_bucket(self) -> int:
+    def _dp_draft_bucket(self, local_num_reqs: int = 0) -> int:
         """Draft-forward token bucket every lockstep rank runs this step."""
-        coordinated_reqs = max(1, self.runner._dp_step_max_reqs)
-        return self._get_padded_len(coordinated_reqs * self.block_size)
+        num_reqs = dp_lockstep_num_reqs(self.runner._dp_step_max_reqs, local_num_reqs)
+        return self._get_padded_len(num_reqs * self.block_size)
 
     @torch.no_grad()
     def _dp_dummy_kv_update(self) -> None:

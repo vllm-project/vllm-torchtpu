@@ -44,13 +44,15 @@ gather / scatter kernels see the per-rank values `kh // R`, `vh // R`
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 import jax.numpy as jnp
 
+from ..decls import KVCacheDecl, RecurrentCacheDecl
 from ..errors import MegakernelConfigError
-from ..ops import BF16, FP8, rup
+from ..ops import BF16, FP8, round_up
 from .config import cache_exec
 
 if TYPE_CHECKING:
@@ -68,7 +70,7 @@ LANES = 128
 # - `rec_pages_per_slot == 4`, `conv_pages_per_slot == 1`: the only slot
 #   geometry exercised on TPU.
 # - `KD == VD == LANES`, `conv_taps == 3`: recurrent rows are one lane-row wide
-#   and the recurrent conv state shapes (`rup(3 * B, 8)`, `rup(3 + T, 8)`)
+#   and the recurrent conv state shapes (`round_up(3 * B, 8)`, `round_up(3 + T, 8)`)
 #   hard-code the 3-tap window.
 VALIDATED_HD = 256
 VALIDATED_PAGE_SIZE = 128
@@ -186,10 +188,10 @@ class PoolLayout:
 
     def gpr_conv_rows(self, T: int, R: int) -> int | None:
         """`(rows, 4, page_size)` fp8 page rows of the in-kernel gather (GPR)
-        conv window `(rup(conv_taps + T, 8), QKV)` per rank, or None when the
+        conv window `(round_up(conv_taps + T, 8), QKV)` per rank, or None when the
         window does not fill whole rows. GPR copies only the K half of the conv
         page (`kv_page_shape[1]` rows), so the window must fit there."""
-        hr = rup(self.conv_taps + T, 8)
+        hr = round_up(self.conv_taps + T, 8)
         conv_bytes = hr * self.qkv_per_rank(R) * jnp.dtype(self.conv_dtype).itemsize
         row_bytes = self.kv_page_shape[2] * self.page_size
         if conv_bytes % row_bytes != 0:
@@ -257,12 +259,19 @@ class PoolLayout:
             )
         if not self.has_recurrent:
             return
+        rec_hint = (
+            "; per-rank recurrent state exceeds 4 pages, increase tensor-parallel R"
+            if self.rec_pages_per_slot > VALIDATED_REC_PAGES_PER_SLOT
+            else ""
+        )
         _need(
             self.rec_pages_per_slot == VALIDATED_REC_PAGES_PER_SLOT
             and self.conv_pages_per_slot == VALIDATED_CONV_PAGES_PER_SLOT,
             "pool kernels are only validated for "
             f"{VALIDATED_REC_PAGES_PER_SLOT} recurrent + "
-            f"{VALIDATED_CONV_PAGES_PER_SLOT} conv page(s) per slot",
+            f"{VALIDATED_CONV_PAGES_PER_SLOT} conv page(s) per slot "
+            f"(got rec_pages_per_slot={self.rec_pages_per_slot}, "
+            f"conv_pages_per_slot={self.conv_pages_per_slot}{rec_hint})",
         )
         _need(
             self.KD == LANES and self.VD == LANES,
@@ -304,11 +313,11 @@ class PoolLayout:
             f"per-rank conv window ({conv_rows_pad} rows) exceeds one conv "
             f"page ({self.conv_page_rows} rows)",
         )
-        # In-kernel paths stage the whole `(rup(conv_taps + T, 8), QKV)` verify
+        # In-kernel paths stage the whole `(round_up(conv_taps + T, 8), QKV)` verify
         # window: GPR in the K half of the conv page (`gpr_conv_fits`),
         # fused pool I/O (at least 16 rows) in the whole conv page.
         qkv_rows = self.qkv_per_rank(R) // LANES
-        hr = rup(self.conv_taps + ex.T, 8)
+        hr = round_up(self.conv_taps + ex.T, 8)
         _need(
             not cache_exec(ex).GPR or self.gpr_conv_fits(ex.T, R),
             f"in-kernel gather (GPR) conv window ({hr * qkv_rows} rows at "
@@ -320,6 +329,29 @@ class PoolLayout:
             not cache_exec(ex).FUSED or rows <= self.conv_page_rows,
             f"fused pool I/O conv window ({rows} rows at T={ex.T}) exceeds one "
             f"conv page ({self.conv_page_rows} rows)",
+        )
+
+    @classmethod
+    def from_cache_decls(
+        cls,
+        decls_or_kv: Sequence[KVCacheDecl | RecurrentCacheDecl | Any | None]
+        | KVCacheDecl
+        | Any,
+        rec_decl: RecurrentCacheDecl | Any | None = None,
+        *,
+        num_pools: int | None = None,
+        slots_per_pool: int | None = None,
+        R: int | None = None,
+    ) -> PoolLayout:
+        """Construct a `PoolLayout` from per-layer `cache_decl()` descriptors."""
+        from .derive import derive_pool_layout
+
+        return derive_pool_layout(
+            decls_or_kv,
+            rec_decl,
+            num_pools=num_pools,
+            slots_per_pool=slots_per_pool,
+            R=R,
         )
 
 

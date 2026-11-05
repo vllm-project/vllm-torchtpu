@@ -399,14 +399,19 @@ def gather_from_page_buffer(
     field_rows: int,
     state_rows_per_token: int,
     overlap: bool,
+    token_valid: list[jax.Array],
     is_indexer: bool = False,
 ):
-    """Extracts kv_window, score_window from page buffer."""
+    """Extracts kv_window, score_window from page buffer.
+
+    Tokens with ``token_valid[n]`` false have no output record, so their
+    window is left as is: their compute lanes are discarded.
+    """
     tile_n = page_buffer.shape[0]
     if is_indexer:
         # CSA_INDEXER (layout 32x4x256)
         # page_buffer shape: (tile_n, pages_to_buffer, 32, 4, 256)
-        for n in range(tile_n):
+        def _gather_indexer_token(n):
             safe_idx = jnp.minimum(global_idx + n, num_tokens - 1)
             pos = positions_ref[safe_idx]
 
@@ -454,18 +459,25 @@ def gather_from_page_buffer(
                     kv_window_u8[n, w, 0, :, :] = val_kv
                     score_window_u8[n, w, 0, :, :] = val_score
 
+        for n in range(tile_n):
+
+            @pl.when(token_valid[n])
+            def _(n=n):
+                _gather_indexer_token(n)
     else:
         # Standard HCA/CSA (last dim 128)
         slots_per_part_head = kv_window_u8.shape[2]
 
-        for n in range(tile_n):
+        def _gather_token(n):
             safe_idx = jnp.minimum(global_idx + n, num_tokens - 1)
             pos = positions_ref[safe_idx]
 
             block_idx_curr = pos // block_size
             pos_start = pos - window + 1
 
-            @pl.loop(0, window)
+            # Unrolled: the body is a handful of row copies, so the loop's own
+            # scalar overhead per position was most of its cost.
+            @pl.loop(0, window, unroll=min(window, 8))
             def body_w(w):
                 pos_w = pos_start + w
                 block_idx_w = pos_w // block_size
@@ -504,3 +516,9 @@ def gather_from_page_buffer(
                     score_window_u8[n, w, d_idx, :, :] = page_buffer[
                         n, p, score_src_row, :, :
                     ]
+
+        for n in range(tile_n):
+
+            @pl.when(token_valid[n])
+            def _(n=n):
+                _gather_token(n)

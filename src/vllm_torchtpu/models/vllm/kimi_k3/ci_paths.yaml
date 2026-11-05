@@ -1,0 +1,49 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Diff-aware CI path rules for Kimi-K3 model & kernel implementations.
+# Owned jointly by models/kernels CODEOWNERS (@kyuyeunk @qizzzh) and CI CODEOWNERS.
+component: kimi_k3
+phase: phase2
+reason: "Kimi-K3 module changes"
+
+path_prefixes:
+  - "src/vllm_torchtpu/models/vllm/kimi_k3/"
+  - "src/vllm_torchtpu/kernels/kimi_k3/"
+  - "src/vllm_torchtpu/kernels/gdn/v3/compute_kda.py"
+  - "src/vllm_torchtpu/layers/adapter/custom_ops/kda_attention_op.py"
+
+module_prefixes:
+  - "vllm_torchtpu.models.vllm.kimi_k3"
+  - "vllm_torchtpu.kernels.kimi_k3"
+
+allowed_test_importers:
+  - "tests/models/vllm/test_kimi_k3.py"
+  - "tests/kernels/test_kimi_"
+
+allowed_external_importers: []
+
+build_docker_omni: false
+
+test_steps:
+  - "typecheck_full"
+  - "unit_tests_cpu_pr"
+  - "unit_tests_general_pr"
+  - "unit_tests_multichip_pr"
+
+full_general_tests: true
+full_multichip_tests: true
+
+integration_steps:
+  - "integration_k3_pruned75_apc_offload_correctness"

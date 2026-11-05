@@ -42,18 +42,29 @@ def resolve_active_seqs(
     active_seqs: jax.Array | str | None,
     *,
     default_mode: str = "from_ckpt",
+    ns: int | None = None,
+    has_recurrent: bool = True,
 ) -> tuple[str, jax.Array | None]:
     """Normalize `active_seqs` into `(act_mode, active_mask_array)`."""
     if active_seqs is None:
-        return default_mode, None
-    if isinstance(active_seqs, str):
-        if active_seqs in ("from_ckpt", "all"):
-            return active_seqs, None
+        act_mode, mask = default_mode, None
+    elif isinstance(active_seqs, str):
+        if active_seqs not in ("from_ckpt", "all"):
+            raise ValueError(
+                f"Unsupported active_seqs mode {active_seqs!r}; "
+                "expected 'from_ckpt', 'all', None, or an int32/bool mask array"
+            )
+        act_mode, mask = active_seqs, None
+    else:
+        act_mode, mask = "ref", jnp.asarray(active_seqs, dtype=I32)
+    if not has_recurrent and act_mode == "from_ckpt":
         raise ValueError(
-            f"Unsupported active_seqs mode {active_seqs!r}; "
-            "expected 'from_ckpt', 'all', None, or an int32/bool mask array"
+            "active_seqs='from_ckpt' requires a layout with recurrent state "
+            "(slots_per_pool > 0); use active_seqs='all' or a mask array"
         )
-    return "ref", jnp.asarray(active_seqs, dtype=I32)
+    if ns is not None and mask is not None and mask.shape != (ns,):
+        raise ValueError(f"active_seqs mask has shape {mask.shape}, expected ({ns},)")
+    return act_mode, mask
 
 
 def check_ckpt_bounds(
@@ -63,35 +74,80 @@ def check_ckpt_bounds(
     *,
     act_mode: str = "from_ckpt",
     active_mask: Any = None,
+    read_offsets: Any = None,
+    raw_pools: Any = None,
+    ns: int | None = None,
+    min_k: int = 1,
 ) -> None:
-    """Validate concrete (eager) active checkpoint slots fit in `[0, num_pages)`.
+    """Validate pool/ckpt shapes and concrete active slot bounds in `[0, num_pages)`.
 
     Accepts 2D `[NS, K]`, 3D `[slots_per_pool, NS, K]` or rank-leading 4D
     `ckpt_indices` (see `PoolLayout.page_base`). 3D indices must use disjoint
-    slots across sub-layers of an active sequence. Under `jax.jit` (`Tracer`
-    inputs), this eager host check is a no-op and bounds are checked inside the
-    Pallas kernels via `pl.debug_check` when Pallas debug checks are enabled
-    (`jax_pallas_enable_debug_checks=True`).
+    slots across sub-layers of an active sequence. When `raw_pools`, `ns`, or
+    `read_offsets` are provided, also checks per-rank pool shapes, `ckpt_indices`
+    / `read_offsets` shapes, and `read_offsets < K` for active sequences. Under
+    `jax.jit` (`Tracer` inputs), static shape checks still run while eager slot
+    value checks are skipped (enforced inside the Pallas kernels via
+    `pl.debug_check` when `jax_pallas_enable_debug_checks=True`).
     """
+    if raw_pools is not None:
+        if len(raw_pools) != layout.num_pools:
+            raise ValueError(
+                f"expected {layout.num_pools} raw_pools, got {len(raw_pools)}"
+            )
+        exp_pool_shape = (num_pages, *layout.kv_page_shape)
+        for p_idx, pool_arr in enumerate(raw_pools):
+            if pool_arr.shape != exp_pool_shape:
+                raise ValueError(
+                    f"raw_pools[{p_idx}] has shape {pool_arr.shape}, expected "
+                    f"per-rank shape {exp_pool_shape}"
+                )
     g_per_att = layout.slots_per_pool
-    if (
-        ckpt_indices is None
-        or g_per_att <= 0
-        or isinstance(ckpt_indices, jax.core.Tracer)
-    ):
+    if ckpt_indices is None or g_per_att <= 0:
+        return
+    if ns is not None:
+        if not (
+            (ckpt_indices.ndim == 2 and ckpt_indices.shape[0] == ns)
+            or (ckpt_indices.ndim == 3 and ckpt_indices.shape[:2] == (g_per_att, ns))
+        ):
+            raise ValueError(
+                f"ckpt_indices has shape {ckpt_indices.shape}, expected "
+                f"({g_per_att}, {ns}, K) or ({ns}, K)"
+            )
+        if ckpt_indices.shape[-1] < min_k:
+            raise ValueError(
+                f"ckpt_indices last dim K={ckpt_indices.shape[-1]} must be >= {min_k}"
+            )
+        if read_offsets is not None and read_offsets.shape not in (
+            (ns,),
+            (g_per_att, ns),
+        ):
+            raise ValueError(
+                f"read_offsets has shape {read_offsets.shape}, expected "
+                f"({g_per_att}, {ns}) or ({ns},)"
+            )
+    if isinstance(ckpt_indices, jax.core.Tracer):
         return
     ckpt_np = np.asarray(ckpt_indices)
     if ckpt_np.ndim == 4:
         ckpt_np = ckpt_np[0]
     is_3d = ckpt_np.ndim == 3
-    ns = ckpt_np.shape[1] if is_3d else ckpt_np.shape[0]
+    n_seqs = int(ckpt_np.shape[1] if is_3d else ckpt_np.shape[0])
+    ckpt_k = ckpt_np.shape[-1]
     mask_np = (
         None
         if (active_mask is None or isinstance(active_mask, jax.core.Tracer))
         else np.asarray(active_mask).reshape(-1)
     )
+    roff_np = (
+        None
+        if (read_offsets is None or isinstance(read_offsets, jax.core.Tracer))
+        else np.asarray(read_offsets)
+    )
+    if roff_np is not None and roff_np.ndim == 3:
+        roff_np = roff_np[0]
     pps = layout.pages_per_slot
-    for s in range(ns):
+    for s in range(n_seqs):
         if act_mode == "from_ckpt":
             active = int(ckpt_np[0, s, 0] if is_3d else ckpt_np[s, 0]) > 0
         elif act_mode == "ref" and mask_np is not None:
@@ -102,6 +158,13 @@ def check_ckpt_bounds(
             continue
         seen_slots: dict[int, int] = {}
         for sub in range(g_per_att):
+            if roff_np is not None:
+                ro_val = int(roff_np[sub, s] if roff_np.ndim == 2 else roff_np[s])
+                if ro_val >= ckpt_k:
+                    raise ValueError(
+                        f"GDN read_offsets={ro_val} (sub={sub}, s={s}) is out of "
+                        f"bounds for ckpt_indices with K={ckpt_k}"
+                    )
             slots = ckpt_np[sub, s] if is_3d else ckpt_np[s]
             for slot in np.ravel(slots):
                 slot_i = int(slot)
@@ -112,7 +175,7 @@ def check_ckpt_bounds(
                         f"maps to pages [{pb}, {pb + pps}), which exceeds pool "
                         f"capacity [0, {num_pages})"
                     )
-                if is_3d:
+                if is_3d and slot_i > 0:
                     prev_sub = seen_slots.get(slot_i)
                     if prev_sub is not None and prev_sub != sub:
                         raise ValueError(
@@ -137,7 +200,7 @@ def kernel_debug_check(cond: Any, msg: str, *, interpret: bool) -> None:
         jax.debug.callback(_cb, cond)
 
 
-# `ex -> (chunk rows, state ring depth)` of the recurrent block's chunked path.
+# `ex -> (chunk rows, state ring depth)` of the recurrent module's chunked path.
 RecChunk = Callable[[ExecSpec], tuple[int, int]]
 
 
@@ -194,9 +257,13 @@ def make_pool_backend(
     elif supports_pool_gather and rec_chunk is None:
         raise MegakernelConfigError(
             "make_pool_backend(supports_pool_gather=True) needs rec_chunk (the "
-            "recurrent block's chunking, e.g. GDNBlock.chunk_rows): without it "
+            "recurrent module's chunking, e.g. GDNModule.chunk_rows): without it "
             "in-kernel gather is never eligible"
         )
+    # Local imports: the kernels import the shared checks from this module.
+    from .gather import gather_gdn_states
+    from .scatter import scatter_pool_states
+
     has_rec = layout.has_recurrent
 
     def _gather(
@@ -206,19 +273,49 @@ def make_pool_backend(
         read_offsets: jax.Array | None,
         active_seqs: Any,
     ) -> dict[str, Any]:
-        del raw_pools, active_seqs
         if not has_rec or cache_exec(ex_paged).GPR:
             return {}
         assert ckpt_indices is not None and read_offsets is not None
         if check is not None:
             check(ex_paged)
-        raise NotImplementedError(
-            "TODO: recurrent state gather is not yet wired in make_pool_backend"
+        conv, rec = gather_gdn_states(
+            layout,
+            ex_paged,
+            raw_pools,
+            ckpt_indices,
+            read_offsets,
+            active_seqs,
+            interpret=ex_paged.interpret,
         )
+        return {"conv": conv, "rec": rec}
 
-    def _scatter(*_args: Any, **_kwargs: Any) -> Any:
-        raise NotImplementedError(
-            "TODO: state scatter is not yet wired in make_pool_backend"
+    def _scatter(
+        ex_paged: ExecSpec,
+        raw_pools: tuple[jax.Array, ...],
+        pos: jax.Array,
+        page_table: jax.Array,
+        out_map: dict[str, Any],
+        ckpt_indices: jax.Array | None,
+        active_seqs: Any,
+    ) -> tuple[jax.Array, ...]:
+        if check is not None:
+            check(ex_paged)
+        conv_out = out_map.get("conv_ckpt" if ex_paged.VER else "conv")
+        rec_out = out_map.get("rec_ckpt" if ex_paged.VER else "rec")
+        return scatter_pool_states(
+            layout,
+            ex_paged,
+            raw_pools,
+            pos,
+            page_table,
+            out_map["knew"],
+            out_map["vnew"],
+            conv_out if has_rec else None,
+            rec_out if has_rec else None,
+            ckpt_indices if has_rec else None,
+            active_seqs,
+            interpret=ex_paged.interpret,
+            conv_partial=cache_exec(ex_paged).GPR,
         )
 
     def _can_pool_gather(ex_paged: ExecSpec) -> bool:

@@ -291,10 +291,7 @@ class TpuKVConnectorPromMetrics(KVConnectorPromMetrics):
         )
         self.runner_device_elapsed = self._histogram_cls(
             name="vllm:tpu_runner_device_elapsed_seconds",
-            documentation=(
-                "Approximate wall time between TPU stage Event completions, "
-                "observed by a background thread."
-            ),
+            documentation="Host-observed time between TPU stage Event completions.",
             buckets=RUNNER_TIMING_BUCKETS_SECONDS,
             labelnames=runner_labels,
         )

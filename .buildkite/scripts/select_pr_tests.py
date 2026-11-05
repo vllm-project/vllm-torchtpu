@@ -24,214 +24,297 @@ import shlex
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
+
+try:
+    import yaml as _pyyaml
+except ImportError:
+    _pyyaml = None
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
+GLOBAL_CI_PATHS_REL = ".buildkite/ci_paths.yaml"
 DEFAULT_TEST_PATTERN = "tests/**/{test_*,*_test}.py"
+VALID_MODES = ("off", "shadow", "phase1", "phase2")
 
-ALL_PR_TEST_STEPS: tuple[str, ...] = (
-    "typecheck_full",
-    "unit_tests_cpu_pr",
-    "unit_tests_general_pr",
-    "unit_tests_multichip_pr",
-    "unit_tests_spec_decode_pr",
-    "unit_tests_spec_decode_multichip_pr",
-    "unit_tests_omni_pr",
+
+def _parse_yaml_scalar(raw: str) -> Any:
+    val = raw.strip()
+    if val == "[]":
+        return []
+    if val == "{}":
+        return {}
+    if val in {"true", "True"}:
+        return True
+    if val in {"false", "False"}:
+        return False
+    if val in {"null", "None", "~"}:
+        return None
+    if (val.startswith('"') and val.endswith('"')) or (
+        val.startswith("'") and val.endswith("'")
+    ):
+        return val[1:-1]
+    if re.fullmatch(r"-?\d+", val):
+        return int(val)
+    return val
+
+
+def _strip_yaml_comment(line: str) -> str:
+    in_single = False
+    in_double = False
+    for idx, ch in enumerate(line):
+        if ch == "'" and not in_double:
+            in_single = not in_single
+        elif ch == '"' and not in_single:
+            in_double = not in_double
+        elif (
+            ch == "#"
+            and not in_single
+            and not in_double
+            and (idx == 0 or line[idx - 1].isspace())
+        ):
+            return line[:idx].rstrip()
+    return line.rstrip()
+
+
+def _parse_simple_yaml(text: str) -> dict[str, Any]:
+    """Pure-stdlib YAML subset parser for ci_paths.yaml when PyYAML is absent."""
+    tokens: list[tuple[int, str]] = []
+    for raw_line in text.splitlines():
+        cleaned = _strip_yaml_comment(raw_line)
+        if not cleaned.strip():
+            continue
+        indent = len(cleaned) - len(cleaned.lstrip(" "))
+        tokens.append((indent, cleaned.strip()))
+
+    def parse_block(index: int, base_indent: int) -> tuple[Any, int]:
+        if index >= len(tokens):
+            return {}, index
+        first_indent, first_content = tokens[index]
+        if first_indent < base_indent:
+            return {}, index
+
+        if first_content.startswith("- "):
+            items: list[Any] = []
+            while index < len(tokens):
+                ind, content = tokens[index]
+                if ind < base_indent or not content.startswith("- "):
+                    break
+                if ind > base_indent:
+                    break
+                item_body = content[2:].strip()
+                index += 1
+                if ":" in item_body and not (
+                    item_body.startswith('"') or item_body.startswith("'")
+                ):
+                    k, v_raw = item_body.split(":", 1)
+                    item_dict: dict[str, Any] = {}
+                    key = _parse_yaml_scalar(k)
+                    if v_raw.strip():
+                        item_dict[key] = _parse_yaml_scalar(v_raw)
+                    else:
+                        sub_val, index = parse_block(index, ind + 2)
+                        item_dict[key] = sub_val
+                    while index < len(tokens) and tokens[index][0] >= ind + 2:
+                        sub_ind, sub_content = tokens[index]
+                        if sub_ind != ind + 2 or sub_content.startswith("- "):
+                            break
+                        sk, sv_raw = sub_content.split(":", 1)
+                        skey = _parse_yaml_scalar(sk)
+                        index += 1
+                        if sv_raw.strip():
+                            item_dict[skey] = _parse_yaml_scalar(sv_raw)
+                        else:
+                            sub_val, index = parse_block(index, sub_ind + 2)
+                            item_dict[skey] = sub_val
+                    items.append(item_dict)
+                else:
+                    items.append(_parse_yaml_scalar(item_body))
+            return items, index
+
+        mapping: dict[str, Any] = {}
+        while index < len(tokens):
+            ind, content = tokens[index]
+            if ind < base_indent or content.startswith("- "):
+                break
+            if ind > base_indent:
+                break
+            k, v_raw = content.split(":", 1)
+            key = str(_parse_yaml_scalar(k))
+            index += 1
+            if v_raw.strip():
+                mapping[key] = _parse_yaml_scalar(v_raw)
+            else:
+                if index < len(tokens) and tokens[index][0] > ind:
+                    sub_val, index = parse_block(index, tokens[index][0])
+                    mapping[key] = sub_val
+                else:
+                    mapping[key] = {}
+        return mapping, index
+
+    result, _ = parse_block(0, 0)
+    return result if isinstance(result, dict) else {}
+
+
+def load_yaml_text(text: str) -> dict[str, Any]:
+    """Loads a YAML mapping using PyYAML if available, else the stdlib parser."""
+    if _pyyaml is not None:
+        loaded = _pyyaml.safe_load(text)
+        return loaded if isinstance(loaded, dict) else {}
+    return _parse_simple_yaml(text)
+
+
+@dataclass(frozen=True)
+class ComponentRule:
+    """Declarative test selection and import boundary rule for a component."""
+
+    component: str
+    phase: str
+    reason: str
+    config_path: str
+    path_prefixes: tuple[str, ...]
+    module_prefixes: tuple[str, ...] = ()
+    allowed_test_importers: tuple[str, ...] = ()
+    allowed_external_importers: tuple[str, ...] = ()
+    build_docker_omni: bool = False
+    test_steps: tuple[str, ...] = ()
+    integration_steps: tuple[str, ...] = ()
+    full_general_tests: bool = False
+    full_multichip_tests: bool = False
+    general_test_pattern: str = ""
+    general_test_files: tuple[str, ...] = ()
+    general_test_parallelism: int | None = None
+
+
+@dataclass(frozen=True)
+class CiPathsConfig:
+    """Parsed declarative configuration from .buildkite/ci_paths.yaml + components."""
+
+    default_policy: str
+    component_config_paths: tuple[str, ...]
+    all_pr_test_steps: tuple[str, ...]
+    all_pr_integration_steps: tuple[str, ...]
+    full_ci_prefixes: tuple[str, ...]
+    full_ci_exact: frozenset[str]
+    skip_all_suffixes: tuple[str, ...]
+    skip_all_exact: frozenset[str]
+    skip_all_prefixes: tuple[str, ...]
+    non_pr_buildkite_exact: frozenset[str]
+    nightly_only_integration_exact: frozenset[str]
+    benchmark_prefixes: tuple[str, ...]
+    cpu_only_exact: frozenset[str]
+    cpu_only_prefixes: tuple[str, ...]
+    cpu_tested_benchmark_files: frozenset[str]
+    integration_file_to_steps: dict[str, set[str]]
+    component_rules: tuple[ComponentRule, ...]
+
+
+def _parse_component_rule(data: dict[str, Any], config_path: str) -> ComponentRule:
+    return ComponentRule(
+        component=str(data["component"]),
+        phase=str(data.get("phase", "phase2")),
+        reason=str(data.get("reason", f"{data['component']} changes")),
+        config_path=config_path,
+        path_prefixes=tuple(data.get("path_prefixes", ())),
+        module_prefixes=tuple(data.get("module_prefixes", ())),
+        allowed_test_importers=tuple(data.get("allowed_test_importers", ())),
+        allowed_external_importers=tuple(data.get("allowed_external_importers", ())),
+        build_docker_omni=bool(data.get("build_docker_omni", False)),
+        test_steps=tuple(data.get("test_steps", ())),
+        integration_steps=tuple(data.get("integration_steps", ())),
+        full_general_tests=bool(data.get("full_general_tests", False)),
+        full_multichip_tests=bool(data.get("full_multichip_tests", False)),
+        general_test_pattern=str(data.get("general_test_pattern", "")),
+        general_test_files=tuple(data.get("general_test_files", ())),
+        general_test_parallelism=(
+            int(data["general_test_parallelism"])
+            if data.get("general_test_parallelism") is not None
+            else None
+        ),
+    )
+
+
+def load_ci_paths_config(repo_root: Path = REPO_ROOT) -> CiPathsConfig:
+    """Loads .buildkite/ci_paths.yaml and all per-component ci_paths.yaml files."""
+    global_path = repo_root / GLOBAL_CI_PATHS_REL
+    if not global_path.is_file():
+        return CiPathsConfig(
+            default_policy="full_ci",
+            component_config_paths=(),
+            all_pr_test_steps=(),
+            all_pr_integration_steps=(),
+            full_ci_prefixes=(),
+            full_ci_exact=frozenset(),
+            skip_all_suffixes=(),
+            skip_all_exact=frozenset(),
+            skip_all_prefixes=(),
+            non_pr_buildkite_exact=frozenset(),
+            nightly_only_integration_exact=frozenset(),
+            benchmark_prefixes=(),
+            cpu_only_exact=frozenset(),
+            cpu_only_prefixes=(),
+            cpu_tested_benchmark_files=frozenset(),
+            integration_file_to_steps={},
+            component_rules=(),
+        )
+    raw = load_yaml_text(global_path.read_text(encoding="utf-8"))
+
+    comp_paths = tuple(raw.get("component_configs", ()))
+    rules: list[ComponentRule] = []
+    for rel_path in comp_paths:
+        comp_file = repo_root / rel_path
+        if comp_file.is_file():
+            comp_raw = load_yaml_text(comp_file.read_text(encoding="utf-8"))
+            rules.append(_parse_component_rule(comp_raw, rel_path))
+
+    for scoped_raw in raw.get("scoped_rules", ()):
+        rules.append(_parse_component_rule(scoped_raw, GLOBAL_CI_PATHS_REL))
+
+    full_ci = raw.get("full_ci_paths", {})
+    no_tpu = raw.get("no_tpu", {})
+    skip_all = no_tpu.get("skip_all_ci", {})
+    cpu_only = no_tpu.get("cpu_only", {})
+    integ_map = {
+        str(k): set(v) for k, v in (raw.get("integration_files", {}) or {}).items()
+    }
+
+    return CiPathsConfig(
+        default_policy=str(raw.get("default_policy", "full_ci")),
+        component_config_paths=comp_paths,
+        all_pr_test_steps=tuple(raw.get("all_pr_test_steps", ())),
+        all_pr_integration_steps=tuple(raw.get("all_pr_integration_steps", ())),
+        full_ci_prefixes=tuple(full_ci.get("prefixes", ())),
+        full_ci_exact=frozenset(full_ci.get("exact", ())),
+        skip_all_suffixes=tuple(skip_all.get("suffixes", ())),
+        skip_all_exact=frozenset(skip_all.get("exact", ())),
+        skip_all_prefixes=tuple(skip_all.get("prefixes", ())),
+        non_pr_buildkite_exact=frozenset(skip_all.get("non_pr_buildkite_exact", ())),
+        nightly_only_integration_exact=frozenset(
+            skip_all.get("nightly_only_integration_exact", ())
+        ),
+        benchmark_prefixes=tuple(skip_all.get("benchmark_prefixes", ())),
+        cpu_only_exact=frozenset(cpu_only.get("exact", ())),
+        cpu_only_prefixes=tuple(cpu_only.get("prefixes", ())),
+        cpu_tested_benchmark_files=frozenset(
+            cpu_only.get("cpu_tested_benchmark_files", ())
+        ),
+        integration_file_to_steps=integ_map,
+        component_rules=tuple(rules),
+    )
+
+
+_DEFAULT_CONFIG = load_ci_paths_config(REPO_ROOT)
+
+ALL_PR_TEST_STEPS: tuple[str, ...] = _DEFAULT_CONFIG.all_pr_test_steps
+ALL_PR_INTEGRATION_STEPS: tuple[str, ...] = _DEFAULT_CONFIG.all_pr_integration_steps
+INTEGRATION_FILE_TO_STEPS: dict[str, set[str]] = (
+    _DEFAULT_CONFIG.integration_file_to_steps
 )
-
-ALL_PR_INTEGRATION_STEPS: tuple[str, ...] = (
-    "integration_qwen35_pcp4_dp4_disagg_correctness",
-    "integration_qwen35_pcp4_2tp2dp_disagg_correctness",
-    "integration_qwen35_pcp4tp1_tp4dcp2_disagg_correctness",
-    "presubmit_disagg_single_host",
-    "integration_qwen35_apc_correctness",
-    "integration_qwen35_gpc_global_dram_pool",
-    "integration_compilation_cache_e2e",
-    "integration_k3_pruned75_apc_offload_correctness",
-    "vllm_torchtpu_multihost_presubmit",
-    "integration_qwen35_pcp8_2tp4dp_disagg_correctness",
-    "integration_qwen35_gpc_correctness",
+CPU_TESTED_BENCHMARK_FILES: set[str] = set(_DEFAULT_CONFIG.cpu_tested_benchmark_files)
+NIGHTLY_ONLY_INTEGRATION_EXACT: set[str] = set(
+    _DEFAULT_CONFIG.nightly_only_integration_exact
 )
-
-INTEGRATION_FILE_TO_STEPS: dict[str, set[str]] = {
-    "scripts/vllm/integration/run_qwen35_p4d2_disagg_correctness.sh": {
-        "integration_qwen35_pcp4_dp4_disagg_correctness",
-        "integration_qwen35_pcp4_2tp2dp_disagg_correctness",
-    },
-    "examples/disagg/launch_qwen35_p4d2_v2_baseline.sh": {
-        "integration_qwen35_pcp4_dp4_disagg_correctness",
-        "integration_qwen35_pcp4_2tp2dp_disagg_correctness",
-    },
-    "scripts/vllm/integration/run_qwen35_pcp4_2tp2dp_disagg_correctness.sh": {
-        "integration_qwen35_pcp4_2tp2dp_disagg_correctness"
-    },
-    "scripts/vllm/integration/qwen35_pd_disagg_common_env.sh": {
-        "integration_qwen35_pcp4_2tp2dp_disagg_correctness",
-        "integration_qwen35_pcp4tp1_tp4dcp2_disagg_correctness",
-        "integration_qwen35_pcp8_2tp4dp_disagg_correctness",
-    },
-    "scripts/vllm/integration/run_qwen35_pcp_tp_dcp_disagg_correctness.sh": {
-        "integration_qwen35_pcp4tp1_tp4dcp2_disagg_correctness"
-    },
-    "examples/disagg/run_disagg_single_host.sh": {"presubmit_disagg_single_host"},
-    "examples/disagg/toy_proxy_server.py": {
-        "presubmit_disagg_single_host",
-        "integration_qwen35_pcp4_dp4_disagg_correctness",
-        "integration_qwen35_pcp4_2tp2dp_disagg_correctness",
-        "integration_qwen35_pcp4tp1_tp4dcp2_disagg_correctness",
-        "integration_qwen35_pcp8_2tp4dp_disagg_correctness",
-    },
-    "scripts/vllm/integration/run_qwen35_apc_correctness.sh": {
-        "integration_qwen35_apc_correctness"
-    },
-    "scripts/vllm/integration/run_qwen35_gpc_global_dram_pool.sh": {
-        "integration_qwen35_gpc_global_dram_pool"
-    },
-    "scripts/vllm/integration/smoke_gpc_global_dram_pool.py": {
-        "integration_qwen35_gpc_global_dram_pool"
-    },
-    "scripts/vllm/integration/run_compilation_cache_e2e.sh": {
-        "integration_compilation_cache_e2e"
-    },
-    "scripts/vllm/integration/run_k3_pruned75_apc_offload_correctness.sh": {
-        "integration_k3_pruned75_apc_offload_correctness"
-    },
-    "scripts/vllm/integration/smoke_prefix_multiturn_and_eviction_recall.py": {
-        "integration_k3_pruned75_apc_offload_correctness"
-    },
-    "scripts/vllm/integration/smoke_basic_offload_correctness.py": {
-        "integration_k3_pruned75_apc_offload_correctness"
-    },
-    "scripts/vllm/integration/smoke_mamba_state_contamination.py": {
-        "integration_qwen35_apc_correctness",
-        "integration_k3_pruned75_apc_offload_correctness",
-    },
-    "scripts/vllm/integration/smoke_prefix_cache_correctness.py": {
-        "integration_qwen35_pcp4_dp4_disagg_correctness",
-        "integration_qwen35_pcp4_2tp2dp_disagg_correctness",
-        "integration_qwen35_pcp4tp1_tp4dcp2_disagg_correctness",
-        "integration_qwen35_apc_correctness",
-        "integration_qwen35_pcp8_2tp4dp_disagg_correctness",
-    },
-    "scripts/vllm/integration/smoke_prefix_cache_e2e_divergence.py": {
-        "integration_qwen35_pcp4_dp4_disagg_correctness",
-        "integration_qwen35_pcp4_2tp2dp_disagg_correctness",
-        "integration_qwen35_pcp4tp1_tp4dcp2_disagg_correctness",
-        "integration_qwen35_apc_correctness",
-        "integration_k3_pruned75_apc_offload_correctness",
-        "integration_qwen35_pcp8_2tp4dp_disagg_correctness",
-    },
-    "scripts/vllm/integration/run_qwen35_p8d8_disagg_correctness.sh": {
-        "integration_qwen35_pcp8_2tp4dp_disagg_correctness",
-        "integration_qwen35_pcp4tp1_tp4dcp2_disagg_correctness",
-    },
-    "examples/disagg/launch_qwen35_disagg_multihost.sh": {
-        "integration_qwen35_pcp8_2tp4dp_disagg_correctness",
-        "integration_qwen35_pcp4tp1_tp4dcp2_disagg_correctness",
-    },
-    ".buildkite/kubernetes/manifests/workloads/qwen3.5-p8d8-disagg.yaml": {
-        "integration_qwen35_pcp8_2tp4dp_disagg_correctness"
-    },
-    "scripts/vllm/integration/run_qwen35_gpc_correctness.sh": {
-        "integration_qwen35_gpc_correctness"
-    },
-    "scripts/vllm/integration/smoke_gpc_global_offloading.py": {
-        "integration_qwen35_gpc_correctness"
-    },
-    ".buildkite/kubernetes/manifests/workloads/qwen3.5-gpc-two-replica.yaml": {
-        "integration_qwen35_gpc_correctness"
-    },
-    ".buildkite/kubernetes/single_host_engine.sh": {
-        "integration_qwen35_pcp8_2tp4dp_disagg_correctness",
-        "integration_qwen35_gpc_correctness",
-    },
-    "examples/offline_inference.py": {
-        "vllm_torchtpu_multihost_presubmit",
-        "integration_compilation_cache_e2e",
-    },
-    ".buildkite/kubernetes/manifests/workloads/ray-multihost-slice.yaml": {
-        "vllm_torchtpu_multihost_presubmit"
-    },
-    ".buildkite/kubernetes/multihost_entry.sh": {"vllm_torchtpu_multihost_presubmit"},
-    ".buildkite/kubernetes/manifests/workloads/mp-multihost-slice.yaml": {
-        "vllm_torchtpu_multihost_presubmit"
-    },
-    ".buildkite/kubernetes/mp_multihost_entry.sh": {
-        "vllm_torchtpu_multihost_presubmit"
-    },
-    ".buildkite/kubernetes/multihost_lib.sh": {
-        "vllm_torchtpu_multihost_presubmit",
-        "integration_qwen35_pcp8_2tp4dp_disagg_correctness",
-        "integration_qwen35_gpc_correctness",
-    },
-    ".buildkite/kubernetes/run_multihost.sh": {
-        "vllm_torchtpu_multihost_presubmit",
-        "integration_qwen35_pcp8_2tp4dp_disagg_correctness",
-        "integration_qwen35_gpc_correctness",
-    },
-}
-
-CPU_TESTED_BENCHMARK_FILES: set[str] = {
-    "scripts/vllm/benchmarking/check_regression.py",
-    "scripts/vllm/benchmarking/configs/qwen3-0.6b-structured-flat-json.sh",
-    "scripts/vllm/benchmarking/configs/qwen3-0.6b-structured-complex-ast.sh",
-    "scripts/vllm/benchmarking/configs/qwen3-0.6b-structured-character-dataset.sh",
-    "scripts/vllm/benchmarking/structured_schemas/flat_json.json",
-    "scripts/vllm/benchmarking/structured_schemas/complex_ast.json",
-    "scripts/vllm/benchmarking/structured_schemas/character_schema.json",
-    "scripts/vllm/benchmarking/datasets/character_benchmark.json",
-    "scripts/vllm/benchmark/inferencex/sweep_summary.py",
-    "scripts/vllm/benchmark/inferencex/sweep_lib.sh",
-    "scripts/vllm/integration/lm_eval_accuracy.py",
-    "scripts/ci_failure_metrics.py",
-    "scripts/find_owners.py",
-}
-
-NIGHTLY_ONLY_INTEGRATION_EXACT: set[str] = {
-    "scripts/vllm/integration/test_accuracy.py",
-    "scripts/vllm/integration/test_safety_model_accuracy.py",
-    "scripts/vllm/integration/run_dsv4_offload_correctness.sh",
-    "scripts/vllm/integration/run_dsv4_pd_correctness.sh",
-    "scripts/vllm/integration/check_dsv4_stage3_log.py",
-    "scripts/vllm/integration/run_glm52_fp4_offload_correctness.sh",
-    "scripts/vllm/integration/run_k3_1p1d_disagg_correctness.sh",
-    "scripts/vllm/integration/run_pcp_correctness.sh",
-    "scripts/vllm/integration/run_qwen35_block_major_disagg_offload.sh",
-    "scripts/vllm/integration/run_qwen35_pp_disagg_offload.sh",
-    "scripts/vllm/integration/smoke_block_major_offload.py",
-    ".buildkite/kubernetes/manifests/workloads/dsv4-pd-disagg.yaml",
-    ".buildkite/kubernetes/manifests/workloads/kimi-k3-1p1d-4dp8tp.yaml",
-    ".buildkite/kubernetes/manifests/workloads/kimi-k3-agentx-1p1d.yaml",
-    ".buildkite/kubernetes/manifests/workloads/qwen3.5-397b-1p1d.yaml",
-    ".buildkite/kubernetes/disagg_benchmark.sh",
-    ".buildkite/kubernetes/disagg_engine.sh",
-    ".buildkite/kubernetes/k3_1p1d.sh",
-    ".buildkite/kubernetes/k3_agentx_client_pod.sh",
-    ".buildkite/kubernetes/benchmark_with_profile.sh",
-}
-
-NON_PR_BUILDKITE_EXACT: set[str] = {
-    ".buildkite/pipeline_perf.yml",
-    ".buildkite/pipeline_promote.yml",
-    ".buildkite/pipeline_nightly_image.yml",
-    ".buildkite/pipeline_dynamic.yml",
-    ".buildkite/pipeline_dev.yml",
-    ".buildkite/pipeline_coverage.yml",
-    ".buildkite/scripts/bootstrap_dev.sh",
-    ".buildkite/scripts/upload_models_and_features.sh",
-    ".buildkite/scripts/record_step_result.sh",
-    ".buildkite/scripts/generate_support_matrices.sh",
-    ".buildkite/scripts/commit_support_matrices.sh",
-    ".buildkite/scripts/commit_verified_commit_hashes.sh",
-    ".buildkite/scripts/nightly_report.sh",
-    ".buildkite/scripts/notify_test_results.sh",
-    ".buildkite/scripts/update_lkg_version.sh",
-    ".buildkite/scripts/publish_nightly_images.sh",
-    ".buildkite/scripts/build_k3_engine_image.sh",
-    ".buildkite/scripts/build_core_wheel.sh",
-    ".buildkite/scripts/build_vllm_torchtpu.sh",
-    ".buildkite/scripts/publish_wheel.sh",
-    ".buildkite/scripts/upload_profile.sh",
-}
+NON_PR_BUILDKITE_EXACT: set[str] = set(_DEFAULT_CONFIG.non_pr_buildkite_exact)
+COMPONENT_RULES: tuple[ComponentRule, ...] = _DEFAULT_CONFIG.component_rules
 
 
 @dataclass
@@ -249,73 +332,46 @@ class SelectionPlan:
     annotation: str = ""
 
 
-def _is_doc_or_non_pr_file(path: str) -> bool:
-    if path.endswith((".md", ".ico", ".png")):
+def _is_doc_or_non_pr_file(path: str, config: CiPathsConfig = _DEFAULT_CONFIG) -> bool:
+    if path.endswith(config.skip_all_suffixes):
         return True
-    if path in {
-        "README",
-        "LICENSE",
-        "mkdocs.yml",
-        ".github/CODEOWNERS",
-        ".git-blame-ignore-revs",
-        ".pyrefly-baseline.json",
-        "verified_commit_hashes.csv",
-    }:
+    if path in config.skip_all_exact:
         return True
-    if path.startswith(
-        (
-            "docs/",
-            ".github/",
-            "support_matrices/",
-            ".buildkite/features/",
-            ".buildkite/models/",
-            ".buildkite/parallelism/",
-            ".buildkite/quantization/",
-            ".buildkite/rl/",
-            ".buildkite/kernel_microbenchmarks/",
-        )
-    ):
+    if path.startswith(config.skip_all_prefixes):
         return True
-    if path in NON_PR_BUILDKITE_EXACT:
+    if path in config.non_pr_buildkite_exact:
         return True
-    if path in NIGHTLY_ONLY_INTEGRATION_EXACT:
+    if path in config.nightly_only_integration_exact:
         return True
     return (
-        path.startswith(
-            (
-                "scripts/vllm/benchmarking/",
-                "scripts/vllm/benchmark/",
-                "scripts/vllm/benchmarks/",
-            )
-        )
-        and path not in CPU_TESTED_BENCHMARK_FILES
+        path.startswith(config.benchmark_prefixes)
+        and path not in config.cpu_tested_benchmark_files
     )
 
 
-def _is_cpu_only_file(path: str) -> bool:
-    if path in {
-        ".pyrefly-baseline-full.json",
-        ".pre-commit-config.yaml",
-    }:
+def _is_cpu_only_file(path: str, config: CiPathsConfig = _DEFAULT_CONFIG) -> bool:
+    if path in config.cpu_only_exact:
         return True
     if path.startswith(".buildkite/scripts/") and path.endswith(".py"):
         return True
-    if path in CPU_TESTED_BENCHMARK_FILES:
+    if path in config.cpu_tested_benchmark_files:
         return True
-    return path.startswith(
-        ("tools/", "tests/scripts/", "tests/tools/", ".buildkite/release/")
-    )
+    return path.startswith(config.cpu_only_prefixes)
 
 
-def _is_omni_file(path: str) -> bool:
-    return path.startswith(
-        (
-            "src/vllm_torchtpu/omni/",
-            "src/vllm_torchtpu/kernels/diffusion_attention/",
-            "tests_omni/",
-            "tests/omni/",
-        )
-    )
+def _match_component_rule(
+    path: str,
+    effective_mode: str,
+    config: CiPathsConfig = _DEFAULT_CONFIG,
+) -> ComponentRule | None:
+    """Returns the matching ComponentRule if active in effective_mode."""
+    allowed_phases = {"phase1"} if effective_mode == "phase1" else {"phase1", "phase2"}
+    for rule in config.component_rules:
+        if rule.phase not in allowed_phases:
+            continue
+        if path.startswith(rule.path_prefixes):
+            return rule
+    return None
 
 
 def _classify_unit_test_file(
@@ -343,6 +399,13 @@ def _format_brace_pattern(files: list[str]) -> str:
     return "{" + ",".join(unique) + "}"
 
 
+def _has_full_ci_override(commit_message: str, ci_extras: str) -> bool:
+    if re.search(r"\[(?:ci[ _-]?full|full[ _-]?ci)\]", commit_message, re.IGNORECASE):
+        return True
+    tokens = {t.strip().lower() for t in re.split(r"[,;\s]+", ci_extras) if t.strip()}
+    return bool(tokens & {"full", "all", "full-ci"})
+
+
 def _finalize_plan(
     run_test_steps: set[str],
     run_integration_steps: set[str],
@@ -350,6 +413,7 @@ def _finalize_plan(
     general_test_pattern: str = DEFAULT_TEST_PATTERN,
     general_test_parallelism: int = 3,
     multichip_test_pattern: str = DEFAULT_TEST_PATTERN,
+    config: CiPathsConfig = _DEFAULT_CONFIG,
 ) -> SelectionPlan:
     lanes = ["verify"]
     if run_integration_steps:
@@ -359,11 +423,11 @@ def _finalize_plan(
 
     skip_steps: dict[str, str] = {}
     if run_test_steps:
-        for step in ALL_PR_TEST_STEPS:
+        for step in config.all_pr_test_steps:
             if step not in run_test_steps:
                 skip_steps[step] = reason[:70]
     if run_integration_steps:
-        for step in ALL_PR_INTEGRATION_STEPS:
+        for step in config.all_pr_integration_steps:
             if step not in run_integration_steps:
                 skip_steps[step] = reason[:70]
 
@@ -411,39 +475,60 @@ def _finalize_plan(
 
 
 def select_for_files(
-    changed_files: list[str], repo_root: Path = REPO_ROOT
+    changed_files: list[str],
+    repo_root: Path = REPO_ROOT,
+    mode: str | None = None,
+    commit_message: str | None = None,
+    ci_extras: str | None = None,
 ) -> SelectionPlan:
     """Computes the PR test selection plan for a list of changed file paths."""
+    raw_mode = (
+        (mode if mode is not None else os.environ.get("CI_DIFF_AWARE_MODE", "phase2"))
+        .strip()
+        .lower()
+    )
+    if raw_mode not in VALID_MODES:
+        raw_mode = "phase2"
+
+    msg = (
+        commit_message
+        if commit_message is not None
+        else os.environ.get("BUILDKITE_MESSAGE", "")
+    )
+    extras = ci_extras if ci_extras is not None else os.environ.get("CI_EXTRAS", "")
+
+    if raw_mode == "off" or _has_full_ci_override(msg, extras):
+        return SelectionPlan()
+
+    effective_mode = "phase2" if raw_mode == "shadow" else raw_mode
+    config = (
+        _DEFAULT_CONFIG if repo_root == REPO_ROOT else load_ci_paths_config(repo_root)
+    )
+
     files = [f.strip() for f in changed_files if f.strip()]
     if not files:
         return SelectionPlan()
 
-    active_files = [f for f in files if not _is_doc_or_non_pr_file(f)]
+    active_files = [f for f in files if not _is_doc_or_non_pr_file(f, config)]
     if not active_files:
-        return SelectionPlan(
+        plan = SelectionPlan(
             skip_all_ci=True,
             skip_all_reason=(
                 "Only docs, benchmarks, or non-PR workflow/config files changed."
             ),
             lanes=(),
         )
+        if raw_mode == "shadow":
+            return SelectionPlan(
+                annotation=(
+                    "Shadow diff-aware PR test selection "
+                    f"(would-skip; running full CI): {plan.skip_all_reason}"
+                )
+            )
+        return plan
 
     for f in active_files:
-        if (
-            f == "pyproject.toml"
-            or f.startswith("docker/")
-            or f
-            in {
-                ".buildkite/pipeline_build.yml",
-                ".buildkite/pipeline_verify.yml",
-                ".buildkite/scripts/bootstrap.sh",
-                ".buildkite/scripts/cap_pr_tpu_concurrency.py",
-                ".buildkite/scripts/configs/pipeline_config.sh",
-                ".buildkite/scripts/setup_docker_env.sh",
-                ".buildkite/kubernetes/run.sh",
-                ".buildkite/kubernetes/common.sh",
-            }
-        ):
+        if f in config.full_ci_exact or f.startswith(config.full_ci_prefixes):
             return SelectionPlan()
 
     run_test_steps: set[str] = set()
@@ -455,35 +540,43 @@ def select_for_files(
     reasons: list[str] = []
 
     for f in active_files:
-        if _is_cpu_only_file(f):
+        if _is_cpu_only_file(f, config):
             run_test_steps.update({"typecheck_full", "unit_tests_cpu_pr"})
             reasons.append("CPU/tooling changes")
             continue
 
-        if _is_omni_file(f):
-            run_test_steps.update(
-                {"typecheck_full", "unit_tests_cpu_pr", "unit_tests_omni_pr"}
-            )
-            reasons.append("Omni changes")
-            continue
-
-        if f in INTEGRATION_FILE_TO_STEPS:
-            run_integration_steps.update(INTEGRATION_FILE_TO_STEPS[f])
+        if f in config.integration_file_to_steps:
+            run_integration_steps.update(config.integration_file_to_steps[f])
             if f.endswith(".py"):
                 run_test_steps.update({"typecheck_full", "unit_tests_cpu_pr"})
             reasons.append("integration script/manifest changes")
             continue
 
         if f == ".buildkite/pipeline_integration.yml":
-            run_integration_steps.update(ALL_PR_INTEGRATION_STEPS)
+            run_integration_steps.update(config.all_pr_integration_steps)
             reasons.append("integration pipeline YAML changes")
             continue
 
         if f == ".buildkite/pipeline_tests.yml":
-            run_test_steps.update(ALL_PR_TEST_STEPS)
+            run_test_steps.update(config.all_pr_test_steps)
             full_general_tests = True
             full_multichip_tests = True
             reasons.append("tests pipeline YAML changes")
+            continue
+
+        comp_rule = _match_component_rule(f, effective_mode, config)
+        if comp_rule is not None:
+            run_test_steps.update(comp_rule.test_steps)
+            run_integration_steps.update(comp_rule.integration_steps)
+            if comp_rule.full_general_tests:
+                full_general_tests = True
+            if comp_rule.full_multichip_tests:
+                full_multichip_tests = True
+            if comp_rule.general_test_pattern:
+                general_test_files.append(comp_rule.general_test_pattern)
+            if comp_rule.general_test_files:
+                general_test_files.extend(comp_rule.general_test_files)
+            reasons.append(comp_rule.reason)
             continue
 
         if f.startswith("tests/"):
@@ -495,6 +588,21 @@ def select_for_files(
                         "unit_tests_spec_decode_multichip_pr",
                     }
                 )
+                reasons.append("spec-decode unit test changes")
+            elif f.startswith("tests/spec_decode/"):
+                run_test_steps.update(
+                    {
+                        "unit_tests_spec_decode_pr",
+                        "unit_tests_spec_decode_multichip_pr",
+                    }
+                )
+                has_gen, has_multi = _classify_unit_test_file(f, repo_root)
+                if has_gen:
+                    run_test_steps.add("unit_tests_general_pr")
+                    general_test_files.append(f)
+                if has_multi:
+                    run_test_steps.add("unit_tests_multichip_pr")
+                    multichip_test_files.append(f)
                 reasons.append("spec-decode unit test changes")
             elif not (
                 Path(f).name.startswith("test_") or Path(f).name.endswith("_test.py")
@@ -526,73 +634,6 @@ def select_for_files(
                     reasons.append("TPU unit test changes")
             continue
 
-        if f.startswith("src/vllm_torchtpu/spec_decode/"):
-            run_test_steps.update(
-                {
-                    "typecheck_full",
-                    "unit_tests_cpu_pr",
-                    "unit_tests_general_pr",
-                    "unit_tests_multichip_pr",
-                    "unit_tests_spec_decode_pr",
-                    "unit_tests_spec_decode_multichip_pr",
-                }
-            )
-            full_general_tests = True
-            full_multichip_tests = True
-            reasons.append("spec_decode module changes")
-            continue
-
-        if f.startswith(
-            (
-                "src/vllm_torchtpu/models/vllm/kimi_k3/",
-                "src/vllm_torchtpu/kernels/kimi_k3/",
-            )
-        ):
-            run_test_steps.update(
-                {
-                    "typecheck_full",
-                    "unit_tests_cpu_pr",
-                    "unit_tests_general_pr",
-                    "unit_tests_multichip_pr",
-                }
-            )
-            run_integration_steps.add("integration_k3_pruned75_apc_offload_correctness")
-            full_general_tests = True
-            full_multichip_tests = True
-            reasons.append("Kimi-K3 module changes")
-            continue
-
-        if f.startswith(
-            (
-                "src/vllm_torchtpu/distributed/kv_transfer/",
-                "src/vllm_torchtpu/offload/",
-            )
-        ):
-            run_test_steps.update(
-                {
-                    "typecheck_full",
-                    "unit_tests_cpu_pr",
-                    "unit_tests_general_pr",
-                    "unit_tests_multichip_pr",
-                }
-            )
-            run_integration_steps.update(
-                {
-                    "integration_qwen35_pcp4_dp4_disagg_correctness",
-                    "integration_qwen35_pcp4_2tp2dp_disagg_correctness",
-                    "integration_qwen35_pcp4tp1_tp4dcp2_disagg_correctness",
-                    "presubmit_disagg_single_host",
-                    "integration_qwen35_pcp8_2tp4dp_disagg_correctness",
-                    "integration_qwen35_gpc_correctness",
-                    "integration_qwen35_gpc_global_dram_pool",
-                    "integration_k3_pruned75_apc_offload_correctness",
-                }
-            )
-            full_general_tests = True
-            full_multichip_tests = True
-            reasons.append("KV-transfer/offload module changes")
-            continue
-
         run_test_steps.update(
             {
                 "typecheck_full",
@@ -603,7 +644,7 @@ def select_for_files(
                 "unit_tests_spec_decode_multichip_pr",
             }
         )
-        run_integration_steps.update(ALL_PR_INTEGRATION_STEPS)
+        run_integration_steps.update(config.all_pr_integration_steps)
         full_general_tests = True
         full_multichip_tests = True
         reasons.append("core runtime changes")
@@ -616,7 +657,7 @@ def select_for_files(
         and general_test_files
     ):
         general_pattern = _format_brace_pattern(general_test_files)
-        general_parallelism = min(3, len(set(general_test_files)))
+        general_parallelism = 1 if len(set(general_test_files)) <= 4 else 3
 
     multichip_pattern = DEFAULT_TEST_PATTERN
     if (
@@ -631,14 +672,25 @@ def select_for_files(
     if len(unique_reasons) > 2:
         reason_str += f" (+{len(unique_reasons) - 2} more)"
 
-    return _finalize_plan(
+    plan = _finalize_plan(
         run_test_steps=run_test_steps,
         run_integration_steps=run_integration_steps,
         reason=f"Skipped: only {reason_str}."[:70],
         general_test_pattern=general_pattern,
         general_test_parallelism=general_parallelism,
         multichip_test_pattern=multichip_pattern,
+        config=config,
     )
+    if raw_mode == "shadow":
+        shadow_note = ""
+        if plan.annotation:
+            shadow_note = plan.annotation.replace(
+                "Diff-aware PR test selection",
+                "Shadow diff-aware PR test selection (would-skip; running full CI)",
+                1,
+            )
+        return SelectionPlan(annotation=shadow_note)
+    return plan
 
 
 def filter_yaml_content(
@@ -714,6 +766,50 @@ def filter_yaml_content(
     return "".join(out_lines)
 
 
+def filter_json_content(
+    doc: dict[str, Any],
+    skip_steps: dict[str, str],
+    general_test_pattern: str = DEFAULT_TEST_PATTERN,
+    general_test_parallelism: int = 3,
+    multichip_test_pattern: str = DEFAULT_TEST_PATTERN,
+) -> dict[str, Any]:
+    """Mutates a Buildkite `pipeline upload --dry-run --format json` document."""
+
+    def _visit_steps(steps: list[dict[str, Any]]) -> None:
+        for step in steps:
+            if not isinstance(step, dict):
+                continue
+            nested = step.get("steps")
+            if isinstance(nested, list):
+                _visit_steps(nested)
+            key = step.get("key")
+            if isinstance(key, str) and key in skip_steps:
+                step["skip"] = skip_steps[key][:70]
+            if key == "unit_tests_general_pr" and general_test_parallelism != 3:
+                step["parallelism"] = general_test_parallelism
+            if key in {"unit_tests_general_pr", "unit_tests_multichip_pr"}:
+                pattern = (
+                    general_test_pattern
+                    if key == "unit_tests_general_pr"
+                    else multichip_test_pattern
+                )
+                if pattern and pattern != DEFAULT_TEST_PATTERN:
+                    plugins = step.get("plugins")
+                    if isinstance(plugins, list):
+                        for plugin in plugins:
+                            if isinstance(plugin, dict):
+                                for p_name, p_cfg in plugin.items():
+                                    if p_name.startswith("tests#") and isinstance(
+                                        p_cfg, dict
+                                    ):
+                                        p_cfg["test-file-pattern"] = pattern
+
+    top_steps = doc.get("steps")
+    if isinstance(top_steps, list):
+        _visit_steps(top_steps)
+    return doc
+
+
 def format_shell(plan: SelectionPlan) -> str:
     """Formats SelectionPlan as bash assignments for `eval` in bootstrap.sh."""
     lines = [
@@ -752,33 +848,82 @@ def main() -> int:
         metavar="YAML_FILE",
         help="Filter a Buildkite pipeline YAML file using exported env vars.",
     )
+    group.add_argument(
+        "--filter-json",
+        action="store_true",
+        help="Filter Buildkite pipeline upload --dry-run --format json on stdin.",
+    )
     args = parser.parse_args()
 
-    if args.filter_yaml:
-        yaml_path = Path(args.filter_yaml)
-        yaml_text = yaml_path.read_text(encoding="utf-8")
-        raw_skip = os.environ.get("PR_SKIP_STEPS_JSON", "")
-        skip_steps = json.loads(raw_skip) if raw_skip else {}
-        general_pattern = os.environ.get(
-            "GENERAL_TEST_FILE_PATTERN", DEFAULT_TEST_PATTERN
-        )
-        general_parallelism = int(os.environ.get("GENERAL_TEST_PARALLELISM", "3"))
-        multichip_pattern = os.environ.get(
-            "MULTICHIP_TEST_FILE_PATTERN", DEFAULT_TEST_PATTERN
-        )
-        sys.stdout.write(
-            filter_yaml_content(
-                yaml_text=yaml_text,
+    if args.filter_json:
+        raw_json = sys.stdin.read()
+        try:
+            doc = json.loads(raw_json)
+            raw_skip = os.environ.get("PR_SKIP_STEPS_JSON", "")
+            skip_steps = json.loads(raw_skip) if raw_skip else {}
+            general_pattern = os.environ.get(
+                "GENERAL_TEST_FILE_PATTERN", DEFAULT_TEST_PATTERN
+            )
+            general_parallelism = int(os.environ.get("GENERAL_TEST_PARALLELISM", "3"))
+            multichip_pattern = os.environ.get(
+                "MULTICHIP_TEST_FILE_PATTERN", DEFAULT_TEST_PATTERN
+            )
+            filter_json_content(
+                doc=doc,
                 skip_steps=skip_steps,
                 general_test_pattern=general_pattern,
                 general_test_parallelism=general_parallelism,
                 multichip_test_pattern=multichip_pattern,
             )
-        )
+            json.dump(doc, sys.stdout)
+            sys.stdout.write("\n")
+        except Exception as exc:
+            print(
+                f"WARNING: select_pr_tests --filter-json failed open: {exc}",
+                file=sys.stderr,
+            )
+            sys.stdout.write(raw_json)
         return 0
 
-    changed_files = [line.strip() for line in sys.stdin if line.strip()]
-    plan = select_for_files(changed_files)
+    if args.filter_yaml:
+        yaml_path = Path(args.filter_yaml)
+        yaml_text = yaml_path.read_text(encoding="utf-8")
+        try:
+            raw_skip = os.environ.get("PR_SKIP_STEPS_JSON", "")
+            skip_steps = json.loads(raw_skip) if raw_skip else {}
+            general_pattern = os.environ.get(
+                "GENERAL_TEST_FILE_PATTERN", DEFAULT_TEST_PATTERN
+            )
+            general_parallelism = int(os.environ.get("GENERAL_TEST_PARALLELISM", "3"))
+            multichip_pattern = os.environ.get(
+                "MULTICHIP_TEST_FILE_PATTERN", DEFAULT_TEST_PATTERN
+            )
+            sys.stdout.write(
+                filter_yaml_content(
+                    yaml_text=yaml_text,
+                    skip_steps=skip_steps,
+                    general_test_pattern=general_pattern,
+                    general_test_parallelism=general_parallelism,
+                    multichip_test_pattern=multichip_pattern,
+                )
+            )
+        except Exception as exc:
+            print(
+                f"WARNING: select_pr_tests --filter-yaml failed open: {exc}",
+                file=sys.stderr,
+            )
+            sys.stdout.write(yaml_text)
+        return 0
+
+    try:
+        changed_files = [line.strip() for line in sys.stdin if line.strip()]
+        plan = select_for_files(changed_files)
+    except Exception as exc:
+        print(
+            f"WARNING: select_pr_tests --shell failed open: {exc}",
+            file=sys.stderr,
+        )
+        plan = SelectionPlan()
     print(format_shell(plan))
     return 0
 

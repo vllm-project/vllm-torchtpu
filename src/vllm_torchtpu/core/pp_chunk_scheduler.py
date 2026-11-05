@@ -136,8 +136,13 @@ class TpuPipelineChunkScheduler(Scheduler):
         pending = 0
         for request in self.running:
             pending += max(_prefill_end(request) - request.num_computed_tokens, 0)
-        for request in self.waiting:
-            pending += max(_prefill_end(request) - request.num_computed_tokens, 0)
+        # Requests holding KV blocks (including async KV loads) wait in a
+        # separate queue. Count both queues before the base scheduler scans
+        # them. deferred_waiting tracks a subset of these requests, so adding
+        # it separately would double-count their remaining prompt work.
+        for queue in (self.waiting, self.kv_holding_waiting):
+            for request in queue:
+                pending += max(_prefill_end(request) - request.num_computed_tokens, 0)
         if pending == 0:
             return None
         granularity = self._cost.granularity

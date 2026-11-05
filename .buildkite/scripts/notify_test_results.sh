@@ -38,6 +38,15 @@ echo "--- Checking test outcomes"
 if [ "${V6_ANY_FAILED}" = "true" ] || [ "${V7_ANY_FAILED}" = "true" ] ; then
   echo "${FAILURE_LABEL}"
   exit 1
+fi
+
+# Cells that failed in a soft_fail stage: non-blocking, but still ❌ in the matrix.
+V6_SOFT_FAILED=$(buildkite-agent meta-data get "v6_CI_SOFT_FAILED" --default "")
+V7_SOFT_FAILED=$(buildkite-agent meta-data get "v7_CI_SOFT_FAILED" --default "")
+if [ -n "${V6_SOFT_FAILED}${V7_SOFT_FAILED}" ]; then
+  echo "All blocking models & features passed. Soft-failed (non-blocking):"
+  if [ -n "${V6_SOFT_FAILED}" ]; then echo "  v6e: ${V6_SOFT_FAILED}"; fi
+  if [ -n "${V7_SOFT_FAILED}" ]; then echo "  v7x: ${V7_SOFT_FAILED}"; fi
 else
   echo "All models & features passed."
 fi

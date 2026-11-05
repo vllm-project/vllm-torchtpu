@@ -34,6 +34,7 @@ from vllm.model_executor.layers.mamba.mamba_utils import is_conv_state_dim_first
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 from vllm.v1.kv_cache_interface import KVCacheSpec, MambaSpec
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.block_major_pool import (
     BlockMajorPoolLayout,
     flat_manager_ids,
@@ -45,10 +46,7 @@ from vllm_torchtpu.distributed.pcp import (
     get_pcp_rank,
     get_pcp_world_size,
 )
-from vllm_torchtpu.gdn_pool_layout import (
-    DEFAULT_POOLED_GDN_CONV_STATE_DTYPE,
-    unified_kv_layout_enabled_for_architecture,
-)
+from vllm_torchtpu.kernels.experimental.gdn_pcp_fused import projection_scale
 from vllm_torchtpu.kernels.gdn.head_geometry import (
     GdnHeadGeometry,
     derive_gdn_head_geometry,
@@ -67,6 +65,7 @@ from vllm_torchtpu.layers.core.gdn_attention import (
 from vllm_torchtpu.layers.core.sequence_layout import (
     is_pcp_streaming_attention_metadata,
 )
+from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
     get_vllm_model_wrapper_context,
 )
@@ -90,6 +89,9 @@ if TYPE_CHECKING:
         query_start_loc: torch.Tensor
         request_distribution: torch.Tensor
         mamba_state_indices: torch.Tensor | None
+
+
+logger = init_logger(__name__)
 
 
 def _to_jax_ssm_state_dtype(dtype: torch.dtype) -> jnp.dtype:
@@ -376,10 +378,6 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._create_conv1d()
-        # `_require_pcp_projection_parameters` hands this weight straight to
-        # `fused_qkvz_projection_pcp_gdn`, which validates it as [n_out, n_in].
-        if hasattr(self, "in_proj_qkvz"):
-            setattr(self.in_proj_qkvz, KEEP_VLLM_LAYOUT_ATTR, True)
         # Bound by the runner during KV-cache initialization; None until then
         # (warmup/profiling runs check this).
         # vLLM's MambaBase types kv_cache as tuple[Tensor, ...].
@@ -396,6 +394,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         self.gdn_pooled_op = self._build_pooled_gdn_op(block_major=self._bm_kernel)
         pcp_enabled = self._pcp_streaming_enabled()
         self._pcp_streaming_configured = pcp_enabled
+        self._keep_qkvz_layout(pcp_enabled)
         self.gdn_pcp_op = (
             self._build_gdn_op(pcp_streaming=True) if pcp_enabled else None
         )
@@ -404,6 +403,27 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             if pcp_enabled
             else None
         )
+
+    def _keep_qkvz_layout(self, pcp_enabled: bool) -> None:
+        """Keep `in_proj_qkvz` in vLLM's [n_out, n_in] layout unless
+        TPU_GDN_QKVZ_KERNEL_LAYOUT asks for the (k, n) layout without PCP.
+
+        The pooled PCP op hands this weight straight to
+        `fused_qkvz_projection_pcp_gdn` (`_require_pcp_projection_parameters`),
+        which validates it as [n_out, n_in], so PCP always keeps it. Without
+        PCP nothing reads it raw, and the kept layout costs the per-block FP8
+        path (gmm_v2) a full weight copy every step.
+        """
+        if not hasattr(self, "in_proj_qkvz"):
+            return
+        kernel_layout = envs.TPU_GDN_QKVZ_KERNEL_LAYOUT
+        if kernel_layout and pcp_enabled:
+            logger.warning_once(
+                "TPU_GDN_QKVZ_KERNEL_LAYOUT is ignored with prefill context "
+                "parallelism: its pooled op reads in_proj_qkvz as [n_out, n_in]."
+            )
+        if pcp_enabled or not kernel_layout:
+            setattr(self.in_proj_qkvz, KEEP_VLLM_LAYOUT_ATTR, True)
 
     def set_block_major_pool(
         self, pool_index: int, layout: BlockMajorPoolLayout
@@ -503,24 +523,14 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
 
     def get_state_dtype(self) -> tuple[torch.dtype, ...]:
         conv_state_dtype, temporal_state_dtype = super().get_state_dtype()
-        if unified_kv_layout_enabled_for_architecture(self.model_config.architecture):
-            # Declare exactly what the pool physically stores. vLLM sizes the
-            # mamba page from the dtype declared HERE and asserts the padded
-            # page covers it, while the block-slot derivation budgets the page
-            # from DEFAULT_POOLED_GDN_CONV_STATE_DTYPE. Declaring anything
-            # wider is not conservative, it is a contradiction: the two
-            # disagreed once and every hybrid GDN engine failed to start on
-            # that assert.
-            conv_state_dtype = getattr(
-                torch, DEFAULT_POOLED_GDN_CONV_STATE_DTYPE.split(".")[1]
+        # TODO(kyuyeunk): Add support for performant bf16 conv state.
+        if conv_state_dtype != torch.float32:
+            logger.info(
+                "Overriding conv_state_dtype=%s to fp32 due to performance "
+                "implications.",
+                conv_state_dtype,
             )
-        else:
-            # TODO: Support bf16 conv state.
-            # Per-layer cache: unlike the pool, the declared dtype IS the
-            # storage dtype (vLLM strides the raw tensor with it), and this
-            # kernel path still reads fp32 conv state. Nothing pads this
-            # layout, so the wider declaration costs only its own bytes.
-            conv_state_dtype = torch.float32
+        conv_state_dtype = torch.float32
         return conv_state_dtype, temporal_state_dtype
 
     def process_weights_after_loading(self, act_dtype: torch.dtype) -> None:
@@ -1049,12 +1059,10 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         elif weight.dtype == torch.float8_e4m3fn:
             if weight_scale is None or weight_scale.dtype != torch.float32:
                 raise RuntimeError("FP8 QKVZ weights require an FP32 scale.")
-            from vllm_torchtpu.kernels.gdn.v3.projection_scale import (
-                projection_scale_layout,
-            )
-
             try:
-                projection_scale_layout(weight.shape, weight_scale.shape)
+                projection_scale.projection_scale_layout(
+                    weight.shape, weight_scale.shape
+                )
             except ValueError as exc:
                 raise RuntimeError(str(exc)) from exc
         else:

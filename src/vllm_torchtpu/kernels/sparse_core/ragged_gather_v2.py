@@ -22,6 +22,7 @@ from jax.experimental.pallas import tpu as pltpu
 from jax.experimental.pallas import tpu_sc as plsc
 
 from vllm_torchtpu.kernels.sparse_core import core_map_helper
+from vllm_torchtpu.kernels.sparse_core.support import get_sparse_core_info
 
 
 def calculate_col_size(hidden_size: int, packing: int) -> int:
@@ -32,13 +33,7 @@ def calculate_col_size(hidden_size: int, packing: int) -> int:
     assert sc_info is not None, "SparseCore info is missing."
     lanes = sc_info.num_lanes
 
-    match tpu_info.generation:
-        case 6:
-            target_bytes = (256 * 1024) * 0.8
-        case 7:
-            target_bytes = (512 * 1024) * 0.8
-        case _:
-            target_bytes = (128 * 1024) * 0.8
+    target_bytes = sc_info.vmem_capacity_bytes * 0.8
 
     # Calculate max safe column size based on VMEM budget and aligne to 128.
     num_buffers = 2
@@ -233,7 +228,7 @@ def ragged_gather_v2(
     if dtype not in (jnp.bfloat16, jnp.float32, jnp.int8, jnp.int4):
         raise ValueError(f"dtype must be f32, bf16, int8, or int4, but got {dtype}")
 
-    sc_info = pltpu.get_tpu_info().sparse_core
+    sc_info = get_sparse_core_info()
     if sc_info is None:
         return x[indices]
 

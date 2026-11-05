@@ -137,6 +137,21 @@ def is_cache_for_ds_v4(attn_module: AttentionLayerBase) -> bool:
     )
 
 
+def sparse_mla_page_size_bytes(
+    attn_module: MLAAttention, block_size: int, kv_cache_dtype: torch.dtype
+) -> int | None:
+    """A sparse MLA layer's page bytes from its (nope, rope) layout specs.
+
+    None when the layer is not sparse, so dense MLA keeps the padded
+    `PallasMLAttentionBackend.get_kv_cache_page_size_bytes`.
+    """
+    if getattr(attn_module, "use_sparse", False) is not True:
+        return None
+    return PallasMLAttentionBackend.get_sparse_kv_cache_page_size_bytes(
+        block_size, attn_module.head_size, kv_cache_dtype
+    )
+
+
 def check_kv_caches_cover_block_ids(
     kv_caches: dict[str, torch.Tensor],
     kv_cache_tensors: Iterable[KVCacheTensor],
@@ -234,7 +249,7 @@ class KVCacheManager:
         if has_attention and not self.runner._unified_kv_layout:
             self._update_attention_page_size_padded(layers, block_size)
             if has_mamba:
-                self._update_mamba_page_size_padded(layers)
+                self._update_mamba_page_size_padded(layers, block_size)
 
         hma_enabled = not self.runner.scheduler_config.disable_hybrid_kv_cache_manager
 
@@ -242,6 +257,9 @@ class KVCacheManager:
         # DSv4 layers whose specs must reach vLLM verbatim; see
         # `is_cache_for_ds_v4`.
         ds_v4_layers: set[str] = set()
+        # Sparse MLA layers sized from their allocated (nope, rope) specs,
+        # which the normalizer's dense MLA page formula does not model.
+        sparse_mla_layers: set[str] = set()
         for layer_name, attn_module in layers.items():
             # Linear Attention path
             if isinstance(attn_module, MambaBase):
@@ -354,6 +372,28 @@ class KVCacheManager:
             elif isinstance(attn_module, MLAAttention):
                 if layer_name in kv_cache_spec:
                     continue
+                sparse_page_size = (
+                    None
+                    if self.runner._hybrid_uniform_page_size_bytes is not None
+                    else sparse_mla_page_size_bytes(
+                        attn_module, block_size, self.runner.kv_cache_dtype
+                    )
+                )
+                if sparse_page_size is not None:
+                    # Published as `customize_spec` would, but from the
+                    # (nope, rope) arrays actually allocated.
+                    kv_cache_spec[layer_name] = MLAAttentionSpec(
+                        block_size=block_size,
+                        num_kv_heads=1,
+                        head_size=attn_module.head_size,
+                        dtype=self.runner.kv_cache_dtype,
+                        cache_dtype_str=cache_dtype_str,
+                        page_size_padded=sparse_page_size,
+                        num_head_slots=1,
+                        state_content_bytes=sparse_page_size // block_size,
+                    )
+                    sparse_mla_layers.add(layer_name)
+                    continue
                 page_size_padded = (
                     self.runner._hybrid_uniform_page_size_bytes
                     if self.runner._hybrid_uniform_page_size_bytes is not None
@@ -421,7 +461,7 @@ class KVCacheManager:
             kv_cache_spec,
             self.runner.kv_cache_dtype,
             enable_unified_kv_layout=self.runner._unified_kv_layout,
-            exempt_layers=ds_v4_layers,
+            exempt_layers=ds_v4_layers | sparse_mla_layers,
             attention_backend=cast("type[PallasAttentionBackend] | None", backend_cls),
         )
         if (
@@ -664,7 +704,10 @@ class KVCacheManager:
                 )
             elif isinstance(m, MLAAttention):
                 attn_page_sizes.add(
-                    PallasMLAttentionBackend.get_kv_cache_page_size_bytes(
+                    sparse_mla_page_size_bytes(
+                        m, block_size, self.runner.kv_cache_dtype
+                    )
+                    or PallasMLAttentionBackend.get_kv_cache_page_size_bytes(
                         block_size,
                         1,
                         m.head_size,
@@ -682,7 +725,9 @@ class KVCacheManager:
                 "Pure-attention hybrid KV cache: padding every layer "
                 "spec to %d bytes (max of native sizes %s). Avoids "
                 "vLLM's unify_kv_cache_spec_page_size leaving a stale "
-                "page_size_padded behind when layer head_dims differ.",
+                "page_size_padded behind when layer head_dims differ. "
+                "Note: A model mixing sparse and dense MLA layers pads "
+                "to the dense size, neutralizing sparse MLA RoPE savings.",
                 uniform_page_size_bytes,
                 sorted(attn_page_sizes),
             )
@@ -690,7 +735,9 @@ class KVCacheManager:
             self.runner.cache_config.mamba_page_size_padded = attn_page_sizes.pop()
 
     def _update_mamba_page_size_padded(
-        self, layers: dict[str, AttentionLayerBase]
+        self,
+        layers: dict[str, AttentionLayerBase],
+        block_size: int | None = None,
     ) -> None:
         """Pad attention and mamba page sizes so vLLM's num_blocks matches
         what the TPU allocates per layer.
@@ -706,6 +753,8 @@ class KVCacheManager:
         Args:
             layers: A dictionary mapping layer names to their corresponding
                 attention module instances (e.g., `MambaBase`, `Attention`).
+            block_size: Finalized attention block size. Defaults to
+                `self.runner.vllm_config.cache_config.block_size`.
         """
         attn_modules = [
             m for m in layers.values() if isinstance(m, (Attention, MLAAttention))
@@ -724,8 +773,19 @@ class KVCacheManager:
             TpuPlatform._find_non_ssm_backend(self.runner.vllm_config),
         )
         assert attention_backend is not None
-        attn_page_size_bytes = attention_backend.get_kv_cache_page_size_bytes(
-            self.runner.block_size,
+        if block_size is None:
+            block_size = self.runner.vllm_config.cache_config.block_size
+        assert block_size is not None
+        attn_page_size_bytes = (
+            sparse_mla_page_size_bytes(
+                first_attn_module,
+                block_size,
+                self.runner.kv_cache_dtype,
+            )
+            if isinstance(first_attn_module, MLAAttention)
+            else None
+        ) or attention_backend.get_kv_cache_page_size_bytes(
+            block_size,
             num_kv_heads,
             first_attn_module.head_size,
             self.runner.kv_cache_dtype,
@@ -840,11 +900,10 @@ class KVCacheManager:
         Matches `TPUWorker.determine_available_memory()`: the
         `utils.compute_hbm_budget` result (which reserves the
         `gpu_memory_utilization` cap minus
-        `utils.estimate_kv_connector_hbm_reserve` (HBM a connector allocates
-        after profile_run, such as the offload H2D
-        staging pool). Sizing overrides against this budget keeps them from
-        filling the connector reserve back up with KV blocks and defeating
-        the worker-side subtraction.
+        `TPUModelRunner.post_profile_hbm_reserves` (HBM allocated after
+        profile_run, such as the offload H2D staging pool). Sizing overrides
+        against this budget keeps them from filling these reserves back up
+        with KV blocks and defeating the worker-side subtraction.
         """
         if kv_cache_memory_bytes := self.runner.cache_config.kv_cache_memory_bytes:
             return kv_cache_memory_bytes
@@ -853,8 +912,7 @@ class KVCacheManager:
         )
         return utils.min_across_ep_dp(
             self.runner.vllm_config.parallel_config,
-            budget.available
-            - utils.estimate_kv_connector_hbm_reserve(self.runner.vllm_config),
+            budget.available - sum(self.runner.post_profile_hbm_reserves()),
         )
 
     def _maybe_set_compact_mamba_num_blocks_override(
@@ -1541,6 +1599,9 @@ class KVCacheManager:
                 tuple[torch.Tensor, ...],
             ],
         ] = {}
+        # Caches allocated on the device below (shared attention regions, then
+        # per-layer attention and mamba caches), flushed after the loop.
+        device_caches: list[torch.Tensor] = []
 
         def allocate_attention_region(
             region: tuple[int, int],
@@ -1566,10 +1627,13 @@ class KVCacheManager:
                     f"budget: region={region}, allocated={allocated_bytes}, "
                     f"required={required_bytes}, budget={budget}"
                 )
+            # Allocate on the device: a host tensor staged through `.to()` costs
+            # about twice the cache size in host RAM per worker.
             caches = tuple(
-                torch.zeros(shape, dtype=dtype).to(self.runner.device)
+                torch.zeros(shape, dtype=dtype, device=self.runner.device)
                 for shape, dtype in geometry
             )
+            device_caches.extend(caches)
             if native_caches is not None:
                 native_caches[key] = caches
             return caches
@@ -1609,6 +1673,7 @@ class KVCacheManager:
                     attn_backend=backend_cls,
                     device=self.runner.device,
                 )
+            device_caches.extend(shared_attention_caches.values())
 
         for kv_cache_tensor in [] if _is_ds_v4 else kv_cache_config.kv_cache_tensors:
             # Each descriptor names layers within the whole backing allocation;
@@ -1639,8 +1704,11 @@ class KVCacheManager:
                     ):
                         cache_shape = (mamba_num_blocks, *shape)
                         mamba_states.append(
-                            torch.zeros(cache_shape, dtype=dtype).to(self.runner.device)
+                            torch.zeros(
+                                cache_shape, dtype=dtype, device=self.runner.device
+                            )
                         )
+                    device_caches.extend(mamba_states)
                     kv_caches[layer_name] = tuple(mamba_states)
                 elif isinstance(kv_cache_spec, MLAAttentionSpec):
                     attn_module = self.runner.vllm_config.compilation_config.static_forward_context.get(  # noqa: E501
@@ -1721,6 +1789,12 @@ class KVCacheManager:
                         )[0]
                 else:
                     raise NotImplementedError
+
+        # torch_tpu defers a device zero-fill until first use. Flush these caches
+        # so the precompile below sees them in HBM, as the unified path flushes
+        # its pool (where PJRT donates only buffers with no pending write).
+        if device_caches:
+            synchronize_tensors(device_caches)
 
         self._add_shared_kv_cache_aliases(kv_caches)
 
