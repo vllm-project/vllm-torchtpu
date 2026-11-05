@@ -31,6 +31,7 @@ MAX_SEQS = 4
 NUM_PAGES = 40
 
 
+@pytest.mark.parametrize("kernel", ["v1", "v2"])
 @pytest.mark.parametrize("dtype", CACHE_DTYPES)
 @pytest.mark.parametrize(
     "q_lens,ctx_lens,block_q,large_block_q,pages_per_step",
@@ -41,7 +42,7 @@ NUM_PAGES = 40
     ],
 )
 def test_matches_reference(
-    q_lens, ctx_lens, block_q, large_block_q, pages_per_step, dtype
+    q_lens, ctx_lens, block_q, large_block_q, pages_per_step, dtype, kernel
 ):
     rng = np.random.default_rng(len(q_lens))
     num_seqs = len(q_lens)
@@ -71,6 +72,7 @@ def test_matches_reference(
         block_q=block_q,
         large_block_q=large_block_q,
         pages_per_step=pages_per_step,
+        kernel=kernel,
         interpret=True,
     )
 
@@ -84,8 +86,9 @@ def test_matches_reference(
                 np.testing.assert_allclose(scores[t, b], expected, rtol=1e-5, atol=1e-4)
 
 
+@pytest.mark.parametrize("kernel", ["v1", "v2"])
 @pytest.mark.parametrize("dtype", CACHE_DTYPES)
-def test_lowers_for_tpu(dtype):
+def test_lowers_for_tpu(dtype, kernel):
     """Pallas -> Mosaic lowering and verification run without a TPU."""
     tokens, max_seqs, pages_per_seq = 256, 16, 2048
     args = (
@@ -101,7 +104,7 @@ def test_lowers_for_tpu(dtype):
     tpu7x = AbstractMesh((), (), (), abstract_device=AbstractDevice("TPU7x", 1, "tpu"))
     with use_abstract_mesh(tpu7x):
         lowered = (
-            jax.jit(functools.partial(block_scores))
+            jax.jit(functools.partial(block_scores, kernel=kernel))
             .trace(*args)
             .lower(lowering_platforms=("tpu",))
         )

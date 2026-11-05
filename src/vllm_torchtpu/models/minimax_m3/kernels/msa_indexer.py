@@ -41,11 +41,12 @@ from vllm_torchtpu.models.minimax_m3.kernels.packed_page import (
 DEFAULT_BLOCK_Q = 128
 DEFAULT_LARGE_BLOCK_Q = 512
 DEFAULT_PAGES_PER_STEP = 32
+DEFAULT_KERNEL = "v2"
 _TILE_SHIFT = 16
 _GROUP_MASK = (1 << _TILE_SHIFT) - 1
 
 
-def _kernel(
+def _kernel_v1(
     # Scalar prefetch
     work_ref,  # [groups] tile << _TILE_SHIFT | page group within the request
     tile_seq_ref,  # [tiles] request of each tile
@@ -68,6 +69,58 @@ def _kernel(
             page_max = m if page_max is None else jnp.maximum(page_max, m)
         maxima.append(page_max)
     o_ref[...] = jnp.concatenate(maxima, axis=0)
+
+
+# Scores per dot in `_kernel_v2`: bounds the f32 ``[pages * S, block_q]``
+# product kept in VMEM (2 MiB).
+_MAX_SCORE_ELEMS = 512 * 1024
+
+
+def _page_keys(page_ref) -> jax.Array:
+    """``[1, S / p, p, D]`` page -> bf16 ``[S, D]`` keys in packing order.
+
+    One width-changing bitcast of the packed 32-bit words: the token order
+    inside the page changes, which a max over the page does not see.
+    """
+    rows, packing, head_dim = page_ref.shape[1:]
+    words = page_ref.bitcast(jnp.uint32)[0, :, 0, :]
+    keys = pltpu.bitcast(words, page_ref.dtype)
+    assert keys.shape == (rows * packing, head_dim), keys.shape
+    return keys.astype(jnp.bfloat16)
+
+
+def _kernel_v2(
+    # Scalar prefetch
+    work_ref,  # [groups] tile << _TILE_SHIFT | page group within the request
+    tile_seq_ref,  # [tiles] request of each tile
+    block_tables_ref,  # [max_num_seqs * pages_per_seq]
+    # In
+    q_ref,  # [Bq, D]
+    *refs,  # G x [1, S / p, p, D] index-cache pages, then the output
+):
+    """`_kernel_v1` with the pages' keys unpacked by one bitcast each and
+    stacked, so each dot keeps the query tile latched across many pages."""
+    pages_per_step = len(refs) - 1
+    page_refs, o_ref = refs[:pages_per_step], refs[pages_per_step]
+    q = q_ref[...]
+    block_q = q.shape[0]
+    page_size = page_refs[0].shape[1] * page_refs[0].shape[2]
+    pages_per_dot = max(
+        1, min(pages_per_step, _MAX_SCORE_ELEMS // (page_size * block_q))
+    )
+    maxima = []
+    for first in range(0, pages_per_step, pages_per_dot):
+        group = page_refs[first : first + pages_per_dot]
+        keys = [_page_keys(r) for r in group]
+        keys = keys[0] if len(keys) == 1 else jnp.concatenate(keys, axis=0)
+        s = jax.lax.dot_general(
+            keys, q, (((1,), (1,)), ((), ())), preferred_element_type=jnp.float32
+        )
+        maxima.append(jnp.max(s.reshape(len(group), page_size, block_q), axis=1))
+    o_ref[...] = maxima[0] if len(maxima) == 1 else jnp.concatenate(maxima, axis=0)
+
+
+_KERNELS = {"v1": _kernel_v1, "v2": _kernel_v2}
 
 
 def _tiles(cu_q_lens: jax.Array, seq_in_class: jax.Array, block_q: int, max_tiles: int):
@@ -97,6 +150,7 @@ def _class_scores(
     block_q,
     max_tiles,
     pages_per_step,
+    kernel,
     interpret,
 ):
     """Scores ``[T, P]`` for the tokens of requests in one tile class."""
@@ -158,7 +212,7 @@ def _class_scores(
         ),
     )
     scores_t = pl.pallas_call(
-        _kernel,
+        _KERNELS[kernel],
         grid_spec=grid_spec,
         out_shape=jax.ShapeDtypeStruct(
             (padded_pages, max_tiles * block_q), jnp.float32
@@ -182,7 +236,13 @@ def _class_scores(
 
 @functools.partial(
     jax.jit,
-    static_argnames=("block_q", "large_block_q", "pages_per_step", "interpret"),
+    static_argnames=(
+        "block_q",
+        "large_block_q",
+        "pages_per_step",
+        "kernel",
+        "interpret",
+    ),
 )
 def block_scores(
     index_q: jax.Array,
@@ -195,6 +255,7 @@ def block_scores(
     block_q: int = DEFAULT_BLOCK_Q,
     large_block_q: int = DEFAULT_LARGE_BLOCK_Q,
     pages_per_step: int = DEFAULT_PAGES_PER_STEP,
+    kernel: str = DEFAULT_KERNEL,
     interpret: bool = False,
 ) -> jax.Array:
     """Block-max index scores ``[T, 1, P]`` (``P`` padded to the page group).
@@ -208,6 +269,8 @@ def block_scores(
       index_q: ``[T, 1, D]`` index queries (one index head per rank).
       index_cache: ``[pages, S / p, p, D]`` key-only cache (bf16 or fp8).
       seq_lens, block_tables, cu_q_lens, num_seqs: ragged batch metadata.
+      kernel: ``"v2"`` (bitcast unpack, query latched across pages) or the
+        original ``"v1"``, kept as the reference arm for benchmarks.
     Pages past a token's own page hold scores of keys it must not see, and
     pages past its request's last page are not written; callers mask both.
     """
@@ -230,6 +293,7 @@ def block_scores(
         block_tables,
         cu_q_lens,
         pages_per_step=pages_per_step,
+        kernel=kernel,
         interpret=interpret,
     )
     small = score(
