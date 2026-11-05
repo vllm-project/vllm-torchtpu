@@ -79,5 +79,8 @@ out = fused_moe_prefill_nvfp4(
   enabled alongside `USE_MOE_TP_DECODE_NVFP4_KERNEL=1`,
   `layers/adapter/moe_tp_decode_nvfp4.py` dispatches `n > 64` buckets with
   `n >= FUSED_MOE_PREFILL_NVFP4_MIN_TOKENS` (default `2048`; smaller `n > 64`
-  buckets keep `_tp_chain` GMM) to `fused_moe_prefill_nvfp4_stage_a` (`W4A16`
-  default) inside the same `jax_op`.
+  buckets keep `_tp_chain` GMM) to `fused_moe_prefill_nvfp4_stage_a` inside the
+  same `jax_op`. `FUSED_MOE_PREFILL_NVFP4_ACT_MODE` selects the activation path:
+  `"w4a16"` (default, BF16 activations) or `"w4a8"` (per-row FP8 activations and
+  `FP8 x FP8` MXU dots, e.g. when lowering
+  `FUSED_MOE_PREFILL_NVFP4_MIN_TOKENS=512`).
