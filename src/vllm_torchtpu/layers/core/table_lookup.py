@@ -28,8 +28,14 @@ def take(table: torch.Tensor, index: torch.Tensor) -> torch.Tensor:
     return torch.where(hit, table, torch.zeros_like(table)).sum(-1, dtype=table.dtype)
 
 
-def bucketize_right(values: torch.Tensor, boundaries: torch.Tensor) -> torch.Tensor:
-    """``torch.bucketize(values, boundaries, right=True)``; ``boundaries`` sorted."""
+def bucketize_right(
+    values: torch.Tensor, boundaries: torch.Tensor, out_int32: bool = False
+) -> torch.Tensor:
+    """``torch.bucketize(values, boundaries, right=True, out_int32=out_int32)``.
+
+    ``boundaries`` sorted.
+    """
     if not envs.TPU_ONEHOT_TABLE_LOOKUP:
-        return torch.bucketize(values, boundaries, right=True)
-    return (boundaries <= values.unsqueeze(-1)).sum(-1)
+        return torch.bucketize(values, boundaries, right=True, out_int32=out_int32)
+    dtype = torch.int32 if out_int32 else torch.int64
+    return (boundaries <= values.unsqueeze(-1)).sum(-1, dtype=dtype)
