@@ -859,7 +859,7 @@ def test_dspark_load_weights(monkeypatch: pytest.MonkeyPatch):
     assert draft_lm2.model.confidence_head is not None
 
 
-def test_decode_sampler_uses_standard_logits_without_copying_lm_weight(monkeypatch):
+def test_decode_sampler_projects_normed_hidden_without_copying_lm_weight(monkeypatch):
     from vllm_torchtpu.models.vllm.deepseek_v41.v2 import dspark_sampling
 
     model = v2_dspark.DSparkDeepseekV41ForCausalLM.__new__(
@@ -870,15 +870,14 @@ def test_decode_sampler_uses_standard_logits_without_copying_lm_weight(monkeypat
     model.lm_head = SimpleNamespace(weight=weight)
     embedding = torch.empty((129280, 256), dtype=torch.bfloat16, device="meta")
     markov_weight = torch.empty_like(embedding)
+    norm = MagicMock(side_effect=lambda x: x + 1)
     model.model = SimpleNamespace(
+        norm=norm,
         markov_head=SimpleNamespace(
             markov_w1=SimpleNamespace(weight=embedding),
             markov_w2=SimpleNamespace(weight=markov_weight),
-        )
+        ),
     )
-    logits = torch.empty((240, 129280), dtype=torch.bfloat16, device="meta")
-    compute_logits = MagicMock(return_value=logits)
-    monkeypatch.setattr(model, "compute_logits", compute_logits)
     tokens = torch.zeros((48, 5), dtype=torch.int64)
     sample = MagicMock(return_value=tokens)
     monkeypatch.setattr(dspark_sampling, "initialize_samples", lambda: sample)
@@ -892,19 +891,17 @@ def test_decode_sampler_uses_standard_logits_without_copying_lm_weight(monkeypat
     hidden = torch.arange(240, dtype=torch.bfloat16)[:, None].expand(240, 5120)
     input_ids = torch.arange(240)
     assert sampler(hidden, input_ids, 5) is tokens
-    torch.testing.assert_close(
-        compute_logits.call_args.args[0][:, 0],
-        torch.arange(240, dtype=torch.bfloat16).view(48, 5).T.reshape(-1),
+    slot_major = torch.arange(240, dtype=torch.bfloat16).view(48, 5).T.reshape(-1)
+    actual_hidden, actual_head, actual_embedding, actual_weight, anchors = (
+        sample.call_args.args
     )
-    actual_logits, actual_embedding, actual_weight, anchors = sample.call_args.args
-    assert actual_logits is logits
+    torch.testing.assert_close(actual_hidden[:, 0], slot_major + 1)
+    assert actual_head is weight
     assert actual_embedding is embedding
     assert actual_weight is markov_weight
     torch.testing.assert_close(anchors, input_ids[::5])
     assert sampler(hidden[:235], input_ids[:235], 5) is None
-    assert compute_logits.call_count == 1
-    compute_logits.return_value = logits.float()
-    assert sampler(hidden, input_ids, 5) is None
+    assert norm.call_count == 1
     assert sample.call_count == 1
 
 
