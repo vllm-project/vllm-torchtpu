@@ -29,7 +29,6 @@ from vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_moe_thinker import (
 
 from vllm_torchtpu.omni.patches.qwen3omni_thinker import (
     _AUDIO_CHUNK_LENGTHS_PATCHED,
-    _is_qwen3_omni_model,
     maybe_patch_qwen3_omni_thinker,
 )
 
@@ -44,27 +43,19 @@ def _model_config(*architectures: str) -> SimpleNamespace:
 OMNI_THINKER = _model_config("Qwen3OmniMoeForConditionalGeneration")
 
 
-@pytest.mark.parametrize(
-    ("model_config", "expected"),
-    [
-        (None, False),
-        (_model_config("Qwen3VLForConditionalGeneration"), False),
-        # Substrings are not enough: the check is the literal architecture.
-        (_model_config("Qwen3OmniMoeThinkerForConditionalGeneration"), False),
-        (OMNI_THINKER, True),
-        (_model_config("SomethingElse", "Qwen3OmniMoeForConditionalGeneration"), True),
-    ],
-    ids=["no_config", "qwen3_vl", "thinker_substring", "qwen3_omni", "multi_arch"],
-)
-def test_is_qwen3_omni_model(model_config, expected):
-    assert _is_qwen3_omni_model(model_config) is expected
-
-
 def test_non_omni_config_is_not_consumed():
-    # ``False`` (not ``None``) tells the registry to retry at model_load.
+    # ``False`` (not ``None``) tells the registry to retry at model_load. The
+    # match is the literal architecture: a substring such as the thinker's own
+    # class name does not count.
     before = Qwen3OmniMoeAudioEncoder.forward
     assert maybe_patch_qwen3_omni_thinker(None) is False
     assert maybe_patch_qwen3_omni_thinker(_model_config("LlamaForCausalLM")) is False
+    assert (
+        maybe_patch_qwen3_omni_thinker(
+            _model_config("Qwen3OmniMoeThinkerForConditionalGeneration")
+        )
+        is False
+    )
     assert Qwen3OmniMoeAudioEncoder.forward is before
 
 

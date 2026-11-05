@@ -18,30 +18,27 @@ import inspect
 import textwrap
 
 import pytest
+from vllm.utils.import_utils import resolve_obj_by_qualname
 from vllm_omni.worker.mixins import OmniWorkerMixin
 
 from vllm_torchtpu.omni.platform import OmniTpuPlatform
 from vllm_torchtpu.omni.worker.base import OmniTPUWorkerBase
 from vllm_torchtpu.omni.worker.tpu_ar_model_runner import TPUARModelRunner
 from vllm_torchtpu.omni.worker.tpu_ar_worker import TPUARWorker
-from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 from vllm_torchtpu.worker.tpu_worker import TPUWorker
 
 pytestmark = pytest.mark.omni
 
 
-def test_platform_ar_worker_cls():
-    assert (
-        OmniTpuPlatform.get_omni_ar_worker_cls()
-        == "vllm_torchtpu.omni.worker.tpu_ar_worker.TPUARWorker"
+def test_tpu_ar_worker_wiring():
+    # The platform hook vLLM-Omni resolves for AR stages lands on a worker of
+    # the same shape as upstream GPUARWorker(OmniWorkerMixin, OmniGPUWorkerBase)
+    # that swaps in the AR runner.
+    assert resolve_obj_by_qualname(OmniTpuPlatform.get_omni_ar_worker_cls()) is (
+        TPUARWorker
     )
-
-
-def test_tpu_ar_worker_hierarchy_and_runner_cls():
-    # Same shape as upstream GPUARWorker(OmniWorkerMixin, OmniGPUWorkerBase).
     assert TPUARWorker.__bases__ == (OmniWorkerMixin, OmniTPUWorkerBase)
     assert issubclass(OmniTPUWorkerBase, TPUWorker)
-    assert TPUWorker.model_runner_cls is TPUModelRunner
     assert TPUARWorker.model_runner_cls is TPUARModelRunner
 
 

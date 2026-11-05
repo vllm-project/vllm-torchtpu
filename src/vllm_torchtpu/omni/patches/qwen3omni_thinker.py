@@ -73,27 +73,20 @@ _QWEN3_OMNI_ARCH = "Qwen3OmniMoeForConditionalGeneration"
 _AUDIO_CHUNK_LENGTHS_PATCHED = "_tpu_audio_chunk_lengths_patched"
 
 
-def _is_qwen3_omni_model(model_config: ModelConfig | None) -> bool:
-    """Whether ``model_config`` serves ``Qwen3OmniMoeForConditionalGeneration``.
-
-    ``ModelConfig.architectures`` is the checkpoint's architecture list; for a
-    vLLM-Omni stage it is the pipeline's ``model_arch``, which is this name
-    for every Qwen3-Omni stage. ``None``, which ``platform_activation`` passes
-    when no model is configured yet, is not a match: the registry then retries
-    the callback at ``model_load``.
-    """
-    return model_config is not None and _QWEN3_OMNI_ARCH in model_config.architectures
-
-
 def maybe_patch_qwen3_omni_thinker(model_config: ModelConfig | None = None) -> bool:
     """Route the audio encoder's chunk-length math through CPU on TPU.
 
-    Returns ``False`` without importing vLLM-Omni when ``model_config`` is not
-    a Qwen3-Omni model, so the registry does not record the patch as applied.
-    For a Qwen3-Omni model the import is unconditional: vLLM-Omni is a hard
-    requirement of that model and an import error must surface.
+    Applies to ``Qwen3OmniMoeForConditionalGeneration`` only, matched
+    literally in ``ModelConfig.architectures`` (for a vLLM-Omni stage that is
+    the pipeline's ``model_arch``, which is this name for every Qwen3-Omni
+    stage). Returns ``False`` without importing vLLM-Omni for anything else,
+    including the ``None`` that ``platform_activation`` passes before a model
+    is configured, so the registry does not record the patch as applied and
+    retries at ``model_load``. For a Qwen3-Omni model the import is
+    unconditional: vLLM-Omni is a hard requirement of that model and an import
+    error must surface.
     """
-    if not _is_qwen3_omni_model(model_config):
+    if model_config is None or _QWEN3_OMNI_ARCH not in model_config.architectures:
         return False
 
     # Imported in the callback, not at module top: the registry imports this

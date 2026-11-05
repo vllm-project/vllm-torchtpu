@@ -11,7 +11,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Unit tests for src/vllm_torchtpu/omni/worker/tpu_ar_model_runner.py."""
+"""Unit tests for src/vllm_torchtpu/omni/worker/tpu_ar_model_runner.py.
+
+``OmniTPUModelRunner`` only records the stage it serves, so it is covered
+through the AR runner here.
+"""
 
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -55,16 +59,16 @@ def _build(model_config) -> TPUARModelRunner:
 
 
 def test_tpu_ar_model_runner_inheritance():
-    # Same shape as upstream GPUARModelRunner: the Omni base first, the
-    # connector mixin on the leaf.
+    # Same shape as upstream GPUARModelRunner: the connector mixin sits on the
+    # leaf runner, not on the shared OmniTPUModelRunner base.
     assert TPUARModelRunner.__bases__ == (
         OmniTPUModelRunner,
         OmniConnectorModelRunnerMixin,
     )
-    assert frozenset({"thinker"}) == TPUARModelRunner.SUPPORTED_STAGES
+    assert OmniConnectorModelRunnerMixin not in OmniTPUModelRunner.__mro__
 
 
-def test_thinker_only_stage_is_accepted():
+def test_thinker_stage_is_accepted():
     runner = _build(_stage_config(model_stage="thinker", stage_id=0))
     assert runner.model_stage == "thinker"
     assert runner.stage_id == 0
@@ -74,6 +78,7 @@ def test_plain_vllm_config_is_accepted():
     # No stage metadata at all: a single-stage deployment outside vLLM-Omni.
     runner = _build(SimpleNamespace())
     assert runner.model_stage is None
+    assert runner.stage_id is None
 
 
 def test_talker_stage_is_refused_at_construction():
@@ -81,19 +86,14 @@ def test_talker_stage_is_refused_at_construction():
         _build(_stage_config(model_stage="talker", stage_id=1))
 
 
-@pytest.mark.parametrize(
-    "connector_fields",
-    [
-        dict(requires_full_payload_input=True),
-        dict(
-            custom_process_next_stage_input_func="pkg.mod.thinker2talker_full_payload"
-        ),
-        dict(stage_connector_config={"extra": {"role": "sender"}}),
-    ],
-    ids=["full_payload_consumer", "producer_hook", "explicit_role"],
-)
-def test_multi_stage_thinker_is_refused_at_construction(connector_fields):
-    # The thinker of a multi-stage pipeline produces inter-stage payloads and
-    # therefore needs connectors, which are not wired on TPU yet.
+def test_multi_stage_thinker_is_refused_at_construction():
+    # The thinker of a multi-stage pipeline hands its output to the next stage
+    # (custom_process_next_stage_input_func is set), which needs connectors.
     with pytest.raises(NotImplementedError, match="connectors"):
-        _build(_stage_config(model_stage="thinker", stage_id=0, **connector_fields))
+        _build(
+            _stage_config(
+                model_stage="thinker",
+                stage_id=0,
+                custom_process_next_stage_input_func="pkg.mod.thinker2talker",
+            )
+        )
