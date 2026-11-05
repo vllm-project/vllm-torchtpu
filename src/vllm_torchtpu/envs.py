@@ -204,6 +204,7 @@ if TYPE_CHECKING:
     VLLM_TPU_SRPT_MAX_CONSECUTIVE_HOLDS: int = 8
     VLLM_TPU_SRPT_ATTN_WORK_CAP: int = 0
     VLLM_TPU_SRPT_ATTN_TILE_TOKENS: int = 32
+    TPU_SKIP_STATIC_QUANT_PROFILE_RUN: bool = True
 
 
 def env_with_choices(
@@ -1233,6 +1234,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # tile).
     "VLLM_TPU_SRPT_ATTN_TILE_TOKENS": env_nonnegative_int(
         "VLLM_TPU_SRPT_ATTN_TILE_TOKENS", 32
+    ),
+    # Skip the throwaway kv=0 backbone compile in profile_run for quantized
+    # models whose weights/scales are already materialized in
+    # process_weights_after_loading when HBM headroom is standard (<= 0.92),
+    # avoiding a permanent bottom-of-HBM program-region leak and ~60s compile.
+    "TPU_SKIP_STATIC_QUANT_PROFILE_RUN": env_bool(
+        "TPU_SKIP_STATIC_QUANT_PROFILE_RUN", default=True
     ),
 }
 
