@@ -101,15 +101,30 @@ def _cache_misses(worker) -> int:
     return stats.num_cache_reqs - stats.num_cache_hits
 
 
+def _compile_and_kv_state(worker) -> dict:
+    from torch._dynamo.utils import counters
+
+    groups = worker.model_runner.kv_cache_config.kv_cache_groups
+    return {
+        "graph_breaks": sum(counters["graph_break"].values()),
+        "windows": [getattr(g.kv_cache_spec, "sliding_window", None) for g in groups],
+        "page_bytes": {g.kv_cache_spec.page_size_bytes for g in groups},
+    }
+
+
 def test_beam_engine_serves_on_tpu(llm: LLM):
-    """Windows the sliding layer only, soft-caps the logits and decodes past the window;
-    once warm, new lengths in the same buckets compile nothing (first use compiles
-    sampler/logprobs programs)."""
+    """Windows the sliding layer only, soft-caps the logits and decodes past the window
+    without graph breaks; once warm, new lengths in the same buckets compile nothing
+    (first use compiles sampler/logprobs programs)."""
     [(windows, ropes, peak, softcap)] = llm.apply_model(_describe)
     assert list(windows) == [WINDOW, None] and softcap == 30.0  # The real config's.
     # Sized to max_model_len, not the 1M max_position_embeddings; full layers use SSMax.
     assert list(ropes) == [[1024, torch.float32], None]
     assert 0 < peak <= softcap
+    # One KV cache group per attention kind, in one page geometry.
+    [state] = llm.llm_engine.collective_rpc(_compile_and_kv_state)
+    assert sorted(state["windows"], key=str) == [WINDOW, None]
+    assert len(state["page_bytes"]) == 1
 
     def generate(lengths):
         assert llm.reset_prefix_cache()
@@ -123,6 +138,10 @@ def test_beam_engine_serves_on_tpu(llm: LLM):
     outputs = generate((9, 601))
     assert [len(o.outputs[0].token_ids) for o in outputs] == [GREEDY.max_tokens] * 2
     assert llm.llm_engine.collective_rpc(_cache_misses) == misses
+    # The backbone compiles with fullgraph=True; the counter also covers every
+    # other function the worker compiled.
+    [state] = llm.llm_engine.collective_rpc(_compile_and_kv_state)
+    assert state["graph_breaks"] == 0
 
 
 def _assert_greedy_close(cached, reference, vocab_size: int, atol: float = 0.1) -> None:
