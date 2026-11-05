@@ -262,7 +262,9 @@ class Qwen4ExpRaidenWorker(TPURaidenConnectorWorker):
             materialize_storages(manifest)
             plan_groups = self._staging.src_groups
         else:
-            manifest = build_transfer_manifest(cache.native_config, cache.materialized)
+            manifest = build_transfer_manifest(
+                cache.native_config, cache.materialized, cache.layout
+            )
             verify_storage_binding(
                 manifest, self.named_kv_caches, runner.kv_cache_raw_tensors
             )
@@ -491,14 +493,10 @@ class Qwen4ExpRaidenWorker(TPURaidenConnectorWorker):
         # An unpacked compressed-key page holds one layer's keys for the page's
         # tokens in its first block_size / 128 kernel pages (12% of a TP1
         # stage's 3200-token page); the rest is padding. Send only the keys.
-        layout = self.runner.model_adapter.cache.layout
-        compressed_bytes = (
-            layout.block_size // layout.kernel_block_size
-        ) * layout.compressed_kernel_bytes
-        trim_compressed = (
-            layout.compressed_slots == 1
-            and 0 < compressed_bytes < layout.page_bytes
-        )
+        from .pd_manifest import compressed_live_bytes
+
+        compressed_bytes = compressed_live_bytes(self.runner.model_adapter.cache.layout)
+        trim_compressed = compressed_bytes is not None
         spans = []
         for pool, group_index in plan.pool_groups():
             ids = pages[group_index]

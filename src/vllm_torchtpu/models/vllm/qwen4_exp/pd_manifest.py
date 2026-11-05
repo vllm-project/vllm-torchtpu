@@ -34,8 +34,45 @@ from vllm_torchtpu.kv_cache_materializer import (
 from .pd import build_transfer_groups
 
 
+def compressed_live_bytes(layout) -> int | None:
+    """Bytes of an unpacked compressed-key page that hold keys, or None.
+
+    One layer's keys for a page's tokens fill its first block_size / 128
+    kernel pages (409,600 of 3,276,800 bytes on a TP1 stage's 3200-token
+    page); the rest is padding a transfer need not carry.
+    """
+    if layout is None or getattr(layout, "compressed_slots", 1) != 1:
+        return None
+    live = (layout.block_size // layout.kernel_block_size) * layout.compressed_kernel_bytes
+    return live if 0 < live < layout.page_bytes else None
+
+
+def page_regions(name: str, page_bytes: int, compressed_live: int | None):
+    """A pool's live region: whole pages, or a compressed-key page's keys."""
+    if compressed_live is not None and name.endswith(".compressed_k"):
+        return (RegionSpec("keys", 0, page_bytes, compressed_live, 1),)
+    return (RegionSpec("page", 0, page_bytes, page_bytes, 1),)
+
+
+def _leading_page_region(pool) -> bool:
+    """One region at the start of each page: the whole page, or (compressed
+    keys) its leading live bytes."""
+    if len(pool.regions) != 1:
+        return False
+    region = pool.regions[0]
+    stride = pool.block_stride_bytes
+    return (
+        region.offset_bytes == 0
+        and region.stride_bytes == stride
+        and region.num_units == 1
+        and region.units_per_stride == 1
+        and 0 < region.unit_bytes <= stride
+        and (region.name == "page") == (region.unit_bytes == stride)
+    )
+
+
 def build_transfer_manifest(
-    config: KVCacheConfig, materialized: MaterializedKVCache
+    config: KVCacheConfig, materialized: MaterializedKVCache, layout=None
 ) -> PoolManifest:
     """Bind every scheduler group to full pages in the actual FP8 carrier.
 
@@ -60,6 +97,7 @@ def build_transfer_manifest(
         raise ManifestError("Qwen PD raw storage list repeats a carrier")
     pools = []
     referenced = set()
+    compressed_live = compressed_live_bytes(layout)
     for group in groups:
         page_bytes = config.kv_cache_groups[
             group.group_index
@@ -97,7 +135,7 @@ def build_transfer_manifest(
                     base_offset_bytes=0,
                     block_stride_bytes=page_bytes,
                     num_blocks=config.num_blocks,
-                    regions=(RegionSpec("page", 0, page_bytes, page_bytes, 1),),
+                    regions=page_regions(name, page_bytes, compressed_live),
                     dtype_tag="qwen4-whole-fp8-page-v1",
                 )
             )
@@ -159,12 +197,7 @@ def measure_transfer_layout(
                 or pool.block_stride_bytes <= 0
                 or pool.block_stride_bytes % row_bytes
                 or pool.num_blocks * pool.block_stride_bytes != raw.nbytes
-                or pool.regions
-                != (
-                    RegionSpec(
-                        "page", 0, pool.block_stride_bytes, pool.block_stride_bytes, 1
-                    ),
-                )
+                or not _leading_page_region(pool)
             ):
                 raise ManifestError("Qwen PD pages do not partition the native carrier")
         carriers.append(

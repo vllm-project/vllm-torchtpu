@@ -527,6 +527,11 @@ class StagedConsumer:
         self.reservations: dict[int, dict[str, list[int]]] = {}
         # uuid -> (decode-local prefix tokens, first staged source page per group)
         self.skips: dict[int, tuple[int, list[int]]] = {}
+        from .pd_manifest import compressed_live_bytes, page_regions
+
+        # The producer sends a compressed-key page's keys only; the carrier
+        # declares the same region so both pool layouts agree.
+        compressed_live = compressed_live_bytes(self.src_layout)
         self.manifest = PoolManifest(
             BINDING_ALIASED_RAW,
             [self.staging],
@@ -538,9 +543,7 @@ class StagedConsumer:
                     base_offset_bytes=0,
                     block_stride_bytes=self.src_layout.page_bytes,
                     num_blocks=self.pages,
-                    regions=(
-                        RegionSpec("page", 0, self.src_layout.page_bytes, self.src_layout.page_bytes, 1),
-                    ),
+                    regions=page_regions(name, self.src_layout.page_bytes, compressed_live),
                     dtype_tag="qwen4-whole-fp8-page-v1",
                 )
                 for group in self.src_groups
