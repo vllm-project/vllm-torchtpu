@@ -525,6 +525,11 @@ def _shared_expert_weights(mesh, seed):
     return w((k, 2 * n)), s(2 * n), w((n, k)), s(k)
 
 
+# The served program is compiled through torch_tpu, which keeps the bf16
+# roundings between fused elementwise ops; compile these the same way.
+_AS_SERVED = {"xla_allow_excess_precision": False}
+
+
 @pytest.mark.parametrize("shape", sorted(SERVED_SHAPES))
 def test_served_dims_shared_expert_inside_is_bit_exact(shape):
     """With the shared expert inside the layer, the routed output is the
@@ -556,10 +561,13 @@ def test_served_dims_shared_expert_inside_is_bit_exact(shape):
         sc_prepush=2,
         tc_exchange=True,
     )
-    want = np.asarray(fused_ep_moe_push(x, *weights, gating, **common))
-    routed, got_shared = fused_ep_moe_push(
-        x, *weights, gating, shared_expert=shared, shared_limit=10.0, **common
-    )
+
+    def layer(x, gating, *operands):
+        kw = dict(shared_expert=operands, shared_limit=10.0) if operands else {}
+        return fused_ep_moe_push(x, *weights, gating, **kw, **common)
+
+    want = np.asarray(jax.jit(layer, compiler_options=_AS_SERVED)(x, gating))
+    routed, got_shared = jax.jit(layer, compiler_options=_AS_SERVED)(x, gating, *shared)
     np.testing.assert_array_equal(np.asarray(routed), want)
     want_shared = jax.jit(
         jax.shard_map(
@@ -568,7 +576,8 @@ def test_served_dims_shared_expert_inside_is_bit_exact(shape):
             in_specs=(P(AXIS),) + (P(),) * 4,
             out_specs=P(AXIS),
             check_vma=False,
-        )
+        ),
+        compiler_options=_AS_SERVED,
     )(x, *shared)
     got_shared = np.asarray(got_shared)
     assert np.isfinite(got_shared.astype(np.float32)).all()
