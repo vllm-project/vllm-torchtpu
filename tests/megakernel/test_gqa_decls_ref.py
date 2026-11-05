@@ -1,0 +1,267 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Standalone unit tests for slice L-6a (`modules/gqa/{params,decls,reference}`)."""
+
+from __future__ import annotations
+
+import dataclasses
+
+import jax
+import jax.numpy as jnp
+import numpy as np
+import pytest
+
+from tests.megakernel.megakernel_fakes import (
+    TINY_TILES,
+    FakeFFNModule,
+    FakeGeometry,
+    FakeMixerModule,
+)
+from vllm_torchtpu.megakernel.decls import (
+    KVCacheDecl,
+    ModuleBinding,
+    ResolvedModuleGeometry,
+)
+from vllm_torchtpu.megakernel.errors import MegakernelConfigError
+from vllm_torchtpu.megakernel.exec_spec import ExecSpec
+from vllm_torchtpu.megakernel.modules.gqa.decls import (
+    GQA_FIELD_ALIASES,
+    GQA_GEOMETRY_FIELDS,
+    GQA_GEOMETRY_METHODS,
+    GQA_OPTIONS,
+    GQA_PARAM_NAMES,
+    GQA_WEIGHT_NAMES,
+    gqa_cache_decl,
+    gqa_hf_params,
+    resolve_gqa_binding,
+    validate_gqa_options,
+)
+from vllm_torchtpu.megakernel.modules.gqa.params import (
+    GQATunables,
+    derive_params,
+    gqa_scratch,
+)
+from vllm_torchtpu.megakernel.modules.gqa.reference import gqa_reference
+from vllm_torchtpu.megakernel.ops import (
+    BF16,
+    F32,
+    FP8,
+    I32,
+    rmsnorm,
+    rope_partial,
+    round_bf16,
+)
+from vllm_torchtpu.megakernel.planner import plan
+from vllm_torchtpu.megakernel.pool.config import CacheExec
+from vllm_torchtpu.megakernel.pool.layout import PoolLayout
+from vllm_torchtpu.megakernel.spec import LayerType, ModelSpec
+
+
+def test_gqa_tunables_and_derive_params_validation():
+    """Verify `GQATunables`, `derive_params` modes/errors, and `gqa_scratch`."""
+    field_names = {f.name for f in dataclasses.fields(GQATunables)}
+    assert set(GQATunables.NUMERICS.keys()) == field_names
+
+    g = FakeGeometry(L=2, att_every=1, H=256, NH=4, NKV=1, HD=256, ROT=64)
+    ms = ModelSpec(
+        "gqa_p",
+        config=g,
+        layer_type=LayerType("lt", slots=(FakeMixerModule(), FakeFFNModule())),
+    )
+    tiles = dataclasses.replace(TINY_TILES, bank=512 << 10).with_modules(
+        {"gqa": {"kv_blk": 128, "nkv": 2}}
+    )
+    ex = ExecSpec(B=4, T=1, R=2, ctx=256, stack_e=True, tiles=tiles)
+    p = plan(ms, ex)
+
+    tt_split = GQATunables(kv_blk=128, nkv=2, split=True, pack=1, gqa_qv=True)
+    ap = derive_params(g, ex, p, tt_split)
+    assert ap.G == 2 and ap.SPLIT and ap.PACK and ap.PB == 4 and ap.QV
+    assert ap.qrow(5) == (1, 2)
+    scr_split = gqa_scratch(ex, ap)
+    assert "kbuf" in scr_split and "pso" in scr_split and "rope" in scr_split
+
+    # GQ mode requires T > 1, gq_pack=True, gqa_qv=True, SPLIT, QG % 16 == 0, HD == 256
+    g_gq = FakeGeometry(L=2, att_every=1, H=512, NH=8, NKV=1, HD=256, ROT=64)
+    ms_gq = ModelSpec(
+        "gqa_gq",
+        config=g_gq,
+        layer_type=LayerType("lt", slots=(FakeMixerModule(), FakeFFNModule())),
+    )
+    ex_gq = ExecSpec(B=8, T=4, R=2, ctx=256, stack_e=True, tiles=tiles)
+    p_gq = plan(ms_gq, ex_gq)
+    tt_gq = GQATunables(kv_blk=128, nkv=2, split=True, gqa_qv=True, gq_pack=True)
+    ap_gq = derive_params(g_gq, ex_gq, p_gq, tt_gq)
+    assert ap_gq.GQ and ap_gq.MLW == 128 // ex_gq.NS
+    scr_gq = gqa_scratch(ex_gq, ap_gq)
+    assert "qxb" in scr_gq and "psend" in scr_gq and "pso" not in scr_gq
+
+    # Paged KV + KVE (expert ring aliasing)
+    tiles_kve = dataclasses.replace(TINY_TILES, bank=512 << 10, ebank=512 << 10, nbe=4)
+    ex_paged = ExecSpec(
+        B=4,
+        T=1,
+        R=2,
+        ctx=256,
+        stack_e=True,
+        tiles=tiles_kve,
+        cache=CacheExec(paged_kv=True, page_size=128, num_pages=16),
+    )
+    p_paged = plan(ms, ex_paged)
+    ap_kve = derive_params(
+        g,
+        ex_paged,
+        p_paged,
+        GQATunables(kv_blk=128, nkv=2, kv_ering=True, pair_kv=True),
+    )
+    assert ap_kve.KVE and ap_kve.PAIR_KV and ap_kve.NKV == 4
+    scr_kve = gqa_scratch(ex_paged, ap_kve)
+    assert "kvbuf" not in scr_kve and "knew_o" in scr_kve and "wl_kp" in scr_kve
+
+    # KVE raises if dynamic-ring owner does not run on every layer
+    p_partial = dataclasses.replace(
+        p_paged, module_layer_counts=dict.fromkeys(p_paged.module_layer_counts, 1)
+    )
+    with pytest.raises(MegakernelConfigError, match="kv_ering"):
+        derive_params(
+            g, ex_paged, p_partial, GQATunables(kv_blk=128, nkv=2, kv_ering=True)
+        )
+
+    with pytest.raises(MegakernelConfigError, match="nkv >= 2"):
+        derive_params(g, ex, p, GQATunables(kv_blk=128, nkv=1, pair_kv=False))
+    with pytest.raises(MegakernelConfigError, match="gq_pack requires gqa_qv"):
+        derive_params(g, ex, p, GQATunables(kv_blk=128, nkv=2, gq_pack=True))
+
+
+def test_gqa_decls_options_binding_and_hf_params():
+    """Verify GQA options, binding resolution, HF parameter keys, and cache decl."""
+    assert GQA_WEIGHT_NAMES == ("att_in", "att_out")
+    assert "q_proj" in GQA_PARAM_NAMES and "qn" in GQA_PARAM_NAMES
+    assert "H" in GQA_FIELD_ALIASES and "hidden" in GQA_GEOMETRY_FIELDS
+    assert GQA_OPTIONS["qk_norm"] is True
+
+    validate_gqa_options(
+        {
+            "qk_norm": True,
+            "output_gate": True,
+            "weight_dtypes": {"att_in": "bf16", "att_out": "fp8"},
+        }
+    )
+    with pytest.raises(MegakernelConfigError, match="qk_norm=True"):
+        validate_gqa_options({"qk_norm": False})
+    with pytest.raises(MegakernelConfigError, match="output_gate=True"):
+        validate_gqa_options({"output_gate": False})
+    with pytest.raises(MegakernelConfigError, match="weight_dtypes"):
+        validate_gqa_options({"weight_dtypes": {"bad": "fp8"}})
+
+    binding = ModuleBinding(
+        module_cls=FakeMixerModule,
+        prefix="self_attn",
+        options={"qk_norm": True, "output_gate": True},
+        rename={"q_proj": "q_custom"},
+    )
+    raw_res = ResolvedModuleGeometry(
+        module_cls=FakeMixerModule,
+        prefix="self_attn",
+        values={
+            "hidden": 256,
+            "heads": 4,
+            "kv_heads": 2,
+            "head_dim": None,
+            "rot": 0.5,
+            "eps": 1e-6,
+            "theta": 10000.0,
+        },
+        options=binding.options,
+        rename=binding.rename,
+    )
+    resolved = resolve_gqa_binding(FakeMixerModule, binding, raw_res)
+    assert resolved.HD == 64 and resolved.ROT == 32
+    assert GQA_GEOMETRY_METHODS["nh"](resolved, 2) == 2
+    assert GQA_GEOMETRY_METHODS["G"](resolved, 2) == 1
+    assert GQA_GEOMETRY_METHODS["NAI"](resolved, 2) == (2 * 2 + 2) * 64
+
+    decls_fp8 = gqa_hf_params("self_attn", resolved)
+    names_fp8 = {d.name for d in decls_fp8}
+    assert "q_custom" in names_fp8 and "q_proj_s" in names_fp8 and "qn" in names_fp8
+
+    decls_bf16 = gqa_hf_params(
+        "self_attn", resolved, weight_dtypes={"att_in": "bf16", "att_out": "bf16"}
+    )
+    names_bf16 = {d.name for d in decls_bf16}
+    assert "q_proj_s" not in names_bf16 and "att_out_s" not in names_bf16
+
+    cdecl_geom = gqa_cache_decl(resolved)
+    assert cdecl_geom == KVCacheDecl(hd=64, kvh=1, page_size=128, page_dtype=FP8)
+    play = PoolLayout(num_pools=1, slots_per_pool=0, hd=128, page_size=128)
+    assert gqa_cache_decl(None, pool_layout=play).hd == 128
+
+
+@pytest.mark.parametrize("T", [1, 2], ids=["decode_t1", "verify_t2"])
+def test_gqa_reference_matches_direct_computation(T: int):
+    """Compare `gqa_reference` against a direct step-by-step computation."""
+    R, B, ctx = 2, 2 * T, 128
+    g = FakeGeometry(L=1, att_every=1, H=256, NH=4, NKV=2, HD=128, ROT=32)
+    tiles = TINY_TILES.with_modules({"gqa": {"kv_blk": 128, "nkv": 2}})
+    ex = ExecSpec(B=B, T=T, R=R, ctx=ctx, tiles=tiles)
+    nh = g.NH // R
+    nai = (2 * nh + 2) * g.HD
+    koff = nh * 2 * g.HD
+
+    keys = jax.random.split(jax.random.PRNGKey(7 + T), 6)
+    x = jax.random.normal(keys[0], (B, g.H), dtype=BF16) * 0.2
+    w_in = jax.random.normal(keys[1], (R, g.H, nai), dtype=BF16) * 0.1
+    w_out = jax.random.normal(keys[2], (R, nh * g.HD, g.H), dtype=BF16) * 0.1
+    qn = jax.random.normal(keys[3], (R, g.HD), dtype=F32) * 0.1
+    kn = jax.random.normal(keys[4], (R, g.HD), dtype=F32) * 0.1
+    kc = jax.random.normal(keys[5], (R, ex.NS, ctx, g.HD), dtype=BF16) * 0.1
+    vc = jax.random.normal(keys[5], (R, ex.NS, ctx, g.HD), dtype=BF16) * 0.05
+    pos = jnp.array([4 + (b % T) for b in range(B)], dtype=I32)
+
+    params = {"att_in": w_in, "att_out": w_out, "qn": qn, "kn": kn}
+    state = {"kc": kc, "vc": vc}
+    delta, new_state = gqa_reference(params, x, state, g=g, ex=ex, pos=pos)
+    assert delta.shape == (B, g.H)
+    assert new_state["kc"].shape == kc.shape
+
+    # Direct single-sequence check for rank 0, token 0 (sq=0, tb=0)
+    xb0 = x[0:1].astype(BF16).astype(F32)
+    y0 = round_bf16(xb0 @ w_in[0].astype(F32))
+    qg0 = y0[0, :koff].reshape(nh, 2 * g.HD)
+    gate0 = round_bf16(jax.nn.sigmoid(qg0[:, g.HD :].reshape(nh * g.HD)))
+    half = g.ROT // 2
+    inv = 1.0 / (g.theta ** (jnp.arange(half, dtype=F32)[None, :] * 2.0 / g.ROT))
+    ang0 = pos[0].astype(F32) * inv
+    cos0, sin0 = round_bf16(jnp.cos(ang0)), round_bf16(jnp.sin(ang0))
+    q0 = round_bf16(
+        rope_partial(
+            rmsnorm(qg0[:, : g.HD], qn[0], g.eps, zero_centered=True),
+            cos0,
+            sin0,
+            g.ROT,
+            round_intermediates=True,
+        )
+        * (g.HD**-0.5)
+    )
+    k0 = rope_partial(
+        rmsnorm(y0[:, koff : koff + g.HD], kn[0], g.eps, zero_centered=True),
+        cos0,
+        sin0,
+        g.ROT,
+        round_intermediates=True,
+    )[0]
+    v0 = y0[0, koff + g.HD : koff + 2 * g.HD]
+    np.testing.assert_allclose(new_state["kc"][0, 0, pos[0]], k0.astype(BF16))
+    np.testing.assert_allclose(new_state["vc"][0, 0, pos[0]], v0.astype(BF16))
+    assert jnp.all(jnp.isfinite(delta)) and jnp.all(jnp.isfinite(q0 * gate0[: g.HD]))

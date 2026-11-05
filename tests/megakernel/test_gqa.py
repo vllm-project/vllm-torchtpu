@@ -22,10 +22,15 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from tests.megakernel.megakernel_fakes import TINY_TILES, FakeGeometry, MiniCtx
+from tests.megakernel.megakernel_fakes import (
+    TINY_TILES,
+    FakeFFNModule,
+    FakeGeometry,
+    MiniCtx,
+)
 from vllm_torchtpu.megakernel import collectives, planner, stream, vmem
 from vllm_torchtpu.megakernel.exec_spec import ExecSpec
-from vllm_torchtpu.megakernel.modules import GQAModule, MoEModule
+from vllm_torchtpu.megakernel.modules.gqa import GQAModule
 from vllm_torchtpu.megakernel.ops import BF16, F32, I32
 from vllm_torchtpu.megakernel.spec import LayerType, ModelSpec
 
@@ -37,11 +42,11 @@ def test_gqa_module_declarations_and_emit_in_pallas_interpret(fake_ex: ExecSpec)
     fake_ex = dataclasses.replace(fake_ex, tiles=_TINY_GQA_TILES)
     g_decl = FakeGeometry(L=2, att_every=1, H=256)
     gqa_decl = GQAModule()
-    moe_decl = MoEModule()
+    ffn_decl = FakeFFNModule()
     ms_decl = ModelSpec(
-        "gqa_moe_test",
+        "gqa_ffn_test",
         config=g_decl,
-        layer_type=LayerType("lt", slots=(gqa_decl, moe_decl)),
+        layer_type=LayerType("lt", slots=(gqa_decl, ffn_decl)),
     )
 
     p_decl = planner.plan(ms_decl, fake_ex)
@@ -73,9 +78,9 @@ def test_gqa_module_declarations_and_emit_in_pallas_interpret(fake_ex: ExecSpec)
         moe_tp=True,
     )
     gqa = GQAModule()
-    moe = MoEModule()
+    ffn = FakeFFNModule()
     ms = ModelSpec(
-        "gqa_moe_exec", config=g, layer_type=LayerType("lt", slots=(gqa, moe))
+        "gqa_ffn_exec", config=g, layer_type=LayerType("lt", slots=(gqa, ffn))
     )
     cp, scratch = vmem.build_scratch(ms, ex)
     p = cp.plan
@@ -85,13 +90,13 @@ def test_gqa_module_declarations_and_emit_in_pallas_interpret(fake_ex: ExecSpec)
     s_names = list(scratch.keys())
 
     assert gqa.input_norm == "in_norm"
-    assert moe.input_norm == "post_norm"
+    assert ffn.input_norm == "post_norm"
 
     def pallas_body(pos_ref, hid_ref, *rest):
         n_w, n_s, n_o = len(p.w_names), len(p.s_names), len(p.o_names)
         W = dict(zip(p.w_names, rest[:n_w]))
         ST = dict(zip(p.s_names, rest[n_w : n_w + n_s]))
-        O = dict(zip(p.o_names, rest[n_w + n_s : n_w + n_s + n_o]))  # noqa: E741
+        out_refs = dict(zip(p.o_names, rest[n_w + n_s : n_w + n_s + n_o]))
         scr = dict(zip(s_names, rest[n_w + n_s + n_o :]))
         me = jnp.int32(0)
         ring = stream.TwoRing(cp.stream, W, scr, me, interpret=True)
@@ -103,7 +108,7 @@ def test_gqa_module_declarations_and_emit_in_pallas_interpret(fake_ex: ExecSpec)
             pos_ref=pos_ref,
             W=W,
             ST=ST,
-            O=O,
+            O=out_refs,
             scr=scr,
             me=me,
             stream=ring,
@@ -116,11 +121,9 @@ def test_gqa_module_declarations_and_emit_in_pallas_interpret(fake_ex: ExecSpec)
             W["smalls"].at[0], scr["sm"].at[0], scr["sm_sem"].at[0]
         ).start()
         gqa.prologue(ctx)
-        moe.prologue(ctx)
         scr["res"][...] = hid_ref[: ex.MB].astype(F32)
         scr["mix"][...] = jnp.zeros(scr["mix"].shape, F32)
         gqa.init_buffers(ctx)
-        moe.init_buffers(ctx)
 
         pltpu.make_async_copy(
             W["smalls"].at[0], scr["sm"].at[0], scr["sm_sem"].at[0]
@@ -129,12 +132,9 @@ def test_gqa_module_declarations_and_emit_in_pallas_interpret(fake_ex: ExecSpec)
         ctx.apply_input_norm(gqa.input_norm, jnp.int32(0))
         part_att = gqa.emit(ctx, jnp.int32(0), jnp.int32(0))
         ar.add_residual(ar.allreduce(0, part_att, jnp.bool_(True)))
-        ctx.apply_input_norm(moe.input_norm, jnp.int32(0))
-        part_moe = moe.emit(ctx, jnp.int32(0), jnp.int32(0))
-        ar.add_residual(ar.allreduce(1, part_moe, jnp.bool_(True)))
-        O["hidden"][: ex.MB] = scr["res"][...].astype(BF16)
+        out_refs["hidden"][: ex.MB] = scr["res"][...].astype(BF16)
         if ex.MB < ex.M:
-            O["hidden"][ex.MB :] = jnp.zeros((ex.M - ex.MB, g.H), BF16)
+            out_refs["hidden"][ex.MB :] = jnp.zeros((ex.M - ex.MB, g.H), BF16)
 
     in_specs = (
         [pl.BlockSpec(memory_space=pltpu.SMEM), pl.BlockSpec(memory_space=pltpu.VMEM)]
