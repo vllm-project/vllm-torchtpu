@@ -11,13 +11,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Interior decode steps: no masks, no stitch, static page copies.
+"""Interior decode steps (no masks, no stitch, static page copies) and skipped
+kernels of modes without sequences.
 
 Run on a TPU: `PYTHONPATH=src python -m pytest -v <this file>`.
 
 Each kernel case runs the batched kernel twice on the same inputs: once with
-masks, stitches and per-page copy lookups on every step, once as served.
-Outputs and KV caches must be bitwise equal.
+masks, stitches and per-page copy lookups on every step and both mode kernels
+launched, once as served. Outputs and KV caches must be bitwise equal.
 """
 
 import dataclasses
@@ -139,6 +140,7 @@ def _run(
 def _assert_same(monkeypatch, call):
     served_out, served_cache = call()
     monkeypatch.setattr(kernel, "_UNMASKED_INTERIOR_BLOCKS", False)
+    monkeypatch.setattr(wrapper, "_SKIP_EMPTY_MODES", False)
     monkeypatch.setattr(bref_override, "_STATIC_FULL_BLOCK_COPIES", False)
     ref_out, ref_cache = call()
     np.testing.assert_array_equal(served_out.view(np.uint16), ref_out.view(np.uint16))
