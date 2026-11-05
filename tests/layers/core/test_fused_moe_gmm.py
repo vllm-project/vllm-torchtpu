@@ -1002,6 +1002,32 @@ def test_onehot_threshold_auto_caps_oversized_block(monkeypatch):
     assert fused_moe_gmm.resolve_onehot_permute_threshold() == 512
 
 
+def test_onehot_threshold_auto_covers_the_decode_step(monkeypatch):
+    monkeypatch.setattr(envs, "ONEHOT_MOE_PERMUTE_THRESHOLD", None, raising=False)
+    monkeypatch.setattr(
+        fused_moe_gmm.pltpu,
+        "get_tpu_info",
+        lambda: _fake_tpu_info(_fake_sc_info(16, 2, 16)),
+    )
+    resolve = fused_moe_gmm.resolve_onehot_permute_threshold
+    # A 96-token top-10 decode step (960 rows) lies above the 511-row block
+    # cutoff, so the threshold rises to it; a smaller step keeps the block
+    # cutoff, and a step beyond the decode cap stops at the cap.
+    assert resolve(960) == 960
+    assert resolve(240) == 511
+    assert resolve(10**6) == fused_moe_gmm._ONEHOT_DECODE_CAP
+
+
+def test_onehot_threshold_decode_rows_keep_explicit_and_no_sc_values(monkeypatch):
+    monkeypatch.setattr(envs, "ONEHOT_MOE_PERMUTE_THRESHOLD", 0, raising=False)
+    assert fused_moe_gmm.resolve_onehot_permute_threshold(960) == 0
+    monkeypatch.setattr(envs, "ONEHOT_MOE_PERMUTE_THRESHOLD", None, raising=False)
+    monkeypatch.setattr(
+        fused_moe_gmm.pltpu, "get_tpu_info", lambda: _fake_tpu_info(None)
+    )
+    assert fused_moe_gmm.resolve_onehot_permute_threshold(960) == 0
+
+
 def test_onehot_threshold_auto_zero_without_sparse_core(monkeypatch):
     monkeypatch.setattr(envs, "ONEHOT_MOE_PERMUTE_THRESHOLD", None, raising=False)
     monkeypatch.setattr(

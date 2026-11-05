@@ -61,18 +61,24 @@ def _select_ragged_gather_reduce(version: str):
 ragged_gather_reduce = _select_ragged_gather_reduce(envs.RAGGED_GATHER_REDUCE_VERSION)
 
 _ONEHOT_AUTO_CAP = 512
+# Largest decode step (routed rows) the auto threshold moves to the one-hot
+# path. The one-hot matmuls grow with tokens x routed rows, so larger steps
+# keep the SparseCore kernels.
+_ONEHOT_DECODE_CAP = 3840
 # Fixed at import, like the other MoE algorithm selectors.
 _DENSE_EXPERT_THRESHOLD = envs.TPU_MOE_DENSE_EXPERT_THRESHOLD
 
 
-def resolve_onehot_permute_threshold() -> int:
+def resolve_onehot_permute_threshold(decode_routed_rows: int = 0) -> int:
     """Routed-row count at/below which MoE permute+combine run as TensorCore
     one-hot matmuls instead of the SparseCore gather/reduce kernels.
 
     Auto (env unset/empty/negative) resolves to ``min(SC block rows - 1,
-    _ONEHOT_AUTO_CAP)`` on SparseCore TPUs and 0 elsewhere. An explicit
-    ``ONEHOT_MOE_PERMUTE_THRESHOLD`` wins: 0 disables the one-hot path, a
-    positive value forces that threshold.
+    _ONEHOT_AUTO_CAP)`` on SparseCore TPUs and 0 elsewhere, raised to
+    ``decode_routed_rows`` (at most ``_ONEHOT_DECODE_CAP``) so a full decode
+    step takes the one-hot path while prefill buckets keep the SparseCore
+    kernels. An explicit ``ONEHOT_MOE_PERMUTE_THRESHOLD`` wins: 0 disables
+    the one-hot path, a positive value forces that threshold.
     """
     explicit = envs.ONEHOT_MOE_PERMUTE_THRESHOLD
     if explicit is not None and explicit >= 0:
@@ -87,7 +93,7 @@ def resolve_onehot_permute_threshold() -> int:
     block_rows = sc_info.num_lanes * sc_info.num_cores * sc_info.num_subcores
     threshold = min(block_rows - 1, _ONEHOT_AUTO_CAP)
 
-    return threshold
+    return max(threshold, min(decode_routed_rows, _ONEHOT_DECODE_CAP))
 
 
 def unpack_fp4_to_e2m1(w_packed: jax.Array) -> jax.Array:
