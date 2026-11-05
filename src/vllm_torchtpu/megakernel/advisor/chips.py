@@ -581,5 +581,6 @@ def load_public_calibration(chip_name: str = "tpu7x") -> dict[str, object] | Non
         return None
     loaded = json.loads(cal_path.read_text(encoding="utf-8"))
     if type(loaded) is not dict:
-        return None
+        msg = f"Expected JSON object in {cal_path}, got {type(loaded).__name__}"
+        raise errors.MegakernelConfigError(msg)
     return {str(k): v for k, v in loaded.items()}

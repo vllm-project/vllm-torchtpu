@@ -16,7 +16,6 @@
       "group_size": 8,
       "bytes": 0,
       "latency_us": 24.2954,
-      "hop_latency_us": 8.0985,
       "n": 416
     },
     {
@@ -24,41 +23,7 @@
       "group_size": 8,
       "bytes": 0,
       "latency_us": 11.7838,
-      "hop_latency_us": 3.9279,
       "n": 40336
     }
-  ],
-  "step_time_us": {
-    "p50": 6082.88,
-    "spread": 2581.08,
-    "n": 2
-  },
-  "prefill": {
-    "phase": "prefill",
-    "batch": 1,
-    "isl": 4096,
-    "collectives": [
-      {
-        "op": "all-gather",
-        "group_size": 8,
-        "bytes": 0,
-        "latency_us": 15.2047,
-        "hop_latency_us": 5.0682,
-        "n": 32
-      },
-      {
-        "op": "all-reduce",
-        "group_size": 8,
-        "bytes": 0,
-        "latency_us": 25.3333,
-        "hop_latency_us": 8.4444,
-        "n": 3104
-      }
-    ],
-    "step_time_us": {
-      "p50": 17638.26,
-      "spread": 552.22,
-      "n": 3
-    }
-  }
+  ]
 }

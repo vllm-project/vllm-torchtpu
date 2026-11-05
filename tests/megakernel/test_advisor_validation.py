@@ -18,7 +18,9 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from vllm_torchtpu.megakernel import advisor
+import pytest
+
+from vllm_torchtpu.megakernel import advisor, errors
 from vllm_torchtpu.megakernel.advisor import chips
 
 _VALIDATION_CORPUS_PATH = (
@@ -27,6 +29,16 @@ _VALIDATION_CORPUS_PATH = (
 _MIN_CORPUS_POINTS = 14
 _MIN_DISTINCT_MODELS = 3
 _ALLOWED_PROVENANCE_KINDS = frozenset({"public_calibration_run", "oss_tpu_measurement"})
+_PHASES: dict[str, advisor.Phase] = {
+    "decode": "decode",
+    "prefill": "prefill",
+    "verify": "verify",
+}
+_MOE_MODES: dict[str, advisor.MoEMode] = {
+    "masked_on_chip": "masked_on_chip",
+    "grouped_on_chip": "grouped_on_chip",
+    "grouped_in_hbm": "grouped_in_hbm",
+}
 
 
 def _load_validation_corpus() -> list[dict[str, object]]:
@@ -42,34 +54,33 @@ def _load_validation_corpus() -> list[dict[str, object]]:
 def _build_workload_from_point(pt: dict[str, object]) -> advisor.WorkloadSpec:
     """Construct a typed `WorkloadSpec` from a validation point dictionary."""
     raw = pt["workload"]
-    wl: dict[str, object] = raw if type(raw) is dict else {}
-    phase_str = str(wl.get("phase", "decode"))
-    phase_val: advisor.Phase = (
-        "prefill"
-        if phase_str == "prefill"
-        else ("verify" if phase_str == "verify" else "decode")
-    )
-    moe_str = str(wl.get("moe_mode", "masked_on_chip"))
-    moe_val: advisor.MoEMode = (
-        "grouped_on_chip"
-        if moe_str == "grouped_on_chip"
-        else ("grouped_in_hbm" if moe_str == "grouped_in_hbm" else "masked_on_chip")
-    )
+    if type(raw) is not dict:
+        msg = f"Expected dict workload, got {type(raw).__name__}"
+        raise TypeError(msg)
+    defaults = advisor.WorkloadSpec()
+    phase_str = str(raw.get("phase", defaults.phase))
+    if phase_str not in _PHASES:
+        msg = f"Unsupported phase: {phase_str!r}"
+        raise ValueError(msg)
+    moe_str = str(raw.get("moe_mode", defaults.moe_mode))
+    if moe_str not in _MOE_MODES:
+        msg = f"Unsupported moe_mode: {moe_str!r}"
+        raise ValueError(msg)
     return advisor.WorkloadSpec(
-        phase=phase_val,
-        batch=int(str(wl.get("batch", 16))),
-        isl=int(str(wl.get("isl", 4096))),
-        osl=int(str(wl.get("osl", 1024))),
-        context=int(str(wl.get("context", 0))),
-        spec_tokens=int(str(wl.get("spec_tokens", 0))),
-        chunk_size=int(str(wl.get("chunk_size", 0))),
-        tp=int(str(wl.get("tp", 8))),
-        pp=int(str(wl.get("pp", 1))),
-        dp=int(str(wl.get("dp", 1))),
-        ep=int(str(wl.get("ep", 1))),
-        dcp=int(str(wl.get("dcp", 1))),
-        pcp=int(str(wl.get("pcp", 1))),
-        moe_mode=moe_val,
+        phase=_PHASES[phase_str],
+        batch=int(str(raw.get("batch", defaults.batch))),
+        isl=int(str(raw.get("isl", defaults.isl))),
+        osl=int(str(raw.get("osl", defaults.osl))),
+        context=int(str(raw.get("context", defaults.context))),
+        spec_tokens=int(str(raw.get("spec_tokens", defaults.spec_tokens))),
+        chunk_size=int(str(raw.get("chunk_size", defaults.chunk_size))),
+        tp=int(str(raw.get("tp", defaults.tp))),
+        pp=int(str(raw.get("pp", defaults.pp))),
+        dp=int(str(raw.get("dp", defaults.dp))),
+        ep=int(str(raw.get("ep", defaults.ep))),
+        dcp=int(str(raw.get("dcp", defaults.dcp))),
+        pcp=int(str(raw.get("pcp", defaults.pcp))),
+        moe_mode=_MOE_MODES[moe_str],
     )
 
 
@@ -98,7 +109,10 @@ def test_no_estimate_exceeds_measured_beyond_spread() -> None:
     assert len(models_seen) >= _MIN_DISTINCT_MODELS
 
 
-def test_validation_corpus_provenance_and_tie_overlap() -> None:
+def test_validation_corpus_provenance_and_tie_overlap(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
     """Verify corpus provenance metadata, tie overlap, and public calibration loader."""
     points = _load_validation_corpus()
     for pt in points:
@@ -141,10 +155,20 @@ def test_validation_corpus_provenance_and_tie_overlap() -> None:
         "tpu7x",
         measurements=cal_data,
     )
-    # The bundled trace carries no host launch gap; that input stays a prior.
+    # Bundled calibration carries collective priors only.
     assert "launch_gap_us" not in cal_data
+    assert "step_time_us" not in cal_data
     for sub in cal_data.values():
         if isinstance(sub, dict):
             assert "launch_gap_us" not in sub
+            assert "step_time_us" not in sub
+    assert cal_rep.confidence == "bounded"
     assert cal_rep.metrics["launch_gap_us"]["tag"] == "ASSUMED"
     assert cal_rep.metrics["collective_latency_us"]["tag"] == "MEASURED"
+
+    # Non-dict JSON in calibration directory raises MegakernelConfigError
+    bad_cal = tmp_path / "tpu7x_public.json"
+    bad_cal.write_text("[1, 2, 3]", encoding="utf-8")
+    monkeypatch.setattr(chips, "_CALIBRATION_DIR", tmp_path)
+    with pytest.raises(errors.MegakernelConfigError, match="Expected JSON object"):
+        chips.load_public_calibration("tpu7x")
