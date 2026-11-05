@@ -76,15 +76,26 @@ def _fits_vmem(buffer_bytes: int, limit: int) -> bool:
     return buffer_bytes <= _VMEM_BUDGET * limit
 
 
-def supports(rows: int, k: int, n: int, w_dtype: jnp.dtype, w_scale_ndim: int) -> bool:
+def supports(
+    rows: int,
+    k: int,
+    n: int,
+    w_dtype: jnp.dtype,
+    w_scale_ndim: int,
+    row_multiple: int = 16,
+) -> bool:
     """Whether `[rows, k] @ [k, n]` with FP8 weights and a per-channel scale
     can run here: whole lanes of output columns, whole FP8 row tiles of k, and
-    the weight ring, the rows, their f32 copy and the whole output in VMEM."""
+    the weight ring, the rows, their f32 copy and the whole output in VMEM.
+    The rows are padded to a whole FP8 row tile inside the kernel; callers
+    keep `row_multiple` at the token bucket granularity they compiled for
+    (8 serves the LM head's request buckets)."""
     if not (
         jnp.issubdtype(w_dtype, jnp.floating)
         and jnp.dtype(w_dtype).itemsize == 1
         and w_scale_ndim == 1
-        and rows % 16 == 0
+        and rows % row_multiple == 0
+        and row_multiple % 8 == 0
         and n % _LANES == 0
         and k % _ROW_TILE == 0
     ):
@@ -208,7 +219,7 @@ def fp8_decode_matmul(
     interpret: bool = False,
 ) -> jax.Array:
     """`xla_quantized_matmul(x, w_q, w_scale)` for few rows: `x` `[m, k]`
-    (m a multiple of 16), `w_q` FP8 `[k, n]`, `w_scale` f32 `[n]`."""
+    (m a multiple of 8), `w_q` FP8 `[k, n]`, `w_scale` f32 `[n]`."""
     m, k = x.shape
     n = w_q.shape[1]
     tn, depth, splits = tile_config(k, n, tile_bytes=tile_bytes)
