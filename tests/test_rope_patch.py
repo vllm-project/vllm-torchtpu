@@ -628,6 +628,11 @@ def test_tpu_oot_custom_inv_freq_ropes_match_and_support_get_cos_sin(
     assert rope_patch.patch_in_graph_rotary_embedding(tier2_rope) == 0
     _assert_cache_buffers_gone(tier2_rope)
 
+    is_proportional = rope_params.get("rope_type") == "proportional"
+    expected_active = 16 if is_proportional else None
+    assert getattr(tier1_rope, "_in_graph_rope_active_angles", None) == expected_active
+    assert getattr(tier2_rope, "_in_graph_rope_active_angles", None) == expected_active
+
     for candidate in (tier1_rope, tier2_rope):
         for method in (
             candidate,
@@ -1231,3 +1236,127 @@ def test_rotary_base_never_uses_content_recovery_and_warns_once(
     assert rope_patch.patch_in_graph_rotary_embedding(unknown) == 0
     assert unknown.cos_sin_cache is orig_buf
     assert any("_UnknownFutureRotaryEmbedding" in w for w in warnings_seen)
+
+
+def test_active_rope_angles_rules() -> None:
+    assert rope_patch._active_rope_angles((), None) is None
+    assert rope_patch._active_rope_angles((0.0, 0.0, 0.0, 0.0), None) is None
+    assert rope_patch._active_rope_angles((1.0, 0.5, 0.25, 0.125), None) is None
+    assert rope_patch._active_rope_angles((1.0, 0.0, 0.25, 0.125), None) is None
+    assert rope_patch._active_rope_angles((1.0, 0.5, 1e-38), None) is None
+
+    padded_128 = (*([1.0] * 32), *([0.0] * 96))
+    assert rope_patch._active_rope_angles(padded_128, None) == 32
+    assert rope_patch._active_rope_angles(padded_128, 32) == 32
+    assert rope_patch._active_rope_angles(padded_128, 16) is None
+    assert rope_patch._active_rope_angles(padded_128, 64) is None
+
+
+def test_compaction_is_off_without_trailing_zero_inv_freq(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    std = _SyntheticRotaryEmbedding()
+    partial = _SyntheticRotaryEmbedding(rotary_dim=_HEAD_SIZE // 2)
+    mrope = _SyntheticRotaryEmbedding(mrope_section=[8, 12, 12], mrope_interleaved=True)
+    for mod in (std, partial, mrope):
+        assert rope_patch.patch_in_graph_rotary_embedding(mod) == 1
+        assert mod._in_graph_rope_active_angles is None
+
+    pytest.importorskip("vllm")
+    _ensure_tpu_rotary_embedding_registered()
+    from vllm.config import set_current_vllm_config
+    from vllm.model_executor.layers import rotary_embedding as rope_lib
+
+    from vllm_torchtpu import envs
+
+    def _llama3() -> nn.Module:
+        rope_lib._ROPE_DICT.clear()
+        with set_current_vllm_config(_vllm_config(1024)):
+            return rope_lib.get_rope(
+                _HEAD_SIZE,
+                max_position=1024,
+                is_neox_style=True,
+                rope_parameters={
+                    "rope_type": "llama3",
+                    "rope_theta": 500000.0,
+                    "factor": 8.0,
+                    "low_freq_factor": 1.0,
+                    "high_freq_factor": 4.0,
+                    "original_max_position_embeddings": 8192,
+                },
+                dtype=torch.bfloat16,
+            )
+
+    monkeypatch.setattr(rope_lib, "_ROPE_DICT", {})
+    # Tier 2: a Tensor-backed instance converted post-load.
+    monkeypatch.setattr(envs, "TPU_ROPE_IN_GRAPH", False)
+    tier2_llama3 = _llama3()
+    assert rope_patch.patch_in_graph_rotary_embedding(tier2_llama3) == 1
+    assert tier2_llama3._in_graph_rope_active_angles is None
+    # Tier 1: converted at `__init__`.
+    monkeypatch.setattr(envs, "TPU_ROPE_IN_GRAPH", True)
+    tier1_llama3 = _llama3()
+    assert rope_patch.patch_in_graph_rotary_embedding(tier1_llama3) == 0
+    assert tier1_llama3._in_graph_rope_active_angles is None
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("neox", [True, False])
+def test_proportional_rope_rotates_only_active_angles(
+    dtype: torch.dtype, neox: bool
+) -> None:
+    """Compact proportional RoPE matches unpatched and full-width forwards.
+
+    Note on sign of zero: on identity pairs the full-width path computes
+    `x - (y * 0.0)`, turning `-0.0` into `+0.0` when `y < 0`, whereas the compact
+    path passes `-0.0` through unchanged. `torch.equal` treats `-0.0` and `+0.0`
+    as equal (a raw bitwise compare would not).
+    """
+    rope = _SyntheticProportionalRotaryEmbedding(is_neox_style=neox, dtype=dtype)
+    ref_rope = copy.deepcopy(rope)
+    rot = rope.rope_angles
+    half = rope.rotary_dim // 2
+
+    positions = torch.tensor([0, 1, 13, 127, 511], dtype=torch.int32)
+    q, k = _qk(positions.numel(), dtype=dtype)
+    ref_q, ref_k = ref_rope(positions, q.clone(), k.clone())
+    assert ref_k is not None
+
+    assert rope_patch.patch_in_graph_rotary_embedding(rope) == 1
+    assert rope._in_graph_rope_active_angles == rot
+
+    out_q, out_k = rope(positions, q.clone(), k.clone())
+    assert out_k is not None
+    assert torch.equal(out_q, ref_q)
+    assert torch.equal(out_k, ref_k)
+
+    full_rope = copy.deepcopy(rope)
+    full_rope._in_graph_rope_active_angles = None
+    full_q, full_k = full_rope(positions, q.clone(), k.clone())
+    assert full_k is not None
+    assert torch.equal(out_q, full_q)
+    assert torch.equal(out_k, full_k)
+
+    qv = q.view(positions.numel(), -1, rope.head_size)
+    kv = k.view(positions.numel(), -1, rope.head_size)
+    oqv = out_q.view(positions.numel(), -1, rope.head_size)
+    okv = out_k.view(positions.numel(), -1, rope.head_size)
+    if neox:
+        assert torch.equal(oqv[..., rot:half], qv[..., rot:half])
+        assert torch.equal(oqv[..., half + rot :], qv[..., half + rot :])
+        assert torch.equal(okv[..., rot:half], kv[..., rot:half])
+        assert torch.equal(okv[..., half + rot :], kv[..., half + rot :])
+    else:
+        assert torch.equal(oqv[..., 2 * rot :], qv[..., 2 * rot :])
+        assert torch.equal(okv[..., 2 * rot :], kv[..., 2 * rot :])
+
+    cos, sin = rope.get_cos_sin(16)
+    assert cos.shape == (16, rope.head_size // 2)
+    assert sin.shape == (16, rope.head_size // 2)
+    assert torch.all(cos[:, rot:] == 1)
+    assert torch.all(sin[:, rot:] == 0)
+    assert rope_patch.get_rope_rotary_dim(rope) == rope.head_size
+    assert rope_patch.get_rope_cos_sin(rope, positions).shape == (
+        positions.numel(),
+        rope.head_size,
+    )

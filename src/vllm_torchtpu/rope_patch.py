@@ -677,23 +677,76 @@ def _eval_spec_cos_sin(
     return rows
 
 
+def _rotate_channels(
+    x: torch.Tensor,
+    head_size: int,
+    rotary_dim: int,
+    is_neox_style: bool,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    num_tokens: int,
+    *,
+    rotate_last: bool = False,
+    active: int | None = None,
+) -> torch.Tensor:
+    """Rotates `x` rotary channels in-graph; with `active` set, only active pairs."""
+    shape = x.shape
+    x = x.view(num_tokens, -1, head_size)
+    if active is not None and not rotate_last:
+        c = cos.unsqueeze(-2).float()
+        s = sin.unsqueeze(-2).float()
+        if is_neox_style:
+            half = rotary_dim // 2
+            x1 = x[..., :active].float()
+            x2 = x[..., half : half + active].float()
+            o1 = (x1 * c - x2 * s).to(x.dtype)
+            o2 = (x2 * c + x1 * s).to(x.dtype)
+            out = torch.cat(
+                (o1, x[..., active:half], o2, x[..., half + active :]), dim=-1
+            )
+        else:
+            width = 2 * active
+            xr = x[..., :width].float()
+            o1 = xr[..., ::2] * c - xr[..., 1::2] * s
+            o2 = xr[..., 1::2] * c + xr[..., ::2] * s
+            rot = torch.stack((o1, o2), dim=-1).flatten(-2).to(x.dtype)
+            out = torch.cat((rot, x[..., width:]), dim=-1)
+        return out.reshape(shape)
+
+    if rotate_last:
+        x_rot = x if rotary_dim == head_size else x[..., -rotary_dim:]
+        out = _apply_rotary_emb(x_rot, cos, sin, is_neox_style)
+        if rotary_dim < head_size:
+            out = torch.cat((x[..., :-rotary_dim], out), dim=-1)
+        return out.reshape(shape)
+
+    # Skip the no-op slice / cat on full-RoPE heads.
+    x_rot = x if rotary_dim == head_size else x[..., :rotary_dim]
+    out = _apply_rotary_emb(x_rot, cos, sin, is_neox_style)
+    if rotary_dim < head_size:
+        out = torch.cat((out, x[..., rotary_dim:]), dim=-1)
+    return out.reshape(shape)
+
+
 def _rotate_in_graph(
     self: Any,
     x: torch.Tensor,
     cos: torch.Tensor,
     sin: torch.Tensor,
     num_tokens: int,
+    active: int | None = None,
 ) -> torch.Tensor:
-    """Rotates `x[..., :rotary_dim]` in-graph and preserves any trailing channels."""
-    shape = x.shape
-    x = x.view(num_tokens, -1, self.head_size)
-    rotary_dim = self.rotary_dim
-    # Skip the no-op slice / cat on full-RoPE heads.
-    x_rot = x if rotary_dim == self.head_size else x[..., :rotary_dim]
-    out = _apply_rotary_emb(x_rot, cos, sin, self.is_neox_style)
-    if rotary_dim < self.head_size:
-        out = torch.cat((out, x[..., rotary_dim:]), dim=-1)
-    return out.reshape(shape)
+    """Rotates `x[..., :rotary_dim]`; with `active` set, only the active pairs."""
+    return _rotate_channels(
+        x,
+        self.head_size,
+        self.rotary_dim,
+        self.is_neox_style,
+        cos,
+        sin,
+        num_tokens,
+        active=active,
+    )
 
 
 def _rotate_with_spec(
@@ -703,21 +756,19 @@ def _rotate_with_spec(
     cos: torch.Tensor,
     sin: torch.Tensor,
     num_tokens: int,
+    active: int | None = None,
 ) -> torch.Tensor:
-    shape = x.shape
-    x = x.view(num_tokens, -1, self.head_size)
-    rotary_dim = spec.rotary_dim
-    if spec.rotate_last:
-        x_rot = x if rotary_dim == self.head_size else x[..., -rotary_dim:]
-        out = _apply_rotary_emb(x_rot, cos, sin, spec.is_neox_style)
-        if rotary_dim < self.head_size:
-            out = torch.cat((x[..., :-rotary_dim], out), dim=-1)
-        return out.reshape(shape)
-    x_rot = x if rotary_dim == self.head_size else x[..., :rotary_dim]
-    out = _apply_rotary_emb(x_rot, cos, sin, spec.is_neox_style)
-    if rotary_dim < self.head_size:
-        out = torch.cat((out, x[..., rotary_dim:]), dim=-1)
-    return out.reshape(shape)
+    return _rotate_channels(
+        x,
+        self.head_size,
+        spec.rotary_dim,
+        spec.is_neox_style,
+        cos,
+        sin,
+        num_tokens,
+        rotate_last=spec.rotate_last,
+        active=active,
+    )
 
 
 def _in_graph_spec_forward(
@@ -732,7 +783,18 @@ def _in_graph_spec_forward(
     if offsets is not None:
         positions = positions + offsets
 
+    active = getattr(self, "_in_graph_rope_active_angles", None)
+    use_active = (
+        active is not None
+        and len(spec.segments) == 1
+        and spec.segments[0].start == 0
+        and spec.segments[0].mscale == 1.0
+        and not spec.rotate_last
+    )
     dim_modalities = spec.dim_modalities
+    if use_active and dim_modalities is not None:
+        dim_modalities = dim_modalities[:active]
+
     if positions.ndim >= 2 and dim_modalities is not None and positions.shape[0] == 3:
         pos_2d = positions.reshape(3, -1)
         num_tokens = pos_2d.shape[-1]
@@ -742,11 +804,21 @@ def _in_graph_spec_forward(
         num_tokens = pos_for_freq.shape[0]
 
     target_dtype = query.dtype if spec.match_query_dtype else spec.cache_dtype
-    cos_sin = _eval_spec_cos_sin(spec, pos_for_freq, target_dtype)
+    if use_active:
+        assert active is not None
+        cos_sin = _in_graph_cos_sin(
+            pos_for_freq,
+            spec.segments[0].inv_freq[:active],
+            spec.cache_dtype,
+            target_dtype,
+        )
+    else:
+        cos_sin = _eval_spec_cos_sin(spec, pos_for_freq, target_dtype)
     cos, sin = cos_sin.chunk(2, dim=-1)
-    query = _rotate_with_spec(self, spec, query, cos, sin, num_tokens)
+    active_arg = active if use_active else None
+    query = _rotate_with_spec(self, spec, query, cos, sin, num_tokens, active_arg)
     if key is not None:
-        key = _rotate_with_spec(self, spec, key, cos, sin, num_tokens)
+        key = _rotate_with_spec(self, spec, key, cos, sin, num_tokens, active_arg)
     return query, key
 
 
@@ -771,6 +843,28 @@ def _in_graph_spec_get_cos_sin(
     return cos, sin
 
 
+def _active_rope_angles(
+    inv_freq: tuple[float, ...], declared: int | None
+) -> int | None:
+    """Leading angle pairs that actually rotate, or None when all of them do.
+
+    Proportional RoPE (Gemma-4 global layers) zero-pads `inv_freq` for the pairs
+    it does not rotate, so their cos/sin rows are the identity (1, 0) at every
+    position and rotating them is a no-op in fp32 (`x * 1.0 - y * 0.0 == x`).
+    Only exact trailing zeros count. A module that declares `rope_angles`
+    (Gemma4RotaryEmbedding) must agree with the zero count, else the shortcut
+    is disabled.
+    """
+    rot = len(inv_freq)
+    while rot > 0 and inv_freq[rot - 1] == 0.0:
+        rot -= 1
+    if rot == 0 or rot == len(inv_freq):
+        return None
+    if declared is not None and int(declared) != rot:
+        return None
+    return rot
+
+
 def _in_graph_rope_forward(
     self: Any,
     positions: torch.Tensor,
@@ -787,6 +881,13 @@ def _in_graph_rope_forward(
 
     inv_freq = self._in_graph_rope_inv_freq
     dim_modalities = getattr(self, "_in_graph_rope_dim_modalities", None)
+    active = getattr(self, "_in_graph_rope_active_angles", None)
+    if active is not None:
+        # Zero-padded (proportional) RoPE: only the leading `active` pairs rotate.
+        inv_freq = inv_freq[:active]
+        if dim_modalities is not None:
+            dim_modalities = dim_modalities[:active]
+
     if positions.ndim >= 2 and dim_modalities is not None and positions.shape[0] == 3:
         pos_2d = positions.reshape(3, -1)
         num_tokens = pos_2d.shape[-1]
@@ -799,9 +900,9 @@ def _in_graph_rope_forward(
         pos_for_freq, inv_freq, self._in_graph_rope_cache_dtype, query.dtype
     )
     cos, sin = cos_sin.chunk(2, dim=-1)
-    query = _rotate_in_graph(self, query, cos, sin, num_tokens)
+    query = _rotate_in_graph(self, query, cos, sin, num_tokens, active)
     if key is not None:
-        key = _rotate_in_graph(self, key, cos, sin, num_tokens)
+        key = _rotate_in_graph(self, key, cos, sin, num_tokens, active)
     return query, key
 
 
@@ -1019,6 +1120,10 @@ def install_tier1_in_graph_rope(
     ):
         rope._in_graph_rope_inv_freq = spec.segments[0].inv_freq
         rope._in_graph_rope_cache_dtype = spec.cache_dtype
+        if not spec.rotate_last:
+            rope._in_graph_rope_active_angles = _active_rope_angles(
+                spec.segments[0].inv_freq, getattr(rope, "rope_angles", None)
+            )
     if had_cache:
         rope.cos_sin_cache = InGraphCosSinCache(
             spec.segments,
@@ -1191,7 +1296,9 @@ def patch_in_graph_rotary_embedding(model: nn.Module) -> int:
     Modules already converted at `__init__` time by Tier 1 (`_tpu_in_graph_tier1`)
     are skipped. Remaining eligible modules (plain-`nn.Module` `Phi3LongRoPE`,
     CPU-traced `torch.export` models, and model-local paired buffers) are
-    converted in-place.
+    converted in-place. Records `_in_graph_rope_active_angles` for zero-padded
+    proportional RoPE while keeping full-width helper APIs (`get_cos_sin`,
+    `get_rope_cos_sin`, `get_rope_rotary_dim`, `InGraphCosSinCache`).
     """
     drop_unused_rope_cache_aliases(model)
     mrope_interleaved_cls: type | None = None
@@ -1223,6 +1330,17 @@ def patch_in_graph_rotary_embedding(model: nn.Module) -> int:
         if spec is not None:
             rope._in_graph_spec = spec
             rope._in_graph_rope_inv_freq = spec.segments[0].inv_freq
+            if (
+                len(spec.segments) == 1
+                and spec.segments[0].start == 0
+                and spec.segments[0].mscale == 1.0
+                and not spec.rotate_last
+            ):
+                rope._in_graph_rope_active_angles = _active_rope_angles(
+                    spec.segments[0].inv_freq, getattr(rope, "rope_angles", None)
+                )
+            else:
+                rope._in_graph_rope_active_angles = None
             rope._in_graph_rope_cache_dtype = spec.cache_dtype
             rope._in_graph_rope_dim_modalities = spec.dim_modalities
             bound_fwd = _in_graph_spec_forward
@@ -1233,11 +1351,13 @@ def patch_in_graph_rotary_embedding(model: nn.Module) -> int:
                     rope._compute_inv_freq(rope.base).detach().cpu().float()
                 )
             rope._in_graph_rope_inv_freq = tuple(inv_freq_tensor.tolist())
+            rope._in_graph_rope_active_angles = _active_rope_angles(
+                rope._in_graph_rope_inv_freq, getattr(rope, "rope_angles", None)
+            )
             rope._in_graph_rope_cache_dtype = cache_dtype
             rope._in_graph_rope_dim_modalities = compute_mrope_dim_modalities(rope)
             bound_fwd = _in_graph_rope_forward
             bound_get = _in_graph_get_cos_sin
-
         rope._in_graph_rope_device = cache_device
         bound = types.MethodType(bound_fwd, rope)
         rope.forward_native = bound
