@@ -34,7 +34,7 @@ from vllm_torchtpu.megakernel.decls import (
     ResolvedModuleGeometry,
 )
 from vllm_torchtpu.megakernel.errors import MegakernelConfigError
-from vllm_torchtpu.megakernel.exec_spec import ExecSpec
+from vllm_torchtpu.megakernel.exec_spec import ExecSpec, register_tunables
 from vllm_torchtpu.megakernel.modules.gqa.decls import (
     GQA_FIELD_ALIASES,
     GQA_GEOMETRY_FIELDS,
@@ -79,9 +79,7 @@ def test_gqa_tunables_and_derive_params_validation():
         config=g,
         layer_type=LayerType("lt", slots=(FakeMixerModule(), FakeFFNModule())),
     )
-    tiles = dataclasses.replace(TINY_TILES, bank=512 << 10).with_modules(
-        {"gqa": {"kv_blk": 128, "nkv": 2}}
-    )
+    tiles = dataclasses.replace(TINY_TILES, bank=512 << 10)
     ex = ExecSpec(B=4, T=1, R=2, ctx=256, stack_e=True, tiles=tiles)
     p = plan(ms, ex)
 
@@ -213,8 +211,8 @@ def test_gqa_reference_matches_direct_computation(T: int):
     """Compare `gqa_reference` against a direct step-by-step computation."""
     R, B, ctx = 2, 2 * T, 128
     g = FakeGeometry(L=1, att_every=1, H=256, NH=4, NKV=2, HD=128, ROT=32)
-    tiles = TINY_TILES.with_modules({"gqa": {"kv_blk": 128, "nkv": 2}})
-    ex = ExecSpec(B=B, T=T, R=R, ctx=ctx, tiles=tiles)
+    register_tunables("fake_gqa_ref", GQATunables)
+    ex = ExecSpec(B=B, T=T, R=R, ctx=ctx, tiles=TINY_TILES)
     nh = g.NH // R
     nai = (2 * nh + 2) * g.HD
     koff = nh * 2 * g.HD
@@ -231,7 +229,9 @@ def test_gqa_reference_matches_direct_computation(T: int):
 
     params = {"att_in": w_in, "att_out": w_out, "qn": qn, "kn": kn}
     state = {"kc": kc, "vc": vc}
-    delta, new_state = gqa_reference(params, x, state, g=g, ex=ex, pos=pos)
+    delta, new_state = gqa_reference(
+        params, x, state, g=g, ex=ex, pos=pos, module_name="fake_gqa_ref"
+    )
     assert delta.shape == (B, g.H)
     assert new_state["kc"].shape == kc.shape
 

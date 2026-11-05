@@ -31,7 +31,7 @@ from tests.megakernel.megakernel_fakes import (
     FakeMixerModule,
     MiniCtx,
 )
-from vllm_torchtpu.megakernel.exec_spec import ExecSpec
+from vllm_torchtpu.megakernel.exec_spec import ExecSpec, register_tunables
 from vllm_torchtpu.megakernel.modules.gqa.attention import (
     att_core,
     item_back,
@@ -148,10 +148,8 @@ def test_gqa_pallas_core_helpers_match_gqa_reference(
     ctx_len = 256
     g = FakeGeometry(L=1, att_every=1, H=256, NH=2, NKV=1, HD=128, ROT=32)
     tt = GQATunables(kv_blk=128, nkv=2, split=False, pair_kv=pair_kv, gqa_qv=gqa_qv)
-    tiles = TINY_TILES.with_modules(
-        {"gqa": {"kv_blk": 128, "nkv": 2, "pair_kv": pair_kv, "gqa_qv": gqa_qv}}
-    )
-    ex = ExecSpec(B=B, T=T, R=1, ctx=ctx_len, tiles=tiles, interpret=True)
+    register_tunables("fake_gqa_ref", GQATunables)
+    ex = ExecSpec(B=B, T=T, R=1, ctx=ctx_len, tiles=TINY_TILES, interpret=True)
     ms = ModelSpec(
         "gqa_core", config=g, layer_type=LayerType("lt", (FakeMixerModule(),))
     )
@@ -291,6 +289,7 @@ def test_gqa_pallas_core_helpers_match_gqa_reference(
         g=g,
         ex=ex,
         pos=pos,
+        module_name="fake_gqa_ref",
     )
     np.testing.assert_allclose(
         yo_out.astype(F32), ref_delta.astype(F32), rtol=2e-2, atol=2e-2

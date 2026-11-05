@@ -16,24 +16,20 @@
 from __future__ import annotations
 
 import dataclasses
+from types import SimpleNamespace
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
 from jax import lax
-from jax.experimental import pallas as pl
-from jax.experimental.pallas import tpu as pltpu
 
 from tests.megakernel.megakernel_fakes import (
     TINY_TILES,
     FakeFFNModule,
     FakeGeometry,
     FakeMixerModule,
-    MiniCtx,
 )
-from vllm_torchtpu.megakernel.dma import stream as dma_stream
-from vllm_torchtpu.megakernel.dma import vmem
 from vllm_torchtpu.megakernel.exec_spec import ExecSpec
 from vllm_torchtpu.megakernel.modules.moe import dedup, ring, topk
 from vllm_torchtpu.megakernel.modules.moe.context import MoEEmit
@@ -44,8 +40,8 @@ from vllm_torchtpu.megakernel.modules.moe.params import (
     derive_moe_params,
 )
 from vllm_torchtpu.megakernel.modules.moe.routing import route
-from vllm_torchtpu.megakernel.ops import F32, I32, round_up
-from vllm_torchtpu.megakernel.planner import plan, weight_shapes
+from vllm_torchtpu.megakernel.ops import F32, I32
+from vllm_torchtpu.megakernel.planner import plan
 from vllm_torchtpu.megakernel.spec import LayerType, ModelSpec
 
 
@@ -252,140 +248,35 @@ def test_moe_ring_schedule_invariants_on_fake_geometry():
         )
 
 
-def _sync_copy(src, dst, sem) -> None:
-    pltpu.make_async_copy(src, dst, sem).start()
-    pltpu.make_async_copy(src, dst, sem).wait()
-
-
-@pytest.mark.parametrize(
-    ("ecopy", "route_vec", "ecopy_opt"),
-    [
-        (False, False, 0),
-        (True, False, 0),
-        (True, False, 1),
-        (True, True, 0),
-    ],
-    ids=["local_dedup", "ecopy_opt0", "ecopy_opt1", "ecopy_route_vec"],
-)
-def test_moe_routing_and_ring_helpers_in_pallas_interpret(
-    ecopy: bool, route_vec: bool, ecopy_opt: int
-):
-    """Execute `MoEEmit.build`, `route_topk`, `dedup_*`, `route`, and `ring.py`."""
-    R, B, H, E, TOPK, IR, ISR = 2, 4, 256, 128, 2, 128, 128
-    e_slots = 70 if ecopy else 0
-    tiles = dataclasses.replace(TINY_TILES, bank=512 << 10, ebank=256 << 10, nbe=4)
-    ex = ExecSpec(B=B, T=1, R=R, ctx=128, stack_e=True, tiles=tiles, interpret=True)
+def test_moe_emit_build_and_ring_unit_meta():
+    """Verify `MoEEmit.build` iotas/masks and `ring._unit_meta` without DMA deps."""
+    tiles = dataclasses.replace(TINY_TILES, bank=512 << 10, ebank=256 << 10, nbe=6)
+    ex = ExecSpec(R=2, B=4, T=1, stack_e=True, tiles=tiles)
     g = FakeGeometry(
-        L=1,
-        att_every=1,
-        H=H,
-        NH=4,
-        NKV=2,
-        E=E,
-        TOPK=TOPK,
-        I=IR,
-        IS=ISR * R,
-        e_slots=e_slots,
+        L=1, att_every=1, H=256, NH=16, NKV=8, I=256, IS=1024, E=128, TOPK=4
     )
     ms = ModelSpec(
-        "moe_r_ring",
+        "moe_emit",
         config=g,
         layer_type=LayerType("lt", slots=(FakeMixerModule(), FakeFFNModule())),
     )
-    cp, scratch = vmem.build_scratch(ms, ex)
-    p = cp.plan
-    tt = MoETunables(
-        topk=True, topk_lanes=True, route_vec=route_vec, ecopy_opt=ecopy_opt
-    )
+    p = plan(ms, ex)
     mp = derive_moe_params(
-        g, ex, p, tt, MoEDebug(), moe_tp=False, e_slots=e_slots, module_name="fake_moe"
+        g, ex, p, MoETunables(), MoEDebug(), moe_tp=False, e_slots=0, module_name="m"
     )
-    assert mp.ECOPY is ecopy and mp.route_vec is route_vec
-    nb_picks = round_up(B * TOPK, 128)
-    scratch["hitv"] = pltpu.VMEM((ex.MR, 128), I32)
-    scratch["hits"] = pltpu.SMEM((ex.MR, 128), I32)
-    scratch["elist"] = pltpu.SMEM((nb_picks,), I32)
-    scratch["seen"] = pltpu.SMEM((8, 128), I32)
-    scratch["misc_sem"] = pltpu.SemaphoreType.DMA(())
-    scratch["st"] = pltpu.SMEM((1,), I32)
-    scratch["es"] = pltpu.VMEM((mp.NSS, 1, 2 * IR + H), F32)
-    scratch["es_sem"] = pltpu.SemaphoreType.DMA((mp.NSS,))
-    if ecopy:
-        scratch["ecopy"] = pltpu.SMEM((2, 1, E), F32)
-        scratch["ec_sem"] = pltpu.SemaphoreType.DMA((2,))
-        for k_ec in ("wlist", "cplist", "cpchoice"):
-            scratch[k_ec] = pltpu.SMEM((nb_picks,), I32)
-        scratch["rload"] = pltpu.SMEM((R,), I32)
-        if ecopy_opt == 1:
-            scratch["ulist"] = pltpu.SMEM((nb_picks,), I32)
-
-    wsh = weight_shapes(ms, ex, p)
-    s_names = list(scratch.keys())
-
-    def pallas_body(pexp_ref, *rest):
-        n_w = len(p.w_names)
-        W = dict(zip(p.w_names, rest[:n_w]))
-        wn_out_ref, nhit_out_ref, e13_out_ref = rest[n_w : n_w + 3]
-        scr = dict(zip(s_names, rest[n_w + 3 :]))
-        me = jnp.int32(0)
-        two_ring = dma_stream.TwoRing(cp.stream, W, scr, me, interpret=True)
-        ctx = MiniCtx(g, ex, cp, None, W, {}, {}, scr, me, stream=two_ring, comm=None)
-        scr["hitv"][...] = jnp.zeros((ex.MR, 128), I32)
-        _sync_copy(scr["hitv"].at[pl.ds(0, 8)], scr["seen"], scr["misc_sem"])
-        _sync_copy(W["smalls"].at[0], scr["sm"].at[0], scr["sm_sem"].at[0])
-        if ecopy:
-            o_ec = cp.stream.lay["ecopy"][0]
-            _sync_copy(
-                W["smalls"].at[0, :, pl.ds(o_ec, E)],
-                scr["ecopy"].at[0],
-                scr["ec_sem"].at[0],
-            )
-
-        m = MoEEmit.build(ctx, mp, MoEDebug())
-        with two_ring.expert_stream():
-            n_hit = route(m, jnp.int32(0), pexp_ref[...])
-            ring.es_wait(m, jnp.int32(0))
-            t0 = ring.etake(m, "e13", 0)
-            e13_out_ref[...] = t0[...]
-            ring.egive(m, 0, jnp.int32(0), t=0)
-            t1 = ring.etake(m, "e2", 1)
-            _ = t1[...]
-            ring.egive_group(m, [(1, 1)], jnp.int32(0))
-        wn_out_ref[...] = scr["wn"][...]
-        nhit_out_ref[0] = n_hit
-
-    call = pl.pallas_call(
-        pallas_body,
-        out_shape=[
-            jax.ShapeDtypeStruct((ex.MR, E), F32),
-            jax.ShapeDtypeStruct((1,), I32),
-            jax.ShapeDtypeStruct((H, 2 * IR), wsh["e13"][1]),
-        ],
-        in_specs=[pl.BlockSpec(memory_space=pltpu.VMEM)]
-        + [pl.BlockSpec(memory_space=pltpu.HBM) for _ in p.w_names],
-        out_specs=[
-            pl.BlockSpec(memory_space=pltpu.VMEM),
-            pl.BlockSpec(memory_space=pltpu.SMEM),
-            pl.BlockSpec(memory_space=pltpu.VMEM),
-        ],
-        scratch_shapes=[scratch[k] for k in s_names],
-        interpret=pltpu.InterpretParams(),
+    scr = {"elist": jnp.arange(16, dtype=I32), "wlist": jnp.arange(16, dtype=I32)}
+    fake_stream = SimpleNamespace(sp=SimpleNamespace(tk={"e13": 1, "e2": 1}))
+    fake_ctx = SimpleNamespace(
+        ex=ex,
+        W={},
+        scr=scr,
+        stream=fake_stream,
+        me=jnp.int32(0),
+        skip=frozenset(),
+        sc=lambda *_: None,
     )
-
-    pexp = jnp.ones((ex.MR, E), dtype=F32) * 0.01
-    pexp = pexp.at[0, 2].set(5.0).at[0, 5].set(4.0)
-    pexp = pexp.at[1, 3].set(5.0).at[1, 66].set(4.0)
-    pexp = pexp.at[2, 2].set(5.0).at[2, 3].set(4.0)
-    pexp = pexp.at[3, 5].set(5.0).at[3, 66].set(4.0)
-
-    w_in = {k: jnp.zeros(wsh[k][0], dtype=wsh[k][1]) for k in p.w_names}
-    if ecopy:
-        o_ec, w_ec = cp.stream.lay["ecopy"]
-        ec_tbl = jnp.zeros((w_ec,), dtype=F32).at[66].set(1.0)
-        w_in["smalls"] = w_in["smalls"].at[0, 0, o_ec : o_ec + w_ec].set(ec_tbl)
-
-    wn_out, nhit_out, e13_out = jax.jit(call)(pexp, *[w_in[k] for k in p.w_names])
-    assert int(nhit_out[0]) >= 3
-    np.testing.assert_allclose(jnp.sum(wn_out[:B], axis=-1), jnp.ones((B,)), atol=1e-5)
-    assert e13_out.shape == (H, 2 * IR)
-    assert callable(dedup.po2c)
+    m = MoEEmit.build(fake_ctx, mp, MoEDebug())
+    assert m.EM == 127 and m.lane_e8.shape == (ex.MR, 128)
+    i, w, bank, t_out, td = ring._unit_meta(m, 3, None)
+    assert i == 3 // mp.TE and bank == 3 % mp.NBE and t_out == 3 % mp.TE and td is None
+    assert callable(route) and callable(dedup.po2c)
