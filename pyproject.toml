@@ -281,5 +281,12 @@ name = "torch-tpu-registry"
 url = "https://us-python.pkg.dev/ml-oss-artifacts-transient/torch-tpu-virtual-registry/simple/"
 explicit = true
 
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
 [tool.uv.sources]
 torch-tpu = { index = "torch-tpu-registry" }
+torch = { index = "pytorch-cpu" }
+torchvision = { index = "pytorch-cpu" }
