@@ -14,6 +14,7 @@
 """Unit tests for vllm_torchtpu.layers.adapter.moe_routing helpers."""
 
 import functools
+import inspect
 from types import SimpleNamespace
 
 import pytest
@@ -288,7 +289,7 @@ def test_route_grouped_sigmoid_topk_matches_noaux_tc_reference(monkeypatch, scal
     monkeypatch.setattr(
         grouped_topk_router,
         "grouped_topk",
-        grouped_topk_router.grouped_topk.__wrapped__,
+        inspect.unwrap(grouped_topk_router.grouped_topk),
     )
     torch.manual_seed(0)
     n_experts, n_group, topk_group, topk = 256, 8, 4, 8
