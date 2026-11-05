@@ -34,7 +34,7 @@ import sys
 import urllib.error
 import urllib.request
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import cap_pr_tpu_concurrency
 
@@ -81,18 +81,13 @@ class BuildContext:
     vllm_commit_override: str
     pr_tpu_concurrency_group_env: str
 
-    def __post_init__(self) -> None:
-        if self.is_pr:
-            conflicting = [label for label in _PR_SUITES if label in self.labels]
-            if len(conflicting) > 1:
-                raise BootstrapError(
-                    f"ERROR: PR labels {', '.join(conflicting)} are mutually "
-                    "exclusive; set at most one"
-                )
-
     @property
     def is_pr(self) -> bool:
         return self.pull_request is not None
+
+    @property
+    def is_post_merge(self) -> bool:
+        return not self.is_pr and self.branch == "main" and self.source == "webhook"
 
     @property
     def is_integration(self) -> bool:
@@ -109,52 +104,49 @@ class BuildContext:
         )
 
     @property
-    def skips_tpu(self) -> bool:
-        return "skip-tpu-ci" in self.labels
-
-    @property
-    def pr_suite_label(self) -> str | None:
-        if self.skips_tpu:
-            return "skip-tpu-ci"
-        if not self.is_pr:
-            return None
-        return next((label for label in _PR_SUITES if label in self.labels), None)
+    def suite_label(self) -> str | None:
+        allowed = tuple(_PR_SUITES) if self.is_pr else ("skip-tpu-ci",)
+        matches = [label for label in allowed if label in self.labels]
+        if len(matches) > 1:
+            joined = ", ".join(matches)
+            raise BootstrapError(
+                f"ERROR: PR labels {joined} are mutually exclusive. "
+                "Remove all but one of skip-tpu-ci / run-perf-eval / "
+                "run-full-ci in the **Labels** sidebar on the GitHub PR "
+                "page, then retry the **Bootstrap Pipeline** step."
+            )
+        return matches[0] if matches else None
 
     @classmethod
-    def from_env(
-        cls, env: Mapping[str, str], merged_labels: Sequence[str] = ()
-    ) -> BuildContext:
+    def from_env(cls, env: Mapping[str, str]) -> BuildContext:
         suite_override = env.get("CI_SUITE", "").strip()
         if env.get("CI_LANES", "").strip() and not suite_override:
             raise BootstrapError(
                 "ERROR: CI_LANES was removed; set CI_SUITE=<name> "
                 f"(suites: {' '.join(SUITES)})"
             )
-        if env.get("SKIP_TPU_CI", "").strip():
+        if _env_or(env, "SKIP_TPU_CI", "0").strip() != "0":
             raise BootstrapError(
                 "ERROR: SKIP_TPU_CI was removed; use the skip-tpu-ci PR label "
                 "(or 'bootstrap.py upload-stages build,cpu')"
             )
         pr_raw = _env_or(env, "BUILDKITE_PULL_REQUEST", "false")
         pull_request = None if pr_raw == "false" else pr_raw
-        branch = env.get("BUILDKITE_BRANCH", "")
-        source = env.get("BUILDKITE_SOURCE", "")
-        if pull_request is not None:
-            labels = _split_labels(env.get("BUILDKITE_PULL_REQUEST_LABELS", ""))
-        elif branch == "main" and source == "webhook":
-            labels = tuple(merged_labels)
-        else:
-            labels = ()
+        labels = (
+            _split_labels(env.get("BUILDKITE_PULL_REQUEST_LABELS", ""))
+            if pull_request is not None
+            else ()
+        )
         author = _env_or(
             env,
             "BUILDKITE_BUILD_AUTHOR_EMAIL",
             _env_or(env, "BUILDKITE_BUILD_CREATOR_EMAIL", ""),
         )
         return cls(
-            branch=branch,
+            branch=env.get("BUILDKITE_BRANCH", ""),
             commit=_env_or(env, "BUILDKITE_COMMIT", "HEAD"),
             message=env.get("BUILDKITE_MESSAGE", ""),
-            source=source,
+            source=env.get("BUILDKITE_SOURCE", ""),
             tag=env.get("BUILDKITE_TAG", ""),
             pipeline_slug=env.get("BUILDKITE_PIPELINE_SLUG", ""),
             pull_request=pull_request,
@@ -178,37 +170,41 @@ class Suite:
     name: str
     about: str
     stages: tuple[tuple[str, ...], ...]
+    nightly: bool = False
 
 
 _CPU_STAGE = ("build", "cpu")  # cpu steps wait on build_docker themselves
 _DEFAULT_TPU = ("tests", "integration", "verify")
 _FULL_TPU = ("tests", "integration", "perf", "verify")
-
-_FULL = Suite(
-    "full",
-    "Nightly schedule and release builds",
-    stages=((*_CPU_STAGE, *_FULL_TPU),),
-)
+_ALL_LANES = (*_CPU_STAGE, *_FULL_TPU)
 
 # Builds that don't wait for CPU: everything is one stage.
 SUITES: dict[str, Suite] = {
-    "default": Suite(
-        "default",
-        "main, torchtpu-nightly",
-        stages=((*_CPU_STAGE, *_DEFAULT_TPU),),
-    ),
-    "full": _FULL,
-    "perf": Suite(
-        "perf",
-        "Perf/eval schedule (CI_SUITE=perf)",
-        stages=(("build", "perf"),),
-    ),
-    "integration": Suite(
-        "integration",
-        "vllm-torchtpu-integration pipeline",
-        # pipeline_promote.yml's own `wait` holds it until the tests finish
-        stages=((*_FULL.stages[0], "promote"),),
-    ),
+    s.name: s
+    for s in (
+        Suite(
+            "default",
+            "CPU checks, TPU tests, integration, verify (no perf)",
+            stages=((*_CPU_STAGE, *_DEFAULT_TPU),),
+        ),
+        Suite(
+            "full",
+            "every lane, including perf (nightly and release builds)",
+            stages=(_ALL_LANES,),
+            nightly=True,
+        ),
+        Suite(
+            "perf",
+            "image build and perf/eval only",
+            stages=(("build", "perf"),),
+        ),
+        Suite(
+            "integration",
+            "full suite against vLLM HEAD, then LKG promotion",
+            # pipeline_promote.yml's own `wait` holds it until the tests finish
+            stages=((*_ALL_LANES, "promote"),),
+        ),
+    )
 }
 
 _PR_DEFAULT = Suite(
@@ -218,7 +214,7 @@ _PR_DEFAULT = Suite(
 )
 # Mutually exclusive PR suite labels (`ready` and `oncall-fix` are orthogonal).
 # `run-perf-eval` and `run-full-ci` share `_FULL_TPU`; `run-full-ci` also sets
-# `NIGHTLY=1` via `runs_nightly_steps(ctx)` to unlock nightly-gated steps.
+# `NIGHTLY=1` via `Suite.nightly` to unlock nightly-gated steps.
 _PR_SUITES: dict[str, Suite] = {
     "skip-tpu-ci": Suite(
         "pr+cpu-only",
@@ -234,19 +230,14 @@ _PR_SUITES: dict[str, Suite] = {
         "pr+nightly-suite",
         "PR: full nightly suite waits for the CPU checks",
         stages=(_CPU_STAGE, _FULL_TPU),
+        nightly=True,
     ),
 }
 
 
-def pr_suite(ctx: BuildContext) -> Suite:
-    """PR builds (and merged skip-tpu-ci): CPU checks, then optional TPU stage."""
-    if ctx.pr_suite_label is not None:
-        return _PR_SUITES[ctx.pr_suite_label]
-    return _PR_DEFAULT
-
-
 def choose_suite(ctx: BuildContext) -> Suite:
     """Return the `Suite` for `ctx`; `CI_SUITE` takes precedence."""
+    label = ctx.suite_label
     if ctx.suite_override:
         if ctx.suite_override not in SUITES:
             raise BootstrapError(
@@ -256,14 +247,11 @@ def choose_suite(ctx: BuildContext) -> Suite:
         return SUITES[ctx.suite_override]
     if ctx.is_integration:
         return SUITES["integration"]
-    if ctx.is_pr or ctx.skips_tpu:
-        return pr_suite(ctx)
+    if label is not None:
+        return _PR_SUITES[label]
+    if ctx.is_pr:
+        return _PR_DEFAULT
     return SUITES["full"] if ctx.nightly_env or ctx.is_release else SUITES["default"]
-
-
-def runs_nightly_steps(ctx: BuildContext) -> bool:
-    """Return True when `NIGHTLY=1` should be exported to unlock nightly steps."""
-    return ctx.nightly_env or ctx.is_release or ctx.pr_suite_label == "run-full-ci"
 
 
 # Build kind -> (Buildkite job priority, Kueue workload priority class).
@@ -580,7 +568,12 @@ def upload_stages(
     *,
     repo_root: pathlib.Path = _REPO_ROOT,
 ) -> int:
-    """Upload `stages[0]`'s lane files and, if more stages remain, `wait` + uploader."""
+    """Upload `stages[0]`'s lane files and, if more stages remain, `wait` + uploader.
+
+    The `wait` step gates `rest` on every step uploaded in `stages[0]` (including
+    both Docker image builds in `pipeline_build.yml`, such as `-omni`, and all
+    `pipeline_cpu.yml` checks).
+    """
     for stage in stages:
         for lane in stage:
             lane_file = f".buildkite/pipeline_{lane}.yml"
@@ -592,16 +585,14 @@ def upload_stages(
     nightly = _env_or(child_env, "NIGHTLY", "0") == "1"
     concurrency_group = child_env.get("PR_TPU_CONCURRENCY_GROUP") or None
 
+    # Buildkite inserts each `pipeline upload` right after the currently running
+    # step (LIFO), so upload `wait` + the next-stage uploader first and then
+    # `stages[0]` in reverse order so `stages[0]` runs before the `wait`.
     rest = stages[1:]
     if rest:
         step_env = {
             k: child_env[k]
-            for k in (
-                "JOB_PRIORITY",
-                "NIGHTLY",
-                "OMNI_IMAGE_SKIP",
-                "PR_TPU_CONCURRENCY_GROUP",
-            )
+            for k in ("JOB_PRIORITY", "NIGHTLY", "PR_TPU_CONCURRENCY_GROUP")
             if child_env.get(k)
         }
         stage_args = " ".join(",".join(s) for s in rest)
@@ -611,7 +602,13 @@ def upload_stages(
                 "wait",
                 {
                     "label": f":pipeline: Upload {', '.join(rest[0])}",
+                    "key": f"upload_stage_{len(rest)}",
                     "agents": {"queue": "cpu"},
+                    "timeout_in_minutes": 15,
+                    "retry": {
+                        "manual": {"permit_on_passed": False},
+                        "automatic": [{"exit_status": -1, "limit": 2}],
+                    },
                     "env": step_env,
                     "command": (
                         "python3 .buildkite/scripts/bootstrap.py "
@@ -653,16 +650,22 @@ def run_bootstrap(
 ) -> int:
     """Execute the full Buildkite bootstrap flow and return an exit status."""
     child_env = dict(os.environ if env is None else env)
-    merged_labels: tuple[str, ...] = ()
-    if (
-        _env_or(child_env, "BUILDKITE_PULL_REQUEST", "false") == "false"
-        and child_env.get("BUILDKITE_BRANCH") == "main"
-        and child_env.get("BUILDKITE_SOURCE") == "webhook"
-    ):
-        pr_num = parse_merged_pr_number(child_env.get("BUILDKITE_MESSAGE", ""))
-        if pr_num is not None:
-            merged_labels = _github_labels(pr_num, env=child_env)
-    ctx = BuildContext.from_env(child_env, merged_labels=merged_labels)
+    ctx = BuildContext.from_env(child_env)
+    if ctx.is_post_merge and (pr := parse_merged_pr_number(ctx.message)):
+        ctx = replace(ctx, labels=_github_labels(pr, env=child_env))
+    try:
+        _ = ctx.suite_label
+    except BootstrapError as exc:
+        _agent(
+            "annotate",
+            "--style",
+            "error",
+            "--context",
+            "ci-labels",
+            str(exc),
+            env=child_env,
+        )
+        raise
 
     # 1. Kind and priority (metadata).
     print("--- Determining job priority", file=sys.stderr)
@@ -722,7 +725,7 @@ def run_bootstrap(
 
     # 4. Suite selection, NIGHTLY policy, and annotation.
     suite = choose_suite(ctx)
-    nightly = runs_nightly_steps(ctx)
+    nightly = ctx.nightly_env or suite.nightly
     nightly_tag = " [NIGHTLY=1]" if nightly else ""
     suite_note = f"CI suite: {suite.name}{nightly_tag}: {suite.about}"
     print(suite_note)
@@ -814,6 +817,9 @@ def run_bootstrap_dev(
     return 0
 
 
+_USAGE = "Usage: bootstrap.py [dev | vllm-pin | upload-stages <stage> [<stage> ...]]"
+
+
 def main(argv: Sequence[str] | None = None) -> None:
     if isinstance(sys.stdout, io.TextIOWrapper):
         sys.stdout.reconfigure(line_buffering=True)
@@ -832,16 +838,10 @@ def main(argv: Sequence[str] | None = None) -> None:
         elif args[:1] == ["upload-stages"]:
             stages = tuple(_split_labels(arg) for arg in args[1:])
             if not stages or not all(stages):
-                raise BootstrapError(
-                    "Usage: bootstrap.py "
-                    "[dev | vllm-pin | upload-stages <stage> [<stage> ...]]"
-                )
+                raise BootstrapError(_USAGE)
             rc = upload_stages(stages)
         else:
-            raise BootstrapError(
-                "Usage: bootstrap.py "
-                "[dev | vllm-pin | upload-stages <stage> [<stage> ...]]"
-            )
+            raise BootstrapError(_USAGE)
     except BootstrapError as exc:
         print(str(exc), file=sys.stderr)
         sys.exit(1)

@@ -44,7 +44,6 @@ x-tests-plugin-defaults: &tests_plugin_defaults
 
 steps:
   - group: "CPU Checks"
-    key: "cpu_checks"
     steps:
       # pyrefly in the CI image against .pyrefly-baseline-full.json.
       # The pod already runs that image, but typecheck_full.sh decides it is
@@ -73,7 +72,6 @@ steps:
           - *kube_plugin
           - tests#v1.0.0:
               <<: *tests_plugin_defaults
-              test-file-pattern: "tests/**/{test_*,*_test}.py"
               test-cmd: "pytest -sv --timeout=600 -m 'not tpu_test and not multichip and not nightly' --junit-xml={{resultPath}} {{testExamples}}"
 
       - label: "Unit Tests - CPU (Nightly)"
@@ -84,6 +82,5 @@ steps:
           - *kube_plugin
           - tests#v1.0.0:
               <<: *tests_plugin_defaults
-              test-file-pattern: "tests/**/{test_*,*_test}.py"
               fail-on-no-tests: true
               test-cmd: "pytest -sv --timeout=600 -m 'not tpu_test and not multichip' --junit-xml={{resultPath}} {{testExamples}}"
