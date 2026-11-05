@@ -128,12 +128,48 @@ def topp_mask(logits: jax.Array, p: jax.Array) -> jax.Array:
     return jnp.where(probs >= threshold, logits, replace)
 
 
-def apply_top_k_top_p(logits, top_k, top_p):
-    """``top_k_top_p.apply_top_k_top_p``; also returns the top-k cutoff."""
-    cutoff = topk_cutoff(logits, top_k)
+def topk_cutoff_pairwise(logits: jax.Array, k: jax.Array) -> jax.Array:
+    """``topk_cutoff`` of a short row from all pairwise comparisons: the
+    largest value with at least k values at or above it."""
+    x = logits.astype(jnp.float32)
+    at_or_above = _sum((x[..., None, :] >= x[..., :, None]).astype(jnp.int32))
+    return jnp.max(jnp.where(at_or_above >= k, x, -jnp.inf), axis=-1)
+
+
+def topp_mask_pairwise(logits: jax.Array, p: jax.Array):
+    """``topp_mask`` of a short row in one pass, and whether some threshold
+    keeps mass p (else the bisection's threshold is not a value of the row).
+
+    The bisection's predicate at any threshold equals its predicate at the
+    smallest value of the row at or above it (same masked row, same sum), so
+    its threshold is the largest value of the row whose mass at or above it
+    is not below p; every value's mass is one masked sum here.
+    """
+    probs = softmax(logits)
+    zero = jnp.zeros_like(probs)
+    kept = probs[..., None, :] >= probs[..., :, None]
+    mass = _sum(jnp.where(kept, probs[..., None, :], zero[..., None, :]))
+    ok = ~(mass < p)
+    threshold = jnp.max(jnp.where(ok, probs, -jnp.inf), axis=-1, keepdims=True)
+    replace = jnp.full_like(logits, MASKED_LOGIT_VALUE)
+    return jnp.where(probs >= threshold, logits, replace), jnp.any(ok, axis=-1)
+
+
+def apply_top_k_top_p(logits, top_k, top_p, pairwise=False):
+    """``top_k_top_p.apply_top_k_top_p``; also returns the top-k cutoff and
+    whether the top-p threshold is a value of the row (always with
+    ``pairwise=False``). ``pairwise`` = one-pass searches for short rows."""
+    if pairwise:
+        cutoff = topk_cutoff_pairwise(logits, top_k)
+    else:
+        cutoff = topk_cutoff(logits, top_k)
     masked = jnp.where(top_k > 0, topk_mask(logits, cutoff), logits)
-    masked = jnp.where(top_p < 1.0, topp_mask(masked, top_p), masked)
-    return masked, cutoff
+    if pairwise:
+        topp_masked, topp_ok = topp_mask_pairwise(masked, top_p)
+    else:
+        topp_masked, topp_ok = topp_mask(masked, top_p), True
+    masked = jnp.where(top_p < 1.0, topp_masked, masked)
+    return masked, cutoff, (top_p[..., 0] >= 1.0) | topp_ok
 
 
 def _clamp_uniform(u: jax.Array) -> jax.Array:
@@ -159,18 +195,21 @@ def _target_scale(x, temps):
     return x.astype(jnp.float32) / (temps.astype(jnp.float32) + TEMPERATURE_EPS)
 
 
-def sample_bonus(vals, ids, greedy, temps, top_k, top_p, u):
+def sample_bonus(vals, ids, greedy, temps, top_k, top_p, u, pairwise=False):
     """``TPUModelRunner.sample_from_logits(all_greedy=False)`` over (vals, ids).
 
     vals: [B, W] logits, ids: [B, W] their token ids, greedy: [B] first argmax
     of the full rows, temps (logits dtype) / top_k / top_p: [B, 1], u: [B, W]
-    uniforms. Returns the token ids [B] and the top-k cutoffs [B].
+    uniforms. Returns the token ids [B], the top-k cutoffs [B] and whether
+    each row's top-p threshold is one of its values [B].
     """
     is_greedy = temps <= SAMPLING_EPS
-    masked, cutoff = apply_top_k_top_p(_bonus_scale(vals, temps), top_k, top_p)
+    masked, cutoff, topp_ok = apply_top_k_top_p(
+        _bonus_scale(vals, temps), top_k, top_p, pairwise
+    )
     noisy = masked + -jnp.log(-jnp.log(_clamp_uniform(u)))
     sampled = argmax_lowest_id(jnp.where(is_greedy, vals, noisy), ids)
-    return jnp.where(is_greedy[:, 0], greedy, sampled), cutoff
+    return jnp.where(is_greedy[:, 0], greedy, sampled), cutoff, topp_ok
 
 
 def verify_targets(
@@ -185,17 +224,21 @@ def verify_targets(
     recover_u,
     rates,
     synthetic,
+    pairwise=False,
 ):
     """The per-slot decisions of ``_random_rejection_sample_with_segment``.
 
     vals / ids / recover_u: [T, W]; greedy, draft, accept_u, rates: [T];
     temps / top_k / top_p: [T, 1]. Returns accepted [T] bool, the recovered
-    token ids [T] and the top-k cutoffs [T].
+    token ids [T], the top-k cutoffs [T] and whether each row's top-p
+    threshold is one of its values [T].
     """
     valid = draft >= 0
     safe_draft = jnp.maximum(draft, 0)
     is_greedy = temps[:, 0] == 0
-    masked, cutoff = apply_top_k_top_p(_target_scale(vals, temps), top_k, top_p)
+    masked, cutoff, topp_ok = apply_top_k_top_p(
+        _target_scale(vals, temps), top_k, top_p, pairwise
+    )
     probs = softmax(masked)
     is_draft = ids == safe_draft[:, None]
     draft_prob = jnp.sum(jnp.where(is_draft, probs, 0.0), axis=-1)
@@ -210,17 +253,18 @@ def verify_targets(
     recovered = argmax_lowest_id(recovered_dist / (exp_noise + tiny), ids)
     has_mass = jnp.any(recovered_dist > 0, axis=-1)
     recovered = jnp.where(has_mass, recovered, argmax_lowest_id(probs, ids))
-    return accepted, jnp.where(is_greedy, greedy, recovered), cutoff
+    return accepted, jnp.where(is_greedy, greedy, recovered), cutoff, topp_ok
 
 
-def rows_exact(scaled_boundary, is_greedy, top_k, cutoff):
+def rows_exact(scaled_boundary, is_greedy, top_k, cutoff, topp_ok=True):
     """Whether the candidates hold every token the row's top-k keeps.
 
     scaled_boundary: [R, tp] each shard's smallest candidate after the row's
-    temperature scaling; cutoff: [R] the top-k cutoff over the candidates.
+    temperature scaling; cutoff: [R] the top-k cutoff over the candidates;
+    topp_ok: [R] whether the top-p threshold is a value of the row.
     """
     below = jnp.all(scaled_boundary < cutoff[:, None], axis=-1)
-    return is_greedy | ((top_k[:, 0] > 0) & below)
+    return is_greedy | ((top_k[:, 0] > 0) & below & topp_ok)
 
 
 _LANES = 128
@@ -382,8 +426,10 @@ def verify_local(
 
     (vb, vt), (ib, it) = split(c_vals), split(c_ids)
     (bb, bt), (greedy_b, greedy_t) = split(c_bound), split(greedy)
-    bonus, cut_b = sample_bonus(vb, ib, greedy_b, temps_b, top_k_b, top_p_b, bonus_u)
-    accepted, recovered, cut_t = verify_targets(
+    bonus, cut_b, ok_b = sample_bonus(
+        vb, ib, greedy_b, temps_b, top_k_b, top_p_b, bonus_u, pairwise=True
+    )
+    accepted, recovered, cut_t, ok_t = verify_targets(
         vt,
         it,
         greedy_t,
@@ -395,11 +441,14 @@ def verify_local(
         recover_u,
         rates,
         synthetic,
+        pairwise=True,
     )
     exact_b = rows_exact(
-        _bonus_scale(bb, temps_b), temps_b[:, 0] <= SAMPLING_EPS, top_k_b, cut_b
+        _bonus_scale(bb, temps_b), temps_b[:, 0] <= SAMPLING_EPS, top_k_b, cut_b, ok_b
     )
-    exact_t = rows_exact(_target_scale(bt, temps_t), temps_t[:, 0] == 0, top_k_t, cut_t)
+    exact_t = rows_exact(
+        _target_scale(bt, temps_t), temps_t[:, 0] == 0, top_k_t, cut_t, ok_t
+    )
     exact = jnp.all(exact_b) & jnp.all(exact_t)
     if force_full:
         exact = jnp.zeros_like(exact)
@@ -417,10 +466,10 @@ def verify_local(
             u_b, u_r = full_vocab_uniforms(
                 seed, num_bonus, rows_t.shape[0], vocab_size, bonus_u.dtype
             )
-        f_bonus, _ = sample_bonus(
+        f_bonus, _, _ = sample_bonus(
             rows_b, full_ids, greedy_b, temps_b, top_k_b, top_p_b, u_b
         )
-        f_acc, f_rec, _ = verify_targets(
+        f_acc, f_rec, _, _ = verify_targets(
             rows_t,
             full_ids,
             greedy_t,
