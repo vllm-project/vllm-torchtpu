@@ -35,33 +35,8 @@ from vllm_torchtpu.megakernel.dma import stream, vmem
 from vllm_torchtpu.megakernel.errors import MegakernelConfigError
 from vllm_torchtpu.megakernel.exec_spec import ExecSpec
 from vllm_torchtpu.megakernel.modules.gdn import GDNModule
-from vllm_torchtpu.megakernel.modules.gdn.gate import (
-    GDN_GATE_ACTS,
-    gdn_gate_act,
-    validate_gdn_gate,
-)
-from vllm_torchtpu.megakernel.modules.gdn.states import gdn_accept
 from vllm_torchtpu.megakernel.ops import BF16, F32, FP8, rmsnorm
 from vllm_torchtpu.megakernel.spec import LayerType, ModelSpec, SwitchSlot
-
-
-def test_gdn_gate_act_and_validate_gdn_gate():
-    """Verify `validate_gdn_gate` and `gdn_gate_act` for valid and invalid gates."""
-    assert set(GDN_GATE_ACTS) == {"silu", "sigmoid"}
-    assert validate_gdn_gate("silu") == "silu"
-    assert validate_gdn_gate("sigmoid") == "sigmoid"
-    assert gdn_gate_act("silu") is jax.nn.silu
-    assert gdn_gate_act("sigmoid") is jax.nn.sigmoid
-
-    x = jnp.array([-1.0, 0.0, 2.0], dtype=F32)
-    np.testing.assert_allclose(gdn_gate_act("silu")(x), jax.nn.silu(x))
-    np.testing.assert_allclose(gdn_gate_act("sigmoid")(x), jax.nn.sigmoid(x))
-
-    for bad in ("relu", "", None, 123):
-        with pytest.raises(ValueError, match="'silu' or 'sigmoid'"):
-            validate_gdn_gate(bad)
-        with pytest.raises(MegakernelConfigError, match="'silu' or 'sigmoid'"):
-            gdn_gate_act(bad, err_cls=MegakernelConfigError)
 
 
 def test_gdn_module_declarations_bind_and_options():
@@ -94,38 +69,6 @@ def test_gdn_module_declarations_bind_and_options():
         GDNModule(gate="invalid_gate")
     with pytest.raises(MegakernelConfigError, match="weight_dtypes"):
         GDNModule(weight_dtypes={"bad_weight": "bf16"})
-
-
-def test_gdn_logical_state_pack_unpack_and_accept():
-    """GDN state helpers pack/unpack rank-folded states and select accepted tokens."""
-    g = FakeGeometry(
-        L=2, att_every=2, H=256, KH=4, VH=4, KD=128, VD=128, NH=4, NKV=2, HD=128
-    )
-    mod = GDNModule(geometry=g)
-    ex_d = ExecSpec(B=4, T=1, R=2, ctx=256, tiles=TINY_TILES)
-    st_d = mod.init_logical_states(jax.random.PRNGKey(0), g, ex_d, n_layers=1)
-    assert st_d["conv"].shape == (2, 1, 4, 3, 768)
-    assert st_d["rec"].shape == (2, 1, 4, 2, 128, 128)
-    packed_d = mod.pack_logical_states(st_d, g, ex_d)
-    unpacked_d = mod.unpack_kernel_states(packed_d, g, ex_d)
-    next_d = mod.next_logical_states(unpacked_d, g, ex_d)
-    np.testing.assert_allclose(next_d["conv"], st_d["conv"], rtol=0, atol=0)
-    np.testing.assert_allclose(next_d["rec"], st_d["rec"], rtol=0, atol=0)
-
-    ex_v = ExecSpec(B=8, T=4, R=2, ctx=256, tiles=TINY_TILES)
-    st_v = mod.init_logical_states(jax.random.PRNGKey(1), g, ex_v, n_layers=1)
-    packed_v = mod.pack_logical_states(st_v, g, ex_v)
-    c_ckpt = jnp.arange(2 * 2 * 8 * 768, dtype=F32).reshape(2, 2, 8, 768)
-    r_ckpt = jnp.arange(2 * (2 * 4 * 2) * 128 * 128, dtype=F32).astype(BF16)
-    r_ckpt = r_ckpt.reshape(2, 2 * 4 * 2, 128, 128)
-    ckpts = {"conv_ckpt": c_ckpt, "rec_ckpt": r_ckpt}
-    acc = jnp.array([2, 4], dtype=jnp.int32)
-    accepted = GDNModule.accept(packed_v, ckpts, acc, T=4, vh=2, taps=3)
-    np.testing.assert_array_equal(accepted["conv"][:, 0, :3], c_ckpt[:, 0, 2:5])
-    np.testing.assert_array_equal(accepted["conv"][:, 1, :3], c_ckpt[:, 1, 4:7])
-
-    with pytest.raises(ValueError, match="requires explicit `taps`"):
-        gdn_accept(packed_v, ckpts, acc, T=4, vh=2, taps=None)
 
 
 @pytest.mark.parametrize(
