@@ -611,6 +611,61 @@
       "concise_description": "Cannot unpack tuple[Unknown, tuple[Unknown, Unknown, Unknown, Unknown]] | tuple[Unknown, Unknown, tuple[Unknown, Unknown, Unknown, Unknown]] (of size 3) into 2 values"
     },
     {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/prefill_megakernel.py",
+      "name": "bad-argument-type",
+      "concise_description": "Argument `int | None` is not assignable to parameter `step` with type `SupportsIndex` in function `range.__new__`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/prefill_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "`+` is not supported between `int` and `None`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/prefill_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "`//` is not supported between `int` and `None`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/prefill_megakernel.py",
+      "name": "bad-assignment",
+      "concise_description": "`FusedWeightsRef` is not assignable to variable `rhs_ref` with type `WeightsRef`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/prefill_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "`%` is not supported between `int` and `None`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/prefill_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "`%` is not supported between `None` and `int`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/prefill_megakernel.py",
+      "name": "bad-argument-type",
+      "concise_description": "Argument `int | None` is not assignable to parameter with type `int`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/prefill_megakernel.py",
+      "name": "unbound-name",
+      "concise_description": "`layer_ref` may be uninitialized"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/prefill_megakernel.py",
+      "name": "unbound-name",
+      "concise_description": "`prefix_k_hbm` may be uninitialized"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/prefill_megakernel.py",
+      "name": "unbound-name",
+      "concise_description": "`prefix_v_hbm` may be uninitialized"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/prefill_megakernel.py",
+      "name": "bad-unpacking",
+      "concise_description": "Cannot unpack tuple[Unknown, Unknown, Unknown, Unknown] | tuple[Unknown, Unknown, Unknown, Unknown, Unknown] (of size 4) into 5 values"
+    },
+    {
       "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/runtime_shim/backend.py",
       "name": "missing-module-attribute",
       "concise_description": "Could not import `program` from `vllm_torchtpu.models.kimi_k3.megakernel`"

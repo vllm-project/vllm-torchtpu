@@ -3476,6 +3476,271 @@
       "concise_description": "Cannot unpack tuple[Array, tuple[Any, Any, Any, Any]] | tuple[Array, Any, tuple[Any, Any, Any, Any]] (of size 3) into 2 values"
     },
     {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/prefill_megakernel.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of class `AbstractValue` has no attribute `memory_space`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/prefill_megakernel.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of class `AbstractValue` has no attribute `shape`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/prefill_megakernel.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of class `AbstractValue` has no attribute `dtype`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/prefill_megakernel.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of class `AbstractValue` has no attribute `sharding`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/prefill_megakernel.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of class `Ref` has no attribute `bitcast`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/prefill_megakernel.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of class `Ref` has no attribute `bitcast`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/prefill_megakernel.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of class `Ref` has no attribute `bitcast`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/prefill_megakernel.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of class `Ref` has no attribute `bitcast`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/prefill_megakernel.py",
+      "name": "bad-argument-type",
+      "concise_description": "Argument `Ref` is not assignable to parameter `ref` with type `AbstractRef | TransformedRef` in function `jax._src.pallas.mosaic.sc_primitives.addupdate_scatter`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/prefill_megakernel.py",
+      "name": "bad-argument-type",
+      "concise_description": "Argument `Ref` is not assignable to parameter `ref` with type `AbstractRef | TransformedRef` in function `jax._src.pallas.mosaic.sc_primitives.addupdate_scatter`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/prefill_megakernel.py",
+      "name": "no-matching-overload",
+      "concise_description": "No matching overload found for function `jax._src.pallas.utils.cdiv` called with arguments: (int, int | None)"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/prefill_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "`//` is not supported between `Array` and `None`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/prefill_megakernel.py",
+      "name": "bad-argument-type",
+      "concise_description": "Argument `int | None` is not assignable to parameter `step` with type `SupportsIndex` in function `range.__new__`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/prefill_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "`+` is not supported between `int` and `None`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/prefill_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "`//` is not supported between `int` and `None`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/prefill_megakernel.py",
+      "name": "bad-assignment",
+      "concise_description": "`FusedWeightsRef` is not assignable to variable `rhs_ref` with type `WeightsRef`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/prefill_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "`%` is not supported between `int` and `None`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/prefill_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "`%` is not supported between `None` and `int`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/prefill_megakernel.py",
+      "name": "no-matching-overload",
+      "concise_description": "No matching overload found for function `jax._src.pallas.utils.cdiv` called with arguments: (int, int | None)"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/prefill_megakernel.py",
+      "name": "bad-argument-type",
+      "concise_description": "Argument `int | None` is not assignable to parameter with type `int`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/prefill_megakernel.py",
+      "name": "bad-argument-type",
+      "concise_description": "Argument `Array | ShapeDtypeStruct` is not assignable to parameter `rhs` with type `Array` in function `make_gmm_configs`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/prefill_megakernel.py",
+      "name": "bad-argument-type",
+      "concise_description": "Argument `Array | ShapeDtypeStruct | None` is not assignable to parameter `rhs_scale` with type `Array | None` in function `make_gmm_configs`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/prefill_megakernel.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of class `NoneType` has no attribute `shape`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/prefill_megakernel.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of class `NoneType` has no attribute `dtype`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/prefill_megakernel.py",
+      "name": "bad-argument-type",
+      "concise_description": "Argument `MemoryRef` is not assignable to parameter `gm_id_to_group_id` with type `Array` in function `MetadataRef.__init__`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/prefill_megakernel.py",
+      "name": "bad-argument-type",
+      "concise_description": "Argument `MemoryRef` is not assignable to parameter `gm_id_to_m_offset` with type `Array` in function `MetadataRef.__init__`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/prefill_megakernel.py",
+      "name": "bad-argument-type",
+      "concise_description": "Argument `list[MemoryRef | MetadataRef]` is not assignable to parameter `scratch_shapes` with type `Mapping[str, ScratchShape | ScratchShapeTree] | Sequence[ScratchShape | ScratchShapeTree | None]` in function `jax._src.pallas.mosaic.core.PrefetchScalarGridSpec.__init__`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/prefill_megakernel.py",
+      "name": "bad-argument-type",
+      "concise_description": "Argument `dict[str, float | int | str]` is not assignable to parameter `metadata` with type `dict[str, str] | None` in function `jax._src.pallas.pallas_call.pallas_call`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/prefill_megakernel.py",
+      "name": "unbound-name",
+      "concise_description": "`layer_ref` may be uninitialized"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/prefill_megakernel.py",
+      "name": "unbound-name",
+      "concise_description": "`prefix_k_hbm` may be uninitialized"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/prefill_megakernel.py",
+      "name": "unbound-name",
+      "concise_description": "`prefix_v_hbm` may be uninitialized"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/prefill_megakernel.py",
+      "name": "bad-unpacking",
+      "concise_description": "Cannot unpack tuple[Array | Unknown, Array, Array, Array] | tuple[Array | Unknown, Array, Array, Array, Array] (of size 4) into 5 values"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/prefill_moe/fused.py",
+      "name": "bad-argument-type",
+      "concise_description": "Argument `ShapeDtypeStruct` is not assignable to parameter `lhs` with type `Array` in function `vllm_torchtpu.models.kimi_k3.megakernel.kernels.prefill_megakernel.make_gmm_configs`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/prefill_moe/fused.py",
+      "name": "bad-argument-type",
+      "concise_description": "Argument `ShapeDtypeStruct` is not assignable to parameter `rhs` with type `Array` in function `vllm_torchtpu.models.kimi_k3.megakernel.kernels.prefill_megakernel.make_gmm_configs`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/prefill_moe/fused.py",
+      "name": "bad-argument-type",
+      "concise_description": "Argument `ShapeDtypeStruct` is not assignable to parameter `rhs_scale` with type `Array | None` in function `vllm_torchtpu.models.kimi_k3.megakernel.kernels.prefill_megakernel.make_gmm_configs`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/prefill_moe/fused.py",
+      "name": "bad-argument-type",
+      "concise_description": "Argument `ShapeDtypeStruct` is not assignable to parameter `lhs` with type `Array` in function `vllm_torchtpu.models.kimi_k3.megakernel.kernels.prefill_megakernel.make_gmm_configs`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/prefill_moe/fused.py",
+      "name": "bad-argument-type",
+      "concise_description": "Argument `ShapeDtypeStruct` is not assignable to parameter `rhs` with type `Array` in function `vllm_torchtpu.models.kimi_k3.megakernel.kernels.prefill_megakernel.make_gmm_configs`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/prefill_moe/fused.py",
+      "name": "bad-argument-type",
+      "concise_description": "Argument `ShapeDtypeStruct` is not assignable to parameter `rhs_scale` with type `Array | None` in function `vllm_torchtpu.models.kimi_k3.megakernel.kernels.prefill_megakernel.make_gmm_configs`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/prefill_moe/fused.py",
+      "name": "bad-argument-type",
+      "concise_description": "Argument `MemoryRef` is not assignable to parameter `gm_id_to_group_id` with type `Array` in function `vllm_torchtpu.models.kimi_k3.megakernel.kernels.prefill_megakernel.MetadataRef.__init__`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/prefill_moe/fused.py",
+      "name": "bad-argument-type",
+      "concise_description": "Argument `MemoryRef` is not assignable to parameter `gm_id_to_m_offset` with type `Array` in function `vllm_torchtpu.models.kimi_k3.megakernel.kernels.prefill_megakernel.MetadataRef.__init__`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/prefill_moe/indexed_ragged_gmm.py",
+      "name": "bad-argument-type",
+      "concise_description": "Argument `ShapeDtypeStruct` is not assignable to parameter `lhs` with type `Array` in function `vllm_torchtpu.models.kimi_k3.megakernel.kernels.prefill_megakernel.make_gmm_configs`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/prefill_moe/indexed_ragged_gmm.py",
+      "name": "bad-argument-type",
+      "concise_description": "Argument `ShapeDtypeStruct` is not assignable to parameter `rhs` with type `Array` in function `vllm_torchtpu.models.kimi_k3.megakernel.kernels.prefill_megakernel.make_gmm_configs`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/prefill_moe/indexed_ragged_gmm.py",
+      "name": "bad-argument-type",
+      "concise_description": "Argument `ShapeDtypeStruct` is not assignable to parameter `rhs_scale` with type `Array | None` in function `vllm_torchtpu.models.kimi_k3.megakernel.kernels.prefill_megakernel.make_gmm_configs`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/prefill_moe/indexed_ragged_gmm.py",
+      "name": "bad-argument-type",
+      "concise_description": "Argument `_PackedRows` is not assignable to parameter `tiled_lhs_ref` with type `Array` in function `vllm_torchtpu.models.kimi_k3.megakernel.kernels.prefill_megakernel.inner_kernel`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/prefill_moe/indexed_ragged_gmm.py",
+      "name": "bad-argument-type",
+      "concise_description": "Argument `tuple[MemoryRef, MemoryRef, MetadataRef, MemoryRef, MemoryRef]` is not assignable to parameter `scratch_shapes` with type `Mapping[str, ScratchShape | ScratchShapeTree] | Sequence[ScratchShape | ScratchShapeTree | None]` in function `jax._src.pallas.mosaic.core.PrefetchScalarGridSpec.__init__`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/prefill_moe/indexed_ragged_gmm.py",
+      "name": "bad-argument-type",
+      "concise_description": "Argument `MemoryRef` is not assignable to parameter `gm_id_to_group_id` with type `Array` in function `vllm_torchtpu.models.kimi_k3.megakernel.kernels.prefill_megakernel.MetadataRef.__init__`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/prefill_moe/indexed_ragged_gmm.py",
+      "name": "bad-argument-type",
+      "concise_description": "Argument `MemoryRef` is not assignable to parameter `gm_id_to_m_offset` with type `Array` in function `vllm_torchtpu.models.kimi_k3.megakernel.kernels.prefill_megakernel.MetadataRef.__init__`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/prefill_moe/moe_down_valu.py",
+      "name": "bad-argument-type",
+      "concise_description": "Argument `ShapeDtypeStruct` is not assignable to parameter `lhs` with type `Array` in function `vllm_torchtpu.models.kimi_k3.megakernel.kernels.prefill_megakernel.make_gmm_configs`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/prefill_moe/moe_down_valu.py",
+      "name": "bad-argument-type",
+      "concise_description": "Argument `ShapeDtypeStruct` is not assignable to parameter `rhs` with type `Array` in function `vllm_torchtpu.models.kimi_k3.megakernel.kernels.prefill_megakernel.make_gmm_configs`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/prefill_moe/moe_down_valu.py",
+      "name": "bad-argument-type",
+      "concise_description": "Argument `ShapeDtypeStruct` is not assignable to parameter `rhs_scale` with type `Array | None` in function `vllm_torchtpu.models.kimi_k3.megakernel.kernels.prefill_megakernel.make_gmm_configs`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/prefill_moe/moe_down_valu.py",
+      "name": "bad-argument-type",
+      "concise_description": "Argument `tuple[None, MemoryRef, MetadataRef, MemoryRef, MemoryRef, MemoryRef, MemoryRef, MemoryRef, MemoryRef, Literal[SemaphoreType.DMA], MemoryRef, MemoryRef, MemoryRef, MemoryRef, MemoryRef | None, MemoryRef | None, Literal[SemaphoreType.DMA] | None, MemoryRef | None]` is not assignable to parameter `scratch_shapes` with type `Mapping[str, ScratchShape | ScratchShapeTree] | Sequence[ScratchShape | ScratchShapeTree | None]` in function `jax._src.pallas.mosaic.core.PrefetchScalarGridSpec.__init__`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/prefill_moe/moe_down_valu.py",
+      "name": "bad-argument-type",
+      "concise_description": "Argument `MemoryRef` is not assignable to parameter `gm_id_to_group_id` with type `Array` in function `vllm_torchtpu.models.kimi_k3.megakernel.kernels.prefill_megakernel.MetadataRef.__init__`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/prefill_moe/moe_down_valu.py",
+      "name": "bad-argument-type",
+      "concise_description": "Argument `MemoryRef` is not assignable to parameter `gm_id_to_m_offset` with type `Array` in function `vllm_torchtpu.models.kimi_k3.megakernel.kernels.prefill_megakernel.MetadataRef.__init__`"
+    },
+    {
       "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/runtime_shim/backend.py",
       "name": "missing-module-attribute",
       "concise_description": "Could not import `program` from `vllm_torchtpu.models.kimi_k3.megakernel`"
