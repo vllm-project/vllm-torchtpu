@@ -9,6 +9,7 @@ from typing import Any, ClassVar
 
 import jax
 import torch
+from jax.experimental.pallas import tpu as pltpu
 from jax.sharding import PartitionSpec as P
 from torch_tpu._internal import pallas
 from vllm.config import (
@@ -503,8 +504,11 @@ def _pallas_rpa_kernel_batched(
     `PallasBatchedRPAAttentionBackendImpl`. max_model_len, if set, bounds the
     block-table columns passed to the kernel."""
     rpa_func = (
-        functools.partial(
-            ragged_paged_attention_batched, decode_query_size=decode_query_size
+        _with_verify_block_override(
+            functools.partial(
+                ragged_paged_attention_batched, decode_query_size=decode_query_size
+            ),
+            decode_query_size,
         )
         if decode_query_size > 1
         else _with_decode_block_override(ragged_paged_attention_batched)
@@ -593,6 +597,97 @@ def _with_decode_block_override(rpa_func):
             bq_sz=1, bq_c_sz=1, bkv_sz=bkv, batch_size=batch, n_buffer=buffers
         ),
     )
+
+
+def _with_verify_block_override(rpa_func, decode_query_size: int):
+    """Bind TPU_BATCHED_RPA_VERIFY_BLOCK as the verify-window decode block, if set.
+
+    The kernel's default block splits a verify window into query chunks and
+    pushes every KV block through the MXU once per chunk. The override
+    computes the whole window per KV block in one pass. Query rows are
+    independent, so with the kernel's own KV block ("window") the outputs are
+    bit-identical; an explicit "bkv,batch,buffers" also changes the KV block.
+    """
+    block = envs.TPU_BATCHED_RPA_VERIFY_BLOCK
+    if block is None:
+        return rpa_func
+    if isinstance(block, tuple):
+        bkv, batch, buffers = block
+        logger.info_once(
+            "Batched RPA verify block: bkv %d, batch %d, %d buffers, %d queries "
+            "per chunk",
+            bkv,
+            batch,
+            buffers,
+            decode_query_size,
+        )
+        return functools.partial(
+            rpa_func,
+            decode_block_sizes=batched_rpa_configs.BlockSizes(
+                bq_sz=decode_query_size,
+                bq_c_sz=decode_query_size,
+                bkv_sz=bkv,
+                batch_size=batch,
+                n_buffer=buffers,
+            ),
+        )
+
+    def call(queries, keys, values, kv_cache, kv_lens, page_indices, *args, **kwargs):
+        layout = kwargs.get(
+            "kv_layout", batched_rpa_configs.KVLayout.HEAD_ALONG_SUBLANE
+        )
+        if layout == batched_rpa_configs.KVLayout.SEQ_ALONG_LANE:
+            page_size = kv_cache.shape[4]
+        else:
+            page_size = kv_cache.shape[1]
+        # The inputs of the kernel's own decode block choice
+        # (rpa_batched_wrapper.calculate_block_sizes) for this call.
+        model_cfgs = batched_rpa_configs.ModelConfigs(
+            num_q_heads=queries.shape[1],
+            num_kv_heads=keys.shape[1],
+            head_dim=queries.shape[2],
+            mask_value=0.0,
+        )
+        serve_cfgs = batched_rpa_configs.ServingConfigs(
+            num_seqs=kv_lens.shape[0],
+            page_size=page_size,
+            total_q_tokens=queries.shape[0],
+            num_page_indices=page_indices.shape[0],
+            dtype_q=queries.dtype,
+            dtype_kv=kv_cache.dtype,
+            dtype_out=kwargs.get("out_dtype") or queries.dtype,
+            kv_layout=layout,
+            decode_query_size=decode_query_size,
+        )
+        default, _ = rpa_batched_wrapper.calculate_block_sizes(
+            model_cfgs,
+            serve_cfgs,
+            kwargs.get("vmem_limit_bytes") or pltpu.get_tpu_info().vmem_capacity_bytes,
+            decode_query_size=decode_query_size,
+        )
+        block_sizes = dataclasses.replace(default, bq_c_sz=default.bq_sz)
+        logger.info_once(
+            "Batched RPA verify block: kernel default bkv %d, batch %d, %d buffers, "
+            "%d queries per chunk instead of %d",
+            default.bkv_sz,
+            default.batch_size,
+            default.n_buffer,
+            block_sizes.bq_c_sz,
+            default.bq_c_sz,
+        )
+        return rpa_func(
+            queries,
+            keys,
+            values,
+            kv_cache,
+            kv_lens,
+            page_indices,
+            *args,
+            decode_block_sizes=block_sizes,
+            **kwargs,
+        )
+
+    return call
 
 
 # ======================================================================================
