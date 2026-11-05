@@ -40,7 +40,10 @@ export TPU_HOST_BOUNDS=1,1,1
 export XLA_PYTHON_CLIENT_PREALLOCATE=false
 export VLLM_XLA_CHECK_RECOMPILATION=0
 # --- 与 serve_cached_prefill.sh 相同 ---
-# 新代码的 host_memory.py 要求进程里的 malloc 来自 glibc；这套 venv 里不是（有别的分配器先加载），开着会在编译时报错。
+# host_memory.py 用 dladdr 检查 malloc 是否来自 glibc。venv 若建在非 PIE 的 python 上（Ubuntu 的
+# /usr/bin/python3.12、uv 的 python-build-standalone），malloc 解析到可执行文件的 PLT 地址而误判失败，
+# 开着会在编译时报错，只能关。关掉后 8 个 worker 编译完不归还堆内存，单机 DP8 启动时可能逼近主机内存上限
+# 被 OOM kill；venv 换成 PIE python 后建议设 TPU_RECLAIM_COMPILE_MEMORY=1。见 REPRODUCE.zh.md §2.4。
 export TPU_RECLAIM_COMPILE_MEMORY="${TPU_RECLAIM_COMPILE_MEMORY:-0}"
 export OMP_NUM_THREADS=1 NEW_MODEL_DESIGN=1 MODEL_IMPL_TYPE=vllm VLLM_TARGET_DEVICE=tpu
 export VLLM_USE_BREAKABLE_CUDAGRAPH=0 VLLM_USE_AOT_COMPILE=0
