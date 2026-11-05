@@ -46,6 +46,7 @@ from vllm_torchtpu.platforms.tpu_platform import (
     TPU_8I_MULTIHOST_TOPOLOGY_MAP,
     TpuPlatform,
     _validate_lora_config,
+    _validate_moe_gather_gmm_config,
     _validate_peer_replay_config,
     _validate_phased_profiling_config,
     get_tpu_multihost_topology,
@@ -1639,3 +1640,24 @@ def test_peer_replay_requires_the_compile_cache(
             _validate_peer_replay_config()
     else:
         _validate_peer_replay_config()
+
+
+@pytest.mark.parametrize(
+    "gather,v2,token,match",
+    [
+        ("0", "1", "0", "TPU_MOE_GATHER_GMM=1"),
+        ("0", "0", "1", "TPU_MOE_GATHER_GMM=1"),
+        ("1", "0", "1", "TPU_MOE_GATHER_GMM_V2=1"),
+        ("1", "1", "1", None),
+        ("0", "0", "0", None),
+    ],
+)
+def test_validate_moe_gather_gmm_config(monkeypatch, gather, v2, token, match):
+    monkeypatch.setenv("TPU_MOE_GATHER_GMM", gather)
+    monkeypatch.setenv("TPU_MOE_GATHER_GMM_V2", v2)
+    monkeypatch.setenv("TPU_MOE_GATHER_GMM_TOKEN_SCALES", token)
+    if match is None:
+        _validate_moe_gather_gmm_config()
+    else:
+        with pytest.raises(ValueError, match=match):
+            _validate_moe_gather_gmm_config()

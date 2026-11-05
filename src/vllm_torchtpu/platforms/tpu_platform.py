@@ -339,6 +339,22 @@ def _validate_peer_replay_config() -> None:
         )
 
 
+def _validate_moe_gather_gmm_config() -> None:
+    """Fail fast on gather-fused MoE options that would select nothing."""
+    if (
+        envs.TPU_MOE_GATHER_GMM_V2 or envs.TPU_MOE_GATHER_GMM_TOKEN_SCALES
+    ) and not envs.TPU_MOE_GATHER_GMM:
+        raise ValueError(
+            "TPU_MOE_GATHER_GMM_V2 and TPU_MOE_GATHER_GMM_TOKEN_SCALES configure the "
+            "gather-fused MoE expert kernel: set TPU_MOE_GATHER_GMM=1 too"
+        )
+    if envs.TPU_MOE_GATHER_GMM_TOKEN_SCALES and not envs.TPU_MOE_GATHER_GMM_V2:
+        raise ValueError(
+            "TPU_MOE_GATHER_GMM_TOKEN_SCALES is a mode of gather_fused_moe_v2: "
+            "set TPU_MOE_GATHER_GMM_V2=1 too"
+        )
+
+
 def _validate_phased_profiling_config(vllm_config: "VllmConfig") -> None:
     """Fail fast on phased-profiling settings that would silently do nothing.
 
@@ -788,6 +804,7 @@ class TpuPlatform(Platform):
         )
         _validate_phased_profiling_config(vllm_config)
         _validate_peer_replay_config()
+        _validate_moe_gather_gmm_config()
         if "USE_MOE_EP_KERNEL" in os.environ:
             raise ValueError(
                 "USE_MOE_EP_KERNEL is no longer supported and enables "

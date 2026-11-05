@@ -24,7 +24,7 @@ import pytest
 import torch
 from jax import lax
 
-from vllm_torchtpu.kernels.router_topk import MAX_BLOCK_ROWS, select
+from vllm_torchtpu.kernels.router_topk import MAX_BLOCK_ROWS, select, select_scaled
 from vllm_torchtpu.layers.core.rowmax_topk import rowmax_topk
 
 EXPERTS = 512
@@ -164,3 +164,39 @@ def test_kernel_ties_and_nan_match_the_reference():
 def test_grid_rounds_up_over_the_tuned_block(rows, grid):
     block = min(MAX_BLOCK_ROWS, rows)
     assert -(-rows // block) == grid
+
+
+def _scaled_vs_reference(scores, scale, topk):
+    kw, ki, ks = select_scaled(
+        jnp.asarray(scores), jnp.asarray(scale), topk, interpret=True
+    )
+    rw, ri = rowmax_topk(torch.from_numpy(scores), topk)
+    return (np.asarray(kw), np.asarray(ki), np.asarray(ks)), (rw.numpy(), ri.numpy())
+
+
+# 128 experts, top-8: Gemma4's router; 1000 and 1536 rows leave a partial last block.
+@pytest.mark.parametrize("rows", [1, 16, 1000, 1536])
+def test_scaled_kernel_matches_reference_and_returns_scale_at_ids(rows):
+    rng = np.random.default_rng(rows)
+    scores = rng.standard_normal((rows, 128), dtype=np.float32) * 3
+    scale = rng.random(128, dtype=np.float32) + 0.5
+    (kw, ki, ks), (rw, ri) = _scaled_vs_reference(scores, scale, 8)
+    np.testing.assert_array_equal(kw, rw)
+    np.testing.assert_array_equal(ki, ri)
+    np.testing.assert_array_equal(ks, scale[ki])
+
+
+def test_scaled_kernel_ties_and_nan_match_the_reference():
+    scores = np.zeros((4, 128), dtype=np.float32)
+    scores[0] = 1.0 / 128  # padded token: all tied
+    scores[1, 100:112] = 4.0  # tie across the boundary
+    scores[2] = np.nan  # fully poisoned row
+    scores[3, :3] = np.nan  # partially poisoned
+    scores[3, 50:60] = np.linspace(1.0, 0.1, 10)
+    scale = np.arange(1, 129, dtype=np.float32)
+    (kw, ki, ks), (rw, ri) = _scaled_vs_reference(scores, scale, 8)
+    np.testing.assert_array_equal(ki, ri)
+    np.testing.assert_array_equal(ks, scale[ki])
+    assert np.isnan(kw[2]).all() and np.isnan(rw[2]).all()
+    keep = [0, 1, 3]
+    np.testing.assert_array_equal(kw[keep], rw[keep])

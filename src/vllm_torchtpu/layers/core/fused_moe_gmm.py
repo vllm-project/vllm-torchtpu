@@ -71,6 +71,11 @@ _GATHER_GMM_MAX_ROUTES = 128 * 1024
 # Batches over that cap take the gather-fused kernels too, the combine in token
 # chunks under it.
 _GATHER_GMM_CHUNKED_COMBINE = envs.TPU_MOE_GATHER_GMM_CHUNKED_COMBINE
+# The expert kernel that starts its row DMAs from inside the compute, and its
+# per-row activation scales (platform check: both need TPU_MOE_GATHER_GMM,
+# the scales need TPU_MOE_GATHER_GMM_V2).
+_GATHER_GMM_V2 = envs.TPU_MOE_GATHER_GMM_V2
+_GATHER_GMM_TOKEN_SCALES = envs.TPU_MOE_GATHER_GMM_TOKEN_SCALES
 _GATHER_COMBINE_TILE_TOKENS = 64
 # Fixed at import: build the MoE permutation from one packed sort.
 _SINGLE_SORT = envs.TPU_MOE_SINGLE_SORT
@@ -530,7 +535,8 @@ def can_use_gather_gmm(
 
     The kernels always run FP8 x FP8 dots, so chips where gmm_v2 would keep
     BF16 activations keep the grouped-matmul path. EP and skipped padded
-    tokens are both served: the combine masks the routes with no row.
+    tokens are both served (``masked``: with EP the combine masks the routes
+    with no row).
     """
     num_tokens, hidden = hidden_states.shape
     num_experts, w1_k, n1 = w1.shape
@@ -562,7 +568,11 @@ def can_use_gather_gmm(
         and w2_scale.size == num_experts * hidden
         and _tpu_has_fp8_matmul()
         # Whole-expert weights must fit the expert kernel's VMEM limit.
-        and gather_gmm.gather_fused_moe_vmem_bytes(hidden, inter)
+        and (
+            gather_gmm.gather_fused_moe_v2_vmem_bytes(hidden, inter)
+            if _GATHER_GMM_V2
+            else gather_gmm.gather_fused_moe_vmem_bytes(hidden, inter)
+        )
         <= _tpu_vmem_capacity_bytes() * gather_gmm.VMEM_LIMIT_FRACTION
     )
 
@@ -644,27 +654,48 @@ def gather_gmm_moe(
     expert outputs, so only the expert-order down rows are written to HBM.
     ``topk_ids`` are local expert ids, negative for routes this rank does not
     compute (expert parallelism); with ``masked`` the combine skips those and
-    skipped padded tokens, whose rows the expert kernel never writes.
+    skipped padded tokens, whose rows the expert kernel never writes. Without
+    it the skipped routes, which are exactly the zero-weight ones, read row 0
+    and the combine zeroes zero-weight routes, so it needs no per-tile route
+    compaction.
     """
     num_tokens, hidden = hidden_states.shape
+    unmasked_skip = skip_padded_tokens and not masked
     token_indices_sorted, group_sizes, positions = _gather_routing(
         topk_ids,
         topk_weights,
         local_num_experts=w1.shape[0],
         topk=topk,
         skip_padded_tokens=skip_padded_tokens,
-        masked=masked,
+        masked=masked or skip_padded_tokens,
     )
-    down_rows = gather_gmm.gather_fused_moe(
-        gather_gmm.quantize_pack_rows(hidden_states),
-        token_indices_sorted,
-        group_sizes,
-        w1,
-        w1_scale,
-        w2,
-        w2_scale,
-        act=activation,
-    )
+    if unmasked_skip:
+        positions = jnp.maximum(positions, 0)
+    if _GATHER_GMM_V2:
+        down_rows = gather_gmm.gather_fused_moe_v2(
+            gather_gmm.quantize_pack_rows(
+                hidden_states, per_token=_GATHER_GMM_TOKEN_SCALES
+            ),
+            token_indices_sorted,
+            group_sizes,
+            w1,
+            w1_scale,
+            w2,
+            w2_scale,
+            act=activation,
+            per_token=_GATHER_GMM_TOKEN_SCALES,
+        )
+    else:
+        down_rows = gather_gmm.gather_fused_moe(
+            gather_gmm.quantize_pack_rows(hidden_states),
+            token_indices_sorted,
+            group_sizes,
+            w1,
+            w1_scale,
+            w2,
+            w2_scale,
+            act=activation,
+        )
     return gather_gmm.gather_combine_in_chunks(
         down_rows,
         positions.reshape(num_tokens, topk),
@@ -673,6 +704,7 @@ def gather_gmm_moe(
         max_routes=_GATHER_GMM_MAX_ROUTES,
         tile_tokens=_GATHER_COMBINE_TILE_TOKENS,
         masked=masked,
+        skip_zero_weights=unmasked_skip,
     )
 
 
@@ -990,10 +1022,12 @@ def fused_moe_func(
         w2_bias,
         topk=topk,
         rhs_quant_dtype=rhs_quant_dtype,
-        masked=use_ep or skip_padded_tokens,
+        masked=use_ep,
     ):
         logger.info_once(
-            "Selected gather-fused MoE expert kernels (TPU_MOE_GATHER_GMM)"
+            "Selected gather-fused MoE expert kernels (TPU_MOE_GATHER_GMM): %s",
+            ("gather_fused_moe_v2" if _GATHER_GMM_V2 else "gather_fused_moe")
+            + (", per-row activation scales" if _GATHER_GMM_TOKEN_SCALES else ""),
         )
         return gather_gmm_moe(
             hidden_states,
@@ -1006,7 +1040,7 @@ def fused_moe_func(
             topk=topk,
             activation=activation,
             skip_padded_tokens=skip_padded_tokens,
-            masked=use_ep or skip_padded_tokens,
+            masked=use_ep,
         )
 
     (
