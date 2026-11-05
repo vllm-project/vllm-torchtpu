@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""BF16 linear head with a fused first-index argmax."""
+"""BF16 linear head: full logits, or a fused first-index argmax."""
 
 import jax
 import jax.numpy as jnp
@@ -11,6 +11,9 @@ from vllm_torchtpu.utils import get_device_name
 
 # Qualified on v7 with full-K reuse and compact partials; other shapes fall back.
 TUNED_TILES = {(288, 5120, 129280): 1280}
+# Vocab tile per (rows, K, vocab) for head_logits: the hidden rows stay resident
+# while [tile, K] weight blocks stream, so the weight is read once.
+LOGITS_TILES = {(240, 5120, 129280): 1280}
 
 
 def is_supported_shape(rows: int, weight_shape: tuple[int, ...]) -> bool:
@@ -69,3 +72,32 @@ def fused_greedy_head(hidden: jax.Array, weight: jax.Array) -> jax.Array:
         jnp.where(chosen, indices, jnp.iinfo(jnp.int32).max),
         axis=0,
     )
+
+
+def head_logits(hidden: jax.Array, weight: jax.Array) -> jax.Array:
+    """BF16 ``hidden @ weight.T`` for the original [vocab, K] weight, FP32-accumulated."""
+    rows, width = hidden.shape
+    vocab, weight_width = weight.shape
+    assert hidden.dtype == weight.dtype == jnp.bfloat16
+    assert width == weight_width
+    tile = LOGITS_TILES[(rows, width, vocab)]
+
+    def kernel(hidden_ref, weight_ref, logits_ref):
+        logits_ref[...] = jnp.dot(
+            hidden_ref[...], weight_ref[...].T, preferred_element_type=jnp.float32
+        ).astype(jnp.bfloat16)
+
+    return pl.pallas_call(
+        kernel,
+        out_shape=jax.ShapeDtypeStruct((rows, vocab), jnp.bfloat16),
+        grid=(vocab // tile,),
+        in_specs=(
+            pl.BlockSpec(hidden.shape, lambda n: (0, 0)),
+            pl.BlockSpec((tile, width), lambda n: (n, 0)),
+        ),
+        out_specs=pl.BlockSpec((rows, tile), lambda n: (0, n)),
+        compiler_params=pltpu.CompilerParams(
+            dimension_semantics=("arbitrary",), vmem_limit_bytes=48 * 1024 * 1024
+        ),
+        name=f"head_logits_m{rows}_n{tile}",
+    )(hidden, weight)
