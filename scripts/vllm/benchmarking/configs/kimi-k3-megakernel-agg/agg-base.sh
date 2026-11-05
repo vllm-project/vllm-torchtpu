@@ -27,6 +27,7 @@
 #   AGG_DRAFTS          DSpark drafts (3 or 7)
 #   AGG_ACCEPTANCE      synthetic acceptance length of the replay
 #   AGG_KV_BYTES        --kv-cache-memory-bytes; optional, 14 GiB
+#   AGG_PREFIX_CACHING  0: --no-enable-prefix-caching; optional, default 1
 
 for _v in AGG_CONCURRENCY AGG_MAX_NUM_SEQS AGG_DRAFTS AGG_ACCEPTANCE; do
   [ -n "${!_v:-}" ] || { echo "ERROR: kimi-k3-megakernel-agg: the point sets no $_v" >&2; return 2; }
@@ -141,7 +142,7 @@ SERVE_ARGS=(
   --max-model-len 1048576
   --kv-cache-dtype fp8 --block-size 512 --cp-kv-cache-interleave-size 512
   --trust-remote-code --language-model-only
-  --mamba-cache-mode align --enable-prefix-caching
+  --mamba-cache-mode align
   --enable-prompt-tokens-details
   --decode-context-parallel-size 32
   --load-format megakernel --model-loader-extra-config "$_loader"
@@ -149,6 +150,11 @@ SERVE_ARGS=(
   --max-num-batched-tokens $((${AGG_PREFILL_WINDOW:-8192} + 8 * AGG_MAX_NUM_SEQS))
   --kv-cache-memory-bytes "${AGG_KV_BYTES:-15032385536}"
 )
+if [ "${AGG_PREFIX_CACHING:-1}" = 0 ]; then
+  SERVE_ARGS+=(--no-enable-prefix-caching)
+else
+  SERVE_ARGS+=(--enable-prefix-caching)
+fi
 # AGG_DRAFTS=0: no speculative decoding.
 [ "$AGG_DRAFTS" = 0 ] || SERVE_ARGS+=(--speculative-config "$_spec")
 if [ "$_eval_job" = 1 ]; then
