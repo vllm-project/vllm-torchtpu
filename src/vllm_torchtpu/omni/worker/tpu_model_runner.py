@@ -13,7 +13,7 @@
 # limitations under the License.
 """Base TPU model runner for vLLM-Omni stages."""
 
-from typing import Any
+from typing import Any, cast
 
 from vllm_omni.config import OmniModelConfig
 
@@ -37,5 +37,9 @@ class OmniTPUModelRunner(TPUModelRunner):
         self.model_stage: str | None = None
         self.stage_id: int | None = None
         if isinstance(self.model_config, OmniModelConfig):
-            self.model_stage = self.model_config.model_stage
-            self.stage_id = self.model_config.stage_id
+            # The cast is for the type checker only: where vllm-omni is not
+            # installed, ``OmniModelConfig`` resolves to ``Any`` and the
+            # isinstance check above does not narrow ``ModelConfig``.
+            omni_config = cast(OmniModelConfig, self.model_config)
+            self.model_stage = omni_config.model_stage
+            self.stage_id = omni_config.stage_id
