@@ -24,9 +24,9 @@ from vllm_torchtpu.layers.adapter.upstream_bindings import (
 )
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.model_loader_patches import register_row_slice
+from vllm_torchtpu.utils import lookup_small_table
 
 from ..config import engram_cpu_offload
-from . import request_table
 from .host_exchange import start_exchange_rows
 from .host_gather import gather_weight_scale
 
@@ -214,9 +214,7 @@ class NgramHashState(upstream.NgramHashState):
         reqs = torch.bucketize(rows, query_start_loc[1:], right=True).clamp(
             max=lookback_token_ids.shape[0] - 1
         )
-        starts = (
-            request_table.per_request(query_start_loc, reqs).long().clamp(max=count - 1)
-        )
+        starts = lookup_small_table(query_start_loc, reqs).long().clamp(max=count - 1)
         chunk_positions = positions[starts]
         shifts = torch.arange(ngram, device=dev)
         past = positions[:, None] - shifts
