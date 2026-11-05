@@ -38,6 +38,7 @@ from vllm_torchtpu.layers.adapter.attention import PallasAttentionBackend
 if TYPE_CHECKING:
     from vllm.model_executor.layers.attention_layer_base import AttentionBackend
 
+from vllm_torchtpu.kernels.deepseek_v4 import q_proj_norm_rope
 from vllm_torchtpu.kernels.deepseek_v4 import rope as rope_kernel
 from vllm_torchtpu.kernels.deepseek_v4.o_projection import (
     cos_sin_table,
@@ -57,8 +58,11 @@ from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4.deepseek_v4_compressor 
 from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4.deepseek_v4_indexer import (
     VllmDeepseekV4Indexer,
 )
+from vllm_torchtpu.layers.adapter.linear_common import (
+    _quantized_matmul_jax,
+    _quantized_matmul_keep_input_jax,
+)
 from vllm_torchtpu.layers.adapter.quantization.fp8 import (
-    apply_fp8_linear_keep_input,
     apply_fp8_linear_pair,
     is_fp8_per_channel_linear,
 )
@@ -90,6 +94,58 @@ def _qnorm_rope_jax(
 ) -> jax.Array:
     """Per-head RMSNorm (no weight) fused with RoPE on the query heads."""
     return rope_kernel.qnorm_rope(x, positions, cos_sin_cache, eps=eps)
+
+
+def _wq_b_qnorm_rope_jax(
+    qr: jax.Array,
+    w_q: jax.Array,
+    w_scale: jax.Array,
+    positions: jax.Array,
+    cos_sin_cache: jax.Array,
+    *,
+    head_dim: int,
+    eps: float,
+) -> jax.Array:
+    """`_qnorm_rope_jax` of the query projection `wq_b(qr)`, as
+    `[T, heads * head_dim]`; one kernel where `q_proj_norm_rope` applies."""
+    if q_proj_norm_rope.applies(qr, w_q, w_scale, cos_sin_cache, head_dim):
+        return q_proj_norm_rope.q_proj_norm_rope(
+            qr, w_q, w_scale, positions, cos_sin_cache, head_dim=head_dim, eps=eps
+        )
+    q = _quantized_matmul_jax(qr, w_q, w_scale)
+    return _qnorm_rope_jax(
+        q.reshape(q.shape[0], -1, head_dim), positions, cos_sin_cache, eps=eps
+    ).reshape(q.shape)
+
+
+def _wq_b_keep_input_qnorm_rope_jax(
+    qr: jax.Array,
+    w_q: jax.Array,
+    w_scale: jax.Array,
+    positions: jax.Array,
+    cos_sin_cache: jax.Array,
+    *,
+    head_dim: int,
+    eps: float,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """`_wq_b_qnorm_rope_jax`, and `qr` as the projection quantized it, as
+    `_quantized_matmul_keep_input_jax` returns it."""
+    if q_proj_norm_rope.applies(qr, w_q, w_scale, cos_sin_cache, head_dim):
+        return q_proj_norm_rope.q_proj_norm_rope(
+            qr,
+            w_q,
+            w_scale,
+            positions,
+            cos_sin_cache,
+            head_dim=head_dim,
+            eps=eps,
+            return_quantized=True,
+        )
+    q, qr_q, qr_scale = _quantized_matmul_keep_input_jax(qr, w_q, w_scale)
+    q = _qnorm_rope_jax(
+        q.reshape(q.shape[0], -1, head_dim), positions, cos_sin_cache, eps=eps
+    ).reshape(q.shape)
+    return q, qr_q, qr_scale
 
 
 def _kv_rope_words_jax(
@@ -125,6 +181,20 @@ def _o_proj_jax(
 def _fake_rope(x, positions, cos_sin_cache, *args, **kwargs):
     """Abstract implementation for PyTorch Dynamo graph tracing."""
     return torch.empty_like(x)
+
+
+def _fake_wq_b_qnorm_rope(qr, w_q, *args, **kwargs):
+    """Abstract implementation for PyTorch Dynamo graph tracing."""
+    return qr.new_empty((qr.shape[0], w_q.shape[-1]))
+
+
+def _fake_wq_b_keep_input_qnorm_rope(qr, w_q, *args, **kwargs):
+    """Abstract implementation for PyTorch Dynamo graph tracing."""
+    return (
+        qr.new_empty((qr.shape[0], w_q.shape[-1])),
+        qr.new_empty(qr.shape, dtype=w_q.dtype),
+        qr.new_empty((qr.shape[0], 1), dtype=torch.float32),
+    )
 
 
 def _fake_kv_rope_words(x, positions, cos_sin_cache, *args, **kwargs):
@@ -509,6 +579,55 @@ class VllmDeepseekV4MLAAttention(
         return op
 
     @property
+    def wq_b_qnorm_rope_op(self):
+        """The op running `wq_b` and `qnorm_rope` on `qr` together, built
+        lazily; on a layer with an indexer it also returns `qr` as `wq_b`
+        quantized it, for the indexer's own projection. None when a `wq_b` is
+        not `is_fp8_per_channel_linear`."""
+        if "_wq_b_qnorm_rope_op_instance" in self.__dict__:
+            return self.__dict__["_wq_b_qnorm_rope_op_instance"]
+
+        op = None
+        keep_input = self.indexer is not None
+        if is_fp8_per_channel_linear(self.wq_b) and (
+            not keep_input or is_fp8_per_channel_linear(self.indexer.wq_b)
+        ):
+            eps = float(self.mla_attn.eps)
+            head_dim = int(self.mla_attn.head_dim)
+            op_name = (
+                f"pallas::deepseek_v4_wq_b_{'keep_input_' if keep_input else ''}"
+                f"qnorm_rope_d{head_dim}_e{_name_float(eps)}"
+            )
+            op = _pallas_op_cache.get(op_name)
+            if op is None:
+                op = pallas.jax_op(
+                    op_name,
+                    functools.partial(
+                        _wq_b_keep_input_qnorm_rope_jax
+                        if keep_input
+                        else _wq_b_qnorm_rope_jax,
+                        head_dim=head_dim,
+                        eps=eps,
+                    ),
+                    mesh=get_pallas_op_mesh(),
+                    input_partition_specs=(
+                        P(),  # qr
+                        P(None, "model"),  # wq_b, (k, n) with heads on n
+                        P("model"),  # wq_b's scale
+                        P(),  # positions
+                        P(),  # cos_sin_cache
+                    ),
+                )
+                op.register_fake(
+                    _fake_wq_b_keep_input_qnorm_rope
+                    if keep_input
+                    else _fake_wq_b_qnorm_rope
+                )
+                _pallas_op_cache[op_name] = op
+        object.__setattr__(self, "_wq_b_qnorm_rope_op_instance", op)
+        return op
+
+    @property
     def kv_rope_op(self):
         """The RoPE op for the decoupled key states, built lazily."""
         op = self.__dict__.get("_kv_rope_op_instance")
@@ -577,14 +696,20 @@ class VllmDeepseekV4MLAAttention(
         # The indexer projects the same qr. It takes qr as wq_b quantized it
         # and projects it inside its own op, or one op quantizes qr for both.
         indexer_q = quantized_qr = None
-        if (
-            self.indexer is not None
-            and qr.dtype == torch.bfloat16
-            and is_fp8_per_channel_linear(self.wq_b)
-            and is_fp8_per_channel_linear(self.indexer.wq_b)
-        ):
-            q, qr_q, qr_scale = apply_fp8_linear_keep_input(self.wq_b, qr)
-            quantized_qr = (qr_q, qr_scale)
+        q_shape = (qr.shape[0], self.mla_attn.n_local_heads, self.mla_attn.head_dim)
+        wq_b_qnorm_rope_op = self.wq_b_qnorm_rope_op
+        if wq_b_qnorm_rope_op is not None and qr.dtype == torch.bfloat16:
+            q = wq_b_qnorm_rope_op(
+                qr,
+                self.wq_b.weight,
+                self.wq_b.weight_scale,
+                positions,
+                self.mla_attn.rotary_emb.cos_sin_cache,
+            )
+            if self.indexer is not None:
+                q, qr_q, qr_scale = q
+                quantized_qr = (qr_q, qr_scale)
+            q = q.view(q_shape)
         else:
             pair = (
                 None
@@ -595,8 +720,7 @@ class VllmDeepseekV4MLAAttention(
                 q = self.wq_b(qr)
             else:
                 q, indexer_q = pair
-        q = q.view(qr.shape[0], self.mla_attn.n_local_heads, self.mla_attn.head_dim)
-        q = self.qnorm_rope(q, positions)
+            q = self.qnorm_rope(q.view(q_shape), positions)
         kv = self.kv_rope(kv, positions)
 
         topk_indices = None

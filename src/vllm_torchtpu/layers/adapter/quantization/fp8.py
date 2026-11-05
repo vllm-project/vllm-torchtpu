@@ -91,7 +91,6 @@ from vllm_torchtpu.layers.adapter.linear_common import (
     KEEP_VLLM_LAYOUT_ATTR,
     WEIGHT_FLIPPED_ATTR,
     quantized_matmul,
-    quantized_matmul_keep_input,
     quantized_matmul_pair,
 )
 from vllm_torchtpu.layers.adapter.pipelined_fused_moe import (
@@ -1737,23 +1736,13 @@ def apply_fp8_linear_pair(
 
 
 def is_fp8_per_channel_linear(layer: torch.nn.Module) -> bool:
-    """Whether `apply_fp8_linear_keep_input` takes `layer`: a plain
-    `VllmFp8LinearMethodTPU` linear with a per-channel e4m3 weight."""
+    """Whether `layer` is a plain `VllmFp8LinearMethodTPU` linear with a
+    per-channel e4m3 weight."""
     return (
         _is_plain_fp8_linear(layer)
         and layer.weight.dtype == torch.float8_e4m3fn
         and layer.weight_scale.dim() == 1
     )
-
-
-def apply_fp8_linear_keep_input(
-    layer: torch.nn.Module, x: torch.Tensor
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """`layer(x)` for a 2-D `x`, and `x` quantized as it was for it: its e4m3
-    rows and their `[M, 1]` float32 scales. `layer` must satisfy
-    `is_fp8_per_channel_linear`."""
-    assert is_fp8_per_channel_linear(layer)
-    return quantized_matmul_keep_input(x, layer.weight, layer.weight_scale)
 
 
 def resolve_online_fp8(
