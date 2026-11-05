@@ -42,6 +42,10 @@ GATHER_GROUP = 8
 # the row DMAs of later chunks land.
 GATHER_CHUNK = 128
 
+# The o-projection kernels' default name. wo_a_cos_sin's gather is shared only
+# while its name matches fused_reverse_rope_wo_a_projection's.
+WO_A_NAME = "wo_a_projection"
+
 
 def _largest_divisor(x: int, cap: int) -> int:
     """Largest divisor of ``x`` that is <= ``cap``."""
@@ -202,6 +206,18 @@ def gather_cos_sin(
     )(positions, pltpu.with_memory_space_constraint(table, pltpu.HBM))
 
 
+def wo_a_cos_sin(
+    positions: jax.Array,  # [T] int
+    table: jax.Array,  # [2 * num_positions, LANE] float32
+    *,
+    name: str = WO_A_NAME,
+) -> jax.Array:
+    """The ``[T, 2 * LANE]`` cos/sin rows ``fused_reverse_rope_wo_a_projection``
+    gathers. XLA computes identical calls once, so another kernel taking them
+    from here shares the o-projection's gather."""
+    return gather_cos_sin(positions, table, name=f"{name}_gather_cos_sin")
+
+
 def _load_head_pair(
     x_ref: jax.Ref, *, t0: int, sub_t: int, pair: int
 ) -> tuple[jax.Array, jax.Array]:
@@ -303,7 +319,7 @@ def wo_a_projection(
     tile_r: int | None = None,
     sub_t: int | None = None,
     quantize_activations: bool = True,
-    name: str = "wo_a_projection",
+    name: str = WO_A_NAME,
 ) -> jax.Array:
     """Do DSv4 wo_a projection.
 
@@ -417,7 +433,7 @@ def fused_reverse_rope_wo_a_projection(
     tile_r: int | None = None,
     sub_t: int | None = None,
     quantize_activations: bool = True,
-    name: str = "wo_a_projection",
+    name: str = WO_A_NAME,
 ) -> jax.Array:
     """``The RoPE-fused ``wo_a_projection``.
 
@@ -427,11 +443,7 @@ def fused_reverse_rope_wo_a_projection(
     assert x.ndim == 3
     assert x.shape[2] == head_dim
 
-    cos_sin = gather_cos_sin(
-        positions,
-        table,
-        name=f"{name}_gather_cos_sin",
-    )
+    cos_sin = wo_a_cos_sin(positions, table, name=name)
     return wo_a_projection(
         x,
         wo_a,

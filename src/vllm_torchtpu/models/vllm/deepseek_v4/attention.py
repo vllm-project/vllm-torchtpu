@@ -43,6 +43,7 @@ from vllm_torchtpu.kernels.deepseek_v4 import rope as rope_kernel
 from vllm_torchtpu.kernels.deepseek_v4.o_projection import (
     cos_sin_table,
     fused_reverse_rope_wo_a_projection,
+    wo_a_cos_sin,
 )
 from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4.deepseek_v4_attention_op import (  # noqa: E501
     BATCH_AXIS,
@@ -102,15 +103,24 @@ def _wq_b_qnorm_rope_jax(
     w_scale: jax.Array,
     positions: jax.Array,
     cos_sin_cache: jax.Array,
+    o_proj_cos_sin_table: jax.Array,
     *,
     head_dim: int,
     eps: float,
 ) -> jax.Array:
     """`_qnorm_rope_jax` of the query projection `wq_b(qr)`, as
-    `[T, heads * head_dim]`; one kernel where `q_proj_norm_rope` applies."""
-    if q_proj_norm_rope.applies(qr, w_q, w_scale, cos_sin_cache, head_dim):
+    `[T, heads * head_dim]`; one kernel where `q_proj_norm_rope` applies.
+    `o_proj_cos_sin_table` is the o-projection's for `cos_sin_cache`."""
+    rotary_dim = cos_sin_cache.shape[1]
+    if q_proj_norm_rope.applies(qr, w_q, w_scale, head_dim, rotary_dim):
         return q_proj_norm_rope.q_proj_norm_rope(
-            qr, w_q, w_scale, positions, cos_sin_cache, head_dim=head_dim, eps=eps
+            qr,
+            w_q,
+            w_scale,
+            wo_a_cos_sin(positions, o_proj_cos_sin_table),
+            head_dim=head_dim,
+            rotary_dim=rotary_dim,
+            eps=eps,
         )
     q = _quantized_matmul_jax(qr, w_q, w_scale)
     return _qnorm_rope_jax(
@@ -124,20 +134,22 @@ def _wq_b_keep_input_qnorm_rope_jax(
     w_scale: jax.Array,
     positions: jax.Array,
     cos_sin_cache: jax.Array,
+    o_proj_cos_sin_table: jax.Array,
     *,
     head_dim: int,
     eps: float,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """`_wq_b_qnorm_rope_jax`, and `qr` as the projection quantized it, as
     `_quantized_matmul_keep_input_jax` returns it."""
-    if q_proj_norm_rope.applies(qr, w_q, w_scale, cos_sin_cache, head_dim):
+    rotary_dim = cos_sin_cache.shape[1]
+    if q_proj_norm_rope.applies(qr, w_q, w_scale, head_dim, rotary_dim):
         return q_proj_norm_rope.q_proj_norm_rope(
             qr,
             w_q,
             w_scale,
-            positions,
-            cos_sin_cache,
+            wo_a_cos_sin(positions, o_proj_cos_sin_table),
             head_dim=head_dim,
+            rotary_dim=rotary_dim,
             eps=eps,
             return_quantized=True,
         )
@@ -616,6 +628,7 @@ class VllmDeepseekV4MLAAttention(
                         P("model"),  # wq_b's scale
                         P(),  # positions
                         P(),  # cos_sin_cache
+                        P(),  # o_proj_cos_sin_table
                     ),
                 )
                 op.register_fake(
@@ -705,6 +718,8 @@ class VllmDeepseekV4MLAAttention(
                 self.wq_b.weight_scale,
                 positions,
                 self.mla_attn.rotary_emb.cos_sin_cache,
+                # Prefill buckets take the o-projection's gathered cos/sin rows.
+                self.rotary_emb.o_proj_cos_sin_table,
             )
             if self.indexer is not None:
                 q, qr_q, qr_scale = q

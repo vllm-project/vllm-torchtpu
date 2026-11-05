@@ -24,6 +24,7 @@ from tests.kernels.deepseek_v4.rope_test import (
     assert_bits_equal,
     make_cos_sin_cache,
 )
+from vllm_torchtpu.kernels.deepseek_v4.o_projection import cos_sin_table, wo_a_cos_sin
 from vllm_torchtpu.kernels.deepseek_v4.q_proj_norm_rope import q_proj_norm_rope
 from vllm_torchtpu.kernels.deepseek_v4.rope import qnorm_rope
 from vllm_torchtpu.kernels.quantized_matmul.fused_quantize_matmul import (
@@ -58,14 +59,15 @@ class QProjNormRopeTest(parameterized.TestCase):
         positions[-7:] = 0  # padding rows
         positions = jnp.asarray(positions, jnp.int32)
         cos_sin_cache = jnp.asarray(make_cos_sin_cache(max_position, ROTARY_DIM))
+        table = cos_sin_table(cos_sin_cache, inverse=True, num_positions=max_position)
 
         got = q_proj_norm_rope(
             x,
             w_q,
             w_scale,
-            positions,
-            cos_sin_cache,
+            wo_a_cos_sin(positions, table),
             head_dim=HEAD_DIM,
+            rotary_dim=ROTARY_DIM,
             eps=EPS,
             return_quantized=return_quantized,
         )
