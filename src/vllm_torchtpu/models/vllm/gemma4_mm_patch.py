@@ -465,7 +465,6 @@ def refresh_gemma4_mm() -> None:
     patch_gemma4_mm_model_classes()
     patch_gemma4_layer_config()
     patch_vision_mrope_lane_swap()
-    patch_gemma4_vision_rope()
 
 
 def _is_gemma4_mm_model(model_config: "ModelConfig | None") -> bool:
@@ -515,7 +514,6 @@ def maybe_patch_gemma4_mm(model_config: "ModelConfig | None" = None) -> bool | N
     patch_gemma4_mm_model_classes()
     patch_gemma4_layer_config()
     patch_vision_mrope_lane_swap()
-    patch_gemma4_vision_rope()
 
     if model_config is not None:
         model_info = getattr(model_config, "_model_info", None)
