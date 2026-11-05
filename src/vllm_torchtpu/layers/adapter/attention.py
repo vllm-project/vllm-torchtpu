@@ -2169,6 +2169,8 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                         _cp_mla_attention.prebuild_send_small(self.dcp_size)
                         if envs.TPU_DCP_MLA_SEND_SMALL_A2A_MERGE:
                             _cp_mla_attention.prebuild_send_small_merge(self.dcp_size)
+            if _cp_mla_attention.online_lse_combine_mode_requested():
+                _cp_mla_attention.prebuild_online_lse_combine(self.dcp_size)
 
     def _get_kv_scales(
         self, layer: Any
@@ -3098,6 +3100,9 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                         uv_first
                         and is_backbone
                         and getattr(layer, "W_O_dcp_qrep", None) is not None
+                        and not _cp_mla_attention.online_lse_combine_applies(
+                            partial.shape[0], is_backbone
+                        )
                         and not (
                             envs.TPU_DCP_LSE_MERGE_A2A
                             and partial.shape[0]

@@ -2520,8 +2520,14 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
                 local_view = q_proj_layer._local_view
                 q_nope, q_pe = local_view(q_nope), local_view(q_pe)
 
+        uv_before_merge_all = (
+            q_dcp_replicated is not None
+            and getattr(self.mla_attn, "W_UV_dcp_qrep", None) is not None
+            and envs.TPU_DCP_MLA_UV_BEFORE_MERGE_MIN_TOKENS <= 0
+        )
         uv_in_oproj = (
             envs.TPU_FUSED_UV_OPROJ
+            and not uv_before_merge_all
             and token_split is None
             and prefill_group is None
             and output_gate is None
@@ -2541,7 +2547,11 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
             q_dcp_replicated=q_dcp_replicated,
             skip_uv=uv_in_oproj,
         )
-        if uv_in_oproj:
+        if (
+            uv_in_oproj
+            and isinstance(attn_out, torch.Tensor)
+            and attn_out.shape[-1] == self.num_heads * self.kv_lora_rank
+        ):
             return small_all_reduce_op.uv_row_parallel(
                 attn_out, self.mla_attn, self.o_proj
             )

@@ -47,7 +47,7 @@ COLLECTIVE_ID = 5
 LANES = 128
 MAX_M = 16
 # The largest block any caller may allow (VMEM: the 6 MB weight ring plus 16 receive
-# slots and the output through 96 rows fit the scoped limit).
+# slots, W_UV and the output at 96 rows take ~10.8 MiB, matching small_all_reduce_op).
 LIMIT_M = 96
 # (k, n) -> (tile, nbuf): fp8_skinny's measured o_proj ring ("n", 2048, 3).
 TUNED = {(1024, 6144): (2048, 3)}

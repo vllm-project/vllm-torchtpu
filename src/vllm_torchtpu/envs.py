@@ -65,6 +65,11 @@ if TYPE_CHECKING:
     TPU_MLA_FUSED_XCHG_MAX_TOKENS: int = 0
     TPU_DCP_MLA_OUT_VMEM_MAX_TOKENS: int = 0
     TPU_DCP_MLA_OUT_VMEM_MIB: int = 32
+    TPU_DCP_ONLINE_LSE_COMBINE: str = ""
+    TPU_DCP_ONLINE_LSE_COMBINE_MAX_TOKENS: int = 96
+    TPU_DCP_ONLINE_LSE_COMBINE_MIN_TOKENS: int = 16
+    TPU_DCP_ONLINE_LSE_COMBINE_LIVE_TOKENS: bool = True
+    TPU_DCP_ONLINE_LSE_COMBINE_OUT_VMEM: bool = True
     TPU_SMALL_COLL_HBM_OPERAND: bool = True
     TPU_DCP_MERGE_CHUNKED_SMALL: int = 2
     TPU_DCP_MLA_MERGE_PIECES: int = 2
@@ -780,6 +785,26 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # prefetches it may run under the call). The kernel's scratch is ~13 MiB
     # at T = 64; 32 is the pinned fused small all-to-all calls' limit.
     "TPU_DCP_MLA_OUT_VMEM_MIB": env_int("TPU_DCP_MLA_OUT_VMEM_MIB", 32),
+    # Single-kernel TensorCore online-LSE DCP combine (`small_collectives/
+    # dcp_lse_combine.py`) for backbone decode/mixed buckets in
+    # `(bucket_gate_edge(MIN_TOKENS), MAX_TOKENS]` that reach
+    # `merge_lse_partials_scatter_heads`: "" / "0" = off (default),
+    # "1" / "auto" = chip-pair-first 2-stage combine ("pairs") when adjacent
+    # DCP ranks pair each chip's two TensorCores else 1-stage "flat",
+    # "pairs" = require chip-pair-first 2-stage combine, "flat" = 1-stage.
+    "TPU_DCP_ONLINE_LSE_COMBINE": lambda: os.getenv("TPU_DCP_ONLINE_LSE_COMBINE", ""),
+    "TPU_DCP_ONLINE_LSE_COMBINE_MAX_TOKENS": env_nonnegative_int(
+        "TPU_DCP_ONLINE_LSE_COMBINE_MAX_TOKENS", 96
+    ),
+    "TPU_DCP_ONLINE_LSE_COMBINE_MIN_TOKENS": env_nonnegative_int(
+        "TPU_DCP_ONLINE_LSE_COMBINE_MIN_TOKENS", 16
+    ),
+    "TPU_DCP_ONLINE_LSE_COMBINE_LIVE_TOKENS": env_bool(
+        "TPU_DCP_ONLINE_LSE_COMBINE_LIVE_TOKENS", default=True
+    ),
+    "TPU_DCP_ONLINE_LSE_COMBINE_OUT_VMEM": env_bool(
+        "TPU_DCP_ONLINE_LSE_COMBINE_OUT_VMEM", default=True
+    ),
     # The DCP small all-gather (TPU_DCP_INDEXER_SMALL_AG) and small all-to-all
     # (TPU_DCP_MLA_SEND_SMALL_A2A) take their data operand constrained to HBM.
     # Unconstrained (pl.ANY), XLA stages it into VMEM with a copy-start/-done
@@ -2221,7 +2246,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # With TPU_FUSED_OPROJ_AR: the largest decode block, in rows, the fused kernel
     # takes. Above 16 rows the two-call path is XLA's matmul and its quantize, then
     # the small all-reduce; the fused kernel streams the weight under the barrier
-    # round there too. A power of 2 (a bucket edge), at most 64.
+    # round there too. At most 96 (fp8_oproj_all_reduce.LIMIT_M).
     "TPU_FUSED_OPROJ_AR_MAX_ROWS": env_nonnegative_int(
         "TPU_FUSED_OPROJ_AR_MAX_ROWS", 16
     ),
