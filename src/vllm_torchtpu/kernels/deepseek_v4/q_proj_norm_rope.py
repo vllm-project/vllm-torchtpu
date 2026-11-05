@@ -135,8 +135,9 @@ def _kernel(
         sin_ref[...] = sin
 
     tile_n = out_ref.shape[1]
-    for h in range(tile_n // head_dim):
-        # fused_quantize_matmul's dot and scaling, one head's columns at a time.
+
+    def project(h):
+        """fused_quantize_matmul's dot, scaling and bf16 store of head h."""
         cols = pl.ds(h * head_dim, head_dim)
         acc = jax.lax.dot_general(
             x_q_ref[...],
@@ -147,10 +148,21 @@ def _kernel(
         acc = acc * x_scale_ref[...]
         first = pl.multiple_of(step * tile_n + h * head_dim, LANE)
         acc = acc * w_scale_ref[pl.ds(first, head_dim)][None, :]
-        # The bf16 query the plain matmul stores, read back as qnorm_rope does.
-        q = acc.astype(out_ref.dtype).astype(jnp.float32)
-        y = _qnorm_rope_rows(q, cos_ref[...], sin_ref[...], eps=eps)
-        out_ref[:, cols] = y.astype(out_ref.dtype)
+        return acc.astype(out_ref.dtype)
+
+    num_heads = tile_n // head_dim
+    # Head h + 1's dot is issued ahead of head h's norm and rotation, so the
+    # MXU has work while the VPU runs the epilogue.
+    q_next = project(0)
+    for h in range(num_heads):
+        q = q_next
+        if h + 1 < num_heads:
+            q_next = project(h + 1)
+        # The bf16 query read back as qnorm_rope does.
+        y = _qnorm_rope_rows(
+            q.astype(jnp.float32), cos_ref[...], sin_ref[...], eps=eps
+        )
+        out_ref[:, pl.ds(h * head_dim, head_dim)] = y.astype(out_ref.dtype)
 
     if return_quantized:
 
