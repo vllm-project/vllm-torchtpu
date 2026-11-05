@@ -85,6 +85,7 @@ def _compute_hash_fn() -> Any:
         "compile_cache_salt": compile_cache_salt,
         "__file__": str(path),
         "VllmConfig": Any,
+        "prefill_checkpoint_enabled": lambda _cfg: False,
     }
     exec(compile(ast.get_source_segment(src, fn) or "", str(path), "exec"), ns)
     return ns["compute_tpu_compilation_hash"]
