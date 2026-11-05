@@ -547,8 +547,14 @@ class HeadTailPcpShardingPlan(PcpShardingPlan):
         self.local_num_tokens = plan.per_rank_num_tokens[self.pcp_rank]
         self.local_padded_num_tokens = local_padded
         self.logits_indices_cpu = torch.from_numpy(logits_indices.astype(np.int32))
-        self.logits_local_indices_cpu = torch.from_numpy(logits_local)
-        self.logits_owner_mask_cpu = torch.from_numpy(owner_mask)
+        # Upload now, before the runner records its input staging fence: the
+        # next step's prepare waits only on that fence before it drops these
+        # host tensors.
+        hosts = (torch.from_numpy(logits_local), torch.from_numpy(owner_mask))
+        self._keepalive.extend(hosts)
+        self.logits_local_indices, self.logits_owner_mask = (
+            t.to(runner.device, non_blocking=True) for t in hosts
+        )
         self.logits_all_local = logits_all_local
         self.request_major_to_local = request_major_to_local
 

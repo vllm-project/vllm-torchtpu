@@ -30,7 +30,10 @@ from vllm_torchtpu.runner.pcp.head_tail_sharding_plan import (
     HeadTailPcpShardingPlan,
     mla_kv_page_size,
 )
-from vllm_torchtpu.runner.pcp.manager import validate_pcp_manager_config
+from vllm_torchtpu.runner.pcp.manager import (
+    validate_pcp_manager_config,
+    validate_pcp_manager_layers,
+)
 
 
 def _manager(page_size, workspace_tokens=262144, dcp_size=8):
@@ -107,7 +110,7 @@ def test_mla_kv_page_size_requires_one_size(specs):
         mla_kv_page_size(_config(*specs))
 
 
-def _pcp_manager_config(max_model_len):
+def _pcp_manager_config(max_model_len=8192, pcp_size=2, tp_size=4):
     return SimpleNamespace(
         model_config=SimpleNamespace(
             use_mla=True,
@@ -116,14 +119,16 @@ def _pcp_manager_config(max_model_len):
             is_multimodal_model=False,
         ),
         parallel_config=SimpleNamespace(
-            prefill_context_parallel_size=2,
+            prefill_context_parallel_size=pcp_size,
             decode_context_parallel_size=8,
-            tensor_parallel_size=4,
+            tensor_parallel_size=tp_size,
             pipeline_parallel_size=1,
             data_parallel_size=1,
             is_moe_model=False,
             enable_expert_parallel=False,
+            cp_kv_cache_interleave_size=4,
         ),
+        scheduler_config=SimpleNamespace(async_scheduling=True),
         speculative_config=None,
         lora_config=None,
     )
@@ -136,3 +141,40 @@ def test_max_model_len_must_fit_the_kv_workspace(monkeypatch):
     validate_pcp_manager_config(_pcp_manager_config(1 << 20))
     with pytest.raises(ValueError, match="TPU_PCP_KV_WORKSPACE_TOKENS"):
         validate_pcp_manager_config(_pcp_manager_config((1 << 20) + 1))
+
+
+def test_pcp_manager_layers_must_opt_in():
+    """An attention layer without `supports_tpu_pcp_manager` (e.g. DeepSeek V4's)
+    would ignore `pcp_metadata`; any such layer fails the check."""
+
+    class _Supported:
+        supports_tpu_pcp_manager = True
+
+    class _Unsupported:
+        pass
+
+    validate_pcp_manager_layers({"a": _Supported(), "b": _Supported()})
+    with pytest.raises(NotImplementedError, match="_Unsupported"):
+        validate_pcp_manager_layers({"a": _Supported(), "b": _Unsupported()})
+
+
+def test_glm_attention_layers_support_the_pcp_manager():
+    from vllm_torchtpu.layers.adapter.custom_ops.mla_attention_op import (
+        VllmTPUIndexerCache,
+        VllmTPUMLAAttention,
+    )
+
+    assert VllmTPUMLAAttention.supports_tpu_pcp_manager
+    assert VllmTPUIndexerCache.supports_tpu_pcp_manager
+
+
+def test_platform_check_rejects_the_pcp_manager_without_pcp(monkeypatch):
+    """`USE_TPU_PCP_MANAGER=1` with pcp_size == 1 fails the platform check,
+    before the workers spawn."""
+    from vllm_torchtpu.platforms.pcp_validation import PcpStaticSupportValidator
+
+    monkeypatch.setattr(envs, "USE_TPU_PCP_MANAGER", True)
+    with pytest.raises(NotImplementedError, match="pcp=1"):
+        PcpStaticSupportValidator.validate_platform_config(
+            _pcp_manager_config(pcp_size=1, tp_size=8), kv_cache_layout="NHD"
+        )

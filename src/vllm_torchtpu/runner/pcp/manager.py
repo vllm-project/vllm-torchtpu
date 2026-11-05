@@ -85,6 +85,22 @@ def validate_pcp_manager_config(vllm_config: Any) -> None:
         )
 
 
+def validate_pcp_manager_layers(layers: dict[str, Any]) -> None:
+    """Rejects attention layers without supports_tpu_pcp_manager"""
+    unsupported = sorted(
+        {
+            type(layer).__name__
+            for layer in layers.values()
+            if not getattr(layer, "supports_tpu_pcp_manager", False)
+        }
+    )
+    if unsupported:
+        raise NotImplementedError(
+            "USE_TPU_PCP_MANAGER=1 does not support these attention layers: "
+            f"{', '.join(unsupported)}."
+        )
+
+
 class PcpManager:
     """PCP x DCP manager owned by `TPUModelRunner`. The runner reads the
     prepared step's state from `sharding_plan`."""

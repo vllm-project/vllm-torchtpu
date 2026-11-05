@@ -84,11 +84,12 @@ class PcpShardingPlan(ABC):
         # rank holds it (None: `token_slice` maps it).
         self.request_major_to_local: np.ndarray | None = None
         # Global request-major sampling rows; each request's last token is
-        # local row `logits_local_indices_cpu[i]` on the ranks in
-        # `logits_owner_mask_cpu`.
+        # local row `logits_local_indices[i]` on the ranks in
+        # `logits_owner_mask`. Both are on the device, uploaded in
+        # `prepare_real` before the runner's input staging fence.
         self.logits_indices_cpu: torch.Tensor | None = None
-        self.logits_local_indices_cpu: torch.Tensor | None = None
-        self.logits_owner_mask_cpu: torch.Tensor | None = None
+        self.logits_local_indices: torch.Tensor | None = None
+        self.logits_owner_mask: torch.Tensor | None = None
         # No split request: every rank holds every sampling row.
         self.logits_all_local = False
 
@@ -176,16 +177,14 @@ class PcpShardingPlan(ABC):
     ) -> torch.Tensor | None:
         """The sampling rows of every request, or None to sample from
         `finalize_hidden_states`."""
-        if self.logits_local_indices_cpu is None or self.logits_owner_mask_cpu is None:
+        if self.logits_local_indices is None or self.logits_owner_mask is None:
             return None
-        device = hidden_states.device
-        local = self.logits_local_indices_cpu.to(device, non_blocking=True)
-        selected = hidden_states.index_select(0, local)
+        selected = hidden_states.index_select(0, self.logits_local_indices)
         if self.logits_all_local:
             return selected
         # The owner of each request's last token contributes it, the others
         # zeros, summed over PCP.
-        mask = self.logits_owner_mask_cpu.to(device, non_blocking=True)
+        mask = self.logits_owner_mask
         selected = torch.where(mask.unsqueeze(1), selected, torch.zeros_like(selected))
         return all_reduce_sum(selected)
 

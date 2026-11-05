@@ -167,7 +167,11 @@ from vllm_torchtpu.runner.mm_encoder_manager import (
     maybe_create_mm_encoder_manager,
 )
 from vllm_torchtpu.runner.mm_video_chunking import chunked_video_encoding
-from vllm_torchtpu.runner.pcp import PcpManager, mla_kv_page_size
+from vllm_torchtpu.runner.pcp import (
+    PcpManager,
+    mla_kv_page_size,
+    validate_pcp_manager_layers,
+)
 from vllm_torchtpu.runner.speculative_decoding_manager import (
     SpecDecodeMetadata,
     SpeculativeDecodingManager,
@@ -1891,6 +1895,11 @@ class TPUModelRunner(GPUModelRunner):
     # KV-cache spec derivation, sizing and allocation live on
     # `self.kv_cache_manager` now; these forward the runner's existing callers.
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
+        if self.pcp_manager is not None:
+            # After the model is built, before any compile.
+            validate_pcp_manager_layers(
+                get_layers_from_vllm_config(self.vllm_config, AttentionLayerBase)
+            )
         self._refresh_smem_request_caps()
         with set_current_vllm_config(self.vllm_config):
             return self.kv_cache_manager.get_kv_cache_spec()

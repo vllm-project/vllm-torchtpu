@@ -1152,6 +1152,8 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
 class VllmTPUIndexerCache(DeepseekV32IndexerCache):
     """Indexer K cache retyped onto the TPU backend. See `VllmTPUIndexer`."""
 
+    supports_tpu_pcp_manager: ClassVar[bool] = True
+
     def get_attn_backend(self) -> type[DeepseekV32IndexerBackend]:
         return VllmTPUDeepseekV32IndexerBackend
 
@@ -1247,7 +1249,10 @@ class TPUDummyMLAPrefillBackend:
 class VllmTPUMLAAttention(MLAAttention):
     """TPU-optimized out-of-tree wrapper for Multi-Head Latent Attention."""
 
+    # Read by vLLM's `MLAAttention.__init__`, which rejects PCP + DCP unless
+    # the subclass opts in; the PCP manager handles that combination.
     supports_pcp_dcp: ClassVar[bool] = True
+    supports_tpu_pcp_manager: ClassVar[bool] = True
 
     def __init__(
         self,

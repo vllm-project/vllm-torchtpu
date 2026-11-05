@@ -53,6 +53,7 @@ def _runner(num_computed, num_prompt, q_lens, capacity):
     seq_lens = np.zeros(capacity, dtype=np.int32)
     seq_lens[: len(q_lens)] = np.asarray(num_computed) + np.asarray(q_lens)
     return SimpleNamespace(
+        device=torch.device("cpu"),
         input_batch=SimpleNamespace(
             num_computed_tokens_cpu=np.asarray(num_computed, dtype=np.int32),
             num_prompt_tokens=np.asarray(num_prompt, dtype=np.int32),
