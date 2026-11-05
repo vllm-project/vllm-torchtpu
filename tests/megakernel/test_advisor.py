@@ -33,6 +33,7 @@ from jax.experimental.pallas import tpu as pltpu
 from tests.megakernel.megakernel_fakes import TINY_TILES, make_fake_model_spec
 from vllm_torchtpu import megakernel as mk
 from vllm_torchtpu.megakernel import advisor
+from vllm_torchtpu.megakernel.advisor.chips import resolve_chip_spec
 from vllm_torchtpu.megakernel.errors import MegakernelConfigError
 from vllm_torchtpu.megakernel.exec_spec import ExecSpec, Tiles
 
@@ -1709,7 +1710,7 @@ def test_compute_all_reduce_transfer_cost_multi_host_hierarchical() -> None:
     # 16 chips = 2 hosts. DCN bandwidth (12.5 GB/s) is 24x slower than ICI (300 GB/s),
     # so multi-host transfer time must be significantly higher.
     assert t_multi > 2.0 * t_single
-    assert hops == 4
+    assert hops == _MULTI_HOST_TP_HOPS
     assert lat_multi > 7 * chip.collective_latency_s
 
 
@@ -1756,3 +1757,71 @@ def test_kimi_k3_deployment_preset_registered_and_evaluated() -> None:
     assert preset.prefill.tp == 32
     assert preset.prefill.ep == 16
     assert preset.prefill.pcp == 32
+
+
+def test_measured_collective_latency_moves_step_bound() -> None:
+    """Measured collective latency must reach the all-reduce base latency term."""
+    wl = advisor.WorkloadSpec(phase="decode", batch=8, isl=128, osl=1, tp=8, ep=1)
+    rep_default = advisor.advise("qwen3.5-397b", wl, chip="tpu7x")
+    meas = advisor.MeasurementsData(
+        source_desc="test_trace",
+        collective_hop_us=3.0,
+        collective_n=10,
+    )
+    rep_calibrated = advisor.advise("qwen3.5-397b", wl, chip="tpu7x", measurements=meas)
+    assert (
+        rep_calibrated.metrics["step_floor_us"]["value"]
+        > rep_default.metrics["step_floor_us"]["value"]
+    )
+
+
+_CUSTOM_VMEM_CAPACITY_BYTES = 64 * 1024 * 1024
+_CUSTOM_VMEM_USABLE_BYTES = 48 * 1024 * 1024
+
+
+def test_custom_chip_spec_vmem_usable_bytes_preserved(tmp_path: Path) -> None:
+    """Custom chip spec vmem_usable_bytes must not be reset by _scale_megacore."""
+    spec_file = tmp_path / "custom_chip.json"
+    spec_file.write_text(
+        json.dumps(
+            {
+                "name": "custom_chip",
+                "vmem_capacity_bytes": _CUSTOM_VMEM_CAPACITY_BYTES,
+                "vmem_usable_bytes": _CUSTOM_VMEM_USABLE_BYTES,
+                "hbm_capacity_bytes": 34359738368,
+                "hbm_bw_bytes_per_s": 3700000000000.0,
+                "bf16_flops_per_s": 1155000000000000.0,
+                "fp8_flops_per_s": 2300000000000000.0,
+                "int8_flops_per_s": 2300000000000000.0,
+                "native_ocp_fp8": True,
+                "ici_egress_bw_bytes_per_s": 300000000000.0,
+                "ici_link_bw_bytes_per_s": 100000000000.0,
+                "collective_latency_s": 0.000001,
+                "collective_latency_us_bracket": [1.0, 5.0],
+                "dcn_bw_gbps": 100.0,
+                "dcn_bw_gbps_bracket": [50.0, 200.0],
+            }
+        )
+    )
+    spec = resolve_chip_spec("custom_chip", chip_spec_path=str(spec_file))
+    assert spec.vmem_usable_bytes == _CUSTOM_VMEM_USABLE_BYTES
+    assert spec.vmem_capacity_bytes == _CUSTOM_VMEM_CAPACITY_BYTES
+
+
+_MULTI_HOST_TP = 16
+_MULTI_HOST_TP_HOPS = 4
+
+
+def test_multi_host_all_reduce_respects_dcn_bandwidth() -> None:
+    """Multi-host all-reduce cost must scale with resolved DCN bandwidth."""
+    spec = resolve_chip_spec("tpu7x")
+    msg_bytes = 16.0 * 1024 * 1024
+    t_default, lat_default, hops, _ = advisor.compute_all_reduce_transfer_cost(
+        msg_bytes, _MULTI_HOST_TP, spec, dcn_bw_bytes_per_s=12.5e9
+    )
+    t_fast, lat_fast, _, _ = advisor.compute_all_reduce_transfer_cost(
+        msg_bytes, _MULTI_HOST_TP, spec, dcn_bw_bytes_per_s=25.0e9
+    )
+    assert t_fast < t_default
+    assert lat_fast == lat_default
+    assert hops == _MULTI_HOST_TP_HOPS

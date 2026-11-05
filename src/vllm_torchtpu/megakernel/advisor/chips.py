@@ -409,12 +409,14 @@ def _scale_megacore(
         if collective_latency_us is None
         else (collective_latency_us, collective_latency_us)
     )
+    vmem_reserve = base.vmem_capacity_bytes - base.vmem_usable_bytes
+    vmem_usable = max(0, vmem_cap - vmem_reserve)
     return replace(
         base,
         name=f"{base.name}_megacore" if num_cores == _MEGACORE_CORES else base.name,
         cores_per_device=num_cores,
         vmem_capacity_bytes=vmem_cap,
-        vmem_usable_bytes=vmem_cap - _USABLE_VMEM_RESERVE_BYTES,
+        vmem_usable_bytes=vmem_usable,
         hbm_capacity_bytes=base.hbm_capacity_bytes * num_cores,
         hbm_bw_bytes_per_s=base.hbm_bw_bytes_per_s * num_cores,
         bf16_flops_per_s=base.bf16_flops_per_s * num_cores,

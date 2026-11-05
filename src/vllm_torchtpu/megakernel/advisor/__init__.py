@@ -83,7 +83,6 @@ _DEFAULT_LAUNCH_GAP_UPPER_US = 8.0
 _MEASUREMENTS_SCHEMA = "advisor.measurements.v1"
 _CHIPS_PER_HOST: int = 8
 _COLLECTIVE_RING_THRESHOLD_BYTES: int = 16 * 1024
-_DEFAULT_DCN_EGRESS_BW_BYTES_PER_S: float = 12.5 * (1024**3)
 _DEFAULT_DCN_HOP_LATENCY_S: float = 5.0e-6
 
 SUPPORTED_ONCHIP_FAMILIES: frozenset[str] = frozenset(
@@ -470,6 +469,8 @@ def compute_all_reduce_transfer_cost(
     message_bytes: float,
     effective_tp: int,
     chip_spec: ChipSpec,
+    dcn_bw_bytes_per_s: float | None = None,
+    collective_latency_s: float | None = None,
 ) -> tuple[float, float, int, float]:
     """Computes transfer time, latency, hop count, and volume for All-Reduce.
 
@@ -490,12 +491,16 @@ def compute_all_reduce_transfer_cost(
         return 0.0, 0.0, 0, 0.0
 
     nominal_volume_bytes = 2.0 * (effective_tp - 1) / effective_tp * message_bytes
-
     hop_count = round(math.log2(effective_tp))
+    coll_lat = (
+        chip_spec.collective_latency_s
+        if collective_latency_s is None
+        else collective_latency_s
+    )
 
     if effective_tp <= _CHIPS_PER_HOST:
         transfer_time_s = nominal_volume_bytes / chip_spec.ici_egress_bw_bytes_per_s
-        base_latency_s = hop_count * chip_spec.collective_latency_s
+        base_latency_s = hop_count * coll_lat
         return transfer_time_s, base_latency_s, hop_count, nominal_volume_bytes
 
     # Multi-host hierarchical collective: intra-host ICI + inter-host DCN
@@ -504,12 +509,17 @@ def compute_all_reduce_transfer_cost(
     # 1. Intra-host ICI: reduce-scatter (7/8 * S) + all-gather (7/8 * S) across 8 chips
     intra_volume_bytes = 2.0 * (_CHIPS_PER_HOST - 1) / _CHIPS_PER_HOST * message_bytes
     intra_transfer_time_s = intra_volume_bytes / chip_spec.ici_egress_bw_bytes_per_s
-    intra_latency_s = 3 * chip_spec.collective_latency_s
+    intra_latency_s = 3 * coll_lat
 
     # 2. Inter-host DCN: all-reduce of partitioned 1/8th slice across num_hosts
+    dcn_bw = (
+        (chip_spec.dcn_bw_gbps / 8.0) * 1e9
+        if dcn_bw_bytes_per_s is None
+        else dcn_bw_bytes_per_s
+    )
     inter_slice_bytes = message_bytes / float(_CHIPS_PER_HOST)
     inter_volume_bytes = 2.0 * (num_hosts - 1) / num_hosts * inter_slice_bytes
-    inter_transfer_time_s = inter_volume_bytes / _DEFAULT_DCN_EGRESS_BW_BYTES_PER_S
+    inter_transfer_time_s = inter_volume_bytes / max(1.0, dcn_bw)
     inter_latency_s = round(math.log2(num_hosts)) * _DEFAULT_DCN_HOP_LATENCY_S
 
     total_transfer_time_s = intra_transfer_time_s + inter_transfer_time_s
@@ -863,7 +873,7 @@ def _evaluate_scopes(
     """Evaluate every FusionScope against VMEM, HBM, and matmul bounds."""
     layers_local, l_moe, active_tokens = ctx.layers_local, ctx.l_moe, ctx.active_tokens
     token_residual_bytes, ep_dp = ctx.token_residual_bytes, ctx.ep_dp
-    num_ar, ar_hops = ctx.num_ar, ctx.ar_hops
+    num_ar = ctx.num_ar
     lat_coll = ctx.lat_coll
     pp_stage_time, a2a_time = ctx.pp_stage_time, ctx.a2a_time
     flops_dense, flops_moe = ctx.flops_dense, ctx.flops_moe
@@ -977,7 +987,7 @@ def _evaluate_scopes(
         step_us = pure_us + n_ops * workload.op_overhead_us
 
         coll_extra_s = (
-            num_ar * n_splits * xla_ar_factor * ar_hops
+            num_ar * n_splits * xla_ar_factor * ctx.ar_intra_hops
             + (2 * l_moe * n_splits * xla_ar_factor if l_moe > 0 and ep_dp > 1 else 0)
         ) * max(0.0, ctx.lat_coll_upper - lat_coll)
         roof_upper_us = (
@@ -1060,6 +1070,9 @@ class _ScopeContext:
     row_floor: int
     num_ar: int
     ar_hops: int
+    ar_intra_hops: int
+    ar_inter_latency_s: float
+    dcn_bytes_per_s: float
     ar_vol: float
     ar_transfer_time_s: float
     ar_base_lat_s: float
@@ -1131,6 +1144,7 @@ def _build_scope_context(
     chip_spec: ChipSpec,
     dtypes_bw: tuple[float, float, float, float],
     plan_error: str,
+    meas: MeasurementsData | None = None,
 ) -> _ScopeContext:
     """Assemble per-core weight, state, FLOP, and VMEM scope context."""
     bw_w, bw_e, bw_kv, bw_st = dtypes_bw
@@ -1309,8 +1323,26 @@ def _build_scope_context(
     has_unmodeled_family = any(
         fam not in SUPPORTED_ONCHIP_FAMILIES for fam in profile.layer_families
     )
+    dcn_bw_gbps = (
+        meas.dcn_bw_gbps
+        if meas is not None and meas.dcn_bw_gbps is not None
+        else chip_spec.dcn_bw_gbps
+    )
+    dcn_bytes_per_s = (dcn_bw_gbps / 8.0) * 1e9
     ar_transfer_time_s, ar_base_lat_s, ar_hops, ar_vol = (
-        compute_all_reduce_transfer_cost(token_residual_bytes, eff_tp, chip_spec)
+        compute_all_reduce_transfer_cost(
+            token_residual_bytes,
+            eff_tp,
+            chip_spec,
+            dcn_bw_bytes_per_s=dcn_bytes_per_s,
+        )
+    )
+    ar_intra_hops = round(math.log2(eff_tp)) if eff_tp <= _CHIPS_PER_HOST else 3
+    num_hosts = math.ceil(eff_tp / _CHIPS_PER_HOST)
+    ar_inter_latency_s = (
+        0.0
+        if eff_tp <= _CHIPS_PER_HOST
+        else round(math.log2(num_hosts)) * _DEFAULT_DCN_HOP_LATENCY_S
     )
     return _ScopeContext(
         vmem_budget=vmem_budget,
@@ -1355,6 +1387,9 @@ def _build_scope_context(
         ),
         num_ar=profile.ar_slots_per_layer * layers_local,
         ar_hops=ar_hops,
+        ar_intra_hops=ar_intra_hops,
+        ar_inter_latency_s=ar_inter_latency_s,
+        dcn_bytes_per_s=dcn_bytes_per_s,
         ar_vol=ar_vol,
         ar_transfer_time_s=ar_transfer_time_s,
         ar_base_lat_s=ar_base_lat_s,
@@ -1551,10 +1586,12 @@ def _apply_box(
     ctx: _ScopeContext, workload: WorkloadSpec, box: _AssumedBox
 ) -> tuple[_ScopeContext, WorkloadSpec]:
     """Price scope floors at the box low corner and band tops at its high corner."""
+    new_ar_base_lat_s = ctx.ar_intra_hops * box.collective_s[0] + ctx.ar_inter_latency_s
     new_ctx = replace(
         ctx,
         lat_coll=box.collective_s[0],
         lat_coll_upper=box.collective_s[1],
+        ar_base_lat_s=new_ar_base_lat_s,
         launch_gap_upper_us=box.launch_gap_us[1],
     )
     return new_ctx, replace(workload, op_overhead_us=box.launch_gap_us[0])
@@ -1576,9 +1613,16 @@ def _evaluate_corners(
     table: dict[_Corner, dict[FusionScope, float]] = {}
     for lg in dict.fromkeys(box.launch_gap_us):
         for coll in dict.fromkeys(box.collective_s):
+            ar_lat = ctx.ar_intra_hops * coll + ctx.ar_inter_latency_s
             for dot in box.attn_dots:
                 est, _ = _evaluate_scopes(
-                    replace(ctx, lat_coll_upper=coll, launch_gap_upper_us=lg),
+                    replace(
+                        ctx,
+                        lat_coll=coll,
+                        lat_coll_upper=coll,
+                        ar_base_lat_s=ar_lat,
+                        launch_gap_upper_us=lg,
+                    ),
                     profile,
                     replace(workload, op_overhead_us=lg),
                     bf16_attention_upper=dot == _DOT_BF16,
@@ -2004,7 +2048,9 @@ def advise(
 
     dtypes_bw = _validate_advise_inputs(prof, eff_wl)
     chip_spec = resolve_chip_spec(chip, chip_spec_path=cs_path)
-    ctx = _build_scope_context(prof, eff_wl, chip_spec, dtypes_bw, plan_error)
+    ctx = _build_scope_context(
+        prof, eff_wl, chip_spec, dtypes_bw, plan_error, meas=meas
+    )
     box = _assumed_box(
         ctx, eff_wl, _resolve_calibrated_priors(eff_wl, chip_spec, ctx, meas)
     )
