@@ -174,8 +174,10 @@ def _select_committed_mamba_blocks(
 ) -> list[int]:
     """Select each Mamba group's last committed state checkpoint.
 
-    The final ``K`` entries are speculative, so the committed checkpoint is
-    the ``-(K + 1)`` entry for a group with speculative depth ``K``.
+    The final K entries are speculative, so the committed prompt-end state sits
+    at -(K + 1) for speculative depth K. Any internal prefill checkpoint block
+    reserved by the step sits earlier at -(K + 2) and is excluded because it
+    stores an intermediate prefix state rather than the prompt-end state.
     """
     required_blocks = num_speculative_blocks + 1
     committed_blocks: list[int] = []
@@ -4019,12 +4021,12 @@ class TPURaidenConnectorWorker:
             )
         if tp_size == 1 and pcp_size == 1 and dp_size == 1 and pp_size in (2, 4, 8):
             return f"pp{pp_size}_decode"
-        if pcp_size != 1 or tp_size not in (1, 2) or dp_size not in (2, 4, 8, 16):
+        if pcp_size != 1 or tp_size not in (1, 2, 4) or dp_size not in (2, 4, 8, 16):
             raise ValueError(
                 "Raiden Qwen3.5 admission topology dp{N}_decode or "
-                "dp{N}tp2_decode requires kv_consumer with "
+                "dp{N}tp{2,4}_decode requires kv_consumer with "
                 "prefill_context_parallel_size=1, tensor_parallel_size in "
-                "(1, 2), data_parallel_size in (2, 4, 8, 16); got "
+                "(1, 2, 4), data_parallel_size in (2, 4, 8, 16); got "
                 f"prefill_context_parallel_size={pcp_size}, "
                 f"tensor_parallel_size={tp_size}, "
                 f"data_parallel_size={dp_size}"

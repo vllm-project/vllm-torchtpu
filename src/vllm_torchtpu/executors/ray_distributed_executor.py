@@ -35,10 +35,14 @@ from vllm.v1.executor.ray_executor import (
 from vllm.v1.executor.ray_executor import RayWorkerMetaData
 from vllm.v1.executor.ray_utils import WORKER_SPECIFIC_ENV_VARS, _wait_until_pg_ready
 from vllm.v1.executor.ray_utils import RayWorkerWrapper as RayWorkerWrapperV1
+from vllm.v1.kv_cache_interface import KVCacheSpec
 from vllm.v1.outputs import ModelRunnerOutput
 
 from vllm_torchtpu import envs as tpu_envs
 from vllm_torchtpu.distributed.utils import set_node_kv_ip_port
+from vllm_torchtpu.executors.kv_block_override import (
+    adopt_worker_num_gpu_blocks_override,
+)
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.platforms.tpu_platform import get_tpu_multihost_topology
 from vllm_torchtpu.runner.tpu_runner import AsyncTPUModelRunnerOutput
@@ -539,6 +543,11 @@ class RayDistributedExecutor(RayDistributedExecutorV1):
                     assert len(self.pp_tp_workers[pp_rank]) == tp_rank
                     assert pp_rank < len(self.pp_tp_workers)
                     self.pp_tp_workers[pp_rank].append(self.workers[rank])
+
+    def get_kv_cache_specs(self) -> list[dict[str, KVCacheSpec]]:
+        specs = super().get_kv_cache_specs()
+        adopt_worker_num_gpu_blocks_override(self)
+        return specs
 
     # Ray executor do not need handshake metadata
     # as we pass the kv_parameters through proxy server

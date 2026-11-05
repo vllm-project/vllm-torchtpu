@@ -16,6 +16,7 @@
 # especially torch_tpu which might read them at import time.
 import vllm_torchtpu.env_override  # noqa: F401  # isort: skip
 
+import importlib.util
 import os
 import time
 from typing import TYPE_CHECKING, Protocol, Union, cast
@@ -31,6 +32,7 @@ from torch_tpu._internal.utils import hardware
 from vllm.platforms.interface import Platform, PlatformEnum
 
 from vllm_torchtpu import envs, patch_registry
+from vllm_torchtpu.core.eagle_block_drop import apply_eagle_block_drop_override
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.platforms.pcp_validation import PcpStaticSupportValidator
 from vllm_torchtpu.platforms.pp_validation import validate_pipeline_parallel_config
@@ -327,6 +329,9 @@ def _validate_peer_replay_config() -> None:
     """
     if not (envs.TPU_PARALLEL_PRECOMPILE and envs.TPU_PRECOMPILE_PEER_REPLAY):
         return
+    # Parse it now, so a bad value fails the launch rather than the precompile
+    # that reads it after the model has loaded.
+    envs.TPU_PRECOMPILE_PEER_WAIT_S  # noqa: B018
     if vllm_envs.VLLM_DISABLE_COMPILE_CACHE:
         raise ValueError(
             "TPU_PRECOMPILE_PEER_REPLAY=1 needs vLLM's compile cache: peer ranks "
@@ -496,6 +501,7 @@ class TpuPlatform(Platform):
         "VLLM_TPU_INDEXER_KV_CACHE_MODE",
         "TPU_DCP_INDEXER_A2A_MERGE",
         "TPU_DCP_INDEXER_A2A_MIN_TOKENS",
+        "TPU_SKIP_MAMBA_SCHEDULER_BLOCKS",
         "TPU_USE_RAIDEN_KV_CACHE_MANAGER",
         "TPU_RAIDEN_GLM_ADMISSION",
         "TPU_KV_RESHARD_TRANSPORT",
@@ -779,6 +785,55 @@ class TpuPlatform(Platform):
         return {}
 
     @classmethod
+    def external_env_var_prefixes(cls) -> tuple[str, ...]:
+        """Prefixes owned by a reader that has no registry to check against."""
+        # vLLM-Omni reads its VLLM_OMNI_* knobs directly and has no registry.
+        # Its stages call EngineArgs.create_engine_config with this class as
+        # vLLM's current_platform (OmniTpuPlatform is only
+        # current_omni_platform), so the prefix must be known here.
+        if importlib.util.find_spec("vllm_omni") is not None:
+            return ("VLLM_OMNI_",)
+        return ()
+
+    @classmethod
+    def known_env_var_names(cls) -> set[str]:
+        """Names this package reads or writes. Subclasses may extend it."""
+        from vllm_torchtpu.env_validation import PACKAGE_WRITTEN_ENV_VARS
+
+        return (
+            set(envs.environment_variables)
+            | set(cls.additional_env_vars)
+            | PACKAGE_WRITTEN_ENV_VARS
+        )
+
+    @classmethod
+    def validate_environ(cls, hard_fail: bool) -> None:
+        """Reports set env vars that neither vLLM nor this package reads.
+
+        Replaces vLLM's check, which flags every VLLM_* name missing from
+        vLLM's registry, including this package's VLLM_TPU_* knobs.
+        EngineArgs calls it once, in the front-end process; hard_fail is
+        vLLM's --fail-on-environ-validation.
+        """
+        from vllm_torchtpu.env_validation import find_unread_env_vars
+
+        unread = find_unread_env_vars(
+            os.environ,
+            cls.known_env_var_names(),
+            vllm_envs.environment_variables,
+            cls.external_env_var_prefixes(),
+        )
+        if not unread:
+            return
+        message = (
+            "Environment variables that nothing reads (unset them, or fix the "
+            "name): " + ", ".join(str(u) for u in unread)
+        )
+        if hard_fail:
+            raise ValueError(message)
+        logger.warning(message)
+
+    @classmethod
     def check_and_update_config(cls, vllm_config: VllmConfig) -> None:
         assert "sharding" not in cast(dict, vllm_config.additional_config), (
             "Legacy additional_config['sharding'] is no longer supported. "
@@ -796,6 +851,9 @@ class TpuPlatform(Platform):
             "platform_activation", model_config=vllm_config.model_config
         )
         _register_tpu_kv_connectors()
+        # Apply before VllmConfig is pickled so EngineCore and all workers see
+        # the same setting.
+        apply_eagle_block_drop_override(vllm_config)
 
         if vllm_envs.VLLM_TPU_USING_PATHWAYS:
             raise NotImplementedError(
@@ -1371,6 +1429,16 @@ class TpuPlatform(Platform):
     @classmethod
     def support_hybrid_kv_cache(cls) -> bool:
         return True
+
+    @classmethod
+    def register_custom_kv_cache_specs(cls, vllm_config: VllmConfig) -> None:
+        # Unconditional: the manager is only used for the specs the runner
+        # emits where it owns the GDN state slots (core/runner_slot_mamba.py).
+        from vllm_torchtpu.core.runner_slot_mamba import (
+            register_runner_slot_mamba_spec,
+        )
+
+        register_runner_slot_mamba_spec()
 
 
 def _get_exponential_token_paddings(

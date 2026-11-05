@@ -17,6 +17,7 @@ Moved verbatim out of `tests/runner/test_tpu_runner.py` alongside the code
 they cover; see vllm-project/vllm-torchtpu#713.
 """
 
+import dataclasses
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -33,6 +34,7 @@ from vllm.config import (
 from vllm.model_executor.layers.attention import Attention, MLAAttention
 from vllm.model_executor.layers.mamba.abstract import MambaBase
 from vllm.v1.attention.backend import AttentionType
+from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheConfig,
@@ -45,6 +47,7 @@ from vllm.v1.kv_cache_interface import (
 from vllm.v1.worker.utils import AttentionGroup
 
 from vllm_torchtpu import utils
+from vllm_torchtpu.core.runner_slot_mamba import RunnerSlotMambaSpec
 from vllm_torchtpu.layers.adapter.attention import (
     PallasAttentionBackend,
     PallasBatchedRPAAttentionBackend,
@@ -98,6 +101,16 @@ class DummyMamba(MambaBase):
     @property
     def mamba_type(self):
         return "dummy"
+
+
+class DummyGdn(DummyMamba):
+    """DummyMamba reporting the GDN backend, as Qwen's GDN layers do."""
+
+    def get_kv_cache_spec(self, vllm_config):
+        return dataclasses.replace(
+            super().get_kv_cache_spec(vllm_config),
+            mamba_type=MambaAttentionBackendEnum.GDN_ATTN,
+        )
 
 
 class _FakeReserveSpec:
@@ -597,6 +610,11 @@ class TestKVCacheManager:
         assert isinstance(created_caches["attn.0"], torch.Tensor)
         assert created_caches["attn.0"].shape == (100, 16, 2, 1, 128)
 
+    @pytest.mark.parametrize(
+        "mamba_spec_cls, uniform_mamba_layout",
+        [(MambaSpec, False), (RunnerSlotMambaSpec, False), (RunnerSlotMambaSpec, True)],
+        ids=["stock_spec", "runner_slot_spec", "runner_slot_spec_without_slot_pool"],
+    )
     @patch(
         "vllm_torchtpu.runner.tpu_runner.PallasAttentionBackend.get_kv_cache_shape",
         return_value=(100, 16, 2, 1, 128),
@@ -618,10 +636,15 @@ class TestKVCacheManager:
         mock_bind_kv_cache,
         mock_get_page_size,
         mock_get_shape,
+        mamba_spec_cls,
+        uniform_mamba_layout,
     ):
         """Compact-mamba: when _mamba_num_blocks is set, mamba layers allocate
         exactly that many recurrent slots while attention keeps num_blocks, and
-        the slot pool is initialized to _mamba_num_blocks."""
+        the slot pool is initialized to _mamba_num_blocks. Every cache is
+        allocated on the device (no host copy) and flushed by one sync. A
+        RunnerSlotMambaSpec group (no scheduler blocks) is refused where there
+        is no slot pool."""
         num_blocks = 100
         mamba_num_blocks = 17  # max_num_reqs(16) + 1
         uniform_size = 203776
@@ -634,7 +657,7 @@ class TestKVCacheManager:
             dtype=torch.bfloat16,
             page_size_padded=uniform_size,
         )
-        mamba_spec = MambaSpec(
+        mamba_spec = mamba_spec_cls(
             block_size=16,
             shapes=[(4, 128), (8, 64, 32)],
             dtypes=[torch.bfloat16, torch.float32],
@@ -672,8 +695,37 @@ class TestKVCacheManager:
         mock_input_batch.return_value.block_table = mock_block_tables
         self.runner.input_batch = mock_input_batch.return_value
         self.runner.kv_caches = []
+        self.runner._uniform_mamba_layout = uniform_mamba_layout
+        if uniform_mamba_layout:
+            # No slot pool: the group's empty block-table rows would send every
+            # request's state to block 0.
+            self.runner._mamba_num_blocks = None
+            with (
+                patch("vllm_torchtpu.runner.kv_cache_manager.synchronize_tensors"),
+                pytest.raises(RuntimeError, match="take no scheduler blocks"),
+            ):
+                self.runner.initialize_kv_cache(kv_cache_config)
+            self.runner._init_mamba_slot_pool.assert_not_called()
+            return
         self.runner._mamba_num_blocks = mamba_num_blocks
-        self.runner.initialize_kv_cache(kv_cache_config)
+        # Record the `device` each torch.zeros result was created with. On a
+        # CPU runner a host tensor copied with `.to(device)` is the same object,
+        # so a cache built that way records no device.
+        real_zeros = torch.zeros
+        zeros_device: dict[int, torch.device | None] = {}
+
+        def recording_zeros(*args, **kwargs):
+            out = real_zeros(*args, **kwargs)
+            zeros_device[id(out)] = kwargs.get("device")
+            return out
+
+        with (
+            patch.object(torch, "zeros", side_effect=recording_zeros),
+            patch(
+                "vllm_torchtpu.runner.kv_cache_manager.synchronize_tensors"
+            ) as mock_sync,
+        ):
+            self.runner.initialize_kv_cache(kv_cache_config)
 
         created_caches = mock_bind_kv_cache.call_args[0][0]
         # Mamba: only mamba_num_blocks slots; attention: full num_blocks.
@@ -683,6 +735,14 @@ class TestKVCacheManager:
         assert created_caches["attn.0"].shape == (100, 16, 2, 1, 128)
         # Slot pool sized to the compact mamba block count.
         self.runner._init_mamba_slot_pool.assert_called_once_with(mamba_num_blocks)
+        # Each cache is allocated on the device, and one sync flushes them all.
+        caches = [created_caches["attn.0"]]
+        for name in ["mamba.0", "mamba.1", "mamba.2"]:
+            caches.extend(created_caches[name])
+        for cache in caches:
+            assert zeros_device.get(id(cache)) == self.runner.device
+        mock_sync.assert_called_once()
+        assert {id(t) for t in mock_sync.call_args[0][0]} == {id(c) for c in caches}
 
     @patch("vllm_torchtpu.runner.kv_cache_manager.get_layers_from_vllm_config")
     def test_batched_kv_spec_rpc_establishes_config_context(self, mock_get_layers):
@@ -753,6 +813,59 @@ class TestKVCacheManager:
             mamba_spec = kv_cache_specs[layer_name]
             assert isinstance(mamba_spec, MambaSpec)
             assert mamba_spec.page_size_padded == expected_padded_size
+
+    @pytest.mark.parametrize(
+        "env_value, uniform_mamba_layout, expect_runner_slot",
+        [(None, False, True), ("0", False, False), (None, True, False)],
+        ids=["compact_default", "opt_out", "uniform_mamba_layout"],
+    )
+    @patch("vllm_torchtpu.runner.kv_cache_manager.get_layers_from_vllm_config")
+    @patch(
+        "vllm_torchtpu.runner.tpu_runner.PallasAttentionBackend.get_kv_cache_page_size_bytes",
+        return_value=4096,
+    )
+    @patch(
+        "vllm_torchtpu.utils.torch.accelerator.get_memory_info",
+        return_value=(10 * 1024 * 1024 * 1024, 10 * 1024 * 1024 * 1024),
+    )
+    def test_get_kv_cache_spec_gdn_runner_slot_flag(
+        self,
+        mock_mem_info,
+        mock_get_page_size,
+        mock_get_layers,
+        monkeypatch,
+        env_value,
+        uniform_mamba_layout,
+        expect_runner_slot,
+    ):
+        """GDN specs reach vLLM as RunnerSlotMambaSpec by default when
+        compact-mamba sizing gave the runner its own GDN slots;
+        TPU_SKIP_MAMBA_SCHEDULER_BLOCKS=0 opts out."""
+        if env_value is None:
+            monkeypatch.delenv("TPU_SKIP_MAMBA_SCHEDULER_BLOCKS", raising=False)
+        else:
+            monkeypatch.setenv("TPU_SKIP_MAMBA_SCHEDULER_BLOCKS", env_value)
+        self.runner._uniform_mamba_layout = uniform_mamba_layout
+
+        mock_attn = _attention_layer_mock()
+        mock_attn.attn_type = AttentionType.DECODER
+        mock_attn.num_kv_heads = 2
+        mock_attn.head_size = 128
+        mock_attn.kv_sharing_target_layer_name = None
+        mock_attn.sliding_window = None
+        layers = {"attn_0": mock_attn}
+        layers.update({f"gdn_{i}": DummyGdn() for i in range(3)})
+        mock_get_layers.return_value = layers
+
+        kv_cache_specs = self.runner.get_kv_cache_spec()
+
+        assert (self.runner._mamba_num_blocks is not None) == (not uniform_mamba_layout)
+        assert type(kv_cache_specs["attn_0"]) is FullAttentionSpec
+        for i in range(3):
+            spec = kv_cache_specs[f"gdn_{i}"]
+            expected = RunnerSlotMambaSpec if expect_runner_slot else MambaSpec
+            assert type(spec) is expected
+            assert spec.page_size_padded == 203776
 
     @patch.object(
         TpuPlatform, "_find_non_ssm_backend", return_value=PallasMLAttentionBackend
@@ -1315,12 +1428,16 @@ class TestKVCacheManager:
                 "vllm_torchtpu.runner.kv_cache_manager.has_kv_transfer_group",
                 return_value=False,
             ),
+            patch("vllm_torchtpu.runner.kv_cache_manager.synchronize_tensors") as sync,
         ):
             self.runner.initialize_kv_cache(config)
         caches = bind.call_args.args[0]
         unique = {id(cache): cache for cache in caches.values()}
         assert sum(cache.nbytes for cache in unique.values()) == budget
         assert len(unique) == 2
+        # One sync flushes the shared caches, as it does the per-layer ones.
+        sync.assert_called_once()
+        assert {id(t) for t in sync.call_args.args[0]} == set(unique)
         for index in range(2):
             assert caches[f"full.{index}"] is caches[f"swa.{index}"]
             assert caches[f"full.{index}"].shape[0] == num_blocks

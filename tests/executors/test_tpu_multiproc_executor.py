@@ -220,3 +220,33 @@ def test_ray_executor_raises_on_real_disagreement():
         pytest.raises(ValueError, match="workers disagree"),
     ):
         executor.get_kv_cache_specs()
+
+
+def test_ray_v1_executor_copies_override_from_workers():
+    """The Ray V1 executor (VLLM_USE_RAY_V2_EXECUTOR_BACKEND=0) must adopt the
+    workers' compact-mamba override too: workers that set it skip their profile
+    run, so an engine left without it would size the KV pool from their
+    unprofiled HBM budget."""
+    from vllm.v1.executor.ray_executor import (
+        RayDistributedExecutor as RayDistributedExecutorV1,
+    )
+
+    from vllm_torchtpu.executors.ray_distributed_executor import (
+        RayDistributedExecutor,
+    )
+
+    executor = RayDistributedExecutor.__new__(RayDistributedExecutor)
+    executor.vllm_config = MagicMock()
+    executor.vllm_config.cache_config = MagicMock(spec=CacheConfig)
+    executor.vllm_config.cache_config.num_gpu_blocks_override = None
+    executor.vllm_config.parallel_config.world_size = 4
+    executor.vllm_config.parallel_config.pipeline_parallel_size = 1
+    executor.collective_rpc = MagicMock(return_value=[49966, 49965, 49967, 49965])
+    with patch.object(
+        RayDistributedExecutorV1, "get_kv_cache_specs", return_value=_SPECS
+    ):
+        specs = executor.get_kv_cache_specs()
+
+    assert specs is _SPECS
+    executor.collective_rpc.assert_called_once_with("get_num_gpu_blocks_override")
+    assert executor.vllm_config.cache_config.num_gpu_blocks_override == 49965
