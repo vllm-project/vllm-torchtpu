@@ -63,11 +63,15 @@ from vllm_torchtpu.layers.core.attention_metadata import (
 from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
 from vllm_torchtpu.runner import tpu_runner
 from vllm_torchtpu.runner import utils as runner_utils_module
+from vllm_torchtpu.runner.speculative_decoding_manager import (
+    SpeculativeDecodingManager,
+)
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 from vllm_torchtpu.runner.tpu_runner_async_output import (
     INVALID_TOKEN_ID,
     AsyncPreResults,
 )
+from vllm_torchtpu.spec_decode.eagle3 import Eagle3Proposer
 
 
 def _warmup_requests():
@@ -135,6 +139,51 @@ def test_spec_warmup_request_counts_blocks_in_block_table_units(
     # 40960 tokens in 40 entries of 1024, and the ids must fit that row.
     assert block_ids == list(range(1, 1 + expected_blocks))
     assert len(block_ids) <= spec.max_num_blocks_per_req(config, 40960)
+
+
+def test_spec_warmup_request_verifies_k_drafts_under_dynamic_schedule():
+    """Each warmup decode step verifies the K drafts the step before proposed,
+    also when a dynamic speculative decoding schedule cuts host drafts."""
+    spec = FullAttentionSpec(
+        block_size=128, num_kv_heads=1, head_size=128, dtype=torch.bfloat16
+    )
+    drafter = MagicMock(spec=Eagle3Proposer)
+    drafter.propose.return_value = [[7, 8, 9]]
+    captured = []
+    runner = SimpleNamespace(
+        max_model_len=4096,
+        speculative_config=SimpleNamespace(
+            method="eagle3",
+            num_speculative_tokens=3,
+            uses_dynamic_speculative_decoding=lambda: True,
+        ),
+        kv_cache_config=SimpleNamespace(
+            num_blocks=64, kv_cache_groups=[SimpleNamespace(kv_cache_spec=spec)]
+        ),
+        vllm_config=SimpleNamespace(
+            parallel_config=SimpleNamespace(decode_context_parallel_size=1)
+        ),
+        input_batch=SimpleNamespace(num_reqs=1, req_ids=["__spec_warmup_0__"]),
+        _is_async_drafter=True,
+        _async_drafter=drafter,
+        execute_model=lambda so: captured.append(so),
+        _warmup_spec_decode_cleanup=lambda rids: True,
+        requests=_warmup_requests(),
+    )
+    manager = SpeculativeDecodingManager(runner)
+    runner.sample_tokens = lambda _: manager.propose_draft_token_ids(
+        sampled_token_ids=None,
+        scheduler_output=captured[-1],
+        next_tokens_per_chunk=[None],
+    )
+    runner.take_draft_token_ids = manager.take_draft_token_ids
+
+    assert TPUModelRunner._warmup_one_spec_request(runner, 128, idx=0)
+
+    decode_steps = captured[1:]
+    assert decode_steps
+    for so in decode_steps:
+        assert so.scheduled_spec_decode_tokens == {"__spec_warmup_0__": [7, 8, 9]}
 
 
 class _BlockTables(list):
