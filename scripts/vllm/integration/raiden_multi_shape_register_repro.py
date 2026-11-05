@@ -30,6 +30,9 @@ write + `copy_` (`donate`), then probes the controller and registers, like
 Each variant runs in its own subprocess, so a segfault or a TPU fatal error is
 reported and the next variant still runs. Variants (default: all, in order):
 
+  tiny      one layer, 8 host blocks (384 KiB pinned)
+  m3rl      m3 after raising the soft RLIMIT_MEMLOCK to the hard limit
+  glmrl     glm after the same raise
   glm       uint32 (nb, W/2, 128) arrays, GLM-DSA sparse-MLA style (prod)
   uint8     uint8 (nb, 32, 4, W) arrays, DSv4 style (prod)
   m3        fp8 (nb, 32, 4, W): the served MiniMax M3 geometry
@@ -56,6 +59,9 @@ import sys
 import time
 
 VARIANTS = {
+    "tiny": {"layers": 1, "host_blocks": 8},
+    "m3rl": {"raise_memlock": True},
+    "glmrl": {"dtype": "uint32", "raise_memlock": True},
     "glm": {"dtype": "uint32"},
     "uint8": {"dtype": "uint8"},
     "m3": {},
@@ -73,6 +79,7 @@ BASE = {
     "view": "int8",
     "host_blocks": 23301,
     "donate": False,
+    "raise_memlock": False,
 }
 
 
@@ -141,6 +148,16 @@ def _run(cfg: dict, port: int) -> None:
     }[cfg["dtype"]]
     device = torch.device("tpu")
     nb = cfg["num_blocks"]
+
+    import resource
+
+    soft, hard = resource.getrlimit(resource.RLIMIT_MEMLOCK)
+    with open("/proc/self/status") as f:
+        cap = [line.strip() for line in f if line.startswith("CapEff")]
+    print(f"MEMLOCK soft={soft} hard={hard} {cap}", flush=True)
+    if cfg["raise_memlock"]:
+        resource.setrlimit(resource.RLIMIT_MEMLOCK, (hard, hard))
+        print(f"MEMLOCK raised to {resource.getrlimit(resource.RLIMIT_MEMLOCK)}")
 
     # One device array per cache, block 3 filled on the host before upload.
     caches = []
@@ -212,8 +229,10 @@ def _run(cfg: dict, port: int) -> None:
                     node_id=0,
                 )
             except Exception as e:
-                print(f"register attempt failed: {e!r}", flush=True)
-                time.sleep(1.0)
+                # No retry: a second KVCacheManager after a failed one
+                # segfaults, which hides the first error.
+                print(f"REGISTER FAILED: {e!r}", flush=True)
+                return
         print("REGISTERED", flush=True)
 
         _wait(mgr.d2h([3], [0]))
@@ -231,7 +250,10 @@ def _run(cfg: dict, port: int) -> None:
         print(f"ROUNDTRIP {verdict}", flush=True)
     finally:
         store.stdin.close()
-        store.wait(timeout=60)
+        try:
+            store.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            store.kill()
 
 
 def main() -> None:
