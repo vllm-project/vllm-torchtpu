@@ -43,7 +43,13 @@ def prepare_inputs(
     v_scale: jax.Array | None = None,
     kv_layout: configs.KVLayout = configs.KVLayout.HEAD_ALONG_SUBLANE,
     page_size: int = 128,
+    shared_kv_rotary_dims: int = 0,
 ) -> tuple[jax.Array, jax.Array]:
+    """The kernel's query and new-K/V layouts. With `shared_kv_rotary_dims`
+    (one KV head, SEQ_ALONG_LANE), the new tokens' page rows are the value in
+    head slot 0 and the key's rotated dims (`configs.ServingConfigs.
+    shared_kv_rotary_dims`) leading slot 1, zero after them; the rest of the
+    key is not stored."""
     total_q_tokens, actual_num_q_heads, actual_q_head_dim = q.shape
     _, actual_num_kv_heads, actual_kv_head_dim = k.shape
     num_q_heads_per_kv_head = actual_num_q_heads // actual_num_kv_heads
@@ -103,6 +109,19 @@ def prepare_inputs(
     # Pad keys and values head_dim
     actual_num_kv_heads_x2 = actual_num_kv_heads * 2
     num_kv_heads_x2_aligned = utils.align_to(actual_num_kv_heads_x2, kv_packing)
+
+    if shared_kv_rotary_dims:
+        validate_shared_kv(
+            shared_kv_rotary_dims,
+            actual_num_kv_heads,
+            actual_kv_head_dim,
+            kv_layout,
+            use_per_token_scale=k_scale is not None,
+        )
+        half, r = actual_kv_head_dim // 2, shared_kv_rotary_dims
+        rotated = jnp.concatenate([k[..., :r], k[..., half : half + r]], axis=-1)
+        rotated = jnp.pad(rotated, ((0, 0), (0, 0), (0, actual_kv_head_dim - 2 * r)))
+        k, v = v, rotated
 
     if k_scale is not None and v_scale is not None:
         k_scale = k_scale.reshape(total_q_tokens, actual_num_kv_heads)
@@ -169,6 +188,34 @@ def prepare_inputs(
             aligned_kv_head_dim,
         )
     return o_hbm_alias_q_hbm, new_kv_hbm
+
+
+def validate_shared_kv(
+    rotary_dims: int,
+    num_kv_heads: int,
+    head_dim: int,
+    kv_layout: configs.KVLayout,
+    use_per_token_scale: bool = False,
+) -> None:
+    """Raises unless shared-KV pages (`shared_kv_rotary_dims`) can hold
+    this layer's KV."""
+    packing_rows = 4 * pltpu.get_tpu_info().num_sublanes  # fp8 rows per tile
+    if kv_layout != configs.KVLayout.SEQ_ALONG_LANE or num_kv_heads != 1:
+        raise ValueError(
+            "shared_kv_rotary_dims needs SEQ_ALONG_LANE pages of one KV head, "
+            f"got {kv_layout} with {num_kv_heads} KV heads."
+        )
+    if use_per_token_scale:
+        raise ValueError("shared_kv_rotary_dims does not support per-token scales.")
+    if rotary_dims % packing_rows or (head_dim // 2) % packing_rows:
+        raise ValueError(
+            f"shared_kv_rotary_dims ({rotary_dims}) and half of head_dim "
+            f"({head_dim // 2}) must be whole {packing_rows}-row tiles."
+        )
+    if not 0 < rotary_dims <= head_dim // 2:
+        raise ValueError(
+            f"shared_kv_rotary_dims {rotary_dims} is not in (0, {head_dim // 2}]."
+        )
 
 
 def validate_fp8_compute(
@@ -352,6 +399,10 @@ def calculate_block_sizes(
             # RpaConfigs.kv_vmem_lanes.
             vmem_bkv_sz += 2 * num_lanes
         bkv_array_size = vmem_bkv_sz * aligned_num_kv_heads_x2 * aligned_kv_head_dim_val
+        if serve_cfgs.shared_kv_rotary_dims:
+            # A value and its rotated key rows (RpaConfigs.kv_vmem_shape).
+            rows = model_cfgs.head_dim + 2 * serve_cfgs.shared_kv_rotary_dims
+            bkv_array_size = vmem_bkv_sz * rows
 
         # Get output buffer size as well - which has same size as query size.
         bo_array_size = bq_array_size
@@ -688,6 +739,8 @@ def fp8_prefill_vmem_bytes(cfgs: configs.RpaConfigs) -> int:
         "fence_output",
         "unmasked_interior",
         "output_quant_dtype",
+        "shared_kv_rotary_dims",
+        "skip_masked_kv_zero_fill",
     ),
     # Donation of transient inputs can fail for some runtime buffer layouts in
     # the experimental tuning path. Keep donation only for kv_cache, which is
@@ -739,6 +792,8 @@ def ragged_paged_attention(
     fence_output: bool = False,
     unmasked_interior: bool = False,
     output_quant_dtype: jnp.dtype | None = None,
+    shared_kv_rotary_dims: int = 0,
+    skip_masked_kv_zero_fill: bool = False,
     prepared_inputs: tuple[jax.Array, ...] | None = None,
 ) -> tuple[Any, jax.Array] | tuple[jax.Array, jax.Array, jax.Array]:
     """Perform batched ragged paged attention.
@@ -832,6 +887,20 @@ def ragged_paged_attention(
             this dtype as `quantize_tensor` does, and their f32 `[max_num_tokens,
             1]` scales, made in one pass over the head-major output
             (`output_quant.quantize_head_major_output`).
+        shared_kv_rotary_dims: If set, `kv_cache` holds shared-KV pages (see
+            `configs.ServingConfigs.shared_kv_rotary_dims`): the kernels read
+            and write a page's value and rotated key rows only, and take the
+            key to equal the value elsewhere, dequantized at `k_scale`. `keys`
+            then only supplies the new tokens' rotated dims. A caller whose key
+            is a per-dim multiple of the value there folds that factor, times
+            `v_scale / k_scale`, into `queries` on those dims
+            (`prologue.shared_kv_query_factor`), and `prepared_inputs` must
+            then be the prologue's shared-KV output. Needs one KV head and
+            SEQ_ALONG_LANE pages.
+        skip_masked_kv_zero_fill: If True, the decode kernel does not zero
+            its KV VMEM window at entry (see
+            `configs.ServingConfigs.skip_masked_kv_zero_fill`). Needs
+            `mask_invalid_v`. Outputs are identical either way.
         prepared_inputs: `(q_hbm, new_kv_hbm)` as `prepare_inputs` returns them
             for these queries, keys and values (e.g. from
             `prologue.qkv_to_rpa_inputs`). Then only the shapes and dtypes of
@@ -926,7 +995,21 @@ def ragged_paged_attention(
         mask_invalid_v=mask_invalid_v,
         skip_empty_launch=skip_empty_launch,
         unmasked_interior=unmasked_interior,
+        shared_kv_rotary_dims=shared_kv_rotary_dims,
+        skip_masked_kv_zero_fill=skip_masked_kv_zero_fill,
     )
+    if shared_kv_rotary_dims:
+        validate_shared_kv(
+            shared_kv_rotary_dims,
+            num_kv_heads,
+            head_dim,
+            kv_layout,
+            use_per_token_scale,
+        )
+        if cp_group_size is not None or return_lse:
+            raise ValueError(
+                "shared_kv_rotary_dims supports neither CP nor LSE output."
+            )
     if output_quant_dtype is not None and (return_lse or cp_group_size is not None):
         raise ValueError("output_quant_dtype supports neither LSE output nor CP.")
 
@@ -938,6 +1021,7 @@ def ragged_paged_attention(
         v_scale=v_scale_tensor,
         kv_layout=kv_layout,
         page_size=page_size,
+        shared_kv_rotary_dims=shared_kv_rotary_dims,
     )
     prepared_q_fetch = None
     if prepared_inputs is None:

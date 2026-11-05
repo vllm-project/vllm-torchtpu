@@ -582,10 +582,14 @@ def _pallas_rpa_kernel_batched(
     fp8_compute: bool = False,
     fence_output: bool = False,
     unmasked_interior: bool = False,
+    shared_kv_rotary_dims: int = 0,
+    skip_masked_kv_zero_fill: bool = False,
 ) -> tuple[jax.Array, jax.Array]:
     """Batched-RPA Pallas kernel entry — used by
     `PallasBatchedRPAAttentionBackendImpl`."""
     rpa_kwargs: dict[str, Any] = {}
+    if shared_kv_rotary_dims:
+        rpa_kwargs["shared_kv_rotary_dims"] = shared_kv_rotary_dims
     if decode_query_size > 1:
         rpa_kwargs["decode_query_size"] = decode_query_size
     if skip_empty_launch:
@@ -602,6 +606,8 @@ def _pallas_rpa_kernel_batched(
         rpa_kwargs["fence_output"] = True
     if unmasked_interior:
         rpa_kwargs["unmasked_interior"] = True
+    if skip_masked_kv_zero_fill:
+        rpa_kwargs["skip_masked_kv_zero_fill"] = True
     return _pallas_rpa_kernel_impl(
         kv_cache,
         query,
@@ -664,11 +670,18 @@ def _pallas_rpa_kernel_batched_from_qkv(
     output_quant_dtype: jnp.dtype | None = None,
     prologue_dma_stores: bool = False,
     prologue_fp8_queries: bool = False,
+    kv_layout: batched_rpa_configs.KVLayout = (
+        batched_rpa_configs.KVLayout.HEAD_ALONG_SUBLANE
+    ),
+    shared_kv_rotary_dims: int = 0,
+    skip_masked_kv_zero_fill: bool = False,
 ) -> tuple[jax.Array, ...]:
     """`_pallas_rpa_kernel_batched` on fused qkv rows (see
     `PallasBatchedRPAAttentionBackendImpl.forward_from_qkv`): `(new_kv_cache,
     output)`, or `(new_kv_cache, q, scale)` with `output_quant_dtype`."""
     rpa_kwargs: dict[str, Any] = dict(
+        kv_layout=kv_layout,
+        shared_kv_rotary_dims=shared_kv_rotary_dims,
         decode_query_size=decode_query_size,
         skip_empty_launch=skip_empty_launch,
         cap_sliding_decode_block=cap_sliding_decode_block,
@@ -677,6 +690,7 @@ def _pallas_rpa_kernel_batched_from_qkv(
         fp8_compute=fp8_compute,
         fence_output=fence_output,
         unmasked_interior=unmasked_interior,
+        skip_masked_kv_zero_fill=skip_masked_kv_zero_fill,
     )
     if output_quant_dtype is not None:
         rpa_kwargs["output_quant_dtype"] = output_quant_dtype
@@ -685,7 +699,7 @@ def _pallas_rpa_kernel_batched_from_qkv(
     if prologue_fp8_queries:
         rpa_kwargs["prologue_fp8_queries"] = True
     native, page_stride, restore_pool = native_kv_cache_view(
-        kv_cache, num_kv_heads, head_dim, None
+        kv_cache, num_kv_heads, head_dim, kv_layout
     )
     if page_stride != 1:
         block_tables = block_tables * page_stride
@@ -982,6 +996,10 @@ class PallasAttentionBackendImpl(AttentionImpl):
     decode_query_size: int = 1
     # Set by the batched-RPA impl under TPU_FP8_ATTENTION.
     fp8_compute: bool = False
+    # Set by the batched-RPA impl's `set_shared_kv`; 0: standard pages.
+    shared_kv_rotary_dims: int = 0
+    _shared_kv_k_norm: torch.nn.Module | None = None
+    _kv_transfer: bool = False
 
     # Bundled (block-major) RPA kernel entry: accepts the full KV cache bundle
     # and a dynamic scalar layer_idx. Registered under a dedicated prefix to avoid
@@ -1052,10 +1070,20 @@ class PallasAttentionBackendImpl(AttentionImpl):
         # Whether kernels consume the merged block-major unified pool via
         # `kernel_view` and block tables remapped by `flat_kernel_ids`.
         self._bm_kernel = unified_block_major_enabled(vllm_config)
+        self._kv_transfer = vllm_config.kv_transfer_config is not None
         self._pool_is_seq_along_lane = (
             isinstance(self, PallasBatchedRPAAttentionBackendImpl)
             and self.kv_layout is batched_rpa_configs.KVLayout.SEQ_ALONG_LANE
         )
+        if (
+            envs.TPU_RPA_SKIP_MASKED_KV_ZERO_FILL
+            and isinstance(self, PallasBatchedRPAAttentionBackendImpl)
+            and not self._pool_is_seq_along_lane
+        ):
+            raise ValueError(
+                "TPU_RPA_SKIP_MASKED_KV_ZERO_FILL needs VLLM_KV_CACHE_LAYOUT=HND: "
+                "only SEQ_ALONG_LANE pages mask the KV window's unwritten rows."
+            )
         self.rpa_kernel = None
         # Populated by initialize_kernel() before torch.compile traces the
         # model. Forward can then reuse the custom op without resolving a PCP
@@ -1128,6 +1156,7 @@ class PallasAttentionBackendImpl(AttentionImpl):
             self.decode_query_size,
             block_major,
             self.fp8_compute,
+            self.shared_kv_rotary_dims,
         )
         existing = self._kernel_config_cache.get(config_key)
         if existing is not None:
@@ -1171,6 +1200,7 @@ class PallasAttentionBackendImpl(AttentionImpl):
             self.decode_query_size,
             block_major,
             self.fp8_compute,
+            self.shared_kv_rotary_dims,
         )
         existing = self._kernel_registry.get(registry_key)
         if existing is not None:
@@ -1252,6 +1282,19 @@ class PallasAttentionBackendImpl(AttentionImpl):
                     "sees the whole KV block."
                 )
                 entry_kwargs["unmasked_interior"] = True
+            if envs.TPU_RPA_SKIP_MASKED_KV_ZERO_FILL:
+                if "skip_masked_kv_zero_fill" in entry_params:
+                    logger.info_once(
+                        "The batched RPA decode kernel skips its KV VMEM zero-fill; "
+                        "SEQ_ALONG_LANE masks the unwritten rows."
+                    )
+                    entry_kwargs["skip_masked_kv_zero_fill"] = True
+                else:
+                    logger.info_once(
+                        "TPU_RPA_SKIP_MASKED_KV_ZERO_FILL does not apply to kernel "
+                        "entry %s.",
+                        self._kernel_entry.__name__,
+                    )
             decode_lanes = envs.TPU_RPA_SLIDING_DECODE_LANES
             if (
                 "sliding_decode_lanes" in entry_params
@@ -1270,6 +1313,13 @@ class PallasAttentionBackendImpl(AttentionImpl):
                         f"{self._kernel_entry.__name__} has no fp8 QK/PV path."
                     )
                 entry_kwargs["fp8_compute"] = True
+            if self.shared_kv_rotary_dims:
+                if "shared_kv_rotary_dims" not in entry_params:
+                    raise NotImplementedError(
+                        "Shared-KV pages: kernel entry "
+                        f"{self._kernel_entry.__name__} cannot read them."
+                    )
+                entry_kwargs["shared_kv_rotary_dims"] = self.shared_kv_rotary_dims
             if block_major:
                 if "block_major" not in entry_params:
                     raise NotImplementedError(
@@ -1754,6 +1804,11 @@ class PallasAttentionBackendImpl(AttentionImpl):
             pool_head_dim = kv_cache.shape[-3] * kv_cache.shape[-2]
         else:
             pool_head_dim = kv_cache.shape[-1]
+        if self.shared_kv_rotary_dims:
+            # Over the layer's own head_size dims, before any pool padding.
+            query = self._shared_kv_queries(
+                query, layer._k_scale_float, layer._v_scale_float
+            )
         # A layer writing its own native page is never padded, even when the
         # page is wider than head_size (the head_dim=64 page packs K and V along
         # its last axis). Only a page defined by another spec is padded.
@@ -1941,14 +1996,62 @@ class PallasBatchedRPAAttentionBackendImpl(PallasAttentionBackendImpl):
                 layer._k_scale_float, layer._v_scale_float, self.qkv_prologue_eps
             )
 
+    def shared_kv_unsupported(self) -> list[str]:
+        """What keeps this layer from shared-KV pages (empty if nothing does)."""
+        reasons = []
+        if self.kv_cache_quantized_dtype != torch.float8_e4m3fn:
+            reasons.append("a KV cache that is not FP8 e4m3")
+        if self.kv_layout is not batched_rpa_configs.KVLayout.SEQ_ALONG_LANE:
+            reasons.append("the NHD KV cache layout (needs VLLM_KV_CACHE_LAYOUT=HND)")
+        if self.num_kv_heads != 1:
+            reasons.append(f"{self.num_kv_heads} KV heads per rank (needs one)")
+        if self.sinks is not None:
+            reasons.append("attention sinks")
+        if self.kv_sharing_target_layer_name is not None:
+            reasons.append("KV sharing")
+        if self._bm_kernel:
+            reasons.append("the block-major KV pool")
+        if self._context_parallel or self._pcp_streaming or self.dcp_world_size > 1:
+            reasons.append("context parallelism (PCP/DCP)")
+        if self.decode_query_size != 1:
+            reasons.append("speculative decoding")
+        if self._kv_transfer:
+            # A peer reading these pages as standard K/V would get no error.
+            reasons.append("a KV transfer connector (P/D or offload)")
+        return reasons
+
+    def set_shared_kv(self, rotary_dims: int, k_norm: torch.nn.Module) -> None:
+        """Store this layer's KV in shared-KV pages: its key equals
+        `k_norm.weight` (per head_size dim, read at each forward) times its
+        value outside the leading `rotary_dims` dims of each half of
+        head_size."""
+        unsupported = self.shared_kv_unsupported()
+        if unsupported:
+            raise NotImplementedError(
+                f"Shared-KV pages do not support {', '.join(unsupported)}."
+            )
+        self.shared_kv_rotary_dims = rotary_dims
+        self._shared_kv_k_norm = k_norm
+
+    def _shared_kv_queries(
+        self, query: torch.Tensor, k_scale: float, v_scale: float
+    ) -> torch.Tensor:
+        """`query` [tokens, heads, head_size] times the shared-KV query factor
+        (`prologue.shared_kv_query_factor`)."""
+        assert self._shared_kv_k_norm is not None
+        d = self.head_size
+        rotated = torch.arange(d, device=query.device) % (d // 2)
+        rotated = rotated < self.shared_kv_rotary_dims
+        w = self._shared_kv_k_norm.weight.to(torch.float32) * (v_scale / k_scale)
+        factor = torch.where(rotated, torch.ones_like(w), w)
+        return (query.to(torch.float32) * factor).to(query.dtype)
+
     def qkv_prologue_unsupported(self) -> list[str]:
         """What keeps `forward_from_qkv` from running this layer (empty if
         nothing does)."""
         reasons = []
         if self.kv_cache_quantized_dtype != torch.float8_e4m3fn:
             reasons.append("a KV cache that is not FP8 e4m3")
-        if self.kv_layout is not batched_rpa_configs.KVLayout.HEAD_ALONG_SUBLANE:
-            reasons.append("VLLM_KV_CACHE_LAYOUT=HND")
         if self.sinks is not None:
             reasons.append("attention sinks")
         if self.kv_sharing_target_layer_name is not None:
@@ -2036,12 +2139,15 @@ class PallasBatchedRPAAttentionBackendImpl(PallasAttentionBackendImpl):
         if existing is not None:
             return existing
         entry_kwargs: dict[str, Any] = dict(
+            kv_layout=self.kv_layout,
+            shared_kv_rotary_dims=self.shared_kv_rotary_dims,
             decode_query_size=self.decode_query_size,
             fp8_compute=self.fp8_compute,
             skip_empty_launch=envs.TPU_RPA_SKIP_EMPTY_LAUNCH,
             fence_output=envs.TPU_RPA_FENCE_OUTPUT,
             unmasked_interior=envs.TPU_RPA_UNMASKED_INTERIOR,
             prologue_dma_stores=envs.TPU_RPA_PROLOGUE_DMA_STORES,
+            skip_masked_kv_zero_fill=envs.TPU_RPA_SKIP_MASKED_KV_ZERO_FILL,
         )
         if envs.TPU_RPA_PROLOGUE_FP8_QUERIES and not envs.TPU_RPA_PROLOGUE_DMA_STORES:
             raise ValueError(

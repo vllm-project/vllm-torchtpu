@@ -1005,8 +1005,8 @@ def _check_context_parallel(model: Gemma4Model, vllm_config: VllmConfig) -> None
                 unsupported.append(name)
     if unsupported:
         raise ValueError(f"{what} does not support {', '.join(unsupported)}")
-    if parallel.tensor_parallel_size < 3:
-        raise ValueError(f"{what} needs TP >= 3, got {parallel.tensor_parallel_size}")
+    if parallel.tensor_parallel_size < 2:
+        raise ValueError(f"{what} needs TP >= 2, got {parallel.tensor_parallel_size}")
 
     # Every step padded into a context-parallel bucket must be one whole
     # prompt: the solo-prefill scheduler's steps of more than N tokens are,

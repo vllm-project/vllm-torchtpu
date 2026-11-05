@@ -472,11 +472,22 @@ def _copy_head_page_kernel(
 
 
 def _seq_along_lane_head_page_kernel(
-    _count_ref, _src_ref, _dst_ref, head_ref, page_ref, _cache_ref, out_ref, scratch_ref
+    _count_ref,
+    _src_ref,
+    _dst_ref,
+    head_ref,
+    page_ref,
+    _cache_ref,
+    out_ref,
+    scratch_ref,
+    *,
+    shared_kv_rotary_dims=0,
 ):
     """One head's K and V of a gathered page as a SEQ_ALONG_LANE cache page:
     from (token, d) words of four slots to (d group, token) words of four
-    consecutive d, each slot's bytes transposed through `scratch_ref`."""
+    consecutive d, each slot's bytes transposed through `scratch_ref`. With
+    `shared_kv_rotary_dims` the page is a shared-KV page: V in slot 0 and K's
+    rotated d groups leading slot 1 (`wrapper.prepare_inputs`), zero after."""
     _, page_size, _, _, head_dim = page_ref.shape
     lanes = scratch_ref.shape[-1]
     chunks, groups = page_size // lanes, head_dim // 4
@@ -501,7 +512,14 @@ def _seq_along_lane_head_page_kernel(
             w = every_4th_row(0)
             for i in range(1, 4):
                 w = w | (every_4th_row(i) << (8 * i))
-            out_ref[0, slot] = pltpu.bitcast(w, out_ref.dtype).reshape(
+            out_slot = slot
+            if shared_kv_rotary_dims:  # V, then K's rotated groups of each half
+                rot, half = shared_kv_rotary_dims // 4, groups // 2
+                out_slot = 1 - slot
+                if slot == 0:
+                    zeros = jnp.zeros((groups - 2 * rot, page_size), w.dtype)
+                    w = jnp.concatenate([w[:rot], w[half : half + rot], zeros], 0)
+            out_ref[0, out_slot] = pltpu.bitcast(w, out_ref.dtype).reshape(
                 groups, 4, page_size
             )
 
@@ -526,9 +544,12 @@ def write_kv_head_pages(
     *,
     num_heads: int,
     kv_layout: configs.KVLayout = configs.KVLayout.HEAD_ALONG_SUBLANE,
+    shared_kv_rotary_dims: int = 0,
 ) -> jax.Array:
     """`write_kv_pages` of the KV heads [first_head, first_head + num_heads)
-    of `pages`, which hold every KV head (`kv_pages_from_rows`).
+    of `pages`, which hold every KV head (`kv_pages_from_rows`). With
+    `shared_kv_rotary_dims` (a SEQ_ALONG_LANE cache) each written page is a
+    shared-KV page of the head (`wrapper.ragged_paged_attention`).
 
     The kernel takes the heads' slots from each page in VMEM, so it costs the
     pages it reads and writes; `kv_head_slots` before `write_kv_pages` is an
@@ -559,11 +580,16 @@ def write_kv_head_pages(
                 f"tiles, got {num_heads} heads of {page_size}-token pages."
             )
         out_block = (1, 2, head_dim // packing, packing, page_size)
-        kernel = _seq_along_lane_head_page_kernel
+        kernel = functools.partial(
+            _seq_along_lane_head_page_kernel,
+            shared_kv_rotary_dims=shared_kv_rotary_dims,
+        )
         scratch_shapes.append(
             pltpu.VMEM((head_dim * page_size // 128, 128), jnp.uint32)
         )
     else:
+        if shared_kv_rotary_dims:
+            raise NotImplementedError("Shared-KV pages are SEQ_ALONG_LANE pages.")
         out_block = in_block
         kernel = functools.partial(_copy_head_page_kernel, half=half)
     if kv_cache.shape[1:] != out_block[1:]:
@@ -773,12 +799,39 @@ class LayerConfig:
     # The attention kernel skips the mask on steps that mask nothing
     # (`ragged_paged_attention(unmasked_interior=True)`).
     unmasked_interior: bool = False
+    # The serving cache holds shared-KV pages of this full-attention layer
+    # (`write_kv_head_pages(shared_kv_rotary_dims=...)`); the layer's own
+    # attention runs on its gathered K/V pages as usual.
+    shared_kv_rotary_dims: int = 0
     # The from-qkv layers all-gather their fp8 K/V as int8 rows in the new-K/V
     # layout ([rows, slots, packing, d], `exchange_rows_int8`), which a page
     # buffer splits without a copy, instead of as [rows, slots * packing * d].
     paged_gather: bool = False
+    # The qkv prologue writes its packed outputs with strided DMAs
+    # (`prologue.qkv_to_rpa_inputs(dma_stores=True)`, the same bits).
+    prologue_dma_stores: bool = False
+    # With prologue_dma_stores, on a full-attention fp8_compute layer: the
+    # prologue also writes the FP8 queries the attention kernel reads, which it
+    # would otherwise cast from the bf16 ones (the same bits).
+    prologue_fp8_queries: bool = False
 
     def __post_init__(self):
+        if self.prologue_dma_stores and self.prologue_eps is None:
+            raise ValueError("prologue_dma_stores needs a layer with prologue_eps")
+        if self.prologue_fp8_queries and not (
+            self.prologue_dma_stores
+            and self.fp8_compute
+            and self.sliding_window is None
+        ):
+            raise ValueError(
+                "prologue_fp8_queries needs prologue_dma_stores on a full-attention "
+                "fp8_compute layer"
+            )
+        if self.shared_kv_rotary_dims and not self.head_page_writes:
+            raise NotImplementedError(
+                "Shared-KV pages are cached by the head-page kernel: set "
+                "TPU_CP_KV_WRITE_KERNEL=1."
+            )
         if not self.head_page_writes:
             return
         layout, heads = self.kv_layout, self.local_kv_heads
@@ -844,9 +897,10 @@ def qkv_prologue(
     k_norm_weight: jax.Array,
     *,
     cfg: LayerConfig,
-) -> tuple[jax.Array, jax.Array]:
+) -> tuple[jax.Array, ...]:
     """(q_hbm, new_kv): `prologue.qkv_to_rpa_inputs` of a layer like `cfg`
-    (every rank's heads), whose norms take `cfg.prologue_eps`."""
+    (every rank's heads), whose norms take `cfg.prologue_eps`; with
+    `cfg.prologue_fp8_queries` also the FP8 queries, (q_hbm, new_kv, q_fp8)."""
     if cfg.prologue_eps is None:
         raise ValueError("qkv_prologue needs a layer with prologue_eps")
     return prologue.qkv_to_rpa_inputs(
@@ -861,6 +915,8 @@ def qkv_prologue(
         eps=cfg.prologue_eps,
         k_scale=cfg.k_scale,
         v_scale=cfg.v_scale,
+        dma_stores=cfg.prologue_dma_stores,
+        fp8_queries=cfg.prologue_fp8_queries,
     )
 
 
@@ -924,6 +980,39 @@ def full_attention_layer_from_q(
     )
 
 
+def full_attention_layer_from_q8(
+    kv_cache: jax.Array,
+    q_hbm: jax.Array,
+    q_fp8: jax.Array,
+    kv_rows: jax.Array,
+    seq_lens: jax.Array,
+    block_tables: jax.Array,
+    rank: jax.Array,
+    *,
+    cfg: LayerConfig,
+    cache_view: CacheView,
+) -> tuple[jax.Array, jax.Array]:
+    """`full_attention_layer_from_q` with the prologue's FP8 queries too
+    (`LayerConfig.prologue_fp8_queries`), which the fp8_compute kernel reads
+    instead of casting `q_hbm`."""
+    if not cfg.prologue_fp8_queries:
+        raise ValueError("full_attention_layer_from_q8 needs prologue_fp8_queries")
+    num_rows = q_hbm.shape[1]
+    query = jnp.zeros((num_rows, cfg.num_heads, cfg.head_dim), q_hbm.dtype)
+    return _full_attention(
+        kv_cache,
+        query,
+        kv_rows,
+        seq_lens,
+        block_tables,
+        rank[0],
+        cfg,
+        cache_view,
+        q_hbm=q_hbm,
+        q_fp8=q_fp8,
+    )
+
+
 def _layer_output(out: Any, cfg: LayerConfig) -> tuple[jax.Array, ...]:
     """The layer output after the attention kernel: its bf16 rows, or with
     `cfg.fp8_out_rows` the fp8 rows and per-token scales the o projection
@@ -941,6 +1030,7 @@ def _full_attention(
     cfg: LayerConfig,
     cache_view: CacheView,
     q_hbm: jax.Array | None = None,
+    q_fp8: jax.Array | None = None,
 ) -> tuple[jax.Array, ...]:
     native, page_stride, restore, page_size = _cache_pages(kv_cache, cfg, cache_view)
     plan = cfg.plan(query.shape[0], page_size)
@@ -953,7 +1043,8 @@ def _full_attention(
     if q_hbm is not None:
         # Every key comes from `pages`: the new K/V operand is never read.
         new_kv = jnp.zeros((query.shape[0], *pages.shape[2:]), pages.dtype)
-        kwargs["prepared_inputs"] = (q_hbm, new_kv)
+        prepared = (q_hbm, new_kv) if q_fp8 is None else (q_hbm, new_kv, q_fp8)
+        kwargs["prepared_inputs"] = prepared
     tables = plan.gathered_page_table()
     if cfg.head_page_writes:
         # The kernel reads every key from `pages` and leaves them as they are.
@@ -961,7 +1052,13 @@ def _full_attention(
             query, pages, tables, plan, rank, return_kv_pages=True, **kwargs
         )
         new_native = write_kv_head_pages(
-            native, pages, first, *writes, num_heads=count, kv_layout=cfg.kv_layout
+            native,
+            pages,
+            first,
+            *writes,
+            num_heads=count,
+            kv_layout=cfg.kv_layout,
+            shared_kv_rotary_dims=cfg.shared_kv_rotary_dims,
         )
         return restore(new_native), *_layer_output(out, cfg)
     out = cp_prefill_attention(query, pages, tables, plan, rank, **kwargs)
@@ -1091,9 +1188,9 @@ def sliding_exchange_rows_from_qkv(
         position_pages=position_pages,
         halo_pages=halo_pages,
     )
-    _, new_kv = qkv_prologue(
+    new_kv = qkv_prologue(
         pick(qkv), pick(cos), pick(sin), q_norm_weight, k_norm_weight, cfg=cfg
-    )
+    )[1]
     return exchange_rows_int8(new_kv, cfg)
 
 
@@ -1320,6 +1417,33 @@ def full_attention_layer_from_q_fp8_rows(
         cfg,
         kv_cache,
         q_hbm,
+        kv_rows,
+        seq_lens,
+        block_tables,
+        rank,
+        cache_view=cache_view,
+    )
+
+
+def full_attention_layer_from_q8_fp8_rows(
+    kv_cache: jax.Array,
+    q_hbm: jax.Array,
+    q_fp8: jax.Array,
+    kv_rows: jax.Array,
+    seq_lens: jax.Array,
+    block_tables: jax.Array,
+    rank: jax.Array,
+    *,
+    cfg: LayerConfig,
+    cache_view: CacheView,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """`full_attention_layer_from_q8` returning the o projection's fp8 input."""
+    return _fp8_rows_layer(
+        full_attention_layer_from_q8,
+        cfg,
+        kv_cache,
+        q_hbm,
+        q_fp8,
         kv_rows,
         seq_lens,
         block_tables,

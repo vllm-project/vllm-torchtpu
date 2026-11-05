@@ -24,13 +24,19 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from vllm_torchtpu.kernels.experimental.batched_rpa import prologue
+from vllm_torchtpu.kernels.experimental.batched_rpa import configs, prologue
 from vllm_torchtpu.kernels.experimental.batched_rpa import wrapper as KB
 
 _EPS = 1e-6
+_LAYOUTS = {
+    "nhd": {},
+    "hnd": dict(kv_layout=configs.KVLayout.SEQ_ALONG_LANE, page_size=128),
+}
 
 
-def _reference(qkv, cos, sin, wq, wk, *, nq, nkv, d, k_scale, v_scale):
+def _reference(
+    qkv, cos, sin, wq, wk, *, nq, nkv, d, k_scale, v_scale, q_factor=None, **layout
+):
     tokens = qkv.shape[0]
     q, k, v = jnp.split(qkv, [nq * d, (nq + nkv) * d], axis=-1)
 
@@ -48,7 +54,8 @@ def _reference(qkv, cos, sin, wq, wk, *, nq, nkv, d, k_scale, v_scale):
     def quantize(x, scale):
         return jnp.clip(x / scale, -448.0, 448.0).astype(jnp.float8_e4m3fn)
 
-    q = rotary(rms(q, wq, nq)).astype(jnp.bfloat16)
+    q = rotary(rms(q, wq, nq))
+    q = (q if q_factor is None else q * q_factor).astype(jnp.bfloat16)
     k = rotary(rms(k, wk, nkv)).astype(jnp.bfloat16).astype(jnp.float32)
     v = rms(v, None, nkv)
     device = jax.sharding.AbstractDevice(
@@ -63,6 +70,7 @@ def _reference(qkv, cos, sin, wq, wk, *, nq, nkv, d, k_scale, v_scale):
             quantize(v, v_scale),
             jnp.bfloat16,
             jnp.float8_e4m3fn,
+            **layout,
         )
 
 
@@ -77,8 +85,9 @@ def _reference(qkv, cos, sin, wq, wk, *, nq, nkv, d, k_scale, v_scale):
     ],
 )
 def test_matches_norm_rotary_quantize_prepare(
-    tokens, nq, nkv, d, rotary_dim, block_tokens, k_scale, v_scale
+    tokens, nq, nkv, d, rotary_dim, block_tokens, k_scale, v_scale, layout=None
 ):
+    layout = layout or {}
     key = jax.random.key(tokens + nq + d)
     qkv = jax.random.normal(key, (tokens, (nq + 2 * nkv) * d), jnp.float32) * 2
     qkv = qkv.astype(jnp.bfloat16)
@@ -93,7 +102,7 @@ def test_matches_norm_rotary_quantize_prepare(
     )
     heads = dict(nq=nq, nkv=nkv, d=d, k_scale=k_scale, v_scale=v_scale)
     with jax.default_matmul_precision("highest"):
-        ref_q, ref_kv = _reference(qkv, cos, sin, wq, wk, **heads)
+        ref_q, ref_kv = _reference(qkv, cos, sin, wq, wk, **heads, **layout)
     q, kv = prologue.qkv_to_rpa_inputs(
         qkv,
         cos,
@@ -108,10 +117,155 @@ def test_matches_norm_rotary_quantize_prepare(
         v_scale=v_scale,
         block_tokens=block_tokens,
         interpret=True,
+        **layout,
     )
     assert q.shape == ref_q.shape and kv.shape == ref_kv.shape
     _assert_within_one_step(q, ref_q, jnp.int16)
     _assert_within_one_step(kv, ref_kv, jnp.int8)
+
+
+@pytest.mark.parametrize(
+    "tokens,nq,nkv,d,rotary_dim,block_tokens,page_size",
+    [
+        (16, 8, 1, 512, 512, None, 256),  # Gemma4-26B TP2 global decode bucket
+        (128, 8, 4, 256, 256, 128, 256),  # Gemma4-26B TP2 sliding: padded to a page
+        (40, 4, 2, 256, 128, None, 128),  # odd bucket, partial rotary
+        (128, 4, 1, 512, 512, 128, 128),  # page-sized: no padding
+    ],
+)
+def test_seq_along_lane_matches_prepare(
+    tokens, nq, nkv, d, rotary_dim, block_tokens, page_size
+):
+    """SEQ_ALONG_LANE K/V are prepare_inputs' [2 * kv_heads, d / 4, 4, padded
+    tokens], zero past the tokens."""
+    layout = dict(kv_layout=configs.KVLayout.SEQ_ALONG_LANE, page_size=page_size)
+    test_matches_norm_rotary_quantize_prepare(
+        tokens, nq, nkv, d, rotary_dim, block_tokens, 1.0, 1.0, layout
+    )
+
+
+@pytest.mark.parametrize(
+    "tokens,nq,nkv,d,block_tokens",
+    [
+        (512, 8, 4, 256, 128),  # four token blocks
+        (1024, 8, 1, 512, 512),  # two token blocks, one KV head
+        (1040, 4, 1, 512, None),  # past one block: padded to whole pages
+        (512, 32, 4, 512, None),  # TP1-wide heads: one block exceeds VMEM
+    ],
+)
+def test_seq_along_lane_is_the_default_layout_relaid_out(
+    tokens, nq, nkv, d, block_tokens
+):
+    """Across token blocks, the SEQ_ALONG_LANE K/V hold the HEAD_ALONG_SUBLANE
+    K/V's bits in prepare_inputs' SEQ_ALONG_LANE order (zero past the tokens),
+    and q is the same."""
+    key = jax.random.key(tokens + d)
+    qkv = jax.random.normal(key, (tokens, (nq + 2 * nkv) * d)) * 2
+    qkv = qkv.astype(jnp.bfloat16)
+    angle = jnp.arange(tokens)[:, None] / (100.0 ** jnp.arange(d // 2))[None]
+    cos, sin = jnp.cos(angle).astype(jnp.bfloat16), jnp.sin(angle).astype(jnp.bfloat16)
+    w = (1 + 0.1 * jax.random.normal(jax.random.fold_in(key, 1), (d,))).astype(
+        jnp.bfloat16
+    )
+    kwargs = dict(num_q_heads=nq, num_kv_heads=nkv, head_dim=d, eps=_EPS, k_scale=1.0)
+    kwargs.update(v_scale=1.0, interpret=True)
+    q, kv = prologue.qkv_to_rpa_inputs(
+        qkv, cos, sin, w, w, block_tokens=block_tokens, **kwargs
+    )
+    lane = configs.KVLayout.SEQ_ALONG_LANE
+    q_lane, kv_lane = prologue.qkv_to_rpa_inputs(
+        qkv, cos, sin, w, w, kv_layout=lane, page_size=256, **kwargs
+    )
+    rows = kv.reshape(tokens, -1, d)[:, : 2 * nkv]  # [tokens, k v of each head, d]
+    want = rows.transpose(1, 2, 0).reshape(2 * nkv, d // 4, 4, tokens)
+    want = jnp.pad(want, ((0, 0),) * 3 + ((0, kv_lane.shape[-1] - tokens),))
+    bits = lambda x: jax.lax.bitcast_convert_type(x, jnp.uint8)  # noqa: E731
+    np.testing.assert_array_equal(bits(q_lane), bits(q))
+    np.testing.assert_array_equal(bits(kv_lane), bits(want))
+
+
+def test_seq_along_lane_one_block_needs_the_vmem_budget():
+    """Buckets of up to 512 tokens take one block (K/V across all their padded
+    lanes) only where it fits VMEM, as the token-major path's blocks must."""
+    one_block = prologue._seq_along_lane_one_block
+    # Gemma4-26B TP2 global and sliding decode buckets: one block.
+    assert one_block(16, 10 * 512, 8, 1, 512, False, 256)
+    assert one_block(16, 16 * 256, 8, 2, 256, False, 256)
+    # Gemma4-31B TP1 global (32 q, 4 KV heads, head_dim 512): 512 tokens do not.
+    assert not one_block(512, 40 * 512, 32, 2, 512, False, 512)
+    assert not one_block(1024, 10 * 512, 8, 1, 512, False, 1024)
+
+
+@pytest.mark.parametrize(
+    "tokens,nq,d,rot,k_scale,v_scale,page_size",
+    [
+        (16, 8, 512, 64, 1.0, 1.0, 256),  # Gemma4-26B TP2 global decode bucket
+        (128, 8, 512, 64, 0.5, 2.0, 128),  # static KV scales in the query factor
+        (40, 4, 256, 32, 1.0, 1.0, 128),  # odd bucket
+    ],
+)
+def test_shared_kv_matches_prepare(tokens, nq, d, rot, k_scale, v_scale, page_size):
+    """Shared-KV rows are prepare_inputs(shared_kv_rotary_dims)'s of the same K
+    and V, and the queries carry shared_kv_query_factor."""
+    key = jax.random.key(tokens + d + rot)
+    qkv = jax.random.normal(key, (tokens, (nq + 2) * d), jnp.float32) * 2
+    qkv = qkv.astype(jnp.bfloat16)
+    angle = jnp.arange(tokens)[:, None] * (0.5 ** jnp.arange(d // 2))[None]
+    cos, sin = jnp.cos(angle).astype(jnp.bfloat16), jnp.sin(angle).astype(jnp.bfloat16)
+    wq = (1 + 0.1 * jax.random.normal(jax.random.fold_in(key, 1), (d,))).astype(
+        jnp.bfloat16
+    )
+    wk = (0.06 + 0.01 * jax.random.normal(jax.random.fold_in(key, 2), (d,))).astype(
+        jnp.bfloat16
+    )
+    layout = dict(
+        kv_layout=configs.KVLayout.SEQ_ALONG_LANE,
+        page_size=page_size,
+        shared_kv_rotary_dims=rot,
+    )
+    factor = prologue.shared_kv_query_factor(wk, rot, k_scale, v_scale)
+    heads = dict(nq=nq, nkv=1, d=d, k_scale=k_scale, v_scale=v_scale)
+    with jax.default_matmul_precision("highest"):
+        ref_q, ref_kv = _reference(
+            qkv, cos, sin, wq, wk, q_factor=factor, **heads, **layout
+        )
+    kwargs = dict(num_q_heads=nq, num_kv_heads=1, head_dim=d, eps=_EPS)
+    kwargs.update(k_scale=k_scale, v_scale=v_scale, interpret=True, **layout)
+    q, kv = prologue.qkv_to_rpa_inputs(qkv, cos, sin, wq, wk, **kwargs)
+    assert q.shape == ref_q.shape and kv.shape == ref_kv.shape
+    _assert_within_one_step(q, ref_q, jnp.int16)
+    _assert_within_one_step(kv, ref_kv, jnp.int8)
+    fp8 = dict(fp8_queries=True) if nq % 4 == 0 else {}
+    q_dma, kv_dma, *q_fp8 = prologue.qkv_to_rpa_inputs(
+        qkv, cos, sin, wq, wk, dma_stores=True, **fp8, **kwargs
+    )
+    bits = lambda x: jax.lax.bitcast_convert_type(x, jnp.uint8)  # noqa: E731
+    np.testing.assert_array_equal(bits(q_dma), bits(q))
+    np.testing.assert_array_equal(bits(kv_dma), bits(kv))
+    for q8 in q_fp8:
+        ref = KB.quantize_queries(q, jnp.float8_e4m3fn)
+        np.testing.assert_array_equal(bits(q8), bits(ref))
+
+
+def test_shared_kv_needs_seq_along_lane_pages_of_one_head():
+    qkv = jnp.zeros((16, 6 * 256), jnp.bfloat16)
+    rows = jnp.zeros((16, 128), jnp.bfloat16)
+    w = jnp.ones((256,), jnp.bfloat16)
+    kwargs = dict(num_q_heads=4, num_kv_heads=1, head_dim=256, eps=_EPS)
+    kwargs.update(k_scale=1.0, v_scale=1.0, interpret=True, shared_kv_rotary_dims=32)
+    with pytest.raises(ValueError, match="SEQ_ALONG_LANE pages of one KV head"):
+        prologue.qkv_to_rpa_inputs(qkv, rows, rows, w, w, **kwargs)
+
+
+def test_seq_along_lane_needs_page_size():
+    qkv = jnp.zeros((128, 6 * 256), jnp.bfloat16)
+    rows = jnp.zeros((128, 128), jnp.bfloat16)
+    w = jnp.ones((256,), jnp.bfloat16)
+    kwargs = dict(num_q_heads=4, num_kv_heads=1, head_dim=256, eps=_EPS)
+    kwargs.update(k_scale=1.0, v_scale=1.0, interpret=True)
+    lane = configs.KVLayout.SEQ_ALONG_LANE
+    with pytest.raises(ValueError, match="page_size"):
+        prologue.qkv_to_rpa_inputs(qkv, rows, rows, w, w, kv_layout=lane, **kwargs)
 
 
 @pytest.mark.parametrize(
@@ -121,9 +275,13 @@ def test_matches_norm_rotary_quantize_prepare(
         (64, 16, 2, 512, 128, 32),  # Gemma4-31B TP2 global: partial rotary
         (48, 4, 1, 128, 64, 16),  # one KV head: K/V rows padded in their slot
         (40, 4, 2, 256, 256, None),  # odd bucket, chosen block
+        (1024, 8, 1, 512, 512, 512),  # two blocks (SEQ_ALONG_LANE: lane tiles)
     ],
 )
-def test_dma_stores_write_the_same_bits(tokens, nq, nkv, d, rotary_dim, block_tokens):
+@pytest.mark.parametrize("layout", ["nhd", "hnd"])
+def test_dma_stores_write_the_same_bits(
+    tokens, nq, nkv, d, rotary_dim, block_tokens, layout
+):
     key = jax.random.key(tokens * nq + d)
     qkv = jax.random.normal(key, (tokens, (nq + 2 * nkv) * d), jnp.float32) * 2
     qkv = qkv.astype(jnp.bfloat16)
@@ -148,6 +306,7 @@ def test_dma_stores_write_the_same_bits(tokens, nq, nkv, d, rotary_dim, block_to
             block_tokens=block_tokens,
             dma_stores=dma,
             interpret=True,
+            **_LAYOUTS[layout],
         )
         for dma in (False, True)
     ]
@@ -167,7 +326,10 @@ def test_dma_stores_write_the_same_bits(tokens, nq, nkv, d, rotary_dim, block_to
         (48, 8, 1, 256, 256, 16),  # two FP8 query words per KV head
     ],
 )
-def test_fp8_queries_are_quantize_queries(tokens, nq, nkv, d, rotary_dim, block_tokens):
+@pytest.mark.parametrize("layout", ["nhd", "hnd"])
+def test_fp8_queries_are_quantize_queries(
+    tokens, nq, nkv, d, rotary_dim, block_tokens, layout
+):
     key = jax.random.key(tokens + nq * d)
     qkv = jax.random.normal(key, (tokens, (nq + 2 * nkv) * d), jnp.float32) * 3
     qkv = qkv.astype(jnp.bfloat16)
@@ -183,6 +345,7 @@ def test_fp8_queries_are_quantize_queries(tokens, nq, nkv, d, rotary_dim, block_
         v_scale=1.0,
         block_tokens=block_tokens,
         interpret=True,
+        **_LAYOUTS[layout],
     )
     q, kv = prologue.qkv_to_rpa_inputs(qkv, cos, sin, w, w, **kwargs)
     q_dma, kv_dma, q_fp8 = prologue.qkv_to_rpa_inputs(
@@ -269,6 +432,24 @@ def test_block_tokens_fit_vmem_and_tile():
             dict(prologue_dma_stores=True, output_quant_dtype=jnp.float8_e4m3fn),
             id="dma-stores-quantized-output",
         ),
+        pytest.param(
+            8,
+            1,
+            512,
+            dict(kv_layout=configs.KVLayout.SEQ_ALONG_LANE, fp8_compute=True),
+            id="seq-along-lane-pages",
+        ),
+        pytest.param(
+            8,
+            4,
+            256,
+            dict(
+                kv_layout=configs.KVLayout.SEQ_ALONG_LANE,
+                prologue_dma_stores=True,
+                output_quant_dtype=jnp.float8_e4m3fn,
+            ),
+            id="seq-along-lane-dma-stores-quantized-output",
+        ),
     ],
 )
 def test_sharded_attention_from_qkv_lowers_for_tpu(nq, nkv, d, rpa_kwargs):
@@ -286,8 +467,12 @@ def test_sharded_attention_from_qkv_lowers_for_tpu(nq, nkv, d, rpa_kwargs):
         abstract_device=device,
     )
     spec = jax.ShapeDtypeStruct
+    layout = rpa_kwargs.get("kv_layout", configs.KVLayout.HEAD_ALONG_SUBLANE)
+    page_size = 128 if layout == configs.KVLayout.SEQ_ALONG_LANE else 16
     with jax.sharding.use_abstract_mesh(mesh):
-        cache = KB.get_kv_cache_shape(128, 16, nkv, d, jnp.float8_e4m3fn)
+        cache = KB.get_kv_cache_shape(
+            128, page_size, nkv, d, jnp.float8_e4m3fn, kv_layout=layout
+        )
         args = (
             spec((tokens, (nq + 2 * nkv) * d), jnp.bfloat16),
             spec((tokens, d // 2), jnp.bfloat16),

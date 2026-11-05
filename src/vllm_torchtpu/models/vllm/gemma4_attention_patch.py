@@ -27,6 +27,12 @@ normed, rotated q/k/v, never the projection's rows.
 With TPU_GEMMA4_QUANTIZED_ATTN_OUTPUT the backend also returns the output rows
 quantized per token for the FP8 o_proj (``batched_rpa/output_quant``), and
 ``o_projection`` completes the projection on them.
+
+With TPU_GEMMA4_SHARED_KV_PAGES, each ``attention_k_eq_v`` full-attention
+layer stores shared-KV pages (``set_shared_kv``): its value is
+``rmsnorm(k_raw)`` and its key ``rope(k_norm.weight * rmsnorm(k_raw))``, so the
+key equals the weight times the value outside the dims the proportional rope
+rotates, and only those rotated dims are stored besides the value.
 """
 
 from __future__ import annotations
@@ -145,6 +151,8 @@ def _patched_attention_init(self: Gemma4Attention, *args: Any, **kwargs: Any) ->
             f"(--attention-backend CUSTOM); {self.attn.layer_name} uses "
             f"{type(impl).__name__}"
         )
+    if envs.TPU_GEMMA4_SHARED_KV_PAGES:
+        _set_shared_kv(self, impl)
     unsupported = impl.qkv_prologue_unsupported()
     if not self.rotary_emb.is_neox_style:
         unsupported.append("non-neox rotary")
@@ -158,6 +166,49 @@ def _patched_attention_init(self: Gemma4Attention, *args: Any, **kwargs: Any) ->
     impl.qkv_prologue_eps = self.q_norm.variance_epsilon
     if envs.TPU_GEMMA4_QUANTIZED_ATTN_OUTPUT:
         impl.qkv_output_quant_dtype = _o_proj_quant_dtype(self.o_proj)
+
+
+def _shared_kv_attention_init(self: Gemma4Attention, *args: Any, **kwargs: Any) -> None:
+    """Upstream's init, then shared-KV pages for an attention_k_eq_v layer
+    (TPU_GEMMA4_SHARED_KV_PAGES without the fused prologue)."""
+    from vllm_torchtpu.layers.adapter.attention import (
+        PallasBatchedRPAAttentionBackendImpl,
+    )
+
+    _orig_attention_init(self, *args, **kwargs)
+    if self.is_kv_shared_layer:
+        return
+    impl = self.attn.impl
+    if not isinstance(impl, PallasBatchedRPAAttentionBackendImpl):
+        raise NotImplementedError(
+            "TPU_GEMMA4_SHARED_KV_PAGES needs the batched RPA backend "
+            f"(--attention-backend CUSTOM); {self.attn.layer_name} uses "
+            f"{type(impl).__name__}"
+        )
+    _set_shared_kv(self, impl)
+
+
+def _set_shared_kv(attn: Gemma4Attention, impl: Any) -> None:
+    """Shared-KV pages for an ``attention_k_eq_v`` full-attention layer."""
+    if impl.sliding_window is not None or not getattr(
+        attn.config, "attention_k_eq_v", False
+    ):
+        return  # its K and V are separate projections
+    rope = attn.rotary_emb
+    rotary_dims = getattr(rope, "rope_angles", None)
+    if rotary_dims is None or not rope.is_neox_style:
+        raise NotImplementedError(
+            "TPU_GEMMA4_SHARED_KV_PAGES needs Gemma4's proportional neox rotary "
+            f"(leading dims of each half rotated); {attn.attn.layer_name} has "
+            f"{type(rope).__name__}"
+        )
+    impl.set_shared_kv(rotary_dims, attn.k_norm)
+    logger.info_once(
+        "Gemma4 k_eq_v layers store shared-KV pages: the value and the key's %d "
+        "rotated dims of each half of head_dim %d.",
+        rotary_dims,
+        attn.head_dim,
+    )
 
 
 def _o_proj_quant_dtype(o_proj: Any) -> torch.dtype:
@@ -195,10 +246,23 @@ def maybe_patch_gemma4_attention(model_config: ModelConfig | None) -> bool | Non
         raise ValueError(
             "TPU_GEMMA4_QUANTIZED_ATTN_OUTPUT needs TPU_GEMMA4_FUSED_ATTN_PROLOGUE"
         )
-    if not envs.TPU_GEMMA4_FUSED_ATTN_PROLOGUE:
+    if not (envs.TPU_GEMMA4_FUSED_ATTN_PROLOGUE or envs.TPU_GEMMA4_SHARED_KV_PAGES):
         return None
     if model_config is None or model_config.hf_text_config.model_type != "gemma4_text":
         return False
+    text_config = model_config.hf_text_config
+    if envs.TPU_GEMMA4_SHARED_KV_PAGES and (
+        not getattr(text_config, "attention_k_eq_v", False)
+        or getattr(text_config, "num_kv_shared_layers", 0)
+    ):
+        # A KV-shared layer would read its target's shared-KV pages as K/V.
+        raise ValueError(
+            "TPU_GEMMA4_SHARED_KV_PAGES needs a Gemma4 model with attention_k_eq_v "
+            "and no KV-shared layers"
+        )
+    if not envs.TPU_GEMMA4_FUSED_ATTN_PROLOGUE:
+        Gemma4Attention.__init__ = _shared_kv_attention_init
+        return None
     Gemma4Attention.__init__ = _patched_attention_init
     Gemma4Attention.forward = _patched_attention_forward
     logger.info(

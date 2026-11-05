@@ -183,6 +183,22 @@ class ServingConfigs:
     # Mixed-kernel steps whose KV block every query of the step sees whole run
     # without the mask (kernel.step_needs_mask). Outputs are unchanged.
     unmasked_interior: bool = False
+    # Shared-KV pages (SEQ_ALONG_LANE, one KV head): head slot 0 holds the
+    # value, and the key equals it except in the leading
+    # `shared_kv_rotary_dims` dims of each half of head_dim, which slot 1's
+    # leading rows hold (first half's, then second half's). Only those rows
+    # are read and written. 0: standard pages.
+    shared_kv_rotary_dims: int = 0
+    # The decode kernel does not zero its KV VMEM window at entry. Needs
+    # `mask_invalid_v`: V rows no DMA wrote are masked before PV, and a decode
+    # lane's rows all sit at its token's position, so QK masks every key past
+    # its sequence's tokens or window. A padding lane (s_idx -1, is_last_k 0)
+    # may turn its m/l/acc NaN; padding lanes exist only at the tail of the
+    # schedule's last step (schedule.flush_to_hbm), so that carry reaches no
+    # real lane. The mixed kernel keeps the fill: its padded query rows see keys
+    # past the sequence, and its l/acc carry resets through alpha == 0. Outputs
+    # are unchanged.
+    skip_masked_kv_zero_fill: bool = False
 
     def __post_init__(self):
         if self.mask_invalid_v is None:
@@ -190,6 +206,11 @@ class ServingConfigs:
                 self,
                 "mask_invalid_v",
                 self.kv_layout == KVLayout.SEQ_ALONG_LANE,
+            )
+        if self.skip_masked_kv_zero_fill and not self.mask_invalid_v:
+            raise ValueError(
+                "skip_masked_kv_zero_fill needs mask_invalid_v: without it the "
+                "PV matmul reads the KV window's unwritten rows."
             )
 
     @property
@@ -233,6 +254,19 @@ class RpaConfigs:
     serve: ServingConfigs
     mode: RpaCase
     vmem_limit_bytes: int
+
+    def __post_init__(self):
+        # SEQ_ALONG_LANE blocks are filled with whole-page DMAs from offset 0, so
+        # a block that does not end on a page boundary reads the wrong tokens.
+        if (
+            self.serve.kv_layout == KVLayout.SEQ_ALONG_LANE
+            and self.block.bkv_sz % self.serve.page_size
+        ):
+            raise ValueError(
+                f"SEQ_ALONG_LANE KV blocks must be whole pages: bkv_sz "
+                f"{self.block.bkv_sz} is not a multiple of page_size "
+                f"{self.serve.page_size}."
+            )
 
     # Expose block sizes for ease of use.
 
@@ -417,7 +451,19 @@ class RpaConfigs:
         return self.mode == RpaCase.DECODE
 
     @property
+    def kv_rows(self) -> int:
+        """Packed 32-bit rows per token that SEQ_ALONG_LANE pages hold and the
+        kernel moves: every head's K and V, or a shared-KV page's value and
+        rotated key rows."""
+        rows = self.aligned_kv_head_dim // self.serve.packing_kv
+        if self.serve.shared_kv_rotary_dims:
+            return rows + 2 * self.serve.shared_kv_rotary_dims // self.serve.packing_kv
+        return self.model.num_kv_heads * 2 * rows
+
+    @property
     def kv_bytes_per_token(self) -> int:
+        if self.serve.shared_kv_rotary_dims:
+            return self.kv_rows * 4
         if self.serve.kv_layout == KVLayout.SEQ_ALONG_LANE:
             num_elements = self.model.num_kv_heads * 2 * self.aligned_kv_head_dim
         else:
@@ -495,6 +541,15 @@ class RpaConfigs:
 
     @property
     def kv_vmem_shape(self):
+        if self.serve.shared_kv_rotary_dims:
+            # One row axis: the value's rows, then the rotated key rows.
+            return (
+                self.block.batch_size,
+                1,
+                self.kv_rows,
+                self.serve.packing_kv,
+                self.kv_vmem_lanes,
+            )
         if self.serve.kv_layout == KVLayout.SEQ_ALONG_LANE:
             return (
                 self.block.batch_size,
