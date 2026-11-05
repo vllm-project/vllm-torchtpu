@@ -292,14 +292,17 @@ utilization 0.85, with FP8 KV/indexer, block size 64 and max model length 98816.
 
 Both hosts use `TPU_DEEPSEEK_V41_ENGRAM_HBM=first`, Engram `cpu_offload=true`
 and `dp_shared_memory=false`, `MOE_FUSED_EP_KERNEL_IMPL=push`,
-`MOE_FUSED_EP_PUSH_SC_PREPUSH=2`, and `MOE_FUSED_EP_PUSH_TC_EXCHANGE=1`.
-This uses the push-dispatch implementation from #2519. The recipe retains
+`MOE_FUSED_EP_PUSH_SC_PREPUSH=2`, `MOE_FUSED_EP_PUSH_TC_EXCHANGE=1`, and
+`TPU_MOE_EPLB_DYNAMIC=1`. This uses push dispatch from #2519 and dynamic
+EPLB from #2523. The recipe retains
 `MOE_FUSED_EP_PREPROCESS_BACKEND=topology` so the serve script enables
 `--xla_mosaic_unsafe_allow_multicore_remote_dma=true`; push does not consume
 the topology preprocessing object or require #2646's split all-gather support.
-Runtime/wheel pins are unchanged; #2523 is not required.
-The worker audit requires an EP16 mesh and the push parameters above, and the
-host manifests record the same parameters for artifact validation.
+Dynamic EPLB requires `tpu-sync-torch==0.0.1.dev20261031081414` for packed
+FP4 expert transfers and `libibverbs1` in the shared CI image (#2758).
+The worker audit requires an EP16 mesh, the push parameters above and dynamic
+EPLB enabled. Both host manifests record these settings and the tpu-sync
+version, and the multihost audit rejects a host with EPLB disabled.
 Each container gets 256 GiB of `/dev/shm`. This decode job clears the CI image's
 tcmalloc preload and enables `TPU_RECLAIM_COMPILE_MEMORY=1` with glibc.
 GSM8K and cached-extend retain their DP8 recipes and allocator settings.

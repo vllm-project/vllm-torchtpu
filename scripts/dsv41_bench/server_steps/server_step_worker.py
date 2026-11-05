@@ -47,13 +47,14 @@ SCENARIOS["decode_dp16"] = Scenario(
 )
 
 
-def require_dp16_push() -> None:
-    """Check the push recipe in every worker before measuring decode."""
+def require_dp16_recipe() -> None:
+    """Check push and dynamic EPLB in every worker before measuring decode."""
     from vllm_torchtpu.distributed.ep_mesh import build_ep_mesh
     from vllm_torchtpu.envs import (
         MOE_FUSED_EP_KERNEL_IMPL,
         MOE_FUSED_EP_PUSH_SC_PREPUSH,
         MOE_FUSED_EP_PUSH_TC_EXCHANGE,
+        TPU_MOE_EPLB_DYNAMIC,
     )
 
     mesh = build_ep_mesh()
@@ -67,6 +68,8 @@ def require_dp16_push() -> None:
         raise ValueError(
             "DP16 decode CI requires push with SC_PREPUSH=2, TC_EXCHANGE=1"
         )
+    if not TPU_MOE_EPLB_DYNAMIC:
+        raise ValueError("DP16 decode CI requires TPU_MOE_EPLB_DYNAMIC=1")
 
 
 def classify_rows(starts: list[int], ends: list[int], prompts: list[int]) -> str:
@@ -414,7 +417,7 @@ class ServerStepWorker:
             raise ValueError(f"Unknown scenario: {scenario}")
         selected = SCENARIOS[scenario]
         if scenario == "decode_dp16":
-            require_dp16_push()
+            require_dp16_recipe()
         config = self.vllm_config.parallel_config
         if (
             config.tensor_parallel_size,

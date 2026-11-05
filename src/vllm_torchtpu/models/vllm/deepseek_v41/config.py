@@ -221,7 +221,7 @@ def verify_and_update_config(config: "VllmConfig") -> None:
             )
         # Resolve and parse now, so a bad name or table fails at configuration
         # rather than inside a worker's weight load.
-        expert_placement.current(config)
+        expert_placement.static_placement(config)
     if policy.execution == ExecutionMode.CED:
         if parallel.prefill_context_parallel_size != 1:
             raise ValueError("CED requires prefill-context-parallel-size=1")

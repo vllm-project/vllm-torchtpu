@@ -11,92 +11,71 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Host-side checks for the static expert layout (vllm_torchtpu/expert_placement.py)."""
+"""Host-side checks for Dynamic EPLB initial expert placement."""
 
-import json
-import os
 from types import SimpleNamespace
 
 import pytest
 import torch
 
-from vllm_torchtpu import expert_placement
+from vllm_torchtpu import envs, expert_placement
 
 pytestmark = pytest.mark.cpu_test
 
 
-def _table(experts=8, shards=2, layers=None, draft=None):
-    layers = layers or {"3": [[7, 0, 5, 2], [1, 6, 3, 4]]}
-    table = {"experts": experts, "shards": shards, "layers": layers}
-    if draft is not None:
-        table["draft"] = draft
-    return table
-
-
 @pytest.fixture(autouse=True)
 def _fresh(monkeypatch):
-    monkeypatch.setattr(expert_placement, "_APPLIED_LAYERS", set())
-    expert_placement._read_once.cache_clear()
+    monkeypatch.setattr(expert_placement, "_LAYER_MODULES", {})
+    monkeypatch.setattr(expert_placement, "_GROUP", None)
     yield
-    expert_placement._read_once.cache_clear()
 
 
 @pytest.fixture
-def placement_file(tmp_path, monkeypatch):
-    path = tmp_path / "placement.json"
-    path.write_text(json.dumps(_table()))
-    monkeypatch.setenv("TPU_EXPERT_PLACEMENT", str(path))
-    yield path
+def dynamic_enabled(monkeypatch):
+    monkeypatch.setitem(vars(envs), "TPU_MOE_EPLB_DYNAMIC", True)
 
 
-def test_slot_table_inverts_the_rank_lists():
-    p = expert_placement.parse(_table())
-    assert p.slots(3) == 4 and p.target.physical == 8
-    assert p.slot_table(3) == [[1], [4], [3], [6], [7], [2], [5], [0]]
-    assert p.target.expert_map(3, 1) == [-1, 0, -1, 2, 3, -1, 1, -1]
-    assert p.ranks(4) is None
+def test_default_ranks_places_contiguous_block_plus_next_rank_first_expert():
+    ranks = expert_placement.default_ranks(8, 2, extra_slots=1)
+    assert ranks == ((0, 1, 2, 3, 4), (4, 5, 6, 7, 0))
+    ranks_ep8 = expert_placement.default_ranks(384, 8, extra_slots=1)
+    assert len(ranks_ep8) == 8
+    assert all(len(r) == 49 for r in ranks_ep8)
+    assert ranks_ep8[0][:3] == (0, 1, 2) and ranks_ep8[0][-2:] == (47, 48)
+    assert ranks_ep8[7][:3] == (336, 337, 338) and ranks_ep8[7][-2:] == (383, 0)
 
 
-def test_spare_slots_hold_replicas():
-    table = _table(layers={"3": [[7, 0, 5, 2, 3], [1, 6, 3, 4, 7]]})
-    p = expert_placement.parse(table)
-    assert p.slots(3) == 5 and p.target.physical == 10
-    rows = p.slot_table(3)
-    assert rows[3] == [4, 7] and rows[7] == [0, 9]
-    assert rows[0] == [1, -1]
+def test_group_slot_table_and_expert_map_invert_initial_ranks():
+    g = expert_placement.Group(
+        experts=8,
+        shards=2,
+        slots=4,
+        initial_ranks=((7, 0, 5, 2), (1, 6, 3, 4)),
+        staging=0,
+    )
+    assert g.slots == 4 and g.physical == 8
+    assert g.slot_table() == [[1], [4], [3], [6], [7], [2], [5], [0]]
+    assert g.expert_map(1) == [-1, 0, -1, 2, 3, -1, 1, -1]
+    assert g.group("target") is g and g.group("draft") is None
 
 
-def test_explicit_slots_field_must_match_the_lists():
-    table = _table(layers={"3": [[7, 0, 5, 2, 3], [1, 6, 3, 4, 7]]})
-    table["slots"] = 5
-    assert expert_placement.parse(table).target.slots == 5
-    table["slots"] = 4
-    with pytest.raises(ValueError, match=r"4 slots each.*widths \[5\]"):
-        expert_placement.parse(table)
-
-
-@pytest.mark.parametrize(
-    "layers",
-    [
-        {"3": [[7, 0, 5, 2], [1, 6, 3, 3]]},  # 4 missing, 3 twice
-        {"3": [[7, 0, 5], [1, 6, 3, 4, 2]]},  # uneven ranks
-        {"3": [[7, 0, 5, 2]]},  # one rank short
-        {"3": [[7, 7, 5, 2], [1, 6, 3, 4]]},  # 0 missing, 7 twice on rank 0
-        {"3": [[7, 0, 5, 2], [1, 6, 3, 4]], "4": [[0, 1, 2], [3, 4, 5]]},  # too few
-    ],
-)
-def test_a_table_that_is_not_a_layout_is_refused(layers):
-    with pytest.raises(ValueError):
-        expert_placement.parse(_table(layers=layers))
-
-
-def test_draft_group_has_its_own_experts_and_slots():
-    draft = {"experts": 4, "layers": {"0": [[0, 1, 2], [2, 3, 1]]}}
-    p = expert_placement.parse(_table(draft=draft))
-    assert p.draft is not None and p.draft.experts == 4
-    assert p.draft.shards == 2 and p.draft.slots == 3
-    assert p.draft.slot_table(0) == [[0, -1], [1, 5], [2, 3], [4, -1]]
-    assert p.group("draft") is p.draft and p.group("target") is p.target
+def test_staging_slots_and_replica_cap_shape_the_slot_table():
+    """A dynamic layout keeps `staging` spare slots per rank after the active
+    ones: physical slots grow, the lists and the table's slot ids stay the
+    active width, and the expert map leaves the spares unassigned."""
+    g = expert_placement.Group(
+        experts=8,
+        shards=2,
+        slots=6,
+        initial_ranks=((7, 0, 5, 2), (1, 6, 3, 4)),
+        staging=2,
+        replica_cap=2,
+    )
+    assert (g.active, g.staging, g.slots, g.physical) == (4, 2, 6, 12)
+    rows = g.slot_table()
+    assert rows[7] == [0, -1] and rows[1] == [6, -1]  # rank 1's slots start at 6
+    assert all(len(r) == 2 for r in rows)
+    assert g.expert_map(1) == [-1, 0, -1, 2, 3, -1, 1, -1]
 
 
 def test_layer_index_reads_module_prefixes_and_checkpoint_names():
@@ -108,7 +87,7 @@ def test_layer_index_reads_module_prefixes_and_checkpoint_names():
 
 @pytest.fixture(autouse=True)
 def _no_vllm_config(monkeypatch):
-    """Outside a served model the target group applies and the env var selects."""
+    """Outside a served model the target group applies."""
     import vllm.config
 
     def _raise():
@@ -139,130 +118,159 @@ def _fake_layer(name, rank, experts=8, shards=2):
     return layer
 
 
-def test_apply_maps_slots_and_gates_the_fetch_filter(placement_file):
+def test_apply_builds_default_dynamic_layout_and_gates_the_fetch_filter(
+    dynamic_enabled,
+):
     assert expert_placement.fetch_filter_ids("layers.3.ffn.experts.0.w1", 1) is None
-    layer = _fake_layer("model.layers.3.ffn.experts", rank=1)
+    layer = _fake_layer("model.layers.3.ffn.experts", rank=1, experts=8, shards=2)
     assert expert_placement.apply_to_layer(layer)
-    assert layer._expert_map.tolist() == [-1, 0, -1, 2, 3, -1, 1, -1]
-    assert layer.local_num_experts == 4
+    # Rank 1 holds contiguous [4, 5, 6, 7] + rank 0's first expert (0) in slot 4,
+    # plus 2 staging slots -> 7 physical slots per rank (14 total across 2 ranks).
+    assert layer._expert_map.tolist() == [4, -1, -1, -1, 0, 1, 2, 3]
+    assert layer.local_num_experts == 7
     slots = expert_placement.expert_slot_table(layer)
     assert slots.dtype == torch.int32
-    assert slots.tolist() == [[1], [4], [3], [6], [7], [2], [5], [0]]
-    assert expert_placement.physical_experts(layer) == 8
+    assert tuple(slots.shape) == (8, 2)
+    assert expert_placement.physical_experts(layer) == 14
+    # Once applied, all target layers use the initial default_ranks; drafter
+    # tensors keep the default contiguous filter.
     assert expert_placement.fetch_filter_ids(
         "layers.3.ffn.experts.0.w1.weight", 1
-    ) == frozenset({1, 6, 3, 4})
-    # Unlisted layers and drafter tensors keep the default filter.
-    assert expert_placement.fetch_filter_ids("layers.4.ffn.experts.0.w1", 1) is None
+    ) == frozenset({4, 5, 6, 7, 0})
+    assert expert_placement.fetch_filter_ids(
+        "layers.4.ffn.experts.0.w1.weight", 1
+    ) == frozenset({4, 5, 6, 7, 0})
     assert expert_placement.fetch_filter_ids("mtp.3.ffn.experts.0.w1", 1) is None
 
 
-def test_replicas_widen_the_fetch_set_and_the_slot_count(tmp_path, monkeypatch):
-    path = tmp_path / "replicas.json"
-    path.write_text(
-        json.dumps(_table(layers={"3": [[7, 0, 5, 2, 3], [1, 6, 3, 4, 7]]}))
-    )
-    monkeypatch.setenv("TPU_EXPERT_PLACEMENT", str(path))
+def test_disabled_when_dynamic_knob_is_off(monkeypatch):
+    monkeypatch.setitem(vars(envs), "TPU_MOE_EPLB_DYNAMIC", False)
     layer = _fake_layer("model.layers.3.ffn.experts", rank=0)
-    assert expert_placement.apply_to_layer(layer)
-    assert layer.local_num_experts == 5
-    assert layer._expert_map.tolist() == [1, -1, 3, 4, -1, 2, -1, 0]
-    assert expert_placement.physical_experts(layer) == 10
-    assert expert_placement.fetch_filter_ids(
-        "layers.3.ffn.experts.0.w1.weight", 0
-    ) == frozenset({7, 0, 5, 2, 3})
-
-
-def test_unlisted_layer_is_untouched_and_any_path_may_serve_it(placement_file):
-    layer = _fake_layer("model.layers.4.ffn.experts", rank=0)
     assert not expert_placement.apply_to_layer(layer)
     assert expert_placement.expert_slot_table(layer) is None
     assert expert_placement.physical_experts(layer) is None
     expert_placement.check_layer_served(layer, fused_armed=False)
 
 
-def test_a_placed_layer_must_be_served_by_the_fused_kernel(placement_file):
-    layer = _fake_layer("model.layers.3.ffn.experts", rank=0)
-    expert_placement.apply_to_layer(layer)
-    expert_placement.check_layer_served(layer, fused_armed=True)
-    with pytest.raises(RuntimeError, match="not armed"):
-        expert_placement.check_layer_served(layer, fused_armed=False)
+def test_moe_routing_remaps_logical_ids_to_slots_and_accumulates_load(
+    dynamic_enabled, monkeypatch
+):
+    """Non-fused MoE backends route through `moe_routing.route`, which remaps
+    logical expert IDs to physical slot IDs via `_tpu_expert_slot`, sets
+    `_experts_start = ep_rank * local_num_experts`, and accumulates per-slot
+    routed row counts into `_tpu_expert_load`."""
+    from vllm_torchtpu.layers.adapter import expert_load, moe_routing
+
+    monkeypatch.setattr(expert_load, "_REGISTERED", [])
+    layer = _fake_layer("model.layers.3.ffn.experts", rank=1, experts=8, shards=2)
+    layer.global_num_experts = 8
+    layer.renormalize = True
+    layer.scoring_func = "softmax"
+    layer.routed_scaling_factor = 1.0
+    layer.use_grouped_topk = False
+    layer.num_expert_group = None
+    layer.topk_group = None
+    layer.e_score_correction_bias = None
+    layer.custom_routing_function = None
+    layer.moe_config = SimpleNamespace(
+        experts_per_token=2,
+        ep_size=2,
+        ep_rank=1,
+        num_local_experts=4,
+        is_sequence_parallel=False,
+        moe_parallel_config=SimpleNamespace(use_ep=True),
+    )
+
+    assert expert_placement.apply_to_layer(layer)
+    assert layer.moe_config.num_local_experts == 7
+    moe_routing.register_experts_start_buffer(layer, device=torch.device("cpu"))
+    assert int(layer._experts_start.item()) == 7  # rank 1 owns slots [7..13]
+    load_buf = expert_load.operand(layer)
+    assert load_buf is not None and tuple(load_buf.shape) == (14,)
+
+    # Initial layout on 8 experts / 2 shards (slots=7 per rank):
+    # rank 0 slots 0..4 hold [0, 1, 2, 3, 4]; rank 1 slots 7..11 hold [4, 5, 6, 7, 0].
+    # Expert 0 has 2 replicas at slots [0, 11]; expert 5 has 1 replica at slot 8.
+    x = torch.zeros((4, 16), dtype=torch.bfloat16)
+    logits = torch.full((4, 8), -10.0, dtype=torch.float32)
+    logits[:, 0] = 5.0
+    logits[:, 5] = 4.0
+
+    weights, slot_ids = moe_routing.route(layer, x, logits)
+    assert tuple(weights.shape) == (4, 2)
+    # Token rows 0..3 alternate between expert 0's two replicas (slots 0 and 11),
+    # while expert 5 always maps to slot 8.
+    assert slot_ids.tolist() == [[0, 8], [11, 8], [0, 8], [11, 8]]
+    assert load_buf.tolist() == [2, 0, 0, 0, 0, 0, 0, 0, 4, 0, 0, 2, 0, 0]
+
+    # Installing a new slot table redirects subsequent routes without recompiling.
+    new_table = expert_placement.expert_slot_table(layer).clone()
+    new_table[5] = torch.tensor([5, -1], dtype=torch.int32)  # move expert 5 to slot 5
+    expert_placement.install_table(layer, new_table)
+    _, slot_ids_after = moe_routing.route(layer, x, logits)
+    assert slot_ids_after.tolist() == [[0, 5], [11, 5], [0, 5], [11, 5]]
+    assert load_buf[5].item() == 4
 
 
-def test_a_table_for_another_mesh_is_refused(placement_file):
-    layer = _fake_layer("model.layers.3.ffn.experts", rank=0, experts=16, shards=4)
-    with pytest.raises(ValueError, match="is for 2 ranks x 8 experts"):
-        expert_placement.apply_to_layer(layer)
+def test_mover_parts_supports_fp8_and_compressed_tensors_moe_layouts():
+    from vllm_torchtpu import expert_mover
+
+    fp8_layer = torch.nn.Module()
+    fp8_layer.w13_weight = torch.nn.Parameter(
+        torch.zeros((7, 16, 32), dtype=torch.float8_e4m3fn), requires_grad=False
+    )
+    fp8_layer.w2_weight = torch.nn.Parameter(
+        torch.zeros((7, 16, 16), dtype=torch.float8_e4m3fn), requires_grad=False
+    )
+    fp8_layer.w13_weight_scale_inv = torch.nn.Parameter(
+        torch.ones((7, 1, 1, 32), dtype=torch.float32), requires_grad=False
+    )
+    fp8_layer.w2_weight_scale_inv = torch.nn.Parameter(
+        torch.ones((7, 1, 1, 16), dtype=torch.float32), requires_grad=False
+    )
+    names = [
+        name for _, name, _, kind in expert_mover._parts(fp8_layer) if kind == "slot"
+    ]
+    assert names == [
+        "w13_weight",
+        "w2_weight",
+        "w13_weight_scale_inv",
+        "w2_weight_scale_inv",
+    ]
+
+    ct_layer = torch.nn.Module()
+    ct_layer.w13_weight_packed = torch.nn.Parameter(
+        torch.zeros((7, 4, 32), dtype=torch.int32), requires_grad=False
+    )
+    ct_layer.w2_weight_packed = torch.nn.Parameter(
+        torch.zeros((7, 4, 16), dtype=torch.int32), requires_grad=False
+    )
+    ct_layer.w13_weight_scale = torch.nn.Parameter(
+        torch.ones((7, 1, 32), dtype=torch.bfloat16), requires_grad=False
+    )
+    ct_layer.w2_weight_scale = torch.nn.Parameter(
+        torch.ones((7, 1, 16), dtype=torch.bfloat16), requires_grad=False
+    )
+    ct_names = [
+        name for _, name, _, kind in expert_mover._parts(ct_layer) if kind == "slot"
+    ]
+    assert ct_names == [
+        "w13_weight_packed",
+        "w2_weight_packed",
+        "w13_weight_scale",
+        "w2_weight_scale",
+    ]
 
 
-def test_drafter_layers_take_the_draft_group_by_runner_type(tmp_path, monkeypatch):
+def test_drafter_layers_are_left_unplaced_by_default(dynamic_enabled, monkeypatch):
     import vllm.config
 
-    path = tmp_path / "drafter.json"
-    draft = {"experts": 4, "layers": {"1": [[0, 1, 2], [2, 3, 1]]}}
-    path.write_text(json.dumps(_table(draft=draft)))
-    monkeypatch.setenv("TPU_EXPERT_PLACEMENT", str(path))
     runner = SimpleNamespace(
         model_config=SimpleNamespace(
             runner_type="draft", hf_config=SimpleNamespace(num_hidden_layers=6)
         )
     )
     monkeypatch.setattr(vllm.config, "get_current_vllm_config", lambda: runner)
-    # A 6-layer target: the drafter's module `model.layers.7` is draft layer 1;
-    # its `model.layers.6` is draft layer 0, which this layout does not list.
     assert not expert_placement.apply_to_layer(
         _fake_layer("model.layers.6.ffn.experts", 1, experts=4)
     )
-    layer = _fake_layer("model.layers.7.ffn.experts", 1, experts=4)
-    assert expert_placement.apply_to_layer(layer)
-    assert layer.local_num_experts == 3
-    assert expert_placement.physical_experts(layer) == 6
-    assert expert_placement.fetch_filter_ids("mtp.1.ffn.experts.0.w1.weight", 1) == (
-        frozenset({2, 3, 1})
-    )
-    assert expert_placement.fetch_filter_ids("mtp.0.ffn.experts.0.w1", 1) is None
-    # The target's layer 1 is a different layer and was not applied.
-    assert expert_placement.fetch_filter_ids("layers.1.ffn.experts.0.w1", 1) is None
-
-
-def test_the_policy_field_selects_the_layout_over_the_env(tmp_path, monkeypatch):
-    path = tmp_path / "policy.json"
-    path.write_text(json.dumps(_table()))
-    monkeypatch.delenv("TPU_EXPERT_PLACEMENT", raising=False)
-    config = SimpleNamespace(
-        additional_config={"deepseek_v41": {"expert_layout": str(path)}}
-    )
-    assert expert_placement.configured_value(config) == str(path)
-    assert expert_placement.current(config).target.slots == 4
-    assert expert_placement.content_hash(config) is not None
-    assert (
-        expert_placement.configured_value(SimpleNamespace(additional_config={})) is None
-    )
-
-
-def test_shipped_layouts_resolve_by_name_and_parse():
-    shipped = sorted(
-        f for f in os.listdir(expert_placement.PLACEMENT_DIR) if f.endswith(".json")
-    )
-    assert shipped
-    for f in shipped:
-        path = expert_placement.resolve(f[:-5])
-        assert path == os.path.join(expert_placement.PLACEMENT_DIR, f)
-        with open(path) as fh:
-            expert_placement.parse(json.load(fh), path)
-    with pytest.raises(FileNotFoundError, match="shipped layout"):
-        expert_placement.resolve("no_such_layout")
-    assert expert_placement.resolve("/tmp/x.json") == "/tmp/x.json"
-
-
-def test_content_hash_tracks_table_bytes(tmp_path, monkeypatch):
-    monkeypatch.delenv("TPU_EXPERT_PLACEMENT", raising=False)
-    assert expert_placement.content_hash() is None
-    path = tmp_path / "placement.json"
-    path.write_text(json.dumps(_table()))
-    monkeypatch.setenv("TPU_EXPERT_PLACEMENT", str(path))
-    first = expert_placement.content_hash()
-    assert len(first) == 64
-    path.write_text(json.dumps(_table(layers={"3": [[0, 1, 2, 3], [4, 5, 6, 7]]})))
-    expert_placement._read_once.cache_clear()
-    assert expert_placement.content_hash() != first

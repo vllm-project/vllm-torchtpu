@@ -65,6 +65,7 @@ from vllm_torchtpu.kernels.fused_moe.v2.host import (
     U32_SUBLANE_TILE,
     token_gather_smem_bytes,
 )
+from vllm_torchtpu.layers.adapter import expert_load as expert_load_tap
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
@@ -186,6 +187,7 @@ def _build_op(
     token_replica_groups=None,
     logical_intermediate_size: int | None = None,
     has_expert_slot=False,
+    has_expert_load=False,
 ):
     """The op for this closure, built once per distinct closure and reused.
 
@@ -245,6 +247,8 @@ def _build_op(
         has_hash_ids,
         token_replica_groups,
         logical_intermediate_size,
+        has_expert_slot,
+        has_expert_load,
         envs.MOE_FUSED_EP_KERNEL_IMPL,
         tuple(sorted(impl_kw.items())),
         has_expert_slot,
@@ -349,10 +353,149 @@ def _build_op(
             hash_topk_ids=hash_ids.astype(jnp.int32),
         )
 
+    def moe_with_expert_slot(
+        x: jax.Array,
+        w1: jax.Array,
+        w2: jax.Array,
+        w1_scale: jax.Array,
+        w2_scale: jax.Array,
+        gating: jax.Array,
+        rank: jax.Array,
+        expert_slot: jax.Array,
+    ) -> jax.Array:
+        return call(
+            x,
+            w1,
+            w2,
+            w1_scale,
+            w2_scale,
+            gating,
+            rank,
+            expert_slot=expert_slot,
+        )
+
+    def moe_with_score_bias_expert_slot(
+        x: jax.Array,
+        w1: jax.Array,
+        w2: jax.Array,
+        w1_scale: jax.Array,
+        w2_scale: jax.Array,
+        gating: jax.Array,
+        rank: jax.Array,
+        score_bias: jax.Array,
+        expert_slot: jax.Array,
+    ) -> jax.Array:
+        return call(
+            x,
+            w1,
+            w2,
+            w1_scale,
+            w2_scale,
+            gating,
+            rank,
+            score_bias=score_bias.astype(jnp.float32),
+            expert_slot=expert_slot,
+        )
+
+    def moe_with_hash_ids_expert_slot(
+        x: jax.Array,
+        w1: jax.Array,
+        w2: jax.Array,
+        w1_scale: jax.Array,
+        w2_scale: jax.Array,
+        gating: jax.Array,
+        rank: jax.Array,
+        hash_ids: jax.Array,
+        expert_slot: jax.Array,
+    ) -> jax.Array:
+        return call(
+            x,
+            w1,
+            w2,
+            w1_scale,
+            w2_scale,
+            gating,
+            rank,
+            hash_topk_ids=hash_ids.astype(jnp.int32),
+            expert_slot=expert_slot,
+        )
+
+    def moe_with_expert_slot_expert_load(
+        x: jax.Array,
+        w1: jax.Array,
+        w2: jax.Array,
+        w1_scale: jax.Array,
+        w2_scale: jax.Array,
+        gating: jax.Array,
+        rank: jax.Array,
+        expert_slot: jax.Array,
+        expert_load: jax.Array,
+    ) -> tuple[jax.Array, jax.Array]:
+        return call(
+            x,
+            w1,
+            w2,
+            w1_scale,
+            w2_scale,
+            gating,
+            rank,
+            expert_slot=expert_slot,
+            expert_load=expert_load,
+        )
+
+    def moe_with_score_bias_expert_slot_expert_load(
+        x: jax.Array,
+        w1: jax.Array,
+        w2: jax.Array,
+        w1_scale: jax.Array,
+        w2_scale: jax.Array,
+        gating: jax.Array,
+        rank: jax.Array,
+        score_bias: jax.Array,
+        expert_slot: jax.Array,
+        expert_load: jax.Array,
+    ) -> tuple[jax.Array, jax.Array]:
+        return call(
+            x,
+            w1,
+            w2,
+            w1_scale,
+            w2_scale,
+            gating,
+            rank,
+            score_bias=score_bias.astype(jnp.float32),
+            expert_slot=expert_slot,
+            expert_load=expert_load,
+        )
+
+    def moe_with_hash_ids_expert_slot_expert_load(
+        x: jax.Array,
+        w1: jax.Array,
+        w2: jax.Array,
+        w1_scale: jax.Array,
+        w2_scale: jax.Array,
+        gating: jax.Array,
+        rank: jax.Array,
+        hash_ids: jax.Array,
+        expert_slot: jax.Array,
+        expert_load: jax.Array,
+    ) -> tuple[jax.Array, jax.Array]:
+        return call(
+            x,
+            w1,
+            w2,
+            w1_scale,
+            w2_scale,
+            gating,
+            rank,
+            hash_topk_ids=hash_ids.astype(jnp.int32),
+            expert_slot=expert_slot,
+            expert_load=expert_load,
+        )
+
     assert not (has_score_bias and has_hash_ids)
+    assert not (has_expert_load and not has_expert_slot)
     spec = PartitionSpec(EP_AXIS_NAME)
-    # The score-correction bias is indexed by GLOBAL expert id and read by
-    # every shard for its own tokens, so it is replicated where the other
     # The score-correction bias is indexed by GLOBAL expert id and read by
     # every shard for its own tokens, so it is replicated where the other
     # seven are sharded on axis 0. The spec tuple goes straight to shard_map,
@@ -365,7 +508,11 @@ def _build_op(
         + ((spec,) if has_hash_ids else ())
         # The slot table is indexed by global expert id too: replicated.
         + ((PartitionSpec(),) if has_expert_slot else ())
+        # The routed-row accumulator is per physical slot and identical on
+        # every shard: replicated, donated, returned as a second output.
+        + ((PartitionSpec(),) if has_expert_load else ())
     )
+    load_argnum = 7 + has_score_bias + has_hash_ids + has_expert_slot
     # Stock jax_op. It used to size its outputs from the export's avals, where
     # a shard_map result is recorded as replicated, so this rank's 2048 rows
     # came back claiming the mesh-wide 16384; `sharded_jax_op`, a local copy of
@@ -377,7 +524,8 @@ def _build_op(
             call,
             ("score_bias",) * has_score_bias
             + ("hash_topk_ids",) * has_hash_ids
-            + ("expert_slot",),
+            + ("expert_slot",)
+            + ("expert_load",) * has_expert_load,
         )
     elif has_score_bias:
         fn = moe_with_score_bias
@@ -390,16 +538,25 @@ def _build_op(
         fn,
         mesh=mesh,
         # x, w1, w2, w1_scale, w2_scale, gating, rank [, score_bias | hash_ids]
-        # [, expert_slot] -- and the single output is sharded on axis 0 like x.
+        # [, expert_slot] [, expert_load] -- and the output is sharded on
+        # axis 0 like x, followed by the updated accumulator when it is taken.
         input_partition_specs=input_specs,
-        output_partition_specs=spec,
+        output_partition_specs=(spec, PartitionSpec()) if has_expert_load else spec,
+        donate_argnums=(load_argnum,) if has_expert_load else None,
     )
 
     # Replaces the fake jax_op installs, which resolves the output aval by
     # running a real `jax.export` every time Dynamo traces the op. This kernel
     # returns the rows it was given, so the answer is known without exporting.
-    def _fake(x, *_args, **_kwargs):
-        return torch.empty_like(x)
+    if has_expert_load:
+
+        def _fake(x, *args, **_kwargs):
+            return torch.empty_like(x), torch.empty_like(args[load_argnum - 1])
+
+    else:
+
+        def _fake(x, *_args, **_kwargs):
+            return torch.empty_like(x)
 
     op.register_fake(_fake)
     _OPS[key] = op
@@ -411,6 +568,7 @@ _OPERAND_DTYPES = {
     "score_bias": jnp.float32,
     "hash_topk_ids": jnp.int32,
     "expert_slot": None,
+    "expert_load": jnp.int32,
 }
 
 
@@ -434,12 +592,14 @@ def _operand_fn(call, names):
         }
         return call(*operands[: len(fixed)], **kw)
 
+    # With the routed-row accumulator the op returns (output, updated load).
+    returns = tuple[jax.Array, jax.Array] if "expert_load" in names else jax.Array
     param = inspect.Parameter.POSITIONAL_OR_KEYWORD
     fn.__signature__ = inspect.Signature(  # type: ignore[attr-defined]
         [inspect.Parameter(n, param, annotation=jax.Array) for n in fixed + names],
-        return_annotation=jax.Array,
+        return_annotation=returns,
     )
-    fn.__annotations__ = {n: jax.Array for n in fixed + names} | {"return": jax.Array}
+    fn.__annotations__ = {n: jax.Array for n in fixed + names} | {"return": returns}
     fn.__name__ = "moe_with_" + "_".join(names)
     return fn
 
@@ -455,6 +615,7 @@ def fused_moe_ep(
     score_bias: torch.Tensor | None = None,
     hash_ids: torch.Tensor | None = None,
     expert_slot: torch.Tensor | None = None,
+    expert_load: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Run one MoE layer through the fused EP kernel.
 
@@ -467,7 +628,9 @@ def fused_moe_ep(
     `score_bias` is the layer's `e_score_correction_bias`, [global experts]
     f32, and `hash_ids` is `hash_topk_ids_operand`'s [tokens, topk] i32 table
     lookup; `expert_slot` is a placed layer's slot table
-    (`expert_placement.expert_slot_table`). Each must be passed exactly when
+    (`expert_placement.expert_slot_table`); `expert_load` is the layer's
+    routed-row accumulator (`expert_load.operand`), donated to the op and
+    written back here. Each must be passed exactly when
     prebuild saw the corresponding thing on the layer -- prebuild built the
     op's signature around that. Getting it wrong is a torch arity error at the
     first call, not a wrong answer.
@@ -483,8 +646,16 @@ def fused_moe_ep(
             _squeeze_channel_scale_checked(w1_scale),
             _squeeze_channel_scale_checked(w2_scale),
         )
-    extra = tuple(t for t in (score_bias, hash_ids, expert_slot) if t is not None)
-    return op(hidden_states, w1, w2, *scales, router_logits, _RANK_BUFFER, *extra)
+    extra = tuple(
+        t for t in (score_bias, hash_ids, expert_slot, expert_load) if t is not None
+    )
+    result = op(hidden_states, w1, w2, *scales, router_logits, _RANK_BUFFER, *extra)
+    if expert_load is None:
+        return result
+    out, updated = result
+    # The operand was donated: the buffer holds nothing useful until this.
+    expert_load.copy_(updated)
+    return out
 
 
 # The buffer `register_score_bias_buffer` stages the bias operand under, and
@@ -744,7 +915,10 @@ def prebuild_fused_moe_ep(
         # and holds `slots` physical experts per rank; the kernel's e_total is
         # the physical count, which the layout fixes.
         physical = expert_placement.physical_experts(layer)
-        if local_experts * ep != physical or placed.shape[0] != layer.global_num_experts:
+        if (
+            local_experts * ep != physical
+            or placed.shape[0] != layer.global_num_experts
+        ):
             logger.warning_once(
                 "Fused EP MoE not engaged: the expert layout places %d physical "
                 "slots over %d logical experts, but this rank holds %d over "
@@ -791,6 +965,7 @@ def prebuild_fused_moe_ep(
         token_replica_groups=token_replica_groups,
         logical_intermediate_size=logical_intermediate_size,
         has_expert_slot=placed is not None,
+        has_expert_load=placed is not None and expert_load_tap.enabled(),
     )
     logger.info_once(
         "Fused EP MoE armed | hidden=%d inter=%d local_experts=%d ep=%d "

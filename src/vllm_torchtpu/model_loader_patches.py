@@ -179,6 +179,25 @@ def _should_skip_weight_tpu(
     return _should_skip(weight_name, local_expert_ids)
 
 
+def _ep_rank_and_size(parallel_config) -> tuple[int, int]:
+    """Derive ``(ep_rank, ep_size)`` as vLLM's FusedMoE parallel config does."""
+    from vllm.distributed import (
+        get_dp_group,
+        get_pcp_group,
+        get_tensor_model_parallel_rank,
+    )
+
+    dp_size = parallel_config.data_parallel_size
+    tp_size = parallel_config.tensor_parallel_size
+    pcp_size = parallel_config.prefill_context_parallel_size
+    dp_rank = get_dp_group().rank_in_group if dp_size > 1 else 0
+    tp_rank = get_tensor_model_parallel_rank() if tp_size > 1 else 0
+    pcp_rank = get_pcp_group().rank_in_group if pcp_size > 1 else 0
+    ep_size = dp_size * pcp_size * tp_size
+    ep_rank = dp_rank * pcp_size * tp_size + pcp_rank * tp_size + tp_rank
+    return ep_rank, ep_size
+
+
 @functools.cache
 def _ep_rank() -> int:
     """This process's EP rank, derived as vLLM's FusedMoE parallel config does.
@@ -187,20 +206,9 @@ def _ep_rank() -> int:
     carry the vLLM config context; the first call is on the loading thread.
     """
     from vllm.config import get_current_vllm_config
-    from vllm.distributed import (
-        get_dp_group,
-        get_pcp_group,
-        get_tensor_model_parallel_rank,
-    )
 
-    parallel_config = get_current_vllm_config().parallel_config
-    dp_size = parallel_config.data_parallel_size
-    tp_size = parallel_config.tensor_parallel_size
-    pcp_size = parallel_config.prefill_context_parallel_size
-    dp_rank = get_dp_group().rank_in_group if dp_size > 1 else 0
-    tp_rank = get_tensor_model_parallel_rank() if tp_size > 1 else 0
-    pcp_rank = get_pcp_group().rank_in_group if pcp_size > 1 else 0
-    return dp_rank * pcp_size * tp_size + pcp_rank * tp_size + tp_rank
+    ep_rank, _ = _ep_rank_and_size(get_current_vllm_config().parallel_config)
+    return ep_rank
 
 
 def _compute_local_expert_ids() -> set[int] | None:
@@ -233,20 +241,7 @@ def _compute_local_expert_ids() -> set[int] | None:
     if num_experts <= 0:
         return None
 
-    from vllm.distributed import (
-        get_dp_group,
-        get_pcp_group,
-        get_tensor_model_parallel_rank,
-    )
-
-    dp_size = parallel_config.data_parallel_size
-    tp_size = parallel_config.tensor_parallel_size
-    pcp_size = parallel_config.prefill_context_parallel_size
-    dp_rank = get_dp_group().rank_in_group if dp_size > 1 else 0
-    tp_rank = get_tensor_model_parallel_rank() if tp_size > 1 else 0
-    pcp_rank = get_pcp_group().rank_in_group if pcp_size > 1 else 0
-    ep_size = dp_size * pcp_size * tp_size
-    ep_rank = dp_rank * pcp_size * tp_size + pcp_rank * tp_size + tp_rank
+    ep_rank, ep_size = _ep_rank_and_size(parallel_config)
 
     # Use the loader's symbol instead of importing the base helper directly.
     # Hierarchical EP replaces this symbol with its chip-aware ownership map,

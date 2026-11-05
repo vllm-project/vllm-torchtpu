@@ -28,6 +28,7 @@ def audit(root: Path) -> dict:
             "moe_kernel": "push",
             "moe_push_sc_prepush": 2,
             "moe_push_tc_exchange": True,
+            "moe_eplb_dynamic": True,
             "moe_preprocess": "topology",
             "allocator": "glibc",
             "reclaim_compile_memory": True,

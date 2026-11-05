@@ -11,46 +11,60 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""A static expert layout for expert parallelism: which experts each EP rank
-holds, in which slot, with spare slots holding replicas of hot experts.
+"""Expert slot layouts for expert parallelism: a static layout from a file,
+and the runtime slot-table state of Dynamic EPLB.
 
-Selected by `additional_config.deepseek_v41.expert_layout` (a shipped layout's
-name, a path or a gs:// URI) or, for harnesses, by `TPU_EXPERT_PLACEMENT`.
-The file names, per MoE layer, which global (logical) experts each EP rank
-holds and in what slot order:
+Two sources decide which experts each EP rank holds, in which slot, with
+spare slots holding replicas of hot experts:
 
-    {"experts": 384, "shards": 32, "slots": 13,
-     "layers": {"3": [[17, 250, ...13 ids...], ...32 ranks...], ...},
-     "draft": {"experts": 128, "slots": 5,
-               "layers": {"0": [[...5 ids...], ...32 ranks...], ...}}}
+  * A STATIC layout, selected by `additional_config.deepseek_v41.expert_layout`
+    (a shipped layout's name, a path or a gs:// URI) or, for harnesses, by
+    `TPU_EXPERT_PLACEMENT`. The file names, per MoE layer, which global
+    (logical) experts each EP rank holds and in what slot order:
 
-Every rank of a listed layer lists `slots` ids, at least experts / shards;
-every expert of the layer is held at least once and at most once per rank.
-Slots beyond experts / shards hold REPLICAS of hot experts: each copy computes
-the share of that expert's tokens the kernel routes to it, at the cost of one
-more expert's weights in HBM per rank. Layers that are not listed keep the
-checkpoint's contiguous blocks. The optional `draft` group describes the
-DSpark drafter's MoE layers, which are a separate model whose `model.layers.i`
-is built from the checkpoint's `mtp.i.*` tensors; it is keyed by the model's
-`runner_type`, never by layer index.
+        {"experts": 384, "shards": 32, "slots": 13,
+         "layers": {"3": [[17, 250, ...13 ids...], ...32 ranks...], ...},
+         "draft": {"experts": 128, "slots": 5,
+                   "layers": {"0": [[...5 ids...], ...32 ranks...], ...}}}
 
-What follows from a listed layer, all decided at load:
+    Every rank of a listed layer lists `slots` ids, at least experts / shards;
+    every expert of the layer is held at least once and at most once per rank.
+    Slots beyond experts / shards hold REPLICAS of hot experts: each copy
+    computes the share of that expert's tokens the kernel routes to it, at the
+    cost of one more expert's weights in HBM per rank. Layers that are not
+    listed keep the checkpoint's contiguous blocks. The optional `draft` group
+    describes the DSpark drafter's MoE layers, a separate model whose
+    `model.layers.i` is built from the checkpoint's `mtp.i.*` tensors; it is
+    keyed by the model's `runner_type`, never by layer index.
+
+  * DYNAMIC EPLB (`TPU_MOE_EPLB_DYNAMIC=1`, expert_relayout.py): the target
+    layers start from an initial layout and are re-laid at runtime from the
+    kernel's load counts. Without a static layout the initial layout is blind
+    (zero prior profiling): EP rank `r` holds its contiguous block plus the
+    first expert of the next rank in one redundant active slot
+    (`DEFAULT_EXTRA_SLOTS`). With a static layout, that layout is the initial
+    one, layer by layer. Either way `DEFAULT_STAGING` spare physical slots sit
+    behind the active slots on every rank for background weight staging, and
+    the slot table is `replica_cap = EP` wide so a re-layout can give an
+    expert more copies without changing a shape.
+
+What follows from a placed layer, all decided at load:
   * the layer's expert map puts expert `ranks[r][j]` in slot j of rank r, so
     vLLM's weight loader and the fetch-time expert filter load exactly those
     (and the layer holds `slots` experts, not experts / shards);
   * `expert_slot_table` lists, per global expert, the SLOT ids holding it,
     `r * slots + j`, the contiguous-block numbering the fused EP kernel
-    addresses, padded with -1 to the most replicas any expert has. The kernel
-    maps the selected ids after top-k, so selection, tie-breaking, the router
+    addresses, padded with -1. The fused EP kernel (`fused_moe_ep.py`) and the
+    shared PyTorch routing entry point (`moe_routing.route` + `fused_moe_gmm`)
+    map the selected ids after top-k, so selection, tie-breaking, the router
     weights and the order of the k combine terms are those of the unplaced
     model: every copy holds the same weights, so per token the output is the
-    same bits; only where the matmuls run moves.
+    same bits; only where the matmuls run moves. Both accumulate per-slot
+    routed row counts into `expert_load` when Dynamic EPLB is on.
 
-Only the fused EP kernel reads slot ids, so a placed layer must be armed for
-it; `check_layer_served` refuses anything else.
-
-This is the design of PR #1408's first revision (`2c55c0109`), with the
-`slots` field and the drafter group added.
+The static layout is the design of PR #1408's first revision (`2c55c0109`)
+with the `slots` field and the drafter group added; the dynamic state is
+#2523's.
 """
 
 import functools
@@ -77,56 +91,104 @@ _DRAFTER_TENSOR_RE = re.compile(r"^mtp\.(\d+)\.")
 TARGET = "target"
 DRAFT = "draft"
 
+# Dynamic EPLB's blind initial layout: one redundant active slot per rank, and
+# the spare physical slots a re-layout stages the next generation into.
+DEFAULT_EXTRA_SLOTS = 1
+DEFAULT_STAGING = 2
+
 # The layer attribute the slot table is registered under.
 EXPERT_SLOT_ATTR = "_tpu_expert_slot"
-# The layer attribute recording which group (target or draft) placed it.
-_GROUP_ATTR = "_tpu_expert_group"
+# The layer attribute naming its (group, layer index) under the layout.
+LAYOUT_KEY_ATTR = "_tpu_layout_key"
 
-# (group, layer index) pairs whose expert map follows the layout in this
-# process. The fetch-time filter consults the layout only for these, so a model
-# whose MoE method never applied it keeps the default filter.
+# (group, layer index) -> the placed layer module, for the dynamic re-layout
+# (its tables to install, its weights to move). Modules live as long as the
+# model; this process holds one model.
+_LAYER_MODULES: dict[tuple[str, int], object] = {}
+# (group, layer index) pairs whose expert map follows a layout in this
+# process. The fetch-time filter consults the layout only for these, so a
+# model whose MoE method never applied it keeps the default filter.
 _APPLIED_LAYERS: set[tuple[str, int]] = set()
+# The active Dynamic EPLB group of the target model's MoE layers, built when
+# the first target layer is placed with `TPU_MOE_EPLB_DYNAMIC` on.
+_GROUP: "Group | None" = None
 _LOCK = threading.Lock()
 
 
 @dataclass(frozen=True)
 class Group:
-    """One layout group: a model's MoE layers over `shards` ranks."""
+    """One layout group: a model's MoE layers over `shards` ranks.
+
+    `slots` is the physical slots per rank: the `active` ones a layer's ranks
+    fill, plus `staging` spare slots a dynamic re-layout stages the next
+    generation's experts into (unreferenced by the table, never routed to,
+    skipped by the kernel's visit list). `layers` holds the per-layer rank
+    lists of a static layout; `initial_ranks` is the layout of a layer it
+    does not list (Dynamic EPLB's blind default), used only when
+    `blind_fallback` is set. `replica_cap` fixes the slot table's width so a
+    re-layout can give an expert more copies without changing a shape; None
+    takes the most copies any expert has.
+    """
 
     experts: int
     shards: int
     slots: int
-    layers: dict[int, tuple[tuple[int, ...], ...]]
+    initial_ranks: tuple[tuple[int, ...], ...]
+    staging: int = 0
+    replica_cap: int | None = None
+    layers: dict[int, tuple[tuple[int, ...], ...]] | None = None
+    blind_fallback: bool = True
+
+    def group(self, name: str) -> "Group | None":
+        return self if name == TARGET else None
+
+    @property
+    def active(self) -> int:
+        """Slots per rank the layout fills."""
+        return self.slots - self.staging
 
     @property
     def physical(self) -> int:
         """Physical slots over the mesh, the kernel's `e_total`."""
         return self.shards * self.slots
 
-    def ranks(self, layer: int) -> tuple[tuple[int, ...], ...] | None:
-        """Per rank, the global experts it holds in slot order; None if unlisted."""
-        return self.layers.get(layer)
+    def ranks(self, layer: int = 0) -> tuple[tuple[int, ...], ...] | None:
+        """Per rank, the global experts it holds in slot order; None when the
+        layer is unlisted and the group has no blind default."""
+        if self.layers is not None and layer in self.layers:
+            return self.layers[layer]
+        return self.initial_ranks if self.blind_fallback else None
 
-    def slot_table(self, layer: int) -> list[list[int]]:
+    def slot_table(self, layer: int = 0) -> list[list[int]]:
         """Row e: the slots r * slots + j holding expert e, padded with -1 to
-        the most replicas any expert of the layer has."""
+        `replica_cap` (or the most replicas any expert of the layer has)."""
+        ranks = self.ranks(layer)
+        if ranks is None:
+            raise KeyError(f"layer {layer} is not listed in the layout")
         held_at: list[list[int]] = [[] for _ in range(self.experts)]
-        for r, held in enumerate(self.layers[layer]):
+        for r, held in enumerate(ranks):
             for j, e in enumerate(held):
                 held_at[e].append(r * self.slots + j)
         width = max(len(h) for h in held_at)
+        if self.replica_cap is not None:
+            width = max(width, self.replica_cap)
         return [h + [-1] * (width - len(h)) for h in held_at]
 
-    def expert_map(self, layer: int, rank: int) -> list[int]:
+    def expert_map(self, rank: int, layer: int = 0) -> list[int]:
         """Global expert -> this rank's local slot, or -1."""
+        ranks = self.ranks(layer)
+        if ranks is None:
+            raise KeyError(f"layer {layer} is not listed in the layout")
         table = [-1] * self.experts
-        for j, e in enumerate(self.layers[layer][rank]):
+        for j, e in enumerate(ranks[rank]):
             table[e] = j
         return table
 
 
 @dataclass(frozen=True)
 class Placement:
+    """A static layout file: the target group and, optionally, the drafter's."""
+
     target: Group
     draft: Group | None = None
 
@@ -150,6 +212,28 @@ class Placement:
 
     def slot_table(self, layer: int):
         return self.target.slot_table(layer)
+
+
+def default_ranks(
+    experts: int, shards: int, extra_slots: int = DEFAULT_EXTRA_SLOTS
+) -> tuple[tuple[int, ...], ...]:
+    """Contiguous block per rank plus the first `extra_slots` expert(s) of the
+    following rank(s), wrapping modulo `experts`."""
+    if shards <= 0 or experts <= 0 or experts % shards != 0:
+        raise ValueError(
+            f"expert placement: {experts} experts do not divide over {shards} ranks"
+        )
+    per_shard = experts // shards
+    if extra_slots < 0 or per_shard + extra_slots > experts:
+        raise ValueError(
+            f"expert placement: invalid extra_slots={extra_slots} for "
+            f"{experts} experts over {shards} ranks"
+        )
+    width = per_shard + extra_slots
+    return tuple(
+        tuple((r * per_shard + j) % experts for j in range(width))
+        for r in range(shards)
+    )
 
 
 def _parse_group(table: dict, source: str, what: str, shards: int | None) -> Group:
@@ -194,7 +278,16 @@ def _parse_group(table: dict, source: str, what: str, shards: int | None) -> Gro
         layers[int(key)] = ranks
     if slots is None:
         slots = experts // shards
-    return Group(experts=experts, shards=shards, slots=slots, layers=layers)
+    return Group(
+        experts=experts,
+        shards=shards,
+        slots=slots,
+        initial_ranks=default_ranks(experts, shards, slots - experts // shards),
+        staging=0,
+        replica_cap=None,
+        layers=layers,
+        blind_fallback=False,
+    )
 
 
 def parse(table: dict, source: str = "<dict>") -> Placement:
@@ -254,7 +347,7 @@ def resolve(value: str) -> str:
 
 
 def configured_value(vllm_config=None) -> str | None:
-    """The layout the serving policy or the environment selects, or None.
+    """The static layout the serving policy or the environment selects, or None.
 
     The typed policy field wins; `TPU_EXPERT_PLACEMENT` is the harness alias.
     `vllm_config` may be passed by a caller that has one (the compile hash);
@@ -276,15 +369,22 @@ def configured_value(vllm_config=None) -> str | None:
 
 
 def content_hash(vllm_config=None) -> str | None:
-    """The layout file's content digest for the compile cache key."""
+    """The static layout file's content digest for the compile cache key."""
     value = configured_value(vllm_config)
     return _digest(resolve(value)) if value else None
 
 
-def current(vllm_config=None) -> Placement | None:
-    """The process's layout, or None when none is selected."""
+def static_placement(vllm_config=None) -> Placement | None:
+    """The process's static layout, or None when none is selected."""
     value = configured_value(vllm_config)
     return _load(resolve(value)) if value else None
+
+
+def current(vllm_config=None) -> Group | None:
+    """The process's active Dynamic EPLB group, or None when it is off."""
+    del vllm_config
+    with _LOCK:
+        return _GROUP
 
 
 def layer_index(name: str) -> int | None:
@@ -316,93 +416,181 @@ def _runner_group() -> tuple[str, int]:
     return DRAFT, base
 
 
+def _is_draft_runner() -> bool:
+    """Whether the model currently being constructed is the speculative drafter."""
+    return _runner_group()[0] == DRAFT
+
+
 def has_applied_layers() -> bool:
-    return bool(_APPLIED_LAYERS)
+    """Whether any layout gates the fetch-time filter: the dynamic group covers
+    every target layer once it exists; a static layout covers the layers an
+    MoE method applied it to."""
+    return _GROUP is not None or bool(_APPLIED_LAYERS)
+
+
+def _group_for(key: tuple[str, int]) -> Group | None:
+    """The group a placed (group, layer) follows: the dynamic group for target
+    layers while Dynamic EPLB is on, else the static layout's group."""
+    group_name = key[0]
+    if group_name == TARGET:
+        dynamic = current()
+        if dynamic is not None:
+            return dynamic
+    placement = static_placement()
+    return placement.group(group_name) if placement is not None else None
+
+
+def _tensor_key(name: str) -> tuple[str, int] | None:
+    """The (group, layer) a checkpoint tensor belongs to: a `mtp.i.*` tensor
+    to draft layer i, a `layers.j.*` tensor to target layer j."""
+    drafter = _DRAFTER_TENSOR_RE.match(name)
+    if drafter is not None:
+        return DRAFT, int(drafter.group(1))
+    layer = layer_index(name)
+    return None if layer is None else (TARGET, layer)
 
 
 def fetch_filter_ids(name: str, ep_rank: int) -> frozenset[int] | None:
     """The experts the fetch-time filter keeps for this tensor's layer.
 
-    None defers to the default contiguous filter: either there is no
-    layout for the layer, or no MoE method applied one to it. A `mtp.i.*`
+    None defers to the default contiguous filter: either there is no layout
+    for the layer, or no MoE method applied a static one to it. A `mtp.i.*`
     tensor belongs to draft layer i; everything else to the target.
     """
-    drafter = _DRAFTER_TENSOR_RE.match(name)
-    if drafter is not None:
-        group_name, layer = DRAFT, int(drafter.group(1))
-    else:
-        group_name, layer = TARGET, layer_index(name)
-    if layer is None or (group_name, layer) not in _APPLIED_LAYERS:
+    key = _tensor_key(name)
+    if key is None:
         return None
-    placement = current()
+    group_name, layer = key
+    if group_name == TARGET:
+        dynamic = current()
+        if dynamic is not None:
+            # Dynamic EPLB lays out every target layer, blind default included.
+            ranks = dynamic.ranks(layer)
+            return None if ranks is None else frozenset(ranks[ep_rank])
+    if key not in _APPLIED_LAYERS:
+        return None
+    placement = static_placement()
     group = placement.group(group_name) if placement is not None else None
-    if group is None:
-        return None
-    ranks = group.ranks(layer)
-    if ranks is None:
-        return None
-    return frozenset(ranks[ep_rank])
+    ranks = group.ranks(layer) if group is not None else None
+    return None if ranks is None else frozenset(ranks[ep_rank])
 
 
 def apply_to_layer(layer) -> bool:
     """Point a RoutedExperts layer's expert map at its layout.
 
-    Must run before the weights load (from the MoE method's create_weights).
-    Registers the slot table the fused EP op takes. Returns whether the layer
-    is placed.
+    Must run before the weights load (from `VllmQuantConfig.get_moe_config` or
+    the MoE method's `create_weights`). A layer the static layout lists takes
+    that layout; with `TPU_MOE_EPLB_DYNAMIC` a target layer also joins the
+    dynamic group (the static ranks as its initial layout, or the blind
+    default) and gains the staging slots. Registers the slot table the fused
+    EP op and `moe_routing.route` take. Idempotent if called more than once on
+    the same layer. Returns whether the layer is placed.
     """
     import torch
 
-    placement = current()
-    if placement is None:
-        return False
+    global _GROUP
+    if expert_slot_table(layer) is not None:
+        return True
     group_name, base = _runner_group()
-    group = placement.group(group_name)
     layer_idx = layer_index(layer.layer_name)
-    if group is None or layer_idx is None:
+    if layer_idx is None:
         return False
     if group_name == DRAFT and layer_idx >= base:
         # Module `layers.{n + i}` of the drafter is its draft layer i.
         layer_idx -= base
-    ranks = group.ranks(layer_idx)
-    if ranks is None:
+    placement = static_placement()
+    static_group = placement.group(group_name) if placement is not None else None
+    static_ranks = (
+        static_group.ranks(layer_idx) if static_group is not None else None
+    )
+    dynamic = bool(envs.TPU_MOE_EPLB_DYNAMIC) and group_name == TARGET
+    if not dynamic and static_ranks is None:
         return False
+
     manager = layer.expert_map_manager
-    if manager.global_num_experts != group.experts or manager.ep_size != group.shards:
+    experts = int(manager.global_num_experts)
+    shards = int(manager.ep_size)
+    if static_ranks is not None and (
+        experts != static_group.experts or shards != static_group.shards
+    ):
         raise ValueError(
             f"expert layout {configured_value()} ({group_name}) is for "
-            f"{group.shards} ranks x {group.experts} experts; "
-            f"{layer.layer_name} has {manager.ep_size} x "
-            f"{manager.global_num_experts}"
+            f"{static_group.shards} ranks x {static_group.experts} experts; "
+            f"{layer.layer_name} has {shards} x {experts}"
         )
     if manager.num_fused_shared_experts or manager.expert_mask is not None:
-        raise ValueError(
-            f"expert layout: {layer.layer_name} fuses shared experts into "
-            "its expert map, which a layout does not describe"
-        )
+        if static_ranks is not None:
+            raise ValueError(
+                f"expert layout: {layer.layer_name} fuses shared experts into "
+                "its expert map, which a layout does not describe"
+            )
+        return False
+    if shards <= 1 or experts <= 0 or experts % shards != 0:
+        return False
+
+    key = (group_name, layer_idx)
+    if dynamic:
+        per_shard = experts // shards
+        with _LOCK:
+            group = _GROUP
+            if group is None:
+                if static_group is not None:
+                    active = static_group.slots
+                    layers = static_group.layers
+                else:
+                    active = per_shard + DEFAULT_EXTRA_SLOTS
+                    layers = None
+                group = Group(
+                    experts=experts,
+                    shards=shards,
+                    slots=active + DEFAULT_STAGING,
+                    initial_ranks=default_ranks(experts, shards, active - per_shard),
+                    staging=DEFAULT_STAGING,
+                    replica_cap=shards,
+                    layers=layers,
+                    blind_fallback=True,
+                )
+                _GROUP = group
+            elif group.experts != experts or group.shards != shards:
+                raise ValueError(
+                    f"expert placement is for {group.shards} ranks x "
+                    f"{group.experts} experts; {layer.layer_name} has "
+                    f"{shards} x {experts}"
+                )
+    else:
+        group = static_group
+
+    ranks = group.ranks(layer_idx)
+    assert ranks is not None
     rank = manager.ep_rank
-    expert_map = torch.tensor(group.expert_map(layer_idx, rank), dtype=torch.int32)
+    expert_map = torch.tensor(group.expert_map(rank, layer_idx), dtype=torch.int32)
     device = manager.expert_map.device
     manager._expert_map = expert_map.to(device)
     manager._local_num_experts = group.slots
+    moe_config = getattr(layer, "moe_config", None)
+    if moe_config is not None and hasattr(moe_config, "num_local_experts"):
+        moe_config.num_local_experts = group.slots
     layer.update_expert_map_info()
     layer.register_buffer(
         EXPERT_SLOT_ATTR,
         torch.tensor(group.slot_table(layer_idx), dtype=torch.int32, device=device),
         persistent=False,
     )
-    setattr(layer, _GROUP_ATTR, group_name)
+    setattr(layer, LAYOUT_KEY_ATTR, key)
     with _LOCK:
-        _APPLIED_LAYERS.add((group_name, layer_idx))
+        _LAYER_MODULES[key] = layer
+        _APPLIED_LAYERS.add(key)
     logger.info_once(
-        "Expert layout %s applied (%s group): rank %d of %d, %d placed layers, "
-        "%d slots per rank; first placed layer holds %s",
-        configured_value(),
+        "Expert layout applied (%s group, %s%s): rank %d of %d, %d slots per "
+        "rank (%d active + %d staging); first placed layer holds %s",
         group_name,
+        "dynamic EPLB" if dynamic else "static",
+        f", initial layout {configured_value()}" if static_ranks is not None else "",
         rank,
         group.shards,
-        len(group.layers),
         group.slots,
+        group.active,
+        group.staging,
         ranks[rank][:6],
     )
     return True
@@ -413,21 +601,53 @@ def expert_slot_table(layer):
     return getattr(layer, EXPERT_SLOT_ATTR, None)
 
 
+def applied_layers() -> dict[tuple[str, int], object]:
+    """(group, layer index) -> placed layer module, for every applied layer."""
+    with _LOCK:
+        return dict(_LAYER_MODULES)
+
+
+def layout_key(layer) -> tuple[str, int] | None:
+    """The (group, layer index) a placed layer follows, or None."""
+    return getattr(layer, LAYOUT_KEY_ATTR, None)
+
+
+def install_table(layer, table) -> None:
+    """Write new slot-table VALUES into a placed layer's table buffer.
+
+    The buffer's shape (experts x replica cap) is a compiled-program input and
+    does not change; the values do, between two steps, once every rank has the
+    experts the new table names in the slots it names (expert_relayout.py).
+    """
+    import torch
+
+    buf = expert_slot_table(layer)
+    if buf is None:
+        raise RuntimeError(f"{getattr(layer, 'layer_name', layer)} has no slot table")
+    new = torch.as_tensor(table, dtype=torch.int32)
+    if tuple(new.shape) != tuple(buf.shape):
+        raise ValueError(
+            f"slot table {tuple(new.shape)} does not match the layer's "
+            f"{tuple(buf.shape)}; the replica cap is fixed at load"
+        )
+    buf.copy_(new.to(buf.device))
+
+
 def physical_experts(layer) -> int | None:
     """The placed layer's physical slot count over the mesh, or None."""
-    table = expert_slot_table(layer)
-    if table is None:
+    if expert_slot_table(layer) is None:
         return None
-    placement = current()
-    group = placement.group(getattr(layer, _GROUP_ATTR, TARGET))
-    return group.physical
+    key = layout_key(layer)
+    group = _group_for(key) if key is not None else current()
+    return group.physical if group is not None else None
 
 
-def check_layer_served(layer, fused_armed: bool) -> None:
-    """A placed layer's weights sit in slot order only the fused op undoes."""
+def check_layer_served(layer, fused_armed: bool = True) -> None:
+    """Log when a placed layer is served by the GMM routing path rather than
+    the fused EP kernel; `moe_routing.route` maps its ids through the slot
+    table as the kernel does."""
     if expert_slot_table(layer) is not None and not fused_armed:
-        raise RuntimeError(
-            f"expert layout covers {layer.layer_name}, but the fused EP "
-            "MoE kernel is not armed for it; the grouped-matmul path reads "
-            "contiguous expert blocks and would run the wrong experts"
+        logger.info_once(
+            "Placed layer %s is served via moe_routing.route + fused_moe_gmm",
+            getattr(layer, "layer_name", "<unnamed>"),
         )

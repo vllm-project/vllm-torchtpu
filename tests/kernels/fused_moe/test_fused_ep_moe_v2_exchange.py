@@ -72,3 +72,25 @@ def test_pack_and_unpack_round_trip_with_a_padded_tail(e_total):
     np.testing.assert_array_equal(np.asarray(got_pairs), np.stack(pairs))
     np.testing.assert_array_equal(np.asarray(got_bits), np.concatenate(scales))
     np.testing.assert_array_equal(np.asarray(got_counts), np.stack(counts))
+
+
+def test_unpermute_load_to_ep_rank_order_inverts_mesh_relabeling():
+    """Slot counts gathered in mesh order map back to EP-rank slot order."""
+    ep, g_local = 4, 6
+    e_total = ep * g_local
+    mesh_ep_ranks = (2, 0, 3, 1)
+    rng = np.random.default_rng(19)
+    ep_slots = rng.integers(0, e_total, size=(32, 4), dtype=np.int32)
+    mesh_slots = np.asarray(
+        layer._relabel_expert_ids_to_mesh_order(
+            jnp.asarray(ep_slots), g_local=g_local, mesh_ep_ranks=mesh_ep_ranks
+        )
+    )
+    mesh_counts = np.bincount(mesh_slots.ravel(), minlength=e_total).astype(np.int32)
+    ep_counts = np.bincount(ep_slots.ravel(), minlength=e_total).astype(np.int32)
+    unpermuted = np.asarray(
+        layer._unpermute_load_to_ep_rank_order(
+            jnp.asarray(mesh_counts), g_local=g_local, mesh_ep_ranks=mesh_ep_ranks
+        )
+    )
+    np.testing.assert_array_equal(unpermuted, ep_counts)
