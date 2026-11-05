@@ -1674,3 +1674,85 @@ def test_chip_spec_optional_fields_sysfs_auto_int8_quant_and_refs_main(
     assert rc == 0
     out_text = capsys.readouterr().out
     assert "tie(objective_split:" in out_text
+
+
+def test_compute_all_reduce_transfer_cost_single_host() -> None:
+    """Verifies single-host (TP <= 8) collective uses pure optical ICI parameters."""
+    chip = advisor.resolve_chip_spec("tpu7x")
+    message_bytes = 1024 * 1024  # 1 MiB (bulk payload)
+    transfer_s, latency_s, hops, vol = advisor.compute_all_reduce_transfer_cost(
+        message_bytes=message_bytes,
+        effective_tp=8,
+        chip_spec=chip,
+    )
+    expected_vol = 2.0 * (8 - 1) / 8 * message_bytes
+    assert vol == expected_vol
+    assert transfer_s == expected_vol / chip.ici_egress_bw_bytes_per_s
+    assert hops == 3
+    assert latency_s == 3 * chip.collective_latency_s
+
+
+def test_compute_all_reduce_transfer_cost_multi_host_hierarchical() -> None:
+    """Verifies multi-host (TP > 8) collective accounts for DCN latency."""
+    chip = advisor.resolve_chip_spec("tpu7x")
+    message_bytes = 1024 * 1024  # 1 MiB
+    t_single, _, _, _ = advisor.compute_all_reduce_transfer_cost(
+        message_bytes=message_bytes,
+        effective_tp=8,
+        chip_spec=chip,
+    )
+    t_multi, lat_multi, hops, _ = advisor.compute_all_reduce_transfer_cost(
+        message_bytes=message_bytes,
+        effective_tp=16,
+        chip_spec=chip,
+    )
+    # 16 chips = 2 hosts. DCN bandwidth (12.5 GB/s) is 24x slower than ICI (300 GB/s),
+    # so multi-host transfer time must be significantly higher.
+    assert t_multi > 2.0 * t_single
+    assert hops == 4
+    assert lat_multi > 7 * chip.collective_latency_s
+
+
+def test_compute_all_reduce_transfer_cost_optical_tree_hops() -> None:
+    """Verifies optical ICI collective scales logarithmically with rank count."""
+    chip = advisor.resolve_chip_spec("tpu7x")
+    _, _, hops_tp8, _ = advisor.compute_all_reduce_transfer_cost(
+        message_bytes=65536,
+        effective_tp=8,
+        chip_spec=chip,
+    )
+    assert hops_tp8 == 3
+
+    _, _, hops_tp4, _ = advisor.compute_all_reduce_transfer_cost(
+        message_bytes=65536,
+        effective_tp=4,
+        chip_spec=chip,
+    )
+    assert hops_tp4 == 2
+
+
+def test_fit_vmem_budget_bytes_across_chip_specs() -> None:
+    """Verifies VMEM usable budget dynamically derives from target chip specs."""
+    v7x = advisor.resolve_chip_spec("tpu7x")
+    v6e = advisor.resolve_chip_spec("tpu6e")
+    rp = advisor.default_double_buffer_ring_plan()
+
+    expected_v7x = max(0, (62 << 20) - rp.compiler_spill_reserve_bytes)
+    assert advisor.fit_vmem_budget_bytes(chip_spec=v7x) == expected_v7x
+
+    expected_v6e = max(0, (126 << 20) - rp.compiler_spill_reserve_bytes)
+    assert advisor.fit_vmem_budget_bytes(chip_spec=v6e) == expected_v6e
+
+    assert advisor.fit_vmem_budget_bytes() == expected_v7x
+
+
+def test_kimi_k3_deployment_preset_registered_and_evaluated() -> None:
+    """Verifies kimi-k3 preset is registered and validly evaluated."""
+    preset = advisor.DEPLOYMENT_PRESETS.get("kimi-k3")
+    assert preset is not None
+    assert preset.decode.tp == 32
+    assert preset.decode.ep == 32
+    assert preset.decode.dcp == 32
+    assert preset.prefill.tp == 32
+    assert preset.prefill.ep == 16
+    assert preset.prefill.pcp == 32

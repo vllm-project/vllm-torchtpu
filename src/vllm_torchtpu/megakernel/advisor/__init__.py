@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import asdict, dataclass, field, replace
 from math import ceil, gcd, log2
 from pathlib import Path
@@ -80,6 +81,10 @@ _DEFAULT_LAUNCH_GAP_FLOOR_US = 1.0
 _DEFAULT_LAUNCH_GAP_VAL_US = 2.0
 _DEFAULT_LAUNCH_GAP_UPPER_US = 8.0
 _MEASUREMENTS_SCHEMA = "advisor.measurements.v1"
+_CHIPS_PER_HOST: int = 8
+_COLLECTIVE_RING_THRESHOLD_BYTES: int = 16 * 1024
+_DEFAULT_DCN_EGRESS_BW_BYTES_PER_S: float = 12.5 * (1024**3)
+_DEFAULT_DCN_HOP_LATENCY_S: float = 5.0e-6
 
 SUPPORTED_ONCHIP_FAMILIES: frozenset[str] = frozenset(
     {"gqa", "mla", "dsa", "swa", "gdn", "kda", "dense_mlp", "moe", "mtp", "ple"}
@@ -439,11 +444,77 @@ class AdvisorSweepReport:
 def fit_vmem_budget_bytes(
     tiles: exec_spec.Tiles | None = None,
     ring_plan: RingPlan | None = None,
+    chip_spec: ChipSpec | None = None,
 ) -> int:
-    """Return usable VMEM budget bytes after subtracting the RingPlan spill reserve."""
+    """Return usable VMEM budget bytes after subtracting the RingPlan spill reserve.
+
+    Args:
+        tiles: Optional execution tiles specifying vmem_mib.
+        ring_plan: Optional RingPlan reserve to deduct.
+        chip_spec: Optional target ChipSpec to derive usable VMEM limit.
+
+    Returns:
+        Usable VMEM budget in bytes.
+    """
     rp = ring_plan or default_double_buffer_ring_plan()
-    vmem_mib = tiles.vmem_mib if tiles is not None else _DEFAULT_USABLE_VMEM_MIB
+    if tiles is not None and getattr(tiles, "vmem_mib", None):
+        vmem_mib = tiles.vmem_mib
+    elif chip_spec is not None:
+        vmem_mib = chip_spec.vmem_usable_bytes >> 20
+    else:
+        vmem_mib = _DEFAULT_USABLE_VMEM_MIB
     return max(0, (vmem_mib << 20) - rp.compiler_spill_reserve_bytes)
+
+
+def compute_all_reduce_transfer_cost(
+    message_bytes: float,
+    effective_tp: int,
+    chip_spec: ChipSpec,
+) -> tuple[float, float, int, float]:
+    """Computes transfer time, latency, hop count, and volume for All-Reduce.
+
+    For intra-host domains (effective_tp <= 8), models optical ICI collective.
+    For multi-host domains (effective_tp > 8), models XLA 2-level hierarchical
+    collective: intra-host reduce-scatter/all-gather over ICI, plus inter-host
+    reduction over DCN.
+
+    Args:
+        message_bytes: Payload size transferred in the collective, in bytes.
+        effective_tp: Effective tensor-parallel rank count (e.g. tp // pp).
+        chip_spec: Hardware chip specification providing ICI bandwidth and base latency.
+
+    Returns:
+        A tuple of (transfer_time_s, base_latency_s, hop_count, nominal_volume_bytes).
+    """
+    if effective_tp <= 1 or message_bytes <= 0.0:
+        return 0.0, 0.0, 0, 0.0
+
+    nominal_volume_bytes = 2.0 * (effective_tp - 1) / effective_tp * message_bytes
+
+    hop_count = round(math.log2(effective_tp))
+
+    if effective_tp <= _CHIPS_PER_HOST:
+        transfer_time_s = nominal_volume_bytes / chip_spec.ici_egress_bw_bytes_per_s
+        base_latency_s = hop_count * chip_spec.collective_latency_s
+        return transfer_time_s, base_latency_s, hop_count, nominal_volume_bytes
+
+    # Multi-host hierarchical collective: intra-host ICI + inter-host DCN
+    num_hosts = math.ceil(effective_tp / _CHIPS_PER_HOST)
+
+    # 1. Intra-host ICI: reduce-scatter (7/8 * S) + all-gather (7/8 * S) across 8 chips
+    intra_volume_bytes = 2.0 * (_CHIPS_PER_HOST - 1) / _CHIPS_PER_HOST * message_bytes
+    intra_transfer_time_s = intra_volume_bytes / chip_spec.ici_egress_bw_bytes_per_s
+    intra_latency_s = 3 * chip_spec.collective_latency_s
+
+    # 2. Inter-host DCN: all-reduce of partitioned 1/8th slice across num_hosts
+    inter_slice_bytes = message_bytes / float(_CHIPS_PER_HOST)
+    inter_volume_bytes = 2.0 * (num_hosts - 1) / num_hosts * inter_slice_bytes
+    inter_transfer_time_s = inter_volume_bytes / _DEFAULT_DCN_EGRESS_BW_BYTES_PER_S
+    inter_latency_s = round(math.log2(num_hosts)) * _DEFAULT_DCN_HOP_LATENCY_S
+
+    total_transfer_time_s = intra_transfer_time_s + inter_transfer_time_s
+    total_base_latency_s = intra_latency_s + inter_latency_s
+    return total_transfer_time_s, total_base_latency_s, hop_count, nominal_volume_bytes
 
 
 def compute_per_token_vmem_bytes(
@@ -792,8 +863,8 @@ def _evaluate_scopes(
     """Evaluate every FusionScope against VMEM, HBM, and matmul bounds."""
     layers_local, l_moe, active_tokens = ctx.layers_local, ctx.l_moe, ctx.active_tokens
     token_residual_bytes, ep_dp = ctx.token_residual_bytes, ctx.ep_dp
-    num_ar, ar_hops, ar_vol = ctx.num_ar, ctx.ar_hops, ctx.ar_vol
-    egress_bw, lat_coll = ctx.egress_bw, ctx.lat_coll
+    num_ar, ar_hops = ctx.num_ar, ctx.ar_hops
+    lat_coll = ctx.lat_coll
     pp_stage_time, a2a_time = ctx.pp_stage_time, ctx.a2a_time
     flops_dense, flops_moe = ctx.flops_dense, ctx.flops_moe
     peak_w, peak_e, bw_hbm = ctx.peak_w, ctx.peak_e, ctx.bw_hbm
@@ -854,7 +925,7 @@ def _evaluate_scopes(
         )
         t_comm = (
             num_ar
-            * (ar_vol / egress_bw + n_splits * xla_ar_factor * ar_hops * lat_coll)
+            * (ctx.ar_transfer_time_s + n_splits * xla_ar_factor * ctx.ar_base_lat_s)
             + xla_hbm_coll_bytes / bw_hbm
             + pp_stage_time
             + (
@@ -990,6 +1061,8 @@ class _ScopeContext:
     num_ar: int
     ar_hops: int
     ar_vol: float
+    ar_transfer_time_s: float
+    ar_base_lat_s: float
     egress_bw: float
     lat_coll: float
     lat_coll_upper: float
@@ -1236,6 +1309,9 @@ def _build_scope_context(
     has_unmodeled_family = any(
         fam not in SUPPORTED_ONCHIP_FAMILIES for fam in profile.layer_families
     )
+    ar_transfer_time_s, ar_base_lat_s, ar_hops, ar_vol = (
+        compute_all_reduce_transfer_cost(token_residual_bytes, eff_tp, chip_spec)
+    )
     return _ScopeContext(
         vmem_budget=vmem_budget,
         single_layer_dense_staging_bytes=min(4 << 20, layer_dense_weight_bytes),
@@ -1278,8 +1354,10 @@ def _build_scope_context(
             profile.expert_dtype if l_moe > 0 else profile.weight_dtype
         ),
         num_ar=profile.ar_slots_per_layer * layers_local,
-        ar_hops=round(log2(eff_tp)),
-        ar_vol=2.0 * (eff_tp - 1) / eff_tp * token_residual_bytes,
+        ar_hops=ar_hops,
+        ar_vol=ar_vol,
+        ar_transfer_time_s=ar_transfer_time_s,
+        ar_base_lat_s=ar_base_lat_s,
         egress_bw=chip_spec.ici_egress_bw_bytes_per_s,
         lat_coll=chip_spec.collective_latency_s,
         lat_coll_upper=chip_spec.collective_latency_us_bracket[1] * 1e-6,
@@ -2877,6 +2955,7 @@ __all__ = [
     "advise_from_spec",
     "advise_regimes",
     "build_arg_parser",
+    "compute_all_reduce_transfer_cost",
     "compare_parallelism_candidates",
     "compute_per_token_vmem_bytes",
     "default_double_buffer_ring_plan",
