@@ -349,6 +349,30 @@ def generate_mask(
     return masks
 
 
+# Decode steps whose every sequence lane reads a full KV block from the cache
+# skip the causal and V masks (all-true there) and the new-token stitch.
+# Module-level for tests.
+_UNMASKED_INTERIOR_BLOCKS = True
+
+
+def _skips_masks_on_interior_blocks(cfgs: configs.RpaConfigs) -> bool:
+    """Whether a full cache block implies all-true masks for this config.
+
+    With the FULL scope a sequence's queries start at its cache length, so a
+    block read entirely from the cache precedes every query, and every token
+    of it is valid. KV sharing (cache includes the step's tokens), sliding
+    windows, other scopes and CP shards break that implication.
+    """
+    return (
+        _UNMASKED_INTERIOR_BLOCKS
+        and cfgs.mode == configs.RpaCase.DECODE
+        and cfgs.model.sliding_window is None
+        and cfgs.serve.attention_scope == configs.AttentionScope.FULL
+        and not cfgs.serve.skip_kv_update
+        and cfgs.serve.cp_group_size is None
+    )
+
+
 def rpa_body(
     # Inputs.
     q_vref: jax.Ref,
@@ -382,6 +406,51 @@ def rpa_body(
         kv_new_lens_ref,
         cfgs=cfgs,
     )
+    attend = functools.partial(
+        _attend,
+        q_vref,
+        kv_in_vref,
+        o_vref,
+        lse_o_vref,
+        schedule_ref,
+        m_scratch_ref,
+        l_scratch_ref,
+        acc_scratch_ref,
+        step,
+        step_meta,
+        cfgs=cfgs,
+    )
+    if _skips_masks_on_interior_blocks(cfgs):
+        interior = functools.reduce(
+            jnp.logical_and,
+            [n == cfgs.bkv_sz for n in step_meta.bkv_sz_frm_cache],
+        )
+        lax.cond(
+            interior,
+            functools.partial(attend, masked=False),
+            functools.partial(attend, masked=True),
+        )
+    else:
+        attend(masked=True)
+
+
+def _attend(
+    q_vref: jax.Ref,
+    kv_in_vref: jax.Ref,
+    o_vref: jax.Ref,
+    lse_o_vref: jax.Ref | None,
+    schedule_ref: schedule.RpaSchedule,
+    m_scratch_ref: jax.Ref,
+    l_scratch_ref: jax.Ref,
+    acc_scratch_ref: jax.Ref,
+    step: jax.Array,
+    step_meta: StepMetadata,
+    *,
+    cfgs: configs.RpaConfigs,
+    masked: bool,
+):
+    """Steps 2-4 of one pipeline step; `masked=False` (interior steps) skips
+    the all-true masks and the new-token stitch."""
     # Step 2: Fetch inputs.
     q_p = cfgs.aligned_num_q_heads_per_kv_head // cfgs.serve.packing_q
     q_ref = q_vref.bitcast(jnp.uint32).reshape(-1, cfgs.aligned_q_head_dim)
@@ -409,7 +478,9 @@ def rpa_body(
 
     if cfgs.serve.kv_layout == configs.KVLayout.SEQ_ALONG_LANE:
         stitch_results = []
-        for b_idx in range(cfgs.batch_size):
+        # A full cache block has no new tokens: the stitch would only touch
+        # the lanes past bkv_sz, which this step neither reads nor writes back.
+        for b_idx in range(cfgs.batch_size if masked else 0):
             res = stitch_utils.stitch_new_kv_lane(
                 kv_in_vref,
                 b_idx,
@@ -419,7 +490,7 @@ def rpa_body(
                 cfgs=cfgs,
             )
             stitch_results.append(res)
-        for b_idx in range(cfgs.batch_size):
+        for b_idx in range(len(stitch_results)):
             stitch_utils.store_new_kv_lane(
                 kv_in_vref,
                 b_idx,
@@ -442,12 +513,11 @@ def rpa_body(
                 v_head_u32 = utils.strided_load(v_head_ref, 0, pack_dim, 1)
                 # HND packs channels of one token together. Mask the words
                 # before unpacking, including any co-located V scale channels.
-                v_head_u32 = _mask_invalid_v(
-                    v_head_u32[:, : cfgs.bkv_sz],
-                    b_idx,
-                    step_meta,
-                    sequence_axis=1,
-                )
+                v_head_u32 = v_head_u32[:, : cfgs.bkv_sz]
+                if masked:
+                    v_head_u32 = _mask_invalid_v(
+                        v_head_u32, b_idx, step_meta, sequence_axis=1
+                    )
 
                 if cfgs.serve.dtype_kv == jnp.uint8:
                     fp4 = jnp.float4_e2m1fn
@@ -484,7 +554,8 @@ def rpa_body(
 
             k = k[: cfgs.model.num_kv_heads]
             v = v[: cfgs.model.num_kv_heads]
-            v = _mask_invalid_v(v, b_idx, step_meta, sequence_axis=1)
+            if masked:
+                v = _mask_invalid_v(v, b_idx, step_meta, sequence_axis=1)
             k_b.append(k)
             v_b.append(v)
     # Stack to (batch, num_heads, bkv_sz, num_lanes)
@@ -508,17 +579,19 @@ def rpa_body(
         q_start = bq_start * cfgs.aligned_num_q_heads_per_kv_head
         q_end = bq_end * cfgs.aligned_num_q_heads_per_kv_head
         q_slice = slice(q_start, q_end)
-        custom_mask = generate_mask(
-            shape=(
-                cfgs.batch_size,
-                cfgs.model.num_kv_heads,
-                q_end - q_start,
-                cfgs.bkv_sz,
-            ),
-            bq_start=bq_start,
-            step_meta=step_meta,
-            cfgs=cfgs,
-        )
+        custom_mask = None
+        if masked:
+            custom_mask = generate_mask(
+                shape=(
+                    cfgs.batch_size,
+                    cfgs.model.num_kv_heads,
+                    q_end - q_start,
+                    cfgs.bkv_sz,
+                ),
+                bq_start=bq_start,
+                step_meta=step_meta,
+                cfgs=cfgs,
+            )
         p, alpha_list, m_next, l_next, m_carry, l_carry = (
             flash_attention.flash_attention_qk_softmax(
                 step,
