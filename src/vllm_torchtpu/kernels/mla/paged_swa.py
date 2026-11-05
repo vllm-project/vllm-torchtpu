@@ -13,6 +13,33 @@ from jax.experimental.pallas import tpu_sc as plsc
 
 
 @functools.partial(jax.jit, donate_argnums=(0,))
+def _row_ordered(
+    local: jax.Array, values: jax.Array, capacity: int
+) -> tuple[jax.Array, jax.Array]:
+    """Records and values with each word row's two tokens adjacent, even first.
+
+    Token batches already lay a request's positions out in order, so the rows
+    are adjacent without reordering; only then is the sort skipped (one
+    [N, N] compare instead of an argsort and two gathers, ~6 us per bank).
+    """
+    n = local.shape[0]
+    valid = local < capacity
+    index = jnp.arange(n)
+    pairs = local // 2
+    shared = (pairs[:, None] == pairs[None, :]) & valid[:, None] & valid[None, :]
+    shared &= index[:, None] != index[None, :]
+    # Two records may share a word row only as (even, odd) neighbours.
+    even_first = (local % 2 == 0)[:, None] & (index[None, :] == index[:, None] + 1)
+    even_first &= local[None, :] == local[:, None] + 1
+    adjacent = ~jnp.any(shared & ~(even_first | even_first.T))
+
+    def sort():
+        order = jnp.argsort(local, stable=True)
+        return local[order], values[order]
+
+    return jax.lax.cond(adjacent, lambda: (local, values), sort)
+
+
 def write_swa_pages(
     pages: jax.Array | tuple[jax.Array, jax.Array],
     records: jax.Array,
@@ -59,8 +86,7 @@ def write_swa_pages(
         capacity = bank.shape[0] * page_size
         valid = (records >= max(base, page_size)) & (records < base + capacity)
         local = jnp.where(valid, records - base, capacity)
-        order = jnp.argsort(local, stable=True)
-        ids = local[order]
+        ids, ordered = _row_ordered(local, values, capacity)
         next_ids = jnp.concatenate((ids[1:], jnp.array([capacity], jnp.int32)))
         # TC BF16 tiles pack adjacent token rows into one physical word row.
         pairs = ids // 2
@@ -69,9 +95,7 @@ def write_swa_pages(
         )
         even = ids % 2 == 0
         has_odd = (~even) | (next_ids // 2 == pairs)
-        bits = jax.lax.bitcast_convert_type(values[order], jnp.uint16).astype(
-            jnp.uint32
-        )
+        bits = jax.lax.bitcast_convert_type(ordered, jnp.uint16).astype(jnp.uint32)
         next_bits = jnp.concatenate((bits[1:], jnp.zeros((1, 512), jnp.uint32)))
         low = jnp.where(even[:, None], bits, jnp.uint32(0))
         high = jnp.where(even[:, None], next_bits, bits)
