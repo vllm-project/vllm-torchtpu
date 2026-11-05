@@ -15,6 +15,7 @@
 import contextlib
 import copy
 import inspect
+from collections import defaultdict
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -61,6 +62,10 @@ from vllm_torchtpu.runner import tpu_runner
 from vllm_torchtpu.runner import utils as runner_utils_module
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 from vllm_torchtpu.runner.tpu_runner_async_output import INVALID_TOKEN_ID
+
+
+def _warmup_requests():
+    return defaultdict(lambda: SimpleNamespace(output_token_ids=[]))
 
 
 def test_idle_dp_rank_encodes_before_decoder_pairing():
@@ -320,6 +325,7 @@ def test_spec_warmup_clamps_circular_buffer_group_blocks():
         sample_tokens=MagicMock(),
         take_draft_token_ids=MagicMock(return_value=None),
         _warmup_spec_decode_cleanup=MagicMock(return_value=True),
+        requests=_warmup_requests(),
     )
 
     assert tpu_runner._spec_warmup_group_num_blocks(runner, attn_group, 2060) == 9
@@ -3060,6 +3066,7 @@ def test_spec_batch_warmup_holds_at_most_max_num_seqs_requests(R):
         sample_tokens=lambda _: None,
         take_draft_token_ids=lambda: None,
         _warmup_spec_decode_cleanup=lambda rids: True,
+        requests=_warmup_requests(),
     )
 
     TPUModelRunner._warmup_spec_batch(runner, R, 16, short=True, mixed=True)
@@ -3067,6 +3074,40 @@ def test_spec_batch_warmup_holds_at_most_max_num_seqs_requests(R):
     # Each mixed variant that fits ran: the peak is R decoders plus two
     # prefills, capped at max_num_seqs, so a swallowed failure shows here too.
     assert max(sizes) == min(R + 2, 4)
+
+
+def test_spec_warmup_keeps_optimistic_output_placeholders():
+    captured = []
+    requests = _warmup_requests()
+    # epic/dsv41 sizes non-ring groups by block_size: one block per request.
+    spec = SimpleNamespace(
+        block_size=256, max_num_blocks_per_req=lambda _config, _max_pos: 1
+    )
+
+    def execute_model(so):
+        if so.scheduled_cached_reqs.req_ids:
+            captured.append(list(so.scheduled_cached_reqs.num_output_tokens))
+        rid = "__spec_warmup_0__"
+        requests[rid].output_token_ids.extend([0] * 8)
+
+    runner = SimpleNamespace(
+        max_model_len=256,
+        speculative_config=SimpleNamespace(num_speculative_tokens=7),
+        kv_cache_config=SimpleNamespace(
+            num_blocks=4096, kv_cache_groups=[SimpleNamespace(kv_cache_spec=spec)]
+        ),
+        # epic/dsv41's warmup also reserves the drafter's lookahead pages.
+        vllm_config=SimpleNamespace(num_lookahead_tokens=0),
+        execute_model=execute_model,
+        sample_tokens=lambda _: None,
+        take_draft_token_ids=lambda: None,
+        _warmup_spec_decode_cleanup=lambda rids: True,
+        requests=requests,
+    )
+
+    assert TPUModelRunner._warmup_one_spec_request(runner, 1, idx=0)
+
+    assert captured == [[8 * (t + 1)] for t in range(9)]
 
 
 @pytest.mark.parametrize("verify", [False, True])
