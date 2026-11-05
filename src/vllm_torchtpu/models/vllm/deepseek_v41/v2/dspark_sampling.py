@@ -8,6 +8,7 @@ import jax.numpy as jnp
 from jax.sharding import PartitionSpec as P
 from torch_tpu._internal import pallas
 
+from vllm_torchtpu.kernels.logits_head import logits_head
 from vllm_torchtpu.kernels.markov_sampling import sample_slot
 from vllm_torchtpu.models.vllm.deepseek_v41.common.mhc import _collapse_flat
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import get_pallas_op_mesh
@@ -38,6 +39,19 @@ def initialize_samples():
         lambda logits, e, mw, anchors: anchors.new_empty(
             (anchors.shape[0], logits.shape[0] // anchors.shape[0])
         )
+    )
+    return op
+
+
+def initialize_logits_head():
+    op = pallas.jax_op(
+        "pallas::dspark_logits_head",
+        logits_head,
+        mesh=None,
+        input_partition_specs=cast(Any, (P(),) * 2),
+    )
+    op.register_fake(
+        lambda hidden, weight: hidden.new_empty((hidden.shape[0], weight.shape[0]))
     )
     return op
 

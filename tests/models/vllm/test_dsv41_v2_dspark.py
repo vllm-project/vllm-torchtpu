@@ -12,6 +12,7 @@ import pytest
 import torch
 import torch.nn as nn
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.models.vllm import register_models
 from vllm_torchtpu.models.vllm.deepseek_v41.v2 import (
     attention as v2_attn,
@@ -859,8 +860,53 @@ def test_dspark_load_weights(monkeypatch: pytest.MonkeyPatch):
     assert draft_lm2.model.confidence_head is not None
 
 
+def test_decode_sampler_uses_pallas_logits_head_when_enabled(monkeypatch):
+    from vllm_torchtpu.models.vllm.deepseek_v41.v2 import dspark_sampling
+
+    monkeypatch.setenv("TPU_DEEPSEEK_V41_DSPARK_PALLAS_LOGITS", "1")
+    model = v2_dspark.DSparkDeepseekV41ForCausalLM.__new__(
+        v2_dspark.DSparkDeepseekV41ForCausalLM
+    )
+    nn.Module.__init__(model)
+    weight = torch.empty((129280, 5120), dtype=torch.bfloat16, device="meta")
+    model.lm_head = SimpleNamespace(weight=weight)
+    embedding = torch.empty((129280, 256), dtype=torch.bfloat16, device="meta")
+    normed = torch.empty((240, 5120), dtype=torch.bfloat16, device="meta")
+    norm = MagicMock(return_value=normed)
+    model.model = SimpleNamespace(
+        norm=norm,
+        markov_head=SimpleNamespace(
+            markov_w1=SimpleNamespace(weight=embedding),
+            markov_w2=SimpleNamespace(weight=torch.empty_like(embedding)),
+        ),
+    )
+    compute_logits = MagicMock()
+    monkeypatch.setattr(model, "compute_logits", compute_logits)
+    logits = torch.empty((240, 129280), dtype=torch.bfloat16, device="meta")
+    head = MagicMock(return_value=logits)
+    monkeypatch.setattr(dspark_sampling, "initialize_logits_head", lambda: head)
+    tokens = torch.zeros((48, 5), dtype=torch.int64)
+    sample = MagicMock(return_value=tokens)
+    monkeypatch.setattr(dspark_sampling, "initialize_samples", lambda: sample)
+    sampler = model.prepare_tpu_draft_sampler(
+        tp_size=1, block_size=5, sample_from_anchor=True
+    )
+    hidden = torch.arange(240, dtype=torch.bfloat16)[:, None].expand(240, 5120)
+    assert sampler(hidden, torch.arange(240), 5) is tokens
+    compute_logits.assert_not_called()
+    torch.testing.assert_close(
+        norm.call_args.args[0][:, 0],
+        torch.arange(240, dtype=torch.bfloat16).view(48, 5).T.reshape(-1),
+    )
+    assert head.call_args.args[0] is normed and head.call_args.args[1] is weight
+    assert sample.call_args.args[0] is logits
+
+
 def test_decode_sampler_uses_standard_logits_without_copying_lm_weight(monkeypatch):
     from vllm_torchtpu.models.vllm.deepseek_v41.v2 import dspark_sampling
+
+    # This test is about the XLA logits path; the Pallas head is on by default.
+    monkeypatch.setattr(envs, "TPU_DEEPSEEK_V41_DSPARK_PALLAS_LOGITS", False)
 
     model = v2_dspark.DSparkDeepseekV41ForCausalLM.__new__(
         v2_dspark.DSparkDeepseekV41ForCausalLM
