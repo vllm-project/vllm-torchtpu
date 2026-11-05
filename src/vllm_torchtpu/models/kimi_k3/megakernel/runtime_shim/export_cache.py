@@ -179,7 +179,7 @@ class _ExportCache:
             op.name, entry["fingerprint"], serialized_mlir_module=module
         )
         outputs = [
-            _sharded_placeholder(shape, dtype, spec, op.mesh)
+            _placeholder(jax.core.ShapedArray(shape, dtype), spec, op.mesh)
             if array
             else pallas_impl.torch_placeholder(
                 jax.core.ShapedArray(shape, dtype), mesh=op.mesh
@@ -362,3 +362,11 @@ def hook(export_key: str | None) -> Callable[[Any], None] | None:
         op.__class__ = _cached_class(type(op))
 
     return configure
+
+
+
+def _placeholder(aval, spec, mesh):
+    try:
+        return _sharded_placeholder(aval.shape, aval.dtype, spec, mesh)
+    except Exception:
+        return torch.empty(tuple(pallas_impl.get_local_shape(aval.shape, mesh, spec)), dtype=pallas_impl.JAX_TO_TORCH_DTYPE_MAP.get(aval.dtype), device="meta")

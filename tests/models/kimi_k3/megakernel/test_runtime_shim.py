@@ -201,6 +201,10 @@ def test_register_op_forwards_specs_and_export_cache_hook(
 ) -> None:
     """Attach flattened PartitionSpecs and reload persisted MLIR from k3_export."""
     monkeypatch.setenv("VLLM_XLA_CACHE_PATH", str(tmp_path))
+    import vllm.envs as vllm_envs
+    monkeypatch.setattr(vllm_envs, "VLLM_XLA_CACHE_PATH", str(tmp_path))
+    orig_is_set = vllm_envs.is_set
+    monkeypatch.setattr(vllm_envs, "is_set", lambda name: True if name == "VLLM_XLA_CACHE_PATH" else orig_is_set(name))
     registered_kernels: list[tuple[str, str, bytes]] = []
 
     def fake_sharded_jax_op(
