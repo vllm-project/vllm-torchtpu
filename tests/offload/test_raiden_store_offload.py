@@ -4417,3 +4417,108 @@ class TestDenseDpIndex(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestExternalPrefixProbe(unittest.TestCase):
+    """count_resident_prefix and the scheduler's side-effect-free peek."""
+
+    def setUp(self):
+        self.store = FakeKVCacheStore()
+        self.manager = make_manager(self.store)
+
+    def test_counts_leading_host_keys_without_pins(self):
+        for n in (0, 1, 3):
+            seed_host_entries(self.store, _key(n))
+        keys = [_key(n) for n in range(4)]
+        self.assertEqual(self.manager.count_resident_prefix(keys), 2)
+        self.assertEqual(self.manager.count_resident_prefix([]), 0)
+        self.assertTrue(all(e.pin_count == 0 for e in self.store.entries.values()))
+        lookups = [c for c in self.store.calls if c.name == "lookup"]
+        self.assertEqual(len(lookups), 1)
+        self.assertFalse(lookups[0].args[2])  # pin_found=False
+
+    def test_save_in_flight_counts_and_failed_residue_stops(self):
+        for h in sub_hashes(_key(0)):
+            self.store.entries[h] = _Entry(status=FakeBlockStatus.HBM)
+            self.manager._hash_to_admission[h] = object()
+        for h in sub_hashes(_key(1)):
+            self.store.entries[h] = _Entry(status=FakeBlockStatus.HBM)
+        seed_host_entries(self.store, _key(2))
+        keys = [_key(0), _key(1), _key(2)]
+        self.assertEqual(self.manager.count_resident_prefix(keys), 1)
+
+    def test_partial_key_is_not_counted(self):
+        seed_host_entries(self.store, _key(0))
+        seed_host_entries(self.store, _key(1))
+        del self.store.entries[sub_hashes(_key(1))[3]]
+        self.assertEqual(self.manager.count_resident_prefix([_key(0), _key(1)]), 1)
+
+    def _scheduler(self, groups):
+        from vllm_torchtpu.offload.raiden_connector import TPURaidenOffloadingScheduler
+
+        sched = object.__new__(TPURaidenOffloadingScheduler)
+        sched.config = SimpleNamespace(kv_group_configs=groups)
+        sched._raiden_manager = self.manager
+        return sched
+
+    @staticmethod
+    def _group(group_idx=0, sliding=None, eagle=False):
+        return SimpleNamespace(
+            group_idx=group_idx,
+            tokens_per_chunk=128,
+            hashes_per_chunk=1,
+            sliding_window_size_in_chunks=sliding,
+            is_eagle_group=eagle,
+        )
+
+    @staticmethod
+    def _request(num_tokens, num_hashes, skip=False):
+        return SimpleNamespace(
+            num_tokens=num_tokens,
+            block_hashes=[_key(n) for n in range(num_hashes)],
+            skip_reading_prefix_cache=skip,
+        )
+
+    def test_peek_counts_from_local_boundary(self):
+        # Keys are (block hash, group) as the offloading scheduler builds them.
+        for n in range(6):
+            seed_host_entries(self.store, _group_key(n, 0))
+        sched = self._scheduler([self._group()])
+        req = self._request(num_tokens=8 * 128 + 5, num_hashes=8)
+        # Local hit covers 2 chunks; host holds chunks 2..5 -> 4 chunks more.
+        self.assertEqual(sched.peek_external_prefix_tokens(req, 256), 4 * 128)
+        # Local hit already past the host run.
+        self.assertEqual(sched.peek_external_prefix_tokens(req, 7 * 128), 0)
+        self.assertTrue(all(e.pin_count == 0 for e in self.store.entries.values()))
+
+    def test_peek_caps_at_num_tokens_minus_one(self):
+        for n in range(4):
+            seed_host_entries(self.store, _group_key(n, 0))
+        sched = self._scheduler([self._group()])
+        req = self._request(num_tokens=4 * 128, num_hashes=4)
+        self.assertEqual(sched.peek_external_prefix_tokens(req, 0), 4 * 128 - 1)
+
+    def test_peek_conservative_cases(self):
+        for n in range(4):
+            seed_host_entries(self.store, _group_key(n, 0))
+        req = self._request(num_tokens=1000, num_hashes=4)
+        sliding = self._scheduler([self._group(), self._group(1, sliding=4)])
+        self.assertEqual(sliding.peek_external_prefix_tokens(req, 0), 0)
+        eagle_only = self._scheduler([self._group(eagle=True)])
+        self.assertEqual(eagle_only.peek_external_prefix_tokens(req, 0), 0)
+        skip = self._request(num_tokens=1000, num_hashes=4, skip=True)
+        full = self._scheduler([self._group()])
+        self.assertEqual(full.peek_external_prefix_tokens(skip, 0), 0)
+        # Two prefix groups: the shorter run bounds the hit.
+        seed_host_entries(self.store, _group_key(0, 1))
+        two = self._scheduler([self._group(), self._group(1)])
+        self.assertEqual(two.peek_external_prefix_tokens(req, 0), 128)
+
+    def test_connector_implements_protocol(self):
+        from vllm_torchtpu.core.external_prefix_probe import ExternalPrefixProbe
+        from vllm_torchtpu.offload.raiden_connector import TPURaidenOffloadingConnector
+
+        conn = object.__new__(TPURaidenOffloadingConnector)
+        self.assertIsInstance(conn, ExternalPrefixProbe)
+        conn.connector_scheduler = None
+        self.assertEqual(conn.peek_external_prefix_tokens(object(), 0), 0)

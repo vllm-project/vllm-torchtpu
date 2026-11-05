@@ -701,6 +701,28 @@ class RaidenOffloadingManager(OffloadingManager):
             self._remote_slices.update(remote_slices)
         return LookupResult.HIT
 
+    def count_resident_prefix(self, keys: Sequence[OffloadKey]) -> int:
+        """Number of leading `keys` whose bytes are (or are being saved) on host.
+
+        For admission ranking only (`ExternalPrefixProbe`): one unpinned probe,
+        so it leaves no pins, no LRU reorder and no per-request state. A save
+        in flight counts as resident, as `lookup` would answer HIT_PENDING.
+        Peer and storage-tier entries are not counted.
+        """
+        if not keys:
+            return 0
+        sub_hashes = self._expand_keys(list(keys))
+        resident = 0
+        for sub_hash, block in self._probe(sub_hashes):
+            status = block.status
+            if status in (self._block_status.HOST, self._block_status.HOST_AND_HBM) or (
+                status == self._block_status.HBM and sub_hash in self._hash_to_admission
+            ):
+                resident += 1
+            else:
+                break
+        return resident // self._device_block_size_factor
+
     def touch(self, keys, req_context: ReqContext) -> None:
         # A lookup pins what it finds and releasing drops the entry back at
         # the Most Recently Used position, so probe-then-release is the touch:

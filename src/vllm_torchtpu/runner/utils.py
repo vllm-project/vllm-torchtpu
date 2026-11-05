@@ -52,6 +52,9 @@ PHASED_PROFILER_PREFILL_ONLY_KV_LEN_THRESHOLD_KEY = (
 # API-server routing mode (vllm_torchtpu.core.dp_prefix_affinity).
 DP_PREFIX_AFFINITY_KEY = "dp_prefix_affinity"
 
+# PrefixAwareScheduler admission aging (vllm_torchtpu.core.prefix_aware_scheduler).
+PAW_MAX_WAIT_S_KEY = "paw_max_wait_s"
+
 # Knobs that steer profiling or request routing and never change the compiled
 # graph, so `_patch_vllm_config_hash_ignore_diagnostics` keeps them out of the
 # TPU compile cache key.
@@ -60,6 +63,7 @@ HASH_IGNORED_ADDITIONAL_CONFIG_KEYS = frozenset(
         PHASED_PROFILER_DECODE_ONLY_KV_LEN_THRESHOLD_KEY,
         PHASED_PROFILER_PREFILL_ONLY_KV_LEN_THRESHOLD_KEY,
         DP_PREFIX_AFFINITY_KEY,
+        PAW_MAX_WAIT_S_KEY,
     }
 )
 
