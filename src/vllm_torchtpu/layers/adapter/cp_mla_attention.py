@@ -306,13 +306,14 @@ def _merge_chunked(
         # `cp_lse_ag_out_rs` op for op, except the scatter-sum's wire dtype
         # (RS_BF16) and/or the heads-major operand (WEIGHTED_HM).
         lse_f32 = lse.to(torch.float32)
+        gather_lse = _gather_lse_row_pairs if _lse_row_pairs(vspace) else _gather_lse
         pieces: list[torch.Tensor] = []
         for c in range(chunks):
             pieces.append(
                 _weighted_reduce_scatter(
                     output[c * step : (c + 1) * step],
                     lse_f32[c * step : (c + 1) * step],
-                    _gather_lse(lse_f32[c * step : (c + 1) * step], group),
+                    gather_lse(lse_f32[c * step : (c + 1) * step], group),
                     group,
                     rs_dtype,
                     vspace=vspace,
@@ -338,10 +339,31 @@ def _lse_gathered_once(num_tokens: int) -> bool:
     return bool(envs.TPU_DCP_MERGE_CHUNKED_LSE_AG) and (cap <= 0 or num_tokens <= cap)
 
 
+def _lse_row_pairs(vspace: Any) -> bool:
+    """Whether the V-space merge gathers its lse as row pairs
+    (TPU_DCP_MERGE_LSE_ROW_PAIRS)."""
+    return vspace is not None and bool(envs.TPU_DCP_MERGE_LSE_ROW_PAIRS)
+
+
 def _gather_lse(lse_f32: torch.Tensor, group: Any) -> torch.Tensor:
     """`[T, H]` f32 -> `[world, T, H]`: every rank's lse rows (the gather
     `cp_lse_ag_out_rs` runs)."""
     return group.all_gather(lse_f32.unsqueeze(0).contiguous(), dim=0)
+
+
+def _gather_lse_row_pairs(lse_f32: torch.Tensor, group: Any) -> torch.Tensor:
+    """`_gather_lse` with rows 2i and 2i + 1 sent side by side as
+    `[T / 2, 2H]`, so no lane of a 128-lane tile row is padding; the result
+    is the same."""
+    torch._check_not_implemented(
+        lse_f32.shape[0] % 2 == 0,
+        lambda: "TPU_DCP_MERGE_LSE_ROW_PAIRS gathers rows in pairs and needs "
+        "an even row count per merge chunk; turn it off for this bucket size",
+    )
+    heads = lse_f32.shape[1]
+    shard = lse_f32.reshape(-1, 2 * heads).contiguous()
+    gathered = group.all_gather(shard.unsqueeze(0), dim=0)
+    return gathered.reshape(gathered.shape[0], -1, heads)
 
 
 def _weighted_reduce_scatter(
@@ -494,6 +516,7 @@ def _merge_chunked_lse_gathered(
     """
     step = output.shape[0] // chunks
     lse_f32 = lse.to(torch.float32)
+    gather_lse = _gather_lse_row_pairs if _lse_row_pairs(vspace) else _gather_lse
     # No token-count test here: torch traces a compile range per graph, and a
     # comparison it cannot decide over the range specializes the graph
     # (ShapeSpecializationError on the mirror). MIN_TOKENS gates the kernel
@@ -502,11 +525,11 @@ def _merge_chunked_lse_gathered(
         # Chunk 0's rows alone, then the rest: chunk 0's reduce-scatter need
         # not wait for every chunk's lse (TPU_DCP_MLA_MERGE_PIECES=2). The
         # same rows, so the same gathered values.
-        head = _gather_lse(lse_f32[:step], group)
-        rest = _gather_lse(lse_f32[step:], group)
+        head = gather_lse(lse_f32[:step], group)
+        rest = gather_lse(lse_f32[step:], group)
         rows = [head] + [rest[:, (c - 1) * step : c * step] for c in range(1, chunks)]
     else:
-        gathered = _gather_lse(lse_f32, group)
+        gathered = gather_lse(lse_f32, group)
         rows = [gathered[:, c * step : (c + 1) * step] for c in range(chunks)]
     pieces: list[torch.Tensor] = []
     for c in range(chunks):
