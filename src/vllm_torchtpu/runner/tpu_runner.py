@@ -25,7 +25,7 @@ import dataclasses
 import math
 import os
 import time
-from collections.abc import Callable, Collection, Iterator
+from collections.abc import Callable, Collection, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from types import SimpleNamespace
@@ -465,6 +465,24 @@ def _spec_warmup_all_token_ids(
         req_id: [0] * (num_computed + 1)
         for req_id, num_computed in zip(req_ids, num_computed_tokens)
     }
+
+
+def _spec_warmup_num_output_tokens(
+    requests: Mapping[str, Any], req_ids: list[str]
+) -> list[int]:
+    """Output-token counts for synthetic async spec-decode cached requests.
+
+    A real async scheduler reports ``num_output_tokens`` as its real outputs
+    plus the placeholders of the steps in flight, which is never below the
+    runner's optimistic ``output_token_ids`` (each step appends 1 + num_draft
+    placeholders that ``_modify_prev_results`` rolls back later). A smaller
+    count makes ``_update_states`` truncate ``output_token_ids`` and rewind
+    ``num_tokens_no_spec`` under the in-flight step; its roll-back then starts
+    before the request's first token and writes an empty (or wrong) slice of
+    ``token_ids_cpu`` ("could not broadcast input array from shape (2,) into
+    shape (0,)"). Report the runner's own count, as the scheduler would.
+    """
+    return [len(requests[req_id].output_token_ids) for req_id in req_ids]
 
 
 @contextmanager
@@ -7612,7 +7630,9 @@ class TPUModelRunner(GPUModelRunner):
                     all_token_ids=all_token_ids,
                     new_block_ids=[None] * R,
                     num_computed_tokens=list(nct),
-                    num_output_tokens=[t + 1] * R,
+                    num_output_tokens=_spec_warmup_num_output_tokens(
+                        self.requests, rids
+                    ),
                 )
                 so = SchedulerOutput.make_empty()
                 so.scheduled_cached_reqs = creq
@@ -7677,7 +7697,9 @@ class TPUModelRunner(GPUModelRunner):
                         all_token_ids=all_token_ids,
                         new_block_ids=[None] * R,
                         num_computed_tokens=list(nct),
-                        num_output_tokens=[n_decode + 1 + vi] * R,
+                        num_output_tokens=_spec_warmup_num_output_tokens(
+                            self.requests, rids
+                        ),
                     )
                     so = SchedulerOutput.make_empty()
                     so.scheduled_new_reqs = extras
@@ -7782,7 +7804,9 @@ class TPUModelRunner(GPUModelRunner):
                     all_token_ids=all_token_ids,
                     new_block_ids=[None],
                     num_computed_tokens=[nct],
-                    num_output_tokens=[t + 1],
+                    num_output_tokens=_spec_warmup_num_output_tokens(
+                        self.requests, [rid]
+                    ),
                 )
                 so = SchedulerOutput.make_empty()
                 so.scheduled_cached_reqs = creq
