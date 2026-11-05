@@ -83,6 +83,36 @@ def strided_load_bkv(
     )
 
 
+def shared_kv_head(
+    kv_in_vref: jax.Ref,
+    b_idx: int,
+    valid: jax.Array | None,
+    *,
+    cfgs: configs.RpaConfigs,
+) -> tuple[jax.Array, jax.Array]:
+    """(key, value), each `[head_dim, bkv]`, of lane `b_idx`'s shared-KV block.
+
+    The value is the leading head_dim rows; the key is the value with the
+    leading `shared_kv_rotary_dims` rows of each half taken from the rotated
+    rows after it (`configs.ServingConfigs.shared_kv_rotary_dims`). Row
+    slices are whole sublane tiles, so the key is assembled without moving
+    data.
+    """
+    words = kv_in_vref.at[b_idx, 0].bitcast(jnp.uint32).reshape(-1, cfgs.kv_vmem_lanes)
+    rows = cfgs.compute_kv_head_dim // cfgs.serve.packing_kv
+    rot = cfgs.serve.shared_kv_rotary_dims // cfgs.serve.packing_kv
+    half = rows // 2
+    v_u32 = utils.strided_load(words, 0, rows, 1)[:, : cfgs.bkv_sz]
+    if valid is not None:
+        v_u32 = jnp.where(valid, v_u32, jnp.zeros_like(v_u32))
+    r_u32 = utils.strided_load(words, rows, 2 * rot, 1)[:, : cfgs.bkv_sz]
+    k_u32 = jnp.concatenate(
+        [r_u32[:rot], v_u32[rot:half], r_u32[rot:], v_u32[half + rot :]], axis=0
+    )
+    dtype = cfgs.serve.dtype_kv
+    return pltpu.bitcast(k_u32, dtype), pltpu.bitcast(v_u32, dtype)
+
+
 def calculate_and_store_out(
     step_idx: jax.Array,
     schedule_ref: schedule.RpaSchedule,
@@ -619,6 +649,11 @@ def _attend_and_store(
                 if token is not None
                 else None
             )
+            if cfgs.serve.shared_kv_rotary_dims:
+                k_head, v_head = shared_kv_head(kv_in_vref, b_idx, valid, cfgs=cfgs)
+                k_b.append(k_head[None])
+                v_b.append(v_head[None])
+                continue
             ks = []
             vs = []
             for kv_head in range(cfgs.model.num_kv_heads):
@@ -1035,8 +1070,15 @@ def rpa_kernel(
                 -1, num_lanes
             )
 
-            # Explicitly zero out scratches and Q/KV buffers.
-            for ref in (scratches[1], scratches[2], q_ref_flat, kv_ref_flat):
+            # Explicitly zero out scratches and Q/KV buffers. A decode kernel that
+            # masks V may skip the KV window (ServingConfigs.skip_masked_kv_zero_fill):
+            # it relies on padding lanes (s_idx -1, is_last_k 0), whose NaN carries
+            # flow to the next lane, existing only at the tail of the schedule's
+            # last step (schedule.flush_to_hbm).
+            zeroed = [scratches[1], scratches[2], q_ref_flat]
+            if not (cfgs.serve.skip_masked_kv_zero_fill and cfgs.fuse_accum):
+                zeroed.append(kv_ref_flat)
+            for ref in zeroed:
                 ref[...] = jnp.zeros_like(ref)
 
             def execute_schedule_chunk(start_step, num_steps):

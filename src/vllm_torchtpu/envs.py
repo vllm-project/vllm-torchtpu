@@ -112,9 +112,11 @@ if TYPE_CHECKING:
     TPU_RPA_CAP_SLIDING_DECODE_BLOCK: bool = True
     TPU_RPA_SLIDING_PREFILL_MAX_BKV: int = 0
     TPU_RPA_UNMASKED_INTERIOR: bool = True
+    TPU_RPA_SKIP_MASKED_KV_ZERO_FILL: bool = True
     TPU_RPA_PROLOGUE_DMA_STORES: bool = True
     TPU_RPA_PROLOGUE_FP8_QUERIES: bool = True
     TPU_RPA_SLIDING_DECODE_LANES: int = 0
+    TPU_GEMMA4_SHARED_KV_PAGES: bool = True
     DP_SCHED_ENABLED: bool = False
     MLA_XPOSE_N_TILE_SIZE: int = 160
     MIXED_Q_SPLIT: int | None = None
@@ -498,7 +500,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_GEMMA4_FUSED_NORM_QUANT": env_bool(
         "TPU_GEMMA4_FUSED_NORM_QUANT", default=True
     ),
-    # Gemma4ForCausalLM at TP >= 3: token buckets of at least this many tokens
+    # Gemma4ForCausalLM at TP >= 2: token buckets of at least this many tokens
     # run context-parallel over the TP group (zigzag pieces of the step's one
     # prompt per rank, every projection whole on every rank); 0 disables. Needs
     # VLLM_TPU_SOLO_PREFILL_OVER_TOKENS whose bucket is the one below. See
@@ -986,7 +988,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # the diagonal and the window edge) runs a mask-free copy of the step body,
     # which saves a compare and a select per logit. Outputs are unchanged.
     "TPU_RPA_UNMASKED_INTERIOR": env_bool("TPU_RPA_UNMASKED_INTERIOR", default=True),
-    # The fused qkv prologue (TPU_GEMMA4_FUSED_ATTN_PROLOGUE) builds its packed
+    # Batched RPA kernels zero their KV VMEM window at entry so stale VMEM
+    # cannot reach PV. Under VLLM_KV_CACHE_LAYOUT=HND the decode kernel masks
+    # unwritten V rows and out-of-range keys anyway; with this on it skips the
+    # fill. Outputs are unchanged.
+    "TPU_RPA_SKIP_MASKED_KV_ZERO_FILL": env_bool(
+        "TPU_RPA_SKIP_MASKED_KV_ZERO_FILL", default=True
+    ),
+    # The fused qkv prologue (TPU_GEMMA4_FUSED_ATTN_PROLOGUE, and the
+    # context-parallel programs' under TPU_CP_FUSED_PROLOGUE) builds its packed
     # q and K/V rows as 32-bit words in contiguous VMEM buffers and writes them
     # with strided DMAs, instead of sublane-packing stores. Outputs unchanged.
     "TPU_RPA_PROLOGUE_DMA_STORES": env_bool(
@@ -1006,6 +1016,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_RPA_SLIDING_DECODE_LANES": env_nonnegative_int(
         "TPU_RPA_SLIDING_DECODE_LANES", 0
     ),
+    # Gemma4 attention_k_eq_v full-attention layers store shared-KV pages: the
+    # value and only the key's rotated dims (the key is the k norm weight times
+    # the value elsewhere; the queries carry that factor). Needs the batched
+    # RPA backend, VLLM_KV_CACHE_LAYOUT=HND, an fp8 KV cache and one KV head
+    # per rank; global-layer decode reads 640 instead of 1024 bytes per token.
+    "TPU_GEMMA4_SHARED_KV_PAGES": env_bool("TPU_GEMMA4_SHARED_KV_PAGES", default=True),
     # Enable TpuDpScheduler.
     "DP_SCHED_ENABLED": lambda: bool(int(os.getenv("DP_SCHED_ENABLED") or "0")),
     # Tile size for MLA transpose pipeline.

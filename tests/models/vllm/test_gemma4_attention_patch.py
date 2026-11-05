@@ -320,3 +320,108 @@ def test_quantized_output_needs_the_fused_prologue(monkeypatch):
     monkeypatch.setattr(envs, "TPU_GEMMA4_QUANTIZED_ATTN_OUTPUT", True)
     with pytest.raises(ValueError, match="TPU_GEMMA4_QUANTIZED_ATTN_OUTPUT"):
         patch.maybe_patch_gemma4_attention(None)
+
+
+class _SharedKvImpl:
+    def __init__(self, sliding_window=None) -> None:
+        self.sliding_window = sliding_window
+        self.calls: list[tuple] = []
+
+    def set_shared_kv(self, rotary_dims, k_norm) -> None:
+        self.calls.append((rotary_dims, k_norm))
+
+
+def _k_eq_v_attn(impl, *, k_eq_v=True, rope_angles=64, neox=True):
+    return SimpleNamespace(
+        attn=SimpleNamespace(layer_name="layers.5.attn", impl=impl),
+        config=SimpleNamespace(attention_k_eq_v=k_eq_v),
+        rotary_emb=SimpleNamespace(rope_angles=rope_angles, is_neox_style=neox),
+        k_norm=SimpleNamespace(weight=torch.full((512,), 0.0625)),
+        head_dim=512,
+    )
+
+
+def test_shared_kv_pages_go_to_k_eq_v_full_attention_layers():
+    impl = _SharedKvImpl()
+    attn = _k_eq_v_attn(impl)
+    patch._set_shared_kv(attn, impl)
+    assert impl.calls == [(64, attn.k_norm)]
+    for skipped in (_SharedKvImpl(sliding_window=1024), _SharedKvImpl()):
+        attn = _k_eq_v_attn(skipped, k_eq_v=skipped.sliding_window is not None)
+        patch._set_shared_kv(attn, skipped)
+        assert skipped.calls == []
+
+
+def test_shared_kv_pages_need_the_proportional_neox_rotary():
+    impl = _SharedKvImpl()
+    for attn in (_k_eq_v_attn(impl, rope_angles=None), _k_eq_v_attn(impl, neox=False)):
+        with pytest.raises(NotImplementedError, match="proportional neox"):
+            patch._set_shared_kv(attn, impl)
+
+
+def test_shared_kv_patch_needs_a_k_eq_v_model(monkeypatch):
+    original_init = Gemma4Attention.__init__
+    k_eq_v = SimpleNamespace(
+        hf_text_config=SimpleNamespace(model_type="gemma4_text", attention_k_eq_v=True)
+    )
+    plain = SimpleNamespace(hf_text_config=SimpleNamespace(model_type="gemma4_text"))
+    kv_shared = SimpleNamespace(
+        hf_text_config=SimpleNamespace(
+            model_type="gemma4_text", attention_k_eq_v=True, num_kv_shared_layers=4
+        )
+    )
+    try:
+        monkeypatch.setattr(envs, "TPU_GEMMA4_FUSED_ATTN_PROLOGUE", False)
+        monkeypatch.setattr(envs, "TPU_GEMMA4_SHARED_KV_PAGES", True)
+        for config in (plain, kv_shared):
+            with pytest.raises(ValueError, match="attention_k_eq_v"):
+                patch.maybe_patch_gemma4_attention(config)
+        assert patch.maybe_patch_gemma4_attention(k_eq_v) is None
+        assert Gemma4Attention.__init__ is patch._shared_kv_attention_init
+    finally:
+        Gemma4Attention.__init__ = original_init
+
+
+def test_shared_kv_queries_carry_the_key_factor_off_the_rotated_dims():
+    from vllm_torchtpu.layers.adapter.attention import (
+        PallasBatchedRPAAttentionBackendImpl,
+    )
+
+    impl = object.__new__(PallasBatchedRPAAttentionBackendImpl)
+    impl.head_size, impl.shared_kv_rotary_dims = 8, 2
+    impl._shared_kv_k_norm = SimpleNamespace(weight=torch.arange(8.0))
+    query = torch.ones(3, 2, 8, dtype=torch.bfloat16)
+    got = impl._shared_kv_queries(query, k_scale=0.5, v_scale=1.0)
+    want = torch.tensor([1, 1, 4, 6, 1, 1, 12, 14], dtype=torch.bfloat16)
+    assert got.dtype == query.dtype and torch.equal(got, want.expand(3, 2, 8))
+
+
+def test_every_rpa_impl_defaults_to_standard_pages():
+    """The base impl (the FLASH_ATTN backend) reads the shared-KV attributes in
+    its kernel build and forward without ever setting them."""
+    from vllm_torchtpu.layers.adapter.attention import (
+        PallasAttentionBackendImpl,
+        PallasBatchedRPAAttentionBackendImpl,
+    )
+
+    for cls in (PallasAttentionBackendImpl, PallasBatchedRPAAttentionBackendImpl):
+        impl = object.__new__(cls)
+        assert impl.shared_kv_rotary_dims == 0 and impl._shared_kv_k_norm is None
+
+
+def test_shared_kv_pages_refuse_a_kv_transfer_connector():
+    """A peer without the flag would read the pages as standard K/V."""
+    from vllm_torchtpu.kernels.experimental.batched_rpa import configs
+    from vllm_torchtpu.layers.adapter.attention import (
+        PallasBatchedRPAAttentionBackendImpl,
+    )
+
+    impl = object.__new__(PallasBatchedRPAAttentionBackendImpl)
+    impl.kv_cache_quantized_dtype = torch.float8_e4m3fn
+    impl.kv_layout = configs.KVLayout.SEQ_ALONG_LANE
+    impl.num_kv_heads, impl.sinks, impl.kv_sharing_target_layer_name = 1, None, None
+    impl._bm_kernel = impl._context_parallel = impl._pcp_streaming = False
+    impl.dcp_world_size = 1
+    assert impl.shared_kv_unsupported() == []
+    impl._kv_transfer = True
+    assert impl.shared_kv_unsupported() == ["a KV transfer connector (P/D or offload)"]

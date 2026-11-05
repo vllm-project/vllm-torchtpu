@@ -191,7 +191,13 @@ def _build_ops_from_qkv(cfg: cp_prefill.LayerConfig, cache_view) -> LayerOps:
         rows = qkv.shape[0]
         q_hbm = qkv.new_empty((kv_heads, rows, group // 2, 2, d), dtype=torch.bfloat16)
         new_kv = qkv.new_empty((rows, slots, 4, d), dtype=torch.float8_e4m3fn)
-        return q_hbm, new_kv
+        if not cfg.prologue_fp8_queries:
+            return q_hbm, new_kv
+        # wrapper.quantize_queries' layout: four heads per fp8 word.
+        q_fp8 = qkv.new_empty(
+            (kv_heads, rows, group // 4, 4, d), dtype=torch.float8_e4m3fn
+        )
+        return q_hbm, new_kv, q_fp8
 
     ops: dict[str, Any] = dict(
         prologue=_register(
@@ -199,10 +205,20 @@ def _build_ops_from_qkv(cfg: cp_prefill.LayerConfig, cache_view) -> LayerOps:
         )
     )
     if cfg.sliding_window is None:
+        if cfg.prologue_fp8_queries:
+            # (kv_cache, q_hbm, q_fp8, kv_rows, seq_lens, block_tables, rank)
+            fns = (
+                cp_prefill.full_attention_layer_from_q8,
+                cp_prefill.full_attention_layer_from_q8_fp8_rows,
+            )
+        else:
+            fns = (
+                cp_prefill.full_attention_layer_from_q,
+                cp_prefill.full_attention_layer_from_q_fp8_rows,
+            )
         ops["full_attention"] = _register_layer(
             "full_attention_from_q",
-            cp_prefill.full_attention_layer_from_q,
-            cp_prefill.full_attention_layer_from_q_fp8_rows,
+            *fns,
             cfg,
             cache_view,
             lambda args: args[0].shape[1],  # q_hbm
@@ -289,10 +305,6 @@ def _layer_config(
             f"{num_kv_heads} KV heads do not fill whole fp8 K/V words; the packed "
             "pages would need padding slots."
         )
-    if impl.sliding_window is not None and world < 3:
-        raise ValueError(
-            f"Sliding-window layers need 3 or more ranks to exchange halos, got {world}"
-        )
     if impl.num_heads * world != num_heads:
         raise ValueError(
             f"{num_heads} query heads are not {world} ranks x {impl.num_heads}."
@@ -311,6 +323,11 @@ def _layer_config(
             f"{impl.head_size}."
         )
     sliding = impl.sliding_window is not None
+    if envs.TPU_RPA_PROLOGUE_FP8_QUERIES and not envs.TPU_RPA_PROLOGUE_DMA_STORES:
+        raise ValueError(
+            "TPU_RPA_PROLOGUE_FP8_QUERIES needs TPU_RPA_PROLOGUE_DMA_STORES"
+        )
+    dma_stores = envs.TPU_RPA_PROLOGUE_DMA_STORES and prologue_eps is not None
     # The layer runs every head here, so its own head ratio can admit fp8 QK/PV
     # where the tensor-parallel shard's does not.
     fp8_compute = impl.fp8_compute or (
@@ -336,12 +353,21 @@ def _layer_config(
         fence_output=envs.TPU_RPA_FENCE_OUTPUT,
         unmasked_interior=envs.TPU_RPA_UNMASKED_INTERIOR,
         head_page_writes=envs.TPU_CP_KV_WRITE_KERNEL and not sliding,
+        shared_kv_rotary_dims=impl.shared_kv_rotary_dims,
         prologue_eps=prologue_eps,
         fp8_out_rows=envs.TPU_CP_FUSED_EPILOGUE,
         exchange_from_qkv=(
             envs.TPU_CP_EARLY_HALO and sliding and prologue_eps is not None
         ),
         paged_gather=envs.TPU_CP_PAGED_GATHER and prologue_eps is not None,
+        # The tensor-parallel prologue's switches, for the same kernel options.
+        prologue_dma_stores=dma_stores,
+        prologue_fp8_queries=(
+            dma_stores
+            and envs.TPU_RPA_PROLOGUE_FP8_QUERIES
+            and fp8_compute
+            and not sliding
+        ),
     )
     if cfg.local_kv_heads != impl.num_kv_heads:
         raise ValueError(
@@ -378,9 +404,14 @@ def prepare_cp_prefill_attention(
         )
     cfg = _layer_config(attn, num_heads, num_kv_heads, world, prologue_eps)
     if cfg not in _OPS:
+        stores = ""
+        if cfg.prologue_dma_stores:
+            stores = " with DMA stores" + (
+                " and FP8 queries" if cfg.prologue_fp8_queries else ""
+            )
         logger.info_once(
             "Context-parallel prefill attention on %d ranks: %d query / %d KV heads, "
-            "sliding window %s, %s QK/PV, KV head pages written by %s, %s.",
+            "sliding window %s, %s QK/PV, KV head pages written by %s, %s%s.",
             world,
             num_heads,
             num_kv_heads,
@@ -388,6 +419,7 @@ def prepare_cp_prefill_attention(
             "fp8" if cfg.fp8_compute else "bf16",
             "the head-page kernel" if cfg.head_page_writes else "XLA slices",
             "from qkv rows" if prologue_eps is not None else "from q, k and v",
+            stores,
         )
     attn._cp_prefill_config = cfg
     attn._cp_prefill_ops = build_ops(cfg)
@@ -541,7 +573,9 @@ def cp_prefill_attention_from_qkv(
             qkv, cos, sin, *weights, seq_lens, rank, plan.page_size
         )
         gathered = _waited(funcol.all_gather_single(exchanged, 0, group))
-    q_hbm, new_kv = ops.prologue(qkv, cos, sin, *weights)
+    # With cfg.prologue_fp8_queries also the FP8 queries, which the
+    # full-attention op takes after q_hbm.
+    q_hbm, new_kv, *q_fp8 = ops.prologue(qkv, cos, sin, *weights)
     if cfg.sliding_window is None:
         # [rows, slots, 4, d] is `pack_kv_rows`' order: as int8 rows of that
         # layout (cfg.paged_gather) or 2-D.
@@ -550,7 +584,7 @@ def cp_prefill_attention_from_qkv(
             kv_rows = kv_rows.reshape(rows, -1)
         gathered = _waited(funcol.all_gather_single(kv_rows, 0, group))
         new_kv_cache, *out = ops.full_attention(
-            kv_cache, q_hbm, gathered, seq_lens, block_tables, rank
+            kv_cache, q_hbm, *q_fp8, gathered, seq_lens, block_tables, rank
         )
     else:
         if not cfg.exchange_from_qkv:

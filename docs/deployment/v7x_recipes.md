@@ -162,7 +162,7 @@ vllm serve RedHatAI/gemma-4-26B-A4B-it-FP8-Dynamic \
   --compilation-config '{"compile_sizes": [16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 24576, 32768, 40960, 49152, 57344, 65536, 73728, 81920, 90112, 98304, 106496, 114688, 122880, 131072, 139264, 147456, 155648, 163840]}' \
   --api-server-count 4 \
 - Every prompt above 8192 tokens is prefilled whole in a step of its own (`VLLM_TPU_SOLO_PREFILL_OVER_TOKENS`), as a context-parallel program over the 8 ranks for each compile size from 16384 up (`TPU_GEMMA4_CP_MIN_TOKENS`). A step pads its prompt to the next compile size, so the sizes step by 8192 above 16384.
-- At TP 8 every layer keeps one KV head per rank; `VLLM_KV_CACHE_LAYOUT=HND` stores it without padding, twice the KV cache of the default layout, which is what lets all 64 long requests run at once. `TPU_GEMMA4_FUSED_ATTN_PROLOGUE` does not support HND; leave it unset.
+- At TP 8 every layer keeps one KV head per rank; `VLLM_KV_CACHE_LAYOUT=HND` stores it without padding, twice the KV cache of the default layout, which is what lets all 64 long requests run at once. This recipe was measured with `TPU_GEMMA4_FUSED_ATTN_PROLOGUE` unset; the fused prologue also runs with HND.
 - One API-server process falls behind on 64 streams of long prompts; `--api-server-count 4` spreads them.
 - `LIBTPU_INIT_ARGS=--xla_tpu_dvfs_p_state=7` (the highest DVFS performance state) adds about 5% at 4 or more concurrent requests.
 
