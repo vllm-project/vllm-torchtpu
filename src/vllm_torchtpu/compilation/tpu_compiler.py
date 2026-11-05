@@ -218,9 +218,9 @@ def _release_compiled_artifact(artifact: Any, seen: set[int] | None = None) -> N
     (added on `torch_tpu` main) once the `torch_tpu` pin advances past `0.2.0`,
     and remove the reload path altogether once `torch_tpu` / `libtpu` drops
     compile-time metadata natively. On `torch_tpu==0.2.0`, `_fast_runner` and
-    `_executable` are cleared directly and verified `None` so any incompatible
-    `torch_tpu` change fails fast before `LoadSerializedExecutable` rather than
-    incurring a silent 2x TPU HBM / host DRAM spike.
+    `_executable` are cleared directly so an incompatible `torch_tpu` artifact
+    type or read-only attribute fails fast before `LoadSerializedExecutable`
+    rather than incurring a silent 2x TPU HBM / host DRAM spike.
     """
     if artifact is None:
         return
@@ -248,12 +248,6 @@ def _release_compiled_artifact(artifact: Any, seen: set[int] | None = None) -> N
     if isinstance(artifact, TorchTpuCompiledExecutable):
         artifact._fast_runner = None
         artifact._executable = None
-        if artifact._executable is not None or artifact._fast_runner is not None:
-            raise RuntimeError(
-                "Failed to clear TorchTpuCompiledExecutable handles; aborting "
-                "reload before LoadSerializedExecutable to prevent a 2x memory "
-                "spike."
-            )
         return
 
     raise TypeError(
@@ -698,6 +692,11 @@ class TpuCompilerAdaptor(CompilerInterface):
         from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import config
 
         config.reset_scheduling_group_ids()
+        # Assumes synchronous compilation (`async_compile=False`, which
+        # vllm-torchtpu always uses): with `async_compile=True`, `CompileAndLoad`
+        # runs in the background so `num_compilations` may not have increased yet
+        # when `_tpu_backend` returns, even though `_release_compiled_artifact`
+        # resolves `AsyncCompiledArtifact`.
         before_compilations = (
             _get_num_compilations()
             if check_compilations and envs.VLLM_TPU_RELOAD_COMPILED_EXECUTABLE
@@ -815,6 +814,51 @@ class TpuCompilerAdaptor(CompilerInterface):
             fallback_graph, example_inputs, check_compilations=False
         )
         return fallback_fn, fallback_entry, False
+
+    def _save_and_reload(
+        self,
+        compiled_fn: Callable[..., Any],
+        entry: Any | None,
+        *,
+        compilations: tuple[int, int] | None,
+        key: str | None,
+        save_path: str | None,
+        graph: fx.GraphModule,
+        orig_graph: fx.GraphModule,
+        example_inputs: list[Any],
+        was_wrapped: bool,
+        fingerprint: str | None,
+    ) -> tuple[Callable[..., Any], bool]:
+        """Persist `entry`, optionally reload it, and repair or drop `save_path`."""
+        saved = False
+        if save_path is not None and entry is not None:
+            assert key is not None
+            saved = self._save_handle(
+                key, save_path, entry, graph, was_wrapped, fingerprint
+            )
+
+        if compilations is not None and entry is not None:
+            saved_path = save_path if saved else None
+            compiled_fn, fallback_entry, reloaded = self._reload_compiled(
+                compiled_fn,
+                entry,
+                compilations=compilations,
+                graph=graph,
+                orig_graph=orig_graph,
+                example_inputs=example_inputs,
+                was_wrapped=was_wrapped,
+                saved_path=saved_path,
+            )
+            if saved_path is not None and not reloaded:
+                assert key is not None
+                saved = fallback_entry is not None and self._save_handle(
+                    key, saved_path, fallback_entry, graph, was_wrapped, fingerprint
+                )
+                if not saved:
+                    with contextlib.suppress(OSError):
+                        os.remove(saved_path)
+
+        return compiled_fn, saved
 
     def _save_handle(
         self,
@@ -1138,48 +1182,35 @@ class TpuCompilerAdaptor(CompilerInterface):
         # When the Tier-3 C++ persistent cache is active torch_tpu also keeps
         # the PJRT binary itself (torch_tpu_tier3/*.bin); that covers the
         # recompile path in `load`, not this one.
-        handle = None
         save_path = (
             os.path.join(self.cache_dir, key)
             if caching and key is not None and self.cache_dir is not None
             else None
         )
-        if save_path is not None and entry is not None:
-            assert key is not None
-            if self._save_handle(
-                key, save_path, entry, graph, was_wrapped, fingerprint
-            ):
-                handle = (key, save_path, was_wrapped)
-        elif caching:
+        if caching and entry is None:
             logger.info(
                 "[TpuCompilerAdaptor] No serializable artifact for range %s; "
                 "it will be recompiled on the next start",
                 compile_range,
             )
-
-        if compilations is not None and entry is not None:
-            saved_path = save_path if handle is not None else None
-            compiled_fn, fallback_entry, reloaded = self._reload_compiled(
-                compiled_fn,
-                entry,
-                compilations=compilations,
-                graph=graph,
-                orig_graph=orig_graph,
-                example_inputs=example_inputs,
-                was_wrapped=was_wrapped,
-                saved_path=saved_path,
-            )
-            if saved_path is not None and not reloaded:
-                assert key is not None
-                if fallback_entry is not None and self._save_handle(
-                    key, saved_path, fallback_entry, graph, was_wrapped, fingerprint
-                ):
-                    handle = (key, saved_path, was_wrapped)
-                else:
-                    with contextlib.suppress(OSError):
-                        os.remove(saved_path)
-                    handle = None
+        compiled_fn, saved = self._save_and_reload(
+            compiled_fn,
+            entry,
+            compilations=compilations,
+            key=key,
+            save_path=save_path,
+            graph=graph,
+            orig_graph=orig_graph,
+            example_inputs=example_inputs,
+            was_wrapped=was_wrapped,
+            fingerprint=fingerprint,
+        )
         entry = None
+        handle = (
+            (key, save_path, was_wrapped)
+            if saved and key is not None and save_path is not None
+            else None
+        )
 
         # Under peer replay, other ranks of the host may be waiting for this
         # artifact: say so when it will not come, so they compile it now.
@@ -1251,39 +1282,18 @@ class TpuCompilerAdaptor(CompilerInterface):
             # Self-heal: overwrite the artifact vLLM will hand us again next
             # run. Without this a single stale entry recompiles forever.
             can_save = self.cache_dir is not None and not self._disable_cache
-            saved = bool(
-                can_save
-                and entry is not None
-                and self._save_handle(key, path, entry, graph, was_wrapped, fingerprint)
+            compiled_fn, _ = self._save_and_reload(
+                compiled_fn,
+                entry,
+                compilations=compilations,
+                key=key,
+                save_path=path if can_save else None,
+                graph=graph,
+                orig_graph=orig_graph,
+                example_inputs=example_inputs,
+                was_wrapped=was_wrapped,
+                fingerprint=fingerprint,
             )
-            if compilations is not None and entry is not None:
-                compiled_fn, fallback_entry, reloaded = self._reload_compiled(
-                    compiled_fn,
-                    entry,
-                    compilations=compilations,
-                    graph=graph,
-                    orig_graph=orig_graph,
-                    example_inputs=example_inputs,
-                    was_wrapped=was_wrapped,
-                    saved_path=path if saved else None,
-                )
-                if (
-                    saved
-                    and not reloaded
-                    and (
-                        fallback_entry is None
-                        or not self._save_handle(
-                            key,
-                            path,
-                            fallback_entry,
-                            graph,
-                            was_wrapped,
-                            fingerprint,
-                        )
-                    )
-                ):
-                    with contextlib.suppress(OSError):
-                        os.remove(path)
             entry = None
 
         if was_wrapped:

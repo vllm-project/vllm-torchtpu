@@ -1721,16 +1721,10 @@ class TestReloadCompiledExecutable:
                 id="readonly-executable-property",
             ),
             pytest.param(
-                "sticky_exec",
-                RuntimeError,
-                "Failed to clear TorchTpuCompiledExecutable handles",
-                id="sticky-executable-handle",
-            ),
-            pytest.param(
-                "sticky_runner",
-                RuntimeError,
-                "Failed to clear TorchTpuCompiledExecutable handles",
-                id="sticky-fast-runner-handle",
+                "readonly_runner",
+                AttributeError,
+                None,
+                id="readonly-fast-runner-property",
             ),
         ],
     )
@@ -1738,7 +1732,7 @@ class TestReloadCompiledExecutable:
         self, failure_kind, expected_exc, match
     ):
         """`_release_compiled_artifact` raises immediately on unknown artifact
-        types, read-only descriptors, or handles that fail to clear to `None`."""
+        types or read-only handle descriptors."""
         from vllm_torchtpu.compilation.tpu_compiler import _release_compiled_artifact
 
         class _ReadOnlyExecArtifact(TorchTpuCompiledExecutable):
@@ -1749,37 +1743,20 @@ class TestReloadCompiledExecutable:
             def _executable(self) -> object:
                 return "readonly_handle"
 
-        class _StickyExecArtifact(TorchTpuCompiledExecutable):
-            def __init__(self) -> None:
-                self._fast_runner = object()
-
-            @property
-            def _executable(self) -> object:
-                return "sticky_exec_handle"
-
-            @_executable.setter
-            def _executable(self, value: object | None) -> None:
-                pass
-
-        class _StickyRunnerArtifact(TorchTpuCompiledExecutable):
+        class _ReadOnlyRunnerArtifact(TorchTpuCompiledExecutable):
             def __init__(self) -> None:
                 self._executable = object()
 
             @property
             def _fast_runner(self) -> object:
-                return "sticky_runner_handle"
-
-            @_fast_runner.setter
-            def _fast_runner(self, value: object | None) -> None:
-                pass
+                return "readonly_runner_handle"
 
         artifacts = {
             "unsupported_type": SimpleNamespace(
                 _executable=object(), _fast_runner=object()
             ),
             "readonly_exec": _ReadOnlyExecArtifact(),
-            "sticky_exec": _StickyExecArtifact(),
-            "sticky_runner": _StickyRunnerArtifact(),
+            "readonly_runner": _ReadOnlyRunnerArtifact(),
         }
 
         with pytest.raises(expected_exc, match=match):
