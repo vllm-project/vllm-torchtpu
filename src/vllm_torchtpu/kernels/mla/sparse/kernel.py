@@ -3670,7 +3670,8 @@ def sparse_ragged_paged_attention(
         piece 0 to piece 0's buffers with an optimization barrier. Same values.
       out_pieces_order: With `out_pieces` taken, how piece k's first attention
         call waits for piece k-1's (`PIECE_ORDERS`): "edge" adds a zero read
-        from piece k-1's lse to its scalar prefetch; "barrier" (default) and
+        from piece k-1's lse to its scalar prefetch (pieces of several chunks;
+        one-chunk pieces keep the barrier); "barrier" (default) and
         "small_barrier" use optimization barriers; "none" nothing. Same values.
       packed_rope: SparseCore layout only. `cache_kv_rope` stores each token's
         rope in 16 words, eight tokens per row
@@ -4169,6 +4170,8 @@ def sparse_ragged_paged_attention(
     if gather_first:
         pre = [run_chunk(i, None, gather_only=True) for i in range(num_chunks)]
     chunks_per_piece = max(1, piece_rows // gather_and_attention_chunk_size)
+    # "edge" only where a piece spans chunks; one-chunk pieces keep the barrier.
+    edge = out_pieces_order == "edge" and chunks_per_piece > 1
 
     prev_out = None
     for i in range(num_chunks):
@@ -4193,7 +4196,14 @@ def sparse_ragged_paged_attention(
         extra = {"out_piece": out_piece}
         if pre[i] is not None:
             extra["pre_gathered"] = pre[i]
-        if piece_rows and i and out_pieces_order == "barrier":
+        if (
+            piece_rows
+            and i
+            and (
+                out_pieces_order == "barrier"
+                or (out_pieces_order == "edge" and not edge)
+            )
+        ):
             # Merge pieces leave the attention calls independent, and XLA is
             # then free to run them in any order (it reversed them). Keep the
             # incumbent's order -- the merge's chunk order -- by handing call
@@ -4201,7 +4211,7 @@ def sparse_ragged_paged_attention(
             extra["q_in"], _ = lax.optimization_barrier((q, prev_out))
         elif piece_rows and i and start_pos == offset:
             # A piece's later chunks already read its lse; order its first.
-            if out_pieces_order == "edge":
+            if edge:
                 extra["order_dep"] = _order_zero(piece_lses[-1])
             elif out_pieces_order == "small_barrier":
                 extra["order_dep"], _ = lax.optimization_barrier(
