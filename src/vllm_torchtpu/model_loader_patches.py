@@ -141,6 +141,8 @@ def _compute_local_expert_ids() -> set[int] | None:
         get_tensor_model_parallel_rank,
     )
 
+    from vllm_torchtpu import utils
+
     dp_size = parallel_config.data_parallel_size
     tp_size = parallel_config.tensor_parallel_size
     pcp_size = parallel_config.prefill_context_parallel_size
@@ -148,7 +150,13 @@ def _compute_local_expert_ids() -> set[int] | None:
     tp_rank = get_tensor_model_parallel_rank() if tp_size > 1 else 0
     pcp_rank = get_pcp_group().rank_in_group if pcp_size > 1 else 0
     ep_size = dp_size * pcp_size * tp_size
-    ep_rank = dp_rank * pcp_size * tp_size + pcp_rank * tp_size + tp_rank
+    ep_rank = utils.ep_rank(
+        dp_rank=dp_rank,
+        pcp_rank=pcp_rank,
+        pcp_size=pcp_size,
+        tp_rank=tp_rank,
+        tp_size=tp_size,
+    )
 
     # Use the loader's symbol instead of importing the base helper directly.
     # Hierarchical EP replaces this symbol with its chip-aware ownership map,

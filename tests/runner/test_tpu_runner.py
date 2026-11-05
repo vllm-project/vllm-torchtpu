@@ -2708,6 +2708,96 @@ class _FakeTpuEvent:
         self.synchronized += 1
 
 
+def _dummy_run_stand_in(monkeypatch, forward_model):
+    """A runner stand-in that `TPUModelRunner._dummy_run` can drive on CPU:
+    attention metadata and input staging run for real, the forward is
+    `forward_model`, and `compute_selected_logits` returns its input."""
+    _FakeTpuEvent.instances.clear()
+    monkeypatch.setattr(
+        torch, "tpu", SimpleNamespace(Event=_FakeTpuEvent), raising=False
+    )
+    monkeypatch.setattr(tpu_runner, "synchronize_tensors", lambda *a, **kw: None)
+    for name in ("set_forward_context", "set_vllm_model_wrapper_context"):
+        monkeypatch.setattr(tpu_runner, name, lambda *a, **kw: contextlib.nullcontext())
+    from vllm_torchtpu.layers.core.sequence_layout import (
+        DEFAULT_SEQUENCE_LAYOUT_DESCRIPTOR,
+    )
+
+    runner = SimpleNamespace(
+        device=torch.device("cpu"),
+        max_model_len=64,
+        max_num_tokens=64,
+        max_num_reqs=4,
+        max_num_blocks_per_req=4,
+        most_model_len=None,
+        block_size=16,
+        uses_mrope=False,
+        supports_mm_inputs=False,
+        _pp_is_first=True,
+        _pp_wave=None,
+        _pp_topk_buffer=None,
+        _kv_cache_bundle=None,
+        lora_config=None,
+        vllm_config=MagicMock(),
+        mesh=MagicMock(),
+        kv_cache_config=SimpleNamespace(kv_cache_groups=[]),
+        _has_mamba_state=False,
+        mamba_slot_read_offsets=None,
+        _mamba_ckpt_window=1,
+        _prefill_ckpt_units=None,
+        _unified_kv_layout=False,
+        empty_slot_mappings={},
+        position_ids=torch.zeros(64, dtype=torch.int32),
+        _input_staging_fence=None,
+        _unfenced_h2d_sources=[],
+        _fenced_h2d_sources=[],
+        _free_h2d_sources={},
+        _registered_h2d_sources=set(),
+        _token_padding_state=None,
+        sequence_layout_planner=SimpleNamespace(
+            prepare_dummy=lambda **kw: SimpleNamespace(
+                descriptor=DEFAULT_SEQUENCE_LAYOUT_DESCRIPTOR
+            )
+        ),
+        maybe_select_dummy_loras=lambda *a, **kw: contextlib.nullcontext(),
+        _dp_num_tokens_across_dp=lambda n: None,
+        forward_model=forward_model,
+        compute_selected_logits=lambda out, idx: out,
+        _dp_vocab_logits=False,
+    )
+    for name in (
+        "_build_attention_metadata",
+        "_record_input_staging_fence",
+        "_wait_input_staging_fence",
+        "_pp_take_topk_indices",
+    ):
+        setattr(runner, name, getattr(TPUModelRunner, name).__get__(runner))
+    bt = MagicMock()
+    bt.max_num_blocks_per_req = 4
+    bt.get_cpu_tensor.return_value = torch.zeros((4, 4), dtype=torch.int32)
+    runner.input_batch = SimpleNamespace(block_table=[bt])
+    builder = AttentionMetadataBuilder(
+        kv_cache_spec=FullAttentionSpec(
+            block_size=16,
+            num_kv_heads=2,
+            head_size=128,
+            dtype=torch.bfloat16,
+            page_size_padded=16384,
+        ),
+        layer_names=["attn.0"],
+        vllm_config=MagicMock(),
+        device=runner.device,
+        runner=runner,
+        kv_cache_group_id=0,
+    )
+    group = MagicMock()
+    group.metadata_builders = [builder]
+    group.layer_names = ["attn.0"]
+    runner.attn_groups = [[group]]
+
+    return runner
+
+
 class TestInputStagingFence:
     """A chunk records a fence after uploading from the reusable host staging
     tensors; the next chunk synchronizes on it before rewriting them, once."""
@@ -2884,18 +2974,6 @@ class TestInputStagingFence:
         release the previous run's host sources and fence its own before the
         forward, so repeated runs neither accumulate buffers nor make the next
         wait block on a dummy forward."""
-        _FakeTpuEvent.instances.clear()
-        monkeypatch.setattr(
-            torch, "tpu", SimpleNamespace(Event=_FakeTpuEvent), raising=False
-        )
-        monkeypatch.setattr(tpu_runner, "synchronize_tensors", lambda *a, **kw: None)
-        for name in ("set_forward_context", "set_vllm_model_wrapper_context"):
-            monkeypatch.setattr(
-                tpu_runner, name, lambda *a, **kw: contextlib.nullcontext()
-            )
-        from vllm_torchtpu.layers.core.sequence_layout import (
-            DEFAULT_SEQUENCE_LAYOUT_DESCRIPTOR,
-        )
 
         def forward_model(**kw):
             # The fence must already cover this run's uploads.
@@ -2903,76 +2981,7 @@ class TestInputStagingFence:
             assert runner._unfenced_h2d_sources == []
             return torch.zeros((4, 8), dtype=torch.float32), None
 
-        runner = SimpleNamespace(
-            device=torch.device("cpu"),
-            max_model_len=64,
-            max_num_tokens=64,
-            max_num_reqs=4,
-            max_num_blocks_per_req=4,
-            most_model_len=None,
-            block_size=16,
-            uses_mrope=False,
-            supports_mm_inputs=False,
-            _pp_is_first=True,
-            _pp_wave=None,
-            _pp_topk_buffer=None,
-            _kv_cache_bundle=None,
-            lora_config=None,
-            vllm_config=MagicMock(),
-            mesh=MagicMock(),
-            kv_cache_config=SimpleNamespace(kv_cache_groups=[]),
-            _has_mamba_state=False,
-            mamba_slot_read_offsets=None,
-            _mamba_ckpt_window=1,
-            _prefill_ckpt_units=None,
-            _unified_kv_layout=False,
-            empty_slot_mappings={},
-            position_ids=torch.zeros(64, dtype=torch.int32),
-            _input_staging_fence=None,
-            _unfenced_h2d_sources=[],
-            _fenced_h2d_sources=[],
-            _free_h2d_sources={},
-            _registered_h2d_sources=set(),
-            _token_padding_state=None,
-            sequence_layout_planner=SimpleNamespace(
-                prepare_dummy=lambda **kw: SimpleNamespace(
-                    descriptor=DEFAULT_SEQUENCE_LAYOUT_DESCRIPTOR
-                )
-            ),
-            maybe_select_dummy_loras=lambda *a, **kw: contextlib.nullcontext(),
-            _dp_num_tokens_across_dp=lambda n: None,
-            forward_model=forward_model,
-            compute_selected_logits=lambda out, idx: out,
-        )
-        for name in (
-            "_build_attention_metadata",
-            "_record_input_staging_fence",
-            "_wait_input_staging_fence",
-            "_pp_take_topk_indices",
-        ):
-            setattr(runner, name, getattr(TPUModelRunner, name).__get__(runner))
-        bt = MagicMock()
-        bt.max_num_blocks_per_req = 4
-        bt.get_cpu_tensor.return_value = torch.zeros((4, 4), dtype=torch.int32)
-        runner.input_batch = SimpleNamespace(block_table=[bt])
-        builder = AttentionMetadataBuilder(
-            kv_cache_spec=FullAttentionSpec(
-                block_size=16,
-                num_kv_heads=2,
-                head_size=128,
-                dtype=torch.bfloat16,
-                page_size_padded=16384,
-            ),
-            layer_names=["attn.0"],
-            vllm_config=MagicMock(),
-            device=runner.device,
-            runner=runner,
-            kv_cache_group_id=0,
-        )
-        group = MagicMock()
-        group.metadata_builders = [builder]
-        group.layer_names = ["attn.0"]
-        runner.attn_groups = [[group]]
+        runner = _dummy_run_stand_in(monkeypatch, forward_model)
 
         for dp_lockstep in (False, True, False):
             TPUModelRunner._dummy_run(
@@ -3909,3 +3918,93 @@ def test_truncate_rope_caches_keeps_speculative_slack(monkeypatch):
         draft_model["draft_rope"].cos_sin_cache[draft_positions],
         untruncated[draft_positions],
     )
+
+
+class TestLogitsAtDpVocabRows:
+    """TPU_DP_VOCAB_PARALLEL: every logits batch reaches the compiled logits
+    program at the step's DP-wide request bucket, padded and sliced outside
+    it."""
+
+    @staticmethod
+    def _runner(on, step_max_reqs=3, max_num_reqs=32):
+        """A runner whose compute_selected_logits records the indices it gets
+        and returns their rows of `hidden * 10`."""
+        runner = SimpleNamespace(
+            _dp_vocab_logits=on,
+            _dp_step_max_reqs=step_max_reqs,
+            max_num_reqs=max_num_reqs,
+            seen=[],
+        )
+        runner._dp_vocab_logits_rows = TPUModelRunner._dp_vocab_logits_rows.__get__(
+            runner
+        )
+
+        def compute_selected_logits(hidden, indices):
+            runner.seen.append(indices)
+            return hidden[indices] * 10
+
+        runner.compute_selected_logits = compute_selected_logits
+        return runner
+
+    def test_off_passes_straight_through(self):
+        runner = self._runner(False)
+        hidden, indices = torch.arange(16.0).reshape(16, 1), torch.tensor([3, 7, 9])
+        got = TPUModelRunner._logits_at_dp_vocab_rows(runner, hidden, indices)
+        assert runner.seen == [indices]
+        assert got.flatten().tolist() == [30.0, 70.0, 90.0]
+
+    @pytest.mark.parametrize(
+        "step_max_reqs, rows", [(0, 8), (3, 8), (9, 16), (17, 32), (40, 32)]
+    )
+    def test_rows_are_the_bucket_of_the_dp_wide_largest_chunk(
+        self, step_max_reqs, rows
+    ):
+        """Busy and idle ranks read the same all-reduced request count, so
+        they pad to the same bucket; a light step pays only for its bucket."""
+        runner = self._runner(True, step_max_reqs=step_max_reqs)
+        assert TPUModelRunner._dp_vocab_logits_rows(runner) == rows
+
+    @pytest.mark.parametrize("step_max_reqs, rows", [(3, 8), (9, 16)])
+    def test_pads_indices_and_slices_the_rows_back(self, step_max_reqs, rows):
+        """This rank samples 3 rows; it enters the logits program at the step's
+        bucket, which another rank's larger chunk (9 requests) can raise."""
+        runner = self._runner(True, step_max_reqs=step_max_reqs)
+        hidden = torch.arange(16.0).reshape(16, 1)
+        indices = torch.tensor([3, 7, 9], dtype=torch.int32)
+        got = TPUModelRunner._logits_at_dp_vocab_rows(runner, hidden, indices)
+        assert runner.seen[0].tolist() == [3, 7, 9] + [0] * (rows - 3)
+        assert got.flatten().tolist() == [30.0, 70.0, 90.0]
+
+    def test_full_bucket_needs_no_pad(self):
+        runner = self._runner(True, step_max_reqs=8)
+        hidden, indices = torch.arange(16.0).reshape(16, 1), torch.arange(8)
+        got = TPUModelRunner._logits_at_dp_vocab_rows(runner, hidden, indices)
+        assert runner.seen[0] is indices
+        assert got.shape == (8, 1)
+
+    @pytest.mark.parametrize("dp_vocab, rows", [(True, 16), (False, 4)])
+    def test_idle_dummy_chunk_enters_logits_at_the_dp_vocab_rows(
+        self, monkeypatch, dp_vocab, rows
+    ):
+        """An idle DP engine's dummy chunk must enter the logits program at the
+        row count busy engines pad to (`_dp_vocab_logits_rows`, the bucket
+        checked above), or the lm_head's cross-engine collectives see different
+        shapes and hang. Without the flag it keeps its own request count."""
+        seen = []
+        runner = _dummy_run_stand_in(
+            monkeypatch, lambda **kw: (torch.zeros((16, 8)), None)
+        )
+        runner.compute_selected_logits = lambda out, idx: seen.append(idx.shape[0])
+        runner._dp_vocab_logits = dp_vocab
+        runner._dp_vocab_logits_rows = lambda: 16
+        TPUModelRunner._dummy_run(
+            runner, num_tokens=16, num_reqs=4, num_blocks=4, dp_lockstep=True
+        )
+        assert seen == [rows]
+
+    def test_rejects_a_batch_above_the_row_count(self):
+        runner = self._runner(True, step_max_reqs=4)
+        with pytest.raises(ValueError, match="exceeds"):
+            TPUModelRunner._logits_at_dp_vocab_rows(
+                runner, torch.zeros(9, 2), torch.arange(9)
+            )
