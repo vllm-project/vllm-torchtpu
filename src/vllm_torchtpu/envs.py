@@ -11,6 +11,7 @@ if TYPE_CHECKING:
     TPU_DEEPSEEK_V41_IMPL: str = "v2"
     TPU_DEEPSEEK_V41_ENGRAM_CPU_OFFLOAD: bool = False
     TPU_DEEPSEEK_V41_ENGRAM_HBM: str = "auto"
+    TPU_DEEPSEEK_V41_BLOCKED_ROPE_GATHER: bool = True
     TPU_DEEPSEEK_V41_FUSED_WO_AB: bool = True
     TPU_DEEPSEEK_V41_CSA2_DEEP_GATHER: bool = True
     TPU_K3_SP_PREFILL: bool = False
@@ -414,6 +415,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "auto",
         ["auto", "off", "first", "all"],
         case_sensitive=False,
+    ),
+    # Gather RoPE table rows (attention preprocessing, CSA2 inverse RoPE) as
+    # 256-row gathers when a step has 257..1024 rows
+    # (`rope_gather.by_row_blocks`). Data movement only; outputs unchanged.
+    "TPU_DEEPSEEK_V41_BLOCKED_ROPE_GATHER": env_bool(
+        "TPU_DEEPSEEK_V41_BLOCKED_ROPE_GATHER", default=True
     ),
     # CSA2 layers: run wo_a and wo_b as one buffered decode kernel (the wo_a
     # output stays in VMEM). Same arithmetic as the two kernels (bit-exact).
