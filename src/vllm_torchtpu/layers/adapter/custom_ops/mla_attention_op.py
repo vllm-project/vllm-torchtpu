@@ -56,6 +56,9 @@ from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
     streamindex_topk,
     streamindex_topk_dcp,
 )
+from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
+    metadata as _streamidx_meta,
+)
 from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.vllm_adapter import (
     pcp_streaming_jax_op,
 )
@@ -67,6 +70,7 @@ from vllm_torchtpu.layers.adapter.attention import (
 )
 from vllm_torchtpu.layers.adapter.linear_common import WEIGHT_FLIPPED_ATTR
 from vllm_torchtpu.layers.adapter.quantization.configs import should_quantize_on_load
+from vllm_torchtpu.layers.core import turboquant
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
 from vllm_torchtpu.layers.core.quantization import quantize_tensor
 from vllm_torchtpu.logger import init_logger
@@ -87,24 +91,135 @@ STREAMIDX_QUERIES_PER_BLOCK = (1, 128, 128)
 STREAMIDX_SMALL_BUCKET_DEFAULT_BKVP = 8
 
 
+def _widen_bkvp_for_smem(
+    bkv_p: int,
+    bq_sz: int,
+    *,
+    decode_only: bool,
+    num_tokens: int,
+    num_seqs: int,
+    pages_per_seq: int,
+    page_size: int,
+    chunk_tokens: int | None,
+    smem_cap: int,
+) -> int:
+    """Doubles `bkv_p` until StreamIdx's worst-case step count fits `smem_cap`."""
+
+    def _cdiv(a: int, b: int) -> int:
+        return (a + b - 1) // b
+
+    max_q_ub = _streamidx_meta.next_power_of_2(num_tokens)
+    total_max_bq = (
+        num_seqs if decode_only else max(1, _cdiv(max_q_ub, bq_sz)) + num_seqs
+    )
+    if (
+        chunk_tokens is not None
+        and num_tokens % chunk_tokens == 0
+        and num_tokens > chunk_tokens
+    ):
+        n_chunks = num_tokens // chunk_tokens
+        per_chunk = min(
+            total_max_bq,
+            _cdiv(chunk_tokens, bq_sz) + min(num_seqs, chunk_tokens),
+        )
+        total_bq_ub = min(
+            n_chunks * per_chunk,
+            total_max_bq + n_chunks - 1,
+            max(1, _cdiv(max_q_ub, bq_sz)) + n_chunks + num_seqs - 1,
+        )
+    else:
+        total_bq_ub = total_max_bq
+
+    while page_size * bkv_p < 8192:
+        max_bkv = max(1, _cdiv(pages_per_seq, bkv_p))
+        if max(1024, _cdiv(total_bq_ub * max_bkv, 1024) * 1024) <= smem_cap:
+            break
+        bkv_p *= 2
+    return bkv_p
+
+
 def _streamidx_block_sizes(
     num_tokens: int,
     small_bucket_bq: int | None,
     small_bucket_bkvp: int | None,
     small_bucket_tokens: int,
+    *,
+    num_seqs: int = 0,
+    pages_per_seq: int = 0,
+    page_size: int = 0,
+    chunk_tokens: int | None = None,
+    smem_cap: int | None = None,
 ) -> tuple[tuple[int, int, int], tuple[int, int, int]]:
     """(num_kv_pages_per_block, num_queries_per_block) for a padded token bucket.
 
     MIXED-pass query blocks hold one sequence each, so an MTP request
     (q_len = gamma + 1) in a 128-row block scores ~124 padding rows. Buckets up
-    to `small_bucket_tokens` take the small-bucket sizes instead.
+    to `small_bucket_tokens` take the small-bucket sizes instead. When ultra-long
+    contexts (e.g. 1M tokens with compressed KV pages) would exceed StreamIdx's
+    SMEM metadata step cap at `bkv_p=2`, `bkv_p` doubles until the step count
+    fits; shorter contexts keep the exact default `(2, 2, 2)`.
     """
     if small_bucket_bq is None or num_tokens > small_bucket_tokens:
-        return STREAMIDX_KV_PAGES_PER_BLOCK, STREAMIDX_QUERIES_PER_BLOCK
-    bkvp = small_bucket_bkvp or STREAMIDX_SMALL_BUCKET_DEFAULT_BKVP
-    return (
-        STREAMIDX_KV_PAGES_PER_BLOCK[:2] + (bkvp,),
-        STREAMIDX_QUERIES_PER_BLOCK[:2] + (small_bucket_bq,),
+        kv_pages = STREAMIDX_KV_PAGES_PER_BLOCK
+        q_per_block = STREAMIDX_QUERIES_PER_BLOCK
+        explicit_mix = False
+    else:
+        bkvp = small_bucket_bkvp or STREAMIDX_SMALL_BUCKET_DEFAULT_BKVP
+        kv_pages = STREAMIDX_KV_PAGES_PER_BLOCK[:2] + (bkvp,)
+        q_per_block = STREAMIDX_QUERIES_PER_BLOCK[:2] + (small_bucket_bq,)
+        explicit_mix = bool(small_bucket_bkvp)
+
+    if pages_per_seq > 0 and num_seqs > 0 and page_size > 0:
+        if smem_cap is None:
+            smem_cap = (
+                _streamidx_meta.generate_max_steps(num_seqs, pages_per_seq)
+                if jax.default_backend() == "tpu"
+                else 0
+            )
+        if smem_cap > 0:
+            widen_kw = dict(
+                num_tokens=num_tokens,
+                num_seqs=num_seqs,
+                pages_per_seq=pages_per_seq,
+                page_size=page_size,
+                chunk_tokens=chunk_tokens,
+                smem_cap=smem_cap,
+            )
+            dec_bkvp = _widen_bkvp_for_smem(
+                kv_pages[0], q_per_block[0], decode_only=True, **widen_kw
+            )
+            mix_bkvp = (
+                kv_pages[2]
+                if explicit_mix
+                else _widen_bkvp_for_smem(
+                    kv_pages[2], q_per_block[2], decode_only=False, **widen_kw
+                )
+            )
+            return (dec_bkvp, kv_pages[1], mix_bkvp), q_per_block
+    return kv_pages, q_per_block
+
+
+def _indexer_block_sizes(
+    q: jax.Array,
+    cache_kv: jax.Array,
+    kv_layout: KVLayout,
+    small_bucket: tuple[int | None, int | None, int],
+    seq_lens: jax.Array,
+    page_indices: jax.Array,
+    chunk_tokens: int | None,
+) -> tuple[tuple[int, int, int], tuple[int, int, int]]:
+    page_size = (
+        cache_kv.shape[3]
+        if kv_layout == KVLayout.SEQ_ALONG_LANE
+        else cache_kv.shape[1] * cache_kv.shape[2]
+    )
+    return _streamidx_block_sizes(
+        q.shape[0],
+        *small_bucket,
+        num_seqs=seq_lens.shape[0],
+        pages_per_seq=page_indices.shape[0] // seq_lens.shape[0],
+        page_size=page_size,
+        chunk_tokens=chunk_tokens,
     )
 
 
@@ -508,8 +623,14 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
                 )
 
             q = jax.lax.bitcast_convert_type(q_bytes, jnp.float8_e4m3fn)
-            kv_pages_per_block, queries_per_block = _streamidx_block_sizes(
-                q.shape[0], *small_bucket
+            kv_pages_per_block, queries_per_block = _indexer_block_sizes(
+                q,
+                cache_kv,
+                kv_layout,
+                small_bucket,
+                seq_lens,
+                page_indices,
+                chunk_tokens,
             )
             topk_indices = streamindex_topk(
                 q,
@@ -603,8 +724,14 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
             )
 
             q = jax.lax.bitcast_convert_type(q_bytes, jnp.float8_e4m3fn)
-            kv_pages_per_block, queries_per_block = _streamidx_block_sizes(
-                q.shape[0], *small_bucket
+            kv_pages_per_block, queries_per_block = _indexer_block_sizes(
+                q,
+                cache_kv,
+                kv_layout,
+                small_bucket,
+                seq_lens,
+                page_indices,
+                chunk_tokens,
             )
             local_topk = streamindex_topk_dcp(
                 q,
@@ -985,6 +1112,29 @@ class VllmTPUMLAAttention(MLAAttention):
             if flipped:
                 assert kv_b_weight is not None
                 self.kv_b_proj.weight = Parameter(kv_b_weight, requires_grad=False)
+
+        self._tq_weights_rotated = False
+        if (
+            self.use_sparse
+            or self.indexer is not None
+            or self.topk_indices_buffer is not None
+        ) and PallasMLAttentionBackendImpl._is_turboquant(self):
+            # Fold the symmetric orthonormal Hadamard H into W_UK_T and W_UV once
+            # on load: (q_nope @ W_UK_T) @ H == q_nope @ (W_UK_T @ H) and
+            # (out @ H) @ W_UV == out @ (H @ W_UV). Eliminates both per-step
+            # [T, H, 512] @ [512, 512] query/output rotations at runtime.
+            h = torch.from_numpy(turboquant.make_mla_latent_tables().hadamard).to(
+                device=self.W_UK_T.device, dtype=torch.float32
+            )
+            self.W_UK_T = Parameter(
+                torch.matmul(self.W_UK_T.to(torch.float32), h).to(self.W_UK_T.dtype),
+                requires_grad=False,
+            )
+            self.W_UV = Parameter(
+                torch.matmul(h, self.W_UV.to(torch.float32)).to(self.W_UV.dtype),
+                requires_grad=False,
+            )
+            self._tq_weights_rotated = True
 
         device = torch.device("tpu")
 
