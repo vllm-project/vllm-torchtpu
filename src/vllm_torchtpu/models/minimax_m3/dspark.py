@@ -29,12 +29,17 @@ from collections.abc import Iterable
 from typing import TYPE_CHECKING
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 from vllm.config import CacheConfig, VllmConfig
+from vllm.distributed import tensor_model_parallel_all_gather
 from vllm.model_executor.layers.layernorm import GemmaRMSNorm
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
-from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
+from vllm.model_executor.layers.vocab_parallel_embedding import (
+    ParallelLMHead,
+    UnquantizedEmbeddingMethod,
+)
 from vllm.model_executor.models.qwen3_dflash import (
     DFlashQwen3Attention,
     DFlashQwen3DecoderLayer,
@@ -48,13 +53,21 @@ from vllm.model_executor.models.utils import maybe_prefix
 from vllm.transformers_utils.configs.minimax_m3 import MiniMaxM3TextConfig
 
 from vllm_torchtpu.layers.core.quant_methods import get_tpu_quant_method
+from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.models.minimax_m3.moe import MiniMaxM3MLP
 from vllm_torchtpu.models.minimax_m3.quant import QUANT_METHOD
+from vllm_torchtpu.spec_decode.vocab_parallel_argmax import (
+    MAX_VOCAB_FOR_FLOAT_IDS,
+    reduce_shard_argmax_pairs,
+    shard_argmax_pair,
+)
 
 if TYPE_CHECKING:
     from vllm.config import SpeculativeConfig
 
     from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
+
+logger = init_logger(__name__)
 
 ARCHITECTURE = "DSparkMiniMaxDraftModel"
 _MODEL_TYPE = "minimax_m3_dspark"
@@ -261,6 +274,112 @@ class MiniMaxM3DSparkForCausalLM(Qwen3DSparkForCausalLM):
         self.logits_processor = LogitsProcessor(self.config.vocab_size)
         self.target_vocab_size = vllm_config.model_config.get_vocab_size()
         self.draft_id_to_target_id = None
+        # This rank's vocab shard of the Markov head, set by
+        # enable_vocab_parallel_markov_argmax() once the LM head is shared.
+        self._markov_cast_dtype: torch.dtype | None = None
+        self.register_buffer("markov_w2_shard", None, persistent=False)
+        self.register_buffer("vocab_shard_start", None, persistent=False)
+        self.register_buffer("vocab_shard_pad_mask", None, persistent=False)
+
+    def _vocab_parallel_markov_blocker(self) -> str | None:
+        """Why the shard argmax cannot reproduce the gathered argmax, or None."""
+        head, processor = self.lm_head, self.logits_processor
+        markov_w2 = self.model.markov_head.markov_w2
+        shard = getattr(head, "shard_indices", None)
+        if head.tp_size <= 1 or shard is None:
+            return "the LM head is not vocab-parallel"
+        if "_gather_logits" in vars(processor):
+            return "the draft is replicated"
+        if head.weight.shape[0] != head.num_embeddings_per_partition:
+            return "the LM head holds a replicated weight"
+        if shard.num_added_elements_padded > 0:
+            return "the LM head has added (LoRA) vocab"
+        if processor.logits_as_input or processor.soft_cap is not None:
+            return "the logits processor transforms the logits"
+        if processor.scale != 1.0:
+            return f"the logit scale is {processor.scale}"
+        if not (
+            processor.org_vocab_size == head.org_vocab_size == markov_w2.org_vocab_size
+        ):
+            return "the LM head, Markov head and logits vocab sizes differ"
+        if head.org_vocab_size >= MAX_VOCAB_FOR_FLOAT_IDS:
+            return "the vocab is too large for float32 ids"
+        if not isinstance(markov_w2.quant_method, UnquantizedEmbeddingMethod):
+            return "the Markov head is quantized"
+        return None
+
+    def _set_markov_vocab_shard(self, start: int, end: int, width: int) -> None:
+        """Keep the Markov head rows of global ids ``[start, end)``, padded with
+        zero rows to the LM head's ``width`` local rows, and a mask of the pad
+        columns. Every rank gets tensors of the same shapes, so the traced
+        program is rank-independent."""
+        markov_w2 = self.model.markov_head.markov_w2.weight
+        embed_dtype = self.model.markov_head.markov_w1.weight.dtype
+        # Mirror LogitsProcessor._apply_head: a head_dtype different from the
+        # input's casts both operands before the matmul.
+        head_dtype = self.logits_processor.head_dtype
+        cast = head_dtype is not None and head_dtype != embed_dtype
+        self._markov_cast_dtype = head_dtype if cast else None
+        rows = markov_w2[start:end]
+        if cast:
+            rows = rows.to(head_dtype)
+        self.markov_w2_shard = F.pad(rows, (0, 0, 0, width - (end - start)))
+        device = markov_w2.device
+        self.vocab_shard_start = torch.tensor(start, dtype=torch.int64, device=device)
+        if self.lm_head.org_vocab_size_padded == self.lm_head.org_vocab_size:
+            self.vocab_shard_pad_mask = None
+        else:
+            self.vocab_shard_pad_mask = (
+                torch.arange(width, device=device) >= end - start
+            )
+
+    def enable_vocab_parallel_markov_argmax(self) -> bool:
+        """DSparkProposer opt-in: argmax the greedy Markov drafts per vocab
+        shard. Call after the target's LM head is shared. Returns False (and
+        the proposer keeps the gathered logits) when the shard path could not
+        give the same ids."""
+        blocker = self._vocab_parallel_markov_blocker()
+        if blocker is not None:
+            logger.info(
+                "MiniMax DSpark: gathering full-vocab draft logits because %s.",
+                blocker,
+            )
+            return False
+        shard = self.lm_head.shard_indices
+        self._set_markov_vocab_shard(
+            shard.org_vocab_start_index,
+            shard.org_vocab_end_index,
+            self.lm_head.num_embeddings_per_partition,
+        )
+        return True
+
+    def compute_draft_logits_shard(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """This rank's vocab shard of ``compute_draft_logits`` (pad columns
+        included), without the all-gather."""
+        return self.logits_processor(self.lm_head, hidden_states, skip_gather=True)
+
+    def markov_shard_pair(
+        self, logits_shard: torch.Tensor, markov_embed: torch.Tensor
+    ) -> torch.Tensor:
+        """``[rows, 2]`` (max, global id) of logits + Markov bias on this
+        rank's shard. Element for element the same sums as the gathered path:
+        the logits are the pre-gather values and the bias columns are the same
+        matmul rows."""
+        if self._markov_cast_dtype is not None:
+            markov_embed = markov_embed.to(self._markov_cast_dtype)
+        scores = logits_shard + F.linear(markov_embed, self.markov_w2_shard)
+        if self.vocab_shard_pad_mask is not None:
+            scores = scores.masked_fill(self.vocab_shard_pad_mask, float("-inf"))
+        return shard_argmax_pair(scores, self.vocab_shard_start)
+
+    def markov_argmax_shard(
+        self, logits_shard: torch.Tensor, markov_embed: torch.Tensor
+    ) -> torch.Tensor:
+        """Draft-vocab ids equal to ``(compute_draft_logits + markov_bias)
+        .argmax(-1)``, exchanging one (max, id) pair per rank and row."""
+        pair = self.markov_shard_pair(logits_shard, markov_embed)
+        gathered = tensor_model_parallel_all_gather(pair, dim=-1)
+        return reduce_shard_argmax_pairs(gathered, self.lm_head.tp_size)
 
     def tpu_precompute_and_store_context_kv(
         self,

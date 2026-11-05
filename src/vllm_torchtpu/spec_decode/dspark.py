@@ -87,6 +87,10 @@ class DSparkProposer(DFlashProposer):
         # this, and nothing turns it on until a caller takes the confidences.
         self.use_confidence_head = False
         self._draft_confidences: DraftConfidences | None = None
+        # Whether the greedy Markov loop argmaxes each rank's vocab shard
+        # instead of the all-gathered full-vocab logits; set by load_model
+        # when the draft model opts in. The compiled draft step traces on it.
+        self._vocab_parallel_markov = False
         # The query block follows K, not the block length the checkpoint was
         # trained at; upstream vLLM likewise only enforces K == block for
         # Qwen3-Omni DSpark. The checkpoint's block is a query-block length in
@@ -136,6 +140,23 @@ class DSparkProposer(DFlashProposer):
                     f"DSpark draft model lacks {attr}(); expected a "
                     "Qwen3DSpark/Gemma4DSpark-family model."
                 )
+        # Opt-in interface for drafts whose LM head is vocab-parallel: the
+        # draft's enable_vocab_parallel_markov_argmax() prepares its shard of
+        # the Markov head and returns whether the shard path applies; then the
+        # draft step calls compute_draft_logits_shard() (no all-gather) and
+        # markov_argmax_shard() (bias on the shard, argmax, exchange of one
+        # (max, id) pair per rank and row). Greedy ids are identical to the
+        # argmax of the gathered logits. Drafts without the method keep the
+        # gathered path.
+        enable = getattr(self.draft_model, "enable_vocab_parallel_markov_argmax", None)
+        self._vocab_parallel_markov = (
+            callable(enable) and not self._draft_replicated and bool(enable())
+        )
+        if self._vocab_parallel_markov:
+            logger.info(
+                "DSpark: greedy Markov drafting argmaxes the vocab-parallel "
+                "logits per rank; full-vocab logits are not gathered."
+            )
 
     def _observe_draft_aux(
         self, aux: torch.Tensor, chunk_index: int, chunk: DraftChunkInputs
@@ -186,7 +207,12 @@ class DSparkProposer(DFlashProposer):
 
         # Draft-vocab logits for every slot; the Markov bias is added in
         # draft space and ids are remapped to target vocab after argmax.
-        logits = self.draft_model.compute_draft_logits(valid_hidden)
+        # The vocab-parallel path keeps each rank's vocab shard of them.
+        vocab_parallel = self._vocab_parallel_markov
+        if vocab_parallel:
+            logits = self.draft_model.compute_draft_logits_shard(valid_hidden)
+        else:
+            logits = self.draft_model.compute_draft_logits(valid_hidden)
         logits_3d = logits.view(padded_num_reqs, block_size, logits.shape[-1])
 
         ids_3d = input_ids[: padded_num_reqs * block_size].view(
@@ -198,10 +224,14 @@ class DSparkProposer(DFlashProposer):
         sample_start = 0 if self.sample_from_anchor else 1
         for i in range(sample_start, block_size):
             markov_embed = self.draft_model.markov_embed(prev)
-            bias = self.draft_model.markov_bias(markov_embed)
-            step = self.draft_model.map_draft_to_target(
-                (logits_3d[:, i] + bias).argmax(dim=-1)
-            )
+            if vocab_parallel:
+                draft_ids = self.draft_model.markov_argmax_shard(
+                    logits_3d[:, i], markov_embed
+                )
+            else:
+                bias = self.draft_model.markov_bias(markov_embed)
+                draft_ids = (logits_3d[:, i] + bias).argmax(dim=-1)
+            step = self.draft_model.map_draft_to_target(draft_ids)
             draft_tokens.append(step)
             markov_embeds.append(markov_embed)
             prev = step
