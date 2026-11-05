@@ -679,8 +679,12 @@ def _reference_ep_moe(
     return out.astype(x.dtype)
 
 
-@pytest.mark.parametrize("tokens", [512, 4096])
-def test_ep_split_body_gives_each_core_its_rows_of_the_psum_path(monkeypatch, tokens):
+@pytest.mark.parametrize(
+    ("tokens", "rotated_table"), [(512, False), (4096, False), (512, True)]
+)
+def test_ep_split_body_gives_each_core_its_rows_of_the_psum_path(
+    monkeypatch, tokens, rotated_table
+):
     """TPU_PREFILL_SEQ_PARALLEL_EP: four "ranks" under vmap, each holding its
     own rows (`own_rows`; 4096 tokens take 2 combine chunks), route them,
     gather rows and routes, run their experts and shared slice on every row
@@ -748,7 +752,15 @@ def test_ep_split_body_gives_each_core_its_rows_of_the_psum_path(monkeypatch, to
     own = [
         jnp.stack([v2.own_rows(a, r, ranks) for r in range(ranks)]) for a in (x, scores)
     ]
-    split = run(moe_tp_decode._ep_split_body(statics, ranks, "ep"), *own)
+    if rotated_table:
+        # A chunk shape the rotated kernel does not take keeps XLA's scatter.
+        monkeypatch.setattr(
+            moe_tp_decode.rotated_collectives,
+            "reduce_scatter_supports",
+            lambda rows, hidden: False,
+        )
+    table = np.zeros(16, np.int32) if rotated_table else None
+    split = run(moe_tp_decode._ep_split_body(statics, ranks, "ep", table), *own)
 
     assert split.shape == (ranks, tokens // ranks, hidden)
     for r in range(ranks):
@@ -837,12 +849,27 @@ def built_bodies(monkeypatch):
     return bodies
 
 
-def test_get_op_builds_the_ep_split_body_for_an_ep_layer(built_bodies):
+@pytest.mark.parametrize("sliced", [False, True])
+def test_get_op_builds_the_ep_split_body_for_an_ep_layer(
+    built_bodies, monkeypatch, sliced
+):
     """TPU_PREFILL_SEQ_PARALLEL_EP: the split op of an EP layer runs
-    _ep_split_body over the op's 16 ranks."""
+    _ep_split_body over the op's 16 ranks, with the rotated reduce-scatter's
+    peer table when arming found the mesh's chip places."""
+    import numpy as np
+
     statics, mesh = _ep_statics(True), _OpMesh()
+    monkeypatch.setattr(
+        moe_tp_decode, "_EP_SCATTER_PLACES", {mesh: _PLACES} if sliced else {}
+    )
     moe_tp_decode._get_op(mesh, statics, split=True)
-    assert built_bodies == [("_ep_split_body", (statics, 16, "ep"))]
+    [(kind, (*args, rs_table))] = built_bodies
+    assert (kind, args) == ("_ep_split_body", [statics, 16, "ep"])
+    if sliced:
+        want = moe_tp_decode.rotated_collectives.peer_table(_PLACES, "reduce_scatter")
+        np.testing.assert_array_equal(rs_table, want)
+    else:
+        assert rs_table is None
 
 
 def test_get_op_keeps_the_tp_split_body_for_a_tp_layer(built_bodies):
@@ -918,3 +945,213 @@ def test_rotated_places_logs_the_collectives_it_takes(
 
     assert found == (places if log.endswith(f"over {_PLACES}") else None)
     assert logs == [log]
+
+
+def test_rotated_scatter_finds_each_ep_mesh_places_once(monkeypatch):
+    """TPU_PREFILL_SEQ_PARALLEL_EP_ROTATED_SCATTER: the first EP layer of a
+    mesh finds its chip places (a collective); later layers reuse them."""
+    statics = _ep_statics(True)
+    mesh, op = object(), object()
+    found = []
+    monkeypatch.setattr(moe_tp_decode, "_OPS", {(mesh, statics, False, False): op})
+    monkeypatch.setattr(moe_tp_decode, "_EP_SCATTER_PLACES", {})
+    monkeypatch.setattr(moe_tp_decode, "_get_op", lambda *a, **k: object())
+    monkeypatch.setattr(
+        moe_tp_decode, "_ep_scatter_places", lambda m: found.append(m) or ["places"]
+    )
+    monkeypatch.setattr(envs, "TPU_PREFILL_SEQ_PARALLEL_EP", True)
+    monkeypatch.setattr(envs, "TPU_PREFILL_SEQ_PARALLEL_EP_ROTATED_SCATTER", True)
+    for _ in range(2):
+        layer = SimpleNamespace(
+            quant_method=SimpleNamespace(**{moe_tp_decode._OP_ATTR: op}),
+            _moe_tp_decode_rank=None,
+        )
+        assert moe_tp_decode.arm_token_split_op(layer, object()) is not None
+    assert found == [mesh]
+    places = moe_tp_decode._EP_SCATTER_PLACES
+    assert places == {mesh: ["places"]}
+
+
+def test_rotated_scatter_needs_the_ep_split(monkeypatch):
+    monkeypatch.setattr(envs, "TPU_PREFILL_SEQ_PARALLEL_EP", False)
+    monkeypatch.setattr(envs, "TPU_PREFILL_SEQ_PARALLEL_EP_ROTATED_SCATTER", True)
+    layer = SimpleNamespace(quant_method=SimpleNamespace())
+    with pytest.raises(ValueError, match="needs TPU_PREFILL_SEQ_PARALLEL_EP=1"):
+        moe_tp_decode.arm_token_split_op(layer, object())
+
+
+@pytest.mark.parametrize(
+    ("size", "index", "places", "reason"),
+    [
+        (8, 0, None, "the mesh has 8 cores, not 16"),
+        (16, None, None, "there is no EP group"),
+        (16, 0, ValueError("not a 2x2x2 slice"), "not a 2x2x2 slice"),
+        (16, 0, _PLACES, None),
+    ],
+)
+def test_rotated_scatter_places_fall_back_to_xla_with_the_reason(
+    monkeypatch, size, index, places, reason
+):
+    """TPU_PREFILL_SEQ_PARALLEL_EP_ROTATED_SCATTER: the EP group's chip places
+    of a 2x2x2 slice; a mesh the rotated kernel cannot run over keeps XLA's
+    reduce-scatter and logs why."""
+    from vllm_torchtpu.layers.adapter import small_all_reduce_op
+
+    def chip_places(mesh, mesh_index, gather=None, who=None):
+        if isinstance(places, Exception):
+            raise places
+        return places
+
+    logs = []
+    monkeypatch.setattr(moe_tp_decode, "logger", _Log(logs))
+    monkeypatch.setattr(small_all_reduce_op, "logger", _Log(logs))
+    monkeypatch.setattr(moe_tp_decode, "ep_mesh_index", lambda: index)
+    monkeypatch.setattr(small_all_reduce_op, "_chip_places", chip_places)
+    monkeypatch.setattr(moe_tp_decode.rotated_collectives, "Layout", lambda p: p)
+
+    found = moe_tp_decode._ep_scatter_places(SimpleNamespace(size=size))
+
+    if reason is None:
+        assert found == places
+        assert logs == [
+            "TPU_PREFILL_SEQ_PARALLEL_EP_ROTATED_SCATTER: the split EP MoE's "
+            f"reduce-scatters run rotated over {_PLACES}"
+        ]
+    else:
+        assert found is None
+        assert logs == [
+            f"TPU_PREFILL_SEQ_PARALLEL_EP_ROTATED_SCATTER: {reason}; "
+            "XLA's collectives"
+        ]
+
+
+@pytest.fixture
+def mesh16():
+    """The 16-core mesh of the rotated kernel; CPU virtual devices suffice
+    (XLA_FLAGS=--xla_force_host_platform_device_count=16). A fixture, not a
+    module-level skipif: collection must not claim a backend."""
+    import jax
+    import numpy as np
+    from jax.sharding import Mesh
+
+    cores = moe_tp_decode.rotated_collectives.CORES
+    if jax.device_count() < cores:
+        pytest.skip("requires 16 devices; CPU virtual devices are sufficient")
+    return Mesh(np.asarray(jax.devices()[:cores]), ("ep",))
+
+
+def _ep_split_op(mesh, monkeypatch, tokens):
+    """(rs_table -> every core's output rows, in core order) of the split EP
+    body on `mesh`, every pallas_call interpreted (the rotated kernel's remote
+    copies and semaphores run on the host) and _reference_ep_moe for the
+    routed experts. Hidden 768: the rotated kernel takes rows of whole 128-lane
+    tiles in 3 parts."""
+    import jax
+    import jax.numpy as jnp
+    import numpy as np
+    from jax.experimental import pallas as pl
+    from jax.sharding import NamedSharding
+    from jax.sharding import PartitionSpec as P
+
+    from vllm_torchtpu.kernels.experimental.fused_moe_prefill import (
+        fused_moe_prefill_kernel_v2 as v2,
+    )
+
+    pallas_call = pl.pallas_call
+    monkeypatch.setattr(
+        pl,
+        "pallas_call",
+        lambda *a, **k: pallas_call(*a, **{**k, "interpret": pltpu.InterpretParams()}),
+    )
+    monkeypatch.setattr(moe_tp_decode, "fused_moe_func", _reference_ep_moe)
+    monkeypatch.setattr(
+        moe_tp_decode.kernel, "can_use_moe_tp_decode", lambda *a, **k: False
+    )
+    hidden, experts, shared, topk = 768, 32, 256, 4
+    ranks = int(mesh.size)
+    local, shard = experts // ranks, shared // ranks
+    statics = moe_tp_decode._OpStatics(
+        topk=topk,
+        routed_scale=ROUTED_SCALE,
+        activation="silu",
+        use_sparse_core=False,
+        onehot_threshold=0,
+        use_ep=True,
+    )
+    rng = np.random.default_rng(0)
+
+    def array(shape, dtype, scale=1.0):
+        return jnp.asarray(rng.standard_normal(shape) * scale, dtype)
+
+    x = array((tokens, hidden), jnp.bfloat16)
+    scores = jax.nn.sigmoid(array((tokens, experts), jnp.float32))
+    args = (
+        jnp.concatenate([v2.own_rows(x, r, ranks) for r in range(ranks)]),
+        jnp.concatenate([v2.own_rows(scores, r, ranks) for r in range(ranks)]),
+        array((experts,), jnp.float32, 0.1),
+        jnp.arange(tokens) >= tokens - 37,
+        array((experts, hidden, 2 * INTER), jnp.bfloat16, 0.05),
+        array((experts, INTER, hidden), jnp.bfloat16, 0.05),
+        jnp.ones((experts, 1, 2 * INTER), jnp.float32),
+        jnp.ones((experts, 1, hidden), jnp.float32),
+        array((ranks * hidden, 2 * shard), jnp.float8_e4m3fn, 0.3),
+        jnp.asarray(rng.uniform(0.01, 0.02, ranks * 2 * shard), jnp.float32),
+        array((ranks * shard, hidden), jnp.float8_e4m3fn, 0.3),
+        jnp.asarray(rng.uniform(0.01, 0.02, ranks * hidden), jnp.float32),
+        jnp.arange(ranks, dtype=jnp.int32).reshape(ranks, 1),
+        (jnp.arange(ranks, dtype=jnp.int32) * local).reshape(ranks, 1),
+    )
+    specs = (P("ep"), P("ep"), P(), P()) + (P("ep"),) * 10
+    placed = [jax.device_put(a, NamedSharding(mesh, s)) for a, s in zip(args, specs)]
+
+    def run(rs_table):
+        body = moe_tp_decode._ep_split_body(statics, ranks, "ep", rs_table)
+        sharded = jax.shard_map(
+            body, mesh=mesh, in_specs=specs, out_specs=P("ep"), check_vma=False
+        )
+        return np.asarray(jax.jit(sharded)(*placed), np.float32)
+
+    return run
+
+
+def _shuffled_places(seed):
+    """_PLACES in a shuffled mesh order, so the peer table is no identity."""
+    import numpy as np
+
+    order = np.random.default_rng(seed).permutation(len(_PLACES))
+    return [_PLACES[i] for i in order]
+
+
+@pytest.mark.multichip
+@pytest.mark.parametrize("tokens", [2048, 4096])
+def test_rotated_scatter_gives_each_core_the_rows_of_xla_scatter(
+    mesh16, monkeypatch, tokens
+):
+    """TPU_PREFILL_SEQ_PARALLEL_EP_ROTATED_SCATTER on 16 host devices: each
+    core's rows equal XLA's reduce-scatter's. At 4,096 tokens the op runs 2
+    combine chunks, one kernel each; a table from any valid layout is a
+    correct halving-doubling over the mesh."""
+    import numpy as np
+
+    from vllm_torchtpu.kernels.experimental.fused_moe_prefill import (
+        fused_moe_prefill_kernel_v2 as v2,
+    )
+
+    rc = moe_tp_decode.rotated_collectives
+    assert rc.reduce_scatter_supports(tokens // v2.token_chunks(tokens), 768)
+    run = _ep_split_op(mesh16, monkeypatch, tokens)
+    want = run(None)
+    for seed in (1, 2):
+        got = run(rc.peer_table(_shuffled_places(seed), "reduce_scatter"))
+        np.testing.assert_allclose(got, want, atol=2e-2 * np.abs(want).max())
+
+
+@pytest.mark.multichip
+def test_a_wrong_peer_table_moves_the_wrong_rows(mesh16, monkeypatch):
+    import numpy as np
+
+    run = _ep_split_op(mesh16, monkeypatch, 2048)
+    want = run(None)
+    rc = moe_tp_decode.rotated_collectives
+    got = run(rc.peer_table(_shuffled_places(1), "all_gather"))
+    assert np.abs(got - want).max() > 0.1 * np.abs(want).max()

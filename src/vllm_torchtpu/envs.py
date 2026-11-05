@@ -340,6 +340,7 @@ if TYPE_CHECKING:
     TPU_PREFILL_SEQ_PARALLEL: bool = False
     TPU_PREFILL_SEQ_PARALLEL_MIN_TOKENS: int = 256
     TPU_PREFILL_SEQ_PARALLEL_EP: bool = False
+    TPU_PREFILL_SEQ_PARALLEL_EP_ROTATED_SCATTER: bool = False
     TPU_MOE_PREFILL_GATHER_ONCE: bool = False
     TPU_MOE_PREFILL_ROTATED_COLLECTIVES: bool = False
     TPU_MOE_PREFILL_COMBINE_SCATTER: bool = False
@@ -2476,6 +2477,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # TPU_PREFILL_SEQ_PARALLEL is on, once an EP model's serving run shows the
     # split no slower at every prefill size.
     "TPU_PREFILL_SEQ_PARALLEL_EP": env_bool("TPU_PREFILL_SEQ_PARALLEL_EP"),
+    # TPU_PREFILL_SEQ_PARALLEL_EP on a 2x2x2 slice of 2-core chips: the split
+    # EP MoE op's reduce-scatter runs as the rotated halving-doubling kernel
+    # (kernels/experimental/rotated_collectives.py) on the TensorCores, one
+    # kernel per combine chunk, instead of XLA's reduce-scatter. Same rows on
+    # each core; the bf16 sums may add their terms in another order. Other
+    # meshes log a warning and keep XLA's. Migration switch: delete it, taking
+    # the rotated kernel on every 2x2x2 slice, with TPU_PREFILL_SEQ_PARALLEL_EP.
+    "TPU_PREFILL_SEQ_PARALLEL_EP_ROTATED_SCATTER": env_bool(
+        "TPU_PREFILL_SEQ_PARALLEL_EP_ROTATED_SCATTER"
+    ),
     # TPU_PREFILL_SEQ_PARALLEL: the split MoE op all-gathers each core's rows
     # once, in core order, instead of once per combine chunk: the routes, their
     # weights and the row scales as one int32 all-gather with one value per
