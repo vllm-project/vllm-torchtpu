@@ -58,6 +58,7 @@ from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4.deepseek_v4_compressor 
 )
 from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4.deepseek_v4_indexer import (
     VllmDeepseekV4Indexer,
+    rotated_query_jax,
 )
 from vllm_torchtpu.layers.adapter.linear_common import (
     _quantized_matmul_jax,
@@ -160,6 +161,61 @@ def _wq_b_keep_input_qnorm_rope_jax(
     return q, qr_q, qr_scale
 
 
+def _wq_b_qnorm_rope_indexer_q_jax(
+    qr: jax.Array,
+    w_q: jax.Array,
+    w_scale: jax.Array,
+    positions: jax.Array,
+    cos_sin_cache: jax.Array,
+    o_proj_cos_sin_table: jax.Array,
+    indexer_w_q: jax.Array,
+    indexer_w_scale: jax.Array,
+    *,
+    head_dim: int,
+    eps: float,
+    indexer_head_dim: int,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """`_wq_b_qnorm_rope_jax`, and the indexer's query projected from `qr` as
+    `wq_b` quantized it and rotated by `cos_sin_cache` too, as
+    `rotated_query_jax` returns it; one kernel where
+    `q_proj_norm_rope.fuses_indexer` holds."""
+    rotary_dim = cos_sin_cache.shape[1]
+    if q_proj_norm_rope.fuses_indexer(
+        qr, w_q, w_scale, head_dim, rotary_dim, indexer_w_q, indexer_head_dim
+    ):
+        return q_proj_norm_rope.q_proj_norm_rope(
+            qr,
+            w_q,
+            w_scale,
+            wo_a_cos_sin(positions, o_proj_cos_sin_table),
+            indexer_w_q,
+            indexer_w_scale,
+            head_dim=head_dim,
+            rotary_dim=rotary_dim,
+            eps=eps,
+        )
+    q, qr_q, qr_scale = _wq_b_keep_input_qnorm_rope_jax(
+        qr,
+        w_q,
+        w_scale,
+        positions,
+        cos_sin_cache,
+        o_proj_cos_sin_table,
+        head_dim=head_dim,
+        eps=eps,
+    )
+    indexer_q, indexer_scales = rotated_query_jax(
+        qr_q,
+        qr_scale,
+        indexer_w_q,
+        indexer_w_scale,
+        positions,
+        cos_sin_cache,
+        head_dim=indexer_head_dim,
+    )
+    return q, indexer_q, indexer_scales
+
+
 def _kv_rope_words_jax(
     x: jax.Array,
     positions: jax.Array,
@@ -200,13 +256,20 @@ def _fake_wq_b_qnorm_rope(qr, w_q, *args, **kwargs):
     return qr.new_empty((qr.shape[0], w_q.shape[-1]))
 
 
-def _fake_wq_b_keep_input_qnorm_rope(qr, w_q, *args, **kwargs):
+def _fake_wq_b_qnorm_rope_indexer_q(indexer_head_dim: int):
     """Abstract implementation for PyTorch Dynamo graph tracing."""
-    return (
-        qr.new_empty((qr.shape[0], w_q.shape[-1])),
-        qr.new_empty(qr.shape, dtype=w_q.dtype),
-        qr.new_empty((qr.shape[0], 1), dtype=torch.float32),
-    )
+
+    def fake(qr, w_q, w_scale, positions, cos_sin_cache, table, indexer_w_q, *args):
+        indexer_heads = indexer_w_q.shape[-1] // indexer_head_dim
+        return (
+            qr.new_empty((qr.shape[0], w_q.shape[-1])),
+            qr.new_empty(
+                (qr.shape[0], indexer_heads, indexer_head_dim), dtype=indexer_w_q.dtype
+            ),
+            qr.new_empty((qr.shape[0], indexer_heads), dtype=torch.float32),
+        )
+
+    return fake
 
 
 def _fake_kv_rope_words(x, positions, cos_sin_cache, *args, **kwargs):
@@ -593,49 +656,62 @@ class VllmDeepseekV4MLAAttention(
     @property
     def wq_b_qnorm_rope_op(self):
         """The op running `wq_b` and `qnorm_rope` on `qr` together, built
-        lazily; on a layer with an indexer it also returns `qr` as `wq_b`
-        quantized it, for the indexer's own projection. None when a `wq_b` is
-        not `is_fp8_per_channel_linear`."""
+        lazily; on a layer with an indexer it also returns the indexer's
+        rotated, quantized query, projected from `qr` as `wq_b` quantized it.
+        None when a `wq_b` is not `is_fp8_per_channel_linear`, or the indexer
+        rotates by another embedding than the query."""
         if "_wq_b_qnorm_rope_op_instance" in self.__dict__:
             return self.__dict__["_wq_b_qnorm_rope_op_instance"]
 
         op = None
-        keep_input = self.indexer is not None
+        with_indexer = self.indexer is not None
+        rotary_emb = self.mla_attn.rotary_emb
         if is_fp8_per_channel_linear(self.wq_b) and (
-            not keep_input or is_fp8_per_channel_linear(self.indexer.wq_b)
+            not with_indexer
+            or (
+                is_fp8_per_channel_linear(self.indexer.wq_b)
+                and getattr(self.mla_attn, "indexer_rotary_emb", rotary_emb)
+                is rotary_emb
+            )
         ):
             eps = float(self.mla_attn.eps)
             head_dim = int(self.mla_attn.head_dim)
             op_name = (
-                f"pallas::deepseek_v4_wq_b_{'keep_input_' if keep_input else ''}"
-                f"qnorm_rope_d{head_dim}_e{_name_float(eps)}"
+                f"pallas::deepseek_v4_wq_b_qnorm_rope_d{head_dim}_e{_name_float(eps)}"
             )
+            input_partition_specs = (
+                P(),  # qr
+                P(None, "model"),  # wq_b, (k, n) with heads on n
+                P("model"),  # wq_b's scale
+                P(),  # positions
+                P(),  # cos_sin_cache
+                P(),  # o_proj_cos_sin_table
+            )
+            jax_fn = functools.partial(_wq_b_qnorm_rope_jax, head_dim=head_dim, eps=eps)
+            fake_fn = _fake_wq_b_qnorm_rope
+            if with_indexer:
+                indexer_head_dim = int(self.indexer.head_dim)
+                op_name += f"_indexer_q_d{indexer_head_dim}"
+                input_partition_specs += (
+                    P(None, "model"),  # the indexer's wq_b, heads on n
+                    P("model"),  # its scale
+                )
+                jax_fn = functools.partial(
+                    _wq_b_qnorm_rope_indexer_q_jax,
+                    head_dim=head_dim,
+                    eps=eps,
+                    indexer_head_dim=indexer_head_dim,
+                )
+                fake_fn = _fake_wq_b_qnorm_rope_indexer_q(indexer_head_dim)
             op = _pallas_op_cache.get(op_name)
             if op is None:
                 op = pallas.jax_op(
                     op_name,
-                    functools.partial(
-                        _wq_b_keep_input_qnorm_rope_jax
-                        if keep_input
-                        else _wq_b_qnorm_rope_jax,
-                        head_dim=head_dim,
-                        eps=eps,
-                    ),
+                    jax_fn,
                     mesh=get_pallas_op_mesh(),
-                    input_partition_specs=(
-                        P(),  # qr
-                        P(None, "model"),  # wq_b, (k, n) with heads on n
-                        P("model"),  # wq_b's scale
-                        P(),  # positions
-                        P(),  # cos_sin_cache
-                        P(),  # o_proj_cos_sin_table
-                    ),
+                    input_partition_specs=input_partition_specs,
                 )
-                op.register_fake(
-                    _fake_wq_b_keep_input_qnorm_rope
-                    if keep_input
-                    else _fake_wq_b_qnorm_rope
-                )
+                op.register_fake(fake_fn)
                 _pallas_op_cache[op_name] = op
         object.__setattr__(self, "_wq_b_qnorm_rope_op_instance", op)
         return op
@@ -706,12 +782,17 @@ class VllmDeepseekV4MLAAttention(
         out: torch.Tensor | None,
     ) -> torch.Tensor:
         """Execute indexing, state compression, and kernel attention dispatch."""
-        # The indexer projects the same qr. It takes qr as wq_b quantized it
-        # and projects it inside its own op, or one op quantizes qr for both.
-        indexer_q = quantized_qr = None
+        # The indexer projects the same qr. The query's op projects and
+        # rotates the indexer's query too, or one op quantizes qr for both.
+        indexer_q = rotated_indexer_q = None
         q_shape = (qr.shape[0], self.mla_attn.n_local_heads, self.mla_attn.head_dim)
         wq_b_qnorm_rope_op = self.wq_b_qnorm_rope_op
         if wq_b_qnorm_rope_op is not None and qr.dtype == torch.bfloat16:
+            indexer_args = (
+                ()
+                if self.indexer is None
+                else (self.indexer.wq_b.weight, self.indexer.wq_b.weight_scale)
+            )
             q = wq_b_qnorm_rope_op(
                 qr,
                 self.wq_b.weight,
@@ -720,10 +801,11 @@ class VllmDeepseekV4MLAAttention(
                 self.mla_attn.rotary_emb.cos_sin_cache,
                 # Prefill buckets take the o-projection's gathered cos/sin rows.
                 self.rotary_emb.o_proj_cos_sin_table,
+                *indexer_args,
             )
             if self.indexer is not None:
-                q, qr_q, qr_scale = q
-                quantized_qr = (qr_q, qr_scale)
+                q, indexer_q_quant, indexer_q_scales = q
+                rotated_indexer_q = (indexer_q_quant, indexer_q_scales)
             q = q.view(q_shape)
         else:
             pair = (
@@ -765,7 +847,7 @@ class VllmDeepseekV4MLAAttention(
                 indexer_emb,
                 compress=not paired,
                 projected_q=indexer_q,
-                quantized_query=quantized_qr,
+                rotated_query=rotated_indexer_q,
             )
         if compressor is not None and not paired:
             compressor(hidden_states, positions, self.mla_attn.rotary_emb)

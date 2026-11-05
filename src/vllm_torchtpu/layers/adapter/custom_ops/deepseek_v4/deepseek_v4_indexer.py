@@ -133,14 +133,38 @@ def _indexer_from_q_jax(
     )
 
 
-# Module-level so `pallas.jax_op` can trace and register it as a torch op.
-def _indexer_from_fp8_query_jax(
+def rotated_query_jax(
     query_q: jax.Array,
     query_scale: jax.Array,
     wq_b: jax.Array,
     wq_b_scale: jax.Array,
     positions: jax.Array,
     cos_sin_cache: jax.Array,
+    *,
+    head_dim: int,
+) -> tuple[jax.Array, jax.Array]:
+    """The rotated, quantized queries of `wq_b(query)` that `_indexer_jax`
+    ranks for, and their scales, given `query` as an fp8 per-channel matmul
+    quantizes it."""
+    # bf16: the dtype of `query`, which upstream's projection outputs.
+    if indexer_q_proj.applies(query_q, wq_b, cos_sin_cache, jnp.bfloat16, head_dim):
+        # The bf16 projection stays in VMEM, between the dot and the rotation.
+        return indexer_q_proj.q_proj_rope_quant(
+            query_q, query_scale, wq_b, wq_b_scale, positions, cos_sin_cache
+        )
+    q = xla_prequantized_matmul(query_q, query_scale, wq_b, wq_b_scale, jnp.bfloat16)
+    return rope_quant(
+        q.reshape(q.shape[0], -1, head_dim),
+        positions,
+        cos_sin_cache,
+        quant_dtype=jnp.float8_e4m3fn,
+    )
+
+
+# Module-level so `pallas.jax_op` can trace and register it as a torch op.
+def _indexer_from_rotated_query_jax(
+    q_quant: jax.Array,
+    q_scales: jax.Array,
     indexer_weights: jax.Array,
     cache_kv: jax.Array,
     seq_lens: jax.Array,
@@ -148,34 +172,14 @@ def _indexer_from_fp8_query_jax(
     cu_q_lens: jax.Array,
     distribution: jax.Array,
     *,
-    head_dim: int,
     k: int,
     compression_ratio: int,
     softmax_scale: float,
     n_head: int,
 ) -> jax.Array:
-    """`_indexer_from_q_jax` of `wq_b(query)`, given `query` as an fp8
-    per-channel matmul quantizes it."""
+    """`_indexer_jax`, with the profiling-shape guard of `_indexer_from_q_jax`."""
     if cache_kv.shape[0] == 0:
-        # Profiling-shape trace, as in `_indexer_from_q_jax`.
-        return jnp.zeros((query_q.shape[0], k), dtype=jnp.int32)
-
-    # bf16: the dtype of `query`, which upstream's projection outputs.
-    if indexer_q_proj.applies(query_q, wq_b, cos_sin_cache, jnp.bfloat16, head_dim):
-        # The bf16 projection stays in VMEM, between the dot and the rotation.
-        q_quant, q_scales = indexer_q_proj.q_proj_rope_quant(
-            query_q, query_scale, wq_b, wq_b_scale, positions, cos_sin_cache
-        )
-    else:
-        q = xla_prequantized_matmul(
-            query_q, query_scale, wq_b, wq_b_scale, jnp.bfloat16
-        )
-        q_quant, q_scales = rope_quant(
-            q.reshape(q.shape[0], -1, head_dim),
-            positions,
-            cos_sin_cache,
-            quant_dtype=jnp.float8_e4m3fn,
-        )
+        return jnp.zeros((q_quant.shape[0], k), dtype=jnp.int32)
     return _indexer_jax(
         q_quant,
         q_scales,
@@ -222,14 +226,16 @@ class VllmDeepseekV4Indexer(DeepseekV4Indexer):
             dsv4_attention.DeepseekV4IndexerCache = orig_cache
         object.__setattr__(self, "indexer_op", self._build_indexer_op())
         object.__setattr__(
-            self, "fp8_query_indexer_op", self._build_indexer_op(fp8_query=True)
+            self,
+            "rotated_query_indexer_op",
+            self._build_indexer_op(rotated_query=True),
         )
         object.__setattr__(self.compressor, "k_cache", self.k_cache)
 
-    def _build_indexer_op(self, fp8_query: bool = False):
-        """The op that ranks from `q = wq_b(query)`, or with `fp8_query` from
-        `query` as `wq_b`'s fp8 per-channel matmul quantizes it and `wq_b`'s
-        weight and scales."""
+    def _build_indexer_op(self, rotated_query: bool = False):
+        """The op that ranks from `q = wq_b(query)` and the positions, or with
+        `rotated_query` from `q` already rotated and quantized, as
+        `rotated_query_jax` returns it."""
         mesh = get_pallas_op_mesh()
 
         topk_kwargs = dict(
@@ -238,9 +244,9 @@ class VllmDeepseekV4Indexer(DeepseekV4Indexer):
             softmax_scale=self.softmax_scale,
             n_head=self.n_head,
         )
-        if fp8_query:
+        if rotated_query:
             wrapped_fn = functools.partial(
-                _indexer_from_fp8_query_jax, head_dim=self.head_dim, **topk_kwargs
+                _indexer_from_rotated_query_jax, **topk_kwargs
             )
         else:
             wrapped_fn = functools.partial(_indexer_from_q_jax, **topk_kwargs)
@@ -254,8 +260,8 @@ class VllmDeepseekV4Indexer(DeepseekV4Indexer):
             f"pallas::deepseek_v4_indexer_k{self.topk_tokens}"
             f"_c{self.compress_ratio}_h{self.n_head}_s{_scale}"
         )
-        if fp8_query:
-            op_name += f"_fp8q_d{self.head_dim}"
+        if rotated_query:
+            op_name += "_rq"
         global _indexer_op_cache
         if op_name in _indexer_op_cache:
             return _indexer_op_cache[op_name]
@@ -263,23 +269,23 @@ class VllmDeepseekV4Indexer(DeepseekV4Indexer):
         attn_data_axis = None
         attn_head_axis = "model"
         batch_axis = BATCH_AXIS
-        if fp8_query:
+        if rotated_query:
             query_specs = (
-                P(attn_data_axis, None),  # query, quantized
-                P(attn_data_axis, None),  # its row scales
-                P(None, attn_head_axis),  # wq_b weight: (k, n), heads on n
-                P(attn_head_axis),  # wq_b weight scales
+                P(attn_data_axis, attn_head_axis, None),  # q, rotated and fp8
+                P(attn_data_axis, attn_head_axis),  # its row scales
             )
         else:
-            query_specs = (P(attn_data_axis, attn_head_axis, None),)  # q
+            query_specs = (
+                P(attn_data_axis, attn_head_axis, None),  # q
+                P(attn_data_axis),  # positions
+                P(),  # cos_sin_cache
+            )
         indexer_jax_op = pallas.jax_op(
             op_name,
             wrapped_fn,
             mesh=mesh,
             input_partition_specs=(
                 *query_specs,
-                P(attn_data_axis),  # positions
-                P(),  # cos_sin_cache
                 P(attn_data_axis, attn_head_axis),  # indexer_weights
                 P(),  # cache_kv
                 P(batch_axis),  # seq_lens
@@ -309,22 +315,26 @@ class VllmDeepseekV4Indexer(DeepseekV4Indexer):
         slot_mapping: torch.Tensor | None = None,
         compress: bool = True,
         projected_q: torch.Tensor | None = None,
-        quantized_query: tuple[torch.Tensor, torch.Tensor] | None = None,
+        rotated_query: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         """``compress=False`` when the caller already ran this indexer's
         compressor (`VllmDeepseekCompressor.forward_with_indexer`),
         ``projected_q`` is ``wq_b(query)`` when the caller already ran it, and
-        ``quantized_query`` is ``query`` as ``wq_b``'s fp8 per-channel matmul
-        quantizes it (rows and their ``[T, 1]`` scales), when the caller
-        already has that: ``wq_b`` then runs inside the op."""
-        if quantized_query is not None:
+        ``rotated_query`` is that query already rotated by ``rotary_emb`` and
+        quantized, as ``rotated_query_jax`` returns it, when the caller
+        already has that."""
+        if rotated_query is not None:
             assert projected_q is None
-            query_args = (*quantized_query, self.wq_b.weight, self.wq_b.weight_scale)
-            indexer_op = self.fp8_query_indexer_op
+            query_args = rotated_query
+            indexer_op = self.rotated_query_indexer_op
         else:
             if projected_q is None:
                 projected_q, _ = self.wq_b(query)
-            query_args = (projected_q.view(-1, self.n_head, self.head_dim),)
+            query_args = (
+                projected_q.view(-1, self.n_head, self.head_dim),
+                positions,
+                rotary_emb.cos_sin_cache,
+            )
             indexer_op = self.indexer_op
         num_tokens = query_args[0].shape[0]
 
@@ -363,8 +373,6 @@ class VllmDeepseekV4Indexer(DeepseekV4Indexer):
 
         return indexer_op(
             *query_args,
-            positions,
-            rotary_emb.cos_sin_cache,
             indexer_weights,
             kv_cache,
             idx_seq_lens,
