@@ -86,6 +86,13 @@ def mhc_post_2d(
             tb * hidden_size * (2 + 2 * hc_mult * 2) * 2 + tb * hidden_size * 4 * 2
         )
 
+    # Rows are independent: a block that divides the token count (e.g. 32 for
+    # the 288-row decode batch) skips padding copies of the whole residual.
+    exact = token_block_size
+    while exact > 16 and num_tokens % exact:
+        exact //= 2
+    if num_tokens % exact == 0:
+        token_block_size = exact
     tb, padded_tokens = utils.select_token_block(
         num_tokens,
         token_block_size,
