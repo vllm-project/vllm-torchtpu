@@ -190,6 +190,7 @@ def _deserialize_entry(entry: Any) -> Callable[..., Any]:
 
 def _get_num_compilations() -> int:
     """Return torch_tpu's cumulative CompileAndLoad count."""
+    # pyrefly: ignore[missing-attribute]
     return int(torch.tpu._get_cache_stats().num_compilations)
 
 
@@ -203,6 +204,7 @@ def _clear_tpu_tier1_cache() -> None:
             "inspect TpuCompilerAdaptor reload logs or stats.num_compilations "
             "instead."
         )
+    # pyrefly: ignore[missing-attribute]
     torch.tpu._clear_cache()
 
 
