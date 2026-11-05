@@ -658,3 +658,201 @@ def test_op_body_pads_a_call_between_kernel_sizes(
         assert calls == [want]
         expected = jnp.where(rows < n_valid, 2.0, 0.0).astype(x.dtype)
     assert bool(jnp.all(out == expected[None]))
+
+
+def _reference_ep_moe(
+    x, w1, w2, w1_scale, w2_scale, w1_bias, w2_bias, topk_weights, topk_ids, e0, **kw
+):
+    """fused_moe_func's EP result in plain JAX: each row's weighted sum over
+    the routes that land on this rank's experts, [experts_start, + local)."""
+    import jax
+    import jax.numpy as jnp
+
+    local_ids = topk_ids - e0
+    inter = w2.shape[1]
+    out = jnp.zeros(x.shape, jnp.float32)
+    for e in range(w1.shape[0]):
+        weight = jnp.where(local_ids == e, topk_weights.astype(jnp.float32), 0.0)
+        gate_up = x.astype(jnp.float32) @ w1[e].astype(jnp.float32)
+        act = jax.nn.silu(gate_up[:, :inter]) * gate_up[:, inter:]
+        out += jnp.sum(weight, 1)[:, None] * (act @ w2[e].astype(jnp.float32))
+    return out.astype(x.dtype)
+
+
+@pytest.mark.parametrize("tokens", [512, 4096])
+def test_ep_split_body_gives_each_core_its_rows_of_the_psum_path(monkeypatch, tokens):
+    """TPU_PREFILL_SEQ_PARALLEL_EP: four "ranks" under vmap, each holding its
+    own rows (`own_rows`; 4096 tokens take 2 combine chunks), route them,
+    gather rows and routes, run their experts and shared slice on every row
+    and reduce-scatter. Each rank's output equals its rows of what the psum
+    path gives every rank from all rows."""
+    import jax
+    import jax.numpy as jnp
+    import numpy as np
+    from jax.experimental import pallas as pl
+
+    from vllm_torchtpu.kernels.experimental.fused_moe_prefill import (
+        fused_moe_prefill_kernel_v2 as v2,
+    )
+
+    pallas_call = pl.pallas_call
+    monkeypatch.setattr(
+        pl,
+        "pallas_call",
+        lambda *a, **k: pallas_call(*a, **{**k, "interpret": pltpu.InterpretParams()}),
+    )
+    monkeypatch.setattr(moe_tp_decode, "fused_moe_func", _reference_ep_moe)
+    monkeypatch.setattr(
+        moe_tp_decode.kernel, "can_use_moe_tp_decode", lambda *a, **k: False
+    )
+    ranks, hidden, experts, inter, shared = 4, 256, 8, 128, 64
+    local = experts // ranks
+    statics = moe_tp_decode._OpStatics(
+        topk=4,
+        routed_scale=ROUTED_SCALE,
+        activation="silu",
+        use_sparse_core=False,
+        onehot_threshold=0,
+        use_ep=True,
+    )
+    rng = np.random.default_rng(0)
+
+    def array(shape, dtype, scale=1.0):
+        return jnp.asarray(rng.standard_normal(shape) * scale, dtype)
+
+    x = array((tokens, hidden), jnp.bfloat16)
+    scores = jax.nn.sigmoid(array((tokens, experts), jnp.float32))
+    bias = array((experts,), jnp.float32, 0.1)
+    pad_mask = jnp.arange(tokens) >= tokens - 37
+    per_rank = (
+        array((ranks, local, hidden, 2 * inter), jnp.bfloat16, 0.05),
+        array((ranks, local, inter, hidden), jnp.bfloat16, 0.05),
+        jnp.ones((ranks, local, 1, 2 * inter), jnp.float32),
+        jnp.ones((ranks, local, 1, hidden), jnp.float32),
+        array((ranks, hidden, 2 * shared), jnp.float8_e4m3fn, 0.3),
+        jnp.asarray(rng.uniform(0.01, 0.02, (ranks, 2 * shared)), jnp.float32),
+        array((ranks, shared, hidden), jnp.float8_e4m3fn, 0.3),
+        jnp.asarray(rng.uniform(0.01, 0.02, (ranks, hidden)), jnp.float32),
+        jnp.arange(ranks, dtype=jnp.int32).reshape(ranks, 1, 1),
+        (jnp.arange(ranks, dtype=jnp.int32) * local).reshape(ranks, 1, 1),
+    )
+
+    def run(body, rows, row_scores):
+        in_axes = (0, 0, None, None) + (0,) * len(per_rank)
+        return jax.jit(jax.vmap(body, in_axes=in_axes, axis_name="ep"))(
+            rows, row_scores, bias, pad_mask, *per_rank
+        )
+
+    every_row = moe_tp_decode._op_body(statics, ranks, "ep")
+    full = run(every_row, jnp.stack([x] * ranks), jnp.stack([scores] * ranks))
+    own = [
+        jnp.stack([v2.own_rows(a, r, ranks) for r in range(ranks)]) for a in (x, scores)
+    ]
+    split = run(moe_tp_decode._ep_split_body(statics, ranks, "ep"), *own)
+
+    assert split.shape == (ranks, tokens // ranks, hidden)
+    for r in range(ranks):
+        want = np.asarray(v2.own_rows(full[0], r, ranks), np.float32)
+        got = np.asarray(split[r], np.float32)
+        np.testing.assert_allclose(got, want, atol=2e-2 * np.abs(want).max())
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_token_split_arms_an_expert_parallel_layer_only_when_asked(
+    monkeypatch, enabled
+):
+    """TPU_PREFILL_SEQ_PARALLEL_EP: an armed EP layer gets the split op and
+    the slot, with the decode kernel's largest token count as its cut-over;
+    without the switch it keeps its path."""
+    statics = moe_tp_decode._OpStatics(
+        topk=TOPK,
+        routed_scale=ROUTED_SCALE,
+        activation="silu",
+        use_sparse_core=False,
+        onehot_threshold=0,
+        use_ep=True,
+    )
+    mesh, op, split_op, rank, slot = (object() for _ in range(5))
+    monkeypatch.setattr(moe_tp_decode, "_OPS", {(mesh, statics, False, False): op})
+    monkeypatch.setattr(
+        moe_tp_decode,
+        "_get_op",
+        lambda m, st, prequant=False, split=False: split_op
+        if (m, st, prequant, split) == (mesh, statics, False, True)
+        else None,
+    )
+    monkeypatch.setattr(envs, "TPU_PREFILL_SEQ_PARALLEL_EP", enabled)
+    method = SimpleNamespace(**{moe_tp_decode._OP_ATTR: op})
+    layer = SimpleNamespace(quant_method=method, _moe_tp_decode_rank=rank)
+
+    armed = moe_tp_decode.arm_token_split_op(layer, slot)
+
+    if not enabled:
+        assert armed is None
+        assert not hasattr(layer, moe_tp_decode.TOKEN_SPLIT_MOE_ATTR)
+        return
+    assert armed == (mesh, max(moe_tp_decode.kernel.ROW_BUCKETS), rank)
+    assert getattr(method, moe_tp_decode._OP_SPLIT_ATTR) is split_op
+    assert getattr(layer, moe_tp_decode.TOKEN_SPLIT_MOE_ATTR) is slot
+
+
+class _OpMesh:
+    """A hashable stand-in for the op's 16-core mesh."""
+
+    axis_names = ("ep",)
+    size = 16
+
+
+def _ep_statics(use_ep):
+    return moe_tp_decode._OpStatics(
+        topk=TOPK,
+        routed_scale=ROUTED_SCALE,
+        activation="silu",
+        use_sparse_core=False,
+        onehot_threshold=0,
+        use_ep=use_ep,
+    )
+
+
+@pytest.fixture
+def built_bodies(monkeypatch):
+    """The real _get_op with shard_map and jax_op passed through: the bodies
+    it builds, as (kind, arguments)."""
+    import jax
+
+    bodies = []
+    monkeypatch.setattr(moe_tp_decode, "_OPS", {})
+    monkeypatch.setattr(jax, "shard_map", lambda body, **kwargs: body)
+    monkeypatch.setattr(
+        moe_tp_decode.pallas,
+        "jax_op",
+        lambda name, fn, **kwargs: SimpleNamespace(register_fake=lambda fake: None),
+    )
+    for kind in ("_ep_split_body", "_split_body"):
+        monkeypatch.setattr(
+            moe_tp_decode,
+            kind,
+            lambda *args, kind=kind: bodies.append((kind, args)),
+        )
+    return bodies
+
+
+def test_get_op_builds_the_ep_split_body_for_an_ep_layer(built_bodies):
+    """TPU_PREFILL_SEQ_PARALLEL_EP: the split op of an EP layer runs
+    _ep_split_body over the op's 16 ranks."""
+    statics, mesh = _ep_statics(True), _OpMesh()
+    moe_tp_decode._get_op(mesh, statics, split=True)
+    assert built_bodies == [("_ep_split_body", (statics, 16, "ep"))]
+
+
+def test_get_op_keeps_the_tp_split_body_for_a_tp_layer(built_bodies):
+    statics, mesh = _ep_statics(False), _OpMesh()
+    moe_tp_decode._get_op(mesh, statics, split=True)
+    assert built_bodies == [("_split_body", (statics, 16, "ep", None))]
+
+
+def test_get_op_refuses_the_prequant_ep_split(built_bodies):
+    """The EP split body takes no pre-quantized rows."""
+    with pytest.raises(AssertionError):
+        moe_tp_decode._get_op(_OpMesh(), _ep_statics(True), prequant=True, split=True)
+    assert built_bodies == []

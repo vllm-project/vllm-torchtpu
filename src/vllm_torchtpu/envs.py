@@ -339,6 +339,7 @@ if TYPE_CHECKING:
     TPU_FUSED_NORM_QKVA: bool = False
     TPU_PREFILL_SEQ_PARALLEL: bool = False
     TPU_PREFILL_SEQ_PARALLEL_MIN_TOKENS: int = 256
+    TPU_PREFILL_SEQ_PARALLEL_EP: bool = False
     TPU_MOE_PREFILL_GATHER_ONCE: bool = False
     TPU_MOE_PREFILL_ROTATED_COLLECTIVES: bool = False
     TPU_MOE_PREFILL_COMBINE_SCATTER: bool = False
@@ -2464,6 +2465,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_PREFILL_SEQ_PARALLEL_MIN_TOKENS": env_int(
         "TPU_PREFILL_SEQ_PARALLEL_MIN_TOKENS", 256
     ),
+    # TPU_PREFILL_SEQ_PARALLEL with expert-parallel MoE layers
+    # (--enable-expert-parallel, no stage-A prefill kernel): the split also
+    # arms on them. Each core routes its own rows, all-gathers the rows and
+    # their routes, runs the layer's EP experts and its slice of the shared
+    # expert on every row as today, and reduce-scatters the sum instead of
+    # all-reducing it, so the residual stream stays split across the layer.
+    # Same terms in every sum; the reduce-scatter may add them in another order.
+    # Migration switch: delete it, arming EP layers whenever
+    # TPU_PREFILL_SEQ_PARALLEL is on, once an EP model's serving run shows the
+    # split no slower at every prefill size.
+    "TPU_PREFILL_SEQ_PARALLEL_EP": env_bool("TPU_PREFILL_SEQ_PARALLEL_EP"),
     # TPU_PREFILL_SEQ_PARALLEL: the split MoE op all-gathers each core's rows
     # once, in core order, instead of once per combine chunk: the routes, their
     # weights and the row scales as one int32 all-gather with one value per
