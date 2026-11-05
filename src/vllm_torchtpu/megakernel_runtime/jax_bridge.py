@@ -13,23 +13,24 @@
 # limitations under the License.
 """Generic torch <-> jax step bridge (no `megakernel` library imports).
 
-- `sharded_jax_callable`: wraps an SPMD JAX function over a mesh into a
-  `torch_tpu` `JaxCallable` (operands as positional tensors; callers pass
-  variable-length groups such as weights / pools as `list[Tensor]` custom-op
-  arguments and flatten them).
+- `sharded_jax_callable`: an SPMD JAX function over a mesh as a `torch_tpu`
+  `JaxCallable`, built by torch_tpu's own `pallas.custom_jax_kernel` (the
+  builder `pallas.jax_op` uses), for callers that wrap it in their own custom
+  op (e.g. to take `list[Tensor]` arguments past the 64-argument schema
+  limit of a `torch.library` op).
 - `make_typed_step_wrapper`: a fixed-arity, `jax.Array`-annotated wrapper of a
   `*args` step function (`JaxCallable` rejects `*args` signatures).
 - `torch_cpu_to_jax` / `jax_to_torch_cpu`: lossless CPU conversions for the
   CPU interpret path of unit tests.
 - `build_jax_step_op`: a JAX step function as a torch callable (a
-  `torch.library` custom op): `sharded_jax_callable` on TPU, the function run
-  by JAX on CPU otherwise, with donated outputs copied back into their input
-  tensors in place.
+  `torch.library` custom op over a `list[Tensor]` of operands):
+  `sharded_jax_callable` with TPU tensors, the function run by JAX with CPU
+  tensors, with donated outputs copied back into their input tensors in
+  place.
 """
 
 from __future__ import annotations
 
-import inspect
 import itertools
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any
@@ -40,6 +41,8 @@ import numpy as np
 import torch
 from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
+
+from vllm_torchtpu.distributed.pallas_shapes import get_global_shape, get_local_shape
 
 
 def _leaf_output_specs(output_partition_specs: Any) -> list[P]:
@@ -56,58 +59,26 @@ def sharded_jax_callable(
     output_partition_specs: Any,
     donate_argnums: Sequence[int] | None = None,
 ) -> Any:
-    """Wrap an SPMD JAX function over `mesh` into a `torch_tpu` `JaxCallable`.
+    """`fn`, an SPMD JAX function over `mesh`, as a `torch_tpu` `JaxCallable`.
 
-    Self-contained: it depends on no `vllm`, `vllm_torchtpu.distributed` or
-    `megakernel` module.
+    Called with this rank's shards of the operands (`input_partition_specs`
+    describe the global arrays), it returns this rank's shards of the
+    outputs (`output_partition_specs`). Every parameter of `fn` must be an
+    array (no static arguments). The callable is the one `pallas.jax_op`
+    would build, without registering a custom op.
     """
     from torch_tpu._internal.pallas import pallas as pallas_impl
 
-    if "::" not in name or len(name.split("::")) != 2:
-        raise ValueError(f"Op name {name} must be 'namespace::op', with one '::'.")
-
-    init_sig = inspect.signature(pallas_impl.JaxCallable.__init__)
-    if "output_partition_specs" not in init_sig.parameters:
-        raise RuntimeError(
-            "torch_tpu.JaxCallable.__init__ does not support 'output_partition_specs'; "
-            "upgrade torch_tpu to use sharded_jax_callable."
-        )
-
-    signature = inspect.signature(inspect.unwrap(fn), eval_str=True)
-    pallas_impl._verify_signature(signature)
-    static_argnums = pallas_impl._infer_static_argnums(signature)
-    input_partition_specs = tuple(input_partition_specs)
-    out_shardings = jax.tree.map(
-        lambda s: NamedSharding(mesh, s),
-        output_partition_specs,
-        is_leaf=lambda s: isinstance(s, P),
-    )
-
-    jit_fn = jax.jit(
+    if name.count("::") != 1:
+        raise ValueError(f"op name {name!r} must be 'namespace::op', with one '::'")
+    return pallas_impl.custom_jax_kernel(
         fn,
-        static_argnums=static_argnums,
-        donate_argnums=donate_argnums,
-        out_shardings=out_shardings,
-        keep_unused=True,
-    )
-    trace_key = pallas_impl._get_kernel_invocation_key(
-        f"{name}_{id(fn)}",
-        [],
-        {
-            "static_argnums": static_argnums,
-            "donate_argnums": donate_argnums,
-            "output_partition_specs": str(output_partition_specs),
-        },
-    )
-    return pallas_impl.JaxCallable(
-        name=name,
-        jit_fn=jit_fn,
-        trace_key=trace_key,
+        name,
+        donate_argnums=list(donate_argnums) if donate_argnums else None,
         mesh=mesh,
-        input_partition_specs=input_partition_specs,
+        input_partition_specs=tuple(input_partition_specs),
         output_partition_specs=tuple(_leaf_output_specs(output_partition_specs)),
-        static_argnums=static_argnums,
-        donate_argnums=donate_argnums,
+        warn_deprecated=False,
     )
 
 
@@ -184,17 +155,37 @@ def _jax_to_torch(a: jax.Array) -> torch.Tensor:
     return jax_to_torch_cpu(a, torch.empty((), dtype=dtype))
 
 
-def _eval_shapes(
-    fn: Callable[..., Any], operands: Sequence[torch.Tensor], n_out: int
+def _out_structs(
+    fn: Callable[..., Any],
+    operands: Sequence[torch.Tensor],
+    n_out: int,
+    *,
+    mesh: jax.sharding.Mesh | None = None,
+    in_specs: Sequence[P] = (),
+    out_specs: Sequence[P] = (),
 ) -> list[jax.ShapeDtypeStruct]:
-    structs = [
-        jax.ShapeDtypeStruct(tuple(t.shape), _TORCH_TO_JAX_DTYPE[t.dtype])
-        for t in operands
-    ]
+    """The outputs' shapes and dtypes for `operands`.
+
+    With `mesh`, the operands are this rank's shards: they are scaled to the
+    global shapes by `in_specs`, `fn`'s global outputs are shrunk to this
+    rank's shards by `out_specs` (what torch_tpu's `JaxCallable` returns).
+    Without, the operands and outputs are the global arrays.
+    """
+    structs = []
+    for i, t in enumerate(operands):
+        shape = tuple(t.shape)
+        if mesh is not None:
+            shape = get_global_shape(shape, mesh, in_specs[i])
+        structs.append(jax.ShapeDtypeStruct(shape, _TORCH_TO_JAX_DTYPE[t.dtype]))
     outs = jax.tree.leaves(jax.eval_shape(fn, *structs))
     if len(outs) != n_out:
         raise ValueError(f"step returned {len(outs)} outputs, out_specs has {n_out}")
-    return outs
+    if mesh is None:
+        return outs
+    return [
+        jax.ShapeDtypeStruct(get_local_shape(o.shape, mesh, spec), o.dtype)
+        for o, spec in zip(outs, out_specs, strict=True)
+    ]
 
 
 def build_jax_step_op(
@@ -209,19 +200,26 @@ def build_jax_step_op(
 ) -> Callable[..., Any]:
     """A JAX step function as a torch callable over positional tensors.
 
-    `fn(*arrays)` is an SPMD JAX function over `mesh` whose operands are
-    sharded by `in_specs` and outputs by `out_specs` (one `PartitionSpec`:
-    the callable returns one tensor; a sequence: a tuple). `donate` maps an
-    output index to the input it updates: that input's buffer is donated on
-    TPU, and the output is copied back into the input tensor in place
-    (`data_ptr()` is preserved) and returned as that tensor.
+    `fn(*arrays)` is an SPMD JAX function over `mesh` whose (global) operands
+    are sharded by `in_specs` and outputs by `out_specs` (one
+    `PartitionSpec`: the callable returns one tensor; a sequence: a tuple).
+    `donate` maps an output index to the input it updates: that input's
+    buffer is donated on TPU, and the output is copied back into the input
+    tensor in place (`data_ptr()` is preserved) and returned as that tensor.
 
-    The callable runs a `torch.library` custom op (a fake kernel from
-    `jax.eval_shape` keeps it traceable by `torch.compile`): with TPU tensors
-    it calls `sharded_jax_callable`, built on first use; with CPU tensors JAX
-    runs `fn` on its CPU devices (`interpret_on_cpu=False` makes that an
-    error). Kernels that need Pallas interpret mode on CPU choose it inside
-    `fn`.
+    The callable runs a `torch.library` custom op, named `name` (default
+    `megakernel_runtime::jax_step`; a name without a namespace gets
+    `megakernel_runtime::`) plus a per-op `_<n>` suffix, so every build
+    registers a new op.
+    - With TPU tensors it calls `sharded_jax_callable` (built on first use):
+      each rank passes its shards of the operands and gets its shards of the
+      outputs.
+    - With CPU tensors (unit tests) JAX runs `fn` in this process over the
+      whole mesh: the operands and outputs are the global arrays
+      (`interpret_on_cpu=False` makes that an error). Kernels that need
+      Pallas interpret mode on CPU choose it inside `fn`.
+    The op's fake kernel (from `jax.eval_shape`) gives the outputs those
+    shapes, so `torch.compile` can trace it.
     """
     single = isinstance(out_specs, P)
     outs_specs: tuple[P, ...] = (out_specs,) if single else tuple(out_specs)
@@ -230,14 +228,17 @@ def build_jax_step_op(
     aliases = dict(donate or {})
     for o, i in aliases.items():
         if not (0 <= o < n_out and 0 <= i < n_in):
-            raise ValueError(f"donate maps output {o} to input {i}: out of range")
+            raise ValueError(
+                f"donate maps output {o} to input {i}: out of range for "
+                f"{n_out} outputs and {n_in} inputs"
+            )
     if len(set(aliases.values())) != len(aliases):
-        raise ValueError("donate maps two outputs to one input")
+        raise ValueError(f"donate maps two outputs to one input: {aliases}")
     op_id = next(_OP_IDS)
-    if name is None:
-        name = f"megakernel_runtime::jax_step_{op_id}"
-    elif "::" not in name:
-        name = f"megakernel_runtime::{name}_{op_id}"
+    base = name or "jax_step"
+    if "::" not in base:
+        base = f"megakernel_runtime::{base}"
+    name = f"{base}_{op_id}"
 
     def tuple_fn(*args: Any) -> tuple[Any, ...]:
         out = fn(*args)
@@ -281,11 +282,20 @@ def build_jax_step_op(
     @op.register_fake
     def _(operands: list[torch.Tensor]) -> list[torch.Tensor]:
         dev = operands[0].device
+        sharded = dev.type != "cpu"
+        structs = _out_structs(
+            tuple_fn,
+            operands,
+            n_out,
+            mesh=mesh if sharded else None,
+            in_specs=ins_specs,
+            out_specs=outs_specs,
+        )
         return [
             torch.empty(
                 s.shape, dtype=_JAX_TO_TORCH_DTYPE[jnp.dtype(s.dtype)], device=dev
             )
-            for s in _eval_shapes(tuple_fn, operands, n_out)
+            for s in structs
         ]
 
     def step(*operands: torch.Tensor) -> Any:
@@ -301,6 +311,7 @@ def build_jax_step_op(
         return res[0] if single else tuple(res)
 
     step.op = op  # type: ignore[attr-defined]
+    step.op_name = name  # type: ignore[attr-defined]
     return step
 
 
