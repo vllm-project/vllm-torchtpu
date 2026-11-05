@@ -209,7 +209,7 @@ class GQAModule(Module):
 
     def _check_pool_layout(self, plan: Any) -> None:
         """`pool_layout` must give the same pool pages as the model's pool
-        backend layout, which the cache pipes allocate and fill."""
+        backend layout (`model_spec.cache_backend.layout`)."""
         pb = plan.model_spec.cache_backend
         lay = None if pb is None else pb.layout
         if self.pool_layout is None or lay is None:

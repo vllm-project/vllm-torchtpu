@@ -166,9 +166,9 @@ def derive_params(
     KV_ITEM = 2 * (g.HD // 4) * BLK * 4
     EBROWS = tiles.ebank // 128
     # KVE stages KV blocks in the (idle) expert ring. On TPU this aliases the
-    # untyped byte pool `epool` via `pool_alias.view`; in CPU interpret mode
-    # `vmem.build_scratch` allocates a separate typed `epool`, so the
-    # aliasing itself is only exercised on TPU (the KV math is shared).
+    # untyped byte pool `epool` via `pool_alias.view`; in CPU interpret mode a
+    # separate typed `epool` is allocated, so the byte-pool aliasing itself is
+    # only exercised on TPU (the KV math is shared).
     KVE = bool(
         cache_exec(ex).paged_kv
         and tt.kv_ering
