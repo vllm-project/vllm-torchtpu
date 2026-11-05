@@ -3,7 +3,7 @@
 """Typed DSV41 serving policy at vLLM's out-of-tree configuration boundary."""
 
 import os
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from enum import StrEnum
 from typing import TYPE_CHECKING
 
@@ -30,15 +30,23 @@ class MoEBackend(StrEnum):
 class DeepseekV41Config:
     execution: ExecutionMode = ExecutionMode.FULL
     moe: MoEBackend = MoEBackend.GMM
+    # A static expert layout for the fused EP MoE path: a shipped layout's
+    # name, a path or a gs:// URI (vllm_torchtpu/expert_placement.py). None
+    # keeps the checkpoint's contiguous expert blocks.
+    expert_layout: str | None = None
 
     @classmethod
     def parse(cls, value: dict) -> "DeepseekV41Config":
-        unknown = value.keys() - {"execution", "moe"}
+        unknown = value.keys() - {"execution", "moe", "expert_layout"}
         if unknown:
             raise ValueError(f"Unknown deepseek_v41 config fields: {sorted(unknown)}")
+        layout = value.get("expert_layout")
+        if layout is not None and not isinstance(layout, str):
+            raise TypeError("deepseek_v41.expert_layout must be a string or null")
         return cls(
             execution=ExecutionMode(value.get("execution", "full")),
             moe=MoEBackend(value.get("moe", "gmm")),
+            expert_layout=layout or None,
         )
 
     @classmethod
@@ -53,7 +61,13 @@ class DeepseekV41Config:
             return cls.from_legacy_env()
         if not isinstance(value, dict):
             raise TypeError("additional_config.deepseek_v41 must be an object")
-        return cls.parse(value)
+        policy = cls.parse(value)
+        if policy.expert_layout is None and envs.TPU_EXPERT_PLACEMENT:
+            # The harness alias fills in a field the typed policy left out;
+            # validate_environment rejects a value that disagrees with one it
+            # did set.
+            policy = replace(policy, expert_layout=envs.TPU_EXPERT_PLACEMENT)
+        return policy
 
     @classmethod
     def from_legacy_env(cls) -> "DeepseekV41Config":
@@ -64,13 +78,18 @@ class DeepseekV41Config:
             moe=MoEBackend.FUSED_EP_W4A8
             if envs.USE_MOE_FUSED_EP_KERNEL and envs.MOE_FUSED_EP_ENABLE_W4A8
             else MoEBackend.GMM,
+            expert_layout=envs.TPU_EXPERT_PLACEMENT or None,
         )
 
     def publish(self, config: "VllmConfig") -> None:
         # Canonical defaults participate in vLLM's config hash and worker copies.
         assert isinstance(config.additional_config, dict)
-        config.additional_config["deepseek_v41"] = asdict(self)
-        logger.info("[DSV41] resolved serving policy: %s", asdict(self))
+        resolved = asdict(self)
+        if resolved["expert_layout"] is None:
+            # Absent and null read the same; keep the published form minimal.
+            del resolved["expert_layout"]
+        config.additional_config["deepseek_v41"] = resolved
+        logger.info("[DSV41] resolved serving policy: %s", resolved)
 
 
 def validate_environment(policy: DeepseekV41Config) -> None:
@@ -100,6 +119,16 @@ def validate_environment(policy: DeepseekV41Config) -> None:
                 "deepseek_v41 instead",
                 name,
             )
+    if "TPU_EXPERT_PLACEMENT" in os.environ:
+        if (envs.TPU_EXPERT_PLACEMENT or None) != policy.expert_layout:
+            raise ValueError(
+                "TPU_EXPERT_PLACEMENT conflicts with deepseek_v41.expert_layout; "
+                "remove the environment variable"
+            )
+        logger.warning_once(
+            "[DSV41] TPU_EXPERT_PLACEMENT is deprecated; use --additional-config "
+            "deepseek_v41.expert_layout instead"
+        )
     if policy.moe == MoEBackend.FUSED_EP_W4A8:
         if envs.MOE_FUSED_EP_KERNEL_IMPL not in (None, "v2", "push"):
             raise ValueError(
@@ -171,6 +200,28 @@ def verify_and_update_config(config: "VllmConfig") -> None:
         assert config.model_config is not None
         if config.model_config.hf_config.expert_dtype != "fp4":
             raise ValueError("fused_ep_w4a8 requires FP4 expert weights")
+    if policy.expert_layout is not None:
+        from vllm_torchtpu import expert_placement
+
+        if policy.moe != MoEBackend.FUSED_EP_W4A8:
+            raise ValueError(
+                "deepseek_v41.expert_layout places experts for the fused EP "
+                "kernel; it requires moe=fused_ep_w4a8"
+            )
+        if getattr(parallel, "enable_eplb", False):
+            raise ValueError("deepseek_v41.expert_layout cannot be combined with EPLB")
+        if getattr(parallel, "expert_placement_strategy", "linear") != "linear":
+            raise ValueError(
+                "deepseek_v41.expert_layout requires expert_placement_strategy=linear"
+            )
+        if envs.TPU_MOE_HIERARCHICAL_EP:
+            raise ValueError(
+                "deepseek_v41.expert_layout cannot be combined with "
+                "TPU_MOE_HIERARCHICAL_EP"
+            )
+        # Resolve and parse now, so a bad name or table fails at configuration
+        # rather than inside a worker's weight load.
+        expert_placement.static_placement(config)
     if policy.execution == ExecutionMode.CED:
         if parallel.prefill_context_parallel_size != 1:
             raise ValueError("CED requires prefill-context-parallel-size=1")

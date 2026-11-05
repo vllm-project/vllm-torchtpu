@@ -235,6 +235,7 @@ def _build_op(
         has_expert_load,
         envs.MOE_FUSED_EP_KERNEL_IMPL,
         tuple(sorted(impl_kw.items())),
+        has_expert_slot,
     )
     cached = _OPS.get(key)
     if cached is not None:
@@ -550,6 +551,48 @@ def _build_op(
     op.register_fake(_fake)
     _OPS[key] = op
     return op
+
+
+# The dtype each optional operand is handed to fused_ep_moe_v2 in; None keeps it.
+_OPERAND_DTYPES = {
+    "score_bias": jnp.float32,
+    "hash_topk_ids": jnp.int32,
+    "expert_slot": None,
+    "expert_load": jnp.int32,
+    **dict.fromkeys(("shared_w13", "shared_s13", "shared_w2", "shared_s2")),
+}
+_SHARED_OPERANDS = ("shared_w13", "shared_s13", "shared_w2", "shared_s2")
+
+
+def _operand_fn(call, names, outputs=1):
+    """`call` behind the signature (x, w1, w2, w1_scale, w2_scale, gating,
+    rank, *names), every operand annotated jax.Array as torch_tpu requires.
+
+    The three fixed-arity functions in _build_op cover the unplaced layers and
+    keep their programs as they were; every combination with a slot table goes
+    through here instead of one more hand-written function per combination.
+    """
+    import inspect
+
+    fixed = ("x", "w1", "w2", "w1_scale", "w2_scale", "gating", "rank")
+
+    def fn(*operands):
+        extra = dict(zip(names, operands[len(fixed) :], strict=True))
+        kw = {
+            n: v if _OPERAND_DTYPES[n] is None else v.astype(_OPERAND_DTYPES[n])
+            for n, v in extra.items()
+        }
+        return call(*operands[: len(fixed)], **kw)
+
+    param = inspect.Parameter.POSITIONAL_OR_KEYWORD
+    ret = jax.Array if outputs == 1 else tuple[(jax.Array,) * outputs]
+    fn.__signature__ = inspect.Signature(  # type: ignore[attr-defined]
+        [inspect.Parameter(n, param, annotation=jax.Array) for n in fixed + names],
+        return_annotation=ret,
+    )
+    fn.__annotations__ = {n: jax.Array for n in fixed + names} | {"return": ret}
+    fn.__name__ = "moe_with_" + "_".join(names)
+    return fn
 
 
 def fused_moe_ep(
