@@ -155,7 +155,11 @@ def sparse_attention(
         local_key,
         pos % block_size + 1,
         sm_scale=sm_scale,
-        block_q=msa_attention.DEFAULT_BLOCK_Q,
+        block_q=(
+            msa_attention.SMALL_BATCH_BLOCK_Q
+            if q.shape[0] <= msa_attention.SMALL_BATCH_TOKENS
+            else msa_attention.DEFAULT_BLOCK_Q
+        ),
         pages_per_step=msa_attention.DEFAULT_PAGES_PER_STEP,
         page_table=block_tables_2d.reshape(-1),
         interpret=interpret,
