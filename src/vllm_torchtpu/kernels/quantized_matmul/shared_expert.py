@@ -91,16 +91,6 @@ def silu_and_mul_with_clamp(gate, up, limit):
     return (gate * sig.astype(gate.dtype)) * up
 
 
-def _silu_and_mul_with_clamp_f32(gate, up, limit):
-    """`silu_and_mul_with_clamp` as XLA computes it inside one fusion: the bf16
-    roundings between its elementwise ops are dropped (excess precision), so
-    only the result is rounded."""
-    gate = jnp.minimum(gate, jnp.asarray(limit, gate.dtype)).astype(jnp.float32)
-    up = jnp.clip(up, jnp.asarray(-limit, up.dtype), jnp.asarray(limit, up.dtype))
-    sig = 1.0 / (jnp.exp(-gate) + 1.0)
-    return ((gate * sig) * up.astype(jnp.float32)).astype(up.dtype)
-
-
 def _kernel(
     x,
     w13,
@@ -219,7 +209,7 @@ def _kernel(
             )
             for c, col in enumerate((i * width, inter + i * width))
         ]
-        a = _silu_and_mul_with_clamp_f32(*zs, limit)
+        a = silu_and_mul_with_clamp(*zs, limit)
         h[:, pl.ds(i * width, width)] = a
         m = jnp.max(jnp.abs(a.astype(jnp.float32)), axis=1, keepdims=True)
         hmax[...] = m if i == 0 else jnp.maximum(hmax[...], m)
