@@ -467,6 +467,8 @@ FRONT_SWITCHES = (
     "exchange_row_gather+early_row_gather+table_kernel+exchange_tables",
     "i32_scale_slab",
     "vmem_combine",
+    "exchange_row_gather+table_kernel+exchange_tables+light_prepush",
+    "table_kernel+kernel_plan_tables+light_prepush",
 )
 
 
