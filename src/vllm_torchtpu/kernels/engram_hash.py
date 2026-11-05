@@ -79,6 +79,34 @@ def _remainder(high, low, prime):
     return rest
 
 
+# Above this a one-hot lookup costs more than the gather it replaces.
+_ONE_HOT_ENTRIES = 256
+
+
+def _lookup(table, index):
+    """``table[clip(index)]`` for a 1-D table; one-hot when the table is short.
+
+    XLA lowers a gather from a few dozen entries to a chain of selects with one
+    scalar operand per entry; comparing against the whole table is one fusion.
+    """
+    if table.shape[0] > _ONE_HOT_ENTRIES:
+        return jnp.take(table, index, mode="clip")
+    index = jnp.clip(index, 0, table.shape[0] - 1)
+    hit = index[..., None] == jnp.arange(table.shape[0], dtype=index.dtype)
+    return jnp.sum(jnp.where(hit, table, 0), axis=-1, dtype=table.dtype)
+
+
+def _shifted(values, ngram):
+    """``values[max(i - s, 0)]`` for s in range(ngram), as [count, ngram]."""
+    count = values.shape[0]
+    cols = []
+    for s in range(ngram):
+        keep = max(count - s, 0)
+        head = jnp.broadcast_to(values[:1], (count - keep,))
+        cols.append(jnp.concatenate([head, values[:keep]]))
+    return jnp.stack(cols, axis=1)
+
+
 @functools.partial(
     jax.jit,
     static_argnames=(
@@ -127,26 +155,26 @@ def engram_hash(
     rows = jnp.arange(count, dtype=jnp.int32)
     requests = jnp.sum(query_start_loc[None, 1:] <= rows[:, None], axis=1)
     requests = jnp.minimum(requests, lookback_token_ids.shape[0] - 1)
-    starts = jnp.minimum(clip(query_start_loc, requests), count - 1)
+    starts = jnp.minimum(_lookup(query_start_loc, requests), count - 1)
     chunk_positions = clip(positions, starts)
     shifts = jnp.arange(ngram, dtype=jnp.int32)
     past = positions[:, None] - shifts
     in_chunk = past >= chunk_positions[:, None]
-    indices = jnp.maximum(rows[:, None] - shifts, 0)
     mapped_batch = jnp.where(dead_mask, dead_id, clip(token_map, input_ids))
-    batch = clip(mapped_batch, indices)
+    batch = _shifted(mapped_batch, ngram)
     cols = chunk_positions[:, None] - 1 - past
     in_window = ~in_chunk & (cols >= 0) & (cols < lookback_depth)
     cols = jnp.clip(cols, 0, lookback_depth - 1)
     requests_col = requests[:, None]
-    window_ids = lookback_token_ids[requests_col, cols]
+    window_index = requests_col * lookback_token_ids.shape[1] + cols
+    window_ids = _lookup(lookback_token_ids.reshape(-1), window_index)
     known = in_window & (window_ids >= 0)
     mapped_lookback = jnp.where(
         lookback_dead_mask,
         dead_id,
         clip(token_map, jnp.maximum(lookback_token_ids, 0)),
     )
-    window = mapped_lookback[requests_col, cols]
+    window = _lookup(mapped_lookback.reshape(-1), window_index)
     if use_cache:
         logical = jnp.clip(past, 0, block_table.shape[1] * block_size - 1)
         blocks = block_table[requests_col, logical // block_size]
@@ -159,18 +187,19 @@ def engram_hash(
     source = jnp.where(in_chunk, batch, jnp.where(known, window, fallback))
     blocked = jnp.cumsum((past < 0) | (source == dead_id), axis=1) > 0
     source = jnp.where(blocked, pad_id, source).astype(jnp.uint32)
-    limbs = limbs.astype(jnp.uint32)
-    hashes = []
-    for layer in range(layers):
-        high = low = None
-        for shift in range(ngram):
-            term_high, term_low = _product(source[:, shift], limbs[layer, shift])
-            if shift == 0:
-                high, low = term_high, term_low
-                continue
-            high, low = high ^ term_high, low ^ term_low
-            prime = primes[layer, shift - 1].astype(jnp.uint32)
-            rest = _remainder(high[:, None], low[:, None], prime[None, :])
-            hashes.append(rest)
-    hashed = jnp.concatenate(hashes, axis=1).reshape(count, layers, -1)
+    # Every (layer, shift) at once, tokens on lanes: [L, N, T] products.
+    terms = _product(source.T[None], limbs.astype(jnp.uint32)[:, :, None])
+    high, low = terms[0][:, 0], terms[1][:, 0]
+    highs, lows = [], []
+    for shift in range(1, ngram):
+        high, low = high ^ terms[0][:, shift], low ^ terms[1][:, shift]
+        highs.append(high)
+        lows.append(low)
+    # [L, N-1, 1, T] against primes [L, N-1, H, 1] -> [L, N-1, H, T].
+    rest = _remainder(
+        jnp.stack(highs, axis=1)[:, :, None],
+        jnp.stack(lows, axis=1)[:, :, None],
+        primes.astype(jnp.uint32)[..., None],
+    )
+    hashed = rest.reshape(-1, count).T.reshape(count, layers, -1)
     return hashed.astype(jnp.int32) + offsets[None].astype(jnp.int32)
