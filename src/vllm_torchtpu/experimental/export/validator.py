@@ -461,10 +461,12 @@ def _check_draft(meta: dict[str, Any], functions: dict[str, Any]) -> None:
                 f"{hidden_in[0].get('shape')}, forward returns "
                 f"{hidden_out[0].get('dtype')}{hidden_out[0].get('shape')}"
             )
-        draft = [o for o in spec.get("outputs", []) if o.get("name") == "draft_tokens"]
+        draft_out = [
+            o for o in spec.get("outputs", []) if o.get("name") == "draft_tokens"
+        ]
         if (
-            len(draft) != 1
-            or draft[0].get("shape") != want_draft
-            or (canonical_dtype(draft[0].get("dtype", "")) != "i32")
+            len(draft_out) != 1
+            or draft_out[0].get("shape") != want_draft
+            or (canonical_dtype(draft_out[0].get("dtype", "")) != "i32")
         ):
             raise ValueError(f"{where} must return draft_tokens i32{want_draft}")

@@ -297,7 +297,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
 # Speculative methods the artifact can declare, with the fields each takes: ngram
 # drafts on the host from the sequence itself; mtp drafts with the model's MTP
-# layer, which the export lowers as `mtp_draft`.
+# layer (the adapter's `mtp_draft()`), which the export lowers as the drafter
+# `draft` / `draft_bucket{B}`.
 _SPECULATIVE_FIELDS = {
     "ngram": frozenset(
         {"method", "num_speculative_tokens", "prompt_lookup_max", "prompt_lookup_min"}

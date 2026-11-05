@@ -2789,10 +2789,15 @@ def test_mtp_needs_the_mtp_layer_among_the_parameters(tmp_path) -> None:
         _export_mtp(tmp_path, model_cls=_TinyMtpWithoutWeights)
 
 
-def test_validator_rejects_mtp_draft_missing_a_bucket(tmp_path) -> None:
+@pytest.mark.parametrize("method", validator.DRAFTER_METHODS)
+def test_validator_rejects_a_draft_missing_a_bucket(tmp_path, method) -> None:
+    # Every drafter method holds the artifact to the same `draft` contract.
     out_dir = _export_mtp(tmp_path)
     meta_path = Path(out_dir, "metadata.json")
     meta = json.loads(meta_path.read_text())
+    meta["serving_config"]["speculative_config"]["method"] = method
+    meta_path.write_text(json.dumps(meta))
+    validator.validate_exported_model_dir(out_dir)
     del meta["functions"]["draft"]["8"]
     meta_path.write_text(json.dumps(meta))
     with pytest.raises(ValueError, match="differ from forward buckets"):
