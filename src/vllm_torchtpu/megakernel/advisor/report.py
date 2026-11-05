@@ -811,15 +811,27 @@ def _render_decision_table_rows(sweep: AdvisorSweepReport) -> list[str]:
         gain_cls = "text-gain" if fg_val > 0 else "text-muted"
 
         verdict_str = entry.verdict
-        if verdict_str.startswith("tie"):
-            knob = (
-                verdict_str[verdict_str.find(":") + 1 : -1].strip()
-                if ":" in verdict_str
-                else ""
-            )
+        if verdict_str.startswith("tie(measure:"):
+            knob = verdict_str[len("tie(measure:") : -1].strip()
             verdict_cell = (
                 '<span class="verdict-tag verdict-tie">TIE</span>'
                 f'<div class="kpi-sub">measure: <code>{_esc(knob)}</code></div>'
+            )
+        elif verdict_str.startswith("tie(objective_split:"):
+            split_info = verdict_str[len("tie(objective_split:") : -1].strip()
+            if entry.recommended_scope in _MEGAKERNEL_LABELS:
+                label = _MEGAKERNEL_LABELS[entry.recommended_scope]
+                tag_cls = "verdict-fusion"
+            elif entry.recommended_scope == "single_layer":
+                label = "PER-LAYER FUSED KERNEL"
+                tag_cls = "verdict-layer"
+            else:
+                label = "SEPARATE OPS"
+                tag_cls = "verdict-separate"
+            verdict_cell = (
+                f'<span class="verdict-tag {tag_cls}">{label}</span>'
+                '<div class="kpi-sub">layout split: '
+                f"<code>{_esc(split_info)}</code></div>"
             )
         elif entry.recommended_scope in _MEGAKERNEL_LABELS:
             label = _MEGAKERNEL_LABELS[entry.recommended_scope]

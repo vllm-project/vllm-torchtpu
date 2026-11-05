@@ -212,3 +212,57 @@ def test_svg_bar_labels_and_step_band_domain_bounds(tmp_path: Path) -> None:
     assert "Disaggregated P/D DCN Handoff" in table_txt
     out_file = advisor_report.write_advisor_html(sweep, tmp_path / "advisor.html")
     assert out_file.read_text(encoding="utf-8").startswith("<!DOCTYPE html>")
+
+
+@pytest.mark.parametrize(
+    ("verdict", "scope", "expected_tag", "expected_sub"),
+    [
+        (
+            "tie(measure: launch_gap_us)",
+            "whole_step",
+            '<span class="verdict-tag verdict-tie">TIE</span>',
+            '<div class="kpi-sub">measure: <code>launch_gap_us</code></div>',
+        ),
+        (
+            "tie(objective_split: step=TP8xDP1, throughput=TP4xDP2)",
+            "whole_step",
+            '<span class="verdict-tag verdict-fusion">WHOLE-STEP MEGAKERNEL</span>',
+            (
+                '<div class="kpi-sub">layout split: '
+                "<code>step=TP8xDP1, throughput=TP4xDP2</code></div>"
+            ),
+        ),
+        (
+            "tie(objective_split: step=TP8, throughput=TP4)",
+            "single_layer",
+            '<span class="verdict-tag verdict-layer">PER-LAYER FUSED KERNEL</span>',
+            (
+                '<div class="kpi-sub">layout split: '
+                "<code>step=TP8, throughput=TP4</code></div>"
+            ),
+        ),
+    ],
+)
+def test_decision_table_verdict_tie_and_objective_split(
+    verdict: str,
+    scope: str,
+    expected_tag: str,
+    expected_sub: str,
+) -> None:
+    """Verify decision table renders distinct badges for ties vs objective splits."""
+    profile = advisor.resolve_model_profile("Qwen/Qwen3-30B-A3B-FP8")
+    chip = advisor.resolve_chip_spec("tpu7x")
+    sweep = advisor.advise_regimes(profile, chip)
+    assert sweep.regimes
+
+    entry0 = sweep.regimes[0]
+    custom_entry = dataclasses.replace(
+        entry0,
+        verdict=verdict,
+        recommended_scope=scope,
+    )
+    custom_sweep = dataclasses.replace(sweep, regimes=(custom_entry,))
+    rows = advisor_report._render_decision_table_rows(custom_sweep)
+    assert len(rows) == 2
+    assert expected_tag in rows[0]
+    assert expected_sub in rows[0]
