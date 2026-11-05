@@ -75,7 +75,7 @@ def fused_greedy_head(hidden: jax.Array, weight: jax.Array) -> jax.Array:
 
 
 def head_logits(hidden: jax.Array, weight: jax.Array) -> jax.Array:
-    """BF16 ``hidden @ weight.T`` for the original [vocab, K] weight, FP32-accumulated."""
+    """BF16 ``hidden @ weight.T`` for the [vocab, K] weight, FP32-accumulated."""
     rows, width = hidden.shape
     vocab, weight_width = weight.shape
     assert hidden.dtype == weight.dtype == jnp.bfloat16
