@@ -106,10 +106,8 @@ def _weights(seed):
     ],
 )
 def test_fused_shared_expert_is_bitwise_equal(compiled, tokens, pattern, seed):
-    from vllm_torchtpu.layers.adapter.linear_common import _fp8_swiglu_mlp_jax
-
     graph = str(
-        jax.make_jaxpr(lambda *a: _fp8_swiglu_mlp_jax(*a, limit=LIMIT))(
+        jax.make_jaxpr(lambda *a: se.fp8_swiglu_mlp(*a, limit=LIMIT))(
             *_abstract(tokens)
         )
     )

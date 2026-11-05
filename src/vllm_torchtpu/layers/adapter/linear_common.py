@@ -18,11 +18,7 @@ from vllm_torchtpu.kernels.quantized_matmul.buffered import (
     is_supported as is_buffered_matmul_supported,
 )
 from vllm_torchtpu.kernels.quantized_matmul.shared_expert import (
-    fused_shared_expert,
-    silu_and_mul_with_clamp,
-)
-from vllm_torchtpu.kernels.quantized_matmul.shared_expert import (
-    is_supported as is_fused_shared_expert_supported,
+    fp8_swiglu_mlp as fp8_swiglu_mlp_jax,
 )
 from vllm_torchtpu.kernels.quantized_matmul.util import xla_quantized_matmul
 
@@ -231,26 +227,6 @@ def quantized_matmul_fp4(
     return out_2d.reshape(orig_out_shape)
 
 
-def _fp8_swiglu_mlp_jax(
-    x: jax.Array,
-    w13: jax.Array,
-    s13: jax.Array,
-    w2: jax.Array,
-    s2: jax.Array,
-    *,
-    limit: float,
-) -> jax.Array:
-    """``down(silu_and_mul_with_clamp(gate_up(x)))``; one kernel when qualified.
-
-    The token count is concrete only during JAX lowering, so the shape
-    dispatch lives here; other shapes run the same ops unfused.
-    """
-    if is_fused_shared_expert_supported(x, w13, s13, w2, s2):
-        return fused_shared_expert(x, w13, s13, w2, s2, limit=limit)
-    gate, up = jnp.split(_quantized_matmul_jax(x, w13, s13), 2, axis=-1)
-    return _quantized_matmul_jax(silu_and_mul_with_clamp(gate, up, limit), w2, s2)
-
-
 _fp8_swiglu_mlp_ops: dict[float, Callable] = {}
 _fp8_swiglu_mlp_ops_lock = Lock()
 
@@ -266,7 +242,7 @@ def get_fp8_swiglu_mlp_op(limit: float) -> Callable:
             tag = f"{limit:g}".replace(".", "p").replace("-", "m")
             op = pallas.jax_op(
                 f"pallas::fp8_swiglu_mlp_limit_{tag}",
-                functools.partial(_fp8_swiglu_mlp_jax, limit=limit),
+                functools.partial(fp8_swiglu_mlp_jax, limit=limit),
             )
             op.register_fake(
                 lambda x, w13, s13, w2, s2: x.new_empty((x.shape[0], w2.shape[1]))

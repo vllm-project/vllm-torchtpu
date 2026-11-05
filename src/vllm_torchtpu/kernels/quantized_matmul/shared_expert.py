@@ -33,6 +33,7 @@ from vllm_torchtpu.kernels.quantized_matmul.tuned_block_sizes import (
     SHARED_EXPERT_TUNING,
     get_tpu_version,
 )
+from vllm_torchtpu.kernels.quantized_matmul.util import xla_quantized_matmul
 
 _FP8_MAX = 448.0
 
@@ -334,3 +335,23 @@ def fused_shared_expert(
         ),
         name="fused_shared_expert_fp8",
     )(x, w13, s13, w2, s2)
+
+
+def fp8_swiglu_mlp(
+    x: jax.Array,
+    w13: jax.Array,
+    s13: jax.Array,
+    w2: jax.Array,
+    s2: jax.Array,
+    *,
+    limit: float,
+) -> jax.Array:
+    """``down(silu_and_mul_with_clamp(gate_up(x)))``; one kernel when qualified.
+
+    The token count is concrete only during JAX lowering, so the shape
+    dispatch lives here; other shapes run the same ops unfused.
+    """
+    if is_supported(x, w13, s13, w2, s2):
+        return fused_shared_expert(x, w13, s13, w2, s2, limit=limit)
+    gate, up = jnp.split(xla_quantized_matmul(x, w13, s13), 2, axis=-1)
+    return xla_quantized_matmul(silu_and_mul_with_clamp(gate, up, limit), w2, s2)

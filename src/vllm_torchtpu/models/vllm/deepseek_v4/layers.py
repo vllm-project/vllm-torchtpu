@@ -104,12 +104,13 @@ class DeepseekV4MLP(nn.Module):
         x, _ = self.down_proj(x)
         return x
 
-    def _fused_forward(self, x: torch.Tensor) -> torch.Tensor:
-        """The whole MLP as one op: what the three modules above compute."""
-        from vllm_torchtpu.layers.adapter.linear_common import (
-            WEIGHT_FLIPPED_ATTR,
-            fp8_swiglu_mlp,
-        )
+    def fused_operands(
+        self,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, float]:
+        """(w13, s13, w2, s2, swiglu limit) for the one-kernel form of this MLP
+        (`kernels/quantized_matmul/shared_expert.py`); raises where that form
+        would not compute what the three modules do."""
+        from vllm_torchtpu.layers.adapter.linear_common import WEIGHT_FLIPPED_ATTR
 
         act = self.act_fn
         for layer in (self.gate_up_proj, self.down_proj):
@@ -124,8 +125,8 @@ class DeepseekV4MLP(nn.Module):
                 and getattr(layer, "tp_size", 1) == 1
             ):
                 raise NotImplementedError(
-                    "TPU_DEEPSEEK_V41_FUSED_SHARED_EXPERT needs unsharded, "
-                    "bias-free, per-channel FP8 projections in (k, n) layout"
+                    "the fused shared expert needs unsharded, bias-free, "
+                    "per-channel FP8 projections in (k, n) layout"
                 )
         if not (
             isinstance(act, SiluAndMulWithClamp)
@@ -133,14 +134,19 @@ class DeepseekV4MLP(nn.Module):
             and act.beta == 0.0
         ):
             raise NotImplementedError(
-                "TPU_DEEPSEEK_V41_FUSED_SHARED_EXPERT needs SiluAndMulWithClamp "
-                "with alpha 1 and beta 0"
+                "the fused shared expert needs SiluAndMulWithClamp with alpha 1 "
+                "and beta 0"
             )
-        return fp8_swiglu_mlp(
-            x,
+        return (
             self.gate_up_proj.weight,
             self.gate_up_proj.weight_scale,
             self.down_proj.weight,
             self.down_proj.weight_scale,
             act.swiglu_limit,
         )
+
+    def _fused_forward(self, x: torch.Tensor) -> torch.Tensor:
+        """The whole MLP as one op: what the three modules above compute."""
+        from vllm_torchtpu.layers.adapter.linear_common import fp8_swiglu_mlp
+
+        return fp8_swiglu_mlp(x, *self.fused_operands())
