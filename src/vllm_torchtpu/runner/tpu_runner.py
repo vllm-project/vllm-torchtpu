@@ -1356,8 +1356,8 @@ class TPUModelRunner(GPUModelRunner):
         self, scheduler_output: "SchedulerOutput"
     ) -> KVConnectorOutput | None:
         """This step's KV transfer report for the scheduler: finished sends and
-        receives, failed loads, worker metadata and stats. None when there is
-        nothing to report."""
+        receives, failed loads, worker metadata and stats. None when vLLM's
+        KVConnectorOutput.is_empty() finds nothing to report."""
         (
             finished_sending,
             finished_recving,
@@ -1367,16 +1367,7 @@ class TPUModelRunner(GPUModelRunner):
             invalid_block_group_index,
             kv_connector_stats,
         ) = self.get_finished_kv_transfers(scheduler_output)
-        if (
-            finished_sending is None
-            and finished_recving is None
-            and not failed_recving
-            and kv_worker_meta is None
-            and not invalid_block_ids
-            and kv_connector_stats is None
-        ):
-            return None
-        return _make_kv_connector_output(
+        output = _make_kv_connector_output(
             finished_sending=finished_sending,
             finished_recving=finished_recving,
             failed_recving=failed_recving,
@@ -1385,6 +1376,7 @@ class TPUModelRunner(GPUModelRunner):
             invalid_block_group_index=invalid_block_group_index,
             kv_connector_stats=kv_connector_stats,
         )
+        return None if output.is_empty() else output
 
     def kv_connector_no_forward(
         self, scheduler_output, vllm_config
