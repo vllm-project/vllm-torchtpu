@@ -16,7 +16,13 @@ from vllm.utils.math_utils import cdiv
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_utils import KVCacheBlock
 from vllm.v1.core.single_type_kv_cache_manager import SlidingWindowManager
-from vllm.v1.kv_cache_interface import KVCacheSpec, SlidingWindowMLASpec
+from vllm.v1.kv_cache_interface import (
+    KVCacheConfig,
+    KVCacheGroupSpec,
+    KVCacheSpec,
+    SlidingWindowMLASpec,
+    UniformTypeKVCacheSpecs,
+)
 from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
 
 
@@ -146,6 +152,65 @@ def register_swa_specs() -> None:
         DeepseekV41SWAManager,
         uniform_type_base_spec=DeepseekV41SWASpec,
     )
+
+
+def merge_swa_groups(kv_cache_config: KVCacheConfig) -> KVCacheConfig:
+    """Fold identical SWA groups into one, after the shared layout is planned.
+
+    Upstream sizes groups for one shared page pool, which splits the SWA
+    layers into one group each. SWA pages come from private pools instead,
+    so layers with an identical spec can share one block table: the ids one
+    manager issues index every layer's own `pool_capacity` pages. Tensors,
+    `num_blocks` and the shared pool are left as planned. Draft groups stay
+    apart from target groups because the EAGLE flag is per group.
+    """
+    groups: list[KVCacheGroupSpec] = []
+    members: dict[tuple, list[KVCacheGroupSpec]] = {}
+    for group in kv_cache_config.kv_cache_groups:
+        spec = _swa_group_spec(group.kv_cache_spec)
+        if spec is None:
+            groups.append(group)
+            continue
+        key = (
+            spec,
+            group.is_eagle_group,
+            group.host_resident,
+            group.enable_kv_transfer,
+            group.role,
+        )
+        if key not in members:
+            members[key] = []
+            # Placeholder at the first member's position, filled in below.
+            groups.append(group)
+        members[key].append(group)
+    if all(len(found) == 1 for found in members.values()):
+        return kv_cache_config
+    first_to_merged = {
+        id(found[0]): _merge_swa_group(found) for found in members.values()
+    }
+    groups = [first_to_merged.get(id(group), group) for group in groups]
+    return replace(kv_cache_config, kv_cache_groups=groups)
+
+
+def _swa_group_spec(spec: KVCacheSpec) -> DeepseekV41SWASpec | None:
+    """The single SWA spec a group carries, bare or in a uniform wrapper."""
+    if isinstance(spec, DeepseekV41SWASpec):
+        return spec
+    if isinstance(spec, UniformTypeKVCacheSpecs):
+        inner = set(spec.kv_cache_specs.values())
+        if len(inner) == 1:
+            (only,) = inner
+            if isinstance(only, DeepseekV41SWASpec):
+                return only
+    return None
+
+
+def _merge_swa_group(found: list[KVCacheGroupSpec]) -> KVCacheGroupSpec:
+    # The bare spec, not a uniform wrapper: a wrapper's page size sums its
+    # layers, while the shared layout and the worker read one layer's page.
+    spec = _swa_group_spec(found[0].kv_cache_spec)
+    layer_names = [name for group in found for name in group.layer_names]
+    return replace(found[0], layer_names=layer_names, kv_cache_spec=spec)
 
 
 def num_physical_blocks(spec: KVCacheSpec, num_blocks: int) -> int:
