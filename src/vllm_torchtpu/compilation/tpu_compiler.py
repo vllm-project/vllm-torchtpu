@@ -41,12 +41,6 @@ import torch._guards
 import torch.fx as fx
 from torch.fx.experimental.symbolic_shapes import ShapeEnv
 from torch_tpu._internal.compile._backend import TpuBackend
-from torch_tpu._internal.compile.split_compiler import _SplitCompiledExecutable
-from torch_tpu._internal.compile.torch_tpu_compiled_executable import (
-    AsyncCompiledArtifact,
-    NoOpCompiledArtifact,
-    TorchTpuCompiledExecutable,
-)
 from vllm.compilation.compiler_interface import CompilerInterface
 from vllm.config import VllmConfig
 from vllm.config.utils import Range
@@ -172,28 +166,25 @@ def _clear_tpu_tier1_cache() -> None:
     torch.tpu._clear_cache()
 
 
-def _release_compiled_artifact(artifact: Any, seen: set[int] | None = None) -> None:
-    """Synchronously drop C++ PjRtLoadedExecutable refs on CompiledArtifact leaves.
-
-    Short-term workaround until `torch_tpu` / `libtpu` releases compile-only
-    C++ metadata natively during `CompileAndLoad`.
-
-    TODO: Switch `TorchTpuCompiledExecutable` cleanup to `artifact.release()`
-    (added on `torch_tpu` main) once the `torch_tpu` pin advances past `0.2.0`,
-    and remove the reload path altogether once `torch_tpu` / `libtpu` drops
-    compile-time metadata natively. On `torch_tpu==0.2.0`, `_fast_runner` and
-    `_executable` are cleared directly so an incompatible `torch_tpu` artifact
-    type or read-only attribute fails fast before `LoadSerializedExecutable`
-    rather than incurring a silent 2x TPU HBM / host DRAM spike.
-    """
+def _collect_compiled_artifact_leaves(
+    artifact: Any,
+    leaves: list[Any],
+    seen: set[int],
+) -> None:
+    """Validate an artifact tree and append `TorchTpuCompiledExecutable` leaves."""
     if artifact is None:
         return
-    if seen is None:
-        seen = set()
     obj_id = id(artifact)
     if obj_id in seen:
         return
     seen.add(obj_id)
+
+    from torch_tpu._internal.compile.split_compiler import _SplitCompiledExecutable
+    from torch_tpu._internal.compile.torch_tpu_compiled_executable import (
+        AsyncCompiledArtifact,
+        NoOpCompiledArtifact,
+        TorchTpuCompiledExecutable,
+    )
 
     if isinstance(artifact, AsyncCompiledArtifact):
         # `resolve()` blocks on the background compile future and swaps
@@ -202,16 +193,21 @@ def _release_compiled_artifact(artifact: Any, seen: set[int] | None = None) -> N
 
     if isinstance(artifact, _SplitCompiledExecutable):
         for sub in artifact.compiled_executables:
-            if sub is not artifact:
-                _release_compiled_artifact(sub, seen)
+            _collect_compiled_artifact_leaves(sub, leaves, seen)
         return
 
     if isinstance(artifact, NoOpCompiledArtifact):
         return
 
     if isinstance(artifact, TorchTpuCompiledExecutable):
-        artifact._fast_runner = None
-        artifact._executable = None
+        for attr in ("_fast_runner", "_executable"):
+            desc = getattr(type(artifact), attr, None)
+            if isinstance(desc, property) and desc.fset is None:
+                raise AttributeError(
+                    f"Cannot clear read-only {type(artifact).__qualname__}.{attr} "
+                    "for VLLM_TPU_RELOAD_COMPILED_EXECUTABLE."
+                )
+        leaves.append(artifact)
         return
 
     raise TypeError(
@@ -220,11 +216,41 @@ def _release_compiled_artifact(artifact: Any, seen: set[int] | None = None) -> N
     )
 
 
+def _clear_compiled_artifact_leaves(leaves: list[Any]) -> None:
+    """Clear C++ PjRtLoadedExecutable refs on validated leaf artifacts."""
+    for leaf in leaves:
+        leaf._fast_runner = None
+        leaf._executable = None
+
+
+def _release_compiled_artifact(artifact: Any) -> None:
+    """Synchronously drop C++ PjRtLoadedExecutable refs on CompiledArtifact leaves.
+
+    Short-term workaround until `torch_tpu` / `libtpu` releases compile-only
+    C++ metadata natively during `CompileAndLoad`.
+
+    Uses two passes — validating the full artifact tree before mutating any
+    leaf — so an unsupported `CompiledArtifact` subclass or read-only handle
+    attribute fails fast without leaving a partially released executable.
+
+    TODO: Switch `TorchTpuCompiledExecutable` cleanup to `artifact.release()`
+    (added on `torch_tpu` main) once the `torch_tpu` pin advances past `0.2.0`,
+    and remove the reload path altogether once `torch_tpu` / `libtpu` drops
+    compile-time metadata natively.
+    """
+    leaves: list[Any] = []
+    _collect_compiled_artifact_leaves(artifact, leaves, set())
+    _clear_compiled_artifact_leaves(leaves)
+
+
 def _release_entry_executables(entry: Any) -> None:
     """Release forward/backward CompiledArtifact wrappers inside a bundled entry."""
+    leaves: list[Any] = []
+    seen: set[int] = set()
     for loadable in (entry.compiled_fw, entry.compiled_bw):
         if loadable is not None:
-            _release_compiled_artifact(loadable.result)
+            _collect_compiled_artifact_leaves(loadable.result, leaves, seen)
+    _clear_compiled_artifact_leaves(leaves)
 
 
 _TPU_COMPILE_ENV_IGNORED = {
@@ -712,7 +738,7 @@ class TpuCompilerAdaptor(CompilerInterface):
         *,
         compilations: tuple[int, int],
         graph: fx.GraphModule,
-        orig_graph: fx.GraphModule | None,
+        orig_graph: fx.GraphModule,
         example_inputs: list[Any],
         was_wrapped: bool,
         saved_path: str | None,
@@ -784,10 +810,7 @@ class TpuCompilerAdaptor(CompilerInterface):
                     e,
                 )
 
-        if orig_graph is not None:
-            fallback_graph, _ = _ensure_tuple_output(copy.deepcopy(orig_graph))
-        else:
-            fallback_graph = graph
+        fallback_graph, _ = _ensure_tuple_output(copy.deepcopy(orig_graph))
         fallback_fn, fallback_entry, _ = self._run_backend(
             fallback_graph, example_inputs, check_compilations=False
         )
