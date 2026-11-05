@@ -510,7 +510,7 @@ def _install_cpu_expert_emulator(monkeypatch: pytest.MonkeyPatch) -> None:
                             DN,
                             preferred_element_type=F32,
                         )
-                        scaled = part * s1_e[b : b + 1, :]
+                        scaled = part * s1_e[b, :, :]
                         acc1 = scaled if acc1 is None else acc1 + scaled
                     assert acc1 is not None
                     mid, mid_s = _intermediate_rows(
@@ -533,7 +533,7 @@ def _install_cpu_expert_emulator(monkeypatch: pytest.MonkeyPatch) -> None:
                                 DN,
                                 preferred_element_type=F32,
                             )
-                            sp = part2 * s2_e[c : c + 1, n0 : n0 + width]
+                            sp = part2 * s2_e[c, :, n0 : n0 + width]
                             acc2 = sp if acc2 is None else acc2 + sp
                         assert acc2 is not None
                         out_c = (acc2 * mid_s if mid_s is not None else acc2).astype(
@@ -1866,6 +1866,287 @@ def test_glm52_4k_sweep_tpu_hlo_lowerings(monkeypatch: pytest.MonkeyPatch):
         assert f"-m_{expect_m}-" in hlo
         if not inc_sh:
             assert "-routed" in hlo
+
+
+def test_scale_4d_no_reshape_in_jaxpr_and_tpu_hlo_and_3d_bitwise(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """4D routed scales reach ``pallas_call`` / ``@tpu_custom_call`` as
+    ``[E_local, B, 1, cols]`` with zero ``reshape`` in jaxpr or TPU HLO, and 3D
+    callers produce 0-ULP bitwise identical outputs."""
+    _install_mock_tpu7x(monkeypatch)
+    mesh = _cpu_or_any_mesh()
+    rep = NamedSharding(mesh, P())
+    shd = NamedSharding(mesh, P("d"))
+    sds = jax.ShapeDtypeStruct
+
+    def aval_shape(v: Any) -> tuple[int, ...]:
+        return tuple(v.aval.shape)
+
+    def trace_scales_to_pallas(
+        jaxpr_obj: Any, init_vars: list[Any]
+    ) -> list[tuple[int, ...]]:
+        j = jaxpr_obj.jaxpr if hasattr(jaxpr_obj, "jaxpr") else jaxpr_obj
+        tracked_ids = {id(v) for v in init_vars}
+        found: list[tuple[int, ...]] = []
+        for eq in j.eqns:
+            matched_pos = [
+                idx for idx, v in enumerate(eq.invars) if id(v) in tracked_ids
+            ]
+            if not matched_pos:
+                continue
+            assert eq.primitive.name not in (
+                "reshape",
+                "squeeze",
+                "broadcast_in_dim",
+                "convert_element_type",
+            ), f"unexpected {eq.primitive.name} on 4D scale: {eq}"
+            if eq.primitive.name == "pallas_call":
+                for idx in matched_pos:
+                    found.append(aval_shape(eq.invars[idx]))
+            elif "jaxpr" in eq.params:
+                sub = eq.params["jaxpr"]
+                sub_j = sub.jaxpr if hasattr(sub, "jaxpr") else sub
+                found.extend(
+                    trace_scales_to_pallas(
+                        sub_j, [sub_j.invars[i] for i in matched_pos]
+                    )
+                )
+            else:
+                tracked_ids.update(id(ov) for ov in eq.outvars)
+        return found
+
+    # 1. VMEM plan check at tile_rows = 128 (T=2048) and 256 (T=4096), plus
+    #    jaxpr + TPU7x StableHLO check for zero reshape on 4D scale operands.
+    info = pltpu.get_tpu_info()
+    cap_bytes = int(info.vmem_capacity_bytes * 0.90)
+    for cfg in (GLM52_EP2TP4, GLM52_TP8):
+        h, e, i, i_s, topk, qb1, bk2, ep = (
+            cfg["h"],
+            cfg["e"],
+            cfg["i"],
+            cfg["i_s"],
+            cfg["topk"],
+            cfg["qb1"],
+            cfg["bk2"],
+            cfg["ep"],
+        )
+        el = e // ep
+        b13 = h // qb1
+        b2 = i // bk2
+        two_i = 2 * i
+        s1_mlir = f"tensor<{el}x{b13}x1x{two_i}xf32>"
+        s2_mlir = f"tensor<{el}x{b2}x1x{h}xf32>"
+        s1_3d_mlir = f"tensor<{el}x{b13}x{two_i}xf32>"
+        s2_3d_mlir = f"tensor<{el}x{b2}x{h}xf32>"
+
+        for act_mode in ("w4a16", "w4a8"):
+            for tokens, exp_tile in ((2048, 128), (4096, 256)):
+                need = nvfp4_kernel._vmem_plan(
+                    tile_rows=exp_tile,
+                    h=h,
+                    i=i,
+                    i_s=i_s,
+                    b13=b13,
+                    b2=b2,
+                    act_mode=act_mode,
+                    nb=4,
+                    w2_n_chunk=2048,
+                    info=info,
+                    include_shared=True,
+                )
+                assert need is not None and need <= cap_bytes
+
+                x = sds((tokens, h), BF16, sharding=rep)
+                w1 = sds((N_RANKS * el, h, two_i), FP4, sharding=shd)
+                w2 = sds((N_RANKS * el, i, h), FP4, sharding=shd)
+                s1 = sds((N_RANKS * el, b13, 1, two_i), F32, sharding=shd)
+                s2 = sds((N_RANKS * el, b2, 1, h), F32, sharding=shd)
+                sw1 = sds((N_RANKS * h, 2 * i_s), FP8, sharding=shd)
+                ss1 = sds((N_RANKS * 2 * i_s,), F32, sharding=shd)
+                sw2 = sds((N_RANKS * i_s, h), FP8, sharding=shd)
+                ss2 = sds((N_RANKS * h,), F32, sharding=shd)
+                tw = sds((tokens, topk), BF16, sharding=rep)
+                tids = sds((tokens, topk), jnp.int32, sharding=rep)
+                e0 = sds((N_RANKS, 1), jnp.int32, sharding=shd)
+
+                def body(
+                    x_,
+                    w1_,
+                    w2_,
+                    s1_,
+                    s2_,
+                    sw1_,
+                    ss1_,
+                    sw2_,
+                    ss2_,
+                    tw_,
+                    tids_,
+                    e0_,
+                    _ep=ep,
+                    _am=act_mode,
+                ):
+                    return mod.fused_moe_prefill_nvfp4_stage_a(
+                        x_,
+                        w1_,
+                        w2_,
+                        s1_,
+                        s2_,
+                        sw1_,
+                        ss1_,
+                        sw2_,
+                        ss2_,
+                        None,
+                        tw_,
+                        tids_,
+                        axis_name="d",
+                        expert_start=e0_.reshape(()) if _ep > 1 else None,
+                        routed_scale=ROUTED_SCALE,
+                        act_mode=_am,
+                    )
+
+                shmap_fn = jax.shard_map(
+                    body,
+                    mesh=mesh,
+                    in_specs=(
+                        P(),
+                        P("d"),
+                        P("d"),
+                        P("d"),
+                        P("d"),
+                        P("d"),
+                        P("d"),
+                        P("d"),
+                        P("d"),
+                        P(),
+                        P(),
+                        P("d"),
+                    ),
+                    out_specs=P(),
+                    check_vma=False,
+                )
+                closed = jax.make_jaxpr(shmap_fn)(
+                    x, w1, w2, s1, s2, sw1, ss1, sw2, ss2, tw, tids, e0
+                )
+                shmap_eqns = [
+                    eq for eq in closed.jaxpr.eqns if "shard" in eq.primitive.name
+                ]
+                assert len(shmap_eqns) == 1
+                inner_jaxpr = shmap_eqns[0].params["jaxpr"]
+                inner_j = (
+                    inner_jaxpr.jaxpr if hasattr(inner_jaxpr, "jaxpr") else inner_jaxpr
+                )
+                s1_var, s2_var = inner_j.invars[3], inner_j.invars[4]
+                assert aval_shape(s1_var) == (el, b13, 1, two_i)
+                assert aval_shape(s2_var) == (el, b2, 1, h)
+                pallas_scale_shapes = trace_scales_to_pallas(inner_j, [s1_var, s2_var])
+                assert pallas_scale_shapes == [
+                    (el, b13, 1, two_i),
+                    (el, b2, 1, h),
+                ]
+
+                hlo = (
+                    jax.jit(shmap_fn)
+                    .trace(x, w1, w2, s1, s2, sw1, ss1, sw2, ss2, tw, tids, e0)
+                    .lower(lowering_platforms=("tpu",))
+                    .as_text()
+                )
+                assert s1_3d_mlir not in hlo
+                assert s2_3d_mlir not in hlo
+                expert_cc = [
+                    ln
+                    for ln in hlo.splitlines()
+                    if "@tpu_custom_call" in ln and s1_mlir in ln
+                ]
+                assert len(expert_cc) == 1 and s2_mlir in expert_cc[0]
+                for ln in hlo.splitlines():
+                    if "reshape" in ln:
+                        assert s1_mlir not in ln and s2_mlir not in ln
+
+    # 2. CPU 0-ULP bitwise identity between 4D [E, B, 1, cols] and 3D callers.
+    _install_cpu_expert_emulator(monkeypatch)
+    for cfg in (SMALL_EP2TP4, SMALL_TP8):
+        w1, w2, s1_4d, s2_4d, sw1, ss1, sw2, ss2, e0 = _build_small_sharded_weights(
+            mesh, cfg, seed=701
+        )
+        s1_3d = jax.device_put(
+            s1_4d.reshape(s1_4d.shape[0], s1_4d.shape[1], s1_4d.shape[3]), shd
+        )
+        s2_3d = jax.device_put(
+            s2_4d.reshape(s2_4d.shape[0], s2_4d.shape[1], s2_4d.shape[3]), shd
+        )
+        x_np, tw_np, ids_np = _make_inputs(128, cfg, seed=702)
+        x_a = jax.device_put(jnp.asarray(x_np, dtype=BF16), rep)
+        tw_a = jax.device_put(jnp.asarray(tw_np, dtype=BF16), rep)
+        tids_a = jax.device_put(jnp.asarray(ids_np, dtype=jnp.int32), rep)
+        ep = cfg["ep"]
+        for act_mode in ("w4a16", "w4a8"):
+
+            def small_body(
+                x_,
+                w1_,
+                w2_,
+                s1_,
+                s2_,
+                sw1_,
+                ss1_,
+                sw2_,
+                ss2_,
+                tw_,
+                tids_,
+                e0_,
+                _ep: int = ep,
+                _am: mod.ActMode = act_mode,
+            ):
+                return mod.fused_moe_prefill_nvfp4_stage_a(
+                    x_,
+                    w1_,
+                    w2_,
+                    s1_,
+                    s2_,
+                    sw1_,
+                    ss1_,
+                    sw2_,
+                    ss2_,
+                    None,
+                    tw_,
+                    tids_,
+                    axis_name="d",
+                    expert_start=e0_.reshape(()) if _ep > 1 else None,
+                    routed_scale=ROUTED_SCALE,
+                    act_mode=_am,
+                    w2_n_chunk=512,
+                )
+
+            fn = jax.jit(
+                jax.shard_map(
+                    small_body,
+                    mesh=mesh,
+                    in_specs=(
+                        P(),
+                        P("d"),
+                        P("d"),
+                        P("d"),
+                        P("d"),
+                        P("d"),
+                        P("d"),
+                        P("d"),
+                        P("d"),
+                        P(),
+                        P(),
+                        P("d"),
+                    ),
+                    out_specs=P(),
+                    check_vma=False,
+                )
+            )
+            out_4d = np.asarray(
+                fn(x_a, w1, w2, s1_4d, s2_4d, sw1, ss1, sw2, ss2, tw_a, tids_a, e0)
+            ).view(np.uint16)
+            out_3d = np.asarray(
+                fn(x_a, w1, w2, s1_3d, s2_3d, sw1, ss1, sw2, ss2, tw_a, tids_a, e0)
+            ).view(np.uint16)
+            assert np.array_equal(out_4d, out_3d)
 
 
 # ==============================================================================

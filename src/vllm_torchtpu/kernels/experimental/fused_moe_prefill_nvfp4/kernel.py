@@ -216,8 +216,8 @@ def _scratch_vmem_bytes(
         + t((2, tile_rows, lane_blocks, _LANES), BF16)
         + t((nb, h // _PACK4, 2 * i), jnp.uint32)
         + t((nb, i // _PACK4, h), jnp.uint32)
-        + t((nb, b13, 2 * i), F32)
-        + t((nb, b2, h), F32)
+        + t((nb, b13, 1, 2 * i), F32)
+        + t((nb, b2, 1, h), F32)
     )
     if include_shared:
         scratch_bytes += (
@@ -848,7 +848,7 @@ def build_expert_kernel_nvfp4(
                         DN,
                         preferred_element_type=F32,
                     )
-                    scaled = part * w1_scale_ring[slot, b : b + 1, :]
+                    scaled = part * w1_scale_ring[slot, b, :, :]
                     acc1 = scaled if acc1 is None else acc1 + scaled
                 assert acc1 is not None
                 mid, mid_scale = _intermediate_rows(
@@ -891,8 +891,7 @@ def build_expert_kernel_nvfp4(
                                     preferred_element_type=F32,
                                 )
                                 s_part = (
-                                    part2
-                                    * w2_scale_ring[slot, c : c + 1, n0 : n0 + width]
+                                    part2 * w2_scale_ring[slot, c, :, n0 : n0 + width]
                                 )
                                 acc2 = s_part if acc2 is None else acc2 + s_part
                             assert acc2 is not None
@@ -1041,8 +1040,8 @@ def build_expert_kernel_nvfp4(
         pltpu.VMEM((2, tile_rows, lane_blocks, _LANES), BF16),
         pltpu.VMEM((nb, h // _PACK4, 2 * i), jnp.uint32),
         pltpu.VMEM((nb, i // _PACK4, h), jnp.uint32),
-        pltpu.VMEM((nb, b13, 2 * i), F32),
-        pltpu.VMEM((nb, b2, h), F32),
+        pltpu.VMEM((nb, b13, 1, 2 * i), F32),
+        pltpu.VMEM((nb, b2, 1, h), F32),
         pltpu.SMEM((2 * window,), jnp.int32),
         pltpu.SemaphoreType.DMA((n_act,)),
         pltpu.SemaphoreType.DMA((2,)),
@@ -1287,11 +1286,17 @@ def fused_moe_prefill_nvfp4(
         args.append(row_scale.reshape(-1, _LANES))
     args.append(row_token)
 
+    w1_s4d = w1_scale[:, :, None, :] if w1_scale.ndim == 3 else w1_scale
+    w2_s4d = w2_scale[:, :, None, :] if w2_scale.ndim == 3 else w2_scale
+    if w1_s4d.dtype != F32:
+        w1_s4d = w1_s4d.astype(F32)
+    if w2_s4d.dtype != F32:
+        w2_s4d = w2_s4d.astype(F32)
     weight_args: list[Any] = [
         w1,
         w2,
-        w1_scale.reshape(experts, b13, two_i).astype(F32),
-        w2_scale.reshape(experts, b2, h).astype(F32),
+        w1_s4d,
+        w2_s4d,
     ]
     if include_shared:
         weight_args += [
