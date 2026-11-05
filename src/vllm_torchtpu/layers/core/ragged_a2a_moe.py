@@ -451,9 +451,10 @@ def ragged_a2a_moe_local(
     ``experts_start`` [1] is this rank's first global expert id. Returns this
     rank's [S, H] sum over its DP group, before the TP all-reduce.
 
-    With ``capacity_factor`` > 0 the exchange and the local MoE are sized by
-    ``exchange_capacity``; a step whose routing exceeds those sizes on any rank
-    runs the full-size exchange instead. Both give the same result.
+    With ``capacity_factor`` > 0 and fewer capacity rows than DP-group tokens,
+    the exchange and the local MoE are sized by ``exchange_capacity``; a step
+    whose routing exceeds those sizes on any rank runs the full-size exchange
+    instead. Both give the same result.
     """
     num_tokens = x.shape[0]
     local_num_experts = w1.shape[0]
@@ -508,7 +509,9 @@ def ragged_a2a_moe_local(
         onehot_moe_permute_threshold=onehot_moe_permute_threshold,
         use_sparse_core=use_sparse_core,
     )
-    if rows >= slots and routes >= slots * topk:
+    if rows >= slots:
+        # Bounding the routes alone saves less than the conditional costs
+        # (the full exchange already runs the local-routes path over all routes).
         return full()
 
     overflow = _capacity_overflow(

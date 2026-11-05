@@ -485,7 +485,7 @@ def ra_capacity(**kw):
 @pytest.mark.parametrize(
     "dp_size,tp_size,num_tokens,topk,skew",
     [
-        (2, 4, 48, 10, False),  # proxy decode step: route capacity only
+        (2, 4, 48, 10, False),  # proxy decode step: full rows, full exchange
         (2, 4, 48, 2, False),  # ~24% occupancy: row capacity too
         (2, 4, 48, 2, True),  # skewed onto DP position 0: overflow
         (4, 2, 24, 2, False),
