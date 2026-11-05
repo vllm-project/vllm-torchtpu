@@ -8,6 +8,8 @@
 #                 single host: tp8 | tp8xdcp2 | dp2xtp4
 #   GLOBAL_SEQS   total concurrent requests across the slice (max-num-seqs = GLOBAL_SEQS / engines)
 #   MTP_K         draft tokens per step; 0 disables speculative decoding
+#   CANDIDATE_SAMPLING 1 = non-greedy verify steps sample from per-vocab-shard top-k candidates when every request
+#                 keeps <= 48 tokens (TPU_CANDIDATE_SAMPLING; same distributions, float sums over the candidates)
 #   SYNTH_ACCEPT  "" (verify drafts against the target) | comma list of per-position unconditional acceptance rates,
 #                 e.g. 0.832,0.692,0.576 (synthetic rejection: draft i is accepted with that marginal probability)
 #   MNBT          --max-num-batched-tokens
@@ -58,6 +60,7 @@ FUSED_COMBINE=${FUSED_COMBINE:-0}
 LM_HEAD_HIDDEN_MAJOR=${LM_HEAD_HIDDEN_MAJOR:-0}
 WEIGHTS=${WEIGHTS:-dummy}
 SYNTH_ACCEPT=${SYNTH_ACCEPT:-}
+CANDIDATE_SAMPLING=${CANDIDATE_SAMPLING:-0}
 KV_MODE=${KV_MODE:-synthetic}
 read -r -a EXTRA_ARGV <<< "${EXTRA_ARGS:-}"
 cd "$(dirname -- "$0")/.."
@@ -77,6 +80,11 @@ case "$FUSED_COMBINE" in
   0) ;;
   1) export TPU_MOE_FUSED_COMBINE=1 ;;
   *) echo "FUSED_COMBINE must be 0 or 1" >&2; exit 2 ;;
+esac
+case "$CANDIDATE_SAMPLING" in
+  0) ;;
+  1) export TPU_CANDIDATE_SAMPLING=1 ;;
+  *) echo "CANDIDATE_SAMPLING must be 0 or 1" >&2; exit 2 ;;
 esac
 case "$LM_HEAD_HIDDEN_MAJOR" in
   0) ;;
@@ -147,7 +155,7 @@ elif [[ -n "$HOT_SET" ]]; then
   [[ "${HS_SPREAD:-}" == spread ]] && export TPU_MOE_HOT_SET_SPREAD=1
 fi
 export TORCH_TPU_TIER2_COMPILATION_CACHE="native_decode_${LAYOUT}_${POD_IP}"
-echo "HILLCLIMB layout=$LAYOUT host=$HOST_RANK engines=$ENGINES seqs/engine=$SEQS_PER_ENGINE mtp=$MTP_K mnbt=$MNBT compile=$COMPILE_SIZES kv=$KV_BYTES async=$ASYNC_SCHED fused_ep=$FUSED_EP w4a8=$W4A8 expert_block=${EXPERT_BLOCK:-16} attn_block=${ATTN_BLOCK:-default} verify_block=${VERIFY_BLOCK:-default} draft_one_query=$DRAFT_ONE_QUERY moe_a2a=$MOE_A2A a2a_sc_offload=${A2A_SC_OFFLOAD:-default} fused_draft=$FUSED_DRAFT fast_subst=$FAST_SUBST lm_head_hidden_major=$LM_HEAD_HIDDEN_MAJOR packed_dispatch=$PACKED_DISPATCH fused_combine=$FUSED_COMBINE weights=$WEIGHTS kv_mode=$KV_MODE synth_accept=${SYNTH_ACCEPT:-none} hot_set=${HOT_SET:-none} headless=${HEADLESS_ARGS[*]:-no}"
+echo "HILLCLIMB layout=$LAYOUT host=$HOST_RANK engines=$ENGINES seqs/engine=$SEQS_PER_ENGINE mtp=$MTP_K mnbt=$MNBT compile=$COMPILE_SIZES kv=$KV_BYTES async=$ASYNC_SCHED fused_ep=$FUSED_EP w4a8=$W4A8 expert_block=${EXPERT_BLOCK:-16} attn_block=${ATTN_BLOCK:-default} verify_block=${VERIFY_BLOCK:-default} draft_one_query=$DRAFT_ONE_QUERY moe_a2a=$MOE_A2A a2a_sc_offload=${A2A_SC_OFFLOAD:-default} fused_draft=$FUSED_DRAFT fast_subst=$FAST_SUBST lm_head_hidden_major=$LM_HEAD_HIDDEN_MAJOR packed_dispatch=$PACKED_DISPATCH fused_combine=$FUSED_COMBINE weights=$WEIGHTS kv_mode=$KV_MODE synth_accept=${SYNTH_ACCEPT:-none} candidate_sampling=$CANDIDATE_SAMPLING hot_set=${HOT_SET:-none} headless=${HEADLESS_ARGS[*]:-no}"
 
 exec numactl --interleave=all "$VLLM_BIN" serve \
   --pipeline-parallel-size 1 \
