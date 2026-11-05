@@ -10,7 +10,13 @@ runs inside the previous group's matmul.
 Arithmetic and rounding match the two buffered kernels: wo_a quantizes each
 group row of 4096 to FP8 with a BF16 scale; wo_b quantizes each full row of
 8192 with an FP32 scale, whose amax the wo_a epilogues collect.
+
+One call holds at most MAX_TILE tokens in VMEM. Longer inputs (prefill) run
+as consecutive calls over token tiles, each writing its rows of one shared
+output. Every quantization is per row, so tiling does not change any bits.
 """
+
+import functools
 
 import jax
 import jax.numpy as jnp
@@ -40,16 +46,27 @@ MXU_TILE = 256
 B_ISSUE = (5, 6, 7)
 # Weight streams yield to activation and scale copies.
 WEIGHT_PRIORITY = 1
-VMEM_LIMIT_BYTES = 60 * 1024**2
+# All of v7's VMEM. A 320-token tile fits; 384 exceeds it by 224 KiB.
+VMEM_LIMIT_BYTES = 64 * 1024**2
+MAX_TILE = 320
+# Just past MAX_TILE, two tiles each read the full weights, so the two-kernel
+# chain is faster until the chain's own cost catches up. v7, 50 calls each,
+# fused vs chain: T330 62.4 vs 58.0 us, T384 64.3 vs 63.3 us, T416 65.3 vs
+# 69.9 us. Token counts in (MAX_TILE, TWO_TILE_MIN) take the chain.
+TWO_TILE_MIN = 416
+# Row granule of the 2D output DMA: Mosaic rejects bf16 row slices that are
+# not whole (16, 128) tiles (v7: T = 1, 100, 300 failed to compile).
+STORE_ROWS = 16
 
 
 def is_supported(
     x: jax.Array, wa: jax.Array, sa: jax.Array, wb: jax.Array, sb: jax.Array
 ) -> bool:
-    """Whether inputs match the measured v7 decode envelope."""
+    """Whether inputs match the v7 output-projection contract at a token count
+    where the fused kernel beats the two-kernel chain."""
     return (
         x.ndim == 3
-        and x.shape[0] in (240, 288)
+        and (0 < x.shape[0] <= MAX_TILE or x.shape[0] >= TWO_TILE_MIN)
         and x.shape[1:] == (64, 512)
         and wa.shape == (4096, 8192)
         and sa.shape == (8192,)
@@ -65,15 +82,33 @@ def is_supported(
 
 
 def _kernel(
-    # HBM inputs and output
+    # HBM inputs and output; this call reads and writes rows
+    # start .. start + tokens.
     x,  # [T, 64, 512] bf16
     wa,  # [4096, 8192] fp8
     sa,  # [1, 8192] f32
     wb,  # [8192, 5120] fp8
     sb,  # [5120] f32
+    *refs,
+    start: int,
+    tokens: int,
+):
+    # After the first token tile, the previous call's output comes in as an
+    # input aliased to this call's output; its other rows pass through.
+    if start:
+        refs = refs[1:]
+    _tile(x, wa, sa, wb, sb, *refs, start=start, tokens=tokens)
+
+
+def _tile(
+    x,
+    wa,
+    sa,
+    wb,
+    sb,
     out,  # [T, 5120] bf16
-    # VMEM scratch; P is T rounded up to QUANT_ROWS. Padding rows of xb stay
-    # zero, so they quantize and project to zeros.
+    # VMEM scratch; P is tokens rounded up to QUANT_ROWS. Padding rows of xb
+    # stay zero, so they quantize and project to zeros.
     xb,  # [GROUP_DEPTH, P, 8, 512] bf16
     wab,  # [GROUP_DEPTH, 4096, 1024] fp8
     qa,  # [2, P, 4096] fp8, quantized wo_a input of groups g and g + 1
@@ -91,8 +126,11 @@ def _kernel(
     bsem,
     osem,
     ssem,
+    *,
+    start: int,
+    tokens: int,
 ):
-    tokens, rows_p = x.shape[0], y.shape[0]
+    rows_p = y.shape[0]
     groups = x.shape[1] // HEADS_PER_GROUP
     width = wa.shape[1] // groups
     windows = wb.shape[1] // WINDOW
@@ -108,7 +146,7 @@ def _kernel(
 
     def x_copy(g, slot):
         return pltpu.make_async_copy(
-            x.at[:, pl.ds(g * HEADS_PER_GROUP, HEADS_PER_GROUP), :],
+            x.at[pl.ds(start, tokens), pl.ds(g * HEADS_PER_GROUP, HEADS_PER_GROUP)],
             xb.at[slot, pl.ds(0, tokens)],
             xsem.at[slot],
         )
@@ -127,10 +165,14 @@ def _kernel(
             bsem.at[slot],
         )
 
+    # The output DMA moves whole bf16 row tiles; out has room for the zero
+    # padding rows past the last token, which the caller slices off.
+    stored = -(-tokens // STORE_ROWS) * STORE_ROWS
+
     def out_copy(i):
         return pltpu.make_async_copy(
-            ob.at[i % 2, pl.ds(0, tokens)],
-            out.at[:, pl.ds(i * WINDOW, WINDOW)],
+            ob.at[i % 2, pl.ds(0, stored)],
+            out.at[pl.ds(start, stored), pl.ds(i * WINDOW, WINDOW)],
             osem.at[i % 2],
         )
 
@@ -388,8 +430,8 @@ def _kernel(
         xs[...] = jnp.where(s == 0, 1.0, s)
         wb_copy(0, 0).wait()
         sb_copy.wait()
-        for start in range(0, rows_p, QUANT_ROWS):
-            rows = pl.ds(start, QUANT_ROWS)
+        for r in range(0, rows_p, QUANT_ROWS):
+            rows = pl.ds(r, QUANT_ROWS)
             scale = xs[rows]
             for c in range(0, y.shape[1], width):
                 cols = pl.ds(c, width)
@@ -420,39 +462,24 @@ def _kernel(
         out_copy(windows - 1).wait()
 
 
-@jax.jit
-def fused_output_projection(
-    x: jax.Array,  # [T, 64, 512] bf16
-    wa: jax.Array,  # [4096, 8192] fp8
-    sa: jax.Array,  # [8192] f32
-    wb: jax.Array,  # [8192, 5120] fp8
-    sb: jax.Array,  # [5120] f32
-) -> jax.Array:
-    """``wo_b(wo_a(x))`` for the qualified decode shapes, see ``is_supported``."""
-    if not is_supported(x, wa, sa, wb, sb):
-        raise ValueError("Fused output projection requires qualified v7 inputs")
-    tokens, heads, head_dim = x.shape
+def _call(x, wa, sa, wb, sb, out, *, start: int, tokens: int) -> jax.Array:
+    """Rows start .. start + tokens of the projection, written into ``out``
+    (a fresh output when None) of T rounded up to STORE_ROWS rows."""
+    total, heads, head_dim = x.shape
+    total = -(-total // STORE_ROWS) * STORE_ROWS
     reduction, features = wa.shape
-    groups = heads // HEADS_PER_GROUP
-    width = features // groups
+    width = features // (heads // HEADS_PER_GROUP)
     k, n = wb.shape
-    # Only the first `tokens` rows travel to and from HBM.
     rows = -(-tokens // QUANT_ROWS) * QUANT_ROWS
     group_depth, window_depth = GROUP_DEPTH, WINDOW_DEPTH
-    assert len(B_ISSUE) == window_depth and all(0 <= at < groups for at in B_ISSUE)
-    assert group_depth < groups
     hbm = pltpu.HBM
-    # Ordinary JAX primitives cannot consume Pallas memory-space annotations.
-    # Reshape before constraining the array at the custom-call boundary.
-    sa = sa.reshape(1, features)
-    x, wa, sa, wb, sb = (
-        pltpu.with_memory_space_constraint(a, hbm) for a in (x, wa, sa, wb, sb)
-    )
+    inputs = (x, wa, sa, wb, sb) + (() if out is None else (out,))
+    inputs = tuple(pltpu.with_memory_space_constraint(a, hbm) for a in inputs)
     f32, fp8 = jnp.float32, wa.dtype
     return pl.pallas_call(
-        _kernel,
-        out_shape=jax.ShapeDtypeStruct((tokens, n), x.dtype),
-        in_specs=(pl.BlockSpec(memory_space=hbm),) * 5,
+        functools.partial(_kernel, start=start, tokens=tokens),
+        out_shape=jax.ShapeDtypeStruct((total, n), x.dtype),
+        in_specs=(pl.BlockSpec(memory_space=hbm),) * len(inputs),
         out_specs=pl.BlockSpec(memory_space=hbm),
         scratch_shapes=(
             pltpu.VMEM((group_depth, rows, HEADS_PER_GROUP, head_dim), x.dtype),
@@ -473,6 +500,40 @@ def fused_output_projection(
             pltpu.SemaphoreType.DMA((2,)),
             pltpu.SemaphoreType.DMA((2,)),
         ),
+        input_output_aliases={} if out is None else {5: 0},
         compiler_params=pltpu.CompilerParams(vmem_limit_bytes=VMEM_LIMIT_BYTES),
         name="fused_output_projection",
-    )(x, wa, sa, wb, sb)
+    )(*inputs)
+
+
+def token_tiles(total: int) -> list[tuple[int, int]]:
+    """(start, size) per call: the fewest tiles of at most MAX_TILE tokens,
+    sized evenly in QUANT_ROWS multiples, with the remainder last."""
+    count = -(-total // MAX_TILE)
+    size = -(-total // count // QUANT_ROWS) * QUANT_ROWS
+    return [(s, min(size, total - s)) for s in range(0, total, size)]
+
+
+@jax.jit
+def fused_output_projection(
+    x: jax.Array,  # [T, 64, 512] bf16
+    wa: jax.Array,  # [4096, 8192] fp8
+    sa: jax.Array,  # [8192] f32
+    wb: jax.Array,  # [8192, 5120] fp8
+    sb: jax.Array,  # [5120] f32
+) -> jax.Array:
+    """``wo_b(wo_a(x))`` for any token count, see ``is_supported``."""
+    if not is_supported(x, wa, sa, wb, sb):
+        raise ValueError("Fused output projection requires qualified v7 inputs")
+    groups = x.shape[1] // HEADS_PER_GROUP
+    assert len(B_ISSUE) == WINDOW_DEPTH and all(0 <= at < groups for at in B_ISSUE)
+    assert groups > GROUP_DEPTH
+    # Ordinary JAX primitives cannot consume Pallas memory-space annotations.
+    # Reshape before constraining the array at the custom-call boundary.
+    sa = sa.reshape(1, wa.shape[1])
+    out = None
+    for start, tokens in token_tiles(x.shape[0]):
+        out = _call(x, wa, sa, wb, sb, out, start=start, tokens=tokens)
+    assert out is not None
+    # A no-op on the serving buckets, which are STORE_ROWS multiples.
+    return out[: x.shape[0]] if out.shape[0] != x.shape[0] else out

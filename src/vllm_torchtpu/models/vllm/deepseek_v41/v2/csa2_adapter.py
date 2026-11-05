@@ -214,9 +214,9 @@ def _project_out(
     wb: jax.Array,
     sb: jax.Array,
 ) -> jax.Array:
-    # wo_a then wo_b. The fused kernel keeps wo_a's result in VMEM on the
-    # qualified decode shapes and is bitwise equal to the two-kernel chain,
-    # which every other shape still runs.
+    # wo_a then wo_b. On v7 with the DSv4.1 weights the fused kernel runs at
+    # every token count, in token tiles beyond one VMEM-resident tile, and is
+    # bitwise equal to the two-kernel chain, which other contracts still run.
     from vllm_torchtpu.layers.adapter.linear_common import _quantized_matmul_jax
 
     sa = sa.reshape(-1)

@@ -103,8 +103,43 @@ def test_buffered_projection_traces_memory_space_boundary(monkeypatch, tokens):
 
 @pytest.mark.cpu_test
 @pytest.mark.parametrize(
+    "total,tiles",
+    [
+        (1, [(0, 1)]),
+        (288, [(0, 288)]),
+        (300, [(0, 300)]),
+        (320, [(0, 320)]),
+        (330, [(0, 192), (192, 138)]),
+        (512, [(0, 256), (256, 256)]),
+        (2048, [(s, 320) for s in range(0, 1920, 320)] + [(1920, 128)]),
+    ],
+)
+def test_output_projection_token_tiles(total, tiles):
+    from vllm_torchtpu.kernels.deepseek_v41 import output_projection as fo
+
+    assert fo.token_tiles(total) == tiles
+    # Tiles cover every row once, fit in VMEM and start on accumulator rows.
+    assert sum(size for _, size in tiles) == total
+    assert all(
+        size <= fo.MAX_TILE and start % fo.QUANT_ROWS == 0 for start, size in tiles
+    )
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize(
     "tokens,generation,fused",
-    [(240, 7, True), (288, 7, True), (256, 7, False), (288, 6, False)],
+    [
+        (1, 7, True),
+        (240, 7, True),
+        (288, 7, True),
+        (300, 7, True),
+        (320, 7, True),
+        (330, 7, False),
+        (384, 7, False),
+        (416, 7, True),
+        (2048, 7, True),
+        (288, 6, False),
+    ],
 )
 def test_project_out_dispatch(monkeypatch, tokens, generation, fused):
     from vllm_torchtpu.kernels.deepseek_v41 import output_projection as fo
