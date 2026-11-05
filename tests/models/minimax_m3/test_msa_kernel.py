@@ -74,12 +74,17 @@ def _reference(q, k, v, iq, ik, ctx_k, ctx_v, ctx_ik, q_lens, ctx_lens, sm_scale
 def test_msa_forward_matches_dense_reference(
     q_lens, ctx_lens, jit, small_chunks, dtype, monkeypatch
 ):
+    # The decode-tile DMA ring copies its pages one by one; at the serving
+    # default of 128 pages per step interpret mode spends minutes per call on
+    # copies of pages past the request (pages_per_seq is 16 here).
+    monkeypatch.setattr(msa_indexer, "DEFAULT_SMALL_PAGES_PER_STEP", 16)
     if small_chunks:
         # Several indexer tiles per request and page groups per tile, and
         # several attention tiles and page groups per step.
         monkeypatch.setattr(msa_indexer, "DEFAULT_BLOCK_Q", 16)
         monkeypatch.setattr(msa_indexer, "DEFAULT_LARGE_BLOCK_Q", 8)
         monkeypatch.setattr(msa_indexer, "DEFAULT_PAGES_PER_STEP", 2)
+        monkeypatch.setattr(msa_indexer, "DEFAULT_SMALL_PAGES_PER_STEP", 2)
     rng = np.random.default_rng(0)
     num_seqs = len(q_lens)
     max_num_seqs = num_seqs + 1

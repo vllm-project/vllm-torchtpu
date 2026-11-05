@@ -218,6 +218,7 @@ def _block_scores(
         block_q=msa_indexer.DEFAULT_BLOCK_Q,
         large_block_q=msa_indexer.DEFAULT_LARGE_BLOCK_Q,
         pages_per_step=msa_indexer.DEFAULT_PAGES_PER_STEP,
+        small_pages_per_step=msa_indexer.DEFAULT_SMALL_PAGES_PER_STEP,
         interpret=interpret,
     )
 
