@@ -17,6 +17,7 @@ if TYPE_CHECKING:
     TPU_DEEPSEEK_V41_INDEXER_PUBLISH_ISSUE_DEPTH: int | None = 7
     TPU_DEEPSEEK_V41_MHC_RESIDENT_GATES: bool = True
     TPU_DEEPSEEK_V41_MHC_EARLY_PREP: bool = False
+    TPU_DEEPSEEK_V41_MHC_SHIFTED_T16: bool = False
     TPU_DEEPSEEK_V41_BLOCKED_ROPE_GATHER: bool = True
     TPU_DEEPSEEK_V41_CSA2_SWA_PLAN: bool = False
     TPU_DEEPSEEK_V41_FUSED_WO_AB: bool = True
@@ -463,6 +464,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # activation tiles are still in flight (scheduling only; outputs unchanged).
     "TPU_DEEPSEEK_V41_MHC_EARLY_PREP": env_bool(
         "TPU_DEEPSEEK_V41_MHC_EARLY_PREP", default=False
+    ),
+    # Shifted mHC: also run token counts that are a multiple of 16 but not 32
+    # (the DSpark drafter's 240 rows) through the fused kernel, with 16-token
+    # mix groups, instead of the unfused post + delayed-pre fallback. Changes
+    # only the drafter's rounding.
+    "TPU_DEEPSEEK_V41_MHC_SHIFTED_T16": env_bool(
+        "TPU_DEEPSEEK_V41_MHC_SHIFTED_T16", default=False
     ),
     # Gather RoPE table rows (attention preprocessing, CSA2 inverse RoPE) as
     # 256-row gathers when a step has 257..1024 rows
