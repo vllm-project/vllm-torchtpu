@@ -33,10 +33,10 @@ explicitly rather than relying on the exporter's defaults:
 - `--kv-cache-memory-bytes`: unset by default. `vllm serve` logs
   `Memory statistics | ... total_hbm_avail_gb=G | profile_run=ran`; bytes =
   G x 2^30. Use it only from a line that says `profile_run=ran`. With
-  `profile_run=skipped`, the KV size was pinned before profiling (for example by
-  compact-mamba sizing on hybrid models), G was measured without activation
-  memory and over-sizes the KV cache: pass `--num-blocks` from the
-  `TPU KV cache size` line instead.
+  `profile_run=skipped`, the KV size was pinned before profiling (by
+  `--num-gpu-blocks-override`, or the uniform hybrid KV layout's own count), G
+  was measured without activation memory and over-sizes the KV cache: pass
+  `--num-blocks` from the `TPU KV cache size` line instead.
 - `--max-num-seqs`, `--max-model-len`, `--max-num-batched-tokens`: default to
   vLLM's engine defaults. Pass what `vllm serve` was given (its
   `non-default args` log line lists them).
