@@ -5,6 +5,10 @@ from typing import Any, cast
 
 import jax
 import jax.numpy as jnp
+import vllm_torchtpu.kernels.experimental.batched_rpa.wrapper as rpa_batched
+import vllm_torchtpu.kernels.mla.v2.kernel as mla_v2_kernel
+import vllm_torchtpu.kernels.ragged_paged_attention.v3.kernel as rpa_default
+import vllm_torchtpu.kernels.ragged_paged_attention.v3.kernel_hd64 as rpa_hd64
 from jax.experimental import shard_map
 from jax.experimental.pallas.ops.tpu.paged_attention import paged_attention
 from jax.experimental.pallas.ops.tpu.splash_attention import (
@@ -15,18 +19,18 @@ from jax.experimental.pallas.ops.tpu.splash_attention import (
 )
 from jax.sharding import Mesh
 from jax.sharding import PartitionSpec as P
-
-import vllm_torchtpu.kernels.experimental.batched_rpa.wrapper as rpa_batched
-import vllm_torchtpu.kernels.mla.sparse.kernel as sparse_mla_kernel
-import vllm_torchtpu.kernels.mla.v2.kernel as mla_v2_kernel
-import vllm_torchtpu.kernels.ragged_paged_attention.v3.kernel as rpa_default
-import vllm_torchtpu.kernels.ragged_paged_attention.v3.kernel_hd64 as rpa_hd64
-from vllm_torchtpu import envs
-from vllm_torchtpu.kernels.deepseek_v4 import streamindex_topk
 from vllm_torchtpu.kernels.experimental.batched_rpa import (
     configs as batched_rpa_configs,
 )
 from vllm_torchtpu.kernels.flash_attention.kernel import flash_attention
+from vllm_torchtpu.kernels.mla.v2.tuned_params import TuningKey, get_tuned_params
+from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
+from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.utils import get_megacore
+
+import vllm_torchtpu.kernels.mla.sparse.kernel as sparse_mla_kernel
+from vllm_torchtpu import envs
+from vllm_torchtpu.kernels.deepseek_v4 import streamindex_topk
 from vllm_torchtpu.kernels.mla import dispatch as mla_dispatch
 from vllm_torchtpu.kernels.mla import kv_cache_utils
 from vllm_torchtpu.kernels.mla.kv_cache_utils import (
@@ -35,10 +39,6 @@ from vllm_torchtpu.kernels.mla.kv_cache_utils import (
     update_sparse_mla_kv_cache_dcp,
 )
 from vllm_torchtpu.kernels.mla.sparse import native_sc_gather
-from vllm_torchtpu.kernels.mla.v2.tuned_params import TuningKey, get_tuned_params
-from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
-from vllm_torchtpu.logger import init_logger
-from vllm_torchtpu.utils import get_megacore
 
 logger = init_logger(__name__)
 
@@ -1195,6 +1195,7 @@ def sparse_mla_attention_dcp(
     dcp_lane_ids: jax.Array | None = None,
     fused_merge: bool = False,
     merge_pieces: bool = True,
+    skip_kv_write: bool = False,
 ) -> tuple[jax.Array, ...]:
     """Sparse MLA attention over a DCP position-sharded latent cache.
 
@@ -1398,7 +1399,8 @@ def sparse_mla_attention_dcp(
             dcp_rank = streamindex_topk.cp_rank_as_data(dcp_axis_name, dcp_size)
         decode_bucket = topk_idx.shape[0] <= sparse_mla_kernel.FUSED_PREP_MAX_TOKENS
         kv_in_gather = (
-            envs.TPU_MLA_KV_WRITE_IN_GATHER
+            not skip_kv_write
+            and envs.TPU_MLA_KV_WRITE_IN_GATHER
             and envs.TPU_DCP_MLA_MASK_IN_KERNEL
             and envs.TPU_DCP_MLA_FUSED_PREP
             and decode_bucket
@@ -1429,7 +1431,7 @@ def sparse_mla_attention_dcp(
                 _pack_lane_dense(kv_c_normed, nope_spec.token_bytes),
                 _pack_lane_dense(k_pe, rope_spec.token_bytes),
             )
-        else:
+        elif not skip_kv_write:
             kv_cache_nope, kv_cache_rope = update_sparse_mla_kv_cache_dcp(
                 kv_cache_nope,
                 kv_cache_rope,
