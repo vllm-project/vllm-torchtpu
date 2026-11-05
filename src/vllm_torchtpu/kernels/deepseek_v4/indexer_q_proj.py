@@ -104,6 +104,76 @@ def applies(
     )
 
 
+def project_token_major(
+    x_q_ref: jax.Ref,  # (T, K) fp8
+    w_ref: jax.Ref,  # (K, heads * LANE) fp8
+    x_scale_ref: jax.Ref,  # (T, LANE) f32: each token's scale, lane-wide
+    w_scale_ref: jax.Ref,  # (heads * LANE,) f32
+    proj_ref: jax.Ref,  # (T * heads, LANE) bf16
+) -> None:
+    """``xla_prequantized_matmul``'s bf16 projection of T tokens' heads, stored
+    token-major: head h of token t in row t * heads + h of ``proj_ref``."""
+    heads = w_ref.shape[1] // LANE
+    # f32 dot, then `* x_scale`, `* w_scale` and the cast to bf16.
+    x = jax.lax.dot_general(
+        x_q_ref[...],
+        w_ref[...],
+        (((1,), (0,)), ((), ())),
+        preferred_element_type=jnp.float32,
+    )
+    x = x * jnp.concatenate([x_scale_ref[...]] * heads, axis=1)
+    x = x * w_scale_ref[...][None, :]
+    # The u32 view of the buffer holds rows 2r and 2r + 1 in the low and high
+    # half of word row r.
+    words = proj_ref.bitcast(jnp.uint32)
+    for p in range(heads // 2):
+        pair = [x[:, (2 * p + i) * LANE : (2 * p + i + 1) * LANE] for i in range(2)]
+        words[pl.ds(p, x.shape[0], stride=heads // 2), :] = pltpu.pack_elementwise(
+            pair, packed_dtype=jnp.bfloat16
+        )
+
+
+def rope_scale_token_major(
+    x_bf16: jax.Array,  # (T * heads, LANE), as `project_token_major` stores it
+    cos_ref: jax.Ref,  # (T, LANE) f32: each token's cos lanes
+    signed_sin_ref: jax.Ref,  # (T, LANE) f32: each token's sin * _gptj_sign()
+    quant_dtype: jnp.dtype,
+) -> tuple[jax.Array, jax.Array]:
+    """``rope_quant``'s rotation and scaling of T tokens' heads: the scaled
+    ``(T, heads, LANE)`` rows, and their ``(T * heads, 1)`` scales."""
+    tokens = cos_ref.shape[0]
+    heads = x_bf16.shape[0] // tokens
+    x = x_bf16.astype(jnp.float32)
+    partners = _gptj_partners(x_bf16).astype(jnp.float32)
+
+    def per_token(lanes_ref):
+        """``lanes_ref``'s row of each token, on each of its heads."""
+        return jnp.concatenate(
+            [
+                jnp.broadcast_to(lanes_ref[pl.ds(t, 1), :], (heads, LANE))
+                for t in range(tokens)
+            ],
+            axis=0,
+        )
+
+    y = _rope_rows_signed(x, partners, per_token(cos_ref), per_token(signed_sin_ref))
+    scaled, scale = _scale_rows(y, quant_dtype)
+    return scaled.reshape(tokens, heads, LANE), scale
+
+
+def store_scales_transposed(
+    scale: jax.Array,  # (T * heads, 1), as `rope_scale_token_major` returns it
+    scale_t_ref: jax.Ref,  # (H, tokens) f32
+    h0: int | jax.Array,
+    t0: int,
+    heads: int,
+) -> None:
+    """Stores the scale of head h of token t into ``scale_t_ref[h0 + h, t0 + t]``."""
+    for r in range(0, scale.shape[0], SUBLANE):
+        rows = pl.ds(h0 + r % heads, SUBLANE)
+        scale_t_ref[rows, pl.ds(t0 + r // heads, 1)] = scale[r : r + SUBLANE]
+
+
 def _kernel(
     # scalar prefetch
     positions_ref: jax.Ref,  # (M,) SMEM
@@ -182,25 +252,14 @@ def _kernel(
         def _():
             weight_copy(c).wait()
 
-        # `xla_prequantized_matmul`: f32 dot, then `* x_scale`, `* w_scale`
-        # and the cast to bf16.
         cols = pl.ds(c * N_CHUNK, N_CHUNK)
-        x = jax.lax.dot_general(
-            x_q_ref[...],
-            w_ref[:, cols],
-            (((1,), (0,)), ((), ())),
-            preferred_element_type=jnp.float32,
+        project_token_major(
+            x_q_ref,
+            w_ref.at[:, cols],
+            lanes_ref.at[2],
+            w_scale_ref.at[cols],
+            proj_ref.at[c % 2],
         )
-        x = x * jnp.concatenate([lanes_ref[2]] * heads_per_chunk, axis=1)
-        x = x * w_scale_ref[cols][None, :]
-        # The u32 view of the buffer holds rows 2r and 2r + 1 in the low and
-        # high half of word row r.
-        words = proj_ref.at[c % 2].bitcast(jnp.uint32)
-        for p in range(heads_per_chunk // 2):
-            pair = [x[:, (2 * p + i) * LANE : (2 * p + i + 1) * LANE] for i in range(2)]
-            words[pl.ds(p, TILE_T, stride=heads_per_chunk // 2), :] = (
-                pltpu.pack_elementwise(pair, packed_dtype=jnp.bfloat16)
-            )
 
     def rope_quant(c):
         """Rotates and scales chunk ``c``'s heads, ROPE_TOKENS tokens at a time."""
@@ -209,26 +268,13 @@ def _kernel(
         completes_tile = (h0 + heads_per_chunk) % FP8_SUBLANES == 0
         for t0 in range(0, TILE_T, ROPE_TOKENS):
             rows = pl.ds(t0 * heads_per_chunk, ROPE_TOKENS * heads_per_chunk)
-            x_bf16 = proj_ref[c % 2, rows, :]
-            x = x_bf16.astype(jnp.float32)
-            partners = _gptj_partners(x_bf16).astype(jnp.float32)
-
-            def per_token(k):
-                """``lanes_ref[k]``'s row of each token, on each of its heads."""
-                return jnp.concatenate(
-                    [
-                        jnp.broadcast_to(
-                            lanes_ref[k, pl.ds(t0 + i, 1), :], (heads_per_chunk, LANE)
-                        )
-                        for i in range(ROPE_TOKENS)
-                    ],
-                    axis=0,
-                )
-
-            y = _rope_rows_signed(x, partners, per_token(0), per_token(1))
-            scaled, scale = _scale_rows(y, quant_dtype)
-            scaled = scaled.reshape(ROPE_TOKENS, heads_per_chunk, LANE)
             tokens = pl.ds(t0, ROPE_TOKENS)
+            scaled, scale = rope_scale_token_major(
+                proj_ref[c % 2, rows, :],
+                lanes_ref.at[0, tokens],
+                lanes_ref.at[1, tokens],
+                quant_dtype,
+            )
             if not completes_tile:
                 held_ref[tokens, pl.ds(h0 - tile_h0, heads_per_chunk), :] = scaled
             else:
@@ -238,11 +284,7 @@ def _kernel(
                 q_ref[tokens, pl.ds(tile_h0, h0 + heads_per_chunk - tile_h0), :] = (
                     scaled.astype(quant_dtype)
                 )
-            for r in range(0, ROPE_TOKENS * heads_per_chunk, SUBLANE):
-                scale_t_ref[
-                    pl.ds(h0 + r % heads_per_chunk, SUBLANE),
-                    pl.ds(t0 + r // heads_per_chunk, 1),
-                ] = scale[r : r + SUBLANE]
+            store_scales_transposed(scale, scale_t_ref, h0, t0, heads_per_chunk)
 
     # Chunk c + 1's dot is issued ahead of chunk c's rope and scaling, which
     # read the other buffer, so the MXU works under them.
