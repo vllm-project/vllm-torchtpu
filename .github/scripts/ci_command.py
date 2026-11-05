@@ -86,15 +86,14 @@ def parse_ci_line(line: str) -> tuple[str | None, list[str] | None, str | None]:
         return (
             None,
             None,
-            f"Unknown `/ci` subcommand `{subcmd}`. "
-            "Comment `/ci help` to list valid commands.",
+            "Unknown `/ci` subcommand. Comment `/ci help` to list valid commands.",
         )
     if subcmd not in EXTRAS_SUBCOMMANDS:
         if len(tokens) > 2:
             return (
                 None,
                 None,
-                f"`/ci {subcmd}` takes no extra arguments (got `{tokens[2]}`). "
+                f"`/ci {subcmd}` takes no extra arguments. "
                 "Comment `/ci help` to list valid commands.",
             )
         return subcmd, [], None
@@ -105,7 +104,7 @@ def parse_ci_line(line: str) -> tuple[str | None, list[str] | None, str | None]:
             return (
                 None,
                 None,
-                f"Unknown `/ci {subcmd}` extra `{extra}`. "
+                f"Unknown `/ci {subcmd}` extra. "
                 f"Valid extras: {valid_list} (see `/ci help`).",
             )
     extras = [e for e in allowed if e in tokens[2:]]
@@ -160,6 +159,7 @@ def _trigger_build(
     message: str,
     env: dict[str, str],
     bk_token: str,
+    gh_token: str = "",
 ) -> dict[str, Any]:
     if not bk_token:
         raise RuntimeError("BUILDKITE_API_TOKEN is required to trigger builds")
@@ -176,12 +176,28 @@ def _trigger_build(
         "pull_request_base_branch": (pr.get("base") or {}).get("ref", "main"),
         "env": env,
     }
+    commit_author_name, commit_author_email = "", ""
+    if gh_token:
+        try:
+            commit_data = _api_json(
+                f"https://api.github.com/repos/{repo}/commits/{head['sha']}",
+                gh_token,
+            )
+            c_author = (commit_data.get("commit") or {}).get("author") or {}
+            commit_author_name = (c_author.get("name") or "").strip()
+            commit_author_email = (c_author.get("email") or "").strip()
+        except Exception as exc:
+            print(
+                f"WARNING: commit author lookup failed ({_err_summary(exc)})",
+                file=sys.stderr,
+            )
     pr_author = ((pr.get("user") or {}).get("login") or "").strip()
-    if pr_author:
-        payload["author"] = {
-            "name": pr_author,
-            "email": f"{pr_author.lower()}@users.noreply.github.com",
-        }
+    author_name = commit_author_name or pr_author
+    author_email = commit_author_email or (
+        f"{pr_author.lower()}@users.noreply.github.com" if pr_author else ""
+    )
+    if author_name or author_email:
+        payload["author"] = {"name": author_name, "email": author_email}
     labels = [
         lbl["name"]
         for lbl in (pr.get("labels") or [])
@@ -352,6 +368,16 @@ def handle_pr_info(
     return body
 
 
+def handle_auto_merge_disabled(repo: str, pr_number: int, gh_token: str) -> str:
+    """Post an empty `/ci merge` marker when auto-merge is disabled on a PR."""
+    comments_url = f"https://api.github.com/repos/{repo}/issues/{pr_number}/comments"
+    body = (
+        "Auto-merge disabled; cleared `/ci merge` extras.\n\n<!-- ci-merge-extras: -->"
+    )
+    _api_json(comments_url, gh_token, method="POST", payload={"body": body})
+    return body
+
+
 def handle_comment(
     repo: str,
     pr_number: int,
@@ -390,12 +416,15 @@ def handle_comment(
     if subcmd == "cancel":
         cancelled = _cancel_pr_builds(pr, repo, pr_number, bk_token)
         if not cancelled:
-            return reply("No running CI builds for this PR.")
+            return reply(
+                "No running CI builds for this PR.\n\n<!-- ci-merge-extras: -->"
+            )
         nums = ", ".join(f"#{n}" for n in cancelled)
         noun = "build" if len(cancelled) == 1 else "builds"
         return reply(
             f"Cancelled {noun} {nums}. To leave the merge queue, click "
             "**Disable auto-merge** or **Remove from queue** on the GitHub PR page."
+            "\n\n<!-- ci-merge-extras: -->"
         )
     if pr.get("state") != "open":
         return reply(
@@ -423,7 +452,9 @@ def handle_comment(
                 )
         extras_csv = ",".join(extras)
         marker = (
-            f"<!-- ci-merge-extras: {extras_csv} -->\n<!-- ci-merge-actor: {author} -->"
+            f"<!-- ci-merge-extras: {extras_csv} -->\n"
+            f"<!-- ci-merge-actor: {author} -->\n"
+            f"<!-- ci-merge-sha: {pr['head']['sha']} -->"
             if extras_csv
             else "<!-- ci-merge-extras: -->"
         )
@@ -456,6 +487,7 @@ def handle_comment(
                 f"/ci precheck (PR #{pr_number} by @{author})",
                 {"CI_PRECHECK": "1"},
                 bk_token,
+                gh_token,
             )
             notes.append(f"Buildkite CPU checks ({build['web_url']})")
         except Exception as exc:
@@ -472,6 +504,7 @@ def handle_comment(
         f"{cmd_text} (PR #{pr_number} by @{author})",
         {"CI_RUN_TPU": "1", "CI_EXTRAS": ",".join(extras)},
         bk_token,
+        gh_token,
     )
     extras_label = ", ".join(extras) if extras else "none"
     return reply(
@@ -484,14 +517,17 @@ if __name__ == "__main__":
     repo, pr_num = os.environ["GITHUB_REPOSITORY"], int(os.environ["PR_NUMBER"])
     actor, gh_tok = os.environ["ACTOR_LOGIN"], os.environ["GH_TOKEN"]
     if os.environ.get("GITHUB_EVENT_NAME") == "pull_request_target":
-        handle_pr_info(
-            repo,
-            pr_num,
-            actor,
-            gh_tok,
-            draft=os.environ.get("PR_DRAFT", "").lower() == "true",
-            is_bot=os.environ.get("ACTOR_TYPE") == "Bot",
-        )
+        if os.environ.get("GITHUB_EVENT_ACTION") == "auto_merge_disabled":
+            handle_auto_merge_disabled(repo, pr_num, gh_tok)
+        else:
+            handle_pr_info(
+                repo,
+                pr_num,
+                actor,
+                gh_tok,
+                draft=os.environ.get("PR_DRAFT", "").lower() == "true",
+                is_bot=os.environ.get("ACTOR_TYPE") == "Bot",
+            )
     else:
         body, bk_tok = (
             os.environ.get("COMMENT_BODY", ""),

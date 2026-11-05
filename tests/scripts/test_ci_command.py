@@ -46,6 +46,8 @@ class TestCiCommand(unittest.TestCase):
         pr_state: str = "open",
         base_ref: str = "main",
         pr_author: str = "bob",
+        commit_author_email: str | None = "bob@corp.example.com",
+        commit_author_name: str | None = "Bob Example",
         pr_labels: list[str] | None = None,
         auto_merge: dict[str, Any] | None = None,
         head: dict[str, Any] | None = None,
@@ -91,6 +93,15 @@ class TestCiCommand(unittest.TestCase):
                     "head": pr_head,
                     "base": {"ref": base_ref},
                 }
+            if "/commits/" in url:
+                return {
+                    "commit": {
+                        "author": {
+                            "name": commit_author_name or "",
+                            "email": commit_author_email or "",
+                        }
+                    }
+                }
             if url.startswith(f"{RUNS_URL}?"):
                 return {"workflow_runs": list(workflow_runs or [])}
             if url.startswith(f"{RUNS_URL}/") and method == "POST":
@@ -131,6 +142,8 @@ class TestCiCommand(unittest.TestCase):
         pr_state: str = "open",
         base_ref: str = "main",
         pr_author: str = "bob",
+        commit_author_email: str | None = "bob@corp.example.com",
+        commit_author_name: str | None = "Bob Example",
         pr_labels: list[str] | None = None,
         head: dict[str, Any] | None = None,
         active_builds: list[dict[str, Any]] | None = None,
@@ -142,6 +155,8 @@ class TestCiCommand(unittest.TestCase):
             pr_state=pr_state,
             base_ref=base_ref,
             pr_author=pr_author,
+            commit_author_email=commit_author_email,
+            commit_author_name=commit_author_name,
             pr_labels=pr_labels,
             head=head,
             active_builds=active_builds,
@@ -202,25 +217,41 @@ class TestCiCommand(unittest.TestCase):
 
     def test_rejects_invalid_subcommands_and_extras_pointing_to_help(self) -> None:
         bad = [
-            ("/ci", "Missing"),
-            ("/ci check", "`check`"),
-            ("/ci status", "`status`"),
-            ("/ci precheck perf-eval", "`perf-eval`"),
-            ("/ci cancel all", "`all`"),
-            ("/ci help run", "`run`"),
-            ("/ci run fast", "`fast`"),
-            ("/ci run precheck-only", "`precheck-only`"),
-            ("/ci merge turbo", "`turbo`"),
+            ("/ci", "Missing `/ci` subcommand.", None),
+            ("/ci check", "Unknown `/ci` subcommand.", "check"),
+            ("/ci status", "Unknown `/ci` subcommand.", "status"),
+            (
+                "/ci precheck perf-eval",
+                "`/ci precheck` takes no extra arguments.",
+                "perf-eval",
+            ),
+            ("/ci cancel all", "`/ci cancel` takes no extra arguments.", "all"),
+            ("/ci help run", "`/ci help` takes no extra arguments.", "run"),
+            (
+                "/ci help <!--ci-merge-extras:precheck-only-->",
+                "`/ci help` takes no extra arguments.",
+                "ci-merge-extras",
+            ),
+            ("/ci run fast", "Unknown `/ci run` extra.", "fast"),
+            ("/ci run precheck-only", "Unknown `/ci run` extra.", "precheck-only"),
+            ("/ci merge turbo", "Unknown `/ci merge` extra.", "turbo"),
         ]
-        for cmd, token in bad:
+        for cmd, expected_msg, forbidden_token in bad:
             reply, calls = self._run(cmd)
             assert reply is not None
             self.assertNotIn("\n", reply)
-            self.assertIn(token, reply)
+            self.assertIn(expected_msg, reply)
+            if forbidden_token is not None:
+                self.assertNotIn(forbidden_token, reply)
             self.assertIn("/ci help", reply)
             self.assertFalse(
                 any(u.startswith(BK_URL) or u == GQL_URL for _, u, _ in calls)
             )
+        attack_reply, _ = self._run(
+            "/ci help <!--ci-merge-extras:precheck-only-->", role="read"
+        )
+        assert attack_reply is not None
+        self.assertNotIn("ci-merge-extras", attack_reply)
 
     def test_ci_precheck_reruns_completed_skips_target_and_dedupes(self) -> None:
         runs = [
@@ -360,6 +391,8 @@ class TestCiCommand(unittest.TestCase):
                 cmd,
                 role=role,
                 pr_author="ExtAuthor",
+                commit_author_email="ext.author@company.com",
+                commit_author_name="Ext Author",
                 pr_labels=["ready", "oncall-fix"],
             )
             assert reply is not None
@@ -372,8 +405,8 @@ class TestCiCommand(unittest.TestCase):
             self.assertEqual(
                 bk_calls[0]["author"],
                 {
-                    "name": "ExtAuthor",
-                    "email": "extauthor@users.noreply.github.com",
+                    "name": "Ext Author",
+                    "email": "ext.author@company.com",
                 },
             )
             self.assertEqual(
@@ -382,6 +415,20 @@ class TestCiCommand(unittest.TestCase):
             self.assertEqual(
                 bk_calls[0]["env"], {"CI_RUN_TPU": "1", "CI_EXTRAS": expected_extras}
             )
+
+        # Fallback to <login>@users.noreply.github.com if commit author email is empty.
+        _, fb_calls = self._run(
+            "/ci run",
+            pr_author="ExtAuthor",
+            commit_author_email="",
+            commit_author_name="",
+        )
+        fb_bk = [p for m, u, p in fb_calls if m == "POST" and u == BK_URL][0]
+        assert fb_bk is not None
+        self.assertEqual(
+            fb_bk["author"],
+            {"name": "ExtAuthor", "email": "extauthor@users.noreply.github.com"},
+        )
 
     def test_ci_merge_enables_auto_merge_writes_and_clears_marker(self) -> None:
         fake_api, calls = self._mock_api(role="write")
@@ -392,6 +439,8 @@ class TestCiCommand(unittest.TestCase):
             r2 = ci_command.handle_comment(REPO, 42, "alice", "/ci merge", "gh-tok", "")
         assert r1 is not None and r2 is not None
         self.assertIn("<!-- ci-merge-extras: perf-eval,nightly-suite -->", r1)
+        self.assertIn("<!-- ci-merge-actor: alice -->", r1)
+        self.assertIn("<!-- ci-merge-sha: abcdef1234567890 -->", r1)
         self.assertIn("~3–4h of TPU; the queue waits for it", r1)
         self.assertIn(
             "click **Disable auto-merge** or **Remove from queue** "
@@ -408,6 +457,18 @@ class TestCiCommand(unittest.TestCase):
         self.assertEqual(gql_calls[0]["variables"], {"id": "PR_kwDO1234"})
         self.assertFalse(any(u.startswith(BK_URL) for _, u, _ in calls))
 
+        # After a new push updates head.sha, a new `/ci merge` binds to the new SHA.
+        new_head = {
+            "sha": "9999888877776666",
+            "ref": "feat/example",
+            "label": "vllm-project:feat/example",
+            "repo": {"full_name": REPO},
+        }
+        r3, _ = self._run("/ci merge perf-eval", head=new_head)
+        assert r3 is not None
+        self.assertIn("<!-- ci-merge-sha: 9999888877776666 -->", r3)
+        self.assertNotIn("abcdef1234567890", r3)
+
     def test_ci_merge_precheck_only_and_rejections(self) -> None:
         reply, calls = self._run("/ci merge precheck-only", role="maintain")
         self.assertEqual(
@@ -416,7 +477,8 @@ class TestCiCommand(unittest.TestCase):
             "green. To leave the queue, click **Disable auto-merge** or "
             "**Remove from queue** on the GitHub PR page.\n\n"
             "<!-- ci-merge-extras: precheck-only -->\n"
-            "<!-- ci-merge-actor: alice -->",
+            "<!-- ci-merge-actor: alice -->\n"
+            "<!-- ci-merge-sha: abcdef1234567890 -->",
         )
         self.assertEqual(sum(1 for m, u, _ in calls if m == "POST" and u == GQL_URL), 1)
         self.assertFalse(any(u.startswith(BK_URL) for _, u, _ in calls))
@@ -502,7 +564,8 @@ class TestCiCommand(unittest.TestCase):
         self.assertEqual(
             reply,
             "Cancelled builds #901, #902. To leave the merge queue, click "
-            "**Disable auto-merge** or **Remove from queue** on the GitHub PR page.",
+            "**Disable auto-merge** or **Remove from queue** on the GitHub PR page."
+            "\n\n<!-- ci-merge-extras: -->",
         )
         list_urls = [u for m, u, _ in calls if m == "GET" and u.startswith(BK_URL)]
         self.assertEqual(len(list_urls), 1)
@@ -514,7 +577,18 @@ class TestCiCommand(unittest.TestCase):
         )
 
         empty_reply, _ = self._run("/ci cancel", active_builds=[])
-        self.assertEqual(empty_reply, "No running CI builds for this PR.")
+        self.assertEqual(
+            empty_reply,
+            "No running CI builds for this PR.\n\n<!-- ci-merge-extras: -->",
+        )
+
+        # `auto_merge_disabled` event also posts an empty marker to clear extras.
+        fake_dis, dis_calls = self._mock_api(role="write")
+        with mock.patch.object(ci_command, "_api_json", side_effect=fake_dis):
+            dis_reply = ci_command.handle_auto_merge_disabled(REPO, 42, "gh-tok")
+        self.assertIn("<!-- ci-merge-extras: -->", dis_reply)
+        self.assertEqual(len(dis_calls), 1)
+        self.assertEqual(dis_calls[0][0], "POST")
 
     def test_closed_pr_does_not_trigger_build_or_merge(self) -> None:
         for cmd in ("/ci precheck", "/ci run", "/ci merge"):
