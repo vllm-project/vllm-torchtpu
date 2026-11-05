@@ -23,6 +23,9 @@ from vllm_torchtpu.kernels.deepseek_v41.csa2.pipeline import (
     csa2_gather_chunk_size,
     csa2_pipeline,
 )
+from vllm_torchtpu.kernels.deepseek_v41.output_projection import (
+    fused_output_projection,
+)
 from vllm_torchtpu.kernels.mla.paged_swa import write_swa_pages
 
 if TYPE_CHECKING:
@@ -240,6 +243,16 @@ def _project(output: jax.Array, weight: jax.Array, scales: jax.Array) -> jax.Arr
     return wo_a_projection(output, weight, scales.reshape(-1), None)
 
 
+def _project_out(
+    output: jax.Array,
+    wa: jax.Array,
+    sa: jax.Array,
+    wb: jax.Array,
+    sb: jax.Array,
+) -> jax.Array:
+    return fused_output_projection(output, wa, sa.reshape(-1), wb, sb)
+
+
 def _manual_bridge(function, mesh, tensor_args, out_specs):
     from jax.sharding import PartitionSpec as P
 
@@ -319,6 +332,12 @@ def initialize_csa2_ops() -> None:
             _project,
             (P(),) * 3,
             lambda x, w, *_: x.new_empty((x.shape[0], w.shape[1])),
+        ),
+        (
+            "project_out",
+            _project_out,
+            (P(),) * 5,
+            lambda x, wa, sa, wb, sb: x.new_empty((x.shape[0], wb.shape[1])),
         ),
     )
     output_counts = {
@@ -497,6 +516,41 @@ def project(
     output: torch.Tensor, weight: torch.Tensor, scales: torch.Tensor
 ) -> torch.Tensor:
     return _ops["project"](output, weight, scales)
+
+
+def fused_output_supported(
+    output: torch.Tensor,
+    wa: torch.Tensor,
+    sa: torch.Tensor,
+    wb: torch.Tensor,
+    sb: torch.Tensor,
+) -> bool:
+    """Whether ``project_out`` covers these operands (the kernel's envelope)."""
+    fp8 = torch.float8_e4m3fn
+    return (
+        output.shape[0] in (240, 288)
+        and output.shape[1:] == (64, 512)
+        and output.dtype == torch.bfloat16
+        and wa.shape == (4096, 8192)
+        and wa.dtype == fp8
+        and sa.numel() == 8192
+        and sa.dtype == torch.float32
+        and wb.shape == (8192, 5120)
+        and wb.dtype == fp8
+        and sb.shape == (5120,)
+        and sb.dtype == torch.float32
+    )
+
+
+def project_out(
+    output: torch.Tensor,
+    wa: torch.Tensor,
+    sa: torch.Tensor,
+    wb: torch.Tensor,
+    sb: torch.Tensor,
+) -> torch.Tensor:
+    """``wo_b(wo_a(output))`` in one kernel; wo_a's result stays in VMEM."""
+    return _ops["project_out"](output, wa, sa, wb, sb)
 
 
 def prepare_swa(

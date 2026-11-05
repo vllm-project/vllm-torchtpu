@@ -2156,6 +2156,15 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
         assert output.dtype == torch.bfloat16
         assert output.shape[1:] == (self.n_local_heads, self.head_dim)
         if self._csa2:
+            wo_b = self.wo_b
+            wb = wo_b.weight
+            if getattr(wo_b, KEEP_VLLM_LAYOUT_ATTR, False):
+                wb = wb.transpose(0, 1)
+            operands = (output, self.wo_a.weight, self.wo_a.weight_scale, wb)
+            if getattr(wo_b, "bias", None) is None and (
+                csa2_adapter.fused_output_supported(*operands, wo_b.weight_scale)
+            ):
+                return csa2_adapter.project_out(*operands, wo_b.weight_scale)
             projected = csa2_adapter.project(
                 output, self.wo_a.weight, self.wo_a.weight_scale
             )
