@@ -120,9 +120,9 @@ def _gather_routing(topk_ids: jax.Array, topk_weights: jax.Array):
     """All-gather the DP group's routing in one collective when it packs:
     a bf16 weight and an expert id below 2**15 share one int32.
 
-    Returns the gathered ids [D, S, K] and a function that reads the routes
-    of the given flat (member, token) rows; an out-of-range row reads expert
-    id -1 with weight 0.
+    Returns the gathered ids [D, S, K], a function that reads the routes of
+    the given flat (member, token) rows (an out-of-range row reads expert id
+    -1 with weight 0), and the packed routes [D * S, K] (None unpacked).
     """
     if topk_weights.dtype != jnp.bfloat16:
         ids = jax.lax.all_gather(topk_ids, DP_AXIS)
@@ -136,19 +136,22 @@ def _gather_routing(topk_ids: jax.Array, topk_weights: jax.Array):
                 flat_weights.at[rows].get(mode="fill", fill_value=0),
             )
 
-        return ids, read
+        return ids, read, None
     bits = jax.lax.bitcast_convert_type(topk_weights, jnp.uint16).astype(jnp.int32)
     packed = jax.lax.all_gather(jnp.left_shift(topk_ids, 16) | bits, DP_AXIS)
 
     def read(rows):
         routes = packed.reshape(-1, packed.shape[-1])
-        routes = routes.at[rows].get(mode="fill", fill_value=_EMPTY_ROUTE)
-        weights = jax.lax.bitcast_convert_type(
-            jnp.bitwise_and(routes, 0xFFFF).astype(jnp.uint16), jnp.bfloat16
-        )
-        return jnp.right_shift(routes, 16), weights
+        return _unpack_routes(routes.at[rows].get(mode="fill", fill_value=_EMPTY_ROUTE))
 
-    return jnp.right_shift(packed, 16), read
+    return jnp.right_shift(packed, 16), read, packed.reshape(-1, packed.shape[-1])
+
+
+def _unpack_routes(routes: jax.Array):
+    weights = jax.lax.bitcast_convert_type(
+        jnp.bitwise_and(routes, 0xFFFF).astype(jnp.uint16), jnp.bfloat16
+    )
+    return jnp.right_shift(routes, 16), weights
 
 
 def exchange_capacity(
@@ -212,11 +215,10 @@ def _capacity_overflow(
     send_rows = rows_hit.reshape(dp_size, num_tokens, dp_size, tp_size).sum(
         axis=(1, 2), dtype=jnp.int32
     )
-    return (
-        (rank_routes.max() > routes)
-        | (recv_rows.max() > rows)
-        | (send_rows.max() > rows)
+    excess = jnp.concatenate(
+        [rank_routes - routes, recv_rows - rows, send_rows.reshape(-1) - rows]
     )
+    return excess.max() > 0
 
 
 def _exclusive_cumsum(a: jax.Array, axis: int) -> jax.Array:
@@ -317,7 +319,9 @@ def _capacity_exchange(
     topk_ids,
     gathered_ids,
     read_routes,
+    packed_routes,
     experts_start,
+    overflow,
     *,
     tp_size,
     dp_size,
@@ -325,6 +329,9 @@ def _capacity_exchange(
     moe,
 ):
     """Send and receive buffers of ``rows`` rows, filled without gaps.
+
+    When ``overflow`` is set no rank sends anything (every rank sees the same
+    flag), so the buffers cannot overrun; the caller discards the result.
 
     A rank sends its tokens grouped by destination member, each group in token
     order, and receives the groups of its sources in DP-position order, each
@@ -348,8 +355,11 @@ def _capacity_exchange(
     token = jnp.arange(num_tokens, dtype=jnp.int32)
     row = jnp.arange(rows, dtype=jnp.int32)
 
+    fits = jnp.logical_not(overflow)
     need_out = (member_index(topk_ids)[:, :, None] == member).any(axis=1)  # [S, D]
+    need_out = need_out & fits
     need = (member_index(gathered_ids)[..., None] == member).any(axis=2)  # [D, S, D]
+    need = need & fits
     need_in = (need & (member == dp_pos)).any(axis=2)  # [D, S]
     counts = need.sum(axis=1, dtype=jnp.int32)  # [source, destination]
     send_sizes = need_out.sum(axis=0, dtype=jnp.int32)
@@ -371,13 +381,20 @@ def _capacity_exchange(
     in_row = recv_start[:, None] + jnp.cumsum(need_in, axis=1, dtype=jnp.int32) - 1
     in_row = jnp.where(need_in, in_row, rows)  # [D, S]
     in_hit = in_row[None] == row[:, None, None]  # [rows, D, S]
-    source = (member[:, None] * num_tokens + token[None, :])[None]
-    source_row = jnp.where(
-        in_hit.any(axis=(1, 2)),
-        jnp.where(in_hit, source, 0).sum(axis=(1, 2)),
-        dp_size * num_tokens,
-    )
-    recv_ids, recv_weights = read_routes(source_row)
+    filled = in_hit.any(axis=(1, 2))
+    if packed_routes is None:
+        source = (member[:, None] * num_tokens + token[None, :])[None]
+        source_row = jnp.where(
+            filled, jnp.where(in_hit, source, 0).sum(axis=(1, 2)), dp_size * num_tokens
+        )
+        recv_ids, recv_weights = read_routes(source_row)
+    else:
+        # At most one hit per row: an integer sum selects the packed route.
+        hit = in_hit.reshape(rows, -1, 1)
+        routes = jnp.where(hit, packed_routes[None], 0).sum(axis=1)
+        recv_ids, recv_weights = _unpack_routes(
+            jnp.where(filled[:, None], routes, _EMPTY_ROUTE)
+        )
 
     sent = _tile_rows(x[send_index])
     received = jax.lax.ragged_all_to_all(
@@ -441,7 +458,7 @@ def ragged_a2a_moe_local(
     num_tokens = x.shape[0]
     local_num_experts = w1.shape[0]
     slots = dp_size * num_tokens
-    gathered_ids, read_routes = _gather_routing(topk_ids, topk_weights)
+    gathered_ids, read_routes, packed_routes = _gather_routing(topk_ids, topk_weights)
 
     def moe(max_local_routes):
         def run(received, recv_weights, recv_ids):
@@ -478,7 +495,7 @@ def ragged_a2a_moe_local(
             experts_start,
             tp_size=tp_size,
             dp_size=dp_size,
-            moe=moe(0),
+            moe=moe(slots * topk),
         )
 
     rows, routes = exchange_capacity(
@@ -494,20 +511,6 @@ def ragged_a2a_moe_local(
     if rows >= slots and routes >= slots * topk:
         return full()
 
-    def capacity():
-        return _capacity_exchange(
-            x,
-            w1,
-            topk_ids,
-            gathered_ids,
-            read_routes,
-            experts_start,
-            tp_size=tp_size,
-            dp_size=dp_size,
-            rows=rows,
-            moe=moe(routes if routes < rows * topk else 0),
-        )
-
     overflow = _capacity_overflow(
         gathered_ids,
         tp_size=tp_size,
@@ -515,7 +518,23 @@ def ragged_a2a_moe_local(
         rows=rows,
         routes=routes,
     )
-    return jax.lax.cond(overflow, full, capacity)
+    # The capacity exchange runs outside the conditional, so the schedule
+    # around it (weight prefetches for the following layers) is unchanged.
+    out = _capacity_exchange(
+        x,
+        w1,
+        topk_ids,
+        gathered_ids,
+        read_routes,
+        packed_routes,
+        experts_start,
+        overflow,
+        tp_size=tp_size,
+        dp_size=dp_size,
+        rows=rows,
+        moe=moe(routes),
+    )
+    return jax.lax.cond(overflow, full, lambda: out)
 
 
 def ragged_a2a_moe(
