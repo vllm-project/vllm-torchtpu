@@ -90,11 +90,12 @@ def _serving_verify_inputs(benchmark, batch, page_size, context, page_stride):
         0,
         np.where(np.arange(batch) % 3 == 1, first - 80, first),
     ).astype(np.int32)
-    metadata, _, _ = prepare_swa_metadata(
-        jnp.asarray(table),
+    (metadata,), _, _ = prepare_swa_metadata(
+        jnp.asarray(table).reshape(-1),
         jnp.arange(batch + 1, dtype=jnp.int32) * 6,
         jnp.asarray(positions),
         jnp.asarray(minimum),
+        layers=1,
         page_size=page_size,
         page_stride=page_stride,
         row_offset=page_stride - page_size,
