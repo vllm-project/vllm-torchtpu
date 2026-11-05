@@ -2646,6 +2646,8 @@ def test_get_kv_cache_spec_propagates_is_draft_layer_cpu(monkeypatch):
         runner_only_attn_layers=set(),
         _hybrid_uniform_page_size_bytes=None,
         _unified_kv_layout=False,
+        _uniform_mamba_layout=False,
+        _mamba_num_blocks=None,
         _is_async_drafter=False,
         drafter=None,
     )
