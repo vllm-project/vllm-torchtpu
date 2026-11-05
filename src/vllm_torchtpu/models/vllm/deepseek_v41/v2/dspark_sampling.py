@@ -8,17 +8,21 @@ import jax.numpy as jnp
 from jax.sharding import PartitionSpec as P
 from torch_tpu._internal import pallas
 
+from vllm_torchtpu.kernels.fused_greedy_head import head_logits
 from vllm_torchtpu.kernels.markov_sampling import sample_slot
 from vllm_torchtpu.models.vllm.deepseek_v41.common.mhc import _collapse_flat
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import get_pallas_op_mesh
 
 
 def samples(
-    logits: jax.Array,
+    hidden: jax.Array,
+    head_weight: jax.Array,
     embedding: jax.Array,
     markov_weight: jax.Array,
     anchors: jax.Array,
 ) -> jax.Array:
+    # Slot-major base logits in one pass over the head weight.
+    logits = head_logits(hidden, head_weight)
     previous = anchors
     tokens = []
     for slot in range(logits.shape[0] // anchors.shape[0]):
@@ -32,11 +36,11 @@ def initialize_samples():
         "pallas::dspark_slot_major_samples",
         samples,
         mesh=None,
-        input_partition_specs=cast(Any, (P(),) * 4),
+        input_partition_specs=cast(Any, (P(),) * 5),
     )
     op.register_fake(
-        lambda logits, e, mw, anchors: anchors.new_empty(
-            (anchors.shape[0], logits.shape[0] // anchors.shape[0])
+        lambda hidden, w, e, mw, anchors: anchors.new_empty(
+            (anchors.shape[0], hidden.shape[0] // anchors.shape[0])
         )
     )
     return op

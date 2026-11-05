@@ -420,14 +420,13 @@ class DSparkDeepseekV41ForCausalLM(nn.Module):
         ):
             return None
         slot_hidden = hidden.view(48, 5, 5120).transpose(0, 1).reshape(240, 5120)
-        logits = self.compute_logits(slot_hidden)
-        if logits.shape != (240, 129280) or logits.dtype != torch.bfloat16:
-            return None
         markov = self.model.markov_head
         anchors = input_ids[:240].view(48, 5)[:, 0]
-        assert self._decode_samples is not None
+        assert self._decode_samples is not None and self.lm_head is not None
+        # compute_logits's projection, fused into the sampler (scale 1, no cap).
         return self._decode_samples(
-            logits,
+            self.model.norm(slot_hidden),
+            self.lm_head.weight,
             markov.markov_w1.weight,
             markov.markov_w2.weight,
             anchors,
