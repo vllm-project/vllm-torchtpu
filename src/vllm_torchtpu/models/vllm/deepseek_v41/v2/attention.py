@@ -542,7 +542,9 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
             and self.window_size == 128
             and self.n_local_heads == 64
         )
-        self._csa2 = bool(self.compress_ratio) and csa2_supported
+        # Compress-ratio-0 layers (SWA only, and the DSpark draft) run CSA2's
+        # SWA-only form: one attention kernel reads native pages for every layer.
+        self._csa2 = csa2_supported
         # Set after weight loading, once wo_b's runtime layout is known.
         self._fused_wo_b = False
         self._fused_preprocess = csa2_supported
