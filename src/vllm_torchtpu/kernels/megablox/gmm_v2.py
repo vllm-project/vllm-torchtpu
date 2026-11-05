@@ -1456,13 +1456,17 @@ def gmm_v2(
 # activation rows are rounded the way the gate/up kernel stores them.
 
 
+# Smallest row bucket of gmm_v2_mlp; the other bucket is the whole row tile.
+DEFAULT_MLP_BUCKET = 32
+
+
 @dataclasses.dataclass(frozen=True)
 class MlpConfigs:
     up: GmmConfigs  # gate/up projection with the fused activation
     down: GmmConfigs  # down projection
     num_parts: int  # column parts of the gate/up weights per expert
     down_parts: int  # column parts of the down weights per expert
-    bucket_base: int  # row bucket of the matmuls
+    bucket_ms: tuple[int, ...]  # row buckets of the matmuls, ascending to tile_m
 
     @property
     def size_inter(self) -> int:
@@ -1489,7 +1493,7 @@ def make_mlp_configs(
     fuse_act: str,
     num_parts: int,
     down_parts: int,
-    bucket_rows: int | None,
+    buckets: tuple[int, ...] | None = None,
     maybe_quantize_lhs: bool = False,
     rhs_quant_dtype: jnp.dtype | None = None,
 ) -> MlpConfigs | None:
@@ -1536,13 +1540,18 @@ def make_mlp_configs(
         fuse_act=None,
         rhs_quant_dtype=rhs_quant_dtype,
     )
-    bucket_base = bucket_rows or up.tiles.bucket_base
+    tile_m = up.tiles.tile_m
+    if buckets is None:
+        # Decode steps route a few rows to each expert: most tiles fit 32 rows.
+        buckets = (
+            (DEFAULT_MLP_BUCKET, tile_m) if tile_m > DEFAULT_MLP_BUCKET else (tile_m,)
+        )
     cfgs = MlpConfigs(
         up=up,
         down=down,
         num_parts=num_parts,
         down_parts=down_parts,
-        bucket_base=bucket_base,
+        bucket_ms=tuple(buckets),
     )
     num_lanes = pltpu.get_tpu_info().num_lanes
     mxu_size = pltpu.get_tpu_info().mxu_column_size
@@ -1564,8 +1573,9 @@ def make_mlp_configs(
         or (2 * cfgs.part_size) % mxu_size
         or cfgs.part_size % num_lanes
         or cfgs.down_part_size % mxu_size
-        or up.tiles.tile_m % bucket_base
-        or bucket_base % up.dims.size_lhs_sublane
+        or buckets[-1] != tile_m
+        or list(buckets) != sorted(set(buckets))
+        or any(b % up.dims.size_lhs_sublane for b in buckets)
     ):
         return None
     return cfgs
@@ -1603,7 +1613,6 @@ def mlp_kernel_main(
     dims = up.dims
     sub = dims.size_lhs_sublane
     tile_m = up.tiles.tile_m
-    bucket_base = cfgs.bucket_base
     size_k = dims.size_k
     size_inter = cfgs.size_inter
     part = cfgs.part_size
@@ -1753,8 +1762,11 @@ def mlp_kernel_main(
                 acc_masked.astype(tiled_out_ref.dtype)
             )
 
-        bucket_ms = [bucket_base * (i + 1) for i in range(tile_m // bucket_base)]
-        bucket_idx = m_end_local // bucket_base
+        # Smallest bucket holding the rows up to m_end_local.
+        bucket_ms = cfgs.bucket_ms
+        bucket_idx = sum(
+            (m_end_local > b).astype(jnp.int32) for b in bucket_ms[:-1]
+        ) + jnp.int32(0)
 
         for p in range(cfgs.num_parts):
             with jax.named_scope(f"mlp_wait_up{p}"):
@@ -1834,7 +1846,7 @@ def mlp_supported(
     fuse_act: str | None,
     num_parts: int = 2,
     down_parts: int = 1,
-    bucket_rows: int | None = None,
+    buckets: tuple[int, ...] | None = None,
     maybe_quantize_lhs: bool = False,
     rhs_quant_dtype: jnp.dtype | None = None,
 ) -> bool:
@@ -1859,7 +1871,7 @@ def mlp_supported(
         fuse_act=fuse_act,
         num_parts=num_parts,
         down_parts=down_parts,
-        bucket_rows=bucket_rows,
+        buckets=buckets,
         maybe_quantize_lhs=maybe_quantize_lhs,
         rhs_quant_dtype=rhs_quant_dtype,
     )
@@ -1896,7 +1908,7 @@ class MlpIndexMaps:
         "fuse_act",
         "num_parts",
         "down_parts",
-        "bucket_rows",
+        "buckets",
         "vmem_limit_bytes",
         "maybe_quantize_lhs",
         "rhs_quant_dtype",
@@ -1914,7 +1926,7 @@ def gmm_v2_mlp(
     fuse_act: str,
     num_parts: int = 2,
     down_parts: int = 1,
-    bucket_rows: int | None = None,
+    buckets: tuple[int, ...] | None = None,
     vmem_limit_bytes: int | None = None,
     maybe_quantize_lhs: bool = True,
     rhs_quant_dtype: jnp.dtype | None = None,
@@ -1953,7 +1965,7 @@ def gmm_v2_mlp(
         fuse_act=fuse_act,
         num_parts=num_parts,
         down_parts=down_parts,
-        bucket_rows=bucket_rows,
+        buckets=buckets,
         maybe_quantize_lhs=maybe_quantize_lhs,
         rhs_quant_dtype=rhs_quant_dtype,
     )
@@ -2002,7 +2014,7 @@ def gmm_v2_mlp(
     name = (
         f"gmm_v2_mlp-g_{dims.size_group}-m_{dims.size_m}-k_{dims.size_k}"
         f"-act_{fuse_act}-n_{dims.size_n}-n2_{size_n}-tm_{tiles.tile_m}"
-        f"-bm_{cfgs.bucket_base}-p_{num_parts}-q_{down_parts}"
+        f"-bm_{'_'.join(map(str, cfgs.bucket_ms))}-p_{num_parts}-q_{down_parts}"
     )
     hbm = pl.BlockSpec(memory_space=pltpu.HBM)
     return pl.pallas_call(
