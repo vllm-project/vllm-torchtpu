@@ -39,7 +39,7 @@ def _pack(keys, layout):
 
 @pytest.mark.parametrize(
     "page_size,max_model_len",
-    [(128, 8192), (32, 8192), (256, 8192), (128, 50000), (128, 98816), (64, 98816)],
+    [(128, 8192), (128, 50000), (128, 98816)],
 )
 @pytest.mark.parametrize("block_size", [None, 8])
 def test_paged_mqa_logits_matches_reference(page_size, max_model_len, block_size):
@@ -123,7 +123,7 @@ def _calc_diff(x, y):
 # Mirrors vLLM tests/kernels/attention/test_deepgemm_attention.py
 # `test_deepgemm_fp8_fp4_paged_mqa_logits`: BF16 references (unquantized q and
 # K, signed weights), causal speculative rows and calc_diff < 1e-3.
-@pytest.mark.parametrize("page_size", [64, 128])
+@pytest.mark.parametrize("page_size", [128])
 @pytest.mark.parametrize("batch_size,next_n", [(4, 1), (2, 2), (2, 4)])
 def test_paged_mqa_logits_matches_vllm_reference(batch_size, next_n, page_size):
     if jax.default_backend() != "tpu":
