@@ -104,6 +104,7 @@ if TYPE_CHECKING:
     MOE_FUSED_EP_PUSH_SHARED_EXPERT: bool = True
     MOE_FUSED_EP_PUSH_LIGHT_PREPUSH: int = 2
     MOE_FUSED_EP_PUSH_SINGLE_BARRIER: bool = True
+    MOE_FUSED_EP_PUSH_EARLY_SCALE_SCATTER: int = 2
     TPU_EXPERT_PLACEMENT: str = ""
     TPU_LATENT_PROJ_INTRA_CHIP_TP: bool = False
     TPU_TOKEN_BUCKET_EXTRA: list[int] = []
@@ -844,6 +845,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # routing exchange open with one all-pairs barrier phase instead of two.
     "MOE_FUSED_EP_PUSH_SINGLE_BARRIER": env_bool(
         "MOE_FUSED_EP_PUSH_SINGLE_BARRIER", default=True
+    ),
+    # MOE_FUSED_EP_KERNEL_IMPL=push with the in-op shared expert: the
+    # activation scale-slab scatter (a SparseCore offload) is not held behind
+    # the shared expert (1), nor behind the SparseCore pre-push (2), so it can
+    # run while the TensorCore computes the shared expert.
+    "MOE_FUSED_EP_PUSH_EARLY_SCALE_SCATTER": env_int(
+        "MOE_FUSED_EP_PUSH_EARLY_SCALE_SCATTER", 2
     ),
     # MOE_FUSED_EP_KERNEL_IMPL=push: run the layer's FP8 shared expert as one
     # kernel (kernels/quantized_matmul/shared_expert.py) inside the MoE op,

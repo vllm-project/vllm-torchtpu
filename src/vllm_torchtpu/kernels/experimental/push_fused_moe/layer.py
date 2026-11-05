@@ -282,6 +282,7 @@ def fused_ep_moe_push(
     kernel_plan_tables=False,
     light_prepush=0,
     single_barrier=False,
+    early_scale_scatter=0,
     expert_slot=None,
     expert_load=None,
     shared_expert=None,
@@ -322,8 +323,10 @@ def fused_ep_moe_push(
     (host.routing_pairs_from_tables); `light_prepush` (1 or 2) gives the
     SparseCore pre-push the lightest experts and orders the rest
     (plan_kernel._tables); `single_barrier` opens the expert kernel and the
-    routing exchange with one barrier phase, not two. The caller
-    (layers/adapter/fused_moe_ep.py) reads all of them from envs.
+    routing exchange with one barrier phase, not two; `early_scale_scatter`
+    lets the scale-slab scatter run under the in-op shared expert (1: not
+    held behind it; 2: nor behind the SparseCore pre-push). The
+    caller (layers/adapter/fused_moe_ep.py) reads all of them from envs.
 
     `expert_slot` [experts, R] i32 and `expert_load` [e_total] i32 (both
     replicated, optional) are the expert-layout operands dynamic EPLB
@@ -852,9 +855,20 @@ def fused_ep_moe_push(
         # Keep the scale-slab scatter (a SparseCore offload) behind the
         # pre-push on the SparseCore queue. The shared expert joins here, so
         # the expert kernel, which reads the slab, cannot start before it.
-        slab_row, scale_bits_g, slab, *shared_out = lax.optimization_barrier(
-            (slab_row, scale_bits_g, slab) + shared_out
-        )
+        if early_scale_scatter == 2:
+            # Nor behind the pre-push: the scatter may take the SparseCore
+            # first; the light pre-push still lands under the shared expert.
+            slab_row, scale_bits_g = lax.optimization_barrier((slab_row, scale_bits_g))
+        elif early_scale_scatter:
+            # The shared expert joins after the scatter instead (below), so
+            # the scatter's SparseCore work can run under it.
+            slab_row, scale_bits_g, slab = lax.optimization_barrier(
+                (slab_row, scale_bits_g, slab)
+            )
+        else:
+            slab_row, scale_bits_g, slab, *shared_out = lax.optimization_barrier(
+                (slab_row, scale_bits_g, slab) + shared_out
+            )
         # The activation row scale, scattered onto the slab row each routed
         # pair computes on (v2's scale slab; see there).
         if form.quantized_activations:
@@ -872,6 +886,10 @@ def fused_ep_moe_push(
             ).reshape(scale_rows, HIDDEN_LANE_BLOCK)
         else:
             scale_slab = None
+        if early_scale_scatter and shared_out and scale_slab is not None:
+            scale_slab, slab, *shared_out = lax.optimization_barrier(
+                (scale_slab, slab) + tuple(shared_out)
+            )
         if shard_tables is not None:
             kernel_tables, expert_rows, slab_base, counts, _ = shard_tables
         elif routing_inputs is not None:
@@ -1122,6 +1140,7 @@ def fused_ep_moe_push(
         float(shared_limit) if has_shared and shared_limit is not None else False,
         int(light_prepush),
         bool(single_barrier),
+        int(early_scale_scatter),
     )
     out_specs = (P(ax),) + ((P(),) if has_expert_load else ()) + ((P(ax),) * has_shared)
     out_specs = out_specs if len(out_specs) > 1 else out_specs[0]
