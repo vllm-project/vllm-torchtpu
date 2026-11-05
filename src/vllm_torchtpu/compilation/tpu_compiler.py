@@ -669,7 +669,7 @@ class TpuCompilerAdaptor(CompilerInterface):
         entry: Any,
         graph: fx.GraphModule,
         was_wrapped: bool,
-        fingerprint: str | None = None,
+        fingerprint: str | None,
     ) -> bool:
         """Write the bundled entry for `graph` to `path`. True if it landed.
 
