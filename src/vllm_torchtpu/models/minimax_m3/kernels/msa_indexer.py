@@ -49,6 +49,11 @@ DEFAULT_KERNEL = "v3"
 # Large prefill tiles: v3's DMA ring is slower there on fp8 (1.79 vs 1.51 ms).
 DEFAULT_LARGE_KERNEL = "v2"
 _TILE_SHIFT = 16
+# tile_info = query row of the tile << _ROW_SHIFT | request of the tile
+_ROW_SHIFT = 10
+_SEQ_MASK = (1 << _ROW_SHIFT) - 1
+# f32 query rows are read at element offsets that are multiples of the sublane tile.
+_ROW_ALIGN = 8
 _GROUP_MASK = (1 << _TILE_SHIFT) - 1
 
 
@@ -63,7 +68,7 @@ def _kernel_v1(
 ):
     pages_per_step = len(refs) - 1
     page_refs, o_ref = refs[:pages_per_step], refs[pages_per_step]
-    q = q_ref[...]
+    q = q_ref[...].astype(jnp.bfloat16)
     maxima = []
     for page_ref in page_refs:
         page_max = None
@@ -108,7 +113,7 @@ def _kernel_v2(
     stacked, so each dot keeps the query tile latched across many pages."""
     pages_per_step = len(refs) - 1
     page_refs, o_ref = refs[:pages_per_step], refs[pages_per_step]
-    q = q_ref[...]
+    q = q_ref[...].astype(jnp.bfloat16)
     block_q = q.shape[0]
     page_size = page_refs[0].shape[1] * page_refs[0].shape[2]
     pages_per_dot = max(
@@ -175,7 +180,7 @@ def _kernel_v3(
 
     def copies(w, buf, slot):
         entry = work_ref[w]
-        seq = tile_seq_ref[entry >> _TILE_SHIFT]
+        seq = tile_seq_ref[entry >> _TILE_SHIFT] & _SEQ_MASK
         first = (entry & _GROUP_MASK) * pages_per_step
         live = jnp.maximum(seq_pages_ref[seq] - first, 1)
         base = seq * pages_per_seq + first
@@ -217,7 +222,7 @@ def _kernel_v3(
         def _():
             start(step + 1, buf0, 0)
 
-    q = q_ref[...]
+    q = q_ref[...].astype(jnp.bfloat16)
 
     @pl.when(even)
     def _():
@@ -234,9 +239,16 @@ _KERNELS = {"v1": _kernel_v1, "v2": _kernel_v2}
 
 
 def _tiles(cu_q_lens: jax.Array, seq_in_class: jax.Array, block_q: int, max_tiles: int):
-    """Query tiles of one tile class; tiles never span requests."""
+    """Query tiles of one tile class.
+
+    A request's tiles start at its first token rounded down to a multiple of
+    `_ROW_ALIGN` (the kernel reads query rows at aligned element offsets), so
+    a tile may begin with up to `_ROW_ALIGN - 1` rows of the previous request
+    and end with rows of the next; those rows' scores are never read.
+    """
     max_num_seqs = cu_q_lens.shape[0] - 1
-    q_lens = jnp.where(seq_in_class, cu_q_lens[1:] - cu_q_lens[:-1], 0)
+    start = (cu_q_lens[:-1] // _ROW_ALIGN) * _ROW_ALIGN
+    q_lens = jnp.where(seq_in_class, cu_q_lens[1:] - start, 0)
     tiles_per_seq = -(-q_lens // block_q)
     tile_ends = jnp.cumsum(tiles_per_seq)
     tile = jnp.arange(max_tiles, dtype=jnp.int32)
@@ -247,8 +259,8 @@ def _tiles(cu_q_lens: jax.Array, seq_in_class: jax.Array, block_q: int, max_tile
         max_num_seqs - 1,
     )
     first_tile = tile_ends - tiles_per_seq
-    tile_row0 = cu_q_lens[tile_seq] + (tile - first_tile[tile_seq]) * block_q
-    return tile_seq, tile_row0, first_tile, tile_ends[-1]
+    tile_row0 = start[tile_seq] + (tile - first_tile[tile_seq]) * block_q
+    return tile_seq, tile_row0, first_tile, start, tile_ends[-1]
 
 
 def _class_scores(
@@ -275,11 +287,22 @@ def _class_scores(
     num_groups_per_seq = -(-pages_per_seq // pages_per_step)
     padded_pages = num_groups_per_seq * pages_per_step
 
-    tile_seq, tile_row0, first_tile, num_tiles = _tiles(
+    tile_seq, tile_row0, first_tile, tile_start, num_tiles = _tiles(
         cu_q_lens, seq_in_class, block_q, max_tiles
     )
-    rows = tile_row0[:, None] + jnp.arange(block_q, dtype=jnp.int32)
-    q_tiles = index_q[jnp.clip(rows, 0, num_tokens - 1), 0].reshape(-1, head_dim)
+    # The kernel reads each tile's query rows straight from the token-ordered
+    # queries at an element offset (a gather of [tiles * block_q, D] cost
+    # ~0.5 ms per layer on an 8K prefill, twin j-52e2df18). Rows past a
+    # request's end read the next request's queries; their columns are never
+    # gathered back. f32 so that any row offset is a whole 32-bit row.
+    if max_num_seqs > _SEQ_MASK + 1:
+        raise NotImplementedError(
+            f"at most {_SEQ_MASK + 1} requests, got {max_num_seqs}"
+        )
+    q_rows = jnp.pad(index_q[:, 0].astype(jnp.float32), ((0, block_q), (0, 0)))
+    tile_info = (
+        jnp.clip(tile_row0, 0, num_tokens // _ROW_ALIGN * _ROW_ALIGN) << _ROW_SHIFT
+    ) | tile_seq
 
     # Work list: every page group of every tile's request.
     seq_pages = -(-seq_lens // page_size)
@@ -300,9 +323,9 @@ def _class_scores(
     work = (work_tile << _TILE_SHIFT) | jnp.clip(work_group, 0, _GROUP_MASK)
 
     def page_block(g):
-        def index_map(w, work, tile_seq, block_tables):
+        def index_map(w, work, tile_info, block_tables, *_):
             entry = work[w]
-            seq = tile_seq[entry >> _TILE_SHIFT]
+            seq = tile_info[entry >> _TILE_SHIFT] & _SEQ_MASK
             col = jnp.minimum(
                 (entry & _GROUP_MASK) * pages_per_step + g, pages_per_seq - 1
             )
@@ -316,8 +339,13 @@ def _class_scores(
         grid=(jnp.maximum(group_ends[-1], 1),),
         in_specs=[
             pl.BlockSpec(
-                (block_q, head_dim),
-                lambda w, work, *_: (work[w] >> _TILE_SHIFT, 0),
+                (pl.Element(block_q), pl.Element(head_dim)),
+                lambda w, work, tile_info, *_: (
+                    pl.multiple_of(
+                        tile_info[work[w] >> _TILE_SHIFT] >> _ROW_SHIFT, _ROW_ALIGN
+                    ),
+                    0,
+                ),
             ),
             *(page_block(g) for g in range(pages_per_step)),
         ],
@@ -352,7 +380,7 @@ def _class_scores(
             compiler_params=params,
             interpret=interpret,
             name="minimax_m3_msa_block_scores",
-        )(work, tile_seq, block_tables, seq_pages, q_tiles, index_cache)
+        )(work, tile_info, block_tables, seq_pages, q_rows, index_cache)
     else:
         scores_t = pl.pallas_call(
             _KERNELS[kernel],
@@ -361,7 +389,7 @@ def _class_scores(
             compiler_params=params,
             interpret=interpret,
             name="minimax_m3_msa_block_scores",
-        )(work, tile_seq, block_tables, q_tiles, *([index_cache] * pages_per_step))
+        )(work, tile_info, block_tables, q_rows, *([index_cache] * pages_per_step))
 
     # Back to token order: token t of request r sits in r's tiles at its offset.
     tok = jnp.arange(num_tokens, dtype=jnp.int32)
@@ -371,7 +399,7 @@ def _class_scores(
         ),
         max_num_seqs - 1,
     )
-    offset = tok - cu_q_lens[seq]
+    offset = tok - tile_start[seq]
     col = (first_tile[seq] + offset // block_q) * block_q + offset % block_q
     col = jnp.clip(col, 0, max_tiles * block_q - 1)
     return scores_t, col
@@ -448,7 +476,9 @@ def block_scores(
     small, small_col = score(
         active & ~is_large,
         block_q=block_q,
-        max_tiles=min(max_num_seqs, num_tokens),
+        # Aligned tile starts can push a request of <= block_q tokens into a
+        # second tile.
+        max_tiles=min(2 * max_num_seqs, num_tokens + max_num_seqs),
         pages_per_step=small_pages_per_step,
         kernel=kernel,
     )
@@ -459,7 +489,12 @@ def block_scores(
     large, large_col = score(
         is_large,
         block_q=large_block_q,
-        max_tiles=num_tokens // large_block_q + max_large,
+        # +1 per request for the partial last tile, plus the up-to-7 rows each
+        # aligned start adds.
+        max_tiles=num_tokens // large_block_q
+        + max_large
+        + -(-(_ROW_ALIGN - 1) * max_large // large_block_q)
+        + 1,
         pages_per_step=pages_per_step,
         kernel=large_kernel,
     )
