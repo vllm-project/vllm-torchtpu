@@ -142,11 +142,25 @@ def _kernel_v1(
         o_ref[...] = out.reshape(num_heads, block_q, head_dim).astype(o_ref.dtype)
 
 
-def _page_rows(kv_ref) -> jax.Array:
+def _page_rows(kv_ref, seen: jax.Array | None) -> jax.Array:
     """``[1, S / p, p, 2D]`` page -> bf16 ``[S, 2D]`` rows by one width-changing
     bitcast of the packed 32-bit words (rows come out in the bitcast's token
-    order; `_bitcast_slots` gives the slot of each row)."""
+    order; `_bitcast_slots` gives the slot of each row).
+
+    With `seen`, slots ``>= seen`` are zeroed in the packed words first: no token of the
+    tile sees them, but p @ v multiplies them by p = 0, and 0 * NaN is NaN,
+    so an unwritten slot holding any bytes would poison the tile.
+    """
+    rows_per_page, packing, width = kv_ref.shape[1:]
+    bits = 32 // packing
     words = kv_ref.bitcast(jnp.uint32)[0, :, 0, :]
+    if seen is not None:
+        row = jax.lax.broadcasted_iota(jnp.int32, (rows_per_page, 1), 0)
+        keep = jnp.zeros((rows_per_page, 1), jnp.uint32)
+        for j in range(packing):
+            field = jnp.uint32(((1 << bits) - 1) << (bits * j))
+            keep = keep | jnp.where(row * packing + j < seen, field, jnp.uint32(0))
+        words = words & keep
     return pltpu.bitcast(words, kv_ref.dtype).astype(jnp.bfloat16)
 
 
@@ -204,16 +218,23 @@ def _kernel_v2(
     keys, values, masks = [], [], []
     for g, kv_ref in enumerate(kv_refs):
         page = work_page_ref[w * pages_per_step + g]
-        rows = _page_rows(kv_ref)
         is_selected = jnp.max(
             (selected == page).astype(jnp.int32), axis=1, keepdims=True
         )
         limit = jnp.where(local_page == page, local_limit, page_size)
         limit = jnp.where(page >= 0, limit * is_selected, 0)  # [Bq, 1]
+        # Zero what no token of the tile sees: p = 0 there, but 0 * NaN is
+        # NaN and an unwritten slot may hold any bytes. Cheapest form per
+        # dtype on v7x (j-3eb5e8aa, j-a9135755): a select on the converted
+        # fp8 value rows; an AND on the packed bf16 words.
+        seen = jnp.max(limit)
+        if packing == 4:
+            rows = _page_rows(kv_ref, None)
+            values.append(jnp.where(row_slots < seen, rows[:, head_dim:], 0))
+        else:
+            rows = _page_rows(kv_ref, seen)
+            values.append(rows[:, head_dim:])
         keys.append(rows[:, :head_dim])
-        # Zero the value rows no token of the tile sees (p = 0 there, but
-        # 0 * NaN is NaN and an unwritten slot may hold any bytes).
-        values.append(jnp.where(row_slots < jnp.max(limit), rows[:, head_dim:], 0))
         masks.append(slots < limit)  # [Bq, S]
     k = jnp.concatenate(keys, axis=0)
     v = jnp.concatenate(values, axis=0)
@@ -308,21 +329,22 @@ def _attention_call(
     _, rows_per_page, packing, row_width = kv_cache.shape
     topk = selected.shape[1]
     pages, meta, num_groups = _work_list(selected, block_q, pages_per_step)
+    prefetch = [pages, meta]
 
-    def tile_block(w, pages, meta):
+    def tile_block(w, pages, meta, *_):
         return (meta[w] >> _TILE_SHIFT, 0)
 
-    def head_major_block(w, pages, meta):
+    def head_major_block(w, pages, meta, *_):
         return (0, meta[w] >> _TILE_SHIFT, 0)
 
     def page_block(g):
-        def index_map(w, pages, meta):
+        def index_map(w, pages, *_):
             return (jnp.maximum(pages[w * pages_per_step + g], 0), 0, 0, 0)
 
         return pl.BlockSpec((1, rows_per_page, packing, row_width), index_map)
 
     grid_spec = pltpu.PrefetchScalarGridSpec(
-        num_scalar_prefetch=2,
+        num_scalar_prefetch=len(prefetch),
         grid=(num_groups,),
         in_specs=[
             pl.BlockSpec((num_heads, block_q, head_dim), head_major_block),
@@ -348,8 +370,7 @@ def _attention_call(
         interpret=interpret,
         name="minimax_m3_msa_sparse_attention",
     )(
-        pages,
-        meta,
+        *prefetch,
         q.transpose(1, 0, 2),
         selected,
         local_page[:, None],
