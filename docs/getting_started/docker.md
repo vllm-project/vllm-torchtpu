@@ -117,7 +117,15 @@ The `ci` and `dev` targets carry [vllm-router](https://github.com/vllm-project/r
 
 ## vllm-rs and numactl
 
-Every target carries vLLM's Rust frontend, `vllm-rs`, taken from the vLLM wheel published for the commit the image installs (PyPI for a release tag, wheels.vllm.ai for a commit). It sits at `/usr/local/bin/vllm-rs` and is linked inside the `vllm` package, where vLLM looks for it by default, so `VLLM_USE_RUST_FRONTEND=1` alone makes `vllm serve` use it. An image built for a commit with no published wheel yet, like the upstream HEAD of an integration run, has no `vllm-rs`. Every target also has `numactl`, which `--numa-bind` uses to launch each worker.
+Every target has `numactl`, which `--numa-bind` uses to launch each worker.
+
+vLLM's Rust frontend, `vllm-rs`, is compiled into the image only with `--vllm-rs` (build arg `BUILD_VLLM_RS=true`), since the compile takes minutes. It is built from the vLLM commit the image installs, sits at `/usr/local/bin/vllm-rs`, and is linked inside the `vllm` package, where vLLM looks for it by default, so `VLLM_USE_RUST_FRONTEND=1` alone makes `vllm serve` use it:
+
+```bash
+./docker/build_image.sh --target dev --vllm-rs -t dev:latest
+```
+
+An image built with `--vllm-source` drops it, as the binary matches the pinned vLLM rather than the source tree.
 
 ## Useful build arguments
 
