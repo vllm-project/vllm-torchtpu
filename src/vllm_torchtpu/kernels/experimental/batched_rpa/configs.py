@@ -174,6 +174,9 @@ class ServingConfigs:
     return_lse: bool = False
     skip_kv_update: bool = False
     mask_invalid_v: bool | None = None
+    skip_empty_launch: bool = True
+    fence_output: bool = True
+    unmasked_interior: bool = True
 
     def __post_init__(self):
         if self.mask_invalid_v is None:
@@ -316,7 +319,10 @@ class RpaConfigs:
     def page_window_slot_len(self) -> int:
         """SMEM entries per window slot: lane-aligned, plus a lane group of slack
         when the window itself is not."""
-        num_lanes = pltpu.get_tpu_info().num_lanes
+        try:
+            num_lanes = pltpu.get_tpu_info().num_lanes
+        except Exception:
+            num_lanes = 128
         entries = self.page_window_entries
         return utils.align_to(entries, num_lanes) + (
             num_lanes if entries % num_lanes else 0

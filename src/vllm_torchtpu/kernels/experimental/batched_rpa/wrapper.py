@@ -223,6 +223,9 @@ def _is_sfs(tpu_info) -> bool:
     )
 
 
+_MAX_BKV_SZ = 4096
+
+
 def calculate_block_sizes(
     model_cfgs: configs.ModelConfigs,
     serve_cfgs: configs.ServingConfigs,
@@ -370,7 +373,9 @@ def calculate_block_sizes(
         return batch_size * num_muls
 
     def find_best_block_sizes(
-        max_batch_size: int, fixed_bq_sz: int | None = None
+        max_batch_size: int,
+        fixed_bq_sz: int | None = None,
+        max_bkv_sz: int = _MAX_BKV_SZ,
     ) -> configs.BlockSizes:
         """Loop through different block sizes to find the most optimal one."""
 
@@ -415,7 +420,7 @@ def calculate_block_sizes(
         while (
             calculate_vmem_usage(batch_size, bq_sz, bkv_sz) < capped_vmem_limit_bytes
             and bkv_sz <= max_seq_len
-            and bkv_sz <= 4096  # TEMP PATCH
+            and bkv_sz <= max_bkv_sz
         ):
             # Unless bq is a fixed value, we want to ensure bq size is the same as bkv
             # size. When using causal masking, if bq size is larger than bkv size,
@@ -477,8 +482,20 @@ def calculate_block_sizes(
     decode_batch_size = 8
     prefill_batch_size = 2
 
-    decode_block_sizes = find_best_block_sizes(decode_batch_size, decode_query_size)
-    prefill_block_sizes = find_best_block_sizes(prefill_batch_size)
+    max_bkv_sz = _MAX_BKV_SZ
+    if model_cfgs.sliding_window is not None:
+        # Bounding bkv_sz <= sliding_window // 2 limits masked-out boundary work
+        # in decode and keeps square prefill tiles small enough to contain
+        # unmasked interior steps (bq_sz + bkv_sz <= sliding_window). The search
+        # never drops below its initial bkv_stride block.
+        max_bkv_sz = min(max_bkv_sz, model_cfgs.sliding_window // 2)
+
+    decode_block_sizes = find_best_block_sizes(
+        decode_batch_size, decode_query_size, max_bkv_sz=max_bkv_sz
+    )
+    prefill_block_sizes = find_best_block_sizes(
+        prefill_batch_size, max_bkv_sz=max_bkv_sz
+    )
 
     return decode_block_sizes, prefill_block_sizes
 
@@ -509,6 +526,9 @@ def calculate_block_sizes(
         "attention_scope",
         "return_lse",
         "mask_invalid_v",
+        "skip_empty_launch",
+        "fence_output",
+        "unmasked_interior",
     ),
     # Donation of transient inputs can fail for some runtime buffer layouts in
     # the experimental tuning path. Keep donation only for kv_cache, which is
@@ -552,6 +572,9 @@ def ragged_paged_attention(
     attention_scope: configs.AttentionScope = configs.AttentionScope.FULL,
     return_lse: bool = False,
     mask_invalid_v: bool | None = None,
+    skip_empty_launch: bool = True,
+    fence_output: bool = True,
+    unmasked_interior: bool = True,
 ) -> tuple[jax.Array, jax.Array] | tuple[jax.Array, jax.Array, jax.Array]:
     """Perform batched ragged paged attention.
 
@@ -699,6 +722,9 @@ def ragged_paged_attention(
         return_lse=return_lse,
         skip_kv_update=skip_kv_update,
         mask_invalid_v=mask_invalid_v,
+        skip_empty_launch=skip_empty_launch,
+        fence_output=fence_output,
+        unmasked_interior=unmasked_interior,
     )
 
     q_hbm, new_kv_hbm = prepare_inputs(
@@ -764,6 +790,10 @@ def ragged_paged_attention(
         kv_new_lens = q_lens
         q_offsets = global_kv_cache_lens
 
+    # XLA copies the output buffer around lax.cond, so host-level empty-segment
+    # branching is bounded to buckets no larger than a full decode batch.
+    branch_on_empty_segment = queries.shape[0] <= max_num_seqs * decode_query_size
+
     def run_rpa_kernel(
         mode: configs.RpaCase,
         o_hbm_alias_q_hbm: jax.Array,
@@ -811,25 +841,32 @@ def ragged_paged_attention(
             computer_cls=computer_cls,
             extra_scalars=extra_scalars,
         )
-        result = kernel.rpa_kernel(
-            cu_q_lens,
-            q_offsets,
-            kv_cache_lens,
-            kv_new_lens,
-            schedule_hbm,
-            o_hbm_alias_q_hbm,
-            new_kv_hbm,
-            kv_cache,
-            lse_hbm_in,
-            cfgs=cfgs,
-            computer_cls=computer_cls,
-        )
-        if return_lse:
+
+        def launch(operands):
+            o_in, kv_in, lse_in = operands
+            result = kernel.rpa_kernel(
+                cu_q_lens,
+                q_offsets,
+                kv_cache_lens,
+                kv_new_lens,
+                schedule_hbm,
+                o_in,
+                new_kv_hbm,
+                kv_in,
+                lse_in,
+                cfgs=cfgs,
+                computer_cls=computer_cls,
+            )
             o_out, kv_out, lse_out = result
-        else:
-            o_out, kv_out, _ = result
-            lse_out = None
-        return o_out, kv_out, lse_out
+            return o_out, kv_out, lse_out if return_lse else None
+
+        operands = (o_hbm_alias_q_hbm, kv_cache, lse_hbm_in)
+        if not (skip_empty_launch and branch_on_empty_segment):
+            return launch(operands)
+        # Keep schedule generation outside the conditional so identical layer
+        # geometries remain eligible for schedule CSE across layers.
+        seq_start, seq_end = cfgs.seq_range(distribution)
+        return jax.lax.cond(seq_end > seq_start, launch, lambda ops: ops, operands)
 
     o_hbm_alias_q_hbm, kv_cache, lse_hbm = run_rpa_kernel(
         configs.RpaCase.DECODE, q_hbm, kv_cache, lse_hbm_init
@@ -846,6 +883,10 @@ def ragged_paged_attention(
     num_q_heads_per_kv_head = num_q_heads // num_kv_heads
     o_hbm = o_hbm[:, :, :num_q_heads_per_kv_head, :head_dim]
     o_hbm = o_hbm.swapaxes(1, 0).reshape(queries.shape)
+    if fence_output:
+        # Materialize the token-major transpose in output precision rather than
+        # fusing it into downstream f32 quantization or projection math.
+        o_hbm = jax.lax.optimization_barrier(o_hbm)
 
     if not return_lse:
         return o_hbm, kv_cache

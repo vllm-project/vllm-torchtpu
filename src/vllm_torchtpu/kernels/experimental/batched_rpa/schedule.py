@@ -938,15 +938,35 @@ def rpa_metadata_schedule_kernel(
     hbm_offset = loop_carry.hbm_offset
     steps = pl.cdiv(count, cfgs.batch_size) + hbm_offset
     schedule_ref.actual_steps[0] = steps
+
     # Step 3: Mask out unvisited steps.
-    flush_to_hbm(
-        count,
-        schedule_ref,
-        schedule_hbm_ref,
-        hbm_offset,
-        dma_sem,
-        cfgs=cfgs,
-    )
+    def flush():
+        flush_to_hbm(
+            count,
+            schedule_ref,
+            schedule_hbm_ref,
+            hbm_offset,
+            dma_sem,
+            cfgs=cfgs,
+        )
+
+    if cfgs.serve.skip_empty_launch:
+        # When skip_empty_launch is enabled, an empty schedule only needs
+        # actual_steps written back to HBM.
+        pl.when(steps > 0)(flush)
+
+        @pl.when(steps == 0)
+        def _():
+            copy = pltpu.make_async_copy(
+                schedule_ref.actual_steps,
+                schedule_hbm_ref.actual_steps,
+                dma_sem.at[0],
+            )
+            copy.start()
+            copy.wait()
+
+    else:
+        flush()
 
 
 def generate_rpa_metadata(

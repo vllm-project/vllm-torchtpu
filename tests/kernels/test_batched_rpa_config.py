@@ -82,3 +82,58 @@ def test_calculate_block_sizes_generation(
         )
         assert decode_blocks.bq_sz >= decode_blocks.bq_c_sz >= expected_bq_c_min
         assert prefill_blocks.bq_sz >= prefill_blocks.bq_c_sz >= expected_bq_c_min
+
+
+@pytest.mark.parametrize(
+    "sliding_window,expected_decode_bkv,expected_prefill_bkv",
+    [
+        (1024, 512, 512),
+        (128, 256, 256),  # Clamped up to initial mxu_column_size stride.
+    ],
+)
+def test_sliding_window_bounds_decode_and_prefill_blocks(
+    sliding_window: int,
+    expected_decode_bkv: int,
+    expected_prefill_bkv: int,
+):
+    base_model_cfg = configs.ModelConfigs(
+        num_q_heads=4,
+        num_kv_heads=2,
+        head_dim=256,
+        sliding_window=None,
+        mask_value=-1e9,
+    )
+    sliding_model_cfg = configs.ModelConfigs(
+        num_q_heads=4,
+        num_kv_heads=2,
+        head_dim=256,
+        sliding_window=sliding_window,
+        mask_value=-1e9,
+    )
+    serve_cfg = configs.ServingConfigs(
+        num_seqs=64,
+        page_size=256,
+        total_q_tokens=16384,
+        num_page_indices=64 * 640,
+        dtype_q=jnp.bfloat16,
+        dtype_kv=jnp.float8_e4m3fn,
+        dtype_out=jnp.bfloat16,
+    )
+    vmem_limit = 64 * 1024 * 1024
+    with patch(
+        "jax.experimental.pallas.tpu.get_tpu_info",
+        return_value=_create_mock_tpu_info(7, chip_version="v7x", mxu_column_size=256),
+    ):
+        full_decode, full_prefill = wrapper.calculate_block_sizes(
+            base_model_cfg, serve_cfg, vmem_limit
+        )
+        sw_decode, sw_prefill = wrapper.calculate_block_sizes(
+            sliding_model_cfg, serve_cfg, vmem_limit
+        )
+
+    assert full_decode.bkv_sz > 512
+    assert full_prefill.bkv_sz == full_prefill.bq_sz == 1024
+    assert sw_decode.bkv_sz == expected_decode_bkv
+    assert sw_decode.batch_size == full_decode.batch_size
+    assert sw_prefill.bkv_sz == sw_prefill.bq_sz == expected_prefill_bkv
+    assert sw_prefill.batch_size == full_prefill.batch_size
