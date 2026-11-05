@@ -270,6 +270,9 @@ _TPU_COMPILE_ENV_IGNORED = {
     # backbone graph, and the KV cap reaches the hash through num_gpu_blocks.
     "VLLM_TPU_STATIC_POOLER",
     "VLLM_TPU_POOLING_KV_CACHE_TOKENS",
+    # Startup memory probe only; does not alter traced graphs or kernel lowering
+    # (num_gpu_blocks is hashed on its own).
+    "TPU_SKIP_UNQUANTIZED_PROFILE_RUN",
     # `import torch_tpu` (via libtpu.configure_library_path()) sets this to
     # <site-packages>/libtpu/libtpu.so, so the raw path would change the key
     # with the venv prefix or mount path. get_libtpu_cache_key() already

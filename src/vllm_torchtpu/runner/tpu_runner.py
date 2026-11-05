@@ -7956,17 +7956,27 @@ class TPUModelRunner(GPUModelRunner):
             # program-region reservation, and the kv=0-specialized graphs are
             # dead after the dynamo reset below — one throwaway program keeps
             # the region within budget for capture_model's full bucket ladder.
-            with self._profile_isolated_cache():
-                cc.compile_sizes = [num_tokens]
-                self._dummy_run(
-                    num_tokens, self.num_reqs_max_model_len, self.max_num_blocks_per_req
-                )
-            reset_compile_wrapper(self.model)
-            # reset_compile_wrapper wipes cache_dir; restore so
-            # capture_model can read/write the persistent cache.
-            cc.cache_dir, cc.local_cache_dir = saved_cache
-            cc.compile_sizes = saved_sizes
-            torch._dynamo.reset()
+            need_backbone_probe = (
+                not envs.TPU_SKIP_UNQUANTIZED_PROFILE_RUN
+                or self.enforce_eager
+                or self.vllm_config.quant_config is not None
+                or self.lora_config is not None
+                or self.parallel_config.pipeline_parallel_size > 1
+            )
+            if need_backbone_probe:
+                with self._profile_isolated_cache():
+                    cc.compile_sizes = [num_tokens]
+                    self._dummy_run(
+                        num_tokens,
+                        self.num_reqs_max_model_len,
+                        self.max_num_blocks_per_req,
+                    )
+                reset_compile_wrapper(self.model)
+                # reset_compile_wrapper wipes cache_dir; restore so
+                # capture_model can read/write the persistent cache.
+                cc.cache_dir, cc.local_cache_dir = saved_cache
+                cc.compile_sizes = saved_sizes
+                torch._dynamo.reset()
             synchronize_device()
 
             # Sampling subgraphs (Phase A) — uses the restored cache_dir.
