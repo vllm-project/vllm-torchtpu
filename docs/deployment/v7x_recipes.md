@@ -19,6 +19,7 @@ The recipes below are extracted directly from the repository's active PR and nig
 | `zai-org/GLM-5.2-FP8` | `v7x-16` (2 hosts, 16 devices) | `TP=1, DP=16` + EP | `fp8` weights, `fp8` KV | [`glm-5.2-fp8-dp16-ep.sh`](https://github.com/vllm-project/vllm-torchtpu/blob/main/scripts/vllm/benchmarking/configs/glm-5.2-fp8-dp16-ep.sh) |
 | `deepseek-ai/DeepSeek-V4-Pro-0813` | `v7x-16` (2 hosts, 16 devices) | `TP=1, DP=16` + EP | `deepseek_v4_fp8` (W4A8 MoE), `fp8_e4m3` KV | [`deepseek-v4-pro-dp16-ep.sh`](https://github.com/vllm-project/vllm-torchtpu/blob/main/scripts/vllm/benchmarking/configs/deepseek-v4-pro-dp16-ep.sh) |
 | `moonshotai/Kimi-K3` | `v7x-32` (4 hosts, 32 devices) | `TP=32, DP=1` + EP | `compressed-tensors` FP8, `fp8` KV | [`kimi-k3-tp32-ep.sh`](https://github.com/vllm-project/vllm-torchtpu/blob/main/scripts/vllm/benchmarking/configs/kimi-k3-tp32-ep.sh) |
+| `moonshotai/Kimi-K3.1-Pro` | `v7x-32` (4 hosts, 32 devices) | `TP=32, DP=1` + EP | `compressed-tensors` MXFP4, `fp8` KV | Not in CI yet |
 
 ---
 
@@ -255,3 +256,34 @@ vllm serve moonshotai/Kimi-K3 \
   --async-scheduling \
   --port 8000
 ```
+
+### `moonshotai/Kimi-K3.1-Pro` on `v7x-32` (`4 Hosts, TP=32 + EP`)
+
+Kimi-K3 with a sparse attention (DSA) indexer on every MLA layer. This recipe is not in the nightly CI yet. Start a Ray cluster across the hosts (see [Multi-Host Serving](../user_guide/multihost.md)), then run on the head node:
+
+```bash
+export TPU_MULTIHOST_BACKEND=ray
+export TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL=1
+export TPU_MOE_HIERARCHICAL_EP=1
+export VLLM_RAY_EXTRA_ENV_VARS_TO_COPY="TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL,TPU_MOE_HIERARCHICAL_EP"
+
+vllm serve moonshotai/Kimi-K3.1-Pro \
+  --tensor-parallel-size 32 \
+  --enable-expert-parallel \
+  --enable-ep-weight-filter \
+  --trust-remote-code \
+  --language-model-only \
+  --limit-mm-per-prompt '{"image":0,"video":0}' \
+  --kv-cache-dtype fp8 \
+  --max-model-len 10240 \
+  --max-num-batched-tokens 8192 \
+  --max-num-seqs 16 \
+  --gpu-memory-utilization 0.82 \
+  --compilation-config '{"compile_sizes":[1,8,16,8192]}' \
+  --async-scheduling \
+  --enable-prefix-caching \
+  --port 8000
+```
+
+> [!TIP]
+> **Alternative Layouts for `Kimi-K3.1-Pro`**: For longer contexts, add `--decode-context-parallel-size 8 --cp-kv-cache-interleave-size 4` and use `--compilation-config '{"compile_sizes":[8,16,8192]}'`, because compile sizes must be divisible by the DCP size.
