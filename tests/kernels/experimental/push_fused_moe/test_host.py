@@ -419,11 +419,13 @@ def test_table_kernel_matches_the_xla_tables(n_pre, skew):
         np.testing.assert_array_equal(cnt, np.asarray(want_counts))
 
 
+@pytest.mark.parametrize("mode", [1, 2])
 @pytest.mark.parametrize("n_pre", [1, 2, 3])
 @pytest.mark.parametrize("skew", [False, True], ids=["uniform", "skewed"])
-def test_light_prepush_only_reorders_the_visits(n_pre, skew):
+def test_light_prepush_only_reorders_the_visits(mode, n_pre, skew):
     """With light_prepush the table kernel visits the n_pre lightest experts
-    first (lightest at 0), then the rest most rows first; the shard tables
+    first (lightest at 0), then the rest most rows first (1) or rising to
+    the heaviest and falling back (2); the shard tables
     the expert kernel reads per expert are unchanged, and the pre-push
     counts follow the new first positions."""
     from vllm_torchtpu.kernels.experimental.push_fused_moe.plan_kernel import (
@@ -445,7 +447,7 @@ def test_light_prepush_only_reorders_the_visits(n_pre, skew):
                     tile_m=kw["tile_m"], interpret=True, light_prepush=lp,
                 )  # fmt: skip
             ]
-            for lp in (False, True)
+            for lp in (0, mode)
         )
         for k in (4, 5, 6, 7, 8):
             jax.tree.map(np.testing.assert_array_equal, light[k], base[k])
@@ -453,7 +455,10 @@ def test_light_prepush_only_reorders_the_visits(n_pre, skew):
         n_live = int((recv > 0).sum())
         lp = min(n_pre, n_live)
         order = list(base[2][:n_live])
-        want = order[n_live - lp :][::-1] + order[: n_live - lp]
+        rest = order[: n_live - lp]
+        if mode == 2:
+            rest = rest[1::2][::-1] + rest[0::2]
+        want = order[n_live - lp :][::-1] + rest
         np.testing.assert_array_equal(light[2][:n_live], want)
         assert light[3][0] + light[3][1] == recv[want[:lp]].sum()
 

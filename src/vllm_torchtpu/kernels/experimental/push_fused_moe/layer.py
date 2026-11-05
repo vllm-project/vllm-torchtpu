@@ -308,7 +308,7 @@ def fused_ep_moe_push(
     i32_scale_slab=False,
     vmem_combine=False,
     staging_slots=0,
-    light_prepush=False,
+    light_prepush=0,
     expert_slot=None,
     expert_load=None,
     shared_expert=None,
@@ -354,8 +354,9 @@ def fused_ep_moe_push(
     (host.routing_pairs_from_tables); `i32_scale_slab` hands the expert
     kernel the scale slab's i32 bit patterns to bitcast in VMEM, and
     `vmem_combine` combines the arrivals with the buffer resident in VMEM
-    where it fits (see `_combine_arrivals_fs`); `light_prepush` gives the
-    SparseCore pre-push the lightest experts (plan_kernel._tables). The
+    where it fits (see `_combine_arrivals_fs`); `light_prepush` (1 or 2)
+    gives the SparseCore pre-push the lightest experts and orders the rest
+    (plan_kernel._tables). The
     caller (layers/adapter/fused_moe_ep.py) reads all of them from envs.
 
     `expert_slot` [experts, R] i32 and `expert_load` [e_total] i32 (both
@@ -522,6 +523,9 @@ def fused_ep_moe_push(
         raise ValueError("kernel_plan_tables needs table_kernel and sharded_plan")
     if exchange_tables and not (table_kernel and exchange_row_gather):
         raise ValueError("exchange_tables needs table_kernel and exchange_row_gather")
+    light_prepush = int(light_prepush)
+    if light_prepush not in (0, 1, 2):
+        raise ValueError(f"light_prepush is 0, 1 or 2; got {light_prepush}")
     if light_prepush and not table_kernel:
         raise ValueError("light_prepush orders the visits in the table kernel")
     if table_kernel and interleave_visits:
@@ -1151,7 +1155,7 @@ def fused_ep_moe_push(
         has_shared and tuple((a.shape, a.dtype) for a in shared_args),
         has_shared and float(shared_limit),
         bool(vmem_combine),
-        bool(light_prepush),
+        int(light_prepush),
     )
     out_specs = (P(ax),) + ((P(),) if has_expert_load else ()) + ((P(ax),) * has_shared)
     out_specs = out_specs if len(out_specs) > 1 else out_specs[0]

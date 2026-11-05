@@ -469,6 +469,7 @@ FRONT_SWITCHES = (
     "vmem_combine",
     "exchange_row_gather+table_kernel+exchange_tables+light_prepush",
     "table_kernel+kernel_plan_tables+light_prepush",
+    "exchange_row_gather+table_kernel+exchange_tables+light_prepush=2",
 )
 
 
@@ -501,7 +502,10 @@ def test_served_dims_front_switches_are_bit_exact(shape, switch):
     )
     want = np.asarray(fused_ep_moe_push(x, *weights, gating, **common))
     assert np.isfinite(want.astype(np.float32)).all()
-    on = {name: True for name in switch.split("+")}
+    on = {
+        name: int(value) if value else True
+        for name, _, value in (item.partition("=") for item in switch.split("+"))
+    }
     got = fused_ep_moe_push(x, *weights, gating, **on, **common)
     np.testing.assert_array_equal(np.asarray(got), want)
     wrong = fused_ep_moe_push(x, *_roll(weights), gating, **common)
