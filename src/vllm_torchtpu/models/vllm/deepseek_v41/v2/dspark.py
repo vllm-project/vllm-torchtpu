@@ -27,7 +27,9 @@ from vllm.model_executor.models.qwen3_dspark import (
 from vllm.model_executor.models.utils import maybe_prefix
 from vllm.models.deepseek_v41.nvidia import model as upstream
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.layers.adapter.quantization.deepseek_v41 import DeepseekV41MoE
+from vllm_torchtpu.layers.core import table_lookup
 from vllm_torchtpu.logger import init_logger
 
 from ..common.mhc import (
@@ -119,7 +121,11 @@ def _insert_context_kv(
             requests = _token_requests(metadata, positions).clamp(
                 max=metadata.seq_lens.shape[0] - 1
             )
-            offsets = positions - metadata.seq_lens[requests] + attn.window_size
+            offsets = (
+                positions
+                - table_lookup.take(metadata.seq_lens, requests)
+                + attn.window_size
+            )
             swa_valid = (swa_slots >= 0) & (offsets >= 0) & (offsets < attn.window_size)
         else:
             swa_valid = swa_slots >= 0
@@ -385,9 +391,10 @@ class DSparkDeepseekV41ForCausalLM(nn.Module):
         None means the proposer retains its ordinary logits/Markov path.
         The returned sampler may also return None for an unsupported bucket.
         """
-        from .dspark_sampling import initialize_samples
+        from .dspark_sampling import initialize_logits_head, initialize_samples
 
         self._decode_samples = None
+        self._decode_logits = None
         if not (tp_size == 1 and sample_from_anchor and block_size == 5):
             return None
         assert self.lm_head is not None
@@ -403,6 +410,8 @@ class DSparkDeepseekV41ForCausalLM(nn.Module):
         ):
             return None
         self._decode_samples = initialize_samples()
+        if envs.TPU_DEEPSEEK_V41_DSPARK_PALLAS_LOGITS:
+            self._decode_logits = initialize_logits_head()
         return self._sample_decode
 
     def _sample_decode(
@@ -415,7 +424,13 @@ class DSparkDeepseekV41ForCausalLM(nn.Module):
         ):
             return None
         slot_hidden = hidden.view(48, 5, 5120).transpose(0, 1).reshape(240, 5120)
-        logits = self.compute_logits(slot_hidden)
+        if self._decode_logits is not None:
+            assert self.lm_head is not None
+            logits = self._decode_logits(
+                self.model.norm(slot_hidden), self.lm_head.weight
+            )
+        else:
+            logits = self.compute_logits(slot_hidden)
         if logits.shape != (240, 129280) or logits.dtype != torch.bfloat16:
             return None
         markov = self.model.markov_head

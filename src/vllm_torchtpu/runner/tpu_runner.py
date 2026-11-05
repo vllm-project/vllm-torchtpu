@@ -78,7 +78,7 @@ from vllm.v1.spec_decode.ngram_proposer import NgramProposer
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 from vllm.v1.worker.kv_connector_model_runner_mixin import KVConnectorOutput
 
-from vllm_torchtpu import envs, expert_relayout, utils
+from vllm_torchtpu import envs, expert_relayout, gc_policy, utils
 from vllm_torchtpu.block_major_pool import BlockMajorPoolLayout
 from vllm_torchtpu.compilation import shape_variants
 from vllm_torchtpu.distributed import utils as dist_utils
@@ -2764,6 +2764,7 @@ class TPUModelRunner(GPUModelRunner):
         from vllm_torchtpu.runner.tpu_runner_async_output import (
             assemble_spec_next_tokens,
             compute_num_rejected,
+            spec_chunk_next_inputs,
         )
 
         assert drafts is not None, (
@@ -2791,16 +2792,26 @@ class TPUModelRunner(GPUModelRunner):
             drafts_per_chunk,
         ):
             chunk_padded_num_reqs = nt_chunk.shape[0] if bucketed else num_reqs
-            drafts_chunk = fit_rows(drafts_chunk, chunk_padded_num_reqs)
-            src = assemble_spec_next_tokens(
-                nt_chunk, drafts_chunk, None if bucketed else num_reqs
-            )
+            num_rejected = None
+            if md is not None and envs.TPU_FUSED_SPEC_NEXT_INPUTS:
+                src, num_rejected = spec_chunk_next_inputs(
+                    nt_chunk,
+                    drafts_chunk,
+                    md.draft_lengths,
+                    chunk_padded_num_reqs,
+                    None if bucketed else num_reqs,
+                )
+            else:
+                drafts_chunk = fit_rows(drafts_chunk, chunk_padded_num_reqs)
+                src = assemble_spec_next_tokens(
+                    nt_chunk, drafts_chunk, None if bucketed else num_reqs
+                )
             if md is not None:
-                num_rejected_chunks.append(
-                    compute_num_rejected(
+                if num_rejected is None:
+                    num_rejected = compute_num_rejected(
                         nt_chunk, fit_rows(md.draft_lengths, chunk_padded_num_reqs)
                     )
-                )
+                num_rejected_chunks.append(num_rejected)
                 for r in range(num_reqs):
                     num_draft_per_req[req_offset + r] = int(md.draft_lengths_cpu[r])
             else:
@@ -2816,9 +2827,12 @@ class TPUModelRunner(GPUModelRunner):
                 next_token_indices[req_offset + r] = padded_req_offset + r
             req_offset += num_reqs
             padded_req_offset += chunk_padded_num_reqs
-        spec_num_rejected = (
-            torch.cat(num_rejected_chunks) if num_rejected_chunks else None
-        )
+        if envs.TPU_FUSED_SPEC_NEXT_INPUTS and len(num_rejected_chunks) == 1:
+            spec_num_rejected = num_rejected_chunks[0]
+        else:
+            spec_num_rejected = (
+                torch.cat(num_rejected_chunks) if num_rejected_chunks else None
+            )
         return (
             next_tokens_tpu_chunks,
             next_token_indices,
@@ -3140,6 +3154,13 @@ class TPUModelRunner(GPUModelRunner):
         ):
             from vllm_torchtpu.runner.tpu_runner_async_output import (
                 subtract_num_rejected_tokens,
+                subtract_num_rejected_tokens_fused,
+            )
+
+            subtract = (
+                subtract_num_rejected_tokens_fused
+                if envs.TPU_FUSED_SPEC_NEXT_INPUTS
+                else subtract_num_rejected_tokens
             )
 
             seq_idx_np = np.full(target_num_reqs, -1, dtype=np.int32)
@@ -3153,7 +3174,7 @@ class TPUModelRunner(GPUModelRunner):
                     seq_idx_np[i] = pos
                     pos_idx_np[acc : acc + n_sched] = pos
                 acc += n_sched
-            seq_lens, self.position_ids = subtract_num_rejected_tokens(
+            seq_lens, self.position_ids = subtract(
                 seq_lens,
                 self.position_ids,
                 self._pre_async_results.spec_decode_num_rejected_tokens,
@@ -3565,6 +3586,10 @@ class TPUModelRunner(GPUModelRunner):
     ) -> "tuple[int | None, int]":
         """Return the DP-wide padded token bucket and forward chunk count."""
         self._draft_proposals_needed = needs_draft_proposals
+        # Every rank reaches this point once per step, dummy steps included,
+        # which is what makes a step-cadenced collection land on all of them
+        # at once instead of 32 independent pauses.
+        gc_policy.on_coordinated_step()
         if not self._dp_lockstep_enabled():
             return None, local_num_chunks
         from vllm.distributed.parallel_state import get_dp_group

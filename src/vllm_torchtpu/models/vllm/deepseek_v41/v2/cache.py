@@ -8,8 +8,10 @@ import jax
 import torch
 from vllm.v1.worker.utils import allocate_kv_cache as allocate_upstream_kv_cache
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.deepseek_v4.csa_cache_layout import ROW_WORDS
 from vllm_torchtpu.kernels.deepseek_v41 import index_key_layout
+from vllm_torchtpu.kernels.deepseek_v41.tile_scatter import tile_scatter
 
 from .swa_cache import DeepseekV41SWASpec, swa_pool_bytes
 
@@ -383,6 +385,7 @@ _read_values_2bank_op = None
 _read_index_values_op = None
 _read_index_values_2bank_op = None
 _write_op = None
+_write_tiles_op = None
 _write_values_op = None
 _write_values_after_op = None
 _encode_fp8_op = None
@@ -1205,6 +1208,7 @@ def initialize_cache_ops():
 
     initialize_csa2_ops()
     global _read_values_op, _read_values_2bank_op, _write_op, _write_values_op
+    global _write_tiles_op
     global _encode_fp8_op, _write_values_after_op
     global _write_index_values_op, _write_index_values_after_op
     global _read_index_values_op, _read_index_values_2bank_op
@@ -1311,6 +1315,20 @@ def initialize_cache_ops():
     )
     _write_op.register_fake(lambda cache, slots, values: torch.empty_like(cache))
     mesh = get_vllm_model_wrapper_context().mesh
+    _write_tiles_op = pallas.jax_op(
+        "pallas::dsv41v2_cache_write_tiles",
+        jax.shard_map(
+            tile_scatter,
+            mesh=mesh,
+            in_specs=(P(), P(), P()),
+            out_specs=P(),
+            check_vma=False,
+        ),
+        donate_argnums=(0,),
+        mesh=get_pallas_op_mesh(),
+        input_partition_specs=cast(tuple[tuple[str, ...], ...], (P(), P(), P())),
+    )
+    _write_tiles_op.register_fake(lambda cache, slots, values: torch.empty_like(cache))
     # Pallas DMA runs independently on each device's replicated cache.
     # Mosaic calls require explicit manual partitioning on a multi-device mesh.
     write_values = jax.shard_map(
@@ -1425,6 +1443,14 @@ def write_cache(cache, slots, values, valid, after=None):
     else:
         assert _write_op is not None
         cache.copy_(_write_op(cache, slots.int(), values))
+
+
+def write_cache_slots(cache, slots, values):
+    """`write_cache` for int32 ``slots`` already holding -1 where invalid."""
+    assert slots.dtype == torch.int32 and cache.device.type != "cpu"
+    assert _write_op is not None and _write_tiles_op is not None
+    op = _write_tiles_op if envs.TPU_DEEPSEEK_V41_ENGRAM_TILE_SCATTER else _write_op
+    cache.copy_(op(cache, slots, values))
 
 
 def merge_sub_rows(
