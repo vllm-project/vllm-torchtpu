@@ -177,6 +177,8 @@ class KVBufferedRefSeqAlongLane(_BypassRef):
         sem = self.sem_recvs.at[slot]
         vmem_dst_lane = cast(jax.Ref, self.window_ref.at[slot])
         num_lanes = pltpu.get_tpu_info().num_lanes
+        rows = self._page_rows()
+        kv_cache_hbm, new_kv_hbm = self._shared_rows(kv_cache_hbm, new_kv_hbm)
         for b in range(self.cfgs.batch_size):
             for i in range(self.cfgs.bkv_p_cache):
                 hbm_p_idx, dst_off, sz = schedule_ref.get_dma_kv_cache(block_idx, b, i)
@@ -188,8 +190,8 @@ class KVBufferedRefSeqAlongLane(_BypassRef):
                 # vmem_dst_lane: (batch_size, num_kv_heads * 2, kv_head_dim // packing,
                 #     packing, page_size)
                 pltpu.make_async_copy(
-                    kv_cache_hbm.at[hbm_p_idx, :, :, :, pl.ds(0, sz)],
-                    vmem_dst_lane.at[b, :, :, :, pl.ds(dst_off, sz)],
+                    kv_cache_hbm.at[hbm_p_idx, :, rows, :, pl.ds(0, sz)],
+                    vmem_dst_lane.at[b, :, rows, :, pl.ds(dst_off, sz)],
                     sem,
                 ).start()
 
@@ -202,8 +204,8 @@ class KVBufferedRefSeqAlongLane(_BypassRef):
             # new_kv_hbm:
             # (num_kv_heads * 2, kv_head_dim // packing, packing, total_new_tokens)
             pltpu.make_async_copy(
-                new_kv_hbm.at[:, :, :, pl.ds(src_new_off, sz)],
-                vmem_dst_lane.at[b, :, :, :, pl.ds(dst_vmem_off, sz)],
+                new_kv_hbm.at[:, rows, :, pl.ds(src_new_off, sz)],
+                vmem_dst_lane.at[b, :, rows, :, pl.ds(dst_vmem_off, sz)],
                 sem,
             ).start()
 
@@ -220,6 +222,8 @@ class KVBufferedRefSeqAlongLane(_BypassRef):
         sem = self.sem_sends.at[slot]
         vmem_src_lane = cast(jax.Ref, self.window_ref.at[slot])
         num_lanes = pltpu.get_tpu_info().num_lanes
+        rows = self._page_rows()
+        kv_out_ref, _ = self._shared_rows(kv_out_ref, None)
         for b in range(self.cfgs.batch_size):
             do_writeback = schedule_ref.do_writeback[block_idx, b] == 1
             for i in range(self.cfgs.bkv_p_new):
@@ -233,10 +237,28 @@ class KVBufferedRefSeqAlongLane(_BypassRef):
                 skip = jnp.logical_or(is_no_op, jnp.logical_not(do_writeback))
                 sz = pl.multiple_of(jnp.where(skip, 0, dma_entry.wb_val), num_lanes)
                 pltpu.make_async_copy(
-                    vmem_src_lane.at[b, :, :, :, pl.ds(src_vmem_off, sz)],
-                    kv_out_ref.at[hbm_p_idx, :, :, :, pl.ds(dst_off, sz)],
+                    vmem_src_lane.at[b, :, rows, :, pl.ds(src_vmem_off, sz)],
+                    kv_out_ref.at[hbm_p_idx, :, rows, :, pl.ds(dst_off, sz)],
                     sem,
                 ).start()
+
+    def _page_rows(self) -> slice:
+        """The packed rows of a token that the kernel moves: all, or a shared-KV
+        page's value and rotated key rows."""
+        if self.cfgs.serve.shared_kv_rotary_dims:
+            return slice(0, self.cfgs.kv_rows)
+        return slice(None)
+
+    def _shared_rows(self, kv_hbm, new_kv_hbm):
+        """Shared-KV pages as one row axis: [pages, 1, 2 * head_dim / 4, 4,
+        page] (and the new K/V likewise), so `_page_rows` addresses the value's
+        rows and the rotated key rows that follow them."""
+        if not self.cfgs.serve.shared_kv_rotary_dims:
+            return kv_hbm, new_kv_hbm
+        kv_hbm = kv_hbm.reshape(kv_hbm.shape[0], 1, -1, *kv_hbm.shape[3:])
+        if new_kv_hbm is not None:
+            new_kv_hbm = new_kv_hbm.reshape(1, -1, *new_kv_hbm.shape[2:])
+        return kv_hbm, new_kv_hbm
 
     def wait_in(
         self,

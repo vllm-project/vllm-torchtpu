@@ -519,7 +519,17 @@ def sharded_ragged_paged_attention_from_qkv(
             f"fused qkv rows need a one-device model axis, got {shards} shards"
         )
     q_heads, kv_heads = num_q_heads, num_kv_heads
-    kv_cache_spec = P(None, None, "model", None, None)
+    kv_layout = rpa_kwargs.get(
+        "kv_layout", batched_rpa_configs.KVLayout.HEAD_ALONG_SUBLANE
+    )
+    seq_along_lane = kv_layout == batched_rpa_configs.KVLayout.SEQ_ALONG_LANE
+    # The head axis: [pages, 2 * kv heads, ...] or [pages, page, slots, ...].
+    kv_cache_spec = (
+        P(None, "model", None, None, None)
+        if seq_along_lane
+        else P(None, None, "model", None, None)
+    )
+    page_size = kv_cache.shape[4] if seq_along_lane else kv_cache.shape[1]
     prologue_dma_stores = rpa_kwargs.pop("prologue_dma_stores", False)
     prologue_fp8_queries = rpa_kwargs.pop("prologue_fp8_queries", False)
 
@@ -539,6 +549,9 @@ def sharded_ragged_paged_attention_from_qkv(
             kv_dtype=kv_cache.dtype,
             dma_stores=prologue_dma_stores,
             fp8_queries=prologue_fp8_queries,
+            kv_layout=kv_layout,
+            page_size=page_size,
+            shared_kv_rotary_dims=rpa_kwargs.get("shared_kv_rotary_dims", 0),
         )
         # Shape-only operands: with prepared_inputs the kernel reads no values
         # from them, and XLA drops the unused zeros.

@@ -974,7 +974,7 @@ def _zigzag_plan(world: int, num_tokens: int, page_size: int = 2) -> Any:
     return gemma4_patch.cp_prefill.make_zigzag_plan(num_tokens, world, page_size)
 
 
-@pytest.mark.parametrize("world", [3, 4, 8])
+@pytest.mark.parametrize("world", [2, 3, 4, 8])
 def test_zigzag_rows_round_trip(world: int) -> None:
     plan = _zigzag_plan(world, 4 * world * 2)
     tokens = torch.arange(plan.num_tokens)
@@ -1102,7 +1102,7 @@ def _cp_attention_reference(mock: _TPCollectiveMock, model: _Model, plan: Any):
     return attention
 
 
-@pytest.mark.parametrize("world", [3, 4])
+@pytest.mark.parametrize("world", [2, 3, 4])
 @pytest.mark.parametrize("fp8", [False, True])
 def test_context_parallel_forward_matches_tp(mock_collectives, world, fp8) -> None:
     """Zigzag rows through whole projections == upstream's TP forward, by token."""
@@ -1353,6 +1353,14 @@ def test_check_context_parallel_bucket_rule(cp_envs, solo, cp_min, ok) -> None:
             gemma4_patch._check_context_parallel(_cp_model(), _cp_config())
 
 
+@pytest.mark.parametrize("tp", [2, 8])
+def test_check_context_parallel_accepts_tp(cp_envs, tp) -> None:
+    """TP2 is one chip's two TensorCores: the last rank's second zigzag piece
+    takes its halo from its own first piece."""
+    config = _cp_config(**{"parallel_config.tensor_parallel_size": tp})
+    gemma4_patch._check_context_parallel(_cp_model(), config)
+
+
 @pytest.mark.parametrize(
     ("model", "config", "env", "match"),
     [
@@ -1367,7 +1375,7 @@ def test_check_context_parallel_bucket_rule(cp_envs, solo, cp_min, ok) -> None:
         ({"layer.self_attn.is_kv_shared_layer": True}, {}, {}, "KV sharing"),
         ({"layer.per_layer_input_gate": object()}, {}, {}, "per-layer"),
         ({"layer.self_attn.o_proj.bias": object()}, {}, {}, "biases"),
-        ({}, {"parallel_config.tensor_parallel_size": 2}, {}, "TP >= 3"),
+        ({}, {"parallel_config.tensor_parallel_size": 1}, {}, "TP >= 2"),
         (
             {"layer.enable_moe_block": True},
             {"parallel_config.enable_ep_weight_filter": True},
