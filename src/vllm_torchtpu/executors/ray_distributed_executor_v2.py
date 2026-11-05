@@ -39,7 +39,9 @@ from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
 
 from vllm_torchtpu import envs as tpu_envs
 from vllm_torchtpu.distributed.utils import set_node_kv_ip_port
-from vllm_torchtpu.executors.kv_block_override import reconcile_num_gpu_blocks_override
+from vllm_torchtpu.executors.kv_block_override import (
+    adopt_worker_num_gpu_blocks_override,
+)
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.platforms.tpu_platform import get_tpu_multihost_topology
 from vllm_torchtpu.utils import get_dp_size
@@ -699,8 +701,7 @@ class RayDistributedExecutorV2(RayExecutorV2):
             # Bind the first bundle to the current node (vLLM engine node).
             # Under DP every engine runs on the head node, so pinning would
             # crowd all of them onto it and split each engine's TP group
-            # across hosts; upstream skips this for RayExecutorV2 entirely
-            # (require_gpu_on_driver=False).
+            # across hosts; upstream RayExecutorV2 never pins it.
             current_ip = get_ip()
             current_node_id = ray.get_runtime_context().get_node_id()
             current_node_info = next(
@@ -736,22 +737,10 @@ class RayDistributedExecutorV2(RayExecutorV2):
 
     def get_kv_cache_specs(self) -> list[dict[str, KVCacheSpec]]:
         specs = super().get_kv_cache_specs()
-
-        if self.vllm_config.cache_config.num_gpu_blocks_override is None:
-            # Compact-mamba sizing sets `num_gpu_blocks_override` on the worker's
-            # cache_config during the RPC above; workers are separate processes, so
-            # copy it to the engine-side config here. Tolerate per-worker HBM
-            # measurement jitter exactly like TpuMultiprocExecutor: build 155
-            # died here on a 3-block spread (6456..6459 at TP=32) because this
-            # path still demanded exact agreement.
-            pc = self.vllm_config.parallel_config
-            agreed = reconcile_num_gpu_blocks_override(
-                self.collective_rpc("get_num_gpu_blocks_override"),
-                workers_per_stage=pc.world_size // pc.pipeline_parallel_size,
-            )
-            if agreed is not None:
-                self.vllm_config.cache_config.num_gpu_blocks_override = agreed
-
+        # Tolerates per-worker HBM measurement jitter exactly like
+        # TpuMultiprocExecutor: build 155 died here on a 3-block spread
+        # (6456..6459 at TP=32) when this path demanded exact agreement.
+        adopt_worker_num_gpu_blocks_override(self)
         return specs
 
     def initialize_from_config(self, kv_cache_configs: list[KVCacheConfig]) -> None:

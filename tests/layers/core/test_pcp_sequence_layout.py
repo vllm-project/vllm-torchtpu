@@ -802,3 +802,79 @@ def test_pcp_planner_preinit_and_dummy_share_the_v1_layout_contract():
     assert after_cache.requires_hidden_state_gather is True
 
     assert before_cache == after_cache
+
+
+@pytest.mark.parametrize(
+    "pcp_size, token_paddings, expected",
+    [(2, [256], 256), (1, [32, 64], 32)],
+    ids=["partial", "all"],
+)
+def test_padded_num_tokens_is_the_local_padding_prepare_real_plans(
+    monkeypatch, pcp_size, token_paddings, expected
+):
+    """The pipeline ring sizes its receives with padded_num_tokens before
+    prepare_real runs; the two must agree."""
+    monkeypatch.setattr(
+        "vllm_torchtpu.layers.core.pcp_sequence_layout._get_native_pcp_rank", lambda: 1
+    )
+    monkeypatch.setattr(
+        "vllm_torchtpu.layers.core.pcp_sequence_layout._get_native_pcp_world_size",
+        lambda: 2,
+    )
+    runner = _planner_runner_stub(
+        scheduled=[25], computed=[0], prompt=[25], token_paddings=token_paddings
+    )
+    planner = PcpSequenceLayoutPlanner(_eligibility(pcp_size=pcp_size))
+    counts = np.asarray([25], dtype=np.int32)
+
+    padded = planner.padded_num_tokens(
+        runner=runner,
+        scheduler_output=_scheduler_output([25]),
+        start_index=0,
+        num_scheduled_tokens_per_req=counts,
+    )
+    plan = planner.prepare_real(
+        runner=runner,
+        scheduler_output=_scheduler_output([25]),
+        start_index=0,
+        num_reqs=1,
+        num_scheduled_tokens_per_req=counts,
+        total_num_scheduled_tokens=25,
+        use_max_model_len=True,
+        target_num_reqs=8,
+        padded_num_reqs=8,
+    )
+
+    assert padded == plan.local_padded_num_tokens == expected
+
+
+@pytest.mark.parametrize("dp_target_bucket, expected", [(None, 32), (64, 64)])
+def test_all_planner_padded_num_tokens_follows_the_dp_bucket(
+    dp_target_bucket, expected
+):
+    runner = _planner_runner_stub(
+        scheduled=[20, 5], computed=[0, 0], prompt=[20, 5], token_paddings=[16, 32, 64]
+    )
+    runner._dp_target_bucket = dp_target_bucket
+    planner = AllSequenceLayoutPlanner()
+    counts = np.asarray([20, 5], dtype=np.int32)
+
+    padded = planner.padded_num_tokens(
+        runner=runner,
+        scheduler_output=_scheduler_output([20, 5]),
+        start_index=0,
+        num_scheduled_tokens_per_req=counts,
+    )
+    plan = planner.prepare_real(
+        runner=runner,
+        scheduler_output=_scheduler_output([20, 5]),
+        start_index=0,
+        num_reqs=2,
+        num_scheduled_tokens_per_req=counts,
+        total_num_scheduled_tokens=25,
+        use_max_model_len=True,
+        target_num_reqs=8,
+        padded_num_reqs=8,
+    )
+
+    assert padded == plan.local_padded_num_tokens == expected

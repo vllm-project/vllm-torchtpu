@@ -53,6 +53,7 @@ from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorBase_V1,
     KVConnectorRole,
+    KVConnectorTransferResults,
     SupportsHMA,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.metrics import (
@@ -86,6 +87,11 @@ from vllm_torchtpu.distributed.kv_transfer.connector_metadata import (
     ReqId,
     SendMeta,
     TPUConnectorMetadata,
+)
+from vllm_torchtpu.distributed.kv_transfer.raiden_pd_completion import (
+    RaidenSendOutcome,
+    RaidenSendResults,
+    send_completion_enabled,
 )
 from vllm_torchtpu.distributed.kv_transfer.tpu_connector_stats import (
     TpuKVConnectorPromMetrics,
@@ -168,8 +174,10 @@ def _select_committed_mamba_blocks(
 ) -> list[int]:
     """Select each Mamba group's last committed state checkpoint.
 
-    The final ``K`` entries are speculative, so the committed checkpoint is
-    the ``-(K + 1)`` entry for a group with speculative depth ``K``.
+    The final K entries are speculative, so the committed prompt-end state sits
+    at -(K + 1) for speculative depth K. Any internal prefill checkpoint block
+    reserved by the step sits earlier at -(K + 2) and is excluded because it
+    stores an intermediate prefix state rather than the prompt-end state.
     """
     required_blocks = num_speculative_blocks + 1
     committed_blocks: list[int] = []
@@ -1023,6 +1031,14 @@ class TPUConnector(KVConnectorBase_V1, SupportsHMA):
         assert self.connector_worker is not None
         return self.connector_worker.get_finished(finished_req_ids)
 
+    def get_transfer_results(
+        self, finished_req_ids: set[str]
+    ) -> KVConnectorTransferResults:
+        assert self.connector_worker is not None
+        if isinstance(self.connector_worker, TPURaidenConnectorWorker):
+            return self.connector_worker.get_transfer_results(finished_req_ids)
+        return super().get_transfer_results(finished_req_ids)
+
     def get_block_ids_with_load_errors(self) -> set[int]:
         # Surface KV-load failures so the scheduler recomputes the affected
         # blocks instead of running with absent KV. Only the Raiden worker
@@ -1049,6 +1065,13 @@ class TPURaidenConnector(TPUConnector):
     selection over ``kv_connector_extra_config.use_raiden_connector``."""
 
     force_raiden_connector = True
+
+    def build_connector_worker_meta(self) -> RaidenSendResults | None:
+        assert self.connector_worker is not None, (
+            "Raiden worker metadata must be collected from the worker role"
+        )
+        worker = cast(TPURaidenConnectorWorker, self.connector_worker)
+        return worker.take_pd_send_results()
 
 
 class TPUConnectorScheduler:
@@ -1487,6 +1510,7 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
 
     def __init__(self, vllm_config: "VllmConfig"):
         super().__init__(vllm_config)
+        self._send_completion_enabled = send_completion_enabled(vllm_config)
         stage3_consumer = not self.is_producer and _use_raiden_stage3_transport()
         self._stage3_prefix_aware_load_enabled = (
             stage3_consumer and _prefix_aware_load_enabled()
@@ -2543,6 +2567,8 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
             "dst_tp_size": _raiden_dst_shards(),
             "dst_dcp_size": _raiden_dst_dcp_size(self.vllm_config),
         }
+        if self._send_completion_enabled:
+            params["kv_transfer_pending"] = True
         if _use_raiden_glm_admission() and params["dst_dcp_size"] > 1:
             params["dst_interleave_size"] = _raiden_dst_interleave_tokens(
                 self.vllm_config
@@ -2601,6 +2627,11 @@ class TPURaidenConnectorWorker:
         self.config = vllm_config.kv_transfer_config
         self.is_producer = self.config.is_kv_producer
         self._stage3_kimi = _is_kimi(vllm_config)
+        self._pd_send_results = (
+            RaidenSendResults() if send_completion_enabled(vllm_config) else None
+        )
+        self._pending_failed_recving: set[str] = set()
+        self._pending_failed_block_ids: set[int] = set()
         self.runner: TPUModelRunner | None = None
         self.node_id = dist_utils.get_node_id()
         self.tp_rank: int = get_tensor_model_parallel_rank()
@@ -3968,12 +3999,12 @@ class TPURaidenConnectorWorker:
             )
         if tp_size == 1 and pcp_size == 1 and dp_size == 1 and pp_size in (2, 4, 8):
             return f"pp{pp_size}_decode"
-        if pcp_size != 1 or tp_size not in (1, 2) or dp_size not in (2, 4, 8, 16):
+        if pcp_size != 1 or tp_size not in (1, 2, 4) or dp_size not in (2, 4, 8, 16):
             raise ValueError(
                 "Raiden Qwen3.5 admission topology dp{N}_decode or "
-                "dp{N}tp2_decode requires kv_consumer with "
+                "dp{N}tp{2,4}_decode requires kv_consumer with "
                 "prefill_context_parallel_size=1, tensor_parallel_size in "
-                "(1, 2), data_parallel_size in (2, 4, 8, 16); got "
+                "(1, 2, 4), data_parallel_size in (2, 4, 8, 16); got "
                 f"prefill_context_parallel_size={pcp_size}, "
                 f"tensor_parallel_size={tp_size}, "
                 f"data_parallel_size={dp_size}"
@@ -4963,6 +4994,7 @@ class TPURaidenConnectorWorker:
         ]
 
     def _record_stage3_load_failure(self, req_id: str, block_ids: list[int]) -> None:
+        self._load_block_ids.setdefault(req_id, list(block_ids))
         self._failed_recving.add(req_id)
         self._failed_block_ids.update(block_ids)
         self._stage3_terminal_loads.add(req_id)
@@ -5250,6 +5282,19 @@ class TPURaidenConnectorWorker:
     ) -> tuple[set[str], set[str], set[str]]:
         """Returns terminal base requests (T3.1: no sibling aggregation)."""
         outcomes, self._stage3_send_outcomes = self._stage3_send_outcomes, {}
+        if self._pd_send_results is not None:
+            result_by_native_outcome = {
+                "done": RaidenSendOutcome.SUCCESS,
+                "failed": RaidenSendOutcome.SEND_FAILURE,
+                "cancelled": RaidenSendOutcome.UNCLAIMED_TIMEOUT,
+            }
+            self._pd_send_results.outcomes.update(
+                {
+                    req_id: result_by_native_outcome[outcome]
+                    for req_id, outcome in outcomes.items()
+                    if req_id not in self._stage3_reported_sends
+                }
+            )
         done = {r for r, outcome in outcomes.items() if outcome == "done"}
         failed = {r for r, outcome in outcomes.items() if outcome == "failed"}
         cancelled = {r for r, outcome in outcomes.items() if outcome == "cancelled"}
@@ -5331,6 +5376,13 @@ class TPURaidenConnectorWorker:
                     sort_keys=True,
                 ),
             )
+
+    def take_pd_send_results(self) -> RaidenSendResults | None:
+        results = self._pd_send_results
+        if results is None or not results.outcomes:
+            return None
+        self._pd_send_results = RaidenSendResults()
+        return results
 
     @staticmethod
     def _start_stage3_transfer_with_d5_retry(facade: Any, **kwargs: Any) -> bool:
@@ -6463,6 +6515,12 @@ class TPURaidenConnectorWorker:
         )
         self._suppress_done_recving.difference_update(recv_finished)
         self._reported_recving.update(done_recving)
+        self._pending_failed_recving = self._failed_recving & done_recving
+        self._pending_failed_block_ids = {
+            block_id
+            for req_id in self._pending_failed_recving
+            for block_id in self._load_block_ids.get(req_id, ())
+        }
         if done_recving:
             logger.debug(
                 "TPURaidenConnectorWorker rank%d --> reporting done_recving=%s",
@@ -6516,6 +6574,27 @@ class TPURaidenConnectorWorker:
         self._done_sending = set()
         self._done_recving = set()
         return done_sending, done_recving
+
+    def get_transfer_results(
+        self, finished_req_ids: set[str] | None = None
+    ) -> KVConnectorTransferResults:
+        done_sending, done_recving = self.get_finished(finished_req_ids)
+        failed_recving = self._pending_failed_recving
+        failed_block_ids = self._pending_failed_block_ids
+        self._pending_failed_recving = set()
+        self._pending_failed_block_ids = set()
+        if dist_utils.get_raiden_inline_load():
+            return KVConnectorTransferResults(
+                finished_sending=done_sending,
+                finished_recving=done_recving,
+            )
+        if failed_recving:
+            self._failed_block_ids.difference_update(failed_block_ids)
+        return KVConnectorTransferResults(
+            finished_sending=done_sending,
+            finished_recving=done_recving,
+            failed_recving=failed_recving,
+        )
 
     def _poll_finished(self, engine: "KVCacheManager") -> None:
         if (

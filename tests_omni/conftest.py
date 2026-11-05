@@ -206,6 +206,46 @@ def omni_runner(
 
 
 @pytest.fixture(autouse=True)
+def _omni_model_patches(request: pytest.FixtureRequest) -> None:
+    """Install the TPU model patches that the diffusion worker runs with.
+
+    Production applies the diffusion_worker stage, then diffusion_model_load
+    for the served pipeline, so without this an in-process test runs them
+    only if an earlier test in the session did. Loading one pipeline of each
+    patched family (Qwen-Image, Wan, LTX-2) installs every model patch. Engine
+    tests are skipped: their workers install the patches themselves.
+    """
+    if request.node.get_closest_marker("spawns_tpu_workers"):
+        return
+    from types import SimpleNamespace
+
+    from vllm_torchtpu import patch_registry
+
+    patch_registry.apply("diffusion_worker")
+    for model_class_name in ("QwenImagePipeline", "WanPipeline", "LTX2Pipeline"):
+        patch_registry.apply(
+            "diffusion_model_load",
+            od_config=SimpleNamespace(model_class_name=model_class_name),
+        )
+
+
+@pytest.fixture(autouse=True)
+def _torchtpu_eager_mode(request: pytest.FixtureRequest) -> None:
+    """Run in-process tests in production's torch_tpu eager mode (DEFER_AND_FUSE).
+
+    Production sets it when a VllmConfig is built, so without this an in-process
+    test's numerics depend on whether an earlier test in the session built one.
+    Engine tests are skipped: their workers set it themselves, and setting it in
+    the pytest parent makes the parent open a TPU device the workers hold.
+    """
+    if request.node.get_closest_marker("spawns_tpu_workers"):
+        return
+    from vllm_torchtpu.platforms.tpu_platform import _configure_torchtpu_eager_mode
+
+    _configure_torchtpu_eager_mode()
+
+
+@pytest.fixture(autouse=True)
 def _sync_tpu(request: pytest.FixtureRequest) -> Generator[None, None, None]:
     """Flush deferred torch_tpu ops between in-process TPU tests."""
     if request.node.get_closest_marker("spawns_tpu_workers"):

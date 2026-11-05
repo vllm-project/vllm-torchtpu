@@ -28,6 +28,8 @@ its workers (multiproc and Ray multi-host); build 155 failed on the Ray
 path's own copy of this logic, which still demanded exact agreement.
 """
 
+from typing import Any, cast
+
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
@@ -105,3 +107,25 @@ def reconcile_num_gpu_blocks_override(
         lo,
     )
     return lo
+
+
+def adopt_worker_num_gpu_blocks_override(executor: Any) -> None:
+    """Copy the workers' agreed `num_gpu_blocks_override` to the engine config.
+
+    Compact-mamba sizing sets the override on each worker's cache_config in
+    `get_kv_cache_spec`, and the workers then skip their profile run. Workers
+    are separate processes, so every executor must copy the value to the
+    engine-side config after `get_kv_cache_specs`; an executor that does not
+    sizes the KV pool from the workers' unprofiled HBM budget. Shared so the
+    executors cannot drift apart again.
+    """
+    cache_config = executor.vllm_config.cache_config
+    if cache_config.num_gpu_blocks_override is not None:
+        return
+    pc = executor.vllm_config.parallel_config
+    agreed = reconcile_num_gpu_blocks_override(
+        cast(list, executor.collective_rpc("get_num_gpu_blocks_override")),
+        workers_per_stage=pc.world_size // pc.pipeline_parallel_size,
+    )
+    if agreed is not None:
+        cache_config.num_gpu_blocks_override = agreed

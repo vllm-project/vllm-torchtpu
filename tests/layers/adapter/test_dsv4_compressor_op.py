@@ -25,11 +25,11 @@ from vllm.sampling_params import SamplingParams
 from vllm.utils.hashing import sha256
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_manager import KVCacheManager
+from vllm.v1.core.kv_cache_planning import is_kv_cache_spec_uniform
 from vllm.v1.core.kv_cache_utils import (
     get_group_id,
     get_request_block_hasher,
     init_none_hash,
-    is_kv_cache_spec_uniform,
 )
 from vllm.v1.kv_cache_interface import (
     KVCacheConfig,

@@ -132,6 +132,7 @@ def test_scheduler_mamba_split_accepts_external_kv_tokens():
         block_size=16,
         use_eagle=False,
         use_eagle_block_drop=False,
+        num_hash_lookahead_tokens=0,
         mamba_partial_cache_hit=False,
         mamba_has_prefill_checkpoint_blocks=False,
         mamba_shared_prefix_checkpoint=False,
@@ -285,7 +286,10 @@ class TestTpuPlatform:
         vllm_config.model_config = MagicMock(spec=ModelConfig)
         vllm_config.model_config.dtype = torch.bfloat16
         vllm_config.model_config.is_hybrid = False
+        vllm_config.model_config.is_attention_free = False
         vllm_config.model_config.hf_config = None
+        # Set in ModelConfig.__post_init__, so the spec has no such attribute.
+        vllm_config.model_config.runner_type = "generate"
         vllm_config.cache_config = CacheConfig()
         vllm_config.cache_config.block_size = None
         vllm_config.cache_config.enable_prefix_caching = False
@@ -413,6 +417,18 @@ class TestTpuPlatform:
             # deployments alike.
             vllm_config.kv_transfer_config = MagicMock()
             assert unified_kv_layout_enabled(vllm_config)
+
+    @pytest.mark.parametrize("method", ["block", "fly"])
+    @patch("vllm_torchtpu.patch_registry.apply")
+    @patch(
+        "vllm_torchtpu.platforms.tpu_platform.TpuPlatform._prepare_singlehost_tpu_env"
+    )
+    def test_check_and_update_config_rejects_unsupported_rejection_sampling(
+        self, mock_prepare_env, mock_apply_patches, vllm_config, method
+    ):
+        vllm_config.speculative_config = MagicMock(rejection_sample_method=method)
+        with pytest.raises(NotImplementedError, match="rejection_sample_method"):
+            TpuPlatform.check_and_update_config(vllm_config)
 
     @pytest.mark.parametrize(
         ("mamba_cache_mode", "speculative_config", "async_scheduling", "message"),
@@ -543,6 +559,47 @@ class TestTpuPlatform:
         vllm_config.cache_config.mamba_cache_mode = "align"
 
         with pytest.raises(NotImplementedError, match="unified KV pool"):
+            TpuPlatform.check_and_update_config(vllm_config)
+
+    @pytest.mark.parametrize(
+        ("enable_prefix_caching", "connector", "should_raise"),
+        [
+            (True, None, True),
+            (False, None, False),
+            (True, "DecodeBenchConnector", False),
+        ],
+    )
+    @patch("vllm_torchtpu.patch_registry.apply")
+    @patch(
+        "vllm_torchtpu.platforms.tpu_platform.TpuPlatform._prepare_singlehost_tpu_env"
+    )
+    def test_check_and_update_config_rejects_attention_free_apc(
+        self,
+        mock_prepare_env,
+        mock_apply_patches,
+        vllm_config,
+        enable_prefix_caching,
+        connector,
+        should_raise,
+    ):
+        vllm_config.model_config.is_attention_free = True
+        vllm_config.cache_config.block_size = 16
+        vllm_config.cache_config.enable_prefix_caching = enable_prefix_caching
+        if connector is not None:
+            vllm_config.kv_transfer_config = KVTransferConfig(
+                kv_connector=connector, kv_role="kv_both"
+            )
+
+        if should_raise:
+            with pytest.raises(
+                NotImplementedError,
+                match=(
+                    "Prefix caching on attention-free models is not yet "
+                    "supported on TPU; run with --no-enable-prefix-caching"
+                ),
+            ):
+                TpuPlatform.check_and_update_config(vllm_config)
+        else:
             TpuPlatform.check_and_update_config(vllm_config)
 
     @patch.dict("os.environ", {"TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL": "0"})
@@ -1018,17 +1075,26 @@ class TestPhasedProfilingConfigValidation:
 
 
 class TestLoRAConfigValidation:
-    """LoRA runs on a single chip with a dense model and no speculative
-    decoding; any other setting is rejected at startup, by name."""
+    """LoRA runs on a single chip with a dense generative model and no
+    speculative decoding; any other setting is rejected at startup, by name."""
 
     @staticmethod
-    def _config(*, is_moe=False, speculative_config=None, lora=None, **parallel):
+    def _config(
+        *,
+        is_moe=False,
+        runner_type="generate",
+        speculative_config=None,
+        lora=None,
+        **parallel,
+    ):
         # By the time the platform hook runs, verify_with_model_config has
         # resolved lora_dtype "auto" to the model dtype.
         lora = {"lora_dtype": torch.bfloat16, **(lora or {})}
         return SimpleNamespace(
             lora_config=LoRAConfig(**lora),
-            model_config=SimpleNamespace(is_moe=is_moe, dtype=torch.bfloat16),
+            model_config=SimpleNamespace(
+                is_moe=is_moe, runner_type=runner_type, dtype=torch.bfloat16
+            ),
             parallel_config=ParallelConfig(**parallel),
             speculative_config=speculative_config,
         )
@@ -1062,6 +1128,7 @@ class TestLoRAConfigValidation:
             ),
             ({"speculative_config": object()}, "speculative decoding"),
             ({"is_moe": True}, "MoE models"),
+            ({"runner_type": "pooling"}, "pooling models"),
             ({"lora": {"fully_sharded_loras": True}}, "fully_sharded_loras"),
             (
                 {"lora": {"enable_tower_connector_lora": True}},
@@ -1512,4 +1579,16 @@ def test_peer_replay_requires_the_compile_cache(
         with pytest.raises(ValueError, match="VLLM_DISABLE_COMPILE_CACHE"):
             _validate_peer_replay_config()
     else:
+        _validate_peer_replay_config()
+
+
+@pytest.mark.parametrize("wait", ["-1", "nan", "soon"])
+def test_a_bad_peer_wait_fails_at_startup(monkeypatch, wait):
+    """TPU_PRECOMPILE_PEER_WAIT_S is first read by the precompile, after the
+    model has loaded; the startup check parses it so a typo fails the launch."""
+    monkeypatch.setenv("TPU_PARALLEL_PRECOMPILE", "1")
+    monkeypatch.setenv("TPU_PRECOMPILE_PEER_REPLAY", "1")
+    monkeypatch.setenv("VLLM_DISABLE_COMPILE_CACHE", "0")
+    monkeypatch.setenv("TPU_PRECOMPILE_PEER_WAIT_S", wait)
+    with pytest.raises(ValueError, match="TPU_PRECOMPILE_PEER_WAIT_S"):
         _validate_peer_replay_config()

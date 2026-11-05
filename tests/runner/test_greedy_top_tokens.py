@@ -23,11 +23,19 @@ import pytest
 import torch
 from vllm import SamplingParams
 from vllm import logger as vllm_logger
+from vllm.config import LoRAConfig
+from vllm.lora.layers import (
+    BaseLayerWithLoRA,
+    LogitsProcessorWithLoRA,
+    LoRAMapping,
+)
+from vllm.lora.layers import logits_processor as lora_lp_module
 from vllm.model_executor.layers import logits_processor as lp_module
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.sampling_params import StructuredOutputsParams
 
 from vllm_torchtpu.layers.adapter.sample.rejection_sampler import RejectionSampler
+from vllm_torchtpu.lora.torch_punica_tpu import PunicaWrapperTPU
 from vllm_torchtpu.runner import greedy_top_tokens, min_tokens
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 
@@ -127,6 +135,73 @@ def test_ties_resolve_to_the_lowest_token_id(monkeypatch, tp_size):
 
     assert got.view(-1).tolist() == [5, 6, 0]
     assert torch.equal(got, _full_logits_tokens(weight, hidden_states))
+
+
+def _lora_owner(monkeypatch):
+    """A 64-token head whose logits processor is vLLM's LoRA wrapper, fed by
+    PunicaWrapperTPU. Request 0 uses adapter 3, whose delta lifts token 7
+    from 9.5 to 10.5, past token 42 at 10.0; request 1 uses no adapter."""
+    vocab, hidden = 64, 4
+    weight = torch.zeros(vocab, hidden)
+    weight[42, 0], weight[7, 0] = 10.0, 9.5
+    owner = _Owner(_HeadShard(weight, 0, 1, 0))
+
+    # A single rank, with no process group to gather over.
+    monkeypatch.setattr(
+        lora_lp_module, "get_tensor_model_parallel_world_size", lambda: 1
+    )
+    monkeypatch.setattr(lora_lp_module, "get_tensor_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr(lp_module, "tensor_model_parallel_all_gather", lambda t: t)
+    monkeypatch.setattr(lp_module, "tensor_model_parallel_gather", lambda t: t)
+    processor = LogitsProcessorWithLoRA(
+        owner.logits_processor, hidden, torch.float32, torch.device("cpu"), None
+    )
+    processor.create_lora_weights(
+        2, LoRAConfig(max_lora_rank=8, max_loras=2, lora_dtype=torch.float32)
+    )
+    # Slot 1: rank 0 reads hidden dim 0 and adds it to token 7.
+    processor.lora_a_stacked[1, 0, 0, 0] = 1.0
+    processor.lora_b_stacked[1, 0, 7, 0] = 1.0
+    punica = PunicaWrapperTPU(8, 2, "cpu")
+    punica.update_metadata(LoRAMapping((3, 0), (3, 0)), [None, 3], 3, vocab)
+    processor.set_mapping(punica)
+    owner.logits_processor = processor
+    return owner
+
+
+def test_top_tokens_include_the_lm_head_lora_delta(monkeypatch):
+    """The LoRA wrapper forwards get_top_tokens to the base layer, which would
+    drop the delta and pick token 42 for both rows."""
+    owner = _lora_owner(monkeypatch)
+    hidden_states = torch.tensor([[1.0, 0, 0, 0]] * 2)
+
+    tokens = greedy_top_tokens.top_tokens(owner, hidden_states)
+
+    assert tokens.dtype == torch.int64
+    assert tokens.tolist() == [[7], [42]]
+
+
+def test_head_owner_resolves_through_the_lora_wrapper(monkeypatch):
+    owner = _lora_owner(monkeypatch)
+
+    assert greedy_top_tokens.resolve_head_owner(owner, dp_lockstep=False) is owner
+
+
+def test_resolve_head_owner_refuses_other_logits_processor_wrappers():
+    """Such a wrapper forwards get_top_tokens to the processor it wraps, so
+    the vocabulary-parallel argmax would skip the wrapper's own logits."""
+
+    class Wrapper(BaseLayerWithLoRA):
+        def __init__(self, base_layer):
+            super().__init__()
+            self.base_layer = base_layer
+
+    owner = _Owner(_shards(torch.zeros(8, 2), 1)[0])
+    owner.logits_processor = Wrapper(owner.logits_processor)
+    assert hasattr(owner.logits_processor, "get_top_tokens")
+
+    with pytest.raises(NotImplementedError, match="no module with an lm_head"):
+        greedy_top_tokens.resolve_head_owner(owner, dp_lockstep=False)
 
 
 def _batch(*params, max_num_logprobs=None):

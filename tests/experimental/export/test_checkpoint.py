@@ -142,6 +142,61 @@ def test_per_rank_tensors_are_sharded_over_tensor_parallel_ranks(
     assert sharding == ["tp"] + [None] * (len(shape) - 1)
 
 
+@pytest.mark.parametrize(
+    "name,shape,expected",
+    [
+        # The MTP predictor's fc is column-parallel; FP8 requantization drops the
+        # attributes that say so, so the name has to.
+        ("model.fc.weight", [4096, 2048], [None, "tp"]),
+        ("model.fc.weight_scale", [2048], ["tp"]),
+        ("model.layers.0.mlp.fc1.weight", [4096, 2048], [None, None]),
+    ],
+)
+def test_the_mtp_fc_is_sharded_like_a_column_parallel_layer(
+    name: str, shape: list[int], expected: list[str | None]
+) -> None:
+    from vllm_torchtpu.experimental.export import weight_mapper
+
+    assert weight_mapper.infer_weight_sharding(name, shape, tp_size_hint=2) == expected
+
+
+@pytest.mark.parametrize(
+    "name,expected",
+    [
+        # Muse Spark's MoE projects to and from the expert width with column- and
+        # row-parallel layers whose shard attributes processing drops.
+        ("model.language_model.layers.0.mlp.pre_expert_proj.weight", [None, "tp"]),
+        ("model.language_model.layers.0.mlp.post_expert_proj.weight", ["tp", None]),
+    ],
+)
+def test_muse_expert_projections_are_sharded_like_their_parallel_layers(
+    name: str, expected: list[str | None]
+) -> None:
+    from vllm_torchtpu.experimental.export import weight_mapper
+
+    sharding = weight_mapper.infer_weight_sharding(name, [8192, 4096], tp_size_hint=8)
+    assert sharding == expected
+
+
+def test_qkvz_kernel_layout_is_rejected_when_tensor_parallel(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The mapper shards in_proj_qkvz as [n_out, n_in], which the flag flips."""
+    from vllm_torchtpu.experimental.export import weight_mapper
+
+    name = "model.layers.0.linear_attn.in_proj_qkvz.weight"
+    monkeypatch.delenv("TPU_GDN_QKVZ_KERNEL_LAYOUT", raising=False)
+    sharding = weight_mapper.infer_weight_sharding(name, [4608, 2048], tp_size_hint=4)
+    assert sharding == ["tp", None]
+
+    monkeypatch.setenv("TPU_GDN_QKVZ_KERNEL_LAYOUT", "1")
+    # Nothing is sharded at TP = 1, so the layout does not matter.
+    sharding = weight_mapper.infer_weight_sharding(name, [2048, 18432])
+    assert sharding == [None, None]
+    with pytest.raises(NotImplementedError, match="TPU_GDN_QKVZ_KERNEL_LAYOUT"):
+        weight_mapper.infer_weight_sharding(name, [2048, 4608], tp_size_hint=4)
+
+
 def test_save_checkpoint_writes_zarr_v2_arrays(tmp_path: Path) -> None:
     pytest.importorskip("orbax.checkpoint")
     ts = pytest.importorskip("tensorstore")
