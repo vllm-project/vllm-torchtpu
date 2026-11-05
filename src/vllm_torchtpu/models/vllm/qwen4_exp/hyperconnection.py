@@ -5,16 +5,54 @@ Reuse the common checkpoint structure with a TPU-specific SiLU precision
 boundary; the NVIDIA model owns CUDA kernels and is not imported here.
 """
 
+import os
+
 import torch
 import torch.nn.functional as F
 from vllm.models.qwen4_exp.common import hyperconnection as common_hc
 
 from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.qwen4_exp.hc_decode import decode_token_tile
+from vllm_torchtpu.logger import init_logger
+
+logger = init_logger(__name__)
 
 GroupedGemmaRMSNorm = common_hc.GroupedGemmaRMSNorm
 HyperConnectionBase = common_hc.HyperConnectionBase
 HyperConnectionConfig = common_hc.HyperConnectionConfig
+
+
+def sparse_core_all_gather_offload() -> bool:
+    """Whether LIBTPU_INIT_ARGS turns on the SparseCore all-gather offload
+    (the last setting of the flag wins, as in libtpu)."""
+    enabled = False
+    for arg in os.environ.get("LIBTPU_INIT_ARGS", "").split():
+        name, _, value = arg.partition("=")
+        if name == "--xla_tpu_enable_sparse_core_collective_offload_all_gather":
+            enabled = value.lower() in ("true", "1")
+    return enabled
+
+
+def prefill_full_variant() -> tuple[bool, bool]:
+    """``(up_t, inject)`` of the prefill full-mix ops.
+
+    Both variants are off while the SparseCore all-gather offload is on. With
+    the offload (c32, >= 8 MiB, i.e. the sequence-parallel hidden gathers),
+    either one corrupts served steps: the first non-finite hidden state is an
+    SP 4096 step and spreads to every later row of the step; c32 GSM8K reads
+    0.0114-0.583. With the offload off the same flags read
+    0.9712 / 0.9719 (UP_T) and 0.9712 (UP_T + INJECT), and the kernels are
+    bitwise equal to the default variant on TPU in isolation.
+    """
+    up_t = envs.VLLM_TPU_HC_PREFILL_UP_T
+    inject = envs.VLLM_TPU_HC_PREFILL_INJECT
+    if (up_t or inject) and sparse_core_all_gather_offload():
+        logger.warning_once(
+            "VLLM_TPU_HC_PREFILL_UP_T / VLLM_TPU_HC_PREFILL_INJECT are ignored "
+            "while the SparseCore all-gather offload is on (corrupts outputs)."
+        )
+        return False, False
+    return up_t, inject
 
 
 class GatedResidual(common_hc.GatedResidual):
@@ -65,7 +103,8 @@ class GatedResidual(common_hc.GatedResidual):
                 build_full_mix_op,
             )
 
-            self._prefill_full_up_t = envs.VLLM_TPU_HC_PREFILL_UP_T
+            up_t, inject = prefill_full_variant()
+            self._prefill_full_up_t = up_t
             wide = envs.VLLM_TPU_HC_PREFILL_WIDE_TILE
             if wide and (wide % prefill_full_tile or wide <= prefill_full_tile):
                 raise ValueError(
@@ -76,9 +115,7 @@ class GatedResidual(common_hc.GatedResidual):
             tiles = (wide, prefill_full_tile) if wide else (prefill_full_tile,)
             args = (self.hc_count, self.hidden_size, self.hc_norm.variance_epsilon)
             # The kernel also projects onto the gate weight of this HC's combine.
-            self._prefill_inject = envs.VLLM_TPU_HC_PREFILL_INJECT and hasattr(
-                self, "block_inject_weight"
-            )
+            self._prefill_inject = inject and hasattr(self, "block_inject_weight")
             variant = (self._prefill_full_up_t, self._prefill_inject)
             self._prefill_full_ops = {
                 tile: build_full_mix_op(*args, tile, *variant) for tile in tiles
