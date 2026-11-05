@@ -102,6 +102,10 @@ class MiniMaxM3Model(nn.Module):
             for idx in range(config.num_hidden_layers)
         )
         self.norm = GemmaRMSNorm(config.hidden_size, config.rms_norm_eps)
+        # Residual-stream entries of these layers (k = output of layer k-1,
+        # residual added, before the next norm) are also returned; set by
+        # the DSpark drafter before the first trace.
+        self.aux_hidden_state_layers: tuple[int, ...] = ()
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
@@ -111,14 +115,21 @@ class MiniMaxM3Model(nn.Module):
         input_ids: torch.Tensor | None,
         positions: torch.Tensor,
         inputs_embeds: torch.Tensor | None = None,
-    ) -> torch.Tensor:
+    ) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]]:
         if inputs_embeds is None:
             assert input_ids is not None
             inputs_embeds = self.embed_input_ids(input_ids)
         hidden_states, residual = inputs_embeds, None
-        for layer in self.layers:
+        aux_hidden_states = []
+        if 0 in self.aux_hidden_state_layers:
+            aux_hidden_states.append(inputs_embeds)
+        for idx, layer in enumerate(self.layers):
             hidden_states, residual = layer(positions, hidden_states, residual)
+            if idx + 1 in self.aux_hidden_state_layers:
+                aux_hidden_states.append(hidden_states + residual)
         hidden_states, _ = self.norm(hidden_states, residual)
+        if aux_hidden_states:
+            return hidden_states, aux_hidden_states
         return hidden_states
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
@@ -217,13 +228,20 @@ class MiniMaxM3SparseForCausalLM(nn.Module):
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)
 
+    def set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
+        num_layers = len(self.model.layers)
+        invalid = [idx for idx in layers if not 0 <= idx <= num_layers]
+        if invalid:
+            raise ValueError(f"Invalid MiniMax M3 aux hidden-state layers: {invalid}")
+        self.model.aux_hidden_state_layers = tuple(layers)
+
     def forward(
         self,
         input_ids: torch.Tensor | None,
         positions: torch.Tensor,
         intermediate_tensors: object | None = None,
         inputs_embeds: torch.Tensor | None = None,
-    ) -> torch.Tensor:
+    ) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]]:
         if intermediate_tensors is not None:
             raise NotImplementedError("MiniMax M3 on TPU does not support PP")
         return self.model(input_ids, positions, inputs_embeds)

@@ -25,6 +25,9 @@ _ARCHITECTURES = (
     "MiniMaxM3SparseForConditionalGeneration",
 )
 _MODEL = "vllm_torchtpu.models.minimax_m3.model:MiniMaxM3SparseForCausalLM"
+# The checkpoint's dspark/ draft; keep in sync with dspark.ARCHITECTURE.
+_DSPARK_ARCHITECTURE = "DSparkMiniMaxDraftModel"
+_DSPARK_MODEL = "vllm_torchtpu.models.minimax_m3.dspark:MiniMaxM3DSparkForCausalLM"
 
 
 def register() -> None:
@@ -44,6 +47,7 @@ def register() -> None:
     for arch in _ARCHITECTURES:
         ModelRegistry.register_model(arch, _MODEL)
         MODELS_CONFIG_MAP[arch] = TPUMiniMaxM3Config
+    ModelRegistry.register_model(_DSPARK_ARCHITECTURE, _DSPARK_MODEL)
     register_tpu_quant_config(QUANT_METHOD, MiniMaxM3QuantConfig)
     # The [K | V] and index caches differ in row width, so KV offload
     # registers them array by array.

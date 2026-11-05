@@ -52,6 +52,11 @@ _NVFP4_GROUP = 16
 # The TPU MoE kernels hard-code SwiGLU-OAI's (alpha, limit, beta).
 _KERNEL_SWIGLU = (1.702, 7.0, 1.0)
 
+# The DSpark draft's quantization config names its modules
+# `language_model.model.dspark.<module>`; the draft model builds them as
+# `model.<module>`.
+_DSPARK_PREFIX = ("language_model.model.dspark.", "model.")
+
 # Compressed-tensors NVFP4 expert tensor suffix -> ModelOpt parameter suffix.
 CT_TO_MODELOPT_EXPERT_SUFFIX = {
     ".weight_packed": ".weight",
@@ -190,10 +195,15 @@ class MiniMaxM3QuantConfig(VllmNvfp4Config):
             raise NotImplementedError(
                 f"MiniMax M3 TPU quantization supports {expected}, got {got}."
             )
+        old, new = _DSPARK_PREFIX
+        exclude_modules = [
+            new + name.removeprefix(old) if name.startswith(old) else name
+            for name in config.get("ignored_layers") or []
+        ]
         return cls(
             quant_method="NVFP4",
             is_checkpoint_nvfp4_serialized=True,
-            exclude_modules=list(config.get("ignored_layers") or []),
+            exclude_modules=exclude_modules,
             group_size=_NVFP4_GROUP,
         )
 
