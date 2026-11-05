@@ -3218,3 +3218,894 @@ def test_arm_ep2_tp4_and_forward_dispatch(monkeypatch):
     assert call_args[3] is pad_mask
     assert call_args[12] is layer_ep1._moe_tp_decode_nvfp4_rank
     assert call_args[13] is layer_ep1._moe_tp_decode_nvfp4_e0
+
+
+def _load_precedence_modules(monkeypatch):
+    """Load real NVFP4, FP8 TP decode, fused MoE decode, and MoERunner bridges."""
+    rt = _load_runtime_modules(monkeypatch)
+    has_full = (
+        _has_real_module("torch")
+        and _has_real_module("vllm")
+        and _has_real_module("torch_tpu")
+    )
+    if has_full:
+        fp8_decode = importlib.import_module(
+            "vllm_torchtpu.layers.adapter.moe_tp_decode"
+        )
+        fused_decode = importlib.import_module(
+            "vllm_torchtpu.layers.adapter.fused_moe_decode"
+        )
+        fp8_mod = importlib.import_module(
+            "vllm_torchtpu.layers.adapter.quantization.fp8"
+        )
+        unquant_mod = importlib.import_module(
+            "vllm_torchtpu.layers.adapter.quantization.unquantized"
+        )
+        ep_mod = importlib.import_module("vllm_torchtpu.layers.adapter.fused_moe_ep")
+        pipelined_mod = importlib.import_module(
+            "vllm_torchtpu.layers.adapter.pipelined_fused_moe"
+        )
+        silu_cls = importlib.import_module(
+            "vllm.model_executor.layers.activation"
+        ).SiluAndMul
+        return SimpleNamespace(
+            torch=rt.torch,
+            nvfp4=rt.nvfp4,
+            moe_runner=rt.moe_runner,
+            adapter=rt.adapter,
+            fp8_decode=fp8_decode,
+            fused_decode=fused_decode,
+            fp8_mod=fp8_mod,
+            unquant_mod=unquant_mod,
+            ep_mod=ep_mod,
+            pipelined_mod=pipelined_mod,
+            silu_cls=silu_cls,
+        )
+
+    t = rt.torch
+    t.device = object
+    t.bool = "bool"
+    t.float16 = "float16"
+    t.int32 = "int32"
+    t.uint8 = "uint8"
+    t.distributed = SimpleNamespace(
+        get_world_size=lambda: N_RANKS,
+        all_gather_object=lambda *_a, **_k: None,
+    )
+    if not hasattr(t.Tensor, "ndim"):
+        t.Tensor.ndim = property(lambda self: self._arr.ndim)
+    if not hasattr(t.Tensor, "dim"):
+        t.Tensor.dim = lambda self: self._arr.ndim
+
+    def _zeros(*s, dtype="float32", device=None):
+        del device
+        shape = s[0] if len(s) == 1 and isinstance(s[0], tuple) else s
+        arr_dt = np.uint8 if dtype == "uint8" else np.float32
+        return t.Tensor(np.zeros(shape, dtype=arr_dt), dtype=dtype)
+
+    def _ones(*s, dtype="float32", device=None):
+        del device
+        shape = s[0] if len(s) == 1 and isinstance(s[0], tuple) else s
+        return t.Tensor(np.ones(shape, dtype=np.float32), dtype=dtype)
+
+    def _tensor(data, dtype="float32", device=None):
+        del device
+        return t.Tensor(np.asarray(data), dtype=dtype)
+
+    t.zeros = _zeros
+    t.ones = _ones
+    t.tensor = _tensor
+
+    def _put_mod(name: str, **attrs):
+        m = types.ModuleType(name)
+        for k, v in attrs.items():
+            setattr(m, k, v)
+        monkeypatch.setitem(sys.modules, name, m)
+        return m
+
+    dtype_map = {
+        "float32": jnp.float32,
+        "bfloat16": jnp.bfloat16,
+        "uint8": jnp.uint8,
+        "int32": jnp.int32,
+        "float8_e4m3fn": jnp.float8_e4m3fn,
+        "float4_e2m1fn_x2": jnp.float4_e2m1fn,
+    }
+    pallas_mod = _put_mod(
+        "torch_tpu._internal.pallas",
+        jax_op=lambda *a, **k: SimpleNamespace(register_fake=lambda _f: None),
+        TORCH_TO_JAX_DTYPE_MAP=dtype_map,
+        pallas=SimpleNamespace(TORCH_TO_JAX_DTYPE_MAP=dtype_map),
+    )
+    monkeypatch.setattr(
+        sys.modules["torch_tpu._internal"], "pallas", pallas_mod, raising=False
+    )
+
+    parallel_state = SimpleNamespace(
+        get_tp_group=lambda: SimpleNamespace(
+            ranks=tuple(range(N_RANKS)), world_size=1, cpu_group=None
+        )
+    )
+    _put_mod(
+        "vllm.distributed",
+        parallel_state=parallel_state,
+        get_tensor_model_parallel_world_size=lambda: N_RANKS,
+    )
+    _put_mod(
+        "vllm.distributed.parallel_state", get_tp_group=parallel_state.get_tp_group
+    )
+    silu_cls = type("SiluAndMul", (), {})
+    _put_mod("vllm.model_executor.layers.activation", SiluAndMul=silu_cls)
+
+    fake_ep_mesh = SimpleNamespace(
+        size=N_RANKS, axis_names=("d",), shape={"d": N_RANKS}
+    )
+    _put_mod("vllm_torchtpu.distributed", __path__=[])
+    _put_mod(
+        "vllm_torchtpu.distributed.ep_mesh",
+        EP_AXIS_NAME="d",
+        build_ep_mesh=lambda: fake_ep_mesh,
+        ep_mesh_index=lambda: 0,
+        get_ep_group=lambda: None,
+    )
+    _put_mod(
+        "vllm_torchtpu.env_override",
+        SC_ALL_REDUCE_FLAG="--xla_tpu_spmd_rng_bit_generator_unsafe",
+        sc_all_reduce_floor=lambda: "0",
+    )
+    _put_mod(
+        "vllm_torchtpu.kernels.router_topk",
+        select=lambda *_a, **_k: None,
+        select_bias=lambda *_a, **_k: None,
+    )
+    _put_mod(
+        "vllm_torchtpu.kernels.experimental.fused_moe_prefill",
+        fused_moe_prefill=lambda *a, **_k: a[0],
+        plan_blocks=lambda *_a, **_k: None,
+    )
+    _put_mod(
+        "vllm_torchtpu.kernels.experimental.fused_moe_prefill.fused_moe_prefill_kernel_v2",
+        fused_moe_prefill_stage_a=lambda *a, **_k: a[0],
+    )
+
+    linear_mod = sys.modules["vllm_torchtpu.layers.adapter.linear_common"]
+    monkeypatch.setattr(
+        linear_mod, "KEEP_VLLM_LAYOUT_ATTR", "_keep_vllm_layout", raising=False
+    )
+    monkeypatch.setattr(
+        linear_mod, "WEIGHT_FLIPPED_ATTR", "_tpu_weight_flipped", raising=False
+    )
+    monkeypatch.setattr(
+        linear_mod, "_quantized_matmul_jax", lambda *_a, **_k: None, raising=False
+    )
+
+    pipelined_mod = sys.modules["vllm_torchtpu.layers.adapter.pipelined_fused_moe"]
+    monkeypatch.setattr(
+        pipelined_mod,
+        "enable_pipelined_collective_and_compute",
+        lambda: envs.TPU_MOE_COLLECTION_CHUNK_SIZE > 0,
+        raising=False,
+    )
+
+    fp8_mod = sys.modules["vllm_torchtpu.layers.adapter.quantization.fp8"]
+    fp8_moe_cls = type("VllmFp8MoEMethodTPU", (), {"_use_adaptive_fused_moe": False})
+    fp8_lin_cls = type("VllmFp8LinearMethodTPU", (), {})
+    monkeypatch.setattr(fp8_mod, "VllmFp8MoEMethodTPU", fp8_moe_cls, raising=False)
+    monkeypatch.setattr(fp8_mod, "VllmFp8LinearMethodTPU", fp8_lin_cls, raising=False)
+    unquant_cls = type("VllmUnquantizedFusedMoEMethod", (), {})
+    unquant_mod = _put_mod(
+        "vllm_torchtpu.layers.adapter.quantization.unquantized",
+        VllmUnquantizedFusedMoEMethod=unquant_cls,
+    )
+
+    src_root = pathlib.Path(envs.__file__).resolve().parent
+    loaded: dict[str, Any] = {}
+    for key, mod_name, rel_file in (
+        (
+            "fp8_decode",
+            "vllm_torchtpu.layers.adapter.moe_tp_decode",
+            "layers/adapter/moe_tp_decode.py",
+        ),
+        (
+            "fused_decode",
+            "vllm_torchtpu.layers.adapter.fused_moe_decode",
+            "layers/adapter/fused_moe_decode.py",
+        ),
+        (
+            "adapter",
+            "vllm_torchtpu.layers.adapter.moe_tp_decode_nvfp4",
+            "layers/adapter/moe_tp_decode_nvfp4.py",
+        ),
+        (
+            "moe_runner",
+            "vllm_torchtpu.layers.adapter.custom_ops.moe_runner",
+            "layers/adapter/custom_ops/moe_runner.py",
+        ),
+        (
+            "nvfp4",
+            "vllm_torchtpu.layers.adapter.quantization.nvfp4",
+            "layers/adapter/quantization/nvfp4.py",
+        ),
+    ):
+        parent_name, child_name = mod_name.rsplit(".", 1)
+        spec = importlib.util.spec_from_file_location(mod_name, src_root / rel_file)
+        assert spec is not None and spec.loader is not None
+        mod = importlib.util.module_from_spec(spec)
+        monkeypatch.setitem(sys.modules, mod_name, mod)
+        monkeypatch.setattr(sys.modules[parent_name], child_name, mod, raising=False)
+        spec.loader.exec_module(mod)
+        loaded[key] = mod
+
+    return SimpleNamespace(
+        torch=t,
+        ep_mod=sys.modules["vllm_torchtpu.layers.adapter.fused_moe_ep"],
+        pipelined_mod=pipelined_mod,
+        fp8_mod=fp8_mod,
+        unquant_mod=unquant_mod,
+        silu_cls=silu_cls,
+        **loaded,
+    )
+
+
+def _build_precedence_harness(monkeypatch):
+    """Build fake NVFP4, FP8, and BF16 MoE runners sharing SMALL_TP8 geometry."""
+    pm = _load_precedence_modules(monkeypatch)
+    t = pm.torch
+    monkeypatch.setattr(pltpu, "get_tpu_info", _tpu7x)
+
+    fake_mesh = SimpleNamespace(size=N_RANKS, axis_names=("d",), shape={"d": N_RANKS})
+    topo = SimpleNamespace(mesh=fake_mesh, mesh_index=0)
+    monkeypatch.setattr(pm.fp8_decode, "_topology", lambda: topo)
+    monkeypatch.setattr(pm.fp8_decode, "_check_ranks_agree", lambda _d: None)
+    monkeypatch.setattr(pm.fp8_decode, "_selftest", lambda *_a: [])
+    monkeypatch.setattr(pm.fp8_decode, "_gather", lambda d: [d])
+    monkeypatch.setattr(pm.fp8_decode, "_SELFTEST_DONE", False)
+    monkeypatch.setattr(pm.adapter, "_SELFTEST_DONE", False)
+    pm.fp8_decode._OPS.clear()
+    pm.fused_decode._OPS.clear()
+    pm.adapter._OPS.clear()
+    monkeypatch.setattr(pm.fused_decode, "_RANK_BUFFER", None)
+    monkeypatch.setattr(pm.fused_decode, "_RANK_BUFFER_START", 0)
+    monkeypatch.setattr(pm.fused_decode, "_RANK_BUFFER_INDEX", None)
+    monkeypatch.setattr(pm.fused_decode, "build_ep_mesh", lambda: fake_mesh)
+    monkeypatch.setattr(pm.fused_decode, "ep_mesh_index", lambda: 0)
+    monkeypatch.setattr(
+        pm.fused_decode, "_check_same_arming_on_every_rank", lambda *_a: None
+    )
+
+    fp8_tp_statics: list[Any] = []
+    fused_decode_builds: list[dict[str, Any]] = []
+    nvfp4_statics: list[Any] = []
+
+    monkeypatch.setattr(
+        pm.fp8_decode,
+        "_get_op",
+        lambda _m, st, prequant=False: fp8_tp_statics.append(st) or "fp8_tp_decode_op",
+    )
+    monkeypatch.setattr(
+        pm.fused_decode,
+        "_build_op",
+        lambda _m, n_ranks, topk, ep, max_tok, sg, rs, prefill_kernel=False: (
+            fused_decode_builds.append(
+                dict(
+                    n_ranks=n_ranks,
+                    topk=topk,
+                    ep=ep,
+                    max_tokens=max_tok,
+                    prefill_kernel=prefill_kernel,
+                )
+            )
+            or "fused_moe_decode_op"
+        ),
+    )
+    monkeypatch.setattr(
+        pm.adapter,
+        "_get_op",
+        lambda _m, st: nvfp4_statics.append(st) or "nvfp4_tp_decode_op",
+    )
+
+    linear_mod = importlib.import_module("vllm_torchtpu.layers.adapter.linear_common")
+    flipped_attr = linear_mod.WEIGHT_FLIPPED_ATTR
+
+    class DeepseekV2MLP(t.nn.Module):
+        def __init__(self, h: int, fs: int):
+            super().__init__()
+            lin_qm = pm.fp8_mod.VllmFp8LinearMethodTPU.__new__(
+                pm.fp8_mod.VllmFp8LinearMethodTPU
+            )
+            self.gate_up_proj = SimpleNamespace(
+                weight=t.zeros(h, 2 * fs, dtype=t.float8_e4m3fn),
+                weight_scale=t.ones(2 * fs, dtype=t.float32),
+                bias=None,
+                quant_method=lin_qm,
+                **{flipped_attr: True},
+            )
+            self.down_proj = SimpleNamespace(
+                weight=t.zeros(fs, h, dtype=t.float8_e4m3fn),
+                weight_scale=t.ones(h, dtype=t.float32),
+                bias=None,
+                reduce_results=False,
+                quant_method=lin_qm,
+                **{flipped_attr: True},
+            )
+            self.act_fn = pm.silu_cls.__new__(pm.silu_cls)
+            self.expert_gate = None
+
+    class _Runner(pm.moe_runner.VllmMoERunner):
+        @property
+        def shared_experts(self):
+            return self._shared_experts
+
+    class _Model(t.nn.Module):
+        def __init__(self, *runners):
+            super().__init__()
+            self._runners = list(runners)
+
+        def modules(self):
+            return [self, *self._runners]
+
+    def make_runner(
+        name: str,
+        kind: str,
+        *,
+        use_ep: bool = False,
+        ep_size: int = 1,
+        tp_size: int = N_RANKS,
+        ep_rank: int = 0,
+    ):
+        h, e_local, inter, fs, topk = 2048, 16, 256, 128, 4
+        global_e = e_local * (ep_size if use_ep else 1)
+        par = SimpleNamespace(
+            use_ep=use_ep,
+            ep_size=ep_size if use_ep else 1,
+            ep_rank=ep_rank if use_ep else 0,
+            tp_size=tp_size,
+            dp_size=1,
+            pcp_size=1,
+            enable_eplb=False,
+        )
+        cfg = SimpleNamespace(
+            experts_per_token=topk,
+            is_sequence_parallel=False,
+            skip_final_all_reduce=False,
+            ep_size=par.ep_size,
+            ep_rank=par.ep_rank,
+            tp_size=par.tp_size,
+            hidden_dim=h,
+            in_dtype=t.bfloat16,
+            moe_parallel_config=par,
+        )
+        layer = pm.nvfp4.RoutedExperts()
+        layer.moe_config = cfg
+        layer.moe_parallel_config = par
+        layer.global_num_experts = global_e
+        layer.expert_placement_strategy = "linear"
+        layer.use_grouped_topk = False
+        layer.num_expert_group = 1
+        layer.topk_group = 1
+        layer.scoring_func = "sigmoid"
+        layer.renormalize = True
+        layer.custom_routing_function = None
+        layer.routed_scaling_factor = 1.0
+        layer.e_score_correction_bias = t.zeros(global_e, dtype=t.float32)
+
+        if kind == "nvfp4":
+            qm: Any = pm.nvfp4.VllmNvfp4MoEMethod(
+                SimpleNamespace(group_size=16),
+                SimpleNamespace(has_bias=False, is_act_and_mul=True),
+            )
+            qm._tpu_activation_str = "silu"
+            qm._use_adaptive_fused_moe = False
+            b2 = 512 if inter >= 512 else 256
+            layer.w13_weight = t.zeros(e_local, h, inter, dtype=t.float4_e2m1fn_x2)
+            layer.w2_weight = t.zeros(e_local, inter, h // 2, dtype=t.float4_e2m1fn_x2)
+            layer.w13_weight_scale = t.ones(
+                e_local, h // 512, 1, 2 * inter, dtype=t.float32
+            )
+            layer.w2_weight_scale = t.ones(e_local, inter // b2, 1, h, dtype=t.float32)
+        elif kind == "fp8":
+            qm = pm.fp8_mod.VllmFp8MoEMethodTPU.__new__(pm.fp8_mod.VllmFp8MoEMethodTPU)
+            qm._tpu_activation_str = "silu"
+            qm._use_adaptive_fused_moe = False
+            layer.w13_weight = t.zeros(e_local, h, 2 * inter, dtype=t.float8_e4m3fn)
+            layer.w2_weight = t.zeros(e_local, inter, h, dtype=t.float8_e4m3fn)
+            layer.w13_weight_scale_inv = t.ones(
+                e_local, 1, 1, 2 * inter, dtype=t.float32
+            )
+            layer.w2_weight_scale_inv = t.ones(e_local, 1, 1, h, dtype=t.float32)
+        elif kind == "bf16":
+            qm = pm.unquant_mod.VllmUnquantizedFusedMoEMethod.__new__(
+                pm.unquant_mod.VllmUnquantizedFusedMoEMethod
+            )
+            qm._tpu_activation_str = "silu"
+            layer.w13_weight = t.zeros(e_local, h, 2 * inter, dtype=t.bfloat16)
+            layer.w2_weight = t.zeros(e_local, inter, h, dtype=t.bfloat16)
+        else:
+            raise ValueError(f"unknown layer kind {kind!r}")
+
+        if use_ep:
+            layer.register_buffer(
+                "_experts_start",
+                t.tensor(ep_rank * e_local, dtype=t.int32),
+                persistent=False,
+            )
+        else:
+            layer._experts_start = None
+        layer.quant_method = qm
+
+        r: Any = _Runner.__new__(_Runner)
+        t.nn.Module.__init__(r)
+        r.layer_name = name
+        r.routed_experts = layer
+        r._quant_method = qm
+        r.moe_config = cfg
+        r.gate = object()
+        r.shared_expert_gate = None
+        r.routed_input_transform = None
+        r.routed_output_transform = None
+        r.router = object()
+        r.routed_scaling_factor = ROUTED_SCALE
+        r._shared_experts = SimpleNamespace(_layer=DeepseekV2MLP(h, fs))
+        return r
+
+    def arm_in_runner_order(model, draft_model=None):
+        """Mirror TPUModelRunner.load_model's exact MoE arming sequence."""
+        pad_mask = t.zeros(64, dtype=t.uint8)
+        pad_state = (
+            SimpleNamespace(local_padding_mask=pad_mask)
+            if envs.TPU_MOE_SKIP_PADDED_TOKENS
+            else None
+        )
+        monkeypatch.setattr(pm.adapter.token_padding, "_padding_state", pad_state)
+        monkeypatch.setattr(pm.fp8_decode.token_padding, "_padding_state", pad_state)
+        runner_obj = SimpleNamespace(
+            model=model,
+            drafter=None
+            if draft_model is None
+            else SimpleNamespace(draft_model=draft_model),
+        )
+        fused_moe_arming = envs.FUSED_MOE_DECODE_KERNEL or envs.FUSED_MOE_PREFILL_KERNEL
+        if fused_moe_arming and not envs.USE_MOE_TP_DECODE_KERNEL:
+            pm.fused_decode.arm_runner_models(runner_obj)
+        if envs.USE_MOE_TP_DECODE_KERNEL:
+            if pm.fp8_decode.should_arm():
+                pm.fp8_decode.arm(model, draft_model)
+            if fused_moe_arming:
+                pm.fused_decode.arm_runner_models(runner_obj)
+        if envs.USE_MOE_TP_DECODE_NVFP4_KERNEL and pm.adapter.should_arm():
+            pm.adapter.arm(model, draft_model)
+
+    def armed_owners(runner) -> list[str]:
+        qm = runner._quant_method
+        owners: list[str] = []
+        if pm.adapter.moe_tp_decode_nvfp4_supported(qm):
+            owners.append("moe_tp_decode_nvfp4")
+        if pm.fp8_decode.moe_tp_decode_supported(qm):
+            owners.append("moe_tp_decode")
+        if pm.fused_decode.fused_moe_decode_supported(qm):
+            owners.append("fused_moe_decode")
+        if pm.ep_mod.fused_moe_ep_supported(qm):
+            owners.append("fused_moe_ep")
+        if getattr(qm, "_use_adaptive_fused_moe", False) and (
+            getattr(qm, "_adaptive_fused_moe_op", None) is not None
+        ):
+            owners.append("adaptive_fused_moe")
+        return owners
+
+    return SimpleNamespace(
+        pm=pm,
+        Model=_Model,
+        make_runner=make_runner,
+        arm_in_runner_order=arm_in_runner_order,
+        armed_owners=armed_owners,
+        fp8_tp_statics=fp8_tp_statics,
+        fused_decode_builds=fused_decode_builds,
+        nvfp4_statics=nvfp4_statics,
+    )
+
+
+@pytest.mark.parametrize(
+    ("env_overrides", "want_nvfp4", "want_fp8", "want_bf16", "want_fp8_prefill"),
+    [
+        pytest.param(
+            {"FUSED_MOE_PREFILL_KERNEL": "0"},
+            "moe_tp_decode_nvfp4",
+            "unarmed",
+            "unarmed",
+            None,
+            id="nvfp4_only",
+        ),
+        pytest.param(
+            {"FUSED_MOE_PREFILL_KERNEL": "1"},
+            "moe_tp_decode_nvfp4",
+            "unarmed",
+            "unarmed",
+            None,
+            id="nvfp4_plus_prefill_default",
+        ),
+        pytest.param(
+            {"USE_MOE_TP_DECODE_KERNEL": "1", "FUSED_MOE_PREFILL_KERNEL": "0"},
+            "moe_tp_decode_nvfp4",
+            "moe_tp_decode",
+            "unarmed",
+            None,
+            id="nvfp4_plus_fp8_tp_decode_no_prefill",
+        ),
+        pytest.param(
+            {"USE_MOE_TP_DECODE_KERNEL": "1", "FUSED_MOE_PREFILL_KERNEL": "1"},
+            "moe_tp_decode_nvfp4",
+            "moe_tp_decode",
+            "unarmed",
+            256,
+            id="nvfp4_plus_fp8_tp_decode_with_prefill",
+        ),
+        pytest.param(
+            {"FUSED_MOE_DECODE_KERNEL": "1", "FUSED_MOE_PREFILL_KERNEL": "1"},
+            "moe_tp_decode_nvfp4",
+            "fused_moe_decode",
+            "unarmed",
+            True,
+            id="nvfp4_plus_fused_moe_decode_regression",
+        ),
+        pytest.param(
+            {
+                "USE_MOE_TP_DECODE_KERNEL": "1",
+                "FUSED_MOE_DECODE_KERNEL": "1",
+                "FUSED_MOE_PREFILL_KERNEL": "0",
+            },
+            "moe_tp_decode_nvfp4",
+            "fused_moe_decode",
+            "unarmed",
+            False,
+            id="nvfp4_plus_both_fp8_decode_flags",
+        ),
+        pytest.param(
+            {
+                "USE_MOE_TP_DECODE_KERNEL": "1",
+                "TPU_MOE_FP8_ALL_GATHER": "1",
+                "TPU_MOE_COLLECTION_CHUNK_SIZE": "0",
+            },
+            "moe_tp_decode_nvfp4",
+            "unarmed",
+            "unarmed",
+            None,
+            id="nvfp4_ignores_fp8_only_all_gather",
+        ),
+        pytest.param(
+            {"TPU_MOE_COLLECTION_CHUNK_SIZE": "256"},
+            "unarmed",
+            "unarmed",
+            "unarmed",
+            None,
+            id="nvfp4_yields_to_collection_chunking",
+        ),
+    ],
+)
+def test_flag_precedence_across_nvfp4_fp8_and_bf16_layers(
+    monkeypatch,
+    env_overrides: dict[str, str],
+    want_nvfp4: str,
+    want_fp8: str,
+    want_bf16: str,
+    want_fp8_prefill: Any,
+):
+    """Verify per-layer flag precedence across NVFP4, FP8, and BF16 MoE layers."""
+    h = _build_precedence_harness(monkeypatch)
+    base_env = {
+        "USE_MOE_TP_DECODE_NVFP4_KERNEL": "1",
+        "TPU_MOE_SKIP_PADDED_TOKENS": "1",
+        "USE_MOE_TP_DECODE_KERNEL": "0",
+        "FUSED_MOE_DECODE_KERNEL": "0",
+        "FUSED_MOE_DECODE_KERNEL_MAX_TOKENS": "256",
+        "FUSED_MOE_PREFILL_KERNEL": "1",
+        "USE_MOE_FUSED_EP_KERNEL": "0",
+        "MOE_FUSED_EP_ENABLE_W4A8": "0",
+        "TPU_MOE_FP8_ALL_GATHER": "0",
+        "TPU_MOE_COLLECTION_CHUNK_SIZE": "0",
+        "TPU_MOE_TP_DECODE_HBM_OPERANDS": "0",
+    }
+    monkeypatch.delenv("MOE_FUSED_EP_KERNEL_IMPL", raising=False)
+    for k, v in {**base_env, **env_overrides}.items():
+        monkeypatch.setenv(k, v)
+
+    nvfp4_runner = h.make_runner("model.layers.0.mlp", "nvfp4")
+    fp8_runner = h.make_runner("model.layers.1.mlp", "fp8")
+    bf16_runner = h.make_runner("draft.layers.0.mlp", "bf16")
+    model = h.Model(nvfp4_runner, fp8_runner)
+    draft = h.Model(bf16_runner)
+
+    h.arm_in_runner_order(model, draft)
+
+    for runner, want in (
+        (nvfp4_runner, want_nvfp4),
+        (fp8_runner, want_fp8),
+        (bf16_runner, want_bf16),
+    ):
+        owners = h.armed_owners(runner)
+        assert len(owners) <= 1, f"double-armed {runner.layer_name}: {owners}"
+        got = owners[0] if owners else "unarmed"
+        assert got == want
+        if want == "unarmed":
+            assert runner._shared_experts is not None
+            assert runner.routed_scaling_factor == ROUTED_SCALE
+            assert runner._fused_output_is_reduced is False
+        else:
+            assert runner._shared_experts is None
+            assert runner.routed_scaling_factor == 1.0
+            assert runner._fused_output_is_reduced is True
+
+    if want_fp8 == "moe_tp_decode":
+        assert len(h.fp8_tp_statics) == 1
+        assert h.fp8_tp_statics[0].prefill_above == want_fp8_prefill
+    elif want_fp8 == "fused_moe_decode":
+        assert len(h.fused_decode_builds) == 1
+        assert h.fused_decode_builds[0]["prefill_kernel"] is want_fp8_prefill
+
+
+def test_flag_precedence_fused_ep_and_token_count_dispatch(monkeypatch):
+    """Verify fused-EP precedence (pure EP vs TP/EPxTP) and n<=64 vs n>64 dispatch."""
+    h = _build_precedence_harness(monkeypatch)
+    pm = h.pm
+    t = pm.torch
+
+    for k, v in {
+        "USE_MOE_TP_DECODE_NVFP4_KERNEL": "1",
+        "TPU_MOE_SKIP_PADDED_TOKENS": "1",
+        "USE_MOE_TP_DECODE_KERNEL": "1",
+        "FUSED_MOE_DECODE_KERNEL": "0",
+        "FUSED_MOE_DECODE_KERNEL_MAX_TOKENS": "256",
+        "FUSED_MOE_PREFILL_KERNEL": "1",
+        "USE_MOE_FUSED_EP_KERNEL": "1",
+        "MOE_FUSED_EP_ENABLE_W4A8": "1",
+        "MOE_REQUANTIZE_BLOCK_SIZE": "512",
+        "TPU_MOE_TP_DECODE_HBM_OPERANDS": "0",
+    }.items():
+        monkeypatch.setenv(k, v)
+    monkeypatch.delenv("MOE_FUSED_EP_KERNEL_IMPL", raising=False)
+
+    # 1. Pure EP (ep=8, tp=1) with USE_MOE_FUSED_EP_KERNEL=1 and
+    #    MOE_FUSED_EP_ENABLE_W4A8=1: fused_moe_ep admits at weight load,
+    #    moe_tp_decode_nvfp4 & moe_tp_decode stand down, and apply_monolithic
+    #    routes both n<=64 and n>64 to fused_moe_ep.
+    monkeypatch.setattr(pm.nvfp4, "prebuild_fused_moe_kernel", lambda **_k: None)
+    monkeypatch.setattr(
+        pm.nvfp4,
+        "_requant_moe_w4a8",
+        lambda w13, _s13, _w2, _s2, _b: (
+            t.zeros(w13.shape[0], 1024, 1024, dtype=t.uint8),
+            t.ones(w13.shape[0], 4, 1, 1024, dtype=t.float32),
+            t.zeros(w13.shape[0], 2048, 256, dtype=t.uint8),
+            t.ones(w13.shape[0], 1, 1, 2048, dtype=t.float32),
+        ),
+    )
+    monkeypatch.setattr(
+        pm.nvfp4,
+        "requant_load_kmajor_fp4",
+        lambda w_u8, _scale_f, block: (
+            t.zeros(
+                w_u8.shape[0],
+                w_u8.shape[2] * 2,
+                w_u8.shape[1] // 2,
+                dtype=t.float4_e2m1fn_x2,
+            ),
+            t.ones(
+                w_u8.shape[0],
+                (w_u8.shape[2] * 2) // block,
+                1,
+                w_u8.shape[1],
+                dtype=t.float32,
+            ),
+        ),
+    )
+    monkeypatch.setattr(
+        pm.nvfp4,
+        "load_kmajor_fp4",
+        lambda w: t.zeros(
+            w.shape[0], w.shape[2] * 2, w.shape[1] // 2, dtype=t.float4_e2m1fn_x2
+        ),
+    )
+    monkeypatch.setattr(
+        pm.nvfp4,
+        "_prebuild_w4a8",
+        lambda layer, _act, _blk: (
+            ("admitted_ep_op", 512)
+            if (
+                envs.USE_MOE_FUSED_EP_KERNEL
+                and envs.MOE_FUSED_EP_ENABLE_W4A8
+                and layer.moe_config.moe_parallel_config.use_ep
+                and layer.moe_config.moe_parallel_config.tp_size == 1
+            )
+            else (None, 512)
+        ),
+    )
+
+    ep_nvfp4_layer, ep_nvfp4_qm = _make_nvfp4_moe_layer(
+        SimpleNamespace(torch=t, nvfp4=pm.nvfp4),
+        e=16,
+        h=2048,
+        inter=512,
+        use_ep=True,
+        ep_size=N_RANKS,
+        ep_rank=0,
+        tp_size=1,
+    )
+    ep_nvfp4_layer.e_score_correction_bias = t.zeros(16 * N_RANKS, dtype=t.float32)
+    ep_nvfp4_layer.use_grouped_topk = False
+    ep_nvfp4_layer.num_expert_group = 1
+    ep_nvfp4_layer.topk_group = 1
+    ep_nvfp4_layer.scoring_func = "sigmoid"
+    ep_nvfp4_layer.renormalize = True
+    ep_nvfp4_layer.custom_routing_function = None
+    ep_nvfp4_layer.routed_scaling_factor = 1.0
+    ep_nvfp4_qm.process_weights_after_loading(ep_nvfp4_layer)
+    ep_nvfp4_layer.quant_method = ep_nvfp4_qm
+
+    ep_nvfp4_runner = h.make_runner(
+        "model.layers.0.mlp", "nvfp4", use_ep=True, ep_size=N_RANKS, tp_size=1
+    )
+    ep_nvfp4_runner.routed_experts = ep_nvfp4_layer
+    ep_nvfp4_runner._quant_method = ep_nvfp4_qm
+
+    ep_fp8_runner = h.make_runner(
+        "model.layers.1.mlp", "fp8", use_ep=True, ep_size=N_RANKS, tp_size=1
+    )
+    setattr(ep_fp8_runner._quant_method, pm.ep_mod.FUSED_MOE_EP_OP_ATTR, "fp8_ep_op")
+    bf16_runner = h.make_runner(
+        "draft.layers.0.mlp", "bf16", use_ep=True, ep_size=N_RANKS, tp_size=1
+    )
+
+    h.arm_in_runner_order(h.Model(ep_nvfp4_runner, ep_fp8_runner), h.Model(bf16_runner))
+
+    assert h.armed_owners(ep_nvfp4_runner) == ["fused_moe_ep"]
+    assert h.armed_owners(ep_fp8_runner) == ["fused_moe_ep"]
+    assert h.armed_owners(bf16_runner) == []
+    assert ep_nvfp4_runner._shared_experts is not None
+    assert ep_nvfp4_runner._fused_output_is_reduced is True
+    assert pm.adapter._admit(ep_nvfp4_runner, N_RANKS) == (
+        "a fused EP MoE kernel serves this layer"
+    )
+
+    ep_calls: list[int] = []
+    monkeypatch.setattr(
+        pm.ep_mod,
+        "fused_moe_ep",
+        lambda _qm, hs, *_a, **_k: ep_calls.append(hs.shape[0]) or "ep_out",
+    )
+    for n_tok in (16, 128):
+        x_tok = t.zeros(n_tok, 2048, dtype=t.bfloat16)
+        logits_tok = t.zeros(n_tok, 16 * N_RANKS, dtype=t.float32)
+        assert (
+            ep_nvfp4_qm.apply_monolithic(ep_nvfp4_layer, x_tok, logits_tok) == "ep_out"
+        )
+    assert ep_calls == [16, 128]
+
+    # 2. On TP8 or EP2xTP4 (tp > 1), fused_moe_ep does not admit NVFP4, so
+    #    moe_tp_decode_nvfp4 arms and wins even when USE_MOE_FUSED_EP_KERNEL=1.
+    tp8_nvfp4_runner = h.make_runner("model.layers.2.mlp", "nvfp4")
+    ep2_nvfp4_runner = h.make_runner(
+        "model.layers.3.mlp", "nvfp4", use_ep=True, ep_size=2, tp_size=4
+    )
+    h.arm_in_runner_order(h.Model(tp8_nvfp4_runner, ep2_nvfp4_runner))
+    assert h.armed_owners(tp8_nvfp4_runner) == ["moe_tp_decode_nvfp4"]
+    assert h.armed_owners(ep2_nvfp4_runner) == ["moe_tp_decode_nvfp4"]
+
+    # 3. Token-count dispatch (n <= 64 vs n > 64) on armed NVFP4 and FP8 ops:
+    #    - NVFP4 op runs moe_tp_decode_nvfp4 for n in (8, 16, 64) and _tp_chain
+    #      for all n > 64 (128, 512), unaffected by FUSED_MOE_PREFILL_KERNEL=1.
+    #    - FP8 moe_tp_decode op runs moe_tp_decode for n in (16, 64), _tp_chain
+    #      for 64 < n <= 256 (128), and _prefill_chain for n > 256 (512) on TP.
+    nvfp4_tags: list[tuple[str, int]] = []
+    monkeypatch.setattr(
+        pm.adapter.kernel,
+        "moe_tp_decode_nvfp4",
+        lambda x_in, *_a, **_k: nvfp4_tags.append(("nvfp4_kernel", x_in.shape[0]))
+        or jnp.zeros_like(x_in),
+    )
+    monkeypatch.setattr(
+        pm.fp8_decode,
+        "_tp_chain",
+        lambda x_in, *_a, **_k: nvfp4_tags.append(("tp_chain", x_in.shape[0]))
+        or jnp.zeros_like(x_in),
+    )
+    nvfp4_body = pm.adapter._op_body(
+        pm.adapter._OpStatics(
+            topk=4,
+            routed_scale=ROUTED_SCALE,
+            activation="silu",
+            use_sparse_core=False,
+            onehot_threshold=0,
+        ),
+        n_ranks=N_RANKS,
+        axis="d",
+    )
+    w_nvfp4 = (
+        jnp.zeros((16, 2048, 512), FP4),
+        jnp.zeros((16, 256, 2048), FP4),
+        jnp.ones((16, 4, 1, 512), F32),
+        jnp.ones((16, 1, 1, 2048), F32),
+        jnp.zeros((2048, 256), FP8),
+        jnp.ones((256,), F32),
+        jnp.zeros((128, 2048), FP8),
+        jnp.ones((2048,), F32),
+    )
+    for n_tok in (8, 16, 64, 128, 512):
+        ops = (
+            jnp.zeros((n_tok, 2048), BF16),
+            jnp.zeros((n_tok, 16), F32),
+            jnp.zeros((16,), F32),
+            jnp.zeros((max(n_tok, 64),), jnp.bool_),
+            *w_nvfp4,
+            jnp.zeros((1, 1), jnp.int32),
+            jnp.zeros((1, 1), jnp.int32),
+        )
+        out_nvfp4 = jax.vmap(nvfp4_body, axis_name="d")(
+            *(jnp.stack([a, a]) for a in ops)
+        )
+        assert out_nvfp4.shape == (2, n_tok, 2048)
+    assert nvfp4_tags == [
+        ("nvfp4_kernel", 16),
+        ("nvfp4_kernel", 16),
+        ("nvfp4_kernel", 64),
+        ("tp_chain", 128),
+        ("tp_chain", 512),
+    ]
+
+    fp8_tags: list[tuple[str, int]] = []
+    monkeypatch.setattr(
+        pm.fp8_decode.kernel,
+        "moe_tp_decode",
+        lambda x_in, *_a, **_k: fp8_tags.append(("fp8_kernel", x_in.shape[0]))
+        or jnp.zeros_like(x_in),
+    )
+    monkeypatch.setattr(
+        pm.fp8_decode,
+        "_tp_chain",
+        lambda x_in, *_a, **_k: fp8_tags.append(("tp_chain", x_in.shape[0]))
+        or jnp.zeros_like(x_in),
+    )
+    monkeypatch.setattr(
+        pm.fp8_decode,
+        "_prefill_chain",
+        lambda x_in, *_a, **_k: fp8_tags.append(("prefill", x_in.shape[0]))
+        or jnp.zeros_like(x_in),
+    )
+    fp8_body = pm.fp8_decode._op_body(
+        pm.fp8_decode._OpStatics(
+            topk=4,
+            routed_scale=ROUTED_SCALE,
+            activation="silu",
+            use_sparse_core=False,
+            onehot_threshold=0,
+            prefill_above=256,
+        ),
+        n_ranks=N_RANKS,
+        axis="d",
+    )
+    w_fp8 = (
+        jnp.zeros((16, 2048, 512), FP8),
+        jnp.zeros((16, 256, 2048), FP8),
+        jnp.ones((16, 1, 1, 512), F32),
+        jnp.ones((16, 1, 1, 2048), F32),
+        *w_nvfp4[4:],
+    )
+    for n_tok in (8, 16, 64, 128, 512):
+        ops_fp8 = (
+            jnp.zeros((n_tok, 2048), BF16),
+            jnp.zeros((n_tok, 16), F32),
+            jnp.zeros((16,), F32),
+            jnp.zeros((max(n_tok, 64),), jnp.bool_),
+            *w_fp8,
+            jnp.zeros((1, 1), jnp.int32),
+            jnp.zeros((1, 1), jnp.int32),
+        )
+        out_fp8 = jax.vmap(fp8_body, axis_name="d")(
+            *(jnp.stack([a, a]) for a in ops_fp8)
+        )
+        assert out_fp8.shape == (2, n_tok, 2048)
+    assert fp8_tags == [
+        ("fp8_kernel", 16),
+        ("fp8_kernel", 16),
+        ("fp8_kernel", 64),
+        ("tp_chain", 128),
+        ("prefill", 512),
+    ]
