@@ -477,6 +477,9 @@ class StagedConsumer:
         self.src_layout, src_specs = pooled_cache_specs(
             without_speculation(cfg), tp=1, main_dcp=1, pack_compressed=False
         )
+        from .config import ensure_kv_group_size_rule
+
+        ensure_kv_group_size_rule()
         self.src_groups = build_transfer_groups(get_kv_cache_groups(cfg, dict(src_specs)))
         self.src_block, self.dst_block = self.src_layout.block_size, decode_layout.block_size
         self.ratio = int(cfg.model_config.hf_text_config.indexer_compress_ratio)
