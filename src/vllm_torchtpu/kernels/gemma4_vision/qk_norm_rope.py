@@ -46,7 +46,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 LANE = 128
-DEFAULT_BLOCK_TOKENS = 256
+DEFAULT_BLOCK_TOKENS = 1024
 DEFAULT_VMEM_LIMIT_BYTES = 64 * 1024 * 1024
 
 
