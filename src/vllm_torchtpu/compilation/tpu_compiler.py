@@ -75,7 +75,7 @@ _tpu_backend = TpuBackend()
 # How long a rank waits for the rank of its host that compiles a bucket, and
 # how often it looks. The wait is bounded only for a peer that never saves the
 # artifact (its serialize() failed); the rank then compiles the bucket itself.
-PEER_WAIT_S = 3600.0
+PEER_WAIT_S = 7200.0
 _PEER_POLL_S = 5.0
 # get_attr tensors up to this size are hashed by value; bigger ones, which are
 # weights rather than constants, by dtype and shape.
@@ -312,6 +312,7 @@ _RUNTIME_CACHE_KEY_PATHS = (
     "vllm_torchtpu/layers/adapter/fused_moe_ep.py",
     # Same for the TP decode MoE op, whose body this module builds.
     "vllm_torchtpu/layers/adapter/moe_tp_decode.py",
+    "vllm_torchtpu/layers/adapter/dcp_token_parallel_op.py",
     "vllm_torchtpu/layers/adapter/small_all_reduce_op.py",
     # The HBM-streaming LM head op.
     "vllm_torchtpu/layers/adapter/lm_head_hbm.py",

@@ -20,6 +20,9 @@ import pytest
 import torch
 from vllm.model_executor.layers.linear import DCPGroupColumnParallelLinear
 from vllm.model_executor.layers.mla import MLAModules
+from vllm_torchtpu.layers.adapter.linear_common import WEIGHT_FLIPPED_ATTR
+from vllm_torchtpu.layers.adapter.quantization.fp8 import VllmFp8LinearMethodTPU
+from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
 
 from vllm_torchtpu import envs
 from vllm_torchtpu.layers.adapter import attention as attention_adapter
@@ -35,9 +38,6 @@ from vllm_torchtpu.layers.adapter.custom_ops.mla_attention_op import (
     VllmTPUSparseAttnIndexer,
     _dcp_indexer_a2a_for_bucket,
 )
-from vllm_torchtpu.layers.adapter.linear_common import WEIGHT_FLIPPED_ATTR
-from vllm_torchtpu.layers.adapter.quantization.fp8 import VllmFp8LinearMethodTPU
-from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
 
 
 def test_mla_attention_interface_mixed_q_split(monkeypatch):
@@ -2039,3 +2039,202 @@ def test_packed_rope_refuses_tensorcore_layouts(monkeypatch, layout_env):
         PallasMLAttentionBackend.get_sparse_kv_cache_specs(
             2, 256, 576, torch.float8_e4m3fn
         )
+
+
+def _tp_test_layout():
+    from vllm_torchtpu.kernels.mla.dcp_token_parallel import TokenParallelLayout
+
+    return TokenParallelLayout(
+        dcp_size=4,
+        interleave_size=4,
+        page_size=256,
+        split_rows=64,
+        max_pages=8,
+        gather_caps=(4, 8),
+    )
+
+
+def _build_sparse_mla_tp_ops(monkeypatch, layers, *, q_replicated=True, meshes=None):
+    from vllm_torchtpu.layers.adapter import dcp_token_parallel_op
+
+    layout = _tp_test_layout()
+    built = []
+
+    def fake_pcp_op(name, fn, **kwargs):
+        built.append((name, fn))
+        return MagicMock()
+
+    monkeypatch.setattr(dcp_token_parallel_op, "pcp_streaming_jax_op", fake_pcp_op)
+    monkeypatch.setattr(dcp_token_parallel_op, "_sharded_rank_ids", lambda: None)
+    monkeypatch.setattr(
+        "vllm_torchtpu.distributed.dcp.dcp_rank_operand",
+        lambda: torch.zeros((1,), dtype=torch.int32),
+    )
+    meshes = meshes or ["tp_mesh"] * len(layers)
+    q_reps = (
+        q_replicated
+        if isinstance(q_replicated, (list, tuple))
+        else [q_replicated] * len(layers)
+    )
+    for layer, mesh, q_rep in zip(layers, meshes, q_reps):
+        impl, _, _, _ = _make_impl_and_layer()
+        impl._dcp_mesh = mesh
+        impl.dcp_size = layout.dcp_size
+        impl.dcp_interleave_size = layout.interleave_size
+        dcp_token_parallel_op.build_attention_op(
+            layer, impl, layout, q_replicated=q_rep
+        )
+    return built
+
+
+def _unwrap_inner_run(wrapper_fn):
+    for cell in wrapper_fn.__closure__ or ():
+        val = cell.cell_contents
+        if callable(val) and getattr(val, "__name__", "") == "_run":
+            return val
+        if callable(val) and getattr(val, "__name__", "") == "_fn_fused":
+            return _unwrap_inner_run(val)
+    raise AssertionError(f"could not find _run in {wrapper_fn}")
+
+
+def test_sparse_mla_tp_op_is_shared_by_layers_with_one_kernel_config(monkeypatch):
+    """Token-parallel sparse MLA layers with matching configs share one op."""
+    layers = [
+        _sparse_mla_layer("model.layers.0.self_attn.attn", use_sparse=False),
+        _sparse_mla_layer("model.layers.1.self_attn.attn"),
+        _sparse_mla_layer("model.layers.2.self_attn.attn"),
+    ]
+    built = _build_sparse_mla_tp_ops(monkeypatch, layers)
+
+    assert len(built) == 1
+    assert re.fullmatch(r"pallas::sparse_mla_tp_\d+", built[0][0])
+    inner_run = _unwrap_inner_run(built[0][1])
+    assert set(inner_run.__code__.co_freevars) == {
+        "dcp",
+        "dequant",
+        "fused_subbatch",
+        "il",
+        "layers",
+        "layout",
+        "mesh",
+        "mixed_levers",
+        "q_replicated",
+        "sm_scale",
+        "sparse_mla_attention_dcp",
+    }
+
+    spec_a = SimpleNamespace(
+        page_size=256,
+        layout=SimpleNamespace(value="sal"),
+        packed_rope=False,
+        token_bytes=64,
+    )
+    spec_b = SimpleNamespace(
+        page_size=256,
+        layout=SimpleNamespace(value="sal"),
+        packed_rope=True,
+        token_bytes=64,
+    )
+    layers[1].mla_kv_spec = (spec_a, spec_a)
+    layers[2].mla_kv_spec = (spec_a, spec_b)
+    with pytest.raises(NotImplementedError, match="model.layers.2.self_attn.attn"):
+        inner_run(*([None] * 14))
+
+
+@pytest.mark.parametrize(
+    "overrides,mesh,q_reps",
+    [
+        ({"scale": 0.25}, "tp_mesh", (True, True)),
+        ({"_k_scale_float": 4.0}, "tp_mesh", (True, True)),
+        ({"num_heads": 8}, "tp_mesh", (True, True)),
+        ({"v_head_dim": 64}, "tp_mesh", (True, True)),
+        ({"W_UV_scale": 1.0}, "tp_mesh", (True, True)),
+        ({}, "other_mesh", (True, True)),
+        ({}, "tp_mesh", (True, False)),
+    ],
+)
+def test_sparse_mla_tp_op_is_not_shared_across_kernel_configs(
+    monkeypatch, overrides, mesh, q_reps
+):
+    layers = [
+        _sparse_mla_layer("model.layers.0.self_attn.attn"),
+        _sparse_mla_layer("model.layers.1.self_attn.attn", **overrides),
+    ]
+    built = _build_sparse_mla_tp_ops(
+        monkeypatch, layers, q_replicated=q_reps, meshes=["tp_mesh", mesh]
+    )
+    assert len(built) == 2
+    assert len({name for name, _ in built}) == 2
+
+
+def test_streamidx_tp_op_is_shared_and_keyed_by_kernel_config(monkeypatch):
+    """Token-parallel indexer ops share per static kernel config."""
+    from vllm_torchtpu.layers.adapter import dcp_token_parallel_op
+
+    layout = _tp_test_layout()
+    built = []
+
+    def fake_pcp_op(name, fn, **kwargs):
+        built.append((name, fn))
+        return MagicMock()
+
+    monkeypatch.setattr(dcp_token_parallel_op, "pcp_streaming_jax_op", fake_pcp_op)
+    monkeypatch.setattr(dcp_token_parallel_op, "_sharded_rank_ids", lambda: None)
+    monkeypatch.setattr(
+        dcp_token_parallel_op, "get_or_create_dcp_mesh", lambda axis_name: "idx_mesh"
+    )
+
+    for i in range(3):
+        idx = SimpleNamespace(
+            topk_tokens=2048,
+            k_cache=SimpleNamespace(prefix=f"model.layers.{i}.self_attn.indexer"),
+            _shared_meta=True,
+        )
+        dcp_token_parallel_op.build_indexer_op(idx, layout, q_own_rows=True)
+
+    assert len(built) == 1
+    assert re.fullmatch(r"pallas::streamidx_topk_tp_\d+", built[0][0])
+    inner_run = _unwrap_inner_run(built[0][1])
+    assert set(inner_run.__code__.co_freevars) == {
+        "a2a_merge",
+        "a2a_min_tokens",
+        "chunk_tokens",
+        "dcp",
+        "decode_pack",
+        "fused_subbatch",
+        "global_group",
+        "hist_merge",
+        "il",
+        "k_write_compact",
+        "kv_cache_mode",
+        "layout",
+        "mesh",
+        "mixed_bkvp",
+        "mla_op",
+        "q_own_rows",
+        "rep",
+        "s",
+        "shared_meta",
+        "sharded",
+        "skip_empty_decode",
+        "skip_empty_decode_chunked",
+        "small_ag",
+        "small_bucket",
+        "streamindex_topk_dcp",
+        "topk",
+    }
+
+    # Distinct q_own_rows, topk_tokens, or _shared_meta each build a new op.
+    for topk, shared_meta, q_own in [
+        (2048, True, False),
+        (1024, True, True),
+        (2048, False, True),
+    ]:
+        idx = SimpleNamespace(
+            topk_tokens=topk,
+            k_cache=SimpleNamespace(prefix="model.layers.9.self_attn.indexer"),
+            _shared_meta=shared_meta,
+        )
+        dcp_token_parallel_op.build_indexer_op(idx, layout, q_own_rows=q_own)
+    assert len(built) == 4
+    assert len({name for name, _ in built}) == 4

@@ -76,10 +76,7 @@ from vllm.v1.outputs import (
 from vllm.v1.spec_decode.ngram_proposer import NgramProposer
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 from vllm.v1.worker.kv_connector_model_runner_mixin import KVConnectorOutput
-
-from vllm_torchtpu import envs, utils
 from vllm_torchtpu.block_major_pool import BlockMajorPoolLayout
-from vllm_torchtpu.compilation import shape_variants
 from vllm_torchtpu.distributed import utils as dist_utils
 from vllm_torchtpu.distributed.kv_transfer.tpu_connector_stats import (
     TpuKVConnectorStats,
@@ -87,14 +84,6 @@ from vllm_torchtpu.distributed.kv_transfer.tpu_connector_stats import (
 from vllm_torchtpu.distributed.pp_wave import PPWave, pp_rank_flags
 from vllm_torchtpu.kernels.experimental.batched_rpa import configs as rpa_configs
 from vllm_torchtpu.kernels.experimental.batched_rpa import wrapper as rpa_batched
-from vllm_torchtpu.kernels.mla import dispatch as mla_dispatch
-from vllm_torchtpu.layers.adapter import small_all_reduce_op, token_padding
-from vllm_torchtpu.layers.adapter.attention import (
-    KV_LAYOUT_BY_VLLM_LAYOUT,
-    TPU_STR_DTYPE_TO_TORCH_DTYPE,
-    PallasAttentionBackend,
-    PallasAttentionBackendImpl,
-)
 from vllm_torchtpu.layers.adapter.custom_ops.mamba_state_copy_op import (
     copy_mamba_state_blocks,
     copy_mamba_state_rows,
@@ -126,8 +115,6 @@ from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
 )
 from vllm_torchtpu.platforms.pcp_validation import PcpStaticSupportValidator
 from vllm_torchtpu.platforms.tpu_block_size_utils import unified_kv_layout_enabled
-from vllm_torchtpu.runner import greedy_top_tokens, spec_precompile_shapes
-from vllm_torchtpu.runner import utils as runner_utils
 from vllm_torchtpu.runner.kv_cache_manager import KVCacheManager
 from vllm_torchtpu.runner.mm_encoder_manager import (
     MMEncoderManager,
@@ -170,6 +157,23 @@ from vllm_torchtpu.tracing.utils import (
 )
 from vllm_torchtpu.utils import synchronize_device, synchronize_tensors
 from vllm_torchtpu.worker.cpu_pin import WorkerCpuPinner
+
+from vllm_torchtpu import envs, utils
+from vllm_torchtpu.compilation import shape_variants
+from vllm_torchtpu.kernels.mla import dispatch as mla_dispatch
+from vllm_torchtpu.layers.adapter import (
+    dcp_token_parallel_op,
+    small_all_reduce_op,
+    token_padding,
+)
+from vllm_torchtpu.layers.adapter.attention import (
+    KV_LAYOUT_BY_VLLM_LAYOUT,
+    TPU_STR_DTYPE_TO_TORCH_DTYPE,
+    PallasAttentionBackend,
+    PallasAttentionBackendImpl,
+)
+from vllm_torchtpu.runner import greedy_top_tokens, spec_precompile_shapes
+from vllm_torchtpu.runner import utils as runner_utils
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
@@ -3078,6 +3082,13 @@ class TPUModelRunner(GPUModelRunner):
         )
         self._last_sequence_layout_plan = layout_plan
         padded_total_num_scheduled_tokens = layout_plan.global_padded_num_tokens
+        dcp_token_parallel_op.check_step_capacity(
+            self.vllm_config,
+            padded_total_num_scheduled_tokens,
+            self.query_start_loc_np,
+            self.seq_lens_np,
+            num_reqs,
+        )
         request_major_input_ids = None
         if self._pcp_enabled and self._mtp_enabled:
             assert request_major_input_ids_cpu is not None
@@ -7438,7 +7449,6 @@ class TPUModelRunner(GPUModelRunner):
         num_tokens: int,
     ) -> None:
         from vllm.compilation.wrapper import reset_compile_wrapper
-
         from vllm_torchtpu.layers.adapter.linear_common import (
             _get_quantized_matmul_fp4_op,
             _get_quantized_matmul_op,

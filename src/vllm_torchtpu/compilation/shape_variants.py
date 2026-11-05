@@ -42,7 +42,6 @@ from typing import TYPE_CHECKING, Any
 import sympy
 import torch
 import torch.fx as fx
-
 from vllm_torchtpu.logger import init_logger
 
 if TYPE_CHECKING:
@@ -751,3 +750,40 @@ def _placeholder_runnable(
         return run
 
     return for_size
+
+
+def check_deferred_handover(
+    to_compile: Sequence[tuple[Any, Any]],
+    to_hand_over: Sequence[tuple[Any, Any]],
+    live_trace: int,
+) -> None:
+    """Validate deferred bucket hand-overs before spending minutes in XLA."""
+    dry = BucketExecutables()
+    for backend, entry in to_compile:
+        r = entry.compile_range
+        if not r.is_single_size():
+            continue
+        compiler = getattr(
+            getattr(backend.vllm_backend, "compiler_manager", None), "compiler", None
+        )
+        cache_dir = getattr(compiler, "cache_dir", None)
+        key = (
+            f"artifact_compile_range_{r.start}_{r.end}"
+            f"_subgraph_{backend.piecewise_compile_index}"
+        )
+        dry.put(cache_dir, key, backend.graph, lambda *a: a)
+    for backend, entry in to_hand_over:
+        if getattr(backend, "_tpu_trace", 0) != live_trace:
+            continue
+        r = entry.compile_range
+        if not r.is_single_size():
+            continue
+        compiler = getattr(
+            getattr(backend.vllm_backend, "compiler_manager", None), "compiler", None
+        )
+        cache_dir = getattr(compiler, "cache_dir", None)
+        key = (
+            f"artifact_compile_range_{r.start}_{r.end}"
+            f"_subgraph_{backend.piecewise_compile_index}"
+        )
+        dry.get(cache_dir, key, backend.graph, r.start)

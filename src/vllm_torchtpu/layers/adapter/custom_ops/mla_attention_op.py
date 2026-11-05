@@ -14,6 +14,7 @@
 """Out-of-tree (OOT) custom operator layers and wrappers for
 Multi-Head Latent Attention (MLA)."""
 
+import functools
 import re
 from typing import Any, cast
 
@@ -22,6 +23,7 @@ import jax.numpy as jnp
 import torch
 from torch.nn import Parameter
 from torch_tpu._internal import pallas
+from vllm.compilation import backends as vllm_compilation_backends
 from vllm.config import CacheConfig, get_current_vllm_config_or_none
 from vllm.distributed import tensor_model_parallel_all_reduce
 from vllm.forward_context import get_forward_context
@@ -45,40 +47,17 @@ from vllm.model_executor.utils import replace_parameter
 from vllm.v1.attention.backend import AttentionType
 from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerBackend
 from vllm.v1.attention.backends.mla.prefill import selector
-
-from vllm_torchtpu import envs
 from vllm_torchtpu.distributed.dcp import (
     dcp_lane_operand,
     dcp_rank_operand,
     get_dcp_group,
     get_or_create_dcp_mesh,
 )
-from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
-    DCP_AXIS_NAME,
-    KVLayout,
-    coalesced_kv_append,
-    coalesced_kv_append_dcp,
-    cp_rank_as_data,
-    get_kv_cache_shape,
-    indexer_kv_layout,
-    kv_cache_append,
-    streamindex_topk,
-    streamindex_topk_dcp,
-)
 from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk.config import (
     register_indexer_layer,
 )
 from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.vllm_adapter import (
     pcp_streaming_jax_op,
-)
-from vllm_torchtpu.kernels.mla.kv_cache_utils import OOB_PAGE, _row_positions
-from vllm_torchtpu.kernels.quantized_matmul import fp8_skinny
-from vllm_torchtpu.layers.adapter import small_all_reduce_op
-from vllm_torchtpu.layers.adapter.attention import (
-    TPU_STR_DTYPE_TO_TORCH_DTYPE,
-    PallasMLAttentionBackendImpl,
-    VllmTPUDeepseekV32IndexerBackend,
-    _retain_buffers,
 )
 from vllm_torchtpu.layers.adapter.linear_common import (
     DCP_ROWS_ATTR,
@@ -97,6 +76,30 @@ from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
 from vllm_torchtpu.layers.core.quantization import quantize_tensor
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.utils import fresh_buffer, get_shared_jax_op, synchronize_tensors
+
+from vllm_torchtpu import envs
+from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
+    DCP_AXIS_NAME,
+    KVLayout,
+    coalesced_kv_append,
+    coalesced_kv_append_dcp,
+    cp_rank_as_data,
+    get_kv_cache_shape,
+    indexer_kv_layout,
+    kv_cache_append,
+    streamindex_topk,
+    streamindex_topk_dcp,
+)
+from vllm_torchtpu.kernels.mla.kv_cache_utils import OOB_PAGE, _row_positions
+from vllm_torchtpu.kernels.quantized_matmul import fp8_skinny, fp8_window_all_gather
+from vllm_torchtpu.layers.adapter import dcp_token_parallel_op, small_all_reduce_op
+from vllm_torchtpu.layers.adapter.attention import (
+    TPU_STR_DTYPE_TO_TORCH_DTYPE,
+    PallasMLAttentionBackendImpl,
+    VllmTPUDeepseekV32IndexerBackend,
+    _retain_buffers,
+)
+from vllm_torchtpu.layers.adapter.cp_mla_attention import local_q_all_gather_op
 
 logger = init_logger(__name__)
 
@@ -150,7 +153,7 @@ def _streamidx_block_sizes(
     buckets take `mixed_bkvp` (TPU_STREAMIDX_MIXED_KV_PAGES) kv pages per MIXED
     block when it is set.
     """
-    if small_bucket_bq is None or num_tokens > small_bucket_tokens:
+    if not _streamidx_small_bucket(num_tokens, small_bucket_bq, small_bucket_tokens):
         if mixed_bkvp is None:
             return STREAMIDX_KV_PAGES_PER_BLOCK, STREAMIDX_QUERIES_PER_BLOCK
         return (
@@ -166,6 +169,32 @@ def _streamidx_block_sizes(
     return (
         STREAMIDX_KV_PAGES_PER_BLOCK[:2] + (bkvp,),
         STREAMIDX_QUERIES_PER_BLOCK[:2] + (small_bucket_bq,),
+    )
+
+
+def _streamidx_small_bucket(
+    num_tokens: int, small_bucket_bq: int | None, small_bucket_tokens: int
+) -> bool:
+    """Whether a padded token bucket takes the MIXED pass's small-bucket sizes."""
+    return small_bucket_bq is not None and num_tokens <= small_bucket_tokens
+
+
+def _qb_window_gather_jax(
+    x, w_q, w_s, rank, lane, *, num_cores, axis, lane_axis, replicated
+):
+    """Overlapped q_b under TPU_MLA_DECODE_LOCAL_Q_AG inside the DCP indexer op."""
+    m, k = x.shape
+    if not fp8_window_all_gather.supports(m, k, w_q.shape[1], num_cores):
+        return replicated(x, w_q, w_s)
+    return fp8_window_all_gather.fp8_window_all_gather(
+        x,
+        w_q,
+        w_s,
+        rank,
+        num_cores=num_cores,
+        axis=axis,
+        lane_axis=lane_axis,
+        lane=None if lane_axis is None else lane,
     )
 
 
@@ -541,9 +570,8 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
         # cannot trace if the op is first built inside a compiled forward.
         self.topk_op = self._build_streamidx_op()
 
-        parallel_config = getattr(
-            get_current_vllm_config_or_none(), "parallel_config", None
-        )
+        vllm_config = get_current_vllm_config_or_none()
+        parallel_config = getattr(vllm_config, "parallel_config", None)
         pcp_size = getattr(parallel_config, "prefill_context_parallel_size", 1)
         pcp_size = pcp_size if isinstance(pcp_size, int) else 1
         dcp_size = getattr(parallel_config, "decode_context_parallel_size", 1)
@@ -562,6 +590,11 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
             self.topk_op_dcp = self._build_streamidx_dcp_op(
                 dcp_size, parallel_config.cp_kv_cache_interleave_size
             )
+            self.topk_op_tp = None
+            if envs.TPU_DCP_PREFILL_TOKEN_PARALLEL:
+                self.topk_op_tp = dcp_token_parallel_op.build_indexer_op(
+                    self, dcp_token_parallel_op.layout_for(vllm_config)
+                )
             # TPU_INDEXER_QB_OVERLAP: the same op, also running the MLA q_b
             # projection under the SparseCore top-k (see `forward_oot`).
             self.topk_op_dcp_qb = None
@@ -750,6 +783,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
         skip_empty_decode_chunked = envs.TPU_STREAMIDX_SKIP_EMPTY_DECODE_CHUNKED
         mixed_bkvp = envs.TPU_STREAMIDX_MIXED_KV_PAGES
         decode_pack = envs.TPU_STREAMIDX_DECODE_PACK
+        decode_as_mixed = envs.TPU_STREAMIDX_DECODE_AS_MIXED
         shared_meta = self._shared_meta
         global_group = None
         if envs.TPU_IDX_TOPK_SCHED_GROUPS:
@@ -781,6 +815,24 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
             layer_prefix = self.k_cache.prefix.split(".self_attn")[0]
             if fp8_skinny_hbm_pin_selected(f"{layer_prefix}.self_attn.q_b_proj"):
                 qb_overlap_fn = _fp8_linear_pallas_hbm_pinned_jax
+        qb_window_gather = bool(qb_overlap and envs.TPU_MLA_DECODE_LOCAL_Q_AG)
+        if qb_window_gather:
+            lane_axes = tuple(a for a in mesh.axis_names if a != DCP_AXIS_NAME)
+            lane_axis = lane_axes[0] if lane_axes else None
+            if lane_axis is not None and mesh.shape[lane_axis] > 1 and not small_ag:
+                raise NotImplementedError(
+                    "TPU_MLA_DECODE_LOCAL_Q_AG in the indexer overlap addresses peers "
+                    "by (lane, rank): with more than one DCP lane it needs the lane "
+                    "operand of TPU_DCP_INDEXER_SMALL_AG (with "
+                    "TPU_SC_TOPK_DCP_MERGE_FLAT and TPU_DCP_RANK_OPERAND)"
+                )
+            qb_overlap_fn = functools.partial(
+                _qb_window_gather_jax,
+                num_cores=dcp_size,
+                axis=DCP_AXIS_NAME,
+                lane_axis=lane_axis,
+                replicated=qb_overlap_fn,
+            )
 
         def _streamidx_topk_dcp_impl(
             q_bytes: jax.Array,  # replicated, uint8 view of fp8 q
@@ -827,6 +879,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
                     overlap_args=tuple(qb_args),
                     # Decode buckets only: the skinny kernel's M range.
                     overlap_pin_max_tokens=fp8_skinny.MAX_M,
+                    overlap_rank=qb_window_gather,
                 )
             # The histogram merge, if on, replaces the all-to-all one.
             large = _dcp_indexer_a2a_for_bucket(q.shape[0], True, a2a_min_tokens)
@@ -857,6 +910,10 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
                 small_all_gather=small_ag,
                 decode_pack=decode_pack,
                 shared_meta=shared_meta,
+                decode_as_mixed=decode_as_mixed
+                and _streamidx_small_bucket(
+                    q.shape[0], small_bucket[0], small_bucket[2]
+                ),
                 **overlap,
             )
             if qb_overlap:
@@ -1163,6 +1220,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
         distribution = torch.stack([rd[0], rd[0], rd[2]])
 
         q_b_out = None
+        num_rows = hidden_states.shape[0]
         topk_op_dcp_qb = getattr(self, "topk_op_dcp_qb", None)
         if qb_overlap is not None and topk_op_dcp_qb is not None:
             # Same op plus the MLA q_b projection, run under the top-k.
@@ -1177,6 +1235,21 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
                 distribution,
                 *qb_overlap,
             )
+        elif getattr(
+            self, "topk_op_tp", None
+        ) is not None and dcp_token_parallel_op.applies(hidden_states.shape[0]):
+            topk_indices = dcp_token_parallel_op.indexer_rows(
+                self,
+                q_values.view(torch.uint8),
+                weights,
+                kv_cache,
+                k_quant_packed,
+                seq_lens,
+                page_indices,
+                cu_q_lens,
+                distribution,
+            )
+            num_rows = topk_indices.shape[0]
         elif self.topk_op_dcp is not None:
             # DCP replicates the queries, so the token
             # inputs are already the whole batch in request-major order. What
@@ -1208,7 +1281,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
         # The top-k ops return a (topk, q) pair only with a q_b layer, which
         # this path never passes.
         rows = self._write_topk_rows(
-            hidden_states.shape[0],
+            num_rows,
             topk_indices,  # pyrefly: ignore[bad-argument-type]
         )
         if envs.TPU_INDEXER_TOPK_SHARED_READ:
@@ -1386,16 +1459,25 @@ class VllmTPUIndexer(Indexer):
         positions,
         rotary_emb,
         q_b_layer: torch.nn.Module | None = None,
+        kw: torch.Tensor | None = None,
+        q_rows: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor | None]:
         """`q_b_layer` (TPU_INDEXER_QB_OVERLAP): also return `q_b_layer(qr)`,
         run inside the top-k op, as `(topk, q)`; `q` None where the op could
-        not take it (the caller runs `q_b_layer` itself)."""
+        not take it (the caller runs `q_b_layer` itself). `kw`: the
+        `wk_weights_proj` output, when the caller already projected the rows
+        (only their count is then read from `hidden_states`). `q_rows`: when
+        `qr` holds only the rows this rank attends (`s + T // dcp`)."""
         q, _ = self.wq_b(qr)
         q = q.view(-1, self.n_head, self.head_dim)
         # Fused wk + weights_proj: one GEMM, then split
-        kw, _ = self.wk_weights_proj(hidden_states)
+        if kw is None:
+            kw, _ = self.wk_weights_proj(hidden_states)
         k = kw[:, : self.head_dim]
         weights = kw[:, self.head_dim :]
+        if q_rows is not None:
+            weights = weights.index_select(0, q_rows)
+        q_positions = positions if q_rows is None else positions.index_select(0, q_rows)
 
         k = self.k_norm(k)
         permuted = getattr(self, "_rope_neox_permuted", False)
@@ -1410,7 +1492,7 @@ class VllmTPUIndexer(Indexer):
             # in the [T, H, D] layout the top-k op reads.
             k = rope_half_split_leading(rotary_emb, positions, k, self.rope_dim)
             c, s_ = rope_half_split_leading_cs(
-                rotary_emb, positions, q, self.head_dim, self.rope_dim
+                rotary_emb, q_positions, q, self.head_dim, self.rope_dim
             )
             q_fp8, q_scale = qprep_op(q.reshape(-1, self.n_head * self.head_dim), c, s_)
             q_scale = q_scale.view(-1, self.n_head, 1)
@@ -1419,7 +1501,7 @@ class VllmTPUIndexer(Indexer):
             )
         if permuted and rope_half_split_leading_supported(rotary_emb):
             # Half-split columns: rope the whole head in place, no split/cat.
-            q = rope_half_split_leading(rotary_emb, positions, q, self.rope_dim)
+            q = rope_half_split_leading(rotary_emb, q_positions, q, self.rope_dim)
             k = rope_half_split_leading(rotary_emb, positions, k, self.rope_dim)
         else:
             q_pe, q_nope = torch.split(
@@ -1428,12 +1510,17 @@ class VllmTPUIndexer(Indexer):
             k_pe, k_nope = torch.split(
                 k, [self.rope_dim, self.head_dim - self.rope_dim], dim=-1
             )
-            if permuted:
-                q_pe, k_pe = rope_half_split(
-                    rotary_emb, positions, q_pe, k_pe.unsqueeze(1)
-                )
+            rope_fn = (
+                (lambda pos, q_, k_: rope_half_split(rotary_emb, pos, q_, k_))
+                if permuted
+                else rotary_emb
+            )
+            if q_rows is None:
+                q_pe, k_pe = rope_fn(positions, q_pe, k_pe.unsqueeze(1))
             else:
-                q_pe, k_pe = rotary_emb(positions, q_pe, k_pe.unsqueeze(1))
+                k_pe_u = k_pe.unsqueeze(1)
+                q_pe = rope_fn(q_positions, q_pe, k_pe_u.index_select(0, q_rows))[0]
+                k_pe = rope_fn(positions, k_pe_u, k_pe_u)[1]
             # A key was passed in, so one comes back.
             assert k_pe is not None
             # Note: RoPE (NeoX) can introduce extra leading dimensions during
@@ -1472,6 +1559,13 @@ class VllmTPUIndexer(Indexer):
         operands = _qb_overlap_operands(q_b_layer)
         if operands is None:
             return self.indexer_op(hidden_states, q_fp8, k, weights), None
+        if envs.TPU_MLA_DECODE_LOCAL_Q_AG and not getattr(
+            q_b_layer, "qrep_active", False
+        ):
+            raise NotImplementedError(
+                "TPU_MLA_DECODE_LOCAL_Q_AG in the indexer overlap needs a "
+                "query-replicated q_b"
+            )
         qb_x = qr.reshape(-1, qr.shape[-1])
         return self.indexer_op(
             hidden_states, q_fp8, k, weights, qb_overlap=(qb_x, *operands)
@@ -1732,6 +1826,20 @@ class VllmTPUMLAAttention(MLAAttention):
         # The shared top-k table. A layer that reuses an earlier layer's
         # indices has no indexer, so this is where its top-k width is stated.
         self.topk_indices_buffer = topk_indices_buffer
+        # TPU_DCP_PREFILL_TOKEN_PARALLEL: the split's shape, read from the
+        # config here (model build); the op itself is built after loading.
+        self.token_parallel_layout = None
+        vllm_config = get_current_vllm_config_or_none()
+        if (
+            envs.TPU_DCP_PREFILL_TOKEN_PARALLEL
+            and use_sparse
+            and vllm_config is not None
+            and vllm_config.parallel_config.decode_context_parallel_size > 1
+        ):
+            dcp_token_parallel_op.check_config(
+                vllm_config, q_replicate=bool(dcp_q_replicate)
+            )
+            self.token_parallel_layout = dcp_token_parallel_op.layout_for(vllm_config)
 
         # For compatibility reasons.
         self.prefix = prefix
@@ -1744,6 +1852,19 @@ class VllmTPUMLAAttention(MLAAttention):
             self.kv_cache_quantized_dtype = TPU_STR_DTYPE_TO_TORCH_DTYPE.get(
                 self.kv_cache_dtype.lower().strip()
             )
+
+    def _local_q_serves(self, m: int) -> bool:
+        operands = _qb_overlap_operands(self.q_b_proj)
+        return operands is not None and fp8_window_all_gather.supports(
+            m, operands[0].shape[0], operands[0].shape[1], self.dcp_group_size
+        )
+
+    def _project_local_q(self, q_c: torch.Tensor) -> torch.Tensor:
+        operands = _qb_overlap_operands(self.q_b_proj)
+        assert operands is not None and self.local_q_fused_op is not None
+        return self.local_q_fused_op(
+            q_c, *operands, self.local_q_window, self.local_q_lane
+        )
 
     def process_weights_after_loading(self, act_dtype: torch.dtype):
         # Upstream `MLAAttention.process_weights_after_loading` reads this
@@ -1885,10 +2006,29 @@ class VllmTPUMLAAttention(MLAAttention):
         self.sparse_mla_dcp_rope_op = None
         self.sparse_mla_dcp_send_op = None
         self.sparse_mla_dcp_fused_op = None
+        self.sparse_mla_tp_op = None
         if dcp_size > 1:
             self.sparse_mla_dcp_op = impl._build_sparse_mla_dcp_op(
                 self, dcp_size, impl.dcp_interleave_size
             )
+            if self.token_parallel_layout is not None:
+                self.sparse_mla_tp_op = dcp_token_parallel_op.build_attention_op(
+                    self,
+                    impl,
+                    self.token_parallel_layout,
+                    q_replicated=bool(self.dcp_q_replicate),
+                )
+                indexer_op = getattr(self.indexer, "indexer_op", None)
+                if (
+                    self.dcp_q_replicate
+                    and indexer_op is not None
+                    and getattr(indexer_op, "topk_op_tp", None) is not None
+                ):
+                    indexer_op.topk_op_tp = dcp_token_parallel_op.build_indexer_op(
+                        indexer_op,
+                        self.token_parallel_layout,
+                        q_own_rows=True,
+                    )
             # TPU_MLA_DECODE_PROLOGUE: the variant that takes the raw q head
             # and ropes q_pe in the attention kernel (query replication only).
             if envs.TPU_MLA_DECODE_PROLOGUE and self.dcp_q_replicate:
@@ -2090,6 +2230,53 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
             and not self.skip_topk
             and self.q_lora_rank is not None
         )
+        dcp_indexer = (
+            getattr(getattr(self.indexer, "indexer_op", None), "dcp_size", 1) > 1
+        )
+        self._dcp_rank_keep = (
+            dcp_rank_operand()
+            if self.is_sparse
+            and self.indexer is not None
+            and not self.skip_topk
+            and (self.dcp_group_size > 1 or dcp_indexer)
+            and envs.TPU_DCP_RANK_OPERAND
+            else None
+        )
+        self._dcp_lane_keep = (
+            dcp_lane_operand()
+            if self._dcp_rank_keep is not None
+            and envs.TPU_DCP_INDEXER_SMALL_AG
+            and envs.TPU_SC_TOPK_DCP_MERGE_FLAT
+            else None
+        )
+
+        self.local_q_fused_op = None
+        self.local_q_window = None
+        self.local_q_lane = None
+        if (
+            envs.TPU_MLA_DECODE_LOCAL_Q_AG
+            and self.dcp_q_replicate
+            and self.is_sparse
+            and self.q_lora_rank is not None
+        ):
+            from vllm_torchtpu.distributed.dcp import (
+                get_dcp_rank,
+                get_dcp_world_size,
+            )
+
+            if (get_dcp_rank(), get_dcp_world_size()) != (
+                q_proj_layer.rank_in_group,
+                self.dcp_group_size,
+            ):
+                raise NotImplementedError(
+                    "TPU_MLA_DECODE_LOCAL_Q_AG gathers q_b head windows over the "
+                    f"DCP group: DCP rank/size ({get_dcp_rank()}, "
+                    f"{get_dcp_world_size()}) != q_b group rank/size "
+                    f"({q_proj_layer.rank_in_group}, {self.dcp_group_size})"
+                )
+            self.local_q_fused_op = local_q_all_gather_op()
+            self.local_q_window = dcp_rank_operand()
+            self.local_q_lane = dcp_lane_operand()
 
         # TPU_MLA_ROPE_NEOX_PERMUTE: set once the q / k_pe projection columns
         # are in half-split order, which is what switches `forward` to NeoX
@@ -2182,6 +2369,67 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
         kv_lora = None
         output_gate = None
         early_topk = None
+        if (
+            self.is_sparse
+            and self.indexer is not None
+            and not self.skip_topk
+            and (
+                getattr(self, "qb_overlap", False)
+                or getattr(self, "_dcp_rank_keep", None) is not None
+            )
+        ):
+            cos_sin = (
+                getattr(self.rotary_emb, "cos_sin_cache", None)
+                if self.rotary_emb is not None
+                else None
+            )
+            hidden_states = _retain_buffers(
+                hidden_states,
+                cos_sin,
+                getattr(self, "_dcp_rank_keep", None),
+                getattr(self, "_dcp_lane_keep", None),
+            )
+        # TPU_MOE_PREFILL_SEQUENCE_PARALLEL: `hidden_states` holds this rank's
+        # rows; the group projects them and gathers the projections instead of
+        # the hidden rows. From here on the gathered fused_qkv_a output stands
+        # in for the step's rows wherever only their count is read.
+        pre_qkv = pre_kw = pre_qc_qrows = None
+        project_gather = getattr(prefill_group, "project_gather", None)
+        if project_gather is not None:
+            pre_qkv, pre_kw = project_gather(self, hidden_states, positions.shape[0])
+            if isinstance(pre_qkv, tuple):
+                pre_qc_qrows, kv_lora = pre_qkv
+                hidden_states = kv_lora
+            else:
+                hidden_states = pre_qkv
+        if getattr(self, "local_q_fused_op", None) is not None:
+            operands = (self.local_q_window, self.local_q_lane)
+            hidden_states = _retain_buffers(
+                hidden_states, *(t for t in operands if t is not None)
+            )
+        # TPU_DCP_PREFILL_TOKEN_PARALLEL under query replication: project q for
+        # only the rows this rank attends (`dcp_token_parallel_op.q_rows`).
+        q_rows = None
+        tp_op = getattr(self.mla_attn, "sparse_mla_tp_op", None)
+        if tp_op is not None and tp_op.q_replicated:
+            if not dcp_token_parallel_op.applies(hidden_states.shape[0]):
+                # Lift the rank operand here too: the warmup hands buckets
+                # over only between traces that lift the same buffers.
+                hidden_states = _retain_buffers(hidden_states, tp_op.rank)
+            elif self.kimi_preprocess is not None:
+                raise NotImplementedError(
+                    "TPU_DCP_PREFILL_TOKEN_PARALLEL: no fused q preprocessing"
+                )
+            else:
+                q_rows = dcp_token_parallel_op.q_rows(tp_op, hidden_states.shape[0])
+
+        indexer_qrows = None
+        if q_rows is not None:
+            idx = self.indexer if not self.skip_topk else None
+            if idx is None or getattr(
+                getattr(idx.indexer_op, "topk_op_tp", None), "q_own_rows", False
+            ):
+                indexer_qrows = q_rows
 
         if self.kimi_preprocess is not None:
             assert self.fused_qkv_a_proj is not None
@@ -2208,23 +2456,42 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
                     "q_b_proj is required when q_lora_rank is not None"
                 )
 
-                qkv_lora = self.fused_qkv_a_proj(hidden_states)[0]
-                if self.gate_is_fused:
-                    q_c, kv_lora, output_gate = qkv_lora.split(
-                        [
-                            self.q_lora_rank,
-                            self.kv_lora_rank + self.qk_rope_head_dim,
-                            self.num_heads * self.v_head_dim,
-                        ],
-                        dim=-1,
-                    )
+                if pre_qc_qrows is not None:
+                    q_c = pre_qc_qrows
                 else:
-                    q_c, kv_lora = qkv_lora.split(
-                        [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim],
-                        dim=-1,
+                    qkv_lora = (
+                        pre_qkv
+                        if pre_qkv is not None
+                        else self.fused_qkv_a_proj(hidden_states)[0]
                     )
+                    if self.gate_is_fused:
+                        q_c, kv_lora, output_gate = qkv_lora.split(
+                            [
+                                self.q_lora_rank,
+                                self.kv_lora_rank + self.qk_rope_head_dim,
+                                self.num_heads * self.v_head_dim,
+                            ],
+                            dim=-1,
+                        )
+                    else:
+                        q_c, kv_lora = qkv_lora.split(
+                            [
+                                self.q_lora_rank,
+                                self.kv_lora_rank + self.qk_rope_head_dim,
+                            ],
+                            dim=-1,
+                        )
+                    if indexer_qrows is not None:
+                        q_c = q_c.index_select(0, indexer_qrows)
                 q_c = self.q_a_layernorm(q_c)
-                if getattr(self, "qb_overlap", False) and self.kimi_preprocess is None:
+                if (
+                    getattr(self, "qb_overlap", False)
+                    and self.kimi_preprocess is None
+                    and q_rows is None
+                    and pre_qkv is None
+                    and pre_qc_qrows is None
+                    and not dcp_token_parallel_op.applies(hidden_states.shape[0])
+                ):
                     # The indexer runs on q_c anyway; it returns q too.
                     assert self.indexer is not None
                     early_topk, q = self.indexer(
@@ -2236,9 +2503,24 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
                     )
                     if q is None:
                         q = self.q_b_proj(q_c)[0]
+                elif (
+                    getattr(self, "local_q_fused_op", None) is not None
+                    and q_rows is None
+                    and pre_qkv is None
+                    and pre_qc_qrows is None
+                    and not dcp_token_parallel_op.applies(hidden_states.shape[0])
+                    and vllm_compilation_backends.model_tag == "backbone"
+                    and self._local_q_serves(q_c.shape[0])
+                ):
+                    q = self._project_local_q(q_c)
                 else:
-                    q = self.q_b_proj(q_c)[0]
+                    q = self.q_b_proj(
+                        q_c
+                        if (q_rows is None or q_c.shape[0] == q_rows.shape[0])
+                        else q_c.index_select(0, q_rows)
+                    )[0]
             else:
+                assert q_rows is None, "token-parallel rows need the q_lora path"
                 assert self.kv_a_proj_with_mqa is not None, (
                     "kv_a_proj_with_mqa is required when q_lora_rank is None"
                 )
@@ -2267,6 +2549,7 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
             getattr(self, "decode_prologue", False)
             and getattr(self, "_rope_neox_permuted", False)
             and llama_4_scaling is None
+            and q_rows is None
         )
         if fold_q_rope:
             # k_pe exactly as below (the unused q half is dead code to XLA);
@@ -2280,9 +2563,21 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
             q_pe_dtype = q_pe.dtype
             k_pe_dtype = k_pe.dtype
             if getattr(self, "_rope_neox_permuted", False):
-                q_pe, k_pe = rope_half_split(self.rotary_emb, positions, q_pe, k_pe)
+
+                def rope(pos, q_, k_):
+                    return rope_half_split(self.rotary_emb, pos, q_, k_)
             else:
-                q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
+                rope = self.rotary_emb
+            if q_rows is None:
+                q_pe, k_pe = rope(positions, q_pe, k_pe)
+            else:
+                # q exists for `q_rows` only; k for every row.
+                q_pe = rope(
+                    positions.index_select(0, q_rows),
+                    q_pe,
+                    k_pe.index_select(0, q_rows),
+                )[0]
+                k_pe = rope(positions, k_pe, k_pe)[1]
             # RoPE caches/frequencies can be fp32 and promote the rotated
             # tensors.  Dense MLA requires new KV values to exactly match the
             # cache dtype, and queries should remain in the activation dtype.
@@ -2294,8 +2589,17 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
             if early_topk is not None:
                 topk_index = early_topk
             elif self.indexer is not None and not self.skip_topk:
+                idx_kwargs: dict[str, Any] = {}
+                if pre_kw is not None:
+                    idx_kwargs["kw"] = pre_kw
+                if indexer_qrows is not None:
+                    idx_kwargs["q_rows"] = indexer_qrows
                 topk_index = self.indexer(
-                    hidden_states, q_c, positions, self.indexer_rope_emb
+                    hidden_states,
+                    q_c,
+                    positions,
+                    self.indexer_rope_emb,
+                    **idx_kwargs,
                 )
             else:
                 # reuse the indices an earlier layer wrote into the shared buffer.
@@ -2334,7 +2638,7 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
             (q_nope, q_pe),
             kv_c_normed,
             k_pe,
-            output_shape=(q.shape[0], self.num_heads * self.v_head_dim),
+            output_shape=(hidden_states.shape[0], self.num_heads * self.v_head_dim),
             topk_indices=topk_indices,
             q_dcp_replicated=q_dcp_replicated,
         )

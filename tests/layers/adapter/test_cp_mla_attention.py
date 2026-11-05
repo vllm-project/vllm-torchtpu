@@ -25,8 +25,8 @@ import numpy as np
 import pytest
 import torch
 from absl.testing import parameterized
-
 from vllm_torchtpu.distributed import dcp_comm
+
 from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
     cp_global_to_local,
     cp_owner_rank,
@@ -1836,3 +1836,32 @@ def test_rs_out_precision_chunked_merge_is_bitwise_the_unchunked_merge(
         # wire). Two ranks' terms round to the same bits on this data.
         f32 = _rs_merge_whole(outputs, lses, monkeypatch)
         assert not torch.equal(today.view(torch.int16), f32.view(torch.int16))
+
+
+def test_local_q_all_gather_op_hands_jax_op_an_annotated_function(monkeypatch):
+    """`local_q_all_gather_op` (TPU_MLA_DECODE_LOCAL_Q_AG) builds at model load:
+    the function it registers passes torch_tpu's signature check, which refuses
+    an unannotated JAX argument."""
+    import inspect
+
+    from vllm_torchtpu.distributed import dcp
+    from vllm_torchtpu.distributed import sharded_jax_op as sjo
+
+    class _Mesh:
+        shape = {dcp.DCP_AXIS_NAME: 16}
+        axis_names = (dcp.DCP_AXIS_NAME,)
+
+    built = []
+
+    def checked_op(name, fn, **_):
+        signature = inspect.signature(inspect.unwrap(fn), eval_str=True)
+        sjo.pallas_impl._verify_signature(signature)
+        assert sjo.pallas_impl._infer_static_argnums(signature) == ()
+        built.append(name)
+        return object()
+
+    monkeypatch.setattr(dcp, "get_or_create_dcp_mesh", lambda: _Mesh())
+    monkeypatch.setattr(sjo, "sharded_jax_op", checked_op)
+    monkeypatch.setattr(cp_mla, "_LOCAL_Q_ALL_GATHER_OPS", {})
+    cp_mla.local_q_all_gather_op()
+    assert built == ["pallas::fp8_window_all_gather_16"]

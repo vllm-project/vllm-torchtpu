@@ -29,6 +29,9 @@ All environment variables read by `vllm-torchtpu` are declared and validated in 
 | `TPU_DCP_MLA_TOPK_CAP` | `-1` (auto: `512` at DCP >= 8, else off) | Caps top-k selection per Decode Context Parallel (`DCP`) rank in Sparse MLA (`0` disables cap). |
 | `TPU_DCP_LSE_MERGE_A2A` | `False` | Uses all-to-all LSE merge for Decode Context Parallelism when token count is below `TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS` (`32`). |
 | `TPU_DCP_MERGE_CHUNKED` | `0` | Splits the Decode Context Parallelism reduce-scatter LSE merge of backbone buckets of at least `TPU_DCP_MERGE_CHUNKED_MIN_TOKENS` (`1024`) tokens into this many token chunks, so each chunk's reduce-scatter overlaps the next chunk's compute (`0`/`1` disables). |
+| `TPU_DCP_PREFILL_TOKEN_PARALLEL` | `False` | Splits prefill tokens across DCP ranks on large Sparse MLA buckets so each rank runs all heads over gathered KV and index-K pages while keeping head-sharded DCP on decode rows. |
+| `TPU_MLA_DECODE_LOCAL_Q_AG` | `False` | Computes each DCP rank's local query head-slice via a fused FP8 column-window matmul and 1-round all-gather on decode buckets. |
+| `TPU_STREAMIDX_DECODE_AS_MIXED` | `False` | Scores single-token decode sequences inside the packed small-bucket `MIXED` pass of `streamindex_topk`. |
 | `TPU_TOKEN_BUCKET_EXTRA` | `[]` | Comma-separated list of additional token padding bucket sizes to precompile. |
 | `TPU_TOKEN_BUCKET_LINEAR` | `False` | Uses linearly spaced token compilation buckets instead of exponential buckets. |
 

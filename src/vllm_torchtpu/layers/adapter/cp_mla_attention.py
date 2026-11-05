@@ -39,12 +39,12 @@ import jax
 import jax.numpy as jnp
 import torch
 from torch_tpu._internal import pallas
-
-from vllm_torchtpu import envs
 from vllm_torchtpu.distributed.dcp import get_dcp_group
 from vllm_torchtpu.distributed.dcp_comm import cp_lse_ag_out_rs
 from vllm_torchtpu.kernels.lse_rescale import lse_rescale_quantize
 from vllm_torchtpu.layers.core.quantization import quantize_tensor
+
+from vllm_torchtpu import envs
 
 if envs.TPU_DCP_MERGE_VSPACE_FUSED:
     # Registers the fused V-space operand ops at import, never in a trace.
@@ -69,6 +69,71 @@ def all_gather_heads(q: torch.Tensor) -> torch.Tensor:
     if group is None or int(group.world_size) == 1:
         return q
     return group.all_gather(q.contiguous(), dim=1)
+
+
+_LOCAL_Q_ALL_GATHER_OPS: dict = {}
+
+
+def local_q_all_gather_op():
+    """`op(x, w_q, w_s, rank, lane)`: `x @ w_q * scales` on every DCP rank, each
+    rank projecting only its column window (`rank`) and all-gathering the rest
+    in one Pallas kernel (kernels/quantized_matmul/fp8_window_all_gather.py,
+    TPU_MLA_DECODE_LOCAL_Q_AG). `rank` / `lane` are `dcp_rank_operand` /
+    `dcp_lane_operand`. Build it outside Dynamo (load time)."""
+    from jax.sharding import PartitionSpec as P
+    from vllm_torchtpu.distributed.dcp import DCP_AXIS_NAME, get_or_create_dcp_mesh
+    from vllm_torchtpu.distributed.sharded_jax_op import sharded_jax_op
+
+    from vllm_torchtpu.kernels.quantized_matmul.fp8_window_all_gather import (
+        fp8_window_all_gather,
+    )
+
+    mesh = get_or_create_dcp_mesh()
+    world = int(mesh.shape[DCP_AXIS_NAME])
+    op = _LOCAL_Q_ALL_GATHER_OPS.get(world)
+    if op is not None:
+        return op
+    lane_axes = tuple(a for a in mesh.axis_names if a != DCP_AXIS_NAME)
+    assert len(lane_axes) <= 1, mesh.axis_names
+    lane_axis = lane_axes[0] if lane_axes else None
+    spec = P(DCP_AXIS_NAME)
+
+    def body(x, w_q, w_s, rank, lane):
+        return fp8_window_all_gather(
+            x,
+            w_q,
+            w_s,
+            rank,
+            num_cores=world,
+            axis=DCP_AXIS_NAME,
+            lane_axis=lane_axis,
+            lane=None if lane_axis is None else lane,
+        )
+
+    def fn(
+        x: jax.Array,
+        w_q: jax.Array,
+        w_s: jax.Array,
+        rank: jax.Array,
+        lane: jax.Array,
+    ) -> jax.Array:
+        return jax.shard_map(
+            body, mesh=mesh, in_specs=(spec,) * 5, out_specs=spec, check_vma=False
+        )(x, w_q, w_s, rank, lane)
+
+    def fake(x: torch.Tensor, w_q: torch.Tensor, *_) -> torch.Tensor:
+        return x.new_empty((x.shape[0], w_q.shape[1]))
+
+    op = sharded_jax_op(
+        f"pallas::fp8_window_all_gather_{world}",
+        fn,
+        mesh=mesh,
+        input_partition_specs=(spec,) * 5,
+        output_partition_specs=spec,
+        fake=fake,
+    )
+    _LOCAL_Q_ALL_GATHER_OPS[world] = op
+    return op
 
 
 def all_gather_q_nope_pe_heads(
@@ -858,7 +923,6 @@ def _retain_rank(out: torch.Tensor) -> torch.Tensor:
 def _build_ragged_all_to_all(world: int, skip: int = 0):
     import jax.numpy as jnp
     from jax.sharding import PartitionSpec as P
-
     from vllm_torchtpu.distributed.dcp import DCP_AXIS_NAME, get_or_create_dcp_mesh
     from vllm_torchtpu.distributed.sharded_jax_op import sharded_jax_op
 
@@ -978,9 +1042,9 @@ def _build_send_unpack(world: int):
     import jax.numpy as jnp
     from jax import lax
     from jax.sharding import PartitionSpec as P
-
     from vllm_torchtpu.distributed.dcp import DCP_AXIS_NAME, get_or_create_dcp_mesh
     from vllm_torchtpu.distributed.sharded_jax_op import sharded_jax_op
+
     from vllm_torchtpu.kernels.mla.sparse.kernel import SEND_PAD_ROWS
 
     mesh = get_or_create_dcp_mesh()
@@ -1139,6 +1203,7 @@ def send_small_unpack_local(
     from vllm_torchtpu.kernels.experimental.small_collectives.all_to_all import (
         small_all_to_all,
     )
+
     from vllm_torchtpu.kernels.mla.sparse.kernel import SEND_PAD_ROWS
 
     block = x.shape[0] // world
@@ -1158,7 +1223,6 @@ def send_small_unpack_local(
 
 def _build_send_small(world: int):
     from jax.sharding import PartitionSpec as P
-
     from vllm_torchtpu.distributed.dcp import DCP_AXIS_NAME, get_or_create_dcp_mesh
     from vllm_torchtpu.distributed.sharded_jax_op import sharded_jax_op
 
@@ -1270,7 +1334,6 @@ def send_group_unpack_local(
 
 def _build_send_group(world: int, group_rows: int):
     from jax.sharding import PartitionSpec as P
-
     from vllm_torchtpu.distributed.dcp import DCP_AXIS_NAME, get_or_create_dcp_mesh
     from vllm_torchtpu.distributed.sharded_jax_op import sharded_jax_op
 
@@ -1497,7 +1560,6 @@ def prebuild_sized_merge(world: int) -> None:
     if not envs.TPU_MTP_DCP_MERGE_SIZED or world <= 1 or world in _SIZED_MERGE_OPS:
         return
     from jax.sharding import PartitionSpec as P
-
     from vllm_torchtpu.distributed.dcp import DCP_AXIS_NAME, get_or_create_dcp_mesh
     from vllm_torchtpu.distributed.sharded_jax_op import sharded_jax_op
 

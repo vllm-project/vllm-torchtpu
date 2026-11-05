@@ -21,6 +21,8 @@ if TYPE_CHECKING:
     TPU_DCP_MERGE_VSPACE_FUSED: bool = False
     TPU_DCP_MLA_OPROJ_ALL_REDUCE: bool = False
     TPU_DCP_MLA_OPROJ_ALL_REDUCE_CHUNK_TOKENS: int = 512
+    TPU_DCP_PREFILL_TOKEN_PARALLEL: bool = False
+    TPU_MLA_DECODE_LOCAL_Q_AG: bool = False
     TPU_MLA_SPARSE_SPLIT_Q: bool = True
     TPU_DCP_LSE_MERGE_A2A_PACK: bool = False
     TPU_DCP_LSE_MERGE_A2A_REAL_ROWS: bool = False
@@ -299,6 +301,7 @@ if TYPE_CHECKING:
     TPU_SAMPLER_GRAPH_RNG: bool = True
     TPU_FP8_LINEAR_PALLAS_SITES: str = "q_b_proj,self_attn.o_proj,mlp.gate_up_proj"
     TPU_SAMPLER_VERIFY_TRIM: bool = False
+    TPU_STREAMIDX_DECODE_AS_MIXED: bool = False
     TPU_ONE_ROW_ALL_REDUCE: bool = False
 
 
@@ -819,6 +822,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_DCP_MLA_OPROJ_ALL_REDUCE_CHUNK_TOKENS": env_int(
         "TPU_DCP_MLA_OPROJ_ALL_REDUCE_CHUNK_TOKENS", 512
     ),
+    # Hybrid DCP sparse MLA: keep head-replicated DCP on decode/leading rows
+    # and split prefill rows across DCP ranks so each rank runs all heads over
+    # gathered KV and index-K pages (`kernels/mla/dcp_token_parallel.py`).
+    "TPU_DCP_PREFILL_TOKEN_PARALLEL": env_bool(
+        "TPU_DCP_PREFILL_TOKEN_PARALLEL", default=False
+    ),
+    # Decode local-Q projection under query-replicated DCP: compute each rank's
+    # local head-slice columns via the fused FP8 column-window matmul + 1-round
+    # all-gather (`kernels/quantized_matmul/fp8_window_all_gather.py`), hidden
+    # under local top-k when TPU_INDEXER_QB_OVERLAP is active.
+    "TPU_MLA_DECODE_LOCAL_Q_AG": env_bool("TPU_MLA_DECODE_LOCAL_Q_AG", default=False),
     # Sparse MLA split q (`sparse_ragged_paged_attention(q_pe=...)`): hand
     # q_nope and q_pe to the kernel as separate operands. The kernel joins
     # them in VMEM and its output aliases q_nope (512 wide), instead of the
@@ -1559,6 +1573,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # passes are unchanged. Pairs with TPU_STREAMIDX_SMALL_BUCKET_BKVP=32
     # (GLM-5.2 DCP8, 9k-67k keys per rank: -10...-48 % per call).
     "TPU_STREAMIDX_DECODE_PACK": env_bool("TPU_STREAMIDX_DECODE_PACK", default=True),
+    # Score q_len=1 decode sequences in the small-bucket MIXED pass of
+    # streamindex_topk rather than building separate DECODE passes.
+    "TPU_STREAMIDX_DECODE_AS_MIXED": env_bool(
+        "TPU_STREAMIDX_DECODE_AS_MIXED", default=False
+    ),
     # StreamIdx per-step inputs built once per step instead of once per
     # indexer layer: the MIXED pass schedule without its empty-pass cond (so
     # XLA CSEs the layers' identical copies), its scalar [start, end, chunk]
