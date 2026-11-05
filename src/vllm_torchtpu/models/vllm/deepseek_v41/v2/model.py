@@ -14,6 +14,7 @@ from vllm.compilation.decorators import support_torch_compile
 from vllm.forward_context import override_forward_context
 from vllm.models.deepseek_v41.nvidia import model as upstream
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v41.deepseek_v41_mhc_op import (
     initialize_shifted_mhc,
 )
@@ -48,7 +49,7 @@ from .ced import (
     plan_decoder_replay,
     prefix_replay_enabled,
 )
-from .engram import Engram, NgramHashState
+from .engram import Engram, NgramHashState, engram_cache_slots
 from .host_engram import (
     HOST_ENGRAM_KEY,
     HostEngramInputs,
@@ -500,14 +501,24 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
                 else:
                     image_mask = upstream.image_sentinel_mask(input_ids)
                     engram_mask = ~image_mask
+                    # The fused hash derives the dead masks from the ids
+                    # itself, so the mask programs do not run ahead of it.
+                    fuse_masks = self.engram_hash.fuses_dead_masks(input_ids)
                     engram_hashes = self.engram_hash(
                         input_ids,
                         positions,
                         swa_metadata.query_start_loc,
-                        image_mask,
+                        None if fuse_masks else image_mask,
                         lookback_token_ids,
-                        upstream.image_sentinel_mask(lookback_token_ids),
-                        _cache_slots(
+                        None
+                        if fuse_masks
+                        else upstream.image_sentinel_mask(lookback_token_ids),
+                        (
+                            engram_cache_slots
+                            if envs.TPU_DEEPSEEK_V41_ENGRAM_INT32_SLOT_WRITE
+                            and positions.device.type != "cpu"
+                            else _cache_slots
+                        )(
                             self.engram_hash.swa_cache_module.kv_cache,
                             swa_metadata,
                             positions,
