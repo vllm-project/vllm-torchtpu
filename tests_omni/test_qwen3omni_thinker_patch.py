@@ -27,7 +27,7 @@ from vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_moe_thinker import (
     Qwen3OmniMoeAudioEncoder,
 )
 
-from vllm_torchtpu.omni.qwen3omni_thinker_patch import (
+from vllm_torchtpu.omni.patches.qwen3omni_thinker import (
     _AUDIO_CHUNK_LENGTHS_PATCHED,
     _is_qwen3_omni_model,
     maybe_patch_qwen3_omni_thinker,
@@ -36,38 +36,25 @@ from vllm_torchtpu.omni.qwen3omni_thinker_patch import (
 pytestmark = pytest.mark.omni
 
 
-def _model_config(
-    model_type: str, architectures: list[str], model: str
-) -> SimpleNamespace:
-    return SimpleNamespace(
-        hf_config=SimpleNamespace(model_type=model_type, architectures=architectures),
-        model=model,
-    )
+def _model_config(*architectures: str) -> SimpleNamespace:
+    """The only ModelConfig field the callback reads."""
+    return SimpleNamespace(architectures=list(architectures))
 
 
-OMNI_THINKER = _model_config(
-    "qwen3_omni_moe_thinker",
-    ["Qwen3OmniMoeThinkerForConditionalGeneration"],
-    "Qwen/Qwen3-Omni-30B-A3B-Instruct",
-)
+OMNI_THINKER = _model_config("Qwen3OmniMoeForConditionalGeneration")
 
 
 @pytest.mark.parametrize(
-    "model_config, expected",
+    ("model_config", "expected"),
     [
         (None, False),
-        (
-            _model_config(
-                "qwen3_vl", ["Qwen3VLForConditionalGeneration"], "Qwen/Qwen3-VL"
-            ),
-            False,
-        ),
-        (_model_config("qwen3_omni_moe", [], "Qwen/Qwen3-Omni-30B-A3B-Instruct"), True),
+        (_model_config("Qwen3VLForConditionalGeneration"), False),
+        # Substrings are not enough: the check is the literal architecture.
+        (_model_config("Qwen3OmniMoeThinkerForConditionalGeneration"), False),
         (OMNI_THINKER, True),
-        # The talker stage config has an empty model_type.
-        (_model_config("", ["Qwen3OmniMoeTalkerForConditionalGeneration"], "x"), True),
+        (_model_config("SomethingElse", "Qwen3OmniMoeForConditionalGeneration"), True),
     ],
-    ids=["no_config", "qwen3_vl", "full_model", "thinker_stage", "talker_stage"],
+    ids=["no_config", "qwen3_vl", "thinker_substring", "qwen3_omni", "multi_arch"],
 )
 def test_is_qwen3_omni_model(model_config, expected):
     assert _is_qwen3_omni_model(model_config) is expected
@@ -77,10 +64,7 @@ def test_non_omni_config_is_not_consumed():
     # ``False`` (not ``None``) tells the registry to retry at model_load.
     before = Qwen3OmniMoeAudioEncoder.forward
     assert maybe_patch_qwen3_omni_thinker(None) is False
-    assert (
-        maybe_patch_qwen3_omni_thinker(_model_config("llama", [], "meta-llama/x"))
-        is False
-    )
+    assert maybe_patch_qwen3_omni_thinker(_model_config("LlamaForCausalLM")) is False
     assert Qwen3OmniMoeAudioEncoder.forward is before
 
 

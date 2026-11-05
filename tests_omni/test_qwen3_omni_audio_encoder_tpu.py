@@ -66,7 +66,7 @@ from vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_moe_thinker import (
 )
 
 from tests_omni.omni_test_utils import assert_numerical_parity
-from vllm_torchtpu.omni.qwen3omni_thinker_patch import (
+from vllm_torchtpu.omni.patches.qwen3omni_thinker import (
     _AUDIO_CHUNK_LENGTHS_PATCHED,
     maybe_patch_qwen3_omni_thinker,
 )
@@ -92,13 +92,7 @@ PARITY_MIN_COS_SIM = 0.999
 
 def _thinker_model_config() -> SimpleNamespace:
     """The part of a Stage-0 ``ModelConfig`` the patch callback looks at."""
-    return SimpleNamespace(
-        hf_config=SimpleNamespace(
-            model_type="qwen3_omni_moe_thinker",
-            architectures=["Qwen3OmniMoeThinkerForConditionalGeneration"],
-        ),
-        model="Qwen/Qwen3-Omni-30B-A3B-Instruct",
-    )
+    return SimpleNamespace(architectures=["Qwen3OmniMoeForConditionalGeneration"])
 
 
 def _tiny_audio_config() -> Qwen3OmniMoeAudioEncoderConfig:
@@ -235,8 +229,10 @@ class Encoders(NamedTuple):
 
 @pytest.fixture(scope="module")
 def tpu_device() -> torch.device:
+    # Fail, not skip: the Omni lanes always run on a TPU, so a missing device
+    # means the host is broken and must not turn the file into 14 green skips.
     if not torch.accelerator.is_available():
-        pytest.skip("Needs a TPU: the chunk-length bug is in TPU float division.")
+        pytest.fail("Needs a TPU: the chunk-length bug is in TPU float division.")
     return torch.device("tpu")
 
 
@@ -246,8 +242,8 @@ def dist_ctx(tpu_device: torch.device) -> Generator[None, None, None]:
 
     Mirrors ``dist_ctx`` in tests/conftest.py, which tests_omni/ does not
     inherit: destroys only the groups it created. Depends on ``tpu_device``
-    because the groups bind to the TPU device; without one the module skips
-    before any distributed state is created.
+    because the groups bind to the TPU device; without one the module fails
+    there, before any distributed state is created.
     """
     owns_world = not dist.is_initialized()
     if owns_world:
