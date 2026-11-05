@@ -13,6 +13,7 @@ import torch
 import torch.nn as nn
 
 from vllm_torchtpu.models.vllm import register_models
+from vllm_torchtpu import envs
 from vllm_torchtpu.models.vllm.deepseek_v41.v2 import (
     attention as v2_attn,
 )
@@ -903,6 +904,9 @@ def test_decode_sampler_uses_pallas_logits_head_when_enabled(monkeypatch):
 
 def test_decode_sampler_uses_standard_logits_without_copying_lm_weight(monkeypatch):
     from vllm_torchtpu.models.vllm.deepseek_v41.v2 import dspark_sampling
+
+    # This test is about the XLA logits path; the Pallas head is on by default.
+    monkeypatch.setattr(envs, "TPU_DEEPSEEK_V41_DSPARK_PALLAS_LOGITS", False)
 
     model = v2_dspark.DSparkDeepseekV41ForCausalLM.__new__(
         v2_dspark.DSparkDeepseekV41ForCausalLM
