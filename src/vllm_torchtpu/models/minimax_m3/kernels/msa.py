@@ -40,7 +40,9 @@ def token_positions(
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Per-token ``(sequence id, absolute position, is-real-token)``."""
     tok = jnp.arange(num_tokens, dtype=jnp.int32)
-    seq_id = jnp.searchsorted(cu_q_lens[1:], tok, side="right").astype(jnp.int32)
+    seq_id = jnp.searchsorted(
+        cu_q_lens[1:], tok, side="right", method="compare_all"
+    ).astype(jnp.int32)
     seq_id = jnp.minimum(seq_id, seq_lens.shape[0] - 1)
     q_len = cu_q_lens[seq_id + 1] - cu_q_lens[seq_id]
     pos = seq_lens[seq_id] - q_len + (tok - cu_q_lens[seq_id])

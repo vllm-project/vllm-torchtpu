@@ -241,7 +241,9 @@ def _tiles(cu_q_lens: jax.Array, seq_in_class: jax.Array, block_q: int, max_tile
     tile_ends = jnp.cumsum(tiles_per_seq)
     tile = jnp.arange(max_tiles, dtype=jnp.int32)
     tile_seq = jnp.minimum(
-        jnp.searchsorted(tile_ends, tile, side="right").astype(jnp.int32),
+        jnp.searchsorted(tile_ends, tile, side="right", method="compare_all").astype(
+            jnp.int32
+        ),
         max_num_seqs - 1,
     )
     first_tile = tile_ends - tiles_per_seq
@@ -289,7 +291,9 @@ def _class_scores(
     group_ends = jnp.cumsum(groups_per_tile)
     w = jnp.arange(max_tiles * num_groups_per_seq, dtype=jnp.int32)
     work_tile = jnp.minimum(
-        jnp.searchsorted(group_ends, w, side="right").astype(jnp.int32),
+        jnp.searchsorted(group_ends, w, side="right", method="compare_all").astype(
+            jnp.int32
+        ),
         max_tiles - 1,
     )
     work_group = w - (group_ends[work_tile] - groups_per_tile[work_tile])
@@ -362,7 +366,9 @@ def _class_scores(
     # Back to token order: token t of request r sits in r's tiles at its offset.
     tok = jnp.arange(num_tokens, dtype=jnp.int32)
     seq = jnp.minimum(
-        jnp.searchsorted(cu_q_lens[1:], tok, side="right").astype(jnp.int32),
+        jnp.searchsorted(cu_q_lens[1:], tok, side="right", method="compare_all").astype(
+            jnp.int32
+        ),
         max_num_seqs - 1,
     )
     offset = tok - cu_q_lens[seq]
@@ -459,7 +465,9 @@ def block_scores(
     )
     tok = jnp.arange(num_tokens, dtype=jnp.int32)
     seq = jnp.minimum(
-        jnp.searchsorted(cu_q_lens[1:], tok, side="right").astype(jnp.int32),
+        jnp.searchsorted(cu_q_lens[1:], tok, side="right", method="compare_all").astype(
+            jnp.int32
+        ),
         max_num_seqs - 1,
     )
     # One gather over both classes' columns (XLA fuses the concatenate into

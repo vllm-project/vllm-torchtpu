@@ -302,7 +302,8 @@ def _work_list(selected: jax.Array, block_q: int, pages_per_step: int):
     max_groups_per_tile = -(-union_size // pages_per_step)
     w = jnp.arange(num_tiles * max_groups_per_tile, dtype=jnp.int32)
     tile = jnp.minimum(
-        jnp.searchsorted(ends, w, side="right").astype(jnp.int32), num_tiles - 1
+        jnp.searchsorted(ends, w, side="right", method="compare_all").astype(jnp.int32),
+        num_tiles - 1,
     )
     group = w - (ends[tile] - groups_in_tile[tile])
     grouped = jnp.pad(
