@@ -25,6 +25,7 @@ from vllm.model_executor.layers.linear import (
 from vllm.model_executor.layers.quantization import QuantizationConfig
 
 
+
 # Pure PyTorch head projection for MHC manifold collapse;
 # upstream vLLM only provides Triton/TileLang GPU kernels for hc_head.
 def mhc_collapse_head(
@@ -93,3 +94,44 @@ class DeepseekV4MLP(nn.Module):
         x = self.act_fn(gate_up)
         x, _ = self.down_proj(x)
         return x
+
+    def fused_operands(
+        self,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, float]:
+        """(w13, s13, w2, s2, swiglu limit) for the one-kernel form of this MLP
+        (`kernels/quantized_matmul/shared_expert.py`); raises where that form
+        would not compute what the three modules do."""
+        from vllm_torchtpu.layers.adapter.linear_common import WEIGHT_FLIPPED_ATTR
+
+        act = self.act_fn
+        for layer in (self.gate_up_proj, self.down_proj):
+            scale = getattr(layer, "weight_scale", None)
+            if not (
+                getattr(layer, WEIGHT_FLIPPED_ATTR, False)
+                and layer.weight.dtype == torch.float8_e4m3fn
+                and scale is not None
+                and scale.dtype == torch.float32
+                and scale.shape == (layer.weight.shape[1],)
+                and getattr(layer, "bias", None) is None
+                and getattr(layer, "tp_size", 1) == 1
+            ):
+                raise NotImplementedError(
+                    "the fused shared expert needs unsharded, bias-free, "
+                    "per-channel FP8 projections in (k, n) layout"
+                )
+        if not (
+            isinstance(act, SiluAndMulWithClamp)
+            and act.alpha == 1.0
+            and act.beta == 0.0
+        ):
+            raise NotImplementedError(
+                "the fused shared expert needs SiluAndMulWithClamp with alpha 1 "
+                "and beta 0"
+            )
+        return (
+            self.gate_up_proj.weight,
+            self.gate_up_proj.weight_scale,
+            self.down_proj.weight,
+            self.down_proj.weight_scale,
+            act.swiglu_limit,
+        )
