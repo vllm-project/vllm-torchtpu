@@ -138,17 +138,17 @@ def get_msa_sharded_op(
     """
 
     def _score_jax(
-        k,
-        v,
-        index_q,
-        index_k,
-        kv_cache,
-        index_cache,
-        seq_lens,
-        block_tables,
-        query_start_loc,
-        request_distribution,
-    ):
+        k: jax.Array,
+        v: jax.Array,
+        index_q: jax.Array,
+        index_k: jax.Array,
+        kv_cache: jax.Array,
+        index_cache: jax.Array,
+        seq_lens: jax.Array,
+        block_tables: jax.Array,
+        query_start_loc: jax.Array,
+        request_distribution: jax.Array,
+    ) -> tuple[jax.Array, jax.Array, jax.Array]:
         return msa.msa_write_and_score_sharded(
             k,
             v,
@@ -164,7 +164,14 @@ def get_msa_sharded_op(
             shards=shards,
         )
 
-    def _attend_jax(q, kv_cache, scores, seq_lens, block_tables, query_start_loc):
+    def _attend_jax(
+        q: jax.Array,
+        kv_cache: jax.Array,
+        scores: jax.Array,
+        seq_lens: jax.Array,
+        block_tables: jax.Array,
+        query_start_loc: jax.Array,
+    ) -> jax.Array:
         return msa.msa_attend_sharded(
             q,
             kv_cache,
