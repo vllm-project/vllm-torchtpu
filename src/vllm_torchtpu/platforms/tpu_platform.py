@@ -1209,6 +1209,7 @@ class TpuPlatform(Platform):
 
         _configure_prefill_first_scheduler(vllm_config)
         _configure_dp_pipeline_scheduler(vllm_config)
+        _configure_multistep_decode_scheduler(vllm_config)
 
         kv_transfer_config = vllm_config.kv_transfer_config
         if kv_transfer_config is not None:
@@ -1430,24 +1431,36 @@ def _get_linear_token_paddings(max_token_size: int, longest_pass: int) -> list[i
     return paddings
 
 
+# The policies that install PrefillFirstScheduler, and those of them that only
+# act while a request waits or prefills, so multi-step bursts compose with them.
+_PREFILL_FIRST_POLICIES = (
+    "VLLM_TPU_SOLO_PREFILL_OVER_TOKENS",
+    "VLLM_TPU_DECODE_INTERVAL_MS",
+    "VLLM_TPU_DP_LB_PREFILL_UNIT_TOKENS",
+    "VLLM_TPU_MIN_DECODE_INTERVAL_MS",
+    "VLLM_TPU_DECODE_TPOT_TARGET_MS",
+    "VLLM_TPU_DECODE_TPOT_MS_PER_REQUEST",
+    "VLLM_TPU_DECODE_TPOT_CAP_MS",
+    "VLLM_TPU_DECODE_TPOT_CAP_MS_PER_REQUEST",
+)
+_BURST_COMPATIBLE_PREFILL_FIRST_POLICIES = (
+    "VLLM_TPU_SOLO_PREFILL_OVER_TOKENS",
+    "VLLM_TPU_DECODE_INTERVAL_MS",
+)
+
+
 def _configure_prefill_first_scheduler(vllm_config: VllmConfig) -> None:
     """Install PrefillFirstScheduler when one of its policies is set. Solo
     prefill steps are a layout the model's programs rely on, so a different
     configured scheduler is an error rather than a warning."""
-    if not (
-        envs.VLLM_TPU_SOLO_PREFILL_OVER_TOKENS
-        or envs.VLLM_TPU_DECODE_INTERVAL_MS
-        or envs.VLLM_TPU_DP_LB_PREFILL_UNIT_TOKENS
-        or envs.VLLM_TPU_MIN_DECODE_INTERVAL_MS
-        or envs.VLLM_TPU_DECODE_TPOT_TARGET_MS
-        or envs.VLLM_TPU_DECODE_TPOT_MS_PER_REQUEST
-        or envs.VLLM_TPU_DECODE_TPOT_CAP_MS
-        or envs.VLLM_TPU_DECODE_TPOT_CAP_MS_PER_REQUEST
-    ):
+    if not any(getattr(envs, name) for name in _PREFILL_FIRST_POLICIES):
         return
     from vllm_torchtpu.core.experimental.prefill_first_scheduler import SCHEDULER_CLS
+    from vllm_torchtpu.core.multistep_decode import PREFILL_FIRST_SCHEDULER_CLS
 
     scheduler_config = vllm_config.scheduler_config
+    if scheduler_config.scheduler_cls == PREFILL_FIRST_SCHEDULER_CLS:
+        return  # installed with multi-step bursts on a previous pass
     if scheduler_config.scheduler_cls not in (None, SCHEDULER_CLS):
         installed_by = ""
         if (
@@ -1486,6 +1499,64 @@ def _configure_dp_pipeline_scheduler(vllm_config: VllmConfig) -> None:
         raise ValueError("TPU_DP_PIPELINE_PREFILL needs --async-scheduling.")
     scheduler_config.scheduler_cls = SCHEDULER_CLS
     logger.info("Enabled DpPipelineScheduler.")
+
+
+def _configure_multistep_decode_scheduler(vllm_config: VllmConfig) -> None:
+    """Install MultiStepAsyncScheduler for TPU_MULTISTEP_DECODE > 1, or
+    MultiStepPrefillFirstScheduler over a configured PrefillFirstScheduler.
+
+    Idempotent: vLLM re-runs the config hooks in the engine core on a config
+    this already set. Layouts whose steps it cannot burst are refused here;
+    the runner refuses the model-side ones at load.
+    """
+    if envs.TPU_MULTISTEP_DECODE <= 1:
+        return
+    from vllm_torchtpu.core.experimental import prefill_first_scheduler
+    from vllm_torchtpu.core.multistep_decode import (
+        PREFILL_FIRST_SCHEDULER_CLS,
+        SCHEDULER_CLS,
+    )
+
+    # The scheduler bursts mix into: the default one, or PrefillFirstScheduler
+    # (installed by _configure_prefill_first_scheduler just before).
+    burst_cls = {
+        None: SCHEDULER_CLS,
+        SCHEDULER_CLS: SCHEDULER_CLS,
+        prefill_first_scheduler.SCHEDULER_CLS: PREFILL_FIRST_SCHEDULER_CLS,
+        PREFILL_FIRST_SCHEDULER_CLS: PREFILL_FIRST_SCHEDULER_CLS,
+    }
+    scheduler_config = vllm_config.scheduler_config
+    parallel_config = vllm_config.parallel_config
+    # The other policies may hold running decodes back while nothing waits,
+    # where a burst could start.
+    decode_holds = [
+        name
+        for name in _PREFILL_FIRST_POLICIES
+        if name not in _BURST_COMPATIBLE_PREFILL_FIRST_POLICIES and getattr(envs, name)
+    ]
+    refusals = {
+        "--async-scheduling": not scheduler_config.async_scheduling,
+        "no speculative decoding": vllm_config.speculative_config is not None,
+        "no pipeline parallelism": parallel_config.pipeline_parallel_size > 1,
+        "no data parallelism": parallel_config.data_parallel_size > 1,
+        (
+            "the default scheduler or PrefillFirstScheduler (not "
+            f"{scheduler_config.scheduler_cls})"
+        ): scheduler_config.scheduler_cls not in burst_cls,
+        (
+            "no PrefillFirstScheduler policy other than solo prefill and the "
+            f"decode interval (set: {', '.join(decode_holds)})"
+        ): bool(decode_holds),
+    }
+    missing = [need for need, refused in refusals.items() if refused]
+    if missing:
+        raise ValueError(f"TPU_MULTISTEP_DECODE needs {', '.join(missing)}.")
+    scheduler_config.scheduler_cls = burst_cls[scheduler_config.scheduler_cls]
+    logger.info(
+        "Enabled %s: greedy decode bursts of up to %d tokens.",
+        scheduler_config.scheduler_cls.rsplit(".", 1)[-1],
+        envs.TPU_MULTISTEP_DECODE,
+    )
 
 
 def _configure_pipeline_chunks(vllm_config: VllmConfig) -> None:

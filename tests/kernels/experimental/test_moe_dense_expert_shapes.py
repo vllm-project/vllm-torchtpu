@@ -54,7 +54,9 @@ def test_qwen_buffers_follow_vmem_capacity(capacity_mib, expected):
     [
         ((256, 4096, 2048, 64), 1),
         ((1024, 4096, 1024, 64), 1),
-        ((256, 4096, 1024, 8192), 2),
+        # Routes are [tokens, top-k] ids and weights, not a [tokens, experts]
+        # table: thousands of experts no longer cost a buffer.
+        ((256, 4096, 1024, 8192), 3),
         ((16, 512, 512, 4), 3),
     ],
 )
@@ -72,6 +74,25 @@ def test_buffer_selection_leaves_resource_failure_to_compiler():
 )
 def test_partial_scale_plane_counts_toward_buffer_budget(shape, capacity, expected):
     assert kernel._select_expert_buffers(*shape, capacity) == expected
+
+
+@pytest.mark.parametrize("m", [16, 32, 64])
+def test_vmem_limit_is_the_buffers_plus_headroom(m):
+    # Gemma4-26B-A4B EP2 decode buckets: three 6.5 MB expert slots leave most
+    # of a 64 MiB VMEM to XLA's own prefetched operands.
+    capacity = 64 << 20
+    buffers = kernel._select_expert_buffers(m, 2816, 768, 64, capacity)
+    expert_bytes, fixed_bytes = kernel._buffer_bytes(m, 2816, 768)
+    limit = kernel._vmem_limit_bytes(m, 2816, 768, buffers, capacity)
+    assert buffers == 3
+    assert limit == fixed_bytes + 3 * expert_bytes + kernel._VMEM_HEADROOM_BYTES
+    assert limit < 25 << 20
+
+
+def test_vmem_limit_never_exceeds_capacity():
+    capacity = 16 << 20
+    buffers = kernel._select_expert_buffers(1024, 8192, 4096, 512, capacity)
+    assert kernel._vmem_limit_bytes(1024, 8192, 4096, buffers, capacity) == capacity
 
 
 def _shapes(m, h, i, e):
@@ -106,6 +127,32 @@ def test_aligned_shapes_have_no_resource_admission_cap(shape, skip_padded_tokens
         activation="silu",
         rhs_quant_dtype=None,
         skip_padded_tokens=skip_padded_tokens,
+    )
+
+
+@pytest.mark.parametrize(
+    "hidden, activation, admitted",
+    [
+        # Gemma4-26B-A4B EP2: 64 local experts, hidden 2816 (not a multiple of
+        # 512), inter 704 padded to 768 at load.
+        (2816, "gelu_tanh", True),
+        (2816, "gelu", False),
+        (768, "gelu_tanh", True),
+        # The down projection's 256-column output tiles do not divide it.
+        (1152, "gelu_tanh", False),
+    ],
+)
+def test_tanh_gelu_and_partial_last_block_are_admitted(hidden, activation, admitted):
+    assert (
+        kernel.can_use_dense_expert(
+            *_shapes(16, hidden, 768, 64),
+            None,
+            None,
+            activation=activation,
+            rhs_quant_dtype=None,
+            skip_padded_tokens=False,
+        )
+        == admitted
     )
 
 
@@ -180,7 +227,8 @@ def test_hidden_contracting_axis_also_needs_gmm_quantization(
     "shape",
     [
         (15, 512, 512, 4),
-        (16, 768, 512, 4),
+        (16, 704, 512, 4),
+        (16, 640, 512, 4),
         (16, 512, 704, 4),
         (0, 512, 512, 4),
         (16, 0, 512, 4),
@@ -216,10 +264,11 @@ def test_only_unpacked_fp8_arithmetic_is_supported(rhs_dtype, supported):
     )
 
 
-def _reference_expert(x, w1, w2, s1, s2):
+def _reference_expert(x, w1, w2, s1, s2, activation="silu"):
     def matmul(lhs, rhs, scale):
-        # Independent full-output contraction per quantization block, with
-        # the documented BF16 intermediate rounding and accumulation.
+        # Independent full-output contraction per quantization block (the
+        # last one narrower when K is not a multiple of 512), with the
+        # documented BF16 intermediate rounding and accumulation.
         result = jnp.zeros((lhs.shape[0], rhs.shape[1]), jnp.bfloat16)
         for start in range(0, lhs.shape[1], 512):
             block = lhs[:, start : start + 512]
@@ -233,21 +282,24 @@ def _reference_expert(x, w1, w2, s1, s2):
         return result
 
     gate, up = jnp.split(matmul(x, w1, s1), 2, axis=1)
-    return matmul(jax.nn.silu(gate) * up, w2, s2)
+    return matmul(gmm_v2.apply_gated_act(gate, up, activation), w2, s2)
 
 
 @pytest.mark.parametrize(
-    "shape",
+    "shape, activation",
     [
-        (272, 512, 512, 2),
-        (16, 1536, 1536, 2),
-        (16, 512, 512, 129),
-        (16, 512, 128, 2),
-        (16, 512, 640, 2),
-        (16, 512, 768, 2),
+        ((272, 512, 512, 2), "silu"),
+        ((16, 1536, 1536, 2), "silu"),
+        ((16, 512, 512, 129), "silu"),
+        ((16, 512, 128, 2), "silu"),
+        ((16, 512, 640, 2), "silu"),
+        ((16, 512, 768, 2), "silu"),
+        # Gemma4-26B-A4B EP2: hidden 2816 = 5 x 512 + 256, inter 704 padded.
+        ((16, 768, 256, 2), "gelu_tanh"),
+        ((32, 2816, 768, 3), "gelu_tanh"),
     ],
 )
-def test_expanded_shapes_match_routed_reference(shape, monkeypatch):
+def test_expanded_shapes_match_routed_reference(shape, activation, monkeypatch):
     if jax.default_backend() != "cpu":
         pytest.skip("CPU Pallas interpreter; run with JAX_PLATFORMS=cpu")
     m, h, i, e = shape
@@ -269,7 +321,12 @@ def test_expanded_shapes_match_routed_reference(shape, monkeypatch):
     expected = jnp.zeros((m, h), jnp.float32)
     for expert in sorted(set(route) - {-1}):
         output = _reference_expert(
-            x, w1[expert], w2[expert], s1[expert, 0, 0], s2[expert, 0, 0]
+            x,
+            w1[expert],
+            w2[expert],
+            s1[expert, 0, 0],
+            s2[expert, 0, 0],
+            activation,
         )
         coeff = jnp.sum(
             jnp.where(ids == expert, weights.astype(jnp.float32), 0), axis=1
@@ -291,7 +348,8 @@ def test_expanded_shapes_match_routed_reference(shape, monkeypatch):
     kernel.dense_expert_moe.clear_cache()
     try:
         actual = np.asarray(
-            kernel.dense_expert_moe(x, w1, w2, s1, s2, weights, ids), dtype=np.float32
+            kernel.dense_expert_moe(x, w1, w2, s1, s2, weights, ids, activation),
+            dtype=np.float32,
         )
     finally:
         kernel.dense_expert_moe.clear_cache()
@@ -377,3 +435,51 @@ def test_dense_expert_threshold_rejects_invalid_value(monkeypatch, value):
     monkeypatch.setenv(name, value)
     with pytest.raises(ValueError, match=name):
         envs.environment_variables[name]()
+
+
+def test_global_ids_with_experts_start_match_local_ids(monkeypatch):
+    if jax.default_backend() != "cpu":
+        pytest.skip("CPU Pallas interpreter; run with JAX_PLATFORMS=cpu")
+    m, h, i, e = 16, 768, 256, 3
+    rng = np.random.default_rng(7)
+    x = jnp.asarray(rng.normal(size=(m, h)), jnp.bfloat16)
+    w1 = jnp.asarray(rng.integers(-4, 5, size=(e, h, 2 * i)), jnp.float8_e4m3fn)
+    w2 = jnp.asarray(rng.integers(-4, 5, size=(e, i, h)), jnp.float8_e4m3fn)
+    s1 = jnp.full((e, 1, 1, 2 * i), 0.01, jnp.float32)
+    s2 = jnp.full((e, 1, 1, h), 0.01, jnp.float32)
+    # This rank owns global experts [8, 11); 3 and 20 are other ranks'.
+    global_ids = jnp.asarray(np.tile([8, 10, 3, 20], (m, 1)), jnp.int32)
+    local_ids = jnp.where(
+        (global_ids >= 8) & (global_ids < 11), global_ids - 8, -1
+    ).astype(jnp.int32)
+    weights = jnp.asarray(rng.uniform(0.1, 1.0, size=(m, 4)), jnp.float32)
+    monkeypatch.setattr(
+        kernel.pl,
+        "pallas_call",
+        functools.partial(kernel.pl.pallas_call, interpret=True),
+    )
+    monkeypatch.setattr(
+        kernel.pltpu,
+        "get_tpu_info",
+        lambda: SimpleNamespace(vmem_capacity_bytes=64 * 1024**2),
+    )
+    kernel.dense_expert_moe.clear_cache()
+    try:
+        local = kernel.dense_expert_moe(
+            x, w1, w2, s1, s2, weights, local_ids, "gelu_tanh"
+        )
+        ranked = kernel.dense_expert_moe(
+            x,
+            w1,
+            w2,
+            s1,
+            s2,
+            weights,
+            global_ids,
+            "gelu_tanh",
+            experts_start=jnp.array(8, jnp.int32),
+        )
+    finally:
+        kernel.dense_expert_moe.clear_cache()
+    np.testing.assert_array_equal(np.asarray(local), np.asarray(ranked))
+    assert np.abs(np.asarray(local, np.float32)).sum() > 0

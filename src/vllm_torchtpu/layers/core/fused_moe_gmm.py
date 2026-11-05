@@ -915,6 +915,52 @@ def fused_moe_func(
     assert topk_weights.shape == (num_tokens, topk)
     assert topk_ids.shape == (num_tokens, topk)
 
+    # Decode services also compile large prefill buckets. Apply the token
+    # threshold before kernel admission so those buckets retain routed GMM.
+    dense_expert = 0 < num_tokens <= _DENSE_EXPERT_THRESHOLD
+    if dense_expert and not can_use_dense_expert(
+        hidden_states,
+        w1,
+        w2,
+        w1_scale,
+        w2_scale,
+        w1_bias,
+        w2_bias,
+        activation=activation,
+        rhs_quant_dtype=rhs_quant_dtype,
+        skip_padded_tokens=skip_padded_tokens,
+    ):
+        dense_expert = False
+        logger.warning_once(
+            "TPU_MOE_DENSE_EXPERT_THRESHOLD: the dense-expert kernel does not "
+            "serve %d tokens with w1 %s %s, w2 %s and activation %s; this MoE "
+            "keeps the grouped-matmul path.",
+            num_tokens,
+            w1.shape,
+            w1.dtype,
+            w2.shape,
+            activation,
+        )
+    if dense_expert:
+        logger.info_once(
+            "Selected experimental dense-expert decode MoE (%s, up to %d tokens)",
+            activation,
+            _DENSE_EXPERT_THRESHOLD,
+        )
+        # The kernel rounds the weights to the hidden dtype, skips other
+        # ranks' routes itself, and mixes no tokens (so no NaN cleanup).
+        return dense_expert_moe(
+            hidden_states,
+            w1,
+            w2,
+            w1_scale,
+            w2_scale,
+            topk_weights,
+            topk_ids,
+            activation=activation,
+            experts_start=experts_start if use_ep else None,
+        )
+
     # Pin topk_weights to hidden_states.dtype so the EP mask, GMM
     # reduce, and `where` propagate in BF16 — some custom_routing_fn
     # callers return FP32 weights and would otherwise promote downstream.
@@ -933,25 +979,6 @@ def fused_moe_func(
         valid = (local_ids >= 0) & (local_ids < w1.shape[0])
         topk_weights = jnp.where(valid, topk_weights, jnp.zeros_like(topk_weights))
         topk_ids = jnp.where(valid, local_ids, jnp.full_like(local_ids, -1))
-
-    # Decode services also compile large prefill buckets. Apply the token
-    # threshold before kernel admission so those buckets retain routed GMM.
-    if 0 < num_tokens <= _DENSE_EXPERT_THRESHOLD and can_use_dense_expert(
-        hidden_states,
-        w1,
-        w2,
-        w1_scale,
-        w2_scale,
-        w1_bias,
-        w2_bias,
-        activation=activation,
-        rhs_quant_dtype=rhs_quant_dtype,
-        skip_padded_tokens=skip_padded_tokens,
-    ):
-        logger.info_once("Selected experimental dense-expert decode MoE")
-        return dense_expert_moe(
-            hidden_states, w1, w2, w1_scale, w2_scale, topk_weights, topk_ids
-        )
 
     if _GATHER_GMM and can_use_gather_gmm(
         hidden_states,

@@ -195,6 +195,11 @@ _TPU_COMPILE_ENV_IGNORED = {
     "VLLM_TPU_DP_LB_EXACT_INFLIGHT",
     # Host-side persistent-batch bookkeeping only.
     "TPU_CACHED_PROMPT_ROWS",
+    # Decode-step orchestration: the backbone graphs do not change; the
+    # multi-step helpers and a K-step backend compile programs of their own.
+    "TPU_MULTISTEP_DECODE",
+    "TPU_MULTISTEP_DECODE_MAX_BURST_MS",
+    "TPU_K_STEP_DECODE_BACKEND",
     # Pipelined prefill routing and timeouts; the segment programs follow
     # TPU_DP_PIPELINE_PREFILL, _STAGES and _SPLITS, which stay in the key.
     "TPU_DP_PIPELINE_MIN_TOKENS",

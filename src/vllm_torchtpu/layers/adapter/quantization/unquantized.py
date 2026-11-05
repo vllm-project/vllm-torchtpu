@@ -36,6 +36,7 @@ and uses our native TorchTPU + Pallas kernels.
 
 from typing import TYPE_CHECKING, Any, cast
 
+import jax.numpy as jnp
 import torch
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.fused_moe import (
@@ -67,7 +68,9 @@ from vllm_torchtpu.layers.adapter.fused_moe import (
 from vllm_torchtpu.layers.adapter.linear_common import (
     KEEP_VLLM_LAYOUT_ATTR,
     WEIGHT_FLIPPED_ATTR,
+    decode_fp8_lm_head,
     decode_matmul_nt,
+    fp8_lm_head_weight,
 )
 from vllm_torchtpu.layers.adapter.pipelined_fused_moe import (
     enable_pipelined_collective_and_compute,
@@ -151,18 +154,66 @@ class VllmUnquantizedLinearMethod(UnquantizedLinearMethod):
         return torch.addmm(bias, x_2d, weight).reshape(orig_out_shape)
 
 
+# Buffers of the LM head's FP8 copy (TPU_LM_HEAD_FP8_DECODE): non-persistent,
+# so Dynamo traces them as module state and checkpoints never see them.
+_FP8_WEIGHT = "decode_fp8_weight"
+_FP8_SCALE = "decode_fp8_scale"
+
+
 class VllmDecodeLMHeadMethod(UnquantizedEmbeddingMethod):
     """vLLM's unquantized LM head, with decode buckets as one weight stream.
 
     The head's `[vocab shard, hidden]` weight (the embedding's, when tied) is
     read whole for a few rows per step. A bucket of at most `max_rows` rows
     without a bias runs `decode_matmul_nt` (TPU_LM_HEAD_DECODE_GEMV_MAX_ROWS);
-    others, and the embedding lookup, are upstream's.
+    others, and the embedding lookup, are upstream's. With `fp8`
+    (TPU_LM_HEAD_FP8_DECODE) such buckets stream an FP8 copy of the weight
+    instead, half the bytes, quantized per vocab row at load: W8A8 with the
+    rows quantized per token, as the model's own FP8 projections.
     """
 
-    def __init__(self, max_rows: int):
+    def __init__(self, max_rows: int, fp8: bool = False):
         super().__init__()
         self.max_rows = max_rows
+        self.fp8 = fp8
+        # Row counts the FP8 copy serves, decided at load: apply() is traced
+        # by Dynamo, which cannot trace jax's dtype queries.
+        self.fp8_rows: frozenset[int] = frozenset()
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        super().process_weights_after_loading(layer)
+        if not self.fp8:
+            return
+        weight = layer.weight
+        if weight.dtype != torch.bfloat16 or weight.dim() != 2:
+            raise ValueError(
+                "TPU_LM_HEAD_FP8_DECODE quantizes a 2-D bf16 LM head; this head is "
+                f"{weight.dtype} {tuple(weight.shape)}"
+            )
+        w_q, scale = fp8_lm_head_weight(weight.data)
+        layer.register_buffer(_FP8_WEIGHT, w_q, persistent=False)
+        layer.register_buffer(_FP8_SCALE, scale, persistent=False)
+        vocab, hidden = weight.shape
+        self.fp8_rows = frozenset(
+            rows
+            for rows in range(8, self.max_rows + 1, 8)
+            if decode_gemv.supports(
+                rows, hidden, vocab, jnp.float8_e4m3fn, 1, row_multiple=8
+            )
+        )
+        if not self.fp8_rows:
+            raise ValueError(
+                "TPU_LM_HEAD_FP8_DECODE: no LM head bucket of at most "
+                f"{self.max_rows} rows fits the FP8 stream of a [{vocab}, {hidden}] "
+                "weight"
+            )
+        logger.info(
+            "TPU_LM_HEAD_FP8_DECODE: LM head buckets of %s rows stream an FP8 copy "
+            "of the [%d, %d] weight (per vocab row scales).",
+            sorted(self.fp8_rows),
+            vocab,
+            hidden,
+        )
 
     def apply(
         self,
@@ -171,14 +222,16 @@ class VllmDecodeLMHeadMethod(UnquantizedEmbeddingMethod):
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
         weight = layer.weight
-        if (
-            bias is None
-            and x.dim() == 2
-            and 0 < x.shape[0] <= self.max_rows
-            and x.dtype == weight.dtype
-            and decode_gemv.supports_nt(
-                x.shape[0], weight.shape[1], weight.shape[0], weight.dtype.itemsize
+        rows = x.shape[0] if x.dim() == 2 else 0
+        decode_bucket = (
+            bias is None and 0 < rows <= self.max_rows and x.dtype == weight.dtype
+        )
+        if decode_bucket and rows in self.fp8_rows:
+            return decode_fp8_lm_head(
+                x, getattr(layer, _FP8_WEIGHT), getattr(layer, _FP8_SCALE)
             )
+        if decode_bucket and decode_gemv.supports_nt(
+            rows, weight.shape[1], weight.shape[0], weight.dtype.itemsize
         ):
             return decode_matmul_nt(x, weight)
         return super().apply(layer, x, bias)
@@ -187,10 +240,14 @@ class VllmDecodeLMHeadMethod(UnquantizedEmbeddingMethod):
 def decode_lm_head_method(layer: torch.nn.Module) -> VllmDecodeLMHeadMethod | None:
     """The method of an unquantized ParallelLMHead under
     TPU_LM_HEAD_DECODE_GEMV_MAX_ROWS; None (upstream's) otherwise."""
-    if isinstance(layer, ParallelLMHead) and (
-        max_rows := envs.TPU_LM_HEAD_DECODE_GEMV_MAX_ROWS
-    ):
-        return VllmDecodeLMHeadMethod(max_rows)
+    max_rows = envs.TPU_LM_HEAD_DECODE_GEMV_MAX_ROWS
+    if envs.TPU_LM_HEAD_FP8_DECODE and not max_rows:
+        raise ValueError(
+            "TPU_LM_HEAD_FP8_DECODE streams the decode buckets of "
+            "TPU_LM_HEAD_DECODE_GEMV_MAX_ROWS; set it too"
+        )
+    if isinstance(layer, ParallelLMHead) and max_rows:
+        return VllmDecodeLMHeadMethod(max_rows, fp8=envs.TPU_LM_HEAD_FP8_DECODE)
     return None
 
 

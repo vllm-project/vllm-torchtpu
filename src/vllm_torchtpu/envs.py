@@ -60,6 +60,7 @@ if TYPE_CHECKING:
     TPU_FP8_LINEAR_W8A16_MAX_ROWS: int = 0
     TPU_FP8_DECODE_GEMV_MAX_ROWS: int = 0
     TPU_LM_HEAD_DECODE_GEMV_MAX_ROWS: int = 0
+    TPU_LM_HEAD_FP8_DECODE: bool = False
     MOE_REQUANTIZE_WEIGHT_DTYPE: str = "float8_e4m3fn"
     MOE_REQUANTIZE_BLOCK_SIZE: int | None = None
     TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL: bool | None = None
@@ -100,6 +101,9 @@ if TYPE_CHECKING:
     TPU_KERNEL_ITER_MODE: bool = False
     TPU_KERNEL_RELOAD_MODULES: str = ""
     TPU_GREEDY_TOP_TOKENS: bool = False
+    TPU_K_STEP_DECODE_BACKEND: str = ""
+    TPU_MULTISTEP_DECODE: int = 0
+    TPU_MULTISTEP_DECODE_MAX_BURST_MS: float = 0.0
     TPU_RPA_SKIP_EMPTY_LAUNCH: bool = False
     TPU_RPA_FENCE_OUTPUT: bool = False
     TPU_GEMMA4_FUSED_ATTN_PROLOGUE: bool = False
@@ -724,6 +728,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_LM_HEAD_DECODE_GEMV_MAX_ROWS": env_nonnegative_int(
         "TPU_LM_HEAD_DECODE_GEMV_MAX_ROWS", 0
     ),
+    # With TPU_LM_HEAD_DECODE_GEMV_MAX_ROWS: those logits buckets stream an FP8
+    # copy of the (bf16) LM head, quantized per vocab row at load.
+    "TPU_LM_HEAD_FP8_DECODE": env_bool("TPU_LM_HEAD_FP8_DECODE"),
     # Specify dtype for quantized MoE weights
     "MOE_REQUANTIZE_WEIGHT_DTYPE": lambda: os.getenv(
         "MOE_REQUANTIZE_WEIGHT_DTYPE", "float8_e4m3fn"
@@ -840,7 +847,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Maximum hidden-state row count (after any EP all-gather) for dense
     # expert MoE. 0 disables it; larger shapes and unsupported layouts use
-    # the original GMM path. This counts tokens, not tokens * topk.
+    # the original GMM path. This counts tokens, not tokens * topk; the
+    # kernel holds tokens * topk route ids and weights in SMEM, so keep it
+    # to decode-sized buckets.
     "TPU_MOE_DENSE_EXPERT_THRESHOLD": env_nonnegative_int(
         "TPU_MOE_DENSE_EXPERT_THRESHOLD", 0
     ),
@@ -928,6 +937,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Greedy steps without logprobs or grammar take the vocabulary-parallel
     # argmax (runner/greedy_top_tokens.py) instead of gathering the logits.
     "TPU_GREEDY_TOP_TOKENS": env_bool("TPU_GREEDY_TOP_TOKENS"),
+    # "module:factory" building a K-step decode backend from the runner
+    # (runner/multistep_decode.py): greedy decode-only chunks are decoded by
+    # one call to it instead of the backbone, LM head and argmax programs.
+    "TPU_K_STEP_DECODE_BACKEND": lambda: os.getenv("TPU_K_STEP_DECODE_BACKEND", ""),
+    # Multi-step greedy decode: up to this many tokens per request per step
+    # (core/multistep_decode.py); 0 or 1 disables it.
+    "TPU_MULTISTEP_DECODE": env_nonnegative_int("TPU_MULTISTEP_DECODE", 0),
+    # Cap on a multi-step burst's duration (ms, from the measured time per
+    # decode iteration); 0 leaves bursts at TPU_MULTISTEP_DECODE tokens.
+    "TPU_MULTISTEP_DECODE_MAX_BURST_MS": env_nonnegative_float(
+        "TPU_MULTISTEP_DECODE_MAX_BURST_MS", 0.0
+    ),
     # Batched RPA launches its decode and its mixed kernel on every step. With
     # this on, a launch whose batch segment is empty (the mixed kernel of a
     # decode-only step, the decode kernel of a prefill-only step) skips its

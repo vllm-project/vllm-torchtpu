@@ -22,6 +22,7 @@ import bisect
 import contextlib
 import copy
 import dataclasses
+import itertools
 import math
 import os
 import time
@@ -152,7 +153,7 @@ from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
 )
 from vllm_torchtpu.platforms.pcp_validation import PcpStaticSupportValidator
 from vllm_torchtpu.platforms.tpu_block_size_utils import unified_kv_layout_enabled
-from vllm_torchtpu.runner import greedy_top_tokens
+from vllm_torchtpu.runner import greedy_top_tokens, multistep_decode
 from vllm_torchtpu.runner import min_tokens as min_tokens_mask
 from vllm_torchtpu.runner import utils as runner_utils
 from vllm_torchtpu.runner.dp_pipeline_stage import (
@@ -237,6 +238,11 @@ class ExecuteModelState:
     # (TPU_GREEDY_TOP_TOKENS).
     top_tokens: bool = False
     kv_save_nan_check: KVSaveNanCheck | None = None
+    # Multi-step burst (TPU_MULTISTEP_DECODE): tokens per request this step;
+    # logits_list holds [rows, burst_len] token blocks and
+    # burst_last_tokens each chunk's last column.
+    burst_len: int = 1
+    burst_last_tokens: list[torch.Tensor] = field(default_factory=list)
 
 
 # Per-step mamba read-offset operations, consolidated into single cached
@@ -1158,6 +1164,11 @@ class TPUModelRunner(GPUModelRunner):
         self._token_padding_state: token_padding.TokenPaddingState | None = None
         # Set at load when TPU_GREEDY_TOP_TOKENS is on.
         self._greedy_head_owner: torch.nn.Module | None = None
+        # Set at load from TPU_K_STEP_DECODE_BACKEND (register_k_step_decode_backend).
+        self.k_step_decode_backend: multistep_decode.KStepDecodeBackend | None = None
+        self._k_step_paths = multistep_decode.KStepPathCounter(
+            "TPU_K_STEP_DECODE_BACKEND"
+        )
 
         self._init_phased_profiling()
         self._stage_timing = RunnerStageTiming(profiler_rank)
@@ -3880,6 +3891,14 @@ class TPUModelRunner(GPUModelRunner):
                 "State error: sample_tokens() must be called "
                 "after execute_model() returns None."
             )
+        burst = (
+            multistep_decode.burst_len(scheduler_output)
+            if envs.TPU_MULTISTEP_DECODE > 1
+            else 1
+        )
+        if burst > 1:
+            # Every input below is prepared as for the burst's first iteration.
+            scheduler_output = multistep_decode.decode_view(scheduler_output)
         # Update cached state
         self._update_states(scheduler_output)
         if self.scheduler_config.async_scheduling:
@@ -4000,6 +4019,12 @@ class TPUModelRunner(GPUModelRunner):
         draft_chunks: list[DraftChunkInputs] = []
         is_draft_model = self._is_async_drafter
         top_tokens = self._greedy_top_tokens_this_step()
+        burst_last_tokens: list[torch.Tensor] = []
+        if burst > 1 and not top_tokens:
+            raise RuntimeError(
+                "TPU_MULTISTEP_DECODE: a burst step whose requests the top-token "
+                "path cannot serve"
+            )
 
         # NOTE: setup current batch's metadata for kv connector.
         # Verified with TPURaidenConnector, TPUConnector, OffloadingConnector
@@ -4170,6 +4195,24 @@ class TPUModelRunner(GPUModelRunner):
                         src_key, "UNKNOWN" if src_key == "phase" else 0
                     )
 
+            use_k_step = False
+            k_step_tokens: torch.Tensor | None = None
+            if self.k_step_decode_backend is not None:
+                k_step_reason = self._k_step_chunk_reason(
+                    scheduler_output,
+                    start_index,
+                    num_reqs,
+                    padded_num_reqs,
+                    burst,
+                    top_tokens,
+                    spec_decode_metadata is not None,
+                )
+                if k_step_reason != "prefill":
+                    self._k_step_paths.record(
+                        k_step_reason, self.input_batch.req_ids[start_index:end_index]
+                    )
+                use_k_step = k_step_reason is None
+
             trace_name = f"ModelForward: {num_reqs} reqs, {num_tokens_padded} toks"
             if "min_kv_len" in trace_kwargs:
                 trace_name += (
@@ -4202,12 +4245,25 @@ class TPUModelRunner(GPUModelRunner):
                 ),
                 self._stage_timing.stage("main_forward"),
             ):
-                hidden_states, aux_hidden_states = self.forward_model(
-                    input_ids=input_ids,
-                    positions=self.position_ids,
-                    inputs_embeds=inputs_embeds,
-                    intermediate_tensors=intermediate_tensors,
-                )
+                if use_k_step:
+                    assert self.k_step_decode_backend is not None
+                    k_step_tokens = self.k_step_decode_backend.decode(
+                        steps=burst,
+                        input_ids=input_ids,
+                        positions=self.position_ids,
+                        attn_metadata=attn_metadata,
+                        num_reqs=num_reqs,
+                        padded_num_reqs=padded_num_reqs,
+                        kv_caches=self.kv_caches,
+                    )
+                    hidden_states, aux_hidden_states = None, None
+                else:
+                    hidden_states, aux_hidden_states = self.forward_model(
+                        input_ids=input_ids,
+                        positions=self.position_ids,
+                        inputs_embeds=inputs_embeds,
+                        intermediate_tensors=intermediate_tensors,
+                    )
             if dp_stage_step is not None:
                 assert self._dp_pipeline is not None
                 assert dp_stage_call is not None
@@ -4245,7 +4301,11 @@ class TPUModelRunner(GPUModelRunner):
 
             sequence_layout_planner = _get_sequence_layout_planner_for_runner(self)
             layout_plan = self._last_sequence_layout_plan
-            if self.is_pooling_model:
+            if use_k_step:
+                # The backend's [padded_num_reqs, steps] tokens, as the top
+                # tokens of the chunk.
+                logits = k_step_tokens
+            elif self.is_pooling_model:
                 hidden_states = sequence_layout_planner.finalize_hidden_states(
                     hidden_states,
                     layout_plan,
@@ -4291,6 +4351,23 @@ class TPUModelRunner(GPUModelRunner):
                         sample_hidden_states
                     )
 
+            if burst > 1:
+                iteration_tokens = (
+                    [logits]
+                    if use_k_step
+                    else self._decode_burst_iterations(
+                        burst,
+                        logits,
+                        input_ids,
+                        attn_metadata,
+                        layout_plan,
+                        logits_indices,
+                        num_reqs,
+                        num_tokens_padded,
+                    )
+                )
+                logits, last_tokens = multistep_decode.stack_tokens(iteration_tokens)
+                burst_last_tokens.append(last_tokens)
             logits_list.append(logits)
             num_reqs_list.append(num_reqs)
             spec_decode_metadata_list.append(spec_decode_metadata)
@@ -4350,6 +4427,8 @@ class TPUModelRunner(GPUModelRunner):
             mamba_state_indices_list=mamba_state_indices_list,
             top_tokens=top_tokens,
             kv_save_nan_check=nan_check,
+            burst_len=burst,
+            burst_last_tokens=burst_last_tokens,
         )
 
         if self.is_pooling_model:
@@ -5068,8 +5147,8 @@ class TPUModelRunner(GPUModelRunner):
                 list[str], self.input_batch.req_ids[: self.input_batch.num_reqs]
             )
             all_greedy = self.input_batch.all_greedy
-            for logits, num_reqs, mamba_indices in zip(
-                state.logits_list, state.num_reqs_list, mamba_idx_list
+            for chunk_idx, (logits, num_reqs, mamba_indices) in enumerate(
+                zip(state.logits_list, state.num_reqs_list, mamba_idx_list)
             ):
                 cur_end_idx = cur_start_idx + num_reqs
                 # Non-spec step (prefill / plain decode): reset the mamba
@@ -5132,7 +5211,12 @@ class TPUModelRunner(GPUModelRunner):
                 combined_selected_tokens.append(selected_token_ids)
                 combined_selected_tokens_real_lens.append(num_reqs)
                 if self.scheduler_config.async_scheduling:
-                    next_tokens_tpu_chunks.append(selected_token_ids.view(-1))
+                    # The next step's input token of each row: a burst's last.
+                    next_tokens_tpu_chunks.append(
+                        state.burst_last_tokens[chunk_idx]
+                        if state.burst_len > 1
+                        else selected_token_ids.view(-1)
+                    )
                     for req_idx in range(cur_start_idx, cur_end_idx):
                         next_token_indices[req_idx] = (
                             next_tokens_tpu_offset + req_idx - cur_start_idx
@@ -5398,6 +5482,12 @@ class TPUModelRunner(GPUModelRunner):
                     combined_selected_tokens,
                     combined_selected_tokens_real_lens,
                 )
+            if state.burst_len > 1:
+                # A burst commits burst_len tokens per request, as a step whose
+                # burst_len - 1 drafts were all accepted.
+                num_draft_per_req = {
+                    i: state.burst_len - 1 for i, *_ in request_seq_lens
+                }
             req_id_to_index_copy = {}
             if not self.is_pooling_model:
                 req_id_to_index_copy = self._update_placeholder(
@@ -5632,6 +5722,12 @@ class TPUModelRunner(GPUModelRunner):
 
             draft = self._async_drafter.draft_model if self._is_async_drafter else None
             arm(self.model, draft)
+
+        backend = multistep_decode.load_backend(envs.TPU_K_STEP_DECODE_BACKEND, self)
+        if backend is not None:
+            self.register_k_step_decode_backend(backend)
+        if envs.TPU_MULTISTEP_DECODE > 1:
+            self._check_multistep_decode()
 
     def load_lora_model(
         self,
@@ -6939,6 +7035,8 @@ class TPUModelRunner(GPUModelRunner):
             self._precompile_sampling_subgraphs()
             self._precompile_pooler_subgraphs()
             self._precompile_mamba_rollback_helpers()
+            self._precompile_multistep_decode()
+            self._precompile_k_step_decode_backend()
 
             # Precompile multimodal vision encoder graphs
             self.encoder_cudagraph_manager = maybe_create_mm_encoder_manager(
@@ -8338,6 +8436,231 @@ class TPUModelRunner(GPUModelRunner):
         self, hidden_states: torch.Tensor
     ) -> torch.Tensor:
         return self.model.compute_logits(hidden_states)
+
+    def register_k_step_decode_backend(
+        self, backend: multistep_decode.KStepDecodeBackend
+    ) -> None:
+        """Serve greedy decode-only chunks with `backend` (one call per chunk).
+
+        Its tokens take the top-token sampling path, so TPU_GREEDY_TOP_TOKENS
+        must be on; layouts whose decode needs more than the backbone, the LM
+        head and the argmax of the chunk's rows are refused.
+        """
+        refusals = {
+            "TPU_GREEDY_TOP_TOKENS is off": self._greedy_head_owner is None,
+            "speculative decoding": self.speculative_config is not None,
+            "pipeline parallelism": not (self._pp_is_first and self._pp_is_last),
+            "a pooling model": self.is_pooling_model,
+            "a KV connector": has_kv_transfer_group(),
+            "LoRA": self.lora_config is not None,
+            "prefill context parallelism": self._pcp_enabled,
+            "DP lockstep": self._dp_lockstep_enabled(),
+            "M-RoPE": self.uses_mrope,
+            "multimodal inputs": self.supports_mm_inputs,
+        }
+        refused = [reason for reason, hit in refusals.items() if hit]
+        if refused:
+            raise ValueError(
+                f"K-step decode backend {type(backend).__name__} needs a plain "
+                f"greedy decode; this server has {', '.join(refused)}."
+            )
+        self.k_step_decode_backend = backend
+        logger.info(
+            "Greedy decode-only chunks are served by the K-step decode backend %s.",
+            type(backend).__name__,
+        )
+
+    def _k_step_chunk_reason(
+        self,
+        scheduler_output: "SchedulerOutput",
+        start_index: int,
+        num_reqs: int,
+        padded_num_reqs: int,
+        steps: int,
+        top_tokens: bool,
+        has_drafts: bool,
+    ) -> str | None:
+        """Why the K-step backend does not serve this chunk, None when it does.
+
+        "prefill" marks a chunk that is not decode-only; the rest are decode
+        chunks the backend could have taken (counted, KStepPathCounter).
+        """
+        req_ids = self.input_batch.req_ids[start_index : start_index + num_reqs]
+        if any(scheduler_output.num_scheduled_tokens[r] != 1 for r in req_ids):
+            return "prefill"
+        if has_drafts:
+            return "drafts"
+        if not top_tokens:
+            return "not top-token eligible (sampling, logprobs, grammar or min_tokens)"
+        assert self.k_step_decode_backend is not None
+        if not self.k_step_decode_backend.supports(num_reqs, padded_num_reqs, steps):
+            return f"backend refused {num_reqs} rows (bucket {padded_num_reqs})"
+        return None
+
+    def _check_multistep_decode(self) -> None:
+        """Refuse what multi-step decode bursts cannot serve; the scheduler
+        side (async scheduling, no spec decode, PP or DP) is refused by the
+        platform hook."""
+        refusals = {
+            "TPU_GREEDY_TOP_TOKENS is off": self._greedy_head_owner is None,
+            "a pooling model": self.is_pooling_model,
+            "a KV connector": has_kv_transfer_group(),
+            "LoRA": self.lora_config is not None,
+            "prefill context parallelism": self._pcp_enabled,
+            "M-RoPE": self.uses_mrope,
+            "multimodal inputs": self.supports_mm_inputs,
+            "recurrent-state layers": any(
+                isinstance(m, MambaBase) for m in self.model.modules()
+            ),
+        }
+        refused = [reason for reason, hit in refusals.items() if hit]
+        if refused:
+            raise ValueError(
+                "TPU_MULTISTEP_DECODE decodes greedy top tokens of plain "
+                f"attention models; this server has {', '.join(refused)}."
+            )
+        logger.info(
+            "Multi-step decode: up to %d greedy tokens per request per step (%s).",
+            envs.TPU_MULTISTEP_DECODE,
+            "K-step decode backend"
+            if self.k_step_decode_backend is not None
+            else "XLA programs per iteration",
+        )
+
+    def _decode_bucket_shapes(self) -> list[tuple[int, int]]:
+        """(padded tokens, padded requests) of every decode-only step."""
+        assert self.num_reqs_max_model_len is not None
+        shapes = {
+            (
+                _get_padded_token_len(self.num_tokens_paddings, n),
+                _get_padded_num_reqs_with_upper_limit(n, self.max_num_reqs),
+            )
+            for n in range(1, min(self.max_num_reqs, self.num_reqs_max_model_len) + 1)
+        }
+        return sorted(shapes)
+
+    def _precompile_multistep_decode(self) -> None:
+        """The advance and token-stacking programs of every decode bucket."""
+        if envs.TPU_MULTISTEP_DECODE <= 1:
+            return
+        assert self.num_reqs_max_model_len is not None
+        # One seq_lens length per context bucket (_prepare_inputs).
+        seq_lens_lengths = {self.num_reqs_max_model_len}
+        if self.num_reqs_most_model_len is not None:
+            seq_lens_lengths.add(self.num_reqs_most_model_len)
+        shapes = self._decode_bucket_shapes()
+
+        def zeros(*shape: int, dtype: torch.dtype) -> torch.Tensor:
+            return torch.zeros(shape, dtype=dtype).to(self.device)
+
+        with self._precompile_timed("multi-step decode helpers"):
+            for (num_tokens, num_reqs), seq_lens_len in itertools.product(
+                shapes, sorted(seq_lens_lengths)
+            ):
+                out = multistep_decode.advance_decode_inputs(
+                    zeros(num_reqs, 1, dtype=torch.int64),
+                    zeros(num_tokens, dtype=self.input_ids_cpu.dtype),
+                    zeros(num_tokens, dtype=self.positions_cpu.dtype),
+                    zeros(seq_lens_len, dtype=self.seq_lens_cpu.dtype),
+                )
+                synchronize_tensors(list(out))
+            for num_reqs in sorted({r for _, r in shapes}):
+                tokens = zeros(num_reqs, 1, dtype=torch.int64)
+                for k in range(1, envs.TPU_MULTISTEP_DECODE + 1):
+                    if self.k_step_decode_backend is not None:
+                        block = zeros(num_reqs, k, dtype=torch.int64)
+                        out = multistep_decode.stack_tokens([block])
+                        synchronize_tensors(list(out))
+                    if k > 1:
+                        out = multistep_decode.stack_tokens([tokens] * k)
+                        synchronize_tensors(list(out))
+
+    def _precompile_k_step_decode_backend(self) -> None:
+        """The K-step decode backend's own programs (its ``warmup``)."""
+        if self.k_step_decode_backend is None:
+            return
+        with (
+            set_vllm_model_wrapper_context(
+                mesh=self.mesh,
+                vllm_config=self.vllm_config,
+                kv_cache_bundle=self._kv_cache_bundle,
+            ),
+            self._precompile_timed("K-step decode backend"),
+        ):
+            self.k_step_decode_backend.warmup(kv_caches=self.kv_caches)
+
+    def _decode_burst_iterations(
+        self,
+        burst: int,
+        first_tokens: torch.Tensor,
+        input_ids: torch.Tensor,
+        attn_metadata: dict[str, Any],
+        layout_plan: Any,
+        logits_indices: torch.Tensor,
+        num_reqs: int,
+        num_tokens_padded: int,
+    ) -> list[torch.Tensor]:
+        """Iterations 1 .. burst - 1 of a burst's decode chunk, after the
+        first's greedy tokens: the same compiled backbone and top-token
+        programs, each on the previous iteration's tokens one position later.
+        Returns every iteration's ``[padded_num_reqs, 1]`` tokens."""
+        if layout_plan.kind is not SequenceLayoutKind.ALL:
+            raise RuntimeError(
+                "TPU_MULTISTEP_DECODE needs the default sequence layout, got "
+                f"{layout_plan.kind}"
+            )
+        tokens = [first_tokens]
+        positions = self.position_ids
+        seq_lens = self._attn_metadata_builder_ctx.seq_lens
+        for j in range(1, burst):
+            input_ids, positions, seq_lens = multistep_decode.advance_decode_inputs(
+                tokens[-1], input_ids, positions, seq_lens
+            )
+            metadata = multistep_decode.advance_metadata(
+                attn_metadata, positions, seq_lens
+            )
+            with (
+                set_forward_context(
+                    metadata,
+                    self.vllm_config,
+                    num_tokens=num_tokens_padded,
+                    num_tokens_across_dp=self._dp_num_tokens_across_dp(
+                        num_tokens_padded
+                    ),
+                ),
+                set_vllm_model_wrapper_context(
+                    mesh=self.mesh,
+                    vllm_config=self.vllm_config,
+                    kv_cache_bundle=self._kv_cache_bundle,
+                    query_start_loc_cpu=self.query_start_loc_np[: num_reqs + 1],
+                    seq_lens_cpu=self.seq_lens_np[:num_reqs] + j,
+                ),
+                self._stage_timing.stage("main_forward"),
+            ):
+                hidden_states, _ = self.forward_model(
+                    input_ids=input_ids, positions=positions
+                )
+            tokens.append(
+                self._top_tokens_of_hidden(hidden_states, layout_plan, logits_indices)
+            )
+        return tokens
+
+    def _top_tokens_of_hidden(
+        self,
+        hidden_states: torch.Tensor,
+        layout_plan: Any,
+        logits_indices: torch.Tensor,
+    ) -> torch.Tensor:
+        """The greedy tokens of a decode chunk's rows, by the programs the
+        chunk's first forward took (execute_model, TPU_GREEDY_TOP_TOKENS)."""
+        planner = _get_sequence_layout_planner_for_runner(self)
+        sample_hidden_states = planner.maybe_select_logits_hidden_states(
+            hidden_states, layout_plan, logits_indices
+        )
+        if sample_hidden_states is None:
+            hidden_states = planner.finalize_hidden_states(hidden_states, layout_plan)
+            return self.compute_selected_top_tokens(hidden_states, logits_indices)
+        return self.compute_top_tokens_from_hidden_states(sample_hidden_states)
 
     def _greedy_top_tokens_this_step(self) -> bool:
         # A request below min_tokens needs the full logits to mask its stops.

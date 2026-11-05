@@ -309,6 +309,59 @@ def decode_matmul_nt(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
     return _decode_matmul_nt_op(x, w)
 
 
+def _fp8_lm_head_weight_jax(w: jax.Array) -> tuple[jax.Array, jax.Array]:
+    # Per vocab row, as the checkpoint's own FP8 projections are per channel.
+    w_q, scale = quantize_tensor(w, jnp.float8_e4m3fn, dim=1)
+    return w_q.T, scale.reshape(-1)
+
+
+_fp8_lm_head_weight_op = pallas.jax_op(
+    "pallas::fp8_lm_head_weight", _fp8_lm_head_weight_jax
+)
+
+
+def _fake_fp8_lm_head_weight(w):
+    vocab, hidden = w.shape
+    return (
+        torch.empty(hidden, vocab, dtype=torch.float8_e4m3fn, device=w.device),
+        torch.empty(vocab, dtype=torch.float32, device=w.device),
+    )
+
+
+_fp8_lm_head_weight_op.register_fake(_fake_fp8_lm_head_weight)
+
+
+def fp8_lm_head_weight(w: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """An LM head's `[vocab shard, hidden]` weight as FP8 in the `(k, n)`
+    layout, `[hidden, vocab shard]`, with one f32 scale per vocab row."""
+    return _fp8_lm_head_weight_op(w)
+
+
+def _decode_fp8_lm_head_jax(x: jax.Array, w_q: jax.Array, w_s: jax.Array) -> jax.Array:
+    return decode_gemv.fp8_decode_matmul(x, w_q, w_s)
+
+
+_decode_fp8_lm_head_op = pallas.jax_op(
+    "pallas::decode_fp8_lm_head", _decode_fp8_lm_head_jax
+)
+
+
+def _fake_decode_fp8_lm_head(x, w_q, w_s):
+    del w_s
+    return torch.empty(x.shape[0], w_q.shape[1], dtype=x.dtype, device=x.device)
+
+
+_decode_fp8_lm_head_op.register_fake(_fake_decode_fp8_lm_head)
+
+
+def decode_fp8_lm_head(
+    x: torch.Tensor, w_q: torch.Tensor, w_s: torch.Tensor
+) -> torch.Tensor:
+    """The logits of a decode bucket from the FP8 copy of an LM head
+    (`fp8_lm_head_weight`), as one weight stream (`fp8_decode_matmul`)."""
+    return _decode_fp8_lm_head_op(x, w_q, w_s)
+
+
 def _decode_geglu_mlp_jax(
     attn: jax.Array,
     residual: jax.Array,
