@@ -66,15 +66,17 @@ from vllm.model_executor.layers.quantization.mxfp4 import Mxfp4Config, Mxfp4MoEM
 from vllm.model_executor.layers.quantization.utils.quant_utils import is_layer_skipped
 
 from vllm_torchtpu import envs
-from vllm_torchtpu.layers.adapter import moe_routing
+from vllm_torchtpu.layers.adapter import moe_routing, token_padding
 from vllm_torchtpu.layers.adapter.fused_moe import (
     TpuMoEActivationMixin,
     dispatches_quantized,
+    drops_padded_routes,
     fused_moe_gmm,
     prebuild_fused_moe_kernel,
     quantize_moe_dispatch_rows,
     quantize_native_fp4_kmajor,
     quantizes_moe_dispatch_rows,
+    zeroes_padding_routes,
 )
 from vllm_torchtpu.layers.adapter.pipelined_fused_moe import (
     enable_pipelined_collective_and_compute,
@@ -331,6 +333,10 @@ class VllmMxfp4MoEMethod(TpuMoEActivationMixin, Mxfp4MoEMethod):
     # was built with; both decided at weight load (dispatches_quantized).
     _quantized_dispatch: bool = False
     _onehot_moe_permute_threshold: int = 0
+    # Whether a dispatch zeroes and may drop the routes of the step's padding
+    # rows (zeroes_padding_routes, drops_padded_routes), for which the runner
+    # keeps token_padding's mask; decided at weight load.
+    reads_token_padding_mask: bool = False
 
     def _forward_monolithic_tpu(
         self,
@@ -360,7 +366,24 @@ class VllmMxfp4MoEMethod(TpuMoEActivationMixin, Mxfp4MoEMethod):
         dispatches_routes = not enable_pipelined_collective_and_compute() and (
             moe_routing.routes_before_dispatch(self.moe)
         )
+        skip_padded_tokens = None
         if dispatches_routes:
+            if self.reads_token_padding_mask and zeroes_padding_routes(
+                self.moe.is_sequence_parallel
+            ):
+                topk_ids, topk_weights = (
+                    token_padding.zero_local_routing_weights_for_padding(
+                        topk_ids, topk_weights
+                    )
+                )
+                if drops_padded_routes(
+                    x.shape[0],
+                    layer.moe_config.experts_per_token,
+                    self._onehot_moe_permute_threshold,
+                ):
+                    # No expert computes a padding row and the combine sums
+                    # nothing for it; the other tokens' outputs are unchanged.
+                    skip_padded_tokens = True
             if (
                 self._quantized_dispatch
                 and x.dtype == torch.bfloat16
@@ -392,6 +415,7 @@ class VllmMxfp4MoEMethod(TpuMoEActivationMixin, Mxfp4MoEMethod):
             "topk": layer.moe_config.experts_per_token,
             "activation": activation_str,
             "rhs_quant_dtype": self.rhs_quant_dtype,
+            "skip_padded_tokens": skip_padded_tokens,
         }
         if enable_pipelined_collective_and_compute():
             return pipelined_fused_moe_gmm(**kwargs)
@@ -762,6 +786,20 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
             )
         )
         self._onehot_moe_permute_threshold = resolve_onehot_permute_threshold()
+        # The GMM path's EP experts, where the routes are dispatched.
+        self.reads_token_padding_mask = (
+            op is None
+            and layer._experts_start is not None
+            and moe_routing.routes_before_dispatch(self.moe)
+        )
+        if self.reads_token_padding_mask:
+            prebuild_fused_moe_kernel(
+                topk=layer.moe_config.experts_per_token,
+                activation=activation_str,
+                use_ep=True,
+                rhs_quant_dtype=jnp.float4_e2m1fn,
+                skip_padded_tokens=True,
+            )
 
         setattr(self, FUSED_MOE_EP_OP_ATTR, op)
         if op is not None:

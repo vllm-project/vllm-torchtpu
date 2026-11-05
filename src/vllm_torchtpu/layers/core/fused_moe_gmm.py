@@ -87,16 +87,24 @@ _ONEHOT_AUTO_CAP = 512
 # Fixed at import, like the other MoE algorithm selectors.
 _DENSE_EXPERT_THRESHOLD = envs.TPU_MOE_DENSE_EXPERT_THRESHOLD
 # Smallest EP token count whose v2 combine runs on the TensorCore (0: never).
-# On DSv4-Flash DP8 the static estimate at 2048 tokens is ~45 us (kernel plus
-# routing tables) against ~90 us of SparseCore v2 plus convert; decode at the
-# 1024-token bucket keeps v2. A decode step of 2048 tokens takes it too.
+# On DSv4-Flash DP8 decode (512 and 1024 gathered tokens) the TensorCore waits
+# 13-64 us per MoE layer for SparseCore v2 and then converts its f32 output
+# for another 10-18 us; the TensorCore kernel writes bf16 itself, at ~2 us per
+# 128-token block (measured at 8192 tokens) plus ~2 us of route tables.
+# Smaller counts are unmeasured (the one-hot path takes up to 511 routes).
 TC_COMBINE_MIN_TOKENS = envs.TPU_MOE_TC_COMBINE_MIN_TOKENS
+# From this EP token count, the dispatch moves rows quantized ahead
+# (dispatches_quantized_rows). This takes in the decode buckets (512 and 1024
+# gathered tokens on DSv4-Flash DP8), whose bf16 rows otherwise all-gather in
+# twice the bytes and are then relaid out for the fused MLP's token rows.
+DISPATCH_SPLIT_MIN_TOKENS = 512
 # From this EP token count, the expert MLP reads the routed rows straight
 # from the tokens' rows (gmm_v2_fused_mlp's token_rows), past the first
-# DISPATCH_HEAD_ROWS that the SparseCore gathers ahead. Below it the full
-# SparseCore gather is short and the TensorCore has other work to hide it
-# behind.
-DISPATCH_SPLIT_MIN_TOKENS = 4096
+# DISPATCH_HEAD_ROWS that the SparseCore gathers ahead. 0 admits every
+# batch; a larger value has the SparseCore gather all rows of smaller ones
+# first (to compare the two paths). At most DISPATCH_SPLIT_MIN_TOKENS: only
+# this path reads quantized rows.
+TOKEN_ROWS_MIN_TOKENS = 0
 # Whole 2048-row ragged_gather_v2 blocks, and whole 16-row sublane blocks as
 # gmm_v2_fused_mlp's head must be, or 0 (the default): no SparseCore gather,
 # the MLP fetches every row. A head can only start once the dispatch
@@ -105,6 +113,14 @@ DISPATCH_HEAD_ROWS = 0
 # The dtype an EP batch's rows may arrive quantized to, as int32 words
 # (quantize_dispatch_rows), as the fused MLP's gate/up leg quantizes them.
 DISPATCH_QUANT_DTYPE = jnp.float8_e4m3fn
+# Largest EP token count whose padding rows route to no expert
+# (skips_padded_tokens). On DSv4-Flash DP8 decode (up to 1024 gathered tokens)
+# about a third of the rows are padding, which repeat one token and so route
+# alike: a few experts on one or two ranks get hundreds of extra rows, and
+# those ranks run the expert MLP and the combine longest while the combine's
+# reduce-scatter waits for them. Prefill chunks keep their routes: they fill
+# the token budget, so they carry little padding to drop.
+SKIP_PADDED_MAX_TOKENS = 1024
 # Fixed at import: build the MoE permutation from one packed sort.
 _SINGLE_SORT = envs.TPU_MOE_SINGLE_SORT
 # Above 2,048 routed rows, the inverse-permutation scatter costs more than
@@ -199,6 +215,23 @@ def dispatches_quantized_rows(
         and num_tokens >= DISPATCH_SPLIT_MIN_TOKENS
         and num_routes > onehot_moe_permute_threshold
         and token_rows_fit_smem(num_routes, QUANTIZE_ROWS_ALIGN, ROWS_PER_WORD)
+    )
+
+
+def skips_padded_tokens(
+    num_local_tokens: int, world_size: int, topk: int, onehot_moe_permute_threshold: int
+) -> bool:
+    """Whether an EP batch of num_local_tokens rows per rank, over world_size
+    ranks, routes its padding rows to no expert: they reach fused_moe_func
+    with zero routing weights, under skip_padded_tokens. Every other token's
+    output keeps its bits, which needs a combine that sums each token's own
+    routes in route order: not the one-hot unpermute, one matmul over all
+    routes. Integer arithmetic only: callers ask it of a traced token count.
+    """
+    num_tokens = num_local_tokens * world_size
+    return (
+        num_tokens <= SKIP_PADDED_MAX_TOKENS
+        and num_tokens * topk > onehot_moe_permute_threshold
     )
 
 
@@ -819,9 +852,9 @@ def moe_gmm(
             )
             return (combine @ gmm2_res).astype(dtype)
         if _runs_tc_combine(gmm2_res, topk_weights_flat, num_tokens, topk):
-            # Same result as v2's SparseCore kernel (v2 falls back to XLA only
-            # for inputs far smaller than this). The TensorCore would otherwise
-            # idle while the SparseCore runs v2, and it sums the rows sooner.
+            # Same result as v2's SparseCore kernel; v2's XLA fallback (sources
+            # under 0.3x VMEM) may round differently. The TensorCore would
+            # otherwise idle while the SparseCore runs v2, and it sums sooner.
             return gather_unpermute(
                 gmm2_res,
                 argsort_revert_indices,
@@ -978,14 +1011,15 @@ def fused_moe_func(
         return _piece_major(out, piece_rows) if piece_rows else out
 
     num_routes = num_tokens * topk
-    # Large batches (prefill chunks; the count is of tokens gathered across
-    # EP ranks): the fused MLP fetches the routed rows itself, past a head of
-    # DISPATCH_HEAD_ROWS the SparseCore gathers first if that is not 0.
+    # The fused MLP fetches the routed rows itself (the count is of tokens
+    # gathered across EP ranks), past a head of DISPATCH_HEAD_ROWS the
+    # SparseCore gathers first if that is not 0.
     dispatch_head_only = (
         use_ep
         and use_sparse_core
-        and num_tokens >= DISPATCH_SPLIT_MIN_TOKENS
+        and num_tokens >= TOKEN_ROWS_MIN_TOKENS
         and num_routes > onehot_moe_permute_threshold
+        and num_routes >= DISPATCH_HEAD_ROWS
         and padded_hidden_size == hidden_size
         # Whole 32-bit words of rows (two bf16 or four fp8 rows each).
         and num_tokens % (4 // jnp.dtype(row_dtype).itemsize) == 0

@@ -5221,7 +5221,13 @@ class TPUModelRunner(GPUModelRunner):
             )
             for module in self.model.modules()
         )
-        if envs.TPU_MOE_SKIP_PADDED_TOKENS or uses_mxfp4_moe:
+        reads_padding_mask = any(
+            getattr(
+                getattr(module, "quant_method", None), "reads_token_padding_mask", False
+            )
+            for module in self.model.modules()
+        )
+        if envs.TPU_MOE_SKIP_PADDED_TOKENS or uses_mxfp4_moe or reads_padding_mask:
             self._token_padding_state = token_padding.TokenPaddingState.create(
                 self.max_num_tokens, self.device
             )

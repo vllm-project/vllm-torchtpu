@@ -63,7 +63,7 @@ if TYPE_CHECKING:
     TPU_MOE_SINGLE_SORT: bool = True
     USE_MOE_TP_DECODE_KERNEL: bool = False
     RAGGED_GATHER_REDUCE_VERSION: str = "v2"
-    TPU_MOE_TC_COMBINE_MIN_TOKENS: int = 2048
+    TPU_MOE_TC_COMBINE_MIN_TOKENS: int = 512
     USE_PHASED_PROFILER: bool = False
     TPU_KERNEL_ITER_MODE: bool = False
     TPU_KERNEL_RELOAD_MODULES: str = ""
@@ -653,7 +653,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Smallest EP token count (after the DP all-gather) at which the v2 combine
     # runs as the TensorCore kernel kernels/megablox/moe_gather_unpermute.py
     # instead, with the same result. 0 keeps the SparseCore kernel everywhere.
-    "TPU_MOE_TC_COMBINE_MIN_TOKENS": env_int("TPU_MOE_TC_COMBINE_MIN_TOKENS", 2048),
+    "TPU_MOE_TC_COMBINE_MIN_TOKENS": env_int("TPU_MOE_TC_COMBINE_MIN_TOKENS", 512),
     # Capture one trace per inference phase instead of one continuous trace.
     # The trace directory and iteration limits come from `profiler_config`;
     # this only selects which profiler consumes them.
