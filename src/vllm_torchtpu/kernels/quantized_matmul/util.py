@@ -310,6 +310,11 @@ def quantize_block(data, axis, target_dtype):
     dtype_max, dtype_min = get_max_min(target_dtype)
     scale = abs_max / dtype_max
     scale = jnp.where(scale == 0, 1.0, scale)
+    # Prevent XLA multi-output fusion from merging `convert(data, f32)` into
+    # the `abs_max` reduction fusion, which otherwise spills a 2x-larger
+    # f32[M, K] activation copy to HBM and executes upstream layout transposes
+    # at 4 bytes/elem instead of bf16 (2 bytes/elem).
+    data, scale = jax.lax.optimization_barrier((data, scale))
 
     if jnp.issubdtype(target_dtype, jnp.floating):
         data_q = (data / scale).clip(dtype_min, dtype_max).astype(target_dtype)
