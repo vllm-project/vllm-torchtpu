@@ -322,14 +322,24 @@ def prepare_routed_gmm_inputs(
     if argsort_revert_indices is not None:
         group_sizes_local = bucket_counts[:local_num_experts]
     else:
-        argsort_revert_indices = jnp.argsort(sorted_indices)
+        # `sorted_indices` is a permutation: scattering the positions through
+        # it inverts it exactly, without a second sort.
+        assert sorted_indices is not None
+        argsort_revert_indices = (
+            jnp.zeros_like(sorted_indices)
+            .at[sorted_indices]
+            .set(
+                jnp.arange(sorted_indices.shape[0], dtype=sorted_indices.dtype),
+                unique_indices=True,
+            )
+        )
         topk_indices_for_count = jnp.where(valid_mask, topk_indices_flat, 0)
         group_sizes_local = jax.nn.one_hot(
             topk_indices_for_count, local_num_experts, dtype=jnp.int32
         ) * valid_mask[:, None].astype(jnp.int32)
         group_sizes_local = group_sizes_local.sum(axis=0)
 
-    if packable:
+    if sorted_indices is None:
         # Packing (key, token) into one int32 keeps the payload out of the sort
         # and drops the follow-up gather. Equal packed values carry the same
         # token id, so their order cannot matter.
@@ -338,6 +348,8 @@ def prepare_routed_gmm_inputs(
         )
         token_indices_sorted = jnp.bitwise_and(packed, (1 << token_bits) - 1)
     else:
+        # The argsort is stable, so each expert's tokens stay in ascending
+        # token order: the (key, token) order of the packed sort.
         token_indices_sorted = token_indices_flat[sorted_indices]
 
     if use_ep and use_sparse_core:

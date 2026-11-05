@@ -13,6 +13,7 @@
 # limitations under the License.
 """Tests for the local-routing fused MoE GMM wrapper."""
 
+import functools
 import types
 from unittest.mock import patch
 
@@ -1052,6 +1053,86 @@ def test_prepare_routed_onehot_permute_matches_plain_gather():
     # match the plain gather bit-for-bit and the routing metadata is shared.
     for got, want in zip(onehot_out, plain_out):
         np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
+
+
+def _two_sort_packed_routing(topk_indices, topk_weights, local_num_experts, valid):
+    """Reference routing order: argsort, its argsort, and a packed (key, token) sort."""
+    num_tokens, topk = topk_indices.shape
+    sort_keys = jnp.where(valid, topk_indices.reshape(-1), local_num_experts)
+    revert = jnp.argsort(jnp.argsort(sort_keys))
+    token_bits = max(1, (num_tokens - 1).bit_length())
+    tokens = jnp.arange(num_tokens, dtype=jnp.int32).repeat(topk)
+    packed = jax.lax.sort(
+        jnp.left_shift(sort_keys, token_bits) | tokens, is_stable=False
+    )
+    return revert, jnp.bitwise_and(packed, (1 << token_bits) - 1)
+
+
+@pytest.mark.parametrize(
+    ("num_tokens", "topk", "local_num_experts"),
+    [(1, 1, 1), (3, 2, 4), (12, 10, 64), (24, 10, 64), (48, 8, 16), (240, 10, 64)],
+)
+@pytest.mark.parametrize("skip_padded_tokens", [False, True])
+@pytest.mark.parametrize(
+    ("use_ep", "use_sparse_core"), [(True, True), (True, False), (False, False)]
+)
+def test_unpacked_routing_matches_two_sort_packed_reference(
+    num_tokens, topk, local_num_experts, skip_padded_tokens, use_ep, use_sparse_core
+):
+    """Below the one-hot threshold the routing order is bitwise the reference's."""
+    hidden = 16
+    prepare = jax.jit(
+        functools.partial(
+            prepare_routed_gmm_inputs,
+            local_num_experts=local_num_experts,
+            topk=topk,
+            use_ep=use_ep,
+            use_sparse_core=use_sparse_core,
+            onehot_moe_permute_threshold=num_tokens * topk,
+            skip_padded_tokens=skip_padded_tokens,
+        )
+    )
+    reference = jax.jit(_two_sort_packed_routing, static_argnums=2)
+    for seed in range(16):
+        rng = np.random.default_rng(seed)
+        # -1 marks experts owned by another EP rank; repeats within a token
+        # and empty experts are kept on purpose.
+        ids = rng.integers(0, local_num_experts, size=(num_tokens, topk))
+        ids[rng.random((num_tokens, topk)) < (seed % 4) / 4] = -1
+        weights = rng.random((num_tokens, topk)).astype(np.float32)
+        # Padded tokens keep their expert ids but carry zero routing weights.
+        weights[num_tokens - rng.integers(0, num_tokens // 2 + 1) :] = 0.0
+        hidden_states = jnp.asarray(
+            rng.standard_normal((num_tokens, hidden)), dtype=jnp.bfloat16
+        )
+        topk_indices = jnp.asarray(ids, dtype=jnp.int32)
+        topk_weights = jnp.asarray(weights)
+
+        x, group_sizes, revert, weights_flat, valid, tokens_sorted = prepare(
+            hidden_states, topk_indices, topk_weights
+        )
+
+        want_valid = ids.reshape(-1) >= 0
+        if skip_padded_tokens:
+            want_valid &= weights.reshape(-1) != 0
+        want_revert, want_tokens = reference(
+            topk_indices, topk_weights, local_num_experts, jnp.asarray(want_valid)
+        )
+        np.testing.assert_array_equal(np.asarray(revert), np.asarray(want_revert))
+        np.testing.assert_array_equal(
+            np.asarray(tokens_sorted), np.asarray(want_tokens)
+        )
+        np.testing.assert_array_equal(
+            np.asarray(x), np.asarray(hidden_states)[np.asarray(want_tokens)]
+        )
+        np.testing.assert_array_equal(np.asarray(valid), want_valid)
+        np.testing.assert_array_equal(np.asarray(weights_flat), weights.reshape(-1))
+        np.testing.assert_array_equal(
+            np.asarray(group_sizes),
+            np.bincount(
+                ids.reshape(-1)[want_valid], minlength=local_num_experts
+            ).astype(np.int32),
+        )
 
 
 def test_moe_gmm_onehot_combine_matches_plain_reduce(monkeypatch):

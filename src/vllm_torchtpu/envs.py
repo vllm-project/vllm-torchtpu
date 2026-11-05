@@ -73,6 +73,7 @@ if TYPE_CHECKING:
     MIXED_Q_SPLIT: int | None = None
     MIXED_NUM_QUERIES_PER_BLOCK: int | None = None
     MIXED_NUM_KV_PAGES_PER_BLOCK: int | None = None
+    TPU_BATCHED_RPA_DECODE_BLOCK: tuple[int, int, int] | None = None
     TPU_MLA_MASKED_DENSE_ENABLED: bool = False
     TPU_MLA_MASKED_DENSE_ANALYTIC_MAX_KV_LEN: int | None = None
     TPU_MLA_MASKED_DENSE_MAX_KV_LEN: int | None = None
@@ -366,6 +367,21 @@ def env_positive_int_or_none(env_name: str) -> Callable[[], int | None]:
     return _get_positive_int_or_none_env
 
 
+def _get_batched_rpa_decode_block() -> tuple[int, int, int] | None:
+    """Parse TPU_BATCHED_RPA_DECODE_BLOCK as three positive integers."""
+    value = os.getenv("TPU_BATCHED_RPA_DECODE_BLOCK", "").strip()
+    if not value:
+        return None
+    parts = value.split(",")
+    if len(parts) != 3 or not all(p.strip().isdigit() and int(p) > 0 for p in parts):
+        raise ValueError(
+            f"Invalid value '{value}' for TPU_BATCHED_RPA_DECODE_BLOCK: "
+            "expected 'bkv,batch,buffers' with positive integers."
+        )
+    bkv, batch, buffers = (int(p) for p in parts)
+    return bkv, batch, buffers
+
+
 def _get_nan_log_level() -> NanLogLevel:
     value = os.getenv("TPU_NAN_LOG_LEVEL", "0")
     if value not in ("0", "1", "2", "3", "4"):
@@ -604,6 +620,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "MIXED_Q_SPLIT": env_optional_int("MIXED_Q_SPLIT"),
     "MIXED_NUM_QUERIES_PER_BLOCK": env_optional_int("MIXED_NUM_QUERIES_PER_BLOCK"),
     "MIXED_NUM_KV_PAGES_PER_BLOCK": env_optional_int("MIXED_NUM_KV_PAGES_PER_BLOCK"),
+    # Decode block of the batched RPA kernel as "bkv,batch,buffers": KV tokens
+    # per block, sequences per block, buffers. Unset keeps the kernel default.
+    # 8192,4,2 is faster at >= 64K tokens per sequence, slower at 24 x 32K.
+    "TPU_BATCHED_RPA_DECODE_BLOCK": _get_batched_rpa_decode_block,
     # Opt in to GLM-5.2's measured masked-dense sparse-MLA prefill routing.
     # Off by default until the model and hardware scope of the cost model is
     # broadened or selected automatically from an explicit model profile.
