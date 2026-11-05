@@ -2899,6 +2899,7 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
 
         topk_indices = kwargs.get("topk_indices")
         q_dcp_replicated = kwargs.get("q_dcp_replicated")
+        ql_nope_absorbed = kwargs.get("ql_nope_absorbed")
         use_qrep = uses_query_replication(self, q_dcp_replicated, topk_indices)
         q_rope_table: list[torch.Tensor] = []
         if use_qrep:
@@ -2938,6 +2939,8 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
             # head it reads, so XLA never relays out the whole q head.
             ql_nope, q_pe = _absorb_q_head(q_pe.flatten(1), w_uk_t_src.to(q_pe.dtype))
             ql_nope = ql_nope.to(input_dtype)
+        elif ql_nope_absorbed is not None:
+            ql_nope = ql_nope_absorbed.to(input_dtype)
         elif q_nope.device.type == "tpu" and w_uk_t_scale is None:
             ql_nope = _absorb_q(q_nope, w_uk_t_src.to(q_nope.dtype)).to(input_dtype)
         else:
