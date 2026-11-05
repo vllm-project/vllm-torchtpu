@@ -49,8 +49,6 @@ import jax.numpy as jnp
 import torch
 from jax.sharding import PartitionSpec
 from torch_tpu._internal.pallas import jax_op
-
-import vllm_torchtpu.envs as envs
 from vllm_torchtpu.distributed.ep_mesh import (
     EP_AXIS_NAME,
     build_ep_mesh,
@@ -58,13 +56,15 @@ from vllm_torchtpu.distributed.ep_mesh import (
     ep_rank_order,
     ep_token_replica_groups,
 )
+from vllm_torchtpu.logger import init_logger
+
+import vllm_torchtpu.envs as envs
 from vllm_torchtpu.kernels.fused_moe.v2.host import (
     PACK4,
     U32_SUBLANE_TILE,
     token_gather_smem_bytes,
 )
 from vllm_torchtpu.layers.adapter import token_padding
-from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
 
@@ -177,6 +177,8 @@ def _build_op(
     has_hash_ids=False,
     *,
     token_replica_groups=None,
+    wire_dtype=None,
+    ep_tp_size: int = 1,
 ):
     """The op for this closure, built once per distinct closure and reused."""
     from vllm_torchtpu.kernels.fused_moe.v2 import WeightFormat, fused_ep_moe_v2
@@ -194,6 +196,8 @@ def _build_op(
         routed_scaling_factor,
         has_hash_ids,
         token_replica_groups,
+        wire_dtype,
+        ep_tp_size,
     )
     cached = _OPS.get(key)
     if cached is not None:
@@ -207,6 +211,10 @@ def _build_op(
     routing_kw = dict(
         scoring_fn=scoring_fn, routed_scaling_factor=routed_scaling_factor
     )
+    if wire_dtype is not None:
+        routing_kw["wire_dtype"] = wire_dtype
+    if ep_tp_size != 1:
+        routing_kw["ep_tp_size"] = ep_tp_size
 
     def call(x, w1, w2, w1_scale, w2_scale, gating, rank, **bias_kw):
         # The router's top-k selector writes into an f32 accumulator ref, so a
@@ -692,6 +700,107 @@ def prebuild_fused_moe_ep(
             envs.TPU_MOE_COLLECTION_CHUNK_SIZE,
         )
     return op
+
+
+def build_sequence_parallel_op(layer, topk: int, renormalize: bool, activation: str):
+    """The fused EP op over this rank's OWN tokens, with a bf16 result wire,
+    for TPU_MOE_PREFILL_SEQUENCE_PARALLEL (`moe_prefill_sp`).
+
+    Unlike `prebuild_fused_moe_ep` this neither reads USE_MOE_FUSED_EP_KERNEL
+    nor arms the layer: the op is recorded by the caller and only the
+    sequence-parallel buckets call it, so `fused_moe_ep_supported` stays False
+    and the other buckets keep the grouped-matmul path and its collectives.
+    Every refusal raises, naming the reason. Call at load, outside Dynamo.
+    """
+    global _RANK_BUFFER
+    if not layer.moe_config.moe_parallel_config.use_ep:
+        raise ValueError("the experts are not expert-parallel")
+    mesh = build_ep_mesh()
+    if mesh is None:
+        raise ValueError("there is no EP group")
+    mesh_size = mesh.shape[EP_AXIS_NAME]
+    ep_tp = int(getattr(layer.moe_config.moe_parallel_config, "tp_size", 1))
+    if ep_tp < 1 or mesh_size % ep_tp:
+        raise ValueError(
+            f"EP mesh size {mesh_size} is not divisible by MoE tp_size={ep_tp}"
+        )
+    ep = mesh_size // ep_tp
+    needed_smem = _SMEM_OVERHEAD_BYTES + token_gather_smem_bytes(_TILE_M)
+    if needed_smem > _smem_capacity_bytes():
+        raise ValueError(
+            f"the routing working set needs {needed_smem} B of SMEM, the chip "
+            f"has {_smem_capacity_bytes()} B"
+        )
+    weights = (
+        layer.w13_weight,
+        layer.w2_weight,
+        layer.w13_weight_scale_inv,
+        layer.w2_weight_scale_inv,
+    )
+    if layer.global_num_experts != weights[0].shape[0] * ep:
+        raise ValueError(
+            f"{layer.global_num_experts} global experts do not split into "
+            f"equal blocks of {weights[0].shape[0]} over ep={ep}"
+        )
+    reason = fused_moe_ep_unsupported_reason(layer, weights, activation)
+    if reason is not None:
+        raise ValueError(reason)
+    mesh_expert_order = _mesh_expert_order(mesh_size)
+    if ep_tp > 1 and mesh_expert_order is not None:
+        raise ValueError("ep_tp_size > 1 requires a rank-ordered EP mesh")
+    if _RANK_BUFFER is None:
+        _RANK_BUFFER = torch.tensor(
+            [[ep_mesh_index()]], dtype=torch.int32, device=layer.w13_weight.device
+        )
+    scoring_fn, has_score_bias, routed_scale = _routing_config(layer)
+    return _build_op(
+        mesh,
+        topk,
+        renormalize,
+        activation,
+        mesh_expert_order,
+        # Always the sharded routing plan: same outputs, and 0.86 vs 1.12 ms
+        # per GLM-5.2 layer at 4096 tokens on a 2x2x2 slice.
+        True,
+        "fp8",
+        None,
+        scoring_fn,
+        has_score_bias,
+        routed_scale,
+        False,
+        token_replica_groups=ep_token_replica_groups(is_sequence_parallel=True),
+        wire_dtype=None if envs.TPU_MOE_PREFILL_SP_FP8_WIRE else jnp.bfloat16,
+        ep_tp_size=ep_tp,
+    )
+
+
+def rank_operand() -> torch.Tensor:
+    """This rank's EP mesh index as the int32 [1, 1] operand the op takes."""
+    assert _RANK_BUFFER is not None, "build the fused EP op first"
+    return _RANK_BUFFER
+
+
+def run_sequence_parallel_op(
+    op,
+    hidden_states: torch.Tensor,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    w1_scale: torch.Tensor,
+    w2_scale: torch.Tensor,
+    router_logits: torch.Tensor,
+    rank: torch.Tensor,
+    score_bias: torch.Tensor | None,
+) -> torch.Tensor:
+    """`op` (from `build_sequence_parallel_op`) on this rank's own rows; the
+    result is this rank's rows combined over every expert, unscaled by the
+    runner's routed scale. `score_bias` must be passed exactly when the layer
+    has one (the op's arity was built around it)."""
+    scales = (
+        _squeeze_channel_scale_checked(w1_scale),
+        _squeeze_channel_scale_checked(w2_scale),
+    )
+    extra = () if score_bias is None else (score_bias,)
+    return op(hidden_states, w1, w2, *scales, router_logits, rank, *extra)
 
 
 def fused_moe_ep_unsupported_reason(

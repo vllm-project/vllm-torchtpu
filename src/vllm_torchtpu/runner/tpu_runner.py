@@ -5365,6 +5365,11 @@ class TPUModelRunner(GPUModelRunner):
 
                 arm_runner_models(self)
 
+        if envs.TPU_MOE_PREFILL_SEQUENCE_PARALLEL:
+            from vllm_torchtpu.layers.adapter import moe_prefill_sp
+
+            moe_prefill_sp.arm(self.model, self.vllm_config)
+
     def _initialize_pallas_kernels(self):
         self._initialize_attention_kernels()
         self._initialize_quantization_kernels()

@@ -48,6 +48,9 @@ All environment variables read by `vllm-torchtpu` are declared and validated in 
 | `MOE_FUSED_EP_ENABLE_W4A8` | `False` | Enables 4-bit weight / 8-bit activation (`W4A8`) execution in the fused EP MoE kernel. |
 | `TPU_MOE_HIERARCHICAL_EP` | `False` | Enables two-level intra-chip / inter-chip hierarchical Expert Parallelism on dual-core TPU v7x hosts. |
 | `TPU_MOE_SEQUENCE_PARALLEL` | `False` | Enables sequence parallelism around MoE blocks. |
+| `TPU_MOE_PREFILL_SEQUENCE_PARALLEL` | `False` | Shards the residual stream across TP around MoE blocks on prefill buckets (`>= 1024` tokens) for DeepSeek-V2 MLA + MoE models. |
+| `TPU_MOE_PREFILL_SP_SHARED_GROUP` | `1` | Tensor-parallel subgroup size for the shared expert under `TPU_MOE_PREFILL_SEQUENCE_PARALLEL`. |
+| `TPU_MOE_PREFILL_SP_FP8_WIRE` | `False` | Uses `fp8` combine wire instead of `bfloat16` in `fused_ep_moe_v2` under `TPU_MOE_PREFILL_SEQUENCE_PARALLEL`. |
 | `TPU_ONE_ROW_ALL_REDUCE` | `False` | Exchanges a single valid decode row (`n_valid == 1`) in one round of remote copies in `moe_tp_decode` and `fp8_oproj_all_reduce`. |
 | `TPU_MOE_ROUTER_TOPK` | `"rowmax"` | MoE router top-k kernel implementation (`"rowmax"` or standard top-k). |
 | `TPU_MOE_FP8_ALL_GATHER` | `False` | Performs MoE activation all-gather in `fp8` before expert computation. |

@@ -33,10 +33,10 @@ from torch_tpu._internal.compile._backend import TpuBackend
 from vllm.compilation.compiler_interface import CompilerInterface
 from vllm.config import VllmConfig
 from vllm.config.utils import Range
+from vllm_torchtpu.logger import init_logger
 
 from vllm_torchtpu import envs, utils
 from vllm_torchtpu.compilation import shape_variants
-from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
 
@@ -313,6 +313,7 @@ _RUNTIME_CACHE_KEY_PATHS = (
     # Same for the TP decode MoE op, whose body this module builds.
     "vllm_torchtpu/layers/adapter/moe_tp_decode.py",
     "vllm_torchtpu/layers/adapter/dcp_token_parallel_op.py",
+    "vllm_torchtpu/layers/adapter/moe_prefill_sp.py",
     "vllm_torchtpu/layers/adapter/small_all_reduce_op.py",
     # The HBM-streaming LM head op.
     "vllm_torchtpu/layers/adapter/lm_head_hbm.py",
