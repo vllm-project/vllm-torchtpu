@@ -1591,6 +1591,9 @@ def test_shared_expert_operands_reach_the_push_layer(monkeypatch):
     assert shared is not plain
     fn, kwargs = built[-1]
     assert kwargs["input_partition_specs"][-4:] == (bridge.PartitionSpec(),) * 4
+    # Two outputs, two specs: one spec fails Dynamo's output pytree at compile.
+    out_specs = kwargs["output_partition_specs"]
+    assert isinstance(out_specs, tuple) and len(out_specs) == 2
     x = jnp.ones((8, 8), dtype=jnp.bfloat16)
     weights = tuple(jnp.full((2,), i, jnp.float32) for i in range(4))
     operands = (x, None, None, None, None, jnp.zeros((8, 4)), jnp.zeros((1, 1)))
