@@ -30,6 +30,7 @@ import dataclasses
 import math
 from collections.abc import Sequence
 
+import numpy as np
 import torch
 
 ROW_SUBLANES = 4
@@ -134,10 +135,16 @@ def repack_chunks(
         )
 
 
-def _pad(values: list[int], size: int) -> list[int]:
+def _pad(values, size: int):
     # Repeat the last pair: duplicate writes of identical values are no-ops.
     # A rank can own no rows (a DCP rank of a request shorter than its page);
     # row 0 is the null page's on both sides, which nothing reads.
+    if isinstance(values, np.ndarray):
+        if values.size == 0:
+            values = np.zeros(1, dtype=np.int64)
+        return np.concatenate(
+            (values, np.full(size - len(values), values[-1], dtype=values.dtype))
+        )
     values = values or [0]
     return values + [values[-1]] * (size - len(values))
 
@@ -160,13 +167,26 @@ def main_rows(
     from ``start`` on: ``src_pages`` then begins at source page ``src_first``
     (the staged suffix), ``dst_pages`` is the full destination table.
     """
-    src, dst = [], []
+    src, dst = main_rows_np(
+        num_tokens, src_pages, src_block, dst_pages, dst_block, rank, start, src_first
+    )
+    return src.tolist(), dst.tolist()
+
+
+def main_rows_np(
+    num_tokens, src_pages, src_block, dst_pages, dst_block, rank, start=0, src_first=0
+) -> tuple[np.ndarray, np.ndarray]:
+    """``main_rows`` as int64 arrays, vectorized (a 100k-token load has a
+    row per token per layer: the Python loop took ~0.7 s per request on the
+    decode's worker thread, stalling its steps)."""
+    t = np.arange(start, num_tokens, dtype=np.int64)
     d = rank.main_dcp
-    for t in range(start, num_tokens):
-        if d > 1 and (t // dst_block) % d != rank.dcp_rank:
-            continue
-        src.append(src_pages[t // src_block - src_first] * src_block + t % src_block)
-        dst.append(dst_pages[t // (d * dst_block)] * dst_block + t % dst_block)
+    if d > 1:
+        t = t[(t // dst_block) % d == rank.dcp_rank]
+    sp = np.asarray(src_pages, dtype=np.int64)
+    dp = np.asarray(dst_pages, dtype=np.int64)
+    src = sp[t // src_block - src_first] * src_block + t % src_block
+    dst = dp[t // (d * dst_block)] * dst_block + t % dst_block
     return src, dst
 
 
@@ -192,19 +212,27 @@ def compressed_rows(
     prefix-aware load starts at the pair of token ``start`` (a pair boundary),
     with ``src_pages`` beginning at source page ``src_first``.
     """
+    src, dst = compressed_rows_np(
+        num_tokens, ratio, src_pages, src_block, dst_pages, dst_block,
+        start, src_first, dst_offset,
+    )
+    return src.tolist(), dst.tolist()
+
+
+def compressed_rows_np(
+    num_tokens, ratio, src_pages, src_block, dst_pages, dst_block,
+    start=0, src_first=0, dst_offset=0,
+) -> tuple[np.ndarray, np.ndarray]:
+    """``compressed_rows`` as int64 arrays, vectorized."""
     span = 2 * ratio
     if start % span:
         raise ValueError(f"A repack must start on a compressed pair ({span} tokens)")
     pairs = math.ceil(math.ceil(num_tokens / ratio) / 2)
-    src, dst = [], []
-    for q in range(start // span, pairs):
-        t = q * span
-        src.append(
-            src_pages[t // src_block - src_first] * src_block + (t % src_block) // span
-        )
-        dst.append(
-            dst_pages[t // dst_block] * dst_block + dst_offset + (t % dst_block) // span
-        )
+    t = np.arange(start // span, pairs, dtype=np.int64) * span
+    sp = np.asarray(src_pages, dtype=np.int64)
+    dp = np.asarray(dst_pages, dtype=np.int64)
+    src = sp[t // src_block - src_first] * src_block + (t % src_block) // span
+    dst = dp[t // dst_block] * dst_block + dst_offset + (t % dst_block) // span
     return src, dst
 
 
@@ -641,15 +669,16 @@ class StagedConsumer:
         pages); ``src_pages[owner]`` are that cache owner's staging pages and
         ``first[g]`` the source page group ``g``'s staging starts at."""
         first = first or [0] * len(self.src_groups)
-        main_s, main_d, copy_s, copy_d, gdn_s, gdn_d = [], [], [], [], [], []
+        main_s, main_d, copy_s, copy_d = [], [], [], []
+        gdn_s, gdn_d = [], []
         for name, (gi, offset) in self._dst_compressed.items():
-            s, d = compressed_rows(
+            s, d = compressed_rows_np(
                 num_tokens, self.ratio, src_pages[name],
                 self.src_block, dst_tables[gi], self.dst_block, start=skip_tokens,
                 src_first=first[self._src_owner[name]], dst_offset=offset,
             )
-            copy_s += s
-            copy_d += d
+            copy_s.append(s)
+            copy_d.append(d)
         for name, gi in self._dst_owner.items():
             kind = owner_kind(name)
             if kind == "compressed":
@@ -658,20 +687,27 @@ class StagedConsumer:
             src_first = first[self._src_owner[name]]
             dst = dst_tables[gi]
             if kind == "main":
-                s, d = main_rows(num_tokens, src, self.src_block, dst, self.dst_block,
-                                 self.rank, start=skip_tokens, src_first=src_first)
-                main_s += s
-                main_d += d
+                s, d = main_rows_np(num_tokens, src, self.src_block, dst, self.dst_block,
+                                    self.rank, start=skip_tokens, src_first=src_first)
+                main_s.append(s)
+                main_d.append(d)
             elif kind in ("ring", "ple"):
                 entry = dst[self._state_entry] if kind == "ple" else dst[0]
                 s, d = page_prefix_rows(src[0], self.src_block, entry, self.dst_block,
                                         min(self.src_block, self.dst_block))
-                copy_s += s
-                copy_d += d
+                copy_s.append(np.asarray(s, dtype=np.int64))
+                copy_d.append(np.asarray(d, dtype=np.int64))
         for name in self._gdn_names:
             gdn_s.append(src_pages[name][0])
             gdn_d.append(dst_tables[self._dst_owner[name]][self._state_entry])
-        return main_s, main_d, copy_s, copy_d, gdn_s, gdn_d
+
+        def cat(parts):
+            return np.concatenate(parts) if parts else np.zeros(0, dtype=np.int64)
+
+        return (
+            cat(main_s), cat(main_d), cat(copy_s), cat(copy_d),
+            np.asarray(gdn_s, dtype=np.int64), np.asarray(gdn_d, dtype=np.int64),
+        )
 
     def repack(self, uuid: int, dst_tables, num_tokens: int) -> None:
         pages = self.reservations[uuid]
@@ -684,7 +720,10 @@ class StagedConsumer:
         if self._op is None:
             self._op = self._build_op()
         for chunk in repack_chunks(main_s, main_d, copy_s, copy_d, gdn_s, gdn_d):
-            args = [torch.tensor(v, dtype=torch.int32).to(device) for v in chunk]
+            args = [
+                torch.from_numpy(np.ascontiguousarray(v, dtype=np.int32)).to(device)
+                for v in chunk
+            ]
             self._op(self.pool, self.staging, *args)
 
     def _build_op(self):

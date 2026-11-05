@@ -297,3 +297,63 @@ def test_packed_compressed_rows_match_kernel_pair_addressing():
     # The source rows are those of the unpacked repack.
     s0, d0 = st.compressed_rows(1024, ratio, [1, 2, 3], 3200, dst_pages, block)
     assert s == s0 and [x - slot * 64 for x in d] == d0
+
+
+def _main_rows_loop(num_tokens, src_pages, src_block, dst_pages, dst_block, rank, start=0, src_first=0):
+    src, dst = [], []
+    d = rank.main_dcp
+    for t in range(start, num_tokens):
+        if d > 1 and (t // dst_block) % d != rank.dcp_rank:
+            continue
+        src.append(src_pages[t // src_block - src_first] * src_block + t % src_block)
+        dst.append(dst_pages[t // (d * dst_block)] * dst_block + t % dst_block)
+    return src, dst
+
+
+def _compressed_rows_loop(num_tokens, ratio, src_pages, src_block, dst_pages, dst_block,
+                          start=0, src_first=0, dst_offset=0):
+    import math
+    span = 2 * ratio
+    pairs = math.ceil(math.ceil(num_tokens / ratio) / 2)
+    src, dst = [], []
+    for q in range(start // span, pairs):
+        t = q * span
+        src.append(src_pages[t // src_block - src_first] * src_block + (t % src_block) // span)
+        dst.append(dst_pages[t // dst_block] * dst_block + dst_offset + (t % dst_block) // span)
+    return src, dst
+
+
+@pytest.mark.parametrize("num_tokens,start", [(1, 0), (511, 0), (7521, 0), (196668, 0), (20000, 4096)])
+@pytest.mark.parametrize("dcp,tp_rank", [(1, 0), (4, 0), (4, 3), (4, 6)])
+def test_vectorized_rows_match_the_loop(num_tokens, start, dcp, tp_rank):
+    rng = np.random.default_rng(num_tokens + dcp + tp_rank)
+    src_block, dst_block, ratio = 3200, 512, 4
+    first = start // src_block
+    src_pages = rng.permutation(10_000)[: -(-num_tokens // src_block) - first + 1].tolist()
+    dst_pages = rng.permutation(50_000)[: -(-num_tokens // dst_block) + 1].tolist()
+    rank = st.RankSlice(tp_size=8, tp_rank=tp_rank, num_kv_heads=2, main_dcp=dcp)
+    assert st.main_rows(num_tokens, src_pages, src_block, dst_pages, dst_block, rank,
+                        start=start, src_first=first) == _main_rows_loop(
+        num_tokens, src_pages, src_block, dst_pages, dst_block, rank, start, first)
+    cstart = start - start % (2 * ratio)
+    assert st.compressed_rows(num_tokens, ratio, src_pages, src_block, dst_pages, dst_block,
+                              start=cstart, src_first=first, dst_offset=128) == _compressed_rows_loop(
+        num_tokens, ratio, src_pages, src_block, dst_pages, dst_block, cstart, first, 128)
+
+
+def test_vectorized_rows_are_fast():
+    import time
+    rank = st.RankSlice(tp_size=8, tp_rank=0, num_kv_heads=2, main_dcp=4)
+    src_pages = list(range(1, 70))
+    dst_pages = list(range(1, 400))
+    t0 = time.perf_counter()
+    for _ in range(12):  # one request's 12 main-KV layers
+        st.main_rows_np(200_000, src_pages, 3200, dst_pages, 512, rank)
+    assert time.perf_counter() - t0 < 0.1
+
+
+def test_pad_keeps_list_and_array_forms():
+    assert st._pad([3, 4], 4) == [3, 4, 4, 4]
+    assert st._pad([], 2) == [0, 0]
+    assert st._pad(np.array([3, 4]), 4).tolist() == [3, 4, 4, 4]
+    assert st._pad(np.zeros(0, dtype=np.int64), 2).tolist() == [0, 0]
