@@ -222,6 +222,9 @@ def test_no_forced_embedding_sharing():
 
 
 class _FakeBackbone:
+    def __init__(self, confidence_head: bool):
+        self.confidence_head = object() if confidence_head else None
+
     def __call__(self, input_ids, positions):
         rows = torch.arange(input_ids.shape[0], dtype=torch.float32)
         return torch.stack([rows, torch.zeros_like(rows)], dim=1)
@@ -234,9 +237,9 @@ class _FakeDraft:
     has_own_lm_head = False
     has_own_embed_tokens = False
 
-    def __init__(self, vocab=16):
+    def __init__(self, vocab=16, confidence_head=True):
         self.vocab = vocab
-        self.model = _FakeBackbone()
+        self.model = _FakeBackbone(confidence_head)
 
     def compute_draft_logits(self, hidden):
         rows = hidden[:, 0].long()
@@ -255,21 +258,31 @@ class _FakeDraft:
         return 100 * head_hidden[:, 0] + markov_embed[:, 0]
 
 
-@pytest.mark.parametrize("enabled", [True, False])
-def test_adaptive_verification_is_ignored_with_a_warning(monkeypatch, enabled):
+@pytest.mark.parametrize(
+    "enabled,confidence_head,uses_head,warns",
+    [
+        (True, True, True, False),
+        (True, False, False, True),
+        (False, True, False, False),
+    ],
+)
+def test_adaptive_verification_needs_a_confidence_head(
+    monkeypatch, enabled, confidence_head, uses_head, warns
+):
     with mock.patch("vllm_torchtpu.spec_decode.dspark.logger") as log:
         p = _make_proposer(
             {"dspark_noise_token_id": 7, **_LAYER_IDS},
             enable_adaptive_verification=enabled,
         )
-    monkeypatch.setattr(
-        DFlashProposer,
-        "load_model",
-        lambda self, target_model: setattr(self, "draft_model", _FakeDraft()),
-    )
-    p.load_model(None)
-    assert p.use_confidence_head is False
-    assert log.warning.called is enabled
+        draft = _FakeDraft(confidence_head=confidence_head)
+        monkeypatch.setattr(
+            DFlashProposer,
+            "load_model",
+            lambda self, target_model: setattr(self, "draft_model", draft),
+        )
+        p.load_model(None)
+    assert p.use_confidence_head is uses_head
+    assert log.warning.called is warns
 
 
 def test_draft_step_scores_each_slot_from_its_hidden_and_previous_token():

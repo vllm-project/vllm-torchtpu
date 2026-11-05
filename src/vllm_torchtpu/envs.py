@@ -54,6 +54,7 @@ if TYPE_CHECKING:
     MOE_REQUANTIZE_WEIGHT_DTYPE: str = "float8_e4m3fn"
     MOE_REQUANTIZE_BLOCK_SIZE: int | None = None
     TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL: bool | None = None
+    TPU_SKIP_MAMBA_SCHEDULER_BLOCKS: bool = True
     TPU_USE_RAIDEN_KV_CACHE_MANAGER: bool = False
     TPU_RAIDEN_QWEN35_ADMISSION: bool = False
     TPU_RAIDEN_KIMIK3_ADMISSION: bool = False
@@ -97,7 +98,9 @@ if TYPE_CHECKING:
     TPU_MLA_MASKED_DENSE_MAX_KV_LEN: int | None = None
     VLLM_TPU_MOST_MODEL_LEN: int | None = None
     TPU_GDN_CONV_QK_PAIR_LAYOUT: bool = False
+    TPU_GDN_QKVZ_KERNEL_LAYOUT: bool = False
     TPU_ENABLE_GDN_DYNAMIC_TILING: bool = False
+    TPU_GDN_PREFILL_CHECKPOINT: bool = True
     TPU_MOE_SKIP_PADDED_TOKENS: bool = False
     TPU_MOE_HIERARCHICAL_EP: bool = False
     TPU_MOE_ROUTER_TOPK: str = "rowmax"
@@ -492,12 +495,29 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_GDN_CONV_QK_PAIR_LAYOUT": env_bool(
         "TPU_GDN_CONV_QK_PAIR_LAYOUT", default=False
     ),
+    # Store GDN's in_proj_qkvz in the matmul's (k, n) layout, like every other
+    # linear, instead of vLLM's [n_out, n_in]. On the per-block FP8 path (gmm_v2)
+    # the kept layout costs a full weight copy every step. Ignored with prefill
+    # context parallelism, whose pooled op reads the weight raw as
+    # [n_out, n_in]. The experimental AOT export rejects it at TP > 1: its
+    # weight mapper assumes the vLLM layout for this weight. Opt-in while the
+    # (k, n) layout is verified only on the per-block FP8 path; once the BF16,
+    # checkpoint-FP8 and per-channel paths are verified and the export mapper
+    # reads the layer's layout marker, make it the default and delete the flag.
+    "TPU_GDN_QKVZ_KERNEL_LAYOUT": env_bool("TPU_GDN_QKVZ_KERNEL_LAYOUT", default=False),
     # Size GDN v3 decode tiles and prefill chunks from per-rank heads, active
     # sequences and the VMEM estimate (kernels/gdn/v3/tiling.py) instead of
     # the fixed defaults.
     "TPU_ENABLE_GDN_DYNAMIC_TILING": env_bool(
         "TPU_ENABLE_GDN_DYNAMIC_TILING", default=False
     ),
+    # Pooled GDN layers declare one prefill checkpoint block, so a prefill
+    # chunk runs to the prompt end and the kernel writes the block-boundary
+    # state mid-chunk (gdn_pool_layout.prefill_checkpoint_enabled). On by
+    # default; 0 goes back to ending each prefill chunk at its last cacheable
+    # block boundary. Set it to the same value on every rank and PP stage: the
+    # scheduler requires identical MambaSpecs.
+    "TPU_GDN_PREFILL_CHECKPOINT": env_bool("TPU_GDN_PREFILL_CHECKPOINT", default=True),
     # Register the DeepSeek-V4 tokenizer that honors continue_final_message.
     # Off by default so tokenizer behavior matches stock vLLM; the DSv4
     # eval config turns it on, since a prefilled assistant turn needs it.
@@ -598,6 +618,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # everything else on the per-layer KV caches.
     "TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL": env_optional_bool(
         "TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL"
+    ),
+    # Debug escape hatch; 0 opts out. On the compact-mamba layout
+    # (TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL=0) with prefix caching off, the
+    # scheduler stops charging GDN layers one block per group per request from
+    # the attention pool: the runner keeps GDN state in its own slot arrays and
+    # never reads those blocks. Applies only where that holds (GDN layers, no
+    # speculative decoding, no KV connector); everything else keeps vLLM's
+    # stock accounting either way. Read by the model runner;
+    # TpuPlatform.additional_env_vars carries it to Ray workers. See
+    # core/runner_slot_mamba.py.
+    "TPU_SKIP_MAMBA_SCHEDULER_BLOCKS": env_bool(
+        "TPU_SKIP_MAMBA_SCHEDULER_BLOCKS", default=True
     ),
     # Destination (decode-side) page geometry in tokens, required on the
     # producer: the byte-span lowering splits declarations at destination
@@ -1167,8 +1199,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # How many times an offload save whose transfer failed is retried.
     "VLLM_TPU_OFFLOAD_SAVE_RETRIES": env_int("VLLM_TPU_OFFLOAD_SAVE_RETRIES", 1),
-    # Scheduler: keep the trailing prefix-cache block that EAGLE/MTP normally
-    # drops (controls vLLM's disable_eagle_block_drop). Host-only.
+    # Keep the trailing prefix-cache block that EAGLE/MTP normally drops
+    # (sets SpeculativeConfig.disable_eagle_block_drop). Host-only.
     "VLLM_TPU_DISABLE_EAGLE_BLOCK_DROP": env_bool(
         "VLLM_TPU_DISABLE_EAGLE_BLOCK_DROP", default=False
     ),

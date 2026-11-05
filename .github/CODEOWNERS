@@ -67,8 +67,8 @@
 /tests/distributed/ @sixiang-google @yinlin09 @benliangw @jcc-google @Nanfang-Li @mrjunwan-lang @wenxindongwork @weiyu0824
 
 # Distributed: Disaggregated KV Transfer
-/src/vllm_torchtpu/distributed/kv_transfer/ @harutmov @sixiang-google @Nanfang-Li @richardsliu @mrjunwan-lang @aman2930 @yinlin09 @benliangw
-/tests/disagg/ @harutmov @sixiang-google @Nanfang-Li @richardsliu @mrjunwan-lang @aman2930 @yinlin09 @benliangw
+/src/vllm_torchtpu/distributed/kv_transfer/ @harutmov @sixiang-google @Nanfang-Li @richardsliu @mrjunwan-lang @aman2930 @yinlin09 @benliangw @yiw-wang
+/tests/disagg/ @harutmov @sixiang-google @Nanfang-Li @richardsliu @mrjunwan-lang @aman2930 @yinlin09 @benliangw @yiw-wang
 /tests/distributed/*raiden* @harutmov @sixiang-google @Nanfang-Li @richardsliu @mrjunwan-lang @aman2930 @yinlin09 @benliangw
 /tests/distributed/test_*kv*.py @harutmov @sixiang-google @Nanfang-Li @richardsliu @mrjunwan-lang @aman2930 @yinlin09 @benliangw
 /tests/distributed/test_tpu_*connector.py @harutmov @sixiang-google @Nanfang-Li @richardsliu @mrjunwan-lang @aman2930 @yinlin09 @benliangw
@@ -154,6 +154,18 @@
 /src/vllm_torchtpu/models/vllm/deepseek_v4/ @gxd3 @patemotter @annyan09023 @gpolovets1 @jrplatin
 /tests/kernels/deepseek_v4/ @gxd3 @patemotter @annyan09023 @gpolovets1 @jrplatin
 /tests/**/test_dsv4_*.py @gxd3 @patemotter @annyan09023 @gpolovets1 @jrplatin
+
+# Kernels & Models: DeepSeek v4.1
+/src/vllm_torchtpu/kernels/experimental/deepseek_v41/ @yuyanpeng-google @fro11o @wenqini
+/src/vllm_torchtpu/layers/adapter/custom_ops/deepseek_v41/ @yuyanpeng-google @fro11o @wenqini
+/src/vllm_torchtpu/models/vllm/deepseek_v41/ @yuyanpeng-google @fro11o @wenqini
+/tests/kernels/experimental/deepseek_v41/ @yuyanpeng-google @fro11o @wenqini
+/tests/layers/adapter/custom_ops/deepseek_v41/ @yuyanpeng-google @fro11o @wenqini
+/tests/models/vllm/deepseek_v41/ @yuyanpeng-google @fro11o @wenqini
+
+# Models: MiniMax M3
+/src/vllm_torchtpu/models/minimax_m3/ @DRZDONG @caojx-google @qizzzh
+/tests/models/minimax_m3/ @DRZDONG @caojx-google @qizzzh
 
 # Megakernel (Framework-Free JAX/Pallas)
 /src/vllm_torchtpu/megakernel/ @caojx-google @annyan09023 @weinan1997 @hhb @brianseung-google
