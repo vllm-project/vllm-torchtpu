@@ -67,8 +67,8 @@ make the default less faithful than an explicit value:
 
 - `vllm serve` runs a profile pass at `--max-num-batched-tokens` before
   measuring, so its KV budget excludes activation memory, unless the KV size is
-  already pinned (`num_gpu_blocks_override`, set by compact-mamba sizing on
-  hybrid models), in which case it skips the pass and logs
+  already pinned (`--num-gpu-blocks-override`, or the uniform hybrid KV
+  layout's own count), in which case it skips the pass and logs
   `profile_run=skipped`. The exporter does not profile, so activations must fit in the headroom `--gpu-memory-utilization`
   leaves. `--kv-cache-memory-bytes` skips the profile pass in `vllm serve`
   too, so it is the setting that gives both the same KV budget.

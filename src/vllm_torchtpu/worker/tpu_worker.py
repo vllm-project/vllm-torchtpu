@@ -506,9 +506,10 @@ class TPUWorker(WorkerBase):
 
     def _kv_cache_size_pinned(self) -> bool:
         """Whether every rank's KV block count is already fixed by
-        `num_gpu_blocks_override`, set by the user or by the runner's
-        compact-mamba sizing in get_kv_cache_spec, which vLLM calls before
-        determine_available_memory.
+        `num_gpu_blocks_override`, set by the user or by the runner's uniform
+        hybrid sizing in get_kv_cache_spec, which vLLM calls before
+        determine_available_memory. Compact-mamba sizing does not set it until
+        after the profile run (KVCacheManager.size_compact_mamba_kv_cache).
 
         Agreed (MIN) across the world group, which is exactly the ranks that
         share the profile run's collectives: this engine's TP x PCP x PP ranks,
@@ -532,10 +533,10 @@ class TPUWorker(WorkerBase):
         # setup, users can run vllm without this flag, and collect the
         # total_hbm_avail_gb value logged later in this function -- only from
         # a run whose log says profile_run=ran. With profile_run=skipped (the
-        # KV size was pinned first, e.g. by compact-mamba sizing on hybrid
-        # models) that value was measured before any activation memory was
-        # allocated, so it over-sizes the KV cache: pin --num-gpu-blocks-override
-        # from the "TPU KV cache size" line instead.
+        # KV size was pinned first, by --num-gpu-blocks-override or the uniform
+        # hybrid sizing) that value was measured before any activation memory
+        # was allocated, so it over-sizes the KV cache: pin
+        # --num-gpu-blocks-override from the "TPU KV cache size" line instead.
         if kv_cache_memory_bytes := self.cache_config.kv_cache_memory_bytes:
             msg = (
                 "kv_cache_memory_bytes in cache_config is specified."
@@ -548,6 +549,9 @@ class TPUWorker(WorkerBase):
                 "correspondingly."
             )
             logger.info(msg)
+            self.model_runner.kv_cache_manager.size_compact_mamba_kv_cache(
+                kv_cache_memory_bytes
+            )
             return kv_cache_memory_bytes
 
         profile_skipped = self._kv_cache_size_pinned()
@@ -626,6 +630,9 @@ class TPUWorker(WorkerBase):
                 f"{total_hbm_limit_cap_gb=}GiB by "
                 f"{-total_hbm_avail_gb}GiB. Please consider {fix}."
             )
+
+        # From the post-profile budget, so the pool leaves room for activations.
+        self.model_runner.kv_cache_manager.size_compact_mamba_kv_cache(available)
 
         cap = self._pooling_kv_cache_cap_bytes()
         if cap is not None and cap < available:

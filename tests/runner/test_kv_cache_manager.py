@@ -353,9 +353,15 @@ class TestKVCacheManager:
         assert self.runner._hybrid_uniform_page_size_bytes == 203776
         assert self.runner.cache_config.mamba_page_size_padded == 203776
 
-        # Compact-mamba sizing runs first and wins (it can read HBM here).
-        # It caps mamba at max_num_reqs + 1 = 17 recurrent slots and gives the
-        # rest of the budget to the attention pool.
+        # The compact-mamba layout is selected first and wins (it can read HBM
+        # here). It caps mamba at max_num_reqs + 1 = 17 recurrent slots; the
+        # attention block count waits for the post-profile budget, so nothing
+        # is pinned yet and the worker still runs its profile run.
+        assert self.runner._mamba_num_blocks == 17
+        assert self.runner.cache_config.num_gpu_blocks_override is None
+
+        # determine_available_memory then gives the rest of the budget to the
+        # attention pool:
         #   1 attn + 3 mamba layers -> group_size=min=1 (3 < 1*1.5 is False),
         #   num_attn_groups=1, num_mamba_groups=3.
         #   avail = 10GB * 0.9 = 9,663,676,416 (headroom pinned to 0)
@@ -363,7 +369,8 @@ class TestKVCacheManager:
         #   mamba_per_tensor = 3 * 17 * 66560 = 3,394,560
         #   attn_num_blocks =
         #       (9,663,676,416 - 3,394,560) // (1 * 4096) = 2,358,467
-        mock_mem_info.assert_called_once()
+        km = self.runner.kv_cache_manager
+        km.size_compact_mamba_kv_cache(km._available_kv_cache_hbm())
         assert self.runner._mamba_num_blocks == 17
         assert self.runner.cache_config.num_gpu_blocks_override == 2358467
 
@@ -426,7 +433,8 @@ class TestKVCacheManager:
         """Mamba slots alone (3 * 17 * 66560 = 3,394,560 B) exceed the 3 MiB
         KV budget, so compact sizing cannot fit. Raise instead of falling back
         to the uniform layout, which pads every block to the mamba page and
-        silently shrinks the block pool ~50x."""
+        silently shrinks the block pool ~50x, and raise in get_kv_cache_spec,
+        before the profile run: the budget after it is no larger."""
         layers = {}
         mock_attn = _attention_layer_mock()
         mock_attn.num_kv_heads = 2
@@ -437,6 +445,63 @@ class TestKVCacheManager:
 
         with pytest.raises(ValueError, match="does not fit"):
             self.runner.kv_cache_manager._update_mamba_page_size_padded(layers)
+
+    @patch(
+        "vllm_torchtpu.runner.tpu_runner.PallasAttentionBackend.get_kv_cache_page_size_bytes",
+        return_value=4096,
+    )
+    def test_compact_mamba_attention_pool_sized_after_the_profile_run(
+        self, mock_get_page_size
+    ):
+        """get_kv_cache_spec runs before the profile run, so the HBM free then
+        still includes what the profile run takes. The attention pool is sized
+        from the budget the worker measures after it, so the count does not
+        overshoot the gpu_memory_utilization cap by the profile residue."""
+        gib = 1024**3
+        layers = {"attn_0": _attention_layer_mock()}
+        layers["attn_0"].num_kv_heads = 2
+        layers["attn_0"].head_size = 128
+        layers.update({f"mamba_{i}": DummyMamba() for i in range(3)})
+        mem = "vllm_torchtpu.utils.torch.accelerator.get_memory_info"
+
+        with patch(mem, return_value=(10 * gib, 10 * gib)):
+            self.runner.kv_cache_manager._update_mamba_page_size_padded(layers)
+        assert self.runner.cache_config.num_gpu_blocks_override is None
+
+        # The profile run leaves 0.5 GiB allocated.
+        post_profile_budget = int(0.9 * 10 * gib) - gib // 2
+        self.runner.kv_cache_manager.size_compact_mamba_kv_cache(post_profile_budget)
+
+        mamba = 3 * 17 * 66560
+        assert (
+            self.runner.cache_config.num_gpu_blocks_override
+            == (post_profile_budget - mamba) // 4096
+        )
+        assert self.runner._mamba_num_blocks == 17
+
+    @patch(
+        "vllm_torchtpu.runner.tpu_runner.PallasAttentionBackend.get_kv_cache_page_size_bytes",
+        return_value=4096,
+    )
+    @patch(
+        "vllm_torchtpu.utils.torch.accelerator.get_memory_info",
+        return_value=(10 * 1024 * 1024 * 1024, 10 * 1024 * 1024 * 1024),
+    )
+    def test_user_pinned_count_is_not_resized(self, mock_mem_info, mock_get_page_size):
+        """--num-gpu-blocks-override is kept as given: no compact layout is
+        selected for it, so there is nothing to size after the profile run."""
+        layers = {"attn_0": _attention_layer_mock()}
+        layers["attn_0"].num_kv_heads = 2
+        layers["attn_0"].head_size = 128
+        layers.update({f"mamba_{i}": DummyMamba() for i in range(3)})
+        self.runner.cache_config.num_gpu_blocks_override = 1234
+
+        self.runner.kv_cache_manager._update_mamba_page_size_padded(layers)
+        km = self.runner.kv_cache_manager
+        km.size_compact_mamba_kv_cache(km._available_kv_cache_hbm())
+
+        assert self.runner.cache_config.num_gpu_blocks_override == 1234
+        assert self.runner._mamba_num_blocks is None
 
     @patch(
         "vllm_torchtpu.runner.tpu_runner.PallasAttentionBackend.get_kv_cache_page_size_bytes",
@@ -470,6 +535,8 @@ class TestKVCacheManager:
             layers[f"mamba_{i}"] = DummyMamba()
 
         self.runner.kv_cache_manager._update_mamba_page_size_padded(layers)
+        km = self.runner.kv_cache_manager
+        km.size_compact_mamba_kv_cache(km._available_kv_cache_hbm())
 
         # Same sizing as test_update_mamba_page_size_padded, but avail is
         # reduced by the 1 GiB reserve:
@@ -503,6 +570,8 @@ class TestKVCacheManager:
             layers[f"mamba_{i}"] = DummyMamba()
 
         self.runner.kv_cache_manager._update_mamba_page_size_padded(layers)
+        km = self.runner.kv_cache_manager
+        km.size_compact_mamba_kv_cache(km._available_kv_cache_hbm())
 
         # Same 1 GiB cut as test_kv_connector_reserve_shrinks_num_blocks_override.
         assert self.runner.cache_config.num_gpu_blocks_override == 2096323

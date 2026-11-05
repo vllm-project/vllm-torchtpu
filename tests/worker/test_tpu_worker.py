@@ -451,8 +451,8 @@ def test_determine_available_memory_profiles_an_unpinned_kv_cache(monkeypatch):
 
 
 def test_determine_available_memory_skips_profiling_a_pinned_kv_cache(monkeypatch):
-    """With num_gpu_blocks_override already set (e.g. by compact-mamba sizing in
-    get_kv_cache_spec), vLLM ignores the profiled budget, so no profile run."""
+    """With num_gpu_blocks_override already set (e.g. --num-gpu-blocks-override),
+    vLLM ignores the profiled budget, so no profile run."""
     worker = _ep_dp_worker(
         monkeypatch, dp_size=1, expert_parallel=False, local=utils.GBYTES, peer=0
     )
@@ -460,6 +460,40 @@ def test_determine_available_memory_skips_profiling_a_pinned_kv_cache(monkeypatc
 
     assert worker.determine_available_memory() == utils.GBYTES
     worker.model_runner.profile_run.assert_not_called()
+
+
+def test_compact_mamba_kv_cache_is_sized_after_the_profile_run(monkeypatch):
+    """Compact-mamba sizing leaves num_gpu_blocks_override unset in
+    get_kv_cache_spec, so the profile run still happens, and sizes the attention
+    pool after it, from the same budget the worker hands vLLM."""
+    worker = _ep_dp_worker(
+        monkeypatch, dp_size=1, expert_parallel=False, local=utils.GBYTES, peer=0
+    )
+    runner = worker.model_runner
+
+    def budget(*_):
+        # The profile run leaves half of the budget allocated.
+        avail = utils.GBYTES // 2 if runner.profile_run.called else utils.GBYTES
+        return utils.HbmBudget(total_limit=0, total_used=0, cap=0, available=avail)
+
+    monkeypatch.setattr(utils, "compute_hbm_budget", budget)
+
+    assert worker.determine_available_memory() == utils.GBYTES // 2
+    sizing = runner.kv_cache_manager.size_compact_mamba_kv_cache
+    sizing.assert_called_once_with(utils.GBYTES // 2)
+
+
+def test_compact_mamba_kv_cache_is_sized_from_kv_cache_memory_bytes(monkeypatch):
+    """kv_cache_memory_bytes fixes the budget without a profile run."""
+    worker = _ep_dp_worker(
+        monkeypatch, dp_size=1, expert_parallel=False, local=utils.GBYTES, peer=0
+    )
+    worker.cache_config.kv_cache_memory_bytes = 3 * utils.GBYTES
+
+    assert worker.determine_available_memory() == 3 * utils.GBYTES
+    worker.model_runner.profile_run.assert_not_called()
+    sizing = worker.model_runner.kv_cache_manager.size_compact_mamba_kv_cache
+    sizing.assert_called_once_with(3 * utils.GBYTES)
 
 
 def _world(monkeypatch, world_size, peer_pinned=1):
