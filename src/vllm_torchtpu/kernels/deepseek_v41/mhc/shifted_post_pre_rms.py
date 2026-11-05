@@ -468,8 +468,9 @@ def shifted_post_pre_rms(
         hc_sinkhorn_eps=hc_sinkhorn_eps,
         hc_post_mult_value=hc_post_mult_value,
         sinkhorn_repeat=sinkhorn_repeat,
+        tokens=t,
     )
-    return (residual, new_post[:t, :, None], new_comb[:t], value, new_pre[:t])
+    return (residual, new_post[:, :, None], new_comb, value, new_pre)
 
 
 def _rms_norm_inplace(value_ref, weight_ref, square, *, columns: int, eps: float):
@@ -495,8 +496,14 @@ def _pre_gates(
     hc_sinkhorn_eps: float = 1e-06,
     hc_post_mult_value: float = 2.0,
     sinkhorn_repeat: int = 20,
+    tokens: int | None = None,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
-    """FP32 gates from logits [M*(M+2),T] and square sums [1,T]; hidden_size=D."""
+    """FP32 gates from logits [M*(M+2),T] and square sums [1,T]; hidden_size=D.
+
+    ``tokens`` real rows are returned token-major. Slicing before the transpose
+    lets the next call's transpose back cancel against it in XLA instead of
+    copying each gate twice per call.
+    """
     mixes, t = mix.shape
     m = math.isqrt(mixes + 1) - 1
     assert m > 0 and mixes == m * (m + 2), "Expected M*(M+2) mix logits"
@@ -556,4 +563,9 @@ def _pre_gates(
         ],
         compiler_params=pltpu.CompilerParams(dimension_semantics=("parallel",)),
     )(mix, square, scale, base)
-    return (pre.T, post.T, comb.transpose(2, 0, 1))
+    tokens = t if tokens is None else tokens
+    return (
+        pre[:, :tokens].T,
+        post[:, :tokens].T,
+        comb[:, :, :tokens].transpose(2, 0, 1),
+    )
