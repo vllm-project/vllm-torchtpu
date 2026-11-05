@@ -279,8 +279,11 @@ def fused_shared_expert(
     width, down_width, depth, split, quant_rows, vmem_budget = tuning
     if inter % width or k % down_width or inter % split or k % split:
         raise ValueError(f"{tuning=} does not tile {inter=} / {k=}")
-    x, w13, s13, w2, s2 = (
-        pltpu.with_memory_space_constraint(a, pltpu.HBM) for a in (x, w13, s13, w2, s2)
+    # The activations are read with one DMA into VMEM, which works from
+    # either memory, so they are taken wherever XLA left them: forcing them
+    # to HBM cost a 2.9 MB copy before every call at DP16 C768 (~2.1 us).
+    w13, s13, w2, s2 = (
+        pltpu.with_memory_space_constraint(a, pltpu.HBM) for a in (w13, s13, w2, s2)
     )
     return pl.pallas_call(
         functools.partial(
@@ -293,7 +296,8 @@ def fused_shared_expert(
             limit=limit,
         ),
         out_shape=jax.ShapeDtypeStruct((t, k), x.dtype),
-        in_specs=(pl.BlockSpec(memory_space=pltpu.HBM),) * 5,
+        in_specs=(pl.BlockSpec(memory_space=pl.ANY),)
+        + (pl.BlockSpec(memory_space=pltpu.HBM),) * 4,
         out_specs=pl.BlockSpec(memory_space=pltpu.HBM),
         scratch_shapes=(
             pltpu.VMEM((t, k), x.dtype),  # xb
