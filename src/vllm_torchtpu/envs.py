@@ -61,6 +61,7 @@ if TYPE_CHECKING:
     QWEN4_EXP_PREFILL_SP: bool = False
     QWEN4_EXP_PD_STAGING_BYTES: int = 8 << 30
     QWEN4_EXP_PP_LOGICAL_BLOCKS_FACTOR: int = 1
+    TPU_KV_CACHE_GROUP_SIZE_RULE: str = "gcd"
     QWEN4_EXP_PREFILL_SP_MIN_TOKENS: int = 1024
     QWEN4_EXP_PREFILL_SP_MOE: bool = False
     QWEN4_EXP_PREFILL_SP_SHARED_LOCAL: bool = False
@@ -974,6 +975,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # own groups holds it (models/vllm/qwen4_exp/stage_pages.py). 1 is off.
     "QWEN4_EXP_PP_LOGICAL_BLOCKS_FACTOR": env_int(
         "QWEN4_EXP_PP_LOGICAL_BLOCKS_FACTOR", 1
+    ),
+    # KV cache group size for uniform-page hybrid models (patched
+    # kv_cache_utils._get_kv_cache_groups_uniform_page_size): "gcd" of the
+    # buckets with more than one layer, small buckets padded (a lone PLE
+    # layer no longer forces one group per layer); "min" is upstream vLLM.
+    "TPU_KV_CACHE_GROUP_SIZE_RULE": env_with_choices(
+        "TPU_KV_CACHE_GROUP_SIZE_RULE", "gcd", ["gcd", "min"]
     ),
     "QWEN4_EXP_PREFILL_SP_MIN_TOKENS": env_int(
         "QWEN4_EXP_PREFILL_SP_MIN_TOKENS", 1024

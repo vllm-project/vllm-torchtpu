@@ -1894,6 +1894,55 @@ def _patch_vllm_block_pool_lifo_free() -> None:
     logger.info("Applied LIFO free-block patch (pre-vllm#48017 order) to BlockPool")
 
 
+def _patch_vllm_kv_cache_group_size() -> None:
+    """Size uniform-page KV cache groups by TPU_KV_CACHE_GROUP_SIZE_RULE.
+
+    Replaces kv_cache_utils._get_kv_cache_groups_uniform_page_size with the
+    same bucketing and strided split, sizing groups by kv_cache_group_size.
+    """
+    import vllm.v1.core.kv_cache_utils as kcu
+    from collections import defaultdict
+
+    from vllm_torchtpu import envs
+    from vllm_torchtpu.kv_group_size import kv_cache_group_size
+
+    if getattr(kcu, "_tpu_group_size_patch", False):
+        return
+    rule = envs.TPU_KV_CACHE_GROUP_SIZE_RULE
+
+    def _get_kv_cache_groups_uniform_page_size(kv_cache_spec):
+        same_type_layers = defaultdict(list)
+        for layer_name, layer_spec in kv_cache_spec.items():
+            same_type_layers[layer_spec].append(layer_name)
+        layer_buckets: list[list[str]] = []
+        spec_buckets: list[list] = []
+        for layer_spec, layer_names in same_type_layers.items():
+            for names, specs in zip(layer_buckets, spec_buckets):
+                try:
+                    type(specs[0]).merge([*specs, layer_spec])
+                except (AssertionError, ValueError):
+                    continue
+                names.extend(layer_names)
+                specs.append(layer_spec)
+                break
+            else:
+                layer_buckets.append(list(layer_names))
+                spec_buckets.append([layer_spec])
+        group_size = kv_cache_group_size([len(b) for b in layer_buckets], rule)
+        grouped_layers = []
+        for layers in layer_buckets:
+            # Strided split (layers[i::num_groups]) as upstream, so a pipeline
+            # stage's layers spread over the groups instead of padding them.
+            num_groups = kcu.cdiv(len(layers), group_size)
+            for i in range(num_groups):
+                grouped_layers.append(layers[i::num_groups])
+        return kcu.create_kv_cache_group_specs(kv_cache_spec, grouped_layers)
+
+    kcu._get_kv_cache_groups_uniform_page_size = _get_kv_cache_groups_uniform_page_size
+    kcu._tpu_group_size_patch = True
+    logger.info("Applied TPU patch: KV cache group size rule %s", rule)
+
+
 def _patch_vllm_same_step_prefix_hits() -> None:
     """Keep prefix-cache hits off blocks the current step has not written.
 

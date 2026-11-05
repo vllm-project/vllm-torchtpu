@@ -182,22 +182,57 @@ def native_cache_capacity(cfg, specs=None):
         get_kv_cache_groups,
     )
 
-    groups = get_kv_cache_groups(
-        cfg, native_cache_specs(cfg) if specs is None else specs
-    )
+    specs = native_cache_specs(cfg) if specs is None else specs
+    groups = get_kv_cache_groups(cfg, specs)
     blocks_per_request = sum(
         group.kv_cache_spec.max_num_blocks_per_req(cfg, cfg.model_config.max_model_len)
         for group in groups
     )
     # One null block is reserved by the scheduler's pool.
     pages = 1 + cfg.scheduler_config.max_num_seqs * blocks_per_request
-    bytes_per_block = _get_kv_cache_bytes_per_block(groups)
+    bytes_per_block = _stage_bytes_per_block(cfg, groups, specs)
     max_pool_bytes = int(os.environ.get("QWEN4_EXP_MAX_POOL_BYTES", str(48 * 1024**3)))
     if bytes_per_block > 0 and max_pool_bytes > 0:
         max_pages = max_pool_bytes // bytes_per_block
         if max_pages > 1:
             pages = min(pages, max_pages)
     return pages
+
+
+def _stage_bytes_per_block(cfg, groups, specs) -> int:
+    """Bytes one block ID takes on the busiest pipeline stage.
+
+    A group of several layers keeps each layer's page in its own per-slot
+    tensor, and a stage backs only the slots its own layers fill (vLLM's
+    per-worker projection), so with groups wider than one layer a stage holds
+    fewer bytes per block ID than the whole model. Every stage shares one
+    block-ID count, so the busiest stage sizes it. Without a pipeline it is
+    the whole model's bytes per block.
+    """
+    from vllm.v1.core.kv_cache_utils import (
+        _get_kv_cache_bytes_per_block,
+        _project_kv_cache_groups_to_worker,
+    )
+
+    size = int(getattr(cfg.parallel_config, "pipeline_parallel_size", 1) or 1)
+    if size == 1:
+        return _get_kv_cache_bytes_per_block(groups)
+    from vllm.distributed.utils import get_pp_indices
+
+    from .pp import owns_cache
+
+    num_layers = cfg.model_config.hf_text_config.num_hidden_layers
+    worst = 0
+    for rank in range(size):
+        layers = range(*get_pp_indices(num_layers, rank, size))
+        local = {
+            name: spec
+            for name, spec in specs.items()
+            if owns_cache(name, layers, rank == size - 1)
+        }
+        projected = _project_kv_cache_groups_to_worker(groups, local)
+        worst = max(worst, _get_kv_cache_bytes_per_block(projected))
+    return worst
 
 
 def pp_logical_block_factor(cfg) -> int:
