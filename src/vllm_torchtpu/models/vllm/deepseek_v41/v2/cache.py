@@ -1419,6 +1419,13 @@ def write_cache(cache, slots, values, valid, after=None):
         cache.copy_(_write_op(cache, slots.int(), values))
 
 
+def write_cache_slots(cache, slots, values):
+    """`write_cache` for int32 ``slots`` already holding -1 where invalid."""
+    assert slots.dtype == torch.int32 and cache.device.type != "cpu"
+    assert _write_op is not None
+    cache.copy_(_write_op(cache, slots, values))
+
+
 def merge_sub_rows(
     cache: jax.Array, records: jax.Array, values: jax.Array
 ) -> tuple[jax.Array, jax.Array]:

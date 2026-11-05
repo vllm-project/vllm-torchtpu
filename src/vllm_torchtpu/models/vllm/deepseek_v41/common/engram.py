@@ -50,6 +50,16 @@ class NgramHashState(upstream.NgramHashState):
         """Write mapped token ids into the slot cache; bound per implementation."""
         raise NotImplementedError
 
+    def write_token_ids(
+        self,
+        cache: torch.Tensor,
+        slots: torch.Tensor,
+        input_ids: torch.Tensor,
+        dead_mask: torch.Tensor,
+    ) -> None:
+        """Map ``input_ids`` and write them at int32 ``slots`` (-1: skip)."""
+        raise NotImplementedError
+
     def ensure_cache(self) -> bool:
         if torch.compiler.is_compiling():
             # The outer CausalLM initializes the cache before tracing.
@@ -93,11 +103,17 @@ class NgramHashState(upstream.NgramHashState):
             slot_mapping = slot_mapping[:count]
         if self.use_slot_cache:
             assert self._cache is not None and slot_mapping is not None
-            mapped = self.token_map[input_ids.long()].masked_fill(
-                dead_mask, upstream.DEAD_ID
-            )
-            valid = slot_mapping >= 0
-            self.write_cache(self._cache, slot_mapping, mapped, valid)
+            if (
+                envs.TPU_DEEPSEEK_V41_ENGRAM_INT32_SLOT_WRITE
+                and input_ids.device.type != "cpu"
+            ):
+                self.write_token_ids(self._cache, slot_mapping, input_ids, dead_mask)
+            else:
+                mapped = self.token_map[input_ids.long()].masked_fill(
+                    dead_mask, upstream.DEAD_ID
+                )
+                valid = slot_mapping >= 0
+                self.write_cache(self._cache, slot_mapping, mapped, valid)
 
         def fallback(past, reqs, window):
             if not self.use_slot_cache:

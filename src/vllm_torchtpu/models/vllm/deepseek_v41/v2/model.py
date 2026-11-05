@@ -49,7 +49,7 @@ from .ced import (
     plan_decoder_replay,
     prefix_replay_enabled,
 )
-from .engram import Engram, NgramHashState
+from .engram import Engram, NgramHashState, engram_cache_slots
 from .host_engram import (
     HOST_ENGRAM_KEY,
     HostEngramInputs,
@@ -508,7 +508,12 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
                         image_mask,
                         lookback_token_ids,
                         upstream.image_sentinel_mask(lookback_token_ids),
-                        _cache_slots(
+                        (
+                            engram_cache_slots
+                            if envs.TPU_DEEPSEEK_V41_ENGRAM_INT32_SLOT_WRITE
+                            and positions.device.type != "cpu"
+                            else _cache_slots
+                        )(
                             self.engram_hash.swa_cache_module.kv_cache,
                             swa_metadata,
                             positions,
