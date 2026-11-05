@@ -204,16 +204,27 @@ def test_chunked_attention_preserves_requests_and_reusable_kv(
     expected_words = jnp.where(records[:, :, None] >= 0, words[selected], 0)
     expected_scales = jnp.where(records >= 0, scales[selected], 0)
     table = jnp.arange(1, 97, dtype=jnp.int32).reshape(6, 16)
-    metadata, bounds, _ = prepare_swa_metadata(
-        table,
-        starts,
-        positions,
-        jnp.array([0, 150, 0, 200, 300, 0], jnp.int32),
-        page_size=page_size,
-        page_stride=page_size,
-        row_offset=0,
-        non_causal=non_causal,
+    minimum = jnp.array([0, 150, 0, 200, 300, 0], jnp.int32)
+    swa_kw = dict(page_size=page_size, page_stride=page_size, row_offset=0)
+    metadata, bounds, swa_records = prepare_swa_metadata(
+        table.reshape(-1), starts, positions, minimum, layers=1,
+        non_causal=non_causal, **swa_kw,
     )
+    # One call over several layers' tables equals one call per layer.
+    other = table[::-1]
+    stacked = prepare_swa_metadata(
+        jnp.concatenate((table.reshape(-1), other.reshape(-1))), starts, positions,
+        minimum, layers=2, non_causal=non_causal, **swa_kw,
+    )
+    alone = prepare_swa_metadata(
+        other.reshape(-1), starts, positions, minimum, layers=1,
+        non_causal=non_causal, **swa_kw,
+    )
+    for got, first, second in zip(stacked, (metadata, bounds, swa_records), alone):
+        # Bounds are shared by the layers; metadata and records stack per layer.
+        expected = first if got.shape == first.shape else jnp.concatenate((first, second))
+        np.testing.assert_array_equal(got, expected)
+    metadata = metadata[0]
     swa = random((97, page_size, 512)).at[0].set(0)
     word_banks = (words[:113], words[113:]) if banked else words
     scale_banks = (scales[:113], scales[113:]) if banked else scales
@@ -301,11 +312,12 @@ def _offset_inputs(ragged):
     records = jnp.array(rng.integers(0, 97, (tokens, 512)), jnp.int32)
     records = jnp.where(jnp.arange(512) < counts[:, None], records, 0)
     table = jnp.arange(1, 1 + batch * 16, dtype=jnp.int32).reshape(batch, 16)
-    metadata, _, _ = prepare_swa_metadata(
-        table,
+    (metadata,), _, _ = prepare_swa_metadata(
+        table.reshape(-1),
         starts,
         positions,
         jnp.zeros(batch, jnp.int32),
+        layers=1,
         page_size=page_size,
         page_stride=page_size,
         row_offset=0,
@@ -403,11 +415,12 @@ def test_chunked_pipeline_writes_owners_without_joins(sparsecore_device):
     table = jnp.arange(1, 17, dtype=jnp.int32).reshape(1, 16)
     starts = jnp.array([0, tokens], jnp.int32)
     positions = jnp.arange(tokens, dtype=jnp.int32)
-    metadata, _, _ = prepare_swa_metadata(
-        table,
+    (metadata,), _, _ = prepare_swa_metadata(
+        table.reshape(-1),
         starts,
         positions,
         jnp.zeros(1, jnp.int32),
+        layers=1,
         page_size=32,
         page_stride=32,
         row_offset=0,

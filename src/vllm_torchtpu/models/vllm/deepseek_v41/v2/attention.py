@@ -56,6 +56,10 @@ from .swa_cache import DeepseekV41SWASpec
 logger = init_logger(__name__)
 
 _active_stage_attn_cache: dict[Any, Any] | None = None
+# CSA2 layers by SWA cache prefix, in model order. Every layer is its own SWA cache group (its own
+# block table), so a stage resolves the SWA pages of all its layers in one
+# metadata call instead of one small gather pair per layer.
+_csa2_swa_layers: dict[str, Any] = {}
 
 
 @contextlib.contextmanager
@@ -571,6 +575,8 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
         # Compress-ratio-0 layers (SWA only, and the DSpark draft) run CSA2's
         # SWA-only form: one attention kernel reads native pages for every layer.
         self._csa2 = csa2_supported
+        if csa2_supported:
+            _csa2_swa_layers[self.swa_cache_layer.prefix] = self
         self._fused_preprocess = csa2_supported
         self.swa_cache_layer.native_pages = self._csa2
         if self.compress_ratio:
@@ -1129,35 +1135,35 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
             elif (window_starts := _window_starts()) is not None:
                 minimum = window_starts
             minimum = minimum[: swa_table.shape[0]]
-            meta_key = (
-                "csa2_swa",
-                rows_per_page,
-                swa_cache.page_stride,
-                swa_cache.row_offset,
-                non_causal,
-                self._ced_decoder,
-            )
+            meta_key = ("csa2_swa", self.swa_cache_layer.prefix)
             cached = stage_cache.get(meta_key) if stage_cache is not None else None
             if cached is None or cached[0] is not swa.block_tables:
-                csa2_metadata, csa2_bounds, csa2_write_records = (
-                    csa2_adapter.prepare_swa(
-                        swa_table,
-                        swa.query_start_loc,
-                        positions,
-                        minimum,
-                        swa_cache,
-                        non_causal,
-                    )
+                peers = (
+                    self._csa2_swa_peers(metadata, swa_cache, non_causal)
+                    if stage_cache is not None
+                    else [self]
                 )
-                if stage_cache is not None:
-                    stage_cache[meta_key] = (
-                        swa.block_tables,
-                        csa2_metadata,
+                prefixes = [peer.swa_cache_layer.prefix for peer in peers]
+                pages, csa2_bounds, records = csa2_adapter.prepare_swa(
+                    [_block_table(metadata[prefix]) for prefix in prefixes],
+                    swa.query_start_loc,
+                    positions,
+                    minimum,
+                    swa_cache,
+                    non_causal,
+                )
+                for i, prefix in enumerate(prefixes):
+                    entry = (
+                        metadata[prefix].block_tables,
+                        pages[i],
                         csa2_bounds,
-                        csa2_write_records,
+                        records[i],
                     )
-            else:
-                _, csa2_metadata, csa2_bounds, csa2_write_records = cached
+                    if stage_cache is not None:
+                        stage_cache[("csa2_swa", prefix)] = entry
+                    if peers[i] is self:
+                        cached = entry
+            _, csa2_metadata, csa2_bounds, csa2_write_records = cached
             swa_valid = csa2_write_records >= 0
             swa_invalid_3d = (~swa_valid)[:, None, None]
             requests = _token_requests(swa, positions).clamp(max=swa_table.shape[0] - 1)
@@ -2151,6 +2157,35 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                 f"{self.prefix}: fused DeepSeek-V4.1 attention preprocessing "
                 "(TP1, FP8 KV) " + "; ".join(problems)
             )
+
+    def _csa2_swa_peers(self, metadata, cache, non_causal):
+        """CSA2 layers of this stage whose SWA pages one metadata call resolves.
+
+        Peers share the cache geometry, the window mode and the block-table
+        shape; ``self`` is always among them.
+        """
+        geometry = (cache.shape[1], cache.page_stride, cache.row_offset)
+        shape = metadata[self.swa_cache_layer.prefix].block_tables.shape
+        peers = []
+        for layer in _csa2_swa_layers.values():
+            if layer._ced_decoder != self._ced_decoder:
+                continue
+            if (
+                bool(getattr(layer, "non_causal_multi_token_decode", False))
+                != non_causal
+            ):
+                continue
+            prefix = layer.swa_cache_layer.prefix
+            other = layer.swa_cache_layer.kv_cache
+            if (
+                prefix in metadata
+                and isinstance(other, PagedCacheRows)
+                and other.numel()
+                and (other.shape[1], other.page_stride, other.row_offset) == geometry
+                and metadata[prefix].block_tables.shape == shape
+            ):
+                peers.append(layer)
+        return peers if any(peer is self for peer in peers) else [self]
 
     def _o_proj(self, output, positions):
         assert output.dtype == torch.bfloat16

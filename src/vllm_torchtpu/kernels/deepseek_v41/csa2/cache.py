@@ -337,14 +337,15 @@ def _requests(starts: jax.Array, tokens: int) -> jax.Array:
 
 @functools.partial(
     jax.jit,
-    static_argnames=("page_size", "page_stride", "row_offset", "non_causal"),
+    static_argnames=("layers", "page_size", "page_stride", "row_offset", "non_causal"),
 )
 def prepare_swa_metadata(
-    block_table: jax.Array,
+    block_tables: jax.Array,
     starts: jax.Array,
     positions: jax.Array,
     minimum_visible: jax.Array,
     *,
+    layers: int,
     page_size: int,
     page_stride: int,
     row_offset: int,
@@ -352,19 +353,27 @@ def prepare_swa_metadata(
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Return request page metadata, explicit bounds, and physical write records.
 
-    Block table entries are allocator block IDs. Stride/offset are in BF16
-    512-feature record units and must preserve whole BF16 pages. Starts and
-    positions obey csa2's contiguous-request contract; noncausal requests have
-    at most 64 queries. Minimum visibility carries replay/window-start state.
-    Bounds are passed to csa2 ONLY for noncausal calls; causal visibility stays
-    query-dependent. Padding records are -1. Empty requests have empty bounds.
+    ``block_tables`` holds the ``[requests, width]`` allocator block tables of
+    ``layers`` layers, flattened row-major into one 1-D array: one call
+    resolves every layer of a stage, and 1-D lookups need no relayout of the
+    tiled 2-D tables. Stride/offset are in BF16 512-feature record units and
+    must preserve whole BF16 pages. Starts and positions obey csa2's
+    contiguous-request contract; noncausal requests have at most 64 queries.
+    Minimum visibility carries replay/window-start state. Bounds are passed to
+    csa2 ONLY for noncausal calls; causal visibility stays query-dependent.
+    Padding records are -1. Empty requests have empty bounds.
+
+    Returns ``[layers, requests, 2 + columns]`` metadata, ``[requests, 2]``
+    bounds (shared by the layers) and ``[layers, tokens]`` records.
     """
     tokens = positions.shape[0]
-    requests = block_table.shape[0]
+    requests = starts.shape[0] - 1
+    width = block_tables.shape[0] // max(layers * requests, 1)
     if (
-        block_table.ndim != 2
-        or block_table.shape[1] < 1
-        or starts.shape != (requests + 1,)
+        block_tables.ndim != 1
+        or layers < 1
+        or width < 1
+        or block_tables.shape[0] != layers * requests * width
         or minimum_visible.shape != (requests,)
         or not tokens
         or page_size not in (8, 16, 32, 64)
@@ -383,27 +392,28 @@ def prepare_swa_metadata(
     # An unaligned first page can add one page to ceil((queries+history)/S).
     columns = (tokens + 128 + page_size - 1) // page_size + 1
     logical_pages = first_page[:, None] + jnp.arange(columns, dtype=jnp.int32)
-    blocks = jnp.take_along_axis(
-        block_table, jnp.minimum(logical_pages, block_table.shape[1] - 1), axis=1
-    )
+    # Flat index of (layer, request, column): layer-major, then row-major.
+    layer_base = jnp.arange(layers, dtype=jnp.int32)[:, None] * (requests * width)
+    row_base = jnp.arange(requests, dtype=jnp.int32)[:, None] * width
+    page_index = row_base + jnp.minimum(logical_pages, width - 1)
+    blocks = jnp.take(block_tables, layer_base[:, :, None] + page_index[None])
     physical = blocks * (page_stride // page_size) + row_offset // page_size
     visible = (
         (count[:, None] > 0)
-        & (logical_pages < block_table.shape[1])
+        & (logical_pages < width)
         & (logical_pages * page_size < right[:, None])
     )
+    head = jnp.stack((first_page * page_size, minimum_visible), axis=1)
     metadata = jnp.concatenate(
         (
-            (first_page * page_size)[:, None],
-            minimum_visible[:, None],
-            jnp.where(visible, physical, 0),
+            jnp.broadcast_to(head[None], (layers, requests, 2)),
+            jnp.where(visible[None], physical, 0),
         ),
-        axis=1,
+        axis=2,
     ).astype(jnp.int32)
     req = _requests(starts, tokens)
-    current_blocks = block_table[
-        req, jnp.minimum(positions // page_size, block_table.shape[1] - 1)
-    ]
+    token_index = req * width + jnp.minimum(positions // page_size, width - 1)
+    current_blocks = jnp.take(block_tables, layer_base + token_index[None])
     records = row_offset + current_blocks * page_stride + positions % page_size
     records = jnp.where(jnp.arange(tokens) < starts[-1], records, -1)
     return metadata, jnp.stack((left, right), axis=1), records.astype(jnp.int32)

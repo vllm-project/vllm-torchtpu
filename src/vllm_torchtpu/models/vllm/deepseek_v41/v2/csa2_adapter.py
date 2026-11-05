@@ -3,6 +3,7 @@
 
 import functools
 import math
+from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any, cast
 
 import jax
@@ -209,20 +210,22 @@ def _fake_gather_attend(q, raw, high, scales, high_scales, *_):
 
 
 def _metadata(
-    table: jax.Array,
+    tables: jax.Array,
     starts: jax.Array,
     positions: jax.Array,
     minimum: jax.Array,
+    layers: int,
     page_size: int,
     page_stride: int,
     row_offset: int,
     non_causal: bool,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     return prepare_swa_metadata(
-        table,
+        tables,
         starts,
         positions,
         minimum,
+        layers=layers,
         page_size=page_size,
         page_stride=page_stride,
         row_offset=row_offset,
@@ -230,12 +233,13 @@ def _metadata(
     )
 
 
-def _fake_metadata(table, starts, positions, minimum, page_size, *_):
+def _fake_metadata(tables, starts, positions, minimum, layers, page_size, *_):
     columns = (positions.shape[0] + 128 + page_size - 1) // page_size + 1
+    requests = starts.shape[0] - 1
     return (
-        table.new_empty((table.shape[0], 2 + columns)),
-        table.new_empty((table.shape[0], 2)),
-        positions.new_empty(positions.shape),
+        tables.new_empty((layers, requests, 2 + columns)),
+        tables.new_empty((requests, 2)),
+        positions.new_empty((layers, positions.shape[0])),
     )
 
 
@@ -284,7 +288,7 @@ def initialize_csa2_ops() -> None:
 
     mesh = get_vllm_model_wrapper_context().mesh
     definitions = (
-        ("metadata", _metadata, (P(),) * 4 + (None,) * 4, _fake_metadata),
+        ("metadata", _metadata, (P(),) * 4 + (None,) * 5, _fake_metadata),
         (
             "publish_main",
             _publish_main,
@@ -554,18 +558,25 @@ def project_out(
 
 
 def prepare_swa(
-    table: torch.Tensor,
+    tables: Sequence[torch.Tensor],
     starts: torch.Tensor,
     positions: torch.Tensor,
     minimum: torch.Tensor,
     cache: "PagedCacheRows",
     non_causal: bool,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """SWA page metadata of every layer whose block table is in ``tables``.
+
+    The layers share ``cache``'s geometry and one batch; returns
+    ``[layers, requests, 2 + columns]`` metadata, ``[requests, 2]`` bounds and
+    ``[layers, tokens]`` write records (see ``prepare_swa_metadata``).
+    """
     return _ops["metadata"](
-        table.int(),
+        torch.cat([table.reshape(-1).int() for table in tables]),
         starts.int(),
         positions.int(),
         minimum.int(),
+        len(tables),
         cache.shape[1],
         cache.page_stride,
         cache.row_offset,
