@@ -52,10 +52,9 @@ Per layer:
   projection ring;
 * MoE, ``make_indexed_moe_sp_ring``: sequence-parallel routing, then by
   ``moe_reduce_dtype``. FP32 (the default): ``prefill_moe.fused``, one
-  EP16/TP2 Pallas schedule for every window (512..8192). BF16:
-  ``prefill_moe.layer`` (packed latent/shared overlap, indexed gate/up,
-  weighted down fused with the reduce-scatter) for 4K/8K windows; 512..2048
-  use SparseCore row movement and the grouped matmuls and ring below.
+  EP16/TP2 Pallas schedule for every window (512..8192). BF16: SparseCore
+  row movement and the grouped matmuls and ring across 512..8192 (the
+  standalone packed BF16 4K/8K MoE ring is retired).
 
 The sections run bottom-up: the TPU kernel library (SparseCore gathers,
 TP32 rings, the grouped matmul), the K3 building blocks, the layers, then
@@ -69,6 +68,7 @@ from __future__ import annotations
 
 import dataclasses
 import functools
+import importlib
 from abc import ABC, abstractmethod
 from collections import namedtuple
 from collections.abc import Callable
@@ -89,14 +89,15 @@ from jax.experimental.pallas import tpu_sc as plsc
 from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 
-from vllm_torchtpu.models.kimi_k3.megakernel.common import pool_alias
-from vllm_torchtpu.models.kimi_k3.megakernel.config import active as _config
-from vllm_torchtpu.models.kimi_k3.megakernel.kernels.helpers import (
-    e8m0_scale,
-    expert_activation,
-    kda_decay,
-    kda_normalize_query_key,
-)
+from vllm_torchtpu.logger import init_logger
+
+from ..common import pool_alias
+
+from .. import config as _config_mod
+from ..config import active as _config
+from .helpers import e8m0_scale, expert_activation, kda_decay, kda_normalize_query_key
+
+logger = init_logger(__name__)
 
 # ============================================================================
 # SparseCore kernels through core_map
@@ -1587,6 +1588,10 @@ def get_packing_factor(storage_dtype: jnp.dtype, quant_dtype: jnp.dtype | None) 
 class RhsRef(ABC):
     """Abstract class that defines interfaces for rhs values."""
 
+    def __post_init__(self) -> None:
+        """Register prefill GMM dataclasses with JAX pytrees on first instantiation."""
+        ensure_prefill_pytrees_registered()
+
     @abstractmethod
     def get_weight(self) -> jax.Array: ...
 
@@ -1596,7 +1601,6 @@ class RhsRef(ABC):
         ...
 
 
-@jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True)
 class WeightsRef(RhsRef):
     """Dataclass for a single weights."""
@@ -1619,7 +1623,6 @@ class WeightsRef(RhsRef):
         return self.scale[...]
 
 
-@jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True)
 class FusedWeightsRef(RhsRef):
     """Dataclass for gate and up weights used in fused activation."""
@@ -1638,11 +1641,27 @@ class FusedWeightsRef(RhsRef):
         return interleave_lane(s_gate, s_up)
 
 
-@jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True)
 class MetadataRef:
+    """GMM group metadata references passed into Pallas kernels."""
+
     gm_id_to_group_id: jax.Array
     gm_id_to_m_offset: jax.Array
+
+    def __post_init__(self) -> None:
+        """Register prefill GMM dataclasses with JAX pytrees on first instantiation."""
+        ensure_prefill_pytrees_registered()
+
+
+_REGISTERED_PREFILL_PYTREES: set[type[object]] = set()
+
+
+def ensure_prefill_pytrees_registered() -> None:
+    """Register prefill GMM dataclasses with JAX pytrees once on first use."""
+    if not _REGISTERED_PREFILL_PYTREES:
+        for cls in (WeightsRef, FusedWeightsRef, MetadataRef):
+            jax.tree_util.register_dataclass(cls)
+            _REGISTERED_PREFILL_PYTREES.add(cls)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -2399,6 +2418,7 @@ def make_gmm_configs(
     rhs_quant_dtype: jnp.dtype | None = None,
 ):
     """Fills the GMM config for the GMM kernel."""
+    ensure_prefill_pytrees_registered()
 
     packing_factor = get_packing_factor(rhs.dtype, rhs_quant_dtype)
 
@@ -4744,6 +4764,9 @@ def _moe_sp_tail(routed, shared, prefix_local, length, weights, *,
     return (prefix_local + output).astype(jnp.bfloat16)
 
 
+moe_sp_tail = _moe_sp_tail
+
+
 def make_moe_fused_sp_repacked(mesh, *, seq_len, eps=1e-5, collective_id=42,
                                token_ranks=None):
     """Build the TP32 MoE layer for repacked projection weights: the local
@@ -4854,26 +4877,49 @@ MOE_FAMILIES = (
 )
 
 
-def make_indexed_moe_sp_ring(mesh, *, seq_len=8192):
+_WARNED_BF16_WINDOWS: set[int] = set()
+_RETIRED_PACKED_BF16_WINDOWS = (4096, 8192)
+
+
+def make_indexed_moe_sp_ring(
+    mesh: jax.sharding.Mesh | None,
+    *,
+    seq_len: int = 8192,
+) -> Callable[..., jax.Array]:
     """Select a MoE layer, keeping packed expert families resident for tile DMA."""
-    from ..config import active
-
-    if active().moe_reduce_dtype == "float32":
-        if seq_len in (512, 1024, 2048, 4096, 8192):
-            from .prefill_moe.fused import make_indexed_moe_sp_ring as make_fused_moe
-
-            return make_fused_moe(mesh, seq_len=seq_len)
-    elif seq_len in (4096, 8192):
-        # The per-hop BF16 reduction.
-        from .prefill_moe.layer import make_indexed_moe_sp_ring as make_packed_moe
-
-        return make_packed_moe(mesh, seq_len=seq_len)
+    reduce_dtype = _config_mod.active().moe_reduce_dtype
+    if reduce_dtype == "float32" and seq_len in (
+        512,
+        1024,
+        2048,
+        4096,
+        8192,
+    ):
+        fused_mod = importlib.import_module(".prefill_moe.fused", __package__)
+        return fused_mod.make_indexed_moe_sp_ring(mesh, seq_len=seq_len)
+    if (
+        reduce_dtype == "bfloat16"
+        and seq_len in _RETIRED_PACKED_BF16_WINDOWS
+        and seq_len not in _WARNED_BF16_WINDOWS
+    ):
+        _WARNED_BF16_WINDOWS.add(seq_len)
+        logger.warning(
+            "Packed BF16 prefill MoE is retired at seq_len=%d; using SparseCore gather/combine MoE.",
+            seq_len,
+        )
     return _make_indexed_moe_sp_ring_reference(mesh, seq_len=seq_len)
 
 
-def _make_indexed_moe_sp_ring_reference(mesh, *, seq_len=8192):
-    """SparseCore gather/combine path, for the windows the fused and packed
-    MoEs do not cover (BF16 reduction below 4K)."""
+def _make_indexed_moe_sp_ring_reference(
+    mesh: jax.sharding.Mesh | None,
+    *,
+    seq_len: int = 8192,
+) -> Callable[..., jax.Array]:
+    """SparseCore gather/combine path for BF16 reduction across all windows."""
+    if mesh is None:
+        msg = "SparseCore MoE ring requires a JAX Mesh"
+        raise ValueError(msg)
+    mesh_size = mesh.size
     base = make_moe_fused_sp_repacked(mesh, seq_len=seq_len)
 
     def run(hidden, prefix, families, length, slot):
@@ -4887,7 +4933,7 @@ def _make_indexed_moe_sp_ring_reference(mesh, *, seq_len=8192):
             )
             for name in MOE_FAMILIES
         }
-        selected["expert_layer"] = jnp.broadcast_to(slot[None], (mesh.size, 1))
+        selected["expert_layer"] = jnp.broadcast_to(slot[None], (mesh_size, 1))
         return base(hidden, prefix, selected, length)
 
     return jax.jit(run)

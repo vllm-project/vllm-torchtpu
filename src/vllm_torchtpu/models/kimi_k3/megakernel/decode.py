@@ -44,20 +44,16 @@ from __future__ import annotations
 
 import time
 from collections.abc import Iterable, Mapping, Sequence
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import torch
 from jax.sharding import PartitionSpec as P
 
 from vllm_torchtpu.logger import init_logger
-from vllm_torchtpu.models.kimi_k3.megakernel.decode_ops import (
-    GREEDY,
-    Control,
-    DecodeOps,
-    dp_row_owners,
-)
-from vllm_torchtpu.models.kimi_k3.megakernel.pools import (
+
+from .decode_ops import GREEDY, Control, DecodeOps, dp_row_owners
+from .pools import (
     KDA_LAYERS,
     KdaImporter,
     SlotMap,
@@ -65,7 +61,7 @@ from vllm_torchtpu.models.kimi_k3.megakernel.pools import (
     kda_blocks_at_length,
     tp_rank_permutation,
 )
-from vllm_torchtpu.models.kimi_k3.megakernel.program import (
+from .program import (
     DP_SPEC_BATCHES,
     SPEC_BATCHES,
     VOCAB,
@@ -73,20 +69,13 @@ from vllm_torchtpu.models.kimi_k3.megakernel.program import (
     spec_tokens_per_batch,
     supports_spec_tokens,
 )
-from vllm_torchtpu.models.kimi_k3.megakernel.runtime_shim.bridge import (
-    hbm,
-    materialize,
-    register_global_op,
-)
-from vllm_torchtpu.models.kimi_k3.megakernel.runtime_shim.config import (
-    MegakernelEngineConfig,
-)
-from vllm_torchtpu.models.kimi_k3.megakernel.runtime_shim.program import (
-    KVGroup,
-    RequestInput,
-    StepInput,
-    StepOutput,
-)
+from .runtime_shim.bridge import hbm, materialize, register_global_op
+from .runtime_shim.compilation import compile_ops
+from .runtime_shim.export_cache import prepare_distributed
+from .runtime_shim.program import KVGroup, RequestInput, StepInput, StepOutput
+
+if TYPE_CHECKING:
+    from .runtime_shim.config import MegakernelEngineConfig
 
 logger = init_logger(__name__)
 
@@ -938,10 +927,6 @@ class KimiDecoder:
         if self._compiled_layout != self.layout.key():
             from torch_tpu._internal.sync import synchronize
 
-            from vllm_torchtpu.models.kimi_k3.megakernel.runtime_shim.compilation import (
-                compile_ops,
-            )
-
             # The first step compiles its own variant (its state buffers come
             # from allocation, not from an op), which the precompiled graphs
             # do not cover: start it first so that compile overlaps theirs.
@@ -968,9 +953,6 @@ class KimiDecoder:
             calls.sort(key=lambda call: call.priority, reverse=True)
             # These builders capture the same static kernel/configuration
             # on every rank; weights and state are dynamic operands.
-            from vllm_torchtpu.models.kimi_k3.megakernel.runtime_shim.export_cache import (
-                prepare_distributed,
-            )
 
             prepare_distributed(calls)
             compile_ops(calls)

@@ -45,7 +45,7 @@ import dataclasses
 
 from jax.experimental import pallas as pl
 
-from vllm_torchtpu.models.kimi_k3.megakernel.common import pool_alias
+from . import pool_alias
 
 ALIGN = 4096
 

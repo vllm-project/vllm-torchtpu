@@ -24,12 +24,15 @@ from __future__ import annotations
 
 import importlib
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-from vllm_torchtpu.models.kimi_k3.megakernel.runtime_shim.config import (
-    MegakernelEngineConfig,
-)
-from vllm_torchtpu.models.kimi_k3.megakernel.runtime_shim.program import Capabilities
+from .layout import cache_layout
+from .runtime_shim.program import Capabilities
+
+if TYPE_CHECKING:
+    from .decode import KimiDecoder
+    from .prefill import KimiPrefiller
+    from .runtime_shim.config import MegakernelEngineConfig
 
 TP_SIZE = 32
 DCP_SIZE = 32
@@ -54,12 +57,7 @@ _SPEC_SUPPORT = (
 
 def kernel_modules(*names: str) -> list[Any]:
     """Import ``vllm_torchtpu.models.kimi_k3.megakernel.kernels.<name>`` for each name."""
-    return [
-        importlib.import_module(
-            f"vllm_torchtpu.models.kimi_k3.megakernel.kernels.{name}"
-        )
-        for name in names
-    ]
+    return [importlib.import_module(f".kernels.{name}", __package__) for name in names]
 
 
 def supports_spec_tokens(batch: int, drafts: int, attention_dp: int = 1) -> bool:
@@ -194,7 +192,6 @@ def check(config: MegakernelEngineConfig) -> None:
             f"the K3 megakernel needs --decode-context-parallel-size {dcp}"
             + (f" under attention_dp {config.attention_dp}" if dcp != DCP_SIZE else "")
         )
-    from vllm_torchtpu.models.kimi_k3.megakernel.layout import cache_layout
 
     layout = cache_layout(config.kv_cache_dtype)
     if config.block_size != layout.tokens_per_block:
@@ -271,27 +268,26 @@ def build(
     draft_checkpoint: Path | None = None,
     *,
     tp_rank: int,
-):
+) -> KimiPrefiller | KimiDecoder:
     """The program for ``config.role`` on TP rank ``tp_rank`` (the order the KV
     connector pairs devices in; ``draft_checkpoint``: the DSpark speculator --
     the prefill computes its ring, the decoder drafts with it and imports the
     ring the prefill wrote)."""
     check(config)
     if config.role == "prefill":
-        from vllm_torchtpu.models.kimi_k3.megakernel.prefill import KimiPrefiller
+        prefill_mod = importlib.import_module(".prefill", __package__)
 
-        return KimiPrefiller(config, presharded, draft_checkpoint, tp_rank=tp_rank)
-    from vllm_torchtpu.models.kimi_k3.megakernel.decode import KimiDecoder
-    from vllm_torchtpu.models.kimi_k3.megakernel.decode_ops import (
-        Control,
-        DecodeOps,
-        decode_batch_sizes,
-    )
+        return prefill_mod.KimiPrefiller(
+            config, presharded, draft_checkpoint, tp_rank=tp_rank
+        )
+    decode_mod = importlib.import_module(".decode", __package__)
+    decode_ops_mod = importlib.import_module(".decode_ops", __package__)
+    decode_batch_sizes = decode_ops_mod.decode_batch_sizes
 
     dense = spec_tokens_per_batch(config)
     draft = None
     if draft_checkpoint is not None and dense is not None and any(dense):
-        from vllm_torchtpu.models.kimi_k3.megakernel.draft import draft_class
+        draft_class = importlib.import_module(".draft", __package__).draft_class
 
         draft = draft_class(draft_checkpoint)(
             max_position=config.max_model_len + 16,
@@ -305,10 +301,10 @@ def build(
     # Speculative post-states are temporary; acceptance commits one state
     # into each regular request slot (decode_ops.Control).
     sub_base = 2 * config.max_num_seqs + 1
-    ops = DecodeOps(
+    ops = decode_ops_mod.DecodeOps(
         presharded,
-        num_slots=Control.total_slots(sub_base) if draft else sub_base,
+        num_slots=decode_ops_mod.Control.total_slots(sub_base) if draft else sub_base,
         batch_sizes=decode_batch_sizes(config.max_num_seqs),
         mamba_ssm_cache_dtype=config.mamba_ssm_cache_dtype,
     )
-    return KimiDecoder(config, ops, draft, tp_rank=tp_rank)
+    return decode_mod.KimiDecoder(config, ops, draft, tp_rank=tp_rank)

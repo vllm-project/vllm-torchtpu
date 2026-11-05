@@ -34,9 +34,9 @@ from typing import Any
 
 import jax
 import torch
+from jax.sharding import Mesh, PartitionSpec
 from torch_tpu._internal.pallas import pallas as pallas_impl
 
-from vllm_torchtpu.distributed.sharded_jax_op import _placeholder
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
@@ -74,6 +74,29 @@ def _process_rank() -> int:
     except Exception:  # best effort
         pass
     return int(jax.process_index())
+
+
+def _sharded_placeholder(
+    shape: tuple[int, ...],
+    dtype: jax.numpy.dtype,
+    spec: PartitionSpec,
+    mesh: Mesh | None,
+) -> torch.Tensor:
+    """Build one output tensor placeholder sized by ``spec`` on ``mesh``."""
+    torch_dtype = pallas_impl.JAX_TO_TORCH_DTYPE_MAP.get(dtype)
+    if torch_dtype is None:
+        msg = f"Unsupported dtype for pallas kernels: {dtype}"
+        raise NotImplementedError(msg)
+    local_shape = tuple(pallas_impl.get_local_shape(shape, mesh, spec))
+    if torch_dtype == torch.float4_e2m1fn_x2 and local_shape:
+        if local_shape[-1] % 2:
+            msg = (
+                f"Expected even minor local dim for {torch_dtype}, got "
+                f"{local_shape[-1]} (local={local_shape}, global={shape}, spec={spec})"
+            )
+            raise ValueError(msg)
+        local_shape = (*local_shape[:-1], local_shape[-1] // 2)
+    return torch.empty(local_shape, dtype=torch_dtype, device="tpu")
 
 
 class _ExportCache:
@@ -339,3 +362,19 @@ def hook(export_key: str | None) -> Callable[[Any], None] | None:
         op.__class__ = _cached_class(type(op))
 
     return configure
+
+
+def _placeholder(
+    aval: jax.core.ShapedArray | jax.ShapeDtypeStruct,
+    spec: PartitionSpec,
+    mesh: Mesh | None,
+) -> torch.Tensor:
+    """Return a sharded TPU tensor placeholder, falling back to meta on CPU."""
+    try:
+        return _sharded_placeholder(aval.shape, aval.dtype, spec, mesh)
+    except (RuntimeError, ValueError, TypeError):
+        return torch.empty(
+            tuple(pallas_impl.get_local_shape(aval.shape, mesh, spec)),
+            dtype=pallas_impl.JAX_TO_TORCH_DTYPE_MAP.get(aval.dtype),
+            device="meta",
+        )

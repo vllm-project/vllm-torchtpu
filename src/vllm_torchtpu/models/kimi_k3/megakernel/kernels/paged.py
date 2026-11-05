@@ -38,12 +38,9 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu
 
-from vllm_torchtpu.models.kimi_k3.megakernel.config import active as _config
-from vllm_torchtpu.models.kimi_k3.megakernel.kernels import mla_dcp
-from vllm_torchtpu.models.kimi_k3.megakernel.kernels.decode_megakernel import (
-    MLA_LAYERS,
-    decode_local,
-)
+from ..config import active as _config
+from . import mla_dcp
+from .decode_megakernel import MLA_LAYERS, decode_local
 
 
 def latent_rows_from_handoff(new_keys):

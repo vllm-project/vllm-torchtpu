@@ -38,7 +38,8 @@ from pathlib import Path
 
 import numpy as np
 
-from vllm_torchtpu.models.kimi_k3.megakernel.config import active as _config
+from ..config import active as _config
+from .decode_megakernel import ATTENTION_DP_WEIGHTS
 
 CHUNK = 64 << 20
 EXPERT_FAMILIES = ("expert_gu", "expert_gus", "expert_down", "expert_ds")
@@ -260,9 +261,6 @@ def attention_dp_families(families: dict, presharded, rank: int, layers: int, dp
     ``rank % (32 / dp) + k * (32 / dp)`` in order ``k``, concatenated or
     stacked per ``decode_megakernel.ATTENTION_DP_WEIGHTS``, the other shards
     read from their ranks' pre-shards."""
-    from vllm_torchtpu.models.kimi_k3.megakernel.kernels.decode_megakernel import (
-        ATTENTION_DP_WEIGHTS,
-    )
 
     group = 32 // dp
     shards = []

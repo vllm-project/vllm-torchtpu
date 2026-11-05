@@ -46,20 +46,21 @@ from vllm_torchtpu.megakernel_runtime.plugin import (
     StepFn,
     WarmupCase,
 )
-from vllm_torchtpu.models.kimi_k3.megakernel.kernels.load import pack_expert_bytes
-from vllm_torchtpu.models.kimi_k3.megakernel.layout import (
+
+from .kernels.load import pack_expert_bytes
+from .layout import (
     FP8_LAYOUT,
     LAYOUT,
     NUM_LAYERS,
 )
-from vllm_torchtpu.models.kimi_k3.megakernel.pools import (
+from .pools import (
     KDA_LAYERS,
     MLA_LAYERS,
     SlotMap,
     is_mla_layer,
     layer_index,
 )
-from vllm_torchtpu.models.kimi_k3.megakernel.program import (
+from .program import (
     DRAFT_TOKENS,
     HIDDEN_SIZE,
     TP_SIZE,

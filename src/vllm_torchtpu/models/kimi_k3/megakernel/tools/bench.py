@@ -36,15 +36,21 @@ case packs into.
 
 from __future__ import annotations
 
+import importlib
 import os
 import statistics
 import time
 from contextlib import contextmanager
+from typing import TYPE_CHECKING
 
 import numpy as np
 
-from vllm_torchtpu.models.kimi_k3.megakernel import settings
-from vllm_torchtpu.models.kimi_k3.megakernel.tools import harness, k3
+from .. import settings
+from . import harness, k3
+
+if TYPE_CHECKING:
+    from ..decode import KimiDecoder
+    from ..prefill import KimiPrefiller
 
 
 def add_arguments(parser, profile: bool = False) -> None:
@@ -150,7 +156,7 @@ def _trace(directory: str, tag: str, last: bool):
     if not (directory and last and harness.rank() in ranks):
         yield
         return
-    from torch_tpu._internal.profiler import _impl as profiler
+    profiler = importlib.import_module("torch_tpu._internal.profiler._impl")
 
     path = os.path.join(directory, tag)
     if ranks != [0]:
@@ -170,10 +176,10 @@ def run(args, records: harness.Records) -> None:
 def run_decode(args, records: harness.Records) -> None:
     import torch
 
-    from vllm_torchtpu.models.kimi_k3.megakernel import config
-    from vllm_torchtpu.models.kimi_k3.megakernel.decode_ops import Control, DecodeOps
-    from vllm_torchtpu.models.kimi_k3.megakernel.runtime_shim import bridge
-    from vllm_torchtpu.models.kimi_k3.megakernel.runtime_shim import program as mk
+    config = importlib.import_module("..config", __package__)
+    decode_ops_mod = importlib.import_module("..decode_ops", __package__)
+    bridge = importlib.import_module("..runtime_shim.bridge", __package__)
+    mk = importlib.import_module("..runtime_shim.program", __package__)
 
     batches = [int(b) for b in args.batches.split(",")]
     contexts = [int(c) for c in args.contexts.split(",")]
@@ -194,9 +200,11 @@ def run_decode(args, records: harness.Records) -> None:
     dp = config.active().attention_dp
     blocks = 1 + -(-rows // dp) * pages
     sizes = tuple(sorted({b for b, _ in cases if b > 1} | {1}))
-    ops = DecodeOps(
+    ops = decode_ops_mod.DecodeOps(
         args.presharded,
-        num_slots=Control.total_slots(sub_base) if args.dspark else sub_base,
+        num_slots=decode_ops_mod.Control.total_slots(sub_base)
+        if args.dspark
+        else sub_base,
         batch_sizes=sizes,
     )
     pools = k3.Pools(blocks, pages, 1, pattern=True)
@@ -213,7 +221,7 @@ def run_decode(args, records: harness.Records) -> None:
 
     draft = None
     if args.dspark and any(drafts_at(batch) for batch, _ in cases):
-        from vllm_torchtpu.models.kimi_k3.megakernel.draft import draft_class
+        draft_class = importlib.import_module("..draft", __package__).draft_class
 
         rates = None
         if args.acceptance:
@@ -326,10 +334,10 @@ def run_decode(args, records: harness.Records) -> None:
 def run_prefill(args, records: harness.Records) -> None:
     import torch
 
-    from vllm_torchtpu.models.kimi_k3.megakernel import prefill as k3_prefill
-    from vllm_torchtpu.models.kimi_k3.megakernel import program as k3_program
-    from vllm_torchtpu.models.kimi_k3.megakernel.runtime_shim import bridge
-    from vllm_torchtpu.models.kimi_k3.megakernel.runtime_shim import program as mk
+    k3_prefill = importlib.import_module("..prefill", __package__)
+    k3_program = importlib.import_module("..program", __package__)
+    bridge = importlib.import_module("..runtime_shim.bridge", __package__)
+    mk = importlib.import_module("..runtime_shim.program", __package__)
 
     cases = []
     for part in filter(None, args.prompts.split(",")):
@@ -350,7 +358,7 @@ def run_prefill(args, records: harness.Records) -> None:
     max_seqs = max(count for _, count, _ in cases)
     totals = [length + prefix for length, _, prefix in cases]
     max_model_len = -(-max(totals) // k3.LOGICAL) * k3.LOGICAL
-    prefiller = k3_program.build(
+    prefiller: KimiPrefiller | KimiDecoder = k3_program.build(
         k3.engine_config(
             "prefill",
             max_num_seqs=max_seqs,

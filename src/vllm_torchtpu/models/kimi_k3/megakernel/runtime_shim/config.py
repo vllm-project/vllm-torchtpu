@@ -33,7 +33,7 @@ from __future__ import annotations
 import dataclasses
 from typing import Any, Protocol
 
-from vllm_torchtpu.models.kimi_k3.megakernel.runtime_shim import backend
+from . import backend
 
 
 @dataclasses.dataclass(frozen=True)

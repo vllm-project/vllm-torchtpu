@@ -35,13 +35,16 @@ from typing import Any
 
 import jax
 import jax.numpy as jnp
+import jax.typing
 from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 from jax.sharding import PartitionSpec as P
 
+from ...config import active as _config
 from .. import prefill_megakernel as k
-from .indexed_ragged_gmm import _PackedRows
+from .indexed_ragged_gmm import PackedRows, indexed_gate_up
+from .moe_down_valu import down_valu, down_valu_compact
 
 
 def _sort_route_steps(keys, probabilities, *, size):
@@ -1282,7 +1285,7 @@ def _routed_experts(
                         start(g + 1, 1 - bank)
 
                     _gu_inner(
-                        _PackedRows(acts.at[bank]),
+                        PackedRows(acts.at[bank]),
                         gw,
                         gy,
                         gu_partial,
@@ -1985,6 +1988,78 @@ def _layer_kernel(
     )
 
 
+_OVERFLOW_WINDOW_TOKENS = 8192
+_COMPACT_METADATA_PREFIX_ROWS = 32768
+_COMPACT_DOWN_TILE = 256
+_COMPACT_DOWN_COLUMNS = 896
+_COMPACT_DOWN_UNROLL = 32
+_DEFAULT_DOWN_TILE = 128
+_DEFAULT_DOWN_COLUMNS = 1792
+_DEFAULT_DOWN_UNROLL = 8
+
+
+def routed_experts_prepared(
+    latent: jax.Array,
+    *expert_inputs: jax.Array,
+    reduce_tables: jax.typing.ArrayLike,
+    expert_layer: jax.Array | None = None,
+    global_route_max: jax.Array | int | None = None,
+) -> jax.Array:
+    """Consume prepared expert-major metadata with the indexed GU/down path."""
+    (
+        sorted_tokens,
+        sorted_probs,
+        counts,
+        expert_gate_up,
+        expert_gate_up_scales,
+        expert_down,
+        expert_down_scales,
+    ) = expert_inputs
+    if expert_layer is not None:
+        expert_layer = k.expert_family_slot(expert_gate_up.shape[0], expert_layer)
+    tokens = latent.shape[0]
+    gu_scale = expert_gate_up_scales.astype(jnp.uint8)
+    down_scale = expert_down_scales.astype(jnp.uint8)
+    middle = indexed_gate_up(
+        latent, sorted_tokens, expert_gate_up, counts, gu_scale, expert_layer
+    )
+    ring_dtype = jnp.dtype(_config().moe_reduce_dtype)
+    if tokens == _OVERFLOW_WINDOW_TOKENS:
+        return down_valu_compact(
+            middle,
+            expert_down,
+            down_scale,
+            counts,
+            sorted_tokens,
+            sorted_probs,
+            reduce_tables,
+            tile=_COMPACT_DOWN_TILE,
+            columns=_COMPACT_DOWN_COLUMNS,
+            unroll=_COMPACT_DOWN_UNROLL,
+            metadata_prefix_rows=_COMPACT_METADATA_PREFIX_ROWS,
+            slice_input=False,
+            global_route_max=global_route_max,
+            tokens=tokens,
+            layer=expert_layer,
+            ring_dtype=ring_dtype,
+        )
+    return down_valu(
+        middle,
+        expert_down,
+        down_scale,
+        counts,
+        sorted_tokens,
+        sorted_probs,
+        reduce_tables,
+        tile=_DEFAULT_DOWN_TILE,
+        columns=_DEFAULT_DOWN_COLUMNS,
+        unroll=_DEFAULT_DOWN_UNROLL,
+        tokens=tokens,
+        layer=expert_layer,
+        ring_dtype=ring_dtype,
+    )
+
+
 def make_indexed_moe_sp_ring(mesh, *, seq_len=8192):
     """Build the fused EP16/TP2 prefill MoE for a supported serving window.
 
@@ -2003,8 +2078,6 @@ def make_indexed_moe_sp_ring(mesh, *, seq_len=8192):
         )
     if mesh.size != 32 or tuple(mesh.axis_names) != ("k3_sp",):
         raise ValueError("Fused prefill MoE requires a flat 32-rank k3_sp mesh")
-    from .layer import routed_experts_prepared
-
     rows = seq_len // 32
     tables = k.ring_tables(list(mesh.devices.flat), tuple(range(32)))
     hbm = pl.BlockSpec(memory_space=pltpu.HBM)
@@ -2090,7 +2163,7 @@ def make_indexed_moe_sp_ring(mesh, *, seq_len=8192):
                 global_route_max=maximum[0],
             )
             selected = {name: w[name][slot[0]] for name in ("latent_norm", "latent_up")}
-            return k._moe_sp_tail(
+            return k.moe_sp_tail(
                 reduced,
                 shared,
                 prefix[0],

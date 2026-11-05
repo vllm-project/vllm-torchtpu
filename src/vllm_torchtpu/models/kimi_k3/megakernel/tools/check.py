@@ -54,11 +54,20 @@ from __future__ import annotations
 
 import dataclasses
 import gc
+import importlib
 import time
+from typing import TYPE_CHECKING
 
 import numpy as np
 
-from vllm_torchtpu.models.kimi_k3.megakernel.tools import harness, k3
+from . import harness, k3
+
+if TYPE_CHECKING:
+    from ..decode import KimiDecoder
+    from ..prefill import KimiPrefiller
+    from ..runtime_shim import bridge as _bridge_type
+else:
+    _bridge_type = None
 
 
 def add_arguments(parser) -> None:
@@ -146,8 +155,8 @@ def run_greedy(args, records: harness.Records) -> None:
 
     import torch
 
-    from vllm_torchtpu.models.kimi_k3.megakernel.decode_ops import DecodeOps
-    from vllm_torchtpu.models.kimi_k3.megakernel.runtime_shim import program as mk
+    decode_ops_mod = importlib.import_module("..decode_ops", __package__)
+    mk = importlib.import_module("..runtime_shim.program", __package__)
 
     all_ids, tokenizer = k3.fixed_prompt(args.prompt_tokens, args.model)
     prompts = [np.asarray(all_ids, np.int32)] + [
@@ -162,7 +171,9 @@ def run_greedy(args, records: harness.Records) -> None:
     pages = -(-(args.prompt_tokens + args.generate + 64) // k3.logical()) + 1
     # One batch size for every config (under attention DP the five prompts
     # need B8): the replay's single rows and the batch run the same kernel.
-    ops = DecodeOps(args.presharded, num_slots=2 * 8 + 1, batch_sizes=(8,))
+    ops = decode_ops_mod.DecodeOps(
+        args.presharded, num_slots=2 * 8 + 1, batch_sizes=(8,)
+    )
     pools = k3.Pools(len(prompts) * pages + 1, pages, 1)
     decoder = k3.decoder(
         ops,
@@ -216,9 +227,9 @@ def _agree(a: list[int], b: list[int]) -> int:
 def run_masked(args, records: harness.Records) -> None:
     import torch
 
-    from vllm_torchtpu.models.kimi_k3.megakernel import program as k3_program
-    from vllm_torchtpu.models.kimi_k3.megakernel.decode_ops import DecodeOps
-    from vllm_torchtpu.models.kimi_k3.megakernel.runtime_shim import program as mk
+    k3_program = importlib.import_module("..program", __package__)
+    decode_ops_mod = importlib.import_module("..decode_ops", __package__)
+    mk = importlib.import_module("..runtime_shim.program", __package__)
 
     all_ids, tokenizer = k3.fixed_prompt(args.prompt_tokens, args.model)
     prompts = [
@@ -234,13 +245,15 @@ def run_masked(args, records: harness.Records) -> None:
     words = k3_program.VOCAB // 32
     # Speculative steps take up to eight tokens each.
     pages = -(-(args.prompt_tokens + 8 * args.generate + 64) // k3.logical()) + 1
-    ops = DecodeOps(args.presharded, num_slots=2 * 4 + 1, batch_sizes=(1, 2, 4))
+    ops = decode_ops_mod.DecodeOps(
+        args.presharded, num_slots=2 * 4 + 1, batch_sizes=(1, 2, 4)
+    )
     pools = k3.Pools(16 * pages + 1, pages, 1)
     draft = None
     if args.dspark:
-        from vllm_torchtpu.models.kimi_k3.megakernel.draft import DsparkDraft
+        draft_mod = importlib.import_module("..draft", __package__)
 
-        draft = DsparkDraft(
+        draft = draft_mod.DsparkDraft(
             max_position=args.prompt_tokens + 8 * args.generate + 64,
             checkpoint=args.dspark,
             presharded=args.presharded,
@@ -377,8 +390,8 @@ def _masked_around_speculation(decoder, prompts, tables, names, reference) -> bo
     multi-token step), and the greedy streams must follow the plain
     reference (until a near-tie: the verify and plain ops reduce in
     different orders) about as far as the pure DSpark streams do."""
-    from vllm_torchtpu.models.kimi_k3.megakernel import program as k3_program
-    from vllm_torchtpu.models.kimi_k3.megakernel.runtime_shim import program as mk
+    k3_program = importlib.import_module("..program", __package__)
+    mk = importlib.import_module("..runtime_shim.program", __package__)
 
     ones = np.full((2, k3_program.VOCAB // 32), -1, np.int32)
     plain_ref = [[int(t) for t in reference[:, n]] for n in range(2)]
@@ -440,14 +453,15 @@ def _masked_around_speculation(decoder, prompts, tables, names, reference) -> bo
 def run_spec(args, records: harness.Records) -> None:
     import torch
 
-    from vllm_torchtpu.models.kimi_k3.megakernel.decode_ops import (
-        Control,
-        DecodeOps,
-        decode_batch_sizes,
+    decode_ops_mod = importlib.import_module("..decode_ops", __package__)
+    decode_batch_sizes = decode_ops_mod.decode_batch_sizes
+    draft_class = importlib.import_module("..draft", __package__).draft_class
+    bridge = (
+        _bridge_type
+        if _bridge_type is not None
+        else importlib.import_module("..runtime_shim.bridge", __package__)
     )
-    from vllm_torchtpu.models.kimi_k3.megakernel.draft import draft_class
-    from vllm_torchtpu.models.kimi_k3.megakernel.runtime_shim import bridge
-    from vllm_torchtpu.models.kimi_k3.megakernel.runtime_shim import program as mk
+    mk = importlib.import_module("..runtime_shim.program", __package__)
 
     count, generate, rows = args.prompt_tokens, args.generate, args.single_drafts + 1
     large = sorted(int(n) for n in args.large_batches.split(",") if n)
@@ -476,9 +490,9 @@ def run_spec(args, records: harness.Records) -> None:
     pages = -(-(longest_prompt + 4 * generate + 64) // k3.logical()) + 1
     # One copy of the weights for the decoders below (max_num_seqs 8, or the
     # largest --large-batches count).
-    ops = DecodeOps(
+    ops = decode_ops_mod.DecodeOps(
         args.presharded,
-        num_slots=Control.total_slots(2 * most + 1),
+        num_slots=decode_ops_mod.Control.total_slots(2 * most + 1),
         batch_sizes=decode_batch_sizes(most),
     )
     pools = k3.Pools((10 + max([0, *large])) * pages + 1, pages, 1)
@@ -998,9 +1012,9 @@ def run_spec(args, records: harness.Records) -> None:
 def run_handoff(args, records: harness.Records) -> None:
     import torch
 
-    from vllm_torchtpu.models.kimi_k3.megakernel import program as k3_program
-    from vllm_torchtpu.models.kimi_k3.megakernel.runtime_shim import bridge
-    from vllm_torchtpu.models.kimi_k3.megakernel.runtime_shim import program as mk
+    k3_program = importlib.import_module("..program", __package__)
+    bridge = importlib.import_module("..runtime_shim.bridge", __package__)
+    mk = importlib.import_module("..runtime_shim.program", __package__)
 
     generate, max_model_len = args.generate, 32768
     # The kernel rank stands in for the TP / DCP rank, so the prefiller writes
@@ -1082,7 +1096,7 @@ def run_handoff(args, records: harness.Records) -> None:
     from pathlib import Path
 
     draft = Path(args.dspark) if args.dspark else None
-    prefiller = k3_program.build(
+    prefiller: KimiPrefiller | KimiDecoder = k3_program.build(
         k3.engine_config(
             "prefill",
             max_num_seqs=4,
@@ -1230,8 +1244,10 @@ def _handoff_rings(
     """The DSpark half of ``check handoff`` (see the module docstring)."""
     import torch
 
-    from vllm_torchtpu.models.kimi_k3.megakernel.pools import kda_blocks_at_length
-    from vllm_torchtpu.models.kimi_k3.megakernel.runtime_shim import program as mk
+    kda_blocks_at_length = importlib.import_module(
+        "..pools", __package__
+    ).kda_blocks_at_length
+    mk = importlib.import_module("..runtime_shim.program", __package__)
 
     window, steps, ok = decoder.draft.config.window, args.speculate_steps, True
     for req, n in lengths.items():
@@ -1327,11 +1343,13 @@ def run_packing(args, records: harness.Records) -> None:
 
     import torch
 
-    from vllm_torchtpu.models.kimi_k3.megakernel import prefill as k3_prefill
-    from vllm_torchtpu.models.kimi_k3.megakernel import program as k3_program
-    from vllm_torchtpu.models.kimi_k3.megakernel.pools import kda_blocks_at_length
-    from vllm_torchtpu.models.kimi_k3.megakernel.runtime_shim import bridge
-    from vllm_torchtpu.models.kimi_k3.megakernel.runtime_shim import program as mk
+    k3_prefill = importlib.import_module("..prefill", __package__)
+    k3_program = importlib.import_module("..program", __package__)
+    kda_blocks_at_length = importlib.import_module(
+        "..pools", __package__
+    ).kda_blocks_at_length
+    bridge = importlib.import_module("..runtime_shim.bridge", __package__)
+    mk = importlib.import_module("..runtime_shim.program", __package__)
 
     window, slots = k3_program.MAX_STEP_TOKENS, k3_prefill.SLOTS
     max_model_len = 2 * window
@@ -1352,7 +1370,7 @@ def run_packing(args, records: harness.Records) -> None:
     # The kernel rank stands in for the TP / DCP rank (see run_handoff).
     rank = bridge.kernel_mesh("tp", k3_program.TP_SIZE)[1]
     draft = Path(args.dspark) if args.dspark else None
-    prefiller = k3_program.build(
+    prefiller: KimiPrefiller | KimiDecoder = k3_program.build(
         k3.engine_config(
             "prefill",
             max_num_seqs=slots,

@@ -19,9 +19,14 @@ as vLLM's, their KV cache groups, the fixed prompt."""
 from __future__ import annotations
 
 import glob
+import importlib
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import numpy as np
+
+if TYPE_CHECKING:
+    from ..decode import KimiDecoder
 
 PAGE, DCP = 256, 32
 LOGICAL = PAGE * DCP  # tokens per vLLM DCP block
@@ -30,7 +35,7 @@ CACHE_DTYPE = "auto"
 
 def configure_cache(dtype: str) -> None:
     """Configure standalone fixtures from the same cache option as serving."""
-    from vllm_torchtpu.models.kimi_k3.megakernel.layout import cache_layout
+    cache_layout = importlib.import_module("..layout", __package__).cache_layout
 
     global PAGE, LOGICAL, CACHE_DTYPE
     PAGE = cache_layout(dtype).tokens_per_block
@@ -40,7 +45,7 @@ def configure_cache(dtype: str) -> None:
 
 def logical() -> int:
     """Tokens per DCP block under the installed kernel config's DCP group."""
-    from vllm_torchtpu.models.kimi_k3.megakernel import config
+    config = importlib.import_module("..config", __package__)
 
     return PAGE * config.active().dcp_group
 
@@ -49,7 +54,7 @@ def fixed_prompt(count: int, checkpoint: str):
     """``(tokens, tokenizer)``: the first ``count`` tokens of a fixed text, the
     model repository's own Python sources (``checkpoint``: the Kimi-K3
     checkpoint directory)."""
-    from vllm_torchtpu.models.kimi_k3.megakernel.program import kernel_modules
+    kernel_modules = importlib.import_module("..program", __package__).kernel_modules
 
     (load,) = kernel_modules("load")
     tokenizer = load.load_tokenizer(checkpoint)
@@ -72,8 +77,8 @@ class Pools:
     ) -> None:
         import torch
 
-        from vllm_torchtpu.models.kimi_k3.megakernel import layout
-        from vllm_torchtpu.models.kimi_k3.megakernel.runtime_shim import program as mk
+        layout = importlib.import_module("..layout", __package__)
+        mk = importlib.import_module("..runtime_shim.program", __package__)
 
         cache = layout.cache_layout(CACHE_DTYPE)
         dtype = getattr(torch, cache.dtype)
@@ -130,7 +135,7 @@ class Pools:
         ``g = index % dp`` (fewest requests first) and its pages are ids
         ``g * num_blocks + row`` (``megakernel.dp_blocks``); the null block
         stays shared."""
-        from vllm_torchtpu.models.kimi_k3.megakernel import config
+        config = importlib.import_module("..config", __package__)
 
         group = index % config.active().attention_dp
         table = np.asarray(table, np.int32)
@@ -163,13 +168,11 @@ def engine_config(
     """The serving configuration's megakernel view, for the TP32 / DCP32
     deployment (DCP over each group under the installed kernel config's
     attention DP) with the configured cache (``configure_cache``)."""
-    from vllm_torchtpu.models.kimi_k3.megakernel import config
-    from vllm_torchtpu.models.kimi_k3.megakernel.runtime_shim.config import (
-        MegakernelEngineConfig,
-    )
+    config = importlib.import_module("..config", __package__)
+    config_mod = importlib.import_module("..runtime_shim.config", __package__)
 
     dp = config.active().attention_dp
-    return MegakernelEngineConfig(
+    return config_mod.MegakernelEngineConfig(
         role=role,
         tensor_parallel_size=32,
         decode_context_parallel_size=DCP // dp,
@@ -192,12 +195,12 @@ def decoder(
     max_model_len: int,
     draft=None,
     schedule: tuple[tuple[int, int, int], ...] | None = None,
-):
+) -> KimiDecoder:
     """A :class:`KimiDecoder` over shared ``ops`` (and ``draft``) and the
     fixture ``pools``, bound and ready to warm. ``schedule``: vLLM's
     per-batch-size draft count (None: plain steps only). Pages are owned by
     mesh position, as the fixtures lay them out."""
-    from vllm_torchtpu.models.kimi_k3.megakernel.decode import KimiDecoder
+    decode_mod = importlib.import_module("..decode", __package__)
 
     config = engine_config(
         "decode",
@@ -207,7 +210,9 @@ def decoder(
         num_speculative_tokens=7 if schedule else 0,
         num_speculative_tokens_per_batch_size=schedule,
     )
-    decoder = KimiDecoder(config, ops, draft if schedule else None, tp_rank=ops.rank)
+    decoder = decode_mod.KimiDecoder(
+        config, ops, draft if schedule else None, tp_rank=ops.rank
+    )
     decoder.bind_kv_caches(pools.caches, pools.groups)
     return decoder
 
@@ -222,7 +227,7 @@ def request(
     """A decode step's request scheduling ``tokens`` after ``computed`` ones,
     MLA pages ``table``. Its KDA tables hold only the null block, so a
     decoder that has not seen it starts it from a clean state (no import)."""
-    from vllm_torchtpu.models.kimi_k3.megakernel.runtime_shim import program as mk
+    mk = importlib.import_module("..runtime_shim.program", __package__)
 
     tokens = np.asarray(tokens, np.int32)
     end = computed + len(tokens)

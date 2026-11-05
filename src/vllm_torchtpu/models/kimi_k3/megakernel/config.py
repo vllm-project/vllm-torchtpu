@@ -26,9 +26,7 @@ import hashlib
 import json
 from typing import Any
 
-from vllm_torchtpu.models.kimi_k3.megakernel.runtime_shim.config import (
-    set_active_kernel_config,
-)
+from .runtime_shim.config import set_active_kernel_config
 
 
 @dataclasses.dataclass(frozen=True)
@@ -75,8 +73,8 @@ class KernelConfig:
     mla_flash_qtile: int = 1024
     mla_flash_ktile: int = 2048
     # Both prefill MoE rings: BF16 halves transfer bytes, rounding every hop.
-    # FP32 runs the fused MoE at every window; BF16 the packed MoE at 4K/8K
-    # and the SparseCore gather/combine below 4K.
+    # FP32 runs the fused MoE at every window; BF16 runs the SparseCore
+    # gather/combine MoE at every window.
     moe_reduce_dtype: str = "float32"
     # Weight loading.
     read_streams: int = 4

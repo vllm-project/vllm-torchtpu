@@ -27,6 +27,7 @@ request's KDA state (into its private slot) and draft ring (:class:`KdaImporter`
 from __future__ import annotations
 
 import dataclasses
+import importlib
 import re
 from collections.abc import Mapping, Sequence
 from typing import Any
@@ -39,15 +40,9 @@ from jax.sharding import Mesh
 from jax.sharding import PartitionSpec as P
 
 from vllm_torchtpu.logger import init_logger
-from vllm_torchtpu.models.kimi_k3.megakernel.layout import (
-    CONV_HEAD_ROWS,
-    CONV_TAPS,
-    HEAD_DIM,
-    KDA_HEADS,
-    LAYOUT,
-    cache_layout,
-)
-from vllm_torchtpu.models.kimi_k3.megakernel.program import TP_SIZE
+
+from .layout import CONV_HEAD_ROWS, CONV_TAPS, HEAD_DIM, KDA_HEADS, LAYOUT, cache_layout
+from .program import TP_SIZE
 
 logger = init_logger(__name__)
 
@@ -362,9 +357,10 @@ class KdaImporter:
         if self._op is not None:
             return self._op
         from vllm_torchtpu.kernels import pool_adapters
-        from vllm_torchtpu.models.kimi_k3.megakernel.runtime_shim.bridge import (
-            register_op,
-        )
+
+        register_op = importlib.import_module(
+            ".runtime_shim.bridge", __package__
+        ).register_op
 
         num_raw, kda_raw, perm = (
             len(self.raw_pools),
@@ -479,10 +475,12 @@ class KdaImporter:
         rank's KV head, positions [1, window])`` -- all ``-1`` (a cold ring)
         unless the prefill wrote a ring for ``length`` tokens there."""
         if self._ring_op is None:
-            from vllm_torchtpu.models.kimi_k3.megakernel.program import kernel_modules
-            from vllm_torchtpu.models.kimi_k3.megakernel.runtime_shim.bridge import (
-                register_op,
-            )
+            kernel_modules = importlib.import_module(
+                ".program", __package__
+            ).kernel_modules
+            register_op = importlib.import_module(
+                ".runtime_shim.bridge", __package__
+            ).register_op
 
             (dspark,) = kernel_modules("dspark")
             num_raw, kda_raw, perm = (

@@ -45,18 +45,13 @@ revision that produced it.
 from __future__ import annotations
 
 import argparse
+import importlib
 import os
 import sys
 import tempfile
 
-from vllm_torchtpu.models.kimi_k3.megakernel import settings
-from vllm_torchtpu.models.kimi_k3.megakernel.tools import (
-    bench,
-    check,
-    harness,
-    k3,
-    preshard,
-)
+from .. import settings
+from . import bench, check, harness, k3, preshard
 
 LLO_FLAGS = (
     "--xla_jf_dump_to={dir} --xla_jf_dump_llo_text=true "
@@ -125,7 +120,7 @@ def parser() -> argparse.ArgumentParser:
 
 
 def kernel_config(overrides: list[str]):
-    from vllm_torchtpu.models.kimi_k3.megakernel import config
+    config = importlib.import_module("..config", __package__)
 
     fields = {}
     for item in overrides:
@@ -177,9 +172,9 @@ def main(argv: list[str]) -> int:
     harness.init()
     coverage = None
     if args.coverage and harness.rank() == 0:
-        from vllm_torchtpu.models.kimi_k3.megakernel.tools.coverage import LineCoverage
+        coverage_mod = importlib.import_module(".coverage", __package__)
 
-        coverage = LineCoverage(args.coverage)
+        coverage = coverage_mod.LineCoverage(args.coverage)
         coverage.start()  # before the kernels import: their module-level lines count
     k3.configure_cache(args.kv_cache_dtype)
     config = kernel_config(args.set)  # before any kernel module is imported

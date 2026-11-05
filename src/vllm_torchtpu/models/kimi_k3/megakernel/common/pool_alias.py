@@ -50,8 +50,15 @@ class Reinterpret(types.ReshapeTransform):
             """Initialize view transform."""
 
 
-tree_util.register_dataclass(Reinterpret)
+_REGISTERED: set[type[object]] = set()
 _ORIGINAL = vars(lowering)["_reshape_memref"]
+
+
+def _ensure_registered() -> None:
+    """Lazily register ``Reinterpret`` with JAX ``tree_util`` on first use."""
+    if Reinterpret not in _REGISTERED:
+        _REGISTERED.add(Reinterpret)
+        tree_util.register_dataclass(Reinterpret)
 
 
 def _lower(
@@ -115,6 +122,7 @@ def view(
     dtype: jax.typing.DTypeLike,
 ) -> types.TransformedRef:
     """Reinterpret ``ref`` as ``shape`` and ``dtype`` over tiled VMEM."""
+    _ensure_registered()
     bitcast_ref = ref.bitcast(dtype)
     return types.TransformedRef(
         bitcast_ref.ref,

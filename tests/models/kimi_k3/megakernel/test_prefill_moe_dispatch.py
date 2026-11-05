@@ -21,7 +21,7 @@ from vllm_torchtpu.models.kimi_k3.megakernel import config
 from vllm_torchtpu.models.kimi_k3.megakernel.kernels import (
     prefill_megakernel as kernels,
 )
-from vllm_torchtpu.models.kimi_k3.megakernel.kernels.prefill_moe import fused, layer
+from vllm_torchtpu.models.kimi_k3.megakernel.kernels.prefill_moe import fused
 from vllm_torchtpu.models.kimi_k3.megakernel.kernels.prefill_moe.moe_down_valu import (
     down_valu_compact,
 )
@@ -42,16 +42,8 @@ def test_dispatch_by_window_and_reduce_dtype(monkeypatch, window, reduce_dtype):
         "make_indexed_moe_sp_ring",
         lambda mesh, *, seq_len: ("fused", seq_len),
     )
-    monkeypatch.setattr(
-        layer,
-        "make_indexed_moe_sp_ring",
-        lambda mesh, *, seq_len: ("bf16", seq_len),
-    )
     result = kernels.make_indexed_moe_sp_ring(None, seq_len=window)
-    if reduce_dtype == "float32":
-        expected = "fused"
-    else:
-        expected = "bf16" if window in (4096, 8192) else "reference"
+    expected = "fused" if reduce_dtype == "float32" else "reference"
     assert result == (expected, window)
 
 
@@ -127,3 +119,35 @@ def test_fused_validity_matches_sequence_parallel_ownership(tokens):
             owned = (owned + np.arange(stripe)[None, :]).reshape(rows, 1)
             actual = fused._stripe_validity(rows, jnp.int32(live), jnp.int32(rank))
             np.testing.assert_array_equal(actual, owned < live)
+
+
+def test_bf16_retired_packed_moe_logs_warning_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify BF16 at 4K/8K logs a one-time notice and routes to SparseCore MoE."""
+    cfg = config.KernelConfig(moe_reduce_dtype="bfloat16")
+    monkeypatch.setattr(config, "active", lambda: cfg)
+    monkeypatch.setattr(
+        kernels,
+        "_make_indexed_moe_sp_ring_reference",
+        lambda _mesh, *, seq_len: ("reference", seq_len),
+    )
+    monkeypatch.setattr(kernels, "_WARNED_BF16_WINDOWS", set())
+    warned: list[int] = []
+    monkeypatch.setattr(
+        kernels.logger,
+        "warning",
+        lambda _msg, seq_len: warned.append(seq_len),
+    )
+    for silent_window in (512, 1024, 2048):
+        assert kernels.make_indexed_moe_sp_ring(None, seq_len=silent_window) == (
+            "reference",
+            silent_window,
+        )
+    assert warned == []
+    for retired_window in (4096, 8192, 4096, 8192):
+        assert kernels.make_indexed_moe_sp_ring(None, seq_len=retired_window) == (
+            "reference",
+            retired_window,
+        )
+    assert warned == [4096, 8192]

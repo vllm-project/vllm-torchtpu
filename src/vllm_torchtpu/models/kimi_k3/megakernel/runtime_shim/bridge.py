@@ -52,10 +52,9 @@ from jax.sharding import Mesh, PartitionSpec
 
 from vllm_torchtpu.distributed.sharded_jax_op import sharded_jax_op
 from vllm_torchtpu.logger import init_logger
-from vllm_torchtpu.models.kimi_k3.megakernel.runtime_shim import export_cache
-from vllm_torchtpu.models.kimi_k3.megakernel.runtime_shim.config import (
-    get_active_kernel_config,
-)
+
+from . import export_cache
+from .config import get_active_kernel_config
 
 logger = init_logger(__name__)
 
