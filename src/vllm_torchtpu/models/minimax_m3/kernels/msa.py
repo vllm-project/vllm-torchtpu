@@ -155,6 +155,62 @@ def sparse_attention(
     )
 
 
+def _select_and_attend(
+    q: jax.Array,
+    kv_cache: jax.Array,
+    scores: jax.Array,
+    block_tables_2d: jax.Array,
+    seq_id: jax.Array,
+    pos: jax.Array,
+    pages: jax.Array,
+    valid: jax.Array,
+    *,
+    sm_scale: float,
+    topk: int,
+    init_blocks: int,
+    local_blocks: int,
+    interpret: bool,
+) -> jax.Array:
+    selected = msa_select.select_blocks(
+        scores,
+        pos,
+        block_size=page_size(kv_cache),
+        topk=topk,
+        init_blocks=init_blocks,
+        local_blocks=local_blocks,
+        interpret=interpret,
+    )
+    return sparse_attention(
+        q,
+        kv_cache,
+        selected,
+        block_tables_2d,
+        seq_id,
+        pos,
+        pages,
+        valid,
+        sm_scale=sm_scale,
+        interpret=interpret,
+    )
+
+
+def _block_scores(
+    index_q, index_cache, seq_lens, block_tables, cu_q_lens, num_seqs, interpret
+):
+    return msa_indexer.block_scores(
+        index_q,
+        index_cache,
+        seq_lens,
+        block_tables,
+        cu_q_lens,
+        num_seqs,
+        block_q=msa_indexer.DEFAULT_BLOCK_Q,
+        large_block_q=msa_indexer.DEFAULT_LARGE_BLOCK_Q,
+        pages_per_step=msa_indexer.DEFAULT_PAGES_PER_STEP,
+        interpret=interpret,
+    )
+
+
 def msa_forward(
     q: jax.Array,
     k: jax.Array,
@@ -194,37 +250,220 @@ def msa_forward(
     kv_cache = write(kv_cache, jnp.concatenate([k, v], axis=-1)[:, 0])
     index_cache = write(index_cache, index_k)
 
-    scores = msa_indexer.block_scores(
+    scores = _block_scores(
         index_q,
         index_cache,
         seq_lens,
         block_tables,
         cu_q_lens,
         distribution[2],
-        block_q=msa_indexer.DEFAULT_BLOCK_Q,
-        large_block_q=msa_indexer.DEFAULT_LARGE_BLOCK_Q,
-        pages_per_step=msa_indexer.DEFAULT_PAGES_PER_STEP,
-        interpret=interpret,
+        interpret,
     )
-    selected = msa_select.select_blocks(
-        scores,
-        pos,
-        block_size=block_size,
-        topk=topk,
-        init_blocks=init_blocks,
-        local_blocks=local_blocks,
-        interpret=interpret,
-    )
-    out = sparse_attention(
+    out = _select_and_attend(
         q,
         kv_cache,
-        selected,
+        scores,
         block_tables_2d,
         seq_id,
         pos,
         pages,
         valid,
         sm_scale=sm_scale,
+        topk=topk,
+        init_blocks=init_blocks,
+        local_blocks=local_blocks,
         interpret=interpret,
     )
     return kv_cache, index_cache, out
+
+
+# Index-cache sharding over the tensor-parallel group. Rank r of S keeps the
+# index keys of the tokens at positions p with p % S == r, so its index cache
+# holds block_size / S tokens per page. A block's score is a max over its
+# tokens, so the max over ranks of each rank's per-page max is the exact
+# block score. Every rank scores all S index heads on its keys; one
+# all-to-all (outside JAX) brings each rank the S partials of its own head.
+
+
+def write_index_shard(
+    index_cache: jax.Array,
+    index_k: jax.Array,
+    pages: jax.Array,
+    pos: jax.Array,
+    valid: jax.Array,
+    *,
+    rank: int,
+    shards: int,
+    max_num_seqs: int,
+    interpret: bool = False,
+) -> jax.Array:
+    """Write the index keys of this rank's tokens into its shard cache.
+
+    The token at position ``p`` (``p % shards == rank``) lands at slot
+    ``(p % block_size) // shards`` of its page. This rank's tokens are first
+    compacted, so a request's rows stay consecutive with consecutive slots,
+    as `msa_write.write_rows` needs.
+    """
+    num_tokens = index_k.shape[0]
+    shard_page = page_size(index_cache)
+    block_size = shard_page * shards
+    # A request of q tokens owns at most ceil(q / shards) of them.
+    size = min(num_tokens, num_tokens // shards + max_num_seqs)
+    (idx,) = jnp.nonzero(
+        valid & (pos % shards == rank), size=size, fill_value=num_tokens
+    )
+    take = jnp.minimum(idx, num_tokens - 1)
+    own_pages = jnp.where(idx < num_tokens, pages[take], _DROPPED_PAGE)
+    return msa_write.write_rows(
+        index_cache,
+        _cache_rows(index_cache, index_k[take]),
+        own_pages,
+        (pos[take] % block_size) // shards,
+        max_runs=msa_write.max_write_runs(size, max_num_seqs, shard_page),
+        interpret=interpret,
+    )
+
+
+def partial_block_scores(
+    index_q: jax.Array,
+    index_cache: jax.Array,
+    seq_lens: jax.Array,
+    block_tables: jax.Array,
+    cu_q_lens: jax.Array,
+    num_seqs: jax.Array,
+    *,
+    interpret: bool = False,
+) -> jax.Array:
+    """``[H, T, P]`` per-page maxima of all ``H`` index heads over this
+    rank's keys (``index_q [T, H, D]``).
+
+    The heads are folded into each request's query rows (request ``s`` owns
+    rows ``[H * cu[s], H * cu[s + 1])`` in (head, token) order), so one
+    `block_scores` call reads the shard's pages once per query tile.
+    """
+    num_tokens, num_heads, head_dim = index_q.shape
+    seq_id, _, valid = token_positions(num_tokens, seq_lens, cu_q_lens)
+    tok = jnp.arange(num_tokens, dtype=jnp.int32)
+    q_len = cu_q_lens[seq_id + 1] - cu_q_lens[seq_id]
+    head = jnp.arange(num_heads, dtype=jnp.int32)[:, None]
+    num_real = cu_q_lens[-1]
+    rows = jnp.where(
+        valid[None],
+        num_heads * cu_q_lens[seq_id][None]
+        + head * q_len[None]
+        + (tok - cu_q_lens[seq_id])[None],
+        # Padding tokens after the last request, one unique row each.
+        num_heads * num_real + head * (num_tokens - num_real) + (tok - num_real)[None],
+    )
+    folded = (
+        jnp.zeros((num_heads * num_tokens, head_dim), index_q.dtype)
+        .at[rows.reshape(-1)]
+        .set(index_q.transpose(1, 0, 2).reshape(-1, head_dim))
+    )
+    scores = _block_scores(
+        folded[:, None],
+        index_cache,
+        seq_lens,
+        block_tables,
+        num_heads * cu_q_lens,
+        num_seqs,
+        interpret,
+    )
+    return scores[rows, 0]
+
+
+def msa_write_and_score_sharded(
+    k: jax.Array,
+    v: jax.Array,
+    index_q: jax.Array,
+    index_k: jax.Array,
+    kv_cache: jax.Array,
+    index_cache: jax.Array,
+    seq_lens: jax.Array,
+    block_tables: jax.Array,
+    cu_q_lens: jax.Array,
+    distribution: jax.Array,
+    *,
+    rank: int,
+    shards: int,
+    interpret: bool = False,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """First half of the sharded forward: write K/V and this rank's index
+    keys, score all heads on them. ``index_q [T, shards, D]`` holds every
+    head (all-gathered). Returns ``(kv_cache, index_cache, partial
+    [shards, T, P])``: rank ``r``'s block scores are the max over ranks of
+    their ``partial[r]``."""
+    num_tokens = k.shape[0]
+    block_size = page_size(kv_cache)
+    max_num_seqs = seq_lens.shape[0]
+    block_tables_2d = block_tables.reshape(max_num_seqs, -1)
+    seq_id, pos, valid = token_positions(num_tokens, seq_lens, cu_q_lens)
+    pages = _token_pages(block_tables_2d, seq_id, pos, valid, block_size)
+    kv_cache = write_rows(
+        kv_cache,
+        jnp.concatenate([k, v], axis=-1)[:, 0],
+        pages,
+        pos,
+        max_num_seqs=max_num_seqs,
+        interpret=interpret,
+    )
+    index_cache = write_index_shard(
+        index_cache,
+        index_k,
+        pages,
+        pos,
+        valid,
+        rank=rank,
+        shards=shards,
+        max_num_seqs=max_num_seqs,
+        interpret=interpret,
+    )
+    partial = partial_block_scores(
+        index_q,
+        index_cache,
+        seq_lens,
+        block_tables,
+        cu_q_lens,
+        distribution[2],
+        interpret=interpret,
+    )
+    return kv_cache, index_cache, partial
+
+
+def msa_attend_sharded(
+    q: jax.Array,
+    kv_cache: jax.Array,
+    scores: jax.Array,
+    seq_lens: jax.Array,
+    block_tables: jax.Array,
+    cu_q_lens: jax.Array,
+    *,
+    sm_scale: float,
+    topk: int,
+    init_blocks: int,
+    local_blocks: int,
+    interpret: bool = False,
+) -> jax.Array:
+    """Second half of the sharded forward: select over the combined
+    ``scores [T, 1, P]`` of this rank's head and attend."""
+    num_tokens = q.shape[0]
+    block_size = page_size(kv_cache)
+    max_num_seqs = seq_lens.shape[0]
+    block_tables_2d = block_tables.reshape(max_num_seqs, -1)
+    seq_id, pos, valid = token_positions(num_tokens, seq_lens, cu_q_lens)
+    pages = _token_pages(block_tables_2d, seq_id, pos, valid, block_size)
+    return _select_and_attend(
+        q,
+        kv_cache,
+        scores,
+        block_tables_2d,
+        seq_id,
+        pos,
+        pages,
+        valid,
+        sm_scale=sm_scale,
+        topk=topk,
+        init_blocks=init_blocks,
+        local_blocks=local_blocks,
+        interpret=interpret,
+    )

@@ -17,7 +17,11 @@ import torch
 from torch import nn
 from transformers import PreTrainedConfig
 from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
-from vllm.distributed import get_tensor_model_parallel_world_size
+from vllm.distributed import (
+    get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size,
+    get_tp_group,
+)
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.layernorm import GemmaRMSNorm
 from vllm.model_executor.layers.linear import (
@@ -32,7 +36,7 @@ from vllm.v1.kv_cache_interface import KVCacheSpec, MLAAttentionSpec
 from vllm_torchtpu.layers.adapter.attention import PallasMLAttentionBackend
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
 from vllm_torchtpu.layers.core.owned_kv_cache import TpuOwnedKVCache
-from vllm_torchtpu.models.minimax_m3.ops.msa import get_msa_op
+from vllm_torchtpu.models.minimax_m3.ops.msa import get_msa_op, get_msa_sharded_op
 
 
 class MiniMaxM3Cache(nn.Module, TpuOwnedKVCache):
@@ -40,32 +44,67 @@ class MiniMaxM3Cache(nn.Module, TpuOwnedKVCache):
 
     Holds ``[K | V]`` rows for the attention cache and index keys for the
     indexer cache; only the MSA kernels read it, so no attention backend's
-    layout is involved.
+    layout is involved. With ``token_shards > 1`` a page holds only every
+    ``token_shards``-th token of its block (the index-cache shard of one
+    tensor-parallel rank), packed as ``[pages, S / shards / p, p, W]``.
     """
 
-    def __init__(self, row_width: int, dtype: torch.dtype, prefix: str) -> None:
+    def __init__(
+        self, row_width: int, dtype: torch.dtype, prefix: str, token_shards: int = 1
+    ) -> None:
         super().__init__()
         self.row_width = row_width
         self.dtype = dtype
         self.prefix = prefix
+        self.token_shards = token_shards
         self.kv_cache = torch.tensor([])
-        static_forward_context = get_current_vllm_config().compilation_config
+        vllm_config = get_current_vllm_config()
+        self.block_size = vllm_config.cache_config.block_size
+        if self.block_size % token_shards:
+            raise ValueError(
+                f"block size {self.block_size} is not a multiple of the "
+                f"{token_shards} index-cache shards"
+            )
+        static_forward_context = vllm_config.compilation_config
         static_forward_context = static_forward_context.static_forward_context
         if prefix in static_forward_context:
             raise ValueError(f"Duplicate layer name: {prefix}")
         static_forward_context[prefix] = self
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
-        # MLAAttentionSpec budgets one row of row_width per token.
+        # MLAAttentionSpec budgets one row of row_width per token; a shard
+        # stores 1 / token_shards of the rows, budgeted as a narrower row.
         return MLAAttentionSpec(
             block_size=vllm_config.cache_config.block_size,
             num_kv_heads=1,
-            head_size=self.row_width,
+            head_size=self.row_width // self.token_shards,
             dtype=self.dtype,
         )
 
+    def kv_cache_shape(self, num_blocks: int) -> tuple[int, ...] | None:
+        if self.token_shards == 1:
+            return None
+        packing = 32 // (8 * self.dtype.itemsize)
+        tokens = self.block_size // self.token_shards
+        return (num_blocks, tokens // packing, packing, self.row_width)
+
     def get_attn_backend(self) -> type[AttentionBackend]:
         return PallasMLAttentionBackend
+
+
+# --additional-config key: shard the MSA index-K cache over the TP group
+# (`kernels.msa` index-cache sharding). Part of the compile-cache key.
+SHARD_INDEX_CACHE_KEY = "minimax_shard_index_cache"
+
+
+def shard_index_cache_enabled(vllm_config: VllmConfig) -> bool:
+    config = vllm_config.additional_config
+    if not isinstance(config, dict):
+        return False
+    enabled = config.get(SHARD_INDEX_CACHE_KEY, False)
+    if not isinstance(enabled, bool):
+        raise ValueError(f"additional_config.{SHARD_INDEX_CACHE_KEY} must be a bool")
+    return enabled
 
 
 def cache_dtype(cache_config: CacheConfig | None) -> torch.dtype:
@@ -146,19 +185,38 @@ class MiniMaxM3SparseAttention(nn.Module):
                 "partial_rotary_factor": config.partial_rotary_factor,
             },
         )
+        # With one index head per rank, each rank can keep a 1 / tp share of
+        # the index keys (`kernels.msa` index-cache sharding).
+        shard = shard_index_cache_enabled(get_current_vllm_config())
+        self.index_shards = tp_size if shard else 1
+        if self.index_shards > 1 and tp_size != config.num_key_value_heads:
+            raise NotImplementedError(
+                f"additional_config.{SHARD_INDEX_CACHE_KEY} needs one index head "
+                f"per rank (tensor parallel size {config.num_key_value_heads}), "
+                f"got {tp_size}."
+            )
         dtype = cache_dtype(cache_config)
         self.kv_cache = MiniMaxM3Cache(
             2 * self.head_dim, dtype, prefix=f"{prefix}.attn"
         )
         self.index_cache = MiniMaxM3Cache(
-            self.index_head_dim, dtype, prefix=f"{prefix}.attn.index_cache"
+            self.index_head_dim,
+            dtype,
+            prefix=f"{prefix}.attn.index_cache",
+            token_shards=self.index_shards,
         )
-        self.msa_op = get_msa_op(
+        msa_config = (
             scaling,
             sparse_cfg["sparse_topk_blocks"],
             sparse_cfg.get("sparse_init_block", 0),
             sparse_cfg.get("sparse_local_block", 0),
         )
+        if self.index_shards > 1:
+            self.msa_op = get_msa_sharded_op(
+                *msa_config, get_tensor_model_parallel_rank(), self.index_shards
+            )
+        else:
+            self.msa_op = get_msa_op(*msa_config)
 
     def forward(
         self, positions: torch.Tensor, hidden_states: torch.Tensor
@@ -190,11 +248,15 @@ class MiniMaxM3SparseAttention(nn.Module):
         else:
             layer_metadata = metadata[self.kv_cache.prefix]
             assert isinstance(layer_metadata, AttentionMetadata)
+            index_q = index_q.view(num_tokens, self.num_kv_heads, self.index_head_dim)
+            if self.index_shards > 1:
+                # Every rank scores all index heads on its share of the keys.
+                index_q = get_tp_group().all_gather(index_q.contiguous(), dim=1)
             attn_output = self.msa_op(
                 q.view(num_tokens, self.num_heads, self.head_dim),
                 k.view(num_tokens, self.num_kv_heads, self.head_dim),
                 v.view(num_tokens, self.num_kv_heads, self.head_dim),
-                index_q.view(num_tokens, self.num_kv_heads, self.index_head_dim),
+                index_q,
                 index_k,
                 kv_cache,
                 self.index_cache.kv_cache,

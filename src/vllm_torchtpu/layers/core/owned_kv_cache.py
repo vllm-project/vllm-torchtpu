@@ -21,3 +21,13 @@ class TpuOwnedKVCache(AttentionLayerBase):
     types subclass this so the spec from `get_kv_cache_spec` is used as is,
     which lets a model add side caches without editing the runner.
     """
+
+    def kv_cache_shape(self, num_blocks: int) -> tuple[int, ...] | None:
+        """The exact shape of this layer's cache tensor, or ``None`` to let
+        the attention backend derive it from the spec.
+
+        A layer that returns a shape gets its spec to vLLM unnormalized, so
+        the spec's page size must match the shape's bytes per block.
+        """
+        del num_blocks
+        return None

@@ -15,16 +15,20 @@
 
 import functools
 from collections.abc import Callable
+from typing import Any
 
 import jax
 import torch
 from torch_tpu._internal import pallas
+from vllm.distributed import get_tp_group
 
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
-from vllm_torchtpu.models.minimax_m3.kernels import msa
+from vllm_torchtpu.models.minimax_m3.kernels import msa, msa_indexer
 
 _KV_CACHE_ARG = 5
 _INDEX_CACHE_ARG = 6
+_SHARD_KV_CACHE_ARG = 4
+_SHARD_INDEX_CACHE_ARG = 5
 
 
 @functools.cache
@@ -113,3 +117,140 @@ def get_msa_op(
         return out
 
     return op
+
+
+@functools.cache
+def get_msa_sharded_op(
+    sm_scale: float,
+    topk: int,
+    init_blocks: int,
+    local_blocks: int,
+    rank: int,
+    shards: int,
+) -> Callable[..., torch.Tensor]:
+    """`get_msa_op` for an index cache sharded over the tensor-parallel group.
+
+    Two JAX ops around one all-to-all: the first writes K/V and this rank's
+    index keys and scores every index head on them; the all-to-all brings
+    each rank the per-rank partials of its own head, whose max is the exact
+    block score; the second selects blocks and attends. ``index_q`` passed
+    to the op holds all ``shards`` heads.
+    """
+
+    def _score_jax(
+        k,
+        v,
+        index_q,
+        index_k,
+        kv_cache,
+        index_cache,
+        seq_lens,
+        block_tables,
+        query_start_loc,
+        request_distribution,
+    ):
+        return msa.msa_write_and_score_sharded(
+            k,
+            v,
+            index_q,
+            index_k,
+            kv_cache,
+            index_cache,
+            seq_lens,
+            block_tables,
+            query_start_loc,
+            request_distribution,
+            rank=rank,
+            shards=shards,
+        )
+
+    def _attend_jax(q, kv_cache, scores, seq_lens, block_tables, query_start_loc):
+        return msa.msa_attend_sharded(
+            q,
+            kv_cache,
+            scores,
+            seq_lens,
+            block_tables,
+            query_start_loc,
+            sm_scale=sm_scale,
+            topk=topk,
+            init_blocks=init_blocks,
+            local_blocks=local_blocks,
+        )
+
+    suffix = (
+        f"t{topk}_i{init_blocks}_l{local_blocks}_s{sm_scale:.8f}_r{rank}of{shards}"
+    ).replace(".", "p")
+    score_op = pallas.jax_op(
+        f"pallas::minimax_m3_msa_shard_score_{suffix}",
+        _score_jax,
+        donate_argnums=(_SHARD_KV_CACHE_ARG, _SHARD_INDEX_CACHE_ARG),
+    )
+    attend_op = pallas.jax_op(
+        f"pallas::minimax_m3_msa_shard_attend_{suffix}", _attend_jax
+    )
+
+    def _score_fake(
+        k, v, index_q, index_k, kv_cache, index_cache, seq_lens, block_tables, *args
+    ):
+        pages_per_seq = block_tables.shape[0] // seq_lens.shape[0]
+        step = msa_indexer.DEFAULT_PAGES_PER_STEP
+        padded_pages = -(-pages_per_seq // step) * step
+        return (
+            torch.empty_like(kv_cache),
+            torch.empty_like(index_cache),
+            torch.empty(
+                (shards, k.shape[0], padded_pages), dtype=torch.float32, device=k.device
+            ),
+        )
+
+    score_op.register_fake(_score_fake)
+    attend_op.register_fake(lambda q, *args: torch.empty_like(q))
+
+    def op(
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        index_q: torch.Tensor,
+        index_k: torch.Tensor,
+        kv_cache: torch.Tensor,
+        index_cache: torch.Tensor,
+        metadata: AttentionMetadata,
+    ) -> torch.Tensor:
+        new_kv_cache, new_index_cache, partial = score_op(
+            k,
+            v,
+            index_q,
+            index_k,
+            kv_cache,
+            index_cache,
+            metadata.seq_lens,
+            metadata.block_tables,
+            metadata.query_start_loc,
+            metadata.request_distribution,
+        )
+        kv_cache.copy_(new_kv_cache)
+        index_cache.copy_(new_index_cache)
+        # Row r of the result came from rank r: its partial for this head.
+        scores = _all_to_all(partial, get_tp_group()).amax(dim=0)
+        return attend_op(
+            q,
+            kv_cache,
+            scores[:, None, :],
+            metadata.seq_lens,
+            metadata.block_tables,
+            metadata.query_start_loc,
+        )
+
+    return op
+
+
+def _all_to_all(x: torch.Tensor, group: Any) -> torch.Tensor:
+    """Block ``d`` of ``x``'s leading axis goes to rank ``d``; block ``r`` of
+    the result came from rank ``r``."""
+    from torch.distributed import _functional_collectives as funcol
+
+    out = funcol.all_to_all_single(x.contiguous(), None, None, group.device_group)
+    if isinstance(out, funcol.AsyncCollectiveTensor):
+        return funcol.wait_tensor(out)
+    return out
