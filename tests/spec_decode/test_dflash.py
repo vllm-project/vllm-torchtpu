@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import inspect
 from types import SimpleNamespace
 from unittest import mock
 
@@ -40,7 +39,6 @@ from vllm.v1.kv_cache_interface import (
 from vllm.v1.request import Request
 from vllm.v1.structured_output import StructuredOutputManager
 
-from vllm_torchtpu import _patch_dflash_drafting_slot_budget
 from vllm_torchtpu.layers.adapter import token_padding
 from vllm_torchtpu.layers.adapter.token_padding import TokenPaddingState
 from vllm_torchtpu.platforms.tpu_platform import _get_token_paddings
@@ -250,7 +248,7 @@ def test_precompile_warms_draft_only_buckets():
 NUM_SPEC_TOKENS = 7
 
 
-def _spec_config(method: str, parallel_drafting: bool = True) -> SpeculativeConfig:
+def _spec_config(method: str) -> SpeculativeConfig:
     """A real SpeculativeConfig for ``method`` without loading a drafter."""
     spec = SpeculativeConfig(
         model="ngram",
@@ -259,22 +257,8 @@ def _spec_config(method: str, parallel_drafting: bool = True) -> SpeculativeConf
         prompt_lookup_min=1,
     )
     spec.method = method
-    spec.parallel_drafting = parallel_drafting
+    spec.parallel_drafting = True
     return spec
-
-
-@pytest.fixture
-def install_slot_patch(monkeypatch):
-    # Platform activation in earlier tests may have installed the patch
-    # already, so unwrap to upstream's getter. Teardown restores the property
-    # the test found.
-    prop = SpeculativeConfig.__dict__["max_num_new_slots_for_drafting"]
-    monkeypatch.setattr(
-        SpeculativeConfig,
-        "max_num_new_slots_for_drafting",
-        property(inspect.unwrap(prop.fget)),
-    )
-    return _patch_dflash_drafting_slot_budget
 
 
 def _build_scheduler(max_num_batched_tokens: int, method: str) -> Scheduler:
@@ -337,53 +321,22 @@ def _add_request(scheduler: Scheduler, request_id: str, num_prompt_tokens: int):
 
 
 @pytest.mark.parametrize(
-    ("method", "parallel_drafting", "upstream_slots", "tpu_slots"),
-    [
-        ("dflash", True, NUM_SPEC_TOKENS, 0),
-        ("dspark", True, NUM_SPEC_TOKENS - 1, 0),
-        # Methods without a TPU block drafter keep upstream's charge.
-        ("eagle3", True, NUM_SPEC_TOKENS - 1, NUM_SPEC_TOKENS - 1),
-        ("draft_model", True, NUM_SPEC_TOKENS, NUM_SPEC_TOKENS),
-        ("draft_model", False, 1, 1),
-        ("ngram", False, 0, 0),
-    ],
-)
-def test_only_tpu_block_drafters_stop_charging_slots(
-    install_slot_patch, method, parallel_drafting, upstream_slots, tpu_slots
-):
-    spec = _spec_config(method, parallel_drafting)
-    assert spec.max_num_new_slots_for_drafting == upstream_slots
-    install_slot_patch()
-    assert spec.max_num_new_slots_for_drafting == tpu_slots
-
-
-def test_slot_patch_installs_once(install_slot_patch):
-    install_slot_patch()
-    installed = SpeculativeConfig.__dict__["max_num_new_slots_for_drafting"]
-    install_slot_patch()
-    assert SpeculativeConfig.__dict__["max_num_new_slots_for_drafting"] is installed
-
-
-@pytest.mark.parametrize(
     ("method", "expected_prefill"),
     [
-        # TPU block drafter: its K - 1 drafting slots go to prefill.
+        # TPU block drafter: vLLM charges it no drafting slots.
         ("dspark", 40),
         # PARD has no TPU block drafter and keeps its K-slot charge.
         ("draft_model", 40 - NUM_SPEC_TOKENS),
     ],
 )
-def test_tpu_block_drafter_slots_go_to_prefill(
-    install_slot_patch, method, expected_prefill
-):
-    install_slot_patch()
+def test_tpu_block_drafter_slots_go_to_prefill(method, expected_prefill):
     scheduler = _build_scheduler(max_num_batched_tokens=40, method=method)
     _add_request(scheduler, "prefill", 96)
 
     assert scheduler.schedule().num_scheduled_tokens == {"prefill": expected_prefill}
 
 
-def test_uncharged_draft_stays_in_precompiled_buckets(install_slot_patch):
+def test_uncharged_draft_stays_in_precompiled_buckets():
     """Without the charge a step's draft outgrows the token budget.
 
     Each scheduled request drafts a full block however few tokens it was
@@ -391,7 +344,6 @@ def test_uncharged_draft_stays_in_precompiled_buckets(install_slot_patch):
     tokens than max_num_batched_tokens. DFlash must still pad that draft to a
     bucket precompile warmed.
     """
-    install_slot_patch()
     budget = 40
     scheduler = _build_scheduler(max_num_batched_tokens=budget, method="dflash")
     for i in range(6):

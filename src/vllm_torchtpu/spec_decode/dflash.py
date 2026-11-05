@@ -227,6 +227,8 @@ class DFlashProposer:
         self._draft_attn_layer_names = (
             set(all_attn_layers.keys()) - target_attn_layer_names
         )
+        for name in self._draft_attn_layer_names:
+            all_attn_layers[name].is_draft_layer = True
 
         # Share Embeddings and LM Head. DFlash drafts always predict target
         # vocab, so sharing is forced; DSpark overrides the flag because a
@@ -305,8 +307,7 @@ class DFlashProposer:
 
         The target's buckets stop at max_num_batched_tokens, but the draft
         forward is num_reqs * block_size tokens: the scheduler does not
-        charge drafting slots for these methods
-        (vllm_torchtpu._patch_dflash_drafting_slot_budget), so a request
+        charge drafting slots for these methods, so a request
         scheduled fewer than block_size tokens still drafts a full block,
         and a step's draft can outgrow the largest target bucket.
         """

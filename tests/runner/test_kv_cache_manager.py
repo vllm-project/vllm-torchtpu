@@ -17,6 +17,7 @@ Moved verbatim out of `tests/runner/test_tpu_runner.py` alongside the code
 they cover; see vllm-project/vllm-torchtpu#713.
 """
 
+import dataclasses
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -33,6 +34,7 @@ from vllm.config import (
 from vllm.model_executor.layers.attention import Attention, MLAAttention
 from vllm.model_executor.layers.mamba.abstract import MambaBase
 from vllm.v1.attention.backend import AttentionType
+from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheConfig,
@@ -45,6 +47,7 @@ from vllm.v1.kv_cache_interface import (
 from vllm.v1.worker.utils import AttentionGroup
 
 from vllm_torchtpu import utils
+from vllm_torchtpu.core.runner_slot_mamba import RunnerSlotMambaSpec
 from vllm_torchtpu.layers.adapter.attention import (
     PallasAttentionBackend,
     PallasBatchedRPAAttentionBackend,
@@ -98,6 +101,16 @@ class DummyMamba(MambaBase):
     @property
     def mamba_type(self):
         return "dummy"
+
+
+class DummyGdn(DummyMamba):
+    """DummyMamba reporting the GDN backend, as Qwen's GDN layers do."""
+
+    def get_kv_cache_spec(self, vllm_config):
+        return dataclasses.replace(
+            super().get_kv_cache_spec(vllm_config),
+            mamba_type=MambaAttentionBackendEnum.GDN_ATTN,
+        )
 
 
 class _FakeReserveSpec:
@@ -597,6 +610,11 @@ class TestKVCacheManager:
         assert isinstance(created_caches["attn.0"], torch.Tensor)
         assert created_caches["attn.0"].shape == (100, 16, 2, 1, 128)
 
+    @pytest.mark.parametrize(
+        "mamba_spec_cls, uniform_mamba_layout",
+        [(MambaSpec, False), (RunnerSlotMambaSpec, False), (RunnerSlotMambaSpec, True)],
+        ids=["stock_spec", "runner_slot_spec", "runner_slot_spec_without_slot_pool"],
+    )
     @patch(
         "vllm_torchtpu.runner.tpu_runner.PallasAttentionBackend.get_kv_cache_shape",
         return_value=(100, 16, 2, 1, 128),
@@ -618,11 +636,15 @@ class TestKVCacheManager:
         mock_bind_kv_cache,
         mock_get_page_size,
         mock_get_shape,
+        mamba_spec_cls,
+        uniform_mamba_layout,
     ):
         """Compact-mamba: when _mamba_num_blocks is set, mamba layers allocate
         exactly that many recurrent slots while attention keeps num_blocks, and
         the slot pool is initialized to _mamba_num_blocks. Every cache is
-        allocated on the device (no host copy) and flushed by one sync."""
+        allocated on the device (no host copy) and flushed by one sync. A
+        RunnerSlotMambaSpec group (no scheduler blocks) is refused where there
+        is no slot pool."""
         num_blocks = 100
         mamba_num_blocks = 17  # max_num_reqs(16) + 1
         uniform_size = 203776
@@ -635,7 +657,7 @@ class TestKVCacheManager:
             dtype=torch.bfloat16,
             page_size_padded=uniform_size,
         )
-        mamba_spec = MambaSpec(
+        mamba_spec = mamba_spec_cls(
             block_size=16,
             shapes=[(4, 128), (8, 64, 32)],
             dtypes=[torch.bfloat16, torch.float32],
@@ -673,6 +695,18 @@ class TestKVCacheManager:
         mock_input_batch.return_value.block_table = mock_block_tables
         self.runner.input_batch = mock_input_batch.return_value
         self.runner.kv_caches = []
+        self.runner._uniform_mamba_layout = uniform_mamba_layout
+        if uniform_mamba_layout:
+            # No slot pool: the group's empty block-table rows would send every
+            # request's state to block 0.
+            self.runner._mamba_num_blocks = None
+            with (
+                patch("vllm_torchtpu.runner.kv_cache_manager.synchronize_tensors"),
+                pytest.raises(RuntimeError, match="take no scheduler blocks"),
+            ):
+                self.runner.initialize_kv_cache(kv_cache_config)
+            self.runner._init_mamba_slot_pool.assert_not_called()
+            return
         self.runner._mamba_num_blocks = mamba_num_blocks
         # Record the `device` each torch.zeros result was created with. On a
         # CPU runner a host tensor copied with `.to(device)` is the same object,
@@ -779,6 +813,59 @@ class TestKVCacheManager:
             mamba_spec = kv_cache_specs[layer_name]
             assert isinstance(mamba_spec, MambaSpec)
             assert mamba_spec.page_size_padded == expected_padded_size
+
+    @pytest.mark.parametrize(
+        "env_value, uniform_mamba_layout, expect_runner_slot",
+        [(None, False, True), ("0", False, False), (None, True, False)],
+        ids=["compact_default", "opt_out", "uniform_mamba_layout"],
+    )
+    @patch("vllm_torchtpu.runner.kv_cache_manager.get_layers_from_vllm_config")
+    @patch(
+        "vllm_torchtpu.runner.tpu_runner.PallasAttentionBackend.get_kv_cache_page_size_bytes",
+        return_value=4096,
+    )
+    @patch(
+        "vllm_torchtpu.utils.torch.accelerator.get_memory_info",
+        return_value=(10 * 1024 * 1024 * 1024, 10 * 1024 * 1024 * 1024),
+    )
+    def test_get_kv_cache_spec_gdn_runner_slot_flag(
+        self,
+        mock_mem_info,
+        mock_get_page_size,
+        mock_get_layers,
+        monkeypatch,
+        env_value,
+        uniform_mamba_layout,
+        expect_runner_slot,
+    ):
+        """GDN specs reach vLLM as RunnerSlotMambaSpec by default when
+        compact-mamba sizing gave the runner its own GDN slots;
+        TPU_SKIP_MAMBA_SCHEDULER_BLOCKS=0 opts out."""
+        if env_value is None:
+            monkeypatch.delenv("TPU_SKIP_MAMBA_SCHEDULER_BLOCKS", raising=False)
+        else:
+            monkeypatch.setenv("TPU_SKIP_MAMBA_SCHEDULER_BLOCKS", env_value)
+        self.runner._uniform_mamba_layout = uniform_mamba_layout
+
+        mock_attn = _attention_layer_mock()
+        mock_attn.attn_type = AttentionType.DECODER
+        mock_attn.num_kv_heads = 2
+        mock_attn.head_size = 128
+        mock_attn.kv_sharing_target_layer_name = None
+        mock_attn.sliding_window = None
+        layers = {"attn_0": mock_attn}
+        layers.update({f"gdn_{i}": DummyGdn() for i in range(3)})
+        mock_get_layers.return_value = layers
+
+        kv_cache_specs = self.runner.get_kv_cache_spec()
+
+        assert (self.runner._mamba_num_blocks is not None) == (not uniform_mamba_layout)
+        assert type(kv_cache_specs["attn_0"]) is FullAttentionSpec
+        for i in range(3):
+            spec = kv_cache_specs[f"gdn_{i}"]
+            expected = RunnerSlotMambaSpec if expect_runner_slot else MambaSpec
+            assert type(spec) is expected
+            assert spec.page_size_padded == 203776
 
     @patch.object(
         TpuPlatform, "_find_non_ssm_backend", return_value=PallasMLAttentionBackend
@@ -1295,7 +1382,7 @@ class TestKVCacheManager:
     @pytest.mark.parametrize("alias_head_size", [128, 256])
     def test_default_attention_hma_preserves_native_pool_budget(self, alias_head_size):
         """Full/SWA overlays share storage while retaining the last block ID."""
-        from vllm.v1.core.kv_cache_utils import get_kv_cache_config_from_groups
+        from vllm.v1.core.kv_cache_planning import get_kv_cache_config_from_groups
         from vllm.v1.kv_cache_interface import SlidingWindowSpec
 
         def spec(cls, head_size=128, **kwargs):
@@ -1371,7 +1458,7 @@ class TestKVCacheManager:
         self, sliding_heads, sliding_page_bytes, shared
     ):
         """Compatible shapes share regions; other shapes retain native arrays."""
-        from vllm.v1.core.kv_cache_utils import (
+        from vllm.v1.core.kv_cache_planning import (
             get_kv_cache_config_from_groups,
             get_kv_cache_groups,
         )
@@ -1973,7 +2060,7 @@ def test_dsv4_groups_are_uniform_type_with_mixed_block_sizes():
     spec must be unwrapped before any `isinstance` type test, and block size is
     not uniform across groups, so it cannot be asserted equal.
     """
-    from vllm.v1.core.kv_cache_utils import get_kv_cache_groups
+    from vllm.v1.core.kv_cache_planning import get_kv_cache_groups
     from vllm.v1.kv_cache_interface import (
         AttentionSpec,
         MambaSpec,
@@ -2502,3 +2589,67 @@ class TestUpdateAttentionPageSizePadded:
                 256, 2, 256, torch.bfloat16
             )
         )
+
+
+def test_get_kv_cache_spec_propagates_is_draft_layer_cpu(monkeypatch):
+    monkeypatch.setattr(
+        TpuPlatform, "_find_non_ssm_backend", lambda *_: PallasAttentionBackend
+    )
+    monkeypatch.setattr(
+        PallasAttentionBackend,
+        "get_kv_cache_page_size_bytes",
+        lambda *_: 4096,
+    )
+
+    target = _attention_layer_mock()
+    target.attn_type = AttentionType.DECODER
+    target.num_kv_heads = 2
+    target.head_size = 128
+    target.kv_sharing_target_layer_name = None
+    target.sliding_window = None
+    target.is_draft_layer = False
+    target.impl = SimpleNamespace(kv_cache_quantized_dtype=None)
+
+    draft = _attention_layer_mock()
+    draft.attn_type = AttentionType.DECODER
+    draft.num_kv_heads = 2
+    draft.head_size = 128
+    draft.kv_sharing_target_layer_name = None
+    draft.sliding_window = None
+    draft.is_draft_layer = True
+    draft.impl = SimpleNamespace(kv_cache_quantized_dtype=None)
+
+    layers = {"target.0": target, "draft.0": draft}
+    monkeypatch.setattr(
+        "vllm_torchtpu.runner.kv_cache_manager.get_layers_from_vllm_config",
+        lambda *_: layers,
+    )
+
+    cache_config = SimpleNamespace(
+        block_size=16,
+        cache_dtype="auto",
+        enable_prefix_caching=False,
+        mamba_page_size_padded=None,
+    )
+    stub = SimpleNamespace(
+        block_size=16,
+        kv_cache_dtype=torch.bfloat16,
+        cache_config=cache_config,
+        scheduler_config=SimpleNamespace(disable_hybrid_kv_cache_manager=True),
+        model_config=SimpleNamespace(
+            use_mla=False,
+            is_hybrid=False,
+        ),
+        parallel_config=SimpleNamespace(pipeline_parallel_size=1),
+        vllm_config=SimpleNamespace(cache_config=cache_config),
+        shared_kv_cache_layers={},
+        runner_only_attn_layers=set(),
+        _hybrid_uniform_page_size_bytes=None,
+        _unified_kv_layout=False,
+        _is_async_drafter=False,
+        drafter=None,
+    )
+
+    kv_cache_specs = KVCacheManager(stub).get_kv_cache_spec()
+    assert kv_cache_specs["target.0"].is_draft is False
+    assert kv_cache_specs["draft.0"].is_draft is True

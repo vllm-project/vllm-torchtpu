@@ -18,25 +18,28 @@ from __future__ import annotations
 import jax
 import jax.numpy as jnp
 import numpy as np
+import pytest
 
+from vllm_torchtpu.megakernel.errors import MegakernelConfigError
 from vllm_torchtpu.megakernel.ops import (
     BF16,
     F32,
     bswitch,
+    col_chunk,
     rms_zc,
     rmsnorm,
-    rnd,
     rope_partial,
-    rup,
+    round_bf16,
+    round_up,
     silu_mul,
 )
 
 
 def test_ops_primitives():
-    """Verify `rup`, `rnd`, `rmsnorm`, `rope_partial`, `silu_mul`, and `bswitch`."""
-    assert rup(1, 128) == 128
-    assert rup(128, 128) == 128
-    assert rup(129, 128) == 256
+    """Verify `round_up`, `round_bf16`, `rmsnorm`, `rope_partial`, and `silu_mul`."""
+    assert round_up(1, 128) == 128
+    assert round_up(128, 128) == 128
+    assert round_up(129, 128) == 256
 
     x = jnp.ones((4, 128), dtype=F32)
     w = jnp.zeros((1, 128), dtype=F32)
@@ -55,7 +58,7 @@ def test_ops_primitives():
     cos = jnp.ones((1, 16), dtype=F32)
     sin = jnp.zeros((1, 16), dtype=F32)
     rx = rope_partial(x, cos, sin, 32)
-    assert jnp.allclose(rx, rnd(x))
+    assert jnp.allclose(rx, round_bf16(x))
 
     # SwiGLU and bswitch
     sm = silu_mul(x, x)
@@ -65,7 +68,7 @@ def test_ops_primitives():
 
 
 def test_fp32_intermediate_precision_rope_and_swiglu():
-    """Verify `rope_partial` and `silu_mul` avoid multi-stage BF16 truncation drift."""
+    """Verify `round_intermediates=False` avoids multi-stage BF16 truncation drift."""
     rng = jax.random.PRNGKey(1234)
     k1, k2, k3, k4 = jax.random.split(rng, 4)
     x = jax.random.normal(k1, (16, 256), dtype=F32)
@@ -73,7 +76,7 @@ def test_fp32_intermediate_precision_rope_and_swiglu():
     sin = jax.random.normal(k3, (16, 32), dtype=F32)
     up = jax.random.normal(k4, (16, 256), dtype=F32)
 
-    out_rope = rope_partial(x, cos, sin, 64)
+    out_rope = rope_partial(x, cos, sin, 64, round_intermediates=False)
     assert out_rope.dtype == F32
 
     x1_64 = np.asarray(x[:, :32], dtype=np.float64)
@@ -87,17 +90,68 @@ def test_fp32_intermediate_precision_rope_and_swiglu():
     err_fp32 = np.max(np.abs(np.asarray(out_rope[:, :64], dtype=np.float64) - ref_rot))
     x1, x2 = x[:, :32], x[:, 32:64]
     legacy_rot = jnp.concatenate(
-        [rnd(rnd(x1 * cos) - rnd(x2 * sin)), rnd(rnd(x2 * cos) + rnd(x1 * sin))],
+        [
+            round_bf16(round_bf16(x1 * cos) - round_bf16(x2 * sin)),
+            round_bf16(round_bf16(x2 * cos) + round_bf16(x1 * sin)),
+        ],
         axis=-1,
     )
     err_legacy = np.max(np.abs(np.asarray(legacy_rot, dtype=np.float64) - ref_rot))
     assert err_fp32 < 1e-6
     assert err_fp32 * 100.0 < err_legacy
 
-    out_swiglu = silu_mul(x, up)
+    out_swiglu = silu_mul(x, up, round_intermediates=False)
     assert out_swiglu.dtype == BF16
     expected_swiglu = (jax.nn.silu(x) * up).astype(BF16)
     np.testing.assert_array_equal(
         np.asarray(out_swiglu).view(np.uint16),
         np.asarray(expected_swiglu).view(np.uint16),
     )
+
+
+def test_default_bf16_rounded_intermediates_rope_and_swiglu():
+    """Verify default `round_intermediates=True` matches BF16-rounded reference."""
+    rng = jax.random.PRNGKey(1234)
+    k1, k2, k3, k4 = jax.random.split(rng, 4)
+    x = jax.random.normal(k1, (16, 256), dtype=F32)
+    cos = jax.random.normal(k2, (16, 32), dtype=F32)
+    sin = jax.random.normal(k3, (16, 32), dtype=F32)
+    up = jax.random.normal(k4, (16, 256), dtype=F32)
+
+    out_rope = rope_partial(x, cos, sin, 64)
+    x1, x2, rest = x[:, :32], x[:, 32:64], x[:, 64:]
+    expected_rope = jnp.concatenate(
+        (
+            round_bf16(round_bf16(x1 * cos) - round_bf16(x2 * sin)),
+            round_bf16(round_bf16(x2 * cos) + round_bf16(x1 * sin)),
+            rest,
+        ),
+        axis=-1,
+    )
+    np.testing.assert_array_equal(
+        np.asarray(out_rope).view(np.uint32),
+        np.asarray(expected_rope).view(np.uint32),
+    )
+
+    out_swiglu = silu_mul(x, up)
+    expected_swiglu = (round_bf16(jax.nn.silu(x)) * up).astype(BF16)
+    np.testing.assert_array_equal(
+        np.asarray(out_swiglu).view(np.uint16),
+        np.asarray(expected_swiglu).view(np.uint16),
+    )
+
+
+def test_col_chunk():
+    """Verify `col_chunk` selects the largest 128-multiple divisor `<= cap`."""
+    assert col_chunk(512, 1024) == 512
+    assert col_chunk(1024, 1024) == 1024
+    assert col_chunk(1536, 1024) == 768
+    assert col_chunk(2048, 1024) == 1024
+    assert col_chunk(1024, 384) == 256
+    assert col_chunk(1024, 128) == 128
+    for bad in (0, -128, 100, 192):
+        with pytest.raises(ValueError, match="positive multiple of 128"):
+            col_chunk(bad)
+    for bad_cap in (127, 64, 0, -128):
+        with pytest.raises(MegakernelConfigError, match="cap="):
+            col_chunk(512, bad_cap)
