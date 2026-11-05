@@ -117,11 +117,13 @@ def _vmem_plan(
     )
     if contig_dma and group > 1:
         w1_slot = t((group, h // _PACK4, 2 * i), u32)
-        s1_slot = t((group, b13, 2 * i), f32)
+        s1_slot = t((group, b13, 1, 2 * i), f32)
     else:
         w1_slot = t((h // _PACK4, group * 2 * i), u32)
-        s1_slot = t((b13, group * 2 * i), f32)
-    slot = w1_slot + t((group, i // _PACK4, h), u32) + s1_slot + t((group, b2, h), f32)
+        s1_slot = t((b13, 1, group * 2 * i), f32)
+    slot = (
+        w1_slot + t((group, i // _PACK4, h), u32) + s1_slot + t((group, b2, 1, h), f32)
+    )
     need = fixed + num_buffers * slot + all_reduce.vmem_bytes(spec, info)
     limit = int(need * VMEM_HEADROOM)
     if limit > int(info.vmem_capacity_bytes * VMEM_FRACTION):
@@ -456,7 +458,7 @@ def _kernel(
         else:
             lanes_slice = pl.ds(k * two_i, two_i)
             w1_dst = w1_ref.at[slot, :, lanes_slice]
-            s1_dst = s1_ref.at[slot, :, lanes_slice]
+            s1_dst = s1_ref.at[slot, :, :, lanes_slice]
         return (
             pltpu.make_async_copy(w1_u32.at[e], w1_dst, ring_sem.at[slot, 4 * k]),
             pltpu.make_async_copy(s1_hbm.at[e], s1_dst, ring_sem.at[slot, 4 * k + 2]),
@@ -574,13 +576,13 @@ def _kernel(
                     axis=1,
                 )
                 s1_b = jnp.concatenate(
-                    [s1_ref[slot, k, b : b + 1, :] for k in range(g)], axis=1
+                    [s1_ref[slot, k, b, :, :] for k in range(g)], axis=1
                 )
             else:
                 wb = pltpu.bitcast(
                     w1_ref[slot, pl.ds(b * rows1_u32, rows1_u32), :], FP4
                 ).astype(FP8)
-                s1_b = s1_ref[slot, b : b + 1, :]
+                s1_b = s1_ref[slot, b, :, :]
             part = jnp.matmul(
                 xq_ref[:, b * _Q_BLOCK : (b + 1) * _Q_BLOCK],
                 wb,
@@ -595,14 +597,14 @@ def _kernel(
         for b in range(h // _Q_BLOCK):
             if use_contig_dma:
                 w1_slice = w1_ref[slot, k, pl.ds(b * rows1_u32, rows1_u32), :]
-                s1_slice = s1_ref[slot, k, b : b + 1, :]
+                s1_slice = s1_ref[slot, k, b, :, :]
             else:
                 w1_slice = w1_ref[
                     slot,
                     pl.ds(b * rows1_u32, rows1_u32),
                     pl.ds(k * two_i, two_i),
                 ]
-                s1_slice = s1_ref[slot, b : b + 1, k * two_i : (k + 1) * two_i]
+                s1_slice = s1_ref[slot, b, :, k * two_i : (k + 1) * two_i]
             wb = pltpu.bitcast(w1_slice, FP4).astype(FP8)
             part = jnp.matmul(
                 xq_ref[:, b * _Q_BLOCK : (b + 1) * _Q_BLOCK],
@@ -647,7 +649,7 @@ def _kernel(
                     wb2,
                     preferred_element_type=jnp.float32,
                 )
-                acc2 = acc2 + part2 * s2_ref[slot, k, c : c + 1, n0:n1]
+                acc2 = acc2 + part2 * s2_ref[slot, k, c, :, n0:n1]
             owner_ref[:, n0:n1] += acc2 * ms
 
     def finish_group(q, slot, acc1):
@@ -976,9 +978,9 @@ def moe_tp_decode_nvfp4(
         else pltpu.VMEM((nb, h // _PACK4, g * 2 * i), jnp.uint32)
     )
     s1_scratch = (
-        pltpu.VMEM((nb, g, b13, 2 * i), jnp.float32)
+        pltpu.VMEM((nb, g, b13, 1, 2 * i), jnp.float32)
         if use_contig_dma
-        else pltpu.VMEM((nb, b13, g * 2 * i), jnp.float32)
+        else pltpu.VMEM((nb, b13, 1, g * 2 * i), jnp.float32)
     )
     e_pad = pl.cdiv(num_experts, info.num_lanes) * info.num_lanes
     padded_active = max(1, pl.cdiv(experts, g) * g)
@@ -1003,11 +1005,23 @@ def moe_tp_decode_nvfp4(
         )
     vmem = pl.BlockSpec(memory_space=pltpu.VMEM)
     hbm = pl.BlockSpec(memory_space=pltpu.HBM)
+    s13_4d = s13[:, :, None, :] if s13.ndim == 3 else s13
+    s2_4d = s2[:, :, None, :] if s2.ndim == 3 else s2
+    if s13_4d.shape != (experts, b13, 1, 2 * i) or s2_4d.shape != (
+        experts,
+        b2,
+        1,
+        h,
+    ):
+        raise ValueError(
+            f"Expected 4D scale shapes {(experts, b13, 1, 2 * i)} and "
+            f"{(experts, b2, 1, h)}, got {s13.shape} and {s2.shape}"
+        )
     weights = (
         w13,
         w2,
-        s13.reshape(experts, b13, 2 * i),
-        s2.reshape(experts, b2, h),
+        s13_4d,
+        s2_4d,
         shared_w13,
         shared_s13.reshape(1, 2 * shared_inter),
         shared_w2,
@@ -1042,7 +1056,7 @@ def moe_tp_decode_nvfp4(
                 w1_scratch,
                 pltpu.VMEM((nb, g, i // _PACK4, h), jnp.uint32),
                 s1_scratch,
-                pltpu.VMEM((nb, g, b2, h), jnp.float32),
+                pltpu.VMEM((nb, g, b2, 1, h), jnp.float32),
                 pltpu.VMEM((h, 2 * shared_inter), FP8),
                 pltpu.VMEM((1, 2 * shared_inter), jnp.float32),
                 pltpu.VMEM((shared_inter, h), FP8),
