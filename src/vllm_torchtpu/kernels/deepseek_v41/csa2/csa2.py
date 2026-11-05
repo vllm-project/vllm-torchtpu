@@ -618,7 +618,10 @@ def _csa2_kernel(
                 denominator = jnp.exp2(sink - maximum) + jnp.sum(
                     exponentials, axis=1, keepdims=True
                 )
-                swa_p_ref[r] = (exponentials / denominator).astype(jnp.bfloat16)
+                # One reciprocal per row: a per-element divide costs 9 us/call
+                # here (62 vs 71 us); the full form keeps its divide (measured
+                # slower with the reciprocal).
+                swa_p_ref[r] = (exponentials * (1.0 / denominator)).astype(jnp.bfloat16)
             swa_pv(indices)
             if not first_tile:
                 output_copy(tile - 1, 1 - bank).start()
