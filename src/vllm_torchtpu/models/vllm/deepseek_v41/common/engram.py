@@ -210,8 +210,12 @@ class NgramHashState(upstream.NgramHashState):
         _, ngram = multipliers.shape
         dev = input_ids.device
         rows = torch.arange(count, device=dev)
-        reqs = torch.bucketize(rows, query_start_loc[1:], right=True).clamp(
-            max=lookback_token_ids.shape[0] - 1
+        # Equals bucketize(right=True); compare-count avoids XLA's serial
+        # scalar binary search.
+        reqs = (
+            (rows[:, None] >= query_start_loc[1:][None, :])
+            .sum(dim=1)
+            .clamp(max=lookback_token_ids.shape[0] - 1)
         )
         starts = query_start_loc[reqs].long().clamp(max=count - 1)
         chunk_positions = positions[starts]

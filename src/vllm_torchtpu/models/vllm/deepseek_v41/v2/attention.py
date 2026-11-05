@@ -156,7 +156,10 @@ def _block_table(metadata):
 
 def _token_requests(metadata, positions):
     rows = torch.arange(positions.shape[0], device=positions.device)
-    return torch.bucketize(rows, metadata.query_start_loc[1:], right=True)
+    # Equals bucketize(right=True). XLA lowers bucketize to a serial scalar
+    # binary search (~32 us at 288 rows); a [T, R] compare-count is one fusion.
+    boundaries = metadata.query_start_loc[1:]
+    return (rows[:, None] >= boundaries[None, :]).sum(dim=1)
 
 
 def _window_starts():
