@@ -96,7 +96,7 @@ def _insert_context_kv(
         f"got compress_ratio={attn.compress_ratio}"
     )
 
-    kv = attn.kv_rope(kv, positions)
+    new_kv = attn.kv_rope(kv, positions)
     num_tokens = kv.shape[0]
     dummy_q = torch.zeros(
         (num_tokens, attn.mla_attn.n_local_heads, attn.mla_attn.head_dim),
@@ -106,7 +106,7 @@ def _insert_context_kv(
     # only writes the SWA cache, and the clones keep the traced signature.
     operands = (
         dummy_q,
-        kv,
+        new_kv,
         orig_sw_cache,
         metadata.seq_lens,
         metadata.block_tables,

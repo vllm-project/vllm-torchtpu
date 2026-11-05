@@ -88,13 +88,13 @@ def _qnorm_rope_jax(
     return rope_kernel.qnorm_rope(x, positions, cos_sin_cache, eps=eps)
 
 
-def _rope_jax(
+def _kv_rope_words_jax(
     x: jax.Array,
     positions: jax.Array,
     cos_sin_cache: jax.Array,
 ) -> jax.Array:
-    """RoPE over the trailing `rotary_dim` channels of `x`."""
-    return rope_kernel.rope(x, positions, cos_sin_cache)
+    """RoPE over the trailing `rotary_dim` channels of `x`, as SWA new-KV words."""
+    return rope_kernel.rope_kv_words(x, positions, cos_sin_cache)
 
 
 def _o_proj_jax(
@@ -121,6 +121,15 @@ def _o_proj_jax(
 def _fake_rope(x, positions, cos_sin_cache, *args, **kwargs):
     """Abstract implementation for PyTorch Dynamo graph tracing."""
     return torch.empty_like(x)
+
+
+def _fake_kv_rope_words(x, positions, cos_sin_cache, *args, **kwargs):
+    """Abstract implementation for PyTorch Dynamo graph tracing."""
+    num_tokens, head_dim = x.shape
+    lane = rope_kernel.LANE
+    return torch.empty(
+        (num_tokens, head_dim // (2 * lane), lane), dtype=torch.int32, device=x.device
+    )
 
 
 def _fake_o_proj(x, positions, cos_sin_table, wo_a, wo_a_scale, *args, **kwargs):
@@ -502,12 +511,12 @@ class VllmDeepseekV4MLAAttention(
         if op is not None:
             return op
 
-        op_name = "pallas::deepseek_v4_kv_rope"
+        op_name = "pallas::deepseek_v4_kv_rope_words"
         op = _pallas_op_cache.get(op_name)
         if op is None:
             op = pallas.jax_op(
                 op_name,
-                _rope_jax,
+                _kv_rope_words_jax,
                 mesh=get_pallas_op_mesh(),
                 input_partition_specs=(
                     P(),  # kv
@@ -515,7 +524,7 @@ class VllmDeepseekV4MLAAttention(
                     P(),  # cos_sin_cache
                 ),
             )
-            op.register_fake(_fake_rope)
+            op.register_fake(_fake_kv_rope_words)
             _pallas_op_cache[op_name] = op
         object.__setattr__(self, "_kv_rope_op_instance", op)
         return op
@@ -544,7 +553,11 @@ class VllmDeepseekV4MLAAttention(
         kv: torch.Tensor,
         positions: torch.Tensor,
     ) -> torch.Tensor:
-        """Apply scaling RoPE to decoupled key states."""
+        """Apply scaling RoPE to decoupled key states.
+
+        Returns them as the int32 new-KV words the SWA kernels read
+        (`rope.rope_kv_words`), not as bf16.
+        """
         return self.kv_rope_op(kv, positions, self.mla_attn.rotary_emb.cos_sin_cache)
 
     def attention_impl(

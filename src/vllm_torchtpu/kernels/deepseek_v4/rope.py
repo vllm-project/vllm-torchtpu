@@ -164,6 +164,17 @@ def _rotate_gptj(x: jax.Array) -> jax.Array:
     return _lane_gather(x, lane ^ 1) * sign
 
 
+def _rope_lanes(
+    x: jax.Array, cos_sin: jax.Array, *, rotary_dim: int, inverse: bool
+) -> jax.Array:
+    """Rotates one float32 ``(tile_n, [num_heads,] LANE)`` lane block."""
+    cos, sin = _cos_sin_lanes(cos_sin, rotary_dim=rotary_dim, inverse=inverse)
+    if x.ndim == 3:  # [tokens, heads, lanes]: cos/sin are per token
+        cos = cos[:, None, :]
+        sin = sin[:, None, :]
+    return x * cos + _rotate_gptj(x) * sin
+
+
 def _rope_body(
     x_ref: jax.Ref,
     cos_sin_ref: jax.Ref,
@@ -179,14 +190,12 @@ def _rope_body(
     With it, the rotated chunk is quantized along the lanes and written to the
     ``(q_ref, scale_ref)`` outputs instead.
     """
-    x = x_ref[...].astype(jnp.float32)
-    cos, sin = _cos_sin_lanes(cos_sin_ref[...], rotary_dim=rotary_dim, inverse=inverse)
-    if x.ndim == 3:  # [tokens, heads, lanes]: cos/sin are per token
-        cos = cos[:, None, :]
-        sin = sin[:, None, :]
-
-    rotated = _rotate_gptj(x)
-    y = x * cos + rotated * sin
+    y = _rope_lanes(
+        x_ref[...].astype(jnp.float32),
+        cos_sin_ref[...],
+        rotary_dim=rotary_dim,
+        inverse=inverse,
+    )
 
     if quant_dtype is None:
         x_ref[...] = y.astype(out_dtype)
@@ -290,6 +299,95 @@ def _kernel(
             *x_ref_args,
             (cos_sin_cache_hbm_ref, positions_ref),
             *out_ref_args,
+            allocations=allocations,
+        )
+
+    _run()
+
+
+def _kv_words_body(
+    x_ref: jax.Ref,
+    cos_sin_ref: jax.Ref,
+    words_ref: jax.Ref,
+    *,
+    rotary_dim: int,
+) -> None:
+    """Process one ``(tile_n, head_dim)`` chunk into its new-KV words.
+
+    The last lane block is rotated as ``_rope_body`` rotates it; the others pass
+    through. Word ``(r, l)`` of a token then holds its bf16 ``256 r + l`` in the
+    low half and ``256 r + LANE + l`` in the high half.
+    """
+    x = x_ref[...]
+    roped = _rope_lanes(
+        x[:, -LANE:].astype(jnp.float32),
+        cos_sin_ref[...],
+        rotary_dim=rotary_dim,
+        inverse=False,
+    ).astype(x.dtype)
+    lane_blocks = [x[:, i : i + LANE] for i in range(0, x.shape[-1] - LANE, LANE)]
+    lane_blocks.append(roped)
+
+    def bits(block):
+        return jax.lax.bitcast_convert_type(block, jnp.uint16).astype(jnp.uint32)
+
+    for r in range(words_ref.shape[1]):
+        words = bits(lane_blocks[2 * r]) | (bits(lane_blocks[2 * r + 1]) << 16)
+        words_ref[:, r, :] = jax.lax.bitcast_convert_type(words, jnp.int32)
+
+
+def _kv_words_kernel(
+    # scalar prefetch
+    positions_ref: jax.Ref,
+    # HBM inputs
+    x_hbm_ref: jax.Ref,
+    cos_sin_cache_hbm_ref: jax.Ref,
+    # HBM output
+    words_hbm_ref: jax.Ref,
+    *,
+    num_tiles: int,
+    tile_n: int,
+    rotary_dim: int,
+) -> None:
+    head_dim = x_hbm_ref.shape[-1]
+    x_spec = pl.BlockSpec(
+        block_shape=(tile_n, head_dim),
+        memory_space=pltpu.VMEM,
+        index_map=lambda i: (i, 0),
+    )
+    cos_sin_spec = pl.BlockSpec(
+        block_shape=(tile_n, rotary_dim),
+        memory_space=pltpu.VMEM,
+        index_map=lambda i: (i, 0),
+    )
+    words_spec = pl.BlockSpec(
+        block_shape=(tile_n, *words_hbm_ref.shape[1:]),
+        memory_space=pltpu.VMEM,
+        index_map=lambda i: (i, 0, 0),
+    )
+    pipeline = pltpu.emit_pipeline(
+        functools.partial(_kv_words_body, rotary_dim=rotary_dim),
+        grid=(num_tiles,),
+        in_specs=[x_spec, cos_sin_spec],
+        out_specs=[words_spec],
+    )
+    allocations = (
+        pltpu.BufferedRef.input(x_spec, x_hbm_ref.dtype, buffer_count=2),
+        CosSinRef.create(
+            spec=cos_sin_spec,
+            dtype=cos_sin_cache_hbm_ref.dtype,
+            buffer_count=2,
+            tile_n=tile_n,
+        ),
+        pltpu.BufferedRef.output(words_spec, jnp.int32, buffer_count=2),
+    )
+
+    @pl.with_scoped(allocations=allocations)
+    def _run(allocations):
+        pipeline(
+            x_hbm_ref,
+            (cos_sin_cache_hbm_ref, positions_ref),
+            words_hbm_ref,
             allocations=allocations,
         )
 
@@ -514,6 +612,59 @@ def rope(
             name=name,
         ),
     )
+
+
+@functools.partial(jax.jit, static_argnames=("name",))
+def rope_kv_words(
+    x: jax.Array,  # [num_tokens, head_dim] bfloat16
+    positions: jax.Array,  # [num_tokens] int
+    cos_sin_cache: jax.Array,  # [max_position, rotary_dim] float32
+    *,
+    name: str = "rope_kv_words",
+) -> jax.Array:
+    """``rope`` on the key states, written as the SWA kernels' new-KV words.
+
+    Returns ``int32[num_tokens, head_dim // 256, 128]`` holding the bytes
+    ``mla_swa.prepare_kv_inputs`` packs from ``rope(x, ...)``, which the SWA
+    kernels read as uint8 rows (``mla_swa._as_u8_rows``) without XLA packing
+    them first.
+    """
+    assert x.ndim == 2 and x.dtype == jnp.bfloat16
+    assert positions.ndim == 1 and positions.shape[0] == x.shape[0]
+    assert cos_sin_cache.ndim == 2
+
+    num_tokens, head_dim = x.shape
+    rotary_dim = cos_sin_cache.shape[1]
+    assert head_dim % (2 * LANE) == 0
+    assert rotary_dim % 2 == 0 and rotary_dim <= LANE
+    tile_n = largest_divisor(num_tokens, cap=128)
+
+    kernel = functools.partial(
+        _kv_words_kernel,
+        num_tiles=num_tokens // tile_n,
+        tile_n=tile_n,
+        rotary_dim=rotary_dim,
+    )
+    grid_spec = pltpu.PrefetchScalarGridSpec(
+        num_scalar_prefetch=1,
+        in_specs=(
+            pl.BlockSpec(memory_space=pltpu.HBM),  # x
+            pl.BlockSpec(memory_space=pltpu.HBM),  # cos_sin_cache
+        ),
+        out_specs=pl.BlockSpec(memory_space=pltpu.HBM),
+    )
+    return pl.pallas_call(
+        kernel,
+        out_shape=jax.ShapeDtypeStruct(
+            (num_tokens, head_dim // (2 * LANE), LANE), jnp.int32
+        ),
+        grid_spec=grid_spec,
+        compiler_params=pltpu.CompilerParams(
+            vmem_limit_bytes=DEFAULT_VMEM_LIMIT_BYTES,
+            disable_bounds_checks=True,
+        ),
+        name=name,
+    )(positions, x, cos_sin_cache)
 
 
 @functools.partial(

@@ -18,7 +18,13 @@ import numpy as np
 import pytest
 from absl.testing import absltest, parameterized
 
-from vllm_torchtpu.kernels.deepseek_v4.rope import qnorm_rope, rope, rope_quant
+from vllm_torchtpu.kernels.deepseek_v4.core_attention.mla_swa import prepare_kv_inputs
+from vllm_torchtpu.kernels.deepseek_v4.rope import (
+    qnorm_rope,
+    rope,
+    rope_kv_words,
+    rope_quant,
+)
 
 pytestmark = pytest.mark.tpu_test
 
@@ -196,6 +202,29 @@ class RopeQuantTest(parameterized.TestCase):
             np.asarray(scales), np.asarray(scales_expected), rtol=1e-6, atol=1e-6
         )
         assert_bits_equal(q, q_expected)
+
+
+class RopeKvWordsTest(parameterized.TestCase):
+    """``kv_rope``: RoPE written as the SWA kernels' int32 new-KV words."""
+
+    @parameterized.product(num_tokens=(16, 40, 256))
+    def test_words_hold_the_roped_kv_input_bytes(self, num_tokens):
+        rng = np.random.default_rng(num_tokens)
+        x = rng.normal(size=(num_tokens, HEAD_DIM)).astype(np.float32)
+        x[0, :7] = [0.0, -0.0, np.inf, -np.inf, 1e-40, -1e-40, np.nan]
+        x[1, -ROTARY_DIM - 6 : -ROTARY_DIM] = [0.0, -0.0, np.inf, -np.inf, 1e-40, 3]
+        x = jnp.asarray(x, jnp.bfloat16)
+        positions = jnp.asarray(rng.integers(0, 4096, size=(num_tokens,)), jnp.int32)
+        cos_sin_cache = jnp.asarray(make_cos_sin_cache(4096, ROTARY_DIM))
+
+        expected = prepare_kv_inputs(rope(x.copy(), positions, cos_sin_cache))
+        words = np.asarray(rope_kv_words(x, positions, cos_sin_cache))
+
+        assert words.shape == (num_tokens, HEAD_DIM // 256, 128)
+        # The kernels' uint8 view: sub-row 4 k + b is byte b of word row k.
+        rows = words.view(np.uint8).reshape(num_tokens, HEAD_DIM // 256, 128, 4)
+        rows = rows.transpose(0, 1, 3, 2).reshape(num_tokens, 2 * HEAD_DIM)
+        np.testing.assert_array_equal(rows, np.asarray(expected))
 
 
 class QNormRopeTest(parameterized.TestCase):
