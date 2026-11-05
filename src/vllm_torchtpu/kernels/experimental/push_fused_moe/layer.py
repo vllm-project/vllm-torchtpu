@@ -41,15 +41,21 @@ import jax.numpy as jnp
 from jax import lax
 
 from vllm_torchtpu.kernels.experimental.push_fused_moe.host import (
+    build_routing_tables_sharded,
+    local_sort_activations,
+    local_sort_tokens,
     push_dispatch_segments,
+    push_dispatch_tables,
+    routing_pairs_from_tables,
     run_tables,
 )
 from vllm_torchtpu.kernels.experimental.push_fused_moe.kernel import (
     build_combine_fs_kernel,
     build_push_moe_kernel,
 )
-from vllm_torchtpu.kernels.experimental.push_fused_moe.presort import (
-    local_sort_activations,
+from vllm_torchtpu.kernels.experimental.push_fused_moe.plan_kernel import (
+    build_exchange_rows_tables,
+    build_push_tables,
 )
 from vllm_torchtpu.kernels.experimental.push_fused_moe.routing import prepare_routing
 from vllm_torchtpu.kernels.experimental.push_fused_moe.sc_dispatch import (
@@ -57,6 +63,7 @@ from vllm_torchtpu.kernels.experimental.push_fused_moe.sc_dispatch import (
 )
 from vllm_torchtpu.kernels.experimental.push_fused_moe.tc_exchange import (
     build_tc_exchange_all_gather,
+    build_tc_exchange_all_gather_rows,
 )
 from vllm_torchtpu.kernels.fused_moe.v2.host import (
     HIDDEN_LANE_BLOCK,
@@ -65,6 +72,8 @@ from vllm_torchtpu.kernels.fused_moe.v2.host import (
     ROWBLK,
     U32_SUBLANE_TILE,
     GatheredPairs,
+    RoutingTables,
+    ShardRoutingTables,
     WeightFormat,
     act_scale_slab_rows,
     align_up,
@@ -93,6 +102,7 @@ from vllm_torchtpu.kernels.fused_moe.v2.layer import (
 )
 from vllm_torchtpu.kernels.fused_moe.v2.router_ops import pallas_select
 from vllm_torchtpu.kernels.fused_moe.v2.token_parallel import TokenReplicaLayout
+from vllm_torchtpu.kernels.quantized_matmul.shared_expert import fp8_swiglu_mlp
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
@@ -101,6 +111,10 @@ logger = init_logger(__name__)
 # (e.g. 192 experts) is lowered as an all-reduce, ~3x slower than the
 # all-gather an aligned one gets.
 EXCHANGE_WIDTH_ALIGN = 128
+# light_prepush applies from this many local slots up: the heavy experts it
+# takes off the pre-push need visits to arrive in (at DP16 the 9-slot kernel
+# lost ~20 us a call with it while the 25-slot kernel held its time).
+LIGHT_PREPUSH_MIN_SLOTS = 16
 
 
 def _exchange_layout(t_local, topk, e_total, quantized):
@@ -154,19 +168,68 @@ def _combine_arrivals_fs(
     return combine(arrivals, arrival_scales, scl, topk_weights, rows)
 
 
-def _to_slots(topk_idx, expert_slot, row_base):
+def _to_slots(topk_idx, expert_slot, row_base, *, onehot=False):
     """Selected global ids [rows, K] -> slots under an [experts, R] table.
 
     Row r's selection of e takes replica (row_base + r) mod (replicas of e),
     so a replicated expert's rows split evenly over its copies within every
     step. Positions are kept, so the k combine terms keep their order.
+
+    `onehot` reads the selected expert's table row through one one-hot
+    matmul instead of two gathers: XLA offloads a small gather to the
+    SparseCore and the TensorCore waits for it, while this is one small dot.
+    Same values: each output is one table entry (< 2**24) times 1.0 at
+    HIGHEST precision.
     """
+    experts, replicas = expert_slot.shape
     n_rep = jnp.sum(expert_slot >= 0, axis=1, dtype=jnp.int32)
-    e = jnp.clip(topk_idx, 0, expert_slot.shape[0] - 1)
+    e = jnp.clip(topk_idx, 0, experts - 1)
     token = row_base + lax.broadcasted_iota(jnp.int32, topk_idx.shape, 0)
-    replica = lax.rem(token, jnp.take(n_rep, e, axis=0))
-    flat = e * expert_slot.shape[1] + replica
-    return jnp.take(expert_slot.reshape(-1), flat, axis=0)
+    if not onehot:
+        replica = lax.rem(token, jnp.take(n_rep, e, axis=0))
+        flat = e * replicas + replica
+        return jnp.take(expert_slot.reshape(-1), flat, axis=0)
+    hit = (e.reshape(-1, 1) == jnp.arange(experts, dtype=jnp.int32)).astype(jnp.float32)
+    rows = jnp.concatenate([n_rep[:, None], expert_slot], axis=1).astype(jnp.float32)
+    picked = jnp.dot(hit, rows, precision=lax.Precision.HIGHEST).astype(jnp.int32)
+    replica = lax.rem(token.reshape(-1), picked[:, 0])
+    slot = jnp.sum(
+        jnp.where(
+            replica[:, None] == jnp.arange(replicas, dtype=jnp.int32), picked[:, 1:], 0
+        ),
+        axis=1,
+    )
+    return slot.reshape(topk_idx.shape).astype(jnp.int32)
+
+
+def _repeat_bits(bits, repeats):
+    """jnp.repeat(bits, repeats) for i32 `bits` [n] as one one-hot matmul
+    over the four bytes of each word.
+
+    XLA spells the repeat as a [n, repeats] broadcast (one word in each
+    128-lane row) and then flattens it; this builds the lane-dense
+    [n / 128, 128 * repeats] result directly. Exact for any bit pattern: each
+    output is one byte (< 256, exact in bf16) times 1.0, summed with zeros in
+    f32.
+    """
+    (n_in,) = bits.shape
+    lanes = HIDDEN_LANE_BLOCK
+    n = align_up(n_in, lanes)
+    bits = jnp.pad(bits, (0, n - n_in))
+    shifts = 8 * jnp.arange(4, dtype=jnp.int32)[:, None, None]
+    planes = (
+        jnp.right_shift(bits.reshape(1, n // lanes, lanes), shifts) & 255
+    ).reshape(4 * n // lanes, lanes)
+    spread = (
+        jnp.arange(lanes * repeats, dtype=jnp.int32)[None, :] // repeats
+        == jnp.arange(lanes, dtype=jnp.int32)[:, None]
+    ).astype(jnp.bfloat16)
+    out = jnp.dot(
+        planes.astype(jnp.bfloat16), spread, preferred_element_type=jnp.float32
+    ).astype(jnp.int32)
+    out = out.reshape(4, n // lanes, lanes * repeats)
+    word = out[0] | (out[1] << 8) | (out[2] << 16) | (out[3] << 24)
+    return word.reshape(n * repeats)[: n_in * repeats]
 
 
 _LAYER_SM_CACHE = {}
@@ -205,8 +268,25 @@ def fused_ep_moe_push(
     sc_prepush=2,
     tc_exchange=False,
     height_rungs_override=0,
+    tail_barrier=True,
+    onehot_slots=False,
+    hbm_staging=False,
+    dispatch_ahead=1,
+    matmul_scale_repeat=False,
+    exchange_row_gather=False,
+    bf16_sort_counts=False,
+    slim_prepush_barrier=False,
+    fused_dispatch_meta=False,
+    table_kernel=False,
+    exchange_tables=False,
+    kernel_plan_tables=False,
+    light_prepush=0,
+    single_barrier=False,
+    early_scale_scatter=0,
     expert_slot=None,
     expert_load=None,
+    shared_expert=None,
+    shared_limit=None,
 ):
     """Run one MoE layer through the push-dispatch fused EP kernel.
 
@@ -219,8 +299,34 @@ def fused_ep_moe_push(
     and a value above the experts per shard is clamped to it with a warning.
     `tc_exchange` runs the routing exchange as a TensorCore remote-DMA kernel
     instead of XLA's all-gather. `height_rungs_override` is the tile-height
-    ladder's rung count (0 = the default; see kernel.tile_height_rungs). The
-    caller (layers/adapter/fused_moe_ep.py) reads all three from envs.
+    ladder's rung count (0 = the default; see kernel.tile_height_rungs).
+    `tail_barrier=False` drops the kernel's closing all-pairs barrier (see
+    kernel._build_push_moe_kernel), `onehot_slots` maps the layout's
+    slots without gathers (see `_to_slots`), `hbm_staging` ships result
+    tiles through the HBM contribution slab and `dispatch_ahead` is how many
+    visit positions the TensorCore's dispatch pushes run ahead of its compute
+    (see the kernel), `matmul_scale_repeat` builds the scale slab's per-pair
+    activation scales with `_repeat_bits` instead of jnp.repeat, and
+    `exchange_row_gather` (with `tc_exchange`) has the routing-exchange kernel
+    also copy the expert-sorted activation rows, while it waits on its peers,
+    instead of a TensorCore gather after it, `bf16_sort_counts` finds the
+    expert-sorted token order with two single-pass bf16 matmuls
+    (host._sorted_tokens_by_count), and `slim_prepush_barrier` keeps the run
+    tables out of the pre-push barrier, and `fused_dispatch_meta` builds the
+    pre-push counts, this shard's visit list and the kernel's remote-row
+    count with the dispatch segments (host.push_dispatch_tables) instead of
+    decoding them back out of them, and `table_kernel`
+    builds the dispatch and shard tables in one TensorCore kernel
+    (plan_kernel.build_push_tables) -- inside the routing-exchange kernel,
+    while its row copies finish, with `exchange_tables`; with
+    `kernel_plan_tables` the plan's small tables come from that kernel too
+    (host.routing_pairs_from_tables); `light_prepush` (1 or 2) gives the
+    SparseCore pre-push the lightest experts and orders the rest
+    (plan_kernel._tables); `single_barrier` opens the expert kernel and the
+    routing exchange with one barrier phase, not two; `early_scale_scatter`
+    lets the scale-slab scatter run under the in-op shared expert (1: not
+    held behind it; 2: nor behind the SparseCore pre-push). The
+    caller (layers/adapter/fused_moe_ep.py) reads all of them from envs.
 
     `expert_slot` [experts, R] i32 and `expert_load` [e_total] i32 (both
     replicated, optional) are the expert-layout operands dynamic EPLB
@@ -233,6 +339,12 @@ def fused_ep_moe_push(
     expert_load + this step's routed rows per physical slot); the counts are
     the routing exchange's, identical on every shard. Without either, the
     program is unchanged.
+
+    `shared_expert` (w13, s13, w2, s2), replicated, is the layer's per-channel
+    FP8 shared expert (`kernels/quantized_matmul/shared_expert.fp8_swiglu_mlp`
+    with `shared_limit`). It is computed on this shard's rows after the
+    SparseCore pre-push is issued and before the expert kernel, so it runs
+    while the pre-push is in flight; the layer then also returns it, last.
     """
     del preprocess_topology
     form = weight_form(weight_format)
@@ -257,6 +369,9 @@ def fused_ep_moe_push(
     e_total = w1.shape[0]
     has_expert_slot = expert_slot is not None
     has_expert_load = expert_load is not None
+    has_shared = shared_expert is not None
+    if has_shared and (len(shared_expert) != 4 or shared_limit is None):
+        raise ValueError("shared_expert is (w13, s13, w2, s2) with a shared_limit")
     # Global experts the router scores; without a layout, one slot each.
     e_logical = gating.shape[1] if has_expert_slot else e_total
     if has_expert_slot and (
@@ -372,7 +487,27 @@ def fused_ep_moe_push(
         )
         n_pre = g_local
     tc_exchange = bool(tc_exchange)
+    exchange_row_gather = bool(exchange_row_gather)
+    if kernel_plan_tables and not (table_kernel and sharded_plan):
+        raise ValueError("kernel_plan_tables needs table_kernel and sharded_plan")
+    if exchange_tables and not (table_kernel and exchange_row_gather):
+        raise ValueError("exchange_tables needs table_kernel and exchange_row_gather")
+    light_prepush = int(light_prepush)
+    if light_prepush not in (0, 1, 2):
+        raise ValueError(f"light_prepush is 0, 1 or 2; got {light_prepush}")
+    if light_prepush and not table_kernel:
+        raise ValueError("light_prepush orders the visits in the table kernel")
+    if g_local < LIGHT_PREPUSH_MIN_SLOTS:
+        light_prepush = 0
+    if exchange_row_gather and not tc_exchange:
+        raise ValueError(
+            "exchange_row_gather needs the TensorCore exchange (tc_exchange)"
+        )
     height_rungs_override = int(height_rungs_override)
+    tail_barrier = bool(tail_barrier)
+    hbm_staging = bool(hbm_staging)
+    # Every window past the last visit position issues the same program.
+    dispatch_ahead = min(int(dispatch_ahead), g_local)
     kfn = build_push_moe_kernel(
         g_local=g_local,
         capacity=capacity,
@@ -390,6 +525,10 @@ def fused_ep_moe_push(
         push_tokens=t_local,
         sc_prepush=n_pre,
         height_rungs_override=height_rungs_override,
+        tail_barrier=tail_barrier,
+        hbm_staging=hbm_staging,
+        dispatch_ahead=dispatch_ahead,
+        single_barrier=bool(single_barrier),
     )
 
     layout = _exchange_layout(t_local, topk, e_total, form.quantized_activations)
@@ -397,14 +536,14 @@ def fused_ep_moe_push(
     def exchange_all_gather(packed, rank_l):
         """The routing exchange all-gather of the flat i32 payload."""
         if tc_exchange:
-            return build_tc_exchange_all_gather(ep=ep, width=packed.size)(
-                packed, rank_l[0, 0]
-            )
+            return build_tc_exchange_all_gather(
+                ep=ep, width=packed.size, single_barrier=bool(single_barrier)
+            )(packed, rank_l[0, 0])
         return lax.all_gather(packed, ax, axis=0, tiled=True)
 
     def unpack_operands(scales_gating_biases):
         """(w1 scale, w2 scale, gate, hash ids, score bias, slot table, load
-        accumulator, bias iterator)."""
+        accumulator, shared expert, bias iterator)."""
         operands = iter(scales_gating_biases)
         if pad_scale_rows:
             # [G * rows, N] -> [G, rows, N]: whole sublane tiles per expert,
@@ -423,6 +562,7 @@ def fused_ep_moe_push(
         score_bias_l = next(operands) if has_score_bias else None
         expert_slot_l = next(operands) if has_expert_slot else None
         expert_load_l = next(operands) if has_expert_load else None
+        shared_l = tuple(next(operands) for _ in range(4)) if has_shared else None
         return (
             w1s_l,
             w2s_l,
@@ -431,6 +571,7 @@ def fused_ep_moe_push(
             score_bias_l,
             expert_slot_l,
             expert_load_l,
+            shared_l,
             operands,
         )
 
@@ -464,7 +605,9 @@ def fused_ep_moe_push(
             topk_idx = hash_l.astype(jnp.int32)
             topk_weights = jnp.take_along_axis(scores, topk_idx, axis=-1)
             if expert_slot_l is not None:
-                topk_idx = _to_slots(topk_idx, expert_slot_l, me * t_local)
+                topk_idx = _to_slots(
+                    topk_idx, expert_slot_l, me * t_local, onehot=onehot_slots
+                )
         elif score_bias_l is None:
             topk_weights, topk_idx = pallas_select(
                 scores, topk=topk, block_rows=select_rows
@@ -477,7 +620,9 @@ def fused_ep_moe_push(
                 weight_scores=scores,
             )
         if expert_slot_l is not None and hash_l is None:
-            topk_idx = _to_slots(topk_idx, expert_slot_l, me * t_local)
+            topk_idx = _to_slots(
+                topk_idx, expert_slot_l, me * t_local, onehot=onehot_slots
+            )
         topk_idx = _relabel_expert_ids_to_mesh_order(
             topk_idx, g_local=g_local, mesh_ep_ranks=mesh_ep_ranks
         )
@@ -524,8 +669,15 @@ def fused_ep_moe_push(
         bias_it,
         out_dtype,
         expert_load_l=None,
+        pre_tables=None,
+        x_l=None,
+        shared_l=None,
     ):
-        """Dispatch tables, SparseCore pre-push, plan, kernel and combine."""
+        """Dispatch tables, SparseCore pre-push, plan, kernel and combine.
+
+        `pre_tables`, where the exchange kernel already built them, are
+        build_push_tables' outputs; `shared_l`, the shared expert computed on
+        `x_l` between the pre-push and the kernel."""
         me = rank_l[0, 0]
         pairs_g, scale_bits_g, rows_by_dest = _unpack_routing_exchange(
             exchange, layout, t_local, topk, e_total
@@ -544,36 +696,77 @@ def fused_ep_moe_push(
         )
         with jax.named_scope("moe_dispatch_tables"):
             runs = run_tables(rows_by_dest)
-            seg, dmeta, visit_all = push_dispatch_segments(
-                runs[3], runs[2], rows_by_dest, me, seg_start, e_total=e_total, ep=ep
-            )
-            recv_by_e = dmeta[g_local + 1 : 2 * g_local + 1]
-            S = ep * g_local
-            seg_n = jnp.bitwise_and(seg[:S], 65535).reshape(g_local, ep)
-            seg_remote = (jnp.arange(ep)[None, :] != me).astype(jnp.int32)
-            visit = lax.dynamic_slice(visit_all, (me, 0), (1, g_local)).reshape(g_local)
-            # Rows landing here at each pre-pushed visit position.
-            vis_s = visit[:n_pre]
-            hit_s = (
-                vis_s[:, None] == jnp.arange(g_local, dtype=jnp.int32)[None, :]
-            ) & (vis_s[:, None] >= 0)
-            rows_at_v = jnp.sum(jnp.where(hit_s, recv_by_e[None, :], 0), axis=1)
-            # The kernel waits only the remote rows IT sends: positions >= n_pre.
-            n_rem_tc = jnp.sum(seg_n[n_pre:] * seg_remote).astype(jnp.int32).reshape(1)
-            dmeta = jnp.concatenate(
-                [dmeta[: 2 * g_local + 1], n_rem_tc, dmeta[2 * g_local + 2 :]]
-            )
-            # SparseCore core c pushes the positions v with v % 2 == c.
-            counts_sc = jnp.stack(
-                [
-                    jnp.sum(rows_at_v[0:n_pre:2]),
-                    jnp.sum(rows_at_v[1:n_pre:2]),
-                    jnp.sum(seg_n[0:n_pre:2] * seg_remote),
-                    jnp.sum(seg_n[1:n_pre:2] * seg_remote),
-                ]
-            ).astype(jnp.int32)
+            shard_tables = None
+            if pre_tables is not None:
+                seg, dmeta, visit, counts_sc, *shard_tables = pre_tables
+            elif table_kernel:
+                seg, dmeta, visit, counts_sc, *shard_tables = build_push_tables(
+                    rows_by_dest,
+                    seg_start,
+                    me,
+                    ep=ep,
+                    n_pre=n_pre,
+                    tile_m=capacity,
+                    light_prepush=light_prepush,
+                )
+            elif fused_dispatch_meta:
+                seg, dmeta, _, visit, counts_sc = push_dispatch_tables(
+                    runs[3],
+                    runs[2],
+                    rows_by_dest,
+                    me,
+                    seg_start,
+                    e_total=e_total,
+                    ep=ep,
+                    n_pre=n_pre,
+                )
+            else:
+                seg, dmeta, visit_all = push_dispatch_segments(
+                    runs[3],
+                    runs[2],
+                    rows_by_dest,
+                    me,
+                    seg_start,
+                    e_total=e_total,
+                    ep=ep,
+                )
+                recv_by_e = dmeta[g_local + 1 : 2 * g_local + 1]
+                S = ep * g_local
+                seg_n = jnp.bitwise_and(seg[:S], 65535).reshape(g_local, ep)
+                seg_remote = (jnp.arange(ep)[None, :] != me).astype(jnp.int32)
+                visit = lax.dynamic_slice(visit_all, (me, 0), (1, g_local)).reshape(
+                    g_local
+                )
+                # Rows landing here at each pre-pushed visit position.
+                vis_s = visit[:n_pre]
+                hit_s = (
+                    vis_s[:, None] == jnp.arange(g_local, dtype=jnp.int32)[None, :]
+                ) & (vis_s[:, None] >= 0)
+                rows_at_v = jnp.sum(jnp.where(hit_s, recv_by_e[None, :], 0), axis=1)
+                # The kernel waits only the remote rows IT sends: positions >= n_pre.
+                n_rem_tc = (
+                    jnp.sum(seg_n[n_pre:] * seg_remote).astype(jnp.int32).reshape(1)
+                )
+                dmeta = jnp.concatenate(
+                    [dmeta[: 2 * g_local + 1], n_rem_tc, dmeta[2 * g_local + 2 :]]
+                )
+                # SparseCore core c pushes the positions v with v % 2 == c.
+                counts_sc = jnp.stack(
+                    [
+                        jnp.sum(rows_at_v[0:n_pre:2]),
+                        jnp.sum(rows_at_v[1:n_pre:2]),
+                        jnp.sum(seg_n[0:n_pre:2] * seg_remote),
+                        jnp.sum(seg_n[1:n_pre:2] * seg_remote),
+                    ]
+                ).astype(jnp.int32)
         # Compute the pre-push operands before the routing plan, so XLA
         # launches the SparseCore dispatch ahead of it and the two overlap.
+        # The plan reads pairs_g, so it follows the barrier either way; the
+        # run tables only add a layout copy at it (`slim_prepush_barrier`).
+        barriered_runs = () if slim_prepush_barrier else tuple(runs)
+        # The shared expert's rows come out of the same barrier as the
+        # pre-push operands, so it cannot be scheduled ahead of them.
+        shared_x = (x_l,) if shared_l is not None else ()
         (
             q_sorted,
             seg,
@@ -582,10 +775,15 @@ def fused_ep_moe_push(
             visit,
             pairs_g,
             scale_bits_g,
-            *runs,
+            *rest,
         ) = lax.optimization_barrier(
-            (q_sorted, seg, counts_sc, dmeta, visit, pairs_g, scale_bits_g, *runs)
+            (q_sorted, seg, counts_sc, dmeta, visit, pairs_g, scale_bits_g)
+            + shared_x
+            + barriered_runs
         )
+        shared_x, barriered_runs = rest[: len(shared_x)], rest[len(shared_x) :]
+        if not slim_prepush_barrier:
+            runs = barriered_runs
         slab = sc_dispatch_chunk_2core(
             q_sorted,
             seg,
@@ -598,6 +796,11 @@ def fused_ep_moe_push(
             name=f"moe_sc_prepush_2c_s{n_pre}",
             rank=me,
         )
+        shared_out = ()
+        if shared_l is not None:
+            assert shared_limit is not None
+            with jax.named_scope("moe_shared_expert"):
+                shared_out = (fp8_swiglu_mlp(*shared_x, *shared_l, limit=shared_limit),)
         plan_kw = dict(
             e_total=e_total,
             ep=ep,
@@ -606,6 +809,7 @@ def fused_ep_moe_push(
             tile_m=capacity,
             shard_stride=ragged_stride,
         )
+        gathered = None
         if sharded_plan:
             gathered = GatheredPairs(
                 expert_blocks=pairs_g.reshape(T * topk // block, block),
@@ -615,44 +819,64 @@ def fused_ep_moe_push(
                 n_tokens=T,
                 topk=topk,
             )
-            (
-                pos,
-                mirror_pos,
-                slab_row,
-                kernel_tables,
-                expert_rows,
-                slab_base,
-                counts,
-            ) = prepare_routing(me, gathered, tuple(runs), **plan_kw)
+        pair_tables = None
+        routing_inputs = None
+        routing = None
+        if kernel_plan_tables:
+            # The table kernel built the plan's small tables; only the
+            # per-pair lookups are left.
+            assert shard_tables is not None
+            pair_tables = routing_pairs_from_tables(
+                me,
+                gathered,
+                *shard_tables[4],
+                e_total=e_total,
+                ep=ep,
+                t_local=t_local,
+                block=block,
+                shard_stride=ragged_stride,
+            )
+            slab_row = pair_tables[2]
+        elif sharded_plan and shard_tables is None:
+            # The sharded plan's consumer inputs, through the fused routing
+            # metadata (routing.prepare_routing) where it admits the shape.
+            assert gathered is not None
+            routing_inputs = prepare_routing(me, gathered, tuple(runs), **plan_kw)
+            slab_row = routing_inputs.slab_row
         else:
-            routing = build_routing_tables(pairs_g.reshape(T, topk), **plan_kw)
+            if sharded_plan:
+                routing = build_routing_tables_sharded(me, gathered, runs, **plan_kw)
+            else:
+                routing = build_routing_tables(pairs_g.reshape(T, topk), **plan_kw)
+            # Both slab tables scatter onto this shard's own slab. The rows of
+            # the other shards are dropped where they are computed rather than
+            # built into a replicated slab and sliced away afterwards.
             slab_row = local_slab_rows(routing, me, shard_stride=ragged_stride)
-            block_tables = shard_transport_tables_in_blocks(
-                routing, me, e_total=e_total, ep=ep
-            )
-            row_tables = shard_push_tables_in_rows(routing, me, e_total=e_total, ep=ep)
-            kernel_tables = (*block_tables[:3], block_tables[5], row_tables[0])
-            expert_rows, slab_base = shard_expert_slabs(
-                routing, me, e_total=e_total, ep=ep
-            )
-            counts = shard_count_vector(
-                routing, expert_rows, me, e_total=e_total, ep=ep
-            )
-            pos = lax.dynamic_slice(
-                routing.arrival_row, (me * t_local, 0), (t_local, topk)
-            )
-            mirror_pos = lax.dynamic_slice(
-                routing.mirror_row, (me * t_local, 0), (t_local, topk)
-            )
         # Keep the scale-slab scatter (a SparseCore offload) behind the
-        # pre-push on the SparseCore queue.
-        slab_row, scale_bits_g, slab = lax.optimization_barrier(
-            (slab_row, scale_bits_g, slab)
-        )
+        # pre-push on the SparseCore queue. The shared expert joins here, so
+        # the expert kernel, which reads the slab, cannot start before it.
+        if early_scale_scatter == 2:
+            # Nor behind the pre-push: the scatter may take the SparseCore
+            # first; the light pre-push still lands under the shared expert.
+            slab_row, scale_bits_g = lax.optimization_barrier((slab_row, scale_bits_g))
+        elif early_scale_scatter:
+            # The shared expert joins after the scatter instead (below), so
+            # the scatter's SparseCore work can run under it.
+            slab_row, scale_bits_g, slab = lax.optimization_barrier(
+                (slab_row, scale_bits_g, slab)
+            )
+        else:
+            slab_row, scale_bits_g, slab, *shared_out = lax.optimization_barrier(
+                (slab_row, scale_bits_g, slab) + shared_out
+            )
         # The activation row scale, scattered onto the slab row each routed
         # pair computes on (v2's scale slab; see there).
         if form.quantized_activations:
-            scale_bits = jnp.repeat(cast(jax.Array, scale_bits_g), topk)
+            scale_bits = (
+                _repeat_bits(cast(jax.Array, scale_bits_g), topk)
+                if matmul_scale_repeat
+                else jnp.repeat(cast(jax.Array, scale_bits_g), topk)
+            )
             scale_rows = act_scale_slab_rows(ragged_stride)
             scale_slab = lax.bitcast_convert_type(
                 jnp.zeros((scale_rows * HIDDEN_LANE_BLOCK,), jnp.int32)
@@ -662,6 +886,30 @@ def fused_ep_moe_push(
             ).reshape(scale_rows, HIDDEN_LANE_BLOCK)
         else:
             scale_slab = None
+        if early_scale_scatter and shared_out and scale_slab is not None:
+            scale_slab, slab, *shared_out = lax.optimization_barrier(
+                (scale_slab, slab) + tuple(shared_out)
+            )
+        if shard_tables is not None:
+            kernel_tables, expert_rows, slab_base, counts, _ = shard_tables
+        elif routing_inputs is not None:
+            kernel_tables = routing_inputs.kernel_tables
+            expert_rows = routing_inputs.expert_rows
+            slab_base = routing_inputs.slab_base
+            counts = routing_inputs.counts
+        else:
+            assert routing is not None
+            block_tables = shard_transport_tables_in_blocks(
+                routing, me, e_total=e_total, ep=ep
+            )
+            row_tables = shard_push_tables_in_rows(routing, me, e_total=e_total, ep=ep)
+            expert_rows, slab_base = shard_expert_slabs(
+                routing, me, e_total=e_total, ep=ep
+            )
+            counts = shard_count_vector(
+                routing, expert_rows, me, e_total=e_total, ep=ep
+            )
+            kernel_tables = (*block_tables[:3], block_tables[5], row_tables[0])
         recv_rows = align_up(t_local * topk + (ROWBLK - 1) * e_total, ROWBLK)
         w1b_k = next(bias_it).reshape(g_local, 2 * inter) if has_w1_bias else None
         w2b_k = next(bias_it).reshape(g_local, hidden) if has_w2_bias else None
@@ -685,6 +933,25 @@ def fused_ep_moe_push(
             slab=slab,
         )
 
+        # The destination's own table: one arrival row per selection slot.
+        if pair_tables is not None:
+            pos, mirror_pos = pair_tables[0], pair_tables[1]
+        elif routing_inputs is not None:
+            pos, mirror_pos = routing_inputs.pos, routing_inputs.mirror_pos
+        elif sharded_plan:
+            pos = cast(ShardRoutingTables, routing).pos
+            mirror_pos = cast(ShardRoutingTables, routing).mirror_pos
+        else:
+            pos = lax.dynamic_slice(
+                cast(RoutingTables, routing).arrival_row,
+                (me * t_local, 0),
+                (t_local, topk),
+            )
+            mirror_pos = lax.dynamic_slice(
+                cast(RoutingTables, routing).mirror_row,
+                (me * t_local, 0),
+                (t_local, topk),
+            )
         combined = _combine_arrivals_fs(
             arrivals, arrival_scales, pos, mirror_pos, topk_weights, out_dtype
         )
@@ -692,7 +959,9 @@ def fused_ep_moe_push(
         # zero, but zero times an unwritten NaN is not.
         combined = jnp.where(row_routes, combined, jnp.zeros_like(combined))
         out = token_layout.restore(combined, ax)
-        return out if updated_load is None else (out, updated_load)
+        outs = (out,) + (() if updated_load is None else (updated_load,))
+        outs += tuple(shared_out)
+        return outs if len(outs) > 1 else out
 
     def local_fn(x_l, rank_l, w1_l, w2_l, *scales_gating_biases):
         """One shard's half of the layer: route, dispatch, kernel, combine."""
@@ -704,23 +973,61 @@ def fused_ep_moe_push(
             score_bias_l,
             expert_slot_l,
             expert_load_l,
+            shared_l,
             bias_it,
         ) = unpack_operands(scales_gating_biases)
         gate_l, hash_l, q_l, row_scale_l = quantize_local(x_l, rank_l, gate_l, hash_l)
         topk_weights, packed, local_blocks, block_hist, row_routes = select_local(
             gate_l, hash_l, score_bias_l, row_scale_l, expert_slot_l, rank_l
         )
-        # Issue the routing exchange before the local sort, so the sort runs
-        # on the TensorCore while the exchange is in flight.
+        pre_tables = None
         my_counts = block_hist.sum(axis=0)
-        packed, q_l, local_blocks, my_counts = lax.optimization_barrier(
-            (packed, q_l, local_blocks, my_counts)
-        )
-        exchange = exchange_all_gather(packed, rank_l).reshape(ep, layout[-1])
-        with jax.named_scope("moe_early_qsort"):
-            q_sorted, seg_start = local_sort_activations(
-                local_blocks.reshape(-1), my_counts, q_l, e_total=e_total, topk=topk
+        if exchange_row_gather:
+            # The sorted rows are copied by the exchange kernel itself.
+            with jax.named_scope("moe_early_qsort"):
+                tok, seg_start = local_sort_tokens(
+                    local_blocks.reshape(-1),
+                    my_counts,
+                    e_total=e_total,
+                    topk=topk,
+                    bf16_counts=bf16_sort_counts,
+                )
+            if exchange_tables:
+                exchange, q_sorted, *pre_tables = build_exchange_rows_tables(
+                    ep=ep,
+                    width=layout[-1],
+                    n_rows=tok.shape[0],
+                    count_at=layout[1],
+                    e_total=e_total,
+                    n_pre=n_pre,
+                    tile_m=capacity,
+                    light_prepush=light_prepush,
+                    single_barrier=bool(single_barrier),
+                )(packed, rank_l[0, 0], q_l, tok, seg_start)
+            else:
+                exchange, q_sorted = build_tc_exchange_all_gather_rows(
+                    ep=ep,
+                    width=layout[-1],
+                    n_rows=tok.shape[0],
+                    single_barrier=bool(single_barrier),
+                )(packed, rank_l[0, 0], q_l, tok)
+            exchange = exchange.reshape(ep, layout[-1])
+        else:
+            # Issue the routing exchange before the local sort, so the sort
+            # runs on the TensorCore while the exchange is in flight.
+            packed, q_l, local_blocks, my_counts = lax.optimization_barrier(
+                (packed, q_l, local_blocks, my_counts)
             )
+            exchange = exchange_all_gather(packed, rank_l).reshape(ep, layout[-1])
+            with jax.named_scope("moe_early_qsort"):
+                q_sorted, seg_start = local_sort_activations(
+                    local_blocks.reshape(-1),
+                    my_counts,
+                    q_l,
+                    e_total=e_total,
+                    topk=topk,
+                    bf16_counts=bf16_sort_counts,
+                )
         exchange, q_sorted, seg_start = lax.optimization_barrier(
             (exchange, q_sorted, seg_start)
         )
@@ -740,6 +1047,9 @@ def fused_ep_moe_push(
             bias_it,
             x_l.dtype,
             expert_load_l,
+            pre_tables,
+            x_l,
+            shared_l,
         )
 
     bias_args = tuple(b for b in (w1_bias, w2_bias) if b is not None)
@@ -753,10 +1063,17 @@ def fused_ep_moe_push(
     # Replicated like the score bias: indexed by global expert / slot id.
     expert_slot_args = (expert_slot,) if has_expert_slot else ()
     expert_load_args = (expert_load,) if has_expert_load else ()
+    # Replicated: every shard holds the whole shared expert.
+    shared_args = () if shared_expert is None else tuple(shared_expert)
     in_specs = (
         (P(ax),) * (5 + len(scale_args) + len(hash_args))
         + (P(),)
-        * (len(score_bias_args) + len(expert_slot_args) + len(expert_load_args))
+        * (
+            len(score_bias_args)
+            + len(expert_slot_args)
+            + len(expert_load_args)
+            + len(shared_args)
+        )
         + (P(ax),) * len(bias_args)
     )
     args = (
@@ -767,6 +1084,7 @@ def fused_ep_moe_push(
         + score_bias_args
         + expert_slot_args
         + expert_load_args
+        + shared_args
         + bias_args
     )
     NS = jax.sharding.NamedSharding
@@ -806,7 +1124,26 @@ def fused_ep_moe_push(
         n_pre,
         tc_exchange,
         height_rungs_override,
+        tail_barrier,
+        bool(onehot_slots),
+        hbm_staging,
+        dispatch_ahead,
+        bool(matmul_scale_repeat),
+        exchange_row_gather,
+        bool(bf16_sort_counts),
+        bool(slim_prepush_barrier),
+        bool(fused_dispatch_meta),
+        bool(table_kernel),
+        bool(exchange_tables),
+        bool(kernel_plan_tables),
+        has_shared and tuple((a.shape, a.dtype) for a in shared_args),
+        float(shared_limit) if has_shared and shared_limit is not None else False,
+        int(light_prepush),
+        bool(single_barrier),
+        int(early_scale_scatter),
     )
+    out_specs = (P(ax),) + ((P(),) if has_expert_load else ()) + ((P(ax),) * has_shared)
+    out_specs = out_specs if len(out_specs) > 1 else out_specs[0]
     sm = _LAYER_SM_CACHE.get(key)
     if sm is None:
         with _LAYER_SM_CACHE_LOCK:
@@ -816,7 +1153,7 @@ def fused_ep_moe_push(
                     local_fn,
                     mesh=mesh,
                     in_specs=in_specs,
-                    out_specs=(P(ax), P()) if has_expert_load else P(ax),
+                    out_specs=out_specs,
                     check_vma=False,
                 )
                 _LAYER_SM_CACHE[key] = sm

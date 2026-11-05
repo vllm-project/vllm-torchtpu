@@ -89,6 +89,22 @@ if TYPE_CHECKING:
     TPU_MOE_EPLB_MOVER_STEP_BUDGET_MB: int = 256
     MOE_FUSED_EP_PUSH_SC_PREPUSH: int = 2
     MOE_FUSED_EP_PUSH_TC_EXCHANGE: bool = False
+    MOE_FUSED_EP_PUSH_TAIL_BARRIER: bool = False
+    MOE_FUSED_EP_PUSH_ONEHOT_SLOTS: bool = True
+    MOE_FUSED_EP_PUSH_HBM_STAGING: bool = True
+    MOE_FUSED_EP_PUSH_DISPATCH_AHEAD: int = 25
+    MOE_FUSED_EP_PUSH_MATMUL_SCALE_REPEAT: bool = True
+    MOE_FUSED_EP_PUSH_EXCHANGE_ROW_GATHER: bool = True
+    MOE_FUSED_EP_PUSH_BF16_SORT_COUNTS: bool = True
+    MOE_FUSED_EP_PUSH_SLIM_PREPUSH_BARRIER: bool = True
+    MOE_FUSED_EP_PUSH_FUSED_DISPATCH_META: bool = True
+    MOE_FUSED_EP_PUSH_TABLE_KERNEL: bool = True
+    MOE_FUSED_EP_PUSH_EXCHANGE_TABLES: bool = True
+    MOE_FUSED_EP_PUSH_KERNEL_PLAN_TABLES: bool = True
+    MOE_FUSED_EP_PUSH_SHARED_EXPERT: bool = True
+    MOE_FUSED_EP_PUSH_LIGHT_PREPUSH: int = 2
+    MOE_FUSED_EP_PUSH_SINGLE_BARRIER: bool = True
+    MOE_FUSED_EP_PUSH_EARLY_SCALE_SCATTER: int = 2
     TPU_EXPERT_PLACEMENT: str = ""
     TPU_LATENT_PROJ_INTRA_CHIP_TP: bool = False
     TPU_TOKEN_BUCKET_EXTRA: list[int] = []
@@ -758,8 +774,92 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # TensorCore remote-DMA kernel instead of XLA's (SparseCore-offloaded)
     # all-gather, keeping it off the SparseCore queue.
     "MOE_FUSED_EP_PUSH_TC_EXCHANGE": env_bool("MOE_FUSED_EP_PUSH_TC_EXCHANGE"),
+    # MOE_FUSED_EP_KERNEL_IMPL=push: keep the all-pairs barrier the expert
+    # kernel runs after its transport drain. 0 drops it; the drain's exact
+    # counts already cover every write a peer makes during the call.
+    "MOE_FUSED_EP_PUSH_TAIL_BARRIER": env_bool(
+        "MOE_FUSED_EP_PUSH_TAIL_BARRIER", default=False
+    ),
     # MOE_FUSED_EP_KERNEL_IMPL=push with an expert layout: map each selected
     # expert to its replica slot with a one-hot matmul instead of two gathers.
+    "MOE_FUSED_EP_PUSH_ONEHOT_SLOTS": env_bool(
+        "MOE_FUSED_EP_PUSH_ONEHOT_SLOTS", default=True
+    ),
+    # MOE_FUSED_EP_KERNEL_IMPL=push: ship the expert kernel's result tiles
+    # through its HBM contribution slab instead of straight from VMEM, so the
+    # remote pushes do not hold a VMEM staging slot while the fabric drains.
+    "MOE_FUSED_EP_PUSH_HBM_STAGING": env_bool(
+        "MOE_FUSED_EP_PUSH_HBM_STAGING", default=True
+    ),
+    # MOE_FUSED_EP_KERNEL_IMPL=push: how many visit positions the expert
+    # kernel's own dispatch pushes run ahead of its compute (>= 1); the experts
+    # per shard or more pushes every position right after the head barrier.
+    "MOE_FUSED_EP_PUSH_DISPATCH_AHEAD": env_int("MOE_FUSED_EP_PUSH_DISPATCH_AHEAD", 25),
+    # MOE_FUSED_EP_KERNEL_IMPL=push: build the scale slab's per-pair row
+    # scales with a one-hot matmul instead of jnp.repeat.
+    "MOE_FUSED_EP_PUSH_MATMUL_SCALE_REPEAT": env_bool(
+        "MOE_FUSED_EP_PUSH_MATMUL_SCALE_REPEAT", default=True
+    ),
+    # MOE_FUSED_EP_KERNEL_IMPL=push with MOE_FUSED_EP_PUSH_TC_EXCHANGE=1: the
+    # routing-exchange kernel also copies the expert-sorted activation rows
+    # while it waits on its peers.
+    "MOE_FUSED_EP_PUSH_EXCHANGE_ROW_GATHER": env_bool(
+        "MOE_FUSED_EP_PUSH_EXCHANGE_ROW_GATHER", default=True
+    ),
+    # MOE_FUSED_EP_KERNEL_IMPL=push: find the expert-sorted token order with
+    # two single-pass bf16 matmuls instead of a cumsum and a HIGHEST matmul.
+    "MOE_FUSED_EP_PUSH_BF16_SORT_COUNTS": env_bool(
+        "MOE_FUSED_EP_PUSH_BF16_SORT_COUNTS", default=True
+    ),
+    # MOE_FUSED_EP_KERNEL_IMPL=push: keep the run tables out of the barrier
+    # that orders the SparseCore pre-push ahead of the routing plan.
+    "MOE_FUSED_EP_PUSH_SLIM_PREPUSH_BARRIER": env_bool(
+        "MOE_FUSED_EP_PUSH_SLIM_PREPUSH_BARRIER", default=True
+    ),
+    # MOE_FUSED_EP_KERNEL_IMPL=push: build the pre-push counts and the
+    # kernel's remote-row count with the dispatch segments, in fewer ops.
+    "MOE_FUSED_EP_PUSH_FUSED_DISPATCH_META": env_bool(
+        "MOE_FUSED_EP_PUSH_FUSED_DISPATCH_META", default=True
+    ),
+    # MOE_FUSED_EP_KERNEL_IMPL=push: build the dispatch and shard tables in
+    # one TensorCore kernel (plan_kernel.py) instead of ~50 XLA ops.
+    "MOE_FUSED_EP_PUSH_TABLE_KERNEL": env_bool(
+        "MOE_FUSED_EP_PUSH_TABLE_KERNEL", default=True
+    ),
+    # With TABLE_KERNEL=1 and EXCHANGE_ROW_GATHER=1: build the tables inside
+    # the routing-exchange kernel while its row copies finish.
+    "MOE_FUSED_EP_PUSH_EXCHANGE_TABLES": env_bool(
+        "MOE_FUSED_EP_PUSH_EXCHANGE_TABLES", default=True
+    ),
+    # With TABLE_KERNEL=1: the routing plan's small tables come from the
+    # table kernel too; XLA keeps only the per-pair lookups.
+    "MOE_FUSED_EP_PUSH_KERNEL_PLAN_TABLES": env_bool(
+        "MOE_FUSED_EP_PUSH_KERNEL_PLAN_TABLES", default=True
+    ),
+    # MOE_FUSED_EP_KERNEL_IMPL=push with TABLE_KERNEL=1: the SparseCore
+    # pre-push carries the lightest experts instead of the heaviest; the rest
+    # most rows first (1) or rising to the heaviest and falling back (2).
+    # Layers with fewer than 16 local slots keep the default order.
+    "MOE_FUSED_EP_PUSH_LIGHT_PREPUSH": env_int("MOE_FUSED_EP_PUSH_LIGHT_PREPUSH", 2),
+    # MOE_FUSED_EP_KERNEL_IMPL=push: the expert kernel and the TensorCore
+    # routing exchange open with one all-pairs barrier phase instead of two.
+    "MOE_FUSED_EP_PUSH_SINGLE_BARRIER": env_bool(
+        "MOE_FUSED_EP_PUSH_SINGLE_BARRIER", default=True
+    ),
+    # MOE_FUSED_EP_KERNEL_IMPL=push with the in-op shared expert: the
+    # activation scale-slab scatter (a SparseCore offload) is not held behind
+    # the shared expert (1), nor behind the SparseCore pre-push (2), so it can
+    # run while the TensorCore computes the shared expert.
+    "MOE_FUSED_EP_PUSH_EARLY_SCALE_SCATTER": env_int(
+        "MOE_FUSED_EP_PUSH_EARLY_SCALE_SCATTER", 2
+    ),
+    # MOE_FUSED_EP_KERNEL_IMPL=push: run the layer's FP8 shared expert as one
+    # kernel (kernels/quantized_matmul/shared_expert.py) inside the MoE op,
+    # issued after the SparseCore pre-push and ahead of the expert kernel, so
+    # the TensorCore computes it while the pre-push is in flight.
+    "MOE_FUSED_EP_PUSH_SHARED_EXPERT": env_bool(
+        "MOE_FUSED_EP_PUSH_SHARED_EXPERT", default=True
+    ),
     # Shard Kimi K3's latent-MoE down/up projections across the cores of a
     # chip instead of replicating them. They are unquantized [7168, 3584] and
     # [3584, 7168] matmuls run at full HBM bandwidth, ~22% of decode device
