@@ -314,6 +314,10 @@ class BeamModel(nn.Module):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()
         config = _beam_config(vllm_config)
+        # Names the compile cache directory (see
+        # _patch_vllm_compile_prefix_isolation); without it the plugin falls
+        # back to an order-dependent counter and warns.
+        self.prefix = prefix
         # As upstream's BeamModel: Beam drives SWA per layer off `layer_types`,
         # passing an explicit `per_layer_sliding_window` (None on the
         # full-attention layers). Without this, those layers would pick up
