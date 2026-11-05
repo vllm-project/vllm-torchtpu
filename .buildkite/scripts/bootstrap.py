@@ -848,8 +848,26 @@ def upload_stages(
     # Buildkite inserts each `pipeline upload` right after the currently running
     # step (LIFO), so upload `wait` + the next-stage uploader first and then
     # `stages[0]` in reverse order so `stages[0]` runs before the `wait`.
+    stage_num = stage_index + 1
     rest = stages[1:]
+    print(f"Stage {stage_num} now: {', '.join(stages[0])}")
+    for offset, next_stage in enumerate(rest, start=1):
+        prev_num = stage_num + offset - 1
+        print(
+            f"Stage {prev_num + 1} after stage {prev_num} passes: "
+            f"{', '.join(next_stage)}"
+        )
+    if len(stages[0]) > 1 or rest:
+        print(
+            "Uploading in reverse order (Buildkite inserts each upload right "
+            "after the running step)."
+        )
     if rest:
+        next_key = f"upload_stage_{stage_index + 1}"
+        print(
+            f"--- :pipeline: Stage {stage_num + 1} is uploaded by step "
+            f"{next_key} after a wait"
+        )
         step_env = {
             k: child_env[k]
             for k in (
@@ -867,7 +885,7 @@ def upload_stages(
                 "wait",
                 {
                     "label": f":pipeline: Upload {', '.join(rest[0])}",
-                    "key": f"upload_stage_{stage_index + 1}",
+                    "key": next_key,
                     "agents": {"queue": "cpu"},
                     "timeout_in_minutes": 15,
                     "retry": {
@@ -900,7 +918,6 @@ def upload_stages(
             print(f"Skipping {lane} (already uploaded for {stage_key})")
             continue
         lane_file = f".buildkite/pipeline_{lane}.yml"
-        print(f"Uploading {lane_file}")
         upload_with_priority(
             lane_file,
             repo_root=repo_root,
@@ -943,10 +960,10 @@ def run_bootstrap(
         raise
 
     # 1. Kind and priority (metadata).
-    print("--- Determining job priority", file=sys.stderr)
+    print("--- Determining job priority")
     kind = build_kind(ctx)
     job_priority, workload_priority = PRIORITIES[kind]
-    print(f"Build type: {kind} - Priority: {job_priority}", file=sys.stderr)
+    print(f"Build type: {kind} - Priority: {job_priority}")
     child_env["JOB_PRIORITY"] = str(job_priority)
     _agent("meta-data", "set", "JOB_PRIORITY", str(job_priority), env=child_env)
     # The kube launcher submits every workload of the build at this Kueue
@@ -1044,6 +1061,7 @@ def run_bootstrap(
     nightly = ctx.nightly_env or suite.nightly
     nightly_tag = " [NIGHTLY=1]" if nightly else ""
     suite_note = f"CI suite: {suite.name}{nightly_tag}: {suite.about}"
+    print(f"--- :pipeline: Suite {suite.name}{nightly_tag} (priority {job_priority})")
     print(suite_note)
     _agent(
         "annotate",
@@ -1124,7 +1142,6 @@ def run_bootstrap_dev(
             f"ERROR: invalid DEV_JOB_PRIORITY '{raw_priority}'; expected an integer."
         ) from exc
 
-    print(f"--- :pipeline: Uploading {pipeline_file}")
     upload_with_priority(
         pipeline_file,
         repo_root=repo_root,

@@ -15,9 +15,11 @@
 
 from __future__ import annotations
 
+import contextlib
 import http.client
 import http.server
 import importlib
+import io
 import json
 import os
 import pathlib
@@ -122,8 +124,18 @@ class _RunRecorder:
         self.uploads: list[tuple[str, str, dict[str, str]]] = []
         self.git_calls: list[tuple[str, ...]] = []
         self.mq_extras_calls: list[str] = []
+        self.stdout_buf = io.StringIO()
+        self.stderr_buf = io.StringIO()
         self._current_lane: str | None = None
         self._real_upload = bp.upload_with_priority
+
+    @property
+    def stdout(self) -> str:
+        return self.stdout_buf.getvalue()
+
+    @property
+    def stderr(self) -> str:
+        return self.stderr_buf.getvalue()
 
     def upload_with_priority(self, yaml_file: str, **kwargs: Any) -> None:
         self._current_lane = pathlib.Path(yaml_file).stem.removeprefix("pipeline_")
@@ -247,6 +259,8 @@ class TestBootstrapUnits(unittest.TestCase):
             mock.patch.object(
                 bp, "upload_with_priority", side_effect=rec.upload_with_priority
             ),
+            contextlib.redirect_stdout(rec.stdout_buf),
+            contextlib.redirect_stderr(rec.stderr_buf),
         ):
             self.assertEqual(bp.run_bootstrap(env, repo_root=_REPO_ROOT), 0)
         return rec
@@ -280,6 +294,8 @@ class TestBootstrapUnits(unittest.TestCase):
             mock.patch.object(
                 bp, "upload_with_priority", side_effect=rec.upload_with_priority
             ),
+            contextlib.redirect_stdout(rec.stdout_buf),
+            contextlib.redirect_stderr(rec.stderr_buf),
         ):
             self.assertEqual(
                 bp.upload_stages(
@@ -1156,11 +1172,27 @@ class TestBootstrapUnits(unittest.TestCase):
         )
         self.assertEqual(pr.uploads[2][2]["OMNI_IMAGE_SKIP"], "")
         self.assertNotIn("tpu-pr/alice@example.com", pr.uploads[1][1])
+        self.assertEqual(pr.stderr, "")
+        for expected_line in (
+            "--- Determining job priority",
+            "Build type: pre-merge - Priority: 6",
+            "--- :pipeline: Suite pr (priority 6)",
+            "Stage 1 now: build, cpu",
+            "Stage 2 after stage 1 passes: tests, integration, verify",
+            "Uploading in reverse order (Buildkite inserts each upload right "
+            "after the running step).",
+            "--- :pipeline: Stage 2 is uploaded by step upload_stage_1 after a wait",
+            "--- :pipeline: Uploading .buildkite/pipeline_cpu.yml with priority 6",
+            "--- :pipeline: Uploading .buildkite/pipeline_build.yml with priority 6",
+        ):
+            self.assertIn(expected_line, pr.stdout)
+        self.assertNotIn("Uploading .buildkite/pipeline_cpu.yml\n", pr.stdout)
         pr_stage1 = self._run_next_stage(pr)
         self.assertEqual(
             [u[0] for u in pr_stage1.uploads],
             ["verify", "integration", "tests"],
         )
+        self.assertIn("Stage 2 now: tests, integration, verify", pr_stage1.stdout)
         self.assertEqual(
             pr_stage1.meta,
             [
@@ -1182,6 +1214,8 @@ class TestBootstrapUnits(unittest.TestCase):
             mock.patch.object(
                 bp, "upload_with_priority", side_effect=retry_rec.upload_with_priority
             ),
+            contextlib.redirect_stdout(retry_rec.stdout_buf),
+            contextlib.redirect_stderr(retry_rec.stderr_buf),
         ):
             self.assertEqual(
                 bp.upload_stages(
@@ -1192,6 +1226,9 @@ class TestBootstrapUnits(unittest.TestCase):
                 0,
             )
         self.assertEqual([u[0] for u in retry_rec.uploads], ["tests"])
+        self.assertIn(
+            "Skipping verify (already uploaded for upload_stage_1)", retry_rec.stdout
+        )
         self.assertIn(("upload-stages:upload_stage_1:tests", "1"), retry_rec.meta)
 
         # 3-stage test-only suite chains stages 0 -> 1 -> 2 with upload_stage_1, _2.
