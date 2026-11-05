@@ -333,6 +333,20 @@ def _compact(records, total_records, tiles, tb):
     several us. Out-of-range records drop.
     """
     n = records.shape[0]
+    from vllm_torchtpu.kernels.experimental import decode_preparation as prep
+
+    # The fused kernel builds an [n, n] rank match; any tiling of a measured n
+    # is exact because offsets are counted per tile boundary.
+    if prep.admit(
+        "compact_records",
+        prep.first_problem(
+            (records.shape == (n,), f"records are {list(records.shape)}"),
+            (tiles * tb == n, f"{tiles} tiles of {tb} do not cover {n} records"),
+        ),
+        tokens=n,
+        buckets=prep.COMPACT_TOKENS,
+    ):
+        return prep.compact_records(records, total_records, tb)
     valid = (records >= 0) & (records < total_records)
     slots = jnp.where(valid, jnp.cumsum(valid, dtype=jnp.int32) - 1, n)
     pairs = jnp.stack((jnp.arange(n, dtype=jnp.int32), records.astype(jnp.int32)), 1)
@@ -356,6 +370,7 @@ def fused_compress_rope(
     eps: float = 1e-6,
     ratio: int = 2,
     config: CompressConfig | None = None,
+    ring_tables: tuple[jax.Array, jax.Array, jax.Array, jax.Array] | None = None,
 ):
     """Return ``(latent BF16, CSA2 words INT32, scales FP32 [T,1], state)``.
 
@@ -374,6 +389,10 @@ def fused_compress_rope(
     ``ring_write`` (unique records), and rows with ``has_prev == 0`` pool
     with the stored row at ``ring_read`` (read before any write). Valid rows
     with ``has_prev == 0`` must have a ``ring_read`` record.
+
+    ``ring_tables`` may replace the two record vectors with precomputed
+    ``(write_pairs, write_offsets, read_pairs, read_offsets)`` from the same
+    stable compaction. This requires unpadded tokens and matching tile offsets.
     """
     tokens, hidden = x.shape
     width = ratio * _DIM
@@ -386,9 +405,11 @@ def fused_compress_rope(
     if has_prev.shape != (tokens, 1) or valid.shape != (tokens, 1):
         raise ValueError("has_prev and valid must be INT32 [tokens, 1]")
     rope_gather.check_rope_rows(rope_rows, tokens, _DIM)
-    banks = _check_ring(state, ring_write, ring_read, tokens, ratio)
+    banks = _check_ring(state, ring_write, ring_read, tokens, ratio, ring_tables)
     pools = () if state is None else (state if isinstance(state, tuple) else (state,))
     padded = -(-tokens // _ROW_ALIGN) * _ROW_ALIGN
+    if ring_tables is not None and padded != tokens:
+        raise ValueError("Precomputed ring tables require unpadded token rows")
     if padded != tokens:
         extra = padded - tokens
         x = jnp.pad(x, ((0, extra), (0, 0)))
@@ -403,6 +424,13 @@ def fused_compress_rope(
     check_config(config, padded, width)
     tb = config.token_block
     tiles = padded // tb
+    if ring_tables is not None:
+        shapes = ((2 * padded,), (tiles + 1,), (2 * padded,), (tiles + 1,))
+        if len(ring_tables) != len(shapes) or any(
+            value.shape != shape or value.dtype != jnp.int32
+            for value, shape in zip(ring_tables, shapes, strict=True)
+        ):
+            raise ValueError("Ring tables must be INT32 pairs and per-tile offsets")
     if ratio == 2:
         capacity = pltpu.get_tpu_info().smem_capacity_bytes
         # Reserve half for compiler scratch/spills and the pipeline's controls.
@@ -420,10 +448,13 @@ def fused_compress_rope(
     ]
     if ratio == 2:
         records = sum(pool.shape[0] for pool in pools) // _RECORD_ROWS
-        prefetch = [
-            *_compact(ring_write.astype(jnp.int32), records, tiles, tb),
-            *_compact(ring_read.astype(jnp.int32), records, tiles, tb),
-        ]
+        if ring_tables is None:
+            prefetch = [
+                *_compact(ring_write.astype(jnp.int32), records, tiles, tb),
+                *_compact(ring_read.astype(jnp.int32), records, tiles, tb),
+            ]
+        else:
+            prefetch = list(ring_tables)
         stage = pltpu.VMEM((tb, _RECORD_ROWS, _POOL_LANES), jnp.float32)
         scratch += [
             pltpu.VMEM((tb + 8, width), jnp.float32),
@@ -486,14 +517,18 @@ def fused_compress_rope(
     return latent, words, scales, new_state if banks == 2 else new_state[0]
 
 
-def _check_ring(state, ring_write, ring_read, tokens, ratio):
+def _check_ring(state, ring_write, ring_read, tokens, ratio, ring_tables=None):
     """Validate the ratio-2 state arguments; return the pool bank count."""
     if ratio == 1:
-        if state is not None or ring_write is not None or ring_read is not None:
+        if any(v is not None for v in (state, ring_write, ring_read, ring_tables)):
             raise ValueError("Ratio 1 keeps no compressor state")
         return 0
-    if state is None or ring_write is None or ring_read is None:
+    if state is None or (
+        ring_tables is None and (ring_write is None or ring_read is None)
+    ):
         raise ValueError("Ratio 2 needs the state pool and ring records")
+    if ring_tables is not None and (ring_write is not None or ring_read is not None):
+        raise ValueError("Pass ring records or precomputed tables, not both")
     pools = state if isinstance(state, tuple) else (state,)
     if len(pools) not in (1, 2) or any(
         pool.dtype != jnp.int32
@@ -503,7 +538,8 @@ def _check_ring(state, ring_write, ring_read, tokens, ratio):
         for pool in pools
     ):
         raise ValueError("State must be one or two INT32 [8k, 128] pool banks")
-    for records in (ring_write, ring_read):
+    for records in () if ring_tables is not None else (ring_write, ring_read):
+        assert records is not None
         if records.shape != (tokens,) or not jnp.issubdtype(records.dtype, jnp.integer):
             raise ValueError("Ring records must be integer [tokens]")
     return len(pools)

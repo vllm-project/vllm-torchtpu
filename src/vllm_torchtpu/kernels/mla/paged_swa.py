@@ -17,6 +17,8 @@ def write_swa_pages(
     pages: jax.Array | tuple[jax.Array, jax.Array],
     records: jax.Array,
     values: jax.Array,
+    *,
+    prepared: tuple | None = None,
 ) -> jax.Array | tuple[jax.Array, jax.Array]:
     """Write physical token records, preserving adjacent BF16 rows and null page.
 
@@ -54,41 +56,54 @@ def write_swa_pages(
         core_axis_name="core",
         subcore_axis_name="subcore",
     )
+    if prepared is None:
+        from vllm_torchtpu.kernels.experimental import decode_preparation as prep
+
+        if prep.admit(
+            "swa_pack",
+            None if page_size == 64 else f"SWA page size {page_size}, kernel 64",
+            tokens=records.shape[0],
+            buckets=prep.SWA_PACK_TOKENS,
+        ):
+            prepared = prep.swa_pack(banks, records, values)
     result, base = [], 0
     for bank in banks:
         capacity = bank.shape[0] * page_size
-        valid = (records >= max(base, page_size)) & (records < base + capacity)
-        local = jnp.where(valid, records - base, capacity)
-        order = jnp.argsort(local, stable=True)
-        ids = local[order]
-        next_ids = jnp.concatenate((ids[1:], jnp.array([capacity], jnp.int32)))
-        # TC BF16 tiles pack adjacent token rows into one physical word row.
-        pairs = ids // 2
-        boundary = (ids < capacity) & jnp.concatenate(
-            (jnp.ones(1, jnp.bool_), pairs[1:] != pairs[:-1])
-        )
-        even = ids % 2 == 0
-        has_odd = (~even) | (next_ids // 2 == pairs)
-        bits = jax.lax.bitcast_convert_type(values[order], jnp.uint16).astype(
-            jnp.uint32
-        )
-        next_bits = jnp.concatenate((bits[1:], jnp.zeros((1, 512), jnp.uint32)))
-        low = jnp.where(even[:, None], bits, jnp.uint32(0))
-        high = jnp.where(even[:, None], next_bits, bits)
-        high = jnp.where(has_odd[:, None], high, jnp.uint32(0))
-        words = jax.lax.bitcast_convert_type(low | (high << 16), jnp.int32)
-        masks = jnp.where(even, jnp.int32(65535), jnp.int32(0)) | jnp.where(
-            has_odd, jnp.int32(-65536), jnp.int32(0)
-        )
-        padding = -records.size % (lanes * cores)
-        destinations = jnp.pad(
-            jnp.where(boundary, pairs, -1), (0, padding), constant_values=-1
-        )
-        # SC cannot reshape a lane vector for a column broadcast in the kernel.
-        masks = jnp.broadcast_to(
-            jnp.pad(masks, (0, padding))[:, None], (records.size + padding, 512)
-        )
-        words = jnp.pad(words, ((0, padding), (0, 0)))
+        if prepared is not None:
+            destinations, masks, words = prepared[len(result)]
+        else:
+            valid = (records >= max(base, page_size)) & (records < base + capacity)
+            local = jnp.where(valid, records - base, capacity)
+            order = jnp.argsort(local, stable=True)
+            ids = local[order]
+            next_ids = jnp.concatenate((ids[1:], jnp.array([capacity], jnp.int32)))
+            # TC BF16 tiles pack adjacent token rows into one physical word row.
+            pairs = ids // 2
+            boundary = (ids < capacity) & jnp.concatenate(
+                (jnp.ones(1, jnp.bool_), pairs[1:] != pairs[:-1])
+            )
+            even = ids % 2 == 0
+            has_odd = (~even) | (next_ids // 2 == pairs)
+            bits = jax.lax.bitcast_convert_type(values[order], jnp.uint16).astype(
+                jnp.uint32
+            )
+            next_bits = jnp.concatenate((bits[1:], jnp.zeros((1, 512), jnp.uint32)))
+            low = jnp.where(even[:, None], bits, jnp.uint32(0))
+            high = jnp.where(even[:, None], next_bits, bits)
+            high = jnp.where(has_odd[:, None], high, jnp.uint32(0))
+            words = jax.lax.bitcast_convert_type(low | (high << 16), jnp.int32)
+            masks = jnp.where(even, jnp.int32(65535), jnp.int32(0)) | jnp.where(
+                has_odd, jnp.int32(-65536), jnp.int32(0)
+            )
+            padding = -records.size % (lanes * cores)
+            destinations = jnp.pad(
+                jnp.where(boundary, pairs, -1), (0, padding), constant_values=-1
+            )
+            # SC cannot reshape a lane vector for a column broadcast in the kernel.
+            masks = jnp.broadcast_to(
+                jnp.pad(masks, (0, padding))[:, None], (records.size + padding, 512)
+            )
+            words = jnp.pad(words, ((0, padding), (0, 0)))
         # Keep the page-shaped owner: reshaping the whole pool can break aliasing.
         owner = jax.new_ref(bank)
 

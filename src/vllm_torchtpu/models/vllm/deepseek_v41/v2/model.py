@@ -17,6 +17,8 @@ from vllm.models.deepseek_v41.nvidia import model as upstream
 from vllm.models.deepseek_v41.nvidia import vl_model as upstream_vl
 from vllm.v1.worker.encoder_cudagraph_defs import EncoderCudaGraphConfig
 
+from vllm_torchtpu import envs
+from vllm_torchtpu.kernels.experimental import decode_preparation
 from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v41.deepseek_v41_mhc_op import (
     initialize_shifted_mhc,
 )
@@ -1248,6 +1250,8 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
     def __init__(self, *, vllm_config, prefix=""):
         self.prefix = prefix
         self._raw_dma_enabled = engram_cpu_offload(vllm_config)
+        # Read once outside traced code; regions consult it at trace time.
+        decode_preparation.configure(envs.TPU_DEEPSEEK_V41_DECODE_FUSION)
         initialize_cache_ops()
         initialize_delayed_mhc()
         initialize_shifted_mhc()

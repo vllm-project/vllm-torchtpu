@@ -7,6 +7,7 @@ signature (no ``*args``, keyword parameters or ``Any`` return); epsilon and
 the compression ratio are bound per op.
 """
 
+import dataclasses
 import functools
 import inspect
 from typing import Any, cast
@@ -23,10 +24,27 @@ from vllm_torchtpu.kernels.attention_preprocessing import (
 from vllm_torchtpu.kernels.attention_preprocessing import qa_rope as qa_kernel
 from vllm_torchtpu.kernels.attention_preprocessing import qb_rope as qb_kernel
 from vllm_torchtpu.kernels.attention_preprocessing import rope_gather
+from vllm_torchtpu.kernels.experimental import decode_preparation
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import get_pallas_op_mesh
 
 _HEAD_DIM = 512
 _ops: dict[str, Any] = {}
+
+
+@torch.compiler.assume_constant_result
+def compressor_layout_admitted(region: str, **geometry: int) -> bool:
+    """Check static cache geometry once, outside the captured tensor graph.
+
+    Only cache layout scalars enter this boundary, never token dimensions or
+    tensors. Fusion policy is frozen by admit; fallback diagnostics must execute
+    here at trace time because Dynamo cannot capture logger.warning.
+    """
+    layout = dataclasses.replace(
+        decode_preparation.DEFAULT_COMPRESSOR_LAYOUT, **geometry
+    )
+    return decode_preparation.admit(
+        region, decode_preparation.compressor_layout_problem(layout), backend=False
+    )
 
 
 def _get(name, build, donate=()):
@@ -250,3 +268,292 @@ def compress_rope(ratio: int, banks: int, eps: float) -> Any:
         lambda: (_compress_bridge(ratio, banks, eps), _compress_fake(banks)),
         donate=tuple(range(6, 6 + banks)),
     )
+
+
+def _state_records(low: jax.Array, high: jax.Array) -> int:
+    return (low.shape[0] + high.shape[0]) // compress_kernel._RECORD_ROWS
+
+
+def _admit_compressor(region, buckets, x, weight, inputs, *page_tables) -> bool:
+    """One gate for both bridges; token dispatch stays inside JAX."""
+    tokens = inputs[3].shape[0]
+    problem = decode_preparation.compressor_inputs_problem(*inputs, *page_tables)
+    if problem is None and x.shape[0] != tokens:
+        problem = f"x has {x.shape[0]} rows for {tokens} positions"
+    if problem is None and weight.shape != (x.shape[1], 2 * _HEAD_DIM):
+        problem = f"weight {list(weight.shape)} is not [hidden, {2 * _HEAD_DIM}]"
+    if problem is None and tokens in buckets:
+        # The precomputed ring tables cover one whole, unpadded token tile.
+        tile = compress_kernel.select_config(tokens, x.shape[1], 2).token_block
+        if tile != tokens or tokens % compress_kernel._ROW_ALIGN:
+            problem = f"compressor tile {tile} does not cover {tokens} tokens"
+    return decode_preparation.admit(region, problem, tokens=tokens, buckets=buckets)
+
+
+def compress_rope_packed(
+    eps: float,
+    layout: decode_preparation.CompressorLayout = (
+        decode_preparation.DEFAULT_COMPRESSOR_LAYOUT
+    ),
+) -> Any:
+    """Registered decode metadata + ratio-2 compressor, with two donated banks."""
+    from vllm_torchtpu.kernels.quantized_matmul.tuned_block_sizes import (
+        get_tpu_version,
+    )
+
+    # Buckets were measured on v7 only.
+    if jax.default_backend() != "tpu" or get_tpu_version() != 7:
+        return None
+
+    def build():
+        def run(
+            table: jax.Array,
+            starts: jax.Array,
+            kv_starts: jax.Array,
+            positions: jax.Array,
+            minimum: jax.Array,
+            x: jax.Array,
+            weight: jax.Array,
+            gamma: jax.Array,
+            rows: jax.Array,
+            low: jax.Array,
+            high: jax.Array,
+        ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
+            inputs = (table, starts, kv_starts, positions, minimum)
+            if not _admit_compressor(
+                "compressor_state",
+                decode_preparation.COMPRESSOR_STATE_TOKENS,
+                x,
+                weight,
+                inputs,
+            ):
+                return _compress_native_metadata(
+                    *inputs, x, weight, gamma, rows, low, high, eps, layout
+                )
+            prev, valid, wp, wo, rp, ro = decode_preparation.compressor_state_packed(
+                *inputs, total_records=_state_records(low, high), layout=layout
+            )
+            latent, words, scales, state = compress_kernel.fused_compress_rope(
+                x,
+                weight,
+                gamma,
+                rows,
+                prev,
+                valid,
+                (low, high),
+                eps=eps,
+                ring_tables=(wp, wo, rp, ro),
+            )
+            assert isinstance(state, tuple)
+            return latent, words, scales, *state, valid[:, 0] != 0
+
+        def fake(
+            table,
+            starts,
+            kv_starts,
+            positions,
+            minimum,
+            x,
+            weight,
+            gamma,
+            rows,
+            low,
+            high,
+        ):
+            return (
+                x.new_empty((x.shape[0], 512), dtype=torch.bfloat16),
+                x.new_empty((x.shape[0], 128), dtype=torch.int32),
+                x.new_empty((x.shape[0], 1), dtype=torch.float32),
+                torch.empty_like(low),
+                torch.empty_like(high),
+                x.new_empty((x.shape[0],), dtype=torch.bool),
+            )
+
+        return run, fake
+
+    return _get(
+        f"compress_rope_packed_{layout.tag}_e{_tag(eps)}", build, donate=(9, 10)
+    )
+
+
+def compress_rope_addresses(
+    eps: float,
+    layout: decode_preparation.CompressorLayout = (
+        decode_preparation.DEFAULT_COMPRESSOR_LAYOUT
+    ),
+) -> Any:
+    """Registered decode state/main/index addresses and ratio-2 compressor.
+
+    Main records are physical rows of the main KV cache; index slots are
+    logical index-cache slots. Both paths return the same contract.
+    """
+    from vllm_torchtpu.kernels.quantized_matmul.tuned_block_sizes import (
+        get_tpu_version,
+    )
+
+    # Buckets were measured on v7 only.
+    if jax.default_backend() != "tpu" or get_tpu_version() != 7:
+        return None
+
+    def build():
+        def run(
+            table: jax.Array,
+            starts: jax.Array,
+            kv_starts: jax.Array,
+            positions: jax.Array,
+            minimum: jax.Array,
+            x: jax.Array,
+            weight: jax.Array,
+            gamma: jax.Array,
+            rows: jax.Array,
+            low: jax.Array,
+            high: jax.Array,
+            main: jax.Array,
+            index: jax.Array,
+        ) -> tuple[
+            jax.Array,
+            jax.Array,
+            jax.Array,
+            jax.Array,
+            jax.Array,
+            jax.Array,
+            jax.Array,
+            jax.Array,
+        ]:
+            inputs = (table, starts, kv_starts, positions, minimum)
+            if not _admit_compressor(
+                "compressor_addresses",
+                decode_preparation.COMPRESSOR_ADDRESS_TOKENS,
+                x,
+                weight,
+                inputs,
+                main,
+                index,
+            ):
+                result = _compress_native_metadata(
+                    *inputs, x, weight, gamma, rows, low, high, eps, layout
+                )
+                return (
+                    *result,
+                    *_native_main_index(
+                        kv_starts, positions, main, index, result[-1], layout
+                    ),
+                )
+            prev, valid, wp, wo, rp, ro, main_records, index_slots = (
+                decode_preparation.compressor_addresses_packed(
+                    *inputs,
+                    main,
+                    index,
+                    total_records=_state_records(low, high),
+                    layout=layout,
+                )
+            )
+            latent, words, scales, state = compress_kernel.fused_compress_rope(
+                x,
+                weight,
+                gamma,
+                rows,
+                prev,
+                valid,
+                (low, high),
+                eps=eps,
+                ring_tables=(wp, wo, rp, ro),
+            )
+            assert isinstance(state, tuple)
+            return (
+                latent,
+                words,
+                scales,
+                *state,
+                valid[:, 0] != 0,
+                main_records,
+                index_slots,
+            )
+
+        def fake(
+            table,
+            starts,
+            kv_starts,
+            positions,
+            minimum,
+            x,
+            weight,
+            gamma,
+            rows,
+            low,
+            high,
+            main,
+            index,
+        ):
+            return (
+                x.new_empty((x.shape[0], 512), dtype=torch.bfloat16),
+                x.new_empty((x.shape[0], 128), dtype=torch.int32),
+                x.new_empty((x.shape[0], 1), dtype=torch.float32),
+                torch.empty_like(low),
+                torch.empty_like(high),
+                x.new_empty((x.shape[0],), dtype=torch.bool),
+                x.new_empty((x.shape[0],), dtype=torch.int32),
+                x.new_empty((x.shape[0],), dtype=torch.int32),
+            )
+
+        return run, fake
+
+    return _get(
+        f"compress_rope_addresses_{layout.tag}_e{_tag(eps)}", build, donate=(9, 10)
+    )
+
+
+def _native_main_index(kv_starts, positions, main, index, valid, layout):
+    """XLA form of the fused address outputs, for any token count."""
+    token = jnp.arange(positions.size, dtype=jnp.int32)
+    request = jnp.minimum(
+        jnp.sum(token[:, None] >= kv_starts[None, 1:], axis=1), main.shape[0] - 1
+    )
+    live = token < kv_starts[-1]
+    logical = positions // 2
+
+    def page(table, capacity):
+        column = jnp.minimum(logical // capacity, table.shape[1] - 1)
+        return table[request, column], logical % capacity
+
+    block, slot = page(main, layout.main_capacity)
+    main_rows = layout.main_offset + block * layout.main_stride + slot
+    records = jnp.where(live & (block >= 0) & valid, main_rows, -1)
+    block, slot = page(index, layout.index_capacity)
+    return records, jnp.where(live, block * layout.index_capacity + slot, -1)
+
+
+def _compress_native_metadata(
+    table,
+    starts,
+    kv_starts,
+    positions,
+    minimum,
+    x,
+    weight,
+    gamma,
+    rows,
+    low,
+    high,
+    eps,
+    layout,
+):
+    """Keep arbitrary token counts behind the dynamic Torch bridge signature."""
+    prev, valid, write, read = decode_preparation._compressor_state_addresses(
+        table, starts, kv_starts, positions, minimum, layout
+    )
+    latent, words, scales, state = _compress(
+        2,
+        eps,
+        x,
+        weight,
+        gamma,
+        rows,
+        prev[:, None],
+        valid[:, None],
+        (low, high),
+        write,
+        read,
+    )
+    assert isinstance(state, tuple)
+    return latent, words, scales, *state, valid != 0
