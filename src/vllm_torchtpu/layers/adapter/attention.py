@@ -62,6 +62,9 @@ from vllm_torchtpu.layers.adapter.cp_attention import (
     build_dcp_kernels as _build_dcp_kernels,
 )
 from vllm_torchtpu.layers.adapter.cp_attention import (
+    dcp_cache_decode_block as _dcp_cache_decode_block,
+)
+from vllm_torchtpu.layers.adapter.cp_attention import (
     forward_with_dcp as _forward_with_dcp,
 )
 from vllm_torchtpu.layers.adapter.cp_mla_attention import (
@@ -893,6 +896,8 @@ class PallasAttentionBackendImpl(AttentionImpl):
         # when decode_context_parallel_size > 1.
         self.dcp_world_size = 1
         self.dcp_rank = 0
+        self.dcp_max_model_len = None  # bounds the DCP block-table columns
+        self.dcp_cache_decode_block = None  # DCP cache-pass decode block
         self.rpa_dcp_cache_kernel = None  # CACHE_ONLY pass, returns (out, lse)
         self.rpa_dcp_new_kernel = None  # NEW_TOKENS_ONLY pass, returns (out, lse)
         # Block-major bundled kernel and pre-allocated layer index. Initialized by
@@ -1162,6 +1167,8 @@ class PallasAttentionBackendImpl(AttentionImpl):
             dcp_rank=self.dcp_rank,
             kv_layout=self.kv_layout,
             decode_query_size=self.decode_query_size,
+            max_model_len=self.dcp_max_model_len,
+            cache_decode_block=self.dcp_cache_decode_block,
         )
 
     def _validate_pcp_streaming_support(self, skip_kv_update: bool) -> None:
@@ -1373,6 +1380,11 @@ class PallasAttentionBackendImpl(AttentionImpl):
             if dcp_group is not None:
                 self.dcp_world_size = int(dcp_group.world_size)
                 self.dcp_rank = int(dcp_group.rank_in_group)
+                model_config = getattr(vllm_config, "model_config", None)
+                self.dcp_max_model_len = getattr(model_config, "max_model_len", None)
+                self.dcp_cache_decode_block = _dcp_cache_decode_block(
+                    self.decode_query_size
+                )
                 self.rpa_dcp_cache_kernel, self.rpa_dcp_new_kernel = _build_dcp_kernels(
                     sliding_window=self.sliding_window,
                     sm_scale=self.scale,
@@ -1384,6 +1396,8 @@ class PallasAttentionBackendImpl(AttentionImpl):
                     cp_rank=self.dcp_rank,
                     kv_layout=self.kv_layout,
                     decode_query_size=self.decode_query_size,
+                    max_model_len=self.dcp_max_model_len,
+                    cache_decode_block=self.dcp_cache_decode_block,
                 )
             return
 
