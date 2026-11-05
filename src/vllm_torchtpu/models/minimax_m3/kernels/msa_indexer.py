@@ -259,7 +259,8 @@ def _class_scores(
     kernel,
     interpret,
 ):
-    """Scores ``[T, P]`` for the tokens of requests in one tile class."""
+    """Transposed scores ``[P, tiles * block_q]`` of one tile class, and the
+    column of each token."""
     num_tokens, _, head_dim = index_q.shape
     _, rows_per_page, packing, _ = index_cache.shape
     page_size = rows_per_page * packing
@@ -363,7 +364,7 @@ def _class_scores(
     offset = tok - cu_q_lens[seq]
     col = (first_tile[seq] + offset // block_q) * block_q + offset % block_q
     col = jnp.clip(col, 0, max_tiles * block_q - 1)
-    return scores_t[:, col].T
+    return scores_t, col
 
 
 @functools.partial(
@@ -431,7 +432,7 @@ def block_scores(
         pages_per_step=pages_per_step,
         interpret=interpret,
     )
-    small = score(
+    small, small_col = score(
         active & ~is_large,
         block_q=block_q,
         max_tiles=min(max_num_seqs, num_tokens),
@@ -440,8 +441,8 @@ def block_scores(
     # Large requests have more than block_q tokens each.
     max_large = min(max_num_seqs, num_tokens // (block_q + 1))
     if max_large == 0:
-        return small[:, None, :]
-    large = score(
+        return small[:, small_col].T[:, None, :]
+    large, large_col = score(
         is_large,
         block_q=large_block_q,
         max_tiles=num_tokens // large_block_q + max_large,
@@ -452,4 +453,7 @@ def block_scores(
         jnp.searchsorted(cu_q_lens[1:], tok, side="right").astype(jnp.int32),
         max_num_seqs - 1,
     )
-    return jnp.where(is_large[seq][:, None], large, small)[:, None, :]
+    # One gather over both classes' columns (XLA fuses the concatenate into
+    # it) instead of a transposing gather per class and a select.
+    col = jnp.where(is_large[seq], small.shape[1] + large_col, small_col)
+    return jnp.concatenate([small, large], axis=1)[:, col].T[:, None, :]
