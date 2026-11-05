@@ -1853,19 +1853,6 @@ class VllmTPUMLAAttention(MLAAttention):
                 self.kv_cache_dtype.lower().strip()
             )
 
-    def _local_q_serves(self, m: int) -> bool:
-        operands = _qb_overlap_operands(self.q_b_proj)
-        return operands is not None and fp8_window_all_gather.supports(
-            m, operands[0].shape[0], operands[0].shape[1], self.dcp_group_size
-        )
-
-    def _project_local_q(self, q_c: torch.Tensor) -> torch.Tensor:
-        operands = _qb_overlap_operands(self.q_b_proj)
-        assert operands is not None and self.local_q_fused_op is not None
-        return self.local_q_fused_op(
-            q_c, *operands, self.local_q_window, self.local_q_lane
-        )
-
     def process_weights_after_loading(self, act_dtype: torch.dtype):
         # Upstream `MLAAttention.process_weights_after_loading` reads this
         # weight raw -- `get_and_maybe_dequant_weights(kv_b_proj).T` -- and
@@ -2348,6 +2335,19 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
     def _q_proj_layer(self):
         """The projection that produces `q`, whichever of the two is wired."""
         return self.q_b_proj if self.q_lora_rank is not None else self.q_proj
+
+    def _local_q_serves(self, m: int) -> bool:
+        operands = _qb_overlap_operands(self.q_b_proj)
+        return operands is not None and fp8_window_all_gather.supports(
+            m, operands[0].shape[0], operands[0].shape[1], self.dcp_group_size
+        )
+
+    def _project_local_q(self, q_c: torch.Tensor) -> torch.Tensor:
+        operands = _qb_overlap_operands(self.q_b_proj)
+        assert operands is not None and self.local_q_fused_op is not None
+        return self.local_q_fused_op(
+            q_c, *operands, self.local_q_window, self.local_q_lane
+        )
 
     def process_weights_after_loading(self, act_dtype: torch.dtype):
         if hasattr(super(), "process_weights_after_loading"):
