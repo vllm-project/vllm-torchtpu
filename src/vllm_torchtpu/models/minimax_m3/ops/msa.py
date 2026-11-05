@@ -23,7 +23,7 @@ from torch_tpu._internal import pallas
 from vllm.distributed import get_tp_group
 
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
-from vllm_torchtpu.models.minimax_m3.kernels import msa, msa_indexer
+from vllm_torchtpu.models.minimax_m3.kernels import msa, msa_dcp, msa_indexer
 
 _KV_CACHE_ARG = 5
 _INDEX_CACHE_ARG = 6
@@ -254,6 +254,150 @@ def get_msa_sharded_op(
             metadata.block_tables,
             metadata.query_start_loc,
         )
+
+    return op
+
+
+@functools.cache
+def get_msa_dcp_op(
+    sm_scale: float,
+    topk: int,
+    init_blocks: int,
+    local_blocks: int,
+    rank: int,
+    dcp: int,
+) -> Callable[..., torch.Tensor]:
+    """`get_msa_op` for a KV head's context split over ``dcp`` ranks
+    (`kernels.msa_dcp`).
+
+    Two JAX ops: the first writes this rank's tokens and returns its local
+    top-k candidates; an all-gather over the DCP group brings every rank all
+    ``dcp * topk`` candidates and the query heads of the whole group; the
+    second merges the candidates into the exact selection and attends over
+    the selected blocks this rank holds; a log-sum-exp merge (shared with the
+    MLA DCP path) combines the ranks' partials and keeps this rank's heads.
+    """
+    from vllm_torchtpu.distributed.dcp import get_dcp_group
+    from vllm_torchtpu.layers.adapter.cp_mla_attention import (
+        all_gather_heads,
+        merge_lse_partials_scatter_heads,
+    )
+
+    def _score_jax(
+        k: jax.Array,
+        v: jax.Array,
+        index_q: jax.Array,
+        index_k: jax.Array,
+        kv_cache: jax.Array,
+        index_cache: jax.Array,
+        seq_lens: jax.Array,
+        block_tables: jax.Array,
+        query_start_loc: jax.Array,
+        request_distribution: jax.Array,
+    ) -> tuple[jax.Array, jax.Array, jax.Array]:
+        return msa_dcp.msa_write_and_candidates_dcp(
+            k,
+            v,
+            index_q,
+            index_k,
+            kv_cache,
+            index_cache,
+            seq_lens,
+            block_tables,
+            query_start_loc,
+            request_distribution,
+            topk=topk,
+            init_blocks=init_blocks,
+            local_blocks=local_blocks,
+            rank=rank,
+            dcp=dcp,
+        )
+
+    def _attend_jax(
+        q: jax.Array,
+        kv_cache: jax.Array,
+        candidates: jax.Array,
+        seq_lens: jax.Array,
+        block_tables: jax.Array,
+        query_start_loc: jax.Array,
+    ) -> tuple[jax.Array, jax.Array]:
+        return msa_dcp.msa_attend_dcp(
+            q,
+            kv_cache,
+            candidates,
+            seq_lens,
+            block_tables,
+            query_start_loc,
+            sm_scale=sm_scale,
+            topk=topk,
+            rank=rank,
+            dcp=dcp,
+        )
+
+    suffix = (
+        f"t{topk}_i{init_blocks}_l{local_blocks}_s{sm_scale:.8f}_r{rank}of{dcp}"
+    ).replace(".", "p")
+    score_op = pallas.jax_op(
+        f"pallas::minimax_m3_msa_dcp_score_{suffix}",
+        _score_jax,
+        donate_argnums=(_SHARD_KV_CACHE_ARG, _SHARD_INDEX_CACHE_ARG),
+    )
+    attend_op = pallas.jax_op(
+        f"pallas::minimax_m3_msa_dcp_attend_{suffix}", _attend_jax
+    )
+
+    def _score_fake(k, v, index_q, index_k, kv_cache, index_cache, *args):
+        return (
+            torch.empty_like(kv_cache),
+            torch.empty_like(index_cache),
+            torch.empty((k.shape[0], 2 * topk), dtype=torch.float32, device=k.device),
+        )
+
+    def _attend_fake(q, *args):
+        return (
+            torch.empty_like(q),
+            torch.empty(q.shape[:2], dtype=torch.float32, device=q.device),
+        )
+
+    score_op.register_fake(_score_fake)
+    attend_op.register_fake(_attend_fake)
+
+    def op(
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        index_q: torch.Tensor,
+        index_k: torch.Tensor,
+        kv_cache: torch.Tensor,
+        index_cache: torch.Tensor,
+        metadata: AttentionMetadata,
+    ) -> torch.Tensor:
+        new_kv_cache, new_index_cache, candidates = score_op(
+            k,
+            v,
+            index_q,
+            index_k,
+            kv_cache,
+            index_cache,
+            metadata.seq_lens,
+            metadata.block_tables,
+            metadata.query_start_loc,
+            metadata.request_distribution,
+        )
+        kv_cache.copy_(new_kv_cache)
+        index_cache.copy_(new_index_cache)
+        group = get_dcp_group()
+        assert group is not None, "DCP group is not initialized"
+        candidates = group.all_gather(candidates.unsqueeze(0), dim=0)
+        out, lse = attend_op(
+            all_gather_heads(q),
+            kv_cache,
+            candidates,
+            metadata.seq_lens,
+            metadata.block_tables,
+            metadata.query_start_loc,
+        )
+        return merge_lse_partials_scatter_heads(out, lse)
 
     return op
 
