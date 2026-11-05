@@ -83,16 +83,31 @@ def _kernel_v1(
 
     keys, values, limits = [], [], []
     selected = selected_ref[...]
+    # Slot of each value row once a page's unpacked arrays are concatenated.
+    row = jax.lax.broadcasted_iota(jnp.int32, (page_size, 1), 0)
+    per_array = page_size // packing
+    value_slot = (row % per_array) * packing + row // per_array
     for g, kv_ref in enumerate(kv_refs):
         page = work_page_ref[w * pages_per_step + g]
         rows = unpack_page(kv_ref)
-        keys.append(jnp.concatenate([r[:, :head_dim] for r in rows], axis=0))
-        values.append(jnp.concatenate([r[:, head_dim:] for r in rows], axis=0))
         is_selected = jnp.max(
             (selected == page).astype(jnp.int32), axis=1, keepdims=True
         )
         limit = jnp.where(local_page_ref[...] == page, local_limit_ref[...], page_size)
         limit = jnp.where(page >= 0, limit * is_selected, 0)
+        keys.append(jnp.concatenate([r[:, :head_dim] for r in rows], axis=0))
+        # Zero the value rows no token of the tile sees: a masked slot gets
+        # p = 0, but 0 * NaN is NaN, and a slot nobody wrote (the null page 0
+        # that fills a group past the tile's union, or a local page's slots
+        # past the newest token) may hold any bytes.
+        visible = value_slot < jnp.max(limit)
+        values.append(
+            jnp.where(
+                visible,
+                jnp.concatenate([r[:, head_dim:] for r in rows], axis=0),
+                0,
+            )
+        )
         # Rows are head-major: row h * block_q + t is token t's head h.
         limits.append(jnp.concatenate([limit] * num_heads, axis=0))
     k = jnp.concatenate(keys, axis=0)
