@@ -117,13 +117,8 @@ def _admit(runner: Any, n_ranks: int) -> _Admitted | str:
         return f"activation {qm._tpu_activation_str!r} is not silu"
     if qm._use_adaptive_fused_moe or fused_moe_ep_supported(qm):
         return "a fused EP MoE kernel serves this layer"
-    if envs.FUSED_MOE_DECODE_KERNEL:
-        return "FUSED_MOE_DECODE_KERNEL is set; moe_tp_decode_nvfp4 stands down"
-    if enable_pipelined_collective_and_compute() or envs.TPU_MOE_FP8_ALL_GATHER:
-        return (
-            "the MoE path owns its collectives "
-            "(TPU_MOE_COLLECTION_CHUNK_SIZE or TPU_MOE_FP8_ALL_GATHER)"
-        )
+    if enable_pipelined_collective_and_compute():
+        return "the MoE path owns its collectives (TPU_MOE_COLLECTION_CHUNK_SIZE)"
     if par.use_ep:
         if par.ep_size * par.tp_size != n_ranks:
             return (
