@@ -432,6 +432,7 @@ class TpuPlatform(Platform):
         "MOE_FUSED_EP_PUSH_TABLE_KERNEL",
         "MOE_FUSED_EP_PUSH_EXCHANGE_TABLES",
         "MOE_FUSED_EP_PUSH_KERNEL_PLAN_TABLES",
+        "MOE_FUSED_EP_PUSH_SHARED_EXPERT",
     ]
 
     # The "Platform" base class has import_kernels() that tries to import
