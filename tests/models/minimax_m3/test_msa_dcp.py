@@ -269,6 +269,40 @@ def test_merge_candidates_breaks_ties_to_lower_block():
     np.testing.assert_array_equal(got, [[1, 4, 3]])
 
 
+def _flush_like_a_tpu_collective(x: jax.Array) -> jax.Array:
+    """Subnormals to zero and NaNs canonical, as a TPU collective may."""
+    tiny = jnp.finfo(jnp.float32).tiny
+    x = jnp.where(jnp.abs(x) < tiny, jnp.zeros_like(x), x)
+    return jnp.where(jnp.isnan(x), jnp.float32(jnp.nan), x)
+
+
+def test_candidates_survive_a_flushing_collective():
+    """Block ids cross the DCP all-gather inside f32 candidates. Bitcast ids
+    are subnormals (and -1 a NaN): a collective that flushes them decoded
+    every id as block 0, so tokens attended block 0 only (j-301d606e: a few
+    GSM8K requests derailed into garbage, MTP acceptance 1.01 on them)."""
+    rng = np.random.default_rng(5)
+    dcp, num_tokens, topk = 2, 64, 16
+    scores = rng.standard_normal((dcp, num_tokens, topk)).astype(np.float32)
+    blocks = np.stack(
+        [
+            rng.permutation(np.arange(r, 4096, dcp))[: num_tokens * topk].reshape(
+                num_tokens, topk
+            )
+            for r in range(dcp)
+        ]
+    ).astype(np.int32)
+    scores[:, :5, 10:] = -np.inf  # missing picks
+    blocks[:, :5, 10:] = -1
+    packed = jax.vmap(msa_dcp.pack_candidates)(jnp.asarray(scores), jnp.asarray(blocks))
+    expected = np.asarray(msa_dcp.merge_candidates(packed, topk))
+    got = np.asarray(
+        msa_dcp.merge_candidates(_flush_like_a_tpu_collective(packed), topk)
+    )
+    np.testing.assert_array_equal(got, expected)
+    assert len(np.unique(expected[5:])) > topk  # real, distinct block ids
+
+
 @pytest.mark.parametrize("dtype", CACHE_DTYPES)
 def test_dcp_forward_lowers_for_tpu(dtype):
     """Both halves of the DCP forward lower to Mosaic without a TPU."""
