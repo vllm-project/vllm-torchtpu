@@ -45,6 +45,7 @@ _CONST_128 = 128
 _CONST_16 = 16
 _CONST_1792 = 1792
 _CONST_2 = 2
+_CONST_6 = 6
 _CONST_2048 = 2048
 _CONST_256 = 256
 _CONST_32 = 32
@@ -84,12 +85,6 @@ def test_k3_phase1_containment_and_live_files() -> _Dynamic:
                         f"Legacy import {alias.name} found in {py_file}"
                     )
             elif isinstance(node, ast.ImportFrom) and node.module:
-                # The shared Mosaic reshape hook comes from main's megakernel
-                # library; nothing else may come from there.
-                if node.module == "vllm_torchtpu.megakernel" and [
-                    a.name for a in node.names
-                ] == ["pool_alias"]:
-                    continue
                 assert node.module != "vllm_torchtpu.megakernel", (
                     f"Legacy import {node.module} found in {py_file}"
                 )
@@ -200,6 +195,7 @@ def test_k3_phase1_provenance_headers() -> _Dynamic:
     base_dir = pathlib.Path(mk.__file__).resolve().parent
 
     modules_11 = [
+        "common/pool_alias.py",
         "common/vmem_pool.py",
         "common/collectives32.py",
         "kernels/decode_megakernel.py",
@@ -392,6 +388,86 @@ def _lower_moe_down_valu_on_tpu7x(devices: _Dynamic) -> None:
     )
     lowered_text = lowered_valu.as_text()
     assert "tpu_custom_call" in lowered_text
+
+
+def _lower_decode_paged_on_tpu7x(devices: _Dynamic, batch: int) -> None:
+    """Verify deviceless TPU v7x AOT lowering for paged.decode_paged at B1 and B8."""
+    decode_ops_mod = importlib.import_module(
+        "vllm_torchtpu.models.kimi_k3.megakernel.decode_ops"
+    )
+    load_mod = importlib.import_module(
+        "vllm_torchtpu.models.kimi_k3.megakernel.kernels.load"
+    )
+    paged_mod = importlib.import_module(
+        "vllm_torchtpu.models.kimi_k3.megakernel.kernels.paged"
+    )
+    mesh_tp = Mesh(devices, ("tp",))
+    layers = _CONST_93
+    shapes = load_mod.selected_local_shapes(
+        layers=layers, hidden=_CONST_7168, vocab=163840
+    )
+    u32_keys = {"expert_gu", "expert_down"}
+    u8_keys = {"expert_gus", "expert_ds"}
+    f32_keys = {
+        "k_a_log",
+        "k_dt",
+        "k_norm",
+        "m_qnorm",
+        "m_knorm",
+        "attn_norm",
+        "ffn_norm",
+        "final_norm",
+    }
+    weights = {
+        k: jax.ShapeDtypeStruct(
+            s,
+            jnp.uint32
+            if k in u32_keys
+            else (
+                jnp.uint8
+                if k in u8_keys
+                else (jnp.float32 if k in f32_keys else jnp.bfloat16)
+            ),
+        )
+        for k, s in shapes.items()
+    }
+    conv = jax.ShapeDtypeStruct((_CONST_8, 69, 3, 3, 4, _CONST_128), jnp.bfloat16)
+    recurrent = jax.ShapeDtypeStruct(
+        (_CONST_8, 69, 3, _CONST_128, _CONST_128), jnp.bfloat16
+    )
+    pools = (jax.ShapeDtypeStruct((_CONST_16, _CONST_128, 4, 640), jnp.float8_e4m3fn),)
+    token = jax.ShapeDtypeStruct((batch,), jnp.int32)
+    pos = jax.ShapeDtypeStruct((batch,), jnp.int32)
+    tables = jax.ShapeDtypeStruct((batch, _CONST_64), jnp.int32)
+    state_slot = jax.ShapeDtypeStruct((batch,), jnp.int32)
+    opts = decode_ops_mod.decode_options(batch)
+    assert opts["alias_expert_scales"] is (batch >= _CONST_6)
+
+    def _decode_step(operands: tuple[_Dynamic, ...]) -> _Dynamic:
+        """Wrap decode_paged call for shard_map."""
+        return paged_mod.decode_paged(
+            *operands,
+            batch_size=batch,
+            dcp_pool_map=(0,) * 24,
+            **opts,
+        )
+
+    sharded = jax.shard_map(
+        _decode_step, mesh=mesh_tp, in_specs=P(), out_specs=P(), check_vma=False
+    )
+    lowered = jax.jit(sharded).lower(
+        (weights, conv, recurrent, pools, token, pos, tables, state_slot)
+    )
+    assert "tpu_custom_call" in lowered.as_text()
+
+
+def test_k3_decode_paged_b8_alias_expert_scales_tpu7x_aot_lowering() -> _Dynamic:
+    """Verify deviceless TPU v7x AOT lowering for paged.decode_paged at B1 and B8."""
+    devices = topologies.get_topology_desc(
+        topology_name="tpu7x_2x2x4", platform="tpu"
+    ).devices
+    _lower_decode_paged_on_tpu7x(devices, batch=1)
+    _lower_decode_paged_on_tpu7x(devices, batch=_CONST_8)
 
 
 def test_k3_deviceless_tpu7x_aot_lowering() -> _Dynamic:

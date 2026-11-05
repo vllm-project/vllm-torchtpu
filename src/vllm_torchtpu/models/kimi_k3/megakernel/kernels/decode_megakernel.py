@@ -29,9 +29,8 @@ from jax import typing as jax_typing
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu
 
-from vllm_torchtpu.megakernel import pool_alias
 from vllm_torchtpu.models.kimi_k3.megakernel import kernels as kimi
-from vllm_torchtpu.models.kimi_k3.megakernel.common import collectives32
+from vllm_torchtpu.models.kimi_k3.megakernel.common import collectives32, pool_alias
 from vllm_torchtpu.models.kimi_k3.megakernel.common.vmem_pool import VmemPool
 from vllm_torchtpu.models.kimi_k3.megakernel.config import active as _config
 from vllm_torchtpu.models.kimi_k3.megakernel.kernels import mla_dcp

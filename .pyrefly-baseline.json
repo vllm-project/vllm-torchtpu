@@ -291,6 +291,11 @@
       "concise_description": "Object of class `NoneType` has no attribute `vmem_capacity_bytes`"
     },
     {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/common/pool_alias.py",
+      "name": "bad-argument-count",
+      "concise_description": "Expected 0 positional arguments, got 1 in function `Reinterpret.__init__`"
+    },
+    {
       "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/decode.py",
       "name": "bad-argument-count",
       "concise_description": "Expected 4 positional arguments, got 6 in function `vllm_torchtpu.models.kimi_k3.megakernel.pools.KdaImporter.import_state`"
@@ -573,7 +578,7 @@
     {
       "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
       "name": "bad-unpacking",
-      "concise_description": "Cannot unpack list[Unknown] | tuple[Unknown, Unknown, Unknown, Unknown] (of size 4) into 2 values"
+      "concise_description": "Cannot unpack list[Any] | tuple[Any, Any, Any, Any] (of size 4) into 2 values"
     },
     {
       "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",

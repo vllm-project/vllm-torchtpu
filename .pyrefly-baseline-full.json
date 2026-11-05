@@ -3438,7 +3438,7 @@
     {
       "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
       "name": "bad-unpacking",
-      "concise_description": "Cannot unpack list[TransformedRef] | tuple[TransformedRef, TransformedRef, TransformedRef, TransformedRef] (of size 4) into 2 values"
+      "concise_description": "Cannot unpack list[Any] | tuple[Any, Any, Any, Any] (of size 4) into 2 values"
     },
     {
       "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",

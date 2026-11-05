@@ -89,7 +89,7 @@ from jax.experimental.pallas import tpu_sc as plsc
 from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 
-from vllm_torchtpu.megakernel import pool_alias
+from vllm_torchtpu.models.kimi_k3.megakernel.common import pool_alias
 from vllm_torchtpu.models.kimi_k3.megakernel.config import active as _config
 from vllm_torchtpu.models.kimi_k3.megakernel.kernels.helpers import (
     e8m0_scale,
