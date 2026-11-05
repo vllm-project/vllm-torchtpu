@@ -43,7 +43,7 @@ from vllm.models.deepseek_v4.attention import (
 from vllm.models.deepseek_v4.compressor import CompressorStateCache
 from vllm.v1.attention.backend import AttentionLayer, AttentionType
 from vllm.v1.attention.backends.mla.sparse_swa import DeepseekV4SWACache
-from vllm.v1.core.kv_cache_utils import get_kv_cache_groups
+from vllm.v1.core.kv_cache_planning import get_kv_cache_groups
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     FullAttentionSpec,
@@ -65,6 +65,10 @@ from vllm_torchtpu import envs, utils
 from vllm_torchtpu.block_major_pool import (
     BlockMajorPoolLayout,
     unified_block_major_enabled,
+)
+from vllm_torchtpu.core.runner_slot_mamba import (
+    check_runner_slot_groups,
+    maybe_runner_slot_mamba_spec,
 )
 from vllm_torchtpu.kernels.mla import dispatch as mla_dispatch
 from vllm_torchtpu.kv_cache_materializer import (
@@ -252,6 +256,14 @@ class KVCacheManager:
                 self._update_mamba_page_size_padded(layers, block_size)
 
         hma_enabled = not self.runner.scheduler_config.disable_hybrid_kv_cache_manager
+        # Compact-mamba sizing (above) gave the GDN layers their own slot
+        # arrays, indexed by the runner's per-request slot ids: their scheduler
+        # blocks are never read.
+        runner_owns_mamba_slots = (
+            not self.runner._unified_kv_layout
+            and not self.runner._uniform_mamba_layout
+            and self.runner._mamba_num_blocks is not None
+        )
 
         kv_cache_spec: dict[str, KVCacheSpec] = {}
         # DSv4 layers whose specs must reach vLLM verbatim; see
@@ -265,7 +277,11 @@ class KVCacheManager:
             if isinstance(attn_module, MambaBase):
                 spec = attn_module.get_kv_cache_spec(self.runner.vllm_config)
                 if spec is not None:
-                    kv_cache_spec[layer_name] = spec
+                    kv_cache_spec[layer_name] = maybe_runner_slot_mamba_spec(
+                        spec,
+                        self.runner.vllm_config,
+                        runner_owns_slots=runner_owns_mamba_slots,
+                    )
             # DSv4's attention, SWA, compressor and indexer caches all build
             # their own specs, as the reference does.
             elif is_cache_for_ds_v4(attn_module):
@@ -420,6 +436,15 @@ class KVCacheManager:
                 )
             else:
                 continue
+
+        for layer_name, attn_module in layers.items():
+            if (
+                layer_name in kv_cache_spec
+                and getattr(attn_module, "is_draft_layer", False) is True
+            ):
+                kv_cache_spec[layer_name] = dataclasses.replace(
+                    kv_cache_spec[layer_name], is_draft=True
+                )
 
         # Note: that each shared layer's target actually owns a KV cache (and
         # that the shared layer was not itself allocated one) is enforced later
@@ -825,7 +850,7 @@ class KVCacheManager:
         #   e.g. 10 full-attn      + 30 mamba     → min (1 attn + 3 mamba)
         #
         # This duplicates the heuristic from
-        # `vllm/v1/core/kv_cache_utils.py::_get_kv_cache_groups_uniform_page_size`.
+        # `vllm/v1/core/kv_cache_planning.py::_get_kv_cache_groups_uniform_page_size`.
         # We can't call it directly because vLLM's grouping needs a fully
         # populated spec dict, while we need the group layout *before* we
         # can finish creating the specs (padding depends on grouping,
@@ -900,11 +925,10 @@ class KVCacheManager:
         Matches `TPUWorker.determine_available_memory()`: the
         `utils.compute_hbm_budget` result (which reserves the
         `gpu_memory_utilization` cap minus
-        `utils.estimate_kv_connector_hbm_reserve` (HBM a connector allocates
-        after profile_run, such as the offload H2D
-        staging pool). Sizing overrides against this budget keeps them from
-        filling the connector reserve back up with KV blocks and defeating
-        the worker-side subtraction.
+        `TPUModelRunner.post_profile_hbm_reserves` (HBM allocated after
+        profile_run, such as the offload H2D staging pool). Sizing overrides
+        against this budget keeps them from filling these reserves back up
+        with KV blocks and defeating the worker-side subtraction.
         """
         if kv_cache_memory_bytes := self.runner.cache_config.kv_cache_memory_bytes:
             return kv_cache_memory_bytes
@@ -913,8 +937,7 @@ class KVCacheManager:
         )
         return utils.min_across_ep_dp(
             self.runner.vllm_config.parallel_config,
-            budget.available
-            - utils.estimate_kv_connector_hbm_reserve(self.runner.vllm_config),
+            budget.available - sum(self.runner.post_profile_hbm_reserves()),
         )
 
     def _maybe_set_compact_mamba_num_blocks_override(
@@ -1382,6 +1405,8 @@ class KVCacheManager:
             for gid in range(len(self.runner.kv_cache_config.kv_cache_groups))
         }
         if self.runner._unified_kv_layout:
+            # The unified pool stores GDN state in the scheduler's blocks.
+            check_runner_slot_groups(kv_cache_config, runner_owns_slots=False)
             self._initialize_unified_kv_cache(kv_cache_config)
             return
         backend_cls = cast(
@@ -1601,6 +1626,9 @@ class KVCacheManager:
                 tuple[torch.Tensor, ...],
             ],
         ] = {}
+        # Caches allocated on the device below (shared attention regions, then
+        # per-layer attention and mamba caches), flushed after the loop.
+        device_caches: list[torch.Tensor] = []
 
         def allocate_attention_region(
             region: tuple[int, int],
@@ -1626,10 +1654,13 @@ class KVCacheManager:
                     f"budget: region={region}, allocated={allocated_bytes}, "
                     f"required={required_bytes}, budget={budget}"
                 )
+            # Allocate on the device: a host tensor staged through `.to()` costs
+            # about twice the cache size in host RAM per worker.
             caches = tuple(
-                torch.zeros(shape, dtype=dtype).to(self.runner.device)
+                torch.zeros(shape, dtype=dtype, device=self.runner.device)
                 for shape, dtype in geometry
             )
+            device_caches.extend(caches)
             if native_caches is not None:
                 native_caches[key] = caches
             return caches
@@ -1669,6 +1700,7 @@ class KVCacheManager:
                     attn_backend=backend_cls,
                     device=self.runner.device,
                 )
+            device_caches.extend(shared_attention_caches.values())
 
         for kv_cache_tensor in [] if _is_ds_v4 else kv_cache_config.kv_cache_tensors:
             # Each descriptor names layers within the whole backing allocation;
@@ -1699,8 +1731,11 @@ class KVCacheManager:
                     ):
                         cache_shape = (mamba_num_blocks, *shape)
                         mamba_states.append(
-                            torch.zeros(cache_shape, dtype=dtype).to(self.runner.device)
+                            torch.zeros(
+                                cache_shape, dtype=dtype, device=self.runner.device
+                            )
                         )
+                    device_caches.extend(mamba_states)
                     kv_caches[layer_name] = tuple(mamba_states)
                 elif isinstance(kv_cache_spec, MLAAttentionSpec):
                     attn_module = self.runner.vllm_config.compilation_config.static_forward_context.get(  # noqa: E501
@@ -1781,6 +1816,12 @@ class KVCacheManager:
                         )[0]
                 else:
                     raise NotImplementedError
+
+        # torch_tpu defers a device zero-fill until first use. Flush these caches
+        # so the precompile below sees them in HBM, as the unified path flushes
+        # its pool (where PJRT donates only buffers with no pending write).
+        if device_caches:
+            synchronize_tensors(device_caches)
 
         self._add_shared_kv_cache_aliases(kv_caches)
 
@@ -1864,11 +1905,14 @@ class KVCacheManager:
         # Initialize the compact-mamba slot allocator now that the true mamba
         # block count is known. When compact sizing was skipped, mamba shares
         # the attention `num_blocks`, so the pool spans that range instead.
+        owns_mamba_slots = False
         if (
             allocated_mamba_num_blocks is not None
             and not self.runner._uniform_mamba_layout
         ):
             self.runner._init_mamba_slot_pool(allocated_mamba_num_blocks)
+            owns_mamba_slots = True
+        check_runner_slot_groups(kv_cache_config, runner_owns_slots=owns_mamba_slots)
 
         # Compact pool counterpart of the read-offset buffer allocated in
         # `initialize_kv_cache`, indexed over the mamba slot pool rather
