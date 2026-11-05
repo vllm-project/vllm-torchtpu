@@ -34,6 +34,7 @@ from jax.experimental.pallas import tpu as pltpu
 from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 
+from vllm_torchtpu.kernels.experimental import rotated_collectives
 from vllm_torchtpu.kernels.experimental.fused_moe_prefill import (
     fused_moe_prefill_kernel as v1,
 )
@@ -466,3 +467,38 @@ def test_token_ops_give_each_core_its_rows(mesh, tokens):
     # Positive control: a wrong index gives other rows.
     shifted = np.asarray(jax.jit(own)(full, (rank + 1) % RANKS))
     assert not np.array_equal(_bits(shifted), _bits(mine))
+
+
+# 2048 tokens: one combine chunk; 4096: two. Hidden 640 is not 3 parts of whole
+# lane tiles, so the kernel does not take it.
+@pytest.mark.parametrize(("tokens", "h"), [(2048, 768), (4096, 768), (2048, 640)])
+def test_rotated_scatter_rows_gives_each_core_the_rows_of_scatter_rows(
+    mesh, interpret, monkeypatch, tokens, h
+):
+    """v2.rotated_scatter_rows, each core's index fed as data, against
+    scatter_rows, bit for bit: integer partials keep every bf16 sum exact in
+    any order. One rotated kernel per combine chunk, none for a shape the
+    kernel does not take."""
+    places = [
+        ((x, y, z), c) for x in (0, 1) for y in (0, 1) for z in (0, 1) for c in (0, 1)
+    ]
+    table = rotated_collectives.peer_table(places, "reduce_scatter")
+    chunks = []
+    chunked = rotated_collectives.reduce_scatter_chunks
+    monkeypatch.setattr(
+        rotated_collectives,
+        "reduce_scatter_chunks",
+        lambda *args, **kwargs: chunks.append(kwargs["chunk"])
+        or chunked(*args, **kwargs),
+    )
+    rng = np.random.default_rng(tokens + h)
+    x = jnp.asarray(rng.integers(-16, 17, (RANKS * tokens, h)), jnp.bfloat16)
+    rank = jnp.arange(RANKS, dtype=jnp.int32).reshape(RANKS, 1)
+
+    rotated = _per_core(
+        mesh, lambda p, r: v2.rotated_scatter_rows(p, r.reshape(1), table, "d"), x, rank
+    )
+    xla = _per_core(mesh, lambda p: v2.scatter_rows(p, "d"), x)
+
+    np.testing.assert_array_equal(_bits(rotated), _bits(xla))
+    assert chunks == ([2048] if h == 768 else [])
