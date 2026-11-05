@@ -61,7 +61,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 import torch
 
-from vllm_torchtpu import envs, expert_placement
+from vllm_torchtpu import envs
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
@@ -79,6 +79,8 @@ _unused_weight_predicate: Callable[[str], bool] | None = None
 
 def _should_skip(name: str, local_expert_ids: set[int]) -> bool:
     from vllm.model_executor.model_loader.ep_weight_filter import parse_expert_id
+
+    from vllm_torchtpu.layers.adapter import expert_placement
 
     expert_id = parse_expert_id(name)
     if expert_id is None:
@@ -1061,6 +1063,8 @@ def patch_expert_placement_routers() -> None:
 
     @functools.wraps(orig_process)
     def process_weights_after_loading(model, model_config, target_device):
+        from vllm_torchtpu.layers.adapter import expert_placement
+
         expert_placement.permute_routers(model)
         return orig_process(model, model_config, target_device)
 
