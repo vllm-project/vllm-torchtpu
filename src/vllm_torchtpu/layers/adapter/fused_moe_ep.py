@@ -237,6 +237,7 @@ def _build_op(
             staging_slots=envs.MOE_FUSED_EP_PUSH_STAGING_SLOTS,
             light_prepush=envs.MOE_FUSED_EP_PUSH_LIGHT_PREPUSH,
             single_barrier=envs.MOE_FUSED_EP_PUSH_SINGLE_BARRIER,
+            early_scale_scatter=envs.MOE_FUSED_EP_PUSH_EARLY_SCALE_SCATTER,
         )
 
     preprocess_topology = prepare_moe_preprocessing(mesh)

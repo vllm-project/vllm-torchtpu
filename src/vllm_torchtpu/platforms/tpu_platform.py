@@ -440,6 +440,7 @@ class TpuPlatform(Platform):
         "MOE_FUSED_EP_PUSH_SHARED_EXPERT",
         "MOE_FUSED_EP_PUSH_LIGHT_PREPUSH",
         "MOE_FUSED_EP_PUSH_SINGLE_BARRIER",
+        "MOE_FUSED_EP_PUSH_EARLY_SCALE_SCATTER",
     ]
 
     # The "Platform" base class has import_kernels() that tries to import
