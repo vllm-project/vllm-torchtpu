@@ -30,6 +30,13 @@ moe_router.select_experts picks them: score, top-k, renormalize.
 ROUTING_MOE_REMOTE_SCATTER=0 selects the kernel's local mode instead of the remote
 scatter above: each device sums its experts' rows into a partial result for
 every token, and a reduce-scatter combines the partial results.
+
+Under MoE tensor parallelism (no --enable-expert-parallel) the layer runs the
+kernel's TP mode instead: every rank holds all tokens and every expert, sliced
+along the intermediate dimension, so each rank computes a partial result for
+every token over its slice and the op all-reduces the partials over the TP
+group. Each rank's w13 is already [gate | up] over its own slice, which is the
+per-shard layout the kernel expects, so the weights go in as they are.
 """
 
 from typing import Any
@@ -48,6 +55,7 @@ from vllm_torchtpu.distributed.ep_mesh import (
     ep_mesh_index,
     ep_rank_order,
     ep_token_replica_groups,
+    get_ep_group,
 )
 from vllm_torchtpu.kernels.fused_moe.v2.token_parallel import TokenReplicaLayout
 from vllm_torchtpu.logger import init_logger
@@ -79,10 +87,9 @@ def unsupported_reason(layer) -> str | None:
     """Why this integration can't run the layer, or None if it can.
 
     Only what the integration itself doesn't handle; the kernel raises for what
-    it doesn't support.
+    it doesn't support. Whether the experts are expert- or tensor-parallel is
+    prebuild's to sort out.
     """
-    if not layer.moe_config.moe_parallel_config.use_ep:
-        return "the experts are not expert-parallel"
     if layer.scoring_func not in ("softmax", "sigmoid"):
         return f"routing here doesn't score with {layer.scoring_func}"
     if layer.e_score_correction_bias is not None:
@@ -247,11 +254,193 @@ def _build_op(
     return op
 
 
+def _tp_moe_fn(
+    mesh,
+    topk: int,
+    renormalize: bool,
+    scoring_fn: str,
+    activation: str,
+    kernel,
+):
+    """The TP op's body: `kernel` is tokamax's `modular.routing_moe`.
+
+    jax_op hands every operand over sharded on axis 0, one rank's tensor per
+    mesh index: x and the gating [ranks * tokens, ...] (every rank's copy of
+    the same tokens), the weights and scales [ranks * E, ...]. The kernel wants
+    replicated tokens and the weights split along the intermediate dimension.
+    Every rank already holds exactly its own slice, so the conversion is an
+    identity shard_map that only relabels the sharding, without moving data.
+    """
+    axis = mesh.axis_names[0]
+    rows = PartitionSpec(axis)
+    replicated = PartitionSpec()
+
+    def relabel(a: jax.Array, out_spec: PartitionSpec) -> jax.Array:
+        return jax.shard_map(
+            lambda v: v,
+            mesh=mesh,
+            in_specs=rows,
+            out_specs=out_spec,
+            check_vma=False,
+        )(a)
+
+    def route(x_l, gating_l):
+        weights, ids = _route(gating_l, topk, renormalize, scoring_fn)
+        return x_l, weights, ids
+
+    def moe(
+        x: jax.Array,
+        w1: jax.Array,
+        w2: jax.Array,
+        w1_scale: jax.Array,
+        w2_scale: jax.Array,
+        gating: jax.Array,
+        rank: jax.Array,
+    ) -> jax.Array:
+        del rank  # TP partials are summed, so the mesh order doesn't matter.
+        # Every rank holds the same tokens; routing them on each rank gives the
+        # same experts everywhere, so the result is replicated.
+        x, weights, ids = jax.shard_map(
+            route,
+            mesh=mesh,
+            in_specs=(rows, rows),
+            out_specs=(replicated,) * 3,
+            check_vma=False,
+        )(x, gating)
+        # The kernel's TP specs (layer/modular.py): w1 and its scale on the
+        # output (intermediate) dim, w2 on its contracting (intermediate) dim.
+        # Each rank quantized its own w2 slice, so w2's scale blocks are split
+        # along the intermediate dim too; concatenated over ranks there is more
+        # than one block, which is what makes the kernel split them as well.
+        w1 = relabel(w1, PartitionSpec(None, None, axis))
+        w2 = relabel(w2, PartitionSpec(None, axis, None))
+        w1_scale = relabel(w1_scale, PartitionSpec(None, None, None, axis))
+        w2_scale = relabel(w2_scale, PartitionSpec(None, axis, None, None))
+        out = kernel(
+            x,
+            weights,
+            ids,
+            w1,
+            w2,
+            w1_scale,
+            w2_scale,
+            None,
+            None,
+            mesh=mesh,
+            activation=activation,
+            tp_axis=axis,
+            ep_axis=None,
+            use_sp=False,
+            reduce_output=True,
+        )
+        # The kernel all-reduces over the TP axis, so every rank gets the
+        # whole result for its own (identical) tokens.
+        return jax.shard_map(
+            lambda v: v,
+            mesh=mesh,
+            in_specs=replicated,
+            out_specs=rows,
+            check_vma=False,
+        )(out)
+
+    return moe
+
+
+def _build_tp_op(
+    mesh,
+    topk: int,
+    renormalize: bool,
+    scoring_fn: str,
+    activation: str,
+):
+    key = ("tp", topk, renormalize, scoring_fn, activation)
+    cached = _OPS.get(key)
+    if cached is not None:
+        return cached
+    # pyrefly: ignore[missing-import]
+    from tokamax._src.ops.experimental.routing_moe.layer import modular as tk_modular
+
+    name = ROUTING_MOE_OP_NAME if not _OPS else f"{ROUTING_MOE_OP_NAME}_{len(_OPS)}"
+    spec = PartitionSpec(mesh.axis_names[0])
+    op = jax_op(
+        name,
+        _tp_moe_fn(
+            mesh, topk, renormalize, scoring_fn, activation, tk_modular.routing_moe
+        ),
+        mesh=mesh,
+        input_partition_specs=(spec,) * 7,
+        output_partition_specs=spec,
+    )
+
+    def _fake(x, *_args, **_kwargs):
+        return torch.empty_like(x)
+
+    op.register_fake(_fake)
+    _OPS[key] = op
+    return op
+
+
+def _tp_group_reason() -> str | None:
+    """Why the TP group can't host the op's mesh, or None if it can.
+
+    The op's mesh is `build_ep_mesh`'s, as for moe_tp_decode: vLLM builds the
+    EP group even with EP off, and with dp 1 and pcp 1 it is the TP group.
+    """
+    from vllm.distributed import parallel_state
+
+    tp = parallel_state.get_tp_group()
+    if int(tp.world_size) < 2:
+        return "the TP group has one device"
+    ep = get_ep_group()
+    tp_ranks = tuple(int(r) for r in tp.ranks)
+    ep_ranks = None if ep is None else tuple(int(r) for r in ep.ranks)
+    if tp_ranks != ep_ranks:
+        return f"TP ranks {tp_ranks} != EP ranks {ep_ranks} (needs dp 1, pcp 1)"
+    return None
+
+
 def _refusal(reason: str) -> ValueError:
     return ValueError(
         f"routing_moe can't run this MoE layer: {reason}. "
         "Unset USE_ROUTING_MOE to use another MoE kernel."
     )
+
+
+def _prebuild_tp(layer, parallel, topk: int, renormalize: bool, activation: str) -> Any:
+    """prebuild_routing_moe for tensor-parallel experts."""
+    global _RANK_BUFFER
+    if getattr(parallel, "is_sequence_parallel", False):
+        raise _refusal("sequence-parallel MoE is only wired up with EP")
+    reason = _tp_group_reason()
+    if reason is not None:
+        raise _refusal(reason)
+    mesh = build_ep_mesh()
+    if mesh is None:
+        raise _refusal("there is no TP group mesh")
+    if layer.global_num_experts != layer.w13_weight.shape[0]:
+        raise _refusal(
+            f"TP expects all {layer.global_num_experts} experts on every rank, "
+            f"got {layer.w13_weight.shape[0]}"
+        )
+    # Unused by the TP body, but routing_moe passes the same seven operands in
+    # both modes.
+    _RANK_BUFFER = torch.tensor(
+        [[ep_mesh_index()]], dtype=torch.int32, device=layer.w13_weight.device
+    )
+    tp = mesh.shape[mesh.axis_names[0]]
+    if envs.ROUTING_MOE_REMOTE_SCATTER:
+        logger.info_once(
+            "[MoE]: ROUTING_MOE_REMOTE_SCATTER needs EP; TP routing_moe "
+            "all-reduces instead."
+        )
+    logger.info_once(
+        "[MoE]: routing_moe over %d TP devices, all %d experts each, "
+        "intermediate %d per device; all-reduce.",
+        tp,
+        layer.global_num_experts,
+        layer.w2_weight.shape[1],
+    )
+    return _build_tp_op(mesh, topk, renormalize, layer.scoring_func, activation)
 
 
 def prebuild_routing_moe(
@@ -271,6 +460,10 @@ def prebuild_routing_moe(
     reason = unsupported_reason(layer)
     if reason is not None:
         raise _refusal(reason)
+    global _RANK_BUFFER
+    parallel = layer.moe_config.moe_parallel_config
+    if not parallel.use_ep:
+        return _prebuild_tp(layer, parallel, topk, renormalize, activation)
     mesh = build_ep_mesh()
     order = ep_rank_order()
     if mesh is None or order is None:
@@ -283,7 +476,6 @@ def prebuild_routing_moe(
             f"{ep} EP ranks of {local_experts}"
         )
 
-    global _RANK_BUFFER
     _RANK_BUFFER = torch.tensor(
         [[ep_mesh_index()]], dtype=torch.int32, device=layer.w13_weight.device
     )
