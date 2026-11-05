@@ -996,6 +996,2491 @@
       "concise_description": "No matching overload found for function `vllm.model_executor.layers.fused_moe.routed_experts.RoutedExperts.weight_loader` called with arguments: (Unknown, Tensor, Unknown, Unknown, Unknown, Unknown, return_success=bool | Unknown)"
     },
     {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-override-param-name",
+      "concise_description": "Class member `_PaddedBf16Rows._validate_shape` overrides parent class `Reinterpret` in an inconsistent manner"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "`None` is not subscriptable"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "`None` is not subscriptable"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "unbound-name",
+      "concise_description": "`initial_first` may be uninitialized"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "unbound-name",
+      "concise_description": "`initial_second` may be uninitialized"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of type `Array | ShapeDtypeStruct | builtins.bool | numpy.bool | complex | float | int | ndarray | number` has no attribute `at`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of type `Array | ShapeDtypeStruct | builtins.bool | numpy.bool | complex | float | int | ndarray | number` has no attribute `shape`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of type `Array | ShapeDtypeStruct | builtins.bool | numpy.bool | complex | float | int | ndarray | number` has no attribute `at`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of type `Array | ShapeDtypeStruct | builtins.bool | numpy.bool | complex | float | int | ndarray | number` has no attribute `at`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of type `Array | ShapeDtypeStruct | builtins.bool | numpy.bool | complex | float | int | ndarray | number` has no attribute `at`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of type `Array | ShapeDtypeStruct | builtins.bool | numpy.bool | complex | float | int | ndarray | number` has no attribute `at`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of type `Array | ShapeDtypeStruct | builtins.bool | numpy.bool | complex | float | int | ndarray | number` has no attribute `at`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of type `Array | ShapeDtypeStruct | builtins.bool | numpy.bool | complex | float | int | ndarray | number` has no attribute `shape`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of type `Array | ShapeDtypeStruct | builtins.bool | numpy.bool | complex | float | int | ndarray | number` has no attribute `shape`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of type `Array | ShapeDtypeStruct | builtins.bool | numpy.bool | complex | float | int | ndarray | number` has no attribute `shape`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of type `Array | ShapeDtypeStruct | builtins.bool | numpy.bool | complex | float | int | ndarray | number` has no attribute `shape`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of type `Array | ShapeDtypeStruct | builtins.bool | numpy.bool | complex | float | int | ndarray | number` has no attribute `shape`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of type `Array | ShapeDtypeStruct | builtins.bool | numpy.bool | complex | float | int | ndarray | number` has no attribute `shape`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of type `Array | ShapeDtypeStruct | builtins.bool | numpy.bool | complex | float | int | ndarray | number` has no attribute `shape`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of type `Array | ShapeDtypeStruct | builtins.bool | numpy.bool | complex | float | int | ndarray | number` has no attribute `shape`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of type `Array | ShapeDtypeStruct | builtins.bool | numpy.bool | complex | float | int | ndarray | number` has no attribute `dtype`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of type `Array | ShapeDtypeStruct | builtins.bool | numpy.bool | complex | float | int | ndarray | number` has no attribute `dtype`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of type `Array | ShapeDtypeStruct | builtins.bool | numpy.bool | complex | float | int | ndarray | number` has no attribute `shape`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of type `Array | ShapeDtypeStruct | builtins.bool | numpy.bool | complex | float | int | ndarray | number` has no attribute `shape`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of type `Array | ShapeDtypeStruct | builtins.bool | numpy.bool | complex | float | int | ndarray | number` has no attribute `shape`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of type `Array | ShapeDtypeStruct | builtins.bool | numpy.bool | complex | float | int | ndarray | number` has no attribute `shape`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of type `Array | ShapeDtypeStruct | builtins.bool | numpy.bool | complex | float | int | ndarray | number` has no attribute `dtype`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of type `Array | ShapeDtypeStruct | builtins.bool | numpy.bool | complex | float | int | ndarray | number` has no attribute `shape`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of type `Array | ShapeDtypeStruct | builtins.bool | numpy.bool | complex | float | int | ndarray | number` has no attribute `dtype`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of type `Array | ShapeDtypeStruct | builtins.bool | numpy.bool | complex | float | int | ndarray | number` has no attribute `shape`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of type `Array | ShapeDtypeStruct | builtins.bool | numpy.bool | complex | float | int | ndarray | number` has no attribute `shape`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of type `Array | ShapeDtypeStruct | builtins.bool | numpy.bool | complex | float | int | ndarray | number` has no attribute `shape`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of type `Array | ShapeDtypeStruct | builtins.bool | numpy.bool | complex | float | int | ndarray | number` has no attribute `shape`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of type `Array | ShapeDtypeStruct | builtins.bool | numpy.bool | complex | float | int | ndarray | number` has no attribute `shape`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of type `Array | ShapeDtypeStruct | builtins.bool | numpy.bool | complex | float | int | ndarray | number` has no attribute `shape`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `ShapeDtypeStruct`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `bool`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `numpy.bool`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `complex`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `float`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `int`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `number`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-argument-type",
+      "concise_description": "Argument `object | tuple[int, ...] | tuple[Any, ...] | Any` is not assignable to parameter `shape` with type `Sequence[int]` in function `jax._src.pallas.mosaic.core.MemorySpace.__call__`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of type `Array | ShapeDtypeStruct | builtins.bool | numpy.bool | complex | float | int | ndarray | number` has no attribute `dtype`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of type `Array | ShapeDtypeStruct | builtins.bool | numpy.bool | complex | float | int | ndarray | number` has no attribute `shape`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of type `Array | ShapeDtypeStruct | builtins.bool | numpy.bool | complex | float | int | ndarray | number` has no attribute `dtype`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of type `Array | ShapeDtypeStruct | builtins.bool | numpy.bool | complex | float | int | ndarray | number` has no attribute `shape`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of type `Array | ShapeDtypeStruct | builtins.bool | numpy.bool | complex | float | int | ndarray | number` has no attribute `dtype`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "`None` is not subscriptable"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `ShapeDtypeStruct`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `bool`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `numpy.bool`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `complex`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `float`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `int`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `number`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "Cannot set item in `ShapeDtypeStruct`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "Cannot set item in `bool`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "Cannot set item in `numpy.bool`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "Cannot set item in `complex`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "Cannot set item in `float`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "Cannot set item in `int`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "Cannot set item in `ndarray`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "Cannot set item in `number`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "Cannot set item in `ShapeDtypeStruct`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "Cannot set item in `bool`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "Cannot set item in `numpy.bool`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "Cannot set item in `complex`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "Cannot set item in `float`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "Cannot set item in `int`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "Cannot set item in `number`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of type `Array | ShapeDtypeStruct | builtins.bool | numpy.bool | complex | float | int | ndarray | number` has no attribute `dtype`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of type `Array | ShapeDtypeStruct | builtins.bool | numpy.bool | complex | float | int | ndarray | number` has no attribute `shape`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of type `Array | ShapeDtypeStruct | builtins.bool | numpy.bool | complex | float | int | ndarray | number` has no attribute `shape`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of type `Array | ShapeDtypeStruct | builtins.bool | numpy.bool | complex | float | int | ndarray | number` has no attribute `shape`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of type `Array | ShapeDtypeStruct | builtins.bool | numpy.bool | complex | float | int | ndarray | number` has no attribute `shape`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of type `Array | ShapeDtypeStruct | builtins.bool | numpy.bool | complex | float | int | ndarray | number` has no attribute `shape`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of type `Array | ShapeDtypeStruct | builtins.bool | numpy.bool | complex | float | int | ndarray | number` has no attribute `shape`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of type `Array | ShapeDtypeStruct | builtins.bool | numpy.bool | complex | float | int | ndarray | number` has no attribute `shape`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of type `Array | ShapeDtypeStruct | builtins.bool | numpy.bool | complex | float | int | ndarray | number` has no attribute `shape`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of type `Array | ShapeDtypeStruct | builtins.bool | numpy.bool | complex | float | int | ndarray | number` has no attribute `shape`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of type `Array | ShapeDtypeStruct | builtins.bool | numpy.bool | complex | float | int | ndarray | number` has no attribute `shape`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of type `Array | ShapeDtypeStruct | builtins.bool | numpy.bool | complex | float | int | ndarray | number` has no attribute `shape`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of type `Array | ShapeDtypeStruct | builtins.bool | numpy.bool | complex | float | int | ndarray | number` has no attribute `shape`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `ShapeDtypeStruct`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `bool`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `numpy.bool`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `complex`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `float`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `int`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `number`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "Cannot set item in `None`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "Cannot set item in `None`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "Cannot set item in `None`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `ShapeDtypeStruct`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `bool`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `numpy.bool`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `complex`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `float`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `int`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `number`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `ShapeDtypeStruct`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `bool`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `numpy.bool`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `complex`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `float`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `int`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `number`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `ShapeDtypeStruct`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `bool`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `numpy.bool`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `complex`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `float`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `int`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `number`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "Cannot set item in `None`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "Cannot set item in `None`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "`None` is not subscriptable"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "`None` is not subscriptable"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `ShapeDtypeStruct`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `bool`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `numpy.bool`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `complex`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `float`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `int`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `number`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "`None` is not subscriptable"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `ShapeDtypeStruct`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `bool`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `numpy.bool`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `complex`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `float`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `int`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `number`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "Cannot set item in `None`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "`None` is not subscriptable"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "`None` is not subscriptable"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `ShapeDtypeStruct`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `bool`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `numpy.bool`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `complex`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `float`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `int`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `number`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "`None` is not subscriptable"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `ShapeDtypeStruct`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `bool`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `numpy.bool`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `complex`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `float`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `int`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `number`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `ShapeDtypeStruct`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `bool`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `numpy.bool`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `complex`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `float`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `int`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `number`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "unbound-name",
+      "concise_description": "`raw_recurrent_gate` may be uninitialized"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `ShapeDtypeStruct`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `bool`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `numpy.bool`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `complex`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `float`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `int`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `number`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `ShapeDtypeStruct`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `bool`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `numpy.bool`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `complex`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `float`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `int`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `number`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `ShapeDtypeStruct`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `bool`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `numpy.bool`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `complex`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `float`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `int`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `number`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `ShapeDtypeStruct`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `bool`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `numpy.bool`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `complex`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `float`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `int`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `number`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "Cannot set item in `ShapeDtypeStruct`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "Cannot set item in `bool`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "Cannot set item in `numpy.bool`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "Cannot set item in `complex`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "Cannot set item in `float`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "Cannot set item in `int`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "Cannot set item in `number`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "Cannot set item in `ShapeDtypeStruct`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "Cannot set item in `bool`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "Cannot set item in `numpy.bool`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "Cannot set item in `complex`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "Cannot set item in `float`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "Cannot set item in `int`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "Cannot set item in `number`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of type `Array | ShapeDtypeStruct | builtins.bool | numpy.bool | complex | float | int | ndarray | number` has no attribute `dtype`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "Cannot set item in `None`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of class `NoneType` has no attribute `dtype`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "Cannot set item in `None`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "Cannot set item in `None`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "Cannot set item in `None`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of class `NoneType` has no attribute `finish`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "`None` is not subscriptable"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `ShapeDtypeStruct`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `bool`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `numpy.bool`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `complex`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `float`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `int`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `number`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of type `Array | ShapeDtypeStruct | builtins.bool | numpy.bool | complex | float | int | ndarray | number` has no attribute `dtype`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "Cannot set item in `ShapeDtypeStruct`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "Cannot set item in `bool`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "Cannot set item in `numpy.bool`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "Cannot set item in `complex`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "Cannot set item in `float`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "Cannot set item in `int`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "Cannot set item in `number`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "Cannot set item in `ShapeDtypeStruct`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "Cannot set item in `bool`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "Cannot set item in `numpy.bool`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "Cannot set item in `complex`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "Cannot set item in `float`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "Cannot set item in `int`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "Cannot set item in `number`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `ShapeDtypeStruct`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `bool`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `numpy.bool`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `complex`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `float`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `int`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `number`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `ShapeDtypeStruct`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `bool`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `numpy.bool`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `complex`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `float`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `int`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `number`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "Cannot set item in `None`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "`None` is not subscriptable"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `ShapeDtypeStruct`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `bool`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `numpy.bool`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `complex`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `float`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `int`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `number`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of type `Array | ShapeDtypeStruct | builtins.bool | numpy.bool | complex | float | int | ndarray | number` has no attribute `shape`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `ShapeDtypeStruct`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `bool`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `numpy.bool`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `complex`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `float`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `int`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `number`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "`None` is not subscriptable"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "`None` is not subscriptable"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "unbound-name",
+      "concise_description": "`output_gate` may be uninitialized"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of class `NoneType` has no attribute `finish`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of type `Array | ShapeDtypeStruct | builtins.bool | numpy.bool | complex | float | int | ndarray | number` has no attribute `shape`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of type `Array | ShapeDtypeStruct | builtins.bool | numpy.bool | complex | float | int | ndarray | number` has no attribute `shape`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of type `Array | ShapeDtypeStruct | builtins.bool | numpy.bool | complex | float | int | ndarray | number` has no attribute `shape`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of type `Array | ShapeDtypeStruct | builtins.bool | numpy.bool | complex | float | int | ndarray | number` has no attribute `shape`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of type `Array | ShapeDtypeStruct | builtins.bool | numpy.bool | complex | float | int | ndarray | number` has no attribute `shape`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of type `Array | ShapeDtypeStruct | builtins.bool | numpy.bool | complex | float | int | ndarray | number` has no attribute `shape`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of type `Array | ShapeDtypeStruct | builtins.bool | numpy.bool | complex | float | int | ndarray | number` has no attribute `shape`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of type `Array | ShapeDtypeStruct | builtins.bool | numpy.bool | complex | float | int | ndarray | number` has no attribute `shape`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of type `Array | ShapeDtypeStruct | builtins.bool | numpy.bool | complex | float | int | ndarray | number` has no attribute `shape`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of type `Array | ShapeDtypeStruct | builtins.bool | numpy.bool | complex | float | int | ndarray | number` has no attribute `shape`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of type `Array | ShapeDtypeStruct | builtins.bool | numpy.bool | complex | float | int | ndarray | number` has no attribute `shape`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of type `Array | ShapeDtypeStruct | builtins.bool | numpy.bool | complex | float | int | ndarray | number` has no attribute `shape`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of type `Array | ShapeDtypeStruct | builtins.bool | numpy.bool | complex | float | int | ndarray | number` has no attribute `shape`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of type `Array | ShapeDtypeStruct | builtins.bool | numpy.bool | complex | float | int | ndarray | number` has no attribute `shape`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of type `Array | ShapeDtypeStruct | builtins.bool | numpy.bool | complex | float | int | ndarray | number` has no attribute `shape`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of type `Array | ShapeDtypeStruct | builtins.bool | numpy.bool | complex | float | int | ndarray | number` has no attribute `shape`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of type `Array | ShapeDtypeStruct | builtins.bool | numpy.bool | complex | float | int | ndarray | number` has no attribute `shape`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-argument-count",
+      "concise_description": "Expected 4 positional arguments, got 6 in function `vllm_torchtpu.models.kimi_k3.megakernel.kernels.mla_dcp.DcpAttention.__init__`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `ShapeDtypeStruct`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `bool`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `numpy.bool`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `complex`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `float`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `int`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `number`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `ShapeDtypeStruct`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `bool`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `numpy.bool`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `complex`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `float`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `int`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `number`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `ShapeDtypeStruct`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `bool`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `numpy.bool`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `complex`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `float`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `int`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `number`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `ShapeDtypeStruct`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `bool`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `numpy.bool`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `complex`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `float`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `int`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `number`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `ShapeDtypeStruct`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `bool`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `numpy.bool`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `complex`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `float`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `int`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `number`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "Cannot set item in `ShapeDtypeStruct`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "Cannot set item in `bool`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "Cannot set item in `numpy.bool`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "Cannot set item in `complex`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "Cannot set item in `float`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "Cannot set item in `int`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "Cannot set item in `number`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "Cannot set item in `ShapeDtypeStruct`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "Cannot set item in `bool`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "Cannot set item in `numpy.bool`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "Cannot set item in `complex`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "Cannot set item in `float`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "Cannot set item in `int`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "Cannot set item in `number`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "Cannot set item in `ShapeDtypeStruct`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "Cannot set item in `bool`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "Cannot set item in `numpy.bool`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "Cannot set item in `complex`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "Cannot set item in `float`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "Cannot set item in `int`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "Cannot set item in `number`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "Cannot set item in `ShapeDtypeStruct`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "Cannot set item in `bool`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "Cannot set item in `numpy.bool`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "Cannot set item in `complex`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "Cannot set item in `float`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "Cannot set item in `int`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "Cannot set item in `number`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `ShapeDtypeStruct`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `bool`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `numpy.bool`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `complex`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `float`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `int`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `number`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of type `Array | ShapeDtypeStruct | builtins.bool | numpy.bool | complex | float | int | ndarray | number` has no attribute `shape`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of type `Array | ShapeDtypeStruct | builtins.bool | numpy.bool | complex | float | int | ndarray | number` has no attribute `shape`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-argument-count",
+      "concise_description": "Expected 4 positional arguments, got 6 in function `vllm_torchtpu.models.kimi_k3.megakernel.kernels.mla_dcp.DcpAttention.__init__`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `ShapeDtypeStruct`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `bool`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `numpy.bool`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `complex`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `float`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `int`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `number`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `ShapeDtypeStruct`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `bool`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `numpy.bool`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `complex`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `float`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `int`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `number`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `ShapeDtypeStruct`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `bool`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `numpy.bool`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `complex`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `float`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `int`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `number`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `ShapeDtypeStruct`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `bool`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `numpy.bool`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `complex`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `float`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `int`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `number`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `ShapeDtypeStruct`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `bool`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `numpy.bool`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `complex`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `float`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `int`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `number`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "Cannot set item in `ShapeDtypeStruct`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "Cannot set item in `bool`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "Cannot set item in `numpy.bool`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "Cannot set item in `complex`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "Cannot set item in `float`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "Cannot set item in `int`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "Cannot set item in `number`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "Cannot set item in `ShapeDtypeStruct`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "Cannot set item in `bool`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "Cannot set item in `numpy.bool`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "Cannot set item in `complex`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "Cannot set item in `float`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "Cannot set item in `int`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "Cannot set item in `number`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "Cannot set item in `ShapeDtypeStruct`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "Cannot set item in `bool`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "Cannot set item in `numpy.bool`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "Cannot set item in `complex`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "Cannot set item in `float`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "Cannot set item in `int`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "Cannot set item in `number`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "Cannot set item in `ShapeDtypeStruct`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "Cannot set item in `bool`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "Cannot set item in `numpy.bool`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "Cannot set item in `complex`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "Cannot set item in `float`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "Cannot set item in `int`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "Cannot set item in `number`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "Cannot set item in `ShapeDtypeStruct`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "Cannot set item in `bool`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "Cannot set item in `numpy.bool`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "Cannot set item in `complex`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "Cannot set item in `float`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "Cannot set item in `int`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "Cannot set item in `number`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `ShapeDtypeStruct`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `bool`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `numpy.bool`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `complex`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `float`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `int`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `number`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "Cannot set item in `ShapeDtypeStruct`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "Cannot set item in `bool`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "Cannot set item in `numpy.bool`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "Cannot set item in `complex`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "Cannot set item in `float`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "Cannot set item in `int`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "Cannot set item in `number`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `ShapeDtypeStruct`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `bool`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `numpy.bool`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `complex`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `float`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `int`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `number`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "`*` is not supported between `None` and `Array`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "no-matching-overload",
+      "concise_description": "No matching overload found for function `max` called with arguments: (dict[Unknown, int], key=Overload[\n  (key: Unknown, default: None = None, /) -> int | None\n  (key: Unknown, default: int, /) -> int\n  [_T](key: Unknown, default: _T, /) -> int | _T\n])"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "`None` is not subscriptable"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of class `NoneType` has no attribute `view`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of class `NoneType` has no attribute `request`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of class `NoneType` has no attribute `request`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "unbound-name",
+      "concise_description": "`group_positions_smem` may be uninitialized"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "`None` is not subscriptable"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "`None` is not subscriptable"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "`None` is not subscriptable"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "Cannot set item in `None`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "Cannot set item in `None`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "`None` is not subscriptable"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "Cannot set item in `None`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "`None` is not subscriptable"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "`None` is not subscriptable"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of class `ChunkedWeightStream` has no attribute `shards`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-argument-count",
+      "concise_description": "Expected 13 positional arguments, got 15 in function `KimiDeltaAttentionWeights.__init__`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-argument-type",
+      "concise_description": "Argument `Array | int` is not assignable to parameter `shard_index` with type `int | None` in function `kda`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-argument-count",
+      "concise_description": "Expected 13 positional arguments, got 15 in function `KimiDeltaAttentionWeights.__init__`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-argument-type",
+      "concise_description": "Argument `Array` is not assignable to parameter `shard_index` with type `int | None` in function `kda`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-argument-type",
+      "concise_description": "Argument `Array | Unknown` is not assignable to parameter `first_chunk` with type `int` in function `KdaStateStreamSlice.__init__`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-argument-count",
+      "concise_description": "Expected 13 positional arguments, got 15 in function `KimiDeltaAttentionWeights.__init__`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "unbound-name",
+      "concise_description": "`row_slice` may be uninitialized"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-unpacking",
+      "concise_description": "Cannot unpack list[TransformedRef] | tuple[TransformedRef, TransformedRef, TransformedRef, TransformedRef] (of size 4) into 2 values"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "`None` is not subscriptable"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "`None` is not subscriptable"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of class `NoneType` has no attribute `dtype`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "`None` is not subscriptable"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "`None` is not subscriptable"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "Cannot set item in `None`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-argument-type",
+      "concise_description": "Unpacked keyword argument `int` is not assignable to parameter `dimension_semantics` with type `Sequence[DimensionSemantics] | None` in function `jax._src.pallas.mosaic.core.CompilerParams.__init__`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-argument-type",
+      "concise_description": "Unpacked keyword argument `int` is not assignable to parameter `allow_input_fusion` with type `Sequence[bool] | None` in function `jax._src.pallas.mosaic.core.CompilerParams.__init__`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-argument-type",
+      "concise_description": "Unpacked keyword argument `int` is not assignable to parameter `has_side_effects` with type `SideEffectType | bool` in function `jax._src.pallas.mosaic.core.CompilerParams.__init__`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-argument-type",
+      "concise_description": "Unpacked keyword argument `int` is not assignable to parameter `flags` with type `Mapping[str, Any] | None` in function `jax._src.pallas.mosaic.core.CompilerParams.__init__`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-argument-type",
+      "concise_description": "Unpacked keyword argument `int` is not assignable to parameter `disable_semaphore_checks` with type `bool` in function `jax._src.pallas.mosaic.core.CompilerParams.__init__`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-argument-type",
+      "concise_description": "Unpacked keyword argument `int` is not assignable to parameter `skip_device_barrier` with type `bool` in function `jax._src.pallas.mosaic.core.CompilerParams.__init__`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-argument-type",
+      "concise_description": "Unpacked keyword argument `int` is not assignable to parameter `allow_collective_id_without_custom_barrier` with type `bool` in function `jax._src.pallas.mosaic.core.CompilerParams.__init__`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-argument-type",
+      "concise_description": "Unpacked keyword argument `int` is not assignable to parameter `use_tc_tiling_on_sc` with type `bool | None` in function `jax._src.pallas.mosaic.core.CompilerParams.__init__`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-argument-type",
+      "concise_description": "Unpacked keyword argument `int` is not assignable to parameter `needs_layout_passes` with type `bool` in function `jax._src.pallas.mosaic.core.CompilerParams.__init__`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-argument-type",
+      "concise_description": "Unpacked keyword argument `int` is not assignable to parameter `fuse_transposed_lhs_in_matmul` with type `bool` in function `jax._src.pallas.mosaic.core.CompilerParams.__init__`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-argument-type",
+      "concise_description": "Unpacked keyword argument `int` is not assignable to parameter `opt_level` with type `OptLevel | None` in function `jax._src.pallas.mosaic.core.CompilerParams.__init__`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/mla_dcp.py",
+      "name": "bad-argument-type",
+      "concise_description": "Argument `Array | int` is not assignable to parameter `x` with type `Array` in function `jax._src.pallas.primitives.multiple_of`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/mla_dcp.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of class `DcpAttention` has no attribute `_attend_chunked`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/mla_dcp.py",
+      "name": "unsupported-operation",
+      "concise_description": "`/` is not supported between `None` and `Array`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/paged.py",
+      "name": "bad-unpacking",
+      "concise_description": "Cannot unpack tuple[Array, tuple[Any, Any, Any, Any]] | tuple[Array, Any, tuple[Any, Any, Any, Any]] (of size 2) into 3 values"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/paged.py",
+      "name": "bad-unpacking",
+      "concise_description": "Cannot unpack tuple[Array, tuple[Any, Any, Any, Any]] | tuple[Array, Any, tuple[Any, Any, Any, Any]] (of size 3) into 2 values"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/runtime_shim/backend.py",
+      "name": "missing-module-attribute",
+      "concise_description": "Could not import `program` from `vllm_torchtpu.models.kimi_k3.megakernel`"
+    },
+    {
       "path": "src/vllm_torchtpu/models/vllm/deepseek_v4/attention.py",
       "name": "bad-assignment",
       "concise_description": "`(*args: Unknown, **kwargs: Unknown) -> None` is not assignable to attribute `Event` with type `type[Event]`"
@@ -1554,11 +4039,6 @@
       "path": "src/vllm_torchtpu/worker/tpu_worker.py",
       "name": "missing-attribute",
       "concise_description": "Object of class `TPUModelRunner` has no attribute `_sync_weights`"
-    },
-    {
-      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/runtime_shim/backend.py",
-      "name": "missing-module-attribute",
-      "concise_description": "Could not import `program` from `vllm_torchtpu.models.kimi_k3.megakernel`"
     }
   ]
 }
