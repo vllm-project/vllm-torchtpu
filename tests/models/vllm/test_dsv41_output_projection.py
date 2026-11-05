@@ -148,9 +148,14 @@ def test_project_out_dispatch(monkeypatch, tokens, generation, fused):
     for module in (oa, ob, fo):
         monkeypatch.setattr(module, "get_tpu_version", lambda: generation)
     # make_jaxpr reuses jit's trace cache, which would replay another
-    # generation's dispatch for the same shapes.
+    # generation's dispatch for the same shapes. Clear it after tracing too:
+    # a faked generation's trace left behind would replace the real one in
+    # later tests (wo_a_projection at T=288 then misses its buffered kernel).
     jax.clear_caches()
-    graph = str(jax.make_jaxpr(_project_out)(*_abstract_inputs(tokens)))
+    try:
+        graph = str(jax.make_jaxpr(_project_out)(*_abstract_inputs(tokens)))
+    finally:
+        jax.clear_caches()
     # The fused kernel replaces both buffered kernels; the other shapes run
     # the unspecialized chain.
     assert ("fused_output_projection" in graph) is fused
