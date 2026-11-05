@@ -967,18 +967,22 @@ class Engram(upstream.Engram):
         else:
             embedded = self.embed(hash_ids)
         kv = self.wkv(embedded.flatten(-2))
-        keys = (
-            kv[:, : self.hc_mult * self.dim]
-            .unflatten(-1, (self.hc_mult, self.dim))
-            .float()
-        )
         values = kv[:, self.hc_mult * self.dim :].float()
-        hidden = hidden_states.float()
-        dot = (hidden * self.q_weight * self.k_weight * keys).sum(-1)
-        dot *= torch.rsqrt(hidden.square().mean(-1) + self.eps)
-        dot *= torch.rsqrt(keys.square().mean(-1) + self.eps) * self.dim**-0.5
-        gate_input = dot.abs().clamp(min=self.clamp_value).sqrt()
-        gate = torch.where(dot < 0, -gate_input, gate_input).sigmoid()
-        if token_mask is not None:
-            gate = gate * token_mask[:, None]
-        return (hidden + gate[:, :, None] * values[:, None, :]).to(hidden_states.dtype)
+        # One HC stream at a time, as column slices of the flat [T, hc * dim]
+        # rows: the FP32 [T, hc, dim] view costs XLA a relayout copy of the
+        # whole residual (~65 us per call at 288 tokens).
+        rows = hidden_states.flatten(1)
+        outputs = []
+        for m in range(self.hc_mult):
+            columns = slice(m * self.dim, (m + 1) * self.dim)
+            hidden = rows[:, columns].float()
+            keys = kv[:, columns].float()
+            dot = (hidden * self.q_weight[m] * self.k_weight[m] * keys).sum(-1)
+            dot *= torch.rsqrt(hidden.square().mean(-1) + self.eps)
+            dot *= torch.rsqrt(keys.square().mean(-1) + self.eps) * self.dim**-0.5
+            gate_input = dot.abs().clamp(min=self.clamp_value).sqrt()
+            gate = torch.where(dot < 0, -gate_input, gate_input).sigmoid()
+            if token_mask is not None:
+                gate = gate * token_mask
+            outputs.append((hidden + gate[:, None] * values).to(hidden_states.dtype))
+        return torch.cat(outputs, dim=1).view_as(hidden_states)
