@@ -80,6 +80,64 @@ DEFAULT_LANES: tuple[str, ...] = ("verify", "integration", "tests")
 LANE_FILES: Mapping[str, tuple[str, ...]] = {
     "tests": (".buildkite/pipeline_tests.yml", ".buildkite/pipeline_tests_cpu.yml"),
 }
+
+
+@dataclass(frozen=True)
+class TpuGeneration:
+    """The upload-time variables a TPU generation fills a TPU file in with.
+
+    A file in TPU_GENERATION_FILES reads them when it is uploaded: its shapes,
+    its group name, a prefix on each step's label and key, and soft_fail. The
+    prefixes keep one generation's keys apart from another's, since Buildkite
+    rejects a duplicate key, and its labels too, since GitHub names a step's
+    commit status after its label.
+    """
+
+    name: str
+    shape_single: str
+    shape_multi: str
+    label_prefix: str
+    key_prefix: str
+    soft_fail: bool
+
+    def upload_env(self) -> dict[str, str]:
+        return {
+            "TPU_GENERATION": self.name,
+            "KUBE_SHAPE_SINGLE": self.shape_single,
+            "KUBE_SHAPE_MULTI": self.shape_multi,
+            "TPU_LABEL_PREFIX": self.label_prefix,
+            "TPU_KEY_PREFIX": self.key_prefix,
+            "TPU_SOFT_FAIL": "true" if self.soft_fail else "false",
+        }
+
+
+# v7x keeps the labels and keys its steps had before v6e ran beside it, so its
+# GitHub statuses and the keys the nightly report checks stay the same. v6e
+# soft-fails while remaining v7x-assumed tests (such as two-TensorCore single-
+# chip or v7x-only chip-budget assumptions) are audited on v6e.
+TPU_V7X = TpuGeneration(
+    name="v7x",
+    shape_single="tpu7x-standard-1t/1x1x1",
+    shape_multi="tpu7x-standard-4t/2x2x1",
+    label_prefix="",
+    key_prefix="",
+    soft_fail=False,
+)
+TPU_V6E = TpuGeneration(
+    name="v6e",
+    shape_single="ct6e-standard-1t/1x1",
+    shape_multi="ct6e-standard-8t/2x4",
+    label_prefix="v6e ",
+    key_prefix="tpu6e_",
+    soft_fail=True,
+)
+# The TPU generations a file's TPU steps run on, side by side. The file goes up
+# once per generation in this order, so the last one shows (and queues) first;
+# a file not named here goes up once, as it is.
+TPU_GENERATION_FILES: Mapping[str, tuple[TpuGeneration, ...]] = {
+    ".buildkite/pipeline_tests.yml": (TPU_V6E, TPU_V7X),
+}
+
 DEFAULT_INTEGRATION_SLUG = "vllm-torchtpu-integration"
 DEFAULT_DEV_PIPELINE_FILE = ".buildkite/pipeline_dev.yml"
 VLLM_UPSTREAM_REPO = "https://github.com/vllm-project/vllm.git"
@@ -380,6 +438,16 @@ def resolve_vllm_commit_hash(base_hash: str, override: str) -> str:
 def files_for_lane(lane: str) -> tuple[str, ...]:
     """Return the pipeline files lane `lane` uploads, in upload order."""
     return LANE_FILES.get(lane, (f".buildkite/pipeline_{lane}.yml",))
+
+
+def upload_envs(path: str) -> tuple[dict[str, str], ...]:
+    """Return the extra variables of each upload of `path`, in upload order.
+
+    A file in TPU_GENERATION_FILES goes up once per TPU generation, with that
+    generation's variables; any other file goes up once, with none.
+    """
+    generations = TPU_GENERATION_FILES.get(path, ())
+    return tuple(generation.upload_env() for generation in generations) or ({},)
 
 
 def plan_uploads(
@@ -891,17 +959,19 @@ def run_bootstrap(
         raise BootstrapError(upload_plan.invalid_ci_lanes_error)
 
     for lane_file in upload_plan.lane_files:
-        print(f"Uploading {lane_file}")
-        upload_with_priority(
-            lane_file,
-            repo_root=repo_root,
-            job_priority=priority_plan.job_priority,
-            nightly=upload_plan.nightly,
-            pr_tpu_concurrency_group=priority_plan.pr_tpu_concurrency_group,
-            pr_tpu_jobs_per_author=ctx.pr_tpu_jobs_per_author,
-            env=child_env,
-            effects=effects,
-        )
+        for extra_env in upload_envs(lane_file):
+            suffix = f" for TPU {extra_env['TPU_GENERATION']}" if extra_env else ""
+            print(f"Uploading {lane_file}{suffix}")
+            upload_with_priority(
+                lane_file,
+                repo_root=repo_root,
+                job_priority=priority_plan.job_priority,
+                nightly=upload_plan.nightly,
+                pr_tpu_concurrency_group=priority_plan.pr_tpu_concurrency_group,
+                pr_tpu_jobs_per_author=ctx.pr_tpu_jobs_per_author,
+                env={**child_env, **extra_env},
+                effects=effects,
+            )
 
     if upload_plan.missing_ci_lanes_error is not None:
         raise BootstrapError(upload_plan.missing_ci_lanes_error)

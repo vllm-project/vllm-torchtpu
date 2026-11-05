@@ -6,7 +6,14 @@ through `.buildkite/kubernetes/run.sh`.
 
 The `tests` lane is two files. `pipeline_tests_cpu.yml` runs the type check and
 unmarked unit tests in `tests/` in CPU pods, and `pipeline_tests.yml` runs
-tests marked `tpu_test` (or `multichip`) on TPU v7x slices (1x1x1 and 2x2x1).
+tests marked `tpu_test` (or `multichip`) on TPU v7x slices (1x1x1 and 2x2x1)
+and, side by side, the same tests on TPU v6e slices (1x1 and 2x4): bootstrap
+uploads it once per generation in `TPU_GENERATION_FILES`. The v6e steps carry a
+`v6e`/`tpu6e_` prefix on their labels and keys, the v7x ones keep their names,
+and the v6e steps soft-fail until the tests that fail rather than skip on v6e
+skip there. A new TPU step takes the `${TPU_LABEL_PREFIX:-}` and
+`${TPU_KEY_PREFIX:-}` prefixes, or the second generation's upload is rejected
+for a duplicate key.
 PR steps exclude `nightly` tests; nightly steps include them. Both use the CI
 image built by `pipeline_build.yml`. The CPU steps set `JAX_PLATFORMS=cpu` so
 JAX does not look for a TPU.
@@ -24,11 +31,11 @@ perf steps take. The integration pipeline also runs the lane, because its LKG
 promotion waits on two of its steps.
 
 A PR labeled `skip-tpu-ci` (it still needs `ready`) runs only the `tests` lane
-and the image build, and the lane's `Unit Tests on TPU` group is skipped through
-`SKIP_TPU_CI`, so what runs is the type check and the CPU unit tests. The
-post-merge build of such a PR does the same: `bootstrap.sh` reads the merged
-PR's labels from GitHub. Keep TPU steps of the `tests` lane inside that group,
-and its CPU steps in `pipeline_tests_cpu.yml`.
+and the image build, and the lane's `Unit Tests on TPU` groups are skipped
+through `SKIP_TPU_CI`, so what runs is the type check and the CPU unit tests.
+The post-merge build of such a PR does the same: `bootstrap.sh` reads the
+merged PR's labels from GitHub. Keep TPU steps of the `tests` lane inside that
+group, and its CPU steps in `pipeline_tests_cpu.yml`.
 
 Releases and nightly images are published by the `vllm-torchtpu-release`
 pipeline in the TPU Release cluster; [`release/README.md`](https://github.com/vllm-project/vllm-torchtpu/blob/main/.buildkite/release/README.md)

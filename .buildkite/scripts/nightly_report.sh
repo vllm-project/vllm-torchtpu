@@ -32,7 +32,10 @@ meta() {
 }
 
 # Every tests-lane step a nightly runs (every key but the (PR) ones') passed,
-# from both of the lane's files: the CPU steps and the TPU steps.
+# from both of the lane's files: the CPU steps and the TPU steps. The TPU keys
+# are read as v7x's upload names them, with an empty ${TPU_KEY_PREFIX}; the v6e
+# steps soft-fail until their tests skip what v6e cannot run, so they do not
+# hold back a pair.
 # A step the report did not wait for may have no outcome yet, which counts as
 # not passed: a nightly test missing from the step's depends_on can stop a
 # pair being recorded, never let one through.
@@ -45,7 +48,7 @@ tests_lane_passed() {
     if [[ "${outcome}" != "passed" ]]; then
       passed=false
     fi
-  done < <(grep -hoE '^[[:space:]]*key:[[:space:]]*"?[A-Za-z0-9_-]+' "${files[@]}" | sed -E 's/.*key:[[:space:]]*"?//' | grep -v '_pr$')
+  done < <(sed -E 's/[$][{]TPU_KEY_PREFIX:-[}]//' "${files[@]}" | grep -oE '^[[:space:]]*key:[[:space:]]*"?[A-Za-z0-9_-]+' | sed -E 's/.*key:[[:space:]]*"?//' | grep -v '_pr$')
   [[ "${passed}" == true ]]
 }
 
