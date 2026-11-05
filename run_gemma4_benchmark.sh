@@ -65,6 +65,9 @@ vllm serve RedHatAI/gemma-4-26B-A4B-it-FP8-Dynamic \
     --mm-processor-kwargs '{"size":{"longest_edge":262144,"shortest_edge":3136}}' \
     --compilation-config '{"cudagraph_mm_encoder":true,"encoder_cudagraph_max_vision_items_per_batch":8,"encoder_cudagraph_max_frames_per_batch":8}' \
     --disable-chunked-mm-input \
+    --max-model-len 4096 \
+    --max-num-batched-tokens 16384 \
+    --kv-cache-dtype fp8 \
     --max-num-seqs 512 \
     --block-size 256 \
     --hf-overrides '{"allow_global_per_layer_attribute_access": true, "text_config": {"allow_global_per_layer_attribute_access": true}}' \
@@ -92,8 +95,8 @@ vllm bench serve \
     --backend openai-chat \
     --model RedHatAI/gemma-4-26B-A4B-it-FP8-Dynamic \
     --dataset-name random-mm \
-    --num-prompts 64 \
-    --num-warmups 4 \
+    --num-prompts 320 \
+    --num-warmups 16 \
     --endpoint /v1/chat/completions \
     --base-url http://localhost:8000 \
     --random-mm-bucket-config '{(512, 512, 1): 1.0}' \
