@@ -122,6 +122,7 @@ if TYPE_CHECKING:
     TPU_ROPE_CACHE_TRUNCATE: bool = False
     TPU_ROPE_CACHE_ROW_MAJOR: bool = False
     TPU_MOE_HASH_TABLE_ROW_MAJOR: bool = False
+    TPU_NORM_WEIGHTS_FP32: bool = True
     TPU_PARALLEL_PRECOMPILE: bool = False
     TPU_PRECOMPILE_BIGGEST_FIRST: bool = False
     TPU_PRECOMPILE_PEER_REPLAY: bool = False
@@ -210,6 +211,8 @@ if TYPE_CHECKING:
     VLLM_TPU_SRPT_MAX_CONSECUTIVE_HOLDS: int = 8
     VLLM_TPU_SRPT_ATTN_WORK_CAP: int = 0
     VLLM_TPU_SRPT_ATTN_TILE_TOKENS: int = 32
+    VLLM_TPU_SOLO_PREFILL_OVER_TOKENS: int = 0
+    VLLM_TPU_DP_LB_EXACT_INFLIGHT: bool = False
 
 
 def env_with_choices(
@@ -891,6 +894,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_MOE_HASH_TABLE_ROW_MAJOR": env_bool(
         "TPU_MOE_HASH_TABLE_ROW_MAJOR", default=False
     ),
+    # Store learned RMSNorm weights in float32 at load (runner/utils.py
+    # upcast_norm_weights) to avoid per-step bf16 -> fp32 conversions in the
+    # TPU rms_norm providers.
+    "TPU_NORM_WEIGHTS_FP32": env_bool("TPU_NORM_WEIGHTS_FP32", default=True),
     # Extra token buckets added to the default list of buckets.
     "TPU_TOKEN_BUCKET_EXTRA": lambda: [
         int(v) for v in os.getenv("TPU_TOKEN_BUCKET_EXTRA", "").split(",") if v.strip()
@@ -1283,6 +1290,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_TPU_SRPT_ATTN_TILE_TOKENS": env_nonnegative_int(
         "VLLM_TPU_SRPT_ATTN_TILE_TOKENS", 32
     ),
+    # PrefillFirstScheduler (installed when > 0): waiting requests with more
+    # than this many tokens to compute (none computed yet) run whole and alone
+    # in a dedicated solo step, while regular steps schedule at most this many
+    # tokens (0 disables).
+    "VLLM_TPU_SOLO_PREFILL_OVER_TOKENS": env_nonnegative_int(
+        "VLLM_TPU_SOLO_PREFILL_OVER_TOKENS", 0
+    ),
+    # With data parallelism and --api-server-count=1, rank DP engines by the
+    # API server's exact in-flight counts instead of the DP coordinator's
+    # periodic snapshot (core/dp_lb_exact_inflight.py).
+    "VLLM_TPU_DP_LB_EXACT_INFLIGHT": env_bool("VLLM_TPU_DP_LB_EXACT_INFLIGHT", False),
 }
 
 

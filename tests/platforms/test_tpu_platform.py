@@ -1579,3 +1579,30 @@ def test_a_bad_peer_wait_fails_at_startup(monkeypatch, wait):
     monkeypatch.setenv("TPU_PRECOMPILE_PEER_WAIT_S", wait)
     with pytest.raises(ValueError, match="TPU_PRECOMPILE_PEER_WAIT_S"):
         _validate_peer_replay_config()
+
+
+def test_configure_prefill_first_scheduler(monkeypatch):
+    from types import SimpleNamespace
+
+    from vllm_torchtpu.core.experimental.prefill_first_scheduler import SCHEDULER_CLS
+    from vllm_torchtpu.platforms import tpu_platform
+
+    monkeypatch.setattr(tpu_platform.envs, "VLLM_TPU_SOLO_PREFILL_OVER_TOKENS", 0)
+    off_cfg = SimpleNamespace(scheduler_config=SimpleNamespace(scheduler_cls=None))
+    tpu_platform._configure_prefill_first_scheduler(off_cfg)
+    assert off_cfg.scheduler_config.scheduler_cls is None
+
+    monkeypatch.setattr(tpu_platform.envs, "VLLM_TPU_SOLO_PREFILL_OVER_TOKENS", 8192)
+    on_cfg = SimpleNamespace(scheduler_config=SimpleNamespace(scheduler_cls=None))
+    tpu_platform._configure_prefill_first_scheduler(on_cfg)
+    assert on_cfg.scheduler_config.scheduler_cls == SCHEDULER_CLS
+
+    monkeypatch.setattr(tpu_platform.envs, "DP_SCHED_ENABLED", True)
+    conflict_cfg = SimpleNamespace(
+        scheduler_config=SimpleNamespace(
+            scheduler_cls="vllm_torchtpu.core.tpu_scheduler.TpuDpScheduler"
+        ),
+        parallel_config=SimpleNamespace(data_parallel_size=4),
+    )
+    with pytest.raises(ValueError, match="DP_SCHED_ENABLED=1 installs it"):
+        tpu_platform._configure_prefill_first_scheduler(conflict_cfg)

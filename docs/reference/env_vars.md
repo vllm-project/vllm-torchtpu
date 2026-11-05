@@ -21,6 +21,7 @@ At startup, `vllm-torchtpu` reports set environment variables that neither vLLM 
 | `TORCH_TPU_MP_RENDEZVOUS_PORT` | `None` | Optional explicit TCP port for multi-host `mp` `TCPStore` rendezvous. |
 | `TPU_ACCELERATOR_TYPE` | `None` | Explicit accelerator type override (e.g., `"tpu7x"`, `"v6e-8"`) when running offline compilation or CPU tests. |
 | `TPU_LIBRARY_PATH` | `None` | `libtpu.so` loaded by the TPU runtime. `import libtpu` sets it to the pip package's own library. A custom path (any other file) takes precedence over an installed `libtpu` package: a fingerprint of that file replaces the package version in the compile and Raiden layout cache keys, and the minimum libtpu version check is skipped. |
+| `TPU_NORM_WEIGHTS_FP32` | `True` | Stores learned `RMSNorm` weights in float32 at load time, avoiding a per-norm weight conversion op on every step when norms run through the TPU `rms_norm` providers. |
 
 ---
 
@@ -32,6 +33,8 @@ At startup, `vllm-torchtpu` reports set environment variables that neither vLLM 
 | `VLLM_TPU_SRPT_MAX_CONSECUTIVE_HOLDS` | `8` | Consecutive `schedule()` steps a running prefill chunk may go without getting at least one KV block of tokens in `SrptPrefillScheduler` (held back or crowded out by shorter prefills) before it moves ahead of the other prefill chunks and is no longer held until it gets a block (`0` disables hold-back). |
 | `VLLM_TPU_SRPT_ATTN_WORK_CAP` | `0` | In `SrptPrefillScheduler`, cap on a step's attention work (`sum(n * (c + n / 2))` over scheduled chunks with `n` new tokens after `c` computed ones); while this rank decodes, or another DP rank decodes under EP lockstep (`DP > 1` with expert parallel), prefill chunks are shrunk to stay under it (`0` disables). |
 | `VLLM_TPU_SRPT_ATTN_TILE_TOKENS` | `32` | In `SrptPrefillScheduler`, a chunk shrunk by `VLLM_TPU_SRPT_ATTN_WORK_CAP` ends on a multiple of this many tokens, rounded down (the attention kernel's query tile). |
+| `VLLM_TPU_SOLO_PREFILL_OVER_TOKENS` | `0` | Opt-in; installs `PrefillFirstScheduler` and caches request prompt rows as NumPy arrays on the runner. Waiting requests with more than this many tokens to compute (none computed yet, no encoder inputs) are prefilled whole in a dedicated solo step without reading the prefix cache while running requests sit that step out; regular steps schedule at most this many tokens and hold back waiting requests from the first solo-eligible prompt onward (`0` disables). |
+| `VLLM_TPU_DP_LB_EXACT_INFLIGHT` | `False` | Opt-in (`--api-server-count=1` only). Ranks data-parallel engines in `DPLBAsyncMPClient` by the API server's exact in-flight request counts rather than the DP coordinator's periodic snapshot. |
 | `TPU_PP_DYNAMIC_CHUNKS` | `True` | Dynamically sizes microbatch chunks in Pipeline Parallelism (`--pipeline-parallel-size`). |
 | `TPU_PP_CHUNK_SLACK` | `0.1` | Slack ratio for dynamic pipeline-parallel chunk sizing. |
 | `TPU_PP_HANDOFF` | `wave` | How pipeline stages hand activations on: `wave` launches one collective on every stage per forward; `ring` sends each forward's output point to point to the next stage as soon as it is done (needs libtpu 0.0.50 or later with torch_tpu 0.2.0 or later). |
