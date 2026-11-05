@@ -140,17 +140,24 @@ def sparse_attention(
         )
     block_size = page_size(kv_cache)
     selected = selected[:, 0]
-    pages = block_tables_2d[seq_id[:, None], jnp.maximum(selected, 0)]
-    pages = jnp.where((selected >= 0) & valid[:, None], pages, -1)
+    # Page keys (seq * pages_per_seq + block): the kernel translates them to
+    # physical pages in its page fetch, which saves a [T, topk] gather of the
+    # block table (0.87 ms per layer at T=8192 on the v14 twin, j-30e45a15).
+    pages_per_seq = block_tables_2d.shape[1]
+    keys = jnp.where(
+        (selected >= 0) & valid[:, None], seq_id[:, None] * pages_per_seq + selected, -1
+    )
+    local_key = jnp.where(valid, seq_id * pages_per_seq + pos // block_size, -1)
     return msa_attention.msa_sparse_attention(
         q,
         kv_cache,
-        pages,
-        jnp.where(valid, token_pages, -1),
+        keys,
+        local_key,
         pos % block_size + 1,
         sm_scale=sm_scale,
         block_q=msa_attention.DEFAULT_BLOCK_Q,
         pages_per_step=msa_attention.DEFAULT_PAGES_PER_STEP,
+        page_table=block_tables_2d.reshape(-1),
         interpret=interpret,
     )
 

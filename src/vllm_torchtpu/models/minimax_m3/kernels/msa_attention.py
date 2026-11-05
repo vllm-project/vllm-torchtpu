@@ -182,8 +182,9 @@ def _bitcast_slots(rows_per_page: int, packing: int) -> jax.Array:
 
 def _kernel_v2(
     # Scalar prefetch
-    work_page_ref,  # [groups * G] page of each group slot, -1 for none
+    work_page_ref,  # [groups * G] page (or page key) of each slot, -1 for none
     work_meta_ref,  # [groups] tile << _TILE_SHIFT | last and first bits
+    page_table_ref,  # page key -> physical page (read by the index maps only)
     # In
     q_ref,  # [H, Bq, D]
     selected_ref,  # [Bq, K] physical pages, -1 padded
@@ -322,6 +323,7 @@ def _attention_call(
     block_q,
     pages_per_step,
     kernel,
+    page_table,
     interpret,
 ):
     """One kernel call over a token count that is a multiple of block_q."""
@@ -330,6 +332,12 @@ def _attention_call(
     topk = selected.shape[1]
     pages, meta, num_groups = _work_list(selected, block_q, pages_per_step)
     prefetch = [pages, meta]
+    if kernel == "v2":
+        prefetch.append(
+            jnp.zeros((1,), jnp.int32) if page_table is None else page_table
+        )
+    elif page_table is not None:
+        raise NotImplementedError("page_table needs kernel v2")
 
     def tile_block(w, pages, meta, *_):
         return (meta[w] >> _TILE_SHIFT, 0)
@@ -338,8 +346,11 @@ def _attention_call(
         return (0, meta[w] >> _TILE_SHIFT, 0)
 
     def page_block(g):
-        def index_map(w, pages, *_):
-            return (jnp.maximum(pages[w * pages_per_step + g], 0), 0, 0, 0)
+        def index_map(w, pages, *rest):
+            page = jnp.maximum(pages[w * pages_per_step + g], 0)
+            if page_table is not None:
+                page = rest[-1][page]
+            return (page, 0, 0, 0)
 
         return pl.BlockSpec((1, rows_per_page, packing, row_width), index_map)
 
@@ -395,6 +406,7 @@ def msa_sparse_attention(
     block_q: int = DEFAULT_BLOCK_Q,
     pages_per_step: int = DEFAULT_PAGES_PER_STEP,
     kernel: str = DEFAULT_KERNEL,
+    page_table: jax.Array | None = None,
     interpret: bool = False,
 ) -> jax.Array:
     """Attention of each token over its selected pages.
@@ -408,6 +420,10 @@ def msa_sparse_attention(
       local_limit: ``[T]`` slots of the local page the token sees.
       kernel: ``"v2"`` (bitcast unpack, one mask select) or the original
         ``"v1"``, kept as the reference arm for benchmarks.
+      page_table: optional flat table from page keys to physical pages. With
+        it, `selected` and `local_page` hold keys (any ids unique per page,
+        e.g. ``seq * pages_per_seq + block``) and only the kernel's page
+        fetch translates them, so no [T, K] gather runs in XLA (v2 only).
     Returns:
       ``[T, H, D]`` outputs; padding tokens get zeros.
     """
@@ -429,6 +445,7 @@ def msa_sparse_attention(
         block_q=block_q,
         pages_per_step=pages_per_step,
         kernel=kernel,
+        page_table=page_table,
         interpret=interpret,
     )
     step = max(block_q, MAX_TOKENS_PER_CALL - MAX_TOKENS_PER_CALL % block_q)
