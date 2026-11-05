@@ -126,7 +126,8 @@ def _mean_hc_streams(hidden_states: torch.Tensor) -> torch.Tensor:
     # XLA MultiOutputFusion otherwise fuses the bf16 mean reduce and f32
     # collapse reduce into a mixed-type tuple reduce fusion that aborts in
     # libtpu FusionEmitter::ComputeWindowConfigInternal at N=2048.
-    streams = hidden_states.float().unbind(dim=1)
+    # Convert each stream slice: the FP32 [T, 4, D] view costs a relayout copy.
+    streams = [stream.float() for stream in hidden_states.unbind(dim=1)]
     acc = streams[0]
     for s in streams[1:]:
         acc = acc + s
