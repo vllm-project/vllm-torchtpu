@@ -332,10 +332,12 @@ def partial_block_scores(
     cu_q_lens: jax.Array,
     num_seqs: jax.Array,
     *,
+    shards: int,
     interpret: bool = False,
 ) -> jax.Array:
     """``[H, T, P]`` per-page maxima of all ``H`` index heads over this
-    rank's keys (``index_q [T, H, D]``).
+    rank's keys (``index_q [T, H, D]``; the cache holds ``1 / shards`` of
+    each page's tokens).
 
     The heads are folded into each request's query rows (request ``s`` owns
     rows ``[H * cu[s], H * cu[s + 1])`` in (head, token) order), so one
@@ -360,10 +362,13 @@ def partial_block_scores(
         .at[rows.reshape(-1)]
         .set(index_q.transpose(1, 0, 2).reshape(-1, head_dim))
     )
+    # block_scores counts a request's pages from its length and the cache's
+    # tokens per page; a shard page holds block_size / shards tokens, so give
+    # it ceil(len / shards) tokens: ceil(ceil(L / S) / (B / S)) = ceil(L / B).
     scores = _block_scores(
         folded[:, None],
         index_cache,
-        seq_lens,
+        -(-seq_lens // shards),
         block_tables,
         num_heads * cu_q_lens,
         num_seqs,
@@ -425,6 +430,7 @@ def msa_write_and_score_sharded(
         block_tables,
         cu_q_lens,
         distribution[2],
+        shards=shards,
         interpret=interpret,
     )
     return kv_cache, index_cache, partial

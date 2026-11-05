@@ -112,7 +112,9 @@ def test_sharded_scores_match_unsharded(q_lens, ctx_lens, shards, dtype):
         )
         np.testing.assert_array_equal(unpack(shard), full_rows[:, rank::shards])
         partial = np.asarray(
-            msa.partial_block_scores(index_q, shard, *meta, interpret=True)
+            msa.partial_block_scores(
+                index_q, shard, *meta, shards=shards, interpret=True
+            )
         )
         combined = partial if combined is None else np.maximum(combined, partial)
 
@@ -122,6 +124,42 @@ def test_sharded_scores_match_unsharded(q_lens, ctx_lens, shards, dtype):
         np.testing.assert_array_equal(
             combined[:, rows, :num_pages], expected[:, rows, :num_pages]
         )
+
+
+@pytest.mark.parametrize("shards", [4, 2])
+def test_shard_scores_count_logical_pages(monkeypatch, shards):
+    """block_scores must see each request's logical page count, not the shard
+    page count (4x more at S = 4): extra page groups write past the scores'
+    padded pages, a TPU bounds-check halt at long contexts."""
+    from vllm_torchtpu.models.minimax_m3.kernels import msa_indexer
+
+    seen = {}
+    real = msa_indexer.block_scores
+
+    def spy(index_q, index_cache, seq_lens, *args, **kwargs):
+        seen["pages"] = -(-np.asarray(seq_lens) // msa.page_size(index_cache))
+        return real(index_q, index_cache, seq_lens, *args, **kwargs)
+
+    monkeypatch.setattr(msa_indexer, "block_scores", spy)
+    seq_lens = np.array([PAGES_PER_SEQ * PAGE, 1, PAGE + 1, 0], np.int32)
+    num_tokens = 4
+    cu_q = np.array([0, 1, 2, 3, 4], np.int32)
+    tables = np.arange(MAX_SEQS * PAGES_PER_SEQ, dtype=np.int32) % NUM_PAGES
+    shard = pack(
+        np.zeros((NUM_PAGES, PAGE // shards, HEAD_DIM), np.float32), jnp.bfloat16
+    )
+    index_q = jnp.zeros((num_tokens, shards, HEAD_DIM), jnp.bfloat16)
+    msa.partial_block_scores(
+        index_q,
+        shard,
+        jnp.asarray(seq_lens),
+        jnp.asarray(tables),
+        jnp.asarray(cu_q),
+        jnp.int32(3),
+        shards=shards,
+        interpret=True,
+    )
+    np.testing.assert_array_equal(seen["pages"], -(-seq_lens // PAGE))
 
 
 @pytest.mark.parametrize("dtype", CACHE_DTYPES)
