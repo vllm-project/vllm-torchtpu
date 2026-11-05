@@ -18,8 +18,11 @@ from __future__ import annotations
 from dataclasses import asdict
 from typing import Any
 
+from .chips import ChipSpec
 from .modules import Dtypes
-from .solver import PoolMeshPlan, ServingPlan
+from .solver import ParetoPoint, PoolMeshPlan, ServingPlan
+
+SOLVE_SCHEMA: str = "vllm_torchtpu.roofline.solve/v1"
 
 
 def pool_cli_args(
@@ -60,6 +63,107 @@ def _format_server_cmd(cli_args: list[str], model: str | None) -> str:
     return f"{prefix} {joined}".strip()
 
 
+def _pool_key(pool: PoolMeshPlan | None) -> tuple | None:
+    """Group layouts by structural parallelism axes that emit distinct serve CLIs."""
+    if pool is None:
+        return None
+    return (
+        pool.topology,
+        pool.tp,
+        pool.dp,
+        pool.ep > 1,
+        pool.pp,
+        pool.pcp,
+        pool.kv_split,
+    )
+
+
+def top_layouts(plan: ServingPlan, k: int = 3) -> tuple[ParetoPoint, ...]:
+    """Select up to k structurally distinct SLO-met layouts spanning Pareto roles."""
+    if k <= 0:
+        return ()
+    best: dict[tuple, ParetoPoint] = {}
+    slo_cands: list[ParetoPoint] = []
+    for pt in plan.candidates:
+        if not pt.slo_met:
+            continue
+        slo_cands.append(pt)
+        key = (pt.mode, _pool_key(pt.prefill_pool), _pool_key(pt.decode_pool))
+        cur = best.get(key)
+        if cur is None or (
+            pt.token_throughput_per_chip,
+            pt.p90_interactivity_tok_s,
+        ) > (
+            cur.token_throughput_per_chip,
+            cur.p90_interactivity_tok_s,
+        ):
+            best[key] = pt
+    ranked = sorted(best.values(), key=lambda p: -p.token_throughput_per_chip)
+    if len(ranked) <= 1 or k < 2:
+        return tuple(ranked[:k])
+    selected = list(ranked[:k])
+    fastest = max(
+        slo_cands,
+        key=lambda p: (p.p90_interactivity_tok_s, p.token_throughput_per_chip),
+    )
+    f_key = (
+        fastest.mode,
+        _pool_key(fastest.prefill_pool),
+        _pool_key(fastest.decode_pool),
+    )
+    sel_keys = [
+        (p.mode, _pool_key(p.prefill_pool), _pool_key(p.decode_pool)) for p in selected
+    ]
+    if f_key not in sel_keys:
+        selected[-1] = fastest
+    elif sel_keys.index(f_key) > 0:
+        selected[sel_keys.index(f_key)] = fastest
+    selected.sort(key=lambda p: -p.token_throughput_per_chip)
+    return tuple(selected)
+
+
+def point_launch_args(
+    pt: ParetoPoint,
+    *,
+    kv_dtype: str = "auto",
+    gpu_memory_utilization: float | None = None,
+    model: str | None = None,
+) -> dict[str, Any]:
+    """Emit ``vllm serve`` CLI flags and commands for a single ParetoPoint."""
+    decode_args = pool_cli_args(
+        pt.decode_pool,
+        kv_dtype=kv_dtype,
+        gpu_memory_utilization=gpu_memory_utilization,
+    )
+    prefill_args = (
+        pool_cli_args(
+            pt.prefill_pool,
+            kv_dtype=kv_dtype,
+            gpu_memory_utilization=gpu_memory_utilization,
+        )
+        if pt.prefill_pool is not None
+        else []
+    )
+    decode_cmd = _format_server_cmd(decode_args, model)
+    if pt.prefill_pool is not None:
+        p_pool = pt.prefill_pool
+        d_pool = pt.decode_pool
+        prefill_cmd = _format_server_cmd(prefill_args, model)
+        commands = [
+            f"# prefill ({p_pool.instances}x {p_pool.topology}): {prefill_cmd}",
+            f"# decode ({d_pool.instances}x {d_pool.topology}): {decode_cmd}",
+        ]
+    else:
+        commands = [decode_cmd]
+
+    return {
+        "mode": pt.mode,
+        "cli_args": decode_args,
+        "prefill_cli_args": prefill_args,
+        "commands": commands,
+    }
+
+
 def emit_launch_args(
     plan: ServingPlan,
     *,
@@ -82,40 +186,77 @@ def emit_launch_args(
             "serving_plan": asdict(plan),
         }
 
-    decode_args = pool_cli_args(
-        rec.decode_pool,
+    launch = point_launch_args(
+        rec,
         kv_dtype=kv_str,
         gpu_memory_utilization=plan.gpu_memory_utilization,
+        model=model,
     )
-    prefill_args = (
-        pool_cli_args(
-            rec.prefill_pool,
-            kv_dtype=kv_str,
-            gpu_memory_utilization=plan.gpu_memory_utilization,
-        )
-        if rec.prefill_pool is not None
-        else []
-    )
-    decode_cmd = _format_server_cmd(decode_args, model)
-    if rec.prefill_pool is not None:
-        p_pool = rec.prefill_pool
-        d_pool = rec.decode_pool
-        prefill_cmd = _format_server_cmd(prefill_args, model)
-        commands = [
-            f"# prefill ({p_pool.instances}x {p_pool.topology}): {prefill_cmd}",
-            f"# decode ({d_pool.instances}x {d_pool.topology}): {decode_cmd}",
-        ]
-    else:
-        commands = [decode_cmd]
-
     return {
-        "mode": rec.mode,
-        "cli_args": decode_args,
-        "prefill_cli_args": prefill_args,
-        "commands": commands,
+        **launch,
         "warnings": warnings,
         "serving_plan": asdict(plan),
     }
+
+
+def build_solve_payload(
+    plan: ServingPlan,
+    *,
+    chip: ChipSpec,
+    dtypes: Dtypes | None = None,
+    model: str | None = None,
+    top_k: int = 3,
+) -> dict[str, Any]:
+    """`solve/v1` JSON payload.
+
+    Includes every ServingPlan key plus schema, provenance, chip, and Top-K.
+    """
+    kv_str = "fp8" if (dtypes is not None and dtypes.kv <= 1.0) else "auto"
+    payload: dict[str, Any] = asdict(plan)
+    payload["schema"] = SOLVE_SCHEMA
+    payload["provenance"] = {
+        "calibrated": False,
+        "basis": "analytical roofline floors; p90 values are modeled, not measured",
+    }
+    payload["chip_spec"] = asdict(chip)
+    payload["model"] = model
+    top_pts = top_layouts(plan, top_k)
+    top1_tput = top_pts[0].token_throughput_per_chip if top_pts else 0.0
+    fastest_idx = (
+        max(
+            range(len(top_pts)),
+            key=lambda i: (
+                top_pts[i].p90_interactivity_tok_s,
+                top_pts[i].token_throughput_per_chip,
+            ),
+        )
+        if len(top_pts) > 1
+        else -1
+    )
+    payload["top_k"] = [
+        {
+            "frontier_role": (
+                "max_throughput"
+                if idx == 0
+                else ("max_interactivity" if idx == fastest_idx else "balanced_knee")
+            ),
+            "margin_vs_rank1_pct": round(
+                100.0
+                * (pt.token_throughput_per_chip - top1_tput)
+                / max(1e-9, top1_tput),
+                2,
+            ),
+            "point": asdict(pt),
+            "launch": point_launch_args(
+                pt,
+                kv_dtype=kv_str,
+                gpu_memory_utilization=plan.gpu_memory_utilization,
+                model=model,
+            ),
+        }
+        for idx, pt in enumerate(top_pts)
+    ]
+    return payload
 
 
 def emit_ceiling_rows(plan: ServingPlan) -> list[dict[str, Any]]:
