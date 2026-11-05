@@ -207,7 +207,15 @@ def native_cache_capacity(cfg, specs=None):
     if bytes_per_block > 0 and max_pool_bytes > 0:
         max_pages = max_pool_bytes // bytes_per_block
         if max_pages > 1:
-            pages = min(pages, max_pages)
+            # Static sizing plans just enough pages for max_num_seqs
+            # full-length requests; the rest of the pool budget is idle HBM.
+            # QWEN4_EXP_STATIC_POOL_FILL=1 spends the whole budget instead,
+            # so the prefix cache holds more than a single batch of requests
+            # (PD prefill: 3945 pages = 8 x 493, 24 GiB of a 49 GiB budget).
+            if _env_int("QWEN4_EXP_STATIC_POOL_FILL", 0) > 0:
+                pages = max(pages, max_pages)
+            else:
+                pages = min(pages, max_pages)
     return pages
 
 
