@@ -41,11 +41,12 @@ def _need_devices(dcp_size):
         pytest.skip(f"needs {dcp_size} devices, have {len(jax.devices())}")
 
 
-def _run(scores, lengths, k, lanes=False):
+def _run(scores, lengths, k, lanes=False, spread_pick=False):
     """scores f32[dcp, b, n], lengths i32[dcp, b] -> i32[dcp, b, k].
 
     `lanes` puts a leading size-1 axis on the mesh, as the served DCP mesh
-    carries for the TP lanes DCP does not shard over.
+    carries for the TP lanes DCP does not shard over. `spread_pick` has every
+    subcore of the owner rank pick its share of the owned rows.
     """
     dcp_size = scores.shape[0]
     devices = np.array(jax.devices()[:dcp_size])
@@ -56,7 +57,13 @@ def _run(scores, lengths, k, lanes=False):
 
     def local(s, ln, bounds):
         return sparsecore_topk_dcp(
-            s[0], k, ln[0], bounds, dcp_size=dcp_size, axis_name=AXIS
+            s[0],
+            k,
+            ln[0],
+            bounds,
+            dcp_size=dcp_size,
+            axis_name=AXIS,
+            spread_pick=spread_pick,
         )[None]
 
     fn = jax.jit(
@@ -122,6 +129,7 @@ def _case(dcp_size, b, n, lo, hi, seed, levels=0, live=None):
 
 
 @pytest.mark.multichip
+@pytest.mark.parametrize("spread_pick", [False, True])
 @pytest.mark.parametrize("dcp_size", [2, 4, 8])
 @pytest.mark.parametrize(
     "b,n,lo,hi,levels,live",
@@ -132,11 +140,11 @@ def _case(dcp_size, b, n, lo, hi, seed, levels=0, live=None):
         (16, 16384, 8000, 16384, 0, None),  # fewer rows than subcores
     ],
 )
-def test_matches_the_global_topk(dcp_size, b, n, lo, hi, levels, live):
+def test_matches_the_global_topk(dcp_size, b, n, lo, hi, levels, live, spread_pick):
     _need_devices(dcp_size)
     k = 512
     scores, lengths = _case(dcp_size, b, n, lo, hi, dcp_size, levels, live)
-    _check(_run(scores, lengths, k), scores, lengths, k)
+    _check(_run(scores, lengths, k, spread_pick=spread_pick), scores, lengths, k)
 
 
 @pytest.mark.multichip
