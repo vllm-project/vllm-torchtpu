@@ -39,9 +39,36 @@ def _xla_write_rows(cache, rows, pages, slots, *, max_runs, interpret=False):
     return cache.at[pages, slots // packing, slots % packing].set(rows, mode="drop")
 
 
+def _small_steps_block_scores(index_q, index_cache, seq_lens, tables, cu_q, n, interp):
+    """`msa._block_scores` with 4 pages per grid step in both tile classes.
+
+    The served defaults (up to 128 pages per step) are far too slow to run
+    in interpret mode on these small tables; the sharding logic does not
+    depend on the step size.
+    """
+    from vllm_torchtpu.models.minimax_m3.kernels import msa_indexer
+
+    return msa_indexer.block_scores(
+        index_q,
+        index_cache,
+        seq_lens,
+        tables,
+        cu_q,
+        n,
+        pages_per_step=4,
+        small_pages_per_step=4,
+        interpret=interp,
+    )
+
+
 @pytest.fixture(autouse=True)
 def _scatter_writes(monkeypatch):
     monkeypatch.setattr(msa_write, "write_rows", _xla_write_rows)
+
+
+@pytest.fixture
+def small_steps(monkeypatch):
+    monkeypatch.setattr(msa, "_block_scores", _small_steps_block_scores)
 
 
 @pytest.mark.parametrize("dtype", CACHE_DTYPES)
@@ -53,6 +80,7 @@ def _scatter_writes(monkeypatch):
         ([4, 4, 4, 4], [1000, 5, 127, 128]),  # spec-decode rows across page ends
     ],
 )
+@pytest.mark.usefixtures("small_steps")
 def test_sharded_scores_match_unsharded(q_lens, ctx_lens, shards, dtype):
     rng = np.random.default_rng(len(q_lens) + shards)
     num_seqs = len(q_lens)
@@ -126,6 +154,7 @@ def test_sharded_scores_match_unsharded(q_lens, ctx_lens, shards, dtype):
         )
 
 
+@pytest.mark.usefixtures("small_steps")
 @pytest.mark.parametrize("shards", [4, 2])
 def test_shard_scores_count_logical_pages(monkeypatch, shards):
     """block_scores must see each request's logical page count, not the shard

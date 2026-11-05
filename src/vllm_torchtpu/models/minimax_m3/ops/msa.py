@@ -200,9 +200,15 @@ def get_msa_sharded_op(
     def _score_fake(
         k, v, index_q, index_k, kv_cache, index_cache, seq_lens, block_tables, *args
     ):
+        # block_scores pads both tile classes to the wider page-group multiple.
         pages_per_seq = block_tables.shape[0] // seq_lens.shape[0]
-        step = msa_indexer.DEFAULT_PAGES_PER_STEP
-        padded_pages = -(-pages_per_seq // step) * step
+        padded_pages = max(
+            -(-pages_per_seq // step) * step
+            for step in (
+                msa_indexer.DEFAULT_PAGES_PER_STEP,
+                msa_indexer.DEFAULT_SMALL_PAGES_PER_STEP,
+            )
+        )
         return (
             torch.empty_like(kv_cache),
             torch.empty_like(index_cache),
