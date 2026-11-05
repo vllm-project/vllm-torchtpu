@@ -824,9 +824,8 @@ class TPUModelRunner(GPUModelRunner):
         # carried in `AttentionMetadata.mamba_state_indices` instead of being
         # derived from the attention `block_tables[:, 0]`. None until
         # get_kv_cache_spec selects the compact layout (and stays None if it
-        # does not, e.g. CPU-only tests or a user-pinned
-        # num_gpu_blocks_override) — in which case mamba and attention share
-        # the uniform `num_blocks` as before.
+        # does not, e.g. a KV connector or CPU-only tests) — in which case
+        # mamba and attention share the uniform `num_blocks` as before.
         self._mamba_num_blocks: int | None = None
         # req_id -> physical mamba slot id, plus the free-slot pool. Slots are
         # allocated when a request first appears and retained until its KV

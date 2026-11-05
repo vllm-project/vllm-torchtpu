@@ -479,29 +479,38 @@ class TestKVCacheManager:
         )
         assert self.runner._mamba_num_blocks == 17
 
+    @pytest.mark.parametrize(
+        "free_gib, warns", [(10, False), (0.25, True)], ids=["fits", "over_budget"]
+    )
     @patch(
         "vllm_torchtpu.runner.tpu_runner.PallasAttentionBackend.get_kv_cache_page_size_bytes",
         return_value=4096,
     )
-    @patch(
-        "vllm_torchtpu.utils.torch.accelerator.get_memory_info",
-        return_value=(10 * 1024 * 1024 * 1024, 10 * 1024 * 1024 * 1024),
-    )
-    def test_user_pinned_count_is_not_resized(self, mock_mem_info, mock_get_page_size):
-        """--num-gpu-blocks-override is kept as given: no compact layout is
-        selected for it, so there is nothing to size after the profile run."""
+    def test_pinned_block_count_keeps_compact_mamba_slots(
+        self, mock_get_page_size, free_gib, warns
+    ):
+        """--num-gpu-blocks-override pins the attention pool; the mamba slots
+        stay compact instead of falling back to the uniform layout (every block
+        padded to the mamba page), and nothing is resized after the profile
+        run. A pin above the measured budget warns."""
+        gib = 1024**3
         layers = {"attn_0": _attention_layer_mock()}
         layers["attn_0"].num_kv_heads = 2
         layers["attn_0"].head_size = 128
         layers.update({f"mamba_{i}": DummyMamba() for i in range(3)})
-        self.runner.cache_config.num_gpu_blocks_override = 1234
+        self.runner.cache_config.num_gpu_blocks_override = 100_000
+        mem = "vllm_torchtpu.utils.torch.accelerator.get_memory_info"
+        with (
+            patch(mem, return_value=(int(free_gib * gib), 10 * gib)),
+            patch("vllm_torchtpu.runner.kv_cache_manager.logger") as log,
+        ):
+            km = self.runner.kv_cache_manager
+            km._update_mamba_page_size_padded(layers)
+            km.size_compact_mamba_kv_cache(km._available_kv_cache_hbm())
 
-        self.runner.kv_cache_manager._update_mamba_page_size_padded(layers)
-        km = self.runner.kv_cache_manager
-        km.size_compact_mamba_kv_cache(km._available_kv_cache_hbm())
-
-        assert self.runner.cache_config.num_gpu_blocks_override == 1234
-        assert self.runner._mamba_num_blocks is None
+        assert self.runner.cache_config.num_gpu_blocks_override == 100_000
+        assert self.runner._mamba_num_blocks == 17
+        assert log.warning.called == warns
 
     @patch(
         "vllm_torchtpu.runner.tpu_runner.PallasAttentionBackend.get_kv_cache_page_size_bytes",
@@ -884,9 +893,14 @@ class TestKVCacheManager:
             assert mamba_spec.page_size_padded == expected_padded_size
 
     @pytest.mark.parametrize(
-        "env_value, uniform_mamba_layout, expect_runner_slot",
-        [(None, False, True), ("0", False, False), (None, True, False)],
-        ids=["compact_default", "opt_out", "uniform_mamba_layout"],
+        "env_value, uniform_mamba_layout, pinned_blocks, expect_runner_slot",
+        [
+            (None, False, None, True),
+            (None, False, 20_000, True),
+            ("0", False, None, False),
+            (None, True, None, False),
+        ],
+        ids=["compact_default", "compact_pinned", "opt_out", "uniform_mamba_layout"],
     )
     @patch("vllm_torchtpu.runner.kv_cache_manager.get_layers_from_vllm_config")
     @patch(
@@ -905,16 +919,19 @@ class TestKVCacheManager:
         monkeypatch,
         env_value,
         uniform_mamba_layout,
+        pinned_blocks,
         expect_runner_slot,
     ):
         """GDN specs reach vLLM as RunnerSlotMambaSpec by default when
-        compact-mamba sizing gave the runner its own GDN slots;
-        TPU_SKIP_MAMBA_SCHEDULER_BLOCKS=0 opts out."""
+        compact-mamba sizing gave the runner its own GDN slots, including under
+        --num-gpu-blocks-override; TPU_SKIP_MAMBA_SCHEDULER_BLOCKS=0 opts
+        out."""
         if env_value is None:
             monkeypatch.delenv("TPU_SKIP_MAMBA_SCHEDULER_BLOCKS", raising=False)
         else:
             monkeypatch.setenv("TPU_SKIP_MAMBA_SCHEDULER_BLOCKS", env_value)
         self.runner._uniform_mamba_layout = uniform_mamba_layout
+        self.runner.cache_config.num_gpu_blocks_override = pinned_blocks
 
         mock_attn = _attention_layer_mock()
         mock_attn.attn_type = AttentionType.DECODER
