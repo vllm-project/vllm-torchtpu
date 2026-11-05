@@ -72,12 +72,11 @@ if TYPE_CHECKING:  # eager imports for type checkers and IDEs
     from .collectives import AllReduceRing
     from .dma import (
         TwoRing,
-        fit_default_tiles,
-        fitted_plan,
         pool_alias,
         stream,
         vmem,
     )
+    from .dma.vmem import fit_default_tiles, fitted_plan
     from .errors import EligibilityResult, MegakernelConfigError, MegakernelLayoutError
     from .exec_spec import DebugOptions, ExecSpec, Tiles, default_tiles
     from .kernel import (

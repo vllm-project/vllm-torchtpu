@@ -11,11 +11,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Core VMEM/SMEM/Semaphore allocator and `StreamParams` / `CommParams` builders."""
+"""VMEM/SMEM/Semaphore scratch allocator, `StreamParams` builder, and tile fitter."""
 
 from __future__ import annotations
 
 import dataclasses
+import logging
 import math
 from dataclasses import dataclass
 from typing import Any
@@ -33,7 +34,29 @@ from ..profiles.default import chip_budget
 from ..spec import ModelSpec, ScratchReq
 from . import pool_alias
 
+logger = logging.getLogger(__name__)
 U8 = jnp.uint8
+
+
+def _vmem_storage_bytes(shape: tuple[int, ...], dtype: Any) -> int:
+    """Return `(8 * packing, 128)`-tiled VMEM storage bytes for `shape`/`dtype`.
+
+    Sublane-packed 32-bit word layouts `(..., rows_u32, packing, cols)` (such as
+    paged KV `(..., HD // 4, 4, BLK)` fp8) already pack `packing` elements per
+    32-bit sublane word along `shape[-3]`, so their physical row extent is
+    `rows_u32 * packing`.
+    """
+    dt = jnp.dtype(dtype)
+    packing = 32 // (dt.itemsize * 8)
+    if not shape:
+        sh2: tuple[int, ...] = (1, 1)
+    elif len(shape) == 1:
+        sh2 = (1, shape[0])
+    elif len(shape) >= 3 and packing > 1 and shape[-2] == packing:
+        sh2 = (*shape[:-3], shape[-3] * shape[-2], shape[-1])
+    else:
+        sh2 = shape
+    return pool_alias.storage_size(sh2, dt)
 
 
 @dataclass(frozen=True)
@@ -156,6 +179,15 @@ def _merge_scratch(
 ) -> None:
     """Merge module `ScratchReq`s into `scratch`, overlaying compatible phases."""
     for r in reqs:
+        ms = getattr(r.spec, "memory_space", None)
+        if ms not in (
+            pltpu.MemorySpace.VMEM,
+            pltpu.MemorySpace.SMEM,
+            pltpu.MemorySpace.SEMAPHORE,
+        ):
+            raise MegakernelConfigError(
+                f"Unsupported scratch spec for {r.name!r}: {r.spec!r}"
+            )
         if r.name not in scratch:
             scratch[r.name] = r.spec
             phase_map[r.name] = r.phase
@@ -163,20 +195,18 @@ def _merge_scratch(
 
         cur_spec = scratch[r.name]
         cur_phase = phase_map[r.name]
+        cur_ms = cur_spec.memory_space
         if (
             r.phase != "persistent"
             and cur_phase != "persistent"
             and r.phase != cur_phase
-            and hasattr(r.spec, "shape")
-            and hasattr(cur_spec, "shape")
-            and getattr(r.spec, "dtype", None) == getattr(cur_spec, "dtype", None)
-            and getattr(r.spec, "memory_space", None)
-            == getattr(cur_spec, "memory_space", None)
+            and ms in (pltpu.MemorySpace.VMEM, pltpu.MemorySpace.SMEM)
+            and ms == cur_ms
+            and r.spec.dtype == cur_spec.dtype
             and len(r.spec.shape) == len(cur_spec.shape)
         ):
             max_shape = tuple(max(a, b) for a, b in zip(cur_spec.shape, r.spec.shape))
-            ms = getattr(cur_spec, "memory_space", pltpu.VMEM)
-            scratch[r.name] = ms(max_shape, cur_spec.dtype)
+            scratch[r.name] = cur_ms(max_shape, cur_spec.dtype)
             phase_map[r.name] = f"{cur_phase}|{r.phase}"
         elif r.spec == cur_spec and r.phase == cur_phase:
             continue
@@ -202,7 +232,10 @@ def build_scratch(
     `ex.tiles=None` uses the default tiles fitted to the model's VMEM budget
     (`fit_default_tiles`).
     """
-    ex = fit_default_tiles(model_spec, ex)
+    if p is not None and ex.tiles is None and p.ex.tiles is not None:
+        ex = p.ex
+    else:
+        ex = fit_default_tiles(model_spec, ex)
     if p is None or p.ex != ex:
         p = plan(model_spec, ex)
     g = model_spec.config
@@ -293,20 +326,25 @@ def build_scratch(
             smem_bytes += math.prod(sh) * jnp.dtype(st.dtype).itemsize
             smem_shapes[k] = (tuple(sh), st.dtype)
     for k, v in scratch.items():
-        if hasattr(v, "shape"):
-            ms_str = str(getattr(v, "memory_space", "")).upper()
-            if "VMEM" in ms_str:
-                vmem_bytes += math.prod(v.shape) * jnp.dtype(v.dtype).itemsize
-                vmem_shapes[k] = (tuple(v.shape), v.dtype)
-            elif "SMEM" in ms_str:
-                smem_bytes += math.prod(v.shape) * jnp.dtype(v.dtype).itemsize
-                smem_shapes[k] = (tuple(v.shape), v.dtype)
+        ms = getattr(v, "memory_space", None)
+        if ms == pltpu.MemorySpace.VMEM:
+            sh = tuple(v.shape)
+            vmem_bytes += _vmem_storage_bytes(sh, v.dtype)
+            vmem_shapes[k] = (sh, v.dtype)
+        elif ms == pltpu.MemorySpace.SMEM:
+            sh = tuple(v.shape)
+            smem_bytes += math.prod(sh) * jnp.dtype(v.dtype).itemsize
+            smem_shapes[k] = (sh, v.dtype)
+        elif ms == pltpu.MemorySpace.SEMAPHORE:
+            continue
+        else:
+            raise MegakernelConfigError(f"Unsupported scratch spec for {k!r}: {v!r}")
 
     vmem_limit_bytes = tiles.vmem_mib * 1024 * 1024
     if vmem_bytes > vmem_limit_bytes:
         breakdown = sorted(
             (
-                (math.prod(sh) * jnp.dtype(dt).itemsize, k, sh, dt)
+                (_vmem_storage_bytes(sh, dt), k, sh, dt)
                 for k, (sh, dt) in vmem_shapes.items()
             ),
             reverse=True,
@@ -405,12 +443,15 @@ def _ring_bytes(core_plan: CorePlan) -> tuple[int, int]:
     """Allocated `(dense, expert)` weight-ring VMEM bytes of `core_plan`."""
     dense = expert = 0
     for k, (sh, dt) in core_plan.vmem_shapes.items():
-        nbytes = math.prod(sh) * jnp.dtype(dt).itemsize
+        nbytes = _vmem_storage_bytes(sh, dt)
         if k == "dpool" or k.startswith("dring_"):
             dense += nbytes
         elif k == "epool" or k.startswith("ering_"):
             expert += nbytes
     return dense, expert
+
+
+_LOGGED_FIT_KEYS: set[tuple[str, int, int, int, int, int, int]] = set()
 
 
 def fit_default_tiles(model_spec: ModelSpec, ex: ExecSpec) -> ExecSpec:
@@ -427,7 +468,8 @@ def fit_default_tiles(model_spec: ModelSpec, ex: ExecSpec) -> ExecSpec:
     """
     if ex.tiles is not None:
         return ex
-    t = exec_spec.default_tiles(ex.B, R=ex.R, chip=chip_budget())
+    t0 = exec_spec.default_tiles(ex.B, R=ex.R, chip=chip_budget())
+    t = t0
     budget = fit_vmem_budget_bytes(t)
     while True:
         probe = dataclasses.replace(
@@ -435,6 +477,32 @@ def fit_default_tiles(model_spec: ModelSpec, ex: ExecSpec) -> ExecSpec:
         )
         core_plan, _ = build_scratch(model_spec, probe)
         if core_plan.vmem_bytes <= budget:
+            if (t.nbd, t.nbe) != (t0.nbd, t0.nbe):
+                log_key = (
+                    model_spec.name,
+                    ex.B,
+                    ex.R,
+                    t0.nbd,
+                    t0.nbe,
+                    t.nbd,
+                    t.nbe,
+                )
+                if log_key not in _LOGGED_FIT_KEYS:
+                    _LOGGED_FIT_KEYS.add(log_key)
+                    logger.info(
+                        "fit_default_tiles shrunk ring depths for ModelSpec %r "
+                        "(B=%d, R=%d): nbd %d->%d, nbe %d->%d "
+                        "(%.2f MiB / %.2f MiB budget)",
+                        model_spec.name,
+                        ex.B,
+                        ex.R,
+                        t0.nbd,
+                        t.nbd,
+                        t0.nbe,
+                        t.nbe,
+                        core_plan.vmem_bytes / (1024 * 1024),
+                        budget / (1024 * 1024),
+                    )
             return dataclasses.replace(ex, tiles=t)
         dense, expert = _ring_bytes(core_plan)
         can_e = expert > 0 and t.nbe > MIN_RING_DEPTH

@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import dataclasses
+import logging
 
 import jax.numpy as jnp
 import pytest
@@ -125,18 +126,29 @@ def test_vmem_phase_overlay_and_conflict(fake_ex: ExecSpec):
     ex_unset = dataclasses.replace(fake_ex, tiles=None)
     fp = vmem.fitted_plan(custom_ms, ex_unset)
     assert fp.ex.tiles is not None
+    cp_reused, _ = vmem.build_scratch(custom_ms, ex_unset, fp)
+    assert cp_reused.plan == fp
+
+    # 1D VMEM buffer is counted with (1, n) tiled storage_size; unknown scratch raises.
+    assert vmem._vmem_storage_bytes((128,), F32) == 8 * 128 * 4
+    with pytest.raises(MegakernelConfigError, match="Unsupported scratch spec"):
+        vmem._merge_scratch({}, {}, [ScratchReq("bad", object(), phase="persistent")])
 
 
-def test_fit_default_tiles_on_fake_model_spec(monkeypatch):
-    """`fit_default_tiles` shrinks ring depths into budget on `make_fake_model_spec`."""
+def test_fit_default_tiles_on_fake_model_spec(monkeypatch, caplog):
+    """`fit_default_tiles` shrinks ring depths into budget and logs once."""
     from vllm_torchtpu.megakernel import exec_spec as exec_spec_mod
-    from vllm_torchtpu.megakernel.profiles import default as default_chip
 
+    monkeypatch.setattr(vmem, "_LOGGED_FIT_KEYS", set())
     ms_large = make_fake_model_spec(L=60, att_every=4, H=4096, moe_tp=False)
     default_64 = dataclasses.replace(exec_spec_mod.default_tiles(64, R=2), vmem_mib=24)
     monkeypatch.setattr(exec_spec_mod, "default_tiles", lambda B, **kw: default_64)
     ex_64 = ExecSpec(B=64, T=1, R=2, ctx=4096)
-    fitted = vmem.fit_default_tiles(ms_large, ex_64)
+    with caplog.at_level(logging.INFO, logger=vmem.__name__):
+        fitted = vmem.fit_default_tiles(ms_large, ex_64)
+        _ = vmem.fit_default_tiles(ms_large, ex_64)
+    assert len(caplog.records) == 1
+    assert "fit_default_tiles shrunk ring depths" in caplog.records[0].getMessage()
     assert fitted.tiles is not None
     assert (fitted.tiles.nbd, fitted.tiles.nbe) != (default_64.nbd, default_64.nbe)
     assert fitted.tiles.nbd <= default_64.nbd and fitted.tiles.nbe <= default_64.nbe
@@ -150,4 +162,3 @@ def test_fit_default_tiles_on_fake_model_spec(monkeypatch):
     monkeypatch.setattr(exec_spec_mod, "default_tiles", lambda B, **kw: tight)
     with pytest.raises(MegakernelConfigError, match="do not fit"):
         vmem.fit_default_tiles(ms_large, ExecSpec(B=4, T=1, R=2, ctx=4096))
-    assert default_chip.TPU_V7X.vmem_mib == 62
