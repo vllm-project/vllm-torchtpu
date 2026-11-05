@@ -26,6 +26,7 @@ import math
 import sys
 from typing import Any
 
+import jax
 import torch
 
 from vllm_torchtpu.logger import init_logger
@@ -36,10 +37,21 @@ _HF_MODULE = "transformers.models.gemma4.modeling_gemma4"
 _ROPE_NDIM = 2
 _ops: dict[str, Any] = {}
 _orig_forward = None
+_orig_init = None
+_OPS_ATTR = "_tpu_qk_norm_rope_ops"
 
 
-def _qk_norm_rope_jax(x, cos, sin, scale, *, num_heads, head_dim, eps):
-    """Module-level so ``pallas.jax_op`` can trace and register it."""
+def _qk_norm_rope_jax(
+    x: jax.Array,
+    cos: jax.Array,
+    sin: jax.Array,
+    scale: jax.Array,
+    *,
+    num_heads: int,
+    head_dim: int,
+    eps: float,
+) -> jax.Array:
+    """Module-level and annotated so ``pallas.jax_op`` can register it."""
     from vllm_torchtpu.kernels.gemma4_vision import qk_norm_rope as lib
 
     return lib.qk_norm_rope(
@@ -82,20 +94,44 @@ def _get_op(num_heads: int, head_dim: int, eps: float):
     return op
 
 
-def _fused_eligible(attn, states: torch.Tensor, cos, position_ids) -> bool:
+def _attach_ops(attn) -> None:
+    """Build the Q and K ops when the layer is constructed.
+
+    ``pallas.jax_op`` cannot be built inside a ``torch.compile`` trace, so the
+    ops are created here, eagerly at model-load time, and stored on the layer
+    (outside the module registry). Layers the kernel does not cover get no ops
+    and keep HF's path.
+    """
+    num_heads = attn.config.num_attention_heads
     head_dim = attn.head_dim
+    norms = (attn.q_norm, attn.k_norm)
+    if (
+        attn.config.num_key_value_heads != num_heads
+        or head_dim % (2 * _ROPE_NDIM) != 0
+        or (num_heads * head_dim) % 128 != 0
+        or not all(getattr(n, "with_scale", False) for n in norms)
+    ):
+        return
+    ops = tuple(_get_op(num_heads, head_dim, float(n.eps)) for n in norms)
+    object.__setattr__(attn, _OPS_ATTR, ops)
+
+
+def _patched_init(self, *args, **kwargs):
+    _orig_init(self, *args, **kwargs)
+    try:
+        _attach_ops(self)
+    except Exception as exc:  # keep HF's path if the op cannot be built
+        logger.warning("Gemma-4 vision fused Q/K norm + RoPE disabled: %s", exc)
+
+
+def _fused_eligible(attn, cos, position_ids) -> bool:
+    """Per-call layout checks; static under tracing."""
     if position_ids is None or position_ids.shape[-1] != _ROPE_NDIM:
         return False
-    if cos.shape[-1] != head_dim or head_dim % (2 * _ROPE_NDIM) != 0:
-        return False
-    if states.shape[-1] % 128 != 0 or states.shape[-1] % head_dim != 0:
-        return False
-    return all(getattr(n, "with_scale", False) for n in (attn.q_norm, attn.k_norm))
+    return cos.shape[-1] == attn.head_dim
 
 
-def _norm_rope(attn, norm, states, cos_tiled, sin_tiled, tokens, hidden_shape):
-    num_heads = states.shape[-1] // attn.head_dim
-    op = _get_op(num_heads, attn.head_dim, float(norm.eps))
+def _norm_rope(op, norm, states, cos_tiled, sin_tiled, tokens, hidden_shape):
     out = op(states.reshape(tokens, -1), cos_tiled, sin_tiled, norm.weight)
     return out.view(hidden_shape)
 
@@ -115,10 +151,9 @@ def _patched_forward(
 
     query_states = self.q_proj(hidden_states)
     key_states = self.k_proj(hidden_states)
-    fused = _fused_eligible(self, query_states, cos, position_ids) and (
-        key_states.shape == query_states.shape
-    )
-    if fused:
+    ops = getattr(self, _OPS_ATTR, None)
+    if ops is not None and _fused_eligible(self, cos, position_ids):
+        q_op, k_op = ops
         tokens = math.prod(input_shape)
         num_heads = query_states.shape[-1] // self.head_dim
         # Same per-token cos/sin in every layer: the compiled graph can share
@@ -126,10 +161,10 @@ def _patched_forward(
         cos_tiled = cos.reshape(tokens, self.head_dim).repeat(1, num_heads)
         sin_tiled = sin.reshape(tokens, self.head_dim).repeat(1, num_heads)
         query_states = _norm_rope(
-            self, self.q_norm, query_states, cos_tiled, sin_tiled, tokens, hidden_shape
+            q_op, self.q_norm, query_states, cos_tiled, sin_tiled, tokens, hidden_shape
         )
         key_states = _norm_rope(
-            self, self.k_norm, key_states, cos_tiled, sin_tiled, tokens, hidden_shape
+            k_op, self.k_norm, key_states, cos_tiled, sin_tiled, tokens, hidden_shape
         )
     else:
         query_states = self.q_norm(query_states.view(hidden_shape))
@@ -168,7 +203,7 @@ setattr(_patched_forward, "_tpu_qk_norm_rope_patched", True)  # noqa: B010
 
 def patch_gemma4_vision_attention() -> None:
     """Install the fused Q/K norm + RoPE forward on ``Gemma4VisionAttention``."""
-    global _orig_forward
+    global _orig_forward, _orig_init
     import vllm_torchtpu.envs as envs
 
     if not envs.TPU_GEMMA4_VISION_FUSED_QK_NORM_ROPE:
@@ -181,6 +216,8 @@ def patch_gemma4_vision_attention() -> None:
     if cls is None or getattr(cls.forward, "_tpu_qk_norm_rope_patched", False):
         return
     _orig_forward = cls.forward
+    _orig_init = cls.__init__
+    cls.__init__ = _patched_init
     cls.forward = _patched_forward
     logger.info(
         "Applied TPU patch: fused Q/K RMSNorm + RoPE kernel for Gemma-4 vision."
