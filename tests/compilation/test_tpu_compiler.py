@@ -1644,69 +1644,21 @@ class TestReloadCompiledExecutable:
         assert torch.equal(fn2(torch.tensor([4])), torch.tensor([32]))
         assert not os.path.exists(artifact_path)
 
-    def test_reload_compiled_fallback_without_orig_graph(self, monkeypatch):
-        """Direct `_reload_compiled` drops `reloaded_entry` on serialized-bytes
-        success and falls back to `graph` when `orig_graph=None`."""
-        global _RELOAD_FAIL_UNPICKLE
-
-        from vllm_torchtpu.compilation import tpu_compiler
-        from vllm_torchtpu.compilation.tpu_compiler import TpuCompilerAdaptor
-
-        monkeypatch.setenv("VLLM_TPU_RELOAD_COMPILED_EXECUTABLE", "1")
-        self._install_fake_tpu_stats(monkeypatch, [0, 1])
-
-        ok_leaf = _ReloadLeafArtifact("direct_ok", 5)
-        ok_entry = _ReloadBundledEntry(_ReloadLoadable(_ReloadSplitArtifact([ok_leaf])))
-        compiler = TpuCompilerAdaptor()
-        graph = torch.fx.symbolic_trace(lambda x: (x * 11,))
-        ok_fn, ok_fb_entry, ok_reloaded = compiler._reload_compiled(
-            lambda x: (ok_leaf(x),),
-            ok_entry,
-            compilations=(0, 1),
-            graph=graph,
-            orig_graph=None,
-            example_inputs=[torch.tensor([2])],
-            was_wrapped=False,
-            saved_path=None,
-        )
-        assert ok_reloaded is True
-        assert ok_fb_entry is None
-        assert torch.equal(ok_fn(torch.tensor([2]))[0], torch.tensor([10]))
-
-        _RELOAD_EVENTS.clear()
-        _RELOAD_FAIL_UNPICKLE = True
-        leaf0 = _ReloadLeafArtifact("direct_0", 3)
-        entry0 = _ReloadBundledEntry(_ReloadLoadable(_ReloadSplitArtifact([leaf0])))
-
-        def fake_backend(graph, example_inputs):
-            leaf1 = _ReloadLeafArtifact("direct_1", 11)
-            return lambda x: (leaf1(x),)
-
-        monkeypatch.setattr(tpu_compiler, "_tpu_backend", fake_backend)
-        fn, fb_entry, reloaded = compiler._reload_compiled(
-            lambda x: (leaf0(x),),
-            entry0,
-            compilations=(0, 1),
-            graph=graph,
-            orig_graph=None,
-            example_inputs=[torch.tensor([2])],
-            was_wrapped=False,
-            saved_path=None,
-        )
-        assert reloaded is False
-        assert fb_entry is None
-        assert "clear_tier1_cache" in _RELOAD_EVENTS
-        assert torch.equal(fn(torch.tensor([2]))[0], torch.tensor([22]))
-
     def test_release_compiled_artifact_dispatches_all_supported_types_and_cycles(
         self,
     ):
-        """`_release_entry_executables` resolves `AsyncCompiledArtifact`, visits
-        shared/cyclic `_SplitCompiledExecutable` nodes once, skips
-        `NoOpCompiledArtifact` and `None`, and clears leaf handles."""
+        """`_release_compiled_artifact` and `_release_entry_executables` resolve
+        `AsyncCompiledArtifact`, visit shared/cyclic `_SplitCompiledExecutable`
+        nodes once, skip `NoOpCompiledArtifact` and `None`, and clear leaves."""
         from vllm_torchtpu.compilation.tpu_compiler import (
+            _release_compiled_artifact,
             _release_entry_executables,
         )
+
+        _release_compiled_artifact(None)
+        direct_leaf = _ReloadLeafArtifact("direct", 1, from_compile_and_load=False)
+        _release_compiled_artifact(direct_leaf)
+        assert direct_leaf.released
 
         shared_leaf = _ReloadLeafArtifact("shared", 2, from_compile_and_load=False)
         async_target = _ReloadLeafArtifact("async_leaf", 3, from_compile_and_load=False)
@@ -1738,6 +1690,8 @@ class TestReloadCompiledExecutable:
         assert isinstance(async_artifact, _ReloadLeafArtifact)
         assert async_artifact.released
         assert _RELOAD_EVENTS == [
+            "clear_runner:direct",
+            "clear_exec:direct",
             "clear_runner:shared",
             "clear_exec:shared",
             "clear_runner:async_leaf",
@@ -1756,23 +1710,26 @@ class TestReloadCompiledExecutable:
             pytest.param(
                 "readonly_exec",
                 AttributeError,
-                None,
+                "Cannot clear read-only",
                 id="readonly-executable-property",
             ),
             pytest.param(
                 "readonly_runner",
                 AttributeError,
-                None,
+                "Cannot clear read-only",
                 id="readonly-fast-runner-property",
             ),
         ],
     )
-    def test_release_compiled_artifact_fails_fast_on_incompatible_artifacts(
+    def test_release_compiled_artifact_fails_fast_without_partial_release(
         self, failure_kind, expected_exc, match
     ):
-        """`_release_compiled_artifact` raises immediately on unknown artifact
-        types or read-only handle descriptors."""
-        from vllm_torchtpu.compilation.tpu_compiler import _release_compiled_artifact
+        """Two-pass validation rejects unknown artifact types or read-only
+        handle properties before mutating earlier leaves in the tree or entry."""
+        from vllm_torchtpu.compilation.tpu_compiler import (
+            _release_compiled_artifact,
+            _release_entry_executables,
+        )
 
         class _ReadOnlyExecArtifact(TorchTpuCompiledExecutable):
             def __init__(self) -> None:
@@ -1790,16 +1747,67 @@ class TestReloadCompiledExecutable:
             def _fast_runner(self) -> object:
                 return "readonly_runner_handle"
 
-        artifacts = {
-            "unsupported_type": SimpleNamespace(
-                _executable=object(), _fast_runner=object()
-            ),
-            "readonly_exec": _ReadOnlyExecArtifact(),
-            "readonly_runner": _ReadOnlyRunnerArtifact(),
-        }
+        def make_bad() -> Any:
+            if failure_kind == "unsupported_type":
+                return SimpleNamespace(_executable=object(), _fast_runner=object())
+            if failure_kind == "readonly_exec":
+                return _ReadOnlyExecArtifact()
+            return _ReadOnlyRunnerArtifact()
 
+        earlier_leaf = _ReloadLeafArtifact("earlier", 2, from_compile_and_load=False)
+        split = _ReloadSplitArtifact([earlier_leaf, make_bad()])
         with pytest.raises(expected_exc, match=match):
-            _release_compiled_artifact(artifacts[failure_kind])
+            _release_compiled_artifact(split)
+        assert not earlier_leaf.released
+        assert _RELOAD_EVENTS == []
+
+        fw_leaf = _ReloadLeafArtifact("fw_ok", 3, from_compile_and_load=False)
+        entry = _ReloadBundledEntry(
+            compiled_fw=_ReloadLoadable(fw_leaf),
+            compiled_bw=_ReloadLoadable(make_bad()),
+        )
+        with pytest.raises(expected_exc, match=match):
+            _release_entry_executables(entry)
+        assert not fw_leaf.released
+        assert _RELOAD_EVENTS == []
+
+    def test_private_torch_tpu_artifact_imports_are_lazy(self, monkeypatch):
+        """Importing `tpu_compiler` does not touch private `torch_tpu` artifact
+        classes until `_release_compiled_artifact` runs."""
+        import importlib.util
+        import sys
+
+        from vllm_torchtpu.compilation import tpu_compiler
+
+        for sym in (
+            "_SplitCompiledExecutable",
+            "AsyncCompiledArtifact",
+            "NoOpCompiledArtifact",
+            "TorchTpuCompiledExecutable",
+        ):
+            assert not hasattr(tpu_compiler, sym)
+
+        monkeypatch.setitem(
+            sys.modules, "torch_tpu._internal.compile.split_compiler", None
+        )
+        monkeypatch.setitem(
+            sys.modules,
+            "torch_tpu._internal.compile.torch_tpu_compiled_executable",
+            None,
+        )
+
+        assert tpu_compiler.__file__ is not None
+        spec = importlib.util.spec_from_file_location(
+            "_isolated_tpu_compiler_lazy_import_check", tpu_compiler.__file__
+        )
+        assert spec is not None and spec.loader is not None
+        isolated_mod = importlib.util.module_from_spec(spec)
+        monkeypatch.setitem(sys.modules, spec.name, isolated_mod)
+        spec.loader.exec_module(isolated_mod)
+        assert hasattr(isolated_mod, "TpuCompilerAdaptor")
+
+        with pytest.raises(ModuleNotFoundError):
+            tpu_compiler._release_compiled_artifact(object())
 
     def test_reload_env_var_registered_for_ray_workers(self):
         """Ray worker propagation copies `TpuPlatform.additional_env_vars`."""
