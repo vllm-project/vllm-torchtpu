@@ -110,14 +110,18 @@ class _RunRecorder:
         files: list[str] | None = None,
         labels: tuple[str, ...] = (),
         mq_marker: tuple[tuple[str, ...], str, str | None] = ((), "", None),
+        fail_git_prefixes: tuple[tuple[str, ...], ...] = (),
     ) -> None:
         self.bp = bp
         self.files = ["src/vllm_torchtpu/envs.py"] if files is None else files
         self.labels = labels
         self.mq_marker = mq_marker
+        self.fail_git_prefixes = fail_git_prefixes
         self.meta: list[tuple[str, str]] = []
         self.annotations: list[tuple[str, str, str]] = []
         self.uploads: list[tuple[str, str, dict[str, str]]] = []
+        self.git_calls: list[tuple[str, ...]] = []
+        self.mq_extras_calls: list[str] = []
         self._current_lane: str | None = None
         self._real_upload = bp.upload_with_priority
 
@@ -168,6 +172,9 @@ class _RunRecorder:
         env: Mapping[str, str] | None = None,
         cwd: pathlib.Path = _REPO_ROOT,
     ) -> subprocess.CompletedProcess[str]:
+        self.git_calls.append(args)
+        if any(args[: len(p)] == p for p in self.fail_git_prefixes):
+            return subprocess.CompletedProcess(args, 1, stdout="")
         if args[:1] == ("ls-remote",):
             return subprocess.CompletedProcess(args, 0, stdout="upstream999\tHEAD\n")
         if args[:1] in (("diff",), ("diff-tree",)):
@@ -184,6 +191,7 @@ class _RunRecorder:
     def merge_queue_pr_extras(
         self, pr_number: str, *, env: Mapping[str, str] | None = None
     ) -> tuple[tuple[str, ...], str, str | None]:
+        self.mq_extras_calls.append(pr_number)
         return self.mq_marker
 
 
@@ -219,9 +227,16 @@ class TestBootstrapUnits(unittest.TestCase):
         files: list[str] | None = None,
         labels: tuple[str, ...] = (),
         mq_marker: tuple[tuple[str, ...], str, str | None] = ((), "", None),
+        fail_git_prefixes: tuple[tuple[str, ...], ...] = (),
     ) -> _RunRecorder:
         bp = self.bp
-        rec = _RunRecorder(bp, files=files, labels=labels, mq_marker=mq_marker)
+        rec = _RunRecorder(
+            bp,
+            files=files,
+            labels=labels,
+            mq_marker=mq_marker,
+            fail_git_prefixes=fail_git_prefixes,
+        )
         with (
             mock.patch.object(bp, "_agent", side_effect=rec.agent),
             mock.patch.object(bp, "_git", side_effect=rec.git),
@@ -452,35 +467,82 @@ class TestBootstrapUnits(unittest.TestCase):
             ctx({"BUILDKITE_BRANCH": "feature/foo"}).merge_queue_pr_number
         )
 
-        # `/ci merge` bot marker parser.
+        # `/ci merge` bot marker parser (trusts only github-actions[bot], whole-line
+        # markers, non-empty actor for non-empty extras, and comments >= head commit).
         with self.assertRaises(ValueError):
             bp.parse_merge_queue_comments_page({"not": "a-list"})
+        gh_bot = {"type": "Bot", "login": "github-actions[bot]"}
         comments = [
             {"user": {"type": "User"}, "body": "<!-- ci-merge-extras: perf-eval -->"},
             {
-                "user": {"type": "Bot"},
+                "user": {"type": "Bot", "login": "other-app[bot]"},
                 "body": (
+                    "<!-- ci-merge-extras: precheck-only -->\n"
+                    "<!-- ci-merge-actor: mallory -->"
+                ),
+            },
+            {
+                "user": gh_bot,
+                "body": (
+                    ":x: `/ci help` takes no extra arguments "
+                    "(got `<!--ci-merge-extras:precheck-only-->`)."
+                ),
+            },
+            {
+                "user": gh_bot,
+                "body": "<!-- ci-merge-extras: precheck-only -->",
+            },
+            {
+                "user": gh_bot,
+                "created_at": "2026-11-05T10:05:00Z",
+                "body": (
+                    "Queued.\n\n"
                     "<!-- ci-merge-extras: perf-eval, nightly-suite -->\n"
                     "<!-- ci-merge-actor: alice -->"
                 ),
             },
             {
-                "user": {"type": "Bot"},
+                "user": gh_bot,
+                "created_at": "2026-11-05T10:06:00Z",
                 "body": ("<!-- ci-merge-extras:  -->\n<!-- ci-merge-actor: bob -->"),
             },
         ]
         self.assertEqual(
-            bp.parse_merge_queue_comments_page(comments[:2]),
+            bp.parse_merge_queue_comments_page(comments[:4]),
+            (False, (), ""),
+        )
+        self.assertEqual(
+            bp.parse_merge_queue_comments_page(comments[:5]),
             (True, ("perf-eval", "nightly-suite"), "alice"),
         )
         self.assertEqual(bp.parse_merge_queue_comments_page(comments), (True, (), ""))
+        # Stale marker before a new push is ignored when head_committed_at is newer.
+        self.assertEqual(
+            bp.parse_merge_queue_comments_page(
+                [
+                    {
+                        "user": gh_bot,
+                        "created_at": "2026-11-05T09:55:00Z",
+                        "body": (
+                            "<!-- ci-merge-extras: precheck-only -->\n"
+                            "<!-- ci-merge-actor: alice -->"
+                        ),
+                    }
+                ],
+                head_committed_at="2026-11-05T10:00:00Z",
+            ),
+            (False, (), ""),
+        )
         for bad_marker in (
-            "<!-- ci-merge-extras: bogus -->",
-            "<!-- ci-merge-extras: precheck-only, perf-eval -->",
+            "<!-- ci-merge-extras: bogus -->\n<!-- ci-merge-actor: alice -->",
+            (
+                "<!-- ci-merge-extras: precheck-only, perf-eval -->\n"
+                "<!-- ci-merge-actor: alice -->"
+            ),
         ):
             with self.assertRaises(ValueError):
                 bp.parse_merge_queue_comments_page(
-                    [{"user": {"type": "Bot"}, "body": bad_marker}]
+                    [{"user": gh_bot, "body": bad_marker}]
                 )
 
         rendered = bp.prepare_upload_yaml(
@@ -621,6 +683,11 @@ class TestBootstrapUnits(unittest.TestCase):
                 "pr+nightly-suite",
             ),
             (
+                {"BUILDKITE_MERGE_QUEUE_BASE_BRANCH": "releases/foo"},
+                ("perf-eval",),
+                "pr+perf-eval",
+            ),
+            (
                 {"BUILDKITE_PULL_REQUEST": "10", "CI_PR_TPU_OPT_IN": "1"},
                 (),
                 "pr+cpu-only",
@@ -723,11 +790,32 @@ class TestBootstrapUnits(unittest.TestCase):
                         items = [{"user": {"type": "User"}, "body": "x"}] * 100
                         self.wfile.write(json.dumps(items).encode("utf-8"))
                     else:
-                        self.wfile.write(
-                            b'[{"user": {"type": "Bot"}, "body": '
-                            b'"<!-- ci-merge-extras: perf-eval -->'
-                            b'<!-- ci-merge-actor: alice -->"}]'
+                        created = (
+                            "2026-11-05T09:55:00Z"
+                            if mode == "stale_marker"
+                            else "2026-11-05T10:05:00Z"
                         )
+                        extra = (
+                            "precheck-only" if mode == "stale_marker" else "perf-eval"
+                        )
+                        payload = [
+                            {
+                                "user": {
+                                    "type": "Bot",
+                                    "login": "github-actions[bot]",
+                                },
+                                "created_at": created,
+                                "body": (
+                                    f"<!-- ci-merge-extras: {extra} -->\n"
+                                    "<!-- ci-merge-actor: alice -->"
+                                ),
+                            }
+                        ]
+                        self.wfile.write(json.dumps(payload).encode("utf-8"))
+                elif "commits/" in self.path:
+                    self.wfile.write(
+                        b'{"commit": {"committer": {"date": "2026-11-05T10:00:00Z"}}}'
+                    )
                 else:
                     self.wfile.write(b'[{"name": "skip-tpu-ci"}]')
 
@@ -752,6 +840,7 @@ class TestBootstrapUnits(unittest.TestCase):
                     mock.patch.object(bp, "_CREDENTIAL_HELPER", helper),
                 ):
                     self.assertEqual(bp._github_labels("42", env={}), ("skip-tpu-ci",))
+                    self.assertEqual(seen_auth, ["token ghs_tok"])
                     mode = "auth_401"
                     self.assertEqual(
                         bp._merge_queue_pr_extras("42", env={}),
@@ -761,6 +850,11 @@ class TestBootstrapUnits(unittest.TestCase):
                     self.assertEqual(
                         bp._merge_queue_pr_extras("42", env={}),
                         (("perf-eval",), "alice", None),
+                    )
+                    mode = "stale_marker"
+                    self.assertEqual(
+                        bp._merge_queue_pr_extras("42", env={}),
+                        ((), "", None),
                     )
                     mode = "bad_json"
                     self.assertIsNotNone(bp._merge_queue_pr_extras("42", env={})[2])
@@ -782,6 +876,7 @@ class TestBootstrapUnits(unittest.TestCase):
                     )
                     mode = "labels"
                     self.assertEqual(bp._github_labels("42", env={}), ("skip-tpu-ci",))
+                    self.assertIsNone(seen_auth[-1])
             finally:
                 server.shutdown()
                 server.server_close()
@@ -1329,17 +1424,28 @@ class TestBootstrapUnits(unittest.TestCase):
         self.assertTrue(bool(pre.uploads[1][2]["OMNI_IMAGE_SKIP"]))
 
         # Merge queue on main: priority 11 (post-merge), ignores PR labels and
-        # CI_PR_TPU_OPT_IN, runs 2-stage pr suite uncapped.
+        # CI_PR_TPU_OPT_IN, diffs against BUILDKITE_MERGE_QUEUE_BASE_COMMIT, and
+        # runs 2-stage pr suite uncapped.
         mq_main = self._run_bootstrap(
             {
                 "BUILDKITE_BRANCH": "gh-readonly-queue/main/pr-42-deadbeef",
+                "BUILDKITE_COMMIT": "deadbeef",
                 "BUILDKITE_MERGE_QUEUE_BASE_BRANCH": "main",
+                "BUILDKITE_MERGE_QUEUE_BASE_COMMIT": "base111",
                 "BUILDKITE_PULL_REQUEST": "42",
                 "BUILDKITE_PULL_REQUEST_LABELS": "skip-tpu-ci,oncall-fix",
                 "BUILDKITE_BUILD_AUTHOR_EMAIL": "Alice@Example.com",
                 "BUILDKITE_MESSAGE": "feat: x [skip ci]",
                 "CI_PR_TPU_OPT_IN": "1",
             }
+        )
+        self.assertEqual(
+            mq_main.git_calls[:3],
+            [
+                ("fetch", "origin", "base111", "--depth=20", "--quiet"),
+                ("fetch", "origin", "deadbeef", "--depth=20", "--quiet"),
+                ("diff", "--name-only", "base111...deadbeef"),
+            ],
         )
         self.assertIn(("JOB_PRIORITY", "11"), mq_main.meta)
         self.assertIn(("WORKLOAD_PRIORITY", "post-merge"), mq_main.meta)
@@ -1351,14 +1457,16 @@ class TestBootstrapUnits(unittest.TestCase):
         )
         self.assertNotIn("tpu-pr/", mq_main_stage1.uploads[2][1])
 
-        # Merge queue on releases/* always runs pr+nightly-suite [NIGHTLY=1].
+        # Merge queue on releases/vX.Y.Z always runs pr+nightly-suite [NIGHTLY=1]
+        # and does not query GitHub comments for /ci merge extras.
         mq_rel = self._run_bootstrap(
             {
-                "BUILDKITE_BRANCH": "gh-readonly-queue/releases/v0.8/pr-42-deadbeef",
-                "BUILDKITE_MERGE_QUEUE_BASE_BRANCH": "releases/v0.8",
+                "BUILDKITE_BRANCH": "gh-readonly-queue/releases/v0.8.1/pr-42-deadbeef",
+                "BUILDKITE_MERGE_QUEUE_BASE_BRANCH": "releases/v0.8.1",
             },
             mq_marker=(("precheck-only",), "alice", None),
         )
+        self.assertEqual(mq_rel.mq_extras_calls, [])
         self.assertTrue(
             mq_rel.annotations[0][2].startswith(
                 "CI suite: pr+nightly-suite [NIGHTLY=1]: "
@@ -1367,16 +1475,58 @@ class TestBootstrapUnits(unittest.TestCase):
         mq_rel_stage1 = self._run_next_stage(mq_rel)
         self.assertIn("perf", [u[0] for u in mq_rel_stage1.uploads])
 
-        # Merge queue with precheck-only marker runs pr+cpu-only.
+        # Merge queue without BUILDKITE_MERGE_QUEUE_BASE_COMMIT falls back to
+        # fetching the base branch ref, and with precheck-only marker runs pr+cpu-only.
         mq_pre = self._run_bootstrap(
             {
                 "BUILDKITE_BRANCH": "gh-readonly-queue/main/pr-42-deadbeef",
+                "BUILDKITE_COMMIT": "deadbeef",
                 "BUILDKITE_MERGE_QUEUE_BASE_BRANCH": "main",
             },
             mq_marker=(("precheck-only",), "alice", None),
         )
+        self.assertEqual(
+            mq_pre.git_calls[:3],
+            [
+                (
+                    "fetch",
+                    "origin",
+                    "+refs/heads/main:refs/remotes/origin/main",
+                    "--depth=20",
+                    "--quiet",
+                ),
+                ("fetch", "origin", "deadbeef", "--depth=20", "--quiet"),
+                ("diff", "--name-only", "origin/main...deadbeef"),
+            ],
+        )
         self.assertTrue(mq_pre.annotations[0][2].startswith("CI suite: pr+cpu-only: "))
         self.assertEqual([u[0] for u in mq_pre.uploads], ["cpu", "build"])
+
+        # Merge queue fail-open: if base fetch or diff fails even when the queue
+        # head commit is docs-only, never fall back to diff-tree on the head commit
+        # (which could skip a code PR grouped behind a docs PR); run the full gate.
+        for fail_prefixes in (
+            (("fetch", "origin", "base111"),),
+            (("diff",),),
+        ):
+            with self.subTest(fail_prefixes=fail_prefixes):
+                mq_fail_open = self._run_bootstrap(
+                    {
+                        "BUILDKITE_BRANCH": "gh-readonly-queue/main/pr-42-deadbeef",
+                        "BUILDKITE_COMMIT": "deadbeef",
+                        "BUILDKITE_MERGE_QUEUE_BASE_BRANCH": "main",
+                        "BUILDKITE_MERGE_QUEUE_BASE_COMMIT": "base111",
+                    },
+                    files=["README.md"],
+                    fail_git_prefixes=fail_prefixes,
+                )
+                self.assertFalse(
+                    any(c[:1] == ("diff-tree",) for c in mq_fail_open.git_calls)
+                )
+                self.assertEqual(
+                    [u[0] for u in mq_fail_open.uploads],
+                    ["upload_stages", "cpu", "build"],
+                )
 
         # Merge queue warning annotation on comment API failure, then default gate.
         mq_warn = self._run_bootstrap(
@@ -1416,6 +1566,178 @@ class TestBootstrapUnits(unittest.TestCase):
             ],
         )
         self.assertEqual(mq_docs.uploads, [])
+
+    def test_scope_equivalence_across_channels(self) -> None:
+        """All channels for a given scope choose the same Suite and upload the same
+        steps; only priority, concurrency_group, and annotation context differ."""
+        bp = self.bp
+
+        def _normalize_lane_uploads(
+            rec: _RunRecorder, stage1: _RunRecorder | None
+        ) -> list[tuple[str, Any]]:
+            all_uploads = [
+                *(u for u in rec.uploads if u[0] != "upload_stages"),
+                *(stage1.uploads if stage1 is not None else ()),
+            ]
+            normalized: list[tuple[str, Any]] = []
+            for lane, content, _ in all_uploads:
+                raw_doc = yaml.safe_load(content) or {}
+                doc = {
+                    k: v
+                    for k, v in raw_doc.items()
+                    if k != "priority" and not k.startswith("x-")
+                }
+                for step in doc.get("steps") or []:
+                    if isinstance(step, dict):
+                        for item in step.get("steps") or [step]:
+                            if isinstance(item, dict):
+                                item.pop("concurrency", None)
+                                item.pop("concurrency_group", None)
+                                item.pop("concurrency_method", None)
+                normalized.append((lane, doc))
+            return normalized
+
+        author = {"BUILDKITE_BUILD_AUTHOR_EMAIL": "Alice@Example.com"}
+        mq_base = {
+            "BUILDKITE_BRANCH": "gh-readonly-queue/main/pr-42-deadbeef",
+            "BUILDKITE_MERGE_QUEUE_BASE_BRANCH": "main",
+            **author,
+        }
+        for scope, expected_suite, expected_nightly, channels in (
+            (
+                "default",
+                "pr",
+                False,
+                (
+                    ({"BUILDKITE_PULL_REQUEST": "42", **author}, (), ()),
+                    (mq_base, (), ()),
+                    ({"CI_RUN_TPU": "1", **author}, (), ()),
+                ),
+            ),
+            (
+                "perf-eval",
+                "pr+perf-eval",
+                False,
+                (
+                    (
+                        {
+                            "BUILDKITE_PULL_REQUEST": "42",
+                            "BUILDKITE_PULL_REQUEST_LABELS": "run-perf-eval",
+                            **author,
+                        },
+                        (),
+                        (),
+                    ),
+                    (mq_base, (), ("perf-eval",)),
+                    (
+                        {"CI_RUN_TPU": "1", "CI_EXTRAS": "perf-eval", **author},
+                        (),
+                        (),
+                    ),
+                ),
+            ),
+            (
+                "nightly-suite",
+                "pr+nightly-suite",
+                True,
+                (
+                    (
+                        {
+                            "BUILDKITE_PULL_REQUEST": "42",
+                            "BUILDKITE_PULL_REQUEST_LABELS": "run-full-ci",
+                            **author,
+                        },
+                        (),
+                        (),
+                    ),
+                    (mq_base, (), ("nightly-suite",)),
+                    (
+                        {
+                            "CI_RUN_TPU": "1",
+                            "CI_EXTRAS": "nightly-suite",
+                            **author,
+                        },
+                        (),
+                        (),
+                    ),
+                ),
+            ),
+            (
+                "cpu-only",
+                "pr+cpu-only",
+                False,
+                (
+                    (
+                        {
+                            "BUILDKITE_PULL_REQUEST": "42",
+                            "BUILDKITE_PULL_REQUEST_LABELS": "skip-tpu-ci",
+                            **author,
+                        },
+                        (),
+                        (),
+                    ),
+                    (
+                        {
+                            "BUILDKITE_PULL_REQUEST": "42",
+                            "CI_PR_TPU_OPT_IN": "1",
+                            **author,
+                        },
+                        (),
+                        (),
+                    ),
+                    (mq_base, (), ("precheck-only",)),
+                    ({"CI_PRECHECK": "1", **author}, (), ()),
+                    (
+                        {
+                            "BUILDKITE_BRANCH": "main",
+                            "BUILDKITE_SOURCE": "webhook",
+                            "BUILDKITE_MESSAGE": "fix (#42)",
+                        },
+                        ("skip-tpu-ci",),
+                        (),
+                    ),
+                ),
+            ),
+        ):
+            baseline_lanes: list[tuple[str, Any]] | None = None
+            for env, gh_labels, mq_extras in channels:
+                with self.subTest(scope=scope, env=env, mq_extras=mq_extras):
+                    ctx = replace(
+                        bp.BuildContext.from_env(env),
+                        labels=gh_labels or bp.BuildContext.from_env(env).labels,
+                        mq_extras=mq_extras,
+                    )
+                    suite = bp.choose_suite(ctx)
+                    self.assertEqual(suite.name, expected_suite)
+                    self.assertEqual(suite.nightly, expected_nightly)
+                    s0 = self._run_bootstrap(
+                        env,
+                        labels=gh_labels,
+                        mq_marker=(mq_extras, "alice" if mq_extras else "", None),
+                    )
+                    s1 = self._run_next_stage(s0) if len(suite.stages) > 1 else None
+                    lanes = _normalize_lane_uploads(s0, s1)
+                    if baseline_lanes is None:
+                        baseline_lanes = lanes
+                    else:
+                        self.assertEqual(lanes, baseline_lanes)
+
+        # Release-branch merge queue uploads the exact same 6 lanes and steps
+        # (with NIGHTLY=1) as the `full` suite on a direct release branch.
+        mq_rel_s0 = self._run_bootstrap(
+            {
+                "BUILDKITE_BRANCH": (
+                    "gh-readonly-queue/releases/v0.32.0/pr-42-deadbeef"
+                ),
+                "BUILDKITE_MERGE_QUEUE_BASE_BRANCH": "releases/v0.32.0",
+            }
+        )
+        mq_rel_s1 = self._run_next_stage(mq_rel_s0)
+        direct_rel = self._run_bootstrap({"BUILDKITE_BRANCH": "releases/v0.32.0"})
+        self.assertEqual(
+            dict(_normalize_lane_uploads(mq_rel_s0, mq_rel_s1)),
+            dict(_normalize_lane_uploads(direct_rel, None)),
+        )
 
     def test_pipeline_yaml_validation_and_nightly_report_keys(self) -> None:
         bp = self.bp

@@ -48,14 +48,19 @@ _GITHUB_API_URL = "https://api.github.com"
 # nightly, post-merge, and release builds run uncapped.
 PR_TPU_JOBS_PER_AUTHOR = 40
 
-_PR_SUITE_LABELS = ("skip-tpu-ci", "run-perf-eval", "run-full-ci")
-_LABEL_EXTRAS = {"run-full-ci": "nightly-suite", "run-perf-eval": "perf-eval"}
-_VALID_CI_EXTRAS = frozenset({"perf-eval", "nightly-suite"})
+_CI_MERGE_BOT_LOGIN = "github-actions[bot]"
+_LABEL_EXTRAS = {"run-perf-eval": "perf-eval", "run-full-ci": "nightly-suite"}
+_PR_SUITE_LABELS = ("skip-tpu-ci", *_LABEL_EXTRAS)
+_VALID_CI_EXTRAS = frozenset(_LABEL_EXTRAS.values())
 _VALID_MERGE_EXTRAS = _VALID_CI_EXTRAS | {"precheck-only"}
 _PR_NUM_RE = re.compile(r"^[0-9]+$")
 _MQ_BRANCH_PR_RE = re.compile(r"^gh-readonly-queue/.+/pr-([0-9]+)-[^/]+$")
-_CI_MERGE_MARKER_RE = re.compile(r"<!--\s*ci-merge-extras:\s*([^\n>]*?)\s*-->")
-_CI_MERGE_ACTOR_RE = re.compile(r"<!--\s*ci-merge-actor:\s*([A-Za-z0-9_.\[\]-]+)\s*-->")
+_CI_MERGE_MARKER_RE = re.compile(
+    r"^<!-- ?ci-merge-extras: ?([^\n>]*?) ?-->$", re.MULTILINE
+)
+_CI_MERGE_ACTOR_RE = re.compile(
+    r"^<!-- ?ci-merge-actor: ?([A-Za-z0-9_.\[\]-]+) ?-->$", re.MULTILINE
+)
 
 
 class BootstrapError(Exception):
@@ -101,7 +106,7 @@ class BuildContext:
 
     @property
     def is_pr(self) -> bool:
-        return self.pull_request is not None
+        return self.pull_request is not None and not self.is_merge_queue
 
     @property
     def is_merge_queue(self) -> bool:
@@ -137,7 +142,7 @@ class BuildContext:
 
     @property
     def is_oncall_fix(self) -> bool:
-        return self.is_pr and not self.is_merge_queue and "oncall-fix" in self.labels
+        return self.is_pr and "oncall-fix" in self.labels
 
     @property
     def is_release(self) -> bool:
@@ -151,7 +156,7 @@ class BuildContext:
 
     def check_suite_labels(self) -> None:
         """Raise `BootstrapError` if mutually exclusive PR suite labels are set."""
-        if not self.is_pr or self.is_merge_queue:
+        if not self.is_pr:
             return
         matches = [label for label in _PR_SUITE_LABELS if label in self.labels]
         if len(matches) > 1:
@@ -167,7 +172,7 @@ class BuildContext:
     @property
     def extras(self) -> frozenset[str]:
         if self.is_merge_queue:
-            if self.merge_queue_base_branch.startswith("releases/"):
+            if _RELEASE_BRANCH_RE.match(self.merge_queue_base_branch):
                 # releases always run the nightly suite
                 return frozenset({"nightly-suite"})
             return frozenset(self.mq_extras)  # from the /ci merge marker
@@ -301,7 +306,7 @@ SUITES: dict[str, Suite] = {
 _PR_SUITES: dict[str, Suite] = {
     "cpu-only": Suite(
         "pr+cpu-only",
-        "CPU checks only (skip-tpu-ci)",
+        "CPU checks only, no TPU",
         stages=(_CPU_STAGE,),
     ),
     "pr": Suite(
@@ -361,13 +366,11 @@ def build_kind(ctx: BuildContext) -> str:
     """Classify the build into one of the `PRIORITIES` keys."""
     if ctx.nightly_env or ctx.torchtpu_nightly_env:
         return "nightly"
-    if ctx.is_merge_queue:
-        return "post-merge"
     if ctx.is_oncall_fix:
         return "oncall-fix"
     if ctx.is_pr or ctx.is_ci_command:
         return "pre-merge"
-    if ctx.branch == "main":
+    if ctx.branch == "main" or ctx.is_merge_queue:
         return "post-merge"
     return "other"
 
@@ -433,7 +436,7 @@ def read_pinned_vllm_commit(repo_root: pathlib.Path = _REPO_ROOT) -> str:
 
 
 def parse_merge_queue_comments_page(
-    items: object,
+    items: object, *, head_committed_at: str = ""
 ) -> tuple[bool, tuple[str, ...], str]:
     """Extract the last valid `/ci merge` bot marker from a comments page."""
     if not isinstance(items, list):
@@ -442,10 +445,16 @@ def parse_merge_queue_comments_page(
     for c in items:
         user = c.get("user") if isinstance(c, dict) else None
         body = c.get("body") if isinstance(c, dict) else None
+        created_at = c.get("created_at") if isinstance(c, dict) else None
         if (
             not isinstance(user, dict)
             or user.get("type") != "Bot"
+            or user.get("login") != _CI_MERGE_BOT_LOGIN
             or not isinstance(body, str)
+            or (
+                head_committed_at
+                and (not isinstance(created_at, str) or created_at < head_committed_at)
+            )
         ):
             continue
         actor_m = _CI_MERGE_ACTOR_RE.search(body)
@@ -456,6 +465,8 @@ def parse_merge_queue_comments_page(
                 raise ValueError(f"unknown extra {bad[0]!r}")
             if "precheck-only" in parts and len(parts) > 1:
                 raise ValueError("precheck-only cannot be combined with other extras")
+            if parts and not c_actor:
+                continue
             found, latest_extras, latest_actor = (
                 True,
                 parts,
@@ -515,30 +526,14 @@ def _git(
     )
 
 
-def _diff_or_tree(
-    diff_specs: Sequence[Sequence[str]],
-    commit: str,
-    *,
-    env: Mapping[str, str],
-) -> list[str]:
-    _git("fetch", "origin", commit, "--depth=20", "--quiet", env=env)
+def _diff_names(*diff_specs: Sequence[str], env: Mapping[str, str]) -> list[str]:
     for args in diff_specs:
         diff = _git("diff", "--name-only", *args, env=env)
         if diff.returncode == 0 and (
             files := [line for line in diff.stdout.splitlines() if line]
         ):
             return files
-    tree = _git(
-        "diff-tree",
-        "--no-commit-id",
-        "--name-only",
-        "-r",
-        "-m",
-        commit,
-        check=True,
-        env=env,
-    )
-    return [line for line in tree.stdout.splitlines() if line]
+    return []
 
 
 def _changed_files(ctx: BuildContext, *, env: Mapping[str, str]) -> list[str]:
@@ -548,27 +543,36 @@ def _changed_files(ctx: BuildContext, *, env: Mapping[str, str]) -> list[str]:
     if ctx.is_merge_queue:
         if ctx.merge_queue_base_commit:
             diff_base = ctx.merge_queue_base_commit
-            _git("fetch", "origin", diff_base, "--depth=20", "--quiet", env=env)
+            fetch_ok = (
+                _git(
+                    "fetch", "origin", diff_base, "--depth=20", "--quiet", env=env
+                ).returncode
+                == 0
+            )
         else:
             base = ctx.merge_queue_base_branch
             diff_base = f"origin/{base}"
             ref = f"+refs/heads/{base}:refs/remotes/origin/{base}"
-            if (
+            fetch_ok = (
                 _git(
                     "fetch", "origin", ref, "--depth=20", "--quiet", env=env
                 ).returncode
-                != 0
-                and _git(
+                == 0
+                or _git(
                     "fetch", "origin", base, "--depth=20", "--quiet", env=env
                 ).returncode
-                != 0
-            ):
-                print("Base fetch failed")
-        return _diff_or_tree(
-            [[f"{diff_base}...{ctx.commit}"], [diff_base, ctx.commit]],
-            ctx.commit,
-            env=env,
-        )
+                == 0
+            )
+        if not fetch_ok:
+            print("Base fetch failed; running full merge-queue gate")
+            return []
+        _git("fetch", "origin", ctx.commit, "--depth=20", "--quiet", env=env)
+        if files := _diff_names(
+            [f"{diff_base}...{ctx.commit}"], [diff_base, ctx.commit], env=env
+        ):
+            return files
+        print("Merge-queue diff failed or empty; running full merge-queue gate")
+        return []
     if ctx.is_pr:
         print(f"PR detected. Target branch: {ctx.pr_base_branch}")
         if (
@@ -583,11 +587,22 @@ def _changed_files(ctx: BuildContext, *, env: Mapping[str, str]) -> list[str]:
             != 0
         ):
             print("Base fetch failed")
-        return _diff_or_tree(
-            [[f"origin/{ctx.pr_base_branch}...{ctx.commit}"]],
+        _git("fetch", "origin", ctx.commit, "--depth=20", "--quiet", env=env)
+        if files := _diff_names(
+            [f"origin/{ctx.pr_base_branch}...{ctx.commit}"], env=env
+        ):
+            return files
+        tree = _git(
+            "diff-tree",
+            "--no-commit-id",
+            "--name-only",
+            "-r",
+            "-m",
             ctx.commit,
+            check=True,
             env=env,
         )
+        return [line for line in tree.stdout.splitlines() if line]
 
     if ctx.source != "schedule":
         # Any other build is of a commit, which on main is the squash merge of
@@ -595,8 +610,7 @@ def _changed_files(ctx: BuildContext, *, env: Mapping[str, str]) -> list[str]:
         # scheduled build: the nightly tests main as it stands, whatever its
         # last commit touched.
         _git("fetch", "origin", ctx.commit, "--depth=2", "--quiet", env=env)
-        diff = _git("diff", "--name-only", f"{ctx.commit}^", ctx.commit, env=env)
-        return [line for line in diff.stdout.splitlines() if line]
+        return _diff_names([f"{ctx.commit}^", ctx.commit], env=env)
 
     return []
 
@@ -681,31 +695,52 @@ def _merge_queue_pr_extras(
     """Return `(extras, actor, error)` from `/ci merge` bot markers on `pr_number`."""
     token = _github_app_token(env=env)
     use_auth = token is not None
-    latest_extras: tuple[str, ...] = ()
-    latest_actor = ""
-    for page in range(1, 51):
-        path = f"issues/{pr_number}/comments?per_page=100&page={page}"
+
+    def _fetch(path: str) -> tuple[str | None, str | None]:
+        nonlocal use_auth
         try:
-            raw = _github_get(path, token=token if use_auth else None)
-        except (
-            OSError,
-            urllib.error.URLError,
-            http.client.HTTPException,
-        ) as exc:
+            return _github_get(path, token=token if use_auth else None), None
+        except (OSError, urllib.error.URLError, http.client.HTTPException) as exc:
             if not use_auth:
-                return (), "", _format_request_error(exc)
+                return None, _format_request_error(exc)
+            use_auth = False
             try:
-                raw = _github_get(path, token=None)
+                return _github_get(path, token=None), None
             except (
                 OSError,
                 urllib.error.URLError,
                 http.client.HTTPException,
             ) as fallback_exc:
-                return (), "", _format_request_error(fallback_exc)
-            use_auth = False
+                return None, _format_request_error(fallback_exc)
+
+    head_committed_at: str | None = None
+    latest_extras: tuple[str, ...] = ()
+    latest_actor = ""
+    for page in range(1, 51):
+        raw, err = _fetch(f"issues/{pr_number}/comments?per_page=100&page={page}")
+        if err is not None or raw is None:
+            return (), "", err
+        if head_committed_at is None and "ci-merge-extras:" in raw:
+            commit_raw, err = _fetch(f"commits/refs/pull/{pr_number}/head")
+            if err is not None or commit_raw is None:
+                return (), "", err
+            try:
+                commit_obj = json.loads(commit_raw)
+            except ValueError as exc:
+                return (), "", (" ".join(str(exc).split()) or "invalid JSON")
+            committer = (
+                commit_obj.get("commit", {}).get("committer", {})
+                if isinstance(commit_obj, dict)
+                and isinstance(commit_obj.get("commit"), dict)
+                else {}
+            )
+            date = committer.get("date") if isinstance(committer, dict) else None
+            head_committed_at = date if isinstance(date, str) else ""
         try:
             items = json.loads(raw)
-            found, p_extras, p_actor = parse_merge_queue_comments_page(items)
+            found, p_extras, p_actor = parse_merge_queue_comments_page(
+                items, head_committed_at=head_committed_at or ""
+            )
         except ValueError as exc:
             return (), "", (" ".join(str(exc).split()) or "invalid JSON")
         if found:
@@ -978,8 +1013,13 @@ def run_bootstrap(
     print(f"Using vLLM commit: {vllm_commit_hash}")
 
     # 4. Suite selection, NIGHTLY policy, and annotation.
-    if not ctx.ci_precheck and ctx.is_merge_queue and ctx.merge_queue_pr_number:
-        mq_extras, _mq_actor, mq_err = _merge_queue_pr_extras(
+    if (
+        not ctx.ci_precheck
+        and ctx.is_merge_queue
+        and not _RELEASE_BRANCH_RE.match(ctx.merge_queue_base_branch)
+        and ctx.merge_queue_pr_number
+    ):
+        mq_extras, mq_actor, mq_err = _merge_queue_pr_extras(
             ctx.merge_queue_pr_number, env=child_env
         )
         if mq_err is not None:
@@ -993,10 +1033,15 @@ def run_bootstrap(
                 f"#{ctx.merge_queue_pr_number}: {mq_err}; ran the default gate",
                 env=child_env,
             )
+        elif mq_extras:
+            print(
+                f"Merge-queue extras for PR #{ctx.merge_queue_pr_number}: "
+                f"{', '.join(mq_extras)} (by @{mq_actor})"
+            )
         ctx = replace(ctx, mq_extras=mq_extras)
 
     suite = choose_suite(ctx)
-    nightly = not ctx.ci_precheck and (ctx.nightly_env or suite.nightly)
+    nightly = ctx.nightly_env or suite.nightly
     nightly_tag = " [NIGHTLY=1]" if nightly else ""
     suite_note = f"CI suite: {suite.name}{nightly_tag}: {suite.about}"
     print(suite_note)
@@ -1024,12 +1069,12 @@ def run_bootstrap(
     # Key the concurrency group on the commit author's email: every webhook
     # build carries it, whereas BUILDKITE_BUILD_CREATOR_EMAIL is missing when
     # the GitHub account is not linked to a Buildkite user.
-    if ctx.is_merge_queue:
-        concurrency_group: str | None = None
-    elif (ctx.is_pr or ctx.is_ci_command) and ctx.author_email:
-        concurrency_group = f"tpu-pr/{ctx.author_email.lower()}"
+    if (ctx.is_pr or ctx.is_ci_command) and ctx.author_email:
+        concurrency_group: str | None = f"tpu-pr/{ctx.author_email.lower()}"
     else:
-        concurrency_group = ctx.pr_tpu_concurrency_group_env or None
+        concurrency_group = (
+            None if ctx.is_merge_queue else ctx.pr_tpu_concurrency_group_env or None
+        )
     if concurrency_group is not None:
         child_env["PR_TPU_CONCURRENCY_GROUP"] = concurrency_group
 
