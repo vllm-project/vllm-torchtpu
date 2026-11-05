@@ -203,3 +203,79 @@ def engram_hash(
     )
     hashed = rest.reshape(-1, count).T.reshape(count, layers, -1)
     return hashed.astype(jnp.int32) + offsets[None].astype(jnp.int32)
+
+
+def engram_prep(
+    token_map: jax.Array,
+    limbs: jax.Array,
+    primes: jax.Array,
+    offsets: jax.Array,
+    cache: jax.Array,
+    input_ids: jax.Array,
+    positions: jax.Array,
+    query_start_loc: jax.Array,
+    lookback_token_ids: jax.Array,
+    block_tables: jax.Array,
+    *,
+    num_reqs: int,
+    lookback_depth: int,
+    block_size: int,
+    pad_id: int,
+    dead_id: int,
+    sentinel: int,
+    tiles: bool,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """The decode Engram preparation as one program.
+
+    Derives the slot-cache slots (v2 ``_cache_slots`` in int32), writes the
+    mapped token ids there, then hashes (``engram_hash`` with the dead masks
+    derived from ``sentinel``). Returns the written cache, the hash ids and
+    the keep mask ``input_ids != sentinel``.
+    """
+    from vllm_torchtpu.kernels.deepseek_v41.tile_scatter import tile_scatter
+
+    count = input_ids.shape[0]
+    input_ids = input_ids.astype(jnp.int32)
+    positions = positions.astype(jnp.int32)
+    query_start_loc = query_start_loc.astype(jnp.int32)
+    table = block_tables.astype(jnp.int32).reshape(num_reqs, -1)
+    rows = jnp.arange(count, dtype=jnp.int32)
+    if num_reqs:
+        requests = jnp.sum(
+            query_start_loc[None, 1:] <= rows[:, None], axis=1, dtype=jnp.int32
+        )
+        requests = jnp.minimum(requests, num_reqs - 1)
+        columns = jnp.minimum(positions // block_size, table.shape[1] - 1)
+        blocks = table[requests, columns]
+        slots = blocks * block_size + positions % block_size
+        slots = jnp.where(rows >= query_start_loc[-1], -1, slots)
+    else:
+        slots = jnp.full_like(positions, -1)
+    dead = input_ids == sentinel
+    mapped = jnp.where(dead, dead_id, jnp.take(token_map, input_ids, mode="clip"))
+    if tiles:
+        cache = tile_scatter(cache, slots, mapped)
+    else:
+        size = cache.shape[0]
+        cache = cache.at[jnp.where(slots >= 0, slots, size)].set(mapped, mode="drop")
+    hashes = engram_hash(
+        token_map,
+        limbs,
+        primes,
+        offsets,
+        input_ids,
+        positions,
+        query_start_loc,
+        dead,
+        lookback_token_ids,
+        lookback_token_ids == sentinel,
+        cache,
+        table,
+        lookback_depth=lookback_depth,
+        block_size=block_size,
+        pad_id=pad_id,
+        dead_id=dead_id,
+        use_cache=True,
+        sentinel=sentinel,
+    )
+    return cache, hashes, ~dead

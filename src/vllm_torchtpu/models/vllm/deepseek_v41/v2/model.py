@@ -439,6 +439,21 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
             upstream.image_sentinel_mask(lookback),
         )
 
+    def _fuses_engram_prep(self, input_ids, swa_metadata) -> bool:
+        """TPU_DEEPSEEK_V41_ENGRAM_FUSED_PREP: slot write and hash in one op."""
+        engram_hash = self.engram_hash
+        return (
+            envs.TPU_DEEPSEEK_V41_ENGRAM_FUSED_PREP
+            and envs.TPU_DEEPSEEK_V41_ENGRAM_INT32_SLOT_WRITE
+            and engram_hash.use_slot_cache
+            and engram_hash.fuses_dead_masks(input_ids)
+            and swa_metadata.seq_lens.shape[0] > 0
+            # The op derives the slots from the SWA block tables and the bound
+            # SWA cache's page size; without them the step takes the eager path.
+            and swa_metadata.block_tables is not None
+            and engram_hash.swa_cache_module.kv_cache is not None
+        )
+
     def _prepare_engram(
         self,
         input_ids: torch.Tensor | None,
@@ -502,6 +517,16 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
                     else:
                         engram_hashes = self.engram_hash.hash_on_host(*host)
                     engram_mask = ~upstream.image_sentinel_mask(host[0])
+                elif self._fuses_engram_prep(input_ids, swa_metadata):
+                    engram_hashes, engram_mask = self.engram_hash.fused_prep(
+                        input_ids,
+                        positions,
+                        swa_metadata.query_start_loc,
+                        lookback_token_ids,
+                        swa_metadata.block_tables,
+                        swa_metadata.seq_lens.shape[0],
+                        self.engram_hash.swa_cache_module.kv_cache.shape[1],
+                    )
                 else:
                     image_mask = upstream.image_sentinel_mask(input_ids)
                     engram_mask = ~image_mask

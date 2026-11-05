@@ -5,6 +5,7 @@ subclasses ``NgramHashState`` to bind its own slot-cache write op and, when
 its SWA cache module differs, the cache lifetime in ``ensure_cache``.
 """
 
+import functools
 import mmap
 import tempfile
 from contextlib import ExitStack
@@ -22,7 +23,7 @@ from vllm.models.deepseek_v41.common.mm_preprocess import (
 )
 
 from vllm_torchtpu import envs
-from vllm_torchtpu.kernels.engram_hash import engram_hash, hash_tables
+from vllm_torchtpu.kernels.engram_hash import engram_hash, engram_prep, hash_tables
 from vllm_torchtpu.layers.adapter.custom_ops.packed_suffix_op import packed_suffix
 from vllm_torchtpu.layers.adapter.upstream_bindings import (
     bind_device_ops,
@@ -177,17 +178,8 @@ class NgramHashState(upstream.NgramHashState):
             input_ids
         )
 
-    def _fused_hash(
-        self,
-        input_ids,
-        positions,
-        query_start_loc,
-        dead_mask,
-        lookback_token_ids,
-        lookback_dead_mask,
-        block_table,
-    ):
-        """``_hash`` as one fused program (kernels/engram_hash.py)."""
+    def _fused_hash_tables(self) -> tuple[int, tuple[torch.Tensor, ...]]:
+        """(pad id, device limbs/primes/offsets), built once."""
         fused = getattr(self, "_fused_tables", None)
         if fused is None:
             pad_id = int(self.pad_id)
@@ -203,7 +195,60 @@ class NgramHashState(upstream.NgramHashState):
                 torch.from_numpy(t).to(device) for t in (limbs, primes, offsets)
             )
             fused = self._fused_tables = (pad_id, tables)
-        pad_id, tables = fused
+        return fused
+
+    def fused_prep(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        lookback_token_ids: torch.Tensor,
+        block_tables: torch.Tensor,
+        num_reqs: int,
+        rows_per_page: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Slot write and hash of a decode step in one op call: (hashes, keep).
+
+        Equals ``forward`` with the slots of the v2 ``engram_cache_slots``,
+        dead masks derived from the ids (ENGRAM_MASKS_IN_HASH) and the int32
+        slot write, plus ``~image_sentinel_mask(input_ids)``. One op call
+        instead of five separately dispatched programs.
+        """
+        assert self.use_slot_cache and self._cache is not None
+        assert self._cache.numel() < 2**31 and rows_per_page == self.block_size
+        pad_id, tables = self._fused_hash_tables()
+        cache, hashes, keep = _fused_prep_op()(
+            self.token_map,
+            *tables,
+            self._cache,
+            input_ids,
+            positions,
+            query_start_loc,
+            lookback_token_ids,
+            block_tables,
+            num_reqs,
+            self.lookback_depth,
+            self.block_size,
+            pad_id,
+            upstream.DEAD_ID,
+            IMAGE_SENTINEL_BASE_ID,
+            bool(envs.TPU_DEEPSEEK_V41_ENGRAM_TILE_SCATTER),
+        )
+        self._cache.copy_(cache)
+        return hashes, keep
+
+    def _fused_hash(
+        self,
+        input_ids,
+        positions,
+        query_start_loc,
+        dead_mask,
+        lookback_token_ids,
+        lookback_dead_mask,
+        block_table,
+    ):
+        """``_hash`` as one fused program (kernels/engram_hash.py)."""
+        pad_id, tables = self._fused_hash_tables()
         use_cache = bool(self.use_slot_cache)
         if use_cache:
             assert self._cache is not None and block_table is not None
@@ -444,6 +489,96 @@ def _fused_hash_op():
         )
         _FUSED_HASH_OP = op
     return _FUSED_HASH_OP
+
+
+_FUSED_PREP_OP = None
+
+
+def _fused_prep_op():
+    """Torch op for ``engram_prep``: 10 arrays (the cache donated), 7 statics."""
+    global _FUSED_PREP_OP
+    if _FUSED_PREP_OP is None:
+        from jax.sharding import PartitionSpec as P
+        from torch_tpu._internal import pallas
+
+        from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
+            get_pallas_op_mesh,
+            get_vllm_model_wrapper_context,
+        )
+
+        mesh = get_vllm_model_wrapper_context().mesh
+
+        def call(
+            token_map: jax.Array,
+            limbs: jax.Array,
+            primes: jax.Array,
+            offsets: jax.Array,
+            cache: jax.Array,
+            input_ids: jax.Array,
+            positions: jax.Array,
+            query_start_loc: jax.Array,
+            lookback_token_ids: jax.Array,
+            block_tables: jax.Array,
+            num_reqs: int,
+            lookback_depth: int,
+            block_size: int,
+            pad_id: int,
+            dead_id: int,
+            sentinel: int,
+            tiles: bool,
+        ) -> tuple[jax.Array, jax.Array, jax.Array]:
+            prep = functools.partial(
+                engram_prep,
+                num_reqs=num_reqs,
+                lookback_depth=lookback_depth,
+                block_size=block_size,
+                pad_id=pad_id,
+                dead_id=dead_id,
+                sentinel=sentinel,
+                tiles=tiles,
+            )
+            # The tile scatter is a Pallas call: manual partitioning, one
+            # replica per device.
+            return jax.shard_map(
+                prep,
+                mesh=mesh,
+                in_specs=(P(),) * 10,
+                out_specs=(P(), P(), P()),
+                check_vma=False,
+            )(
+                token_map,
+                limbs,
+                primes,
+                offsets,
+                cache,
+                input_ids,
+                positions,
+                query_start_loc,
+                lookback_token_ids,
+                block_tables,
+            )
+
+        op = pallas.jax_op(
+            "pallas::dsv41_engram_fused_prep",
+            call,
+            donate_argnums=(4,),
+            mesh=get_pallas_op_mesh(),
+            input_partition_specs=cast(
+                tuple[tuple[str, ...], ...], (P(),) * 10 + (None,) * 7
+            ),
+        )
+        op.register_fake(
+            lambda token_map, limbs, primes, offsets, cache, input_ids, *_: (
+                torch.empty_like(cache),
+                input_ids.new_empty(
+                    (input_ids.shape[0], limbs.shape[0], offsets.shape[1]),
+                    dtype=torch.int32,
+                ),
+                torch.empty_like(input_ids, dtype=torch.bool),
+            )
+        )
+        _FUSED_PREP_OP = op
+    return _FUSED_PREP_OP
 
 
 def _load_local_rows(param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
