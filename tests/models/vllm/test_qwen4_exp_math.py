@@ -6,10 +6,12 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.models.vllm.qwen4_exp.hyperconnection import (
     GatedResidual,
     HyperConnectionBase,
     HyperConnectionConfig,
+    prefill_full_variant,
 )
 
 TPU = pytest.mark.tpu_test
@@ -258,3 +260,37 @@ def test_hc_tpu_negative_silu_preserves_mix_gate(compiled):
     with torch.inference_mode():
         actual = run(torch.ones(43, 10240, dtype=torch.bfloat16, device="tpu"))
     assert_metrics(_np(actual.cpu()), expected)
+
+
+@pytest.mark.parametrize(
+    ("libtpu_args", "expected"),
+    [
+        ("", (True, True)),
+        (
+            "--xla_tpu_enable_sparse_core_collective_offload_all_gather=false",
+            (True, True),
+        ),
+        (
+            "--xla_tpu_enable_sparse_core_collective_offload_all_gather=true",
+            (False, False),
+        ),
+        # The last setting wins, as in libtpu (the recipe appends overrides).
+        (
+            "--xla_tpu_enable_sparse_core_collective_offload_all_gather=true "
+            "--xla_tpu_enable_sparse_core_collective_offload_all_gather=false",
+            (True, True),
+        ),
+        (
+            "--xla_tpu_enable_sparse_core_collective_offload_all_gather=false "
+            "--xla_tpu_enable_sparse_core_collective_offload_all_gather=true",
+            (False, False),
+        ),
+    ],
+)
+def test_hc_prefill_variants_off_with_sparse_core_all_gather(
+    monkeypatch, libtpu_args, expected
+):
+    monkeypatch.setenv("LIBTPU_INIT_ARGS", libtpu_args)
+    monkeypatch.setattr(envs, "VLLM_TPU_HC_PREFILL_UP_T", True)
+    monkeypatch.setattr(envs, "VLLM_TPU_HC_PREFILL_INJECT", True)
+    assert prefill_full_variant() == expected
