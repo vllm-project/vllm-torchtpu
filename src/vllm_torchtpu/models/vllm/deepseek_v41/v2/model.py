@@ -14,6 +14,7 @@ from vllm.compilation.decorators import support_torch_compile
 from vllm.forward_context import override_forward_context
 from vllm.models.deepseek_v41.nvidia import model as upstream
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v41.deepseek_v41_mhc_op import (
     initialize_shifted_mhc,
 )
@@ -48,7 +49,7 @@ from .ced import (
     plan_decoder_replay,
     prefix_replay_enabled,
 )
-from .engram import Engram, NgramHashState
+from .engram import Engram, NgramHashState, engram_cache_slots
 from .host_engram import (
     HOST_ENGRAM_KEY,
     HostEngramInputs,
@@ -95,15 +96,24 @@ def _ced_config(
     return ced_enabled, ced_boundary
 
 
-def _with_window_starts(context, first, positions):
-    """Publish each request's SWA bounded replay start to the attention layers."""
+def _with_window_starts(context, first, positions, reuse=None):
+    """Publish each request's SWA bounded replay start to the attention layers.
+
+    ``reuse`` (a dict owned by the caller) keeps the last upload, so a step
+    whose replay starts did not change skips the host tensor and its H2D copy.
+    """
     requests = first.seq_lens.shape[0] if first is not None else 1
     hits = tuple(getattr(first, "replay_starts_cpu", None) or ())[:requests]
-    window_starts = torch.tensor(
-        hits + (0,) * (requests - len(hits)),
-        dtype=positions.dtype,
-        device=positions.device,
-    )
+    values = hits + (0,) * (requests - len(hits))
+    key = (values, positions.dtype, positions.device)
+    if reuse is not None and reuse.get("key") == key:
+        window_starts = reuse["tensor"]
+    else:
+        window_starts = torch.tensor(
+            values, dtype=positions.dtype, device=positions.device
+        )
+        if reuse is not None:
+            reuse.update(key=key, tensor=window_starts)
     return replace(
         context,
         additional_kwargs={
@@ -372,6 +382,11 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
     _hbm_engram_cached: bool | None = None
 
     @cached_property
+    def _window_starts_upload(self) -> dict:
+        """Last window-starts upload (TPU_DEEPSEEK_V41_REUSE_WINDOW_STARTS)."""
+        return {}
+
+    @cached_property
     def _hash_download(self) -> "EngramHashDownload":
         from ..common.host_transfer import EngramHashDownload
 
@@ -500,14 +515,24 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
                 else:
                     image_mask = upstream.image_sentinel_mask(input_ids)
                     engram_mask = ~image_mask
+                    # The fused hash derives the dead masks from the ids
+                    # itself, so the mask programs do not run ahead of it.
+                    fuse_masks = self.engram_hash.fuses_dead_masks(input_ids)
                     engram_hashes = self.engram_hash(
                         input_ids,
                         positions,
                         swa_metadata.query_start_loc,
-                        image_mask,
+                        None if fuse_masks else image_mask,
                         lookback_token_ids,
-                        upstream.image_sentinel_mask(lookback_token_ids),
-                        _cache_slots(
+                        None
+                        if fuse_masks
+                        else upstream.image_sentinel_mask(lookback_token_ids),
+                        (
+                            engram_cache_slots
+                            if envs.TPU_DEEPSEEK_V41_ENGRAM_INT32_SLOT_WRITE
+                            and positions.device.type != "cpu"
+                            else _cache_slots
+                        )(
                             self.engram_hash.swa_cache_module.kv_cache,
                             swa_metadata,
                             positions,
@@ -739,7 +764,14 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
                 next(iter(metadata.values())) if isinstance(metadata, dict) else None
             )
             # Upload window bounds before Engram's blocking hash D2H.
-            encoder_context = _with_window_starts(context, first, positions)
+            encoder_context = _with_window_starts(
+                context,
+                first,
+                positions,
+                self._window_starts_upload
+                if envs.TPU_DEEPSEEK_V41_REUSE_WINDOW_STARTS
+                else None,
+            )
         offload_engram = self._has_cpu_offloaded_engram()
         if offload_engram:
             input_ids_prep = (
@@ -863,18 +895,31 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
                 else torch.zeros_like(positions, dtype=torch.bool)
             )
         else:
-            # The extra output row absorbs padded scatter writes. Reusing row
-            # zero for padding would overwrite a real request's first result.
-            indices = torch.tensor(
-                plan.indices
-                + (positions.shape[0],) * (plan.padded_num_tokens - len(plan.indices)),
-                dtype=torch.int64,
-                device=positions.device,
-            )
-            gather = indices.clamp(max=positions.shape[0] - 1)
-            decoder_positions = positions[gather]
-            decoder_ids = input_ids[gather] if input_ids is not None else None
-            decoder_hidden, decoder_mix = hidden[gather], pre_mix[gather]
+            num_tokens = positions.shape[0]
+            if (
+                envs.TPU_DEEPSEEK_V41_CED_IDENTITY_REPLAY
+                and plan.padded_num_tokens == num_tokens
+                and plan.indices == tuple(range(num_tokens))
+            ):
+                # Every row replays in place (steady decode): gathering and
+                # scattering by the identity only copies rows.
+                indices = None
+                decoder_positions, decoder_ids = positions, input_ids
+                decoder_hidden, decoder_mix = hidden, pre_mix
+            else:
+                # The extra output row absorbs padded scatter writes. Reusing
+                # row zero for padding would overwrite a real request's first
+                # result.
+                indices = torch.tensor(
+                    plan.indices
+                    + (num_tokens,) * (plan.padded_num_tokens - len(plan.indices)),
+                    dtype=torch.int64,
+                    device=positions.device,
+                )
+                gather = indices.clamp(max=num_tokens - 1)
+                decoder_positions = positions[gather]
+                decoder_ids = input_ids[gather] if input_ids is not None else None
+                decoder_hidden, decoder_mix = hidden[gather], pre_mix[gather]
             bounds = torch.tensor(
                 plan.query_start_loc, dtype=torch.int32, device=positions.device
             )

@@ -1109,10 +1109,14 @@ def test_explicit_policy_keeps_hardware_and_placement_checks():
 
 
 @pytest.mark.parametrize("required", [False, True])
-def test_mxfp4_explicit_backend_never_silently_changes_to_gmm(required):
+def test_mxfp4_explicit_backend_never_silently_changes_to_gmm(required, monkeypatch):
     from vllm_torchtpu.layers.adapter.quantization.mxfp4 import (
         VllmDeepseekV4Mxfp4MoEMethod,
     )
+
+    # The subject is the REQUIRED policy's error; the in-op shared expert
+    # (on by default on this measurement branch) adds its own prebuild step.
+    monkeypatch.setitem(vars(envs), "MOE_FUSED_EP_PUSH_SHARED_EXPERT", False)
 
     method = object.__new__(VllmDeepseekV4Mxfp4MoEMethod)
     method.fused_ep = required

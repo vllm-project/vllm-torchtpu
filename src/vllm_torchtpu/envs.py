@@ -8,11 +8,17 @@ from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     TPU_DEEPSEEK_V41_CED: bool = False
+    TPU_DEEPSEEK_V41_CED_IDENTITY_REPLAY: bool = True
+    TPU_DEEPSEEK_V41_ENGRAM_FUSED_HASH: bool = True
+    TPU_DEEPSEEK_V41_ENGRAM_MASKS_IN_HASH: bool = True
+    TPU_DEEPSEEK_V41_ENGRAM_INT32_SLOT_WRITE: bool = True
+    TPU_DEEPSEEK_V41_ENGRAM_TILE_SCATTER: bool = True
     TPU_DEEPSEEK_V41_IMPL: str = "v2"
     TPU_DEEPSEEK_V41_ENGRAM_CPU_OFFLOAD: bool = False
     TPU_DEEPSEEK_V41_ENGRAM_HBM: str = "auto"
     TPU_DEEPSEEK_V41_CSA2_EARLY_GATHER: bool = False
     TPU_DEEPSEEK_V41_INDEXER_TAIL_OUTSIDE_COND: bool = False
+    TPU_DEEPSEEK_V41_REUSE_WINDOW_STARTS: bool = True
     TPU_DEEPSEEK_V41_INDEXER_ISSUE_DEPTH: int | None = 8
     TPU_DEEPSEEK_V41_INDEXER_PUBLISH_ISSUE_DEPTH: int | None = 7
     TPU_DEEPSEEK_V41_MHC_RESIDENT_GATES: bool = True
@@ -30,6 +36,8 @@ if TYPE_CHECKING:
     TPU_ONEHOT_TABLE_LOOKUP: bool = True
     TPU_INLINE_DEDUPLICATED_CALLS: bool = True
     TPU_VERIFY_INCREMENTAL_BLOCK_TABLE: bool = False
+    TPU_BLOCK_TABLE_DELTA_BUCKETS: bool = True
+    TPU_FUSED_SPEC_NEXT_INPUTS: bool = True
     LIBTPU_INIT_ARGS: str = ""
     JAX_PLATFORMS: str = ""
     TPU_ACCELERATOR_TYPE: str | None = None
@@ -121,7 +129,7 @@ if TYPE_CHECKING:
     MOE_FUSED_EP_PUSH_I32_SCALE_SLAB: bool = False
     MOE_FUSED_EP_PUSH_VMEM_COMBINE: bool = False
     MOE_FUSED_EP_PUSH_STAGING_SLOTS: int = 0
-    MOE_FUSED_EP_PUSH_SHARED_EXPERT: bool = False
+    MOE_FUSED_EP_PUSH_SHARED_EXPERT: bool = True
     MOE_FUSED_EP_PUSH_LIGHT_PREPUSH: int = 0
     MOE_FUSED_EP_PUSH_SINGLE_BARRIER: bool = False
     TPU_EXPERT_PLACEMENT: str = ""
@@ -194,8 +202,8 @@ if TYPE_CHECKING:
     VLLM_TPU_FAST_TOKEN_SUBSTITUTION: bool = False
     VLLM_TPU_FUSED_DRAFT_LOOP: bool = False
     MM_ENCODER_FRAME_CHUNK_PATCH_SIZE: int = 0
-    TPU_GC_POLICY: str = "default"
-    TPU_GC_COLLECT_EVERY: int = 1000
+    TPU_GC_POLICY: str = "freeze"
+    TPU_GC_COLLECT_EVERY: int = 500
     TPU_GC_TRACE: bool = False
 
 
@@ -412,6 +420,38 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Decoder SWA bounded replay is approximate. Keep full-forward as the
     # default/reference until matched model-quality and performance validation.
     "TPU_DEEPSEEK_V41_CED": env_bool("TPU_DEEPSEEK_V41_CED"),
+    # CED: when the decoder replays every row in place (steady decode), pass
+    # the encoder outputs straight to the decoder stage and return its output
+    # as is, instead of eager gathers and an index_copy scatter by the
+    # identity (v2/model.py). Outputs are unchanged.
+    "TPU_DEEPSEEK_V41_CED_IDENTITY_REPLAY": env_bool(
+        "TPU_DEEPSEEK_V41_CED_IDENTITY_REPLAY", default=True
+    ),
+    # Engram n-gram hash on device as one fused program with exact 64-bit
+    # arithmetic on uint32 pairs (kernels/engram_hash.py), instead of the
+    # eager int64 torch ops XLA emulates op by op. Hash ids are unchanged.
+    "TPU_DEEPSEEK_V41_ENGRAM_FUSED_HASH": env_bool(
+        "TPU_DEEPSEEK_V41_ENGRAM_FUSED_HASH", default=True
+    ),
+    # With the fused Engram hash, derive the image-sentinel dead masks of the
+    # input and lookback ids inside the slot-cache write and the hash program
+    # instead of in two eager compare programs ahead of them. Same integers
+    # (bit-exact). Requires TPU_DEEPSEEK_V41_ENGRAM_FUSED_HASH. Default off.
+    "TPU_DEEPSEEK_V41_ENGRAM_MASKS_IN_HASH": env_bool(
+        "TPU_DEEPSEEK_V41_ENGRAM_MASKS_IN_HASH", default=True
+    ),
+    # Engram slot-cache write: derive the slots and map the token ids in int32,
+    # one compiled program each (v2/engram.py), instead of eager int64 torch
+    # ops. Same slots, same cache contents.
+    "TPU_DEEPSEEK_V41_ENGRAM_INT32_SLOT_WRITE": env_bool(
+        "TPU_DEEPSEEK_V41_ENGRAM_INT32_SLOT_WRITE", default=True
+    ),
+    # With the int32 slot write: scatter into the slot cache by 128-entry tile
+    # read-modify-writes (kernels/deepseek_v41/tile_scatter.py), costing per
+    # touched tile instead of XLA's pass over the whole cache. Same contents.
+    "TPU_DEEPSEEK_V41_ENGRAM_TILE_SCATTER": env_bool(
+        "TPU_DEEPSEEK_V41_ENGRAM_TILE_SCATTER", default=True
+    ),
     # Deprecated aliases, resolved by the DSV41 serving-policy verifier.
     # Serving supports v2; v1 remains only as a standalone reference.
     "TPU_DEEPSEEK_V41_IMPL": env_with_choices(
@@ -451,6 +491,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Same kernels on the same scores (bit-exact). Default off until measured.
     "TPU_DEEPSEEK_V41_INDEXER_TAIL_OUTSIDE_COND": env_bool(
         "TPU_DEEPSEEK_V41_INDEXER_TAIL_OUTSIDE_COND", default=False
+    ),
+    # CED decode: reuse the per-request SWA window-starts device tensor while
+    # the replay starts are unchanged, instead of building and uploading it in
+    # every step's host path ahead of the encoder. Same values (bit-exact).
+    # Default off until measured.
+    "TPU_DEEPSEEK_V41_REUSE_WINDOW_STARTS": env_bool(
+        "TPU_DEEPSEEK_V41_REUSE_WINDOW_STARTS", default=True
     ),
     # Packed FP8 dense indexer scorer: fragments in flight between the QK
     # matmul and the head reduction (unset: the tuned 10). The second applies
@@ -546,6 +593,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_VERIFY_INCREMENTAL_BLOCK_TABLE": env_bool(
         "TPU_VERIFY_INCREMENTAL_BLOCK_TABLE", default=False
     ),
+    # Pad each block-table delta upload to 64, 512 or 8192 entries, whichever
+    # first holds it, instead of always 8192 (layers/core/block_table_delta.py).
+    # Same table contents; the device scatter's cost follows the padded length.
+    "TPU_BLOCK_TABLE_DELTA_BUCKETS": env_bool(
+        "TPU_BLOCK_TABLE_DELTA_BUCKETS", default=True
+    ),
+    # Async spec decode: build the next step's substitution source and rejected
+    # counts, and correct seq_lens/positions by them, each as one compiled
+    # program with vector table lookups instead of a program per eager op
+    # (runner/tpu_runner_async_output.py). Integer-exact.
+    "TPU_FUSED_SPEC_NEXT_INPUTS": env_bool("TPU_FUSED_SPEC_NEXT_INPUTS", default=True),
     # QK pair-blocked pooled GDN conv layout: full-width states interleave
     # Q and K row-pairs per tap so a TP-rank shard's first conv token maps
     # to one whole destination pool token (2 contiguous transfer spans per
@@ -977,7 +1035,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # fused kernel of TPU_DEEPSEEK_V41_FUSED_SHARED_EXPERT) inside the MoE op,
     # issued after the SparseCore pre-push and ahead of the expert kernel, so
     # the TensorCore computes it while the pre-push is in flight.
-    "MOE_FUSED_EP_PUSH_SHARED_EXPERT": env_bool("MOE_FUSED_EP_PUSH_SHARED_EXPERT"),
+    "MOE_FUSED_EP_PUSH_SHARED_EXPERT": env_bool("MOE_FUSED_EP_PUSH_SHARED_EXPERT", default=True),
     # Shard Kimi K3's latent-MoE down/up projections across the cores of a
     # chip instead of replicating them. They are unquantized [7168, 3584] and
     # [3584, 7168] matmuls run at full HBM bandwidth, ~22% of decode device
@@ -1206,9 +1264,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # TPU_GC_COLLECT_EVERY DP-coordinated steps, which every rank reaches
     # together; 0 never collects. 'default' leaves CPython's own cadence.
     "TPU_GC_POLICY": env_with_choices(
-        "TPU_GC_POLICY", "default", ["default", "freeze"]
+        "TPU_GC_POLICY", "freeze", ["default", "freeze"]
     ),
-    "TPU_GC_COLLECT_EVERY": env_nonnegative_int("TPU_GC_COLLECT_EVERY", 1000),
+    "TPU_GC_COLLECT_EVERY": env_nonnegative_int("TPU_GC_COLLECT_EVERY", 500),
     # Log every cyclic collection of 2 ms or more in the model runner and the
     # engine core (generation, duration, wall-clock ns), to line stalls up
     # with collections in the step records. Independent of TPU_GC_POLICY.
