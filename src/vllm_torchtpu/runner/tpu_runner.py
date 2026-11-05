@@ -3871,9 +3871,13 @@ class TPUModelRunner(GPUModelRunner):
             # which passes the full mask to embed_input_ids and lets
             # masked_scatter place the embeds (no manual counting).
             if mm_embeds_flat is not None:
-                mm_cumsum_np = np.concatenate(
-                    [[0], np.cumsum(is_mm_embed_full.cpu().numpy())]
+                is_mm_np = (
+                    is_mm_embed_full.numpy()
+                    if getattr(is_mm_embed_full, "device", None) is not None
+                    and is_mm_embed_full.device.type == "cpu"
+                    else is_mm_embed_full.cpu().numpy()
                 )
+                mm_cumsum_np = np.concatenate([[0], np.cumsum(is_mm_np)])
 
         start_index = 0
         chunk_index = 0
