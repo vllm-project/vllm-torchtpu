@@ -28,6 +28,7 @@ if TYPE_CHECKING:
     TPU_ONEHOT_TABLE_LOOKUP: bool = True
     TPU_INLINE_DEDUPLICATED_CALLS: bool = True
     TPU_VERIFY_INCREMENTAL_BLOCK_TABLE: bool = False
+    TPU_BLOCK_TABLE_DELTA_BUCKETS: bool = False
     LIBTPU_INIT_ARGS: str = ""
     JAX_PLATFORMS: str = ""
     TPU_ACCELERATOR_TYPE: str | None = None
@@ -525,6 +526,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # host and check it against the device-resident copy (raises on mismatch).
     "TPU_VERIFY_INCREMENTAL_BLOCK_TABLE": env_bool(
         "TPU_VERIFY_INCREMENTAL_BLOCK_TABLE", default=False
+    ),
+    # Pad each block-table delta upload to 64, 512 or 8192 entries, whichever
+    # first holds it, instead of always 8192 (layers/core/block_table_delta.py).
+    # Same table contents; the device scatter's cost follows the padded length.
+    "TPU_BLOCK_TABLE_DELTA_BUCKETS": env_bool(
+        "TPU_BLOCK_TABLE_DELTA_BUCKETS", default=False
     ),
     # QK pair-blocked pooled GDN conv layout: full-width states interleave
     # Q and K row-pairs per tap so a TP-rank shard's first conv token maps
