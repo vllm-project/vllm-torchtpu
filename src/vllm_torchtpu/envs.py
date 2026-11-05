@@ -13,6 +13,7 @@ if TYPE_CHECKING:
     TPU_DEEPSEEK_V41_ENGRAM_HBM: str = "auto"
     TPU_DEEPSEEK_V41_DECODE_FUSION: str = "auto"
     TPU_DEEPSEEK_V41_BLOCKED_ROPE_GATHER: bool = True
+    TPU_DEEPSEEK_V41_QB_ROPE_EXACT_ROWS: bool = True
     TPU_DEEPSEEK_V41_CSA2_DEEP_GATHER: bool = True
     TPU_K3_SP_PREFILL: bool = False
     TPU_INCREMENTAL_BLOCK_TABLE_UPLOAD: bool = True
@@ -413,6 +414,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # (`rope_gather.by_row_blocks`). Data movement only; outputs unchanged.
     "TPU_DEEPSEEK_V41_BLOCKED_ROPE_GATHER": env_bool(
         "TPU_DEEPSEEK_V41_BLOCKED_ROPE_GATHER", default=True
+    ),
+    # Fused Q-B/RoPE at token counts that are not a multiple of 32 (the DSpark
+    # drafter's 240 rows): write only the real rows instead of slicing a padded
+    # [256, 64, 512] result. Same values (bit-exact).
+    "TPU_DEEPSEEK_V41_QB_ROPE_EXACT_ROWS": env_bool(
+        "TPU_DEEPSEEK_V41_QB_ROPE_EXACT_ROWS", default=True
     ),
     # CSA2 SparseCore word/scale gather: three staging slots in flight and
     # DMA-zeroed invalid rows instead of two slots cleared by vector stores
