@@ -24,7 +24,7 @@ from vllm_torchtpu.megakernel.errors import MegakernelConfigError
 def test_register_and_lookup_fused_io_impl(monkeypatch):
     """`register_fused_io` installs an implementation returned by `fused_io()`."""
     monkeypatch.setattr(_builtins, "_LOADED", set(_builtins.BUILTINS))
-    monkeypatch.setattr(fused_io_hook, "_REGISTRY", {})
+    monkeypatch.setattr(fused_io_hook, "_IMPL", None)
     assert not fused_io_hook.fused_io_available()
 
     sentinel = object()
@@ -36,7 +36,7 @@ def test_register_and_lookup_fused_io_impl(monkeypatch):
 def test_fused_io_without_implementation_raises_framework_neutral_error(monkeypatch):
     """`fused_io()` raises `MegakernelConfigError` with a framework-neutral message."""
     monkeypatch.setattr(_builtins, "_LOADED", set(_builtins.BUILTINS))
-    monkeypatch.setattr(fused_io_hook, "_REGISTRY", {})
+    monkeypatch.setattr(fused_io_hook, "_IMPL", None)
     assert not fused_io_hook.fused_io_available()
     with pytest.raises(MegakernelConfigError, match="fused pool I/O") as err:
         fused_io_hook.fused_io()
@@ -50,7 +50,7 @@ def test_fused_io_lookup_calls_ensure_builtins(monkeypatch):
         fused_io_hook, "ensure_builtins", lambda *names: called.append(names)
     )
     sentinel = object()
-    monkeypatch.setattr(fused_io_hook, "_REGISTRY", {"fused_pool_io": sentinel})
+    monkeypatch.setattr(fused_io_hook, "_IMPL", sentinel)
     assert fused_io_hook.fused_io_available()
     assert fused_io_hook.fused_io() is sentinel
     assert called == [fused_io_hook.FUSED_IO, fused_io_hook.FUSED_IO]

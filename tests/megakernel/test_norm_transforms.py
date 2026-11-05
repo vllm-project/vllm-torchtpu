@@ -116,7 +116,7 @@ def test_apply_hf_transforms_shard_repeat_reduce_pad_and_fuse():
         shape=(8, 16),
         dtype=F32,
         transform=ParamTransform(
-            shard_axis=0, fuse_into="qkv", fuse_order=0, fuse_axis=1
+            shard_axis=0, fuse_into="qkv", fuse_order=0, fuse_axis=0
         ),
     )
     d_kv = HFParamDecl(
@@ -125,7 +125,7 @@ def test_apply_hf_transforms_shard_repeat_reduce_pad_and_fuse():
         shape=(2, 1, 16),
         dtype=F32,
         transform=ParamTransform(
-            shard_axis=0, kv_repeat=True, fuse_into="qkv", fuse_order=1, fuse_axis=1
+            shard_axis=0, kv_repeat=True, fuse_into="qkv", fuse_order=1, fuse_axis=0
         ),
     )
     d_red = HFParamDecl(
@@ -142,7 +142,7 @@ def test_apply_hf_transforms_shard_repeat_reduce_pad_and_fuse():
         hf_name="ln.w",
         shape=(16,),
         dtype=F32,
-        transform=ParamTransform(shard_axis=None, replicate_ranks=True),
+        transform=ParamTransform(shard_axis=None, replicate_ranks=True, pad=((0, 20),)),
     )
     d_split = HFParamDecl(
         name="split_c",
@@ -167,8 +167,20 @@ def test_apply_hf_transforms_shard_repeat_reduce_pad_and_fuse():
     assert out["head_s"].shape == (R, 2, 8)
     np.testing.assert_allclose(out["head_s"][:, :, :4], 3.0)
     np.testing.assert_allclose(out["head_s"][:, :, 4:], 0.0)
-    assert out["ln"].shape == (R, 16)
+    assert out["ln"].shape == (R, 20)
+    np.testing.assert_array_equal(out["ln"][0, :16], hf["ln"])
+    np.testing.assert_array_equal(out["ln"][0, 16:], 0.0)
     assert out["split_c"].shape == (R, 4 * 4)
+
+    # Leading layer dim (L, ...) preserves layer axis and fuses along per-layer axis 0.
+    L = 3
+    hf_layered = {
+        "q": jnp.broadcast_to(hf["q"][None, ...], (L, 8, 16)),
+        "kv": jnp.broadcast_to(hf["kv"][None, ...], (L, 2, 1, 16)),
+    }
+    out_layered = apply_hf_transforms([d_q, d_kv], hf_layered, R=R)
+    assert out_layered["qkv"].shape == (R, L, 2 + 1, 16)
+    np.testing.assert_array_equal(out_layered["qkv"][:, 0], out["qkv"])
 
 
 def test_apply_hf_transforms_validation_errors():
@@ -196,3 +208,63 @@ def test_apply_hf_transforms_validation_errors():
 
     with pytest.raises(ValueError, match="missing canonical parameter key"):
         apply_hf_transforms([d_bad_shape], {}, R=2)
+
+    # kv_repeat divisibility errors
+    d_kv_bad = HFParamDecl(
+        "kv", "kv", (3, 8), F32, transform=ParamTransform(shard_axis=0, kv_repeat=True)
+    )
+    with pytest.raises(ValueError, match="kv_repeat on 'kv'"):
+        apply_hf_transforms([d_kv_bad], {"kv": jnp.zeros((3, 8), dtype=F32)}, R=4)
+
+    # Non-divisible shard dimension
+    d_ndiv = HFParamDecl(
+        "w_ndiv", "w", (6, 8), F32, transform=ParamTransform(shard_axis=0)
+    )
+    with pytest.raises(ValueError, match="divisible by R=4"):
+        apply_hf_transforms([d_ndiv], {"w_ndiv": jnp.zeros((6, 8), dtype=F32)}, R=4)
+
+    # channel_splits sum mismatch and R-divisibility
+    d_cs_sum = HFParamDecl(
+        "cs", "cs", (4, 24), F32, transform=ParamTransform(channel_splits=(8, 8))
+    )
+    with pytest.raises(ValueError, match=r"sum\(channel_splits\) == 24"):
+        apply_hf_transforms([d_cs_sum], {"cs": jnp.zeros((4, 24), dtype=F32)}, R=4)
+
+    d_cs_r = HFParamDecl(
+        "cs", "cs", (4, 12), F32, transform=ParamTransform(channel_splits=(6, 6))
+    )
+    with pytest.raises(ValueError, match="divisible by R=4"):
+        apply_hf_transforms([d_cs_r], {"cs": jnp.zeros((4, 12), dtype=F32)}, R=4)
+
+    # head_reduce incompatible with shard_axis=None / kv_repeat / channel_splits
+    d_hr_bad = HFParamDecl(
+        "hr",
+        "hr",
+        (4, 8),
+        F32,
+        transform=ParamTransform(shard_axis=None, head_reduce="mean"),
+    )
+    with pytest.raises(ValueError, match="head_reduce='mean'"):
+        apply_hf_transforms([d_hr_bad], {"hr": arr}, R=2)
+
+    # Inconsistent fuse_axis across fuse_into group members
+    d_f0 = HFParamDecl(
+        "f0",
+        "f0",
+        (4, 8),
+        F32,
+        transform=ParamTransform(
+            shard_axis=0, fuse_into="f01", fuse_order=0, fuse_axis=0
+        ),
+    )
+    d_f1 = HFParamDecl(
+        "f1",
+        "f1",
+        (4, 8),
+        F32,
+        transform=ParamTransform(
+            shard_axis=0, fuse_into="f01", fuse_order=1, fuse_axis=1
+        ),
+    )
+    with pytest.raises(ValueError, match="inconsistent fuse axes"):
+        apply_hf_transforms([d_f0, d_f1], {"f0": arr, "f1": arr}, R=2)

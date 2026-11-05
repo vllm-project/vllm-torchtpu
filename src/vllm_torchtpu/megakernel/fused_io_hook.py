@@ -16,10 +16,10 @@
 Mixer modules never import the fused pool I/O implementation directly; when
 fused pool I/O is selected (`CacheExec.FUSED`) they call `fused_io()`, which
 returns the implementation registered via `register_fused_io()` (loaded on the
-first lookup, `_builtins.ensure_builtins`). Without a registered
-implementation, `"auto"` fused selection falls back to split pool I/O
-(`fused_io_available()`), and an explicit fused build fails with
-`MegakernelConfigError`.
+first lookup, `_builtins.ensure_builtins`). Callers that resolve `"auto"` fused
+pool I/O policy query `fused_io_available()` to fall back to split pool I/O when
+no implementation is registered, whereas calling `fused_io()` directly without a
+registered implementation raises `MegakernelConfigError`.
 
 This module depends only on `errors` and `_builtins` (both stdlib at import), so
 importing it does not load any mixer module.
@@ -63,31 +63,30 @@ class FusedPoolIO(Protocol):
     def gdn_fused_epilogue(self, ctx: Any, gp: Any) -> None: ...
 
 
-_REGISTRY: dict[str, FusedPoolIO] = {}
-_KEY = "fused_pool_io"
+_IMPL: FusedPoolIO | None = None
 
 
 def register_fused_io(impl: FusedPoolIO) -> None:
     """Install the fused pool I/O helpers (`gqa_fused_*`, `gdn_fused_*`)."""
-    _REGISTRY[_KEY] = impl
+    global _IMPL
+    _IMPL = impl
 
 
 def fused_io_available() -> bool:
     """Whether a fused pool I/O implementation is registered."""
     ensure_builtins(*FUSED_IO)
-    return _KEY in _REGISTRY
+    return _IMPL is not None
 
 
 def fused_io() -> FusedPoolIO:
     """Return the registered fused pool I/O helpers (used under `CacheExec.FUSED`)."""
     ensure_builtins(*FUSED_IO)
-    impl = _REGISTRY.get(_KEY)
-    if impl is None:
+    if _IMPL is None:
         raise MegakernelConfigError(
             "fused pool I/O was requested, but no fused pool I/O implementation "
             "is registered (the megakernel experimental package is not loaded)"
         )
-    return impl
+    return _IMPL
 
 
 __all__ = ["FusedPoolIO", "fused_io", "fused_io_available", "register_fused_io"]

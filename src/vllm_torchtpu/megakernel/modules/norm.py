@@ -144,7 +144,7 @@ class NormModule(Module):
         p = self.prefix if prefix is None else prefix
         renamed = self.renamed_param_name(p, geom)
         hf_name = f"{p}.weight" if p else "weight"
-        H = int(getattr(geom, "H", getattr(geom, "hidden", 0)))
+        H = int(geom.H)
         decls = [
             HFParamDecl(
                 name=renamed,
@@ -193,7 +193,7 @@ class NormModule(Module):
             eps_val = float(eps)
         elif self.eps is not None:
             eps_val = float(self.eps)
-        elif geom is not None and hasattr(geom, "eps"):
+        elif geom is not None:
             eps_val = float(geom.eps)
         else:
             eps_val = 1e-6
@@ -288,11 +288,10 @@ class EmbeddingModule(Module):
     def hf_params(self, prefix: str | None = None, g: Any = None) -> list[HFParamDecl]:
         geom = self._require_geometry(g)
         p = (self.prefix if prefix is None else prefix) or "model.embed_tokens"
-        canon = self.param_name or "embed_tokens"
         renamed = self.renamed_param_name(geom)
-        hf_name = f"{p}.weight" if p else f"{canon}.weight"
-        vocab = int(getattr(geom, "vocab_size", getattr(geom, "vocab", 0)))
-        H = int(getattr(geom, "H", getattr(geom, "hidden", 0)))
+        hf_name = f"{p}.weight"
+        vocab = int(geom.vocab)
+        H = int(geom.H)
         decls = [
             HFParamDecl(
                 name=renamed,
