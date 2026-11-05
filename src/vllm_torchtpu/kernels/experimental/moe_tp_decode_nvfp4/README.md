@@ -12,10 +12,10 @@ in-kernel cross-rank all-reduce for decode batches (`n <= 64`). Opt-in with
 from vllm_torchtpu.kernels.experimental.moe_tp_decode_nvfp4 import (
     ROW_BUCKETS,
     can_use_moe_tp_decode_nvfp4,
+    exact_in_bf16,
     group_size,
     kernel_name,
     moe_tp_decode_nvfp4,
-    vmem_bytes,
 )
 
 out = moe_tp_decode_nvfp4(
@@ -32,29 +32,57 @@ out = moe_tp_decode_nvfp4(
     ss13,                 # [2 * I_shared] f32 per-channel scales
     sw2,                  # [I_shared, H] float8_e4m3fn
     ss2,                  # [H] f32 per-channel scales
-    experts_start=None,   # int32[], first global expert id on this rank (EP x TP)
+    experts_start=0,      # int32[], first global expert id on this rank (EP x TP)
     *,
     routed_scale=1.0,     # bf16-exact factor multiplying routed sum (GLM-5.2: 2.5)
     topk=8,
     n_ranks=8,
-    router_bias=True,
     fast=True,
     hbm_operands=False,
     split_meta=True,
     w2_n_chunk=2048,
+    max_group=4,
+    group_cols=1024,
+    num_buffers=4,
+    contig_dma=False,
+    overlap_schedule=False,
+    skip_tail=False,
 )  # -> [m, H] bf16, all-reduced across n_ranks, rows >= n_valid are +0.0
 ```
 
 - Call `moe_tp_decode_nvfp4` inside `jax.shard_map` over an `n_ranks`-device
   1D mesh, one call per rank.
-- `can_use_moe_tp_decode_nvfp4(...)` validates TPU generation (TPU7x FP8 MXU),
+- `can_use_moe_tp_decode_nvfp4` (accepting `max_group=4`, `group_cols=1024`,
+  `num_buffers=4`, `contig_dma=False`) validates TPU generation (TPU7x FP8 MXU),
   dtypes, divisibility, `b13 == 512`, `b2 in (128, 256, 512)` with
-  `I_rank % b2 == 0`, `routed_scale` exact in `bf16`, and VMEM budget
-  (`vmem_bytes(...) * 1.25 <= 0.75 * vmem_capacity_bytes`).
-- `group_size(I_rank, E_local)` selects the number of active experts batched
-  into each gate/up K-block loop (`g = 4` when `I_rank <= 256`, `g = 2` when
-  `I_rank > 256`), keeping `g * 2 * I_rank == 2048` and the 3-slot weight ring
-  within ~13.5 MiB of VMEM.
+  `I_rank % b2 == 0`, `routed_scale` exact in `bf16`, `max_group >= 1`,
+  `group_cols >= 1`, `num_buffers >= 2`, and VMEM budget
+  (`need_bytes * 1.25 <= 0.875 * vmem_capacity_bytes`).
+- `group_size(I_rank, E_local, *, max_group=4, group_cols=1024)` selects the
+  number of active experts batched into each gate/up K-block loop
+  (`min(max_group, E_local, max(1, group_cols // (2 * I_rank)))`; default
+  `g = 2` when `I_rank == 256`, `g = 1` when `I_rank >= 512`), keeping
+  `g * 2 * I_rank <= 1024` and the default 4-slot weight ring (`num_buffers=4`)
+  within `19.0–19.75 MiB` of VMEM (`33.47–43.16 MiB` total VMEM limit across
+  `m in (16, 32, 64)` vs the `56.00 MiB` budget cap).
+- Static tuning arguments:
+  - `max_group` (`int`, default `4`), `group_cols` (`int`, default `1024`), and
+    `num_buffers` (`int`, default `4`): control `g` and the weight-ring depth
+    (`num_buffers >= 2`). Passing `group_cols=2048, num_buffers=3` selects the
+    wider `g = 4` (`TP8`) / `g = 2` (`EP2xTP4`) 3-slot ring configuration.
+  - `contig_dma` (`bool`, default `False`): when `True` and `g > 1`, stores
+    `w13` and `s13` ring slots per expert (`(num_buffers, g, H // 8, 2 * I_rank)`
+    and `(num_buffers, g, H // 512, 2 * I_rank)`) so each per-expert HBM->VMEM
+    async DMA targets a contiguous subbuffer, concatenating widened FP8
+    K-blocks in VREGs before the grouped `[m, 512] x [512, g * 2 * I_rank]`
+    dot (`+0` VMEM bytes vs default).
+  - `overlap_schedule` (`bool`, default `False`): overlaps `owner_ref` zeroing
+    and shared/routed `x` FP8 quantization with the `hits_v -> hits_s` async
+    SMEM copy, queues `(w13, s13)` DMAs ahead of `(w2, s2)`, and runs a
+    split-phase carry-free ring loop (`1x` live `acc1` VREG footprint).
+  - `skip_tail` (`bool`, default `False`): peels partial final groups
+    (`active_count % g != 0`) out of the unpredicated full-group `fori_loop` so
+    inactive tail lanes skip HBM->VMEM DMAs and `w2` down-projection compute.
 
 ## When it runs and flags
 
@@ -83,7 +111,7 @@ layers after model load when `USE_MOE_TP_DECODE_NVFP4_KERNEL=1` and
 | `USE_MOE_TP_DECODE_NVFP4_KERNEL` | `0` | Enables per-matrix K-major FP4 block requantization at load time and arms the fused NVFP4 TP decode op. |
 | `TPU_MOE_SKIP_PADDED_TOKENS` | `0` | Required (`=1`) so `token_padding` provides the valid-token mask consumed as `n_valid`. |
 | `MOE_REQUANTIZE_BLOCK_SIZE` | `512` (when kernel flag is `1`) | Target K-block size; clamped per matrix to `min(block, K_matrix)` when the fused EP W4A8 kernel is not used. |
-| `TPU_MOE_TP_DECODE_FAST` | `1` | Uses packed-key top-k routing, vector active-expert compaction, and peeled 3-slot ring scheduling (bitwise identical to `0`). |
+| `TPU_MOE_TP_DECODE_FAST` | `1` | Uses packed-key top-k routing, vector active-expert compaction, and peeled 4-slot ring scheduling (bitwise identical to `0`). |
 | `TPU_MOE_TP_DECODE_HBM_OPERANDS` | `drafter` | Pins large weight operands to HBM on armed layers (`0`, `drafter`, or `1`). |
 | `ENABLE_EXPERT_PARALLEL` / `TPU_MOE_EP_TP_SIZE` | `false` / unset | Configures `EP x TP` sharding (`ep_size * tp_size == n_ranks`, e.g. `EP2xTP4` with `TPU_MOE_EP_TP_SIZE=4`). |
 
@@ -95,10 +123,10 @@ the requantization block size per matrix (`b13 = min(block, H)` and
 `I_rank` up to `512`. For GLM-5.2 (`H = 6144, E = 256, I_tp8 = 256,
 I_shared_tp8 = 256`, 8 TPU7x ranks):
 
-| Layout | Sharding | Per-rank experts (`E_local`) | `I_rank` | Requant blocks (`b13 / b2`) | Group `g` | Ring slot (3-slot ring) | VMEM (`m = 16 / 32 / 64`) |
+| Layout | Sharding | Per-rank experts (`E_local`) | `I_rank` | Requant blocks (`b13 / b2`) | Group `g` | Ring slot (4-slot ring) | VMEM (`m = 16 / 32 / 64`) |
 | :--- | :--- | ---: | ---: | :--- | ---: | ---: | :--- |
-| `TP8` | `ep=1, tp=8` | `256` (`e0 = 0`) | `256` | `512 / 256` (`12` / `1` blocks) | `4` | `2.25 MiB` (`6.75 MiB`) | `37.40 / 39.61 / 44.41 MiB` |
-| `EP2xTP4` | `ep=2, tp=4` | `128` (`e0 in {0, 128}`) | `512` | `512 / 512` (`12` / `1` blocks) | `2` | `4.50 MiB` (`13.50 MiB`) | `36.27 / 38.48 / 43.28 MiB` |
+| `TP8` | `ep=1, tp=8` | `256` (`e0 = 0`) | `256` | `512 / 256` (`12` / `1` blocks) | `2` | `4.94 MiB` (`19.75 MiB`) | `27.52 / 29.73 / 34.53 MiB` |
+| `EP2xTP4` | `ep=2, tp=4` | `128` (`e0 in {0, 128}`) | `512` | `512 / 512` (`12` / `1` blocks) | `1` | `4.75 MiB` (`19.00 MiB`) | `26.77 / 28.98 / 33.78 MiB` |
 
 At `TP8`, clamping `b2` to `256` avoids padding `I_rank` from `256` to `512`,
 which would otherwise double routed-expert HBM on 4-chip hosts.
@@ -142,9 +170,10 @@ and `exp_body` have virtually identical distance to the dequantized `f32`
 reference (`rel_l2 = 0.0437–0.0515`,
 `|rel_l2(kernel, f32) - rel_l2(exp_body, f32)| <= 0.0007`,
 `cos = 0.9987–0.9990`), and all bitwise (`fast` vs `slow`, `hbm_operands`,
-`split_meta`, `w2_n_chunk=2048` vs `6144`), rank-identity, `+0.0` padding, and
-`NaN=0` checks matched on hardware. Comparing the Mosaic MLIR against XLA:TPU
-StableHLO shows two lowering differences immediately before
+`split_meta`, `w2_n_chunk=2048` vs `6144`, `group_cols` / `num_buffers`,
+`contig_dma`, `overlap_schedule`, `skip_tail`), rank-identity, `+0.0` padding,
+and `NaN=0` checks matched to 0 ULP on hardware. Comparing the Mosaic MLIR
+against XLA:TPU StableHLO shows two lowering differences immediately before
 `.astype(float8_e4m3fn)`:
 
 1. In `quantize_block`, Mosaic lowers `x / broadcast(scale)` to
@@ -158,31 +187,44 @@ step), a 1-ULP `f32`/`bf16` difference prior to `.astype(float8_e4m3fn)` flips
 boundary elements into adjacent FP8 quantization buckets before the subsequent
 MXU matmuls.
 
-## Measured per-layer latency (single-host kernel screening)
+## Measured per-layer latency (single-host 8-rank TPU7x kernel screening)
 
-Measured on an 8-rank TPU7x single-host kernel screening benchmark at GLM-5.2
-per-rank shapes (`H = 6144`, `E = 256`, `topk = 8`, `I_shared_rank = 256`,
-in-graph `lax.fori_loop` with calibrated loop overhead subtracted; `n = 4` runs
-via `pad_to_m = 16`):
+Single-host 8-rank TPU7x kernel screening, GLM-5.2 shapes, seed 2026;
+full-layer `us/layer [x75 ms] (speedup vs old default)` (`H = 6144`, `E = 256`,
+`topk = 8`, `I_shared_rank = 256`, in-graph `lax.fori_loop` with calibrated
+loop overhead subtracted; `n = 4, 8` run via `pad_to_m = 16`):
 
-| Decode tokens `n` | Active experts (`TP8` / `EP2`) | Arm | Full layer (`us`) | 75 layers (`ms`) | Routed loop (`us`) | Routed 75x (`ms`) | Speedup vs `#1763` FP8 (full / loop) |
-| ---: | :--- | :--- | ---: | ---: | ---: | ---: | :--- |
-| `4` | `30 / 17` | `fp8_1763_tp8` (`#1763` FP8) | `59.83` | `4.49` | `42.15` | `3.16` | `1.00x / 1.00x` |
-| `4` | `30 / 17` | `nvfp4_tp8_fast` (`b512/b256, g=4`) | `45.97` | `3.45` | `28.13` | `2.11` | `1.30x / 1.50x` |
-| `4` | `30 / 17` | `nvfp4_ep2tp4_fast` (`b512/b512, g=2`) | `48.03` | `3.60` | `30.45` | `2.28` | `1.25x / 1.38x` |
-| `4` | `30 / 17` | `r1_fp4_g4` (standalone loop) | `n/a` | `n/a` | `32.54` | `2.44` | `n/a / 1.30x` |
-| `16` | `94 / 51` | `fp8_1763_tp8` (`#1763` FP8) | `147.51` | `11.06` | `130.49` | `9.79` | `1.00x / 1.00x` |
-| `16` | `94 / 51` | `nvfp4_tp8_fast` (`b512/b256, g=4`) | `95.43` | `7.16` | `79.45` | `5.96` | `1.55x / 1.64x` |
-| `16` | `94 / 51` | `nvfp4_ep2tp4_fast` (`b512/b512, g=2`) | `101.21` | `7.59` | `85.28` | `6.40` | `1.46x / 1.53x` |
-| `16` | `94 / 51` | `r1_fp4_g4` (standalone loop) | `n/a` | `n/a` | `80.38` | `6.03` | `n/a / 1.62x` |
-| `32` | `153 / 81` | `fp8_1763_tp8` (`#1763` FP8) | `231.97` | `17.40` | `210.57` | `15.79` | `1.00x / 1.00x` |
-| `32` | `153 / 81` | `nvfp4_tp8_fast` (`b512/b256, g=4`) | `149.28` | `11.20` | `129.04` | `9.68` | `1.55x / 1.63x` |
-| `32` | `153 / 81` | `nvfp4_ep2tp4_fast` (`b512/b512, g=2`) | `154.75` | `11.61` | `134.64` | `10.10` | `1.50x / 1.56x` |
-| `32` | `153 / 81` | `r1_fp4_g4` (standalone loop) | `n/a` | `n/a` | `127.70` | `9.58` | `n/a / 1.65x` |
-| `64` | `197 / 104` | `fp8_1763_tp8` (`#1763` FP8) | `301.85` | `22.64` | `272.25` | `20.42` | `1.00x / 1.00x` |
-| `64` | `197 / 104` | `nvfp4_tp8_fast` (`b512/b256, g=4`) | `209.43` | `15.71` | `178.09` | `13.36` | `1.44x / 1.53x` |
-| `64` | `197 / 104` | `nvfp4_ep2tp4_fast` (`b512/b512, g=2`) | `207.91` | `15.59` | `176.63` | `13.25` | `1.45x / 1.54x` |
-| `64` | `197 / 104` | `r1_fp4_g4` (standalone loop) | `n/a` | `n/a` | `182.78` | `13.71` | `n/a / 1.49x` |
+### Uniform routing (`us/layer [x75 ms] (speedup vs old default)`)
 
-`w2_n_chunk=2048` and `w2_n_chunk=6144` produce bitwise-identical outputs and
-are within `0.5 us` across all token counts.
+| Layout | `n` | Old default (`us/layer [x75 ms]`) | New default (`us/layer [x75 ms] (speedup vs old default)`) |
+| :--- | ---: | :--- | :--- |
+| `EP2xTP4` (`b512/b512`: old `g=2, nb=3` -> new `g=1, nb=4`) | `4` | `48.13 [3.610]` | `42.50 [3.187] (1.133x)` |
+| `EP2xTP4` (`b512/b512`: old `g=2, nb=3` -> new `g=1, nb=4`) | `8` | `67.40 [5.055]` | `59.41 [4.456] (1.134x)` |
+| `EP2xTP4` (`b512/b512`: old `g=2, nb=3` -> new `g=1, nb=4`) | `16` | `101.49 [7.612]` | `88.03 [6.602] (1.153x)` |
+| `EP2xTP4` (`b512/b512`: old `g=2, nb=3` -> new `g=1, nb=4`) | `32` | `154.14 [11.561]` | `135.01 [10.126] (1.142x)` |
+| `EP2xTP4` (`b512/b512`: old `g=2, nb=3` -> new `g=1, nb=4`) | `64` | `208.34 [15.626]` | `196.11 [14.709] (1.062x)` |
+| `TP8` (`b512/b256`: old `g=4, nb=3` -> new `g=2, nb=4`) | `4` | `45.85 [3.439]` | `40.12 [3.009] (1.143x)` |
+| `TP8` (`b512/b256`: old `g=4, nb=3` -> new `g=2, nb=4`) | `8` | `65.40 [4.905]` | `58.47 [4.386] (1.119x)` |
+| `TP8` (`b512/b256`: old `g=4, nb=3` -> new `g=2, nb=4`) | `16` | `95.91 [7.193]` | `83.53 [6.265] (1.148x)` |
+| `TP8` (`b512/b256`: old `g=4, nb=3` -> new `g=2, nb=4`) | `32` | `149.57 [11.218]` | `133.69 [10.027] (1.119x)` |
+| `TP8` (`b512/b256`: old `g=4, nb=3` -> new `g=2, nb=4`) | `64` | `209.97 [15.747]` | `202.74 [15.205] (1.036x)` |
+
+### Concentrated routing (`us/layer (speedup vs old default)`)
+
+| Layout | `n` | Old default (`us/layer`) | New default (`us/layer (speedup vs old default)`) |
+| :--- | ---: | ---: | :--- |
+| `EP2xTP4` (`b512/b512`: old `g=2, nb=3` -> new `g=1, nb=4`) | `4` | `32.39` | `28.62 (1.132x)` |
+| `EP2xTP4` (`b512/b512`: old `g=2, nb=3` -> new `g=1, nb=4`) | `8` | `32.59` | `28.67 (1.137x)` |
+| `EP2xTP4` (`b512/b512`: old `g=2, nb=3` -> new `g=1, nb=4`) | `16` | `30.91` | `26.97 (1.146x)` |
+| `TP8` (`b512/b256`: old `g=4, nb=3` -> new `g=2, nb=4`) | `4` | `33.12` | `29.36 (1.128x)` |
+| `TP8` (`b512/b256`: old `g=4, nb=3` -> new `g=2, nb=4`) | `8` | `33.09` | `29.39 (1.126x)` |
+| `TP8` (`b512/b256`: old `g=4, nb=3` -> new `g=2, nb=4`) | `16` | `31.49` | `27.70 (1.137x)` |
+
+Outputs are bitwise identical (`0 ULP`) vs the old default
+(`group_cols=2048, num_buffers=3`) on TPU7x hardware across all screened arms.
+For reference, the `#1763` W8A8 FP8 `TP8` fused decode kernel measures
+`59.83 [4.49]`, `147.51 [11.06]`, `231.97 [17.40]`, and `301.85 [22.64]`
+`us/layer [x75 ms]` at `n = 4, 16, 32, 64` under uniform routing on the same
+harness (`1.49–1.77x` slower than the new `TP8` default). `w2_n_chunk=2048` and
+`w2_n_chunk=6144` produce bitwise-identical outputs and are within `0.5 us`
+across all token counts.
