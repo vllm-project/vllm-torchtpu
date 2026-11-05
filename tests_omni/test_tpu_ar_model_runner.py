@@ -18,14 +18,17 @@ through the AR runner here.
 """
 
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
+import torch
 from vllm_omni.config import OmniModelConfig
+from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.worker.omni_connector_model_runner_mixin import (
     OmniConnectorModelRunnerMixin,
 )
 
+from vllm_torchtpu.omni.worker import tpu_ar_model_runner as ar_runner_mod
 from vllm_torchtpu.omni.worker.tpu_ar_model_runner import TPUARModelRunner
 from vllm_torchtpu.omni.worker.tpu_model_runner import OmniTPUModelRunner
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
@@ -97,3 +100,94 @@ def test_multi_stage_thinker_is_refused_at_construction():
                 custom_process_next_stage_input_func="pkg.mod.thinker2talker",
             )
         )
+
+
+def test_tpu_ar_model_runner_mixed_dim_mm_slicing():
+    runner = _build(_stage_config(model_stage="thinker", stage_id=0))
+    runner.supports_mm_inputs = True
+
+    vid_emb, aud_emb = torch.ones(6, 32), torch.ones(4, 8)
+    vid_emb.modality, aud_emb.modality = "video", "audio"
+    mask = torch.ones(10, dtype=torch.bool)
+
+    with patch.object(
+        OmniTPUModelRunner,
+        "_gather_mm_embeddings",
+        return_value=([vid_emb, aud_emb], mask),
+    ):
+        idx_list, out_mask = runner._gather_mm_embeddings("sched_out")
+    assert len(idx_list) == 1 and torch.equal(idx_list[0], torch.arange(10))
+    assert out_mask is mask
+
+    captured_mm = []
+
+    def _dummy_embed_input_ids(ids, **kwargs):
+        captured_mm.append(kwargs.get("multimodal_embeddings"))
+        return torch.zeros(ids.shape[0], 8)
+
+    runner.model = SimpleNamespace(embed_input_ids=_dummy_embed_input_ids)
+    _, embeds_out = runner._get_model_inputs(
+        torch.zeros(5, dtype=torch.long),
+        ([torch.arange(4, 9, dtype=torch.int64)], torch.ones(5, dtype=torch.bool)),
+    )
+    assert embeds_out.shape == (5, 8) and len(captured_mm[0]) == 2
+    assert captured_mm[0][0].shape == (2, 32)
+    assert captured_mm[0][0].modality == "video"
+    assert captured_mm[0][1].shape == (3, 8)
+    assert captured_mm[0][1].modality == "audio"
+    assert len(runner._omni_mm_embeds_list) == 2
+
+    # Slicing through the final embedding row clears _omni_mm_embeds_list.
+    runner._get_model_inputs(
+        torch.zeros(1, dtype=torch.long),
+        ([torch.arange(9, 10, dtype=torch.int64)], torch.ones(1, dtype=torch.bool)),
+    )
+    assert runner._omni_mm_embeds_list == []
+
+
+def test_tpu_ar_model_runner_capture_model_precompiles_mm_buckets():
+    runner = _build(
+        _stage_config(
+            model_stage="thinker",
+            stage_id=0,
+            model_arch_config=SimpleNamespace(
+                architectures=["Qwen3OmniMoeForConditionalGeneration"]
+            ),
+        )
+    )
+    runner.enforce_eager = False
+    runner.supports_mm_inputs = True
+    runner._pp_is_first = True
+    runner.num_tokens_paddings = [16, 64]
+    runner.model = SimpleNamespace()
+    runner._update_num_xla_graphs = MagicMock()
+
+    with (
+        patch.object(OmniTPUModelRunner, "capture_model") as mock_super_capture,
+        patch.object(
+            ar_runner_mod, "precompile_qwen3_omni_thinker_mm"
+        ) as mock_precompile_mm,
+    ):
+        runner.capture_model()
+        mock_super_capture.assert_called_once_with()
+        mock_precompile_mm.assert_called_once_with(runner.model, [16, 64])
+
+        # Non-MM stage skips MM encoder precompilation
+        mock_precompile_mm.reset_mock()
+        runner.supports_mm_inputs = False
+        runner.capture_model()
+        mock_precompile_mm.assert_not_called()
+
+
+def test_tpu_ar_model_runner_forward_model_unwraps_omni_output():
+    runner = _build(_stage_config(model_stage="thinker", stage_id=0))
+    expected_hs = torch.ones(3, 8)
+    omni_out = OmniOutput(text_hidden_states=expected_hs)
+    with patch.object(
+        OmniTPUModelRunner, "forward_model", return_value=(omni_out, None)
+    ):
+        hs, aux = runner.forward_model(
+            torch.zeros(3, dtype=torch.long), torch.arange(3)
+        )
+    assert hs is expected_hs
+    assert aux is None

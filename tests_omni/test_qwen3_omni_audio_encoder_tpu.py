@@ -41,7 +41,7 @@ TPU:
 from __future__ import annotations
 
 from collections.abc import Generator
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 from typing import NamedTuple
 
 import portpicker
@@ -80,8 +80,9 @@ pytestmark = [pytest.mark.omni]
 # 3200 adds a length several attention windows (n_window_infer = 800) long.
 BOUNDARY_LENGTHS = [99, 100, 101, 799, 800, 801, 3200]
 MIXED_BATCH = [800, 250, 200, 30]
-# The exact multiple the patch rewrites and one partial-window neighbour.
-PARITY_LENGTHS = [800, 801]
+# The exact multiple the patch rewrites, a partial-window neighbour that
+# crosses into the 16-window bucket, and a 32-window multi-segment clip.
+PARITY_LENGTHS = [800, 801, 3200]
 
 # Measured on TPU v6e (bf16 encoder vs the CPU reference, 799-801 frames): max
 # abs diff 0.0017 on outputs of magnitude ~0.19, cosine similarity 0.99998;
@@ -287,6 +288,9 @@ def encoders(dist_ctx: None, tpu_device: torch.device) -> Encoders:
     config = _tiny_audio_config()
     torch.manual_seed(0)
     cpu_encoder = Qwen3OmniMoeAudioEncoder(config).eval()
+    cpu_encoder.forward = MethodType(
+        Qwen3OmniMoeAudioEncoder._tpu_orig_forward, cpu_encoder
+    )
     _init_linear_weights(cpu_encoder, seed=0)
     assert all(torch.isfinite(p).all() for p in cpu_encoder.parameters())
     _route_custom_ops_to_cpu(cpu_encoder)
@@ -342,11 +346,18 @@ def test_audio_encoder_mixed_batch_on_tpu(encoders: Encoders) -> None:
     the same sample encoded alone, so no chunk leaks into its neighbour.
     """
     per_sample = [encoders.features(n) for n in MIXED_BATCH]
-    out = _encode(
-        encoders.tpu, torch.cat(per_sample, dim=1), MIXED_BATCH, encoders.window
-    )
+    packed = torch.cat(per_sample, dim=1)
+    out = _encode(encoders.tpu, packed, MIXED_BATCH, encoders.window)
+    reference = _encode(encoders.cpu, packed, MIXED_BATCH, encoders.window)
     expected = [expected_tokens(n, encoders.window) for n in MIXED_BATCH]
     assert out.shape[0] == sum(expected)  # 104 + 33 + 26 + 4 = 167
+    assert_numerical_parity(
+        out.cpu(),
+        reference,
+        atol=PARITY_ATOL,
+        rtol=PARITY_RTOL,
+        min_cos_sim=PARITY_MIN_COS_SIM,
+    )
 
     row = 0
     for n_frames, feats, n_tokens in zip(MIXED_BATCH, per_sample, expected):
