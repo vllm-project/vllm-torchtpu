@@ -47,15 +47,16 @@ from vllm_torchtpu.kernels.qwen4_exp.tuned_block_sizes import (
 )
 
 
-def _write_main_cache_universal(pool, rows, page, logical, valid):
+def _write_main_cache_universal(pool, rows, page, logical, valid, tile=128):
     """Write contiguous prefill tiles without copying the full cache pool.
 
     Complete page-local tiles use one large DMA. Tiles that cross a request or
     page boundary fall back to row DMAs inside the same aliased custom call.
     An outer ``lax.cond`` cannot be used here: XLA then copies the multi-GiB
-    cache to reconcile the two aliased branch outputs.
+    cache to reconcile the two aliased branch outputs. ``tile`` rows per
+    grid step (the staged PD repack uses 64: a decode page holds 64 rows of
+    one layer's compressed keys).
     """
-    tile = 128
 
     if len(rows) % tile or pool.shape[1] % tile:
         return pool.at[page, logical % pool.shape[1]].set(rows, mode="drop")
