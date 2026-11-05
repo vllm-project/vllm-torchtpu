@@ -140,3 +140,26 @@ def test_serving_verify_ignores_stale_swa_rows(
     actual = np.asarray(csa2(**jax.device_put(host), bq=6), np.float32)
     assert np.isfinite(actual).all()
     np.testing.assert_allclose(actual, expected, atol=3e-3, rtol=3e-2)
+
+
+@pytest.mark.parametrize("batch", [8, 48])
+def test_swa_only_matches_reference(benchmark, batch):
+    """main_kv=None is attention over the SWA window alone (compress ratio 0)."""
+    host = benchmark.make_inputs(batch, 6, 64, varied_counts=False)
+    host["main_lengths"] = np.zeros_like(host["main_lengths"])
+    inputs = dict(host, main_kv=None, main_kv_scale=None)
+    del inputs["main_lengths"]
+    if jax.default_backend() != "tpu":
+        arrays = jax.tree.map(jnp.asarray, inputs)
+        mesh = jax.sharding.AbstractMesh(
+            (1,),
+            ("core",),
+            abstract_device=jax.sharding.AbstractDevice("TPU7x", 1, "tpu"),
+        )
+        with jax.sharding.use_abstract_mesh(mesh):
+            traced = jax.make_jaxpr(lambda data: csa2(**data, bq=6))(arrays)
+        assert traced.out_avals[0].shape == host["q"].shape
+        return
+    expected = benchmark.reference(host, range(batch * 6))
+    actual = csa2(**jax.device_put(inputs), bq=6)
+    np.testing.assert_allclose(actual, expected, atol=3e-3, rtol=3e-2)
