@@ -11,7 +11,16 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Kimi K3 MonoProgram adapter and pre-quantization hooks."""
+"""Kimi K3 MonoProgram adapter and pre-quantization hooks.
+
+Limitations:
+- On TPU, `create()` validates topology and weights and returns
+  `Decline("runner_lifecycle_unwired", ...)` until runner step-execution,
+  output-sampling, and single-copy weight-ownership hooks land.
+- `StepContext` and `ForwardView` carry no request IDs, so per-step `SlotMap`
+  slot admission is not driven from `decide()`; callers use `admit_requests()`
+  directly until the runner step-execution hook passes `StepInput`.
+"""
 
 from __future__ import annotations
 
@@ -25,10 +34,7 @@ import torch
 
 from vllm_torchtpu.megakernel.runtime.contract import EligibilityResult
 from vllm_torchtpu.megakernel.runtime.eligibility import check_step_eligibility
-from vllm_torchtpu.megakernel.runtime.policy import (
-    BucketPolicy,
-    parse_mk_verify_buckets,
-)
+from vllm_torchtpu.megakernel.runtime.policy import BucketPolicy
 from vllm_torchtpu.megakernel_runtime.plugin import (
     Bucket,
     Decline,
@@ -42,9 +48,23 @@ from vllm_torchtpu.megakernel_runtime.plugin import (
 )
 
 from .kernels.load import pack_expert_bytes
-from .layout import FP8_LAYOUT, LAYOUT, NUM_LAYERS
-from .pools import KDA_LAYERS, MLA_LAYERS, SlotMap
-from .program import DRAFT_TOKENS, HIDDEN_SIZE, TP_SIZE
+from .layout import (
+    FP8_LAYOUT,
+    LAYOUT,
+    NUM_LAYERS,
+)
+from .pools import (
+    KDA_LAYERS,
+    MLA_LAYERS,
+    SlotMap,
+    is_mla_layer,
+    layer_index,
+)
+from .program import (
+    DRAFT_TOKENS,
+    HIDDEN_SIZE,
+    TP_SIZE,
+)
 
 KIMI_K3_NUM_EXPERTS = 896
 KIMI_K3_EP_GROUPS = 8
@@ -153,7 +173,7 @@ def _as_int(val: object, default: int = 0) -> int:
 def layout_request(
     vllm_config: object, options: Mapping[str, object] | None = None
 ) -> dict[str, int]:
-    """Pre-size unified MLA + KDA pool page geometry before allocation."""
+    """Return unified MLA + KDA pool `block_size` and `dcp_interleave_size`."""
     del options
     cache_cfg = getattr(vllm_config, "cache_config", None)
     raw_dtype = getattr(cache_cfg, "cache_dtype", "auto")
@@ -170,7 +190,7 @@ def layout_request(
 
 
 def _default_kernel_position() -> int:
-    """Resolve local worker position in ascending `device.id` order."""
+    """Resolve local worker position in ascending `device.id` order (matching `pools.tp_rank_permutation`)."""
     devices = sorted(jax.devices(), key=lambda d: int(d.id))
     if len(devices) != TP_SIZE:
         msg = (
@@ -190,11 +210,13 @@ def _default_kernel_position() -> int:
 def _resolve_kernel_position(opts: Mapping[str, object]) -> int:
     """Return ascending-`device.id` rank position `p` in `0..31`."""
     raw_pos = opts.get("kernel_rank", opts.get("device_position"))
-    pos = (
-        _as_int(raw_pos, default=0)
-        if raw_pos is not None
-        else _default_kernel_position()
-    )
+    if raw_pos is None:
+        pos = _default_kernel_position()
+    elif isinstance(raw_pos, bool) or not isinstance(raw_pos, (int, str)):
+        msg = f"kernel_rank must be an integer, got {raw_pos!r}"
+        raise ValueError(msg)
+    else:
+        pos = int(raw_pos)
     if not 0 <= pos < TP_SIZE:
         msg = f"kernel_rank position must be in 0..{TP_SIZE - 1}, got {pos}"
         raise ValueError(msg)
@@ -296,17 +318,19 @@ def _slice_expert_shard(
 def load_tensor(
     name: str, tensor: torch.Tensor, options: Mapping[str, object] | None = None
 ) -> None:
-    """Capture `1/32` rank-sliced MXFP4 bytes and E8M0 scales before delattr."""
+    """Capture `1/32` rank-sliced routed-expert MXFP4 bytes and E8M0 scales before delattr."""
     opts = dict(options) if isinstance(options, Mapping) else {}
     if not opts.get("load_tensors", False):
         return
     low = name.lower()
+    if "shared_experts" in low:
+        return
     is_scale = any(
         tok in low for tok in ("weight_scale", "scale_inv", "e8m0", ".scales")
     )
     is_packed = any(
         tok in low
-        for tok in ("weight_packed", "blocks", "mxfp4", "experts", "w13", "w2")
+        for tok in ("weight_packed", "blocks", "mxfp4", ".experts.", "w13", "w2")
     )
     if (
         not (is_scale or is_packed)
@@ -395,16 +419,71 @@ def load_tensor(
     )
 
 
-def _parse_int_seq(val: object, default: Sequence[int]) -> tuple[int, ...]:
-    """Parse an integer sequence from a comma-separated string or iterable."""
-    if val is None:
-        return tuple(default)
-    if isinstance(val, str):
-        parts = [p.strip() for p in val.split(",") if p.strip()]
-        return tuple(int(p) for p in parts)
-    if isinstance(val, Iterable):
-        return tuple(_as_int(x) for x in val)
-    return (_as_int(val),)
+def _parse_strict_int(item: object, field_name: str) -> int:
+    """Parse an integer from `int` or decimal `str`, raising `ValueError` otherwise."""
+    if isinstance(item, bool) or not isinstance(item, (int, str)):
+        msg = f"invalid {field_name} entry {item!r}: expected integer"
+        raise ValueError(msg)
+    try:
+        return int(item)
+    except ValueError as exc:
+        msg = f"invalid {field_name} entry {item!r}: expected integer"
+        raise ValueError(msg) from exc
+
+
+def _parse_decode_buckets(raw_decode: object) -> tuple[int, ...]:
+    """Parse and validate positive decode bucket sizes."""
+    if raw_decode is None:
+        return DEFAULT_DECODE_BUCKETS
+    if raw_decode in ((), [], "none", False):
+        return ()
+    if isinstance(raw_decode, str):
+        items: list[object] = [p.strip() for p in raw_decode.split(",") if p.strip()]
+    elif isinstance(raw_decode, Iterable) and not isinstance(raw_decode, bytes):
+        items = list(raw_decode)
+    else:
+        msg = (
+            "buckets must be a comma-separated string or iterable of positive "
+            f"integers, got {raw_decode!r}"
+        )
+        raise ValueError(msg)
+    parsed: list[int] = []
+    for item in items:
+        val = _parse_strict_int(item, "buckets")
+        if val <= 0:
+            msg = f"invalid buckets entry {val}: must be > 0"
+            raise ValueError(msg)
+        parsed.append(val)
+    return tuple(sorted(set(parsed)))
+
+
+def _parse_verify_buckets(raw_verify: object) -> tuple[int, ...]:
+    """Parse and validate Kimi K3 verify bucket sizes (multiples of `VERIFY_TOKEN_COUNT`)."""
+    if raw_verify is None:
+        return DEFAULT_VERIFY_BUCKETS
+    if raw_verify in ((), [], "none", False):
+        return ()
+    if isinstance(raw_verify, str):
+        items: list[object] = [p.strip() for p in raw_verify.split(",") if p.strip()]
+    elif isinstance(raw_verify, Iterable) and not isinstance(raw_verify, bytes):
+        items = list(raw_verify)
+    else:
+        msg = (
+            "verify_buckets must be a comma-separated string or iterable of "
+            f"integers, got {raw_verify!r}"
+        )
+        raise ValueError(msg)
+    parsed: list[int] = []
+    for item in items:
+        val = _parse_strict_int(item, "verify_buckets")
+        if val < VERIFY_TOKEN_COUNT or val % VERIFY_TOKEN_COUNT != 0:
+            msg = (
+                f"invalid verify_buckets entry {val}: Kimi K3 verify buckets "
+                f"must be positive multiples of VERIFY_TOKEN_COUNT={VERIFY_TOKEN_COUNT}"
+            )
+            raise ValueError(msg)
+        parsed.append(val)
+    return tuple(sorted(set(parsed)))
 
 
 def _validate_hf_config(
@@ -516,33 +595,10 @@ def _resolve_buckets(
     opts: Mapping[str, object],
 ) -> tuple[tuple[int, ...], tuple[int, ...]]:
     """Resolve sorted decode and verify bucket tuples from plugin options."""
-    decode_buckets = tuple(
-        sorted(
-            {
-                b
-                for b in _parse_int_seq(opts.get("buckets"), DEFAULT_DECODE_BUCKETS)
-                if b > 0
-            }
-        )
+    decode_buckets = _parse_decode_buckets(opts.get("buckets"))
+    verify_buckets = _parse_verify_buckets(
+        opts.get("verify_buckets", DEFAULT_VERIFY_BUCKETS)
     )
-    raw_verify = opts.get("verify_buckets", DEFAULT_VERIFY_BUCKETS)
-    if raw_verify in ((), [], "none", False):
-        verify_buckets: tuple[int, ...] = ()
-    elif isinstance(raw_verify, str):
-        verify_buckets = parse_mk_verify_buckets(raw_verify)
-    elif isinstance(raw_verify, Iterable):
-        verify_buckets = tuple(
-            sorted(
-                {
-                    _as_int(b)
-                    for b in raw_verify
-                    if _as_int(b) >= VERIFY_TOKEN_COUNT
-                    and _as_int(b) % VERIFY_TOKEN_COUNT == 0
-                }
-            )
-        )
-    else:
-        verify_buckets = ()
     return decode_buckets, verify_buckets
 
 
@@ -654,6 +710,7 @@ class KimiK3MonoProgram:
         self.is_tpu = config.is_tpu
         self.options = dict(config.options)
         self.slot_map = SlotMap(num_slots=config.max_slots, groups=config.attention_dp)
+        self._group: dict[str, tuple[int, int]] = {}
         self.warmed: list[tuple[int, int]] = []
         self.mesh: object = None
         self.observed_weights: dict[str, ObservedMxfp4Entry] = dict(
@@ -685,18 +742,48 @@ class KimiK3MonoProgram:
             prof_ns, verify_tokens=verify_toks, token_paddings=token_paddings
         )
 
+    def _group_of(self, req_id: str, context_len: int = 0) -> int:
+        """Select or look up the attention-DP group (`0 .. attention_dp - 1`) for `req_id`."""
+        if self.attention_dp == 1:
+            return 0
+        if req_id in self._group:
+            g, _ = self._group[req_id]
+            self._group[req_id] = (g, context_len)
+            return g
+        count = [0] * self.attention_dp
+        context = [0] * self.attention_dp
+        for g, c in self._group.values():
+            count[g] += 1
+            context[g] += c
+        g = min(range(self.attention_dp), key=lambda k: (count[k], context[k]))
+        self._group[req_id] = (g, context_len)
+        return g
+
     def admit_requests(
         self,
         active_req_ids: Sequence[str],
         finished_req_ids: Iterable[str] = (),
         *,
-        group: int = 0,
+        group: int | None = None,
+        context_lens: Mapping[str, int] | None = None,
     ) -> list[int]:
-        """Release finished requests and allocate non-null SlotMap slots."""
-        self.slot_map.release(finished_req_ids)
-        return [
-            self.slot_map.allocate(req_id, group=group) for req_id in active_req_ids
-        ]
+        """Release finished requests and allocate attention-DP-grouped SlotMap slots."""
+        fin_list = [str(req_id) for req_id in finished_req_ids]
+        self.slot_map.release(fin_list)
+        for req_id in fin_list:
+            self._group.pop(req_id, None)
+        slots: list[int] = []
+        for req_id in active_req_ids:
+            ctx_len = (
+                int(context_lens.get(req_id, 0)) if context_lens is not None else 0
+            )
+            target_group = (
+                group
+                if group is not None
+                else self._group_of(req_id, context_len=ctx_len)
+            )
+            slots.append(self.slot_map.allocate(req_id, group=target_group))
+        return slots
 
     def buckets(self, token_paddings: Sequence[int]) -> Sequence[Bucket]:
         """Return decode and verify compilation buckets aligned to token paddings."""
@@ -835,42 +922,26 @@ class KimiK3MonoProgram:
         return WarmupCase(args=(ids, pos), check=_check)
 
     def _extract_attn_pair(self, md: object) -> tuple[object, object]:
-        """Extract `(mla_md, kda_md)` from per-layer attention metadata."""
+        """Extract `(mla_md, kda_md)` from per-layer attention metadata via `pools.is_mla_layer`."""
         if not isinstance(md, Mapping):
             return None, None
-        mla_md = md.get("mla")
-        kda_md = md.get("kda_0")
+        mla_md: object = None
+        kda_md: object = None
         for k, val in md.items():
-            key_low = str(k).lower()
-            if mla_md is None and "mla" in key_low:
-                mla_md = val
-            elif kda_md is None and ("kda" in key_low or "mamba" in key_low):
+            try:
+                idx = layer_index(str(k))
+            except ValueError:
+                continue
+            if is_mla_layer(idx):
+                if mla_md is None:
+                    mla_md = val
+            elif kda_md is None:
                 kda_md = val
-        if mla_md is None and md:
-            mla_md = next(iter(md.values()))
         return mla_md, kda_md
-
-    def _release_finished_from_metadata(self, md: object) -> None:
-        """Release finished request slots from step metadata on every step."""
-        if not isinstance(md, Mapping):
-            return
-        fin_ids = md.get("finished_req_ids", ())
-        if isinstance(fin_ids, Iterable) and not isinstance(fin_ids, (str, bytes)):
-            self.slot_map.release(str(f) for f in fin_ids)
-
-    def _allocate_active_from_metadata(self, md: object) -> None:
-        """Allocate slots for active requests on eligible steps."""
-        if not isinstance(md, Mapping):
-            return
-        req_ids = md.get("req_ids")
-        if isinstance(req_ids, Sequence) and not isinstance(req_ids, (str, bytes)):
-            for req_id in req_ids:
-                self.slot_map.allocate(str(req_id))
 
     def decide(self, ctx: object, fwd: ForwardView) -> StepDecision | None:
         """Evaluate step eligibility and select the target bucket."""
         attn_md = fwd.attn_metadata or {}
-        self._release_finished_from_metadata(attn_md)
         input_ids = getattr(ctx, "input_ids", None)
         positions = getattr(ctx, "positions", None)
         if (
@@ -881,16 +952,13 @@ class KimiK3MonoProgram:
             return None
         mla_md, kda_md = self._extract_attn_pair(attn_md)
         b_shape = fwd.batch_shape(mla_md, kda_md)
-        decision = check_step_eligibility(
+        return check_step_eligibility(
             b_shape,
             self.policy,
             compiled_buckets=set(fwd.steps.keys()),
             bucket_out_rows=self.bucket_out_rows,
             input_rows=int(input_ids.shape[0]),
         )
-        if decision.eligible:
-            self._allocate_active_from_metadata(attn_md)
-        return decision
 
     def forward(
         self, decision: StepDecision | None, ctx: object, fwd: ForwardView

@@ -364,9 +364,17 @@ def hook(export_key: str | None) -> Callable[[Any], None] | None:
     return configure
 
 
-
-def _placeholder(aval, spec, mesh):
+def _placeholder(
+    aval: jax.core.ShapedArray | jax.ShapeDtypeStruct,
+    spec: PartitionSpec,
+    mesh: Mesh | None,
+) -> torch.Tensor:
+    """Return a sharded TPU tensor placeholder, falling back to meta on CPU."""
     try:
         return _sharded_placeholder(aval.shape, aval.dtype, spec, mesh)
-    except Exception:
-        return torch.empty(tuple(pallas_impl.get_local_shape(aval.shape, mesh, spec)), dtype=pallas_impl.JAX_TO_TORCH_DTYPE_MAP.get(aval.dtype), device="meta")
+    except (RuntimeError, ValueError, TypeError):
+        return torch.empty(
+            tuple(pallas_impl.get_local_shape(aval.shape, mesh, spec)),
+            dtype=pallas_impl.JAX_TO_TORCH_DTYPE_MAP.get(aval.dtype),
+            device="meta",
+        )
