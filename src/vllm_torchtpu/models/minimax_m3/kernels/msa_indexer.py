@@ -41,7 +41,9 @@ from vllm_torchtpu.models.minimax_m3.kernels.packed_page import (
 DEFAULT_BLOCK_Q = 128
 DEFAULT_LARGE_BLOCK_Q = 512
 DEFAULT_PAGES_PER_STEP = 32
-DEFAULT_KERNEL = "v2"
+DEFAULT_KERNEL = "v3"
+# Large prefill tiles: v3's DMA ring is slower there on fp8 (1.79 vs 1.51 ms).
+DEFAULT_LARGE_KERNEL = "v2"
 _TILE_SHIFT = 16
 _GROUP_MASK = (1 << _TILE_SHIFT) - 1
 
@@ -118,6 +120,110 @@ def _kernel_v2(
         )
         maxima.append(jnp.max(s.reshape(len(group), page_size, block_q), axis=1))
     o_ref[...] = maxima[0] if len(maxima) == 1 else jnp.concatenate(maxima, axis=0)
+
+
+def _scores_v3(q, page_refs, o_ref):
+    """`_kernel_v2`'s scoring over pages already in VMEM."""
+    block_q = q.shape[0]
+    pages_per_step = len(page_refs)
+    rows, packing, _ = page_refs[0].shape
+    page_size = rows * packing
+    pages_per_dot = max(
+        1, min(pages_per_step, _MAX_SCORE_ELEMS // (page_size * block_q))
+    )
+    maxima = []
+    for first in range(0, pages_per_step, pages_per_dot):
+        group = page_refs[first : first + pages_per_dot]
+        keys = []
+        for r in group:
+            words = r.bitcast(jnp.uint32)[:, 0, :]
+            keys.append(pltpu.bitcast(words, r.dtype).astype(jnp.bfloat16))
+        keys = keys[0] if len(keys) == 1 else jnp.concatenate(keys, axis=0)
+        s = jax.lax.dot_general(
+            keys, q, (((1,), (1,)), ((), ())), preferred_element_type=jnp.float32
+        )
+        maxima.append(jnp.max(s.reshape(len(group), page_size, block_q), axis=1))
+    o_ref[...] = maxima[0] if len(maxima) == 1 else jnp.concatenate(maxima, axis=0)
+
+
+def _kernel_v3(
+    # Scalar prefetch
+    work_ref,  # [groups] tile << _TILE_SHIFT | page group within the request
+    tile_seq_ref,  # [tiles] request of each tile
+    block_tables_ref,  # [max_num_seqs * pages_per_seq]
+    seq_pages_ref,  # [max_num_seqs] pages of each request
+    # In
+    q_ref,  # [Bq, D]
+    cache_ref,  # [pages, S / p, p, D] index cache, left in HBM
+    # Out
+    o_ref,  # [G, Bq]
+    # Scratch
+    buf0,  # [G, S / p, p, D] pages of even steps
+    buf1,  # [G, S / p, p, D] pages of odd steps
+    sems,  # DMA semaphores [2, G]
+):
+    """`_kernel_v2` with the pages fetched by a hand-written double-buffered
+    DMA ring: one scalar address per page and no copy for pages past the
+    request's end (their scores are never read)."""
+    pages_per_step = buf0.shape[0]
+    pages_per_seq = block_tables_ref.shape[0] // seq_pages_ref.shape[0]
+    step, num_steps = pl.program_id(0), pl.num_programs(0)
+
+    def copies(w, buf, slot):
+        entry = work_ref[w]
+        seq = tile_seq_ref[entry >> _TILE_SHIFT]
+        first = (entry & _GROUP_MASK) * pages_per_step
+        live = jnp.maximum(seq_pages_ref[seq] - first, 1)
+        base = seq * pages_per_seq + first
+        out = []
+        for g in range(pages_per_step):
+            col = jnp.minimum(first + g, pages_per_seq - 1) - first
+            page = block_tables_ref[base + col]
+            out.append(
+                (
+                    g < live,
+                    pltpu.make_async_copy(
+                        cache_ref.at[page], buf.at[g], sems.at[slot, g]
+                    ),
+                )
+            )
+        return out
+
+    def start(w, buf, slot):
+        for live, copy in copies(w, buf, slot):
+            pl.when(live)(copy.start)
+
+    def wait(w, buf, slot):
+        for live, copy in copies(w, buf, slot):
+            pl.when(live)(copy.wait)
+
+    @pl.when(step == 0)
+    def _():
+        start(step, buf0, 0)
+
+    even = step % 2 == 0
+
+    @pl.when(step + 1 < num_steps)
+    def _():
+        @pl.when(even)
+        def _():
+            start(step + 1, buf1, 1)
+
+        @pl.when(jnp.logical_not(even))
+        def _():
+            start(step + 1, buf0, 0)
+
+    q = q_ref[...]
+
+    @pl.when(even)
+    def _():
+        wait(step, buf0, 0)
+        _scores_v3(q, [buf0.at[g] for g in range(pages_per_step)], o_ref)
+
+    @pl.when(jnp.logical_not(even))
+    def _():
+        wait(step, buf1, 1)
+        _scores_v3(q, [buf1.at[g] for g in range(pages_per_step)], o_ref)
 
 
 _KERNELS = {"v1": _kernel_v1, "v2": _kernel_v2}
@@ -211,16 +317,42 @@ def _class_scores(
             lambda w, work, *_: (work[w] & _GROUP_MASK, work[w] >> _TILE_SHIFT),
         ),
     )
-    scores_t = pl.pallas_call(
-        _KERNELS[kernel],
-        grid_spec=grid_spec,
-        out_shape=jax.ShapeDtypeStruct(
-            (padded_pages, max_tiles * block_q), jnp.float32
-        ),
-        compiler_params=pltpu.CompilerParams(dimension_semantics=("arbitrary",)),
-        interpret=interpret,
-        name="minimax_m3_msa_block_scores",
-    )(work, tile_seq, block_tables, q_tiles, *([index_cache] * pages_per_step))
+    out_shape = jax.ShapeDtypeStruct((padded_pages, max_tiles * block_q), jnp.float32)
+    params = pltpu.CompilerParams(dimension_semantics=("arbitrary",))
+    if kernel == "v3":
+        scores_t = pl.pallas_call(
+            _kernel_v3,
+            grid_spec=pltpu.PrefetchScalarGridSpec(
+                num_scalar_prefetch=4,
+                grid=grid_spec.grid,
+                in_specs=[grid_spec.in_specs[0], pl.BlockSpec(memory_space=pl.ANY)],
+                out_specs=grid_spec.out_specs,
+                scratch_shapes=[
+                    pltpu.VMEM(
+                        (pages_per_step, rows_per_page, packing, head_dim),
+                        index_cache.dtype,
+                    ),
+                    pltpu.VMEM(
+                        (pages_per_step, rows_per_page, packing, head_dim),
+                        index_cache.dtype,
+                    ),
+                    pltpu.SemaphoreType.DMA((2, pages_per_step)),
+                ],
+            ),
+            out_shape=out_shape,
+            compiler_params=params,
+            interpret=interpret,
+            name="minimax_m3_msa_block_scores",
+        )(work, tile_seq, block_tables, seq_pages, q_tiles, index_cache)
+    else:
+        scores_t = pl.pallas_call(
+            _KERNELS[kernel],
+            grid_spec=grid_spec,
+            out_shape=out_shape,
+            compiler_params=params,
+            interpret=interpret,
+            name="minimax_m3_msa_block_scores",
+        )(work, tile_seq, block_tables, q_tiles, *([index_cache] * pages_per_step))
 
     # Back to token order: token t of request r sits in r's tiles at its offset.
     tok = jnp.arange(num_tokens, dtype=jnp.int32)
@@ -241,6 +373,7 @@ def _class_scores(
         "large_block_q",
         "pages_per_step",
         "kernel",
+        "large_kernel",
         "interpret",
     ),
 )
@@ -256,6 +389,7 @@ def block_scores(
     large_block_q: int = DEFAULT_LARGE_BLOCK_Q,
     pages_per_step: int = DEFAULT_PAGES_PER_STEP,
     kernel: str = DEFAULT_KERNEL,
+    large_kernel: str = DEFAULT_LARGE_KERNEL,
     interpret: bool = False,
 ) -> jax.Array:
     """Block-max index scores ``[T, 1, P]`` (``P`` padded to the page group).
@@ -269,8 +403,10 @@ def block_scores(
       index_q: ``[T, 1, D]`` index queries (one index head per rank).
       index_cache: ``[pages, S / p, p, D]`` key-only cache (bf16 or fp8).
       seq_lens, block_tables, cu_q_lens, num_seqs: ragged batch metadata.
-      kernel: ``"v2"`` (bitcast unpack, query latched across pages) or the
-        original ``"v1"``, kept as the reference arm for benchmarks.
+      kernel: ``"v2"`` (bitcast unpack, query latched across pages), ``"v3"``
+        (v2 with a hand-written DMA ring for the pages) or the original
+        ``"v1"``, kept as the reference arm for benchmarks.
+      large_kernel: the same choice for the `large_block_q` tiles.
     Pages past a token's own page hold scores of keys it must not see, and
     pages past its request's last page are not written; callers mask both.
     """
@@ -293,11 +429,13 @@ def block_scores(
         block_tables,
         cu_q_lens,
         pages_per_step=pages_per_step,
-        kernel=kernel,
         interpret=interpret,
     )
     small = score(
-        active & ~is_large, block_q=block_q, max_tiles=min(max_num_seqs, num_tokens)
+        active & ~is_large,
+        block_q=block_q,
+        max_tiles=min(max_num_seqs, num_tokens),
+        kernel=kernel,
     )
     # Large requests have more than block_q tokens each.
     max_large = min(max_num_seqs, num_tokens // (block_q + 1))
@@ -307,6 +445,7 @@ def block_scores(
         is_large,
         block_q=large_block_q,
         max_tiles=num_tokens // large_block_q + max_large,
+        kernel=large_kernel,
     )
     tok = jnp.arange(num_tokens, dtype=jnp.int32)
     seq = jnp.minimum(
