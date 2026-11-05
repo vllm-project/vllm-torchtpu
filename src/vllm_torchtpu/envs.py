@@ -121,7 +121,7 @@ if TYPE_CHECKING:
     MOE_FUSED_EP_PUSH_I32_SCALE_SLAB: bool = False
     MOE_FUSED_EP_PUSH_VMEM_COMBINE: bool = False
     MOE_FUSED_EP_PUSH_STAGING_SLOTS: int = 0
-    MOE_FUSED_EP_PUSH_SHARED_EXPERT: bool = False
+    MOE_FUSED_EP_PUSH_SHARED_EXPERT: bool = True
     MOE_FUSED_EP_PUSH_LIGHT_PREPUSH: int = 0
     TPU_EXPERT_PLACEMENT: str = ""
     TPU_LATENT_PROJ_INTRA_CHIP_TP: bool = False
@@ -972,7 +972,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # fused kernel of TPU_DEEPSEEK_V41_FUSED_SHARED_EXPERT) inside the MoE op,
     # issued after the SparseCore pre-push and ahead of the expert kernel, so
     # the TensorCore computes it while the pre-push is in flight.
-    "MOE_FUSED_EP_PUSH_SHARED_EXPERT": env_bool("MOE_FUSED_EP_PUSH_SHARED_EXPERT"),
+    "MOE_FUSED_EP_PUSH_SHARED_EXPERT": env_bool("MOE_FUSED_EP_PUSH_SHARED_EXPERT", default=True),
     # Shard Kimi K3's latent-MoE down/up projections across the cores of a
     # chip instead of replicating them. They are unquantized [7168, 3584] and
     # [3584, 7168] matmuls run at full HBM bandwidth, ~22% of decode device
