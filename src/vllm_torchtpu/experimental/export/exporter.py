@@ -71,7 +71,7 @@ DEBUG_TAPS_MANIFEST = "taps.json"
 
 @dataclasses.dataclass
 class _DebugTaps:
-    """Modules whose outputs the debug variants of `forward` and `mtp_draft`
+    """Modules whose outputs the debug variants of `forward` and `draft`
     return, and the manifest entries those variants add."""
 
     forward: dict[str, Any]
@@ -632,7 +632,7 @@ _MTP_PARAM_PREFIX = "mtp."
 def _mtp_user_inputs(
     model: api.ExportableTextOnlyLLM, bucket_size: int
 ) -> list[tuple[str, tuple[int, ...]]]:
-    """`(name, shape)` of the int32 user inputs of `mtp_draft_bucket{B}`."""
+    """`(name, shape)` of the int32 user inputs of `draft_bucket{B}`."""
     cfg = model.export_config
     return [
         *_user_inputs(cfg, bucket_size, _req_dist_len(model)),
@@ -697,8 +697,8 @@ def _export_text_only_llm_functions(
     debug_taps: _DebugTaps | None = None,
 ) -> dict[str, dict[str, Any]]:
     """Lowers `forward`, `compute_logits`, the samplers and, with MTP drafting,
-    `mtp_draft` across all buckets, plus `debug_taps`' variants of `forward`
-    and `mtp_draft` for the smallest bucket."""
+    `draft` across all buckets, plus `debug_taps`' variants of `forward`
+    and `draft` for the smallest bucket."""
     cfg: api.TextOnlyLLMExportConfig = model.export_config
     act_dtype_str = tpu_lowering.dtype_name(cfg.dtype)
     tp_size = cfg.tensor_parallel_size
@@ -935,7 +935,7 @@ def _export_text_only_llm_functions(
         **sampler_variants,
     }
     if mtp_weight_names:
-        functions["mtp_draft"] = _export_mtp_draft(
+        functions["draft"] = _export_mtp_draft(
             model,
             params_map,
             layouts,
@@ -963,7 +963,7 @@ def _export_mtp_draft(
     constants: frozenset[str],
     debug_taps: _DebugTaps | None = None,
 ) -> dict[str, Any]:
-    """Lowers `mtp_draft_bucket{B}` for every forward bucket, and `debug_taps`'
+    """Lowers the drafter `draft_bucket{B}` for every forward bucket, and `debug_taps`'
     variant for the smallest.
 
     Inputs: the forward's user inputs with `input_ids` shifted by one token,
@@ -1004,7 +1004,7 @@ def _export_mtp_draft(
             bucket_size=bucket_size,
             weight_reshapes=reshapes,
         )
-        file = f"mtp_draft_bucket{bucket_size}.mlir"
+        file = f"draft_bucket{bucket_size}.mlir"
         rel = f"{subdir}/{file}" if subdir else file
         with open(os.path.join(target_dir, file), "w") as f:
             f.write(mlir)
@@ -1023,7 +1023,7 @@ def _export_mtp_draft(
                 tap_names=tap_names,
             )
             debug_taps.write(
-                "mtp_draft", bucket_size, debug_mlir, tap_names, len(state_specs) + 1
+                "draft", bucket_size, debug_mlir, tap_names, len(state_specs) + 1
             )
 
         inputs: list[dict[str, Any]] = [

@@ -195,7 +195,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help=(
             "Comma-separated glob patterns of module names (e.g. "
             "'model.layers.3.self_attn,mtp.fc'; MTP draft modules start with "
-            "'mtp.'). Also exports forward and mtp_draft for the smallest token "
+            "'mtp.'). Also exports forward and draft for the smallest token "
             "bucket with those modules' outputs as extra results, under "
             "assets.extra/debug/, for comparing intermediates against vLLM. The "
             "serving artifact is unchanged."
