@@ -143,15 +143,28 @@ def derive_metadata(
     return token_to_req_indices, slot_mapping_slots, kv_slot_mapping
 
 
-def _get_packing_indices(keep, size):
-    order = jnp.nonzero(keep, size=size, fill_value=-1)[0]
-    valid = order >= 0
-    safe = jnp.where(valid, order, 0)
-    return safe, valid
+def _pack(
+    keep: jax.Array, size: int, *columns: tuple[jax.Array, int | bool]
+) -> tuple[jax.Array, ...]:
+    """Packs each ``(x, default)`` column's elements where ``keep`` holds to
+    the front, in order, padded to ``size`` with ``default``.
 
-
-def _pack_array(x, safe, valid, default_value):
-    return jnp.where(valid, x[safe], default_value)
+    Equal to ``x[jnp.nonzero(keep, size=size)]`` per column, but done as one
+    scatter to each kept element's rank: XLA runs those gathers on the
+    SparseCore one after another, and the TensorCore waits on each.
+    """
+    # The scatter carries every column as int32, which only these hold exactly.
+    assert all(x.dtype in (jnp.int32, jnp.bool_) for x, _ in columns)
+    rank = jnp.cumsum(keep.astype(jnp.int32)) - 1
+    dest = jnp.where(keep, rank, size)
+    values = jnp.stack([x.astype(jnp.int32) for x, _ in columns], axis=1)
+    defaults = jnp.array([d for _, d in columns], dtype=jnp.int32)
+    packed = (
+        jnp.broadcast_to(defaults, (size, len(columns)))
+        .at[dest]
+        .set(values, mode="drop")
+    )
+    return tuple(packed[:, i].astype(x.dtype) for i, (x, _) in enumerate(columns))
 
 
 def prepare_boundary_batch(
@@ -173,14 +186,15 @@ def prepare_boundary_batch(
     max_prefill_boundary = num_tokens // compress_ratio + 1 + num_reqs
     packed_size = num_tokens + max_prefill_boundary
 
-    # 1. Get packing indices for all boundary tokens
-    safe, valid = _get_packing_indices(is_boundary, packed_size)
-
-    # 2. Pack inputs and the decode mask
-    pos = _pack_array(positions, safe, valid, 0)
-    req = _pack_array(token_to_req_indices, safe, valid, 0)
-    kv = _pack_array(kv_slot_mapping, safe, valid, -1)
-    is_decode = _pack_array(is_decode_token, safe, valid, False)
+    # 1-2. Pack the boundary tokens' inputs and decode mask to the front
+    pos, req, kv, is_decode = _pack(
+        is_boundary,
+        packed_size,
+        (positions, 0),
+        (token_to_req_indices, 0),
+        (kv_slot_mapping, -1),
+        (is_decode_token, False),
+    )
 
     valid_token = kv >= 0
     is_prefill = valid_token & ~is_decode
