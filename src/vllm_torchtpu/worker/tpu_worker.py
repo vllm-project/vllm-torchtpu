@@ -296,32 +296,48 @@ class TPUWorker(WorkerBase):
                 # every worker in this replica, since it's sliced
                 # deterministically out of the same parent-established list
                 # every sibling worker also inherited.
-                full_sb_addresses = os.environ.get(
-                    "TORCH_TPU_SLICEBUILDER_ADDRESSES", ""
-                )
-                sb_addresses = full_sb_addresses.split(",") if full_sb_addresses else []
-                start = dp_rank * per_engine_world
-                my_sb_addresses = sb_addresses[start : start + per_engine_world]
-                if len(my_sb_addresses) == per_engine_world:
-                    os.environ["TORCH_TPU_SLICEBUILDER_ADDRESSES"] = ",".join(
-                        my_sb_addresses
-                    )
+                if per_engine_world == 1:
+                    # A one-device replica (DP=N x TP=1) needs no distributed
+                    # PjRt bootstrap, as in
+                    # TpuPlatform._prepare_singlehost_tpu_env, and torch_tpu has
+                    # no one-device topology to look up. Drop the inherited
+                    # full-slice bootstrap so this worker opens only the chip
+                    # pinned below.
+                    for name in (
+                        "TORCH_TPU_SLICEBUILDER_ADDRESSES",
+                        "TORCH_TPU_TOPOLOGY",
+                        "WORLD_SIZE",
+                    ):
+                        os.environ.pop(name, None)
                 else:
-                    logger.warning(
-                        "Expected %d slicebuilder addresses for dp_rank=%d "
-                        "at offset %d, found %d in inherited list %r; "
-                        "leaving TORCH_TPU_SLICEBUILDER_ADDRESSES as-is.",
-                        per_engine_world,
-                        dp_rank,
-                        start,
-                        len(my_sb_addresses),
-                        full_sb_addresses,
+                    full_sb_addresses = os.environ.get(
+                        "TORCH_TPU_SLICEBUILDER_ADDRESSES", ""
                     )
-                from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
+                    sb_addresses = (
+                        full_sb_addresses.split(",") if full_sb_addresses else []
+                    )
+                    start = dp_rank * per_engine_world
+                    my_sb_addresses = sb_addresses[start : start + per_engine_world]
+                    if len(my_sb_addresses) == per_engine_world:
+                        os.environ["TORCH_TPU_SLICEBUILDER_ADDRESSES"] = ",".join(
+                            my_sb_addresses
+                        )
+                    else:
+                        logger.warning(
+                            "Expected %d slicebuilder addresses for dp_rank=%d "
+                            "at offset %d, found %d in inherited list %r; "
+                            "leaving TORCH_TPU_SLICEBUILDER_ADDRESSES as-is.",
+                            per_engine_world,
+                            dp_rank,
+                            start,
+                            len(my_sb_addresses),
+                            full_sb_addresses,
+                        )
+                    from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
 
-                os.environ["TORCH_TPU_TOPOLOGY"] = TpuPlatform._get_tpu_topology(
-                    per_engine_world
-                )
+                    os.environ["TORCH_TPU_TOPOLOGY"] = TpuPlatform._get_tpu_topology(
+                        per_engine_world
+                    )
                 # Request this worker's own physical chip explicitly,
                 # instead of relying on the flattened-rank chip binding EP
                 # uses, so independent replicas don't contend for the same

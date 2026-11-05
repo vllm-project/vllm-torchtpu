@@ -18,6 +18,7 @@ they cover; see vllm-project/vllm-torchtpu#713.
 """
 
 import dataclasses
+import logging
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -30,6 +31,7 @@ from vllm.config import (
     SchedulerConfig,
     VllmConfig,
     get_current_vllm_config_or_none,
+    set_current_vllm_config,
 )
 from vllm.model_executor.layers.attention import Attention, MLAAttention
 from vllm.model_executor.layers.mamba.abstract import MambaBase
@@ -61,6 +63,7 @@ from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
 from vllm_torchtpu.runner.kv_cache_dsv4 import DsV4KVCacheAllocator
 from vllm_torchtpu.runner.kv_cache_manager import (
     KVCacheManager,
+    _warn_if_kv_cache_is_padded,
     check_kv_caches_cover_block_ids,
     sparse_mla_page_size_bytes,
 )
@@ -2589,3 +2592,35 @@ class TestUpdateAttentionPageSizePadded:
                 256, 2, 256, torch.bfloat16
             )
         )
+
+
+@pytest.mark.parametrize(
+    "backend,head_size,mentions_hnd",
+    [
+        (PallasBatchedRPAAttentionBackend, 256, True),
+        (PallasBatchedRPAAttentionBackend, 64, False),
+        (PallasAttentionBackend, 256, False),
+    ],
+)
+def test_warn_if_kv_cache_is_padded_mentions_hnd_for_custom_non_hd64(
+    backend, head_size, mentions_hnd
+):
+    messages: list[str] = []
+    handler = logging.Handler(logging.WARNING)
+    handler.emit = lambda record: messages.append(record.getMessage())
+    vllm_logger = logging.getLogger("vllm")
+    old_level = vllm_logger.level
+    old_disable = logging.root.manager.disable
+    vllm_logger.addHandler(handler)
+    vllm_logger.setLevel(logging.WARNING)
+    logging.disable(logging.NOTSET)
+    try:
+        with set_current_vllm_config(VllmConfig()):
+            _warn_if_kv_cache_is_padded(backend, 256, 1, head_size, torch.float8_e4m3fn)
+    finally:
+        vllm_logger.removeHandler(handler)
+        vllm_logger.setLevel(old_level)
+        logging.disable(old_disable)
+
+    assert len(messages) == 1
+    assert ("VLLM_KV_CACHE_LAYOUT=HND" in messages[0]) is mentions_hnd
