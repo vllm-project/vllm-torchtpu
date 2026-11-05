@@ -51,6 +51,18 @@ args = sys.argv[1:]
 if args[:2] == ["meta-data", "set"]:
     with log_path.open("a", encoding="utf-8") as fh:
         fh.write(json.dumps({"meta": [args[2], args[3]]}) + "\\n")
+elif args[:2] == ["meta-data", "exists"]:
+    entries = (
+        [
+            json.loads(line)
+            for line in log_path.read_text(encoding="utf-8").splitlines()
+        ]
+        if log_path.exists()
+        else []
+    )
+    sys.exit(
+        0 if any(e.get("meta", [None])[0] == args[2] for e in entries) else 100
+    )
 elif args[:2] == ["pipeline", "upload"]:
     content = sys.stdin.read()
     if "--dry-run" in args:
@@ -125,6 +137,9 @@ class _RunRecorder:
         env_map = env or {}
         if args[:2] == ("meta-data", "set"):
             self.meta.append((args[2], args[3]))
+        elif args[:2] == ("meta-data", "exists"):
+            exists = any(k == args[2] for k, _ in self.meta)
+            return subprocess.CompletedProcess(args, 0 if exists else 100, stdout="")
         elif args[:1] == ("annotate",):
             # args: ("annotate", "--style", <style>, "--context", <ctx>, <note>)
             self.annotations.append((args[2], args[4], args[5]))
@@ -241,7 +256,11 @@ class TestBootstrapUnits(unittest.TestCase):
             ),
         ):
             self.assertEqual(
-                bp.upload_stages(stages, step["env"], repo_root=_REPO_ROOT),
+                bp.upload_stages(
+                    stages,
+                    {**step["env"], "BUILDKITE_STEP_KEY": step["key"]},
+                    repo_root=_REPO_ROOT,
+                ),
                 0,
             )
         return rec
@@ -845,6 +864,7 @@ class TestBootstrapUnits(unittest.TestCase):
             {
                 "BUILDKITE_PULL_REQUEST": "42",
                 "BUILDKITE_BUILD_AUTHOR_EMAIL": "Alice@Example.com",
+                "CI_FLEET": "kube",
             }
         )
         self.assertEqual(
@@ -853,6 +873,8 @@ class TestBootstrapUnits(unittest.TestCase):
                 ("JOB_PRIORITY", "6"),
                 ("WORKLOAD_PRIORITY", "pre-merge"),
                 ("VLLM_COMMIT_HASH", self.pinned),
+                ("upload-stages:upload_stage_0:cpu", "1"),
+                ("upload-stages:upload_stage_0:build", "1"),
             ],
         )
         self.assertEqual(
@@ -867,6 +889,9 @@ class TestBootstrapUnits(unittest.TestCase):
             ":pipeline: Upload tests, integration, verify",
             pr.uploads[0][1],
         )
+        self.assertEqual(
+            json.loads(pr.uploads[0][1])["steps"][1]["env"]["CI_FLEET"], "kube"
+        )
         self.assertEqual(pr.uploads[2][2]["OMNI_IMAGE_SKIP"], "")
         self.assertNotIn("tpu-pr/alice@example.com", pr.uploads[1][1])
         pr_stage1 = self._run_next_stage(pr)
@@ -874,9 +899,40 @@ class TestBootstrapUnits(unittest.TestCase):
             [u[0] for u in pr_stage1.uploads],
             ["verify", "integration", "tests"],
         )
+        self.assertEqual(
+            pr_stage1.meta,
+            [
+                ("upload-stages:upload_stage_1:verify", "1"),
+                ("upload-stages:upload_stage_1:integration", "1"),
+                ("upload-stages:upload_stage_1:tests", "1"),
+            ],
+        )
         self.assertIn("tpu-pr/alice@example.com", pr_stage1.uploads[2][1])
 
-        # 3-stage test-only suite chains stages 0 -> 1 -> 2 with distinct stage keys.
+        # Automatic retry after agent loss skips lanes already recorded in meta-data.
+        retry_rec = _RunRecorder(bp)
+        retry_rec.meta = [
+            ("upload-stages:upload_stage_1:verify", "1"),
+            ("upload-stages:upload_stage_1:integration", "1"),
+        ]
+        with (
+            mock.patch.object(bp, "_agent", side_effect=retry_rec.agent),
+            mock.patch.object(
+                bp, "upload_with_priority", side_effect=retry_rec.upload_with_priority
+            ),
+        ):
+            self.assertEqual(
+                bp.upload_stages(
+                    (("tests", "integration", "verify"),),
+                    {"JOB_PRIORITY": "6", "BUILDKITE_STEP_KEY": "upload_stage_1"},
+                    repo_root=_REPO_ROOT,
+                ),
+                0,
+            )
+        self.assertEqual([u[0] for u in retry_rec.uploads], ["tests"])
+        self.assertIn(("upload-stages:upload_stage_1:tests", "1"), retry_rec.meta)
+
+        # 3-stage test-only suite chains stages 0 -> 1 -> 2 with upload_stage_1, _2.
         three_stage_suite = bp.Suite(
             "three-stage",
             "3-stage test suite",
@@ -888,12 +944,12 @@ class TestBootstrapUnits(unittest.TestCase):
                 [u[0] for u in chain_s0.uploads],
                 ["upload_stages", "cpu", "build"],
             )
-            chain_s1 = self._run_next_stage(chain_s0, expected_key="upload_stage_2")
+            chain_s1 = self._run_next_stage(chain_s0, expected_key="upload_stage_1")
             self.assertEqual(
                 [u[0] for u in chain_s1.uploads],
                 ["upload_stages", "integration", "tests"],
             )
-            chain_s2 = self._run_next_stage(chain_s1, expected_key="upload_stage_1")
+            chain_s2 = self._run_next_stage(chain_s1, expected_key="upload_stage_2")
             self.assertEqual([u[0] for u in chain_s2.uploads], ["verify"])
 
         # PR run-perf-eval: pr+perf-eval suite, NIGHTLY unset.
@@ -1010,7 +1066,7 @@ class TestBootstrapUnits(unittest.TestCase):
             }
         )
         self.assertEqual(
-            nightly.meta, [("JOB_PRIORITY", "1"), ("VLLM_COMMIT_HASH", self.pinned)]
+            nightly.meta[:2], [("JOB_PRIORITY", "1"), ("VLLM_COMMIT_HASH", self.pinned)]
         )
         tag_fx = self._run_bootstrap(
             {"BUILDKITE_TAG": "v0.32.0", "BUILDKITE_BRANCH": "v0.32.0"}
@@ -1040,7 +1096,7 @@ class TestBootstrapUnits(unittest.TestCase):
             }
         )
         self.assertEqual(
-            torchtpu_nightly.meta,
+            torchtpu_nightly.meta[:2],
             [("JOB_PRIORITY", "1"), ("VLLM_COMMIT_HASH", self.pinned)],
         )
         self.assertEqual(

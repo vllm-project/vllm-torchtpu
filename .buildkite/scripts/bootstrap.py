@@ -43,7 +43,9 @@ _REPO_ROOT = _SCRIPT_DIR.parents[1]
 _CREDENTIAL_HELPER = pathlib.Path("/etc/buildkite-agent/git-credential-github-app")
 _GITHUB_API_URL = "https://api.github.com"
 
-# Max TPU jobs one author's PR builds may have in flight on kube (~2 PRs at ~19 jobs).
+# Max TPU jobs one author's PR builds may have in flight on kube (~2 PRs at ~19
+# jobs); extra jobs wait in Buildkite as `limited` and take no Kueue slot, while
+# nightly, post-merge, and release builds run uncapped.
 PR_TPU_JOBS_PER_AUTHOR = 40
 
 
@@ -103,10 +105,11 @@ class BuildContext:
             _RELEASE_TAG_RE.match(self.tag) or _RELEASE_BRANCH_RE.match(self.branch)
         )
 
-    @property
-    def suite_label(self) -> str | None:
-        allowed = tuple(_PR_SUITES) if self.is_pr else ("skip-tpu-ci",)
-        matches = [label for label in allowed if label in self.labels]
+    def check_suite_labels(self) -> None:
+        """Raise `BootstrapError` if mutually exclusive PR suite labels are set."""
+        if not self.is_pr:
+            return
+        matches = [label for label in _PR_SUITES if label in self.labels]
         if len(matches) > 1:
             joined = ", ".join(matches)
             raise BootstrapError(
@@ -115,7 +118,12 @@ class BuildContext:
                 "run-full-ci in the **Labels** sidebar on the GitHub PR "
                 "page, then retry the **Bootstrap Pipeline** step."
             )
-        return matches[0] if matches else None
+
+    @property
+    def suite_label(self) -> str | None:
+        self.check_suite_labels()
+        allowed = tuple(_PR_SUITES) if self.is_pr else ("skip-tpu-ci",)
+        return next((label for label in allowed if label in self.labels), None)
 
     @classmethod
     def from_env(cls, env: Mapping[str, str]) -> BuildContext:
@@ -567,12 +575,13 @@ def upload_stages(
     env: Mapping[str, str] | None = None,
     *,
     repo_root: pathlib.Path = _REPO_ROOT,
+    stage_index: int = 0,
 ) -> int:
     """Upload `stages[0]`'s lane files and, if more stages remain, `wait` + uploader.
 
     The `wait` step gates `rest` on every step uploaded in `stages[0]` (including
     both Docker image builds in `pipeline_build.yml`, such as `-omni`, and all
-    `pipeline_cpu.yml` checks).
+    `pipeline_cpu.yml` checks); a retried uploader skips lanes it already uploaded.
     """
     for stage in stages:
         for lane in stage:
@@ -581,6 +590,10 @@ def upload_stages(
                 raise BootstrapError(f"ERROR: lane file '{lane_file}' not found")
 
     child_env = dict(os.environ if env is None else env)
+    step_key = child_env.get("BUILDKITE_STEP_KEY", "")
+    if step_key.startswith("upload_stage_"):
+        stage_index = int(step_key.removeprefix("upload_stage_"))
+    stage_key = f"upload_stage_{stage_index}"
     job_priority = int(_env_or(child_env, "JOB_PRIORITY", str(PRIORITIES["other"][0])))
     nightly = _env_or(child_env, "NIGHTLY", "0") == "1"
     concurrency_group = child_env.get("PR_TPU_CONCURRENCY_GROUP") or None
@@ -592,7 +605,12 @@ def upload_stages(
     if rest:
         step_env = {
             k: child_env[k]
-            for k in ("JOB_PRIORITY", "NIGHTLY", "PR_TPU_CONCURRENCY_GROUP")
+            for k in (
+                "CI_FLEET",
+                "JOB_PRIORITY",
+                "NIGHTLY",
+                "PR_TPU_CONCURRENCY_GROUP",
+            )
             if child_env.get(k)
         }
         stage_args = " ".join(",".join(s) for s in rest)
@@ -602,7 +620,7 @@ def upload_stages(
                 "wait",
                 {
                     "label": f":pipeline: Upload {', '.join(rest[0])}",
-                    "key": f"upload_stage_{len(rest)}",
+                    "key": f"upload_stage_{stage_index + 1}",
                     "agents": {"queue": "cpu"},
                     "timeout_in_minutes": 15,
                     "retry": {
@@ -625,6 +643,15 @@ def upload_stages(
         )
 
     for lane in reversed(stages[0]):
+        meta_key = f"upload-stages:{stage_key}:{lane}"
+        if (
+            _agent(
+                "meta-data", "exists", meta_key, check=False, env=child_env
+            ).returncode
+            == 0
+        ):
+            print(f"Skipping {lane} (already uploaded for {stage_key})")
+            continue
         lane_file = f".buildkite/pipeline_{lane}.yml"
         print(f"Uploading {lane_file}")
         upload_with_priority(
@@ -635,6 +662,7 @@ def upload_stages(
             pr_tpu_concurrency_group=concurrency_group,
             env=child_env,
         )
+        _agent("meta-data", "set", meta_key, "1", env=child_env)
     return 0
 
 
@@ -654,7 +682,7 @@ def run_bootstrap(
     if ctx.is_post_merge and (pr := parse_merged_pr_number(ctx.message)):
         ctx = replace(ctx, labels=_github_labels(pr, env=child_env))
     try:
-        _ = ctx.suite_label
+        ctx.check_suite_labels()
     except BootstrapError as exc:
         _agent(
             "annotate",
@@ -750,6 +778,9 @@ def run_bootstrap(
         if has_tests
         else "Only the tests lane uses the -omni image; this build has none."
     )
+    # Key the concurrency group on the commit author's email: every webhook
+    # build carries it, whereas BUILDKITE_BUILD_CREATOR_EMAIL is missing when
+    # the GitHub account is not linked to a Buildkite user.
     concurrency_group = (
         f"tpu-pr/{ctx.author_email.lower()}"
         if (ctx.is_pr and ctx.author_email)
@@ -839,7 +870,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             stages = tuple(_split_labels(arg) for arg in args[1:])
             if not stages or not all(stages):
                 raise BootstrapError(_USAGE)
-            rc = upload_stages(stages)
+            rc = upload_stages(stages, stage_index=1)
         else:
             raise BootstrapError(_USAGE)
     except BootstrapError as exc:
