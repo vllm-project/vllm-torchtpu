@@ -99,6 +99,110 @@ def patch_vision_mrope_lane_swap() -> None:
             pass
 
 
+_GEMMA4_HF_MODELING = "transformers.models.gemma4.modeling_gemma4"
+_orig_apply_multidimensional_rope = None
+
+
+def _rotate_half_matrix(num_channels: int, chunk: int, device, dtype):
+    """Signed permutation P with ``x @ P == cat(rotate_half(x_k) for x_k)``.
+
+    ``x`` is split into contiguous chunks of ``chunk`` channels; each chunk is
+    rotated with HF's ``rotate_half`` (``cat(-x2, x1)``). Every output channel
+    reads exactly one input channel scaled by +1 or -1, so the product is exact.
+    Built from ``arange`` so a compiled graph folds it to a constant.
+    """
+    import torch
+
+    idx = torch.arange(num_channels, device=device)
+    row = idx.unsqueeze(1)  # input channel
+    col = idx.unsqueeze(0)  # output channel
+    half = chunk // 2
+    same_chunk = (row // chunk) == (col // chunk)
+    row_pos = row % chunk
+    col_pos = col % chunk
+    # out[j] = -x[j + half] for the first half of each chunk.
+    neg = same_chunk & (col_pos < half) & (row_pos == col_pos + half)
+    # out[j] = x[j - half] for the second half of each chunk.
+    pos = same_chunk & (col_pos >= half) & (row_pos == col_pos - half)
+    return pos.to(dtype) - neg.to(dtype)
+
+
+def tpu_apply_multidimensional_rope(
+    x,
+    cos,
+    sin,
+    position_ids,
+    unsqueeze_dim: int = 2,
+):
+    """Single-pass replacement for HF ``apply_multidimensional_rope`` (b/581011672).
+
+    HF splits the head into ``ndim`` contiguous chunks, applies 1D RoPE to each
+    chunk via ``rotate_half`` (slice + negate + concat) and concatenates the
+    results. For the Gemma-4 vision tower (head_dim 72, ndim 2) this slices
+    18-channel pieces, which pads badly on 128-lane TPU vregs.
+
+    This computes the same result on the full head in one pass:
+        y = x * cos + (x @ P) * sin
+    where ``P`` is the block-diagonal signed permutation that applies
+    ``rotate_half`` within each chunk. Falls back to the HF implementation for
+    layouts that do not split evenly.
+    """
+    import torch
+
+    ndim = position_ids.shape[-1]
+    num_channels = x.shape[-1]
+    chunk = 2 * (num_channels // (2 * ndim))
+    if (
+        chunk <= 0
+        or chunk * ndim != num_channels
+        or cos.shape[-1] != num_channels
+        or sin.shape[-1] != num_channels
+    ):
+        assert _orig_apply_multidimensional_rope is not None
+        return _orig_apply_multidimensional_rope(
+            x, cos, sin, position_ids, unsqueeze_dim=unsqueeze_dim
+        )
+
+    rot = _rotate_half_matrix(num_channels, chunk, x.device, x.dtype)
+    cos = cos.unsqueeze(unsqueeze_dim)
+    sin = sin.unsqueeze(unsqueeze_dim)
+    return (x * cos) + (torch.matmul(x, rot) * sin)
+
+
+setattr(tpu_apply_multidimensional_rope, "_tpu_rope_patched", True)  # noqa: B010
+
+
+def patch_gemma4_vision_rope() -> None:
+    """Route Gemma-4 vision attention RoPE through the single-pass version.
+
+    ``Gemma4VisionAttention.forward`` resolves ``apply_multidimensional_rope``
+    from the module globals at call time, so replacing the module attribute
+    before the vision graph is traced is sufficient. Only the Gemma-4 HF
+    modeling module is touched.
+    """
+    global _orig_apply_multidimensional_rope
+    import sys
+
+    try:
+        mod = sys.modules.get(_GEMMA4_HF_MODELING)
+        if mod is None:
+            __import__(_GEMMA4_HF_MODELING)
+            mod = sys.modules.get(_GEMMA4_HF_MODELING)
+    except ImportError:
+        return
+    if mod is None:
+        return
+
+    current = getattr(mod, "apply_multidimensional_rope", None)
+    if current is None or getattr(current, "_tpu_rope_patched", False):
+        return
+    _orig_apply_multidimensional_rope = current
+    mod.apply_multidimensional_rope = tpu_apply_multidimensional_rope
+    logger.info(
+        "Applied TPU patch: single-pass multidimensional RoPE for Gemma-4 vision."
+    )
+
+
 def _make_eager_dp_embed_multimodal(orig_embed_multimodal):
     """Wrap embed_multimodal with eager-mode data-parallel sharding."""
 
@@ -361,6 +465,7 @@ def refresh_gemma4_mm() -> None:
     patch_gemma4_mm_model_classes()
     patch_gemma4_layer_config()
     patch_vision_mrope_lane_swap()
+    patch_gemma4_vision_rope()
 
 
 def _is_gemma4_mm_model(model_config: "ModelConfig | None") -> bool:
@@ -410,6 +515,7 @@ def maybe_patch_gemma4_mm(model_config: "ModelConfig | None" = None) -> bool | N
     patch_gemma4_mm_model_classes()
     patch_gemma4_layer_config()
     patch_vision_mrope_lane_swap()
+    patch_gemma4_vision_rope()
 
     if model_config is not None:
         model_info = getattr(model_config, "_model_info", None)
