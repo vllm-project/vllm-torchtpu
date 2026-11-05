@@ -136,11 +136,15 @@ class BeamAttention(nn.Module):
         set_weight_attrs(self.gate_bias, {"weight_loader": sharded_weight_loader(0)})
 
         is_sliding = config.layer_types[layer_id] == "sliding_attention"
-        # Beam rotates in fp32.
+        # Beam rotates in fp32. The cache covers max_model_len positions, not
+        # the 1M max_position_embeddings (512 MB in fp32).
         self.rotary_emb = (
             get_rope(
                 self.head_dim,
-                max_position=config.max_position_embeddings,
+                max_position=min(
+                    config.max_position_embeddings,
+                    vllm_config.model_config.max_model_len,
+                ),
                 is_neox_style=True,
                 rope_parameters=config.rope_parameters,
                 dtype=torch.float32,

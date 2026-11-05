@@ -126,6 +126,14 @@ def _check_checkpoint(vllm_config: VllmConfig) -> None:
             "Beam on TPU supports only hidden_act='silu', got "
             f"{hf_config.hidden_act!r}; use a checkpoint with SiLU MLPs."
         )
+    rope_type = (hf_config.rope_parameters or {}).get("rope_type", "default")
+    if rope_type != "default":
+        # BeamAttention sizes get_rope to max_model_len, which is exact only
+        # for unscaled ("default") RoPE.
+        raise NotImplementedError(
+            "Beam on TPU supports only rope_type='default', got "
+            f"{rope_type!r}; use a checkpoint with unscaled RoPE."
+        )
     if hf_config.tie_word_embeddings:
         raise NotImplementedError(
             "Beam on TPU requires tie_word_embeddings=False; use a checkpoint "

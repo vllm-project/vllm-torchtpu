@@ -157,6 +157,19 @@ def test_config_accepts_released_model(clean_check_flags):
             id="hidden_act",
         ),
         pytest.param(
+            {
+                "hf_overrides": {
+                    "rope_parameters": {
+                        "rope_type": "linear",
+                        "rope_theta": 10000.0,
+                        "factor": 2.0,
+                    }
+                }
+            },
+            "rope_type='default'",
+            id="rope_type",
+        ),
+        pytest.param(
             {"hf_overrides": {"tie_word_embeddings": True}},
             "tie_word_embeddings=False",
             id="tied_embeddings",
