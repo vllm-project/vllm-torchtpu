@@ -7,6 +7,7 @@ signature (no ``*args``, keyword parameters or ``Any`` return); epsilon and
 the compression ratio are bound per op.
 """
 
+import dataclasses
 import functools
 import inspect
 from typing import Any, cast
@@ -28,6 +29,22 @@ from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import get_pallas_op_m
 
 _HEAD_DIM = 512
 _ops: dict[str, Any] = {}
+
+
+@torch.compiler.assume_constant_result
+def compressor_layout_admitted(region: str, **geometry: int) -> bool:
+    """Check static cache geometry once, outside the captured tensor graph.
+
+    Only cache layout scalars enter this boundary, never token dimensions or
+    tensors. Fusion policy is frozen by admit; fallback diagnostics must execute
+    here at trace time because Dynamo cannot capture logger.warning.
+    """
+    layout = dataclasses.replace(
+        decode_preparation.DEFAULT_COMPRESSOR_LAYOUT, **geometry
+    )
+    return decode_preparation.admit(
+        region, decode_preparation.compressor_layout_problem(layout), backend=False
+    )
 
 
 def _get(name, build, donate=()):

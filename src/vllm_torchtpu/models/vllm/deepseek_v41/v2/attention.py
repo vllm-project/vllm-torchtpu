@@ -21,7 +21,6 @@ from vllm.models.deepseek_v41 import attention as upstream
 from vllm.models.deepseek_v41 import compressor as compressor_upstream
 from vllm.v1.attention.backends.mla.sparse_swa import DeepseekV4SWACache
 
-from vllm_torchtpu.kernels.experimental import decode_preparation
 from vllm_torchtpu.layers.adapter.linear_common import (
     KEEP_VLLM_LAYOUT_ATTR,
     WEIGHT_FLIPPED_ATTR,
@@ -849,12 +848,7 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                 main_offset=main_cache.row_offset,
                 index_capacity=index_cache.shape[1],
             )
-        layout = dataclasses.replace(
-            decode_preparation.DEFAULT_COMPRESSOR_LAYOUT, **fields
-        )
-        return decode_preparation.admit(
-            region, decode_preparation.compressor_layout_problem(layout), backend=False
-        )
+        return preprocess_ops.compressor_layout_admitted(region, **fields)
 
     def _write_csa2_global_kv(self, hidden_states, positions):
         """Fused compressor: one kernel projects, pools (reading and writing the
