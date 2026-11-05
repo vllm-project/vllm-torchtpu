@@ -856,3 +856,65 @@ def test_get_op_refuses_the_prequant_ep_split(built_bodies):
     with pytest.raises(AssertionError):
         moe_tp_decode._get_op(_OpMesh(), _ep_statics(True), prequant=True, split=True)
     assert built_bodies == []
+
+
+_PLACES = [
+    ((x, y, z), c) for x in (0, 1) for y in (0, 1) for z in (0, 1) for c in (0, 1)
+]
+
+
+@pytest.mark.parametrize(
+    ("gather_once", "size", "places", "log"),
+    [
+        (False, 16, _PLACES, None),
+        (
+            True,
+            16,
+            _PLACES,
+            "TPU_MOE_PREFILL_ROTATED_COLLECTIVES: the split MoE op's fp8 row "
+            f"all-gather and last reduce-scatter run rotated over {_PLACES}",
+        ),
+        (
+            True,
+            8,
+            _PLACES,
+            "TPU_MOE_PREFILL_ROTATED_COLLECTIVES: the mesh has 8 cores, not 16; "
+            "XLA's collectives",
+        ),
+        (
+            True,
+            16,
+            ValueError("not a 2x2x2 slice"),
+            "TPU_MOE_PREFILL_ROTATED_COLLECTIVES: not a 2x2x2 slice; XLA's collectives",
+        ),
+    ],
+)
+def test_rotated_places_logs_the_collectives_it_takes(
+    monkeypatch, gather_once, size, places, log
+):
+    """TPU_MOE_PREFILL_ROTATED_COLLECTIVES: the op mesh's chip places when it
+    is a 2x2x2 slice of 2-core chips, else None and XLA's collectives, with
+    the reason logged (small_all_reduce_op.rotated_places); without
+    TPU_MOE_PREFILL_GATHER_ONCE it raises."""
+    from vllm_torchtpu.layers.adapter import small_all_reduce_op
+
+    def chip_places(mesh, mesh_index, gather=None, who=None):
+        if isinstance(places, Exception):
+            raise places
+        return places
+
+    logs = []
+    monkeypatch.setattr(small_all_reduce_op, "logger", _Log(logs))
+    monkeypatch.setattr(small_all_reduce_op, "_chip_places", chip_places)
+    monkeypatch.setattr(moe_tp_decode.rotated_collectives, "Layout", lambda p: p)
+    monkeypatch.setattr(envs, "TPU_MOE_PREFILL_GATHER_ONCE", gather_once)
+    topo = moe_tp_decode._Topology(mesh=SimpleNamespace(size=size), mesh_index=0)
+
+    if not gather_once:
+        with pytest.raises(ValueError, match="needs TPU_MOE_PREFILL_GATHER_ONCE=1"):
+            moe_tp_decode._rotated_places(topo)
+        return
+    found = moe_tp_decode._rotated_places(topo)
+
+    assert found == (places if log.endswith(f"over {_PLACES}") else None)
+    assert logs == [log]
