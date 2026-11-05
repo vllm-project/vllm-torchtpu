@@ -699,9 +699,10 @@ def fused_moe_func(
     containers are supported. Weights must be packed along the contracting dimension
     (K-axis) in LSB-first order.
 
+    The one-hot EP path runs as ``onehot_moe_local_routes`` over every route.
     ``max_local_routes`` > 0 promises that at most that many routes hit a local
-    expert: the one-hot EP path then permutes, multiplies and combines only
-    those rows (``onehot_moe_local_routes``), with the same results.
+    expert: that path then permutes, multiplies and combines only those rows,
+    with the same results.
     """
 
     # Convert 3D scale [experts, blocks, N] to 4D [experts, blocks, 1, N]
@@ -762,8 +763,7 @@ def fused_moe_func(
         )
 
     if (
-        max_local_routes > 0
-        and use_ep
+        use_ep
         and use_sparse_core
         and num_tokens * topk <= onehot_moe_permute_threshold
         and envs.TPU_MOE_OWNER_OUTPUT_MODE.lower() != "on"
@@ -778,7 +778,9 @@ def fused_moe_func(
             w2_bias,
             topk_weights,
             topk_ids,
-            max_local_routes=min(max_local_routes, num_tokens * topk),
+            max_local_routes=min(
+                max_local_routes or num_tokens * topk, num_tokens * topk
+            ),
             padded_hidden_size=padded_hidden_size,
             activation=activation,
             rhs_quant_dtype=rhs_quant_dtype,
