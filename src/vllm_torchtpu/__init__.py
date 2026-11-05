@@ -656,6 +656,7 @@ def _patch_multiproc_worker_global_rank_env() -> None:
 
     from vllm.v1.executor.multiproc_executor import WorkerProc
 
+    from vllm_torchtpu.executors.worker_spawn import exclusive_spawn
     from vllm_torchtpu.models.parallel_requirements import requires_dp_collectives
     from vllm_torchtpu.worker.tpu_rank_binding import get_tpu_worker_binding
 
@@ -665,46 +666,52 @@ def _patch_multiproc_worker_global_rank_env() -> None:
 
     def _wrapped(vllm_config, local_rank, rank, *args, **kwargs):
         pc = vllm_config.parallel_config
-        binding = get_tpu_worker_binding(
-            pc,
-            rank,
-            local_rank,
-            env=_os.environ,
-            dp_collectives=requires_dp_collectives(vllm_config),
-        )
-        _os.environ.update(binding.as_env())
-        # VLLM_TPU_DEVICE_ORDER lists a physical device per local rank, so
-        # consecutive ranks (a two-device pipeline stage) can sit on different
-        # chips; TorchTPU reads TPU_VISIBLE_DEVICES at import, hence set here.
-        order = envs.VLLM_TPU_DEVICE_ORDER
-        if order:
-            device = [int(x) for x in order.split(",")][binding.local_rank]
-            _os.environ["TPU_VISIBLE_CHIPS"] = str(device)
-            _os.environ["TPU_VISIBLE_DEVICES"] = str(device)
-            logger.info(
-                "Applied TPU patch: worker spawn env local rank %d -> device %d "
-                "(VLLM_TPU_DEVICE_ORDER=%s)",
-                binding.local_rank,
-                device,
-                order,
+        # The binding goes through the parent's os.environ, so a spawn's env
+        # writes and process start must not overlap another's, whichever
+        # thread MultiprocExecutor starts it from. Large pipes let the start
+        # return before the child has imported.
+        with exclusive_spawn(pc.local_world_size):
+            binding = get_tpu_worker_binding(
+                pc,
+                rank,
+                local_rank,
+                env=_os.environ,
+                dp_collectives=requires_dp_collectives(vllm_config),
             )
-        logger.info(
-            "Applied TPU patch: worker spawn env RANK=%d LOCAL_RANK=%d "
-            "WORLD_SIZE=%d LOCAL_WORLD_SIZE=%d "
-            "(rank=%d local_rank=%d dp_rank=%d dp_size=%d offset=%d "
-            "init_local_rank=%d)",
-            binding.rank,
-            binding.local_rank,
-            binding.world_size,
-            binding.local_world_size,
-            rank,
-            local_rank,
-            binding.dp_rank,
-            binding.dp_size,
-            binding.local_rank_offset,
-            binding.init_local_rank,
-        )
-        return _orig(vllm_config, local_rank, rank, *args, **kwargs)
+            _os.environ.update(binding.as_env())
+            # VLLM_TPU_DEVICE_ORDER lists a physical device per local rank,
+            # so consecutive ranks (a two-device pipeline stage) can sit on
+            # different chips; TorchTPU reads TPU_VISIBLE_DEVICES at import,
+            # hence set here.
+            order = envs.VLLM_TPU_DEVICE_ORDER
+            if order:
+                device = [int(x) for x in order.split(",")][binding.local_rank]
+                _os.environ["TPU_VISIBLE_CHIPS"] = str(device)
+                _os.environ["TPU_VISIBLE_DEVICES"] = str(device)
+                logger.info(
+                    "Applied TPU patch: worker spawn env local rank %d -> device %d "
+                    "(VLLM_TPU_DEVICE_ORDER=%s)",
+                    binding.local_rank,
+                    device,
+                    order,
+                )
+            logger.info(
+                "Applied TPU patch: worker spawn env RANK=%d LOCAL_RANK=%d "
+                "WORLD_SIZE=%d LOCAL_WORLD_SIZE=%d "
+                "(rank=%d local_rank=%d dp_rank=%d dp_size=%d offset=%d "
+                "init_local_rank=%d)",
+                binding.rank,
+                binding.local_rank,
+                binding.world_size,
+                binding.local_world_size,
+                rank,
+                local_rank,
+                binding.dp_rank,
+                binding.dp_size,
+                binding.local_rank_offset,
+                binding.init_local_rank,
+            )
+            return _orig(vllm_config, local_rank, rank, *args, **kwargs)
 
     WorkerProc.make_worker_process = staticmethod(_wrapped)
     WorkerProc._tpu_global_rank_env_patch = True
