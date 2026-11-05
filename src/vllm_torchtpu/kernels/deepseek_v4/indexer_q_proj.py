@@ -17,10 +17,11 @@ Computes what ``util.xla_prequantized_matmul`` followed by ``rope.rope_quant``
 compute, but the bf16 projection never leaves VMEM. Each grid step projects a
 tile of tokens through the resident weight, one column chunk at a time, and
 rotates and scales each head's rows in the dot's own layout, tokens on
-sublanes: every head of a token tile shares one cos/sin tile, and each row's
-scale is stored straight into its lane of the ``[T, H]`` scales. The scaled rows
-go to VMEM through stores strided by a tile, which put each token's heads on
-sublanes, and are cast to the ``[T, H, LANE]`` fp8 query from there.
+sublanes: every head of a token tile shares one cos tile and one sin tile
+with the rotation's sign folded in, and each row's scale is stored straight
+into its lane of the ``[T, H]`` scales. The scaled rows go to VMEM through
+stores strided by a tile, which put each token's heads on sublanes, and are
+cast to the ``[T, H, LANE]`` fp8 query from there.
 """
 
 import functools
@@ -33,7 +34,9 @@ from jax.experimental.pallas import tpu as pltpu
 from vllm_torchtpu.kernels.deepseek_v4.rope import (
     LANE,
     _cos_sin_lanes,
-    _rope_rows,
+    _gptj_partners,
+    _gptj_sign,
+    _rope_rows_signed,
     _scale_rows,
 )
 
@@ -58,9 +61,10 @@ def _vmem_bytes(k: int, n: int) -> int:
     x = 2 * TILE_T * (k + LANE * 4)  # fp8 rows and their (lane-padded) scales
     scaled = TILE_T * n * 4  # f32
     cos_sin = 2 * TILE_T * LANE * 4
+    lanes = 2 * TILE_T * LANE * 4
     out = 2 * TILE_T * (n + LANE * 4)  # fp8 query and its (lane-padded) scales
     dot = 2 * TILE_T * N_CHUNK * 4  # one chunk's f32 result, and its epilogue
-    return weight + x + scaled + cos_sin + out + dot
+    return weight + x + scaled + cos_sin + lanes + out + dot
 
 
 def applies(
@@ -109,6 +113,7 @@ def _kernel(
     # for the cast, in row ((h // SUBLANE) * TILE_T + t) * SUBLANE + h % SUBLANE.
     scaled_ref: jax.Ref,
     cos_sin_ref: jax.Ref,  # (2, TILE_T, rotary_dim) f32
+    lanes_ref: jax.Ref,  # (2, TILE_T, LANE) f32: the tile's cos and signed sin
     w_sems: jax.Ref,  # (N // N_CHUNK,) DMA
     cos_sin_sems: jax.Ref,  # (2,) DMA
 ):
@@ -155,6 +160,8 @@ def _kernel(
     cos, sin = _cos_sin_lanes(
         cos_sin_ref[slot], rotary_dim=cos_sin_ref.shape[-1], inverse=False
     )
+    lanes_ref[0] = cos
+    lanes_ref[1] = sin * _gptj_sign()
     for c in range(num_chunks):
 
         @pl.when(step == 0)
@@ -175,7 +182,10 @@ def _kernel(
         x = x.astype(jnp.bfloat16).astype(jnp.float32)
         for j in range(heads_per_chunk):
             head = c * heads_per_chunk + j
-            y = _rope_rows(x[:, j * LANE : (j + 1) * LANE], cos, sin)
+            x_head = x[:, j * LANE : (j + 1) * LANE]
+            y = _rope_rows_signed(
+                x_head, _gptj_partners(x_head), lanes_ref[0], lanes_ref[1]
+            )
             scaled, scale = _scale_rows(y, quant_dtype)
             rows = pl.ds(
                 head // SUBLANE * TILE_T * SUBLANE + head % SUBLANE,
@@ -247,6 +257,7 @@ def q_proj_rope_quant(
             pltpu.VMEM((k, n), w_q.dtype),
             pltpu.VMEM((num_heads * TILE_T, LANE), jnp.float32),
             pltpu.VMEM((2, TILE_T, rotary_dim), cos_sin_cache.dtype),
+            pltpu.VMEM((2, TILE_T, LANE), jnp.float32),
             pltpu.SemaphoreType.DMA((n // N_CHUNK,)),
             pltpu.SemaphoreType.DMA((2,)),
         ],

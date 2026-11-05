@@ -159,9 +159,18 @@ def _rotate_gptj(x: jax.Array) -> jax.Array:
     constant-index lane shuffle and a sign, no reshape. Lane parity may be read
     for channel parity because ``LANE - rotary_dim`` is even.
     """
+    return _gptj_partners(x) * _gptj_sign()
+
+
+def _gptj_partners(x: jax.Array) -> jax.Array:
+    """``_rotate_gptj`` before its sign: every lane holds its partner lane."""
+    return _lane_gather(x, jnp.arange(LANE) ^ 1)
+
+
+def _gptj_sign() -> jax.Array:
+    """``_rotate_gptj``'s per-lane sign."""
     lane = jnp.arange(LANE)
-    sign = jnp.where(lane % 2 == 0, -1.0, 1.0).astype(jnp.float32)
-    return _lane_gather(x, lane ^ 1) * sign
+    return jnp.where(lane % 2 == 0, -1.0, 1.0).astype(jnp.float32)
 
 
 def _rope_rows(x: jax.Array, cos: jax.Array, sin: jax.Array) -> jax.Array:
@@ -169,6 +178,20 @@ def _rope_rows(x: jax.Array, cos: jax.Array, sin: jax.Array) -> jax.Array:
     its shape."""
     rotated = _rotate_gptj(x)
     return x * cos + rotated * sin
+
+
+def _rope_rows_signed(
+    x: jax.Array, partners: jax.Array, cos: jax.Array, signed_sin: jax.Array
+) -> jax.Array:
+    """``_rope_rows(x, cos, sin)``, given ``_gptj_partners(x)`` and
+    ``signed_sin = sin * _gptj_sign()``.
+
+    Bit for bit the same for non-NaN values: a product's magnitude does not
+    depend on its operands' signs, so ``(p * -1) * s == p * (-1 * s)``, signed
+    zeros included. A ``signed_sin`` shared by many rows saves their sign
+    multiply.
+    """
+    return x * cos + partners * signed_sin
 
 
 def _scale_rows(y: jax.Array, quant_dtype: jnp.dtype) -> tuple[jax.Array, jax.Array]:
