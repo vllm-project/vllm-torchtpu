@@ -170,8 +170,36 @@ def _replayed(metadata, positions, starts, window):
     return (start > 0) & (positions >= start) & (positions < start + window)
 
 
-def _cache_slots(cache, metadata, positions, *, compress_ratio=1, ring=False):
-    """Derive this cache's addresses from the shared TPU metadata contract."""
+def _cache_slots(cache, metadata, positions, *, compress_ratio=1, ring=False, offset=0):
+    """Addresses of ``positions + offset`` from the shared TPU metadata contract.
+
+    Layers of one cache group read the same tables, so a stage computes each
+    address set once (~4 us of lookups per call).
+    """
+    stage_cache = _active_stage_attn_cache
+    key = ("cache_slots", cache.shape[1], compress_ratio, ring, offset)
+    if stage_cache is not None:
+        for tables, starts, cached_positions, slots in stage_cache.get(key, ()):
+            if (
+                tables is metadata.block_tables
+                and starts is metadata.query_start_loc
+                and cached_positions is positions
+            ):
+                return slots
+    slots = _compute_cache_slots(
+        cache,
+        metadata,
+        positions + offset if offset else positions,
+        compress_ratio=compress_ratio,
+        ring=ring,
+    )
+    if stage_cache is not None:
+        entry = (metadata.block_tables, metadata.query_start_loc, positions, slots)
+        stage_cache.setdefault(key, []).append(entry)
+    return slots
+
+
+def _compute_cache_slots(cache, metadata, positions, *, compress_ratio, ring):
     if metadata.seq_lens.numel() == 0:
         return torch.full_like(positions, -1)
     table = _block_table(metadata)
@@ -880,7 +908,9 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
             # only its last ring-capacity rows are stored.
             has_prev = rows != lookup_small_table(starts_loc, requests)
             slots = _cache_slots(state_cache, state_meta, positions, ring=True)
-            previous = _cache_slots(state_cache, state_meta, positions - 1, ring=True)
+            previous = _cache_slots(
+                state_cache, state_meta, positions, ring=True, offset=-1
+            )
             stored = (slots >= 0) & (
                 rows
                 >= lookup_small_table(starts_loc, requests + 1) - state_cache.shape[1]
