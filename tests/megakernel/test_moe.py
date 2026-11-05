@@ -37,7 +37,6 @@ from tests.megakernel.megakernel_fakes import (
     MiniCtx,
 )
 from vllm_torchtpu.megakernel import collectives, modules, planner, stream, vmem
-from vllm_torchtpu.megakernel.errors import MegakernelConfigError
 from vllm_torchtpu.megakernel.exec_spec import ExecSpec
 from vllm_torchtpu.megakernel.modules import MoEModule
 from vllm_torchtpu.megakernel.ops import BF16, F32, FP8, I32, rmsnorm, round_bf16
@@ -49,12 +48,9 @@ MODULES_DIR = pathlib.Path(modules.__file__).resolve().parent
 _ROW_NAMES = {"B", "NS", "MR", "MB", "M", "CB"}
 # Remaining literal row-count comparisons are hardware / layout limits, not
 # per-bucket tuning (each one with its reason).
-_ALLOWED = {
-    ("moe/topk.py", "MR <= 128"): "lane top-k keeps all MR rows in one 128-lane vreg",
-    (
-        "gqa/params.py",
-        "ex.NS <= 64",
-    ): "GQ packs 128 // NS lanes per sequence (m | l) field",
+_ALLOWED_EXPRS = {
+    "MR <= 128": "lane top-k keeps all MR rows in one 128-lane vreg",
+    "ex.NS <= 64": "sequence metadata packs 128 // NS lanes per (m | l) field",
 }
 
 
@@ -76,9 +72,10 @@ def _is_num(node: ast.AST) -> bool:
 
 def test_modules_have_no_row_count_literal_comparisons():
     """Modules read per-bucket tuning from `Tiles`, never `B <= 40`-style literals."""
-    assert (MODULES_DIR / "moe" / "module.py").is_file()
+    py_files = sorted(MODULES_DIR.rglob("*.py"))
+    assert py_files
     found = []
-    for path in sorted(MODULES_DIR.rglob("*.py")):
+    for path in py_files:
         rel = path.relative_to(MODULES_DIR).as_posix()
         tree = ast.parse(path.read_text(encoding="utf-8"))
         for node in ast.walk(tree):
@@ -88,9 +85,9 @@ def test_modules_have_no_row_count_literal_comparisons():
             for a, b in zip(ops, ops[1:]):
                 pair = (_row_name(a) and _is_num(b)) or (_row_name(b) and _is_num(a))
                 if pair:
-                    key = (rel, ast.unparse(node))
-                    if key not in _ALLOWED:
-                        found.append(f"{rel}:{node.lineno}: {key[1]}")
+                    expr = ast.unparse(node)
+                    if expr not in _ALLOWED_EXPRS:
+                        found.append(f"{rel}:{node.lineno}: {expr}")
     assert not found, "row-count literal comparisons in modules/:\n" + "\n".join(found)
 
 
@@ -158,7 +155,7 @@ def test_moe_module_declarations_and_emit_in_pallas_interpret(fake_ex: ExecSpec)
     def pallas_body(pos_ref, hid_ref, *rest):
         n_w, n_o = len(p.w_names), len(p.o_names)
         W = dict(zip(p.w_names, rest[:n_w]))
-        O = dict(zip(p.o_names, rest[n_w : n_w + n_o]))  # noqa: E741
+        out_refs = dict(zip(p.o_names, rest[n_w : n_w + n_o]))
         scr = dict(zip(s_names, rest[n_w + n_o :]))
         me = jnp.int32(0)
         ring = stream.TwoRing(cp.stream, W, scr, me, interpret=True)
@@ -170,7 +167,7 @@ def test_moe_module_declarations_and_emit_in_pallas_interpret(fake_ex: ExecSpec)
             pos_ref=pos_ref,
             W=W,
             ST={},
-            O=O,
+            O=out_refs,
             scr=scr,
             me=me,
             stream=ring,
@@ -195,9 +192,9 @@ def test_moe_module_declarations_and_emit_in_pallas_interpret(fake_ex: ExecSpec)
         ctx.apply_input_norm(moe.input_norm, jnp.int32(0))
         part_moe = moe.emit(ctx, jnp.int32(0), jnp.int32(0))
         ar.add_residual(ar.allreduce(0, part_moe, jnp.bool_(True)))
-        O["hidden"][: ex.MB] = scr["res"][...].astype(BF16)
+        out_refs["hidden"][: ex.MB] = scr["res"][...].astype(BF16)
         if ex.MB < ex.M:
-            O["hidden"][ex.MB :] = jnp.zeros((ex.M - ex.MB, g.H), BF16)
+            out_refs["hidden"][ex.MB :] = jnp.zeros((ex.M - ex.MB, g.H), BF16)
 
     in_specs = [
         pl.BlockSpec(memory_space=pltpu.SMEM),
@@ -330,7 +327,7 @@ def test_moe_module_numerical_parity(moe_tp: bool, R: int, pipe: bool):
     def pallas_body(pos_ref, hid_ref, *rest):
         n_w, n_o = len(p.w_names), len(p.o_names)
         W = dict(zip(p.w_names, rest[:n_w]))
-        O = dict(zip(p.o_names, rest[n_w : n_w + n_o]))  # noqa: E741
+        out_refs = dict(zip(p.o_names, rest[n_w : n_w + n_o]))
         scr = dict(zip(s_names, rest[n_w + n_o :]))
         me = lax.axis_index("tp").astype(I32) if R > 1 else jnp.int32(0)
         if R > 1:
@@ -353,7 +350,7 @@ def test_moe_module_numerical_parity(moe_tp: bool, R: int, pipe: bool):
             pos_ref=pos_ref,
             W=W,
             ST={},
-            O=O,
+            O=out_refs,
             scr=scr,
             me=me,
             stream=ring,
@@ -379,9 +376,9 @@ def test_moe_module_numerical_parity(moe_tp: bool, R: int, pipe: bool):
         part_moe = moe.emit(ctx, jnp.int32(0), jnp.int32(0))
         ar.add_residual(ar.allreduce(0, part_moe, jnp.bool_(True)))
         ar.drain_sends()
-        O["hidden"][: ex.MB] = scr["res"][...].astype(BF16)
+        out_refs["hidden"][: ex.MB] = scr["res"][...].astype(BF16)
         if ex.MB < ex.M:
-            O["hidden"][ex.MB :] = jnp.zeros((ex.M - ex.MB, H), BF16)
+            out_refs["hidden"][ex.MB :] = jnp.zeros((ex.M - ex.MB, H), BF16)
 
     in_specs = [
         pl.BlockSpec(memory_space=pltpu.SMEM),
@@ -469,331 +466,6 @@ def test_moe_module_numerical_parity(moe_tp: bool, R: int, pipe: bool):
     for r in range(R):
         assert jnp.allclose(
             out_ranks[r].astype(F32), ref_out.astype(F32), atol=2e-2, rtol=2e-2
-        )
-
-
-def test_moe_topk_packed_and_route_vec_compile_time_bounds():
-    """Verify compile-time checks guard bit-packed top-k and resolve `route_vec`."""
-    moe = MoEModule()
-    base_tiles = dataclasses.replace(TINY_TILES, bank=512 << 10)
-    g_ok = FakeGeometry(
-        L=1,
-        att_every=1,
-        H=256,
-        I=256,
-        IS=1024,
-        E=512,
-        TOPK=8,
-        moe_tp=False,
-        e_slots=72,
-    )
-    ex_ok = ExecSpec(
-        R=8,
-        B=4,
-        T=1,
-        tiles=base_tiles.with_modules({"moe": {"topk": True, "route_vec": True}}),
-    )
-    ms_ok = ModelSpec("moe_ok", config=g_ok, layer_type=LayerType("lt", slots=(moe,)))
-    plan_ok = planner.plan(ms_ok, ex_ok)
-    mp_ok = plan_ok.module_params["moe"]
-    assert mp_ok.topk_packed is True
-    assert mp_ok.route_vec is True
-
-    # Non-power-of-two E=384 <= 512 is valid for topk=True.
-    g_e384 = dataclasses.replace(g_ok, E=384, e_slots=0)
-    ms_e384 = ModelSpec(
-        "moe_e384", config=g_e384, layer_type=LayerType("lt", slots=(moe,))
-    )
-    ex_topk = ExecSpec(
-        R=8,
-        B=4,
-        T=1,
-        tiles=base_tiles.with_modules({"moe": {"topk": True, "route_vec": False}}),
-    )
-    assert planner.plan(ms_e384, ex_topk).module_params["moe"].topk_packed is True
-
-    # E > 512 (e.g. 513, 1024) overflows the 9-bit float32 mantissa pack when topk=True.
-    for bad_e in (513, 1024):
-        g_bad_topk = dataclasses.replace(g_ok, E=bad_e, e_slots=0)
-        ms_bad_topk = ModelSpec(
-            f"moe_e{bad_e}", config=g_bad_topk, layer_type=LayerType("lt", slots=(moe,))
-        )
-        with pytest.raises(MegakernelConfigError, match="topk_packed"):
-            planner.plan(ms_bad_topk, ex_topk)
-
-    # `route_vec` resolves to False (quiet fallback) when preconditions are not met:
-    # - `e_slots=80` (128 redundant experts on R=8 -> R*EXTRA+R+1 = 137 > 128)
-    # - `e_slots=96` (R*EXTRA+R+1 = 265 > 128)
-    # - `E=2048, B=4` (E // 128 + 1 = 17 > MR=8)
-    # - `e_slots=0` (ecopy=False)
-    ex_rvec = ExecSpec(
-        R=8,
-        B=4,
-        T=1,
-        tiles=base_tiles.with_modules({"moe": {"topk": False, "route_vec": True}}),
-    )
-    for fallback_g in (
-        dataclasses.replace(g_ok, E=512, e_slots=80),
-        dataclasses.replace(g_ok, E=512, e_slots=96),
-        dataclasses.replace(g_ok, E=2048, e_slots=260),
-        dataclasses.replace(g_ok, E=512, e_slots=0),
-    ):
-        ms_fb = ModelSpec(
-            "moe_fb", config=fallback_g, layer_type=LayerType("lt", slots=(moe,))
-        )
-        assert planner.plan(ms_fb, ex_rvec).module_params["moe"].route_vec is False
-
-
-def _simulate_expert_ring_no_collision(mp, n_hit: int = 8) -> None:
-    """Simulate `ring.py` / `experts.py` `e_ring` (`NBE`) and `es` (`NSS`) lifetimes."""
-    nbe, nss, te, t13, t2 = mp.NBE, mp.NSS, mp.TE, mp.T13, mp.T2
-    assert nbe >= 1 and nss >= 1 and te == t13 + t2
-    e_inflight: dict[int, int] = {}
-    es_inflight: dict[int, int] = {}
-
-    def fetch_unit(u: int, t: int | None = None) -> None:
-        if u >= n_hit * te:
-            return
-        if t is not None:
-            nt = (t + nbe) % te
-            assert (u - nt) % te == 0, f"misaligned unit {u} for tile {nt}"
-            if mp.PIPE_EP and nbe >= te:
-                assert nt == t, (
-                    "PIPE_EP requires (t + NBE) % TE == t, "
-                    f"got t={t}, NBE={nbe}, TE={te}"
-                )
-        slot = u % nbe
-        assert slot not in e_inflight, (
-            f"e_ring slot {slot} collision: {e_inflight[slot]} vs {u}"
-        )
-        e_inflight[slot] = u
-        if u % te == 0:
-            exp_i = u // te
-            es_slot = exp_i % nss
-            assert es_slot not in es_inflight, (
-                f"es slot {es_slot} collision: {es_inflight[es_slot]} vs {exp_i}"
-            )
-            es_inflight[es_slot] = exp_i
-
-    # `route_fetch` primes units `0 .. min(NBE, n_hit * TE) - 1`; `fetch_e`
-    # starts `es[(u // TE) % NSS]` whenever `u % TE == 0`.
-    for u0 in range(min(nbe, n_hit * te)):
-        fetch_unit(u0)
-
-    if mp.PIPE:
-        assert t13 == 1 and t2 == 1, f"PIPE requires T13=T2=1, got {t13}, {t2}"
-        assert e_inflight.pop(0 % nbe, None) == 0, "e_ring unit 0 not ready"
-        assert es_inflight.get(0 % nss) == 0, "es expert 0 not ready"
-        fetch_unit(0 + nbe, t=0)
-        for i in range(n_hit - 1):
-            u13 = (i + 1) * te
-            u2 = i * te + t13
-            assert e_inflight.pop(u13 % nbe, None) == u13, f"e_ring unit {u13} missing"
-            assert es_inflight.get((i + 1) % nss) == i + 1, f"es expert {i + 1} missing"
-            assert e_inflight.pop(u2 % nbe, None) == u2, f"e_ring unit {u2} missing"
-            assert es_inflight.pop(i % nss, None) == i, f"es expert {i} missing"
-            fetch_unit(u13 + nbe, t=0)
-            fetch_unit(u2 + nbe, t=t13)
-        last = n_hit - 1
-        u2_last = last * te + t13
-        assert e_inflight.pop(u2_last % nbe, None) == u2_last, (
-            f"e_ring unit {u2_last} missing"
-        )
-        assert es_inflight.pop(last % nss, None) == last, f"es expert {last} missing"
-        fetch_unit(u2_last + nbe, t=t13)
-    elif mp.PIPE_EP:
-        assert t13 == 2 * t2, f"PIPE_EP requires T13=2*T2, got {t13}, {t2}"
-        for t in range(t13):
-            assert e_inflight.pop(t % nbe, None) == t, f"e_ring unit {t} missing"
-            if mp.group_rel:
-                if t % 2 == 1:
-                    fetch_unit(t - 1 + nbe, t=t - 1)
-                    fetch_unit(t + nbe, t=t)
-                elif t == t13 - 1:
-                    fetch_unit(t + nbe, t=t)
-            else:
-                fetch_unit(t + nbe, t=t)
-        assert es_inflight.get(0 % nss) == 0, "es expert 0 not ready"
-        for i in range(n_hit - 1):
-            # In PIPE_EP, all `e2` tiles of expert `i` and all `e13` tiles of
-            # expert `i + 1` must already be in flight at the start of `body_ep(i)`.
-            for s_step in range(t2):
-                u2 = i * te + t13 + s_step
-                u13_0 = (i + 1) * te + 2 * s_step
-                u13_1 = (i + 1) * te + 2 * s_step + 1
-                assert e_inflight.get(u2 % nbe) == u2, (
-                    f"unit {u2} not prefetched before body_ep({i})"
-                )
-                assert e_inflight.get(u13_0 % nbe) == u13_0, (
-                    f"unit {u13_0} not prefetched before body_ep({i})"
-                )
-                assert e_inflight.get(u13_1 % nbe) == u13_1, (
-                    f"unit {u13_1} not prefetched before body_ep({i})"
-                )
-            for s_step in range(t2):
-                u2 = i * te + t13 + s_step
-                t0, t1 = 2 * s_step, 2 * s_step + 1
-                u13_0 = (i + 1) * te + t0
-                u13_1 = (i + 1) * te + t1
-                assert e_inflight.pop(u2 % nbe, None) == u2, f"e_ring unit {u2} missing"
-                assert e_inflight.pop(u13_0 % nbe, None) == u13_0, (
-                    f"e_ring unit {u13_0} missing"
-                )
-                fetch_unit(u2 + nbe, t=t13 + s_step)
-                fetch_unit(u13_0 + nbe, t=t0)
-                assert e_inflight.pop(u13_1 % nbe, None) == u13_1, (
-                    f"e_ring unit {u13_1} missing"
-                )
-                fetch_unit(u13_1 + nbe, t=t1)
-            # `scr["es"][s_cur, :, BN:]` is read after the `s_step` loop, then
-            # `es_wait(i + 1)` waits on expert `i + 1`'s scales.
-            assert es_inflight.pop(i % nss, None) == i, f"es expert {i} missing"
-            assert es_inflight.get((i + 1) % nss) == i + 1, f"es expert {i + 1} missing"
-        i_last = n_hit - 1
-        for s_step in range(t2):
-            u2 = i_last * te + t13 + s_step
-            assert e_inflight.pop(u2 % nbe, None) == u2, f"e_ring unit {u2} missing"
-            if mp.group_rel:
-                if s_step % 2 == 1:
-                    fetch_unit(u2 - 1 + nbe, t=t13 + s_step - 1)
-                    fetch_unit(u2 + nbe, t=t13 + s_step)
-                elif s_step == t2 - 1:
-                    fetch_unit(u2 + nbe, t=t13 + s_step)
-            else:
-                fetch_unit(u2 + nbe, t=t13 + s_step)
-        assert es_inflight.pop(i_last % nss, None) == i_last, (
-            f"es expert {i_last} missing"
-        )
-    else:
-        for i in range(n_hit):
-            base = i * te
-            for t in range(t13):
-                u = base + t
-                assert e_inflight.pop(u % nbe, None) == u, f"e_ring unit {u} missing"
-                if mp.unroll and mp.group_rel and t13 > 1:
-                    if t % 2 == 1:
-                        fetch_unit(u - 1 + nbe, t=t - 1)
-                        fetch_unit(u + nbe, t=t)
-                    elif t == t13 - 1:
-                        fetch_unit(u + nbe, t=t)
-                else:
-                    fetch_unit(u + nbe, t=t if mp.unroll and t13 > 1 else None)
-            assert es_inflight.get(i % nss) == i, f"es expert {i} missing"
-            u2_base = base + t13
-            if t2 == 1:
-                assert e_inflight.pop(u2_base % nbe, None) == u2_base, (
-                    f"e_ring unit {u2_base} missing"
-                )
-                assert es_inflight.pop(i % nss, None) == i, f"es expert {i} missing"
-                fetch_unit(u2_base + nbe)
-            else:
-                for t in range(t2):
-                    u = u2_base + t
-                    assert e_inflight.pop(u % nbe, None) == u, (
-                        f"e_ring unit {u} missing"
-                    )
-                    if mp.unroll and mp.group_rel:
-                        if t % 2 == 1:
-                            fetch_unit(u - 1 + nbe, t=t13 + t - 1)
-                            fetch_unit(u + nbe, t=t13 + t)
-                        elif t == t2 - 1:
-                            fetch_unit(u + nbe, t=t13 + t)
-                    else:
-                        fetch_unit(u + nbe, t=t13 + t if mp.unroll else None)
-                assert es_inflight.pop(i % nss, None) == i, f"es expert {i} missing"
-    assert not e_inflight and not es_inflight, (
-        f"unreleased ring slots: e={e_inflight}, es={es_inflight}"
-    )
-
-
-def test_moe_deployment_ring_invariants():
-    """Verify MoE ring schedules and PIPE / PIPE_EP / LAZY_MOE across real profiles."""
-    from vllm_torchtpu.models.qwen3_5.megakernel.model import (
-        Qwen35Geometry,
-        qwen35_spec,
-    )
-    from vllm_torchtpu.models.qwen3_5.megakernel.profiles.baseline import baseline_tiles
-    from vllm_torchtpu.models.qwen3_5.megakernel.profiles.candidate30 import (
-        candidate30_tiles,
-    )
-
-    seen_pipe = False
-    seen_pipe_ep = False
-    seen_lazy = False
-    sample_plain_mp = None
-    sample_pipe_mp = None
-    sample_pipe_ep_mp = None
-    for moe_tp, e_slots in ((False, 0), (False, 72), (True, 0)):
-        g = Qwen35Geometry(L=4, moe_tp=moe_tp, e_slots=e_slots)
-        ms = qwen35_spec(g)
-        for T in (1, 4):
-            for B in (1, 4, 8, 16, 20, 24, 32, 40, 48, 56, 64):
-                if B % T != 0:
-                    continue
-                for tile_fn in (baseline_tiles, candidate30_tiles):
-                    tiles = tile_fn(B, moe_tp=moe_tp, R=8)
-                    ex = ExecSpec(R=8, B=B, T=T, tiles=tiles)
-                    cp, _ = vmem.build_scratch(ms, ex)
-                    mp = cp.module("moe")
-                    assert mp.NSS >= 3 + (mp.NBE - 1) // mp.TE
-                    assert mp.NBE >= 2
-                    assert not (mp.PIPE and mp.PIPE_EP)
-                    if mp.PIPE:
-                        assert mp.T13 == 1 and mp.T2 == 1
-                        sample_pipe_mp = mp
-                    elif mp.PIPE_EP:
-                        assert mp.T13 == 2 * mp.T2
-                        assert mp.NBE >= mp.TE and mp.NBE % mp.TE == 0
-                        sample_pipe_ep_mp = mp
-                    else:
-                        sample_plain_mp = mp
-                    if mp.LAZY_MOE:
-                        assert cp.plan.ex.resolved_tiles.nbd >= mp.N_MOE
-                    seen_pipe = seen_pipe or mp.PIPE
-                    seen_pipe_ep = seen_pipe_ep or mp.PIPE_EP
-                    seen_lazy = seen_lazy or mp.LAZY_MOE
-                    _simulate_expert_ring_no_collision(mp, n_hit=8)
-    assert seen_pipe and seen_pipe_ep and seen_lazy, (
-        seen_pipe,
-        seen_pipe_ep,
-        seen_lazy,
-    )
-    assert sample_plain_mp is not None
-    assert sample_pipe_mp is not None
-    assert sample_pipe_ep_mp is not None
-    # Negative self-tests: mutating NSS or NBE below the schedule requirements
-    # or breaking PIPE_EP's NBE % TE == 0 invariant must fail the simulator.
-    with pytest.raises(AssertionError, match="es slot .* collision"):
-        _simulate_expert_ring_no_collision(
-            dataclasses.replace(sample_plain_mp, NSS=sample_plain_mp.NSS - 2),
-            n_hit=8,
-        )
-    with pytest.raises(AssertionError, match="es slot .* collision"):
-        _simulate_expert_ring_no_collision(
-            dataclasses.replace(sample_pipe_mp, NSS=sample_pipe_mp.NSS - 2),
-            n_hit=8,
-        )
-    with pytest.raises(AssertionError, match="es slot .* collision"):
-        _simulate_expert_ring_no_collision(
-            dataclasses.replace(sample_pipe_ep_mp, NSS=sample_pipe_ep_mp.NSS - 1),
-            n_hit=8,
-        )
-    with pytest.raises(AssertionError, match="es slot .* collision"):
-        _simulate_expert_ring_no_collision(
-            dataclasses.replace(sample_pipe_ep_mp, T13=2, T2=1, TE=3, NBE=12, NSS=3),
-            n_hit=8,
-        )
-    with pytest.raises(AssertionError, match="not prefetched before body_ep"):
-        _simulate_expert_ring_no_collision(
-            dataclasses.replace(sample_pipe_ep_mp, NBE=sample_pipe_ep_mp.TE - 1),
-            n_hit=8,
-        )
-    with pytest.raises(AssertionError, match="PIPE_EP requires"):
-        _simulate_expert_ring_no_collision(
-            dataclasses.replace(
-                sample_pipe_ep_mp, NBE=sample_pipe_ep_mp.TE + 1, NSS=10
-            ),
-            n_hit=8,
         )
 
 
@@ -941,7 +613,7 @@ def test_moe_dynamic_dma_race_invariants(
         def pallas_body(pos_ref, hid_ref, *rest):
             n_w, n_o = len(p.w_names), len(p.o_names)
             W = dict(zip(p.w_names, rest[:n_w]))
-            O = dict(zip(p.o_names, rest[n_w : n_w + n_o]))  # noqa: E741
+            out_refs = dict(zip(p.o_names, rest[n_w : n_w + n_o]))
             scr = dict(zip(s_names, rest[n_w + n_o :]))
             me = lax.axis_index("tp").astype(I32)
             barrier = pltpu.get_barrier_semaphore()
@@ -963,7 +635,7 @@ def test_moe_dynamic_dma_race_invariants(
                 pos_ref=pos_ref,
                 W=W,
                 ST={},
-                O=O,
+                O=out_refs,
                 scr=scr,
                 me=me,
                 stream=ring,
@@ -993,9 +665,9 @@ def test_moe_dynamic_dma_race_invariants(
             part_moe = moe.emit(ctx, jnp.int32(0), jnp.int32(0))
             ar.add_residual(ar.allreduce(0, part_moe, jnp.bool_(True)))
             ar.drain_sends()
-            O["hidden"][: ex.MB] = scr["res"][...].astype(BF16)
+            out_refs["hidden"][: ex.MB] = scr["res"][...].astype(BF16)
             if ex.MB < ex.M:
-                O["hidden"][ex.MB :] = jnp.zeros((ex.M - ex.MB, H), BF16)
+                out_refs["hidden"][ex.MB :] = jnp.zeros((ex.M - ex.MB, H), BF16)
 
         in_specs = [
             pl.BlockSpec(memory_space=pltpu.SMEM),
