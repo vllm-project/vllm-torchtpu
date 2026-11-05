@@ -1,4 +1,4 @@
-# Copyright 2026 Google LLC
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -25,8 +25,6 @@ from vllm_torchtpu.models.kimi_k3.megakernel.kernels.prefill_moe import fused, l
 from vllm_torchtpu.models.kimi_k3.megakernel.kernels.prefill_moe.moe_down_valu import (
     down_valu_compact,
 )
-
-pytestmark = pytest.mark.cpu_test
 
 
 @pytest.mark.parametrize("window", [512, 1024, 2048, 4096, 8192])

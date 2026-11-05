@@ -57,15 +57,17 @@ def compile_ops(calls: Iterable[CompileCall]) -> None:
                     return
             time.sleep(0.01)
 
+    eager_mode = (
+        execution_mode.EagerMode.__members__.get("INTERNAL_COMPILE_FX_GRAPH")
+        or execution_mode.EagerMode.__members__["_INTERNAL_COMPILE_FX_GRAPH"]
+    )
     failure: BaseException | None = None
     try:
         for call in calls:
             if len(pending) == 8:
                 finish()
             inputs = tuple(tpu_torch_compile.placeholder_like(t) for t in call.operands)
-            with execution_mode.set_eager_mode(
-                execution_mode.EagerMode.INTERNAL_COMPILE_FX_GRAPH
-            ):
+            with execution_mode.set_eager_mode(eager_mode):
                 outputs = call.op(*inputs)
             with custom_compiler_options(call.options):
                 handle = tpu_torch_compile.async_traverse_and_compile(

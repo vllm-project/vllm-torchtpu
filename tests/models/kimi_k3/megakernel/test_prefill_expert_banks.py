@@ -1,4 +1,4 @@
-# Copyright 2026 Google LLC
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -22,7 +22,6 @@ from vllm_torchtpu.models.kimi_k3.megakernel.kernels.prefill_megakernel import (
 )
 from vllm_torchtpu.models.kimi_k3.megakernel.prefill import _bank_expert_weights
 
-pytestmark = pytest.mark.cpu_test
 FAMILIES = ("expert_gu", "expert_gus", "expert_down", "expert_ds")
 
 

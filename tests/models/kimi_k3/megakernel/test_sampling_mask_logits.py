@@ -15,8 +15,6 @@
 
 from __future__ import annotations
 
-from typing import Any
-
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -24,15 +22,12 @@ import numpy as np
 from vllm_torchtpu.models.kimi_k3.megakernel.program import TP_SIZE
 from vllm_torchtpu.models.kimi_k3.megakernel.sampling import mask_logits
 
-_Dynamic = Any
-
-
 _NEG_INF = -1e30
 VOCAB_WORDS = 163840 // 32
 
 
-def test_mask_logits_unpacking_and_sharding() -> _Dynamic:
-    """Verify test mask logits unpacking and sharding logic."""
+def test_mask_logits_unpacking_and_sharding() -> None:
+    """Unpack bitmask shards per TP rank and set disallowed logits to -1e30."""
     width = 163840 // TP_SIZE
     rows = 3
     rng = np.random.default_rng(0)
@@ -49,8 +44,8 @@ def test_mask_logits_unpacking_and_sharding() -> _Dynamic:
         np.testing.assert_array_equal(out[allowed], logits[allowed])
 
 
-def test_mask_logits_all_ones_is_identity_and_finite_when_rank_empty() -> _Dynamic:
-    """Verify test mask logits all ones is identity and finite when rank empty logic."""
+def test_mask_logits_all_ones_is_identity_and_finite_when_rank_empty() -> None:
+    """Preserve finite logits unchanged when every bitmask word is all-ones."""
     width = 163840 // TP_SIZE
     rows = 2
     mask = np.full((rows, VOCAB_WORDS), -1, dtype=np.int32)

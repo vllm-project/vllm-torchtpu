@@ -1,4 +1,4 @@
-# Copyright 2026 Google LLC
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -33,8 +33,6 @@ from vllm_torchtpu.models.kimi_k3.megakernel.program import spec_tokens_per_batc
 from vllm_torchtpu.models.kimi_k3.megakernel.runtime_shim.config import (
     MegakernelEngineConfig,
 )
-
-pytestmark = pytest.mark.cpu_test
 
 
 @pytest.mark.parametrize("batch", [8, 16, 32, 64, 96, 128])

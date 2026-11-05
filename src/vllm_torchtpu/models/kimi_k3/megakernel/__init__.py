@@ -13,3 +13,4 @@
 # limitations under the License.
 
 # Source provenance: inferact/k3-megakernel@30c9ba966b src/vllm_torchtpu/megakernel/kimi_k3/__init__.py
+"""Isolated Kimi-K3 megakernel package."""

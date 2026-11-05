@@ -1,4 +1,4 @@
-# Copyright 2026 Google LLC
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -11,25 +11,24 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-# Source provenance: inferact/k3-megakernel@30c9ba966b src/vllm_torchtpu/megakernel/common/pool_alias.py
 
+# Source provenance: inferact/k3-megakernel@30c9ba966b
+#   src/vllm_torchtpu/megakernel/common/pool_alias.py
 """Raw VMEM views; every new view must be overwritten before reading.
-
-Source provenance: Adapted from inferact/k3-megakernel@30c9ba966b.
 
 Calling :func:`view` patches JAX's private
 ``jax._src.pallas.mosaic.lowering._reshape_memref`` so a :class:`Reinterpret`
 transform lowers to a ``tpu.reinterpret_cast`` with an explicit tiled layout;
-other reshapes keep the stock lowering.
+other reshapes keep the default lowering.
 """
 
 from __future__ import annotations
 
 import dataclasses
 import math
-import operator
-from typing import Any
+from typing import TYPE_CHECKING
 
+import jax
 import jax.numpy as jnp
 from jax import tree_util
 from jax._src.lib import tpu
@@ -37,37 +36,34 @@ from jax._src.lib.mlir import ir
 from jax._src.pallas.mosaic import lowering
 from jax._src.state import types
 
-_Dynamic = Any
+if TYPE_CHECKING:
+    from collections.abc import Sequence
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
 class Reinterpret(types.ReshapeTransform):
-    """Manage reinterpret instance and state."""
+    """Reshape transform that lowers via tiled ``tpu.reinterpret_cast``."""
+
+    if TYPE_CHECKING:
+
+        def __init__(self, shape: tuple[int, ...]) -> None:
+            """Initialize view transform."""
 
 
-_original: _Dynamic = None
-_patched_box = [False]
-_registered_box = [False]
-
-
-def _ensure_patched() -> None:
-    """Ensure reshape lowering is patched."""
-    if not _registered_box[0]:
-        tree_util.register_dataclass(Reinterpret)
-        _registered_box[0] = True
-    if not _patched_box[0]:
-        globals()["_original"] = vars(lowering)["_reshape_memref"]
-        vars(lowering)["_reshape_memref"] = _lower
-        _patched_box[0] = True
+tree_util.register_dataclass(Reinterpret)
+_ORIGINAL = vars(lowering)["_reshape_memref"]
 
 
 def _lower(
-    ref: _Dynamic, transform: _Dynamic, aval: _Dynamic, block_shape: _Dynamic
-) -> _Dynamic:
-    """Execute lower logic."""
+    ref: ir.Value,
+    transform: types.Transform,
+    aval: jax.core.ShapedArray,
+    block_shape: Sequence[int],
+) -> tuple[ir.Value, tuple[int, ...]]:
+    """Lower ``Reinterpret`` views to an explicit tiled memref cast."""
     if not isinstance(transform, Reinterpret):
-        return _original(ref, transform, aval, block_shape)
-    operator.attrgetter("_validate_shape")(transform)(tuple(block_shape))
+        return _ORIGINAL(ref, transform, aval, block_shape)
+    transform.transform_type(jax.core.ShapedArray(tuple(block_shape), aval.dtype))
     original_type = ir.MemRefType(ref.type)
     bits = aval.dtype.itemsize * 8
     packing = 32 // bits
@@ -99,18 +95,28 @@ def _lower(
     return tpu.erase_memref_layout(erased, alias), transform.shape
 
 
-def storage_size(shape: _Dynamic, dtype: _Dynamic) -> _Dynamic:
-    """Execute storage size logic."""
-    dtype = jnp.dtype(dtype)
-    bits = dtype.itemsize * 8
+if vars(lowering)["_reshape_memref"] is not _lower:
+    vars(lowering)["_reshape_memref"] = _lower
+
+
+def storage_size(shape: Sequence[int], dtype: jax.typing.DTypeLike) -> int:
+    """Return the padded tile byte footprint for ``shape`` and ``dtype``."""
+    resolved_dtype = jnp.dtype(dtype)
+    bits = resolved_dtype.itemsize * 8
     packing = 32 // bits
     rows = 8 * packing
     row_tiles = (shape[-2] + rows - 1) // rows
     return math.prod(shape[:-2]) * row_tiles * (shape[-1] // 128) * 4096
 
 
-def view(ref: _Dynamic, shape: _Dynamic, dtype: _Dynamic) -> _Dynamic:
-    """Execute view logic."""
-    _ensure_patched()
-    ref = ref.bitcast(dtype)
-    return types.TransformedRef(ref.ref, (*ref.transforms, Reinterpret(tuple(shape))))
+def view(
+    ref: types.TransformedRef,
+    shape: Sequence[int],
+    dtype: jax.typing.DTypeLike,
+) -> types.TransformedRef:
+    """Reinterpret ``ref`` as ``shape`` and ``dtype`` over tiled VMEM."""
+    bitcast_ref = ref.bitcast(dtype)
+    return types.TransformedRef(
+        bitcast_ref.ref,
+        (*bitcast_ref.transforms, Reinterpret(tuple(shape))),
+    )
