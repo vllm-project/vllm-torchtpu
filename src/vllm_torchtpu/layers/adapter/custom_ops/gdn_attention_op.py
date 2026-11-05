@@ -46,6 +46,7 @@ from vllm_torchtpu.distributed.pcp import (
     get_pcp_rank,
     get_pcp_world_size,
 )
+from vllm_torchtpu.gdn_pool_layout import prefill_checkpoint_enabled
 from vllm_torchtpu.kernels.experimental.gdn_pcp_fused import projection_scale
 from vllm_torchtpu.kernels.gdn.head_geometry import (
     GdnHeadGeometry,
@@ -89,6 +90,8 @@ if TYPE_CHECKING:
         query_start_loc: torch.Tensor
         request_distribution: torch.Tensor
         mamba_state_indices: torch.Tensor | None
+        mamba_prefill_ckpt_offsets: torch.Tensor | None
+        mamba_prefill_ckpt_indices: torch.Tensor | None
 
 
 logger = init_logger(__name__)
@@ -191,6 +194,8 @@ def gdn_attention_pooled_core_tpu(
     seq_lens: jax.Array,
     slot_read_offsets: jax.Array | None = None,
     ckpt_indices: jax.Array | None = None,
+    prefill_ckpt_offsets: jax.Array | None = None,
+    prefill_ckpt_indices: jax.Array | None = None,
     *,
     mesh: jax.sharding.Mesh,
     n_kq: int,
@@ -217,6 +222,8 @@ def gdn_attention_pooled_core_tpu(
         seq_lens,
         slot_read_offsets,
         ckpt_indices,
+        prefill_ckpt_offsets=prefill_ckpt_offsets,
+        prefill_ckpt_indices=prefill_ckpt_indices,
         n_kq=n_kq,
         n_v=n_v,
         d_k=d_k,
@@ -440,6 +447,23 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         pool_index, layout = self._bm_region
         return flat_manager_ids(ids, pool_index, layout.num_pools)
 
+    def _prefill_ckpt_operands(
+        self, attn_metadata: "_GdnAttentionMetadata"
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        """Returns prefill checkpoint offsets and kernel-space block IDs."""
+        offsets = attn_metadata.mamba_prefill_ckpt_offsets
+        ids = attn_metadata.mamba_prefill_ckpt_indices
+        if offsets is None:
+            assert ids is None
+            return None, None
+        assert ids is not None
+        ids = ids.to(torch.int32)
+        if self._bm_kernel:
+            ids = torch.where(
+                ids >= 0, self._bm_state_ids(ids), torch.full_like(ids, -1)
+            )
+        return offsets, ids
+
     @property
     def tp_head_geometry(self) -> GdnHeadGeometry:
         return derive_gdn_head_geometry(
@@ -513,7 +537,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         if spec is None:
             return None
         assert isinstance(spec, MambaSpec)
-        return _localize_gdn_mamba_spec_for_pcp(
+        spec = _localize_gdn_mamba_spec_for_pcp(
             spec,
             _get_pcp_size(vllm_config),
             num_kq_heads=self.tp_head_geometry.local_num_kq_heads,
@@ -521,6 +545,17 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             d_k=self.head_k_dim,
             d_v=self.head_v_dim,
         )
+        if prefill_checkpoint_enabled(vllm_config):
+            # Gate only on config shared across all processes so every stage and
+            # rank declares identical MambaSpecs (required by the scheduler).
+            # Alignment is 1 because the GDN v3 kernels can export a checkpoint
+            # at any query row.
+            spec = dataclasses.replace(
+                spec,
+                num_prefill_checkpoint_blocks=1,
+                prefill_checkpoint_alignment=1,
+            )
+        return spec
 
     def get_state_dtype(self) -> tuple[torch.dtype, ...]:
         conv_state_dtype, temporal_state_dtype = super().get_state_dtype()
@@ -753,6 +788,8 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             seq_lens: jax.Array,
             slot_read_offsets: jax.Array | None = None,
             ckpt_indices: jax.Array | None = None,
+            prefill_ckpt_offsets: jax.Array | None = None,
+            prefill_ckpt_indices: jax.Array | None = None,
         ) -> tuple[jax.Array, jax.Array]:
             # Fold the `(num_blocks, rows_per_block, *page)` block-major pool so
             # pool adapters index flat kernel blocks along dim 0; both reshapes
@@ -773,6 +810,8 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 seq_lens,
                 slot_read_offsets,
                 ckpt_indices,
+                prefill_ckpt_offsets,
+                prefill_ckpt_indices,
                 mesh=mesh,
                 n_kq=n_kq,
                 n_v=local_num_v_heads,
@@ -841,7 +880,11 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             seq_lens: torch.Tensor,
             slot_read_offsets: torch.Tensor | None = None,
             ckpt_indices: torch.Tensor | None = None,
+            prefill_ckpt_offsets: torch.Tensor | None = None,
+            prefill_ckpt_indices: torch.Tensor | None = None,
         ) -> torch.Tensor:
+            # Keep optional operands after the donated pool tensor so dropping
+            # None args at the TorchTPU boundary does not shift donate_argnums.
             new_rec, outputs = gdn_jax_op(
                 mixed_qkv,
                 b,
@@ -857,6 +900,8 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 seq_lens,
                 slot_read_offsets,
                 ckpt_indices,
+                prefill_ckpt_offsets,
+                prefill_ckpt_indices,
             )
 
             # Plain donation + copy_ writeback (aliased in-place by XLA).
@@ -915,6 +960,8 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             distribution: jax.Array,
             seq_lens: jax.Array,
             qkvz_weight_scale: jax.Array | None,
+            prefill_ckpt_offsets: jax.Array | None = None,
+            prefill_ckpt_indices: jax.Array | None = None,
         ) -> tuple[jax.Array, jax.Array, jax.Array]:
             pool = kernel_view(recurrent_state) if block_major else recurrent_state
             result = run_jax_gdn_attention_pooled_pcp_prefill_projection(
@@ -942,6 +989,8 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 pcp_size=pcp_size,
                 interleave_size=interleave_size,
                 recurrent_state_dtype=recurrent_state_dtype,
+                prefill_ckpt_offsets=prefill_ckpt_offsets,
+                prefill_ckpt_indices=prefill_ckpt_indices,
             )
             if not block_major:
                 return result
@@ -968,6 +1017,8 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             PartitionSpec(),  # request_distribution
             PartitionSpec(),  # seq_lens
             PartitionSpec(_GDN_TP_AXIS_NAME),  # optional QKVZ weight scale
+            PartitionSpec(),  # optional prefill checkpoint offsets
+            PartitionSpec(),  # optional prefill checkpoint block ids
         )
         output_partition_specs = (
             PartitionSpec(_GDN_PCP_TP_STATE_AXIS),  # new pool
@@ -983,8 +1034,8 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             # TorchTPU boundary cannot change the donated tensor's index.
             donate_argnums=(4,),
             mesh=pcp_mesh,
-            input_partition_specs=input_partition_specs,
-            output_partition_specs=output_partition_specs,
+            input_partition_specs=cast(Any, input_partition_specs),
+            output_partition_specs=cast(Any, output_partition_specs),
         )
 
         def _fake_gdn(hidden_states, _weight, _b, _a, recurrent_state, *args, **kwargs):
@@ -1012,6 +1063,8 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             query_start_loc: torch.Tensor,
             request_distribution: torch.Tensor,
             seq_lens: torch.Tensor,
+            prefill_ckpt_offsets: torch.Tensor | None = None,
+            prefill_ckpt_indices: torch.Tensor | None = None,
         ) -> tuple[torch.Tensor, torch.Tensor]:
             new_rec, outputs, z = gdn_jax_op(
                 hidden_states,
@@ -1028,6 +1081,8 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 request_distribution,
                 seq_lens,
                 qkvz_weight_scale,
+                prefill_ckpt_offsets,
+                prefill_ckpt_indices,
             )
             # Match the non-PCP pooled path: donation aliases the Pallas
             # result to the input pool, while copy_ exposes the mutation to
@@ -1114,6 +1169,9 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         state_indices = attn_metadata.mamba_state_indices
         assert state_indices is not None
         state_indices = self._bm_state_ids(state_indices.to(torch.int32))
+        prefill_ckpt_offsets, prefill_ckpt_indices = self._prefill_ckpt_operands(
+            attn_metadata
+        )
         core_attn_out, z = gdn_pooled_pcp_op(
             hidden_states,
             qkvz_weight,
@@ -1129,6 +1187,8 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             attn_metadata.query_start_loc,
             attn_metadata.request_distribution,
             attn_metadata.seq_lens,
+            prefill_ckpt_offsets,
+            prefill_ckpt_indices,
         )
         num_tokens = hidden_states.size(0)
         if core_attn_out.shape[0] != num_tokens:
@@ -1225,6 +1285,9 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                         "mamba_slot_read_offsets in the attention metadata."
                     )
                 ckpt_indices = getattr(attn_metadata, "mamba_ckpt_indices", None)
+                prefill_ckpt_offsets, prefill_ckpt_indices = (
+                    self._prefill_ckpt_operands(attn_metadata)
+                )
                 core_attn_out = self.gdn_pooled_op(
                     mixed_qkv,
                     b,
@@ -1240,11 +1303,16 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                     attn_metadata.seq_lens,
                     slot_read_offsets,
                     ckpt_indices,
+                    prefill_ckpt_offsets,
+                    prefill_ckpt_indices,
                 )
                 if core_attn_out.shape[0] != num_tokens:
                     raise RuntimeError("GDN op returned an incompatible output shape.")
             else:
                 conv_state, recurrent_state = kv_cache
+                assert attn_metadata.mamba_prefill_ckpt_offsets is None, (
+                    "GDN prefill checkpoints need the unified KV pool."
+                )
                 # Recurrent-state slot id per persistent-batch position.
                 # Compact-mamba: the mamba pool has only `_mamba_num_blocks` slots
                 # (< attention `num_blocks`), so the slot id is carried explicitly
