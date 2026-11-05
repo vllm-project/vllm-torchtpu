@@ -431,6 +431,22 @@ def _kv_words_kernel(
     _run()
 
 
+def _qnorm_rope_rows(
+    x: jax.Array, cos: jax.Array, sin: jax.Array, *, eps: float
+) -> jax.Array:
+    """Per-head RMSNorm (no weight) of the f32 ``x`` over its whole last axis,
+    then the rotation ``_rope_body`` applies, by ``_cos_sin_lanes``' ``cos`` and
+    ``sin`` broadcast to ``x[..., -LANE:]``."""
+    rms = jax.lax.rsqrt(jnp.mean(x * x, axis=-1, keepdims=True) + eps)
+    y = x * rms
+
+    # Only the last lane block holds roped channels; the rest of the row passes
+    # through with nothing but the norm applied.
+    tail = y[..., -LANE:]
+    roped = tail * cos + _rotate_gptj(tail) * sin
+    return jnp.concatenate([y[..., :-LANE], roped], axis=-1)
+
+
 def _qnorm_rope_body(
     x_ref: jax.Ref,
     cos_sin_ref: jax.Ref,
@@ -441,25 +457,12 @@ def _qnorm_rope_body(
     inverse: bool,
     out_dtype: jnp.dtype,
 ) -> None:
-    """Process one ``(tile_n, num_heads, head_dim)`` chunk.
-
-    Per-head RMSNorm (no weight) over the whole ``head_dim``, then the same
-    rotation ``_rope_body`` applies.
-    """
+    """Process one ``(tile_n, num_heads, head_dim)`` chunk."""
     x = x_ref[...].astype(jnp.float32)
-    rms = jax.lax.rsqrt(jnp.mean(x * x, axis=-1, keepdims=True) + eps)
-    y = x * rms
-
-    # Only the last lane block holds roped channels; the rest of the row passes
-    # through with nothing but the norm applied.
-    tail = y[..., -LANE:]
+    assert x.ndim == 3
     cos, sin = _cos_sin_lanes(cos_sin_ref[...], rotary_dim=rotary_dim, inverse=inverse)
-    assert tail.ndim == 3
-    cos = cos[:, None, :]
-    sin = sin[:, None, :]
-    roped = tail * cos + _rotate_gptj(tail) * sin
-
-    out_ref[...] = jnp.concatenate([y[..., :-LANE], roped], axis=-1).astype(out_dtype)
+    y = _qnorm_rope_rows(x, cos[:, None, :], sin[:, None, :], eps=eps)
+    out_ref[...] = y.astype(out_dtype)
 
 
 def _qnorm_rope_kernel(
