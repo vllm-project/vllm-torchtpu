@@ -42,7 +42,8 @@ def test_int32_slots_match_int64(device, monkeypatch, onehot):
     assert (out.cpu()[-6:] == -1).all()
 
 
-def test_int32_slot_write_matches_write_cache(device, monkeypatch):
+@pytest.mark.parametrize("tile_scatter", [False, True])
+def test_int32_slot_write_matches_write_cache(device, monkeypatch, tile_scatter):
     if device.type != "tpu":
         pytest.skip("the cache write op runs on TPU")
     from vllm_torchtpu.models.vllm import vllm_model_wrapper_context
@@ -54,6 +55,9 @@ def test_int32_slot_write_matches_write_cache(device, monkeypatch):
         lambda: SimpleNamespace(mesh=mesh),
     )
     v2_cache.initialize_cache_ops()
+    monkeypatch.setattr(
+        "vllm_torchtpu.envs.TPU_DEEPSEEK_V41_ENGRAM_TILE_SCATTER", tile_scatter
+    )
     metadata, positions = _metadata(device)
     kv_cache = torch.empty((PAGES, PAGE), dtype=torch.int8, device=device)
     gen = torch.Generator().manual_seed(1)

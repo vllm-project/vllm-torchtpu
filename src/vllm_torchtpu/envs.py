@@ -12,6 +12,7 @@ if TYPE_CHECKING:
     TPU_DEEPSEEK_V41_ENGRAM_FUSED_HASH: bool = False
     TPU_DEEPSEEK_V41_ENGRAM_MASKS_IN_HASH: bool = False
     TPU_DEEPSEEK_V41_ENGRAM_INT32_SLOT_WRITE: bool = False
+    TPU_DEEPSEEK_V41_ENGRAM_TILE_SCATTER: bool = False
     TPU_DEEPSEEK_V41_IMPL: str = "v2"
     TPU_DEEPSEEK_V41_ENGRAM_CPU_OFFLOAD: bool = False
     TPU_DEEPSEEK_V41_ENGRAM_HBM: str = "auto"
@@ -433,6 +434,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # ops. Same slots, same cache contents.
     "TPU_DEEPSEEK_V41_ENGRAM_INT32_SLOT_WRITE": env_bool(
         "TPU_DEEPSEEK_V41_ENGRAM_INT32_SLOT_WRITE", default=False
+    ),
+    # With the int32 slot write: scatter into the slot cache by 128-entry tile
+    # read-modify-writes (kernels/deepseek_v41/tile_scatter.py), costing per
+    # touched tile instead of XLA's pass over the whole cache. Same contents.
+    "TPU_DEEPSEEK_V41_ENGRAM_TILE_SCATTER": env_bool(
+        "TPU_DEEPSEEK_V41_ENGRAM_TILE_SCATTER", default=False
     ),
     # Deprecated aliases, resolved by the DSV41 serving-policy verifier.
     # Serving supports v2; v1 remains only as a standalone reference.
