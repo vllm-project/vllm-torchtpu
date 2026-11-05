@@ -72,6 +72,7 @@ def test_matches_reference(
         block_q=block_q,
         large_block_q=large_block_q,
         pages_per_step=pages_per_step,
+        small_pages_per_step=pages_per_step,
         kernel=kernel,
         large_kernel=kernel,
         interpret=True,
