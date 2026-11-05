@@ -209,24 +209,21 @@ class ModelSpec:
     name: str
     config: Any
     layer_type: LayerType
-    # Optional cache backend (layout + gather / scatter callbacks); None for
-    # models without a page-based cache.
+    # Optional cache backend (layout + gather / scatter / with_layout callbacks);
+    # None for models without a page-based cache.
     cache_backend: Any = None
 
     def __post_init__(self) -> None:
-        layout = getattr(self.cache_backend, "layout", None)
-        if layout is None:
+        if self.cache_backend is None or self.cache_backend.layout is None:
             return
+        layout = self.cache_backend.layout
         cloned: dict[int, Module] = {}
         changed = False
 
         def _bind_mod(m: Module) -> Module:
             nonlocal changed
-            bind = getattr(m, "with_cache_layout", None)
-            if bind is None:
-                return m
             if id(m) not in cloned:
-                m_new = bind(layout)
+                m_new = m.with_cache_layout(layout)
                 if m_new is not m:
                     changed = True
                 cloned[id(m)] = m_new

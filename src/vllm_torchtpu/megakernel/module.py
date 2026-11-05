@@ -271,6 +271,11 @@ class Module:
     def cache_decl(self, g: Any = None) -> KVCacheDecl | RecurrentCacheDecl | None:
         return None
 
+    def with_cache_layout(self, layout: Any) -> Module:
+        """Return this module bound to `layout` (identity by default)."""
+        del layout
+        return self
+
     def init_logical_states(
         self, key: Any, g: Any, ex: ExecSpec, n_layers: int
     ) -> dict[str, Any]:

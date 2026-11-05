@@ -57,8 +57,7 @@ class FakeGeometry:
     VD: int = 128
     E: int = 128
     TOPK: int = 2
-    __annotations__["I"] = int
-    vars()["I"] = 256
+    I: int = 256  # noqa: E741
     IS: int = 256
     moe_tp: bool = False
     e_slots: int = 0
@@ -265,7 +264,7 @@ class MiniCtx:
     pos_ref: Any
     W: dict[str, Any]
     ST: dict[str, Any]
-    __annotations__["O"] = dict[str, Any]
+    O: dict[str, Any]  # noqa: E741
     scr: dict[str, Any]
     me: Any
     stream: Any

@@ -42,8 +42,6 @@ re-labels (`<name>+overrides`, class derived) instead of silently staying
 from __future__ import annotations
 
 import dataclasses
-import functools
-import inspect
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Literal
@@ -75,71 +73,11 @@ class TileContext:
         assert self.B % self.T == 0, (self.B, self.T)
         return self.B // self.T
 
-    def __int__(self) -> int:
-        return int(self.B)
 
-
-# Tile rule: `(tc: TileContext) -> Tiles` or `(B, *, moe_tp, R) -> Tiles`.
-TileRule = Callable[..., Tiles]
+# Tile rule: `(tc: TileContext) -> Tiles`.
+TileRule = Callable[[TileContext], Tiles]
 # Fields automatically derived by `Profile.with_overrides`.
 _DERIVED_PROFILE_FIELDS = frozenset({"name", "numerics", "model_default"})
-
-
-def _compute_rule_dispatch(rule: TileRule) -> tuple[bool, tuple[str, ...]]:
-    try:
-        sig = inspect.signature(rule)
-    except (TypeError, ValueError):
-        return (True, ())
-    params = sig.parameters
-    pos_params = [
-        p
-        for p in params.values()
-        if p.kind
-        in (
-            inspect.Parameter.POSITIONAL_ONLY,
-            inspect.Parameter.POSITIONAL_OR_KEYWORD,
-        )
-    ]
-    has_varkw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
-    first_is_tc = bool(
-        pos_params
-        and (
-            pos_params[0].name in ("tc", "tile_ctx", "tile_context", "context")
-            or pos_params[0].annotation
-            in (TileContext, "TileContext", "mk.TileContext")
-        )
-    )
-    takes_tc = first_is_tc or (
-        "moe_tp" not in params and "R" not in params and not has_varkw
-    )
-    extra_kws = tuple(k for k in ("T", "NS", "ctx", "g") if k in params)
-    return (takes_tc, extra_kws)
-
-
-@functools.lru_cache(maxsize=256)
-def _rule_dispatch_cached(rule: TileRule) -> tuple[bool, tuple[str, ...]]:
-    return _compute_rule_dispatch(rule)
-
-
-def _rule_dispatch(rule: TileRule) -> tuple[bool, tuple[str, ...]]:
-    """Return cached `(takes_tile_context, extra_kw_names)` for `rule`."""
-    try:
-        return _rule_dispatch_cached(rule)
-    except TypeError:
-        return _compute_rule_dispatch(rule)
-
-
-def _call_tile_rule(rule: TileRule, tc: TileContext) -> Tiles:
-    """Invoke `rule` with `TileContext` `tc` or `(B, *, moe_tp, R)`."""
-    takes_tc, extra_kws = _rule_dispatch(rule)
-    if takes_tc:
-        return rule(tc)
-    if not extra_kws:
-        return rule(tc.B, moe_tp=tc.moe_tp, R=tc.R)
-    kw: dict[str, Any] = {"moe_tp": tc.moe_tp, "R": tc.R}
-    for k in extra_kws:
-        kw[k] = getattr(tc, k)
-    return rule(tc.B, **kw)
 
 
 @dataclass(frozen=True)
@@ -253,7 +191,7 @@ class Profile:
         self,
         B: int | TileContext,
         *,
-        R: int = 8,
+        R: int | None = None,
         moe_tp: bool = False,
         T: int = 1,
         ctx: int = 2048,
@@ -264,15 +202,19 @@ class Profile:
         For the library default rule (`tile_rule() is None`) these are the
         tiles before build-time VMEM refinement.
         """
-        tc = (
-            B
-            if isinstance(B, TileContext)
-            else TileContext(B=int(B), T=T, R=R, moe_tp=moe_tp, ctx=ctx, g=g)
-        )
+        if isinstance(B, TileContext):
+            tc = B
+        else:
+            if R is None:
+                raise TypeError(
+                    "Profile.tiles_for(B, *, R=...) requires explicit R "
+                    "when B is an int"
+                )
+            tc = TileContext(B=int(B), T=T, R=R, moe_tp=moe_tp, ctx=ctx, g=g)
         rule = self.tile_rule()
         if rule is None:
-            return default_tiles(tc.B, moe_tp=tc.moe_tp, R=tc.R)
-        return _call_tile_rule(rule, tc)
+            return default_tiles(tc)
+        return rule(tc)
 
     def exec_for(self, base: ExecSpec, *, B: int, T: int, g: Any = None) -> ExecSpec:
         """Specialize `base` for bucket `(T, B)` under this profile.
@@ -344,10 +286,12 @@ def approx_features(profile: Profile) -> tuple[str, ...]:
     The reference is `model_default_profile(profile.model)`; a model default
     profile is its own reference (no features). A tile field counts when the
     two tile rules give it different values on any bucket of the grid (`B` in
-    `1..MAX_BATCH_ROWS`, `R` in `{1, 2, 4, 8, 16}`, `moe_tp` in `{False, True}`)
-    and the knob is `approx` in `exec_spec.tile_numerics()` (module knobs as
-    `tiles.<module>.<field>`); a pool-I/O mode the profile turns on and the
-    reference does not counts per `POOL_IO_NUMERICS`.
+    `1..MAX_BATCH_ROWS`, `T` in `{1, 2, 4, 8}` with `B % T == 0`, `R` in
+    `{1, 2, 4, 8, 16}`, `moe_tp` in `{False, True}`, `ctx` in
+    `{2048, 8192, 32768}`) and the knob is `approx` in
+    `exec_spec.tile_numerics()` (module knobs as `tiles.<module>.<field>`); a
+    pool-I/O mode the profile turns on and the reference does not counts per
+    `POOL_IO_NUMERICS`.
     """
     if profile.model_default:
         return ()
@@ -372,11 +316,7 @@ def approx_features(profile: Profile) -> tuple[str, ...]:
                                 continue
                             tc = TileContext(B=B, T=T, R=R, moe_tp=moe_tp, ctx=ctx)
                             t = profile.tiles_for(tc)
-                            d = (
-                                default_tiles(B, moe_tp=moe_tp, R=R)
-                                if ref is None
-                                else ref.tiles_for(tc)
-                            )
+                            d = default_tiles(tc) if ref is None else ref.tiles_for(tc)
                             if t == d:
                                 continue
                             feats.update(

@@ -134,14 +134,39 @@ def test_registry_lookups_load_the_builtins_first() -> None:
 
 
 _FIRST_LOOKUP = """
+import importlib
 from vllm_torchtpu import megakernel as mk
-# The first lookup can be a profile one: `profile` builds DEFAULT_PROFILE
-# (a module-tunables lookup) while it is itself being imported.
+from vllm_torchtpu.megakernel import _builtins
+
+calls = []
+real_import = importlib.import_module
+
+def fake_import(name, package=None):
+    if name == "vllm_torchtpu.megakernel._reentrant_builtin":
+        calls.append(name)
+        assert len(calls) == 1, f"re-entered builtin import: {calls}"
+        # Re-entrant lookup while `profile` is mid-import (building
+        # DEFAULT_PROFILE) and `_reentrant_builtin` is mid-import: fails with
+        # RecursionError unless `_LOADED.add(name)` runs before import.
+        p = mk.Profile(
+            name="reentrant-exact",
+            numerics="exact",
+            tiles=lambda tc: mk.default_tiles(tc),
+        )
+        assert p.numerics == "exact"
+        return None
+    return real_import(name, package)
+
+importlib.import_module = fake_import
+_builtins.TUNABLES = ("_reentrant_builtin", *_builtins.TUNABLES)
+_builtins._LOADED.discard("_reentrant_builtin")
+
 assert mk.get_profile("default").numerics == "exact"
 mk.register_profile(
     mk.Profile(name="test-approx-profile", numerics="approx", fused_pool_io=True)
 )
 assert mk.get_profile("test-approx-profile").numerics == "approx"
+assert calls == ["vllm_torchtpu.megakernel._reentrant_builtin"], calls
 print("OK")
 """
 

@@ -144,7 +144,10 @@ class ParamTransform:
             not isinstance(self.transpose, tuple)
             or not all(type(i) is int for i in self.transpose)
         ):
-            raise TypeError("transpose must be a permutation tuple or None")
+            raise TypeError(
+                "ParamTransform.transpose must be a permutation tuple or None, "
+                f"got {self.transpose!r}"
+            )
 
 
 _TRANSFORM_FIELD_NAMES = frozenset(f.name for f in dataclasses.fields(ParamTransform))
@@ -166,7 +169,13 @@ class VLLMAlias:
 
 @dataclass(frozen=True)
 class HFParamDecl:
-    """Canonical parameter declaration (`shape` in MK layout, `hf_shape` in raw HF)."""
+    """Canonical parameter declaration (`shape` in MK layout, `hf_shape` in raw HF).
+
+    When `hf_shape` is omitted, it is derived by inverting `transform.transpose`
+    on `shape` (or equals `shape` when `transpose` is None). When a 2D `hf_shape`
+    differs in rank from `shape`, the loader first reshapes the raw HF tensor to
+    the inverse-permuted `shape` before applying `transform.transpose`.
+    """
 
     name: str
     hf_name: str
@@ -180,7 +189,10 @@ class HFParamDecl:
     def __post_init__(self) -> None:
         perm = self.transform.transpose
         if perm is not None and sorted(perm) != list(range(len(self.shape))):
-            raise ValueError(f"not a valid rank-{len(self.shape)} permutation")
+            raise ValueError(
+                f"HFParamDecl {self.name!r}: transpose={perm} is not a valid "
+                f"rank-{len(self.shape)} permutation for shape={self.shape}"
+            )
         if self.hf_shape is None:
             hf_sh = (
                 tuple(self.shape[perm.index(i)] for i in range(len(perm)))

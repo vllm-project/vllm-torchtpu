@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import functools
 from dataclasses import dataclass
+from typing import Any
 
 import jax
 
@@ -80,15 +81,15 @@ def chip_budget(device_kind: str | None = None) -> ChipBudget:
 
 
 def default_tiles(
-    B: int, *, moe_tp: bool = False, R: int = 8, chip: ChipBudget = DEFAULT_CHIP
+    tc: Any = None, *, moe_tp: bool = False, R: int = 8, chip: ChipBudget = DEFAULT_CHIP
 ) -> Tiles:
     """Model-agnostic default tiles (identical for every bucket).
 
-    `B`, `moe_tp` and `R` are accepted for tile-rule call-site compatibility
-    and ignored: field defaults everywhere, flat-ring all-reduce (`hier=0`),
-    and `chip`'s VMEM / SMEM budgets.
+    `tc` (a `TileContext` or batch row count `B`), `moe_tp` and `R` are accepted
+    for tile-rule and direct call-site compatibility and ignored: field defaults
+    everywhere, flat-ring all-reduce (`hier=0`), and `chip`'s VMEM / SMEM budgets.
     """
-    del B, moe_tp, R
+    del tc, moe_tp, R
     return Tiles(hier=0, vmem_mib=chip.vmem_mib, smem_mib=chip.smem_mib)
 
 
