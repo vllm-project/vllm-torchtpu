@@ -23,7 +23,7 @@ linear expert placement) and plain TP MoE (``tp_size == n_ranks``).
 """
 
 import dataclasses
-from typing import Any
+from typing import Any, cast
 
 import jax
 import jax.numpy as jnp
@@ -57,6 +57,7 @@ _OPS: dict[tuple, Any] = {}
 
 @dataclasses.dataclass(frozen=True)
 class _OpStatics(fp8_decode._OpStatics):
+    prefill_act_mode: prefill_nvfp4.ActMode = "w4a16"
     split_meta: bool = True
     w2_n_chunk: int = 2048
 
@@ -97,8 +98,12 @@ def _admit(runner: Any, n_ranks: int) -> fp8_decode._Admitted | str:
         w13_scale, w2_scale = scales
         sw13_t, ss13_t, sw2_t, ss2_t = shared
         prefill_above: int | None = None
-        if envs.FUSED_MOE_PREFILL_NVFP4_KERNEL and (
-            prefill_nvfp4.can_use_fused_moe_prefill_nvfp4(
+        prefill_act_mode: prefill_nvfp4.ActMode = "w4a16"
+        if envs.FUSED_MOE_PREFILL_NVFP4_KERNEL:
+            cand_act_mode = cast(
+                prefill_nvfp4.ActMode, envs.FUSED_MOE_PREFILL_NVFP4_ACT_MODE
+            )
+            if prefill_nvfp4.can_use_fused_moe_prefill_nvfp4(
                 jax.ShapeDtypeStruct((_PREFILL_PROBE_ROWS, hidden), jnp.bfloat16),
                 fp8_decode._sds(layer.w13_weight),
                 fp8_decode._sds(layer.w2_weight),
@@ -110,13 +115,15 @@ def _admit(runner: Any, n_ranks: int) -> fp8_decode._Admitted | str:
                 fp8_decode._sds(ss2_t),
                 jax.ShapeDtypeStruct((_PREFILL_PROBE_ROWS, topk), jnp.bfloat16),
                 jax.ShapeDtypeStruct((_PREFILL_PROBE_ROWS, topk), jnp.int32),
-            )
-        ):
-            min_tokens = envs.FUSED_MOE_PREFILL_NVFP4_MIN_TOKENS
-            prefill_above = max(kernel.ROW_BUCKETS[-1], min_tokens - 1)
+                act_mode=cand_act_mode,
+            ):
+                min_tokens = envs.FUSED_MOE_PREFILL_NVFP4_MIN_TOKENS
+                prefill_above = max(kernel.ROW_BUCKETS[-1], min_tokens - 1)
+                prefill_act_mode = cand_act_mode
         return _OpStatics(
             **base,
             prefill_above=prefill_above,
+            prefill_act_mode=prefill_act_mode,
             split_meta=bool(envs.TPU_MOE_TP_DECODE_SPLIT_META),
         )
 
@@ -154,9 +161,10 @@ def _prefill_chain(
     axis: str,
     e0,
 ):
-    """Reduced layer output via ``fused_moe_prefill_nvfp4_stage_a`` (W4A16)."""
+    """Reduced layer output via ``fused_moe_prefill_nvfp4_stage_a``."""
     logger.info(
-        "moe_tp_decode_nvfp4: fused MoE prefill kernel traced for %d tokens",
+        "moe_tp_decode_nvfp4: fused MoE prefill kernel (%s) traced for %d tokens",
+        st.prefill_act_mode,
         x.shape[0],
     )
     w, ids = fp8_decode._route(x, scores, bias, is_pad, st)
@@ -176,6 +184,7 @@ def _prefill_chain(
         axis_name=axis,
         expert_start=e0.astype(jnp.int32) if st.use_ep else None,
         routed_scale=st.routed_scale,
+        act_mode=st.prefill_act_mode,
         w2_n_chunk=st.w2_n_chunk,
     )
 
