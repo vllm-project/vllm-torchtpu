@@ -404,7 +404,16 @@ def _relane_counts(cnt, r3_ref, *, count_at, g):
 
 @functools.cache
 def _build_exchange_rows_tables(
-    ep, width, n_rows, count_at, g, n_pre, tile_m, before_barrier, light_prepush=0
+    ep,
+    width,
+    n_rows,
+    count_at,
+    g,
+    n_pre,
+    tile_m,
+    before_barrier,
+    light_prepush=0,
+    single_barrier=False,
 ):
     slab_rows = tx._slab_rows(width)
     r_lo = count_at // LANES
@@ -435,6 +444,7 @@ def _build_exchange_rows_tables(
             lsem,
             (lambda: None) if before_barrier else copy_rows,
             before=copy_rows if before_barrier else None,
+            single_barrier=single_barrier,
         )
         # Every peer's row has landed; the row copies may still be in flight,
         # and the tables are built meanwhile from the exchanged counts.
@@ -480,7 +490,8 @@ def _build_exchange_rows_tables(
             compiler_params=tx._compiler_params(),
             name=f"moe_tc_routing_exchange_ep{ep}_w{width}_rows{n_rows}_tables"
             + ("_early" if before_barrier else "")
-            + (f"_lp{light_prepush}" if light_prepush else ""),
+            + (f"_lp{light_prepush}" if light_prepush else "")
+            + ("_1b" if single_barrier else ""),
         )(r, idx, slab, rows, _seg3(seg_start_local, ep, g))
         return (tx._unpad(out, ep, width), gathered) + _unpack_tables(tables)
 
@@ -498,6 +509,7 @@ def build_exchange_rows_tables(
     tile_m,
     before_barrier=False,
     light_prepush=0,
+    single_barrier=False,
 ):
     """tc_exchange.build_tc_exchange_all_gather_rows' kernel (row copies
     issued after the pushes, or before the entry barrier with
@@ -518,4 +530,5 @@ def build_exchange_rows_tables(
         int(tile_m),
         bool(before_barrier),
         int(light_prepush),
+        bool(single_barrier),
     )

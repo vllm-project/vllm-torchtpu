@@ -97,6 +97,19 @@ def tile_height_rungs(tile_m, override=0):
     return tuple(range(step, tile_m + 1, step))
 
 
+def _entry_barrier_first_phase(ep):
+    """_all_pairs_barrier's first phase: every shard signals every shard."""
+    barrier_sem = pltpu.get_barrier_semaphore()
+    for i in range(ep):
+        pl.semaphore_signal(
+            barrier_sem,
+            inc=1,
+            device_id=(jnp.int32(i),),
+            device_id_type=pl.DeviceIdType.MESH,
+        )
+    pl.semaphore_wait(barrier_sem, ep)
+
+
 def _build_push_moe_kernel(
     *,
     g_local,
@@ -120,6 +133,7 @@ def _build_push_moe_kernel(
     dispatch_ahead=1,
     staging_slots=0,
     act_scale_bits=False,
+    single_barrier=False,
 ):
     """Build the pallas_call and the function that invokes it.
 
@@ -176,6 +190,13 @@ def _build_push_moe_kernel(
     `act_scale_bits=True` takes the activation scale slab as the i32 bit
     patterns of the scales (what the layer's scatter writes) and bitcasts
     each tile's column in VMEM, so no bitcast copy of the slab runs first.
+
+    `single_barrier=True` opens with the first phase of the all-pairs entry
+    barrier only. The second phase guards the barrier semaphore against a
+    peer that races into this kernel's next call while this shard still
+    waits in this one; the layer's routing exchange stands between any two
+    calls, and a peer leaves it only once this shard's row has landed, which
+    this shard sends only after leaving this call.
     """
     if staging_slots and hbm_staging:
         raise ValueError("staging_slots stages in VMEM; hbm_staging stages in HBM")
@@ -1459,7 +1480,10 @@ def _build_push_moe_kernel(
         def _():
             prime_expert(visit_sm[0], jnp.int32(0), 0)
 
-        _all_pairs_barrier(ep)
+        if single_barrier:
+            _entry_barrier_first_phase(ep)
+        else:
+            _all_pairs_barrier(ep)
         if tc_dispatch:
             dispatch_issue(sc_prepush, min(sc_prepush + dispatch_ahead, g_local))
 
@@ -1769,6 +1793,7 @@ def _build_push_moe_kernel(
             f"{'' if dispatch_ahead == 1 else f'_da{dispatch_ahead}'}"
             f"{f'_st{out_slots}' if deep_staging else ''}"
             f"{'_lsbits' if act_scale_bits else ''}"
+            f"{'_1b' if single_barrier else ''}"
         )
         return pl.pallas_call(
             kernel,

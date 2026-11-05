@@ -470,6 +470,8 @@ FRONT_SWITCHES = (
     "exchange_row_gather+table_kernel+exchange_tables+light_prepush",
     "table_kernel+kernel_plan_tables+light_prepush",
     "exchange_row_gather+table_kernel+exchange_tables+light_prepush=2",
+    "exchange_row_gather+table_kernel+exchange_tables+single_barrier",
+    "single_barrier",
 )
 
 

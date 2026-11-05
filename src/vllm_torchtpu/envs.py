@@ -123,6 +123,7 @@ if TYPE_CHECKING:
     MOE_FUSED_EP_PUSH_STAGING_SLOTS: int = 0
     MOE_FUSED_EP_PUSH_SHARED_EXPERT: bool = False
     MOE_FUSED_EP_PUSH_LIGHT_PREPUSH: int = 0
+    MOE_FUSED_EP_PUSH_SINGLE_BARRIER: bool = False
     TPU_EXPERT_PLACEMENT: str = ""
     TPU_LATENT_PROJ_INTRA_CHIP_TP: bool = False
     TPU_TOKEN_BUCKET_EXTRA: list[int] = []
@@ -969,6 +970,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # most rows first (1) or rising to the heaviest and falling back (2).
     # Layers with fewer than 16 local slots keep the default order.
     "MOE_FUSED_EP_PUSH_LIGHT_PREPUSH": env_int("MOE_FUSED_EP_PUSH_LIGHT_PREPUSH", 0),
+    # MOE_FUSED_EP_KERNEL_IMPL=push: the expert kernel and the TensorCore
+    # routing exchange open with one all-pairs barrier phase instead of two.
+    "MOE_FUSED_EP_PUSH_SINGLE_BARRIER": env_bool("MOE_FUSED_EP_PUSH_SINGLE_BARRIER"),
     # MOE_FUSED_EP_KERNEL_IMPL=push: run the layer's FP8 shared expert (the
     # fused kernel of TPU_DEEPSEEK_V41_FUSED_SHARED_EXPERT) inside the MoE op,
     # issued after the SparseCore pre-push and ahead of the expert kernel, so

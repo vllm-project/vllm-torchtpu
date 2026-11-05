@@ -313,6 +313,7 @@ def fused_ep_moe_push(
     vmem_combine=False,
     staging_slots=0,
     light_prepush=0,
+    single_barrier=False,
     expert_slot=None,
     expert_load=None,
     shared_expert=None,
@@ -360,7 +361,8 @@ def fused_ep_moe_push(
     `vmem_combine` combines the arrivals with the buffer resident in VMEM
     where it fits (see `_combine_arrivals_fs`); `light_prepush` (1 or 2)
     gives the SparseCore pre-push the lightest experts and orders the rest
-    (plan_kernel._tables). The
+    (plan_kernel._tables); `single_barrier` opens the expert kernel and the
+    routing exchange with one barrier phase, not two. The
     caller (layers/adapter/fused_moe_ep.py) reads all of them from envs.
 
     `expert_slot` [experts, R] i32 and `expert_load` [e_total] i32 (both
@@ -569,6 +571,7 @@ def fused_ep_moe_push(
         dispatch_ahead=dispatch_ahead,
         staging_slots=int(staging_slots),
         act_scale_bits=bool(i32_scale_slab),
+        single_barrier=bool(single_barrier),
     )
 
     layout = _exchange_layout(t_local, topk, e_total, form.quantized_activations)
@@ -576,7 +579,9 @@ def fused_ep_moe_push(
     def exchange_all_gather(packed, rank_l):
         """The routing exchange all-gather of the flat i32 payload."""
         if tc_exchange:
-            return build_tc_exchange_all_gather(ep=ep, width=packed.size)(
+            return build_tc_exchange_all_gather(
+                ep=ep, width=packed.size, single_barrier=bool(single_barrier)
+            )(
                 packed, rank_l[0, 0]
             )
         return lax.all_gather(packed, ax, axis=0, tiled=True)
@@ -1021,6 +1026,7 @@ def fused_ep_moe_push(
                     tile_m=capacity,
                     before_barrier=early_row_gather,
                     light_prepush=light_prepush,
+                    single_barrier=bool(single_barrier),
                 )(packed, rank_l[0, 0], q_l, tok, seg_start)
             else:
                 exchange, q_sorted = build_tc_exchange_all_gather_rows(
@@ -1028,6 +1034,7 @@ def fused_ep_moe_push(
                     width=layout[-1],
                     n_rows=tok.shape[0],
                     before_barrier=early_row_gather,
+                    single_barrier=bool(single_barrier),
                 )(packed, rank_l[0, 0], q_l, tok)
             exchange = exchange.reshape(ep, layout[-1])
         else:
@@ -1162,6 +1169,7 @@ def fused_ep_moe_push(
         has_shared and float(shared_limit),
         bool(vmem_combine),
         int(light_prepush),
+        bool(single_barrier),
     )
     out_specs = (P(ax),) + ((P(),) if has_expert_load else ()) + ((P(ax),) * has_shared)
     out_specs = out_specs if len(out_specs) > 1 else out_specs[0]

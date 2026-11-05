@@ -27,7 +27,8 @@ for the ep - 1 incoming rows. Bit-exact with
   partial-tile remote DMA has crashed a slice);
 * a two-phase entry barrier (barrier semaphore, then a scoped REGULAR
   semaphore), so every peer is inside this call -- output allocated, the
-  previous call's exchange consumed -- before any row lands;
+  previous call's exchange consumed -- before any row lands; with
+  `single_barrier` only the first phase (see _double_barrier);
 * its own collective id: the TensorCore MoE kernel uses 0 and the SparseCore
   kernels 1.
 """
@@ -49,7 +50,13 @@ _CACHE = {}
 _CACHE_LOCK = threading.Lock()
 
 
-def _double_barrier(ep, me):
+def _double_barrier(ep, me, single=False):
+    """Every peer signals every peer, twice. The second phase guards the
+    barrier semaphore against a peer that races into the next call and
+    signals it while this shard still waits in this one. `single` drops it:
+    a peer leaves an exchange only once every peer's row has landed, and a
+    peer pushes only after its own wait has returned, so no signal of the
+    next call can reach a shard still waiting in this one."""
     barrier_sem = pltpu.get_barrier_semaphore()
 
     def sig(sem):
@@ -66,21 +73,28 @@ def _double_barrier(ep, me):
         pl.semaphore_wait(sem, ep)
 
     sig(barrier_sem)
+    if single:
+        return
 
     @functools.partial(pl.run_scoped, second=pltpu.SemaphoreType.REGULAR)
     def _(second):
         sig(second)
 
 
-def build_tc_exchange_all_gather(*, ep, width):
+def build_tc_exchange_all_gather(*, ep, width, single_barrier=False):
     """fn(packed i32[width], rank i32 scalar / [1] / [1, 1]) -> i32[ep * width].
 
     Memoized per (ep, width) under a lock, like the package's other builders.
     """
-    return _memoized(("plain", ep, width), lambda: _build_plain(ep=ep, width=width))
+    return _memoized(
+        ("plain", ep, width, single_barrier),
+        lambda: _build_plain(ep=ep, width=width, single_barrier=single_barrier),
+    )
 
 
-def build_tc_exchange_all_gather_rows(*, ep, width, n_rows, before_barrier=False):
+def build_tc_exchange_all_gather_rows(
+    *, ep, width, n_rows, before_barrier=False, single_barrier=False
+):
     """fn(packed, rank, rows [n_src, ...], idx i32 [n_rows]) ->
     (the exchange as build_tc_exchange_all_gather's, rows[idx]).
 
@@ -91,9 +105,13 @@ def build_tc_exchange_all_gather_rows(*, ep, width, n_rows, before_barrier=False
     Every idx entry must be in range.
     """
     return _memoized(
-        ("rows", ep, width, n_rows, before_barrier),
+        ("rows", ep, width, n_rows, before_barrier, single_barrier),
         lambda: _build_rows(
-            ep=ep, width=width, n_rows=n_rows, before_barrier=before_barrier
+            ep=ep,
+            width=width,
+            n_rows=n_rows,
+            before_barrier=before_barrier,
+            single_barrier=single_barrier,
         ),
     )
 
@@ -114,13 +132,22 @@ def _slab_rows(width):
 
 
 def _exchange(
-    ep, me, x_hbm, out_hbm, send_sem, recv_sem, lsem, while_in_flight, before=None
+    ep,
+    me,
+    x_hbm,
+    out_hbm,
+    send_sem,
+    recv_sem,
+    lsem,
+    while_in_flight,
+    before=None,
+    single_barrier=False,
 ):
     """Run `before`, barrier, push this shard's row everywhere, run
     `while_in_flight`, then wait for every row in and out."""
     if before is not None:
         before()
-    _double_barrier(ep, me)
+    _double_barrier(ep, me, single=single_barrier)
     mine = out_hbm.at[pl.ds(me, 1)]
     local = pltpu.make_async_copy(x_hbm, mine, lsem)
     local.start()
@@ -171,10 +198,18 @@ def _unpad(out, ep, width):
 _HBM = pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM)
 
 
-def _build_plain(*, ep, width):
+def _build_plain(*, ep, width, single_barrier=False):
     def kernel(rank_sm, x_hbm, out_hbm, send_sem, recv_sem, lsem):
         _exchange(
-            ep, rank_sm[0], x_hbm, out_hbm, send_sem, recv_sem, lsem, lambda: None
+            ep,
+            rank_sm[0],
+            x_hbm,
+            out_hbm,
+            send_sem,
+            recv_sem,
+            lsem,
+            lambda: None,
+            single_barrier=single_barrier,
         )
 
     call = pl.pallas_call(
@@ -188,7 +223,8 @@ def _build_plain(*, ep, width):
         ),
         out_shape=jax.ShapeDtypeStruct((ep, _slab_rows(width), LANES), jnp.int32),
         compiler_params=_compiler_params(),
-        name=f"moe_tc_routing_exchange_ep{ep}_w{width}",
+        name=f"moe_tc_routing_exchange_ep{ep}_w{width}"
+        + ("_1b" if single_barrier else ""),
     )
 
     def fn(packed, rank):
@@ -197,7 +233,7 @@ def _build_plain(*, ep, width):
     return fn
 
 
-def _build_rows(*, ep, width, n_rows, before_barrier):
+def _build_rows(*, ep, width, n_rows, before_barrier, single_barrier=False):
     def kernel(
         rank_sm, idx_sm, x_hbm, src_hbm, out_hbm, dst_hbm,
         send_sem, recv_sem, lsem, gsem,
@@ -221,6 +257,7 @@ def _build_rows(*, ep, width, n_rows, before_barrier):
             lsem,
             (lambda: None) if before_barrier else copy_rows,
             before=copy_rows if before_barrier else None,
+            single_barrier=single_barrier,
         )
         # One wait the size of all n_rows rows retires every row copy.
         pltpu.make_async_copy(dst_hbm, dst_hbm, gsem).wait()
@@ -245,7 +282,8 @@ def _build_rows(*, ep, width, n_rows, before_barrier):
             ),
             compiler_params=_compiler_params(),
             name=f"moe_tc_routing_exchange_ep{ep}_w{width}_rows{n_rows}"
-            + ("_early" if before_barrier else ""),
+            + ("_early" if before_barrier else "")
+            + ("_1b" if single_barrier else ""),
         )(r, idx, slab, rows)
         return _unpad(out, ep, width), gathered
 

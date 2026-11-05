@@ -236,6 +236,7 @@ def _build_op(
             vmem_combine=envs.MOE_FUSED_EP_PUSH_VMEM_COMBINE,
             staging_slots=envs.MOE_FUSED_EP_PUSH_STAGING_SLOTS,
             light_prepush=envs.MOE_FUSED_EP_PUSH_LIGHT_PREPUSH,
+            single_barrier=envs.MOE_FUSED_EP_PUSH_SINGLE_BARRIER,
         )
 
     preprocess_topology = prepare_moe_preprocessing(mesh)
