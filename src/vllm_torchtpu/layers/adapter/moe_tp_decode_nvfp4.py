@@ -8,10 +8,14 @@ behind ``USE_MOE_TP_DECODE_NVFP4_KERNEL`` (default off):
     ``moe_tp_decode_nvfp4`` (W4A8 grouped FP4 decode kernel + in-kernel
     all-reduce), and slices ``[:n]``.
   - At ``n in (16, 32, 64)``, runs ``moe_tp_decode_nvfp4`` directly.
-  - At ``n > 64`` (mixed / prefill buckets), runs ``moe_tp_decode._tp_chain``
-    (``fused_moe_func`` -> ``gmm_v2`` W4A16 + online-FP8 shared expert) plus
-    ``lax.psum`` on the same K-major FP4 weights and 4D block scales, with zero
-    weight duplication.
+  - At ``n > 64`` (mixed / prefill buckets), runs
+    ``fused_moe_prefill_nvfp4_stage_a`` (W4A16 default, Stage-A whole-expert
+    ring + fused online-FP8 shared expert + chunked RS/AG combine) when
+    ``FUSED_MOE_PREFILL_NVFP4_KERNEL`` is enabled, the layer admits it, and
+    ``n >= FUSED_MOE_PREFILL_NVFP4_MIN_TOKENS`` (default ``2048``);
+    otherwise runs ``moe_tp_decode._tp_chain`` (``fused_moe_func`` ->
+    ``gmm_v2`` W4A16 + online-FP8 shared expert) plus ``lax.psum`` on the same
+    K-major FP4 weights and 4D block scales, with zero weight duplication.
 
 Supports both EP x TP MoE (e.g. ``EP2xTP4`` via ``ENABLE_EXPERT_PARALLEL=true``
 and ``TPU_MOE_EP_TP_SIZE=4``, where ``ep_size * tp_size == n_ranks`` with
@@ -21,9 +25,14 @@ linear expert placement) and plain TP MoE (``tp_size == n_ranks``).
 import dataclasses
 from typing import Any
 
+import jax
+import jax.numpy as jnp
 import torch
 
 import vllm_torchtpu.envs as envs
+from vllm_torchtpu.kernels.experimental import (
+    fused_moe_prefill_nvfp4 as prefill_nvfp4,
+)
 from vllm_torchtpu.kernels.experimental import moe_tp_decode_nvfp4 as kernel
 from vllm_torchtpu.layers.adapter import moe_tp_decode as fp8_decode
 from vllm_torchtpu.logger import init_logger
@@ -32,6 +41,7 @@ logger = init_logger(__name__)
 
 _ENV_FLAG = "USE_MOE_TP_DECODE_NVFP4_KERNEL"
 _OP_ATTR = "_moe_tp_decode_nvfp4_op"
+_PREFILL_PROBE_ROWS = 128
 _BUFFERS = (
     "_moe_tp_decode_nvfp4_sw13",
     "_moe_tp_decode_nvfp4_ss13",
@@ -75,6 +85,41 @@ def _admit(runner: Any, n_ranks: int) -> fp8_decode._Admitted | str:
             return "missing w13_weight_scale / w2_weight_scale"
         return (w13_scale, w2_scale)
 
+    def _build_statics(
+        base: dict[str, Any],
+        rnr: Any,
+        hidden: int,
+        topk: int,
+        scales: tuple[torch.Tensor, torch.Tensor],
+        shared: tuple[torch.Tensor, ...],
+    ) -> _OpStatics:
+        layer = rnr.routed_experts
+        w13_scale, w2_scale = scales
+        sw13_t, ss13_t, sw2_t, ss2_t = shared
+        prefill_above: int | None = None
+        if envs.FUSED_MOE_PREFILL_NVFP4_KERNEL and (
+            prefill_nvfp4.can_use_fused_moe_prefill_nvfp4(
+                jax.ShapeDtypeStruct((_PREFILL_PROBE_ROWS, hidden), jnp.bfloat16),
+                fp8_decode._sds(layer.w13_weight),
+                fp8_decode._sds(layer.w2_weight),
+                fp8_decode._sds(w13_scale),
+                fp8_decode._sds(w2_scale),
+                fp8_decode._sds(sw13_t),
+                fp8_decode._sds(ss13_t),
+                fp8_decode._sds(sw2_t),
+                fp8_decode._sds(ss2_t),
+                jax.ShapeDtypeStruct((_PREFILL_PROBE_ROWS, topk), jnp.bfloat16),
+                jax.ShapeDtypeStruct((_PREFILL_PROBE_ROWS, topk), jnp.int32),
+            )
+        ):
+            min_tokens = envs.FUSED_MOE_PREFILL_NVFP4_MIN_TOKENS
+            prefill_above = max(kernel.ROW_BUCKETS[-1], min_tokens - 1)
+        return _OpStatics(
+            **base,
+            prefill_above=prefill_above,
+            split_meta=bool(envs.TPU_MOE_TP_DECODE_SPLIT_META),
+        )
+
     return fp8_decode._admit_common(
         runner,
         n_ranks,
@@ -88,20 +133,94 @@ def _admit(runner: Any, n_ranks: int) -> fp8_decode._Admitted | str:
             f"{layer.w13_weight.dtype}, s13 {list(scales[0].shape)}, "
             f"s2 {list(scales[1].shape)}, shared w13 {list(shared[0].shape)})"
         ),
-        build_statics=lambda base, _rnr, _hid, _topk, _scales, _shared: _OpStatics(
-            **base,
-            split_meta=bool(envs.TPU_MOE_TP_DECODE_SPLIT_META),
-        ),
+        build_statics=_build_statics,
     )
 
 
-def _op_body(
-    statics: _OpStatics,
-    n_ranks: int,
+def _prefill_chain(
+    x,
+    scores,
+    bias,
+    is_pad,
+    w13,
+    w2,
+    s13,
+    s2,
+    sw13,
+    ss13,
+    sw2,
+    ss2,
+    st: _OpStatics,
     axis: str,
-    above_fn: Any = None,
+    e0,
 ):
+    """Reduced layer output via ``fused_moe_prefill_nvfp4_stage_a`` (W4A16)."""
+    logger.info(
+        "moe_tp_decode_nvfp4: fused MoE prefill kernel traced for %d tokens",
+        x.shape[0],
+    )
+    w, ids = fp8_decode._route(x, scores, bias, is_pad, st)
+    return prefill_nvfp4.fused_moe_prefill_nvfp4_stage_a(
+        x,
+        w13,
+        w2,
+        s13,
+        s2,
+        sw13,
+        ss13,
+        sw2,
+        ss2,
+        None,
+        w,
+        ids.astype(jnp.int32),
+        axis_name=axis,
+        expert_start=e0.astype(jnp.int32) if st.use_ep else None,
+        routed_scale=st.routed_scale,
+        w2_n_chunk=st.w2_n_chunk,
+    )
+
+
+def _op_body(statics: _OpStatics, n_ranks: int, axis: str):
     """Per-rank body under ``shard_map`` over ``axis``."""
+
+    def _above(
+        x,
+        scores,
+        bias,
+        is_pad,
+        w13,
+        w2,
+        s13,
+        s2,
+        sw13,
+        ss13,
+        sw2,
+        ss2,
+        *,
+        statics,
+        axis,
+        e0,
+        prequant,
+    ):
+        del prequant
+        return _prefill_chain(
+            x,
+            scores,
+            bias,
+            is_pad,
+            w13,
+            w2,
+            s13,
+            s2,
+            sw13,
+            ss13,
+            sw2,
+            ss2,
+            statics,
+            axis,
+            e0.reshape(()),
+        )
+
     return fp8_decode._make_op_body(
         statics,
         n_ranks,
@@ -133,7 +252,7 @@ def _op_body(
                 w2_n_chunk=statics.w2_n_chunk,
             )
         ),
-        above_fn=above_fn,
+        above_fn=_above,
     )
 
 
