@@ -13,6 +13,8 @@
 # limitations under the License.
 """Wrapper for RPA kernel to match expected interface."""
 
+import dataclasses
+import math
 from typing import cast
 
 import jax
@@ -167,6 +169,47 @@ def prepare_inputs(
     return o_hbm_alias_q_hbm, new_kv_hbm
 
 
+def validate_fp8_compute(
+    kv_dtype: jnp.dtype,
+    num_q_heads: int,
+    num_kv_heads: int,
+    q_scale: float | None,
+    return_lse: bool,
+    use_per_token_scale: bool = False,
+) -> None:
+    """Raises unless `fp8_compute` is supported for the given arguments."""
+    kv_dtype = jnp.dtype(kv_dtype)
+    if not (
+        jnp.issubdtype(kv_dtype, jnp.floating) and utils.get_dtype_bits(kv_dtype) == 8
+    ):
+        raise ValueError(f"fp8_compute needs an fp8 KV cache, got {kv_dtype}.")
+    packing = utils.get_dtype_packing(kv_dtype)
+    if (num_q_heads // num_kv_heads) % packing:
+        raise ValueError(
+            "fp8_compute needs the query heads per KV head "
+            f"({num_q_heads // num_kv_heads}) to be a multiple of {packing}."
+        )
+    if q_scale is not None:
+        raise ValueError("fp8_compute quantizes queries at scale 1.0; got q_scale.")
+    if return_lse:
+        raise ValueError("fp8_compute does not support return_lse.")
+    if use_per_token_scale:
+        raise ValueError("fp8_compute does not support per-token KV scales.")
+
+
+def quantize_queries(q_hbm: jax.Array, dtype: jnp.dtype) -> jax.Array:
+    """Saturating cast of prepared queries to `dtype` at unit scale.
+
+    Maps `[kv_heads, tokens, G // p, p, d]` to `[kv_heads, tokens, G // p', p', d]`.
+    """
+    kv_heads, tokens, q_per_kv_packed, q_packing, head_dim = q_hbm.shape
+    packing = utils.get_dtype_packing(dtype)
+    info = jnp.finfo(dtype)
+    q = q_hbm.reshape(kv_heads, tokens, q_per_kv_packed * q_packing, head_dim)
+    q = jnp.clip(q, float(info.min), float(info.max)).astype(dtype)
+    return q.reshape(kv_heads, tokens, -1, packing, head_dim)
+
+
 def prepare_outputs(out: jax.Array) -> jax.Array:
     kv_heads, max_tokens, q_per_kv_packed, q_packing, d = out.shape
     return out.reshape(kv_heads, max_tokens, q_per_kv_packed * q_packing, d)
@@ -224,6 +267,19 @@ def _is_sfs(tpu_info) -> bool:
 
 
 _MAX_BKV_SZ = 4096
+_FALLBACK_VMEM_BYTES = 1 << 24
+_FALLBACK_MXU_COLUMN_SIZE = 128
+
+
+def _get_tpu_vmem_and_mxu() -> tuple[int, int]:
+    """Queries hardware VMEM capacity and MXU column size with a CPU fallback."""
+    try:
+        info = pltpu.get_tpu_info()
+    except Exception:
+        info = None
+    if info is None:
+        return _FALLBACK_VMEM_BYTES, _FALLBACK_MXU_COLUMN_SIZE
+    return int(info.vmem_capacity_bytes), int(info.mxu_column_size)
 
 
 def calculate_block_sizes(
@@ -500,6 +556,77 @@ def calculate_block_sizes(
     return decode_block_sizes, prefill_block_sizes
 
 
+FP8_PREFILL_KV_BLOCK = 512
+FP8_PREFILL_CHUNK_ROWS = 256
+FP8_PREFILL_STEP_ROWS = 8192
+FP8_PREFILL_BUFFER_VMEM_FRACTION = 0.8
+
+
+def fp8_prefill_vmem_bytes(cfgs: configs.RpaConfigs) -> int:
+    """VMEM bytes required by the FP8 MIXED kernel's pipeline buffers and scratches."""
+
+    def nbytes(shape: tuple[int, ...], dtype: jnp.dtype) -> int:
+        return math.prod(shape) * utils.get_dtype_bits(dtype) // 8
+
+    serve = cfgs.serve
+    return (
+        configs.NUM_INPUT_SLOTS * nbytes(cfgs.q_vmem_shape, serve.dtype_q)
+        + configs.NUM_INPUT_SLOTS * nbytes(cfgs.kv_vmem_shape, serve.dtype_kv)
+        + configs.NUM_OUTPUT_SLOTS * nbytes(cfgs.o_vmem_shape, serve.dtype_out)
+        + 2 * nbytes(cfgs.lm_scratch_shape, serve.dtype_out)
+        + nbytes(cfgs.acc_scratch_shape, serve.dtype_out)
+    )
+
+
+def fp8_prefill_block_sizes(
+    model_cfgs: configs.ModelConfigs,
+    serve_cfgs: configs.ServingConfigs,
+    vmem_limit_bytes: int | None = None,
+) -> configs.BlockSizes:
+    """Selects MIXED-kernel block sizes for `fp8_compute` within VMEM budget."""
+    hw_vmem, mxu_col = _get_tpu_vmem_and_mxu()
+    effective_vmem = hw_vmem if vmem_limit_bytes is None else vmem_limit_bytes
+
+    rows_per_token = utils.align_to(
+        model_cfgs.num_q_heads_per_kv_head, serve_cfgs.packing_q
+    )
+    bq_c = max(1, FP8_PREFILL_CHUNK_ROWS // rows_per_token)
+    bkv = FP8_PREFILL_KV_BLOCK
+    if serve_cfgs.kv_layout == configs.KVLayout.SEQ_ALONG_LANE:
+        bkv = utils.align_to(bkv, serve_cfgs.page_size)
+    bq = FP8_PREFILL_STEP_ROWS // (rows_per_token * model_cfgs.num_kv_heads)
+    bq = utils.align_to(max(bq, bq_c), bq_c)
+
+    if model_cfgs.sliding_window is not None:
+        sliding_cap = model_cfgs.sliding_window // 2
+        stride = mxu_col
+        if serve_cfgs.kv_layout == configs.KVLayout.SEQ_ALONG_LANE:
+            stride = utils.align_to(stride, serve_cfgs.page_size)
+        bkv = max(min(bkv, sliding_cap) // stride, 1) * stride
+        bq = max(min(bq, sliding_cap) // bq_c, 1) * bq_c
+
+    while True:
+        blocks = configs.BlockSizes(bq_sz=bq, bq_c_sz=bq_c, bkv_sz=bkv, batch_size=1)
+        cfgs = configs.RpaConfigs(
+            block=blocks,
+            model=model_cfgs,
+            serve=serve_cfgs,
+            mode=configs.RpaCase.MIXED,
+            vmem_limit_bytes=effective_vmem,
+        )
+        if (
+            fp8_prefill_vmem_bytes(cfgs)
+            <= FP8_PREFILL_BUFFER_VMEM_FRACTION * effective_vmem
+        ):
+            return blocks
+        if bq == bq_c:
+            raise ValueError(
+                f"fp8_compute: no query block fits {effective_vmem} bytes of VMEM "
+                f"for {model_cfgs}."
+            )
+        bq = utils.align_to(max(bq // 2, bq_c), bq_c)
+
+
 @jax.jit(
     static_argnames=(
         "sm_scale",
@@ -529,6 +656,7 @@ def calculate_block_sizes(
         "skip_empty_launch",
         "fence_output",
         "unmasked_interior",
+        "fp8_compute",
     ),
     # Donation of transient inputs can fail for some runtime buffer layouts in
     # the experimental tuning path. Keep donation only for kv_cache, which is
@@ -575,6 +703,7 @@ def ragged_paged_attention(
     skip_empty_launch: bool = True,
     fence_output: bool = True,
     unmasked_interior: bool = True,
+    fp8_compute: bool = False,
 ) -> tuple[jax.Array, jax.Array] | tuple[jax.Array, jax.Array, jax.Array]:
     """Perform batched ragged paged attention.
 
@@ -664,7 +793,7 @@ def ragged_paged_attention(
     if mask_value is None:
         mask_value = cast(float, jnp.finfo(out_dtype).min)
     if vmem_limit_bytes is None:
-        vmem_limit_bytes = cast(int, pltpu.get_tpu_info().vmem_capacity_bytes)
+        vmem_limit_bytes, _ = _get_tpu_vmem_and_mxu()
     max_num_seqs = kv_lens.shape[0]
     if kv_layout == configs.KVLayout.SEQ_ALONG_LANE:
         page_size = kv_cache.shape[4]
@@ -745,6 +874,27 @@ def ragged_paged_attention(
         vmem_limit_bytes,
         decode_query_size=decode_query_size,
     )
+
+    mixed_serve_cfgs = serve_cfgs
+    q_fetch_hbm: jax.Array | None = None
+    if fp8_compute:
+        validate_fp8_compute(
+            kv_cache.dtype,
+            num_q_heads,
+            num_kv_heads,
+            q_scale,
+            return_lse,
+            use_per_token_scale,
+        )
+        mixed_serve_cfgs = dataclasses.replace(
+            serve_cfgs, dtype_q=kv_cache.dtype, fp8_compute=True
+        )
+        q_fetch_hbm = quantize_queries(q_hbm, kv_cache.dtype)
+        default_prefill = fp8_prefill_block_sizes(
+            model_cfgs,
+            mixed_serve_cfgs,
+            vmem_limit_bytes,
+        )
     # Pre-allocate LSE buffer.
     lse_hbm_init: jax.Array | None = None
     if return_lse:
@@ -802,13 +952,15 @@ def ragged_paged_attention(
     ):
         if mode == configs.RpaCase.DECODE:
             effective_blocks = decode_block_sizes or default_decode
+            mode_serve_cfgs = serve_cfgs
         else:
             effective_blocks = prefill_block_sizes or default_prefill
+            mode_serve_cfgs = mixed_serve_cfgs
 
         cfgs = configs.RpaConfigs(
             block=effective_blocks,
             model=model_cfgs,
-            serve=serve_cfgs,
+            serve=mode_serve_cfgs,
             vmem_limit_bytes=vmem_limit_bytes,
             mode=mode,
         )
@@ -856,6 +1008,7 @@ def ragged_paged_attention(
                 lse_in,
                 cfgs=cfgs,
                 computer_cls=computer_cls,
+                q_fetch_hbm=q_fetch_hbm if mode == configs.RpaCase.MIXED else None,
             )
             o_out, kv_out, lse_out = result
             return o_out, kv_out, lse_out if return_lse else None
