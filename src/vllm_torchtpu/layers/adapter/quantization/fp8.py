@@ -641,15 +641,23 @@ def _quantize_bf16_moe_weights(
     layer: TpuRoutedExperts,
     *,
     activation: str,
+    force_per_channel: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, str, int | None]:
     """Quantize BF16 MoE weights to FP8 for the TPU GMM kernel.
 
     Same output format as _process_fp8_moe_weights but starts from BF16
-    weights instead of dequantizing from FP8 first.
+    weights instead of dequantizing from FP8 first. When ``force_per_channel``
+    is True, uses per-channel ``float8_e4m3fn`` regardless of
+    ``MOE_REQUANTIZE_*`` overrides.
     """
-    desired_quant_dtype, requant_dtype, requant_block_size = _get_moe_quant_config(
-        "[MoE online FP8]: quantizing BF16 MoE weights"
-    )
+    if force_per_channel:
+        desired_quant_dtype = "float8_e4m3fn"
+        requant_dtype = torch.float8_e4m3fn
+        requant_block_size = None
+    else:
+        desired_quant_dtype, requant_dtype, requant_block_size = _get_moe_quant_config(
+            "[MoE online FP8]: quantizing BF16 MoE weights"
+        )
 
     def to_fp32(w: torch.Tensor, _scale: torch.Tensor | None) -> torch.Tensor:
         return w.to(torch.float32)
@@ -755,11 +763,15 @@ class VllmFp8Config(Fp8Config, VllmQuantConfig):
                 ignored_layers=self.ignored_layers,
                 fused_mapping=self.packed_modules_mapping,
             ):
+                moe_config = self.get_moe_config(layer)
+                if envs.MOE_ONLINE_FP8_EXCLUDED_EXPERTS:
+                    return build_excluded_moe_online_fp8_method(
+                        moe_config, prefix=prefix
+                    )
                 from vllm_torchtpu.layers.adapter.quantization.unquantized import (
                     VllmUnquantizedFusedMoEMethod,
                 )
 
-                moe_config = self.get_moe_config(layer)
                 return VllmUnquantizedFusedMoEMethod(moe_config)
             moe_config = self.get_moe_config(layer)
             return VllmFp8MoEMethodTPU(self, moe_config)
@@ -783,6 +795,25 @@ class VllmFp8Config(Fp8Config, VllmQuantConfig):
         return None
 
 
+def build_excluded_moe_online_fp8_method(
+    moe_config,
+    *,
+    prefix: str,
+) -> VllmFp8MoEMethodTPU:
+    """Build a per-channel online-FP8 MoE method for checkpoint-excluded experts."""
+    online_config = VllmFp8Config(
+        is_checkpoint_fp8_serialized=False,
+        activation_scheme="dynamic",
+        weight_block_size=None,
+    )
+    return VllmFp8MoEMethodTPU(
+        online_config,
+        moe_config,
+        force_per_channel=True,
+        online_fp8_excluded_prefix=prefix,
+    )
+
+
 class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
     """
     TPU-native FP8 MoE method.
@@ -797,10 +828,21 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
 
     _use_adaptive_fused_moe: bool = False
     _adaptive_fused_moe_op: torch.library.CustomOpDef | None = None
+    _force_per_channel: bool = False
+    _online_fp8_excluded_prefix: str | None = None
 
-    def __init__(self, quant_config: Fp8Config, moe_config):
+    def __init__(
+        self,
+        quant_config: Fp8Config,
+        moe_config,
+        *,
+        force_per_channel: bool = False,
+        online_fp8_excluded_prefix: str | None = None,
+    ):
         FusedMoEMethodBase.__init__(self, moe_config)
         self.quant_config = quant_config
+        self._force_per_channel = force_per_channel
+        self._online_fp8_excluded_prefix = online_fp8_excluded_prefix
         self.weight_block_size = quant_config.weight_block_size
         self.block_quant = self.weight_block_size is not None
         self.weight_scale_name = (
@@ -1039,6 +1081,7 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
                 _quantize_bf16_moe_weights(
                     layer,
                     activation=activation_str,
+                    force_per_channel=self._force_per_channel,
                 )
             )
 
@@ -1070,17 +1113,27 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
                 ]
             )
 
-        scale_desc = (
-            "per-channel" if requant_block_size is None else str(requant_block_size)
-        )
-        logger.info_once(
-            "FP8 weights transposed for GMM kernel: "
-            f"w13={list(layer.w13_weight.shape)}, "
-            f"w2={list(layer.w2_weight.shape)}, "
-            f"w13_scale={list(layer.w13_weight_scale_inv.shape)}, "
-            f"w2_scale={list(layer.w2_weight_scale_inv.shape)}, "
-            f"requant_block_size={scale_desc}"
-        )
+        if self._online_fp8_excluded_prefix is not None:
+            logger.info(
+                "MOE_ONLINE_FP8_EXCLUDED_EXPERTS: quantized excluded MoE layer %s "
+                "to %s (w13_scale=%s, w2_scale=%s)",
+                self._online_fp8_excluded_prefix,
+                layer.w13_weight.dtype,
+                tuple(layer.w13_weight_scale_inv.shape),
+                tuple(layer.w2_weight_scale_inv.shape),
+            )
+        else:
+            scale_desc = (
+                "per-channel" if requant_block_size is None else str(requant_block_size)
+            )
+            logger.info_once(
+                "FP8 weights transposed for GMM kernel: "
+                f"w13={list(layer.w13_weight.shape)}, "
+                f"w2={list(layer.w2_weight.shape)}, "
+                f"w13_scale={list(layer.w13_weight_scale_inv.shape)}, "
+                f"w2_scale={list(layer.w2_weight_scale_inv.shape)}, "
+                f"requant_block_size={scale_desc}"
+            )
         if layer.moe_config.moe_parallel_config.use_ep:
             moe_routing.validate_linear_ep_placement(layer)
         moe_routing.register_experts_start_buffer(layer, device=layer.w13_weight.device)

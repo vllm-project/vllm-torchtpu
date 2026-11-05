@@ -84,6 +84,7 @@ if TYPE_CHECKING:
     REQUANTIZE_WEIGHT_DTYPE: str = "float8_e4m3fn"
     MOE_REQUANTIZE_WEIGHT_DTYPE: str = "float8_e4m3fn"
     MOE_REQUANTIZE_BLOCK_SIZE: int | None = None
+    MOE_ONLINE_FP8_EXCLUDED_EXPERTS: bool = False
     TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL: bool | None = None
     TPU_USE_RAIDEN_KV_CACHE_MANAGER: bool = False
     TPU_RAIDEN_QWEN35_ADMISSION: bool = False
@@ -1019,6 +1020,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "MOE_REQUANTIZE_BLOCK_SIZE": lambda: int(block_size)
     if (block_size := os.getenv("MOE_REQUANTIZE_BLOCK_SIZE")) is not None
     else None,
+    # Quantize checkpoint-excluded RoutedExperts weights from BF16 to
+    # per-channel float8_e4m3fn at load time, ignoring MOE_REQUANTIZE_BLOCK_SIZE
+    # so the per-channel FP8 TP decode kernel can arm on excluded layers (such
+    # as an MTP drafter layer). Already-quantized layers are untouched.
+    "MOE_ONLINE_FP8_EXCLUDED_EXPERTS": env_bool(
+        "MOE_ONLINE_FP8_EXCLUDED_EXPERTS", default=False
+    ),
     # TPU unified block-pool cache layout. Tri-state: an explicit 0/1 always
     # wins; unset defers to
     # platforms.tpu_block_size_utils.unified_kv_layout_enabled, which selects
