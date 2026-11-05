@@ -154,6 +154,7 @@ class TestDeepseekV41Quant:
         def mock_super_init(self, cfg, *args, **kwargs):
             # Inside the with device_hooks context!
             v4_upstream.FusedMoEFactory(routed_scaling=2.0)
+            self.gate = SimpleNamespace(bias_vl=None)
 
         monkeypatch.setattr(dsv41_quant.DeepseekV4MoE, "__init__", mock_super_init)
 

@@ -1487,9 +1487,8 @@ class DeepseekV41ForCausalLM(upstream.DeepseekV41LLMForCausalLM):
 class DeepseekV41VLForCausalLM(upstream_vl.DeepseekV41ForCausalLM):
     """Upstream V4.1 vision tower and preprocessing around the TPU text model."""
 
-    # TODO: route image tokens with gate.bias_vl. Upstream selects their
-    # experts with bias_vl instead of e_score_correction_bias or the hash
-    # table; the TPU fused EP MoE loads bias_vl but routes them like text.
+    # TODO: route image tokens with gate.bias_vl under fused EP; the kernel
+    # still selects their experts like text.
     def __init__(self, *, vllm_config, prefix=""):
         # TPU's FP8 linear adapter registers weight_scale_inv, as in the text model.
         with device_hooks(
