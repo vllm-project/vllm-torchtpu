@@ -783,7 +783,7 @@ class _FakeQProj:
         self._out = out
 
     def __call__(self, _hidden):
-        return self._out, None
+        return (self._out(_hidden) if callable(self._out) else self._out), None
 
 
 class _FakeHeadGatherGroup:
@@ -1014,6 +1014,467 @@ def test_mla_forward_qrep_skips_the_gather_and_absorbs_group_heads(monkeypatch):
     ).transpose(0, 1)
     torch.testing.assert_close(ql_nope, expected_ql)
     torch.testing.assert_close(q_pe, q_pe_rep)
+
+
+def _setup_qrep_dcp_layer(partial_dtype=torch.bfloat16):
+    impl, layer, inputs, _ = _make_impl_and_layer()
+    impl.dcp_size = 2
+    torch.manual_seed(2)
+    layer.W_UK_T_dcp_qrep = torch.randn(32, 128, 512) * 0.05
+    layer.W_UK_T_dcp_qrep_scale = layer.W_UV_dcp_qrep_scale = layer.W_UV = None
+    layer.W_UV_dcp_qrep = (torch.randn(32, 512, 128) * 0.05).to(partial_dtype)
+    inputs["kv_cache"] = tuple(
+        torch.zeros(spec.shape, dtype=spec.torch_dtype)
+        for spec in PallasMLAttentionBackend.get_sparse_kv_cache_specs(
+            2, 8, 576, torch.float8_e4m3fn
+        )
+    )
+    return impl, layer, inputs
+
+
+@pytest.mark.parametrize(
+    "model_tag,rs_bf16,partial_dtype,want_dtype",
+    [
+        ("backbone", True, torch.bfloat16, torch.bfloat16),
+        ("backbone", False, torch.bfloat16, torch.float32),
+        ("eagle_head", True, torch.bfloat16, torch.float32),
+    ],
+)
+def test_mla_forward_qrep_applies_w_uv_before_the_merge(
+    model_tag, rs_bf16, partial_dtype, want_dtype, monkeypatch
+):
+    impl, layer, inputs = _setup_qrep_dcp_layer(partial_dtype)
+    partial = torch.randn(4, 32, 512).to(partial_dtype)
+    layer.sparse_mla_dcp_op = MagicMock(return_value=(partial, torch.zeros(4, 32)))
+    monkeypatch.setattr(attention_adapter.envs, "TPU_DCP_RS_OUT_PRECISION", rs_bf16)
+    monkeypatch.setattr(
+        attention_adapter.vllm_compilation_backends, "model_tag", model_tag
+    )
+    seen = []
+    monkeypatch.setattr(
+        attention_adapter,
+        "merge_lse_partials_scatter_heads",
+        lambda out, _lse, **kw: seen.append((out, kw)) or out[:, :16, :],
+    )
+
+    got = impl.forward(
+        layer=layer,
+        **inputs,
+        topk_indices=torch.zeros((4, 8), dtype=torch.int32),
+        q_dcp_replicated=(torch.randn(4, 32, 128), torch.randn(4, 32, 64)),
+    )
+    ((seen_out, kw),) = seen
+    assert seen_out.dtype == want_dtype and kw["is_backbone"] == (
+        model_tag == "backbone"
+    )
+    projected = torch.bmm(
+        partial.to(want_dtype).transpose(0, 1), layer.W_UV_dcp_qrep.to(want_dtype)
+    ).transpose(0, 1)
+    torch.testing.assert_close(seen_out, projected)
+    torch.testing.assert_close(got, projected[:, :16].to(got.dtype).reshape(4, -1))
+
+
+def test_mla_forward_oproj_all_reduce_returns_quantized_chunks(monkeypatch):
+    impl, layer, inputs = _setup_qrep_dcp_layer()
+    layer.W_O_dcp_qrep = torch.zeros((32 * 128, 64), dtype=torch.float8_e4m3fn)
+    layer.W_O_dcp_qrep_scale = torch.ones((64,), dtype=torch.float32)
+    monkeypatch.setattr(attention_adapter.envs, "TPU_DCP_LSE_MERGE_A2A", False)
+    monkeypatch.setattr(attention_adapter, "_MLA_DUPLICATE_O_PROJ_MIN_TOKENS", 256)
+    monkeypatch.setattr(attention_adapter, "_MLA_DUPLICATE_O_PROJ_CHUNK_TOKENS", 128)
+    weight_calls, merge_calls = [], []
+    monkeypatch.setattr(
+        attention_adapter,
+        "weight_lse_partials",
+        lambda out, _lse, dt, chunk: weight_calls.append((out.shape[0], dt, chunk))
+        or [(torch.zeros((out.shape[0], 32 * 128)), torch.ones((out.shape[0], 1)))],
+    )
+    monkeypatch.setattr(
+        attention_adapter,
+        "merge_lse_partials_scatter_heads",
+        lambda out, _lse, **kw: merge_calls.append(out.shape[0]) or out[:, :16, :],
+    )
+
+    for tag, n_tok, want_list in (
+        ("backbone", 256, True),
+        ("backbone", 512, True),
+        ("backbone", 16, False),
+        ("backbone", 128, False),
+        ("eagle_head", 256, False),
+    ):
+        monkeypatch.setattr(
+            attention_adapter.vllm_compilation_backends, "model_tag", tag
+        )
+        layer.sparse_mla_dcp_op = MagicMock(
+            return_value=(
+                torch.randn(n_tok, 32, 512, dtype=torch.bfloat16),
+                torch.zeros(n_tok, 32),
+            )
+        )
+        got = impl.forward(
+            layer=layer,
+            **inputs,
+            topk_indices=torch.zeros((n_tok, 8), dtype=torch.int32),
+            q_dcp_replicated=(torch.randn(n_tok, 32, 128), torch.randn(n_tok, 32, 64)),
+        )
+        assert isinstance(got, list if want_list else torch.Tensor)
+    assert weight_calls == [
+        (256, torch.float8_e4m3fn, 128),
+        (512, torch.float8_e4m3fn, 128),
+    ]
+    assert merge_calls == [16, 128, 256]
+
+
+def test_mla_uv_and_oproj_gates_preserve_bucket_graph_signature(monkeypatch):
+    from vllm_torchtpu.compilation import shape_variants
+    from vllm_torchtpu.layers.adapter.custom_ops import mla_attention_op
+
+    for val, edge in ((0, 0), (1, 0), (64, 32), (256, 128), (100, 99)):
+        assert attention_adapter._bucket_gate_edge(val) == edge
+
+    dcp_size, local_heads, hidden_size, kv_lora, qk_nope, qk_rope, v_dim = (
+        2,
+        2,
+        8,
+        4,
+        3,
+        2,
+        2,
+    )
+    group_heads = local_heads * dcp_size
+    wrapper = _run_qrep_wrapper(rank_in_group=0, is_sparse=True, run_forward=False)
+    wrapper.dcp_group_size = dcp_size
+    wrapper.topk_indices_buffer = torch.zeros((512, 8), dtype=torch.int32)
+    wrapper.kv_a_proj_with_mqa = torch.nn.Linear(
+        hidden_size, kv_lora + qk_rope, bias=False, dtype=torch.bfloat16
+    )
+
+    class _LinearQProj(torch.nn.Module):
+        qrep_active = True
+        _local_view = DCPGroupColumnParallelLinear._local_view
+        group_size, rank_in_group = dcp_size, 0
+
+        def __init__(self):
+            super().__init__()
+            self.proj = torch.nn.Linear(
+                hidden_size,
+                group_heads * (qk_nope + qk_rope),
+                bias=False,
+                dtype=torch.bfloat16,
+            )
+
+        def forward(self, x):
+            return self.proj(x), None
+
+    class _FakeFP8OProj(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(
+                torch.zeros((local_heads * v_dim, hidden_size), dtype=torch.bfloat16),
+                requires_grad=False,
+            )
+            self.weight_scale = torch.nn.Parameter(
+                torch.ones((hidden_size,), dtype=torch.float32), requires_grad=False
+            )
+            self.bias = None
+
+        def forward(self, x):
+            return (x @ self.weight) * self.weight_scale.to(x.dtype), None
+
+    wrapper.q_proj, wrapper.kv_a_layernorm, wrapper.o_proj = (
+        _LinearQProj(),
+        torch.nn.Identity(),
+        _FakeFP8OProj(),
+    )
+
+    impl = attention_adapter.PallasMLAttentionBackendImpl.__new__(
+        attention_adapter.PallasMLAttentionBackendImpl
+    )
+    impl.dcp_size, impl._get_kv_scales = dcp_size, lambda _layer: (None, None, None)
+
+    mla_attn = torch.nn.Module()
+    (
+        mla_attn.num_heads,
+        mla_attn.kv_lora_rank,
+        mla_attn.qk_rope_head_dim,
+        mla_attn.v_head_dim,
+    ) = (local_heads, kv_lora, qk_rope, v_dim)
+    mla_attn.kv_cache_quantized_dtype = None
+    for name, shape, dt in (
+        ("W_UK_T_dcp_qrep", (group_heads, qk_nope, kv_lora), torch.bfloat16),
+        ("W_UK_T_dcp_qrep_scale", (group_heads, 1, kv_lora), torch.bfloat16),
+        ("W_UV", (local_heads, kv_lora, v_dim), torch.bfloat16),
+        ("W_UV_scale", (local_heads, 1, v_dim), torch.bfloat16),
+        ("W_UV_dcp_qrep", (group_heads, kv_lora, v_dim), torch.bfloat16),
+        ("W_UV_dcp_qrep_scale", (group_heads, 1, v_dim), torch.bfloat16),
+        ("W_O_dcp_qrep", (group_heads * v_dim, hidden_size), torch.float8_e4m3fn),
+        ("W_O_dcp_qrep_scale", (hidden_size,), torch.float32),
+    ):
+        setattr(
+            mla_attn,
+            name,
+            torch.nn.Parameter(torch.ones(shape, dtype=dt), requires_grad=False),
+        )
+    kv_cache = (torch.zeros((2, 8, kv_lora)), torch.zeros((2, 8, qk_rope)))
+    attn_meta = SimpleNamespace(
+        seq_lens=torch.ones((1,), dtype=torch.int32),
+        block_tables=torch.zeros((1, 2), dtype=torch.int32),
+        query_start_loc=torch.tensor([0, 1], dtype=torch.int32),
+        request_distribution=torch.tensor([0, 0, 1], dtype=torch.int32),
+    )
+    mla_attn.sparse_mla_dcp_op = lambda _c, q_n, *_a: (
+        q_n,
+        torch.zeros((q_n.shape[0], group_heads), dtype=torch.float32),
+    )
+    mla_attn.forward = lambda q, kv_c, k_pe, **kw: impl.forward(
+        mla_attn, q, kv_c, k_pe, kv_cache, attn_meta, **kw
+    )
+    wrapper.mla_attn = mla_attn
+
+    monkeypatch.setattr(attention_adapter.envs, "TPU_DCP_LSE_MERGE_A2A", False)
+    monkeypatch.setattr(attention_adapter, "_MLA_DUPLICATE_O_PROJ_MIN_TOKENS", 256)
+    monkeypatch.setattr(attention_adapter, "_MLA_DUPLICATE_O_PROJ_CHUNK_TOKENS", 128)
+    monkeypatch.setattr(
+        attention_adapter.vllm_compilation_backends, "model_tag", "backbone"
+    )
+    monkeypatch.setattr(
+        attention_adapter,
+        "merge_lse_partials_scatter_heads",
+        lambda out, _l, **_k: out[:, :local_heads, :],
+    )
+    monkeypatch.setattr(
+        attention_adapter,
+        "weight_lse_partials",
+        lambda out, _l, dt, chunk: [
+            (
+                c.reshape(c.shape[0], -1).to(dt),
+                torch.ones((c.shape[0], 1), dtype=torch.float32),
+            )
+            for c in out.split(chunk, dim=0)
+        ],
+    )
+    monkeypatch.setattr(
+        mla_attention_op,
+        "prequantized_matmul",
+        lambda x, x_s, w, w_s: (x.float() * x_s @ w.float() * w_s).to(torch.bfloat16),
+    )
+    monkeypatch.setattr(mla_attention_op, "_after", lambda y, _dep: y)
+    monkeypatch.setattr(
+        mla_attention_op, "tensor_model_parallel_all_reduce", lambda y: y
+    )
+
+    signatures = []
+    with shape_variants.warmup() as executables:
+        for idx, n_tok in enumerate((16, 64, 256)):
+            torch._dynamo.reset()
+            captured = []
+            compiled = torch.compile(
+                wrapper.forward,
+                backend=lambda gm, _ex, _c=captured: _c.append(gm) or gm.forward,
+                fullgraph=True,
+                dynamic=True,
+            )
+            pos, hid = (
+                torch.arange(n_tok),
+                torch.ones((n_tok, hidden_size), dtype=torch.bfloat16),
+            )
+            torch._dynamo.mark_dynamic(pos, 0)
+            torch._dynamo.mark_dynamic(hid, 0)
+            assert compiled(positions=pos, hidden_states=hid).shape == (
+                n_tok,
+                hidden_size,
+            )
+            gm = captured[0]
+            signatures.append(shape_variants._signature(gm))
+            if idx == 0:
+                executables.put("cache", "sub0", gm, gm.forward)
+            else:
+                assert executables.get("cache", "sub0", gm) is not None
+    assert signatures[0] == signatures[1] == signatures[2]
+
+
+def test_mla_oproj_all_reduce_guards_and_weight_reload(monkeypatch, caplog):
+    import logging
+
+    from vllm_torchtpu.compilation import tpu_compiler
+    from vllm_torchtpu.layers.adapter.custom_ops import mla_attention_op
+    from vllm_torchtpu.layers.adapter.linear_common import (
+        DCP_ROWS_ATTR,
+        WEIGHT_FLIPPED_ATTR,
+    )
+    from vllm_torchtpu.layers.adapter.quantization import fp8 as fp8_mod
+
+    assert "TPU_DCP_DUPLICATE_O_PROJ" in TpuPlatform.additional_env_vars
+    assert (
+        attention_adapter._MLA_DUPLICATE_O_PROJ_MIN_TOKENS,
+        attention_adapter._MLA_DUPLICATE_O_PROJ_CHUNK_TOKENS,
+    ) == (256, 512)
+    monkeypatch.setenv("TPU_DCP_DUPLICATE_O_PROJ", "1")
+    assert tpu_compiler._tpu_compile_env_factors()["TPU_DCP_DUPLICATE_O_PROJ"] is True
+    monkeypatch.setattr(envs, "TPU_DCP_DUPLICATE_O_PROJ", True)
+
+    for with_bias in (False, True):
+        modules = _gate_modules("none", 2)
+        modules.is_sparse = True
+        modules.q_b_proj.qrep_active, modules.q_b_proj.group_size = True, 2
+        modules.o_proj.bias = torch.nn.Parameter(torch.ones(2)) if with_bias else None
+        fake_attn = torch.nn.Module()
+        fake_attn.dcp_q_replicate = True
+        with patch(
+            "vllm_torchtpu.layers.adapter.custom_ops.mla_attention_op.VllmTPUMLAAttention",
+            return_value=fake_attn,
+        ):
+            w = VllmMultiHeadLatentAttentionWrapper(
+                hidden_size=4,
+                num_heads=1,
+                scale=1.0,
+                qk_nope_head_dim=2,
+                qk_rope_head_dim=1,
+                v_head_dim=2,
+                q_lora_rank=2,
+                kv_lora_rank=2,
+                mla_modules=modules,
+            )
+        assert getattr(modules.o_proj, DCP_ROWS_ATTR, False) is (not with_bias)
+        assert (getattr(w.mla_attn, "o_proj", None) is modules.o_proj) is (
+            not with_bias
+        )
+
+    fake_group = SimpleNamespace(
+        world_size=2, all_gather=lambda t, dim=0: torch.cat([t, t * 2.0], dim=dim)
+    )
+    monkeypatch.setattr(fp8_mod, "get_dcp_group", lambda: fake_group)
+    monkeypatch.setattr(mla_attention_op, "get_dcp_group", lambda: fake_group)
+    monkeypatch.setattr(mla_attention_op, "get_prequantized_matmul_op", lambda: None)
+
+    method = fp8_mod.VllmFp8LinearMethodTPU.__new__(fp8_mod.VllmFp8LinearMethodTPU)
+    method.online_fp8, method.online_fp8_policy, method.linear_config = (
+        False,
+        None,
+        None,
+    )
+    method.quant_config = SimpleNamespace(is_checkpoint_fp8_serialized=True)
+    method.block_quant, method.weight_block_size = True, (128, 128)
+    method._linear_quant_config = ("float8_e4m3fn", torch.float8_e4m3fn, None, False)
+
+    n_out, k_local = 128, 256
+    o_proj = torch.nn.Module()
+    o_proj.logical_widths = [n_out]
+    setattr(o_proj, DCP_ROWS_ATTR, True)
+    torch.manual_seed(17)
+    w1, s1 = (
+        torch.randn((n_out, k_local)).to(torch.float8_e4m3fn),
+        torch.full((1, 2), 0.25),
+    )
+    for k, v in (
+        ("weight", w1),
+        ("weight_scale_inv", s1),
+        ("weight_scale", s1.clone()),
+    ):
+        o_proj.register_parameter(k, torch.nn.Parameter(v, requires_grad=False))
+
+    mla = mla_attention_op.VllmTPUMLAAttention.__new__(
+        mla_attention_op.VllmTPUMLAAttention
+    )
+    torch.nn.Module.__init__(mla)
+    mla.prefix = mla.layer_name = "model.layers.0.self_attn.attn"
+    mla.dcp_q_replicate = True
+    mla.is_amx_bmm_enabled = mla.is_aiter_triton_fp4_bmm_enabled = (
+        mla.is_aiter_triton_fp8_bmm_enabled
+    ) = False
+    mla.q_pad_num_heads = mla.quant_config = None
+    mla.kv_lora_rank, mla.num_heads, mla.qk_nope_head_dim, mla.v_head_dim = 8, 2, 4, 4
+    kv_b_proj = torch.nn.Module()
+    kv_b_proj.register_parameter(
+        "weight", torch.nn.Parameter(torch.ones((16, 8)), requires_grad=False)
+    )
+    setattr(kv_b_proj, WEIGHT_FLIPPED_ATTR, True)
+    mla.kv_b_proj, mla.o_proj = kv_b_proj, o_proj
+    mla.impl = MagicMock(
+        _get_kv_scales=MagicMock(return_value=(None, None, None)), dcp_size=1
+    )
+
+    orig_to, orig_dev = torch.Tensor.to, torch.device
+
+    def cpu_to(self, *a, **kw):
+        return orig_to(
+            self,
+            *("cpu" if str(x).startswith("tpu") else x for x in a),
+            **(
+                {**kw, "device": "cpu"}
+                if str(kw.get("device", "")).startswith("tpu")
+                else kw
+            ),
+        )
+
+    caplog.set_level(logging.WARNING)
+    with (
+        patch.object(mla_attention_op, "should_quantize_on_load", return_value=False),
+        patch.object(mla_attention_op, "synchronize_tensors"),
+        patch(
+            "vllm.model_executor.layers.attention.mla_attention.split_kv_b_proj",
+            side_effect=lambda proj, *a, **k: (
+                torch.ones((8, 2, 4)),
+                torch.ones((8, 2, 4)),
+            ),
+        ),
+        patch(
+            "vllm.model_executor.layers.attention.mla_attention.set_default_quant_scales"
+        ),
+        patch(
+            "vllm.model_executor.layers.attention.mla_attention.get_dcp_group",
+            return_value=fake_group,
+        ),
+        patch.object(
+            torch,
+            "device",
+            lambda d, *a, **k: orig_dev(
+                "cpu" if str(d).startswith("tpu") else d, *a, **k
+            ),
+        ),
+        patch.object(torch.Tensor, "to", cpu_to),
+    ):
+        method.process_weights_after_loading(o_proj)
+        mla.process_weights_after_loading(torch.bfloat16)
+        assert mla.W_O_dcp_qrep.shape == (k_local * 2, n_out)
+        w_ptr, s_ptr = mla.W_O_dcp_qrep.data_ptr(), mla.W_O_dcp_qrep_scale.data_ptr()
+        first_deq = mla.W_O_dcp_qrep.float() * mla.W_O_dcp_qrep_scale
+
+        caplog.clear()
+        method.process_weights_after_loading(o_proj)
+        mla.process_weights_after_loading(torch.bfloat16)
+        assert mla.W_O_dcp_qrep.data_ptr() == w_ptr
+        assert not [r for r in caplog.records if "FP8 o_proj" in r.message]
+
+        w2 = torch.randn((n_out, k_local)).to(torch.float8_e4m3fn)
+        o_proj.register_parameter("weight", torch.nn.Parameter(w2, requires_grad=False))
+        o_proj.register_parameter(
+            "weight_scale_inv",
+            torch.nn.Parameter(torch.full((1, 2), 0.75), requires_grad=False),
+        )
+        o_proj.weight_block_size = (128, 128)
+        kv_b_proj.register_parameter(
+            "weight", torch.nn.Parameter(torch.ones((16, 8)) * 2.0, requires_grad=False)
+        )
+        method.process_weights_after_loading(o_proj)
+        mla.process_weights_after_loading(torch.bfloat16)
+        assert (mla.W_O_dcp_qrep.data_ptr(), mla.W_O_dcp_qrep_scale.data_ptr()) == (
+            w_ptr,
+            s_ptr,
+        )
+        reloaded = mla.W_O_dcp_qrep.float() * mla.W_O_dcp_qrep_scale
+        torch.testing.assert_close(
+            reloaded,
+            fake_group.all_gather(w2.float() * 0.75, dim=1).T,
+            rtol=0.15,
+            atol=0.15,
+        )
+        assert not torch.allclose(reloaded, first_deq)
+
+        caplog.clear()
+        mla.W_O_dcp_qrep = mla.W_O_dcp_qrep_scale = None
+        mla.process_weights_after_loading(torch.bfloat16)
+        assert mla.W_O_dcp_qrep is None
+        assert len([r for r in caplog.records if "FP8 o_proj" in r.message]) == 1
 
 
 def test_mla_forward_without_qrep_still_gathers(monkeypatch):

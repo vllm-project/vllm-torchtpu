@@ -76,6 +76,7 @@ from vllm.model_executor.parameter import (
 from vllm.model_executor.utils import replace_parameter, set_weight_attrs
 
 from vllm_torchtpu import envs
+from vllm_torchtpu.distributed.dcp import get_dcp_group
 from vllm_torchtpu.kernels.experimental.adaptive_fused_moe import (
     vllm_adapter as adaptive_moe,
 )
@@ -86,6 +87,7 @@ from vllm_torchtpu.layers.adapter.fused_moe import (
     prebuild_fused_moe_kernel,
 )
 from vllm_torchtpu.layers.adapter.linear_common import (
+    DCP_ROWS_ATTR,
     KEEP_VLLM_LAYOUT_ATTR,
     WEIGHT_FLIPPED_ATTR,
     quantized_matmul,
@@ -329,6 +331,18 @@ def _process_fp8_linear_weights(
         logical_widths=layer.logical_widths,
         out_dtype=torch.float32,
     )
+    if (
+        getattr(layer, DCP_ROWS_ATTR, False)
+        and not getattr(layer.weight, WEIGHT_FLIPPED_ATTR, False)
+        and requant_dtype.is_floating_point
+    ):
+        group = get_dcp_group()
+        assert group is not None
+        w, s = quantize_tensor(
+            group.all_gather(weight_f, dim=1), quant_dtype=requant_dtype, axis=-1
+        )
+        layer.weight_dcp = fresh_buffer(w.transpose(0, 1))
+        layer.weight_scale_dcp = fresh_buffer(s.reshape(-1))
     if requant_block_size is not None and weight_f.shape[-1] < requant_block_size:
         # Sub-block TP partition along the contracting dimension (e.g. RowParallel
         # down_proj with input_size_per_partition=64 < 128 at TP=16) has a single
@@ -1535,6 +1549,13 @@ class VllmFp8LinearMethodTPU(Fp8LinearMethod):
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         """Convert dense linear checkpoint weights to runtime FP8."""
         layer = cast("TpuLinear", layer)
+        if getattr(layer.weight, WEIGHT_FLIPPED_ATTR, False) or (
+            getattr(layer, WEIGHT_FLIPPED_ATTR, False)
+            and self.quant_config.is_checkpoint_fp8_serialized
+            and self.block_quant
+            and not hasattr(layer, "weight_scale_inv")
+        ):
+            return  # already flipped; re-entry without fresh weights
         if self.online_fp8:
             if layer._tpu_online_fp8_processed:
                 return
@@ -1605,7 +1626,7 @@ class VllmFp8LinearMethodTPU(Fp8LinearMethod):
         ckpt_n_out, ckpt_n_in = weight.shape
         # Layers whose weight is read raw by code expecting vLLM's
         # [n_out, n_in] keep that layout; `apply` below contracts accordingly.
-        if getattr(layer, WEIGHT_FLIPPED_ATTR, False):
+        if getattr(layer.weight, WEIGHT_FLIPPED_ATTR, False):
             return  # already flipped; reload paths re-enter this hook
         # Prevent transposing for embedding lookup, keep [vocab_size, hidden_size].
         is_embedding = isinstance(layer, VocabParallelEmbedding) and not isinstance(
@@ -1627,6 +1648,7 @@ class VllmFp8LinearMethodTPU(Fp8LinearMethod):
         )
         if not keep_vllm_layout:
             setattr(layer, WEIGHT_FLIPPED_ATTR, True)
+            setattr(layer.weight, WEIGHT_FLIPPED_ATTR, True)
         if hasattr(layer, "weight_scale_inv"):
             delattr(layer, "weight_scale_inv")
         replace_parameter(layer, "weight_scale", weight_scale)
