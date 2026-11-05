@@ -22,8 +22,9 @@ block (D2H block 3 -> host 0, H2D host 0 -> block 5) and checks the bytes.
 Process layout follows the server: the KVCacheStore controller runs in its
 own process (the scheduler; its constructor blocks until the workers
 register), the worker process owns the chip, takes the byte views at KV cache
-init, rebinds the caches with a donated in-place write + `copy_` (what each
-forward does), then probes the controller and registers, like
+init (block 3 is filled on the host before the upload, so nothing rewrites
+the device buffers), optionally rebinds the caches with an eager donated
+write + `copy_` (`donate`), then probes the controller and registers, like
 `RaidenStoreOffloadingWorker._register_loop`.
 
 Each variant runs in its own subprocess, so a segfault or a TPU fatal error is
@@ -35,7 +36,8 @@ reported and the next variant still runs. Variants (default: all, in order):
   small     m3 with 1024 host blocks instead of 23301 (host pool size)
   typed     m3 registering the native fp8 tensors, not int8 byte views
   two       m3 with one layer (2 arrays) (array count)
-  nodonate  m3 written through a plain copy, no donation (cache rebinding)
+  donate    m3, then an eager donated write + copy_ per cache after the views
+            were taken (buffer rebinding under live byte views)
 
 All: 60 layers x widths {256, 128} (page 32 KiB / 16 KiB per 128-token
 block), 4096 device blocks (the served 20011 do not fit 120 arrays on one
@@ -60,7 +62,7 @@ VARIANTS = {
     "small": {"host_blocks": 1024},
     "typed": {"view": "typed"},
     "two": {"layers": 1},
-    "nodonate": {"donate": False},
+    "donate": {"donate": True},
 }
 BASE = {
     "layers": 60,
@@ -70,7 +72,7 @@ BASE = {
     "dtype": "fp8",
     "view": "int8",
     "host_blocks": 23301,
-    "donate": True,
+    "donate": False,
 }
 
 
@@ -140,11 +142,14 @@ def _run(cfg: dict, port: int) -> None:
     device = torch.device("tpu")
     nb = cfg["num_blocks"]
 
-    # Allocate as the runner does: one array per cache, synced one by one.
+    # One device array per cache, block 3 filled on the host before upload.
     caches = []
     for _ in range(cfg["layers"]):
         for width in cfg["widths"]:
-            cache = torch.zeros(_shape(cfg, width), dtype=dtype, device=device)
+            page = cfg["block_size"] * width
+            host = torch.zeros((nb, page), dtype=torch.uint8)
+            host[3] = (torch.arange(page) % 7 + 1).to(torch.uint8)
+            cache = host.view(dtype).view(_shape(cfg, width)).to(device)
             synchronize_tensors([cache], wait=True)
             caches.append(cache)
     print(f"ALLOCATED {len(caches)} x {caches[0].dtype}", flush=True)
@@ -162,9 +167,8 @@ def _run(cfg: dict, port: int) -> None:
     else:
         tensors = caches
 
-    # Then write block 3 of every cache with nonzero values.
     if cfg["donate"]:
-
+        # Rewrite block 3 (same values) through an eager donated op.
         def _fill(cache: jax.Array) -> jax.Array:
             row = (jnp.arange(cache[3].size, dtype=jnp.int32) % 7 + 1).astype(
                 jnp.float32
@@ -175,11 +179,6 @@ def _run(cfg: dict, port: int) -> None:
         op.register_fake(lambda cache: torch.empty_like(cache))
         for cache in caches:
             cache.copy_(op(cache))
-            synchronize_tensors([cache], wait=True)
-    else:
-        for cache in caches:
-            row = (torch.arange(cache[3].numel()) % 7 + 1).to(torch.float32)
-            cache[3].copy_(row.view(cache[3].shape).to(dtype).to(device))
             synchronize_tensors([cache], wait=True)
     print(
         f"WRITTEN; registering {len(tensors)} arrays "
