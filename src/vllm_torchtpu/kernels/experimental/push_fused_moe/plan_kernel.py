@@ -75,7 +75,7 @@ def _flatten_rows(x, g, n):
     return flat
 
 
-def _tables(r3, seg3, me, *, ep, g, n_pre, tile_m):
+def _tables(r3, seg3, me, *, ep, g, n_pre, tile_m, light_prepush=0):
     """All tables from r3 [ep (s), ep (d), 128] (rows_by_dest[s, d*g+e] on
     lane e, zero past g), seg3 [ep (d), 128] (segment starts, same lanes)
     and the scalar rank `me`; see build_push_tables for the outputs."""
@@ -112,6 +112,24 @@ def _tables(r3, seg3, me, *, ep, g, n_pre, tile_m):
     for e in range(g):
         rank = rank + (key[:, e : e + 1] < key).astype(i32)
     n_visit = jnp.sum((real & (ea > 0)).astype(i32), 1, keepdims=True)  # [d, 1]
+    if light_prepush:
+        # The SparseCore pre-push carries the n_pre LIGHTEST experts with
+        # rows (lightest at 0), so it moves the fewest bytes. The rest follow
+        # most rows first (1), or (2) rising to the heaviest mid-kernel and
+        # falling back: the heavy experts' rows, now dispatched by the
+        # kernel, get visits to arrive in. Both keep a light expert last,
+        # whose result push is the kernel's exposed tail. Same experts, same
+        # tiles: only the visit order changes.
+        n_lp = jnp.minimum(n_visit, n_pre)
+        m = n_visit - n_lp
+        light = (rank >= m) & (rank < n_visit)
+        rest = rank
+        if light_prepush == 2:
+            # Most-rows rank r: odd r rise on the left, even r fall on the
+            # right from the peak r = 0.
+            half = m >> 1
+            rest = jnp.where((rank & 1) == 1, half - 1 - (rank >> 1), half + (rank >> 1))
+        rank = jnp.where(light, n_visit - 1 - rank, jnp.where(rank < m, rest + n_lp, rank))
     visit = zero
     for v in range(g):
         col = jnp.sum(_sel(real & (rank == v), lane), 1, keepdims=True)
@@ -257,10 +275,10 @@ def _tables(r3, seg3, me, *, ep, g, n_pre, tile_m):
 
 
 @functools.cache
-def _build(ep, g, n_pre, tile_m, interpret):
+def _build(ep, g, n_pre, tile_m, interpret, light_prepush=0):
     def kernel(me_sm, r3_ref, seg3_ref, *outs):
         t = _tables(r3_ref[...], seg3_ref[...], me_sm[0], ep=ep, g=g, n_pre=n_pre,
-                    tile_m=tile_m)  # fmt: skip
+                    tile_m=tile_m, light_prepush=light_prepush)  # fmt: skip
         _store_tables(t, outs, ep=ep, g=g)
 
     vmem = pl.BlockSpec(memory_space=pltpu.MemorySpace.VMEM)
@@ -274,12 +292,12 @@ def _build(ep, g, n_pre, tile_m, interpret):
         ),
         out_shape=_table_out_shapes(ep, g),
         interpret=interpret,
-        name=f"moe_push_tables_ep{ep}_g{g}",
+        name=f"moe_push_tables_ep{ep}_g{g}" + (f"_lp{light_prepush}" if light_prepush else ""),
     )
 
 
 def build_push_tables(rows_by_dest, seg_start_local, me, *, ep, n_pre, tile_m,
-                      interpret=False):  # fmt: skip
+                      interpret=False, light_prepush=0):  # fmt: skip
     """The push layer's dispatch and shard tables in one kernel.
 
     Returns (seg, dmeta, visit, counts_sc, kernel_tables, expert_rows,
@@ -289,7 +307,8 @@ def build_push_tables(rows_by_dest, seg_start_local, me, *, ep, n_pre, tile_m,
     shard_push_tables_in_rows [0], shard_expert_slabs and
     shard_count_vector; plan_tables = (arrival base [e_total], mirror base
     [e_total], run slab base [ep, g_local]) for
-    host.routing_pairs_from_tables.
+    host.routing_pairs_from_tables. `light_prepush` (1 or 2) reorders the
+    visits (see _tables) and then has no host equivalent.
     """
     e_total = rows_by_dest.shape[1]
     g = e_total // ep
@@ -300,7 +319,7 @@ def build_push_tables(rows_by_dest, seg_start_local, me, *, ep, n_pre, tile_m,
         ((0, 0), (0, 0), (0, LANES - g)),
     )
     me_arr = jnp.asarray(me, jnp.int32).reshape(1)
-    outs = _build(ep, g, int(n_pre), int(tile_m), bool(interpret))(
+    outs = _build(ep, g, int(n_pre), int(tile_m), bool(interpret), int(light_prepush))(
         me_arr, r3, _seg3(seg_start_local, ep, g)
     )
     return _unpack_tables(outs)
@@ -385,7 +404,7 @@ def _relane_counts(cnt, r3_ref, *, count_at, g):
 
 @functools.cache
 def _build_exchange_rows_tables(
-    ep, width, n_rows, count_at, g, n_pre, tile_m, before_barrier
+    ep, width, n_rows, count_at, g, n_pre, tile_m, before_barrier, light_prepush=0
 ):
     slab_rows = tx._slab_rows(width)
     r_lo = count_at // LANES
@@ -424,7 +443,14 @@ def _build_exchange_rows_tables(
         cp.wait()
         _relane_counts(cnt_vm[...], r3_vm, count_at=count_at - r_lo * LANES, g=g)
         t = _tables(
-            r3_vm[...], seg3_vm[...], me, ep=ep, g=g, n_pre=n_pre, tile_m=tile_m
+            r3_vm[...],
+            seg3_vm[...],
+            me,
+            ep=ep,
+            g=g,
+            n_pre=n_pre,
+            tile_m=tile_m,
+            light_prepush=light_prepush,
         )
         _store_tables(t, outs, ep=ep, g=g)
         pltpu.make_async_copy(dst_hbm, dst_hbm, gsem).wait()
@@ -453,7 +479,8 @@ def _build_exchange_rows_tables(
             + _table_out_shapes(ep, g),
             compiler_params=tx._compiler_params(),
             name=f"moe_tc_routing_exchange_ep{ep}_w{width}_rows{n_rows}_tables"
-            + ("_early" if before_barrier else ""),
+            + ("_early" if before_barrier else "")
+            + (f"_lp{light_prepush}" if light_prepush else ""),
         )(r, idx, slab, rows, _seg3(seg_start_local, ep, g))
         return (tx._unpad(out, ep, width), gathered) + _unpack_tables(tables)
 
@@ -461,7 +488,16 @@ def _build_exchange_rows_tables(
 
 
 def build_exchange_rows_tables(
-    *, ep, width, n_rows, count_at, e_total, n_pre, tile_m, before_barrier=False
+    *,
+    ep,
+    width,
+    n_rows,
+    count_at,
+    e_total,
+    n_pre,
+    tile_m,
+    before_barrier=False,
+    light_prepush=0,
 ):
     """tc_exchange.build_tc_exchange_all_gather_rows' kernel (row copies
     issued after the pushes, or before the entry barrier with
@@ -473,5 +509,13 @@ def build_exchange_rows_tables(
     if g > LANES or ep > LANES or 2 * g + 3 > LANES:
         raise ValueError(f"the table kernel takes g_local, ep <= {LANES}")
     return _build_exchange_rows_tables(
-        ep, width, n_rows, count_at, g, int(n_pre), int(tile_m), bool(before_barrier)
+        ep,
+        width,
+        n_rows,
+        count_at,
+        g,
+        int(n_pre),
+        int(tile_m),
+        bool(before_barrier),
+        int(light_prepush),
     )

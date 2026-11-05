@@ -619,3 +619,10 @@ BUFFERED_MATMUL_TUNING = {
     (7, 240, 8192, 5120): (1024, 32, 56 * 1024**2),
     (7, 288, 8192, 5120): (1024, 32, 56 * 1024**2),
 }
+
+# fused shared expert: (tpu_version, tokens, hidden, intermediate) ->
+# (gate/up window, down window, stream depth, DMAs per window, quant rows,
+#  vmem bytes)
+SHARED_EXPERT_TUNING = {
+    (7, 288, 5120, 2304): (256, 1024, 3, 2, 32, 56 * 1024**2),
+}

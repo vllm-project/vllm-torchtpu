@@ -40,6 +40,10 @@ import jax
 import jax.numpy as jnp
 from jax import lax
 
+from vllm_torchtpu.kernels.experimental.push_fused_moe.combine_vmem import (
+    build_combine_vmem_kernel,
+    combine_vmem_applies,
+)
 from vllm_torchtpu.kernels.experimental.push_fused_moe.host import (
     build_routing_tables_sharded,
     local_sort_activations,
@@ -80,6 +84,7 @@ from vllm_torchtpu.kernels.fused_moe.v2.host import (
     fp4_scale_rows,
     local_slab_rows,
     pair_block_hist,
+    pow2_shift,
     ragged_stride_bound,
     routing_block,
     shard_count_vector,
@@ -100,6 +105,7 @@ from vllm_torchtpu.kernels.fused_moe.v2.layer import (
 )
 from vllm_torchtpu.kernels.fused_moe.v2.router_ops import pallas_select
 from vllm_torchtpu.kernels.fused_moe.v2.token_parallel import TokenReplicaLayout
+from vllm_torchtpu.kernels.quantized_matmul.shared_expert import fp8_swiglu_mlp
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
@@ -134,14 +140,38 @@ def _pack_routing_exchange(pairs, scale_bits, counts, layout):
 
 
 def _combine_arrivals_fs(
-    arrivals, arrival_scales, pos, mirror_pos, topk_weights, out_dtype
+    arrivals, arrival_scales, pos, mirror_pos, topk_weights, out_dtype, *, vmem=False
 ):
     """v2's `_combine_arrivals`, with the arrival-scale lookup done inside the
     combine kernel (see kernel._build_combine_fs_kernel) where that kernel
-    applies; v2's XLA epilogue everywhere else."""
+    applies; v2's XLA epilogue everywhere else, or with `vmem` where the
+    arrival buffer fits VMEM, the VMEM-resident combine
+    (combine_vmem.build_combine_vmem_kernel), which computes the epilogue's
+    arithmetic in its order."""
     t_local, topk = pos.shape
     recv_rows, lane_blocks, lanes = arrivals.shape
     mirror_sublanes, tile_m = arrival_scales.shape
+    if (
+        vmem
+        and not combine_step_tokens(t_local)
+        and combine_vmem_applies(t_local, arrivals.shape, arrivals.dtype)
+    ):
+        # The epilogue's coefficient, computed exactly as _combine_arrivals
+        # computes it.
+        shift = pow2_shift(tile_m, "the mirror's lane count")
+        scl = jnp.minimum(mirror_pos, mirror_sublanes * tile_m - 1)
+        row_scales = arrival_scales[jnp.right_shift(scl, shift), scl & (tile_m - 1)]
+        coef = row_scales * topk_weights.astype(jnp.float32)
+        combine = build_combine_vmem_kernel(
+            t_local=t_local,
+            topk=topk,
+            recv_rows=recv_rows,
+            lane_blocks=lane_blocks,
+            lanes=lanes,
+            wire_dtype=arrivals.dtype,
+            out_dtype=out_dtype,
+        )
+        return combine(arrivals, coef, jnp.minimum(pos, recv_rows - 1))
     if not combine_step_tokens(t_local):
         return _combine_arrivals(
             arrivals, arrival_scales, pos, mirror_pos, topk_weights, out_dtype
@@ -276,9 +306,13 @@ def fused_ep_moe_push(
     exchange_tables=False,
     kernel_plan_tables=False,
     i32_scale_slab=False,
+    vmem_combine=False,
     staging_slots=0,
+    light_prepush=0,
     expert_slot=None,
     expert_load=None,
+    shared_expert=None,
+    shared_limit=None,
 ):
     """Run one MoE layer through the push-dispatch fused EP kernel.
 
@@ -318,8 +352,12 @@ def fused_ep_moe_push(
     while its row copies finish, with `exchange_tables`; with
     `kernel_plan_tables` the plan's small tables come from that kernel too
     (host.routing_pairs_from_tables); `i32_scale_slab` hands the expert
-    kernel the scale slab's i32 bit patterns to bitcast in VMEM. The caller
-    (layers/adapter/fused_moe_ep.py) reads all nineteen from envs.
+    kernel the scale slab's i32 bit patterns to bitcast in VMEM, and
+    `vmem_combine` combines the arrivals with the buffer resident in VMEM
+    where it fits (see `_combine_arrivals_fs`); `light_prepush` (1 or 2)
+    gives the SparseCore pre-push the lightest experts and orders the rest
+    (plan_kernel._tables). The
+    caller (layers/adapter/fused_moe_ep.py) reads all of them from envs.
 
     `expert_slot` [experts, R] i32 and `expert_load` [e_total] i32 (both
     replicated, optional) are the expert-layout operands dynamic EPLB
@@ -332,6 +370,12 @@ def fused_ep_moe_push(
     expert_load + this step's routed rows per physical slot); the counts are
     the routing exchange's, identical on every shard. Without either, the
     program is unchanged.
+
+    `shared_expert` (w13, s13, w2, s2), replicated, is the layer's per-channel
+    FP8 shared expert (`kernels/quantized_matmul/shared_expert.fp8_swiglu_mlp`
+    with `shared_limit`). It is computed on this shard's rows after the
+    SparseCore pre-push is issued and before the expert kernel, so it runs
+    while the pre-push is in flight; the layer then also returns it, last.
     """
     del preprocess_topology
     form = weight_form(weight_format)
@@ -356,6 +400,9 @@ def fused_ep_moe_push(
     e_total = w1.shape[0]
     has_expert_slot = expert_slot is not None
     has_expert_load = expert_load is not None
+    has_shared = shared_expert is not None
+    if has_shared and (len(shared_expert) != 4 or shared_limit is None):
+        raise ValueError("shared_expert is (w13, s13, w2, s2) with a shared_limit")
     # Global experts the router scores; without a layout, one slot each.
     e_logical = gating.shape[1] if has_expert_slot else e_total
     if has_expert_slot and (
@@ -476,6 +523,11 @@ def fused_ep_moe_push(
         raise ValueError("kernel_plan_tables needs table_kernel and sharded_plan")
     if exchange_tables and not (table_kernel and exchange_row_gather):
         raise ValueError("exchange_tables needs table_kernel and exchange_row_gather")
+    light_prepush = int(light_prepush)
+    if light_prepush not in (0, 1, 2):
+        raise ValueError(f"light_prepush is 0, 1 or 2; got {light_prepush}")
+    if light_prepush and not table_kernel:
+        raise ValueError("light_prepush orders the visits in the table kernel")
     if table_kernel and interleave_visits:
         raise ValueError("table_kernel builds the most-rows-first visit order only")
     if early_row_gather and not exchange_row_gather:
@@ -525,7 +577,7 @@ def fused_ep_moe_push(
 
     def unpack_operands(scales_gating_biases):
         """(w1 scale, w2 scale, gate, hash ids, score bias, slot table, load
-        accumulator, bias iterator)."""
+        accumulator, shared expert, bias iterator)."""
         operands = iter(scales_gating_biases)
         if pad_scale_rows:
             # [G * rows, N] -> [G, rows, N]: whole sublane tiles per expert,
@@ -544,6 +596,7 @@ def fused_ep_moe_push(
         score_bias_l = next(operands) if has_score_bias else None
         expert_slot_l = next(operands) if has_expert_slot else None
         expert_load_l = next(operands) if has_expert_load else None
+        shared_l = tuple(next(operands) for _ in range(4)) if has_shared else None
         return (
             w1s_l,
             w2s_l,
@@ -552,6 +605,7 @@ def fused_ep_moe_push(
             score_bias_l,
             expert_slot_l,
             expert_load_l,
+            shared_l,
             operands,
         )
 
@@ -650,11 +704,14 @@ def fused_ep_moe_push(
         out_dtype,
         expert_load_l=None,
         pre_tables=None,
+        x_l=None,
+        shared_l=None,
     ):
         """Dispatch tables, SparseCore pre-push, plan, kernel and combine.
 
         `pre_tables`, where the exchange kernel already built them, are
-        build_push_tables' outputs."""
+        build_push_tables' outputs; `shared_l`, the shared expert computed on
+        `x_l` between the pre-push and the kernel."""
         me = rank_l[0, 0]
         pairs_g, scale_bits_g, rows_by_dest = _unpack_routing_exchange(
             exchange, layout, t_local, topk, e_total
@@ -679,6 +736,7 @@ def fused_ep_moe_push(
                     ep=ep,
                     n_pre=n_pre,
                     tile_m=capacity,
+                    light_prepush=light_prepush,
                 )
             elif fused_dispatch_meta:
                 seg, dmeta, _, visit, counts_sc = push_dispatch_tables(
@@ -737,6 +795,9 @@ def fused_ep_moe_push(
         # The plan reads pairs_g, so it follows the barrier either way; the
         # run tables only add a layout copy at it (`slim_prepush_barrier`).
         barriered_runs = () if slim_prepush_barrier else tuple(runs)
+        # The shared expert's rows come out of the same barrier as the
+        # pre-push operands, so it cannot be scheduled ahead of them.
+        shared_x = (x_l,) if shared_l is not None else ()
         (
             q_sorted,
             seg,
@@ -745,11 +806,13 @@ def fused_ep_moe_push(
             visit,
             pairs_g,
             scale_bits_g,
-            *barriered_runs,
+            *rest,
         ) = lax.optimization_barrier(
             (q_sorted, seg, counts_sc, dmeta, visit, pairs_g, scale_bits_g)
+            + shared_x
             + barriered_runs
         )
+        shared_x, barriered_runs = rest[: len(shared_x)], rest[len(shared_x) :]
         if not slim_prepush_barrier:
             runs = barriered_runs
         slab = sc_dispatch_chunk_2core(
@@ -764,6 +827,10 @@ def fused_ep_moe_push(
             name=f"moe_sc_prepush_2c_s{n_pre}",
             rank=me,
         )
+        shared_out = ()
+        if shared_l is not None:
+            with jax.named_scope("moe_shared_expert"):
+                shared_out = (fp8_swiglu_mlp(*shared_x, *shared_l, limit=shared_limit),)
         plan_kw = dict(
             e_total=e_total,
             ep=ep,
@@ -807,9 +874,10 @@ def fused_ep_moe_push(
             # built into a replicated slab and sliced away afterwards.
             slab_row = local_slab_rows(routing, me, shard_stride=ragged_stride)
         # Keep the scale-slab scatter (a SparseCore offload) behind the
-        # pre-push on the SparseCore queue.
-        slab_row, scale_bits_g, slab = lax.optimization_barrier(
-            (slab_row, scale_bits_g, slab)
+        # pre-push on the SparseCore queue. The shared expert joins here, so
+        # the expert kernel, which reads the slab, cannot start before it.
+        slab_row, scale_bits_g, slab, *shared_out = lax.optimization_barrier(
+            (slab_row, scale_bits_g, slab) + shared_out
         )
         # The activation row scale, scattered onto the slab row each routed
         # pair computes on (v2's scale slab; see there).
@@ -891,13 +959,21 @@ def fused_ep_moe_push(
             )
         )
         combined = _combine_arrivals_fs(
-            arrivals, arrival_scales, pos, mirror_pos, topk_weights, out_dtype
+            arrivals,
+            arrival_scales,
+            pos,
+            mirror_pos,
+            topk_weights,
+            out_dtype,
+            vmem=vmem_combine,
         )
         # A row that routed nowhere read arrival rows nobody wrote; its weight is
         # zero, but zero times an unwritten NaN is not.
         combined = jnp.where(row_routes, combined, jnp.zeros_like(combined))
         out = token_layout.restore(combined, ax)
-        return out if updated_load is None else (out, updated_load)
+        outs = (out,) + (() if updated_load is None else (updated_load,))
+        outs += tuple(shared_out)
+        return outs if len(outs) > 1 else out
 
     def local_fn(x_l, rank_l, w1_l, w2_l, *scales_gating_biases):
         """One shard's half of the layer: route, dispatch, kernel, combine."""
@@ -909,6 +985,7 @@ def fused_ep_moe_push(
             score_bias_l,
             expert_slot_l,
             expert_load_l,
+            shared_l,
             bias_it,
         ) = unpack_operands(scales_gating_biases)
         gate_l, hash_l, q_l, row_scale_l = quantize_local(x_l, rank_l, gate_l, hash_l)
@@ -937,6 +1014,7 @@ def fused_ep_moe_push(
                     n_pre=n_pre,
                     tile_m=capacity,
                     before_barrier=early_row_gather,
+                    light_prepush=light_prepush,
                 )(packed, rank_l[0, 0], q_l, tok, seg_start)
             else:
                 exchange, q_sorted = build_tc_exchange_all_gather_rows(
@@ -982,6 +1060,8 @@ def fused_ep_moe_push(
             x_l.dtype,
             expert_load_l,
             pre_tables,
+            x_l,
+            shared_l,
         )
 
     bias_args = tuple(b for b in (w1_bias, w2_bias) if b is not None)
@@ -995,10 +1075,17 @@ def fused_ep_moe_push(
     # Replicated like the score bias: indexed by global expert / slot id.
     expert_slot_args = (expert_slot,) if has_expert_slot else ()
     expert_load_args = (expert_load,) if has_expert_load else ()
+    # Replicated: every shard holds the whole shared expert.
+    shared_args = tuple(shared_expert) if has_shared else ()
     in_specs = (
         (P(ax),) * (5 + len(scale_args) + len(hash_args))
         + (P(),)
-        * (len(score_bias_args) + len(expert_slot_args) + len(expert_load_args))
+        * (
+            len(score_bias_args)
+            + len(expert_slot_args)
+            + len(expert_load_args)
+            + len(shared_args)
+        )
         + (P(ax),) * len(bias_args)
     )
     args = (
@@ -1009,6 +1096,7 @@ def fused_ep_moe_push(
         + score_bias_args
         + expert_slot_args
         + expert_load_args
+        + shared_args
         + bias_args
     )
     NS = jax.sharding.NamedSharding
@@ -1064,7 +1152,13 @@ def fused_ep_moe_push(
         bool(exchange_tables),
         bool(kernel_plan_tables),
         bool(i32_scale_slab),
+        has_shared and tuple((a.shape, a.dtype) for a in shared_args),
+        has_shared and float(shared_limit),
+        bool(vmem_combine),
+        int(light_prepush),
     )
+    out_specs = (P(ax),) + ((P(),) if has_expert_load else ()) + ((P(ax),) * has_shared)
+    out_specs = out_specs if len(out_specs) > 1 else out_specs[0]
     sm = _LAYER_SM_CACHE.get(key)
     if sm is None:
         with _LAYER_SM_CACHE_LOCK:
@@ -1074,7 +1168,7 @@ def fused_ep_moe_push(
                     local_fn,
                     mesh=mesh,
                     in_specs=in_specs,
-                    out_specs=(P(ax), P()) if has_expert_load else P(ax),
+                    out_specs=out_specs,
                     check_vma=False,
                 )
                 _LAYER_SM_CACHE[key] = sm

@@ -22,6 +22,7 @@ if TYPE_CHECKING:
     TPU_DEEPSEEK_V41_BLOCKED_ROPE_GATHER: bool = True
     TPU_DEEPSEEK_V41_CSA2_SWA_PLAN: bool = False
     TPU_DEEPSEEK_V41_FUSED_WO_AB: bool = True
+    TPU_DEEPSEEK_V41_FUSED_SHARED_EXPERT: bool = False
     TPU_DEEPSEEK_V41_QB_ROPE_EXACT_ROWS: bool = True
     TPU_DEEPSEEK_V41_CSA2_DEEP_GATHER: bool = True
     TPU_K3_SP_PREFILL: bool = False
@@ -118,7 +119,10 @@ if TYPE_CHECKING:
     MOE_FUSED_EP_PUSH_EXCHANGE_TABLES: bool = True
     MOE_FUSED_EP_PUSH_KERNEL_PLAN_TABLES: bool = True
     MOE_FUSED_EP_PUSH_I32_SCALE_SLAB: bool = False
+    MOE_FUSED_EP_PUSH_VMEM_COMBINE: bool = False
     MOE_FUSED_EP_PUSH_STAGING_SLOTS: int = 0
+    MOE_FUSED_EP_PUSH_SHARED_EXPERT: bool = False
+    MOE_FUSED_EP_PUSH_LIGHT_PREPUSH: int = 0
     TPU_EXPERT_PLACEMENT: str = ""
     TPU_LATENT_PROJ_INTRA_CHIP_TP: bool = False
     TPU_TOKEN_BUCKET_EXTRA: list[int] = []
@@ -498,6 +502,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # output stays in VMEM). Same arithmetic as the two kernels (bit-exact).
     "TPU_DEEPSEEK_V41_FUSED_WO_AB": env_bool(
         "TPU_DEEPSEEK_V41_FUSED_WO_AB", default=True
+    ),
+    # Shared expert (per-channel FP8 gate/up, clamped SiLU-and-mul, down) as
+    # one decode kernel at the qualified shapes; the intermediate stays in
+    # VMEM. Same arithmetic as the XLA ops (bit-exact).
+    "TPU_DEEPSEEK_V41_FUSED_SHARED_EXPERT": env_bool(
+        "TPU_DEEPSEEK_V41_FUSED_SHARED_EXPERT", default=False
     ),
     # Fused Q-B/RoPE at token counts that are not a multiple of 32 (the DSpark
     # drafter's 240 rows): write only the real rows instead of slicing a padded
@@ -948,9 +958,21 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # MOE_FUSED_EP_KERNEL_IMPL=push: hand the expert kernel the activation
     # scale slab as i32 bit patterns and bitcast each tile's column in VMEM.
     "MOE_FUSED_EP_PUSH_I32_SCALE_SLAB": env_bool("MOE_FUSED_EP_PUSH_I32_SCALE_SLAB"),
+    # MOE_FUSED_EP_KERNEL_IMPL=push: where the shard's arrival buffer fits
+    # VMEM, combine with it resident there instead of XLA's gather epilogue.
+    "MOE_FUSED_EP_PUSH_VMEM_COMBINE": env_bool("MOE_FUSED_EP_PUSH_VMEM_COMBINE"),
     # MOE_FUSED_EP_KERNEL_IMPL=push without HBM staging: VMEM slots the expert
     # kernel stages result tiles in for the wire (0 = the default two).
     "MOE_FUSED_EP_PUSH_STAGING_SLOTS": env_int("MOE_FUSED_EP_PUSH_STAGING_SLOTS", 0),
+    # MOE_FUSED_EP_KERNEL_IMPL=push with TABLE_KERNEL=1: the SparseCore
+    # pre-push carries the lightest experts instead of the heaviest; the rest
+    # most rows first (1) or rising to the heaviest and falling back (2).
+    "MOE_FUSED_EP_PUSH_LIGHT_PREPUSH": env_int("MOE_FUSED_EP_PUSH_LIGHT_PREPUSH", 0),
+    # MOE_FUSED_EP_KERNEL_IMPL=push: run the layer's FP8 shared expert (the
+    # fused kernel of TPU_DEEPSEEK_V41_FUSED_SHARED_EXPERT) inside the MoE op,
+    # issued after the SparseCore pre-push and ahead of the expert kernel, so
+    # the TensorCore computes it while the pre-push is in flight.
+    "MOE_FUSED_EP_PUSH_SHARED_EXPERT": env_bool("MOE_FUSED_EP_PUSH_SHARED_EXPERT"),
     # Shard Kimi K3's latent-MoE down/up projections across the cores of a
     # chip instead of replicating them. They are unquantized [7168, 3584] and
     # [3584, 7168] matmuls run at full HBM bandwidth, ~22% of decode device
