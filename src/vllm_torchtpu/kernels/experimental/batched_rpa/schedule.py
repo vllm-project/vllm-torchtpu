@@ -467,6 +467,27 @@ def _compute_waits(
     jax.lax.fori_loop(start_step, end_step, body, None)
 
 
+def get_end_k_idx(
+    *,
+    q_offset: jax.typing.ArrayLike,
+    q_idx: jax.typing.ArrayLike,
+    q_sz_task: jax.typing.ArrayLike,
+    num_k: jax.typing.ArrayLike,
+    cfgs: configs.RpaConfigs,
+) -> jax.Array:
+    """Returns one past the last KV block a Q block attends to.
+
+    Causal attention stops at the block holding the Q block's last query
+    position. Non-causal attention reads all of the sequence's KV blocks.
+    """
+    if not cfgs.model.causal:
+        return jnp.asarray(num_k)
+    end_k_idx_causal = (
+        q_offset + q_idx * cfgs.bq_sz + q_sz_task - 1
+    ) // cfgs.bkv_sz + 1
+    return jnp.minimum(num_k, end_k_idx_causal)
+
+
 def flush_to_hbm(
     count: jax.typing.ArrayLike,
     schedule: RpaSchedule,
@@ -762,10 +783,13 @@ class BaseMetadataComputer:
             sw_start_idx = q_offset + q_idx * cfgs.bq_sz - sliding_window + 1
             start_k_idx = jnp.maximum(0, sw_start_idx) // cfgs.bkv_sz
 
-        end_k_idx_causal = (
-            q_offset + q_idx * cfgs.bq_sz + q_sz_task - 1
-        ) // cfgs.bkv_sz + 1
-        end_k_idx = jnp.minimum(num_k, end_k_idx_causal)
+        end_k_idx = get_end_k_idx(
+            q_offset=q_offset,
+            q_idx=q_idx,
+            q_sz_task=q_sz_task,
+            num_k=num_k,
+            cfgs=cfgs,
+        )
         if cfgs.serve.attention_scope == configs.AttentionScope.NEW_TOKENS_ONLY:
             start_k_idx = jnp.maximum(start_k_idx, kv_cache_len // cfgs.bkv_sz)
         k_loop_fn = functools.partial(
