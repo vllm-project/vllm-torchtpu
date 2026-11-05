@@ -44,6 +44,8 @@ At startup, `vllm-torchtpu` reports set environment variables that neither vLLM 
 | `TPU_DCP_LSE_MERGE_A2A` | `False` | Uses all-to-all LSE merge for Decode Context Parallelism when token count is below `TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS` (`64`). |
 | `TPU_TOKEN_BUCKET_EXTRA` | `[]` | Comma-separated list of additional token padding bucket sizes to precompile. |
 | `TPU_TOKEN_BUCKET_LINEAR` | `False` | Uses linearly spaced token compilation buckets instead of exponential buckets. |
+| `TPU_GEMMA4_SEQUENCE_PARALLEL` | `False` | Opt-in. Keeps the Gemma 4 residual stream sharded across TP ranks on prefill token buckets whose per-rank shard is at least 1 MiB, overlapping two microbatches when each half-chunk remains at least 1 MiB per rank. |
+| `TPU_GEMMA4_CP_MIN_TOKENS` | `0` | Opt-in (`0` disables). Runs Gemma 4 token buckets of at least this many tokens with zigzag context-parallel prefill across the TP group (requires `TP >= 3`, prefix caching disabled, and `VLLM_TPU_SOLO_PREFILL_OVER_TOKENS` whose bucket sits immediately below this threshold). |
 
 ---
 

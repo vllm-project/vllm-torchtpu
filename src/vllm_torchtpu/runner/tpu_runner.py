@@ -4333,6 +4333,8 @@ class TPUModelRunner(GPUModelRunner):
                     mesh=self.mesh,
                     vllm_config=self.vllm_config,
                     kv_cache_bundle=self._kv_cache_bundle,
+                    query_start_loc_cpu=self.query_start_loc_np[: num_reqs + 1],
+                    seq_lens_cpu=self.seq_lens_np[:num_reqs],
                 ),
                 self._stage_timing.stage("main_forward"),
             ):
