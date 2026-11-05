@@ -382,7 +382,9 @@ def make_repack(
             _write_main_cache_universal,
         )
 
-        write = functools.partial(_write_main_cache_universal, tile=REPACK_TILE)
+        write = functools.partial(
+            _write_main_cache_universal, tile=REPACK_TILE, overlap_edges=True
+        )
 
     def gdn_page(page, s: GdnGeometry, d: GdnGeometry):
         """One producer GDN page -> this rank's page rows ``[ssm + conv]``."""

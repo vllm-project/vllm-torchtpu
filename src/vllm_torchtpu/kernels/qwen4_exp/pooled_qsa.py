@@ -47,7 +47,9 @@ from vllm_torchtpu.kernels.qwen4_exp.tuned_block_sizes import (
 )
 
 
-def _write_main_cache_universal(pool, rows, page, logical, valid, tile=128):
+def _write_main_cache_universal(
+    pool, rows, page, logical, valid, tile=128, overlap_edges=False
+):
     """Write contiguous prefill tiles without copying the full cache pool.
 
     Complete page-local tiles use one large DMA. Tiles that cross a request or
@@ -96,18 +98,46 @@ def _write_main_cache_universal(pool, rows, page, logical, valid, tile=128):
                 semaphore,
             ).wait()
 
-        @pl.when(bulk_ref[program] == 0)
-        def store_edges():
-            for lane in range(tile):
-                row = first + lane
+        def row_copy(lane, row):
+            return pltpu.make_async_copy(
+                source_ref.at[pl.ds(lane, 1)],
+                target_ref.at[pages_ref[row], pl.ds(offsets_ref[row], 1)],
+                semaphore,
+            )
 
-                @pl.when(valid_ref[row] != 0)
-                def store_row(*, lane=lane, row=row):
-                    pltpu.async_copy(
-                        source_ref.at[pl.ds(lane, 1)],
-                        target_ref.at[pages_ref[row], pl.ds(offsets_ref[row], 1)],
-                        semaphore,
-                    ).wait()
+        if overlap_edges:
+            # Start every valid row's DMA, then wait them all: a serial
+            # start/wait per row paid one DMA round trip per row (the staged
+            # PD repack's scatter ran ~8 us per 64-row tile, ~8 GB/s). Rows of
+            # one tile may repeat a destination only with identical bytes
+            # (align_rows pads by repeating a row), so the order is free.
+            @pl.when(bulk_ref[program] == 0)
+            def store_edges_overlapped():
+                for lane in range(tile):
+                    row = first + lane
+
+                    @pl.when(valid_ref[row] != 0)
+                    def start_row(*, lane=lane, row=row):
+                        row_copy(lane, row).start()
+
+                for lane in range(tile):
+                    row = first + lane
+
+                    @pl.when(valid_ref[row] != 0)
+                    def wait_row(*, lane=lane, row=row):
+                        row_copy(lane, row).wait()
+
+        else:
+
+            @pl.when(bulk_ref[program] == 0)
+            def store_edges():
+                for lane in range(tile):
+                    row = first + lane
+
+                    @pl.when(valid_ref[row] != 0)
+                    def store_row(*, lane=lane, row=row):
+                        row_copy(lane, row).start()
+                        row_copy(lane, row).wait()
 
     return pl.pallas_call(
         kernel,
