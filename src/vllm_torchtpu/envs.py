@@ -13,7 +13,7 @@ if TYPE_CHECKING:
     TPU_DEEPSEEK_V41_ENGRAM_MASKS_IN_HASH: bool = True
     TPU_DEEPSEEK_V41_ENGRAM_INT32_SLOT_WRITE: bool = True
     TPU_DEEPSEEK_V41_ENGRAM_TILE_SCATTER: bool = True
-    TPU_DEEPSEEK_V41_ENGRAM_FUSED_PREP: bool = False
+    TPU_DEEPSEEK_V41_ENGRAM_FUSED_PREP: bool = True
     TPU_DEEPSEEK_V41_IMPL: str = "v2"
     TPU_DEEPSEEK_V41_ENGRAM_CPU_OFFLOAD: bool = False
     TPU_DEEPSEEK_V41_ENGRAM_HBM: str = "auto"
@@ -133,7 +133,7 @@ if TYPE_CHECKING:
     MOE_FUSED_EP_PUSH_SHARED_EXPERT: bool = True
     MOE_FUSED_EP_PUSH_LIGHT_PREPUSH: int = 2
     MOE_FUSED_EP_PUSH_SINGLE_BARRIER: bool = True
-    MOE_FUSED_EP_PUSH_EARLY_SCALE_SCATTER: int = 0
+    MOE_FUSED_EP_PUSH_EARLY_SCALE_SCATTER: int = 2
     TPU_EXPERT_PLACEMENT: str = ""
     TPU_LATENT_PROJ_INTRA_CHIP_TP: bool = False
     TPU_TOKEN_BUCKET_EXTRA: list[int] = []
@@ -459,7 +459,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # call (kernels/engram_hash.py engram_prep) instead of five, to cut host
     # dispatch time ahead of the encoder. Same hashes and cache contents.
     "TPU_DEEPSEEK_V41_ENGRAM_FUSED_PREP": env_bool(
-        "TPU_DEEPSEEK_V41_ENGRAM_FUSED_PREP", default=False
+        "TPU_DEEPSEEK_V41_ENGRAM_FUSED_PREP", default=True
     ),
     # Deprecated aliases, resolved by the DSV41 serving-policy verifier.
     # Serving supports v2; v1 remains only as a standalone reference.
@@ -1045,7 +1045,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # the shared expert (1), nor behind the SparseCore pre-push (2), so it can
     # run while the TensorCore computes the shared expert.
     "MOE_FUSED_EP_PUSH_EARLY_SCALE_SCATTER": env_int(
-        "MOE_FUSED_EP_PUSH_EARLY_SCALE_SCATTER", 0
+        "MOE_FUSED_EP_PUSH_EARLY_SCALE_SCATTER", 2
     ),
     # MOE_FUSED_EP_KERNEL_IMPL=push: run the layer's FP8 shared expert (the
     # fused kernel of TPU_DEEPSEEK_V41_FUSED_SHARED_EXPERT) inside the MoE op,
