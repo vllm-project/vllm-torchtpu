@@ -662,10 +662,15 @@ def post(x, residual, post_layer_mix, comb_res_mix):
 def collapse(x, pre_mix):
     if x.shape[-2] != 4:
         return (x.float() * pre_mix.unsqueeze(-1)).sum(-2).to(x.dtype)
-    # Stream slices, not the [T, 4, D] FP32 view, which costs XLA a relayout
-    # copy of the whole residual; (s0 + s2) + (s1 + s3) is the order its
-    # reduce applies, as in _collapse_flat.
-    terms = [x[..., m, :].float() * pre_mix[..., m : m + 1] for m in range(4)]
+    # Column slices of the flat [T, 4 * D] rows the mHC kernels produce:
+    # slicing the [T, 4, D] view makes XLA relayout the whole residual into
+    # 3-D tiles first. (s0 + s2) + (s1 + s3) is the order its reduce applies,
+    # as in _collapse_flat.
+    flat, width = x.flatten(-2), x.shape[-1]
+    terms = [
+        flat[..., m * width : (m + 1) * width].float() * pre_mix[..., m : m + 1]
+        for m in range(4)
+    ]
     return ((terms[0] + terms[2]) + (terms[1] + terms[3])).to(x.dtype)
 
 
