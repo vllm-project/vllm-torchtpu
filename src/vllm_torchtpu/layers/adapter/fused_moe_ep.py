@@ -230,6 +230,8 @@ def _build_op(
             table_kernel=envs.MOE_FUSED_EP_PUSH_TABLE_KERNEL,
             exchange_tables=envs.MOE_FUSED_EP_PUSH_EXCHANGE_TABLES,
             kernel_plan_tables=envs.MOE_FUSED_EP_PUSH_KERNEL_PLAN_TABLES,
+            light_prepush=envs.MOE_FUSED_EP_PUSH_LIGHT_PREPUSH,
+            single_barrier=envs.MOE_FUSED_EP_PUSH_SINGLE_BARRIER,
         )
 
     preprocess_topology = prepare_moe_preprocessing(mesh)
