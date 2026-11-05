@@ -28,6 +28,7 @@ from vllm.model_executor.models.utils import maybe_prefix
 from vllm.models.deepseek_v41.nvidia import model as upstream
 
 from vllm_torchtpu.layers.adapter.quantization.deepseek_v41 import DeepseekV41MoE
+from vllm_torchtpu.layers.core import table_lookup
 from vllm_torchtpu.logger import init_logger
 
 from ..common.mhc import (
@@ -119,7 +120,11 @@ def _insert_context_kv(
             requests = _token_requests(metadata, positions).clamp(
                 max=metadata.seq_lens.shape[0] - 1
             )
-            offsets = positions - metadata.seq_lens[requests] + attn.window_size
+            offsets = (
+                positions
+                - table_lookup.take(metadata.seq_lens, requests)
+                + attn.window_size
+            )
             swa_valid = (swa_slots >= 0) & (offsets >= 0) & (offsets < attn.window_size)
         else:
             swa_valid = swa_slots >= 0

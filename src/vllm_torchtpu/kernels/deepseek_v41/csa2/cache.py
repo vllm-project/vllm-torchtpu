@@ -496,17 +496,36 @@ def publish_csa2_kv(
     return (out_words, out_scales) if banked else (out_words[0], out_scales[0])
 
 
-def _requests(starts: jax.Array, tokens: int) -> jax.Array:
-    return jnp.repeat(
-        jnp.arange(starts.shape[0] - 1, dtype=jnp.int32),
-        starts[1:] - starts[:-1],
-        total_repeat_length=tokens,
-    )
+def _requests(starts: jax.Array, tokens: int, *, onehot: bool) -> jax.Array:
+    """Request of each of ``tokens`` rows under contiguous ``starts`` [R + 1],
+    padded with the last request past ``starts[-1]`` as ``jnp.repeat`` pads.
+
+    ``onehot`` compares every row against all request ends in one vector op;
+    the repeat lowers to a gather from a short table, which XLA:TPU expands
+    into a select chain over scalar operands.
+    """
+    requests = starts.shape[0] - 1
+    if not onehot:
+        return jnp.repeat(
+            jnp.arange(requests, dtype=jnp.int32),
+            starts[1:] - starts[:-1],
+            total_repeat_length=tokens,
+        )
+    ends = starts[1:] - starts[0]
+    rows = jnp.arange(tokens, dtype=ends.dtype)
+    count = jnp.sum(ends[None, :] <= rows[:, None], axis=1, dtype=jnp.int32)
+    return jnp.minimum(count, requests - 1)
 
 
 @functools.partial(
     jax.jit,
-    static_argnames=("page_size", "page_stride", "row_offset", "non_causal"),
+    static_argnames=(
+        "page_size",
+        "page_stride",
+        "row_offset",
+        "non_causal",
+        "onehot_requests",
+    ),
 )
 def prepare_swa_metadata(
     block_table: jax.Array,
@@ -518,6 +537,7 @@ def prepare_swa_metadata(
     page_stride: int,
     row_offset: int,
     non_causal: bool = False,
+    onehot_requests: bool = False,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Return request page metadata, explicit bounds, and physical write records.
 
@@ -569,7 +589,7 @@ def prepare_swa_metadata(
         ),
         axis=1,
     ).astype(jnp.int32)
-    req = _requests(starts, tokens)
+    req = _requests(starts, tokens, onehot=onehot_requests)
     current_blocks = block_table[
         req, jnp.minimum(positions // page_size, block_table.shape[1] - 1)
     ]
@@ -578,13 +598,14 @@ def prepare_swa_metadata(
     return metadata, jnp.stack((left, right), axis=1), records.astype(jnp.int32)
 
 
-@functools.partial(jax.jit, static_argnames=("page_size",))
+@functools.partial(jax.jit, static_argnames=("page_size", "onehot_requests"))
 def prepare_main_records(
     selected: jax.Array,
     physical_pages: jax.Array,
     starts: jax.Array,
     *,
     page_size: int,
+    onehot_requests: bool = False,
 ) -> tuple[jax.Array, jax.Array]:
     """Resolve already-compacted logical selections; preserve stage gather reuse.
 
@@ -614,7 +635,7 @@ def prepare_main_records(
         inputs = (selected, physical_pages, starts)
         return prep.main_records_call(inputs, page_size=page_size)(*inputs)
     tokens, width = selected.shape
-    req = _requests(starts, tokens)
+    req = _requests(starts, tokens, onehot=onehot_requests)
     valid = (selected >= 0) & (jnp.arange(tokens)[:, None] < starts[-1])
     logical = jnp.maximum(selected, 0)
     if jax.default_backend() == "tpu":
