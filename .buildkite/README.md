@@ -30,9 +30,11 @@ lane, because its LKG promotion waits on two of its steps.
 
 A PR labeled `skip-tpu-ci` (it still needs `ready`) uploads only the `cpu` lane
 and the image build (skipping the `-omni` image and every TPU lane), so what
-runs is the image build, the type check, and the CPU unit tests (or the nightly
-CPU unit tests when combined with `run-full-ci`). The post-merge build of such
-a PR does the same: `bootstrap.py` reads the merged PR's labels from GitHub.
+runs is the image build, the type check, and the CPU unit tests. The post-merge
+build of such a PR does the same: `bootstrap.py` reads the merged PR's labels
+from GitHub. The PR suite labels `skip-tpu-ci`, `run-perf-eval`, and
+`run-full-ci` are mutually exclusive (`bootstrap.py` fails if more than one is
+set; `ready` and `oncall-fix` are orthogonal).
 
 Releases and nightly images are published by the `vllm-torchtpu-release`
 pipeline in the TPU Release cluster; [`release/README.md`](https://github.com/vllm-project/vllm-torchtpu/blob/main/.buildkite/release/README.md)

@@ -46,11 +46,6 @@ _GITHUB_API_URL = "https://api.github.com"
 # Max TPU jobs one author's PR builds may have in flight on kube (~2 PRs at ~19 jobs).
 PR_TPU_JOBS_PER_AUTHOR = 40
 
-_LABEL_EXTRAS: dict[str, str] = {
-    "run-full-ci": "nightly-suite",
-    "run-perf-eval": "perf-eval",
-}
-
 
 class BootstrapError(Exception):
     """Fatal configuration or git/pin lookup error that exits bootstrap with 1."""
@@ -86,6 +81,15 @@ class BuildContext:
     vllm_commit_override: str
     pr_tpu_concurrency_group_env: str
 
+    def __post_init__(self) -> None:
+        if self.is_pr:
+            conflicting = [label for label in _PR_SUITES if label in self.labels]
+            if len(conflicting) > 1:
+                raise BootstrapError(
+                    f"ERROR: PR labels {', '.join(conflicting)} are mutually "
+                    "exclusive; set at most one"
+                )
+
     @property
     def is_pr(self) -> bool:
         return self.pull_request is not None
@@ -109,16 +113,18 @@ class BuildContext:
         return "skip-tpu-ci" in self.labels
 
     @property
-    def extras(self) -> frozenset[str]:
+    def pr_suite_label(self) -> str | None:
+        if self.skips_tpu:
+            return "skip-tpu-ci"
         if not self.is_pr:
-            return frozenset()
-        return frozenset(
-            _LABEL_EXTRAS[label] for label in self.labels if label in _LABEL_EXTRAS
-        )
+            return None
+        return next((label for label in _PR_SUITES if label in self.labels), None)
 
     @property
     def runs_nightly_steps(self) -> bool:
-        return self.nightly_env or self.is_release or "nightly-suite" in self.extras
+        return (
+            self.nightly_env or self.is_release or self.pr_suite_label == "run-full-ci"
+        )
 
     @classmethod
     def from_env(
@@ -207,28 +213,38 @@ SUITES: dict[str, Suite] = {
     ),
 }
 
+_PR_STAGE0 = ("build", "cpu")  # cpu steps wait on build_docker themselves
+_PR_ABOUT = "PR: TPU waits for the CPU checks"
+_PR_DEFAULT = Suite(
+    "pr",
+    _PR_ABOUT,
+    stages=(_PR_STAGE0, ("tests", "integration", "verify")),
+)
+# Mutually exclusive PR suite labels (`ready` and `oncall-fix` are orthogonal).
+_PR_SUITES: dict[str, Suite] = {
+    "skip-tpu-ci": Suite(
+        "pr+cpu-only",
+        "CPU checks only (skip-tpu-ci)",
+        stages=(_PR_STAGE0,),
+    ),
+    "run-perf-eval": Suite(
+        "pr+perf-eval",
+        _PR_ABOUT,
+        stages=(_PR_STAGE0, ("tests", "integration", "perf", "verify")),
+    ),
+    "run-full-ci": Suite(
+        "pr+nightly-suite",
+        _PR_ABOUT,
+        stages=(_PR_STAGE0, ("tests", "integration", "perf", "verify")),
+    ),
+}
+
 
 def pr_suite(ctx: BuildContext) -> Suite:
     """PR builds (and merged skip-tpu-ci): CPU checks, then optional TPU stage."""
-    stage0 = ("build", "cpu")  # cpu steps wait on build_docker themselves
-    if ctx.skips_tpu:
-        # skip-tpu-ci drops all TPU lanes (including perf-eval), while
-        # run-full-ci still enables nightly CPU unit tests via NIGHTLY=1.
-        extras = sorted(ctx.extras & {"nightly-suite"})
-        return Suite(
-            "+".join(["pr", "cpu-only", *extras]),
-            "CPU checks only (skip-tpu-ci)",
-            stages=(stage0,),
-        )
-    tpu = ["tests", "integration"]
-    if ctx.extras:  # perf-eval or nightly-suite both add perf
-        tpu.append("perf")
-    tpu.append("verify")
-    return Suite(
-        "+".join(["pr", *sorted(ctx.extras)]),
-        "PR: TPU waits for the CPU checks",
-        stages=(stage0, tuple(tpu)),
-    )
+    if ctx.pr_suite_label is not None:
+        return _PR_SUITES[ctx.pr_suite_label]
+    return _PR_DEFAULT
 
 
 def choose_suite(ctx: BuildContext) -> Suite:
