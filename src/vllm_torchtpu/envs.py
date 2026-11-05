@@ -16,6 +16,7 @@ if TYPE_CHECKING:
     TPU_DEEPSEEK_V41_INDEXER_ISSUE_DEPTH: int | None = 8
     TPU_DEEPSEEK_V41_INDEXER_PUBLISH_ISSUE_DEPTH: int | None = 7
     TPU_DEEPSEEK_V41_MHC_RESIDENT_GATES: bool = True
+    TPU_DEEPSEEK_V41_MHC_EARLY_PREP: bool = False
     TPU_DEEPSEEK_V41_BLOCKED_ROPE_GATHER: bool = True
     TPU_DEEPSEEK_V41_CSA2_SWA_PLAN: bool = False
     TPU_DEEPSEEK_V41_FUSED_WO_AB: bool = True
@@ -457,6 +458,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # outputs are unchanged.
     "TPU_DEEPSEEK_V41_MHC_RESIDENT_GATES": env_bool(
         "TPU_DEEPSEEK_V41_MHC_RESIDENT_GATES", default=True
+    ),
+    # Shifted mHC: build the first tile's gate coefficients while the first
+    # activation tiles are still in flight (scheduling only; outputs unchanged).
+    "TPU_DEEPSEEK_V41_MHC_EARLY_PREP": env_bool(
+        "TPU_DEEPSEEK_V41_MHC_EARLY_PREP", default=False
     ),
     # Gather RoPE table rows (attention preprocessing, CSA2 inverse RoPE) as
     # 256-row gathers when a step has 257..1024 rows

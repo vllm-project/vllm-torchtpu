@@ -66,6 +66,7 @@ def shifted_post_pre_rms(
     norm_weight: jax.Array | None = None,
     norm_eps: float = 1e-06,
     unpadded_gates: bool = False,
+    early_prep: bool = False,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
     """Update residuals and collapse with incoming pre; predict gates separately.
 
@@ -81,6 +82,8 @@ def shifted_post_pre_rms(
         ``unpadded_gates`` emits the gates T tokens wide instead of padded to a
         multiple of 128 (T <= 1024), so that between layers the [T,M] views
         are transposes of the next call's [M,T] gate inputs, not slices.
+        ``early_prep`` builds tile 0's gate coefficients while the first
+        activation tiles are still in flight instead of after they land.
     """
     t, d = x.shape
     token_tile = 128 if t % 128 == 0 else 96 if t % 96 == 0 else 32
@@ -264,11 +267,13 @@ def shifted_post_pre_rms(
         def run_tile(tile_index, xr, rr, yr, vr):
             previous_projected = projection_buf[...]
 
-            @pl.when(tile_index == 0)
-            def wait_gates():
-                for copy in copies[:-1]:
-                    copy.wait()
-                prepare(0, 0)
+            if not early_prep:
+
+                @pl.when(tile_index == 0)
+                def wait_gates():
+                    for copy in copies[:-1]:
+                        copy.wait()
+                    prepare(0, 0)
 
             pre_tile = load_gate(pr, tile_index)
             slot = tile_index % 2
@@ -350,6 +355,10 @@ def shifted_post_pre_rms(
                 copy.start()
             if index == 0:
                 copies[-1].start()
+        if early_prep:
+            for copy in copies[:-1]:
+                copy.wait()
+            prepare(0, 0)
 
         def body(tile_index, unused):
             for copy in input_copies(tile_index):

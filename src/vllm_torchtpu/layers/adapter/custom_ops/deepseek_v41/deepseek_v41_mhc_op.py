@@ -80,12 +80,11 @@ def _post_pre_rms_jax(
 
 
 def _gate_layout() -> dict:
-    if not envs.TPU_DEEPSEEK_V41_MHC_RESIDENT_GATES:
-        return {}
-    return {
-        "unpadded_gates": True,
-        "gate_input_mode": shifted_post_pre_rms.GateInputMode.COMPILER,
-    }
+    layout: dict = {"early_prep": envs.TPU_DEEPSEEK_V41_MHC_EARLY_PREP}
+    if envs.TPU_DEEPSEEK_V41_MHC_RESIDENT_GATES:
+        layout["unpadded_gates"] = True
+        layout["gate_input_mode"] = shifted_post_pre_rms.GateInputMode.COMPILER
+    return layout
 
 
 def initialize_shifted_mhc() -> None:

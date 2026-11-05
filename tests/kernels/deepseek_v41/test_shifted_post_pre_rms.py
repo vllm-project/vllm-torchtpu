@@ -50,3 +50,20 @@ def test_resident_gates_are_bitwise_identical(tokens):
             np.ascontiguousarray(r).view(np.uint8),
             np.ascontiguousarray(g).view(np.uint8),
         )
+
+
+@pytest.mark.skipif("jax.default_backend() != 'tpu'", reason="TPU7x mHC kernel")
+@pytest.mark.parametrize("tokens", [96, 288, 2048])
+def test_early_prep_is_bitwise_identical(tokens):
+    args = _inputs(tokens)
+    resident = {
+        "unpadded_gates": True,
+        "gate_input_mode": mhc.GateInputMode.COMPILER,
+    }
+    ref = jax.jit(lambda *a: _layers(resident, *a))(*args)
+    got = jax.jit(lambda *a: _layers({**resident, "early_prep": True}, *a))(*args)
+    for r, g in zip(ref, got, strict=True):
+        np.testing.assert_array_equal(
+            np.ascontiguousarray(r).view(np.uint8),
+            np.ascontiguousarray(g).view(np.uint8),
+        )
