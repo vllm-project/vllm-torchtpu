@@ -329,19 +329,30 @@ def test_patch_vision_mrope_lane_swap():
     import sys
     import types
     from unittest.mock import patch
+
     from vllm_torchtpu.models.vllm.gemma4_mm_patch import (
         _lane_swap_rotate_half,
         patch_vision_mrope_lane_swap,
     )
 
     mock_siglip = types.ModuleType("transformers.models.siglip.modeling_siglip")
+    mock_gemma4 = types.ModuleType("transformers.models.gemma4.modeling_gemma4")
 
     def dummy_rotate_half(x):
         return "original_rotate_half"
 
     mock_siglip.rotate_half = dummy_rotate_half
+    mock_gemma4.rotate_half = dummy_rotate_half
 
-    with patch.dict(sys.modules, {"transformers.models.siglip.modeling_siglip": mock_siglip}):
+    with patch.dict(
+        sys.modules,
+        {
+            "transformers.models.siglip.modeling_siglip": mock_siglip,
+            "transformers.models.gemma4.modeling_gemma4": mock_gemma4,
+        },
+    ):
         patch_vision_mrope_lane_swap()
         assert mock_siglip.rotate_half == _lane_swap_rotate_half
         assert getattr(mock_siglip.rotate_half, "_is_lane_swap_patched", False)
+        assert mock_gemma4.rotate_half == _lane_swap_rotate_half
+        assert getattr(mock_gemma4.rotate_half, "_is_lane_swap_patched", False)
