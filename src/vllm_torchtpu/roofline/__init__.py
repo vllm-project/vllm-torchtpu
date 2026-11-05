@@ -65,7 +65,10 @@ from .solver import (
     build_example_scenario,
     hbm_breakdown_per_core_bytes,
     hbm_footprint_per_core_bytes,
+    max_ep_load_ratio,
+    partition_pp_layers,
     solve_serving_plan,
+    sweep_prefix_hit_crossovers,
 )
 from .step import StepFloor, spec_cycle_floor, step_floor
 
@@ -114,9 +117,12 @@ __all__ = [
     "hbm_breakdown_per_core_bytes",
     "hbm_footprint_per_core_bytes",
     "load_hf_config",
+    "max_ep_load_ratio",
+    "partition_pp_layers",
     "pass_costs",
     "plan",
     "solve_serving_plan",
+    "sweep_prefix_hit_crossovers",
     "spec_cycle_floor",
     "step_floor",
     "collective_ici_hops",

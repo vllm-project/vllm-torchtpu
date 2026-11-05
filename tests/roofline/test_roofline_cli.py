@@ -185,6 +185,137 @@ def test_plan_requires_acceptance_length_for_spec_window(tmp_path: Path) -> None
     assert excinfo.value.code != 0
 
 
+def test_cli_from_serve_and_bench_cmd_roundtrip(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    bf16_cfg_path = tmp_path / "synth_bf16_config.json"
+    bf16_cfg_path.write_text(json.dumps(QWEN35_CFG))
+    cfg_path = tmp_path / "synth_config.json"
+    cfg_path.write_text(
+        json.dumps({**QWEN35_CFG, "quantization_config": {"quant_method": "fp8"}})
+    )
+    html_path = tmp_path / "roundtrip.html"
+    rc = cli.main(
+        [
+            "solve",
+            "--from-serve-cmd",
+            (
+                f"vllm serve {bf16_cfg_path} --quantization fp8 "
+                "--kv-cache-dtype fp8 --tensor-parallel-size 8 "
+                "--data-parallel-size 1 --enable-expert-parallel "
+                "--gpu-memory-utilization 0.90 --kv-offloading-size 32"
+            ),
+            "--from-bench-cmd",
+            (
+                "vllm bench serve --dataset-name random "
+                "--random-prefix-len 3072 --random-input-len 1024 "
+                "--random-output-len 512 --max-concurrency 16"
+            ),
+            "--dcn-gbps",
+            "200",
+            "--html",
+            str(html_path),
+            "--json",
+        ]
+    )
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["scenario"]["isl"] == 4096
+    assert payload["scenario"]["osl"] == 512
+    assert payload["scenario"]["prefix_hit_rate"] == pytest.approx(0.75)
+    assert payload["scenario"]["concurrencies"] == [16]
+    assert payload["scenario"]["kv_offload_gb"] == pytest.approx(32.0)
+    assert payload["gpu_memory_utilization"] == pytest.approx(0.90)
+    assert payload["chip_spec"]["dcn_bw"] == pytest.approx(25.0e9)
+    # TP=8, DP=1 on tpu7x (2 TensorCores/chip) budgets 4 physical chips, not 8.
+    assert payload["recommended"]["total_chips"] <= 4
+    assert payload["winner_prefix_hit_range"] is not None
+    assert "sweep_candidates" not in payload
+    assert "--kv-offloading-size 32" in payload["top_k"][0]["launch"]["commands"][0]
+    html_text = html_path.read_text()
+    assert "sweep_candidates" not in html_text
+    assert "Prefix-Hit Regime" in html_text
+    assert ("crossover=" in html_text) or ("stable" in html_text)
+
+    # Sonnet dataset --sonnet-input-len already includes --sonnet-prefix-len, and
+    # direct --shared-prefix-len / --kv-offload-gb flags work standalone.
+    stable_html = tmp_path / "sonnet_direct.html"
+    rc_sonnet = cli.main(
+        [
+            "solve",
+            "--config",
+            str(cfg_path),
+            "--from-bench-cmd",
+            (
+                "vllm bench serve --dataset-name sonnet "
+                "--sonnet-input-len 550 --sonnet-prefix-len 200 "
+                "--sonnet-output-len 150 --max-concurrency 4"
+            ),
+            "--kv-offload-gb",
+            "16",
+            "--max-chips",
+            "4",
+            "--mode",
+            "mixed",
+            "--html",
+            str(stable_html),
+            "--json",
+        ]
+    )
+    assert rc_sonnet == 0
+    sonnet_payload = json.loads(capsys.readouterr().out)
+    assert sonnet_payload["scenario"]["isl"] == 550
+    assert sonnet_payload["scenario"]["prefix_hit_rate"] == pytest.approx(200.0 / 550.0)
+    assert sonnet_payload["scenario"]["kv_offload_gb"] == pytest.approx(16.0)
+    assert ("crossover=" in stable_html.read_text()) or (
+        "stable" in stable_html.read_text()
+    )
+
+    rc_direct = cli.main(
+        [
+            "solve",
+            "--config",
+            str(cfg_path),
+            "--isl",
+            "4096",
+            "--shared-prefix-len",
+            "1024",
+            "--osl",
+            "256",
+            "--concurrency",
+            "8",
+            "--max-chips",
+            "4",
+            "--json",
+        ]
+    )
+    assert rc_direct == 0
+    direct_payload = json.loads(capsys.readouterr().out)
+    assert direct_payload["scenario"]["isl"] == 4096
+    assert direct_payload["scenario"]["prefix_hit_rate"] == pytest.approx(0.25)
+
+    # R3: Generic --input-len under default random dataset adds --random-prefix-len.
+    rc_gen_rand = cli.main(
+        [
+            "solve",
+            "--config",
+            str(cfg_path),
+            "--from-bench-cmd",
+            (
+                "vllm bench serve --random-prefix-len 3072 "
+                "--input-len 1024 --output-len 256 --max-concurrency 8"
+            ),
+            "--max-chips",
+            "4",
+            "--json",
+        ]
+    )
+    assert rc_gen_rand == 0
+    gen_rand_payload = json.loads(capsys.readouterr().out)
+    assert gen_rand_payload["scenario"]["isl"] == 4096
+    assert gen_rand_payload["scenario"]["prefix_hit_rate"] == pytest.approx(0.75)
+
+
 def test_cli_module_dunder_main_help() -> None:
     py_exe = sys.executable or "python3"
     proc = subprocess.run(
@@ -195,3 +326,10 @@ def test_cli_module_dunder_main_help() -> None:
     )
     assert proc.returncode == 0
     assert "usage:" in proc.stdout.lower()
+    sp = cli._parse_serve_cmd(
+        "vllm serve org/m --max-model-len 32768 --max-num-batched-tokens 2048 "
+        '--speculative-config \'{"method":"mtp","num_speculative_tokens":3}\''
+    )
+    assert sp["max_model_len"] == 32768
+    assert sp["max_num_batched_tokens"] == 2048
+    assert sp["spec_tokens"] == 3

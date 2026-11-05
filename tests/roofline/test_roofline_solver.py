@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import json
+import time
 from dataclasses import replace as dc_replace
 from pathlib import Path
 
@@ -255,9 +256,28 @@ def test_solver_hybrid_moe_mixed_vs_disagg_and_crossover(
             topology=rf.TOPOLOGIES[p0.prefill_pool.topology],
         )
         bubble_mult = 1.0 + float(p0.prefill_pool.pp - 1) / float(n_chk)
-        assert p0.p90_ttft_ms == pytest.approx(
-            sf_st.serial_floor_s * bubble_mult * 1e3, rel=1e-4
+        chk_disagg_inf_dcn = rf.solve_serving_plan(
+            pp_geom,
+            rf.Dtypes(kv=1.0),
+            dc_replace(chip, dcn_bw=math.inf),
+            chk_scen,
+            mode="disagg",
+            max_chips=8,
         )
+        p0_inf = next(
+            p
+            for p in chk_disagg_inf_dcn.candidates
+            if p.prefill_pool is not None
+            and p.prefill_pool.pp == p0.prefill_pool.pp
+            and p.prefill_pool.pcp == p0.prefill_pool.pcp
+            and p.prefill_pool.topology == p0.prefill_pool.topology
+            and p.decode_pool.topology == p0.decode_pool.topology
+        )
+        if p0.prefill_pool.ep <= 1:
+            assert p0_inf.p90_ttft_ms == pytest.approx(
+                sf_st.serial_floor_s * bubble_mult * 1e3, rel=1e-4
+            )
+        assert p0.p90_ttft_ms > p0_inf.p90_ttft_ms
 
     hybrid_2t_cfg = {
         "text_config": {
@@ -1029,3 +1049,410 @@ def test_hbm_breakdown_dsa_indexer_weights_and_mla_gqa_parity() -> None:
     expected_idx_w = float(4 * 4096 * (64 // 4) * 128) * 1.0
     assert bd_idx.weights - bd_no_idx.weights == pytest.approx(expected_idx_w, rel=1e-6)
     assert bd_gqa_tok == bd_idx
+
+
+def test_asymmetric_pp_partition_emits_vllm_pp_layer_partition() -> None:
+    # 1. Disagg full-attention stage constraint forces uneven (7, 1) split on 8 layers
+    # and scales bottleneck stage prefill floor by 7 / 4 = 1.75x, while retaining
+    # full-attention MTP weights even though layer 0 is linear_attention.
+    asym_hybrid_cfg = {
+        "hidden_size": 4096,
+        "num_hidden_layers": 8,
+        "layer_types": ["linear_attention"] * 6 + ["full_attention"] * 2,
+        "num_attention_heads": 32,
+        "num_key_value_heads": 8,
+        "head_dim": 128,
+        "linear_num_key_heads": 16,
+        "linear_num_value_heads": 32,
+        "linear_key_head_dim": 128,
+        "linear_value_head_dim": 128,
+        "linear_conv_kernel_dim": 4,
+        "num_experts": 64,
+        "num_experts_per_tok": 4,
+        "moe_intermediate_size": 2048,
+        "intermediate_size": 1024,
+        "first_k_dense_replace": 2,
+        "vocab_size": 200000,
+        "mtp_num_hidden_layers": 2,
+    }
+    geom = rf.from_hf_config(asym_hybrid_cfg)
+    dt = rf.Dtypes(kv=1.0)
+    par_pp2 = rf.Parallel(tp=1, pp=2, pcp=2, moe="ep", ep=2)
+    part = rf.partition_pp_layers(
+        geom,
+        dt,
+        par_pp2,
+        context=4096,
+        seqs_per_dp=1,
+        disagg=True,
+    )
+    assert part == (7, 1)
+    assert "full_attention" in geom.layer_types[: part[0]]
+    assert "full_attention" in geom.layer_types[part[0] :]
+
+    # Verify solve_serving_plan wires uneven PP into PoolMeshPlan, scales TTFT by
+    # max(part) / ceil(L / pp) = 7 / 4, and emits VLLM_PP_LAYER_PARTITION=7,1.
+    chip_inf_dcn = dc_replace(rf.CHIPS["tpu7x"], dcn_bw=math.inf)
+    scen_pp = rf.TrafficScenario(
+        name="uneven-pp-disagg",
+        isl=4096,
+        osl=128,
+        prefix_hit_rate=0.0,
+        accept_len=1.0,
+        think_time_s=0.0,
+        concurrencies=(4,),
+        kv_working_set_turns=1.0,
+        prefill_chunk=4096,
+    )
+    disagg_plan = rf.solve_serving_plan(
+        geom, dt, chip_inf_dcn, scen_pp, mode="disagg", max_chips=4
+    )
+    pt_pp2 = next(
+        p
+        for p in disagg_plan.candidates
+        if p.prefill_pool is not None
+        and p.prefill_pool.pp == 2
+        and p.prefill_pool.pcp == 2
+    )
+    assert pt_pp2.prefill_pool is not None
+    assert pt_pp2.prefill_pool.pp_layer_partition == (7, 1)
+    sf_even = rf.step_floor(
+        geom,
+        chip_inf_dcn,
+        dc_replace(par_pp2, ranks_per_chip=2),
+        rf.StepShape(
+            batch=0,
+            rows_per_seq=0,
+            context=0,
+            state_writes=0,
+            prefill_tokens=4096,
+            prefix_hit_rate=0.0,
+        ),
+        dt,
+        topology=rf.TOPOLOGIES["1x2x1"],
+    )
+    # 7-layer heavy stage + EP load ratio makes TTFT strictly > 1.5x the 4-layer floor.
+    assert pt_pp2.p90_ttft_ms > sf_even.serial_floor_s * 1.5 * 1e3
+    launch = rf.point_launch_args(pt_pp2, model="org/synth-hybrid")
+    assert (
+        "VLLM_PP_LAYER_PARTITION=7,1 vllm serve org/synth-hybrid"
+        in launch["commands"][0]
+    )
+
+    # 2. Odd layer count L=13 on PP=2 picks (7, 6) instead of putting 7 layers on
+    # the heavy lm_head + MTP stage, while L=12 uniform stays (6, 6) without env prefix.
+    odd_geom = dc_replace(
+        geom,
+        num_layers=13,
+        layer_types=("full_attention",) * 13,
+    )
+    odd_plan = rf.solve_serving_plan(
+        odd_geom, dt, chip_inf_dcn, scen_pp, mode="disagg", max_chips=4
+    )
+    pt_odd = next(
+        p
+        for p in odd_plan.candidates
+        if p.prefill_pool is not None and p.prefill_pool.pp == 2
+    )
+    assert pt_odd.prefill_pool is not None
+    assert pt_odd.prefill_pool.pp_layer_partition == (7, 6)
+    odd_launch = rf.point_launch_args(pt_odd, model="org/synth-odd")
+    assert "VLLM_PP_LAYER_PARTITION=7,6" in odd_launch["commands"][0]
+
+    even_geom = dc_replace(geom, num_layers=12, layer_types=("full_attention",) * 12)
+    even_plan = rf.solve_serving_plan(
+        even_geom, dt, chip_inf_dcn, scen_pp, mode="disagg", max_chips=4
+    )
+    pt_even = next(
+        p
+        for p in even_plan.candidates
+        if p.prefill_pool is not None and p.prefill_pool.pp == 2
+    )
+    assert pt_even.prefill_pool is not None
+    assert pt_even.prefill_pool.pp_layer_partition is None
+    assert (
+        "VLLM_PP_LAYER_PARTITION"
+        not in rf.point_launch_args(pt_even, model="org/synth-even")["commands"][0]
+    )
+
+    # 3. Direct unit check on max_ep_load_ratio boundary and decay.
+    assert rf.max_ep_load_ratio(0, 8) == 1.0
+    assert rf.max_ep_load_ratio(64, 1) == 1.0
+    r_small = rf.max_ep_load_ratio(16, 8)
+    r_large = rf.max_ep_load_ratio(4096, 8)
+    assert 1.0 < r_large < r_small <= 8.0
+
+
+def test_prefill_logit_hbm_bound_and_disagg_dcn_transfer_floor() -> None:
+    large_vocab_cfg = {
+        "hidden_size": 2048,
+        "num_hidden_layers": 8,
+        "num_attention_heads": 16,
+        "num_key_value_heads": 4,
+        "head_dim": 128,
+        "intermediate_size": 4096,
+        "vocab_size": 262144,
+        "mtp_num_hidden_layers": 3,
+    }
+    geom = rf.from_hf_config(large_vocab_cfg)
+    dt = rf.Dtypes(w_dense=1.0, lm_head=2.0, kv=1.0, act="a16")
+    # At b_res=1, TP1 weights + KV + MTP (~2.87 GB) fit inside 2.91 GB, while the
+    # active-chunk hidden tensor + sampled-row vocab logits (~69 MB) push TP1 past
+    # 2.91 GB without falsely charging 8.59 GB (chunk_rows * vocab) at 4.0 GB!
+    bd_tp1 = rf.hbm_breakdown_per_core_bytes(
+        geom, dt, rf.Parallel(tp=1), 1, 16384 + 128
+    )
+    tight_hbm = int(bd_tp1.total + 30_000_000)
+    tight_chip = dc_replace(rf.CHIPS["tpu7x"], hbm_bytes=tight_hbm)
+    scen_big_chunk = rf.TrafficScenario(
+        name="logit-oom-check",
+        isl=16384,
+        osl=128,
+        prefix_hit_rate=0.0,
+        accept_len=4.0,
+        think_time_s=0.0,
+        concurrencies=(1,),
+        kv_working_set_turns=1.0,
+        prefill_chunk=16384,
+    )
+    plan_tight = rf.solve_serving_plan(
+        geom,
+        dt,
+        tight_chip,
+        scen_big_chunk,
+        mode="mixed",
+        max_chips=4,
+        gpu_memory_utilization=1.0,
+    )
+    assert len(plan_tight.candidates) > 0
+    assert all(p.decode_pool.tp >= 2 for p in plan_tight.candidates)
+
+    # Verify TP1 IS admitted at 4.0 GB because compute_selected_logits gathers
+    # sampled_rows before lm_head rather than materializing [chunk_rows, vocab].
+    roomy_chip = dc_replace(rf.CHIPS["tpu7x"], hbm_bytes=4_000_000_000)
+    plan_roomy = rf.solve_serving_plan(
+        geom,
+        dt,
+        roomy_chip,
+        scen_big_chunk,
+        mode="mixed",
+        max_chips=4,
+        gpu_memory_utilization=1.0,
+    )
+    assert any(p.decode_pool.tp == 1 for p in plan_roomy.candidates)
+
+    chip_fast_dcn = dc_replace(rf.CHIPS["tpu7x"], dcn_bw=50.0e9)
+    chip_slow_dcn = dc_replace(rf.CHIPS["tpu7x"], dcn_bw=1.25e9)
+    disagg_fast = rf.solve_serving_plan(
+        geom, dt, chip_fast_dcn, scen_big_chunk, mode="disagg", max_chips=4
+    )
+    disagg_slow = rf.solve_serving_plan(
+        geom, dt, chip_slow_dcn, scen_big_chunk, mode="disagg", max_chips=4
+    )
+    assert disagg_fast.recommended is not None and disagg_slow.recommended is not None
+    assert (
+        disagg_slow.recommended.p90_ttft_ms > disagg_fast.recommended.p90_ttft_ms + 5.0
+    )
+
+
+def test_prefix_hit_crossover_sweep_under_50ms_and_pcie_offload() -> None:
+    chip = rf.CHIPS["tpu7x"]
+    geom = rf.from_hf_config(QWEN35_CFG)
+    dt = rf.Dtypes(kv=1.0, state=2.0)
+    scen_no_offload = rf.TrafficScenario(
+        name="offload-compare",
+        isl=32768,
+        osl=512,
+        prefix_hit_rate=0.90,
+        accept_len=1.0,
+        think_time_s=0.0,
+        concurrencies=(32,),
+        kv_working_set_turns=20.0,
+        kv_offload_gb=0.0,
+    )
+    scen_offload = dc_replace(scen_no_offload, kv_offload_gb=64.0)
+
+    def _cold_sweep(
+        plan_obj: rf.ServingPlan, repeats: int = 3
+    ) -> tuple[tuple[float, float] | None, float | None, float]:
+        best_ms = math.inf
+        last_res: tuple[tuple[float, float] | None, float | None] = (None, None)
+        for _ in range(repeats):
+            rf.solver._EP_BUSIEST_CACHE.clear()
+            rf.solver._ep_z_unit.cache_clear()
+            rf.solver._coll_spec.cache_clear()
+            rf.solver._make_draft_geom.cache_clear()
+            rf.solver._classify_layers_cached.cache_clear()
+            rf.hbm_breakdown_per_core_bytes.cache_clear()
+            t0 = time.perf_counter()
+            last_res = rf.sweep_prefix_hit_crossovers(geom, dt, chip, plan_obj)
+            best_ms = min(best_ms, (time.perf_counter() - t0) * 1e3)
+        return last_res[0], last_res[1], best_ms
+
+    plan_off = rf.solve_serving_plan(
+        geom, dt, chip, scen_offload, mode="auto", max_chips=8
+    )
+    assert len(plan_off.candidates) > len(plan_off.frontier)
+    win_range, cross_rate, sweep_ms = _cold_sweep(plan_off)
+    assert sweep_ms < 50.0
+    assert win_range is not None
+    assert 0.0 <= win_range[0] <= 0.90 <= win_range[1] <= 0.95
+    assert plan_off.winner_prefix_hit_range == win_range
+    assert plan_off.prefix_hit_crossover_rate == cross_rate
+    solve_payload = rf.build_solve_payload(plan_off, chip=chip, dtypes=dt)
+    assert "sweep_candidates" not in solve_payload
+
+    # Verify full-candidate sweep agrees with a fresh solve_serving_plan at h=0.0.
+    plan_h0 = rf.solve_serving_plan(
+        geom,
+        dt,
+        chip,
+        dc_replace(scen_offload, prefix_hit_rate=0.0),
+        mode="auto",
+        max_chips=8,
+    )
+    assert plan_h0.recommended is not None and plan_off.recommended is not None
+    if (
+        plan_h0.recommended.mode,
+        plan_h0.recommended.decode_pool.topology,
+        plan_h0.recommended.decode_pool.tp,
+    ) != (
+        plan_off.recommended.mode,
+        plan_off.recommended.decode_pool.topology,
+        plan_off.recommended.decode_pool.tp,
+    ):
+        assert cross_rate is not None
+        assert win_range[0] > 0.0
+
+    plan_no = rf.solve_serving_plan(
+        geom, dt, chip, scen_no_offload, mode="mixed", max_chips=4
+    )
+    plan_yes = rf.solve_serving_plan(
+        geom, dt, chip, scen_offload, mode="mixed", max_chips=4
+    )
+    pt_no = next(p for p in plan_no.candidates if p.decode_pool.tp == 8)
+    pt_yes = next(p for p in plan_yes.candidates if p.decode_pool.tp == 8)
+    # 64 GiB summed across TP=8 adds exactly 8 GiB per rank / b_kv_phys_core tokens.
+    b_kv_core = rf.hbm_footprint_per_core_bytes(
+        geom, dt, rf.Parallel(tp=8, moe="ep"), 1, 1
+    ) - rf.hbm_footprint_per_core_bytes(geom, dt, rf.Parallel(tp=8, moe="ep"), 1, 0)
+    expected_delta_tok = int((64.0 * float(1 << 30) / 8.0) / b_kv_core)
+    assert pt_yes.kv_cache_capacity_tokens is not None
+    assert pt_no.kv_cache_capacity_tokens is not None
+    assert (
+        abs(
+            (pt_yes.kv_cache_capacity_tokens - pt_no.kv_cache_capacity_tokens)
+            - expected_delta_tok
+        )
+        <= 2
+    )
+    # Slower PCIe increases TTFT on both mixed and disagg pools when host
+    # offload hits read over PCIe.
+    slow_pcie_plan = rf.solve_serving_plan(
+        geom,
+        dt,
+        dc_replace(chip, pcie_bw=4.0e9),
+        scen_offload,
+        mode="mixed",
+        max_chips=4,
+    )
+    pt_slow_pcie = next(p for p in slow_pcie_plan.candidates if p.decode_pool.tp == 8)
+    assert pt_slow_pcie.p90_ttft_ms > pt_yes.p90_ttft_ms
+
+    disagg_fast_pcie = rf.solve_serving_plan(
+        geom, dt, chip, scen_offload, mode="disagg", max_chips=8
+    )
+    disagg_slow_pcie = rf.solve_serving_plan(
+        geom,
+        dt,
+        dc_replace(chip, pcie_bw=4.0e9),
+        scen_offload,
+        mode="disagg",
+        max_chips=8,
+    )
+    assert (
+        disagg_fast_pcie.recommended is not None
+        and disagg_slow_pcie.recommended is not None
+    )
+    assert (
+        disagg_slow_pcie.recommended.p90_ttft_ms
+        > disagg_fast_pcie.recommended.p90_ttft_ms
+    )
+
+    emitted = rf.emit_launch_args(plan_yes, dtypes=dt, model="org/synth-moe")
+    assert "sweep_candidates" not in emitted["serving_plan"]
+    assert "--kv-offloading-size" in emitted["cli_args"]
+    idx = emitted["cli_args"].index("--kv-offloading-size")
+    assert emitted["cli_args"][idx + 1] == "64"
+
+    # R1: TTFT-SLO filtering at h0=0.0 must still evaluate full HBM-fit candidates
+    # across higher hit rates where prefill shrinks under the TTFT SLO.
+    scen_probe = rf.TrafficScenario(
+        name="slo-crossover-probe",
+        isl=8192,
+        osl=256,
+        prefix_hit_rate=0.0,
+        accept_len=1.0,
+        think_time_s=0.0,
+        concurrencies=(8, 32),
+        kv_working_set_turns=1.0,
+    )
+    probe_h0 = rf.solve_serving_plan(
+        geom, dt, chip, scen_probe, mode="mixed", max_chips=4
+    )
+    probe_h95 = rf.solve_serving_plan(
+        geom,
+        dt,
+        chip,
+        dc_replace(scen_probe, prefix_hit_rate=0.95),
+        mode="mixed",
+        max_chips=4,
+    )
+    assert probe_h0.recommended is not None and probe_h95.recommended is not None
+    mid_ttft_slo = 0.5 * (
+        probe_h0.recommended.p90_ttft_ms + probe_h95.recommended.p90_ttft_ms
+    )
+    scen_slo = dc_replace(scen_probe, ttft_slo_ms=mid_ttft_slo)
+    plan_slo_h0 = rf.solve_serving_plan(
+        geom, dt, chip, scen_slo, mode="mixed", max_chips=4
+    )
+    plan_slo_h95 = rf.solve_serving_plan(
+        geom,
+        dt,
+        chip,
+        dc_replace(scen_slo, prefix_hit_rate=0.95),
+        mode="mixed",
+        max_chips=4,
+    )
+    assert plan_slo_h0.recommended is not None and plan_slo_h95.recommended is not None
+    if (
+        plan_slo_h0.recommended.decode_pool.tp,
+        plan_slo_h0.recommended.concurrency,
+    ) != (
+        plan_slo_h95.recommended.decode_pool.tp,
+        plan_slo_h95.recommended.concurrency,
+    ):
+        assert plan_slo_h0.prefix_hit_crossover_rate is not None
+        assert plan_slo_h0.winner_prefix_hit_range is not None
+        assert plan_slo_h0.winner_prefix_hit_range[1] < 0.95
+
+    # R2: Built-in multi-concurrency scenarios stay under 50 ms cold at 8 and 16 chips.
+    for ex_name, n_chips in (
+        ("coding-agent", 8),
+        ("chat-8k1k", 16),
+        ("reasoning-1k8k", 16),
+    ):
+        ex_scen = rf.build_example_scenario(ex_name)
+        ex_plan = rf.solve_serving_plan(
+            geom, dt, chip, ex_scen, mode="auto", max_chips=n_chips
+        )
+        ex_range, _ex_cross, ex_ms = _cold_sweep(ex_plan)
+        assert ex_ms < 50.0
+        assert ex_range is not None
+        if ex_name == "chat-8k1k":
+            ex_uncached = dc_replace(ex_plan, sweep_candidates=())
+            fb_range, fb_cross, _ = _cold_sweep(ex_uncached, repeats=1)
+            assert (fb_range, fb_cross) == (
+                ex_plan.winner_prefix_hit_range,
+                ex_plan.prefix_hit_crossover_rate,
+            )
