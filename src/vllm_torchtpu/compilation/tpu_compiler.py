@@ -345,6 +345,9 @@ _RUNTIME_CACHE_KEY_PATHS = (
     # K3 custom-op registration, sharding, and Attention Residual bridges.
     "vllm_torchtpu/models/vllm/kimi_k3/collective_ops.py",
     "vllm_torchtpu/models/vllm/kimi_k3/layers.py",
+    # Gemma 4 zigzag context-parallel prefill Pallas kernels and custom ops.
+    "vllm_torchtpu/models/vllm/gemma4/cp_attention.py",
+    "vllm_torchtpu/models/vllm/gemma4/cp_prefill.py",
 )
 
 # vLLM-Omni diffusion code, dropped from the hashed set above. Diffusion

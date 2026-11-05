@@ -21,6 +21,8 @@ from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     TPU_ATTN_MOE_OVERLAP: bool = False
+    TPU_GEMMA4_CP_MIN_TOKENS: int = 0
+    TPU_GEMMA4_SEQUENCE_PARALLEL: bool = True
     TPU_K3_SP_PREFILL: bool = False
     TPU_DCP_MLA_TOPK_CAP: int = 0
     TPU_DCP_MLA_TOPK_CAP_CHUNK: int = 256
@@ -446,6 +448,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # post-attention norm and router gate on the token shard, and fold the
     # attention partial sum into the MoE all-reduce. Default MoE path only.
     "TPU_ATTN_MOE_OVERLAP": env_bool("TPU_ATTN_MOE_OVERLAP", default=False),
+    # Minimum token bucket size for Gemma 4 zigzag context-parallel prefill
+    # over the TP group (0 = disabled).
+    "TPU_GEMMA4_CP_MIN_TOKENS": env_int("TPU_GEMMA4_CP_MIN_TOKENS", 0),
+    # Gemma 4 sequence-parallel residual stream at TP > 1 on large prefill
+    # token buckets. Set to 0 to disable.
+    "TPU_GEMMA4_SEQUENCE_PARALLEL": env_bool(
+        "TPU_GEMMA4_SEQUENCE_PARALLEL", default=True
+    ),
     # Opt in to K3 TP32/EP32 sequence-parallel prefill.
     "TPU_K3_SP_PREFILL": env_bool("TPU_K3_SP_PREFILL", default=False),
     # DCP sparse MLA (SparseCore cache layout): gather and attend this many
