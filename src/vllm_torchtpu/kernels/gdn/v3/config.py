@@ -232,6 +232,12 @@ class GDNConfig:
     DEFAULT_VMEM_FRACTION = 0.7
     WINDOWED_VMEM_FRACTION = 0.9
 
+    # Verify-window tiles read each state through its own buffer and write
+    # their checkpoints to a separate one (memory_ref.create_allocs). False
+    # keeps one in-out buffer per state, whose next fetch waits for the
+    # previous tile's write-back.
+    SPLIT_BATCHED_STATE_IO = True
+
     def get_vmem_limit_bytes(self) -> int:
         tpu_info = pltpu.get_tpu_info()
         fraction = (
