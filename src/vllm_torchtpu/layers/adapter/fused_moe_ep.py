@@ -216,6 +216,18 @@ def _build_op(
             sc_prepush=envs.MOE_FUSED_EP_PUSH_SC_PREPUSH,
             tc_exchange=envs.MOE_FUSED_EP_PUSH_TC_EXCHANGE,
             height_rungs_override=envs.MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE,
+            tail_barrier=envs.MOE_FUSED_EP_PUSH_TAIL_BARRIER,
+            onehot_slots=envs.MOE_FUSED_EP_PUSH_ONEHOT_SLOTS,
+            hbm_staging=envs.MOE_FUSED_EP_PUSH_HBM_STAGING,
+            dispatch_ahead=envs.MOE_FUSED_EP_PUSH_DISPATCH_AHEAD,
+            matmul_scale_repeat=envs.MOE_FUSED_EP_PUSH_MATMUL_SCALE_REPEAT,
+            exchange_row_gather=envs.MOE_FUSED_EP_PUSH_EXCHANGE_ROW_GATHER,
+            bf16_sort_counts=envs.MOE_FUSED_EP_PUSH_BF16_SORT_COUNTS,
+            slim_prepush_barrier=envs.MOE_FUSED_EP_PUSH_SLIM_PREPUSH_BARRIER,
+            fused_dispatch_meta=envs.MOE_FUSED_EP_PUSH_FUSED_DISPATCH_META,
+            table_kernel=envs.MOE_FUSED_EP_PUSH_TABLE_KERNEL,
+            exchange_tables=envs.MOE_FUSED_EP_PUSH_EXCHANGE_TABLES,
+            kernel_plan_tables=envs.MOE_FUSED_EP_PUSH_KERNEL_PLAN_TABLES,
         )
 
     preprocess_topology = prepare_moe_preprocessing(mesh)
