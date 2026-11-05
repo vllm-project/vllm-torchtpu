@@ -113,7 +113,7 @@ if TYPE_CHECKING:
     TPU_PP_LAZY_PUSH: bool = False
     TPU_PP_HANDOFF: str = "wave"
     TPU_PP_RING_DEPTH: int = 2
-    TPU_ROPE_CACHE_TRUNCATE: bool = False
+    TPU_ROPE_CACHE_TRUNCATE: bool = True
     TPU_ROPE_CACHE_ROW_MAJOR: bool = False
     TPU_MOE_HASH_TABLE_ROW_MAJOR: bool = False
     TPU_PARALLEL_PRECOMPILE: bool = False
@@ -838,7 +838,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_DSV4_ATTN_INTRA_CHIP_TP": env_bool("TPU_DSV4_ATTN_INTRA_CHIP_TP"),
     # Slice the rotary cos_sin caches to max model len at load to
     # minimize xla layout data copy overhead. Text-only.
-    "TPU_ROPE_CACHE_TRUNCATE": env_bool("TPU_ROPE_CACHE_TRUNCATE"),
+    "TPU_ROPE_CACHE_TRUNCATE": env_bool("TPU_ROPE_CACHE_TRUNCATE", default=True),
     # Materialize the rotary cos_sin caches with a row-major ({1,0}) device
     # layout at load, May cost more HBM due to padding.
     "TPU_ROPE_CACHE_ROW_MAJOR": env_bool("TPU_ROPE_CACHE_ROW_MAJOR", default=False),
