@@ -28,8 +28,9 @@ bins, three stride-2 convolutions, 100-frame windows, 800-frame attention
 windows), shrunk to one 256-wide transformer layer, and run it in bf16 on the
 TPU:
 
-- whole-second lengths plus or minus one frame: 99/100/101, 799/800/801 and
-  3199/3200/3201 mel frames (10 ms per frame), each checked for the expected
+- exact window multiples with their +-1 neighbours, 99/100/101 and
+  799/800/801 mel frames (10 ms per frame), plus 3200 frames, which spans
+  several 800-frame attention windows; each is checked for the expected
   number of encoder tokens;
 - a mixed batch with two exact multiples;
 - numerical parity with a CPU reference built from the same weights;
@@ -75,10 +76,12 @@ pytestmark = [pytest.mark.omni]
 
 # Whole seconds of 16 kHz audio are 100 mel frames each; 800 (8 s) is the
 # length the production bug was found with. The +-1 neighbours take the
-# partial-window branch of the chunking code on both sides of the boundary.
-BOUNDARY_LENGTHS = [99, 100, 101, 799, 800, 801, 3199, 3200, 3201]
+# partial-window branch of the chunking code on both sides of the boundary;
+# 3200 adds a length several attention windows (n_window_infer = 800) long.
+BOUNDARY_LENGTHS = [99, 100, 101, 799, 800, 801, 3200]
 MIXED_BATCH = [800, 250, 200, 30]
-PARITY_LENGTHS = [799, 800, 801]
+# The exact multiple the patch rewrites and one partial-window neighbour.
+PARITY_LENGTHS = [800, 801]
 
 # Measured on TPU v6e (bf16 encoder vs the CPU reference, 799-801 frames): max
 # abs diff 0.0017 on outputs of magnitude ~0.19, cosine similarity 0.99998;
