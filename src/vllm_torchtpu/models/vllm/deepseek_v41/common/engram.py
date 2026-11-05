@@ -11,6 +11,7 @@ from contextlib import ExitStack
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, cast
 
+import jax
 import numpy as np
 import torch
 from vllm.config import get_current_vllm_config_or_none
@@ -347,11 +348,40 @@ def _fused_hash_op():
             get_pallas_op_mesh,
         )
 
-        def call(*args):
-            depth, block_size, pad_id, dead_id, use_cache = args[12:]
+        # jax_op requires every argument named and annotated.
+        def call(
+            token_map: jax.Array,
+            limbs: jax.Array,
+            primes: jax.Array,
+            offsets: jax.Array,
+            input_ids: jax.Array,
+            positions: jax.Array,
+            query_start_loc: jax.Array,
+            dead_mask: jax.Array,
+            lookback_token_ids: jax.Array,
+            lookback_dead_mask: jax.Array,
+            cache: jax.Array,
+            block_table: jax.Array,
+            lookback_depth: int,
+            block_size: int,
+            pad_id: int,
+            dead_id: int,
+            use_cache: bool,
+        ) -> jax.Array:
             return engram_hash(
-                *args[:12],
-                lookback_depth=depth,
+                token_map,
+                limbs,
+                primes,
+                offsets,
+                input_ids,
+                positions,
+                query_start_loc,
+                dead_mask,
+                lookback_token_ids,
+                lookback_dead_mask,
+                cache,
+                block_table,
+                lookback_depth=lookback_depth,
                 block_size=block_size,
                 pad_id=pad_id,
                 dead_id=dead_id,
