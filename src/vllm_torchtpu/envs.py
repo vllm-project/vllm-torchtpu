@@ -20,6 +20,7 @@ if TYPE_CHECKING:
     TPU_K3_SP_PREFILL: bool = False
     TPU_INCREMENTAL_BLOCK_TABLE_UPLOAD: bool = True
     TPU_ONEHOT_TABLE_LOOKUP: bool = True
+    TPU_INLINE_DEDUPLICATED_CALLS: bool = True
     TPU_VERIFY_INCREMENTAL_BLOCK_TABLE: bool = False
     LIBTPU_INIT_ARGS: str = ""
     JAX_PLATFORMS: str = ""
@@ -473,6 +474,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # starts) by token as a one-hot sum instead of a gather or a bucketize
     # (`layers/core/table_lookup.py`). Integer-exact.
     "TPU_ONEHOT_TABLE_LOOKUP": env_bool("TPU_ONEHOT_TABLE_LOOKUP", default=True),
+    # Compile without libtpu's deduplicated calls (--xla_tpu_enable_deduplicated_calls=
+    # false). With them, a program of many identical layers calls shared functions
+    # from every layer; when one layer's functions exceed the instruction region,
+    # each layer reloads its code (env_override.py). Code layout only.
+    "TPU_INLINE_DEDUPLICATED_CALLS": env_bool(
+        "TPU_INLINE_DEDUPLICATED_CALLS", default=True
+    ),
     # Debug: on every incremental step, rebuild the full packed table on the
     # host and check it against the device-resident copy (raises on mismatch).
     "TPU_VERIFY_INCREMENTAL_BLOCK_TABLE": env_bool(
