@@ -967,6 +967,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # MOE_FUSED_EP_KERNEL_IMPL=push with TABLE_KERNEL=1: the SparseCore
     # pre-push carries the lightest experts instead of the heaviest; the rest
     # most rows first (1) or rising to the heaviest and falling back (2).
+    # Layers with fewer than 16 local slots keep the default order.
     "MOE_FUSED_EP_PUSH_LIGHT_PREPUSH": env_int("MOE_FUSED_EP_PUSH_LIGHT_PREPUSH", 0),
     # MOE_FUSED_EP_KERNEL_IMPL=push: run the layer's FP8 shared expert (the
     # fused kernel of TPU_DEEPSEEK_V41_FUSED_SHARED_EXPERT) inside the MoE op,

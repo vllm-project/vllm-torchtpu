@@ -114,6 +114,10 @@ logger = init_logger(__name__)
 # (e.g. 192 experts) is lowered as an all-reduce, ~3x slower than the
 # all-gather an aligned one gets.
 EXCHANGE_WIDTH_ALIGN = 128
+# light_prepush applies from this many local slots up: the heavy experts it
+# takes off the pre-push need visits to arrive in (at DP16 the 9-slot kernel
+# lost ~20 us a call with it while the 25-slot kernel held its time).
+LIGHT_PREPUSH_MIN_SLOTS = 16
 
 
 def _exchange_layout(t_local, topk, e_total, quantized):
@@ -528,6 +532,8 @@ def fused_ep_moe_push(
         raise ValueError(f"light_prepush is 0, 1 or 2; got {light_prepush}")
     if light_prepush and not table_kernel:
         raise ValueError("light_prepush orders the visits in the table kernel")
+    if g_local < LIGHT_PREPUSH_MIN_SLOTS:
+        light_prepush = 0
     if table_kernel and interleave_visits:
         raise ValueError("table_kernel builds the most-rows-first visit order only")
     if early_row_gather and not exchange_row_gather:
