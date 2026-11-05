@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     TPU_ATTN_MOE_OVERLAP: bool = False
+    TPU_DCP_DUPLICATE_O_PROJ: bool = False
     TPU_K3_SP_PREFILL: bool = False
     TPU_DCP_MLA_TOPK_CAP: int = 0
     TPU_DCP_MLA_TOPK_CAP_CHUNK: int = 256
@@ -471,6 +472,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # lane-padded tiles cost a broadcast init, a relayout copy and padded
     # copies through the LSE merge. Bit-identical outputs.
     "TPU_MLA_SPARSE_SPLIT_Q": env_bool("TPU_MLA_SPARSE_SPLIT_Q", default=False),
+    # Duplicate o_proj across DCP ranks to skip the post-attention DCP
+    # reduce-scatter on supported MLA (--dcp-q-replicate and FP8 o_proj)
+    # and GQA (Qwen3-Next / Qwen3.5 full-attention layers with 1 KV head per
+    # rank and prefill_context_parallel_size == 1) layers.
+    "TPU_DCP_DUPLICATE_O_PROJ": env_bool("TPU_DCP_DUPLICATE_O_PROJ", default=False),
     # QK pair-blocked GDN conv layout for Raiden transfers.  Not supported
     # with the unified GDN state pool: its kernel reads segment-major
     # [Q | K | V] conv rows, so the pool manifest rejects this flag.  Must

@@ -134,6 +134,7 @@ def test_rs_bf16_flag_sets_the_reduce_scatter_dtype(enabled, monkeypatch):
         enabled,
         raising=False,
     )
+    monkeypatch.setattr(cp_mla.envs, "TPU_DCP_LSE_MERGE_A2A", False)
     outputs, lses = _partials(np.random.default_rng(5), 4)
     outputs = outputs.to(torch.bfloat16)
     group = _FakeGroup(outputs, lses, 0)
@@ -178,6 +179,7 @@ def test_glm52_fp8_default_reduce_scatters_in_bf16(monkeypatch):
     """GLM-5.2-FP8 (bf16 activations, 64 heads, kv_lora_rank 512) at DCP=16:
     with the flag at its default, the merge passes rs_dtype=bf16."""
     monkeypatch.delenv("TPU_DCP_RS_OUT_PRECISION", raising=False)
+    monkeypatch.setattr(cp_mla.envs, "TPU_DCP_LSE_MERGE_A2A", False)
     dcp, heads, kv_lora_rank = 16, 64, 512
     outputs, lses = _partials(
         np.random.default_rng(52),
@@ -206,6 +208,94 @@ def test_glm52_fp8_default_reduce_scatters_in_bf16(monkeypatch):
         _reference_merge(outputs.float(), lses)[:, 12:16],
         rtol=2e-2,
         atol=2e-2,
+    )
+
+
+@pytest.mark.parametrize("dcp_size", [2, 8])
+def test_projecting_before_the_merge_and_narrow_scale(dcp_size, monkeypatch):
+    rng = np.random.default_rng(20261009)
+    outputs, lses = _partials(rng, dcp_size, empty=((0, 1), (dcp_size - 1, 5)))
+    heads, vdim = outputs.shape[2], outputs.shape[3]
+    w_uv = torch.from_numpy(
+        (rng.standard_normal((heads, vdim, 8)) / 8).astype(np.float32)
+    )
+    projected = torch.stack(
+        [cp_mla.project_uv_heads(outputs[r], w_uv, None) for r in range(dcp_size)]
+    )
+    got = _merge_whole(projected, lses, monkeypatch).numpy()
+    want = np.einsum(
+        "thv,hvd->thd", _reference_merge(outputs, lses), w_uv.double().numpy()
+    )
+    np.testing.assert_allclose(got, want, rtol=1e-5, atol=1e-5)
+
+    p_bf16, w_bf16 = outputs[0].to(torch.bfloat16), w_uv.to(torch.bfloat16)
+    exact64 = cp_mla.project_uv_heads(p_bf16, w_bf16, None).double().numpy()
+    narrow = cp_mla.project_uv_heads(p_bf16, w_bf16, None, out_dtype=torch.bfloat16)
+    assert narrow.dtype == torch.bfloat16
+    assert (
+        np.abs(narrow.double().numpy() - exact64) <= 2.0**-8 * np.abs(exact64) + 1e-6
+    ).all()
+
+    scale = torch.from_numpy(rng.uniform(0.5, 2.0, (heads, 1, 8)).astype(np.float32))
+    np.testing.assert_allclose(
+        cp_mla.project_uv_heads(outputs[0], w_uv, scale).numpy(),
+        cp_mla.project_uv_heads(outputs[0], w_uv * scale, None).numpy(),
+        rtol=1e-5,
+        atol=1e-5,
+    )
+    torch.testing.assert_close(
+        cp_mla.project_uv_heads(p_bf16, w_bf16, scale, out_dtype=torch.bfloat16),
+        cp_mla.project_uv_heads(p_bf16, w_bf16, scale).to(torch.bfloat16),
+    )
+
+
+@pytest.mark.parametrize(
+    "rs_bf16, is_backbone, want",
+    [
+        (True, True, torch.bfloat16),
+        (True, False, torch.float32),
+        (False, True, torch.float32),
+    ],
+)
+def test_a_projected_partial_crosses_in_the_wire_dtype(
+    rs_bf16, is_backbone, want, monkeypatch
+):
+    monkeypatch.setattr(cp_mla.envs, "TPU_DCP_RS_OUT_PRECISION", rs_bf16)
+    monkeypatch.setattr(cp_mla.envs, "TPU_DCP_LSE_MERGE_A2A", False)
+    outputs, lses = _partials(np.random.default_rng(12), 4)
+    group = _FakeGroup(outputs, lses, 0)
+    seen, inner = [], group.reduce_scatter
+    group.reduce_scatter = lambda t, dim=-1: seen.append(t.dtype) or inner(t, dim)
+    monkeypatch.setattr(cp_mla, "get_dcp_group", lambda: group)
+    got = cp_mla.merge_lse_partials_scatter_heads(
+        outputs[0], lses[0], is_backbone=is_backbone, wire_dtype=torch.bfloat16
+    )
+    assert seen == [want] and got.dtype == torch.float32
+
+
+@pytest.mark.parametrize("chunk,dcp_size", [(3, 2), (8, 8)])
+def test_unscattered_terms_sum_to_the_merge(dcp_size, chunk, monkeypatch):
+    outputs, lses = _partials(np.random.default_rng(20261017), dcp_size, empty=[(0, 1)])
+    outputs[0, 1] = float("nan")
+    total = torch.zeros(())
+    for rank in range(dcp_size):
+        monkeypatch.setattr(
+            cp_mla, "get_dcp_group", lambda r=rank: _FakeGroup(outputs, lses, r)
+        )
+        pieces = cp_mla.weight_lse_partials(
+            outputs[rank], lses[rank], torch.float8_e4m3fn, chunk
+        )
+        assert [q.shape[0] for q, _ in pieces] == [
+            len(c) for c in torch.arange(outputs.shape[1]).split(chunk)
+        ]
+        total = total + torch.cat([q.float() * s for q, s in pieces]).view(
+            outputs.shape[1:]
+        )
+    want = _reference_merge(outputs.nan_to_num(0.0), lses)
+    peak = outputs.nan_to_num(0.0).abs().amax(dim=(0, 2, 3)).numpy()
+    np.testing.assert_array_less(
+        np.abs(total.numpy() - want),
+        np.broadcast_to(dcp_size * peak[:, None, None] / 16, want.shape),
     )
 
 
@@ -362,15 +452,23 @@ class _A2AGroup:
         return recv
 
 
-def _a2a_merge_whole(outputs, lses, monkeypatch, wrong_destination=False):
+def _a2a_merge_whole(
+    outputs, lses, monkeypatch, wrong_destination=False, send_dtype=None, sent=None
+):
     """Every rank's all-to-all merge, run in lockstep, reassembled over heads."""
-    monkeypatch.setattr(cp_mla, "_all_to_all", lambda x, group: group.all_to_all(x))
+
+    def exchange(x, group):
+        if sent is not None:
+            sent.append(x.dtype)
+        return group.all_to_all(x)
+
+    monkeypatch.setattr(cp_mla, "_all_to_all", exchange)
     world = outputs.shape[0]
     hub = _ExchangeHub(world, wrong_destination)
 
     def run(rank):
         return cp_mla.merge_lse_partials_all_to_all(
-            outputs[rank], lses[rank], _A2AGroup(hub, rank)
+            outputs[rank], lses[rank], _A2AGroup(hub, rank), send_dtype=send_dtype
         )
 
     with concurrent.futures.ThreadPoolExecutor(world) as pool:
@@ -481,7 +579,7 @@ def test_merge_picks_the_all_to_all(
     monkeypatch.setattr(
         cp_mla,
         "merge_lse_partials_all_to_all",
-        lambda o, lse, g: calls.append(o.shape[0]) or o[:, :2],
+        lambda o, lse, g, **kw: calls.append(o.shape[0]) or o[:, :2],
     )
     outputs, lses = _partials(np.random.default_rng(3), 2, tokens=tokens, vdim=4)
     group = _FakeGroup(outputs, lses, 0)
@@ -490,6 +588,29 @@ def test_merge_picks_the_all_to_all(
         outputs[0], lses[0], is_backbone=is_backbone
     )
     assert calls == ([tokens] if expect_a2a else [])
+
+
+@pytest.mark.parametrize("dcp_size", [2, 8])
+def test_a_projected_all_to_all_merge_in_bf16_matches_the_reference(
+    dcp_size, monkeypatch
+):
+    rng = np.random.default_rng(20261015)
+    outputs, lses = _hard_partials(rng, dcp_size, vdim=32)
+    w_uv = torch.from_numpy(
+        (rng.standard_normal((outputs.shape[2], 32, 16)) / 32**0.5).astype(np.float32)
+    )
+    projected = torch.stack(
+        [cp_mla.project_uv_heads(outputs[r], w_uv, None) for r in range(dcp_size)]
+    )
+    reference = _reference_merge(projected.double(), lses)
+    sent = []
+    got = _a2a_merge_whole(
+        projected, lses, monkeypatch, send_dtype=torch.bfloat16, sent=sent
+    )
+    assert got.dtype == torch.float32 and set(sent) == {torch.bfloat16, torch.float32}
+    err = np.abs(got.double().numpy() - reference)
+    assert (err <= 2.0**-8 * projected.double().abs().amax(dim=0).numpy() + 1e-6).all()
+    assert (got[3] == 0).all()
 
 
 # ===================================================================== #
