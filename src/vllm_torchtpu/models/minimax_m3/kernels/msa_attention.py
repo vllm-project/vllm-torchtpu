@@ -39,8 +39,9 @@ from vllm_torchtpu.models.minimax_m3.kernels.packed_page import (
     unpack_page,
 )
 
-DEFAULT_BLOCK_Q = 64
-DEFAULT_PAGES_PER_STEP = 8
+DEFAULT_BLOCK_Q = 16
+DEFAULT_PAGES_PER_STEP = 16
+DEFAULT_KERNEL = "v2"
 # Tokens per kernel call. The work list lives in SMEM, sized for the worst
 # case of tokens * topk pages.
 MAX_TOKENS_PER_CALL = 2048
@@ -53,7 +54,7 @@ _MASK_VALUE = -1e30
 _NO_PAGE = jnp.iinfo(jnp.int32).max
 
 
-def _kernel(
+def _kernel_v1(
     # Scalar prefetch
     work_page_ref,  # [groups * G] page of each group slot, -1 for none
     work_meta_ref,  # [groups] tile << _TILE_SHIFT | last and first bits
@@ -126,6 +127,111 @@ def _kernel(
         o_ref[...] = out.reshape(num_heads, block_q, head_dim).astype(o_ref.dtype)
 
 
+def _page_rows(kv_ref) -> jax.Array:
+    """``[1, S / p, p, 2D]`` page -> bf16 ``[S, 2D]`` rows by one width-changing
+    bitcast of the packed 32-bit words (rows come out in the bitcast's token
+    order; `_bitcast_slots` gives the slot of each row)."""
+    words = kv_ref.bitcast(jnp.uint32)[0, :, 0, :]
+    return pltpu.bitcast(words, kv_ref.dtype).astype(jnp.bfloat16)
+
+
+def _bitcast_slots(rows_per_page: int, packing: int) -> jax.Array:
+    """Slot of each row of `_page_rows`, as a ``[1, S]`` lane vector.
+
+    Bitcasts words holding their own slot ids the same way the page is
+    bitcast, so the order is whatever the hardware bitcast produces.
+    """
+    bits = 32 // packing
+    uint = {16: jnp.uint16, 8: jnp.uint8}[bits]
+    row = jax.lax.broadcasted_iota(jnp.uint32, (rows_per_page, 128), 0)
+    words = jnp.zeros((rows_per_page, 128), jnp.uint32)
+    for j in range(packing):
+        words = words | ((row * packing + j) << (bits * j))
+    slots = pltpu.bitcast(words, uint).astype(jnp.int32)  # [S, 128], equal lanes
+    return slots[:, :1].T  # [1, S]
+
+
+def _kernel_v2(
+    # Scalar prefetch
+    work_page_ref,  # [groups * G] page of each group slot, -1 for none
+    work_meta_ref,  # [groups] tile << _TILE_SHIFT | last and first bits
+    # In
+    q_ref,  # [H, Bq, D]
+    selected_ref,  # [Bq, K] physical pages, -1 padded
+    local_page_ref,  # [Bq, 1]
+    local_limit_ref,  # [Bq, 1] visible slots of the local page
+    *refs,  # G x [1, S / p, p, 2D] KV pages, then out and scratch
+    sm_scale: float,
+):
+    """`_kernel_v1` with pages unpacked by one bitcast each, and one mask
+    select per score: masked scores are -inf against a finite running max,
+    so their exp is already 0."""
+    pages_per_step = len(refs) - 4
+    kv_refs = refs[:pages_per_step]
+    o_ref, m_ref, l_ref, acc_ref = refs[pages_per_step:]
+    w = pl.program_id(0)
+    meta = work_meta_ref[w]
+    num_heads, block_q, head_dim = q_ref.shape
+    rows_per_page, packing = kv_refs[0].shape[1:3]
+    page_size = rows_per_page * packing
+
+    @pl.when((meta & _FIRST_BIT) != 0)
+    def _init():
+        m_ref[...] = jnp.full_like(m_ref, _MASK_VALUE)
+        l_ref[...] = jnp.zeros_like(l_ref)
+        acc_ref[...] = jnp.zeros_like(acc_ref)
+
+    slots = _bitcast_slots(rows_per_page, packing)  # [1, S]
+    selected = selected_ref[...]
+    local_page = local_page_ref[...]
+    local_limit = local_limit_ref[...]
+    keys, values, masks = [], [], []
+    for g, kv_ref in enumerate(kv_refs):
+        page = work_page_ref[w * pages_per_step + g]
+        rows = _page_rows(kv_ref)
+        keys.append(rows[:, :head_dim])
+        values.append(rows[:, head_dim:])
+        is_selected = jnp.max(
+            (selected == page).astype(jnp.int32), axis=1, keepdims=True
+        )
+        limit = jnp.where(local_page == page, local_limit, page_size)
+        limit = jnp.where(page >= 0, limit * is_selected, 0)  # [Bq, 1]
+        masks.append(slots < limit)  # [Bq, S]
+    k = jnp.concatenate(keys, axis=0)
+    v = jnp.concatenate(values, axis=0)
+    # Rows are head-major (h * block_q + t): every head shares a token's mask.
+    mask = jnp.concatenate(masks, axis=1)
+    mask = jnp.concatenate([mask] * num_heads, axis=0)
+
+    q = q_ref[...].reshape(num_heads * block_q, head_dim)
+    s = jax.lax.dot_general(
+        q, k, (((1,), (1,)), ((), ())), preferred_element_type=jnp.float32
+    )
+    s = jnp.where(mask, s * sm_scale, -jnp.inf)
+
+    m_prev = m_ref[...]
+    m_new = jnp.maximum(m_prev, jnp.max(s, axis=1, keepdims=True))
+    alpha = jnp.exp(m_prev - m_new)
+    p = jnp.exp(s - m_new)
+    l_ref[...] = alpha * l_ref[...] + jnp.sum(p, axis=1, keepdims=True)
+    acc_ref[...] = alpha * acc_ref[...] + jax.lax.dot_general(
+        p.astype(v.dtype),
+        v,
+        (((1,), (0,)), ((), ())),
+        preferred_element_type=jnp.float32,
+    )
+    m_ref[...] = m_new
+
+    @pl.when((meta & _LAST_BIT) != 0)
+    def _finalize():
+        denom = l_ref[...]
+        out = jnp.where(denom > 0, acc_ref[...] / jnp.where(denom > 0, denom, 1.0), 0.0)
+        o_ref[...] = out.reshape(num_heads, block_q, head_dim).astype(o_ref.dtype)
+
+
+_KERNELS = {"v1": _kernel_v1, "v2": _kernel_v2}
+
+
 def _work_list(selected: jax.Array, block_q: int, pages_per_step: int):
     """Each tile's sorted page union, cut into groups of `pages_per_step`.
 
@@ -176,6 +282,7 @@ def _attention_call(
     sm_scale,
     block_q,
     pages_per_step,
+    kernel,
     interpret,
 ):
     """One kernel call over a token count that is a multiple of block_q."""
@@ -214,7 +321,7 @@ def _attention_call(
         ],
     )
     out = pl.pallas_call(
-        functools.partial(_kernel, sm_scale=sm_scale),
+        functools.partial(_KERNELS[kernel], sm_scale=sm_scale),
         grid_spec=grid_spec,
         out_shape=jax.ShapeDtypeStruct((num_heads, num_tokens, head_dim), q.dtype),
         compiler_params=pltpu.CompilerParams(
@@ -235,7 +342,8 @@ def _attention_call(
 
 
 @functools.partial(
-    jax.jit, static_argnames=("sm_scale", "block_q", "pages_per_step", "interpret")
+    jax.jit,
+    static_argnames=("sm_scale", "block_q", "pages_per_step", "kernel", "interpret"),
 )
 def msa_sparse_attention(
     q: jax.Array,
@@ -247,6 +355,7 @@ def msa_sparse_attention(
     sm_scale: float,
     block_q: int = DEFAULT_BLOCK_Q,
     pages_per_step: int = DEFAULT_PAGES_PER_STEP,
+    kernel: str = DEFAULT_KERNEL,
     interpret: bool = False,
 ) -> jax.Array:
     """Attention of each token over its selected pages.
@@ -258,6 +367,8 @@ def msa_sparse_attention(
       local_page: ``[T]`` the page holding the token itself (``-1`` for
         padding tokens).
       local_limit: ``[T]`` slots of the local page the token sees.
+      kernel: ``"v2"`` (bitcast unpack, one mask select) or the original
+        ``"v1"``, kept as the reference arm for benchmarks.
     Returns:
       ``[T, H, D]`` outputs; padding tokens get zeros.
     """
@@ -278,6 +389,7 @@ def msa_sparse_attention(
         sm_scale=sm_scale,
         block_q=block_q,
         pages_per_step=pages_per_step,
+        kernel=kernel,
         interpret=interpret,
     )
     step = max(block_q, MAX_TOKENS_PER_CALL - MAX_TOKENS_PER_CALL % block_q)

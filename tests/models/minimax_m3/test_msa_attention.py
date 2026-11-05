@@ -52,6 +52,7 @@ def _reference(q, kv_rows, selected, local_page, local_limit):
     return out
 
 
+@pytest.mark.parametrize("kernel,block_q", [("v1", 64), ("v2", 64), ("v2", 16)])
 @pytest.mark.parametrize("dtype", CACHE_DTYPES)
 @pytest.mark.parametrize(
     "num_tokens,num_real,tokens_per_call",
@@ -62,7 +63,7 @@ def _reference(q, kv_rows, selected, local_page, local_limit):
     ],
 )
 def test_matches_dense_reference(
-    num_tokens, num_real, tokens_per_call, dtype, monkeypatch
+    num_tokens, num_real, tokens_per_call, dtype, kernel, block_q, monkeypatch
 ):
     if tokens_per_call is not None:
         monkeypatch.setattr(msa_attention, "MAX_TOKENS_PER_CALL", tokens_per_call)
@@ -88,6 +89,8 @@ def test_matches_dense_reference(
         jnp.asarray(local_page),
         jnp.asarray(local_limit),
         sm_scale=HEAD_DIM**-0.5,
+        block_q=block_q,
+        kernel=kernel,
         interpret=True,
     )
 
@@ -115,8 +118,9 @@ def test_rejects_unsupported_cache():
         )
 
 
+@pytest.mark.parametrize("kernel,block_q", [("v1", 64), ("v2", 64), ("v2", 16)])
 @pytest.mark.parametrize("dtype", CACHE_DTYPES)
-def test_lowers_for_tpu(dtype):
+def test_lowers_for_tpu(dtype, kernel, block_q):
     """Pallas -> Mosaic lowering and verification run without a TPU."""
     tokens, topk = 256, 16
     args = (
@@ -128,7 +132,9 @@ def test_lowers_for_tpu(dtype):
         jax.ShapeDtypeStruct((tokens,), jnp.int32),
         jax.ShapeDtypeStruct((tokens,), jnp.int32),
     )
-    attention = functools.partial(msa_sparse_attention, sm_scale=HEAD_DIM**-0.5)
+    attention = functools.partial(
+        msa_sparse_attention, sm_scale=HEAD_DIM**-0.5, block_q=block_q, kernel=kernel
+    )
     tpu7x = AbstractMesh((), (), (), abstract_device=AbstractDevice("TPU7x", 1, "tpu"))
     with use_abstract_mesh(tpu7x):
         lowered = jax.jit(attention).trace(*args).lower(lowering_platforms=("tpu",))
