@@ -490,7 +490,10 @@ class StagedConsumer:
         )
         self.free = torch.ones(self.pages, dtype=torch.int32)
         self.free[0] = 0  # the null page
-        self.reservations: dict[int, list[list[int]]] = {}
+        # uuid -> staging pages per producer cache owner (manifest order). A
+        # producer group of several layers shares block IDs across them, each
+        # layer's page in its own slot tensor, so each owner stages its own.
+        self.reservations: dict[int, dict[str, list[int]]] = {}
         # uuid -> (decode-local prefix tokens, first staged source page per group)
         self.skips: dict[int, tuple[int, list[int]]] = {}
         self.manifest = PoolManifest(
@@ -563,9 +566,13 @@ class StagedConsumer:
         if uuid in self.reservations:
             return True
         first = [skipped_source_pages(g, skip_tokens) for g in self.src_groups]
-        counts = [g.page_count(num_tokens) - f for g, f in zip(self.src_groups, first)]
-        if any(count <= 0 for count in counts):
+        group_counts = [
+            g.page_count(num_tokens) - f for g, f in zip(self.src_groups, first)
+        ]
+        if any(count <= 0 for count in group_counts):
             raise ValueError("A prefix-aware load must leave every group a suffix")
+        owners = [pool.layer_name for pool in self.manifest.pools]
+        counts = [group_counts[self._src_owner[name]] for name in owners]
         free = self.free.clone()
         if tp_group is not None and getattr(tp_group, "world_size", 1) > 1:
             import torch.distributed as dist
@@ -576,12 +583,12 @@ class StagedConsumer:
         available = torch.nonzero(free, as_tuple=False).flatten().tolist()
         if len(available) < sum(counts):
             return False
-        pages, cursor = [], 0
-        for count in counts:
-            pages.append(available[cursor : cursor + count])
+        pages, cursor = {}, 0
+        for name, count in zip(owners, counts):
+            pages[name] = available[cursor : cursor + count]
             cursor += count
-        for group_pages in pages:
-            self.free[group_pages] = 0
+        for owner_pages in pages.values():
+            self.free[owner_pages] = 0
         self.reservations[uuid] = pages
         self.skips[uuid] = (skip_tokens, first)
         return True
@@ -600,10 +607,10 @@ class StagedConsumer:
         pages = self.reservations[uuid]
         tags, blocks, counts = [], [], []
         for pool in self.manifest.pools:
-            group_pages = pages[self._src_owner[pool.layer_name]]
+            owner_pages = pages[pool.layer_name]
             tags.append(pool.tag)
-            blocks.extend(group_pages)
-            counts.append(len(group_pages))
+            blocks.extend(owner_pages)
+            counts.append(len(owner_pages))
         return tags, blocks, counts
 
     def skip_bytes(self, uuid: int) -> list[int]:
@@ -615,12 +622,12 @@ class StagedConsumer:
             for pool in self.manifest.pools
         ]
 
-    def release(self, uuid: int) -> list[list[int]] | None:
+    def release(self, uuid: int) -> dict[str, list[int]] | None:
         self.skips.pop(uuid, None)
         pages = self.reservations.pop(uuid, None)
         if pages is not None:
-            for group_pages in pages:
-                self.free[group_pages] = 1
+            for owner_pages in pages.values():
+                self.free[owner_pages] = 1
         return pages
 
     # --- the repack ---
@@ -628,12 +635,13 @@ class StagedConsumer:
     def indices(self, src_pages, dst_tables, num_tokens, skip_tokens=0, first=None):
         """Row indices of the repack. With ``skip_tokens`` only tokens from
         there on are written (the destination's earlier rows are shared prefix
-        pages); ``first[g]`` is the source page group ``g``'s staging starts at."""
+        pages); ``src_pages[owner]`` are that cache owner's staging pages and
+        ``first[g]`` the source page group ``g``'s staging starts at."""
         first = first or [0] * len(self.src_groups)
         main_s, main_d, copy_s, copy_d, gdn_s, gdn_d = [], [], [], [], [], []
         for name, (gi, offset) in self._dst_compressed.items():
             s, d = compressed_rows(
-                num_tokens, self.ratio, src_pages[self._src_owner[name]],
+                num_tokens, self.ratio, src_pages[name],
                 self.src_block, dst_tables[gi], self.dst_block, start=skip_tokens,
                 src_first=first[self._src_owner[name]], dst_offset=offset,
             )
@@ -643,7 +651,7 @@ class StagedConsumer:
             kind = owner_kind(name)
             if kind == "compressed":
                 continue
-            src = src_pages[self._src_owner[name]]
+            src = src_pages[name]
             src_first = first[self._src_owner[name]]
             dst = dst_tables[gi]
             if kind == "main":
@@ -658,7 +666,7 @@ class StagedConsumer:
                 copy_s += s
                 copy_d += d
         for name in self._gdn_names:
-            gdn_s.append(src_pages[self._src_owner[name]][0])
+            gdn_s.append(src_pages[name][0])
             gdn_d.append(dst_tables[self._dst_owner[name]][self._state_entry])
         return main_s, main_d, copy_s, copy_d, gdn_s, gdn_d
 
