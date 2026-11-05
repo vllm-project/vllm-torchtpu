@@ -637,3 +637,108 @@ def test_decode_block_env_binds_the_one_query_decode_block(monkeypatch):
         monkeypatch.setenv("TPU_BATCHED_RPA_DECODE_BLOCK", value)
         with pytest.raises(ValueError, match="TPU_BATCHED_RPA_DECODE_BLOCK"):
             run()
+
+
+@pytest.mark.cpu_test
+def test_max_model_len_bounds_the_batched_page_table():
+    """Only the columns a max_model_len sequence can address reach the kernel."""
+    import numpy as np
+
+    from vllm_torchtpu.layers.adapter import attention as adapter
+
+    calls = []
+
+    def rpa(q, k, v, kv_cache, kv_lens, page_indices, *args, **kwargs):
+        calls.append((page_indices, args, kwargs))
+        return "out"
+
+    num_seqs = 3
+    lane = KVLayout.SEQ_ALONG_LANE
+
+    def run(page_size, width, decode_query_size=1, **kwargs):
+        """Pages passed on for a num_seqs x width table of page_size pages."""
+        table = np.arange(num_seqs * width, dtype=np.int32)
+        if kwargs.get("kv_layout") == lane:
+            cache = np.empty((1, 1, 1, 1, page_size))
+        else:
+            cache = np.empty((1, page_size, 1, 1, 1))
+        bounded = adapter._with_addressable_page_table(rpa, 1048576, decode_query_size)
+        kv_lens = np.zeros(num_seqs, np.int32)
+        assert bounded(0, 1, 2, cache, kv_lens, table, "cu", "d", **kwargs) == "out"
+        pages, args, passed = calls[-1]
+        assert (args, passed) == (("cu", "d"), kwargs)
+        return table, pages
+
+    # 1M tokens in 2176-token blocks of 128-token pages: 8194 -> 8192 columns.
+    table, pages = run(128, 8194, kv_layout=lane)
+    np.testing.assert_array_equal(pages, table.reshape(3, 8194)[:, :8192].ravel())
+    # Without kv_layout the wrapper reads HEAD_ALONG_SUBLANE: page size on axis 1.
+    assert run(128, 8194)[1].shape == (num_seqs * 8192,)
+    # 2304-token blocks of 256-token pages: 4104 -> 4096 columns.
+    assert run(256, 4104, kv_layout=lane)[1].shape == (num_seqs * 4096,)
+    # A verify window reaches one page further; 8320 columns cover the table.
+    table, pages = run(128, 8194, decode_query_size=4, kv_layout=lane)
+    assert pages is table
+    # A table no wider than the addressable columns passes through unchanged.
+    table, pages = run(128, 1040, kv_layout=lane)
+    assert pages is table
+
+
+@pytest.mark.cpu_test
+def test_batched_entry_bounds_the_page_table_only_with_max_model_len(monkeypatch):
+    from vllm_torchtpu.layers.adapter import attention as adapter
+
+    entries = []
+
+    def impl(*args, rpa_func, **kwargs):
+        entries.append(rpa_func)
+
+    monkeypatch.setattr(adapter, "_pallas_rpa_kernel_impl", impl)
+    monkeypatch.delenv("TPU_BATCHED_RPA_DECODE_BLOCK", raising=False)
+    run = functools.partial(
+        adapter._pallas_rpa_kernel_batched,
+        *([None] * 12),
+        mesh=None,
+        sliding_window=None,
+        skip_kv_update=False,
+        kv_layout=KVLayout.SEQ_ALONG_LANE,
+    )
+    run()
+    assert entries[-1] is adapter.ragged_paged_attention_batched
+    run(max_model_len=1048576)
+    assert entries[-1] is not adapter.ragged_paged_attention_batched
+    assert entries[-1].__qualname__.startswith("_with_addressable_page_table")
+
+
+def test_build_rpa_kernel_binds_max_model_len(nhd, monkeypatch):
+    from types import SimpleNamespace
+
+    from vllm_torchtpu.layers.adapter.attention import PallasAttentionBackendImpl
+    from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
+        set_vllm_model_wrapper_context,
+    )
+
+    captured = {}
+
+    class FakeOp:
+        def register_fake(self, _fake_impl):
+            pass
+
+    def fake_jax_op(_name, wrapped_fn, **_kwargs):
+        captured["fn"] = wrapped_fn
+        return FakeOp()
+
+    monkeypatch.setattr(PallasAttentionBackendImpl, "_kernel_registry", {})
+    monkeypatch.setattr(
+        PallasAttentionBackendImpl,
+        "_select_kernel_mesh",
+        staticmethod(lambda _mesh, _pcp: (object(), object(), None)),
+    )
+    monkeypatch.setattr(
+        "vllm_torchtpu.layers.adapter.attention.pallas.jax_op", fake_jax_op
+    )
+    mesh = SimpleNamespace(shape={"attn_dp": 1, "expert": 1, "model": 1})
+    config = SimpleNamespace(model_config=SimpleNamespace(max_model_len=1048576))
+    with set_vllm_model_wrapper_context(mesh=mesh, vllm_config=config):
+        _batched_impl()._build_rpa_kernel(None, None, None)
+    assert captured["fn"].keywords["max_model_len"] == 1048576
