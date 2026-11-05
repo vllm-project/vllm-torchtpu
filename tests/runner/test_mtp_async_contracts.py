@@ -52,6 +52,8 @@ def request_state(req_id, block, output=()):
 def make_runner(device, monkeypatch, k):
     runner = object.__new__(TPUModelRunner)
     runner.device = device
+    runner._unfenced_h2d_sources = []
+    runner._registered_h2d_sources = set()
     runner.speculative_config = (
         SimpleNamespace(num_speculative_tokens=k, use_ngram_gpu=lambda: False)
         if k
@@ -162,7 +164,9 @@ def test_mamba_read_offset_follows_storage_owner(
     runner.cache_config = SimpleNamespace(block_size=256)
     runner._pending_mamba_state_copies = []
     runner._mamba_slot_stride = 4
-    runner.mamba_state_indices_cpu = torch.zeros(2, dtype=torch.int32)
+    runner._unfenced_h2d_sources = []
+    runner._free_h2d_sources = {}
+    runner._registered_h2d_sources = set()
     runner._init_mamba_slot_pool(9)
     if layout == "compact":
         runner._mamba_copy_plan = []
@@ -325,6 +329,8 @@ def test_bootstrap_commits_once_after_upstream_update(device, monkeypatch, k):
 def test_proposed_drafts_reach_next_inputs(device, k, mode):
     runner = object.__new__(TPUModelRunner)
     runner.device = device
+    runner._unfenced_h2d_sources = []
+    runner._registered_h2d_sources = set()
     runner.speculative_config = SimpleNamespace(num_speculative_tokens=k)
     runner._last_sequence_layout_plan = None
     runner._fast_token_substitution = False
@@ -402,9 +408,11 @@ def test_spec_tail_matches_per_chunk_assembly(monkeypatch, bucketed):
         [[11, 12, -1, -1], [21, -1, -1, -1], [31, 32, 33, 34], [-1, -1, -1, -1]],
         dtype=torch.int32,
     )
-    drafts = torch.arange(100, 100 + (rows if bucketed else num_reqs) * k).reshape(
-        -1, k
-    ).to(torch.int32)
+    drafts = (
+        torch.arange(100, 100 + (rows if bucketed else num_reqs) * k)
+        .reshape(-1, k)
+        .to(torch.int32)
+    )
     state = SimpleNamespace(
         num_reqs_list=[num_reqs],
         spec_decode_metadata_list=[

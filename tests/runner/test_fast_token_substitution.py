@@ -35,6 +35,8 @@ def test_substitution_disabled_by_default():
     runner = SimpleNamespace(
         _fast_token_substitution=False,
         device=torch.device("cpu"),
+        _unfenced_h2d_sources=[],
+        _registered_h2d_sources=set(),
         _pre_async_results=SimpleNamespace(
             next_tokens_tpu=torch.tensor([101, 102, 103, 104], dtype=torch.int64)
         ),
@@ -52,6 +54,12 @@ def test_substitution_disabled_by_default():
         )
         assert mock_kernel.called
         assert torch.equal(out, torch.tensor([101, 102, 103, 104], dtype=torch.int32))
+    # The kernel's index uploads stay owned by the runner until a staging
+    # fence covers them.
+    assert [host.tolist() for host, _ in runner._unfenced_h2d_sources] == [
+        [0, 1, 2, 3],
+        [0, 1, 2, 3],
+    ]
 
 
 def test_substitution_enabled_fast_path():
@@ -59,6 +67,8 @@ def test_substitution_enabled_fast_path():
     runner = SimpleNamespace(
         _fast_token_substitution=True,
         device=torch.device("cpu"),
+        _unfenced_h2d_sources=[],
+        _registered_h2d_sources=set(),
         _pre_async_results=SimpleNamespace(
             next_tokens_tpu=torch.tensor([201, 202, 203, 204], dtype=torch.int64)
         ),

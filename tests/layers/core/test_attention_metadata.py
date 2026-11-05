@@ -23,6 +23,7 @@ from vllm_torchtpu.layers.core.attention_metadata import (
     AttentionMetadataBuilder,
     AttentionMetadataBuilderContext,
     stage_block_table_uploads,
+    stage_h2d_upload,
 )
 from vllm_torchtpu.layers.core.sequence_layout import (
     PCP_STREAMING_SEQUENCE_LAYOUT_PROTOCOL,
@@ -45,7 +46,9 @@ class TestAttentionMetadataBuilderPlumbing:
         runner.max_num_reqs = max_num_reqs
         runner.most_model_len = most_model_len
         runner.position_ids = torch.full((8,), 42, dtype=torch.int32)
-        runner._block_table_stage_cpu = None
+        runner._unfenced_h2d_sources = []
+        runner._free_h2d_sources = {}
+        runner._registered_h2d_sources = set()
         runner.attn_groups = []
         runner._unified_kv_layout = False
 
@@ -428,7 +431,6 @@ class TestAttentionMetadataBuilderPlumbing:
         def make(staged):
             runner = self._make_runner_mock(num_groups=3, max_num_blocks_per_req=6)
             runner._unified_kv_layout = True
-            runner._block_table_stage_cpu = None
             attn = self._make_builder(runner, kv_cache_group_id=0)
             mambas = [
                 self._make_mamba_builder(runner, kv_cache_group_id=gid)
@@ -502,10 +504,113 @@ class TestAttentionMetadataBuilderPlumbing:
         assert ctx.staged_mamba_products is None
         assert ctx.staged_block_tables[0].numel() == 4 * 4
 
+    @pytest.mark.parametrize("num_groups", [1, 3])
+    def test_each_staged_walk_owns_its_host_buffer(self, num_groups):
+        """TorchTPU reads a non-blocking H2D source until the copy drains, so a
+        later chunk, draft or dummy walk must neither refill nor drop an earlier
+        walk's buffer before the staging fence releases it."""
+        runner = self._make_runner_mock(num_groups=num_groups)
+        self._make_attn_groups(
+            runner, [self._make_builder(runner, gid) for gid in range(num_groups)]
+        )
+        snapshots = []
+        for start, count, padded, dummy in [
+            (0, 2, 4, False),
+            (1, 1, 2, False),
+            (0, 3, 4, True),
+        ]:
+            ctx = AttentionMetadataBuilderContext(
+                num_reqs=count,
+                start_index=start,
+                use_max_model_len=True,
+                seq_lens=torch.ones(padded, dtype=torch.int32),
+                query_start_loc=torch.arange(padded + 1, dtype=torch.int32),
+                request_distribution=torch.tensor(
+                    [count, count, count], dtype=torch.int32
+                ),
+                position_ids_override=torch.zeros(1) if dummy else None,
+            )
+            stage_block_table_uploads(runner, ctx, padded)
+            snapshots.append(runner._unfenced_h2d_sources[-1][0].clone())
+
+        sources = [src for src, _ in runner._unfenced_h2d_sources]
+        assert len(sources) == 3
+        assert len({src.data_ptr() for src in sources}) == 3
+        for src, snapshot in zip(sources, snapshots, strict=True):
+            torch.testing.assert_close(src, snapshot, rtol=0, atol=0)
+        # The first walk's rows survived the smaller batch and the dummy walk.
+        expected = torch.zeros((4, 4), dtype=torch.int32)
+        expected[:2] = runner.input_batch.block_table[0].get_cpu_tensor()[:2]
+        torch.testing.assert_close(
+            sources[0][: 4 * 4].view(4, 4), expected, rtol=0, atol=0
+        )
+
+    def test_each_unstaged_build_owns_its_host_buffer(self):
+        """The unstaged build() fallback must not reuse a shared block table
+        buffer across walks either."""
+        runner = self._make_runner_mock(num_groups=1)
+        builder = self._make_builder(runner, kv_cache_group_id=0)
+        snapshots = []
+        for start, count, padded in [(0, 2, 4), (1, 1, 2)]:
+            runner._attn_metadata_builder_ctx = AttentionMetadataBuilderContext(
+                num_reqs=count,
+                start_index=start,
+                use_max_model_len=True,
+                seq_lens=torch.ones(padded, dtype=torch.int32),
+                query_start_loc=torch.arange(padded + 1, dtype=torch.int32),
+                request_distribution=torch.tensor(
+                    [count, count, count], dtype=torch.int32
+                ),
+            )
+            builder.build(
+                common_prefix_len=0, common_attn_metadata=self._make_cm(padded)
+            )
+            snapshots.append(runner._unfenced_h2d_sources[-1][0].clone())
+
+        sources = [src for src, _ in runner._unfenced_h2d_sources]
+        assert len(sources) == 2
+        assert sources[0].data_ptr() != sources[1].data_ptr()
+        for src, snapshot in zip(sources, snapshots, strict=True):
+            torch.testing.assert_close(src, snapshot, rtol=0, atol=0)
+
+    def test_stage_h2d_upload_rejects_non_contiguous_source(self):
+        runner = self._make_runner_mock(num_groups=1)
+        non_contig = torch.zeros((4, 4), dtype=torch.int32)[:, :2]
+        assert not non_contig.is_contiguous()
+        with pytest.raises(AssertionError):
+            stage_h2d_upload(runner, non_contig)
+        assert runner._unfenced_h2d_sources == []
+
+    def test_recycled_free_list_buffer_is_reused_and_zeroed(self):
+        runner = self._make_runner_mock(num_groups=1)
+        builder = self._make_builder(runner, kv_cache_group_id=0)
+        self._make_attn_groups(runner, [builder])
+        recycled = torch.full((4 * 4,), 99, dtype=torch.int32)
+        ptr = recycled.data_ptr()
+        runner._free_h2d_sources[(4 * 4, torch.int32)] = [recycled]
+
+        ctx = AttentionMetadataBuilderContext(
+            num_reqs=2,
+            start_index=0,
+            use_max_model_len=True,
+            seq_lens=torch.ones(4, dtype=torch.int32),
+            query_start_loc=torch.arange(5, dtype=torch.int32),
+            request_distribution=torch.tensor([2, 2, 2], dtype=torch.int32),
+        )
+        stage_block_table_uploads(runner, ctx, 4)
+
+        assert runner._free_h2d_sources[(4 * 4, torch.int32)] == []
+        used, release_cb = runner._unfenced_h2d_sources[-1]
+        assert id(used) in runner._registered_h2d_sources
+        assert used.data_ptr() == ptr
+        # Padded tail rows (2..3) were zeroed before refilling rows 0..1.
+        assert used.view(4, 4)[2:].tolist() == [[0, 0, 0, 0], [0, 0, 0, 0]]
+        release_cb()
+        assert runner._free_h2d_sources[(4 * 4, torch.int32)] == [used]
+
     def test_staged_build_skips_per_group_upload(self):
         """With views staged, build() must not touch the CPU block table."""
         runner = self._make_runner_mock(num_groups=1)
-        runner._block_table_stage_cpu = None
         builder = self._make_builder(runner, kv_cache_group_id=0)
         self._make_attn_groups(runner, [builder])
         ctx = AttentionMetadataBuilderContext(
@@ -566,6 +671,53 @@ class TestAttentionMetadataBuilderPlumbing:
 
         stage_block_table_uploads(runner, ctx(num_reqs=1), 4)  # new window
         assert source.call_count == calls + 2
+
+    @patch.dict(os.environ, {"VLLM_TPU_BLOCK_TABLE_UPLOAD_REUSE": "1"})
+    def test_content_reuse_returns_the_packed_buffer_to_the_pool(self):
+        """A walk whose re-packed tables equal the previous upload reuses that
+        upload; the pooled buffer it packed into is never uploaded, so it must
+        go back on the free list instead of leaking a registered id."""
+        from vllm_torchtpu.layers.core import attention_metadata as am
+
+        runner = self._make_runner_mock(num_groups=1)
+        builder = self._make_builder(runner, kv_cache_group_id=0)
+        self._make_attn_groups(runner, [builder])
+
+        def walk():
+            c = AttentionMetadataBuilderContext(
+                num_reqs=2,
+                start_index=0,
+                use_max_model_len=True,
+                seq_lens=torch.ones((4,), dtype=torch.int32),
+                query_start_loc=torch.arange(5, dtype=torch.int32),
+                request_distribution=torch.tensor([2, 2, 2], dtype=torch.int32),
+            )
+            runner._attn_metadata_builder_ctx = c
+            stage_block_table_uploads(runner, c, 4)
+            return c
+
+        key = (4 * 4, torch.int32)
+        first = walk()
+        assert len(runner._unfenced_h2d_sources) == 1
+        uploaded = runner._unfenced_h2d_sources[0][0]
+        cached = runner._block_table_stage_prev[1]
+
+        # A version bump with unchanged contents re-packs, then reuses.
+        am._BLOCK_TABLE_VERSION[0] += 1
+        second = walk()
+        assert torch.equal(second.staged_block_tables[0], first.staged_block_tables[0])
+        assert len(runner._unfenced_h2d_sources) == 1  # no second upload
+        # The reuse keeps the cached host copy rather than cloning a new one.
+        assert runner._block_table_stage_prev[1] is cached
+        (packed,) = runner._free_h2d_sources[key]
+        assert packed is not uploaded
+        assert id(packed) in runner._registered_h2d_sources
+
+        # The next reused walk packs into that same buffer again.
+        am._BLOCK_TABLE_VERSION[0] += 1
+        walk()
+        assert runner._free_h2d_sources[key] == [packed]
+        assert runner._registered_h2d_sources == {id(uploaded), id(packed)}
 
     @patch.dict(os.environ, {"VLLM_TPU_BLOCK_TABLE_UPLOAD_REUSE": "1"})
     def test_reused_upload_reuses_tables_and_rederives_mamba_indices(self):
@@ -713,9 +865,14 @@ class TestAttentionMetadataBuilderPlumbing:
         for name in ref:
             a, b = fast[name], ref[name]
             for f in (
-                "input_positions", "block_tables", "seq_lens", "query_start_loc",
-                "request_distribution", "mamba_state_indices",
-                "mamba_slot_read_offsets", "mamba_ckpt_indices",
+                "input_positions",
+                "block_tables",
+                "seq_lens",
+                "query_start_loc",
+                "request_distribution",
+                "mamba_state_indices",
+                "mamba_slot_read_offsets",
+                "mamba_ckpt_indices",
                 "mamba_request_distribution",
             ):
                 x, y = getattr(a, f), getattr(b, f)
@@ -757,7 +914,6 @@ class TestAttentionMetadataBuilderPlumbing:
 
     def test_staging_respects_gid_subset_and_dummy_override(self):
         runner = self._make_runner_mock(num_groups=2)
-        runner._block_table_stage_cpu = None
         builders = [
             self._make_builder(runner, kv_cache_group_id=gid) for gid in range(2)
         ]

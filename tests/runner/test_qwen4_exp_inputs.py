@@ -16,6 +16,11 @@ from vllm_torchtpu.models.vllm.qwen4_exp.inputs import (
 from vllm_torchtpu.runner.model_adapters import ModelInputSnapshot, select_model_adapter
 
 
+def _h2d_staging():
+    """Runner fields `stage_h2d_upload` appends the uploaded host tensors to."""
+    return {"_unfenced_h2d_sources": [], "_registered_h2d_sources": set()}
+
+
 @pytest.mark.parametrize("offload", [False, True])
 @pytest.mark.parametrize("qsa_index", [0, 3])
 @pytest.mark.parametrize("pooled", [False, True])
@@ -31,7 +36,7 @@ def test_reordered_history_slots_and_group_tables_are_independent(
         seq_lens=torch.tensor([4, 4, 0], dtype=torch.int32),
         mamba_state_indices=torch.tensor([7, 2, 0], dtype=torch.int32),
     )
-    runner = NS(device="cpu", _attn_metadata_builder_ctx=ctx)
+    runner = NS(device="cpu", _attn_metadata_builder_ctx=ctx, **_h2d_staging())
     runner.model_config = NS(hf_text_config=q4exp_text_config())
     runner.cache_config = NS(block_size=128)
     runner.model_config.hf_text_config.layer_types[qsa_index] = "full_attention"
@@ -169,6 +174,7 @@ def test_profile_binds_state_and_uses_serving_dtypes_and_full_work(monkeypatch, 
     monkeypatch.setattr(inputs, "synchronize_tensors", lambda tensor: None)
     runner = NS(
         device="cpu",
+        **_h2d_staging(),
         parallel_config=NS(tensor_parallel_size=tp),
         scheduler_config=NS(max_num_seqs=1),
         input_batch=NS(
@@ -254,7 +260,11 @@ def test_async_history_reads_committed_prefix_after_reorder_and_row_reuse():
         dtype=torch.int32,
     )
     order = torch.tensor([1, 2, 0])
-    runner = NS(device="cpu", input_batch=NS(token_ids_cpu_tensor=host[order]))
+    runner = NS(
+        device="cpu",
+        input_batch=NS(token_ids_cpu_tensor=host[order]),
+        **_h2d_staging(),
+    )
     runner.model_config = NS(hf_text_config=q4exp_text_config())
     runner.cache_config = NS(block_size=128)
     adapter = Qwen4ExpAdapter(runner)
@@ -363,7 +373,7 @@ def test_fused_prepare_inputs_matches_eager(
     rng = np.random.default_rng(spec * 10 + pooled)
 
     def make():
-        runner = NS(device="cpu", max_num_reqs=max_reqs)
+        runner = NS(device="cpu", max_num_reqs=max_reqs, **_h2d_staging())
         runner.model_config = NS(hf_text_config=q4exp_text_config())
         runner.cache_config = NS(block_size=128)
         runner.input_batch = NS(

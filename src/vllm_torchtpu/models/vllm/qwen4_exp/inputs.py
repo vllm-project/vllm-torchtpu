@@ -10,7 +10,10 @@ from vllm.forward_context import set_forward_context
 
 from vllm_torchtpu import envs
 from vllm_torchtpu.kv_cache_materializer import LayerKVCache
-from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
+from vllm_torchtpu.layers.core.attention_metadata import (
+    AttentionMetadata,
+    stage_h2d_upload,
+)
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
     set_vllm_model_wrapper_context,
@@ -353,7 +356,7 @@ class Qwen4ExpAdapter:
         history = merge_recent_ngram_context(
             history,
             *previous,
-            previous_np.to(runner.device, non_blocking=True),
+            stage_h2d_upload(runner, previous_np),
             context,
         )
         tokens, recent_context, lengths = current
@@ -417,7 +420,7 @@ class Qwen4ExpAdapter:
                 self.config.eos_token_id,
             )
             history = ngram_context_from_window(
-                torch.from_numpy(window).to(runner.device, non_blocking=True),
+                stage_h2d_upload(runner, torch.from_numpy(window)),
                 context,
                 self.config.eos_token_id,
                 self.config.ngram_size,
@@ -463,11 +466,9 @@ class Qwen4ExpAdapter:
         ]
 
     def _host_upload(self, array):
-        """Upload a small host array; keep the source alive for a few steps
-        because a non-blocking copy may still be reading it."""
-        host = torch.from_numpy(array)
-        self._host_keep = (getattr(self, "_host_keep", ()) + (host,))[-8:]
-        return host.to(self.runner.device, non_blocking=True)
+        """Upload a small host array, owned by the runner until a staging
+        fence covers the non-blocking copy (see `stage_h2d_upload`)."""
+        return stage_h2d_upload(self.runner, torch.from_numpy(array))
 
     def _scalars_upload(self, scalars):
         """The step's [row_start, num_requests, previous rows] upload, reused

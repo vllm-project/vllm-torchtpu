@@ -37,6 +37,8 @@ def _runner_with_raw_tensors(raw_tensors):
     runner._unified_kv_layout = bool(raw_tensors)
     runner.kv_cache_raw_tensors = raw_tensors
     runner._install_spec_token_room_guard = lambda: None
+    runner._unfenced_h2d_sources = []
+    runner._registered_h2d_sources = set()
     return runner
 
 
@@ -141,6 +143,8 @@ def test_page_local_copy_expands_split_and_updates_every_pool(monkeypatch):
         device="cpu",
         mamba_slot_read_offsets=None,
         bm_pool_layout=None,
+        _unfenced_h2d_sources=[],
+        _registered_h2d_sources=set(),
     )
     fake._copy_mamba_state_blocks = TPUModelRunner._copy_mamba_state_blocks.__get__(
         fake
@@ -162,6 +166,12 @@ def test_page_local_copy_expands_split_and_updates_every_pool(monkeypatch):
     assert calls[0][0] == id(raw_tensors)
     assert calls[0][1] == [18, 19, 20, 0, 0, 0, 0, 0]
     assert calls[0][2] == [21, 22, 23, 0, 0, 0, 0, 0]
+    # The host index tensors stay owned by the runner until a staging fence
+    # covers their non-blocking upload (see `stage_h2d_upload`).
+    assert [host.tolist() for host, _ in fake._unfenced_h2d_sources] == [
+        [18, 19, 20, 0, 0, 0, 0, 0],
+        [21, 22, 23, 0, 0, 0, 0, 0],
+    ]
     for raw, old in zip(raw_tensors, before):
         torch.testing.assert_close(raw[21:24], old[18:21])
         torch.testing.assert_close(raw[24], old[24])
@@ -219,6 +229,8 @@ def test_apply_kv_cache_block_copies_migrates_mamba_offsets(monkeypatch):
         _pad_to_bucket=TPUModelRunner._pad_to_bucket,
         device="cpu",
         bm_pool_layout=None,
+        _unfenced_h2d_sources=[],
+        _registered_h2d_sources=set(),
     )
     fake._copy_mamba_state_blocks = TPUModelRunner._copy_mamba_state_blocks.__get__(
         fake
@@ -239,6 +251,13 @@ def test_apply_kv_cache_block_copies_migrates_mamba_offsets(monkeypatch):
     assert migrated[0][0] == [3, 0, 0, 0, 0, 0, 0, 0]
     assert migrated[0][1] == [5, 0, 0, 0, 0, 0, 0, 0]
     assert offsets[5].item() == 3
+    # Manager pairs for the offsets, then split pairs for the pool copy.
+    assert [host.tolist() for host, _ in fake._unfenced_h2d_sources] == [
+        [3, 0, 0, 0, 0, 0, 0, 0],
+        [5, 0, 0, 0, 0, 0, 0, 0],
+        [6, 7, 0, 0, 0, 0, 0, 0],
+        [10, 11, 0, 0, 0, 0, 0, 0],
+    ]
 
 
 def test_precompile_mamba_state_seed_copies_covers_all_groups_and_raw_tensors(
@@ -429,6 +448,12 @@ def test_dense_copy_fans_out_per_split_dedupes_and_pads(monkeypatch):
     assert calls == [
         ([id(latent)], [2, 0, 0, 0, 0, 0, 0, 0], [5, 0, 0, 0, 0, 0, 0, 0]),
         ([id(indexer)], [4, 5, 0, 0, 0, 0, 0, 0], [10, 11, 0, 0, 0, 0, 0, 0]),
+    ]
+    assert [host.tolist() for host, _ in runner._unfenced_h2d_sources] == [
+        [2, 0, 0, 0, 0, 0, 0, 0],
+        [5, 0, 0, 0, 0, 0, 0, 0],
+        [4, 5, 0, 0, 0, 0, 0, 0],
+        [10, 11, 0, 0, 0, 0, 0, 0],
     ]
     torch.testing.assert_close(latent[5], before_latent[2])
     torch.testing.assert_close(latent[4], before_latent[4])
