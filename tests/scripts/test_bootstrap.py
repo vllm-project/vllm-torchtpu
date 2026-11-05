@@ -137,6 +137,11 @@ class TestBootstrapUnits(unittest.TestCase):
                 (2, None),
             ),
             (
+                {"BUILDKITE_BRANCH": "releases/v0.32.0"},
+                "other",
+                (2, None),
+            ),
+            (
                 {"BUILDKITE_TAG": "v0.32.0"},
                 "other",
                 (2, None),
@@ -152,10 +157,12 @@ class TestBootstrapUnits(unittest.TestCase):
             self.assertEqual(kind, expected_kind)
             self.assertEqual(bp.PRIORITIES[kind], expected_prio)
 
-        # BuildContext named properties (labels, extras, runs_nightly_steps).
+        # BuildContext named properties (labels, extras, is_release,
+        # runs_nightly_steps).
         pr_ctx = ctx(
             {
                 "BUILDKITE_PULL_REQUEST": "42",
+                "BUILDKITE_BRANCH": "releases/v0.32.0",
                 "BUILDKITE_PULL_REQUEST_LABELS": (
                     "ready,run-full-ci,run-perf-eval,skip-tpu-ci,oncall-fix"
                 ),
@@ -163,9 +170,30 @@ class TestBootstrapUnits(unittest.TestCase):
         )
         self.assertTrue(pr_ctx.is_pr)
         self.assertTrue(pr_ctx.is_oncall_fix)
+        self.assertFalse(pr_ctx.is_release)
         self.assertTrue(pr_ctx.skips_tpu)
         self.assertEqual(pr_ctx.extras, frozenset({"nightly-suite", "perf-eval"}))
         self.assertTrue(pr_ctx.runs_nightly_steps)
+
+        for rel_env in (
+            {"BUILDKITE_TAG": "v0.32.0"},
+            {"BUILDKITE_TAG": "v0.32.0rc1"},
+            {"BUILDKITE_TAG": "0.32.0"},
+            {"BUILDKITE_BRANCH": "releases/v0.32.0"},
+        ):
+            rel_ctx = ctx(rel_env)
+            self.assertTrue(rel_ctx.is_release)
+            self.assertTrue(rel_ctx.runs_nightly_steps)
+
+        for non_rel_env in (
+            {"BUILDKITE_BRANCH": "release/v1"},
+            {"BUILDKITE_BRANCH": "releases/v01.0.0"},
+            {"BUILDKITE_BRANCH": "releases/foo"},
+            {"BUILDKITE_TAG": "nightly-20261105"},
+        ):
+            non_rel_ctx = ctx(non_rel_env)
+            self.assertFalse(non_rel_ctx.is_release)
+            self.assertFalse(non_rel_ctx.runs_nightly_steps)
 
         post_merge_ctx = ctx(
             {"BUILDKITE_BRANCH": "main", "BUILDKITE_SOURCE": "webhook"},
@@ -173,6 +201,7 @@ class TestBootstrapUnits(unittest.TestCase):
         )
         self.assertFalse(post_merge_ctx.is_pr)
         self.assertFalse(post_merge_ctx.is_oncall_fix)
+        self.assertFalse(post_merge_ctx.is_release)
         self.assertTrue(post_merge_ctx.skips_tpu)
         self.assertEqual(post_merge_ctx.extras, frozenset())
         self.assertFalse(post_merge_ctx.runs_nightly_steps)
@@ -226,23 +255,56 @@ class TestBootstrapUnits(unittest.TestCase):
         bp = self.bp
         ctx = bp.BuildContext.from_env
 
-        # 1. pr_suite with each extras combination.
-        for raw_labels, expected_name, expected_tpu in (
-            ("ready", "pr", ("tests", "integration", "verify")),
+        # 1. pr_suite with each label/extras combination (including oncall-fix
+        # and skip-tpu-ci).
+        for raw_labels, expected_name, expected_about, expected_stages in (
+            (
+                "ready",
+                "pr",
+                "PR: TPU waits for the CPU checks",
+                (("build", "cpu"), ("tests", "integration", "verify")),
+            ),
+            (
+                "ready,oncall-fix",
+                "pr",
+                "PR: TPU waits for the CPU checks",
+                (("build", "cpu"), ("tests", "integration", "verify")),
+            ),
             (
                 "ready,run-perf-eval",
                 "pr+perf-eval",
-                ("tests", "integration", "perf", "verify"),
+                "PR: TPU waits for the CPU checks",
+                (("build", "cpu"), ("tests", "integration", "perf", "verify")),
             ),
             (
                 "ready,run-full-ci",
                 "pr+nightly-suite",
-                ("tests", "integration", "perf", "verify"),
+                "PR: TPU waits for the CPU checks",
+                (("build", "cpu"), ("tests", "integration", "perf", "verify")),
             ),
             (
                 "ready,run-perf-eval,run-full-ci",
                 "pr+nightly-suite+perf-eval",
-                ("tests", "integration", "perf", "verify"),
+                "PR: TPU waits for the CPU checks",
+                (("build", "cpu"), ("tests", "integration", "perf", "verify")),
+            ),
+            (
+                "ready,skip-tpu-ci",
+                "pr+cpu-only",
+                "CPU checks only (skip-tpu-ci)",
+                (("build", "cpu"),),
+            ),
+            (
+                "ready,skip-tpu-ci,run-perf-eval",
+                "pr+cpu-only",
+                "CPU checks only (skip-tpu-ci)",
+                (("build", "cpu"),),
+            ),
+            (
+                "ready,skip-tpu-ci,run-full-ci,run-perf-eval",
+                "pr+cpu-only+nightly-suite",
+                "CPU checks only (skip-tpu-ci)",
+                (("build", "cpu"),),
             ),
         ):
             suite = bp.pr_suite(
@@ -255,16 +317,12 @@ class TestBootstrapUnits(unittest.TestCase):
             )
             self.assertEqual(
                 suite,
-                bp.Suite(
-                    expected_name,
-                    "PR: TPU waits for the CPU checks",
-                    stages=(("build", "cpu"), expected_tpu),
-                ),
+                bp.Suite(expected_name, expected_about, stages=expected_stages),
             )
 
         # 2. One test per branch of choose_suite (first match wins).
-        # Branch 1: CI_SUITE override beats integration, skip-tpu-ci, and PR labels;
-        # unknown CI_SUITE raises listing the valid suite names.
+        # Branch 1: CI_SUITE override beats integration, skip-tpu-ci, release,
+        # and PR labels; unknown CI_SUITE (including removed cpu-only) raises.
         self.assertEqual(
             bp.choose_suite(
                 ctx(
@@ -278,88 +336,72 @@ class TestBootstrapUnits(unittest.TestCase):
             ),
             bp.SUITES["perf"],
         )
-        with self.assertRaisesRegex(
-            bp.BootstrapError,
-            r"ERROR: unknown CI_SUITE 'bogus'; "
-            r"suites are: default full perf cpu-only integration",
-        ):
-            bp.choose_suite(ctx({"CI_SUITE": "bogus"}))
+        for bad_suite in ("bogus", "cpu-only"):
+            with self.assertRaisesRegex(
+                bp.BootstrapError,
+                rf"ERROR: unknown CI_SUITE '{bad_suite}'; "
+                r"suites are: default full perf integration",
+            ):
+                bp.choose_suite(ctx({"CI_SUITE": bad_suite}))
 
-        # Branch 2: vllm-torchtpu-integration pipeline.
+        # Branch 2: vllm-torchtpu-integration pipeline extends full with promote.
         self.assertEqual(
             bp.choose_suite(
                 ctx({"BUILDKITE_PIPELINE_SLUG": "vllm-torchtpu-integration"})
             ),
             bp.SUITES["integration"],
         )
-
-        # Branch 3: skip-tpu-ci (PR label or post-merge merged_labels)
-        # beats PR and full/perf extras.
         self.assertEqual(
-            bp.choose_suite(
-                ctx(
-                    {
-                        "BUILDKITE_PULL_REQUEST": "10",
-                        "BUILDKITE_PULL_REQUEST_LABELS": (
-                            "run-full-ci,run-perf-eval,skip-tpu-ci"
-                        ),
-                    }
-                )
-            ),
-            bp.SUITES["cpu-only"],
+            bp.SUITES["integration"].stages,
+            ((*bp.SUITES["full"].stages[0], "promote"),),
         )
+
+        # Branch 3: PRs (including oncall-fix and skip-tpu-ci) and post-merge
+        # skip-tpu-ci webhook builds all route to pr_suite(ctx).
+        for raw_labels, expected_name in (
+            ("ready", "pr"),
+            ("ready,oncall-fix", "pr"),
+            ("ready,oncall-fix,run-perf-eval", "pr+perf-eval"),
+            ("ready,oncall-fix,run-full-ci", "pr+nightly-suite"),
+            ("ready,run-perf-eval,run-full-ci", "pr+nightly-suite+perf-eval"),
+            ("ready,skip-tpu-ci", "pr+cpu-only"),
+            ("run-full-ci,run-perf-eval,skip-tpu-ci", "pr+cpu-only+nightly-suite"),
+        ):
+            pr_env = {
+                "BUILDKITE_PULL_REQUEST": "10",
+                "BUILDKITE_PULL_REQUEST_LABELS": raw_labels,
+            }
+            self.assertEqual(bp.choose_suite(ctx(pr_env)), bp.pr_suite(ctx(pr_env)))
+            self.assertEqual(bp.choose_suite(ctx(pr_env)).name, expected_name)
+
         self.assertEqual(
             bp.choose_suite(
                 ctx(
                     {"BUILDKITE_BRANCH": "main", "BUILDKITE_SOURCE": "webhook"},
-                    merged_labels=("skip-tpu-ci",),
+                    merged_labels=("skip-tpu-ci", "run-full-ci"),
                 )
             ),
-            bp.SUITES["cpu-only"],
+            bp.Suite(
+                "pr+cpu-only",
+                "CPU checks only (skip-tpu-ci)",
+                stages=(("build", "cpu"),),
+            ),
         )
 
-        # Branch 4: PR without oncall-fix -> pr_suite(ctx).
-        for raw_labels, expected_name in (
-            ("ready", "pr"),
-            ("ready,run-perf-eval", "pr+perf-eval"),
-            ("ready,run-full-ci", "pr+nightly-suite"),
-            ("ready,run-perf-eval,run-full-ci", "pr+nightly-suite+perf-eval"),
-        ):
-            self.assertEqual(
-                bp.choose_suite(
-                    ctx(
-                        {
-                            "BUILDKITE_PULL_REQUEST": "10",
-                            "BUILDKITE_PULL_REQUEST_LABELS": raw_labels,
-                        }
-                    )
-                ).name,
-                expected_name,
-            )
-
-        # Branch 5a: NIGHTLY=1 or oncall-fix PR with extras -> SUITES["full"].
+        # Branch 4a: NIGHTLY=1 or release builds (tag or releases/vX.Y.Z branch)
+        # -> SUITES["full"].
         for full_env in (
             {"NIGHTLY": "1"},
-            {
-                "BUILDKITE_PULL_REQUEST": "10",
-                "BUILDKITE_PULL_REQUEST_LABELS": "oncall-fix,run-full-ci",
-            },
-            {
-                "BUILDKITE_PULL_REQUEST": "10",
-                "BUILDKITE_PULL_REQUEST_LABELS": "oncall-fix,run-perf-eval",
-            },
+            {"BUILDKITE_TAG": "v0.32.0"},
+            {"BUILDKITE_TAG": "v0.32.0rc1"},
+            {"BUILDKITE_BRANCH": "releases/v0.32.0"},
         ):
             self.assertEqual(bp.choose_suite(ctx(full_env)), bp.SUITES["full"])
 
-        # Branch 5b: default for main, oncall-fix PR without extras, tags,
-        # torchtpu-nightly, and other builds.
+        # Branch 4b: default for main, torchtpu-nightly, and other non-release builds.
         for default_env in (
             {"BUILDKITE_BRANCH": "main", "BUILDKITE_SOURCE": "webhook"},
-            {
-                "BUILDKITE_PULL_REQUEST": "10",
-                "BUILDKITE_PULL_REQUEST_LABELS": "ready,oncall-fix",
-            },
-            {"BUILDKITE_TAG": "v0.32.0"},
+            {"BUILDKITE_BRANCH": "release/v1"},
             {
                 "BUILDKITE_PIPELINE_SLUG": "vllm-torchtpu-torchtpu-nightly",
                 "TORCHTPU_NIGHTLY": "1",
@@ -371,7 +413,7 @@ class TestBootstrapUnits(unittest.TestCase):
         # 3. Every suite in SUITES maps to existing .buildkite/pipeline_<lane>.yml.
         self.assertEqual(
             set(bp.SUITES),
-            {"default", "full", "perf", "cpu-only", "integration"},
+            {"default", "full", "perf", "integration"},
         )
         for suite in bp.SUITES.values():
             self.assertEqual(len(suite.stages), 1)
@@ -779,21 +821,23 @@ class TestBootstrapUnits(unittest.TestCase):
             return rec
 
         # Unknown CI_SUITE and removed CI_LANES / SKIP_TPU_CI knobs fail clearly.
-        with self.assertRaisesRegex(
-            bp.BootstrapError,
-            r"ERROR: unknown CI_SUITE 'bogus'; "
-            r"suites are: default full perf cpu-only integration",
-        ):
-            run({"CI_SUITE": "bogus"})
+        for bad_suite in ("bogus", "cpu-only"):
+            with self.assertRaisesRegex(
+                bp.BootstrapError,
+                rf"ERROR: unknown CI_SUITE '{bad_suite}'; "
+                r"suites are: default full perf integration",
+            ):
+                run({"CI_SUITE": bad_suite})
         with self.assertRaisesRegex(
             bp.BootstrapError,
             r"ERROR: CI_LANES was removed; set CI_SUITE=<name> "
-            r"\(suites: default full perf cpu-only integration\)",
+            r"\(suites: default full perf integration\)",
         ):
             run({"CI_LANES": "perf"})
         with self.assertRaisesRegex(
             bp.BootstrapError,
-            r"ERROR: SKIP_TPU_CI was removed; use CI_SUITE=cpu-only",
+            r"ERROR: SKIP_TPU_CI was removed; use the skip-tpu-ci PR label "
+            r"\(or 'bootstrap\.py upload-stages build,cpu'\)",
         ):
             run({"SKIP_TPU_CI": "1"})
 
@@ -915,7 +959,7 @@ class TestBootstrapUnits(unittest.TestCase):
             self.assertIn(("WORKLOAD_PRIORITY", wprio), fx.meta)
             self.assertEqual(
                 fx.annotations,
-                [("ci-suite", "CI suite: cpu-only: CPU checks only (skip-tpu-ci)")],
+                [("ci-suite", "CI suite: pr+cpu-only: CPU checks only (skip-tpu-ci)")],
             )
             self.assertEqual([u[0] for u in fx.uploads], ["cpu", "build"])
             self.assertTrue(bool(fx.uploads[1][2]["OMNI_IMAGE_SKIP"]))
@@ -935,13 +979,7 @@ class TestBootstrapUnits(unittest.TestCase):
         self.assertIn(("WORKLOAD_PRIORITY", "post-merge"), main_pm.meta)
         self.assertEqual(
             main_pm.annotations,
-            [
-                (
-                    "ci-suite",
-                    "CI suite: default: "
-                    "main, oncall-fix PRs, release tags, torchtpu-nightly",
-                )
-            ],
+            [("ci-suite", "CI suite: default: main, torchtpu-nightly")],
         )
         self.assertEqual(
             [u[0] for u in main_pm.uploads],
@@ -960,24 +998,38 @@ class TestBootstrapUnits(unittest.TestCase):
         skip_full = run(
             {
                 "BUILDKITE_PULL_REQUEST": "42",
-                "BUILDKITE_PULL_REQUEST_LABELS": "skip-tpu-ci,run-full-ci",
+                "BUILDKITE_PULL_REQUEST_LABELS": (
+                    "skip-tpu-ci,run-full-ci,run-perf-eval"
+                ),
             }
+        )
+        self.assertEqual(
+            skip_full.annotations,
+            [
+                (
+                    "ci-suite",
+                    "CI suite: pr+cpu-only+nightly-suite: "
+                    "CPU checks only (skip-tpu-ci)",
+                )
+            ],
         )
         self.assertEqual([u[0] for u in skip_full.uploads], ["cpu", "build"])
         self.assertEqual(skip_full.uploads[0][2]["NIGHTLY"], "1")
         self.assertNotIn('build.env("NIGHTLY")', skip_full.uploads[0][1])
 
-        # PR run-full-ci + oncall-fix & scheduled Nightly (both 1-stage full suite).
-        full = run(
+        # PR run-full-ci + oncall-fix: priority 12, oncall-fix warning, still 2-stage
+        # pr+nightly-suite (oncall-fix changes priority only, not suite).
+        oncall_full = run(
             {
                 "BUILDKITE_PULL_REQUEST": "42",
                 "BUILDKITE_PULL_REQUEST_LABELS": "run-full-ci,oncall-fix",
+                "BUILDKITE_BUILD_AUTHOR_EMAIL": "Oncall@Example.com",
             }
         )
-        self.assertIn(("JOB_PRIORITY", "12"), full.meta)
-        self.assertIn(("WORKLOAD_PRIORITY", "oncall-fix"), full.meta)
+        self.assertIn(("JOB_PRIORITY", "12"), oncall_full.meta)
+        self.assertIn(("WORKLOAD_PRIORITY", "oncall-fix"), oncall_full.meta)
         self.assertEqual(
-            full.annotations,
+            oncall_full.annotations,
             [
                 (
                     "oncall-fix",
@@ -986,10 +1038,26 @@ class TestBootstrapUnits(unittest.TestCase):
                 ),
                 (
                     "ci-suite",
-                    "CI suite: full: Nightly schedule, or oncall-fix PRs with extras",
+                    "CI suite: pr+nightly-suite: PR: TPU waits for the CPU checks",
                 ),
             ],
         )
+        self.assertEqual(
+            [u[0] for u in oncall_full.uploads],
+            ["upload_stages", "cpu", "build"],
+        )
+        oncall_stage1 = run_next_stage(oncall_full)
+        self.assertEqual(
+            [u[0] for u in oncall_stage1.uploads],
+            ["verify", "perf", "integration", "tests"],
+        )
+        self.assertEqual(json.loads(oncall_stage1.uploads[0][1])["priority"], 12)
+        self.assertIn("tpu-pr/oncall@example.com", oncall_stage1.uploads[3][1])
+        for _, content, _ in (*oncall_full.uploads[1:], *oncall_stage1.uploads):
+            self.assertNotIn('build.env("NIGHTLY")', content)
+
+        # Scheduled Nightly and release builds (tag or releases/vX.Y.Z branch)
+        # run 1-stage full suite with NIGHTLY=1 substituted.
         nightly = run(
             {
                 "NIGHTLY": "1",
@@ -1000,7 +1068,19 @@ class TestBootstrapUnits(unittest.TestCase):
         self.assertEqual(
             nightly.meta, [("JOB_PRIORITY", "1"), ("VLLM_COMMIT_HASH", pinned)]
         )
-        for fx in (full, nightly):
+        tag_fx = run({"BUILDKITE_TAG": "v0.32.0", "BUILDKITE_BRANCH": "v0.32.0"})
+        self.assertEqual(
+            tag_fx.meta, [("JOB_PRIORITY", "2"), ("VLLM_COMMIT_HASH", pinned)]
+        )
+        rel_branch_fx = run({"BUILDKITE_BRANCH": "releases/v0.32.0"})
+        self.assertEqual(
+            rel_branch_fx.meta, [("JOB_PRIORITY", "2"), ("VLLM_COMMIT_HASH", pinned)]
+        )
+        for fx in (nightly, tag_fx, rel_branch_fx):
+            self.assertEqual(
+                fx.annotations,
+                [("ci-suite", "CI suite: full: Nightly schedule and release builds")],
+            )
             self.assertEqual(
                 [u[0] for u in fx.uploads],
                 ["verify", "perf", "integration", "tests", "cpu", "build"],
@@ -1023,13 +1103,6 @@ class TestBootstrapUnits(unittest.TestCase):
         )
         self.assertEqual(
             [u[0] for u in torchtpu_nightly.uploads],
-            ["verify", "integration", "tests", "cpu", "build"],
-        )
-
-        # Release tag is 1-stage default; integration pipeline is 1-stage integration.
-        tag_fx = run({"BUILDKITE_TAG": "v0.32.0", "BUILDKITE_BRANCH": "v0.32.0"})
-        self.assertEqual(
-            [u[0] for u in tag_fx.uploads],
             ["verify", "integration", "tests", "cpu", "build"],
         )
 

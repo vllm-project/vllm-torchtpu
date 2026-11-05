@@ -99,6 +99,12 @@ class BuildContext:
         return self.is_pr and "oncall-fix" in self.labels
 
     @property
+    def is_release(self) -> bool:
+        return not self.is_pr and bool(
+            _RELEASE_TAG_RE.match(self.tag) or _RELEASE_BRANCH_RE.match(self.branch)
+        )
+
+    @property
     def skips_tpu(self) -> bool:
         return "skip-tpu-ci" in self.labels
 
@@ -112,7 +118,7 @@ class BuildContext:
 
     @property
     def runs_nightly_steps(self) -> bool:
-        return self.nightly_env or "nightly-suite" in self.extras
+        return self.nightly_env or self.is_release or "nightly-suite" in self.extras
 
     @classmethod
     def from_env(
@@ -126,7 +132,8 @@ class BuildContext:
             )
         if env.get("SKIP_TPU_CI", "").strip():
             raise BootstrapError(
-                "ERROR: SKIP_TPU_CI was removed; use CI_SUITE=cpu-only"
+                "ERROR: SKIP_TPU_CI was removed; use the skip-tpu-ci PR label "
+                "(or 'bootstrap.py upload-stages build,cpu')"
             )
         pr_raw = _env_or(env, "BUILDKITE_PULL_REQUEST", "false")
         pull_request = None if pr_raw == "false" else pr_raw
@@ -173,66 +180,59 @@ class Suite:
     stages: tuple[tuple[str, ...], ...]
 
 
+_FULL = Suite(
+    "full",
+    "Nightly schedule and release builds",
+    stages=(("build", "cpu", "tests", "integration", "perf", "verify"),),
+)
+
 # Builds that don't wait for CPU: everything is one stage.
 SUITES: dict[str, Suite] = {
     "default": Suite(
         "default",
-        "main, oncall-fix PRs, release tags, torchtpu-nightly",
+        "main, torchtpu-nightly",
         stages=(("build", "cpu", "tests", "integration", "verify"),),
     ),
-    "full": Suite(
-        "full",
-        "Nightly schedule, or oncall-fix PRs with extras",
-        stages=(("build", "cpu", "tests", "integration", "perf", "verify"),),
-    ),
+    "full": _FULL,
     "perf": Suite(
         "perf",
         "Perf/eval schedule (CI_SUITE=perf)",
         stages=(("build", "perf"),),
     ),
-    "cpu-only": Suite(
-        "cpu-only",
-        "CPU checks only (skip-tpu-ci)",
-        stages=(("build", "cpu"),),
-    ),
     "integration": Suite(
         "integration",
         "vllm-torchtpu-integration pipeline",
-        stages=(
-            (
-                "build",
-                "cpu",
-                "tests",
-                "integration",
-                "perf",
-                "verify",
-                # pipeline_promote.yml's own `wait` holds it until the tests finish
-                "promote",
-            ),
-        ),
+        # pipeline_promote.yml's own `wait` holds it until the tests finish
+        stages=((*_FULL.stages[0], "promote"),),
     ),
 }
 
 
 def pr_suite(ctx: BuildContext) -> Suite:
-    """PR builds: CPU checks first, then TPU lanes plus any requested extras."""
+    """PR builds (and merged skip-tpu-ci): CPU checks, then optional TPU stage."""
+    stage0 = ("build", "cpu")  # cpu steps wait on build_docker themselves
+    if ctx.skips_tpu:
+        # skip-tpu-ci drops all TPU lanes (including perf-eval), while
+        # run-full-ci still enables nightly CPU unit tests via NIGHTLY=1.
+        extras = sorted(ctx.extras & {"nightly-suite"})
+        return Suite(
+            "+".join(["pr", "cpu-only", *extras]),
+            "CPU checks only (skip-tpu-ci)",
+            stages=(stage0,),
+        )
     tpu = ["tests", "integration"]
     if ctx.extras:  # perf-eval or nightly-suite both add perf
         tpu.append("perf")
     tpu.append("verify")
-    name = "+".join(["pr", *sorted(ctx.extras)])
     return Suite(
-        name,
+        "+".join(["pr", *sorted(ctx.extras)]),
         "PR: TPU waits for the CPU checks",
-        stages=(
-            ("build", "cpu"),  # cpu steps wait on build_docker themselves
-            tuple(tpu),
-        ),
+        stages=(stage0, tuple(tpu)),
     )
 
 
 def choose_suite(ctx: BuildContext) -> Suite:
-    """Pick what this build runs. First match wins."""
+    """Return the `Suite` for `ctx`; `CI_SUITE` takes precedence."""
     if ctx.suite_override:
         if ctx.suite_override not in SUITES:
             raise BootstrapError(
@@ -242,11 +242,9 @@ def choose_suite(ctx: BuildContext) -> Suite:
         return SUITES[ctx.suite_override]
     if ctx.is_integration:
         return SUITES["integration"]
-    if ctx.skips_tpu:
-        return SUITES["cpu-only"]
-    if ctx.is_pr and not ctx.is_oncall_fix:
-        return pr_suite(ctx)  # only PRs wait for CPU
-    return SUITES["full"] if ctx.nightly_env or ctx.extras else SUITES["default"]
+    if ctx.is_pr or ctx.skips_tpu:
+        return pr_suite(ctx)
+    return SUITES["full"] if ctx.nightly_env or ctx.is_release else SUITES["default"]
 
 
 # Build kind -> (Buildkite job priority, Kueue workload priority class).
@@ -281,6 +279,13 @@ _DOCS_ONLY_RE = re.compile(
     r"|^LICENSE$|^\.git-blame-ignore-revs$|^\.pyrefly-baseline\.json$)"
 )
 _MERGED_PR_RE = re.compile(r"\(#([0-9]+)\)$")
+# Keep in sync with .buildkite/pipeline_verify.yml and
+# .buildkite/scripts/nightly_report.sh.
+_RELEASE_TAG_RE = re.compile(r"^v?[0-9]+(\.[a-zA-Z0-9]+)*([a-zA-Z]+[0-9]*)?$")
+# Keep in sync with RELEASE_BRANCH_REGEX in .buildkite/release/lib.sh.
+_RELEASE_BRANCH_RE = re.compile(
+    r"^releases/v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$"
+)
 _VLLM_PIN_RE = re.compile(
     r".*vllm @ git\+https://github\.com/vllm-project/vllm\.git@([a-zA-Z0-9.-]+).*"
 )
