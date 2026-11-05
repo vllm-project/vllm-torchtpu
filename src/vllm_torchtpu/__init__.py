@@ -687,6 +687,7 @@ def _patch_multiproc_worker_global_rank_env() -> None:
 
     from vllm.v1.executor.multiproc_executor import WorkerProc
 
+    from vllm_torchtpu.executors.worker_spawn import SPAWN_LOCK, large_spawn_pipes
     from vllm_torchtpu.worker.tpu_rank_binding import get_tpu_worker_binding
 
     if getattr(WorkerProc, "_tpu_global_rank_env_patch", False):
@@ -694,6 +695,13 @@ def _patch_multiproc_worker_global_rank_env() -> None:
     _orig = WorkerProc.make_worker_process
 
     def _wrapped(vllm_config, local_rank, rank, *args, **kwargs):
+        # The binding goes through the parent's os.environ, so a spawn's env
+        # writes and process start must not overlap another's, whichever
+        # thread MultiprocExecutor starts it from.
+        with SPAWN_LOCK:
+            return _spawn(vllm_config, local_rank, rank, *args, **kwargs)
+
+    def _spawn(vllm_config, local_rank, rank, *args, **kwargs):
         pc = vllm_config.parallel_config
         binding = get_tpu_worker_binding(pc, rank, local_rank, env=_os.environ)
         _os.environ.update(binding.as_env())
@@ -728,7 +736,9 @@ def _patch_multiproc_worker_global_rank_env() -> None:
             binding.local_rank_offset,
             binding.init_local_rank,
         )
-        return _orig(vllm_config, local_rank, rank, *args, **kwargs)
+        # Large pipes, so this start returns before the child has imported.
+        with large_spawn_pipes():
+            return _orig(vllm_config, local_rank, rank, *args, **kwargs)
 
     WorkerProc.make_worker_process = staticmethod(_wrapped)
     WorkerProc._tpu_global_rank_env_patch = True

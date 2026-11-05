@@ -199,6 +199,7 @@ if TYPE_CHECKING:
     VLLM_TPU_DEBUG_PCP_LAYOUT: bool = False
     TPU_LOCAL_RANK_OFFSET: int = 0
     VLLM_TPU_DEVICE_ORDER: str = ""
+    TPU_WORKER_SPAWN_PIPE_BYTES: int = 1 << 20
     DEBUG_TPU_LOCAL_RANK_OFFSET: int = 0
     TORCH_TPU_BASE_PORT: int = 8070
     TORCH_TPU_MP_RENDEZVOUS_PORT: int | None = None
@@ -1228,6 +1229,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_LOCAL_RANK_OFFSET": env_int("TPU_LOCAL_RANK_OFFSET", 0),
     # Physical device index per local rank ("0,2,1,3,4,6,5,7"); empty = native.
     "VLLM_TPU_DEVICE_ORDER": lambda: os.getenv("VLLM_TPU_DEVICE_ORDER", ""),
+    # Bytes requested for each worker spawn pipe (capped at
+    # /proc/sys/fs/pipe-max-size), so writing a worker's pickled payload does
+    # not block until the child has started; see executors/worker_spawn.py.
+    # Workers start in parallel while the payload fits. 0 keeps the 64 KiB
+    # default pipes, and workers then start one after another.
+    "TPU_WORKER_SPAWN_PIPE_BYTES": env_nonnegative_int(
+        "TPU_WORKER_SPAWN_PIPE_BYTES", 1 << 20
+    ),
     # Same offset for the legacy worker init path; debug only.
     "DEBUG_TPU_LOCAL_RANK_OFFSET": env_int("DEBUG_TPU_LOCAL_RANK_OFFSET", 0),
     # First slicebuilder port; each chip on a host takes base + local rank.
