@@ -106,6 +106,35 @@ def test_agree_on_decline_detects_bucket_set_mismatch(fake_tp_group: Any) -> Non
     assert res is not None and res.code == "bucket_set_mismatch"
 
 
+def test_startup_agreement_fingerprint_mismatch_wins_over_votes(
+    fake_tp_group: Any,
+) -> None:
+    """With `mismatch_code` (the startup agreement), differing tokens decline
+    every rank with that code, even when a peer also votes a decline."""
+    fake_tp_group([_vote("create_error")], peer_tokens=[7])
+    res = agreement_mod.agree_on_decline(None, token=8, mismatch_code="plugin_mismatch")
+    assert res is not None and res.code == "plugin_mismatch"
+    assert "plugin_mismatch" in res.message
+    # Equal tokens: the vote decides as usual.
+    fake_tp_group([_vote("create_error")], peer_tokens=[8])
+    res = agreement_mod.agree_on_decline(None, token=8, mismatch_code="plugin_mismatch")
+    assert res is not None and res.code == "peer_declined:create_error"
+
+
+def test_vote_codes_add_a_plugin_s_codes_before_other(fake_tp_group: Any) -> None:
+    codes = agreement_mod.vote_codes(("my_code", "bind_error", "other"))
+    base = agreement_mod.DECLINE_VOTE_CODES
+    assert codes == (*base[:-1], "my_code", "other")
+    # A peer voting the plugin's code: this rank declines naming it.
+    fake_tp_group([codes.index("my_code") + 1])
+    res = agreement_mod.agree_on_decline(None, codes=codes)
+    assert res is not None and res.code == "peer_declined:my_code"
+    # Without the plugin's codes the same decline votes as `other`.
+    mine = EligibilityResult(False, "my_code", "m")
+    assert agreement_mod._decline_vote(mine) == _vote("other")
+    assert agreement_mod._decline_vote(mine, codes) == codes.index("my_code") + 1
+
+
 def test_declined_driver_joins_the_bind_agreement(fake_tp_group: Any) -> None:
     from types import SimpleNamespace
 

@@ -15,6 +15,8 @@
 
 from typing import Any
 
+from vllm_torchtpu.distributed.kv_transfer.connector_names import kv_connector_names
+
 
 def _legacy_ray_executor() -> bool:
     import vllm.envs as vllm_envs
@@ -55,19 +57,10 @@ _FULL_ATTENTION_LAYER_TYPES = [
 _RAIDEN_CONNECTORS = ("TPURaidenConnector", "TPURaidenOffloadingConnector")
 
 
-def _kv_connector_names(kv_transfer_config: Any) -> list[str]:
-    """The connector a config names, or the children of a TPUMultiConnector."""
-    name = kv_transfer_config.kv_connector
-    if name != "TPUMultiConnector":
-        return [name]
-    extra = getattr(kv_transfer_config, "kv_connector_extra_config", None) or {}
-    return [child["kv_connector"] for child in extra.get("connectors", [])]
-
-
 def _non_raiden_connectors(kv_transfer_config: Any) -> list[str]:
     return [
         name
-        for name in _kv_connector_names(kv_transfer_config)
+        for name in kv_connector_names(kv_transfer_config, ("TPUMultiConnector",))
         if name not in _RAIDEN_CONNECTORS
     ]
 

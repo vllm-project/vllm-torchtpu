@@ -17,11 +17,13 @@ config, before `create`. Config and local device facts only: no collective."""
 
 from __future__ import annotations
 
-import os
 from collections.abc import Mapping
 from typing import Any
 
 from vllm_torchtpu import _OFFLOADING_CONNECTORS
+from vllm_torchtpu.distributed.kv_transfer.connector_names import (
+    kv_connector_names as _connector_names,
+)
 from vllm_torchtpu.megakernel.runtime.contract import (
     DOMAIN_TP,
     PARALLELISM_UNSUPPORTED,
@@ -35,20 +37,33 @@ from vllm_torchtpu.megakernel_runtime.backbone import find_backbone
 from vllm_torchtpu.megakernel_runtime.plugin import RunnerView
 
 
+def _without_vllm(exc: ModuleNotFoundError) -> bool:
+    return (exc.name or "").partition(".")[0] == "vllm"
+
+
 def _ep_group_size() -> int:
-    """vLLM's expert-parallel group size (1 when EP is off or unavailable)."""
+    """vLLM's expert-parallel group size (`ep_mesh.get_ep_group`; 1 when EP is
+    off, or without vLLM, as in a CPU test of a plugin)."""
     try:
-        from vllm.distributed.parallel_state import get_ep_group
-    except ImportError:
+        from vllm_torchtpu.distributed.ep_mesh import get_ep_group
+    except ModuleNotFoundError as exc:
+        if not _without_vllm(exc):
+            raise
         return 1
-    try:
-        group = get_ep_group()
-    except (AssertionError, AttributeError, RuntimeError):
-        return 1
-    return int(getattr(group, "world_size", 1) or 1) if group is not None else 1
+    group = get_ep_group()
+    return int(group.world_size) if group is not None else 1
 
 
-_OFFLOAD_CONNECTORS = _OFFLOADING_CONNECTORS
+def _dp_size(parallel_config: Any) -> int:
+    """The data-parallel size by the runner's rule (`utils.get_dp_size`; 1
+    without vLLM, which runs no data-parallel engines then)."""
+    try:
+        from vllm_torchtpu.utils import get_dp_size
+    except ModuleNotFoundError as exc:
+        if not _without_vllm(exc):
+            raise
+        return 1
+    return int(get_dp_size(parallel_config))
 
 
 def _runner_cfg(runner: Any, name: str) -> Any:
@@ -58,29 +73,13 @@ def _runner_cfg(runner: Any, name: str) -> Any:
 
 
 def kv_connector_names(kv_transfer_config: Any) -> tuple[str, ...]:
-    """The KV connector names in effect (a `MultiConnector`'s members)."""
+    """The KV connector names in effect: the configured connector, or the
+    children of a `MultiConnector` / `TPUMultiConnector` (the multi-connector
+    itself when it lists none)."""
     if kv_transfer_config is None:
         return ()
-    name = str(getattr(kv_transfer_config, "kv_connector", None) or "")
-    if name != "MultiConnector":
-        return (name,)
-    extra = getattr(kv_transfer_config, "kv_connector_extra_config", None) or {}
-    members = extra.get("connectors", ()) if isinstance(extra, dict) else ()
-    names = tuple(
-        str(
-            (m.get("kv_connector") if isinstance(m, dict) else None)
-            or getattr(m, "kv_connector", None)
-            or ""
-        )
-        for m in members
-    )
-    return names or (name,)
-
-
-def kv_connector_is_offloading(kv_transfer_config: Any) -> bool:
-    """Offloading connectors only (a `MultiConnector` only if every member is)."""
-    names = kv_connector_names(kv_transfer_config)
-    return bool(names) and all(n in _OFFLOAD_CONNECTORS for n in names)
+    names = _connector_names(kv_transfer_config)
+    return tuple(str(n) for n in names) or (str(kv_transfer_config.kv_connector),)
 
 
 def _aux_hidden_layers(backbone: Any) -> Any:
@@ -154,23 +153,20 @@ def detect_parallelism(runner: Any, tp_size: int) -> list[str]:
     """The parallelism kinds (beyond "tp") the runner uses, in check order.
     Reads config and group sizes only: no collective."""
     p_cfg = _runner_cfg(runner, "parallel_config")
-    dp = int(os.environ.get("TORCH_TPU_DP_SIZE", "0") or 0) or int(
-        getattr(p_cfg, "data_parallel_size", 1) or 1
-    )
-    ep_wide = _ep_group_size() > max(1, int(tp_size))
+    dp = _dp_size(p_cfg)
+    ep = bool(getattr(p_cfg, "enable_expert_parallel", False))
+    # Only expert parallelism runs MoE collectives over vLLM's EP group.
+    ep_wide = ep and _ep_group_size() > max(1, int(tp_size))
     dp_fn = getattr(runner, "_dp_lockstep_enabled", None)
     pp_multi = not (
         getattr(runner, "_pp_is_first", True) and getattr(runner, "_pp_is_last", True)
     )
-    dcp = (
-        bool(getattr(runner, "_dcp_enabled", False))
-        or int(getattr(p_cfg, "decode_context_parallel_size", 1) or 1) > 1
-    )
+    dcp = int(getattr(p_cfg, "decode_context_parallel_size", 1) or 1) > 1
     pcp = (
         bool(getattr(runner, "_pcp_enabled", False))
         or int(getattr(p_cfg, "prefill_context_parallel_size", 1) or 1) > 1
     )
-    ep_in_tp = bool(getattr(p_cfg, "enable_expert_parallel", False)) and not ep_wide
+    ep_in_tp = ep and not ep_wide
     flags = (
         ("dp", dp > 1),
         ("ep_wider_than_tp", ep_wide),
@@ -275,11 +271,11 @@ def check_runner_features(
     kv_cfg = _runner_cfg(runner, "kv_transfer_config")
     par_cfg = _runner_cfg(runner, "parallel_config")
     m_cfg = _runner_cfg(runner, "model_config")
-    offload = kv_cfg is not None and kv_connector_is_offloading(kv_cfg)
-    other_kv = next(
-        (n for n in kv_connector_names(kv_cfg) if n not in _OFFLOAD_CONNECTORS),
-        None,
-    )
+    # Offloading and transfer are separate features: a multi-connector may
+    # mix an offloading child with a transfer child.
+    kv_names = kv_connector_names(kv_cfg)
+    offload = any(n in _OFFLOADING_CONNECTORS for n in kv_names)
+    other_kv = next((n for n in kv_names if n not in _OFFLOADING_CONNECTORS), None)
     rules = [
         (
             int(getattr(spec_cfg, "num_speculative_tokens", 0) or 0) > 0
@@ -304,7 +300,7 @@ def check_runner_features(
             "plugin does not declare KV offloading",
         ),
         (
-            kv_cfg is not None and not offload and "kv_transfer" not in caps,
+            other_kv is not None and "kv_transfer" not in caps,
             f"kv_connector_unsupported:{other_kv}",
             f"plugin does not declare KV transfer (connector {other_kv})",
         ),
@@ -313,7 +309,7 @@ def check_runner_features(
             "eplb_dynamic_unsupported",
             "plugin does not declare dynamic EPLB",
         ),
-        # The attribute name on the pinned vLLM is checked on the serving image.
+        # vLLM's `ModelConfig.enable_sleep_mode`.
         (
             bool(getattr(m_cfg, "enable_sleep_mode", False))
             and "sleep_mode" not in caps,

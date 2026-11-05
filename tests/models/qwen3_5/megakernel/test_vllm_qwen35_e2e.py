@@ -1856,7 +1856,7 @@ def test_maybe_create_declines_without_usable_pallas_mesh(
     assert "0/1 MK" in caplog.text
 
 
-@pytest.mark.parametrize("why", ["dp_size", "dp_env", "ep_wider_than_tp"])
+@pytest.mark.parametrize("why", ["dp", "ep_wider_than_tp"])
 def test_maybe_create_declines_data_parallel_before_any_collective(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, why: str
 ) -> None:
@@ -1885,14 +1885,11 @@ def test_maybe_create_declines_data_parallel_before_any_collective(
         mamba_ssm_cache_dtype="bfloat16",
         megakernel=True,
     )
-    runner.parallel_config.data_parallel_size = 2 if why == "dp_size" else 1
-    if why == "dp_env":
-        monkeypatch.setenv("TORCH_TPU_DP_SIZE", "4")
-    else:
-        monkeypatch.delenv("TORCH_TPU_DP_SIZE", raising=False)
-    monkeypatch.setattr(
-        guards_mod, "_ep_group_size", lambda: 16 if why == "ep_wider_than_tp" else 8
-    )
+    # The guard reads the DP size and the EP group through the runner's helpers
+    # (`utils.get_dp_size`, `ep_mesh.get_ep_group`), which need vLLM.
+    monkeypatch.setattr(guards_mod, "_dp_size", lambda _p: 2 if why == "dp" else 1)
+    runner.parallel_config.enable_expert_parallel = why == "ep_wider_than_tp"
+    monkeypatch.setattr(guards_mod, "_ep_group_size", lambda: 16)
 
     def no_collective(*_a: Any, **_k: Any) -> Any:
         raise AssertionError("must decline before any collective / mesh build")

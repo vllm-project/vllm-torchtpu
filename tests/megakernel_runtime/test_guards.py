@@ -24,6 +24,7 @@ import pytest
 import torch
 
 import vllm_torchtpu.megakernel_runtime.guards as guards_mod
+from vllm_torchtpu.distributed.kv_transfer import connector_names
 from vllm_torchtpu.megakernel_runtime import testing
 from vllm_torchtpu.megakernel_runtime.backbone import find_backbone
 from vllm_torchtpu.megakernel_runtime.plugin import RunnerView, TpuMonoSpec
@@ -66,6 +67,21 @@ def _kv(name: str, members: list[str] | None = None) -> Any:
         (_kv("TPURaidenConnector"), "kv_connector_unsupported:TPURaidenConnector"),
         (_kv("DecodeBenchConnector"), "kv_connector_unsupported:DecodeBenchConnector"),
         (_kv("MultiConnector"), "kv_connector_unsupported:MultiConnector"),
+        # The TPU multi-connector is expanded like vLLM's.
+        (
+            _kv(
+                "TPUMultiConnector",
+                ["TPURaidenOffloadingConnector", "OffloadingConnector"],
+            ),
+            None,
+        ),
+        (
+            _kv(
+                "TPUMultiConnector",
+                ["TPURaidenOffloadingConnector", "TPURaidenConnector"],
+            ),
+            "kv_connector_unsupported:TPURaidenConnector",
+        ),
     ],
 )
 def test_kv_connector_guard(kv: Any, code: str | None) -> None:
@@ -78,6 +94,41 @@ def test_kv_connector_guard(kv: Any, code: str | None) -> None:
     if code is not None:
         caps = _QWEN_CAPS | {"kv_transfer"}
         assert guards_mod.check_runner_features(runner, caps) is None
+
+
+@pytest.mark.parametrize("multi", ["MultiConnector", "TPUMultiConnector"])
+def test_mixed_kv_connector_needs_offload_and_transfer(multi: str) -> None:
+    """Offloading and transfer are checked separately: a multi-connector with
+    an offloading child and a transfer child needs both features."""
+    kv = _kv(multi, ["TPURaidenOffloadingConnector", "NixlConnector"])
+    assert guards_mod.kv_connector_names(kv) == (
+        "TPURaidenOffloadingConnector",
+        "NixlConnector",
+    )
+    runner = testing.fake_runner(kv_transfer_config=kv)
+    res = guards_mod.check_runner_features(runner, frozenset({"kv_transfer"}))
+    assert res is not None and res.code == "kv_offload_unsupported"
+    res = guards_mod.check_runner_features(runner, frozenset({"kv_offload"}))
+    assert res is not None and res.code == "kv_connector_unsupported:NixlConnector"
+    caps = frozenset({"kv_offload", "kv_transfer"})
+    assert guards_mod.check_runner_features(runner, caps) is None
+
+
+def test_kv_connector_names_share_one_helper() -> None:
+    """The guard and the pipeline-parallel check expand connectors through one
+    helper; the pipeline check expands only the TPU multi-connector."""
+    vllm_multi = _kv("MultiConnector", ["OffloadingConnector"])
+    tpu_multi = _kv("TPUMultiConnector", ["TPURaidenConnector"])
+    tpu_only = ("TPUMultiConnector",)
+    assert connector_names.kv_connector_names(vllm_multi, tpu_only) == [
+        "MultiConnector"
+    ]
+    assert connector_names.kv_connector_names(tpu_multi, tpu_only) == [
+        "TPURaidenConnector"
+    ]
+    assert guards_mod.kv_connector_names(vllm_multi) == ("OffloadingConnector",)
+    assert guards_mod.kv_connector_names(tpu_multi) == ("TPURaidenConnector",)
+    assert guards_mod.kv_connector_names(None) == ()
 
 
 def _mm_cfg(lm_only: bool = False, limits: dict[str, Any] | None = None) -> Any:
@@ -150,19 +201,22 @@ def test_undeclared_feature_is_a_named_decline(
 
 
 @pytest.mark.parametrize(
-    "kw, kind",
+    "kw, par, kind",
     [
-        ({"_pp_is_last": False}, "pp"),
-        ({"_dcp_enabled": True}, "dcp"),
-        ({"_pcp_enabled": True}, "pcp"),
-        ({"_dp_lockstep_enabled": lambda: True}, "dp_lockstep"),
-        ({"enable_expert_parallel": True}, "ep_in_tp"),
+        ({"_pp_is_last": False}, {}, "pp"),
+        ({}, {"decode_context_parallel_size": 2}, "dcp"),
+        ({"_pcp_enabled": True}, {}, "pcp"),
+        ({}, {"prefill_context_parallel_size": 2}, "pcp"),
+        ({"_dp_lockstep_enabled": lambda: True}, {}, "dp_lockstep"),
+        ({"enable_expert_parallel": True}, {}, "ep_in_tp"),
     ],
 )
 def test_undeclared_parallelism_is_a_named_decline(
-    kw: dict[str, Any], kind: str
+    kw: dict[str, Any], par: dict[str, Any], kind: str
 ) -> None:
     runner = testing.fake_runner(**kw)
+    for k, v in par.items():
+        setattr(runner.parallel_config, k, v)
     assert guards_mod.detect_parallelism(runner, 1) == [kind]
     res = _check(runner)
     assert res is not None and res.code == f"parallelism_unsupported:{kind}"
@@ -171,23 +225,68 @@ def test_undeclared_parallelism_is_a_named_decline(
 
 
 def test_dp_and_wide_ep_parallelism(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(guards_mod, "_dp_size", lambda _p_cfg: 2)
     runner = testing.fake_runner()
-    runner.parallel_config.data_parallel_size = 2
     res = _check(runner, features=_QWEN_CAPS)
     assert res is not None and res.code == "parallelism_unsupported:dp"
     assert "data_parallel_size" in res.message
-    # An EP group wider than TP is its own kind (EP inside TP is not).
-    runner = testing.fake_runner(enable_expert_parallel=True)
+    monkeypatch.setattr(guards_mod, "_dp_size", lambda _p_cfg: 1)
+    # An EP group wider than TP is its own kind (EP inside TP is not); the
+    # EP group counts only with expert parallelism on.
     monkeypatch.setattr(guards_mod, "_ep_group_size", lambda: 2)
+    assert guards_mod.detect_parallelism(testing.fake_runner(), 1) == []
+    runner = testing.fake_runner(enable_expert_parallel=True)
     assert guards_mod.detect_parallelism(runner, 1) == ["ep_wider_than_tp"]
     assert guards_mod.detect_parallelism(runner, 2) == ["ep_in_tp"]
     res = _check(runner, parallelism={"tp", "ep_in_tp"})
     assert res is not None and res.code == "parallelism_unsupported:ep_wider_than_tp"
 
 
-def test_static_expert_placement_and_sleep_mode() -> None:
-    # A static placement table is not dynamic EPLB.
-    runner = testing.fake_runner(TPU_EXPERT_PLACEMENT="table")
+def test_dp_and_ep_sizes_come_from_the_runner_helpers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The DP size is `utils.get_dp_size`'s and the EP group is
+    `ep_mesh.get_ep_group`'s (both need vLLM)."""
+    pytest.importorskip("vllm")
+    from vllm_torchtpu.distributed import ep_mesh
+
+    p_cfg = SimpleNamespace(data_parallel_size=1)
+    monkeypatch.setenv("TORCH_TPU_DP_SIZE", "4")
+    assert guards_mod._dp_size(p_cfg) == 4
+    monkeypatch.delenv("TORCH_TPU_DP_SIZE")
+    p_cfg.data_parallel_size = 2
+    assert guards_mod._dp_size(p_cfg) == 2
+    monkeypatch.setattr(ep_mesh, "get_ep_group", lambda: SimpleNamespace(world_size=8))
+    assert guards_mod._ep_group_size() == 8
+    monkeypatch.setattr(ep_mesh, "get_ep_group", lambda: None)
+    assert guards_mod._ep_group_size() == 1
+
+
+def test_dp_and_ep_without_vllm_are_off(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Without vLLM (a CPU test of a plugin) there are no DP engines and no EP
+    group; a broken import of anything else still raises."""
+    import builtins
+
+    real_import = builtins.__import__
+
+    def fake_import(name: str, *args: Any, **kwargs: Any) -> Any:
+        if name in ("vllm_torchtpu.utils", "vllm_torchtpu.distributed.ep_mesh"):
+            raise ModuleNotFoundError(f"No module named {missing!r}", name=missing)
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", fake_import)
+    missing = "vllm.distributed"
+    p_cfg = SimpleNamespace(data_parallel_size=2)
+    assert guards_mod._dp_size(p_cfg) == 1 and guards_mod._ep_group_size() == 1
+    missing = "jax"
+    with pytest.raises(ModuleNotFoundError, match="jax"):
+        guards_mod._dp_size(p_cfg)
+    with pytest.raises(ModuleNotFoundError, match="jax"):
+        guards_mod._ep_group_size()
+
+
+def test_sleep_mode_is_a_named_decline() -> None:
+    runner = testing.fake_runner()
     assert _check(runner, features=_QWEN_CAPS) is None
     runner.vllm_config.model_config.enable_sleep_mode = True
     res = _check(runner, features=_QWEN_CAPS)
