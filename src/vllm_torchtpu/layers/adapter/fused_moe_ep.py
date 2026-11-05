@@ -235,6 +235,7 @@ def _build_op(
             i32_scale_slab=envs.MOE_FUSED_EP_PUSH_I32_SCALE_SLAB,
             vmem_combine=envs.MOE_FUSED_EP_PUSH_VMEM_COMBINE,
             staging_slots=envs.MOE_FUSED_EP_PUSH_STAGING_SLOTS,
+            light_prepush=envs.MOE_FUSED_EP_PUSH_LIGHT_PREPUSH,
         )
 
     preprocess_topology = prepare_moe_preprocessing(mesh)

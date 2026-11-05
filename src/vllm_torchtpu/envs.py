@@ -119,6 +119,7 @@ if TYPE_CHECKING:
     MOE_FUSED_EP_PUSH_VMEM_COMBINE: bool = False
     MOE_FUSED_EP_PUSH_STAGING_SLOTS: int = 0
     MOE_FUSED_EP_PUSH_SHARED_EXPERT: bool = False
+    MOE_FUSED_EP_PUSH_LIGHT_PREPUSH: bool = False
     TPU_EXPERT_PLACEMENT: str = ""
     TPU_LATENT_PROJ_INTRA_CHIP_TP: bool = False
     TPU_TOKEN_BUCKET_EXTRA: list[int] = []
@@ -939,6 +940,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # MOE_FUSED_EP_KERNEL_IMPL=push without HBM staging: VMEM slots the expert
     # kernel stages result tiles in for the wire (0 = the default two).
     "MOE_FUSED_EP_PUSH_STAGING_SLOTS": env_int("MOE_FUSED_EP_PUSH_STAGING_SLOTS", 0),
+    # MOE_FUSED_EP_KERNEL_IMPL=push with TABLE_KERNEL=1: the SparseCore
+    # pre-push carries the lightest experts instead of the heaviest.
+    "MOE_FUSED_EP_PUSH_LIGHT_PREPUSH": env_bool("MOE_FUSED_EP_PUSH_LIGHT_PREPUSH"),
     # MOE_FUSED_EP_KERNEL_IMPL=push: run the layer's FP8 shared expert (the
     # fused kernel of TPU_DEEPSEEK_V41_FUSED_SHARED_EXPERT) inside the MoE op,
     # issued after the SparseCore pre-push and ahead of the expert kernel, so

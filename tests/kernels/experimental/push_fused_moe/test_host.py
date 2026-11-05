@@ -419,6 +419,45 @@ def test_table_kernel_matches_the_xla_tables(n_pre, skew):
         np.testing.assert_array_equal(cnt, np.asarray(want_counts))
 
 
+@pytest.mark.parametrize("n_pre", [1, 2, 3])
+@pytest.mark.parametrize("skew", [False, True], ids=["uniform", "skewed"])
+def test_light_prepush_only_reorders_the_visits(n_pre, skew):
+    """With light_prepush the table kernel visits the n_pre lightest experts
+    first (lightest at 0), then the rest most rows first; the shard tables
+    the expert kernel reads per expert are unchanged, and the pre-push
+    counts follow the new first positions."""
+    from vllm_torchtpu.kernels.experimental.push_fused_moe.plan_kernel import (
+        build_push_tables,
+    )
+
+    ep, t_local, g_local, topk = 16, 288, 25, 6
+    idx, kw = _routing(ep, t_local, g_local, topk, skew=skew, seed=13)
+    e_total = kw["e_total"]
+    rows_by_dest = jnp.asarray(_counts(idx, ep, t_local, e_total))
+    for me in (0, 3, ep - 1):
+        counts = np.asarray(rows_by_dest)[me]
+        seg_start = jnp.asarray(np.cumsum(counts) - counts)
+        base, light = (
+            [
+                jax.tree.map(np.asarray, x)
+                for x in build_push_tables(
+                    rows_by_dest, seg_start, jnp.int32(me), ep=ep, n_pre=n_pre,
+                    tile_m=kw["tile_m"], interpret=True, light_prepush=lp,
+                )  # fmt: skip
+            ]
+            for lp in (False, True)
+        )
+        for k in (4, 5, 6, 7, 8):
+            jax.tree.map(np.testing.assert_array_equal, light[k], base[k])
+        recv = np.asarray(rows_by_dest)[:, me * g_local : (me + 1) * g_local].sum(0)
+        n_live = int((recv > 0).sum())
+        lp = min(n_pre, n_live)
+        order = list(base[2][:n_live])
+        want = order[n_live - lp :][::-1] + order[: n_live - lp]
+        np.testing.assert_array_equal(light[2][:n_live], want)
+        assert light[3][0] + light[3][1] == recv[want[:lp]].sum()
+
+
 @pytest.mark.parametrize("skew", [False, True], ids=["uniform", "skewed"])
 def test_plan_from_kernel_tables_matches_the_sharded_plan(skew):
     """routing_pairs_from_tables, fed the table kernel's plan tables
