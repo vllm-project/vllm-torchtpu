@@ -264,7 +264,7 @@ def test_default_onehot_path_matches_previous(num_tokens, routing, fp4, skip_pad
     "num_tokens,threshold,local_routes",
     [
         (384, 3840, True),  # at the cap
-        (385, 3840, False),  # one token above: SparseCore
+        (400, 3840, False),  # above: SparseCore (its gather tiles 16 tokens)
         (96, 960, True),  # threshold = the step's routed rows
         (96, 959, False),
     ],
