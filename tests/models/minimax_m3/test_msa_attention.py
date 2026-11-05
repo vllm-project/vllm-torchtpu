@@ -186,3 +186,53 @@ def test_lowers_for_tpu(dtype, kernel, block_q):
     with use_abstract_mesh(tpu7x):
         lowered = jax.jit(attention).trace(*args).lower(lowering_platforms=("tpu",))
     assert "tpu_custom_call" in lowered.as_text()
+
+
+@pytest.mark.parametrize("dtype", CACHE_DTYPES)
+def test_page_table_keys_match_physical_pages(dtype):
+    """Page keys translated by `page_table` in the page fetch give the output
+    of physical pages (the XLA block-table gather they replace)."""
+    num_tokens = 70
+    rng = np.random.default_rng(3)
+    q = jnp.asarray(rng.standard_normal((num_tokens, HEADS, HEAD_DIM))).astype(
+        jnp.bfloat16
+    )
+    kv = pack(rounded(rng.standard_normal((PAGES, PAGE, 2 * HEAD_DIM)), dtype), dtype)
+    table = rng.permutation(PAGES).astype(np.int32)  # key -> page, one-to-one
+    keys = np.full((num_tokens, TOPK), -1, np.int32)
+    local_key = np.full(num_tokens, -1, np.int32)
+    local_limit = np.zeros(num_tokens, np.int32)
+    for t in range(num_tokens - 4):  # the last tokens are padding
+        chosen = rng.choice(PAGES, rng.integers(1, TOPK + 1), replace=False)
+        keys[t, : len(chosen)] = chosen
+        local_key[t] = chosen[0]
+        local_limit[t] = rng.integers(1, PAGE + 1)
+
+    def physical(k):
+        return np.where(k >= 0, table[np.maximum(k, 0)], -1)
+
+    common = dict(sm_scale=HEAD_DIM**-0.5, kernel="v2", interpret=True)
+    by_key = msa_sparse_attention(
+        q,
+        kv,
+        jnp.asarray(keys),
+        jnp.asarray(local_key),
+        jnp.asarray(local_limit),
+        page_table=jnp.asarray(table),
+        **common,
+    )
+    by_page = msa_sparse_attention(
+        q,
+        kv,
+        jnp.asarray(physical(keys)),
+        jnp.asarray(physical(local_key)),
+        jnp.asarray(local_limit),
+        **common,
+    )
+    # The union is sorted by key instead of by page, so pages accumulate in a
+    # different order: equal up to bf16 rounding.
+    np.testing.assert_allclose(
+        np.asarray(by_key.astype(jnp.float32)),
+        np.asarray(by_page.astype(jnp.float32)),
+        atol=2e-3,
+    )
