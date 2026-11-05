@@ -82,10 +82,14 @@ def shifted_post_pre_rms(
     token_tile = 128 if t % 128 == 0 else 96 if t % 96 == 0 else 32
     num_tiles = t // token_tile
     input_buffers = min(3, num_tiles)
-    output_buffers = min(2, num_tiles)
+    m = pre.shape[-1]
+    # Decode batches keep every tile's residual in VMEM and project the next
+    # gates once over all rows: the projection weight is pushed through the
+    # MXU once instead of once per tile (each row's dot is unchanged).
+    project_once = t * m * x.shape[1] * 2 <= 16 * 1024 * 1024
+    output_buffers = num_tiles if project_once else min(2, num_tiles)
     # Early stores shorten the drain for batches that fit in the input buffers.
     early_output = num_tiles <= input_buffers
-    m = pre.shape[-1]
     width = m * d
     parts = 3
     info = pltpu.get_tpu_info()
@@ -258,7 +262,7 @@ def shifted_post_pre_rms(
             return tuple(output_copy(tile_index, component) for component in range(2))
 
         def run_tile(tile_index, xr, rr, yr, vr):
-            previous_projected = projection_buf[...]
+            previous_projected = None if project_once else projection_buf[...]
 
             @pl.when(tile_index == 0)
             def wait_gates():
@@ -331,14 +335,16 @@ def shifted_post_pre_rms(
                 (tile_index + 1) % 2,
             )
 
-            @pl.when(tile_index == 0)
-            def wait_weight():
-                copies[-1].wait()
+            if not project_once:
 
-            projection_buf[...] = jax.lax.dot(
-                yr[...], wr[...], preferred_element_type=jnp.float32
-            )
-            store_projection(previous_projected, jnp.maximum(tile_index - 1, 0))
+                @pl.when(tile_index == 0)
+                def wait_weight():
+                    copies[-1].wait()
+
+                projection_buf[...] = jax.lax.dot(
+                    yr[...], wr[...], preferred_element_type=jnp.float32
+                )
+                store_projection(previous_projected, jnp.maximum(tile_index - 1, 0))
             store_vector(sbuf[...].T, sh, tile_index * tile)
 
         for index in range(input_buffers):
@@ -379,10 +385,20 @@ def shifted_post_pre_rms(
             return unused
 
         jax.lax.fori_loop(0, num_tiles, body, None)
+        if project_once:
+            copies[-1].wait()
+            projected = jax.lax.dot(
+                output_y[...].reshape(t, width),
+                wr[...],
+                preferred_element_type=jnp.float32,
+            )
+            values = finish_projection(projected)
+            mh[...] = jnp.pad(values, ((0, 0), (0, gate_tokens - t)))
         for index in range(num_tiles - output_buffers, num_tiles):
             for copy in output_copies(index):
                 copy.wait()
-        store_projection(projection_buf[...], num_tiles - 1)
+        if not project_once:
+            store_projection(projection_buf[...], num_tiles - 1)
 
     hbm = pl.BlockSpec(memory_space=pltpu.HBM)
     gate_args = (post.reshape(t, m).T, comb.transpose(1, 2, 0), pre.T)
