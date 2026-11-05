@@ -23,6 +23,7 @@ from vllm_torchtpu.kernels.experimental.moe_dense_expert import (
     can_use_dense_expert,
     dense_expert_moe,
 )
+from vllm_torchtpu.kernels.megablox import gather_gmm
 from vllm_torchtpu.kernels.megablox.gmm_v2 import get_packing_factor, gmm_v2
 from vllm_torchtpu.kernels.megablox.moe_onehot_unpermute import (
     blockwise_onehot_unpermute,
@@ -72,6 +73,11 @@ ragged_gather_reduce = _select_ragged_gather_reduce(envs.RAGGED_GATHER_REDUCE_VE
 _ONEHOT_AUTO_CAP = 512
 # Fixed at import, like the other MoE algorithm selectors.
 _DENSE_EXPERT_THRESHOLD = envs.TPU_MOE_DENSE_EXPERT_THRESHOLD
+_GATHER_GMM = envs.TPU_MOE_GATHER_GMM
+# gather_combine scalar-prefetches one int32 expert-order position per route;
+# batches above this cap run gather_combine_in_chunks automatically.
+_GATHER_GMM_MAX_ROUTES = 128 * 1024
+_GATHER_COMBINE_TILE_TOKENS = 64
 # Fixed at import: build the MoE permutation from one packed sort.
 _SINGLE_SORT = envs.TPU_MOE_SINGLE_SORT
 # Fixed at import: let the counting sort replace the comparison sorts on the
@@ -345,8 +351,12 @@ def prepare_routed_gmm_inputs(
     use_sparse_core: bool,
     onehot_moe_permute_threshold: int = 0,
     skip_padded_tokens: bool = False,
-) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
+    permute: bool = True,
+) -> tuple[jax.Array | None, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
     """Prepare the local-only routing layout using already-local expert ids.
+
+    When ``permute=False``, returns ``None`` in place of the gathered rows for
+    callers that gather token rows inside the expert kernel.
 
     For non-EP runs `topk_indices_local` is always non-negative, so the
     valid-mask path computed below is a no-op (jnp.where on an all-True
@@ -447,7 +457,9 @@ def prepare_routed_gmm_inputs(
         else:
             token_indices_sorted = token_indices_flat[sorted_indices]
 
-    if use_ep and use_sparse_core:
+    if not permute:
+        x = None
+    elif use_ep and use_sparse_core:
         if token_indices_sorted.shape[0] <= onehot_moe_permute_threshold:
             # Use one-hot matmul for permutation, which can be faster for small
             # batch size. When `argsort_revert_indices` came from the counting
@@ -492,6 +504,181 @@ def prepare_routed_gmm_inputs(
         valid_mask,
         token_indices_sorted,
     )
+
+
+def _get_gather_gmm_tpu_info() -> pltpu.TpuInfo | None:
+    try:
+        return pltpu.get_tpu_info()
+    except ValueError:
+        return None
+
+
+def _gather_gmm_min_tokens(tpu_info: pltpu.TpuInfo) -> int:
+    """Minimum batch token count for ``gather_gmm_moe`` derived from MXU width."""
+    return 4 * int(tpu_info.mxu_column_size)
+
+
+def can_use_gather_gmm(
+    hidden_states: jax.Array,
+    w1: jax.Array,
+    w2: jax.Array,
+    w1_scale: jax.Array | None,
+    w2_scale: jax.Array | None,
+    w1_bias: jax.Array | None,
+    w2_bias: jax.Array | None,
+    *,
+    topk: int,
+    rhs_quant_dtype: jnp.dtype | None,
+    masked: bool = False,
+) -> bool:
+    """Trace-time admission check for ``gather_gmm_moe``."""
+    if hidden_states.ndim != 2 or w1.ndim != 3 or w2.ndim != 3:
+        return False
+    num_tokens, hidden = hidden_states.shape
+    num_experts, w1_k, n1 = w1.shape
+    if n1 % 2 != 0:
+        return False
+    inter = n1 // 2
+    num_routes = num_tokens * topk
+    if not (
+        rhs_quant_dtype is None
+        and w1_bias is None
+        and w2_bias is None
+        and topk > 0
+        and (masked or topk <= num_experts)
+        and num_tokens % _GATHER_COMBINE_TILE_TOKENS == 0
+        and (
+            not masked
+            or (
+                _GATHER_COMBINE_TILE_TOKENS * topk
+                <= gather_gmm.MASKED_COMBINE_MAX_TILE_ROUTES
+                and num_routes < gather_gmm.MASKED_COMBINE_MAX_ROWS
+            )
+        )
+        and hidden_states.dtype == jnp.bfloat16
+        and w1.dtype == jnp.float8_e4m3fn
+        and w2.dtype == jnp.float8_e4m3fn
+        and w1_k == hidden
+        and hidden > 0
+        and hidden % gather_gmm.PACKED_COLUMNS == 0
+        and inter > 0
+        and inter % gather_gmm.LANES == 0
+        and w2.shape == (num_experts, inter, hidden)
+        and num_experts + 1 <= min(_COUNTING_SORT_BLOCK, num_routes)
+        and (num_experts + 1).bit_length() + max(1, (num_routes - 1).bit_length()) < 31
+        and w1_scale is not None
+        and w1_scale.size == num_experts * n1
+        and w2_scale is not None
+        and w2_scale.size == num_experts * hidden
+    ):
+        return False
+    tpu_info = _get_gather_gmm_tpu_info()
+    if tpu_info is None or tpu_info.fp8_ops_per_second <= 0:
+        return False
+    mxu_cols = int(tpu_info.mxu_column_size)
+    if mxu_cols <= 0 or gather_gmm.PACKED_COLUMNS % mxu_cols != 0 or n1 % mxu_cols != 0:
+        return False
+    if num_tokens < _gather_gmm_min_tokens(tpu_info):
+        return False
+    vmem_limit = int(tpu_info.vmem_capacity_bytes * gather_gmm.VMEM_LIMIT_FRACTION)
+    return (
+        gather_gmm.select_tile_m(hidden, inter, vmem_limit_bytes=vmem_limit) is not None
+    )
+
+
+def _gather_routing(
+    topk_ids: jax.Array,
+    topk_weights: jax.Array,
+    *,
+    local_num_experts: int,
+    topk: int,
+    skip_padded_tokens: bool,
+    masked: bool,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """Compute ``(token_indices_sorted, group_sizes, route_positions)``."""
+    if not _COUNTING_SORT:
+        _, group_sizes, positions, _, valid, token_indices_sorted = (
+            prepare_routed_gmm_inputs(
+                jnp.zeros((topk_ids.shape[0], 1), jnp.bfloat16),
+                topk_ids,
+                topk_weights,
+                local_num_experts=local_num_experts,
+                topk=topk,
+                use_ep=False,
+                use_sparse_core=False,
+                skip_padded_tokens=skip_padded_tokens,
+                permute=False,
+            )
+        )
+        if masked:
+            positions = jnp.where(valid, positions, -1)
+        return token_indices_sorted, group_sizes, positions
+
+    flat_ids = topk_ids.reshape(-1)
+    valid = flat_ids >= 0
+    if skip_padded_tokens:
+        valid &= topk_weights.reshape(-1) != 0
+    keys = jnp.where(valid, flat_ids, local_num_experts)
+    rows = keys.shape[0]
+    positions, counts = _counting_sort_positions(keys, local_num_experts + 1)
+    if positions is None:
+        raise ValueError(
+            f"{local_num_experts + 1} buckets exceed the counting sort block"
+        )
+    bits = max(1, (rows - 1).bit_length())
+    packed = jax.lax.sort(
+        jnp.left_shift(keys, bits) | jnp.arange(rows, dtype=jnp.int32), is_stable=False
+    )
+    token_indices_sorted = jnp.bitwise_and(packed, (1 << bits) - 1) // topk
+    if masked:
+        positions = jnp.where(valid, positions, -1)
+    return token_indices_sorted, counts[:local_num_experts], positions
+
+
+def gather_gmm_moe(
+    hidden_states: jax.Array,
+    w1: jax.Array,
+    w2: jax.Array,
+    w1_scale: jax.Array,
+    w2_scale: jax.Array,
+    topk_weights: jax.Array,
+    topk_ids: jax.Array,
+    *,
+    topk: int,
+    activation: str,
+    skip_padded_tokens: bool,
+    masked: bool,
+) -> jax.Array:
+    """Execute MoE with VMEM gather-fused expert and combine kernels."""
+    num_tokens, hidden = hidden_states.shape
+    token_indices_sorted, group_sizes, positions = _gather_routing(
+        topk_ids,
+        topk_weights,
+        local_num_experts=w1.shape[0],
+        topk=topk,
+        skip_padded_tokens=skip_padded_tokens,
+        masked=masked,
+    )
+    down_rows = gather_gmm.gather_fused_moe(
+        gather_gmm.quantize_pack_rows(hidden_states),
+        token_indices_sorted,
+        group_sizes,
+        w1,
+        w1_scale,
+        w2,
+        w2_scale,
+        act=activation,
+    )
+    return gather_gmm.gather_combine_in_chunks(
+        down_rows,
+        positions.reshape(num_tokens, topk),
+        topk_weights,
+        hidden_size=hidden,
+        max_routes=_GATHER_GMM_MAX_ROUTES,
+        tile_tokens=_GATHER_COMBINE_TILE_TOKENS,
+        masked=masked,
+        out_dtype=hidden_states.dtype,
+    ).astype(hidden_states.dtype)
 
 
 def moe_gmm(
@@ -733,9 +920,13 @@ def fused_moe_func(
     assert topk_weights.shape == (num_tokens, topk)
     assert topk_ids.shape == (num_tokens, topk)
 
-    # Pin topk_weights to hidden_states.dtype (or float32 if
-    # TPU_MOE_TOPK_WEIGHTS_FLOAT32 is enabled) so the EP mask, GMM reduce,
-    # and `where` propagate appropriately.
+    # Preserve float32 router weights for gather_gmm's FP32 combine path while
+    # pinning topk_weights for standard GMM / dense-expert paths.
+    gather_weights = (
+        topk_weights
+        if topk_weights.dtype == jnp.float32
+        else topk_weights.astype(hidden_states.dtype)
+    )
     topk_weights = topk_weights.astype(_get_topk_weights_dtype(hidden_states.dtype))
 
     if use_ep and use_sparse_core and num_tokens * topk <= onehot_moe_permute_threshold:
@@ -745,11 +936,15 @@ def fused_moe_func(
         # so the damage stays with that token.
         hidden_states = jnp.where(jnp.isfinite(hidden_states), hidden_states, 0)
         topk_weights = jnp.where(jnp.isfinite(topk_weights), topk_weights, 0)
+        gather_weights = jnp.where(jnp.isfinite(gather_weights), gather_weights, 0)
 
     if use_ep and experts_start is not None:
         local_ids = topk_ids - experts_start
         valid = (local_ids >= 0) & (local_ids < w1.shape[0])
         topk_weights = jnp.where(valid, topk_weights, jnp.zeros_like(topk_weights))
+        gather_weights = jnp.where(
+            valid, gather_weights, jnp.zeros_like(gather_weights)
+        )
         topk_ids = jnp.where(valid, local_ids, jnp.full_like(local_ids, -1))
 
     # Decode services also compile large prefill buckets. Apply the token
@@ -769,6 +964,35 @@ def fused_moe_func(
         logger.info_once("Selected experimental dense-expert decode MoE")
         return dense_expert_moe(
             hidden_states, w1, w2, w1_scale, w2_scale, topk_weights, topk_ids
+        )
+
+    if _GATHER_GMM and can_use_gather_gmm(
+        hidden_states,
+        w1,
+        w2,
+        w1_scale,
+        w2_scale,
+        w1_bias,
+        w2_bias,
+        topk=topk,
+        rhs_quant_dtype=rhs_quant_dtype,
+        masked=use_ep or skip_padded_tokens,
+    ):
+        logger.info_once(
+            "Selected gather-fused MoE expert kernels (TPU_MOE_GATHER_GMM)"
+        )
+        return gather_gmm_moe(
+            hidden_states,
+            w1,
+            w2,
+            w1_scale,
+            w2_scale,
+            gather_weights,
+            topk_ids,
+            topk=topk,
+            activation=activation,
+            skip_padded_tokens=skip_padded_tokens,
+            masked=use_ep or skip_padded_tokens,
         )
 
     (

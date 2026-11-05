@@ -74,6 +74,7 @@ if TYPE_CHECKING:
     TPU_MOE_SEQUENCE_PARALLEL: bool = False
     TPU_MOE_OWNER_OUTPUT_MODE: str = "off"
     TPU_MOE_DENSE_EXPERT_THRESHOLD: int = 0
+    TPU_MOE_GATHER_GMM: bool = True
     FUSED_MOE_DECODE_KERNEL: bool = False
     FUSED_MOE_DECODE_KERNEL_MAX_TOKENS: int = 256
     TPU_MOE_SINGLE_SORT: bool = True
@@ -716,6 +717,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_MOE_DENSE_EXPERT_THRESHOLD": env_nonnegative_int(
         "TPU_MOE_DENSE_EXPERT_THRESHOLD", 0
     ),
+    # Serve eligible FP8 per-channel MoE prefill batches with the VMEM
+    # gather-fused expert and combine kernels (kernels/megablox/gather_gmm.py)
+    # so [tokens * topk, hidden] routed activations are not materialized in
+    # HBM. Smaller batches and unsupported shapes keep the grouped-matmul path.
+    "TPU_MOE_GATHER_GMM": env_bool("TPU_MOE_GATHER_GMM", True),
     # Serve eligible MoE layers (TP experts, or EP with TP attention) with the
     # fused MoE decode kernel: routed experts, shared expert and all-reduce in
     # one Pallas call (layers/adapter/fused_moe_decode.py). Armed once after

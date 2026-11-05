@@ -26,6 +26,7 @@ import vllm_torchtpu.envs as envs
 from vllm_torchtpu.kernels.megablox.gmm_v2 import apply_act_fn, interleave_lane
 from vllm_torchtpu.layers.core import fused_moe_gmm
 from vllm_torchtpu.layers.core.fused_moe_gmm import (
+    can_use_gather_gmm,
     fused_moe_func,
     moe_gmm,
     prepare_routed_gmm_inputs,
@@ -499,6 +500,230 @@ def test_prepare_routed_gmm_inputs_keeps_original_combine_metadata():
     np.testing.assert_array_equal(valid_mask, valid)
     np.testing.assert_array_equal(token_indices_sorted, sorted_indices_expected // 2)
     np.testing.assert_array_equal(group_sizes, np.array([3, 2]))
+
+
+def test_gather_gmm_env_defaults_to_true_and_parses_bools(monkeypatch):
+    monkeypatch.delenv("TPU_MOE_GATHER_GMM", raising=False)
+    getter = envs.environment_variables["TPU_MOE_GATHER_GMM"]
+    assert getter() is True
+
+    monkeypatch.setenv("TPU_MOE_GATHER_GMM", "0")
+    assert getter() is False
+
+    monkeypatch.setenv("TPU_MOE_GATHER_GMM", "1")
+    assert getter() is True
+
+
+def test_prepare_routed_gmm_inputs_permute_false_skips_only_the_rows():
+    hidden_states = jnp.arange(24, dtype=jnp.bfloat16).reshape(6, 4)
+    topk_indices = jnp.array(
+        [[1, -1], [0, 1], [1, 0], [-1, 0], [0, 1], [1, -1]], dtype=jnp.int32
+    )
+    topk_weights = jnp.linspace(0.1, 1.2, 12, dtype=jnp.float32).reshape(6, 2)
+    common = dict(
+        local_num_experts=2,
+        topk=2,
+        use_ep=False,
+        use_sparse_core=False,
+        skip_padded_tokens=False,
+    )
+    full = prepare_routed_gmm_inputs(
+        hidden_states, topk_indices, topk_weights, **common
+    )
+    skipped = prepare_routed_gmm_inputs(
+        hidden_states, topk_indices, topk_weights, permute=False, **common
+    )
+    assert full[0] is not None
+    assert skipped[0] is None
+    for got, want in zip(skipped[1:], full[1:]):
+        np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
+
+
+@pytest.mark.parametrize("counting_sort", [True, False])
+@pytest.mark.parametrize(
+    ("tokens", "masked", "skip_padded"),
+    [
+        (8, False, False),
+        (8, True, False),
+        (8, True, True),
+    ],
+)
+def test_gather_routing_matches_prepare_routed_gmm_inputs(
+    monkeypatch, counting_sort, tokens, masked, skip_padded
+):
+    monkeypatch.setattr(fused_moe_gmm, "_COUNTING_SORT", counting_sort)
+    topk, local_num_experts = 4, 3
+    k_ids, k_mask, k_w = jax.random.split(jax.random.key(31), 3)
+    raw_ids = jax.random.randint(
+        k_ids, (tokens, topk), minval=0, maxval=local_num_experts, dtype=jnp.int32
+    )
+    if masked:
+        keep = jax.random.bernoulli(k_mask, p=0.6, shape=(tokens, topk))
+        topk_ids = jnp.where(keep, raw_ids, -1)
+    else:
+        topk_ids = raw_ids
+    topk_weights = jax.random.uniform(
+        k_w, (tokens, topk), dtype=jnp.float32, minval=0.05, maxval=1.0
+    )
+    if skip_padded:
+        topk_weights = topk_weights.at[-2:].set(0.0)
+
+    token_indices_sorted, group_sizes, positions = fused_moe_gmm._gather_routing(
+        topk_ids,
+        topk_weights,
+        local_num_experts=local_num_experts,
+        topk=topk,
+        skip_padded_tokens=skip_padded,
+        masked=masked,
+    )
+    _, ref_groups, ref_pos, _, ref_valid, ref_tokens = prepare_routed_gmm_inputs(
+        jnp.zeros((tokens, 4), dtype=jnp.bfloat16),
+        topk_ids,
+        topk_weights,
+        local_num_experts=local_num_experts,
+        topk=topk,
+        use_ep=False,
+        use_sparse_core=False,
+        skip_padded_tokens=skip_padded,
+        permute=False,
+    )
+    np.testing.assert_array_equal(np.asarray(group_sizes), np.asarray(ref_groups))
+    np.testing.assert_array_equal(
+        np.asarray(token_indices_sorted), np.asarray(ref_tokens)
+    )
+    expected_pos = np.where(ref_valid, ref_pos, -1) if masked else np.asarray(ref_pos)
+    np.testing.assert_array_equal(np.asarray(positions), expected_pos)
+
+
+def test_can_use_gather_gmm_admission(monkeypatch):
+    tpu_7x = pltpu.get_tpu_info_for_chip(pltpu.ChipVersion.TPU_7X, 1)
+    monkeypatch.setattr(pltpu, "get_tpu_info", lambda: tpu_7x)
+
+    def _shapes(
+        tokens=1024,
+        hidden=2560,
+        inter=768,
+        experts=16,
+        topk=8,
+        masked=False,
+        w_dtype=jnp.float8_e4m3fn,
+        w1_bias=None,
+        block_scale=False,
+        rhs_quant_dtype=None,
+    ):
+        hs = jax.ShapeDtypeStruct((tokens, hidden), jnp.bfloat16)
+        w1 = jax.ShapeDtypeStruct((experts, hidden, 2 * inter), w_dtype)
+        w2 = jax.ShapeDtypeStruct((experts, inter, hidden), w_dtype)
+        w1_scale = (
+            jax.ShapeDtypeStruct((experts, 2, 2 * inter), jnp.float32)
+            if block_scale
+            else jax.ShapeDtypeStruct((experts, 2 * inter), jnp.float32)
+        )
+        w2_scale = jax.ShapeDtypeStruct((experts, hidden), jnp.float32)
+        return can_use_gather_gmm(
+            hs,
+            w1,
+            w2,
+            w1_scale,
+            w2_scale,
+            w1_bias,
+            None,
+            topk=topk,
+            rhs_quant_dtype=rhs_quant_dtype,
+            masked=masked,
+        )
+
+    assert _shapes() is True
+    assert _shapes(tokens=1088) is True
+    assert _shapes(tokens=512) is False
+    assert _shapes(tokens=1056) is False
+    assert _shapes(w1_bias=jax.ShapeDtypeStruct((16, 1536), jnp.float32)) is False
+    assert _shapes(block_scale=True) is False
+    assert _shapes(w_dtype=jnp.bfloat16) is False
+    assert _shapes(inter=1536) is True
+    assert _shapes(inter=2048) is True
+    assert _shapes(inter=32768) is False
+    assert _shapes(experts=4, topk=8, masked=False) is False
+    assert _shapes(experts=4, topk=8, masked=True) is True
+    # Automatic chunked combine above 128Ki routes:
+    assert _shapes(tokens=32768, topk=8, masked=False) is True
+    assert _shapes(tokens=32768, topk=8, masked=True) is True
+    assert _shapes(tokens=65536, topk=8, masked=False) is True
+    assert _shapes(tokens=65536, topk=8, masked=True) is False
+
+    no_fp8 = types.SimpleNamespace(
+        vmem_capacity_bytes=tpu_7x.vmem_capacity_bytes,
+        mxu_column_size=tpu_7x.mxu_column_size,
+        fp8_ops_per_second=0,
+    )
+    monkeypatch.setattr(pltpu, "get_tpu_info", lambda: no_fp8)
+    assert _shapes() is False
+
+    def _raise_value_error():
+        raise ValueError("CPU device")
+
+    monkeypatch.setattr(pltpu, "get_tpu_info", _raise_value_error)
+    assert _shapes() is False
+
+
+def test_fused_moe_func_dispatches_to_gather_gmm_with_fp32_weights(monkeypatch):
+    hs = jnp.ones((1024, 512), dtype=jnp.bfloat16)
+    w1 = jnp.ones((8, 512, 512), dtype=jnp.float8_e4m3fn)
+    w2 = jnp.ones((8, 256, 512), dtype=jnp.float8_e4m3fn)
+    w1_scale = jnp.ones((8, 512), dtype=jnp.float32)
+    w2_scale = jnp.ones((8, 512), dtype=jnp.float32)
+    topk_weights = jnp.full((1024, 2), 0.5, dtype=jnp.float32)
+    topk_ids = jnp.zeros((1024, 2), dtype=jnp.int32)
+    captured = {}
+
+    def _fake_gather_gmm_moe(
+        hidden_states,
+        _w1,
+        _w2,
+        _w1_s,
+        _w2_s,
+        weights,
+        _ids,
+        *,
+        topk,
+        activation,
+        skip_padded_tokens,
+        masked,
+    ):
+        captured["weights_dtype"] = weights.dtype
+        captured["topk"] = topk
+        captured["activation"] = activation
+        captured["skip_padded_tokens"] = skip_padded_tokens
+        captured["masked"] = masked
+        return jnp.zeros_like(hidden_states)
+
+    monkeypatch.setattr(fused_moe_gmm, "_GATHER_GMM", True)
+    monkeypatch.setattr(fused_moe_gmm, "can_use_gather_gmm", lambda *a, **kw: True)
+    monkeypatch.setattr(fused_moe_gmm, "gather_gmm_moe", _fake_gather_gmm_moe)
+
+    out = fused_moe_func(
+        hs,
+        w1,
+        w2,
+        w1_bias=None,
+        w2_bias=None,
+        w1_scale=w1_scale,
+        w2_scale=w2_scale,
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
+        topk=2,
+        activation="geglu",
+        use_ep=True,
+    )
+    assert out.dtype == jnp.bfloat16
+    assert out.shape == hs.shape
+    assert captured == {
+        "weights_dtype": jnp.float32,
+        "topk": 2,
+        "activation": "geglu",
+        "skip_padded_tokens": False,
+        "masked": True,
+    }
 
 
 @pytest.mark.parametrize(("mode", "owner_called"), [("on", True), ("off", False)])
