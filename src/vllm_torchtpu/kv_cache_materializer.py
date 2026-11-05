@@ -336,19 +336,27 @@ def can_share_attention_cache(
     first = specs[0]
     if not isinstance(first, AttentionSpec):
         return False
+    attn_specs: list[AttentionSpec] = []
     for spec in specs:
         if (
             not isinstance(spec, AttentionSpec)
             or isinstance(spec, MLAAttentionSpec)
             or spec.dtype != first.dtype
-            or spec.block_size != first.block_size
             or spec.page_size_bytes != first.page_size_bytes
         ):
             return False
+        attn_specs.append(spec)
+    min_block_size = min(s.block_size for s in attn_specs)
+    if min_block_size <= 0:
+        return False
+    for spec in attn_specs:
+        if spec.block_size % min_block_size != 0:
+            return False
+        split = spec.block_size // min_block_size
         shape = attn_backend.get_kv_cache_shape(
-            1, spec.block_size, spec.num_kv_heads, spec.head_size, spec.dtype
+            1, min_block_size, spec.num_kv_heads, spec.head_size, spec.dtype
         )
-        if spec.page_size_bytes % (math.prod(shape) * spec.dtype.itemsize):
+        if spec.page_size_bytes % (split * math.prod(shape) * spec.dtype.itemsize):
             return False
     return True
 
@@ -365,25 +373,29 @@ def materialize_shared_attention_cache(
     if not layer_specs:
         raise ValueError("layer_specs must contain an attention layer")
     spec = layer_specs[0][1]
+    min_block_size = min(ls.block_size for _, ls in layer_specs)
+    if min_block_size <= 0:
+        raise ValueError(f"Invalid block_size {min_block_size} in shared KV cache")
     page_elements = tensor_size // (num_blocks * spec.dtype.itemsize)
     shapes = []
     for name, layer_spec in layer_specs:
         if (
             layer_spec.dtype != spec.dtype
-            or layer_spec.block_size != spec.block_size
+            or layer_spec.block_size % min_block_size != 0
             or layer_spec.page_size_bytes * num_blocks != tensor_size
         ):
             raise ValueError(f"Incompatible shared KV cache spec for {name}")
+        split = layer_spec.block_size // min_block_size
         shape = tuple(
             attn_backend.get_kv_cache_shape(
-                num_blocks,
-                spec.block_size,
+                num_blocks * split,
+                min_block_size,
                 layer_spec.num_kv_heads,
                 layer_spec.head_size,
                 spec.dtype,
             )
         )
-        if page_elements % math.prod(shape[1:]):
+        if page_elements % (split * math.prod(shape[1:])):
             raise ValueError(
                 f"Shared pool page must contain whole native pages for {name}"
             )
@@ -391,15 +403,15 @@ def materialize_shared_attention_cache(
     pool_shape = shapes[0]
     if (
         any(shape != pool_shape for shape in shapes)
-        or math.prod(pool_shape[1:]) != page_elements
+        or math.prod(pool_shape) != num_blocks * page_elements
     ):
         # Keep the packed dtype axis separate when reinterpreting head shapes.
         packing = 4 // spec.dtype.itemsize
         pool_shape = (
             num_blocks,
-            spec.block_size,
+            min_block_size,
             packing,
-            page_elements // (spec.block_size * packing),
+            page_elements // (min_block_size * packing),
         )
     return torch.zeros(pool_shape, dtype=spec.dtype, device=device)
 
