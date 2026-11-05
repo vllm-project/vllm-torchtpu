@@ -43,7 +43,15 @@ def _truncate_bf16(values: jax.Array) -> jax.Array:
 
 
 def is_supported_shape(t: int, m: int, d: int) -> bool:
-    return t > 0 and t % 32 == 0 and m == 4 and d == 5120
+    return t > 0 and t % 16 == 0 and m == 4 and d == 5120
+
+
+def _token_tile(t: int) -> int:
+    """Tokens per pipelined tile: 32-token mix groups, else 16 (T % 32 != 0)."""
+    for tile in (128, 96, 32, 80, 48, 16):
+        if t % tile == 0:
+            return tile
+    raise ValueError(f"T={t} is not a multiple of 16")
 
 
 def shifted_post_pre_rms(
@@ -65,10 +73,13 @@ def shifted_post_pre_rms(
     constrain_activations_to_hbm: bool = True,
     norm_weight: jax.Array | None = None,
     norm_eps: float = 1e-06,
+    unpadded_gates: bool = False,
+    early_prep: bool = False,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
     """Update residuals and collapse with incoming pre; predict gates separately.
 
-    TPU7x: M=4, D=5120, positive local T divisible by 32.
+    TPU7x: M=4, D=5120, positive local T divisible by 16 (by 32 uses 32-token
+    mix groups; otherwise 16-token groups, e.g. T=240 in 80-token tiles).
     Activations are BF16; gates are FP32. Weight is packed BF16 [20480,128].
     Three-component mixing and BF16 residual/collapse rounding are retained;
     streamed square sums change the reference reduction order.
@@ -77,9 +88,14 @@ def shifted_post_pre_rms(
         (residual [T,M*D], next_post [T,M,1], next_comb [T,M,M],
         value [T,D], next_pre [T,M]). Value includes RMSNorm when
         norm_weight [D] is supplied. Other keyword arguments are JIT-static.
+        ``unpadded_gates`` emits the gates T tokens wide instead of padded to a
+        multiple of 128 (T <= 1024), so that between layers the [T,M] views
+        are transposes of the next call's [M,T] gate inputs, not slices.
+        ``early_prep`` builds tile 0's gate coefficients while the first
+        activation tiles are still in flight instead of after they land.
     """
     t, d = x.shape
-    token_tile = 128 if t % 128 == 0 else 96 if t % 96 == 0 else 32
+    token_tile = _token_tile(t)
     num_tiles = t // token_tile
     input_buffers = min(3, num_tiles)
     output_buffers = min(2, num_tiles)
@@ -93,7 +109,9 @@ def shifted_post_pre_rms(
     mixes = m * (m + 2)
     assert is_supported_shape(t, m, d)
     gate_tokens = (t + 127) // 128 * 128
-    tuning = PostPreTuning(token_tile, 32, 256, 50 * 1024 * 1024)
+    tuning = PostPreTuning(
+        token_tile, 32 if token_tile % 32 == 0 else 16, 256, 50 * 1024 * 1024
+    )
     tile, group, columns = (
         tuning.token_tile,
         tuning.mix_group,
@@ -260,11 +278,13 @@ def shifted_post_pre_rms(
         def run_tile(tile_index, xr, rr, yr, vr):
             previous_projected = projection_buf[...]
 
-            @pl.when(tile_index == 0)
-            def wait_gates():
-                for copy in copies[:-1]:
-                    copy.wait()
-                prepare(0, 0)
+            if not early_prep:
+
+                @pl.when(tile_index == 0)
+                def wait_gates():
+                    for copy in copies[:-1]:
+                        copy.wait()
+                    prepare(0, 0)
 
             pre_tile = load_gate(pr, tile_index)
             slot = tile_index % 2
@@ -346,6 +366,10 @@ def shifted_post_pre_rms(
                 copy.start()
             if index == 0:
                 copies[-1].start()
+        if early_prep:
+            for copy in copies[:-1]:
+                copy.wait()
+            prepare(0, 0)
 
         def body(tile_index, unused):
             for copy in input_copies(tile_index):
@@ -452,6 +476,7 @@ def shifted_post_pre_rms(
         hc_sinkhorn_eps=hc_sinkhorn_eps,
         hc_post_mult_value=hc_post_mult_value,
         sinkhorn_repeat=sinkhorn_repeat,
+        tokens=t if unpadded_gates and gate_tokens <= 1024 else None,
     )
     return (residual, new_post[:t, :, None], new_comb[:t], value, new_pre[:t])
 
@@ -479,8 +504,12 @@ def _pre_gates(
     hc_sinkhorn_eps: float = 1e-06,
     hc_post_mult_value: float = 2.0,
     sinkhorn_repeat: int = 20,
+    tokens: int | None = None,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
-    """FP32 gates from logits [M*(M+2),T] and square sums [1,T]; hidden_size=D."""
+    """FP32 gates from logits [M*(M+2),T] and square sums [1,T]; hidden_size=D.
+
+    ``tokens`` (single-block T only) keeps the first ``tokens`` gate columns.
+    """
     mixes, t = mix.shape
     m = math.isqrt(mixes + 1) - 1
     assert m > 0 and mixes == m * (m + 2), "Expected M*(M+2) mix logits"
@@ -493,6 +522,8 @@ def _pre_gates(
     assert mix.dtype == square.dtype == scale.dtype == base.dtype == jnp.float32
     if not isinstance(sinkhorn_repeat, int) or sinkhorn_repeat < 1:
         raise ValueError("sinkhorn_repeat must be a positive static integer")
+    width = t if tokens is None else tokens
+    assert width == t or (block == t and 0 < width < t)
 
     def gate_kernel(mr, sr, scr, br, pre_out, post_out, comb_out):
         mixed = mr[...] * jax.lax.rsqrt(sr[...] / (m * hidden_size) + rms_eps)
@@ -516,9 +547,9 @@ def _pre_gates(
             comb_mix = comb_mix / (
                 jnp.sum(comb_mix, axis=0, keepdims=True) + hc_sinkhorn_eps
             )
-        pre_out[...] = pre_mix
-        post_out[...] = post_mix
-        comb_out[...] = comb_mix
+        pre_out[...] = pre_mix[..., :width]
+        post_out[...] = post_mix[..., :width]
+        comb_out[...] = comb_mix[..., :width]
 
     pre, post, comb = pl.pallas_call(
         gate_kernel,
@@ -530,13 +561,13 @@ def _pre_gates(
             pl.BlockSpec((mixes,), lambda i: (0,)),
         ],
         out_specs=[
-            pl.BlockSpec((m, block), lambda i: (0, i)),
-            pl.BlockSpec((m, block), lambda i: (0, i)),
-            pl.BlockSpec((m, m, block), lambda i: (0, 0, i)),
+            pl.BlockSpec((m, min(block, width)), lambda i: (0, i)),
+            pl.BlockSpec((m, min(block, width)), lambda i: (0, i)),
+            pl.BlockSpec((m, m, min(block, width)), lambda i: (0, 0, i)),
         ],
         out_shape=[
             jax.ShapeDtypeStruct(shape, jnp.float32)
-            for shape in ((m, t), (m, t), (m, m, t))
+            for shape in ((m, width), (m, width), (m, m, width))
         ],
         compiler_params=pltpu.CompilerParams(dimension_semantics=("parallel",)),
     )(mix, square, scale, base)

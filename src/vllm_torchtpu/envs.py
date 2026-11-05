@@ -13,6 +13,10 @@ if TYPE_CHECKING:
     TPU_DEEPSEEK_V41_ENGRAM_HBM: str = "auto"
     TPU_DEEPSEEK_V41_INDEXER_ISSUE_DEPTH: int | None = 8
     TPU_DEEPSEEK_V41_INDEXER_PUBLISH_ISSUE_DEPTH: int | None = 7
+    TPU_DEEPSEEK_V41_MHC_RESIDENT_GATES: bool = True
+    TPU_DEEPSEEK_V41_MHC_EARLY_PREP: bool = True
+    TPU_DEEPSEEK_V41_MHC_SHIFTED_T16: bool = True
+    TPU_DEEPSEEK_V41_DSPARK_PALLAS_LOGITS: bool = True
     TPU_DEEPSEEK_V41_BLOCKED_ROPE_GATHER: bool = True
     TPU_DEEPSEEK_V41_FUSED_WO_AB: bool = True
     TPU_DEEPSEEK_V41_QB_ROPE_EXACT_ROWS: bool = True
@@ -433,6 +437,31 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_DEEPSEEK_V41_INDEXER_PUBLISH_ISSUE_DEPTH": env_positive_int_or_none(
         "TPU_DEEPSEEK_V41_INDEXER_PUBLISH_ISSUE_DEPTH", default=7
     ),
+    # Shifted mHC: emit the next layer's gates T tokens wide (not padded to a
+    # multiple of 128) and read them as compiler-managed VMEM inputs, so the
+    # gates pass between layers without slice/transpose ops. Layout only;
+    # outputs are unchanged.
+    "TPU_DEEPSEEK_V41_MHC_RESIDENT_GATES": env_bool(
+        "TPU_DEEPSEEK_V41_MHC_RESIDENT_GATES", default=True
+    ),
+    # Shifted mHC: build the first tile's gate coefficients while the first
+    # activation tiles are still in flight (scheduling only; outputs unchanged).
+    "TPU_DEEPSEEK_V41_MHC_EARLY_PREP": env_bool(
+        "TPU_DEEPSEEK_V41_MHC_EARLY_PREP", default=True
+    ),
+    # Shifted mHC: also run token counts that are a multiple of 16 but not 32
+    # (the DSpark drafter's 240 rows) through the fused kernel, with 16-token
+    # mix groups, instead of the unfused post + delayed-pre fallback. Changes
+    # only the drafter's rounding.
+    "TPU_DEEPSEEK_V41_MHC_SHIFTED_T16": env_bool(
+        "TPU_DEEPSEEK_V41_MHC_SHIFTED_T16", default=True
+    ),
+    # DSpark decode sampler: compute the drafter's BF16 base logits with the
+    # Pallas full-K head (kernels/logits_head.py) instead of the XLA dot.
+    # Changes only the draft logits' rounding (FP32 accumulation order).
+    "TPU_DEEPSEEK_V41_DSPARK_PALLAS_LOGITS": env_bool(
+        "TPU_DEEPSEEK_V41_DSPARK_PALLAS_LOGITS", default=True
+    ),
     # Gather RoPE table rows (attention preprocessing, CSA2 inverse RoPE) as
     # 256-row gathers when a step has 257..1024 rows
     # (`rope_gather.by_row_blocks`). Data movement only; outputs unchanged.
@@ -444,6 +473,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_DEEPSEEK_V41_FUSED_WO_AB": env_bool(
         "TPU_DEEPSEEK_V41_FUSED_WO_AB", default=True
     ),
+    # Fused Q-B/RoPE at token counts that are not a multiple of 32 (the DSpark
+    # drafter's 240 rows): write only the real rows instead of slicing a padded
     # [256, 64, 512] result. Same values (bit-exact).
     "TPU_DEEPSEEK_V41_QB_ROPE_EXACT_ROWS": env_bool(
         "TPU_DEEPSEEK_V41_QB_ROPE_EXACT_ROWS", default=True
