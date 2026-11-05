@@ -17,6 +17,7 @@ if TYPE_CHECKING:
     TPU_DEEPSEEK_V41_ENGRAM_HBM: str = "auto"
     TPU_DEEPSEEK_V41_CSA2_EARLY_GATHER: bool = False
     TPU_DEEPSEEK_V41_INDEXER_TAIL_OUTSIDE_COND: bool = False
+    TPU_DEEPSEEK_V41_REUSE_WINDOW_STARTS: bool = False
     TPU_DEEPSEEK_V41_INDEXER_ISSUE_DEPTH: int | None = 8
     TPU_DEEPSEEK_V41_INDEXER_PUBLISH_ISSUE_DEPTH: int | None = 7
     TPU_DEEPSEEK_V41_MHC_RESIDENT_GATES: bool = True
@@ -472,6 +473,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Same kernels on the same scores (bit-exact). Default off until measured.
     "TPU_DEEPSEEK_V41_INDEXER_TAIL_OUTSIDE_COND": env_bool(
         "TPU_DEEPSEEK_V41_INDEXER_TAIL_OUTSIDE_COND", default=False
+    ),
+    # CED decode: reuse the per-request SWA window-starts device tensor while
+    # the replay starts are unchanged, instead of building and uploading it in
+    # every step's host path ahead of the encoder. Same values (bit-exact).
+    # Default off until measured.
+    "TPU_DEEPSEEK_V41_REUSE_WINDOW_STARTS": env_bool(
+        "TPU_DEEPSEEK_V41_REUSE_WINDOW_STARTS", default=False
     ),
     # Packed FP8 dense indexer scorer: fragments in flight between the QK
     # matmul and the head reduction (unset: the tuned 10). The second applies
