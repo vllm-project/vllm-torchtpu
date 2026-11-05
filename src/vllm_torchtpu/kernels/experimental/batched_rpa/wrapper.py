@@ -14,8 +14,9 @@
 """Wrapper for RPA kernel to match expected interface."""
 
 import dataclasses
+import functools
 import math
-from typing import cast
+from typing import Any, cast
 
 import jax
 import jax.numpy as jnp
@@ -25,6 +26,7 @@ from jax.experimental.pallas import tpu as pltpu
 from vllm_torchtpu.kernels.experimental.batched_rpa import (
     configs,
     kernel,
+    output_quant,
     schedule,
     schedule_cp,
     utils,
@@ -627,46 +629,46 @@ def fp8_prefill_block_sizes(
         bq = utils.align_to(max(bq // 2, bq_c), bq_c)
 
 
-@jax.jit(
-    static_argnames=(
-        "sm_scale",
-        "sliding_window",
-        "soft_cap",
-        "mask_value",
-        "use_per_token_scale",
-        "per_token_scale_dtype",
-        "q_scale",
-        "k_scale",
-        "v_scale",
-        "chunk_prefill_size",
-        "decode_block_sizes",
-        "prefill_block_sizes",
-        "vmem_limit_bytes",
-        "debug_mode",
-        "out_dtype",
-        "use_causal_mask",
-        "skip_kv_update",
-        "update_kv_cache",
-        "kv_layout",
-        "decode_query_size",
-        "cp_group_size",
-        "attention_scope",
-        "return_lse",
-        "mask_invalid_v",
-        "skip_empty_launch",
-        "fence_output",
-        "unmasked_interior",
-        "fp8_compute",
-    ),
-    # Donation of transient inputs can fail for some runtime buffer layouts in
-    # the experimental tuning path. Keep donation only for kv_cache, which is
-    # the intended long-lived mutable state.
-    donate_argnames=("kv_cache",),
+_RPA_STATIC_ARGNAMES = (
+    "sm_scale",
+    "sliding_window",
+    "soft_cap",
+    "mask_value",
+    "use_per_token_scale",
+    "per_token_scale_dtype",
+    "q_scale",
+    "k_scale",
+    "v_scale",
+    "chunk_prefill_size",
+    "decode_block_sizes",
+    "prefill_block_sizes",
+    "vmem_limit_bytes",
+    "debug_mode",
+    "out_dtype",
+    "use_causal_mask",
+    "skip_kv_update",
+    "update_kv_cache",
+    "kv_layout",
+    "decode_query_size",
+    "cp_group_size",
+    "attention_scope",
+    "return_lse",
+    "mask_invalid_v",
+    "skip_empty_launch",
+    "fence_output",
+    "unmasked_interior",
+    "fp8_compute",
+    "output_quant_dtype",
 )
-def ragged_paged_attention(
-    queries: jax.Array,
-    keys: jax.Array,
-    values: jax.Array,
+
+
+def _ragged_paged_attention_impl(
+    q_spec: jax.Array | jax.ShapeDtypeStruct,
+    k_spec: jax.Array | jax.ShapeDtypeStruct,
+    v_spec: jax.Array | jax.ShapeDtypeStruct,
+    q_hbm: jax.Array,
+    new_kv_hbm: jax.Array,
+    prepared_q_fetch: jax.Array | None,
     kv_cache: jax.Array,
     kv_lens: jax.Array,
     page_indices: jax.Array,
@@ -704,78 +706,8 @@ def ragged_paged_attention(
     fence_output: bool = True,
     unmasked_interior: bool = True,
     fp8_compute: bool = False,
-) -> tuple[jax.Array, jax.Array] | tuple[jax.Array, jax.Array, jax.Array]:
-    """Perform batched ragged paged attention.
-
-    Args:
-        queries: [max_num_tokens, num_q_heads, head_dim]. Output of q projection.
-        keys: [max_num_tokens, num_kv_heads, head_dim]. Output of k projection.
-        values: [max_num_tokens, num_kv_heads, head_dim]. Output of v projection.
-        kv_cache: [num_pages, page_size, cdiv(num_kv_heads * 2, kv_packing),
-            kv_packing, head_dim]. Stores existing kv cache data where k & vs are
-            concatenated along num kv heads dim.
-        kv_lens: [max_num_seqs]. Existing kv cache length of each sequence.
-        page_indices: [max_num_seqs * pages_per_seqs]. kv cache page table of each
-            sequence.
-        cu_q_lens: [max_num_seqs + 1]. Cumulative sum of each sequence's query
-            length. queries[a:b], keys[a:b], and values[a:b] where a=cu_q_lens[i] and
-            b=cu_q_lens[i+1] represents q/k/v of sequence i.
-        distribution: [3]. Cumulative sum of number of decode, prefill, and mixed
-            sequences (cumulative end indices for decode, prefill-only, and mixed).
-            The prefill-only segment is handled by the mixed kernel call.
-            distribution[2] represents total number of sequences.
-        sm_scale: Softmax scale value.
-        sliding_window: Size of sliding window (also known as local attention). kvs
-            outside of the window is not fetched from hbm and masked out during
-            computation.
-        soft_cap: Cap values of softmax inputs.
-        mask_value: Value to use for causal masking. Defaults to smallest
-            representable value of the activation dtype.
-        use_per_token_scale: Whether to use per-token quantization.
-        per_token_scale_dtype: Dtype of per-token scale. Defaults to None.
-        q_scale: Quantization scale value of queries.
-        k_scale: Per-tensor quantization scale value of keys.
-        v_scale: Per-tensor quantization scale value of values.
-        dynamic_k_scale: Per-token quantization scale value of keys.
-        dynamic_v_scale: Per-token quantization scale value of values.
-        chunk_prefill_size: Not used.
-        decode_block_sizes: Kernel block size to use during decode.
-        prefill_block_sizes: Kernel block size to use during prefill.
-        vmem_limit_bytes: VMEM size limit of the kernel. Defaults to maximum VMEM
-            size of the hardware.
-        debug_mode: Not used.
-        out_dtype: Dtype of output. Defaults to dtype of queries.
-        use_causal_mask: Not used.
-        skip_kv_update: If True, don't write keys/values back to kv_cache
-            (KV-share). All kv, including this step's tokens, is read from kv_cache.
-        update_kv_cache: If set, overrides skip_kv_update (update_kv_cache=False
-            is the same as skip_kv_update=True). None (default) uses skip_kv_update.
-        decode_query_size: Number of query tokens in decode (1 by default, can be
-            higher in case of speculative decoding).
-        cp_group_size: Size of the context parallelism (CP) group. KV cache is
-            sharded across devices in this group. Defaults to None.
-        cp_rank: Rank of the current device within the CP group, which determine
-            the token ownership. Defaults to None.
-        attention_scope: Which KV positions to attend to. FULL attends all
-            positions, CACHE_ONLY skips new tokens, NEW_TOKENS_ONLY skips cached
-            tokens. Defaults to FULL.
-        return_lse: If True, return log-sum-exp (lse) values along with the
-            output. Defaults to False.
-        mask_invalid_v: If True, zero out invalid V token slices before the pv
-            matmul so NaNs in unused VMEM or shared new-KV pages cannot propagate via
-            0.0 * NaN. Defaults to None (True for SEQ_ALONG_LANE, False for
-            HEAD_ALONG_SUBLANE).
-
-    Returns:
-        out: [max_num_tokens, num_q_heads, head_dim]. Output of self attention.
-        new_kv_cache: [num_pages, page_size, cdiv(num_kv_heads * 2, kv_packing),
-            kv_packing, head_dim]. Result of new kv cache where k & vs are
-            concatenated along num kv heads dim.
-        lse (only when return_lse=True): [max_num_tokens, num_q_heads].
-            Log-sum-exp values (m + log(l)) for each query token and head,
-            needed for merging partial attention results in CP.
-    """
-
+    output_quant_dtype: jnp.dtype | None = None,
+) -> tuple[Any, jax.Array] | tuple[jax.Array, jax.Array, jax.Array]:
     if not use_causal_mask:
         raise ValueError("Only causal attention is supported.")
     if chunk_prefill_size is not None:
@@ -783,13 +715,11 @@ def ragged_paged_attention(
     if debug_mode:
         raise ValueError("Debug mode is not supported.")
 
-    # update_kv_cache (as passed by tpu-inference) overrides skip_kv_update when
-    # set; update_kv_cache=False (KV-share) is the same as skip_kv_update=True.
     if update_kv_cache is not None:
         skip_kv_update = not update_kv_cache
 
     if out_dtype is None:
-        out_dtype = queries.dtype
+        out_dtype = q_spec.dtype
     if mask_value is None:
         mask_value = cast(float, jnp.finfo(out_dtype).min)
     if vmem_limit_bytes is None:
@@ -800,9 +730,9 @@ def ragged_paged_attention(
     else:
         page_size = kv_cache.shape[1]
 
-    num_q_heads = queries.shape[1]
-    head_dim = queries.shape[2]
-    num_kv_heads = keys.shape[1]
+    num_q_heads = q_spec.shape[1]
+    head_dim = q_spec.shape[2]
+    num_kv_heads = k_spec.shape[1]
     num_page_indices = page_indices.shape[0]
 
     model_cfgs = configs.ModelConfigs(
@@ -826,24 +756,19 @@ def ragged_paged_attention(
             f" {v_scale=} and {dynamic_v_scale=}"
         )
 
-    k_scale_config = k_scale
-    v_scale_config = v_scale
-    k_scale_tensor = dynamic_k_scale
-    v_scale_tensor = dynamic_v_scale
-
     serve_cfgs = configs.ServingConfigs(
         num_seqs=max_num_seqs,
         num_page_indices=num_page_indices,
-        total_q_tokens=queries.shape[0],
-        dtype_q=queries.dtype,
+        total_q_tokens=q_spec.shape[0],
+        dtype_q=q_spec.dtype,
         dtype_kv=kv_cache.dtype,
         dtype_out=out_dtype,
         page_size=page_size,
         per_token_scale=use_per_token_scale,
         per_token_scale_dtype=per_token_scale_dtype,
         scale_q=q_scale,
-        scale_k=k_scale_config,
-        scale_v=v_scale_config,
+        scale_k=k_scale,
+        scale_v=v_scale,
         kv_layout=kv_layout,
         decode_query_size=decode_query_size,
         cp_group_size=cp_group_size,
@@ -855,18 +780,8 @@ def ragged_paged_attention(
         fence_output=fence_output,
         unmasked_interior=unmasked_interior,
     )
-
-    q_hbm, new_kv_hbm = prepare_inputs(
-        queries,
-        keys,
-        values,
-        queries.dtype,
-        kv_cache.dtype,
-        k_scale_tensor,
-        v_scale_tensor,
-        kv_layout=kv_layout,
-        page_size=page_size,
-    )
+    if output_quant_dtype is not None and (return_lse or cp_group_size is not None):
+        raise ValueError("output_quant_dtype supports neither LSE output nor CP.")
 
     default_decode, default_prefill = calculate_block_sizes(
         model_cfgs,
@@ -877,6 +792,8 @@ def ragged_paged_attention(
 
     mixed_serve_cfgs = serve_cfgs
     q_fetch_hbm: jax.Array | None = None
+    if prepared_q_fetch is not None and not fp8_compute:
+        raise ValueError("prepared FP8 queries require fp8_compute=True.")
     if fp8_compute:
         validate_fp8_compute(
             kv_cache.dtype,
@@ -889,22 +806,33 @@ def ragged_paged_attention(
         mixed_serve_cfgs = dataclasses.replace(
             serve_cfgs, dtype_q=kv_cache.dtype, fp8_compute=True
         )
-        q_fetch_hbm = quantize_queries(q_hbm, kv_cache.dtype)
+        if prepared_q_fetch is None:
+            q_fetch_hbm = quantize_queries(q_hbm, kv_cache.dtype)
+        else:
+            want = jax.eval_shape(
+                functools.partial(quantize_queries, dtype=kv_cache.dtype), q_hbm
+            )
+            got = (prepared_q_fetch.shape, prepared_q_fetch.dtype)
+            if got != (want.shape, want.dtype):
+                raise ValueError(
+                    f"prepared FP8 queries {got} != expected {(want.shape, want.dtype)}"
+                )
+            q_fetch_hbm = prepared_q_fetch
         default_prefill = fp8_prefill_block_sizes(
             model_cfgs,
             mixed_serve_cfgs,
             vmem_limit_bytes,
         )
-    # Pre-allocate LSE buffer.
+
     lse_hbm_init: jax.Array | None = None
     if return_lse:
         num_lanes = pltpu.get_tpu_info().num_lanes
-        q_packing = utils.get_dtype_packing(queries.dtype)
+        q_packing = utils.get_dtype_packing(q_spec.dtype)
         num_q_heads_per_kv_head = num_q_heads // num_kv_heads
         aligned_num_q_heads_per_kv_head = utils.align_to(
             num_q_heads_per_kv_head, q_packing
         )
-        max_tokens = queries.shape[0]
+        max_tokens = q_spec.shape[0]
         lse_hbm_init = jnp.full(
             [
                 num_kv_heads,
@@ -917,7 +845,6 @@ def ragged_paged_attention(
             dtype=out_dtype,
         )
 
-    # Compute per-sequence length parameters for the kernel.
     q_lens = cu_q_lens[1:] - cu_q_lens[:-1]
     global_kv_cache_lens = kv_lens - q_lens
 
@@ -942,7 +869,7 @@ def ragged_paged_attention(
 
     # XLA copies the output buffer around lax.cond, so host-level empty-segment
     # branching is bounded to buckets no larger than a full decode batch.
-    branch_on_empty_segment = queries.shape[0] <= max_num_seqs * decode_query_size
+    branch_on_empty_segment = q_spec.shape[0] <= max_num_seqs * decode_query_size
 
     def run_rpa_kernel(
         mode: configs.RpaCase,
@@ -965,16 +892,15 @@ def ragged_paged_attention(
             mode=mode,
         )
         cfgs.validate_inputs(
-            q=queries,
-            k=keys,
-            v=values,
+            q=cast(jax.Array, q_spec),
+            k=cast(jax.Array, k_spec),
+            v=cast(jax.Array, v_spec),
             kv_cache=kv_cache,
             kv_lens=kv_lens,
             page_indices=page_indices,
             cu_q_lens=cu_q_lens,
             distribution=distribution,
         )
-        # Select metadata computer class.
         if cp_group_size is not None:
             computer_cls = schedule_cp.CPMetadataComputer
             extra_scalars = (cp_rank,) if cp_rank is not None else ()
@@ -1028,14 +954,19 @@ def ragged_paged_attention(
         configs.RpaCase.MIXED, o_hbm_alias_q_hbm, kv_cache, lse_hbm
     )
 
-    # before: [kv_heads, max_tokens, q_per_kv // q_packing, q_packing, d]
-    o_hbm = prepare_outputs(o_hbm_alias_q_hbm)
-    # after: [kv_heads, max_tokens, q_per_kv, d]
-
-    # slice back to original shape if padded
     num_q_heads_per_kv_head = num_q_heads // num_kv_heads
+    if output_quant_dtype is not None:
+        quantized = output_quant.quantize_head_major_output(
+            o_hbm_alias_q_hbm,
+            quant_dtype=output_quant_dtype,
+            num_q_heads_per_kv_head=num_q_heads_per_kv_head,
+            head_dim=head_dim,
+        )
+        return quantized, kv_cache
+
+    o_hbm = prepare_outputs(o_hbm_alias_q_hbm)
     o_hbm = o_hbm[:, :, :num_q_heads_per_kv_head, :head_dim]
-    o_hbm = o_hbm.swapaxes(1, 0).reshape(queries.shape)
+    o_hbm = o_hbm.swapaxes(1, 0).reshape(q_spec.shape)
     if fence_output:
         # Materialize the token-major transpose in output precision rather than
         # fusing it into downstream f32 quantization or projection math.
@@ -1044,13 +975,265 @@ def ragged_paged_attention(
     if not return_lse:
         return o_hbm, kv_cache
 
-    # Reshape LSE from [num_kv_heads, max_tokens, q_per_kv // q_packing, q_packing
-    # , num_lanes] to [max_tokens, num_q_heads].
-    max_tokens = queries.shape[0]
-    # Extract first lane (scalar LSE value per token-head pair).
+    max_tokens = q_spec.shape[0]
     lse = cast(jax.Array, lse_hbm).reshape(
         num_kv_heads, max_tokens, aligned_num_q_heads_per_kv_head, num_lanes
     )[:, :max_tokens, :num_q_heads_per_kv_head, 0]
     lse = lse.swapaxes(0, 1).reshape(max_tokens, num_q_heads)
 
     return o_hbm, kv_cache, lse
+
+
+@jax.jit(
+    static_argnames=_RPA_STATIC_ARGNAMES,
+    # Donation of transient inputs can fail for some runtime buffer layouts in
+    # the experimental tuning path. Keep donation only for kv_cache, which is
+    # the intended long-lived mutable state.
+    donate_argnames=("kv_cache",),
+)
+def ragged_paged_attention(
+    queries: jax.Array,
+    keys: jax.Array,
+    values: jax.Array,
+    kv_cache: jax.Array,
+    kv_lens: jax.Array,
+    page_indices: jax.Array,
+    cu_q_lens: jax.Array,
+    distribution: jax.Array,
+    *,
+    sm_scale: float = 1.0,
+    sliding_window: int | None = None,
+    soft_cap: float | None = None,
+    mask_value: float | None = None,
+    use_per_token_scale: bool = False,
+    per_token_scale_dtype: jnp.dtype | None = None,
+    q_scale: float | None = None,
+    k_scale: float | None = None,
+    v_scale: float | None = None,
+    dynamic_k_scale: jax.Array | None = None,
+    dynamic_v_scale: jax.Array | None = None,
+    chunk_prefill_size: int | None = None,
+    decode_block_sizes: configs.BlockSizes | None = None,
+    prefill_block_sizes: configs.BlockSizes | None = None,
+    vmem_limit_bytes: int | None = None,
+    debug_mode: bool = False,
+    out_dtype: jnp.dtype | None = None,
+    use_causal_mask: bool = True,
+    skip_kv_update: bool = False,
+    update_kv_cache: bool | None = None,
+    kv_layout: configs.KVLayout = configs.KVLayout.HEAD_ALONG_SUBLANE,
+    decode_query_size: int = 1,
+    cp_group_size: int | None = None,
+    cp_rank: jax.Array | None = None,
+    attention_scope: configs.AttentionScope = configs.AttentionScope.FULL,
+    return_lse: bool = False,
+    mask_invalid_v: bool | None = None,
+    skip_empty_launch: bool = True,
+    fence_output: bool = True,
+    unmasked_interior: bool = True,
+    fp8_compute: bool = False,
+    output_quant_dtype: jnp.dtype | None = None,
+    prepared_inputs: tuple[jax.Array, ...] | None = None,
+) -> tuple[Any, jax.Array] | tuple[jax.Array, jax.Array, jax.Array]:
+    """Perform batched ragged paged attention."""
+    page_size = (
+        kv_cache.shape[4]
+        if kv_layout == configs.KVLayout.SEQ_ALONG_LANE
+        else kv_cache.shape[1]
+    )
+    prepare = functools.partial(
+        prepare_inputs,
+        q_dtype=queries.dtype,
+        kv_dtype=kv_cache.dtype,
+        k_scale=dynamic_k_scale,
+        v_scale=dynamic_v_scale,
+        kv_layout=kv_layout,
+        page_size=page_size,
+    )
+    prepared_q_fetch: jax.Array | None = None
+    if prepared_inputs is None:
+        q_hbm, new_kv_hbm = prepare(queries, keys, values)
+    else:
+        expected = [
+            (a.shape, a.dtype) for a in jax.eval_shape(prepare, queries, keys, values)
+        ]
+        got = [(a.shape, a.dtype) for a in prepared_inputs[:2]]
+        if got != expected or len(prepared_inputs) > 3:
+            raise ValueError(f"prepared_inputs {got} != prepare_inputs {expected}")
+        q_hbm, new_kv_hbm = prepared_inputs[:2]
+        if len(prepared_inputs) == 3:
+            prepared_q_fetch = prepared_inputs[2]
+
+    return _ragged_paged_attention_impl(
+        queries,
+        keys,
+        values,
+        q_hbm,
+        new_kv_hbm,
+        prepared_q_fetch,
+        kv_cache,
+        kv_lens,
+        page_indices,
+        cu_q_lens,
+        distribution,
+        sm_scale=sm_scale,
+        sliding_window=sliding_window,
+        soft_cap=soft_cap,
+        mask_value=mask_value,
+        use_per_token_scale=use_per_token_scale,
+        per_token_scale_dtype=per_token_scale_dtype,
+        q_scale=q_scale,
+        k_scale=k_scale,
+        v_scale=v_scale,
+        dynamic_k_scale=dynamic_k_scale,
+        dynamic_v_scale=dynamic_v_scale,
+        chunk_prefill_size=chunk_prefill_size,
+        decode_block_sizes=decode_block_sizes,
+        prefill_block_sizes=prefill_block_sizes,
+        vmem_limit_bytes=vmem_limit_bytes,
+        debug_mode=debug_mode,
+        out_dtype=out_dtype,
+        use_causal_mask=use_causal_mask,
+        skip_kv_update=skip_kv_update,
+        update_kv_cache=update_kv_cache,
+        kv_layout=kv_layout,
+        decode_query_size=decode_query_size,
+        cp_group_size=cp_group_size,
+        cp_rank=cp_rank,
+        attention_scope=attention_scope,
+        return_lse=return_lse,
+        mask_invalid_v=mask_invalid_v,
+        skip_empty_launch=skip_empty_launch,
+        fence_output=fence_output,
+        unmasked_interior=unmasked_interior,
+        fp8_compute=fp8_compute,
+        output_quant_dtype=output_quant_dtype,
+    )
+
+
+@jax.jit(
+    static_argnames=("num_q_heads", "num_kv_heads", "head_dim", *_RPA_STATIC_ARGNAMES),
+    donate_argnames=("kv_cache",),
+)
+def ragged_paged_attention_prepared(
+    q_hbm: jax.Array,
+    new_kv_hbm: jax.Array,
+    kv_cache: jax.Array,
+    kv_lens: jax.Array,
+    page_indices: jax.Array,
+    cu_q_lens: jax.Array,
+    distribution: jax.Array,
+    *,
+    num_q_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+    q_fetch_hbm: jax.Array | None = None,
+    sm_scale: float = 1.0,
+    sliding_window: int | None = None,
+    soft_cap: float | None = None,
+    mask_value: float | None = None,
+    use_per_token_scale: bool = False,
+    per_token_scale_dtype: jnp.dtype | None = None,
+    q_scale: float | None = None,
+    k_scale: float | None = None,
+    v_scale: float | None = None,
+    dynamic_k_scale: jax.Array | None = None,
+    dynamic_v_scale: jax.Array | None = None,
+    chunk_prefill_size: int | None = None,
+    decode_block_sizes: configs.BlockSizes | None = None,
+    prefill_block_sizes: configs.BlockSizes | None = None,
+    vmem_limit_bytes: int | None = None,
+    debug_mode: bool = False,
+    out_dtype: jnp.dtype | None = None,
+    use_causal_mask: bool = True,
+    skip_kv_update: bool = False,
+    update_kv_cache: bool | None = None,
+    kv_layout: configs.KVLayout = configs.KVLayout.HEAD_ALONG_SUBLANE,
+    decode_query_size: int = 1,
+    cp_group_size: int | None = None,
+    cp_rank: jax.Array | None = None,
+    attention_scope: configs.AttentionScope = configs.AttentionScope.FULL,
+    return_lse: bool = False,
+    mask_invalid_v: bool | None = None,
+    skip_empty_launch: bool = True,
+    fence_output: bool = True,
+    unmasked_interior: bool = True,
+    fp8_compute: bool = False,
+    output_quant_dtype: jnp.dtype | None = None,
+) -> tuple[Any, jax.Array] | tuple[jax.Array, jax.Array, jax.Array]:
+    """Run batched ragged paged attention directly from pre-packed prologue outputs."""
+    tokens = q_hbm.shape[1]
+    kv_head_dim = head_dim // 2 if kv_cache.dtype == jnp.uint8 else head_dim
+    q_spec = jax.ShapeDtypeStruct((tokens, num_q_heads, head_dim), q_hbm.dtype)
+    kv_spec = jax.ShapeDtypeStruct((tokens, num_kv_heads, kv_head_dim), kv_cache.dtype)
+    page_size = (
+        kv_cache.shape[4]
+        if kv_layout == configs.KVLayout.SEQ_ALONG_LANE
+        else kv_cache.shape[1]
+    )
+    expected = [
+        (a.shape, a.dtype)
+        for a in jax.eval_shape(
+            functools.partial(
+                prepare_inputs,
+                q_dtype=q_spec.dtype,
+                kv_dtype=kv_cache.dtype,
+                k_scale=dynamic_k_scale,
+                v_scale=dynamic_v_scale,
+                kv_layout=kv_layout,
+                page_size=page_size,
+            ),
+            q_spec,
+            kv_spec,
+            kv_spec,
+        )
+    ]
+    got = [(q_hbm.shape, q_hbm.dtype), (new_kv_hbm.shape, new_kv_hbm.dtype)]
+    if got != expected:
+        raise ValueError(f"prepared inputs {got} != prepare_inputs {expected}")
+
+    return _ragged_paged_attention_impl(
+        q_spec,
+        kv_spec,
+        kv_spec,
+        q_hbm,
+        new_kv_hbm,
+        q_fetch_hbm,
+        kv_cache,
+        kv_lens,
+        page_indices,
+        cu_q_lens,
+        distribution,
+        sm_scale=sm_scale,
+        sliding_window=sliding_window,
+        soft_cap=soft_cap,
+        mask_value=mask_value,
+        use_per_token_scale=use_per_token_scale,
+        per_token_scale_dtype=per_token_scale_dtype,
+        q_scale=q_scale,
+        k_scale=k_scale,
+        v_scale=v_scale,
+        dynamic_k_scale=dynamic_k_scale,
+        dynamic_v_scale=dynamic_v_scale,
+        chunk_prefill_size=chunk_prefill_size,
+        decode_block_sizes=decode_block_sizes,
+        prefill_block_sizes=prefill_block_sizes,
+        vmem_limit_bytes=vmem_limit_bytes,
+        debug_mode=debug_mode,
+        out_dtype=out_dtype,
+        use_causal_mask=use_causal_mask,
+        skip_kv_update=skip_kv_update,
+        update_kv_cache=update_kv_cache,
+        kv_layout=kv_layout,
+        decode_query_size=decode_query_size,
+        cp_group_size=cp_group_size,
+        cp_rank=cp_rank,
+        attention_scope=attention_scope,
+        return_lse=return_lse,
+        mask_invalid_v=mask_invalid_v,
+        skip_empty_launch=skip_empty_launch,
+        fence_output=fence_output,
+        unmasked_interior=unmasked_interior,
+        fp8_compute=fp8_compute,
+        output_quant_dtype=output_quant_dtype,
+    )

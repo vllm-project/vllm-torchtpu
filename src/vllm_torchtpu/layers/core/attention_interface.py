@@ -39,6 +39,9 @@ from vllm_torchtpu.kernels.deepseek_v4 import streamindex_topk
 from vllm_torchtpu.kernels.experimental.batched_rpa import (
     configs as batched_rpa_configs,
 )
+from vllm_torchtpu.kernels.experimental.batched_rpa import (
+    prologue as rpa_prologue,
+)
 from vllm_torchtpu.kernels.flash_attention.kernel import flash_attention
 from vllm_torchtpu.kernels.mla import dispatch as mla_dispatch
 from vllm_torchtpu.kernels.mla import kv_cache_utils
@@ -492,6 +495,119 @@ def sharded_ragged_paged_attention(
         out_specs=out_specs,
         check_rep=False,
     )(*args)
+
+
+def sharded_ragged_paged_attention_from_qkv(
+    mesh: Mesh,
+    qkv: jax.Array,
+    cos: jax.Array,
+    sin: jax.Array,
+    q_norm_weight: jax.Array,
+    k_norm_weight: jax.Array,
+    kv_cache: jax.Array,
+    kv_lens: jax.Array,
+    page_indices: jax.Array,
+    cu_q_lens: jax.Array,
+    distribution: jax.Array,
+    *,
+    num_q_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+    eps: float,
+    sm_scale: float,
+    k_scale: float,
+    v_scale: float,
+    v_rms_norm: bool = False,
+    attention_chunk_size: int | None = None,
+    soft_cap: float | None = None,
+    **rpa_kwargs: Any,
+) -> tuple[Any, jax.Array]:
+    """Run batched RPA on fused QKV projection rows over a 1-device model axis."""
+    shards = mesh.shape["model"]
+    if shards != 1:
+        raise NotImplementedError(
+            f"fused qkv rows need a one-device model axis, got {shards} shards"
+        )
+    q_heads, kv_heads = num_q_heads, num_kv_heads
+    kv_cache_spec = P(None, None, "model", None, None)
+    emit_fp8_queries = bool(
+        rpa_kwargs.pop("prologue_fp8_queries", rpa_kwargs.get("fp8_compute", False))
+    )
+
+    def _attend(qkv, cos, sin, wq, wk, kv_cache, kv_lens, pages, cu_q_lens, dist):
+        prepared = rpa_prologue.qkv_to_rpa_inputs(
+            qkv,
+            cos,
+            sin,
+            wq,
+            wk,
+            num_q_heads=q_heads,
+            num_kv_heads=kv_heads,
+            head_dim=head_dim,
+            eps=eps,
+            k_scale=k_scale,
+            v_scale=v_scale,
+            kv_dtype=kv_cache.dtype,
+            v_rms_norm=v_rms_norm,
+            emit_fp8_queries=emit_fp8_queries,
+        )
+        q_hbm, new_kv_hbm, *extra = prepared
+        q_fetch_hbm = extra[0] if extra else None
+        return rpa_batched.ragged_paged_attention_prepared(
+            q_hbm,
+            new_kv_hbm,
+            kv_cache,
+            kv_lens,
+            pages,
+            cu_q_lens,
+            dist,
+            num_q_heads=q_heads,
+            num_kv_heads=kv_heads,
+            head_dim=head_dim,
+            q_fetch_hbm=q_fetch_hbm,
+            sm_scale=sm_scale,
+            sliding_window=attention_chunk_size,
+            k_scale=k_scale,
+            v_scale=v_scale,
+            soft_cap=soft_cap,
+            **rpa_kwargs,
+        )
+
+    replicated = P(None, None)
+    out_spec = (
+        P(None, "model", None)
+        if rpa_kwargs.get("output_quant_dtype") is None
+        else (P(None, "model"), replicated)
+    )
+    return shard_map.shard_map(
+        _attend,
+        mesh=mesh,
+        in_specs=(
+            P(None, "model"),
+            replicated,
+            replicated,
+            P(None),
+            P(None),
+            kv_cache_spec,
+            P(None),
+            P(None),
+            P(None),
+            P(None),
+        ),
+        out_specs=(out_spec, kv_cache_spec),
+        check_rep=False,
+    )(
+        qkv,
+        cos,
+        sin,
+        q_norm_weight,
+        k_norm_weight,
+        kv_cache,
+        kv_lens,
+        page_indices,
+        cu_q_lens,
+        distribution,
+    )
 
 
 def attention_bundled(
