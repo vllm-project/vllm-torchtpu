@@ -122,5 +122,7 @@ def test_assert_rank_uniform_declines_fails_when_both_ranks_serve(
     tmp_path: Path,
 ) -> None:
     src = (testkit.TOY_PLUGIN, testkit.TOY_PLUGIN)
-    with pytest.raises(AssertionError):
+    # The serve check fails, not a crashed rank (run_two_ranks asserts that
+    # each rank exits cleanly, with its log as the message).
+    with pytest.raises(AssertionError, match=r"rank 0 served \(ProgramDriver\)"):
         testkit.assert_rank_uniform_declines(tmp_path, sources=src)

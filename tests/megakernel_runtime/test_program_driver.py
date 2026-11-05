@@ -20,6 +20,7 @@ from __future__ import annotations
 import ast
 import dataclasses
 import importlib
+import json
 import logging
 import textwrap
 from pathlib import Path
@@ -126,6 +127,71 @@ def test_toy_plugin_serves_through_try_forward(
             None,
         )
     assert drv.step_mix_tracker.counts == {"mk_t1_b4": 1, "stock_big": 1}
+
+
+class _StockModel:
+    """A stand-in for `runner.model`: records its calls, returns `-input_ids`
+    wrapped in a one-element list (as `@support_torch_compile` may)."""
+
+    def __init__(self) -> None:
+        self.calls: list[int] = []
+
+    def __call__(self, *, input_ids: Any, positions: Any, inputs_embeds: Any) -> Any:
+        del positions, inputs_embeds
+        self.calls.append(int(input_ids.shape[0]))
+        return [-input_ids.float()]
+
+
+def test_ab_calibration_alternates_and_times_the_stock_arm(
+    toy: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With `ab` on, an eligible step alternates between the megakernel and
+    the stock model (both timed, both `hit=True`); an ineligible step is timed
+    on the stock model; a step the program doesn't classify stays with the
+    runner."""
+    _no_group(monkeypatch)
+    _fwd_ctx(monkeypatch)
+    runner = testing.fake_runner(megakernel={"plugin": "toy_mk_plugin", "ab": True})
+    stock = _StockModel()
+    runner.model = stock
+    drv = driver_mod.ProgramDriver.maybe_create(runner)
+    assert isinstance(drv, driver_mod.ProgramDriver) and drv.ab_calibrator.enabled
+    runner._megakernel = drv
+    drv.bind_and_warmup(runner)
+
+    ids = torch.arange(3, dtype=torch.int32)
+    outs = []
+    for _ in range(4):
+        hit, out = drv.try_forward(runner, StepContext(ids, torch.zeros(3)))
+        assert hit
+        # A stock-arm step leaves no megakernel step pending.
+        assert drv._pending is None
+        outs.append(out)
+    mk_out, stock_out = ids.float() * 2.0 + 4, -ids.float()
+    for out, want in zip(outs, (mk_out, stock_out, mk_out, stock_out), strict=True):
+        assert torch.equal(out, want)
+    big = torch.arange(9, dtype=torch.int32)
+    hit, out = drv.try_forward(runner, StepContext(big, torch.zeros(9)))
+    assert hit and torch.equal(out, -big.float())
+    assert stock.calls == [3, 3, 9]
+    assert drv.step_mix_tracker.counts == {
+        "mk_t1_b4_ab_mk": 2,
+        "mk_t1_b4_ab_stock": 2,
+        "stock_big": 1,
+    }
+    cal = drv.ab_calibrator
+    cum = json.loads(cal.format_summary(cal._cumulative))
+    assert (cum["mk_t1_b4_p3"]["mk"][0], cum["mk_t1_b4_p3"]["stock"][0]) == (2, 2)
+    assert "d_mean_ms" in cum["mk_t1_b4_p3"]
+    assert cum["stock_big_p9"]["stock"][0] == 1 and "mk" not in cum["stock_big_p9"]
+
+    # Not classified by the program (`decide` returns None), or not a
+    # megakernel step at all (`inputs_embeds`): the runner's own forward.
+    monkeypatch.setattr(drv.program, "decide", lambda ctx, fwd: None)
+    assert drv.try_forward(runner, StepContext(ids, torch.zeros(3))) == (False, None)
+    embeds = StepContext(None, torch.zeros(3), inputs_embeds=torch.zeros(3, 4))
+    assert drv.try_forward(runner, embeds) == (False, None)
+    assert stock.calls == [3, 3, 9]
 
 
 def test_toy_fingerprint_changes_with_options_and_source(

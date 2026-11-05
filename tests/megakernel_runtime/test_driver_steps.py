@@ -17,15 +17,18 @@ the bind agreement before warmup."""
 from __future__ import annotations
 
 import logging
+from types import SimpleNamespace
 from typing import Any
 
 import jax
 import numpy as np
 import pytest
+import torch
 from jax.sharding import Mesh
 
 import vllm_torchtpu.megakernel_runtime.agreement as agreement_mod
 import vllm_torchtpu.megakernel_runtime.driver as driver_mod
+from vllm_torchtpu.megakernel.runtime.stats import BatchShape
 
 
 @pytest.fixture(autouse=True)
@@ -134,6 +137,133 @@ def test_get_pallas_mesh_fn_is_none_without_torch_tpu(
 
     monkeypatch.setitem(sys.modules, "torch_tpu", None)
     assert driver_mod._get_pallas_mesh_fn() is None
+
+
+def _step_runner(
+    num_reqs: int | None = None,
+    qsl: list[int] | None = None,
+    *,
+    offsets: bool = False,
+    comb_key: tuple[Any, int, int] | None = None,
+    comb_cpu: list[int] | None = None,
+) -> Any:
+    """The runner attributes `_inspect_step_detail` reads during a step."""
+    return SimpleNamespace(
+        _attn_metadata_builder_ctx=SimpleNamespace(num_reqs=num_reqs),
+        mamba_slot_read_offsets=torch.zeros(4, dtype=torch.int32) if offsets else None,
+        _cached_comb_key=comb_key,
+        _combined_request_distribution_cpu=(
+            None if comb_cpu is None else torch.tensor(comb_cpu, dtype=torch.int32)
+        ),
+        query_start_loc_np=None if qsl is None else np.asarray(qsl, dtype=np.int32),
+        query_start_loc_cpu=None,
+    )
+
+
+def _i32(*vals: int) -> torch.Tensor:
+    return torch.tensor(vals, dtype=torch.int32)
+
+
+_NO_MD = SimpleNamespace()
+
+
+@pytest.mark.parametrize(
+    "runner, attn_md, m0, want",
+    [
+        # The runner decides: its request count and host query_start_loc.
+        (_step_runner(3, [0, 1, 2, 3]), _NO_MD, _NO_MD, BatchShape(True, 3, 1, "ok")),
+        # A multi-token step without slot read offsets is a prefill.
+        (
+            _step_runner(2, [0, 4, 8]),
+            _NO_MD,
+            _NO_MD,
+            BatchShape(False, 2, 0, "stock_prefill"),
+        ),
+        # Slot read offsets: the combined distribution (decode, total) from
+        # the cached key; equal counts serve the verify step.
+        (
+            _step_runner(2, [0, 4, 8], offsets=True, comb_key=("k", 2, 2)),
+            _NO_MD,
+            _NO_MD,
+            BatchShape(True, 2, 4, "ok"),
+        ),
+        (
+            _step_runner(2, [0, 5, 9], offsets=True, comb_key=("k", 0, 2)),
+            _NO_MD,
+            _NO_MD,
+            BatchShape(False, 2, 0, "stock_prefill"),
+        ),
+        (
+            _step_runner(2, [0, 4, 9], offsets=True, comb_key=("k", 1, 2)),
+            _NO_MD,
+            _NO_MD,
+            BatchShape(False, 2, 0, "stock_mixed"),
+        ),
+        # ... or from the CPU distribution tensor (indices 3 and 5), with the
+        # request count taken from it.
+        (
+            _step_runner(None, [0, 4, 8], offsets=True, comb_cpu=[0, 0, 0, 2, 0, 2]),
+            _NO_MD,
+            _NO_MD,
+            BatchShape(True, 2, 4, "ok"),
+        ),
+        # Without a host query_start_loc the distribution alone can decline.
+        (
+            _step_runner(None, None, offsets=True, comb_key=("k", 1, 2)),
+            _NO_MD,
+            _NO_MD,
+            BatchShape(False, 2, 0, "stock_mixed"),
+        ),
+        # CPU attention metadata (no runner): the request distribution, the
+        # sequence count and query_start_loc_cpu.
+        (
+            None,
+            SimpleNamespace(
+                request_distribution=_i32(3, 0, 3),
+                num_seqs=3,
+                query_start_loc_cpu=_i32(0, 1, 2, 3),
+            ),
+            _NO_MD,
+            BatchShape(True, 3, 1, "ok"),
+        ),
+        # The recurrent layer's distribution comes first.
+        (
+            None,
+            SimpleNamespace(request_distribution=_i32(2, 0, 2), num_seqs=2),
+            SimpleNamespace(mamba_request_distribution=_i32(1, 0, 2)),
+            BatchShape(False, 2, 0, "stock_mixed"),
+        ),
+        # A CPU query_start_loc tensor serves as the host copy.
+        (
+            None,
+            SimpleNamespace(num_seqs=2, query_start_loc=_i32(0, 1, 2)),
+            _NO_MD,
+            BatchShape(True, 2, 1, "ok"),
+        ),
+        # No host query_start_loc anywhere fails closed.
+        (
+            _step_runner(2, None),
+            SimpleNamespace(num_seqs=2),
+            _NO_MD,
+            BatchShape(False, 0, 0, "stock_no_qsl"),
+        ),
+    ],
+    ids=[
+        "runner_decode",
+        "runner_multi_token_without_offsets",
+        "offsets_comb_key_verify",
+        "offsets_comb_key_prefill",
+        "offsets_comb_key_mixed",
+        "offsets_comb_cpu_tensor",
+        "offsets_without_query_start_loc",
+        "metadata_decode",
+        "metadata_recurrent_distribution_first",
+        "metadata_query_start_loc_tensor",
+        "no_host_query_start_loc",
+    ],
+)
+def test_inspect_step_detail(runner: Any, attn_md: Any, m0: Any, want: Any) -> None:
+    assert driver_mod._inspect_step_detail(attn_md, m0, runner) == want
 
 
 def _bare_driver(monkeypatch: pytest.MonkeyPatch, *, eligible: bool = True) -> Any:

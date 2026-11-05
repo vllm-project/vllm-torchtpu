@@ -435,7 +435,10 @@ def assert_rank_uniform_declines(tmp_path: Path, **kwargs: Any) -> list[dict[str
     declines or raises, at least one declines, and nothing hung."""
     results = run_two_ranks(tmp_path, **kwargs)
     for rank, res in enumerate(results):
-        assert res.get("type") == "DeclinedDriver" or "raised" in res, (rank, results)
+        assert res.get("type") == "DeclinedDriver" or "raised" in res, (
+            f"rank {rank} served ({res.get('type')}); expected every rank to "
+            f"decline or raise: {results}"
+        )
     assert any(r.get("type") == "DeclinedDriver" for r in results), results
     return results
 
