@@ -1048,6 +1048,7 @@ def _effective_row_lengths(
         "interleave_size",
         "return_scores",
         "uniform_q_len",
+        "scheduling_group_base",
     ),
 )
 def streamindex_topk(
@@ -1077,6 +1078,7 @@ def streamindex_topk(
     interleave_size: int = 1,
     return_scores: bool = False,
     uniform_q_len: int | None = None,
+    scheduling_group_base: int | None = None,
 ) -> jax.Array | tuple[jax.Array, jax.Array]:
     """StreamIndex Top-K retrieval.
 
@@ -1532,7 +1534,11 @@ def streamindex_topk(
         # pair to annotate and takes the `None` branch below both times.
         group_base = 0
         if num_chunks > 1:
-            group_base = config.reserve_scheduling_group_ids(num_chunks - 1)
+            group_base = (
+                scheduling_group_base
+                if scheduling_group_base is not None
+                else config.reserve_scheduling_group_ids(num_chunks - 1)
+            )
 
         chunk_starts = (
             (None,)
@@ -1652,6 +1658,7 @@ def streamindex_topk(
         "chunk_tokens",
         "dcp_axis_name",
         "a2a_merge",
+        "scheduling_group_base",
     ),
 )
 def streamindex_topk_dcp(
@@ -1677,6 +1684,7 @@ def streamindex_topk_dcp(
     chunk_tokens: int | None = None,
     dcp_axis_name: str = DCP_AXIS_NAME,
     a2a_merge: bool = False,
+    scheduling_group_base: int | None = None,
 ) -> jax.Array:
     """Exact global top-k over a DCP-sharded KV cache, delivered rank-local.
 
@@ -1773,6 +1781,10 @@ def streamindex_topk_dcp(
         raise ValueError(
             f"padded_num_tokens={q.shape[0]} must be divisible by dcp_size={dcp_size}."
         )
+    if scheduling_group_base is None:
+        scheduling_group_base = config.reserve_chunk_scheduling_group_base(
+            q.shape[0], chunk_tokens
+        )
 
     def _local(
         q,
@@ -1808,6 +1820,7 @@ def streamindex_topk_dcp(
             cp_rank=dcp_rank,
             interleave_size=interleave_size,
             return_scores=True,
+            scheduling_group_base=scheduling_group_base,
         )
 
         if a2a_merge:

@@ -136,3 +136,22 @@ def reset_scheduling_group_ids() -> None:
     global _scheduling_group_ids
     with _scheduling_group_ids_lock:
         _scheduling_group_ids = itertools.count(1)
+
+
+def reserve_chunk_scheduling_group_base(
+    max_num_tokens: int, chunk_tokens: int | None
+) -> int | None:
+    """Reserves the first scheduling group id for a chunked pass, or `None`.
+
+    Callers that trace one custom-op closure per layer must reserve here before
+    entering `@jax.jit`-cached `streamindex_topk` / `streamindex_topk_dcp`:
+    otherwise JAX's jit trace cache reuses layer 0's ids for every layer.
+    """
+    if (
+        chunk_tokens is None
+        or chunk_tokens <= 0
+        or max_num_tokens <= chunk_tokens
+        or max_num_tokens % chunk_tokens != 0
+    ):
+        return None
+    return reserve_scheduling_group_ids(max_num_tokens // chunk_tokens - 1)

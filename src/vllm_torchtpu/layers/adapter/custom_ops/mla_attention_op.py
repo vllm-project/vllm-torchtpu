@@ -56,6 +56,9 @@ from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
     streamindex_topk,
     streamindex_topk_dcp,
 )
+from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
+    config as streamidx_config,
+)
 from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.vllm_adapter import (
     pcp_streaming_jax_op,
 )
@@ -511,6 +514,9 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
             kv_pages_per_block, queries_per_block = _streamidx_block_sizes(
                 q.shape[0], *small_bucket
             )
+            sched_base = streamidx_config.reserve_chunk_scheduling_group_base(
+                q.shape[0], chunk_tokens
+            )
             topk_indices = streamindex_topk(
                 q,
                 weights,
@@ -526,6 +532,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
                 enable_early_exit=STREAMIDX_ENABLE_EARLY_EXIT,
                 kv_layout=kv_layout,
                 chunk_tokens=chunk_tokens,
+                scheduling_group_base=sched_base,
             )
             return cache_kv, topk_indices
 
@@ -606,6 +613,9 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
             kv_pages_per_block, queries_per_block = _streamidx_block_sizes(
                 q.shape[0], *small_bucket
             )
+            sched_base = streamidx_config.reserve_chunk_scheduling_group_base(
+                q.shape[0], chunk_tokens
+            )
             local_topk = streamindex_topk_dcp(
                 q,
                 weights,
@@ -626,6 +636,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
                 a2a_merge=_dcp_indexer_a2a_for_bucket(
                     q.shape[0], a2a_merge, a2a_min_tokens
                 ),
+                scheduling_group_base=sched_base,
             )
             return cache_kv, local_topk
 

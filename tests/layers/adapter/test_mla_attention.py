@@ -1030,6 +1030,68 @@ def test_mla_process_weights_after_loading_qrep_wraps_parameter(monkeypatch):
     assert attention.W_UK_T_dcp_qrep.shape == (4, 3, 4)
 
 
+def test_streamidx_dcp_layers_get_disjoint_scheduling_group_bases(monkeypatch):
+    """Two indexed layers in one compiled program must not reuse layer 0's
+    `scheduling_group_base` via `@jax.jit` trace caching."""
+    import jax
+    import jax.numpy as jnp
+    import numpy as np
+
+    from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
+        DCP_AXIS_NAME,
+    )
+    from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
+        config as streamidx_config,
+    )
+    from vllm_torchtpu.layers.adapter.custom_ops import mla_attention_op
+
+    mesh = jax.sharding.Mesh(np.array(jax.devices()[:1]), (DCP_AXIS_NAME,))
+    captured_fns = []
+    seen_bases = []
+
+    def _capture_jax_op(_name, fn, **_kwargs):
+        captured_fns.append(fn)
+        return MagicMock()
+
+    def _fake_streamindex_topk_dcp(*args, scheduling_group_base=None, **_kwargs):
+        seen_bases.append(scheduling_group_base)
+        return jnp.zeros((args[0].shape[0], 16), dtype=jnp.int32)
+
+    monkeypatch.setattr(jax, "default_backend", lambda: "tpu")
+    monkeypatch.setattr(mla_attention_op, "get_or_create_dcp_mesh", lambda **_k: mesh)
+    monkeypatch.setattr(mla_attention_op, "pcp_streaming_jax_op", _capture_jax_op)
+    monkeypatch.setattr(
+        mla_attention_op, "_cp_scatter_indexer_k", lambda c, *_a, **_k: c
+    )
+    monkeypatch.setattr(
+        mla_attention_op, "streamindex_topk_dcp", _fake_streamindex_topk_dcp
+    )
+    monkeypatch.setattr(envs, "TPU_STREAMIDX_CHUNK_TOKENS", 256)
+
+    for layer_idx in (0, 1):
+        indexer = mla_attention_op.VllmTPUSparseAttnIndexer.__new__(
+            mla_attention_op.VllmTPUSparseAttnIndexer
+        )
+        indexer.topk_tokens = 16
+        indexer.k_cache = SimpleNamespace(prefix=f"model.layers.{layer_idx}.indexer")
+        indexer._build_streamidx_dcp_op(dcp_size=8, interleave_size=4)
+
+    streamidx_config.reset_scheduling_group_ids()
+    for fn in captured_fns:
+        fn(
+            jnp.zeros((4096, 32, 128), dtype=jnp.uint8),
+            jnp.ones((4096, 32), dtype=jnp.bfloat16),
+            jnp.zeros((4, 33, 4, 256), dtype=jnp.uint8),
+            jnp.zeros((4096, 129), dtype=jnp.uint8),
+            jnp.ones((8,), dtype=jnp.int32),
+            jnp.zeros((64,), dtype=jnp.int32),
+            jnp.zeros((9,), dtype=jnp.int32),
+            jnp.zeros((3,), dtype=jnp.int32),
+        )
+    # 4096 / 256 = 16 chunks -> 15 scheduling groups per layer: [1..15], [16..30].
+    assert seen_bases == [1, 16]
+
+
 def test_mla_forward_qrep_skips_the_gather_and_absorbs_group_heads(monkeypatch):
     """On the sparse DCP path a replicated q is consumed directly, against the
     group-wide `W_UK_T`, and the per-step head all-gather is not run."""
