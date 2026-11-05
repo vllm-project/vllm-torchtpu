@@ -29,7 +29,7 @@ from typing import Any
 from vllm_torchtpu.megakernel.exec_spec import Tiles
 from vllm_torchtpu.megakernel.modules.gqa import GQAModule, GQATunables
 from vllm_torchtpu.megakernel.modules.moe import MoEModule
-from vllm_torchtpu.megakernel.profile import Profile
+from vllm_torchtpu.megakernel.profile import Profile, TileContext
 
 # `ModelSpec.name` and default HuggingFace config of the Qwen3.5-397B-A17B model.
 QWEN35_MODEL_NAME = "qwen3_5"
@@ -72,16 +72,21 @@ TINY_TILES = Tiles(
 ).with_modules({_GQA: {"kv_blk": 256, "nkv": 3}})
 
 
-def baseline_tiles(B: int, *, moe_tp: bool = False, R: int = 8) -> Tiles:
-    """Qwen3.5 baseline tiles for batch row count `B`.
+def baseline_tiles(tc: TileContext | int, *, moe_tp: bool = False, R: int = 8) -> Tiles:
+    """Qwen3.5 baseline tiles for bucket `tc` (`TileContext` or batch row count `B`).
 
     Selects the per-bucket ring depths, all-reduce mode, and VMEM budget (using
     `nbe=6` for `B > 48` so 64-row MoE scratch fits VMEM). Every opt-in
     performance flag stays at its `Tiles` default (off). `moe_tp` is accepted
-    for the tile-rule signature and ignored. Hierarchical all-reduce (`hier`
-    1/2) is v7x-8 specific, so `R` outside `{1, 8}` falls back to the flat ring.
+    for direct call-site compatibility and ignored. Hierarchical all-reduce
+    (`hier` 1/2) is v7x-8 specific, so `R` outside `{1, 8}` falls back to the
+    flat ring.
     """
     del moe_tp
+    if isinstance(tc, TileContext):
+        B, R = tc.B, tc.R
+    else:
+        B = int(tc)
     if B > 48:
         t = dataclasses.replace(WIDE_TILES, nbe=6)
     elif B > 32:

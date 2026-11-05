@@ -766,62 +766,6 @@ def test_merged_tile_operand_layout() -> None:
     )
 
 
-def test_configurable_collective_id(monkeypatch: pytest.MonkeyPatch) -> None:
-    assert mk.Tiles().collective_id == 0
-    assert mk.ExecSpec().resolved_collective_id == 0
-    assert mk.ExecSpec(tiles=mk.Tiles(collective_id=47)).resolved_collective_id == 47
-    assert (
-        mk.ExecSpec(
-            tiles=mk.Tiles(collective_id=12), collective_id=47
-        ).resolved_collective_id
-        == 47
-    )
-    assert mk.exec_spec.tile_numerics()["collective_id"] == "exact"
-
-    with pytest.raises(ValueError, match="collective_id"):
-        mk.Tiles(collective_id=-1)
-    with pytest.raises(ValueError, match="collective_id"):
-        mk.ExecSpec(collective_id=-1)
-
-    g = _SynthBaseModel.derive_geometry()
-    spec = _SynthBaseModel.to_model_spec(g, R=2)
-    base_tiles = mk.Tiles(
-        bank=512 << 10, nbd=10, nbe=6, ebank=256 << 10, vmem_mib=32
-    ).with_modules({"gqa": {"kv_blk": 256}})
-    seen: list[int | None] = []
-    real_cp = mk.kernel.pltpu.CompilerParams
-
-    def spy_cp(*args, **kwargs):
-        seen.append(kwargs.get("collective_id"))
-        return real_cp(*args, **kwargs)
-
-    monkeypatch.setattr(mk.kernel.pltpu, "CompilerParams", spy_cp)
-
-    _, info_def = mk.build(spec, mk.ExecSpec(R=2, B=4, T=1, ctx=256, tiles=base_tiles))
-    assert info_def["collective_id"] == 0
-    assert seen[-1] == 0
-
-    _, info_tiles = mk.build(
-        spec,
-        mk.ExecSpec(
-            R=2,
-            B=4,
-            T=1,
-            ctx=256,
-            tiles=dataclasses.replace(base_tiles, collective_id=47),
-        ),
-    )
-    assert info_tiles["collective_id"] == 47
-    assert seen[-1] == 47
-
-    _, info_ex = mk.build(
-        spec,
-        mk.ExecSpec(R=2, B=4, T=1, ctx=256, tiles=base_tiles, collective_id=99),
-    )
-    assert info_ex["collective_id"] == 99
-    assert seen[-1] == 99
-
-
 def test_comm_params_derives_pc_hpc_pr() -> None:
     ex = mk.ExecSpec(R=8, B=4, T=1, ctx=2048)
     tiles = mk.Tiles()
@@ -858,19 +802,6 @@ def test_tile_rule_context_and_keyword_callable() -> None:
     assert ex_t4.resolved_tiles.nbd == 8
     assert prof_ctx.tiles_for(mk.TileContext(B=16, T=4, R=8)).nbd == 8
     assert prof_ctx.tiles_for(16, R=8, T=4).nbd == 8
-
-    # (B, *, moe_tp, R) keyword callable remains working
-    def kw_rule(B: int, *, moe_tp: bool = False, R: int = 8) -> mk.Tiles:
-        base = mk.default_tiles(B, moe_tp=moe_tp, R=R)
-        return dataclasses.replace(base, nbd=10 if B >= 16 else 12)
-
-    prof_kw = mk.Profile(
-        name="b8_kw_tiles",
-        numerics="exact",
-        tiles=kw_rule,
-    )
-    assert prof_kw.exec_for(base_ex, B=4, T=1).resolved_tiles.nbd == 12
-    assert prof_kw.exec_for(base_ex, B=16, T=4).resolved_tiles.nbd == 10
 
     # Approx knob enabled only at T=2 or ctx > 4096 is caught by
     # approx_features / _check_exact

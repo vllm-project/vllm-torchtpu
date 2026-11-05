@@ -133,8 +133,8 @@ def test_profile_numerics_are_derived_and_enforced():
         )
 
     # A profile declared exact that turns on an approx feature is rejected.
-    def _kv_sub_rule(B: int, *, moe_tp: bool = False, R: int = 8) -> mk.Tiles:
-        return mk.default_tiles(B, R=R).with_modules({"gqa": {"kv_sub": 1024}})
+    def _kv_sub_rule(tc: mk.TileContext) -> mk.Tiles:
+        return mk.default_tiles(tc).with_modules({"gqa": {"kv_sub": 1024}})
 
     with pytest.raises(ValueError, match="tiles.gqa.kv_sub"):
         mk.Profile(name="bad-exact", tiles=_kv_sub_rule)
@@ -142,10 +142,8 @@ def test_profile_numerics_are_derived_and_enforced():
         mk.Profile(name="bad-exact-fused", fused_pool_io="auto")
 
     # Exact-class changes keep an exact profile exact.
-    def _sched_rule(B: int, *, moe_tp: bool = False, R: int = 8) -> mk.Tiles:
-        return mk.default_tiles(B, R=R).with_modules(
-            {"gqa": {"pair_kv": True, "nkv": 4}}
-        )
+    def _sched_rule(tc: mk.TileContext) -> mk.Tiles:
+        return mk.default_tiles(tc).with_modules({"gqa": {"pair_kv": True, "nkv": 4}})
 
     assert mk.Profile(name="sched-only", tiles=_sched_rule).numerics == "exact"
 
@@ -158,8 +156,8 @@ def test_model_profile_without_tiles_inherits_the_model_default_rule(monkeypatch
         profile_mod, "_MODEL_DEFAULTS", dict(profile_mod._MODEL_DEFAULTS)
     )
 
-    def _ref_rule(B: int, *, moe_tp: bool = False, R: int = 8) -> mk.Tiles:
-        return mk.default_tiles(B, R=R).with_modules({"gqa": {"kv_sub": 1024}})
+    def _ref_rule(tc: mk.TileContext) -> mk.Tiles:
+        return mk.default_tiles(tc).with_modules({"gqa": {"kv_sub": 1024}})
 
     ref = mk.register_profile(
         mk.Profile(
@@ -175,7 +173,7 @@ def test_model_profile_without_tiles_inherits_the_model_default_rule(monkeypatch
     assert profile_mod.approx_features(p) == ()
     assert p.tiles_for(8, R=2) == ref.tiles_for(8, R=2)
     ex = p.exec_for(mk.ExecSpec(R=2), B=8, T=1)
-    assert ex.tiles == _ref_rule(8, R=2)
+    assert ex.tiles == _ref_rule(mk.TileContext(B=8, R=2))
     # Without a model (or a model with no default profile): the library rule,
     # left for the kernel builder's VMEM fit.
     for q in (

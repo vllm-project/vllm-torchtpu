@@ -34,7 +34,7 @@ from vllm_torchtpu.megakernel.exec_spec import Tiles
 from vllm_torchtpu.megakernel.modules.gdn import GDNModule
 from vllm_torchtpu.megakernel.modules.gqa import GQAModule
 from vllm_torchtpu.megakernel.modules.moe import MoEModule
-from vllm_torchtpu.megakernel.profile import Profile
+from vllm_torchtpu.megakernel.profile import Profile, TileContext
 
 from .baseline import QWEN35_MODEL_NAME
 
@@ -65,8 +65,14 @@ _WIDE = dataclasses.replace(_VERIFY, nbd=10, vmem_mib=62, hier=0).with_modules(
 )
 
 
-def candidate30_tiles(B: int, *, moe_tp: bool = False, R: int = 8) -> Tiles:
+def candidate30_tiles(
+    tc: TileContext | int, *, moe_tp: bool = False, R: int = 8
+) -> Tiles:
     """Per-bucket tiles for the tuned Qwen3.5 schedule (deeper EP rings, hier=2/3)."""
+    if isinstance(tc, TileContext):
+        B, moe_tp, R = tc.B, tc.moe_tp, tc.R
+    else:
+        B = int(tc)
     nbe_ep = 12 if not moe_tp else 10
     nbe_small = 20 if not moe_tp else nbe_ep
     if B > 48:
@@ -90,8 +96,14 @@ def candidate30_tiles(B: int, *, moe_tp: bool = False, R: int = 8) -> Tiles:
     return t
 
 
-def candidate30_fused_tiles(B: int, *, moe_tp: bool = False, R: int = 8) -> Tiles:
+def candidate30_fused_tiles(
+    tc: TileContext | int, *, moe_tp: bool = False, R: int = 8
+) -> Tiles:
     """Tiles for `qwen35-candidate30-fused` (`nbe=16, nkv=4` at `32 < B <= 48` EP)."""
+    if isinstance(tc, TileContext):
+        B, moe_tp, R = tc.B, tc.moe_tp, tc.R
+    else:
+        B = int(tc)
     t = candidate30_tiles(B, moe_tp=moe_tp, R=R)
     if 32 < B <= 48 and not moe_tp:
         t = dataclasses.replace(t, nbe=16).with_modules({_GQA: {"nkv": 4}})

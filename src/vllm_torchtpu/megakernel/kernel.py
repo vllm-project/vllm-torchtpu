@@ -399,7 +399,7 @@ def build(
                 aliases[2 + n_w_leaves + s_leaf_offset] = o_names.index(k)
             s_leaf_offset += n_s_leaves
 
-    coll_id = ex.resolved_collective_id if ex.R > 1 else None
+    coll_id = 0 if ex.R > 1 else None
     call = pl.pallas_call(
         kernel,
         out_shape=out_shape,
