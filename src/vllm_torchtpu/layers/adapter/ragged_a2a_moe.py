@@ -179,6 +179,15 @@ def _log_capacity(mesh, topk, onehot_threshold, decode_routed_rows) -> None:
         onehot_moe_permute_threshold=onehot_threshold,
         use_sparse_core=envs.USE_MOE_SPARSE_CORE,
     )
+    if rows >= dp_size * decode_tokens:
+        logger.info(
+            "Ragged A2A MoE capacity x%g | decode step: full-size exchange "
+            "(capacity %d rows >= %d group tokens)",
+            envs.TPU_MOE_A2A_CAPACITY,
+            rows,
+            dp_size * decode_tokens,
+        )
+        return
     logger.info(
         "Ragged A2A MoE capacity x%g | decode step: %d of %d rows, %d of %d "
         "routes per rank",
