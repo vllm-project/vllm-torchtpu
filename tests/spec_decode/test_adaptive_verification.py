@@ -221,7 +221,8 @@ def test_async_decisions_read_the_previous_proposal(async_scheduling, trimmed_re
 
 
 @pytest.mark.parametrize(
-    "case", ["structured_output", "prefill", "no_cost_table", "multi_chunk"]
+    "case",
+    ["structured_output", "prefill", "no_cost_table", "multi_chunk", "too_many_reqs"],
 )
 def test_manager_leaves_steps_it_cannot_trim(case):
     manager = _manager(costs=None if case == "no_cost_table" else COSTS)
@@ -232,6 +233,9 @@ def test_manager_leaves_steps_it_cannot_trim(case):
         so.has_structured_output_requests = True
     if case == "multi_chunk":
         manager.cost_table = _table({8: 1.0})
+    if case == "too_many_reqs":
+        # Trimming this step would give shapes warmup left cold.
+        manager.max_num_reqs = 1
     assert manager.trim(so) is so
     assert manager.step_trimmed == {}
 
