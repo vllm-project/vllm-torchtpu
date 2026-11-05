@@ -18,7 +18,6 @@ folders skipped, and the explicit table winning."""
 from __future__ import annotations
 
 import importlib
-import logging
 import sys
 import textwrap
 from collections.abc import Iterator
@@ -141,15 +140,25 @@ def test_a_module_reference_does_not_discover(models_dir: Path) -> None:
     assert discovered_shorthands.cache_info().currsize == 1
 
 
-def test_a_broken_folder_is_skipped(
-    models_dir: Path, caplog: pytest.LogCaptureFixture
+def test_a_broken_folder_is_skipped_with_a_warning(
+    models_dir: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _folder(models_dir, "zz_broken_mk", "brokenmk", "", init="import no_such_pkg\n")
     _folder(models_dir, "zz_fake_mk", "fakemk", 'model_types=("fake_mt",)')
-    with caplog.at_level(logging.DEBUG, logger=plugin_mod.__name__):
-        found = discovered_shorthands()
+    warnings: list[str] = []
+    fake_logger = SimpleNamespace(
+        warning=lambda msg, *args: warnings.append(msg % args),
+        debug=lambda *_a: None,
+    )
+    monkeypatch.setattr(plugin_mod, "logger", fake_logger)
+    found = discovered_shorthands()
     assert "fakemk" in found and "brokenmk" not in found
-    assert "skipping vllm_torchtpu.models.zz_broken_mk.megakernel" in caplog.text
+    # A broken folder would otherwise leave the megakernel off silently.
+    assert len(warnings) == 1
+    assert (
+        "vllm_torchtpu.models.zz_broken_mk.megakernel failed to import" in warnings[0]
+    )
+    assert "ModuleNotFoundError: No module named 'no_such_pkg'" in warnings[0]
 
 
 def test_the_explicit_table_wins(

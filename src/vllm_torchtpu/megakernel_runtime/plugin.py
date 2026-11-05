@@ -30,13 +30,13 @@ from __future__ import annotations
 import dataclasses
 import functools
 import importlib
-import logging
 import os
 import pkgutil
 from collections.abc import Callable, Mapping
 from types import MappingProxyType
 from typing import Any, NamedTuple
 
+from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.megakernel.runtime.contract import (
     API_VERSION,
     FEATURES,
@@ -55,7 +55,7 @@ from vllm_torchtpu.megakernel.runtime.contract import (
     WarmupCase,
 )
 
-logger = logging.getLogger(__name__)
+logger = init_logger(__name__)
 
 # Where model folders live: `<MODELS_PACKAGE>.<model>.megakernel`.
 MODELS_PACKAGE = "vllm_torchtpu.models"
@@ -118,7 +118,7 @@ def discovered_shorthands() -> Mapping[str, Shorthand]:
     `megakernel/__init__.py` on disk is imported, which runs that package's
     `__init__` and the folder's stdlib-only `__init__` (`SPEC`), never its
     `create` target. Packages without a `megakernel` folder aren't imported.
-    A folder that fails to import is skipped (logged at debug). A discovered
+    A folder that fails to import is skipped with a warning. A discovered
     folder takes settings through `options` only (no top-level template
     keys); on a name clash the first package in name order wins.
     """
@@ -140,9 +140,13 @@ def discovered_shorthands() -> Mapping[str, Shorthand]:
         module = f"{MODELS_PACKAGE}.{info.name}.megakernel"
         try:
             spec = getattr(importlib.import_module(module), "SPEC", None)
-        except Exception as exc:  # an unrelated broken folder: skip it
-            logger.debug(
-                "megakernel: skipping %s (%s: %s)", module, type(exc).__name__, exc
+        except Exception as exc:  # a broken folder: say so, and skip it
+            logger.warning(
+                "Megakernel: model folder %s failed to import (%s: %s); "
+                "skipping it, so the megakernel stays off for its models.",
+                module,
+                type(exc).__name__,
+                exc,
             )
             continue
         if not isinstance(spec, TpuMonoSpec):
