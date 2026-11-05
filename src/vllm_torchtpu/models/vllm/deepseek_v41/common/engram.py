@@ -16,6 +16,10 @@ import numpy as np
 import torch
 from vllm.config import get_current_vllm_config_or_none
 from vllm.models.deepseek_v41.common import engram as upstream
+from vllm.models.deepseek_v41.common.mm_preprocess import (
+    IMAGE_SENTINEL_BASE_ID,
+    image_sentinel_mask,
+)
 
 from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.engram_hash import engram_hash, hash_tables
@@ -56,9 +60,12 @@ class NgramHashState(upstream.NgramHashState):
         cache: torch.Tensor,
         slots: torch.Tensor,
         input_ids: torch.Tensor,
-        dead_mask: torch.Tensor,
+        dead_mask: torch.Tensor | None,
     ) -> None:
-        """Map ``input_ids`` and write them at int32 ``slots`` (-1: skip)."""
+        """Map ``input_ids`` and write them at int32 ``slots`` (-1: skip).
+
+        A None ``dead_mask`` means image-sentinel ids, derived in the write.
+        """
         raise NotImplementedError
 
     def ensure_cache(self) -> bool:
@@ -102,6 +109,13 @@ class NgramHashState(upstream.NgramHashState):
             )
         if slot_mapping is not None:
             slot_mapping = slot_mapping[:count]
+        # None masks: derive them from the ids where each is consumed, so no
+        # shared mask program runs ahead of this call (fused hash only).
+        masks_from_ids = dead_mask is None
+        if masks_from_ids != (lookback_dead_mask is None) or (
+            masks_from_ids and not self.fuses_dead_masks(input_ids)
+        ):
+            raise ValueError("Engram dead masks may be omitted only together, fused")
         if self.use_slot_cache:
             assert self._cache is not None and slot_mapping is not None
             if (
@@ -111,7 +125,8 @@ class NgramHashState(upstream.NgramHashState):
                 self.write_token_ids(self._cache, slot_mapping, input_ids, dead_mask)
             else:
                 mapped = self.token_map[input_ids.long()].masked_fill(
-                    dead_mask, upstream.DEAD_ID
+                    image_sentinel_mask(input_ids) if masks_from_ids else dead_mask,
+                    upstream.DEAD_ID,
                 )
                 valid = slot_mapping >= 0
                 self.write_cache(self._cache, slot_mapping, mapped, valid)
@@ -129,7 +144,7 @@ class NgramHashState(upstream.NgramHashState):
             )
             return self._cache[slots]
 
-        if envs.TPU_DEEPSEEK_V41_ENGRAM_FUSED_HASH and input_ids.device.type != "cpu":
+        if self.uses_fused_hash(input_ids):
             return self._fused_hash(
                 input_ids,
                 positions,
@@ -149,6 +164,17 @@ class NgramHashState(upstream.NgramHashState):
             lookback_token_ids,
             lookback_dead_mask,
             fallback,
+        )
+
+    def uses_fused_hash(self, input_ids: torch.Tensor) -> bool:
+        return (
+            envs.TPU_DEEPSEEK_V41_ENGRAM_FUSED_HASH and input_ids.device.type != "cpu"
+        )
+
+    def fuses_dead_masks(self, input_ids: torch.Tensor) -> bool:
+        """Whether ``forward`` takes None dead masks (ENGRAM_MASKS_IN_HASH)."""
+        return envs.TPU_DEEPSEEK_V41_ENGRAM_MASKS_IN_HASH and self.uses_fused_hash(
+            input_ids
         )
 
     def _fused_hash(
@@ -185,14 +211,20 @@ class NgramHashState(upstream.NgramHashState):
         else:
             # Unused operands; the static use_cache drops their reads.
             cache, table, block_size = input_ids, lookback_token_ids, 1
+        input_ids, lookback_token_ids = input_ids.int(), lookback_token_ids.int()
+        sentinel = -1
+        if dead_mask is None:
+            # The op derives both masks from the ids; the mask operands are unread.
+            sentinel = IMAGE_SENTINEL_BASE_ID
+            dead_mask, lookback_dead_mask = input_ids, lookback_token_ids
         return _fused_hash_op()(
             self.token_map,
             *tables,
-            input_ids.int(),
+            input_ids,
             positions.int(),
             query_start_loc.int(),
             dead_mask,
-            lookback_token_ids.int(),
+            lookback_token_ids,
             lookback_dead_mask,
             cache,
             table.int(),
@@ -201,6 +233,7 @@ class NgramHashState(upstream.NgramHashState):
             pad_id,
             upstream.DEAD_ID,
             use_cache,
+            sentinel,
         )
 
     def hash_on_host(
@@ -338,7 +371,7 @@ _FUSED_HASH_OP = None
 
 
 def _fused_hash_op():
-    """Torch op for ``engram_hash``: 12 arrays, then 5 static arguments."""
+    """Torch op for ``engram_hash``: 12 arrays, then 6 static arguments."""
     global _FUSED_HASH_OP
     if _FUSED_HASH_OP is None:
         from jax.sharding import PartitionSpec as P
@@ -367,6 +400,7 @@ def _fused_hash_op():
             pad_id: int,
             dead_id: int,
             use_cache: bool,
+            sentinel: int,
         ) -> jax.Array:
             return engram_hash(
                 token_map,
@@ -386,6 +420,7 @@ def _fused_hash_op():
                 pad_id=pad_id,
                 dead_id=dead_id,
                 use_cache=use_cache,
+                sentinel=None if sentinel < 0 else sentinel,
             )
 
         op = pallas.jax_op(
@@ -393,7 +428,7 @@ def _fused_hash_op():
             call,
             mesh=get_pallas_op_mesh(),
             input_partition_specs=cast(
-                tuple[tuple[str, ...], ...], (P(),) * 12 + (None,) * 5
+                tuple[tuple[str, ...], ...], (P(),) * 12 + (None,) * 6
             ),
         )
         op.register_fake(

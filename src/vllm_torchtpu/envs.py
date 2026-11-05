@@ -10,6 +10,7 @@ if TYPE_CHECKING:
     TPU_DEEPSEEK_V41_CED: bool = False
     TPU_DEEPSEEK_V41_CED_IDENTITY_REPLAY: bool = False
     TPU_DEEPSEEK_V41_ENGRAM_FUSED_HASH: bool = False
+    TPU_DEEPSEEK_V41_ENGRAM_MASKS_IN_HASH: bool = False
     TPU_DEEPSEEK_V41_ENGRAM_INT32_SLOT_WRITE: bool = False
     TPU_DEEPSEEK_V41_IMPL: str = "v2"
     TPU_DEEPSEEK_V41_ENGRAM_CPU_OFFLOAD: bool = False
@@ -418,6 +419,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # eager int64 torch ops XLA emulates op by op. Hash ids are unchanged.
     "TPU_DEEPSEEK_V41_ENGRAM_FUSED_HASH": env_bool(
         "TPU_DEEPSEEK_V41_ENGRAM_FUSED_HASH", default=False
+    ),
+    # With the fused Engram hash, derive the image-sentinel dead masks of the
+    # input and lookback ids inside the slot-cache write and the hash program
+    # instead of in two eager compare programs ahead of them. Same integers
+    # (bit-exact). Requires TPU_DEEPSEEK_V41_ENGRAM_FUSED_HASH. Default off.
+    "TPU_DEEPSEEK_V41_ENGRAM_MASKS_IN_HASH": env_bool(
+        "TPU_DEEPSEEK_V41_ENGRAM_MASKS_IN_HASH", default=False
     ),
     # Engram slot-cache write: derive the slots and map the token ids in int32,
     # one compiled program each (v2/engram.py), instead of eager int64 torch

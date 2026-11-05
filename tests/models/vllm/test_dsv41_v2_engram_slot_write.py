@@ -70,8 +70,23 @@ def test_int32_slot_write_matches_write_cache(device, monkeypatch):
     state = SimpleNamespace(token_map=token_map)
     new_cache = initial.to(device)
     slots32 = v2_engram.engram_cache_slots(kv_cache, metadata, positions)
-    v2_engram.NgramHashState.write_token_ids(
-        state, new_cache, slots32, input_ids, dead
-    )
+    v2_engram.NgramHashState.write_token_ids(state, new_cache, slots32, input_ids, dead)
     assert torch.equal(new_cache.cpu(), ref_cache.cpu())
     assert not torch.equal(new_cache.cpu(), initial)
+
+
+def test_live_token_mapping_matches_explicit_mask():
+    # TPU_DEEPSEEK_V41_ENGRAM_MASKS_IN_HASH: the write derives the image-sentinel
+    # dead mask from the ids; same mapped values as the eager mask.
+    sentinel = v2_engram.common.IMAGE_SENTINEL_BASE_ID
+    gen = torch.Generator().manual_seed(2)
+    token_map = torch.randint(0, 1 << 20, (sentinel + 16,), generator=gen).int()
+    input_ids = torch.randint(0, sentinel + 16, (TOKENS,), generator=gen).int()
+    input_ids[::7] = sentinel
+    dead_id = v2_engram.upstream.DEAD_ID
+    given = v2_engram._mapped_token_ids(
+        token_map, input_ids, input_ids == sentinel, dead_id
+    )
+    derived = v2_engram._mapped_live_token_ids(token_map, input_ids, sentinel, dead_id)
+    assert torch.equal(given, derived)
+    assert (derived[::7] == dead_id).all()

@@ -501,13 +501,18 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
                 else:
                     image_mask = upstream.image_sentinel_mask(input_ids)
                     engram_mask = ~image_mask
+                    # The fused hash derives the dead masks from the ids
+                    # itself, so the mask programs do not run ahead of it.
+                    fuse_masks = self.engram_hash.fuses_dead_masks(input_ids)
                     engram_hashes = self.engram_hash(
                         input_ids,
                         positions,
                         swa_metadata.query_start_loc,
-                        image_mask,
+                        None if fuse_masks else image_mask,
                         lookback_token_ids,
-                        upstream.image_sentinel_mask(lookback_token_ids),
+                        None
+                        if fuse_masks
+                        else upstream.image_sentinel_mask(lookback_token_ids),
                         (
                             engram_cache_slots
                             if envs.TPU_DEEPSEEK_V41_ENGRAM_INT32_SLOT_WRITE

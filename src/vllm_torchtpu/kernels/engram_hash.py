@@ -81,7 +81,14 @@ def _remainder(high, low, prime):
 
 @functools.partial(
     jax.jit,
-    static_argnames=("lookback_depth", "block_size", "pad_id", "dead_id", "use_cache"),
+    static_argnames=(
+        "lookback_depth",
+        "block_size",
+        "pad_id",
+        "dead_id",
+        "use_cache",
+        "sentinel",
+    ),
 )
 def engram_hash(
     token_map: jax.Array,
@@ -102,8 +109,16 @@ def engram_hash(
     pad_id: int,
     dead_id: int,
     use_cache: bool,
+    sentinel: int | None = None,
 ) -> jax.Array:
-    """INT32 [T, L, (N-1)*H] hash ids, equal to ``NgramHashState._hash``."""
+    """INT32 [T, L, (N-1)*H] hash ids, equal to ``NgramHashState._hash``.
+
+    With ``sentinel`` the dead masks are ``ids == sentinel``, computed here
+    instead of read from ``dead_mask`` and ``lookback_dead_mask``.
+    """
+    if sentinel is not None:
+        dead_mask = input_ids == sentinel
+        lookback_dead_mask = lookback_token_ids == sentinel
     count = input_ids.shape[0]
     layers, ngram = limbs.shape[:2]
     clip = functools.partial(jnp.take, mode="clip")
