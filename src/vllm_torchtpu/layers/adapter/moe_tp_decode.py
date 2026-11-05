@@ -478,11 +478,17 @@ def _prefill_chain(
 def _tp_chain(
     x, scores, bias, is_pad, w13, w2, s13, s2, sw13, ss13, sw2, ss2, st, e0=None
 ):
-    """This rank's partial as the unarmed path computes it: _route,
-    fused_moe_func (under EP with experts_start e0, so the SparseCore EP
-    dispatch and combine), the shared expert's two quantized linears around
-    SiluAndMul, and shared + scale * routed in bf16."""
+    """This rank's partial as the unarmed path computes it: _route, then
+    _routed_partial."""
     w, ids = _route(x, scores, bias, is_pad, st)
+    return _routed_partial(x, w, ids, w13, w2, s13, s2, sw13, ss13, sw2, ss2, st, e0)
+
+
+def _routed_partial(x, w, ids, w13, w2, s13, s2, sw13, ss13, sw2, ss2, st, e0=None):
+    """This rank's partial of rows x routed to (w, ids): fused_moe_func (under
+    EP with experts_start e0, so the SparseCore EP dispatch and combine), the
+    shared expert's two quantized linears around SiluAndMul, and shared +
+    scale * routed in bf16."""
     routed = fused_moe_func(
         x,
         w13,
