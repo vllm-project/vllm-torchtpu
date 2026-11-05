@@ -91,6 +91,9 @@ from vllm_torchtpu.runner.kv_cache_dsv4 import DsV4KVCacheAllocator
 from vllm_torchtpu.utils import synchronize_tensors
 
 if TYPE_CHECKING:
+    from vllm.config import VllmConfig
+    from vllm.v1.attention.backend import AttentionBackend
+
     from vllm_torchtpu.layers.adapter.attention import PallasAttentionBackendImpl
     from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 
@@ -119,6 +122,32 @@ if TYPE_CHECKING:
 
 
 logger = init_logger(__name__)
+
+
+def dense_attention_backend(vllm_config: VllmConfig) -> type[AttentionBackend] | None:
+    """The backend that lays out the plain (non-MLA) attention caches.
+
+    vLLM's `_find_non_ssm_backend` returns the first backend in layer order,
+    which is the target's. When the target declares an MLA-family backend
+    and a drafter adds plain `Attention` layers (MiniMax M3, whose owned
+    caches report `PallasMLAttentionBackend`, with its DSpark drafter), the
+    drafter's pages would take the MLA geometry: a 128-token block becomes a
+    32-token RPA page, so the RPA kernel indexes the block table at 4x the
+    block count and, past a quarter of max_model_len, beyond the table. Take
+    the first `PallasAttentionBackend`-family backend instead; deployments
+    without one (pure MLA) keep the first backend.
+    """
+    first = TpuPlatform._find_non_ssm_backend(vllm_config)
+    if first is None or _is_dense_attention_backend(first):
+        return first
+    for backend in TpuPlatform._find_non_ssm_backends(vllm_config):
+        if _is_dense_attention_backend(backend):
+            return backend
+    return first
+
+
+def _is_dense_attention_backend(backend: object) -> bool:
+    return isinstance(backend, type) and issubclass(backend, PallasAttentionBackend)
 
 
 def is_cache_for_ds_v4(attn_module: AttentionLayerBase) -> bool:
@@ -239,7 +268,7 @@ class KVCacheManager:
             self.runner.vllm_config,
             (AttentionLayerBase, MambaBase),  # type: ignore[type-abstract]
         )
-        backend_cls = TpuPlatform._find_non_ssm_backend(self.runner.vllm_config)
+        backend_cls = dense_attention_backend(self.runner.vllm_config)
         block_size = self.runner.vllm_config.cache_config.block_size
         cache_dtype_str = self.runner.vllm_config.cache_config.cache_dtype
 
@@ -699,7 +728,7 @@ class KVCacheManager:
         attn_page_sizes = set()
         backend_cls = cast(
             "type[_TpuKVCacheBackend] | None",
-            TpuPlatform._find_non_ssm_backend(self.runner.vllm_config),
+            dense_attention_backend(self.runner.vllm_config),
         )
         for m in layers.values():
             if isinstance(m, Attention):
@@ -780,7 +809,7 @@ class KVCacheManager:
         )
         attention_backend = cast(
             "type[_TpuKVCacheBackend] | None",
-            TpuPlatform._find_non_ssm_backend(self.runner.vllm_config),
+            dense_attention_backend(self.runner.vllm_config),
         )
         assert attention_backend is not None
         if block_size is None:
@@ -1394,7 +1423,7 @@ class KVCacheManager:
             return
         backend_cls = cast(
             "type[_TpuKVCacheBackend] | None",
-            TpuPlatform._find_non_ssm_backend(self.runner.vllm_config),
+            dense_attention_backend(self.runner.vllm_config),
         )
 
         for group in kv_cache_config.kv_cache_groups:
