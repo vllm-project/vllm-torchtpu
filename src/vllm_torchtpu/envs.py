@@ -95,6 +95,11 @@ if TYPE_CHECKING:
     TPU_MOE_SKIP_PADDED_TOKENS: bool = False
     TPU_MOE_HIERARCHICAL_EP: bool = False
     TPU_MOE_ROUTER_TOPK: str = "rowmax"
+    HF_HOME: str = ""
+    HF_TOKEN: str = ""
+    HUGGING_FACE_HUB_TOKEN: str = ""
+    HF_HUB_OFFLINE: bool = False
+    TRANSFORMERS_OFFLINE: bool = False
     USE_MOE_FUSED_EP_KERNEL: bool = False
     MOE_FUSED_EP_KERNEL_IMPL: str | None = None
     MOE_FUSED_EP_ENABLE_W4A8: bool = False
@@ -1186,6 +1191,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_TPU_SRPT_ATTN_TILE_TOKENS": env_nonnegative_int(
         "VLLM_TPU_SRPT_ATTN_TILE_TOKENS", 32
     ),
+    # Hugging Face Hub local cache root and authentication tokens read by
+    # offline config resolvers such as vllm_torchtpu.roofline.hf_loader.
+    "HF_HOME": env_str("HF_HOME", ""),
+    "HF_TOKEN": env_str("HF_TOKEN", ""),
+    "HUGGING_FACE_HUB_TOKEN": env_str("HUGGING_FACE_HUB_TOKEN", ""),
+    "HF_HUB_OFFLINE": env_bool("HF_HUB_OFFLINE", False),
+    "TRANSFORMERS_OFFLINE": env_bool("TRANSFORMERS_OFFLINE", False),
 }
 
 
