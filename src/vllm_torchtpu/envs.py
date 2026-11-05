@@ -452,6 +452,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_DSV4_HONOR_CONTINUE_FINAL_MESSAGE": env_bool(
         "TPU_DSV4_HONOR_CONTINUE_FINAL_MESSAGE", default=False
     ),
+    # Fused Pallas Q/K RMSNorm + 2D RoPE in the Gemma-4 vision tower attention.
+    "TPU_GEMMA4_VISION_FUSED_QK_NORM_ROPE": env_bool(
+        "TPU_GEMMA4_VISION_FUSED_QK_NORM_ROPE", default=True
+    ),
     # NoPE and RoPE KV cache layouts allocated for sparse MLA.
     "TPU_SPARSE_MLA_NOPE_LAYOUT": env_with_choices(
         "TPU_SPARSE_MLA_NOPE_LAYOUT", "sparsecore", ["sparsecore", "tensorcore"]
