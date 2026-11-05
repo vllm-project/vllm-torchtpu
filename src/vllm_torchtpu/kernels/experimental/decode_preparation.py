@@ -155,7 +155,8 @@ def compressor_layout_problem(
     """Fields where the bound cache differs from the registered kernel."""
     diffs = [
         f"{f.name}={getattr(actual, f.name)} (kernel {getattr(expected, f.name)})"
-        for f in dataclasses.fields(CompressorLayout)
+        # Pass an instance: Dynamo cannot trace ``fields`` on the class.
+        for f in dataclasses.fields(expected)
         if getattr(actual, f.name) != getattr(expected, f.name)
     ]
     return "cache layout " + ", ".join(diffs) if diffs else None
