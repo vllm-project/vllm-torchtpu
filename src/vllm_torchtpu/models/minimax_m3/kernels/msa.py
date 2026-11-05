@@ -20,6 +20,8 @@ blocks) into the selection, and keeps the ``topk`` best blocks. Attention then
 runs over the selected blocks only (`msa_attention.msa_sparse_attention`).
 """
 
+import functools
+
 import jax
 import jax.numpy as jnp
 
@@ -27,6 +29,7 @@ from vllm_torchtpu.models.minimax_m3.kernels import (
     msa_attention,
     msa_indexer,
     msa_select,
+    msa_write,
 )
 
 _DROPPED_PAGE = 2**30
@@ -61,19 +64,57 @@ def page_size(cache: jax.Array) -> int:
     return cache.shape[1] * cache.shape[2]
 
 
-def write_rows(
-    cache: jax.Array, rows: jax.Array, pages: jax.Array, pos: jax.Array
-) -> jax.Array:
-    """Scatter one row per token into a packed ``[pages, S / p, p, W]`` cache."""
-    packing = cache.shape[2]
-    slot = pos % page_size(cache)
+def _cache_rows(cache: jax.Array, rows: jax.Array) -> jax.Array:
     if jnp.issubdtype(cache.dtype, jnp.floating) and jnp.finfo(cache.dtype).bits == 8:
         # e4m3fn has no inf: an out-of-range value would be stored as NaN and
         # poison every token attending its page (0 * NaN in p @ v).
         limit = float(jnp.finfo(cache.dtype).max)
         rows = jnp.clip(rows, -limit, limit)
+    return rows.astype(cache.dtype)
+
+
+def write_rows_xla(
+    cache: jax.Array, rows: jax.Array, pages: jax.Array, pos: jax.Array
+) -> jax.Array:
+    """XLA scatter of one row per token; relayouts the whole cache on TPU.
+
+    Kept as the reference for `write_rows`.
+    """
+    packing = cache.shape[2]
+    slot = pos % page_size(cache)
     return cache.at[pages, slot // packing, slot % packing].set(
-        rows.astype(cache.dtype), mode="drop"
+        _cache_rows(cache, rows), mode="drop"
+    )
+
+
+def write_rows(
+    cache: jax.Array,
+    rows: jax.Array,
+    pages: jax.Array,
+    pos: jax.Array,
+    *,
+    max_num_seqs: int | None = None,
+    interpret: bool = False,
+) -> jax.Array:
+    """Write one row per token into a packed ``[pages, S / p, p, W]`` cache.
+
+    Only the pages that receive rows are rewritten (`msa_write`). A request's
+    tokens must be consecutive with consecutive positions. `max_num_seqs`
+    bounds the requests in the batch (default: one per token).
+    """
+    num_tokens = rows.shape[0]
+    max_runs = msa_write.max_write_runs(
+        num_tokens,
+        num_tokens if max_num_seqs is None else max_num_seqs,
+        page_size(cache),
+    )
+    return msa_write.write_rows(
+        cache,
+        _cache_rows(cache, rows),
+        pages,
+        pos % page_size(cache),
+        max_runs=max_runs,
+        interpret=interpret,
     )
 
 
@@ -147,8 +188,11 @@ def msa_forward(
     seq_id, pos, valid = token_positions(num_tokens, seq_lens, cu_q_lens)
     pages = _token_pages(block_tables_2d, seq_id, pos, valid, block_size)
 
-    kv_cache = write_rows(kv_cache, jnp.concatenate([k, v], axis=-1)[:, 0], pages, pos)
-    index_cache = write_rows(index_cache, index_k, pages, pos)
+    write = functools.partial(
+        write_rows, pages=pages, pos=pos, max_num_seqs=max_num_seqs, interpret=interpret
+    )
+    kv_cache = write(kv_cache, jnp.concatenate([k, v], axis=-1)[:, 0])
+    index_cache = write(index_cache, index_k)
 
     scores = msa_indexer.block_scores(
         index_q,
