@@ -93,15 +93,10 @@ def _fused_eligible(attn, states: torch.Tensor, cos, position_ids) -> bool:
     return all(getattr(n, "with_scale", False) for n in (attn.q_norm, attn.k_norm))
 
 
-def _norm_rope(attn, norm, states, cos, sin, tokens, hidden_shape):
+def _norm_rope(attn, norm, states, cos_tiled, sin_tiled, tokens, hidden_shape):
     num_heads = states.shape[-1] // attn.head_dim
     op = _get_op(num_heads, attn.head_dim, float(norm.eps))
-    out = op(
-        states.reshape(tokens, -1),
-        cos.reshape(tokens, attn.head_dim),
-        sin.reshape(tokens, attn.head_dim),
-        norm.weight,
-    )
+    out = op(states.reshape(tokens, -1), cos_tiled, sin_tiled, norm.weight)
     return out.view(hidden_shape)
 
 
@@ -120,15 +115,21 @@ def _patched_forward(
 
     query_states = self.q_proj(hidden_states)
     key_states = self.k_proj(hidden_states)
-    if _fused_eligible(self, query_states, cos, position_ids) and (
+    fused = _fused_eligible(self, query_states, cos, position_ids) and (
         key_states.shape == query_states.shape
-    ):
+    )
+    if fused:
         tokens = math.prod(input_shape)
+        num_heads = query_states.shape[-1] // self.head_dim
+        # Same per-token cos/sin in every layer: the compiled graph can share
+        # these tiles across all Q and K calls.
+        cos_tiled = cos.reshape(tokens, self.head_dim).repeat(1, num_heads)
+        sin_tiled = sin.reshape(tokens, self.head_dim).repeat(1, num_heads)
         query_states = _norm_rope(
-            self, self.q_norm, query_states, cos, sin, tokens, hidden_shape
+            self, self.q_norm, query_states, cos_tiled, sin_tiled, tokens, hidden_shape
         )
         key_states = _norm_rope(
-            self, self.k_norm, key_states, cos, sin, tokens, hidden_shape
+            self, self.k_norm, key_states, cos_tiled, sin_tiled, tokens, hidden_shape
         )
     else:
         query_states = self.q_norm(query_states.view(hidden_shape))

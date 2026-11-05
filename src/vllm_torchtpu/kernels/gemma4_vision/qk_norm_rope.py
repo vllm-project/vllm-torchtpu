@@ -27,14 +27,15 @@ This kernel does both in one pass over a lane-aligned layout. Tokens are rows
 and the ``num_heads * head_dim`` channels (16 * 72 = 1152 = 9 * 128) are the
 lanes, so no head is sliced out:
 
-  - Per-head sums of squares and their broadcast back are two small matmuls
-    with constant 0/1 head-membership matrices (MXU work, no lane slicing).
+  - Per-head sums of squares and their broadcast back are small matmuls with
+    constant 0/1 head-membership matrices, each done as two plain bf16 MXU
+    passes (no lane slicing, no 6-pass float32 matmul).
   - ``rotate_half`` becomes an in-register lane rotation: every lane reads the
     lane ``half`` channels ahead (first half of a chunk, negated) or behind
     (second half). Partners never leave their chunk, so the wrap-around of the
     row-wide roll is never selected.
-  - cos/sin arrive once per token, ``[tokens, head_dim]``, and are tiled across
-    the heads with a constant one-hot matmul instead of a 16x larger input.
+  - cos/sin come in tiled across the heads (``tile_cos_sin``). Every layer's
+    Q and K share the same tiled tensors, so they are built once per forward.
 """
 
 import functools
@@ -47,7 +48,6 @@ from jax.experimental.pallas import tpu as pltpu
 LANE = 128
 DEFAULT_BLOCK_TOKENS = 256
 DEFAULT_VMEM_LIMIT_BYTES = 64 * 1024 * 1024
-_HIGHEST = jax.lax.Precision.HIGHEST
 
 
 def _round_up(x: int, m: int) -> int:
@@ -68,27 +68,38 @@ def _constants(num_heads: int, head_dim: int, ndim: int):
     """Constant matrices and masks; folded by XLA, fetched once by the kernel."""
     width = num_heads * head_dim
     padded_heads = _round_up(num_heads, LANE)
-    padded_dim = _round_up(head_dim, LANE)
     chunk, half = _rope_layout(head_dim, ndim)
 
     lane = jnp.arange(width)
     head_of_lane = lane // head_dim
     channel = lane % head_dim
 
-    # [width, padded_heads]: lane -> its head. Sums squares per head.
+    # [width, padded_heads]: lane -> its head. 0/1 is exact in bf16, so the
+    # matmuls below run as plain bf16 MXU passes.
     head_sum = (head_of_lane[:, None] == jnp.arange(padded_heads)[None, :]).astype(
-        jnp.float32
+        jnp.bfloat16
     )
     # [padded_heads, width]: per-head value back onto that head's lanes.
     head_spread = head_sum.T
-    # [padded_dim, width]: per-token cos/sin channel -> every head's lane.
-    channel_tile = (jnp.arange(padded_dim)[:, None] == channel[None, :]).astype(
-        jnp.float32
-    )
     # 1 where a lane is in the first half of its RoPE chunk (reads +half,
     # negated), 0 in the second half (reads -half).
     first_half = ((channel % chunk) < half).astype(jnp.float32)[None, :]
-    return head_sum, head_spread, channel_tile, first_half, half
+    return head_sum, head_spread, first_half, half
+
+
+def _dot_01(a: jax.Array, m01: jax.Array) -> jax.Array:
+    """``a @ m01`` for float32 ``a`` and a bf16 0/1 matrix, in two bf16 passes.
+
+    ``a`` is split into a bf16 high part and a bf16 low part. Every product
+    with a 0/1 entry is exact and accumulation is float32, so the result is
+    accurate to ~2^-16 relative -- far below the bf16 output rounding -- at a
+    third of the cost of a ``Precision.HIGHEST`` float32 matmul.
+    """
+    hi = a.astype(jnp.bfloat16)
+    lo = (a - hi.astype(jnp.float32)).astype(jnp.bfloat16)
+    return jnp.dot(hi, m01, preferred_element_type=jnp.float32) + jnp.dot(
+        lo, m01, preferred_element_type=jnp.float32
+    )
 
 
 def _kernel(
@@ -98,7 +109,6 @@ def _kernel(
     scale_ref,
     head_sum_ref,
     head_spread_ref,
-    channel_tile_ref,
     first_half_ref,
     out_ref,
     *,
@@ -110,41 +120,28 @@ def _kernel(
     width = x.shape[-1]
 
     # Per-head RMSNorm, in float32 like HF's Gemma RMSNorm.
-    sum_sq = jnp.dot(
-        x * x,
-        head_sum_ref[...],
-        precision=_HIGHEST,
-        preferred_element_type=jnp.float32,
-    )  # [tokens, padded_heads]
+    sum_sq = _dot_01(x * x, head_sum_ref[...])  # [tokens, padded_heads]
     inv_rms = jax.lax.rsqrt(sum_sq * (1.0 / head_dim) + eps)
-    inv_rms = jnp.dot(
-        inv_rms,
-        head_spread_ref[...],
-        precision=_HIGHEST,
-        preferred_element_type=jnp.float32,
-    )  # [tokens, width]
+    inv_rms = _dot_01(inv_rms, head_spread_ref[...])  # [tokens, width]
     y = x * inv_rms * scale_ref[...]
-
-    # Per-token cos/sin tiled across the heads.
-    cos = jnp.dot(
-        cos_ref[...].astype(jnp.float32),
-        channel_tile_ref[...],
-        precision=_HIGHEST,
-        preferred_element_type=jnp.float32,
-    )
-    sin = jnp.dot(
-        sin_ref[...].astype(jnp.float32),
-        channel_tile_ref[...],
-        precision=_HIGHEST,
-        preferred_element_type=jnp.float32,
-    )
 
     # rotate_half within every chunk as an in-register lane rotation.
     ahead = pltpu.roll(y, shift=width - half, axis=1)  # lane i reads i + half
     behind = pltpu.roll(y, shift=half, axis=1)  # lane i reads i - half
     rotated = jnp.where(first_half_ref[...] > 0.5, -ahead, behind)
 
+    cos = cos_ref[...].astype(jnp.float32)
+    sin = sin_ref[...].astype(jnp.float32)
     out_ref[...] = (y * cos + rotated * sin).astype(out_ref.dtype)
+
+
+def tile_cos_sin(cos_or_sin: jax.Array, num_heads: int) -> jax.Array:
+    """``[tokens, head_dim]`` -> ``[tokens, num_heads * head_dim]``.
+
+    The tiled tensor is shared by every layer's Q and K, so callers build it
+    once per forward rather than per kernel call.
+    """
+    return jnp.tile(cos_or_sin, (1, num_heads))
 
 
 @functools.partial(
@@ -153,8 +150,8 @@ def _kernel(
 )
 def qk_norm_rope(
     x: jax.Array,  # [tokens, num_heads * head_dim]
-    cos: jax.Array,  # [tokens, head_dim]
-    sin: jax.Array,  # [tokens, head_dim]
+    cos: jax.Array,  # [tokens, num_heads * head_dim], see tile_cos_sin
+    sin: jax.Array,  # [tokens, num_heads * head_dim]
     scale: jax.Array,  # [head_dim], the RMSNorm's effective per-channel multiplier
     *,
     num_heads: int,
@@ -167,8 +164,9 @@ def qk_norm_rope(
 
     Args:
       x: ``[tokens, num_heads * head_dim]`` projection output (heads contiguous).
-      cos, sin: ``[tokens, head_dim]`` as produced by
-        ``Gemma4VisionRotaryEmbedding`` (``[H, H, W, W]`` frequency layout).
+      cos, sin: ``[tokens, num_heads * head_dim]``: the per-token
+        ``Gemma4VisionRotaryEmbedding`` output (``[H, H, W, W]`` frequency
+        layout) tiled across heads with ``tile_cos_sin``.
       scale: ``[head_dim]`` multiplier applied after normalization, i.e. the
         RMSNorm weight in whatever form the module applies it.
       num_heads, head_dim: head layout of ``x``.
@@ -184,16 +182,10 @@ def qk_norm_rope(
         raise ValueError(f"x width {width} != {num_heads} * {head_dim}")
     if width % LANE != 0:
         raise ValueError(f"num_heads * head_dim = {width} must be a multiple of 128")
-    if cos.shape != (tokens, head_dim) or sin.shape != (tokens, head_dim):
-        raise ValueError("cos/sin must be [tokens, head_dim]")
+    if cos.shape != x.shape or sin.shape != x.shape:
+        raise ValueError("cos/sin must be tiled to x's shape (see tile_cos_sin)")
 
-    head_sum, head_spread, channel_tile, first_half, half = _constants(
-        num_heads, head_dim, ndim
-    )
-    padded_dim = channel_tile.shape[0]
-    pad = padded_dim - head_dim
-    cos = jnp.pad(cos, ((0, 0), (0, pad)))
-    sin = jnp.pad(sin, ((0, 0), (0, pad)))
+    head_sum, head_spread, first_half, half = _constants(num_heads, head_dim, ndim)
     scale_row = jnp.tile(scale.astype(jnp.float32), num_heads)[None, :]
 
     block = min(block_tokens, _round_up(tokens, 8))
@@ -205,14 +197,14 @@ def qk_norm_rope(
     def whole(i):
         return (0, 0)
 
+    row_spec = pl.BlockSpec((block, width), rows)
     in_specs = [
-        pl.BlockSpec((block, width), rows),  # x
-        pl.BlockSpec((block, padded_dim), rows),  # cos
-        pl.BlockSpec((block, padded_dim), rows),  # sin
+        row_spec,  # x
+        row_spec,  # cos
+        row_spec,  # sin
         pl.BlockSpec(scale_row.shape, whole),
         pl.BlockSpec(head_sum.shape, whole),
         pl.BlockSpec(head_spread.shape, whole),
-        pl.BlockSpec(channel_tile.shape, whole),
         pl.BlockSpec(first_half.shape, whole),
     ]
     return pl.pallas_call(
@@ -220,13 +212,13 @@ def qk_norm_rope(
         out_shape=jax.ShapeDtypeStruct(x.shape, x.dtype),
         grid=grid,
         in_specs=in_specs,
-        out_specs=pl.BlockSpec((block, width), rows),
+        out_specs=row_spec,
         compiler_params=pltpu.CompilerParams(
             dimension_semantics=("parallel",),
             vmem_limit_bytes=DEFAULT_VMEM_LIMIT_BYTES,
         ),
         name="gemma4_vision_qk_norm_rope",
-    )(x, cos, sin, scale_row, head_sum, head_spread, channel_tile, first_half)
+    )(x, cos, sin, scale_row, head_sum, head_spread, first_half)
 
 
 def reference(

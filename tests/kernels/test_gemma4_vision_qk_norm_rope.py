@@ -49,7 +49,13 @@ def _inputs(tokens: int, seed: int = 0):
 def _run_both(tokens: int, seed: int = 0):
     x, cos, sin, scale = _inputs(tokens, seed)
     kwargs = dict(num_heads=NUM_HEADS, head_dim=HEAD_DIM)
-    got = lib.qk_norm_rope(x, cos, sin, scale, **kwargs)
+    got = lib.qk_norm_rope(
+        x,
+        lib.tile_cos_sin(cos, NUM_HEADS),
+        lib.tile_cos_sin(sin, NUM_HEADS),
+        scale,
+        **kwargs,
+    )
     want = jax.jit(functools.partial(lib.reference, **kwargs))(x, cos, sin, scale)
     return np.asarray(got, np.float32), np.asarray(want, np.float32)
 
@@ -71,7 +77,13 @@ def test_rotation_direction_is_hf_rotate_half():
     zeros = jnp.zeros((tokens, HEAD_DIM), jnp.bfloat16)
     ones = jnp.ones((tokens, HEAD_DIM), jnp.bfloat16)
     kwargs = dict(num_heads=NUM_HEADS, head_dim=HEAD_DIM)
-    got = lib.qk_norm_rope(x, zeros, ones, scale, **kwargs)
+    got = lib.qk_norm_rope(
+        x,
+        lib.tile_cos_sin(zeros, NUM_HEADS),
+        lib.tile_cos_sin(ones, NUM_HEADS),
+        scale,
+        **kwargs,
+    )
     want = lib.reference(x, zeros, ones, scale, **kwargs)
     np.testing.assert_allclose(
         np.asarray(got, np.float32),
@@ -99,12 +111,14 @@ if __name__ == "__main__":
             f"[tpu] tokens={tokens} max_abs_diff="
             f"{float(np.max(np.abs(got - want))):.3e}"
         )
-    args = _inputs(SERVING_TOKENS)
+    x, cos, sin, scale = _inputs(SERVING_TOKENS)
     ref = jax.jit(functools.partial(lib.reference, **kwargs))
-    ref_us = _bench(ref, args)
-    for block in (128, 256, 512):
+    ref_us = _bench(ref, (x, cos, sin, scale))
+    # cos/sin are tiled once per forward and shared by every layer's Q and K.
+    tiled = (x, lib.tile_cos_sin(cos, NUM_HEADS), lib.tile_cos_sin(sin, NUM_HEADS))
+    for block in (128, 256, 512, 1024):
         fused_b = functools.partial(lib.qk_norm_rope, block_tokens=block, **kwargs)
-        us = _bench(fused_b, args)
+        us = _bench(fused_b, (*tiled, scale))
         print(
             f"[tpu] norm+rope per call, tokens={SERVING_TOKENS}: "
             f"xla_unfused={ref_us:.1f} us, fused_kernel(block={block})={us:.1f} us, "
