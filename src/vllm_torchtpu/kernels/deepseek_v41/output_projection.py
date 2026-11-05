@@ -11,8 +11,9 @@ Arithmetic and rounding match the two buffered kernels: wo_a quantizes each
 group row of 4096 to FP8 with a BF16 scale; wo_b quantizes each full row of
 8192 with an FP32 scale, whose amax the wo_a epilogues collect.
 
-One call holds at most MAX_TILE tokens in VMEM. Longer inputs (prefill) run
-as consecutive calls over token tiles, each writing its rows of one shared
+One kernel step holds at most MAX_TILE tokens in VMEM. Longer inputs
+(prefill) run equal token tiles as grid steps of one kernel, then a shorter
+last tile as a second, static call, each writing its rows of one shared
 output. Every quantization is per row, so tiling does not change any bits.
 """
 
@@ -82,7 +83,7 @@ def is_supported(
 
 
 def _kernel(
-    # HBM inputs and output; this call reads and writes rows
+    # HBM inputs and output; each grid step reads and writes rows
     # start .. start + tokens.
     x,  # [T, 64, 512] bf16
     wa,  # [4096, 8192] fp8
@@ -90,12 +91,16 @@ def _kernel(
     wb,  # [8192, 5120] fp8
     sb,  # [5120] f32
     *refs,
-    start: int,
     tokens: int,
+    start: int | None,
 ):
-    # After the first token tile, the previous call's output comes in as an
-    # input aliased to this call's output; its other rows pass through.
-    if start:
+    # start None: grid step i covers rows i * tokens, found at run time, so
+    # the full tiles share one body for any token count. A static start > 0
+    # is the shorter remainder tile, which takes the full tiles' output as
+    # an input aliased to its own; their rows pass through.
+    if start is None:
+        start = pl.multiple_of(pl.program_id(0) * tokens, QUANT_ROWS)
+    elif start:
         refs = refs[1:]
     _tile(x, wa, sa, wb, sb, *refs, start=start, tokens=tokens)
 
@@ -127,7 +132,7 @@ def _tile(
     osem,
     ssem,
     *,
-    start: int,
+    start: int | jax.Array,
     tokens: int,
 ):
     rows_p = y.shape[0]
@@ -462,14 +467,16 @@ def _tile(
         out_copy(windows - 1).wait()
 
 
-def _call(x, wa, sa, wb, sb, out, *, start: int, tokens: int) -> jax.Array:
-    """Rows start .. start + tokens of the projection, written into ``out``
-    (a fresh output when None) of T rounded up to STORE_ROWS rows."""
+def _call(x, wa, sa, wb, sb, out, *, tokens: int, count: int, start: int | None):
+    """``count`` tiles of ``tokens`` rows as grid steps (start None), or one
+    tile at a static ``start``, written into ``out`` (fresh when None)."""
     total, heads, head_dim = x.shape
-    total = -(-total // STORE_ROWS) * STORE_ROWS
     reduction, features = wa.shape
     width = features // (heads // HEADS_PER_GROUP)
     k, n = wb.shape
+    # The output DMA moves whole bf16 row tiles, so the output has
+    # STORE_ROWS-aligned rows; the caller's rows are sliced back out.
+    padded = -(-total // STORE_ROWS) * STORE_ROWS
     rows = -(-tokens // QUANT_ROWS) * QUANT_ROWS
     group_depth, window_depth = GROUP_DEPTH, WINDOW_DEPTH
     hbm = pltpu.HBM
@@ -477,8 +484,9 @@ def _call(x, wa, sa, wb, sb, out, *, start: int, tokens: int) -> jax.Array:
     inputs = tuple(pltpu.with_memory_space_constraint(a, hbm) for a in inputs)
     f32, fp8 = jnp.float32, wa.dtype
     return pl.pallas_call(
-        functools.partial(_kernel, start=start, tokens=tokens),
-        out_shape=jax.ShapeDtypeStruct((total, n), x.dtype),
+        functools.partial(_kernel, tokens=tokens, start=start),
+        out_shape=jax.ShapeDtypeStruct((padded, n), x.dtype),
+        grid=(count,),
         in_specs=(pl.BlockSpec(memory_space=hbm),) * len(inputs),
         out_specs=pl.BlockSpec(memory_space=hbm),
         scratch_shapes=(
@@ -501,17 +509,12 @@ def _call(x, wa, sa, wb, sb, out, *, start: int, tokens: int) -> jax.Array:
             pltpu.SemaphoreType.DMA((2,)),
         ),
         input_output_aliases={} if out is None else {5: 0},
-        compiler_params=pltpu.CompilerParams(vmem_limit_bytes=VMEM_LIMIT_BYTES),
+        compiler_params=pltpu.CompilerParams(
+            dimension_semantics=("arbitrary",),
+            vmem_limit_bytes=VMEM_LIMIT_BYTES,
+        ),
         name="fused_output_projection",
     )(*inputs)
-
-
-def token_tiles(total: int) -> list[tuple[int, int]]:
-    """(start, size) per call: the fewest tiles of at most MAX_TILE tokens,
-    sized evenly in QUANT_ROWS multiples, with the remainder last."""
-    count = -(-total // MAX_TILE)
-    size = -(-total // count // QUANT_ROWS) * QUANT_ROWS
-    return [(s, min(size, total - s)) for s in range(0, total, size)]
 
 
 @jax.jit
@@ -525,15 +528,34 @@ def fused_output_projection(
     """``wo_b(wo_a(x))`` for any token count, see ``is_supported``."""
     if not is_supported(x, wa, sa, wb, sb):
         raise ValueError("Fused output projection requires qualified v7 inputs")
+    total = x.shape[0]
     groups = x.shape[1] // HEADS_PER_GROUP
     assert len(B_ISSUE) == WINDOW_DEPTH and all(0 <= at < groups for at in B_ISSUE)
     assert groups > GROUP_DEPTH
     # Ordinary JAX primitives cannot consume Pallas memory-space annotations.
     # Reshape before constraining the array at the custom-call boundary.
     sa = sa.reshape(1, wa.shape[1])
+    count, tokens, rest = token_tiles(total)
+    # At most two kernels for any token count: the full tiles as grid steps
+    # of one, a shorter remainder tile as a second, static call.
     out = None
-    for start, tokens in token_tiles(x.shape[0]):
-        out = _call(x, wa, sa, wb, sb, out, start=start, tokens=tokens)
+    if count:
+        out = _call(x, wa, sa, wb, sb, None, tokens=tokens, count=count, start=None)
+    if rest:
+        start = count * tokens
+        out = _call(x, wa, sa, wb, sb, out, tokens=rest, count=1, start=start)
     assert out is not None
     # A no-op on the serving buckets, which are STORE_ROWS multiples.
-    return out[: x.shape[0]] if out.shape[0] != x.shape[0] else out
+    return out[:total] if out.shape[0] != total else out
+
+
+def token_tiles(total: int) -> tuple[int, int, int]:
+    """(count, tokens, rest): ``count`` full tiles of ``tokens`` rows, a
+    QUANT_ROWS multiple of at most MAX_TILE, then a shorter last tile of
+    ``rest`` rows (0 if none). One tile up to MAX_TILE is the whole input."""
+    if total <= MAX_TILE:
+        return 0, 0, total
+    tiles = -(-total // MAX_TILE)
+    tokens = -(-total // tiles // QUANT_ROWS) * QUANT_ROWS
+    count = total // tokens
+    return count, tokens, total - count * tokens

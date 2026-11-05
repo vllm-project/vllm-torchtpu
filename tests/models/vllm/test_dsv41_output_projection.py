@@ -103,26 +103,29 @@ def test_buffered_projection_traces_memory_space_boundary(monkeypatch, tokens):
 
 @pytest.mark.cpu_test
 @pytest.mark.parametrize(
-    "total,tiles",
+    "total,count,tokens,rest",
     [
-        (1, [(0, 1)]),
-        (288, [(0, 288)]),
-        (300, [(0, 300)]),
-        (320, [(0, 320)]),
-        (330, [(0, 192), (192, 138)]),
-        (512, [(0, 256), (256, 256)]),
-        (2048, [(s, 320) for s in range(0, 1920, 320)] + [(1920, 128)]),
+        (1, 0, 0, 1),
+        (288, 0, 0, 288),
+        (300, 0, 0, 300),
+        (320, 0, 0, 320),
+        (330, 1, 192, 138),
+        (416, 1, 224, 192),
+        (512, 2, 256, 0),
+        (1024, 4, 256, 0),
+        (2048, 6, 320, 128),
     ],
 )
-def test_output_projection_token_tiles(total, tiles):
+def test_output_projection_token_tiles(total, count, tokens, rest):
     from vllm_torchtpu.kernels.deepseek_v41 import output_projection as fo
 
-    assert fo.token_tiles(total) == tiles
-    # Tiles cover every row once, fit in VMEM and start on accumulator rows.
-    assert sum(size for _, size in tiles) == total
-    assert all(
-        size <= fo.MAX_TILE and start % fo.QUANT_ROWS == 0 for start, size in tiles
-    )
+    assert fo.token_tiles(total) == (count, tokens, rest)
+    # Tiles cover every row once and fit in VMEM; the full tiles are whole
+    # accumulator chunks, so the remainder starts on one.
+    assert count * tokens + rest == total
+    assert tokens <= fo.MAX_TILE and rest <= fo.MAX_TILE
+    assert tokens % fo.QUANT_ROWS == 0
+    assert count == 0 or rest < tokens
 
 
 @pytest.mark.cpu_test
