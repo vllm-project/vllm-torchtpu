@@ -18,7 +18,13 @@ how many rows travel (fold exists only when spec.fold, trim only when
 tile_rows < m):
 
   zero  n_valid == 0: barrier wait, zeros.
-  fold  1 <= n_valid <= fold_rows: the valid rows are folded into one
+  one   n_valid == 1 and spec.one_shot: one round instead of two. The valid row
+        is folded into one row tile, q1[j, x] = p[0, j * h / tile_rows + x], every
+        rank pushes its q1 into slot `me` of every peer, and each rank sums the n
+        slots itself. Each element is the same f32 sum in rank order as the
+        two-shot's, so the row is bitwise the other paths'.
+  fold  1 <= n_valid <= fold_rows (2 <= with spec.one_shot): the valid rows are
+        folded into one
         [tile_rows, h / k] matrix, q[j * fold_rows + r, x] = p[r, j * h / k + x]
         (k = lane groups per chunk), and that is all-reduced instead.
   trim  above the fold range, n_valid <= tile_rows: rows [0, tile_rows) only.
@@ -82,10 +88,17 @@ class AllReduceSpec:
     h: int
     tile_rows: int  # bf16 sublane tiling
     lanes: int
+    # The one-row path (n_valid == 1) runs one round (module docstring).
+    one_shot: bool = False
 
     @property
     def chunk(self) -> int:
         return self.h // self.n
+
+    @property
+    def row_tile_width(self) -> int:
+        """Columns of the one-row path's fold, q1 [tile_rows, h / tile_rows]."""
+        return self.h // self.tile_rows
 
     @property
     def lane_groups(self) -> int:
@@ -100,7 +113,12 @@ class AllReduceSpec:
         return self.lane_groups >= 2 and self.fold_rows >= 1
 
 
-def make_spec(n: int, m: int, h: int) -> AllReduceSpec:
+def one_shot_supported(h: int, info) -> bool:
+    """Whether one row of h columns folds into one row tile of whole lane groups."""
+    return h % (info.get_sublane_tiling(BF16) * info.num_lanes) == 0
+
+
+def make_spec(n: int, m: int, h: int, one_shot: bool = False) -> AllReduceSpec:
     info = pltpu.get_tpu_info()
     if not supported(n, m, h, info):
         raise ValueError(
@@ -108,16 +126,35 @@ def make_spec(n: int, m: int, h: int) -> AllReduceSpec:
             f"multiple of {info.num_lanes} lanes and m a multiple of "
             f"{info.get_sublane_tiling(BF16)} rows"
         )
-    return AllReduceSpec(n, m, h, info.get_sublane_tiling(BF16), info.num_lanes)
+    if one_shot and not one_shot_supported(h, info):
+        raise ValueError(
+            f"the one-row all-reduce path needs h = {h} to be a multiple of "
+            f"{info.get_sublane_tiling(BF16)} x {info.num_lanes}"
+        )
+    return AllReduceSpec(
+        n, m, h, info.get_sublane_tiling(BF16), info.num_lanes, one_shot
+    )
 
 
 def kernel_name(spec: AllReduceSpec) -> str:
-    return f"moe_tp_decode_all_reduce-m_{spec.m}-h_{spec.h}-n_{spec.n}"
+    suffix = "-os" if spec.one_shot else ""
+    return f"moe_tp_decode_all_reduce-m_{spec.m}-h_{spec.h}-n_{spec.n}{suffix}"
 
 
 def _scratch_names(spec: AllReduceSpec) -> tuple[str, ...]:
     fold = ("q",) if spec.fold else ()
-    return ("recv", "red", *fold, "rs_send", "rs_recv", "ag_send", "ag_recv", "loc")
+    one = ("one",) if spec.one_shot else ()
+    return (
+        "recv",
+        "red",
+        *fold,
+        *one,
+        "rs_send",
+        "rs_recv",
+        "ag_send",
+        "ag_recv",
+        "loc",
+    )
 
 
 def scratch_shapes(spec: AllReduceSpec) -> list:
@@ -128,10 +165,16 @@ def scratch_shapes(spec: AllReduceSpec) -> list:
         if spec.fold
         else []
     )
+    one = (
+        [pltpu.VMEM((n, spec.tile_rows, spec.row_tile_width), BF16)]
+        if spec.one_shot
+        else []
+    )
     return [
         pltpu.VMEM((n, m, w), BF16),
         pltpu.VMEM((m, w), BF16),
         *fold,
+        *one,
         *[pltpu.SemaphoreType.DMA((n,)) for _ in range(4)],
         pltpu.SemaphoreType.DMA((2,)),
     ]
@@ -146,6 +189,9 @@ def vmem_bytes(spec: AllReduceSpec, info) -> int:
     if spec.fold:
         block = (spec.tile_rows, h // spec.lane_groups)
         total += t(block, BF16) + (spec.lane_groups + 1) * t(block, F32)
+    if spec.one_shot:
+        block = (spec.tile_rows, spec.row_tile_width)
+        total += t((n, *block), BF16) + 2 * t(block, F32)
     return total
 
 
@@ -289,6 +335,34 @@ def _run_path(spec, kind, me, nv, partial, out_ref, s, barrier):
         _unfold(spec, s["q"][...].astype(F32), nv, out_ref)
 
 
+def _one_row_path(spec, me, partial, out_ref, s, barrier):
+    """n_valid == 1 (spec.one_shot): push row 0, folded into one row tile, to
+    every peer's slot `me`; sum the n slots locally; rows >= 1 come out +0."""
+    n, m, tr, w = spec.n, spec.m, spec.tile_rows, spec.row_tile_width
+    slots = s["one"]
+    p0 = partial[0:1].astype(BF16).astype(F32)
+    rows = lax.broadcasted_iota(jnp.int32, (tr, w), 0)
+    q1 = jnp.zeros((tr, w), F32)
+    for j in range(tr):
+        part = jnp.broadcast_to(p0[:, j * w : (j + 1) * w], (tr, w))
+        q1 = jnp.where(rows == j, part, q1)
+    slots.at[me][...] = q1.astype(BF16)
+    pl.semaphore_wait(barrier, n)
+
+    def slot(q):
+        return slots.at[q]
+
+    sends = _send_all(spec, me, lambda t: slot(me), slot, s["rs_send"], s["rs_recv"])
+    _recv_all(spec, me, slot, s["rs_recv"])
+    total = _sum_slots(lambda q: slots[q], n).astype(BF16).astype(F32)
+    first = lax.broadcasted_iota(jnp.int32, (m, w), 0) == 0
+    for j in range(tr):
+        part = jnp.broadcast_to(total[j : j + 1, :], (m, w))
+        out_ref[:, pl.ds(j * w, w)] = jnp.where(first, part, 0.0).astype(out_ref.dtype)
+    for copy in sends:
+        copy.wait_send()
+
+
 def prologue(spec: AllReduceSpec) -> None:
     """Kernel entry: signal the barrier semaphore +1 on every rank, self
     included, so the work before the epilogue hides the barrier."""
@@ -327,9 +401,16 @@ def epilogue(spec: AllReduceSpec, rank, n_valid, partial, out_ref, scr) -> None:
         pl.semaphore_wait(barrier, spec.n)
 
     lo = 0
-    if spec.fold:
+    if spec.one_shot:
 
-        @pl.when((nv > 0) & (nv <= spec.fold_rows))
+        @pl.when(nv == 1)
+        def _one_path():
+            _one_row_path(spec, rank, partial, out_ref, s, barrier)
+
+        lo = 1
+    if spec.fold and spec.fold_rows > lo:
+
+        @pl.when((nv > lo) & (nv <= spec.fold_rows))
         def _fold_path():
             _run_path(spec, "fold", rank, nv, partial, out_ref, s, barrier)
 
@@ -403,9 +484,11 @@ def selftest_inputs(spec: AllReduceSpec) -> np.ndarray:
 
 
 def selftest_row_counts(spec: AllReduceSpec) -> list[int]:
-    """One n_valid per row path: full, fold, trim (where they exist), zero."""
+    """One n_valid per row path: full, one, fold, trim (where they exist), zero."""
     counts = [spec.m]
-    if spec.fold:
+    if spec.one_shot:
+        counts.append(1)
+    if spec.fold and spec.fold_rows > int(spec.one_shot):
         counts.append(spec.fold_rows)
     if spec.tile_rows < spec.m:
         counts.append(spec.tile_rows)

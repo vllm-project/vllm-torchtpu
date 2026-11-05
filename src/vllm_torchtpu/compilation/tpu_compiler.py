@@ -312,6 +312,7 @@ _RUNTIME_CACHE_KEY_PATHS = (
     "vllm_torchtpu/layers/adapter/fused_moe_ep.py",
     # Same for the TP decode MoE op, whose body this module builds.
     "vllm_torchtpu/layers/adapter/moe_tp_decode.py",
+    "vllm_torchtpu/layers/adapter/small_all_reduce_op.py",
     # The HBM-streaming LM head op.
     "vllm_torchtpu/layers/adapter/lm_head_hbm.py",
     # The V-space DCP merge operand op (TPU_DCP_MERGE_VSPACE_FUSED).

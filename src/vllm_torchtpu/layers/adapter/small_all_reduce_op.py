@@ -47,14 +47,14 @@ would sum -- attention's o_proj -- takes ``row_parallel_or`` instead: one kernel
 for the matmul and the all-reduce (kernels/quantized_matmul/
 fp8_oproj_all_reduce.py), bitwise the two-call path, for blocks of at most
 16 rows inside the warmup. Everything else keeps the layer's own forward.
+With TPU_ONE_ROW_ALL_REDUCE that kernel also takes the step's valid-row
+count from the token-padding mask and exchanges a lone valid row in one round
+(its one-row build); every trace then reads the mask (``retain``).
 """
 
 import jax
 import torch
 from jax.sharding import PartitionSpec
-
-from vllm_torchtpu import envs
-from vllm_torchtpu.compilation import shape_variants
 from vllm_torchtpu.distributed.ep_mesh import (
     EP_AXIS_NAME,
     build_ep_mesh,
@@ -67,8 +67,6 @@ from vllm_torchtpu.kernels.experimental.small_collectives import (
     reduce_scatter,
 )
 from vllm_torchtpu.kernels.experimental.small_collectives.common import LANES
-from vllm_torchtpu.kernels.quantized_matmul import fp8_oproj_all_reduce
-from vllm_torchtpu.layers.adapter import token_padding
 from vllm_torchtpu.layers.adapter.linear_common import (
     FP8_PALLAS_N_ATTR,
     FP8_PALLAS_WEIGHT,
@@ -76,6 +74,11 @@ from vllm_torchtpu.layers.adapter.linear_common import (
     PREQUANT_ATTR,
 )
 from vllm_torchtpu.logger import init_logger
+
+from vllm_torchtpu import envs
+from vllm_torchtpu.compilation import shape_variants
+from vllm_torchtpu.kernels.quantized_matmul import fp8_oproj_all_reduce
+from vllm_torchtpu.layers.adapter import token_padding
 
 logger = init_logger(__name__)
 
@@ -111,6 +114,9 @@ _DP_COMBINE = False
 # The fused row-parallel FP8 matmul + all-reduce (TPU_FUSED_OPROJ_AR); built only
 # when the TP group is the mesh (the only group it sums over).
 _MM_AR_OP = None
+# Whether _MM_AR_OP is the one-row build (TPU_ONE_ROW_ALL_REDUCE), which
+# takes the valid-row count.
+_MM_AR_ONE_ROW = False
 
 
 def _build_all_reduce(mesh, psum_above: int | None = None):
@@ -210,6 +216,44 @@ def _build_matmul_all_reduce(mesh, waves: bool):
     )
 
 
+def _build_matmul_all_reduce_one_row(mesh, waves: bool):
+    """The fused op's one-row build: fn(x, w, w_s, n_valid int32 [1], rank int32
+    [1]) per core; rows >= n_valid are padding (+0 when n_valid == 1)."""
+    n = mesh.shape[EP_AXIS_NAME]
+    spec = PartitionSpec(EP_AXIS_NAME)
+
+    def body(x, w, w_s, n_valid, rank):
+        return fp8_oproj_all_reduce.fp8_matmul_all_reduce(
+            x,
+            w,
+            w_s,
+            rank,
+            num_cores=n,
+            axis=EP_AXIS_NAME,
+            waves=waves,
+            n_valid=n_valid,
+        )
+
+    def fn(
+        x: jax.Array, w: jax.Array, w_s: jax.Array, n_valid: jax.Array, rank: jax.Array
+    ) -> jax.Array:
+        return jax.shard_map(
+            body, mesh=mesh, in_specs=(spec,) * 5, out_specs=spec, check_vma=False
+        )(x, w, w_s, n_valid, rank)
+
+    def fake(x, w, w_s, n_valid, rank):
+        return x.new_empty((x.shape[0], w.shape[1]))
+
+    return sharded_jax_op(
+        "pallas::fp8_matmul_all_reduce_one_row",
+        fn,
+        mesh=mesh,
+        input_partition_specs=(spec,) * 5,
+        output_partition_specs=spec,
+        fake=fake,
+    )
+
+
 def _build_reduce_scatter(mesh):
     n = mesh.shape[EP_AXIS_NAME]
     spec = PartitionSpec(EP_AXIS_NAME)
@@ -241,7 +285,7 @@ def prebuild() -> None:
     """Build the ops and this core's rank tensor, outside any traced region:
     the mesh comes from a collective. A no-op unless TPU_SMALL_ALL_REDUCE."""
     global _AR_OP, _AR_SIZED_OP, _RS_OP, _RANK, _CORES, _MESH_RANKS, _DP_COMBINE
-    global _AR_VALID_OP, _VALID_TILE_ROWS, _MM_AR_OP
+    global _AR_VALID_OP, _VALID_TILE_ROWS, _MM_AR_OP, _MM_AR_ONE_ROW
     if not envs.TPU_SMALL_ALL_REDUCE or _AR_OP is not None:
         return
     mesh = build_ep_mesh()
@@ -277,11 +321,23 @@ def prebuild() -> None:
     _DP_COMBINE = tuple(int(r) for r in get_dp_group().ranks) == _MESH_RANKS
     tp_all_reduce = tuple(int(r) for r in get_tp_group().ranks) == _MESH_RANKS
     if envs.TPU_FUSED_OPROJ_AR and tp_all_reduce:
-        _MM_AR_OP = _build_matmul_all_reduce(mesh, envs.TPU_FUSED_OPROJ_AR_WAVES)
+        _MM_AR_ONE_ROW = bool(envs.TPU_ONE_ROW_ALL_REDUCE)
+        if _MM_AR_ONE_ROW and not envs.TPU_MOE_SKIP_PADDED_TOKENS:
+            raise NotImplementedError(
+                "TPU_ONE_ROW_ALL_REDUCE reads the valid-row count from the "
+                "token-padding mask: set TPU_MOE_SKIP_PADDED_TOKENS=1"
+            )
+        build = (
+            _build_matmul_all_reduce_one_row
+            if _MM_AR_ONE_ROW
+            else _build_matmul_all_reduce
+        )
+        _MM_AR_OP = build(mesh, envs.TPU_FUSED_OPROJ_AR_WAVES)
     logger.info(
         "Small collectives armed | cores=%d | max_rows=%d | "
         "combine_max_rows=%d | one_shot_max_bytes=%d | tp_all_reduce=%s | "
-        "dp_combine=%s | outside_warmup=%s | valid_rows=%s | fused_oproj_ar=%s",
+        "dp_combine=%s | outside_warmup=%s | valid_rows=%s | fused_oproj_ar=%s"
+        " | fused_oproj_ar_one_row=%s",
         _CORES,
         max_rows(),
         COMBINE_MAX_ROWS,
@@ -295,6 +351,7 @@ def prebuild() -> None:
         if _AR_VALID_OP is not None
         else "off",
         _MM_AR_OP is not None,
+        _MM_AR_ONE_ROW,
     )
 
 
@@ -316,16 +373,28 @@ def _padding_mask() -> torch.Tensor | None:
     return token_padding._padding_state.local_padding_mask
 
 
+def _one_row_mask() -> torch.Tensor:
+    """The token-padding mask the one-row o_proj kernel reads its valid-row
+    count from (TPU_ONE_ROW_ALL_REDUCE needs it)."""
+    if token_padding._padding_state is None:
+        raise NotImplementedError(
+            "TPU_ONE_ROW_ALL_REDUCE reads the valid-row count from the "
+            "token-padding mask: set TPU_MOE_SKIP_PADDED_TOKENS=1"
+        )
+    return token_padding._padding_state.local_padding_mask
+
+
 def retain(out: torch.Tensor) -> torch.Tensor:
     """``out`` plus a zero read from the rank buffer (and, with the valid-rows
-    all-reduce, the padding mask), for a token-count branch that skips the
-    kernel while its other side calls it: the warmup hands a bucket over only
-    between traces that lift the same buffers. A read whose result is dead
-    would be eliminated, so the zero rides on ``out``."""
+    all-reduce or the one-row o_proj kernel, the padding mask), for a
+    token-count branch that skips the kernel while its other side calls it:
+    the warmup hands a bucket over only between traces that lift the same
+    buffers. A read whose result is dead would be eliminated, so the zero
+    rides on ``out``."""
     if _RANK is None or not shape_variants.in_warmup():
         return out
     value = _RANK[0].to(out.dtype)
-    mask = _padding_mask()
+    mask = _one_row_mask() if _MM_AR_ONE_ROW else _padding_mask()
     if mask is not None:
         value = value + mask[0].to(out.dtype)
     return out + (value - value)
@@ -346,7 +415,9 @@ def _small_all_reduce(x: torch.Tensor) -> torch.Tensor:
     assert _AR_OP is not None, "init_small_all_reduce builds the ops first"
     mask = _padding_mask()
     if mask is None:
-        return _AR_OP(x, _RANK)
+        # The one-row o_proj kernel reads the mask, so every trace reads it here
+        # first too (retain): the warmup hands buckets over by lifted name.
+        return _AR_OP(retain(x) if _MM_AR_ONE_ROW else x, _RANK)
     rows, hidden = x.shape
     if all_reduce.fold_geometry(rows, hidden, _CORES, _VALID_TILE_ROWS) is not None:
         assert _AR_VALID_OP is not None
@@ -421,5 +492,8 @@ def row_parallel_or(x: torch.Tensor, layer) -> torch.Tensor:
             if k == w.shape[0] and fp8_oproj_all_reduce.supports(
                 rows, k, w.shape[1], _CORES
             ):
+                if _MM_AR_ONE_ROW:
+                    n_valid = _valid_rows(rows, _one_row_mask())
+                    return _MM_AR_OP(retain(x), w, w_s, n_valid, _RANK)
                 return _MM_AR_OP(retain(x), w, w_s, _RANK)
     return layer(x)[0]

@@ -299,6 +299,7 @@ if TYPE_CHECKING:
     TPU_SAMPLER_GRAPH_RNG: bool = True
     TPU_FP8_LINEAR_PALLAS_SITES: str = "q_b_proj,self_attn.o_proj,mlp.gate_up_proj"
     TPU_SAMPLER_VERIFY_TRIM: bool = False
+    TPU_ONE_ROW_ALL_REDUCE: bool = False
 
 
 def env_with_choices(
@@ -1930,6 +1931,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # instead of all after the last tile. 0.3-0.7 us/call faster on 2x2x2 tpu7x
     # (t5-oproj-ar probe 02b); 0 keeps every push after the last tile.
     "TPU_FUSED_OPROJ_AR_WAVES": env_bool("TPU_FUSED_OPROJ_AR_WAVES", True),
+    # Exchange a single valid decode row (`n_valid == 1`) in one round of Pallas
+    # remote copies across moe_tp_decode and fp8_oproj_all_reduce.
+    "TPU_ONE_ROW_ALL_REDUCE": env_bool("TPU_ONE_ROW_ALL_REDUCE", default=False),
     # Per-channel FP8 dense linears whose decode weight XLA reads from HBM: route
     # M <= 16 through the weight-streaming Pallas kernel
     # (kernels/quantized_matmul/fp8_skinny.py), XLA otherwise. Outputs differ from

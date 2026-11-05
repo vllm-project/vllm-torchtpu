@@ -25,12 +25,12 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from jax.experimental.pallas import tpu as pltpu
+from vllm_torchtpu.kernels.quantized_matmul.util import xla_quantized_matmul
 
 from vllm_torchtpu.kernels.experimental import moe_tp_decode as kernel
 from vllm_torchtpu.kernels.experimental.moe_tp_decode import all_reduce
 from vllm_torchtpu.kernels.experimental.moe_tp_decode import kernel as kernel_impl
 from vllm_torchtpu.kernels.experimental.moe_tp_decode.kernel import _quantize_blocks
-from vllm_torchtpu.kernels.quantized_matmul.util import xla_quantized_matmul
 
 F8, BF16, F32 = jnp.float8_e4m3fn, jnp.bfloat16, jnp.float32
 FP8_MAX = float(jnp.finfo(F8).max)
@@ -145,6 +145,31 @@ def test_expert_range_kernel_name(monkeypatch):
     assert kernel.kernel_name(256, 16, 6144, 128, 128, 16, 256) == (
         kernel.kernel_name(256, 16, 6144, 128, 128, 16)
     )
+    assert "-nb_5-n_16-ic_256" in kernel.kernel_name(
+        32, 64, 6144, 1024, 128, 16, 256, nb=5, ic=256
+    )
+
+
+@pytest.mark.parametrize(
+    "i_chunk, expected",
+    [
+        ("256", {16: (256, 6), 32: (256, 6), 64: (256, 5)}),
+        ("512", {16: (512, 3), 32: (512, 3), 64: (256, 5)}),
+    ],
+)
+def test_wider_i_chunk_steps_ring_depth_on_large_buckets(
+    monkeypatch, i_chunk, expected
+):
+    monkeypatch.setattr(pltpu, "get_tpu_info", _tpu7x)
+    monkeypatch.setenv("TPU_MOE_TP_DECODE_I_CHUNK", i_chunk)
+    info = _tpu7x()
+    for rows, (exp_ic, exp_nb) in expected.items():
+        shapes = _shapes(rows, 6144, 32, 1024, 128, score_experts=256)
+        assert kernel.can_use_moe_tp_decode(*shapes, topk=8, n_ranks=N_RANKS)
+        spec = all_reduce.make_spec(N_RANKS, rows, 6144)
+        plan = kernel_impl._plan_ring(rows, 6144, 1024, 256, 128, info, spec)
+        assert plan is not None
+        assert plan[:2] == (exp_ic, exp_nb)
 
 
 @pytest.mark.parametrize(

@@ -577,3 +577,127 @@ def test_fused_flag_defaults_on(monkeypatch):
     monkeypatch.delenv("TPU_FUSED_OPROJ_AR_WAVES", raising=False)
     assert envs.environment_variables["TPU_FUSED_OPROJ_AR"]() is True
     assert envs.environment_variables["TPU_FUSED_OPROJ_AR_WAVES"]() is True
+
+
+# --- TPU_ONE_ROW_ALL_REDUCE ------------------------------------------------------
+
+
+@pytest.fixture
+def one_row(fused, monkeypatch):
+    """The fused op's one-row build, with a padding mask marking rows [1, 64) of
+    the step as padding (a batch-1 decode step)."""
+    from vllm_torchtpu.layers.adapter import token_padding
+
+    monkeypatch.setattr(op, "_MM_AR_ONE_ROW", True)
+    state = token_padding.TokenPaddingState.create(64, "cpu")
+    state.update(1, 64)
+    monkeypatch.setattr(token_padding, "_padding_state", state)
+    return fused
+
+
+@pytest.mark.parametrize("rows", [4, 8, 16])
+def test_one_row_build_takes_the_valid_count(one_row, rows):
+    layer = _RowParallel()
+    x = _block(rows, hidden=K_OPROJ)
+    assert op.row_parallel_or(x, layer) is one_row.return_value
+    (block, w, w_s, n_valid, rank), _ = one_row.call_args
+    torch.testing.assert_close(block, x, rtol=0, atol=0)
+    assert w is layer.weight and w_s is layer.weight_scale and rank is op._RANK
+    assert n_valid.dtype == torch.int32 and n_valid.tolist() == [1]
+
+
+def test_one_row_build_counts_every_valid_row(one_row):
+    from vllm_torchtpu.layers.adapter import token_padding
+
+    token_padding._padding_state.update(3, 64)
+    op.row_parallel_or(_block(8, hidden=K_OPROJ), _RowParallel())
+    (_, _, _, n_valid, _), _ = one_row.call_args
+    assert n_valid.tolist() == [3]
+
+
+def test_one_row_build_needs_the_padding_mask(one_row, monkeypatch):
+    from vllm_torchtpu.layers.adapter import token_padding
+
+    monkeypatch.setattr(token_padding, "_padding_state", None)
+    with pytest.raises(NotImplementedError, match="TPU_MOE_SKIP_PADDED_TOKENS"):
+        op.row_parallel_or(_block(4, hidden=K_OPROJ), _RowParallel())
+
+
+def test_one_row_build_retain_reads_the_mask(one_row, monkeypatch):
+    """Traces that skip the kernel read the mask too (a NaN entry poisons the
+    output), so both sides of the row fork lift it."""
+    from vllm_torchtpu.layers.adapter import token_padding
+
+    monkeypatch.setattr(
+        token_padding._padding_state,
+        "local_padding_mask",
+        torch.full((64,), float("nan")),
+    )
+    assert torch.isnan(op.retain(_block(32))).all()
+
+
+@pytest.mark.parametrize("rows", [1, 17, 32, 96])
+def test_one_row_build_small_all_reduces_read_the_mask(
+    armed, one_row, rows, monkeypatch
+):
+    """With the one-row o_proj kernel armed and the valid-rows all-reduce off,
+    the two-shot all-reduce's input reads the mask too, so every trace reaches
+    the mask first through this module."""
+    from vllm_torchtpu.layers.adapter import token_padding
+
+    ar, _ = armed
+    monkeypatch.setattr(
+        token_padding._padding_state,
+        "local_padding_mask",
+        torch.full((64,), float("nan")),
+    )
+    op.all_reduce_or(_block(rows), MESH, _fallback)
+    (block, rank), _ = ar.call_args
+    assert rank is op._RANK and torch.isnan(block).all()
+
+
+@pytest.mark.parametrize("skip_padded", [False, True])
+def test_prebuild_one_row_build_needs_the_padding_flag(monkeypatch, skip_padded):
+    import types
+
+    import vllm.distributed.parallel_state as ps
+
+    monkeypatch.setattr(op.envs, "TPU_SMALL_ALL_REDUCE", True)
+    monkeypatch.setattr(op.envs, "TPU_SMALL_ALL_REDUCE_DRAFT", False)
+    monkeypatch.setattr(op.envs, "TPU_FUSED_OPROJ_AR", True)
+    monkeypatch.setattr(op.envs, "TPU_ONE_ROW_ALL_REDUCE", True)
+    monkeypatch.setattr(op.envs, "TPU_MOE_SKIP_PADDED_TOKENS", skip_padded)
+    for name in ("_AR_OP", "_AR_SIZED_OP", "_RS_OP", "_RANK", "_MM_AR_OP"):
+        monkeypatch.setattr(op, name, None)
+    monkeypatch.setattr(op, "_MM_AR_ONE_ROW", False)
+    monkeypatch.setattr(
+        op,
+        "build_ep_mesh",
+        lambda: types.SimpleNamespace(shape={op.EP_AXIS_NAME: CORES}),
+    )
+    monkeypatch.setattr(
+        op, "get_ep_group", lambda: types.SimpleNamespace(ranks=list(MESH))
+    )
+    monkeypatch.setattr(op, "ep_mesh_index", lambda: 0)
+    monkeypatch.setattr(op.torch, "tensor", lambda *a, **k: "rank")
+    monkeypatch.setattr(op, "_build_all_reduce", lambda mesh, psum_above=None: "ar")
+    monkeypatch.setattr(op, "_build_reduce_scatter", lambda mesh: "rs")
+    monkeypatch.setattr(
+        op, "_build_matmul_all_reduce_one_row", lambda mesh, waves: "mm_ar_one_row"
+    )
+    group = types.SimpleNamespace(ranks=list(MESH))
+    monkeypatch.setattr(ps, "get_dp_group", lambda: group)
+    monkeypatch.setattr(ps, "get_tp_group", lambda: group)
+    if not skip_padded:
+        with pytest.raises(NotImplementedError, match="TPU_MOE_SKIP_PADDED_TOKENS"):
+            op.prebuild()
+        return
+    op.prebuild()
+    assert op._MM_AR_ONE_ROW and op._MM_AR_OP == "mm_ar_one_row"
+
+
+def test_one_row_flag_defaults_off(monkeypatch):
+    from vllm_torchtpu import envs
+
+    monkeypatch.delenv("TPU_ONE_ROW_ALL_REDUCE", raising=False)
+    assert envs.environment_variables["TPU_ONE_ROW_ALL_REDUCE"]() is False

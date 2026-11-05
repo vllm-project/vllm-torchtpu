@@ -1,5 +1,16 @@
 # Copyright 2026 Google LLC
-# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Serve a MoE layer's decode steps with the fused MoE decode kernel.
 
 Under MoE tensor parallelism vLLM computes the shared expert separately, adds
@@ -48,8 +59,6 @@ import torch
 from jax.experimental.pallas import tpu as pltpu
 from jax.sharding import PartitionSpec
 from torch_tpu._internal.pallas import jax_op
-
-import vllm_torchtpu.envs as envs
 from vllm_torchtpu.distributed.ep_mesh import EP_AXIS_NAME, build_ep_mesh, ep_mesh_index
 from vllm_torchtpu.kernels.experimental.fused_moe_decode import (
     fused_moe_decode as _kernel_body,
@@ -71,6 +80,8 @@ from vllm_torchtpu.layers.core.fused_moe_gmm import (
     resolve_onehot_permute_threshold,
 )
 from vllm_torchtpu.logger import init_logger
+
+import vllm_torchtpu.envs as envs
 
 logger = init_logger(__name__)
 
@@ -95,6 +106,11 @@ _OPS: dict[tuple, Any] = {}
 _RANK_BUFFER: Any = None
 _RANK_BUFFER_START = 0
 _RANK_BUFFER_INDEX: int | None = None
+
+
+def rank_operand() -> torch.Tensor | None:
+    """The rank operand armed layers read (a module global), or None."""
+    return _RANK_BUFFER
 
 
 def fused_moe_decode_supported(quant_method: Any) -> bool:
@@ -477,7 +493,6 @@ def _admit(runner, n_ranks: int) -> tuple[tuple, bool, float] | None:
     """(shared-expert tensors, expert_parallel, routed scale) for an eligible
     layer, else None."""
     from vllm.distributed import get_tensor_model_parallel_world_size
-
     from vllm_torchtpu.layers.adapter.quantization.fp8 import VllmFp8MoEMethodTPU
 
     cfg = runner.moe_config

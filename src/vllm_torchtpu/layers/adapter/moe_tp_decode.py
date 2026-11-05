@@ -49,14 +49,12 @@ import jax
 import jax.numpy as jnp
 import torch
 from jax import lax
+from jax.experimental.pallas import tpu as pltpu
 from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 from torch_tpu._internal import pallas
 from vllm.distributed import parallel_state
-
-import vllm_torchtpu.envs as envs
 from vllm_torchtpu.distributed.ep_mesh import build_ep_mesh, ep_mesh_index, get_ep_group
-from vllm_torchtpu.kernels.experimental import moe_tp_decode as kernel
 from vllm_torchtpu.kernels.experimental.fused_moe_prefill import (
     fused_moe_prefill,
     plan_blocks,
@@ -64,16 +62,19 @@ from vllm_torchtpu.kernels.experimental.fused_moe_prefill import (
 from vllm_torchtpu.kernels.experimental.fused_moe_prefill.fused_moe_prefill_kernel_v2 import (  # noqa: E501
     fused_moe_prefill_stage_a,
 )
-from vllm_torchtpu.kernels.experimental.moe_tp_decode import all_reduce
 from vllm_torchtpu.kernels.quantized_matmul.util import xla_quantized_matmul
 from vllm_torchtpu.kernels.router_topk import select as router_select
 from vllm_torchtpu.kernels.router_topk import select_bias as router_select_bias
-from vllm_torchtpu.layers.adapter import moe_routing, token_padding
 from vllm_torchtpu.layers.core.fused_moe_gmm import (
     fused_moe_func,
     resolve_onehot_permute_threshold,
 )
 from vllm_torchtpu.logger import init_logger
+
+import vllm_torchtpu.envs as envs
+from vllm_torchtpu.kernels.experimental import moe_tp_decode as kernel
+from vllm_torchtpu.kernels.experimental.moe_tp_decode import all_reduce
+from vllm_torchtpu.layers.adapter import moe_routing, token_padding
 
 logger = init_logger(__name__)
 
@@ -137,6 +138,8 @@ class _OpStatics:
     # TPU_MOE_TP_DECODE_HBM_OPERANDS: the kernel's 8 weight operands constrained
     # to HBM (it DMAs them itself; no XLA VMEM staging copy). Same bits.
     hbm_operands: bool = False
+    # TPU_ONE_ROW_ALL_REDUCE: the in-kernel all-reduce's one-row path.
+    ar_one_shot: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -220,12 +223,12 @@ def _admit(runner, n_ranks: int) -> _Admitted | str:
     from vllm.model_executor.layers.fused_moe.router.zero_expert_router import (
         ZeroExpertRouter,
     )
-
-    from vllm_torchtpu.layers.adapter.fused_moe_ep import fused_moe_ep_supported
     from vllm_torchtpu.layers.adapter.pipelined_fused_moe import (
         enable_pipelined_collective_and_compute,
     )
     from vllm_torchtpu.layers.adapter.quantization.fp8 import VllmFp8MoEMethodTPU
+
+    from vllm_torchtpu.layers.adapter.fused_moe_ep import fused_moe_ep_supported
 
     layer = runner.routed_experts
     qm = layer.quant_method
@@ -313,6 +316,12 @@ def _admit(runner, n_ranks: int) -> _Admitted | str:
     hidden = layer.w13_weight.shape[1]
     experts = layer.global_num_experts
     topk = int(cfg.experts_per_token)
+    ar_one_shot = bool(envs.TPU_ONE_ROW_ALL_REDUCE)
+    if ar_one_shot and not all_reduce.one_shot_supported(hidden, pltpu.get_tpu_info()):
+        raise ValueError(
+            f"TPU_ONE_ROW_ALL_REDUCE: hidden {hidden} does not fold one row "
+            "into one bf16 row tile of whole lane groups"
+        )
     weights = (
         layer.e_score_correction_bias,
         layer.w13_weight,
@@ -330,6 +339,7 @@ def _admit(runner, n_ranks: int) -> _Admitted | str:
             *(_sds(t) for t in weights),
             topk=topk,
             n_ranks=n_ranks,
+            ar_one_shot=ar_one_shot,
         )
     )
     if not rows:
@@ -353,6 +363,7 @@ def _admit(runner, n_ranks: int) -> _Admitted | str:
             else None
         ),
         fast=bool(envs.TPU_MOE_TP_DECODE_FAST),
+        ar_one_shot=ar_one_shot,
     )
     return _Admitted(
         shared=shared,
@@ -515,7 +526,13 @@ def _op_body(statics: _OpStatics, n_ranks: int, axis: str):
             xp = jnp.pad(x, ((0, m - n), (0, 0)))
             sp = jnp.pad(scores, ((0, m - n), (0, 0)))
             if kernel.can_use_moe_tp_decode(
-                xp, sp, bias, *weights, topk=statics.topk, n_ranks=n_ranks
+                xp,
+                sp,
+                bias,
+                *weights,
+                topk=statics.topk,
+                n_ranks=n_ranks,
+                ar_one_shot=statics.ar_one_shot,
             ):
                 return kernel.moe_tp_decode(
                     xp,
@@ -530,9 +547,16 @@ def _op_body(statics: _OpStatics, n_ranks: int, axis: str):
                     n_ranks=n_ranks,
                     fast=statics.fast,
                     hbm_operands=statics.hbm_operands,
+                    ar_one_shot=statics.ar_one_shot,
                 )[:n]
         if kernel.can_use_moe_tp_decode(
-            x, scores, bias, *weights, topk=statics.topk, n_ranks=n_ranks
+            x,
+            scores,
+            bias,
+            *weights,
+            topk=statics.topk,
+            n_ranks=n_ranks,
+            ar_one_shot=statics.ar_one_shot,
         ):
             return kernel.moe_tp_decode(
                 x,
@@ -547,6 +571,7 @@ def _op_body(statics: _OpStatics, n_ranks: int, axis: str):
                 n_ranks=n_ranks,
                 fast=statics.fast,
                 hbm_operands=statics.hbm_operands,
+                ar_one_shot=statics.ar_one_shot,
             )
         if statics.prefill_above is not None and n > statics.prefill_above:
             return _prefill_chain(
@@ -715,7 +740,9 @@ def _e0_tensor(device: torch.device, experts_start: int) -> torch.Tensor:
     return t
 
 
-def _selftest(topo: _Topology, buckets, device) -> list[tuple[int, int, int]]:
+def _selftest(
+    topo: _Topology, buckets, device, one_shot: bool = False
+) -> list[tuple[int, int, int]]:
     """Run the kernel's all-reduce alone for every armed (rows, hidden) and row
     path through the op's mesh and rank operand; returns this rank's failing
     (rows, hidden, n_valid). Collective: every rank makes the same calls."""
@@ -725,7 +752,7 @@ def _selftest(topo: _Topology, buckets, device) -> list[tuple[int, int, int]]:
     faulthandler.dump_traceback_later(SELFTEST_TIMEOUT_S, exit=True)
     try:
         for m, h in buckets:
-            spec = all_reduce.make_spec(n_ranks, m, h)
+            spec = all_reduce.make_spec(n_ranks, m, h, one_shot=one_shot)
             op = _selftest_op(topo.mesh, spec)
             x = all_reduce.selftest_inputs(spec)
             mine = torch.from_numpy(x[topo.mesh_index]).to(torch.bfloat16).to(device)
@@ -824,7 +851,9 @@ def arm(model: torch.nn.Module, draft_model: torch.nn.Module | None = None) -> i
     if plan and not _SELFTEST_DONE:
         assert not isinstance(topo, str)
         device = plan[0][0].routed_experts.w13_weight.device
-        failures = _selftest(topo, buckets, device)
+        # Every armed layer takes the same flag (statics are in the signature).
+        one_shot = plan[0][1].statics.ar_one_shot
+        failures = _selftest(topo, buckets, device, one_shot)
         seen = _gather(dict(mesh_index=topo.mesh_index, failures=failures))
         if any(s["failures"] for s in seen):
             raise RuntimeError(

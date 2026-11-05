@@ -1,5 +1,16 @@
 # Copyright 2026 Google LLC
-# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Decode MoE layer of one TP rank, all-reduce included, in one pallas_call.
 
 For DeepSeek-V3-style MoE layers served with MoE tensor parallelism (every
@@ -63,9 +74,9 @@ import numpy as np
 from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
+from vllm_torchtpu.kernels.quantized_matmul.util import quantize_block
 
 from vllm_torchtpu.kernels.experimental.moe_tp_decode import all_reduce
-from vllm_torchtpu.kernels.quantized_matmul.util import quantize_block
 
 FP8 = jnp.float8_e4m3fn
 FP8_MAX = float(jnp.finfo(FP8).max)
@@ -87,8 +98,11 @@ _N_CHUNK = 512
 # columns of x (its quant_block_size).
 _Q_BLOCK = 512
 # Weight ring depth. One slot holds the expert whose first matmul is in
-# flight, so num_buffers - 2 transfers run ahead of compute.
+# flight, so num_buffers - 2 transfers run ahead of compute. At wider chunk
+# widths the ring steps down as far as _MIN_BUFFERS (and then halves the chunk
+# width back toward _I_CHUNK) so larger decode buckets fit VMEM.
 _NUM_BUFFERS = 6
+_MIN_BUFFERS = 3
 # Intermediate columns per ring item (one MXU-wide gate and up chunk).
 _I_CHUNK = 128
 
@@ -97,13 +111,6 @@ def exact_in_bf16(value: float) -> bool:
     """True if `value` is a bf16 number, so bf16 and f32 products agree."""
     rounded = np.asarray(value, dtype=jnp.bfloat16).astype(np.float32)
     return float(rounded) == float(value)
-
-
-def _split_meta():
-    """TPU_MOE_TP_DECODE_SPLIT_META: n_valid / rank / e0 as [1] operands."""
-    from vllm_torchtpu import envs
-
-    return bool(envs.TPU_MOE_TP_DECODE_SPLIT_META)
 
 
 class _Meta:
@@ -120,15 +127,19 @@ def _split_entry(n_valid_ref, rank_ref, e0_ref, *refs, **kwargs):
     return _kernel(_Meta((n_valid_ref, rank_ref, e0_ref)), *refs, **kwargs)
 
 
-def _i_chunk(i):
+def _i_chunk(i: int, max_i_chunk: int = _I_CHUNK) -> int:
     """Intermediate columns per ring item for a rank holding I = i."""
-    return min(i, _I_CHUNK)
+    ic = int(max_i_chunk)
+    if ic <= 0 or ic % PAIR or i % ic:
+        ic = _I_CHUNK
+    return min(i, ic)
 
 
 def _vmem_plan(m, h, i, num_experts, shared_inter, info, spec):
-    """(need_bytes, vmem_limit_bytes), or None if the limit would exceed
-    VMEM_FRACTION of the capacity. Whole-array blocks (grid=()), tiles padded.
-    `i` is the ring item's column count (_i_chunk of the rank's I)."""
+    """(nb, need_bytes, vmem_limit_bytes) for the deepest ring (from
+    _NUM_BUFFERS down to _MIN_BUFFERS) whose limit stays within VMEM_FRACTION
+    of capacity, or None if even _MIN_BUFFERS exceeds it. Whole-array blocks
+    (grid=()), tiles padded. `i` is the ring item's column count."""
     t = functools.partial(all_reduce.tiled_bytes, info=info)
     e_pad = pl.cdiv(num_experts, info.num_lanes) * info.num_lanes
     f32, bf16 = jnp.float32, jnp.bfloat16
@@ -147,27 +158,70 @@ def _vmem_plan(m, h, i, num_experts, shared_inter, info, spec):
         + t((1, e_pad), jnp.int32)  # hits_v
     )
     slot = t((h, 2 * i), FP8) + t((i, h), FP8) + t((1, 2 * i), f32) + t((1, h), f32)
-    need = fixed + _NUM_BUFFERS * slot + all_reduce.vmem_bytes(spec, info)
-    limit = int(need * VMEM_HEADROOM)
-    if limit > int(info.vmem_capacity_bytes * VMEM_FRACTION):
-        return None
-    return need, min(limit, info.vmem_capacity_bytes)
+    ar_bytes = all_reduce.vmem_bytes(spec, info)
+    budget = int(info.vmem_capacity_bytes * VMEM_FRACTION)
+    for nb in range(_NUM_BUFFERS, _MIN_BUFFERS - 1, -1):
+        need = fixed + nb * slot + ar_bytes
+        limit = int(need * VMEM_HEADROOM)
+        if limit <= budget:
+            return nb, need, min(limit, info.vmem_capacity_bytes)
+    return None
+
+
+def _plan_ring(
+    m, h, i, num_experts, shared_inter, info, spec, max_i_chunk: int = _I_CHUNK
+):
+    """(ic, nb, need_bytes, vmem_limit_bytes) at `m` rows for a rank holding
+    `i` intermediate columns, stepping down from _i_chunk(i, max_i_chunk) by
+    powers of two toward _I_CHUNK if needed so larger row buckets fit VMEM."""
+    ic = _i_chunk(i, max_i_chunk)
+    floor = min(i, _I_CHUNK)
+    while ic >= floor:
+        if ic % PAIR == 0 and i % ic == 0:
+            plan = _vmem_plan(m, h, ic, num_experts, shared_inter, info, spec)
+            if plan is not None:
+                nb, need, limit = plan
+                return ic, nb, need, limit
+        if ic == floor or ic % 2:
+            break
+        ic //= 2
+    return None
 
 
 def kernel_name(
-    experts, m, h, i, shared_inter, n_ranks, num_experts=None, fast=False
+    experts,
+    m,
+    h,
+    i,
+    shared_inter,
+    n_ranks,
+    num_experts=None,
+    fast=False,
+    ar_one_shot=False,
+    *,
+    nb=None,
+    ic=None,
+    split_meta=True,
 ) -> str:
+    if nb is None:
+        nb = _NUM_BUFFERS
+    if ic is None:
+        ic = _i_chunk(i)
     name = (
         f"moe_tp_decode-e_{experts}-m_{m}-h_{h}-i_{i}-fs_{shared_inter}"
-        f"-nb_{_NUM_BUFFERS}-n_{n_ranks}"
+        f"-nb_{nb}-n_{n_ranks}"
     )
-    if _split_meta():
+    if ic != min(i, _I_CHUNK):
+        name += f"-ic_{ic}"
+    if split_meta:
         name += "-sm"
     if num_experts is not None and num_experts != experts:
         # Expert range: `experts` of the router's num_experts.
         name += f"-ne_{num_experts}"
     if fast:
         name += "-fast"
+    if ar_one_shot:
+        name += "-os"
     return name
 
 
@@ -186,6 +240,9 @@ def can_use_moe_tp_decode(
     *,
     topk: int,
     n_ranks: int,
+    ar_one_shot: bool = False,
+    max_i_chunk: int = _I_CHUNK,
+    max_tokens: int | None = None,
 ) -> bool:
     """Trace-time admission; False means the caller keeps its own path.
 
@@ -202,6 +259,8 @@ def can_use_moe_tp_decode(
     if w13.ndim != 3 or w2.ndim != 3 or shared_w13.ndim != 2 or shared_w2.ndim != 2:
         return False
     m, h = x.shape
+    if max_tokens is not None and 0 < max_tokens < m:
+        return False
     experts, i, out = w2.shape
     num_experts, shared_inter = scores.shape[1], shared_w2.shape[0]
     if m not in ROW_BUCKETS or scores.shape != (m, num_experts):
@@ -230,8 +289,12 @@ def can_use_moe_tp_decode(
         return False
     if not all_reduce.supported(n_ranks, m, h, info):
         return False
-    spec = all_reduce.make_spec(n_ranks, m, h)
-    plan = _vmem_plan(m, h, _i_chunk(i), num_experts, shared_inter, info, spec)
+    if ar_one_shot and not all_reduce.one_shot_supported(h, info):
+        return False
+    spec = all_reduce.make_spec(n_ranks, m, h, one_shot=ar_one_shot)
+    plan = _plan_ring(
+        m, h, i, num_experts, shared_inter, info, spec, max_i_chunk=max_i_chunk
+    )
     return plan is not None
 
 
@@ -443,7 +506,7 @@ def _kernel(
     i = w2_hbm.shape[1]  # this rank's I
     ic = w2_ref.shape[1]  # columns per ring item; i == ic * n_chunks
     nc = n_chunks
-    nb = _NUM_BUFFERS
+    nb = w1_ref.shape[0]
     n_valid = meta_ref[0]
     rank = meta_ref[1]
     # First global expert this rank holds (0 under plain TP).
@@ -722,7 +785,16 @@ def _kernel(
 
 @functools.partial(
     jax.jit,
-    static_argnames=("routed_scale", "topk", "n_ranks", "fast", "hbm_operands"),
+    static_argnames=(
+        "routed_scale",
+        "topk",
+        "n_ranks",
+        "fast",
+        "hbm_operands",
+        "ar_one_shot",
+        "max_i_chunk",
+        "split_meta",
+    ),
 )
 def moe_tp_decode(
     x,
@@ -745,6 +817,9 @@ def moe_tp_decode(
     n_ranks: int,
     fast: bool = False,
     hbm_operands: bool = False,
+    ar_one_shot: bool = False,
+    max_i_chunk: int = _I_CHUNK,
+    split_meta: bool = True,
 ):
     """The layer's bf16 [N, D] output, summed over the n_ranks TP ranks.
 
@@ -773,6 +848,10 @@ def moe_tp_decode(
         VMEM with a copy-start/-done before the call (exposed in the MTP
         drafter's one-layer program), though the kernel DMAs the rows it uses
         itself. Same bytes read, same output bits.
+      ar_one_shot: the all-reduce's one-row path (all_reduce.py): a step with
+        one valid row exchanges it in one round instead of two. Same bits.
+      max_i_chunk: upper bound on intermediate columns per ring item.
+      split_meta: pass n_valid / rank / experts_start as three [1] scalars.
 
     Returns:
       bf16(sum over ranks of each rank's shared + routed_scale * routed),
@@ -789,13 +868,13 @@ def moe_tp_decode(
     num_experts = scores.shape[1]
     shared_inter = shared_w2.shape[0]
     info = pltpu.get_tpu_info()
-    ar_spec = all_reduce.make_spec(n_ranks, m, h)
-    ic = _i_chunk(i)
-    plan = _vmem_plan(m, h, ic, num_experts, shared_inter, info, ar_spec)
+    ar_spec = all_reduce.make_spec(n_ranks, m, h, one_shot=ar_one_shot)
+    plan = _plan_ring(
+        m, h, i, num_experts, shared_inter, info, ar_spec, max_i_chunk=max_i_chunk
+    )
     if plan is None:
         raise ValueError("moe_tp_decode does not fit VMEM; check can_use_moe_tp_decode")
-    _, limit = plan
-    nb = _NUM_BUFFERS
+    ic, nb, _, limit = plan
     # Lane-dense routing table. Padded experts never win: their biased score
     # is -inf, clamped to ROUTER_NEG, and every real column has a lower index.
     e_pad = pl.cdiv(num_experts, info.num_lanes) * info.num_lanes
@@ -804,11 +883,7 @@ def moe_tp_decode(
     if e_pad != num_experts:
         scores = jnp.pad(scores, ((0, 0), (0, e_pad - num_experts)))
         bias = jnp.pad(bias, (0, e_pad - num_experts), constant_values=-jnp.inf)
-    split = _split_meta()
-    if split:
-        # UPDATE (TPU_MOE_TP_DECODE_SPLIT_META): three [1] scalar operands, as
-        # small_all_reduce_valid_rows passes n_valid and rank, instead of one
-        # stacked int32[3] that XLA materializes with its own fusion per call.
+    if split_meta:
         metas = tuple(
             jnp.asarray(v, jnp.int32).reshape(1) for v in (n_valid, rank, experts_start)
         )
@@ -840,7 +915,7 @@ def moe_tp_decode(
         )
     return pl.pallas_call(
         functools.partial(
-            _split_entry if split else _kernel,
+            _split_entry if split_meta else _kernel,
             local_experts=experts,
             n_chunks=i // ic,
             topk=topk,
@@ -880,7 +955,20 @@ def moe_tp_decode(
         compiler_params=pltpu.CompilerParams(
             vmem_limit_bytes=limit, collective_id=all_reduce.COLLECTIVE_ID
         ),
-        name=kernel_name(experts, m, h, i, shared_inter, n_ranks, num_experts, fast),
+        name=kernel_name(
+            experts,
+            m,
+            h,
+            i,
+            shared_inter,
+            n_ranks,
+            num_experts,
+            fast,
+            ar_one_shot,
+            nb=nb,
+            ic=ic,
+            split_meta=split_meta,
+        ),
     )(
         *metas,
         x,
