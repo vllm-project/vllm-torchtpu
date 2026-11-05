@@ -12,6 +12,7 @@ if TYPE_CHECKING:
     TPU_DEEPSEEK_V41_ENGRAM_CPU_OFFLOAD: bool = False
     TPU_DEEPSEEK_V41_ENGRAM_HBM: str = "auto"
     TPU_DEEPSEEK_V41_DECODE_FUSION: str = "auto"
+    TPU_DEEPSEEK_V41_BLOCKED_ROPE_GATHER: bool = True
     TPU_DEEPSEEK_V41_CSA2_DEEP_GATHER: bool = True
     TPU_K3_SP_PREFILL: bool = False
     TPU_INCREMENTAL_BLOCK_TABLE_UPLOAD: bool = True
@@ -406,6 +407,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "auto",
         ["auto", "off", "require"],
         case_sensitive=False,
+    ),
+    # Gather RoPE table rows (attention preprocessing, CSA2 inverse RoPE) as
+    # 256-row gathers when a step has 257..1024 rows
+    # (`rope_gather.by_row_blocks`). Data movement only; outputs unchanged.
+    "TPU_DEEPSEEK_V41_BLOCKED_ROPE_GATHER": env_bool(
+        "TPU_DEEPSEEK_V41_BLOCKED_ROPE_GATHER", default=True
     ),
     # CSA2 SparseCore word/scale gather: three staging slots in flight and
     # DMA-zeroed invalid rows instead of two slots cleared by vector stores

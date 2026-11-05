@@ -18,6 +18,7 @@ import torch
 from jax.sharding import PartitionSpec as P
 from torch_tpu._internal import pallas
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.attention_preprocessing import (
     compress_rope as compress_kernel,
 )
@@ -72,10 +73,11 @@ def _tag(eps: float) -> str:
 
 def rope_rows() -> Any:
     """``(cos_sin_cache, positions) -> [T, rotary_dim]`` FP32 rows, clamped."""
+    blocked = envs.TPU_DEEPSEEK_V41_BLOCKED_ROPE_GATHER
     return _get(
-        "rope_rows",
+        "rope_rows_blocked" if blocked else "rope_rows",
         lambda: (
-            rope_gather.gather_rows,
+            rope_gather.gather_rows_blocked if blocked else rope_gather.gather_rows,
             lambda cache, pos: cache.new_empty((pos.shape[0], cache.shape[1])),
         ),
     )
