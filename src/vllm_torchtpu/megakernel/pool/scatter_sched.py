@@ -22,7 +22,7 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from ..ops import BF16, U32
+from ..ops import U32
 from .layout import LANES
 from .scatter_ckpt import start_scatter_seq, wait_scatter_seq
 from .scatter_ctx import ScatterKernel, is_active
@@ -125,7 +125,7 @@ def ckpt_prologue(kc: ScatterKernel) -> None:
                             (rec_u32_cap, LANES), U32
                         )
                 if not use_conv_partial:
-                    store_dt = BF16 if sg.conv_store_dt is None else sg.conv_store_dt
+                    store_dt = sg.conv_store_dt
                     for t in range(T):
                         page_buf.at[slot, t * pps + conv_page].bitcast(
                             store_dt

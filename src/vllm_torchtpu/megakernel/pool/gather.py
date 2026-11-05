@@ -113,7 +113,7 @@ def gather_gdn_states(
     conv_page_rows = layout.conv_page_rows
     # The pool stores the conv window as `layout.conv_dtype` (bf16 or f32).
     conv_store_dt = layout.conv_dtype
-    conv_tile = 32 // layout.conv_itemsize  # sublane tile rows: 16 bf16 / 8 f32
+    conv_tile = layout.conv_tile  # sublane tile rows: 16 bf16 / 8 f32
     ssm_u32_rows = (vh * KD) // 2
     conv_rows = (taps * QKV) // LANES
     conv_rows_pad = layout.conv_rows_pad(ex.R)

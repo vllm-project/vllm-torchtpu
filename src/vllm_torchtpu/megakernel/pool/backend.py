@@ -316,7 +316,7 @@ def make_pool_backend(
             ckpt_indices if has_rec else None,
             active_seqs,
             interpret=ex_paged.interpret,
-            conv_partial=cache_exec(ex_paged).GPR,
+            conv_partial=cache_exec(ex_paged).GPR and layout.conv_itemsize == 2,
         )
 
     def _can_pool_gather(ex_paged: ExecSpec) -> bool:

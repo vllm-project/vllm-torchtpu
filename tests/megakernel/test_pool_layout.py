@@ -17,6 +17,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 
+import jax.numpy as jnp
 import pytest
 
 from vllm_torchtpu.megakernel.errors import MegakernelConfigError
@@ -131,11 +132,10 @@ def test_layout_f32_conv_geometry_and_in_kernel_windows():
     GPR copies the whole conv page for f32 conv (128 page rows) and fused pool
     I/O stages `round_up(taps + T, 8)` f32 rows, so at Qwen3.5 TP8 both fit up to
     T=5 and fail closed past it."""
-    import jax.numpy as jnp
-
     bf16 = replace(_layout(3), kh=16, vh=64)  # Qwen3.5: 12 conv rows per rank at R=8
     f32 = replace(bf16, conv_dtype=jnp.float32)
     assert (bf16.conv_itemsize, f32.conv_itemsize) == (2, 4)
+    assert (bf16.conv_tile, f32.conv_tile) == (16, 8)
     assert (bf16.conv_page_rows, f32.conv_page_rows) == (256, 128)
     assert bf16.conv_rows(8) == f32.conv_rows(8) == 36
     assert (bf16.conv_rows_pad(8), f32.conv_rows_pad(8)) == (48, 40)

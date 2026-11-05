@@ -190,6 +190,11 @@ class PoolLayout:
         return jnp.dtype(self.conv_dtype).itemsize
 
     @property
+    def conv_tile(self) -> int:
+        """Sublane tile height in `conv_dtype` rows (`16` for bf16, `8` for f32)."""
+        return 32 // self.conv_itemsize
+
+    @property
     def conv_page_rows(self) -> int:
         """`conv_dtype` rows of `LANES` lanes in one conv page (256 bf16 / 128 f32)."""
         return self.page_bytes // (LANES * self.conv_itemsize)
@@ -247,7 +252,7 @@ class PoolLayout:
 
     def conv_rows_pad(self, R: int) -> int:
         """`conv_rows` rounded to the dtype's sublane tile (16 bf16 / 8 f32)."""
-        return round_up(self.conv_rows(R), 32 // self.conv_itemsize)
+        return round_up(self.conv_rows(R), self.conv_tile)
 
     def conv_bytes(self, R: int) -> int:
         """Bytes of one sequence's per-rank conv window."""

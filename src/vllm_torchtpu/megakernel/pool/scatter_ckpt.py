@@ -61,7 +61,7 @@ def prepare_ckpt(
         ssm_u32_rows = (vh * KD) // 2
         conv_rows = (taps * QKV) // LANES
         conv_rows_pad = layout.conv_rows_pad(ex.R)
-        conv_tile = 32 // layout.conv_itemsize  # sublane tile rows: 16 bf16 / 8 f32
+        conv_tile = layout.conv_tile  # sublane tile rows: 16 bf16 / 8 f32
         qkv_128 = QKV // LANES
         # The direct path reads `taps + 1` rows per token (the last one masked
         # to zero) when `tail_row` is true (`(taps + 1) * qkv_128 == conv_rows_pad`),
@@ -212,12 +212,12 @@ def start_scatter_seq(
     KD, VD, taps, ssm_u32_rows = sg.KD, sg.VD, sg.taps, sg.ssm_u32_rows
     conv_rows, conv_rows_pad = sg.conv_rows, sg.conv_rows_pad
     direct_conv, conv_tail_row = sg.direct_conv, sg.conv_tail_row
-    store_dt = BF16 if sg.conv_store_dt is None else sg.conv_store_dt
+    store_dt = sg.conv_store_dt
     store_isz = jnp.dtype(store_dt).itemsize
 
     @pl.when(is_active(kc, s))
     def _():
-        conv_bf16: Any = conv_buf[slot, 0].astype(store_dt) if conv_tail_row else None
+        conv_st: Any = conv_buf[slot, 0].astype(store_dt) if conv_tail_row else None
         for t in range(T):
             s_km = rec_buf[slot, pl.ds(t * vh, vh)]
             if bool(interpret):
@@ -246,8 +246,8 @@ def start_scatter_seq(
                 if conv_tail_row:
                     w4 = jnp.where(
                         w4_row_iota < taps,
-                        conv_bf16[1 + t : 2 + taps + t, :],
-                        store_dt(0.0),  # built here: bf16 traces as before
+                        conv_st[1 + t : 2 + taps + t, :],
+                        store_dt(0.0),  # scalar zero in conv_store_dt
                     )
                     conv_taps = w4.reshape(conv_rows_pad, LANES)
                 else:

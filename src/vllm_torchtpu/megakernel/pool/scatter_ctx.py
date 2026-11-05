@@ -76,7 +76,7 @@ class ScatterGeom:
     # window); False: `conv_taps` rows plus zero padding.
     conv_tail_row: bool = False
     # Pool storage dtype of the conv window (`PoolLayout.conv_dtype`).
-    conv_store_dt: Any = None
+    conv_store_dt: Any = BF16
     ckpt_is_3d: bool = False
     ckpt_t_off: int = 0
     ckpt_ndim: int = 0

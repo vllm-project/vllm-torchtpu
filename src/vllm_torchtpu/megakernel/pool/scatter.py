@@ -100,8 +100,9 @@ def scatter_pool_states(
             f"page_table has shape {page_table.shape}, expected ({NS}, >=1)"
         )
     has_gdn = G_PER_ATT > 0
+    default_partial = cache_exec(ex).GPR and layout.conv_itemsize == 2
     use_conv_partial = (
-        bool(cache_exec(ex).GPR if conv_partial is None else conv_partial)
+        bool(default_partial if conv_partial is None else conv_partial)
         and has_gdn
         and not bool(interpret)
     )
