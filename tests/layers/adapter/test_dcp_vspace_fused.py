@@ -108,6 +108,87 @@ def test_vspace_merge_is_the_latent_merge_then_w_uv(monkeypatch, lse_ag):
         )
 
 
+@pytest.mark.parametrize("lse_ag,merge_pieces", [(False, 0), (True, 0), (True, 2)])
+def test_vspace_merge_pipeline_orders_tc_and_sc_chunks(
+    monkeypatch, lse_ag, merge_pieces
+):
+    """Chunked V-space merge orders each chunk's TensorCore operand after the
+    prior chunk's operand (`out_c` after `x_{c-1}`) and each chunk's
+    SparseCore reduce-scatter after the prior chunk's reduce-scatter output
+    (`x_c` after `pieces[c-1]`)."""
+    rng = np.random.default_rng(19)
+    chunks = 4
+    tokens = 8 * chunks
+    step = tokens // chunks
+    outputs = torch.from_numpy(
+        rng.standard_normal((D, tokens, H, C)).astype(np.float32)
+    )
+    lses = torch.from_numpy(
+        (rng.standard_normal((D, tokens, H)) * 3).astype(np.float32)
+    )
+    w_uv = torch.from_numpy(rng.standard_normal((H, C, V)).astype(np.float32))
+    for k, val in {
+        "TPU_DCP_MERGE_VSPACE_FUSED": True,
+        "TPU_DCP_LSE_MERGE_A2A": False,
+        "TPU_DCP_MERGE_CHUNKED": chunks,
+        "TPU_DCP_MERGE_CHUNKED_MIN_TOKENS": 0,
+        "TPU_DCP_MERGE_CHUNKED_SMALL": 0,
+        "TPU_DCP_MERGE_CHUNKED_LSE_AG": lse_ag,
+        "TPU_DCP_MERGE_CHUNKED_LSE_AG_MAX_TOKENS": 0,
+        "TPU_DCP_MLA_MERGE_PIECES": merge_pieces,
+        "TPU_DCP_MERGE_RS_BF16": 0,
+        "TPU_DCP_RS_OUT_PRECISION": False,
+    }.items():
+        monkeypatch.setattr(cp_mla.envs, k, val, raising=False)
+
+    after_edges: list[tuple[tuple[int, ...], tuple[int, ...]]] = []
+    monkeypatch.setattr(
+        cp_mla,
+        "_after",
+        lambda x, dep: after_edges.append((tuple(x.shape), tuple(dep.shape))) or x,
+    )
+
+    merged = torch.logsumexp(lses.double(), dim=0)
+    w = torch.exp(lses.double() - merged)
+    latent = torch.einsum("dth,dthc->thc", w.nan_to_num(0), outputs.double())
+    want = torch.einsum("thc,hcv->thv", latent, w_uv.double())
+
+    rank = 1
+
+    class _SizedGroup(_Group):
+        def all_gather(self, tensor, dim=0):
+            n = tensor.shape[1]
+            own = self.lses[self.rank_in_group]
+            for off in range(0, tokens - n + 1):
+                if torch.equal(own[off : off + n], tensor[0]):
+                    return self.lses[:, off : off + n].clone()
+            raise AssertionError("lse rows not found")
+
+    group = _SizedGroup(outputs, lses, w_uv, rank)
+    monkeypatch.setattr(cp_mla, "get_dcp_group", lambda: group)
+    got = cp_mla.merge_lse_partials_scatter_heads_vspace(
+        outputs[rank], lses[rank], w_uv, None
+    )
+    torch.testing.assert_close(
+        got.double(),
+        want[:, rank * LOCAL : (rank + 1) * LOCAL],
+        rtol=1e-4,
+        atol=1e-4,
+    )
+    # 1. Each chunk c >= 1 orders its latent slice `(step, H, C)` after the
+    #    previous chunk's V-space operand `(H, step, V)`:
+    tc_barriers = [e for e in after_edges if e == ((step, H, C), (H, step, V))]
+    assert len(tc_barriers) == chunks - 1
+    # 2. Each chunk c >= 1 orders its V-space reduce-scatter operand `(H, step, V)`
+    #    after the previous chunk's reduce-scattered output `(step, LOCAL, V)`:
+    rs_barriers = [e for e in after_edges if e == ((H, step, V), (step, LOCAL, V))]
+    assert len(rs_barriers) == chunks - 1
+    # 3. With MERGE_PIECES=2, the `rest` LSE gather `(tokens - step, H)` is also
+    #    ordered after chunk 0's V-space operand `(H, step, V)`:
+    if lse_ag and merge_pieces >= 2:
+        assert ((tokens - step, H), (H, step, V)) in after_edges
+
+
 @pytest.mark.tpu_test
 @pytest.mark.parametrize("scaled", [False, True])
 def test_vspace_operand_kernel_matches_reference(scaled):
