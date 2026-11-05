@@ -65,7 +65,7 @@ def _vmem_bytes(k: int, n: int) -> int:
     proj = 2 * TILE_T * N_CHUNK * 2  # bf16
     scaled = TILE_T * n * 4  # f32
     cos_sin = 2 * TILE_T * LANE * 4
-    lanes = 2 * TILE_T * LANE * 4
+    lanes = 3 * TILE_T * LANE * 4
     out = 2 * TILE_T * (n + LANE * 4)  # fp8 query and its (lane-padded) scales
     dot = 2 * TILE_T * N_CHUNK * 4  # one chunk's f32 result, and its epilogue
     return weight + x + proj + scaled + cos_sin + lanes + out + dot
@@ -118,7 +118,8 @@ def _kernel(
     # for the cast, in row ((h // SUBLANE) * TILE_T + t) * SUBLANE + h % SUBLANE.
     scaled_ref: jax.Ref,
     cos_sin_ref: jax.Ref,  # (2, TILE_T, rotary_dim) f32
-    lanes_ref: jax.Ref,  # (2, TILE_T, LANE) f32: the tile's cos and signed sin
+    # (3, TILE_T, LANE) f32: the tile's cos, signed sin and x scales, lane-wide
+    lanes_ref: jax.Ref,
     w_sems: jax.Ref,  # (N // N_CHUNK,) DMA
     cos_sin_sems: jax.Ref,  # (2,) DMA
 ):
@@ -167,6 +168,7 @@ def _kernel(
     )
     lanes_ref[0] = cos
     lanes_ref[1] = sin * _gptj_sign()
+    lanes_ref[2] = jnp.broadcast_to(x_scale_ref[...], (TILE_T, LANE))
 
     def project(c):
         """Chunk ``c`` of the projection, rounded to bf16, into its buffer."""
@@ -184,7 +186,7 @@ def _kernel(
             (((1,), (0,)), ((), ())),
             preferred_element_type=jnp.float32,
         )
-        x = x * x_scale_ref[...]
+        x = x * jnp.concatenate([lanes_ref[2]] * (N_CHUNK // LANE), axis=1)
         x = x * w_scale_ref[cols][None, :]
         proj_ref[c % 2] = x.astype(proj_ref.dtype)
 
@@ -282,7 +284,7 @@ def q_proj_rope_quant(
             pltpu.VMEM((2, TILE_T, N_CHUNK), jnp.bfloat16),
             pltpu.VMEM((num_heads * TILE_T, LANE), jnp.float32),
             pltpu.VMEM((2, TILE_T, rotary_dim), cos_sin_cache.dtype),
-            pltpu.VMEM((2, TILE_T, LANE), jnp.float32),
+            pltpu.VMEM((3, TILE_T, LANE), jnp.float32),
             pltpu.SemaphoreType.DMA((n // N_CHUNK,)),
             pltpu.SemaphoreType.DMA((2,)),
         ],
