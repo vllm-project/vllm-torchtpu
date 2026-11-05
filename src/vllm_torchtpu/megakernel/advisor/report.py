@@ -18,6 +18,7 @@ from __future__ import annotations
 import html
 import json
 import math
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -27,6 +28,9 @@ if TYPE_CHECKING:
     from . import (
         AdvisorReport,
         AdvisorSweepReport,
+        ModelProfile,
+        RegimeEntry,
+        chips,
     )
 
 _MOE_MODE_SHORT_HINTS: Mapping[str, str] = {
@@ -46,6 +50,15 @@ _SCOPE_HINTS: Mapping[str, str] = {
     "single_layer": "one call per layer",
     "per_op": "one call per operator; activations hand off through HBM",
 }
+_PROVENANCE_TAGS: tuple[str, ...] = ("DERIVED", "ASSUMED", "MEASURED")
+_BAND_PAIR_LEN = 2
+# Table 5 verdict labels for scopes that fuse more than one layer per call.
+_MEGAKERNEL_LABELS: Mapping[str, str] = {
+    "whole_step": "WHOLE-STEP MEGAKERNEL",
+    "layer_group": "LAYER-GROUP MEGAKERNEL",
+}
+# Columns of Table 5; the ledger row spans all of them.
+_DECISION_TABLE_COLS = 12
 
 
 def _esc(val: object) -> str:
@@ -123,6 +136,23 @@ def format_regime_table(sweep: AdvisorSweepReport) -> str:
             f"Prefill Parallelism: {pre.label()} [{pre.topology}] "
             f"({pre.source}{groups})"
         )
+    sat = sweep.saturation_parallelism
+    if sat is not None:
+        layout_lines.append(
+            f"Decode Saturation Parallelism: {sat.label()} [{sat.topology}] "
+            f"({sat.source})"
+        )
+    handoff = sweep.disagg_handoff
+    if handoff is not None:
+        lo_ms, hi_ms = handoff.dcn_xfer_bracket_ms
+        layout_lines.append(
+            f"Disaggregated P/D DCN Handoff (ISL={handoff.isl}): "
+            f"{handoff.total_wire_mb:.2f} MB/req "
+            f"(KV={handoff.kv_wire_mb:.2f} MB + "
+            f"state={handoff.state_wire_mb:.2f} MB) -> "
+            f"{handoff.dcn_xfer_ms:.2f} ms [{lo_ms:.2f}..{hi_ms:.2f} ms] "
+            f"at {handoff.dcn_bw_gbps:.0f} Gbps/chip [{handoff.dcn_provenance}]"
+        )
     lines = [
         f"=== Megakernel Advisor Regime Report: {sweep.model} on {sweep.chip} ===",
         *layout_lines,
@@ -176,10 +206,9 @@ def format_regime_table(sweep: AdvisorSweepReport) -> str:
 
 def _render_vmem_svg(sweep: AdvisorSweepReport) -> str:
     """Render inline SVG chart of VMEM token budget vs usable VMEM capacity."""
-    width, height = 680, 260
-    pad_l, pad_r, pad_t, pad_b = 64, 28, 28, 44
+    width, height = 960, 310
+    pad_l, pad_r, pad_t, pad_b = 64, 32, 42, 50
     pw, ph = width - pad_l - pad_r, height - pad_t - pad_b
-    cap_mib = max(sweep.vmem_budget_mib, 64.0)
     static_vmem_mib = sweep.vmem_static_mib
     residual_per_tok_mib = sweep.vmem_breakdown_bytes["residual_buffer_bytes"] / (
         1 << 20
@@ -189,7 +218,12 @@ def _render_vmem_svg(sweep: AdvisorSweepReport) -> str:
     ) / (1 << 20)
 
     token_ticks = [4, 8, 16, 64, 128, 256, 512]
-    bar_w = pw / (len(token_ticks) * 1.6)
+    max_total_mib = max(
+        static_vmem_mib + (residual_per_tok_mib + per_op_per_tok_mib) * tok
+        for tok in token_ticks
+    )
+    cap_mib = max(sweep.vmem_budget_mib * 1.15, max_total_mib * 1.08)
+    bar_w = pw / (len(token_ticks) * 1.8)
     parts = [
         (
             f'<svg viewBox="0 0 {width} {height}" class="chart-svg" '
@@ -197,18 +231,26 @@ def _render_vmem_svg(sweep: AdvisorSweepReport) -> str:
         ),
         (
             f'<rect x="{pad_l}" y="{pad_t}" width="{pw}" height="{ph}" '
-            'fill="#0f172a" stroke="#334155"/>'
+            'fill="var(--chart-bg, #181A2B)" '
+            'stroke="var(--chart-grid, #2D3150)" rx="6"/>'
         ),
     ]
     y_cap = pad_t + ph - min(1.0, sweep.vmem_budget_mib / cap_mib) * ph
     parts.append(
         f'<line x1="{pad_l}" y1="{y_cap:.1f}" x2="{pad_l + pw}" y2="{y_cap:.1f}" '
-        'stroke="#f43f5e" stroke-width="2" stroke-dasharray="5,4"/>'
+        'stroke="#EF4444" stroke-width="2.5" stroke-dasharray="8,5"/>'
+    )
+    lbl_text = (
+        f"Usable VMEM Ceiling: {sweep.vmem_budget_mib:.1f} MiB "
+        f"(T_max={sweep.max_vmem_tokens} tokens)"
     )
     parts.append(
-        f'<text x="{pad_l + pw - 6}" y="{y_cap - 6:.1f}" text-anchor="end" '
-        'font-size="11" fill="#fda4af">Usable VMEM Ceiling '
-        f"({sweep.vmem_budget_mib:.1f} MiB, T_max={sweep.max_vmem_tokens})</text>"
+        f'<rect x="{pad_l + pw - 300}" y="{pad_t - 26}" width="296" height="22" '
+        'fill="var(--card-inner, #1C1E32)" stroke="#EF4444" stroke-width="1.5" rx="4"/>'
+    )
+    parts.append(
+        f'<text x="{pad_l + pw - 152}" y="{pad_t - 11}" text-anchor="middle" '
+        f'font-size="11" font-weight="700" fill="#FCA5A5">{lbl_text}</text>'
     )
 
     for idx, tok in enumerate(token_ticks):
@@ -217,9 +259,9 @@ def _render_vmem_svg(sweep: AdvisorSweepReport) -> str:
         residual_mib = residual_per_tok_mib * tok
         per_op_mib = per_op_per_tok_mib * tok
         total_mib = static_vmem_mib + residual_mib + per_op_mib
-        h_static = min(ph, (static_vmem_mib / cap_mib) * ph)
-        h_residual = min(ph - h_static, (residual_mib / cap_mib) * ph)
-        h_per_op = min(ph - h_static - h_residual, (per_op_mib / cap_mib) * ph)
+        h_static = (static_vmem_mib / cap_mib) * ph
+        h_residual = (residual_mib / cap_mib) * ph
+        h_per_op = (per_op_mib / cap_mib) * ph
 
         y_static = pad_t + ph - h_static
         y_residual = y_static - h_residual
@@ -252,21 +294,24 @@ def _render_vmem_svg(sweep: AdvisorSweepReport) -> str:
             )
         )
         badge = "1 pass" if passes == 1 else f"{passes} passes"
-        color = "#4ade80" if passes == 1 else "#fbbf24"
-        y_lbl = max(pad_t + 12, y_per_op - 5)
+        color = "#10B981" if passes == 1 else "#F59E0B"
+        y_lbl = max(pad_t + 16, y_per_op - 6)
         parts.append(
             f'<text x="{cx:.1f}" y="{y_lbl:.1f}" text-anchor="middle" '
-            f'font-size="10" fill="{color}">{total_mib:.1f}M ({badge})</text>'
+            f'font-size="11" font-weight="600" fill="{color}">'
+            f"{total_mib:.1f}M ({badge})</text>"
         )
         parts.append(
-            f'<text x="{cx:.1f}" y="{pad_t + ph + 18}" text-anchor="middle" '
-            f'font-size="11" fill="#cbd5e1">T={tok}</text>'
+            f'<text x="{cx:.1f}" y="{pad_t + ph + 20}" text-anchor="middle" '
+            'font-size="12" font-weight="600" fill="var(--text, #E4E4F7)">'
+            f"T={tok}</text>"
         )
 
     parts.append(
-        f'<text x="{pad_l + pw / 2:.1f}" y="{height - 6}" text-anchor="middle" '
-        'font-size="11" fill="#94a3b8">'
-        f"Active Tokens per Step (T) - Blue: {sweep.dma_buffers}-Slot Weight Buffers | "
+        f'<text x="{pad_l + pw / 2:.1f}" y="{height - 10}" text-anchor="middle" '
+        'font-size="12" fill="var(--muted, #9D9EC4)">'
+        f"Active Tokens per Step (T) &middot; Blue: {sweep.dma_buffers}-Slot "
+        "Weight Buffers | "
         "Green: [T, H] Residual | Amber: Operator Scratchpad</text>"
     )
     parts.append("</svg>")
@@ -293,7 +338,12 @@ def svg_text_width(text: str, font_px: float = SVG_MIN_FONT_PX) -> float:
 
 
 def _svg_text(
-    x: float, y: float, text: str, *, anchor: str = "start", fill: str = "#e2e8f0"
+    x: float,
+    y: float,
+    text: str,
+    *,
+    anchor: str = "start",
+    fill: str = "var(--text, #E4E4F7)",
 ) -> str:
     """Return one SVG text element at the report's minimum font size."""
     return (
@@ -304,9 +354,9 @@ def _svg_text(
 
 def _svg_marker(shape: str, cx: float, cy: float, color: str, title: str) -> str:
     """Return a circle, diamond, square, or triangle marker with a tooltip."""
-    r = 6.0
+    r = 7.0
     tip = f"<title>{_esc(title)}</title>"
-    common = f'fill="{color}" stroke="#0f172a" stroke-width="1.5"'
+    common = f'fill="{color}" stroke="var(--chart-bg, #181A2B)" stroke-width="2.0"'
     if shape == "circle":
         return f'<circle cx="{cx:.1f}" cy="{cy:.1f}" r="{r}" {common}>{tip}</circle>'
     if shape == "square":
@@ -327,17 +377,24 @@ def render_regime_dot_plot_svg(sweep: AdvisorSweepReport) -> str:
     """Render one row per workload on a log axis of tokens per core."""
     regimes = sweep.regimes
     right = [f"{e.recommended_scope}, {e.step_bound_us:,.0f} us" for e in regimes]
-    pad, gap, row_h, plot_w = 12.0, 14.0, 26.0, 440.0
-    label_w = max(svg_text_width(e.label) for e in regimes)
-    right_w = max(svg_text_width(t) for t in right)
+    pad, gap, row_h, plot_w = 16.0, 16.0, 28.0, 520.0
+    label_w = max((svg_text_width(e.label) for e in regimes), default=0.0)
+    right_w = max((svg_text_width(t) for t in right), default=0.0)
     x0 = pad + label_w + gap
     x1 = x0 + plot_w
     marks = (
-        ("VMEM fit, whole_step", sweep.max_vmem_tokens, "#009E73"),
-        ("VMEM fit, single_layer", sweep.single_layer_vmem_tokens, "#E69F00"),
-        ("compute-bound from", sweep.ridge_tokens, "#cbd5e1"),
+        ("whole_step VMEM ceiling", "#009E73"),
+        ("single_layer VMEM ceiling", "#E69F00"),
+        ("compute-bound point", "#38BDF8"),
     )
-    hi = max(4096, *(e.active_tokens for e in regimes), *(v for _, v, _ in marks))
+    row_limits = [_row_limits(e) for e in regimes]
+    hi = max(
+        (
+            4096,
+            *(e.active_tokens for e in regimes),
+            *(v for lim in row_limits for v in lim if v > 0),
+        )
+    )
     ticks = [t for t in _SVG_TICKS if t <= hi]
     hi = max(hi, ticks[-1])
     log_hi = math.log2(hi)
@@ -346,51 +403,69 @@ def render_regime_dot_plot_svg(sweep: AdvisorSweepReport) -> str:
         """Map tokens per core to an x coordinate on the log2 axis."""
         return x0 + math.log2(max(1.0, float(tok))) / log_hi * plot_w
 
-    mark_labels = [f"{name}: {val:,} tok" for name, val, _ in marks]
+    mark_labels = [f"| {name} (this row's layout)" for name, _ in marks]
     width = max(
         x1 + gap + right_w + pad,
-        *(
-            sx(v) + 4 + svg_text_width(t) + pad
-            for (_, v, _), t in zip(marks, mark_labels)
-        ),
+        *(x0 + 18 + svg_text_width(t) + pad for t in mark_labels),
     )
     title = "Where each workload lands: tokens per core vs on-chip limits"
     width = max(width, pad + svg_text_width(title, 15) + pad)
     width = max(
         width,
         *(
-            pad + 22 + svg_text_width(f"{n}: {_SCOPE_HINTS[n]}") + pad
+            pad + 24 + svg_text_width(f"{n}: {_SCOPE_HINTS[n]}") + pad
             for n in _SCOPE_MARKS
         ),
     )
-    top = 30.0 + 18.0 * len(marks) + 8.0
+    top = 34.0 + 20.0 * len(marks) + 8.0
     bottom = top + row_h * len(regimes)
-    legend_y = bottom + 58.0
-    height = legend_y + 20.0 * len(_SCOPE_MARKS) + 8.0
+    legend_y = bottom + 60.0
+    height = legend_y + 22.0 * len(_SCOPE_MARKS) + 12.0
 
     parts = [
         f'<svg viewBox="0 0 {width:.0f} {height:.0f}" class="chart-svg" '
         'xmlns="http://www.w3.org/2000/svg" role="img">',
-        f'<rect x="0" y="0" width="{width:.0f}" height="{height:.0f}" fill="#0f172a"/>',
-        f'<text x="{pad}" y="20" font-size="15" font-weight="600" '
-        f'fill="#f8fafc">{_esc(title)}</text>',
+        (
+            f'<rect x="0" y="0" width="{width:.0f}" height="{height:.0f}" '
+            'fill="var(--chart-bg, #181A2B)" stroke="var(--border, #373B5E)" '
+            'stroke-width="1" rx="6"/>'
+        ),
+        f'<text x="{pad}" y="24" font-size="15" font-weight="700" '
+        f'fill="var(--text, #E4E4F7)">{_esc(title)}</text>',
     ]
-    for i, ((_, val, color), text) in enumerate(zip(marks, mark_labels)):
-        x = sx(val)
-        y_lbl = 30.0 + 18.0 * (i + 1)
+    for i, ((_, color), text) in enumerate(zip(marks, mark_labels, strict=True)):
+        y_lbl = 34.0 + 20.0 * (i + 1)
         parts.append(
-            f'<line x1="{x:.1f}" y1="{y_lbl + 4:.1f}" x2="{x:.1f}" y2="{bottom:.1f}" '
-            f'stroke="{color}" stroke-width="1.5" stroke-dasharray="5,4"/>'
+            f'<line x1="{x0 + 4:.1f}" y1="{y_lbl - 11:.1f}" x2="{x0 + 4:.1f}" '
+            f'y2="{y_lbl + 3:.1f}" stroke="{color}" stroke-width="3"/>'
         )
-        parts.append(_svg_text(x + 4, y_lbl, text))
-    for i, (entry, rtext) in enumerate(zip(regimes, right)):
+        parts.append(_svg_text(x0 + 14, y_lbl, text[2:], fill=color))
+    for i, (entry, rtext) in enumerate(zip(regimes, right, strict=True)):
         cy = top + row_h * i + row_h / 2
+        for (name, color), val in zip(marks, row_limits[i], strict=True):
+            if val > 0:
+                xv = sx(val)
+                parts.append(
+                    f'<line x1="{xv:.1f}" y1="{cy - 9:.1f}" x2="{xv:.1f}" '
+                    f'y2="{cy + 9:.1f}" stroke="{color}" stroke-width="3">'
+                    f"<title>{_esc(entry.label)}: {name} = {val:,} tokens/core"
+                    "</title></line>"
+                )
         color, shape = _SCOPE_MARKS.get(entry.recommended_scope, ("#cbd5e1", "circle"))
         parts.append(
             f'<line x1="{x0:.1f}" y1="{cy:.1f}" x2="{x1:.1f}" y2="{cy:.1f}" '
-            'stroke="#334155" stroke-width="1"/>'
+            'stroke="var(--chart-grid, #2D3150)" stroke-width="1.5" '
+            'stroke-dasharray="2,4"/>'
         )
-        parts.append(_svg_text(x0 - gap / 2, cy + 4.5, entry.label, anchor="end"))
+        parts.append(
+            _svg_text(
+                x0 - gap / 2,
+                cy + 4.5,
+                entry.label,
+                anchor="end",
+                fill="var(--text, #E4E4F7)",
+            )
+        )
         tip = (
             f"{entry.label}: {entry.active_tokens} tokens/core, "
             f"AI {entry.step_arithmetic_intensity} FLOP/B, {entry.layout} -> "
@@ -398,33 +473,600 @@ def render_regime_dot_plot_svg(sweep: AdvisorSweepReport) -> str:
             f"{entry.step_bound_us:.1f} us"
         )
         parts.append(_svg_marker(shape, sx(entry.active_tokens), cy, color, tip))
-        parts.append(_svg_text(x1 + gap, cy + 4.5, rtext))
+        parts.append(_svg_text(x1 + gap, cy + 4.5, rtext, fill="var(--muted, #9D9EC4)"))
     parts.append(
         f'<line x1="{x0:.1f}" y1="{bottom:.1f}" x2="{x1:.1f}" y2="{bottom:.1f}" '
-        'stroke="#94a3b8" stroke-width="1"/>'
+        'stroke="var(--muted, #9D9EC4)" stroke-width="1.5"/>'
     )
     for t in ticks:
         x = sx(t)
         parts.append(
             f'<line x1="{x:.1f}" y1="{bottom:.1f}" x2="{x:.1f}" y2="{bottom + 5:.1f}" '
-            'stroke="#94a3b8" stroke-width="1"/>'
+            'stroke="var(--muted, #9D9EC4)" stroke-width="1.5"/>'
         )
-        parts.append(_svg_text(x, bottom + 20, f"{t:,}", anchor="middle"))
+        parts.append(
+            _svg_text(
+                x, bottom + 22, f"{t:,}", anchor="middle", fill="var(--muted, #9D9EC4)"
+            )
+        )
     parts.append(
         _svg_text(
             (x0 + x1) / 2,
-            bottom + 40,
+            bottom + 44,
             "Active tokens per core per step (log scale)",
             anchor="middle",
-            fill="#cbd5e1",
+            fill="var(--text, #E4E4F7)",
         )
     )
     for i, (name, (color, shape)) in enumerate(_SCOPE_MARKS.items()):
-        y = legend_y + 20.0 * i
+        y = legend_y + 22.0 * i
         parts.append(_svg_marker(shape, pad + 8, y - 4.5, color, name))
-        parts.append(_svg_text(pad + 22, y, f"{name}: {_SCOPE_HINTS[name]}"))
+        parts.append(
+            _svg_text(
+                pad + 24,
+                y,
+                f"{name}: {_SCOPE_HINTS[name]}",
+                fill="var(--text, #E4E4F7)",
+            )
+        )
     parts.append("</svg>")
     return "\n".join(parts)
+
+
+def _row_limits(entry: RegimeEntry) -> tuple[int, int, int]:
+    """Return this row's whole_step and single_layer VMEM ceilings and ridge."""
+    ceil = {
+        str(sc["scope"]): int(str(sc["t_vmem_max"]))
+        for sc in entry.scopes
+        if sc["feasible"]
+    }
+    ridge = int(float(str(entry.metrics.get("compute_bound_at", {}).get("value", 0))))
+    return ceil.get("whole_step", 0), ceil.get("single_layer", 0), ridge
+
+
+def _scope_floor_us(entry: RegimeEntry, scope: str) -> float:
+    """Return the floor of `scope` on this row, or 0.0 when it is infeasible."""
+    for sc in entry.scopes:
+        if sc["scope"] == scope and sc["feasible"]:
+            return float(str(sc["step_bound_us"]))
+    return 0.0
+
+
+def render_step_band_svg(sweep: AdvisorSweepReport) -> str:
+    """Render horizontal one-sided upward uncertainty whiskers for each regime."""
+    regimes = sweep.regimes
+    pad, gap, row_h, plot_w = 16.0, 16.0, 28.0, 520.0
+    label_w = max((svg_text_width(e.label) for e in regimes), default=0.0)
+    right = [
+        f"{e.step_bound_us:,.1f}..{max(e.step_bound_us, e.step_upper_us):,.1f} us"
+        for e in regimes
+    ]
+    right_w = max((svg_text_width(t) for t in right), default=0.0)
+    x0 = pad + label_w + gap
+    x1 = x0 + plot_w
+    min_us = min((e.step_bound_us for e in regimes), default=50.0)
+    max_us = max(
+        (
+            10.0,
+            *(max(e.step_bound_us, e.step_upper_us) for e in regimes),
+            *(_scope_floor_us(e, "per_op") for e in regimes),
+        )
+    )
+    domain_min = max(1.0, min(50.0, min_us * 0.75))
+    domain_max = max(domain_min * 1.25, max_us * 1.15)
+    log_min = math.log10(domain_min)
+    log_max = math.log10(domain_max)
+
+    def sx_us(val_us: float) -> float:
+        """Map latency in microseconds to horizontal log10 coordinate."""
+        clamped = max(domain_min, min(domain_max, float(val_us)))
+        t = (math.log10(clamped) - log_min) / max(0.01, log_max - log_min)
+        return x0 + max(0.0, min(1.0, t)) * plot_w
+
+    title = "One-sided upward step latency bands: hardware floor to upper bound (us)"
+    width = max(
+        x1 + gap + right_w + pad,
+        pad + svg_text_width(title, 15) + pad,
+    )
+    top = 62.0
+    bottom = top + row_h * len(regimes)
+    height = bottom + 38.0
+    legend = (
+        "dot: floor of the recommended scope | bar: up to the upper bound | "
+        "red dot: per_op floor at the same inputs"
+    )
+    width = max(width, pad + svg_text_width(legend) + pad)
+
+    parts = [
+        f'<svg viewBox="0 0 {width:.0f} {height:.0f}" class="chart-svg" '
+        'xmlns="http://www.w3.org/2000/svg" role="img">',
+        (
+            f'<rect x="0" y="0" width="{width:.0f}" height="{height:.0f}" '
+            'fill="var(--chart-bg, #181A2B)" stroke="var(--border, #373B5E)" '
+            'stroke-width="1" rx="6"/>'
+        ),
+        f'<text x="{pad}" y="24" font-size="15" font-weight="700" '
+        f'fill="var(--text, #E4E4F7)">{_esc(title)}</text>',
+        _svg_text(pad, 46, legend, fill="var(--muted, #9D9EC4)"),
+    ]
+    for gt in (500.0, 1000.0, 2000.0, 5000.0, 10000.0, 20000.0, 50000.0):
+        if domain_min <= gt <= domain_max:
+            gx = sx_us(gt)
+            parts.append(
+                f'<line x1="{gx:.1f}" y1="{top}" x2="{gx:.1f}" y2="{bottom:.1f}" '
+                'stroke="var(--chart-grid, #2D3150)" stroke-width="1.5" '
+                'stroke-dasharray="3,3"/>'
+            )
+            parts.append(
+                _svg_text(
+                    gx,
+                    bottom + 18,
+                    f"{gt / 1000:g}ms",
+                    anchor="middle",
+                    fill="var(--muted, #9D9EC4)",
+                )
+            )
+
+    for idx, (entry, rtext) in enumerate(zip(regimes, right, strict=True)):
+        cy = top + row_h * idx + row_h / 2
+        lo = float(entry.step_bound_us)
+        hi = max(lo, float(entry.step_upper_us))
+        x_lo = sx_us(lo)
+        x_hi = max(x_lo, sx_us(hi))
+        color, _ = _SCOPE_MARKS.get(entry.recommended_scope, ("#38bdf8", "circle"))
+        parts.append(
+            f'<line x1="{x0:.1f}" y1="{cy:.1f}" x2="{x1:.1f}" y2="{cy:.1f}" '
+            'stroke="var(--chart-grid, #2D3150)" stroke-width="1.5" '
+            'stroke-dasharray="2,4"/>'
+        )
+        parts.append(
+            _svg_text(
+                x0 - gap / 2,
+                cy + 4.5,
+                entry.label,
+                anchor="end",
+                fill="var(--text, #E4E4F7)",
+            )
+        )
+        parts.append(
+            f'<line class="uncertainty-whisker" data-floor="{lo:.2f}" '
+            f'data-upper="{hi:.2f}" x1="{x_lo:.2f}" y1="{cy:.2f}" '
+            f'x2="{x_hi:.2f}" y2="{cy:.2f}" stroke="{color}" stroke-width="3"/>'
+        )
+        per_op_us = _scope_floor_us(entry, "per_op")
+        if per_op_us > 0.0 and entry.recommended_scope != "per_op":
+            x_per_op = sx_us(per_op_us)
+            tip = f"per_op floor: {per_op_us:,.1f} us (+{per_op_us - lo:,.1f} us)"
+            parts.append(
+                f'<circle cx="{x_per_op:.2f}" cy="{cy:.2f}" r="4.0" '
+                f'fill="#EF4444" opacity="0.9"><title>{tip}</title></circle>'
+            )
+        parts.append(
+            f'<circle cx="{x_lo:.2f}" cy="{cy:.2f}" r="5.0" fill="{color}" '
+            'stroke="var(--chart-bg, #181A2B)" stroke-width="1.5"/>'
+        )
+        parts.append(_svg_text(x1 + gap, cy + 4.5, rtext, fill="var(--muted, #9D9EC4)"))
+    parts.append("</svg>")
+    return "\n".join(parts)
+
+
+def _render_ledger_row(entry: RegimeEntry) -> str:
+    """Render a collapsed full-width row listing every number behind one regime."""
+    counts = dict.fromkeys(_PROVENANCE_TAGS, 0)
+    metric_rows: list[str] = []
+    for name, metric in entry.metrics.items():
+        tag = str(metric["tag"])
+        counts[tag] = counts.get(tag, 0) + 1
+        band = metric["band"]
+        band_str = f"[{band[0]}, {band[1]}]" if len(band) >= _BAND_PAIR_LEN else "[]"
+        metric_rows.append(
+            f"<tr><td><code>{_esc(name)}</code></td>"
+            f'<td><span class="prov-tag prov-tag-{_esc(tag)}">{_esc(tag)}</span></td>'
+            f'<td class="tabular">{_esc(metric["value"])}</td>'
+            f"<td>{_esc(metric['unit'])}</td>"
+            f'<td class="tabular">{_esc(band_str)}</td>'
+            f"<td>{_esc(metric['source'])}</td></tr>"
+        )
+    scope_rows = [
+        f"<tr><td><code>{_esc(sc['scope'])}</code></td>"
+        f"<td>{'yes' if sc['feasible'] else 'no'}</td>"
+        f'<td class="tabular">{float(str(sc["step_bound_us"])):,.1f}</td>'
+        f'<td class="tabular">{float(str(sc["step_upper_us"])):,.1f}</td>'
+        f'<td class="tabular">{_esc(sc["ops_per_step"])}</td>'
+        f'<td class="tabular">{_esc(sc["n_splits"])}</td></tr>'
+        for sc in entry.scopes
+    ]
+    summary = ", ".join(f"{counts[t]} {t.lower()}" for t in _PROVENANCE_TAGS)
+    scope_table = (
+        '<table class="ledger-table"><thead><tr><th>Scope</th><th>Feasible</th>'
+        '<th class="tabular">Floor (us)</th><th class="tabular">Upper (us)</th>'
+        '<th class="tabular">Launches</th><th class="tabular">Passes</th>'
+        f"</tr></thead><tbody>{''.join(scope_rows)}</tbody></table>"
+        if scope_rows
+        else ""
+    )
+    return (
+        f'<tr class="ledger-row"><td colspan="{_DECISION_TABLE_COLS}">'
+        '<details class="prov-details">'
+        f"<summary>Numbers behind this row: {_esc(summary)}</summary>"
+        '<table class="ledger-table"><thead><tr><th>Metric</th><th>Tag</th>'
+        '<th class="tabular">Value</th><th>Unit</th><th class="tabular">Band</th>'
+        f"<th>Source</th></tr></thead><tbody>{''.join(metric_rows)}</tbody></table>"
+        f"{scope_table}</details></td></tr>"
+    )
+
+
+def _render_flags_cell(entry: RegimeEntry) -> str:
+    """Render pill badges for non-empty regime flags."""
+    if not entry.flags:
+        return '<span class="kpi-sub">none</span>'
+    return " ".join(f'<span class="flag-pill">{_esc(fl)}</span>' for fl in entry.flags)
+
+
+@dataclass(frozen=True)
+class _FactsCardData:
+    """Resolved hardware/model specs and provenance tags for the top facts card."""
+
+    chip_spec: chips.ChipSpec
+    model_prof: ModelProfile
+    chip_sources: dict[str, str]
+    model_sources: dict[str, str]
+    cal_status_badge: str
+    legend_html: str
+    lg_metric: Mapping[str, object]
+    coll_metric: Mapping[str, object]
+    cov_metric: Mapping[str, object]
+    lg_tag: str
+    coll_tag: str
+    cov_tag: str
+
+
+def _resolve_facts_card_data(sweep: AdvisorSweepReport) -> _FactsCardData:
+    """Resolve hardware spec, model profile, sources, and calibration status."""
+    if sweep.chip_spec is None:
+        msg = "sweep.chip_spec is required to render the hardware facts card"
+        raise ValueError(msg)
+    if sweep.model_profile is None:
+        msg = "sweep.model_profile is required to render the model facts card"
+        raise ValueError(msg)
+    chip_spec = sweep.chip_spec
+    model_prof = sweep.model_profile
+
+    chip_sources = dict(sweep.chip_sources or chip_spec.sources or {})
+    model_sources = dict(sweep.model_sources or {})
+
+    first_entry = sweep.regimes[0] if sweep.regimes else None
+    lg_metric = first_entry.metrics.get("launch_gap_us", {}) if first_entry else {}
+    coll_metric = (
+        first_entry.metrics.get("collective_latency_us", {}) if first_entry else {}
+    )
+    cov_metric = first_entry.metrics.get("step_coverage", {}) if first_entry else {}
+
+    handoff = sweep.disagg_handoff
+    dcn_tag = handoff.dcn_provenance if handoff is not None else "ASSUMED"
+    lg_tag = str(lg_metric.get("tag", "ASSUMED"))
+    coll_tag = str(coll_metric.get("tag", "ASSUMED"))
+    cov_tag = str(cov_metric.get("tag", "ASSUMED"))
+    is_calibrated = "MEASURED" in (lg_tag, coll_tag, cov_tag, dcn_tag)
+    measured = [
+        m for m in (lg_metric, coll_metric, cov_metric) if m.get("tag") == "MEASURED"
+    ]
+    meas_source = (
+        str(measured[0].get("source", ""))
+        if measured
+        else ("dcn_bw_gbps" if dcn_tag == "MEASURED" else "")
+    )
+
+    if is_calibrated:
+        cal_status_badge = (
+            f'<span class="badge badge-measured">CALIBRATED TRACE</span> '
+            f'<span class="cal-source">Source: <code>{_esc(meas_source)}</code></span>'
+        )
+    else:
+        hint_code = "advisor calibrate &lt;trace.xplane.pb&gt;"
+        cal_status_badge = (
+            '<span class="badge badge-assumed">UNCALIBRATED PRIORS</span> '
+            f'<span class="cal-hint">Calibrate via: <code>{hint_code}</code></span>'
+        )
+    legend_html = (
+        '<span class="prov-tag prov-tag-DERIVED">DERIVED</span>'
+        '<span class="prov-tag prov-tag-ASSUMED">ASSUMED</span>'
+        + (
+            '<span class="prov-tag prov-tag-MEASURED">MEASURED</span>'
+            if is_calibrated
+            else '<span class="kpi-sub">'
+            "MEASURED: none yet (run advisor calibrate)</span>"
+        )
+    )
+    return _FactsCardData(
+        chip_spec=chip_spec,
+        model_prof=model_prof,
+        chip_sources=chip_sources,
+        model_sources=model_sources,
+        cal_status_badge=cal_status_badge,
+        legend_html=legend_html,
+        lg_metric=lg_metric,
+        coll_metric=coll_metric,
+        cov_metric=cov_metric,
+        lg_tag=lg_tag,
+        coll_tag=coll_tag,
+        cov_tag=cov_tag,
+    )
+
+
+def _render_decision_table_rows(sweep: AdvisorSweepReport) -> list[str]:
+    """Render HTML table rows for Table 5 (Decision Table)."""
+    rows_html = []
+    for entry in sweep.regimes:
+        scope = _esc(entry.recommended_scope)
+        moe_mode = entry.recommended_moe_mode
+        hi_us = max(entry.step_bound_us, entry.step_upper_us)
+        flags_cell = _render_flags_cell(entry)
+
+        tput_val = float(
+            entry.metrics.get("throughput_tok_s_per_chip", {}).get("value", 0.0)
+        )
+        fg_val = float(entry.metrics.get("fusion_gain_max", {}).get("value", 0.0))
+        gain_str = f"+{fg_val * 100:.1f}%" if fg_val > 0 else "+0.0%"
+        gain_cls = "text-gain" if fg_val > 0 else "text-muted"
+
+        verdict_str = entry.verdict
+        if verdict_str.startswith("tie(measure:"):
+            knob = verdict_str[len("tie(measure:") : -1].strip()
+            verdict_cell = (
+                '<span class="verdict-tag verdict-tie">TIE</span>'
+                f'<div class="kpi-sub">measure: <code>{_esc(knob)}</code></div>'
+            )
+        elif verdict_str.startswith("tie(objective_split:"):
+            split_info = verdict_str[len("tie(objective_split:") : -1].strip()
+            if entry.recommended_scope in _MEGAKERNEL_LABELS:
+                label = _MEGAKERNEL_LABELS[entry.recommended_scope]
+                tag_cls = "verdict-fusion"
+            elif entry.recommended_scope == "single_layer":
+                label = "PER-LAYER FUSED KERNEL"
+                tag_cls = "verdict-layer"
+            else:
+                label = "SEPARATE OPS"
+                tag_cls = "verdict-separate"
+            verdict_cell = (
+                f'<span class="verdict-tag {tag_cls}">{label}</span>'
+                '<div class="kpi-sub">layout split: '
+                f"<code>{_esc(split_info)}</code></div>"
+            )
+        elif entry.recommended_scope in _MEGAKERNEL_LABELS:
+            label = _MEGAKERNEL_LABELS[entry.recommended_scope]
+            verdict_cell = f'<span class="verdict-tag verdict-fusion">{label}</span>'
+        elif entry.recommended_scope == "single_layer":
+            verdict_cell = (
+                '<span class="verdict-tag verdict-layer">PER-LAYER FUSED KERNEL</span>'
+            )
+        else:
+            verdict_cell = (
+                '<span class="verdict-tag verdict-separate">SEPARATE OPS</span>'
+            )
+
+        rows_html.append(
+            "<tr>"
+            f"<td><strong>{_esc(entry.label)}</strong></td>"
+            f"<td><code>{_esc(entry.layout)}</code></td>"
+            f'<td class="tabular">{entry.active_tokens:,}</td>'
+            f'<td class="tabular">{entry.step_arithmetic_intensity:.2f}</td>'
+            f'<td class="tabular">{entry.num_vmem_splits}</td>'
+            f'<td><span class="badge badge-{scope}">{scope}</span>'
+            f'<div class="kpi-sub"><code>{_esc(moe_mode)}</code></div></td>'
+            f'<td class="tabular">{tput_val:,.1f}</td>'
+            f'<td class="tabular {gain_cls}">{gain_str}</td>'
+            f'<td class="tabular">{entry.step_bound_us:,.1f}'
+            f'<div class="kpi-sub tabular" style="text-align: right;">'
+            f"upper: {hi_us:,.1f} us</div></td>"
+            f"<td>{verdict_cell}</td>"
+            f"<td>{flags_cell}</td>"
+            f"<td>{_esc(entry.rationale)}</td>"
+            "</tr>"
+        )
+        rows_html.append(_render_ledger_row(entry))
+    return rows_html
+
+
+def _render_facts_ledger_card(sweep: AdvisorSweepReport) -> str:
+    """Render the top Sourced Hardware & Model Facts Ledger HTML card."""
+    data = _resolve_facts_card_data(sweep)
+    chip_spec = data.chip_spec
+    model_prof = data.model_prof
+    chip_sources = data.chip_sources
+    model_sources = data.model_sources
+    rec = sweep.parallelism
+    chip_bw_gb = chip_spec.hbm_bw_bytes_per_s / 1e9
+    fp8_tflops = chip_spec.fp8_flops_per_s / 1e12
+    bf16_tflops = chip_spec.bf16_flops_per_s / 1e12
+    ici_bw_gb = chip_spec.ici_egress_bw_bytes_per_s / 1e9
+    hbm_cap_gb = rec.hbm_capacity_gb
+
+    num_layers = model_prof.num_layers
+    hidden_size = model_prof.hidden_size
+    num_attn = model_prof.num_attention_heads
+    num_kv = model_prof.num_kv_heads
+    head_dim = model_prof.head_dim
+    num_exp = model_prof.num_experts
+    top_k = model_prof.top_k
+    moe_desc = (
+        f"E={num_exp} routed experts, top-{top_k}, "
+        f"intermediate={model_prof.moe_intermediate_size}"
+        if num_exp > 0
+        else "Dense MLP"
+    )
+
+    handoff = sweep.disagg_handoff
+    if handoff is not None:
+        h_lo, h_hi = handoff.dcn_xfer_bracket_ms
+        h_tag = handoff.dcn_provenance
+        handoff_html = (
+            f'<div class="prior-item">'
+            f'<span class="prior-name">Host DCN Hand-Off ({handoff.isl} tok):</span>'
+            f'<span class="prior-val"><code>{handoff.dcn_bw_gbps:.0f} Gbps/chip '
+            f"({handoff.total_wire_mb:.1f} MB &rarr; {handoff.dcn_xfer_ms:.2f} ms "
+            f"[{h_lo:.2f}..{h_hi:.2f} ms])</code></span>"
+            f'<span class="prov-tag prov-tag-{h_tag}">{h_tag}</span>'
+            f"</div>"
+        )
+    else:
+        handoff_html = ""
+
+    return f"""  <div class="card facts-card">
+    <div class="facts-header">
+      <div>
+        <h2 style="margin: 0; font-size: 16px;">
+          Hardware &amp; Model Architecture Specifications
+        </h2>
+        <div class="kpi-sub">Sourced specs below; values computed from them are
+          tagged DERIVED in the KPI cards and in each row's number ledger</div>
+      </div>
+      <div class="prov-legend">{data.legend_html}</div>
+    </div>
+    <div class="facts-grid">
+      <div class="facts-col">
+        <h3>Hardware Specifications (<code>{_esc(sweep.chip)}</code>)</h3>
+        <table class="facts-table">
+          <tr>
+            <td>Usable VMEM / Core</td>
+            <td><strong>{sweep.vmem_budget_mib:.1f} MiB</strong></td>
+            <td>
+              <span class="fact-src">
+                {_esc(chip_sources.get("vmem_capacity_bytes", "Hardware Spec"))}
+              </span>
+            </td>
+          </tr>
+          <tr>
+            <td>HBM Capacity / Core</td>
+            <td><strong>{hbm_cap_gb:.1f} GB</strong></td>
+            <td>
+              <span class="fact-src">
+                {_esc(chip_sources.get("hbm_capacity_bytes", "Hardware Spec"))}
+              </span>
+            </td>
+          </tr>
+          <tr>
+            <td>HBM Bandwidth / Core</td>
+            <td><strong>{chip_bw_gb:,.0f} GB/s</strong></td>
+            <td>
+              <span class="fact-src">
+                {_esc(chip_sources.get("hbm_bw_bytes_per_s", "Hardware Spec"))}
+              </span>
+            </td>
+          </tr>
+          <tr>
+            <td>Peak Compute / Core</td>
+            <td><strong>
+              {fp8_tflops:,.0f} TFLOP/s (FP8) &middot;
+              {bf16_tflops:,.0f} TFLOP/s (BF16)
+            </strong></td>
+            <td>
+              <span class="fact-src">
+                {_esc(chip_sources.get("fp8_flops_per_s", "Hardware Spec"))}
+              </span>
+            </td>
+          </tr>
+          <tr>
+            <td>ICI Interconnect Egress</td>
+            <td><strong>{ici_bw_gb:,.0f} GB/s/core</strong></td>
+            <td>
+              <span class="fact-src">
+                {_esc(chip_sources.get("ici_egress_bw_bytes_per_s", "Hardware Spec"))}
+              </span>
+            </td>
+          </tr>
+        </table>
+      </div>
+      <div class="facts-col">
+        <h3>Model Architecture Dimensions (<code>{_esc(sweep.model)}</code>)</h3>
+        <table class="facts-table">
+          <tr>
+            <td>Source Configuration</td>
+            <td><strong>{_esc(model_prof.model_type)}</strong></td>
+            <td>
+              <span class="fact-src">
+                {_esc(model_sources.get("config", "HF config.json"))}
+              </span>
+            </td>
+          </tr>
+          <tr>
+            <td>Layers &amp; Hidden Size</td>
+            <td><strong>{num_layers} layers &middot; H={hidden_size}</strong></td>
+            <td>
+              <span class="fact-src">
+                {_esc(model_sources.get("num_layers", "HF config.json"))}
+              </span>
+            </td>
+          </tr>
+          <tr>
+            <td>Attention Geometry</td>
+            <td><strong>NH={num_attn}, NKV={num_kv}, HD={head_dim}</strong></td>
+            <td>
+              <span class="fact-src">
+                {_esc(model_sources.get("attention_heads", "HF config.json"))}
+              </span>
+            </td>
+          </tr>
+          <tr>
+            <td>MoE / MLP Structure</td>
+            <td><strong>{_esc(moe_desc)}</strong></td>
+            <td>
+              <span class="fact-src">
+                {_esc(model_sources.get("moe", "Dense MLP"))}
+              </span>
+            </td>
+          </tr>
+          <tr>
+            <td>Weight &amp; KV Dtypes</td>
+            <td>
+              <strong>
+                weight={model_prof.weight_dtype},
+                expert={model_prof.expert_dtype},
+                kv={model_prof.kv_dtype}
+              </strong>
+            </td>
+            <td>
+              <span class="fact-src">
+                {_esc(model_sources.get("dtypes", "HF config.json"))}
+              </span>
+            </td>
+          </tr>
+        </table>
+      </div>
+    </div>
+    <div class="priors-bar">
+      <div class="priors-header">
+        <span class="priors-title">
+          Runtime Priors &amp; Empirical Calibration Status
+        </span>
+        <div>{data.cal_status_badge}</div>
+      </div>
+      <div class="priors-items">
+        <div class="prior-item">
+          <span class="prior-name">Launch Gap:</span>
+          <span class="prior-val">
+            <code>{data.lg_metric.get("value", "1.0..8.0")} us</code>
+          </span>
+          <span class="prov-tag prov-tag-{data.lg_tag}">{data.lg_tag}</span>
+        </div>
+        <div class="prior-item">
+          <span class="prior-name">Collective Latency:</span>
+          <span class="prior-val">
+            <code>{data.coll_metric.get("value", "1.0..5.13")} us/hop</code>
+          </span>
+          <span class="prov-tag prov-tag-{data.coll_tag}">{data.coll_tag}</span>
+        </div>
+        <div class="prior-item">
+          <span class="prior-name">Step Coverage:</span>
+          <span class="prior-val">
+            <code>{data.cov_metric.get("value", "0.50..0.995")}</code>
+          </span>
+          <span class="prov-tag prov-tag-{data.cov_tag}">{data.cov_tag}</span>
+        </div>
+        {handoff_html}
+      </div>
+    </div>
+  </div>"""
 
 
 def render_advisor_html(sweep: AdvisorSweepReport) -> str:
@@ -432,36 +1074,24 @@ def render_advisor_html(sweep: AdvisorSweepReport) -> str:
     rec = sweep.parallelism
     vmem_svg = _render_vmem_svg(sweep)
     regime_svg = render_regime_dot_plot_svg(sweep)
+    band_svg = render_step_band_svg(sweep)
     safe_json = json.dumps(sweep.to_dict(), indent=2).replace("</", "<\\/")
 
-    rows_html = []
-    for entry in sweep.regimes:
-        scope = _esc(entry.recommended_scope)
-        moe_mode = entry.recommended_moe_mode
-        moe_hint = _esc(_MOE_MODE_SHORT_HINTS.get(moe_mode, ""))
-        rows_html.append(
-            "<tr>"
-            f"<td><strong>{_esc(entry.label)}</strong></td>"
-            f"<td>{_esc(entry.layout)}</td>"
-            f"<td>{entry.active_tokens}</td>"
-            f"<td>{entry.step_arithmetic_intensity:.2f}</td>"
-            f"<td>{entry.num_vmem_splits}</td>"
-            f'<td><span class="badge badge-{scope}">{scope}</span></td>'
-            f"<td><code>{_esc(moe_mode)}</code>"
-            f'<div class="kpi-sub">{moe_hint}</div></td>'
-            f"<td>{entry.step_bound_us:.1f}</td>"
-            f"<td>{_esc(entry.rationale)}</td>"
-            "</tr>"
-        )
-
+    facts_card_html = _render_facts_ledger_card(sweep)
+    rows_html = _render_decision_table_rows(sweep)
     rules_html = "".join(f"<li>{_esc(r)}</li>" for r in sweep.tailoring_guide)
     mode_src = rec.source or ("auto-derived" if rec.auto_selected else "manual")
     pre = sweep.prefill_parallelism
+    sat = sweep.saturation_parallelism
     prefill_kpi = (
         f'<div class="kpi-sub">Prefill: {_esc(pre.label())} ({_esc(pre.source)})</div>'
         if pre is not None
         else ""
     )
+    if sat is not None:
+        prefill_kpi += (
+            f'<div class="kpi-sub">Saturated Decode: {_esc(sat.label())}</div>'
+        )
     scope_items = "".join(
         f"<li><strong><code>{_esc(n)}</code></strong>: {_esc(h)}.</li>"
         for n, h in _SCOPE_HINTS.items()
@@ -476,54 +1106,207 @@ def render_advisor_html(sweep: AdvisorSweepReport) -> str:
         f"({sweep.dma_buffers}-slot DMA)"
     )
     return f"""<!DOCTYPE html>
-<html lang="en">
+<html lang="en" data-theme="dark">
 <head>
 <meta charset="utf-8"/>
 <title>Megakernel Advisor Report - {_esc(sweep.model)} ({_esc(sweep.chip)})</title>
 <style>
   :root {{
-    --bg: #0b1120; --card: #1e293b; --border: #334155;
-    --text: #f8fafc; --muted: #94a3b8;
+    --bg: #FAF4E5;
+    --card: #FFFFFF;
+    --card-inner: #F5EFE1;
+    --border: #E8DFCF;
+    --border-subtle: #F0E8D9;
+    --text: #435155;
+    --muted: #7E8C8F;
+    --accent: #CB4B16;
+    --accent-subtle: #FDF2EC;
+    --code-bg: #F0E8D9;
+    --th-bg: #F5EFE1;
+    --chart-bg: #FDFBF7;
+    --chart-grid: #E8DFCF;
+    --shadow: 0 1px 3px rgba(0,0,0,0.06), 0 1px 2px rgba(0,0,0,0.04);
+  }}
+  [data-theme="dark"] {{
+    --bg: #1F2237;
+    --card: #262942;
+    --card-inner: #1C1E32;
+    --border: #373B5E;
+    --border-subtle: #2D3150;
+    --text: #E4E4F7;
+    --muted: #9D9EC4;
+    --accent: #CE3D28;
+    --accent-subtle: #3A2326;
+    --code-bg: #1C1E32;
+    --th-bg: #1F2237;
+    --chart-bg: #181A2B;
+    --chart-grid: #2D3150;
+    --shadow: 0 2px 8px rgba(10, 12, 24, 0.45);
   }}
   body {{
-    font-family: system-ui, -apple-system, sans-serif;
+    font-family:
+      -apple-system, BlinkMacSystemFont, "Segoe UI",
+      Roboto, Helvetica, Arial, sans-serif;
     background: var(--bg); color: var(--text);
     margin: 0; padding: 24px; line-height: 1.5;
+    transition: background 0.2s ease, color 0.2s ease;
   }}
-  .container {{ max-width: 1200px; margin: 0 auto; }}
-  h1, h2 {{ margin-top: 0; }}
+  .container {{ max-width: 1240px; margin: 0 auto; }}
+  .report-header {{
+    display: flex; justify-content: space-between; align-items: center;
+    margin-bottom: 24px; padding-bottom: 16px; border-bottom: 1px solid var(--border);
+  }}
+  h1 {{ margin: 0; font-size: 24px; font-weight: 700; letter-spacing: -0.01em; }}
+  .report-subtitle {{ font-size: 14px; color: var(--muted); margin-top: 4px; }}
+  .theme-btn {{
+    background: var(--card); border: 1px solid var(--border); color: var(--text);
+    border-radius: 6px; padding: 6px 12px; font-size: 12px; font-weight: 600;
+    cursor: pointer; display: inline-flex; align-items: center; gap: 6px;
+    box-shadow: var(--shadow);
+  }}
+  .theme-btn:hover {{ border-color: var(--accent); }}
   .grid-kpi {{
     display: grid; gap: 14px; margin-bottom: 20px;
     grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
   }}
   .card {{
     background: var(--card); border: 1px solid var(--border);
-    border-radius: 8px; padding: 16px;
+    border-radius: 8px; padding: 18px; box-shadow: var(--shadow);
   }}
-  .kpi-label {{ font-size: 12px; color: var(--muted); text-transform: uppercase; }}
+  .kpi-label {{
+    font-size: 11px; color: var(--muted); text-transform: uppercase;
+    letter-spacing: 0.05em; font-weight: 600;
+  }}
   .kpi-val {{ font-size: 22px; font-weight: 700; margin-top: 4px; }}
   .kpi-sub {{ font-size: 12px; color: var(--muted); margin-top: 4px; }}
-  .grid-charts {{
-    display: grid; gap: 16px; margin-bottom: 20px;
-    grid-template-columns: repeat(auto-fit, minmax(520px, 1fr));
+  .tabular {{
+    font-variant-numeric: tabular-nums;
+    font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
   }}
+  th.tabular, td.tabular {{ text-align: right; }}
   .chart-svg {{ width: 100%; height: auto; border-radius: 6px; }}
-  table {{ width: 100%; border-collapse: collapse; font-size: 14px; }}
+  table {{ width: 100%; border-collapse: collapse; font-size: 13px; }}
   th, td {{
     border-bottom: 1px solid var(--border);
     padding: 10px 12px; text-align: left; vertical-align: top;
   }}
-  th {{ color: var(--muted); font-weight: 600; background: #0f172a; }}
-  .badge {{ padding: 2px 8px; border-radius: 4px; font-weight: 600; font-size: 12px; }}
-  .badge-whole_step {{ background: #065f46; color: #6ee7b7; }}
-  .badge-layer_group, .badge-single_layer {{ background: #78350f; color: #fde68a; }}
-  .badge-per_op {{ background: #0c4a6e; color: #7dd3fc; }}
+  th {{
+    color: var(--muted); font-weight: 600;
+    background: var(--th-bg); font-size: 12px;
+  }}
+  .badge {{
+    display: inline-block; padding: 2px 8px;
+    border-radius: 4px; font-weight: 600; font-size: 11px;
+  }}
+  .badge-whole_step {{ background: #d1fae5; color: #065f46; }}
+  .badge-layer_group, .badge-single_layer {{ background: #fef3c7; color: #92400e; }}
+  .badge-per_op {{ background: #e0f2fe; color: #0369a1; }}
+  .badge-measured {{ background: #ede9fe; color: #5b21b6; }}
+  .badge-assumed {{ background: #ffedd5; color: #9a3412; }}
+  [data-theme="dark"] .badge-whole_step {{ background: #064e3b; color: #6ee7b7; }}
+  [data-theme="dark"] .badge-layer_group,
+  [data-theme="dark"] .badge-single_layer {{
+    background: #78350f; color: #fde68a;
+  }}
+  [data-theme="dark"] .badge-per_op {{ background: #0c4a6e; color: #7dd3fc; }}
+  [data-theme="dark"] .badge-measured {{ background: #4c1d95; color: #ddd6fe; }}
+  [data-theme="dark"] .badge-assumed {{ background: #7c2d12; color: #fed7aa; }}
+  .verdict-tag {{
+    display: inline-block; padding: 2px 8px;
+    border-radius: 4px; font-weight: 700; font-size: 11px;
+  }}
+  .verdict-tie {{ background: #fef08a; color: #854d0e; }}
+  .verdict-fusion {{ background: #bbf7d0; color: #166534; }}
+  .verdict-separate {{ background: #e2e8f0; color: #334155; }}
+  .verdict-layer {{ background: #ffedd5; color: #9a3412; }}
+  [data-theme="dark"] .verdict-layer {{ background: #7c2d12; color: #fed7aa; }}
+  [data-theme="dark"] .verdict-tie {{ background: #713f12; color: #fef08a; }}
+  [data-theme="dark"] .verdict-fusion {{ background: #14532d; color: #86efac; }}
+  [data-theme="dark"] .verdict-separate {{ background: #334155; color: #cbd5e1; }}
+  .prov-tag {{
+    display: inline-block; padding: 1px 6px; margin: 1px;
+    border-radius: 4px; font-size: 11px; font-weight: 600;
+  }}
+  .prov-tag-DERIVED {{ background: #dcfce7; color: #166534; }}
+  .prov-tag-ASSUMED {{ background: #fef3c7; color: #92400e; }}
+  .prov-tag-MEASURED {{ background: #ede9fe; color: #5b21b6; }}
+  [data-theme="dark"] .prov-tag-DERIVED {{ background: #065f46; color: #a7f3d0; }}
+  [data-theme="dark"] .prov-tag-ASSUMED {{ background: #78350f; color: #fde68a; }}
+  [data-theme="dark"] .prov-tag-MEASURED {{ background: #4c1d95; color: #ddd6fe; }}
+  .prov-details {{ margin-top: 6px; font-size: 12px; }}
+  .prov-details summary {{ cursor: pointer; color: var(--muted); }}
+  .ledger-row td {{ background: var(--card-inner); padding-top: 4px; }}
+  .ledger-table {{ width: 100%; margin: 8px 0; font-size: 12px; }}
+  .text-gain {{ color: #16a34a; font-weight: 600; }}
+  [data-theme="dark"] .text-gain {{ color: #4ade80; }}
+  .flag-pill {{
+    display: inline-block; padding: 2px 8px; margin: 1px;
+    border-radius: 999px; font-size: 11px; font-weight: 600;
+    background: #fee2e2; color: #991b1b;
+  }}
+  [data-theme="dark"] .flag-pill {{ background: #7f1d1d; color: #fecaca; }}
+  .facts-card {{ margin-bottom: 20px; }}
+  .facts-header {{
+    display: flex; justify-content: space-between; align-items: center;
+    padding-bottom: 12px; border-bottom: 1px solid var(--border);
+  }}
+  .facts-grid {{
+    display: grid; gap: 18px; margin-top: 14px;
+    grid-template-columns: repeat(auto-fit, minmax(460px, 1fr));
+  }}
+  .facts-col h3 {{
+    margin: 0 0 8px 0; font-size: 13px; font-weight: 600; color: var(--muted);
+    text-transform: uppercase; letter-spacing: 0.04em;
+  }}
+  .facts-table {{ width: 100%; border-collapse: collapse; font-size: 12px; }}
+  .facts-table td {{
+    padding: 6px 8px; border-bottom: 1px solid var(--border-subtle);
+    vertical-align: middle;
+  }}
+  .facts-table tr:last-child td {{ border-bottom: none; }}
+  .fact-src {{ font-size: 11px; color: var(--muted); }}
+  .priors-bar {{
+    margin-top: 14px; padding: 12px; border-radius: 6px;
+    background: var(--card-inner); border: 1px solid var(--border-subtle);
+  }}
+  .priors-header {{
+    display: flex; justify-content: space-between; align-items: center;
+    margin-bottom: 8px; font-size: 12px; font-weight: 600;
+  }}
+  .priors-title {{
+    color: var(--muted);
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+  }}
+  .priors-items {{ display: flex; flex-wrap: wrap; gap: 16px; font-size: 12px; }}
+  .prior-item {{ display: inline-flex; align-items: center; gap: 6px; }}
+  .prior-name {{ color: var(--muted); }}
+  .prior-val {{ font-family: ui-monospace, SFMono-Regular, monospace; }}
+  .cal-source {{ font-size: 11px; color: var(--muted); margin-left: 6px; }}
+  .cal-hint {{ font-size: 11px; color: var(--muted); margin-left: 6px; }}
+  .prov-legend {{ display: inline-flex; gap: 6px; align-items: center; }}
 </style>
 </head>
 <body>
 <div class="container">
-  <h1>TPU Megakernel Fusion-Scope Advisor: {_esc(sweep.model)}</h1>
-  <div class="grid-kpi">
+  <div class="report-header">
+    <div>
+      <h1>Megakernel Architecture &amp; Regime Advisor</h1>
+      <div class="report-subtitle">
+        Model: <strong>{_esc(sweep.model)}</strong> &middot;
+        Chip: <strong>{_esc(sweep.chip)}</strong> &middot;
+        Parallelism: <strong>{_esc(rec.label())}</strong> ({_esc(mode_src)})
+      </div>
+    </div>
+    <button class="theme-btn" id="theme-toggle" onclick="toggleTheme()"
+      type="button" aria-label="Toggle theme">
+      <span>&#9680;</span> Theme
+    </button>
+  </div>
+
+  {facts_card_html}
+
+    <div class="grid-kpi">
     <div class="card">
       <div class="kpi-label">Target Chip &amp; Mesh</div>
       <div class="kpi-val">{_esc(sweep.chip)} &middot; {_esc(rec.label())}</div>
@@ -531,46 +1314,68 @@ def render_advisor_html(sweep: AdvisorSweepReport) -> str:
       {prefill_kpi}
     </div>
     <div class="card">
-      <div class="kpi-label">Full-Step VMEM Ceiling</div>
-      <div class="kpi-val">{sweep.max_vmem_tokens} tokens</div>
-      <div class="kpi-sub">Static: {static_str}</div>
+      <div class="kpi-label">Full-Step VMEM Ceiling
+        <span class="prov-tag prov-tag-DERIVED">DERIVED</span></div>
+      <div class="kpi-val tabular">{sweep.max_vmem_tokens:,} tokens/core</div>
+      <div class="kpi-sub">Static: {static_str}; decode layout {_esc(rec.label())}</div>
     </div>
     <div class="card">
-      <div class="kpi-label">Per-Token VMEM Slope</div>
-      <div class="kpi-val">{sweep.per_token_vmem_bytes / 1024:.1f} KiB/tok</div>
+      <div class="kpi-label">Per-Token VMEM Slope
+        <span class="prov-tag prov-tag-DERIVED">DERIVED</span></div>
+      <div class="kpi-val tabular">{sweep.per_token_vmem_bytes / 1024:.1f} KiB/tok</div>
       <div class="kpi-sub">[T, H] Residual {residual_k}K + Operator Scratchpad</div>
     </div>
     <div class="card">
-      <div class="kpi-label">Hardware Ridge Crossover</div>
-      <div class="kpi-val">{sweep.ridge_dense_flop_per_byte:.1f} FLOP/B</div>
-      <div class="kpi-sub">T_ridge &asymp; {sweep.ridge_tokens} tokens/step</div>
+      <div class="kpi-label">Compute-Bound Point
+        <span class="prov-tag prov-tag-DERIVED">DERIVED</span></div>
+      <div class="kpi-val tabular">{sweep.ridge_dense_flop_per_byte:.1f} FLOP/B</div>
+      <div class="kpi-sub">&asymp; {sweep.ridge_tokens} tokens/core/step on the decode
+        layout; each row's own point is in Chart 2 and its ledger</div>
     </div>
   </div>
-  <div class="grid-charts">
-    <div class="card">
-      <h2>1. VMEM Capacity &amp; Single-Pass Token Ceiling</h2>
-      {vmem_svg}
-    </div>
-    <div class="card">
-      <h2>2. Where Each Workload Lands (Tokens per Core vs On-Chip Limits)</h2>
-      {regime_svg}
-    </div>
+
+<div class="card" style="margin-bottom: 20px;">
+    <h2 style="font-size: 16px;">1. VMEM Capacity &amp; Single-Pass Token Ceiling
+      (decode layout {_esc(rec.label())})</h2>
+    {vmem_svg}
   </div>
   <div class="card" style="margin-bottom: 20px;">
-    <h2>3. How to Read the Scope and MoE Mode</h2>
+    <h2 style="font-size: 16px;">
+      2. Where Each Workload Lands (Tokens per Core vs On-Chip Limits)
+    </h2>
+    {regime_svg}
+  </div>
+  <div class="card" style="margin-bottom: 20px;">
+    <h2 style="font-size: 16px;">3. Step Latency Floor vs Upper Uncertainty Band</h2>
+    {band_svg}
+  </div>
+  <div class="card" style="margin-bottom: 20px;">
+    <h2 style="font-size: 16px;">4. How to Read the Scope and MoE Mode</h2>
     <p>Scope: where the kernel boundary falls.</p>
     <ul>{scope_items}</ul>
     <p>MoE mode: where tokens are grouped by expert and where the data lives.</p>
     <ul>{moe_items}</ul>
   </div>
   <div class="card" style="margin-bottom: 20px;">
-    <h2>4. Request Regime Recommendations</h2>
+    <h2 style="font-size: 16px;">5. Request Regime Recommendations</h2>
+    <p class="kpi-sub">Step bounds are hardware floors, not predictions: on the
+      silicon validation corpus they range from well below to near measured step
+      time. A small margin to the runner-up is a close call; A/B the two scopes
+      before building.</p>
     <table>
       <thead>
         <tr>
-          <th>Request Regime</th><th>Layout</th><th>Active Tokens (T)</th>
-          <th>AI (FLOP/B)</th><th>Token Passes</th><th>Scope</th><th>MoE Mode</th>
-          <th>Step Bound (us)</th><th>Mechanical Rationale</th>
+          <th>Request Regime</th>
+          <th>Layout</th>
+          <th class="tabular">Tokens (T)</th>
+          <th class="tabular">AI (FLOP/B)</th>
+          <th class="tabular">Passes</th>
+          <th>Scope &amp; MoE</th>
+          <th class="tabular">Throughput (tok/s/chip)</th>
+          <th class="tabular">Gain vs per_op</th>
+          <th class="tabular">Step Bound (us)</th><th>Verdict &amp; Action</th>
+          <th>Flags</th>
+          <th>Mechanical Rationale</th>
         </tr>
       </thead>
       <tbody>
@@ -579,11 +1384,30 @@ def render_advisor_html(sweep: AdvisorSweepReport) -> str:
     </table>
   </div>
   <div class="card">
-    <h2>5. How to Tailor to Your Request Mix</h2>
+    <h2 style="font-size: 16px;">6. How to Tailor to Your Request Mix
+      (thresholds from the decode layout {_esc(rec.label())})</h2>
     <ul>{rules_html}</ul>
   </div>
 </div>
 <script id="advisor-data" type="application/json">{safe_json}</script>
+<script>
+function toggleTheme() {{
+  const current = document.documentElement.getAttribute('data-theme') || 'dark';
+  const target = current === 'dark' ? 'light' : 'dark';
+  document.documentElement.setAttribute('data-theme', target);
+  try {{ localStorage.setItem('mk_advisor_theme', target); }} catch(e) {{}}
+}}
+(function() {{
+  try {{
+    const saved = localStorage.getItem('mk_advisor_theme');
+    if (saved) {{
+      document.documentElement.setAttribute('data-theme', saved);
+    }} else {{
+      document.documentElement.setAttribute('data-theme', 'dark');
+    }}
+  }} catch(e) {{}}
+}})();
+</script>
 </body>
 </html>
 """
