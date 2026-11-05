@@ -52,12 +52,17 @@ out = fused_moe_prefill_nvfp4(
 
 ## Design Highlights
 
-- **Whole-expert Stage-A ring (`nb = 4`) on `EP2 x TP4` and `TP8`**: At
-  `GLM-5.2` `EP2 x TP4` (`E_local = 128, I = 512`), one NVFP4 expert + scales
-  occupies `4.75 MiB` in VMEM (`19.00 MiB` for `nb = 4`), fitting comfortably
-  within `64 MiB` VMEM (`45.95 MiB` in `W4A16`, `40.34 MiB` in `W4A8` at
-  `tile_rows = 256`). `EP8` (`I = 2048`, `18.44 MiB/slot`) is cleanly refused by
-  `can_use_fused_moe_prefill_nvfp4`.
+- **Whole-expert Stage-A ring (`nb = 4`) on `EP2 x TP4` and `TP8`**: Routed
+  block scales stay 4D (`[E_local, B, 1, cols]`) across the `pallas_call` HBM
+  operands and VMEM ring slots so the size-1 sublane-guard dimension (`T(1, 128)`)
+  is preserved without an XLA boundary reshape+copy. At `GLM-5.2` `EP2 x TP4`
+  (`E_local = 128, I = 512`), one NVFP4 expert + 4D scales budgets `5.06 MiB` in
+  VMEM (`20.25 MiB` for `nb = 4`; `2.62 MiB/slot`, `10.50 MiB` on `TP8`), fitting
+  comfortably within `64 MiB` VMEM (`36.70 / 48.45 MiB` in `W4A16` and
+  `35.21 / 45.46 MiB` in `W4A8` at `tile_rows = 128 / 256` on `EP2 x TP4`;
+  `26.95 / 38.70 MiB` in `W4A16` and `25.46 / 35.71 MiB` in `W4A8` on `TP8`, vs
+  `62.72 MiB` `vmem_limit_bytes`). `EP8` (`I = 2048`, `20.25 MiB/slot`) is
+  cleanly refused by `can_use_fused_moe_prefill_nvfp4`.
 - **`w2_n_chunk = 2048` N-chunked down projection**: Replaces TP16-only
   `down="xmxu"` while preventing a full `[256, H] float32` accumulator from
   materializing in VMEM and writing `256`-column BF16 pairs directly into
