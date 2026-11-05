@@ -284,6 +284,19 @@ def get_raiden_pool_staging_leases() -> int:
     return envs.TPU_RAIDEN_POOL_STAGING_LEASES
 
 
+def get_raiden_num_staging_layers() -> int:
+    """Host staging layer buffers for the Raiden transfer engine.
+
+    With N > 0 the engine allocates N storage-sized host buffers shared by
+    every KV storage (tpu-sync bounded host layer staging) instead of one per
+    storage; a transfer leases one per pool it stages and returns it when the
+    pool's push (producer) or H2D (consumer) completes, so host DRAM per
+    shard is N x the largest storage arena and at most N storages of one
+    transfer are in flight per side. 0 keeps one host buffer per storage.
+    """
+    return envs.TPU_RAIDEN_NUM_STAGING_LAYERS
+
+
 def get_raiden_inline_load() -> bool:
     """Load remote KV before the first forward instead of a no-forward step."""
     return envs.TPU_RAIDEN_INLINE_LOAD

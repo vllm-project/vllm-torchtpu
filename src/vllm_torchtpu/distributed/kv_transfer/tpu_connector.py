@@ -3613,6 +3613,25 @@ class TPURaidenConnectorWorker:
 
         return KVCacheManager(**kwargs)
 
+    @staticmethod
+    def _raiden_num_staging_layers(num_storages: int) -> int:
+        """Host staging layer buffers to allocate for an engine over
+        ``num_storages`` KV storages, or 0 for one buffer per storage.
+
+        TPU_RAIDEN_NUM_STAGING_LAYERS bounds the host mirror to that many
+        storage-sized buffers shared by every storage (tpu-sync bounded host
+        layer staging): a transfer leases one per pool it stages and returns
+        it when the pool's push (producer) or H2D (consumer) completes, so
+        host DRAM per shard is N x the largest storage arena and at most N
+        storages of one transfer are in flight per side. 0, or a value at
+        least the storage count, keeps the full per-storage mirror, which is
+        what tpu-sync allocates without the parameter.
+        """
+        requested = int(dist_utils.get_raiden_num_staging_layers())
+        if requested <= 0 or num_storages <= 0 or requested >= num_storages:
+            return 0
+        return requested
+
     def _raiden_transfer_parallelism(self) -> int:
         parallelism = int(tpu_envs.TPU_RAIDEN_TRANSFER_PARALLELISM)
         if parallelism <= 0:
@@ -6957,6 +6976,9 @@ class TPURaidenConnectorWorker:
             num_slots=num_slots,
             timeout_s=float(dist_utils.get_p2p_wait_pull_timeout()),
         )
+        staging_layers = self._raiden_num_staging_layers(len(kv_caches))
+        if staging_layers:
+            manager_kwargs["num_staging_layers"] = staging_layers
         if stage3_enabled:
             manager_kwargs.update(
                 listener_port=0,
@@ -6987,13 +7009,15 @@ class TPURaidenConnectorWorker:
         logger.info(
             "TPURaidenConnectorWorker rank%d --> Raiden engine enabled | "
             "legacy_control_port=%d data_endpoint=%s listener_endpoint=%s "
-            "max_blocks=%d num_slots=%d",
+            "max_blocks=%d num_slots=%d host_staging_layers=%d/%d",
             self.tp_rank,
             local_control_port,
             str(getattr(engine, "transfer_address", "")),
             str(getattr(engine, "listener_address", "")),
             max_blocks,
             num_slots,
+            staging_layers or len(kv_caches),
+            len(kv_caches),
         )
         return engine
 
@@ -7160,15 +7184,22 @@ class TPURaidenConnectorWorker:
             summary = dict(engine.register_pools(pool_dicts))
         staging = summary.get("host_staging")
         if isinstance(staging, dict):
+            # Under bounded host layer staging only the allocated buffers
+            # report host bytes (every other storage stages through them), so
+            # the per-storage sum is the host DRAM this shard really holds.
+            storages = staging.get("storages") or ()
+            host_bytes = [int(s.get("host_bytes_per_shard") or 0) for s in storages]
             logger.info(
                 "Raiden host staging mode=%s leases=%s "
                 "bounded_bytes_per_shard=%s full_mirror_bytes_per_shard=%s "
-                "storages=%d",
+                "storages=%d host_buffers=%d host_bytes_per_shard=%d",
                 staging.get("mode"),
                 staging.get("leases"),
                 staging.get("bounded_storage_bytes_per_shard"),
                 staging.get("full_storage_bytes_per_shard"),
-                len(staging.get("storages") or ()),
+                len(storages),
+                sum(1 for b in host_bytes if b > 0),
+                sum(host_bytes),
             )
         else:
             logger.info("Raiden host staging mode=full (legacy tpu_sync)")

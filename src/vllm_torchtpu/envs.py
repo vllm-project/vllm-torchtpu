@@ -167,6 +167,7 @@ if TYPE_CHECKING:
     TPU_USE_RAIDEN_CONNECTOR: bool = False
     TPU_RAIDEN_TRANSFER_NUM_SLOTS: int = 0
     TPU_RAIDEN_POOL_STAGING_LEASES: int = 8
+    TPU_RAIDEN_NUM_STAGING_LAYERS: int = 4
     TPU_RAIDEN_INLINE_LOAD: bool = False
     QUANTIZE_ON_LOAD_PREFIXES: list[str] = []
     KDA_MANUAL_STATE_DMA: bool | None = None
@@ -1111,6 +1112,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Concurrent pool-reshard transfers to provision bounded host staging for.
     "TPU_RAIDEN_POOL_STAGING_LEASES": env_nonnegative_int(
         "TPU_RAIDEN_POOL_STAGING_LEASES", 8
+    ),
+    # Host staging layer buffers the Raiden transfer engine allocates (tpu-sync
+    # bounded host layer staging): N storage-sized host buffers shared by every
+    # KV storage, each transfer leasing one per pool it stages, instead of one
+    # host buffer per storage. Host DRAM per shard becomes N x the largest
+    # storage arena (or extent) rather than the sum over storages, and a
+    # transfer keeps at most N storages in flight per side. 0, or a value at
+    # least the storage count, keeps one host buffer per storage.
+    "TPU_RAIDEN_NUM_STAGING_LAYERS": env_nonnegative_int(
+        "TPU_RAIDEN_NUM_STAGING_LAYERS", 4
     ),
     # Load remote KV before the first forward, not in a no-forward step.
     "TPU_RAIDEN_INLINE_LOAD": env_bool("TPU_RAIDEN_INLINE_LOAD", default=False),

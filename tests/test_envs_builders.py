@@ -240,6 +240,7 @@ def test_str_keeps_an_explicit_empty_value_distinct_from_unset(monkeypatch):
         ("TPU_USE_RAIDEN_CONNECTOR", False),
         ("TPU_RAIDEN_TRANSFER_NUM_SLOTS", 0),
         ("TPU_RAIDEN_POOL_STAGING_LEASES", 8),
+        ("TPU_RAIDEN_NUM_STAGING_LAYERS", 4),
         ("TPU_RAIDEN_INLINE_LOAD", False),
         ("KDA_MANUAL_STATE_DMA", None),
         ("KDA_MANUAL_H0_DMA", None),

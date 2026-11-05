@@ -3468,6 +3468,108 @@ class TestTPURaidenConnectorWorker:
             parallelism=8,
         )
 
+    @pytest.mark.parametrize(
+        ("requested", "num_storages", "expected"),
+        (
+            # 0 keeps one host buffer per storage (no kwarg).
+            (0, 15, None),
+            # The default bounds a 15-storage engine to 4 shared buffers.
+            (4, 15, 4),
+            (2, 3, 2),
+            # A bound at or above the storage count is the full mirror again.
+            (15, 15, None),
+            (99, 15, None),
+            (4, 1, None),
+        ),
+    )
+    def test_stage3_manager_host_staging_layers_follow_env(
+        self, requested, num_storages, expected
+    ):
+        worker = _make_raiden_worker(
+            tp_rank=0, tp_size=1, is_producer=True, dp_size=1, pcp_size=8
+        )
+        worker._local_raiden_transfer_rank = MagicMock(return_value=3)
+        engine = _FakeAdmissionRaidenEngine()
+        worker._new_raiden_manager = MagicMock(return_value=engine)
+        storages = [object() for _ in range(num_storages)]
+
+        with (
+            patch(f"{_MOD}.tpu_envs.TPU_KV_RESHARD_TRANSPORT", "raiden", create=True),
+            patch(f"{_MOD}.tpu_envs.TPU_RAIDEN_TRANSFER_PARALLELISM", 8, create=True),
+            patch(
+                f"{_MOD}.dist_utils.get_raiden_num_staging_layers",
+                return_value=requested,
+            ),
+            patch(f"{_MOD}.dist_utils.get_p2p_wait_pull_timeout", return_value=12.0),
+        ):
+            worker._construct_raiden_transfer_engine(storages, num_slots=1)
+
+        kwargs = worker._new_raiden_manager.call_args.kwargs
+        assert kwargs["kv_caches"] == storages
+        if expected is None:
+            assert "num_staging_layers" not in kwargs
+        else:
+            assert kwargs["num_staging_layers"] == expected
+
+    def test_stage3_manager_host_staging_layers_default_is_bounded(self):
+        """The registry default enables bounded host layer staging."""
+        from vllm_torchtpu import envs as _envs
+
+        assert _envs.TPU_RAIDEN_NUM_STAGING_LAYERS == 4
+        worker = _make_raiden_worker(
+            tp_rank=0, tp_size=1, is_producer=False, dp_size=1, pcp_size=1
+        )
+        worker._local_raiden_transfer_rank = MagicMock(return_value=0)
+        worker._new_raiden_manager = MagicMock(
+            return_value=_FakeAdmissionRaidenEngine()
+        )
+        storages = [object() for _ in range(15)]
+        with (
+            patch(f"{_MOD}.tpu_envs.TPU_KV_RESHARD_TRANSPORT", "raiden", create=True),
+            patch(f"{_MOD}.dist_utils.get_p2p_wait_pull_timeout", return_value=12.0),
+        ):
+            worker._construct_raiden_transfer_engine(storages, num_slots=1)
+        assert worker._new_raiden_manager.call_args.kwargs["num_staging_layers"] == 4
+
+    def test_register_raiden_pools_logs_allocated_host_bytes(self):
+        """The admission log sums the host bytes the shard really allocated:
+        under bounded host layer staging only the shared buffers carry
+        host bytes, every other storage stages through them."""
+        worker = _make_raiden_worker(tp_rank=0, tp_size=1, is_producer=False)
+        engine = MagicMock()
+        engine.register_pools.return_value = {
+            "host_staging": {
+                "mode": "bounded",
+                "leases": 8,
+                "bounded_storage_bytes_per_shard": 300,
+                "full_storage_bytes_per_shard": 0,
+                "storages": [
+                    {"storage_index": 0, "bounded": True, "host_bytes_per_shard": 100},
+                    {"storage_index": 1, "bounded": True, "host_bytes_per_shard": 100},
+                    {"storage_index": 2, "bounded": True, "host_bytes_per_shard": 100},
+                    {"storage_index": 3, "bounded": True, "host_bytes_per_shard": 0},
+                    {"storage_index": 4, "bounded": True, "host_bytes_per_shard": 0},
+                ],
+            }
+        }
+        manifest = MagicMock()
+        manifest.pool_dicts.return_value = []
+        with (
+            patch.object(worker, "_raiden_staging_blocks_per_pool", return_value=[]),
+            patch(f"{_MOD}.dist_utils.get_raiden_pool_staging_leases", return_value=8),
+            patch(f"{_MOD}.logger.info") as info,
+        ):
+            worker._register_raiden_pools(engine, manifest, kv_cache_groups=())
+        staging_logs = [
+            call
+            for call in info.call_args_list
+            if "Raiden host staging" in call.args[0]
+        ]
+        assert len(staging_logs) == 1
+        args = staging_logs[0].args
+        # storages=5, host_buffers=3, host_bytes_per_shard=300
+        assert args[-3:] == (5, 3, 300)
+
     @pytest.mark.parametrize("transfer_rank", (0, 3, 7))
     def test_stage3_gdn_registration_declares_every_pcp_head_shard(self, transfer_rank):
         from vllm_torchtpu.distributed.kv_transfer.raiden.byte_spans import PoolByteSpan
