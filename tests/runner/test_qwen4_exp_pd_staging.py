@@ -357,3 +357,35 @@ def test_pad_keeps_list_and_array_forms():
     assert st._pad([], 2) == [0, 0]
     assert st._pad(np.array([3, 4]), 4).tolist() == [3, 4, 4, 4]
     assert st._pad(np.zeros(0, dtype=np.int64), 2).tolist() == [0, 0]
+
+
+def test_align_rows_repeats_the_last_row_to_a_tile():
+    assert st.align_rows(np.arange(64)).tolist() == list(range(64))
+    out = st.align_rows(np.array([5, 6, 7]), 4)
+    assert out.tolist() == [5, 6, 7, 7]
+
+
+def _bulk_tiles(dst, kernel_rows=512, tile=64):
+    """Fraction of tiles the tiled scatter writes with one DMA."""
+    dst = np.asarray(dst)
+    dst = np.concatenate((dst, np.full(-len(dst) % tile, dst[-1])))
+    page, off = dst // kernel_rows, dst % kernel_rows
+    t = len(dst) // tile
+    page, off = page.reshape(t, tile), off.reshape(t, tile)
+    bulk = (page == page[:, :1]).all(1) & (off == off[:, :1] + np.arange(tile)).all(1)
+    return bulk.mean()
+
+
+def test_aligned_segments_fill_whole_tiles():
+    rank = st.RankSlice(tp_size=8, tp_rank=0, num_kv_heads=2, main_dcp=4)
+    rng = np.random.default_rng(0)
+    segs = []
+    for _ in range(12):  # main KV layers of one 100k-token request
+        dst_pages = rng.permutation(50_000)[:300].tolist()
+        _, d = st.main_rows_np(100_000, list(range(1, 40)), 3200, dst_pages, 512, rank)
+        segs.append(st.align_rows(d))
+    for _ in range(12):  # compressed keys
+        dst_pages = rng.permutation(50_000)[:300].tolist()
+        _, d = st.compressed_rows_np(100_000, 4, list(range(1, 40)), 3200, dst_pages, 512)
+        segs.append(st.align_rows(d))
+    assert _bulk_tiles(np.concatenate(segs)) > 0.99

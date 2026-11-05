@@ -105,6 +105,10 @@ def owner_kind(name: str) -> str:
 # int32 scalars per row in SMEM (1 MiB; ~11.5 B/row measured), so a program
 # stays near 40k rows: 16k main, 16k copied, 4 GDN pages (~1.6k rows each).
 REPACK_CHUNK_ROWS = 1 << 14
+# Rows per scatter tile. Every run of contiguous destination rows starts on a
+# tile (each layer's segment is padded to a multiple), so a tile is one DMA:
+# main KV runs a page (512 rows), compressed keys 64 rows per decode page.
+REPACK_TILE = 64
 REPACK_GDN_PAGES = 4
 
 
@@ -236,6 +240,19 @@ def compressed_rows_np(
     return src, dst
 
 
+def align_rows(rows: np.ndarray, tile: int = REPACK_TILE) -> np.ndarray:
+    """Pad a row segment to a multiple of ``tile`` by repeating its last row.
+
+    Applied alike to a segment's source and destination rows, the repeats
+    rewrite the last row with its own bytes (a no-op), and the next segment
+    then starts on a tile, so its contiguous runs fill whole tiles.
+    """
+    pad = -len(rows) % tile
+    if not pad:
+        return rows
+    return np.concatenate((rows, np.full(pad, rows[-1], dtype=rows.dtype)))
+
+
 def compressed_destinations(
     layout, dst_owner: dict[str, int], dst_block: int, ratio: int
 ) -> dict[str, tuple[int, int]]:
@@ -359,9 +376,13 @@ def make_repack(
         return rows[flat]
 
     if write is None:
+        import functools
+
         from vllm_torchtpu.kernels.qwen4_exp.pooled_qsa import (
-            _write_main_cache_universal as write,
+            _write_main_cache_universal,
         )
+
+        write = functools.partial(_write_main_cache_universal, tile=REPACK_TILE)
 
     def gdn_page(page, s: GdnGeometry, d: GdnGeometry):
         """One producer GDN page -> this rank's page rows ``[ssm + conv]``."""
@@ -384,19 +405,23 @@ def make_repack(
     def rows(
         staging: jax.Array, main_src: jax.Array, copy_src: jax.Array, gdn_src: jax.Array
     ) -> tuple[jax.Array, jax.Array, jax.Array]:
-        stage = jax.lax.bitcast_convert_type(staging, jnp.uint8).reshape(
-            -1, ROW_SUBLANES, ROW_LANES
-        )
+        # Gather rows in the carrier's own dtype and bitcast only those: a
+        # bitcast of the whole carrier materialized a copy of it per call.
+        stage = staging.reshape(-1, ROW_SUBLANES, ROW_LANES)
+
+        def gather(flat):
+            return jax.lax.bitcast_convert_type(rows_of(stage, flat), jnp.uint8)
+
         # Main KV: the rank's head pair to slot 0, the other slots zero.
-        pair = rows_of(stage, main_src)[:, 2 * kv_head : 2 * kv_head + 2]
+        pair = gather(main_src)[:, 2 * kv_head : 2 * kv_head + 2]
         main = jnp.concatenate([pair, jnp.zeros_like(pair)], axis=1)
         # Compressed keys, rings + tags, PLE state: bytes unchanged.
-        copies = rows_of(stage, copy_src)
+        copies = gather(copy_src)
         if has_gdn:
             s, d = src_gdn, dst_gdn
             s_rows = s.ssm_tokens + s.conv_tokens
             src_flat = (gdn_src[:, None] * src_block + jnp.arange(s_rows)).reshape(-1)
-            region = rows_of(stage, src_flat).reshape(-1, s_rows, ROW_SUBLANES, ROW_LANES)
+            region = gather(src_flat).reshape(-1, s_rows, ROW_SUBLANES, ROW_LANES)
             gdn = jax.vmap(lambda page: gdn_page(page, s, d))(region)
             gdn = gdn.reshape(-1, ROW_SUBLANES, ROW_LANES)
         else:
@@ -422,8 +447,8 @@ def make_repack(
         values = jnp.concatenate(values)
         flat = jnp.concatenate(flat).astype(jnp.int32)
         valid = jnp.ones(flat.shape, jnp.bool_)
-        # The writer takes whole 128-row tiles; the tail is masked out.
-        tail = -len(flat) % 128
+        # The writer takes whole tiles; the tail is masked out.
+        tail = -len(flat) % REPACK_TILE
         values = jnp.pad(values, ((0, tail), (0, 0), (0, 0)))
         flat = jnp.pad(flat, (0, tail))
         valid = jnp.pad(valid, (0, tail))
@@ -705,6 +730,7 @@ class StagedConsumer:
             gdn_d.append(dst_tables[self._dst_owner[name]][self._state_entry])
 
         def cat(parts):
+            parts = [align_rows(p) for p in parts if len(p)]
             return np.concatenate(parts) if parts else np.zeros(0, dtype=np.int64)
 
         return (
