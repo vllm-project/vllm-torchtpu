@@ -16,12 +16,13 @@
 Computes what ``util.xla_prequantized_matmul`` followed by ``rope.rope_quant``
 compute, but the bf16 projection never leaves VMEM. Each grid step projects a
 tile of tokens through the resident weight, one column chunk at a time, into
-a bf16 VMEM buffer, and rotates and scales each head's rows from there in the
-dot's own layout, tokens on sublanes: every head of a token tile shares one
-cos tile and one sin tile with the rotation's sign folded in, and each row's
-scale is stored straight into its lane of the ``[T, H]`` scales. The scaled
-rows go to VMEM through stores strided by a tile, which put each token's heads
-on sublanes, and are cast to the ``[T, H, LANE]`` fp8 query from there.
+one of two bf16 VMEM buffers, issued a chunk ahead, and rotates and scales
+each head's rows from there in the dot's own layout, tokens on sublanes:
+every head of a token tile shares one cos tile and one sin tile with the
+rotation's sign folded in, and each row's scale is stored straight into its
+lane of the ``[T, H]`` scales. The scaled rows go to VMEM through stores
+strided by a tile, which put each token's heads on sublanes, and are cast to
+the ``[T, H, LANE]`` fp8 query from there.
 """
 
 import functools
@@ -61,7 +62,7 @@ def _vmem_bytes(k: int, n: int) -> int:
     """VMEM the kernel's buffers take."""
     weight = k * n + n * 4  # fp8 weight and f32 scales, resident
     x = 2 * TILE_T * (k + LANE * 4)  # fp8 rows and their (lane-padded) scales
-    proj = TILE_T * N_CHUNK * 2  # bf16
+    proj = 2 * TILE_T * N_CHUNK * 2  # bf16
     scaled = TILE_T * n * 4  # f32
     cos_sin = 2 * TILE_T * LANE * 4
     lanes = 2 * TILE_T * LANE * 4
@@ -112,7 +113,7 @@ def _kernel(
     scale_ref: jax.Ref,  # (TILE_T, H) f32
     # scratch
     w_ref: jax.Ref,  # (K, N) fp8
-    proj_ref: jax.Ref,  # (TILE_T, N_CHUNK) bf16: a chunk's projection
+    proj_ref: jax.Ref,  # (2, TILE_T, N_CHUNK) bf16: two chunks' projections
     # (H // SUBLANE * TILE_T * SUBLANE, LANE) f32: head h of token t, scaled
     # for the cast, in row ((h // SUBLANE) * TILE_T + t) * SUBLANE + h % SUBLANE.
     scaled_ref: jax.Ref,
@@ -168,7 +169,7 @@ def _kernel(
     lanes_ref[1] = sin * _gptj_sign()
 
     def project(c):
-        """Chunk ``c`` of the projection, rounded to bf16, into ``proj_ref``."""
+        """Chunk ``c`` of the projection, rounded to bf16, into its buffer."""
 
         @pl.when(step == 0)
         def _():
@@ -185,13 +186,13 @@ def _kernel(
         )
         x = x * x_scale_ref[...]
         x = x * w_scale_ref[cols][None, :]
-        proj_ref[...] = x.astype(proj_ref.dtype)
+        proj_ref[c % 2] = x.astype(proj_ref.dtype)
 
     def rope_quant(c):
-        """Rotates and scales chunk ``c``'s heads, read back from ``proj_ref``
+        """Rotates and scales chunk ``c``'s heads, read back from its buffer
         HEADS_PER_LOAD at a time."""
         for j in range(0, heads_per_chunk, HEADS_PER_LOAD):
-            heads = proj_ref[:, pl.ds(j * LANE, HEADS_PER_LOAD * LANE)]
+            heads = proj_ref[c % 2, :, pl.ds(j * LANE, HEADS_PER_LOAD * LANE)]
             xs = [
                 heads[:, i * LANE : (i + 1) * LANE].astype(jnp.float32)
                 for i in range(HEADS_PER_LOAD)
@@ -210,8 +211,12 @@ def _kernel(
                 scaled_ref[rows, :] = scaled
                 scale_ref[:, pl.ds(head, 1)] = scale
 
+    # Chunk c + 1's dot is issued ahead of chunk c's rope and scaling, which
+    # read the other buffer, so the MXU works under them.
+    project(0)
     for c in range(num_chunks):
-        project(c)
+        if c + 1 < num_chunks:
+            project(c + 1)
         rope_quant(c)
 
     # Each FP8_SUBLANES-head tile of the query is FP8_SUBLANES // SUBLANE
@@ -274,7 +279,7 @@ def q_proj_rope_quant(
         ],
         scratch_shapes=[
             pltpu.VMEM((k, n), w_q.dtype),
-            pltpu.VMEM((TILE_T, N_CHUNK), jnp.bfloat16),
+            pltpu.VMEM((2, TILE_T, N_CHUNK), jnp.bfloat16),
             pltpu.VMEM((num_heads * TILE_T, LANE), jnp.float32),
             pltpu.VMEM((2, TILE_T, rotary_dim), cos_sin_cache.dtype),
             pltpu.VMEM((2, TILE_T, LANE), jnp.float32),
