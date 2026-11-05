@@ -660,7 +660,13 @@ def post(x, residual, post_layer_mix, comb_res_mix):
 
 
 def collapse(x, pre_mix):
-    return (x.float() * pre_mix.unsqueeze(-1)).sum(-2).to(x.dtype)
+    if x.shape[-2] != 4:
+        return (x.float() * pre_mix.unsqueeze(-1)).sum(-2).to(x.dtype)
+    # Stream slices, not the [T, 4, D] FP32 view, which costs XLA a relayout
+    # copy of the whole residual; (s0 + s2) + (s1 + s3) is the order its
+    # reduce applies, as in _collapse_flat.
+    terms = [x[..., m, :].float() * pre_mix[..., m : m + 1] for m in range(4)]
+    return ((terms[0] + terms[2]) + (terms[1] + terms[3])).to(x.dtype)
 
 
 def _default_pre_mix(residual: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
