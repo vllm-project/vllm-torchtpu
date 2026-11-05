@@ -120,12 +120,6 @@ class BuildContext:
             return None
         return next((label for label in _PR_SUITES if label in self.labels), None)
 
-    @property
-    def runs_nightly_steps(self) -> bool:
-        return (
-            self.nightly_env or self.is_release or self.pr_suite_label == "run-full-ci"
-        )
-
     @classmethod
     def from_env(
         cls, env: Mapping[str, str], merged_labels: Sequence[str] = ()
@@ -186,10 +180,14 @@ class Suite:
     stages: tuple[tuple[str, ...], ...]
 
 
+_CPU_STAGE = ("build", "cpu")  # cpu steps wait on build_docker themselves
+_DEFAULT_TPU = ("tests", "integration", "verify")
+_FULL_TPU = ("tests", "integration", "perf", "verify")
+
 _FULL = Suite(
     "full",
     "Nightly schedule and release builds",
-    stages=(("build", "cpu", "tests", "integration", "perf", "verify"),),
+    stages=((*_CPU_STAGE, *_FULL_TPU),),
 )
 
 # Builds that don't wait for CPU: everything is one stage.
@@ -197,7 +195,7 @@ SUITES: dict[str, Suite] = {
     "default": Suite(
         "default",
         "main, torchtpu-nightly",
-        stages=(("build", "cpu", "tests", "integration", "verify"),),
+        stages=((*_CPU_STAGE, *_DEFAULT_TPU),),
     ),
     "full": _FULL,
     "perf": Suite(
@@ -213,29 +211,29 @@ SUITES: dict[str, Suite] = {
     ),
 }
 
-_PR_STAGE0 = ("build", "cpu")  # cpu steps wait on build_docker themselves
-_PR_ABOUT = "PR: TPU waits for the CPU checks"
 _PR_DEFAULT = Suite(
     "pr",
-    _PR_ABOUT,
-    stages=(_PR_STAGE0, ("tests", "integration", "verify")),
+    "PR: TPU waits for the CPU checks",
+    stages=(_CPU_STAGE, _DEFAULT_TPU),
 )
 # Mutually exclusive PR suite labels (`ready` and `oncall-fix` are orthogonal).
+# `run-perf-eval` and `run-full-ci` share `_FULL_TPU`; `run-full-ci` also sets
+# `NIGHTLY=1` via `runs_nightly_steps(ctx)` to unlock nightly-gated steps.
 _PR_SUITES: dict[str, Suite] = {
     "skip-tpu-ci": Suite(
         "pr+cpu-only",
         "CPU checks only (skip-tpu-ci)",
-        stages=(_PR_STAGE0,),
+        stages=(_CPU_STAGE,),
     ),
     "run-perf-eval": Suite(
         "pr+perf-eval",
-        _PR_ABOUT,
-        stages=(_PR_STAGE0, ("tests", "integration", "perf", "verify")),
+        "PR: TPU and perf/eval wait for the CPU checks",
+        stages=(_CPU_STAGE, _FULL_TPU),
     ),
     "run-full-ci": Suite(
         "pr+nightly-suite",
-        _PR_ABOUT,
-        stages=(_PR_STAGE0, ("tests", "integration", "perf", "verify")),
+        "PR: full nightly suite waits for the CPU checks",
+        stages=(_CPU_STAGE, _FULL_TPU),
     ),
 }
 
@@ -261,6 +259,11 @@ def choose_suite(ctx: BuildContext) -> Suite:
     if ctx.is_pr or ctx.skips_tpu:
         return pr_suite(ctx)
     return SUITES["full"] if ctx.nightly_env or ctx.is_release else SUITES["default"]
+
+
+def runs_nightly_steps(ctx: BuildContext) -> bool:
+    """Return True when `NIGHTLY=1` should be exported to unlock nightly steps."""
+    return ctx.nightly_env or ctx.is_release or ctx.pr_suite_label == "run-full-ci"
 
 
 # Build kind -> (Buildkite job priority, Kueue workload priority class).
@@ -717,9 +720,11 @@ def run_bootstrap(
     _agent("meta-data", "set", "VLLM_COMMIT_HASH", vllm_commit_hash, env=child_env)
     print(f"Using vLLM commit: {vllm_commit_hash}")
 
-    # 4. Suite selection and annotation.
+    # 4. Suite selection, NIGHTLY policy, and annotation.
     suite = choose_suite(ctx)
-    suite_note = f"CI suite: {suite.name}: {suite.about}"
+    nightly = runs_nightly_steps(ctx)
+    nightly_tag = " [NIGHTLY=1]" if nightly else ""
+    suite_note = f"CI suite: {suite.name}{nightly_tag}: {suite.about}"
     print(suite_note)
     _agent(
         "annotate",
@@ -732,7 +737,7 @@ def run_bootstrap(
     )
 
     # 5. Env exports (NIGHTLY, OMNI_IMAGE_SKIP, PR_TPU_CONCURRENCY_GROUP).
-    if ctx.runs_nightly_steps:
+    if nightly:
         child_env["NIGHTLY"] = "1"
     # pipeline_build.yml skips the -omni image build when this is non-empty.
     # Buildkite rejects the upload if a skip reason is over 70 characters.

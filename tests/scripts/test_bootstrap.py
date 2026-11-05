@@ -177,7 +177,7 @@ class TestBootstrapUnits(unittest.TestCase):
             self.assertFalse(pr_ctx.is_release)
             self.assertEqual(pr_ctx.skips_tpu, skips)
             self.assertEqual(pr_ctx.pr_suite_label, suite_label)
-            self.assertEqual(pr_ctx.runs_nightly_steps, runs_nightly)
+            self.assertEqual(bp.runs_nightly_steps(pr_ctx), runs_nightly)
 
         # Mutually exclusive PR suite labels raise BootstrapError naming conflicts.
         for bad_labels, expected_conflicts in (
@@ -210,7 +210,7 @@ class TestBootstrapUnits(unittest.TestCase):
             rel_ctx = ctx(rel_env)
             self.assertTrue(rel_ctx.is_release)
             self.assertIsNone(rel_ctx.pr_suite_label)
-            self.assertTrue(rel_ctx.runs_nightly_steps)
+            self.assertTrue(bp.runs_nightly_steps(rel_ctx))
 
         for non_rel_env in (
             {"BUILDKITE_BRANCH": "release/v1"},
@@ -221,7 +221,7 @@ class TestBootstrapUnits(unittest.TestCase):
             non_rel_ctx = ctx(non_rel_env)
             self.assertFalse(non_rel_ctx.is_release)
             self.assertIsNone(non_rel_ctx.pr_suite_label)
-            self.assertFalse(non_rel_ctx.runs_nightly_steps)
+            self.assertFalse(bp.runs_nightly_steps(non_rel_ctx))
 
         post_merge_ctx = ctx(
             {"BUILDKITE_BRANCH": "main", "BUILDKITE_SOURCE": "webhook"},
@@ -232,14 +232,14 @@ class TestBootstrapUnits(unittest.TestCase):
         self.assertFalse(post_merge_ctx.is_release)
         self.assertTrue(post_merge_ctx.skips_tpu)
         self.assertEqual(post_merge_ctx.pr_suite_label, "skip-tpu-ci")
-        self.assertFalse(post_merge_ctx.runs_nightly_steps)
+        self.assertFalse(bp.runs_nightly_steps(post_merge_ctx))
 
         post_merge_full_label_ctx = ctx(
             {"BUILDKITE_BRANCH": "main", "BUILDKITE_SOURCE": "webhook"},
             merged_labels=("run-full-ci", "run-perf-eval"),
         )
         self.assertIsNone(post_merge_full_label_ctx.pr_suite_label)
-        self.assertFalse(post_merge_full_label_ctx.runs_nightly_steps)
+        self.assertFalse(bp.runs_nightly_steps(post_merge_full_label_ctx))
         self.assertEqual(
             bp.choose_suite(post_merge_full_label_ctx), bp.SUITES["default"]
         )
@@ -307,13 +307,13 @@ class TestBootstrapUnits(unittest.TestCase):
             (
                 "ready,run-perf-eval",
                 "pr+perf-eval",
-                "PR: TPU waits for the CPU checks",
+                "PR: TPU and perf/eval wait for the CPU checks",
                 (("build", "cpu"), ("tests", "integration", "perf", "verify")),
             ),
             (
                 "ready,run-full-ci",
                 "pr+nightly-suite",
-                "PR: TPU waits for the CPU checks",
+                "PR: full nightly suite waits for the CPU checks",
                 (("build", "cpu"), ("tests", "integration", "perf", "verify")),
             ),
         ):
@@ -936,7 +936,13 @@ class TestBootstrapUnits(unittest.TestCase):
         )
         self.assertEqual(
             perf_eval_pr.annotations,
-            [("ci-suite", "CI suite: pr+perf-eval: PR: TPU waits for the CPU checks")],
+            [
+                (
+                    "ci-suite",
+                    "CI suite: pr+perf-eval: "
+                    "PR: TPU and perf/eval wait for the CPU checks",
+                )
+            ],
         )
         self.assertEqual(
             [u[0] for u in perf_eval_pr.uploads],
@@ -1034,7 +1040,8 @@ class TestBootstrapUnits(unittest.TestCase):
                 ),
                 (
                     "ci-suite",
-                    "CI suite: pr+nightly-suite: PR: TPU waits for the CPU checks",
+                    "CI suite: pr+nightly-suite [NIGHTLY=1]: "
+                    "PR: full nightly suite waits for the CPU checks",
                 ),
             ],
         )
@@ -1075,7 +1082,13 @@ class TestBootstrapUnits(unittest.TestCase):
         for fx in (nightly, tag_fx, rel_branch_fx):
             self.assertEqual(
                 fx.annotations,
-                [("ci-suite", "CI suite: full: Nightly schedule and release builds")],
+                [
+                    (
+                        "ci-suite",
+                        "CI suite: full [NIGHTLY=1]: "
+                        "Nightly schedule and release builds",
+                    )
+                ],
             )
             self.assertEqual(
                 [u[0] for u in fx.uploads],
@@ -1083,6 +1096,13 @@ class TestBootstrapUnits(unittest.TestCase):
             )
             for _, content, _ in fx.uploads:
                 self.assertNotIn('build.env("NIGHTLY")', content)
+
+        manual_full = run({"CI_SUITE": "full", "BUILDKITE_BRANCH": "exp/manual"})
+        self.assertEqual(
+            manual_full.annotations,
+            [("ci-suite", "CI suite: full: Nightly schedule and release builds")],
+        )
+        self.assertNotIn("NIGHTLY", manual_full.uploads[0][2])
 
         # torchtpu-nightly schedule runs default suite at priority 1 (one stage).
         torchtpu_nightly = run(
