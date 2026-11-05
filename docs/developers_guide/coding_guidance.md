@@ -342,14 +342,18 @@ op = pallas.jax_op("pallas::quantized_matmul_kernel",
 ## 7. Diff discipline
 
 - **R-7.1** **Small, single-purpose PRs** ([Small CLs](https://google.github.io/eng-practices/review/developer/small-cls.html)).
-  Aim for ≤ 300 changed lines (excluding baselines and lockfiles) doing one
-  self-contained thing. Kernel changes under `src/vllm_torchtpu/kernels/`
-  (plus their standalone kernel tests) get their own PR separate from
-  `layers/`, `runner/`, or `models/` wiring; shared runner/layer changes land
-  before model-specific bring-up. Reviewers may refuse oversized diffs
-  outright ("oversized" is reviewer judgment, not a fixed line count); very
-  large designs need an RFC/design doc first. Each PR in a stack must pass
-  tests on its own and cite its base PR explicitly.
+  Aim for a soft target of ≤ 300 changed lines (excluding baselines and
+  lockfiles) doing one self-contained thing. Pure deletions, atomic
+  renames/moves with their caller updates, and tiny dependent follow-ups may
+  stay in one PR; above ~300 changed lines, split along natural boundaries:
+  (a) enabling refactor before feature (R-7.2), (b) kernel changes under
+  `src/vllm_torchtpu/kernels/` (plus standalone kernel tests) before
+  `layers/`, `runner/`, or `models/` wiring, and (c) shared `runner/`,
+  `layers/`, or `quantization/` changes before model-specific files under
+  `models/`. Reviewers may still ask to split smaller multi-purpose diffs or
+  accept larger cohesive ones; very large designs need an RFC/design doc
+  first. Each PR in a stack must pass tests on its own and cite its base PR
+  explicitly.
 - **R-7.2** **Refactor first, feature second.** Land the enabling refactor,
   helper move, or signature change as its own behavior-preserving PR before
   the feature or optimization PR that needs it.
