@@ -19,6 +19,7 @@ if TYPE_CHECKING:
     TPU_DCP_MLA_UV_BEFORE_MERGE: bool = False
     TPU_DCP_MLA_UV_BEFORE_MERGE_MIN_TOKENS: int = 0
     TPU_DCP_MERGE_VSPACE_FUSED: bool = False
+    TPU_DCP_MERGE_LSE_ROW_PAIRS: bool = False
     TPU_DCP_MLA_OPROJ_ALL_REDUCE: bool = False
     TPU_DCP_MLA_OPROJ_ALL_REDUCE_CHUNK_TOKENS: int = 512
     TPU_MLA_SPARSE_SPLIT_Q: bool = True
@@ -913,6 +914,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # DCP8: P90 TTFT -10..-12% (the separate W_UV bmm, concat and relayouts
     # cost ~36 ms per 4096-token step).
     "TPU_DCP_MERGE_VSPACE_FUSED": env_bool("TPU_DCP_MERGE_VSPACE_FUSED"),
+    # The V-space merge's lse all-gather sends f32[T, 64] rows, which sit in
+    # 8 x 128 tiles with half of each row padding, so the gather moves twice
+    # its bytes. On: gather the rows in pairs side by side, [T / 2, 128]. Only
+    # the layout of the sent values changes; the merge arithmetic is the same.
+    # Migration switch: delete it, gathering row pairs whenever
+    # TPU_DCP_MERGE_VSPACE_FUSED is on, once a serving run shows it no slower
+    # at every prefill size.
+    "TPU_DCP_MERGE_LSE_ROW_PAIRS": env_bool("TPU_DCP_MERGE_LSE_ROW_PAIRS"),
     # Where W_UV is replicated over the DCP group (TPU_DCP_MLA_UV_BEFORE_MERGE),
     # replicate o_proj too, so the backbone buckets that apply W_UV before the
     # merge (TPU_DCP_MLA_UV_BEFORE_MERGE_MIN_TOKENS) and would reduce-scatter
