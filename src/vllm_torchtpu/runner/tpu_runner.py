@@ -8610,10 +8610,11 @@ class TPUModelRunner(GPUModelRunner):
             raise ValueError("kernel_block_sizes is required on TPU")
         super().may_reinitialize_input_batch(kv_cache_config)
         install_kernel_block_tables(self.input_batch.block_table, kernel_block_sizes)
-        if self.input_batch.block_table:
-            self.max_num_blocks_per_req = self.input_batch.block_table[
-                0
-            ].max_num_blocks_per_req
+        if self.input_batch.block_table.block_tables:
+            self.max_num_blocks_per_req = max(
+                bt.max_num_blocks_per_req
+                for bt in self.input_batch.block_table.block_tables
+            )
             if self.block_table_cpu.shape != (
                 self.max_num_reqs,
                 self.max_num_blocks_per_req,
