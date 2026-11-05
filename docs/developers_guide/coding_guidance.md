@@ -342,21 +342,18 @@ op = pallas.jax_op("pallas::quantized_matmul_kernel",
 ## 7. Diff discipline
 
 - **R-7.1** **Small, single-purpose PRs** ([Small CLs](https://google.github.io/eng-practices/review/developer/small-cls.html)).
-  Aim for a soft target of ≤ 300 changed lines (excluding baselines and
-  lockfiles) doing one self-contained thing. Pure deletions, atomic
-  renames/moves with their caller updates, and tiny dependent follow-ups may
-  stay in one PR; above ~300 changed lines, split along natural boundaries:
-  (a) enabling refactor before feature (R-7.2), (b) kernel changes under
-  `src/vllm_torchtpu/kernels/` (plus standalone kernel tests) before
-  `layers/`, `runner/`, or `models/` wiring, and (c) shared `runner/`,
-  `layers/`, or `quantization/` changes before model-specific files under
-  `models/`. Reviewers may still ask to split smaller multi-purpose diffs or
-  accept larger cohesive ones; very large designs need an RFC/design doc
+  Small, focused PRs get faster, more thorough reviews, make bugs easier to
+  spot, conflict less, and are safer to revert. Aim for a soft target of ≤ 300
+  changed lines (excluding baselines and lockfiles) doing one self-contained
+  logical change. Pure deletions, atomic renames/moves with their caller
+  updates, and tiny dependent follow-ups may stay in one PR; reviewers may
+  still ask to split smaller multi-purpose diffs or accept larger cohesive ones
+  when splitting would be artificial. Very large designs need an RFC/design doc
   first. Each PR in a stack must pass tests on its own and cite its base PR
   explicitly.
-- **R-7.2** **Refactor first, feature second.** Land the enabling refactor,
-  helper move, or signature change as its own behavior-preserving PR before
-  the feature or optimization PR that needs it.
+- **R-7.2** **Refactor first, feature second.** Land the enabling refactor or
+  cleanup as its own behavior-preserving PR before the feature/optimization PR
+  that needs it.
 - **R-7.3** **Do not include changes unrelated to the PR's purpose.** If a
   hunk is not needed for what the PR is about — reformatting of lines the
   change didn't touch, a rename done in passing, an unrelated typo fix —
