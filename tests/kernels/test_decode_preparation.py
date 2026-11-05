@@ -139,6 +139,28 @@ def test_compressor_layout_problem_names_field(field, value):
     assert layout.tag != default.tag
 
 
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("state_capacity", [16, 32])
+def test_compressor_layout_guard_compiles_fullgraph(state_capacity):
+    """Dynamo must inspect a bound layout without a graph break at warmup."""
+    import dataclasses
+
+    import torch
+
+    def guard(x):
+        layout = dataclasses.replace(
+            prep.DEFAULT_COMPRESSOR_LAYOUT, state_capacity=state_capacity
+        )
+        problem = prep.compressor_layout_problem(layout)
+        return x + (1 if problem is None else 2)
+
+    compiled = torch.compile(guard, backend="eager", fullgraph=True, dynamic=False)
+    x = torch.zeros(2)
+    expected = x + (1 if state_capacity == 16 else 2)
+    torch.testing.assert_close(compiled(x), expected)
+    torch.testing.assert_close(compiled(x), expected)
+
+
 def _compressor_inputs(tokens=96, requests=16, columns=8, seed=0):
     """Random decode batch: some empty requests, padded tail tokens."""
     rng = np.random.default_rng(seed)

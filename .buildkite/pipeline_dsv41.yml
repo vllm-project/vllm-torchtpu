@@ -146,6 +146,7 @@ steps:
         tests/models/vllm/test_dsv41_v2_prefix_replay.py
         tests/layers/adapter/test_fused_moe_ep.py
         tests/kernels/test_dsv41_decode_tuning.py
+        tests/kernels/test_decode_preparation.py
         tests/kernels/test_dsv41_decode_index_scores.py
         tests/models/vllm/test_dsv41_decode_indexer_route.py
         tests/models/vllm/test_csa2_chunk_cache.py
