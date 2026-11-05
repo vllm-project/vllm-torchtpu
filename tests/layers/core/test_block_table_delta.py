@@ -245,6 +245,44 @@ def test_capacity_overflow_falls_back_to_full(builders, monkeypatch):
     assert stager.num_delta == 1
 
 
+@pytest.mark.parametrize("buckets", [False, True])
+def test_bucketed_delta_matches_full_upload(builders, monkeypatch, buckets):
+    # With buckets a small delta is padded to 64 entries, a larger one to 512;
+    # either way every walk hands out exactly the full-upload tables.
+    monkeypatch.setenv("TPU_INCREMENTAL_BLOCK_TABLE_UPLOAD", "1")
+    monkeypatch.setenv("TPU_VERIFY_INCREMENTAL_BLOCK_TABLE", "0")
+    monkeypatch.setenv("TPU_BLOCK_TABLE_DELTA_BUCKETS", "1" if buckets else "0")
+    sizes = []
+    apply = btd.apply_block_table_delta
+
+    def record(staged, update):
+        sizes.append(update.shape[1])
+        return apply(staged, update)
+
+    monkeypatch.setattr(btd, "apply_block_table_delta", record)
+    runner = _make_runner(builders)
+    seq = [1024, 1024]  # every column of every group is active
+    for b in builders:
+        b.bt.append_row([1, 2], 0)
+        b.bt.append_row([3], 1)
+    _stage(runner, 2, seq, 2)
+    for step, new_blocks in enumerate(([4], list(range(10, 50)), [60])):
+        for b in builders:
+            b.bt.append_row([n + step for n in new_blocks], 0)
+        got = _stage(runner, 2, seq, 2)
+        want = _reference(builders, 2, seq, 2, 0)
+        for gid in want:
+            assert torch.equal(got[gid], want[gid])
+    if buckets:
+        assert sizes == [64, 512, 64]
+    else:
+        assert sizes == [btd.DELTA_CAPACITY] * 3
+    stager = runner._block_table_delta_stager
+    stager.warm(torch.zeros((8,), dtype=torch.int32))
+    expected = btd.DELTA_BUCKETS if buckets else (btd.DELTA_CAPACITY,)
+    assert sorted(size for _, size in stager._zero_update) == sorted(expected)
+
+
 def test_disabled_dummy_and_single_group_paths(builders, monkeypatch):
     monkeypatch.setenv("TPU_INCREMENTAL_BLOCK_TABLE_UPLOAD", "0")
     runner = _make_runner(builders)
@@ -313,9 +351,9 @@ def test_warm_reuses_zero_update_and_device_copy_not_cloned(builders):
     stager = btd.BlockTableDeltaStager()
     staged = torch.zeros((8,), dtype=torch.int32)
     stager.warm(staged)
-    zero = stager._zero_update[staged.device]
+    zero = stager._zero_update[(staged.device, btd.DELTA_CAPACITY)]
     stager.warm(staged)
-    assert stager._zero_update[staged.device] is zero
+    assert stager._zero_update[(staged.device, btd.DELTA_CAPACITY)] is zero
 
     # A non-CPU device copy is already distinct from the host scratch and is
     # kept as is (no defensive clone).

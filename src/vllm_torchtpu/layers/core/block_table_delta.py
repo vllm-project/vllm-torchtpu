@@ -39,10 +39,24 @@ from typing import Any
 import numpy as np
 import torch
 
+from vllm_torchtpu import envs
+
 # Changed entries one delta upload carries. Larger walks take the full path.
 # 128 requests crossing a block boundary together in every one of 51 groups is
 # 6528 entries.
 DELTA_CAPACITY = 8192
+# With TPU_BLOCK_TABLE_DELTA_BUCKETS, an upload is padded only to the first of
+# these that holds it: a steady decode step changes tens of entries, and the
+# scatter's cost follows its padded length.
+DELTA_BUCKETS = (64, 512, DELTA_CAPACITY)
+
+
+def _delta_capacity(count: int) -> int:
+    if not envs.TPU_BLOCK_TABLE_DELTA_BUCKETS:
+        return DELTA_CAPACITY
+    return next(size for size in DELTA_BUCKETS if size >= count)
+
+
 # Staging layouts kept on device (target walk, drafter walk, chunk offsets).
 MAX_LAYOUTS = 4
 
@@ -167,7 +181,7 @@ class BlockTableDeltaStager:
 
     def __init__(self) -> None:
         self._layouts: OrderedDict[tuple, _Layout] = OrderedDict()
-        self._zero_update: dict[torch.device, torch.Tensor] = {}
+        self._zero_update: dict[tuple[torch.device, int], torch.Tensor] = {}
         self.num_full = 0
         self.num_delta = 0
         self.num_reuse = 0
@@ -263,7 +277,7 @@ class BlockTableDeltaStager:
         self._layouts.move_to_end(key)
         count = len(idx)
         if count:
-            update = np.empty((2, DELTA_CAPACITY), dtype=np.int32)
+            update = np.empty((2, _delta_capacity(count)), dtype=np.int32)
             update[0, :count] = idx
             update[1, :count] = vals
             update[0, count:] = idx[0]
@@ -315,11 +329,15 @@ class BlockTableDeltaStager:
     def warm(self, staged_dev: torch.Tensor) -> None:
         """Compile the scatter for this layout during dummy runs (no-op update)."""
         device = staged_dev.device
-        zero = self._zero_update.get(device)
-        if zero is None:
-            zero = torch.zeros((2, DELTA_CAPACITY), dtype=torch.int32).to(device)
-            self._zero_update[device] = zero
-        apply_block_table_delta(staged_dev, zero)
+        sizes = (
+            DELTA_BUCKETS if envs.TPU_BLOCK_TABLE_DELTA_BUCKETS else (DELTA_CAPACITY,)
+        )
+        for size in sizes:
+            zero = self._zero_update.get((device, size))
+            if zero is None:
+                zero = torch.zeros((2, size), dtype=torch.int32).to(device)
+                self._zero_update[(device, size)] = zero
+            apply_block_table_delta(staged_dev, zero)
 
     def verify(self, key: tuple, expected_flat: torch.Tensor) -> None:
         """Raise unless the mirror and the device copy equal `expected_flat`."""
