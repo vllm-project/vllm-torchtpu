@@ -104,6 +104,53 @@ def test_matches_dense_reference(
     np.testing.assert_allclose(np.asarray(out.astype(jnp.float32)), expected, atol=2e-2)
 
 
+@pytest.mark.parametrize("kernel,block_q", [("v1", 64), ("v2", 64), ("v2", 16)])
+@pytest.mark.parametrize("dtype", CACHE_DTYPES)
+def test_unseen_cache_bytes_do_not_leak(dtype, kernel, block_q):
+    """NaN in slots no token sees leaves the output finite and unchanged.
+
+    A tile's page union is cut into groups of `pages_per_step`; the slots past
+    the union read the null page 0, and a local page's slots past the newest
+    token are masked. Masked slots get p = 0, but 0 * NaN is NaN, so a
+    never-written page (j-30e45a15: page 0 held NaN rows on the dummy-weight
+    twin) turned whole prefill tiles NaN.
+    """
+    num_tokens = 64
+    rng = np.random.default_rng(7)
+    q = jnp.asarray(rng.standard_normal((num_tokens, HEADS, HEAD_DIM))).astype(
+        jnp.bfloat16
+    )
+    kv_rows = rounded(rng.standard_normal((PAGES, PAGE, 2 * HEAD_DIM)), dtype)
+    # One prefill run on pages 1..3 (local page 3, 20 + t slots visible):
+    # a union of 3 pages, so 5 slots of the 8-page group read page 0.
+    selected = np.full((num_tokens, TOPK), -1, np.int32)
+    selected[:, :3] = [1, 2, 3]
+    local_page = np.full(num_tokens, 3, np.int32)
+    local_limit = 20 + np.arange(num_tokens, dtype=np.int32)
+    poisoned = kv_rows.copy()
+    poisoned[0] = np.nan
+    poisoned[3, 100:] = np.nan  # past every token's limit (<= 83)
+
+    def run(rows):
+        return msa_sparse_attention(
+            q,
+            pack(rows, dtype),
+            jnp.asarray(selected),
+            jnp.asarray(local_page),
+            jnp.asarray(local_limit),
+            sm_scale=HEAD_DIM**-0.5,
+            block_q=block_q,
+            kernel=kernel,
+            interpret=True,
+        )
+
+    clean, dirty = run(kv_rows), run(poisoned)
+    assert np.isfinite(np.asarray(dirty.astype(jnp.float32))).all()
+    np.testing.assert_array_equal(
+        np.asarray(dirty.astype(jnp.float32)), np.asarray(clean.astype(jnp.float32))
+    )
+
+
 def test_rejects_unsupported_cache():
     kv = jnp.zeros((2, PAGE, 1, 2 * HEAD_DIM), jnp.float32)
     with pytest.raises(NotImplementedError):
