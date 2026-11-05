@@ -93,6 +93,8 @@ if TYPE_CHECKING:
     TPU_MOE_GATHER_GMM: bool = False
     TPU_MOE_GATHER_GMM_MIN_TOKENS: int = 1024
     TPU_MOE_GATHER_GMM_CHUNKED_COMBINE: bool = False
+    TPU_MOE_GATHER_GMM_V2: bool = False
+    TPU_MOE_GATHER_GMM_TOKEN_SCALES: bool = False
     TPU_MOE_TP_EXPERT_SPLIT: bool = False
     FUSED_MOE_DECODE_KERNEL: bool = False
     FUSED_MOE_DECODE_KERNEL_MAX_TOKENS: int = 256
@@ -133,6 +135,7 @@ if TYPE_CHECKING:
     TPU_GDN_PREFILL_CHECKPOINT: bool = True
     TPU_MOE_SKIP_PADDED_TOKENS: bool = False
     TPU_GEMMA4_TOPK_SOFTMAX_ROUTING: bool = False
+    TPU_GEMMA4_ROUTER_TOPK_KERNEL: bool = False
     TPU_MOE_HIERARCHICAL_EP: bool = False
     TPU_MOE_ROUTER_TOPK: str = "rowmax"
     TPU_MOE_TOPK_WEIGHTS_FLOAT32: bool = False
@@ -493,11 +496,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # With TPU_GEMMA4_SEQUENCE_PARALLEL: split a large bucket into this many
     # contiguous token chunks whose collectives and projections can overlap.
     "TPU_GEMMA4_SP_MICROBATCHES": env_int("TPU_GEMMA4_SP_MICROBATCHES", 1),
-    # With TPU_GEMMA4_SEQUENCE_PARALLEL: between two projections of a dense
-    # Gemma4 layer, the residual add around a norm and the next norm with its
+    # With TPU_GEMMA4_SEQUENCE_PARALLEL: between two projections of a Gemma4
+    # layer, the residual add around a norm and the next norm with its
     # per-token FP8 quantization run as one Pallas pass on the rank's rows
-    # (kernels/norm_quant.py) instead of four XLA passes. Rounding: the norms'
-    # sums of squares are added in another order, so values can move one step.
+    # (kernels/norm_quant.py) instead of four XLA passes; on a MoE layer, so
+    # do the three norms, add and layer scalar after the experts. Rounding: the
+    # norms' sums of squares are added in another order, so values can move.
     "TPU_GEMMA4_FUSED_NORM_QUANT": env_bool("TPU_GEMMA4_FUSED_NORM_QUANT"),
     # Gemma4ForCausalLM at TP >= 2: token buckets of at least this many tokens
     # run context-parallel over the TP group (zigzag pieces of the step's one
@@ -867,6 +871,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_MOE_GATHER_GMM_CHUNKED_COMBINE": env_bool(
         "TPU_MOE_GATHER_GMM_CHUNKED_COMBINE"
     ),
+    # With TPU_MOE_GATHER_GMM: the expert kernel is gather_fused_moe_v2, which
+    # starts each tile's row DMAs from inside an earlier tile's compute instead
+    # of in a scalar loop before its own. Same arithmetic and output bits.
+    "TPU_MOE_GATHER_GMM_V2": env_bool("TPU_MOE_GATHER_GMM_V2"),
+    # With TPU_MOE_GATHER_GMM_V2: the expert kernel quantizes with one FP8
+    # activation scale per token (and per row of the activation for down)
+    # instead of one per 512 columns, each dequantizing an F32 product over
+    # the whole contraction. Changes the MoE arithmetic (tolerance tier).
+    "TPU_MOE_GATHER_GMM_TOKEN_SCALES": env_bool("TPU_MOE_GATHER_GMM_TOKEN_SCALES"),
     # MoE layers that run without expert parallelism (no
     # --enable-expert-parallel) on a tensor-parallel group, with no data,
     # pipeline-context or sequence parallelism inside the engine: give each TP
@@ -1055,6 +1068,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # gathers. Same top-k ids; weights equal up to float32 rounding for the
     # float32 logits the TPU gate emits (bf16 logits differ at bf16 precision).
     "TPU_GEMMA4_TOPK_SOFTMAX_ROUTING": env_bool("TPU_GEMMA4_TOPK_SOFTMAX_ROUTING"),
+    # With TPU_GEMMA4_TOPK_SOFTMAX_ROUTING: the router's top-k logits and each
+    # selected expert's per_expert_scale come from one sort-free Pallas pass
+    # (kernels/router_topk.select_scaled) instead of a full sort of the logits
+    # and a compare-select-sum over the experts. Ties go to the lowest id.
+    "TPU_GEMMA4_ROUTER_TOPK_KERNEL": env_bool("TPU_GEMMA4_ROUTER_TOPK_KERNEL"),
     # Hierarchical MoE parallelism: expert-parallel between chips,
     # tensor-parallel between the two chiplets of a chip. Off by
     # default; it helps only at low concurrency, where the MoE is

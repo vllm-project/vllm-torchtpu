@@ -22,7 +22,11 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from vllm_torchtpu.kernels.norm_quant import add_rms_norm_quantize
+from vllm_torchtpu.kernels.norm_quant import (
+    add_rms_norm_quantize,
+    moe_head_rms_norm_quantize,
+    moe_tail_rms_norm_quantize,
+)
 from vllm_torchtpu.kernels.quantized_matmul.util import quantize_tensor
 
 FP8 = jnp.float8_e4m3fn
@@ -116,3 +120,141 @@ def test_block_rows_need_a_power_of_two():
         add_rms_norm_quantize(
             x, x, w, w, None, eps=EPS, quant_dtype=FP8, max_block_rows=96
         )
+
+
+def _moe_tail_reference(mlp, moe, residual, w_mlp, w_moe, w_post, scalar, w_next):
+    f32 = jnp.float32
+    mixed = (
+        _rms_norm(mlp, w_mlp).astype(f32) + _rms_norm(moe, w_moe).astype(f32)
+    ).astype(mlp.dtype)
+    h = (_rms_norm(mixed, w_post).astype(f32) + residual.astype(f32)).astype(mlp.dtype)
+    h = (h.astype(f32) * scalar.astype(f32)).astype(mlp.dtype)
+    if w_next is None:
+        return (h,)
+    q, scale = quantize_tensor(_rms_norm(h, w_next), FP8)
+    return h, q, scale
+
+
+@pytest.mark.parametrize("last_layer", [False, True])
+@pytest.mark.parametrize("tokens,hidden,scalar", [(64, 512, 1.0), (96, 2816, 0.75)])
+def test_moe_tail_matches_the_unfused_ops(tokens, hidden, scalar, last_layer):
+    rng = np.random.default_rng(tokens + hidden)
+    mlp, moe, residual = (
+        jnp.asarray(rng.standard_normal((tokens, hidden)) * a, jnp.bfloat16)
+        for a in (3, 2, 10)
+    )
+    w_mlp, w_moe, w_post, w_next = (
+        jnp.asarray(rng.standard_normal(hidden), jnp.float32) for _ in range(4)
+    )
+    if last_layer:
+        w_next = None
+    s = jnp.asarray([scalar], jnp.bfloat16)
+    got = moe_tail_rms_norm_quantize(
+        mlp,
+        moe,
+        residual,
+        w_mlp,
+        w_moe,
+        w_post,
+        s,
+        w_next,
+        eps=EPS,
+        quant_dtype=FP8,
+        interpret=True,
+    )
+    want = _moe_tail_reference(mlp, moe, residual, w_mlp, w_moe, w_post, s, w_next)
+    assert len(got) == len(want)
+    for a, b in zip(got, want):
+        assert a.dtype == b.dtype and a.shape == b.shape
+        _assert_within_one_step(a, b)
+
+
+def _assert_within_one_step(a, b):
+    """Equal up to one rounding step (the sums of squares run in another order
+    than XLA's), on a negligible share of elements."""
+    if a.dtype == jnp.float32:
+        np.testing.assert_allclose(np.asarray(a), np.asarray(b), rtol=1e-6)
+        return
+    bits = jnp.uint16 if a.dtype.itemsize == 2 else jnp.uint8
+    ia = np.asarray(jax.lax.bitcast_convert_type(a, bits)).astype(np.int64)
+    ib = np.asarray(jax.lax.bitcast_convert_type(b, bits)).astype(np.int64)
+    sign = 1 << (8 * a.dtype.itemsize - 1)
+    same_sign = (ia & sign) == (ib & sign)
+    assert (same_sign & (np.abs(ia - ib) <= 1) | (ia == ib)).all()
+    assert (ia != ib).mean() < 1e-4
+
+
+def _router_logits(h, root, scale, w_router):
+    """Gemma4Router.forward: weightless norm, root, scale, then a bf16 matmul
+    with f32 output, each op rounding to the activation dtype."""
+    f32, dt = jnp.float32, h.dtype
+    x = _rms_norm(h, jnp.ones(h.shape[-1], f32))
+    x = (x.astype(f32) * jnp.asarray(root, dt).astype(f32)).astype(dt)
+    x = (x.astype(f32) * scale.astype(dt).astype(f32)).astype(dt)
+    out = jnp.dot(x, w_router.T, preferred_element_type=f32)
+    return out.astype(dt).astype(f32)
+
+
+@pytest.mark.parametrize("tokens,hidden,experts", [(256, 512, 128), (128, 2816, 128)])
+def test_moe_head_matches_the_unfused_ops(tokens, hidden, experts):
+    """h, its quantized next-norm rows and scales as add_rms_norm_quantize (bit
+    for bit), the experts' norm, and the router logits up to one rounding."""
+    rng = np.random.default_rng(tokens + hidden)
+    x = jnp.asarray(rng.standard_normal((tokens, hidden)) * 3, jnp.bfloat16)
+    residual = jnp.asarray(rng.standard_normal((tokens, hidden)) * 10, jnp.bfloat16)
+    w_post, w_next, w_moe = (
+        jnp.asarray(rng.standard_normal(hidden), jnp.float32) for _ in range(3)
+    )
+    w_router = jnp.asarray(rng.standard_normal((experts, hidden)) * 0.05, jnp.bfloat16)
+    scale = jnp.asarray(1 + 0.1 * rng.standard_normal(hidden), jnp.bfloat16)
+    root = float(jnp.asarray(hidden**-0.5, jnp.bfloat16))
+    h, q, s, m, logits = moe_head_rms_norm_quantize(
+        x,
+        residual,
+        w_post,
+        w_next,
+        w_moe,
+        w_router,
+        scale,
+        eps=EPS,
+        router_root=root,
+        quant_dtype=FP8,
+        interpret=True,
+    )
+    one = jnp.ones(1, jnp.bfloat16)
+    for a, b in zip((h, q, s), _reference(x, residual, w_post, one, w_next)):
+        np.testing.assert_array_equal(
+            np.asarray(a.astype(jnp.float32)), np.asarray(b.astype(jnp.float32))
+        )
+    np.testing.assert_array_equal(
+        np.asarray(m.view(jnp.uint16)), np.asarray(_rms_norm(h, w_moe).view(jnp.uint16))
+    )
+    want = _router_logits(h, root, scale, w_router)
+    assert logits.shape == (tokens, experts) and logits.dtype == jnp.float32
+    # The dot accumulates in another order: within one bf16 rounding step.
+    np.testing.assert_allclose(
+        np.asarray(logits), np.asarray(want), rtol=2**-7, atol=1e-6
+    )
+
+
+def test_moe_head_lowers_for_tpu7x():
+    device = jax.sharding.AbstractDevice(
+        device_kind="TPU7x", num_cores=1, platform="tpu"
+    )
+    mesh = jax.sharding.AbstractMesh((), (), abstract_device=device)
+    rows = jax.ShapeDtypeStruct((45056, 2816), jnp.bfloat16)
+    weight = jax.ShapeDtypeStruct((2816,), jnp.float32)
+    router = jax.ShapeDtypeStruct((128, 2816), jnp.bfloat16)
+    scale = jax.ShapeDtypeStruct((2816,), jnp.bfloat16)
+    with jax.sharding.use_abstract_mesh(mesh):
+        text = (
+            jax.jit(
+                lambda *a: moe_head_rms_norm_quantize(
+                    *a, eps=EPS, router_root=2816**-0.5, quant_dtype=FP8
+                )
+            )
+            .trace(rows, rows, weight, weight, weight, router, scale)
+            .lower(lowering_platforms=("tpu",))
+            .as_text()
+        )
+    assert "moe_head_rms_norm_quantize" in text

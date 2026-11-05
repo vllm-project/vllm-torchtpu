@@ -132,3 +132,260 @@ def add_rms_norm_quantize(
         interpret=interpret,
         name="add_rms_norm_quantize",
     )(*operands)
+
+
+def _moe_tail_kernel(*refs, eps, quantize, quant_dtype, bytes_out):
+    m_ref, e_ref, r_ref, w1_ref, w2_ref, wp_ref, sc_ref, *rest = refs
+    if quantize:
+        wn_ref, h_ref, q_ref, s_ref = rest
+    else:
+        (h_ref,) = rest
+        wn_ref = q_ref = s_ref = None
+    dtype = h_ref.dtype
+    f32 = jnp.float32
+    mixed = _rms_norm(m_ref[...].astype(f32), w1_ref[...].astype(f32), eps, dtype)
+    mixed += _rms_norm(e_ref[...].astype(f32), w2_ref[...].astype(f32), eps, dtype)
+    mixed = mixed.astype(dtype).astype(f32)
+    n = _rms_norm(mixed, wp_ref[...].astype(f32), eps, dtype)
+    h = (n + r_ref[...].astype(f32)).astype(dtype).astype(f32)
+    h = (h * sc_ref[...].astype(f32)).astype(dtype).astype(f32)
+    h_ref[...] = h.astype(dtype)
+    if wn_ref is None or q_ref is None or s_ref is None:
+        return
+    m = _rms_norm(h, wn_ref[...].astype(f32), eps, dtype)
+    info = jnp.finfo(quant_dtype)
+    scale = jnp.max(jnp.abs(m), axis=-1, keepdims=True) / float(info.max)
+    scale = jnp.where(scale == 0, jnp.ones_like(scale), scale)
+    q = jnp.clip(m / scale, float(info.min), float(info.max)).astype(quant_dtype)
+    q_ref[...] = jax.lax.bitcast_convert_type(q, jnp.int8) if bytes_out else q
+    s_ref[...] = scale
+
+
+@functools.partial(
+    jax.jit,
+    static_argnames=("eps", "quant_dtype", "bytes_out", "max_block_rows", "interpret"),
+)
+def moe_tail_rms_norm_quantize(
+    mlp: jax.Array,
+    moe: jax.Array,
+    residual: jax.Array,
+    w_mlp: jax.Array,
+    w_moe: jax.Array,
+    w_post: jax.Array,
+    scalar: jax.Array,
+    w_next: jax.Array | None,
+    *,
+    eps: float,
+    quant_dtype: jnp.dtype | None,
+    bytes_out: bool = False,
+    max_block_rows: int = _BLOCK_ROWS,
+    interpret: bool = False,
+) -> tuple[jax.Array, ...]:
+    """A Gemma4 MoE layer's tail and the next layer's input quantization:
+
+        h = (rms_norm(rms_norm(mlp, w_mlp) + rms_norm(moe, w_moe), w_post)
+             + residual) * scalar
+        q, scale = quantize_tensor(rms_norm(h, w_next), quant_dtype)
+
+    Returns `(h, q, scale)`, or `(h,)` without `w_next` (the last layer).
+    Rounding as `add_rms_norm_quantize`: each norm, add and product rounds to
+    the activation dtype, as the unfused ops do.
+    """
+    tokens, hidden = mlp.shape
+    quantize = w_next is not None
+    # mlp, moe, residual and h in the activation dtype, q in 1 byte, double-buffered.
+    row_bytes = 2 * (4 * mlp.dtype.itemsize + int(quantize)) * hidden
+    rows = fit_block_rows(tokens, row_bytes, max_block_rows, _VMEM_LIMIT_BYTES)
+    row_block = pl.BlockSpec((rows, hidden), lambda i: (i, 0))
+    weight = pl.BlockSpec((1, hidden), lambda i: (0, 0))
+    operands = [
+        mlp,
+        moe,
+        residual,
+        w_mlp.reshape(1, hidden),
+        w_moe.reshape(1, hidden),
+        w_post.reshape(1, hidden),
+        scalar.reshape(1, 1),
+    ]
+    in_specs = [row_block] * 3 + [weight] * 3 + [pl.BlockSpec((1, 1), lambda i: (0, 0))]
+    out_specs = [row_block]
+    out_shape = [jax.ShapeDtypeStruct(mlp.shape, mlp.dtype)]
+    if quantize:
+        operands.append(w_next.reshape(1, hidden))
+        in_specs.append(weight)
+        out_specs += [row_block, pl.BlockSpec((rows, 1), lambda i: (i, 0))]
+        out_shape += [
+            jax.ShapeDtypeStruct(mlp.shape, jnp.int8 if bytes_out else quant_dtype),
+            jax.ShapeDtypeStruct((tokens, 1), jnp.float32),
+        ]
+    return tuple(
+        pl.pallas_call(
+            functools.partial(
+                _moe_tail_kernel,
+                eps=eps,
+                quantize=quantize,
+                quant_dtype=quant_dtype,
+                bytes_out=bytes_out,
+            ),
+            grid=(tokens // rows,),
+            in_specs=in_specs,
+            out_specs=out_specs,
+            out_shape=out_shape,
+            compiler_params=pltpu.CompilerParams(
+                dimension_semantics=("parallel",),
+                vmem_limit_bytes=_VMEM_LIMIT_BYTES,
+            ),
+            interpret=interpret,
+            name="moe_tail_rms_norm_quantize",
+        )(*operands)
+    )
+
+
+def _moe_head_kernel(
+    x_ref,
+    r_ref,
+    wp_ref,
+    wn_ref,
+    wm_ref,
+    wr_ref,
+    rs_ref,
+    h_ref,
+    q_ref,
+    s_ref,
+    m_ref,
+    logits_ref,
+    *,
+    eps,
+    router_root,
+    quant_dtype,
+    bytes_out,
+):
+    dtype = h_ref.dtype
+    f32 = jnp.float32
+    n = _rms_norm(x_ref[...].astype(f32), wp_ref[...].astype(f32), eps, dtype)
+    h = (n + r_ref[...].astype(f32)).astype(dtype).astype(f32)
+    h_ref[...] = h.astype(dtype)
+    # The three norms of h share its variance (one epsilon, checked at build).
+    hn = h * jax.lax.rsqrt(jnp.mean(h * h, axis=-1, keepdims=True) + eps)
+    m = (hn * wn_ref[...].astype(f32)).astype(dtype).astype(f32)
+    info = jnp.finfo(quant_dtype)
+    scale = jnp.max(jnp.abs(m), axis=-1, keepdims=True) / float(info.max)
+    scale = jnp.where(scale == 0, jnp.ones_like(scale), scale)
+    q = jnp.clip(m / scale, float(info.min), float(info.max)).astype(quant_dtype)
+    q_ref[...] = jax.lax.bitcast_convert_type(q, jnp.int8) if bytes_out else q
+    s_ref[...] = scale
+    m_ref[...] = (hn * wm_ref[...].astype(f32)).astype(dtype)
+    # The router's weightless norm, root scale and per-dimension scale, each
+    # rounded to the activation dtype as separate ops would (a product of two
+    # activation-dtype values rounds the same in that dtype as through f32).
+    xr = hn.astype(dtype) * jnp.asarray(router_root, dtype)
+    xr = xr * rs_ref[...].astype(dtype)
+    logits = jax.lax.dot_general(
+        xr, wr_ref[...], (((1,), (1,)), ((), ())), preferred_element_type=f32
+    )
+    logits_ref[...] = logits.astype(dtype).astype(f32)
+
+
+@functools.partial(
+    jax.jit,
+    static_argnames=(
+        "eps",
+        "router_root",
+        "quant_dtype",
+        "bytes_out",
+        "max_block_rows",
+        "interpret",
+    ),
+)
+def moe_head_rms_norm_quantize(
+    x: jax.Array,
+    residual: jax.Array,
+    w_post: jax.Array,
+    w_next: jax.Array,
+    w_moe: jax.Array,
+    w_router: jax.Array,
+    router_scale: jax.Array,
+    *,
+    eps: float,
+    router_root: float,
+    quant_dtype: jnp.dtype,
+    bytes_out: bool = False,
+    max_block_rows: int = _BLOCK_ROWS,
+    interpret: bool = False,
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
+    """A Gemma4 MoE layer's post-attention tail and everything read from it:
+
+        h = rms_norm(x, w_post) + residual
+        q, scale = quantize_tensor(rms_norm(h, w_next), quant_dtype)
+        m = rms_norm(h, w_moe)
+        logits = (rms_norm(h) * router_root * router_scale) @ w_router.T
+
+    `rms_norm(h)` has no weight; `router_root` is the router's constant input
+    scale already rounded to the activation dtype, `w_router` its [experts,
+    hidden] projection. Returns `(h, q, scale, m,
+    logits)`: `h` and `m` in `x`'s dtype, `q` as `add_rms_norm_quantize`,
+    `logits` f32 [tokens, experts] rounded through the activation dtype, as a
+    matmul in that dtype returns them. Every norm, product and the dot round
+    as the separate ops do; sums of squares and the dot accumulate in another
+    order.
+    """
+    tokens, hidden = x.shape
+    experts = w_router.shape[0]
+    if w_router.shape != (experts, hidden):
+        raise ValueError(f"w_router {w_router.shape} is not [experts, {hidden}]")
+    # x, residual, h and m in the activation dtype, q in 1 byte and the f32
+    # logits, double-buffered, beside the double-buffered router weight.
+    row_bytes = 2 * ((4 * x.dtype.itemsize + 1) * hidden + 4 * experts)
+    weight_bytes = 2 * w_router.size * w_router.dtype.itemsize
+    rows = fit_block_rows(
+        tokens, row_bytes, max_block_rows, _VMEM_LIMIT_BYTES - weight_bytes
+    )
+    row_block = pl.BlockSpec((rows, hidden), lambda i: (i, 0))
+    weight = pl.BlockSpec((1, hidden), lambda i: (0, 0))
+    return pl.pallas_call(
+        functools.partial(
+            _moe_head_kernel,
+            eps=eps,
+            router_root=router_root,
+            quant_dtype=quant_dtype,
+            bytes_out=bytes_out,
+        ),
+        grid=(tokens // rows,),
+        in_specs=[
+            row_block,
+            row_block,
+            weight,
+            weight,
+            weight,
+            pl.BlockSpec((experts, hidden), lambda i: (0, 0)),
+            weight,
+        ],
+        out_specs=[
+            row_block,
+            row_block,
+            pl.BlockSpec((rows, 1), lambda i: (i, 0)),
+            row_block,
+            pl.BlockSpec((rows, experts), lambda i: (i, 0)),
+        ],
+        out_shape=[
+            jax.ShapeDtypeStruct(x.shape, x.dtype),
+            jax.ShapeDtypeStruct(x.shape, jnp.int8 if bytes_out else quant_dtype),
+            jax.ShapeDtypeStruct((tokens, 1), jnp.float32),
+            jax.ShapeDtypeStruct(x.shape, x.dtype),
+            jax.ShapeDtypeStruct((tokens, experts), jnp.float32),
+        ],
+        compiler_params=pltpu.CompilerParams(
+            dimension_semantics=("parallel",),
+            vmem_limit_bytes=_VMEM_LIMIT_BYTES,
+        ),
+        interpret=interpret,
+        name="moe_head_rms_norm_quantize",
+    )(
+        x,
+        residual,
+        w_post.reshape(1, hidden),
+        w_next.reshape(1, hidden),
+        w_moe.reshape(1, hidden),
+        w_router,
+        router_scale.reshape(1, hidden),
+    )

@@ -564,6 +564,76 @@ def test_gather_routing_matches_prepare_routed_gmm_inputs(
     np.testing.assert_array_equal(positions, want_positions)
 
 
+@pytest.mark.parametrize(
+    ("padded", "nan_row0"),
+    [(40, False), (40, True), (256, False)],  # 256: every token, as in warmup
+)
+@pytest.mark.parametrize("v2", [False, True])
+@pytest.mark.parametrize("counting_sort", [False, True])
+def test_gather_gmm_moe_skips_padded_tokens_without_a_mask(
+    monkeypatch, padded, nan_row0, v2, counting_sort
+):
+    """Without EP the skipped (zero-weight) routes read row 0 and the combine
+    zeroes them: the masked combine's bits for every token, also when row 0 is
+    a NaN token's (it stays that token's) and when every token is padding and
+    the expert kernel writes no row (the interpreter fills unwritten memory
+    with NaN)."""
+    import functools
+
+    from vllm_torchtpu.kernels.megablox import gather_gmm as G
+
+    tokens, experts, topk, hidden, inter = 256, 8, 2, 768, 128
+    kx, kr, k1, k2, k3, k4 = jax.random.split(jax.random.PRNGKey(5), 6)
+    x = (jax.random.normal(kx, (tokens, hidden)) * 2.0).astype(jnp.bfloat16)
+    weights, ids = jax.lax.top_k(
+        jax.nn.softmax(jax.random.normal(kr, (tokens, experts)), axis=-1), topk
+    )
+    ids = ids.astype(jnp.int32)
+    if nan_row0:
+        # Token 0's first route goes to expert 0, so its row is row 0.
+        x = x.at[0].set(jnp.nan)
+        ids = ids.at[0].set(jnp.array([0, 1], jnp.int32))
+    weights = weights.astype(jnp.bfloat16).at[tokens - padded :].set(0)
+    f8 = jnp.float8_e4m3fn
+    w1 = (jax.random.normal(k1, (experts, hidden, 2 * inter)) * 0.5).astype(f8)
+    w2 = (jax.random.normal(k2, (experts, inter, hidden)) * 0.5).astype(f8)
+    w1s = jax.random.uniform(k3, (experts, 1, 2 * inter), minval=0.01, maxval=0.03)
+    w2s = jax.random.uniform(k4, (experts, 1, hidden), minval=0.01, maxval=0.03)
+    tiles = dict(tile_m=64, height_step=32, vmem_limit_bytes=64 << 20, interpret=True)
+    kernels = types.SimpleNamespace(
+        quantize_pack_rows=functools.partial(
+            G.quantize_pack_rows, tile_tokens=8, interpret=True
+        ),
+        gather_fused_moe=functools.partial(G.gather_fused_moe, **tiles),
+        gather_fused_moe_v2=functools.partial(G.gather_fused_moe_v2, **tiles),
+        gather_combine_in_chunks=functools.partial(
+            G.gather_combine_in_chunks, interpret=True
+        ),
+    )
+    monkeypatch.setattr(fused_moe_gmm, "gather_gmm", kernels)
+    monkeypatch.setattr(fused_moe_gmm, "_GATHER_GMM_V2", v2)
+    monkeypatch.setattr(fused_moe_gmm, "_COUNTING_SORT", counting_sort)
+    moe = functools.partial(
+        fused_moe_gmm.gather_gmm_moe,
+        x,
+        w1,
+        w2,
+        w1s,
+        w2s,
+        weights,
+        ids,
+        topk=topk,
+        activation="gelu_tanh",
+        skip_padded_tokens=True,
+    )
+    want = np.asarray(moe(masked=True))
+    got = np.asarray(moe(masked=False))
+    finite = np.isfinite(want.astype(np.float32)).all(axis=1)
+    assert finite[int(nan_row0) :].all() and not finite[: int(nan_row0)].any()
+    assert not want[tokens - padded :].astype(np.float32).any()
+    np.testing.assert_array_equal(got.view(np.uint16), want.view(np.uint16))
+
+
 def _gather_gmm_weights(inter, num_experts=32, hidden=2816):
     """can_use_gather_gmm weight overrides for another intermediate size."""
     f8 = jnp.float8_e4m3fn

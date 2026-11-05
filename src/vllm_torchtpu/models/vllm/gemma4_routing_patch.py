@@ -19,11 +19,16 @@ gathers the top-k weights and gathers ``per_expert_scale`` at the top-k ids.
 XLA lowers the gathers from the [num_experts] table as slow scalar loops at
 prefill sizes. Renormalizing a full softmax over the top-k is the softmax of
 the top-k logits, and the scale lookup is a compare-select-sum over the
-experts axis, so this routing has no gather and the same top-k ids.
+experts axis, so this routing has no gather and the same top-k ids. With
+``TPU_GEMMA4_ROUTER_TOPK_KERNEL`` the sort-free router kernel
+(``kernels/router_topk.select_scaled``) returns the top-k logits and each
+selected expert's scale in one pass instead of a full sort of the logits and a
+compare-select-sum (ties go to the lowest expert id).
 """
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import TYPE_CHECKING
 
 import torch
@@ -36,6 +41,14 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+# Fixed at import, as in layers/adapter/moe_routing.py: the traced routing
+# branches on it.
+_ROUTER_TOPK_KERNEL = envs.TPU_GEMMA4_ROUTER_TOPK_KERNEL
+# layers.adapter.router_topk.rowmax_select_scaled, bound when the patch is
+# applied with the kernel on: importing it registers torch_tpu Pallas ops, and
+# this module is imported at platform activation in every process.
+_select_scaled: Callable[..., tuple[torch.Tensor, ...]] | None = None
+
 
 def gemma4_topk_softmax_routing(
     gating_output: torch.Tensor,
@@ -43,15 +56,21 @@ def gemma4_topk_softmax_routing(
     per_expert_scale: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Drop-in for upstream ``gemma4_routing_function_torch``."""
-    topk_logits, topk_ids = torch.topk(gating_output, k=topk, dim=-1)
+    if _ROUTER_TOPK_KERNEL:
+        assert _select_scaled is not None, "bound by maybe_patch_gemma4_routing"
+        topk_logits, topk_ids, expert_scales = _select_scaled(
+            gating_output, topk, per_expert_scale
+        )
+    else:
+        topk_logits, topk_ids = torch.topk(gating_output, k=topk, dim=-1)
+        experts = torch.arange(
+            gating_output.shape[-1], device=topk_ids.device, dtype=topk_ids.dtype
+        )
+        selected = topk_ids.unsqueeze(-1) == experts
+        expert_scales = torch.where(
+            selected, per_expert_scale.to(torch.float32), 0.0
+        ).sum(dim=-1)
     topk_weights = torch.softmax(topk_logits.to(torch.float32), dim=-1)
-    experts = torch.arange(
-        gating_output.shape[-1], device=topk_ids.device, dtype=topk_ids.dtype
-    )
-    selected = topk_ids.unsqueeze(-1) == experts
-    expert_scales = torch.where(selected, per_expert_scale.to(torch.float32), 0.0).sum(
-        dim=-1
-    )
     return topk_weights * expert_scales, topk_ids.to(torch.int32)
 
 
@@ -60,9 +79,18 @@ def maybe_patch_gemma4_routing(
 ) -> bool | None:
     """Returns False until a Gemma4 model config is available."""
     if not envs.TPU_GEMMA4_TOPK_SOFTMAX_ROUTING:
+        if envs.TPU_GEMMA4_ROUTER_TOPK_KERNEL:
+            raise ValueError(
+                "TPU_GEMMA4_ROUTER_TOPK_KERNEL needs TPU_GEMMA4_TOPK_SOFTMAX_ROUTING"
+            )
         return None
     if model_config is None or model_config.hf_text_config.model_type != "gemma4_text":
         return False
+    if _ROUTER_TOPK_KERNEL:
+        global _select_scaled
+        from vllm_torchtpu.layers.adapter.router_topk import rowmax_select_scaled
+
+        _select_scaled = rowmax_select_scaled
     import vllm.model_executor.models.gemma4 as gemma4_mod
 
     # Gemma4Router.routing_function resolves this module global per call, and
@@ -70,5 +98,8 @@ def maybe_patch_gemma4_routing(
     if not callable(gemma4_mod.gemma4_routing_function_torch):
         raise TypeError("vLLM gemma4_routing_function_torch is not a function")
     gemma4_mod.gemma4_routing_function_torch = gemma4_topk_softmax_routing
-    logger.info("Applied TPU patch: Gemma4 MoE top-k softmax routing without gathers.")
+    logger.info(
+        "Applied TPU patch: Gemma4 MoE top-k softmax routing without gathers%s.",
+        " (sort-free top-k kernel)" if _ROUTER_TOPK_KERNEL else "",
+    )
     return None
