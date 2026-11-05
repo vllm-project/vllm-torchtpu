@@ -12,6 +12,7 @@ if TYPE_CHECKING:
     TPU_DEEPSEEK_V41_ENGRAM_CPU_OFFLOAD: bool = False
     TPU_DEEPSEEK_V41_ENGRAM_HBM: str = "auto"
     TPU_DEEPSEEK_V41_DECODE_FUSION: str = "auto"
+    TPU_DEEPSEEK_V41_SWA_RECORDS_FUSION: bool = True
     TPU_K3_SP_PREFILL: bool = False
     TPU_INCREMENTAL_BLOCK_TABLE_UPLOAD: bool = True
     TPU_VERIFY_INCREMENTAL_BLOCK_TABLE: bool = False
@@ -405,6 +406,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "auto",
         ["auto", "off", "require"],
         case_sensitive=False,
+    ),
+    # Temporary ordinary-SWA migration/A-B selector; remove after validation.
+    # Read once by the attention constructor before graph compilation.
+    "TPU_DEEPSEEK_V41_SWA_RECORDS_FUSION": env_bool(
+        "TPU_DEEPSEEK_V41_SWA_RECORDS_FUSION", default=True
     ),
     # Opt in to K3 TP32/EP32 sequence-parallel prefill.
     "TPU_K3_SP_PREFILL": env_bool("TPU_K3_SP_PREFILL", default=False),
