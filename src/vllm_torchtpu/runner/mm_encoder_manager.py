@@ -422,14 +422,6 @@ class MMEncoderManager(EncoderCudaGraphManager):
 
     def precompile_vision_encoder(self) -> None:
         """Prime the XLA compilation cache for all configured token budgets."""
-        try:
-            from vllm_torchtpu.models.vllm.gemma4_mm_patch import (
-                patch_vision_mrope_lane_swap,
-            )
-
-            patch_vision_mrope_lane_swap()
-        except Exception as exc:
-            logger.debug("Could not pre-patch vision mrope: %s", exc)
         for path, templates in self.budget_templates.items():
             for budget in templates:
                 self._capture_budget_graph(budget, path=path)

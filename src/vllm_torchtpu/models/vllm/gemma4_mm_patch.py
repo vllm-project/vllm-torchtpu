@@ -13,7 +13,7 @@
 # limitations under the License.
 """Model-specific patches for Gemma4 multimodal models on TPU."""
 
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 from vllm_torchtpu.logger import init_logger
 
@@ -34,50 +34,39 @@ _TEXT_ONLY_ARCHITECTURES = {
 _orig_gemma4_layer_config = None
 
 
-_LANE_SWAP_CACHE: dict[tuple[int, int, Any, Any], tuple[Any, Any]] = {}
-
-
-def _get_lane_swap_permutation(
-    head_dim: int, n: int, device: Any, dtype: Any
-) -> tuple[Any, Any]:
-    """Retrieve or construct cached in-register permutation tables."""
-    cache_key = (head_dim, n, device, dtype)
-    cached = _LANE_SWAP_CACHE.get(cache_key)
-    if cached is not None:
-        return cached
-
-    import torch
-
-    partner = torch.arange(head_dim, device=device)
-    partner[:n] = torch.arange(n, 2 * n, device=device)
-    partner[n : 2 * n] = torch.arange(0, n, device=device)
-
-    signs = torch.ones(head_dim, device=device, dtype=dtype)
-    signs[:n] = -1.0
-
-    _LANE_SWAP_CACHE[cache_key] = (partner, signs)
-    return partner, signs
-
-
-def _lane_swap_rotate_half(x: Any) -> Any:
+def _lane_swap_rotate_half(x):
     """In-register lane-swap rotate_half (l ^ n) for TPU acceleration (b/581011672).
 
     Adapted from the Lane-swap technique (go/fused_qkv_proj, cl/989795783).
     Replaces tensor slicing (torch.chunk) and concatenation (torch.cat)
-    with an in-register lane permutation table, eliminating
+    with an in-register bitwise XOR lane permutation (l ^ 32), eliminating
     crossbar lane masking and HBM round-trips on TPU hardware.
     """
     head_dim = x.shape[-1]
-    n = head_dim // 2
-    partner, signs = _get_lane_swap_permutation(head_dim, n, x.device, x.dtype)
-    return x.gather(-1, partner.expand_as(x)) * signs.expand_as(x)
+    # In Gemma-4 vision encoder, head_dim is 72 with 64 rotated lanes (n = 32 pairs).
+    # For standard rotary heads, rotary_dim == head_dim (n = head_dim // 2).
+    n = 32 if head_dim == 72 else head_dim // 2
+    if (n & (n - 1)) == 0 and n >= 8:
+        import torch
+
+        partner = torch.arange(head_dim, device=x.device)
+        partner[: 2 * n] = partner[: 2 * n] ^ n
+        signs = torch.ones(head_dim, device=x.device, dtype=x.dtype)
+        signs[:n] = -1.0
+        return x.gather(-1, partner.expand_as(x)) * signs
+
+    import torch
+
+    x1 = x[..., : head_dim // 2]
+    x2 = x[..., head_dim // 2 :]
+    return torch.cat((-x2, x1), dim=-1)
 
 
 setattr(_lane_swap_rotate_half, "_is_lane_swap_patched", True)  # noqa: B010
 
 
 def patch_vision_mrope_lane_swap() -> None:
-    """Patch vision encoder rotary embedding with in-register XOR lane-swap.
+    """Patch SigLip vision encoder rotary embedding with in-register XOR lane-swap.
 
     Eliminates the 0.932 ms/layer slicing overhead in Gemma-4 vision encoder
     by replacing standard rotate_half with in-register lane-swap (b/581011672).
@@ -85,16 +74,8 @@ def patch_vision_mrope_lane_swap() -> None:
     import sys
 
     modules_to_patch = [
-        "transformers.models.gemma4.modeling_gemma4",
-        "transformers.models.gemma4",
-        "transformers.models.gemma.modeling_gemma",
-        "transformers.models.gemma2.modeling_gemma2",
         "transformers.models.siglip.modeling_siglip",
         "transformers.models.siglip2.modeling_siglip2",
-        "transformers.models.qwen2_vl.modeling_qwen2_vl",
-        "transformers.models.llama.modeling_llama",
-        "transformers.models.mistral.modeling_mistral",
-        "transformers.models.qwen2.modeling_qwen2",
         "vllm.model_executor.layers.rotary_embedding.common",
         "vllm.model_executor.layers.rotary_embedding",
     ]
@@ -103,44 +84,19 @@ def patch_vision_mrope_lane_swap() -> None:
         try:
             mod = sys.modules.get(mod_name)
             if mod is None:
-                try:
-                    __import__(mod_name)
-                    mod = sys.modules.get(mod_name)
-                except (ImportError, AttributeError):
-                    continue
-            if mod is None:
-                continue
-
-            if hasattr(mod, "rotate_half"):
-                orig_fn = getattr(mod, "rotate_half")  # noqa: B009
+                __import__(mod_name)
+                mod = sys.modules.get(mod_name)
+            if mod is not None and hasattr(mod, "rotate_half"):
+                orig_fn = mod.rotate_half
                 if not getattr(orig_fn, "_is_lane_swap_patched", False):
-                    setattr(mod, "rotate_half", _lane_swap_rotate_half)  # noqa: B010
+                    mod.rotate_half = _lane_swap_rotate_half
                     logger.info(
                         "Applied TPU patch: enabled in-register 2D mRoPE "
                         "lane-swap in %s.",
                         mod_name,
                     )
-
-            # Also patch __globals__ of all functions and classes in the module
-            for attr_name in dir(mod):
-                attr = getattr(mod, attr_name, None)
-                if callable(attr) and hasattr(attr, "__globals__"):
-                    globs = attr.__globals__
-                    if "rotate_half" in globs and not getattr(
-                        globs["rotate_half"], "_is_lane_swap_patched", False
-                    ):
-                        globs["rotate_half"] = _lane_swap_rotate_half
-                elif isinstance(attr, type):
-                    for class_attr_name in dir(attr):
-                        class_attr = getattr(attr, class_attr_name, None)
-                        if callable(class_attr) and hasattr(class_attr, "__globals__"):
-                            globs = class_attr.__globals__
-                            if "rotate_half" in globs and not getattr(
-                                globs["rotate_half"], "_is_lane_swap_patched", False
-                            ):
-                                globs["rotate_half"] = _lane_swap_rotate_half
-        except Exception as e:
-            logger.debug("Failed patching %s for lane-swap: %s", mod_name, e)
+        except (ImportError, AttributeError):
+            pass
 
 
 def _make_eager_dp_embed_multimodal(orig_embed_multimodal):
