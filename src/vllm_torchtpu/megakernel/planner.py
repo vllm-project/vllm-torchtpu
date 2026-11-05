@@ -21,10 +21,10 @@ from typing import Any
 
 import jax.numpy as jnp
 
-from . import pool_alias
+from .dma import pool_alias
 from .errors import MegakernelConfigError
 from .exec_spec import ExecSpec
-from .ops import BF16, F32, rup
+from .ops import BF16, F32, round_up
 from .spec import ExtraInput, ModelSpec, Module, Spec, StateDecl, SwitchSlot, WeightDecl
 
 
@@ -343,7 +343,7 @@ def plan(
     for name in small_fields_order:
         w_len = small_widths[name]
         lay[name] = (offset, w_len)
-        offset += rup(w_len, 128)
+        offset += round_up(w_len, 128)
     smalls_width = max(128, offset)
 
     w_names = tuple(

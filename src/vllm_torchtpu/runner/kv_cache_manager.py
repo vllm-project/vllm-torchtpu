@@ -43,7 +43,7 @@ from vllm.models.deepseek_v4.attention import (
 from vllm.models.deepseek_v4.compressor import CompressorStateCache
 from vllm.v1.attention.backend import AttentionLayer, AttentionType
 from vllm.v1.attention.backends.mla.sparse_swa import DeepseekV4SWACache
-from vllm.v1.core.kv_cache_utils import get_kv_cache_groups
+from vllm.v1.core.kv_cache_planning import get_kv_cache_groups
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     FullAttentionSpec,
@@ -65,6 +65,10 @@ from vllm_torchtpu import envs, utils
 from vllm_torchtpu.block_major_pool import (
     BlockMajorPoolLayout,
     unified_block_major_enabled,
+)
+from vllm_torchtpu.core.runner_slot_mamba import (
+    check_runner_slot_groups,
+    maybe_runner_slot_mamba_spec,
 )
 from vllm_torchtpu.kernels.mla import dispatch as mla_dispatch
 from vllm_torchtpu.kv_cache_materializer import (
@@ -252,6 +256,14 @@ class KVCacheManager:
                 self._update_mamba_page_size_padded(layers, block_size)
 
         hma_enabled = not self.runner.scheduler_config.disable_hybrid_kv_cache_manager
+        # Compact-mamba sizing (above) gave the GDN layers their own slot
+        # arrays, indexed by the runner's per-request slot ids: their scheduler
+        # blocks are never read.
+        runner_owns_mamba_slots = (
+            not self.runner._unified_kv_layout
+            and not self.runner._uniform_mamba_layout
+            and self.runner._mamba_num_blocks is not None
+        )
 
         kv_cache_spec: dict[str, KVCacheSpec] = {}
         # DSv4 layers whose specs must reach vLLM verbatim; see
@@ -265,7 +277,11 @@ class KVCacheManager:
             if isinstance(attn_module, MambaBase):
                 spec = attn_module.get_kv_cache_spec(self.runner.vllm_config)
                 if spec is not None:
-                    kv_cache_spec[layer_name] = spec
+                    kv_cache_spec[layer_name] = maybe_runner_slot_mamba_spec(
+                        spec,
+                        self.runner.vllm_config,
+                        runner_owns_slots=runner_owns_mamba_slots,
+                    )
             # DSv4's attention, SWA, compressor and indexer caches all build
             # their own specs, as the reference does.
             elif is_cache_for_ds_v4(attn_module):
@@ -420,6 +436,15 @@ class KVCacheManager:
                 )
             else:
                 continue
+
+        for layer_name, attn_module in layers.items():
+            if (
+                layer_name in kv_cache_spec
+                and getattr(attn_module, "is_draft_layer", False) is True
+            ):
+                kv_cache_spec[layer_name] = dataclasses.replace(
+                    kv_cache_spec[layer_name], is_draft=True
+                )
 
         # Note: that each shared layer's target actually owns a KV cache (and
         # that the shared layer was not itself allocated one) is enforced later
@@ -825,7 +850,7 @@ class KVCacheManager:
         #   e.g. 10 full-attn      + 30 mamba     → min (1 attn + 3 mamba)
         #
         # This duplicates the heuristic from
-        # `vllm/v1/core/kv_cache_utils.py::_get_kv_cache_groups_uniform_page_size`.
+        # `vllm/v1/core/kv_cache_planning.py::_get_kv_cache_groups_uniform_page_size`.
         # We can't call it directly because vLLM's grouping needs a fully
         # populated spec dict, while we need the group layout *before* we
         # can finish creating the specs (padding depends on grouping,
@@ -1380,6 +1405,8 @@ class KVCacheManager:
             for gid in range(len(self.runner.kv_cache_config.kv_cache_groups))
         }
         if self.runner._unified_kv_layout:
+            # The unified pool stores GDN state in the scheduler's blocks.
+            check_runner_slot_groups(kv_cache_config, runner_owns_slots=False)
             self._initialize_unified_kv_cache(kv_cache_config)
             return
         backend_cls = cast(
@@ -1878,11 +1905,14 @@ class KVCacheManager:
         # Initialize the compact-mamba slot allocator now that the true mamba
         # block count is known. When compact sizing was skipped, mamba shares
         # the attention `num_blocks`, so the pool spans that range instead.
+        owns_mamba_slots = False
         if (
             allocated_mamba_num_blocks is not None
             and not self.runner._uniform_mamba_layout
         ):
             self.runner._init_mamba_slot_pool(allocated_mamba_num_blocks)
+            owns_mamba_slots = True
+        check_runner_slot_groups(kv_cache_config, runner_owns_slots=owns_mamba_slots)
 
         # Compact pool counterpart of the read-offset buffer allocated in
         # `initialize_kv_cache`, indexed over the mamba slot pool rather

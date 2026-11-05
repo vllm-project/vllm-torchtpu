@@ -72,6 +72,13 @@ def get_dp_size(parallel_config) -> int:
     )
 
 
+def min_over_group(value: int, cpu_group: Any) -> int:
+    """Return the minimum of `value` over the ranks of a gloo `cpu_group`."""
+    t = torch.tensor([value], dtype=torch.int64, device="cpu")
+    torch.distributed.all_reduce(t, op=torch.distributed.ReduceOp.MIN, group=cpu_group)
+    return int(t.item())
+
+
 def min_across_ep_dp(parallel_config, value: int) -> int:
     """Return the minimum of `value` across the DP engines coupled by EP.
 
@@ -82,11 +89,7 @@ def min_across_ep_dp(parallel_config, value: int) -> int:
         return value
     from vllm.distributed.parallel_state import get_dp_group
 
-    t = torch.tensor([value], dtype=torch.int64, device="cpu")
-    torch.distributed.all_reduce(
-        t, op=torch.distributed.ReduceOp.MIN, group=get_dp_group().cpu_group
-    )
-    return int(t.item())
+    return min_over_group(value, get_dp_group().cpu_group)
 
 
 def hbm_usage_bytes(devices: Any) -> list[tuple[int, int]]:
