@@ -9,7 +9,10 @@ import jax
 import jax.numpy as jnp
 import torch
 
-from vllm_torchtpu.kernels.deepseek_v4.o_projection import wo_a_projection
+from vllm_torchtpu.kernels.deepseek_v4.o_projection import (
+    gather_cos_sin,
+    wo_a_projection,
+)
 from vllm_torchtpu.kernels.deepseek_v41.csa2.cache import (
     prepare_main_records,
     prepare_swa_metadata,
@@ -68,15 +71,15 @@ def _publish_swa_banked(
 
 def _inverse_rope(cos_sin: jax.Array, positions: jax.Array) -> jax.Array:
     # Q/K already carry RoPE; CSA2 consumes this small inverse-rotation table.
-    table = cos_sin[positions].astype(jnp.float32)
-    cos = jnp.concatenate(
-        (jnp.ones((positions.shape[0], 64)), jnp.repeat(table[:, :32], 2, axis=1)),
-        axis=1,
+    # The Pallas row gather gives [cos | sin] over the last 128 head lanes (an
+    # XLA gather of the full cache costs ~11 us). CSA2 pairs lane i with i ^ 1,
+    # so the inverse rotation's sin alternates sign on the roped lanes.
+    table = gather_cos_sin(positions, cos_sin, name="csa2_inverse_rope").reshape(
+        -1, 2, 128
     )
-    sin = jnp.repeat(table[:, 32:], 2, axis=1)
-    sin *= jnp.where(jnp.arange(64) % 2 == 0, 1.0, -1.0)
-    sin = jnp.concatenate((jnp.zeros((positions.shape[0], 64)), sin), axis=1)
-    return jnp.stack((cos, sin), axis=1)
+    lane = jnp.arange(128)
+    sign = jnp.where((lane >= 64) & (lane % 2 == 1), -1.0, 1.0)
+    return table * jnp.stack((jnp.ones(128), sign))[None]
 
 
 def _attend(
