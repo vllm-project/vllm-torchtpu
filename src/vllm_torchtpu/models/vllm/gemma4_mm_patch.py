@@ -70,7 +70,7 @@ def _lane_swap_rotate_half(x: Any) -> Any:
     head_dim = x.shape[-1]
     n = head_dim // 2
     partner, signs = _get_lane_swap_permutation(head_dim, n, x.device, x.dtype)
-    return x.gather(-1, partner.expand_as(x)) * signs
+    return x.gather(-1, partner.expand_as(x)) * signs.expand_as(x)
 
 
 setattr(_lane_swap_rotate_half, "_is_lane_swap_patched", True)  # noqa: B010
@@ -87,9 +87,14 @@ def patch_vision_mrope_lane_swap() -> None:
     modules_to_patch = [
         "transformers.models.gemma4.modeling_gemma4",
         "transformers.models.gemma4",
+        "transformers.models.gemma.modeling_gemma",
+        "transformers.models.gemma2.modeling_gemma2",
         "transformers.models.siglip.modeling_siglip",
         "transformers.models.siglip2.modeling_siglip2",
         "transformers.models.qwen2_vl.modeling_qwen2_vl",
+        "transformers.models.llama.modeling_llama",
+        "transformers.models.mistral.modeling_mistral",
+        "transformers.models.qwen2.modeling_qwen2",
         "vllm.model_executor.layers.rotary_embedding.common",
         "vllm.model_executor.layers.rotary_embedding",
     ]
@@ -116,7 +121,7 @@ def patch_vision_mrope_lane_swap() -> None:
                         mod_name,
                     )
 
-            # Also patch __globals__ of all functions in the module
+            # Also patch __globals__ of all functions and classes in the module
             for attr_name in dir(mod):
                 attr = getattr(mod, attr_name, None)
                 if callable(attr) and hasattr(attr, "__globals__"):
@@ -125,6 +130,15 @@ def patch_vision_mrope_lane_swap() -> None:
                         globs["rotate_half"], "_is_lane_swap_patched", False
                     ):
                         globs["rotate_half"] = _lane_swap_rotate_half
+                elif isinstance(attr, type):
+                    for class_attr_name in dir(attr):
+                        class_attr = getattr(attr, class_attr_name, None)
+                        if callable(class_attr) and hasattr(class_attr, "__globals__"):
+                            globs = class_attr.__globals__
+                            if "rotate_half" in globs and not getattr(
+                                globs["rotate_half"], "_is_lane_swap_patched", False
+                            ):
+                                globs["rotate_half"] = _lane_swap_rotate_half
         except Exception as e:
             logger.debug("Failed patching %s for lane-swap: %s", mod_name, e)
 
