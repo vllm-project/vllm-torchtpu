@@ -401,9 +401,11 @@ class TestBootstrapUnits(unittest.TestCase):
         pm_skip = replace(
             pm_base, labels=("skip-tpu-ci", "run-full-ci", "run-perf-eval")
         )
-        self.assertEqual(pm_skip.suite_label, "skip-tpu-ci")
+        self.assertFalse(pm_skip.runs_tpu)
+        self.assertEqual(pm_skip.extras, frozenset())
         pm_full = replace(pm_base, labels=("run-full-ci", "run-perf-eval"))
-        self.assertIsNone(pm_full.suite_label)
+        self.assertTrue(pm_full.runs_tpu)
+        self.assertEqual(pm_full.extras, frozenset())
         self.assertEqual(bp.choose_suite(pm_full), bp.SUITES["default"])
 
     def test_skip_docs_vllm_pin_and_merged_pr_parsing(self) -> None:
@@ -591,7 +593,7 @@ class TestBootstrapUnits(unittest.TestCase):
 
         # 4. Integration, post-merge skip-tpu-ci, merge-queue, /ci, full, and default.
         self.assertEqual(
-            bp.choose_suite(ctx({"CI_PRECHECK": "1", "CI_EXTRAS": "bogus"})).name,
+            bp.choose_suite(ctx({"CI_PRECHECK": "1", "CI_EXTRAS": "perf-eval"})).name,
             "pr+cpu-only",
         )
         with self.assertRaisesRegex(bp.BootstrapError, "CI_EXTRAS names 'bogus'"):
@@ -1044,7 +1046,7 @@ class TestBootstrapUnits(unittest.TestCase):
         )
         self.assertEqual(
             pr.annotations,
-            [("info", "ci-suite", f"CI suite: pr: {bp._PR_DEFAULT.about}")],
+            [("info", "ci-suite", f"CI suite: pr: {bp._PR_SUITES['pr'].about}")],
         )
         self.assertEqual(
             [u[0] for u in pr.uploads],

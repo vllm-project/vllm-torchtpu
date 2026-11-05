@@ -48,6 +48,8 @@ _GITHUB_API_URL = "https://api.github.com"
 # nightly, post-merge, and release builds run uncapped.
 PR_TPU_JOBS_PER_AUTHOR = 40
 
+_PR_SUITE_LABELS = ("skip-tpu-ci", "run-perf-eval", "run-full-ci")
+_LABEL_EXTRAS = {"run-full-ci": "nightly-suite", "run-perf-eval": "perf-eval"}
 _VALID_CI_EXTRAS = frozenset({"perf-eval", "nightly-suite"})
 _VALID_MERGE_EXTRAS = _VALID_CI_EXTRAS | {"precheck-only"}
 _PR_NUM_RE = re.compile(r"^[0-9]+$")
@@ -94,7 +96,7 @@ class BuildContext:
     ci_run_tpu: bool = False
     ci_precheck: bool = False
     ci_pr_tpu_opt_in: bool = False
-    ci_extras_raw: str = ""
+    ci_extras: tuple[str, ...] = ()
     mq_extras: tuple[str, ...] = ()
 
     @property
@@ -151,7 +153,7 @@ class BuildContext:
         """Raise `BootstrapError` if mutually exclusive PR suite labels are set."""
         if not self.is_pr or self.is_merge_queue:
             return
-        matches = [label for label in _PR_SUITES if label in self.labels]
+        matches = [label for label in _PR_SUITE_LABELS if label in self.labels]
         if len(matches) > 1:
             joined = ", ".join(matches)
             raise BootstrapError(
@@ -161,38 +163,32 @@ class BuildContext:
                 "page, then retry the **Bootstrap Pipeline** step."
             )
 
+    # Extras a PR-like build asked for, from whichever channel it came in on.
     @property
-    def suite_label(self) -> str | None:
-        self.check_suite_labels()
-        if self.ci_precheck:
-            return "skip-tpu-ci"
-        ci_extras = tuple(p.strip() for p in self.ci_extras_raw.split(",") if p.strip())
-        bad_extra = next((e for e in ci_extras if e not in _VALID_CI_EXTRAS), None)
-        if bad_extra is not None:
-            raise BootstrapError(
-                f"ERROR: CI_EXTRAS names '{bad_extra}'; "
-                "valid extras are: perf-eval, nightly-suite"
-            )
+    def extras(self) -> frozenset[str]:
         if self.is_merge_queue:
             if self.merge_queue_base_branch.startswith("releases/"):
-                return "run-full-ci"
-            if "precheck-only" in self.mq_extras:
-                return "skip-tpu-ci"
-            if "nightly-suite" in self.mq_extras:
-                return "run-full-ci"
-            if "perf-eval" in self.mq_extras:
-                return "run-perf-eval"
-            return None
-        if not self.ci_run_tpu and (
-            "skip-tpu-ci" in self.labels or (self.is_pr and self.ci_pr_tpu_opt_in)
-        ):
-            return "skip-tpu-ci"
-        if self.is_pr or self.ci_run_tpu:
-            if "nightly-suite" in ci_extras or "run-full-ci" in self.labels:
-                return "run-full-ci"
-            if "perf-eval" in ci_extras or "run-perf-eval" in self.labels:
-                return "run-perf-eval"
-        return None
+                # releases always run the nightly suite
+                return frozenset({"nightly-suite"})
+            return frozenset(self.mq_extras)  # from the /ci merge marker
+        from_labels = {
+            _LABEL_EXTRAS[label] for label in self.labels if label in _LABEL_EXTRAS
+        }
+        return frozenset(self.ci_extras) | (
+            from_labels if self.is_pr or self.ci_run_tpu else set()
+        )
+
+    # Whether this build runs TPU lanes at all.
+    @property
+    def runs_tpu(self) -> bool:
+        if self.ci_precheck or "precheck-only" in self.extras:
+            return False
+        if self.is_merge_queue or self.ci_run_tpu:  # queue and /ci run always run TPU
+            return True
+        if "skip-tpu-ci" in self.labels:
+            return False
+        # after cutover, PR pushes are CPU-only
+        return not (self.is_pr and self.ci_pr_tpu_opt_in)
 
     @classmethod
     def from_env(cls, env: Mapping[str, str]) -> BuildContext:
@@ -206,6 +202,15 @@ class BuildContext:
             raise BootstrapError(
                 "ERROR: SKIP_TPU_CI was removed; use the skip-tpu-ci PR label "
                 "(or 'bootstrap.py upload-stages build,cpu')"
+            )
+        ci_extras = tuple(
+            p.strip() for p in env.get("CI_EXTRAS", "").split(",") if p.strip()
+        )
+        bad_extra = next((e for e in ci_extras if e not in _VALID_CI_EXTRAS), None)
+        if bad_extra is not None:
+            raise BootstrapError(
+                f"ERROR: CI_EXTRAS names '{bad_extra}'; "
+                "valid extras are: perf-eval, nightly-suite"
             )
         pr_raw = _env_or(env, "BUILDKITE_PULL_REQUEST", "false")
         pull_request = None if pr_raw == "false" else pr_raw
@@ -241,7 +246,7 @@ class BuildContext:
             ci_run_tpu=_env_or(env, "CI_RUN_TPU", "0") == "1",
             ci_precheck=_env_or(env, "CI_PRECHECK", "0") == "1",
             ci_pr_tpu_opt_in=_env_or(env, "CI_PR_TPU_OPT_IN", "0") == "1",
-            ci_extras_raw=env.get("CI_EXTRAS", ""),
+            ci_extras=ci_extras,
         )
 
 
@@ -291,26 +296,25 @@ SUITES: dict[str, Suite] = {
     )
 }
 
-_PR_DEFAULT = Suite(
-    "pr",
-    "PR: TPU waits for the CPU checks",
-    stages=(_CPU_STAGE, _DEFAULT_TPU),
-)
-# Mutually exclusive PR suite labels (`ready` and `oncall-fix` are orthogonal).
-# `run-perf-eval` and `run-full-ci` share `_FULL_TPU`; `run-full-ci` also sets
-# `NIGHTLY=1` via `Suite.nightly` to unlock nightly-gated steps.
+# Two-stage PR suites (plus cpu-only). `run-perf-eval` and `run-full-ci` share
+# `_FULL_TPU`; `pr+full` also sets `NIGHTLY=1` via `Suite.nightly`.
 _PR_SUITES: dict[str, Suite] = {
-    "skip-tpu-ci": Suite(
+    "cpu-only": Suite(
         "pr+cpu-only",
         "CPU checks only (skip-tpu-ci)",
         stages=(_CPU_STAGE,),
     ),
-    "run-perf-eval": Suite(
+    "pr": Suite(
+        "pr",
+        "PR: TPU waits for the CPU checks",
+        stages=(_CPU_STAGE, _DEFAULT_TPU),
+    ),
+    "pr+perf": Suite(
         "pr+perf-eval",
         "PR: TPU and perf/eval wait for the CPU checks",
         stages=(_CPU_STAGE, _FULL_TPU),
     ),
-    "run-full-ci": Suite(
+    "pr+full": Suite(
         "pr+nightly-suite",
         "PR: full nightly suite waits for the CPU checks",
         stages=(_CPU_STAGE, _FULL_TPU),
@@ -328,15 +332,17 @@ def choose_suite(ctx: BuildContext) -> Suite:
                 f"suites are: {' '.join(SUITES)}"
             )
         return SUITES[ctx.suite_override]
-    if ctx.ci_precheck:
-        return _PR_SUITES["skip-tpu-ci"]
-    label = ctx.suite_label
+    ctx.check_suite_labels()
+    if not ctx.runs_tpu:
+        return _PR_SUITES["cpu-only"]
     if ctx.is_integration:
         return SUITES["integration"]
-    if label is not None:
-        return _PR_SUITES[label]
     if ctx.is_pr_like:
-        return _PR_DEFAULT
+        if "nightly-suite" in ctx.extras:
+            return _PR_SUITES["pr+full"]
+        if "perf-eval" in ctx.extras:
+            return _PR_SUITES["pr+perf"]
+        return _PR_SUITES["pr"]
     return SUITES["full"] if ctx.nightly_env or ctx.is_release else SUITES["default"]
 
 
