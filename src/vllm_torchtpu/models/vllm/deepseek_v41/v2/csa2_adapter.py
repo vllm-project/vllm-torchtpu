@@ -10,6 +10,7 @@ import jax.numpy as jnp
 import torch
 
 from vllm_torchtpu.kernels.deepseek_v4.o_projection import wo_a_projection
+from vllm_torchtpu.kernels.deepseek_v41 import output_projection
 from vllm_torchtpu.kernels.deepseek_v41.csa2.cache import (
     prepare_main_records,
     prepare_swa_metadata,
@@ -257,6 +258,24 @@ def _project(output: jax.Array, weight: jax.Array, scales: jax.Array) -> jax.Arr
     return wo_a_projection(output, weight, scales.reshape(-1), None)
 
 
+def _project_out(
+    output: jax.Array,
+    wa: jax.Array,
+    sa: jax.Array,
+    wb: jax.Array,
+    sb: jax.Array,
+) -> jax.Array:
+    # wo_a then wo_b. On v7 with the DSv4.1 weights the fused kernel runs at
+    # every token count, in token tiles beyond one VMEM-resident tile, and is
+    # bitwise equal to the two-kernel chain, which other contracts still run.
+    from vllm_torchtpu.layers.adapter.linear_common import _quantized_matmul_jax
+
+    sa = sa.reshape(-1)
+    if output_projection.is_supported(output, wa, sa, wb, sb):
+        return output_projection.fused_output_projection(output, wa, sa, wb, sb)
+    return _quantized_matmul_jax(wo_a_projection(output, wa, sa, None), wb, sb)
+
+
 def _manual_bridge(function, mesh, tensor_args, out_specs):
     from jax.sharding import PartitionSpec as P
 
@@ -342,6 +361,12 @@ def initialize_csa2_ops() -> None:
             _project,
             (P(),) * 3,
             lambda x, w, *_: x.new_empty((x.shape[0], w.shape[1])),
+        ),
+        (
+            "project_out",
+            _project_out,
+            (P(),) * 5,
+            lambda x, wa, sa, wb, sb: x.new_empty((x.shape[0], wb.shape[1])),
         ),
     )
     output_counts = {
@@ -509,6 +534,18 @@ def project(
     output: torch.Tensor, weight: torch.Tensor, scales: torch.Tensor
 ) -> torch.Tensor:
     return _ops["project"](output, weight, scales)
+
+
+def project_out(
+    output: torch.Tensor,
+    wa: torch.Tensor,
+    sa: torch.Tensor,
+    wb: torch.Tensor,
+    sb: torch.Tensor,
+) -> torch.Tensor:
+    """``wo_b(wo_a(output))``; ``wb`` is the canonical ``[k, n]`` FP8 weight
+    with a per-channel ``[n]`` scale."""
+    return _ops["project_out"](output, wa, sa, wb, sb)
 
 
 def prepare_swa(
