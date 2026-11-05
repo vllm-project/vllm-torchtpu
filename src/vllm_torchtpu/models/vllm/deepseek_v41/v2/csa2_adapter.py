@@ -9,6 +9,7 @@ import jax
 import jax.numpy as jnp
 import torch
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.deepseek_v4.o_projection import wo_a_projection
 from vllm_torchtpu.kernels.deepseek_v41.csa2.cache import (
     prepare_main_records,
@@ -139,7 +140,11 @@ def _gather_attend(
     bq: int,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
     records, counts = prepare_main_records(
-        selected, pages, main_starts, page_size=main_page_size
+        selected,
+        pages,
+        main_starts,
+        page_size=main_page_size,
+        onehot_requests=envs.TPU_ONEHOT_TABLE_LOOKUP,
     )
     output, words, scales = csa2_pipeline(
         q,
@@ -190,6 +195,7 @@ def _metadata(
         page_stride=page_stride,
         row_offset=row_offset,
         non_causal=non_causal,
+        onehot_requests=envs.TPU_ONEHOT_TABLE_LOOKUP,
     )
 
 
