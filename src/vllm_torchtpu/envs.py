@@ -62,6 +62,7 @@ if TYPE_CHECKING:
     TPU_FP8_LINEAR_W8A16_MAX_ROWS: int = 0
     TPU_FP8_DECODE_GEMV_MAX_ROWS: int = 0
     TPU_LM_HEAD_DECODE_GEMV_MAX_ROWS: int = 0
+    TPU_LM_HEAD_FP8_DECODE: bool = False
     MOE_REQUANTIZE_WEIGHT_DTYPE: str = "float8_e4m3fn"
     MOE_REQUANTIZE_BLOCK_SIZE: int | None = None
     TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL: bool | None = None
@@ -711,6 +712,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_LM_HEAD_DECODE_GEMV_MAX_ROWS": env_nonnegative_int(
         "TPU_LM_HEAD_DECODE_GEMV_MAX_ROWS", 0
     ),
+    # With TPU_LM_HEAD_DECODE_GEMV_MAX_ROWS: those logits buckets stream an FP8
+    # copy of the (bf16) LM head, quantized per vocab row at load.
+    "TPU_LM_HEAD_FP8_DECODE": env_bool("TPU_LM_HEAD_FP8_DECODE"),
     # Specify dtype for quantized MoE weights
     "MOE_REQUANTIZE_WEIGHT_DTYPE": lambda: os.getenv(
         "MOE_REQUANTIZE_WEIGHT_DTYPE", "float8_e4m3fn"
@@ -839,7 +843,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Maximum hidden-state row count (after any EP all-gather) for dense
     # expert MoE. 0 disables it; larger shapes and unsupported layouts use
-    # the original GMM path. This counts tokens, not tokens * topk.
+    # the original GMM path. This counts tokens, not tokens * topk; the
+    # kernel holds tokens * topk route ids and weights in SMEM, so keep it
+    # to decode-sized buckets.
     "TPU_MOE_DENSE_EXPERT_THRESHOLD": env_nonnegative_int(
         "TPU_MOE_DENSE_EXPERT_THRESHOLD", 0
     ),

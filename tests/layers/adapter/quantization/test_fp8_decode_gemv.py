@@ -309,3 +309,106 @@ def test_decode_matmul_nt_op_shape():
         w = torch.empty((256, 128), dtype=torch.bfloat16)
         out = linear_common._decode_matmul_nt_op(x, w)
     assert out.shape == (8, 256) and out.dtype == torch.bfloat16
+
+
+@pytest.mark.cpu_test
+def test_fp8_decode_matmul_takes_request_buckets_of_eight_rows():
+    # The LM head's logits rows are request buckets (8 at least), padded to a
+    # whole FP8 row tile inside the kernel.
+    x, w_q, w_s = _operands(8, 256, 1536)
+    ref = jax.jit(xla_quantized_matmul)(x, w_q, w_s)
+    out = decode_gemv.fp8_decode_matmul(
+        x, w_q, w_s, tile_bytes=256 * 512, interpret=True
+    )
+    np.testing.assert_array_equal(np.asarray(out), np.asarray(ref))
+    assert decode_gemv.supports(8, 2816, 131072, jnp.float8_e4m3fn, 1, row_multiple=8)
+    assert not decode_gemv.supports(8, 2816, 131072, jnp.float8_e4m3fn, 1)
+
+
+@pytest.mark.cpu_test
+def test_fp8_lm_head_weight_is_per_vocab_row_in_kn_layout():
+    w = jax.random.normal(jax.random.key(3), (384, 256), jnp.float32)
+    w = (w * jnp.linspace(0.01, 5.0, 384)[:, None]).astype(jnp.bfloat16)
+    w_q, scale = linear_common._fp8_lm_head_weight_jax(w)
+    assert w_q.shape == (256, 384) and w_q.dtype == jnp.float8_e4m3fn
+    assert scale.shape == (384,) and scale.dtype == jnp.float32
+    np.testing.assert_allclose(
+        np.asarray(scale),
+        np.abs(np.asarray(w, np.float32)).max(axis=1) / 448.0,
+        rtol=1e-6,
+    )
+    deq = np.asarray(w_q, np.float32).T * np.asarray(scale)[:, None]
+    np.testing.assert_allclose(deq, np.asarray(w, np.float32), rtol=0.07, atol=1e-3)
+
+
+def _fp8_reference_weight(w):
+    amax = w.float().abs().amax(dim=1)
+    scale = torch.where(amax == 0, torch.ones_like(amax), amax / 448.0)
+    w_q = (w.float() / scale[:, None]).clamp(-448, 448).to(torch.float8_e4m3fn)
+    return w_q.t().contiguous(), scale
+
+
+@pytest.mark.cpu_test
+def test_lm_head_fp8_copy_serves_small_buckets(monkeypatch):
+    from vllm_torchtpu.layers.adapter.quantization import unquantized
+
+    calls = []
+
+    def fake_fp8(x, w_q, w_s):
+        calls.append(("fp8", tuple(x.shape), tuple(w_q.shape)))
+        return (x.float() @ (w_q.float() * w_s)).to(x.dtype)
+
+    def fake_nt(x, w):
+        calls.append(("nt", tuple(x.shape)))
+        return torch.nn.functional.linear(x, w)
+
+    monkeypatch.setattr(unquantized, "fp8_lm_head_weight", _fp8_reference_weight)
+    monkeypatch.setattr(unquantized, "decode_fp8_lm_head", fake_fp8)
+    monkeypatch.setattr(unquantized, "decode_matmul_nt", fake_nt)
+    method = unquantized.VllmDecodeLMHeadMethod(16, fp8=True)
+    head = _head()
+    method.process_weights_after_loading(head)
+    assert method.fp8_rows == {8, 16}
+    x = torch.randn(8, 128).to(torch.bfloat16)
+    # The runner compiles apply() with Dynamo, which cannot trace jax's dtype
+    # queries: the bucket test must be plain Python by then.
+    out = torch.compile(
+        lambda rows: method.apply(head, rows), fullgraph=True, backend="eager"
+    )(x)
+    # The copy is the reference quantization of the bf16 weight.
+    w_q, scale = _fp8_reference_weight(head.weight)
+    torch.testing.assert_close(head.decode_fp8_weight, w_q, rtol=0, atol=0)
+    torch.testing.assert_close(out, (x.float() @ (w_q.float() * scale)).to(x.dtype))
+    assert calls == [("fp8", (8, 128), (128, 256))]
+    method.apply(head, torch.randn(32, 128).to(torch.bfloat16))  # above max_rows
+    method.apply(head, torch.randn(12, 128).to(torch.bfloat16))  # not a request bucket
+    assert calls == [("fp8", (8, 128), (128, 256))]
+
+
+@pytest.mark.cpu_test
+def test_lm_head_fp8_refuses_a_head_no_bucket_fits(monkeypatch):
+    from vllm_torchtpu.layers.adapter.quantization import unquantized
+
+    monkeypatch.setattr(unquantized, "fp8_lm_head_weight", _fp8_reference_weight)
+    method = unquantized.VllmDecodeLMHeadMethod(16, fp8=True)
+    # A vocab shard of 200 is not a whole number of 128-lane output tiles.
+    with pytest.raises(ValueError, match="no LM head bucket"):
+        method.process_weights_after_loading(_head(n=200))
+
+
+@pytest.mark.cpu_test
+def test_lm_head_fp8_needs_the_decode_buckets(monkeypatch):
+    from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
+
+    from vllm_torchtpu.layers.adapter.quantization.unquantized import (
+        VllmUnquantizedConfig,
+    )
+
+    head = MagicMock(spec=ParallelLMHead)
+    monkeypatch.setenv("TPU_LM_HEAD_FP8_DECODE", "1")
+    monkeypatch.setenv("TPU_LM_HEAD_DECODE_GEMV_MAX_ROWS", "0")
+    with pytest.raises(ValueError, match="TPU_LM_HEAD_DECODE_GEMV_MAX_ROWS"):
+        VllmUnquantizedConfig.get_quant_method(None, head, "lm_head")
+    monkeypatch.setenv("TPU_LM_HEAD_DECODE_GEMV_MAX_ROWS", "16")
+    method = VllmUnquantizedConfig.get_quant_method(None, head, "lm_head")
+    assert method.fp8 and method.max_rows == 16
