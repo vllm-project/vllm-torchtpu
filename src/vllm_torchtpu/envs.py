@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     TPU_DEEPSEEK_V41_CED: bool = False
     TPU_DEEPSEEK_V41_CED_IDENTITY_REPLAY: bool = False
+    TPU_DEEPSEEK_V41_ENGRAM_FUSED_HASH: bool = False
     TPU_DEEPSEEK_V41_IMPL: str = "v2"
     TPU_DEEPSEEK_V41_ENGRAM_CPU_OFFLOAD: bool = False
     TPU_DEEPSEEK_V41_ENGRAM_HBM: str = "auto"
@@ -408,6 +409,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # identity (v2/model.py). Outputs are unchanged.
     "TPU_DEEPSEEK_V41_CED_IDENTITY_REPLAY": env_bool(
         "TPU_DEEPSEEK_V41_CED_IDENTITY_REPLAY", default=False
+    ),
+    # Engram n-gram hash on device as one fused program with exact 64-bit
+    # arithmetic on uint32 pairs (kernels/engram_hash.py), instead of the
+    # eager int64 torch ops XLA emulates op by op. Hash ids are unchanged.
+    "TPU_DEEPSEEK_V41_ENGRAM_FUSED_HASH": env_bool(
+        "TPU_DEEPSEEK_V41_ENGRAM_FUSED_HASH", default=False
     ),
     # Deprecated aliases, resolved by the DSV41 serving-policy verifier.
     # Serving supports v2; v1 remains only as a standalone reference.

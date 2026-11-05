@@ -17,6 +17,7 @@ from vllm.config import get_current_vllm_config_or_none
 from vllm.models.deepseek_v41.common import engram as upstream
 
 from vllm_torchtpu import envs
+from vllm_torchtpu.kernels.engram_hash import engram_hash, hash_tables
 from vllm_torchtpu.layers.adapter.custom_ops.packed_suffix_op import packed_suffix
 from vllm_torchtpu.layers.adapter.upstream_bindings import (
     bind_device_ops,
@@ -111,6 +112,16 @@ class NgramHashState(upstream.NgramHashState):
             )
             return self._cache[slots]
 
+        if envs.TPU_DEEPSEEK_V41_ENGRAM_FUSED_HASH and input_ids.device.type != "cpu":
+            return self._fused_hash(
+                input_ids,
+                positions,
+                query_start_loc,
+                dead_mask,
+                lookback_token_ids,
+                lookback_dead_mask,
+                block_table,
+            )
         tables = (self.token_map, self.multipliers, self.primes, self.offsets)
         return self._hash(
             tables,
@@ -121,6 +132,58 @@ class NgramHashState(upstream.NgramHashState):
             lookback_token_ids,
             lookback_dead_mask,
             fallback,
+        )
+
+    def _fused_hash(
+        self,
+        input_ids,
+        positions,
+        query_start_loc,
+        dead_mask,
+        lookback_token_ids,
+        lookback_dead_mask,
+        block_table,
+    ):
+        """``_hash`` as one fused program (kernels/engram_hash.py)."""
+        fused = getattr(self, "_fused_tables", None)
+        if fused is None:
+            pad_id = int(self.pad_id)
+            token_map, multipliers, primes, offsets = (
+                np.asarray(t.to("cpu"), dtype=np.int64)
+                for t in (self.token_map, self.multipliers, self.primes, self.offsets)
+            )
+            limbs, primes, offsets = hash_tables(
+                token_map, multipliers, primes, offsets, pad_id
+            )
+            device = self.token_map.device
+            tables = tuple(
+                torch.from_numpy(t).to(device) for t in (limbs, primes, offsets)
+            )
+            fused = self._fused_tables = (pad_id, tables)
+        pad_id, tables = fused
+        use_cache = bool(self.use_slot_cache)
+        if use_cache:
+            assert self._cache is not None and block_table is not None
+            cache, table, block_size = self._cache, block_table, self.block_size
+        else:
+            # Unused operands; the static use_cache drops their reads.
+            cache, table, block_size = input_ids, lookback_token_ids, 1
+        return _fused_hash_op()(
+            self.token_map,
+            *tables,
+            input_ids.int(),
+            positions.int(),
+            query_start_loc.int(),
+            dead_mask,
+            lookback_token_ids.int(),
+            lookback_dead_mask,
+            cache,
+            table.int(),
+            self.lookback_depth,
+            block_size,
+            pad_id,
+            upstream.DEAD_ID,
+            use_cache,
         )
 
     def hash_on_host(
@@ -252,6 +315,54 @@ class NgramHashState(upstream.NgramHashState):
             None, :, :
         ]
         return hashed.to(torch.int32)
+
+
+_FUSED_HASH_OP = None
+
+
+def _fused_hash_op():
+    """Torch op for ``engram_hash``: 12 arrays, then 5 static arguments."""
+    global _FUSED_HASH_OP
+    if _FUSED_HASH_OP is None:
+        from jax.sharding import PartitionSpec as P
+        from torch_tpu._internal import pallas
+
+        from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
+            get_pallas_op_mesh,
+        )
+
+        def call(*args):
+            depth, block_size, pad_id, dead_id, use_cache = args[12:]
+            return engram_hash(
+                *args[:12],
+                lookback_depth=depth,
+                block_size=block_size,
+                pad_id=pad_id,
+                dead_id=dead_id,
+                use_cache=use_cache,
+            )
+
+        op = pallas.jax_op(
+            "pallas::dsv41_engram_fused_hash",
+            call,
+            mesh=get_pallas_op_mesh(),
+            input_partition_specs=cast(
+                tuple[tuple[str, ...], ...], (P(),) * 12 + (None,) * 5
+            ),
+        )
+        op.register_fake(
+            lambda token_map,
+            limbs,
+            primes,
+            offsets,
+            input_ids,
+            *_: input_ids.new_empty(
+                (input_ids.shape[0], limbs.shape[0], offsets.shape[1]),
+                dtype=torch.int32,
+            )
+        )
+        _FUSED_HASH_OP = op
+    return _FUSED_HASH_OP
 
 
 def _load_local_rows(param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
