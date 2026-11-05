@@ -1988,9 +1988,17 @@ def _patch_vllm_vocab_parallel_embedding() -> None:
     Prevents TorchTPU from baking rank-specific integer literals into the MLIR
     graph as scalar constants, ensuring identical CompilationCacheKeys across
     all TP ranks.
+
+    Also where TPU_DP_VOCAB_PARALLEL takes effect: stock embeddings and lm_heads
+    built without a parallel group of their own shard over every DP x TP rank
+    instead of the TP group (layers/adapter/dp_vocab_parallel.py).
     """
+    import inspect
+
     import torch
     import vllm.model_executor.layers.vocab_parallel_embedding as vpe
+
+    from vllm_torchtpu.layers.adapter import dp_vocab_parallel
 
     if getattr(
         vpe.VocabParallelEmbedding, "_tpu_vocab_parallel_embedding_patch", False
@@ -1998,9 +2006,34 @@ def _patch_vllm_vocab_parallel_embedding() -> None:
         return
 
     original_init = vpe.VocabParallelEmbedding.__init__
+    init_signature = inspect.signature(original_init)
 
     def patched_init(self, *args, **kwargs):
+        dp_vocab_group = None
+        # Only the stock classes, whose forward and logits path the DP-vocab
+        # module replaces; a subclass may run its own.
+        if envs.TPU_DP_VOCAB_PARALLEL and type(self) in (
+            vpe.VocabParallelEmbedding,
+            vpe.ParallelLMHead,
+        ):
+            call = init_signature.bind(self, *args, **kwargs)
+            call.apply_defaults()
+            arg = call.arguments
+            if (
+                arg["parallel_group"] is None
+                and not arg["disable_tp"]
+                and arg["reduce_results"]
+            ):
+                dp_vocab_group = dp_vocab_parallel.group_for_new_layer(
+                    arg["num_embeddings"],
+                    arg["org_num_embeddings"],
+                    arg["padding_size"],
+                )
+            if dp_vocab_group is not None:
+                kwargs["parallel_group"] = dp_vocab_group
         original_init(self, *args, **kwargs)
+        if dp_vocab_group is not None:
+            setattr(self, dp_vocab_parallel.DP_VOCAB_ATTR, True)
         if not hasattr(self, "org_vocab_start_index"):
             self.register_buffer(
                 "org_vocab_start_index",
@@ -2037,6 +2070,8 @@ def _patch_vllm_vocab_parallel_embedding() -> None:
             )
 
     def patched_forward(self, input_):
+        if getattr(self, dp_vocab_parallel.DP_VOCAB_ATTR, False):
+            return dp_vocab_parallel.embedding_forward(self, input_)
         input_mask = None
         if self.tp_size > 1:
             masked_input, input_mask = vpe.get_masked_input_and_mask(
