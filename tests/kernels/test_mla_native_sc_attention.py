@@ -14,6 +14,8 @@
 """Standalone sparse-attention tests for both physical cache layouts."""
 
 import functools
+import os
+import re
 from unittest import mock
 
 import jax
@@ -61,6 +63,38 @@ def _optimized_hlo(fn, *args) -> str:
         key=os.path.getmtime,
     )
     return open(files[-1]).read()
+
+
+def _mla_call_preds(hlo: str) -> tuple[list[str], dict[str, set[str]]]:
+    """The MLA kernel calls of the computation holding them, in schedule order,
+    and each one's transitive operands (names) within that computation."""
+    comps: dict[str, list[tuple[str, str]]] = {}
+    cur = None
+    for line in hlo.splitlines():
+        head = line.split("{")[0]
+        if line.rstrip().endswith("{") and "=" not in head:
+            cur = comps.setdefault(
+                head.split()[1 if head.startswith("ENTRY") else 0], []
+            )
+        elif line.strip() == "}":
+            cur = None
+        elif cur is not None and " = " in line:
+            cur.append((line.split(" = ")[0].split()[-1].lstrip("%"), line))
+    body = max(comps.values(), key=lambda c: sum("MLA-sparsecore" in ln for _, ln in c))
+    names = {n for n, _ in body}
+    # Operands only: cut the attributes (metadata, calls=, backend_config).
+    args = {n: re.split(r"\), [a-z_]+=", ln.split(" = ", 1)[1])[0] for n, ln in body}
+    ops = {
+        n: [a for a in re.findall(r"%?([\w.\-]+)", args[n]) if a in names and a != n]
+        for n, _ in body
+    }
+    preds: dict[str, set[str]] = {}
+    for n, _ in body:  # defs precede uses in HLO text
+        preds[n] = set()
+        for a in ops[n]:
+            preds[n] |= {a} | preds.get(a, set())
+    calls = [n for n, ln in body if "custom-call(" in ln and "MLA-sparsecore" in ln]
+    return calls, preds
 
 
 def _build_problem(rng, *, k_scale, query_tokens=128, topk=256, num_heads=8):
@@ -1815,6 +1849,64 @@ class SparseMlaCacheLayoutsTest(parameterized.TestCase):
         self.assertEqual(counts[0], query_tokens // 256, counts)
         self.assertEqual(counts[8], calls, counts)
 
+    @parameterized.parameters(
+        # (bucket, pieces, gathers first): one chunk per piece, two per piece.
+        (2048, 8, False),
+        (4096, 8, False),
+        (2048, 2, False),
+        (2048, 2, True),
+    )
+    def test_merge_pieces_order_bit_identical(self, query_tokens, pieces, gather_first):
+        """TPU_DCP_MLA_PIECE_ORDER only changes the schedule: every order's
+        outputs and lse equal the default ("barrier") bit for bit."""
+        if jax.devices()[0].platform != "tpu":
+            self.skipTest("SparseCore cache-layout attention requires a TPU")
+        run, _, _ = self._merge_pieces_run(query_tokens, (4, 4, query_tokens - 8))
+
+        def go(order):
+            return jax.block_until_ready(
+                run(
+                    out_pieces=pieces,
+                    out_pieces_gather_first=gather_first,
+                    out_pieces_order=order,
+                )
+            )
+
+        ref, ref_lse = go("barrier")
+        bits = lambda x: np.asarray(jax.lax.bitcast_convert_type(x, jnp.uint16))  # noqa: E731
+        for order in ("edge", "small_barrier", "none"):
+            out, lse = go(order)
+            np.testing.assert_array_equal(bits(out), bits(ref), err_msg=order)
+            np.testing.assert_array_equal(
+                np.asarray(lse).view(np.uint32),
+                np.asarray(ref_lse).view(np.uint32),
+                err_msg=order,
+            )
+
+    @parameterized.parameters(
+        ("edge", True), ("barrier", False), ("small_barrier", False)
+    )
+    def test_merge_pieces_order_edge_survives(self, order, ordered):
+        """In the optimized HLO, piece 1's first MLA call depends on piece 0's
+        last only with "edge": XLA removes optimization barriers before it
+        schedules, so the default leaves the calls free to run in any order."""
+        if jax.devices()[0].platform != "tpu":
+            self.skipTest("SparseCore cache-layout attention requires a TPU")
+        run, _, _ = self._merge_pieces_run(2048, (4, 4, 2040))
+
+        # Named `layers` for `_optimized_hlo`'s XLA-dump fallback glob.
+        def layers(dummy):
+            out, lse = run(out_pieces=2, out_pieces_order=order)
+            return out.astype(jnp.float32).sum() + lse.sum() + dummy
+
+        hlo = _optimized_hlo(jax.jit(layers), jnp.float32(0))
+        calls, preds = _mla_call_preds(hlo)
+        self.assertEqual(len(calls), 2048 // 256, calls)
+        half = len(calls) // 2
+        # Positive control: a piece's chunks always chain through its lse.
+        self.assertIn(calls[half], preds[calls[half + 1]])
+        self.assertEqual(calls[half - 1] in preds[calls[half]], ordered, order)
+
     def test_merge_pieces_supported(self):
         ok = sparse_mla.merge_pieces_supported
         self.assertTrue(ok(4096, 256, 8))
@@ -1962,6 +2054,39 @@ class SparseMlaCacheLayoutsTest(parameterized.TestCase):
                 distribution,
                 cache_layout=sparse_mla.SPARSECORE_CACHE_LAYOUT,
             )
+
+
+class MergePiecesOrderTest(parameterized.TestCase):
+    """TPU_DCP_MLA_PIECE_ORDER pieces that need no TPU."""
+
+    def test_rejects_unknown_order(self):
+        z = jnp.zeros((16, 8, HEAD_DIM), jnp.bfloat16)
+        with self.assertRaisesRegex(ValueError, "out_pieces_order"):
+            sparse_mla.sparse_ragged_paged_attention(
+                z, z, z, z, None, z, z, out_pieces_order="bogus"
+            )
+
+    def test_order_zero_is_zero_and_not_folded(self):
+        x = jnp.array(
+            [[v, 1.0] for v in (0.0, -np.inf, np.inf, np.nan, -1e30)], jnp.float32
+        )
+        for row in range(x.shape[0]):
+            self.assertEqual(int(sparse_mla._order_zero(x[row : row + 1])), 0)
+        fn = jax.jit(lambda a: sparse_mla._order_zero(a) + jnp.int32(5))
+        hlo = fn.lower(x).compile().as_text()
+        self.assertIn("compare", hlo)  # still reads `a`: the edge survives
+
+    def test_env_default_and_override(self):
+        from vllm_torchtpu import envs
+
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("TPU_DCP_MLA_PIECE_ORDER", None)
+            self.assertEqual(envs.TPU_DCP_MLA_PIECE_ORDER, "barrier")
+        with mock.patch.dict(os.environ, {"TPU_DCP_MLA_PIECE_ORDER": "edge"}):
+            self.assertEqual(envs.TPU_DCP_MLA_PIECE_ORDER, "edge")
+        for order in sparse_mla.PIECE_ORDERS:
+            self.assertIn(order, ("barrier", "edge", "small_barrier", "none"))
+        self.assertEqual(sparse_mla.PIECE_ORDERS[0], "barrier")
 
 
 if __name__ == "__main__":
