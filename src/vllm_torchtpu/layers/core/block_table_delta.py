@@ -11,8 +11,9 @@ block id each time a request crosses a block boundary in some group.
 `BlockTableDeltaStager` keeps the last uploaded packed buffer on device, plus a
 host mirror of its contents, for each staging layout. On the next walk with the
 same layout it diffs only the rows that may have changed against the mirror.
-It uploads the changed `(flat_index, value)` pairs as one fixed-size
-`int32[2, DELTA_CAPACITY]` tensor and scatters them into the device copy.
+It uploads the changed `(flat_index, value)` pairs as one `int32[2, bucket]`
+tensor, the smallest of `DELTA_BUCKETS` that holds them, and scatters them into
+the device copy.
 A walk with no changes uploads nothing. A walk with more changes than
 `DELTA_CAPACITY`, or with a new layout, falls back to the full upload.
 
@@ -43,6 +44,9 @@ import torch
 # 128 requests crossing a block boundary together in every one of 51 groups is
 # 6528 entries.
 DELTA_CAPACITY = 8192
+# Scatter sizes, each compiled at warm-up. A TensorCore scatter costs about its
+# size (8192 entries ~36 us); a decode step changes a few hundred at most.
+DELTA_BUCKETS = (256, 1024, DELTA_CAPACITY)
 # Staging layouts kept on device (target walk, drafter walk, chunk offsets).
 MAX_LAYOUTS = 4
 
@@ -167,7 +171,7 @@ class BlockTableDeltaStager:
 
     def __init__(self) -> None:
         self._layouts: OrderedDict[tuple, _Layout] = OrderedDict()
-        self._zero_update: dict[torch.device, torch.Tensor] = {}
+        self._zero_update: dict[torch.device, list[torch.Tensor]] = {}
         self.num_full = 0
         self.num_delta = 0
         self.num_reuse = 0
@@ -263,7 +267,8 @@ class BlockTableDeltaStager:
         self._layouts.move_to_end(key)
         count = len(idx)
         if count:
-            update = np.empty((2, DELTA_CAPACITY), dtype=np.int32)
+            capacity = next(size for size in DELTA_BUCKETS if size >= count)
+            update = np.empty((2, capacity), dtype=np.int32)
             update[0, :count] = idx
             update[1, :count] = vals
             update[0, count:] = idx[0]
@@ -313,13 +318,17 @@ class BlockTableDeltaStager:
         self.num_full += 1
 
     def warm(self, staged_dev: torch.Tensor) -> None:
-        """Compile the scatter for this layout during dummy runs (no-op update)."""
+        """Compile every scatter size for this layout during dummy runs."""
         device = staged_dev.device
-        zero = self._zero_update.get(device)
-        if zero is None:
-            zero = torch.zeros((2, DELTA_CAPACITY), dtype=torch.int32).to(device)
-            self._zero_update[device] = zero
-        apply_block_table_delta(staged_dev, zero)
+        zeros = self._zero_update.get(device)
+        if zeros is None:
+            zeros = [
+                torch.zeros((2, size), dtype=torch.int32).to(device)
+                for size in DELTA_BUCKETS
+            ]
+            self._zero_update[device] = zeros
+        for zero in zeros:
+            apply_block_table_delta(staged_dev, zero)
 
     def verify(self, key: tuple, expected_flat: torch.Tensor) -> None:
         """Raise unless the mirror and the device copy equal `expected_flat`."""
