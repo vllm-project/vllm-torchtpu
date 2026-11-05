@@ -1102,7 +1102,6 @@ def _patch_vllm_hybrid_pcp_block_sizes() -> None:
             scheduler_block_size,
             hash_block_size,
             metrics_collector=None,
-            num_hash_lookahead_tokens=0,
             num_prefill_lookahead=0,
             allow_partial_hash_hits: bool = True,
             **kwargs,
@@ -1176,7 +1175,6 @@ def _patch_vllm_hybrid_pcp_block_sizes() -> None:
                 scheduler_block_size,
                 hash_block_size,
                 metrics_collector,
-                num_hash_lookahead_tokens=num_hash_lookahead_tokens,
                 num_prefill_lookahead=num_prefill_lookahead,
                 allow_partial_hash_hits=allow_partial_hash_hits,
                 **kwargs,
@@ -1425,7 +1423,7 @@ def _patch_vllm_dcp_fine_prefix_hits() -> None:
     for module_name in (
         "vllm.v1.engine.core",
         "vllm.v1.kv_offload.base",
-        "vllm.distributed.kv_transfer.kv_connector.v1.offloading.config",
+        "vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler",
     ):
         module = sys.modules.get(module_name)
         if module is not None and hasattr(module, "resolve_kv_cache_block_sizes"):
