@@ -23,7 +23,12 @@ from vllm_torchtpu.kernels.experimental.moe_dense_expert import (
     can_use_dense_expert,
     dense_expert_moe,
 )
-from vllm_torchtpu.kernels.megablox.gmm_v2 import get_packing_factor, gmm_v2
+from vllm_torchtpu.kernels.megablox.gmm_v2 import (
+    get_packing_factor,
+    gmm_v2,
+    gmm_v2_mlp,
+    mlp_supported,
+)
 from vllm_torchtpu.kernels.megablox.moe_onehot_unpermute import (
     blockwise_onehot_unpermute,
     can_use_blockwise_onehot_unpermute,
@@ -185,6 +190,13 @@ def quantize_to_native_fp4_kmajor(
     return packed, scale
 
 
+def _is_fp4_weight(rhs) -> bool:
+    return (
+        jnp.issubdtype(rhs.dtype, jnp.floating)
+        and jax.dtypes.itemsize_bits(rhs.dtype) == 4
+    )
+
+
 def gmm_wrapper(
     lhs,
     rhs,
@@ -200,10 +212,7 @@ def gmm_wrapper(
     # fp4 weights: keep bf16 activations. Quantizing activations to fp8 collapses
     # fp4 accuracy (error compounds across MoE layers) with no decode speedup
     # (decode is weight-HBM-bound). fp8/int4 weights keep the default fp8 act.
-    is_fp4_weight = (
-        jnp.issubdtype(rhs.dtype, jnp.floating)
-        and jax.dtypes.itemsize_bits(rhs.dtype) == 4
-    )
+    is_fp4_weight = _is_fp4_weight(rhs)
     return gmm_v2(
         lhs=lhs,
         rhs=rhs,
@@ -215,6 +224,86 @@ def gmm_wrapper(
         fuse_act=fuse_act,
         preferred_element_type=preferred_element_type,
         maybe_quantize_lhs=not is_fp4_weight,
+        rhs_quant_dtype=rhs_quant_dtype,
+    )
+
+
+# Largest routed-row count (static GMM rows) that runs gate/up and down as one
+# kernel: decode and verify steps. Prefill chunks keep the two kernels.
+_MLP_KERNEL_MAX_ROWS = 4096
+
+
+def expert_mlp(
+    x,
+    w1,
+    w1_scale,
+    w1_bias,
+    w2,
+    w2_scale,
+    w2_bias,
+    group_sizes,
+    group_offset,
+    *,
+    activation,
+    rhs_quant_dtype=None,
+):
+    """Gate/up GMM with the fused activation, then the down GMM, per routed row.
+
+    Decode-sized steps run both in one kernel (`gmm_v2_mlp`, same results),
+    which streams every expert's weights once and keeps the activation in VMEM.
+    """
+    maybe_quantize_lhs = not _is_fp4_weight(w1)
+    if (
+        x.shape[0] <= _MLP_KERNEL_MAX_ROWS
+        and w1_bias is None
+        and w2_bias is None
+        and w1.dtype == w2.dtype
+        and mlp_supported(
+            x,
+            w1,
+            w1_scale,
+            w2,
+            w2_scale,
+            group_sizes,
+            fuse_act=activation,
+            maybe_quantize_lhs=maybe_quantize_lhs,
+            rhs_quant_dtype=rhs_quant_dtype,
+        )
+    ):
+        return gmm_v2_mlp(
+            x,
+            w1,
+            w2,
+            group_sizes,
+            w1_scale,
+            w2_scale,
+            group_offset[0],
+            fuse_act=activation,
+            maybe_quantize_lhs=maybe_quantize_lhs,
+            rhs_quant_dtype=rhs_quant_dtype,
+        )
+    gmm1_res = gmm_wrapper(
+        x,
+        w1,
+        w1_scale,
+        w1_bias,
+        group_sizes,
+        group_offset,
+        zero_initialize=False,
+        fuse_act=activation,
+        rhs_quant_dtype=rhs_quant_dtype,
+    )
+    packing_factor = get_packing_factor(w2.dtype, rhs_quant_dtype)
+    gmm1_res = gmm1_res[:, : w2.shape[1] * packing_factor]
+    return gmm_wrapper(
+        gmm1_res,
+        w2,
+        w2_scale,
+        w2_bias,
+        group_sizes,
+        group_offset,
+        zero_initialize=False,
+        preferred_element_type=x.dtype,
         rhs_quant_dtype=rhs_quant_dtype,
     )
 
@@ -419,32 +508,20 @@ def moe_gmm(
     """
     group_offset = jnp.array([0], dtype=jnp.int32)
 
-    gmm1_res = gmm_wrapper(
+    topk_weights = topk_weights_flat.reshape((num_tokens, topk))
+    valid_mask = valid_mask_flat.reshape((num_tokens, topk))
+
+    gmm2_res = expert_mlp(
         x,
         w1,
         w1_scale,
         w1_bias,
-        group_sizes,
-        group_offset,
-        zero_initialize=False,
-        fuse_act=activation,
-        rhs_quant_dtype=rhs_quant_dtype,
-    )
-    packing_factor = get_packing_factor(w2.dtype, rhs_quant_dtype)
-    gmm1_res = gmm1_res[:, : w2.shape[1] * packing_factor]
-
-    topk_weights = topk_weights_flat.reshape((num_tokens, topk))
-    valid_mask = valid_mask_flat.reshape((num_tokens, topk))
-
-    gmm2_res = gmm_wrapper(
-        gmm1_res,
         w2,
         w2_scale,
         w2_bias,
         group_sizes,
         group_offset,
-        zero_initialize=False,
-        preferred_element_type=x.dtype,
+        activation=activation,
         rhs_quant_dtype=rhs_quant_dtype,
     )
     # The destination-major kernel packs source indices into 20 bits and
@@ -614,28 +691,17 @@ def onehot_moe_local_routes(
     x = onehot @ hidden_states
     x = jnp.pad(x, ((0, 0), (0, padded_hidden_size - x.shape[1])))
     group_offset = jnp.array([0], dtype=jnp.int32)
-    gmm1_res = gmm_wrapper(
+    gmm2_res = expert_mlp(
         x,
         w1,
         w1_scale,
         w1_bias,
-        group_sizes,
-        group_offset,
-        zero_initialize=False,
-        fuse_act=activation,
-        rhs_quant_dtype=rhs_quant_dtype,
-    )
-    packing_factor = get_packing_factor(w2.dtype, rhs_quant_dtype)
-    gmm1_res = gmm1_res[:, : w2.shape[1] * packing_factor]
-    gmm2_res = gmm_wrapper(
-        gmm1_res,
         w2,
         w2_scale,
         w2_bias,
         group_sizes,
         group_offset,
-        zero_initialize=False,
-        preferred_element_type=x.dtype,
+        activation=activation,
         rhs_quant_dtype=rhs_quant_dtype,
     )
     # Rows past the computed prefix are never written by the GMM.

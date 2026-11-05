@@ -1441,3 +1441,583 @@ def gmm_v2(
         cost_estimate=get_cost_estimate(cfgs),
         metadata=get_metadata(cfgs),
     )(group_sizes, group_offset, lhs, rhs_weights)[:size_m, : cfgs.out_size_n]
+
+
+# Gate/up and down projections of a MoE layer in one kernel.
+#
+# Each expert's weights stream through VMEM slots by explicit DMAs: the gate/up
+# weights in `num_parts` column parts, then the down weights in `down_parts`
+# column parts. A slot is refilled with the next expert's weights as soon as the
+# matmul that reads it finishes, so every copy overlaps the other parts'
+# matmuls and no expert waits on its own weights after the first. The
+# activation stays in VMEM. Every row gets the arithmetic of `gmm_v2` gate/up
+# (fused activation) followed by `gmm_v2` down: same 256-wide column blocks,
+# same block-scale multiplies and the same f32 accumulation order, and the
+# activation rows are rounded the way the gate/up kernel stores them.
+
+
+@dataclasses.dataclass(frozen=True)
+class MlpConfigs:
+    up: GmmConfigs  # gate/up projection with the fused activation
+    down: GmmConfigs  # down projection
+    num_parts: int  # column parts of the gate/up weights per expert
+    down_parts: int  # column parts of the down weights per expert
+    bucket_base: int  # row bucket of the matmuls
+
+    @property
+    def size_inter(self) -> int:
+        return self.up.out_size_n
+
+    @property
+    def part_size(self) -> int:
+        return self.size_inter // self.num_parts
+
+    @property
+    def down_part_size(self) -> int:
+        return self.down.dims.size_n // self.down_parts
+
+
+def make_mlp_configs(
+    lhs: jax.Array,
+    w1: jax.Array,
+    w1_scale: jax.Array | None,
+    w2: jax.Array,
+    w2_scale: jax.Array | None,
+    group_sizes: jax.Array,
+    group_offset: jax.Array,
+    *,
+    fuse_act: str,
+    num_parts: int,
+    down_parts: int,
+    bucket_rows: int | None,
+    maybe_quantize_lhs: bool = False,
+    rhs_quant_dtype: jnp.dtype | None = None,
+) -> MlpConfigs | None:
+    """Configs of the fused gate/up + down kernel, or None if it does not apply.
+
+    The two projections keep the tiles `gmm_v2` picks for them; the fused
+    kernel tiles rows like the gate/up kernel. It requires one k and one n tile
+    for each, weights scaled after the matmul per 256+ block, unquantized
+    activations, no bias and no packing.
+    """
+
+    # Tiles as gmm_v2 picks them with its default VMEM limit.
+    vmem_limit_bytes = int(pltpu.get_tpu_info().vmem_capacity_bytes * 0.9)
+    up = make_gmm_configs(
+        lhs,
+        w1,
+        w1_scale,
+        None,
+        group_sizes,
+        group_offset,
+        tile_info=calculate_tiling,
+        vmem_limit_bytes=vmem_limit_bytes,
+        out_dtype=None,
+        acc_dtype=None,
+        maybe_quantize_lhs=maybe_quantize_lhs,
+        zero_initialize=False,
+        fuse_act=fuse_act,
+        rhs_quant_dtype=rhs_quant_dtype,
+    )
+    inter = jax.ShapeDtypeStruct((lhs.shape[0], up.out_size_n), up.out_dtype)
+    down = make_gmm_configs(
+        inter,
+        w2,
+        w2_scale,
+        None,
+        group_sizes,
+        group_offset,
+        tile_info=calculate_tiling,
+        vmem_limit_bytes=vmem_limit_bytes,
+        out_dtype=lhs.dtype,
+        acc_dtype=None,
+        maybe_quantize_lhs=maybe_quantize_lhs,
+        zero_initialize=False,
+        fuse_act=None,
+        rhs_quant_dtype=rhs_quant_dtype,
+    )
+    bucket_base = bucket_rows or up.tiles.bucket_base
+    cfgs = MlpConfigs(
+        up=up,
+        down=down,
+        num_parts=num_parts,
+        down_parts=down_parts,
+        bucket_base=bucket_base,
+    )
+    num_lanes = pltpu.get_tpu_info().num_lanes
+    mxu_size = pltpu.get_tpu_info().mxu_column_size
+    for c in (up, down):
+        if (
+            c.rhs_cfgs.should_unpack
+            or c.rhs_cfgs.has_bias
+            or not c.rhs_cfgs.should_dequantize_after_matmul
+            or c.lhs_cfgs.should_quantize
+            or c.tiles.tile_k != c.dims.size_k
+            or c.tiles.tile_n * (2 if c.fuse_act else 1) != c.dims.size_n
+        ):
+            return None
+    if (
+        down.dims.size_k != up.out_size_n
+        or up.out_size_n % num_parts
+        or down.dims.size_n % down_parts
+        # Each part holds whole 256-wide column blocks (interleaved gate/up).
+        or (2 * cfgs.part_size) % mxu_size
+        or cfgs.part_size % num_lanes
+        or cfgs.down_part_size % mxu_size
+        or up.tiles.tile_m % bucket_base
+        or bucket_base % up.dims.size_lhs_sublane
+    ):
+        return None
+    return cfgs
+
+
+def mlp_kernel_main(
+    # Scalar prefetch
+    lhs_group_sizes_ref: jax.Array,  # int32[size_lhs_group]
+    group_offset_ref: jax.Array,  # int32[1]
+    # In
+    lhs_ref: jax.Array,  # [size_m, size_k]
+    w1_ref: jax.Array,  # [size_group, size_k, 2 * size_inter]
+    s1_ref: jax.Array,  # [size_group, num_blocks, 1, 2 * size_inter]
+    w2_ref: jax.Array,  # [size_group, size_inter, size_n]
+    s2_ref: jax.Array,  # [size_group, num_blocks, 1, size_n]
+    # Out
+    out_ref: jax.Array,  # [size_m, size_n]
+    # Scratch memory
+    w1_gate_slots: jax.Array,  # [num_parts, size_k, part_size]
+    w1_up_slots: jax.Array,  # [num_parts, size_k, part_size]
+    s1_gate_slots: jax.Array,  # [num_parts, num_blocks, 1, part_size]
+    s1_up_slots: jax.Array,  # [num_parts, num_blocks, 1, part_size]
+    w2_slots: jax.Array,  # [down_parts, size_inter, down_part_size]
+    s2_slots: jax.Array,  # [down_parts, num_blocks, 1, down_part_size]
+    inter_ref: jax.Array,  # [tile_m // size_lhs_sublane, size_lhs_sublane, size_inter]
+    partial_out_ref: jax.Array,  # [size_lhs_sublane, size_n]
+    metadata_ref: MetadataRef,
+    sems: jax.Array,  # DMA[num_parts + down_parts]
+    *,
+    cfgs: MlpConfigs,
+):
+    """Entry point of the fused gate/up + down kernel (see MlpConfigs)."""
+
+    up, down = cfgs.up, cfgs.down
+    dims = up.dims
+    sub = dims.size_lhs_sublane
+    tile_m = up.tiles.tile_m
+    bucket_base = cfgs.bucket_base
+    size_k = dims.size_k
+    size_inter = cfgs.size_inter
+    part = cfgs.part_size
+    down_part = cfgs.down_part_size
+    size_n = down.dims.size_n
+    mxu_size = pltpu.get_tpu_info().mxu_column_size
+
+    def up_copies(p, group_id):
+        c0 = p * part
+        sem = sems.at[p]
+        return (
+            pltpu.make_async_copy(
+                w1_ref.at[group_id, :, pl.ds(c0, part)], w1_gate_slots.at[p], sem
+            ),
+            pltpu.make_async_copy(
+                w1_ref.at[group_id, :, pl.ds(size_inter + c0, part)],
+                w1_up_slots.at[p],
+                sem,
+            ),
+            pltpu.make_async_copy(
+                s1_ref.at[group_id, :, :, pl.ds(c0, part)], s1_gate_slots.at[p], sem
+            ),
+            pltpu.make_async_copy(
+                s1_ref.at[group_id, :, :, pl.ds(size_inter + c0, part)],
+                s1_up_slots.at[p],
+                sem,
+            ),
+        )
+
+    def down_copies(q, group_id):
+        c0 = q * down_part
+        sem = sems.at[cfgs.num_parts + q]
+        return (
+            pltpu.make_async_copy(
+                w2_ref.at[group_id, :, pl.ds(c0, down_part)], w2_slots.at[q], sem
+            ),
+            pltpu.make_async_copy(
+                s2_ref.at[group_id, :, :, pl.ds(c0, down_part)], s2_slots.at[q], sem
+            ),
+        )
+
+    def start(copies):
+        for c in copies:
+            c.start()
+
+    def wait(copies):
+        for c in copies:
+            c.wait()
+
+    # The first tile's weights start copying before the metadata loop: the
+    # first local group with rows, which fill_metadata assigns to tile 0.
+    group_offset = group_offset_ref[0]
+    max_num_group = group_offset + dims.size_group
+
+    def is_empty(lhs_group_id):
+        size = lhs_group_sizes_ref[jnp.minimum(lhs_group_id, max_num_group - 1)]
+        return jnp.logical_and(lhs_group_id < max_num_group, size <= 0)
+
+    first_lhs_group = lax.while_loop(is_empty, lambda i: i + 1, group_offset)
+
+    @pl.when(first_lhs_group < max_num_group)
+    def _():
+        group_id = first_lhs_group - group_offset
+        for p in range(cfgs.num_parts):
+            start(up_copies(p, group_id))
+        for q in range(cfgs.down_parts):
+            start(down_copies(q, group_id))
+
+    num_gm = fill_metadata(lhs_group_sizes_ref, group_offset_ref, metadata_ref, cfgs=up)
+
+    def scaled_matmul(tiled_lhs, rhs: RhsRef, c: GmmConfigs, bucket_m: int):
+        """Step 2 of `inner_kernel._matmul` on the unquantized-lhs path."""
+        tiled_rhs = rhs.get_weight()
+        rhs_tile_n = tiled_rhs.shape[1]
+        rhs_qbs = c.rhs_cfgs.quant_block_size
+        acc_list = []
+        for start_n in range(0, rhs_tile_n, mxu_size):
+            end_n = min(rhs_tile_n, start_n + mxu_size)
+            col_size = end_n - start_n
+
+            acc_n = jnp.zeros((bucket_m, col_size), dtype=c.acc_dtype)
+            for start_k in range(0, c.tiles.tile_k, rhs_qbs):
+                end_k = min(c.tiles.tile_k, start_k + rhs_qbs)
+
+                block_acc = jnp.matmul(
+                    tiled_lhs[:, start_k:end_k],
+                    tiled_rhs[start_k:end_k, start_n:end_n],
+                    preferred_element_type=jnp.float32,
+                ).astype(c.acc_dtype)
+
+                b_id = start_k // rhs_qbs
+                rhs_scale_replicated = rhs.get_scale(replicate_size=bucket_m)[
+                    b_id, :, start_n : start_n + col_size
+                ]
+                block_acc *= rhs_scale_replicated.astype(c.acc_dtype)
+
+                acc_n += block_acc
+            acc_list.append(acc_n)
+        return jnp.concatenate(acc_list, axis=1)
+
+    def body(tiled_lhs_ref, tiled_out_ref):
+        gm_id = pl.program_id(0)
+        group_id = metadata_ref.gm_id_to_group_id[gm_id]
+        prev_group_id = metadata_ref.gm_id_to_group_id[jnp.maximum(gm_id - 1, 0)]
+        is_new_group = jnp.logical_or(gm_id == 0, prev_group_id != group_id)
+        has_next = gm_id + 1 < num_gm
+        next_group_id = metadata_ref.gm_id_to_group_id[
+            jnp.minimum(gm_id + 1, num_gm - 1)
+        ]
+        fetch_next = jnp.logical_and(has_next, next_group_id != group_id)
+
+        m_start = metadata_ref.gm_id_to_m_offset[gm_id]
+        m_end = metadata_ref.gm_id_to_m_offset[gm_id + 1]
+        m_offset = m_start - m_start % sub
+        m_start_local = m_start - m_offset
+        m_end_local = m_end - m_offset
+
+        def row_mask(shape):
+            iota = lax.broadcasted_iota(jnp.int32, shape, 0)
+            return jnp.logical_and(m_start_local <= iota, iota < m_end_local)
+
+        def up_part(p: int, bucket_m: int):
+            tiled_lhs = tiled_lhs_ref.reshape(-1, size_k)[:bucket_m]
+            gate = WeightsRef(
+                weight=w1_gate_slots.at[p], scale=s1_gate_slots.at[p], bias=None
+            )
+            up_w = WeightsRef(
+                weight=w1_up_slots.at[p], scale=s1_up_slots.at[p], bias=None
+            )
+            acc = scaled_matmul(
+                tiled_lhs, FusedWeightsRef(gate=gate, up=up_w), up, bucket_m
+            )
+            acc = apply_act_fn(acc, up.fuse_act)
+            acc_masked = jnp.where(row_mask(acc.shape), acc, 0)
+            inter_2d = inter_ref.reshape(-1, size_inter)
+            inter_2d[:bucket_m, p * part : (p + 1) * part] = acc_masked.astype(
+                inter_ref.dtype
+            )
+
+        def down_part_fn(q: int, bucket_m: int):
+            tiled_lhs = inter_ref.reshape(-1, size_inter)[:bucket_m]
+            rhs = WeightsRef(weight=w2_slots.at[q], scale=s2_slots.at[q], bias=None)
+            acc = scaled_matmul(tiled_lhs, rhs, down, bucket_m)
+            acc_masked = jnp.where(row_mask(acc.shape), acc, 0)
+            tiled_out_2d_ref = tiled_out_ref.reshape(-1, size_n)
+            tiled_out_2d_ref[:bucket_m, q * down_part : (q + 1) * down_part] = (
+                acc_masked.astype(tiled_out_ref.dtype)
+            )
+
+        bucket_ms = [bucket_base * (i + 1) for i in range(tile_m // bucket_base)]
+        bucket_idx = m_end_local // bucket_base
+
+        for p in range(cfgs.num_parts):
+            with jax.named_scope(f"mlp_wait_up{p}"):
+
+                @pl.when(is_new_group)
+                def _():
+                    wait(up_copies(p, group_id))
+
+            with jax.named_scope(f"mlp_up{p}"):
+                lax.switch(
+                    bucket_idx,
+                    [functools.partial(up_part, p, b) for b in bucket_ms],
+                )
+
+            @pl.when(fetch_next)
+            def _():
+                start(up_copies(p, next_group_id))
+
+        # The gate/up kernel stores its rows with `out[0] += partial`, and the
+        # next tile adds this tile's last partial sublane block: x + 0 there.
+        inter_ref[0] = inter_ref[0] + jnp.zeros_like(inter_ref[0])
+
+        @pl.when(jnp.logical_and(m_end_local % sub != 0, has_next))
+        def _():
+            last_row = m_end_local // sub
+            inter_ref[last_row] = inter_ref[last_row] + jnp.zeros_like(inter_ref[0])
+
+        for q in range(cfgs.down_parts):
+            with jax.named_scope(f"mlp_wait_down{q}"):
+
+                @pl.when(is_new_group)
+                def _():
+                    wait(down_copies(q, group_id))
+
+            with jax.named_scope(f"mlp_down{q}"):
+                lax.switch(
+                    bucket_idx,
+                    [functools.partial(down_part_fn, q, b) for b in bucket_ms],
+                )
+
+            @pl.when(fetch_next)
+            def _():
+                start(down_copies(q, next_group_id))
+
+        # Output rows as the down kernel stores them (see inner_kernel).
+        partial_out_zeros = jnp.zeros_like(partial_out_ref)
+        tiled_out_ref[0] += jnp.where(
+            gm_id == 0, partial_out_zeros, partial_out_ref[...]
+        )
+        last_row = m_end_local // sub
+        partial_out_ref[...] = jnp.where(
+            m_end_local % sub == 0,
+            partial_out_zeros,
+            tiled_out_ref[last_row],
+        )
+
+    index_maps = MlpIndexMaps(metadata_ref, sub)
+    bounded = pl.BoundedSlice(tile_m // sub)
+    lhs_spec = pl.BlockSpec((bounded, sub, size_k), index_maps.lhs_index_map)
+    out_spec = pl.BlockSpec((bounded, sub, size_n), index_maps.out_index_map)
+    pipeline_fn = pltpu.emit_pipeline(
+        body, grid=(num_gm,), in_specs=(lhs_spec,), out_specs=out_spec
+    )
+    lhs_in = lhs_ref.reshape(-1, sub, lhs_ref.shape[-1])
+    out_in = out_ref.reshape(-1, sub, out_ref.shape[-1])
+    pipeline_fn(lhs_in, out_in)
+
+
+def mlp_supported(
+    lhs: jax.Array,
+    w1: jax.Array,
+    w1_scale: jax.Array | None,
+    w2: jax.Array,
+    w2_scale: jax.Array | None,
+    group_sizes: jax.Array,
+    *,
+    fuse_act: str | None,
+    num_parts: int = 2,
+    down_parts: int = 1,
+    bucket_rows: int | None = None,
+    maybe_quantize_lhs: bool = False,
+    rhs_quant_dtype: jnp.dtype | None = None,
+) -> bool:
+    """Whether `gmm_v2_mlp` takes these inputs (static shapes and dtypes)."""
+
+    if fuse_act is None or w1_scale is None or w2_scale is None:
+        return False
+    if w1_scale.ndim != 4 or w2_scale.ndim != 4:
+        return False
+    sub = _get_lhs_sublane_size(lhs.dtype, lhs.shape[0])
+    padded = jax.ShapeDtypeStruct(
+        (align_to(lhs.shape[0], sub), lhs.shape[1]), lhs.dtype
+    )
+    cfgs = make_mlp_configs(
+        padded,
+        w1,
+        w1_scale,
+        w2,
+        w2_scale,
+        group_sizes,
+        jax.ShapeDtypeStruct((1,), jnp.int32),
+        fuse_act=fuse_act,
+        num_parts=num_parts,
+        down_parts=down_parts,
+        bucket_rows=bucket_rows,
+        maybe_quantize_lhs=maybe_quantize_lhs,
+        rhs_quant_dtype=rhs_quant_dtype,
+    )
+    return cfgs is not None
+
+
+class MlpIndexMaps:
+    """Row windows of the fused kernel's single grid axis (gm tiles)."""
+
+    def __init__(self, metadata_ref: MetadataRef, size_lhs_sublane: int):
+        self.metadata_ref = metadata_ref
+        self.sub = size_lhs_sublane
+
+    def lhs_index_map(self, gm_id: jax.Array):
+        m_start = self.metadata_ref.gm_id_to_m_offset[gm_id]
+        m_end = self.metadata_ref.gm_id_to_m_offset[gm_id + 1]
+        row_start = m_start // self.sub
+        row_end = pl.cdiv(m_end, self.sub)
+        return (pl.ds(row_start, row_end - row_start), 0, 0)
+
+    def out_index_map(self, gm_id: jax.Array):
+        is_last_gm = gm_id == (pl.num_programs(0) - 1)
+        m_start = self.metadata_ref.gm_id_to_m_offset[gm_id]
+        m_end = self.metadata_ref.gm_id_to_m_offset[gm_id + 1]
+        row_start = m_start // self.sub
+        capped_row_end = m_end // self.sub
+        last_row_end = pl.cdiv(m_end, self.sub)
+        row_end = jnp.where(is_last_gm, last_row_end, capped_row_end)
+        return (pl.ds(row_start, row_end - row_start), 0, 0)
+
+
+@jax.jit(
+    static_argnames=[
+        "fuse_act",
+        "num_parts",
+        "down_parts",
+        "bucket_rows",
+        "vmem_limit_bytes",
+        "maybe_quantize_lhs",
+        "rhs_quant_dtype",
+    ]
+)
+def gmm_v2_mlp(
+    lhs: jax.Array,  # [size_m, size_k]
+    w1: jax.Array,  # [size_group, size_k, 2 * size_inter]
+    w2: jax.Array,  # [size_group, size_inter, size_n]
+    group_sizes: jax.Array,  # int32[size_lhs_group]
+    w1_scale: jax.Array,  # [size_group, num_blocks, 1, 2 * size_inter]
+    w2_scale: jax.Array,  # [size_group, num_blocks, 1, size_n]
+    group_offset: jax.Array | None = None,  # int32[1]
+    *,
+    fuse_act: str,
+    num_parts: int = 2,
+    down_parts: int = 1,
+    bucket_rows: int | None = None,
+    vmem_limit_bytes: int | None = None,
+    maybe_quantize_lhs: bool = True,
+    rhs_quant_dtype: jnp.dtype | None = None,
+) -> jax.Array:
+    """`gmm_v2(gmm_v2(lhs, w1, fuse_act), w2)` in one kernel, same results.
+
+    Rows past the routed rows are not written, as in `gmm_v2` without zero
+    initialization. Raises ValueError if the shapes or dtypes are not supported
+    (see `make_mlp_configs`); `mlp_supported` tells beforehand.
+    """
+
+    size_m = lhs.shape[0]
+    size_lhs_sublane = _get_lhs_sublane_size(lhs.dtype, size_m)
+    padded_size_m = align_to(size_m, size_lhs_sublane)
+    if padded_size_m != size_m:
+        lhs = jnp.pad(lhs, ((0, padded_size_m - size_m), (0, 0)))
+
+    if group_offset is None:
+        group_offset = jnp.array([0], dtype=jnp.int32)
+    elif jnp.isscalar(group_offset):
+        group_offset = group_offset[None]
+
+    if vmem_limit_bytes is None:
+        # The weight slots, row tiles and the matmul temporaries of the
+        # 128-row bucket need ~58 MiB at the Qwen3.8 expert shapes.
+        vmem_limit_bytes = int(pltpu.get_tpu_info().vmem_capacity_bytes * 0.96)
+
+    cfgs = make_mlp_configs(
+        lhs,
+        w1,
+        w1_scale,
+        w2,
+        w2_scale,
+        group_sizes,
+        group_offset,
+        fuse_act=fuse_act,
+        num_parts=num_parts,
+        down_parts=down_parts,
+        bucket_rows=bucket_rows,
+        maybe_quantize_lhs=maybe_quantize_lhs,
+        rhs_quant_dtype=rhs_quant_dtype,
+    )
+    if cfgs is None:
+        raise ValueError("gmm_v2_mlp does not support these inputs")
+    up, down = cfgs.up, cfgs.down
+    dims = up.dims
+    sub = dims.size_lhs_sublane
+    tiles = up.tiles
+    part = cfgs.part_size
+    down_part = cfgs.down_part_size
+    size_n = down.dims.size_n
+
+    w1_scale = w1_scale.astype(jnp.float32)
+    w2_scale = w2_scale.astype(jnp.float32)
+    nb1 = w1_scale.shape[1]
+    nb2 = w2_scale.shape[1]
+
+    max_num_gm = dims.size_group + pl.cdiv(dims.size_m, tiles.tile_m) - 1
+    scratch_shapes = [
+        pltpu.VMEM((num_parts, dims.size_k, part), w1.dtype),
+        pltpu.VMEM((num_parts, dims.size_k, part), w1.dtype),
+        pltpu.VMEM((num_parts, nb1, 1, part), jnp.float32),
+        pltpu.VMEM((num_parts, nb1, 1, part), jnp.float32),
+        pltpu.VMEM((down_parts, cfgs.size_inter, down_part), w2.dtype),
+        pltpu.VMEM((down_parts, nb2, 1, down_part), jnp.float32),
+        pltpu.VMEM((tiles.tile_m // sub, sub, cfgs.size_inter), up.out_dtype),
+        pltpu.VMEM((sub, size_n), down.out_dtype),
+        MetadataRef(
+            gm_id_to_group_id=pltpu.SMEM((max_num_gm,), jnp.int32),
+            gm_id_to_m_offset=pltpu.SMEM((max_num_gm + 1,), jnp.int32),
+        ),
+        pltpu.SemaphoreType.DMA((num_parts + down_parts,)),
+    ]
+
+    num_lanes = pltpu.get_tpu_info().num_lanes
+    aligned_n = align_to(size_n, num_lanes)
+    out_init = jax.ShapeDtypeStruct((dims.size_m, aligned_n), down.out_dtype)
+    cost_up = get_cost_estimate(up)
+    cost_down = get_cost_estimate(down)
+    cost = pl.CostEstimate(
+        flops=cost_up.flops + cost_down.flops,
+        bytes_accessed=cost_up.bytes_accessed + cost_down.bytes_accessed,
+        transcendentals=0,
+    )
+    name = (
+        f"gmm_v2_mlp-g_{dims.size_group}-m_{dims.size_m}-k_{dims.size_k}"
+        f"-act_{fuse_act}-n_{dims.size_n}-n2_{size_n}-tm_{tiles.tile_m}"
+        f"-bm_{cfgs.bucket_base}-p_{num_parts}-q_{down_parts}"
+    )
+    hbm = pl.BlockSpec(memory_space=pltpu.HBM)
+    return pl.pallas_call(
+        functools.partial(mlp_kernel_main, cfgs=cfgs),
+        out_shape=out_init,
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=2,
+            in_specs=[hbm] * 5,
+            out_specs=hbm,
+            scratch_shapes=scratch_shapes,
+        ),
+        compiler_params=pltpu.CompilerParams(
+            vmem_limit_bytes=vmem_limit_bytes,
+            disable_bounds_checks=True,
+        ),
+        name=name,
+        cost_estimate=cost,
+    )(group_sizes, group_offset, lhs, w1, w1_scale, w2, w2_scale)[:size_m, :size_n]
