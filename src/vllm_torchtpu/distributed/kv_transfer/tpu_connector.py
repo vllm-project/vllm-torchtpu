@@ -1692,16 +1692,16 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
         step first waits for the next batch's forward (and, with a drafter,
         for every KV write) before it registers, so the consumer's load
         parks on the deferred-submit path for a whole prefill step. GLM,
-        DSv4 and Kimi-K3 producers keep finish-time registration. Whole-page
-        request-state groups also wait for finish: the ahead path publishes
-        only FA/checkpoint tables, not their complete group plan."""
+        DSv4 and Kimi-K3 producers keep finish-time registration. Producers
+        with whole-page request-state groups publish their complete group
+        tables ahead, as accumulated from the scheduler output; a finish whose
+        group pages differ mints a fresh send and releases the ahead one."""
         return (
             self.is_producer
             and _use_raiden_stage3_transport()
             and not _use_raiden_glm_admission()
             and not _use_raiden_dsv4_admission()
             and not _uses_tp_stage3_source(self.vllm_config)
-            and not any(group.request_state for group in self._stage3_transfer_groups)
             and (
                 _engine_is_pipeline(self.vllm_config)
                 or dist_utils.get_stage3_register_ahead_enabled()
@@ -2418,12 +2418,16 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
             mamba_block_ids = [
                 table[group_index] for group_index in self._stage3_mamba_group_indices
             ] or None
+            grouped = len(self._stage3_transfer_groups) > 1 or any(
+                group.request_state for group in self._stage3_transfer_groups
+            )
             delay_free_blocks, params = self._stage3_publish_send(
                 request,
                 fa_block_ids,
                 mamba_block_ids,
                 num_tokens,
                 computed_tokens=computed_tokens,
+                group_block_ids=[list(ids) for ids in table] if grouped else None,
                 ahead=True,
             )
             if delay_free_blocks:
@@ -2739,6 +2743,17 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
             raise ValueError("Producer data-parallel rank must be non-negative")
         existing = self._stage3_finished_sends.get(request.request_id)
         group_ids = tuple(tuple(ids) for ids in (normalized_group_block_ids or ()))
+        if (
+            existing is not None
+            and existing[4] != group_ids
+            and existing[0] == self._stage3_early_sends.get(request.request_id)
+            and not ahead
+        ):
+            # The finish's group pages differ from the send published ahead
+            # of it: mint a fresh transfer below; request_finished releases
+            # the published uuid.
+            del self._stage3_finished_sends[request.request_id]
+            existing = None
         if existing is not None and existing[4] != group_ids:
             raise ValueError(
                 "Conflicting group pages for an in-flight Stage-3 request: "
