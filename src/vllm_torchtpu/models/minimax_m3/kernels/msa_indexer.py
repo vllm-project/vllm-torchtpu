@@ -41,6 +41,10 @@ from vllm_torchtpu.models.minimax_m3.kernels.packed_page import (
 DEFAULT_BLOCK_Q = 128
 DEFAULT_LARGE_BLOCK_Q = 512
 DEFAULT_PAGES_PER_STEP = 32
+# The block_q class (decode, MTP verify) runs the v3 DMA ring; 128 pages per
+# step keep more bytes in flight (j-dba77583: 32 req x 8 tokens at 128K,
+# 1.95 -> 1.66 ms). The large prefill class keeps 32.
+DEFAULT_SMALL_PAGES_PER_STEP = 128
 DEFAULT_KERNEL = "v3"
 # Large prefill tiles: v3's DMA ring is slower there on fp8 (1.79 vs 1.51 ms).
 DEFAULT_LARGE_KERNEL = "v2"
@@ -373,6 +377,7 @@ def _class_scores(
         "block_q",
         "large_block_q",
         "pages_per_step",
+        "small_pages_per_step",
         "kernel",
         "large_kernel",
         "interpret",
@@ -389,6 +394,7 @@ def block_scores(
     block_q: int = DEFAULT_BLOCK_Q,
     large_block_q: int = DEFAULT_LARGE_BLOCK_Q,
     pages_per_step: int = DEFAULT_PAGES_PER_STEP,
+    small_pages_per_step: int = DEFAULT_SMALL_PAGES_PER_STEP,
     kernel: str = DEFAULT_KERNEL,
     large_kernel: str = DEFAULT_LARGE_KERNEL,
     interpret: bool = False,
@@ -408,6 +414,8 @@ def block_scores(
         (v2 with a hand-written DMA ring for the pages) or the original
         ``"v1"``, kept as the reference arm for benchmarks.
       large_kernel: the same choice for the `large_block_q` tiles.
+      pages_per_step / small_pages_per_step: pages per grid step of the large
+        and the block_q tile classes.
     Pages past a token's own page hold scores of keys it must not see, and
     pages past its request's last page are not written; callers mask both.
     """
@@ -429,13 +437,13 @@ def block_scores(
         seq_lens,
         block_tables,
         cu_q_lens,
-        pages_per_step=pages_per_step,
         interpret=interpret,
     )
     small, small_col = score(
         active & ~is_large,
         block_q=block_q,
         max_tiles=min(max_num_seqs, num_tokens),
+        pages_per_step=small_pages_per_step,
         kernel=kernel,
     )
     # Large requests have more than block_q tokens each.
@@ -446,6 +454,7 @@ def block_scores(
         is_large,
         block_q=large_block_q,
         max_tiles=num_tokens // large_block_q + max_large,
+        pages_per_step=pages_per_step,
         kernel=large_kernel,
     )
     tok = jnp.arange(num_tokens, dtype=jnp.int32)
@@ -456,4 +465,9 @@ def block_scores(
     # One gather over both classes' columns (XLA fuses the concatenate into
     # it) instead of a transposing gather per class and a select.
     col = jnp.where(is_large[seq], small.shape[1] + large_col, small_col)
+    # The classes may pad pages to different group multiples; pad to the wider.
+    pages = max(small.shape[0], large.shape[0])
+    small, large = (
+        jnp.pad(x, ((0, pages - x.shape[0]), (0, 0))) for x in (small, large)
+    )
     return jnp.concatenate([small, large], axis=1)[:, col].T[:, None, :]
