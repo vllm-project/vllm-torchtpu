@@ -8,6 +8,7 @@ import math
 from typing import Any, ClassVar
 
 import jax
+import jax.numpy as jnp
 import torch
 from jax.experimental.pallas import tpu as pltpu
 from jax.sharding import PartitionSpec as P
@@ -499,10 +500,12 @@ def _pallas_rpa_kernel_batched(
     decode_query_size: int = 1,
     block_major: bool = False,
     max_model_len: int | None = None,
+    one_query_steps: bool = False,
 ) -> tuple[jax.Array, jax.Array]:
     """Batched-RPA Pallas kernel entry — used by
     `PallasBatchedRPAAttentionBackendImpl`. max_model_len, if set, bounds the
-    block-table columns passed to the kernel."""
+    block-table columns passed to the kernel. one_query_steps adds the
+    one-query kernel for calls whose sequences all carry one query."""
     rpa_func = (
         _with_verify_block_override(
             functools.partial(
@@ -513,6 +516,8 @@ def _pallas_rpa_kernel_batched(
         if decode_query_size > 1
         else _with_decode_block_override(ragged_paged_attention_batched)
     )
+    if one_query_steps and decode_query_size > 1:
+        rpa_func = _with_one_query_steps(rpa_func, decode_query_size)
     if max_model_len is not None:
         rpa_func = _with_addressable_page_table(
             rpa_func, max_model_len, decode_query_size
@@ -599,6 +604,43 @@ def _with_decode_block_override(rpa_func):
     )
 
 
+def _kernel_decode_block(
+    queries, keys, kv_cache, kv_lens, page_indices, decode_query_size: int, kwargs
+) -> batched_rpa_configs.BlockSizes:
+    """The decode block the batched kernel picks by default for this call."""
+    layout = kwargs.get("kv_layout", batched_rpa_configs.KVLayout.HEAD_ALONG_SUBLANE)
+    if layout == batched_rpa_configs.KVLayout.SEQ_ALONG_LANE:
+        page_size = kv_cache.shape[4]
+    else:
+        page_size = kv_cache.shape[1]
+    # The inputs of the kernel's own decode block choice
+    # (rpa_batched_wrapper.calculate_block_sizes) for this call.
+    model_cfgs = batched_rpa_configs.ModelConfigs(
+        num_q_heads=queries.shape[1],
+        num_kv_heads=keys.shape[1],
+        head_dim=queries.shape[2],
+        mask_value=0.0,
+    )
+    serve_cfgs = batched_rpa_configs.ServingConfigs(
+        num_seqs=kv_lens.shape[0],
+        page_size=page_size,
+        total_q_tokens=queries.shape[0],
+        num_page_indices=page_indices.shape[0],
+        dtype_q=queries.dtype,
+        dtype_kv=kv_cache.dtype,
+        dtype_out=kwargs.get("out_dtype") or queries.dtype,
+        kv_layout=layout,
+        decode_query_size=decode_query_size,
+    )
+    default, _ = rpa_batched_wrapper.calculate_block_sizes(
+        model_cfgs,
+        serve_cfgs,
+        kwargs.get("vmem_limit_bytes") or pltpu.get_tpu_info().vmem_capacity_bytes,
+        decode_query_size=decode_query_size,
+    )
+    return default
+
+
 def _with_verify_block_override(rpa_func, decode_query_size: int):
     """Bind TPU_BATCHED_RPA_VERIFY_BLOCK as the verify-window decode block, if set.
 
@@ -633,37 +675,8 @@ def _with_verify_block_override(rpa_func, decode_query_size: int):
         )
 
     def call(queries, keys, values, kv_cache, kv_lens, page_indices, *args, **kwargs):
-        layout = kwargs.get(
-            "kv_layout", batched_rpa_configs.KVLayout.HEAD_ALONG_SUBLANE
-        )
-        if layout == batched_rpa_configs.KVLayout.SEQ_ALONG_LANE:
-            page_size = kv_cache.shape[4]
-        else:
-            page_size = kv_cache.shape[1]
-        # The inputs of the kernel's own decode block choice
-        # (rpa_batched_wrapper.calculate_block_sizes) for this call.
-        model_cfgs = batched_rpa_configs.ModelConfigs(
-            num_q_heads=queries.shape[1],
-            num_kv_heads=keys.shape[1],
-            head_dim=queries.shape[2],
-            mask_value=0.0,
-        )
-        serve_cfgs = batched_rpa_configs.ServingConfigs(
-            num_seqs=kv_lens.shape[0],
-            page_size=page_size,
-            total_q_tokens=queries.shape[0],
-            num_page_indices=page_indices.shape[0],
-            dtype_q=queries.dtype,
-            dtype_kv=kv_cache.dtype,
-            dtype_out=kwargs.get("out_dtype") or queries.dtype,
-            kv_layout=layout,
-            decode_query_size=decode_query_size,
-        )
-        default, _ = rpa_batched_wrapper.calculate_block_sizes(
-            model_cfgs,
-            serve_cfgs,
-            kwargs.get("vmem_limit_bytes") or pltpu.get_tpu_info().vmem_capacity_bytes,
-            decode_query_size=decode_query_size,
+        default = _kernel_decode_block(
+            queries, keys, kv_cache, kv_lens, page_indices, decode_query_size, kwargs
         )
         block_sizes = dataclasses.replace(default, bq_c_sz=default.bq_sz)
         logger.info_once(
@@ -685,6 +698,123 @@ def _with_verify_block_override(rpa_func, decode_query_size: int):
             *args,
             decode_block_sizes=block_sizes,
             **kwargs,
+        )
+
+    return call
+
+
+def _compact_page_columns(num_seqs: int, pages_per_seq: int, itemsize: int) -> int:
+    """Columns of the compact page table the batched kernel switches to for a
+    decode batch whose sequences fit them, or 0 when it keeps the whole table
+    in SMEM (rpa_batched_wrapper.ragged_paged_attention's own rule)."""
+    limit = 160 * 1024 if pages_per_seq >= 4096 else 512 * 1024
+    if num_seqs * pages_per_seq * itemsize <= limit:
+        return 0
+    lanes = pltpu.get_tpu_info().num_lanes
+    columns = min(160 * 1024 // itemsize // num_seqs, pages_per_seq) // lanes * lanes
+    return columns if columns < pages_per_seq else 0
+
+
+def _with_one_query_steps(verify_func, decode_query_size: int):
+    """Run calls whose sequences all carry one query through the one-query kernel.
+
+    MTP draft steps after the first attend one query per sequence but still
+    run the verify-window kernel, which loads and computes the whole window.
+    This wrapper adds the one-query decode kernel at the KV block, sequences
+    per block and buffers of TPU_BATCHED_RPA_VERIFY_BLOCK and picks it on
+    device when every live sequence decodes exactly one token. The KV block
+    fixes each row's accumulation order and query rows are independent, so
+    the outputs and KV cache are identical to the verify-window kernel's.
+    The one-query call passes the compact page table the kernel would select
+    at run time, which skips its compact/streamed switch. Programs with room
+    for full verify windows skip the switch.
+    """
+    block = envs.TPU_BATCHED_RPA_VERIFY_BLOCK
+    if block is None:
+        raise ValueError(
+            "TPU_BATCHED_RPA_DRAFT_ONE_QUERY needs TPU_BATCHED_RPA_VERIFY_BLOCK: "
+            "the one-query kernel takes the KV block of the verify block."
+        )
+
+    def call(
+        queries,
+        keys,
+        values,
+        kv_cache,
+        kv_lens,
+        page_indices,
+        cu_q_lens,
+        distribution,
+        **kwargs,
+    ):
+        args = (
+            queries,
+            keys,
+            values,
+            kv_cache,
+            kv_lens,
+            page_indices,
+            cu_q_lens,
+            distribution,
+        )
+        num_seqs = kv_lens.shape[0]
+        if queries.shape[0] >= decode_query_size * num_seqs:
+            return verify_func(*args, **kwargs)
+        if not isinstance(block, tuple):
+            default = _kernel_decode_block(
+                queries,
+                keys,
+                kv_cache,
+                kv_lens,
+                page_indices,
+                decode_query_size,
+                kwargs,
+            )
+            bkv, batch, buffers = default.bkv_sz, default.batch_size, default.n_buffer
+        else:
+            bkv, batch, buffers = block
+        logger.info_once(
+            "Batched RPA one-query draft steps: bkv %d, batch %d, %d buffers",
+            bkv,
+            batch,
+            buffers,
+        )
+        one_query_block = batched_rpa_configs.BlockSizes(
+            bq_sz=1, bq_c_sz=1, bkv_sz=bkv, batch_size=batch, n_buffer=buffers
+        )
+        q_lens = cu_q_lens[1:] - cu_q_lens[:-1]
+        live = jnp.arange(num_seqs) < distribution[2]
+        one_query = (distribution[0] == distribution[2]) & jnp.all(
+            jnp.where(live, q_lens == 1, True)
+        )
+        pages_per_seq = page_indices.shape[0] // num_seqs
+        columns = _compact_page_columns(
+            num_seqs, pages_per_seq, page_indices.dtype.itemsize
+        )
+        if columns:
+            # The table columns the kernel keeps in SMEM for a decode batch that
+            # fits them; longer sequences take the verify-window kernel.
+            layout = kwargs.get(
+                "kv_layout", batched_rpa_configs.KVLayout.HEAD_ALONG_SUBLANE
+            )
+            page_size = kv_cache.shape[
+                4 if layout == batched_rpa_configs.KVLayout.SEQ_ALONG_LANE else 1
+            ]
+            one_query &= jnp.all(jnp.where(live, kv_lens <= columns * page_size, True))
+
+        def one_query_call(q, k, v, cache, lens, table, cu, dist):
+            if columns:
+                table = table.reshape(num_seqs, pages_per_seq)[:, :columns].reshape(-1)
+            return ragged_paged_attention_batched(
+                q, k, v, cache, lens, table, cu, dist,
+                decode_block_sizes=one_query_block, **kwargs,
+            )  # fmt: skip
+
+        return jax.lax.cond(
+            one_query,
+            one_query_call,
+            lambda *a: verify_func(*a, **kwargs),
+            *args,
         )
 
     return call
@@ -952,6 +1082,9 @@ class PallasAttentionBackendImpl(AttentionImpl):
     _kernel_entry: ClassVar = staticmethod(_pallas_rpa_kernel_default)
     _kernel_op_prefix: ClassVar[str] = "pallas::rpa_kernel"
     decode_query_size: int = 1
+    # Set on speculative draft layers to also run the one-query decode kernel
+    # for passes in which every sequence carries one query.
+    one_query_steps: bool = False
 
     # Bundled (block-major) RPA kernel entry: accepts the full KV cache bundle
     # and a dynamic scalar layer_idx. Registered under a dedicated prefix to avoid
@@ -1099,6 +1232,7 @@ class PallasAttentionBackendImpl(AttentionImpl):
             pcp_kv_layout,
             self.decode_query_size,
             block_major,
+            self.one_query_steps,
         )
         existing = self._kernel_config_cache.get(config_key)
         if existing is not None:
@@ -1138,6 +1272,7 @@ class PallasAttentionBackendImpl(AttentionImpl):
             pcp_kv_layout,
             self.decode_query_size,
             block_major,
+            self.one_query_steps,
         )
         existing = self._kernel_registry.get(registry_key)
         if existing is not None:
@@ -1179,6 +1314,8 @@ class PallasAttentionBackendImpl(AttentionImpl):
                 entry_kwargs["decode_query_size"] = self.decode_query_size
             if "max_model_len" in entry_params and vllm_config is not None:
                 entry_kwargs["max_model_len"] = vllm_config.model_config.max_model_len
+            if self.one_query_steps and "one_query_steps" in entry_params:
+                entry_kwargs["one_query_steps"] = True
             if block_major:
                 if "block_major" not in entry_params:
                     raise NotImplementedError(

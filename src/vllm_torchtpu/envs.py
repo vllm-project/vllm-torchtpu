@@ -75,6 +75,7 @@ if TYPE_CHECKING:
     MIXED_NUM_KV_PAGES_PER_BLOCK: int | None = None
     TPU_BATCHED_RPA_DECODE_BLOCK: tuple[int, int, int] | None = None
     TPU_BATCHED_RPA_VERIFY_BLOCK: str | tuple[int, int, int] | None = None
+    TPU_BATCHED_RPA_DRAFT_ONE_QUERY: bool = False
     TPU_MLA_MASKED_DENSE_ENABLED: bool = False
     TPU_MLA_MASKED_DENSE_ANALYTIC_MAX_KV_LEN: int | None = None
     TPU_MLA_MASKED_DENSE_MAX_KV_LEN: int | None = None
@@ -650,6 +651,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # kernel's default block (bit-identical outputs); "bkv,batch,buffers" sets
     # the block as well. Unset keeps the kernel default.
     "TPU_BATCHED_RPA_VERIFY_BLOCK": _get_batched_rpa_verify_block,
+    # Speculative draft layers of the batched RPA kernel run passes in which
+    # every sequence carries one query (MTP draft steps after the first)
+    # through the one-query decode kernel at the KV block of the verify block,
+    # instead of the verify-window kernel. Needs TPU_BATCHED_RPA_VERIFY_BLOCK.
+    "TPU_BATCHED_RPA_DRAFT_ONE_QUERY": env_bool("TPU_BATCHED_RPA_DRAFT_ONE_QUERY"),
     # Opt in to GLM-5.2's measured masked-dense sparse-MLA prefill routing.
     # Off by default until the model and hardware scope of the cost model is
     # broadened or selected automatically from an explicit model profile.
