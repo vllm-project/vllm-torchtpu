@@ -20,12 +20,14 @@ block 256.
 
 import math
 import weakref
+from collections import Counter
 
 import pytest
 import torch
 from vllm import LLM, SamplingParams
 from vllm.distributed import cleanup_dist_env_and_memory
 from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMethod
+from vllm.v1.kv_cache_interface import SlidingWindowSpec
 
 from vllm_torchtpu.models.vllm.beam.model import RMSNormWeight
 from vllm_torchtpu.models.vllm.beam.router import BeamRouter, split_weight_bf16
@@ -145,6 +147,28 @@ def _cache_misses(worker) -> int:
     return stats.num_cache_reqs - stats.num_cache_hits
 
 
+def _kv_cache_group_windows(worker) -> list[int | None]:
+    """Per KV cache group, its window, or None for full attention."""
+    specs = [
+        g.kv_cache_spec for g in worker.model_runner.kv_cache_config.kv_cache_groups
+    ]
+    return [
+        spec.sliding_window if isinstance(spec, SlidingWindowSpec) else None
+        for spec in specs
+    ]
+
+
+def _kv_cache_page_bytes(worker) -> set[int]:
+    groups = worker.model_runner.kv_cache_config.kv_cache_groups
+    return {g.kv_cache_spec.page_size_bytes for g in groups}
+
+
+def _graph_breaks(worker) -> int:
+    from torch._dynamo.utils import counters
+
+    return sum(counters["graph_break"].values())
+
+
 def test_beam_windows_only_the_sliding_layers(llm: LLM):
     [windows] = llm.apply_model(_layer_windows)
     assert list(windows) == [WINDOW, None]
@@ -162,8 +186,16 @@ def test_beam_softcaps_the_logits(llm: LLM):
     assert 0 < peak <= SOFTCAP
 
 
+def test_beam_kv_cache_has_one_group_per_attention_kind(llm: LLM):
+    """One KV cache group per attention kind, in one page geometry."""
+    [windows] = llm.llm_engine.collective_rpc(_kv_cache_group_windows)
+    assert Counter(windows) == Counter([WINDOW, None])
+    [page_bytes] = llm.llm_engine.collective_rpc(_kv_cache_page_bytes)
+    assert len(page_bytes) == 1
+
+
 def test_beam_decodes_past_the_window_without_recompiling(llm: LLM):
-    """Once warm, new lengths in the same buckets compile nothing.
+    """Once warm, new lengths in the same buckets compile nothing and never break.
 
     The warm-up's first use compiles the sampler and logprobs programs.
     """
@@ -180,6 +212,9 @@ def test_beam_decodes_past_the_window_without_recompiling(llm: LLM):
     outputs = generate((SHORT_LEN + 1, PAST_WINDOW_LEN + 1))
     assert [len(o.outputs[0].token_ids) for o in outputs] == [GREEDY.max_tokens] * 2
     assert llm.llm_engine.collective_rpc(_cache_misses) == misses
+    # The backbone compiles with fullgraph=True; the counter also covers every
+    # other function the worker compiled.
+    assert llm.llm_engine.collective_rpc(_graph_breaks) == [0]
 
 
 def _first_divergence(tokens, ref_tokens) -> int:
