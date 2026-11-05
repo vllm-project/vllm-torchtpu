@@ -9,6 +9,7 @@ import jax
 import jax.numpy as jnp
 import torch
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.deepseek_v4.o_projection import wo_a_projection
 from vllm_torchtpu.kernels.deepseek_v41 import output_projection
 from vllm_torchtpu.kernels.deepseek_v41.csa2.cache import (
@@ -159,6 +160,7 @@ def _gather_attend(
         bq=bq,
         scale=scale,
         compress_ratio=ratio,
+        deep_gather=envs.TPU_DEEPSEEK_V41_CSA2_DEEP_GATHER,
     )
     return output, words, scales, counts
 

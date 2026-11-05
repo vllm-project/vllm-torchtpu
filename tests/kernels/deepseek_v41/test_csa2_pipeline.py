@@ -254,22 +254,34 @@ def test_chunked_attention_preserves_requests_and_reusable_kv(
         jnp.take_along_axis(expected_words, order[:, :, None], axis=1),
         jnp.take_along_axis(expected_scales, order, axis=1),
     )
-    output, gathered_words, gathered_scales = csa2_pipeline(
-        q,
-        word_banks,
-        scale_banks,
-        records,
-        swa_banks,
-        starts,
-        positions,
-        sink,
-        rope,
-        metadata,
-        bounds if non_causal else None,
-        counts,
-        chunk_size=chunk_size,
-        **kwargs,
-    )
+
+    def pipeline(chunk, deep_gather=False):
+        return csa2_pipeline(
+            q,
+            word_banks,
+            scale_banks,
+            records,
+            swa_banks,
+            starts,
+            positions,
+            sink,
+            rope,
+            metadata,
+            bounds if non_causal else None,
+            counts,
+            chunk_size=chunk,
+            deep_gather=deep_gather,
+            **kwargs,
+        )
+
+    output, gathered_words, gathered_scales = pipeline(chunk_size)
+    # The deep gather only changes staging: chunked and
+    # single-chunk results, including zeroed invalid rows, must be bitwise
+    # equal to the default.
+    for chunk in (chunk_size, tokens):
+        reference = pipeline(chunk)
+        for variant, default in zip(pipeline(chunk, deep_gather=True), reference):
+            np.testing.assert_array_equal(variant, default)
     np.testing.assert_allclose(output, expected, atol=2e-3, rtol=2e-2)
     np.testing.assert_array_equal(output[155:], 0)
     np.testing.assert_array_equal(gathered_words, expected_words)

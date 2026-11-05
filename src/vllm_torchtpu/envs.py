@@ -12,6 +12,7 @@ if TYPE_CHECKING:
     TPU_DEEPSEEK_V41_ENGRAM_CPU_OFFLOAD: bool = False
     TPU_DEEPSEEK_V41_ENGRAM_HBM: str = "auto"
     TPU_DEEPSEEK_V41_DECODE_FUSION: str = "auto"
+    TPU_DEEPSEEK_V41_CSA2_DEEP_GATHER: bool = True
     TPU_K3_SP_PREFILL: bool = False
     TPU_INCREMENTAL_BLOCK_TABLE_UPLOAD: bool = True
     TPU_VERIFY_INCREMENTAL_BLOCK_TABLE: bool = False
@@ -422,6 +423,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "auto",
         ["auto", "off", "require"],
         case_sensitive=False,
+    ),
+    # CSA2 SparseCore word/scale gather: three staging slots in flight and
+    # DMA-zeroed invalid rows instead of two slots cleared by vector stores
+    # (csa2/cache.py). Gathered rows are unchanged.
+    "TPU_DEEPSEEK_V41_CSA2_DEEP_GATHER": env_bool(
+        "TPU_DEEPSEEK_V41_CSA2_DEEP_GATHER", default=True
     ),
     # Opt in to K3 TP32/EP32 sequence-parallel prefill.
     "TPU_K3_SP_PREFILL": env_bool("TPU_K3_SP_PREFILL", default=False),
