@@ -21,7 +21,7 @@ from vllm_torchtpu.models.kimi_k3.megakernel import config
 from vllm_torchtpu.models.kimi_k3.megakernel.kernels import (
     prefill_megakernel as kernels,
 )
-from vllm_torchtpu.models.kimi_k3.megakernel.kernels.prefill_moe import fused, layer
+from vllm_torchtpu.models.kimi_k3.megakernel.kernels.prefill_moe import fused
 from vllm_torchtpu.models.kimi_k3.megakernel.kernels.prefill_moe.moe_down_valu import (
     down_valu_compact,
 )
@@ -42,16 +42,8 @@ def test_dispatch_by_window_and_reduce_dtype(monkeypatch, window, reduce_dtype):
         "make_indexed_moe_sp_ring",
         lambda mesh, *, seq_len: ("fused", seq_len),
     )
-    monkeypatch.setattr(
-        layer,
-        "make_indexed_moe_sp_ring",
-        lambda mesh, *, seq_len: ("bf16", seq_len),
-    )
     result = kernels.make_indexed_moe_sp_ring(None, seq_len=window)
-    if reduce_dtype == "float32":
-        expected = "fused"
-    else:
-        expected = "bf16" if window in (4096, 8192) else "reference"
+    expected = "fused" if reduce_dtype == "float32" else "reference"
     assert result == (expected, window)
 
 

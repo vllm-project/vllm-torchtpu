@@ -32,7 +32,7 @@ from typing import Any
 
 import torch
 
-from vllm_torchtpu.models.kimi_k3.megakernel.pools import DRAFT_LAYER0
+from .pools import DRAFT_LAYER0
 
 
 def register_draft_layers(vllm_config: Any, checkpoint: Path) -> list[torch.nn.Module]:

@@ -36,7 +36,7 @@ import jax
 import torch
 from torch_tpu._internal.pallas import pallas as pallas_impl
 
-from vllm_torchtpu.distributed.sharded_jax_op import _placeholder
+from vllm_torchtpu.distributed import sharded_jax_op
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
@@ -155,8 +155,9 @@ class _ExportCache:
         pallas_impl.tpu_torch_pallas.register_custom_kernel(
             op.name, entry["fingerprint"], serialized_mlir_module=module
         )
+        placeholder_fn = vars(sharded_jax_op)["_placeholder"]
         outputs = [
-            _placeholder(jax.core.ShapedArray(shape, dtype), spec, op.mesh)
+            placeholder_fn(jax.core.ShapedArray(shape, dtype), spec, op.mesh)
             if array
             else pallas_impl.torch_placeholder(
                 jax.core.ShapedArray(shape, dtype), mesh=op.mesh

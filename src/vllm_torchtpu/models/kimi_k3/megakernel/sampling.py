@@ -36,7 +36,7 @@ from __future__ import annotations
 import jax
 import jax.numpy as jnp
 
-from vllm_torchtpu.models.kimi_k3.megakernel.program import TP_SIZE, kernel_modules
+from .program import TP_SIZE, kernel_modules
 
 AXIS = "tp"
 CANDIDATES = 128

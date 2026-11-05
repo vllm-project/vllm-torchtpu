@@ -40,13 +40,9 @@ import torch
 from jax.sharding import PartitionSpec as P
 
 from vllm_torchtpu.logger import init_logger
-from vllm_torchtpu.models.kimi_k3.megakernel.program import kernel_modules
-from vllm_torchtpu.models.kimi_k3.megakernel.runtime_shim.bridge import (
-    hbm,
-    materialize,
-    register_op,
-    upload,
-)
+
+from .program import kernel_modules
+from .runtime_shim.bridge import hbm, materialize, register_op, upload
 
 logger = init_logger(__name__)
 

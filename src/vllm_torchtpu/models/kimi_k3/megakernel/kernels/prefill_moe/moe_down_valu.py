@@ -36,7 +36,7 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from vllm_torchtpu.models.kimi_k3.megakernel.kernels import prefill_megakernel as k
+from .. import prefill_megakernel as k
 
 
 def ring_step(

@@ -33,7 +33,7 @@ import sys
 import time
 from pathlib import Path
 
-from vllm_torchtpu.models.kimi_k3.megakernel import settings
+from .. import settings
 
 T0 = time.perf_counter()
 REPO = next(

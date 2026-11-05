@@ -27,6 +27,7 @@ patches call it.
 
 from __future__ import annotations
 
+import importlib
 from pathlib import Path
 from typing import Any
 
@@ -195,18 +196,18 @@ def draft_ring_rows(vllm_config: Any) -> int:
         return 0
     if not carries or mla_draft(vllm_config) is not None:
         return 0  # (the MLA draft's context is in its own KV cache layers)
-    from vllm_torchtpu.models.kimi_k3.megakernel.layout import LAYOUT
+    layout_mod = importlib.import_module("..layout", __package__)
 
-    return LAYOUT.region("draft").rows
+    return layout_mod.LAYOUT.region("draft").rows
 
 
 def capabilities(vllm_config: Any):
     """The selected program's :class:`Capabilities` (None: backend not selected)."""
     if role(vllm_config) is None:
         return None
-    from vllm_torchtpu.models.kimi_k3.megakernel import program
-    from vllm_torchtpu.models.kimi_k3.megakernel.runtime_shim.config import (
-        MegakernelEngineConfig,
-    )
+    program = importlib.import_module("..program", __package__)
+    config_mod = importlib.import_module(".config", __package__)
 
-    return program.capabilities(MegakernelEngineConfig.from_vllm_config(vllm_config))
+    return program.capabilities(
+        config_mod.MegakernelEngineConfig.from_vllm_config(vllm_config)
+    )

@@ -26,9 +26,7 @@ import hashlib
 import json
 from typing import Any
 
-from vllm_torchtpu.models.kimi_k3.megakernel.runtime_shim.config import (
-    set_active_kernel_config,
-)
+from .runtime_shim.config import set_active_kernel_config
 
 
 @dataclasses.dataclass(frozen=True)

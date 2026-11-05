@@ -47,14 +47,17 @@ import torch
 from jax.sharding import PartitionSpec as P
 
 from vllm_torchtpu.logger import init_logger
-from vllm_torchtpu.models.kimi_k3.megakernel.program import TP_SIZE, kernel_modules
-from vllm_torchtpu.models.kimi_k3.megakernel.runtime_shim.bridge import (
+
+from .draft_mla import MlaDsparkDraft
+from .program import TP_SIZE, kernel_modules
+from .runtime_shim.bridge import (
     hbm,
     kernel_mesh,
     materialize,
     register_global_op,
     upload,
 )
+from .runtime_shim.compilation import CompileCall
 
 logger = init_logger(__name__)
 
@@ -208,8 +211,6 @@ def draft_class(checkpoint) -> type:
     (``RedHatAI/Kimi-K3-speculator.dspark``)."""
     (mla,) = kernel_modules("dspark_mla")
     if mla.is_mla_draft(Path(checkpoint)):
-        from vllm_torchtpu.models.kimi_k3.megakernel.draft_mla import MlaDsparkDraft
-
         return MlaDsparkDraft
     return DsparkDraft
 
@@ -566,9 +567,6 @@ class DsparkDraft:
         these graphs also cover new/continuing state mixtures. The ordinary
         warmup still validates every transition with real donated buffers.
         """
-        from vllm_torchtpu.models.kimi_k3.megakernel.runtime_shim.compilation import (
-            CompileCall,
-        )
 
         c = self.config
         weights = tuple(self.weights[n] for n in self.names)

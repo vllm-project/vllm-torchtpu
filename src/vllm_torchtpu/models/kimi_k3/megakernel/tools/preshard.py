@@ -58,7 +58,7 @@ from pathlib import Path
 
 import numpy as np
 
-from vllm_torchtpu.models.kimi_k3.megakernel import settings
+from .. import settings
 
 FORMAT = 1
 GU_FILES = 4  # gate/up split into layer ranges

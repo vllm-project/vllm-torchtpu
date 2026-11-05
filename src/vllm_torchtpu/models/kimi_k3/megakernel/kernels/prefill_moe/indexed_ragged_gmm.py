@@ -23,7 +23,7 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from vllm_torchtpu.models.kimi_k3.megakernel.kernels import prefill_megakernel as k
+from .. import prefill_megakernel as k
 
 
 class _PackedRows:
@@ -38,6 +38,9 @@ class _PackedRows:
 
     def __getitem__(self, rows):
         return self.ref[rows].reshape(-1, 2 * self.ref.shape[-1])
+
+
+PackedRows = _PackedRows
 
 
 def indexed_gate_up(latent, indices, rhs, sizes, scales, layer):

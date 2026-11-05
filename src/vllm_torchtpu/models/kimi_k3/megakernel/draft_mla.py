@@ -49,15 +49,11 @@ import torch
 from jax.sharding import PartitionSpec as P
 
 from vllm_torchtpu.logger import init_logger
-from vllm_torchtpu.models.kimi_k3.megakernel import config as kernel_config
-from vllm_torchtpu.models.kimi_k3.megakernel.program import TP_SIZE, kernel_modules
-from vllm_torchtpu.models.kimi_k3.megakernel.runtime_shim.bridge import (
-    hbm,
-    kernel_mesh,
-    materialize,
-    register_op,
-    upload,
-)
+
+from . import config as kernel_config
+from .program import TP_SIZE, kernel_modules
+from .runtime_shim.bridge import hbm, kernel_mesh, materialize, register_op, upload
+from .runtime_shim.compilation import CompileCall
 
 logger = init_logger(__name__)
 
@@ -597,10 +593,6 @@ class MlaDsparkDraft:
         return self._ops[key]
 
     def compilation_calls(self, control: Any, spec_alone: bool, spec_shapes) -> list:
-        from vllm_torchtpu.models.kimi_k3.megakernel.runtime_shim.compilation import (
-            CompileCall,
-        )
-
         c = self.config
         operands = self._operands()
         vector = torch.empty((1, 128), dtype=torch.int32)

@@ -41,7 +41,7 @@ import dataclasses
 import time
 from collections.abc import Mapping, Sequence
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import jax
 import jax.numpy as jnp
@@ -50,8 +50,12 @@ import torch
 from jax.sharding import PartitionSpec as P
 
 from vllm_torchtpu.logger import init_logger
-from vllm_torchtpu.models.kimi_k3.megakernel.layout import NUM_LAYERS
-from vllm_torchtpu.models.kimi_k3.megakernel.pools import (
+
+from . import sampling
+from .draft_mla_prefill import PrefillDraftLatents
+from .draft_ring import PrefillRing
+from .layout import NUM_LAYERS, cache_layout
+from .pools import (
     CONV_ROWS,
     KDA_LAYERS,
     MLA_LAYERS,
@@ -64,14 +68,8 @@ from vllm_torchtpu.models.kimi_k3.megakernel.pools import (
     tp_rank_permutation,
     write_draft_rings,
 )
-from vllm_torchtpu.models.kimi_k3.megakernel.program import (
-    DCP_SIZE,
-    HIDDEN_SIZE,
-    TP_SIZE,
-    VOCAB,
-    kernel_modules,
-)
-from vllm_torchtpu.models.kimi_k3.megakernel.runtime_shim.bridge import (
+from .program import DCP_SIZE, HIDDEN_SIZE, TP_SIZE, VOCAB, kernel_modules
+from .runtime_shim.bridge import (
     hbm,
     kernel_mesh,
     materialize,
@@ -80,15 +78,12 @@ from vllm_torchtpu.models.kimi_k3.megakernel.runtime_shim.bridge import (
     report_load_stats,
     stream_to_device,
 )
-from vllm_torchtpu.models.kimi_k3.megakernel.runtime_shim.config import (
-    MegakernelEngineConfig,
-)
-from vllm_torchtpu.models.kimi_k3.megakernel.runtime_shim.program import (
-    KVGroup,
-    RequestInput,
-    StepInput,
-    StepOutput,
-)
+from .runtime_shim.compilation import CompileCall, compile_ops
+from .runtime_shim.export_cache import prepare_distributed
+from .runtime_shim.program import KVGroup, RequestInput, StepInput, StepOutput
+
+if TYPE_CHECKING:
+    from .runtime_shim.config import MegakernelEngineConfig
 
 logger = init_logger(__name__)
 
@@ -756,7 +751,6 @@ class PoolWriter:
     ) -> None:
         self.mesh, self.rank = mesh, rank
         self.raw_pools = raw_pools
-        from vllm_torchtpu.models.kimi_k3.megakernel.layout import cache_layout
 
         self.layout = cache_layout(str(raw_pools[0].dtype))
         self.mla_raw, self._kda_raw = tuple(mla_raw), tuple(kda_raw)
@@ -1211,10 +1205,6 @@ class KimiPrefiller:
         if draft_checkpoint is not None:
             (mla,) = kernel_modules("dspark_mla")
             if mla.is_mla_draft(Path(draft_checkpoint)):
-                from vllm_torchtpu.models.kimi_k3.megakernel.draft_mla_prefill import (
-                    PrefillDraftLatents,
-                )
-
                 self.draft_latents = PrefillDraftLatents(
                     self.program.mesh,
                     self.rank,
@@ -1224,10 +1214,6 @@ class KimiPrefiller:
                     config.max_model_len,
                 )
             else:
-                from vllm_torchtpu.models.kimi_k3.megakernel.draft_ring import (
-                    PrefillRing,
-                )
-
                 self.ring = PrefillRing(
                     self.program.mesh,
                     self.rank,
@@ -1429,7 +1415,6 @@ class KimiPrefiller:
         key = ("sampler", sampled)
         if key in self.program._ops:
             return self.program._ops[key]
-        from vllm_torchtpu.models.kimi_k3.megakernel import sampling
 
         width = VOCAB // TP_SIZE
 
@@ -1693,9 +1678,6 @@ class KimiPrefiller:
         weights and pools as they are): every window's stack ops, state
         stack/split, draft-ring update and pool writes, then the hit-state
         and ring reads, the block copy and the first-token samplers."""
-        from vllm_torchtpu.models.kimi_k3.megakernel.runtime_shim.compilation import (
-            CompileCall,
-        )
 
         program, writer, ring = self.program, self._writer, self.ring
         assert writer is not None
@@ -1836,12 +1818,6 @@ class KimiPrefiller:
         """Trace :meth:`compilation_calls` spread over the workers and compile
         them concurrently (``megakernel.compilation``), so the warmup that
         follows only runs them."""
-        from vllm_torchtpu.models.kimi_k3.megakernel.runtime_shim.compilation import (
-            compile_ops,
-        )
-        from vllm_torchtpu.models.kimi_k3.megakernel.runtime_shim.export_cache import (
-            prepare_distributed,
-        )
 
         started = time.perf_counter()
         calls = self.compilation_calls()

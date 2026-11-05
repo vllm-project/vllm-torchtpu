@@ -33,10 +33,7 @@ also holds KDA layers ``3p .. 3p + 2`` (the last pool none). A block is
 
 import dataclasses
 
-from vllm_torchtpu.models.kimi_k3.megakernel.runtime_shim.layout import (
-    KVLayout,
-    StateRegion,
-)
+from .runtime_shim.layout import KVLayout, StateRegion
 
 NUM_LAYERS = 93
 MLA = tuple(i for i in range(NUM_LAYERS) if i % 4 == 3 or i == NUM_LAYERS - 1)

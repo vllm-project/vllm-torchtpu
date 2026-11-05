@@ -69,6 +69,7 @@ from __future__ import annotations
 
 import dataclasses
 import functools
+import importlib
 from abc import ABC, abstractmethod
 from collections import namedtuple
 from collections.abc import Callable
@@ -89,14 +90,11 @@ from jax.experimental.pallas import tpu_sc as plsc
 from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 
-from vllm_torchtpu.models.kimi_k3.megakernel.common import pool_alias
-from vllm_torchtpu.models.kimi_k3.megakernel.config import active as _config
-from vllm_torchtpu.models.kimi_k3.megakernel.kernels.helpers import (
-    e8m0_scale,
-    expert_activation,
-    kda_decay,
-    kda_normalize_query_key,
-)
+from ..common import pool_alias
+
+from .. import config as _config_mod
+from ..config import active as _config
+from .helpers import e8m0_scale, expert_activation, kda_decay, kda_normalize_query_key
 
 # ============================================================================
 # SparseCore kernels through core_map
@@ -1596,7 +1594,18 @@ class RhsRef(ABC):
         ...
 
 
-@jax.tree_util.register_dataclass
+_REGISTERED_PREFILL_PYTREES: set[type[object]] = set()
+
+
+def _pytree_dataclass[DataclassT: type[object]](cls: DataclassT) -> DataclassT:
+    """Attach JAX pytree flattening to a frozen prefill dataclass once."""
+    if cls not in _REGISTERED_PREFILL_PYTREES:
+        jax.tree_util.register_dataclass(cls)
+        _REGISTERED_PREFILL_PYTREES.add(cls)
+    return cls
+
+
+@_pytree_dataclass
 @dataclasses.dataclass(frozen=True)
 class WeightsRef(RhsRef):
     """Dataclass for a single weights."""
@@ -1619,7 +1628,7 @@ class WeightsRef(RhsRef):
         return self.scale[...]
 
 
-@jax.tree_util.register_dataclass
+@_pytree_dataclass
 @dataclasses.dataclass(frozen=True)
 class FusedWeightsRef(RhsRef):
     """Dataclass for gate and up weights used in fused activation."""
@@ -1638,7 +1647,7 @@ class FusedWeightsRef(RhsRef):
         return interleave_lane(s_gate, s_up)
 
 
-@jax.tree_util.register_dataclass
+@_pytree_dataclass
 @dataclasses.dataclass(frozen=True)
 class MetadataRef:
     gm_id_to_group_id: jax.Array
@@ -4744,6 +4753,9 @@ def _moe_sp_tail(routed, shared, prefix_local, length, weights, *,
     return (prefix_local + output).astype(jnp.bfloat16)
 
 
+moe_sp_tail = _moe_sp_tail
+
+
 def make_moe_fused_sp_repacked(mesh, *, seq_len, eps=1e-5, collective_id=42,
                                token_ranks=None):
     """Build the TP32 MoE layer for repacked projection weights: the local
@@ -4856,18 +4868,15 @@ MOE_FAMILIES = (
 
 def make_indexed_moe_sp_ring(mesh, *, seq_len=8192):
     """Select a MoE layer, keeping packed expert families resident for tile DMA."""
-    from ..config import active
-
-    if active().moe_reduce_dtype == "float32":
-        if seq_len in (512, 1024, 2048, 4096, 8192):
-            from .prefill_moe.fused import make_indexed_moe_sp_ring as make_fused_moe
-
-            return make_fused_moe(mesh, seq_len=seq_len)
-    elif seq_len in (4096, 8192):
-        # The per-hop BF16 reduction.
-        from .prefill_moe.layer import make_indexed_moe_sp_ring as make_packed_moe
-
-        return make_packed_moe(mesh, seq_len=seq_len)
+    if _config_mod.active().moe_reduce_dtype == "float32" and seq_len in (
+        512,
+        1024,
+        2048,
+        4096,
+        8192,
+    ):
+        fused_mod = importlib.import_module(".prefill_moe.fused", __package__)
+        return fused_mod.make_indexed_moe_sp_ring(mesh, seq_len=seq_len)
     return _make_indexed_moe_sp_ring_reference(mesh, seq_len=seq_len)
 
 
