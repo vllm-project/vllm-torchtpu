@@ -16,13 +16,15 @@
 Computes what ``util.xla_prequantized_matmul`` followed by ``rope.rope_quant``
 compute, but the bf16 projection never leaves VMEM. Each grid step projects a
 tile of tokens through the resident weight, one column chunk at a time, into
-one of two bf16 VMEM buffers, issued a chunk ahead, and rotates and scales
-each head's rows from there in the dot's own layout, tokens on sublanes:
-every head of a token tile shares one cos tile and one sin tile with the
-rotation's sign folded in, and each row's scale is stored straight into its
-lane of the ``[T, H]`` scales. The scaled rows go to VMEM through stores
-strided by a tile, which put each token's heads on sublanes, and are cast to
-the ``[T, H, LANE]`` fp8 query from there.
+one of two VMEM buffers, issued a chunk ahead. Each chunk's bf16 projection
+is stored token-major, each token's heads on consecutive rows as in the
+``[T, H, LANE]`` query: two heads' dot rows are packed into the bf16 pairs of
+one u32 vreg and stored through a stride of one token. The rotation and the
+scaling then run on rows that are (token, head) pairs, every token's cos and
+sin broadcast from its row, and each fp8 tile of the query is cast and
+stored whole once its heads are scaled. Each row's scale goes to lane t of
+an ``[H, TILE_T]`` scratch, transposed into the ``[T, H]`` scales at the end
+of the step.
 """
 
 import functools
@@ -48,10 +50,8 @@ MIN_ROWS = 512
 TILE_T = 512
 # Projection columns per dot, and per weight DMA on the first step.
 N_CHUNK = 2048
-# Heads read back from the projection buffer per load.
-HEADS_PER_LOAD = 2
-# Tokens cast to fp8 at a time.
-CAST_TOKENS = 32
+# Tokens rotated and scaled per block of rows.
+ROPE_TOKENS = 64
 VMEM_LIMIT_BYTES = 64 * 1024 * 1024
 SUBLANE = 8
 # Heads per fp8 (32, LANE) tile.
@@ -63,12 +63,13 @@ def _vmem_bytes(k: int, n: int) -> int:
     weight = k * n + n * 4  # fp8 weight and f32 scales, resident
     x = 2 * TILE_T * (k + LANE * 4)  # fp8 rows and their (lane-padded) scales
     proj = 2 * TILE_T * N_CHUNK * 2  # bf16
-    scaled = TILE_T * n * 4  # f32
+    scales = TILE_T * n // LANE * 4  # f32, transposed
+    held = TILE_T * FP8_SUBLANES * LANE * 4  # f32 heads waiting for their tile
     cos_sin = 2 * TILE_T * LANE * 4
     lanes = 3 * TILE_T * LANE * 4
     out = 2 * TILE_T * (n + LANE * 4)  # fp8 query and its (lane-padded) scales
     dot = 2 * TILE_T * N_CHUNK * 4  # one chunk's f32 result, and its epilogue
-    return weight + x + proj + scaled + cos_sin + lanes + out + dot
+    return weight + x + proj + scales + held + cos_sin + lanes + out + dot
 
 
 def applies(
@@ -90,6 +91,10 @@ def applies(
         and m >= MIN_ROWS
         and m % TILE_T == 0
         and n % N_CHUNK == 0
+        and (
+            N_CHUNK // LANE % FP8_SUBLANES == 0 or FP8_SUBLANES % (N_CHUNK // LANE) == 0
+        )
+        and TILE_T % ROPE_TOKENS == 0
         and n // LANE <= LANE
         and n // LANE % FP8_SUBLANES == 0
         and cos_sin_cache.shape[1] <= LANE
@@ -113,19 +118,19 @@ def _kernel(
     scale_ref: jax.Ref,  # (TILE_T, H) f32
     # scratch
     w_ref: jax.Ref,  # (K, N) fp8
-    proj_ref: jax.Ref,  # (2, TILE_T, N_CHUNK) bf16: two chunks' projections
-    # (H // SUBLANE * TILE_T * SUBLANE, LANE) f32: head h of token t, scaled
-    # for the cast, in row ((h // SUBLANE) * TILE_T + t) * SUBLANE + h % SUBLANE.
-    scaled_ref: jax.Ref,
+    # (2, TILE_T * N_CHUNK // LANE, LANE) bf16: two chunks' projections,
+    # token-major: head h of the chunk's token t in row t * N_CHUNK // LANE + h.
+    proj_ref: jax.Ref,
     cos_sin_ref: jax.Ref,  # (2, TILE_T, rotary_dim) f32
     # (3, TILE_T, LANE) f32: the tile's cos, signed sin and x scales, lane-wide
     lanes_ref: jax.Ref,
+    scale_t_ref: jax.Ref,  # (H, TILE_T) f32: the tile's row scales, transposed
+    held_ref: jax.Ref,  # (TILE_T, FP8_SUBLANES, LANE) f32: scaled heads of a tile
     w_sems: jax.Ref,  # (N // N_CHUNK,) DMA
     cos_sin_sems: jax.Ref,  # (2,) DMA
 ):
     step = pl.program_id(0)
     num_steps = pl.num_programs(0)
-    num_heads = scale_ref.shape[1]
     num_chunks = w_ref.shape[1] // N_CHUNK
     heads_per_chunk = N_CHUNK // LANE
     quant_dtype = q_ref.dtype
@@ -186,31 +191,58 @@ def _kernel(
             (((1,), (0,)), ((), ())),
             preferred_element_type=jnp.float32,
         )
-        x = x * jnp.concatenate([lanes_ref[2]] * (N_CHUNK // LANE), axis=1)
+        x = x * jnp.concatenate([lanes_ref[2]] * heads_per_chunk, axis=1)
         x = x * w_scale_ref[cols][None, :]
-        proj_ref[c % 2] = x.astype(proj_ref.dtype)
+        # The u32 view of the buffer holds rows 2r and 2r + 1 in the low and
+        # high half of word row r.
+        words = proj_ref.at[c % 2].bitcast(jnp.uint32)
+        for p in range(heads_per_chunk // 2):
+            pair = [x[:, (2 * p + i) * LANE : (2 * p + i + 1) * LANE] for i in range(2)]
+            words[pl.ds(p, TILE_T, stride=heads_per_chunk // 2), :] = (
+                pltpu.pack_elementwise(pair, packed_dtype=jnp.bfloat16)
+            )
 
     def rope_quant(c):
-        """Rotates and scales chunk ``c``'s heads, read back from its buffer
-        HEADS_PER_LOAD at a time."""
-        for j in range(0, heads_per_chunk, HEADS_PER_LOAD):
-            heads = proj_ref[c % 2, :, pl.ds(j * LANE, HEADS_PER_LOAD * LANE)]
-            hs = [heads[:, i * LANE : (i + 1) * LANE] for i in range(HEADS_PER_LOAD)]
-            xs = [h.astype(jnp.float32) for h in hs]
-            # Every head's lane shuffle is issued before any head's arithmetic,
-            # on the bf16 rows: widening commutes with moving lanes.
-            partners = [_gptj_partners(h).astype(jnp.float32) for h in hs]
-            for i, (x, x_partners) in enumerate(zip(xs, partners)):
-                head = c * heads_per_chunk + j + i
-                y = _rope_rows_signed(x, x_partners, lanes_ref[0], lanes_ref[1])
-                scaled, scale = _scale_rows(y, quant_dtype)
-                rows = pl.ds(
-                    head // SUBLANE * TILE_T * SUBLANE + head % SUBLANE,
-                    TILE_T,
-                    stride=SUBLANE,
+        """Rotates and scales chunk ``c``'s heads, ROPE_TOKENS tokens at a time."""
+        h0 = c * heads_per_chunk
+        tile_h0 = h0 // FP8_SUBLANES * FP8_SUBLANES
+        completes_tile = (h0 + heads_per_chunk) % FP8_SUBLANES == 0
+        for t0 in range(0, TILE_T, ROPE_TOKENS):
+            rows = pl.ds(t0 * heads_per_chunk, ROPE_TOKENS * heads_per_chunk)
+            x_bf16 = proj_ref[c % 2, rows, :]
+            x = x_bf16.astype(jnp.float32)
+            partners = _gptj_partners(x_bf16).astype(jnp.float32)
+
+            def per_token(k):
+                """``lanes_ref[k]``'s row of each token, on each of its heads."""
+                return jnp.concatenate(
+                    [
+                        jnp.broadcast_to(
+                            lanes_ref[k, pl.ds(t0 + i, 1), :], (heads_per_chunk, LANE)
+                        )
+                        for i in range(ROPE_TOKENS)
+                    ],
+                    axis=0,
                 )
-                scaled_ref[rows, :] = scaled
-                scale_ref[:, pl.ds(head, 1)] = scale
+
+            y = _rope_rows_signed(x, partners, per_token(0), per_token(1))
+            scaled, scale = _scale_rows(y, quant_dtype)
+            scaled = scaled.reshape(ROPE_TOKENS, heads_per_chunk, LANE)
+            tokens = pl.ds(t0, ROPE_TOKENS)
+            if not completes_tile:
+                held_ref[tokens, pl.ds(h0 - tile_h0, heads_per_chunk), :] = scaled
+            else:
+                if h0 > tile_h0:
+                    held = held_ref[tokens, pl.ds(0, h0 - tile_h0), :]
+                    scaled = jnp.concatenate([held, scaled], axis=1)
+                q_ref[tokens, pl.ds(tile_h0, h0 + heads_per_chunk - tile_h0), :] = (
+                    scaled.astype(quant_dtype)
+                )
+            for r in range(0, ROPE_TOKENS * heads_per_chunk, SUBLANE):
+                scale_t_ref[
+                    pl.ds(h0 + r % heads_per_chunk, SUBLANE),
+                    pl.ds(t0 + r // heads_per_chunk, 1),
+                ] = scale[r : r + SUBLANE]
 
     # Chunk c + 1's dot is issued ahead of chunk c's rope and scaling, which
     # read the other buffer, so the MXU works under them.
@@ -219,25 +251,7 @@ def _kernel(
         if c + 1 < num_chunks:
             project(c + 1)
         rope_quant(c)
-
-    # Each FP8_SUBLANES-head tile of the query is FP8_SUBLANES // SUBLANE
-    # consecutive SUBLANE-head blocks of `scaled_ref`.
-    per_tile = FP8_SUBLANES // SUBLANE
-    for t in range(0, TILE_T, CAST_TOKENS):
-        for b in range(0, num_heads // SUBLANE, per_tile):
-            tile = jnp.concatenate(
-                [
-                    scaled_ref[
-                        pl.ds(((b + i) * TILE_T + t) * SUBLANE, CAST_TOKENS * SUBLANE),
-                        :,
-                    ].reshape(CAST_TOKENS, SUBLANE, LANE)
-                    for i in range(per_tile)
-                ],
-                axis=1,
-            )
-            q_ref[pl.ds(t, CAST_TOKENS), pl.ds(b * SUBLANE, FP8_SUBLANES), :] = (
-                tile.astype(quant_dtype)
-            )
+    scale_ref[...] = scale_t_ref[...].T
 
 
 @functools.partial(jax.jit, static_argnames=("quant_dtype",))
@@ -280,10 +294,11 @@ def q_proj_rope_quant(
         ],
         scratch_shapes=[
             pltpu.VMEM((k, n), w_q.dtype),
-            pltpu.VMEM((2, TILE_T, N_CHUNK), jnp.bfloat16),
-            pltpu.VMEM((num_heads * TILE_T, LANE), jnp.float32),
+            pltpu.VMEM((2, TILE_T * N_CHUNK // LANE, LANE), jnp.bfloat16),
             pltpu.VMEM((2, TILE_T, rotary_dim), cos_sin_cache.dtype),
             pltpu.VMEM((3, TILE_T, LANE), jnp.float32),
+            pltpu.VMEM((num_heads, TILE_T), jnp.float32),
+            pltpu.VMEM((TILE_T, FP8_SUBLANES, LANE), jnp.float32),
             pltpu.SemaphoreType.DMA((n // N_CHUNK,)),
             pltpu.SemaphoreType.DMA((2,)),
         ],
