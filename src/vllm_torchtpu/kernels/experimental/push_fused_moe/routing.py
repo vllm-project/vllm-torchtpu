@@ -21,8 +21,9 @@ from vllm_torchtpu.kernels.experimental.push_fused_moe.host import (
 from vllm_torchtpu.kernels.fused_moe.v2 import host
 
 # The kernel's static group slices and [destination, expert] tables were
-# lowered and checked for this routing geometry: (topk, experts, ep, tile_m).
-ROUTING_GEOMETRY = (6, 384, 16, 128)
+# lowered and checked for these (topk, physical slots, ep, tile_m) geometries.
+# EPLB includes replicated experts and inactive staging slots in this axis.
+ROUTING_GEOMETRIES = frozenset({(6, 384, 16, 128), (6, 432, 16, 128)})
 
 
 def routing_problem(
@@ -33,8 +34,9 @@ def routing_problem(
     return (
         first_problem(
             (
-                geometry == ROUTING_GEOMETRY,
-                f"(topk, experts, ep, tile_m)={geometry}, kernel {ROUTING_GEOMETRY}",
+                geometry in ROUTING_GEOMETRIES,
+                f"(topk, experts, ep, tile_m)={geometry}, "
+                f"kernels {sorted(ROUTING_GEOMETRIES)}",
             ),
             (gathered.n_tokens == t_local * ep, "tokens are not t_local * ep"),
             (
@@ -79,7 +81,7 @@ def _metadata(true, aligned, starts, expert_rows, rank, shard_stride):
     recv = prefix_sum(aligned, axis=1) - aligned
 
     def local(table):
-        # Mosaic dynamic gather cannot cross source vregs (E384 > lane128).
+        # Mosaic dynamic gather cannot cross source vregs (experts > lane128).
         # Static group slices expose the small fixed movement to the compiler.
         result = jnp.zeros((table.shape[0], g), jnp.int32)
         for owner in range(ep):

@@ -14,9 +14,9 @@ from vllm_torchtpu.kernels.experimental.decode_preparation import (
 )
 from vllm_torchtpu.kernels.experimental.push_fused_moe import host
 
-# (experts, topk) the metadata kernel was checked for; its BF16 base-256
+# (physical slots, topk) the metadata kernel was checked for; its BF16 base-256
 # one-hot reconstruction is exact while per-expert counts stay below 2**16.
-PRESORT_GEOMETRY = (384, 6)
+PRESORT_GEOMETRIES = frozenset({(384, 6), (432, 6)})
 
 
 def _metadata(pairs, counts):
@@ -35,7 +35,7 @@ def _metadata(pairs, counts):
     expert = jnp.minimum(jnp.sum(end[None, :] <= jj[:, None], axis=1), experts - 1)
     onehot = expert[:, None] == bins[None, :]
     offset = jj - jnp.sum(jnp.where(onehot, start[None, :], 0), axis=1)
-    # Each one-hot row selects one integer in [0, 384]. Base-256 digits
+    # Each one-hot row selects one integer in [0, tokens]. Base-256 digits
     # are exact in BF16, so FP32 accumulation and reconstruction are exact.
     hot = onehot.astype(jnp.bfloat16)
     low = (cumulative & 255).T.astype(jnp.bfloat16)
@@ -60,8 +60,9 @@ def local_sort_problem(pairs, counts, q, *, e_total, topk) -> str | None:
     return (
         first_problem(
             (
-                (e_total, topk) == PRESORT_GEOMETRY,
-                f"(experts, topk)={(e_total, topk)}, kernel {PRESORT_GEOMETRY}",
+                (e_total, topk) in PRESORT_GEOMETRIES,
+                f"(experts, topk)={(e_total, topk)}, "
+                f"kernels {sorted(PRESORT_GEOMETRIES)}",
             ),
             (
                 pairs.shape == (tokens * topk,),

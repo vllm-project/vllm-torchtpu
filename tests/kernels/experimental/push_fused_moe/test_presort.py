@@ -3,6 +3,7 @@
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 import pytest
 
 from vllm_torchtpu.kernels.experimental import decode_preparation as prep
@@ -15,17 +16,20 @@ def tpu_v7(monkeypatch):
     monkeypatch.setattr(prep, "get_tpu_version", lambda: 7)
 
 
-def inputs(tokens=288):
+def inputs(tokens=288, experts=384):
     return [
         jax.ShapeDtypeStruct((tokens * 6,), jnp.int32),
-        jax.ShapeDtypeStruct((384,), jnp.int32),
+        jax.ShapeDtypeStruct((experts,), jnp.int32),
         jax.ShapeDtypeStruct((tokens, 40, 128), jnp.float8_e4m3fn),
     ]
 
 
 @pytest.mark.parametrize("tokens", [96, 192, 256, 288, 384])
-def test_approved_tokens(tpu_v7, tokens):
-    assert presort.supports_local_sort(*inputs(tokens), e_total=384, topk=6)
+@pytest.mark.parametrize("experts", [384, 432])
+def test_approved_tokens(tpu_v7, tokens, experts):
+    assert presort.supports_local_sort(
+        *inputs(tokens, experts), e_total=experts, topk=6
+    )
 
 
 @pytest.mark.parametrize(
@@ -82,3 +86,40 @@ def test_activation_layout_is_unconstrained(tpu_v7, shape, dtype):
     xs = inputs()
     xs[2] = jax.ShapeDtypeStruct(shape, dtype)
     assert presort.supports_local_sort(*xs, e_total=384, topk=6)
+
+
+@pytest.mark.parametrize("tokens", [96, 192, 256, 288, 384])
+@pytest.mark.parametrize("experts", [384, 432])
+@pytest.mark.parametrize("interpret", [True, False])
+def test_physical_slot_sort_matches_native(monkeypatch, tokens, experts, interpret):
+    if not interpret and jax.default_backend() != "tpu":
+        pytest.skip("compiled Pallas requires TPU")
+    rng = np.random.default_rng(17)
+    slots_per_rank = experts // 16
+    active_per_rank = slots_per_rank - (2 if experts == 432 else 0)
+    active = np.flatnonzero(np.arange(experts) % slots_per_rank < active_per_rank)
+    pairs = np.stack([rng.choice(active, 6, replace=False) for _ in range(tokens)])
+    pairs[: tokens * 3 // 4] = active[-6:]
+    pairs[-3:] = experts
+    pairs = jnp.asarray(pairs.reshape(-1), jnp.int32)
+    counts = jnp.bincount(pairs, length=experts)
+    q = jnp.arange(tokens, dtype=jnp.int32)[:, None]
+    expected = np.argsort(np.asarray(pairs), kind="stable") // 6
+    expected[np.arange(tokens * 6) >= int(counts.sum())] = tokens - 1
+    native = presort.host.local_sort_activations(
+        pairs, counts, q, e_total=experts, topk=6
+    )
+    calls = []
+
+    def fuse(fn, args, *, name):
+        calls.append(name)
+        return prep.fuse_function(fn, args, name=name, interpret=interpret)
+
+    monkeypatch.setattr(presort, "fuse_function", fuse)
+    monkeypatch.setattr(jax, "default_backend", lambda: "tpu")
+    monkeypatch.setattr(prep, "get_tpu_version", lambda: 7)
+    actual = presort.local_sort_activations(pairs, counts, q, e_total=experts, topk=6)
+    assert calls == ["dsv41_presort_metadata_v2"]
+    np.testing.assert_array_equal(actual[0][:, 0], expected)
+    for got, want in zip(actual, native):
+        np.testing.assert_array_equal(got, want)
