@@ -325,11 +325,14 @@ def publish_csa2_kv(
 
 
 def _requests(starts: jax.Array, tokens: int) -> jax.Array:
-    return jnp.repeat(
-        jnp.arange(starts.shape[0] - 1, dtype=jnp.int32),
-        starts[1:] - starts[:-1],
-        total_repeat_length=tokens,
-    )
+    """Request of each token; padding tokens map to the last request.
+
+    Counts the request ends at or before each token with a [tokens, requests]
+    compare: jnp.repeat's lowering is a ~30 us scalar loop on TPU (vs ~1 us).
+    """
+    rows = jnp.arange(tokens, dtype=jnp.int32)
+    ends = (rows[:, None] >= starts[None, 1:]).sum(-1, dtype=jnp.int32)
+    return jnp.minimum(ends, starts.shape[0] - 2)
 
 
 @functools.partial(
