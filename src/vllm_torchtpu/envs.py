@@ -13,18 +13,18 @@ if TYPE_CHECKING:
     TPU_DEEPSEEK_V41_ENGRAM_HBM: str = "auto"
     TPU_DEEPSEEK_V41_CSA2_EARLY_GATHER: bool = False
     TPU_DEEPSEEK_V41_INDEXER_TAIL_OUTSIDE_COND: bool = False
-    TPU_DEEPSEEK_V41_INDEXER_ISSUE_DEPTH: int | None = None
-    TPU_DEEPSEEK_V41_INDEXER_PUBLISH_ISSUE_DEPTH: int | None = None
-    TPU_DEEPSEEK_V41_MHC_RESIDENT_GATES: bool = False
-    TPU_DEEPSEEK_V41_BLOCKED_ROPE_GATHER: bool = False
+    TPU_DEEPSEEK_V41_INDEXER_ISSUE_DEPTH: int | None = 8
+    TPU_DEEPSEEK_V41_INDEXER_PUBLISH_ISSUE_DEPTH: int | None = 7
+    TPU_DEEPSEEK_V41_MHC_RESIDENT_GATES: bool = True
+    TPU_DEEPSEEK_V41_BLOCKED_ROPE_GATHER: bool = True
     TPU_DEEPSEEK_V41_CSA2_SWA_PLAN: bool = False
-    TPU_DEEPSEEK_V41_FUSED_WO_AB: bool = False
-    TPU_DEEPSEEK_V41_QB_ROPE_EXACT_ROWS: bool = False
-    TPU_DEEPSEEK_V41_CSA2_DEEP_GATHER: bool = False
+    TPU_DEEPSEEK_V41_FUSED_WO_AB: bool = True
+    TPU_DEEPSEEK_V41_QB_ROPE_EXACT_ROWS: bool = True
+    TPU_DEEPSEEK_V41_CSA2_DEEP_GATHER: bool = True
     TPU_K3_SP_PREFILL: bool = False
     TPU_INCREMENTAL_BLOCK_TABLE_UPLOAD: bool = True
     TPU_ONEHOT_TABLE_LOOKUP: bool = True
-    TPU_INLINE_DEDUPLICATED_CALLS: bool = False
+    TPU_INLINE_DEDUPLICATED_CALLS: bool = True
     TPU_VERIFY_INCREMENTAL_BLOCK_TABLE: bool = False
     LIBTPU_INIT_ARGS: str = ""
     JAX_PLATFORMS: str = ""
@@ -372,15 +372,19 @@ def env_optional_int(env_name: str) -> Callable[[], int | None]:
     return _get_optional_int_env
 
 
-def env_positive_int_or_none(env_name: str) -> Callable[[], int | None]:
+def env_positive_int_or_none(
+    env_name: str, default: int | None = None
+) -> Callable[[], int | None]:
     """Optional size knob that must be greater than zero when it is set.
 
-    Unset or empty reads as ``None``, meaning the feature is off.
+    Unset or empty reads as ``default`` (``None`` means the feature is off).
     """
     parse_int = env_optional_int(env_name)
 
     def _get_positive_int_or_none_env() -> int | None:
         value = parse_int()
+        if value is None:
+            value = default
         if value is not None and value <= 0:
             raise ValueError(f"Invalid value '{value}' for {env_name}: must be > 0.")
         return value
@@ -438,23 +442,23 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # to the scorer with fused candidate publication. Scheduling only: the
     # head-sum split stays keyed to the tuned depth (bit-exact).
     "TPU_DEEPSEEK_V41_INDEXER_ISSUE_DEPTH": env_positive_int_or_none(
-        "TPU_DEEPSEEK_V41_INDEXER_ISSUE_DEPTH"
+        "TPU_DEEPSEEK_V41_INDEXER_ISSUE_DEPTH", default=8
     ),
     "TPU_DEEPSEEK_V41_INDEXER_PUBLISH_ISSUE_DEPTH": env_positive_int_or_none(
-        "TPU_DEEPSEEK_V41_INDEXER_PUBLISH_ISSUE_DEPTH"
+        "TPU_DEEPSEEK_V41_INDEXER_PUBLISH_ISSUE_DEPTH", default=7
     ),
     # Shifted mHC: emit the next layer's gates T tokens wide (not padded to a
     # multiple of 128) and read them as compiler-managed VMEM inputs, so the
     # gates pass between layers without slice/transpose ops. Layout only;
     # outputs are unchanged.
     "TPU_DEEPSEEK_V41_MHC_RESIDENT_GATES": env_bool(
-        "TPU_DEEPSEEK_V41_MHC_RESIDENT_GATES", default=False
+        "TPU_DEEPSEEK_V41_MHC_RESIDENT_GATES", default=True
     ),
     # Gather RoPE table rows (attention preprocessing, CSA2 inverse RoPE) as
     # 256-row gathers when a step has 257..1024 rows
     # (`rope_gather.by_row_blocks`). Data movement only; outputs unchanged.
     "TPU_DEEPSEEK_V41_BLOCKED_ROPE_GATHER": env_bool(
-        "TPU_DEEPSEEK_V41_BLOCKED_ROPE_GATHER", default=False
+        "TPU_DEEPSEEK_V41_BLOCKED_ROPE_GATHER", default=True
     ),
     # CSA2 layers: build the SWA metadata and write plan once per stage at row
     # offset 0 and shift them per layer, instead of re-deriving them in every
@@ -465,19 +469,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # CSA2 layers: run wo_a and wo_b as one buffered decode kernel (the wo_a
     # output stays in VMEM). Same arithmetic as the two kernels (bit-exact).
     "TPU_DEEPSEEK_V41_FUSED_WO_AB": env_bool(
-        "TPU_DEEPSEEK_V41_FUSED_WO_AB", default=False
+        "TPU_DEEPSEEK_V41_FUSED_WO_AB", default=True
     ),
     # Fused Q-B/RoPE at token counts that are not a multiple of 32 (the DSpark
     # drafter's 240 rows): write only the real rows instead of slicing a padded
     # [256, 64, 512] result. Same values (bit-exact).
     "TPU_DEEPSEEK_V41_QB_ROPE_EXACT_ROWS": env_bool(
-        "TPU_DEEPSEEK_V41_QB_ROPE_EXACT_ROWS", default=False
+        "TPU_DEEPSEEK_V41_QB_ROPE_EXACT_ROWS", default=True
     ),
     # CSA2 SparseCore word/scale gather: three staging slots in flight and
     # DMA-zeroed invalid rows instead of two slots cleared by vector stores
     # (csa2/cache.py). Gathered rows are unchanged.
     "TPU_DEEPSEEK_V41_CSA2_DEEP_GATHER": env_bool(
-        "TPU_DEEPSEEK_V41_CSA2_DEEP_GATHER", default=False
+        "TPU_DEEPSEEK_V41_CSA2_DEEP_GATHER", default=True
     ),
     # Opt in to K3 TP32/EP32 sequence-parallel prefill.
     "TPU_K3_SP_PREFILL": env_bool("TPU_K3_SP_PREFILL", default=False),
@@ -496,7 +500,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # from every layer; when one layer's functions exceed the instruction region,
     # each layer reloads its code (env_override.py). Code layout only.
     "TPU_INLINE_DEDUPLICATED_CALLS": env_bool(
-        "TPU_INLINE_DEDUPLICATED_CALLS", default=False
+        "TPU_INLINE_DEDUPLICATED_CALLS", default=True
     ),
     # Debug: on every incremental step, rebuild the full packed table on the
     # host and check it against the device-resident copy (raises on mismatch).
