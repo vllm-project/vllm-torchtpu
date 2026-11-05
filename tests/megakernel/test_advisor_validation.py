@@ -26,9 +26,7 @@ _VALIDATION_CORPUS_PATH = (
 )
 _MIN_CORPUS_POINTS = 14
 _MIN_DISTINCT_MODELS = 3
-_ALLOWED_PROVENANCE_KINDS = frozenset(
-    {"public_calibration_run", "oss_tpu_measurement"}
-)
+_ALLOWED_PROVENANCE_KINDS = frozenset({"public_calibration_run", "oss_tpu_measurement"})
 
 
 def _load_validation_corpus() -> list[dict[str, object]]:
@@ -145,5 +143,8 @@ def test_validation_corpus_provenance_and_tie_overlap() -> None:
     )
     # The bundled trace carries no host launch gap; that input stays a prior.
     assert "launch_gap_us" not in cal_data
+    for sub in cal_data.values():
+        if isinstance(sub, dict):
+            assert "launch_gap_us" not in sub
     assert cal_rep.metrics["launch_gap_us"]["tag"] == "ASSUMED"
     assert cal_rep.metrics["collective_latency_us"]["tag"] == "MEASURED"

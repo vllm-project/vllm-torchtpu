@@ -37,11 +37,6 @@
     "phase": "prefill",
     "batch": 1,
     "isl": 4096,
-    "launch_gap_us": {
-      "p50": 0.0073,
-      "p90": 0.0085,
-      "n": 170320
-    },
     "collectives": [
       {
         "op": "all-gather",
