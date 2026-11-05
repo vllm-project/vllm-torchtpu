@@ -775,6 +775,9 @@ def _patch_vllm_offloading_config_build() -> None:
     from vllm.distributed.kv_transfer.kv_connector.v1.offloading import (
         config as offloading_config_module,
     )
+    from vllm.distributed.kv_transfer.kv_connector.v1.offloading import (
+        scheduler as offloading_scheduler_module,
+    )
     from vllm.v1.kv_cache_interface import iter_layer_specs
 
     if getattr(offloading_config_module, "_tpu_offloading_config_patch", False):
@@ -821,7 +824,7 @@ def _patch_vllm_offloading_config_build() -> None:
                 group,
                 tokens_per_block=tokens_per_block,
                 sliding_window_size_in_chunks=(
-                    offloading_config_module.get_sliding_window_size_in_chunks(
+                    offloading_scheduler_module.get_sliding_window_size_in_chunks(
                         layer_spec, tokens_per_block * blocks_per_chunk
                     )
                 ),
@@ -1104,7 +1107,6 @@ def _patch_vllm_hybrid_pcp_block_sizes() -> None:
             scheduler_block_size,
             hash_block_size,
             metrics_collector=None,
-            num_hash_lookahead_tokens=0,
             num_prefill_lookahead=0,
             allow_partial_hash_hits: bool = True,
             **kwargs,
@@ -1178,7 +1180,7 @@ def _patch_vllm_hybrid_pcp_block_sizes() -> None:
                 scheduler_block_size,
                 hash_block_size,
                 metrics_collector,
-                num_hash_lookahead_tokens=num_hash_lookahead_tokens,
+                
                 num_prefill_lookahead=num_prefill_lookahead,
                 allow_partial_hash_hits=allow_partial_hash_hits,
                 **kwargs,

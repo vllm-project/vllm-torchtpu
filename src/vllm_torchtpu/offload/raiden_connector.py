@@ -209,11 +209,7 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
         kv_cache_config: KVCacheConfig,
     ):
         super().__init__(spec, vllm_config, kv_cache_config)
-        if self.config.sync_load_budget_bytes:
-            raise ValueError(
-                "TPURaidenOffloadingConnector does not support "
-                "sync_load_budget_bytes: its loads always complete asynchronously."
-            )
+        
         assert isinstance(self.manager, RaidenOffloadingManager)
         self._raiden_manager: RaidenOffloadingManager = self.manager
         self._fence_pending: dict[int, _ParkedStore] = {}
