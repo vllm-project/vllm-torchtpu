@@ -261,6 +261,9 @@ class KVCacheManager:
         # Sparse MLA layers sized from their allocated (nope, rope) specs,
         # which the normalizer's dense MLA page formula does not model.
         sparse_mla_layers: set[str] = set()
+        # Model-owned caches that allocate their own exact shape
+        # (`TpuOwnedKVCache.kv_cache_shape`); their specs are exact as given.
+        owned_shape_layers: set[str] = set()
         for layer_name, attn_module in layers.items():
             # Linear Attention path
             if isinstance(attn_module, MambaBase):
@@ -423,6 +426,8 @@ class KVCacheManager:
                 spec = attn_module.get_kv_cache_spec(self.runner.vllm_config)
                 if spec is not None:
                     kv_cache_spec[layer_name] = spec
+                    if attn_module.kv_cache_shape(1) is not None:
+                        owned_shape_layers.add(layer_name)
             else:
                 continue
 
@@ -466,7 +471,7 @@ class KVCacheManager:
             kv_cache_spec,
             self.runner.kv_cache_dtype,
             enable_unified_kv_layout=self.runner._unified_kv_layout,
-            exempt_layers=ds_v4_layers | sparse_mla_layers,
+            exempt_layers=ds_v4_layers | sparse_mla_layers | owned_shape_layers,
             attention_backend=cast("type[PallasAttentionBackend] | None", backend_cls),
         )
         if (
@@ -1752,12 +1757,21 @@ class KVCacheManager:
                         if isinstance(attn_module, DeepseekV32IndexerCache)
                         else PallasMLAttentionBackend
                     )
-                    kv_cache_shape = mla_backend_cls.get_kv_cache_shape(
-                        num_blocks,
-                        kv_cache_spec.block_size,
-                        kv_cache_spec.num_kv_heads,
-                        kv_cache_spec.head_size,
-                        kv_cache_spec.dtype,
+                    owned_shape = (
+                        attn_module.kv_cache_shape(num_blocks)
+                        if isinstance(attn_module, TpuOwnedKVCache)
+                        else None
+                    )
+                    kv_cache_shape = (
+                        owned_shape
+                        if owned_shape is not None
+                        else mla_backend_cls.get_kv_cache_shape(
+                            num_blocks,
+                            kv_cache_spec.block_size,
+                            kv_cache_spec.num_kv_heads,
+                            kv_cache_spec.head_size,
+                            kv_cache_spec.dtype,
+                        )
                     )
                     dtype = kv_cache_spec.dtype
                     kv_caches[layer_name] = allocate_attention_region(
