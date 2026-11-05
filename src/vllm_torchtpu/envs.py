@@ -18,6 +18,7 @@ if TYPE_CHECKING:
     TPU_DEEPSEEK_V41_MHC_RESIDENT_GATES: bool = True
     TPU_DEEPSEEK_V41_MHC_EARLY_PREP: bool = False
     TPU_DEEPSEEK_V41_MHC_SHIFTED_T16: bool = False
+    TPU_DEEPSEEK_V41_DSPARK_PALLAS_LOGITS: bool = False
     TPU_DEEPSEEK_V41_BLOCKED_ROPE_GATHER: bool = True
     TPU_DEEPSEEK_V41_CSA2_SWA_PLAN: bool = False
     TPU_DEEPSEEK_V41_FUSED_WO_AB: bool = True
@@ -471,6 +472,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # only the drafter's rounding.
     "TPU_DEEPSEEK_V41_MHC_SHIFTED_T16": env_bool(
         "TPU_DEEPSEEK_V41_MHC_SHIFTED_T16", default=False
+    ),
+    # DSpark decode sampler: compute the drafter's BF16 base logits with the
+    # Pallas full-K head (kernels/logits_head.py) instead of the XLA dot.
+    # Changes only the draft logits' rounding (FP32 accumulation order).
+    "TPU_DEEPSEEK_V41_DSPARK_PALLAS_LOGITS": env_bool(
+        "TPU_DEEPSEEK_V41_DSPARK_PALLAS_LOGITS", default=False
     ),
     # Gather RoPE table rows (attention preprocessing, CSA2 inverse RoPE) as
     # 256-row gathers when a step has 257..1024 rows
