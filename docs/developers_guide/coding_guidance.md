@@ -341,14 +341,15 @@ op = pallas.jax_op("pallas::quantized_matmul_kernel",
 
 ## 7. Diff discipline
 
-- **R-7.1** **Small, single-purpose PRs** ([Small CLs](https://google.github.io/eng-practices/review/developer/small-cls.html)).
+- **R-7.1** **Small, single-purpose PRs**
+  ([Small CLs](https://google.github.io/eng-practices/review/developer/small-cls.html)).
   Small, focused PRs get faster, more thorough reviews, make bugs easier to
   spot, conflict less, and are safer to revert. Aim for a soft target of ≤ 300
   changed lines (excluding baselines and lockfiles) doing one self-contained
-  logical change. Pure deletions, atomic renames/moves with their caller
-  updates, and tiny dependent follow-ups may stay in one PR; reviewers may
-  still ask to split smaller multi-purpose diffs or accept larger cohesive ones
-  when splitting would be artificial. Very large designs need an RFC/design doc
+  logical change. Carve-outs: pure deletions, atomic renames/moves with their
+  caller updates, tiny dependent follow-ups, and larger cohesive diffs where
+  splitting would be artificial may stay in one PR; reviewers may still ask to
+  split smaller multi-purpose diffs. Very large designs need an RFC/design doc
   first. Each PR in a stack must pass tests on its own and cite its base PR
   explicitly.
 - **R-7.2** **Refactor first, feature second.** Land the enabling refactor or
@@ -476,8 +477,8 @@ Background material for the rules above.
 ## Author checklist (run before sending a PR)
 
 1. **Scope** — duplicate-work check done, not busywork (R-7.8, R-7.9);
-   single purpose; kernel changes separated; refactor pre-landed; stacked
-   base cited; no drive-by reformatting. (R-7.x)
+   single purpose; refactor pre-landed; stacked base cited; no drive-by
+   reformatting. (R-7.x)
 2. **Reuse & placement** — nothing reimplements a vLLM / vllm-torchtpu /
    Pallas utility; code sits in the right directory per R-2.1; interface
    files thin; kernels dependency-free; no model-specific logic in shared

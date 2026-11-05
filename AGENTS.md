@@ -45,9 +45,7 @@ git diff --stat origin/main...HEAD
     changes (`R-7.2`), and omit unrelated cleanups or drive-by edits (`R-7.3`).
   - Break larger end-to-end work into independently testable, reviewable steps
     (for example, landing a self-contained building block with its tests before
-    broader integration). Pure deletions, atomic renames/moves with their
-    caller updates, tiny dependent follow-ups, and cohesive changes that cannot
-    be split cleanly may stay in one PR.
+    broader integration), unless `R-7.1`'s carve-outs apply.
 - **Stacked PRs workflow**: Each PR in a stack must build and pass tests on its
   own without relying on code added in later PRs, and link the other PRs in the
   stack.
@@ -80,14 +78,16 @@ git diff --stat origin/main...HEAD
     git checkout feat/part-2
     git rebase feat/part-1
 
-    # 2. When rebasing the unmerged stack onto newer origin/main (run from the top branch)
+    # 2. When rebasing an unmerged stack onto origin/main (from top branch)
     git fetch origin main
     git checkout feat/part-2
     git rebase --update-refs origin/main
 
-    # 3. After PR 1 is squash-merged into main: drop PR 1's commits and retarget PR 2
+    # 3. After PR 1 is squash-merged into main: drop PR 1's commits
     git fetch origin main
     git rebase --onto origin/main feat/part-1 feat/part-2
+    # Only if PR 2 targeted feat/part-1 in the main repo (fork PRs already
+    # target main):
     gh pr edit <pr2_number> --base main
     ```
 
