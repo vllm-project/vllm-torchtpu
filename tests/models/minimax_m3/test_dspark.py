@@ -56,6 +56,7 @@ from vllm_torchtpu.models.minimax_m3.quant import (
     MiniMaxM3QuantConfig,
     dequantize_mxfp8,
 )
+from vllm_torchtpu.spec_decode.vocab_parallel_argmax import reduce_shard_argmax_pairs
 
 HIDDEN = 64
 HEAD_DIM = 128
@@ -553,3 +554,67 @@ def test_context_kv_from_target_aux_states(tiny_draft) -> None:
         )
         torch.testing.assert_close(write["value"], v)
         assert write["query"].shape == (num_tokens, NUM_HEADS, HEAD_DIM)
+
+
+def _simulated_shard_argmax(model, logits, embed, tp_size, width):
+    """Run markov_shard_pair as each of tp_size ranks (``width`` padded local
+    columns, vLLM layout) and reduce the rank-major pairs."""
+    pairs = []
+    for rank in range(tp_size):
+        start = min(rank * width, VOCAB)
+        end = min(start + width, VOCAB)
+        model._set_markov_vocab_shard(start, end, width)
+        # Pad columns hold a large logit: only the mask may hide them.
+        local = torch.full((logits.shape[0], width), 100.0, dtype=logits.dtype)
+        local[:, : end - start] = logits[:, start:end]
+        pairs.append(model.markov_shard_pair(local, embed))
+    return reduce_shard_argmax_pairs(torch.cat(pairs, dim=-1), tp_size)
+
+
+@pytest.mark.parametrize("tp_size,width", [(4, 24), (2, 48), (4, 25), (8, 13)])
+def test_markov_shard_argmax_matches_gathered(tiny_draft, tp_size, width) -> None:
+    """Per-rank (max, id) of logits + Markov bias on the shard, reduced across
+    ranks, equals the gathered (logits + markov_bias).argmax: small integers
+    make every sum exact, so ties (within and across shards) are frequent."""
+    model = tiny_draft
+    _load(model, _checkpoint())
+    gen = torch.Generator().manual_seed(3)
+    head = model.model.markov_head
+    head.markov_w1.weight.data = torch.randint(
+        -1, 2, head.markov_w1.weight.shape, generator=gen
+    ).to(torch.bfloat16)
+    head.markov_w2.weight.data = torch.randint(
+        -1, 2, head.markov_w2.weight.shape, generator=gen
+    ).to(torch.bfloat16)
+    rows = 64
+    prev = torch.randint(0, VOCAB, (rows,), generator=gen)
+    logits = torch.randint(-3, 4, (rows, VOCAB), generator=gen).to(torch.bfloat16)
+    # A tie straddling every shard boundary.
+    for rank in range(1, tp_size):
+        logits[rank, :] = -100
+        logits[rank, rank * width - 1 : rank * width + 1] = 100
+    embed = model.markov_embed(prev)
+    expected = (logits + model.markov_bias(embed)).argmax(dim=-1)
+    got = _simulated_shard_argmax(model, logits, embed, tp_size, width)
+    assert got.tolist() == expected.tolist()
+
+
+def test_vocab_parallel_markov_needs_a_sharded_head(tiny_draft) -> None:
+    model = tiny_draft
+    _load(model, _checkpoint())
+    assert model.lm_head.tp_size == 1
+    assert model._vocab_parallel_markov_blocker() == (
+        "the LM head is not vocab-parallel"
+    )
+    assert model.enable_vocab_parallel_markov_argmax() is False
+    assert model.markov_w2_shard is None
+    # Without the gather the logits are the head's local columns.
+    model.lm_head.weight.data = torch.randn(model.lm_head.weight.shape).to(
+        torch.bfloat16
+    )
+    hidden = torch.randn(3, HIDDEN).to(torch.bfloat16)
+    shard = model.compute_draft_logits_shard(hidden)
+    assert shard.shape == (3, model.lm_head.num_embeddings_per_partition)
+    torch.testing.assert_close(
+        shard[:, :VOCAB], model.compute_draft_logits(hidden), rtol=0, atol=0
+    )
