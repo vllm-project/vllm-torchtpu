@@ -39,6 +39,9 @@ def _scheduler():
         mamba_has_prefill_checkpoint_blocks=False,
         mamba_shared_prefix_checkpoint=False,
         hash_block_size=3072,
+        kv_cache_manager=SimpleNamespace(
+            coordinator=SimpleNamespace(enable_partial_hash_hits=False)
+        ),
     )
     return scheduler, physical_cache_config
 

@@ -657,6 +657,8 @@ def test_draft_rows_match_all_token_step_at_those_rows(monkeypatch):
         reduce=True,
         replicated_indexer=False,
         token_shard=False,
+        shared=None,
+        decode_token_shard=False,
     ):
         attended.append((len(hidden), None if rows is None else rows.tolist()))
         output = torch.sin(hidden.float() * 3 + positions[:, None].float() / 7)
