@@ -191,6 +191,7 @@ if TYPE_CHECKING:
     MM_ENCODER_FRAME_CHUNK_PATCH_SIZE: int = 0
     TPU_GC_POLICY: str = "default"
     TPU_GC_COLLECT_EVERY: int = 1000
+    TPU_GC_TRACE: bool = False
 
 
 def env_with_choices(
@@ -1181,6 +1182,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "TPU_GC_POLICY", "default", ["default", "freeze"]
     ),
     "TPU_GC_COLLECT_EVERY": env_nonnegative_int("TPU_GC_COLLECT_EVERY", 1000),
+    # Log every cyclic collection of 2 ms or more in the model runner and the
+    # engine core (generation, duration, wall-clock ns), to line stalls up
+    # with collections in the step records. Independent of TPU_GC_POLICY.
+    "TPU_GC_TRACE": env_bool("TPU_GC_TRACE", default=False),
 }
 
 

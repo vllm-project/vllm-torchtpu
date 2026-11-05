@@ -120,6 +120,46 @@ def _make(mode: str, collect_every: int, name: str) -> StepGCPolicy | None:
     return StepGCPolicy(collect_every, name)
 
 
+_TRACE_MIN_NS = 2_000_000
+_TRACE_INSTALLED: set[str] = set()
+
+
+def install_trace(name: str) -> None:
+    """Log cyclic collections of 2 ms or more with ``gc.callbacks``.
+
+    One line per collection: generation, duration, the wall clock in ns at its
+    start (``time.time_ns``, the clock the step records use), objects collected.
+    A stall in the step records that coincides with a line here is a collection
+    pause; one that does not is something else. Idempotent per process name.
+    """
+    if name in _TRACE_INSTALLED:
+        return
+    _TRACE_INSTALLED.add(name)
+    started = {"perf": 0, "wall": 0}
+
+    def callback(phase: str, info: dict) -> None:
+        if phase == "start":
+            started["perf"] = time.perf_counter_ns()
+            started["wall"] = time.time_ns()
+            return
+        elapsed = time.perf_counter_ns() - started["perf"]
+        if elapsed < _TRACE_MIN_NS:
+            return
+        logger.info(
+            "gc trace (%s): generation %d collection %.1f ms at wall %d ns, "
+            "collected %d, uncollectable %d",
+            name,
+            info.get("generation", -1),
+            elapsed / 1e6,
+            started["wall"],
+            info.get("collected", 0),
+            info.get("uncollectable", 0),
+        )
+
+    gc.callbacks.append(callback)
+    logger.info("gc trace (%s): logging collections of %d ms or more", name, _TRACE_MIN_NS // 1_000_000)
+
+
 def install(mode: str, collect_every: int) -> StepGCPolicy | None:
     """Create the policy named by ``TPU_GC_POLICY``, or none for 'default'."""
     global _POLICY
@@ -130,6 +170,8 @@ def install(mode: str, collect_every: int) -> StepGCPolicy | None:
 def arm_after_warmup() -> None:
     from vllm_torchtpu import envs
 
+    if envs.TPU_GC_TRACE:
+        install_trace("runner")
     policy = install(envs.TPU_GC_POLICY, envs.TPU_GC_COLLECT_EVERY)
     if policy is not None:
         policy.arm()
@@ -153,6 +195,8 @@ def install_engine_core() -> None:
 
     from vllm_torchtpu import envs
 
+    if envs.TPU_GC_TRACE:
+        install_trace("engine core")
     if getattr(EngineCoreProc._process_engine_step, "_tpu_gc_policy", False):
         return
     policy = _make(envs.TPU_GC_POLICY, envs.TPU_GC_COLLECT_EVERY, "engine core")

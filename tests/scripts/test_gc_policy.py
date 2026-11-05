@@ -158,3 +158,25 @@ def test_engine_core_install_is_inert_under_the_default_policy(monkeypatch):
     assert EngineCoreProc._process_engine_step is step
     assert DPEngineCoreProc._has_global_unfinished_reqs is sync
     assert gc_policy._ENGINE_POLICY is None
+
+
+def test_trace_logs_slow_collections_only(monkeypatch, caplog):
+    import gc
+    import logging
+
+    from vllm_torchtpu import gc_policy
+
+    monkeypatch.setattr(gc_policy, "_TRACE_INSTALLED", set())
+    monkeypatch.setattr(gc_policy, "_TRACE_MIN_NS", 0)
+    before = list(gc.callbacks)
+    try:
+        with caplog.at_level(logging.INFO, logger=gc_policy.logger.name):
+            gc_policy.install_trace("test")
+            gc_policy.install_trace("test")  # idempotent
+            gc.collect()
+        assert len(gc.callbacks) == len(before) + 1
+        lines = [r.getMessage() for r in caplog.records if "gc trace (test): generation" in r.getMessage()]
+        assert lines, caplog.text
+        assert "collection" in lines[-1] and "at wall" in lines[-1]
+    finally:
+        gc.callbacks[:] = before
