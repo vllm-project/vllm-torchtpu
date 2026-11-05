@@ -121,6 +121,17 @@ def _layer_windows(model) -> list[int | None]:
     return [layer.self_attn.attn.sliding_window for layer in model.model.layers]
 
 
+def _rope_caches(model) -> list:
+    """Per layer, the RoPE cache's [rows, dtype], or None on a NoPE layer."""
+    ropes = [layer.self_attn.rotary_emb for layer in model.model.layers]
+    return [
+        None
+        if rope is None
+        else [rope.cos_sin_cache.shape[0], rope.cos_sin_cache.dtype]
+        for rope in ropes
+    ]
+
+
 def _softcap_and_peak_logit(model) -> list[float]:
     """The model's logit softcap and the max |logit| of a huge final hidden state."""
     norm = model.model.norm.weight
@@ -137,6 +148,12 @@ def _cache_misses(worker) -> int:
 def test_beam_windows_only_the_sliding_layers(llm: LLM):
     [windows] = llm.apply_model(_layer_windows)
     assert list(windows) == [WINDOW, None]
+
+
+def test_beam_rope_cache_covers_max_model_len(llm: LLM):
+    """Sized to max_model_len, not the 1M max_position_embeddings; NoPE has none."""
+    [ropes] = llm.apply_model(_rope_caches)
+    assert list(ropes) == [[MAX_MODEL_LEN, torch.float32], None]
 
 
 def test_beam_softcaps_the_logits(llm: LLM):
