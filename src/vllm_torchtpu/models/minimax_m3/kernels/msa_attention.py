@@ -151,7 +151,7 @@ def _page_rows(kv_ref) -> jax.Array:
 
 
 def _bitcast_slots(rows_per_page: int, packing: int) -> jax.Array:
-    """Slot of each row of `_page_rows`, as a ``[1, S]`` lane vector.
+    """Slot of each row of `_page_rows`, as an ``[S, 1]`` column.
 
     Bitcasts words holding their own slot ids the same way the page is
     bitcast, so the order is whatever the hardware bitcast produces.
@@ -163,7 +163,7 @@ def _bitcast_slots(rows_per_page: int, packing: int) -> jax.Array:
     for j in range(packing):
         words = words | ((row * packing + j) << (bits * j))
     slots = pltpu.bitcast(words, uint).astype(jnp.int32)  # [S, 128], equal lanes
-    return slots[:, :1].T  # [1, S]
+    return slots[:, :1]  # [S, 1]
 
 
 def _kernel_v2(
@@ -196,7 +196,8 @@ def _kernel_v2(
         l_ref[...] = jnp.zeros_like(l_ref)
         acc_ref[...] = jnp.zeros_like(acc_ref)
 
-    slots = _bitcast_slots(rows_per_page, packing)  # [1, S]
+    row_slots = _bitcast_slots(rows_per_page, packing)  # [S, 1]
+    slots = row_slots.T  # [1, S]
     selected = selected_ref[...]
     local_page = local_page_ref[...]
     local_limit = local_limit_ref[...]
@@ -204,13 +205,15 @@ def _kernel_v2(
     for g, kv_ref in enumerate(kv_refs):
         page = work_page_ref[w * pages_per_step + g]
         rows = _page_rows(kv_ref)
-        keys.append(rows[:, :head_dim])
-        values.append(rows[:, head_dim:])
         is_selected = jnp.max(
             (selected == page).astype(jnp.int32), axis=1, keepdims=True
         )
         limit = jnp.where(local_page == page, local_limit, page_size)
         limit = jnp.where(page >= 0, limit * is_selected, 0)  # [Bq, 1]
+        keys.append(rows[:, :head_dim])
+        # Zero the value rows no token of the tile sees (p = 0 there, but
+        # 0 * NaN is NaN and an unwritten slot may hold any bytes).
+        values.append(jnp.where(row_slots < jnp.max(limit), rows[:, head_dim:], 0))
         masks.append(slots < limit)  # [Bq, S]
     k = jnp.concatenate(keys, axis=0)
     v = jnp.concatenate(values, axis=0)

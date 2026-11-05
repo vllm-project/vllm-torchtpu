@@ -104,8 +104,9 @@ def test_matches_dense_reference(
     np.testing.assert_allclose(np.asarray(out.astype(jnp.float32)), expected, atol=2e-2)
 
 
+@pytest.mark.parametrize("kernel,block_q", [("v1", 64), ("v2", 64), ("v2", 16)])
 @pytest.mark.parametrize("dtype", CACHE_DTYPES)
-def test_unseen_cache_bytes_do_not_leak(dtype):
+def test_unseen_cache_bytes_do_not_leak(dtype, kernel, block_q):
     """NaN in slots no token sees leaves the output finite and unchanged.
 
     A tile's page union is cut into groups of `pages_per_step`; the slots past
@@ -138,6 +139,8 @@ def test_unseen_cache_bytes_do_not_leak(dtype):
             jnp.asarray(local_page),
             jnp.asarray(local_limit),
             sm_scale=HEAD_DIM**-0.5,
+            block_q=block_q,
+            kernel=kernel,
             interpret=True,
         )
 
