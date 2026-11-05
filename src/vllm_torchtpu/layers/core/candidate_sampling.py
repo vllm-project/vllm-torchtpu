@@ -50,6 +50,13 @@ SAMPLING_EPS = 1e-5
 _INT32_MAX = 2**31 - 1
 
 
+def _rounded(x: jax.Array, dtype) -> jax.Array:
+    """x rounded to bf16 when the torch op's result is bf16. XLA may keep a
+    bf16 intermediate at float32 inside a fusion; the served torch program
+    rounds at these points, and so must the candidate and full paths."""
+    return lax.reduce_precision(x, 8, 7) if dtype == jnp.bfloat16 else x
+
+
 def _sum(x: jax.Array, axis: int = -1) -> jax.Array:
     """Sum in the input dtype, the reduction torch emits for ``torch.sum``."""
     axis = axis % x.ndim
@@ -110,7 +117,7 @@ def softmax(x: jax.Array) -> jax.Array:
     xf = x.astype(jnp.float32)
     shifted = xf - jnp.max(xf, axis=-1, keepdims=True)
     e = jnp.exp(shifted)
-    return (e / _sum(e)[..., None]).astype(x.dtype)
+    return _rounded(e / _sum(e)[..., None], x.dtype).astype(x.dtype)
 
 
 def topp_mask(logits: jax.Array, p: jax.Array) -> jax.Array:
@@ -121,7 +128,8 @@ def topp_mask(logits: jax.Array, p: jax.Array) -> jax.Array:
 
     def predicate(threshold):
         threshold = threshold[..., None]
-        return _sum(jnp.where(probs >= threshold, probs, zero)) < p
+        mass = _sum(jnp.where(probs >= threshold, probs, zero))
+        return _rounded(mass, probs.dtype) < p
 
     threshold = _float32_bsearch(logits.shape[:-1], predicate)[..., None]
     replace = jnp.full_like(logits, MASKED_LOGIT_VALUE)
@@ -149,6 +157,7 @@ def topp_mask_pairwise(logits: jax.Array, p: jax.Array):
     zero = jnp.zeros_like(probs)
     kept = probs[..., None, :] >= probs[..., :, None]
     mass = _sum(jnp.where(kept, probs[..., None, :], zero[..., None, :]))
+    mass = _rounded(mass, probs.dtype)
     ok = ~(mass < p)
     threshold = jnp.max(jnp.where(ok, probs, -jnp.inf), axis=-1, keepdims=True)
     replace = jnp.full_like(logits, MASKED_LOGIT_VALUE)
@@ -188,7 +197,7 @@ def argmax_lowest_id(x: jax.Array, ids: jax.Array) -> jax.Array:
 
 def _bonus_scale(x, temps):
     safe = jnp.where(temps == 0.0, jnp.ones_like(temps), temps)
-    return x / safe
+    return _rounded(x / safe, x.dtype)
 
 
 def _target_scale(x, temps):
@@ -207,7 +216,9 @@ def sample_bonus(vals, ids, greedy, temps, top_k, top_p, u, pairwise=False):
     masked, cutoff, topp_ok = apply_top_k_top_p(
         _bonus_scale(vals, temps), top_k, top_p, pairwise
     )
-    noisy = masked + -jnp.log(-jnp.log(_clamp_uniform(u)))
+    log_u = _rounded(jnp.log(_clamp_uniform(u)), u.dtype)
+    gumbel = -_rounded(jnp.log(-log_u), u.dtype)
+    noisy = _rounded(masked + gumbel, masked.dtype)
     sampled = argmax_lowest_id(jnp.where(is_greedy, vals, noisy), ids)
     return jnp.where(is_greedy[:, 0], greedy, sampled), cutoff, topp_ok
 
