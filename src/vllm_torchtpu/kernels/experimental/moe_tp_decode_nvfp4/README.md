@@ -63,16 +63,17 @@ out = moe_tp_decode_nvfp4(
   (`min(max_group, E_local, max(1, group_cols // (2 * I_rank)))`; default
   `g = 2` when `I_rank == 256`, `g = 1` when `I_rank >= 512`), keeping
   `g * 2 * I_rank <= 1024` and the default 4-slot weight ring (`num_buffers=4`)
-  within `19.0–19.75 MiB` of VMEM (`33.47–43.16 MiB` total VMEM limit across
+  within `20.25–21.00 MiB` of VMEM (`35.03–44.73 MiB` total VMEM limit across
   `m in (16, 32, 64)` vs the `56.00 MiB` budget cap).
 - Static tuning arguments:
   - `max_group` (`int`, default `4`), `group_cols` (`int`, default `1024`), and
     `num_buffers` (`int`, default `4`): control `g` and the weight-ring depth
     (`num_buffers >= 2`). Passing `group_cols=2048, num_buffers=3` selects the
-    wider `g = 4` (`TP8`) / `g = 2` (`EP2xTP4`) 3-slot ring configuration.
+    wider `g = 4` (`TP8`) / `g = 2` (`EP2xTP4`) 3-slot ring configuration for
+    `m in (16, 32)` (`group_cols=2048, num_buffers=2` fits `m = 64`).
   - `contig_dma` (`bool`, default `False`): when `True` and `g > 1`, stores
     `w13` and `s13` ring slots per expert (`(num_buffers, g, H // 8, 2 * I_rank)`
-    and `(num_buffers, g, H // 512, 2 * I_rank)`) so each per-expert HBM->VMEM
+    and `(num_buffers, g, H // 512, 1, 2 * I_rank)`) so each per-expert HBM->VMEM
     async DMA targets a contiguous subbuffer, concatenating widened FP8
     K-blocks in VREGs before the grouped `[m, 512] x [512, g * 2 * I_rank]`
     dot (`+0` VMEM bytes vs default).
@@ -123,13 +124,17 @@ the requantization block size per matrix (`b13 = min(block, H)` and
 `I_rank` up to `512`. For GLM-5.2 (`H = 6144, E = 256, I_tp8 = 256,
 I_shared_tp8 = 256`, 8 TPU7x ranks):
 
-| Layout | Sharding | Per-rank experts (`E_local`) | `I_rank` | Requant blocks (`b13 / b2`) | Group `g` | Ring slot (4-slot ring) | VMEM (`m = 16 / 32 / 64`) |
-| :--- | :--- | ---: | ---: | :--- | ---: | ---: | :--- |
-| `TP8` | `ep=1, tp=8` | `256` (`e0 = 0`) | `256` | `512 / 256` (`12` / `1` blocks) | `2` | `4.94 MiB` (`19.75 MiB`) | `27.52 / 29.73 / 34.53 MiB` |
-| `EP2xTP4` | `ep=2, tp=4` | `128` (`e0 in {0, 128}`) | `512` | `512 / 512` (`12` / `1` blocks) | `1` | `4.75 MiB` (`19.00 MiB`) | `26.77 / 28.98 / 33.78 MiB` |
+| Layout | Sharding | Per-rank experts (`E_local`) | `I_rank` | Requant blocks (`b13 / b2`) | Group `g` | Ring slot (4-slot ring) | VMEM need (`m = 16 / 32 / 64`) | VMEM limit (`m = 16 / 32 / 64`) |
+| :--- | :--- | ---: | ---: | :--- | ---: | ---: | :--- | :--- |
+| `TP8` | `ep=1, tp=8` | `256` (`e0 = 0`) | `256` | `512 / 256` (`12` / `1` blocks) | `2` | `5.25 MiB` (`21.00 MiB`) | `28.77 / 30.98 / 35.78 MiB` | `35.97 / 38.73 / 44.73 MiB` |
+| `EP2xTP4` | `ep=2, tp=4` | `128` (`e0 in {0, 128}`) | `512` | `512 / 512` (`12` / `1` blocks) | `1` | `5.06 MiB` (`20.25 MiB`) | `28.02 / 30.23 / 35.03 MiB` | `35.03 / 37.79 / 43.79 MiB` |
 
-At `TP8`, clamping `b2` to `256` avoids padding `I_rank` from `256` to `512`,
-which would otherwise double routed-expert HBM on 4-chip hosts.
+`s13` and `s2` stay 4D (`[E_local, B, 1, cols]`) across the `pallas_call` HBM
+operands and VMEM scratch slots so the size-1 sublane-guard dimension is
+preserved without an XLA `T(1, 128) -> T(8, 128)` reshape+copy at the
+custom-call boundary. At `TP8`, clamping `b2` to `256` avoids padding `I_rank`
+from `256` to `512`, which would otherwise double routed-expert HBM on 4-chip
+hosts.
 
 ## Numerics
 

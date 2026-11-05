@@ -651,8 +651,9 @@ def test_tuning_levers_admission_vmem_and_kernel_name(monkeypatch):
     assert tuned_tp8.endswith("-fast-cdma-ovlp-stail")
 
     # VMEM plan & admission across EP2xTP4 (g=1, nb=4) and TP8 (g=2, nb=4) at
-    # m=16,32,64 with >12 MiB headroom below the 56 MiB cap, plus legacy
-    # (group_cols=2048, num_buffers=3) admission and contig_dma zero-byte delta.
+    # m=16,32,64 with >11 MiB headroom below the 56 MiB cap, plus legacy
+    # (group_cols=2048, num_buffers=3) admission at m=16,32 and contig_dma
+    # zero-byte delta.
     cap_bytes = int(info.vmem_capacity_bytes * nvfp4_kernel_impl.VMEM_FRACTION)
     for cfg, exp_g, legacy_g in ((GLM52_EP2TP4, 1, 2), (GLM52_TP8, 2, 4)):
         g_def = kernel.group_size(cfg["i"], cfg["e"] // cfg["ep"])
@@ -690,7 +691,7 @@ def test_tuning_levers_admission_vmem_and_kernel_name(monkeypatch):
                 contig_dma=True,
             )
             assert plan_def is not None and plan_cdma == plan_def
-            assert cap_bytes - plan_def[1] >= 12 * 2**20
+            assert cap_bytes - plan_def[1] >= 11 * 2**20
             plan_leg = nvfp4_kernel_impl._vmem_plan(
                 rows,
                 cfg["h"],
@@ -718,19 +719,37 @@ def test_tuning_levers_admission_vmem_and_kernel_name(monkeypatch):
                 num_buffers=3,
                 contig_dma=True,
             )
-            assert plan_leg is not None and plan_leg_cdma == plan_leg
+            assert plan_leg_cdma == plan_leg
             assert kernel.can_use_moe_tp_decode_nvfp4(
                 *shps, topk=cfg["topk"], n_ranks=N_RANKS
             )
             assert kernel.can_use_moe_tp_decode_nvfp4(
                 *shps, topk=cfg["topk"], n_ranks=N_RANKS, contig_dma=True
             )
+            if rows in (16, 32):
+                assert plan_leg is not None
+                assert kernel.can_use_moe_tp_decode_nvfp4(
+                    *shps,
+                    topk=cfg["topk"],
+                    n_ranks=N_RANKS,
+                    group_cols=2048,
+                    num_buffers=3,
+                )
+            else:
+                assert plan_leg is None
+                assert not kernel.can_use_moe_tp_decode_nvfp4(
+                    *shps,
+                    topk=cfg["topk"],
+                    n_ranks=N_RANKS,
+                    group_cols=2048,
+                    num_buffers=3,
+                )
             assert kernel.can_use_moe_tp_decode_nvfp4(
                 *shps,
                 topk=cfg["topk"],
                 n_ranks=N_RANKS,
                 group_cols=2048,
-                num_buffers=3,
+                num_buffers=2,
             )
             # Legacy wide group (g=2/4) with 4 buffers exceeds the 56 MiB VMEM cap.
             assert not kernel.can_use_moe_tp_decode_nvfp4(
@@ -997,8 +1016,8 @@ def test_tuning_levers_cpu_kernel_bitwise_and_dma_invariants(monkeypatch):
             jnp.asarray(rng.standard_normal((el, cfg_i, h), np.float32) * 0.3, FP4),
             copy=True,
         )
-        s1 = np.abs(rng.standard_normal((el, b13, 2 * cfg_i), np.float32)) * 0.05
-        s2 = np.abs(rng.standard_normal((el, b2, h), np.float32)) * 0.05
+        s1 = np.abs(rng.standard_normal((el, b13, 1, 2 * cfg_i), np.float32)) * 0.05
+        s2 = np.abs(rng.standard_normal((el, b2, 1, h), np.float32)) * 0.05
         sw13 = np.array(
             jnp.asarray(rng.standard_normal((h, 2 * fs), np.float32) * 0.3, FP8),
             copy=True,
@@ -1069,9 +1088,9 @@ def test_tuning_levers_cpu_kernel_bitwise_and_dma_invariants(monkeypatch):
                 np.uint32,
             )
             s1_scr = np.zeros(
-                (num_buffers, g, b13, 2 * _i)
+                (num_buffers, g, b13, 1, 2 * _i)
                 if use_cdma
-                else (num_buffers, b13, g * 2 * _i),
+                else (num_buffers, b13, 1, g * 2 * _i),
                 np.float32,
             )
             out = np.array(jnp.full((m, h), -1.0, dtype=BF16), copy=True)
@@ -1096,7 +1115,7 @@ def test_tuning_levers_cpu_kernel_bitwise_and_dma_invariants(monkeypatch):
                 _FakeRef(w1_scr),
                 _FakeRef(np.zeros((num_buffers, g, _i // 8, h), np.uint32)),
                 _FakeRef(s1_scr),
-                _FakeRef(np.zeros((num_buffers, g, b2, h), np.float32)),
+                _FakeRef(np.zeros((num_buffers, g, b2, 1, h), np.float32)),
                 _FakeRef(np.array(jnp.zeros((h, 2 * fs), FP8), copy=True)),
                 _FakeRef(np.zeros((1, 2 * fs), np.float32)),
                 _FakeRef(np.array(jnp.zeros((fs, h), FP8), copy=True)),
@@ -1181,6 +1200,191 @@ def test_tuning_levers_cpu_kernel_bitwise_and_dma_invariants(monkeypatch):
             skip_tail=True,
         )
         assert np.array_equal(got_tied.view(np.uint16), base_tied.view(np.uint16))
+
+
+def test_scale_4d_no_reshape_in_jaxpr_and_tpu_hlo_and_3d_compat(monkeypatch):
+    """4D routed scales reach ``pallas_call`` / ``@tpu_custom_call`` directly as
+    ``[E_local, B, 1, cols]`` with zero ``reshape`` in the jaxpr or TPU HLO."""
+    monkeypatch.setattr(pltpu, "get_tpu_info", _tpu7x)
+    devs = jax.devices()[:1]
+    mesh = Mesh(np.asarray(devs), ("d",))
+    sds = jax.ShapeDtypeStruct
+    specs = (P("d"), P("d"), P(), P(), P("d"), P("d")) + (P("d"),) * 8
+
+    def aval_shape(v: Any) -> tuple[int, ...]:
+        return tuple(v.aval.shape)
+
+    def trace_scales_to_pallas(
+        jaxpr_obj: Any, init_vars: list[Any]
+    ) -> list[tuple[int, ...]]:
+        j = jaxpr_obj.jaxpr if hasattr(jaxpr_obj, "jaxpr") else jaxpr_obj
+        tracked_ids = {id(v) for v in init_vars}
+        found: list[tuple[int, ...]] = []
+        for eqn in j.eqns:
+            matched_pos = [
+                idx for idx, v in enumerate(eqn.invars) if id(v) in tracked_ids
+            ]
+            if not matched_pos:
+                continue
+            assert eqn.primitive.name not in (
+                "reshape",
+                "squeeze",
+                "broadcast_in_dim",
+                "convert_element_type",
+            ), f"unexpected {eqn.primitive.name} on 4D scale: {eqn}"
+            if eqn.primitive.name == "pallas_call":
+                for idx in matched_pos:
+                    found.append(aval_shape(eqn.invars[idx]))
+            elif "jaxpr" in eqn.params:
+                sub = eqn.params["jaxpr"]
+                sub_j = sub.jaxpr if hasattr(sub, "jaxpr") else sub
+                found.extend(
+                    trace_scales_to_pallas(
+                        sub_j, [sub_j.invars[i] for i in matched_pos]
+                    )
+                )
+            else:
+                tracked_ids.update(id(ov) for ov in eqn.outvars)
+        return found
+
+    def collect_pallas_in_shapes(jaxpr_obj: Any) -> list[tuple[int, ...]]:
+        j = jaxpr_obj.jaxpr if hasattr(jaxpr_obj, "jaxpr") else jaxpr_obj
+        shapes: list[tuple[int, ...]] = []
+        for eqn in j.eqns:
+            if eqn.primitive.name == "pallas_call":
+                shapes.extend(aval_shape(v) for v in eqn.invars if hasattr(v, "aval"))
+            elif "jaxpr" in eqn.params:
+                shapes.extend(collect_pallas_in_shapes(eqn.params["jaxpr"]))
+        return shapes
+
+    for cfg in (GLM52_EP2TP4, GLM52_TP8):
+        el = cfg["e"] // cfg["ep"]
+        b13 = cfg["h"] // cfg["b13"]
+        b2 = cfg["i"] // cfg["b2"]
+        two_i = 2 * cfg["i"]
+        h = cfg["h"]
+        topk = cfg["topk"]
+        shps = _shapes(16, cfg)
+
+        def call_direct(*d_args, _tk: int = topk, _h: bool = False, _c: bool = False):
+            return kernel.moe_tp_decode_nvfp4(
+                *d_args,
+                routed_scale=ROUTED_SCALE,
+                topk=_tk,
+                n_ranks=N_RANKS,
+                hbm_operands=_h,
+                contig_dma=_c,
+            )
+
+        # 1. Direct jaxpr inspection: 4D s13 and s2 invars flow straight into
+        #    pallas_call (or memory_space_cast -> pallas_call) with no reshape.
+        direct_args = (
+            shps[0],
+            shps[1],
+            shps[2],
+            sds((), jnp.int32),
+            sds((), jnp.int32),
+            *shps[3:],
+            sds((), jnp.int32),
+        )
+        for hbm_ops in (False, True):
+            for cdma in (False, True):
+                closed = jax.make_jaxpr(
+                    lambda *a, _f=call_direct, _h=hbm_ops, _c=cdma: _f(*a, _h=_h, _c=_c)
+                )(*direct_args)
+                s1_var, s2_var = closed.jaxpr.invars[7], closed.jaxpr.invars[8]
+                assert aval_shape(s1_var) == (el, b13, 1, two_i)
+                assert aval_shape(s2_var) == (el, b2, 1, h)
+                pallas_scale_shapes = trace_scales_to_pallas(
+                    closed.jaxpr, [s1_var, s2_var]
+                )
+                assert pallas_scale_shapes == [
+                    (el, b13, 1, two_i),
+                    (el, b2, 1, h),
+                ]
+
+        # 2. TPU7x StableHLO lowering: @tpu_custom_call receives 4D scale tensors
+        #    directly with zero stablehlo.reshape on the scale shapes.
+        abstract_args = (
+            shps[0],
+            shps[1],
+            shps[2],
+            sds((1,), jnp.int32),
+            sds((1, 1), jnp.int32),
+            sds((1, 1), jnp.int32),
+            *shps[3:],
+        )
+        s1_mlir = f"tensor<{el}x{b13}x1x{two_i}xf32>"
+        s2_mlir = f"tensor<{el}x{b2}x1x{h}xf32>"
+        s1_3d_mlir = f"tensor<{el}x{b13}x{two_i}xf32>"
+        s2_3d_mlir = f"tensor<{el}x{b2}x{h}xf32>"
+
+        for hbm_ops in (False, True):
+            for cdma in (False, True):
+
+                def rank_body(
+                    x_s,
+                    s_s,
+                    b_s,
+                    nv_s,
+                    r_s,
+                    e0_s,
+                    *ws_s,
+                    _tk: int = topk,
+                    _h: bool = hbm_ops,
+                    _c: bool = cdma,
+                ):
+                    return kernel.moe_tp_decode_nvfp4(
+                        x_s,
+                        s_s,
+                        b_s,
+                        nv_s[0],
+                        r_s.reshape(()),
+                        *ws_s,
+                        e0_s.reshape(()),
+                        routed_scale=ROUTED_SCALE,
+                        topk=_tk,
+                        n_ranks=N_RANKS,
+                        hbm_operands=_h,
+                        contig_dma=_c,
+                    )
+
+                fn = jax.jit(
+                    jax.shard_map(
+                        rank_body,
+                        mesh=mesh,
+                        in_specs=specs,
+                        out_specs=P("d"),
+                        check_vma=False,
+                    )
+                )
+                hlo = (
+                    fn.trace(*abstract_args)
+                    .lower(lowering_platforms=("tpu",))
+                    .as_text()
+                )
+                assert s1_3d_mlir not in hlo
+                assert s2_3d_mlir not in hlo
+                cc_lines = [ln for ln in hlo.splitlines() if "@tpu_custom_call" in ln]
+                assert len(cc_lines) == 1
+                assert s1_mlir in cc_lines[0] and s2_mlir in cc_lines[0]
+                for ln in hlo.splitlines():
+                    if "reshape" in ln:
+                        assert s1_mlir not in ln and s2_mlir not in ln
+
+        # 3. 3D scale callers expand cleanly to 4D; invalid 4D dim-2 raises ValueError.
+        args_3d = list(direct_args)
+        args_3d[7] = sds((el, b13, two_i), jnp.float32)
+        args_3d[8] = sds((el, b2, h), jnp.float32)
+        closed_3d = jax.make_jaxpr(call_direct)(*args_3d)
+        pallas_in_shapes = collect_pallas_in_shapes(closed_3d.jaxpr)
+        assert (el, b13, 1, two_i) in pallas_in_shapes
+        assert (el, b2, 1, h) in pallas_in_shapes
+
+        bad_args = list(direct_args)
+        bad_args[7] = sds((el, b13, 2, two_i), jnp.float32)
+        with pytest.raises(ValueError, match="Expected 4D scale shapes"):
+            jax.make_jaxpr(call_direct)(*bad_args)
 
 
 @pytest.mark.parametrize(
@@ -2293,6 +2497,7 @@ def _load_runtime_modules(monkeypatch):
     )
     _put_mod(
         "vllm_torchtpu.layers.adapter.quantization.fp8",
+        build_excluded_moe_online_fp8_method=lambda *_a, **_k: None,
         resolve_online_fp8=lambda _c, _l, _p, m: m,
     )
     _put_mod(
