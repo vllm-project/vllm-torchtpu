@@ -195,12 +195,11 @@ def _kernel(
         HEADS_PER_LOAD at a time."""
         for j in range(0, heads_per_chunk, HEADS_PER_LOAD):
             heads = proj_ref[c % 2, :, pl.ds(j * LANE, HEADS_PER_LOAD * LANE)]
-            xs = [
-                heads[:, i * LANE : (i + 1) * LANE].astype(jnp.float32)
-                for i in range(HEADS_PER_LOAD)
-            ]
-            # Every head's lane shuffle is issued before any head's arithmetic.
-            partners = [_gptj_partners(x) for x in xs]
+            hs = [heads[:, i * LANE : (i + 1) * LANE] for i in range(HEADS_PER_LOAD)]
+            xs = [h.astype(jnp.float32) for h in hs]
+            # Every head's lane shuffle is issued before any head's arithmetic,
+            # on the bf16 rows: widening commutes with moving lanes.
+            partners = [_gptj_partners(h).astype(jnp.float32) for h in hs]
             for i, (x, x_partners) in enumerate(zip(xs, partners)):
                 head = c * heads_per_chunk + j + i
                 y = _rope_rows_signed(x, x_partners, lanes_ref[0], lanes_ref[1])

@@ -163,8 +163,13 @@ def _rotate_gptj(x: jax.Array) -> jax.Array:
 
 
 def _gptj_partners(x: jax.Array) -> jax.Array:
-    """``_rotate_gptj`` before its sign: every lane holds its partner lane."""
-    return _lane_gather(x, jnp.arange(LANE) ^ 1)
+    """``_rotate_gptj`` before its sign: every lane holds its partner lane.
+
+    Mosaic gathers with indices as wide as the operand, so a bf16 operand is
+    shuffled packed, two rows per lane shuffle.
+    """
+    index_dtype = jnp.int16 if x.dtype.itemsize == 2 else jnp.int32
+    return _lane_gather(x, (jnp.arange(LANE) ^ 1).astype(index_dtype))
 
 
 def _gptj_sign() -> jax.Array:
