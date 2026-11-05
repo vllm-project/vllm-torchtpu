@@ -167,6 +167,10 @@
 /src/vllm_torchtpu/models/minimax_m3/ @DRZDONG @caojx-google @qizzzh
 /tests/models/minimax_m3/ @DRZDONG @caojx-google @qizzzh
 
+# Models: Kimi-K3
+/src/vllm_torchtpu/models/kimi_k3/ @yiw-wang @QiliangCui @qizzzh
+/tests/models/kimi_k3/ @yiw-wang @QiliangCui @qizzzh
+
 # Megakernel (Framework-Free JAX/Pallas)
 /src/vllm_torchtpu/megakernel/ @caojx-google @annyan09023 @weinan1997 @hhb @brianseung-google
 /tests/megakernel/ @caojx-google @annyan09023 @weinan1997 @hhb @brianseung-google
