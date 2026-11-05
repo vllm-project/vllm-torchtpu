@@ -214,6 +214,12 @@ class TestTensorParallel:
         from jax.sharding import PartitionSpec as P
 
         axis = bridge.EP_AXIS_NAME
+
+        def ein(spec, *operands):
+            # TPU runs default-precision f32 matmuls through bf16 passes;
+            # compare at full precision so the check is on layout, not rounding.
+            return jnp.einsum(spec, *operands, precision=lax.Precision.HIGHEST)
+
         mesh = Mesh(np.array(jax.devices()[:tp]), (axis,))
         tokens, hidden, experts, inter_l, topk = 3, 8, 4, 4, 2
         keys = jax.random.split(jax.random.key(1), 4)
@@ -234,10 +240,10 @@ class TestTensorParallel:
                 assert w2.shape == (experts, inter_l, hidden)
                 assert s1.shape == (experts, 1, 1, 2 * inter_l)
                 assert s2.shape == (experts, 1, 1, hidden)
-                h = jnp.einsum("th,tkhn->tkn", x, w1[ids])
+                h = ein("th,tkhn->tkn", x, w1[ids])
                 gate, up = jnp.split(h, 2, axis=-1)
-                y = jnp.einsum("tki,tkih->tkh", jax.nn.silu(gate) * up, w2[ids])
-                return lax.psum(jnp.einsum("tkh,tk->th", y, weights), axis)
+                y = ein("tki,tkih->tkh", jax.nn.silu(gate) * up, w2[ids])
+                return lax.psum(ein("tkh,tk->th", y, weights), axis)
 
             return jax.shard_map(
                 local,
@@ -275,12 +281,10 @@ class TestTensorParallel:
         gate_full = jnp.concatenate([w13[r, ..., :inter_l] for r in range(tp)], -1)
         up_full = jnp.concatenate([w13[r, ..., inter_l:] for r in range(tp)], -1)
         w2_full = jnp.concatenate([w2[r] for r in range(tp)], axis=1)
-        act = jax.nn.silu(jnp.einsum("th,tkhi->tki", x, gate_full[ids])) * jnp.einsum(
+        act = jax.nn.silu(ein("th,tkhi->tki", x, gate_full[ids])) * ein(
             "th,tkhi->tki", x, up_full[ids]
         )
-        want = jnp.einsum(
-            "tkh,tk->th", jnp.einsum("tki,tkih->tkh", act, w2_full[ids]), weights
-        )
+        want = ein("tkh,tk->th", ein("tki,tkih->tkh", act, w2_full[ids]), weights)
         got = np.asarray(out).reshape(tp, tokens, hidden)
         for r in range(tp):
             np.testing.assert_allclose(got[r], want, rtol=2e-5, atol=2e-5)
