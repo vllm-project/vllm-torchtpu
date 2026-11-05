@@ -14,6 +14,7 @@ from vllm.compilation.decorators import support_torch_compile
 from vllm.forward_context import override_forward_context
 from vllm.models.deepseek_v41.nvidia import model as upstream
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v41.deepseek_v41_mhc_op import (
     initialize_shifted_mhc,
 )
@@ -863,18 +864,31 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
                 else torch.zeros_like(positions, dtype=torch.bool)
             )
         else:
-            # The extra output row absorbs padded scatter writes. Reusing row
-            # zero for padding would overwrite a real request's first result.
-            indices = torch.tensor(
-                plan.indices
-                + (positions.shape[0],) * (plan.padded_num_tokens - len(plan.indices)),
-                dtype=torch.int64,
-                device=positions.device,
-            )
-            gather = indices.clamp(max=positions.shape[0] - 1)
-            decoder_positions = positions[gather]
-            decoder_ids = input_ids[gather] if input_ids is not None else None
-            decoder_hidden, decoder_mix = hidden[gather], pre_mix[gather]
+            num_tokens = positions.shape[0]
+            if (
+                envs.TPU_DEEPSEEK_V41_CED_IDENTITY_REPLAY
+                and plan.padded_num_tokens == num_tokens
+                and plan.indices == tuple(range(num_tokens))
+            ):
+                # Every row replays in place (steady decode): gathering and
+                # scattering by the identity only copies rows.
+                indices = None
+                decoder_positions, decoder_ids = positions, input_ids
+                decoder_hidden, decoder_mix = hidden, pre_mix
+            else:
+                # The extra output row absorbs padded scatter writes. Reusing
+                # row zero for padding would overwrite a real request's first
+                # result.
+                indices = torch.tensor(
+                    plan.indices
+                    + (num_tokens,) * (plan.padded_num_tokens - len(plan.indices)),
+                    dtype=torch.int64,
+                    device=positions.device,
+                )
+                gather = indices.clamp(max=num_tokens - 1)
+                decoder_positions = positions[gather]
+                decoder_ids = input_ids[gather] if input_ids is not None else None
+                decoder_hidden, decoder_mix = hidden[gather], pre_mix[gather]
             bounds = torch.tensor(
                 plan.query_start_loc, dtype=torch.int32, device=positions.device
             )

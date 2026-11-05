@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     TPU_DEEPSEEK_V41_CED: bool = False
+    TPU_DEEPSEEK_V41_CED_IDENTITY_REPLAY: bool = False
     TPU_DEEPSEEK_V41_IMPL: str = "v2"
     TPU_DEEPSEEK_V41_ENGRAM_CPU_OFFLOAD: bool = False
     TPU_DEEPSEEK_V41_ENGRAM_HBM: str = "auto"
@@ -401,6 +402,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Decoder SWA bounded replay is approximate. Keep full-forward as the
     # default/reference until matched model-quality and performance validation.
     "TPU_DEEPSEEK_V41_CED": env_bool("TPU_DEEPSEEK_V41_CED"),
+    # CED: when the decoder replays every row in place (steady decode), pass
+    # the encoder outputs straight to the decoder stage and return its output
+    # as is, instead of eager gathers and an index_copy scatter by the
+    # identity (v2/model.py). Outputs are unchanged.
+    "TPU_DEEPSEEK_V41_CED_IDENTITY_REPLAY": env_bool(
+        "TPU_DEEPSEEK_V41_CED_IDENTITY_REPLAY", default=False
+    ),
     # Deprecated aliases, resolved by the DSV41 serving-policy verifier.
     # Serving supports v2; v1 remains only as a standalone reference.
     "TPU_DEEPSEEK_V41_IMPL": env_with_choices(

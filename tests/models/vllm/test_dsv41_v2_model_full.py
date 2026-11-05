@@ -1061,6 +1061,59 @@ class TestModelForward:
             model.forward(torch.tensor([1, 2, 3, 4]), torch.tensor([0, 1, 2, 3]))
             mock_sync.assert_called_once()
 
+    @pytest.mark.parametrize("identity_switch", [False, True])
+    def test_forward_ced_identity_replay_matches_gather_and_scatter(
+        self, monkeypatch, identity_switch
+    ) -> None:
+        # A plan that replays every row in place: with the switch the stages
+        # exchange the tensors directly, without it they gather and scatter by
+        # the identity. Both must return the same values and decoder inputs.
+        monkeypatch.setenv(
+            "TPU_DEEPSEEK_V41_CED_IDENTITY_REPLAY", "1" if identity_switch else "0"
+        )
+        model = self._create_model(ced_enabled=True, sp_enabled=False)
+        hidden = torch.arange(4 * 64, dtype=torch.float32).reshape(4, 64)
+        pre_mix = -hidden
+        model.encoder_stage = MagicMock(return_value=(hidden, pre_mix))
+        plan = DecoderReplayPlan(
+            indices=(0, 1, 2, 3),
+            padded_num_tokens=4,
+            query_start_loc=(0, 2, 4),
+            replay_starts=(0, 1),
+        )
+        model.decoder_stage = MagicMock(
+            side_effect=lambda ids, positions, inputs_embeds, encoder_pre_mix: (
+                inputs_embeds * 2 + encoder_pre_mix + positions[:, None]
+            )
+        )
+        meta_entry = _FakeAttnMeta(
+            input_positions=None,
+            query_start_loc=None,
+            seq_lens=torch.tensor([2, 2]),
+        )
+        mock_ctx = _FakeForwardCtx(attn_metadata={"layer_0": meta_entry})
+        ids, positions = torch.tensor([1, 2, 3, 4]), torch.tensor([5, 6, 7, 8])
+        with (
+            patch(
+                "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.upstream.get_forward_context",
+                return_value=mock_ctx,
+            ),
+            patch(
+                "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.plan_decoder_replay",
+                return_value=plan,
+            ),
+        ):
+            res = model.forward(ids, positions)
+        torch.testing.assert_close(
+            res, hidden * 2 + pre_mix + positions[:, None], rtol=0, atol=0
+        )
+        args, kwargs = model.decoder_stage.call_args
+        torch.testing.assert_close(args[0], ids, rtol=0, atol=0)
+        torch.testing.assert_close(args[1], positions, rtol=0, atol=0)
+        torch.testing.assert_close(kwargs["inputs_embeds"], hidden, rtol=0, atol=0)
+        torch.testing.assert_close(kwargs["encoder_pre_mix"], pre_mix, rtol=0, atol=0)
+        assert (kwargs["inputs_embeds"] is hidden) == identity_switch
+
 
 # ==============================================================================
 # 8. Tests for DeepseekV41Model._forward_stage
