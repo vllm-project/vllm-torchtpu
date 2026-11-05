@@ -82,12 +82,18 @@ def llm():
 
 
 def _describe(model):
-    """Runs in the worker: per-layer windows, and the max |logit| of a huge input."""
-    windows = [layer.self_attn.attn.sliding_window for layer in model.model.layers]
+    """Runs in the worker: per-layer windows and RoPE caches, and the max |logit| of
+    a huge input."""
+    layers = model.model.layers
+    windows = [layer.self_attn.attn.sliding_window for layer in layers]
+    ropes = [
+        None if r is None else [r.cos_sin_cache.shape[0], r.cos_sin_cache.dtype]
+        for r in (layer.self_attn.rotary_emb for layer in layers)
+    ]
     norm = model.model.norm.weight
     huge = torch.full((1, norm.shape[0]), 1e3, device=norm.device, dtype=norm.dtype)
     peak = model.compute_logits(huge).abs().max().item()
-    return windows, peak, model.final_logit_softcapping
+    return windows, ropes, peak, model.final_logit_softcapping
 
 
 def _cache_misses(worker) -> int:
@@ -99,8 +105,10 @@ def test_beam_engine_serves_on_tpu(llm: LLM):
     """Windows the sliding layer only, soft-caps the logits and decodes past the window;
     once warm, new lengths in the same buckets compile nothing (first use compiles
     sampler/logprobs programs)."""
-    [(windows, peak, softcap)] = llm.apply_model(_describe)
+    [(windows, ropes, peak, softcap)] = llm.apply_model(_describe)
     assert list(windows) == [WINDOW, None] and softcap == 30.0  # The real config's.
+    # Sized to max_model_len, not the 1M max_position_embeddings; full layers use SSMax.
+    assert list(ropes) == [[1024, torch.float32], None]
     assert 0 < peak <= softcap
 
     def generate(lengths):

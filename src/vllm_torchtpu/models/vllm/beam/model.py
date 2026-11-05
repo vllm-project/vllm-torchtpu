@@ -133,11 +133,15 @@ class BeamAttention(nn.Module):
 
         is_sliding = config.layer_types[layer_id] == "sliding_attention"
         self.disable_rope = not is_sliding
-        # Beam rotates in fp32.
+        # Beam rotates in fp32. The cache covers max_model_len positions, not
+        # the 1M max_position_embeddings (512 MB in fp32).
         self.rotary_emb = (
             get_rope(
                 self.head_dim,
-                max_position=config.max_position_embeddings,
+                max_position=min(
+                    config.max_position_embeddings,
+                    vllm_config.model_config.max_model_len,
+                ),
                 is_neox_style=True,
                 rope_parameters=config.rope_parameters,
                 dtype=torch.float32,
@@ -164,6 +168,9 @@ class BeamAttention(nn.Module):
             [self.q_size, self.kv_size, self.kv_size, self.q_size], dim=-1
         )
         rope = self.rotary_emb
+        if rope is not None:
+            # Keep the lookup in bounds if a position ever exceeds max_model_len.
+            positions = positions.clamp(max=rope.cos_sin_cache.shape[0] - 1)
         q, k = ops.beam_qk_norm_rope(
             q,
             k,
