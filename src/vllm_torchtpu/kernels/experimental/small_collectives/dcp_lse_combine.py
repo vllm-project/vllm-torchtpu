@@ -59,6 +59,8 @@ rows and dead rows past ``live_tokens`` are zeroed.
 
 from __future__ import annotations
 
+from typing import Any
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -277,9 +279,7 @@ def _pack_lse_header(l_col: jax.Array, part_rows: int, vdim: int) -> jax.Array:
             blk = jnp.where(sub == r, tr_c, blk)
         lane_blocks.append(blk)
     hdr_f32 = (
-        jnp.concatenate(lane_blocks, axis=1)
-        if len(lane_blocks) > 1
-        else lane_blocks[0]
+        jnp.concatenate(lane_blocks, axis=1) if len(lane_blocks) > 1 else lane_blocks[0]
     )
     return pltpu.bitcast(hdr_f32, jnp.int16)
 
@@ -299,10 +299,10 @@ def _unpack_lse_header(hdr_i16: jax.Array, part_rows: int) -> jax.Array:
 
 
 def _clean_part(part_i16: jax.Array, live_mask_col: jax.Array | None) -> jax.Array:
-    """Bitcast ``int16[rows, vdim]`` to ``bf16``, zero NaNs (and dead rows when
-    ``live_mask_col`` is given), and widen to ``float32``."""
+    """Bitcast ``int16[rows, vdim]`` to ``bf16``, zero non-finite values (and
+    dead rows when ``live_mask_col`` is given), and widen to ``float32``."""
     part = pltpu.bitcast(part_i16, jnp.bfloat16)
-    valid = ~jnp.isnan(part)
+    valid = jnp.isfinite(part)
     if live_mask_col is not None:
         valid = valid & live_mask_col
     return jnp.where(valid, part, jnp.bfloat16(0)).astype(jnp.float32)
@@ -353,9 +353,7 @@ def _merge_n_slots(
     slots ``[num_senders, 16 + part_rows, vdim]``, rounded once to ``bf16``."""
     lses = []
     for k in range(num_senders):
-        lk = _unpack_lse_header(
-            recv_ref[k, pl.ds(0, HEADER_ROWS), :], part_rows
-        )
+        lk = _unpack_lse_header(recv_ref[k, pl.ds(0, HEADER_ROWS), :], part_rows)
         if live_mask_col is not None:
             lk = jnp.where(live_mask_col, lk, -jnp.inf)
         lses.append(lk)
@@ -420,7 +418,7 @@ def dcp_online_lse_combine(
         downstream VMEM consumer (e.g. ``fp8_uv_oproj_all_reduce`` /
         ``fp8_oproj_all_reduce``) avoids an HBM round-trip.
       vmem_limit_bytes: scoped VMEM limit for Mosaic compilation.
-      collective_id: barrier semaphore ID (default ``13``).
+      collective_id: barrier semaphore ID (default ``21``).
       interpret: Pallas CPU interpret mode for unit testing.
     """
     if partial.ndim != 3 or lse.ndim != 2:
@@ -522,6 +520,8 @@ def dcp_online_lse_combine(
         def flat_kernel(*refs):
             refs_list = list(refs)
             me, my_lane, sizes, live_mask_col = pop_headers(refs_list)
+            out_sem: Any = None
+            v_out: Any = None
             if not out_vmem:
                 out_sem = refs_list.pop()
                 v_out = refs_list.pop()
@@ -621,6 +621,8 @@ def dcp_online_lse_combine(
         def pairs_kernel(*refs):
             refs_list = list(refs)
             me, my_lane, sizes, live_mask_col = pop_headers(refs_list)
+            out_sem: Any = None
+            v_out: Any = None
             if not out_vmem:
                 out_sem = refs_list.pop()
                 v_out = refs_list.pop()
@@ -651,9 +653,7 @@ def dcp_online_lse_combine(
             )
             lse_val = lse_ref[...]
             for i in range(chips):
-                l_even = _extract_block_lse_col(
-                    lse_val, (2 * i) * local, tokens, local
-                )
+                l_even = _extract_block_lse_col(lse_val, (2 * i) * local, tokens, local)
                 l_odd = _extract_block_lse_col(
                     lse_val, (2 * i + 1) * local, tokens, local
                 )

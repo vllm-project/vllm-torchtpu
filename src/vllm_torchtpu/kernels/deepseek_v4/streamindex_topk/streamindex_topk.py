@@ -2447,11 +2447,11 @@ def streamindex_topk_dcp(
         a mesh with a lane axis of size > 1 the torch bridge must pass
         `dcp_lane_ids`. None reads `TPU_DCP_INDEXER_SMALL_AG`. Same
         bytes, so the same result.
-      a2a_small_coll: with `a2a_merge` on eligible buckets (`padded_num_tokens <=
-        TPU_DCP_INDEXER_A2A_SMALL_COLL_MAX_TOKENS`), run both the score
-        `all_to_all` and the slot `all_gather` as Pallas remote-DMA small
-        collectives over flat 1-D HBM buffers instead of XLA collectives. None
-        reads `TPU_DCP_INDEXER_A2A_SMALL_COLL`. Same bytes, same result.
+      a2a_small_coll: with `a2a_merge` on eligible buckets
+        (`supports_indexer_score_all_to_all`), run both the score `all_to_all`
+        and the slot `all_gather` as Pallas remote-DMA small collectives over
+        flat 1-D HBM buffers instead of XLA collectives. Same bytes, same
+        result.
       dcp_lane_ids: optional i32[dcp_size] sharded over `dcp_axis_name`,
         each shard holding its index on the mesh's other (lane) axis
         (`dcp_lane_operand`): the small collectives' peer addresses under the
@@ -2508,8 +2508,6 @@ def streamindex_topk_dcp(
     small_all_gather = (
         bool(small_all_gather) and flat_merge and q.shape[0] <= SMALL_AG_MAX_TOKENS
     )
-    if a2a_small_coll is None:
-        a2a_small_coll = _envs.TPU_DCP_INDEXER_A2A_SMALL_COLL
     a2a_small_coll = (
         bool(a2a_small_coll)
         and a2a_merge
@@ -2517,7 +2515,6 @@ def streamindex_topk_dcp(
             q.shape[0],
             dcp_size,
             k,
-            _envs.TPU_DCP_INDEXER_A2A_SMALL_COLL_MAX_TOKENS,
         )
     )
     small_ag_hbm = _envs.TPU_SMALL_COLL_HBM_OPERAND

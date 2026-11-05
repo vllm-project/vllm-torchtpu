@@ -212,22 +212,34 @@ def test_mesh_has_chip_pairs_1d_and_2d():
     assert not comb.mesh_has_chip_pairs(_FakeMesh(bad_lane, ("dcp_lane", "dcp")), "dcp")
 
 
+def test_clean_part_masks_inf_and_nan_padding():
+    raw_bf16 = jnp.zeros((16, 128), dtype=jnp.bfloat16)
+    raw_bf16 = raw_bf16.at[0, 0].set(jnp.bfloat16(2.5))
+    raw_bf16 = raw_bf16.at[0, 1].set(jnp.bfloat16(jnp.inf))
+    raw_bf16 = raw_bf16.at[0, 2].set(jnp.bfloat16(-jnp.inf))
+    raw_bf16 = raw_bf16.at[0, 3].set(jnp.bfloat16(jnp.nan))
+    raw_bf16 = raw_bf16.at[8:, :].set(jnp.bfloat16(-jnp.inf))
+    raw_i16 = jax.lax.bitcast_convert_type(raw_bf16, jnp.int16)
+    live_mask = jnp.arange(16)[:, None] < 4
+    cleaned = comb._clean_part(raw_i16, live_mask)
+    assert bool(jnp.all(jnp.isfinite(cleaned)))
+    assert float(cleaned[0, 0]) == 2.5
+    assert float(cleaned[0, 1]) == 0.0
+    assert float(cleaned[0, 2]) == 0.0
+    assert float(cleaned[0, 3]) == 0.0
+    assert float(jnp.max(jnp.abs(cleaned[4:, :]))) == 0.0
+
+
 def test_envs_defaults_and_oproj_limit_m(monkeypatch):
     from vllm_torchtpu import envs
     from vllm_torchtpu.kernels.quantized_matmul import fp8_oproj_all_reduce
 
     assert fp8_oproj_all_reduce.LIMIT_M == 96
     monkeypatch.delenv("TPU_DCP_ONLINE_LSE_COMBINE", raising=False)
-    monkeypatch.delenv("TPU_DCP_ONLINE_LSE_COMBINE_MAX_TOKENS", raising=False)
-    monkeypatch.delenv("TPU_DCP_ONLINE_LSE_COMBINE_MIN_TOKENS", raising=False)
-    monkeypatch.delenv("TPU_DCP_ONLINE_LSE_COMBINE_LIVE_TOKENS", raising=False)
-    monkeypatch.delenv("TPU_DCP_ONLINE_LSE_COMBINE_OUT_VMEM", raising=False)
     assert envs.TPU_DCP_ONLINE_LSE_COMBINE == ""
-    assert envs.TPU_DCP_ONLINE_LSE_COMBINE_MAX_TOKENS == 96
-    assert envs.TPU_DCP_ONLINE_LSE_COMBINE_MIN_TOKENS == 16
-    assert envs.TPU_DCP_ONLINE_LSE_COMBINE_LIVE_TOKENS is True
-    assert envs.TPU_DCP_ONLINE_LSE_COMBINE_OUT_VMEM is True
-    assert envs.bucket_gate_edge(envs.TPU_DCP_ONLINE_LSE_COMBINE_MIN_TOKENS) == 8
+    monkeypatch.setenv("TPU_DCP_ONLINE_LSE_COMBINE", "invalid_mode")
+    with pytest.raises(ValueError, match="TPU_DCP_ONLINE_LSE_COMBINE"):
+        _ = envs.TPU_DCP_ONLINE_LSE_COMBINE
 
 
 def test_adapter_env_gate_and_uv_compat(monkeypatch):
@@ -237,21 +249,19 @@ def test_adapter_env_gate_and_uv_compat(monkeypatch):
     from vllm_torchtpu.layers.adapter import cp_mla_attention as cp
 
     fake_group = types.SimpleNamespace(
-        world_size=16, rank_in_group=0, ranks=list(range(16))
+        world_size=16, rank_in_group=0, ranks=list(range(16)), cpu_group=None
     )
     monkeypatch.setattr(cp, "get_dcp_group", lambda: fake_group)
 
     # Default-off: unset env leaves all predicates False / unchanged.
     monkeypatch.setenv("TPU_DCP_ONLINE_LSE_COMBINE", "")
     assert cp.online_lse_combine_mode_requested() == ""
-    for t in (4, 8, 16, 32, 64, 80, 96, 128):
-        assert not cp.online_lse_combine_applies(t, True)
-        assert not cp.online_lse_combine_applies(t, False)
+    for t in (4, 8, 16, 24, 32, 64, 80, 96, 128):
+        assert not cp.online_lse_combine_applies(t, True, num_heads=64, vdim=512)
+        assert not cp.online_lse_combine_applies(t, False, num_heads=64, vdim=512)
 
     for raw, want in (
         ("0", ""),
-        ("off", ""),
-        ("false", ""),
         ("1", "auto"),
         ("auto", "auto"),
         ("PAIRS", "pairs"),
@@ -260,20 +270,23 @@ def test_adapter_env_gate_and_uv_compat(monkeypatch):
         monkeypatch.setenv("TPU_DCP_ONLINE_LSE_COMBINE", raw)
         assert cp.online_lse_combine_mode_requested() == want
 
-    monkeypatch.setenv("TPU_DCP_ONLINE_LSE_COMBINE", "invalid_mode")
-    with pytest.raises(ValueError, match="TPU_DCP_ONLINE_LSE_COMBINE"):
-        cp.online_lse_combine_mode_requested()
-
     monkeypatch.setenv("TPU_DCP_ONLINE_LSE_COMBINE", "pairs")
-    monkeypatch.setenv("TPU_DCP_ONLINE_LSE_COMBINE_MIN_TOKENS", "16")
-    monkeypatch.setenv("TPU_DCP_ONLINE_LSE_COMBINE_MAX_TOKENS", "96")
-    for t in (1, 4, 8, 128, 256):
-        assert not cp.online_lse_combine_applies(t, True)
+    # Non-multiple-of-16 buckets (24, 40, 48, 56, 72, 88), tiny buckets (<=8),
+    # oversized buckets (>96 at local=4, vdim=512), and float32 partials must
+    # return False so send_layout / oproj_all_reduce / vspace_fused are not
+    # disabled when the kernel cannot run.
+    for t in (1, 4, 8, 24, 40, 48, 56, 72, 88, 128, 256):
+        assert not cp.online_lse_combine_applies(t, True, num_heads=64, vdim=512)
     for t in TOKEN_BUCKETS:
-        assert cp.online_lse_combine_applies(t, True)
-        assert not cp.online_lse_combine_applies(t, False)
+        assert cp.online_lse_combine_applies(t, True, num_heads=64, vdim=512)
+        assert not cp.online_lse_combine_applies(
+            t, True, num_heads=64, vdim=128, combine_dtype=torch.float32
+        )
+        assert not cp.online_lse_combine_applies(t, False, num_heads=64, vdim=512)
         assert not cp.send_layout_applies(t, 64, 512, torch.bfloat16, True)
-        assert not cp.vspace_fused_applies(t, True)
+        assert not cp.vspace_fused_applies(
+            t, True, num_heads=64, vdim=128, combine_dtype=torch.bfloat16
+        )
 
 
 def _run_16cpu_worker() -> dict:

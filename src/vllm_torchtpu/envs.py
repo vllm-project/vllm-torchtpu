@@ -66,10 +66,6 @@ if TYPE_CHECKING:
     TPU_DCP_MLA_OUT_VMEM_MAX_TOKENS: int = 0
     TPU_DCP_MLA_OUT_VMEM_MIB: int = 32
     TPU_DCP_ONLINE_LSE_COMBINE: str = ""
-    TPU_DCP_ONLINE_LSE_COMBINE_MAX_TOKENS: int = 96
-    TPU_DCP_ONLINE_LSE_COMBINE_MIN_TOKENS: int = 16
-    TPU_DCP_ONLINE_LSE_COMBINE_LIVE_TOKENS: bool = True
-    TPU_DCP_ONLINE_LSE_COMBINE_OUT_VMEM: bool = True
     TPU_SMALL_COLL_HBM_OPERAND: bool = True
     TPU_DCP_MERGE_CHUNKED_SMALL: int = 2
     TPU_DCP_MLA_MERGE_PIECES: int = 2
@@ -216,7 +212,6 @@ if TYPE_CHECKING:
     TPU_SC_TOPK_ONE_SUBCORE_CAPACITY: int = 0
     TPU_DCP_INDEXER_SMALL_AG: bool = True
     TPU_DCP_INDEXER_A2A_SMALL_COLL: bool = False
-    TPU_DCP_INDEXER_A2A_SMALL_COLL_MAX_TOKENS: int = 128
     TPU_INDEXER_TOPK_SHARED_READ: bool = True
     TPU_SPARSE_MLA_CHUNK_TOKENS: int | None = None
     TPU_STREAMIDX_SKIP_EMPTY_DECODE_CHUNKED: bool = False
@@ -237,7 +232,6 @@ if TYPE_CHECKING:
     TPU_MLA_KV_WRITE_IN_GATHER_MAX_TOKENS: int = 32
     TPU_INDEXER_QB_OVERLAP: bool = False
     TPU_INDEXER_OVERLAP_QB_ABSORB: bool = False
-    TPU_INDEXER_OVERLAP_QB_ABSORB_MAX_TOKENS: int = 64
     TPU_QB_OVERLAP_HONORS_SKIP_TOPK: bool = False
     TPU_SPARSE_MLA_PACKED_ROPE: bool = False
     TPU_SPARSE_MLA_GATHER_PACKED_ROPE: bool = False
@@ -790,24 +784,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # at T = 64; 32 is the pinned fused small all-to-all calls' limit.
     "TPU_DCP_MLA_OUT_VMEM_MIB": env_int("TPU_DCP_MLA_OUT_VMEM_MIB", 32),
     # Single-kernel TensorCore online-LSE DCP combine (`small_collectives/
-    # dcp_lse_combine.py`) for backbone decode/mixed buckets in
-    # `(bucket_gate_edge(MIN_TOKENS), MAX_TOKENS]` that reach
-    # `merge_lse_partials_scatter_heads`: "" / "0" = off (default),
+    # dcp_lse_combine.py`) for backbone decode/mixed buckets supported by
+    # `online_lse_combine_supported`: "" / "0" = off (default),
     # "1" / "auto" = chip-pair-first 2-stage combine ("pairs") when adjacent
     # DCP ranks pair each chip's two TensorCores else 1-stage "flat",
     # "pairs" = require chip-pair-first 2-stage combine, "flat" = 1-stage.
-    "TPU_DCP_ONLINE_LSE_COMBINE": lambda: os.getenv("TPU_DCP_ONLINE_LSE_COMBINE", ""),
-    "TPU_DCP_ONLINE_LSE_COMBINE_MAX_TOKENS": env_nonnegative_int(
-        "TPU_DCP_ONLINE_LSE_COMBINE_MAX_TOKENS", 96
-    ),
-    "TPU_DCP_ONLINE_LSE_COMBINE_MIN_TOKENS": env_nonnegative_int(
-        "TPU_DCP_ONLINE_LSE_COMBINE_MIN_TOKENS", 16
-    ),
-    "TPU_DCP_ONLINE_LSE_COMBINE_LIVE_TOKENS": env_bool(
-        "TPU_DCP_ONLINE_LSE_COMBINE_LIVE_TOKENS", default=True
-    ),
-    "TPU_DCP_ONLINE_LSE_COMBINE_OUT_VMEM": env_bool(
-        "TPU_DCP_ONLINE_LSE_COMBINE_OUT_VMEM", default=True
+    "TPU_DCP_ONLINE_LSE_COMBINE": env_with_choices(
+        "TPU_DCP_ONLINE_LSE_COMBINE",
+        "",
+        ["", "0", "1", "auto", "pairs", "flat"],
+        case_sensitive=False,
     ),
     # The DCP small all-gather (TPU_DCP_INDEXER_SMALL_AG) and small all-to-all
     # (TPU_DCP_MLA_SEND_SMALL_A2A) take their data operand constrained to HBM.
@@ -1122,14 +1108,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # fp8_skinny, or xla_quantized_matmul) and the W_UK query absorption
     # (`absorb_q`) inside the DCP indexer op, pinned under the local SparseCore
     # top-k and the cross-rank SparseCore merge / compaction calls respectively
-    # on buckets up to TPU_INDEXER_OVERLAP_QB_ABSORB_MAX_TOKENS. Hands the
-    # pre-absorbed `ql_nope` straight to MLA attention so `_absorb_q` is skipped
-    # after the indexer wait. Bit-identical outputs.
+    # on decode buckets. Hands the pre-absorbed `ql_nope` straight to MLA
+    # attention so `_absorb_q` is skipped after the indexer wait. Bit-identical.
     "TPU_INDEXER_OVERLAP_QB_ABSORB": env_bool(
         "TPU_INDEXER_OVERLAP_QB_ABSORB", default=False
-    ),
-    "TPU_INDEXER_OVERLAP_QB_ABSORB_MAX_TOKENS": env_nonnegative_int(
-        "TPU_INDEXER_OVERLAP_QB_ABSORB_MAX_TOKENS", 64
     ),
     # Take the q_b overlap path only in passes that run their own indexer, so an
     # IndexShare draft step traced with skip_topk reads the shared top-k table.
@@ -1917,17 +1899,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # 13-17 us per idx layer. Needs TPU_DCP_RANK_OPERAND (the kernel's peer
     # addresses take the rank and lane as data). Same bytes, same result.
     "TPU_DCP_INDEXER_SMALL_AG": env_bool("TPU_DCP_INDEXER_SMALL_AG", default=True),
-    # On DCP indexer buckets taking `a2a_merge` up to
-    # TPU_DCP_INDEXER_A2A_SMALL_COLL_MAX_TOKENS (such as 64-row DCP=16 decode),
-    # replace XLA's candidate `all_to_all` and slot `all_gather` with Pallas
-    # remote-DMA small collectives (`small_indexer_score_all_to_all` +
-    # `small_all_gather`) over flat 1-D HBM buffers, eliminating XLA's
-    # multi-stage collective schedule and 2-D sublane relayouts. Bit-identical.
+    # On eligible DCP indexer buckets taking `a2a_merge`
+    # (`supports_indexer_score_all_to_all`), replace XLA's candidate
+    # `all_to_all` and slot `all_gather` with Pallas remote-DMA small
+    # collectives (`small_indexer_score_all_to_all` + `small_all_gather`) over
+    # flat 1-D HBM buffers, eliminating XLA's multi-stage collective schedule
+    # and 2-D sublane relayouts. Bit-identical.
     "TPU_DCP_INDEXER_A2A_SMALL_COLL": env_bool(
         "TPU_DCP_INDEXER_A2A_SMALL_COLL", default=False
-    ),
-    "TPU_DCP_INDEXER_A2A_SMALL_COLL_MAX_TOKENS": env_nonnegative_int(
-        "TPU_DCP_INDEXER_A2A_SMALL_COLL_MAX_TOKENS", 128
     ),
     # The indexed layer's own attention reads its rows back from the updated
     # shared table, the same `table[:num_tokens]` expression the following

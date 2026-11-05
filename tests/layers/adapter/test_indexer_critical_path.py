@@ -63,23 +63,20 @@ except ImportError:
 
 
 def test_critical_path_env_flags_default_off(monkeypatch):
+    from vllm_torchtpu.kernels.experimental.small_collectives import indexer_a2a
+
     monkeypatch.delenv("TPU_DCP_INDEXER_A2A_SMALL_COLL", raising=False)
-    monkeypatch.delenv("TPU_DCP_INDEXER_A2A_SMALL_COLL_MAX_TOKENS", raising=False)
     monkeypatch.delenv("TPU_INDEXER_OVERLAP_QB_ABSORB", raising=False)
-    monkeypatch.delenv("TPU_INDEXER_OVERLAP_QB_ABSORB_MAX_TOKENS", raising=False)
     assert envs.TPU_DCP_INDEXER_A2A_SMALL_COLL is False
-    assert envs.TPU_DCP_INDEXER_A2A_SMALL_COLL_MAX_TOKENS == 128
     assert envs.TPU_INDEXER_OVERLAP_QB_ABSORB is False
-    assert envs.TPU_INDEXER_OVERLAP_QB_ABSORB_MAX_TOKENS == 64
+    assert indexer_a2a.MAX_SCORE_A2A_TOKENS == 224
+    assert indexer_a2a.supports_indexer_score_all_to_all(64, 16, 2048)
+    assert not indexer_a2a.supports_indexer_score_all_to_all(256, 16, 2048)
 
     monkeypatch.setenv("TPU_DCP_INDEXER_A2A_SMALL_COLL", "1")
-    monkeypatch.setenv("TPU_DCP_INDEXER_A2A_SMALL_COLL_MAX_TOKENS", "64")
     monkeypatch.setenv("TPU_INDEXER_OVERLAP_QB_ABSORB", "1")
-    monkeypatch.setenv("TPU_INDEXER_OVERLAP_QB_ABSORB_MAX_TOKENS", "32")
     assert envs.TPU_DCP_INDEXER_A2A_SMALL_COLL is True
-    assert envs.TPU_DCP_INDEXER_A2A_SMALL_COLL_MAX_TOKENS == 64
     assert envs.TPU_INDEXER_OVERLAP_QB_ABSORB is True
-    assert envs.TPU_INDEXER_OVERLAP_QB_ABSORB_MAX_TOKENS == 32
 
 
 # --------------------------------------------------------------------------- #

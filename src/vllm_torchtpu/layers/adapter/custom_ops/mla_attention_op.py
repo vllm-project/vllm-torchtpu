@@ -383,9 +383,7 @@ def _qb_absorb_operands(
         if scale.dim() != 1:
             return None
         mode = (
-            "pallas_hbm"
-            if getattr(layer, FP8_PALLAS_HBM_PIN_ATTR, False)
-            else "pallas"
+            "pallas_hbm" if getattr(layer, FP8_PALLAS_HBM_PIN_ATTR, False) else "pallas"
         )
         return weight, scale, mode
     if scale.dim() in (1, 4):
@@ -631,16 +629,17 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
             self.topk_op_dcp = self._build_streamidx_dcp_op(dcp_size, interleave_size)
             # TPU_INDEXER_QB_OVERLAP: the same op, also running the MLA q_b
             # projection under the SparseCore top-k (see `forward_oot`).
-            if envs.TPU_INDEXER_QB_OVERLAP and not envs.TPU_INDEXER_OVERLAP_QB_ABSORB:
+            use_qb_absorb_overlap = (
+                envs.TPU_INDEXER_OVERLAP_QB_ABSORB
+                and not envs.TPU_MLA_ABSORB_Q_FROM_HEAD
+            )
+            if envs.TPU_INDEXER_QB_OVERLAP and not use_qb_absorb_overlap:
                 self.topk_op_dcp_qb = self._build_streamidx_dcp_op(
                     dcp_size,
                     interleave_size,
                     qb_overlap=True,
                 )
-            if (
-                envs.TPU_INDEXER_OVERLAP_QB_ABSORB
-                and not envs.TPU_MLA_ABSORB_Q_FROM_HEAD
-            ):
+            if use_qb_absorb_overlap:
                 for qb_mode in ("prequant", "pallas", "pallas_hbm", "xla"):
                     self.topk_op_dcp_qb_absorb[qb_mode] = (
                         self._build_streamidx_dcp_qb_absorb_op(
@@ -1206,7 +1205,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
         a2a_merge = envs.TPU_DCP_INDEXER_A2A_MERGE
         a2a_min_tokens = envs.TPU_DCP_INDEXER_A2A_MIN_TOKENS
         a2a_small_coll = envs.TPU_DCP_INDEXER_A2A_SMALL_COLL
-        pin_max_tokens = envs.TPU_INDEXER_OVERLAP_QB_ABSORB_MAX_TOKENS
+        pin_max_tokens = 224
         small_bucket = (
             envs.TPU_STREAMIDX_SMALL_BUCKET_BQ,
             envs.TPU_STREAMIDX_SMALL_BUCKET_BKVP,

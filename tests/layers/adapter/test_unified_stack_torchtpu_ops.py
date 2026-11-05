@@ -1,5 +1,16 @@
 # Copyright 2026 Google LLC
-# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Verify torch_tpu custom-op registration and Dynamo export for the decode
 optimization stack:
 
@@ -22,6 +33,8 @@ from vllm_torchtpu.distributed import dcp
 from vllm_torchtpu.layers.adapter import cp_mla_attention
 from vllm_torchtpu.layers.adapter.custom_ops import mla_attention_op as mla_op
 
+pytestmark = [pytest.mark.tpu_test, pytest.mark.multichip]
+
 
 class _FakeGroup:
     def __init__(self, ranks, rank_in_group=0):
@@ -42,8 +55,12 @@ def test_online_lse_combine_sharded_jax_op_registration_and_dynamo(
 
     cp_mla_attention._ONLINE_COMBINE_OPS.clear()
     cp_mla_attention._DCP_CHIP_PAIRS_CACHE.clear()
-    monkeypatch.setattr(cp_mla_attention, "_DCP_RANK", torch.zeros(1, dtype=torch.int32))
-    monkeypatch.setattr(cp_mla_attention, "_DCP_LANE", torch.zeros(1, dtype=torch.int32))
+    monkeypatch.setattr(
+        cp_mla_attention, "_DCP_RANK", torch.zeros(1, dtype=torch.int32)
+    )
+    monkeypatch.setattr(
+        cp_mla_attention, "_DCP_LANE", torch.zeros(1, dtype=torch.int32)
+    )
     monkeypatch.setenv("TPU_DCP_ONLINE_LSE_COMBINE", "flat")
 
     if multi_lane:

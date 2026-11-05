@@ -81,8 +81,14 @@ def reference(blocks, *, tokens_per_core: int | None = None, k: int | None = Non
     return transposed.reshape(n, tokens_per_core * n * k)
 
 
+MAX_SCORE_A2A_TOKENS = 224
+
+
 def supports_indexer_score_all_to_all(
-    num_tokens: int, dcp_size: int, k: int, max_tokens: int
+    num_tokens: int,
+    dcp_size: int,
+    k: int,
+    max_tokens: int = MAX_SCORE_A2A_TOKENS,
 ) -> bool:
     """Whether ``(num_tokens, dcp_size, k)`` is eligible for the kernel."""
     return (
@@ -166,6 +172,7 @@ def small_indexer_score_all_to_all(
         else:
             my_lane = lax.axis_index(lane_axis)
 
+        recv_ref = out_ref = out_sem = None
         if direct_hbm:
             x_ref, o_ref, send_sem, recv_sem, local_sem = refs_list
         else:
@@ -217,6 +224,8 @@ def small_indexer_score_all_to_all(
             local.wait()
             wait_bytes_of(others, send_sem)
             return
+
+        assert recv_ref is not None and out_ref is not None and out_sem is not None
 
         mine = recv_ref.at[me]
         for j in range(n):
