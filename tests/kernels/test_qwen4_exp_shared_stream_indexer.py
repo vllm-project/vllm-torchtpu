@@ -37,7 +37,15 @@ TABLE_COLUMNS = 8
 class ReferenceTopK:
     """JAX stand-in for the SparseCore selector (lowest IDs win ties)."""
 
+    _instance = None
     overlaps_scoring = False
+
+    def __new__(cls, *args, **kwargs):
+        if cls is ReferenceTopK and not args and not kwargs:
+            if cls._instance is None:
+                cls._instance = super().__new__(cls)
+            return cls._instance
+        return super().__new__(cls)
 
     def select(self, score_bits, k, row_lengths, *, scheduling_group_id, return_scores):
         scores = jax.lax.bitcast_convert_type(score_bits, jnp.float32)
@@ -87,15 +95,23 @@ def _copy_in_whole_pages(self, src_ref, grid_indices):
             ).start()
 
 
+_REFERENCE_TOPK = ReferenceTopK()
+
+
+@functools.cache
+def _tpu7x_info():
+    return pltpu.get_tpu_info_for_chip(pltpu.ChipVersion.TPU_7X, 1)
+
+
+@functools.cache
+def _interpret_pallas_call():
+    return functools.partial(pl.pallas_call, interpret=pltpu.InterpretParams())
+
+
 @pytest.fixture
 def interpret(monkeypatch):
-    info = pltpu.get_tpu_info_for_chip(pltpu.ChipVersion.TPU_7X, 1)
-    monkeypatch.setattr(pltpu, "get_tpu_info", lambda: info)
-    monkeypatch.setattr(
-        streamindex.pl,
-        "pallas_call",
-        functools.partial(pl.pallas_call, interpret=pltpu.InterpretParams()),
-    )
+    monkeypatch.setattr(pltpu, "get_tpu_info", _tpu7x_info)
+    monkeypatch.setattr(streamindex.pl, "pallas_call", _interpret_pallas_call())
     monkeypatch.setattr(
         bref_override.StreamIndexKVBufferedRef, "copy_in", _copy_in_whole_pages
     )
@@ -108,7 +124,7 @@ def capture_scores(monkeypatch):
     def scored(*args, **kwargs):
         kwargs.update(enable_early_exit=False, return_scores=True)
         ids, bits = streamindex.streamindex_topk(
-            *args, topk_backend=ReferenceTopK(), **kwargs
+            *args, topk_backend=_REFERENCE_TOPK, **kwargs
         )
         calls.append((kwargs["num_queries_per_block"], bits))
         return ids
@@ -592,3 +608,40 @@ def test_prefill_sc_bounded_copy_flag_selects_the_backend(monkeypatch, bounded):
             block_topk=BLOCK_TOPK,
         )
     assert seen == [SparseCoreTopK(bounded_copy=True) if bounded else None]
+
+
+@pytest.mark.parametrize("slot", [0, 1, 7])
+@pytest.mark.parametrize(
+    "q_lens,context,tokens",
+    [
+        # One prefill request with history, an idle slot.
+        ([24, 0], [600, 0], 24),
+        # Decode prefix + two prefill pieces + an idle slot, padded bucket.
+        ([1, 1, 20, 9, 0], [900, 33, 1203, 0, 0], 40),
+        # A long history spanning many pool pages.
+        ([32, 0, 0], [3000, 0, 0], 32),
+    ],
+)
+def test_prefill_pool_page_table_keeps_the_selection(
+    monkeypatch, interpret, q_lens, context, tokens, slot
+):
+    """Past PREFILL_PAGE_TABLE_SMEM_BYTES (96 request slots at max_model_len)
+    the ragged prefill indexer hands StreamIndex the pool-page table; its KV
+    reader expands the entries to the same kernel pages, so the selection is
+    the expanded table's."""
+    args = inputs(len(q_lens) + slot, q_lens, context, tokens, "integer")
+    assert tokens > len(context)  # the ragged prefill path
+    monkeypatch.setattr(
+        pooled_qsa,
+        "streamindex_topk",
+        functools.partial(streamindex.streamindex_topk, topk_backend=ReferenceTopK()),
+    )
+
+    def run():
+        return np.asarray(
+            pooled_qsa.select_blocks(**args, ratio=RATIO, block_topk=BLOCK_TOPK, slot=slot)
+        )
+
+    expected = run()
+    monkeypatch.setattr(pooled_qsa, "PREFILL_PAGE_TABLE_SMEM_BYTES", 0)
+    np.testing.assert_array_equal(run(), expected)

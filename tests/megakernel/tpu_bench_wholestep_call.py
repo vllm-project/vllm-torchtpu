@@ -58,38 +58,20 @@ def main():
     ap.add_argument("--iters", type=int, default=20)
     ap.add_argument("--wstd", type=float, default=0.02)
     ap.add_argument("--L", type=int, default=44)
-    ap.add_argument(
-        "--remove",
-        default="",
-        help="timing-only removal arms (wrong results): comma list of "
-        "attn_dma, attn_matmul, keys, select, uattn",
-    )
-    ap.add_argument(
-        "--shard",
-        action="store_true",
-        help="request-sharded indexer (VLLM_TPU_MEGAKERNEL wholeshard=1)",
-    )
-    ap.add_argument(
-        "--union",
-        action="store_true",
-        help="per-request union attention (VLLM_TPU_MEGAKERNEL wholeunion=1)",
-    )
-    ap.add_argument(
-        "--loop",
-        action="store_true",
-        help="per-request work in a fori_loop (VLLM_TPU_MEGAKERNEL wholeloop=1)",
-    )
-    ap.add_argument(
-        "--phys",
-        action="store_true",
-        help=(
-            "union ids -> physical page ids per request "
-            "(VLLM_TPU_MEGAKERNEL wholephys=1)"
-        ),
-    )
-    ap.add_argument(
-        "--slots", type=int, default=0, help="union attention ring slots (0: default)"
-    )
+    ap.add_argument("--remove", default="",
+                    help="timing-only removal arms (wrong results): comma list of "
+                         "attn_dma, attn_matmul, keys, select, uattn")
+    ap.add_argument("--shard", action="store_true",
+                    help="request-sharded indexer (VLLM_TPU_MEGAKERNEL wholeshard=1)")
+    ap.add_argument("--union", action="store_true",
+                    help="per-request union attention (VLLM_TPU_MEGAKERNEL wholeunion=1)")
+    ap.add_argument("--loop", action="store_true",
+                    help="per-request work in a fori_loop (VLLM_TPU_MEGAKERNEL wholeloop=1)")
+    ap.add_argument("--phys", action="store_true",
+                    help="union ids -> physical page ids per request (VLLM_TPU_MEGAKERNEL wholephys=1)")
+    ap.add_argument("--slots", type=int, default=0, help="union attention ring slots (0: default)")
+    ap.add_argument("--profile", default="", help="jax.profiler trace dir for --profile-iters calls")
+    ap.add_argument("--profile-iters", type=int, default=5)
     a = ap.parse_args()
     _apply_removals(a.remove)
     wsc.SHARD_INDEX, wsc.UNION_ATTN, wsc.LOOP_REQUESTS = a.shard, a.union, a.loop
@@ -117,9 +99,8 @@ def main():
     pps = a.max_groups * 4 // 128
     for B in [int(b) for b in a.buckets.split(",")]:
         nreq = B // 4
-        n_cols = (
-            pps  # table width (static); only the pages the contexts reach are allocated
-        )
+        NR = max(16, nreq)  # runner request rows (max_num_reqs)
+        n_cols = pps  # table width (static); only the pages the contexts reach are allocated
         n_used = -(-(a.ctx + 4 + nreq) // 128)
         # Blocks: GDN 33 layers x 4 ckpts per request, QSA main + compressed per request
         # & layer.
@@ -186,25 +167,25 @@ def main():
         NG = 1 + nreq * n_gdn * 4
         free_gdn = iter(rng.permutation(np.arange(1, NG)))
         free = iter(rng.permutation(np.arange(4 * NG, 4 * NB)))
-        ctx = np.array([a.ctx + q for q in range(nreq)] + [0] * (16 - nreq), np.int32)
-        qsl = np.array([min(q, nreq) * 4 for q in range(17)], np.int32)
-        seq = ctx + np.where(np.arange(16) < nreq, 4, 0)
+        ctx = np.array([a.ctx + q for q in range(nreq)] + [0] * (NR - nreq), np.int32)
+        qsl = np.array([min(q, nreq) * 4 for q in range(NR + 1)], np.int32)
+        seq = ctx + np.where(np.arange(NR) < nreq, 4, 0)
         meta = []
         for _ in range(n_gdn):
-            st = np.zeros(16, np.int32)
-            ck = np.zeros((16, 4), np.int32)
+            st = np.zeros(NR, np.int32)
+            ck = np.zeros((NR, 4), np.int32)
             for q in range(nreq):
                 ck[q] = [next(free_gdn) for _ in range(4)]
                 st[q] = ck[q, 0]
             meta += [st, np.zeros(NB * 4, np.int32), ck, qsl, seq]
         tabs = []
-        main = np.zeros((16, n_cols), np.int32)
-        comp = np.zeros((16, n_cols), np.int32)
+        main = np.zeros((NR, n_cols), np.int32)
+        comp = np.zeros((NR, n_cols), np.int32)
         for q in range(nreq):
             main[q, :n_used] = [next(free) for _ in range(n_used)]
             comp[q, :n_used] = [next(free) for _ in range(n_used)]
         for _ in range(n_att):
-            ring = np.zeros((16, 8), np.int32)
+            ring = np.zeros((NR, 8), np.int32)
             for q in range(nreq):
                 ring[q, 0] = next(free)
             tabs += [ring.reshape(-1), main.reshape(-1), comp.reshape(-1)]
@@ -228,18 +209,12 @@ def main():
             out_shardings=tp,
         )()
         put = lambda x: jax.device_put(jnp.asarray(x), rep)  # noqa: E731
-        args = [
-            hidden,
-            *ws,
-            pool,
-            *map(put, meta),
-            *map(put, tabs),
-            put(positions),
-            put(qsl),
-            put(ctx),
-            put(trig),
-            *map(put, norms),
-        ]
+        args = [hidden, *ws, pool, *map(put, meta), *map(put, tabs), put(positions), put(qsl),
+                put(ctx), put(trig), *map(put, norms)]
+        from vllm_torchtpu.models.vllm.qwen4_exp.pool_layout import main_kv_dcp
+
+        if main_kv_dcp() > 1:  # the QSA layers' dcp_rank buffer: tp rank % 2, one per rank
+            args.append(jax.device_put(jnp.arange(R, dtype=jnp.int32) % main_kv_dcp(), tp))
         f = jax.jit(call, donate_argnums=donate)
         t0 = time.time()
         res, pool = f(*args)
@@ -256,6 +231,12 @@ def main():
             res, pool = f(*args)
             jax.block_until_ready((res, pool))
             ts.append(time.perf_counter() - t0)
+        if a.profile:
+            with jax.profiler.trace(f"{a.profile}/b{B}"):
+                for _ in range(a.profile_iters):
+                    args[1 + len(ws)] = pool
+                    res, pool = f(*args)
+                jax.block_until_ready((res, pool))
         r32 = res.astype(jnp.float32)
         fin_rows = np.asarray(jnp.isfinite(r32).all(axis=1)).reshape(R, B)
         print(

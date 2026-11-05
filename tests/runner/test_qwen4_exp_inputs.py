@@ -352,14 +352,18 @@ def test_ngram_window_matches_full_store(spec):
         )
 
 
+@pytest.mark.parametrize("functional", [False, True])
 @pytest.mark.parametrize("check", ["", "check", "fault"])
 @pytest.mark.parametrize("window", ["", "1"])
 @pytest.mark.parametrize("pooled", [False, True])
 @pytest.mark.parametrize("spec", [0, 3])
-def test_fused_prepare_inputs_matches_eager(monkeypatch, spec, pooled, window, check):
+def test_fused_prepare_inputs_matches_eager(
+    monkeypatch, spec, pooled, window, check, functional
+):
     """VLLM_TPU_QWEN4_FUSED_PREP: the one-program input preparation returns the
     eager path's kwargs and leaves the same speculative records, step after step,
-    as requests move rows and drop out."""
+    as requests move rows and drop out (FUSED_PREP_FUNCTIONAL: by returning the
+    record instead of updating it in place)."""
     import numpy as np
 
     from vllm_torchtpu import envs
@@ -391,6 +395,9 @@ def test_fused_prepare_inputs_matches_eager(monkeypatch, spec, pooled, window, c
     )
     monkeypatch.setattr(envs, "VLLM_TPU_QWEN4_NGRAM_WINDOW", window, raising=False)
     monkeypatch.setattr(envs, "VLLM_TPU_QWEN4_FUSED_PREP_CHECK", check, raising=False)
+    monkeypatch.setattr(
+        envs, "VLLM_TPU_QWEN4_FUSED_PREP_FUNCTIONAL", functional, raising=False
+    )
     monkeypatch.setattr(a_fused, "_fused_fn", lambda: inputs_mod.fused_step_inputs)
     attention = f"{a_eager.attention_prefix}.self_attn"
     main = torch.arange(rows * 3).reshape(rows, 3)

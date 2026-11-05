@@ -39,7 +39,7 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from ..blocks.qsa_attn.block import attend_row
+from ..blocks.qsa_attn.block import MICRO, attend_row
 from ..exec_spec import ExecSpec
 from ..ops import BF16, F32, I32, rnd
 from ..spec import ExtraInput, ScratchReq, SmallField, StateDecl, WeightDecl
@@ -84,6 +84,8 @@ class QSAFullIndexedBlock(QSAFullBlock):
         union_stats: bool = False,
         union_phys: bool = False,
         loop_requests: bool = False,
+        dcp: int = 1,
+        compressed_dcp: bool = False,
         **kw: Any,
     ) -> None:
         """`carrier`: "" = prototype contiguous keys `[requests, max_groups, 128]`;
@@ -142,11 +144,18 @@ class QSAFullIndexedBlock(QSAFullBlock):
         issues from one SMEM load instead of the ids -> table chain (same addresses).
         `loop_requests` (needs
         `per_request_scores`): the per-request work of a QSA layer (completed group, key
-        streaming and scores, selection, recent tile) runs in a `fori_loop` over
-        requests instead
-        of a Python loop, so the kernel body, and its compile time, does not grow with
-        the
-        bucket's request count."""
+        streaming and scores, selection, recent tile) runs in a `fori_loop` over requests instead
+        of a Python loop, so the kernel body, and its compile time, does not grow with the
+        bucket's request count. `dcp` = 2 (VLLM_TPU_QSA_MAIN_KV_DCP, needs `union_attn`): the
+        main KV is split by token over TP rank pairs (`me`, `me ^ 1`; owner `(t // B) % 2`, one
+        table column = `2 B` tokens); each rank attends both ranks' heads over the groups it owns
+        and the pair combines the partials by LSE (`QSAFullStepBlock`). `compressed_dcp`
+        (VLLM_TPU_QSA_COMPRESSED_DCP, needs `dcp` = 2 and the carrier with `bounded_chunks`):
+        the compressed keys are split the same way (group `g` on rank `(g // gpp) % 2`, `gpp` =
+        groups per pool block; `qsa_cktab` lists a rank's own pages in local order). Both ranks
+        of a pair score the same request, each over its own groups, swap their halves of the
+        scores (in-kernel remote DMA, F32 bits: exact) and select over the whole set; with
+        `shard_index` the requests are sharded over pairs."""
         super().__init__(**kw)
         assert max_groups % 1024 == 0, max_groups  # whole (8, 128) score tiles per row
         self.max_groups, self.pps, self.debug = max_groups, pages_per_seq, debug
@@ -161,6 +170,13 @@ class QSAFullIndexedBlock(QSAFullBlock):
         )
         self.union_attn = union_attn
         assert not union_attn or per_request_scores, "the union is built per request"
+        self.dcp = max(int(dcp), 1)
+        assert self.dcp in (1, 2), dcp
+        assert self.dcp == 1 or union_attn, "main-KV DCP is implemented on the union path"
+        self.compressed_dcp = compressed_dcp
+        assert not compressed_dcp or (
+            self.dcp == 2 and carrier and per_request_scores and bounded_chunks
+        ), "compressed-key DCP: pair split, carrier keys, per-request bounded scores"
         if union_attn:
             # The union path's scratch (codes, union ids, compaction) pushed the 16-row
             # kernel
@@ -187,10 +203,29 @@ class QSAFullIndexedBlock(QSAFullBlock):
         )
         assert (self.chunk_pages * GPK) % 128 == 0 and (max_groups // 128) % 8 == 0
         assert not self.mp or self.chunk_pages % self.mp == 0
+        assert not compressed_dcp or self.n_chunks % self.dcp == 0, self.n_chunks
 
     @property
     def n_chunks(self) -> int:
         return self.max_groups // GPK // self.chunk_pages
+
+    # ------------------------------------------------- compressed-key DCP (`compressed_dcp`)
+    # Score layout: rank r's own groups, in local order, fill chunks [r * NC / D, (r + 1) * NC / D)
+    # of `qi_s`; so score position p holds group `_cdcp_gid(p)` and each half is ascending.
+    def _cdcp_gpp(self, ctx: Any) -> int:
+        """Groups per pool block: the unit of the owner rule `(g // gpp) % D`."""
+        return ctx.extra[POOL].shape[1] // MICRO
+
+    def _cdcp_local_nv(self, ctx: Any, nv: Any, rk: Any) -> Any:
+        """How many of rank `rk`'s own groups are among the first `nv` (its visible prefix)."""
+        gpp, D = self._cdcp_gpp(ctx), self.dcp
+        return (nv // (D * gpp)) * gpp + jnp.clip(nv % (D * gpp) - rk * gpp, 0, gpp)
+
+    def _cdcp_gid(self, ctx: Any, p: Any) -> Any:
+        """Group id at score position `p` (`cp_local_to_global` of the half's local index)."""
+        gpp, D, Gh = self._cdcp_gpp(ctx), self.dcp, self.max_groups // self.dcp
+        loc = jax.lax.rem(p, Gh)
+        return (loc // gpp) * (D * gpp) + (p // Gh) * gpp + jax.lax.rem(loc, gpp)
 
     def outputs(self, g: Any, ex: ExecSpec) -> list[StateDecl]:
         out = super().outputs(g, ex)
@@ -367,30 +402,31 @@ class QSAFullIndexedBlock(QSAFullBlock):
                 else []
             ),
             ScratchReq("qi_sem", pltpu.SemaphoreType.DMA((3,))),
+            *(
+                [
+                    ScratchReq("qx_ssem", pltpu.SemaphoreType.DMA((2,))),
+                    ScratchReq("qx_rsem", pltpu.SemaphoreType.DMA((2,))),
+                    ScratchReq("qx_credit", pltpu.SemaphoreType.REGULAR((1,))),
+                ]
+                if self.compressed_dcp
+                else []
+            ),
         ]
 
     # ------------------------------------------------------------ in kernel
     def _score_request(
-        self,
-        ctx: Any,
-        q: int,
-        qr: jax.Array,
-        base: Any = 0,
-        last: bool | jax.Array = True,
-        row0: Any = None,
-        first: bool | jax.Array | None = None,
+        self, ctx: Any, q: int, qr: jax.Array, base: Any = 0, last: bool = True, row0: Any = None,
+        first: bool | None = None, c_off: Any = 0,
     ) -> None:
         """Scores of request `q`'s `T` rows into `qi_s[q*T : (q+1)*T]` (chunk-major).
 
-        Carrier mode streams chunks through a 2-slot ring whose slot follows a chunk
-        counter
-        across requests (`q * n_chunks + c`): request q's last chunk prefetches request
-        q+1's
-        first chunk (unless `last`), so no request starts its key stream cold; request
-        0's
-        first chunk is issued here. `first` (default `q == 0`) marks the first request
-        of the
-        rank's run when the indexer is sharded by request (`shard_index`)."""
+        Carrier mode streams chunks through a 2-slot ring whose slot follows a chunk counter
+        across requests (`q * n_chunks + c`): request q's last chunk prefetches request q+1's
+        first chunk (unless `last`), so no request starts its key stream cold; request 0's
+        first chunk is issued here. `first` (default `q == 0`) marks the first request of the
+        rank's run when the indexer is sharded by request (`shard_index`). `compressed_dcp`:
+        only this rank's own groups (`qsa_cktab` lists its pages), scored into chunks from
+        `c_off` on."""
         scr, T = ctx.scr, ctx.ex.T
         r0 = q * T if row0 is None else row0
         rows = slice(r0, r0 + T)
@@ -449,7 +485,9 @@ class QSAFullIndexedBlock(QSAFullBlock):
             # chunk counter carried across requests, as the fixed count's `q * NC + c`
             # does.
             nv = ctx.extra[NVIS][q * T + T - 1]
-            n_q = jnp.clip((nv + CG - 1) // CG, 1, NC)
+            if self.compressed_dcp:
+                nv = self._cdcp_local_nv(ctx, nv, jax.lax.rem(ctx.me, self.dcp))
+            n_q = jnp.clip((nv + CG - 1) // CG, 1, NC // (self.dcp if self.compressed_dcp else 1))
             c0 = scr["qi_cc"][0]
         else:
             n_q, c0 = NC, q * NC
@@ -477,7 +515,7 @@ class QSAFullIndexedBlock(QSAFullBlock):
             keys = ring.at[s].bitcast(BF16)[...] if self.carrier == "fp8" else ring[s]
             keys = keys.reshape(CG, W)[:, : ix.IDX_DIM]
             st = ix.score_rows(qr, keys)  # [T, CG]
-            scr["qi_s"][rows, c] = st.reshape(T, CG // 128, 128)
+            scr["qi_s"][rows, c_off + c] = st.reshape(T, CG // 128, 128)
             return carry
 
         jax.lax.fori_loop(0, n_q, chunk, 0)

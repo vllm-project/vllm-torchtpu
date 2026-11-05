@@ -60,6 +60,7 @@ from vllm_torchtpu.layers.adapter.gdn_linear import (
 )
 from vllm_torchtpu.layers.adapter.linear_common import KEEP_VLLM_LAYOUT_ATTR
 from vllm_torchtpu.layers.core.gdn_attention import (
+    gdn_step_metadata,
     run_jax_gdn_attention,
     run_jax_gdn_attention_pcp_tp_prefill,
     run_jax_gdn_attention_pooled,
@@ -202,6 +203,7 @@ def gdn_attention_pooled_core_tpu(
     conv_state_dtype: jnp.dtype = jnp.bfloat16,
     num_spec_tokens: int = 0,
     conv_weight_kmajor: bool = False,
+    step_metadata: tuple[jax.Array, ...] | None = None,
 ) -> tuple[jax.Array, jax.Array]:
     return run_jax_gdn_attention_pooled(
         mixed_qkv,
@@ -229,6 +231,7 @@ def gdn_attention_pooled_core_tpu(
         mesh=mesh,
         num_spec_tokens=num_spec_tokens,
         conv_weight_kmajor=conv_weight_kmajor,
+        step_metadata=step_metadata,
     )
 
 
@@ -366,6 +369,56 @@ def _get_shared_gdn_op(kind: str, key: tuple, build: Callable[[str], Any]) -> An
     return op
 
 
+def _gdn_step_metadata_jax(
+    slot_read_offsets: jax.Array,
+    state_indices: jax.Array,
+    query_start_loc: jax.Array,
+    seq_lens: jax.Array,
+    distribution: jax.Array,
+    ckpt_indices: jax.Array,
+) -> tuple[jax.Array, ...]:
+    return gdn_step_metadata(
+        slot_read_offsets,
+        state_indices,
+        query_start_loc,
+        seq_lens,
+        distribution,
+        ckpt_indices,
+    )
+
+
+def _gdn_step_metadata_op() -> Any:
+    return _get_shared_gdn_op(
+        "gdn_step_metadata",
+        (),
+        lambda name: pallas.jax_op(name, _gdn_step_metadata_jax),
+    )
+
+
+class GdnStepMetadataCache:
+    """Per-forward memo of the pooled GDN step metadata (VLLM_TPU_GDN_HOIST_METADATA).
+
+    The model creates one per forward and hands it to every GDN layer. Layers
+    of one KV-cache group share one AttentionMetadata object, so the first of
+    them computes `gdn_step_metadata` and the rest reuse it. Keyed on object
+    identity (AttentionMetadata is an unhashable dataclass); a forward sees a
+    handful of groups, so the scan is short.
+    """
+
+    def __init__(self) -> None:
+        self._entries: list[tuple[Any, tuple[torch.Tensor, ...]]] = []
+
+    def get(
+        self, attn_metadata: Any, build: Callable[[], tuple[torch.Tensor, ...]]
+    ) -> tuple[torch.Tensor, ...]:
+        for key, value in self._entries:
+            if key is attn_metadata:
+                return value
+        value = build()
+        self._entries.append((attn_metadata, value))
+        return value
+
+
 @QwenGatedDeltaNetAttention.register_oot
 class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
     # Whether pooled ops consume the merged block-major unified pool, along
@@ -407,6 +460,18 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         )
         self.gdn_op = self._build_gdn_op()
         self.gdn_pooled_op = self._build_pooled_gdn_op(block_major=self._bm_kernel)
+        # Block-major state ids are per layer (pool_index), so only the
+        # plain unified pool can share one step's metadata across layers.
+        self.gdn_pooled_hoisted_op = (
+            self._build_pooled_gdn_op(hoisted=True)
+            if envs.VLLM_TPU_GDN_HOIST_METADATA and not self._bm_kernel
+            else None
+        )
+        # Built here, not on first use: registering a custom op while dynamo
+        # traces the forward is an error.
+        self.gdn_step_metadata_op = (
+            _gdn_step_metadata_op() if self.gdn_pooled_hoisted_op is not None else None
+        )
         pcp_enabled = self._pcp_streaming_enabled()
         self._pcp_streaming_configured = pcp_enabled
         self.gdn_pcp_op = (
@@ -745,7 +810,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         """Keep the ordinary projection input unchanged."""
         return mixed_qkv
 
-    def _build_pooled_gdn_op(self, *, block_major: bool = False):
+    def _build_pooled_gdn_op(self, *, block_major: bool = False, hoisted: bool = False):
         vllm_context = get_vllm_model_wrapper_context()
         local_num_v_heads = self.num_v_heads // self.tp_size
         vllm_config = cast(VllmConfig, vllm_context.vllm_config)
@@ -766,22 +831,23 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         # Written out rather than functools.partial so pool_block_tokens is
         # read per call instead of at build time; pallas.jax_op requires a
         # fully annotated signature, so the operands are spelled out.
-        def wrapped_fn(
-            mixed_qkv: jax.Array,
-            b: jax.Array,
-            a: jax.Array,
-            recurrent_state: jax.Array,
-            conv_weight: jax.Array,
-            conv_bias: jax.Array | None,
-            A_log: jax.Array,
-            dt_bias: jax.Array,
-            state_indices: jax.Array,
-            query_start_loc: jax.Array,
-            distribution: jax.Array,
-            seq_lens: jax.Array,
-            slot_read_offsets: jax.Array | None = None,
-            ckpt_indices: jax.Array | None = None,
-        ) -> tuple[jax.Array, jax.Array]:
+        def run(
+            mixed_qkv,
+            b,
+            a,
+            recurrent_state,
+            conv_weight,
+            conv_bias,
+            A_log,
+            dt_bias,
+            state_indices,
+            query_start_loc,
+            distribution,
+            seq_lens,
+            slot_read_offsets,
+            ckpt_indices,
+            step_metadata=None,
+        ):
             # Fold the `(num_blocks, rows_per_block, *page)` block-major pool so
             # pool adapters index flat kernel blocks along dim 0; both reshapes
             # compile to zero-copy bitcasts on the donated buffer.
@@ -819,11 +885,94 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 conv_state_dtype=conv_state_dtype,
                 num_spec_tokens=num_spec_tokens,
                 conv_weight_kmajor=conv_weight_kmajor,
+                step_metadata=step_metadata,
             )
             if not block_major:
                 return result
             new_pool, output = result
             return new_pool.reshape(recurrent_state.shape), output
+
+        def wrapped_fn(
+            mixed_qkv: jax.Array,
+            b: jax.Array,
+            a: jax.Array,
+            recurrent_state: jax.Array,
+            conv_weight: jax.Array,
+            conv_bias: jax.Array | None,
+            A_log: jax.Array,
+            dt_bias: jax.Array,
+            state_indices: jax.Array,
+            query_start_loc: jax.Array,
+            distribution: jax.Array,
+            seq_lens: jax.Array,
+            slot_read_offsets: jax.Array | None = None,
+            ckpt_indices: jax.Array | None = None,
+        ) -> tuple[jax.Array, jax.Array]:
+            return run(
+                mixed_qkv,
+                b,
+                a,
+                recurrent_state,
+                conv_weight,
+                conv_bias,
+                A_log,
+                dt_bias,
+                state_indices,
+                query_start_loc,
+                distribution,
+                seq_lens,
+                slot_read_offsets,
+                ckpt_indices,
+            )
+
+        # VLLM_TPU_GDN_HOIST_METADATA: the step's `gdn_step_metadata` outputs
+        # replace the slot read-offset buffer and the checkpoint ids.
+        def wrapped_hoisted_fn(
+            mixed_qkv: jax.Array,
+            b: jax.Array,
+            a: jax.Array,
+            recurrent_state: jax.Array,
+            conv_weight: jax.Array,
+            conv_bias: jax.Array | None,
+            A_log: jax.Array,
+            dt_bias: jax.Array,
+            state_indices: jax.Array,
+            query_start_loc: jax.Array,
+            distribution: jax.Array,
+            seq_lens: jax.Array,
+            read_offsets: jax.Array,
+            ckpt_indices: jax.Array,
+            ps_query_start_loc: jax.Array,
+            ps_seq_lens: jax.Array,
+            ps_state_indices: jax.Array,
+            ps_read_offsets: jax.Array,
+            ps_ckpt_indices: jax.Array,
+        ) -> tuple[jax.Array, jax.Array]:
+            return run(
+                mixed_qkv,
+                b,
+                a,
+                recurrent_state,
+                conv_weight,
+                conv_bias,
+                A_log,
+                dt_bias,
+                state_indices,
+                query_start_loc,
+                distribution,
+                seq_lens,
+                None,
+                None,
+                step_metadata=(
+                    read_offsets,
+                    ckpt_indices,
+                    ps_query_start_loc,
+                    ps_seq_lens,
+                    ps_state_indices,
+                    ps_read_offsets,
+                    ps_ckpt_indices,
+                ),
+            )
 
         def _fake_gdn(mixed_qkv, _b, _a, recurrent_state, *args, **kwargs):
             num_tokens = mixed_qkv.size(0)
@@ -837,12 +986,21 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             # adapters, so it is the only donated input. inplace-donation
             # aliases its program-level output to the input buffer so the
             # ~pool-sized update is not double-counted at compile.
-            op = pallas.jax_op(op_name, wrapped_fn, donate_argnums=(3,))
+            op = pallas.jax_op(
+                op_name,
+                wrapped_hoisted_fn if hoisted else wrapped_fn,
+                donate_argnums=(3,),
+            )
             op.register_fake(_fake_gdn)
             return op
 
+        if hoisted:
+            assert not block_major
+            kind = "gdn_attention_pooled_hoisted"
+        else:
+            kind = "gdn_attention_pooled_bm" if block_major else "gdn_attention_pooled"
         gdn_jax_op = _get_shared_gdn_op(
-            "gdn_attention_pooled_bm" if block_major else "gdn_attention_pooled",
+            kind,
             (
                 type(self)._prepare_pooled_gdn_input,
                 id(mesh),
@@ -875,7 +1033,12 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             seq_lens: torch.Tensor,
             slot_read_offsets: torch.Tensor | None = None,
             ckpt_indices: torch.Tensor | None = None,
+            *step_metadata: torch.Tensor,
         ) -> torch.Tensor:
+            # Hoisted: `slot_read_offsets` / `ckpt_indices` are the step's
+            # read offsets / int32 checkpoint ids, followed by the rolled
+            # per-sequence inputs (see gdn_step_metadata).
+            assert len(step_metadata) == (5 if hoisted else 0)
             new_rec, outputs = gdn_jax_op(
                 mixed_qkv,
                 b,
@@ -891,6 +1054,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 seq_lens,
                 slot_read_offsets,
                 ckpt_indices,
+                *step_metadata,
             )
 
             # Plain donation + copy_ writeback (aliased in-place by XLA).
@@ -1174,6 +1338,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
     def forward(
         self,
         hidden_states: torch.Tensor,
+        gdn_step_metadata_cache: GdnStepMetadataCache | None = None,
     ) -> torch.Tensor:
         num_tokens = hidden_states.size(0)
         kv_cache = self.kv_cache
@@ -1261,7 +1426,34 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                         "mamba_slot_read_offsets in the attention metadata."
                     )
                 ckpt_indices = getattr(attn_metadata, "mamba_ckpt_indices", None)
-                core_attn_out = self.gdn_pooled_op(
+                step_metadata: tuple[torch.Tensor, ...] = ()
+                pooled_op = self.gdn_pooled_op
+                if (
+                    gdn_step_metadata_cache is not None
+                    and self.gdn_pooled_hoisted_op is not None
+                    and self.gdn_step_metadata_op is not None
+                    and slot_read_offsets is not None
+                    and ckpt_indices is not None
+                ):
+                    # VLLM_TPU_GDN_HOIST_METADATA: the read-offset gather, the
+                    # int32 casts and the PER_SEQ roll once per step and group.
+                    group_inputs = (
+                        slot_read_offsets,
+                        state_indices,
+                        attn_metadata.query_start_loc,
+                        attn_metadata.seq_lens,
+                        request_distribution,
+                        ckpt_indices,
+                    )
+                    slot_read_offsets, ckpt_indices, *rest = (
+                        gdn_step_metadata_cache.get(
+                            attn_metadata,
+                            lambda: tuple(self.gdn_step_metadata_op(*group_inputs)),
+                        )
+                    )
+                    step_metadata = tuple(rest)
+                    pooled_op = self.gdn_pooled_hoisted_op
+                core_attn_out = pooled_op(
                     mixed_qkv,
                     b,
                     a,
@@ -1276,6 +1468,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                     attn_metadata.seq_lens,
                     slot_read_offsets,
                     ckpt_indices,
+                    *step_metadata,
                 )
                 if core_attn_out.shape[0] != num_tokens:
                     raise RuntimeError("GDN op returned an incompatible output shape.")

@@ -28,26 +28,27 @@ and writes every QSA layer's step tokens through the stock writer sequence
 
 from __future__ import annotations
 
+import dataclasses
 from typing import Any
 
 import jax
 import jax.numpy as jnp
 from jax.sharding import PartitionSpec as P
 
-from vllm_torchtpu.megakernel.exec_spec import ExecSpec, Tiles
+import os
+
+from vllm_torchtpu import envs
+from vllm_torchtpu.megakernel.exec_spec import DebugOptions, ExecSpec, Tiles
+from vllm_torchtpu.megakernel.ops import F32, REC
 from vllm_torchtpu.megakernel.models.qwen38_step import make_flat_segment_step
 from vllm_torchtpu.megakernel.wholestep.qsa_full import KV_NEW
 from vllm_torchtpu.megakernel.wholestep.qsa_full_c import IR_NEW, KR_NEW, UNION_STATS
 from vllm_torchtpu.megakernel.wholestep.spec import wholestep_spec
 
 from .qwen38_scatter import scatter_gdn_ckpts_fast
-from .qwen38_segment_call import (
-    GDN_META,
-    T_VERIFY,
-    gdn_blocks,
-    ring_depths,
-    segment_tiles,
-)
+from .qwen38_segment_call import GDN_META, T_VERIFY, gdn_blocks, ring_depths, segment_tiles
+from vllm_torchtpu.models.vllm.qwen4_exp.pool_layout import main_kv_dcp
+
 from .qwen38_wholestep_cache import QSALayerCache, wholestep_qsa_writes
 from .qwen38_wholestep_inputs import qsa_step_inputs
 
@@ -88,34 +89,76 @@ def union_stats_on() -> bool:
     return UNION_ATTN and UNION_STATS_EVERY > 0
 
 
+def compressed_dcp() -> bool:
+    """VLLM_TPU_QSA_COMPRESSED_DCP under main-KV DCP: compressed keys split like the main KV."""
+    return main_kv_dcp() > 1 and bool(envs.VLLM_TPU_QSA_COMPRESSED_DCP)
+
+
 def indexed_options() -> dict:
-    """The served indexer options (`LONG_CONTEXT`, the request-sharded selection, union
-    attention)."""
+    """The served indexer options (`LONG_CONTEXT`, the request-sharded selection, union attention,
+    the main-KV DCP size, compressed-key DCP)."""
     return dict(
-        LONG_CONTEXT,
-        shard_index=SHARD_INDEX,
-        union_attn=UNION_ATTN,
-        union_stats=union_stats_on(),
-        loop_requests=LOOP_REQUESTS,
-        union_phys=UNION_ATTN and UNION_PHYS,
+        LONG_CONTEXT, shard_index=SHARD_INDEX, union_attn=UNION_ATTN, union_stats=union_stats_on(),
+        loop_requests=LOOP_REQUESTS, union_phys=UNION_ATTN and UNION_PHYS, dcp=main_kv_dcp(),
+        compressed_dcp=compressed_dcp(),
     )
 
 
 def wholestep_tiles(B: int, max_groups: int = 0) -> Tiles:
-    """Segment tiles, with the 64-row ring depths from 48 rows up: at 48 rows the
-    segment's
+    """`_wholestep_tiles`; with main-KV DCP-2 up to 32 rows the expert ring drops one more 2 MiB
+    slot: the pair exchange buffers and the doubled-head union attention put b32 (f32 state)
+    over scoped VMEM (tpu_bench_wholestep_call j-677db355: CompileTimeScopedVmemOom), and the
+    owned-only per-rank unions (`qu_id` / `qu_cd` / `qgu_*` x2) b16 too (served j-af65b422:
+    62.49M at qwen38_mk_whole_b16)."""
+    t = _wholestep_tiles(B, max_groups)
+    if main_kv_dcp() > 1 and B <= 32:
+        # Above 32 rows the GDN chunk gather (no NS-sized pg_rec) leaves room for the full
+        # expert ring: at b48 the trimmed 5 slots cost 0.3-0.4 ms per call vs 6 (j-74ef730a).
+        t = dataclasses.replace(t, nbe=t.nbe - 1)
+    # Head-major GDN state update on the chunked (WIDE, > 16 rows) path: per-head states stay
+    # in vregs (same-pod A/B j-ed2d3a52: b32 8.42 -> 8.24 ms, b64 14.28 -> 13.99 ms; gdn_rec was
+    # 1.7x its VPU floor). Reassociates the f32 sums (`GDNTunables` "approx").
+    # VLLM_TPU_MK_GDN_HM=0 restores the whole-state update.
+    if os.environ.get("VLLM_TPU_MK_GDN_HM", "1") not in ("", "0"):
+        t = t.with_blocks({"gdn": {"gdn_head_major": True}})
+    # VLLM_TPU_MK_HIER=N (bench sweeps): override the all-reduce hierarchy.
+    hier = os.environ.get("VLLM_TPU_MK_HIER", "")
+    if hier:
+        t = dataclasses.replace(t, hier=int(hier))
+    # VLLM_TPU_MK_RINGS=nbe:nbd (bench sweeps): override the ring depths.
+    rings = os.environ.get("VLLM_TPU_MK_RINGS", "")
+    if rings:
+        nbe, nbd = (int(x) for x in rings.split(":"))
+        t = dataclasses.replace(t, nbe=nbe, nbd=nbd)
+    return t
+
+
+def _wholestep_tiles(B: int, max_groups: int = 0) -> Tiles:
+    """Segment tiles, with the 64-row ring depths from 48 rows up: at 48 rows the segment's
     (6, 10) rings leave the whole-step kernel 0.65 MiB over the 62 MiB VMEM limit (w01
-    j-508c1d10: CompileTimeScopedVmemOom 62.63M at qwen38_mk_whole_b48). Past 32768
-    groups
-    (262K contexts) the 16-row kernel's selection temporaries double and miss by 0.13
-    MiB
-    (j-38d236d7: 62.23M at 65536 groups), so up to 16 rows the expert ring drops one 2
-    MiB slot."""
+    j-508c1d10: CompileTimeScopedVmemOom 62.63M at qwen38_mk_whole_b48). Past 32768 groups
+    (262K contexts) the 16-row kernel's selection temporaries double and miss by 0.13 MiB
+    (j-38d236d7: 62.23M at 65536 groups), so up to 16 rows the expert ring drops one 2 MiB slot.
+    An f32 GDN state (`VLLM_TPU_MK_GDN_REC_F32=1`) on the WIDE rows (17..47) misses by 0.43 MiB
+    (j-f4f467fc: 64.37M at qwen38_mk_whole_b32; 2.16 MiB in tpu_bench_wholestep_call j-5ae41ffb,
+    where one expert slot fell 8 KiB short): the chunked GDN state ring (f32 chunk 3 MiB) drops
+    from 3 to 2 buffers there; scheduling only. Up to 16 rows (whole-state path, f32 `recb`) it
+    misses by 0.30 MiB (j-4aeaf924: 62.30M at qwen38_mk_whole_b16): one more expert slot.
+    Above 32 rows the GDN chunks read their states from the pool per `recb` slot (chunk
+    gather, `qwen38_gdn_pool`; no NS-sized `pg_rec`); above 64 rows the dense ring drops to
+    3 slots. Scratch (f32 state): b48 42.1 / b64 47.9 / b96 53.7 MiB (CPU plan)."""
+    if B > 64:
+        t = segment_tiles(B, rings=(6, 3))
+        return t.with_blocks({"gdn": {"gdn_bufs": 2}}) if REC == F32 else t
     if B >= 48:
-        return segment_tiles(B, rings=(6, 4))
-    if B <= 16 and max_groups > 32768:
+        t = segment_tiles(B, rings=(6, 4))
+        return t.with_blocks({"gdn": {"gdn_bufs": 2}}) if REC == F32 else t
+    if REC == F32 and B > 16:
+        return segment_tiles(B).with_blocks({"gdn": {"gdn_bufs": 2}})
+    if B <= 16 and (max_groups > 32768 or REC == F32):
         nbe, nbd = ring_depths(B)
-        return segment_tiles(B, rings=(nbe - 1, nbd))
+        drop = int(max_groups > 32768) + int(REC == F32)
+        return segment_tiles(B, rings=(nbe - drop, nbd))
     return segment_tiles(B)
 
 
@@ -137,13 +180,11 @@ def build_wholestep_call(
 ) -> tuple[Any, tuple, tuple, tuple]:
     R = mesh.size
     T = T_VERIFY
+    # VLLM_TPU_MK_SCOPES=N: per-phase named scopes in the kernel (profiling only).
+    scopes = int(os.environ.get("VLLM_TPU_MK_SCOPES", "0") or 0)
     ex = ExecSpec(
-        R=R,
-        B=B,
-        T=T,
-        ctx=128,
-        tiles=wholestep_tiles(B, max_groups) if tiles is None else tiles,
-        interpret=interpret,
+        R=R, B=B, T=T, ctx=128, tiles=wholestep_tiles(B, max_groups) if tiles is None else tiles,
+        interpret=interpret, debug=DebugOptions(scopes=scopes),
     )
     n_att = L // g.att_every
     n_gdn = L - n_att
@@ -257,24 +298,11 @@ def build_wholestep_call(
         check_vma=False,
     )
 
-    def per_rank_writes(
-        pool,
-        conv_ck,
-        rec_ck,
-        wb,
-        kv,
-        kr,
-        ir,
-        tables_flat,
-        positions,
-        starts,
-        context,
-        trig,
-        norms_flat,
-    ):
-        pool = scatter_gdn_ckpts_fast(
-            pool, conv_ck, rec_ck, wb, layout=layout, interpret=interpret
-        )
+    dcp_size = main_kv_dcp()
+
+    def per_rank_writes(pool, conv_ck, rec_ck, wb, kv, kr, ir, tables_flat, positions, starts,
+                        context, trig, norms_flat, *rank):
+        pool = scatter_gdn_ckpts_fast(pool, conv_ck, rec_ck, wb, layout=layout, interpret=interpret)
         if not write:
             return pool
         Bq = len(positions)
@@ -283,30 +311,21 @@ def build_wholestep_call(
             for o in range(n_att)
         ]
         norms = [tuple(norms_flat[2 * o : 2 * o + 2]) for o in range(n_att)]
-        tables = [
-            tuple(tables_flat[i : i + QSA_TABLES]) for i in range(0, n_tab, QSA_TABLES)
-        ]
+        tables = [tuple(tables_flat[i : i + QSA_TABLES]) for i in range(0, n_tab, QSA_TABLES)]
+        # Main-KV DCP: this rank's pair rank, the QSA layers' `dcp_rank` buffer (int32 [1] per
+        # rank; `axis_index` lowers to a partition id, which the served SPMD compile refuses).
+        dcp = (rank[0].reshape(1), dcp_size) if dcp_size > 1 else None
         return wholestep_qsa_writes(
-            pool,
-            rows,
-            norms,
-            tables,
-            qsa_layers,
-            positions,
-            trig,
-            starts,
-            context,
-            compress_ratio=4,
-            norm_eps=norm_eps,
-            rotary_dim=rotary_dim,
-            max_query_len=T,
-            num_requests=M // T,
+            pool, rows, norms, tables, qsa_layers, positions, trig, starts, context,
+            compress_ratio=4, norm_eps=norm_eps, rotary_dim=rotary_dim, max_query_len=T,
+            num_requests=M // T, dcp=dcp, compressed_dcp=dcp if compressed_dcp() else None,
         )
 
     writes = jax.shard_map(
         per_rank_writes,
         mesh=mesh,
-        in_specs=(tp, tp, tp, rep, tp, tp, tp, rep, rep, rep, rep, rep, rep),
+        in_specs=(tp, tp, tp, rep, tp, tp, tp, rep, rep, rep, rep, rep, rep)
+        + ((tp,) if dcp_size > 1 else ()),
         out_specs=tp,
         check_vma=False,
     )
@@ -324,37 +343,20 @@ def build_wholestep_call(
         tables = args[i : i + n_tab]
         i += n_tab
         positions, starts, context, trig = args[i : i + 4]
-        norms = args[i + 4 :]  # per QSA layer: k_norm, index k_norm (cache writer)
+        norms = args[i + 4 : i + 4 + 2 * n_att]  # per QSA layer: k_norm, index k_norm (cache writer)
+        rank = args[i + 4 + 2 * n_att :]  # main-KV DCP: the pair rank, int32 [1] per rank
         x = pad(hidden)
         rb, wb, hi = gdn_blocks(meta, NS, write)
         xs = dict(zip(names, inputs(pool, tables, positions, starts, context, trig)))
         xs.update(gdn_pool=pool, gdn_rb=rb, gdn_hi=hi.astype(jnp.int32))
         outs = fn(pos0, x, *(xs[k] for k in fn.extra_names), *w)
         res, conv_ck, rec_ck, kv, kr, ir = outs[:6]
-        pool = writes(
-            pool,
-            conv_ck,
-            rec_ck,
-            wb,
-            kv,
-            kr,
-            ir,
-            tables,
-            positions,
-            starts,
-            context,
-            trig,
-            norms,
-        )
+        pool = writes(pool, conv_ck, rec_ck, wb, kv, kr, ir, tables, positions, starts, context,
+                      trig, norms, *rank)
         return (unpad(res), pool, outs[6]) if stats else (unpad(res), pool)
 
     in_specs = (
-        (tp,)
-        + (tp,) * n_w
-        + (tp,)
-        + (rep,) * n_meta
-        + (rep,) * n_tab
-        + (rep,) * 4
-        + (rep,) * (2 * n_att)
+        (tp,) + (tp,) * n_w + (tp,) + (rep,) * n_meta + (rep,) * n_tab + (rep,) * 4
+        + (rep,) * (2 * n_att) + ((tp,) if dcp_size > 1 else ())
     )
     return call, in_specs, (tp, tp, tp) if stats else (tp, tp), (1 + n_w,)

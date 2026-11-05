@@ -25,7 +25,6 @@ from typing import Any
 
 import jax
 import jax.numpy as jnp
-import ml_dtypes
 import numpy as np
 from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
@@ -133,11 +132,9 @@ def random_wholestep_inputs(
     ang = pos[:, None] * inv[None, :]
     rope = np.zeros(
         (ex.M, 128), np.float32
-    )  # host-only (traceable under jit): ml_dtypes BF16
-    rope[:, : g.ROT // 2] = np.cos(ang).astype(ml_dtypes.bfloat16).astype(np.float32)
-    rope[:, g.ROT // 2 : g.ROT] = (
-        np.sin(ang).astype(ml_dtypes.bfloat16).astype(np.float32)
-    )
+    )  # host-only (traceable under jit): BF16-rounded sin/cos
+    rope[:, : g.ROT // 2] = np.cos(ang).astype(BF16).astype(np.float32)
+    rope[:, g.ROT // 2 : g.ROT] = np.sin(ang).astype(BF16).astype(np.float32)
     out = dict(
         inp=inp,
         hc=hc,
@@ -507,11 +504,12 @@ def _flat(x: Any) -> Any:
 def extras_b(d: dict[str, Any], mesh: Mesh, R: int) -> tuple:
     tp, rep = NamedSharding(mesh, P("tp")), NamedSharding(mesh, P())
     pl_ = d.get("per_layer")
-    ck: tuple[Any, ...] = (
-        (
-            jax.device_put(kernel.fold(_rep(d["carrier"], R)), tp),
-            jax.device_put(_flat(d["cktab"]) if pl_ else d["cktab"], rep),
-        )
+    car = d.get("carrier")
+    if car is not None and car.ndim == 4:  # per-rank carriers (compressed-key DCP) are [R, ...]
+        car = _rep(car, R)
+    ck = (
+        (jax.device_put(kernel.fold(car), tp),
+         jax.device_put(_flat(d["cktab"]) if pl_ else d["cktab"], rep))
         if "carrier" in d
         else (jax.device_put(kernel.fold(_rep(d["ck"], R)), tp),)
     )
@@ -572,12 +570,8 @@ def add_step_inputs(
     inv = 1.0 / (g.theta ** (np.arange(0, g.ROT, 2) / g.ROT))
     ang = j0[:, None] * inv[None, :]
     rope_ck = np.zeros((nreq, 1, 128), np.float32)
-    rope_ck[:, 0, : g.ROT // 2] = (
-        np.cos(ang).astype(ml_dtypes.bfloat16).astype(np.float32)
-    )
-    rope_ck[:, 0, g.ROT // 2 : g.ROT] = (
-        np.sin(ang).astype(ml_dtypes.bfloat16).astype(np.float32)
-    )
+    rope_ck[:, 0, : g.ROT // 2] = np.cos(ang).astype(BF16).astype(np.float32)
+    rope_ck[:, 0, g.ROT // 2 : g.ROT] = np.sin(ang).astype(BF16).astype(np.float32)
     return {
         **d,
         "ctxq": jnp.asarray(ctxq),

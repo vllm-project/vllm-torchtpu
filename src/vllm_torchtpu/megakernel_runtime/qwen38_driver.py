@@ -58,9 +58,10 @@ logger = init_logger(__name__)
 # 24 and 48 are serving token buckets too (TPU_TOKEN_BUCKET_EXTRA); without them
 # 24-/48-row verify steps (6 or 12 requests) run stock.
 # 96 rows (24 requests, the default seat cap; a serving token bucket) runs as row
-# chunks of at most KERNEL_ROWS. 128+ is left out: the segment program shares the
-# stock hyper-connection code, which branches at its 128-row prefill tile.
-DEFAULT_BUCKETS = (4, 8, 16, 24, 32, 48, 64, 96)
+# chunks of at most KERNEL_ROWS; 128 (32 requests, the c32 full load) as 2 x 64. The
+# stock hyper-connections the programs trace keep their small-row path at 128 rows
+# (hyperconnection.verify_rows); larger buckets are left out.
+DEFAULT_BUCKETS = (4, 8, 16, 24, 32, 48, 64, 96, 128)
 # The segment kernel's row limit (Qwen38InnerGeometry.check: B <= M <= 64).
 KERNEL_ROWS = 64
 
@@ -94,9 +95,15 @@ def _parse_int(raw: str, key: str) -> int | None:
     return None
 
 
-def _real_traffic(kw: dict) -> bool:
-    """A served step rather than a warmup dummy: some request has more than 64 tokens of
-    context."""
+def _real_traffic(kw: dict, runner: Any = None, n_req: int | None = None) -> bool:
+    """A served step rather than a warmup dummy: some request has more than 64 tokens of context.
+
+    Reads the runner's host-side computed-token counts when it has them: `context_lens`
+    is a device tensor, and `int(ctx.max())` on it is a device program plus a host sync
+    on every megakernel step (~0.65 ms idle per step in serving, j-3f588cde)."""
+    host = getattr(getattr(runner, "input_batch", None), "num_computed_tokens_cpu", None)
+    if host is not None and n_req:
+        return int(host[:n_req].max()) > 64
     ctx = kw.get("context_lens")
     if ctx is None or not isinstance(ctx, torch.Tensor) or ctx.numel() == 0:
         return True
@@ -200,8 +207,8 @@ def _cpu_proxy(m: Any, memo: dict | None = None) -> Any:
 # writes a fresh pool that `_run` copies back into the live cache (bisecting a served
 # hang).
 NO_DONATE = False
-# Largest whole-step bucket: its VMEM plan fits up to 64 rows (`wholestep_tiles`).
-WHOLE_MAX_ROWS = 64
+# Largest whole-step bucket: its VMEM plan fits up to 96 rows (`wholestep_tiles`).
+WHOLE_MAX_ROWS = 96
 # Model steps after warmup (verify steps; any step once disabled) by which a `whole=1`
 # server must have made a whole-step call.
 WHOLE_SELF_CHECK_STEPS = 200
@@ -672,7 +679,9 @@ class Qwen38SegmentDriver:
         )
         self.program: Any = None
         self.check_left = 0
-        self.shadow: Any = None
+        self.check_rows: frozenset[int] = frozenset()
+        self.check_warm: set[int] = set()
+        self.shadow = None
         self.h0check_left = 0
         self.h0rows = 0
         self.h0dump = False
@@ -709,9 +718,19 @@ class Qwen38SegmentDriver:
         self.whole_above = "stock"  # `wholeabove=stock|seg`: steps above `wholerows`
         self.whole_program: Any = None
         self.whole_calls = 0
-        self.whole_dry = (
-            False  # `wholedry=1`: decide and count as whole=1, run stock (AL control)
-        )
+        self.whole_dry = False  # `wholedry=1`: decide and count as whole=1, run stock (AL control)
+        # `wholecheck=N`: the first N real whole-eligible steps run the whole-step program
+        # without GDN / QSA cache writes, then stock; log MK vs stock, serve stock.
+        self.wholecheck_left = 0
+        self.whole_shadow = None
+        self.wholecheck_warm: set[int] = set()
+        self.wholecheck_agg: dict[int, list[float]] = {}
+        # `wholefault=1`: positive control; each checked step also runs the shadow on the step's
+        # token ids rolled by one row (a row-misaligned embedding / PLE input) and logs its diff.
+        self.whole_fault = False
+        # `wholecheckrows=16:24`: check (and compile the shadow programs for) only these
+        # buckets; default every whole-step bucket.
+        self.wholecheck_rows: frozenset[int] = frozenset()
 
     @classmethod
     def maybe_create(cls, runner: Any) -> Qwen38SegmentDriver | None:
@@ -733,15 +752,12 @@ class Qwen38SegmentDriver:
             if getattr(t, field, None) != want:
                 reasons.append(f"{field}={getattr(t, field, None)} != {want}")
         if (
-            getattr(getattr(runner.model, "model", None), "host_ple_index", None)
-            is not None
+            getattr(getattr(runner.model, "model", None), "host_ple_index", None) is not None
+            and not envs.VLLM_TPU_MK_HOST_PLE
         ):
-            # PLE CPU offload (PLE_CPU_OFFLOAD, auto-on at max concurrency >= 32): the
-            # MK programs need
-            # the PLE table on HBM, so no driver at all - building one would still pack
-            # the segment
-            # operands into HBM before KV-cache sizing and shrink the pool of an
-            # all-stock run
+            # PLE CPU offload (PLE_CPU_OFFLOAD, auto-on at max concurrency >= 32): the MK programs need
+            # the PLE table on HBM, so no driver at all - building one would still pack the segment
+            # operands into HBM before KV-cache sizing and shrink the pool of an all-stock run
             # (c32 j-f34a09a4: prefix hit 0.9403 vs 0.9454 MK-unset).
             reasons.append(
                 "PLE CPU offload is on (the segment program needs the PLE table on HBM)"
@@ -762,6 +778,12 @@ class Qwen38SegmentDriver:
                 qwen38_segment_call.DEFAULT_RINGS = (int(e), int(d))
         drv = cls(runner, _parse_buckets(raw), head=_parse_flag(raw, "head", True))
         drv.check_left = _parse_check(raw)
+        # `checkrows=16:24`: check=N compares only these buckets. Checks count real steps
+        # only (after warmup, real context); warmup runs each bucket's shadow once to
+        # compile it (j-ef8effe9: all 300 checks went to warmup dummies, rel 0).
+        for part in raw.split(","):
+            if part.startswith("checkrows="):
+                drv.check_rows = frozenset(int(x) for x in part[len("checkrows=") :].split(":"))
         # `h0check=N`: every eligible step runs stock; the first N real ones also
         # compare the head-0 (layer 0) kernel against stock layer 0 on the same
         # input, the kernel reading a private copy of layer 0's state blocks.
@@ -802,6 +824,11 @@ class Qwen38SegmentDriver:
         drv.noaot = _parse_flag(raw, "noaot", False)
         drv.whole = _parse_flag(raw, "whole", False)
         drv.whole_dry = _parse_flag(raw, "wholedry", False)
+        drv.wholecheck_left = _parse_int(raw, "wholecheck") or 0
+        drv.whole_fault = _parse_flag(raw, "wholefault", False)
+        for part in raw.split(","):
+            if part.startswith("wholecheckrows="):
+                drv.wholecheck_rows = frozenset(int(x) for x in part[len("wholecheckrows=") :].split(":"))
         cap = _parse_int(raw, "wholecap")
         if cap is not None:
             drv.whole_cap = cap
@@ -893,11 +920,13 @@ class Qwen38SegmentDriver:
 
         stack = contextlib.ExitStack()
         stack.enter_context(set_model_tag(tag))
-        cfg = (
-            getattr(self, "whole_cfg", None) if tag == "model_mk_whole" else None
-        ) or (getattr(self, "cfg", None) or runner.vllm_config)
-        stack.enter_context(
-            set_vllm_model_wrapper_context(mesh=runner.mesh, vllm_config=cfg)
+        # Both whole-step programs (served and `wholecheck` shadow) compile only the whole buckets.
+        if tag in ("model_mk_whole_shadow", "model_mk_segcut_shadow"):
+            cfg = getattr(self, "check_cfg", None) or getattr(self, "whole_cfg", None)
+        else:
+            cfg = getattr(self, "whole_cfg", None) if tag == "model_mk_whole" else None
+        cfg = cfg or (
+            getattr(self, "cfg", None) or runner.vllm_config
         )
         stack.enter_context(set_current_vllm_config(cfg))
         if getattr(self, "noaot", False):
@@ -973,7 +1002,7 @@ class Qwen38SegmentDriver:
     def bind_and_warmup(self, runner: Any) -> None:
         from vllm_torchtpu.models.vllm.qwen4_exp.model import Qwen4ExpSegmentModel
 
-        if getattr(runner.model.model, "host_ple_index", None) is not None:
+        if getattr(runner.model.model, "host_ple_index", None) is not None and not envs.VLLM_TPU_MK_HOST_PLE:
             # forward_segments needs the PLE table on HBM; with PLE CPU offload
             # (PLE_CPU_OFFLOAD, auto-on at max concurrency >= 32) the first MK
             # call would fail to trace and fail closed. Say so once, up front.
@@ -1023,8 +1052,12 @@ class Qwen38SegmentDriver:
                 head=bool(self.segments.head_groups),
             )
             shadow_seg.bind_pool()
+            from vllm_torchtpu.models.vllm.qwen4_exp.model import Qwen4ExpSegmentShadowModel
+
+            # Own compiled class: a second Qwen4ExpSegmentModel instance would share the served
+            # segment program's compiled graph (see `_attach_whole_shadow`).
             with self._contexts(runner, "model_mk_segments_shadow"):
-                self.shadow = Qwen4ExpSegmentModel(
+                self.shadow = Qwen4ExpSegmentShadowModel(
                     vllm_config=self.cfg,
                     prefix="model_mk_segments_shadow",
                     backbone=runner.model.model,
@@ -1635,6 +1668,8 @@ class Qwen38SegmentDriver:
                     segments=self.segments,
                     whole=whole,
                 )
+            if self.wholecheck_left > 0:
+                self._attach_whole_shadow(runner, whole)
             logger.info(
                 "Qwen3.8 whole-step megakernel attached: layers 3..46, context cap "
                 "%d, rows <= %d, "
@@ -1649,6 +1684,224 @@ class Qwen38SegmentDriver:
         except Exception:
             logger.exception("Qwen3.8 whole-step: setup failed; segment program only")
             self.whole_program = None
+
+    def _attach_whole_shadow(self, runner: Any, whole: Any) -> None:
+        """`wholecheck=N`: the whole-step program again, writing no GDN checkpoints (shadow
+        segments for the head groups and L47) and no QSA cache rows; the packed operands are
+        the served module's (a shallow copy shares its buffers)."""
+        import copy
+
+        from vllm_torchtpu.models.vllm.qwen4_exp.model import (
+            Qwen4ExpSegmentCutModel,
+            Qwen4ExpWholeStepShadowModel,
+        )
+
+        # One write-free segments instance for both programs: each instance registers its
+        # kernels as custom ops named by tag, and two instances re-register the same names
+        # (j-3628e449: TP2 failed with no schema for qwen38_mk::seg_l1_shadow, the other ranks
+        # waited PEER_WAIT_S = 3600 s for its artifact). `stop_before_last` only stops
+        # `forward_segments`; the whole-step forward does not read it.
+        seg = Qwen38Segments(
+            runner.model, self.g, self.mesh, self.buckets, shared=self.segments,
+            head=bool(self.segments.head_groups),
+        )
+        seg.bind_pool()
+        seg.stop_before_last = True
+        # Compile the shadow programs only for the checked buckets.
+        rows = sorted(self.wholecheck_rows) or list(self.whole_cfg.compilation_config.compile_sizes)
+        self.wholecheck_rows = frozenset(rows)
+        self.check_cfg = copy.copy(self.whole_cfg)
+        cc = copy.copy(self.whole_cfg.compilation_config)
+        cc.compile_sizes = rows
+        object.__setattr__(self.check_cfg, "compilation_config", cc)
+
+        sw = copy.copy(whole)
+        sw.write, sw.tag = False, "whole_shadow"
+        sw.bind_pool(self.segments.pool, self.segments.layout)
+        # Own compiled classes: a second instance of the served program's class would share
+        # its compiled graph (j-5635b8b7: model_mk_whole never compiled; the served whole
+        # steps ran the shadow's write-free graph).
+        with self._contexts(runner, "model_mk_whole_shadow"):
+            self.whole_shadow = Qwen4ExpWholeStepShadowModel(
+                vllm_config=self.check_cfg,
+                prefix="model_mk_whole_shadow",
+                backbone=runner.model.model,
+                segments=seg,
+                whole=sw,
+            )
+        # Cut reference: the segment program over the same layers 3..46, stopped before the
+        # last QSA layer's cache-writing attention core (compared with the shadow's residual
+        # at the same point, so a double cache write in L47 cannot enter the comparison).
+        with self._contexts(runner, "model_mk_segcut_shadow"):
+            self.whole_cut_ref = Qwen4ExpSegmentCutModel(
+                vllm_config=self.check_cfg,
+                prefix="model_mk_segcut_shadow",
+                backbone=runner.model.model,
+                segments=seg,
+            )
+        logger.info(
+            "Qwen3.8 whole-step shadow check attached: %d steps, buckets %s",
+            self.wholecheck_left, sorted(self.wholecheck_rows),
+        )
+
+    def _whole_shadow_step(self, runner: Any, input_ids: Any, positions: Any, kw: dict,
+                           rows: int, real: bool, n_req: int = 0) -> Any:
+        """Whole-step shadow (no cache writes) and the cut segment reference, then stock; log
+        the diffs on real steps, serve stock."""
+        with self._contexts(runner, "model_mk_whole_shadow"):
+            mk, mk_pre = self.whole_shadow(input_ids=input_ids, positions=positions, **kw)
+        with self._contexts(runner, "model_mk_segcut_shadow"):
+            seg_pre = self.whole_cut_ref(input_ids=input_ids, positions=positions, **kw)
+        seg_pre = seg_pre[0] if isinstance(seg_pre, (tuple, list)) else seg_pre
+        stock = runner.model(input_ids=input_ids, positions=positions, **kw)
+        if not real:  # warmup: compile this bucket's shadow programs, compare nothing
+            return stock
+        rel, max_abs, agree = self._vs_stock(runner, mk, stock)
+        self._log_per_request(runner, mk, stock, mk_pre, seg_pre, kw, positions, rows, n_req)
+        if self.whole_fault:
+            with self._contexts(runner, "model_mk_whole_shadow"):
+                bad = self.whole_shadow(input_ids=input_ids.roll(1, 0), positions=positions, **kw)[0]
+            f_rel, f_max, f_agree = self._vs_stock(runner, bad, stock)
+            logger.info(
+                "qwen38 whole-step shadow FAULT CONTROL rows=%d mean_rel=%.4g max_abs=%.4g "
+                "top1_agree=%.4f", rows, f_rel, f_max, f_agree,
+            )
+        self.wholecheck_left -= 1
+        agg = self.wholecheck_agg.setdefault(rows, [0.0, 0.0, 0.0, 0.0])
+        agg[0] += 1
+        agg[1] += rel
+        agg[2] = max(agg[2], rel)
+        agg[3] += agree
+        logger.info(
+            "qwen38 whole-step shadow check rows=%d mean_rel=%.4g max_abs=%.4g top1_agree=%.4f "
+            "(%d left)", rows, rel, max_abs, agree, self.wholecheck_left,
+        )
+        if self.wholecheck_left == 0:
+            logger.info(
+                "qwen38 whole-step shadow check summary {rows: (n, mean_rel, max_rel, top1_agree)}: %s",
+                {r: (int(a[0]), round(a[1] / a[0], 5), round(a[2], 5), round(a[3] / a[0], 4))
+                 for r, a in sorted(self.wholecheck_agg.items())},
+            )
+        return stock
+
+    def _log_per_request(self, runner: Any, mk: Any, stock: Any, mk_pre: Any, seg_pre: Any,
+                         kw: dict, positions: Any, rows: int, n_req: int) -> None:
+        """Per request: top-1 agreement MK vs stock, residual rel (shadow vs cut segment
+        reference) entering the last QSA layer; per-request ctx / pos / state slot and the
+        final-hidden rel scaled by each request's own magnitude, logged for every request."""
+        T = T_VERIFY
+        n = n_req or rows // T
+        mk_h = mk[0] if isinstance(mk, (tuple, list)) else mk
+        st_h = stock[0] if isinstance(stock, (tuple, list)) else stock
+        lm = runner.model.compute_logits(mk_h).float()[: n * T]
+        ls = runner.model.compute_logits(st_h).float()[: n * T]
+        eq = (lm.argmax(-1) == ls.argmax(-1)).float().reshape(n, T)
+        agree = [round(float(v), 2) for v in eq.mean(-1).cpu()]
+        self._margin_diag(lm, ls, mk_h.float()[: n * T], st_h.float()[: n * T], kw, n)
+        pre = None  # check=N: no cut reference
+        if mk_pre is not None:
+            a, b = mk_pre.float()[: n * T], seg_pre.float()[: n * T]
+            scale = b.abs().mean().clamp_min(1e-6)
+            pre = [round(float(v), 4) for v in ((a - b).abs().reshape(n, T, -1).mean((1, 2)) / scale).cpu()]
+        pre_own = None  # same, scaled by each request's own reference magnitude
+        if mk_pre is not None:
+            pre_own = [round(float(v), 4) for v in
+                       ((a - b).abs().reshape(n, T, -1).mean((1, 2))
+                        / b.abs().reshape(n, T, -1).mean((1, 2)).clamp_min(1e-6)).cpu()]
+        fa = mk_h.float()[: n * T].reshape(n, T, -1)
+        fb = st_h.float()[: n * T].reshape(n, T, -1)
+        fin = [round(float(v), 4) for v in
+               ((fa - fb).abs().mean((1, 2)) / fb.abs().mean((1, 2)).clamp_min(1e-6)).cpu()]
+
+        def col(name):
+            t = kw.get(name)
+            if isinstance(t, torch.Tensor) and t.numel() >= n:
+                return [int(v) for v in t[:n].cpu()]
+            return None
+
+        bad = [q for q in range(n) if agree[q] < 0.5]
+        logger.info(
+            "qwen38 whole-step shadow per-request rows=%d agree=%s pre_last_rel_vs_seg=%s bad=%s",
+            rows, agree, pre, bad,
+        )
+        logger.info(
+            "qwen38 per-request meta rows=%d ctx=%s pos=%s slot=%s qsl=%s fin_rel_own=%s "
+            "pre_rel_own=%s", rows, col("context_lens"),
+            [int(v) for v in positions[: n * T : T].cpu()], col("state_slots"),
+            col("query_start_loc"), fin, pre_own,
+        )
+
+    # Context buckets (tokens) for the per-row hidden-state error.
+    _CTX_EDGES = (8192, 32768, 65536, 131072)
+    # Stock top-1 minus top-2 logit margin bins.
+    _MARGIN_EDGES = (0.25, 0.5, 1.0, 2.0, 4.0, 8.0)
+
+    def _margin_diag(self, lm: Any, ls: Any, mk_h: Any, st_h: Any, kw: dict, n: int) -> None:
+        """Near-tie noise vs drift. Per checked row: the stock top1 - top2 logit margin, and
+        for a row whose top-1 differs, MK's pick's rank in the stock logits and |MK - stock|
+        at the stock top-1 token; per-row final-hidden relative error by request context.
+        Noise flips only at margins below the logit error and picks stock's runner-up; drift
+        flips at large margins or picks deep. Logs a summary every 50 checked steps."""
+        T = T_VERIFY
+        top2 = ls.topk(2, dim=-1)
+        margin = (top2.values[:, 0] - top2.values[:, 1]).cpu()
+        s_arg = top2.indices[:, 0]
+        m_arg = lm.argmax(-1)
+        flip = (m_arg != s_arg).cpu()
+        dlogit = (lm.gather(1, s_arg[:, None]) - ls.gather(1, s_arg[:, None])).abs()[:, 0].cpu()
+        rank = (ls > ls.gather(1, m_arg[:, None])).sum(-1).cpu()  # 0 = stock top-1
+        rel = ((mk_h - st_h).abs().mean(-1) / st_h.abs().mean(-1).clamp_min(1e-6)).cpu()
+        ctx = kw.get("context_lens")
+        ctx = ctx[:n].cpu() if isinstance(ctx, torch.Tensor) and ctx.numel() >= n else None
+        agg = self.__dict__.setdefault("_mdiag", dict(
+            steps=0, rows=0, flips=0, margin_all=[0] * 7, margin_flip=[0] * 7,
+            rank=[0] * 4, flip_over_dlogit=0, rel_ctx=[[0.0, 0] for _ in range(5)],
+        ))
+        import bisect
+
+        agg["steps"] += 1
+        flips = []
+        for r in range(n * T):
+            mb = bisect.bisect_right(self._MARGIN_EDGES, float(margin[r]))
+            agg["rows"] += 1
+            agg["margin_all"][mb] += 1
+            q = r // T
+            c = int(ctx[q]) if ctx is not None else -1
+            cb = bisect.bisect_right(self._CTX_EDGES, c) if c >= 0 else 0
+            agg["rel_ctx"][cb][0] += float(rel[r])
+            agg["rel_ctx"][cb][1] += 1
+            if flip[r]:
+                agg["flips"] += 1
+                agg["margin_flip"][mb] += 1
+                agg["rank"][min(int(rank[r]), 3)] += 1
+                agg["flip_over_dlogit"] += int(float(margin[r]) > float(dlogit[r]))
+                flips.append((r, round(float(margin[r]), 3), int(rank[r]),
+                              round(float(dlogit[r]), 3), c))
+        logger.info(
+            "qwen38 MK margin-diag rows=%d flips(row,margin,mk_rank_in_stock,dlogit,ctx)=%s "
+            "rel_per_row=%s", n * T, flips, [round(float(v), 3) for v in rel],
+        )
+        if agg["steps"] % 50 == 0:
+            logger.info(
+                "qwen38 MK margin-diag SUMMARY steps=%d rows=%d flips=%d margin_edges=%s "
+                "margin_all=%s margin_flip=%s mk_rank_in_stock[0,1,2,3+]=%s "
+                "flips_with_margin>dlogit=%d ctx_edges=%s mean_row_rel_by_ctx=%s",
+                agg["steps"], agg["rows"], agg["flips"], self._MARGIN_EDGES,
+                agg["margin_all"], agg["margin_flip"], agg["rank"], agg["flip_over_dlogit"],
+                self._CTX_EDGES,
+                [(round(t / k, 4) if k else None, k) for t, k in agg["rel_ctx"]],
+            )
+
+    @staticmethod
+    def _vs_stock(runner: Any, mk: Any, stock: Any) -> tuple[float, float, float]:
+        """(mean rel diff, max abs diff, top-1 agreement) of the first outputs."""
+        mk_h = mk[0] if isinstance(mk, (tuple, list)) else mk
+        st_h = stock[0] if isinstance(stock, (tuple, list)) else stock
+        d = (mk_h.float() - st_h.float()).abs()
+        rel = float(d.mean() / st_h.float().abs().mean().clamp_min(1e-6))
+        top_mk = runner.model.compute_logits(mk_h).argmax(-1)
+        top_st = runner.model.compute_logits(st_h).argmax(-1)
+        return rel, float(d.max()), float((top_mk == top_st).float().mean())
 
     def _whole_self_check(self, runner: Any) -> None:
         """Loud error if `whole=1` but no whole-step call ran in the first model steps
@@ -1753,15 +2006,17 @@ class Qwen38SegmentDriver:
             "Qwen3.8 MTP draft tail kernel attached, rows buckets %s", self.buckets
         )
 
-    def _shadow_step(
-        self, runner: Any, input_ids: Any, positions: Any, kw: dict
-    ) -> Any:
-        """Run the kernel program (no GDN writes) then the stock model; log, return
-        stock."""
-        assert self.shadow is not None
+    def _shadow_step(self, runner: Any, input_ids: Any, positions: Any, kw: dict,
+                     real: bool = True, n_req: int = 0) -> Any:
+        """Run the kernel program (no GDN writes) then the stock model; log, return stock."""
         with self._contexts(runner, "model_mk_segments_shadow"):
             mk = self.shadow(input_ids=input_ids, positions=positions, **kw)
         stock = runner.model(input_ids=input_ids, positions=positions, **kw)
+        if not real:  # warmup: compile this bucket's shadow program, compare nothing
+            return stock
+        # n_req, not rows // T: a padded request slot (stale context_lens) is no request.
+        self._log_per_request(runner, mk, stock, None, None, kw, positions,
+                              int(input_ids.shape[0]), n_req)
         mk_h = mk[0] if isinstance(mk, (tuple, list)) else mk
         st_h = stock[0] if isinstance(stock, (tuple, list)) else stock
         d = (mk_h.float() - st_h.float()).abs()
@@ -1969,11 +2224,7 @@ class Qwen38SegmentDriver:
         # Read-only below: no per-step copy.
         kw = model_kwargs if model_kwargs is not None else {}
         if self.segx_left > 0 or getattr(self, "segx_done", False):
-            if (
-                self.segx_left > 0
-                and getattr(runner, "warmup_done", False)
-                and _real_traffic(kw)
-            ):
+            if self.segx_left > 0 and getattr(runner, "warmup_done", False) and _real_traffic(kw, runner, n_req):
                 self.segx_left -= 1
                 self.segx_done = True
                 try:
@@ -1985,7 +2236,7 @@ class Qwen38SegmentDriver:
                     self.segx_left = 0
             return False, None
         if self.h0check_left > 0 or getattr(self, "h0check_done", False):
-            warm, real = bool(getattr(runner, "warmup_done", False)), _real_traffic(kw)
+            warm, real = bool(getattr(runner, "warmup_done", False)), _real_traffic(kw, runner, n_req)
             want = not getattr(self, "h0rows", 0) or rows == self.h0rows
             seen = self.__dict__.setdefault("_h0_gate_seen", set())
             if self.h0check_left > 0 and (rows, warm, real) not in seen:
@@ -2017,8 +2268,30 @@ class Qwen38SegmentDriver:
         if first_warm:
             self._tp_barrier("before the first (compiling) call")
         try:
-            if self.check_left > 0 and self.shadow is not None:
-                out = self._shadow_step(runner, input_ids, positions, kw)
+            check_real = bool(getattr(runner, "warmup_done", False)) and _real_traffic(kw, runner, n_req)
+            if (
+                self.check_left > 0
+                and self.shadow is not None
+                and (not self.check_rows or rows in self.check_rows)
+                and (rows not in self.check_warm or check_real)
+            ):
+                self.check_warm.add(rows)
+                self._note(f"check_b{rows}" if check_real else f"check_warm_b{rows}")
+                out = self._shadow_step(runner, input_ids, positions, kw, check_real, n_req)
+            elif (
+                self.wholecheck_left > 0
+                and self.whole_shadow is not None
+                and rows in self.wholecheck_rows
+                and self._whole_eligible(runner, n_req, rows)
+                and (
+                    rows not in self.wholecheck_warm
+                    or (getattr(runner, "warmup_done", False) and _real_traffic(kw, runner, n_req))
+                )
+            ):
+                real = bool(getattr(runner, "warmup_done", False)) and _real_traffic(kw, runner, n_req)
+                self.wholecheck_warm.add(rows)
+                self._note(f"wholecheck_b{rows}" if real else f"wholecheck_warm_b{rows}")
+                out = self._whole_shadow_step(runner, input_ids, positions, kw, rows, real, n_req)
             elif self._whole_eligible(runner, n_req, rows):
                 self.whole_calls += 1
                 self._count("drafts_whole", n_req * (T_VERIFY - 1))

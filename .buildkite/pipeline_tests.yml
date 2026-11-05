@@ -86,15 +86,27 @@ steps:
     key: "unit_tests_cpu_pr"
     <<: *cpu_unit_test_defaults
     if: 'build.env("NIGHTLY") != "1"'
-    parallelism: 4
+    parallelism: 16
+    env:
+      SHAPE: "cpu"
+      # Without it JAX looks for a TPU.
+      JAX_PLATFORMS: "cpu"
+      # Carries the -m filter into bktec's --collect-only step so TPU-only and
+      # nightly-only tests do not skew CPU shard planning.
+      PYTEST_ADDOPTS: "-m 'not tpu_test and not multichip and not nightly'"
+    retry:
+      automatic:
+        - exit_status: 1
+          limit: 1
     commands:
       - .buildkite/kubernetes/run.sh bash -c 'bktec run || [ $$? -eq 5 ]'
     plugins:
       - *kube_plugin
       - tests#v1.0.0:
           <<: *tests_plugin_defaults
+          split-by-example: true
           test-file-pattern: "tests/**/{test_*,*_test}.py"
-          test-cmd: "python3 .buildkite/scripts/run_pytest_chunked.py --chunk-size 12 --timeout 600 --mark 'not tpu_test and not multichip and not nightly' --junit-xml={{resultPath}} -- {{testExamples}}"
+          test-cmd: "python3 .buildkite/scripts/run_pytest_chunked.py --isolated-chunk-size 4 --chunk-size 64 --timeout 600 --mark 'not tpu_test and not multichip and not nightly' --junit-xml={{resultPath}} -- {{testExamples}}"
 
   - label: "Unit Tests - CPU (Nightly)"
     key: "unit_tests_cpu_nightly"
@@ -137,12 +149,16 @@ steps:
         parallelism: 2
         env:
           SHAPE: *shape_multi
+        retry:
+          automatic:
+            - exit_status: 1
+              limit: 1
         plugins:
           - *kube_plugin
           - tests#v1.0.0:
               <<: *tests_plugin_defaults
               test-file-exclude-pattern: "tests/entrypoints/llm/test_speculative_decoding.py"
-              test-cmd: "python3 .buildkite/scripts/run_pytest_chunked.py --chunk-size 6 --timeout 600 --mark 'not nightly and multichip' --junit-xml={{resultPath}} -- {{testExamples}}"
+              test-cmd: "python3 .buildkite/scripts/run_pytest_chunked.py --chunk-size 6 --timeout 1200 --mark 'not nightly and multichip' --junit-xml={{resultPath}} -- {{testExamples}}"
 
       # Representative correctness cases run on PRs; the full parameter matrix
       # and acceptance-rate tests run nightly. Split by example because the

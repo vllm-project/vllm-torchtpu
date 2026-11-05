@@ -60,6 +60,7 @@ if TYPE_CHECKING:
     QWEN4_EXP_PREFILL_SP: bool = False
     QWEN4_EXP_PREFILL_SP_MIN_TOKENS: int = 1024
     QWEN4_EXP_PREFILL_SP_MOE: bool = False
+    VLLM_TPU_MK_HOST_PLE: bool = False
     QWEN4_EXP_PREFILL_SP_SHARED_LOCAL: bool = False
     QWEN4_EXP_PREFILL_SP_PAD_HC: bool = False
     TPU_MOE_OWNER_OUTPUT_MODE: str = "off"
@@ -85,7 +86,9 @@ if TYPE_CHECKING:
     VLLM_TPU_MOST_MODEL_LEN: int | None = None
     TPU_GDN_CONV_QK_PAIR_LAYOUT: bool = False
     VLLM_TPU_GDN_CONV_WEIGHT_KMAJOR: bool = False
+    VLLM_TPU_GDN_HOIST_METADATA: bool = False
     TPU_ENABLE_GDN_DYNAMIC_TILING: bool = False
+    TPU_GDN_CHUNK_PAIR: bool = False
     VLLM_TPU_QSA_DECODE_QUERY_BLOCK: int = 0
     VLLM_TPU_QSA_TOPK_STATS: int = 0
     VLLM_TPU_QSA_DECODE_KV_BLOCK: int = 1024
@@ -97,17 +100,35 @@ if TYPE_CHECKING:
     VLLM_TPU_GDN_HOIST_READ_OFFSETS: bool = False
     VLLM_TPU_QSA_BF16_REDUCE_PRECISION: bool = False
     VLLM_TPU_QSA_INDEXER_HOIST_META: bool = False
+    VLLM_TPU_QSA_INDEXER_TILE_ALIGNED_SCORES: bool = False
     VLLM_TPU_QSA_INDEXER_MIXED_ONLY: bool = False
     VLLM_TPU_QSA_DRAFT_SHARED_SELECTION: bool = False
     VLLM_TPU_QWEN4_NGRAM_WINDOW: str = ""
     VLLM_TPU_QWEN4_FUSED_PREP: bool = False
     VLLM_TPU_QWEN4_FUSED_PREP_CHECK: str = ""
+    VLLM_TPU_QWEN4_FUSED_PREP_FUNCTIONAL: bool = False
     VLLM_TPU_QSA_FUSED_SPARSE_DECODE: bool = False
     VLLM_TPU_QSA_PREFIX_SLICE: bool = False
     VLLM_TPU_QSA_INDEXER_UPDATE_SHIFT: bool = False
     VLLM_TPU_QSA_PREFILL_BITSET_KERNEL: bool = True
     VLLM_TPU_QSA_PREFILL_BF16_MXU: bool = False
+    VLLM_TPU_QSA_DCP_FINE_PREFIX: bool = False
+    VLLM_TPU_QSA_DCP_FINE_PREFIX_SEQ_TAIL: bool = False
     VLLM_TPU_QSA_PREFILL_LEAN: bool = False
+    VLLM_TPU_QSA_MAIN_KV_DCP: int = 0
+    VLLM_TPU_QSA_DCP_PREFILL_QUERY_BLOCK: int = 1024
+    VLLM_TPU_QSA_DCP_PREFILL_QUERY_TILE: int = 256
+    VLLM_TPU_QSA_MTP_KV_DCP: bool = False
+    VLLM_TPU_QSA_COMPRESSED_DCP: bool = False
+    VLLM_TPU_QSA_DCP_SHARD_MERGE: bool = False
+    VLLM_TPU_QSA_COMPRESSED_PAIR_SHIFT: bool = False
+    VLLM_TPU_HC_PREFILL_UP_T: bool = False
+    VLLM_TPU_HC_PREFILL_COMBINE_MIX: bool = False
+    VLLM_TPU_HC_PREFILL_WIDE_TILE: int = 0
+    VLLM_TPU_HC_PREFILL_INJECT: bool = False
+    VLLM_TPU_QSA_FUSED_DCP_BLOCKS: bool = False
+    VLLM_TPU_QSA_DCP_HEAD_EXCHANGE: bool = False
+    VLLM_TPU_QSA_DCP_Q_GATHER: bool = False
     VLLM_TPU_QSA_DECODE_SHARED_SCHEDULE: bool = False
     VLLM_TPU_QSA_DECODE_LEAN_FETCH: bool = False
     VLLM_TPU_QSA_DECODE_SLOT_READ: bool = False
@@ -125,6 +146,7 @@ if TYPE_CHECKING:
     VLLM_TPU_QSA_INDEXER_SHARD_A2A_MIN_TOKENS: int = 0
     VLLM_TPU_QSA_INDEXER_SHARD_SKIP_SP: bool = False
     VLLM_TPU_QSA_INDEXER_TOKEN_SHARD: bool = False
+    VLLM_TPU_QSA_DECODE_TOKEN_SHARD: bool = False
     VLLM_TPU_PLE_LOOKUP_CHUNK_TOKENS: int = 8
     TPU_MOE_SKIP_PADDED_TOKENS: bool = False
     TPU_MOE_HIERARCHICAL_EP: bool = False
@@ -247,15 +269,34 @@ if TYPE_CHECKING:
     VLLM_TPU_PY_SAMPLER_INTERVAL_MS: float = 1.0
     VLLM_TPU_PY_SAMPLER_DELAY_S: float = 600.0
     VLLM_TPU_STAGE_ENTRIES_CACHE: bool = False
+    VLLM_TPU_SUBST_STATIC_ARGS: bool = False
+    VLLM_TPU_SUBTRACT_REJECTED_COMPILED: bool = False
+    VLLM_TPU_SPEC_TAIL_COMPILED: bool = False
     VLLM_TPU_STALL_WATCHDOG_S: float = 0.0
+    VLLM_TPU_LOOP_LAG_WATCHDOG_S: float = 30.0
+    VLLM_TPU_FREEZE_PYSPY_S: float = 120.0
+    VLLM_TPU_REASONING_COUNT_SKIP_TOOLS: bool = False
+    VLLM_TPU_QSA_PREFILL_BITSET_OWNED: bool = False
+    VLLM_TPU_QSA_DCP_QGATE_PAIR_MAJOR: bool = False
+    VLLM_TPU_QSA_DCP_GATE_IN_COMBINE: bool = False
+    VLLM_TPU_QSA_PREFILL_LIVE_MASK_PADDED: bool = False
+    VLLM_TPU_QSA_DCP_SPLIT_LSE: bool = False
     VLLM_TPU_VERIFY_FUSED: bool = False
     VLLM_TPU_VERIFY_FUSED_CHECK: int = 0
     VLLM_TPU_VERIFY_FUSED_CHECK_FAULT: int = 0
     VLLM_TPU_DRAFT_SEED_FUSED: bool = False
+    VLLM_TPU_DRAFT_CARRY_FUSED: bool = False
+    VLLM_TPU_VERIFY_FUSED_READ_OFFSETS: bool = False
+    VLLM_TPU_DRAFT_SEED_EXTRAS: bool = False
+    VLLM_TPU_DRAFT_SEED_BOOTSTRAP_PAD: bool = False
     VLLM_TPU_CPU_PIN_RESERVE: int = 2
     VLLM_TPU_CPU_PROBE_S: float = 0.0
     VLLM_TPU_FUSED_READ_OFFSET_UPDATE: bool = True
     VLLM_TPU_BLOCK_TABLE_UPLOAD_REUSE: bool = False
+    VLLM_TPU_BLOCK_TABLE_PACK_DELTA: bool = False
+    VLLM_TPU_TOKEN_PADDING_REUSE: bool = False
+    VLLM_TPU_FAST_METADATA_BUILD: bool = False
+    VLLM_TPU_AOT_SKIP_GUARD_CHECK: bool = False
     VLLM_TPU_STAGE_TIMING_ONLY_WITH_SINK: bool = False
     VLLM_TPU_STAGED_WALK_CLASS_GATHER: bool = False
     VLLM_TPU_WARMED_SUBSTITUTE_SOURCE: bool = False
@@ -531,12 +572,24 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # in its `[kernel_size, 1, dim]` order. Otherwise every GDN layer swaps
     # and casts the bf16 `[dim, 1, kernel_size]` weight on every forward.
     "VLLM_TPU_GDN_CONV_WEIGHT_KMAJOR": env_bool("VLLM_TPU_GDN_CONV_WEIGHT_KMAJOR"),
+    # Compute the pooled GDN step metadata (read-offset gather, int32 casts,
+    # PER_SEQ roll) once per step and KV-cache group instead of in every GDN
+    # layer: each layer's op is a separate program, so XLA cannot share them.
+    # Same integers; spec decoding on the plain unified pool only.
+    "VLLM_TPU_GDN_HOIST_METADATA": env_bool("VLLM_TPU_GDN_HOIST_METADATA"),
     # Size GDN v3 decode tiles and prefill chunks from per-rank heads, active
     # sequences and the VMEM estimate (kernels/gdn/v3/tiling.py) instead of
     # the fixed defaults.
     "TPU_ENABLE_GDN_DYNAMIC_TILING": env_bool(
         "TPU_ENABLE_GDN_DYNAMIC_TILING", default=False
     ),
+    # GDN chunked prefill: each grid step takes two chunks of the same
+    # sequence. The state-independent intra-chunk work (gates, K K^T, the
+    # triangular inverse, U/W, masked Q K^T) runs once for both chunks batched
+    # over heads, then the two state updates run in order. Same ops per chunk,
+    # so bit-identical. A sequence's odd last chunk still costs a full pair
+    # (its empty half is masked).
+    "TPU_GDN_CHUNK_PAIR": env_bool("TPU_GDN_CHUNK_PAIR", default=False),
     # Qwen4-exp QSA decode/verify indexer: score all query tokens of a
     # request (e.g. the K+1 MTP verify tokens) in one query block of this many
     # tokens, sharing one stream over the request's compressed keys instead of
@@ -595,6 +648,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_TPU_QSA_INDEXER_HOIST_META": env_bool(
         "VLLM_TPU_QSA_INDEXER_HOIST_META", default=False
     ),
+    # Qwen4-exp decode / verify indexer: StreamIndex pads each token's score
+    # rows to whole (8, 128) int32 tiles, so its HBM scores reach the
+    # SparseCore top-k as a bitcast instead of a relayout copy (~8 us per QSA
+    # layer at c48). The padding lies past every row length (same selection).
+    "VLLM_TPU_QSA_INDEXER_TILE_ALIGNED_SCORES": env_bool(
+        "VLLM_TPU_QSA_INDEXER_TILE_ALIGNED_SCORES", default=False
+    ),
     # Qwen4-exp QSA indexer on decode / verify steps: score every request in the
     # mixed pass and drop the two one-token decode passes (empty on verify
     # steps). Bypasses VLLM_TPU_QSA_DECODE_SINGLE_KV_BLOCK on one-token steps.
@@ -616,6 +676,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # live step (counts logged every 500 checks); "fault": its positive control.
     "VLLM_TPU_QWEN4_FUSED_PREP_CHECK": lambda: os.getenv(
         "VLLM_TPU_QWEN4_FUSED_PREP_CHECK", ""
+    ),
+    # The fused program returns the updated speculative record instead of
+    # mutating its inputs (no eager copy-back per record tensor after it).
+    "VLLM_TPU_QWEN4_FUSED_PREP_FUNCTIONAL": env_bool(
+        "VLLM_TPU_QWEN4_FUSED_PREP_FUNCTIONAL"
     ),
     "VLLM_TPU_QSA_DRAFT_SHARED_SELECTION": env_bool(
         "VLLM_TPU_QSA_DRAFT_SHARED_SELECTION"
@@ -726,9 +791,81 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_TPU_QSA_PREFILL_BF16_MXU": env_bool(
         "VLLM_TPU_QSA_PREFILL_BF16_MXU", default=False
     ),
+    # Under VLLM_TPU_QSA_MAIN_KV_DCP > 1: prefix-cache hits at the hash unit
+    # (B) instead of the D*B scheduler block, with copy-on-write of a partially
+    # hit block (vllm_torchtpu/__init__.py _patch_vllm_qsa_dcp_fine_prefix_hits).
+    "VLLM_TPU_QSA_DCP_FINE_PREFIX": env_bool("VLLM_TPU_QSA_DCP_FINE_PREFIX"),
+    # With it: at request free, also register partial entries at the hash
+    # boundaries inside the request's last block (next turns resuming past the
+    # previous output), not only at the prompt's last boundary.
+    "VLLM_TPU_QSA_DCP_FINE_PREFIX_SEQ_TAIL": env_bool(
+        "VLLM_TPU_QSA_DCP_FINE_PREFIX_SEQ_TAIL"
+    ),
     # qwen4_exp QSA sparse prefill: skip the FP8 key finite/written guard,
     # which the score mask select already covers (bit-identical output).
     "VLLM_TPU_QSA_PREFILL_LEAN": env_bool("VLLM_TPU_QSA_PREFILL_LEAN"),
+    # Main KV of the target QSA layers split over TP rank pairs that share a
+    # KV head (2; 0/1 = off): each rank stores and attends half the tokens,
+    # the pair's partial attention is LSE-combined.
+    "VLLM_TPU_QSA_MAIN_KV_DCP": env_nonnegative_int("VLLM_TPU_QSA_MAIN_KV_DCP", 0),
+    # Main-KV DCP prefill (owned-page walk): query block / subtile; 0 keeps the tile table's.
+    "VLLM_TPU_QSA_DCP_PREFILL_QUERY_BLOCK": env_nonnegative_int(
+        "VLLM_TPU_QSA_DCP_PREFILL_QUERY_BLOCK", 1024
+    ),
+    "VLLM_TPU_QSA_DCP_PREFILL_QUERY_TILE": env_nonnegative_int(
+        "VLLM_TPU_QSA_DCP_PREFILL_QUERY_TILE", 256
+    ),
+    # With VLLM_TPU_QSA_MAIN_KV_DCP: the MTP draft layers' main KV split the
+    # same way (otherwise the draft keeps whole pages).
+    "VLLM_TPU_QSA_MTP_KV_DCP": env_bool("VLLM_TPU_QSA_MTP_KV_DCP"),
+    # With VLLM_TPU_QSA_MAIN_KV_DCP and VLLM_TPU_QSA_MTP_KV_DCP: compressed keys
+    # split the same way; each rank scores its owned groups and the pair merges
+    # the local top-k lists into the exact global selection.
+    "VLLM_TPU_QSA_COMPRESSED_DCP": env_bool("VLLM_TPU_QSA_COMPRESSED_DCP"),
+    # With VLLM_TPU_QSA_COMPRESSED_DCP on the prefill token-shard path: each
+    # rank merges its own 1/TP of the rows from its pair's lists and one TP
+    # all-gather shares the merged selection, instead of every rank merging
+    # every row of every pair's raw lists (bit-identical).
+    "VLLM_TPU_QSA_DCP_SHARD_MERGE": env_bool("VLLM_TPU_QSA_DCP_SHARD_MERGE"),
+    # Compressed-key writes: take each pair's two key rows by selecting over
+    # statically shifted copies of the keys (offsets within two compression
+    # groups of the token) instead of a gather; a lax.cond falls back to the
+    # gather when a written row's offset is out of range (bit-identical pool).
+    "VLLM_TPU_QSA_COMPRESSED_PAIR_SHIFT": env_bool("VLLM_TPU_QSA_COMPRESSED_PAIR_SHIFT"),
+    # Prefill HC full mix: take the up projection as its [low rank, width]
+    # transpose. The checkpoint weight is held column-major, so the transpose
+    # is a bitcast and the per-call relayout copy before the kernel goes away
+    # (bit-identical).
+    "VLLM_TPU_HC_PREFILL_UP_T": env_bool("VLLM_TPU_HC_PREFILL_UP_T"),
+    # Prefill HC combine_mix (attn -> mlp): the gated residual runs as the
+    # prologue of the next HC's full-mix kernel, which writes the combined hyper
+    # input once instead of a separate merge kernel writing it and the mix
+    # reading it back (bit-identical).
+    "VLLM_TPU_HC_PREFILL_COMBINE_MIX": env_bool("VLLM_TPU_HC_PREFILL_COMBINE_MIX"),
+    # Prefill HC full mix: token tile for calls whose rows divide two such tiles
+    # (0 = always hc_prefill_full_tile). Rows are independent, so the tile only
+    # changes the schedule (bit-identical); 256 is ~25 us/call faster than 128
+    # at 1024 rows.
+    "VLLM_TPU_HC_PREFILL_WIDE_TILE": env_nonnegative_int(
+        "VLLM_TPU_HC_PREFILL_WIDE_TILE", 0
+    ),
+    # Prefill HC full mix: project the normalized input onto the combine's gate
+    # weight in the kernel and return that [T, hc] projection instead of writing
+    # the normalized [T, hc * H] input for an XLA projection to read back.
+    "VLLM_TPU_HC_PREFILL_INJECT": env_bool("VLLM_TPU_HC_PREFILL_INJECT"),
+    # With VLLM_TPU_QSA_COMPRESSED_DCP: merge a pair's local top-k lists into the
+    # global selection with one TensorCore Pallas kernel (radix select, tie
+    # cut, bitonic sort) instead of the SparseCore top-k + keep mask + sort
+    # (bit-identical).
+    "VLLM_TPU_QSA_FUSED_DCP_BLOCKS": env_bool("VLLM_TPU_QSA_FUSED_DCP_BLOCKS"),
+    # With VLLM_TPU_QSA_MAIN_KV_DCP: the pair exchanges each rank's heads of
+    # the partial attention (all-to-all) instead of all-gathering every
+    # partial; half the bytes, bit-identical.
+    "VLLM_TPU_QSA_DCP_HEAD_EXCHANGE": env_bool("VLLM_TPU_QSA_DCP_HEAD_EXCHANGE"),
+    # Qwen4-exp token-shard DCP prefill: all-gather only the pair's q heads,
+    # not their gates (the DCP attention is ungated; each rank gates its own
+    # heads); half the bytes, bit-identical.
+    "VLLM_TPU_QSA_DCP_Q_GATHER": env_bool("VLLM_TPU_QSA_DCP_Q_GATHER"),
     # Qwen4-exp pooled QSA decode/verify steps: write main KV, compressed
     # indexer keys and the raw ring/tags of a layer with one Pallas kernel
     # whose row DMAs are all in flight together, and read the ring with every
@@ -763,6 +900,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # precedence over VLLM_TPU_QSA_INDEXER_SHARD in that graph.
     "VLLM_TPU_QSA_INDEXER_TOKEN_SHARD": env_bool(
         "VLLM_TPU_QSA_INDEXER_TOKEN_SHARD", default=False
+    ),
+    # Qwen4-exp pooled QSA with VLLM_TPU_QSA_COMPRESSED_DCP, the replicated
+    # (non-SP) backbone, i.e. decode / verify and the small prefill buckets:
+    # each DCP pair indexes one contiguous 1/(TP / DCP) of the step's rows
+    # (token_shard_step) and one TP all-gather brings every pair's local lists
+    # for the pair merge, instead of every pair indexing every row. The
+    # selection is the replicated indexer's.
+    "VLLM_TPU_QSA_DECODE_TOKEN_SHARD": env_bool(
+        "VLLM_TPU_QSA_DECODE_TOKEN_SHARD", default=False
     ),
     # Qwen4-exp resident PLE table: tokens per gather in the raw embedding
     # lookup (a multiple of 8). 8 is the originally validated chunk; an
@@ -954,10 +1100,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # rank's own rows on sequence-parallel steps (no replica split/restore)
     # and the shared expert's TP sum is reduce-scattered, not all-reduced.
     "QWEN4_EXP_PREFILL_SP_MOE": env_bool("QWEN4_EXP_PREFILL_SP_MOE"),
-    # With QWEN4_EXP_PREFILL_SP_MOE=1: the shared expert of sequence-parallel
-    # steps runs on this rank's own rows with a replicated copy of its weights
-    # (loaded next to the TP slices, which decode keeps), so it needs no
-    # all-gather or reduce-scatter. Costs one full shared expert of HBM per rank.
+    # Qwen3.8 megakernel with PLE CPU offload: the segment / whole-step programs take the
+    # PLE layer's rows from the host lookup instead of refusing to run (the kernels never
+    # read the PLE table; only apply_ple before the PLE layer's head group does).
+    "VLLM_TPU_MK_HOST_PLE": env_bool("VLLM_TPU_MK_HOST_PLE"),
+    # With QWEN4_EXP_PREFILL_SP_MOE=1: the shared expert of sequence-parallel steps runs on
+    # this rank's own rows with a replicated copy of its weights (loaded next to the TP slices,
+    # which decode keeps), so it needs no all-gather or reduce-scatter. Costs one full shared
+    # expert of HBM per rank.
     "QWEN4_EXP_PREFILL_SP_SHARED_LOCAL": env_bool("QWEN4_EXP_PREFILL_SP_SHARED_LOCAL"),
     # With QWEN4_EXP_PREFILL_SP=1: the sequence-parallel graph pads each
     # rank's shard to the HC kernels' row tile, so buckets whose shard does
@@ -1532,9 +1682,51 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Keep the per-group (block table, width) list the staged metadata walk
     # builds, instead of re-walking every KV cache group each step.
     "VLLM_TPU_STAGE_ENTRIES_CACHE": env_bool("VLLM_TPU_STAGE_ENTRIES_CACHE"),
+    # Strip dynamic-dim stamps from the async token substitution's inputs so it
+    # does not recompile mid-run (tpu_runner._apply_async_token_substitution).
+    "VLLM_TPU_SUBST_STATIC_ARGS": env_bool("VLLM_TPU_SUBST_STATIC_ARGS"),
+    # Async spec decode: the per-step rejected-count correction of seq_lens and
+    # positions as one compiled program (precompiled per request bucket).
+    "VLLM_TPU_SUBTRACT_REJECTED_COMPILED": env_bool(
+        "VLLM_TPU_SUBTRACT_REJECTED_COMPILED"
+    ),
+    # Async spec decode, one chunk: the next step's substitution source and the
+    # rejected count (with their row fits and the source pad) as one program.
+    "VLLM_TPU_SPEC_TAIL_COMPILED": env_bool("VLLM_TPU_SPEC_TAIL_COMPILED"),
     # Dump all processes' stacks when no step starts for N s with live
     # requests (stall_watchdog.py; read directly there, registered here).
     "VLLM_TPU_STALL_WATCHDOG_S": env_float("VLLM_TPU_STALL_WATCHDOG_S", 0.0),
+    # With the stall watchdog on: dump the API server's stacks when its event
+    # loop blocks for N s (stall_watchdog.py; read directly there).
+    "VLLM_TPU_LOOP_LAG_WATCHDOG_S": env_float("VLLM_TPU_LOOP_LAG_WATCHDOG_S", 30.0),
+    # With the stall watchdog on: an out-of-process monitor runs py-spy dump
+    # --native on the API server and its children when a heartbeat or progress
+    # stops for N s (freeze_spy.py; read directly there; 0 disables).
+    "VLLM_TPU_FREEZE_PYSPY_S": env_float("VLLM_TPU_FREEZE_PYSPY_S", 120.0),
+    # API server: count a streamed response's reasoning tokens without
+    # re-parsing its tool calls (core/reasoning_count_patch.py). The full
+    # re-parse is quadratic in tool-argument length and freezes the server.
+    "VLLM_TPU_REASONING_COUNT_SKIP_TOOLS": env_bool("VLLM_TPU_REASONING_COUNT_SKIP_TOOLS"),
+    # Main-KV DCP sparse prefill: the selection bitset kernel emits this rank's
+    # words only, instead of a global bitset then an owned-word gather
+    # (bit-identical).
+    "VLLM_TPU_QSA_PREFILL_BITSET_OWNED": env_bool("VLLM_TPU_QSA_PREFILL_BITSET_OWNED"),
+    # Compressed main-KV DCP ops: all-gather the pair's q/gate rank-major
+    # (dim 0) and join the heads inside the step, instead of a dim -1 gather
+    # whose head join runs as a standalone copy (bit-identical).
+    "VLLM_TPU_QSA_DCP_QGATE_PAIR_MAJOR": env_bool("VLLM_TPU_QSA_DCP_QGATE_PAIR_MAJOR"),
+    # Main-KV DCP: pass the whole q/gate row to the pair combine, which slices
+    # the gate half itself, instead of slicing it on the Torch side
+    # (a standalone strided slice plus relayout; bit-identical).
+    "VLLM_TPU_QSA_DCP_GATE_IN_COMBINE": env_bool("VLLM_TPU_QSA_DCP_GATE_IN_COMBINE"),
+    # Sparse prefill with lse (main-KV DCP): mask dead rows only in the padded
+    # layouts; the aligned layout's kernel rows are already 0 / -inf there
+    # (bit-identical, drops an f32 [T, heads, D] select per call).
+    "VLLM_TPU_QSA_PREFILL_LIVE_MASK_PADDED": env_bool("VLLM_TPU_QSA_PREFILL_LIVE_MASK_PADDED"),
+    # Main-KV DCP attention: route the partial output and its lse as two arrays
+    # instead of one [.., D + 1] channel (a padded f32 concat plus the slices
+    # that undo it at every 8K prefill step); same values.
+    "VLLM_TPU_QSA_DCP_SPLIT_LSE": env_bool("VLLM_TPU_QSA_DCP_SPLIT_LSE"),
     # Non-greedy spec verify as one program (tpu_runner._verify_fused_impl).
     "VLLM_TPU_VERIFY_FUSED": env_bool("VLLM_TPU_VERIFY_FUSED"),
     # Compare the fused verify and draft seed with the separate programs for
@@ -1549,6 +1741,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Async draft seed + input shift/scatter + gather pad as one program
     # (eagle3._async_seed_inputs_impl).
     "VLLM_TPU_DRAFT_SEED_FUSED": env_bool("VLLM_TPU_DRAFT_SEED_FUSED"),
+    # Row-selected draft step 0: position carry + first draft token as one
+    # program (eagle3._draft_rows_carry_and_token).
+    "VLLM_TPU_DRAFT_CARRY_FUSED": env_bool("VLLM_TPU_DRAFT_CARRY_FUSED"),
+    # With VLLM_TPU_VERIFY_FUSED: compute the mamba read offsets inside the
+    # fused verify program and apply them with one eager scatter.
+    "VLLM_TPU_VERIFY_FUSED_READ_OFFSETS": env_bool("VLLM_TPU_VERIFY_FUSED_READ_OFFSETS"),
+    # With VLLM_TPU_DRAFT_SEED_FUSED: the fused seed also emits step 0's
+    # draft_rows and the loop's padded rejected counts (no eager pads).
+    "VLLM_TPU_DRAFT_SEED_EXTRAS": env_bool("VLLM_TPU_DRAFT_SEED_EXTRAS"),
+    # Prefill-bootstrap draft seed scatter at the loop bucket width (a
+    # precompiled key) instead of the real request count (mid-serve compiles).
+    "VLLM_TPU_DRAFT_SEED_BOOTSTRAP_PAD": env_bool("VLLM_TPU_DRAFT_SEED_BOOTSTRAP_PAD"),
     "VLLM_TPU_CPU_PIN_RESERVE": env_nonnegative_int("VLLM_TPU_CPU_PIN_RESERVE", 2),
     # Log each worker's thread CPU placement every N seconds (0 = off).
     "VLLM_TPU_CPU_PROBE_S": env_float("VLLM_TPU_CPU_PROBE_S", 0.0),
@@ -1576,6 +1780,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_TPU_BLOCK_TABLE_UPLOAD_REUSE": env_bool(
         "VLLM_TPU_BLOCK_TABLE_UPLOAD_REUSE", default=False
     ),
+    # With UPLOAD_REUSE: re-pack only the block tables that changed since the
+    # previous pack of the same layout (per-table versions).
+    "VLLM_TPU_BLOCK_TABLE_PACK_DELTA": env_bool("VLLM_TPU_BLOCK_TABLE_PACK_DELTA"),
+    # Skip the token-padding mask's synchronous H2D when its rows are the same
+    # as the last write (layers/adapter/token_padding.py).
+    "VLLM_TPU_TOKEN_PADDING_REUSE": env_bool("VLLM_TPU_TOKEN_PADDING_REUSE"),
+    # Staged metadata walk: build every group's AttentionMetadata inline instead
+    # of one builder call per group (tpu_runner._build_attention_metadata_staged).
+    "VLLM_TPU_FAST_METADATA_BUILD": env_bool("VLLM_TPU_FAST_METADATA_BUILD"),
+    # Freshly AOT-compiled models skip the per-call Dynamo guard check when
+    # vLLM does not evaluate guards (as it already does for cached artifacts).
+    "VLLM_TPU_AOT_SKIP_GUARD_CHECK": env_bool("VLLM_TPU_AOT_SKIP_GUARD_CHECK"),
     # Host-path pieces (q38f-int: default off, toggled per arm).
     # Record stage-timing device events only when a KV connector consumes them.
     "VLLM_TPU_STAGE_TIMING_ONLY_WITH_SINK": env_bool(

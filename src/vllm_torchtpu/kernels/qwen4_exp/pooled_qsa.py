@@ -1,8 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """QSA over one donated pool, with independent group-native block tables."""
 
+import dataclasses
+import functools
 import math
-from typing import Any
+from typing import ClassVar
 
 import jax
 import jax.numpy as jnp
@@ -27,6 +29,7 @@ from vllm_torchtpu.kernels.qwen4_exp.fused_kv_write import (
 from vllm_torchtpu.kernels.qwen4_exp.indexer_components import qsa_indexing
 from vllm_torchtpu.kernels.qwen4_exp.qsa import (
     _indexer_updates,
+    _shift_clip,
     _token_metadata,
     produce,
 )
@@ -437,10 +440,43 @@ def write_main_cache(
     )
 
 
+def _pair_values_by_shift(keys, local, mask, ratio):
+    """``keys[clip(local)]`` for the rows ``mask`` keeps, without a gather.
+
+    Row ``t``'s group members sit at ``local[t, h] = t + o`` with a small
+    static offset ``o`` (``[-ratio, ratio)`` for the first half, ``[0,
+    2 * ratio)`` for the second, when the row's logical position follows its
+    token index), so a select over statically shifted copies gives the same
+    rows. Rows ``mask`` drops are never written and may hold any value; if a
+    kept row's offset is outside that range the gather runs instead.
+    """
+    t = jnp.arange(len(keys), dtype=local.dtype)[:, None]
+    offset = local - t
+    halves, ok = [], []
+    for h in range(local.shape[1]):
+        o = offset[:, h]
+        low = (h - 1) * ratio
+        candidates = range(low, low + 2 * ratio)
+        out = _shift_clip(keys, candidates[0])
+        for d in candidates[1:]:
+            out = jnp.where((o == d)[:, None], _shift_clip(keys, d), out)
+        halves.append(out)
+        ok.append(jnp.all(((o >= low) & (o < low + 2 * ratio)) | ~mask[:, h]))
+    return jax.lax.cond(
+        jnp.all(jnp.stack(ok)),
+        lambda: jnp.stack(halves, axis=1),
+        lambda: keys[jnp.clip(local, 0, len(keys) - 1)],
+    )
+
+
 def compressed_pairs(
-    pool, keys, complete, req, logical, starts, context, table, ratio, slot=0
+    pool, keys, complete, req, logical, starts, context, table, ratio, slot=0, dcp=None
 ):
     """Pair destinations, writers, half masks and values of ``write_compressed``.
+
+    ``dcp=(rank int32[1], D)`` (``VLLM_TPU_QSA_COMPRESSED_DCP``): a table entry
+    covers ``D`` pool blocks and this rank writes only the groups of its owned
+    blocks (owner ``(t // B) % D``), at row ``t % B`` of the entry's page.
 
     Returns ``(pair, write, mask, values)``: ``pair`` indexes
     ``pool.reshape(-1, packing, width)``, ``write`` marks the one writer of
@@ -453,7 +489,13 @@ def compressed_pairs(
     group = logical // ratio
     end = context[req] + starts[req + 1] - starts[req]
     write = complete & ((group % 2 == 1) | (logical + ratio >= end))
-    pair = table[req, logical // pool.shape[1]] * pairs_per_page + (
+    span = pool.shape[1]
+    if dcp is not None:
+        rank, size = dcp
+        span = size * pool.shape[1]
+        owner = (logical // pool.shape[1]) % size
+        write = write & (owner == jnp.asarray(rank).reshape(()).astype(owner.dtype))
+    pair = table[req, logical // span] * pairs_per_page + (
         logical % pool.shape[1]
     ) // (2 * ratio)
     if slot:
@@ -470,13 +512,16 @@ def compressed_pairs(
         - context[req, None]
     )
     mask = (local >= starts[req, None]) & (local < starts[req + 1, None])
-    values = keys[jnp.clip(local, 0, len(keys) - 1)]
+    if envs.VLLM_TPU_QSA_COMPRESSED_PAIR_SHIFT and len(local) == len(keys):
+        values = _pair_values_by_shift(keys, local, mask, ratio)
+    else:
+        values = keys[jnp.clip(local, 0, len(keys) - 1)]
     values = jnp.pad(values, ((0, 0), (0, 0), (0, width - keys.shape[-1])))
     return pair, write, mask, values
 
 
 def write_compressed(
-    pool, keys, complete, req, logical, starts, context, table, ratio, slot=0
+    pool, keys, complete, req, logical, starts, context, table, ratio, slot=0, dcp=None
 ):
     """One writer per BF16 pair, preserving the other half of partial pairs.
 
@@ -492,7 +537,8 @@ def write_compressed(
     width = pool.shape[-1]
     view = pool.reshape(-1, packing, width)
     pair, write, mask, values = compressed_pairs(
-        pool, keys, complete, req, logical, starts, context, table, ratio, slot
+        pool, keys, complete, req, logical, starts, context, table, ratio, slot,
+        **({"dcp": dcp} if dcp is not None else {}),
     )
     if (
         envs.VLLM_TPU_QSA_COMPRESSED_RUN_WRITE
@@ -806,6 +852,66 @@ def _sharded_topk(
     return jnp.stack([bits, position.astype(jnp.int32)], axis=-1)
 
 
+@dataclasses.dataclass(frozen=True)
+class _SequentialSparseCoreTopK(SparseCoreTopK):
+    """The SparseCore selector without the score / next-chunk overlap: the
+    DCP owned scan's chunked prefill otherwise leaves unannotated ops inside
+    an overlap group ("annotation groups with gaps", j-5830132e)."""
+
+    overlaps_scoring: ClassVar[bool] = False
+
+
+def _dcp_topk(
+    q, weights, cache, seq_lens, pages, cu, distribution, *, dcp, block_tokens, **kw
+):
+    """``streamindex_topk`` over this DCP rank's owned compressed groups.
+
+    Under ``VLLM_TPU_QSA_COMPRESSED_DCP`` a table entry covers ``D *
+    block_tokens`` tokens and the rank holds the groups of its owned
+    ``block_tokens``-token blocks (owner ``(t // block_tokens) % D``) in the
+    entry's page: ``pages`` [seqs, kernel pages] lists them in local order,
+    which is StreamIndex's context-parallel layout with a ``block_tokens``
+    interleave. Returns int32 ``[tokens, k, 2]``: f32 score bits and the global
+    group id of each local winner (``dcp_select.EMPTY`` / ``-inf`` unfilled).
+    """
+    from vllm_torchtpu.kernels.qwen4_exp.dcp_select import EMPTY
+
+    rank, size = dcp
+    rank = jnp.asarray(rank, jnp.int32).reshape(-1)[0]
+    align = max(
+        kw["num_kv_pages_per_block"]
+        if isinstance(kw["num_kv_pages_per_block"], tuple)
+        else (kw["num_kv_pages_per_block"],)
+    )
+    kw.pop("enable_early_exit", None)
+    kw["topk_backend"] = _SequentialSparseCoreTopK()
+    pages = jnp.pad(pages, ((0, 0), (0, (-pages.shape[1]) % align)))
+    idx, bits = streamindex_topk(
+        q,
+        weights,
+        cache,
+        seq_lens,
+        pages.reshape(-1),
+        cu,
+        distribution,
+        enable_early_exit=False,
+        cp_size=size,
+        cp_rank=rank,
+        interleave_size=block_tokens,
+        return_scores=True,
+        **kw,
+    )
+    filled = idx >= 0
+    ratio = kw["compression_ratio"]
+    position = jnp.where(
+        filled, cp_local_to_global(idx, rank, size, block_tokens // ratio), EMPTY
+    )
+    if bits.dtype != jnp.int32:
+        bits = jax.lax.bitcast_convert_type(bits.astype(jnp.float32), jnp.int32)
+    bits = jnp.where(filled, bits, BITS_NEG_INF)
+    return jnp.stack([bits, position.astype(jnp.int32)], axis=-1)
+
+
 def merge_candidates(candidates, k, *, topk=None):
     """Exact top-``k`` of all ranks' candidates, lower position first on ties.
 
@@ -882,6 +988,50 @@ def token_shard_step(starts, context, shard_index, rows):
     return base, sub_starts, (context + before).astype(context.dtype)
 
 
+def token_shard_selection(select, iq, lengths, req, starts, context, max_query_len, token_shard):
+    """``select``'s rows of token shard ``token_shard=(index, size)`` of a step.
+
+    ``select(query, lengths=, req=, starts=, context=, max_query_len=)`` is the
+    indexer over a ragged request batch. Shards wider than the request slots
+    take the ragged prefill indexer on the shard, as the replicated shard
+    does. Narrower shards take the decode indexer, which selects a request's
+    rows exactly only when the shard holds the whole request: a step in which
+    any request crosses a shard boundary indexes the whole step instead and
+    keeps the shard's rows.
+    """
+    index, size = token_shard
+    width = len(iq) // size
+    base, sub_starts, sub_context = token_shard_step(starts, context, index, width)
+
+    def own(x):
+        return jax.lax.dynamic_slice_in_dim(x, base, width)
+
+    def sharded(_):
+        return select(
+            own(iq), lengths=own(lengths), req=own(req), starts=sub_starts,
+            context=sub_context, max_query_len=1,
+        )
+
+    if width > len(context):
+        return sharded(None)
+
+    def whole(_):
+        out = select(
+            iq, lengths=lengths, req=req, starts=starts, context=context,
+            max_query_len=max_query_len,
+        )
+        return jax.tree_util.tree_map(own, out)
+
+    return jax.lax.cond(requests_within_shards(starts, width), sharded, whole, None)
+
+
+def requests_within_shards(starts, width):
+    """Whether every nonempty request's rows lie in one ``width``-row shard."""
+    begins, ends = starts[:-1], starts[1:]
+    live = ends > begins
+    return jnp.all(~live | (begins // width == (ends - 1) // width))
+
+
 def compressed_kernel_pages(
     pages: jax.Array, pool: jax.Array, slot: int = 0, ratio: int = 4
 ) -> jax.Array:
@@ -908,6 +1058,11 @@ def compressed_kernel_pages(
     return (scaled + first).reshape(-1)
 
 
+# Largest expanded kernel-page table the ragged prefill indexer prefetches
+# into SMEM (64 request slots at max_model_len 262144 fit; 96 do not).
+PREFILL_PAGE_TABLE_SMEM_BYTES = 512 * 1024
+
+
 def select_blocks(
     query,
     pool,
@@ -922,8 +1077,49 @@ def select_blocks(
     slot=0,
     max_query_len=1,
     shard=None,
+    dcp=None,
 ):
     """Read BF16 key tiles directly from the carrier, without a cache conversion.
+
+    ``dcp=(rank int32[1], D)`` (``VLLM_TPU_QSA_COMPRESSED_DCP``): ``table``
+    entries cover ``D`` pool blocks and hold this rank's owned groups; score
+    only those and return the local top-k as ``(vals f32 [T, k], pos int32
+    [T, k])`` with global group ids (``dcp_select.EMPTY`` unfilled) for the
+    pair merge (``dcp_select.merge_threshold``). Exclusive with ``shard``.
+    """
+    if dcp is None:
+        return _select_blocks(
+            query, pool, lengths, table, req, starts, context, ratio=ratio,
+            block_topk=block_topk, slot=slot, max_query_len=max_query_len,
+            shard=shard,
+        )
+    if shard is not None:
+        raise ValueError("select_blocks: shard= and dcp= are exclusive")
+    out = _select_blocks(
+        query, pool, lengths, table, req, starts, context, ratio=ratio,
+        block_topk=block_topk, slot=slot, max_query_len=max_query_len, dcp=dcp,
+    )
+    return jax.lax.bitcast_convert_type(out[..., 0], jnp.float32), out[..., 1]
+
+
+def _select_blocks(
+    query,
+    pool,
+    lengths,
+    table,
+    req,
+    starts,
+    context,
+    *,
+    ratio,
+    block_topk,
+    slot=0,
+    max_query_len=1,
+    shard=None,
+    dcp=None,
+):
+    """``select_blocks``; under ``dcp`` the local top-k as int32 [T, k, 2]
+    (score bits, global group id).
 
     ``max_query_len`` routes as in ``qsa_attention``: steps with at most that
     many tokens per request row use the per-token decode indexer.
@@ -952,6 +1148,12 @@ def select_blocks(
 
     def topk(q, weights, cache, seq_lens, pages, cu, distribution, **kw):
         """``pages``: [seqs, kernel pages per seq]."""
+        if dcp is not None:
+            kw.pop("topk_backend", None)
+            return _dcp_topk(
+                q, weights, cache, seq_lens, pages, cu, distribution, dcp=dcp,
+                block_tokens=pool.shape[1], **kw,
+            )
         if shard is None:
             return streamindex_topk(
                 q, weights, cache, seq_lens, pages.reshape(-1), cu, distribution, **kw
@@ -1007,12 +1209,27 @@ def select_blocks(
         num_decodes = decode_prefix(starts)
         seq_lens = context + query_lens
         chunk_tokens = 512 if len(query) % 512 == 0 else None
+        # The scalar-prefetched kernel-page table holds every request slot's
+        # whole row (slots x max_model_len / 128 pages). Past the SMEM budget
+        # (e.g. 96 slots at 262144 tokens: 768 KiB) hand StreamIndex the
+        # pool-page table and let its KV reader expand each entry, as the
+        # decode path's VLLM_TPU_QSA_DECODE_POOL_PAGE_TABLE does.
+        expansion = (1, 1, 0)
+        pages = table
+        if (
+            dcp is None
+            and len(table) * table.shape[1] * logical_pages * 4
+            > PREFILL_PAGE_TABLE_SMEM_BYTES
+        ):
+            expansion = (logical_pages, physical_pages, slot * logical_pages)
+        else:
+            pages = expand_pages(table).reshape(len(table), -1)
         return topk(
             jnp.pad(query, ((0, 0), (0, 0), (0, width - query.shape[-1]))),
             jnp.full(query.shape[:2], query.shape[-1] ** -0.5, jnp.float32),
             cache,
             seq_lens,
-            expand_pages(table).reshape(len(table), -1),
+            pages,
             starts,
             jnp.asarray([num_decodes, num_decodes, num_seqs], dtype=jnp.int32),
             k=block_topk,
@@ -1022,12 +1239,14 @@ def select_blocks(
             decode_req_batch_size=8,
             enable_early_exit=True,
             chunk_tokens=chunk_tokens,
-            components=qsa_indexing(ratio - 1),
+            components=qsa_indexing(ratio - 1, table_expansion=expansion),
             # VLLM_TPU_QSA_PREFILL_SC_BOUNDED_COPY: as the decode flag, for
             # the prefill chunks' rows (short contexts early in a prompt).
             **(
                 {"topk_backend": SparseCoreTopK(bounded_copy=True)}
-                if envs.VLLM_TPU_QSA_PREFILL_SC_BOUNDED_COPY and shard is None
+                if envs.VLLM_TPU_QSA_PREFILL_SC_BOUNDED_COPY
+                and shard is None
+                and dcp is None
                 else {}
             ),
         )
@@ -1058,7 +1277,7 @@ def select_blocks(
                     f"and of {rows} compressed keys per page, got {block}"
                 )
         mixed_only = envs.VLLM_TPU_QSA_INDEXER_MIXED_ONLY
-        if shard is not None:
+        if shard is not None or dcp is not None:
             # Room for the local table padded to the widest KV block.
             pages_per_query += max(256, kv_block, decode_kv_block) // rows
             chunk_size = min(len(query), decode_query_chunk_size(pages_per_query))
@@ -1066,7 +1285,9 @@ def select_blocks(
         # table and let its KV reader expand each entry into the page's
         # kernel pages, so the scalar-prefetched table (and with it the query
         # window) is not bounded by logical_pages x the table width.
-        pool_table = envs.VLLM_TPU_QSA_DECODE_POOL_PAGE_TABLE and shard is None
+        pool_table = (
+            envs.VLLM_TPU_QSA_DECODE_POOL_PAGE_TABLE and shard is None and dcp is None
+        )
         expansion = (1, 1, 0)
         if pool_table:
             # Same headroom as the sharded table, in pool pages.
@@ -1113,17 +1334,20 @@ def select_blocks(
                 ),
                 decode_passes=not mixed_only,
                 hoist_step_metadata=envs.VLLM_TPU_QSA_INDEXER_HOIST_META,
+                tile_aligned_scores=envs.VLLM_TPU_QSA_INDEXER_TILE_ALIGNED_SCORES,
                 # VLLM_TPU_QSA_INDEXER_SC_BOUNDED_COPY: the score rows are
                 # sized for max_model_len; select from each row's live prefix
                 # only instead of copying the whole row to the SparseCore.
                 **(
                     {"topk_backend": SparseCoreTopK(bounded_copy=True)}
-                    if envs.VLLM_TPU_QSA_INDEXER_SC_BOUNDED_COPY and shard is None
+                    if envs.VLLM_TPU_QSA_INDEXER_SC_BOUNDED_COPY
+                    and shard is None
+                    and dcp is None
                     else {}
                 ),
             ),
         )
-    if shard is not None:
+    if shard is not None or dcp is not None:
         pages_per_query += 256 // rows
         chunk_size = min(len(query), decode_query_chunk_size(pages_per_query))
     if len(query) <= chunk_size:
@@ -1171,12 +1395,22 @@ def qsa_cache_writes(
     compressed_slot: int = 0,
     main_slot: int = -1,
     max_query_len: int = 1,
+    dcp: tuple[jax.Array, int] | None = None,
+    compressed_dcp: tuple[jax.Array, int] | None = None,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
     """One QSA layer's cache writes for a step's tokens: main K/V, the completed groups'
     compressed keys, ring rows and tags. Returns ``(pool, req, logical, valid)``.
 
-    ``k`` / ``v`` are ``produce``'s normed+roped keys and values, ``raw`` its raw
-    indexer
+    ``dcp=(rank, size)`` (VLLM_TPU_QSA_MAIN_KV_DCP; ``rank`` int32 ``[1]``): a main-KV
+    block-table entry covers ``size`` physical pages' worth of tokens and this rank stores
+    only the rows it owns: token ``t`` at page ``main_table[req, t // (size * B)]``, row
+    ``t % B``, owned iff ``(t // B) % size == rank`` (``B = pool.shape[1]``). Compressed keys
+    and rings stay replicated unless ``compressed_dcp`` (VLLM_TPU_QSA_COMPRESSED_DCP, same
+    rule): then each rank writes only its owned groups' compressed keys, at row ``t % B`` of
+    page ``compressed_table[req, t // (size * B)]``. Rings stay replicated (every rank
+    compresses).
+
+    ``k`` / ``v`` are ``produce``'s normed+roped keys and values, ``raw`` its raw indexer
     keys; tables are the per-request rows (``ring_ids`` already column 0). Every token
     writes, verify drafts included (later steps overwrite rejected positions). Shared by
     ``_pooled_qsa`` and the Qwen3.8 whole-step megakernel's post-kernel scatter, so both
@@ -1188,7 +1422,14 @@ def qsa_cache_writes(
     active = starts[1:] > starts[:-1]
     slots = jnp.where(active, jnp.arange(len(ring_ids), dtype=jnp.int32), -1)
     req, logical, valid = _token_metadata(len(k), starts, context, slots)
-    page = jnp.where(valid, main_table[req, logical // pool.shape[1]], len(pool))
+    main_valid = valid
+    span = pool.shape[1]
+    if dcp is not None:
+        rank, size = dcp
+        span = size * pool.shape[1]
+        owner = (logical // pool.shape[1]) % size
+        main_valid = valid & (owner == rank.reshape(()).astype(owner.dtype))
+    page = jnp.where(main_valid, main_table[req, logical // span], len(pool))
     fp8 = pool.dtype == jnp.float8_e4m3fn
     rows_packed = pack_rows(k, v, fp8=fp8, k_scale=k_scale, v_scale=v_scale)
     slot_kw = {"slot": main_slot} if main_slot >= 0 else {}
@@ -1201,7 +1442,7 @@ def qsa_cache_writes(
         )
     )
     if not fused:
-        pool = write_main_cache(pool, rows_packed, page, logical, valid, **slot_kw)
+        pool = write_main_cache(pool, rows_packed, page, logical, main_valid, **slot_kw)
     ring_rows = math.ceil(compress_ratio / 8) * 8
     ring_elements = ring_rows * raw.shape[-1]
     # A RING_DMA_BATCH override keeps the ring reads on the batched reader.
@@ -1243,6 +1484,7 @@ def qsa_cache_writes(
             compressed_table,
             compress_ratio,
             compressed_slot,
+            **({"dcp": compressed_dcp} if compressed_dcp is not None else {}),
         )
         pool = fused_layer_write(
             pool,
@@ -1251,7 +1493,7 @@ def qsa_cache_writes(
             else rows_packed,
             main_page=page,
             main_offset=main_logical,
-            main_valid=valid,
+            main_valid=main_valid,
             main_slot=main_slot if main_slot >= 0 else None,
             comp_pair=pair,
             comp_write=write,
@@ -1284,6 +1526,7 @@ def qsa_cache_writes(
             compressed_table,
             compress_ratio,
             compressed_slot,
+            **({"dcp": compressed_dcp} if compressed_dcp is not None else {}),
         )
         pool = write_ring_and_tags(
             pool, ring.reshape(len(ids), -1), tags.reshape(len(ids), -1), ids
@@ -1322,8 +1565,16 @@ def _pooled_qsa(
     shard: tuple[int, int] | None = None,
     token_shard: tuple[jax.Array, int] | None = None,
     shared: jax.Array | None = None,
-) -> Any:
+    dcp: tuple[jax.Array, int] | None = None,
+    compressed_dcp: bool = False,
+) -> tuple[jax.Array, ...]:
     """One QSA layer over the unified pool.
+
+    ``compressed_dcp`` (VLLM_TPU_QSA_COMPRESSED_DCP, with ``dcp``): compressed
+    keys are written and scored on their owner only. Without ``shared`` the
+    layer stops after the indexer and returns ``(pool, q, gate, lengths, req,
+    starts, vals, pos)``, this rank's local top-k for
+    ``pooled_qsa_compressed_dcp_attend_step``.
 
     ``select_only``: stop after the indexer and return ``(pool, q, gate, pages,
     kv_lens)`` for an attention computed elsewhere (the Qwen3.8 segment
@@ -1352,6 +1603,16 @@ def _pooled_qsa(
     # Native BlockTable pads this one-block ring row to token alignment.
     # Only column zero owns storage; the remaining entries are padding.
     ring_ids = ring_ids.reshape(len(context), -1)[:, 0]
+    if qgate.ndim == 4:
+        # With VLLM_TPU_QSA_DCP_Q_GATHER too: [pair, T, H, D] q heads only;
+        # the DCP attention is ungated, so their gates are zeros.
+        qgate = jnp.concatenate([qgate, jnp.zeros_like(qgate)], axis=-1)
+        qgate = qgate.reshape(*qgate.shape[:2], -1)
+    if qgate.ndim == 3:
+        # VLLM_TPU_QSA_DCP_QGATE_PAIR_MAJOR: the pair's q/gate rows arrive
+        # rank-major ([pair, T, C], a dim-0 all-gather); join each token's
+        # ranks here, where XLA fuses the transpose into its consumers.
+        qgate = jnp.moveaxis(qgate, 0, 1).reshape(qgate.shape[1], -1)
     q, k, v, gate, iq, raw = produce(
         qgate, key, value, index_qk, nq, nk, niq, positions, trig, norm_eps, rotary_dim
     )
@@ -1376,6 +1637,8 @@ def _pooled_qsa(
         compressed_slot=compressed_slot,
         main_slot=main_slot,
         max_query_len=max_query_len,
+        dcp=dcp,
+        **({"compressed_dcp": dcp} if compressed_dcp else {}),
     )
     fp8 = pool.dtype == jnp.float8_e4m3fn
     lengths = jnp.where(valid, logical + 1, 0).astype(jnp.int32)
@@ -1400,6 +1663,29 @@ def _pooled_qsa(
         starts = jnp.arange(len(rows) + 1, dtype=jnp.int32)
         context = jnp.maximum(lengths - 1, 0)
         keep = picked = None
+    if compressed_dcp and shared is None:
+        assert dcp is not None and rows is None and shard is None
+        select = functools.partial(
+            select_blocks,
+            pool=pool,
+            table=compressed_table,
+            ratio=compress_ratio,
+            block_topk=token_topk // compress_ratio,
+            slot=compressed_slot,
+            dcp=dcp,
+        )
+        if token_shard is None:
+            vals, pos = select(
+                iq, lengths=lengths, req=req, starts=starts, context=context,
+                max_query_len=max_query_len,
+            )
+        else:
+            # The pair scores one token shard together (``index`` = the pair's
+            # shard) and keeps that shard's rows of the selection.
+            vals, pos = token_shard_selection(
+                select, iq, lengths, req, starts, context, max_query_len, token_shard
+            )
+        return pool, q, gate, lengths, req, starts, vals, pos
     if token_shard is not None:
         assert rows is None, "the token shard covers the all-token prefill path"
         index, size = token_shard
@@ -1512,6 +1798,7 @@ def _pooled_qsa(
         v_scale=v_scale if fp8 else 1.0,
         main_slot=main_slot,
         max_query_len=max_query_len,
+        dcp=dcp,
     )
 
 
@@ -1533,8 +1820,11 @@ def _attend(
     v_scale,
     main_slot,
     max_query_len,
+    dcp=None,
 ):
-    output, pool = qsa_attention(
+    """``dcp`` (see ``qsa_cache_writes``): returns ``(pool, out, lse, selected)``
+    with this rank's partial, ungated attention for ``dcp_combine``."""
+    result = qsa_attention(
         q,
         gate,
         blocks,
@@ -1548,9 +1838,20 @@ def _attend(
         v_scale=v_scale,
         **({"kv_head_offset": main_slot} if main_slot > 0 else {}),
         max_query_len=max_query_len,
+        **({"dcp": dcp} if dcp is not None else {}),
     )
-    output = output.reshape(len(q), -1)
     selected = selected_tokens(blocks, lengths, token_topk, compress_ratio)
+    if dcp is not None:
+        output, lse, pool = result
+        if picked is not None:
+            # More rows than the decode path holds: attend every token, then
+            # pick; an unpicked row has no key on either rank.
+            output = jnp.where(keep[:, None, None], output[picked], 0)
+            lse = jnp.where(keep[:, None], lse[picked], -jnp.inf)
+            selected = jnp.where(keep[:, None], selected[picked], -1)
+        return pool, output, lse, selected
+    output, pool = result
+    output = output.reshape(len(q), -1)
     if picked is not None:
         # More rows than the decode path holds: attend every token, then pick.
         output = jnp.where(keep[:, None], output[picked], 0)
@@ -1804,6 +2105,7 @@ def _shard_attend(
     main_slot,
     max_query_len,
     merged,
+    dcp=None,
 ):
     """Merge the gathered candidates, attend, and pick ``rows`` if given.
 
@@ -1846,6 +2148,7 @@ def _shard_attend(
         v_scale=v_scale,
         main_slot=main_slot,
         max_query_len=max_query_len,
+        dcp=dcp,
     )
 
 
@@ -2041,6 +2344,397 @@ def pooled_qsa_step(
     )
 
 
+def pooled_qsa_dcp_step(
+    qgate: jax.Array,
+    key: jax.Array,
+    value: jax.Array,
+    index_qk: jax.Array,
+    nq: jax.Array,
+    nk: jax.Array,
+    niq: jax.Array,
+    nik: jax.Array,
+    positions: jax.Array,
+    trig: jax.Array,
+    pool: jax.Array,
+    starts: jax.Array,
+    context: jax.Array,
+    ring_ids: jax.Array,
+    main_table: jax.Array,
+    compressed_table: jax.Array,
+    dcp_rank: jax.Array,
+    compress_ratio: int,
+    token_topk: int,
+    norm_eps: float,
+    rotary_dim: int,
+    dcp_size: int = 2,
+    k_scale: float = 1.0,
+    v_scale: float = 1.0,
+    compressed_slot: int = 0,
+    main_slot: int = -1,
+    max_query_len: int = 1,
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+    """``pooled_qsa_step`` with the main KV split over a DCP group
+    (VLLM_TPU_QSA_MAIN_KV_DCP): ``qgate`` holds the group's concatenated
+    heads; returns ``(pool, out [T, heads, D] f32, lse [T, heads], selected)``
+    for ``qsa_rpa.dcp_combine``."""
+    return _pooled_qsa(
+        qgate,
+        key,
+        value,
+        index_qk,
+        nq,
+        nk,
+        niq,
+        nik,
+        positions,
+        trig,
+        pool,
+        starts,
+        context,
+        ring_ids,
+        main_table,
+        compressed_table,
+        compress_ratio,
+        token_topk,
+        norm_eps,
+        rotary_dim,
+        k_scale,
+        v_scale,
+        compressed_slot,
+        main_slot,
+        max_query_len=max_query_len,
+        dcp=(dcp_rank, dcp_size),
+    )
+
+
+def pooled_qsa_token_select_dcp_step(
+    qgate: jax.Array,
+    key: jax.Array,
+    value: jax.Array,
+    index_qk: jax.Array,
+    nq: jax.Array,
+    nk: jax.Array,
+    niq: jax.Array,
+    nik: jax.Array,
+    positions: jax.Array,
+    trig: jax.Array,
+    pool: jax.Array,
+    starts: jax.Array,
+    context: jax.Array,
+    ring_ids: jax.Array,
+    main_table: jax.Array,
+    compressed_table: jax.Array,
+    shard_index: jax.Array,
+    dcp_rank: jax.Array,
+    compress_ratio: int,
+    token_topk: int,
+    norm_eps: float,
+    rotary_dim: int,
+    shard_size: int,
+    dcp_size: int = 2,
+    k_scale: float = 1.0,
+    v_scale: float = 1.0,
+    compressed_slot: int = 0,
+    main_slot: int = -1,
+    max_query_len: int = 1,
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
+    """``pooled_qsa_token_select_step`` whose main-KV writes follow the DCP
+    ownership (``qsa_cache_writes(dcp=...)``)."""
+    return _pooled_qsa(
+        qgate, key, value, index_qk, nq, nk, niq, nik, positions, trig, pool, starts, context,
+        ring_ids, main_table, compressed_table, compress_ratio, token_topk, norm_eps,
+        rotary_dim, k_scale, v_scale, compressed_slot, main_slot,
+        max_query_len=max_query_len, token_shard=(shard_index, shard_size),
+        dcp=(dcp_rank, dcp_size),
+    )
+
+
+def pooled_qsa_shard_attend_dcp_step(
+    q: jax.Array,
+    gate: jax.Array,
+    lengths: jax.Array,
+    req: jax.Array,
+    starts: jax.Array,
+    main_table: jax.Array,
+    context: jax.Array,
+    pool: jax.Array,
+    gathered: jax.Array,
+    dcp_rank: jax.Array,
+    kv_heads: int,
+    compress_ratio: int,
+    token_topk: int,
+    dcp_size: int = 2,
+    k_scale: float = 1.0,
+    v_scale: float = 1.0,
+    main_slot: int = -1,
+    max_query_len: int = 1,
+    merged: bool = False,
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+    """``pooled_qsa_shard_attend_step`` over this rank's DCP main-KV rows:
+    returns ``(pool, out, lse, selected)`` for ``qsa_rpa.dcp_combine``."""
+    return _shard_attend(
+        q, gate, lengths, req, starts, main_table, context, pool, gathered, None,
+        kv_heads=kv_heads, compress_ratio=compress_ratio, token_topk=token_topk,
+        k_scale=k_scale, v_scale=v_scale, main_slot=main_slot,
+        max_query_len=max_query_len, merged=merged, dcp=(dcp_rank, dcp_size),
+    )
+
+
+def compressed_dcp_blocks(vals_pair, pos_pair, block_topk, *, topk=None):
+    """The global selection ``[T, block_topk]`` (ascending group ids, -1 padded)
+    from a DCP pair's owned local top-k lists ``[2, T, k]``: the entries of
+    both lists that ``dcp_select.keep_mask`` keeps. Every rank gets the same
+    blocks; the DCP attention drops the groups another rank owns."""
+    from vllm_torchtpu.kernels.qwen4_exp import dcp_select
+
+    if topk is None and envs.VLLM_TPU_QSA_FUSED_DCP_BLOCKS:
+        from vllm_torchtpu.kernels.qwen4_exp.fused_dcp_blocks import fused_dcp_blocks
+
+        return fused_dcp_blocks(vals_pair, pos_pair, block_topk)
+    thr_val, thr_pos = dcp_select.merge_threshold(vals_pair, pos_pair, block_topk, topk=topk)
+    keep = jax.vmap(dcp_select.keep_mask, in_axes=(0, 0, None, None))(
+        vals_pair, pos_pair, thr_val, thr_pos
+    )
+    kept = jnp.where(keep, pos_pair, dcp_select.EMPTY)
+    kept = jnp.moveaxis(kept, 0, 1).reshape(kept.shape[1], -1)
+    kept = jnp.sort(kept, axis=1)[:, :block_topk]
+    return jnp.where(kept == dcp_select.EMPTY, -1, kept).astype(jnp.int32)
+
+
+def pooled_qsa_compressed_dcp_select_step(
+    qgate: jax.Array,
+    key: jax.Array,
+    value: jax.Array,
+    index_qk: jax.Array,
+    nq: jax.Array,
+    nk: jax.Array,
+    niq: jax.Array,
+    nik: jax.Array,
+    positions: jax.Array,
+    trig: jax.Array,
+    pool: jax.Array,
+    starts: jax.Array,
+    context: jax.Array,
+    ring_ids: jax.Array,
+    main_table: jax.Array,
+    compressed_table: jax.Array,
+    dcp_rank: jax.Array,
+    compress_ratio: int,
+    token_topk: int,
+    norm_eps: float,
+    rotary_dim: int,
+    dcp_size: int = 2,
+    k_scale: float = 1.0,
+    v_scale: float = 1.0,
+    compressed_slot: int = 0,
+    main_slot: int = -1,
+    max_query_len: int = 1,
+) -> tuple[
+    jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array
+]:
+    """``pooled_qsa_dcp_step`` up to this rank's owned-group indexer
+    (VLLM_TPU_QSA_COMPRESSED_DCP): ``(pool, q, gate, lengths, req, starts,
+    vals, pos)``; gather ``vals`` / ``pos`` over the pair for
+    ``pooled_qsa_compressed_dcp_attend_step``."""
+    return _pooled_qsa(
+        qgate,
+        key,
+        value,
+        index_qk,
+        nq,
+        nk,
+        niq,
+        nik,
+        positions,
+        trig,
+        pool,
+        starts,
+        context,
+        ring_ids,
+        main_table,
+        compressed_table,
+        compress_ratio,
+        token_topk,
+        norm_eps,
+        rotary_dim,
+        k_scale,
+        v_scale,
+        compressed_slot,
+        main_slot,
+        max_query_len=max_query_len,
+        dcp=(dcp_rank, dcp_size),
+        compressed_dcp=True,
+    )
+
+
+def pooled_qsa_token_select_compressed_dcp_step(
+    qgate: jax.Array,
+    key: jax.Array,
+    value: jax.Array,
+    index_qk: jax.Array,
+    nq: jax.Array,
+    nk: jax.Array,
+    niq: jax.Array,
+    nik: jax.Array,
+    positions: jax.Array,
+    trig: jax.Array,
+    pool: jax.Array,
+    starts: jax.Array,
+    context: jax.Array,
+    ring_ids: jax.Array,
+    main_table: jax.Array,
+    compressed_table: jax.Array,
+    shard_index: jax.Array,
+    dcp_rank: jax.Array,
+    compress_ratio: int,
+    token_topk: int,
+    norm_eps: float,
+    rotary_dim: int,
+    shard_size: int,
+    dcp_size: int = 2,
+    k_scale: float = 1.0,
+    v_scale: float = 1.0,
+    compressed_slot: int = 0,
+    main_slot: int = -1,
+    max_query_len: int = 1,
+) -> tuple[
+    jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array
+]:
+    """``pooled_qsa_compressed_dcp_select_step`` on token shard
+    ``shard_index`` of ``shard_size`` (one shard per DCP pair): ``vals`` /
+    ``pos`` cover the shard's ``T / shard_size`` rows."""
+    return _pooled_qsa(
+        qgate,
+        key,
+        value,
+        index_qk,
+        nq,
+        nk,
+        niq,
+        nik,
+        positions,
+        trig,
+        pool,
+        starts,
+        context,
+        ring_ids,
+        main_table,
+        compressed_table,
+        compress_ratio,
+        token_topk,
+        norm_eps,
+        rotary_dim,
+        k_scale,
+        v_scale,
+        compressed_slot,
+        main_slot,
+        max_query_len=max_query_len,
+        token_shard=(shard_index, shard_size),
+        dcp=(dcp_rank, dcp_size),
+        compressed_dcp=True,
+    )
+
+def pooled_qsa_compressed_dcp_attend_step(
+    q: jax.Array,
+    gate: jax.Array,
+    lengths: jax.Array,
+    req: jax.Array,
+    starts: jax.Array,
+    main_table: jax.Array,
+    context: jax.Array,
+    pool: jax.Array,
+    vals_pair: jax.Array,
+    pos_pair: jax.Array,
+    dcp_rank: jax.Array,
+    kv_heads: int,
+    compress_ratio: int,
+    token_topk: int,
+    dcp_size: int = 2,
+    k_scale: float = 1.0,
+    v_scale: float = 1.0,
+    main_slot: int = -1,
+    max_query_len: int = 1,
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+    """Merge the pair's local top-k (``compressed_dcp_blocks``) and attend this
+    rank's owned main KV: ``(pool, out, lse, selected)`` for
+    ``qsa_rpa.dcp_combine``; ``selected`` is the global selection.
+    ``vals_pair`` / ``pos_pair`` are ``[2, T, k]``: per pair rank, every row's
+    local list (token shards concatenated in token order)."""
+    blocks = compressed_dcp_blocks(vals_pair, pos_pair, token_topk // compress_ratio)
+    return pooled_qsa_compressed_dcp_attend_blocks_step(
+        q,
+        gate,
+        lengths,
+        req,
+        starts,
+        main_table,
+        context,
+        pool,
+        blocks,
+        dcp_rank,
+        kv_heads=kv_heads,
+        compress_ratio=compress_ratio,
+        token_topk=token_topk,
+        dcp_size=dcp_size,
+        k_scale=k_scale,
+        v_scale=v_scale,
+        main_slot=main_slot,
+        max_query_len=max_query_len,
+    )
+
+
+def pooled_qsa_compressed_dcp_merge_step(
+    vals_pair: jax.Array, pos_pair: jax.Array, block_topk: int
+) -> jax.Array:
+    """``compressed_dcp_blocks`` as a step: row-independent, so a rank may
+    merge any subset of rows (VLLM_TPU_QSA_DCP_SHARD_MERGE)."""
+    return compressed_dcp_blocks(vals_pair, pos_pair, block_topk)
+
+
+def pooled_qsa_compressed_dcp_attend_blocks_step(
+    q: jax.Array,
+    gate: jax.Array,
+    lengths: jax.Array,
+    req: jax.Array,
+    starts: jax.Array,
+    main_table: jax.Array,
+    context: jax.Array,
+    pool: jax.Array,
+    blocks: jax.Array,
+    dcp_rank: jax.Array,
+    kv_heads: int,
+    compress_ratio: int,
+    token_topk: int,
+    dcp_size: int = 2,
+    k_scale: float = 1.0,
+    v_scale: float = 1.0,
+    main_slot: int = -1,
+    max_query_len: int = 1,
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+    """``pooled_qsa_compressed_dcp_attend_step`` from the merged global
+    selection ``blocks`` [T, token_topk // compress_ratio]."""
+    return _shard_attend(
+        q,
+        gate,
+        lengths,
+        req,
+        starts,
+        main_table,
+        context,
+        pool,
+        blocks,
+        None,
+        kv_heads=kv_heads,
+        compress_ratio=compress_ratio,
+        token_topk=token_topk,
+        k_scale=k_scale,
+        v_scale=v_scale,
+        main_slot=main_slot,
+        max_query_len=max_query_len,
+        merged=True,
+        dcp=(dcp_rank, dcp_size),
+    )
+
 def pooled_qsa_shared_step(
     qgate: jax.Array,
     key: jax.Array,
@@ -2161,6 +2855,204 @@ def pooled_qsa_shared_rows_step(
         max_query_len=max_query_len,
         rows=rows,
         shared=shared,
+    )
+
+
+def pooled_qsa_rows_dcp_step(
+    qgate: jax.Array,
+    key: jax.Array,
+    value: jax.Array,
+    index_qk: jax.Array,
+    nq: jax.Array,
+    nk: jax.Array,
+    niq: jax.Array,
+    nik: jax.Array,
+    positions: jax.Array,
+    trig: jax.Array,
+    pool: jax.Array,
+    starts: jax.Array,
+    context: jax.Array,
+    ring_ids: jax.Array,
+    main_table: jax.Array,
+    compressed_table: jax.Array,
+    rows: jax.Array,
+    dcp_rank: jax.Array,
+    compress_ratio: int,
+    token_topk: int,
+    norm_eps: float,
+    rotary_dim: int,
+    dcp_size: int = 2,
+    k_scale: float = 1.0,
+    v_scale: float = 1.0,
+    compressed_slot: int = 0,
+    main_slot: int = -1,
+    max_query_len: int = 1,
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+    """``pooled_qsa_rows_step`` over this rank's DCP main-KV rows (the MTP
+    draft under VLLM_TPU_QSA_MTP_KV_DCP): returns ``(pool, out, lse,
+    selected)`` for ``qsa_rpa.dcp_combine``, one row per entry of ``rows``."""
+    return _pooled_qsa(
+        qgate,
+        key,
+        value,
+        index_qk,
+        nq,
+        nk,
+        niq,
+        nik,
+        positions,
+        trig,
+        pool,
+        starts,
+        context,
+        ring_ids,
+        main_table,
+        compressed_table,
+        compress_ratio,
+        token_topk,
+        norm_eps,
+        rotary_dim,
+        k_scale,
+        v_scale,
+        compressed_slot,
+        main_slot,
+        max_query_len=max_query_len,
+        rows=rows,
+        dcp=(dcp_rank, dcp_size),
+    )
+
+
+def pooled_qsa_shared_dcp_step(
+    qgate: jax.Array,
+    key: jax.Array,
+    value: jax.Array,
+    index_qk: jax.Array,
+    nq: jax.Array,
+    nk: jax.Array,
+    niq: jax.Array,
+    nik: jax.Array,
+    positions: jax.Array,
+    trig: jax.Array,
+    pool: jax.Array,
+    starts: jax.Array,
+    context: jax.Array,
+    ring_ids: jax.Array,
+    main_table: jax.Array,
+    compressed_table: jax.Array,
+    shared: jax.Array,
+    dcp_rank: jax.Array,
+    compress_ratio: int,
+    token_topk: int,
+    norm_eps: float,
+    rotary_dim: int,
+    dcp_size: int = 2,
+    k_scale: float = 1.0,
+    v_scale: float = 1.0,
+    compressed_slot: int = 0,
+    main_slot: int = -1,
+    max_query_len: int = 1,
+    compressed_dcp: bool = False,
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+    """``pooled_qsa_shared_step`` over this rank's DCP main-KV rows; returns
+    ``(pool, out, lse, selected)`` for ``qsa_rpa.dcp_combine``. ``compressed_dcp``:
+    compressed keys written on their owner only (VLLM_TPU_QSA_COMPRESSED_DCP)."""
+    return _pooled_qsa(
+        qgate,
+        key,
+        value,
+        index_qk,
+        nq,
+        nk,
+        niq,
+        nik,
+        positions,
+        trig,
+        pool,
+        starts,
+        context,
+        ring_ids,
+        main_table,
+        compressed_table,
+        compress_ratio,
+        token_topk,
+        norm_eps,
+        rotary_dim,
+        k_scale,
+        v_scale,
+        compressed_slot,
+        main_slot,
+        max_query_len=max_query_len,
+        shared=shared,
+        dcp=(dcp_rank, dcp_size),
+        compressed_dcp=compressed_dcp,
+    )
+
+
+def pooled_qsa_shared_rows_dcp_step(
+    qgate: jax.Array,
+    key: jax.Array,
+    value: jax.Array,
+    index_qk: jax.Array,
+    nq: jax.Array,
+    nk: jax.Array,
+    niq: jax.Array,
+    nik: jax.Array,
+    positions: jax.Array,
+    trig: jax.Array,
+    pool: jax.Array,
+    starts: jax.Array,
+    context: jax.Array,
+    ring_ids: jax.Array,
+    main_table: jax.Array,
+    compressed_table: jax.Array,
+    rows: jax.Array,
+    shared: jax.Array,
+    dcp_rank: jax.Array,
+    compress_ratio: int,
+    token_topk: int,
+    norm_eps: float,
+    rotary_dim: int,
+    dcp_size: int = 2,
+    k_scale: float = 1.0,
+    v_scale: float = 1.0,
+    compressed_slot: int = 0,
+    main_slot: int = -1,
+    max_query_len: int = 1,
+    compressed_dcp: bool = False,
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+    """``pooled_qsa_shared_rows_step`` over this rank's DCP main-KV rows;
+    returns ``(pool, out, lse, selected)`` for ``qsa_rpa.dcp_combine``. ``compressed_dcp``:
+    compressed keys written on their owner only (VLLM_TPU_QSA_COMPRESSED_DCP)."""
+    return _pooled_qsa(
+        qgate,
+        key,
+        value,
+        index_qk,
+        nq,
+        nk,
+        niq,
+        nik,
+        positions,
+        trig,
+        pool,
+        starts,
+        context,
+        ring_ids,
+        main_table,
+        compressed_table,
+        compress_ratio,
+        token_topk,
+        norm_eps,
+        rotary_dim,
+        k_scale,
+        v_scale,
+        compressed_slot,
+        main_slot,
+        max_query_len=max_query_len,
+        rows=rows,
+        shared=shared,
+        dcp=(dcp_rank, dcp_size),
+        compressed_dcp=compressed_dcp,
     )
 
 

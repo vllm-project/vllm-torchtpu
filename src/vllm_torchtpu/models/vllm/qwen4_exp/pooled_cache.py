@@ -301,9 +301,18 @@ class Qwen4ExpPooledCache:
             self._materialize(config.num_blocks, final=True)
         else:
             self.allocate()
-        assert config == self.native_config, (
+        # vLLM 0.32's engine core also resolves the layout and prefix-cache
+        # granularity into the config it hands back; only the pool plan must
+        # match. Adopt the engine's resolved fields.
+        planned = self.native_config
+        assert planned is not None and (
+            config.num_blocks,
+            config.kv_cache_tensors,
+            config.kv_cache_groups,
+        ) == (planned.num_blocks, planned.kv_cache_tensors, planned.kv_cache_groups), (
             "Qwen4Exp native pool plan changed after profiling"
         )
+        self.native_config = config
         runner = self.runner
         runner.kv_cache_config = config
         runner.empty_slot_mappings = {

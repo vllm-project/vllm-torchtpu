@@ -267,19 +267,10 @@ CTX_C = [
 ]  # request 0: g_a holds one old token; request 1: g_a starts at the step
 
 
-def _run_c(
-    key: int = 17,
-    T: int = 4,
-    long: bool = False,
-    shard: bool = False,
-    rank_ids: bool = False,
-    union: bool = False,
-    stats: bool = False,
-    loop: bool = False,
-    ctx: list | None = None,
-    max_groups: int | None = None,
-    phys: bool = False,
-):
+def _run_c(key: int = 17, T: int = 4, long: bool = False, shard: bool = False, rank_ids: bool = False,
+           union: bool = False, stats: bool = False, loop: bool = False, ctx: list | None = None,
+           max_groups: int | None = None, phys: bool = False, dcp: int = 1, dcp_pool: bool = True,
+           shared_kv: bool = False, cdcp: bool = False, cdcp_keys: bool = True, ck_fn=None):
     from vllm_torchtpu.megakernel.wholestep.qsa_full_b import DBG_IDS, DBG_IQ
     from vllm_torchtpu.megakernel.wholestep.qsa_full_c import (
         CK_NEW,
@@ -296,27 +287,31 @@ def _run_c(
         key, G, ex, L, budget=BUDGET, n_pages=PAGES, identical_experts=True
     )
     d = wi.add_indexer_inputs(key, G, ex, d, L, max_groups=MG, ctx=CTX)
+    if ck_fn is not None:  # test-chosen compressed keys (e.g. tie-heavy scores)
+        d["ck"] = ck_fn(d["ck"])
     d = wi.add_step_inputs(key, G, ex, d, L, ctx=CTX)
     if (
         long
     ):  # served long-context mode: HBM page tables, one request's scores at a time
         d = wi.add_carrier(key, d)
         d["hbm_tables"] = True
+    if shared_kv:  # the ranks share one KV head (a DCP pair): same K/V columns, same pool
+        kv = 2 * G.HD  # `[q0|g0|..|k|v]`: K and V are the last two 256-wide column blocks
+        d["qkvg"] = d["qkvg"].at[1:, ..., -kv:].set(
+            jnp.broadcast_to(d["qkvg"][:1, ..., -kv:], d["qkvg"][1:, ..., -kv:].shape)
+        )
+        d["pool"] = jnp.broadcast_to(d["pool"][:1], d["pool"].shape)
     ref, _ = wi.wholestep_reference(G, ex, d, L)
     steps = d.pop("_step_out")
     pps = d["mtab"].shape[1]
-    long_kw = dict(
-        carrier="bf16",
-        chunk_pages=8,
-        hbm_tables=True,
-        per_request_scores=True,
-        bounded_chunks=True,
-        shard_index=shard,
-        union_attn=union,
-        union_stats=stats,
-        union_phys=phys,
-        loop_requests=loop,
-    )
+    if dcp > 1 and dcp_pool:
+        _dcp_split(d)
+    if cdcp and cdcp_keys:
+        _ck_split(d)
+    long_kw = dict(carrier="bf16", chunk_pages=8, hbm_tables=True, per_request_scores=True,
+                   bounded_chunks=True, shard_index=shard, union_attn=union,
+                   union_stats=stats, union_phys=phys, loop_requests=loop, dcp=dcp,
+                   compressed_dcp=cdcp)
     spec = wholestep_spec(
         G,
         R,
@@ -362,6 +357,121 @@ def _run_c(
             R, n_att, UNION_STATS_REQS, -1
         )[:, :, :nreq]
     return res, np.asarray(ref, np.float32), x0, ck, ring, steps, iq, ids, d
+
+
+def _dcp_split(d: dict) -> None:
+    """Main-KV DCP-2 layout of the replicated test pool, in place: table column `c` now covers
+    tokens `[2cB, 2(c+1)B)` at page `mtab[2c]`; rank 0 keeps that page (its first `B` tokens),
+    rank 1's copy of it gets page `mtab[2c + 1]`'s rows (the next `B`), and every odd-column page
+    is NaN-poisoned on both ranks (nothing may read it)."""
+    pool = np.array(d["pool"])  # [R, pages, B, 1, 4, 256] FP8
+    mtab = np.asarray(d["mtab"])
+    even, odd = mtab[..., 0::2], mtab[..., 1::2]
+    n = odd.shape[-1]
+    nan = np.full(pool.shape[2:], np.nan, np.float32).astype(pool.dtype)
+    for r in range(pool.shape[0]):
+        src = pool[r].copy()
+        for e, o in zip(even[..., :n].ravel(), odd.ravel()):
+            if r == 1:
+                pool[r, e] = src[o]
+        for o in set(odd.ravel().tolist()) - set(even.ravel().tolist()):
+            pool[r, o] = nan
+    d["pool"] = jnp.asarray(pool)
+    pad = np.zeros_like(mtab[..., : mtab.shape[-1] - even.shape[-1]])
+    d["mtab"] = jnp.asarray(np.concatenate([even, pad], axis=-1))
+
+
+def _ck_split(d: dict, R: int = 2) -> None:
+    """Compressed-key DCP-2 layout of the test carrier, in place: rank r's copy of request q's
+    first half of `cktab` pages holds its own groups in local order (local `l` -> group
+    `(l // gpp) * 2 gpp + r gpp + l % gpp`, `gpp` = groups per pool block), and every other
+    page is NaN-poisoned on that rank (nothing may read it)."""
+    car = np.asarray(d["carrier"].astype(jnp.float32))  # [pages, 16, 2, width]
+    n_pages, width = car.shape[0], car.shape[-1]
+    flat = car.reshape(n_pages, 32, width)
+    tab = np.asarray(d["cktab"])
+    ck = np.asarray(d["ck"].astype(jnp.float32))  # [requests, groups, 128]
+    gpp = d["pool"].shape[2] // 4
+    half = tab.shape[1] // R
+    l = np.arange(half * 32)
+    out = np.full((R, n_pages, 32, width), np.nan, np.float32)
+    for r in range(R):
+        gid = (l // gpp) * (R * gpp) + r * gpp + l % gpp
+        for q in range(tab.shape[0]):
+            keys = np.zeros((half * 32, width), np.float32)
+            keys[:, : ck.shape[-1]] = ck[q, gid]
+            out[r, tab[q, :half]] = keys.reshape(half, 32, width)
+    d["carrier"] = jnp.asarray(out.reshape(R, n_pages, 16, 2, width), BF16)
+
+
+def _cdcp_runs(monkeypatch, **kw):
+    """(replicated-key DCP-2 run, compressed-key DCP-2 run) of `_run_c(long, union, shard)`."""
+    from vllm_torchtpu.models.vllm.qwen4_exp import pool_layout
+
+    monkeypatch.setenv(pool_layout.MAIN_KV_DCP_ENV, "2")
+    base_kw = dict(long=True, rank_ids=True, union=True, shard=True, shared_kv=True, dcp=2)
+    base_kw.update(kw)
+    return _run_c(**base_kw), _run_c(**base_kw, cdcp=True)
+
+
+def _assert_same_selection(run: tuple, base: tuple) -> None:
+    """Same pool-path ids per row (as sets: the pair layout lists rank 0's groups first), on
+    every rank, and the same step outputs."""
+    a, b = np.sort(run[7], axis=-1), np.sort(base[7], axis=-1)
+    np.testing.assert_array_equal(a, b)
+    assert np.isfinite(run[0]).all()
+    for i, name in ((0, "residual"), (3, "ck_new"), (4, "ring_new")):
+        np.testing.assert_array_equal(run[i], base[i], err_msg=name)
+
+
+@pytest.mark.parametrize("loop", [False, True])
+def test_compressed_dcp2_selection_matches_replicated_keys(monkeypatch, loop):
+    """Compressed-key DCP-2 (`compressed_dcp`, R = 2 = one pair): each rank holds only its own
+    groups' keys (`_ck_split`, the rest NaN-poisoned), scores them, the pair swaps score halves
+    and both select over the whole set. Same selection and bit-identical outputs as the
+    replicated-key DCP-2 kernel; the compressed kernel on unsplit keys (it would score the
+    wrong groups for every odd-gpp span) is caught."""
+    base, run = _cdcp_runs(monkeypatch, loop=loop)
+    _assert_same_selection(run, base)
+    with pytest.raises(AssertionError):
+        _assert_same_selection(_run_c(long=True, rank_ids=True, union=True, shard=True,
+                                      shared_kv=True, dcp=2, loop=loop, cdcp=True,
+                                      cdcp_keys=False), base)
+
+
+def test_compressed_dcp2_ties_break_to_the_lower_group(monkeypatch):
+    """Tie-heavy: every key repeats with period 3 groups, so most scores tie and the top-K
+    boundary lands inside a run of equal scores that spans both ranks' groups. The pair
+    selection keeps the lower group ids exactly as the replicated selection does."""
+    def ties(ck):
+        G_ = ck.shape[1]
+        return ck[:, np.arange(G_) % 3]
+
+    base, run = _cdcp_runs(monkeypatch, loop=True, ck_fn=ties)
+    _assert_same_selection(run, base)
+
+
+def test_dcp2_union_attention_matches_replicated(monkeypatch):
+    """Main-KV DCP-2 (`dcp=2`, R = 2 = one pair sharing a KV head): each rank holds half of every request's main
+    KV (`_dcp_split`, the other half NaN-poisoned), attends both ranks' heads over the groups it
+    owns and the pair combines by LSE. Matches the replicated union kernel to f32 combine
+    rounding; the DCP kernel on the unsplit pool (wrong rows for every odd-B span) is caught."""
+    from vllm_torchtpu.models.vllm.qwen4_exp import pool_layout
+
+    base = _run_c(long=True, rank_ids=True, union=True, shard=True, shared_kv=True)
+    scale = float(np.abs(base[1]).mean())
+
+    def close(run: tuple) -> None:
+        dd = np.abs(run[0] - base[0])
+        assert np.isfinite(run[0]).all()
+        assert dd.max() < 1e-2 * scale, dd.max() / scale
+        np.testing.assert_array_equal(run[7], base[7])  # selection untouched
+
+    monkeypatch.setenv(pool_layout.MAIN_KV_DCP_ENV, "2")
+    close(_run_c(long=True, rank_ids=True, union=True, shard=True, shared_kv=True, dcp=2))
+    with pytest.raises(AssertionError):
+        close(_run_c(long=True, rank_ids=True, union=True, shard=True, shared_kv=True, dcp=2,
+                     dcp_pool=False))
 
 
 @pytest.mark.parametrize("long", [False, True])
@@ -410,6 +520,26 @@ def test_sharded_indexer_matches_unsharded():
         np.testing.assert_array_equal(ids_s[r], ids_b[0])
     for i, name in ((0, "residual"), (3, "ck_new"), (4, "ring_new")):
         np.testing.assert_array_equal(shard[i], base[i], err_msg=name)
+
+
+@pytest.mark.parametrize("dcp", [1, 2])
+def test_union_stacked_rows_bit_identical(monkeypatch, dcp):
+    """`union_attn.STACK_ROWS`: a request's rows scored and accumulated as one stacked
+    `[T * nh, 256]` matmul / softmax per tile give bit-identical outputs to the per-row loop,
+    with and without main-KV DCP."""
+    from vllm_torchtpu.megakernel.wholestep import union_attn as ua
+    from vllm_torchtpu.models.vllm.qwen4_exp import pool_layout
+
+    kw = dict(long=True, rank_ids=True, union=True, shard=True, shared_kv=True)
+    if dcp > 1:
+        monkeypatch.setenv(pool_layout.MAIN_KV_DCP_ENV, str(dcp))
+        kw["dcp"] = dcp
+    monkeypatch.setattr(ua, "STACK_ROWS", True)
+    stacked = _run_c(**kw)
+    monkeypatch.setattr(ua, "STACK_ROWS", False)
+    per_row = _run_c(**kw)
+    assert np.isfinite(stacked[0]).all()
+    np.testing.assert_array_equal(stacked[0], per_row[0])
 
 
 def test_union_attention_matches_per_row(monkeypatch):

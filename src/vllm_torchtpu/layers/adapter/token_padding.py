@@ -16,6 +16,8 @@ from dataclasses import dataclass
 
 import torch
 
+from vllm_torchtpu import envs
+
 _padding_state: "TokenPaddingState | None" = None
 
 
@@ -34,6 +36,13 @@ class TokenPaddingState:
 
     def update(self, local_valid_tokens: int, local_padded_tokens: int) -> None:
         """Write this rank's token padding mask."""
+        key = (local_valid_tokens, local_padded_tokens)
+        if envs.VLLM_TPU_TOKEN_PADDING_REUSE:
+            # The mask only ever changes here, so the same rows as the last
+            # write leave it exact: skip the synchronous H2D.
+            if self.__dict__.get("_last_key") == key:
+                return
+            self._last_key = key
         host = torch.zeros(self.local_padding_mask.shape[0], dtype=torch.bool)
         host[local_valid_tokens:local_padded_tokens] = True
         # Synchronous copy since the host tensor is temporary.

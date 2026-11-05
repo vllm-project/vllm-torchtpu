@@ -36,6 +36,7 @@ from vllm_torchtpu.kernels.gdn.head_geometry import (
     GdnHeadGeometry,
     derive_gdn_head_geometry,
 )
+from vllm_torchtpu.kernels.gdn.v3 import metadata as gdn_v3_metadata
 from vllm_torchtpu.kernels.gdn.v3 import pcp_wrapper as gdn_v3_pcp_wrapper
 from vllm_torchtpu.kernels.gdn.v3 import wrapper as gdn_v3_wrapper
 from vllm_torchtpu.kernels.gdn.v3.input_layout import Conv1DInput
@@ -865,6 +866,7 @@ def run_jax_gdn_attention_pooled_local(
     seq_lens: jnp.ndarray,
     read_offsets: jnp.ndarray | None = None,
     ckpt_indices: jnp.ndarray | None = None,
+    per_seq_inputs: tuple[jnp.ndarray, ...] | None = None,
     *,
     n_kq: int,
     n_v: int,
@@ -930,8 +932,42 @@ def run_jax_gdn_attention_pooled_local(
         state_plan=plan,
         num_spec_tokens=num_spec_tokens,
         conv_weight_kmajor=conv_weight_kmajor,
+        per_seq_inputs=per_seq_inputs,
     )
     return recurrent_state, output
+
+
+def gdn_step_metadata(
+    slot_read_offsets: jnp.ndarray,
+    state_indices: jnp.ndarray,
+    query_start_loc: jnp.ndarray,
+    seq_lens: jnp.ndarray,
+    distribution: jnp.ndarray,
+    ckpt_indices: jnp.ndarray,
+) -> tuple[jnp.ndarray, ...]:
+    """The per-step GDN index metadata every pooled layer of a step shares.
+
+    `run_jax_gdn_attention_pooled` otherwise derives these inside each layer
+    (the read-offset gather, the int32 casts and the PER_SEQ roll of
+    `fused_conv1d_gdn`); the per-layer ops are separate programs, so XLA
+    repeats them once per GDN layer. The values are the same integers.
+
+    Returns `(read_offsets, ckpt_indices, *per_seq_inputs)`: the
+    `(num_seqs,)` read offsets, the `(num_seqs, num_spec + 1)` checkpoint
+    ids, and the five rolled per-sequence arrays of
+    `metadata.roll_per_seq_inputs`.
+    """
+    read_offsets = slot_read_offsets[state_indices].astype(jnp.int32)
+    ckpt_indices = ckpt_indices.astype(jnp.int32)
+    per_seq_inputs = gdn_v3_metadata.roll_per_seq_inputs(
+        query_start_loc,
+        seq_lens,
+        state_indices,
+        read_offsets,
+        distribution[0],
+        ckpt_indices,
+    )
+    return (read_offsets, ckpt_indices, *per_seq_inputs)
 
 
 def run_jax_gdn_attention_pooled(
@@ -961,6 +997,7 @@ def run_jax_gdn_attention_pooled(
     conv_state_dtype: jnp.dtype = jnp.bfloat16,
     num_spec_tokens: int = 0,
     conv_weight_kmajor: bool = False,
+    step_metadata: tuple[jnp.ndarray, ...] | None = None,
 ) -> tuple[jnp.ndarray, jnp.ndarray]:
     """Runs GDN attention over the unified block pool, sharded on the mesh.
 
@@ -994,6 +1031,9 @@ def run_jax_gdn_attention_pooled(
         d_v: Dimension of value.
         kernel_size: Convolution kernel size.
         mesh: The device mesh for distributed computation.
+        step_metadata: Optional `gdn_step_metadata(...)` output computed once
+          for the step; replaces `slot_read_offsets` and `ckpt_indices`
+          (pass both as None) and the per-layer index math they feed.
 
     Returns:
         A tuple containing:
@@ -1021,6 +1061,17 @@ def run_jax_gdn_attention_pooled(
         P(None),  # distribution
         P(None),  # seq_lens
     )
+    if step_metadata is not None:
+        assert slot_read_offsets is None and ckpt_indices is None, (
+            "step_metadata replaces slot_read_offsets and ckpt_indices"
+        )
+        # Read offsets, checkpoint ids and the rolled per-sequence inputs,
+        # all replicated like the other per-sequence inputs.
+        in_specs = in_specs + (
+            P(None),
+            P(None, None),
+            (P(None), P(None), P(None), P(None), P(None, None)),
+        )
     if slot_read_offsets is not None:
         # Per-sequence read offsets (see below), replicated like the other
         # per-sequence inputs.
@@ -1070,7 +1121,10 @@ def run_jax_gdn_attention_pooled(
     # initial state from checkpoint `read_offsets[s]` of block
     # `state_indices[s]`. Both operands are replicated, so gather here,
     # outside the shard_map (mirrors run_jax_gdn_attention).
-    if slot_read_offsets is not None:
+    if step_metadata is not None:
+        read_offsets, step_ckpt_indices, *per_seq_inputs = step_metadata
+        extra_args = (read_offsets, step_ckpt_indices, tuple(per_seq_inputs))
+    elif slot_read_offsets is not None:
         extra_args = (slot_read_offsets[state_indices],)
     else:
         extra_args = ()

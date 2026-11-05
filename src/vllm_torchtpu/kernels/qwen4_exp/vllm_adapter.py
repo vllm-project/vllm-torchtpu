@@ -10,7 +10,7 @@ from torch_tpu._internal import pallas
 
 from vllm_torchtpu.kernels.qwen4_exp.gated_residual import gated_residual_fn
 from vllm_torchtpu.kernels.qwen4_exp.hc_decode import hc_decode_mix
-from vllm_torchtpu.kernels.qwen4_exp.hc_full import _full_mix
+from vllm_torchtpu.kernels.qwen4_exp.hc_full import _combine_full_mix, _full_mix
 from vllm_torchtpu.kernels.qwen4_exp.hc_norm import _normalize
 from vllm_torchtpu.kernels.qwen4_exp.hc_up import _up_epilogue
 
@@ -29,34 +29,133 @@ def build_gated_residual_op(branches: int, hidden: int, token_tile: int):
     return op
 
 
+def _up_operand(up_t: bool):
+    """The kernel's up operand from the checkpoint's [width, low rank] weight.
+
+    Transposing here rather than at the Torch call site keeps every graph's
+    operands (and their first-use order) the checkpoint parameters.
+    """
+    return (lambda up: up.T) if up_t else (lambda up: up)
+
+
 @functools.cache
-def build_full_mix_op(branches: int, hidden: int, eps: float, token_tile: int):
+def build_full_mix_op(
+    branches: int,
+    hidden: int,
+    eps: float,
+    token_tile: int,
+    up_t: bool = False,
+    inject: bool = False,
+):
+    """``up_t``: the kernel reads the up projection as its [low rank, width]
+    transpose, taken inside the op (a bitcast of the checkpoint's column-major
+    weight); the op's operands stay the checkpoint tensors either way.
+    ``inject``: it also takes the combine's gate weight and returns the BF16 gate
+    projection [tokens, branches] in place of the normalized input."""
     eps_tag = hashlib.sha1(repr(eps).encode()).hexdigest()[:8]
 
-    def core(
-        x: jax.Array, weight: jax.Array, down: jax.Array, up: jax.Array
-    ) -> tuple[jax.Array, jax.Array]:
-        return _full_mix(
-            x,
-            weight,
-            down,
-            up,
-            branches=branches,
-            hidden=hidden,
-            eps=eps,
-            token_tile=token_tile,
-        )
+    static = dict(
+        branches=branches, hidden=hidden, eps=eps, token_tile=token_tile, up_t=up_t
+    )
+    _up = _up_operand(up_t)
+    # torch.library.infer_schema takes explicit tensor parameters only.
+    if inject:
+
+        def core(
+            x: jax.Array,
+            weight: jax.Array,
+            down: jax.Array,
+            up: jax.Array,
+            inject_weight: jax.Array,
+        ) -> tuple[jax.Array, jax.Array]:
+            return _full_mix(x, weight, down, _up(up), inject_weight, **static)
+
+    else:
+
+        def core(
+            x: jax.Array, weight: jax.Array, down: jax.Array, up: jax.Array
+        ) -> tuple[jax.Array, jax.Array]:
+            return _full_mix(x, weight, down, _up(up), **static)
 
     op = pallas.jax_op(
-        f"qwen4_exp::hc_full_c{branches}_h{hidden}_m{token_tile}_e{eps_tag}_v1",
+        f"qwen4_exp::hc_full_c{branches}_h{hidden}_m{token_tile}_e{eps_tag}"
+        f"{'_upt' if up_t else ''}{'_inj' if inject else ''}_v1",
         core,
     )
 
     @op.register_fake
-    def fake(x, weight, down, up):
+    def fake(x, weight, down, up, inject_weight=None):
         return (
             x.new_empty((x.shape[0], hidden), dtype=torch.bfloat16),
-            x.new_empty(x.shape, dtype=torch.bfloat16),
+            x.new_empty(
+                (x.shape[0], branches) if inject else x.shape, dtype=torch.bfloat16
+            ),
+        )
+
+    return op
+
+
+@functools.cache
+def build_combine_full_mix_op(
+    branches: int,
+    hidden: int,
+    eps: float,
+    token_tile: int,
+    up_t: bool,
+    inject: bool = False,
+):
+    """``(mixed, norm, combined)``: the gated residual merge, then the full mix
+    (``inject``: the gate projection in place of ``norm``, as ``build_full_mix_op``)."""
+    eps_tag = hashlib.sha1(repr(eps).encode()).hexdigest()[:8]
+
+    static = dict(
+        branches=branches, hidden=hidden, eps=eps, token_tile=token_tile, up_t=up_t
+    )
+    _up = _up_operand(up_t)
+    if inject:
+
+        def core(
+            residual: jax.Array,
+            block: jax.Array,
+            gates: jax.Array,
+            weight: jax.Array,
+            down: jax.Array,
+            up: jax.Array,
+            inject_weight: jax.Array,
+        ) -> tuple[jax.Array, jax.Array, jax.Array]:
+            return _combine_full_mix(
+                residual, block, gates, weight, down, _up(up), inject_weight, **static
+            )
+
+    else:
+
+        def core(
+            residual: jax.Array,
+            block: jax.Array,
+            gates: jax.Array,
+            weight: jax.Array,
+            down: jax.Array,
+            up: jax.Array,
+        ) -> tuple[jax.Array, jax.Array, jax.Array]:
+            return _combine_full_mix(
+                residual, block, gates, weight, down, _up(up), **static
+            )
+
+    op = pallas.jax_op(
+        f"qwen4_exp::hc_combine_full_c{branches}_h{hidden}_m{token_tile}_e{eps_tag}"
+        f"{'_upt' if up_t else ''}{'_inj' if inject else ''}_v1",
+        core,
+    )
+
+    @op.register_fake
+    def fake(residual, block, gates, weight, down, up, inject_weight=None):
+        rows = residual.shape[0]
+        return (
+            residual.new_empty((rows, hidden), dtype=torch.bfloat16),
+            residual.new_empty(
+                (rows, branches) if inject else residual.shape, dtype=torch.bfloat16
+            ),
+            residual.new_empty(residual.shape, dtype=torch.bfloat16),
         )
 
     return op

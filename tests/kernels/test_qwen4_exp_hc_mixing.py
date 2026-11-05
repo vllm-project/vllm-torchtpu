@@ -8,7 +8,8 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from vllm_torchtpu.kernels.qwen4_exp.hc_full import _full_mix
+from vllm_torchtpu.kernels.qwen4_exp.gated_residual import gated_residual_fn
+from vllm_torchtpu.kernels.qwen4_exp.hc_full import _combine_full_mix, _full_mix
 from vllm_torchtpu.kernels.qwen4_exp.hc_norm import _normalize
 from vllm_torchtpu.kernels.qwen4_exp.hc_up import _up_epilogue
 
@@ -85,3 +86,103 @@ def test_hc_staged_and_full_mix_match_cpu_reference(tokens):
             np.vdot(a.ravel(), e.ravel()) / (np.linalg.norm(a) * np.linalg.norm(e))
             >= 0.999
         )
+
+
+def _bitwise(actual, expected):
+    for a, e in zip(actual, expected, strict=True):
+        np.testing.assert_array_equal(
+            np.asarray(a).view(np.uint16), np.asarray(e).view(np.uint16)
+        )
+
+
+def _full_mix_variants_match(device):
+    """The transposed-up and the fused combine variants are bit-identical."""
+    put = functools.partial(jax.device_put, device=device)
+    x, weight, down, up = (put(jnp.asarray(a, jnp.bfloat16)) for a in inputs(512))
+    rng = np.random.default_rng(7)
+    block = put(jnp.asarray(rng.normal(size=(512, 128)) * 0.1, jnp.bfloat16))
+    gates = put(jnp.asarray(rng.uniform(0, 2, size=(512, 4)), jnp.float32))
+    static = dict(branches=4, hidden=128, eps=1e-6, token_tile=128)
+    expected = _full_mix(x, weight, down, up, **static)
+    _bitwise(_full_mix(x, weight, down, up.T, **static, up_t=True), expected)
+    combined = gated_residual_fn(4, 128, 128)(x, block, gates)
+    mixed, norm = _full_mix(combined, weight, down, up, **static)
+    for up_t in (False, True):
+        _bitwise(
+            _combine_full_mix(
+                x, block, gates, weight, down, up.T if up_t else up, **static, up_t=up_t
+            ),
+            (mixed, norm, combined),
+        )
+    # Rows are independent: a wider tile changes only the schedule.
+    wide = dict(static, token_tile=256)
+    _bitwise(_full_mix(x, weight, down, up, **wide), expected)
+    _bitwise(
+        _combine_full_mix(x, block, gates, weight, down, up, **wide, up_t=False),
+        (mixed, norm, combined),
+    )
+
+
+def test_full_mix_variants_are_bit_identical_interpret():
+    from jax.experimental import pallas as pl
+
+    real = pl.pallas_call
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(pl, "pallas_call", functools.partial(real, interpret=True))
+        _full_mix.clear_cache()
+        _combine_full_mix.clear_cache()
+        try:
+            _full_mix_variants_match(jax.devices("cpu")[0])
+        finally:
+            _full_mix.clear_cache()
+            _combine_full_mix.clear_cache()
+
+
+@pytest.mark.tpu_test
+def test_full_mix_variants_are_bit_identical():
+    _full_mix_variants_match(jax.devices("tpu")[0])
+
+
+def _inject_matches(device):
+    """With ``inject`` the second output is the XLA gate projection of ``norm``."""
+    put = functools.partial(jax.device_put, device=device)
+    x, weight, down, up = (put(jnp.asarray(a, jnp.bfloat16)) for a in inputs(512))
+    rng = np.random.default_rng(9)
+    inject = put(jnp.asarray(rng.normal(size=(4, 512)) * 0.05, jnp.bfloat16))
+    block = put(jnp.asarray(rng.normal(size=(512, 128)) * 0.1, jnp.bfloat16))
+    gates = put(jnp.asarray(rng.uniform(0, 2, size=(512, 4)), jnp.float32))
+    static = dict(branches=4, hidden=128, eps=1e-6, token_tile=128)
+    project = jax.jit(
+        lambda n: jax.lax.dot_general(n, inject, (((1,), (1,)), ((), ())))
+    )
+    mixed, norm = _full_mix(x, weight, down, up, **static)
+    _bitwise(_full_mix(x, weight, down, up, inject, **static), (mixed, project(norm)))
+    mixed, norm, combined = _combine_full_mix(
+        x, block, gates, weight, down, up, **static, up_t=False
+    )
+    _bitwise(
+        _combine_full_mix(
+            x, block, gates, weight, down, up, inject, **static, up_t=False
+        ),
+        (mixed, project(norm), combined),
+    )
+
+
+def test_full_mix_inject_interpret():
+    from jax.experimental import pallas as pl
+
+    real = pl.pallas_call
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(pl, "pallas_call", functools.partial(real, interpret=True))
+        _full_mix.clear_cache()
+        _combine_full_mix.clear_cache()
+        try:
+            _inject_matches(jax.devices("cpu")[0])
+        finally:
+            _full_mix.clear_cache()
+            _combine_full_mix.clear_cache()
+
+
+@pytest.mark.tpu_test
+def test_full_mix_inject():
+    _inject_matches(jax.devices("tpu")[0])

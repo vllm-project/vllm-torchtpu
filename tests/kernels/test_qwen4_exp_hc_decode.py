@@ -325,3 +325,39 @@ def test_disable_decode_fused_keeps_the_unfused_mix():
     with torch.no_grad():
         mixed, (residual, injection) = module.mix(hyper)
     assert mixed.shape == (8, 128) and injection.shape == (8, BRANCHES)
+
+
+def test_small_rows_skips_prefill_tiles_at_128_rows():
+    """Megakernel verify programs mix 128 verify rows (32 requests x 4) with
+    small_rows=True: the prefill-tile ops must not run, and the result must be the
+    module's small-row path at the same row count bit for bit (the path it takes
+    when no prefill tile is configured)."""
+    module = _module(7)
+    calls = []
+
+    def prefill_op(name):
+        def op(*args):
+            calls.append(name)
+            raise AssertionError(f"prefill {name} op taken")
+
+        return op
+
+    module.prefill_norm_tile = module.prefill_up_tile = module.prefill_full_tile = 128
+    module._prefill_norm_op = prefill_op("norm")
+    module._prefill_up_op = prefill_op("up")
+    module._prefill_full_op = prefill_op("full")
+    torch.manual_seed(128)
+    hyper = torch.randn(128, BRANCHES * HIDDEN).to(torch.bfloat16)
+    with torch.no_grad():
+        mixed, (_, injection) = module.mix(hyper, small_rows=True)
+    assert calls == []
+    plain = _module(7)  # same weights, no prefill tiles configured
+    with torch.no_grad():
+        ref_mixed, (_, ref_injection) = plain.mix(hyper)
+    torch.testing.assert_close(mixed, ref_mixed, rtol=0, atol=0)
+    torch.testing.assert_close(injection, ref_injection, rtol=0, atol=0)
+    # Positive control: without small_rows the same 128 rows take the prefill tiles.
+    with pytest.raises(AssertionError, match="prefill"):
+        with torch.no_grad():
+            module.mix(hyper)
+    assert calls == ["norm"]

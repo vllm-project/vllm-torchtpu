@@ -301,9 +301,14 @@ def _pooled_outputs_uncached(
     out, raw = step(pos, hid_mk, w_mk, pools, pt, ckpt, roff)
     res = [np.asarray(x).view(np.uint8).copy() for x in (out, *raw)]
     del step, out, raw, pools, hid_mk, w_mk
-    if not os.path.exists("/dev/vfio"):
-        jax.clear_caches()
-        gc.collect()
+    from tests.conftest import (
+        _CPU_JAX_GROUP_RSS_LIMIT_MIB,
+        _current_rss_mib,
+        _reclaim_cpu_jax_memory,
+    )
+
+    if _current_rss_mib() >= _CPU_JAX_GROUP_RSS_LIMIT_MIB:
+        _reclaim_cpu_jax_memory()
     return res
 
 

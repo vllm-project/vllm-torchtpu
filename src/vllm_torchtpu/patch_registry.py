@@ -87,6 +87,7 @@ PATCHES = (
         _ENGINE,
         refresh="vllm_torchtpu:_patch_vllm_dcp_fine_prefix_hits",
     ),
+    Patch("vllm_torchtpu:_patch_vllm_qsa_dcp_fine_prefix_hits", _ENGINE),
     Patch("vllm_torchtpu:_patch_vllm_mamba_split_scheduler_block_size", _ENGINE),
     Patch("vllm_torchtpu:_patch_vllm_offloading_config_build", _ENGINE),
     Patch("vllm_torchtpu:_patch_vllm_offload_all_ranks_kv_bytes", _ENGINE),
@@ -94,6 +95,11 @@ PATCHES = (
     Patch("vllm_torchtpu:_patch_vllm_hybrid_kv_load_failure_recovery", _ENGINE),
     Patch("vllm_torchtpu:_patch_vllm_block_pool_lifo_free", _ACTIVE),
     Patch("vllm_torchtpu:_patch_vllm_same_step_prefix_hits", _ENGINE),
+    Patch("vllm_torchtpu.core.decode_priority:patch_decode_priority", _ENGINE),
+    Patch("vllm_torchtpu.compilation.aot_guard_skip:patch_aot_guard_skip", _ACTIVE),
+    Patch("vllm_torchtpu.core.zero_schedule_diag:patch_zero_schedule_diag", _ENGINE),
+    # API server: reasoning-token count at stream end without tool re-parsing.
+    Patch("vllm_torchtpu.core.reasoning_count_patch:patch_reasoning_count_skip_tools", _ACTIVE),
     Patch(
         "vllm_torchtpu.core.eagle_block_drop:patch_disable_eagle_block_drop",
         _ENGINE,

@@ -33,6 +33,11 @@ from vllm_torchtpu.spec_decode.eagle3 import (
     _maybe_pad_dim0,
 )
 
+# The server raises dynamo's limits for its per-bucket graphs; do the same so
+# the sweep below (buckets x params x synthetic x candidates) can compile.
+torch._dynamo.config.recompile_limit = 1024
+torch._dynamo.config.accumulated_recompile_limit = 8192
+
 _tpu_compile = torch.compile(backend="tpu", fullgraph=True, dynamic=False)
 
 

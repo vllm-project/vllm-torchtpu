@@ -146,8 +146,12 @@ def _selection_bitset(
     query_block,
     width,
     interpret=False,
+    owned=None,
 ):
     """int32[blocks, words, width] selection bitset without a scatter.
+
+    ``owned=(rank, dcp_world, words_per_tile, live_words)``: keep only this
+    DCP rank's words, numbered locally (``own_words`` of the global bitset).
 
     Equals ``_scatter_bitset`` reshaped to query blocks, transposed to
     word-major rows and zero padded to ``width`` query lanes. Each block only
@@ -158,6 +162,12 @@ def _selection_bitset(
     tokens = blocks.shape[0]
     nblocks = tokens // query_block
     word, bit = _selection_words(blocks, lengths, ratio=ratio, groups=groups)
+    if owned is not None:
+        rank, world, per_tile, live_words = owned
+        local = (word // (per_tile * world)) * per_tile + word % per_tile
+        keep = (word >= 0) & ((word // per_tile) % world == rank) & (local < live_words)
+        word = jnp.where(keep, local, -1)
+        bit = jnp.where(keep, bit, 0)
     rows = (word.shape[1] + 7) // 8 * 8
 
     def layout(array, fill):
@@ -195,19 +205,7 @@ def _kernel(
     table_ref,
     active_tiles_ref,
     active_counts_ref,
-    query_ref,
-    bitset_ref,
-    lengths_ref,
-    cache_ref,
-    output_ref,
-    kv0_ref,
-    kv1_ref,
-    sem0_ref,
-    sem1_ref,
-    max_ref,
-    mass_ref,
-    accumulator_ref,
-    *,
+    *refs,
     ratio: int,
     kv_tile: int,
     physical_page_size: int,
@@ -225,7 +223,19 @@ def _kernel(
     bf16_mxu: bool = False,
     query_tile: int = 256,
     lean: bool = False,
+    return_lse: bool = False,
+    dcp_world: int = 1,
 ):
+    # DCP: a fourth scalar operand holds this rank; its KV tiles are its owned
+    # page-sized blocks only (local tile t is global block t * dcp_world + rank).
+    rank_ref = refs[0] if dcp_world > 1 else None
+    refs = refs[1:] if dcp_world > 1 else refs
+    query_ref, bitset_ref, lengths_ref, cache_ref, output_ref = refs[:5]
+    refs = refs[5:]
+    lse_ref = refs[0] if return_lse else None
+    kv0_ref, kv1_ref, sem0_ref, sem1_ref, max_ref, mass_ref, accumulator_ref = refs[
+        1 if return_lse else 0 :
+    ]
     block = pl.program_id(0)
     # The model produces BF16 queries.  A BF16 call boundary can avoid a large
     # FP32 input window while preserving the existing FP32 QK accumulation.
@@ -258,6 +268,7 @@ def _kernel(
         # shared pool page may contain an odd number of these segments.
         copy_rows = min(kv_tile, physical_page_size, ratio * 32)
         for offset in range(0, kv_tile, copy_rows):
+            # Local rows: under DCP the tiles walk this rank's own pages.
             logical = tile * kv_tile + offset
             page = logical // physical_page_size
             in_page = logical % physical_page_size
@@ -316,6 +327,9 @@ def _kernel(
 
     def compute_tile(tile, kv_ref):
         logical = tile * kv_tile
+        if dcp_world > 1:
+            # Global token position of this owned block (masks, causality).
+            logical = (tile * dcp_world + rank_ref[0]) * kv_tile
         # Dynamic scalar indexing must address a native 128-wide row.  Keep
         # query bits on that row and slice the statically known live prefix.
         # Query blocks longer than 256 rows store one bitset per 256 rows.
@@ -482,6 +496,20 @@ def _kernel(
             )
         output_tiles.append(jnp.concatenate(heads, axis=1))
     output_ref[...] = jnp.concatenate(output_tiles, axis=0).astype(output_ref.dtype)
+    if return_lse:
+        # Natural-log sum of the scaled scores; -inf for a row with no key.
+        lse_tiles = []
+        for query_tile_index in range(num_query_tiles):
+            heads = []
+            for head in range(kv_heads):
+                m = max_ref[query_tile_index, head, :]
+                mass = mass_ref[query_tile_index, head, :]
+                lse = jnp.where(
+                    mass > 0, m + jnp.log(jnp.where(mass > 0, mass, 1)), -jnp.inf
+                )
+                heads.append(lse.reshape(q_heads_per_kv, query_tile).T)
+            lse_tiles.append(jnp.concatenate(heads, axis=1))
+        lse_ref[...] = jnp.concatenate(lse_tiles, axis=0)
 
 
 @functools.partial(
@@ -496,6 +524,8 @@ def _kernel(
         "bf16_io",
         "kv_head_offset",
         "query_tile",
+        "return_lse",
+        "dcp_world",
     ),
 )
 def block_sparse_gqa_prefill(
@@ -514,8 +544,20 @@ def block_sparse_gqa_prefill(
     bf16_io: bool = False,
     kv_head_offset: int = 0,
     query_tile: int | None = None,
+    return_lse: bool = False,
+    dcp_rank=None,
+    dcp_world: int = 1,
 ):
     """Run exact selected-group attention with query-block KV reuse.
+
+    ``return_lse``: also return lse [tokens, heads] (natural log of the scaled
+    scores' sum, -inf for a row with no key); the output is then f32.
+    ``dcp_rank`` (int32[1]) / ``dcp_world``: main-KV decode context parallel.
+    A table entry covers ``dcp_world * page`` tokens; this rank attends the
+    tokens with ``(t // page) % dcp_world == dcp_rank``, held in the entry's
+    page at row ``t % page``. The KV tiles walk only those owned pages (one
+    page per tile: ``kv_tile`` equal to the page), so no other rank's rows are
+    fetched and the tile size does not grow with ``dcp_world``.
 
     ``kv_head_offset`` skips that many KV heads of each cache row: a paired
     main KV page stores a second layer's head after the first layer's.
@@ -559,9 +601,22 @@ def block_sparse_gqa_prefill(
     if packing != (2 if cache.dtype == jnp.bfloat16 else 4):
         raise ValueError("Cache packing does not match its dtype")
 
-    groups = page_table.shape[1] * physical_page_size // ratio
-    num_kv_tiles = (groups * ratio + kv_tile - 1) // kv_tile
+    dcp = dcp_rank is not None
+    if dcp and not (paired_pages and kv_tile == physical_page_size):
+        raise ValueError("DCP prefill needs paired pages, one owned page per KV tile")
+    # Selection groups / words over the request's global token range; under
+    # DCP the kernel walks only this rank's pages (one per table entry), so
+    # its tiles and bitset words are the owned ones (`owned_word_ids`).
+    groups = page_table.shape[1] * physical_page_size * dcp_world // ratio
     words_per_tile = kv_tile // (ratio * 32)
+    global_words = (
+        (((groups * ratio + kv_tile - 1) // kv_tile) * words_per_tile + 127) // 128
+    ) * 128
+    num_kv_tiles = (
+        page_table.shape[1]
+        if dcp
+        else (groups * ratio + kv_tile - 1) // kv_tile
+    )
     words = ((num_kv_tiles * words_per_tile + 127) // 128) * 128
     nblocks = tokens // query_block
     native_query_width = ((query_block + 127) // 128) * 128
@@ -571,16 +626,46 @@ def block_sparse_gqa_prefill(
         raise ValueError("Query blocks above 256 rows must be 256-aligned")
     parts = max(1, query_block // 256)
     part_width = native_query_width // parts
+    if dcp:
+        # Local word w (tile w // words_per_tile of this rank's pages) is
+        # global word (tile * dcp_world + rank) * words_per_tile + w % ...
+        rank = jnp.asarray(dcp_rank, jnp.int32).reshape(-1)[0]
+        local = jnp.arange(words, dtype=jnp.int32)
+        owned_word_ids = (
+            (local // words_per_tile) * dcp_world + rank
+        ) * words_per_tile + local % words_per_tile
+        owned_word_live = (local < num_kv_tiles * words_per_tile) & (
+            owned_word_ids < global_words
+        )
+        owned_word_ids = jnp.minimum(owned_word_ids, global_words - 1)
+
+        def own_words(bits, axis):
+            taken = jnp.take(bits, owned_word_ids, axis=axis)
+            shape = [1] * bits.ndim
+            shape[axis] = words
+            return jnp.where(owned_word_live.reshape(shape), taken, 0)
+
+    # VLLM_TPU_QSA_PREFILL_BITSET_OWNED: the bitset kernel numbers this rank's
+    # words itself, so the global bitset, its relayout copy and the owned-word
+    # gather drop out (bit-identical).
+    owned_kernel = dcp and envs.VLLM_TPU_QSA_PREFILL_BITSET_OWNED
     if envs.VLLM_TPU_QSA_PREFILL_BITSET_KERNEL:
         block_bits_native = _selection_bitset(
             blocks,
             lengths,
             ratio=ratio,
             groups=groups,
-            words=words,
+            words=global_words if dcp and not owned_kernel else words,
             query_block=query_block // parts,
             width=part_width,
+            **(
+                {"owned": (rank, dcp_world, words_per_tile, num_kv_tiles * words_per_tile)}
+                if owned_kernel
+                else {}
+            ),
         )
+        if dcp and not owned_kernel:
+            block_bits_native = own_words(block_bits_native, 1)
         part_bits = block_bits_native.reshape(nblocks, parts, words, part_width)
         if paired_pages:
             active = jnp.any(
@@ -595,7 +680,12 @@ def block_sparse_gqa_prefill(
         active_tiles = _compact_active(active)
         active_counts = jnp.sum(active, axis=1, dtype=jnp.int32)
         table = page_table.reshape(nblocks, query_block, -1)[:, 0]
-    elif paired_pages and query_block == 256 and tokens * words * 4 >= 16 * 1024**2:
+    elif (
+        not dcp
+        and paired_pages
+        and query_block == 256
+        and tokens * words * 4 >= 16 * 1024**2
+    ):
         batch = 8
         while batch > 1 and batch * query_block * words * 4 >= 16 * 1024**2:
             batch //= 2
@@ -613,8 +703,11 @@ def block_sparse_gqa_prefill(
         )
     else:
         bitset = _scatter_bitset(
-            blocks, lengths, ratio=ratio, groups=groups, words=words
+            blocks, lengths, ratio=ratio, groups=groups,
+            words=global_words if dcp else words,
         )
+        if dcp:
+            bitset = own_words(bitset, 1)
 
         nblocks = tokens // query_block
         block_bits = bitset.reshape(nblocks, query_block, words)
@@ -658,6 +751,10 @@ def block_sparse_gqa_prefill(
         kv_heads,
         query_tile * (query_heads // kv_heads),
     )
+    out_spec = pl.BlockSpec(
+        (query_block, query_heads, head_dim),
+        lambda b, *_: (b, 0, 0),
+    )
     output = pl.pallas_call(
         functools.partial(
             _kernel,
@@ -678,9 +775,11 @@ def block_sparse_gqa_prefill(
             **({"bf16_mxu": True} if bf16_mxu else {}),
             query_tile=query_tile,
             **({"lean": True} if envs.VLLM_TPU_QSA_PREFILL_LEAN else {}),
+            **({"return_lse": True} if return_lse else {}),
+            **({"dcp_world": dcp_world} if dcp else {}),
         ),
         grid_spec=pltpu.PrefetchScalarGridSpec(
-            num_scalar_prefetch=3,
+            num_scalar_prefetch=4 if dcp else 3,
             grid=(nblocks,),
             in_specs=[
                 pl.BlockSpec(
@@ -694,9 +793,10 @@ def block_sparse_gqa_prefill(
                 pl.BlockSpec((query_block, 1), lambda b, *_: (b, 0)),
                 pl.BlockSpec(memory_space=pltpu.HBM),
             ],
-            out_specs=pl.BlockSpec(
-                (query_block, query_heads, head_dim),
-                lambda b, *_: (b, 0, 0),
+            out_specs=(
+                [out_spec, pl.BlockSpec((query_block, query_heads), lambda b, *_: (b, 0))]
+                if return_lse
+                else out_spec
             ),
             scratch_shapes=[
                 pltpu.VMEM((kv_tile, head_axis, packing, head_dim), cache.dtype),
@@ -730,8 +830,15 @@ def block_sparse_gqa_prefill(
             * 1024**2,
             disable_bounds_checks=True,
         ),
-        out_shape=jax.ShapeDtypeStruct(
-            query.shape, jnp.bfloat16 if bf16_io else jnp.float32
+        out_shape=(
+            [
+                jax.ShapeDtypeStruct(query.shape, jnp.float32),
+                jax.ShapeDtypeStruct((tokens, query_heads), jnp.float32),
+            ]
+            if return_lse
+            else jax.ShapeDtypeStruct(
+                query.shape, jnp.bfloat16 if bf16_io else jnp.float32
+            )
         ),
         name=(
             "general_qsub256_state_ref_sparse_gqa_prefill_paired_pages"
@@ -742,11 +849,14 @@ def block_sparse_gqa_prefill(
         table.reshape(-1),
         active_tiles.reshape(-1),
         active_counts,
+        *([jnp.asarray(dcp_rank, jnp.int32).reshape(1)] if dcp else []),
         query.astype(jnp.bfloat16 if bf16_io else jnp.float32),
         block_bits_native,
         lengths[:, None],
         cache.reshape(pages * physical_page_size, head_axis, packing, head_dim),
     )
+    if return_lse:
+        return output[0][:, :, :original_head_dim], output[1]
     return output[:, :, :original_head_dim]
 
 
@@ -767,12 +877,23 @@ def block_sparse_gqa_attention(
     kv_tile: int = 128,
     kv_head_offset: int = 0,
     query_tile: int | None = None,
+    dcp=None,
+    return_lse: bool = False,
 ):
-    """Align requests, share KV tiles, then restore the original token order."""
+    """Align requests, share KV tiles, then restore the original token order.
+
+    With ``return_lse`` returns ``(out, lse, cache)``: ``out`` f32, normalized
+    and not gated, ``lse`` [tokens, heads] (-inf for an empty row). ``dcp =
+    (rank int32[1], D)``: attend this rank's owned main-KV rows (see
+    ``block_sparse_gqa_prefill``)."""
     real = starts[1:] - starts[:-1]
     offset = {"kv_head_offset": kv_head_offset} if kv_head_offset else {}
     if query_tile is not None:
         offset["query_tile"] = query_tile
+    if return_lse:
+        offset["return_lse"] = True
+    if dcp is not None:
+        offset["dcp_rank"], offset["dcp_world"] = dcp
 
     def run_aligned(_):
         return block_sparse_gqa_prefill(
@@ -839,7 +960,23 @@ def block_sparse_gqa_attention(
             bf16_io=True,
             **offset,
         )
-        return output[jnp.minimum(slots, max_tokens - 1)]
+        back = jnp.minimum(slots, max_tokens - 1)
+        if return_lse:
+            out, lse = output[0][back], output[1][back]
+            if mask_in_padding:
+                # Tokens past the step's rows read the last aligned row, which
+                # can be a real one: mask them here, fused with the gather.
+                out = jnp.where(live[:, None, None], out, 0)
+                lse = jnp.where(live[:, None], lse, -jnp.inf)
+            return out, lse
+        return output[back]
+
+    live = lengths > 0
+    # VLLM_TPU_QSA_PREFILL_LIVE_MASK_PADDED: only the padded layouts mask
+    # dead rows. In the aligned layout a row with length 0 sees no key, so the
+    # kernel already gives it out 0 and lse -inf (bit-identical, one f32
+    # [T, heads, D] select less per call).
+    mask_in_padding = return_lse and envs.VLLM_TPU_QSA_PREFILL_LIVE_MASK_PADDED
 
     # All lax.switch branches are traced. A statically unaligned total cannot
     # enter run_aligned, whose core rejects its shape before execution.
@@ -851,6 +988,16 @@ def block_sparse_gqa_attention(
     output = (
         branches[0](None) if len(branches) == 1 else lax.switch(route, branches, None)
     )
+    if mask_in_padding:
+        out, lse = output
+        return out, lse, cache
+    if return_lse:
+        out, lse = output
+        return (
+            jnp.where(live[:, None, None], out, 0),
+            jnp.where(live[:, None], lse, -jnp.inf),
+            cache,
+        )
     output = bf16(
         bf16(output).astype(jnp.float32)
         * bf16(jax.nn.sigmoid(gate.astype(jnp.float32))).astype(jnp.float32)
