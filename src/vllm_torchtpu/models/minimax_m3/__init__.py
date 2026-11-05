@@ -37,8 +37,14 @@ def register() -> None:
         QUANT_METHOD,
         MiniMaxM3QuantConfig,
     )
+    from vllm_torchtpu.offload.multi_shapes_kv import (
+        register_multi_shapes_kv_architectures,
+    )
 
     for arch in _ARCHITECTURES:
         ModelRegistry.register_model(arch, _MODEL)
         MODELS_CONFIG_MAP[arch] = TPUMiniMaxM3Config
     register_tpu_quant_config(QUANT_METHOD, MiniMaxM3QuantConfig)
+    # The [K | V] and index caches differ in row width, so KV offload
+    # registers them array by array.
+    register_multi_shapes_kv_architectures(*_ARCHITECTURES)
