@@ -134,6 +134,9 @@ def _hook_config(**overrides) -> SimpleNamespace:
         user_specified_block_size=False,
         speculative_config=None,
         indexer_kv_dtype="auto",
+        prefill_context_parallel_size=1,
+        decode_context_parallel_size=1,
+        cp_kv_cache_interleave_size=1,
     )
     values.update(overrides)
     return SimpleNamespace(
@@ -146,8 +149,9 @@ def _hook_config(**overrides) -> SimpleNamespace:
         parallel_config=SimpleNamespace(
             tensor_parallel_size=values["tensor_parallel_size"],
             pipeline_parallel_size=1,
-            prefill_context_parallel_size=1,
-            decode_context_parallel_size=1,
+            prefill_context_parallel_size=values["prefill_context_parallel_size"],
+            decode_context_parallel_size=values["decode_context_parallel_size"],
+            cp_kv_cache_interleave_size=values["cp_kv_cache_interleave_size"],
         ),
         speculative_config=values["speculative_config"],
         attention_config=AttentionConfig(
@@ -179,11 +183,78 @@ def test_config_pins_block_size_to_sparse_block(cache_dtype, indexer_kv_dtype) -
         ),
         (dict(block_size=64, user_specified_block_size=True), ValueError),
         (dict(indexer_kv_dtype="fp8"), NotImplementedError),
+        (dict(prefill_context_parallel_size=2), NotImplementedError),
+        # DCP needs whole sparse blocks per rank, splits KV-head replicas only
+        # and does not run the DSpark draft yet.
+        (
+            dict(
+                tensor_parallel_size=8,
+                decode_context_parallel_size=2,
+                cp_kv_cache_interleave_size=64,
+            ),
+            ValueError,
+        ),
+        (dict(tensor_parallel_size=8, decode_context_parallel_size=4), ValueError),
+        (
+            dict(
+                tensor_parallel_size=8,
+                decode_context_parallel_size=2,
+                speculative_config=SimpleNamespace(method="dspark"),
+            ),
+            NotImplementedError,
+        ),
     ],
 )
 def test_config_rejects_unsupported(overrides, error) -> None:
     with pytest.raises(error):
         TPUMiniMaxM3Config.verify_and_update_config(_hook_config(**overrides))
+
+
+@pytest.mark.parametrize("interleave", [1, 128])
+def test_config_dcp_keeps_whole_blocks_per_rank(interleave) -> None:
+    config = _hook_config(
+        tensor_parallel_size=8,
+        decode_context_parallel_size=2,
+        cp_kv_cache_interleave_size=interleave,
+    )
+    TPUMiniMaxM3Config.verify_and_update_config(config)
+    assert config.parallel_config.cp_kv_cache_interleave_size == 128
+
+
+@pytest.mark.parametrize("dcp", [1, 2, 4])
+def test_msa_cache_spec_under_dcp(dcp, monkeypatch) -> None:
+    """A rank's page bytes do not change with DCP, but the spec is
+    DCP-sharded: the scheduler's block (and so each page's tokens) grows
+    dcp-fold, and a request needs 1 / dcp of the pages per rank."""
+    from vllm.platforms import current_platform
+    from vllm.v1.core.single_type_kv_cache_manager import FullAttentionManager
+
+    monkeypatch.setattr(current_platform, "device_name", "cpu")
+    monkeypatch.setattr(current_platform, "device_type", "cpu")
+
+    vllm_config = VllmConfig()
+    vllm_config.cache_config = CacheConfig(block_size=128)
+    vllm_config.parallel_config.decode_context_parallel_size = dcp
+    with set_current_vllm_config(vllm_config):
+        caches = [
+            attention_mod.MiniMaxM3Cache(256, torch.bfloat16, prefix=f"l.kv{dcp}"),
+            attention_mod.MiniMaxM3Cache(128, torch.bfloat16, prefix=f"l.idx{dcp}"),
+        ]
+    for cache, width in zip(caches, (256, 128), strict=True):
+        spec = cache.get_kv_cache_spec(vllm_config)
+        assert spec.dcp_sharded
+        assert spec.block_size == 128
+        assert spec.page_size_bytes == 128 * width * 2
+        assert spec.max_num_blocks_per_req(vllm_config, 128 * 1024) == 1024 // dcp
+        manager = FullAttentionManager(
+            spec,
+            block_pool=SimpleNamespace(null_block=None),
+            enable_caching=False,
+            kv_cache_group_id=0,
+            scheduler_block_size=128 * dcp,
+            dcp_world_size=dcp,
+        )
+        assert manager.block_size == 128 * dcp
 
 
 def test_dequantize_mxfp8_applies_power_of_two_block_scales() -> None:

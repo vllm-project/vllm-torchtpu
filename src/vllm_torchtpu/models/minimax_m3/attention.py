@@ -36,7 +36,11 @@ from vllm.v1.kv_cache_interface import KVCacheSpec, MLAAttentionSpec
 from vllm_torchtpu.layers.adapter.attention import PallasMLAttentionBackend
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
 from vllm_torchtpu.layers.core.owned_kv_cache import TpuOwnedKVCache
-from vllm_torchtpu.models.minimax_m3.ops.msa import get_msa_op, get_msa_sharded_op
+from vllm_torchtpu.models.minimax_m3.ops.msa import (
+    get_msa_dcp_op,
+    get_msa_op,
+    get_msa_sharded_op,
+)
 
 
 class MiniMaxM3Cache(nn.Module, TpuOwnedKVCache):
@@ -47,6 +51,10 @@ class MiniMaxM3Cache(nn.Module, TpuOwnedKVCache):
     layout is involved. With ``token_shards > 1`` a page holds only every
     ``token_shards``-th token of its block (the index-cache shard of one
     tensor-parallel rank), packed as ``[pages, S / shards / p, p, W]``.
+    Under DCP a page holds whole blocks: vLLM's logical block ``j`` of
+    ``dcp * S`` tokens is block ``j * dcp + r`` on DCP rank ``r``
+    (`kernels.msa_dcp`); the spec is per rank and DCP-sharded, so the
+    scheduler counts ``dcp`` times the tokens per page.
     """
 
     def __init__(
@@ -195,6 +203,15 @@ class MiniMaxM3SparseAttention(nn.Module):
                 f"per rank (tensor parallel size {config.num_key_value_heads}), "
                 f"got {tp_size}."
             )
+        # Decode context parallelism: the ranks sharing this KV head split its
+        # context by whole sparse blocks (`kernels.msa_dcp`).
+        vllm_config = get_current_vllm_config()
+        self.dcp_size = vllm_config.parallel_config.decode_context_parallel_size
+        if self.dcp_size > 1 and self.index_shards > 1:
+            raise NotImplementedError(
+                f"additional_config.{SHARD_INDEX_CACHE_KEY} does not combine with "
+                "--decode-context-parallel-size."
+            )
         dtype = cache_dtype(cache_config)
         self.kv_cache = MiniMaxM3Cache(
             2 * self.head_dim, dtype, prefix=f"{prefix}.attn"
@@ -211,7 +228,16 @@ class MiniMaxM3SparseAttention(nn.Module):
             sparse_cfg.get("sparse_init_block", 0),
             sparse_cfg.get("sparse_local_block", 0),
         )
-        if self.index_shards > 1:
+        if self.dcp_size > 1:
+            from vllm_torchtpu.distributed.dcp import get_dcp_rank, get_dcp_world_size
+
+            if get_dcp_world_size() != self.dcp_size:
+                raise RuntimeError(
+                    f"DCP group of {get_dcp_world_size()} ranks, expected "
+                    f"{self.dcp_size}."
+                )
+            self.msa_op = get_msa_dcp_op(*msa_config, get_dcp_rank(), self.dcp_size)
+        elif self.index_shards > 1:
             self.msa_op = get_msa_sharded_op(
                 *msa_config, get_tensor_model_parallel_rank(), self.index_shards
             )

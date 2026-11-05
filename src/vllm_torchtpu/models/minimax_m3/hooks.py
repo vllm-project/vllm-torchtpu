@@ -78,6 +78,12 @@ class TPUMiniMaxM3Config(VerifyAndUpdateConfig):
                 f"({kv_dtype}); set indexer_kv_dtype to {kv_dtype!r} in "
                 f"--attention-config, got {indexer_dtype!r}."
             )
+        if parallel_config.prefill_context_parallel_size > 1:
+            raise NotImplementedError(
+                "MiniMax M3 on TPU does not support prefill context parallelism."
+            )
+        if parallel_config.decode_context_parallel_size > 1:
+            _verify_dcp(vllm_config, block_size)
         if vllm_config.speculative_config is not None:
             from vllm_torchtpu.models.minimax_m3.dspark import (
                 configure_dspark_draft,
@@ -88,10 +94,34 @@ class TPUMiniMaxM3Config(VerifyAndUpdateConfig):
             raise NotImplementedError(
                 "MiniMax M3 on TPU requires pipeline_parallel_size=1."
             )
-        if (
-            parallel_config.prefill_context_parallel_size > 1
-            or parallel_config.decode_context_parallel_size > 1
-        ):
-            raise NotImplementedError(
-                "MiniMax M3 on TPU does not support context parallelism yet."
-            )
+
+
+def _verify_dcp(vllm_config: "VllmConfig", block_size: int) -> None:
+    """DCP splits a KV head's context over the ranks that replicate it, one
+    whole sparse block per rank in turn (`kernels.msa_dcp`)."""
+    parallel_config = vllm_config.parallel_config
+    dcp = parallel_config.decode_context_parallel_size
+    tp_size = parallel_config.tensor_parallel_size
+    num_kv_heads = vllm_config.model_config.hf_text_config.num_key_value_heads
+    if tp_size % (num_kv_heads * dcp):
+        raise ValueError(
+            f"MiniMax M3 DCP splits the {tp_size // num_kv_heads} ranks that "
+            f"replicate a KV head; --decode-context-parallel-size {dcp} must "
+            "divide them."
+        )
+    interleave = parallel_config.cp_kv_cache_interleave_size
+    if interleave == 1:
+        parallel_config.cp_kv_cache_interleave_size = block_size
+    elif interleave != block_size:
+        raise ValueError(
+            "MiniMax M3 DCP keeps whole sparse blocks on a rank: use "
+            f"--cp-kv-cache-interleave-size {block_size} (or leave it unset), "
+            f"got {interleave}."
+        )
+    if vllm_config.speculative_config is not None:
+        # TODO(minimax-m3): the DSpark draft's sliding-window GQA cache under
+        # DCP (vLLM's sliding-window manager rejects DCP-sharded specs).
+        raise NotImplementedError(
+            "MiniMax M3 on TPU does not combine --decode-context-parallel-size "
+            "with speculative decoding yet."
+        )
