@@ -244,6 +244,43 @@ def test_precompile_warms_draft_only_buckets():
     assert draft_sizes == [16, 32, 64, 128]
 
 
+@pytest.mark.parametrize(
+    ("num_tokens_paddings", "num_reqs_max_model_len", "buckets"),
+    [
+        # The sub-block bucket drops out; a full chunk rounds up to 512.
+        ([1, 8, 16, 512], 8, [8, 16, 512]),
+        # The draft-only bucket past the largest target bucket stays.
+        ([16, 32, 64], 16, [16, 32, 64, 128]),
+    ],
+)
+def test_draft_forward_buckets_are_the_ones_precompile_warms(
+    num_tokens_paddings, num_reqs_max_model_len, buckets
+):
+    proposer = _make_precompile_proposer(num_tokens_paddings, num_reqs_max_model_len)
+
+    assert proposer.draft_forward_buckets() == buckets
+    proposer.precompile()
+    _, draft_sizes = _precompiled_sizes(proposer)
+    assert draft_sizes == buckets
+
+
+def test_profile_draft_ms_keeps_the_faster_run(monkeypatch):
+    proposer = _make_precompile_proposer([16, 32, 64], num_reqs_max_model_len=4)
+    draft_forward = mock.MagicMock()
+    proposer._dummy_draft_forward = draft_forward
+    # A 10 ms run that compiles, then a 4 ms one.
+    clock = iter([0.0, 0.010, 1.0, 1.004])
+    monkeypatch.setattr(
+        dflash_module, "time", SimpleNamespace(perf_counter=lambda: next(clock))
+    )
+
+    assert proposer.profile_draft_ms(32) == pytest.approx(4.0)
+    calls = draft_forward.call_args_list
+    assert [(c.args, c.kwargs) for c in calls] == [
+        ((32,), {"use_max_model_len": True, "sync": True})
+    ] * 2
+
+
 # Matches _make_precompile_proposer (K=7, block_size 8).
 NUM_SPEC_TOKENS = 7
 

@@ -73,6 +73,7 @@ def _make_runner(
     runner._pp_is_first = True
     runner._pp_is_last = True
     runner._pp_wave = None
+    runner._adaptive_verification = None
     runner.scheduler_config = SimpleNamespace(async_scheduling=False)
     runner.parallel_config = SimpleNamespace(
         prefill_context_parallel_size=pcp_size,

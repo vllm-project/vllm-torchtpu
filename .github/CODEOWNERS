@@ -163,6 +163,10 @@
 /tests/layers/adapter/custom_ops/deepseek_v41/ @yuyanpeng-google @fro11o @wenqini
 /tests/models/vllm/deepseek_v41/ @yuyanpeng-google @fro11o @wenqini
 
+# Models: MiniMax M3
+/src/vllm_torchtpu/models/minimax_m3/ @DRZDONG @caojx-google @qizzzh
+/tests/models/minimax_m3/ @DRZDONG @caojx-google @qizzzh
+
 # Megakernel (Framework-Free JAX/Pallas)
 /src/vllm_torchtpu/megakernel/ @caojx-google @annyan09023 @weinan1997 @hhb @brianseung-google
 /tests/megakernel/ @caojx-google @annyan09023 @weinan1997 @hhb @brianseung-google
