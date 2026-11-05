@@ -173,7 +173,10 @@ def test_config_pins_block_size_to_sparse_block(cache_dtype, indexer_kv_dtype) -
         (dict(tensor_parallel_size=2), NotImplementedError),
         (dict(cache_dtype="fp8_e5m2"), NotImplementedError),
         (dict(cache_dtype="fp8", indexer_kv_dtype="bf16"), NotImplementedError),
-        (dict(speculative_config=object()), NotImplementedError),
+        (
+            dict(speculative_config=SimpleNamespace(method="eagle3")),
+            NotImplementedError,
+        ),
         (dict(block_size=64, user_specified_block_size=True), ValueError),
         (dict(indexer_kv_dtype="fp8"), NotImplementedError),
     ],

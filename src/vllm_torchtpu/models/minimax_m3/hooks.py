@@ -79,10 +79,11 @@ class TPUMiniMaxM3Config(VerifyAndUpdateConfig):
                 f"--attention-config, got {indexer_dtype!r}."
             )
         if vllm_config.speculative_config is not None:
-            # TODO(minimax-m3): port the DSpark drafter.
-            raise NotImplementedError(
-                "MiniMax M3 on TPU does not support speculative decoding yet."
+            from vllm_torchtpu.models.minimax_m3.dspark import (
+                configure_dspark_draft,
             )
+
+            configure_dspark_draft(vllm_config.speculative_config)
         if parallel_config.pipeline_parallel_size > 1:
             raise NotImplementedError(
                 "MiniMax M3 on TPU requires pipeline_parallel_size=1."
