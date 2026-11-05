@@ -9,6 +9,8 @@ import jax
 import jax.numpy as jnp
 import torch
 
+from vllm_torchtpu import envs
+from vllm_torchtpu.kernels.attention_preprocessing import rope_gather
 from vllm_torchtpu.kernels.deepseek_v4.o_projection import wo_a_projection
 from vllm_torchtpu.kernels.deepseek_v41 import output_projection
 from vllm_torchtpu.kernels.deepseek_v41.csa2.cache import (
@@ -69,7 +71,11 @@ def _publish_swa_banked(
 
 def _inverse_rope(cos_sin: jax.Array, positions: jax.Array) -> jax.Array:
     # Q/K already carry RoPE; CSA2 consumes this small inverse-rotation table.
-    table = cos_sin[positions].astype(jnp.float32)
+    table = rope_gather.by_row_blocks(
+        lambda rows: cos_sin[rows],
+        positions,
+        envs.TPU_DEEPSEEK_V41_BLOCKED_ROPE_GATHER,
+    ).astype(jnp.float32)
     cos = jnp.concatenate(
         (jnp.ones((positions.shape[0], 64)), jnp.repeat(table[:, :32], 2, axis=1)),
         axis=1,
@@ -111,6 +117,37 @@ def _attend(
         swa_bounds=bounds if non_causal else None,
         main_lengths=counts,
         compress_ratio=ratio,
+        scale=scale,
+        bq=bq,
+    )
+
+
+def _attend_swa(
+    q: jax.Array,
+    raw: jax.Array,
+    high: jax.Array | None,
+    starts: jax.Array,
+    positions: jax.Array,
+    sink: jax.Array,
+    cos_sin: jax.Array,
+    metadata: jax.Array,
+    bounds: jax.Array,
+    scale: float,
+    non_causal: bool,
+    bq: int,
+) -> jax.Array:
+    """Attention over the SWA window alone: the layers whose compress ratio is 0."""
+    return csa2(
+        q,
+        None,
+        None,
+        raw if high is None else (raw, high),
+        starts,
+        positions,
+        sink.astype(jnp.float32),
+        _inverse_rope(cos_sin, positions),
+        swa_metadata=metadata,
+        swa_bounds=bounds if non_causal else None,
         scale=scale,
         bq=bq,
     )
@@ -159,6 +196,7 @@ def _gather_attend(
         bq=bq,
         scale=scale,
         compress_ratio=ratio,
+        deep_gather=envs.TPU_DEEPSEEK_V41_CSA2_DEEP_GATHER,
     )
     return output, words, scales, counts
 
@@ -351,6 +389,12 @@ def initialize_csa2_ops() -> None:
             lambda q, *_: torch.empty_like(q),
         ),
         (
+            "attend_swa",
+            _attend_swa,
+            (P(),) * 9 + (None,) * 3,
+            lambda q, *_: torch.empty_like(q),
+        ),
+        (
             "gather_attend",
             _gather_attend,
             (P(),) * 16 + (None,) * 5,
@@ -463,6 +507,22 @@ def attention(
 
     if not q.shape[0]:
         return q
+    bq = 6 if q.shape[0] <= 384 else 16
+    if not records.shape[1]:
+        return _ops["attend_swa"](
+            q,
+            swa.raw,
+            swa.raw_hi,
+            starts.int(),
+            positions.int(),
+            sink,
+            cos_sin,
+            metadata.int(),
+            bounds.int(),
+            scale,
+            non_causal,
+            bq,
+        )
     if pages is None:
         # Already physical records: a single synthetic sequence preserves IDs.
         page_size = (
@@ -478,7 +538,6 @@ def attention(
         page_size = main.shape[1]
     assert main_starts is not None and main.scale is not None
     cache = attention_kernels._active_gathered_kv
-    bq = 6 if q.shape[0] <= 384 else 16
     layout = ("csa2", page_size)
     gathered = cache.get(main, records, layout) if cache is not None else None
     if gathered is None:
