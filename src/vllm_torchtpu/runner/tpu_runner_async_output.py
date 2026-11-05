@@ -18,6 +18,7 @@ import numpy as np
 import torch
 from vllm.v1.outputs import (
     AsyncModelRunnerOutput,
+    KVConnectorOutput,
     LogprobsLists,
     LogprobsTensors,
     ModelRunnerOutput,
@@ -228,6 +229,10 @@ class AsyncTPUModelRunnerOutput(AsyncModelRunnerOutput):
 
         self._model_runner_output.sampled_token_ids = valid_sampled_token_ids
         return self._model_runner_output
+
+    def get_kv_connector_output(self) -> KVConnectorOutput | None:
+        """Get the KV connector output for this async output."""
+        return self._model_runner_output.kv_connector_output
 
 
 def assemble_spec_next_tokens(

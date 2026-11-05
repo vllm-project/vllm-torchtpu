@@ -34,6 +34,11 @@ class TpuMultiprocExecutor(MultiprocExecutor):
         _patch_multiproc_worker_global_rank_env()
         super()._init_executor()
 
+    def _can_start_workers_concurrently(self, inherited_fds: list[int] | None) -> bool:
+        # The rank-binding patch writes each worker's binding into os.environ
+        # right before spawning it, so the starts must not overlap.
+        return False
+
     def get_kv_cache_specs(self) -> list[dict[str, KVCacheSpec]]:
         specs = super().get_kv_cache_specs()
         adopt_worker_num_gpu_blocks_override(self)

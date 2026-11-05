@@ -209,7 +209,6 @@ _DYNAMIC_COMPILE_TARGETS: list[tuple[str, str]] = [
     ),
     ("vllm.model_executor.layers.fused_moe.router.grouped_topk_router", "grouped_topk"),
     ("vllm.v1.sample.ops.logprobs", "batched_count_greater_than"),
-    ("vllm.v1.sample.ops.topk_topp_sampler", "compiled_random_sample"),
     ("vllm.utils.deep_gemm", "per_block_cast_to_fp8"),
 ]
 
@@ -1059,6 +1058,14 @@ class TpuPlatform(Platform):
         cache_config = vllm_config.cache_config
 
         is_hybrid = model_config.is_hybrid if model_config is not None else False
+        speculative_config = vllm_config.speculative_config
+        if speculative_config is not None and (
+            speculative_config.rejection_sample_method not in ("standard", "synthetic")
+        ):
+            raise NotImplementedError(
+                "TPU supports rejection_sample_method 'standard' and 'synthetic' "
+                f"(got {speculative_config.rejection_sample_method!r})."
+            )
         is_attention_free = (
             model_config.is_attention_free if model_config is not None else False
         )
@@ -1215,33 +1222,17 @@ class TpuPlatform(Platform):
 
                 parallel_config.distributed_executor_backend = TpuMultiprocExecutor
         elif multihost_backend == "ray":
-            if parallel_config.data_parallel_size > 1:
-                if pcp_size > 1:
-                    raise NotImplementedError(
-                        "Prefill context parallelism is not supported "
-                        "together with multihost data parallelism."
-                    )
-                if not vllm_envs.VLLM_USE_RAY_V2_EXECUTOR_BACKEND:
-                    raise NotImplementedError(
-                        "Multihost data parallelism requires the Ray V2 "
-                        "executor. Set VLLM_USE_RAY_V2_EXECUTOR_BACKEND=1."
-                    )
-            if vllm_envs.VLLM_USE_RAY_V2_EXECUTOR_BACKEND:
-                from vllm_torchtpu.executors.ray_distributed_executor_v2 import (
-                    RayDistributedExecutorV2,
+            if parallel_config.data_parallel_size > 1 and pcp_size > 1:
+                raise NotImplementedError(
+                    "Prefill context parallelism is not supported "
+                    "together with multihost data parallelism."
                 )
+            from vllm_torchtpu.executors.ray_distributed_executor_v2 import (
+                RayDistributedExecutorV2,
+            )
 
-                parallel_config.distributed_executor_backend = RayDistributedExecutorV2
-                logger.info(
-                    "Force using RayDistributedExecutorV2 for TPU on multihost."
-                )
-            else:
-                from vllm_torchtpu.executors.ray_distributed_executor import (
-                    RayDistributedExecutor,
-                )
-
-                parallel_config.distributed_executor_backend = RayDistributedExecutor
-                logger.info("Force using RayDistributedExecutor for TPU on multihost.")
+            parallel_config.distributed_executor_backend = RayDistributedExecutorV2
+            logger.info("Force using RayDistributedExecutorV2 for TPU on multihost.")
         else:
             logger.warning(
                 "Unknown TPU multihost backend: %s. Using uniproc_executor.",

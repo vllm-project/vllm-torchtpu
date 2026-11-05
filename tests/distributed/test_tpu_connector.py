@@ -628,8 +628,13 @@ class TestTPUConnector:
             connector._connectors = children
 
         manager = SimpleNamespace(
-            get_computed_blocks=lambda request: (("common",), 3072, 6144),
-            get_computed_blocks_for_connector=lambda request: (
+            get_computed_blocks=lambda request, max_cache_hit_length=None: (
+                ("common",),
+                3072,
+                6144,
+            ),
+            get_computed_blocks_for_connector=lambda request,
+            max_cache_hit_length=None: (
                 ("divergent",),
                 9216,
                 0,

@@ -54,10 +54,15 @@ def make_manager(
     return StructuredDecodingManager(runner)
 
 
-def make_grammar_output(req_ids: list[str], rows: list[list[int]]):
+def make_grammar_output(
+    req_ids: list[str],
+    rows: list[list[int]],
+    num_acceptable_drafts: list[int] | None = None,
+):
     return SimpleNamespace(
         structured_output_request_ids=req_ids,
         grammar_bitmask=np.array(rows, dtype=np.int32),
+        num_acceptable_drafts=num_acceptable_drafts,
     )
 
 
@@ -266,6 +271,30 @@ class TestPrepareStructuredDecodingInput:
         assert bitmask[2].tolist() == row(20)  # reqB sits at batch row 6.
         assert bitmask[3].tolist() == row(40)  # reqD sits at batch row 7.
 
+    def test_spec_config_prefill_strides_over_unused_draft_rows(self):
+        # When speculative decoding is configured, StructuredOutputManager
+        # allocates 1 + num_spec_tokens rows per request even on prefill steps
+        # where 0 draft tokens are scheduled and `prepare_structured_decoding_input`
+        # is called. Each request's bonus mask sits at `grammar_idx * mask_stride`.
+        manager = make_manager(
+            num_spec_tokens=2,
+            req_id_to_index={"req0": 0, "req1": 1, "req2": 2},
+        )
+        grammar_output = make_grammar_output(
+            ["req0", "req2"],
+            [row(10), row(99), row(99), row(20), row(99), row(99)],
+        )
+        logits = torch.zeros(4, VOCAB_SIZE)
+
+        require, bitmask, _ = manager.prepare_structured_decoding_input(
+            logits, grammar_output, cur_start_idx=0, cur_end_idx=3
+        )
+
+        assert require[:, 0].tolist() == [True, False, True, False]
+        assert bitmask[0].tolist() == row(10)
+        assert bitmask[1].tolist() == [0, 0]
+        assert bitmask[2].tolist() == row(20)
+
 
 class TestStructuredDecode:
     @pytest.mark.parametrize("vocab_size", [64, 50])
@@ -429,8 +458,8 @@ def row(value: int) -> list[int]:
 
 
 class TestPrepareSpecStructuredDecodingInput:
-    """Each structured request owns 1 + s_r consecutive
-    bitmask rows (draft + bonus)"""
+    """Each structured request owns a fixed block of 1 + num_spec_tokens
+    bitmask rows (s_r draft rows + 1 bonus row + unused tail rows)."""
 
     def test_spec_buffers_only_allocated_with_spec_config(self):
         manager = make_manager()
@@ -451,14 +480,15 @@ class TestPrepareSpecStructuredDecodingInput:
 
     def test_variable_draft_counts_single_chunk(self):
         # req0 structured, 2 drafts; req1 unstructured, 1 draft;
-        # req2 structured, 0 drafts.
+        # req2 structured, 0 drafts (plus 2 unused tail rows in its 3-row block).
         manager = make_manager(
             num_spec_tokens=2, req_id_to_index={"req0": 0, "req1": 1, "req2": 2}
         )
         grammar_output = make_grammar_output(
             ["req0", "req2"],
-            # req0: draft rows 10, 11, bonus 12; req2: bonus row 20.
-            [row(10), row(11), row(12), row(20)],
+            # req0: draft rows 10, 11, bonus 12;
+            # req2: bonus row 20 + 2 unused tail rows.
+            [row(10), row(11), row(12), row(20), row(99), row(99)],
         )
         scheduled = {"req0": [7, 8], "req1": [9]}
         draft_lengths = np.array([2, 1, 0], dtype=np.int32)
@@ -511,8 +541,9 @@ class TestPrepareSpecStructuredDecodingInput:
         )
         grammar_output = make_grammar_output(
             ["req0", "req3"],
-            # req0: draft row 10, bonus 11; req3: draft rows 30, 31, bonus 32.
-            [row(10), row(11), row(30), row(31), row(32)],
+            # req0: draft row 10, bonus 11, 1 unused tail row;
+            # req3: draft rows 30, 31, bonus 32.
+            [row(10), row(11), row(99), row(30), row(31), row(32)],
         )
         scheduled = {"req0": [1], "req2": [2], "req3": [3, 4]}
         # Chunk-local draft lengths for [req2, req3].
@@ -552,8 +583,9 @@ class TestPrepareSpecStructuredDecodingInput:
         )
         grammar_output = make_grammar_output(
             ["req0", "req1"],
-            # req0 (other chunk): drafts 10, 11, bonus 12; req1: bonus 20.
-            [row(10), row(11), row(12), row(20)],
+            # req0 (other chunk): drafts 10, 11, bonus 12;
+            # req1: bonus 20 + 2 unused tail rows.
+            [row(10), row(11), row(12), row(20), row(99), row(99)],
         )
         scheduled = {"req0": [5, 6]}
         logits = torch.zeros(2, VOCAB_SIZE)
@@ -571,14 +603,14 @@ class TestPrepareSpecStructuredDecodingInput:
         assert bonus_bitmask[0].tolist() == row(20)
 
     def test_finished_request_keeps_row_alignment(self):
-        # A request already removed from the batch still owns its 1 + s_r
-        # rows; later requests must not shift up.
+        # A request already removed from the batch still owns its
+        # 1 + num_spec_tokens rows; later requests must not shift up.
         manager = make_manager(num_spec_tokens=2, req_id_to_index={"req1": 0})
         grammar_output = make_grammar_output(
             ["req0", "req1"],
             # req0 (gone, had 2 drafts): rows 10, 11, 12; req1: draft 20,
-            # bonus 21.
-            [row(10), row(11), row(12), row(20), row(21)],
+            # bonus 21, 1 unused tail row.
+            [row(10), row(11), row(12), row(20), row(21), row(99)],
         )
         scheduled = {"req0": [1, 2], "req1": [3]}
         draft_lengths = np.array([1], dtype=np.int32)
@@ -719,7 +751,10 @@ class TestMaskLogitsWithTrace:
         ), f"SD:MaskSpecLogits not found in {events}"
 
         # 3. TraceAnnotation verification when target_logits is None (non-draft chunk).
-        grammar_output_none = make_grammar_output(["req0"], [[ALLOW_ALL, BLOCK_ALL]])
+        # The scheduler still sends the request's full 1 + K row block.
+        grammar_output_none = make_grammar_output(
+            ["req0"], [[ALLOW_ALL, BLOCK_ALL], [ALLOW_ALL, ALLOW_ALL]]
+        )
         with capture_trace() as prof_none:
             manager.mask_spec_logits(
                 None, bonus_logits, grammar_output_none, {}, None, 0, 1
@@ -730,3 +765,122 @@ class TestMaskLogitsWithTrace:
             in name
             for name in events_none
         ), f"SD:PrepareSpecInput (target=None) not found in {events_none}"
+
+
+class TestMaskInvalidDraftTokens:
+    @pytest.fixture(autouse=True)
+    def _run_pinning_eagerly(self):
+        with torch.compiler.set_stance("force_eager"):
+            yield
+
+    def test_fast_path_when_all_drafts_acceptable(self):
+        manager = make_manager(
+            num_spec_tokens=3, req_id_to_index={"req0": 0, "req1": 1}
+        )
+        grammar_output = make_grammar_output(
+            ["req0"],
+            [[ALLOW_ALL, ALLOW_ALL]] * 4,
+            num_acceptable_drafts=[3],
+        )
+        draft_token_ids = torch.tensor([10, 11, 12, 20, 21, 0, 0, 0], dtype=torch.int32)
+        draft_lengths_cpu = np.array([3, 2], dtype=np.int32)
+
+        out = manager.mask_invalid_draft_tokens(
+            draft_token_ids,
+            grammar_output,
+            cur_start_idx=0,
+            cur_end_idx=2,
+            draft_lengths_cpu=draft_lengths_cpu,
+        )
+        assert out is draft_token_ids
+
+    def test_masks_drafts_beyond_num_acceptable_with_draft_lengths_cpu(self):
+        manager = make_manager(
+            num_spec_tokens=3, req_id_to_index={"req0": 0, "req1": 1}
+        )
+        grammar_output = make_grammar_output(
+            ["req0"],
+            [[ALLOW_ALL, ALLOW_ALL]] * 4,
+            num_acceptable_drafts=[1],
+        )
+        # req0 has 3 drafts [10, 11, 12] (only 1 acceptable -> [10, -1, -1]);
+        # req1 is unstructured with 2 drafts [20, 21] (unchanged);
+        # the trailing 3 slots are padding past the drafts (unchanged).
+        draft_token_ids = torch.tensor([10, 11, 12, 20, 21, 0, 0, 0], dtype=torch.int32)
+        draft_lengths_cpu = np.array([3, 2], dtype=np.int32)
+
+        out = manager.mask_invalid_draft_tokens(
+            draft_token_ids,
+            grammar_output,
+            cur_start_idx=0,
+            cur_end_idx=2,
+            draft_lengths_cpu=draft_lengths_cpu,
+        )
+        assert out.tolist() == [10, -1, -1, 20, 21, 0, 0, 0]
+
+    def test_masks_every_structured_request_and_leaves_padding(self):
+        manager = make_manager(
+            num_spec_tokens=3, req_id_to_index={"req0": 0, "req1": 1}
+        )
+        grammar_output = make_grammar_output(
+            ["req0", "req1"],
+            [[ALLOW_ALL, ALLOW_ALL]] * 8,
+            num_acceptable_drafts=[2, 0],
+        )
+        # The trailing 3 slots are padding past the drafts and stay untouched.
+        draft_token_ids = torch.tensor([10, 11, 12, 20, 21, 0, 0, 0], dtype=torch.int32)
+        draft_lengths_cpu = np.array([3, 2], dtype=np.int32)
+
+        out = manager.mask_invalid_draft_tokens(
+            draft_token_ids,
+            grammar_output,
+            cur_start_idx=0,
+            cur_end_idx=2,
+            draft_lengths_cpu=draft_lengths_cpu,
+        )
+        assert out.tolist() == [10, 11, -1, -1, -1, 0, 0, 0]
+
+    def test_none_num_acceptable_drafts_invalidates_all_structured_drafts(self):
+        manager = make_manager(
+            num_spec_tokens=2, req_id_to_index={"req0": 0, "req1": 1}
+        )
+        grammar_output = make_grammar_output(
+            ["req1"],
+            [[ALLOW_ALL, ALLOW_ALL]] * 3,
+            num_acceptable_drafts=None,
+        )
+        draft_token_ids = torch.tensor([10, 11, 20, 21], dtype=torch.int32)
+        draft_lengths_cpu = np.array([2, 2], dtype=np.int32)
+
+        out = manager.mask_invalid_draft_tokens(
+            draft_token_ids,
+            grammar_output,
+            cur_start_idx=0,
+            cur_end_idx=2,
+            draft_lengths_cpu=draft_lengths_cpu,
+        )
+        assert out.tolist() == [10, 11, -1, -1]
+
+    def test_chunk_offset_filters_requests_to_current_chunk(self):
+        manager = make_manager(
+            num_spec_tokens=2,
+            req_id_to_index={"req0": 0, "req1": 1, "req2": 2, "req3": 3},
+        )
+        grammar_output = make_grammar_output(
+            ["req0", "req3"],
+            [[ALLOW_ALL, ALLOW_ALL]] * 6,
+            num_acceptable_drafts=[0, 1],
+        )
+        # Chunk covers [2, 4) -> local 0 is req2 (unstructured, 1 draft),
+        # local 1 is req3 (structured, 2 drafts, 1 acceptable).
+        draft_token_ids = torch.tensor([20, 30, 31, 0], dtype=torch.int32)
+        draft_lengths_cpu = np.array([1, 2], dtype=np.int32)
+
+        out = manager.mask_invalid_draft_tokens(
+            draft_token_ids,
+            grammar_output,
+            cur_start_idx=2,
+            cur_end_idx=4,
+            draft_lengths_cpu=draft_lengths_cpu,
+        )
+        assert out.tolist() == [20, 30, -1, 0]
