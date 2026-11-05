@@ -11,16 +11,15 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Shared ring topology, barrier semaphore, and VMEM scratch utilities for small collectives.
-"""
+"""Shared ring topology, barrier semaphore, and VMEM scratch utilities."""
+
+import contextlib
 
 import jax
 import jax.numpy as jnp
 from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
-
-import contextlib
 
 LANES = 128
 MESH = pl.DeviceIdType.MESH
@@ -117,6 +116,18 @@ def sum_slots(slots, n):
     for j in range(1, n):
         acc = acc + slots[j].astype(jnp.float32)
     return acc
+
+
+def normalize_rank_of_core(rank_of_core, n: int) -> tuple[int, ...]:
+    """Validate ``rank_of_core`` as a permutation of ``0..n - 1``."""
+    if rank_of_core is None:
+        return tuple(range(n))
+    order = tuple(int(r) for r in rank_of_core)
+    if len(order) != n or sorted(order) != list(range(n)):
+        raise ValueError(
+            f"rank_of_core {order} must be a permutation of 0..{n - 1}"
+        )
+    return order
 
 
 def call(kernel, x, out_rows, rank, scratch, collective_id, name):

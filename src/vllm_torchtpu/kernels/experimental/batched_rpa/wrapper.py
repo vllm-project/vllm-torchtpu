@@ -372,7 +372,10 @@ def calculate_block_sizes(
             # compute tiles are live for one batch item at a time.
             total_bytes = buffer_bytes * batch_size + compute_bytes
             bq_c_sz = pick_bq_c_sz(batch_size, bq_sz, bkv_sz)
-            if bq_c_sz < bq_sz:
+            if (
+                bq_c_sz < bq_sz
+                or serve_cfgs.kv_layout != configs.KVLayout.SEQ_ALONG_LANE
+            ):
                 # Every q sub-chunk's QK and PV matmuls read the K and V tiles
                 # of all lanes, stacked, so Mosaic keeps them in register
                 # allocator spill slots across the sub-chunk loop, with one
@@ -453,7 +456,10 @@ def calculate_block_sizes(
         # Even if we loose some potential performance, we want to avoid OOM at all
         # costs. For decode, active compute tiles are not replicated across
         # batch_size, allowing a 0.85 VMEM cap so bkv_sz reaches 4096 (32 pages).
-        decode_vmem_frac = 0.85 if kv_bytes == 1 else 0.75
+        if serve_cfgs.kv_layout == configs.KVLayout.SEQ_ALONG_LANE:
+            decode_vmem_frac = 0.85 if kv_bytes == 1 else 0.75
+        else:
+            decode_vmem_frac = 0.65
         capped_vmem_limit_bytes = vmem_limit_bytes * (
             decode_vmem_frac if is_decode else 0.8
         )

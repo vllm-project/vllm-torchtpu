@@ -301,7 +301,7 @@ elif os.environ.get("TPU_RAIDEN_JOB_NAME", "").strip().lower() == "decode":
 else:
     if "USE_MOE_FUSED_EP_KERNEL" not in os.environ:
         _set_env("USE_MOE_FUSED_EP_KERNEL", "1")
-    if os.environ.get("TPU_MOE_FUSED_EP_STEP_MIN_TOKENS") in (None, "", "33"):
+    if os.environ.get("TPU_MOE_FUSED_EP_STEP_MIN_TOKENS") in (None, ""):
         _set_env("TPU_MOE_FUSED_EP_STEP_MIN_TOKENS", "64")
 
 

@@ -26,10 +26,12 @@ from vllm_torchtpu.distributed.ep_mesh import (
     EP_AXIS_NAME,
     build_ep_mesh,
     ep_mesh_index,
+    ep_rank_order,
     get_ep_group,
 )
 from vllm_torchtpu.distributed.sharded_jax_op import sharded_jax_op
 from vllm_torchtpu.kernels.experimental.small_collectives import (
+    all_gather,
     all_reduce,
     reduce_scatter,
 )
@@ -48,9 +50,14 @@ MAX_ROWS = envs.TPU_SMALL_ALL_REDUCE_MAX_ROWS
 # relies on XLA lowering psum_scatter to a full all-reduce when rows per engine
 # is not a multiple of 16, which depends on libtpu: re-measure on a bump.
 COMBINE_MAX_ROWS = 40
+# Largest DP dispatch, in rows per engine, the fused all-gather pair takes:
+# bounds VMEM scratch (2 x 8 x rows x width) and stays in the latency-bound
+# small-batch regime where a single-hop push beats two XLA ring all-gathers.
+DISPATCH_MAX_ROWS = 64
 
 _AR_OP = None
 _RS_OP = None
+_AG_OP = None
 # The TP all-reduce over a TP group that is a sub-group of the mesh (DP x TP
 # engines): the kernel over the "tp" axis of a (dp, tp) view of the mesh, this
 # core's TP index as data, and the TP group's ranks it serves.
@@ -119,7 +126,9 @@ def _build_tp_all_reduce(mesh, tp: int, form: str | None):
     from jax.sharding import Mesh
 
     n = mesh.shape[EP_AXIS_NAME]
-    mesh2 = Mesh(np.asarray(mesh.devices).reshape(n // tp, tp), axis_names=("dp_", "tp_"))
+    mesh2 = Mesh(
+        np.asarray(mesh.devices).reshape(n // tp, tp), axis_names=("dp_", "tp_")
+    )
     spec = PartitionSpec(("dp_", "tp_"))
 
     def body(block, rank):
@@ -156,27 +165,30 @@ def _tp_pairs_match_mesh(mesh_index: int, tp: int) -> bool:
     import torch.distributed as dist
     from vllm.distributed.parallel_state import get_tp_group
 
-    from vllm_torchtpu.distributed.ep_mesh import ep_rank_order
-
     order = ep_rank_order()
+    group = get_ep_group()
+    ep_ranks = tuple(int(r) for r in group.ranks)
     tp_ranks = tuple(int(r) for r in get_tp_group().ranks)
     block = mesh_index - mesh_index % tp
     mine = order is not None and len(tp_ranks) == tp and all(
-        order[block + j] in tp_ranks for j in range(tp)
+        ep_ranks[order[block + j]] in tp_ranks for j in range(tp)
     )
-    group = get_ep_group()
     verdicts = [None] * group.world_size
     dist.all_gather_object(verdicts, bool(mine), group=group.cpu_group)
     return all(verdicts)
 
 
-def _build_reduce_scatter(mesh):
+def _build_reduce_scatter(mesh, rank_of_core: tuple[int, ...] | None = None):
     n = mesh.shape[EP_AXIS_NAME]
     spec = PartitionSpec(EP_AXIS_NAME)
 
     def body(block, rank):
         return reduce_scatter.small_reduce_scatter(
-            block, num_cores=n, axis=EP_AXIS_NAME, rank=rank
+            block,
+            num_cores=n,
+            axis=EP_AXIS_NAME,
+            rank=rank,
+            rank_of_core=rank_of_core,
         )
 
     def fn(x: jax.Array, rank: jax.Array) -> jax.Array:
@@ -197,10 +209,54 @@ def _build_reduce_scatter(mesh):
     )
 
 
+def _build_all_gather_pair(mesh, rank_of_core: tuple[int, ...] | None = None):
+    """The data-parallel MoE dispatch: each rank's ([rows, hidden],
+    [rows, num_experts]) -> ([n * rows, hidden], [n * rows, num_experts])
+    with block r = rank r's rows."""
+    n = mesh.shape[EP_AXIS_NAME]
+    spec = PartitionSpec(EP_AXIS_NAME)
+
+    def body(x, logits, rank):
+        return all_gather.small_all_gather_pair(
+            x,
+            logits,
+            num_cores=n,
+            axis=EP_AXIS_NAME,
+            rank=rank,
+            rank_of_core=rank_of_core,
+        )
+
+    def fn(
+        x: jax.Array, logits: jax.Array, rank: jax.Array
+    ) -> tuple[jax.Array, jax.Array]:
+        return jax.shard_map(
+            body,
+            mesh=mesh,
+            in_specs=(spec, spec, spec),
+            out_specs=(spec, spec),
+            check_vma=False,
+        )(x, logits, rank)
+
+    def fake(x, logits, rank):
+        return (
+            x.new_empty((n * x.shape[0], x.shape[1])),
+            logits.new_empty((n * logits.shape[0], logits.shape[1])),
+        )
+
+    return sharded_jax_op(
+        "pallas::small_all_gather_pair",
+        fn,
+        mesh=mesh,
+        input_partition_specs=(spec, spec, spec),
+        output_partition_specs=(spec, spec),
+        fake=fake,
+    )
+
+
 def prebuild() -> None:
     """Build the ops and this core's rank tensor, outside any traced region:
     the mesh comes from a collective. A no-op unless TPU_SMALL_ALL_REDUCE."""
-    global _AR_OP, _RS_OP, _RANK, _CORES, _MESH_RANKS, _DP_COMBINE, MAX_ROWS
+    global _AR_OP, _RS_OP, _AG_OP, _RANK, _CORES, _MESH_RANKS, _DP_COMBINE, MAX_ROWS
     global _AR_TP_OP, _TP_RANK, _TP_RANKS
     MAX_ROWS = envs.TPU_SMALL_ALL_REDUCE_MAX_ROWS
     if not envs.TPU_SMALL_ALL_REDUCE or _AR_OP is not None:
@@ -217,10 +273,12 @@ def prebuild() -> None:
     _CORES = mesh.shape[EP_AXIS_NAME]
     _MESH_RANKS = tuple(int(r) for r in get_ep_group().ranks)
     _RANK = torch.tensor([ep_mesh_index()], dtype=torch.int32, device="tpu")
+    order = ep_rank_order()
     _AR_OP = _build_all_reduce(mesh)
-    _RS_OP = _build_reduce_scatter(mesh)
-    # The mesh is rank-ordered (ep_mesh.build_ep_mesh), so when the DP group
-    # is the mesh, DP rank r's rows go to mesh core r.
+    _RS_OP = _build_reduce_scatter(mesh, order)
+    _AG_OP = _build_all_gather_pair(mesh, order)
+    # Rows are in DP-rank order while mesh cores sit in device-id order; both
+    # DP kernels map mesh core c to DP rank ep_rank_order()[c] when DP == EP.
     _DP_COMBINE = tuple(int(r) for r in get_dp_group().ranks) == _MESH_RANKS
     tp_all_reduce = tuple(int(r) for r in get_tp_group().ranks) == _MESH_RANKS
     tp = int(get_tp_group().world_size)
@@ -243,11 +301,12 @@ def prebuild() -> None:
         )
     logger.info(
         "Small collectives armed | cores=%d | max_rows=%d | "
-        "combine_max_rows=%d | one_shot_max_bytes=%d | tp_all_reduce=%s | "
-        "dp_combine=%s | tp_pair_all_reduce=%s",
+        "combine_max_rows=%d | dispatch_max_rows=%d | one_shot_max_bytes=%d | "
+        "tp_all_reduce=%s | dp_combine=%s | tp_pair_all_reduce=%s",
         _CORES,
         MAX_ROWS,
         COMBINE_MAX_ROWS,
+        min(MAX_ROWS, DISPATCH_MAX_ROWS),
         all_reduce.ONE_SHOT_MAX_BYTES,
         tp_all_reduce,
         _DP_COMBINE,
@@ -306,3 +365,33 @@ def dp_combine_or(x: torch.Tensor, fallback) -> torch.Tensor:
     if x.shape[0] <= _CORES * COMBINE_MAX_ROWS:
         return _RS_OP(x, _RANK)
     return retain(fallback(x))
+
+
+def _fits_dispatch(x: torch.Tensor, router_logits: torch.Tensor) -> bool:
+    """Static checks: whether this DP dispatch call site can take the kernel."""
+    return (
+        torch.compiler.is_compiling()
+        and shape_variants.in_warmup()
+        and x.dim() == 2
+        and router_logits.dim() == 2
+        and x.shape[0] == router_logits.shape[0]
+        and x.dtype == torch.bfloat16
+        and router_logits.dtype in (torch.bfloat16, torch.float32)
+        and x.shape[1] % LANES == 0
+        and router_logits.shape[1] % LANES == 0
+    )
+
+
+def dp_dispatch_or(
+    x: torch.Tensor, router_logits: torch.Tensor, fallback
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """The DP MoE dispatch of ``(x, router_logits)`` ([rows, hidden] and
+    [rows, num_experts] -> [dp * rows, ...], block r for DP rank r): the fused
+    kernel for a small block when the DP group is the mesh,
+    ``fallback(x, router_logits)`` otherwise."""
+    if _AG_OP is None or not _DP_COMBINE or not _fits_dispatch(x, router_logits):
+        return fallback(x, router_logits)
+    if x.shape[0] <= min(MAX_ROWS, DISPATCH_MAX_ROWS):
+        return _AG_OP(x, router_logits, _RANK)
+    out_x, out_logits = fallback(x, router_logits)
+    return retain(out_x), out_logits
