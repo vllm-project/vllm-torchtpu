@@ -28,7 +28,8 @@ _UPSTREAM = gemma4.gemma4_routing_function_torch
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize("num_tokens", [1, 16, 1000])
-def test_matches_upstream_routing(dtype, num_tokens):
+def test_matches_upstream_routing(monkeypatch, dtype, num_tokens):
+    monkeypatch.setattr(gemma4_routing_patch, "_ROUTER_TOPK_KERNEL", False)
     gen = torch.Generator().manual_seed(num_tokens)
     logits = (torch.randn(num_tokens, 128, generator=gen) * 3).to(dtype)
     scale = (torch.rand(128, generator=gen) + 0.5).to(torch.bfloat16)
@@ -63,3 +64,27 @@ def test_patch_installs_only_when_enabled_for_gemma4(monkeypatch):
     assert patch(_config("gemma4_text")) is None
     routed = gemma4.gemma4_routing_function_torch
     assert routed is gemma4_routing_patch.gemma4_topk_softmax_routing
+
+
+def test_router_topk_kernel_branch_matches_the_sort(monkeypatch):
+    """TPU_GEMMA4_ROUTER_TOPK_KERNEL: the scaled select (its CPU reference
+    here) gives the sort branch's ids and weights."""
+    from vllm_torchtpu.layers.adapter.router_topk import rowmax_select_scaled
+
+    gen = torch.Generator().manual_seed(7)
+    logits = torch.randn(64, 128, generator=gen) * 3
+    scale = (torch.rand(128, generator=gen) + 0.5).to(torch.bfloat16)
+    monkeypatch.setattr(gemma4_routing_patch, "_ROUTER_TOPK_KERNEL", False)
+    ref_w, ref_ids = gemma4_routing_patch.gemma4_topk_softmax_routing(logits, 8, scale)
+    monkeypatch.setattr(gemma4_routing_patch, "_ROUTER_TOPK_KERNEL", True)
+    monkeypatch.setattr(gemma4_routing_patch, "_select_scaled", rowmax_select_scaled)
+    new_w, new_ids = gemma4_routing_patch.gemma4_topk_softmax_routing(logits, 8, scale)
+    torch.testing.assert_close(new_ids, ref_ids, rtol=0, atol=0)
+    torch.testing.assert_close(new_w, ref_w, rtol=1e-6, atol=1e-6)
+
+
+def test_router_topk_kernel_needs_topk_softmax_routing(monkeypatch):
+    monkeypatch.setenv("TPU_GEMMA4_TOPK_SOFTMAX_ROUTING", "0")
+    monkeypatch.setenv("TPU_GEMMA4_ROUTER_TOPK_KERNEL", "1")
+    with pytest.raises(ValueError, match="TPU_GEMMA4_TOPK_SOFTMAX_ROUTING"):
+        gemma4_routing_patch.maybe_patch_gemma4_routing(_config("gemma4_text"))

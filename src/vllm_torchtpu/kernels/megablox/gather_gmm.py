@@ -123,6 +123,20 @@ def _quantize_rows(block: jax.Array) -> tuple[jax.Array, jax.Array]:
     return scaled.astype(FP8), scale
 
 
+def _quantize_pack_token_kernel(x_ref, o_ref, *, s, tt):
+    x = x_ref[...].astype(jnp.float32)
+    scale = jnp.max(jnp.abs(x), axis=1, keepdims=True) / _FP8_MAX
+    xs = jnp.clip(x * jnp.where(scale == 0, 0, 1 / scale), -_FP8_MAX, _FP8_MAX)
+    for j in range(s):
+        lo = xs[:, PACKED_COLUMNS * j : PACKED_COLUMNS * j + LANES]
+        hi = xs[:, PACKED_COLUMNS * j + LANES : PACKED_COLUMNS * (j + 1)]
+        o_ref[pl.ds(j, tt, stride=s + 1), :] = _pack_lane_block(lo, hi)
+    # The row's F32 scale in every lane of its last sublane.
+    o_ref[pl.ds(s, tt, stride=s + 1), :] = jnp.broadcast_to(
+        pltpu.bitcast(scale, jnp.uint32), (tt, LANES)
+    )
+
+
 def _quantize_pack_kernel(x_ref, o_ref, *, s, tt, hidden):
     scaled, scales = [], []
     for k0 in range(0, hidden, QUANT_BLOCK):
@@ -145,15 +159,21 @@ def _quantize_pack_kernel(x_ref, o_ref, *, s, tt, hidden):
     o_ref[pl.ds(s, tt, stride=s + 1), :] = words
 
 
-@functools.partial(jax.jit, static_argnames=("tile_tokens", "interpret"))
+@functools.partial(jax.jit, static_argnames=("tile_tokens", "per_token", "interpret"))
 def quantize_pack_rows(
-    x: jax.Array, *, tile_tokens: int = 256, interpret: bool = False
+    x: jax.Array,
+    *,
+    tile_tokens: int = 256,
+    per_token: bool = False,
+    interpret: bool = False,
 ) -> jax.Array:
     """BF16 ``[n, hidden]`` -> the expert kernel's rows, uint32 ``[n * (S + 1), 128]``.
 
     Sublanes ``[0, S)`` of a row hold ``bf16(x * scale_inv)`` per 512-column
     block in the packed form; lane ``b`` of sublane ``S`` holds block ``b``'s
-    BF16 scale as F32 bits.
+    BF16 scale as F32 bits. With ``per_token`` the row has one F32 scale
+    (its absolute maximum / the FP8 maximum, in every lane of sublane ``S``),
+    for ``gather_fused_moe_v2(per_token=True)``.
     """
     n, h = x.shape
     s = packed_sublanes(h)
@@ -164,14 +184,19 @@ def quantize_pack_rows(
     if tile % 8:
         raise ValueError(f"gcd({n=}, {tile_tokens=}) = {tile} is not a multiple of 8")
     tile_tokens = tile
+    if per_token:
+        kernel = functools.partial(_quantize_pack_token_kernel, s=s, tt=tile_tokens)
+    else:
+        kernel = functools.partial(_quantize_pack_kernel, s=s, tt=tile_tokens, hidden=h)
     return pl.pallas_call(
-        functools.partial(_quantize_pack_kernel, s=s, tt=tile_tokens, hidden=h),
+        kernel,
         out_shape=jax.ShapeDtypeStruct((n * (s + 1), LANES), jnp.uint32),
         grid=(n // tile_tokens,),
         in_specs=[pl.BlockSpec((tile_tokens, h), lambda i: (i, 0))],
         out_specs=pl.BlockSpec((tile_tokens * (s + 1), LANES), lambda i: (i, 0)),
         compiler_params=pltpu.CompilerParams(dimension_semantics=("parallel",)),
-        name=f"quantize_pack_rows-h_{h}-tt_{tile_tokens}",
+        name=f"quantize_pack_rows-h_{h}-tt_{tile_tokens}"
+        + ("-token" if per_token else ""),
         interpret=pltpu.InterpretParams() if interpret else False,
     )(x)
 
@@ -214,6 +239,7 @@ class FusedMoeConfig:
     act: str
     mxu_cols: int
     issue_group: int
+    per_token: bool = False  # gather_fused_moe_v2's per-row activation scales
 
     @property
     def sublanes(self) -> int:
@@ -222,6 +248,116 @@ class FusedMoeConfig:
     @property
     def x_sublanes(self) -> int:
         return self.sublanes + 1
+
+
+def _gate_up_block_scales(lane_block, weights, cfg: FusedMoeConfig, height: int):
+    """gate_up of ``height`` rows as gmm_v2 computes it: per 512-column block,
+    the FP8 cast of the stored bf16(x * scale_inv), then BF16 accumulation of
+    the dequantized block products. ``lane_block(j)`` reads packed sublane j
+    of the rows (sublane S holds the block scales)."""
+    w1, w1s, _, _ = weights
+    scale_words = lane_block(cfg.sublanes)
+    n1 = 2 * cfg.inter_size
+    acc = [
+        jnp.zeros((height, cfg.mxu_cols), jnp.bfloat16)
+        for _ in range(n1 // cfg.mxu_cols)
+    ]
+    for k0 in range(0, cfg.hidden_size, QUANT_BLOCK):
+        k1 = min(cfg.hidden_size, k0 + QUANT_BLOCK)
+        cols = []
+        for j in range(k0 // PACKED_COLUMNS, k1 // PACKED_COLUMNS):
+            cols.extend(_unpack_lane_block(lane_block(j)))
+        block_q = jnp.concatenate(cols, axis=1).astype(jnp.bfloat16).astype(FP8)
+        b = k0 // QUANT_BLOCK
+        block_scale = pltpu.bitcast(scale_words[:, b : b + 1], jnp.float32)
+        block_scale = block_scale.astype(jnp.bfloat16)
+        for n, n0 in enumerate(range(0, n1, cfg.mxu_cols)):
+            prod = jnp.dot(
+                block_q,
+                w1[k0:k1, n0 : n0 + cfg.mxu_cols],
+                preferred_element_type=jnp.float32,
+            ).astype(jnp.bfloat16)
+            prod *= block_scale
+            prod *= w1s[:, n0 : n0 + cfg.mxu_cols].astype(jnp.bfloat16)
+            acc[n] += prod
+    return jnp.concatenate(acc, axis=1)
+
+
+def _down_block_scales(gate_up, weights, cfg: FusedMoeConfig, height: int):
+    """The activation and down projection as gmm_v2 computes them (per
+    512-column block of the intermediate): yields ``(j, words)``, the packed
+    output sublane j of the rows."""
+    _, _, w2, w2s = weights
+    mid = apply_gated_act(
+        gate_up[:, : cfg.inter_size], gate_up[:, cfg.inter_size :], cfg.act
+    )
+    mid_blocks = []
+    for k0 in range(0, cfg.inter_size, QUANT_BLOCK):
+        k1 = min(cfg.inter_size, k0 + QUANT_BLOCK)
+        mid_q, mid_scale = _quantize_rows(mid[:, k0:k1])
+        mid_blocks.append((k0, k1, mid_q, mid_scale.astype(jnp.bfloat16)))
+    for j in range(cfg.sublanes):
+        n0 = j * PACKED_COLUMNS
+        halves = []
+        for h0 in range(n0, n0 + PACKED_COLUMNS, cfg.mxu_cols):
+            down_acc = jnp.zeros((height, cfg.mxu_cols), jnp.bfloat16)
+            for k0, k1, mid_q, mid_scale in mid_blocks:
+                prod = jnp.dot(
+                    mid_q,
+                    w2[k0:k1, h0 : h0 + cfg.mxu_cols],
+                    preferred_element_type=jnp.float32,
+                ).astype(jnp.bfloat16)
+                prod *= mid_scale
+                prod *= w2s[:, h0 : h0 + cfg.mxu_cols].astype(jnp.bfloat16)
+                down_acc += prod
+            halves.append(down_acc)
+        down = jnp.concatenate(halves, axis=1)
+        yield j, _pack_lane_block(down[:, :LANES], down[:, LANES:])
+
+
+def _gate_up_token_scales(lane_block, weights, cfg: FusedMoeConfig, height: int):
+    """gate_up with one activation scale per row, as quantize_pack_rows'
+    ``per_token`` rows carry it: the MXU accumulates each output column over
+    the whole hidden size in F32, dequantized once by the row's and the
+    column's scale."""
+    del height
+    w1, w1s, _, _ = weights
+    row_scale = pltpu.bitcast(lane_block(cfg.sublanes)[:, :1], jnp.float32)
+    cols = []
+    for j in range(cfg.sublanes):
+        cols.extend(_unpack_lane_block(lane_block(j)))
+    x_q = jnp.concatenate(cols, axis=1).astype(jnp.bfloat16).astype(FP8)
+    out = []
+    for n0 in range(0, 2 * cfg.inter_size, cfg.mxu_cols):
+        acc = jnp.dot(
+            x_q, w1[:, n0 : n0 + cfg.mxu_cols], preferred_element_type=jnp.float32
+        )
+        scaled = acc * row_scale * w1s[:, n0 : n0 + cfg.mxu_cols]
+        out.append(scaled.astype(jnp.bfloat16))
+    return jnp.concatenate(out, axis=1)
+
+
+def _down_token_scales(gate_up, weights, cfg: FusedMoeConfig, height: int):
+    """The activation, quantized with one scale per row, and the down
+    projection with F32 accumulation over the whole intermediate: yields
+    ``(j, words)``, the packed output sublane j of the rows."""
+    del height
+    _, _, w2, w2s = weights
+    mid = apply_gated_act(
+        gate_up[:, : cfg.inter_size], gate_up[:, cfg.inter_size :], cfg.act
+    )
+    amax = jnp.max(jnp.abs(mid), axis=1, keepdims=True).astype(jnp.float32)
+    scale = amax / _FP8_MAX
+    scale_inv = jnp.where(scale == 0, 0, 1 / scale)
+    mid_q = jnp.clip(mid * scale_inv.astype(jnp.bfloat16), -_FP8_MAX, _FP8_MAX)
+    mid_q = mid_q.astype(FP8)
+    for j in range(cfg.sublanes):
+        n0 = j * PACKED_COLUMNS
+        acc = jnp.dot(
+            mid_q, w2[:, n0 : n0 + PACKED_COLUMNS], preferred_element_type=jnp.float32
+        )
+        down = acc * scale * w2s[:, n0 : n0 + PACKED_COLUMNS]
+        yield j, _pack_lane_block(down[:, :LANES], down[:, LANES:])
 
 
 def _fill_tiles(gs_ref, m_expert, m_start, m_count, m_visit, v_expert, *, cfg):
@@ -369,65 +505,10 @@ def _fused_moe_kernel(
         def lane_block(j):
             return x_vm[slot, pl.ds(j, height, stride=sx), :]
 
-        scale_words = lane_block(s)
-        # gate_up: per 512-column block, the FP8 cast of the stored
-        # bf16(x * scale_inv) as gmm_v2 does, then BF16 accumulation of the
-        # dequantized block products.
-        n1 = 2 * cfg.inter_size
-        acc = [
-            jnp.zeros((height, cfg.mxu_cols), jnp.bfloat16)
-            for _ in range(n1 // cfg.mxu_cols)
-        ]
-        for k0 in range(0, cfg.hidden_size, QUANT_BLOCK):
-            k1 = min(cfg.hidden_size, k0 + QUANT_BLOCK)
-            cols = []
-            for j in range(k0 // PACKED_COLUMNS, k1 // PACKED_COLUMNS):
-                cols.extend(_unpack_lane_block(lane_block(j)))
-            block_q = jnp.concatenate(cols, axis=1).astype(jnp.bfloat16).astype(FP8)
-            b = k0 // QUANT_BLOCK
-            block_scale = pltpu.bitcast(scale_words[:, b : b + 1], jnp.float32)
-            block_scale = block_scale.astype(jnp.bfloat16)
-            for n, n0 in enumerate(range(0, n1, cfg.mxu_cols)):
-                prod = jnp.dot(
-                    block_q,
-                    w1_vm[wslot, k0:k1, n0 : n0 + cfg.mxu_cols],
-                    preferred_element_type=jnp.float32,
-                ).astype(jnp.bfloat16)
-                prod *= block_scale
-                prod *= w1s_vm[wslot, :, n0 : n0 + cfg.mxu_cols].astype(jnp.bfloat16)
-                acc[n] += prod
-        gate_up = jnp.concatenate(acc, axis=1)
-        mid = apply_gated_act(
-            gate_up[:, : cfg.inter_size], gate_up[:, cfg.inter_size :], cfg.act
-        )
-
-        # down: per 512-column block of the intermediate, as gmm_v2 does.
-        mid_blocks = []
-        for k0 in range(0, cfg.inter_size, QUANT_BLOCK):
-            k1 = min(cfg.inter_size, k0 + QUANT_BLOCK)
-            mid_q, mid_scale = _quantize_rows(mid[:, k0:k1])
-            mid_blocks.append((k0, k1, mid_q, mid_scale.astype(jnp.bfloat16)))
-        for j in range(s):
-            n0 = j * PACKED_COLUMNS
-            halves = []
-            for h0 in range(n0, n0 + PACKED_COLUMNS, cfg.mxu_cols):
-                down_acc = jnp.zeros((height, cfg.mxu_cols), jnp.bfloat16)
-                for k0, k1, mid_q, mid_scale in mid_blocks:
-                    prod = jnp.dot(
-                        mid_q,
-                        w2_vm[wslot, k0:k1, h0 : h0 + cfg.mxu_cols],
-                        preferred_element_type=jnp.float32,
-                    ).astype(jnp.bfloat16)
-                    prod *= mid_scale
-                    prod *= w2s_vm[wslot, :, h0 : h0 + cfg.mxu_cols].astype(
-                        jnp.bfloat16
-                    )
-                    down_acc += prod
-                halves.append(down_acc)
-            down = jnp.concatenate(halves, axis=1)
-            y_vm[slot, pl.ds(j, height, stride=s), :] = _pack_lane_block(
-                down[:, :LANES], down[:, LANES:]
-            )
+        weights = (w1_vm.at[wslot], w1s_vm.at[wslot], w2_vm.at[wslot], w2s_vm.at[wslot])
+        gate_up = _gate_up_block_scales(lane_block, weights, cfg, height)
+        for j, words in _down_block_scales(gate_up, weights, cfg, height):
+            y_vm[slot, pl.ds(j, height, stride=s), :] = words
 
     def tile_loop(i, carry):
         slot = i % 2
@@ -590,6 +671,369 @@ def gather_fused_moe(
     )(group_sizes.astype(jnp.int32), tok, x_packed, w1, w1_scale, w2, w2_scale)
 
 
+# ------------------------------------------------------------ expert kernel v2
+
+# gather_fused_moe_v2's x row slots: the tile in compute, the next one
+# landing, and the one after it, whose row DMAs the compute starts.
+_V2_ROW_SLOTS = 3
+# A tile of at least twice this many rows is computed as two independent row
+# chains, so one chain's activation and epilogues overlap the other's matmuls.
+_V2_CHAIN_ROWS = 192
+
+
+def gather_fused_moe_v2_vmem_bytes(
+    hidden: int, inter: int, tile_m: int = DEFAULT_TILE_M
+) -> int:
+    """Upper estimate of the VMEM gather_fused_moe_v2 compiles into: that of
+    gather_fused_moe plus its third x row slot."""
+    row_slot = tile_m * (packed_sublanes(hidden) + 1) * LANES * 4
+    return gather_fused_moe_vmem_bytes(hidden, inter, tile_m) + row_slot
+
+
+def _fused_moe_v2_kernel(
+    gs_ref,  # SMEM int32 [E] (scalar prefetch)
+    tok_hbm,  # int32 [rows + tile_m + 128]: token id of each expert-sorted row
+    x_hbm,  # uint32 [tokens * (S + 1), 128] quantize_pack_rows rows
+    w1_hbm,  # fp8 [E, H, 2I] gate | up
+    w1s_hbm,  # f32 [E, 1, 2I]
+    w2_hbm,  # fp8 [E, I, H]
+    w2s_hbm,  # f32 [E, 1, H]
+    y_hbm,  # out: uint32 [rows * S, 128] packed down rows, expert order
+    m_expert,
+    m_start,
+    m_count,
+    m_visit,
+    v_expert,
+    tok_sm,  # SMEM int32 [2 * (tile_m + 128)]: token-id windows of even, odd tiles
+    rows_vm,  # VMEM uint32: 3 x slots of tile_m * (S + 1), then 2 y slots of tile_m * S
+    w1_vm,
+    w1s_vm,
+    w2_vm,
+    w2s_vm,
+    sem_tok,
+    sem_x,
+    sem_w,
+    sem_y,
+    *,
+    cfg: FusedMoeConfig,
+):
+    s = cfg.sublanes
+    sx = cfg.x_sublanes
+    group = cfg.issue_group
+    window = cfg.tile_m + LANES
+    n_tiles, n_visits = _fill_tiles(
+        gs_ref, m_expert, m_start, m_count, m_visit, v_expert, cfg=cfg
+    )
+    gate_up_rows, down_rows = (
+        (_gate_up_token_scales, _down_token_scales)
+        if cfg.per_token
+        else (_gate_up_block_scales, _down_block_scales)
+    )
+
+    # The x and y row slots share one allocation: the row DMA starts (writes
+    # of an x slot) that the compute emits between its y stores then stay
+    # where they are emitted instead of sinking to the end of the body.
+    def x_start(slot):
+        return slot * (cfg.tile_m * sx)
+
+    def y_start(slot):
+        return (_V2_ROW_SLOTS * sx + slot * s) * cfg.tile_m
+
+    def tok_copy(i):
+        w = i % 2
+        # A 1-D HBM window DMA must start on a lane-tile boundary.
+        base = pl.multiple_of(m_start[i] - m_start[i] % LANES, LANES)
+        return pltpu.make_async_copy(
+            tok_hbm.at[pl.ds(base, window)],
+            tok_sm.at[pl.ds(w * window, window)],
+            sem_tok.at[w],
+        )
+
+    def issued_rows(i):
+        # Rows are issued in whole groups; the tail of the last group fetches
+        # the next tile's (or padding) tokens into rows nothing reads.
+        return pl.cdiv(m_count[i], group) * group
+
+    def row_copy(token, slot, r):
+        return pltpu.make_async_copy(
+            x_hbm.at[pl.ds(token * sx, sx)],
+            rows_vm.at[pl.ds(x_start(slot) + r * sx, sx)],
+            sem_x.at[slot],
+        )
+
+    def tile_tokens(i):
+        """Tile i's first entry in tok_sm and its x row slot."""
+        return (i % 2) * window + m_start[i] % LANES, i % _V2_ROW_SLOTS
+
+    def issue_rows_loop(i):
+        first, slot = tile_tokens(i)
+
+        def body(g, carry):
+            for u in range(group):
+                r = g * group + u
+                row_copy(tok_sm[first + r], slot, r).start()
+            return carry
+
+        lax.fori_loop(0, issued_rows(i) // group, body, 0)
+
+    def rows_issue(i, valid):
+        """emit(r0, r1): straight-line starts of tile ``i``'s rows [r0, r1),
+        each predicated on the tile having that row (none unless ``valid``)."""
+        first, slot = tile_tokens(i)
+        count = jnp.where(valid, issued_rows(i), 0)
+
+        def emit(r0, r1):
+            for r in range(r0, r1):
+                token = tok_sm[first + r]
+                start = functools.partial(
+                    lambda token, r: row_copy(token, slot, r).start(), token, r
+                )
+                pl.when(r < count)(start)
+
+        return emit
+
+    def rows_wait(i):
+        slot = i % _V2_ROW_SLOTS
+        # Waits count bytes, so one descriptor the size of the issued rows
+        # retires all of their DMAs whatever order they landed in.
+        rows = rows_vm.at[pl.ds(x_start(slot), issued_rows(i) * sx)]
+        pltpu.make_async_copy(rows, rows, sem_x.at[slot]).wait()
+
+    def weight_copies(e, wslot):
+        pairs = ((w1_hbm, w1_vm), (w1s_hbm, w1s_vm), (w2_hbm, w2_vm), (w2s_hbm, w2s_vm))
+        return [
+            pltpu.make_async_copy(src.at[e], dst.at[wslot], sem_w.at[wslot])
+            for src, dst in pairs
+        ]
+
+    def out_copy(i):
+        slot = i % 2
+        rows = m_count[i] * s
+        return pltpu.make_async_copy(
+            rows_vm.at[pl.ds(y_start(slot), rows)],
+            y_hbm.at[pl.ds(m_start[i] * s, rows)],
+            sem_y.at[slot],
+        )
+
+    # Tiles 0 and 1 issue their rows before the loop; tile i + 2's rows are
+    # started by tile i's compute.
+    @pl.when(n_tiles > 0)
+    def _():
+        tok_copy(0).start()
+        for c in weight_copies(v_expert[0], 0):
+            c.start()
+        tok_copy(0).wait()
+        issue_rows_loop(0)
+
+        @pl.when(n_tiles > 1)
+        def _():
+            tok_copy(1).start()
+            tok_copy(1).wait()
+            issue_rows_loop(1)
+
+            @pl.when(n_tiles > 2)
+            def _():
+                tok_copy(2).start()
+
+    def compute(x_slot, y_slot, wslot, emit, height):
+        chains = 2 if height >= 2 * _V2_CHAIN_ROWS else 1
+        rows = height // chains
+        weights = (w1_vm.at[wslot], w1s_vm.at[wslot], w2_vm.at[wslot], w2s_vm.at[wslot])
+
+        def lane_blocks(r0):
+            return lambda j: rows_vm[
+                pl.ds(x_start(x_slot) + r0 * sx + j, rows, stride=sx), :
+            ]
+
+        gate_ups = [
+            gate_up_rows(lane_blocks(c * rows), weights, cfg, rows)
+            for c in range(chains)
+        ]
+        per_store = pl.cdiv(cfg.tile_m, chains * s)
+        for c in range(chains):
+            for j, words in down_rows(gate_ups[c], weights, cfg, rows):
+                k = c * s + j
+                emit(
+                    min(cfg.tile_m, k * per_store), min(cfg.tile_m, (k + 1) * per_store)
+                )
+                out_rows = pl.ds(y_start(y_slot) + c * rows * s + j, rows, stride=s)
+                rows_vm[out_rows, :] = words
+
+    def tile_loop(i, carry):
+        ahead = i + 2
+        has_ahead = ahead < n_tiles
+
+        @pl.when(has_ahead)
+        def _():
+            tok_copy(ahead).wait()
+
+        # Window (i + 3) % 2 last held tile i + 1's tokens, which tile i - 1
+        # issued: refill it a whole tile before tile i + 1 issues from it.
+        @pl.when(ahead + 1 < n_tiles)
+        def _():
+            tok_copy(ahead + 1).start()
+
+        visit = m_visit[i]
+        wslot = visit % 2
+        first_of_visit = jnp.logical_or(i == 0, m_visit[jnp.maximum(i - 1, 0)] != visit)
+
+        @pl.when(first_of_visit)
+        def _():
+            for c in weight_copies(m_expert[i], wslot):
+                c.wait()
+
+            @pl.when(visit + 1 < n_visits)
+            def _():
+                for c in weight_copies(v_expert[visit + 1], 1 - wslot):
+                    c.start()
+
+        rows_wait(i)
+
+        @pl.when(i >= 2)
+        def _():
+            out_copy(i - 2).wait()
+
+        emit = rows_issue(jnp.minimum(ahead, n_tiles - 1), has_ahead)
+        rung = (m_count[i] - 1) // cfg.height_step
+        lax.switch(
+            rung,
+            [
+                functools.partial(
+                    compute,
+                    i % _V2_ROW_SLOTS,
+                    i % 2,
+                    wslot,
+                    emit,
+                    cfg.height_step * (b + 1),
+                )
+                for b in range(cfg.tile_m // cfg.height_step)
+            ],
+        )
+        out_copy(i).start()
+        return carry
+
+    lax.fori_loop(0, n_tiles, tile_loop, 0)
+
+    @pl.when(n_tiles >= 2)
+    def _():
+        out_copy(n_tiles - 2).wait()
+
+    @pl.when(n_tiles >= 1)
+    def _():
+        out_copy(n_tiles - 1).wait()
+
+
+@functools.partial(
+    jax.jit,
+    static_argnames=(
+        "act",
+        "per_token",
+        "tile_m",
+        "height_step",
+        "issue_group",
+        "vmem_limit_bytes",
+        "interpret",
+    ),
+)
+def gather_fused_moe_v2(
+    x_packed: jax.Array,  # uint32 [tokens * (S + 1), 128] (quantize_pack_rows)
+    token_indices_sorted: jax.Array,  # int32 [rows]
+    group_sizes: jax.Array,  # int32 [E]
+    w1: jax.Array,  # fp8 [E, H, 2I]: gate columns [0, I), up columns [I, 2I)
+    w1_scale: jax.Array,  # f32 per-channel [E, 1, 1, 2I] or [E, 1, 2I]
+    w2: jax.Array,  # fp8 [E, I, H]
+    w2_scale: jax.Array,  # f32 per-channel [E, 1, 1, H] or [E, 1, H]
+    *,
+    act: str,
+    per_token: bool = False,
+    tile_m: int = DEFAULT_TILE_M,
+    height_step: int = 128,
+    issue_group: int = 16,
+    vmem_limit_bytes: int | None = None,
+    interpret: bool = False,
+) -> jax.Array:
+    """`gather_fused_moe` with its row DMAs started by the compute.
+
+    Same contract and, without ``per_token``, the same arithmetic and output
+    bits. Each tile's rows are issued two tiles ahead as straight-line
+    predicated DMA starts placed between the compute's output stores, where
+    they co-issue with the vector work, instead of in a scalar loop that runs
+    before each tile's compute. Tiles of at least 384 rows run as two row
+    chains. With ``per_token`` the rows come from
+    ``quantize_pack_rows(per_token=True)``: one activation scale per row for
+    gate_up and one per row of the activation for down, each dequantizing an
+    F32 product accumulated over the whole contraction.
+    """
+    num_experts, hidden, n1 = w1.shape
+    inter = n1 // 2
+    rows = token_indices_sorted.shape[0]
+    s = packed_sublanes(hidden)
+    if w2.shape != (num_experts, inter, hidden):
+        raise ValueError(f"w2 {w2.shape} does not match w1 {w1.shape}")
+    if inter % LANES:
+        raise ValueError(f"intermediate {inter} must be a multiple of {LANES}")
+    if tile_m % height_step or tile_m % issue_group:
+        raise ValueError(
+            f"{tile_m=} is not a multiple of {height_step=} and {issue_group=}"
+        )
+    if x_packed.shape[0] % (s + 1):
+        raise ValueError(f"x_packed {x_packed.shape} is not quantize_pack_rows output")
+    w1_scale = w1_scale.reshape(num_experts, 1, n1).astype(jnp.float32)
+    w2_scale = w2_scale.reshape(num_experts, 1, hidden).astype(jnp.float32)
+    # The token-id windows read up to tile_m + 128 entries past a tile's start.
+    tok = jnp.pad(token_indices_sorted.astype(jnp.int32), (0, tile_m + LANES))
+    max_tiles = pl.cdiv(rows, tile_m) + num_experts
+    cfg = FusedMoeConfig(
+        num_experts=num_experts,
+        hidden_size=hidden,
+        inter_size=inter,
+        tile_m=tile_m,
+        height_step=height_step,
+        max_tiles=max_tiles,
+        act=act,
+        mxu_cols=256,
+        issue_group=issue_group,
+        per_token=per_token,
+    )
+    hbm = pl.BlockSpec(memory_space=pltpu.HBM)
+    smem_tiles = [pltpu.SMEM((max_tiles,), jnp.int32) for _ in range(4)]
+    row_sublanes = tile_m * (_V2_ROW_SLOTS * (s + 1) + 2 * s)
+    return pl.pallas_call(
+        functools.partial(_fused_moe_v2_kernel, cfg=cfg),
+        out_shape=jax.ShapeDtypeStruct((rows * s, LANES), jnp.uint32),
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=1,
+            grid=(1,),
+            in_specs=[hbm] * 6,
+            out_specs=hbm,
+            scratch_shapes=[
+                *smem_tiles,
+                pltpu.SMEM((num_experts,), jnp.int32),
+                pltpu.SMEM((2 * (tile_m + LANES),), jnp.int32),
+                pltpu.VMEM((row_sublanes, LANES), jnp.uint32),
+                pltpu.VMEM((2, hidden, n1), w1.dtype),
+                pltpu.VMEM((2, 1, n1), jnp.float32),
+                pltpu.VMEM((2, inter, hidden), w2.dtype),
+                pltpu.VMEM((2, 1, hidden), jnp.float32),
+                pltpu.SemaphoreType.DMA((2,)),
+                pltpu.SemaphoreType.DMA((_V2_ROW_SLOTS,)),
+                pltpu.SemaphoreType.DMA((2,)),
+                pltpu.SemaphoreType.DMA((2,)),
+            ],
+        ),
+        compiler_params=pltpu.CompilerParams(
+            vmem_limit_bytes=vmem_limit_bytes
+            or int(pltpu.get_tpu_info().vmem_capacity_bytes * VMEM_LIMIT_FRACTION),
+            disable_bounds_checks=True,
+        ),
+        name=(
+            f"gather_fused_moe_v2-e_{num_experts}-h_{hidden}-i_{inter}-tm_{tile_m}"
+            f"{'-token' if per_token else ''}"
+        ),
+        interpret=pltpu.InterpretParams() if interpret else False,
+    )(group_sizes.astype(jnp.int32), tok, x_packed, w1, w1_scale, w2, w2_scale)
+
+
 # ---------------------------------------------------------------- combine
 
 
@@ -600,7 +1044,9 @@ MASKED_COMBINE_MAX_ROWS = 1 << (31 - _SLOT_BITS)
 _ISSUE_GROUP = 8
 
 
-def _combine_kernel(route_smem, *rest, tt, topk, s, masked):
+def _combine_kernel(route_smem, *rest, tt, topk, s, masked, skip_zero_weights, into):
+    if into:  # the aliased output buffer, written through out_ref
+        rest = rest[:-4] + rest[-3:]
     if masked:
         count_smem, w_ref, pos_ref, y_hbm, out_ref, buf, sem = rest
     else:
@@ -666,8 +1112,12 @@ def _combine_kernel(route_smem, *rest, tt, topk, s, masked):
         pltpu.make_async_copy(buf.at[slot], buf.at[slot], sem.at[slot]).wait()
     # BF16 rows times BF16 weights are exact in F32; sum in F32, round once.
     w = w_ref[...].astype(jnp.float32)
+    zero_skipped = masked or skip_zero_weights
     if masked:
         valid = pos_ref[...] >= 0
+    elif skip_zero_weights:
+        # The row read for a zero-weight route need not be finite.
+        valid = w != 0
     for j in range(s):
         acc_lo = jnp.zeros((tt, LANES), jnp.float32)
         acc_hi = jnp.zeros((tt, LANES), jnp.float32)
@@ -676,8 +1126,9 @@ def _combine_kernel(route_smem, *rest, tt, topk, s, masked):
             lo, hi = _unpack_lane_block(words)
             wk = w[:, k : k + 1]
             lo, hi = lo * wk, hi * wk
-            if masked:
-                # Slots of skipped routes hold stale buffer contents.
+            if zero_skipped:
+                # Skipped routes' slots hold stale contents or a row read
+                # for a zero weight.
                 lo = jnp.where(valid[:, k : k + 1], lo, 0.0)
                 hi = jnp.where(valid[:, k : k + 1], hi, 0.0)
             acc_lo += lo
@@ -712,27 +1163,55 @@ def _masked_route_entries(positions: jax.Array, tt: int) -> tuple[jax.Array, jax
 
 
 @functools.partial(
-    jax.jit, static_argnames=("hidden_size", "tile_tokens", "masked", "interpret")
+    jax.jit,
+    static_argnames=(
+        "hidden_size",
+        "tile_tokens",
+        "masked",
+        "skip_zero_weights",
+        "out_tokens",
+        "out_start",
+        "interpret",
+    ),
 )
 def gather_combine(
-    y_packed: jax.Array,  # uint32 [rows * S, 128] (gather_fused_moe)
+    y_packed: jax.Array,  # uint32 [rows * S, 128] (gather_fused_moe*)
     positions: jax.Array,  # int32 [tokens, topk]: expert-order row of each route
     weights: jax.Array,  # BF16 [tokens, topk]
     *,
     hidden_size: int,
     tile_tokens: int = 64,
     masked: bool = False,
+    skip_zero_weights: bool = False,
+    into: jax.Array | None = None,
+    out_tokens: int | None = None,
+    out_start: int = 0,
     interpret: bool = False,
 ) -> jax.Array:
     """BF16 ``out[t] = sum_k weights[t, k] * row(positions[t, k])``.
 
     ``masked=True`` admits negative positions: those routes contribute zero
-    and are never read, and only the valid routes are fetched.
+    and are never read, and only the valid routes are fetched. With
+    ``skip_zero_weights`` every route is fetched and zero-weight routes
+    contribute zero whatever their row holds.
+
+    The result is rows ``[out_start, out_start + tokens)`` of an
+    ``[out_tokens, hidden]`` array, the other rows unwritten: of ``into``
+    (donated), or of a new array.
     """
     tokens, topk = weights.shape
     s = packed_sublanes(hidden_size)
-    if tokens % tile_tokens:
-        raise ValueError(f"{tokens=} is not a multiple of {tile_tokens=}")
+    if into is not None:
+        out_tokens = into.shape[0]
+    out_tokens = tokens if out_tokens is None else out_tokens
+    if tokens % tile_tokens or out_start % tile_tokens:
+        raise ValueError(
+            f"{tokens=} or {out_start=} is not a multiple of {tile_tokens=}"
+        )
+    if out_start + tokens > out_tokens:
+        raise ValueError(
+            f"rows [{out_start}, {out_start + tokens}) exceed {out_tokens}"
+        )
     routes = tile_tokens * topk
     if masked and (
         routes >= 1 << _SLOT_BITS or y_packed.shape[0] // s >= MASKED_COMBINE_MAX_ROWS
@@ -755,15 +1234,23 @@ def gather_combine(
         slots = routes
     return pl.pallas_call(
         functools.partial(
-            _combine_kernel, tt=tile_tokens, topk=topk, s=s, masked=masked
+            _combine_kernel,
+            tt=tile_tokens,
+            topk=topk,
+            s=s,
+            masked=masked,
+            skip_zero_weights=skip_zero_weights,
+            into=into is not None,
         ),
-        out_shape=jax.ShapeDtypeStruct((tokens, s * PACKED_COLUMNS), jnp.bfloat16),
+        out_shape=jax.ShapeDtypeStruct((out_tokens, s * PACKED_COLUMNS), jnp.bfloat16),
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=len(prefetch),
             grid=(tokens // tile_tokens,),
-            in_specs=[*in_specs, pl.BlockSpec(memory_space=pltpu.HBM)],
+            in_specs=[*in_specs, pl.BlockSpec(memory_space=pltpu.HBM)]
+            + ([pl.BlockSpec(memory_space=pltpu.HBM)] if into is not None else []),
             out_specs=pl.BlockSpec(
-                (tile_tokens, s * PACKED_COLUMNS), lambda i, *_: (i, 0)
+                (tile_tokens, s * PACKED_COLUMNS),
+                lambda i, *_: (i + out_start // tile_tokens, 0),
             ),
             scratch_shapes=[
                 pltpu.VMEM((2, slots * s, LANES), jnp.uint32),
@@ -773,9 +1260,15 @@ def gather_combine(
         compiler_params=pltpu.CompilerParams(
             dimension_semantics=("arbitrary",), disable_bounds_checks=True
         ),
-        name=f"gather_combine-k_{topk}-s_{s}-tt_{tile_tokens}-m{int(masked)}",
+        name=(
+            f"gather_combine-k_{topk}-s_{s}-tt_{tile_tokens}-m{int(masked)}"
+            f"{'-z' if skip_zero_weights else ''}"
+        ),
+        input_output_aliases=(
+            {len(prefetch) + len(operands) + 1: 0} if into is not None else {}
+        ),
         interpret=pltpu.InterpretParams() if interpret else False,
-    )(*prefetch, *operands, y_packed)
+    )(*prefetch, *operands, y_packed, *([into] if into is not None else []))
 
 
 def gather_combine_in_chunks(
@@ -787,12 +1280,14 @@ def gather_combine_in_chunks(
     max_routes: int,
     tile_tokens: int = 64,
     masked: bool = False,
+    skip_zero_weights: bool = False,
     interpret: bool = False,
 ) -> jax.Array:
     """`gather_combine` run on token chunks of at most `max_routes` routes.
 
     A call scalar-prefetches one int32 per route into SMEM, which bounds the
-    routes a single call takes; every chunk reads the same `y_packed`.
+    routes a single call takes; every chunk reads the same `y_packed` and
+    writes its rows of one output buffer, so no concatenation follows.
     """
     tokens, topk = weights.shape
     chunk = max_routes // topk // tile_tokens * tile_tokens
@@ -804,13 +1299,19 @@ def gather_combine_in_chunks(
         hidden_size=hidden_size,
         tile_tokens=tile_tokens,
         masked=masked,
+        skip_zero_weights=skip_zero_weights,
         interpret=interpret,
     )
     if tokens <= chunk:
         return combine(positions, weights)
-    return jnp.concatenate(
-        [
-            combine(positions[start : start + chunk], weights[start : start + chunk])
-            for start in range(0, tokens, chunk)
-        ]
-    )
+    out = None
+    for start in range(0, tokens, chunk):
+        rows = slice(start, start + chunk)
+        out = combine(
+            positions[rows],
+            weights[rows],
+            into=out,
+            out_tokens=None if out is not None else tokens,
+            out_start=start,
+        )
+    return out

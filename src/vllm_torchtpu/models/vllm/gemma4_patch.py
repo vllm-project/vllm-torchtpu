@@ -64,6 +64,7 @@ from vllm.model_executor.layers.linear import (
     MergedColumnParallelLinear,
     QKVParallelLinear,
     RowParallelLinear,
+    UnquantizedLinearMethod,
 )
 from vllm.model_executor.models.gemma4 import (
     Gemma4DecoderLayer,
@@ -75,7 +76,12 @@ from vllm.model_executor.models.utils import maybe_prefix, sequence_parallel_chu
 from vllm_torchtpu import envs
 from vllm_torchtpu.compilation import shape_variants
 from vllm_torchtpu.kernels.experimental.batched_rpa import cp_prefill
-from vllm_torchtpu.layers.adapter.norm_quant import add_rms_norm_quantize_op
+from vllm_torchtpu.layers.adapter.linear_common import WEIGHT_FLIPPED_ATTR
+from vllm_torchtpu.layers.adapter.norm_quant import (
+    add_rms_norm_quantize_op,
+    moe_head_rms_norm_quantize_op,
+    moe_tail_rms_norm_quantize_op,
+)
 from vllm_torchtpu.layers.adapter.quantization.fp8 import VllmFp8LinearMethodTPU
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.models.vllm.gemma4_attention_patch import (
@@ -176,19 +182,37 @@ def _per_token_fp8(linear: Any) -> bool:
 _FUSED_QUANT_DTYPE = torch.float8_e4m3fn
 
 
-def _configure_fused_norm_quant(layer: Gemma4DecoderLayer) -> None:
-    """Refuse what the fused add-norm-quantize tail cannot run, and build its op
-    (outside tracing)."""
-    if layer.enable_moe_block:
+def _check_fused_quant_projection(linear: Any) -> None:
+    """Refuse a projection the fused norm tails cannot feed."""
+    if not _per_token_fp8(linear):
+        # The tails feed FP8 rows quantized per token to every bucket.
         raise ValueError(
-            "TPU_GEMMA4_FUSED_NORM_QUANT supports dense Gemma4 layers only"
+            "TPU_GEMMA4_FUSED_NORM_QUANT needs per-channel W8A8 FP8 "
+            "projections without TPU_FP8_LINEAR_W8A16_MAX_ROWS"
         )
+    # The runtime weight's dtype, which quantize_input quantizes rows to.
+    if linear.quant_method._linear_quant_config[1] != _FUSED_QUANT_DTYPE:
+        raise ValueError(
+            f"TPU_GEMMA4_FUSED_NORM_QUANT needs {_FUSED_QUANT_DTYPE} "
+            "projection weights (unset REQUANTIZE_WEIGHT_DTYPE)"
+        )
+
+
+def _configure_fused_norm_quant(layer: Gemma4DecoderLayer) -> None:
+    """Refuse what the fused add-norm-quantize tails cannot run, and build their
+    ops (outside tracing)."""
     norms = (
         layer.input_layernorm,
         layer.post_attention_layernorm,
         layer.pre_feedforward_layernorm,
         layer.post_feedforward_layernorm,
     )
+    if layer.enable_moe_block:
+        norms += (
+            layer.post_feedforward_layernorm_1,
+            layer.pre_feedforward_layernorm_2,
+            layer.post_feedforward_layernorm_2,
+        )
     eps = {norm.variance_epsilon for norm in norms}
     if len(eps) != 1 or any(
         not norm.has_weight or norm.variance_size_override is not None for norm in norms
@@ -197,19 +221,44 @@ def _configure_fused_norm_quant(layer: Gemma4DecoderLayer) -> None:
             "TPU_GEMMA4_FUSED_NORM_QUANT needs weighted RMSNorms with one epsilon"
         )
     for linear in (layer.self_attn.qkv_proj, layer.mlp.gate_up_proj):
-        if not _per_token_fp8(linear):
-            # The tails feed FP8 rows quantized per token to every SP bucket.
-            raise ValueError(
-                "TPU_GEMMA4_FUSED_NORM_QUANT needs per-channel W8A8 FP8 "
-                "projections without TPU_FP8_LINEAR_W8A16_MAX_ROWS"
-            )
-        # The runtime weight's dtype, which quantize_input quantizes rows to.
-        if linear.quant_method._linear_quant_config[1] != _FUSED_QUANT_DTYPE:
-            raise ValueError(
-                f"TPU_GEMMA4_FUSED_NORM_QUANT needs {_FUSED_QUANT_DTYPE} "
-                "projection weights (unset REQUANTIZE_WEIGHT_DTYPE)"
-            )
-    layer.fused_norm_quant = add_rms_norm_quantize_op(eps.pop(), _FUSED_QUANT_DTYPE)
+        _check_fused_quant_projection(linear)
+    eps = eps.pop()
+    layer.fused_norm_quant = add_rms_norm_quantize_op(eps, _FUSED_QUANT_DTYPE)
+    if layer.enable_moe_block:
+        layer.fused_moe_tail = moe_tail_rms_norm_quantize_op(eps, _FUSED_QUANT_DTYPE)
+
+
+def _configure_fused_moe_head(layer: Gemma4DecoderLayer) -> None:
+    """Build the op that runs a MoE layer's post-attention tail with what reads
+    its result, the experts' input norm and Gemma4Router (a weightless RMSNorm,
+    its root and per-dimension scales, an unquantized projection), in one pass
+    (context-parallel layers under TPU_GEMMA4_FUSED_NORM_QUANT, after
+    _configure_fused_norm_quant); refuse a router it does not compute."""
+    router: Any = layer.router
+    proj = router.proj
+    eps = layer.post_attention_layernorm.variance_epsilon
+    if (
+        router.norm.has_weight
+        or router.norm.variance_size_override is not None
+        or router.norm.variance_epsilon != eps
+        or proj.bias is not None
+        or not isinstance(proj.quant_method, UnquantizedLinearMethod)
+    ):
+        raise ValueError(
+            "TPU_GEMMA4_FUSED_NORM_QUANT in the context-parallel layers needs "
+            "Gemma4's router: a weightless RMSNorm with the layer norms' epsilon "
+            "and an unquantized projection without bias"
+        )
+    dtype = proj.params_dtype
+    # Gemma4Router.root_size, rounded to the activation dtype as its forward does.
+    root = float(torch.tensor(router.hidden_size**-0.5).to(dtype))
+    layer.fused_moe_head = moe_head_rms_norm_quantize_op(eps, _FUSED_QUANT_DTYPE, root)
+
+
+def _router_weight(proj: Any) -> torch.Tensor:
+    """An unquantized projection's weight as [out, in]: vLLM's layout, unless
+    the TPU linear method transposed it after loading."""
+    return proj.weight.t() if getattr(proj, WEIGHT_FLIPPED_ATTR, False) else proj.weight
 
 
 def _patched_layer_init(self: Gemma4DecoderLayer, *args: Any, **kwargs: Any) -> None:
@@ -279,14 +328,11 @@ def _activation_quant_dtype(linear: Any) -> torch.dtype:
     return linear.weight.dtype
 
 
-def _gathered_prequantized(
-    linear: Any, x_bytes: torch.Tensor, x_scale: torch.Tensor
-) -> torch.Tensor:
-    """Column-parallel FP8 ``linear`` on the all-gather of rows the fused norm
-    tail already quantized per token; ``x_bytes`` holds their
-    ``_FUSED_QUANT_DTYPE`` bytes as int8, gathered without a dtype view."""
+def _prequantized_method(linear: Any, x_bytes: torch.Tensor, rows: int) -> Any:
+    """``linear``'s FP8 method, which must take ``rows`` rows the fused norm
+    tail already quantized per token (``x_bytes``: their ``_FUSED_QUANT_DTYPE``
+    bytes as int8)."""
     method = linear.quant_method
-    rows = x_bytes.shape[0] * linear.tp_size
     if not (
         isinstance(method, VllmFp8LinearMethodTPU)
         and method.supports_quantized_input(linear, rows)
@@ -297,8 +343,27 @@ def _gathered_prequantized(
             "TPU_GEMMA4_FUSED_NORM_QUANT needs per-channel FP8 projections that "
             f"take {_FUSED_QUANT_DTYPE} rows quantized per token"
         )
+    return method
+
+
+def _gathered_prequantized(
+    linear: Any, x_bytes: torch.Tensor, x_scale: torch.Tensor
+) -> torch.Tensor:
+    """Column-parallel FP8 ``linear`` on the all-gather of rows the fused norm
+    tail already quantized per token, gathered as int8 without a dtype view."""
+    method = _prequantized_method(linear, x_bytes, x_bytes.shape[0] * linear.tp_size)
     rows_q = _all_gather_rows(x_bytes).view(_FUSED_QUANT_DTYPE)
     return method.apply_quantized_input(linear, rows_q, _all_gather_rows(x_scale))
+
+
+def _prequantized(
+    linear: Any, x_bytes: torch.Tensor, x_scale: torch.Tensor
+) -> torch.Tensor:
+    """FP8 ``linear`` on rows the fused norm tail already quantized per token."""
+    method = _prequantized_method(linear, x_bytes, x_bytes.shape[0])
+    return method.apply_quantized_input(
+        linear, x_bytes.view(_FUSED_QUANT_DTYPE), x_scale
+    )
 
 
 def _token_chunks(x: torch.Tensor, chunks: int) -> list[torch.Tensor]:
@@ -387,8 +452,9 @@ def _fused_norm_sequence_parallel_layer(
     hidden_states: list[Any],
     next_input_norm: Any,
 ) -> list[Any]:
-    """`_sequence_parallel_layer` of a dense layer with each residual add, the
-    next norm and its FP8 quantization fused (TPU_GEMMA4_FUSED_NORM_QUANT).
+    """`_sequence_parallel_layer` with each residual add, the next norm and its
+    FP8 quantization fused (TPU_GEMMA4_FUSED_NORM_QUANT); on a MoE layer the
+    tail after the experts is `_fused_moe_tail`.
 
     A chunk arrives as this rank's residual rows, or as `(rows, q, scale)` when
     the previous layer's tail already quantized them through this layer's
@@ -422,6 +488,8 @@ def _fused_norm_sequence_parallel_layer(
     ]
     residual = [h for h, _, _ in tails]
     hidden_states = [_reduce_scatter_rows(m) for m in mlp_out]
+    if self.enable_moe_block:
+        return _fused_moe_tail(self, hidden_states, residual, next_input_norm)
     if next_input_norm is None:
         return [
             (self.post_feedforward_layernorm(h) + r) * self.layer_scalar
@@ -432,6 +500,54 @@ def _fused_norm_sequence_parallel_layer(
     w_next = next_input_norm.weight.view(-1)
     return [
         fused(h, r, w_post, scalar, w_next) for h, r in zip(hidden_states, residual)
+    ]
+
+
+def _fused_moe_tail(
+    self: Gemma4DecoderLayer,
+    mlp_rows: list[torch.Tensor],
+    residual: list[torch.Tensor],
+    next_input_norm: Any,
+) -> list[Any]:
+    """The experts and the MoE layer's tail of `_fused_norm_sequence_parallel_layer`:
+    the three output norms, the residual add and `layer_scalar` in one pass,
+    with the next layer's input norm and quantization when there is one."""
+    assert self.post_feedforward_layernorm_1 is not None
+    assert self.pre_feedforward_layernorm_2 is not None
+    assert self.router is not None
+    assert self.experts is not None
+    assert self.post_feedforward_layernorm_2 is not None
+    # Weights are first used in the unfused layer's order (see the caller):
+    # post_feedforward_layernorm_1's before the experts'.
+    if next_input_norm is None:
+        mlp_rows = [self.post_feedforward_layernorm_1(m) for m in mlp_rows]
+    w_mlp = self.post_feedforward_layernorm_1.weight.view(-1)
+    experts_out = [
+        self.experts(
+            _all_gather_rows(self.pre_feedforward_layernorm_2(r)),
+            _all_gather_rows(self.router(r)),
+        )
+        for r in residual
+    ]
+    moe_rows = [_reduce_scatter_rows(e) for e in experts_out]
+    if next_input_norm is None:
+        return [
+            (
+                self.post_feedforward_layernorm(
+                    m + self.post_feedforward_layernorm_2(e)
+                )
+                + r
+            )
+            * self.layer_scalar
+            for m, e, r in zip(mlp_rows, moe_rows, residual)
+        ]
+    w_moe = self.post_feedforward_layernorm_2.weight.view(-1)
+    w_post = self.post_feedforward_layernorm.weight.view(-1)
+    scalar = self.layer_scalar.view(1)
+    w_next = next_input_norm.weight.view(-1)
+    return [
+        self.fused_moe_tail(m, e, r, w_mlp, w_moe, w_post, scalar, w_next)
+        for m, e, r in zip(mlp_rows, moe_rows, residual)
     ]
 
 
@@ -819,16 +935,30 @@ def _context_parallel_layer(
     rank: torch.Tensor,
     attention: CPAttention,
     attention_from_qkv: CPAttentionFromQKV | None = None,
-) -> torch.Tensor:
-    """Upstream's decoder layer on this rank's zigzag rows, every head local."""
+    next_input_norm: Any = None,
+) -> Any:
+    """Upstream's decoder layer on this rank's zigzag rows, every head local.
+
+    With TPU_GEMMA4_FUSED_NORM_QUANT the residual adds, norms and FP8
+    quantizations around the projections run as the fused tails of
+    `_fused_norm_sequence_parallel_layer`: ``x`` arrives as the residual rows,
+    or as ``(rows, q, scale)`` when the previous layer's tail already quantized
+    them through this layer's input norm, and with ``next_input_norm`` this
+    layer's tail does that for the next layer.
+    """
     attn = layer.self_attn
     heads, kv_heads, head_dim = (
         attn.total_num_heads,
         attn.total_num_kv_heads,
         attn.head_dim,
     )
-    residual = x
-    qkv, _ = replica.self_attn.qkv_proj(layer.input_layernorm(x))
+    fused = envs.TPU_GEMMA4_FUSED_NORM_QUANT
+    if isinstance(x, tuple):
+        residual, x_q, x_scale = x
+        qkv = _prequantized(replica.self_attn.qkv_proj, x_q, x_scale)
+    else:
+        residual = x
+        qkv, _ = replica.self_attn.qkv_proj(layer.input_layernorm(x))
     if attention_from_qkv is not None:
         cos, sin = _rotary_rows(attn.rotary_emb, qkv, positions)
         weights = (attn.q_norm.weight, attn.k_norm.weight)
@@ -843,21 +973,62 @@ def _context_parallel_layer(
         v = attn.v_norm(v.unflatten(-1, (kv_heads, head_dim))).flatten(-2, -1)
         attended = attention(attn.attn, q, k, v, plan, rank)
     out = _o_projection(replica.self_attn.o_proj, attended)
-    x = layer.post_attention_layernorm(out) + residual
-    residual = x
-
-    gate_up, _ = replica.mlp.gate_up_proj(layer.pre_feedforward_layernorm(x))
+    moe_rows = router_logits = None
+    if fused:
+        w_post = layer.post_attention_layernorm.weight.view(-1)
+        w_next = layer.pre_feedforward_layernorm.weight.view(-1)
+        if layer.enable_moe_block:
+            router: Any = layer.router
+            residual, x_q, x_scale, moe_rows, router_logits = layer.fused_moe_head(
+                out,
+                residual,
+                w_post,
+                w_next,
+                layer.pre_feedforward_layernorm_2.weight.view(-1),
+                _router_weight(router.proj),
+                router.scale,
+            )
+        else:
+            residual, x_q, x_scale = layer.fused_norm_quant(
+                out, residual, w_post, out.new_ones(1), w_next
+            )
+        gate_up = _prequantized(replica.mlp.gate_up_proj, x_q, x_scale)
+    else:
+        residual = layer.post_attention_layernorm(out) + residual
+        gate_up, _ = replica.mlp.gate_up_proj(layer.pre_feedforward_layernorm(residual))
     out, _ = replica.mlp.down_proj(layer.mlp.act_fn(gate_up))
+    # The last layer's tail ends at the final norm, unfused.
+    fused_tail = fused and next_input_norm is not None
     if layer.enable_moe_block:
         # Under TPU_MOE_SKIP_PADDED_TOKENS the experts read the runner's
         # token-order padding mask, which flags row i when i >= the prompt
         # length: every such zigzag row is padding too (its position is >= i),
         # and with prompts over the solo threshold no row of a rank is flagged.
-        experts = replica.experts(
-            layer.pre_feedforward_layernorm_2(residual), layer.router(residual)
-        )
+        if moe_rows is None:
+            moe_rows = layer.pre_feedforward_layernorm_2(residual)
+            router_logits = layer.router(residual)
+        experts = replica.experts(moe_rows, router_logits)
+        if fused_tail:
+            return layer.fused_moe_tail(
+                out,
+                experts,
+                residual,
+                layer.post_feedforward_layernorm_1.weight.view(-1),
+                layer.post_feedforward_layernorm_2.weight.view(-1),
+                layer.post_feedforward_layernorm.weight.view(-1),
+                layer.layer_scalar.view(1),
+                next_input_norm.weight.view(-1),
+            )
         out = layer.post_feedforward_layernorm_1(out)
         out = out + layer.post_feedforward_layernorm_2(experts)
+    elif fused_tail:
+        return layer.fused_norm_quant(
+            out,
+            residual,
+            layer.post_feedforward_layernorm.weight.view(-1),
+            layer.layer_scalar.view(1),
+            next_input_norm.weight.view(-1),
+        )
     return (layer.post_feedforward_layernorm(out) + residual) * layer.layer_scalar
 
 
@@ -888,9 +1059,23 @@ def _context_parallel_forward(
         # As upstream: the normalizer scales the reduced embedding.
         x = _reduce_scatter_rows(shards) * model.normalizer
     positions = positions.index_select(0, rows)
-    for layer, replica in zip(model.layers, getattr(model, _REPLICA).layers):
+    layers = list(zip(model.layers, getattr(model, _REPLICA).layers))
+    for i, (layer, replica) in enumerate(layers):
+        next_input_norm = (
+            layers[i + 1][0].input_layernorm
+            if envs.TPU_GEMMA4_FUSED_NORM_QUANT and i + 1 < len(layers)
+            else None
+        )
         x = _context_parallel_layer(
-            layer, replica, positions, x, plan, rank, attention, attention_from_qkv
+            layer,
+            replica,
+            positions,
+            x,
+            plan,
+            rank,
+            attention,
+            attention_from_qkv,
+            next_input_norm,
         )
     return _token_order(_all_gather_rows(model.norm(x)), plan)
 
@@ -1063,6 +1248,11 @@ def _patched_causal_lm_init(
         model, vllm_config.quant_config, f"{maybe_prefix(prefix, 'model')}.{_REPLICA}"
     )
     for layer, copied in zip(model.layers, replica.layers):
+        if envs.TPU_GEMMA4_FUSED_NORM_QUANT:
+            for linear in (copied.self_attn.qkv_proj, copied.mlp.gate_up_proj):
+                _check_fused_quant_projection(linear)
+            if layer.enable_moe_block:
+                _configure_fused_moe_head(layer)
         pairs = [
             (layer.self_attn.qkv_proj, copied.self_attn.qkv_proj),
             (layer.self_attn.o_proj, copied.self_attn.o_proj),

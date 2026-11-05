@@ -98,3 +98,62 @@ def select(
 def router_topk(scores: jax.Array, topk: int) -> tuple[jax.Array, jax.Array]:
     """``select`` with a jax_op-compatible signature (arrays, then statics)."""
     return select(scores, topk)
+
+
+def _select_scaled_kernel(x_ref, s_ref, w_ref, i_ref, ws_ref, *, topk: int, n: int):
+    """``_select_kernel`` with experts on sublanes and rows on lanes.
+
+    Each pass reduces over sublanes (elementwise across vregs) instead of
+    across lanes, and also returns the selected expert's ``scale``. The clamp,
+    the tie rule and the NaN poisoning are ``_select_kernel``'s (see there);
+    keep both in step with ``layers/core/rowmax_topk.py``, the tests' oracle.
+    """
+    x = jnp.where(x_ref[...] > NEG, x_ref[...], NEG)
+    masked = jnp.finfo(x.dtype).min
+    iota = jax.lax.broadcasted_iota(jnp.int32, x.shape, 0)
+    for j in range(topk):
+        m = jnp.max(x, axis=0, keepdims=True)
+        idx = jnp.min(jnp.where(x == m, iota, n - 1), axis=0, keepdims=True)
+        hit = iota == idx
+        w_ref[j : j + 1, :] = m
+        i_ref[j : j + 1, :] = idx
+        # The selected expert's scale: a sum with one nonzero term, exact.
+        ws_ref[j : j + 1, :] = jnp.sum(
+            jnp.where(hit, s_ref[...], 0.0), axis=0, keepdims=True
+        )
+        x = jnp.where(hit, masked, x)
+    w_ref[...] = jnp.where(w_ref[:1, :] <= NEG, jnp.nan, w_ref[...])
+
+
+def select_scaled(
+    scores: jax.Array, scale: jax.Array, topk: int, interpret: bool = False
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """``select`` plus ``scale[indices]`` for an f32 per-expert ``scale``.
+
+    Same selection, ties and clamp as ``select``; the kernel works on the
+    transposed scores, so each pass is a reduction over sublanes. Returns
+    ``(weights f32, indices int32, scale[indices] f32)``, each ``[rows, topk]``.
+    """
+    rows, n = scores.shape
+    block = rows if rows <= MAX_BLOCK_ROWS else MAX_BLOCK_ROWS
+    out = jax.ShapeDtypeStruct((topk, rows), jnp.float32)
+    k_block = pl.BlockSpec((topk, block), lambda i: (0, i))
+    w, ids, ws = pl.pallas_call(
+        functools.partial(_select_scaled_kernel, topk=topk, n=n),
+        grid=(pl.cdiv(rows, block),),
+        in_specs=[
+            pl.BlockSpec((n, block), lambda i: (0, i)),
+            pl.BlockSpec((n, 1), lambda i: (0, 0)),
+        ],
+        out_specs=[k_block, k_block, k_block],
+        out_shape=[out, jax.ShapeDtypeStruct((topk, rows), jnp.int32), out],
+        interpret=interpret,
+    )(scores.T, scale.astype(jnp.float32).reshape(n, 1))
+    return w.T, ids.T, ws.T
+
+
+def router_topk_scaled(
+    scores: jax.Array, scale: jax.Array, topk: int
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """``select_scaled`` with a jax_op-compatible signature (arrays, then statics)."""
+    return select_scaled(scores, scale, topk)

@@ -32,6 +32,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 from torch.fx.passes.split_module import split_module
+from vllm.model_executor.layers.linear import UnquantizedLinearMethod
 from vllm.model_executor.models import gemma4
 from vllm.model_executor.models.gemma4 import (
     Gemma4Attention,
@@ -44,6 +45,7 @@ from vllm.model_executor.models.interfaces import EagleModelMixin
 
 from vllm_torchtpu import envs
 from vllm_torchtpu.compilation import shape_variants
+from vllm_torchtpu.layers.adapter.linear_common import WEIGHT_FLIPPED_ATTR
 from vllm_torchtpu.layers.adapter.quantization.fp8 import VllmFp8LinearMethodTPU
 from vllm_torchtpu.models.vllm import gemma4_patch
 
@@ -277,6 +279,7 @@ class _Model:
                 up=w(h, self.inter),
                 down=w(self.inter, h),
                 router=w(h, tp),
+                router_scale=1.0 + 0.1 * torch.randn(h),
                 experts=[w(h, h) for _ in range(tp)],
                 norms={
                     name: _Norm(h, has_weight=name != "router")
@@ -359,8 +362,7 @@ class _Model:
             act_fn=_gelu_and_mul,
         )
         norms = lw["norms"]
-        router_norm = norms["router"]
-        router_weight = lw["router"]
+        router = _Router(norms["router"], lw["router"], lw["router_scale"])
         layer = _CallableLayer(
             self_attn=_CallableAttention(attn, attn_forward),
             mlp=_CallableMlp(mlp),
@@ -369,7 +371,7 @@ class _Model:
             pre_feedforward_layernorm=norms["pre_feedforward"],
             post_feedforward_layernorm=norms["post_feedforward"],
             enable_moe_block=self.moe,
-            router=(lambda h: router_norm(h) @ router_weight) if self.moe else None,
+            router=router if self.moe else None,
             experts=(
                 _Experts(rank, lw["experts"][rank], all_reduce) if self.moe else None
             ),
@@ -386,6 +388,28 @@ class _Model:
             layer_scalar=lw["layer_scalar"],
         )
         return layer
+
+
+class _Router:
+    """Gemma4Router's forward (weightless norm, root and per-dimension scales,
+    then its GateLinear projection: vLLM's stock unquantized method and its
+    [experts, hidden] weight) and the attributes the fused context-parallel
+    MoE head reads. ``weight`` is [hidden, experts]."""
+
+    def __init__(self, norm: _Norm, weight: torch.Tensor, scale: torch.Tensor):
+        self.hidden_size = weight.shape[0]
+        self.norm = norm
+        self.scale = scale
+        self.proj = SimpleNamespace(
+            weight=weight.t().contiguous(),
+            bias=None,
+            params_dtype=weight.dtype,
+            quant_method=UnquantizedLinearMethod(),
+        )
+
+    def __call__(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.norm(x) * self.hidden_size**-0.5 * self.scale
+        return x @ gemma4_patch._router_weight(self.proj).t()
 
 
 class _CallableAttention(SimpleNamespace):
@@ -553,17 +577,54 @@ def _emulated_add_rms_norm_quantize(eps, quant_dtype):
     return op
 
 
+def _emulated_moe_tail_rms_norm_quantize(eps, quant_dtype):
+    """kernels/norm_quant.py's MoE tail arithmetic on the f32 test model."""
+
+    def op(mlp, moe, residual, w_mlp, w_moe, w_post, scalar, w_next):
+        def norm(t, w):
+            return t * torch.rsqrt(t.pow(2).mean(-1, keepdim=True) + eps) * w
+
+        mixed = norm(mlp, w_mlp) + norm(moe, w_moe)
+        h = (norm(mixed, w_post) + residual) * scalar
+        m = norm(h, w_next)
+        scale = m.abs().amax(-1, keepdim=True) / 448.0
+        scale = torch.where(scale == 0, torch.ones_like(scale), scale)
+        return h, (m / scale).to(quant_dtype).view(torch.int8), scale
+
+    return op
+
+
+def _emulated_moe_head_rms_norm_quantize(eps, quant_dtype, router_root):
+    """kernels/norm_quant.py's MoE head arithmetic on the f32 test model."""
+
+    def op(x, residual, w_post, w_next, w_moe, w_router, router_scale):
+        def norm(t, w):
+            return t * torch.rsqrt(t.pow(2).mean(-1, keepdim=True) + eps) * w
+
+        h = norm(x, w_post) + residual
+        m = norm(h, w_next)
+        scale = m.abs().amax(-1, keepdim=True) / 448.0
+        scale = torch.where(scale == 0, torch.ones_like(scale), scale)
+        logits = (norm(h, 1.0) * router_root * router_scale) @ w_router.t()
+        q = (m / scale).to(quant_dtype).view(torch.int8)
+        return h, q, scale, norm(h, w_moe), logits
+
+    return op
+
+
+@pytest.mark.parametrize("moe", [False, True])
 @pytest.mark.parametrize("chunks", [1, 2])
 def test_fused_norm_quant_model_forward_matches_unfused(
-    mock_collectives, monkeypatch, chunks
+    mock_collectives, monkeypatch, chunks, moe
 ):
     """TPU_GEMMA4_FUSED_NORM_QUANT: each layer's add-norm-quantize tails feed the
     next projection (the next layer's qkv through its input norm) and the last
-    layer ends at the final norm, as the unfused SP forward computes them."""
+    layer ends at the final norm, as the unfused SP forward computes them; on a
+    MoE layer the tail after the experts is one fused op too."""
     tp, num_layers, num_tokens = 2, 3, 32
     mock = mock_collectives(tp)
-    model = _Model(tp, moe=False, fp8=True, num_layers=num_layers)
-    calls = []
+    model = _Model(tp, moe=moe, fp8=True, num_layers=num_layers)
+    calls, moe_calls = [], []
     monkeypatch.setattr(
         gemma4_patch, "_activation_quant_dtype", lambda linear: torch.float8_e4m3fn
     )
@@ -572,7 +633,12 @@ def test_fused_norm_quant_model_forward_matches_unfused(
         op = _emulated_add_rms_norm_quantize(eps, quant_dtype)
         return lambda *args: calls.append(args[3]) or op(*args)
 
+    def counted_moe_op(eps, quant_dtype):
+        op = _emulated_moe_tail_rms_norm_quantize(eps, quant_dtype)
+        return lambda *args: moe_calls.append(args[6]) or op(*args)
+
     monkeypatch.setattr(gemma4_patch, "add_rms_norm_quantize_op", counted_op)
+    monkeypatch.setattr(gemma4_patch, "moe_tail_rms_norm_quantize_op", counted_moe_op)
     input_ids = torch.randint(0, model.embedding.shape[0], (num_tokens,))
     positions = torch.arange(num_tokens)
 
@@ -607,29 +673,106 @@ def test_fused_norm_quant_model_forward_matches_unfused(
     monkeypatch.setattr(gemma4_patch, "_MIN_SHARD_BYTES", 1)
     monkeypatch.setattr(gemma4_patch, "_microbatches", chunks)
     reference = _run_ranks(tp, forward)
-    assert not calls
+    assert not calls and not moe_calls
     monkeypatch.setattr(envs, "TPU_GEMMA4_FUSED_NORM_QUANT", True)
     fused = _run_ranks(tp, forward)
     for out, ref in zip(fused, reference):
         torch.testing.assert_close(out, ref, rtol=2e-5, atol=2e-5)
+    if moe:
+        # Per rank and chunk: the attention tail of every layer (unit scalar),
+        # and the expert tail of each layer but the last, which ends at the
+        # final norm (layer scalars).
+        assert len(calls) == tp * chunks * num_layers
+        assert all(float(c) == 1.0 for c in calls)
+        assert len(moe_calls) == tp * chunks * (num_layers - 1)
+        assert all(float(c) != 1.0 for c in moe_calls)
+        return
     # Per rank and chunk: two tails in each layer but the last, whose MLP tail
     # ends at the final norm; layer scalars only on the MLP tails.
+    assert not moe_calls
     assert len(calls) == tp * chunks * (2 * num_layers - 1)
     assert sum(float(c) != 1.0 for c in calls) == tp * chunks * (num_layers - 1)
 
 
-def test_fused_norm_quant_refuses_moe_and_needs_sp(monkeypatch) -> None:
-    monkeypatch.setattr(envs, "TPU_GEMMA4_FUSED_NORM_QUANT", True)
+def test_fused_norm_quant_ops_return_tuples() -> None:
+    """The layers tell an already quantized chunk by `isinstance(c, tuple)`, so
+    both tails' ops must return a fixed tuple (a variadic return annotation of
+    the JAX function would make the op return a list)."""
+    from vllm_torchtpu.layers.adapter.norm_quant import (
+        add_rms_norm_quantize_op,
+        moe_head_rms_norm_quantize_op,
+        moe_tail_rms_norm_quantize_op,
+    )
+
+    for build in (add_rms_norm_quantize_op, moe_tail_rms_norm_quantize_op):
+        returns = build(1e-6, torch.float8_e4m3fn)._opoverload._schema.returns
+        assert [str(r.type) for r in returns] == ["Tensor"] * 3
+    head = moe_head_rms_norm_quantize_op(1e-6, torch.float8_e4m3fn, 2816**-0.5)
+    returns = head._opoverload._schema.returns
+    assert [str(r.type) for r in returns] == ["Tensor"] * 5
+
+
+def test_router_weight_is_out_by_in_in_either_layout() -> None:
+    weight = torch.randn(4, 6)  # [experts, hidden], vLLM's layout
+    proj = SimpleNamespace(weight=weight)
+    assert gemma4_patch._router_weight(proj) is weight
+    flipped = SimpleNamespace(weight=weight.t().contiguous())
+    setattr(flipped, WEIGHT_FLIPPED_ATTR, True)  # the TPU method's transpose
+    torch.testing.assert_close(gemma4_patch._router_weight(flipped), weight)
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"norm": _Norm(32)},  # a weighted router norm
+        {"proj.quant_method": _Bf16Method()},  # not an unquantized linear
+        {"proj.bias": torch.zeros(2)},
+    ],
+)
+def test_fused_moe_head_refuses_another_router(monkeypatch, override) -> None:
+    monkeypatch.setattr(
+        gemma4_patch,
+        "moe_head_rms_norm_quantize_op",
+        _emulated_moe_head_rms_norm_quantize,
+    )
     layer = _Model(2, moe=True, fp8=True).layer(0, 0, lambda t: t)
-    with pytest.raises(ValueError, match="dense"):
-        gemma4_patch._configure_fused_norm_quant(layer)
+    gemma4_patch._configure_fused_moe_head(layer)
+    assert callable(layer.fused_moe_head)
+    ((path, value),) = override.items()
+    *owner, attr = path.split(".")
+    target = layer.router
+    for name in owner:
+        target = getattr(target, name)
+    setattr(target, attr, value)
+    with pytest.raises(ValueError, match="Gemma4's router"):
+        gemma4_patch._configure_fused_moe_head(layer)
+
+
+def test_fused_norm_quant_builds_the_moe_tail_and_needs_sp(monkeypatch) -> None:
+    monkeypatch.setattr(envs, "TPU_GEMMA4_FUSED_NORM_QUANT", True)
+    monkeypatch.setattr(
+        gemma4_patch, "add_rms_norm_quantize_op", _emulated_add_rms_norm_quantize
+    )
+    monkeypatch.setattr(
+        gemma4_patch,
+        "moe_tail_rms_norm_quantize_op",
+        _emulated_moe_tail_rms_norm_quantize,
+    )
+    layer = _Model(2, moe=True, fp8=True).layer(0, 0, lambda t: t)
+    gemma4_patch._configure_fused_norm_quant(layer)
+    assert callable(layer.fused_norm_quant) and callable(layer.fused_moe_tail)
+    dense = _Model(2, moe=False, fp8=True).layer(0, 0, lambda t: t)
+    gemma4_patch._configure_fused_norm_quant(dense)
+    assert not hasattr(dense, "fused_moe_tail")
     monkeypatch.setattr(envs, "TPU_GEMMA4_SEQUENCE_PARALLEL", False)
     gemma4 = SimpleNamespace(hf_text_config=SimpleNamespace(model_type="gemma4_text"))
     with pytest.raises(ValueError, match="TPU_GEMMA4_SEQUENCE_PARALLEL"):
         gemma4_patch.maybe_patch_gemma4_sequence_parallel(gemma4)
 
 
-@pytest.mark.parametrize("moe,fused", [(False, False), (True, False), (False, True)])
+@pytest.mark.parametrize(
+    "moe,fused", [(False, False), (True, False), (False, True), (True, True)]
+)
 def test_branches_trace_the_same_inputs(monkeypatch, moe: bool, fused: bool) -> None:
     """The all-reduce and sequence-parallel traces take the same tensors, in order.
 
@@ -642,6 +785,11 @@ def test_branches_trace_the_same_inputs(monkeypatch, moe: bool, fused: bool) -> 
         monkeypatch.setattr(envs, "TPU_GEMMA4_FUSED_NORM_QUANT", True)
         monkeypatch.setattr(
             gemma4_patch, "add_rms_norm_quantize_op", _emulated_add_rms_norm_quantize
+        )
+        monkeypatch.setattr(
+            gemma4_patch,
+            "moe_tail_rms_norm_quantize_op",
+            _emulated_moe_tail_rms_norm_quantize,
         )
         monkeypatch.setattr(
             gemma4_patch, "_activation_quant_dtype", lambda linear: torch.float8_e4m3fn
@@ -1202,17 +1350,110 @@ def test_context_parallel_moe_forward_matches_tp(mock_collectives) -> None:
         torch.testing.assert_close(out, expected, rtol=1e-5, atol=1e-5)
 
 
+@pytest.mark.parametrize("moe", [False, True])
+def test_fused_norm_quant_context_parallel_forward_matches_unfused(
+    mock_collectives, monkeypatch, moe
+) -> None:
+    """TPU_GEMMA4_FUSED_NORM_QUANT in the context-parallel program: the fused
+    tails feed the replica's projections (the next layer's qkv through its input
+    norm) and the last layer ends at the final norm, as the unfused program
+    computes them; on a MoE layer the tail after the experts is one op too."""
+    world, num_layers, normalizer = 2, 3, torch.tensor(2.0)
+    mock = mock_collectives(world)
+    model = _GqaModel(world if moe else 1, moe=moe, fp8=True, num_layers=num_layers)
+    plan = _zigzag_plan(world, 2 * world * 4)
+    input_ids = torch.randint(0, model.embedding.shape[0], (plan.num_tokens,))
+    positions = torch.arange(plan.num_tokens)
+    attention = _cp_attention_reference(mock, model, plan)
+    calls, moe_calls, head_calls = [], [], []
+    monkeypatch.setattr(
+        gemma4_patch, "_activation_quant_dtype", lambda linear: torch.float8_e4m3fn
+    )
+
+    def counted_op(eps, quant_dtype):
+        op = _emulated_add_rms_norm_quantize(eps, quant_dtype)
+        return lambda *args: calls.append(args[3]) or op(*args)
+
+    def counted_moe_op(eps, quant_dtype):
+        op = _emulated_moe_tail_rms_norm_quantize(eps, quant_dtype)
+        return lambda *args: moe_calls.append(args[6]) or op(*args)
+
+    def counted_head_op(eps, quant_dtype, router_root):
+        op = _emulated_moe_head_rms_norm_quantize(eps, quant_dtype, router_root)
+        return lambda *args: head_calls.append(router_root) or op(*args)
+
+    monkeypatch.setattr(gemma4_patch, "add_rms_norm_quantize_op", counted_op)
+    monkeypatch.setattr(gemma4_patch, "moe_tail_rms_norm_quantize_op", counted_moe_op)
+    monkeypatch.setattr(gemma4_patch, "moe_head_rms_norm_quantize_op", counted_head_op)
+
+    def cp_rank(rank: int) -> torch.Tensor:
+        layers = [model.layer(i, rank, mock.all_reduce) for i in range(num_layers)]
+        for layer in layers:
+            gemma4_patch._configure_fused_norm_quant(layer)
+            if layer.enable_moe_block:
+                gemma4_patch._configure_fused_moe_head(layer)
+        fake = SimpleNamespace(
+            embed_tokens=_vocab_shard(model.embedding, rank, world),
+            normalizer=normalizer,
+            layers=layers,
+            cp_replica=SimpleNamespace(
+                layers=[_replica(model, i) for i in range(num_layers)]
+            ),
+            norm=model.final_norm,
+        )
+        return gemma4_patch._context_parallel_forward(
+            fake,
+            input_ids,
+            positions,
+            plan,
+            torch.tensor([rank]),
+            _rows(plan, rank),
+            attention,
+        )
+
+    reference = _run_ranks(world, cp_rank)
+    assert not calls and not moe_calls and not head_calls
+    monkeypatch.setattr(envs, "TPU_GEMMA4_FUSED_NORM_QUANT", True)
+    fused = _run_ranks(world, cp_rank)
+    for out, ref in zip(fused, reference):
+        torch.testing.assert_close(out, ref, rtol=2e-5, atol=2e-5)
+    # Per rank: the attention tail of every layer (unit scalar; on a MoE layer
+    # the head that also feeds the experts and the router), and the MLP or
+    # expert tail of each layer but the last, which ends at the final norm
+    # (layer scalars).
+    if moe:
+        assert not calls
+        assert len(head_calls) == world * num_layers
+        # The router's root scale, rounded to the activation dtype (f32 here).
+        assert head_calls[0] == float(torch.tensor(model.hidden**-0.5))
+        assert len(moe_calls) == world * (num_layers - 1)
+        assert all(float(c) != 1.0 for c in moe_calls)
+        return
+    assert not head_calls and not moe_calls
+    assert sum(float(c) == 1.0 for c in calls) == world * num_layers
+    assert sum(float(c) != 1.0 for c in calls) == world * (num_layers - 1)
+
+
 def _rank_scaled_query(attn, q, k, v, plan, rank):
     """An attention stand-in that reads the rank tensor, as the real op does."""
     return q * rank.to(q.dtype)
 
 
-def _trace_context_parallel_forward(monkeypatch, rank: int) -> Any:
+def _trace_context_parallel_forward(monkeypatch, rank: int, fused: bool = False) -> Any:
     """Dynamo's graph of `_context_parallel_forward` on rank ``rank`` of 4, with
     collectives and attention that are the same on every rank and the vocab
-    shard bounds as the TPU platform's buffers."""
+    shard bounds as the TPU platform's buffers; with ``fused``, under
+    TPU_GEMMA4_FUSED_NORM_QUANT (the tails' ops emulated in torch)."""
     world = 4
     model = _GqaModel(1, moe=False, fp8=True, num_layers=2)
+    if fused:
+        monkeypatch.setattr(envs, "TPU_GEMMA4_FUSED_NORM_QUANT", True)
+        monkeypatch.setattr(
+            gemma4_patch, "_activation_quant_dtype", lambda linear: torch.float8_e4m3fn
+        )
+        monkeypatch.setattr(
+            gemma4_patch, "add_rms_norm_quantize_op", _emulated_add_rms_norm_quantize
+        )
     plan = _zigzag_plan(world, 2 * world * 4)
     monkeypatch.setattr(
         gemma4_patch, "_reduce_scatter_rows", lambda x: x[: x.shape[0] // world] * 1
@@ -1221,10 +1462,14 @@ def _trace_context_parallel_forward(monkeypatch, rank: int) -> Any:
     embed = _vocab_shard(model.embedding, rank, world)
     for name in ("org_vocab_start_index", "org_vocab_end_index"):
         setattr(embed, name, torch.tensor(getattr(embed.shard_indices, name)))
+    layers = [model.layer(i, 0, lambda t: t) for i in range(2)]
+    if fused:
+        for layer in layers:
+            gemma4_patch._configure_fused_norm_quant(layer)
     fake = SimpleNamespace(
         embed_tokens=embed,
         normalizer=torch.tensor(2.0),
-        layers=[model.layer(i, 0, lambda t: t) for i in range(2)],
+        layers=layers,
         cp_replica=SimpleNamespace(layers=[_replica(model, i) for i in range(2)]),
         norm=model.final_norm,
     )
@@ -1261,10 +1506,11 @@ def _trace_context_parallel_forward(monkeypatch, rank: int) -> Any:
     return graphs[0], plan.num_tokens
 
 
-def test_context_parallel_trace_keeps_the_bucket_symbolic(monkeypatch) -> None:
+@pytest.mark.parametrize("fused", [False, True])
+def test_context_parallel_trace_keeps_the_bucket_symbolic(monkeypatch, fused) -> None:
     """Only the token slices touch the token dimension: no specialization, and
     the trace refuses smaller buckets, as shape_variants reads its guards."""
-    graph, num_tokens = _trace_context_parallel_forward(monkeypatch, 1)
+    graph, num_tokens = _trace_context_parallel_forward(monkeypatch, 1, fused)
     shape_env = shape_variants.trace_shape_env(graph)
     assert shape_env is not None and shape_env.var_to_range
     assert shape_variants.unsupported_reason(shape_env, num_tokens) is None
