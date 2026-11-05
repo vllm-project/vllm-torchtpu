@@ -1041,7 +1041,11 @@ def _run_routed_expert_stream(
                         (compact_capacity, expert_input_size),
                     )
                     selected_rows = jnp.take_along_axis(
-                        rows, gather_indices, axis=0, mode="promise_in_bounds",
+                        rows,
+                        gather_indices,
+                        axis=0,
+                        mode="promise_in_bounds",
+                        wrap_negative_indices=False,
                     ).astype(jnp.float32)
                     destination[...] = jnp.where(
                         in_block[:, None], selected_rows, destination[...]
@@ -1061,7 +1065,11 @@ def _run_routed_expert_stream(
             ]
             gather_indices = jnp.full((1, expert_input_size), index % 16, jnp.int16)
             selected_row = jnp.take_along_axis(
-                rows, gather_indices, axis=0, mode="promise_in_bounds",
+                rows,
+                gather_indices,
+                axis=0,
+                mode="promise_in_bounds",
+                wrap_negative_indices=False,
             ).astype(jnp.float32)
             destination[pl.ds(position, 1), :] = selected_row
 
