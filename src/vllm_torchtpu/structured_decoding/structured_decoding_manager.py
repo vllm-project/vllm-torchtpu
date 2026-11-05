@@ -223,45 +223,16 @@ class StructuredDecodingManager:
 
         req_id_to_index = self.runner.input_batch.req_id_to_index
         bitmask = grammar_output.grammar_bitmask
-<<<<<<< HEAD
         req_ids = grammar_output.structured_output_request_ids
         mask_stride = self._mask_stride(bitmask, req_ids)
+        
+        local_indices = []
+        mask_rows = []
+        draft_counts = []
+        total_structured_drafts = 0
+        
         for grammar_idx, req_id in enumerate(req_ids):
             mask_row = grammar_idx * mask_stride
-            num_drafts = len(scheduled_spec_decode_tokens.get(req_id, ()))
-            batch_index = req_id_to_index.get(req_id)
-            if batch_index is None or not cur_start_idx <= batch_index < cur_end_idx:
-                continue
-            local_index = batch_index - cur_start_idx
-            if num_drafts:
-                assert target_row_starts is not None, (
-                    f"chunk without target_logits scheduled drafts for request {req_id}"
-                )
-                assert draft_lengths_cpu is not None
-                if draft_lengths_cpu[local_index] != num_drafts:
-                    raise ValueError(
-                        f"Draft lengths mismatch for request {req_id}: "
-                        f"scheduler scheduled {num_drafts} drafts, but runner recorded "
-                        f"{draft_lengths_cpu[local_index]} drafts."
-                    )
-                row = int(target_row_starts[local_index])
-                self.target_grammar_bitmask_np[row : row + num_drafts] = bitmask[
-                    mask_row : mask_row + num_drafts
-                ]
-                self.require_structured_out_target_np[row : row + num_drafts] = True
-            # Bonus row.
-            self.grammar_bitmask_np[local_index] = bitmask[mask_row + num_drafts]
-            self.require_structured_out_np[local_index] = True
-=======
-        local_indices: list[int] = []
-        mask_rows: list[int] = []
-        draft_counts: list[int] = []
-        is_contiguous = True
-        uniform_drafts = True
-        total_structured_drafts = 0
-        mask_row = 0
-
-        for req_id in grammar_output.structured_output_request_ids:
             num_drafts = len(scheduled_spec_decode_tokens.get(req_id, ()))
             batch_index = req_id_to_index.get(req_id)
             if batch_index is not None and cur_start_idx <= batch_index < cur_end_idx:
@@ -279,30 +250,16 @@ class StructuredDecodingManager:
                             f"but runner recorded {draft_lengths_cpu[local_idx]} "
                             "drafts."
                         )
-                if local_indices:
-                    if (
-                        local_idx != local_indices[-1] + 1
-                        or mask_row != mask_rows[-1] + 1 + draft_counts[-1]
-                    ):
-                        is_contiguous = False
-                    if num_drafts != draft_counts[0]:
-                        uniform_drafts = False
                 local_indices.append(local_idx)
                 mask_rows.append(mask_row)
                 draft_counts.append(num_drafts)
                 total_structured_drafts += num_drafts
-            mask_row += 1 + num_drafts
->>>>>>> 20e2b6b ([Structured Decoding] Add fast paths and vectorized 3D copy for speculative decoding)
 
         # Fast path 1: No structured requests in this chunk.
         if not local_indices:
             if target_logits is not None:
-                require_target: torch.Tensor | None = self.device_all_false_require[
-                    :padded_target_rows
-                ]
-                target_bitmask: torch.Tensor | None = self.device_dummy_bitmask[
-                    :padded_target_rows
-                ]
+                require_target = self.device_all_false_require[:padded_target_rows]
+                target_bitmask = self.device_dummy_bitmask[:padded_target_rows]
             else:
                 require_target = None
                 target_bitmask = None
@@ -332,54 +289,29 @@ class StructuredDecodingManager:
             self.target_grammar_bitmask_np[:padded_target_rows].fill(0)
             self.require_structured_out_target_np[:padded_target_rows].fill(False)
 
-        if is_contiguous and uniform_drafts:
-            l0 = local_indices[0]
-            m0 = mask_rows[0]
-            k = draft_counts[0]
-            if k == 0:
-                self.grammar_bitmask_np[l0 : l0 + num_local] = bitmask[
-                    m0 : m0 + num_local
+        target_row_starts = None
+        if target_logits is not None and total_structured_drafts > 0:
+            assert draft_lengths_cpu is not None
+            target_row_starts = np.zeros(len(draft_lengths_cpu) + 1, dtype=np.int64)
+            np.cumsum(draft_lengths_cpu, out=target_row_starts[1:])
+
+        for local_index, mask_row_i, num_drafts in zip(
+            local_indices, mask_rows, draft_counts
+        ):
+            if num_drafts:
+                assert target_row_starts is not None
+                row = int(target_row_starts[local_index])
+                self.target_grammar_bitmask_np[row : row + num_drafts] = bitmask[
+                    mask_row_i : mask_row_i + num_drafts
                 ]
-            else:
-                assert draft_lengths_cpu is not None
-                r0 = 0 if l0 == 0 else int(draft_lengths_cpu[:l0].sum())
-                stride = 1 + k
-                chunk_view = bitmask[m0 : m0 + num_local * stride].reshape(
-                    num_local, stride, -1
-                )
-                self.target_grammar_bitmask_np[r0 : r0 + total_structured_drafts] = (
-                    chunk_view[:, :k, :].reshape(total_structured_drafts, -1)
-                )
-                self.grammar_bitmask_np[l0 : l0 + num_local] = chunk_view[:, k, :]
                 if not all_target_structured:
                     self.require_structured_out_target_np[
-                        r0 : r0 + total_structured_drafts
+                        row : row + num_drafts
                     ] = True
+            # Bonus row.
+            self.grammar_bitmask_np[local_index] = bitmask[mask_row_i + num_drafts]
             if not all_bonus_structured:
-                self.require_structured_out_np[l0 : l0 + num_local] = True
-        else:
-            target_row_starts = None
-            if target_logits is not None and total_structured_drafts > 0:
-                assert draft_lengths_cpu is not None
-                target_row_starts = np.zeros(len(draft_lengths_cpu) + 1, dtype=np.int64)
-                np.cumsum(draft_lengths_cpu, out=target_row_starts[1:])
-
-            for local_index, mask_row_i, num_drafts in zip(
-                local_indices, mask_rows, draft_counts
-            ):
-                if num_drafts:
-                    assert target_row_starts is not None
-                    row = int(target_row_starts[local_index])
-                    self.target_grammar_bitmask_np[row : row + num_drafts] = bitmask[
-                        mask_row_i : mask_row_i + num_drafts
-                    ]
-                    if not all_target_structured:
-                        self.require_structured_out_target_np[
-                            row : row + num_drafts
-                        ] = True
-                self.grammar_bitmask_np[local_index] = bitmask[mask_row_i + num_drafts]
-                if not all_bonus_structured:
-                    self.require_structured_out_np[local_index] = True
+                self.require_structured_out_np[local_index] = True
 
         if target_logits is not None:
             if total_structured_drafts == 0:

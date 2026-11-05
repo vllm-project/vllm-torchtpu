@@ -1903,7 +1903,6 @@ class TPUModelRunner(GPUModelRunner):
                 f"{cache_hit_alignment_tokens=}."
             )
         speculative_config = self.vllm_config.speculative_config
-        num_hash_lookahead_tokens = self.vllm_config.num_hash_lookahead_tokens
         units = PrefillCheckpointUnits(
             hash_block_size=hash_block_size,
             cache_hit_alignment_tokens=cache_hit_alignment_tokens,
@@ -1912,9 +1911,7 @@ class TPUModelRunner(GPUModelRunner):
             drop_eagle_block=(
                 speculative_config is not None
                 and speculative_config.use_eagle_block_drop()
-                and not num_hash_lookahead_tokens
             ),
-            num_hash_lookahead_tokens=num_hash_lookahead_tokens,
         )
         self._prefill_ckpt_units = units
         self._prefill_ckpt_offsets_cpu = torch.zeros(
@@ -1923,13 +1920,11 @@ class TPUModelRunner(GPUModelRunner):
         logger.info(
             "GDN internal prefill checkpoints enabled: hash_block_size=%d "
             "cache_hit_alignment_tokens=%d mamba_block_size=%d alignment=%d "
-            "drop_eagle_block=%s num_hash_lookahead_tokens=%d",
             units.hash_block_size,
             units.cache_hit_alignment_tokens,
             units.mamba_block_size,
             units.alignment,
             units.drop_eagle_block,
-            units.num_hash_lookahead_tokens,
         )
 
     def _dummy_prefill_ckpt_offsets(self, num_reqs: int) -> torch.Tensor:
