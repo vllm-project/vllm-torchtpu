@@ -282,9 +282,7 @@ def build(
         )
     decode_mod = importlib.import_module(".decode", __package__)
     decode_ops_mod = importlib.import_module(".decode_ops", __package__)
-    decode_batch_sizes = importlib.import_module(
-        ".decode_ops", __package__
-    ).decode_batch_sizes
+    decode_batch_sizes = decode_ops_mod.decode_batch_sizes
 
     dense = spec_tokens_per_batch(config)
     draft = None

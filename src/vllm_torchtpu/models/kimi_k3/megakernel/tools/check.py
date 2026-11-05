@@ -454,9 +454,7 @@ def run_spec(args, records: harness.Records) -> None:
     import torch
 
     decode_ops_mod = importlib.import_module("..decode_ops", __package__)
-    decode_batch_sizes = importlib.import_module(
-        "..decode_ops", __package__
-    ).decode_batch_sizes
+    decode_batch_sizes = decode_ops_mod.decode_batch_sizes
     draft_class = importlib.import_module("..draft", __package__).draft_class
     bridge = (
         _bridge_type

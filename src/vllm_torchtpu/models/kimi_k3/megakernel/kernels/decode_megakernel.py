@@ -41,19 +41,14 @@ from . import mla_dcp
 _REGISTERED_DECODE_PYTREES: set[type[object]] = set()
 
 
-def _pytree_dataclass[DataclassT: type[object]](cls: DataclassT) -> DataclassT:
-    """Attach JAX pytree flattening to a frozen decode dataclass once."""
-    if cls not in _REGISTERED_DECODE_PYTREES:
-        jax.tree_util.register_dataclass(cls)
-        _REGISTERED_DECODE_PYTREES.add(cls)
-    return cls
-
-
-@_pytree_dataclass
 @dataclasses.dataclass(frozen=True, slots=True)
 class _PaddedBf16Rows(pool_alias.Reinterpret):
     """Expose active rows while preserving the full native row capacity (a
     multiple of 16 rows)."""
+
+    def __post_init__(self) -> None:
+        """Register decode dataclasses with JAX pytrees on first instantiation."""
+        ensure_decode_pytrees_registered()
 
     def _validate_shape(self, shape):
         rows, width = self.shape
@@ -1869,7 +1864,6 @@ def communication_scratch(batch_size: int = 1, attention_dp: int = 1) -> tuple[A
 TensorLike = jax_typing.ArrayLike | jax.ShapeDtypeStruct
 
 
-@_pytree_dataclass
 @dataclasses.dataclass(frozen=True, slots=True)
 class AttentionCommunicationWorkspace:
     """Collective transport storage shared by attention and MoE layers."""
@@ -1889,6 +1883,10 @@ class AttentionCommunicationWorkspace:
     attention_gather_vmem: Any = None  # B4: private final-gather packets
     routed_consumed: Any = None  # routed reduce-scatter: host-mates done reading their slots
     pair_semaphores: Any = None  # DP MoE-input gather: the rank pair's half-wire swap
+
+    def __post_init__(self) -> None:
+        """Register decode dataclasses with JAX pytrees on first instantiation."""
+        ensure_decode_pytrees_registered()
 
 
 class _ScopedWait:
@@ -1941,10 +1939,13 @@ def _gather_output_shards(
     ).wait()
 
 
-@_pytree_dataclass
 @dataclasses.dataclass(frozen=True, slots=True)
 class MixtureOfExpertsWeights:
     """MoE parameters and persistent resources for asynchronous weight copies."""
+
+    def __post_init__(self) -> None:
+        """Register decode dataclasses with JAX pytrees on first instantiation."""
+        ensure_decode_pytrees_registered()
 
     routing_projection: TensorLike  # [hidden_size, 896]
     routing_projection_vmem: Any  # [1, hidden_size, 512]
@@ -2066,7 +2067,6 @@ class MixtureOfExpertsWeights:
         )
 
 
-@_pytree_dataclass
 @dataclasses.dataclass(frozen=True, slots=True)
 class MixtureOfExpertsWorkspace:
     """Persistent VMEM and semaphores used by one MoE invocation."""
@@ -2093,6 +2093,10 @@ class MixtureOfExpertsWorkspace:
     # Sharded routing only: this pair's selection rows and everyone's.
     selection_source_vmem: Any = None  # [batch_size / 4, 128] FP32
     selections_vmem: Any = None  # [batch_size, 128] FP32
+
+    def __post_init__(self) -> None:
+        """Register decode dataclasses with JAX pytrees on first instantiation."""
+        ensure_decode_pytrees_registered()
 
 
 def moe(
@@ -3635,10 +3639,13 @@ def _traced_dot_position(stream, x_ref, position, guard, out_ref):
                 copy(position + stream.depth, destination, semaphore).start()
 
 
-@_pytree_dataclass
 @dataclasses.dataclass(frozen=True, slots=True)
 class KimiDeltaAttentionWeights:
     """KDA parameters and their persistent projection-copy resources."""
+
+    def __post_init__(self) -> None:
+        """Register decode dataclasses with JAX pytrees on first instantiation."""
+        ensure_decode_pytrees_registered()
 
     gate_projection: TensorLike  # [hidden_size, 128]
     gate_projection_vmem: Any  # [hidden_size, 128]
@@ -4205,10 +4212,13 @@ def kda(
         state_stream.finish()
 
 
-@_pytree_dataclass
 @dataclasses.dataclass(frozen=True, slots=True)
 class MultiHeadLatentAttentionWeights:
     """MLA parameters and their persistent projection-copy resources."""
+
+    def __post_init__(self) -> None:
+        """Register decode dataclasses with JAX pytrees on first instantiation."""
+        ensure_decode_pytrees_registered()
 
     query_down_projection: TensorLike  # [hidden_size, 1536]
     query_down_projection_vmem: Any  # [hidden_size, 1536]
@@ -4267,7 +4277,6 @@ PAGE_TOKENS = 256  # tokens per paged MLA cache page (two 128-token read tiles)
 MLA_LAYERS = 24
 
 
-@_pytree_dataclass
 @dataclasses.dataclass(frozen=True, slots=True)
 class MultiHeadLatentAttentionWorkspace:
     """Persistent VMEM and semaphores used by one MLA invocation."""
@@ -4284,6 +4293,26 @@ class MultiHeadLatentAttentionWorkspace:
     maximum_vmem: Any  # [batch_size, 3, 1]
     denominator_vmem: Any  # [batch_size, 3, 1]
     accumulator_vmem: Any  # [batch_size, 3, 128]
+
+    def __post_init__(self) -> None:
+        """Register decode dataclasses with JAX pytrees on first instantiation."""
+        ensure_decode_pytrees_registered()
+
+
+def ensure_decode_pytrees_registered() -> None:
+    """Register decode dataclasses with JAX pytrees once on first use."""
+    if not _REGISTERED_DECODE_PYTREES:
+        for cls in (
+            _PaddedBf16Rows,
+            AttentionCommunicationWorkspace,
+            MixtureOfExpertsWeights,
+            MixtureOfExpertsWorkspace,
+            KimiDeltaAttentionWeights,
+            MultiHeadLatentAttentionWeights,
+            MultiHeadLatentAttentionWorkspace,
+        ):
+            jax.tree_util.register_dataclass(cls)
+            _REGISTERED_DECODE_PYTREES.add(cls)
 
 
 def mla(
@@ -8831,6 +8860,7 @@ def decode_local(
     pools receive all rows. ``aux_hidden_layers`` additionally returns the
     residual stream entering those layers as ``[len, batch, hidden]``.
     """
+    ensure_decode_pytrees_registered()
     if gate_first_kda_projection is False:
         raise ValueError("The clean decoder always uses the split KDA gate projection")
     gate_first_kda_projection = True

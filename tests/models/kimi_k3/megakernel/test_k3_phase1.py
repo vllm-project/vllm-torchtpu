@@ -51,6 +51,7 @@ _CONST_1792 = 1792
 _CONST_2 = 2
 _CONST_2048 = 2048
 _CONST_256 = 256
+_CONST_3 = 3
 _CONST_32 = 32
 _CONST_4096 = 4096
 _CONST_512 = 512
@@ -722,3 +723,46 @@ def test_k3_prefill_moe_8192_routed_experts_prepared_lowering() -> None:
     assert "tpu_custom_call" in lowered.as_text()
     assert lowered.out_info.shape == (_CONST_256, _CONST_3584)
     assert lowered.out_info.dtype == jnp.float32
+
+
+def test_pytrees_register_lazily_on_first_use(monkeypatch: _Dynamic) -> None:
+    """Verify decode and prefill dataclasses avoid import-time registration."""
+    dm = importlib.import_module(
+        "vllm_torchtpu.models.kimi_k3.megakernel.kernels.decode_megakernel"
+    )
+    k = importlib.import_module(
+        "vllm_torchtpu.models.kimi_k3.megakernel.kernels.prefill_megakernel"
+    )
+    for mod in (dm, k):
+        tree = ast.parse(
+            pathlib.Path(mod.__file__).read_text(encoding="utf-8"),
+            filename=mod.__file__,
+        )
+        for node in tree.body:
+            if isinstance(node, ast.ClassDef):
+                decos = [ast.unparse(d) for d in node.decorator_list]
+                assert all("register" not in d and "pytree" not in d for d in decos)
+
+    recorded_decode: list[type[object]] = []
+    monkeypatch.setattr(dm, "_REGISTERED_DECODE_PYTREES", set())
+    monkeypatch.setattr(
+        jax.tree_util,
+        "register_dataclass",
+        recorded_decode.append,
+    )
+    _ = dm.MultiHeadLatentAttentionWorkspace(*[jnp.zeros(1)] * _CONST_10)
+    assert len(recorded_decode) == _CONST_7
+    _ = dm.MultiHeadLatentAttentionWorkspace(*[jnp.zeros(1)] * _CONST_10)
+    assert len(recorded_decode) == _CONST_7
+
+    recorded_prefill: list[type[object]] = []
+    monkeypatch.setattr(k, "_REGISTERED_PREFILL_PYTREES", set())
+    monkeypatch.setattr(
+        jax.tree_util,
+        "register_dataclass",
+        recorded_prefill.append,
+    )
+    _ = k.MetadataRef(gm_id_to_group_id=jnp.zeros(1), gm_id_to_m_offset=jnp.zeros(1))
+    assert len(recorded_prefill) == _CONST_3
+    _ = k.WeightsRef(weight=jnp.zeros(1), scale=jnp.zeros(1))
+    assert len(recorded_prefill) == _CONST_3
