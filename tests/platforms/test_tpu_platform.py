@@ -889,14 +889,14 @@ class TestTpuPlatform:
         # before this hook runs; the hook must not clobber that choice.
         vllm_config.cache_config.block_size = 16
         vllm_config.parallel_config.worker_cls = (
-            "vllm_torchtpu.omni.tpu_ar_worker.TPUARWorker"
+            "vllm_torchtpu.omni.worker.tpu_ar_worker.TPUARWorker"
         )
 
         TpuPlatform.check_and_update_config(vllm_config)
 
         assert (
             vllm_config.parallel_config.worker_cls
-            == "vllm_torchtpu.omni.tpu_ar_worker.TPUARWorker"
+            == "vllm_torchtpu.omni.worker.tpu_ar_worker.TPUARWorker"
         )
 
     @pytest.mark.parametrize(
@@ -1233,11 +1233,17 @@ def test_qwen_wrappers_are_installed_once_across_model_loads(
     originals = [getattr(target, name) for target, name in targets]
     for (target, name), original in zip(targets, originals):
         monkeypatch.setattr(target, name, original)
+    # Every model-gated callback runs against these, so they carry the fields
+    # a real ModelConfig has: hf_config, model and architectures.
     other_model = SimpleNamespace(
-        hf_config=SimpleNamespace(model_type="llama"), model="llama"
+        hf_config=SimpleNamespace(model_type="llama"),
+        model="llama",
+        architectures=["LlamaForCausalLM"],
     )
     qwen_model = SimpleNamespace(
-        hf_config=SimpleNamespace(model_type="qwen3_vl"), model="Qwen/Qwen3-VL-4B"
+        hf_config=SimpleNamespace(model_type="qwen3_vl"),
+        model="Qwen/Qwen3-VL-4B",
+        architectures=["Qwen3VLForConditionalGeneration"],
     )
     reg.apply("platform_activation", model_config=other_model)
     assert [getattr(target, name) for target, name in targets] == originals

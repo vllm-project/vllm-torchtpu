@@ -11,15 +11,20 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""TPU Autoregressive (AR) Worker for Omni models."""
+"""TPU worker for autoregressive vLLM-Omni stages."""
 
 from vllm_omni.worker.mixins import OmniWorkerMixin
 
-from vllm_torchtpu.omni.omni_tpu_ar_model_runner import OmniTPUARModelRunner
-from vllm_torchtpu.worker.tpu_worker import TPUWorker
+from vllm_torchtpu.omni.worker.base import OmniTPUWorkerBase
+from vllm_torchtpu.omni.worker.tpu_ar_model_runner import TPUARModelRunner
 
 
-class TPUARWorker(OmniWorkerMixin, TPUWorker):
-    """TPU AR worker for autoregressive stages (thinker, talker) in Omni models."""
+class TPUARWorker(OmniWorkerMixin, OmniTPUWorkerBase):
+    """TPU worker for autoregressive stages; the counterpart of ``GPUARWorker``.
 
-    model_runner_cls = OmniTPUARModelRunner
+    ``OmniTpuPlatform.get_omni_ar_worker_cls`` points vLLM-Omni here. The
+    worker only swaps in the AR runner; ``TPUARModelRunner`` decides which
+    stages it serves.
+    """
+
+    model_runner_cls = TPUARModelRunner

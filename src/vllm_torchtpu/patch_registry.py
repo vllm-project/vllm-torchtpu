@@ -171,7 +171,7 @@ PATCHES = (
         model_config=True,
     ),
     Patch(
-        "vllm_torchtpu.omni.qwen3omni_thinker_patch:maybe_patch_qwen3_omni_thinker",
+        "vllm_torchtpu.omni.patches.qwen3omni_thinker:maybe_patch_qwen3_omni_thinker",
         ("platform_activation", "model_load"),
         model_config=True,
     ),

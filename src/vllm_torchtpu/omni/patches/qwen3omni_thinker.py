@@ -39,10 +39,10 @@ device. ``forward`` is the only caller of ``_get_cnn_output_lengths`` in
 both vLLM and vLLM-Omni, so nothing else observes the device change.
 
 Installed through ``patch_registry.PATCHES`` at ``platform_activation`` and
-``model_load`` for Qwen3-Omni models only. The thinker stage runs in a
-``TPUWorker`` (``TPUARWorker``), which drives both stages; the callback
-returns ``False`` for every other architecture so the registry retries it
-once a model config is known.
+``model_load`` for ``Qwen3OmniMoeForConditionalGeneration`` only. The thinker
+stage runs in a ``TPUWorker`` (``TPUARWorker``), which drives both stages; the
+callback returns ``False`` for every other architecture so the registry
+retries it once a model config is known.
 
 TODO: remove once vLLM-Omni computes ``chunk_num`` with integer
 ceil-division, ``(feature_lens + window - 1) // window``, in
@@ -66,31 +66,23 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+_QWEN3_OMNI_ARCH = "Qwen3OmniMoeForConditionalGeneration"
+
 # Idempotence marker on the wrapped ``forward``. The registry runs a callback
 # once per process; the marker covers forks and direct calls from tests.
 _AUDIO_CHUNK_LENGTHS_PATCHED = "_tpu_audio_chunk_lengths_patched"
 
 
 def _is_qwen3_omni_model(model_config: ModelConfig | None) -> bool:
-    """Whether ``model_config`` is a Qwen3-Omni model or one of its stages.
+    """Whether ``model_config`` serves ``Qwen3OmniMoeForConditionalGeneration``.
 
-    The full model reports ``model_type == "qwen3_omni_moe"`` and the thinker
-    stage ``"qwen3_omni_moe_thinker"``. The talker stage has an empty
-    ``model_type``, so the architecture names
-    (``Qwen3OmniMoe*ForConditionalGeneration``) are checked as well. ``None``,
-    which ``platform_activation`` passes when no model is configured yet, is
-    not a match: the registry then retries the callback at ``model_load``.
+    ``ModelConfig.architectures`` is the checkpoint's architecture list; for a
+    vLLM-Omni stage it is the pipeline's ``model_arch``, which is this name
+    for every Qwen3-Omni stage. ``None``, which ``platform_activation`` passes
+    when no model is configured yet, is not a match: the registry then retries
+    the callback at ``model_load``.
     """
-    if model_config is None:
-        return False
-    hf_config = model_config.hf_config
-    if hf_config is not None:
-        if "qwen3_omni" in str(getattr(hf_config, "model_type", "")).lower():
-            return True
-        architectures = getattr(hf_config, "architectures", None) or []
-        if any("qwen3omnimoe" in str(arch).lower() for arch in architectures):
-            return True
-    return "qwen3-omni" in str(model_config.model).lower()
+    return model_config is not None and _QWEN3_OMNI_ARCH in model_config.architectures
 
 
 def maybe_patch_qwen3_omni_thinker(model_config: ModelConfig | None = None) -> bool:
