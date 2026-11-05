@@ -966,6 +966,70 @@ def test_mla_wrapper_qrep_dense_layer_keeps_its_rank_block():
     )
 
 
+def test_mla_process_weights_after_loading_qrep_wraps_parameter(monkeypatch):
+    """Upstream `MLAAttention.process_weights_after_loading` registers
+    `W_UK_T_dcp_qrep` in `_parameters` via `replace_parameter`; TPU's override
+    must re-assign a `torch.nn.Parameter` rather than a bare tensor."""
+    from vllm.model_executor.utils import replace_parameter
+
+    from vllm_torchtpu.layers.adapter.custom_ops import mla_attention_op
+
+    attention = VllmMLAAttention.__new__(VllmMLAAttention)
+    torch.nn.Module.__init__(attention)
+    attention.prefix = "model.layers.0.self_attn.attn"
+    attention.dcp_q_replicate = True
+    attention.kv_b_proj = torch.nn.Module()
+    attention.kv_b_proj.register_parameter(
+        "weight", torch.nn.Parameter(torch.ones((4, 6), dtype=torch.bfloat16))
+    )
+    impl = MagicMock()
+    impl.dcp_size = 1
+    impl._get_kv_scales.return_value = (1.0, 1.0, 1.0)
+    impl._build_mla_op.return_value = MagicMock()
+    impl._build_sparse_mla_op.return_value = MagicMock()
+    attention.impl = impl
+
+    fake_group = SimpleNamespace(
+        world_size=2,
+        all_gather=lambda t, dim=0: torch.cat([t, t], dim=dim),
+    )
+
+    def upstream_process(_self, _act_dtype):
+        replace_parameter(
+            attention,
+            "W_UV",
+            torch.ones((2, 4, 3), dtype=torch.bfloat16),
+            prefer_copy=True,
+        )
+        replace_parameter(
+            attention,
+            "W_UK_T",
+            torch.ones((2, 3, 4), dtype=torch.bfloat16),
+            prefer_copy=True,
+        )
+        replace_parameter(
+            attention,
+            "W_UK_T_dcp_qrep",
+            fake_group.all_gather(attention.W_UK_T.contiguous(), dim=0),
+            prefer_copy=True,
+        )
+
+    monkeypatch.setattr(
+        "vllm.model_executor.layers.attention.mla_attention.MLAAttention.process_weights_after_loading",
+        upstream_process,
+    )
+    monkeypatch.setattr(mla_attention_op, "get_dcp_group", lambda: fake_group)
+    monkeypatch.setattr(mla_attention_op, "should_quantize_on_load", lambda _p: True)
+    monkeypatch.setattr(
+        torch, "device", lambda name: torch.empty(0).device if name == "tpu" else name
+    )
+
+    attention.process_weights_after_loading(torch.bfloat16)
+    assert isinstance(attention.W_UK_T_dcp_qrep, torch.nn.Parameter)
+    assert isinstance(attention.W_UK_T_dcp_qrep_scale, torch.nn.Parameter)
+    assert attention.W_UK_T_dcp_qrep.shape == (4, 3, 4)
+
+
 def test_mla_forward_qrep_skips_the_gather_and_absorbs_group_heads(monkeypatch):
     """On the sparse DCP path a replicated q is consumed directly, against the
     group-wide `W_UK_T`, and the per-step head all-gather is not run."""
