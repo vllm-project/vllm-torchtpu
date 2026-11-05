@@ -13,29 +13,43 @@
 # limitations under the License.
 """Unit tests for the TPU Reflection Beam model.
 
-Covers registration, the config checks, the pure PyTorch ops and the
-fp32-accurate router, on CPU and on TPU.
+Covers registration, the config checks, checkpoint loading, the pure PyTorch
+ops and the fp32-accurate router, on CPU and on TPU.
 """
 
+import hashlib
 from types import SimpleNamespace
 
 import pytest
 import torch
 import torch.nn.functional as F
-from vllm.config import DeviceConfig, VllmConfig, set_current_vllm_config
+from torch import nn
+from vllm.config import (
+    CompilationMode,
+    DeviceConfig,
+    VllmConfig,
+    set_current_vllm_config,
+)
 from vllm.model_executor.layers.fused_moe import GateLinear
 from vllm.model_executor.layers.rotary_embedding.base import RotaryEmbedding
 from vllm.model_executor.models import ModelRegistry
 from vllm.model_executor.models.config import MODELS_CONFIG_MAP
+from vllm.platforms import current_platform
 from vllm.transformers_utils.configs.beam import BeamConfig
+from vllm.utils.torch_utils import set_default_torch_dtype
 
+import vllm_torchtpu.models.vllm.beam.model as beam_model
+from vllm_torchtpu.layers.adapter.quantization.compressed_tensors.compressed_tensors import (  # noqa: E501
+    VllmCompressedTensorsConfig,
+)
+from vllm_torchtpu.layers.adapter.quantization.fp8 import VllmFp8Config
 from vllm_torchtpu.models.vllm import register_models
 from vllm_torchtpu.models.vllm.beam import ops
 from vllm_torchtpu.models.vllm.beam.config import TPUBeamConfig
 from vllm_torchtpu.models.vllm.beam.model import BeamForCausalLM
 from vllm_torchtpu.models.vllm.beam.router import BeamRouter
 
-BF16, FP32 = torch.bfloat16, torch.float32
+BF16, FP32, FP8 = torch.bfloat16, torch.float32, torch.float8_e4m3fn
 
 # The fields of the released Beam-1.0-501B-A23B config.json.
 RELEASED_CONFIG = dict(
@@ -189,6 +203,147 @@ def test_config_rejects_unsupported_flag(clean_check_flags, monkeypatch, flag):
     monkeypatch.setenv(flag, "1")
     with pytest.raises(NotImplementedError, match=f"unset {flag}"):
         TPUBeamConfig.verify_and_update_config(_config_for_checks())
+
+
+# The quantization_config of Beam-1.0-501B-A23B-FP8 (revision 077872da), without
+# its null and bookkeeping fields.
+_FP8_TENSORS = dict(num_bits=8, symmetric=True, type="float")
+FP8_QUANTIZATION_CONFIG = {
+    "quant_method": "compressed-tensors",
+    "format": "float-quantized",
+    "config_groups": {
+        "FP8_DYNAMIC": {
+            "targets": ["Linear"],
+            "weights": dict(_FP8_TENSORS, dynamic=False, strategy="channel"),
+            "input_activations": dict(_FP8_TENSORS, dynamic=True, strategy="token"),
+        }
+    },
+    "ignore": ["lm_head", "model.embed_tokens", "re:.*mlp\\.gate$"],
+}
+
+
+def _checkpoint_tensors(config: BeamConfig, *, fp8: bool):
+    """Yields (name, shape, dtype) of every tensor of a Beam checkpoint.
+
+    FP8 checkpoints hold e4m3 linear weights with a bf16 scale per output row.
+    """
+    hidden, head_dim, experts = config.hidden_size, config.head_dim, config.num_experts
+    q_size = config.num_attention_heads * head_dim
+    kv_size = config.num_key_value_heads * head_dim
+
+    def linears(prefix, *projs):
+        for proj, out_size, in_size in projs:
+            yield (
+                f"{prefix}.{proj}_proj.weight",
+                (out_size, in_size),
+                FP8 if fp8 else BF16,
+            )
+            if fp8:
+                yield f"{prefix}.{proj}_proj.weight_scale", (out_size, 1), BF16
+
+    yield "model.embed_tokens.weight", (config.vocab_size, hidden), BF16
+    yield "model.norm.weight", (hidden,), BF16
+    yield "lm_head.weight", (config.vocab_size, hidden), BF16
+    for layer, mlp_type in enumerate(config.mlp_layer_types):
+        prefix = f"model.layers.{layer}"
+        for norm in ("input", "post_attention", "pre_feedforward", "post_feedforward"):
+            yield f"{prefix}.{norm}_layernorm.weight", (hidden,), BF16
+        attn = f"{prefix}.self_attn"
+        yield from linears(
+            attn,
+            ("q", q_size, hidden),
+            ("k", kv_size, hidden),
+            ("v", kv_size, hidden),
+            ("gate", q_size, hidden),
+            ("o", hidden, q_size),
+        )
+        yield f"{attn}.gate_bias", (config.num_attention_heads,), BF16
+        yield f"{attn}.q_norm.weight", (head_dim,), BF16
+        yield f"{attn}.k_norm.weight", (head_dim,), BF16
+        if mlp_type == "dense":
+            mlps, size = [f"{prefix}.mlp"], config.intermediate_size
+        else:
+            yield f"{prefix}.mlp.gate.weight", (experts, hidden), FP32
+            yield f"{prefix}.mlp.gate.e_score_correction_bias", (experts,), FP32
+            mlps = [f"{prefix}.mlp.experts.{e}" for e in range(experts)]
+            size = config.moe_intermediate_size
+        for mlp in mlps:
+            yield from linears(
+                mlp,
+                ("gate", size, hidden),
+                ("up", size, hidden),
+                ("down", hidden, size),
+            )
+
+
+@pytest.mark.parametrize(
+    "fp8,count,digest",
+    [
+        (False, 38366, "9161379b68290704feb12d19059067bb3517578c734bce86faa83674ed06e75d"),  # noqa: E501
+        (True,  76267, "ee4b6ffe4fcb9af2b76104d924dc60fe1fcfd88604af241bbed78f80399fc4a1"),  # noqa: E501
+    ],
+    ids=["bf16", "fp8"],
+)  # fmt: skip
+def test_checkpoint_tensors_match_released_index(fp8, count, digest):
+    """``_checkpoint_tensors`` names exactly the released checkpoint's tensors.
+
+    The digests are sha256("\\n".join(sorted(index["weight_map"]))) of the
+    model.safetensors.index.json of reflection/Beam-1.0-501B-A23B and
+    Beam-1.0-501B-A23B-FP8 (rev 077872da). Without this, the load test's names
+    would only echo the model's own.
+    """
+    config = BeamConfig(**RELEASED_CONFIG)
+    names = sorted(name for name, _, _ in _checkpoint_tensors(config, fp8=fp8))
+    assert len(names) == count
+    assert hashlib.sha256("\n".join(names).encode()).hexdigest() == digest
+
+
+def _meta_model_config(config: BeamConfig, monkeypatch, *, fp8: bool) -> VllmConfig:
+    """A CPU VllmConfig for building the full-size model on the meta device."""
+    vllm_config = VllmConfig(device_config=DeviceConfig(device="cpu"))
+    vllm_config.model_config = SimpleNamespace(
+        hf_config=config, max_model_len=4096, dtype=BF16, head_dtype=None
+    )
+    vllm_config.compilation_config.mode = CompilationMode.NONE
+    if fp8:
+        vllm_config.quant_config = VllmCompressedTensorsConfig.from_config(
+            FP8_QUANTIZATION_CONFIG
+        )
+        # Mirrors VllmConfig._set_quant_config / set_configs on TPU quant classes.
+        for cls in (VllmCompressedTensorsConfig, VllmFp8Config):
+            monkeypatch.setattr(cls, "vllm_config", vllm_config, raising=False)
+    return vllm_config
+
+
+def _zeros_for_load(name, shape, dtype):
+    # BeamRouter splits its fp32 weight on the host, so it needs data.
+    device = "cpu" if name.endswith(".mlp.gate.weight") else "meta"
+    return torch.zeros(shape, dtype=dtype, device=device)
+
+
+@pytest.mark.parametrize("fp8", [False, True], ids=["bf16", "fp8"])
+def test_released_checkpoint_loads_into_every_parameter(monkeypatch, request, fp8):
+    """Every released tensor loads into the full-size meta model, filling it."""
+    config = BeamConfig(**RELEASED_CONFIG)
+    monkeypatch.setattr(current_platform, "device_name", "cpu")
+    monkeypatch.setattr(current_platform, "device_type", "cpu")
+    request.getfixturevalue("dist_ctx")  # A CPU (gloo) group, after the patch.
+    monkeypatch.setattr(beam_model, "Attention", lambda *args, **kwargs: nn.Identity())
+    vllm_config = _meta_model_config(config, monkeypatch, fp8=fp8)
+    with (
+        set_current_vllm_config(vllm_config),
+        set_default_torch_dtype(BF16),
+        torch.device("meta"),
+    ):
+        model = BeamForCausalLM(vllm_config=vllm_config)
+
+    tensors = _checkpoint_tensors(config, fp8=fp8)
+    with set_current_vllm_config(vllm_config):
+        loaded = model.load_weights(
+            (name, _zeros_for_load(name, shape, dtype))
+            for name, shape, dtype in tensors
+        )
+    assert loaded == {name for name, _ in model.named_parameters()}
 
 
 def _randn(generator, *shape, dtype=BF16, scale=1.0):
