@@ -438,6 +438,7 @@ def test_an_unclipped_mtp_prompt_runs_whole_with_internal_checkpoints(
     scheduler.hash_block_size = 3072
     scheduler.use_eagle = True
     scheduler.use_eagle_block_drop = True
+    scheduler.num_hash_lookahead_tokens = 0
     scheduler.max_num_scheduled_tokens = 16384
     scheduler.scheduler_config = SimpleNamespace(long_prefill_token_threshold=16384)
     scheduler.mamba_has_prefill_checkpoint_blocks = checkpoint_blocks

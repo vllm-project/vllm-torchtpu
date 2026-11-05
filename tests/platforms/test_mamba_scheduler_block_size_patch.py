@@ -47,6 +47,7 @@ def _scheduler():
         block_size=3072,
         use_eagle=True,
         use_eagle_block_drop=False,
+        num_hash_lookahead_tokens=0,
         max_num_scheduled_tokens=16384,
         scheduler_config=SimpleNamespace(long_prefill_token_threshold=0),
         mamba_partial_cache_hit=False,

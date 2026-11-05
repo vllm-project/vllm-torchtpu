@@ -498,9 +498,9 @@ def _build_kv_connector_output(
 ) -> KVConnectorOutput:
     """Build the runner's KVConnectorOutput.
 
-    ``failed_recving`` needs vLLM >= 0.31 (the pin is v0.32.0).
+    ``failed_recving`` needs vLLM >= 0.31 (the pin is v0.33.0).
     ``invalid_block_group_index`` is passed only when ``KVConnectorOutput``
-    has it. v0.32.0 does not, so it rejects block-level load failures on
+    has it. v0.33.0 does not, so it rejects block-level load failures on
     multi-group KV layouts; connectors for those layouts must report failed
     requests through ``failed_recving``.
     """
@@ -1838,8 +1838,9 @@ class TPUModelRunner(GPUModelRunner):
 
         They must match the engine core's: the hash block and cache-hit
         alignment it resolved into kv_cache_config, the Mamba block at the
-        column stride the metadata builder reads the block table with, and the
-        eagle bit including the TPU override.
+        column stride the metadata builder reads the block table with, the eagle
+        bit including the TPU override, and the lookahead block hashes, which
+        replace the eagle drop.
         """
         self._prefill_ckpt_units = None
         self._prefill_ckpt_offsets_cpu = None
@@ -1876,6 +1877,7 @@ class TPUModelRunner(GPUModelRunner):
                 f"{cache_hit_alignment_tokens=}."
             )
         speculative_config = self.vllm_config.speculative_config
+        num_hash_lookahead_tokens = self.vllm_config.num_hash_lookahead_tokens
         units = PrefillCheckpointUnits(
             hash_block_size=hash_block_size,
             cache_hit_alignment_tokens=cache_hit_alignment_tokens,
@@ -1884,7 +1886,9 @@ class TPUModelRunner(GPUModelRunner):
             drop_eagle_block=(
                 speculative_config is not None
                 and speculative_config.use_eagle_block_drop()
+                and not num_hash_lookahead_tokens
             ),
+            num_hash_lookahead_tokens=num_hash_lookahead_tokens,
         )
         self._prefill_ckpt_units = units
         self._prefill_ckpt_offsets_cpu = torch.zeros(
@@ -1893,12 +1897,13 @@ class TPUModelRunner(GPUModelRunner):
         logger.info(
             "GDN internal prefill checkpoints enabled: hash_block_size=%d "
             "cache_hit_alignment_tokens=%d mamba_block_size=%d alignment=%d "
-            "drop_eagle_block=%s",
+            "drop_eagle_block=%s num_hash_lookahead_tokens=%d",
             units.hash_block_size,
             units.cache_hit_alignment_tokens,
             units.mamba_block_size,
             units.alignment,
             units.drop_eagle_block,
+            units.num_hash_lookahead_tokens,
         )
 
     def _dummy_prefill_ckpt_offsets(self, num_reqs: int) -> torch.Tensor:
@@ -4892,6 +4897,7 @@ class TPUModelRunner(GPUModelRunner):
                 min_tokens_rows = min_tokens_mask.verify_rows(
                     min_toks, cur_start_idx, draft_lengths.tolist()
                 )
+        draft_token_ids = md.draft_token_ids
         if all_greedy and grammar_output is None:
             bonus_token_ids, target_logits = self.spec_bonus_and_target_logits(
                 logits, md.bonus_logits_indices, md.target_logits_indices
@@ -4913,6 +4919,15 @@ class TPUModelRunner(GPUModelRunner):
                     )
                 )
                 assert target_logits is not None
+                draft_token_ids = (
+                    self.structured_decoding_manager.mask_invalid_draft_tokens(
+                        draft_token_ids,
+                        grammar_output,
+                        cur_start_idx,
+                        cur_end_idx,
+                        draft_lengths_cpu=md.draft_lengths_cpu,
+                    )
+                )
             if min_tokens_rows is not None:
                 target_rows, bonus_rows = min_tokens_rows
                 target_logits = self._mask_min_tokens(
@@ -4948,14 +4963,14 @@ class TPUModelRunner(GPUModelRunner):
         assert self.speculative_config is not None
         if self.rejection_sampler.synthetic_mode or not all_greedy:
             accept_u = torch.rand(
-                md.draft_token_ids.shape,
+                draft_token_ids.shape,
                 dtype=torch.float32,
                 device=target_logits.device,
                 generator=sampling_generator,
             )
         if all_greedy:
             return self.rejection_sampler(
-                draft_token_ids=md.draft_token_ids,
+                draft_token_ids=draft_token_ids,
                 num_draft_tokens=md.draft_lengths,
                 target_logits=target_logits,
                 bonus_token_ids=bonus_token_ids,
@@ -4972,7 +4987,7 @@ class TPUModelRunner(GPUModelRunner):
             target_logits, dtype=torch.float32, generator=sampling_generator
         )
         return self.rejection_sampler(
-            draft_token_ids=md.draft_token_ids,
+            draft_token_ids=draft_token_ids,
             num_draft_tokens=md.draft_lengths,
             target_logits=target_logits,
             bonus_token_ids=bonus_token_ids,
@@ -6580,6 +6595,11 @@ class TPUModelRunner(GPUModelRunner):
                     arange,
                 )
                 synchronize_tensors(out)
+                out = self.structured_decoding_manager.pin_invalid_draft_tokens(
+                    torch.zeros((num_tokens,), dtype=torch.bool).to(self.device),
+                    torch.zeros((num_tokens,), dtype=torch.int32).to(self.device),
+                )
+                synchronize_tensors(out)
                 logger.info("  -- target_logits_length: %d", num_tokens)
 
     def _verify_logits_paddings(self) -> list[int]:
@@ -7698,8 +7718,8 @@ class TPUModelRunner(GPUModelRunner):
         sp = SamplingParams(temperature=0.0 if greedy else 1.0)
         logger.info("spec-decode warmup batch: R=%d P=%d greedy=%s", R, P, greedy)
         try:
-            # Match the low-block working set used by the LIFO BlockPool
-            # workaround. High physical block ids can trigger the v7x SC2
+            # Match the low-block working set that vLLM's LIFO reuse of freed
+            # blocks keeps in service. High physical block ids can trigger the v7x SC2
             # indexed-KV halt even though they are inside the allocated pool.
             # Warmup runs before serving, with no live scheduler requests;
             # reserve block 0 and keep each synthetic request's range disjoint.
@@ -7860,8 +7880,8 @@ class TPUModelRunner(GPUModelRunner):
         room = self.max_model_len - P
         n_dec = min(max(5, K + 2), max(0, room // (1 + K) - 1))
         decode_ncts = [P + t for t in range(n_dec)]
-        # Reuse low physical block ids, as in _warmup_spec_batch and the LIFO
-        # BlockPool workaround, rather than exercising the SC2-sensitive end
+        # Reuse low physical block ids, as in _warmup_spec_batch and vLLM's
+        # LIFO reuse of freed blocks, rather than exercising the SC2-sensitive end
         # of the pool. Warmup runs before serving and tears down each request;
         # real requests overwrite their valid KV positions on first prefill.
         # Cover the highest context this request reaches, reserving block 0.
@@ -8220,7 +8240,7 @@ class TPUModelRunner(GPUModelRunner):
         Groups whose kernel block is smaller than their manager block get a
         `KernelBlockTable`, so the block tables hold the kernel block ids TPU
         attention reads. `kernel_block_sizes` is required; its `None` default
-        only matches the vLLM 0.32 base signature.
+        only matches the vLLM 0.33.0 base signature.
         """
         if kernel_block_sizes is None:
             raise ValueError("kernel_block_sizes is required on TPU")

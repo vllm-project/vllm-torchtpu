@@ -177,7 +177,9 @@ class TPUWorker(WorkerBase):
                 "Profiling enabled. Traces will be saved to: %s", self.profile_dir
             )
 
-    def set_kv_cache_layout(self, kv_cache_layout: str) -> None:
+    def set_kv_cache_layout(
+        self, kv_cache_layout: str, cp_kv_cache_interleave_size: int
+    ) -> None:
         # TPU resolves before model load because layout determines its page
         # geometry. Check the actual loaded backends when engine core publishes
         # that choice; its pre-resolved-config path does not validate them.
@@ -187,7 +189,7 @@ class TPUWorker(WorkerBase):
                 f"TPU KV cache layout {kv_cache_layout} is incompatible with "
                 f"the loaded attention backends; supported layouts: {supported}"
             )
-        super().set_kv_cache_layout(kv_cache_layout)
+        super().set_kv_cache_layout(kv_cache_layout, cp_kv_cache_interleave_size)
 
     def initialize_cache(self, num_gpu_blocks: int, num_cpu_blocks: int) -> None:
         self.cache_config.num_gpu_blocks = num_gpu_blocks

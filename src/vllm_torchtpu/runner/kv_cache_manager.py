@@ -43,7 +43,7 @@ from vllm.models.deepseek_v4.attention import (
 from vllm.models.deepseek_v4.compressor import CompressorStateCache
 from vllm.v1.attention.backend import AttentionLayer, AttentionType
 from vllm.v1.attention.backends.mla.sparse_swa import DeepseekV4SWACache
-from vllm.v1.core.kv_cache_utils import get_kv_cache_groups
+from vllm.v1.core.kv_cache_planning import get_kv_cache_groups
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     FullAttentionSpec,
@@ -436,6 +436,15 @@ class KVCacheManager:
                 )
             else:
                 continue
+
+        for layer_name, attn_module in layers.items():
+            if (
+                layer_name in kv_cache_spec
+                and getattr(attn_module, "is_draft_layer", False) is True
+            ):
+                kv_cache_spec[layer_name] = dataclasses.replace(
+                    kv_cache_spec[layer_name], is_draft=True
+                )
 
         # Note: that each shared layer's target actually owns a KV cache (and
         # that the shared layer was not itself allocated one) is enforced later
@@ -841,7 +850,7 @@ class KVCacheManager:
         #   e.g. 10 full-attn      + 30 mamba     → min (1 attn + 3 mamba)
         #
         # This duplicates the heuristic from
-        # `vllm/v1/core/kv_cache_utils.py::_get_kv_cache_groups_uniform_page_size`.
+        # `vllm/v1/core/kv_cache_planning.py::_get_kv_cache_groups_uniform_page_size`.
         # We can't call it directly because vLLM's grouping needs a fully
         # populated spec dict, while we need the group layout *before* we
         # can finish creating the specs (padding depends on grouping,
