@@ -373,3 +373,15 @@ def test_gmm_v2_trace_scopes_gate(scopes, level, on):
     assert isinstance(scope, contextlib.nullcontext) is (not on)
     with scope:
         pass
+
+
+@pytest.mark.parametrize("value,expected", [(None, ""), ("skip_math", "skip_math"), (" half_cols ", "half_cols")])
+def test_sc_combine_bench_knob_is_read_from_the_environment(monkeypatch, value, expected):
+    """TPU_SC_COMBINE_BENCH (bench-only attribution) is unset by default."""
+    from vllm_torchtpu.kernels.sparse_core import ragged_gather_reduce_v3 as v3
+
+    if value is None:
+        monkeypatch.delenv("TPU_SC_COMBINE_BENCH", raising=False)
+    else:
+        monkeypatch.setenv("TPU_SC_COMBINE_BENCH", value)
+    assert v3._bench_mode() == expected

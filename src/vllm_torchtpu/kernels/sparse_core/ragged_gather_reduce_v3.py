@@ -21,6 +21,7 @@ BF16 tiles.
 """
 
 import functools
+import os
 
 import jax
 import jax.numpy as jnp
@@ -35,6 +36,14 @@ _NUM_TOKEN_SUBCHUNKS = 4
 _TOKEN_BLOCK = _TOKEN_SUBCHUNK * _NUM_TOKEN_SUBCHUNKS
 _ROUTE_INDEX_BITS = 20
 _ROUTE_INDEX_MASK = (1 << _ROUTE_INDEX_BITS) - 1
+
+
+def _bench_mode() -> str:
+    """Bench-only attribution knob (TPU_SC_COMBINE_BENCH, ported from the
+    Qwen3.5 branch): "skip_math" keeps the row gathers and drops the
+    scatter-adds, "half_cols" scatter-adds the first half of each column
+    partition. Must stay unset in serving (the output is then wrong)."""
+    return os.environ.get("TPU_SC_COMBINE_BENCH", "").strip()
 
 
 def _align_to(value: int, alignment: int) -> int:
@@ -109,6 +118,7 @@ def _main_kernel(
     num_column_partitions: int,
     blocks_per_row_partition: int,
     topk: int,
+    bench_mode: str = "",
 ):
     sc_info = pltpu.get_tpu_info().sparse_core
     assert sc_info is not None
@@ -264,15 +274,19 @@ def _main_kernel(
                             mask=scatter_mask,
                         )
 
+            if bench_mode == "skip_math":
+                return
+            math_col_size = col_size // 2 if bench_mode == "half_cols" else col_size
+
             @pl.when(fixed_two_routes)
             def run_fixed_two_route_path():
-                plsc.parallel_loop(0, col_size, step=_TOKEN_SUBCHUNK)(
+                plsc.parallel_loop(0, math_col_size, step=_TOKEN_SUBCHUNK)(
                     fixed_two_route_column_loop
                 )
 
             @pl.when(jnp.logical_not(fixed_two_routes))
             def run_generic_path():
-                plsc.parallel_loop(0, col_size, step=_TOKEN_SUBCHUNK)(
+                plsc.parallel_loop(0, math_col_size, step=_TOKEN_SUBCHUNK)(
                     generic_column_loop
                 )
 
@@ -445,6 +459,7 @@ def ragged_gather_reduce(
         core_axis_name="core",
         subcore_axis_name="subcore",
     )
+    bench_mode = _bench_mode()
     out = core_map_helper.kernel(
         functools.partial(
             _main_kernel,
@@ -454,6 +469,7 @@ def ragged_gather_reduce(
             num_column_partitions=num_column_partitions,
             blocks_per_row_partition=blocks_per_row_partition,
             topk=reduce_group_size,
+            bench_mode=bench_mode,
         ),
         out_type=jax.ShapeDtypeStruct((padded_num_tokens, hidden_size), jnp.bfloat16),
         compiler_params=pltpu.CompilerParams(
@@ -467,6 +483,6 @@ def ragged_gather_reduce(
             pltpu.SemaphoreType.DMA((2,)),
         ),
         mesh=vector_mesh,
-        name="sc_ragged_gather_reduce_v3",
+        name="sc_ragged_gather_reduce_v3" + (f"_{bench_mode}" if bench_mode else ""),
     )(x, route_metadata, route_weights, route_counts)
     return out[:num_tokens]
