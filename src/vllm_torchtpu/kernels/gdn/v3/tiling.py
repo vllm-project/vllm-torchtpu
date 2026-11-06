@@ -30,6 +30,14 @@ MIXED_TILE_SIZES = (128, 64, 32, 16, 8, 4, 2, 1)
 # transfers.
 _DECODE_STEP_COST_IN_HEAD_TRANSFERS = 16
 
+# Extra VMEM per qkv column of a PER_SEQ tile when qkv streams as 2D bf16 rows
+# (GDNConfig.qkv_2d) rather than f32 rows. Measured on the Qwen3.5 branch for
+# TPU7x (AOT compile) as the smallest vmem_limit_bytes that compiles, dense and
+# pooled states, dim 1536 to 12288, chunks 32 to 128: 68 to 136 bytes per
+# column, the maximum at dim 12288. 64 of them are the two 16-row DMA tails of
+# the double-buffered bf16 tile.
+_QKV_2D_PER_SEQ_EXTRA_BYTES_PER_COLUMN = 136
+
 
 def decode_tile_target(num_seqs: int, n_v: int) -> int:
     """Returns the largest candidate T with T^2 * n_v <= K * num_seqs, else 1."""
@@ -57,8 +65,13 @@ def get_vmem_estimate_bytes(
     is_decode: bool = False,
     carry_scratch_bytes: int = 4,
     window_size: int = 1,
+    qkv_2d: bool = False,
 ) -> int:
-    """Estimates total on-chip VMEM footprint in bytes for a GDN tile."""
+    """Estimates total on-chip VMEM footprint in bytes for a GDN tile.
+
+    `qkv_2d` adds the 2D bf16 qkv rows' extra (wrapper `bf16_qkv_2d`) to
+    prefill/mixed tiles; BATCHED tiles keep f32 rows either way.
+    """
     aligned_num_v_heads = align_to(n_v, num_lanes)
     aligned_d_k = align_to(d_k, num_lanes)
     aligned_d_v = align_to(d_v, num_lanes)
@@ -67,6 +80,8 @@ def get_vmem_estimate_bytes(
 
     # 1. Double-buffered input activation buffers (QKV, A, B), upcast to float32.
     qkv_bytes = 2 * (tile_b * chunk_sz * dim_size * carry_scratch_bytes)
+    if qkv_2d and not is_decode:
+        qkv_bytes += tile_b * dim_size * _QKV_2D_PER_SEQ_EXTRA_BYTES_PER_COLUMN
     b_bytes = 2 * (tile_b * chunk_sz * aligned_num_v_heads * carry_scratch_bytes)
     a_bytes = 2 * (tile_b * chunk_sz * aligned_num_v_heads * carry_scratch_bytes)
 
@@ -213,6 +228,7 @@ def calculate_mixed_tile_size(
     num_lanes: int,
     vmem_capacity_limit_bytes: int,
     kernel_size: int = 4,
+    qkv_2d: bool = False,
 ) -> int:
     """Largest prefill chunk whose VMEM estimate fits the limit.
 
@@ -230,6 +246,7 @@ def calculate_mixed_tile_size(
       num_lanes: Number of lanes for TPU vector layout alignment.
       vmem_capacity_limit_bytes: Maximum allowed VMEM capacity in bytes.
       kernel_size: 1D convolution kernel window size.
+      qkv_2d: qkv streams as 2D bf16 rows, see get_vmem_estimate_bytes.
 
     Returns:
       Derived chunk tile size fitting within VMEM capacity limits.
@@ -258,6 +275,7 @@ def calculate_mixed_tile_size(
             num_lanes=num_lanes,
             conv_state_dim_size=conv_state_dim_size,
             is_decode=False,
+            qkv_2d=qkv_2d,
         )
         if vmem_est <= vmem_capacity_limit_bytes:
             return candidate
@@ -283,6 +301,7 @@ def get_tile_sizes(
     window_size: int = 1,
     decode_tile_size: int | None = None,
     mixed_tile_size: int | None = None,
+    qkv_2d: bool = False,
 ) -> tuple[int, int]:
     """Derives decode and mixed tile sizes within each kernel's VMEM limit.
 
@@ -308,6 +327,8 @@ def get_tile_sizes(
         window_size: Number of state checkpoints per sequence in decode.
         decode_tile_size: Explicit decode sequence tile size override, if provided.
         mixed_tile_size: Explicit prefill/mixed chunk size override, if provided.
+        qkv_2d: qkv streams as 2D bf16 rows; sizes the prefill/mixed chunk
+            only, see get_vmem_estimate_bytes.
 
     Returns:
         Tuple of (decode_tile_size, mixed_tile_size).
@@ -348,6 +369,7 @@ def get_tile_sizes(
             num_lanes=num_lanes,
             vmem_capacity_limit_bytes=mixed_vmem_limit_bytes,
             kernel_size=kernel_size,
+            qkv_2d=qkv_2d,
         )
         mixed_tile_size = vmem_fit
 

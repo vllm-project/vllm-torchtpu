@@ -15,6 +15,7 @@
 import jax
 from jax.sharding import PartitionSpec as P
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.gdn.v3.input_layout import Conv1DInput
 from vllm_torchtpu.kernels.qwen4_exp.gdn_input import (
     compact_qkv_input,
@@ -36,7 +37,14 @@ def prepare_gdn_input(
     Buckets with at most one token per request slot keep the original input.
     Larger eligible buckets cover prefill/mixed work. This is a shape policy,
     not a claim that every row is live: padded decode buckets can also qualify.
+
+    With VLLM_TPU_GDN_PREFILL_BF16_QKV_2D every bucket keeps the original
+    input: the GDN v3 kernel streams the bf16 rows of buckets past the request
+    capacity into its PER_SEQ tiles and casts them in VMEM, so no f32 copy is
+    written here.
     """
+    if envs.VLLM_TPU_GDN_PREFILL_BF16_QKV_2D:
+        return qkv
     tokens, width = qkv.shape
     local_width = width // get_mesh_shape_product(mesh, _MODEL_AXIS)
     if tokens <= request_capacity or not supports_compact_qkv(

@@ -164,6 +164,27 @@ class BaseBufferedRef(pltpu.BufferedRef):
         )
 
 
+def qkv_2d_rows(
+    metadata_ref: MetadataRef, p_id: jax.Array, idx: int
+) -> tuple[jax.Array, jax.Array]:
+    """(first row, row count) of one sequence tile's aligned 2D bf16 DMA.
+
+    The rows `[r_base, r_base + r_size)` are widened to whole
+    `QKV_2D_ROW_ALIGN`-row tiles, so the tile's rows start `r_base % 16` rows
+    into the window. The end, `cdiv(r_base + r_size, 16) * 16`, stays within a
+    token count padded to a multiple of 16. Empty tiles move no rows.
+    """
+    align = config.QKV_2D_ROW_ALIGN
+    r_base = metadata_ref.p_id_to_r_base[p_id, idx]
+    r_size = metadata_ref.p_id_to_r_size[p_id, idx]
+    r_base_aligned = pl.multiple_of((r_base // align) * align, align)
+    r_prefix = r_base - r_base_aligned
+    dma_rows = pl.multiple_of(
+        jnp.where(r_size > 0, pl.cdiv(r_prefix + r_size, align) * align, 0), align
+    )
+    return r_base_aligned, dma_rows
+
+
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True, kw_only=True)
 class InBufferedRef(BaseBufferedRef):
@@ -174,6 +195,17 @@ class InBufferedRef(BaseBufferedRef):
         sem = self.sem_recvs.at[slot]
         vmem_ref = cast(jax.Ref, self.window_ref.at[slot])
         p_id = grid_indices[0]
+
+        if src_ref.ndim == 2:
+            # 2D bf16 qkv rows (GDNConfig.qkv_2d): one aligned DMA per tile.
+            for idx in range(self.cfg.seq_tile_size):
+                row0, dma_rows = qkv_2d_rows(self.metadata_ref, p_id, idx)
+                pltpu.make_async_copy(
+                    src_ref.at[pl.ds(row0, dma_rows)],
+                    vmem_ref.at[idx, pl.ds(0, dma_rows)],
+                    sem,
+                ).start()
+            return
 
         for idx in range(self.cfg.seq_tile_size):
             r_base = self.metadata_ref.p_id_to_r_base[p_id, idx]
@@ -191,6 +223,13 @@ class InBufferedRef(BaseBufferedRef):
         sem = self.sem_recvs.at[slot]
         vmem_ref = cast(jax.Ref, self.window_ref.at[slot])
         p_id = grid_indices[0]
+
+        if src_ref.ndim == 2:
+            for idx in range(self.cfg.seq_tile_size):
+                _, dma_rows = qkv_2d_rows(self.metadata_ref, p_id, idx)
+                wait_ref = vmem_ref.at[idx, pl.ds(0, dma_rows)]
+                pltpu.make_async_copy(wait_ref, wait_ref, sem).wait()
+            return
 
         dma_size = 0
         for idx in range(self.cfg.seq_tile_size):
@@ -632,7 +671,14 @@ def create_allocs(
             f"windows, got window_size={cfg.window_size}."
         )
 
-    qkv_shape = (cfg.seq_tile_size, cfg.chunk_size, 1, cfg.dim_size)
+    if qkv_ref.ndim == 2:
+        # 2D bf16 rows: the chunk plus one row tile of slack for a sequence
+        # tile that starts part-way into an aligned row tile.
+        assert cfg.qkv_2d and qkv_ref.dtype == jnp.bfloat16
+        qkv_rows = cfg.qkv_2d_aligned_chunk + config.QKV_2D_ROW_ALIGN
+        qkv_shape = (cfg.seq_tile_size, qkv_rows, cfg.dim_size)
+    else:
+        qkv_shape = (cfg.seq_tile_size, cfg.chunk_size, 1, cfg.dim_size)
     b_shape = (cfg.seq_tile_size, cfg.chunk_size, 1, cfg.aligned_num_v_heads)
     # Same shape as b under GDN; under KDA the gate is per-channel, so it is
     # d_k times wider (see GDNConfig.gate_dim).

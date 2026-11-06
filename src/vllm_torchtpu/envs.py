@@ -107,6 +107,7 @@ if TYPE_CHECKING:
     VLLM_TPU_MOST_MODEL_LEN: int | None = None
     TPU_GDN_CONV_QK_PAIR_LAYOUT: bool = False
     VLLM_TPU_GDN_CONV_WEIGHT_KMAJOR: bool = False
+    VLLM_TPU_GDN_PREFILL_BF16_QKV_2D: bool = False
     TPU_ENABLE_GDN_DYNAMIC_TILING: bool = False
     VLLM_TPU_QSA_DECODE_QUERY_BLOCK: int = 0
     VLLM_TPU_QSA_TOPK_STATS: int = 0
@@ -560,6 +561,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # in its `[kernel_size, 1, dim]` order. Otherwise every GDN layer swaps
     # and casts the bf16 `[dim, 1, kernel_size]` weight on every forward.
     "VLLM_TPU_GDN_CONV_WEIGHT_KMAJOR": env_bool("VLLM_TPU_GDN_CONV_WEIGHT_KMAJOR"),
+    # GDN v3 prefill: DMA bf16 qkv rows into PER_SEQ and cast in VMEM, not in HBM.
+    "VLLM_TPU_GDN_PREFILL_BF16_QKV_2D": env_bool("VLLM_TPU_GDN_PREFILL_BF16_QKV_2D"),
     # Size GDN v3 decode tiles and prefill chunks from per-rank heads, active
     # sequences and the VMEM estimate (kernels/gdn/v3/tiling.py) instead of
     # the fixed defaults.

@@ -22,6 +22,11 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 
+# Row granule of a 2D bf16 qkv tile (see `GDNConfig.qkv_2d`): one packed bf16
+# sublane tile, so every DMA offset and size is aligned to it.
+QKV_2D_ROW_ALIGN = 16
+
+
 class AttentionMode(enum.StrEnum):
     # Gated Delta Net: one scalar gate per value head.
     GDN = enum.auto()
@@ -186,6 +191,23 @@ class GDNConfig:
         return 1 << (block.bit_length() - 1)
 
     @property
+    def qkv_2d(self) -> bool:
+        """Whether qkv streams as 2D bf16 [tokens, dim] rows.
+
+        Only the PER_SEQ tile takes them: each sequence tile DMAs the
+        `QKV_2D_ROW_ALIGN`-aligned rows around its chunk and the kernel casts
+        its rows to f32 in VMEM, instead of reading an f32 copy made in HBM.
+        Derived from the input dtype rather than stored, so f32 configs keep
+        their exact kernel metadata.
+        """
+        return self.dtypes.act_in == jnp.bfloat16
+
+    @property
+    def qkv_2d_aligned_chunk(self) -> int:
+        """Chunk rows rounded up to whole 2D bf16 row tiles."""
+        return pl.cdiv(self.chunk_size, QKV_2D_ROW_ALIGN) * QKV_2D_ROW_ALIGN
+
+    @property
     def use_recurrent(self) -> bool:
         """Whether GDN runs the token-recurrent scan instead of the chunked one.
 
@@ -270,7 +292,15 @@ class GDNConfig:
             carry_conv_scratch = pltpu.VMEM(conv_shape, jnp.float32)
             carry_recurrent_scratch = pltpu.VMEM(recurrent_shape, jnp.float32)
 
-        return dict(
+        scratches = dict(
             carry_conv_scratch_ref=carry_conv_scratch,
             carry_recurrent_scratch_ref=carry_recurrent_scratch,
         )
+        if self.qkv_2d:
+            # f32 rows of the chunk, cast from the 2D bf16 tile; also where
+            # the post-conv activations are staged for the head loads.
+            scratches["act_scratch_ref"] = pltpu.VMEM(
+                (self.seq_tile_size, self.qkv_2d_aligned_chunk, 1, self.dim_size),
+                jnp.float32,
+            )
+        return scratches
