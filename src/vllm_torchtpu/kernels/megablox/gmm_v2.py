@@ -938,6 +938,330 @@ def kernel_main(
         zero_out_end(out_ref, cast(jax.Array, semaphore_ref), zero_size, dims=cfgs.dims)
 
 
+def kernel_main_scratch_shapes(cfgs: GmmConfigs, metadata_shapes: MetadataRef) -> list:
+    """Scratch shapes of `kernel_main`, in its argument order."""
+    dims, tiles = cfgs.dims, cfgs.tiles
+    acc_cols = 2 * tiles.tile_n if cfgs.fuse_act is not None else tiles.tile_n
+    scratch_shapes = [
+        # partial_out_ref
+        pltpu.VMEM((dims.size_lhs_sublane, tiles.tile_n), cfgs.out_dtype),
+        # acc_ref
+        pltpu.VMEM((tiles.tile_m, acc_cols), cfgs.acc_dtype),
+        metadata_shapes,
+    ]
+
+    num_lanes = pltpu.get_tpu_info().num_lanes
+    if cfgs.zero_init:
+        # TODO(kyuyeunk): Create better heuristics for determining this value.
+        target_zero_ref_bytes = 2 * 1024 * 1024
+
+        # Zero initialization is done by tiling size_m dim where each tile invokes
+        # zero initializing DMA for up-to tile_zero_m rows. This means larger
+        # tile_zero_m will result in fewer number of tiles and lead to smaller
+        # overhead. However, in order to invoke DMA call up-to tile_zero_m rows, we
+        # need to store equivalent sized memory in VMEM buffer for the duration of
+        # DMA. Storing [tile_zero_m, size_n] in buffer will trigger OOM if
+        # tile_zero_m is too large. Instead, if we set column size as num_lanes
+        # (which is smallest allowed column size for DMA) and reuse the buffer by
+        # size_n//num_lanes times in a single tile, we can significantly increase
+        # tile_zero_m without triggering OOM.
+        out_bytes = jnp.dtype(cfgs.out_dtype).itemsize
+        tile_zero_m = target_zero_ref_bytes // num_lanes // out_bytes
+        tile_zero_m = min(tile_zero_m, dims.size_m)
+
+        scratch_shapes += [
+            pltpu.VMEM((tile_zero_m, num_lanes), cfgs.out_dtype),
+            pltpu.SemaphoreType.DMA((1,)),
+        ]
+    else:
+        scratch_shapes += [None, None]
+
+    return scratch_shapes
+
+
+#: Most weight bytes in one chunk of the decode weight stream. A chunk is a
+#: column panel spanning all of k, so every output column is multiplied exactly
+#: as `inner_kernel` multiplies it with a single k tile. Half of emit_pipeline's
+#: 9.4 MB decode block on MiniMax-M3.1's experts: deviceless AOT gives the same
+#: bundles per weight byte as that block, where 3 MB chunks cost 4-14% more.
+DECODE_CHUNK_BYTES = 9 * 2**19
+
+#: Chunk buffers of the decode weight stream: DECODE_SLOTS - 1 chunks are in
+#: flight while one is multiplied, as many as emit_pipeline's triple-buffered
+#: weights keep at that chunk size, within VMEM at 512 rows.
+DECODE_SLOTS = 4
+
+#: Most lhs rows a call can have to take the decode weight stream, whose lhs
+#: and output stay resident in VMEM for the whole call.
+DECODE_MAX_ROWS = 512
+
+
+def decode_chunk_cols(cfgs: GmmConfigs) -> int:
+    """Weight columns per projection (gate or up) of one decode stream chunk.
+
+    The widest panel within DECODE_CHUNK_BYTES that tiles the output columns
+    along MXU column blocks, or 0 if there is none.
+    """
+    dims, rhs_cfgs = cfgs.dims, cfgs.rhs_cfgs
+    halves = 1 if cfgs.fuse_act is None else 2
+    rhs_bits = jax.dtypes.itemsize_bits(rhs_cfgs.quant_dtype or rhs_cfgs.dtype)
+    max_cols = DECODE_CHUNK_BYTES * 8 // (halves * dims.size_k * rhs_bits)
+    tpu_info = pltpu.get_tpu_info()
+    # A fused chunk's MXU column blocks pair 128 gate with 128 up columns.
+    align = tpu_info.num_lanes if cfgs.fuse_act else tpu_info.mxu_column_size
+    for cols in range(max_cols - max_cols % align, 0, -align):
+        if cfgs.out_size_n % cols == 0:
+            return cols
+    return 0
+
+
+def decode_stream_vmem_bytes(cfgs: GmmConfigs) -> int:
+    """VMEM `decode_stream_kernel` needs, with room for the dequantized chunk."""
+    dims, rhs_cfgs = cfgs.dims, cfgs.rhs_cfgs
+    halves = 1 if cfgs.fuse_act is None else 2
+    chunk_cols = halves * decode_chunk_cols(cfgs)
+    rhs_bits = jax.dtypes.itemsize_bits(rhs_cfgs.quant_dtype or rhs_cfgs.dtype)
+    lhs_bytes = jnp.dtype(cfgs.lhs_cfgs.dtype).itemsize
+    num_quant_blocks = dims.size_k // rhs_cfgs.quant_block_size
+    lhs = dims.size_m * dims.size_k * lhs_bytes
+    out = dims.size_m * cfgs.out_size_n * jnp.dtype(cfgs.out_dtype).itemsize
+    slots = DECODE_SLOTS * chunk_cols * (dims.size_k * rhs_bits // 8)
+    scales = DECODE_SLOTS * chunk_cols * num_quant_blocks * 4
+    dequantized = dims.size_k * chunk_cols * lhs_bytes
+    return lhs + out + slots + scales + dequantized
+
+
+def use_decode_stream(cfgs: GmmConfigs, vmem_limit_bytes: int) -> bool:
+    """Whether `decode_stream_kernel` runs the call instead of `kernel_main`.
+
+    Holds on the bf16-lhs, dequantize-before-matmul path (rhs blocks narrower
+    than the MXU) when `calculate_tiling` gives a single k tile, so a chunk's
+    multiply is `inner_kernel`'s: same lhs row bucket, same full-k dot per
+    MXU column block, same epilogue.
+    """
+    dims, rhs_cfgs = cfgs.dims, cfgs.rhs_cfgs
+    rhs_bits = jax.dtypes.itemsize_bits(rhs_cfgs.quant_dtype or rhs_cfgs.dtype)
+    return (
+        dims.size_m <= DECODE_MAX_ROWS
+        # The VMEM estimate is checked against compiles of 4-bit weights with
+        # 128-row scale blocks; smaller blocks or wider weights are not.
+        and rhs_bits == 4
+        and rhs_cfgs.quant_block_size >= 128
+        and cfgs.tiles.tile_k == dims.size_k
+        and not cfgs.zero_init
+        and not cfgs.lhs_cfgs.should_quantize
+        and rhs_cfgs.should_dequantize_before_matmul
+        and not rhs_cfgs.has_bias
+        and not rhs_cfgs.should_unpack
+        and decode_chunk_cols(cfgs) > 0
+        and decode_stream_vmem_bytes(cfgs) <= vmem_limit_bytes
+    )
+
+
+def decode_stream_scratch_shapes(cfgs: GmmConfigs) -> list:
+    """Scratch shapes of `decode_stream_kernel` after its metadata."""
+    assert DECODE_SLOTS >= 2, DECODE_SLOTS
+    dims = cfgs.dims
+    sublane = dims.size_lhs_sublane
+    cols = decode_chunk_cols(cfgs)
+    halves = 1 if cfgs.fuse_act is None else 2
+    num_panels = cfgs.out_size_n // cols
+    num_quant_blocks = dims.size_k // cfgs.rhs_cfgs.quant_block_size
+    rhs_dtype = cfgs.rhs_cfgs.quant_dtype or cfgs.rhs_cfgs.dtype
+    return [
+        # lhs_vmem
+        pltpu.VMEM((dims.size_m // sublane, sublane, dims.size_k), cfgs.lhs_cfgs.dtype),
+        # out_vmem
+        pltpu.VMEM((num_panels, dims.size_m // sublane, sublane, cols), cfgs.out_dtype),
+        # weight_slots
+        pltpu.VMEM((halves, DECODE_SLOTS, dims.size_k, cols), rhs_dtype),
+        # scale_slots
+        pltpu.VMEM((halves, DECODE_SLOTS, num_quant_blocks, 1, cols), jnp.float32),
+        # weight_sems, scale_sems
+        pltpu.SemaphoreType.DMA((halves, DECODE_SLOTS)),
+        pltpu.SemaphoreType.DMA((halves, DECODE_SLOTS)),
+        # io_sems: lhs fetch, then one output writeback per panel
+        pltpu.SemaphoreType.DMA((1 + num_panels,)),
+    ]
+
+
+def decode_stream_kernel(
+    # Scalar prefetch
+    lhs_group_sizes_ref: jax.Array,  # int32[size_lhs_group]
+    group_offset_ref: jax.Array,  # int32[1]
+    # In
+    lhs_ref: jax.Array,  # [size_m, size_k]
+    rhs_ref: WeightsRef,  # [size_group, size_k, size_n]
+    # Out
+    out_ref: jax.Array,  # [size_m, out_size_n]
+    # Scratch memory
+    metadata_ref: MetadataRef,
+    lhs_vmem: jax.Array,  # [size_m // sublane, sublane, size_k]
+    out_vmem: jax.Array,  # [num_panels, size_m // sublane, sublane, cols]
+    weight_slots: jax.Array,  # [halves, DECODE_SLOTS, size_k, cols]
+    scale_slots: jax.Array,  # [halves, DECODE_SLOTS, num_quant_blocks, 1, cols]
+    weight_sems: jax.Array,  # DMA[halves, DECODE_SLOTS]
+    scale_sems: jax.Array,  # DMA[halves, DECODE_SLOTS]
+    io_sems: jax.Array,  # DMA[1 + num_panels]
+    *,
+    cfgs: GmmConfigs,
+):
+    """GMM for small row counts as one continuous weight stream.
+
+    The weights of every gm tile `fill_metadata` lays out are streamed as a
+    single sequence of fixed-size chunks (gm tile, column panel), each spanning
+    all of k, through a ring of DECODE_SLOTS buffers, so the next chunks are in
+    flight across gm tile and group boundaries and the first multiply waits for
+    one small chunk. A chunk is multiplied as `inner_kernel` multiplies its
+    columns and written to a VMEM-resident output with the same partial
+    sublane-slab handling; the touched rows are written back once at the end.
+    """
+    dims, tiles = cfgs.dims, cfgs.tiles
+    sublane = dims.size_lhs_sublane
+    cols = decode_chunk_cols(cfgs)
+    halves = weight_slots.shape[0]
+    num_panels = cfgs.out_size_n // cols
+    m_offsets = metadata_ref.gm_id_to_m_offset
+
+    num_gm = fill_metadata(
+        lhs_group_sizes_ref, group_offset_ref, metadata_ref, cfgs=cfgs
+    )
+    num_chunks = num_gm * num_panels
+    first_slab = m_offsets[0] // sublane
+    num_slabs = pl.cdiv(m_offsets[num_gm], sublane) - first_slab
+
+    lhs_slabs = lhs_ref.reshape(-1, sublane, dims.size_k)
+    out_slabs = out_ref.reshape(-1, sublane, out_ref.shape[-1])
+
+    def chunk_copies(chunk):
+        gm_id, panel = chunk // num_panels, chunk % num_panels
+        group_id = metadata_ref.gm_id_to_group_id[gm_id]
+        slot = chunk % DECODE_SLOTS
+        copies = []
+        for half in range(halves):
+            col = half * cfgs.out_size_n + panel * cols
+            copies += [
+                pltpu.make_async_copy(
+                    rhs_ref.weight.at[group_id, :, pl.ds(col, cols)],
+                    weight_slots.at[half, slot],
+                    weight_sems.at[half, slot],
+                ),
+                pltpu.make_async_copy(
+                    rhs_ref.scale.at[group_id, :, :, pl.ds(col, cols)],
+                    scale_slots.at[half, slot],
+                    scale_sems.at[half, slot],
+                ),
+            ]
+        return copies
+
+    def multiply_chunk(chunk):
+        gm_id, panel = chunk // num_panels, chunk % num_panels
+        slot = chunk % DECODE_SLOTS
+        m_start = m_offsets[gm_id]
+        m_end = m_offsets[gm_id + 1]
+        m_offset = m_start - m_start % sublane
+        written_end = pl.cdiv(m_end, sublane) * sublane
+        # As in inner_kernel, the first slab adds the previous tile's partial
+        # slab when that tile ended inside it, and zeros otherwise.
+        carries_partial = jnp.logical_and(gm_id > 0, m_start % sublane != 0)
+
+        def slot_weights(half):
+            return WeightsRef(
+                weight=weight_slots.at[half, slot],
+                scale=scale_slots.at[half, slot],
+                bias=None,
+            )
+
+        rhs = slot_weights(0)
+        if halves == 2:
+            rhs = FusedWeightsRef(gate=rhs, up=slot_weights(1))
+
+        def run_bucket(bucket_idx: int):
+            bucket_m = tiles.bucket_base * (bucket_idx + 1)
+            # Rows [row_start, row_start + bucket_m) cover the tile and stay
+            # inside the arrays.
+            row_start = jnp.minimum(m_offset, dims.size_m - bucket_m)
+            bucket_slabs = pl.ds(row_start // sublane, bucket_m // sublane)
+            tiled_lhs = lhs_vmem[bucket_slabs].reshape(bucket_m, dims.size_k)
+            acc = dequant_matmul(
+                tiled_lhs, rhs, is_last_k_step=True, bucket_m=bucket_m, cfgs=cfgs
+            )
+            acc = apply_act_fn(acc, cfgs.fuse_act)
+
+            rows = row_start + lax.broadcasted_iota(jnp.int32, acc.shape, 0)
+            in_tile = jnp.logical_and(m_start <= rows, rows < m_end)
+            acc_masked = jnp.where(in_tile, acc, 0).astype(cfgs.out_dtype)
+
+            out_tile_ref = out_vmem.at[panel, bucket_slabs]
+            prev = out_tile_ref[...].reshape(bucket_m, cols)
+            in_first_slab = jnp.logical_and(m_offset <= rows, rows < m_offset + sublane)
+            in_written = jnp.logical_and(m_offset <= rows, rows < written_end)
+            partial = jnp.where(carries_partial, prev, jnp.zeros_like(prev))
+            out = jnp.where(
+                in_first_slab,
+                acc_masked + partial,
+                jnp.where(in_written, acc_masked, prev),
+            )
+            out_tile_ref[...] = out.reshape(out_tile_ref.shape)
+
+        branches = [
+            functools.partial(run_bucket, bucket_idx=bucket_idx)
+            for bucket_idx in range(tiles.tile_m // tiles.bucket_base)
+        ]
+        lax.switch((m_end - m_offset) // tiles.bucket_base, branches)
+
+    @pl.when(num_chunks > 0)
+    def _():
+        lhs_copy = pltpu.make_async_copy(
+            lhs_slabs.at[pl.ds(first_slab, num_slabs)],
+            lhs_vmem.at[pl.ds(first_slab, num_slabs)],
+            io_sems.at[0],
+        )
+        lhs_copy.start()
+        for copy in chunk_copies(0):
+            copy.start()
+        lhs_copy.wait()
+
+        def start_chunk(chunk):
+            @pl.when(chunk < num_chunks)
+            def _():
+                for copy in chunk_copies(chunk):
+                    copy.start()
+
+        def stream_step(chunk, carry):
+            for copy in chunk_copies(chunk):
+                copy.wait()
+
+            # Chunk 0 streams alone so the first multiply starts early; then
+            # DECODE_SLOTS - 1 chunks stay in flight. A chunk's slot was last
+            # read by the previous step's multiply.
+            @pl.when(chunk == 0)
+            def _():
+                for ahead in range(1, DECODE_SLOTS - 1):
+                    start_chunk(ahead)
+
+            start_chunk(chunk + DECODE_SLOTS - 1)
+            multiply_chunk(chunk)
+            return carry
+
+        lax.fori_loop(0, num_chunks, stream_step, 0)
+
+        out_copies = [
+            pltpu.make_async_copy(
+                out_vmem.at[panel, pl.ds(first_slab, num_slabs)],
+                out_slabs.at[
+                    pl.ds(first_slab, num_slabs), :, pl.ds(panel * cols, cols)
+                ],
+                io_sems.at[1 + panel],
+            )
+            for panel in range(num_panels)
+        ]
+        for copy in out_copies:
+            copy.start()
+        for copy in out_copies:
+            copy.wait()
+
+
 def calculate_tiling(
     dims: Dimensions,
     lhs_cfgs: InputConfigs,
@@ -1318,7 +1642,10 @@ def gmm_v2(
 
     Dynamically calculate offset lhs/out tiles to reduce redundant computations.
     Additionally, it adjusts dma size based on number of valid rows and utilize
-    triple buffering on weights to better utilize memory.
+    triple buffering on weights to better utilize memory. Small-m calls that
+    dequantize rhs before the matmul run `decode_stream_kernel` instead (see
+    `use_decode_stream`). With zero_initialize=False, rows outside the groups
+    processed are left undefined on either path.
 
     Args:
         lhs: lhs with shape [size_m, size_k].
@@ -1393,51 +1720,24 @@ def gmm_v2(
 
     # Initialize scratch shapes.
     max_num_gm = dims.size_group + pl.cdiv(dims.size_m, tiles.tile_m) - 1
-    acc_cols = 2 * tiles.tile_n if cfgs.fuse_act is not None else tiles.tile_n
-    scratch_shapes = [
-        # partial_out_ref
-        pltpu.VMEM((dims.size_lhs_sublane, tiles.tile_n), cfgs.out_dtype),
-        # acc_ref
-        pltpu.VMEM((tiles.tile_m, acc_cols), cfgs.acc_dtype),
-        # metadata_ref
-        MetadataRef(
-            gm_id_to_group_id=pltpu.SMEM((max_num_gm,), jnp.int32),
-            gm_id_to_m_offset=pltpu.SMEM((max_num_gm + 1,), jnp.int32),
-        ),
-    ]
+    metadata_shapes = MetadataRef(
+        gm_id_to_group_id=pltpu.SMEM((max_num_gm,), jnp.int32),
+        gm_id_to_m_offset=pltpu.SMEM((max_num_gm + 1,), jnp.int32),
+    )
+    if use_decode_stream(cfgs, vmem_limit_bytes):
+        kernel = decode_stream_kernel
+        scratch_shapes = [metadata_shapes, *decode_stream_scratch_shapes(cfgs)]
+    else:
+        kernel = kernel_main
+        scratch_shapes = kernel_main_scratch_shapes(cfgs, metadata_shapes)
 
     num_lanes = pltpu.get_tpu_info().num_lanes
-    if cfgs.zero_init:
-        # TODO(kyuyeunk): Create better heuristics for determining this value.
-        target_zero_ref_bytes = 2 * 1024 * 1024
-
-        # Zero initialization is done by tiling size_m dim where each tile invokes
-        # zero initializing DMA for up-to tile_zero_m rows. This means larger
-        # tile_zero_m will result in fewer number of tiles and lead to smaller
-        # overhead. However, in order to invoke DMA call up-to tile_zero_m rows, we
-        # need to store equivalent sized memory in VMEM buffer for the duration of
-        # DMA. Storing [tile_zero_m, size_n] in buffer will trigger OOM if
-        # tile_zero_m is too large. Instead, if we set column size as num_lanes
-        # (which is smallest allowed column size for DMA) and reuse the buffer by
-        # size_n//num_lanes times in a single tile, we can significantly increase
-        # tile_zero_m without triggering OOM.
-        out_bytes = jnp.dtype(cfgs.out_dtype).itemsize
-        tile_zero_m = target_zero_ref_bytes // num_lanes // out_bytes
-        tile_zero_m = min(tile_zero_m, dims.size_m)
-
-        scratch_shapes += [
-            pltpu.VMEM((tile_zero_m, num_lanes), cfgs.out_dtype),
-            pltpu.SemaphoreType.DMA((1,)),
-        ]
-    else:
-        scratch_shapes += [None, None]
-
     aligned_n = align_to(cfgs.out_size_n, num_lanes)
     out_init = jax.ShapeDtypeStruct((dims.size_m, aligned_n), cfgs.out_dtype)
     rhs_weights = WeightsRef(weight=rhs, scale=rhs_scale, bias=rhs_bias)
 
     return pl.pallas_call(
-        functools.partial(kernel_main, cfgs=cfgs),
+        functools.partial(kernel, cfgs=cfgs),
         out_shape=out_init,
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=2,

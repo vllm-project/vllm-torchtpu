@@ -26,12 +26,16 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
+from vllm_torchtpu.kernels.megablox import gmm_v2 as gmm_v2_module
 from vllm_torchtpu.kernels.megablox.gmm_v2 import (
     TileSizes,
     apply_act_fn,
+    calculate_tiling,
     gmm_v2,
     interleave_lane,
+    make_gmm_configs,
     situ_and_mul,
+    use_decode_stream,
 )
 
 _GroupConfig = collections.namedtuple(
@@ -462,3 +466,74 @@ def test_gmm_v2_int4_packed_matches_reference():
 
     assert actual.shape == (batch_size, out_size)
     _assert_allclose(actual, expected, atol=3e-1, rtol=3e-1)
+
+
+@pytest.mark.tpu_test
+@pytest.mark.parametrize("fuse_act", [None, "swigluoai"])
+@pytest.mark.parametrize("group_offset", [0, 2])
+@pytest.mark.parametrize("chunk_bytes", [256 * 1024, 4 * 1024 * 1024])
+def test_gmm_decode_stream_matches_pipeline(
+    monkeypatch, request, fuse_act, group_offset, chunk_bytes
+):
+    """The decode weight stream gives kernel_main's output bit for bit."""
+    _require_tpu()
+    monkeypatch.setattr(gmm_v2_module, "DECODE_CHUNK_BYTES", chunk_bytes)
+    # Traces read the patched constant: drop any built before and after.
+    jax.clear_caches()
+    request.addfinalizer(jax.clear_caches)
+
+    in_size = 1024
+    out_size = 1024
+    block_size = 128
+    # Unaligned groups, a group spanning two m tiles, and empty groups.
+    group_sizes = jnp.array([3, 0, 2, 140, 1, 0, 0, 14], dtype=jnp.int32)
+    batch_size = int(jnp.sum(group_sizes))
+    num_local_groups = group_sizes.size - group_offset
+    w_key, s_key, x_key = jax.random.split(jax.random.key(0), 3)
+
+    lhs = jax.random.normal(x_key, (batch_size, in_size), dtype=jnp.bfloat16)
+    fp4_values = jnp.array([0, 0.5, 1, 1.5, 2, 3, 4, 6, -0.5, -1, -3, -6])
+    rhs = jax.random.choice(
+        w_key, fp4_values, (num_local_groups, in_size, out_size)
+    ).astype(jnp.float4_e2m1fn)
+    rhs_scale = jax.random.uniform(
+        s_key,
+        (num_local_groups, in_size // block_size, 1, out_size),
+        minval=0.01,
+        maxval=0.1,
+    )
+    group_offset = jnp.array([group_offset], dtype=jnp.int32)
+    kwargs = dict(
+        rhs_scale=rhs_scale,
+        group_offset=group_offset,
+        fuse_act=fuse_act,
+        maybe_quantize_lhs=False,
+    )
+
+    vmem_limit_bytes = int(gmm_v2_module.pltpu.get_tpu_info().vmem_capacity_bytes * 0.9)
+    cfgs = make_gmm_configs(
+        lhs,
+        rhs,
+        rhs_scale,
+        None,
+        group_sizes,
+        group_offset,
+        tile_info=calculate_tiling,
+        vmem_limit_bytes=vmem_limit_bytes,
+        out_dtype=None,
+        acc_dtype=None,
+        maybe_quantize_lhs=False,
+        zero_initialize=False,
+        fuse_act=fuse_act,
+    )
+    assert use_decode_stream(cfgs, vmem_limit_bytes)
+
+    actual = gmm_v2(lhs, rhs, group_sizes, zero_initialize=False, **kwargs)
+    # Zero initialization keeps the call on kernel_main.
+    expected = gmm_v2(lhs, rhs, group_sizes, zero_initialize=True, **kwargs)
+
+    first_row = int(jnp.sum(group_sizes[: group_offset[0]]))
+    np.testing.assert_array_equal(
+        np.asarray(actual[first_row:]).view(np.uint16),
+        np.asarray(expected[first_row:]).view(np.uint16),
+    )
