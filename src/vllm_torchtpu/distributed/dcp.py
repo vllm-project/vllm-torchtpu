@@ -162,8 +162,15 @@ _KV_HEAD_SPANNING_DCP_ARCHITECTURES: set[str] = set()
 
 
 def register_kv_head_spanning_dcp_architectures(*architectures: str) -> None:
-    """Declare that these architectures support DCP up to the TP size."""
+    """Declare that these architectures support DCP up to the TP size.
+
+    Also installs `_patch_vllm_gqa_dcp_limit`. Models register from the
+    general plugin, which every process (API server, engine core, workers)
+    loads before it builds a VllmConfig; platform activation comes later in
+    the API server, after `create_engine_config` has validated the config.
+    """
     _KV_HEAD_SPANNING_DCP_ARCHITECTURES.update(architectures)
+    _patch_vllm_gqa_dcp_limit()
 
 
 def _patch_vllm_gqa_dcp_limit() -> None:
