@@ -47,7 +47,11 @@ def _make_runner(
     block_size=16,
 ):
     num_reqs = len(scheduled_tokens)
-    max_model_len = max(64, max(prompt_tokens) + 16)
+    max_seq_len = max(
+        max(int(p), int(c) + int(s))
+        for p, c, s in zip(prompt_tokens, num_computed_tokens, scheduled_tokens)
+    )
+    max_model_len = max(64, max_seq_len + 16)
     target_num_reqs = max_num_reqs
     max_num_tokens = max(token_paddings)
 
@@ -196,7 +200,7 @@ def _make_runner(
             dtype=torch.int32,
         )
 
-    pages_per_req = max(4, (max(prompt_tokens) + block_size - 1) // block_size)
+    pages_per_req = max(4, (max_seq_len + block_size - 1) // block_size)
     block_tables = torch.zeros((num_reqs, pages_per_req), dtype=torch.int32)
     next_block = 0
     for req_idx, seq_len in enumerate(prompt_tokens):
@@ -273,4 +277,5 @@ def _scheduler_output(scheduled_tokens):
             f"req{i}": int(n) for i, n in enumerate(scheduled_tokens)
         },
         scheduled_spec_decode_tokens={},
+        scheduled_encoder_inputs={},
     )
