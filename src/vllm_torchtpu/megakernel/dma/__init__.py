@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""VMEM aliasing (pool_alias)."""
+"""VMEM aliasing (pool_alias and arena)."""
 
 from __future__ import annotations
 
@@ -19,12 +19,23 @@ import importlib
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
-    from . import pool_alias
+    from . import arena, pool_alias
+    from .arena import ALIGNMENT_BYTES, ArenaSignature, ArenaSlice, VmemArena
 
-_SUBMODULES = frozenset({"pool_alias"})
-_LAZY: dict[str, str] = {}
+_SUBMODULES = frozenset({"arena", "pool_alias"})
+_LAZY: dict[str, str] = {
+    "ALIGNMENT_BYTES": "arena",
+    "ArenaSignature": "arena",
+    "ArenaSlice": "arena",
+    "VmemArena": "arena",
+}
 
 __all__ = [
+    "ALIGNMENT_BYTES",
+    "ArenaSignature",
+    "ArenaSlice",
+    "VmemArena",
+    "arena",
     "pool_alias",
 ]
 
@@ -34,6 +45,11 @@ def __getattr__(name: str) -> Any:
         mod_obj = importlib.import_module(f".{name}", __name__)
         globals()[name] = mod_obj
         return mod_obj
+    if name in _LAZY:
+        mod = importlib.import_module(f".{_LAZY[name]}", __name__)
+        attr = getattr(mod, name)
+        globals()[name] = attr
+        return attr
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 

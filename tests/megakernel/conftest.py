@@ -89,6 +89,14 @@ def _xla_cpu_initialized() -> bool:
     return isinstance(backends, dict) and "cpu" in backends
 
 
+def _is_tpu_item(item: pytest.Item) -> bool:
+    """Return True when `item` targets TPU hardware (`tpu_test` or `multichip`)."""
+    return (
+        item.get_closest_marker("tpu_test") is not None
+        or item.get_closest_marker("multichip") is not None
+    )
+
+
 def _targets_only_megakernel(config: pytest.Config) -> bool:
     if not config.args:
         return False
@@ -264,7 +272,7 @@ class _ParentIsolationPlugin:
         wanted = [
             it.nodeid
             for it in session_items[start:]
-            if Path(it.path).resolve() == mod_path
+            if Path(it.path).resolve() == mod_path and not _is_tpu_item(it)
         ]
         fd_tmp, nodeids_str = tempfile.mkstemp(prefix="mk_nodeids_", suffix=".json")
         with os.fdopen(fd_tmp, "w", encoding="utf-8") as f:
@@ -315,7 +323,7 @@ class _ParentIsolationPlugin:
         self, item: pytest.Item, nextitem: pytest.Item | None
     ) -> bool | None:
         mod_path = Path(item.path).resolve()
-        if not _is_mk_path(mod_path):
+        if not _is_mk_path(mod_path) or _is_tpu_item(item):
             return None
         if self._check_inproc_8_cpu():
             return None
