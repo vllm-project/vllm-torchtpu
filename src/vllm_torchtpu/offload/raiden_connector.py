@@ -46,6 +46,7 @@ Core mechanisms:
 from __future__ import annotations
 
 import os
+import time
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
@@ -180,6 +181,19 @@ class RaidenOffloadingWorkerMetadata(OffloadingWorkerMetadata):
         )
 
 
+def _cgroup_memory() -> dict[str, int | None]:
+    """The container's memory (cgroup v2): current, peak and limit bytes."""
+
+    def read(name: str) -> int | None:
+        try:
+            with open(f"/sys/fs/cgroup/{name}") as f:
+                return int(f.read().strip())
+        except (OSError, ValueError):
+            return None
+
+    return {k: read(f"memory.{k}") for k in ("current", "peak", "max")}
+
+
 @dataclass
 class _ParkedStore:
     """A store job parked until every worker rank acknowledges the device fence."""
@@ -206,6 +220,41 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
         assert isinstance(self.manager, RaidenOffloadingManager)
         self._raiden_manager: RaidenOffloadingManager = self.manager
         self._fence_pending: dict[int, _ParkedStore] = {}
+
+    # Cumulative host-tier counters, logged every VLLM_TPU_OFFLOAD_TELEMETRY_S
+    # seconds (60 by default; <= 0 turns the line off) with the container's
+    # memory, so a serving log shows the tier working and its host footprint.
+    # Created lazily: tests build this scheduler without __init__.
+    _TELEMETRY_KEYS = (
+        "loads", "load_keys", "loads_done", "failed_load_blocks",
+        "stores", "store_keys", "stores_done", "stores_cancelled",
+    )
+
+    @property
+    def telemetry(self) -> dict[str, int]:
+        return self.__dict__.setdefault(
+            "_telemetry", dict.fromkeys(self._TELEMETRY_KEYS, 0)
+        )
+
+    def telemetry_line(self) -> str:
+        mem = _cgroup_memory()
+        gib = lambda v: "n/a" if v is None else f"{v / 1024**3:.1f}GiB"
+        counters = " ".join(f"{k}={v}" for k, v in self.telemetry.items())
+        return (
+            f"offload-tier telemetry: {counters} fence_pending={len(self._fence_pending)} "
+            f"mem_current={gib(mem['current'])} mem_peak={gib(mem['peak'])} "
+            f"mem_max={gib(mem['max'])}"
+        )
+
+    def _maybe_log_telemetry(self) -> None:
+        period = float(os.environ.get("VLLM_TPU_OFFLOAD_TELEMETRY_S", "60"))
+        if period <= 0:
+            return
+        now = time.monotonic()
+        next_at = self.__dict__.setdefault("_telemetry_next", now + period)
+        if now >= next_at:
+            self.__dict__["_telemetry_next"] = now + period
+            logger.info("%s", self.telemetry_line())
 
     def build_connector_meta(
         self, scheduler_output: SchedulerOutput
@@ -249,6 +298,8 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
                 job.req_id,
                 pinned=src_spec.pinned,
             )
+            self.telemetry["loads"] += 1
+            self.telemetry["load_keys"] += len(src_spec.keys)
 
         # Handle jobs_to_flush (source blocks are about to be recycled):
         # - Cancel fence-pending stores before they start.
@@ -263,6 +314,7 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
             parked = self._fence_pending.pop(job_id, None)
             if parked is not None:
                 manager.on_store_job_cancelled(parked.keys)
+                self.telemetry["stores_cancelled"] += 1
                 finished_store_ids.append(job_id)
                 # Avoid useless TPU sync if created and cancelled in the same step.
                 new_fence_ids.discard(job_id)
@@ -279,10 +331,16 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
         for finished_job in list(drained) + manager.poll_finished_jobs():
             if finished_job.op == AdmissionOp.STORE:
                 finished_store_ids.append(finished_job.job_id)
+                self.telemetry["stores_done"] += 1
             else:
                 assert finished_job.req_id is not None
                 finished_loads[finished_job.job_id] = finished_job.req_id
                 failed_load_block_ids.extend(finished_job.failed_device_block_ids)
+                self.telemetry["loads_done"] += 1
+                self.telemetry["failed_load_blocks"] += len(
+                    finished_job.failed_device_block_ids
+                )
+        self._maybe_log_telemetry()
 
         # Return empty load_jobs/store_jobs: workers act as passive DMA endpoints.
         return RaidenOffloadingConnectorMetadata(
@@ -311,6 +369,8 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
                     self._raiden_manager.submit_store_job(
                         job_id, parked.keys, parked.device_block_ids
                     )
+                    self.telemetry["stores"] += 1
+                    self.telemetry["store_keys"] += len(parked.keys)
         super().update_connector_output(connector_output)
 
 

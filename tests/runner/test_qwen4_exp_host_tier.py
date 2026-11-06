@@ -540,9 +540,12 @@ def test_pp8_host_hit_restores_every_group_at_the_mamba_boundary(monkeypatch):
     sched.update_connector_output(KVConnectorOutput(kv_connector_worker_meta=last))
     saved = [h for call in store.calls_named("save") for h in call.args[0]]
     assert len(saved) == len(expected)
+    assert sched.telemetry["stores"] == len(meta.fence_job_ids)
+    assert sched.telemetry["store_keys"] == len(expected)
     store.complete_save(saved)
     done = sched.build_connector_meta(SchedulerOutput.make_empty())
     assert sorted(done.finished_store_job_ids) == sorted(meta.fence_job_ids)
+    assert sched.telemetry["stores_done"] == len(meta.fence_job_ids)
     sched.update_connector_output(KVConnectorOutput(
         kv_connector_worker_meta=RaidenOffloadingWorkerMetadata(
             completed_jobs={job: STAGES for job in done.finished_store_job_ids})))
@@ -574,10 +577,14 @@ def test_pp8_host_hit_restores_every_group_at_the_mamba_boundary(monkeypatch):
     expected_load = {(gid, c): alloc[gid][c].block_id for gid in attention for c in range(3)}
     expected_load.update({(gid, 2): alloc[gid][2].block_id for gid in mamba})
     assert loaded == expected_load
+    assert sched.telemetry["loads"] == 1 and sched.telemetry["load_keys"] == len(expected_load)
 
     # No partial hit: with one checkpoint gone there is no boundary to load.
     store.complete_load(hashes)
     sched.build_connector_meta(SchedulerOutput.make_empty())
+    assert sched.telemetry["loads_done"] == 1 and sched.telemetry["failed_load_blocks"] == 0
+    line = sched.telemetry_line()
+    assert line.startswith("offload-tier telemetry: loads=1 ") and "mem_max=" in line
     victim = next(h for h in list(store.entries)
                   if _key_group_of_sub_hash(h, namespace)[1] == mamba[0])
     del store.entries[victim]
