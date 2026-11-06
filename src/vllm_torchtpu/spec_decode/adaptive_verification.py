@@ -324,6 +324,9 @@ class AdaptiveVerificationManager:
         self._confidences: dict[str, np.ndarray] = {}
         self._default_confidences = np.ones(num_speculative_tokens)
         self.cost_table: StepCostTable | None = None
+        # Most requests a trimmed step may hold: trimming a larger step would
+        # give it shapes warmup never compiled. None sets no limit.
+        self.max_num_reqs: int | None = None
         # Startup warmup only: verify exactly this many drafts per step.
         self.forced_budget: int | None = None
         # Drafts trimmed from each request in the current step.
@@ -408,7 +411,7 @@ class AdaptiveVerificationManager:
         if (
             self.cost_table is not None
             and scheduler_output.total_num_scheduled_tokens > self.cost_table.max_tokens
-        ):
+        ) or (self.max_num_reqs is not None and len(num_scheduled) > self.max_num_reqs):
             return scheduler_output
 
         req_ids = list(spec_tokens)

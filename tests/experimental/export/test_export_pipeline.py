@@ -144,9 +144,7 @@ class _TinyPyTorchCausalLM(nn.Module):
         self.model = _TinyPyTorchBackbone(vocab_size, hidden_size, num_layers)
         self.lm_head = nn.Linear(hidden_size, vocab_size, bias=False)
         if mrope_section is not None:
-            from tests.experimental.export.test_rope_patch import (
-                _SyntheticRotaryEmbedding,
-            )
+            from tests.test_rope_patch import _SyntheticRotaryEmbedding
 
             self.rotary_emb = _SyntheticRotaryEmbedding(
                 head_size=32,

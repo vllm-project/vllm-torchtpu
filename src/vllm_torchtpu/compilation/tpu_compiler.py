@@ -47,6 +47,8 @@ from vllm.config.utils import Range
 
 from vllm_torchtpu import envs, utils
 from vllm_torchtpu.compilation import shape_variants
+from vllm_torchtpu.compilation.graph_fingerprint import _graph_fingerprint
+from vllm_torchtpu.gdn_pool_layout import prefill_checkpoint_enabled
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
@@ -99,9 +101,6 @@ _PEER_POLL_S = 0.5
 # so clock skew between the host and a shared cache filesystem does not matter.
 _FAILED_SUFFIX = ".failed"
 _PROCESS_START = time.time()
-# get_attr tensors up to this size are hashed by value; bigger ones, which are
-# weights rather than constants, by dtype and shape.
-_FINGERPRINT_MAX_NUMEL = 1 << 16
 
 _peer_wait = threading.local()
 
@@ -119,41 +118,6 @@ def wait_for_peer_artifact(timeout_s: float):
         yield
     finally:
         _peer_wait.timeout_s = 0.0
-
-
-def _graph_fingerprint(graph: fx.GraphModule) -> str | None:
-    """Hash of the code of `graph` and its submodules and of their constants.
-
-    Two ranks with the same fingerprint traced the same program, so either can
-    replay the other's artifact. A rank-dependent value baked into the graph,
-    e.g. a Python int from `rank_in_group`, changes the code and so the hash.
-    None if the graph cannot be hashed; its artifact is then only replayed by
-    the rank that saved it.
-    """
-    try:
-        h = hashlib.sha256()
-        for name, module in graph.named_modules():
-            if not isinstance(module, fx.GraphModule):
-                continue
-            h.update(f"{name}\n{module.code}".encode())
-            for node in module.graph.nodes:
-                if node.op != "get_attr":
-                    continue
-                value = module
-                for atom in str(node.target).split("."):
-                    value = getattr(value, atom)
-                h.update(str(node.target).encode())
-                if not isinstance(value, torch.Tensor):
-                    h.update(type(value).__qualname__.encode())
-                    continue
-                h.update(f"{value.dtype}{tuple(value.shape)}".encode())
-                if value.numel() <= _FINGERPRINT_MAX_NUMEL:
-                    flat = value.detach().to("cpu").contiguous().reshape(-1)
-                    h.update(flat.view(torch.uint8).numpy().tobytes())
-        return h.hexdigest()
-    except Exception as e:
-        logger.warning("[TpuCompilerAdaptor] Could not fingerprint graph: %s", e)
-        return None
 
 
 def _deserialize_entry(entry: Any) -> Callable[..., Any]:
@@ -199,6 +163,7 @@ _TPU_COMPILE_ENV_IGNORED = {
     "TPU_RAIDEN_ENGINE_ID",
     "TPU_RAIDEN_JOB_NAME",
     "TPU_RAIDEN_TRANSFER_PARALLELISM",
+    "TPU_RAIDEN_TRANSFER_STREAMS",
     "TPU_WORKER_ID",
     "VLLM_USE_RAY_COMPILED_DAG_CHANNEL_TYPE",
     "VLLM_XLA_CHECK_RECOMPILATION",
@@ -271,8 +236,12 @@ _TPU_COMPILE_ENV_IGNORED = {
     "VLLM_TPU_DEBUG_PCP_LAYOUT",
     "VLLM_TPU_OFFLOAD_SAVE_RETRIES",
     "VLLM_TPU_OFFLOAD_WAIT_TIMEOUT_S",
-    # Scheduler prefix-cache hit length only.
+    # Affects only scheduler prefix-cache hit length and runtime GDN checkpoint
+    # offsets.
     "VLLM_TPU_DISABLE_EAGLE_BLOCK_DROP",
+    # Scheduler block accounting for GDN groups only: block-table shapes and
+    # num_gpu_blocks are the same either way, only the block ids differ.
+    "TPU_SKIP_MAMBA_SCHEDULER_BLOCKS",
     "TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT",
     # Only changes LIBTPU_INIT_ARGS, which is hashed on its own.
     "SC_ALLREDUCE_ALLGATHER_OFFLOAD_MIN_BYTES",
@@ -320,6 +289,9 @@ _RUNTIME_CACHE_KEY_PATHS = (
     # Same reason: dcp.py owns the DCP kernels' mesh shape and device order.
     "vllm_torchtpu/distributed/dcp.py",
     "vllm_torchtpu/distributed/pallas_shapes.py",
+    # `prefill_checkpoint_enabled` decides whether the GDN op traces with
+    # prefill checkpoint operands or with constant None inputs.
+    "vllm_torchtpu/gdn_pool_layout.py",
     "vllm_torchtpu/layers/adapter/linear_common.py",
     "vllm_torchtpu/layers/adapter/router_topk.py",
     "vllm_torchtpu/layers/adapter/quantization",
@@ -457,6 +429,12 @@ def compute_tpu_compilation_hash(vllm_config: VllmConfig) -> str:
             "gpu_memory_utilization": cache_config.gpu_memory_utilization,
             "num_gpu_blocks": cache_config.num_gpu_blocks,
         },
+        # The GDN op traces with prefill checkpoint operands or with constant
+        # None inputs depending on this gate. Its inputs (prefix_match_unit,
+        # mamba_cache_mode, the PCP and DCP sizes, TPU_GDN_PREFILL_CHECKPOINT)
+        # are hashed only through the outcome, so changing one of them without
+        # flipping the gate keeps the cache.
+        "gdn_prefill_checkpoint": prefill_checkpoint_enabled(vllm_config),
         "scheduler": {
             "max_model_len": vllm_config.model_config.max_model_len,
             "max_num_batched_tokens": scheduler_config.max_num_batched_tokens,

@@ -31,7 +31,12 @@ explicitly rather than relying on the exporter's defaults:
   or else from `--gpu-memory-utilization` (see below). `vllm serve` logs
   `TPU KV cache size: T tokens`; `--num-blocks` = T / block size.
 - `--kv-cache-memory-bytes`: unset by default. `vllm serve` logs
-  `Memory statistics | ... total_hbm_avail_gb=G`; bytes = G x 2^30.
+  `Memory statistics | ... total_hbm_avail_gb=G | profile_run=ran`; bytes =
+  G x 2^30. Use it only from a line that says `profile_run=ran`. With
+  `profile_run=skipped`, the KV size was pinned before profiling (by
+  `--num-gpu-blocks-override`, or the uniform hybrid KV layout's own count), G
+  was measured without activation memory and over-sizes the KV cache: pass
+  `--num-blocks` from the `TPU KV cache size` line instead.
 - `--max-num-seqs`, `--max-model-len`, `--max-num-batched-tokens`: default to
   vLLM's engine defaults. Pass what `vllm serve` was given (its
   `non-default args` log line lists them).
@@ -61,8 +66,10 @@ This follows `TPUWorker.determine_available_memory`, with two differences that
 make the default less faithful than an explicit value:
 
 - `vllm serve` runs a profile pass at `--max-num-batched-tokens` before
-  measuring, so its KV budget excludes activation memory. The exporter does
-  not, so activations must fit in the headroom `--gpu-memory-utilization`
+  measuring, so its KV budget excludes activation memory, unless the KV size is
+  already pinned (`--num-gpu-blocks-override`, or the uniform hybrid KV
+  layout's own count), in which case it skips the pass and logs
+  `profile_run=skipped`. The exporter does not profile, so activations must fit in the headroom `--gpu-memory-utilization`
   leaves. `--kv-cache-memory-bytes` skips the profile pass in `vllm serve`
   too, so it is the setting that gives both the same KV budget.
 - The device is measured at export time. An artifact exported on one chip

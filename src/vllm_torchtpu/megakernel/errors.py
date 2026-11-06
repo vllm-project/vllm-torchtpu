@@ -11,9 +11,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Exception types of the megakernel library (framework-free)."""
+"""Exception and result types of the megakernel library (framework-free)."""
 
 from __future__ import annotations
+
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:  # defined in the runtime contract; see `__getattr__`
+    from .runtime.contract import EligibilityResult
 
 
 class MegakernelConfigError(RuntimeError):
@@ -28,4 +33,14 @@ class MegakernelLayoutError(ValueError):
     """
 
 
-__all__ = ["MegakernelConfigError", "MegakernelLayoutError"]
+def __getattr__(name: str) -> Any:
+    # `EligibilityResult` is part of the runtime contract (one definition);
+    # resolved lazily since the contract imports this module.
+    if name == "EligibilityResult":
+        from .runtime.contract import EligibilityResult
+
+        return EligibilityResult
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+__all__ = ["EligibilityResult", "MegakernelConfigError", "MegakernelLayoutError"]
