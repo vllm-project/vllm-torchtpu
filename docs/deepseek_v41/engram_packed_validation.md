@@ -62,4 +62,26 @@ to establish that its measured requests use the new kernel.
   lowering or execution against the branch's newer runtime pins.
 - Full-environment type checking requires the CI container; the local
   machine has no Docker.
-- TPU numerical, kernel timing and complete model A/B results are pending.
+- The production kernel has run on TPU v7 with JAX/jaxlib 0.11.2 and
+  libtpu 0.0.50. Experiment `exp-pivkjv7ghf` captured 30 device calls per
+  input form in alternating AB/BA order. Device custom-call medians were
+  94.772509 us for split input and 94.800720 us for packed input. The
+  containing-module medians were 97.967587 us and 100.971789 us. The paired
+  packed-minus-split module difference was 3.0186075 us; packed slicing
+  and reshaping therefore have a measured outer cost, while the Pallas
+  computation is unchanged within run variation.
+- Both forms return identical BF16 Y bytes. Each passes the independent
+  full-output fixture comparison with zero tolerance failures, while
+  retaining 40 BF16 bit differences from that reference. All 96 masked
+  rows preserve hidden bytes. This fixture uses independent CPU packed
+  decoding, activation quantization and postprocessing with a same-device
+  native FP8 projection; it does not validate the Torch bridge or model.
+- Artifact `art-6jvqs1e9op` preserves the 38,507,015-byte XPlane and complete
+  compiler dumps. Declared evidence analysis `an-ll5p5j3bb8` and operator
+  analysis `an-es23t9pof7` passed. The built-in operator trace discovery
+  misses this trace layout, and Pallas analysis `an-63e5qdh2li` discovers
+  native files but returns zero instruction-family counts. Those are
+  analysis coverage gaps, not evidence of zero device work or zero spill.
+- Torch single-layer integration and complete model A/B results are still
+  pending. They must validate actual fused dispatch and capture separate
+  model profiles; the JAX-only measurement above cannot replace them.
