@@ -11,8 +11,9 @@ behind ``USE_MOE_TP_DECODE_NVFP4_KERNEL`` (default off):
   - At ``n > 64`` (mixed / prefill buckets), runs
     ``fused_moe_prefill_nvfp4_stage_a`` (W4A16 default, Stage-A whole-expert
     ring + fused online-FP8 shared expert + chunked RS/AG combine) when
-    ``FUSED_MOE_PREFILL_NVFP4_KERNEL`` is enabled, the layer admits it, and
-    ``n >= FUSED_MOE_PREFILL_NVFP4_MIN_TOKENS`` (default ``2048``);
+    ``FUSED_MOE_PREFILL_NVFP4_KERNEL`` is enabled, the layer and traced
+    activations admit it, and ``n`` meets the mode cutoff (``n >= 2048`` for
+    ``"w4a16"``, ``n >= 512`` for ``"w4a8"``);
     otherwise runs ``moe_tp_decode._tp_chain`` (``fused_moe_func`` ->
     ``gmm_v2`` W4A16 + online-FP8 shared expert) plus ``lax.psum`` on the same
     K-major FP4 weights and 4D block scales, with zero weight duplication.
@@ -43,6 +44,10 @@ logger = init_logger(__name__)
 _ENV_FLAG = "USE_MOE_TP_DECODE_NVFP4_KERNEL"
 _OP_ATTR = "_moe_tp_decode_nvfp4_op"
 _PREFILL_PROBE_ROWS = 128
+_PREFILL_MIN_TOKENS: dict[prefill_nvfp4.ActMode, int] = {
+    "w4a16": 2048,
+    "w4a8": 512,
+}
 _BUFFERS = (
     "_moe_tp_decode_nvfp4_sw13",
     "_moe_tp_decode_nvfp4_ss13",
@@ -158,7 +163,7 @@ def _admit(
             cand_act_mode = cast(
                 prefill_nvfp4.ActMode, envs.FUSED_MOE_PREFILL_NVFP4_ACT_MODE
             )
-            if prefill_nvfp4.can_use_fused_moe_prefill_nvfp4(
+            reason = prefill_nvfp4.fused_moe_prefill_nvfp4_unsupported_reason(
                 jax.ShapeDtypeStruct((_PREFILL_PROBE_ROWS, hidden), jnp.bfloat16),
                 fp8_decode._sds(layer.w13_weight),
                 fp8_decode._sds(layer.w2_weight),
@@ -171,10 +176,25 @@ def _admit(
                 jax.ShapeDtypeStruct((_PREFILL_PROBE_ROWS, topk), jnp.bfloat16),
                 jax.ShapeDtypeStruct((_PREFILL_PROBE_ROWS, topk), jnp.int32),
                 act_mode=cand_act_mode,
-            ):
-                min_tokens = envs.FUSED_MOE_PREFILL_NVFP4_MIN_TOKENS
+            )
+            if reason is None:
+                min_tokens = _PREFILL_MIN_TOKENS[cand_act_mode]
                 prefill_above = max(kernel.ROW_BUCKETS[-1], min_tokens - 1)
                 prefill_act_mode = cand_act_mode
+            else:
+                logger.warning_once(
+                    "moe_tp_decode_nvfp4: FUSED_MOE_PREFILL_NVFP4_KERNEL=1 "
+                    "refused prefill (act_mode=%s, w13=%s %s, w2=%s, "
+                    "s13=%s, s2=%s, shared_w13=%s): %s",
+                    cand_act_mode,
+                    tuple(layer.w13_weight.shape),
+                    str(layer.w13_weight.dtype),
+                    tuple(layer.w2_weight.shape),
+                    tuple(w13_scale.shape),
+                    tuple(w2_scale.shape),
+                    tuple(sw13_t.shape),
+                    reason,
+                )
         return _OpStatics(
             **base,
             prefill_above=prefill_above,
@@ -302,6 +322,38 @@ def _op_body(statics: _OpStatics, n_ranks: int, axis: str):
         prequant,
     ):
         del prequant
+        if not prefill_nvfp4.can_use_fused_moe_prefill_nvfp4(
+            x,
+            w13,
+            w2,
+            s13,
+            s2,
+            sw13,
+            ss13,
+            sw2,
+            ss2,
+            jax.ShapeDtypeStruct((x.shape[0], statics.topk), jnp.bfloat16),
+            jax.ShapeDtypeStruct((x.shape[0], statics.topk), jnp.int32),
+            act_mode=statics.prefill_act_mode,
+            w2_n_chunk=statics.w2_n_chunk,
+        ):
+            partial = fp8_decode._tp_chain(
+                x,
+                scores,
+                bias,
+                is_pad,
+                w13,
+                w2,
+                s13,
+                s2,
+                sw13,
+                ss13,
+                sw2,
+                ss2,
+                statics,
+                e0.reshape(()),
+            )
+            return jax.lax.psum(partial, axis)
         return _prefill_chain(
             x,
             scores,

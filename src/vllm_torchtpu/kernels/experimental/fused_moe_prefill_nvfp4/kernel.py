@@ -53,7 +53,6 @@ from vllm_torchtpu.kernels.experimental.fused_moe_prefill.fused_moe_prefill_kern
     _cdiv,
 )
 from vllm_torchtpu.kernels.experimental.fused_moe_prefill.fused_moe_prefill_kernel_v2 import (  # noqa: E501
-    _psum_rows,
     _quantize_rows,
     _routing_plan,
     tile_rows_for,
@@ -66,12 +65,8 @@ from vllm_torchtpu.kernels.fused_moe.v2.kernel import (
     _tile_row_scales,
 )
 from vllm_torchtpu.kernels.quantized_matmul.util import quantize_block
-from vllm_torchtpu.logger import init_logger
-
-logger = init_logger(__name__)
 
 ActMode = Literal["w4a16", "w4a8"]
-TallRungRows = int | None | Literal["auto"]
 
 FP4 = jnp.float4_e2m1fn
 FP8 = jnp.float8_e4m3fn
@@ -86,29 +81,18 @@ _STATIC_MAX_TILE_ROWS = 256
 _VMEM_ADMISSION_FRACTION = 0.875
 _REF_BITCAST_JAX_VERSION = "0.9.1"
 
+# Default Stage-A settings: 4-slot expert ring, 256-row tiles from T >= 4096,
+# and 4 rungs (`tall_rung_rows=None`: [32, 64, 96, 128] at 128-row tiles and
+# [64, 128, 192, 256] at 256-row tiles, where 8 rungs were measured much slower
+# for W4A16 and no faster for W4A8).
 STAGE_A_NVFP4: dict[str, Any] = dict(
     nb=4,
     tile_min=4096,
     flat=True,
-    tall_rung_rows="auto",
+    tall_rung_rows=None,
     w2_n_chunk=_DEFAULT_W2_N_CHUNK,
     act_mode="w4a16",
 )
-
-
-def tall_rung_rows_for(tile_rows: int, i: int) -> int | None:
-    """Select default ``rung_rows`` for ``(tile_rows, i)``.
-
-    ``tile_rows_for`` returns ``128`` or ``256``. At ``tile_rows = 128``,
-    ``None`` already yields the 4 base rungs ``[32, 64, 96, 128]``. At
-    ``256``-row tiles, 8 rungs (``rung_rows = 32``) were measured much slower
-    for ``W4A16`` (``EP2 x TP4`` and ``TP8``; ``TP8``, ``256``-row tiles:
-    ``509-546`` vs ``83-113 ms`` per 75 layers) and no faster for ``W4A8``, so
-    4 rungs (``None``, ``[64, 128, 192, 256]``) are used at ``256``-row tiles;
-    ``tall_rung_rows`` still overrides.
-    """
-    del tile_rows, i
-    return None
 
 
 def _routing_plan_ids(topk_ids, route_valid, experts: int):
@@ -186,7 +170,6 @@ def _scratch_vmem_bytes(
     act_mode: ActMode,
     nb: int,
     info,
-    include_shared: bool = True,
 ) -> int:
     """Exact static Pallas VMEM scratch bytes declared in ``grid_spec``."""
     t = functools.partial(all_reduce.tiled_bytes, info=info)
@@ -196,7 +179,7 @@ def _scratch_vmem_bytes(
     has_act_scale = act_mode == "w4a8"
     act_dtype = FP8 if has_act_scale else BF16
 
-    scratch_bytes = (
+    return (
         t((n_act, tile_rows, lane_blocks, _LANES), act_dtype)
         + (t((n_act, scale_window, _LANES), F32) if has_act_scale else 0)
         + t((2, tile_rows, lane_blocks, _LANES), BF16)
@@ -204,15 +187,11 @@ def _scratch_vmem_bytes(
         + t((nb, i // _PACK4, h), jnp.uint32)
         + t((nb, b13, 1, 2 * i), F32)
         + t((nb, b2, 1, h), F32)
+        + t((h, 2 * i_s), FP8)
+        + t((i_s, h), FP8)
+        + t((1, 2 * i_s), F32)
+        + t((1, h), F32)
     )
-    if include_shared:
-        scratch_bytes += (
-            t((h, 2 * i_s), FP8)
-            + t((i_s, h), FP8)
-            + t((1, 2 * i_s), F32)
-            + t((1, h), F32)
-        )
-    return scratch_bytes
 
 
 def _vmem_plan(
@@ -227,7 +206,6 @@ def _vmem_plan(
     nb: int,
     w2_n_chunk: int,
     info,
-    include_shared: bool = True,
 ) -> int | None:
     """Estimated VMEM bytes (scratch + peak body live values), or ``None``."""
     t = functools.partial(all_reduce.tiled_bytes, info=info)
@@ -243,7 +221,6 @@ def _vmem_plan(
         act_mode=act_mode,
         nb=nb,
         info=info,
-        include_shared=include_shared,
     )
 
     qb1 = h // b13
@@ -260,18 +237,159 @@ def _vmem_plan(
         + 2 * t((tile_rows, n_chunk), F32)
     )
     shared_live = (
-        (
-            t((tile_rows, h), BF16)
-            + t((tile_rows, h), FP8)
-            + 2 * t((tile_rows, max(2 * i_s, n_chunk)), F32)
-        )
-        if include_shared
-        else 0
+        t((tile_rows, h), BF16)
+        + t((tile_rows, h), FP8)
+        + 2 * t((tile_rows, max(2 * i_s, n_chunk)), F32)
     )
     need = scratch_bytes + max(gate_up_live, down_live, shared_live)
     if need > int(info.vmem_capacity_bytes * _VMEM_ADMISSION_FRACTION):
         return None
     return need
+
+
+def fused_moe_prefill_nvfp4_unsupported_reason(
+    x,
+    w1,
+    w2,
+    w1_scale,
+    w2_scale,
+    shared_w1,
+    shared_w1_scale,
+    shared_w2,
+    shared_w2_scale,
+    topk_weights,
+    topk_ids,
+    *,
+    shared_gate_weight=None,
+    act_mode: ActMode = "w4a16",
+    nb: int = 4,
+    w2_n_chunk: int = _DEFAULT_W2_N_CHUNK,
+) -> str | None:
+    """Return a human-readable refusal reason, or ``None`` if admitted."""
+    info = pltpu.get_tpu_info()
+    if info.num_cores != 1 or not info.is_matmul_supported(FP8, FP8):
+        return "needs a single-core TPU with native FP8 x FP8 matmul (TPU v7x+)"
+    if act_mode not in ("w4a16", "w4a8"):
+        return f"unsupported act_mode={act_mode!r}"
+    if nb < 2:
+        return f"nb={nb} < 2"
+    if w2_n_chunk <= 0 or w2_n_chunk % _PAIR_COLS != 0:
+        return f"w2_n_chunk={w2_n_chunk} is not a positive multiple of {_PAIR_COLS}"
+    if x.ndim != 2 or w1.ndim != 3 or w2.ndim != 3:
+        return f"invalid operand ranks (x={x.ndim}D, w1={w1.ndim}D, w2={w2.ndim}D)"
+    if (
+        shared_w1 is None
+        or shared_w2 is None
+        or shared_w1_scale is None
+        or shared_w2_scale is None
+        or shared_w1.ndim != 2
+        or shared_w2.ndim != 2
+    ):
+        return "missing or non-2D shared expert weights / scales"
+    if topk_weights.ndim != 2 or topk_ids.ndim != 2:
+        return "topk_weights and topk_ids must be 2D"
+
+    tokens, h = x.shape
+    experts, k1, two_i = w1.shape
+    e2, i, out_h = w2.shape
+    i_s = shared_w2.shape[0]
+    topk = topk_ids.shape[1]
+    if tokens <= 0 or topk <= 0 or experts <= 0:
+        return (
+            f"non-positive dimension (tokens={tokens}, topk={topk}, experts={experts})"
+        )
+    if e2 != experts or k1 != h or out_h != h or two_i != 2 * i:
+        return (
+            f"mismatched routed weight shapes w1={tuple(w1.shape)}, "
+            f"w2={tuple(w2.shape)} for hidden={h}"
+        )
+    if topk_ids.shape != (tokens, topk) or topk_weights.shape != (tokens, topk):
+        return "mismatched topk_ids / topk_weights shapes"
+
+    packed_row_tile = info.num_sublanes * _PACK4
+    if h <= 0 or h % _H_ALIGN != 0 or h % _PAIR_COLS != 0 or h % packed_row_tile != 0:
+        return (
+            f"hidden size {h} is not aligned to "
+            f"{_H_ALIGN} / {_PAIR_COLS} / {packed_row_tile}"
+        )
+    if i <= 0 or i % _LANES != 0 or i % packed_row_tile != 0:
+        return f"routed intermediate {i} is not aligned to {_LANES} / {packed_row_tile}"
+    if i_s <= 0 or i_s % _LANES != 0:
+        return f"shared intermediate {i_s} is not a positive multiple of {_LANES}"
+    if shared_w1.shape != (h, 2 * i_s) or shared_w2.shape != (i_s, h):
+        return (
+            f"incompatible shared expert shapes sw1={tuple(shared_w1.shape)}, "
+            f"sw2={tuple(shared_w2.shape)}"
+        )
+    if not _valid_shared_scale(shared_w1_scale, 2 * i_s):
+        return f"incompatible shared_w1_scale shape {tuple(shared_w1_scale.shape)}"
+    if not _valid_shared_scale(shared_w2_scale, h):
+        return f"incompatible shared_w2_scale shape {tuple(shared_w2_scale.shape)}"
+    if shared_gate_weight is not None and (
+        shared_gate_weight.ndim not in (1, 2)
+        or math.prod(shared_gate_weight.shape) != h
+        or shared_gate_weight.dtype not in (BF16, F32)
+    ):
+        return "incompatible shared_gate_weight shape or dtype"
+
+    b13 = _scale_blocks(w1_scale, experts, 2 * i)
+    b2 = _scale_blocks(w2_scale, experts, h)
+    min_block = max(_LANES, packed_row_tile)
+    if b13 is None or b13 <= 0 or h % b13 != 0:
+        return (
+            f"incompatible w1_scale shape {tuple(w1_scale.shape)} "
+            f"for h={h}, 2*i={2 * i}"
+        )
+    qb1 = h // b13
+    if qb1 < min_block or qb1 % _LANES != 0 or qb1 % packed_row_tile != 0:
+        return f"w1 quantization block {qb1} < {min_block} or unaligned"
+    if b2 is None or b2 <= 0 or i % b2 != 0:
+        return f"incompatible w2_scale shape {tuple(w2_scale.shape)} for i={i}, h={h}"
+    bk2 = i // b2
+    if bk2 < min_block or bk2 % _LANES != 0 or bk2 % packed_row_tile != 0:
+        return f"w2 quantization block {bk2} < {min_block} or unaligned"
+
+    if x.dtype != BF16:
+        return f"activation dtype {x.dtype} != bfloat16"
+    if w1.dtype != FP4 or w2.dtype != FP4:
+        return f"routed weight dtypes {(w1.dtype, w2.dtype)} != float4_e2m1fn"
+    if w1_scale.dtype != F32 or w2_scale.dtype != F32:
+        return f"routed scale dtypes {(w1_scale.dtype, w2_scale.dtype)} != float32"
+    if shared_w1.dtype != FP8 or shared_w2.dtype != FP8:
+        return (
+            f"shared weight dtypes {(shared_w1.dtype, shared_w2.dtype)} "
+            "!= float8_e4m3fn"
+        )
+    if shared_w1_scale.dtype != F32 or shared_w2_scale.dtype != F32:
+        return (
+            f"shared scale dtypes {(shared_w1_scale.dtype, shared_w2_scale.dtype)} "
+            "!= float32"
+        )
+    if topk_ids.dtype != jnp.int32 or topk_weights.dtype not in (BF16, F32):
+        return (
+            f"routing dtypes topk_ids={topk_ids.dtype}, "
+            f"topk_weights={topk_weights.dtype} unsupported"
+        )
+
+    plan = _vmem_plan(
+        tile_rows=_STATIC_MAX_TILE_ROWS,
+        h=h,
+        i=i,
+        i_s=i_s,
+        b13=b13,
+        b2=b2,
+        act_mode=act_mode,
+        nb=nb,
+        w2_n_chunk=w2_n_chunk,
+        info=info,
+    )
+    if plan is None:
+        budget_mib = info.vmem_capacity_bytes * _VMEM_ADMISSION_FRACTION / (1 << 20)
+        return (
+            f"exceeds VMEM admission budget ({budget_mib:.1f} MiB) at "
+            f"tile_rows={_STATIC_MAX_TILE_ROWS}, i={i}, nb={nb}"
+        )
+    return None
 
 
 def can_use_fused_moe_prefill_nvfp4(
@@ -291,103 +409,28 @@ def can_use_fused_moe_prefill_nvfp4(
     act_mode: ActMode = "w4a16",
     nb: int = 4,
     w2_n_chunk: int = _DEFAULT_W2_N_CHUNK,
-    include_shared: bool = True,
 ) -> bool:
     """Static trace-time admission check (independent of token count ``T``)."""
-    info = pltpu.get_tpu_info()
-    if info.num_cores != 1 or not info.is_matmul_supported(FP8, FP8):
-        return False
-    if act_mode not in ("w4a16", "w4a8") or nb < 2:
-        return False
-    if w2_n_chunk <= 0 or w2_n_chunk % _PAIR_COLS != 0:
-        return False
-    if x.ndim != 2 or w1.ndim != 3 or w2.ndim != 3:
-        return False
-    if include_shared and (
-        shared_w1 is None
-        or shared_w2 is None
-        or shared_w1_scale is None
-        or shared_w2_scale is None
-        or shared_w1.ndim != 2
-        or shared_w2.ndim != 2
-    ):
-        return False
-    if topk_weights.ndim != 2 or topk_ids.ndim != 2:
-        return False
-
-    tokens, h = x.shape
-    experts, k1, two_i = w1.shape
-    e2, i, out_h = w2.shape
-    i_s = shared_w2.shape[0] if include_shared else 0
-    topk = topk_ids.shape[1]
-    if tokens <= 0 or topk <= 0 or experts <= 0:
-        return False
-    if e2 != experts or k1 != h or out_h != h or two_i != 2 * i:
-        return False
-    if topk_ids.shape != (tokens, topk) or topk_weights.shape != (tokens, topk):
-        return False
-
-    packed_row_tile = info.num_sublanes * _PACK4
-    if h <= 0 or h % _H_ALIGN != 0 or h % _PAIR_COLS != 0 or h % packed_row_tile != 0:
-        return False
-    if i <= 0 or i % _LANES != 0 or i % packed_row_tile != 0:
-        return False
-    if include_shared:
-        if i_s <= 0 or i_s % _LANES != 0:
-            return False
-        if shared_w1.shape != (h, 2 * i_s) or shared_w2.shape != (i_s, h):
-            return False
-        if not _valid_shared_scale(shared_w1_scale, 2 * i_s):
-            return False
-        if not _valid_shared_scale(shared_w2_scale, h):
-            return False
-        if shared_gate_weight is not None and (
-            shared_gate_weight.ndim not in (1, 2)
-            or math.prod(shared_gate_weight.shape) != h
-            or shared_gate_weight.dtype not in (BF16, F32)
-        ):
-            return False
-
-    b13 = _scale_blocks(w1_scale, experts, 2 * i)
-    b2 = _scale_blocks(w2_scale, experts, h)
-    min_block = max(_LANES, packed_row_tile)
-    if b13 is None or b13 <= 0 or h % b13 != 0:
-        return False
-    qb1 = h // b13
-    if qb1 < min_block or qb1 % _LANES != 0 or qb1 % packed_row_tile != 0:
-        return False
-    if b2 is None or b2 <= 0 or i % b2 != 0:
-        return False
-    bk2 = i // b2
-    if bk2 < min_block or bk2 % _LANES != 0 or bk2 % packed_row_tile != 0:
-        return False
-
-    if x.dtype != BF16 or w1.dtype != FP4 or w2.dtype != FP4:
-        return False
-    if w1_scale.dtype != F32 or w2_scale.dtype != F32:
-        return False
-    if include_shared:
-        if shared_w1.dtype != FP8 or shared_w2.dtype != FP8:
-            return False
-        if shared_w1_scale.dtype != F32 or shared_w2_scale.dtype != F32:
-            return False
-    if topk_ids.dtype != jnp.int32 or topk_weights.dtype not in (BF16, F32):
-        return False
-
-    plan = _vmem_plan(
-        tile_rows=_STATIC_MAX_TILE_ROWS,
-        h=h,
-        i=i,
-        i_s=i_s,
-        b13=b13,
-        b2=b2,
-        act_mode=act_mode,
-        nb=nb,
-        w2_n_chunk=w2_n_chunk,
-        info=info,
-        include_shared=include_shared,
+    return (
+        fused_moe_prefill_nvfp4_unsupported_reason(
+            x,
+            w1,
+            w2,
+            w1_scale,
+            w2_scale,
+            shared_w1,
+            shared_w1_scale,
+            shared_w2,
+            shared_w2_scale,
+            topk_weights,
+            topk_ids,
+            shared_gate_weight=shared_gate_weight,
+            act_mode=act_mode,
+            nb=nb,
+            w2_n_chunk=w2_n_chunk,
+        )
+        is None
     )
-    return plan is not None
 
 
 @functools.cache
@@ -406,7 +449,6 @@ def build_expert_kernel_nvfp4(
     nb: int = 4,
     rung_rows: int | None = None,
     w2_n_chunk: int = _DEFAULT_W2_N_CHUNK,
-    include_shared: bool = True,
 ):
     """Build the per-rank NVFP4 routed + online-FP8 shared expert Pallas call."""
     if act_mode not in ("w4a16", "w4a8"):
@@ -437,7 +479,7 @@ def build_expert_kernel_nvfp4(
     n_chunk = min(h, w2_n_chunk)
 
     shared = experts
-    slab_rows = routes + (tokens if include_shared else 1) + tile_rows
+    slab_rows = routes + tokens + tile_rows
     scale_rows = (_cdiv(slab_rows, _LANES) + 1) if has_act_scale else 0
     token_rows = _cdiv(routes, _LANES) * _LANES + window
 
@@ -454,17 +496,13 @@ def build_expert_kernel_nvfp4(
             k0 += 2
         w1_hbm, w2_hbm, w1_scale_hbm, w2_scale_hbm = refs[k0 : k0 + 4]
         k0 += 4
-        if include_shared:
-            (
-                shared_w1_hbm,
-                shared_w2_hbm,
-                shared_w1_scale_hbm,
-                shared_w2_scale_hbm,
-            ) = refs[k0 : k0 + 4]
-            k0 += 4
-        else:
-            shared_w1_hbm = shared_w2_hbm = None
-            shared_w1_scale_hbm = shared_w2_scale_hbm = None
+        (
+            shared_w1_hbm,
+            shared_w2_hbm,
+            shared_w1_scale_hbm,
+            shared_w2_scale_hbm,
+        ) = refs[k0 : k0 + 4]
+        k0 += 4
         slab_hbm = refs[k0]
         k0 += 1
         act_vmem = refs[k0]
@@ -484,20 +522,13 @@ def build_expert_kernel_nvfp4(
             window_sems,
             out_sems,
             ring_sems,
-        ) = refs[k0 : k0 + 10]
-        k0 += 10
-        if include_shared:
-            (
-                shared_w1_vmem,
-                shared_w2_vmem,
-                shared_w1_scale_vmem,
-                shared_w2_scale_vmem,
-                shared_sem,
-            ) = refs[k0 : k0 + 5]
-            k0 += 5
-        else:
-            shared_w1_vmem = shared_w2_vmem = None
-            shared_w1_scale_vmem = shared_w2_scale_vmem = shared_sem = None
+            shared_w1_vmem,
+            shared_w2_vmem,
+            shared_w1_scale_vmem,
+            shared_w2_scale_vmem,
+            shared_sem,
+        ) = refs[k0 : k0 + 15]
+        k0 += 15
         assert k0 == len(refs), (k0, len(refs))
 
         if not hasattr(w1_hbm, "bitcast"):
@@ -532,59 +563,39 @@ def build_expert_kernel_nvfp4(
                 for s, d in zip(srcs, dsts)
             ]
 
-        shared_copies: list[Any] = []
-        if include_shared:
-            assert (
-                shared_w1_hbm is not None
-                and shared_w2_hbm is not None
-                and shared_w1_scale_hbm is not None
-                and shared_w2_scale_hbm is not None
+        shared_copies = [
+            pltpu.make_async_copy(s, d, shared_sem)
+            for s, d in zip(
+                (
+                    shared_w1_hbm.at[0],
+                    shared_w2_hbm.at[0],
+                    shared_w1_scale_hbm.at[0],
+                    shared_w2_scale_hbm.at[0],
+                ),
+                (
+                    shared_w1_vmem,
+                    shared_w2_vmem,
+                    shared_w1_scale_vmem,
+                    shared_w2_scale_vmem,
+                ),
             )
-            shared_copies = [
-                pltpu.make_async_copy(s, d, shared_sem)
-                for s, d in zip(
-                    (
-                        shared_w1_hbm.at[0],
-                        shared_w2_hbm.at[0],
-                        shared_w1_scale_hbm.at[0],
-                        shared_w2_scale_hbm.at[0],
-                    ),
-                    (
-                        shared_w1_vmem,
-                        shared_w2_vmem,
-                        shared_w1_scale_vmem,
-                        shared_w2_scale_vmem,
-                    ),
-                )
-            ]
+        ]
 
         def start_weights(v):
-            if include_shared:
-
-                @pl.when(jnp.logical_not(is_shared(v)))
-                def _():
-                    for c in ring_copies(visit_expert[v], lax.rem(v, nb)):
-                        c.start(priority=_WEIGHT_DMA_PRIORITY)
-
-            else:
+            @pl.when(jnp.logical_not(is_shared(v)))
+            def _():
                 for c in ring_copies(visit_expert[v], lax.rem(v, nb)):
                     c.start(priority=_WEIGHT_DMA_PRIORITY)
 
         def wait_weights(v):
-            if include_shared:
-
-                @pl.when(jnp.logical_not(is_shared(v)))
-                def _():
-                    for c in ring_copies(0, lax.rem(v, nb)):
-                        c.wait()
-
-                @pl.when(is_shared(v))
-                def _():
-                    for c in shared_copies:
-                        c.wait()
-
-            else:
+            @pl.when(jnp.logical_not(is_shared(v)))
+            def _():
                 for c in ring_copies(0, lax.rem(v, nb)):
+                    c.wait()
+
+            @pl.when(is_shared(v))
+            def _():
+                for c in shared_copies:
                     c.wait()
 
         def next_tile(v, t):
@@ -609,24 +620,13 @@ def build_expert_kernel_nvfp4(
             )
 
         def start_window(v, t, slot):
-            cond = (
-                jnp.logical_and(v < n_visit, jnp.logical_not(is_shared(v)))
-                if include_shared
-                else (v < n_visit)
-            )
-
-            @pl.when(cond)
+            @pl.when(jnp.logical_and(v < n_visit, jnp.logical_not(is_shared(v))))
             def _():
                 window_copy(tile_start(v, t), slot).start()
 
         def wait_window(v, t, slot):
-            if include_shared:
-
-                @pl.when(jnp.logical_not(is_shared(v)))
-                def _():
-                    window_copy(tile_start(v, t), slot).wait()
-
-            else:
+            @pl.when(jnp.logical_not(is_shared(v)))
+            def _():
                 window_copy(tile_start(v, t), slot).wait()
 
         def scale_copy(start, slot):
@@ -655,22 +655,17 @@ def build_expert_kernel_nvfp4(
                 ptr0 = wslot * window + lax.rem(start, _LANES)
                 lax.fori_loop(0, _cdiv(tile_live(v, t), _GATHER_UNROLL), block, ptr0)
 
-            if include_shared:
+            @pl.when(is_shared(v))
+            def _():
+                n = tile_live(v, t)
+                pltpu.make_async_copy(
+                    x_hbm.at[pl.ds(t * tile_rows, n)],
+                    act_vmem.at[slot, pl.ds(0, n)],
+                    act_sems.at[slot],
+                ).start()
 
-                @pl.when(is_shared(v))
-                def _():
-                    n = tile_live(v, t)
-                    pltpu.make_async_copy(
-                        x_hbm.at[pl.ds(t * tile_rows, n)],
-                        act_vmem.at[slot, pl.ds(0, n)],
-                        act_sems.at[slot],
-                    ).start()
-
-                @pl.when(jnp.logical_not(is_shared(v)))
-                def _():
-                    gather_routed()
-
-            else:
+            @pl.when(jnp.logical_not(is_shared(v)))
+            def _():
                 gather_routed()
 
             if has_act_scale:
@@ -678,11 +673,7 @@ def build_expert_kernel_nvfp4(
 
         def wait_tile(v, t, slot):
             routed_n = _cdiv(tile_live(v, t), _GATHER_UNROLL) * _GATHER_UNROLL
-            n = (
-                jnp.where(is_shared(v), tile_live(v, t), routed_n)
-                if include_shared
-                else routed_n
-            )
+            n = jnp.where(is_shared(v), tile_live(v, t), routed_n)
             pltpu.make_async_copy(
                 act_vmem.at[slot, pl.ds(0, n)],
                 act_vmem.at[slot, pl.ds(0, n)],
@@ -706,12 +697,8 @@ def build_expert_kernel_nvfp4(
             ).wait()
 
         # ---- prologue ----
-        if include_shared:
-            for c in shared_copies:
-                c.start(priority=_WEIGHT_DMA_PRIORITY)
-        else:
-            out_vmem[0, 0] = jnp.zeros((lane_blocks, _LANES), BF16)
-            pltpu.sync_copy(out_vmem.at[0, pl.ds(0, 1)], slab_hbm.at[pl.ds(routes, 1)])
+        for c in shared_copies:
+            c.start(priority=_WEIGHT_DMA_PRIORITY)
         for k in range(nb - 1):
 
             @pl.when(k < n_visit)
@@ -889,24 +876,14 @@ def build_expert_kernel_nvfp4(
                             )
 
             def compute_shared(rows):
-                assert (
-                    shared_w1_vmem is not None
-                    and shared_w2_vmem is not None
-                    and shared_w1_scale_vmem is not None
-                    and shared_w2_scale_vmem is not None
-                )
-                # Verified shared-expert quantization & rounding contract:
-                # Today's `_tp_chain` (`layers/adapter/moe_tp_decode.py:474-478`)
-                # computes `shared` via two calls to `xla_quantized_matmul`
-                # (`kernels/quantized_matmul/util.py:68-112`), which quantizes
-                # activations dynamically per row at `util.py:96` via
-                # `quantize_tensor` (`util.py:51-52`) -> `quantize_block(x,
-                # axis=-1, target_dtype=FP8)` (`util.py:319-334`), then performs
-                # `dot_general(x_q, w_q, preferred_element_type=f32) * x_scale *
-                # w_scale` and casts to `bf16` (`util.py:97-112`). Using
-                # `quantize_block` directly in `w4a16` (mirroring
-                # `moe_tp_decode/kernel.py:371-387`) matches `_tp_chain`
-                # operation-for-operation and rounding-for-rounding.
+                # Shared-expert quantization and rounding contract:
+                # Match the TP-chain FP8 shared-expert path operation-for-operation.
+                # In w4a16, quantize each BF16 activation row dynamically to FP8
+                # via quantize_block(..., axis=1), accumulate the FP8xFP8 matmul in
+                # F32, multiply by the row and channel scales, round to BF16 before
+                # SiLU*up, and dynamically requantize the BF16 intermediate per row
+                # for the down projection. In w4a8, reuse the pre-quantized FP8
+                # input activations and scales directly.
                 if has_act_scale:
                     assert act_scale_vmem is not None
                     act_fp8 = build_lhs(rows)
@@ -978,17 +955,12 @@ def build_expert_kernel_nvfp4(
                             )
 
             def compute_visit(rows):
-                if include_shared:
+                @pl.when(is_shared(v))
+                def _():
+                    compute_shared(rows)
 
-                    @pl.when(is_shared(v))
-                    def _():
-                        compute_shared(rows)
-
-                    @pl.when(jnp.logical_not(is_shared(v)))
-                    def _():
-                        compute_routed(rows)
-
-                else:
+                @pl.when(jnp.logical_not(is_shared(v)))
+                def _():
                     compute_routed(rows)
 
             for r, rows in enumerate(rungs):
@@ -1014,9 +986,7 @@ def build_expert_kernel_nvfp4(
                 out_wait(par, n)
 
     hbm = pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM)
-    n_in = (
-        (11 if has_act_scale else 10) if include_shared else (7 if has_act_scale else 6)
-    )
+    n_in = 11 if has_act_scale else 10
     scratch: list[Any] = [
         pltpu.VMEM((n_act, tile_rows, lane_blocks, _LANES), act_dtype)
     ]
@@ -1033,19 +1003,14 @@ def build_expert_kernel_nvfp4(
         pltpu.SemaphoreType.DMA((2,)),
         pltpu.SemaphoreType.DMA((2,)),
         pltpu.SemaphoreType.DMA((nb,)),
+        pltpu.VMEM((h, 2 * i_s), FP8),
+        pltpu.VMEM((i_s, h), FP8),
+        pltpu.VMEM((1, 2 * i_s), F32),
+        pltpu.VMEM((1, h), F32),
+        pltpu.SemaphoreType.DMA(()),
     ]
-    if include_shared:
-        scratch += [
-            pltpu.VMEM((h, 2 * i_s), FP8),
-            pltpu.VMEM((i_s, h), FP8),
-            pltpu.VMEM((1, 2 * i_s), F32),
-            pltpu.VMEM((1, h), F32),
-            pltpu.SemaphoreType.DMA(()),
-        ]
-    tag = (
-        f"{act_mode}-nb{nb}-nc{n_chunk}"
-        + ("" if rung_rows is None else f"-r{rung_rows}")
-        + ("" if include_shared else "-routed")
+    tag = f"{act_mode}-nb{nb}-nc{n_chunk}" + (
+        "" if rung_rows is None else f"-r{rung_rows}"
     )
     call = pl.pallas_call(
         kernel,
@@ -1066,50 +1031,6 @@ def build_expert_kernel_nvfp4(
         ),
     )
     return call, scale_rows, token_rows
-
-
-def _combine_with_chunk_tokens(
-    slab,
-    slab_row,
-    coeff,
-    axis_name,
-    *,
-    flat: bool = True,
-    chunk_tokens: int = 2048,
-):
-    """Run ``combine`` with configurable max tokens per combine/AR chunk."""
-    if chunk_tokens <= 0:
-        raise ValueError(f"combine_chunk_tokens={chunk_tokens} must be positive")
-    if chunk_tokens == 2048:
-        return prefill_v2.combine(slab, slab_row, coeff, axis_name, flat=flat)
-    tokens, slots = slab_row.shape
-    h = slab.shape[1] * _LANES
-    chunks = next(
-        n
-        for n in range(1, tokens + 1)
-        if not tokens % n and tokens // n <= chunk_tokens
-    )
-    chunk = tokens // chunks
-    outs = []
-    for c in range(chunks):
-        rows = slice(c * chunk, (c + 1) * chunk)
-        if prefill_v2.combine_step_tokens(chunk):
-            y = prefill_v2.build_combine(
-                t_local=chunk,
-                topk=slots,
-                hidden=h,
-                lane_blocks=h // _LANES,
-                wire_dtype=BF16,
-                out_dtype=BF16,
-                flat=flat,
-            )(slab, coeff[rows], slab_row[rows])
-        else:
-            gathered = slab.reshape(-1, h)[slab_row[rows]].astype(F32)
-            y = jnp.sum(gathered * coeff[rows][..., None], axis=1).astype(BF16)
-        if outs:
-            y, _ = lax.optimization_barrier((y, outs[-1]))
-        outs.append(_psum_rows(y, axis_name))
-    return outs[0] if chunks == 1 else jnp.concatenate(outs, 0)
 
 
 def fused_moe_prefill_nvfp4(
@@ -1133,48 +1054,38 @@ def fused_moe_prefill_nvfp4(
     nb: int = 4,
     tile_min: int = 4096,
     flat: bool = True,
-    tall_rung_rows: TallRungRows = "auto",
+    tall_rung_rows: int | None = None,
     w2_n_chunk: int = _DEFAULT_W2_N_CHUNK,
-    include_shared: bool = True,
-    combine_chunk_tokens: int = 2048,
-    x_q=None,
-    x_scale=None,
 ):
     """Per-rank NVFP4 fused MoE prefill op (routed + shared + combine + AR).
 
     Call inside ``jax.shard_map(..., mesh=mesh)`` over ``axis_name``. Under
     ``EP2 x TP4``, pass ``expert_start = ep_rank * E_local``: non-local routes
     are filtered out on each rank, every rank computes its ``1 / N_ranks`` TP
-    slice of ``shared_experts`` once (when ``include_shared=True``),
-    ``routed_scale`` scales only routed experts, and one
-    ``reduce-scatter + all-gather`` sums everything across ``axis_name``.
+    slice of ``shared_experts`` once, ``routed_scale`` scales only routed
+    experts, and one ``reduce-scatter + all-gather`` sums everything across
+    ``axis_name``.
     """
     if act_mode not in ("w4a16", "w4a8"):
         raise ValueError(f"Unsupported act_mode={act_mode!r}; expected w4a16 or w4a8")
-    if act_mode == "w4a16" and (x_q is not None or x_scale is not None):
-        raise ValueError("x_q and x_scale are only supported when act_mode='w4a8'")
+    if x.dtype != BF16:
+        raise ValueError(f"Expected bfloat16 activations, got {x.dtype}")
     if w1.dtype != FP4 or w2.dtype != FP4:
         raise ValueError(
             f"Expected float4_e2m1fn routed weights, got {w1.dtype}, {w2.dtype}"
         )
-    if include_shared:
-        if shared_w1 is None or shared_w2 is None:
-            raise ValueError(
-                "shared_w1 and shared_w2 are required when include_shared=True"
-            )
-        if shared_w1.dtype != FP8 or shared_w2.dtype != FP8:
-            raise ValueError(
-                "Expected float8_e4m3fn shared weights, got "
-                f"{shared_w1.dtype}, {shared_w2.dtype}"
-            )
+    if shared_w1 is None or shared_w2 is None:
+        raise ValueError("shared_w1 and shared_w2 are required")
+    if shared_w1.dtype != FP8 or shared_w2.dtype != FP8:
+        raise ValueError(
+            "Expected float8_e4m3fn shared weights, got "
+            f"{shared_w1.dtype}, {shared_w2.dtype}"
+        )
 
-    if x_q is None:
-        tokens, h = x.shape
-    else:
-        tokens, h = x_q.shape[0], x_q.shape[1] * x_q.shape[2]
+    tokens, h = x.shape
     experts, _, two_i = w1.shape
     i = two_i // 2
-    i_s = shared_w2.shape[0] if include_shared else 0
+    i_s = shared_w2.shape[0]
     routes = tokens * topk_ids.shape[1]
     b13 = _scale_blocks(w1_scale, experts, two_i)
     b2 = _scale_blocks(w2_scale, experts, h)
@@ -1185,10 +1096,7 @@ def fused_moe_prefill_nvfp4(
         )
 
     tile_rows = tile_rows_for(tokens, tile_min)
-    if tall_rung_rows == "auto":
-        rung_rows = tall_rung_rows_for(tile_rows, i)
-    else:
-        rung_rows = tall_rung_rows if tile_rows > 128 else None
+    rung_rows = tall_rung_rows if tile_rows > 128 else None
     call, scale_rows, token_rows = build_expert_kernel_nvfp4(
         experts=experts,
         h=h,
@@ -1203,13 +1111,10 @@ def fused_moe_prefill_nvfp4(
         nb=nb,
         rung_rows=rung_rows,
         w2_n_chunk=w2_n_chunk,
-        include_shared=include_shared,
     )
 
     x_clean = None
-    if x is not None and (
-        act_mode == "w4a16" or (include_shared and shared_gate_weight is not None)
-    ):
+    if act_mode == "w4a16" or shared_gate_weight is not None:
         row_finite = jnp.all(jnp.isfinite(x), axis=-1, keepdims=True)
         x_clean = jnp.where(row_finite, x, jnp.zeros_like(x))
 
@@ -1221,9 +1126,7 @@ def fused_moe_prefill_nvfp4(
         topk_ids = jnp.where(local, topk_ids, 0)
 
     if act_mode == "w4a8":
-        if x_q is None:
-            x_q, x_scale = _quantize_rows(x, FP8)
-        assert x_scale is not None
+        x_q, x_scale = _quantize_rows(x, FP8)
         (
             row_token,
             slab_row,
@@ -1234,9 +1137,7 @@ def fused_moe_prefill_nvfp4(
             routed_visits,
         ) = _routing_plan(topk_ids, route_valid, experts, x_scale)
         # pyrefly: ignore[bad-argument-type]
-        row_scale = (
-            jnp.concatenate([sorted_scale, x_scale]) if include_shared else sorted_scale
-        )
+        row_scale = jnp.concatenate([sorted_scale, x_scale])
         row_scale = jnp.pad(row_scale, (0, scale_rows * _LANES - row_scale.shape[0]))
         x_in = x_q
     else:
@@ -1252,13 +1153,10 @@ def fused_moe_prefill_nvfp4(
         row_scale = None
         x_in = x_clean.reshape(tokens, h // _LANES, _LANES)
 
-    if include_shared:
-        visit_expert = visit_expert.at[routed_visits].set(experts)
-        visit_start = visit_start.at[routed_visits].set(routes)
-        visit_rows = visit_rows.at[routed_visits].set(tokens)
-        n_vis = (routed_visits + 1).reshape(1)
-    else:
-        n_vis = routed_visits.reshape(1)
+    visit_expert = visit_expert.at[routed_visits].set(experts)
+    visit_start = visit_start.at[routed_visits].set(routes)
+    visit_rows = visit_rows.at[routed_visits].set(tokens)
+    n_vis = (routed_visits + 1).reshape(1)
     row_token = jnp.pad(row_token, (0, token_rows - routes))
 
     args: list[Any] = [
@@ -1283,31 +1181,16 @@ def fused_moe_prefill_nvfp4(
         w2,
         w1_s4d,
         w2_s4d,
+        shared_w1.reshape(1, h, 2 * i_s),
+        shared_w2.reshape(1, i_s, h),
+        shared_w1_scale.reshape(1, 1, 2 * i_s).astype(F32),
+        shared_w2_scale.reshape(1, 1, h).astype(F32),
     ]
-    if include_shared:
-        weight_args += [
-            shared_w1.reshape(1, h, 2 * i_s),
-            shared_w2.reshape(1, i_s, h),
-            shared_w1_scale.reshape(1, 1, 2 * i_s).astype(F32),
-            shared_w2_scale.reshape(1, 1, h).astype(F32),
-        ]
     slab = call(*args, *weight_args)
 
     coeff = jnp.where(route_valid, topk_weights.astype(F32), 0.0)
     if routed_scale != 1.0:
         coeff = coeff * routed_scale
-
-    if not include_shared:
-        zero_row = jnp.full_like(slab_row, routes)
-        slab_row = jnp.where(route_valid, slab_row, zero_row)
-        return _combine_with_chunk_tokens(
-            slab,
-            slab_row,
-            coeff,
-            axis_name,
-            flat=flat,
-            chunk_tokens=combine_chunk_tokens,
-        )
 
     if shared_gate_weight is None:
         gate = jnp.ones((tokens, 1), F32)
@@ -1322,13 +1205,12 @@ def fused_moe_prefill_nvfp4(
         )
     shared_row = routes + jnp.arange(tokens, dtype=jnp.int32)[:, None]
     slab_row = jnp.where(route_valid, slab_row, shared_row)
-    return _combine_with_chunk_tokens(
+    return prefill_v2.combine(
         slab,
         jnp.concatenate([slab_row, shared_row], 1),
         jnp.concatenate([coeff, gate], 1),
         axis_name,
         flat=flat,
-        chunk_tokens=combine_chunk_tokens,
     )
 
 

@@ -11,21 +11,19 @@ all-reduces across ranks via chunked ``reduce-scatter + all-gather``.
 from vllm_torchtpu.kernels.experimental.fused_moe_prefill_nvfp4.kernel import (
     STAGE_A_NVFP4,
     ActMode,
-    TallRungRows,
     build_expert_kernel_nvfp4,
     can_use_fused_moe_prefill_nvfp4,
     fused_moe_prefill_nvfp4,
     fused_moe_prefill_nvfp4_stage_a,
-    tall_rung_rows_for,
+    fused_moe_prefill_nvfp4_unsupported_reason,
 )
 
 __all__ = [
     "STAGE_A_NVFP4",
     "ActMode",
-    "TallRungRows",
     "build_expert_kernel_nvfp4",
     "can_use_fused_moe_prefill_nvfp4",
     "fused_moe_prefill_nvfp4",
     "fused_moe_prefill_nvfp4_stage_a",
-    "tall_rung_rows_for",
+    "fused_moe_prefill_nvfp4_unsupported_reason",
 ]
