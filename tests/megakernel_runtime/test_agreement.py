@@ -39,9 +39,8 @@ class _FakeTPGroup:
         assert group is self
         self.calls += 1
         mine = int(t[1])
-        toks = [mine] if self.peer_tokens is None else [mine, *self.peer_tokens]
-        if self.peer_tokens is None:
-            toks = [mine] * (1 + len(self.peer_votes))
+        peers = self.peer_tokens
+        toks = [mine] * (1 + len(self.peer_votes)) if peers is None else [mine, *peers]
         t[0] = max([int(t[0]), *self.peer_votes])
         t[1] = max(toks)
         t[2] = max(-x for x in toks)
@@ -144,6 +143,49 @@ def test_declined_driver_joins_the_bind_agreement(fake_tp_group: Any) -> None:
     )
     dd.bind_and_warmup(SimpleNamespace())
     assert g.calls == 1
+
+
+def test_declined_driver_counts_stock_steps(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Every forward falls through to the stock model and counts as
+    `stock_<code>` (the periodic summary names it); a suppressed run (dummy /
+    precompile) isn't counted; `reset_stats` clears the counts."""
+    import logging
+
+    from vllm_torchtpu.megakernel_runtime import hooks, testing
+
+    try:
+        agreement_mod.logger._resolve()
+    except ModuleNotFoundError:
+        monkeypatch.setattr(
+            agreement_mod.logger,
+            "_logger",
+            logging.getLogger(agreement_mod.logger._name),
+        )
+    monkeypatch.setattr(logging.getLogger("vllm"), "propagate", True)
+    dd = agreement_mod.DeclinedDriver(
+        EligibilityResult(False, "pallas_mesh_unavailable", "m"),
+        display_name="Toy",
+        stats_period_s=3600.0,
+    )
+    runner = testing.fake_runner()
+    with hooks.suppressed(runner):
+        assert dd.try_forward(runner, hooks.StepContext(None, None)) == (False, None)
+    assert dd.step_mix_tracker.counts == {}
+    assert dd.try_forward(runner, hooks.StepContext(None, None)) == (False, None)
+    assert dd.step_mix_tracker.counts == {"stock_pallas_mesh_unavailable": 1}
+    # A due summary unpacks note_step's tuple and logs it on rank 0.
+    dd.step_mix_tracker.period_s = 0.0
+    with caplog.at_level(logging.INFO):
+        assert dd.try_forward(runner, hooks.StepContext(None, None)) == (False, None)
+    assert "Toy megakernel step mix" in caplog.text
+    assert "0/2 MK (0.0%)" in caplog.text
+    assert "'stock_pallas_mesh_unavailable': 2" in caplog.text
+    dd.step_mix_tracker.period_s = 3600.0
+    dd.try_forward(runner, hooks.StepContext(None, None))
+    dd.reset_stats()
+    assert dd.step_mix_tracker.counts == {}
 
 
 def test_agreement_group_resolves_the_tp_group(monkeypatch: pytest.MonkeyPatch) -> None:

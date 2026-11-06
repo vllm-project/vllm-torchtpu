@@ -72,7 +72,7 @@ def _tp_cpu_group() -> Any:
     from vllm.distributed import get_tp_group
 
     tp_group = get_tp_group()
-    if int(getattr(tp_group, "world_size", 1)) <= 1:
+    if int(tp_group.world_size) <= 1:
         return None
     return tp_group.cpu_group
 
