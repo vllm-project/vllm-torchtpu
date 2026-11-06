@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """``repetition_penalty`` on the TPU sampler: request tracking, scaling math,
-sync decode integration, and TPU compilation."""
+sync decode and spec verify integration, and TPU compilation."""
 
 from __future__ import annotations
 
@@ -28,6 +28,7 @@ from vllm.v1.sample.logits_processor import LogitsProcessors
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
+from vllm_torchtpu.layers.adapter.sample.rejection_sampler import RejectionSampler
 from vllm_torchtpu.runner import min_tokens
 from vllm_torchtpu.runner import repetition_penalty as rep_pen
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
@@ -256,12 +257,10 @@ class TestRunnerIntegration:
         assert out.sampled_token_ids == [[2]]
         assert seen_logprob_logits[0][0, 4].item() == pytest.approx(3.0)
 
-    @pytest.mark.parametrize(
-        ("async_scheduling", "spec"), [(True, None), (False, object())]
-    )
-    def test_unsupported_modes_skip_penalty_with_warning(self, async_scheduling, spec):
+    @pytest.mark.parametrize("spec", [None, object()])
+    def test_async_scheduling_skips_penalty_with_warning(self, spec):
         logits = torch.zeros(1, 8)
-        runner = _plain_runner(logits, async_scheduling=async_scheduling, spec=spec)
+        runner = _plain_runner(logits, async_scheduling=True, spec=spec)
         runner._repetition_penalty.add(
             "r0", SamplingParams(repetition_penalty=1.5), [4]
         )
@@ -360,12 +359,73 @@ class TestRunnerIntegration:
             TPUModelRunner._update_states(runner, so)
         assert not runner._repetition_penalty
 
+    @pytest.mark.parametrize("use_grammar", [False, True])
+    def test_spec_verify_chunk_penalizes_draft_prefixes_and_bonus(self, use_grammar):
+        """Draft [2, 3]: draft pos 0 sees prompt [1]; draft pos 1 sees [1, 2];
+        bonus pos 2 sees [1, 2, 3]."""
+        logits = torch.zeros(3, 8)
+        # Pos 0: token 2 (unseen, 3.0) accepted.
+        logits[0, 2], logits[0, 6] = 3.0, 2.0
+        # Pos 1: token 2 (now seen from draft[0]!, 3.0 / 2.0 = 1.5 < token 3's 2.5)
+        # -> token 3 accepted!
+        logits[1, 2], logits[1, 3] = 3.0, 2.5
+        # Bonus pos 2: token 3 (now seen from draft[1]!, 3.0 / 2.0 = 1.5 < 6's 2.0)
+        # -> bonus picks 6 instead of repeating 3!
+        logits[2, 3], logits[2, 6] = 3.0, 2.0
+
+        md = SimpleNamespace(
+            draft_token_ids=torch.tensor([2, 3], dtype=torch.int32),
+            draft_lengths=torch.tensor([2], dtype=torch.int32),
+            draft_lengths_cpu=np.array([2]),
+            target_logits_indices=torch.tensor([0, 1], dtype=torch.int32),
+            bonus_logits_indices=torch.tensor([2], dtype=torch.int32),
+            segment_ids=torch.tensor([0, 0], dtype=torch.int64),
+            group_indices=torch.tensor([0, 1], dtype=torch.int32),
+        )
+        spec_cfg = SimpleNamespace(
+            num_speculative_tokens=2,
+            rejection_sample_method="strict",
+            synthetic_acceptance_rates=None,
+        )
+        runner = object.__new__(TPUModelRunner)
+        runner.input_batch = SimpleNamespace(
+            req_ids=["r0"], no_top_k=True, no_top_p=True
+        )
+        runner.speculative_config = spec_cfg
+        runner.rejection_sampler = RejectionSampler(spec_cfg, torch.device("cpu"))
+        runner.structured_decoding_manager = SimpleNamespace(
+            mask_spec_logits=lambda t, b, *_a: (t, b),
+            mask_invalid_draft_tokens=lambda d, *_a, **_kw: d,
+        )
+        runner.sample_from_logits_func = lambda x, *_a, **_kw: torch.argmax(
+            x, dim=-1, keepdim=True
+        )
+        tracker = rep_pen.RepetitionPenaltyTracker()
+        tracker.add("r0", SamplingParams(repetition_penalty=2.0), [1])
+        state = tracker.batch_state({"r0": 0}, lambda _rid: [])
+
+        out = TPUModelRunner._sample_spec_verify_chunk(
+            runner,
+            logits,
+            md,
+            object() if use_grammar else None,
+            SimpleNamespace(scheduled_spec_decode_tokens={"r0": [2, 3]}),
+            0,
+            1,
+            True,
+            None,
+            False,
+            {},
+            state,
+        )
+        assert out.tolist() == [[2, 3, 6]]
+
     @pytest.mark.parametrize(
         ("async_scheduling", "spec", "expected"),
         [
             (False, None, [(8, 12), (16, 12)]),
+            (False, object(), [(8, 12), (16, 12), (32, 12)]),
             (True, None, []),
-            (False, object(), []),
         ],
     )
     def test_precompile_covers_supported_buckets_only(
@@ -373,6 +433,11 @@ class TestRunnerIntegration:
     ):
         runner = object.__new__(TPUModelRunner)
         runner.num_reqs_paddings = [8, 16]
+        runner.num_tokens_paddings = [16, 32, 64]
+        runner._mtp_prefill_only = False
+        runner.structured_decoding_manager = SimpleNamespace(
+            target_grammar_bitmask_cpu=torch.zeros(32, 1)
+        )
         runner.speculative_config = spec
         runner.scheduler_config = SimpleNamespace(async_scheduling=async_scheduling)
         runner.device = torch.device("cpu")

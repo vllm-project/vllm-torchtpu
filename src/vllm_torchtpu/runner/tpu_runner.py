@@ -4988,9 +4988,8 @@ class TPUModelRunner(GPUModelRunner):
         if not self._repetition_penalty_supported():
             logger.warning_once(
                 "repetition_penalty is not yet applied on TPU with "
-                "async_scheduling or speculative decoding; requests run without "
-                "it. Run with async_scheduling=False and no speculative_config "
-                "to apply it."
+                "async_scheduling; requests run without it. Run with "
+                "async_scheduling=False to apply it."
             )
             return {}
         return self._repetition_penalty.batch_state(
@@ -5000,10 +4999,7 @@ class TPUModelRunner(GPUModelRunner):
 
     def _repetition_penalty_supported(self) -> bool:
         """Whether this runner mode applies ``repetition_penalty``."""
-        return (
-            not self.scheduler_config.async_scheduling
-            and self.speculative_config is None
-        )
+        return not self.scheduler_config.async_scheduling
 
     def _lookup_repetition_penalty_output(self, req_id: str) -> Sequence[int] | None:
         req_state = self.requests.get(req_id)
@@ -5039,6 +5035,7 @@ class TPUModelRunner(GPUModelRunner):
         sampling_generator: torch.Generator | None,
         top_tokens: bool = False,
         min_toks: min_tokens_mask.MinTokensState | None = None,
+        rep_pen: repetition_penalty_ops.RepetitionPenaltyState | None = None,
     ) -> torch.Tensor:
         """Bonus-token sampling + draft rejection for one spec-verify chunk.
 
@@ -5076,7 +5073,9 @@ class TPUModelRunner(GPUModelRunner):
         req_temperatures = req_top_k = req_top_p = None
         topk_candidates = 0
         min_toks = min_toks or {}
+        rep_pen = rep_pen or {}
         min_tokens_rows = None
+        rep_pen_draft_info: tuple[list[int], list[Sequence[int]]] | None = None
         if min_toks and any(cur_start_idx <= i < cur_end_idx for i in min_toks):
             draft_lengths = md.draft_lengths_cpu[: cur_end_idx - cur_start_idx]
             if grammar_output is None:
@@ -5095,6 +5094,30 @@ class TPUModelRunner(GPUModelRunner):
                 min_tokens_rows = min_tokens_mask.verify_rows(
                     min_toks, cur_start_idx, draft_lengths.tolist()
                 )
+        if rep_pen and any(cur_start_idx <= i < cur_end_idx for i in rep_pen):
+            draft_lengths_list = md.draft_lengths_cpu[
+                : cur_end_idx - cur_start_idx
+            ].tolist()
+            spec_tokens = scheduler_output.scheduled_spec_decode_tokens
+            drafts_by_req: list[Sequence[int]] = [
+                spec_tokens.get(self.input_batch.req_ids[i] or "", ())
+                for i in range(cur_start_idx, cur_end_idx)
+            ]
+            if grammar_output is None:
+                verify_inputs = repetition_penalty_ops.build_verify_logits_inputs(
+                    rep_pen,
+                    cur_start_idx,
+                    draft_lengths_list,
+                    drafts_by_req,
+                    logits.shape[0],
+                    logits.shape[1],
+                )
+                if verify_inputs is not None:
+                    logits = repetition_penalty_ops.apply_penalties_table(
+                        logits, *verify_inputs
+                    )
+            else:
+                rep_pen_draft_info = (draft_lengths_list, drafts_by_req)
         draft_token_ids = md.draft_token_ids
         if all_greedy and grammar_output is None:
             bonus_token_ids, target_logits = self.spec_bonus_and_target_logits(
@@ -5132,6 +5155,27 @@ class TPUModelRunner(GPUModelRunner):
                     target_logits, target_rows, min_toks
                 )
                 bonus_logits = self._mask_min_tokens(bonus_logits, bonus_rows, min_toks)
+            if rep_pen_draft_info is not None:
+                draft_lengths_list, drafts_by_req = rep_pen_draft_info
+                target_inputs, bonus_inputs = (
+                    repetition_penalty_ops.build_verify_split_inputs(
+                        rep_pen,
+                        cur_start_idx,
+                        draft_lengths_list,
+                        drafts_by_req,
+                        target_logits.shape[0],
+                        bonus_logits.shape[0],
+                        bonus_logits.shape[1],
+                    )
+                )
+                if target_inputs is not None:
+                    target_logits = repetition_penalty_ops.apply_penalties_table(
+                        target_logits, *target_inputs
+                    )
+                if bonus_inputs is not None:
+                    bonus_logits = repetition_penalty_ops.apply_penalties_table(
+                        bonus_logits, *bonus_inputs
+                    )
             if all_greedy:
                 bonus_token_ids = self._greedy_sample(bonus_logits).view(-1)
             else:
@@ -5302,6 +5346,7 @@ class TPUModelRunner(GPUModelRunner):
                             sampling_generator,
                             state.top_tokens,
                             min_toks,
+                            rep_pen,
                         )
                     combined_selected_tokens.append(next_tokens)
                     combined_selected_tokens_real_lens.append(num_reqs)
@@ -6904,7 +6949,9 @@ class TPUModelRunner(GPUModelRunner):
         if not self._repetition_penalty_supported():
             return
         with self._precompile_timed("repetition_penalty"):
-            for num_rows in self.num_reqs_paddings:
+            row_counts = set(self.num_reqs_paddings)
+            row_counts.update(self._verify_logits_paddings())
+            for num_rows in sorted(row_counts):
                 logits = self._dummy_logits(num_rows)
                 seen_mask = torch.zeros(
                     (num_rows, logits.shape[1]), dtype=torch.bool, device=self.device
