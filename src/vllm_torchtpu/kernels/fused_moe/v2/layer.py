@@ -23,8 +23,11 @@ from typing import cast
 import jax
 import jax.numpy as jnp
 from jax import lax
+from jax.experimental import pallas as pl
+from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.kernels.fused_moe.v2.host import (
+    FP8,
     HIDDEN_LANE_BLOCK,
     MAX_ROUTING_BLOCK,
     QB4,
@@ -36,6 +39,7 @@ from vllm_torchtpu.kernels.fused_moe.v2.host import (
     WeightFormat,
     act_scale_slab_rows,
     align_up,
+    array_vmem_bytes,
     build_routing_tables,
     build_routing_tables_sharded,
     expert_visit_list,
@@ -44,12 +48,14 @@ from vllm_torchtpu.kernels.fused_moe.v2.host import (
     pow2_shift,
     ragged_stride_bound,
     routing_block,
+    row_lane_blocks,
     shard_count_vector,
     shard_expert_slabs,
     shard_push_tables_in_rows,
     shard_token_gather,
     shard_transport_tables_in_blocks,
     token_gather_window_rows,
+    vmem_limit,
     weight_form,
     weight_format_of_dtype,
 )
@@ -68,6 +74,68 @@ from vllm_torchtpu.kernels.fused_moe.v2.token_parallel import (
 # The scoring functions the router can apply to the gate logits. These
 # mirror `layers/adapter/moe_routing._apply_scoring_fn` exactly.
 SCORING_FNS = ("softmax", "sigmoid", "sqrtsoftplus")
+_ROWQUANT_TILE_ROWS = 1024
+
+
+def _fp8_wire_blocks(tokens: int, hidden: int) -> int | None:
+    if tokens < _ROWQUANT_TILE_ROWS or tokens % _ROWQUANT_TILE_ROWS:
+        return None
+    if hidden < HIDDEN_LANE_BLOCK or hidden % HIDDEN_LANE_BLOCK:
+        return None
+    info = pltpu.get_tpu_info()
+    if info.num_lanes != HIDDEN_LANE_BLOCK:
+        return None
+
+    blocks = row_lane_blocks(hidden)
+    # Compact HBM tiles use whole FP8 packing groups and grow to one sublane
+    # tile. Padding to that tile keeps the logical row stride after the gather.
+    packing = jnp.dtype(jnp.int32).itemsize // jnp.dtype(FP8).itemsize
+    block_tile = max(packing, min(info.num_sublanes, 1 << (blocks - 1).bit_length()))
+    wire_blocks = align_up(blocks, block_tile)
+
+    rows = _ROWQUANT_TILE_ROWS
+    input_bytes = array_vmem_bytes((rows, hidden), jnp.bfloat16, info)
+    wire_bytes = array_vmem_bytes((rows, wire_blocks, info.num_lanes), FP8, info)
+    scale_bytes = array_vmem_bytes((rows, 1), jnp.float32, info)
+    # Allow double-buffered I/O and another BF16 tile for quantization.
+    if 2 * (input_bytes + wire_bytes + scale_bytes) + input_bytes > vmem_limit(info):
+        return None
+    return wire_blocks
+
+
+def _rowquant_fp8_wire(x: jax.Array, wire_blocks: int) -> tuple[jax.Array, jax.Array]:
+    """Quantize each tile directly into the activation all-gather layout."""
+    tokens, hidden = x.shape
+    tile_rows = _ROWQUANT_TILE_ROWS
+    lanes = HIDDEN_LANE_BLOCK
+    blocks = row_lane_blocks(hidden)
+    tile_shape = (tile_rows, wire_blocks, lanes)
+
+    def quantize(x_ref, q_ref, scale_ref):
+        q, scale = rowquant_fp8(x_ref[...])
+        q_ref[...] = jnp.pad(
+            q.reshape(tile_rows, blocks, lanes),
+            ((0, 0), (0, wire_blocks - blocks), (0, 0)),
+        )
+        scale_ref[...] = scale
+
+    return pl.pallas_call(
+        quantize,
+        out_shape=(
+            jax.ShapeDtypeStruct((tokens, wire_blocks, lanes), FP8),
+            jax.ShapeDtypeStruct((tokens, 1), jnp.float32),
+        ),
+        in_specs=[pl.BlockSpec((tile_rows, hidden), lambda i: (i, 0))],
+        out_specs=(
+            pl.BlockSpec(tile_shape, lambda i: (i, 0, 0)),
+            pl.BlockSpec((tile_rows, 1), lambda i: (i, 0)),
+        ),
+        grid=(tokens // tile_rows,),
+        compiler_params=pltpu.CompilerParams(
+            dimension_semantics=("parallel",), vmem_limit_bytes=vmem_limit()
+        ),
+        name="moe_rowquant_fp8_wire",
+    )(x)
 
 
 def _apply_scoring_fn(logits, scoring_fn):
@@ -478,6 +546,15 @@ def fused_ep_moe_v2(
                 "hash_topk_ids are expert ids and must be an integer dtype; "
                 f"got {jnp.dtype(hash_topk_ids.dtype).name}"
             )
+    activation_wire_blocks = None
+    if (
+        stage == "fused"
+        and ep > 1
+        and len(token_layout.groups[0]) == 1
+        and form.quantized_activations
+        and x.dtype == jnp.bfloat16
+    ):
+        activation_wire_blocks = _fp8_wire_blocks(t_local, hidden)
     kfn = build_fused_ep_moe_kernel(
         g_local=g_local,
         capacity=capacity,
@@ -528,6 +605,9 @@ def fused_ep_moe_v2(
             # Keep this boundary only for quantized replicated inputs.
             x_l = lax.optimization_barrier(x_l)
         rows_bf16 = x_l.astype(jnp.bfloat16)
+        if activation_wire_blocks is not None:
+            q_l, row_scale_l = _rowquant_fp8_wire(rows_bf16, activation_wire_blocks)
+            return gate_l, hash_l, q_l, row_scale_l
         if form.quantized_activations:
             q_l, row_scale_l = rowquant_fp8(rows_bf16)
         else:
@@ -800,6 +880,8 @@ def fused_ep_moe_v2(
         )
         gate_l, hash_l, q_l, row_scale_l = quantize_local(x_l, rank_l, gate_l, hash_l)
         q_g = lax.all_gather(q_l, ax, axis=0, tiled=True)
+        if activation_wire_blocks is not None:
+            q_g = q_g[:, : row_lane_blocks(hidden), :]
         topk_weights, packed, local_blocks, block_hist, row_routes = select_local(
             gate_l, hash_l, score_bias_l, row_scale_l
         )
@@ -933,6 +1015,7 @@ def fused_ep_moe_v2(
         mesh_ep_ranks,
         token_layout,
         bool(sharded_plan),
+        activation_wire_blocks,
         x.dtype,
         w1.dtype,
         w2.dtype,
