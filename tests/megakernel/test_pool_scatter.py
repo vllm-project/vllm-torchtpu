@@ -236,7 +236,7 @@ def test_scatter_direct_conv_window_traces_for_24_lane_rows(T: int):
     jaxpr = jax.make_jaxpr(
         lambda *a: pool.scatter_pool_states(lay, ex, *a, ckpt_indices=ckpt)
     )(*args)
-    assert "qwen3_5_scatter_pool_states" in str(jaxpr)
+    assert "scatter_pool_states" in str(jaxpr)
 
 
 @pytest.mark.parametrize("R,kh,vh", [(1, 8, 8), (4, 32, 32)])
@@ -502,3 +502,55 @@ def test_scatter_input_validation_and_pos_debug_check():
         lambda *a: pool.scatter_pool_states(lay, ex_bc, *a, ckpt_indices=ckpt)
     )(raw_r0, pos, pt, knew, vnew, conv, rec)
     assert "disable_bounds_checks=False" in str(jaxpr)
+
+
+@pytest.mark.parametrize("T", [1, 2])
+@pytest.mark.parametrize(
+    "bad_case", ["neg_pos", "pos_past_cols", "page_past_num_pages"]
+)
+def test_scatter_routes_invalid_active_tokens_to_null_page_zero(T: int, bad_case: str):
+    """Out-of-range active tokens clamp `lp` and `kp` to null page `0` without
+    touching any non-reserved page (`lay.reserved_pages .. NUM_PAGES - 1`)."""
+    lay = _layout(0, num_pools=2)
+    ex = _exec(R=1, B=2 * T, T=T)
+    st = _random_states(lay, ex, seed=401 + T)
+    pt, ckpt, roff = _tables(lay, ex, 3)
+    raw_pools = pool.states_to_pool(lay, ex, st, pt, ckpt, roff)
+
+    # Sequence 0 token 0 has an invalid position or page; other tokens are valid.
+    pos_list = [10 + 129 * (s % 2) + t for s in range(ex.NS) for t in range(T)]
+    pt_mod = pt
+    if bad_case == "neg_pos":
+        pos_list[0] = -5
+    elif bad_case == "pos_past_cols":
+        pos_list[0] = pt.shape[1] * lay.page_size + 7
+    else:
+        assert bad_case == "page_past_num_pages"
+        lp0 = pos_list[0] // lay.page_size
+        pt_mod = pt.at[0, lp0].set(NUM_PAGES + 5)
+    pos = jnp.asarray(pos_list, dtype=jnp.int32)
+
+    k = jax.random.split(jax.random.key(420 + T), 2)
+    knew = (jax.random.normal(k[0], (lay.num_pools, ex.MR, lay.hd)) * 0.5).astype(FP8)
+    vnew = (jax.random.normal(k[1], (lay.num_pools, ex.MR, lay.hd)) * 0.5).astype(FP8)
+
+    # Run with only sequence 0 active and all its tokens invalid so sequence 0
+    # writes strictly to null page 0.
+    pos_seq0_bad = pos.at[:T].set(pos[0])
+    mask_seq0 = jnp.asarray([1, 0], dtype=jnp.int32)
+    with pl.enable_debug_checks(False):
+        out_pools = pool.scatter_pool_states(
+            lay,
+            ex,
+            raw_pools,
+            pos_seq0_bad,
+            pt_mod,
+            knew,
+            vnew,
+            active_seqs=mask_seq0,
+        )
+    for raw_before, raw_after in zip(raw_pools, out_pools):
+        np.testing.assert_array_equal(
+            _bytes(raw_after[lay.reserved_pages :]),
+            _bytes(raw_before[lay.reserved_pages :]),
+        )

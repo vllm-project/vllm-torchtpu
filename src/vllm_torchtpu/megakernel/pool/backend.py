@@ -252,6 +252,7 @@ def make_pool_backend(
     `can_pool_gather`); `supports_pool_gather` defaults to whether it is set,
     and `True` without `rec_chunk` raises `MegakernelConfigError`.
     """
+    pool_gather_arg = supports_pool_gather
     if supports_pool_gather is None:
         supports_pool_gather = rec_chunk is not None
     elif supports_pool_gather and rec_chunk is None:
@@ -315,11 +316,20 @@ def make_pool_backend(
             ckpt_indices if has_rec else None,
             active_seqs,
             interpret=ex_paged.interpret,
-            conv_partial=cache_exec(ex_paged).GPR,
+            conv_partial=cache_exec(ex_paged).GPR and layout.conv_itemsize == 2,
         )
 
     def _can_pool_gather(ex_paged: ExecSpec) -> bool:
         return can_pool_gather(layout, ex_paged, rec_chunk)
+
+    def _rebuild(new_layout: PoolLayout) -> PoolBackend:
+        return make_pool_backend(
+            new_layout,
+            check=check,
+            rec_chunk=rec_chunk,
+            supports_fused_io=supports_fused_io,
+            supports_pool_gather=pool_gather_arg,
+        )
 
     return PoolBackend(
         layout=layout,
@@ -330,6 +340,7 @@ def make_pool_backend(
         page_table_state_name="page_table",
         supports_fused_io=supports_fused_io,
         supports_pool_gather=supports_pool_gather,
+        rebuild=_rebuild,
     )
 
 
