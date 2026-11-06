@@ -145,7 +145,6 @@ from vllm_torchtpu.layers.core.attention_metadata import (
     zeros_h2d_source,
 )
 from vllm_torchtpu.layers.core.sequence_layout import (
-    DEFAULT_SEQUENCE_LAYOUT_DESCRIPTOR,
     SequenceLayoutKind,
     SequenceLayoutPlanner,
     create_sequence_layout_planner,
@@ -167,11 +166,7 @@ from vllm_torchtpu.runner.mm_encoder_manager import (
     maybe_create_mm_encoder_manager,
 )
 from vllm_torchtpu.runner.mm_video_chunking import chunked_video_encoding
-from vllm_torchtpu.runner.pcp import (
-    PcpManager,
-    mla_kv_page_size,
-    validate_pcp_manager_layers,
-)
+from vllm_torchtpu.runner.pcp import PcpManager, validate_pcp_manager_layers
 from vllm_torchtpu.runner.speculative_decoding_manager import (
     SpecDecodeMetadata,
     SpeculativeDecodingManager,
@@ -786,20 +781,24 @@ class TPUModelRunner(GPUModelRunner):
             sequence_layout_planner = None
         else:
             sequence_layout_planner = create_sequence_layout_planner(vllm_config)
-            if sequence_layout_planner.requires_backend_preinit:
-                # GPUModelRunner probes torch.cuda.mem_get_info during init. The
-                # TPU shim maps that to torch.accelerator.get_memory_info, which
-                # initializes TorchTPU/PJRT from TORCH_TPU_TOPOLOGY=1,1,1 and would
-                # otherwise leave JAX seeing only one chip. Initialize JAX first
-                # so partial sequence layout backends own the full local device
-                # set.
-                layout_devices = list(jax.local_devices())
-                logger.info(
-                    "Pre-initialized JAX backend for partial sequence layout "
-                    "| world_size=%d | visible_devices=%d",
-                    sequence_layout_planner.backend_preinit_world_size,
-                    len(layout_devices),
-                )
+        pcp_planner = (
+            pcp_manager if pcp_manager is not None else sequence_layout_planner
+        )
+        assert pcp_planner is not None
+        if pcp_planner.requires_backend_preinit:
+            # GPUModelRunner probes torch.cuda.mem_get_info during init. The
+            # TPU shim maps that to torch.accelerator.get_memory_info, which
+            # initializes TorchTPU/PJRT from TORCH_TPU_TOPOLOGY=1,1,1 and would
+            # otherwise leave JAX seeing only one chip. Initialize JAX first
+            # so partial sequence layout backends own the full local device
+            # set.
+            layout_devices = list(jax.local_devices())
+            logger.info(
+                "Pre-initialized JAX backend for partial sequence layout "
+                "| world_size=%d | visible_devices=%d",
+                pcp_planner.backend_preinit_world_size,
+                len(layout_devices),
+            )
         # Disable cudagraphs before parent init so its dispatch self-disables.
         # TPU uses AOT bucket precompile (_precompile_* methods) instead.
         vllm_config.compilation_config.cudagraph_capture_sizes = []
@@ -1021,19 +1020,7 @@ class TPUModelRunner(GPUModelRunner):
             if self.pcp_manager is not None
             else self.max_num_reqs
         )
-        # TPUPlatform sets compile_sizes to the token padding buckets, so they
-        # are ints here; the config field's own type also admits str and None.
-        compile_sizes = vllm_config.compilation_config.compile_sizes
-        assert compile_sizes, "TPUPlatform sets compile_sizes"
-        self.num_tokens_paddings: list[int] = [int(size) for size in compile_sizes]
-        # Override parent's max_num_tokens with the last (largest) padding
-        # bucket so all CPU staging buffers cover it.
-        self.max_num_tokens = self.num_tokens_paddings[-1]
-        # vLLM compiles the backbone for every compile size, but it runs on a
-        # rank's local tokens, which PCP caps well below the global step.
-        backbone_paddings = self._backbone_token_paddings()
-        if len(backbone_paddings) < len(self.num_tokens_paddings):
-            vllm_config.compilation_config.compile_sizes = list(backbone_paddings)
+        self._init_token_buckets_and_host_buffers(vllm_config)
         self.num_attn_layers = self.model_config.get_num_layers_by_block_type(
             self.parallel_config, "attention"
         )
@@ -1048,14 +1035,6 @@ class TPUModelRunner(GPUModelRunner):
         # by KV length. None until a sparse MLA layer is allocated.
         self._masked_dense_groups_requests: bool | None = None
 
-        # CPU staging tensors (TPU prepares inputs on CPU then transfers).
-        self.input_ids_cpu = torch.zeros(
-            self.max_num_tokens, dtype=torch.int32, device="cpu"
-        )
-        self.positions_cpu = torch.zeros(
-            self.max_num_tokens, dtype=torch.int32, device="cpu"
-        )
-        self.positions_np = self.positions_cpu.numpy()
         self.block_table_cpu = torch.zeros(
             (self.max_num_reqs, self.max_num_blocks_per_req),
             dtype=torch.int32,
@@ -1075,32 +1054,6 @@ class TPUModelRunner(GPUModelRunner):
         self._pending_mamba_state_copies: list[
             tuple[list[torch.Tensor], torch.Tensor, torch.Tensor]
         ] = []
-        if self.uses_mrope:
-            # Override parent's int64 mrope buffer with int32 so the H2D copy is
-            # dtype-identical to what the TPU model expects. Parent's
-            # _calc_mrope_positions writes via .cpu and .np — both route here.
-            self.mrope_positions = self._make_buffer(
-                3, self.max_num_tokens + 1, dtype=torch.int32
-            )
-        self.query_start_loc_cpu = torch.zeros(
-            self.max_num_tokens + 1,
-            dtype=torch.int32,
-            device="cpu",
-            pin_memory=PIN_MEMORY,
-        )
-        self.query_start_loc_np = self.query_start_loc_cpu.numpy()
-        self.seq_lens_cpu = torch.zeros(
-            self.max_num_tokens, dtype=torch.int32, device="cpu", pin_memory=PIN_MEMORY
-        )
-        self.seq_lens_np = self.seq_lens_cpu.numpy()
-        if self.supports_mm_inputs:
-            self.is_mm_embed_cpu = torch.zeros(
-                self.max_num_tokens,
-                dtype=torch.bool,
-                device="cpu",
-                pin_memory=PIN_MEMORY,
-            )
-        self.arange_np = np.arange(self.max_num_tokens, dtype=np.int64)
         self.num_reqs_paddings = _get_req_paddings(
             min_req_size=MIN_NUM_SEQS, max_req_size=self.max_num_reqs
         )
@@ -1232,6 +1185,74 @@ class TPUModelRunner(GPUModelRunner):
 
         self._init_phased_profiling()
         self._stage_timing = RunnerStageTiming(profiler_rank)
+
+    def _init_token_buckets_and_host_buffers(self, vllm_config: VllmConfig) -> None:
+        """Resolves per-rank and global token buckets and pre-sizes CPU staging
+        buffers."""
+        # TPUPlatform sets compile_sizes to the token padding buckets, so they
+        # are ints here; the config field's own type also admits str and None.
+        compile_sizes = vllm_config.compilation_config.compile_sizes
+        assert compile_sizes, "TPUPlatform sets compile_sizes"
+        self.num_tokens_paddings: list[int] = [int(size) for size in compile_sizes]
+        self._global_num_tokens_paddings: list[int] = list(self.num_tokens_paddings)
+        # Override parent's max_num_tokens with the last (largest) padding
+        # bucket so all CPU staging buffers cover it.
+        self.max_num_tokens = self.num_tokens_paddings[-1]
+        # vLLM compiles the backbone for every compile size, but it runs on a
+        # rank's local tokens, which PCP caps well below the global step.
+        backbone_paddings = self._backbone_token_paddings()
+        if (
+            self.pcp_manager is not None
+            and self.pcp_manager.local_compile_token_multiple > 1
+        ):
+            self.num_tokens_paddings = list(backbone_paddings)
+            self.max_num_tokens = self.num_tokens_paddings[-1]
+        if len(backbone_paddings) < len(self._global_num_tokens_paddings):
+            vllm_config.compilation_config.compile_sizes = list(backbone_paddings)
+
+        # CPU staging tensors (TPU prepares inputs on CPU then transfers).
+        # Under PcpManager, pre-size token staging buffers once for the full
+        # request-major and rank-major packed step capacity.
+        host_num_tokens = self.max_num_tokens
+        if self.pcp_manager is not None:
+            host_num_tokens = max(
+                host_num_tokens,
+                int(self.scheduler_config.max_num_batched_tokens),
+                backbone_paddings[-1] * self.pcp_manager.sharding_plan.pcp_size,
+            )
+        self.input_ids_cpu = torch.zeros(
+            host_num_tokens, dtype=torch.int32, device="cpu"
+        )
+        self.positions_cpu = torch.zeros(
+            host_num_tokens, dtype=torch.int32, device="cpu"
+        )
+        self.positions_np = self.positions_cpu.numpy()
+        if self.uses_mrope:
+            # Override parent's int64 mrope buffer with int32 so the H2D copy is
+            # dtype-identical to what the TPU model expects. Parent's
+            # _calc_mrope_positions writes via .cpu and .np — both route here.
+            self.mrope_positions = self._make_buffer(
+                3, host_num_tokens + 1, dtype=torch.int32
+            )
+        self.query_start_loc_cpu = torch.zeros(
+            self.max_num_tokens + 1,
+            dtype=torch.int32,
+            device="cpu",
+            pin_memory=PIN_MEMORY,
+        )
+        self.query_start_loc_np = self.query_start_loc_cpu.numpy()
+        self.seq_lens_cpu = torch.zeros(
+            self.max_num_tokens, dtype=torch.int32, device="cpu", pin_memory=PIN_MEMORY
+        )
+        self.seq_lens_np = self.seq_lens_cpu.numpy()
+        if self.supports_mm_inputs:
+            self.is_mm_embed_cpu = torch.zeros(
+                host_num_tokens,
+                dtype=torch.bool,
+                device="cpu",
+                pin_memory=PIN_MEMORY,
+            )
+        self.arange_np = np.arange(host_num_tokens, dtype=np.int64)
 
     def _init_phased_profiling(self) -> None:
         """Resolves whether USE_PHASED_PROFILER is set and where its traces go.
@@ -1898,7 +1919,8 @@ class TPUModelRunner(GPUModelRunner):
         if self.pcp_manager is not None:
             # After the model is built, before any compile.
             validate_pcp_manager_layers(
-                get_layers_from_vllm_config(self.vllm_config, AttentionLayerBase)
+                get_layers_from_vllm_config(self.vllm_config, AttentionLayerBase),
+                self.pcp_manager.plan_name,
             )
         self._refresh_smem_request_caps()
         with set_current_vllm_config(self.vllm_config):
@@ -1909,7 +1931,9 @@ class TPUModelRunner(GPUModelRunner):
         with set_current_vllm_config(self.vllm_config):
             self.kv_cache_manager.initialize_kv_cache(kv_cache_config)
         if self.pcp_manager is not None:
-            self.pcp_manager.set_page_size(mla_kv_page_size(kv_cache_config))
+            self.pcp_manager.configure_kv_cache(
+                kv_cache_config, self._attention_kernel_block_size
+            )
 
     def _init_prefill_checkpoint_units(self, kv_cache_config: KVCacheConfig) -> None:
         """Initializes the units the worker places prefill checkpoints with.
@@ -3419,6 +3443,25 @@ class TPUModelRunner(GPUModelRunner):
 
         if self.uses_mrope:
             self._calc_mrope_positions(scheduler_output)
+            if start_index > 0:
+                mrope_offset = sum(
+                    int(scheduler_output.num_scheduled_tokens[req_id])
+                    for req_id in self.input_batch.req_ids[:start_index]
+                    if req_id is not None
+                    and req_id in scheduler_output.num_scheduled_tokens
+                )
+                if mrope_offset > 0:
+                    chunk_tokens = int(total_num_scheduled_tokens)
+                    end_col = mrope_offset + chunk_tokens
+                    mrope_cols = int(self.mrope_positions.cpu.shape[1])
+                    if end_col > mrope_cols:
+                        raise ValueError(
+                            f"mrope_positions buffer ({mrope_cols} cols) is smaller "
+                            f"than chunk end offset {end_col}."
+                        )
+                    self.mrope_positions.cpu[:, :chunk_tokens] = (
+                        self.mrope_positions.cpu[:, mrope_offset:end_col].clone()
+                    )
 
         # Fast path for decode-only: all requests have exactly 1 token.
         if max_num_scheduled_tokens_all_reqs == 1:
@@ -3537,8 +3580,8 @@ class TPUModelRunner(GPUModelRunner):
         if self.pcp_manager is not None:
             self.pcp_manager.prepare_real(**prepare_kwargs)
             pcp_plan = self.pcp_manager.sharding_plan
-            layout_plan = None
-            layout_descriptor = DEFAULT_SEQUENCE_LAYOUT_DESCRIPTOR
+            layout_plan = pcp_plan.sequence_layout_plan
+            layout_descriptor = self.pcp_manager.sequence_layout_descriptor
             meta_num_reqs = pcp_plan.local_num_reqs
             global_num_tokens = pcp_plan.global_num_tokens
             padded_total_num_scheduled_tokens = pcp_plan.global_padded_num_tokens
@@ -4350,8 +4393,14 @@ class TPUModelRunner(GPUModelRunner):
         batch_composition_stats = None
         if self.phase_based_profiler:
             self.batch_counter += 1
+            global_paddings = self._global_num_tokens_paddings
+            # Custom per-rank compile_sizes under PCP cap below the global step budget.
             padded_total_tokens = _get_padded_token_len(
-                self.num_tokens_paddings, scheduler_output.total_num_scheduled_tokens
+                global_paddings,
+                min(
+                    scheduler_output.total_num_scheduled_tokens,
+                    global_paddings[-1],
+                ),
             )
             batch_composition_stats = runner_utils.get_batch_composition_stats(
                 batch_id=self.batch_counter,
@@ -6354,7 +6403,7 @@ class TPUModelRunner(GPUModelRunner):
                 num_reqs=num_reqs,
                 max_num_tokens=int(self.num_tokens_paddings[-1]),
             )
-            dummy_layout_descriptor = DEFAULT_SEQUENCE_LAYOUT_DESCRIPTOR
+            dummy_layout_descriptor = self.pcp_manager.sequence_layout_descriptor
         else:
             assert self.sequence_layout_planner is not None
             dummy_layout_descriptor = self.sequence_layout_planner.prepare_dummy(
@@ -6722,6 +6771,8 @@ class TPUModelRunner(GPUModelRunner):
             self.num_tokens_paddings = sorted(
                 set(self.num_tokens_paddings) | set(extra)
             )
+            if not self._pcp_enabled:
+                self._global_num_tokens_paddings = list(self.num_tokens_paddings)
             self.vllm_config.compilation_config.compile_sizes = list(
                 self.num_tokens_paddings
             )
@@ -7648,15 +7699,33 @@ class TPUModelRunner(GPUModelRunner):
 
     def _backbone_token_paddings(self) -> list[int]:
         """Token buckets the backbone can run at on this rank."""
+        multiple = (
+            self.pcp_manager.local_compile_token_multiple
+            if self.pcp_manager is not None
+            else 1
+        )
         cap = (
             self.pcp_manager.max_local_num_tokens
             if self.pcp_manager is not None
             else None
         )
-        if cap is None or cap >= self.num_tokens_paddings[-1]:
-            return self.num_tokens_paddings
-        top = _get_padded_token_len(self.num_tokens_paddings, cap)
-        return [n for n in self.num_tokens_paddings if n <= top]
+        if multiple > 1:
+            paddings = [n for n in self.num_tokens_paddings if n % multiple == 0]
+            min_bucket = cap if cap is not None else multiple
+            if not paddings or paddings[-1] < min_bucket:
+                raise ValueError(
+                    f"PCP sharding plan requires a compile_sizes entry divisible "
+                    f"by {multiple} and >= {min_bucket} (got "
+                    f"{self.num_tokens_paddings}); add a {min_bucket} bucket to "
+                    f"--compilation-config compile_sizes or lower "
+                    f"--max-num-batched-tokens."
+                )
+        else:
+            paddings = self.num_tokens_paddings
+        if cap is None or cap >= paddings[-1]:
+            return paddings
+        top = _get_padded_token_len(paddings, cap)
+        return [n for n in paddings if n <= top]
 
     def _precompile_backbone(self) -> None:
         """Compile the backbone for every token bucket.

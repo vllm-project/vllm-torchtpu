@@ -134,3 +134,15 @@ Sizing:
 
 - `TPU_PCP_KV_WORKSPACE_TOKENS` (default `1048576`): if the split prefill contexts in a step sum to more than this, the runner splits the step into more forwards. Must be at least `--max-model-len`.
 - `TPU_PCP_KV_CHUNK_TOKENS` sets how many tokens are all-gathered in each step.
+
+### Interleaved PCP (PCP manager)
+
+Set `USE_TPU_PCP_MANAGER=1 TPU_PCP_SHARDING_PLAN=interleaved` to route streamed `PCP` (`--decode-context-parallel-size 1`) through `PcpManager`. Request-major tokens are assigned round-robin across `PCP` ranks in chunks of `--cp-kv-cache-interleave-size` tokens, while each rank compiles backbone buckets in multiples of `512` local tokens.
+
+Requirements:
+
+- `--prefill-context-parallel-size > 1` and `--decode-context-parallel-size 1`.
+- `--cp-kv-cache-interleave-size` dividing `512` (and dividing the attention KV page size; `HND` KV cache layout additionally requires a multiple of `128`).
+- Pooled Qwen GDN hybrid models require `--cp-kv-cache-interleave-size >= 16` (until `#2698` lands).
+- No speculative decoding, LoRA, pipeline parallelism, data parallelism, or multimodal encoder inputs (`--language-model-only` is supported on multimodal architectures).
+- MoE models require `--enable-expert-parallel`.
