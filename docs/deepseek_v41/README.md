@@ -89,6 +89,11 @@ expert count rather than the target's.
 
 ## Validation limits
 
+For the ongoing long-context output investigation, see the
+[DeepSWE reproduction and CI handoff](deepswe_repetition_reproduction.md).
+It records the frozen-request protocol, source boundary, evidence format and
+remaining requirements for a CI regression case; it does not claim a root cause.
+
 Tuning measurements in the kernel tables identify the runtime they were measured
 on. The epic upgrade to JAX 0.11.2 / libtpu 0.0.50 / TorchTPU 0.2.0rc1 requires
 fresh accelerator validation; old measurements are not evidence for these pins.
