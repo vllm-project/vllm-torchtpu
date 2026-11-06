@@ -185,7 +185,11 @@ def quantize_to_native_fp4_kmajor(
     )
     fp4_max = float(jnp.finfo(jnp.float4_e2m1fn).max)
     abs_max = jnp.max(jnp.abs(blocked), axis=-2, keepdims=True)
-    scale = abs_max / fp4_max
+    # MoE kernel path.: power-of-two scale 2^ceil(log2(absmax/6)) instead of absmax/6. DeepSeek-V4 checkpoints are
+    # e2m1 x 2^e per 1x32 block, so 32-blocks at their block's top exponent stay exact (frexp: no transcendental).
+    mant, expo = jnp.frexp(abs_max / fp4_max)
+    expo = jnp.where(mant == 0.5, expo - 1, expo)
+    scale = jnp.where(abs_max == 0, 0.0, jnp.ldexp(jnp.ones_like(abs_max), expo))
     scale_inv = jnp.where(scale == 0, 0.0, 1.0 / scale)
     quantized = jnp.clip(blocked * scale_inv, -fp4_max, fp4_max).astype(
         jnp.float4_e2m1fn
