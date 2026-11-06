@@ -342,6 +342,7 @@ class Qwen4ExpRaidenWorker(TPURaidenConnectorWorker):
             manifest = self._staging.manifest
             materialize_storages(manifest)
             plan_groups = self._staging.src_groups
+            self._log_hbm_after_staging(runner)
         else:
             manifest = build_transfer_manifest(
                 cache.native_config, cache.materialized, cache.layout
@@ -395,6 +396,30 @@ class Qwen4ExpRaidenWorker(TPURaidenConnectorWorker):
                 "Qwen PD staging full (%d pages): req=%s waits", staging.pages, destination_req_id
             )
         return ok
+
+    def _log_hbm_after_staging(self, runner) -> None:
+        """One line per rank with the device's HBM after the staging carrier.
+
+        The carrier is allocated here, after the KV pool is sized and after
+        the worker's ``Memory statistics`` line, and it is not part of the
+        connector HBM reserve; this is the only record of the margin a larger
+        ``QWEN4_EXP_PD_STAGING_BYTES`` would eat (XFER L4)."""
+        staging = self._staging
+        try:
+            device = getattr(runner, "device", None) or torch.device("tpu")
+            free, limit = torch.accelerator.get_memory_info(device)
+            logger.info(
+                "Qwen PD staging carrier rank%d: %d pages, %.2f GiB requested | HBM after the "
+                "carrier: used %.2f GiB of %.2f GiB, free %.2f GiB",
+                self.tp_rank,
+                staging.pages,
+                int(envs.QWEN4_EXP_PD_STAGING_BYTES) / 2**30,
+                (limit - free) / 2**30,
+                limit / 2**30,
+                free / 2**30,
+            )
+        except Exception as exc:  # observability only; never block the load path
+            logger.info("Qwen PD staging carrier rank%d: HBM unavailable (%s)", self.tp_rank, exc)
 
     # --- QWEN4_EXP_PD_BATCHED_ADMISSION hooks (distributed/kv_transfer/stage3_admission.py) ---
 
