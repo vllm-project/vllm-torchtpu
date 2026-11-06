@@ -124,6 +124,7 @@ if TYPE_CHECKING:
     VLLM_TPU_QSA_PREFILL_BITSET_KERNEL: bool = True
     VLLM_TPU_QSA_PREFILL_BF16_MXU: bool = False
     VLLM_TPU_QSA_PREFILL_LEAN: bool = False
+    VLLM_TPU_QSA_PREFILL_QUERY_TILE: int = 0
     VLLM_TPU_QSA_PREFILL_Q128_FALLBACK: bool = False
     VLLM_TPU_QSA_MAIN_KV_DCP: int = 0
     VLLM_TPU_QSA_MTP_KV_DCP: bool = False
@@ -755,6 +756,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # qwen4_exp QSA sparse prefill: skip the FP8 key finite/written guard,
     # which the score mask select already covers (bit-identical output).
     "VLLM_TPU_QSA_PREFILL_LEAN": env_bool("VLLM_TPU_QSA_PREFILL_LEAN"),
+    # Qwen4-exp QSA prefill: query subtile (rows that share one decoded KV tile)
+    # for paired-page tiles whose table entry leaves it to the kernel default
+    # (the query block). 64 measured bitwise and 6-9% faster at Q256/KV512 on
+    # a TP1 stage's 3200-token pages (P-ATTN i1f, j-03e68c32). 0 = default.
+    "VLLM_TPU_QSA_PREFILL_QUERY_TILE": env_nonnegative_int(
+        "VLLM_TPU_QSA_PREFILL_QUERY_TILE", 0
+    ),
     # Qwen4-exp QSA prefill on a TP1 stage's 3200-token pages: run token counts
     # that are a multiple of 128 but not of 256 (the 3200-token bucket) on the
     # paired Q128/KV512 kernel instead of the unpaired Q256/KV128 fallback.

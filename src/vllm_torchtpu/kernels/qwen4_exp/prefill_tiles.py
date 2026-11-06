@@ -99,6 +99,20 @@ def get_sparse_prefill_tiles(
     tiles = _get_sparse_prefill_tiles(query, cache, kv_heads=kv_heads, ratio=ratio)
     if len(tiles) == 2:
         tiles = (*tiles, None)
+    # VLLM_TPU_QSA_PREFILL_QUERY_TILE: a query subtile for paired-page entries
+    # that leave it to the kernel. Query rows are independent, so the output is
+    # bitwise unchanged; only how many rows share one decoded KV tile changes.
+    subtile = envs.VLLM_TPU_QSA_PREFILL_QUERY_TILE
+    if (
+        subtile
+        and tiles[2] is None
+        and tiles[1] in (256, 512, 1024, 2048)
+        and not cache.shape[1] % 128
+        and subtile % 8 == 0
+        and subtile < tiles[0]
+        and tiles[0] % subtile == 0
+    ):
+        tiles = (tiles[0], tiles[1], subtile)
     return tiles if with_query_tile else tiles[:2]
 
 
