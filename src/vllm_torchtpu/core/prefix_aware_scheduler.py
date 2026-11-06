@@ -31,7 +31,7 @@ host-resident prefix costs a DMA, not a prefill, so it must not rank as cold.
 Warmest-first alone starves long cold prompts: while warmer requests keep
 arriving they never reach the front, their session stalls, and its cached
 prefix ages out. A request that has waited `paw_max_wait_s` seconds (additional
-config, default 60; 0 disables) is promoted ahead of every normal request,
+config, default 0 = off) is promoted ahead of every normal request,
 oldest first.
 
 Enable with:
@@ -65,7 +65,7 @@ _TIER_NORMAL = 3
 
 # Seconds a request may wait before it is promoted ahead of warmer requests
 # (additional_config PAW_MAX_WAIT_S_KEY; 0 disables aging).
-DEFAULT_PAW_MAX_WAIT_S = 60.0
+DEFAULT_PAW_MAX_WAIT_S = 0.0
 
 # Connector probes are cached per request and refreshed every this many
 # scheduler steps: the host tier changes slowly, and the window is re-scored
