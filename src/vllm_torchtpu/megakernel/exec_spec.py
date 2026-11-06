@@ -167,8 +167,9 @@ def default_tiles(B: Any = 4, **kw: Any) -> Tiles:
 class DebugOptions:
     """Debug, ablation, and LLO profiling flags (`ExecSpec.debug`).
 
-    `scopes` controls `jax.named_scope` LLO region markers emitted by the
-    megakernel builder (`sc(name, level)` is enabled when `int(scopes) >= level`):
+    `scopes` configures `jax.named_scope` LLO region markers and
+    `pltpu.trace_value` layer tags for the megakernel step builder
+    (`sc(name, level)` is enabled when `int(scopes) >= level`):
     - `0` / `False`: off (default; zero LLO instructions emitted).
     - `1` / `True`: per-module hook scopes `<module>/<phase>` around every module's
       `prologue`, `init_buffers`, `on_layer_start`, `emit`, and `epilogue`, plus

@@ -190,6 +190,43 @@ def test_profile_validation_and_numerics_enforcement():
             fused_pool_io=False,
         )
 
+    # Non-power-of-two T (e.g. T=3 for 2 draft tokens) and long ctx (>32768)
+    # are caught by the grid, and g-dependent or off-grid approx differences
+    # are caught by tiles_for / exec_for on exact profiles.
+    with pytest.raises(ValueError, match="tiles.dense_acc_pair"):
+        Profile(
+            name="bad-t3",
+            numerics="exact",
+            tiles=lambda tc: (
+                dataclasses.replace(default_tiles(tc), dense_acc_pair=True)
+                if tc.T == 3
+                else default_tiles(tc)
+            ),
+        )
+    with pytest.raises(ValueError, match="tiles.dense_acc_pair"):
+        Profile(
+            name="bad-ctx131k",
+            numerics="exact",
+            tiles=lambda tc: (
+                dataclasses.replace(default_tiles(tc), dense_acc_pair=True)
+                if tc.ctx > 32768
+                else default_tiles(tc)
+            ),
+        )
+    g_sneaky = Profile(
+        name="bad-g-only",
+        numerics="exact",
+        tiles=lambda tc: (
+            dataclasses.replace(default_tiles(tc), dense_acc_pair=True)
+            if tc.g is not None
+            else default_tiles(tc)
+        ),
+    )
+    with pytest.raises(ValueError, match="tiles.dense_acc_pair"):
+        g_sneaky.exec_for(
+            ExecSpec(R=2, ctx=131072), B=6, T=3, g=types.SimpleNamespace(moe_tp=False)
+        )
+
 
 def test_approx_features_against_default_and_model_reference():
     def _ref_rule(tc: TileContext) -> Tiles:

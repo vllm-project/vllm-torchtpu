@@ -241,7 +241,13 @@ def test_normalize_weight_dtypes_and_host_update_states_passthrough():
         decls.normalize_weight_dtypes(["w1"], ("w1",), "toy")
     with pytest.raises(ValueError, match="unknown weight 'w_bad'"):
         decls.normalize_weight_dtypes({"w_bad": "fp8"}, ("w1",), "toy")
-    with pytest.raises(ValueError, match="must be 'fp8' or 'bf16', got 'int8'"):
+    with pytest.raises(
+        ValueError,
+        match=(
+            r"must be 'fp8' or 'bf16' \(or alias 'fp8_channel', "
+            r"'per_channel_fp8'\), got 'int8'"
+        ),
+    ):
         decls.normalize_weight_dtypes({"w1": "int8"}, ("w1",), "toy")
 
     class _OutModule(Module):
