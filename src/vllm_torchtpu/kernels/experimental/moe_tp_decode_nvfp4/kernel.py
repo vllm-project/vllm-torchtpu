@@ -12,7 +12,7 @@ expert weight ring with grouped whole-expert FP4 slots:
      (8 K-rows per 32-bit word) and streamed whole into a 4-slot VMEM ring.
   2. Each ring slot groups ``g = group_size(I, El)`` active local experts side
      by side along ``N`` (``g = 2`` at TP8 ``I = 256``, ``g = 1`` at EP2xTP4
-     ``I = 512``, capping ``g * 2I <= 1024`` by default), so each 512-row ``w13``
+     ``I = 512``, capping ``g * 2I <= 1024``), so each 512-row ``w13``
      K-block widens ``fp4 -> fp8`` in VMEM and executes one wide ``[M, 512] x
      [512, g * 2I]`` FP8 MXU dot, scaled in ``f32`` by the ``x`` and ``w13``
      block scales and summed in ``f32``. Tail lanes when ``active_count % g != 0``
@@ -60,22 +60,11 @@ _MAX_GROUP = 4
 _NUM_BUFFERS = 4
 VMEM_HEADROOM = 1.25
 VMEM_FRACTION = 0.875
-_REF_BITCAST_JAX_VERSION = "0.9.1"
 
 
-def group_size(
-    i: int,
-    local_experts: int,
-    *,
-    max_group: int = _MAX_GROUP,
-    group_cols: int = _GROUP_COLS,
-) -> int:
+def group_size(i: int, local_experts: int) -> int:
     """Experts grouped per gate/up dot slot (2 at I=256, 1 at I>=512)."""
-    if max_group <= 0:
-        raise ValueError(f"max_group {max_group} must be positive")
-    if group_cols <= 0:
-        raise ValueError(f"group_cols {group_cols} must be positive")
-    return min(max_group, local_experts, max(1, group_cols // (2 * i)))
+    return min(_MAX_GROUP, local_experts, max(1, _GROUP_COLS // (2 * i)))
 
 
 def _split_entry(n_valid_ref, rank_ref, e0_ref, *refs, **kwargs):
@@ -93,9 +82,6 @@ def _vmem_plan(
     shared_inter,
     info,
     spec,
-    *,
-    num_buffers: int = _NUM_BUFFERS,
-    contig_dma: bool = False,
 ):
     """(need_bytes, vmem_limit_bytes), or None if limit exceeds budget."""
     t = functools.partial(all_reduce.tiled_bytes, info=info)
@@ -115,16 +101,13 @@ def _vmem_plan(
         + t((m, e_pad), f32)  # wtab
         + t((4, e_pad), jnp.int32)  # hits_v
     )
-    if contig_dma and group > 1:
-        w1_slot = t((group, h // _PACK4, 2 * i), u32)
-        s1_slot = t((group, b13, 1, 2 * i), f32)
-    else:
-        w1_slot = t((h // _PACK4, group * 2 * i), u32)
-        s1_slot = t((b13, 1, group * 2 * i), f32)
     slot = (
-        w1_slot + t((group, i // _PACK4, h), u32) + s1_slot + t((group, b2, 1, h), f32)
+        t((h // _PACK4, group * 2 * i), u32)
+        + t((group, i // _PACK4, h), u32)
+        + t((b13, 1, group * 2 * i), f32)
+        + t((group, b2, 1, h), f32)
     )
-    need = fixed + num_buffers * slot + all_reduce.vmem_bytes(spec, info)
+    need = fixed + _NUM_BUFFERS * slot + all_reduce.vmem_bytes(spec, info)
     limit = int(need * VMEM_HEADROOM)
     if limit > int(info.vmem_capacity_bytes * VMEM_FRACTION):
         return None
@@ -142,18 +125,11 @@ def kernel_name(
     fast: bool = False,
     split_meta: bool = True,
     w2_n_chunk: int = _W2_N_CHUNK,
-    *,
-    max_group: int = _MAX_GROUP,
-    group_cols: int = _GROUP_COLS,
-    num_buffers: int = _NUM_BUFFERS,
-    contig_dma: bool = False,
-    overlap_schedule: bool = False,
-    skip_tail: bool = False,
 ) -> str:
-    g = group_size(i, experts, max_group=max_group, group_cols=group_cols)
+    g = group_size(i, experts)
     name = (
         f"moe_tp_decode_nvfp4-e_{experts}-m_{m}-h_{h}-i_{i}-g_{g}"
-        f"-fs_{shared_inter}-nb_{num_buffers}-n_{n_ranks}"
+        f"-fs_{shared_inter}-nb_{_NUM_BUFFERS}-n_{n_ranks}"
     )
     if w2_n_chunk != _W2_N_CHUNK:
         name += f"-nc_{w2_n_chunk}"
@@ -163,12 +139,6 @@ def kernel_name(
         name += f"-ne_{num_experts}"
     if fast:
         name += "-fast"
-    if contig_dma:
-        name += "-cdma"
-    if overlap_schedule:
-        name += "-ovlp"
-    if skip_tail:
-        name += "-stail"
     return name
 
 
@@ -188,16 +158,10 @@ def can_use_moe_tp_decode_nvfp4(
     topk: int,
     n_ranks: int,
     w2_n_chunk: int = _W2_N_CHUNK,
-    max_group: int = _MAX_GROUP,
-    group_cols: int = _GROUP_COLS,
-    num_buffers: int = _NUM_BUFFERS,
-    contig_dma: bool = False,
 ) -> bool:
     """Trace-time admission for the NVFP4 W4A8 TP/EPxTP decode kernel."""
     info = pltpu.get_tpu_info()
     if info.num_cores != 1 or not info.is_matmul_supported(FP8, FP8):
-        return False
-    if max_group <= 0 or group_cols <= 0 or num_buffers < 2:
         return False
     if w2_n_chunk <= 0 or w2_n_chunk % info.num_lanes != 0:
         return False
@@ -250,7 +214,7 @@ def can_use_moe_tp_decode_nvfp4(
     if not all_reduce.supported(n_ranks, m, h, info):
         return False
     spec = all_reduce.make_spec(n_ranks, m, h)
-    g = group_size(i, experts, max_group=max_group, group_cols=group_cols)
+    g = group_size(i, experts)
     plan = _vmem_plan(
         m,
         h,
@@ -262,8 +226,6 @@ def can_use_moe_tp_decode_nvfp4(
         shared_inter,
         info,
         spec,
-        num_buffers=num_buffers,
-        contig_dma=contig_dma,
     )
     return plan is not None
 
@@ -323,27 +285,15 @@ def _kernel(
     ar_spec: all_reduce.AllReduceSpec,
     fast: bool = False,
     w2_n_chunk: int = _W2_N_CHUNK,
-    num_buffers: int = _NUM_BUFFERS,
-    contig_dma: bool = False,
-    overlap_schedule: bool = False,
-    skip_tail: bool = False,
 ):
     all_reduce.prologue(ar_spec)
-    if not hasattr(w1_hbm, "bitcast"):
-        raise NotImplementedError(
-            f"moe_tp_decode_nvfp4 views 4-bit weight refs as packed uint32 words "
-            f"via {type(w1_hbm).__name__}.bitcast, missing in jax {jax.__version__} "
-            f"(built against jax {_REF_BITCAST_JAX_VERSION})."
-        )
     w1_u32 = w1_hbm.bitcast(jnp.uint32)
     w2_u32 = w2_hbm.bitcast(jnp.uint32)
 
     m, h = x_ref.shape
     g = group
-    nb = num_buffers
-    use_contig_dma = contig_dma and g > 1
-    use_skip_tail = skip_tail and g > 1
-    two_i = s1_ref.shape[-1] if use_contig_dma else s1_ref.shape[-1] // g
+    nb = _NUM_BUFFERS
+    two_i = s1_ref.shape[-1] // g
     i = two_i // 2
     n_valid = meta_ref[0]
     rank = meta_ref[1]
@@ -374,36 +324,7 @@ def _kernel(
             n_active, (1, hits_v_ref.shape[1])
         ).astype(jnp.int32)
 
-    sxs_early = None
-    if overlap_schedule:
-        if fast:
-            wtab, flag = _route_fast(scores_ref[...], bias_ref[...], n_valid, topk=topk)
-            wtab_ref[...] = wtab
-            store_active()
-            hits_v_ref[1:2, :] = jnp.broadcast_to(
-                flag, (1, hits_v_ref.shape[1])
-            ).astype(jnp.int32)
-        else:
-            wtab_ref[...] = _route(scores_ref[...], bias_ref[...], n_valid, topk=topk)
-            store_hits()
-        hit_copy = pltpu.make_async_copy(hits_v_ref, hits_s_ref, hit_sem.at[0])
-        hit_copy.start()
-        owner_ref[...] = jnp.zeros((m, h), jnp.float32)
-        sxq_early, sxs_early = quantize_block(x_ref[...], axis=1, target_dtype=FP8)
-        sxq_ref[...] = sxq_early
-        _quantize_blocks_f32(x_ref[...], xq_ref, xs_ref)
-        hit_copy.wait()
-        if fast:
-
-            @pl.when(hits_s_ref[1, 0] != 0)
-            def _exact_routing_ovlp():
-                wtab_ref[...] = _route(
-                    scores_ref[...], bias_ref[...], n_valid, topk=topk
-                )
-                store_active()
-                copy_hits()
-
-    elif fast:
+    if fast:
         wtab, flag = _route_fast(scores_ref[...], bias_ref[...], n_valid, topk=topk)
         wtab_ref[...] = wtab
         store_active()
@@ -436,12 +357,7 @@ def _kernel(
         active_ids_ref[0] = jnp.int32(0)
         count = lax.fori_loop(0, local_experts, compact, jnp.int32(0))
 
-    if use_skip_tail:
-        n_main = lax.div(count, g)
-        tail_rem = count - n_main * g
-    else:
-        n_main = lax.div(count + (g - 1), g)
-        tail_rem = jnp.int32(0)
+    n_main = lax.div(count + (g - 1), g)
 
     def active_clamped(j):
         """Local expert id for compacted index j; tail indices >= count clamp
@@ -449,73 +365,37 @@ def _kernel(
         j_safe = jnp.where(j < count, j, jnp.int32(0))
         return hits_s_ref[2, j_safe] if fast else active_ids_ref[j_safe]
 
-    def transfers_w1_k(q, k: int):
-        slot = q % nb
-        e = active_clamped(q * g + k)
-        if use_contig_dma:
-            w1_dst = w1_ref.at[slot, k]
-            s1_dst = s1_ref.at[slot, k]
-        else:
-            lanes_slice = pl.ds(k * two_i, two_i)
-            w1_dst = w1_ref.at[slot, :, lanes_slice]
-            s1_dst = s1_ref.at[slot, :, :, lanes_slice]
-        return (
-            pltpu.make_async_copy(w1_u32.at[e], w1_dst, ring_sem.at[slot, 4 * k]),
-            pltpu.make_async_copy(s1_hbm.at[e], s1_dst, ring_sem.at[slot, 4 * k + 2]),
-        )
-
-    def transfers_w2_k(q, k: int):
-        slot = q % nb
-        e = active_clamped(q * g + k)
-        return (
-            pltpu.make_async_copy(
-                w2_u32.at[e], w2_ref.at[slot, k], ring_sem.at[slot, 4 * k + 1]
-            ),
-            pltpu.make_async_copy(
-                s2_hbm.at[e], s2_ref.at[slot, k], ring_sem.at[slot, 4 * k + 3]
-            ),
-        )
-
-    def transfers_w1(q):
-        copies = []
-        for k in range(g):
-            copies.extend(transfers_w1_k(q, k))
-        return copies
-
-    def transfers_w2(q):
-        copies = []
-        for k in range(g):
-            copies.extend(transfers_w2_k(q, k))
-        return copies
-
     def transfers(q):
-        if overlap_schedule:
-            return [*transfers_w1(q), *transfers_w2(q)]
+        slot = q % nb
         copies = []
         for k in range(g):
-            w1_c, s1_c = transfers_w1_k(q, k)
-            w2_c, s2_c = transfers_w2_k(q, k)
-            copies.extend((w1_c, w2_c, s1_c, s2_c))
+            e = active_clamped(q * g + k)
+            lanes_slice = pl.ds(k * two_i, two_i)
+            copies.extend(
+                (
+                    pltpu.make_async_copy(
+                        w1_u32.at[e],
+                        w1_ref.at[slot, :, lanes_slice],
+                        ring_sem.at[slot, 4 * k],
+                    ),
+                    pltpu.make_async_copy(
+                        w2_u32.at[e],
+                        w2_ref.at[slot, k],
+                        ring_sem.at[slot, 4 * k + 1],
+                    ),
+                    pltpu.make_async_copy(
+                        s1_hbm.at[e],
+                        s1_ref.at[slot, :, :, lanes_slice],
+                        ring_sem.at[slot, 4 * k + 2],
+                    ),
+                    pltpu.make_async_copy(
+                        s2_hbm.at[e],
+                        s2_ref.at[slot, k],
+                        ring_sem.at[slot, 4 * k + 3],
+                    ),
+                )
+            )
         return copies
-
-    def start_tail(q_tail):
-        for copy in transfers_w1_k(q_tail, 0):
-            copy.start()
-        for k in range(1, g - 1):
-
-            @pl.when(k < tail_rem)
-            def _start_w1(k=k):
-                for copy in transfers_w1_k(q_tail, k):
-                    copy.start()
-
-        for copy in transfers_w2_k(q_tail, 0):
-            copy.start()
-        for k in range(1, g - 1):
-
-            @pl.when(k < tail_rem)
-            def _start_w2(k=k):
-                for copy in transfers_w2_k(q_tail, k):
-                    copy.start()
 
     if fast:
 
@@ -536,24 +416,14 @@ def _kernel(
         for s in range(nb):
             prime(jnp.int32(s))
 
-    if use_skip_tail:
-
-        @pl.when(jnp.logical_and(tail_rem > 0, n_main < nb))
-        def _prime_tail():
-            start_tail(n_main)
-
     for copy in shared_copies:
         copy.wait()
 
-    if sxs_early is None:
-        owner_ref[...] = jnp.zeros((m, h), jnp.float32)
-        sxq, sxs = quantize_block(x_ref[...], axis=1, target_dtype=FP8)
-        sxq_ref[...] = sxq
-    else:
-        sxs = sxs_early
+    owner_ref[...] = jnp.zeros((m, h), jnp.float32)
+    sxq, sxs = quantize_block(x_ref[...], axis=1, target_dtype=FP8)
+    sxq_ref[...] = sxq
     _shared_expert(sxq_ref, sxs, sw13_ref, ss13_ref, sw2_ref, ss2_ref, shared_ref)
-    if not overlap_schedule:
-        _quantize_blocks_f32(x_ref[...], xq_ref, xs_ref)
+    _quantize_blocks_f32(x_ref[...], xq_ref, xs_ref)
 
     expert_columns = lax.broadcasted_iota(jnp.int32, wtab_ref.shape, 1)
     lanes = xs_ref.shape[-1]
@@ -565,24 +435,10 @@ def _kernel(
     def gate_up(slot):
         acc = jnp.zeros((m, cols), jnp.float32)
         for b in range(h // _Q_BLOCK):
-            if use_contig_dma:
-                wb = jnp.concatenate(
-                    [
-                        pltpu.bitcast(
-                            w1_ref[slot, k, pl.ds(b * rows1_u32, rows1_u32), :], FP4
-                        ).astype(FP8)
-                        for k in range(g)
-                    ],
-                    axis=1,
-                )
-                s1_b = jnp.concatenate(
-                    [s1_ref[slot, k, b, :, :] for k in range(g)], axis=1
-                )
-            else:
-                wb = pltpu.bitcast(
-                    w1_ref[slot, pl.ds(b * rows1_u32, rows1_u32), :], FP4
-                ).astype(FP8)
-                s1_b = s1_ref[slot, b, :, :]
+            wb = pltpu.bitcast(
+                w1_ref[slot, pl.ds(b * rows1_u32, rows1_u32), :], FP4
+            ).astype(FP8)
+            s1_b = s1_ref[slot, b, :, :]
             part = jnp.matmul(
                 xq_ref[:, b * _Q_BLOCK : (b + 1) * _Q_BLOCK],
                 wb,
@@ -590,29 +446,6 @@ def _kernel(
             )
             xs_b = jnp.concatenate([xs_ref[b]] * (cols // lanes), axis=1)
             acc = acc + part * xs_b * s1_b
-        return acc
-
-    def gate_up_one(slot, k: int):
-        acc = jnp.zeros((m, two_i), jnp.float32)
-        for b in range(h // _Q_BLOCK):
-            if use_contig_dma:
-                w1_slice = w1_ref[slot, k, pl.ds(b * rows1_u32, rows1_u32), :]
-                s1_slice = s1_ref[slot, k, b, :, :]
-            else:
-                w1_slice = w1_ref[
-                    slot,
-                    pl.ds(b * rows1_u32, rows1_u32),
-                    pl.ds(k * two_i, two_i),
-                ]
-                s1_slice = s1_ref[slot, b, :, k * two_i : (k + 1) * two_i]
-            wb = pltpu.bitcast(w1_slice, FP4).astype(FP8)
-            part = jnp.matmul(
-                xq_ref[:, b * _Q_BLOCK : (b + 1) * _Q_BLOCK],
-                wb,
-                preferred_element_type=jnp.float32,
-            )
-            xs_b = jnp.concatenate([xs_ref[b]] * (two_i // lanes), axis=1)
-            acc = acc + part * xs_b * s1_slice
         return acc
 
     def finish_one(j, slot, k: int, ak):
@@ -656,25 +489,6 @@ def _kernel(
         for k in range(g):
             finish_one(q * g + k, slot, k, acc1[:, k * two_i : (k + 1) * two_i])
 
-    def run_tail(q_tail):
-        slot = q_tail % nb
-        for copy in transfers_w1_k(q_tail, 0):
-            copy.wait()
-        ak0 = gate_up_one(slot, 0)
-        for copy in transfers_w2_k(q_tail, 0):
-            copy.wait()
-        finish_one(q_tail * g, slot, 0, ak0)
-        for k in range(1, g - 1):
-
-            @pl.when(k < tail_rem)
-            def _run_k(k=k):
-                for copy in transfers_w1_k(q_tail, k):
-                    copy.wait()
-                akk = gate_up_one(slot, k)
-                for copy in transfers_w2_k(q_tail, k):
-                    copy.wait()
-                finish_one(q_tail * g + k, slot, k, akk)
-
     def ring_step(step, acc1, refill: bool):
         nxt = step + 1
         for copy in transfers(nxt):
@@ -686,148 +500,40 @@ def _kernel(
                 copy.start()
         return acc1_next
 
-    def step_overlap(q, carry, refill: bool):
-        slot = q % nb
-        for copy in transfers_w1(q):
+    @(pl.when(n_main > 0) if fast else _unused)
+    def run_experts_fast():
+        for copy in transfers(jnp.int32(0)):
             copy.wait()
-        acc1 = gate_up(slot)
-        if refill:
-            for copy in transfers_w1(q + nb):
-                copy.start()
-        for copy in transfers_w2(q):
+        n_refill = jnp.maximum(n_main - nb, 0)
+        acc1 = lax.fori_loop(
+            0, n_refill, lambda s, a: ring_step(s, a, True), gate_up(0)
+        )
+        acc1 = lax.fori_loop(
+            n_refill, n_main - 1, lambda s, a: ring_step(s, a, False), acc1
+        )
+        finish_group(n_main - 1, (n_main - 1) % nb, acc1)
+
+    @(_unused if fast else pl.when(n_main > 0))
+    def run_experts():
+        for copy in transfers(jnp.int32(0)):
             copy.wait()
-        finish_group(q, slot, acc1)
-        if refill:
-            for copy in transfers_w2(q + nb):
-                copy.start()
-        return carry
 
-    if use_skip_tail and overlap_schedule:
-
-        @pl.when(jnp.logical_and(n_main > 0, n_main < nb))
-        def _run_short_ovlp():
-            lax.fori_loop(0, n_main, lambda s, c: step_overlap(s, c, False), 0)
-
-        @pl.when(n_main >= nb)
-        def _run_long_ovlp():
-            q_prev = n_main - nb
-            lax.fori_loop(0, q_prev, lambda s, c: step_overlap(s, c, True), 0)
-            step_overlap(q_prev, 0, False)
-
-            @pl.when(tail_rem > 0)
-            def _refill_tail_ovlp():
-                start_tail(n_main)
-
-            lax.fori_loop(q_prev + 1, n_main, lambda s, c: step_overlap(s, c, False), 0)
-
-        @pl.when(tail_rem > 0)
-        def _finish_tail_ovlp():
-            run_tail(n_main)
-
-    elif use_skip_tail:
-
-        @pl.when(jnp.logical_and(n_main > 0, n_main < nb))
-        def _run_short_ring():
-            for copy in transfers(jnp.int32(0)):
+        def group_body(step, acc1):
+            nxt = step + 1
+            for copy in transfers(nxt):
                 copy.wait()
-            acc1 = lax.fori_loop(
-                0, n_main - 1, lambda s, a: ring_step(s, a, False), gate_up(0)
-            )
-            finish_group(n_main - 1, (n_main - 1) % nb, acc1)
+            acc1_next = gate_up(nxt % nb)
+            finish_group(step, step % nb, acc1)
 
-        @pl.when(n_main >= nb)
-        def _run_long_ring():
-            for copy in transfers(jnp.int32(0)):
-                copy.wait()
-            q_prev = n_main - nb
-            acc1 = lax.fori_loop(
-                0, q_prev, lambda s, a: ring_step(s, a, True), gate_up(0)
-            )
-            acc1 = ring_step(q_prev, acc1, False)
+            @pl.when(step + nb < n_main)
+            def refill():
+                for copy in transfers(step + nb):
+                    copy.start()
 
-            @pl.when(tail_rem > 0)
-            def _refill_tail_ring():
-                start_tail(n_main)
+            return acc1_next
 
-            acc1 = lax.fori_loop(
-                q_prev + 1, n_main - 1, lambda s, a: ring_step(s, a, False), acc1
-            )
-            finish_group(n_main - 1, (n_main - 1) % nb, acc1)
-
-        @pl.when(tail_rem > 0)
-        def _finish_tail_ring():
-            run_tail(n_main)
-
-    elif overlap_schedule:
-
-        @(pl.when(n_main > 0) if fast else _unused)
-        def _run_experts_ovlp_fast():
-            n_refill = jnp.maximum(n_main - nb, 0)
-            lax.fori_loop(0, n_refill, lambda s, c: step_overlap(s, c, True), 0)
-            lax.fori_loop(n_refill, n_main, lambda s, c: step_overlap(s, c, False), 0)
-
-        @(_unused if fast else pl.when(n_main > 0))
-        def _run_experts_ovlp():
-            def ovlp_body(q, carry):
-                slot = q % nb
-                for copy in transfers_w1(q):
-                    copy.wait()
-                acc1 = gate_up(slot)
-
-                @pl.when(q + nb < n_main)
-                def _refill_w1():
-                    for copy in transfers_w1(q + nb):
-                        copy.start()
-
-                for copy in transfers_w2(q):
-                    copy.wait()
-                finish_group(q, slot, acc1)
-
-                @pl.when(q + nb < n_main)
-                def _refill_w2():
-                    for copy in transfers_w2(q + nb):
-                        copy.start()
-
-                return carry
-
-            lax.fori_loop(0, n_main, ovlp_body, 0)
-
-    else:
-
-        @(pl.when(n_main > 0) if fast else _unused)
-        def run_experts_fast():
-            for copy in transfers(jnp.int32(0)):
-                copy.wait()
-            n_refill = jnp.maximum(n_main - nb, 0)
-            acc1 = lax.fori_loop(
-                0, n_refill, lambda s, a: ring_step(s, a, True), gate_up(0)
-            )
-            acc1 = lax.fori_loop(
-                n_refill, n_main - 1, lambda s, a: ring_step(s, a, False), acc1
-            )
-            finish_group(n_main - 1, (n_main - 1) % nb, acc1)
-
-        @(_unused if fast else pl.when(n_main > 0))
-        def run_experts():
-            for copy in transfers(jnp.int32(0)):
-                copy.wait()
-
-            def group_body(step, acc1):
-                nxt = step + 1
-                for copy in transfers(nxt):
-                    copy.wait()
-                acc1_next = gate_up(nxt % nb)
-                finish_group(step, step % nb, acc1)
-
-                @pl.when(step + nb < n_main)
-                def refill():
-                    for copy in transfers(step + nb):
-                        copy.start()
-
-                return acc1_next
-
-            acc1 = lax.fori_loop(0, n_main - 1, group_body, gate_up(0))
-            finish_group(n_main - 1, (n_main - 1) % nb, acc1)
+        acc1 = lax.fori_loop(0, n_main - 1, group_body, gate_up(0))
+        finish_group(n_main - 1, (n_main - 1) % nb, acc1)
 
     all_reduce.epilogue(
         ar_spec,
@@ -849,12 +555,6 @@ def _kernel(
         "hbm_operands",
         "split_meta",
         "w2_n_chunk",
-        "max_group",
-        "group_cols",
-        "num_buffers",
-        "contig_dma",
-        "overlap_schedule",
-        "skip_tail",
     ),
 )
 def moe_tp_decode_nvfp4(
@@ -880,12 +580,6 @@ def moe_tp_decode_nvfp4(
     hbm_operands: bool = False,
     split_meta: bool = True,
     w2_n_chunk: int = _W2_N_CHUNK,
-    max_group: int = _MAX_GROUP,
-    group_cols: int = _GROUP_COLS,
-    num_buffers: int = _NUM_BUFFERS,
-    contig_dma: bool = False,
-    overlap_schedule: bool = False,
-    skip_tail: bool = False,
 ):
     """The layer's bf16 [N, D] output, summed over the n_ranks TP/EPxTP mesh.
 
@@ -913,16 +607,6 @@ def moe_tp_decode_nvfp4(
       split_meta: pass n_valid, rank, experts_start as three int32[1] scalar
         prefetch buffers rather than one stacked int32[3].
       w2_n_chunk: output-column tile width for the w2 down projection.
-      max_group: upper bound on experts grouped per gate/up slot (default 4).
-      group_cols: target gate/up column budget g * 2I per slot (default 1024;
-        2048 selects g=4 at I=256 / g=2 at I=512).
-      num_buffers: number of weight-ring VMEM slots (>= 2, default 4).
-      contig_dma: store w13/s13 ring slots as (nb, g, ..., 2I) for contiguous
-        per-expert HBM->VMEM DMAs and VREG FP8 block concatenation.
-      overlap_schedule: overlap input quantization with router hit copy and run
-        a split-phase (w1, s1) / (w2, s2) carry-free ring schedule.
-      skip_tail: peel partial final groups (count % g != 0) so inactive tail
-        expert lanes skip HBM->VMEM DMAs and w2 compute.
 
     Returns:
       bf16(sum over ranks of shared + routed_scale * routed), rows >= n_valid
@@ -930,12 +614,6 @@ def moe_tp_decode_nvfp4(
     """
     if not exact_in_bf16(routed_scale):
         raise ValueError(f"routed_scale {routed_scale!r} is not exact in bf16")
-    if max_group <= 0:
-        raise ValueError(f"max_group {max_group} must be positive")
-    if group_cols <= 0:
-        raise ValueError(f"group_cols {group_cols} must be positive")
-    if num_buffers < 2:
-        raise ValueError(f"num_buffers {num_buffers} must be at least 2")
     m, h = x.shape
     experts, i, _ = w2.shape
     b13 = s13.shape[1]
@@ -950,7 +628,7 @@ def moe_tp_decode_nvfp4(
             f"{info.num_lanes}"
         )
     ar_spec = all_reduce.make_spec(n_ranks, m, h)
-    g = group_size(i, experts, max_group=max_group, group_cols=group_cols)
+    g = group_size(i, experts)
     plan = _vmem_plan(
         m,
         h,
@@ -962,26 +640,13 @@ def moe_tp_decode_nvfp4(
         shared_inter,
         info,
         ar_spec,
-        num_buffers=num_buffers,
-        contig_dma=contig_dma,
     )
     if plan is None:
         raise ValueError(
             "moe_tp_decode_nvfp4 does not fit VMEM; check can_use_moe_tp_decode_nvfp4"
         )
     _, limit = plan
-    nb = num_buffers
-    use_contig_dma = contig_dma and g > 1
-    w1_scratch = (
-        pltpu.VMEM((nb, g, h // _PACK4, 2 * i), jnp.uint32)
-        if use_contig_dma
-        else pltpu.VMEM((nb, h // _PACK4, g * 2 * i), jnp.uint32)
-    )
-    s1_scratch = (
-        pltpu.VMEM((nb, g, b13, 1, 2 * i), jnp.float32)
-        if use_contig_dma
-        else pltpu.VMEM((nb, b13, 1, g * 2 * i), jnp.float32)
-    )
+    nb = _NUM_BUFFERS
     e_pad = pl.cdiv(num_experts, info.num_lanes) * info.num_lanes
     padded_active = max(1, pl.cdiv(experts, g) * g)
     scores = scores.astype(jnp.float32)
@@ -1042,10 +707,6 @@ def moe_tp_decode_nvfp4(
             ar_spec=ar_spec,
             fast=fast,
             w2_n_chunk=w2_n_chunk,
-            num_buffers=nb,
-            contig_dma=contig_dma,
-            overlap_schedule=overlap_schedule,
-            skip_tail=skip_tail,
         ),
         out_shape=jax.ShapeDtypeStruct((m, h), x.dtype),
         grid_spec=pltpu.PrefetchScalarGridSpec(
@@ -1053,9 +714,9 @@ def moe_tp_decode_nvfp4(
             in_specs=[vmem, vmem, vmem, *[hbm] * 8],
             out_specs=vmem,
             scratch_shapes=[
-                w1_scratch,
+                pltpu.VMEM((nb, h // _PACK4, g * 2 * i), jnp.uint32),
                 pltpu.VMEM((nb, g, i // _PACK4, h), jnp.uint32),
-                s1_scratch,
+                pltpu.VMEM((nb, b13, 1, g * 2 * i), jnp.float32),
                 pltpu.VMEM((nb, g, b2, 1, h), jnp.float32),
                 pltpu.VMEM((h, 2 * shared_inter), FP8),
                 pltpu.VMEM((1, 2 * shared_inter), jnp.float32),
@@ -1090,12 +751,6 @@ def moe_tp_decode_nvfp4(
             fast,
             split_meta,
             w2_n_chunk,
-            max_group=max_group,
-            group_cols=group_cols,
-            num_buffers=nb,
-            contig_dma=contig_dma,
-            overlap_schedule=overlap_schedule,
-            skip_tail=skip_tail,
         ),
     )(
         *metas,
