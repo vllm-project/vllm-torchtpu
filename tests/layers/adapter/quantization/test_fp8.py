@@ -62,70 +62,13 @@ def test_fp8_config_rejects_store_dtype():
     ],
 )
 def test_fp8_routed_experts_checkpoint_allocation(
-    monkeypatch, block_size, shard_size, deepseek_v4
+    make_fp8_experts, block_size, shard_size, deepseek_v4
 ):
     """Exercise upstream construction and loading with TPU checkpoint geometry."""
     from math import gcd
-    from types import SimpleNamespace
-
-    from vllm.config import set_current_vllm_config
-    from vllm.model_executor.layers.fused_moe import RoutedExperts
-    from vllm.model_executor.layers.fused_moe.config import (
-        FusedMoEConfig,
-        FusedMoEParallelConfig,
-        MoEActivation,
-        RoutingMethodType,
-    )
-    from vllm.model_executor.layers.fused_moe.expert_map_manager import ExpertMapManager
 
     from vllm_torchtpu.layers.adapter.quantization.fp8 import VllmFp8MoEMethodTPU
 
-    parallel = FusedMoEParallelConfig(
-        tp_size=2,
-        pcp_size=1,
-        dp_size=1,
-        ep_size=1,
-        tp_rank=1,
-        pcp_rank=0,
-        dp_rank=0,
-        ep_rank=0,
-        sp_size=1,
-        use_ep=False,
-        all2all_backend="allgather_reducescatter",
-        enable_eplb=False,
-    )
-    config = FusedMoEConfig(
-        num_experts=2,
-        experts_per_token=1,
-        hidden_dim=256,
-        intermediate_size=2 * shard_size,
-        num_local_experts=2,
-        num_logical_experts=2,
-        activation=MoEActivation.SILU,
-        device=torch.device("cpu"),
-        routing_method=RoutingMethodType.Renormalize,
-        moe_parallel_config=parallel,
-        in_dtype=torch.bfloat16,
-    )
-    expert_map = ExpertMapManager(
-        max_num_batched_tokens=16,
-        top_k=1,
-        global_num_experts=2,
-        num_redundant_experts=0,
-        num_expert_group=None,
-        moe_parallel_config=parallel,
-        placement_strategy="linear",
-        enable_eplb=False,
-    )
-    monkeypatch.setattr(
-        "vllm.model_executor.layers.quantization.fp8."
-        "get_tensor_model_parallel_world_size",
-        lambda: 2,
-    )
-    monkeypatch.setattr(
-        "vllm.distributed.get_tensor_model_parallel_world_size",
-        lambda: 2,
-    )
     quant_cls = VllmFp8Config
     if deepseek_v4:
         from vllm_torchtpu.layers.adapter.quantization.deepseek_v4_fp8 import (
@@ -138,18 +81,7 @@ def test_fp8_routed_experts_checkpoint_allocation(
         activation_scheme="dynamic",
         weight_block_size=block_size,
     )
-    quant.vllm_config = SimpleNamespace(
-        parallel_config=SimpleNamespace(enable_expert_parallel=False),
-        model_config=SimpleNamespace(hf_config=SimpleNamespace(expert_dtype="fp8")),
-    )
-    with set_current_vllm_config(quant.vllm_config):
-        layer = RoutedExperts(
-            layer_name="model.layers.0.mlp.experts",
-            params_dtype=torch.bfloat16,
-            moe_config=config,
-            quant_config=quant,
-            expert_map_manager=expert_map,
-        )
+    layer = make_fp8_experts(quant, shard_size)
 
     assert isinstance(layer.quant_method, VllmFp8MoEMethodTPU)
     eff_block = gcd(128, shard_size) if block_size else None
