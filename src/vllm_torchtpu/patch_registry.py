@@ -202,32 +202,32 @@ PATCHES = (
     # Model-specific diffusion patches. Append new ones here with
     # stages=("diffusion_model_load",) and od_config=True.
     Patch(
-        "vllm_torchtpu.omni.patches:_patch_qwen_image_rope_txt_freqs_clone",
+        "vllm_torchtpu.omni.patches.qwen_image:_patch_qwen_image_rope_txt_freqs_clone",
         ("diffusion_model_load",),
         od_config=True,
     ),
     Patch(
-        "vllm_torchtpu.omni.patches:_patch_wan_ffn_gelu_fence",
+        "vllm_torchtpu.omni.patches.wan:_patch_wan_ffn_gelu_fence",
         ("diffusion_model_load",),
         od_config=True,
     ),
     Patch(
-        "vllm_torchtpu.omni.patches:_patch_wan_fused_qk_norm_rope",
+        "vllm_torchtpu.omni.patches.wan:_patch_wan_fused_qk_norm_rope",
         ("diffusion_model_load",),
         od_config=True,
     ),
     Patch(
-        "vllm_torchtpu.omni.patches:_patch_wan_fresh_timestep",
+        "vllm_torchtpu.omni.patches.wan:_patch_wan_fresh_timestep",
         ("diffusion_model_load",),
         od_config=True,
     ),
     Patch(
-        "vllm_torchtpu.omni.patches:_patch_ltx2_vocoder_cpu_init",
+        "vllm_torchtpu.omni.patches.ltx2:_patch_ltx2_vocoder_cpu_init",
         ("diffusion_model_load",),
         od_config=True,
     ),
     Patch(
-        "vllm_torchtpu.omni.patches:_patch_ltx2_split_rope",
+        "vllm_torchtpu.omni.patches.ltx2:_patch_ltx2_split_rope",
         ("diffusion_model_load",),
         od_config=True,
     ),
@@ -311,6 +311,6 @@ def apply(
                 )
 
 
-def entered(stage: Stage) -> bool:
+def has_entered(stage: Stage) -> bool:
     """Returns whether `apply` has completed for `stage` in this process."""
     return stage in _entered_stages

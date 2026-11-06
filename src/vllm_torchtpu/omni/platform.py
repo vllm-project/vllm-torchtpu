@@ -82,9 +82,9 @@ class OmniTpuPlatform(OmniPlatform, TpuPlatform):
         # attention layers; they enter worker_init, not the diffusion stages,
         # so apply the shared diffusion_worker patches here without importing
         # model modules.
-        if patch_registry.entered("diffusion_model_load"):
+        if patch_registry.has_entered("diffusion_model_load"):
             pass
-        elif patch_registry.entered("worker_init"):
+        elif patch_registry.has_entered("worker_init"):
             patch_registry.apply("diffusion_worker")
         else:
             logger.warning_once(

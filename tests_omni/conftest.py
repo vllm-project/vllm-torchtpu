@@ -217,16 +217,9 @@ def _omni_model_patches(request: pytest.FixtureRequest) -> None:
     """
     if request.node.get_closest_marker("spawns_tpu_workers"):
         return
-    from types import SimpleNamespace
+    from tests_omni.omni_test_utils import apply_diffusion_model_patches
 
-    from vllm_torchtpu import patch_registry
-
-    patch_registry.apply("diffusion_worker")
-    for model_class_name in ("QwenImagePipeline", "WanPipeline", "LTX2Pipeline"):
-        patch_registry.apply(
-            "diffusion_model_load",
-            od_config=SimpleNamespace(model_class_name=model_class_name),
-        )
+    apply_diffusion_model_patches()
 
 
 @pytest.fixture(autouse=True)

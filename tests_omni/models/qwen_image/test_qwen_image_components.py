@@ -22,7 +22,6 @@ Tested components:
 """
 
 import math
-from types import SimpleNamespace
 
 import pytest
 import torch
@@ -33,8 +32,7 @@ from vllm_omni.diffusion.models.qwen_image.qwen_image_transformer import (
     QwenEmbedRope,
 )
 
-from tests_omni.omni_test_utils import assert_parity
-from vllm_torchtpu import patch_registry
+from tests_omni.omni_test_utils import apply_diffusion_model_patches, assert_parity
 from vllm_torchtpu.omni.attention import TpuSDPAImpl
 
 pytestmark = [pytest.mark.omni]
@@ -55,14 +53,6 @@ ROPE_TXT_MAX_REL_L2 = 2.8e-3
 ROPE_TXT_MAX_ABS = 2.6e-2
 JOINT_ATTN_MAX_REL_L2 = 5.4e-3
 JOINT_ATTN_MAX_ABS = 2.0e-3
-
-
-def _apply_model_patches() -> None:
-    patch_registry.apply("diffusion_worker")
-    patch_registry.apply(
-        "diffusion_model_load",
-        od_config=SimpleNamespace(model_class_name="QwenImagePipeline"),
-    )
 
 
 class TestQwenEmbedRopeOnTpu:
@@ -99,7 +89,7 @@ class TestQwenEmbedRopeOnTpu:
     def test_qwen_image_rope_txt_freqs_under_inference_mode_on_tpu(
         self, rope_cls: type[torch.nn.Module]
     ) -> None:
-        _apply_model_patches()
+        apply_diffusion_model_patches("QwenImagePipeline")
 
         with torch.device("tpu"):
             tpu_embedder = rope_cls(theta=10000, axes_dim=[16, 56, 56], scale_rope=True)

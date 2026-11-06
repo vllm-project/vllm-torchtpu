@@ -85,45 +85,47 @@ Patch(
 ),
 ```
 
-### Diffusion processes
+### Adding vLLM-Omni diffusion patches
 
-vLLM-Omni diffusion workers do not run `TPUWorker`, so they never enter
-`worker_init` or `model_load`. `OmniTpuPlatform` enters the diffusion stages
-instead. A diffusion worker runs `diffusion_worker` and then
-`diffusion_model_load` for each pipeline it loads. Its `VllmConfig` also runs
-`platform_activation`. Entries that a diffusion worker depends on, such as
-`_configure_torchtpu_eager_mode`, list `diffusion_worker` to make that
-dependency explicit.
+vLLM-Omni diffusion workers do not run `TPUWorker`, so they never enter `worker_init`
+or `model_load`. Instead, `OmniTpuPlatform` enters `omni_platform`, `diffusion_worker`,
+and `diffusion_model_load` (see [Lifecycle stages](#lifecycle-stages)).
 
-Diffusion patches live in `src/vllm_torchtpu/omni/patches.py`. Register a
-patch to a shared layer module, such as `_patch_wan_pair_swap_rope`, at
-`diffusion_worker` for every model when it is safe for every user of the
-patched class. A model-specific callback accepts `od_config` and returns
-`False` unless `od_config.model_class_name` is one of the vLLM-Omni pipelines
-that build the patched classes (keys of `vllm_omni/diffusion/registry.py`).
-Import the patched module after that check, so that only the served model's
-module is imported. Add a new pipeline set to `_PATCHED_PIPELINES` and to
-`tests_omni/test_patch_pipelines.py`, which compares the sets with the real
-registry. Register the callback under the model-specific diffusion section:
+To add TPU patches or workarounds for a vLLM-Omni diffusion model family:
+
+1. Implement the patch callback in `src/vllm_torchtpu/omni/patches/<model_name>.py`
+   (e.g., `_patch_<model>_<fix>`).
+2. Inside the callback:
+    - Accept `od_config: "OmniDiffusionConfig | None" = None`.
+    - Return `False` immediately using `is_model_class_in(od_config, _<MODEL>_PIPELINES)`
+      when `od_config` is `None` or does not match the target pipeline family. Keep
+      `vllm_omni` model imports after this check so other pipelines never import that
+      model module.
+    - Call `mark_model_patch_applied()`, apply the patch idempotently, and return `None`.
+    - When adding a new `_<MODEL>_PIPELINES` set, add a matching entry to
+      `test_patched_pipelines_match_registry` in `tests_omni/test_omni_patches.py`.
+3. Append a new `Patch` entry under `# Model-specific diffusion patches` in
+   `src/vllm_torchtpu/patch_registry.py`:
 
 ```python
 Patch(
-    "vllm_torchtpu.omni.patches:_patch_<model>_<fix>",
+    "vllm_torchtpu.omni.patches.<model_name>:_patch_<model>_<fix>",
     ("diffusion_model_load",),
     od_config=True,
 ),
 ```
 
-After the `diffusion_model_load` pass, `OmniTpuPlatform` logs
-`No model-specific TPU diffusion patch applies to pipeline <name>.` at INFO
-when the served pipeline is in no set. When a `TPUWorker` process (which
-entered `worker_init`, not `diffusion_model_load`) builds diffusion attention,
-`OmniTpuPlatform.get_diffusion_attn_backend_cls` applies `diffusion_worker` so
-the shared diffusion patches still cover that stage. When neither
-`diffusion_model_load` nor `worker_init` ran, `get_diffusion_attn_backend_cls`
-logs a warning because vLLM-Omni built the pipeline without calling
-`init_diffusion_model_runner_runtime`. `patch_registry.entered(stage)` reports
-whether a stage was applied in the process.
+For patches to shared diffusion worker infrastructure or common layer modules that are
+safe for every model, implement the callback in
+`src/vllm_torchtpu/omni/patches/__init__.py` and register it at `diffusion_worker` (or
+`omni_platform` when every process resolving `OmniTpuPlatform` needs it).
+
+After `diffusion_model_load`, `OmniTpuPlatform` logs an INFO message if no
+model-specific diffusion patch ran in the process. When a `TPUWorker` process (which
+enters `worker_init`, not `diffusion_model_load`) builds diffusion attention,
+`OmniTpuPlatform.get_diffusion_attn_backend_cls` checks
+`patch_registry.has_entered(stage)` and applies `diffusion_worker` so shared diffusion
+patches still run.
 
 ## Completion, retries, and model selection
 
