@@ -65,6 +65,7 @@ if TYPE_CHECKING:
     VLLM_TPU_GDN_PREFILL_NO_ZERO_INIT: bool = False
     QWEN4_EXP_PREFILL_SP: bool = False
     QWEN4_EXP_PD_STAGING_BYTES: int = 8 << 30
+    QWEN4_EXP_PD_ROUTED_DST: str = ""
     QWEN4_EXP_PD_SYNC_REPACK: bool = False
     QWEN4_EXP_PD_SYNC_REPACK_AB_S: int = 0
     QWEN4_EXP_PD_BATCHED_ADMISSION: bool = False
@@ -1127,6 +1128,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # (models/vllm/qwen4_exp/pd_staging.py). Bytes of that carrier per rank;
     # a load that does not fit recomputes on the decode.
     "QWEN4_EXP_PD_STAGING_BYTES": env_int("QWEN4_EXP_PD_STAGING_BYTES", 8 << 30),
+    # "<decode tp>,<decode dcp>,<decode block>" on BOTH legs of a TP1 pipeline
+    # producer -> staged TP>1 Qwen4Exp decode: the producer routes each decode
+    # rank only its slice (main-KV DCP runs, its GDN heads; compressed keys,
+    # ring and PLE to all) into a dense compact staging space per rank, and
+    # the decode stages in 256-row pages (models/vllm/qwen4_exp/pd_route.py).
+    # Empty (the default) broadcasts every page to every rank. Changes the
+    # decode's staging carrier and repack program, so it joins the compile key.
+    "QWEN4_EXP_PD_ROUTED_DST": env_str("QWEN4_EXP_PD_ROUTED_DST", ""),
     # A staged Qwen4Exp decode runs each load's repack in the step after the
     # scheduler sees the load complete on EVERY rank, on all ranks together,
     # instead of on each rank in the step its own bytes land. Ranks land a
