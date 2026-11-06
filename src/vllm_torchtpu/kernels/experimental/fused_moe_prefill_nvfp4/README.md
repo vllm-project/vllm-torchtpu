@@ -31,7 +31,7 @@ out = fused_moe_prefill_nvfp4(
     expert_start=e0,          # int32 scalar (ep_rank * E_local) or None for TP
     routed_scale=2.5,         # scales routed experts only (never shared)
     act_mode="w4a16",         # "w4a16" (default, BF16) or "w4a8" (per-row FP8)
-    tall_rung_rows="auto",    # code-size-aware rung step via tall_rung_rows_for
+    tall_rung_rows="auto",    # default 4 rungs via tall_rung_rows_for
     include_shared=True,      # False omits shared-expert DMA/visit (routed-only)
     combine_chunk_tokens=2048,  # max tokens per combine + RS/AG chunk
 )  # -> [T, H] bf16, all-reduced, identical on every rank
@@ -67,12 +67,15 @@ out = fused_moe_prefill_nvfp4(
   `down="xmxu"` while preventing a full `[256, H] float32` accumulator from
   materializing in VMEM and writing `256`-column BF16 pairs directly into
   `out_vmem` via `pltpu.pack_elementwise`.
-- **Code-size-aware rung selection (`tall_rung_rows_for`)**: At `tile_rows = 256`
-  (`T >= 4096`), keeps `8` rungs (`rung_rows = 32`, `[32..256]`) when
-  `tile_rows * I <= 65_536` (`TP8`, `I = 256`, `8.33–8.75 MiB` code), and steps
-  in `4` rungs (`rung_rows = None`, `[64, 128, 192, 256]`) when
-  `tile_rows * I > 65_536` (`EP2 x TP4`, `I = 512`, keeping code at
-  `7.21–7.64 MiB` below TPU v7x's `8 MiB` on-chip IMEM overlay limit).
+- **Rung selection (`tall_rung_rows_for`)**: Defaults to `4` rungs
+  (`rung_rows = None`: `[32, 64, 96, 128]` at `tile_rows = 128`, and
+  `[64, 128, 192, 256]` at `tile_rows = 256` for `T >= 4096`) across both
+  `EP2 x TP4` and `TP8` and both `act_mode` values: `8` rungs
+  (`rung_rows = 32`, `[32..256]`) at `256`-row tiles were measured much slower
+  for `W4A16` (`EP2 x TP4` and `TP8`; `TP8`, `256`-row tiles: `509-546` vs
+  `83-113 ms` per `75` layers) and no faster for `W4A8`, so `4` rungs are used
+  at `256`-row tiles; `tall_rung_rows` still overrides (e.g.
+  `tall_rung_rows=32`).
 - **Single cross-rank reduction (`EP2 x TP4` & `TP8`)**: Under `EP2 x TP4`,
   `expert_start` filters non-local routes (`~50%` fewer live routed rows per
   rank), every rank computes `1/8` of the TP8-sharded `shared_experts`, and the
