@@ -1085,6 +1085,56 @@ def decode_stream_scratch_shapes(cfgs: GmmConfigs) -> list:
     ]
 
 
+def decode_bucket_rows(
+    m_offset: jax.Array, bucket_idx: int, *, cfgs: GmmConfigs
+) -> tuple[int, jax.Array, pl.Slice]:
+    """(rows, first row, sublane slabs) of a decode stream row bucket.
+
+    Rows [row_start, row_start + bucket_m) cover the gm tile at m_offset and
+    stay inside the arrays.
+    """
+    sublane = cfgs.dims.size_lhs_sublane
+    bucket_m = cfgs.tiles.bucket_base * (bucket_idx + 1)
+    row_start = jnp.minimum(m_offset, cfgs.dims.size_m - bucket_m)
+    return bucket_m, row_start, pl.ds(row_start // sublane, bucket_m // sublane)
+
+
+def store_decode_tile(
+    out_tile_ref: jax.Array,  # [bucket_m // sublane, sublane, cols]
+    acc: jax.Array,  # [bucket_m, cols]
+    *,
+    row_start: jax.Array,
+    gm_id: jax.Array,
+    m_start: jax.Array,
+    m_end: jax.Array,
+    sublane: int,
+):
+    """Stores a gm tile's rows [m_start, m_end) of acc into a VMEM-resident output.
+
+    As in inner_kernel, the tile's first slab adds the previous tile's partial
+    slab when that tile ended inside it, and zeros otherwise; the rest of the
+    touched slabs take the masked acc and every other row keeps its value.
+    """
+    m_offset = m_start - m_start % sublane
+    written_end = pl.cdiv(m_end, sublane) * sublane
+    carries_partial = jnp.logical_and(gm_id > 0, m_start % sublane != 0)
+
+    rows = row_start + lax.broadcasted_iota(jnp.int32, acc.shape, 0)
+    in_tile = jnp.logical_and(m_start <= rows, rows < m_end)
+    acc_masked = jnp.where(in_tile, acc, 0).astype(out_tile_ref.dtype)
+
+    prev = out_tile_ref[...].reshape(acc.shape)
+    in_first_slab = jnp.logical_and(m_offset <= rows, rows < m_offset + sublane)
+    in_written = jnp.logical_and(m_offset <= rows, rows < written_end)
+    partial = jnp.where(carries_partial, prev, jnp.zeros_like(prev))
+    out = jnp.where(
+        in_first_slab,
+        acc_masked + partial,
+        jnp.where(in_written, acc_masked, prev),
+    )
+    out_tile_ref[...] = out.reshape(out_tile_ref.shape)
+
+
 def decode_stream_kernel(
     # Scalar prefetch
     lhs_group_sizes_ref: jax.Array,  # int32[size_lhs_group]
@@ -1160,10 +1210,6 @@ def decode_stream_kernel(
         m_start = m_offsets[gm_id]
         m_end = m_offsets[gm_id + 1]
         m_offset = m_start - m_start % sublane
-        written_end = pl.cdiv(m_end, sublane) * sublane
-        # As in inner_kernel, the first slab adds the previous tile's partial
-        # slab when that tile ended inside it, and zeros otherwise.
-        carries_partial = jnp.logical_and(gm_id > 0, m_start % sublane != 0)
 
         def slot_weights(half):
             return WeightsRef(
@@ -1177,32 +1223,23 @@ def decode_stream_kernel(
             rhs = FusedWeightsRef(gate=rhs, up=slot_weights(1))
 
         def run_bucket(bucket_idx: int):
-            bucket_m = tiles.bucket_base * (bucket_idx + 1)
-            # Rows [row_start, row_start + bucket_m) cover the tile and stay
-            # inside the arrays.
-            row_start = jnp.minimum(m_offset, dims.size_m - bucket_m)
-            bucket_slabs = pl.ds(row_start // sublane, bucket_m // sublane)
+            bucket_m, row_start, bucket_slabs = decode_bucket_rows(
+                m_offset, bucket_idx, cfgs=cfgs
+            )
             tiled_lhs = lhs_vmem[bucket_slabs].reshape(bucket_m, dims.size_k)
             acc = dequant_matmul(
                 tiled_lhs, rhs, is_last_k_step=True, bucket_m=bucket_m, cfgs=cfgs
             )
             acc = apply_act_fn(acc, cfgs.fuse_act)
-
-            rows = row_start + lax.broadcasted_iota(jnp.int32, acc.shape, 0)
-            in_tile = jnp.logical_and(m_start <= rows, rows < m_end)
-            acc_masked = jnp.where(in_tile, acc, 0).astype(cfgs.out_dtype)
-
-            out_tile_ref = out_vmem.at[panel, bucket_slabs]
-            prev = out_tile_ref[...].reshape(bucket_m, cols)
-            in_first_slab = jnp.logical_and(m_offset <= rows, rows < m_offset + sublane)
-            in_written = jnp.logical_and(m_offset <= rows, rows < written_end)
-            partial = jnp.where(carries_partial, prev, jnp.zeros_like(prev))
-            out = jnp.where(
-                in_first_slab,
-                acc_masked + partial,
-                jnp.where(in_written, acc_masked, prev),
+            store_decode_tile(
+                out_vmem.at[panel, bucket_slabs],
+                acc,
+                row_start=row_start,
+                gm_id=gm_id,
+                m_start=m_start,
+                m_end=m_end,
+                sublane=sublane,
             )
-            out_tile_ref[...] = out.reshape(out_tile_ref.shape)
 
         branches = [
             functools.partial(run_bucket, bucket_idx=bucket_idx)
