@@ -38,6 +38,9 @@ At startup, `vllm-torchtpu` reports set environment variables that neither vLLM 
 | `TPU_PP_HANDOFF` | `wave` | How pipeline stages hand activations on: `wave` launches one collective on every stage per forward; `ring` sends each forward's output point to point to the next stage as soon as it is done (needs libtpu 0.0.50 or later with torch_tpu 0.2.0 or later). |
 | `TPU_PP_RING_DEPTH` | `2` | With `TPU_PP_HANDOFF=ring`, the forwards a stage may queue for sending before it waits for room; each device holds up to this many outgoing buffers and up to 7 landing buffers for receives posted ahead of their forwards, each `--max-num-batched-tokens` x hidden size in the model dtype, and that memory is reserved before the KV cache is sized. |
 | `TPU_PCP_TOPOLOGY_AWARE_MESH` | `True` | Orders Prefill Context Parallel (`PCP`) ranks along adjacent ICI torus neighbors to minimize ring hop count. |
+| `USE_TPU_PCP_MANAGER` | `False` | Runs `PCP` through the PCP manager. Only supports sparse MLA models with `DCP` = `PCP` x `TP`. See [PCP with PCP manager](../user_guide/parallelism.md#pcp-with-pcp-manager). |
+| `TPU_PCP_KV_WORKSPACE_TOKENS` | `1048576` | With `USE_TPU_PCP_MANAGER=1`, the context tokens one forward's prefills may gather; a step that needs more runs as several forwards. Must be at least `--max-model-len`. |
+| `TPU_PCP_KV_CHUNK_TOKENS` | `65536` | With `USE_TPU_PCP_MANAGER=1`, the context tokens each all-gather moves. |
 | `TPU_DCP_MLA_TOPK_CAP` | `0` | Caps top-k selection per Decode Context Parallel (`DCP`) rank in Sparse MLA (`0` disables cap). |
 | `TPU_DCP_LSE_MERGE_A2A` | `False` | Uses all-to-all LSE merge for Decode Context Parallelism when token count is below `TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS` (`64`). |
 | `TPU_TOKEN_BUCKET_EXTRA` | `[]` | Comma-separated list of additional token padding bucket sizes to precompile. |
