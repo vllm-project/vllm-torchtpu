@@ -58,6 +58,9 @@ if TYPE_CHECKING:
     ONEHOT_MOE_PERMUTE_THRESHOLD: int | None = None
     TPU_MOE_SEQUENCE_PARALLEL: bool = False
     TPU_QWEN4_HC_DECODE_FUSED: bool = False
+    TPU_QWEN4_HC_PREFILL_ODD_TILES: bool = False
+    TPU_QWEN4_HC_PREFILL_FUSED_MIX: bool = False
+    VLLM_TPU_GDN_PREFILL_NO_ZERO_INIT: bool = False
     QWEN4_EXP_PREFILL_SP: bool = False
     QWEN4_EXP_PD_STAGING_BYTES: int = 8 << 30
     QWEN4_EXP_PD_SYNC_REPACK: bool = False
@@ -1060,6 +1063,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # gate, branch mean and the combine's injection gate) at <= 512 tokens as
     # one Pallas call, with the attn combine fused ahead of the mlp mix.
     "TPU_QWEN4_HC_DECODE_FUSED": env_bool("TPU_QWEN4_HC_DECODE_FUSED"),
+    # qwen4_exp prefill: let the fused HC mix (hc_full) and the gated_residual
+    # combine take any whole number (>= 2) of hc_prefill_full_tile tiles, not
+    # only even counts, so 6,400- and 3,200-token steps leave the unfused
+    # fallback (norm kernel + XLA down + up epilogue + XLA combine).
+    "TPU_QWEN4_HC_PREFILL_ODD_TILES": env_bool("TPU_QWEN4_HC_PREFILL_ODD_TILES"),
+    # qwen4_exp prefill: one Pallas pass per HC mix that also produces the
+    # combine's injection gate (norm never reaches HBM), with the attn combine
+    # fused ahead of the mlp mix; whole hc_prefill_full_tile tiles only.
+    "TPU_QWEN4_HC_PREFILL_FUSED_MIX": env_bool("TPU_QWEN4_HC_PREFILL_FUSED_MIX"),
+    # Pooled GDN: skip zero-filling the [T, n_v, d_v] output before the
+    # decode (BATCHED) and prefill (PER_SEQ) kernels write it. Rows no request
+    # owns (bucket padding) are then left unwritten; the decoder layer masks
+    # them before the MoE.
+    "VLLM_TPU_GDN_PREFILL_NO_ZERO_INIT": env_bool("VLLM_TPU_GDN_PREFILL_NO_ZERO_INIT"),
     # qwen4_exp: shard prefill-sized steps across TP ranks between attention
     # blocks (reduce-scatter instead of all-reduce), so the hyper-connection
     # streams, PLE gate and residual math run on 1/TP of the tokens. Steps

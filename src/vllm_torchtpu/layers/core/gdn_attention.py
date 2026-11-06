@@ -850,6 +850,23 @@ def _build_v3_pool_state_plan(
     )
 
 
+def pooled_gdn_zero_initialize_out(
+    num_rows: int, num_seqs: int, num_spec_tokens: int
+) -> bool:
+    """Whether the pooled GDN zero-fills its [T, n_v, d_v] output.
+
+    VLLM_TPU_GDN_PREFILL_NO_ZERO_INIT skips the fill on prefill-sized buckets
+    (more rows than request windows, ``prepare_gdn_input``'s shape policy):
+    the decode and prefill kernels write every row a request owns, and the
+    decoder layer masks the bucket-padding rows before the MoE. Decode buckets
+    keep the fill.
+    """
+    return not (
+        tpu_envs.VLLM_TPU_GDN_PREFILL_NO_ZERO_INIT
+        and num_rows > num_seqs * (num_spec_tokens + 1)
+    )
+
+
 def run_jax_gdn_attention_pooled_local(
     mixed_qkv: jnp.ndarray | Conv1DInput,
     b: jnp.ndarray,
@@ -905,6 +922,14 @@ def run_jax_gdn_attention_pooled_local(
         recurrent_state_dtype=recurrent_state_dtype,
         conv_state_dtype=conv_state_dtype,
     )
+    num_rows = (
+        mixed_qkv.values.shape[0]
+        if isinstance(mixed_qkv, Conv1DInput)
+        else mixed_qkv.shape[0]
+    )
+    zero_initialize_out = pooled_gdn_zero_initialize_out(
+        num_rows, seq_lens.shape[0], num_spec_tokens
+    )
     recurrent_state, output = gdn_v3_wrapper.fused_conv1d_gdn(
         mixed_qkv,
         b,
@@ -930,6 +955,7 @@ def run_jax_gdn_attention_pooled_local(
         state_plan=plan,
         num_spec_tokens=num_spec_tokens,
         conv_weight_kmajor=conv_weight_kmajor,
+        zero_initialize_out=zero_initialize_out,
     )
     return recurrent_state, output
 

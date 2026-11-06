@@ -192,7 +192,14 @@ def _kernel(
         one_step(2 * pair + 1, 1)
         return carry
 
-    jax.lax.fori_loop(0, tokens // (2 * token_tile), step_pair, jnp.int32(0))
+    num_tiles = tokens // token_tile
+    jax.lax.fori_loop(0, num_tiles // 2, step_pair, jnp.int32(0))
+    if num_tiles % 2:
+        # An odd tile count (TPU_QWEN4_HC_PREFILL_ODD_TILES, e.g. 6,400 rows
+        # in 256-row tiles): the last tile runs on parity 0. Its input copy was
+        # started by the previous (parity 1) step and its waits pair with the
+        # step two back, as inside the loop. Even counts emit no extra code.
+        one_step(jnp.int32(num_tiles - 1), 0)
     for parity in range(2):
         pltpu.make_async_copy(
             norm_vm.at[parity], norm_vm.at[parity], norm_sems.at[parity]
@@ -202,12 +209,16 @@ def _kernel(
         ).wait()
 
 
-@functools.partial(jax.jit, static_argnames=("branches", "hidden", "eps", "token_tile"))
-def _full_mix(x, weight, down, up, *, branches, hidden, eps, token_tile):
+@functools.partial(
+    jax.jit, static_argnames=("branches", "hidden", "eps", "token_tile", "interpret")
+)
+def _full_mix(x, weight, down, up, *, branches, hidden, eps, token_tile, interpret=False):
     tokens, width = x.shape
     lowrank = down.shape[0]
+    # At least two whole tiles: the drain below waits on both parities.
     if (
-        tokens % (2 * token_tile)
+        tokens % token_tile
+        or tokens < 2 * token_tile
         or width != branches * hidden
         or weight.shape != (width,)
         or down.shape != (lowrank, width)
@@ -250,5 +261,6 @@ def _full_mix(x, weight, down, up, *, branches, hidden, eps, token_tile):
             jax.ShapeDtypeStruct((tokens, width), jnp.bfloat16),
         ),
         compiler_params=pltpu.CompilerParams(vmem_limit_bytes=60 << 20),
+        interpret=interpret,
         name=f"qwen4exp_hc_branchstore32_m{token_tile}",
     )(x, weight, down, up)

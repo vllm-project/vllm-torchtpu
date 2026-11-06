@@ -42,6 +42,38 @@ class GatedResidual(common_hc.GatedResidual):
         self._prefill_norm_op = None
         self._prefill_full_op = None
         self._prefill_combine_op = None
+        # Fused prefill mix and combine take T % tile == 0 (any count >= 2)
+        # under TPU_QWEN4_HC_PREFILL_ODD_TILES or ..._FUSED_MIX, else even
+        # tile counts only (the served default).
+        self._prefill_tile_step = (
+            prefill_full_tile
+            if envs.TPU_QWEN4_HC_PREFILL_ODD_TILES
+            or envs.TPU_QWEN4_HC_PREFILL_FUSED_MIX
+            else 2 * prefill_full_tile
+        )
+        self._prefill_inj_mix_op = None
+        self._prefill_combine_mix_op = None
+        if (
+            envs.TPU_QWEN4_HC_PREFILL_FUSED_MIX
+            and prefill_full_tile
+            and self.config.hc_per_branch_norm
+            and self.hidden_size % 128 == 0
+            and hasattr(self, "input_mix_weight_down")
+            and hasattr(self, "block_inject_weight")
+        ):
+            from vllm_torchtpu.kernels.qwen4_exp.vllm_adapter import (
+                build_prefill_combine_mix_op,
+                build_prefill_inj_mix_op,
+            )
+
+            eps = self.hc_norm.variance_epsilon
+            self._prefill_inj_mix_op = build_prefill_inj_mix_op(
+                self.hc_count, self.hidden_size, eps, prefill_full_tile
+            )
+            # Used by the preceding HC's combine_mix (attn -> mlp).
+            self._prefill_combine_mix_op = build_prefill_combine_mix_op(
+                self.hc_count, self.hidden_size, eps, prefill_full_tile
+            )
         if (
             prefill_full_tile
             and self.hidden_size % 128 == 0
@@ -167,6 +199,25 @@ class GatedResidual(common_hc.GatedResidual):
             and all(w.dtype == torch.bfloat16 for w in self._decode_weights())
         )
 
+    def _prefill_full_rows(self, tokens: int) -> bool:
+        """Whole fused-prefill tiles: at least two, and an even count unless
+        TPU_QWEN4_HC_PREFILL_ODD_TILES / ..._FUSED_MIX allow any count."""
+        return (
+            tokens >= 2 * self.prefill_full_tile
+            and tokens % self._prefill_tile_step == 0
+        )
+
+    def _prefill_fused_mix(self, hyper_input) -> bool:
+        """TPU_QWEN4_HC_PREFILL_FUSED_MIX: norm, gate, mix and the injection
+        gate in one Pallas pass over whole prefill tiles."""
+        return (
+            self._prefill_inj_mix_op is not None
+            and hyper_input.dim() == 2
+            and self._prefill_full_rows(hyper_input.shape[0])
+            and hyper_input.dtype == torch.bfloat16
+            and all(w.dtype == torch.bfloat16 for w in self._decode_weights())
+        )
+
     def _residual(self, hyper_input, norm):
         """``mix``'s residual for ``combine``, with the injection gate computed
         here as the fused decode mix computes it.
@@ -196,10 +247,14 @@ class GatedResidual(common_hc.GatedResidual):
                 mixed, injection = out
                 return mixed, (hyper_input, injection)
             return out, (hyper_input, None)
+        if self._prefill_fused_mix(hyper_input):
+            mixed, injection = self._prefill_inj_mix_op(
+                hyper_input, *self._decode_weights()
+            )
+            return mixed, (hyper_input, injection)
         if (
             self._prefill_full_op is not None
-            and hyper_input.shape[0] >= 2 * self.prefill_full_tile
-            and hyper_input.shape[0] % (2 * self.prefill_full_tile) == 0
+            and self._prefill_full_rows(hyper_input.shape[0])
             and hyper_input.dtype == torch.bfloat16
             and self.hc_norm.weight.dtype == torch.bfloat16
             and self.input_mix_weight_down.weight.dtype == torch.bfloat16
@@ -258,8 +313,7 @@ class GatedResidual(common_hc.GatedResidual):
             injection = 2.0 * torch.sigmoid(injection.float() / self.hc_count)
         if (
             self._prefill_combine_op is not None
-            and hyper_input.shape[0] >= 2 * self.prefill_full_tile
-            and hyper_input.shape[0] % (2 * self.prefill_full_tile) == 0
+            and self._prefill_full_rows(hyper_input.shape[0])
             and hyper_input.dtype == torch.bfloat16
             and block_output.dtype == torch.bfloat16
         ):
@@ -298,6 +352,18 @@ class GatedResidual(common_hc.GatedResidual):
             and next_hc._decode_fused(hyper_input)
         ):
             mixed, injection, combined = next_hc._decode_combine_mix_op(
+                hyper_input, block_output, gate, *next_hc._decode_weights()
+            )
+            return mixed, (combined, injection)
+        if (
+            next_hc._prefill_combine_mix_op is not None
+            and gate is not None
+            and gate.shape[-1] == self.hc_count
+            and gate.dtype == torch.float32
+            and block_output.dtype == torch.bfloat16
+            and next_hc._prefill_fused_mix(hyper_input)
+        ):
+            mixed, injection, combined = next_hc._prefill_combine_mix_op(
                 hyper_input, block_output, gate, *next_hc._decode_weights()
             )
             return mixed, (combined, injection)
