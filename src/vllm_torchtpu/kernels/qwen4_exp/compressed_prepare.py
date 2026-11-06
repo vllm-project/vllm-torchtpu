@@ -22,7 +22,7 @@ from vllm_torchtpu.kernels.qwen4_exp.rounding import bf16
 
 
 def write_prepared_pairs(
-    pool, values, pair, active, mask, *, local=None, trig_rows=None
+    pool, values, pair, active, mask, *, local=None, trig_rows=None, rotary_dim=None
 ):
     """Accept prepared pairs or indexed keys with optional aligned trig rows.
 
@@ -33,6 +33,14 @@ def write_prepared_pairs(
     packing = 4 if pool.dtype == jnp.float8_e4m3fn else 2
     width = pool.shape[-1]
     view = pool.reshape(-1, packing, width)
+    if trig_rows is not None and (
+        rotary_dim is None
+        or rotary_dim <= 0
+        or rotary_dim % 2
+        or rotary_dim > min(width, trig_rows.shape[-1])
+    ):
+        raise ValueError("Rotating pair writes require compatible rotary dimensions")
+    half = 0 if rotary_dim is None else rotary_dim // 2
     count = len(values)
     conflict = (
         (pair[:, None] == pair[None, :])
@@ -67,19 +75,15 @@ def write_prepared_pairs(
         if rotating:
             assert trig_ref is not None
             a, b = (
-                source[:, :32].astype(jnp.float32),
-                source[:, 32:64].astype(jnp.float32),
+                source[:, :half].astype(jnp.float32),
+                source[:, half:rotary_dim].astype(jnp.float32),
             )
             angles = trig_ref[...].astype(jnp.float32)
-            c, sn = angles[:, :32], angles[:, 32:64]
-            source = jnp.concatenate(
-                (
-                    bf16(a * c - bf16(b * sn)),
-                    bf16(a * sn + bf16(b * c)),
-                    source[:, 64:],
-                ),
-                axis=1,
-            )
+            c, sn = angles[:, :half], angles[:, half:rotary_dim]
+            parts = (bf16(a * c - bf16(b * sn)), bf16(a * sn + bf16(b * c)))
+            if rotary_dim < width:
+                parts += (source[:, rotary_dim:],)
+            source = jnp.concatenate(parts, axis=1)
         source_bits = (
             jax.lax.bitcast_convert_type(source, jnp.uint16).astype(jnp.int32)
             if indexed

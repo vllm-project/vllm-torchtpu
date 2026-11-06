@@ -56,6 +56,7 @@ def test_compressed_preparation_keeps_partial_and_aliased_pairs(
                     4,
                     logical_block_size=1664,
                     batch_pairs=True,
+                    rotary_dim=64,
                     trig_rows=None
                     if dma
                     else jax.lax.optimization_barrier(trig[positions]),

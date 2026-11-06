@@ -12,25 +12,26 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""QSA decode output projection with measured BF16 weight prefetch."""
+"""QSA decode output projection with budgeted BF16 weight prefetch."""
 
 import dataclasses
 from typing import Any
 
 import jax
 import jax.numpy as jnp
-from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.kernels.qwen4_exp.decode_indexer import _request_bounds
 from vllm_torchtpu.kernels.qwen4_exp.qsa_rpa import qsa_attention
-from vllm_torchtpu.kernels.sparse_gqa_decode import plan_decode, schedule
+from vllm_torchtpu.kernels.sparse_gqa_decode import schedule
 from vllm_torchtpu.kernels.sparse_gqa_decode.metadata import virtual_page_metadata
 from vllm_torchtpu.kernels.sparse_gqa_decode.projection_kernel import (
     decode_projected_kernel,
 )
-from vllm_torchtpu.kernels.sparse_gqa_decode.tuned_block_sizes import (
-    supports_output_projection_layout,
+from vllm_torchtpu.kernels.sparse_gqa_decode.projection_planning import (
+    plan_projected_decode,
+    projection_width,
 )
+from vllm_torchtpu.kernels.sparse_gqa_decode.query_layout import query_offsets
 
 
 def projected_attention(
@@ -60,37 +61,23 @@ def projected_attention(
     """Return projected HC output and the unchanged cache owner."""
     from vllm_torchtpu.kernels.sparse_gqa_decode.query_layout import planning_query
 
-    launch = plan_decode(
+    width = projection_width(query, weight, residual, hc_gate)
+    launch = plan_projected_decode(
         planning_query(query, query_prepared),
         gate,
         blocks,
         lengths,
         table,
         cache,
+        weight,
+        hc_gate,
         kv_heads=kv_heads,
         ratio=ratio,
         k_scale=k_scale,
         v_scale=v_scale,
     )
-    supported = (
-        query.shape[0] == 16
-        and blocks.shape[0] == len(query)
-        and supports_output_projection_layout(
-            query.shape[1:],
-            kv_heads=kv_heads,
-            ratio=ratio,
-            groups=blocks.shape[1],
-            page_size=cache.shape[1],
-        )
-        and cache.dtype == jnp.float8_e4m3fn
-        and weight.shape == (5, 6144, 512)
-        and residual.shape == (16, 10240)
-        and hc_gate.shape == (16, 4)
-        and len(query) <= len(starts) - 1
-        and launch is not None
-        and launch.chunk_queries >= len(query)
-        and pltpu.get_tpu_info().chip_version == pltpu.ChipVersion.TPU_7X
-    )
+    padded_width = weight.shape[0] * weight.shape[2]
+    supported = len(query) <= len(starts) - 1 and launch is not None
 
     def fallback():
         prefill_options: dict[str, Any] = dict(sc_min_context=sc_min_context)
@@ -114,12 +101,11 @@ def projected_attention(
         matrix = (
             original_weight
             if original_weight is not None
-            else weight.transpose(1, 0, 2).reshape(weight.shape[1], -1)
+            else weight.transpose(1, 0, 2).reshape(weight.shape[1], -1)[:, :width]
         )
         projected = jnp.matmul(attended.reshape(len(query), -1), matrix).astype(
             jnp.bfloat16
         )
-        width = projected.shape[-1]
         if (
             hc_token_tile > 0
             and len(query) >= max(hc_token_tile, hc_min_tokens)
@@ -162,13 +148,7 @@ def projected_attention(
         else:
             q = jnp.where((lengths > 0)[:, None, None], query, 0).astype(jnp.float32)
             q = q.reshape(batch, kv_heads, heads // kv_heads, 1, dim).swapaxes(0, 1)
-        if prepared_cu is not None:
-            assert prepared_cu.shape == (batch + 1,) and prepared_cu.dtype == jnp.int32
-        starts = (
-            jnp.arange(batch + 1, dtype=jnp.int32)
-            if prepared_cu is None
-            else prepared_cu
-        )
+        starts = query_offsets(batch, prepared_cu)
         q_lens = (kv_lens > 0).astype(jnp.int32)
         metadata = schedule.generate(starts, kv_lens, pages, cfgs)
         _, output = decode_projected_kernel(
@@ -181,12 +161,17 @@ def projected_attention(
             cache=cache.reshape(-1, ratio, *cache.shape[2:]),
             gate=gate,
             output_weight=weight,
-            residual=residual,
+            residual=jnp.pad(
+                residual.reshape(batch, hc_gate.shape[1], width),
+                ((0, 0), (0, 0), (0, padded_width - width)),
+            ).reshape(batch, -1),
             hc_gate=hc_gate,
             cfgs=cfgs,
             policy=launch.policy,
         )
-        return output
+        return output.reshape(batch, hc_gate.shape[1], padded_width)[
+            :, :, :width
+        ].reshape(residual.shape)
 
     if not supported:
         return fallback(), cache

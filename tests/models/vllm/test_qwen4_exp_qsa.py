@@ -38,6 +38,21 @@ from vllm_torchtpu.models.vllm.qwen4_exp.qsa import (
 
 
 @pytest.fixture(autouse=True)
+def projection_hardware(monkeypatch):
+    from jax.experimental.pallas import tpu as pltpu
+
+    info = pltpu.get_tpu_info_for_chip(pltpu.ChipVersion.TPU_7X, 1)
+    monkeypatch.setattr(pltpu, "get_tpu_info", lambda: info)
+    from vllm_torchtpu.kernels.qwen4_exp import tuned_block_sizes
+
+    monkeypatch.setattr(
+        tuned_block_sizes,
+        "_hardware",
+        lambda: tuned_block_sizes.DmaHardware.from_tpu_info(info),
+    )
+
+
+@pytest.fixture(autouse=True)
 def cpu_vllm_config_context(monkeypatch):
     from vllm.config import DeviceConfig, VllmConfig, set_current_vllm_config
     from vllm.model_executor.layers.utils import default_unquantized_gemm
@@ -408,6 +423,7 @@ def test_merged_inputs_forward_and_checkpoint_completeness(tp, rank, monkeypatch
         num_attention_heads=8,
         num_key_value_heads=2,
         head_dim=32,
+        rope_parameters={"rope_type": "default", "rope_theta": 10000000},
         indexer_n_heads=2,
         indexer_head_dim=32,
     )
@@ -659,6 +675,7 @@ def test_output_projection_tp2_partial_sum_matches_tp1(monkeypatch):
         num_attention_heads=4,
         num_key_value_heads=2,
         head_dim=128,
+        rope_parameters={"rope_type": "default", "rope_theta": 10000000},
         indexer_n_heads=2,
         indexer_head_dim=128,
     )

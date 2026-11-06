@@ -16,7 +16,7 @@
 
 Extends this package's fused_kernel.py pipeline with one weight DMA per
 output-column tile. RPA math and schedule loading use the original helpers.
-The separate entry retains the original attention-only path for other shapes.
+The separate entry retains attention plus projection when fusion cannot fit.
 """
 
 import jax
@@ -37,9 +37,19 @@ from vllm_torchtpu.kernels.sparse_gqa_decode.fused_kernel import (
     _load_schedule,
 )
 from vllm_torchtpu.kernels.sparse_gqa_decode.tuned_block_sizes import (
-    OUTPUT_PROJECTION_REDUCTION_BLOCKS,
     DecodePolicy,
 )
+
+
+def project_tile(attended: jax.Array, weight: jax.Array) -> jax.Array:
+    """Reduce the complete K axis in FP32, then round the projection to BF16."""
+    projected = jax.lax.dot_general(
+        attended,
+        weight,
+        (((1,), (0,)), ((), ())),
+        preferred_element_type=jnp.float32,
+    )
+    return bf16(projected).astype(jnp.float32)
 
 
 def decode_projected_kernel(
@@ -71,12 +81,22 @@ def decode_projected_kernel(
         raise ValueError("Split decode requests before exceeding one schedule window")
     if output_weight.ndim != 3 or output_weight.dtype != jnp.bfloat16:
         raise ValueError("Projection requires tiled BF16 [N_tiles,K,tile_N] weights")
+    if (
+        min(output_weight.shape) <= 0
+        or output_weight.shape[1] != cfgs.model.num_q_heads * cfgs.model.head_dim
+        or residual.dtype != jnp.bfloat16
+        or hc_gate.dtype != jnp.float32
+        or residual.ndim != 2
+        or hc_gate.ndim != 2
+        or residual.shape[0] != cfgs.serve.num_seqs
+        or hc_gate.shape[0] != cfgs.serve.num_seqs
+        or hc_gate.shape[1] <= 0
+    ):
+        raise ValueError(
+            "Projection dimensions/dtypes must match the decode and HC ABI"
+        )
     output_tiles = output_weight.shape[0]
     output_width = output_weight.shape[-1] * output_tiles
-    reduction_key = (cfgs.serve.num_seqs, output_weight.shape[1], output_width)
-    if reduction_key not in OUTPUT_PROJECTION_REDUCTION_BLOCKS:
-        raise ValueError(f"Unvalidated BF16 projection reduction: {reduction_key}")
-    reduction_block = OUTPUT_PROJECTION_REDUCTION_BLOCKS[reduction_key]
     result_width = residual.shape[-1]
     branches = hc_gate.shape[-1]
     if result_width != output_width * branches:
@@ -211,31 +231,8 @@ def decode_projected_kernel(
             pltpu.make_async_copy(
                 weight_ref.at[tile], weight_buf.at[tile], projection_sems.at[tile]
             ).wait()
-        # Every valid schedule has nonnegative actual_steps, including zero.
-        # A runtime all-one mask preserves each FP32 partial-sum boundary;
-        # casts alone allow the backend to contract the dot/add expression.
-        partial_mask = jnp.where(
-            metadata_ref.actual_steps[0] >= 0, jnp.int32(-1), jnp.int32(0)
-        )
         for tile in range(output_tiles):
-            partials = []
-            for block in range(output_weight.shape[1] // reduction_block):
-                k_slice = pl.ds(block * reduction_block, reduction_block)
-                partial = jax.lax.dot_general(
-                    attended[:, k_slice],
-                    weight_buf[tile, k_slice, :],
-                    (((1,), (0,)), ((), ())),
-                    preferred_element_type=jnp.float32,
-                )
-                partial = jax.lax.bitcast_convert_type(
-                    jax.lax.bitcast_convert_type(partial, jnp.int32) & partial_mask,
-                    jnp.float32,
-                )
-                partials.append(partial)
-            projected = partials[0]
-            for partial in partials[1:]:
-                projected = projected + partial
-            projected = bf16(projected).astype(jnp.float32)
+            projected = project_tile(attended, weight_buf[tile, ...])
             for branch in range(branches):
                 out_cols = pl.ds(
                     branch * output_width + tile * output_weight.shape[-1],

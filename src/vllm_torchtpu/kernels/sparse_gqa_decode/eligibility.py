@@ -27,7 +27,6 @@ from vllm_torchtpu.kernels.sparse_gqa_decode.planning import (
 from vllm_torchtpu.kernels.sparse_gqa_decode.tuned_block_sizes import (
     DEFAULT_POLICY,
     DecodePolicy,
-    default_policy_for,
 )
 
 
@@ -46,7 +45,6 @@ def plan_decode(
     policy: DecodePolicy | None = None,
 ) -> DecodeLaunch | None:
     """Static eligibility; callers supply valid per-query selected groups."""
-    automatic_policy = policy is None
     policy = DEFAULT_POLICY if policy is None else policy
     if (
         q.ndim != 3
@@ -83,10 +81,6 @@ def plan_decode(
     ):
         return None
     info = pltpu.get_tpu_info()
-    if automatic_policy:
-        policy = default_policy_for(
-            q, cache, kv_heads=kv_heads, ratio=ratio, groups=blocks.shape[1], info=info
-        )
     if (
         info.num_lanes != RPA_WAIT_ROW_WORDS
         or policy.bkv_tokens % info.num_lanes

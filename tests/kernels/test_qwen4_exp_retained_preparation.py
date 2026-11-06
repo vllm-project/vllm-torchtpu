@@ -13,14 +13,23 @@
 # limitations under the License.
 """Admission and dtype boundary regression tests for retained decode preparation."""
 
-from types import SimpleNamespace
-
 import jax
 import jax.numpy as jnp
 import pytest
 from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.kernels.qwen4_exp import retained_preparation as prep
+
+
+@pytest.fixture(autouse=True)
+def hardware_descriptor(monkeypatch):
+    from vllm_torchtpu.kernels.qwen4_exp import tuned_block_sizes
+
+    def descriptor():
+        return tuned_block_sizes.DmaHardware.from_tpu_info(pltpu.get_tpu_info())
+
+    monkeypatch.setattr(tuned_block_sizes, "_hardware", descriptor)
+    monkeypatch.setattr(prep, "_hardware", descriptor)
 
 
 @pytest.mark.parametrize("rope_rows", [128, 65536, 67584])
@@ -39,18 +48,15 @@ def test_preparation_depends_on_compute_layout_not_serving_capacity(
         arr((rope_rows, 128), jnp.bfloat16),
     ]
     options = dict(rotary_dim=64)
-    monkeypatch.setattr(
-        prep,
-        "_hardware",
-        lambda: SimpleNamespace(chip_version=pltpu.ChipVersion.TPU_7X),
-    )
+    info = pltpu.get_tpu_info_for_chip(pltpu.ChipVersion.TPU_7X, 1)
+    monkeypatch.setattr(pltpu, "get_tpu_info", lambda: info)
     assert prep.use_retained_preparation(*args, **options)
     for index, value in [
         (0, arr((32, 12288), jnp.bfloat16)),
         (6, None),
         (6, arr((256,), jnp.bfloat16)),
         (7, arr((0, 128), jnp.bfloat16)),
-        (7, arr((rope_rows, 64), jnp.bfloat16)),
+        (7, arr((rope_rows, 32), jnp.bfloat16)),
     ]:
         changed = args.copy()
         changed[index] = value

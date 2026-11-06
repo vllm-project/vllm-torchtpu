@@ -26,7 +26,10 @@ from vllm_torchtpu.kernels.sparse_gqa_decode.batching import attend_in_chunks
 from vllm_torchtpu.kernels.sparse_gqa_decode.fused_kernel import decode_kernel
 from vllm_torchtpu.kernels.sparse_gqa_decode.metadata import virtual_page_metadata
 from vllm_torchtpu.kernels.sparse_gqa_decode.planning import DecodeLaunch
-from vllm_torchtpu.kernels.sparse_gqa_decode.query_layout import prepare_query
+from vllm_torchtpu.kernels.sparse_gqa_decode.query_layout import (
+    prepare_query,
+    query_offsets,
+)
 
 
 def _attend(
@@ -57,11 +60,7 @@ def _attend(
     # RPA's buffer binding accepts a new-KV operand even when cache updates and
     # new-KV DMAs are disabled. No dummy K/V preparation or concatenation needed.
     unused_new_kv = jnp.zeros((batch, *cache.shape[2:]), cache.dtype)
-    if prepared_cu is not None:
-        assert prepared_cu.shape == (batch + 1,) and prepared_cu.dtype == jnp.int32
-    cu_q_lens = (
-        jnp.arange(batch + 1, dtype=jnp.int32) if prepared_cu is None else prepared_cu
-    )
+    cu_q_lens = query_offsets(batch, prepared_cu)
     q_lens = (kv_lens > 0).astype(jnp.int32)
     metadata = schedule.generate(cu_q_lens, kv_lens, pages, cfgs)
     out = decode_kernel(

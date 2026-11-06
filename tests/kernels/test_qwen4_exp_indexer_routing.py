@@ -68,6 +68,12 @@ def test_decode_reader_view_preserves_page_ids_and_native_keys(monkeypatch, case
 
     monkeypatch.setattr(decode_indexer, "streamindex_topk", inspect)
     # Inspect concrete reader operands inside the runtime scoring branch.
+    info = pltpu.get_tpu_info_for_chip(chip, 1)
+    monkeypatch.setattr(
+        tuned_block_sizes,
+        "_hardware",
+        lambda: tuned_block_sizes.DmaHardware.from_tpu_info(info),
+    )
     with jax.disable_jit():
         decode_indexer.select_index_blocks(
             jnp.zeros((batch, 4, 128), jnp.bfloat16),
@@ -80,7 +86,7 @@ def test_decode_reader_view_preserves_page_ids_and_native_keys(monkeypatch, case
             ratio=4,
             block_topk=k,
         )
-    assert calls == [16 if case == "wide" else 2]
+    assert calls == [info.get_sublane_tiling(jnp.bfloat16) if case != "carrier" else 2]
 
 
 @pytest.mark.parametrize("case", ["decode", "prefill", "padding", "backend", "chip"])
@@ -131,7 +137,7 @@ def test_sidecar_page_coalescing_preserves_owned_key_addresses(monkeypatch, case
         table[req[:, None], columns[None] // 416], columns[None] % 416
     ]
     np.testing.assert_array_equal(actual, expected)
-    assert observed == [416 if case == "decode" else 32]
+    assert observed == [416 if case in ("decode", "chip") else 32]
 
 
 @dataclass(frozen=True)
@@ -258,8 +264,12 @@ def test_shared_schedule_forwards_backend_and_causal_metadata(
     prefill_rows = sum(
         int(cu[-1]) for lens, cu, kw in seen if kw["num_queries_per_block"] != 1
     )
-    assert decode_rows == sum(int(n) for n in counts if n == 1)
-    assert prefill_rows == sum(int(n) for n in counts if n > 1)
+    if tokens <= requests:
+        assert decode_rows == sum(counts)
+        assert prefill_rows == 0
+    else:
+        assert decode_rows == sum(int(n) for n in counts if n == 1)
+        assert prefill_rows == sum(int(n) for n in counts if n > 1)
 
 
 def test_default_is_qwen_sparsecore_and_jit_backend_identity(monkeypatch):
@@ -377,6 +387,7 @@ def test_pooled_step_forwards_geometry_and_backend_before_attention(
     monkeypatch, tokens
 ):
     backend = ReferenceTopK()
+    fixture_rotary_dim = 2
     seen = []
 
     def select(query, pool, lengths, table, req, starts, context, **kwargs):
@@ -404,7 +415,9 @@ def test_pooled_step_forwards_geometry_and_backend_before_attention(
         trig_rows,
         trig_cache,
         positions,
+        rotary_dim,
     ):
+        assert rotary_dim == fixture_rotary_dim
         assert logical_block_size == 128
         assert not batch_pairs
         assert trig_rows is None and trig_cache is None and positions is None
@@ -459,7 +472,7 @@ def test_pooled_step_forwards_geometry_and_backend_before_attention(
         compress_ratio=4,
         token_topk=64,
         norm_eps=1e-6,
-        rotary_dim=2,
+        rotary_dim=fixture_rotary_dim,
         request_distribution=jnp.array(
             [1 if tokens == 1 else 0, 1 if tokens == 1 else 0, 1], jnp.int32
         ),

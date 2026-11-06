@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Measured QSA tiles and transfer-sized DMA concurrency."""
+"""QSA tile defaults and tensor/resource-derived transfer policies."""
 
 import dataclasses
 import math
@@ -30,134 +30,137 @@ _DMA_BATCHES = tuple(
 )
 _COMPILER_SMEM_RESERVE = 32 * 1024
 _MAIN_TILE = 128
-_MAIN_DECODE_TILES = {(16, 1, 4, 256)}
 _DmaArray = jax.Array | jax.ShapeDtypeStruct
-
-# (query bucket, heads, width, keys/page, page-table width, ratio, top-k).
-# TPU7x BF16 decode: 32 pages amortize pipeline steps without the short-context
-# overfetch of 64 pages. Measured at 2K/8K/32K/64K with 8 or 16 live rows;
-# keep request groups at 8 because a group of 16 reads padded idle requests.
-_DECODE_INDEX_PAGES = {
-    (16, 4, 128, 32, 533, 4, 512): 32,
-    # Thirteen adjacent subpages already share a physical sidecar allocation.
-    # Four whole pages keep the 416-key page extent aligned to 128 lanes.
-    (16, 4, 128, 416, 41, 4, 512): 4,
-}
-
-# Widen only the measured native BF16 reader; storage and page ownership stay
-# unchanged. A full BF16 sublane tile avoids the narrow two-row DMA layout.
-_DECODE_INDEX_WIDE_KEYS = {(16, 4, 128, 416, 41, 4, 512)}
+DECODE_INDEX_TILE_KEYS = 1024
 
 
 def get_decode_index_key_packing(
-    query: jax.Array,
-    cache: jax.Array,
-    *,
-    pages_per_query: int,
-    ratio: int,
-    topk: int,
+    query: _DmaArray, cache: _DmaArray, *, pages_per_query: int, ratio: int, topk: int
 ) -> int:
-    """Select a zero-copy page view only for verified geometry and hardware."""
-    page_size = cache.shape[1] * 2
-    key = (*query.shape, page_size, pages_per_query, ratio, topk)
+    """Widen a native BF16 reader only when whole physical pages reshape exactly."""
     if (
-        key not in _DECODE_INDEX_WIDE_KEYS
+        query.ndim != 3
+        or cache.ndim != 4
         or query.dtype != jnp.bfloat16
         or cache.dtype != jnp.bfloat16
         or cache.shape[2:] != (2, query.shape[-1])
     ):
         return 2
     hw = _hardware()
-    if hw is None or hw.chip_version != pltpu.ChipVersion.TPU_7X:
+    page_size = cache.shape[1] * 2
+    if hw is None or hw.bf16_rows <= 0:
         return 2
     return hw.bf16_rows if page_size % hw.bf16_rows == 0 else 2
 
 
-# Small mixed windows share the decode implementation. A single resident tile
-# owns every request, so repeated tokens cannot race separate state writers.
-_DECODE_STATE_TILES = {(16, 16, 128, 4), (16, 32, 128, 4)}
-
-
-def use_decode_state_fusion(raw, pool, *, requests: int, ratio: int) -> bool:
-    """Admit only measured state geometry and generation, retaining fallback."""
+def use_decode_state_fusion(
+    raw: _DmaArray,
+    pool: _DmaArray,
+    *,
+    requests: int,
+    ratio: int,
+    position_axes: int = 1,
+) -> bool:
+    """Fuse resident state and pair writes within the small-query bucket."""
+    hw = _hardware()
     if (
-        (raw.shape[0], requests, raw.shape[-1], ratio) not in _DECODE_STATE_TILES
+        not _carrier(pool, hw)
+        or raw.ndim != 2
+        or min(raw.shape) <= 0
+        or requests <= 0
+        # The whole-batch pair writer shares the per-query schedule's bucket.
+        # Larger token windows require the bounded prefill/verification writer.
+        or raw.shape[0] > requests
+        or ratio <= 0
+        or position_axes <= 0
         or raw.dtype != jnp.bfloat16
         or pool.dtype != jnp.bfloat16
-        or pool.ndim != 5
         or pool.shape[2:] != (1, 2, raw.shape[-1])
     ):
         return False
-    hw = _hardware()
-    if hw is None or hw.chip_version != pltpu.ChipVersion.TPU_7X:
-        return False
-    ring_elements = 8 * raw.shape[-1]
+    assert hw is not None
+    # Persistent ring/tag storage pads compression groups to eight rows.
+    ring_rows = _align(ratio, 8)
+    ring_elements = ring_rows * raw.shape[-1]
+    tag_elements = ring_rows * (position_axes + 1)
     rt, _ = region_rows(pool, ring_elements, jnp.bfloat16)
-    tt, _ = region_rows(pool, 16, jnp.int32)
+    tt, _ = region_rows(pool, tag_elements, jnp.int32)
     memory = ring_tag_dma_memory(
-        pool, min(raw.shape[0], requests), requests, ring_elements, 16, hw
+        pool, min(raw.shape[0], requests), requests, ring_elements, tag_elements, hw
+    )
+    resident = (
+        3 * _vmem(raw.shape, jnp.bfloat16, hw)
+        + _vmem(raw.shape, jnp.int32, hw)
+        + _vmem((1, raw.shape[1]), jnp.bfloat16, hw)
     )
     return (
         rt + tt <= pool.shape[1]
-        and memory.vmem_bytes <= hw.vmem_bytes
-        and memory.scalar <= hw.smem_bytes
+        and memory.vmem_bytes + resident <= hw.vmem_bytes
+        and memory.scalar + (requests * 2 + 1 + raw.shape[0] * position_axes) * 4
+        <= hw.smem_bytes
     )
 
 
 def get_decode_index_page_group(
-    query: jax.Array,
-    pool: jax.Array,
+    query: _DmaArray,
+    pool: _DmaArray,
     *,
     logical_pages: int,
     pages_per_query: int,
     ratio: int,
     topk: int,
+    keys_per_base_page: int,
 ) -> int:
-    """Coalesce measured sidecars only when every stored row is a logical key.
-
-    Physical padding or ring storage must not become addressable key columns.
-    The caller owns the per-query schedule contract and performs the reshape
-    inside JAX, never as a Torch view that could materialize the entire pool.
-    """
+    """Coalesce only pages containing logical keys, excluding padding and state."""
     if (
         logical_pages <= 1
+        or keys_per_base_page <= 0
+        or query.ndim != 3
+        or pool.ndim != 5
         or query.dtype != jnp.bfloat16
         or pool.dtype != jnp.bfloat16
         or pool.shape[-1] != query.shape[-1]
     ):
         return 1
-    rows = logical_pages * (128 // ratio)
-    if math.prod(pool.shape[1:]) != rows * query.shape[-1]:
-        return 1
-    key = (*query.shape, rows, pages_per_query, ratio, topk)
-    if key not in _DECODE_INDEX_PAGES:
-        return 1
-    hardware = _hardware()
-    if hardware is None or hardware.chip_version != pltpu.ChipVersion.TPU_7X:
-        return 1
-    return logical_pages
+    rows = logical_pages * keys_per_base_page
+    return logical_pages if math.prod(pool.shape[1:]) == rows * query.shape[-1] else 1
 
 
-def get_decode_index_pages(
-    query: jax.Array,
-    cache: jax.Array,
-    *,
-    pages_per_query: int,
-    ratio: int,
-    topk: int,
-) -> int:
-    """Use measured BF16 decode tiles, preserving other shapes' default."""
+def get_decode_index_pages(query, cache, *, pages_per_query, ratio, topk) -> int | None:
+    """Return a lane-aligned tile, or None if its minimum live buffers cannot fit."""
     page_size = cache.shape[1] * 2
     fallback = max(1, 256 // page_size)
-    if query.dtype != jnp.bfloat16 or cache.dtype != jnp.bfloat16:
+    if (
+        query.ndim != 3
+        or cache.ndim != 4
+        or query.dtype != jnp.bfloat16
+        or cache.dtype != jnp.bfloat16
+        or pages_per_query <= 0
+        or min(query.shape) <= 0
+    ):
         return fallback
-    key = (*query.shape, page_size, pages_per_query, ratio, topk)
-    if key not in _DECODE_INDEX_PAGES:
+    hw = _hardware()
+    if hw is None or min(hw.vmem_bytes, hw.lanes, hw.bf16_rows) <= 0:
         return fallback
-    hardware = _hardware()
-    if hardware is None or hardware.chip_version != pltpu.ChipVersion.TPU_7X:
-        return fallback
-    return _DECODE_INDEX_PAGES[key]
+    page_alignment = hw.lanes // math.gcd(page_size, hw.lanes)
+    pages = max(
+        page_alignment,
+        _align(math.ceil(DECODE_INDEX_TILE_KEYS / page_size), page_alignment),
+    )
+    # Score kernels mask page-table tails; keep a complete lane-aligned key tile.
+    pages = min(pages, _align(pages_per_query, page_alignment))
+    while pages >= page_alignment:
+        keys = pages * page_size
+        # BF16 key/Q operands plus FP32 per-head score and reduction planes.
+        memory = (
+            _vmem((keys, cache.shape[-1]), jnp.bfloat16, hw)
+            + _vmem(query.shape, jnp.bfloat16, hw)
+            + 2 * _vmem((query.shape[1], keys), jnp.float32, hw)
+        )
+        if memory <= hw.vmem_bytes * 0.8:
+            return pages
+        pages = (pages // 2 // page_alignment) * page_alignment
+    return None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -185,7 +188,12 @@ class DmaHardware:
         )
 
 
-def _hardware() -> DmaHardware:
+def _hardware() -> DmaHardware | None:
+    device = jax.sharding.get_abstract_mesh().abstract_device
+    if (device is None and jax.default_backend() != "tpu") or (
+        device is not None and device.platform != "tpu"
+    ):
+        return None
     return DmaHardware.from_tpu_info(pltpu.get_tpu_info())
 
 
@@ -199,6 +207,7 @@ def _vmem(shape: tuple[int, ...], dtype: DTypeLike, hw: DmaHardware) -> int:
         jnp.dtype(jnp.bfloat16): hw.bf16_rows,
         jnp.dtype(jnp.float8_e4m3fn): hw.fp8_rows,
         jnp.dtype(jnp.int32): hw.int32_rows,
+        jnp.dtype(jnp.float32): hw.int32_rows,
     }[dtype]
     return (
         math.prod(shape[:-2])
@@ -327,27 +336,17 @@ def ring_tag_dma_batch(
 def main_kv_dma_batch(
     pool: _DmaArray, rows: _DmaArray, *, hardware: DmaHardware | None
 ) -> int:
-    """Pure row-DMA policy for full prefill tiles and measured decode buckets."""
+    """Bound complete resident row transfers by physical layout and capacity."""
     if (
         not _carrier(pool, hardware)
         or rows.shape[1:] != pool.shape[2:]
         or rows.dtype != pool.dtype
         or len(rows) == 0
-        or (
-            not (rows.shape in _MAIN_DECODE_TILES and rows.dtype == jnp.float8_e4m3fn)
-            and len(rows) % _MAIN_TILE
-        )
+        or (len(rows) >= _MAIN_TILE and len(rows) % _MAIN_TILE)
         or pool.shape[1] % _MAIN_TILE
     ):
         return 1
     assert hardware is not None
-    if (
-        get_main_kv_tile(rows) < _MAIN_TILE
-        and hardware.chip_version != pltpu.ChipVersion.TPU_7X
-    ):
-        return 1
-    # A resident decode bucket owns one semaphore per source row. The older
-    # prefill writer retains its measured packet-size candidates.
     batches = (len(rows),) if get_main_kv_tile(rows) < _MAIN_TILE else _DMA_BATCHES
     for batch in batches:
         memory = main_kv_dma_memory(pool, rows, batch, hardware)
@@ -363,13 +362,9 @@ def get_main_kv_dma_batch(pool: jax.Array, rows: jax.Array) -> int:
     return main_kv_dma_batch(pool, rows, hardware=_hardware())
 
 
-def get_main_kv_tile(rows: jax.Array) -> int:
+def get_main_kv_tile(rows: _DmaArray) -> int:
     """Keep the complete small decode bucket in one resident source tile."""
-    return (
-        len(rows)
-        if rows.shape in _MAIN_DECODE_TILES and rows.dtype == jnp.float8_e4m3fn
-        else _MAIN_TILE
-    )
+    return min(len(rows), _MAIN_TILE)
 
 
 def get_ring_tag_dma_batch(
@@ -384,23 +379,42 @@ def get_ring_tag_dma_batch(
     )
 
 
-def use_query_prepare(qgate, norm, trig, rotary_dim):
-    """Only the measured TPU7x decode query shape uses the fused preparation."""
+def use_query_prepare(
+    qgate: _DmaArray, norm: _DmaArray, trig: _DmaArray, rotary_dim: int
+) -> bool:
+    """Fuse norm/RoPE when the complete resident vector planes fit."""
     if (
-        qgate.shape != (16, 24, 512)
+        qgate.ndim != 3
+        or min(qgate.shape) <= 0
+        or qgate.shape[-1] % 2
         or qgate.dtype != jnp.bfloat16
-        or norm.shape != (256,)
+        or norm.shape != (qgate.shape[-1] // 2,)
         or norm.dtype != jnp.bfloat16
-        or trig.shape[-1] != 128
+        or trig.ndim != 2
+        or trig.shape[0] <= 0
         or trig.dtype != jnp.bfloat16
-        or rotary_dim != 64
+        or rotary_dim <= 0
+        or rotary_dim % 2
+        or rotary_dim > min(norm.shape[0], trig.shape[1])
     ):
         return False
     hw = _hardware()
-    return hw is not None and hw.chip_version == pltpu.ChipVersion.TPU_7X
+    if hw is None or min(hw.vmem_bytes, hw.lanes, hw.bf16_rows) <= 0:
+        return False
+    count, heads, _ = qgate.shape
+    width = norm.shape[0]
+    if width % hw.lanes:
+        return False
+    memory = (
+        _vmem(qgate.shape, qgate.dtype, hw)
+        + _vmem((1, width), norm.dtype, hw)
+        + _vmem((count, trig.shape[1]), trig.dtype, hw)
+        + _vmem((count, heads, width), jnp.bfloat16, hw)
+        + 4 * _vmem((count, heads, width), jnp.float32, hw)
+    )
+    return memory <= hw.vmem_bytes * 0.8
 
 
-_COMPRESSED_PREPARATION_SHAPES = {((16, 128), 4, 64)}
 COMPLETED_ROPE_DMA_ROWS = 8
 
 _PREFILL_INDEX_PREPARATION_SHAPES = {((8192, 128), 4, 8)}
@@ -419,38 +433,72 @@ def use_prefill_index_preparation(
     if jax.default_backend() != "tpu":
         return False
     hw = _hardware()
-    return hw.chip_version == pltpu.ChipVersion.TPU_7X
-
-
-def use_compressed_preparation(raw, trig, ratio, rotary_dim):
-    """Further preparation fusion only for measured state-fusion geometry."""
-    return (
-        (raw.shape, ratio, rotary_dim) in _COMPRESSED_PREPARATION_SHAPES
-        and raw.dtype == jnp.bfloat16
-        and trig.ndim == 2
-        and trig.shape[1] == 128
-        and trig.dtype == jnp.bfloat16
-    )
-
-
-def use_completed_rope_dma(trig: jax.Array, positions: jax.Array) -> bool:
-    if (
-        trig.ndim != 2
-        or trig.shape[0] <= 0
-        or trig.shape[0] % COMPLETED_ROPE_DMA_ROWS
-        or trig.shape[1] != 128
-        or positions.shape != (16,)
-        or trig.dtype != jnp.bfloat16
-        or positions.dtype != jnp.int32
-    ):
-        return False
-    hw = _hardware()
     return hw is not None and hw.chip_version == pltpu.ChipVersion.TPU_7X
 
 
-# Five contiguous 6 MiB tiles overlap output-weight reads with sparse decode.
-# Measured on TPU7x for M=16, K=6144, N=2560; other weights retain the linear path.
+def use_compressed_preparation(
+    raw: _DmaArray, trig: _DmaArray, ratio: int, rotary_dim: int
+) -> bool:
+    """Defer RoPE only when the indexed pair writer's resident planes fit."""
+    if (
+        raw.ndim != 2
+        or min(raw.shape) <= 0
+        or raw.dtype != jnp.bfloat16
+        or ratio <= 0
+        or trig.ndim != 2
+        or trig.shape[0] <= 0
+        or trig.dtype != jnp.bfloat16
+        or rotary_dim <= 0
+        or rotary_dim % 2
+        or rotary_dim > min(raw.shape[1], trig.shape[1])
+    ):
+        return False
+    hw = _hardware()
+    if hw is None or raw.shape[1] % hw.lanes:
+        return False
+    memory = (
+        4 * _vmem(raw.shape, jnp.bfloat16, hw)
+        + 4 * _vmem(raw.shape, jnp.float32, hw)
+        + _vmem(
+            (raw.shape[0], COMPLETED_ROPE_DMA_ROWS, trig.shape[1]), jnp.bfloat16, hw
+        )
+    )
+    return memory <= hw.vmem_bytes * 0.8
+
+
+def use_completed_rope_dma(trig: jax.Array, positions: jax.Array) -> bool:
+    hw = _hardware()
+    if (
+        hw is None
+        or trig.ndim != 2
+        or trig.shape[0] <= 0
+        or trig.shape[0] % COMPLETED_ROPE_DMA_ROWS
+        or positions.ndim != 1
+        or len(positions) <= 0
+        or trig.dtype != jnp.bfloat16
+        or positions.dtype != jnp.int32
+        or trig.shape[1] % hw.lanes
+    ):
+        return False
+    return (
+        _vmem((len(positions), COMPLETED_ROPE_DMA_ROWS, trig.shape[1]), trig.dtype, hw)
+        <= hw.vmem_bytes * 0.8
+    )
+
+
+# Output-column DMA tile; the final tile is zero-padded during weight packing.
+OUTPUT_PROJECTION_TILE_COLUMNS = 512
+
+
 def output_projection_tile(weight_shape: tuple[int, ...]) -> int | None:
-    if len(weight_shape) != 2:
+    if len(weight_shape) != 2 or min(weight_shape) <= 0:
         return None
-    return {(6144, 2560): 512}.get((weight_shape[0], weight_shape[1]))
+    hw = _hardware()
+    if hw is None:
+        return None
+    tile = OUTPUT_PROJECTION_TILE_COLUMNS
+    tiles = math.ceil(weight_shape[1] / tile)
+    # Necessary resident-weight lower bound before making a permanent HBM copy.
+    # The launch planner additionally includes attention, HC and scratch buffers.
+    weight_bytes = _vmem((tiles, weight_shape[0], tile), jnp.bfloat16, hw)
+    return tile if weight_bytes <= hw.vmem_bytes * 0.8 else None

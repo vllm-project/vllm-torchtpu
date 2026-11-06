@@ -40,6 +40,28 @@ The visible RPA pipeline retains input/output slots 3/2 and LAST_TILE scratch
 carry/reset. Sigmoid, explicit BF16 rounding and multiplication precede output
 DMA; integer RNE, zeroing and fences are required arithmetic/ownership boundaries.
 
+## Output projection and preparation
+
+Projected decode derives the BF16 weight tiles, logical output width and HC
+branches from the supplied arrays. The final output-column tile is padded
+internally and sliced back to the logical width. Each dot reduces the complete
+input width with FP32 accumulation and the existing BF16 output rounding.
+
+The planner counts the resident full weight, padded attended/residual/gate/output
+buffers and projection working planes alongside the attention buffers. It tries
+the default pipeline concurrency, then smaller powers of two when necessary to
+fit that combined budget. If fusion cannot fit, QSA attention followed by the
+separate projection and HC operations remains available. Packing also checks the
+resident-weight lower bound before creating a persistent tiled copy. The fused
+HC entry requires an unsharded projection input because it has no cross-shard
+sum before adding the residual.
+
+Decode preparation derives head grouping and rotary extents from the arrays;
+state storage retains its eight-row ring/tag padding ABI. Index scoring groups
+whole pages into lane-aligned key tiles, with a named target key count used only
+for tuning. A minimum aligned tile that cannot fit VMEM is rejected explicitly.
+These resource checks do not establish a speedup for every admitted geometry.
+
 ## Checks and benchmark
 
 ```bash

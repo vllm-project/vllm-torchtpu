@@ -41,9 +41,10 @@ def prepare_query_values(
             x[..., :half].astype(jnp.float32),
             x[..., half:rotary_dim].astype(jnp.float32),
         )
-        output[...] = jnp.concatenate(
-            (bf16(a * c - b * s), bf16(b * c + a * s), x[..., rotary_dim:]), axis=-1
-        )
+        parts = (bf16(a * c - b * s), bf16(b * c + a * s))
+        if rotary_dim < width:
+            parts += (x[..., rotary_dim:],)
+        output[...] = jnp.concatenate(parts, axis=-1)
 
     return pl.pallas_call(
         kernel,

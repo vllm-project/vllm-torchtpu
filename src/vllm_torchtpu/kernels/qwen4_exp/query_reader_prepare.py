@@ -32,13 +32,15 @@ def prepare_query_reader_layout(
     norm_eps: float,
     rotary_dim: int,
     rope_axes: tuple[int, ...] | None = None,
+    *,
+    kv_heads: int,
 ) -> jax.Array:
     count, heads, doubled = qgate.shape
     width = doubled // 2
     selected = select_rope_rows(positions, trig, rotary_dim, rope_axes)
-    shape = (2, count, heads // 2, 1, width)
-    kv_heads = 2
-    assert (count, heads, width) == (16, 24, 256)
+    if kv_heads <= 0 or heads % kv_heads:
+        raise ValueError("Query heads must be divisible by positive KV heads")
+    shape = (kv_heads, count, heads // kv_heads, 1, width)
     group = heads // kv_heads
     half = rotary_dim // 2
 
@@ -50,9 +52,10 @@ def prepare_query_reader_layout(
             x[..., :half].astype(jnp.float32),
             x[..., half:rotary_dim].astype(jnp.float32),
         )
-        value = jnp.concatenate(
-            (bf16(a * c - b * s), bf16(b * c + a * s), x[..., rotary_dim:]), axis=-1
-        )
+        parts = (bf16(a * c - b * s), bf16(b * c + a * s))
+        if rotary_dim < width:
+            parts += (x[..., rotary_dim:],)
+        value = jnp.concatenate(parts, axis=-1)
         output[...] = (
             jnp.concatenate(
                 [value[:, h * group : (h + 1) * group] for h in range(kv_heads)],

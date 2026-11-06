@@ -280,48 +280,26 @@ def _specs(fp8=False):
     ]
 
 
-@pytest.mark.parametrize(
-    "case", ["measured", "bf16", "batch", "heads", "page", "groups", "chip"]
-)
-def test_measured_policy_is_narrow_and_explicit_override_wins(case, monkeypatch):
+@pytest.mark.parametrize("chip", [pltpu.ChipVersion.TPU_V5P, pltpu.ChipVersion.TPU_7X])
+@pytest.mark.parametrize("fp8", [False, True])
+def test_default_policy_and_explicit_override_are_shape_independent(
+    chip, fp8, monkeypatch
+):
     from vllm_torchtpu.kernels.sparse_gqa_decode import plan_decode
     from vllm_torchtpu.kernels.sparse_gqa_decode.tuned_block_sizes import (
         DEFAULT_POLICY,
-        default_policy_for,
+        DecodePolicy,
     )
 
-    chip = pltpu.ChipVersion.TPU_V5P if case == "chip" else pltpu.ChipVersion.TPU_7X
     info = pltpu.get_tpu_info_for_chip(chip, 1)
     monkeypatch.setattr(pltpu, "get_tpu_info", lambda: info)
-    batch = 8 if case == "batch" else 16
-    heads = 12 if case == "heads" else 24
-    page = 128 if case == "page" else 1664
-    groups = 256 if case == "groups" else 512
-    fp8 = case != "bf16"
-    q = jax.ShapeDtypeStruct((batch, heads, 256), jnp.bfloat16)
-    cache = jax.ShapeDtypeStruct(
-        (41, page, 1 if fp8 else 2, 4 if fp8 else 2, 256),
-        jnp.float8_e4m3fn if fp8 else jnp.bfloat16,
-    )
-    selected = default_policy_for(
-        q, cache, kv_heads=2, ratio=4, groups=groups, info=info
-    )
-    assert selected.pipeline_lanes == (4 if case == "measured" else 8)
-    if case == "measured":
-        args = (
-            q,
-            q,
-            jax.ShapeDtypeStruct((batch, groups), jnp.int32),
-            jax.ShapeDtypeStruct((batch,), jnp.int32),
-            jax.ShapeDtypeStruct((batch, 41), jnp.int32),
-            cache,
-        )
-        opts = dict(kv_heads=2, ratio=4, k_scale=0.375, v_scale=2.5)
-        auto = plan_decode(*args, **opts)
-        explicit = plan_decode(*args, policy=DEFAULT_POLICY, **opts)
-        assert auto is not None and explicit is not None
-        assert auto.policy.pipeline_lanes == 4
-        assert explicit.policy.pipeline_lanes == 8
+    args = _specs(fp8)
+    opts = dict(kv_heads=2, ratio=4, k_scale=0.375, v_scale=2.5)
+    auto = plan_decode(*args, **opts)
+    explicit = plan_decode(*args, policy=DecodePolicy(pipeline_lanes=4), **opts)
+    assert auto is not None and explicit is not None
+    assert auto.policy == DEFAULT_POLICY
+    assert explicit.policy.pipeline_lanes == 4
 
 
 @pytest.mark.parametrize("fp8", [False, True])
@@ -647,8 +625,6 @@ def test_projected_decode_scratch_does_not_scale_with_cache():
     """A read-only pool must not become an unused full-size Pallas output."""
     from vllm_torchtpu.kernels.sparse_gqa_decode.projection import projected_attention
 
-    if pltpu.get_tpu_info().chip_version != pltpu.ChipVersion.TPU_7X:
-        pytest.skip("Measured output projection requires TPU7x")
     args = _case(16, 2051, 1664, True)
     cache_before = np.asarray(args[5]).view(np.uint8).copy()
     rng = np.random.default_rng(5173)

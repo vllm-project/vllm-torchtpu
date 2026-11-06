@@ -17,6 +17,20 @@ import jax
 import jax.numpy as jnp
 
 
+def query_offsets(batch: int, cached_prefix: jax.Array | None = None) -> jax.Array:
+    """Size unit-stride query offsets independently of request segmentation.
+
+    The immutable zero-origin prefix is a cache, so its capacity may differ
+    from the current launch's query count.
+    """
+    if cached_prefix is not None:
+        if cached_prefix.ndim != 1 or cached_prefix.dtype != jnp.int32:
+            raise ValueError("Cached query offsets must be an int32 vector")
+        if len(cached_prefix) >= batch + 1:
+            return cached_prefix[: batch + 1]
+    return jnp.arange(batch + 1, dtype=jnp.int32)
+
+
 def planning_query(query: jax.Array, prepared: bool) -> jax.Array:
     """Plan BF16-valued queries held in an FP32 reader layout.
 

@@ -313,6 +313,7 @@ def write_compressed(
     trig_rows=None,
     trig_cache=None,
     positions=None,
+    rotary_dim: int | None = None,
 ):
     """One writer per BF16 pair, preserving the other half of partial pairs.
 
@@ -343,6 +344,8 @@ def write_compressed(
     )
     mask = (local >= starts[req, None]) & (local < starts[req + 1, None])
     if batch_pairs and trig_cache is not None:
+        if rotary_dim is None:
+            raise ValueError("Rotary dimensions are required for deferred pair writes")
         from .compressed_prepare_dma import write_prepared_pairs_dma
 
         return write_prepared_pairs_dma(
@@ -354,13 +357,14 @@ def write_compressed(
             local=jnp.clip(local, 0, len(keys) - 1),
             trig_cache=trig_cache,
             positions=positions,
+            rotary_dim=rotary_dim,
         )
     if batch_pairs and trig_rows is not None:
         from vllm_torchtpu.kernels.qwen4_exp.compressed_prepare import (
             write_prepared_pairs,
         )
 
-        assert len(keys) == 16 and keys.shape[-1] == width == 128
+        assert keys.shape[-1] == width
         return write_prepared_pairs(
             pool,
             keys,
@@ -369,6 +373,7 @@ def write_compressed(
             mask,
             local=jnp.clip(local, 0, len(keys) - 1),
             trig_rows=trig_rows,
+            rotary_dim=rotary_dim,
         )
 
     if (
@@ -580,6 +585,7 @@ def select_blocks(
             query,
             pool,
             logical_pages=logical_pages,
+            keys_per_base_page=rows,
             pages_per_query=table.shape[1],
             ratio=ratio,
             topk=block_topk,
@@ -793,7 +799,11 @@ def compact_pooled_qsa_step(
     # Retain the write dependency across the two owners.
     main_pool, index_pool = jax.lax.optimization_barrier((main_pool, index_pool))
     fused_state = use_decode_state_fusion(
-        raw, index_pool, requests=len(context), ratio=compress_ratio
+        raw,
+        index_pool,
+        requests=len(context),
+        ratio=compress_ratio,
+        position_axes=positions.shape[0] if positions.ndim == 2 else 1,
     )
     pending_state = None
     trig_rows = None
@@ -866,6 +876,7 @@ def compact_pooled_qsa_step(
         trig_rows=trig_rows,
         trig_cache=trig if compressed_positions is not None else None,
         positions=compressed_positions,
+        rotary_dim=rotary_dim,
     )
     if pending_state is not None:
         ring, tags = pending_state

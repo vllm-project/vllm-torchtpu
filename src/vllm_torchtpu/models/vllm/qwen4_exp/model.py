@@ -341,7 +341,7 @@ class Qwen4ExpBackbone(nn.Module):
     def __init__(self, cfg):
         super().__init__()
         self.prefix = "model"
-        # Immutable prefix for the measured 16-token decode bucket.
+        # Shared unit-stride prefix cache; launch adapters size its local view.
         self.register_buffer(
             "decode_cu", torch.arange(17, dtype=torch.int32), persistent=False
         )

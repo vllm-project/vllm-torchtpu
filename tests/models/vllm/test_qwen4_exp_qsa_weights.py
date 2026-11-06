@@ -23,6 +23,21 @@ from vllm_torchtpu.models.vllm.qwen4_exp.qsa import Qwen4ExpQSA
 
 
 @pytest.fixture(autouse=True)
+def projection_hardware(monkeypatch):
+    from jax.experimental.pallas import tpu as pltpu
+
+    info = pltpu.get_tpu_info_for_chip(pltpu.ChipVersion.TPU_7X, 1)
+    monkeypatch.setattr(pltpu, "get_tpu_info", lambda: info)
+    from vllm_torchtpu.kernels.qwen4_exp import tuned_block_sizes
+
+    monkeypatch.setattr(
+        tuned_block_sizes,
+        "_hardware",
+        lambda: tuned_block_sizes.DmaHardware.from_tpu_info(info),
+    )
+
+
+@pytest.fixture(autouse=True)
 def cpu_vllm_config_context():
     from vllm.config import DeviceConfig, VllmConfig, set_current_vllm_config
     from vllm.v1.attention.backends.utils import resolve_kv_cache_layout
@@ -228,13 +243,13 @@ def test_checkpoint_weights_finalize_and_reject_bad_payloads():
 @pytest.mark.parametrize(
     "cache_dtype,budget,tp,block_size,allocate",
     [
-        ("auto", 2048, 1, 1664, False),
-        ("bfloat16", 2048, 1, 1664, False),
+        ("auto", 2048, 1, 1664, True),
+        ("bfloat16", 2048, 1, 1664, True),
         ("fp8", 2048, 1, 1664, True),
-        ("fp8", 2048, 1, 3328, False),
-        ("fp8", 2048, 1, 128, False),
-        ("fp8", 2048, 1, None, False),
-        ("fp8_e4m3", 1024, 1, 1664, False),
+        ("fp8", 2048, 1, 3328, True),
+        ("fp8", 2048, 1, 128, True),
+        ("fp8", 2048, 1, None, True),
+        ("fp8_e4m3", 1024, 1, 1664, True),
         ("fp8", 2048, 2, 1664, False),
     ],
 )
@@ -292,8 +307,8 @@ def test_output_weight_storage_only_for_supported_cache_and_projection(
         layer.finalize_weights(block_size=block_size)
         assert layer.output_weight_tiles.data_ptr() == tiles.data_ptr()
         layer.finalize_weights(block_size=3328)
-        assert layer.output_weight_tiles is None
-        assert layer._projected_op is None
+        assert layer.output_weight_tiles.data_ptr() == tiles.data_ptr()
+        assert layer._projected_op is not None
     else:
         assert layer.output_weight_tiles is None
         assert layer._projected_op is None
@@ -316,3 +331,47 @@ def test_deprecated_shared_scale_is_rejected_without_partial_update(name):
         == layer._v_scale_float
         == 1.0
     )
+
+
+@torch.inference_mode()
+def test_output_weight_tiles_preserve_nonwhitelist_width_and_padding():
+    config = small_config(
+        hidden_size=193,
+        num_attention_heads=6,
+        num_key_value_heads=2,
+        head_dim=128,
+        indexer_n_heads=3,
+        indexer_head_dim=128,
+        rope_parameters={"rope_type": "default", "rope_theta": 10000000},
+    )
+    layer = Qwen4ExpQSA(
+        config=config,
+        tp_rank=0,
+        tp_size=1,
+        max_model_len=16,
+        cache_dtype="bfloat16",
+        device="cpu",
+    )
+    matrix = ((torch.arange(193 * 768).reshape(193, 768) % 113 - 56) / 128).to(
+        torch.bfloat16
+    )
+    weights = {
+        "q_proj.weight": torch.zeros(1536, 193, dtype=torch.bfloat16),
+        "k_proj.weight": torch.zeros(256, 193, dtype=torch.bfloat16),
+        "v_proj.weight": torch.zeros(256, 193, dtype=torch.bfloat16),
+        "indexer.index_qk_proj.weight": torch.zeros(512, 193, dtype=torch.bfloat16),
+        "o_proj.weight": matrix,
+        "q_norm.weight": torch.zeros(128, dtype=torch.bfloat16),
+        "k_norm.weight": torch.zeros(128, dtype=torch.bfloat16),
+        "indexer.q_layernorm.weight": torch.zeros(128, dtype=torch.bfloat16),
+        "indexer.k_layernorm.weight": torch.zeros(128, dtype=torch.bfloat16),
+    }
+    layer.load_weights(weights.items())
+    layer.finalize_weights(block_size=132)
+    tiles = layer.output_weight_tiles
+    assert tiles is not None
+    restored = tiles.permute(1, 0, 2).reshape(768, -1)
+    torch.testing.assert_close(restored[:, :193], matrix.T, rtol=0, atol=0)
+    assert torch.count_nonzero(restored[:, 193:]) == 0
+    layer.finalize_weights(block_size=384)
+    assert layer.output_weight_tiles.data_ptr() == tiles.data_ptr()

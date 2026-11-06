@@ -456,10 +456,10 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
             output_projection_tile,
         )
 
-        weight = self.o_proj.weight
+        weight = cast(torch.Tensor, self.o_proj.weight)
         tile = (
             output_projection_tile(tuple(weight.shape))
-            if self._supports_projected_output(block_size)
+            if self._supports_projected_output()
             else None
         )
         if tile is None:
@@ -467,8 +467,8 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
             self._projected_op = None
         if tile is not None and self.output_weight_tiles is None:
             self.output_weight_tiles = (
-                weight.detach()
-                .reshape(weight.shape[0], weight.shape[1] // tile, tile)
+                torch.nn.functional.pad(weight.detach(), (0, -weight.shape[1] % tile))
+                .reshape(weight.shape[0], math.ceil(weight.shape[1] / tile), tile)
                 .permute(1, 0, 2)
                 .contiguous()
             )
@@ -487,28 +487,16 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
                 rotary_dim=int(self.head_dim * self.config.partial_rotary_factor),
             )
 
-    def _supports_projected_output(self, block_size: int | None) -> bool:
-        from vllm_torchtpu.kernels.sparse_gqa_decode.tuned_block_sizes import (
-            supports_output_projection_layout,
-        )
-
-        return (
-            self.tp_size == 1
-            and self.fp8_kv
-            and supports_output_projection_layout(
-                (self.num_heads, self.head_dim),
-                kv_heads=self.num_kv_heads,
-                ratio=self.compress_ratio,
-                groups=self.token_topk // self.compress_ratio,
-                page_size=block_size,
-            )
-        )
+    def _supports_projected_output(self) -> bool:
+        # HC must follow the row-parallel projection's cross-shard reduction.
+        # The fused entry has no collective and therefore requires unsharded K.
+        return self.tp_size == 1 and self.o_proj.weight.dtype == torch.bfloat16
 
     def can_prefetch_output(self, hidden: torch.Tensor) -> bool:
-        """Use a stable Torch ABI; select the measured shape inside JAX."""
+        """Use a stable Torch ABI; plan fusion from actual arrays inside JAX."""
         return (
             len(self.cache_owners) == 2
-            and self._supports_projected_output(self.cache_owners[0].shape[1])
+            and self._supports_projected_output()
             and self.output_weight_tiles is not None
             and hidden.device.type == "tpu"
             and hidden.ndim == 2

@@ -32,6 +32,7 @@ def write_prepared_pairs_dma(
     local: jax.Array,
     trig_cache: jax.Array,
     positions: jax.Array,
+    rotary_dim: int,
 ) -> jax.Array:
     """Deduplicate rotary-block DMA and rotate the token batch before pair selection.
 
@@ -42,6 +43,13 @@ def write_prepared_pairs_dma(
     packing = 4 if pool.dtype == jnp.float8_e4m3fn else 2
     width = pool.shape[-1]
     view = pool.reshape(-1, packing, width)
+    if (
+        rotary_dim <= 0
+        or rotary_dim % 2
+        or rotary_dim > min(width, trig_cache.shape[-1])
+    ):
+        raise ValueError("Rotating pair writes require compatible rotary dimensions")
+    half = rotary_dim // 2
     count = len(values)
     angle_rows = COMPLETED_ROPE_DMA_ROWS
     conflict = (
@@ -124,8 +132,8 @@ def write_prepared_pairs_dma(
             source = values_ref[...]
             if rotating:
                 a, b = (
-                    source[:, :32].astype(jnp.float32),
-                    source[:, 32:64].astype(jnp.float32),
+                    source[:, :half].astype(jnp.float32),
+                    source[:, half:rotary_dim].astype(jnp.float32),
                 )
                 for t in range(count):
 
@@ -158,15 +166,11 @@ def write_prepared_pairs_dma(
                         )
                     )
                 angles = jnp.stack(selected_angles).astype(jnp.float32)
-                c, sn = angles[:, :32], angles[:, 32:64]
-                source = jnp.concatenate(
-                    (
-                        bf16(a * c - bf16(b * sn)),
-                        bf16(a * sn + bf16(b * c)),
-                        source[:, 64:],
-                    ),
-                    axis=1,
-                )
+                c, sn = angles[:, :half], angles[:, half:rotary_dim]
+                parts = (bf16(a * c - bf16(b * sn)), bf16(a * sn + bf16(b * c)))
+                if rotary_dim < width:
+                    parts += (source[:, rotary_dim:],)
+                source = jnp.concatenate(parts, axis=1)
             source_bits = (
                 jax.lax.bitcast_convert_type(source, jnp.uint16).astype(jnp.int32)
                 if indexed
@@ -259,7 +263,7 @@ def write_prepared_pairs_dma(
             scratch_shapes=[
                 pltpu.VMEM((count, packing, width), pool.dtype),
                 pltpu.SemaphoreType.DMA((count,)),
-                pltpu.VMEM((count, angle_rows, width), trig_cache.dtype),
+                pltpu.VMEM((count, angle_rows, trig_cache.shape[1]), trig_cache.dtype),
                 pltpu.SemaphoreType.DMA((count,)),
             ],
         ),

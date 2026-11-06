@@ -44,7 +44,7 @@ def update_decode_state(
 
     Keep each request's state in VMEM across its query window. Only completed
     keys are observable by the compressed-cache writer. ID0 remains immutable.
-    The caller gates the measured small-batch BF16/128-lane ABI.
+    The caller budgets the resident ring, tags and raw/output planes.
     """
     count, width = raw.shape
     ring_rows = (ratio + 7) // 8 * 8

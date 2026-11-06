@@ -11,17 +11,16 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Explicit prepared-input boundary for the validated B16 QSA decode path."""
+"""Prepared-input boundary for tensor-derived QSA decode layouts."""
 
 import jax
 import jax.numpy as jnp
-from jax.experimental.pallas import tpu as pltpu
 
 from .preparation_candidates import norm_with_multiplier, prepare_index_query
 from .qsa import main_rope
 from .query_reader_prepare import prepare_query_reader_layout
 from .rope import select_rope_rows
-from .tuned_block_sizes import _hardware
+from .tuned_block_sizes import _hardware, _vmem, use_query_prepare
 
 
 def use_retained_preparation(
@@ -37,26 +36,46 @@ def use_retained_preparation(
     rotary_dim: int,
 ) -> bool:
     if (
-        multiplier is None
-        or multiplier.shape != (256,)
+        nq.ndim != 1
+        or nk.shape != nq.shape
+        or niq.ndim != 1
+        or min(nq.shape) <= 0
+        or min(niq.shape) <= 0
+        or multiplier is None
+        or multiplier.shape != nq.shape
         or multiplier.dtype != jnp.float32
-        or qgate.shape != (16, 12288)
-        or key.shape != (16, 512)
-        or index_qk.shape != (16, 640)
-        or nq.shape != (256,)
-        or nk.shape != (256,)
-        or niq.shape != (128,)
+        or qgate.ndim != 2
+        or key.ndim != 2
+        or index_qk.ndim != 2
+        or min(qgate.shape) <= 0
+        or min(key.shape) <= 0
+        or key.shape[0] != len(qgate)
+        or index_qk.shape[0] != len(qgate)
+        or qgate.shape[1] % (2 * len(nq))
+        or key.shape[1] % len(nq)
+        or index_qk.shape[1] % len(niq)
+        or index_qk.shape[1] <= len(niq)
         or any(
             x.dtype != jnp.bfloat16 for x in (qgate, key, index_qk, nq, nk, niq, trig)
         )
-        or trig.ndim != 2
-        or trig.shape[0] == 0
-        or trig.shape[1] != 128
-        or rotary_dim != 64
+        or rotary_dim > len(niq)
     ):
         return False
-    hardware = _hardware()
-    return hardware is not None and hardware.chip_version == pltpu.ChipVersion.TPU_7X
+    heads = qgate.shape[1] // (2 * len(nq))
+    kv_heads = key.shape[1] // len(nq)
+    if heads % kv_heads:
+        return False
+    hw = _hardware()
+    if hw is None:
+        return False
+    shaped = jax.ShapeDtypeStruct((len(qgate), heads, 2 * len(nq)), qgate.dtype)
+    if not use_query_prepare(shaped, nq, trig, rotary_dim):
+        return False
+    query_memory = _vmem(
+        (kv_heads, len(qgate), heads // kv_heads, 1, len(nq)), jnp.float32, hw
+    )
+    index_memory = 6 * _vmem(index_qk.shape, jnp.float32, hw)
+    return query_memory + index_memory <= hw.vmem_bytes * 0.8
 
 
 def produce_prepared(
@@ -78,7 +97,14 @@ def produce_prepared(
     key = key.reshape(len(key), -1, width)
     value = value.reshape(len(value), -1, width)
     q = prepare_query_reader_layout(
-        qgate, nq, positions, trig, norm_eps, rotary_dim, rope_axes
+        qgate,
+        nq,
+        positions,
+        trig,
+        norm_eps,
+        rotary_dim,
+        rope_axes,
+        kv_heads=key.shape[1],
     )
     key = main_rope(
         norm_with_multiplier(key, multiplier, norm_eps),
@@ -88,5 +114,5 @@ def produce_prepared(
         rope_axes,
     )
     angles = select_rope_rows(positions, trig, rotary_dim, rope_axes)
-    iq = prepare_index_query(index_qk, niq, angles, norm_eps)
+    iq = prepare_index_query(index_qk, niq, angles, norm_eps, rotary_dim)
     return q, key, value, qgate[..., width:], iq, index_qk[:, -niq.shape[0] :]

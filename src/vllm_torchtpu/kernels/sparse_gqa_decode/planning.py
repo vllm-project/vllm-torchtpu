@@ -125,7 +125,16 @@ def resource_usage(cfgs: configs.RpaConfigs) -> ResourceUsage:
         + cfgs.bkv_sz * heads * cfgs.serve.dtype_out.itemsize
         + heads * dim * cfgs.serve.dtype_q.itemsize
     )
-    gate = n * heads * dim * jnp.dtype(jnp.bfloat16).itemsize
+    info = pltpu.get_tpu_info()
+    gate_rows = info.get_sublane_tiling(jnp.bfloat16)
+    gate = (
+        n
+        * pl.cdiv(heads, gate_rows)
+        * gate_rows
+        * pl.cdiv(dim, info.num_lanes)
+        * info.num_lanes
+        * jnp.dtype(jnp.bfloat16).itemsize
+    )
     # Keep the existing RPA planner's 20% headroom for compiler layout/temps.
     return ResourceUsage(
         schedule_bytes=schedule_bytes,

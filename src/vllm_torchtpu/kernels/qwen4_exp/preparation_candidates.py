@@ -40,23 +40,37 @@ def prepare_index_query(
     norm: jax.Array,
     angles: jax.Array,
     norm_eps: float,
+    rotary_dim: int,
 ) -> jax.Array:
     """Preserve index RoPE rounding while producing its complete reader input."""
     count, total = index_qk.shape
     width = norm.shape[0]
     heads = total // width - 1
-    assert (count, heads, width, angles.shape) == (16, 4, 128, (16, 128))
+    if (
+        total % width
+        or heads <= 0
+        or rotary_dim <= 0
+        or rotary_dim % 2
+        or rotary_dim > min(width, angles.shape[-1])
+    ):
+        raise ValueError(
+            "Index query projection and rotary dimensions are incompatible"
+        )
+    half = rotary_dim // 2
 
     def kernel(source, weight, trig, output):
         x = source[:, : heads * width].reshape(count, heads, width)
         x = gemma_norm(x, weight[...], norm_eps)
         t = trig[...].astype(jnp.float32)
-        a, b = x[..., :32].astype(jnp.float32), x[..., 32:64].astype(jnp.float32)
-        c, s = t[:, None, :32], t[:, None, 32:64]
-        output[...] = jnp.concatenate(
-            (bf16(a * c - bf16(b * s)), bf16(a * s + bf16(b * c)), x[..., 64:]),
-            axis=-1,
+        a, b = (
+            x[..., :half].astype(jnp.float32),
+            x[..., half:rotary_dim].astype(jnp.float32),
         )
+        c, s = t[:, None, :half], t[:, None, half:rotary_dim]
+        parts = (bf16(a * c - bf16(b * s)), bf16(a * s + bf16(b * c)))
+        if rotary_dim < width:
+            parts += (x[..., rotary_dim:],)
+        output[...] = jnp.concatenate(parts, axis=-1)
 
     return pl.pallas_call(
         kernel,

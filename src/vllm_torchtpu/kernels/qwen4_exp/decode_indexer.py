@@ -216,6 +216,13 @@ def select_index_blocks(
                 if key_packing != 2
                 else cache
             )
+            tile_pages = get_decode_index_pages(
+                q, cache, pages_per_query=table.shape[1], ratio=ratio, topk=block_topk
+            )
+            if tile_pages is None:
+                raise ValueError(
+                    "Minimum lane-aligned decode index tile exceeds VMEM budget"
+                )
             return streamindex_topk(
                 q,
                 jnp.full(q.shape[:2], scale, jnp.float32),
@@ -226,13 +233,7 @@ def select_index_blocks(
                 jnp.full((3,), size, jnp.int32),
                 k=block_topk,
                 compression_ratio=ratio,
-                num_kv_pages_per_block=get_decode_index_pages(
-                    q,
-                    cache,
-                    pages_per_query=table.shape[1],
-                    ratio=ratio,
-                    topk=block_topk,
-                ),
+                num_kv_pages_per_block=tile_pages,
                 num_queries_per_block=1,
                 decode_req_batch_size=8 if size >= 8 else 4,
                 enable_early_exit=True,

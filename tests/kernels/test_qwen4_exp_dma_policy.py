@@ -23,6 +23,16 @@ from jax.experimental.pallas import tpu as pltpu
 from vllm_torchtpu.kernels.qwen4_exp import tuned_block_sizes as policy
 
 
+@pytest.fixture(autouse=True)
+def hardware_descriptor(monkeypatch):
+    from vllm_torchtpu.kernels.qwen4_exp import tuned_block_sizes
+
+    def descriptor():
+        return tuned_block_sizes.DmaHardware.from_tpu_info(pltpu.get_tpu_info())
+
+    monkeypatch.setattr(tuned_block_sizes, "_hardware", descriptor)
+
+
 def hardware():
     return policy.DmaHardware.from_tpu_info(
         pltpu.get_tpu_info_for_chip(pltpu.ChipVersion.TPU_7X, 1)
@@ -43,7 +53,7 @@ def hardware():
         "chip",
     ],
 )
-def test_fused_state_keeps_unmeasured_geometry_on_existing_path(case, monkeypatch):
+def test_fused_state_derives_layout_and_capacity(case, monkeypatch):
     chip = pltpu.ChipVersion.TPU_V5P if case == "chip" else pltpu.ChipVersion.TPU_7X
     monkeypatch.setattr(
         policy.pltpu, "get_tpu_info", lambda: pltpu.get_tpu_info_for_chip(chip, 1)
@@ -57,11 +67,74 @@ def test_fused_state_keeps_unmeasured_geometry_on_existing_path(case, monkeypatc
     raw = jax.ShapeDtypeStruct((tokens, width), jnp.bfloat16)
     assert policy.use_decode_state_fusion(
         raw, pool, requests=requests, ratio=ratio
-    ) == (case in ("decode", "slots32"))
+    ) == (case not in ("fp8", "short", "large", "requests"))
+
+
+@pytest.mark.parametrize(
+    "tokens,requests,width,ratio,expected",
+    [
+        (8192, 16, 128, 4, False),
+        (128, 16, 128, 4, False),
+        (17, 16, 128, 4, False),
+        (16, 16, 128, 4, True),
+        (3, 3, 256, 8, True),
+        (5, 8, 128, 2, True),
+        (33, 64, 128, 4, True),
+    ],
+)
+def test_state_schedule_routes_whole_query_bucket_or_bounded_writer(
+    monkeypatch, tokens, requests, width, ratio, expected
+):
+    from jax.experimental import pallas as pl
+
+    from vllm_torchtpu.kernels.qwen4_exp import compressed_prepare, pooled_qsa
+
+    info = pltpu.get_tpu_info_for_chip(pltpu.ChipVersion.TPU_7X, 1)
+    monkeypatch.setattr(policy.pltpu, "get_tpu_info", lambda: info)
+    arr = jax.ShapeDtypeStruct
+    pool = carrier(208, jnp.bfloat16, width)
+    keys = arr((tokens, width), jnp.bfloat16)
+    fused = policy.use_decode_state_fusion(
+        keys, pool, requests=requests, ratio=ratio, position_axes=3
+    )
+    assert fused == expected
+    routes = []
+
+    def whole_batch(owner, values, *args, **kwargs):
+        assert expected
+        assert values.shape == (tokens, 2, width)
+        routes.append("whole_query_bucket")
+        return owner
+
+    def tiled(kernel, **kwargs):
+        assert not expected
+        assert kwargs["name"] == "qwen4_exp_compressed_kv_page_tiled_scatter"
+        assert kwargs["grid_spec"].in_specs[0].block_shape == (256, width)
+        routes.append("bounded_writer")
+        return lambda *args: args[-1]
+
+    monkeypatch.setattr(compressed_prepare, "write_prepared_pairs", whole_batch)
+    monkeypatch.setattr(pl, "pallas_call", tiled)
+    args = (
+        pool,
+        keys,
+        arr((tokens,), jnp.bool_),
+        arr((tokens,), jnp.int32),
+        arr((tokens,), jnp.int32),
+        arr((requests + 1,), jnp.int32),
+        arr((requests,), jnp.int32),
+        arr((requests, 21), jnp.int32),
+    )
+    result = jax.eval_shape(
+        lambda *arrays: pooled_qsa.write_compressed(*arrays, ratio, batch_pairs=fused),
+        *args,
+    )
+    assert result == pool
+    assert routes == ["whole_query_bucket" if expected else "bounded_writer"]
 
 
 @pytest.mark.parametrize("chip", [pltpu.ChipVersion.TPU_7X, pltpu.ChipVersion.TPU_V5P])
-def test_decode_index_tile_is_limited_to_measured_native_bf16(chip, monkeypatch):
+def test_decode_index_tile_uses_native_layout_and_resource_budget(chip, monkeypatch):
     monkeypatch.setattr(
         policy.pltpu, "get_tpu_info", lambda: pltpu.get_tpu_info_for_chip(chip, 1)
     )
@@ -71,15 +144,10 @@ def test_decode_index_tile_is_limited_to_measured_native_bf16(chip, monkeypatch)
         pages = policy.get_decode_index_pages(
             query, cache, pages_per_query=533, ratio=4, topk=512
         )
-        assert pages == (
-            32 if chip == pltpu.ChipVersion.TPU_7X and dtype == jnp.bfloat16 else 8
-        )
-        assert (
-            policy.get_decode_index_pages(
-                query, cache, pages_per_query=16, ratio=4, topk=512
-            )
-            == 8
-        )
+        assert pages == (32 if dtype == jnp.bfloat16 else 8)
+        assert policy.get_decode_index_pages(
+            query, cache, pages_per_query=16, ratio=4, topk=512
+        ) == (16 if dtype == jnp.bfloat16 else 8)
 
 
 def carrier(page=384, dtype=jnp.float8_e4m3fn, width=256, heads=1):
@@ -170,7 +238,7 @@ def test_insufficient_region_capacity_and_main_partial_tiles():
         )
         == 1
     )
-    for count, page in [(127, 384), (128, 129), (0, 384)]:
+    for count, page in [(129, 384), (128, 129), (0, 384)]:
         pool = carrier(page)
         rows = jax.ShapeDtypeStruct((count, *pool.shape[2:]), pool.dtype)
         assert policy.main_kv_dma_batch(pool, rows, hardware=hw) == 1
@@ -253,14 +321,10 @@ def test_public_capacities_and_layout_determine_concurrency(chip):
 @pytest.mark.parametrize("chip", [pltpu.ChipVersion.TPU_7X, pltpu.ChipVersion.TPU_V5P])
 @pytest.mark.parametrize("dtype", [jnp.bfloat16, jnp.float8_e4m3fn])
 @pytest.mark.parametrize("count", [8, 16, 32])
-def test_main_decode_policy_keeps_unmeasured_buckets_on_fallback(chip, dtype, count):
+def test_main_decode_policy_fits_all_resident_small_buckets(chip, dtype, count):
     hw = policy.DmaHardware.from_tpu_info(pltpu.get_tpu_info_for_chip(chip, 1))
     pool = carrier(1664, dtype)
     rows = jax.ShapeDtypeStruct((count, *pool.shape[2:]), dtype)
-    measured = (
-        chip == pltpu.ChipVersion.TPU_7X and dtype == jnp.float8_e4m3fn and count == 16
-    )
-    assert policy.main_kv_dma_batch(pool, rows, hardware=hw) == (16 if measured else 1)
     assert (
         policy.main_kv_dma_batch(
             pool, rows, hardware=dataclasses.replace(hw, smem_bytes=1)
@@ -293,12 +357,12 @@ def test_main_decode_counts_all_sixteen_dma_semaphores():
     "shape,dtype,rotary,expected",
     [
         ((16, 24, 512), jnp.bfloat16, 64, True),
-        ((8, 24, 512), jnp.bfloat16, 64, False),
+        ((8, 24, 512), jnp.bfloat16, 64, True),
         ((16, 24, 512), jnp.float32, 64, False),
-        ((16, 24, 512), jnp.bfloat16, 128, False),
+        ((16, 24, 512), jnp.bfloat16, 128, True),
     ],
 )
-def test_query_prepare_guard_keeps_untested_shapes_on_fallback(
+def test_query_prepare_derives_norm_rope_layout_and_dtype(
     shape, dtype, rotary, expected, monkeypatch
 ):
     monkeypatch.setattr(
@@ -314,11 +378,12 @@ def test_query_prepare_guard_keeps_untested_shapes_on_fallback(
 
 @pytest.mark.parametrize(
     "count,ratio,rotary,expected",
-    [(16, 4, 64, True), (8, 4, 64, False), (16, 8, 64, False), (16, 4, 128, False)],
+    [(16, 4, 64, True), (8, 4, 64, True), (16, 8, 64, True), (16, 4, 128, True)],
 )
-def test_compressed_preparation_only_admits_measured_compute_geometry(
-    count, ratio, rotary, expected
+def test_compressed_preparation_uses_resident_layout(
+    count, ratio, rotary, expected, monkeypatch
 ):
+    monkeypatch.setattr(policy, "_hardware", hardware)
     raw = jax.ShapeDtypeStruct((count, 128), jnp.bfloat16)
     trig = jax.ShapeDtypeStruct((67584, 128), jnp.bfloat16)
     assert policy.use_compressed_preparation(raw, trig, ratio, rotary) == expected
