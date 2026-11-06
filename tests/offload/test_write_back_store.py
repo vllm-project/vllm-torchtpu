@@ -142,6 +142,30 @@ class TestWriteBackScheduling(unittest.TestCase):
         sched.manager.on_request_finished.assert_called_once()
         self.assertEqual(sched.wb_counters["dropped_requests"], 1)
 
+    def test_block_reused_in_the_finishing_step_drops_the_request(self):
+        sched = self._sched()
+        self._finished(sched, "a", [5, 6])
+        sched.attach_block_pool(_pool([5, 6]))
+        out = sched._write_back_output(_output(finished={"a"}, new_blocks=[5]))
+        self.assertEqual(out.finished_req_ids, set())
+        self.assertNotIn("a", sched._req_status)
+        self.assertEqual(sched._wb_owners, {})
+
+    def test_partial_tail_block_is_not_held(self):
+        sched = self._sched()
+        keys = self._finished(sched, "a", [5, 6])
+        # A third, partial block (no key) is the first the pool reuses.
+        sched._req_status["a"].group_states[0].block_ids.append(7)
+        sched.attach_block_pool(_pool([7, 1, 2]))
+        sched._write_back_output(_output(finished={"a"}))
+        self.assertEqual(sched._wb_blocks["a"], {5, 6})
+        out = sched._write_back_output(_output(new_blocks=[7]))
+        self.assertIn("a", sched._wb_blocks)  # reusing 7 drops nothing
+        sched.attach_block_pool(_pool([5, 6]))
+        out = sched._write_back_output(_output())
+        (job,) = sched._build_store_jobs(out).values()
+        self.assertEqual(job.dst_spec.keys, keys)
+
     def test_without_a_block_pool_stores_at_finish(self):
         sched = self._sched()
         keys = self._finished(sched, "a", [5, 6])

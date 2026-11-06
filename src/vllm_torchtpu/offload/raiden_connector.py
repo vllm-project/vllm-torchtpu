@@ -318,8 +318,11 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
         blocks_per_chunk = self.config.blocks_per_chunk
         blocks: set[int] = set()
         for group_state in req_status.group_states:
+            # Only blocks of keyed (full) chunks can be stored; the partial
+            # tail block has no hash, so the pool reuses it first.
             start = group_state.next_stored_chunk_idx * blocks_per_chunk
-            blocks.update(b for b in group_state.block_ids[start:] if b != 0)
+            end = len(group_state.offload_keys) * blocks_per_chunk
+            blocks.update(b for b in group_state.block_ids[start:end] if b != 0)
         if not blocks:
             return False
         self._wb_blocks[req_id] = blocks
@@ -389,11 +392,13 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
         allocated = _allocated_block_ids(scheduler_output)
         self.wb_counters["steps"] += 1
         self.wb_counters["allocated_blocks"] += len(allocated)
+        finished = set(scheduler_output.finished_req_ids or ())
+        passed = {r for r in finished if not self._wb_register(r)}
+        # After registering: a request that finished last step may already
+        # have a block reused by this step's allocation.
         reused = allocated & self._wb_owners.keys()
         for req_id in {r for bid in reused for r in self._wb_owners.get(bid, ())}:
             self._wb_drop(req_id)
-        finished = set(scheduler_output.finished_req_ids or ())
-        passed = {r for r in finished if not self._wb_register(r)}
         flush = self._wb_near_eviction()
         for req_id in flush:
             self._wb_unregister(req_id)
