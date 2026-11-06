@@ -362,3 +362,92 @@ def test_dcp_forward_lowers_for_tpu(dtype):
         ):
             lowered = jax.jit(fn).trace(*args).lower(lowering_platforms=("tpu",))
             assert "tpu_custom_call" in lowered.as_text()
+
+
+def test_rank_as_input_matches_int_rank():
+    """`local_candidates` reads the rank from SMEM; an ``int32[1]`` rank
+    gives the same picks as the Python int it holds."""
+    rng = np.random.default_rng(3)
+    tokens, cols, dcp, topk = 16, 12, 4, 5
+    scores = jnp.asarray(rng.standard_normal((tokens, 1, cols)), jnp.float32)
+    pos = jnp.asarray(rng.integers(0, cols * dcp * PAGE, tokens), jnp.int32)
+    common = dict(block_size=PAGE, topk=topk, init_blocks=1, local_blocks=1, dcp=dcp)
+    for rank in range(dcp):
+        want = msa_dcp.local_candidates(
+            scores, pos, rank=rank, interpret=True, **common
+        )
+        got = msa_dcp.local_candidates(
+            scores,
+            pos,
+            rank=jnp.asarray([rank], jnp.int32),
+            interpret=True,
+            **common,
+        )
+        for w, g in zip(want, got):
+            np.testing.assert_array_equal(np.asarray(w), np.asarray(g))
+
+
+def test_dcp_forward_lowers_once_for_every_rank():
+    """With the rank as an input both halves lower to one TPU program for
+    all ranks (a Python int rank would give each rank its own)."""
+    from jax.sharding import AbstractDevice, AbstractMesh, use_abstract_mesh
+
+    tokens, max_seqs, pages_per_seq, dcp, heads = 256, 16, 1024, 4, 16
+    dtype = jnp.float8_e4m3fn
+    from tests.models.minimax_m3.packing import PACKING
+
+    packing = PACKING[dtype]
+    i32 = jnp.int32
+    meta = (
+        jax.ShapeDtypeStruct((max_seqs,), i32),
+        jax.ShapeDtypeStruct((max_seqs * pages_per_seq,), i32),
+        jax.ShapeDtypeStruct((max_seqs + 1,), i32),
+    )
+    kv = jax.ShapeDtypeStruct((4096, PAGE // packing, packing, 2 * HEAD_DIM), dtype)
+    rank = jax.ShapeDtypeStruct((1,), i32)
+    score_args = (
+        jax.ShapeDtypeStruct((tokens, 1, HEAD_DIM), jnp.bfloat16),
+        jax.ShapeDtypeStruct((tokens, 1, HEAD_DIM), jnp.bfloat16),
+        jax.ShapeDtypeStruct((tokens, 1, HEAD_DIM), jnp.bfloat16),
+        jax.ShapeDtypeStruct((tokens, HEAD_DIM), jnp.bfloat16),
+        kv,
+        jax.ShapeDtypeStruct((4096, PAGE // packing, packing, HEAD_DIM), dtype),
+        *meta,
+        jax.ShapeDtypeStruct((3,), i32),
+        rank,
+    )
+    attend_args = (
+        jax.ShapeDtypeStruct((tokens, heads, HEAD_DIM), jnp.bfloat16),
+        kv,
+        jax.ShapeDtypeStruct((dcp, tokens, 32), jnp.float32),
+        *meta,
+        rank,
+    )
+
+    def score(*args):
+        *rest, r = args
+        return msa_dcp.msa_write_and_candidates_dcp(
+            *rest, topk=16, init_blocks=0, local_blocks=1, rank=r, dcp=dcp
+        )
+
+    def attend(*args):
+        *rest, r = args
+        return msa_dcp.msa_attend_dcp(*rest, sm_scale=SCALE, topk=16, rank=r, dcp=dcp)
+
+    tpu7x = AbstractMesh((), (), (), abstract_device=AbstractDevice("TPU7x", 1, "tpu"))
+    with use_abstract_mesh(tpu7x):
+        for fn, args in ((score, score_args), (attend, attend_args)):
+            lowered = jax.jit(fn).trace(*args).lower(lowering_platforms=("tpu",))
+            assert "tpu_custom_call" in lowered.as_text()
+
+
+def test_dcp_op_name_has_no_rank():
+    """The torch op's name (its compile-cache identity) is rank-free."""
+    import inspect
+
+    from vllm_torchtpu.models.minimax_m3.ops import msa as msa_ops
+
+    params = inspect.signature(msa_ops.get_msa_dcp_op).parameters
+    assert "rank" not in params
+    src = inspect.getsource(msa_ops.get_msa_dcp_op)
+    assert "_r{rank}" not in src and "dcp_rank" in src

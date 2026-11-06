@@ -285,12 +285,16 @@ def get_msa_dcp_op(
     topk: int,
     init_blocks: int,
     local_blocks: int,
-    rank: int,
     dcp: int,
     kv_head_replicas: int = 1,
 ) -> Callable[..., torch.Tensor]:
     """`get_msa_op` for a KV head's context split over ``dcp`` ranks
     (`kernels.msa_dcp`).
+
+    The returned op takes this rank's DCP rank as an ``int32[1]`` device
+    tensor (``dcp_rank``, a module buffer of the caller), not a Python int:
+    the rank then reaches the kernels as an input, every rank lowers to the
+    same program, and one compile and one cache entry serve all ranks.
 
     ``kv_head_replicas`` is the TP ranks per KV head. A DCP group wider than
     that spans ``dcp // kv_head_replicas`` KV heads; one all-gather then also
@@ -328,6 +332,7 @@ def get_msa_dcp_op(
         block_tables: jax.Array,
         query_start_loc: jax.Array,
         request_distribution: jax.Array,
+        dcp_rank: jax.Array,
     ) -> tuple[jax.Array, jax.Array, jax.Array]:
         return msa_dcp.msa_write_and_candidates_dcp(
             k,
@@ -343,7 +348,7 @@ def get_msa_dcp_op(
             topk=topk,
             init_blocks=init_blocks,
             local_blocks=local_blocks,
-            rank=rank,
+            rank=dcp_rank,
             dcp=dcp,
         )
 
@@ -354,6 +359,7 @@ def get_msa_dcp_op(
         seq_lens: jax.Array,
         block_tables: jax.Array,
         query_start_loc: jax.Array,
+        dcp_rank: jax.Array,
     ) -> tuple[jax.Array, jax.Array]:
         return msa_dcp.msa_attend_dcp(
             q,
@@ -364,13 +370,14 @@ def get_msa_dcp_op(
             query_start_loc,
             sm_scale=sm_scale,
             topk=topk,
-            rank=rank,
+            rank=dcp_rank,
             dcp=dcp,
         )
 
+    # No rank in the name: the op (and the program it lowers to) is the same
+    # on every rank of the group.
     suffix = (
-        f"t{topk}_i{init_blocks}_l{local_blocks}_s{sm_scale:.8f}_r{rank}of{dcp}"
-        f"_g{kv_heads}"
+        f"t{topk}_i{init_blocks}_l{local_blocks}_s{sm_scale:.8f}_dcp{dcp}_g{kv_heads}"
     ).replace(".", "p")
     score_op = pallas.jax_op(
         f"pallas::minimax_m3_msa_dcp_score_{suffix}",
@@ -410,6 +417,8 @@ def get_msa_dcp_op(
         kv_cache: torch.Tensor,
         index_cache: torch.Tensor,
         metadata: AttentionMetadata,
+        *,
+        dcp_rank: torch.Tensor,
     ) -> torch.Tensor:
         group = get_dcp_group()
         assert group is not None, "DCP group is not initialized"
@@ -435,6 +444,7 @@ def get_msa_dcp_op(
             metadata.block_tables,
             metadata.query_start_loc,
             metadata.request_distribution,
+            dcp_rank,
         )
         kv_cache.copy_(new_kv_cache)
         index_cache.copy_(new_index_cache)
@@ -446,6 +456,7 @@ def get_msa_dcp_op(
             metadata.seq_lens,
             metadata.block_tables,
             metadata.query_start_loc,
+            dcp_rank,
         )
         return merge_lse_partials_scatter_heads(out, lse)
 

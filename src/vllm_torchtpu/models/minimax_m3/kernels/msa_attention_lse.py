@@ -35,6 +35,7 @@ def _kernel(
     work_page_ref,  # [groups * G] page key of each slot, -1 for none
     work_meta_ref,  # [groups] tile << _TILE_SHIFT | last and first bits
     page_table_ref,  # page key -> physical page (read by the index maps only)
+    head_ref,  # [1] KV head of the cache rows (read by the index maps only)
     # In
     q_ref,  # [H, Bq, D]
     selected_ref,  # [Bq, K] page keys, -1 padded
@@ -124,14 +125,17 @@ def _attention_call(
     local_page,
     local_limit,
     page_table,
+    head,
     *,
     sm_scale,
     block_q,
     pages_per_step,
-    head,
     interpret,
 ):
-    """One kernel call over a token count that is a multiple of block_q."""
+    """One kernel call over a token count that is a multiple of block_q.
+
+    ``head`` (``int32[1]``) is a scalar-prefetch input, not a static, so one
+    kernel serves every KV head of the cache rows."""
     num_tokens, num_heads, head_dim = q.shape
     _, rows_per_page, packing, _ = kv_cache.shape
     # One KV head's [K | V] slice of each row.
@@ -148,14 +152,14 @@ def _attention_call(
         return (0, meta[w] >> msa_attention._TILE_SHIFT, 0)
 
     def page_block(g):
-        def index_map(w, pages, meta, table):
+        def index_map(w, pages, meta, table, head_idx):
             page = table[jnp.maximum(pages[w * pages_per_step + g], 0)]
-            return (page, 0, 0, head)
+            return (page, 0, 0, head_idx[0])
 
         return pl.BlockSpec((1, rows_per_page, packing, row_width), index_map)
 
     grid_spec = pltpu.PrefetchScalarGridSpec(
-        num_scalar_prefetch=3,
+        num_scalar_prefetch=4,
         grid=(num_groups,),
         in_specs=[
             pl.BlockSpec((num_heads, block_q, head_dim), head_major_block),
@@ -191,6 +195,7 @@ def _attention_call(
         pages,
         meta,
         page_table,
+        head,
         q.transpose(1, 0, 2),
         selected,
         local_page[:, None],
@@ -198,6 +203,84 @@ def _attention_call(
         *([kv_cache] * pages_per_step),
     )
     return out.transpose(1, 0, 2), lse[:, :, 0].T
+
+
+def _chunked_call(
+    q,
+    kv_cache,
+    selected,
+    local_page,
+    local_limit,
+    page_table,
+    head,
+    *,
+    sm_scale,
+    block_q,
+    pages_per_step,
+    interpret,
+):
+    """`_attention_call` over chunks of at most `MAX_TOKENS_PER_CALL` tokens
+    (the work list lives in SMEM). Several chunks run as one `lax.map`, so
+    the kernel is emitted once per call site rather than once per chunk."""
+    num_tokens = q.shape[0]
+    call = functools.partial(
+        _attention_call,
+        sm_scale=sm_scale,
+        block_q=block_q,
+        pages_per_step=pages_per_step,
+        interpret=interpret,
+    )
+    limit = msa_attention.MAX_TOKENS_PER_CALL
+    step = max(block_q, limit - limit % block_q)
+    num_chunks = -(-num_tokens // step)
+    if num_chunks == 1:
+        return call(q, kv_cache, selected, local_page, local_limit, page_table, head)
+    pad = num_chunks * step - num_tokens
+    q = jnp.pad(q, ((0, pad), (0, 0), (0, 0)))
+    selected = jnp.pad(selected, ((0, pad), (0, 0)), constant_values=-1)
+    local_page = jnp.pad(local_page, (0, pad), constant_values=-1)
+    local_limit = jnp.pad(local_limit, (0, pad))
+
+    def chunk(xs):
+        q_c, sel_c, page_c, limit_c = xs
+        return call(q_c, kv_cache, sel_c, page_c, limit_c, page_table, head)
+
+    out, lse = jax.lax.map(
+        chunk,
+        (
+            q.reshape(num_chunks, step, *q.shape[1:]),
+            selected.reshape(num_chunks, step, -1),
+            local_page.reshape(num_chunks, step),
+            local_limit.reshape(num_chunks, step),
+        ),
+    )
+    out = out.reshape(num_chunks * step, *out.shape[2:])[:num_tokens]
+    lse = lse.reshape(num_chunks * step, -1)[:num_tokens]
+    return out, lse
+
+
+def _pad_tokens(q, selected, local_page, local_limit, block_q):
+    pad = -q.shape[0] % block_q
+    if pad:
+        q = jnp.pad(q, ((0, pad),) + ((0, 0),) * (q.ndim - 1))
+        selected = jnp.pad(
+            selected, ((0, pad),) + ((0, 0),) * (selected.ndim - 1), constant_values=-1
+        )
+        local_page = jnp.pad(local_page, (0, pad), constant_values=-1)
+        local_limit = jnp.pad(local_limit, (0, pad))
+    return q, selected, local_page, local_limit
+
+
+def _check_rows(kv_cache, head_dim, head=None):
+    num_heads = kv_cache.shape[3] // (2 * head_dim)
+    if kv_cache.shape[3] % (2 * head_dim) or (
+        head is not None and not 0 <= head < num_heads
+    ):
+        raise ValueError(
+            f"Cache rows hold [K | V] of width {2 * head_dim} per KV head; got "
+            f"{kv_cache.shape} for head {head}."
+        )
+    return num_heads
 
 
 @functools.partial(
@@ -228,40 +311,85 @@ def msa_sparse_attention_lse(
     """
     num_tokens, _, head_dim = q.shape
     check_page_dtype(kv_cache.shape[2], kv_cache.dtype)
-    if kv_cache.shape[3] % (2 * head_dim) or not (
-        0 <= head < kv_cache.shape[3] // (2 * head_dim)
-    ):
-        raise ValueError(
-            f"Cache rows hold [K | V] of width {2 * head_dim} per KV head; got "
-            f"{kv_cache.shape} for head {head}."
-        )
-    pad = -num_tokens % block_q
-    if pad:
-        q = jnp.pad(q, ((0, pad), (0, 0), (0, 0)))
-        selected = jnp.pad(selected, ((0, pad), (0, 0)), constant_values=-1)
-        local_page = jnp.pad(local_page, (0, pad), constant_values=-1)
-        local_limit = jnp.pad(local_limit, (0, pad))
-    call = functools.partial(
-        _attention_call,
+    _check_rows(kv_cache, head_dim, head)
+    q, selected, local_page, local_limit = _pad_tokens(
+        q, selected, local_page, local_limit, block_q
+    )
+    out, lse = _chunked_call(
+        q,
+        kv_cache,
+        selected,
+        local_page,
+        local_limit,
+        page_table,
+        jnp.full((1,), head, jnp.int32),
         sm_scale=sm_scale,
         block_q=block_q,
         pages_per_step=pages_per_step,
-        head=head,
         interpret=interpret,
     )
-    limit = msa_attention.MAX_TOKENS_PER_CALL
-    step = max(block_q, limit - limit % block_q)
-    results = [
-        call(
-            q[start : start + step],
-            kv_cache,
-            selected[start : start + step],
-            local_page[start : start + step],
-            local_limit[start : start + step],
-            page_table,
+    return out[:num_tokens], lse[:num_tokens]
+
+
+@functools.partial(
+    jax.jit, static_argnames=("sm_scale", "block_q", "pages_per_step", "interpret")
+)
+def msa_sparse_attention_lse_heads(
+    q: jax.Array,
+    kv_cache: jax.Array,
+    selected: jax.Array,
+    local_page: jax.Array,
+    local_limit: jax.Array,
+    page_table: jax.Array,
+    *,
+    sm_scale: float,
+    block_q: int = msa_attention.DEFAULT_BLOCK_Q,
+    pages_per_step: int = msa_attention.DEFAULT_PAGES_PER_STEP,
+    interpret: bool = False,
+) -> tuple[jax.Array, jax.Array]:
+    """`msa_sparse_attention_lse` for every KV head of the cache rows at once.
+
+    ``q [T, G * Hg, D]`` (KV head ``h`` owns query heads ``[h * Hg,
+    (h + 1) * Hg)``), ``selected [T, G, K]``. The heads run as one `lax.map`
+    over a single kernel whose KV head is an input, so the program carries
+    one copy of the kernel instead of one per head. Returns ``(out
+    [T, G * Hg, D], lse [T, G * Hg] f32)``.
+    """
+    num_tokens, num_q_heads, head_dim = q.shape
+    num_heads = selected.shape[1]
+    check_page_dtype(kv_cache.shape[2], kv_cache.dtype)
+    if _check_rows(kv_cache, head_dim) < num_heads or num_q_heads % num_heads:
+        raise ValueError(
+            f"{num_heads} KV heads of {num_q_heads} query heads do not fit cache "
+            f"rows {kv_cache.shape}."
         )
-        for start in range(0, num_tokens + pad, step)
-    ]
-    out = jnp.concatenate([o for o, _ in results], axis=0)[:num_tokens]
-    lse = jnp.concatenate([s for _, s in results], axis=0)[:num_tokens]
-    return out, lse
+    q, selected, local_page, local_limit = _pad_tokens(
+        q, selected, local_page, local_limit, block_q
+    )
+    padded = q.shape[0]
+    q_per_head = num_q_heads // num_heads
+    q_heads = q.reshape(padded, num_heads, q_per_head, head_dim).transpose(1, 0, 2, 3)
+
+    def one_head(xs):
+        q_h, sel_h, h = xs
+        return _chunked_call(
+            q_h,
+            kv_cache,
+            sel_h,
+            local_page,
+            local_limit,
+            page_table,
+            h.reshape(1),
+            sm_scale=sm_scale,
+            block_q=block_q,
+            pages_per_step=pages_per_step,
+            interpret=interpret,
+        )
+
+    out, lse = jax.lax.map(
+        one_head,
+        (q_heads, selected.transpose(1, 0, 2), jnp.arange(num_heads, dtype=jnp.int32)),
+    )  # [G, T, Hg, D], [G, T, Hg]
+    out = out.transpose(1, 0, 2, 3).reshape(padded, num_q_heads, head_dim)
+    lse = lse.transpose(1, 0, 2).reshape(padded, num_q_heads)
+    return out[:num_tokens], lse[:num_tokens]

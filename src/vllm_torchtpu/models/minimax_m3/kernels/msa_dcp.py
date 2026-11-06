@@ -57,6 +57,17 @@ from vllm_torchtpu.models.minimax_m3.kernels import (
 _NEG_INF = float("-inf")
 
 
+def rank_array(rank: int | jax.Array) -> jax.Array:
+    """The DCP rank as an ``int32[1]`` array.
+
+    Callers pass it as a traced input (`ops.msa.get_msa_dcp_op` feeds a
+    per-rank device buffer), so all ranks lower to one program: a Python
+    ``int`` rank is baked into the HLO and gives every rank its own
+    executable, compile and cache entry.
+    """
+    return jnp.asarray(rank, dtype=jnp.int32).reshape(1)
+
+
 def owner_pages(
     block_tables_2d: jax.Array,
     seq_id: jax.Array,
@@ -64,7 +75,7 @@ def owner_pages(
     valid: jax.Array,
     *,
     block_size: int,
-    rank: int,
+    rank: int | jax.Array,
     dcp: int,
 ) -> jax.Array:
     """This rank's page of each token, dropped for tokens of other ranks."""
@@ -74,7 +85,7 @@ def owner_pages(
 
 
 def local_seq_lens(
-    seq_lens: jax.Array, *, block_size: int, rank: int, dcp: int
+    seq_lens: jax.Array, *, block_size: int, rank: int | jax.Array, dcp: int
 ) -> jax.Array:
     """A length whose page count is the number of blocks this rank holds:
     blocks ``rank, rank + dcp, ...`` below ``ceil(len / block_size)``."""
@@ -83,6 +94,7 @@ def local_seq_lens(
 
 
 def _candidates_kernel(
+    rank_ref,
     scores_ref,
     pos_ref,
     score_out_ref,
@@ -92,11 +104,12 @@ def _candidates_kernel(
     topk,
     init_blocks,
     local_blocks,
-    rank,
     dcp,
 ):
     """`msa_select._kernel` over this rank's columns (column ``c`` is block
-    ``c * dcp + rank``), also returning the picked scores."""
+    ``c * dcp + rank``), also returning the picked scores. The rank is read
+    from SMEM so that every rank runs the same program."""
+    rank = rank_ref[0]
     s = scores_ref[...]
     rows, num_cols = s.shape
     cols = jax.lax.broadcasted_iota(jnp.int32, (rows, num_cols), 1)
@@ -130,7 +143,6 @@ def _candidates_kernel(
         "topk",
         "init_blocks",
         "local_blocks",
-        "rank",
         "dcp",
         "block_rows",
         "interpret",
@@ -144,7 +156,7 @@ def local_candidates(
     topk: int,
     init_blocks: int,
     local_blocks: int,
-    rank: int,
+    rank: int | jax.Array,
     dcp: int,
     block_rows: int = msa_select.DEFAULT_BLOCK_ROWS,
     interpret: bool = False,
@@ -171,11 +183,11 @@ def local_candidates(
             topk=topk,
             init_blocks=init_blocks,
             local_blocks=local_blocks,
-            rank=rank,
             dcp=dcp,
         ),
         grid=((num_tokens + pad) // block_rows,),
         in_specs=[
+            pl.BlockSpec(memory_space=pltpu.SMEM),
             pl.BlockSpec((block_rows, num_cols), lambda i: (i, 0)),
             pl.BlockSpec((block_rows, 1), lambda i: (i, 0)),
         ],
@@ -190,7 +202,7 @@ def local_candidates(
         ),
         interpret=interpret,
         name="minimax_m3_msa_dcp_candidates",
-    )(s, p)
+    )(rank_array(rank), s, p)
     return picked_scores[:num_tokens], picked_blocks[:num_tokens]
 
 
@@ -250,7 +262,7 @@ def msa_write_and_candidates_dcp(
     topk: int,
     init_blocks: int,
     local_blocks: int,
-    rank: int,
+    rank: int | jax.Array,
     dcp: int,
     interpret: bool = False,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
@@ -266,6 +278,7 @@ def msa_write_and_candidates_dcp(
     head, head-major.
     """
     num_tokens, num_heads, _ = k.shape
+    rank = rank_array(rank)[0]
     block_size = msa.page_size(kv_cache)
     max_num_seqs = seq_lens.shape[0]
     block_tables_2d = block_tables.reshape(max_num_seqs, -1)
@@ -339,7 +352,7 @@ def msa_attend_dcp(
     *,
     sm_scale: float,
     topk: int,
-    rank: int,
+    rank: int | jax.Array,
     dcp: int,
     interpret: bool = False,
 ) -> tuple[jax.Array, jax.Array]:
@@ -352,6 +365,7 @@ def msa_attend_dcp(
     the partial ``(out [T, G * Hg, D], lse [T, G * Hg] f32)``.
     """
     num_tokens = q.shape[0]
+    rank = rank_array(rank)[0]
     block_size = msa.page_size(kv_cache)
     max_num_seqs = seq_lens.shape[0]
     block_tables_2d = block_tables.reshape(max_num_seqs, -1)
@@ -359,35 +373,28 @@ def msa_attend_dcp(
     seq_id, pos, valid = msa.token_positions(num_tokens, seq_lens, cu_q_lens)
     selected = merge_head_candidates(candidates, topk)  # [T, G, topk]
     num_heads = selected.shape[1]
-    q_per_head = q.shape[1] // num_heads
     own_block = pos // block_size
     local_key = jnp.where(
         valid & (own_block % dcp == rank),
         seq_id * pages_per_seq + own_block // dcp,
         -1,
     )
-    outs, lses = [], []
-    for head in range(num_heads):
-        sel = selected[:, head]
-        # Page keys (seq * pages_per_seq + logical block), as
-        # `msa.sparse_attention`.
-        mine = (sel >= 0) & (sel % dcp == rank) & valid[:, None]
-        keys = jnp.where(mine, seq_id[:, None] * pages_per_seq + sel // dcp, -1)
-        out, lse = msa_attention_lse.msa_sparse_attention_lse(
-            q[:, head * q_per_head : (head + 1) * q_per_head],
-            kv_cache,
-            keys,
-            local_key,
-            pos % block_size + 1,
-            block_tables.reshape(-1),
-            sm_scale=sm_scale,
-            block_q=msa_attention.DEFAULT_BLOCK_Q,
-            pages_per_step=msa_attention.DEFAULT_PAGES_PER_STEP,
-            head=head,
-            interpret=interpret,
-        )
-        outs.append(out)
-        lses.append(lse)
+    # Page keys (seq * pages_per_seq + logical block) of the selected blocks
+    # this rank holds, as `msa.sparse_attention`; [T, G, topk].
+    mine = (selected >= 0) & (selected % dcp == rank) & valid[:, None, None]
+    keys = jnp.where(mine, seq_id[:, None, None] * pages_per_seq + selected // dcp, -1)
+    common = dict(
+        sm_scale=sm_scale,
+        block_q=msa_attention.DEFAULT_BLOCK_Q,
+        pages_per_step=msa_attention.DEFAULT_PAGES_PER_STEP,
+        interpret=interpret,
+    )
+    args = (local_key, pos % block_size + 1, block_tables.reshape(-1))
     if num_heads == 1:
-        return outs[0], lses[0]
-    return jnp.concatenate(outs, axis=1), jnp.concatenate(lses, axis=1)
+        return msa_attention_lse.msa_sparse_attention_lse(
+            q, kv_cache, keys[:, 0], *args, head=0, **common
+        )
+    # One kernel for all the group's KV heads (the head is a kernel input).
+    return msa_attention_lse.msa_sparse_attention_lse_heads(
+        q, kv_cache, keys, *args, **common
+    )

@@ -101,12 +101,34 @@ def _jnp_attention_lse(
     return out.astype(q.dtype), lse
 
 
+def _jnp_attention_lse_heads(q, kv_cache, selected, *args, sm_scale, **kwargs):
+    num_heads = selected.shape[1]
+    q_per_head = q.shape[1] // num_heads
+    outs, lses = zip(
+        *(
+            _jnp_attention_lse(
+                q[:, h * q_per_head : (h + 1) * q_per_head],
+                kv_cache,
+                selected[:, h],
+                *args,
+                sm_scale=sm_scale,
+                head=h,
+            )
+            for h in range(num_heads)
+        )
+    )
+    return jnp.concatenate(outs, axis=1), jnp.concatenate(lses, axis=1)
+
+
 @pytest.fixture
 def _fast_kernels(monkeypatch):
     monkeypatch.setattr(msa_write, "write_rows", _xla_write_rows)
     monkeypatch.setattr(msa, "_block_scores", _jnp_block_scores)
     monkeypatch.setattr(
         msa_attention_lse, "msa_sparse_attention_lse", _jnp_attention_lse
+    )
+    monkeypatch.setattr(
+        msa_attention_lse, "msa_sparse_attention_lse_heads", _jnp_attention_lse_heads
     )
 
     def attention(q, kv_cache, selected, local_page, local_limit, **kwargs):
@@ -280,6 +302,53 @@ def test_lse_kernel_attends_the_chosen_kv_head(dtype):
         )
         for g, e in zip(got, expected, strict=True):
             np.testing.assert_array_equal(np.asarray(g), np.asarray(e))
+
+
+@pytest.mark.parametrize("chunk_tokens", [2048, 32])
+def test_lse_heads_kernel_matches_each_head(monkeypatch, chunk_tokens):
+    """One `lax.map`-ed kernel over the KV heads (and, with a small
+    `MAX_TOKENS_PER_CALL`, over token chunks) equals the per-head kernel."""
+    dtype = jnp.float8_e4m3fn
+    rng = np.random.default_rng(13)
+    num_tokens, pages, topk, heads, hd, q_per_head = 72, 6, 3, 2, 128, 2
+    q = jnp.asarray(rng.standard_normal((num_tokens, heads * q_per_head, hd)))
+    q = q.astype(jnp.bfloat16)
+    rows = pack(
+        rounded(rng.standard_normal((pages, PAGE, heads * 2 * hd)), dtype), dtype
+    )
+    selected = np.full((num_tokens, heads, topk), -1, np.int32)
+    for t in range(num_tokens):
+        for h in range(heads):
+            chosen = rng.choice(pages, rng.integers(0, topk + 1), replace=False)
+            selected[t, h, : len(chosen)] = chosen
+    rest = (
+        jnp.asarray(selected[:, 0, 0]),
+        jnp.asarray(rng.integers(1, PAGE + 1, num_tokens), jnp.int32),
+        jnp.arange(pages, dtype=jnp.int32),
+    )
+    expected = [
+        msa_attention_lse.msa_sparse_attention_lse(
+            q[:, h * q_per_head : (h + 1) * q_per_head],
+            rows,
+            jnp.asarray(selected[:, h]),
+            *rest,
+            sm_scale=hd**-0.5,
+            head=h,
+            interpret=True,
+        )
+        for h in range(heads)
+    ]
+    monkeypatch.setattr(msa_attention, "MAX_TOKENS_PER_CALL", chunk_tokens)
+    jax.clear_caches()  # the chunk size is read at trace time
+    got_out, got_lse = msa_attention_lse.msa_sparse_attention_lse_heads(
+        q, rows, jnp.asarray(selected), *rest, sm_scale=hd**-0.5, interpret=True
+    )
+    np.testing.assert_array_equal(
+        np.asarray(got_out), np.asarray(jnp.concatenate([e[0] for e in expected], 1))
+    )
+    np.testing.assert_array_equal(
+        np.asarray(got_lse), np.asarray(jnp.concatenate([e[1] for e in expected], 1))
+    )
 
 
 def test_split_group_heads_picks_one_rank_per_kv_head():

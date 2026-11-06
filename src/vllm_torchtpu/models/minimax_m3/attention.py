@@ -291,7 +291,14 @@ class MiniMaxM3SparseAttention(nn.Module):
                     f"{self.dcp_size}."
                 )
             self.msa_op = get_msa_dcp_op(
-                *msa_config, get_dcp_rank(), self.dcp_size, self.kv_head_replicas
+                *msa_config, self.dcp_size, self.kv_head_replicas
+            )
+            # A buffer, not a Python int, so the rank is a graph input and
+            # every DCP rank compiles the same program (see get_msa_dcp_op).
+            self.register_buffer(
+                "dcp_rank",
+                torch.tensor([get_dcp_rank()], dtype=torch.int32),
+                persistent=False,
             )
         elif self.index_shards > 1:
             self.msa_op = get_msa_sharded_op(
@@ -327,6 +334,7 @@ class MiniMaxM3SparseAttention(nn.Module):
             if self.index_shards > 1:
                 # Every rank scores all index heads on its share of the keys.
                 index_q = get_tp_group().all_gather(index_q.contiguous(), dim=1)
+            extra = {"dcp_rank": self.dcp_rank} if self.dcp_size > 1 else {}
             attn_output = self.msa_op(
                 q.view(num_tokens, self.num_heads, self.head_dim),
                 k.view(num_tokens, self.num_kv_heads, self.head_dim),
@@ -336,6 +344,7 @@ class MiniMaxM3SparseAttention(nn.Module):
                 kv_cache,
                 self.index_cache.kv_cache,
                 layer_metadata,
+                **extra,
             ).reshape(num_tokens, self.q_size)
         output, _ = self.o_proj(attn_output)
         return output
