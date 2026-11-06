@@ -33,6 +33,8 @@
 #   FUSED_COMBINE 1 = one EP all-reduce per MoE layer instead of DP reduce-scatter + TP all-reduce (TPU_MOE_FUSED_COMBINE)
 #   LM_HEAD_HIDDEN_MAJOR 1 = store the LM head [hidden, vocab shard] so the vocab projection is a plain matmul
 #                 (TPU_LM_HEAD_HIDDEN_MAJOR; reduction order: logits may differ in the last bf16 bit)
+#   EMBED_SHARD   ep = split the token embedding over all DP x TP ranks (TPU_EMBED_EP_SHARD; 1/DP of the table per rank,
+#                 one DP reduce-scatter per lookup, bitwise the vocab-parallel lookup); "" = vocab-parallel over TP
 #   WEIGHTS       dummy (default) | real: real checkpoint at MODEL_PATH
 #   KV_MODE       synthetic (default, needs dummy weights) | normal: real prefill with prefix caching
 #   EXTRA_ARGS    appended verbatim to vllm serve
@@ -58,6 +60,7 @@ FAST_SUBST=${FAST_SUBST:-0}
 PACKED_DISPATCH=${PACKED_DISPATCH:-0}
 FUSED_COMBINE=${FUSED_COMBINE:-0}
 LM_HEAD_HIDDEN_MAJOR=${LM_HEAD_HIDDEN_MAJOR:-0}
+EMBED_SHARD=${EMBED_SHARD:-}
 WEIGHTS=${WEIGHTS:-dummy}
 SYNTH_ACCEPT=${SYNTH_ACCEPT:-}
 CANDIDATE_SAMPLING=${CANDIDATE_SAMPLING:-0}
@@ -90,6 +93,11 @@ case "$LM_HEAD_HIDDEN_MAJOR" in
   0) ;;
   1) export TPU_LM_HEAD_HIDDEN_MAJOR=1 ;;
   *) echo "LM_HEAD_HIDDEN_MAJOR must be 0 or 1" >&2; exit 2 ;;
+esac
+case "$EMBED_SHARD" in
+  "") ;;
+  ep) export TPU_EMBED_EP_SHARD=1 ;;
+  *) echo "EMBED_SHARD must be empty or ep" >&2; exit 2 ;;
 esac
 [[ -n "$EXPERT_BLOCK" ]] && export MOE_REQUANTIZE_BLOCK_SIZE="$EXPERT_BLOCK"
 case "$MOE_A2A" in
@@ -155,7 +163,7 @@ elif [[ -n "$HOT_SET" ]]; then
   [[ "${HS_SPREAD:-}" == spread ]] && export TPU_MOE_HOT_SET_SPREAD=1
 fi
 export TORCH_TPU_TIER2_COMPILATION_CACHE="native_decode_${LAYOUT}_${POD_IP}"
-echo "HILLCLIMB layout=$LAYOUT host=$HOST_RANK engines=$ENGINES seqs/engine=$SEQS_PER_ENGINE mtp=$MTP_K mnbt=$MNBT compile=$COMPILE_SIZES kv=$KV_BYTES async=$ASYNC_SCHED fused_ep=$FUSED_EP w4a8=$W4A8 expert_block=${EXPERT_BLOCK:-16} attn_block=${ATTN_BLOCK:-default} verify_block=${VERIFY_BLOCK:-default} draft_one_query=$DRAFT_ONE_QUERY moe_a2a=$MOE_A2A a2a_sc_offload=${A2A_SC_OFFLOAD:-default} fused_draft=$FUSED_DRAFT fast_subst=$FAST_SUBST lm_head_hidden_major=$LM_HEAD_HIDDEN_MAJOR packed_dispatch=$PACKED_DISPATCH fused_combine=$FUSED_COMBINE weights=$WEIGHTS kv_mode=$KV_MODE synth_accept=${SYNTH_ACCEPT:-none} candidate_sampling=$CANDIDATE_SAMPLING hot_set=${HOT_SET:-none} headless=${HEADLESS_ARGS[*]:-no}"
+echo "HILLCLIMB layout=$LAYOUT host=$HOST_RANK engines=$ENGINES seqs/engine=$SEQS_PER_ENGINE mtp=$MTP_K mnbt=$MNBT compile=$COMPILE_SIZES kv=$KV_BYTES async=$ASYNC_SCHED fused_ep=$FUSED_EP w4a8=$W4A8 expert_block=${EXPERT_BLOCK:-16} attn_block=${ATTN_BLOCK:-default} verify_block=${VERIFY_BLOCK:-default} draft_one_query=$DRAFT_ONE_QUERY moe_a2a=$MOE_A2A a2a_sc_offload=${A2A_SC_OFFLOAD:-default} fused_draft=$FUSED_DRAFT fast_subst=$FAST_SUBST lm_head_hidden_major=$LM_HEAD_HIDDEN_MAJOR embed_shard=${EMBED_SHARD:-tp} packed_dispatch=$PACKED_DISPATCH fused_combine=$FUSED_COMBINE weights=$WEIGHTS kv_mode=$KV_MODE synth_accept=${SYNTH_ACCEPT:-none} candidate_sampling=$CANDIDATE_SAMPLING hot_set=${HOT_SET:-none} headless=${HEADLESS_ARGS[*]:-no}"
 
 exec numactl --interleave=all "$VLLM_BIN" serve \
   --pipeline-parallel-size 1 \

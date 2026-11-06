@@ -105,6 +105,7 @@ if TYPE_CHECKING:
     TPU_ROPE_CACHE_TRUNCATE: bool = False
     TPU_ROPE_CACHE_ROW_MAJOR: bool = False
     TPU_LM_HEAD_HIDDEN_MAJOR: bool = False
+    TPU_EMBED_EP_SHARD: bool = False
     TPU_CANDIDATE_SAMPLING: bool = False
     TPU_MOE_HASH_TABLE_ROW_MAJOR: bool = False
     TPU_PARALLEL_PRECOMPILE: bool = False
@@ -774,6 +775,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # so the vocab projection is a plain matmul. Changes the accumulation
     # order of the logits (last-bit differences), hence opt-in.
     "TPU_LM_HEAD_HIDDEN_MAJOR": env_bool("TPU_LM_HEAD_HIDDEN_MAJOR", default=False),
+    # Split the token embedding over every DP x TP rank instead of each DP
+    # engine's TP ranks (layers/core/ep_sharded_embedding.py): 1/DP of the
+    # table per rank for one DP reduce-scatter per lookup. Bitwise the
+    # vocab-parallel lookup; needs the rank-aligned DP x TP layout.
+    "TPU_EMBED_EP_SHARD": env_bool("TPU_EMBED_EP_SHARD", default=False),
     # Non-greedy spec-decode verify steps whose requests all keep at most 48
     # tokens (top_k) sample from per-vocab-shard top-k candidates instead of
     # all-gathered logits (layers/core/candidate_sampling.py). Same
