@@ -510,3 +510,16 @@ def test_vllm_gqa_dcp_cap_is_lifted_for_registered_models(monkeypatch) -> None:
     )
     assert seen == [2, 8, 8]
     assert pc.decode_context_parallel_size == 8  # the caller's config is untouched
+
+
+@pytest.mark.parametrize("unit,expected", [(None, 128), (64, 64)])
+def test_config_dcp_defaults_prefix_match_unit_to_the_sparse_block(
+    unit, expected
+) -> None:
+    """Under DCP the manager block is 128 * dcp tokens; the hook makes prefix
+    hits land on sparse blocks unless --prefix-match-unit is given."""
+    config = _hook_config(tensor_parallel_size=8, decode_context_parallel_size=8)
+    config.cache_config.enable_prefix_caching = True
+    config.cache_config.prefix_match_unit = unit
+    TPUMiniMaxM3Config.verify_and_update_config(config)
+    assert config.cache_config.prefix_match_unit == expected

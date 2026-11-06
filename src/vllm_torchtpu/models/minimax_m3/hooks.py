@@ -121,6 +121,16 @@ def _verify_dcp(vllm_config: "VllmConfig", block_size: int) -> None:
             f"--cp-kv-cache-interleave-size {block_size} (or leave it unset), "
             f"got {interleave}."
         )
+    cache_config = vllm_config.cache_config
+    if (
+        getattr(cache_config, "enable_prefix_caching", False)
+        and getattr(cache_config, "prefix_match_unit", None) is None
+    ):
+        # The DCP manager block is block_size * dcp tokens; without a finer
+        # unit a prefix hit stops at that boundary (DCP 8: 1024 tokens). Hit
+        # at sparse-block granularity, as without DCP (the patched single-
+        # group coordinator copy-on-writes a partly shared block).
+        cache_config.prefix_match_unit = block_size
     if (
         vllm_config.speculative_config is not None
         and vllm_config.scheduler_config.disable_hybrid_kv_cache_manager is False
