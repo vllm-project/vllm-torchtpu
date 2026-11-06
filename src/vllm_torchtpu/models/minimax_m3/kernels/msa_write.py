@@ -180,13 +180,8 @@ def _write_pages(cache, word_bits, pages, slots, max_runs, interpret):
 
 def _window_kernel(
     # Scalar prefetch
-    num_windows_ref,  # [1]
-    window_page_ref,  # [N] page of each window
-    window_row_ref,  # [N] first packed row of each window
-    window_tok0_ref,  # [N] first token of each window
-    window_end_ref,  # [N] one past its last token
-    token_row_ref,  # [T] packed row of each token within its window
-    token_shift_ref,  # [T] bit offset of each token within its word
+    pages_ref,  # [T] page of each token
+    slots_ref,  # [T] slot of each token, as uint32
     # In
     new_ref,  # [T, W] uint32: each token's row in the low bits
     cache_ref,  # [pages, S / p, p, W] left in HBM
@@ -195,13 +190,42 @@ def _window_kernel(
     # Scratch
     buf,  # [N, WINDOW_ROWS, p, W] the windows
     sems,  # DMA semaphores [2, N]
+    windows_ref,  # [4, N] page, first row, first token and end token of each
 ):
-    num_windows = num_windows_ref[0]
-    rows, packing = buf.shape[1:3]
+    """A window is a maximal span of consecutive tokens whose slots fall in
+    one window of one page."""
+    num_tokens = pages_ref.shape[0]
+    num_pages = cache_ref.shape[0]
+    max_windows, rows, packing = buf.shape[:3]
     bits = 32 // packing
+    page_ref, row_ref, tok0_ref, end_ref = (windows_ref.at[i] for i in range(4))
+
+    def scan(t, carry):
+        starts, prev_page, prev_win = carry
+        page = pages_ref[t]
+        win = (slots_ref[t] // (rows * packing)).astype(jnp.int32)
+        valid = (page >= 0) & (page < num_pages)
+        start = valid & ((page != prev_page) | (win != prev_win))
+        starts += start.astype(jnp.int32)
+        w = starts - 1
+
+        @pl.when(start & (w < max_windows))
+        def _():
+            page_ref[w] = page
+            row_ref[w] = win * rows
+            tok0_ref[w] = t
+
+        @pl.when(valid & (w < max_windows))
+        def _():
+            end_ref[w] = t + 1
+
+        return starts, jnp.where(valid, page, -1), jnp.where(valid, win, -1)
+
+    starts, _, _ = jax.lax.fori_loop(0, num_tokens, scan, (0, -1, -1))
+    num_windows = jnp.minimum(starts, max_windows)
 
     def window(ref, w):
-        return ref.at[window_page_ref[w], pl.ds(window_row_ref[w], rows)]
+        return ref.at[page_ref[w], pl.ds(row_ref[w], rows)]
 
     def fetch(w):
         return pltpu.make_async_copy(window(cache_ref, w), buf.at[w], sems.at[0, w])
@@ -217,18 +241,19 @@ def _window_kernel(
     words = buf.bitcast(jnp.uint32)
     row_ids = jax.lax.broadcasted_iota(jnp.int32, (rows, words.shape[-1]), 0)
 
+    def merge(t, window):
+        slot = slots_ref[t]
+        shift = slot % packing * bits
+        keep = ~(jnp.uint32((1 << bits) - 1) << shift)
+        merged = (window & keep) | (new_ref[pl.ds(t, 1), :] << shift)
+        row = (slot // packing % rows).astype(jnp.int32)
+        return jnp.where(row_ids == row, merged, window)
+
     @pl.loop(0, num_windows)
     def _(w):
         fetch(w).wait()
-
-        def merge(t, window):
-            shift = token_shift_ref[t].astype(jnp.uint32)
-            keep = ~(jnp.uint32((1 << bits) - 1) << shift)
-            merged = (window & keep) | (new_ref[pl.ds(t, 1), :] << shift)
-            return jnp.where(row_ids == token_row_ref[t], merged, window)
-
         words[w, :, 0, :] = jax.lax.fori_loop(
-            window_tok0_ref[w], window_end_ref[w], merge, words[w, :, 0, :]
+            tok0_ref[w], end_ref[w], merge, words[w, :, 0, :]
         )
         store(w).start()
 
@@ -237,48 +262,13 @@ def _window_kernel(
         store(w).wait()
 
 
-def _windows(
-    pages: jax.Array, rows: jax.Array, num_pages: int, size: int, max_windows: int
-):
-    """Windows to rewrite: maximal spans of consecutive tokens whose packed
-    `rows` fall in one window of `size` rows of one page."""
-    num_tokens = pages.shape[0]
-    tok = jnp.arange(num_tokens, dtype=jnp.int32)
-    valid = (pages >= 0) & (pages < num_pages)
-    win = rows // size
-
-    # Token t continues the window of token t - 1.
-    cont = valid[1:] & valid[:-1] & (pages[1:] == pages[:-1]) & (win[1:] == win[:-1])
-    start = valid & ~jnp.concatenate([jnp.zeros(1, bool), cont])
-    end = valid & ~jnp.concatenate([cont, jnp.zeros(1, bool)])
-    window_id = jnp.cumsum(start.astype(jnp.int32)) - 1
-    num_windows = jnp.minimum(jnp.sum(start.astype(jnp.int32)), max_windows)
-    at_start = jnp.where(start, window_id, max_windows)
-    at_end = jnp.where(end, window_id, max_windows)
-
-    def per_window(at, values):
-        return jnp.zeros(max_windows, jnp.int32).at[at].set(values, mode="drop")
-
-    return (
-        num_windows,
-        per_window(at_start, pages),
-        per_window(at_start, win * size),
-        per_window(at_start, tok),
-        per_window(at_end, tok + 1),
-    )
-
-
 def _write_windows(cache, word_bits, pages, slots, max_windows, interpret):
-    num_pages, rows_per_page, packing, width = cache.shape
+    rows_per_page, packing, width = cache.shape[1:]
     rows = math.gcd(WINDOW_ROWS, rows_per_page)
-    token_row = slots // packing
-    num_windows, window_page, window_row, window_tok0, window_end = _windows(
-        pages, token_row, num_pages, rows, max_windows
-    )
     return pl.pallas_call(
         _window_kernel,
         grid_spec=pltpu.PrefetchScalarGridSpec(
-            num_scalar_prefetch=7,
+            num_scalar_prefetch=2,
             grid=(1,),
             in_specs=[
                 pl.BlockSpec(word_bits.shape, lambda i, *_: (0, 0)),
@@ -288,25 +278,16 @@ def _write_windows(cache, word_bits, pages, slots, max_windows, interpret):
             scratch_shapes=[
                 pltpu.VMEM((max_windows, rows, packing, width), cache.dtype),
                 pltpu.SemaphoreType.DMA((2, max_windows)),
+                pltpu.SMEM((4, max_windows), jnp.int32),
             ],
         ),
         out_shape=jax.ShapeDtypeStruct(cache.shape, cache.dtype),
-        # Operand 8 = the cache (after 7 scalar-prefetch operands and the rows).
-        input_output_aliases={8: 0},
+        # Operand 3 = the cache (after 2 scalar-prefetch operands and the rows).
+        input_output_aliases={3: 0},
         compiler_params=pltpu.CompilerParams(dimension_semantics=("arbitrary",)),
         interpret=interpret,
         name="minimax_m3_msa_write_rows",
-    )(
-        num_windows[None],
-        window_page,
-        window_row,
-        window_tok0,
-        window_end,
-        token_row % rows,
-        slots % packing * (32 // packing),
-        word_bits,
-        cache,
-    )
+    )(pages, slots.astype(jnp.uint32), word_bits, cache)
 
 
 def max_write_runs(num_tokens: int, max_num_seqs: int, span: int) -> int:
