@@ -270,3 +270,8 @@ def test_tpu_sdpa_attention_backend():
     value_gqa = torch.randn(1, 16, 2, 16)
     res_gqa = impl_gqa.forward(query_gqa, key_gqa, value_gqa)
     assert res_gqa.shape == (1, 16, 8, 16)
+
+
+def test_supports_talker_mtp_graph_capture_disabled():
+    assert OmniTpuPlatform.supports_talker_mtp_graph_capture() is False
+    assert OmniTpuPlatform().supports_talker_mtp_graph_capture() is False

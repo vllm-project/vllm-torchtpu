@@ -130,6 +130,10 @@ class OmniTpuPlatform(OmniPlatform, TpuPlatform):
         return False
 
     @classmethod
+    def supports_talker_mtp_graph_capture(cls) -> bool:
+        return False
+
+    @classmethod
     def set_device(cls, device: torch.device | int) -> None:
         world_size = int(os.environ.get("WORLD_SIZE", "1") or "1")
         if world_size > 1:
