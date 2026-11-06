@@ -80,10 +80,7 @@ from vllm_torchtpu.layers.adapter.quantization.configs import (
     VllmQuantConfig,
     VllmQuantLinearConfig,
 )
-from vllm_torchtpu.layers.adapter.quantization.fp8 import (
-    build_excluded_moe_online_fp8_method,
-    resolve_online_fp8,
-)
+from vllm_torchtpu.layers.adapter.quantization.fp8 import resolve_online_fp8
 from vllm_torchtpu.layers.adapter.quantization.online_fp8 import map_online_fp8
 from vllm_torchtpu.layers.core.quant_methods import NVFP4, get_tpu_quant_method
 from vllm_torchtpu.layers.core.quantization import (
@@ -282,16 +279,11 @@ class VllmNvfp4Config(ModelOptNvFp4Config, VllmQuantConfig):
             return VllmNvfp4LinearMethod(self, self.get_linear_config(layer))
         if isinstance(layer, RoutedExperts):
             if self.is_layer_excluded(prefix):
-                moe_config = self.get_moe_config(layer)
-                if envs.MOE_ONLINE_FP8_EXCLUDED_EXPERTS:
-                    return build_excluded_moe_online_fp8_method(
-                        moe_config, prefix=prefix
-                    )
                 from vllm_torchtpu.layers.adapter.quantization.unquantized import (
                     VllmUnquantizedFusedMoEMethod,
                 )
 
-                return VllmUnquantizedFusedMoEMethod(moe_config)
+                return VllmUnquantizedFusedMoEMethod(self.get_moe_config(layer))
             return VllmNvfp4MoEMethod(self, self.get_moe_config(layer))
         return None
 

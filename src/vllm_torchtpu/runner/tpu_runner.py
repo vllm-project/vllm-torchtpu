@@ -5228,7 +5228,6 @@ class TPUModelRunner(GPUModelRunner):
             model = load_model(
                 vllm_config=self.vllm_config, model_config=self.model_config
             )
-        validate_online_fp8(model, self.vllm_config.quant_config)
         self.model = model
         if self.is_pooling_model:
             self._resolve_static_pooler()
@@ -5266,6 +5265,14 @@ class TPUModelRunner(GPUModelRunner):
             # shared op rejects them with RuntimeProgramInputMismatch while
             # precompiling the draft buckets.
             self._relayout_tables(getattr(self.drafter, "draft_model", None))
+
+        validate_online_fp8(
+            self.model,
+            self.vllm_config.quant_config,
+            draft_model=getattr(self.drafter, "draft_model", None)
+            if self._is_async_drafter
+            else None,
+        )
 
         # After the drafter has bound its heads (an MTP draft's shared heads are the
         # target's lm_head module) and before any program is compiled.
