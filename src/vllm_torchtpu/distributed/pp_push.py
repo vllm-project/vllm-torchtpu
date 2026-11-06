@@ -229,6 +229,22 @@ def ring_extra_steps(stages: int) -> int:
     return max(1, stages // 2)
 
 
+def extra_steps_in_flight(stages: int) -> int:
+    """Steps the engine keeps in flight beyond the stage count.
+
+    ``TPU_PP_EXTRA_STEPS_IN_FLIGHT`` sets it for either hand-off (the
+    Qwen3.5 branch's knob, there for the wave only). Unset (-1), each
+    hand-off keeps its own default: 0 for the wave, ``ring_extra_steps``
+    for the ring.
+    """
+    from vllm_torchtpu import envs
+
+    extra = int(envs.TPU_PP_EXTRA_STEPS_IN_FLIGHT)
+    if extra >= 0:
+        return extra
+    return ring_extra_steps(stages) if ring_handoff() else 0
+
+
 def rpc_ring_chunks(stages: int, extra: int = 0) -> int:
     """Messages each ring buffer between the engine and its workers must hold.
 
@@ -282,7 +298,7 @@ def widen_message_rings(vllm_config: Any) -> None:
         return
     stages = int(vllm_config.parallel_config.pipeline_parallel_size)
     if stages > 1:
-        extra = ring_extra_steps(stages) if ring_handoff() else 0
+        extra = extra_steps_in_flight(stages)
         _widen_rpc_ring(stages, extra)
         if extra:
             _raise_steps_in_flight(extra)
@@ -386,9 +402,10 @@ def patch_executor_for_pp_ring(vllm_config: Any) -> None:
     stages = int(vllm_config.parallel_config.pipeline_parallel_size)
     if stages <= 1:
         return
-    extra = ring_extra_steps(stages)
+    extra = extra_steps_in_flight(stages)
     _widen_rpc_ring(stages, extra)
-    _raise_steps_in_flight(extra)
+    if extra > 0:
+        _raise_steps_in_flight(extra)
     from vllm.v1.executor.multiproc_executor import MultiprocExecutor
 
     if getattr(MultiprocExecutor, "_tpu_pp_ring_patch", False):
@@ -418,7 +435,13 @@ def patch_executor_for_pp_wave(vllm_config: Any) -> None:
     stages = int(vllm_config.parallel_config.pipeline_parallel_size)
     if stages <= 1:
         return
-    _widen_rpc_ring(stages)
+    # TPU_PP_EXTRA_STEPS_IN_FLIGHT (default 0 here): the pushes a wait sends
+    # count the later steps that exist, so a deeper queue changes none of
+    # them; it only lets the engine dispatch further ahead.
+    extra = extra_steps_in_flight(stages)
+    _widen_rpc_ring(stages, extra)
+    if extra > 0:
+        _raise_steps_in_flight(extra)
     from vllm.v1.executor.multiproc_executor import MultiprocExecutor
 
     if getattr(MultiprocExecutor, "_tpu_pp_wave_patch", False):
@@ -469,6 +492,8 @@ def patch_executor_for_pp_wave(vllm_config: Any) -> None:
     _install_take_draft_token_ids(MultiprocExecutor)
     MultiprocExecutor._tpu_pp_wave_patch = True
     logger.info(
-        "PP wave: engine push and settle installed, message ring %d chunks",
+        "PP wave: engine push and settle installed, message ring %d chunks, "
+        "%d steps in flight beyond the pipeline depth",
         _ring_chunks_needed,
+        extra,
     )

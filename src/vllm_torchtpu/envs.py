@@ -190,6 +190,9 @@ if TYPE_CHECKING:
     TPU_PP_LAZY_PUSH: bool = False
     TPU_PP_HANDOFF: str = "wave"
     TPU_PP_RING_DEPTH: int = 2
+    TPU_PP_EXTRA_STEPS_IN_FLIGHT: int = -1
+    TPU_PP_RING_VERIFY: int = 0
+    TPU_PP_RING_VERIFY_MUTANT: int = -1
     TPU_ROPE_CACHE_TRUNCATE: bool = False
     TPU_ROPE_CACHE_ROW_MAJOR: bool = False
     TPU_MOE_HASH_TABLE_ROW_MAJOR: bool = False
@@ -1467,6 +1470,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # With TPU_PP_HANDOFF=ring: the forwards a stage may queue for sending
     # to the next stage before end_forward waits for room.
     "TPU_PP_RING_DEPTH": env_int("TPU_PP_RING_DEPTH", 2),
+    # Steps the engine keeps in flight beyond the pipeline's stage count, for
+    # either hand-off (distributed/pp_push.py extra_steps_in_flight). -1 keeps
+    # each hand-off's default: 0 for the wave, stages // 2 for the ring.
+    "TPU_PP_EXTRA_STEPS_IN_FLIGHT": env_int("TPU_PP_EXTRA_STEPS_IN_FLIGHT", -1),
+    # With TPU_PP_HANDOFF=ring: check the first N sampled transfers byte for
+    # byte. The sender and the receiver each log an integer digest of the
+    # activations of every 64th transfer (distributed/pp_ring.py); equal
+    # digests on both ends show the hand-off moved the bytes unchanged.
+    # Each check syncs the host with the device once on both ends. 0: off.
+    "TPU_PP_RING_VERIFY": env_int("TPU_PP_RING_VERIFY", 0),
+    # Test control for TPU_PP_RING_VERIFY: the receiving stage of this rank
+    # digests a copy of what it received with one bit flipped, so its link
+    # must report mismatches; the forward reads the unchanged tensor. -1: off.
+    "TPU_PP_RING_VERIFY_MUTANT": env_int("TPU_PP_RING_VERIFY_MUTANT", -1),
     # Enable pre-compile rotation to speed up the startup time.
     "TPU_PARALLEL_PRECOMPILE": env_bool("TPU_PARALLEL_PRECOMPILE", default=False),
     # Under TPU_PARALLEL_PRECOMPILE, take a subgraph's ranges biggest first,

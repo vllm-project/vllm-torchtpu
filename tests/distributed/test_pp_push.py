@@ -511,3 +511,75 @@ def test_the_wave_flag_installs_the_wave(monkeypatch, queue):
     assert executor_cls._tpu_pp_wave_patch
     assert not getattr(executor_cls, "_tpu_pp_ring_patch", False)
     assert queue(1, 1).kwargs["max_chunks"] == pp_push.rpc_ring_chunks(4)
+
+
+# q38: TPU_PP_EXTRA_STEPS_IN_FLIGHT (the Qwen3.5 branch's knob) overrides the
+# steps the engine keeps in flight beyond the stage count, for either hand-off.
+
+
+@pytest.fixture
+def fresh_steps(monkeypatch):
+    from vllm.config import VllmConfig
+
+    monkeypatch.setattr(
+        VllmConfig, "max_concurrent_batches", VllmConfig.max_concurrent_batches
+    )
+    monkeypatch.setattr(VllmConfig, "_tpu_pp_extra_steps", None, raising=False)
+    monkeypatch.delattr(VllmConfig, "_tpu_pp_extra_steps")
+    monkeypatch.delenv("TPU_PP_EXTRA_STEPS_IN_FLIGHT", raising=False)
+    monkeypatch.delenv("TPU_PP_HANDOFF", raising=False)
+
+
+def test_q38_extra_steps_default_per_hand_off(monkeypatch, fresh_steps):
+    assert pp_push.extra_steps_in_flight(8) == 0
+    monkeypatch.setenv("TPU_PP_HANDOFF", "ring")
+    assert pp_push.extra_steps_in_flight(8) == 4
+    assert pp_push.extra_steps_in_flight(4) == 2
+
+
+def test_q38_extra_steps_override_either_hand_off(monkeypatch, fresh_steps):
+    monkeypatch.setenv("TPU_PP_EXTRA_STEPS_IN_FLIGHT", "2")
+    assert pp_push.extra_steps_in_flight(8) == 2
+    monkeypatch.setenv("TPU_PP_HANDOFF", "ring")
+    assert pp_push.extra_steps_in_flight(8) == 2
+    monkeypatch.setenv("TPU_PP_EXTRA_STEPS_IN_FLIGHT", "0")
+    assert pp_push.extra_steps_in_flight(8) == 0
+
+
+def test_q38_the_wave_keeps_extra_steps_when_asked(monkeypatch, fresh_steps, queue):
+    from vllm.config import VllmConfig
+
+    monkeypatch.setenv("TPU_PP_EXTRA_STEPS_IN_FLIGHT", "3")
+    _bare_executor_cls(monkeypatch)
+    pp_push.patch_executor_for_pp_handoff(_config(8))
+    steps = VllmConfig.max_concurrent_batches.fget
+    assert steps(_engine_config(8, async_scheduling=False)) == 8 + 3
+    assert VllmConfig._tpu_pp_extra_steps == 3
+    # the engine's rings hold the deeper queue
+    assert queue(1, 1).kwargs["max_chunks"] == pp_push.rpc_ring_chunks(8, 3)
+
+
+def test_q38_the_wave_keeps_vllms_steps_by_default(monkeypatch, fresh_steps, queue):
+    from vllm.config import VllmConfig
+
+    _bare_executor_cls(monkeypatch)
+    pp_push.patch_executor_for_pp_handoff(_config(8))
+    assert getattr(VllmConfig, "_tpu_pp_extra_steps", None) is None
+    assert queue(1, 1).kwargs["max_chunks"] == pp_push.rpc_ring_chunks(8)
+
+
+def test_q38_the_ring_can_be_held_to_vllms_steps(monkeypatch, fresh_steps, queue):
+    from vllm.config import VllmConfig
+
+    monkeypatch.setenv("TPU_PP_HANDOFF", "ring")
+    monkeypatch.setenv("TPU_PP_EXTRA_STEPS_IN_FLIGHT", "0")
+    _bare_executor_cls(monkeypatch)
+    pp_push.patch_executor_for_pp_handoff(_config(8))
+    assert getattr(VllmConfig, "_tpu_pp_extra_steps", None) is None
+    assert queue(1, 1).kwargs["max_chunks"] == pp_push.rpc_ring_chunks(8)
+
+
+def test_q38_worker_rings_follow_the_override(monkeypatch, fresh_steps, queue):
+    monkeypatch.setenv("TPU_PP_EXTRA_STEPS_IN_FLIGHT", "5")
+    pp_push.widen_message_rings(_config(8))
+    assert queue(1, 1).kwargs["max_chunks"] == pp_push.rpc_ring_chunks(8, 5)

@@ -791,3 +791,163 @@ def test_the_hand_off_always_carries_hidden_states_and_residual(monkeypatch):
         )
     with pytest.raises(ValueError, match="depth of at least 1"):
         pp_ring.PPRing(torch.device("cpu"), MAX_ROWS, _template(False), depth=0)
+
+
+# q38: the ring moves activations byte for byte, at qwen4_exp's hand-off shape,
+# and TPU_PP_RING_VERIFY shows it on hardware by digesting sampled transfers on
+# both ends.
+
+Q38_WIDTH = 10240  # qwen4_exp: 4 hyper-connection streams x hidden 2560
+
+
+def test_q38_the_ring_delivers_the_senders_bytes_unchanged(monkeypatch):
+    """What stage 1 receives is bit for bit the sum stage 0 handed on, for
+    bfloat16 activations of qwen4_exp's width at unaligned row counts: the
+    same tensor the wave delivers (its padded buffer's first ``rows`` rows),
+    so the next stage's forward sees identical inputs under either hand-off."""
+    import sys
+
+    module = sys.modules[__name__]
+    template = {
+        "hidden_states": ((Q38_WIDTH,), torch.bfloat16),
+        "residual": ((Q38_WIDTH,), torch.bfloat16),
+    }
+    monkeypatch.setattr(module, "_template", lambda side: dict(template))
+    transport, rings = _build(monkeypatch, stages=2)
+    sender, receiver = rings[0, 0], rings[1, 0]
+    gen = torch.Generator().manual_seed(7)
+    rows_list = [13, 64, 37]
+    sent = []
+    got = []
+
+    def run_sender():
+        sender.warmup()
+        for rows in rows_list:
+            assert sender.start_forward(rows) is None
+            h = torch.randn((rows, Q38_WIDTH), generator=gen).to(torch.bfloat16)
+            # qwen4_exp hands on a zero residual: the sum is exact
+            r = torch.zeros_like(h)
+            sent.append(h + r)
+            sender.end_forward({"hidden_states": h, "residual": r}, rows)
+        sender.close()
+
+    def run_receiver():
+        receiver.warmup()
+        receiver.begin_step(rows_list)
+        for rows in rows_list:
+            received = receiver.start_forward(rows)
+            transport.wait_landed(received["hidden_states"])
+            got.append(received["hidden_states"].clone())
+            receiver.end_forward(None, rows)
+        receiver.close()
+
+    threads = [threading.Thread(target=f, daemon=True) for f in (run_sender, run_receiver)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=TIMEOUT)
+    assert not any(t.is_alive() for t in threads)
+    assert len(got) == len(sent) == len(rows_list)
+    for a, b, rows in zip(sent, got, rows_list):
+        assert b.shape == (rows, Q38_WIDTH) and b.dtype == torch.bfloat16
+        assert torch.equal(a.view(torch.int16), b.view(torch.int16))
+        # the wave's view of the same forward: its padded buffer's first rows
+        padded = torch.cat([a, torch.zeros((MAX_ROWS - rows, Q38_WIDTH), dtype=a.dtype)])
+        assert torch.equal(padded[:rows].view(torch.int16), b.view(torch.int16))
+    # only the forward's own rows travel (the wave pads every launch)
+    assert [rows for _, rows in transport.sends[1:]] == rows_list
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+def test_q38_the_digest_tells_tensors_apart(dtype):
+    gen = torch.Generator().manual_seed(3)
+    x = torch.randn((48, 96), generator=gen).to(dtype)
+    same = x.clone()
+    assert pp_ring.activation_digest(x) == pp_ring.activation_digest(same)
+    # one flipped bit changes the word sum
+    flipped = pp_ring.activation_digest(x, flip=True)
+    assert flipped[0] != pp_ring.activation_digest(x)[0]
+    # two rows swapped keep the word sum and change the row-weighted sum
+    swapped = x.clone()
+    swapped[[3, 17]] = x[[17, 3]]
+    a, b = pp_ring.activation_digest(x), pp_ring.activation_digest(swapped)
+    assert a[0] == b[0] and a[1] != b[1]
+    # two columns swapped change the column-weighted sum
+    cols = x.clone()
+    cols[:, [5, 60]] = x[:, [60, 5]]
+    c = pp_ring.activation_digest(cols)
+    assert a[0] == c[0] and a[2] != c[2]
+    # flip digests a copy: the tensor itself is unchanged
+    assert torch.equal(x, same)
+
+
+def _verify_lines(records):
+    """{(kind, rank, transfer): digest} from the verify log lines."""
+    out = {}
+    for msg in records:
+        if not msg.startswith("PP ring verify ") or "digest failed" in msg:
+            continue
+        parts = msg.split()
+        kind, rank, transfer = parts[3], int(parts[5]), int(parts[7])
+        out[kind, rank, transfer] = parts[11]
+    return out
+
+
+def _run_verified(monkeypatch, stages, verify, mutant=-1, period=2):
+    monkeypatch.setenv("TPU_PP_RING_VERIFY", str(verify))
+    monkeypatch.setenv("TPU_PP_RING_VERIFY_MUTANT", str(mutant))
+    monkeypatch.setattr(pp_ring, "_VERIFY_PERIOD", period)
+    lines = []
+    real_info = pp_ring.logger.info
+
+    def info(fmt, *args, **kwargs):
+        if isinstance(fmt, str) and fmt.startswith("PP ring verify"):
+            lines.append(fmt % args)
+        return real_info(fmt, *args, **kwargs)
+
+    monkeypatch.setattr(pp_ring.logger, "info", info)
+    transport, rings = _build(monkeypatch, stages)
+    steps = [([16, 8], True), ([32], True), ([], True), ([64, 16, 8], True), ([8], False)]
+    results = _run(rings, transport, steps)
+    _check(results, steps, stages - 1)
+    return _verify_lines(lines)
+
+
+def _pairs(lines, stages):
+    """Per link (r, r+1): matching and mismatching sampled transfers."""
+    links = {}
+    for (kind, rank, transfer), digest in lines.items():
+        if kind != "send":
+            continue
+        recv = lines.get(("recv", rank + 1, transfer))
+        assert recv is not None, f"transfer {transfer} logged by sender {rank} only"
+        ok, bad = links.get(rank, (0, 0))
+        links[rank] = (ok + (recv == digest), bad + (recv != digest))
+    return links
+
+
+def test_q38_verify_pairs_every_sampled_transfer_and_they_match(monkeypatch):
+    lines = _run_verified(monkeypatch, stages=3, verify=3)
+    links = _pairs(lines, 3)
+    # transfers 2, 4, 6 (period 2, three checks per end) on both links
+    assert links == {0: (3, 0), 1: (3, 0)}
+    assert {t for (_, _, t) in lines} == {2, 4, 6}
+
+
+def test_q38_verify_mutant_fails_only_its_link(monkeypatch):
+    lines = _run_verified(monkeypatch, stages=3, verify=3, mutant=2)
+    links = _pairs(lines, 3)
+    assert links == {0: (3, 0), 1: (0, 3)}
+
+
+def test_q38_verify_off_logs_nothing(monkeypatch):
+    assert _run_verified(monkeypatch, stages=3, verify=0) == {}
+
+
+def test_q38_a_failing_digest_turns_verification_off_and_serving_goes_on(monkeypatch):
+    def boom(*_a, **_k):
+        raise RuntimeError("no bitcast on this device")
+
+    monkeypatch.setattr(pp_ring, "activation_digest", boom)
+    lines = _run_verified(monkeypatch, stages=3, verify=3)
+    assert lines == {}

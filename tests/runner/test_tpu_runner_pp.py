@@ -210,6 +210,8 @@ class TestHandOffConstruction:
             vllm_config=None,
             device=torch.device("cpu"),
             enforce_eager=True,
+            # q38: capture_model binds a megakernel after the hand-off.
+            _megakernel=None,
         )
 
         def intermediate_tensors(num_tokens, zeros):
@@ -351,8 +353,11 @@ class TestRingStepPosting:
             supports_mm_inputs=False,
             phase_based_profiler=None,
             _is_async_drafter=False,
-            # the first call after the posting point
-            _greedy_top_tokens_this_step=stop,
+            # q38: the stall watchdog reads the batch size every step.
+            input_batch=SimpleNamespace(num_reqs=1),
+            # the first call after the posting point (q38: the model
+            # adapter's begin_step)
+            model_adapter=SimpleNamespace(begin_step=stop),
         )
         scheduler_output = SimpleNamespace(
             total_num_scheduled_tokens=tokens, scheduled_encoder_inputs={}

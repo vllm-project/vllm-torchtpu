@@ -283,6 +283,11 @@ _TPU_COMPILE_ENV_IGNORED = {
     # the compiled forwards, which take the same inputs either way.
     "TPU_PP_HANDOFF",
     "TPU_PP_RING_DEPTH",
+    # Engine-side queue depth and the ring's host-side byte check: the
+    # compiled forwards are the same either way.
+    "TPU_PP_EXTRA_STEPS_IN_FLIGHT",
+    "TPU_PP_RING_VERIFY",
+    "TPU_PP_RING_VERIFY_MUTANT",
     # Startup and host-side knobs: ports, an IPC secret, two raiden startup
     # checks, the raiden offload storage tier, offload retry and drain
     # limits, a weight-load sync cadence, a debug log switch, and the

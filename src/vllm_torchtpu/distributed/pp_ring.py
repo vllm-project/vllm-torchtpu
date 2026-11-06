@@ -185,6 +185,41 @@ def _first_and_last(x: torch.Tensor) -> tuple[float, float]:
     return float(x[0, 0].item()), float(x[-1, -1].item())
 
 
+# TPU_PP_RING_VERIFY samples every this many transfers.
+_VERIFY_PERIOD = 64
+
+
+def activation_digest(x: torch.Tensor, flip: bool = False) -> tuple[int, int, int]:
+    """An exact integer digest of a [rows, width] tensor's bytes: the sum of
+    its 16- or 32-bit words, and the row- and column-weighted sums of its
+    row and column word sums. Equal tensors give equal digests; a changed
+    word changes the first sum, and a moved word changes a weighted one.
+
+    The row and column sums run on the tensor's device in 32 bits (a row of
+    up to 65536 16-bit words, or a column of up to 65536 rows, fits); the
+    weighting runs on the host in Python integers. ``flip`` digests a copy
+    with the lowest bit of the middle word flipped (the verify mutant)."""
+    if x.dim() != 2:
+        x = x.reshape(x.shape[0], -1)
+    if x.element_size() == 2:
+        words = x.contiguous().view(torch.int16)
+    elif x.element_size() == 4:
+        words = x.contiguous().view(torch.int32)
+    else:
+        words = x.contiguous().view(torch.int8)
+    if flip:
+        words = words.clone()
+        r, c = words.shape[0] // 2, words.shape[1] // 2
+        words[r, c] = words[r, c] ^ 1
+    wide = words.to(torch.int64 if words.dtype == torch.int32 else torch.int32)
+    row_sums = [int(v) for v in wide.sum(dim=1).cpu().tolist()]
+    col_sums = [int(v) for v in wide.sum(dim=0).cpu().tolist()]
+    total = sum(row_sums)
+    by_row = sum((i + 1) * v for i, v in enumerate(row_sums))
+    by_col = sum((j + 1) * v for j, v in enumerate(col_sums))
+    return total, by_row, by_col
+
+
 class PPRing:
     # Read by the worker's pp_drains_before_handoff: no stage waits for the
     # slice before a hand-off.
@@ -274,6 +309,11 @@ class PPRing:
         # 64 MiB for buckets of 16 to 8192 rows of 2048 bfloat16 values. The
         # KV-cache budget reserves them (hbm_reserve_bytes).
         self._zero_residuals: dict[int, torch.Tensor] = {}
+        # TPU_PP_RING_VERIFY: sampled transfers left to check on each end.
+        from vllm_torchtpu import envs
+
+        self._verify_sends = self._verify_recvs = max(int(envs.TPU_PP_RING_VERIFY), 0)
+        self._verify_flip = int(envs.TPU_PP_RING_VERIFY_MUTANT) == self.rank
         logger.info(
             "PP ring: rank %d/%d column %d/%d (global rank %d, from %s, to %s), "
             "depth %d, hand-off carries %s",
@@ -345,6 +385,35 @@ class PPRing:
         """Marks a runner call that traces device ops. The helper threads
         trace none, so there is nothing to keep out of it."""
         yield
+
+    def _verify(self, kind: str, transfer: int, x: torch.Tensor) -> None:
+        """Logs the digest of one sampled transfer's activations on this end
+        (TPU_PP_RING_VERIFY); the reader pairs the sending rank's ``send``
+        line with the next rank's ``recv`` line of the same transfer."""
+        flip = kind == "recv" and self._verify_flip
+        try:
+            with TraceAnnotation("PP:Verify"):
+                digest = activation_digest(x, flip=flip)
+        except Exception as exc:  # noqa: BLE001 - a check never stops serving
+            self._verify_sends = self._verify_recvs = 0
+            logger.warning(
+                "PP ring verify rank %d: digest failed (%r); verification off",
+                self.rank,
+                exc,
+            )
+            return
+        logger.info(
+            "PP ring verify %s rank %d transfer %d rows %d digest %d/%d/%d%s",
+            kind,
+            self.rank,
+            transfer,
+            x.shape[0],
+            *digest,
+            " (mutant)" if flip else "",
+        )
+
+    def _verify_due(self, transfer: int, left: int) -> bool:
+        return left > 0 and transfer % _VERIFY_PERIOD == 0
 
     def warmup(self) -> None:
         """One small transfer of every carried tensor from each device to
@@ -524,6 +593,9 @@ class PPRing:
                 f"{posted_rows} rows"
             )
         tensors = dict(zip(self.carried, received))
+        if self._verify_due(transfer, self._verify_recvs):
+            self._verify_recvs -= 1
+            self._verify("recv", transfer, tensors[HIDDEN_STATES])
         # The residual is zero: the sum arrived as the hidden states.
         zero = self._zero_residuals.get(rows)
         if zero is None:
@@ -567,6 +639,9 @@ class PPRing:
                 f"PP ring rank {self.rank}: forward {self._current} of {rows} "
                 f"rows hands on {wrong}"
             )
+        if self._verify_due(self._current, self._verify_sends):
+            self._verify_sends -= 1
+            self._verify("send", self._current, outgoing[0])
         _flush(outgoing)
         self._queue_send(self._current, outgoing, _fence())
 
