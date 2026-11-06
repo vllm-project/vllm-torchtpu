@@ -48,13 +48,17 @@ Core mechanisms:
 
 from __future__ import annotations
 
+import dataclasses
 import os
+import time
+from collections import Counter, OrderedDict
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 import torch
 from vllm.config import VllmConfig
+from vllm.distributed.kv_transfer.kv_connector.utils import yield_req_data
 from vllm.distributed.kv_transfer.kv_connector.v1 import KVConnectorRole
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorBase_V1,
@@ -198,12 +202,66 @@ class _ParkedStore:
     acks: int = 0
 
 
+@dataclass(frozen=True)
+class WriteBackPolicy:
+    """``kv_connector_extra_config["store_policy"]`` in write-back mode.
+
+    The default policy writes every computed chunk through to the host, so
+    the host tier mostly mirrors HBM. Write-back stores a finished request's
+    chunks only when they near eviction: once one of their blocks is within
+    ``window_blocks`` of the head of the free queue (the next blocks to be
+    reused), at most ``max_requests_per_step`` requests per step.
+    """
+
+    window_blocks: int = 1024
+    max_requests_per_step: int = 8
+
+    @classmethod
+    def from_extra_config(cls, extra_config: Mapping) -> WriteBackPolicy | None:
+        """``None`` for the default write-through policy."""
+        policy = extra_config.get("store_policy")
+        if policy is None or policy == "write_through":
+            return None
+        if policy == "write_back":
+            policy = {"mode": "write_back"}
+        if not isinstance(policy, Mapping) or policy.get("mode") != "write_back":
+            raise ValueError(
+                f"store_policy must be 'write_through', 'write_back' or "
+                f"{{'mode': 'write_back', ...}}, got {policy!r}"
+            )
+        options = {k: v for k, v in policy.items() if k != "mode"}
+        unknown = set(options) - {f.name for f in dataclasses.fields(cls)}
+        if unknown:
+            raise ValueError(f"unknown store_policy options: {sorted(unknown)}")
+        written = cls(**options)
+        if written.window_blocks <= 0 or written.max_requests_per_step <= 0:
+            raise ValueError(f"store_policy options must be positive: {policy!r}")
+        return written
+
+
+def _allocated_block_ids(scheduler_output: SchedulerOutput) -> set[int]:
+    """Blocks this step allocates, by the rule of `_update_req_states`
+    (which computes the same set inside the base build_connector_meta)."""
+    allocated: set[int] = set()
+    for _, new_block_id_groups, _ in yield_req_data(scheduler_output):
+        for group in new_block_id_groups or ():
+            allocated.update(bid for bid in group if bid != 0)
+    for copy in scheduler_output.kv_cache_block_copies or ():
+        allocated.add(copy.dst_block_id)
+    return allocated
+
+
 class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
     """Scheduler for the store-backed offload path.
 
     Strips per-rank transfer jobs and orchestrates the store engine directly
     via RaidenOffloadingManager.
     """
+
+    # Write-through unless the connector config asks for write-back
+    # (class defaults also cover instances built without __init__).
+    _write_back: WriteBackPolicy | None = None
+    _block_pool = None
 
     def __init__(
         self,
@@ -215,10 +273,141 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
         assert isinstance(self.manager, RaidenOffloadingManager)
         self._raiden_manager: RaidenOffloadingManager = self.manager
         self._fence_pending: dict[int, _ParkedStore] = {}
+        self._write_back = WriteBackPolicy.from_extra_config(
+            getattr(spec, "extra_config", None) or {}
+        )
+        # Write-back state: finished requests whose chunks are not stored yet
+        # (their finish is deferred), the blocks each one would store, and
+        # each such block's owners (shared prefix blocks have several).
+        self._block_pool = None
+        self._wb_blocks: OrderedDict[str, set[int]] = OrderedDict()
+        self._wb_owners: dict[int, set[str]] = {}
+        self.wb_counters: Counter[str] = Counter()
+
+    def attach_block_pool(self, block_pool) -> None:
+        """`EvictionAwareConnector`: the scheduler's block pool, whose free
+        queue tells write-back which finished requests near eviction."""
+        self._block_pool = block_pool
+
+    def _wb_unregister(self, req_id: str) -> None:
+        for bid in self._wb_blocks.pop(req_id, ()):
+            owners = self._wb_owners.get(bid)
+            if owners is not None:
+                owners.discard(req_id)
+                if not owners:
+                    del self._wb_owners[bid]
+
+    def _wb_drop(self, req_id: str) -> None:
+        """Finish a held request without storing it (a block was reused)."""
+        self._wb_unregister(req_id)
+        req_status = self._req_status.get(req_id)
+        if req_status is None:
+            return
+        self.wb_counters["dropped_requests"] += 1
+        req_status.finished_signaled = True
+        self.manager.on_request_finished(req_status.req_context)
+        if not req_status.transfer_jobs:
+            del self._req_status[req_id]
+
+    def _wb_register(self, req_id: str) -> bool:
+        """Hold a finished request for write-back; False if it has nothing
+        left to store."""
+        req_status = self._req_status.get(req_id)
+        if req_status is None:
+            return False
+        blocks_per_chunk = self.config.blocks_per_chunk
+        blocks: set[int] = set()
+        for group_state in req_status.group_states:
+            start = group_state.next_stored_chunk_idx * blocks_per_chunk
+            blocks.update(b for b in group_state.block_ids[start:] if b != 0)
+        if not blocks:
+            return False
+        self._wb_blocks[req_id] = blocks
+        for bid in blocks:
+            self._wb_owners.setdefault(bid, set()).add(req_id)
+        return True
+
+    def _wb_near_eviction(self) -> list[str]:
+        """Held requests with a block among the next ``window_blocks`` the
+        free queue hands out, oldest first, at most ``max_requests_per_step``.
+        Without a block pool, every held request (store at finish)."""
+        policy = self._write_back
+        assert policy is not None
+        if self._block_pool is None:
+            return list(self._wb_blocks)
+        queue = self._block_pool.free_block_queue
+        picked: dict[str, None] = {}
+        block = queue.fake_free_list_head.next_free_block
+        for _ in range(policy.window_blocks):
+            if block is None or block is queue.fake_free_list_tail:
+                break
+            for req_id in self._wb_owners.get(block.block_id, ()):
+                picked.setdefault(req_id)
+            if len(picked) >= policy.max_requests_per_step:
+                break
+            block = block.next_free_block
+        return list(picked)[: policy.max_requests_per_step]
+
+    def _maybe_log_write_back(self, interval_s: float = 30.0) -> None:
+        """One log line per interval. Not on the KV Transfer stats line: the
+        Prometheus logger asserts every stats key is registered, and with
+        no ``spec_name`` in the connector config its spec lookup resolves to
+        the CPU spec, so names added by this spec would not be registered.
+        ``allocated_blocks / steps`` (blocks handed out per step, i.e. the
+        eviction rate at steady state) is what ``window_blocks`` should
+        cover for a few steps."""
+        now = time.monotonic()
+        last = getattr(self, "_wb_last_log", None)
+        if last is None:
+            self._wb_last_log = now
+            return
+        if now - last < interval_s:
+            return
+        c = self.wb_counters
+        logger.info(
+            "KV write-back: %d steps, %.1f blocks allocated/step, %d requests "
+            "stored, %d dropped (blocks reused before the flush), %d held",
+            c["steps"],
+            c["allocated_blocks"] / max(c["steps"], 1),
+            c["flushed_requests"],
+            c["dropped_requests"],
+            c["held_requests"],
+        )
+        held = c["held_requests"]
+        c.clear()
+        c["held_requests"] = held
+        self._wb_last_log = now
+
+    def _write_back_output(self, scheduler_output: SchedulerOutput) -> SchedulerOutput:
+        """The scheduler output the base sees in write-back mode: no running
+        request stores (no write-through), newly finished requests are held
+        (their finish deferred), and held requests near eviction finish now,
+        so the base stores them through its normal finish path."""
+        allocated = _allocated_block_ids(scheduler_output)
+        self.wb_counters["steps"] += 1
+        self.wb_counters["allocated_blocks"] += len(allocated)
+        reused = allocated & self._wb_owners.keys()
+        for req_id in {r for bid in reused for r in self._wb_owners.get(bid, ())}:
+            self._wb_drop(req_id)
+        finished = set(scheduler_output.finished_req_ids or ())
+        passed = {r for r in finished if not self._wb_register(r)}
+        flush = self._wb_near_eviction()
+        for req_id in flush:
+            self._wb_unregister(req_id)
+        self.wb_counters["flushed_requests"] += len(flush)
+        self.wb_counters["held_requests"] = len(self._wb_blocks)
+        self._maybe_log_write_back()
+        return dataclasses.replace(
+            scheduler_output,
+            finished_req_ids=passed | set(flush),
+            num_scheduled_tokens={},
+        )
 
     def build_connector_meta(
         self, scheduler_output: SchedulerOutput
     ) -> KVConnectorMetadata:
+        if self._write_back is not None:
+            scheduler_output = self._write_back_output(scheduler_output)
         meta = super().build_connector_meta(scheduler_output)
         assert isinstance(meta, OffloadingConnectorMetadata)
 
@@ -470,6 +659,12 @@ class TPURaidenOffloadingConnector(OffloadingConnector):
         if self.connector_scheduler is not None:
             return self.connector_scheduler.take_events()
         return []
+
+    def attach_block_pool(self, block_pool) -> None:
+        """`EvictionAwareConnector`: hand the block pool to the scheduler side
+        (write-back reads its free queue)."""
+        if self.connector_scheduler is not None:
+            self.connector_scheduler.attach_block_pool(block_pool)
 
     def peek_external_prefix_tokens(
         self, request: Request, num_local_tokens: int
