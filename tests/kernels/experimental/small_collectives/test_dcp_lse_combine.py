@@ -29,6 +29,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
@@ -160,8 +161,20 @@ def test_supported_geometries_and_validation():
     assert not comb.online_lse_combine_supported(16, 4, 2, 256, mode="pairs")
     assert comb.online_lse_combine_supported(16, 4, 2, 256, mode="flat")
     assert not comb.online_lse_combine_supported(16, 64, 16, 256, mode="unknown")
-    # Header capacity: tokens * local <= 8 * vdim -> 512 * 8 = 4096 > 8 * 256.
-    assert not comb.online_lse_combine_supported(512, 64, 8, 256, mode="pairs")
+    # Header capacity: tokens * local <= 8 * vdim -> 96 * 16 = 1536 > 8 * 128.
+    assert not comb.online_lse_combine_supported(96, 256, 16, 128, mode="pairs")
+    # Single pass only: buckets above MAX_COMBINE_TOKENS keep the XLA merge.
+    for tokens in (112, 128, 192, 256, 512):
+        for mode in ("pairs", "flat"):
+            assert not comb.online_lse_combine_supported(tokens, 64, 16, 512, mode=mode)
+    # VMEM budget: 128 heads over 16 cores fit at 32 tokens but not at 96
+    # (about 39 MB of buffers against 80% of the 32 MiB scoped limit) unless
+    # the kernel is compiled with a larger limit.
+    assert comb.online_lse_combine_supported(32, 128, 16, 512, mode="flat")
+    assert not comb.online_lse_combine_supported(96, 128, 16, 512, mode="flat")
+    assert comb.online_lse_combine_supported(
+        96, 128, 16, 512, mode="flat", vmem_limit_bytes=64 * 1024 * 1024
+    )
 
     part = jnp.zeros((16, 64, 256), jnp.bfloat16)
     lse = jnp.zeros((16, 64), jnp.float32)
@@ -177,6 +190,48 @@ def test_supported_geometries_and_validation():
         comb.dcp_online_lse_combine(
             part, jnp.zeros((16, 32), jnp.float32), num_cores=8, axis="dcp"
         )
+
+
+def test_geometry_supported_bounds_every_admitted_bucket():
+    for mode in ("pairs", "flat"):
+        assert comb.online_lse_combine_geometry_supported(64, 16, 512, mode=mode)
+        assert comb.online_lse_combine_geometry_supported(64, 8, 512, mode=mode)
+        # 128 heads over 16 cores fit at 32 tokens but not at the largest
+        # admitted bucket, so trace-time dispatch keeps the XLA merge.
+        assert comb.online_lse_combine_supported(32, 128, 16, 512, mode=mode)
+        assert not comb.online_lse_combine_geometry_supported(128, 16, 512, mode=mode)
+        # Header capacity at the largest bucket: 96 * 16 > 8 * 128.
+        assert not comb.online_lse_combine_geometry_supported(256, 16, 128, mode=mode)
+    assert not comb.online_lse_combine_geometry_supported(12, 3, 256, mode="pairs")
+    assert comb.online_lse_combine_geometry_supported(12, 3, 256, mode="flat")
+    assert not comb.online_lse_combine_geometry_supported(64, 16, 512, mode="unknown")
+
+
+def test_trace_time_gate_keeps_the_token_count_dynamic():
+    """MLA dispatch evaluates the gate inside vLLM's compile, which marks the
+    token dimension dynamic. Token gates must not pin it (for example a lower
+    bound ``T >= 16`` next to another gate's ``T <= 16``), and the gate must not
+    use builtins Dynamo cannot model on symbolic ints."""
+    torch = pytest.importorskip("torch")
+
+    def route(x):
+        t = x.shape[0]
+        y = x * 2 if t <= 16 else x  # another decode gate at the 16-token edge
+        if (
+            t > 8
+            and t <= comb.MAX_COMBINE_TOKENS
+            and t % comb.TILE_ROWS == 0
+            and comb.online_lse_combine_geometry_supported(64, 16, 512, mode="pairs")
+        ):
+            return y + 1
+        return y - 1
+
+    for tokens, want in ((16, 3.0), (32, 2.0), (96, 2.0), (192, 0.0)):
+        torch._dynamo.reset()
+        x = torch.ones(tokens)
+        torch._dynamo.mark_dynamic(x, 0)
+        compiled = torch.compile(route, fullgraph=True, backend="eager")
+        assert float(compiled(x)[0]) == want
 
 
 def test_mesh_has_chip_pairs_1d_and_2d():
@@ -220,8 +275,18 @@ def test_clean_part_masks_inf_and_nan_padding():
     raw_bf16 = raw_bf16.at[0, 3].set(jnp.bfloat16(jnp.nan))
     raw_bf16 = raw_bf16.at[8:, :].set(jnp.bfloat16(-jnp.inf))
     raw_i16 = jax.lax.bitcast_convert_type(raw_bf16, jnp.int16)
-    live_mask = jnp.arange(16)[:, None] < 4
-    cleaned = comb._clean_part(raw_i16, live_mask)
+    live_mask = (jnp.arange(16)[:, None] < 4).astype(jnp.int32)
+
+    # pltpu.bitcast only lowers inside a kernel, so run the helper in one
+    # (TPU interpret mode keeps this on the CPU lane).
+    def kernel(part_ref, mask_ref, out_ref):
+        out_ref[...] = comb._clean_part(part_ref[...], mask_ref[...] != 0)
+
+    cleaned = pl.pallas_call(
+        kernel,
+        out_shape=jax.ShapeDtypeStruct(raw_i16.shape, jnp.float32),
+        interpret=pltpu.InterpretParams(),
+    )(raw_i16, live_mask)
     assert bool(jnp.all(jnp.isfinite(cleaned)))
     assert float(cleaned[0, 0]) == 2.5
     assert float(cleaned[0, 1]) == 0.0
@@ -271,12 +336,13 @@ def test_adapter_env_gate_and_uv_compat(monkeypatch):
         assert cp.online_lse_combine_mode_requested() == want
 
     monkeypatch.setenv("TPU_DCP_ONLINE_LSE_COMBINE", "pairs")
-    # Non-multiple-of-16 buckets (24, 40, 48, 56, 72, 88), tiny buckets (<=8),
-    # oversized buckets (>96 at local=4, vdim=512), and float32 partials must
-    # return False so send_layout / oproj_all_reduce / vspace_fused are not
-    # disabled when the kernel cannot run.
-    for t in (1, 4, 8, 24, 40, 48, 56, 72, 88, 128, 256):
+    # Non-multiple-of-16 buckets (24, 40, 56, 72, 88), tiny buckets (<=8),
+    # oversized buckets (>96), and float32 partials must return False so
+    # send_layout / oproj_all_reduce / vspace_fused are not disabled when the
+    # kernel cannot run.
+    for t in (1, 4, 8, 24, 40, 56, 72, 88, 128, 256):
         assert not cp.online_lse_combine_applies(t, True, num_heads=64, vdim=512)
+    assert cp.online_lse_combine_applies(48, True, num_heads=64, vdim=512)
     for t in TOKEN_BUCKETS:
         assert cp.online_lse_combine_applies(t, True, num_heads=64, vdim=512)
         assert not cp.online_lse_combine_applies(
@@ -287,6 +353,37 @@ def test_adapter_env_gate_and_uv_compat(monkeypatch):
         assert not cp.vspace_fused_applies(
             t, True, num_heads=64, vdim=128, combine_dtype=torch.bfloat16
         )
+
+
+def test_adapter_gate_traces_under_torch_compile(monkeypatch):
+    """``online_lse_combine_applies`` runs inside vLLM's compile of the MLA
+    forward, which marks the token dimension dynamic. The gate must trace
+    without pinning the token count next to another gate at the 16-token edge,
+    and keep the eager routing."""
+    pytest.importorskip("torch")
+    import torch
+
+    from vllm_torchtpu.layers.adapter import cp_mla_attention as cp
+
+    fake_group = types.SimpleNamespace(
+        world_size=16, rank_in_group=0, ranks=list(range(16)), cpu_group=None
+    )
+    monkeypatch.setattr(cp, "get_dcp_group", lambda: fake_group)
+    monkeypatch.setenv("TPU_DCP_ONLINE_LSE_COMBINE", "pairs")
+
+    def route(x):
+        t = x.shape[0]
+        y = x * 2 if t <= 16 else x  # another decode gate at the 16-token edge
+        if cp.online_lse_combine_applies(t, True, num_heads=64, vdim=512):
+            return y + 1
+        return y - 1
+
+    for tokens, want in ((16, 3.0), (32, 2.0), (96, 2.0), (192, 0.0)):
+        torch._dynamo.reset()
+        x = torch.ones(tokens)
+        torch._dynamo.mark_dynamic(x, 0)
+        compiled = torch.compile(route, fullgraph=True, backend="eager")
+        assert float(compiled(x)[0]) == want
 
 
 def _run_16cpu_worker() -> dict:

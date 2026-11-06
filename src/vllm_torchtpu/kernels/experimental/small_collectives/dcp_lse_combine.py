@@ -85,6 +85,67 @@ HEADER_ROWS = 16
 TILE_ROWS = 16
 MAX_LIVE_STEPS = 8
 DEFAULT_VMEM_LIMIT_BYTES = 32 * 1024 * 1024
+# Largest decode bucket validated on TPU v7x (numerics, race detector and
+# Mosaic lowering at DCP8 and DCP16). Larger buckets keep the XLA all-gather +
+# reduce-scatter merge.
+MAX_COMBINE_TOKENS = 96
+# Share of the scoped VMEM limit that the kernel's buffers may take; the rest
+# is left for Mosaic temporaries.
+VMEM_BUFFER_FRACTION = 0.8
+
+
+def _vmem_buffer_bytes(
+    tokens: int,
+    num_heads: int,
+    num_cores: int,
+    vdim: int,
+    mode: str,
+) -> int:
+    """VMEM bytes of the kernel's input, scratch and output buffers."""
+    local = num_heads // num_cores
+    block_rows = HEADER_ROWS + tokens * local
+    partial_bytes = tokens * num_heads * vdim * 2
+    lse_bytes = tokens * ((num_heads + LANES - 1) // LANES * LANES) * 4
+    slots = 2 * num_cores if mode == "flat" else 4 * (num_cores // 2)
+    scratch_bytes = slots * block_rows * vdim * 2
+    out_bytes = tokens * ((local + 7) // 8 * 8) * vdim * 2
+    return partial_bytes + lse_bytes + scratch_bytes + out_bytes
+
+
+def online_lse_combine_geometry_supported(
+    num_heads: int,
+    num_cores: int,
+    vdim: int,
+    mode: str = "pairs",
+    vmem_limit_bytes: int = DEFAULT_VMEM_LIMIT_BYTES,
+) -> bool:
+    """Whether every 16-row bucket up to ``MAX_COMBINE_TOKENS`` fits the kernel
+    for ``num_heads`` x ``vdim`` over ``num_cores`` ranks in ``mode``.
+
+    Takes no token count, so trace-time dispatch can pair it with bucket-edge
+    token gates without constraining the symbolic token count. Buffers grow
+    with the token count, so the largest bucket bounds them all.
+    """
+    if mode not in ("pairs", "flat"):
+        return False
+    if (
+        num_cores < 2
+        or num_heads < num_cores
+        or num_heads % num_cores != 0
+        or vdim < LANES
+        or vdim % LANES != 0
+    ):
+        return False
+    if mode == "pairs" and (num_cores < 4 or num_cores % 2 != 0):
+        return False
+    local = num_heads // num_cores
+    if MAX_COMBINE_TOKENS * local > 8 * vdim:
+        return False
+    budget = int(vmem_limit_bytes * VMEM_BUFFER_FRACTION)
+    return (
+        _vmem_buffer_bytes(MAX_COMBINE_TOKENS, num_heads, num_cores, vdim, mode)
+        <= budget
+    )
 
 
 def online_lse_combine_supported(
@@ -93,13 +154,20 @@ def online_lse_combine_supported(
     num_cores: int,
     vdim: int,
     mode: str = "pairs",
+    vmem_limit_bytes: int = DEFAULT_VMEM_LIMIT_BYTES,
 ) -> bool:
     """Whether ``[tokens, num_heads, vdim]`` over ``num_cores`` ranks is valid
-    for ``dcp_online_lse_combine`` in ``mode`` (``'pairs'`` or ``'flat'``)."""
+    for ``dcp_online_lse_combine`` in ``mode`` (``'pairs'`` or ``'flat'``).
+
+    For a concrete token count (kernel entry, the XLA-fallback check inside the
+    traced JAX function). Trace-time dispatch on a symbolic token count uses
+    bucket-edge gates and ``online_lse_combine_geometry_supported`` instead.
+    """
     if mode not in ("pairs", "flat"):
         return False
     if (
         tokens < TILE_ROWS
+        or tokens > MAX_COMBINE_TOKENS
         or tokens % TILE_ROWS != 0
         or num_cores < 2
         or num_heads < num_cores
@@ -111,7 +179,10 @@ def online_lse_combine_supported(
     if mode == "pairs" and (num_cores < 4 or num_cores % 2 != 0):
         return False
     local = num_heads // num_cores
-    return tokens * local <= 8 * vdim
+    if tokens * local > 8 * vdim:
+        return False
+    budget = int(vmem_limit_bytes * VMEM_BUFFER_FRACTION)
+    return _vmem_buffer_bytes(tokens, num_heads, num_cores, vdim, mode) <= budget
 
 
 def mesh_has_chip_pairs(mesh: jax.sharding.Mesh, axis: str) -> bool:
@@ -299,13 +370,13 @@ def _unpack_lse_header(hdr_i16: jax.Array, part_rows: int) -> jax.Array:
 
 
 def _clean_part(part_i16: jax.Array, live_mask_col: jax.Array | None) -> jax.Array:
-    """Bitcast ``int16[rows, vdim]`` to ``bf16``, zero non-finite values (and
-    dead rows when ``live_mask_col`` is given), and widen to ``float32``."""
-    part = pltpu.bitcast(part_i16, jnp.bfloat16)
+    """Bitcast ``int16[rows, vdim]`` to ``bf16``, widen to ``float32``, and zero
+    non-finite values (and dead rows when ``live_mask_col`` is given)."""
+    part = pltpu.bitcast(part_i16, jnp.bfloat16).astype(jnp.float32)
     valid = jnp.isfinite(part)
     if live_mask_col is not None:
         valid = valid & live_mask_col
-    return jnp.where(valid, part, jnp.bfloat16(0)).astype(jnp.float32)
+    return jnp.where(valid, part, 0.0)
 
 
 def _merge_two_blocks(
@@ -436,7 +507,14 @@ def dcp_online_lse_combine(
         raise ValueError(
             f"lse shape {lse.shape} does not match partial {partial.shape[:2]}"
         )
-    if not online_lse_combine_supported(tokens, num_heads, num_cores, vdim, mode=mode):
+    if not online_lse_combine_supported(
+        tokens,
+        num_heads,
+        num_cores,
+        vdim,
+        mode=mode,
+        vmem_limit_bytes=vmem_limit_bytes,
+    ):
         raise ValueError(
             f"Unsupported dcp_online_lse_combine geometry: tokens={tokens}, "
             f"heads={num_heads}, cores={num_cores}, vdim={vdim}, mode={mode!r}"
