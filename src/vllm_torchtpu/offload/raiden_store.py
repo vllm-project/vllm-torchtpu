@@ -190,6 +190,68 @@ def _worker_kv_bytes_per_block(kv_cache_config: Any) -> int:
     )
 
 
+_CGROUP_DIR = "/sys/fs/cgroup"
+# Headroom kept below the cgroup limit for the page cache, kernel memory and
+# growth after registration.
+_HOST_POOL_CGROUP_MARGIN = 0.03
+
+
+def _read_cgroup_memory(cgroup_dir: str = _CGROUP_DIR) -> tuple[int, int] | None:
+    """(memory.max, non-reclaimable bytes in use) of this cgroup (v2), or None.
+
+    Non-reclaimable = anon + shmem from memory.stat: process heaps and tmpfs
+    (/dev/shm compile caches) cannot be dropped to make room for pinned pages,
+    while the page cache (e.g. checkpoint reads) can.
+    """
+    try:
+        with open(os.path.join(cgroup_dir, "memory.max")) as f:
+            raw_max = f.read().strip()
+        if raw_max == "max":
+            return None
+        limit = int(raw_max)
+        stats: dict[str, int] = {}
+        with open(os.path.join(cgroup_dir, "memory.stat")) as f:
+            for line in f:
+                key, _, value = line.partition(" ")
+                if key in ("anon", "shmem"):
+                    stats[key] = int(value)
+    except (OSError, ValueError):
+        return None
+    if len(stats) != 2:
+        return None
+    return limit, stats["anon"] + stats["shmem"]
+
+
+def check_host_pool_fits_cgroup(pool_bytes: int, cgroup_dir: str = _CGROUP_DIR) -> None:
+    """Raise if pinning `pool_bytes` more would exceed the container limit.
+
+    Logs the figures either way; does nothing when the cgroup is unreadable or
+    unlimited.
+    """
+    memory = _read_cgroup_memory(cgroup_dir)
+    if memory is None:
+        return
+    limit, in_use = memory
+    budget = int(limit * (1 - _HOST_POOL_CGROUP_MARGIN))
+    gib = float(1 << 30)
+    logger.info(
+        "TPURaidenOffloadingConnector: host pool %.1f GiB to pin; container "
+        "limit %.1f GiB, non-reclaimable in use (anon+shmem) %.1f GiB",
+        pool_bytes / gib,
+        limit / gib,
+        in_use / gib,
+    )
+    if in_use + pool_bytes > budget:
+        raise ValueError(
+            "TPURaidenOffloadingConnector: the host pool does not fit the "
+            f"container: pinning {pool_bytes / gib:.1f} GiB on top of "
+            f"{in_use / gib:.1f} GiB non-reclaimable (anon+shmem) exceeds "
+            f"{budget / gib:.1f} GiB ({1 - _HOST_POOL_CGROUP_MARGIN:.0%} of the "
+            f"{limit / gib:.1f} GiB limit); lower cpu_bytes_to_use "
+            "(--kv-offloading-size)"
+        )
+
+
 def draft_kv_layer_names(kv_cache_config: Any) -> set[str]:
     """Layers holding a speculative drafter's K/V in a multi-shape KV group.
 
@@ -2701,6 +2763,16 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
         )
         self.kernel_physical_blocks_capacity = (
             self.offload_logical_blocks_capacity * self.device_block_size_factor
+        )
+        # The workers pin the whole host pool when they register, which is
+        # after warmup -- when compile caches and worker heaps are at their
+        # peak. A pool that does not fit gets the container OOM-killed with no
+        # trace, so check it here (the scheduler builds its spec right before
+        # waiting for those registrations) and fail with the numbers instead.
+        # Per engine: under DP another engine's pool may already be pinned and
+        # counted in use, so counting it again could refuse a pool that fits.
+        check_host_pool_fits_cgroup(
+            self.offload_logical_blocks_capacity * bytes_per_block_all_ranks
         )
 
         # Cross-instance KV sharing: configured via extra_config. Setting
