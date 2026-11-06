@@ -74,6 +74,10 @@ if TYPE_CHECKING:
     FUSED_MOE_DECODE_KERNEL_MAX_TOKENS: int = 256
     FUSED_MOE_DECODE_KERNEL_FOLD: str = "off"
     TPU_MOE_SINGLE_SORT: bool = True
+    TPU_MOE_NONEP_GATHER: str = "xla"
+    TPU_MOE_NONEP_GATHER_COLS: int = 0
+    TPU_MOE_NONEP_GATHER_CHUNK: int = 16384
+    TPU_MOE_NONEP_PERMUTE: str = "sorts"
     USE_MOE_TP_DECODE_KERNEL: bool = False
     RAGGED_GATHER_REDUCE_VERSION: str = "v2"
     USE_PHASED_PROFILER: bool = False
@@ -1078,6 +1082,43 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Build the MoE permutation, its inverse, and the sorted token ids from
     # one packed sort instead of three. The ragged (counting sort) path ignores it.
     "TPU_MOE_SINGLE_SORT": env_bool("TPU_MOE_SINGLE_SORT", True),
+    # Token movement of the whole-expert (non-EP) grouped MoE path, as the
+    # PP8xTP1 prefill stages run it (fused_moe_gmm.prepare_routed_gmm_inputs).
+    # Gather of the routed rows before the expert GMM:
+    #   "xla"          hidden_states[token_indices_sorted]; XLA picks the lowering.
+    #                  A [3200, 2560] bf16 source table sits in VMEM and gathers
+    #                  at ~4 ns per row; a [6400, 2560] one stays in HBM and
+    #                  gathers at ~36 ns per row (2.31 ms per call, aa1 xprof).
+    #   "xla_colchunk" the same gather per block of TPU_MOE_NONEP_GATHER_COLS
+    #                  columns, concatenated, so each block's source table is
+    #                  small enough for VMEM. Bitwise the same rows.
+    #   "xla_chunked"  the same gather in pieces of TPU_MOE_NONEP_GATHER_CHUNK
+    #                  rows (the source table is unchanged; a control).
+    #   "sc"           the SparseCore ragged_gather_v2 kernel.
+    "TPU_MOE_NONEP_GATHER": env_with_choices(
+        "TPU_MOE_NONEP_GATHER",
+        "xla",
+        ["xla", "xla_colchunk", "xla_chunked", "sc"],
+        case_sensitive=False,
+    ),
+    # Columns per block for "xla_colchunk". 0 picks the widest block (a
+    # multiple of 128 dividing the hidden size) whose source table is at most
+    # 3200 x 2560 bf16 bytes, the largest size measured in VMEM; a step whose
+    # whole table fits keeps the single unchunked gather.
+    "TPU_MOE_NONEP_GATHER_COLS": env_nonnegative_int("TPU_MOE_NONEP_GATHER_COLS", 0),
+    "TPU_MOE_NONEP_GATHER_CHUNK": env_int("TPU_MOE_NONEP_GATHER_CHUNK", 16384),
+    # Permutation metadata of the non-EP path above TPU_MOE_SINGLE_SORT's row
+    # cap: "sorts" runs three sorts (argsort, its inverse, the packed token
+    # ids); "two_sorts" takes the sorted token ids from the argsort by
+    # division; "counting" takes the inverse permutation and the group sizes
+    # from the one-hot counting sort (block 1024) and keeps one argsort.
+    # All three give the same permutation.
+    "TPU_MOE_NONEP_PERMUTE": env_with_choices(
+        "TPU_MOE_NONEP_PERMUTE",
+        "sorts",
+        ["sorts", "two_sorts", "counting"],
+        case_sensitive=False,
+    ),
     # Serve eligible tensor-parallel MoE layers (sigmoid + correction-bias
     # top-k with renormalization, one shared expert, FP8 per-channel weights)
     # with one op that also covers the shared expert and the TP all-reduce:

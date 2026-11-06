@@ -181,6 +181,11 @@ def _build_fused_moe_custom_op(
         onehot_moe_permute_threshold=resolve_onehot_permute_threshold(),
         rhs_quant_dtype=rhs_quant_dtype,
         skip_padded_tokens=skip_padded_tokens,
+        # Token movement of the whole-expert (non-EP) path; envs.TPU_MOE_NONEP_*.
+        nonep_permute=envs.TPU_MOE_NONEP_PERMUTE.lower(),
+        nonep_gather=envs.TPU_MOE_NONEP_GATHER.lower(),
+        nonep_gather_cols=envs.TPU_MOE_NONEP_GATHER_COLS,
+        nonep_gather_chunk=envs.TPU_MOE_NONEP_GATHER_CHUNK,
     )
 
     fused_moe_kernel_impl = pallas.jax_op(op_name, wrapped_fn)
