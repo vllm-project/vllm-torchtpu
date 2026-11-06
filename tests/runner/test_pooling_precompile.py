@@ -127,10 +127,12 @@ def _reference(pooler, hidden_states, prompt_lens, params):
 
 
 def _padded_hidden(prompt_lens, t_pad, *, dtype=torch.float32, pad_value=0.0):
-    torch.manual_seed(0)
+    # A local CPU generator: torch.manual_seed also seeds torch_tpu, which opens
+    # a TPU device and fails these CPU-only tests when the chip is busy.
+    gen = torch.Generator().manual_seed(0)
     total = sum(prompt_lens)
     hidden = torch.full((t_pad, HIDDEN), pad_value, dtype=dtype)
-    hidden[:total] = torch.randn(total, HIDDEN).to(dtype)
+    hidden[:total] = torch.randn(total, HIDDEN, generator=gen).to(dtype)
     return hidden
 
 
@@ -254,8 +256,11 @@ def test_static_pool_matryoshka_and_mixed_activation():
 
 
 def test_static_pool_with_projector():
-    torch.manual_seed(1)
+    gen = torch.Generator().manual_seed(1)
     projector = torch.nn.Linear(HIDDEN, 12)
+    with torch.no_grad():
+        projector.weight.copy_(torch.randn(12, HIDDEN, generator=gen))
+        projector.bias.copy_(torch.randn(12, generator=gen))
     prompt_lens = [2, 7]
     t_pad, r_pad = 16, 8
     for pooling_type in ("LAST", "MEAN"):
