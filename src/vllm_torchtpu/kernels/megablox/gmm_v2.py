@@ -1456,8 +1456,8 @@ def gmm_v2(
 # activation rows are rounded the way the gate/up kernel stores them.
 
 
-# Smallest row bucket of gmm_v2_mlp; the other bucket is the whole row tile.
-DEFAULT_MLP_BUCKET = 32
+# Row buckets of gmm_v2_mlp below the row tile (the tile is always the last).
+DEFAULT_MLP_BUCKETS = (32, 64)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1542,8 +1542,9 @@ def make_mlp_configs(
     )
     tile_m = up.tiles.tile_m
     if buckets is None:
-        # Decode steps route a few rows to each expert: most tiles fit 32 rows.
-        buckets = (DEFAULT_MLP_BUCKET,)
+        # Decode steps route a few rows to each expert: most tiles fit 32 rows,
+        # larger batches or skewed routing 64.
+        buckets = DEFAULT_MLP_BUCKETS
     # Buckets of the row tile or larger collapse into the tile.
     buckets = tuple(sorted({b for b in buckets if b < tile_m})) + (tile_m,)
     cfgs = MlpConfigs(
