@@ -15,8 +15,13 @@
 
 `fake_runner(...)` sets every attribute `RunnerView` and the runtime's
 startup checks read, with serving-like defaults (TP=1, no draft, no
-connectors), so a plugin's `create` / `bind` / `decide` can run on CPU.
-`RunnerView` reads them directly: a runner stand-in must set them all.
+connectors, the KV cache initialized), so a plugin's `create` / `bind` /
+`decide` can run on CPU. `RunnerView` reads them directly: a runner stand-in
+must set them all. Each attribute is one `TPUModelRunner` (or vLLM's
+`GPUModelRunner`, its base) sets.
+
+This module ships in the package, not under `tests/`, because plugin tests
+outside this repository use it (directly or through `testkit`).
 """
 
 from __future__ import annotations
@@ -36,7 +41,6 @@ def fake_runner(
     speculative_tokens: int = 0,
     token_paddings: tuple[int, ...] = (16, 32, 64),
     req_block_pairs: tuple[tuple[int, int], ...] = ((8, 4),),
-    max_pages_per_seq: int | None = None,
     ckpt_window: int | None = None,
     mamba_slot_read_offsets: Any = None,
     uses_mrope: bool = False,
@@ -52,9 +56,17 @@ def fake_runner(
     supports_mm_inputs: bool = False,
     multimodal_config: Any = None,
     mesh: Any = None,
+    kv_cache_initialized: bool = True,
     **extra: Any,
 ) -> SimpleNamespace:
-    """A CPU runner stand-in; `extra` sets (or overrides) any attribute."""
+    """A CPU runner stand-in; `extra` sets (or overrides) any attribute.
+
+    `req_block_pairs` are the attention kernel's `(sequences, pages per
+    sequence)` per shape class (max-model-len first; a second entry is the
+    most-model-len class), with `block_size` as its page size.
+    `kv_cache_initialized=False` is the runner before `initialize_kv_cache`
+    (`kv_cache_config` is `None`), as `create` sees it.
+    """
     import torch
 
     spec_cfg = (
@@ -63,11 +75,10 @@ def fake_runner(
         else None
     )
     pairs = tuple((int(r), int(b)) for r, b in req_block_pairs)
-    max_pages = int(max_pages_per_seq if max_pages_per_seq is not None else pairs[0][1])
 
     def attention_kernel_shapes(max_model_len: bool) -> tuple[int, int, int]:
         r, b = pairs[0] if max_model_len or len(pairs) == 1 else pairs[1]
-        return r, (max_pages if max_model_len else b), 0
+        return r, b, int(block_size)
 
     model_cfg = SimpleNamespace(
         hf_config=hf_config,
@@ -111,6 +122,8 @@ def fake_runner(
         _attention_kernel_shapes=attention_kernel_shapes,
         most_model_len=None if len(pairs) == 1 else 1,
         mamba_slot_read_offsets=mamba_slot_read_offsets,
+        # `initialize_kv_cache` sets it; `None` before.
+        kv_cache_config=SimpleNamespace() if kv_cache_initialized else None,
         # As TPUModelRunner: the draft's tokens + 1 with the unified KV
         # layout, else 1.
         _mamba_ckpt_window=int(
@@ -126,7 +139,6 @@ def fake_runner(
         _pp_is_first=True,
         _pp_is_last=True,
         _pcp_enabled=False,
-        _dcp_enabled=False,
         _dp_lockstep_enabled=lambda: False,
         _megakernel=None,
     )

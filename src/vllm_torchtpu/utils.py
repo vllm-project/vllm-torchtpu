@@ -120,8 +120,19 @@ def hbm_usage_bytes(devices: Any) -> list[tuple[int, int]]:
     return usage
 
 
+def local_device_kind() -> str:
+    """The `device_kind` of this process's first local JAX device (e.g.
+    `"TPU7x"`, or `"cpu"` off TPU). No collective."""
+    devices = jax.local_devices()
+    if not devices:
+        raise RuntimeError(
+            "No local JAX devices in this process; can't read the device kind"
+        )
+    return str(devices[0].device_kind)
+
+
 def get_device_name(num_devices: int | None = None):
-    kind = jax.devices()[0].device_kind
+    kind = local_device_kind()
     if "TPU" not in kind:
         raise RuntimeError("Expected TPU devices")
     suffix = ""

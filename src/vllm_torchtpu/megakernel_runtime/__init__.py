@@ -17,7 +17,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from .errors import MegakernelUnsupported
+from .errors import MegakernelPluginError, MegakernelUnsupported
 from .hooks import StepContext, is_suppressed, suppressed
 
 _DRIVER_EXPORTS = frozenset({"ProgramDriver"})
@@ -123,6 +123,7 @@ def __getattr__(name: str) -> Any:
 
 
 __all__ = [
+    "MegakernelPluginError",
     "MegakernelUnsupported",
     "PooledStepExport",
     "ProgramDriver",

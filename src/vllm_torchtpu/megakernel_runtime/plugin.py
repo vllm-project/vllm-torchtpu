@@ -181,6 +181,11 @@ class RunnerView:
     raises rather than falling back to a guess. The raw vLLM `model` is passed
     through: a program may mutate it only after all TP ranks have agreed to
     load the program (in `load`), and the stock forward must stay valid.
+
+    `req_block_pairs`, `max_pages_per_seq` and `mamba_slot_read_offsets`
+    describe the KV cache: they raise until the runner's KV cache is
+    initialized (`runner.kv_cache_config` is set by `initialize_kv_cache`),
+    so `create` can't read them, and `bind` can.
     """
 
     __slots__ = ("_runner", "_tp_rank")
@@ -241,11 +246,20 @@ class RunnerView:
     def token_paddings(self) -> tuple[int, ...]:
         return tuple(int(x) for x in self._runner.num_tokens_paddings)
 
+    def _require_kv_cache(self, name: str) -> None:
+        if self._runner.kv_cache_config is None:
+            raise RuntimeError(
+                f"RunnerView.{name} describes the KV cache, which the runner "
+                "hasn't initialized yet (runner.kv_cache_config is None); read "
+                "it in bind, not in create"
+            )
+
     @property
     def req_block_pairs(self) -> tuple[tuple[int, int], ...]:
         """`(max reqs, blocks per req)` per attention-kernel shape class: the
         max-model-len class, then the most-model-len class if the runner has
-        one and it differs."""
+        one and it differs. Needs the KV cache initialized."""
+        self._require_kv_cache("req_block_pairs")
         shapes = self._runner._attention_kernel_shapes
         r_max, b_max, _ = shapes(True)
         pairs = [(int(r_max), int(b_max))]
@@ -261,6 +275,9 @@ class RunnerView:
 
     @property
     def mamba_slot_read_offsets(self) -> Any:
+        """The runner's per-slot recurrent-state read offsets (`None` without
+        a hybrid model and a draft). Needs the KV cache initialized."""
+        self._require_kv_cache("mamba_slot_read_offsets")
         return self._runner.mamba_slot_read_offsets
 
     @property
@@ -277,21 +294,22 @@ class RunnerView:
 
     @property
     def max_pages_per_seq(self) -> int:
-        """Pages per sequence the attention kernel's max-model-len shape uses."""
-        return int(self._runner._attention_kernel_shapes(True)[1])
+        """Pages per sequence the attention kernel's max-model-len shape uses
+        (`req_block_pairs[0][1]`). Needs the KV cache initialized."""
+        self._require_kv_cache("max_pages_per_seq")
+        return self.req_block_pairs[0][1]
 
     @property
     def device_kind(self) -> str:
-        """The local accelerator's `device_kind` (e.g. `"TPU7x"`); no collective."""
-        dev = self.device
-        if getattr(dev, "type", None) == "tpu":
-            import torch
+        """The local TPU's `device_kind` (e.g. `"TPU7x"`, from
+        `utils.local_device_kind`); for a runner on another device (a CPU
+        test), that device's type. No collective."""
+        dev_type = str(self.device.type)
+        if dev_type != "tpu":
+            return dev_type
+        from vllm_torchtpu.utils import local_device_kind
 
-            attrs = torch.get_device_module("tpu")._get_local_device_attributes()
-            return str(attrs.get("device_kind") or "")
-        import jax
-
-        return str(getattr(jax.local_devices()[0], "device_kind", "") or "")
+        return local_device_kind()
 
 
 @dataclasses.dataclass(slots=True)
