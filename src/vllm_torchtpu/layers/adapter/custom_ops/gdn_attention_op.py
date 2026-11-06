@@ -505,9 +505,13 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         if spec is None:
             return None
         assert isinstance(spec, MambaSpec)
+        from vllm_torchtpu.distributed.pcp import pcp_splits_tokens
+
+        # A model whose PCP ranks all run every head (qwen4_exp) keeps the
+        # whole state per rank; only the head-split PCP layout shrinks it.
         return _localize_gdn_mamba_spec_for_pcp(
             spec,
-            _get_pcp_size(vllm_config),
+            _get_pcp_size(vllm_config) if pcp_splits_tokens(vllm_config) else 1,
             num_kq_heads=self.tp_head_geometry.local_num_kq_heads,
             num_v_heads=self.tp_head_geometry.local_num_v_heads,
             d_k=self.head_k_dim,
