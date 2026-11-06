@@ -177,6 +177,9 @@ def pcp_shard(x: torch.Tensor) -> torch.Tensor:
     from vllm_torchtpu.distributed.pcp import get_pcp_rank
 
     size = pcp_world_size()
+    # State that the step divides by the group, so the gathered result's
+    # size * (tokens // size) rows trace as the step's own token count.
+    torch._check(x.shape[0] % size == 0)
     rows = x.shape[0] // size
     return x.narrow(0, get_pcp_rank() * rows, rows)
 
