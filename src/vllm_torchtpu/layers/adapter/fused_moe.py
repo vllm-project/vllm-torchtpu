@@ -191,6 +191,7 @@ def _build_fused_moe_custom_op(
         nonep_gmm_hoist_quant=envs.TPU_MOE_NONEP_GMM_HOIST_QUANT,
         nonep_gmm2_rhs_split=int(envs.TPU_MOE_NONEP_GMM2_RHS_SPLIT),
         nonep_gmm_experts_per_visit=int(envs.TPU_MOE_NONEP_GMM_EXPERTS_PER_VISIT),
+        nonep_combine_packed=envs.TPU_MOE_NONEP_COMBINE_PACKED,
     )
 
     fused_moe_kernel_impl = pallas.jax_op(op_name, wrapped_fn)

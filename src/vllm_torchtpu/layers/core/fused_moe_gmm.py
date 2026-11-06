@@ -237,6 +237,7 @@ def gmm_wrapper(
     hoist_lhs_quant=False,
     rhs_split=1,
     experts_per_visit=1,
+    pack_out=False,
 ):
     # fp4 weights: keep bf16 activations. Quantizing activations to fp8 collapses
     # fp4 accuracy (error compounds across MoE layers) with no decode speedup
@@ -262,6 +263,7 @@ def gmm_wrapper(
         **({"hoist_lhs_quant": True} if hoist_lhs_quant else {}),
         **({"rhs_split": rhs_split} if rhs_split > 1 else {}),
         **({"experts_per_visit": experts_per_visit} if experts_per_visit > 1 else {}),
+        **({"pack_out": True} if pack_out else {}),
     )
 
 
@@ -632,6 +634,7 @@ def moe_gmm(
     nonep_gmm_hoist_quant: bool = False,
     nonep_gmm2_rhs_split: int = 1,
     nonep_gmm_experts_per_visit: int = 1,
+    nonep_combine_packed: bool = False,
 ) -> jax.Array:
     """Run grouped GEMM for routed tokens and reduce back to tokens.
 
@@ -722,6 +725,20 @@ def moe_gmm(
             )
         return jnp.concatenate(blocks, axis=1)
 
+    # TPU_MOE_NONEP_COMBINE_PACKED: gmm2 stores each row's bf16 column pairs
+    # (j, j + hidden / 2) as whole 32-bit words (gmm_v2 pack_out) and the
+    # SparseCore combine gathers single rows instead of row pairs: half the
+    # gather bytes, the same values and sums.
+    packed = (
+        nonep_combine_packed
+        and not use_ep
+        and w2_bias is None
+        and rhs_split == 1
+        and x.dtype == jnp.bfloat16
+        and get_packing_factor(w2.dtype, rhs_quant_dtype) == 1
+        and (size_n // 2) % 128 == 0
+        and _local_ragged_combine_eligible(gmm1_res.shape[0], size_n, x.dtype, **combine_kw)
+    )
     gmm2_res = gmm_wrapper(
         gmm1_res,
         w2,
@@ -736,7 +753,17 @@ def moe_gmm(
         hoist_lhs_quant=hoist,
         rhs_split=rhs_split,
         experts_per_visit=epv,
+        pack_out=packed,
     )
+    if packed:
+        return ragged_gather_reduce_v3(
+            gmm2_res,
+            argsort_revert_indices,
+            topk_weights_flat,
+            valid_mask_flat,
+            reduce_group_size=topk,
+            x_packed=True,
+        ).astype(x.dtype)
     # The destination-major kernel packs source indices into 20 bits and
     # processes 16-lane SparseCore tiles.
     if _local_ragged_combine_eligible(
@@ -835,6 +862,7 @@ def moe_gmm(
         "nonep_gmm_hoist_quant",
         "nonep_gmm2_rhs_split",
         "nonep_gmm_experts_per_visit",
+        "nonep_combine_packed",
     ),
 )
 def fused_moe_func(
@@ -864,6 +892,7 @@ def fused_moe_func(
     nonep_gmm_hoist_quant: bool = False,
     nonep_gmm2_rhs_split: int = 1,
     nonep_gmm_experts_per_visit: int = 1,
+    nonep_combine_packed: bool = False,
 ) -> jax.Array:
     """Run MoE with precomputed expert ids and weights.
 
@@ -990,5 +1019,6 @@ def fused_moe_func(
         nonep_gmm_hoist_quant=nonep_gmm_hoist_quant,
         nonep_gmm2_rhs_split=nonep_gmm2_rhs_split,
         nonep_gmm_experts_per_visit=nonep_gmm_experts_per_visit,
+        nonep_combine_packed=nonep_combine_packed,
     )
     return x[:num_tokens, :hidden_size]

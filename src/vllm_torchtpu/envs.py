@@ -94,6 +94,7 @@ if TYPE_CHECKING:
     TPU_MOE_NONEP_GMM2_RHS_SPLIT: str = "1"
     TPU_MOE_NONEP_GMM_EXPERTS_PER_VISIT: str = "1"
     TPU_SC_COMBINE_DENSE: str = ""
+    TPU_MOE_NONEP_COMBINE_PACKED: bool = False
     USE_MOE_TP_DECODE_KERNEL: bool = False
     RAGGED_GATHER_REDUCE_VERSION: str = "v2"
     USE_PHASED_PROFILER: bool = False
@@ -1317,6 +1318,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # (indexed scatter-add). Read at trace time by ragged_gather_reduce_v3;
     # registered here so the compile-cache key sees it. Bitwise the same output.
     "TPU_SC_COMBINE_DENSE": lambda: os.getenv("TPU_SC_COMBINE_DENSE", "").strip(),
+    # The non-EP second GMM stores each row's bf16 column pairs (j, j + N/2)
+    # as whole 32-bit words (gmm_v2 pack_out), and the SparseCore combine
+    # gathers single rows instead of row pairs: half the gather bytes.
+    # Bitwise the same output.
+    "TPU_MOE_NONEP_COMBINE_PACKED": env_bool("TPU_MOE_NONEP_COMBINE_PACKED"),
     # Serve eligible tensor-parallel MoE layers (sigmoid + correction-bias
     # top-k with renormalization, one shared expert, FP8 per-channel weights)
     # with one op that also covers the shared expert and the TP all-reduce:

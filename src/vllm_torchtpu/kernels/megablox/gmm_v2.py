@@ -356,6 +356,10 @@ class GmmConfigs:
     # Consecutive experts per pipeline step (one block of E experts' weights,
     # one visit over their rows). Amortizes the per-step fixed cost.
     experts_per_visit: int = 1
+    # Store the bf16 output as uint32 [M, N/2], word j = bits(col j) << 16 |
+    # bits(col j + N/2): each row's values in whole 32-bit words, so a row
+    # gather (the SparseCore combine) moves only that row. Same bf16 values.
+    pack_out: bool = False
 
     @property
     def num_quant_blocks_per_tile_k(self) -> int:
@@ -464,12 +468,33 @@ def generate_block_specs(
         bias=rhs_bias_block_spec,
     )
 
+    out_cols = cfgs.tiles.tile_n // 2 if cfgs.pack_out else cfgs.tiles.tile_n
     out_block_spec = pl.BlockSpec(
-        (bounded_slice_gm, cfgs.dims.size_lhs_sublane, cfgs.tiles.tile_n),
+        (bounded_slice_gm, cfgs.dims.size_lhs_sublane, out_cols),
         index_map.out_index_map,
     )
 
     return (lhs_block_spec, rhs_block_spec), out_block_spec
+
+
+def pack_halves(v: jax.Array) -> jax.Array:
+    """bf16 [..., n] -> uint32 [..., n/2]: word j = bits(v[j]) << 16 | bits(v[j + n/2]).
+
+    bf16 -> f32 appends 16 zero bits, so the f32 word holds the bf16 bits in
+    its high half; only 32-bit ops are used."""
+    h = v.shape[-1] // 2
+    hi = lax.bitcast_convert_type(v[..., :h].astype(jnp.float32), jnp.uint32)
+    lo = lax.bitcast_convert_type(v[..., h:].astype(jnp.float32), jnp.uint32)
+    return jnp.bitwise_or(
+        jnp.bitwise_and(hi, jnp.uint32(0xFFFF0000)), jnp.right_shift(lo, jnp.uint32(16))
+    )
+
+
+def unpack_halves(u: jax.Array) -> jax.Array:
+    """Inverse of pack_halves: uint32 [..., h] -> bf16 [..., 2h] (exact)."""
+    hi = lax.bitcast_convert_type(jnp.bitwise_and(u, jnp.uint32(0xFFFF0000)), jnp.float32)
+    lo = lax.bitcast_convert_type(jnp.left_shift(u, jnp.uint32(16)), jnp.float32)
+    return jnp.concatenate([hi.astype(jnp.bfloat16), lo.astype(jnp.bfloat16)], axis=-1)
 
 
 # Define kernels.
@@ -706,8 +731,12 @@ def inner_kernel(
             acc_masked = jnp.where(mask, acc, 0)
 
             # Write the final output to the output ref.
-            tiled_out_2d_ref = tiled_out_ref.reshape(-1, cfgs.tiles.tile_n)
-            tiled_out_2d_ref[:acc_m] = acc_masked.astype(tiled_out_ref.dtype)
+            out_cols = tiled_out_ref.shape[-1]
+            tiled_out_2d_ref = tiled_out_ref.reshape(-1, out_cols)
+            if cfgs.pack_out:
+                tiled_out_2d_ref[:acc_m] = pack_halves(acc_masked.astype(cfgs.out_dtype))
+            else:
+                tiled_out_2d_ref[:acc_m] = acc_masked.astype(tiled_out_ref.dtype)
 
             # If this is the first tile for grid[n_id, :, :], we initialize the
             # partial out to zeros. Otherwise, partial out from last tile of
@@ -715,9 +744,18 @@ def inner_kernel(
             partial_out_zeros = jnp.zeros_like(partial_out_ref)
 
             # Accumulate the partial output from the previous step.
-            tiled_out_ref[0] += jnp.where(
-                gm_id == 0, partial_out_zeros, partial_out_ref[...]
-            )
+            if cfgs.pack_out:
+                # the same bf16 add, on the unpacked values
+                tiled_out_ref[0] = pack_halves(
+                    unpack_halves(tiled_out_ref[0])
+                    + unpack_halves(
+                        jnp.where(gm_id == 0, partial_out_zeros, partial_out_ref[...])
+                    )
+                )
+            else:
+                tiled_out_ref[0] += jnp.where(
+                    gm_id == 0, partial_out_zeros, partial_out_ref[...]
+                )
 
             # Consider following case where size_lhs_sublane = 4, number denotes group
             # id and | denotes boundaries between sublanes:
@@ -849,15 +887,15 @@ def _multi_expert_visit(
     e = cfgs.experts_per_visit
     sub = e + 1
     sublane = cfgs.dims.size_lhs_sublane
-    tile_n = cfgs.tiles.tile_n
+    out_cols = tiled_out_ref.shape[-1]
     bucket_base = cfgs.tiles.bucket_base
     num_buckets = cfgs.tiles.tile_m // bucket_base
-    tiled_out_2d_ref = tiled_out_ref.reshape(-1, tile_n)
+    tiled_out_2d_ref = tiled_out_ref.reshape(-1, out_cols)
 
     tile_m = cfgs.tiles.tile_m
     total = metadata_ref.gm_id_to_m_offset[pl.num_programs(1)]
     # +0.0 that the compiler cannot fold away (x + 0.0 -> x drops the sign rule).
-    dyn_zero = jnp.where(gm_id < 0, 1.0, 0.0).astype(tiled_out_ref.dtype)
+    dyn_zero = jnp.where(gm_id < 0, 1.0, 0.0).astype(cfgs.out_dtype)
 
     def gbound(j):
         return metadata_ref.gm_id_to_sub_bounds[gm_id * sub + j]
@@ -885,9 +923,7 @@ def _multi_expert_visit(
                     acc += rhs_s.get_bias().astype(acc.dtype)
                 acc = apply_act_fn(acc, cfgs.fuse_act)
                 rows = start + lax.broadcasted_iota(jnp.int32, acc.shape, 0)
-                mine = jnp.logical_and(lo <= rows, rows < hi)
-                keep = jnp.logical_and(rows < lo, lo > m_start_local)
-                val = acc.astype(tiled_out_ref.dtype)
+                val = acc.astype(cfgs.out_dtype)
                 grow = m_offset + rows
                 norm_a = (grow - (gstart // sublane) * sublane) % tile_m < sublane
                 norm_b = jnp.logical_and(
@@ -895,6 +931,11 @@ def _multi_expert_visit(
                     jnp.logical_and(gend % sublane != 0, gend != total),
                 )
                 val = jnp.where(jnp.logical_or(norm_a, norm_b), val + dyn_zero, val)
+                if cfgs.pack_out:
+                    val = pack_halves(val)  # rows stay rows: row masks apply as is
+                rows = start + lax.broadcasted_iota(jnp.int32, val.shape, 0)
+                mine = jnp.logical_and(lo <= rows, rows < hi)
+                keep = jnp.logical_and(rows < lo, lo > m_start_local)
                 old = tiled_out_2d_ref[pl.ds(start, bucket_m)]
                 zeros = jnp.zeros_like(old)
                 tiled_out_2d_ref[pl.ds(start, bucket_m)] = jnp.where(
@@ -922,11 +963,12 @@ def _multi_expert_visit(
     partial_out_zeros = jnp.zeros_like(partial_out_ref)
     first_group = tiled_out_ref[0]
     group_rows = lax.broadcasted_iota(jnp.int32, first_group.shape, 0)
-    tiled_out_ref[0] = jnp.where(
-        group_rows < m_start_local,
-        first_group + jnp.where(gm_id == 0, partial_out_zeros, partial_out_ref[...]),
-        first_group,
-    )
+    carry_in = jnp.where(gm_id == 0, partial_out_zeros, partial_out_ref[...])
+    if cfgs.pack_out:
+        carried = pack_halves(unpack_halves(first_group) + unpack_halves(carry_in))
+    else:
+        carried = first_group + carry_in
+    tiled_out_ref[0] = jnp.where(group_rows < m_start_local, carried, first_group)
     last_row = m_end_local // sublane
     partial_out_ref[...] = jnp.where(
         m_end_local % sublane == 0,
@@ -1505,6 +1547,7 @@ def get_scope_name(cfgs: GmmConfigs) -> str:
     window += f"-sc{cfgs.trace_scopes}" if cfgs.trace_scopes else ""
     window += f"-rs{cfgs.rhs_split}" if cfgs.rhs_split > 1 else ""
     window += f"-ev{cfgs.experts_per_visit}" if cfgs.experts_per_visit > 1 else ""
+    window += "-po" if cfgs.pack_out else ""
     return (
         f"gmm_v2-g_{dims.size_group}-m_{dims.size_m}-k_{dims.size_k}-act_{cfgs.fuse_act}"
         f"-n_{dims.size_n}{window}-tm_{tiles.tile_m}-tk_{tiles.tile_k}-tn_{tiles.tile_n}"
@@ -1532,6 +1575,7 @@ def make_gmm_configs(
     trace_scopes: int = 0,
     rhs_split: int = 1,
     experts_per_visit: int = 1,
+    pack_out: bool = False,
 ):
     """Fills the GMM config for the GMM kernel."""
 
@@ -1652,6 +1696,20 @@ def make_gmm_configs(
             rhs_split=rhs_split,
         )
 
+    if pack_out and not (
+        fuse_act is None
+        and n_window is None
+        and rhs_split == 1
+        and not zero_initialize
+        and jnp.dtype(out_dtype) == jnp.bfloat16
+        and tiles.tile_n == dims.size_n
+        and (dims.size_n // 2) % pltpu.get_tpu_info().num_lanes == 0
+    ):
+        raise ValueError(
+            f"pack_out needs a bf16, non-fused, unwindowed GMM with one lane-aligned "
+            f"N tile and no zero init ({dims=}, {tiles=}, {out_dtype=})"
+        )
+
     return GmmConfigs(
         dims=dims,
         tiles=tiles,
@@ -1666,6 +1724,7 @@ def make_gmm_configs(
         trace_scopes=trace_scopes,
         rhs_split=rhs_split,
         experts_per_visit=experts_per_visit,
+        pack_out=pack_out,
     )
 
 
@@ -1726,6 +1785,7 @@ def get_metadata(cfgs: GmmConfigs) -> dict[str, str | int | float]:
         "trace_scopes",
         "rhs_split",
         "experts_per_visit",
+        "pack_out",
     ]
 )
 def gmm_v2(
@@ -1750,6 +1810,7 @@ def gmm_v2(
     trace_scopes: int = 0,
     rhs_split: int = 1,
     experts_per_visit: int = 1,
+    pack_out: bool = False,
 ) -> jax.Array:
     """GMM kernel implemented with emit_pipeline.
 
@@ -1791,6 +1852,9 @@ def gmm_v2(
             E-expert weight block, one pass over their rows), amortizing the
             fixed per-step cost. All groups local (no group offset), one k
             tile. Every row is computed exactly as with one expert per step.
+        pack_out: Return uint32 [size_m, size_n / 2] holding the bf16 output
+            column pairs (j, j + size_n / 2) as one word (pack_halves), so each
+            row is whole 32-bit words. Same values (unpack_halves recovers them).
 
     Returns:
         Output of shape [size_m, size_n] ([size_m, width] with n_window).
@@ -1836,6 +1900,7 @@ def gmm_v2(
         trace_scopes=trace_scopes,
         rhs_split=rhs_split,
         experts_per_visit=experts_per_visit,
+        pack_out=pack_out,
     )
     dims = cfgs.dims
     tiles = cfgs.tiles
@@ -1854,7 +1919,11 @@ def gmm_v2(
     acc_cols = 2 * tiles.tile_n if cfgs.fuse_act is not None else tiles.tile_n
     scratch_shapes = [
         # partial_out_ref
-        pltpu.VMEM((dims.size_lhs_sublane, tiles.tile_n), cfgs.out_dtype),
+        (
+            pltpu.VMEM((dims.size_lhs_sublane, tiles.tile_n // 2), jnp.uint32)
+            if cfgs.pack_out
+            else pltpu.VMEM((dims.size_lhs_sublane, tiles.tile_n), cfgs.out_dtype)
+        ),
         # acc_ref
         pltpu.VMEM((tiles.tile_m, acc_cols), cfgs.acc_dtype),
         # metadata_ref
@@ -1892,7 +1961,10 @@ def gmm_v2(
         scratch_shapes += [None, None]
 
     aligned_n = align_to(cfgs.out_size_n, num_lanes)
-    out_init = jax.ShapeDtypeStruct((dims.size_m, aligned_n), cfgs.out_dtype)
+    if cfgs.pack_out:
+        out_init = jax.ShapeDtypeStruct((dims.size_m, aligned_n // 2), jnp.uint32)
+    else:
+        out_init = jax.ShapeDtypeStruct((dims.size_m, aligned_n), cfgs.out_dtype)
     rhs_weights = WeightsRef(weight=rhs, scale=rhs_scale, bias=rhs_bias)
 
     return pl.pallas_call(
@@ -1918,4 +1990,6 @@ def gmm_v2(
         name=get_scope_name(cfgs),
         cost_estimate=get_cost_estimate(cfgs),
         metadata=get_metadata(cfgs),
-    )(group_sizes, group_offset, lhs, rhs_weights)[:size_m, : cfgs.out_size_n]
+    )(group_sizes, group_offset, lhs, rhs_weights)[
+        :size_m, : cfgs.out_size_n // 2 if cfgs.pack_out else cfgs.out_size_n
+    ]

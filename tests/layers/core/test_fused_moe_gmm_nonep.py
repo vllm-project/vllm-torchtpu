@@ -153,7 +153,7 @@ def test_nonep_choices_change_only_the_non_ep_program():
     assert "concatenate" in non_ep and "concatenate" not in jaxpr(False)
 
 
-def _ref_gmm(calls, tiles=None, hoists=None, splits=None, epvs=None):
+def _ref_gmm(calls, tiles=None, hoists=None, splits=None, epvs=None, packs=None):
     """Pure-JAX stand-in for gmm_wrapper that records its n_window (and
     tile_m); every output column is computed independently, as the kernel's
     are."""
@@ -161,12 +161,14 @@ def _ref_gmm(calls, tiles=None, hoists=None, splits=None, epvs=None):
     hoists = [] if hoists is None else hoists
     splits = [] if splits is None else splits
     epvs = [] if epvs is None else epvs
+    packs = [] if packs is None else packs
 
     def gmm(lhs, rhs, rhs_scale, rhs_bias, group_sizes, group_offset, zero_initialize=False,
             fuse_act=None, preferred_element_type=None, rhs_quant_dtype=None, n_window=None,
-            tile_m=0, hoist_lhs_quant=False, rhs_split=1, experts_per_visit=1):
+            tile_m=0, hoist_lhs_quant=False, rhs_split=1, experts_per_visit=1, pack_out=False):
         calls.append(n_window)
         epvs.append(experts_per_visit)
+        packs.append(pack_out)
         tiles.append(tile_m)
         hoists.append(hoist_lhs_quant)
         splits.append(rhs_split)
@@ -177,7 +179,12 @@ def _ref_gmm(calls, tiles=None, hoists=None, splits=None, epvs=None):
         if fuse_act == "silu":
             h = out.shape[1] // 2
             out = jax.nn.silu(out[:, :h]) * out[:, h:]
-        return out.astype(preferred_element_type or lhs.dtype)
+        out = out.astype(preferred_element_type or lhs.dtype)
+        if pack_out:
+            from vllm_torchtpu.kernels.megablox.gmm_v2 import pack_halves
+
+            out = pack_halves(out)
+        return out
 
     return gmm
 
@@ -433,6 +440,94 @@ def test_dense_combine_mode_is_read_and_checked(monkeypatch):
     monkeypatch.setenv("TPU_SC_COMBINE_DENSE", "registers")
     with pytest.raises(ValueError):
         _dense_mode()
+
+
+def test_pack_halves_round_trips_every_non_nan_bf16_value():
+    """gmm_v2 pack_out's word layout: (bits(col j) << 16) | bits(col j + n/2),
+    and both unpackers (gmm_v2, the combine's) restore every bf16 bit pattern
+    exactly, -0.0 and infinities included (NaNs excluded: their payload is not
+    a value)."""
+    from vllm_torchtpu.kernels.megablox.gmm_v2 import pack_halves, unpack_halves
+    from vllm_torchtpu.kernels.sparse_core.ragged_gather_reduce_v3 import unpack_rows
+
+    bits = np.arange(1 << 16, dtype=np.uint32).astype(np.uint16)
+    vals = bits.view(jnp.bfloat16)
+    vals = vals[~np.isnan(vals.astype(np.float32))]
+    n = len(vals) // 256 * 256
+    v = jnp.asarray(vals[:n].reshape(-1, 256))
+    packed = pack_halves(v)
+    assert packed.dtype == jnp.uint32 and packed.shape == (v.shape[0], 128)
+    pb = np.asarray(packed)
+    vb = np.asarray(v).view(np.uint16).astype(np.uint32)
+    np.testing.assert_array_equal(pb, (vb[:, :128] << 16) | vb[:, 128:])
+    for unpack in (unpack_halves, unpack_rows):
+        np.testing.assert_array_equal(np.asarray(unpack(packed)).view(np.uint16), np.asarray(v).view(np.uint16))
+
+
+def test_packed_combine_fallback_equals_the_unpacked_combine(monkeypatch):
+    """Without SparseCores the packed combine unpacks and runs the reference
+    combine: the same bf16 output as the unpacked rows."""
+    import dataclasses as dc
+
+    from jax._src import tpu_info as ti
+    from jax._src.pallas.mosaic import tpu_info as pti
+    from jax.experimental.pallas import tpu as pltpu
+
+    from vllm_torchtpu.kernels.megablox.gmm_v2 import pack_halves
+    from vllm_torchtpu.kernels.sparse_core import ragged_gather_reduce_v3 as v3
+
+    info = dc.replace(ti.get_tpu_info_for_chip(ti.ChipVersion.TPU_7X, 1), sparse_core=None)
+    for mod in (pltpu, ti, pti):
+        monkeypatch.setattr(mod, "get_tpu_info", lambda: info, raising=False)
+    rng = np.random.default_rng(3)
+    t, k, h = 64, 10, 512
+    rows = jnp.asarray(rng.standard_normal((t * k, h)), jnp.bfloat16)
+    idx = jnp.asarray(rng.permutation(t * k), jnp.int32)
+    w = jnp.asarray(rng.random(t * k), jnp.float32)
+    valid = jnp.ones((t * k,), bool)
+    a = v3.ragged_gather_reduce(rows, idx, w, valid, reduce_group_size=k)
+    b = v3.ragged_gather_reduce(pack_halves(rows), idx, w, valid, reduce_group_size=k, x_packed=True)
+    np.testing.assert_array_equal(np.asarray(a).view(np.uint16), np.asarray(b).view(np.uint16))
+
+
+@pytest.mark.parametrize("use_ep,split", [(False, 1), (True, 1), (False, 2)])
+def test_packed_combine_reaches_gmm2_and_the_combine_on_the_unsplit_non_ep_path(monkeypatch, use_ep, split):
+    experts, hidden, inter, topk, tokens = 16, 512, 128, 4, 640
+    k1, k2, k3 = jax.random.split(jax.random.key(8), 3)
+    w1, s1 = _fp8_per_channel(k1, (experts, hidden, 2 * inter))
+    w2, s2 = _fp8_per_channel(k2, (experts, inter, hidden))
+    x = (jax.random.normal(k3, (tokens, hidden), jnp.float32) / 4).astype(jnp.bfloat16)
+    rng = np.random.default_rng(9)
+    ids = jnp.asarray(np.stack([rng.choice(experts, topk, replace=False) for _ in range(tokens)]), jnp.int32)
+    w = jnp.asarray(rng.random((tokens, topk)), jnp.bfloat16)
+    from vllm_torchtpu.kernels.sparse_core.ragged_gather_reduce_v3 import unpack_rows
+
+    seen = []
+
+    def fake_combine(rows, rev, wts, valid, reduce_group_size, x_packed=False):
+        seen.append(x_packed)
+        return _ref_combine(unpack_rows(rows) if x_packed else rows, rev, wts, valid, reduce_group_size)
+
+    monkeypatch.setattr(fused_moe_gmm, "_local_ragged_combine_eligible", lambda *a, **k: True)
+    monkeypatch.setattr(fused_moe_gmm, "ragged_gather_reduce_v3", fake_combine)
+    xs, gs, rev, wf, valid, tok = prepare_routed_gmm_inputs(
+        x, ids, w, local_num_experts=experts, topk=topk, use_ep=False, use_sparse_core=False
+    )
+    outs = []
+    for packed in (False, True):
+        calls, packs = [], []
+        seen.clear()
+        monkeypatch.setattr(fused_moe_gmm, "gmm_wrapper", _ref_gmm(calls, packs=packs))
+        outs.append(fused_moe_gmm.moe_gmm(
+            xs, w1, s1, None, w2, s2, None, gs, rev, wf, valid, tok, activation="silu",
+            num_tokens=tokens, topk=topk, use_ep=use_ep, use_sparse_core=False,
+            nonep_combine_split=split, nonep_combine_packed=packed,
+        ))
+        engaged = packed and not use_ep and split == 1
+        assert packs == [False, engaged] if split == 1 else packs == [False] * (1 + split)
+        if not use_ep:
+            assert seen == [engaged] * split
+    np.testing.assert_array_equal(np.asarray(outs[0]).view(np.uint16), np.asarray(outs[1]).view(np.uint16))
 
 
 # --------------------------------------------------------------------------- TPU

@@ -43,7 +43,8 @@ def _bench_mode() -> str:
     """Bench-only attribution knob (TPU_SC_COMBINE_BENCH, ported from the
     Qwen3.5 branch): "skip_math" keeps the row gathers and drops the
     scatter-adds, "half_cols" scatter-adds the first half of each column
-    partition. With TPU_SC_COMBINE_DENSE=reg, "dense_pairadd" reassociates
+    partition. "packed_wide" halves the column partitions of the packed-row
+    variant. With TPU_SC_COMBINE_DENSE=reg, "dense_pairadd" reassociates
     each run's sums and "dense_forcegate" sends partial blocks through the
     run table: must-fail controls of the hash comparison. Must stay unset in
     serving (the output is then wrong)."""
@@ -159,6 +160,7 @@ def _main_kernel(
     topk: int,
     bench_mode: str = "",
     dense_mode: str = "",
+    x_packed: bool = False,
 ):
     sc_info = pltpu.get_tpu_info().sparse_core
     assert sc_info is not None
@@ -170,6 +172,13 @@ def _main_kernel(
     col_partition_id = core_id % num_column_partitions
     col_size = accum_vmem_ref.shape[-1]
     col_start = col_partition_id * col_size
+    # x_packed: x is uint32 [rows, hidden / 2], word j = bits(col j) << 16 |
+    # bits(col j + hidden / 2) (gmm_v2 pack_out). A route gathers its own row
+    # only (no row pair), half as many bytes; the accumulator's first half
+    # holds columns [p * g, (p + 1) * g) and its second half the same columns
+    # + hidden / 2, where g = col_size / 2 packed columns per partition.
+    gather_cols = col_size // 2 if x_packed else col_size
+    half_hidden = out_hbm_ref.shape[-1] // 2
     metadata_block_size = topk * _TOKEN_BLOCK
     x_32b_hbm_ref = x_hbm_ref.bitcast(jnp.int32)
     out_32b_hbm_ref = out_hbm_ref.bitcast(jnp.uint32)
@@ -194,6 +203,8 @@ def _main_kernel(
         global_block_id = row_partition_id * blocks_per_row_partition + block_id
         valid_route_count = route_counts_ref[...][0]
         fixed_two_routes = valid_route_count == 2 * _TOKEN_BLOCK
+        if x_packed:  # the pair fast path reads row pairs; packed rows take the generic path
+            fixed_two_routes = jnp.bool_(False)
         num_route_chunks = pl.cdiv(valid_route_count, _TOKEN_SUBCHUNK)
 
         # Scatter-add below reads the previous accumulator value, so initialize
@@ -216,9 +227,11 @@ def _main_kernel(
             pltpu.emit_pipeline,
             grid=(num_route_chunks,),
             in_specs=pl.BlockSpec(
-                (pl.Indirect(_TOKEN_SUBCHUNK), col_size),
+                (pl.Indirect(_TOKEN_SUBCHUNK), gather_cols),
                 lambda route_chunk: (
-                    jnp.bitwise_right_shift(
+                    route_indices_slice(route_chunk)
+                    if x_packed
+                    else jnp.bitwise_right_shift(
                         route_indices_slice(route_chunk),
                         1,
                     ),
@@ -275,6 +288,41 @@ def _main_kernel(
                             + weighted_values[pair_start + 1],
                         )
 
+            def packed_halves(route_lane, col_slice):
+                # word = bits(col j) << 16 | bits(col j + hidden / 2); weight both
+                value_i32 = gather_ref[route_lane, col_slice]
+                high = plsc.bitcast(
+                    jnp.bitwise_and(value_i32, jnp.int32(-65536)), jnp.float32
+                )
+                low = plsc.bitcast(jnp.left_shift(value_i32, 16), jnp.float32)
+                high *= route_weights[route_lane]
+                low *= route_weights[route_lane]
+                return high, low
+
+            def packed_generic_column_loop(col_offset):
+                col_slice = pl.ds(col_offset, _TOKEN_SUBCHUNK)
+                feature_hi = col_offset + jnp.arange(_TOKEN_SUBCHUNK, dtype=jnp.int32)
+                feature_lo = feature_hi + gather_cols
+                for route_lane in range(_TOKEN_SUBCHUNK):
+                    high, low = packed_halves(route_lane, col_slice)
+                    destination_indices = jnp.full_like(
+                        feature_hi, route_destinations[route_lane]
+                    )
+                    route_valid = metadata_start + route_lane < valid_route_count
+                    scatter_mask = jnp.broadcast_to(route_valid, (_TOKEN_SUBCHUNK,))
+                    plsc.addupdate_scatter(
+                        accum_vmem_ref,
+                        (destination_indices, feature_hi),
+                        high,
+                        mask=scatter_mask,
+                    )
+                    plsc.addupdate_scatter(
+                        accum_vmem_ref,
+                        (destination_indices, feature_lo),
+                        low,
+                        mask=scatter_mask,
+                    )
+
             def generic_column_loop(col_offset):
                 col_slice = pl.ds(col_offset, _TOKEN_SUBCHUNK)
                 feature_indices = col_offset + jnp.arange(
@@ -316,7 +364,7 @@ def _main_kernel(
 
             if bench_mode == "skip_math":
                 return
-            math_col_size = col_size // 2 if bench_mode == "half_cols" else col_size
+            math_col_size = gather_cols // 2 if bench_mode == "half_cols" else gather_cols
 
             @pl.when(fixed_two_routes)
             def run_fixed_two_route_path():
@@ -356,6 +404,25 @@ def _main_kernel(
                 def dense_column_loop(runs):
                     def body(col_offset):
                         col_slice = pl.ds(col_offset, _TOKEN_SUBCHUNK)
+                        if x_packed:
+                            lo_slice = pl.ds(col_offset + gather_cols, _TOKEN_SUBCHUNK)
+                            for tok, first, length in runs:
+                                row = base_token + tok
+                                if dense_mode == "addupdate":
+                                    for route_lane in range(first, first + length):
+                                        high, low = packed_halves(route_lane, col_slice)
+                                        plsc.addupdate(accum_vmem_ref.at[row, col_slice], high)
+                                        plsc.addupdate(accum_vmem_ref.at[row, lo_slice], low)
+                                    continue
+                                acc_hi = accum_vmem_ref[row, col_slice]
+                                acc_lo = accum_vmem_ref[row, lo_slice]
+                                for route_lane in range(first, first + length):
+                                    high, low = packed_halves(route_lane, col_slice)
+                                    acc_hi = acc_hi + high
+                                    acc_lo = acc_lo + low
+                                accum_vmem_ref[row, col_slice] = acc_hi
+                                accum_vmem_ref[row, lo_slice] = acc_lo
+                            return
                         for tok, first, length in runs:
                             row = base_token + tok
                             lanes = range(first, first + length)
@@ -396,7 +463,7 @@ def _main_kernel(
             )
             def run_generic_path():
                 plsc.parallel_loop(0, math_col_size, step=_TOKEN_SUBCHUNK)(
-                    generic_column_loop
+                    packed_generic_column_loop if x_packed else generic_column_loop
                 )
 
         route_pipeline(x_32b_hbm_ref)
@@ -430,6 +497,24 @@ def _main_kernel(
                 output_row_packed = pl.multiple_of(
                     output_row // 2, _TOKEN_SUBCHUNK // 2
                 )
+                if x_packed:
+                    for half in range(2):
+                        copy = pltpu.make_async_copy(
+                            out_tile_vmem_ref.at[
+                                output_buffer, :, pl.ds(half * gather_cols, gather_cols)
+                            ],
+                            out_32b_hbm_ref.at[
+                                pl.ds(output_row_packed, _TOKEN_SUBCHUNK // 2),
+                                pl.ds(
+                                    half * half_hidden + col_partition_id * gather_cols,
+                                    gather_cols,
+                                ),
+                            ],
+                            output_sem_ref.at[output_buffer * 2 + half],
+                        )
+                        copy.start()
+                        copies.append(copy)
+                    continue
                 copy = pltpu.make_async_copy(
                     out_tile_vmem_ref.at[output_buffer],
                     out_32b_hbm_ref.at[
@@ -451,17 +536,43 @@ def _main_kernel(
     )
 
 
-@functools.partial(jax.jit, static_argnames=("reduce_group_size",))
+def unpack_rows(x: jax.Array) -> jax.Array:
+    """uint32 [rows, h] packed by gmm_v2 pack_out -> bf16 [rows, 2h] (exact)."""
+    hi = jax.lax.bitcast_convert_type(jnp.bitwise_and(x, jnp.uint32(0xFFFF0000)), jnp.float32)
+    lo = jax.lax.bitcast_convert_type(jnp.left_shift(x, jnp.uint32(16)), jnp.float32)
+    return jnp.concatenate([hi.astype(jnp.bfloat16), lo.astype(jnp.bfloat16)], axis=-1)
+
+
+@functools.partial(jax.jit, static_argnames=("reduce_group_size", "x_packed"))
 def ragged_gather_reduce(
     x: jax.Array,
     indices: jax.Array,
     topk_weights: jax.Array,
     valid_rows_mask: jax.Array,
     reduce_group_size: int,
+    x_packed: bool = False,
 ) -> jax.Array:
-    """Destination-major prototype for MoE output combine."""
+    """Destination-major prototype for MoE output combine.
+
+    x_packed: x is gmm_v2's pack_out layout, uint32 [rows, hidden / 2]; the
+    result is the same bf16 [tokens, hidden] as for the unpacked rows."""
+    if x_packed:
+        assert x.dtype == jnp.uint32, x.dtype
+        hidden = 2 * x.shape[-1]
+        sc_info = pltpu.get_tpu_info().sparse_core
+        num_column_partitions = (
+            partition_counts(hidden, pltpu.get_tpu_info())[0] if sc_info is not None else 1
+        )
+        if (
+            sc_info is None
+            or (hidden // 2) % (num_column_partitions * _TOKEN_SUBCHUNK) != 0
+            or jnp.size(x) * 4 * 2 < pltpu.get_tpu_info().vmem_capacity_bytes * 0.6
+        ):
+            return _fallback_implementation(
+                unpack_rows(x), indices, topk_weights, valid_rows_mask, reduce_group_size
+            )
     sc_info = pltpu.get_tpu_info().sparse_core
-    if (
+    if not x_packed and (
         sc_info is None
         or x.dtype != jnp.bfloat16
         or x.shape[-1] % pltpu.get_tpu_info().num_lanes != 0
@@ -474,7 +585,7 @@ def ragged_gather_reduce(
             reduce_group_size,
         )
     dtype_bytes = jax.dtypes.itemsize_bits(x.dtype) // 8
-    if jnp.size(x) * dtype_bytes * 2 < pltpu.get_tpu_info().vmem_capacity_bytes * 0.6:
+    if not x_packed and jnp.size(x) * dtype_bytes * 2 < pltpu.get_tpu_info().vmem_capacity_bytes * 0.6:
         return _fallback_implementation(
             x,
             indices,
@@ -487,10 +598,10 @@ def ragged_gather_reduce(
     if input_size % reduce_group_size != 0:
         raise ValueError(f"{input_size=} must be divisible by {reduce_group_size=}")
     # SparseCore row-packing views BF16 as pairs of rows.
-    if x.shape[0] % 2:
+    if x.shape[0] % 2 and not x_packed:
         x = jnp.pad(x, ((0, 1), (0, 0)))
     num_tokens = input_size // reduce_group_size
-    hidden_size = x.shape[-1]
+    hidden_size = 2 * x.shape[-1] if x_packed else x.shape[-1]
     if x.shape[0] > 1 << _ROUTE_INDEX_BITS:
         raise ValueError(
             f"destination-major prototype supports at most "
@@ -499,6 +610,11 @@ def ragged_gather_reduce(
     num_column_partitions, num_row_partitions = partition_counts(
         hidden_size, pltpu.get_tpu_info()
     )
+    if x_packed and _bench_mode() == "packed_wide" and num_column_partitions % 2 == 0:
+        # bench-only: half as many column partitions, so each packed route DMA is as
+        # large as an unpacked one (half the descriptors, half the bytes)
+        num_column_partitions //= 2
+        num_row_partitions *= 2
 
     token_alignment = num_row_partitions * _TOKEN_BLOCK
     padded_num_tokens = _align_to(num_tokens, token_alignment)
@@ -581,6 +697,7 @@ def ragged_gather_reduce(
             topk=reduce_group_size,
             bench_mode=bench_mode,
             dense_mode=dense_mode,
+            x_packed=x_packed,
         ),
         out_type=jax.ShapeDtypeStruct((padded_num_tokens, hidden_size), jnp.bfloat16),
         compiler_params=pltpu.CompilerParams(
@@ -591,11 +708,12 @@ def ragged_gather_reduce(
         scratch_types=(
             pltpu.VMEM((_TOKEN_BLOCK, col_size), jnp.float32),
             pltpu.VMEM((2, _TOKEN_SUBCHUNK // 2, col_size), jnp.uint32),
-            pltpu.SemaphoreType.DMA((2,)),
+            pltpu.SemaphoreType.DMA((4,) if x_packed else (2,)),
         ),
         mesh=vector_mesh,
         name="sc_ragged_gather_reduce_v3"
         + (f"_{bench_mode}" if bench_mode else "")
-        + (f"_dense_{dense_mode}" if dense_mode else ""),
+        + (f"_dense_{dense_mode}" if dense_mode else "")
+        + ("_packed" if x_packed else ""),
     )(x, route_metadata, route_weights, route_counts)
     return out[:num_tokens]
