@@ -1102,7 +1102,8 @@ def _patch_vllm_hybrid_pcp_block_sizes() -> None:
             scheduler_block_size,
             hash_block_size,
             metrics_collector=None,
-            num_prefill_lookahead=0,
+            num_hash_lookahead_tokens: int = 0,
+            num_prefill_lookahead: int = 0,
             allow_partial_hash_hits: bool = True,
             **kwargs,
         ):

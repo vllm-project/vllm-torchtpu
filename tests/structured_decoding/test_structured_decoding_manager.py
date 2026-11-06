@@ -755,7 +755,7 @@ class TestPrepareSpecStructuredDecodingInput:
         manager = make_manager(
             num_spec_tokens=2, req_id_to_index={"req0": 0, "req1": 1}
         )
-        grammar_output = make_grammar_output(["req1"], [row(20)])
+        grammar_output = make_grammar_output(["req1"], [row(20)] * 3)
         scheduled = {"req0": [1, 2]}
         draft_lengths = np.array([2, 0], dtype=np.int32)
         target_logits = torch.zeros(2, VOCAB_SIZE)

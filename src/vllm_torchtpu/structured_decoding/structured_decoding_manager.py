@@ -73,6 +73,7 @@ class StructuredDecodingManager:
         # padded to a num-tokens bucket (up to max_num_reqs * (1 + K) rows).
         # Prefill-only MTP skips _precompile_rejection_sampler(), so we
         # skip it here as well.
+        max_device_rows = runner.max_num_reqs
         if runner.speculative_config is not None and not runner._mtp_prefill_only:
             from vllm_torchtpu.runner.tpu_runner import _get_padded_token_len
 
@@ -82,6 +83,7 @@ class StructuredDecodingManager:
             # Use min here is because needed can exceed max_num_batched_tokens
             # (which is the largest bucket), and target_logits rows never exceed
             # the largest bucket.
+            
             max_target_rows = _get_padded_token_len(paddings, min(needed, paddings[-1]))
             max_device_rows = max(max_device_rows, max_target_rows)
             self.target_grammar_bitmask_cpu = torch.zeros(
@@ -161,24 +163,15 @@ class StructuredDecodingManager:
 
         num_local = len(local_indices)
         all_rows_structured = num_local == padded_num_reqs
-
+        
         # Standard path: handles all structured batches (all-structured,
         # mixed, or permuted).
         if not all_rows_structured:
             self.grammar_bitmask_np[:padded_num_reqs].fill(0)
             self.require_structured_out_np[:padded_num_reqs].fill(False)
-            if is_contiguous:
-                l0 = local_indices[0]
-                self.require_structured_out_np[l0 : l0 + num_local] = True
-            else:
-                self.require_structured_out_np[local_indices] = True
+            self.require_structured_out_np[local_indices] = True
 
-        if is_contiguous:
-            l0 = local_indices[0]
-            m0 = mask_rows[0]
-            self.grammar_bitmask_np[l0 : l0 + num_local] = bitmask[m0 : m0 + num_local]
-        else:
-            self.grammar_bitmask_np[local_indices] = bitmask[mask_rows]
+        self.grammar_bitmask_np[local_indices] = bitmask[mask_rows]
 
         require_sd = (
             self.device_all_true_require[:padded_num_reqs]
