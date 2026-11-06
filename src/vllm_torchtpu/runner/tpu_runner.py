@@ -4185,6 +4185,15 @@ class TPUModelRunner(GPUModelRunner):
                     model_kwargs=model_kwargs,
                 )
             host_phases.mark("forward_dispatch")
+            if envs.VLLM_TPU_QSA_PREFILL_UNION_COUNT and envs.VLLM_TPU_QSA_PREFILL_UNION_WALK:
+                # D2 engagement (debug, log-only): the step's padded rows and longest sequence, on the host.
+                from vllm_torchtpu.kernels.qwen4_exp.qsa_union_dense import count_union_walk_step
+
+                count_union_walk_step(
+                    int(num_tokens_padded),
+                    int(self.seq_lens_np[:num_reqs].max(initial=0)),
+                    envs.VLLM_TPU_QSA_PREFILL_UNION_COUNT,
+                )
 
             if not self._pp_is_last:
                 # The next stage continues this chunk; logits and sampling

@@ -132,6 +132,11 @@ if TYPE_CHECKING:
     VLLM_TPU_QSA_PREFILL_LEAN: bool = False
     VLLM_TPU_QSA_PREFILL_QUERY_TILE: int = 0
     VLLM_TPU_QSA_PREFILL_Q128_FALLBACK: bool = False
+    VLLM_TPU_QSA_PREFILL_UNION_WALK: int = 0
+    VLLM_TPU_QSA_PREFILL_UNION_MIN_CONTEXT: int = 32768
+    VLLM_TPU_QSA_PREFILL_UNION_CAP: int = 12288
+    VLLM_TPU_QSA_PREFILL_UNION_KV_TILE: int = 1024
+    VLLM_TPU_QSA_PREFILL_UNION_COUNT: int = 0
     VLLM_TPU_QSA_MAIN_KV_DCP: int = 0
     VLLM_TPU_QSA_MTP_KV_DCP: bool = False
     VLLM_TPU_QSA_COMPRESSED_DCP: bool = False
@@ -777,6 +782,33 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # keys); identity/accuracy gated (reports/prereg/q38_attn_tile3200_plan_DRAFT.md).
     "VLLM_TPU_QSA_PREFILL_Q128_FALLBACK": env_bool(
         "VLLM_TPU_QSA_PREFILL_Q128_FALLBACK", default=False
+    ),
+    # Qwen4-exp QSA prefill: the D2 union-walk attention kernel
+    # (qsa_union_dense.union_walk_prefill) with query groups of this many rows
+    # (a divisor of 128; 0, the default, keeps the served block-sparse kernel).
+    # Only Q24/KV2/D256 steps on an FP8 pool of 128-aligned pages, at least
+    # 1024 tokens and a multiple of the group, without DCP, a KV head offset or
+    # LSE output. Each step falls back to the served kernel when its longest
+    # row is below VLLM_TPU_QSA_PREFILL_UNION_MIN_CONTEXT tokens or a group's
+    # union exceeds VLLM_TPU_QSA_PREFILL_UNION_CAP 4-token groups. Not bitwise
+    # against the served kernel (union-order accumulation); accuracy gated.
+    "VLLM_TPU_QSA_PREFILL_UNION_WALK": env_nonnegative_int(
+        "VLLM_TPU_QSA_PREFILL_UNION_WALK", 0
+    ),
+    "VLLM_TPU_QSA_PREFILL_UNION_MIN_CONTEXT": env_nonnegative_int(
+        "VLLM_TPU_QSA_PREFILL_UNION_MIN_CONTEXT", 32768
+    ),
+    "VLLM_TPU_QSA_PREFILL_UNION_CAP": env_nonnegative_int(
+        "VLLM_TPU_QSA_PREFILL_UNION_CAP", 12288
+    ),
+    # KV tile of the union walk: union groups per tile times 4 (256-2048).
+    "VLLM_TPU_QSA_PREFILL_UNION_KV_TILE": env_nonnegative_int(
+        "VLLM_TPU_QSA_PREFILL_UNION_KV_TILE", 1024
+    ),
+    # Debug: log the D2 union walk's eligible prefill steps every N steps on each stage process
+    # (host-side count, log-only, no graph change; 0 = off). See qsa_union_dense.count_union_walk_step.
+    "VLLM_TPU_QSA_PREFILL_UNION_COUNT": env_nonnegative_int(
+        "VLLM_TPU_QSA_PREFILL_UNION_COUNT", 0
     ),
     # Main KV of the target QSA layers split over TP rank pairs that share a
     # KV head (2; 0/1 = off): each rank stores and attends half the tokens,
