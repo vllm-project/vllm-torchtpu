@@ -352,6 +352,20 @@ class DeepseekV41DecoderStage(_StageBase):
         )
 
 
+def _stages_engram_on_host(layer) -> bool:
+    """Whether ``layer``'s Engram rows are prepared on the host each step.
+
+    HBM-lookup layers (``TPU_DEEPSEEK_V41_ENGRAM_HBM``) keep the host table
+    only as the source of their HBM copy; their per-step lookup is one device
+    op with nothing for an encoder split to overlap.
+    """
+    engram = getattr(layer, "engram", None)
+    return bool(
+        getattr(getattr(engram, "embed_tokens", None), "host_offload", False)
+        and not getattr(engram, "uses_hbm_lookup", False)
+    )
+
+
 class _StepHashes:
     """A step's Engram hashes: device hashes for HBM layers, the host path's
     downloaded and gathered ones for the rest. With `eager` (no HBM layer) the
@@ -1031,8 +1045,12 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
         inputs_embeds,
         lookback_token_ids,
     ):
-        """Enqueue each encoder segment before staging the next Engram layer."""
-        first_split = cast(int, self._engram_first_split_layer)
+        """Enqueue each encoder segment before staging the next Engram layer.
+
+        Without an early split (no host-staged Engram before the tail split,
+        e.g. layer 1 served from HBM) the head runs straight to the tail split.
+        """
+        first_split = self._engram_first_split_layer
         split = cast(int, self._engram_split_layer)
         carry = self.encoder_head_stage(
             input_ids,
@@ -1042,16 +1060,19 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
             lookback_token_ids,
         )
         synchronize_tensors(carry, wait=False)
-        self._record_engram_consumers(self.start_layer, first_split, carry)
+        self._record_engram_consumers(
+            self.start_layer, split if first_split is None else first_split, carry
+        )
         if self._pending_engram_hashes is not None:
             self._gathered_engram_hashes = self._gather_engram_hashes(
                 self._pending_engram_hashes
             )
             self._pending_engram_hashes = None
-        self._stage_engram_layers(first_split, split, self._gathered_engram_hashes)
-        carry = self.encoder_middle_stage(input_ids, positions, *carry)
-        synchronize_tensors(carry, wait=False)
-        self._record_engram_consumers(first_split, split, carry)
+        if first_split is not None:
+            self._stage_engram_layers(first_split, split, self._gathered_engram_hashes)
+            carry = self.encoder_middle_stage(input_ids, positions, *carry)
+            synchronize_tensors(carry, wait=False)
+            self._record_engram_consumers(first_split, split, carry)
         hidden, residual, post_mix, res_mix, pre_mix = carry
         self._stage_engram_layers(
             split, self._ced_boundary, self._gathered_engram_hashes
@@ -1073,8 +1094,7 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
         if self._engram_split_layer is None:
             return None
         for i in range(self.start_layer, self._engram_split_layer):
-            engram = self.layers[i].engram
-            if engram is not None and engram.embed_tokens.host_offload:
+            if _stages_engram_on_host(self.layers[i]):
                 return i if i > self.start_layer else None
         return None
 
@@ -1093,11 +1113,7 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
         layers = [
             i
             for i in range(self.start_layer + 1, self._ced_boundary)
-            if getattr(
-                getattr(getattr(self.layers[i], "engram", None), "embed_tokens", None),
-                "host_offload",
-                False,
-            )
+            if _stages_engram_on_host(self.layers[i])
         ]
         return layers[-1] if layers else None
 
@@ -1418,16 +1434,24 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
             self._tp_size = vllm_config.parallel_config.tensor_parallel_size
             self._engram_split_layer = self._select_engram_split_layer()
             self._engram_first_split_layer = self._select_engram_first_split_layer()
-            if self._engram_first_split_layer is None:
-                self._engram_split_layer = None
-            if self._engram_split_layer is not None:
-                assert self._engram_first_split_layer is not None
+            split = self._engram_split_layer
+            first_split = self._engram_first_split_layer
+            if (
+                split is not None
+                and first_split is None
+                and _stages_engram_on_host(self.layers[self.start_layer])
+            ):
+                # The start layer stages host Engram rows, so no head can be
+                # enqueued ahead of that staging.
+                self._engram_split_layer = split = None
+            if split is not None:
                 assert (
                     self.start_layer
-                    < self._engram_first_split_layer
-                    < self._engram_split_layer
+                    < (first_split if first_split is not None else split)
+                    <= split
                     < self._ced_boundary
                 )
+            if split is not None and first_split is not None:
                 with set_model_tag("v41_encoder_middle"):
                     self.encoder_middle_stage = DeepseekV41EncoderMiddleStage(
                         owner=self,
@@ -1439,10 +1463,11 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
                 logger.info(
                     "Engram early split: head [%d, %d), middle [%d, %d)",
                     self.start_layer,
-                    self._engram_first_split_layer,
-                    self._engram_first_split_layer,
-                    self._engram_split_layer,
+                    first_split,
+                    first_split,
+                    split,
                 )
+            if split is not None:
                 with set_model_tag("v41_encoder_head"):
                     self.encoder_head_stage = DeepseekV41EncoderHeadStage(
                         owner=self,
