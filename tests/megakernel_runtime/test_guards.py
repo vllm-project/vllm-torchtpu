@@ -25,9 +25,10 @@ import torch
 
 import vllm_torchtpu.megakernel_runtime.guards as guards_mod
 from vllm_torchtpu.distributed.kv_transfer import connector_names
+from vllm_torchtpu.megakernel.runtime.contract import TpuMonoSpec
 from vllm_torchtpu.megakernel_runtime import testing
 from vllm_torchtpu.megakernel_runtime.backbone import find_backbone
-from vllm_torchtpu.megakernel_runtime.plugin import RunnerView, TpuMonoSpec
+from vllm_torchtpu.megakernel_runtime.plugin import RunnerView
 
 _QWEN_CAPS = frozenset({"spec_decode", "mrope", "prefix_caching", "kv_offload"})
 
