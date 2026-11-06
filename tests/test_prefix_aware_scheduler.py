@@ -235,6 +235,7 @@ def make_scheduler(
     budget: int = BUDGET,
     max_num_seqs: int = 8,
     policy: str = "fcfs",
+    prefix_caching: bool = True,
 ) -> PrefixAwareScheduler:
     model_config = ModelConfig(
         model="facebook/opt-125m",
@@ -257,7 +258,7 @@ def make_scheduler(
         block_size=BLOCK,
         gpu_memory_utilization=0.9,
         cache_dtype="auto",
-        enable_prefix_caching=True,
+        enable_prefix_caching=prefix_caching,
     )
     cache_config.num_gpu_blocks = num_blocks
     vllm_config = VllmConfig(
@@ -594,8 +595,10 @@ def short_first_scheduler(
     follow: bool = False,
     budget: int = CHUNKS_PER_STEP * CHUNK,
     max_num_seqs: int = 8,
+    hold: bool = False,
 ) -> PrefixAwareScheduler:
     monkeypatch.setenv("TPU_PREFIX_AWARE_SHORT_PROMPTS", "first" if on else "off")
+    monkeypatch.setenv("TPU_PREFIX_AWARE_HOLD_SHARED_PREFIX", "1" if hold else "0")
     return make_scheduler(follow, budget=budget, max_num_seqs=max_num_seqs)
 
 
@@ -653,10 +656,23 @@ def test_short_prompts_first_needs_a_step_of_two_chunks(monkeypatch, budget):
         short_first_scheduler(monkeypatch, budget=budget)
 
 
-def test_short_prompts_first_needs_the_fcfs_policy(monkeypatch):
-    monkeypatch.setenv("TPU_PREFIX_AWARE_SHORT_PROMPTS", "first")
+@pytest.mark.parametrize(
+    "env, value",
+    [
+        ("TPU_PREFIX_AWARE_SHORT_PROMPTS", "first"),
+        ("TPU_PREFIX_AWARE_HOLD_SHARED_PREFIX", "1"),
+    ],
+)
+def test_short_prompts_first_and_the_hold_need_the_fcfs_policy(monkeypatch, env, value):
+    monkeypatch.setenv(env, value)
     with pytest.raises(NotImplementedError, match="FCFS"):
         make_scheduler(False, policy="priority")
+
+
+def test_the_hold_needs_prefix_caching(monkeypatch):
+    monkeypatch.setenv("TPU_PREFIX_AWARE_HOLD_SHARED_PREFIX", "1")
+    with pytest.raises(NotImplementedError, match="--enable-prefix-caching"):
+        make_scheduler(False, prefix_caching=False)
 
 
 def test_an_unknown_short_prompts_mode_is_refused(monkeypatch):
@@ -833,3 +849,99 @@ def test_short_prompts_first_keeps_followers_and_every_read_correct(monkeypatch,
     assert on.reads_checked > 0
     if seed == 0:
         assert rejoins > 0
+
+
+def prefilled(scheduler, request_id: str) -> int:
+    """Steps on until the request finishes; the prompt tokens it computed."""
+    tokens = 0
+    for _ in range(100):
+        tokens += step(scheduler).get(request_id, 0)
+        if request_id not in scheduler.requests:
+            return tokens
+    raise AssertionError(f"{request_id} did not finish")
+
+
+def parent_and_child(scheduler):
+    add(scheduler, "parent", 40 * BLOCK)
+    assert step(scheduler) == {"parent": CHUNK}
+    add(scheduler, "child", 41 * BLOCK)
+
+
+@pytest.mark.parametrize("short_first", [False, True])
+def test_a_prompt_sharing_a_running_prefix_waits_for_it(monkeypatch, short_first):
+    off = short_first_scheduler(monkeypatch, on=short_first, hold=False)
+    on = short_first_scheduler(monkeypatch, on=short_first, hold=True)
+    for scheduler in (off, on):
+        parent_and_child(scheduler)
+    assert step(off) == {"parent": CHUNK, "child": CHUNK}
+    assert step(on) == {"parent": CHUNK}
+    assert prefilled(on, "child") == BLOCK
+
+
+def test_hold_off_holds_no_prompt(monkeypatch):
+    scheduler = short_first_scheduler(
+        monkeypatch, follow=True, hold=False, budget=BUDGET
+    )
+
+    def hold():
+        raise AssertionError("a prompt was held")
+
+    scheduler._hold_prompts_behind_running_prefixes = hold
+    run = run_engine(True, tree_arrivals(0), scheduler=scheduler)
+    assert run.reads_checked > 0
+
+
+def test_a_waiting_prompt_skips_the_chunk_a_follower_computes(monkeypatch):
+    """Following the shared prefix alone, the prompt computes one chunk beside
+    the running prefill before it follows; waiting in the queue, it computes
+    only its own tokens."""
+    follow = short_first_scheduler(monkeypatch, on=False, follow=True, hold=False)
+    both = short_first_scheduler(monkeypatch, follow=True, hold=True)
+    for scheduler in (follow, both):
+        parent_and_child(scheduler)
+    assert prefilled(follow, "child") == CHUNK + BLOCK
+    assert prefilled(both, "child") == BLOCK
+
+
+def test_a_long_prefill_a_prompt_waits_for_keeps_its_full_chunk(monkeypatch):
+    scheduler = short_first_scheduler(monkeypatch, hold=True)
+    two_long_prefills(scheduler)
+    add(scheduler, "child", 2000 + 16, first_token=30_000)
+    add(scheduler, "short", 31, first_token=50_000)
+    assert step(scheduler) == {"long1": CHUNK, "long2": CHUNK}
+
+
+@pytest.mark.parametrize(
+    "status, skips_cache, held",
+    [
+        (RequestStatus.WAITING, False, True),
+        (RequestStatus.PREEMPTED, False, False),
+        (RequestStatus.WAITING, True, False),
+    ],
+)
+def test_only_a_new_prompt_that_reads_the_cache_waits(
+    monkeypatch, status, skips_cache, held
+):
+    scheduler = short_first_scheduler(monkeypatch, hold=True)
+    parent_and_child(scheduler)
+    child = scheduler.requests["child"]
+    child.status = status
+    child.skip_reading_prefix_cache = skips_cache
+    carrier = scheduler._carrier_of(child, list(scheduler.running))
+    assert carrier == ("parent" if held else None)
+
+
+def test_a_sibling_held_in_the_queue_never_follows(monkeypatch):
+    """The hold keeps the sibling waiting until the leader has cached the
+    shared prefix, so it computes only its own blocks and never runs as a
+    follower."""
+    follow_alone = make_scheduler(True)
+    alone = run_engine(True, sibling_arrivals(), scheduler=follow_alone)
+    held = short_first_scheduler(monkeypatch, follow=True, hold=True, budget=BUDGET)
+    both = run_engine(True, sibling_arrivals(), scheduler=held)
+    assert follow_alone._num_followed_steps > 0
+    assert held._num_followed_steps == 0
+    assert alone.computed["follower"] > 5 * BLOCK
+    assert both.computed["follower"] == 5 * BLOCK
+    assert both.computed["leader"] == alone.computed["leader"]
+    assert both.reads_checked > 0

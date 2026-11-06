@@ -143,6 +143,7 @@ if TYPE_CHECKING:
     TPU_DEFER_STEP: bool = False
     VLLM_TPU_FOLLOW_SHARED_PREFIX: bool = False
     TPU_PREFIX_AWARE_SHORT_PROMPTS: str = "off"
+    TPU_PREFIX_AWARE_HOLD_SHARED_PREFIX: bool = False
     MLA_XPOSE_N_TILE_SIZE: int = 160
     MIXED_Q_SPLIT: int | None = None
     MIXED_NUM_QUERIES_PER_BLOCK: int | None = None
@@ -1502,6 +1503,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # before; "first" serves short prompts first.
     "TPU_PREFIX_AWARE_SHORT_PROMPTS": env_with_choices(
         "TPU_PREFIX_AWARE_SHORT_PROMPTS", "off", ["off", "first"]
+    ),
+    # PrefixAwareScheduler: a waiting prompt whose first uncached block a
+    # running prefill is still computing waits until that block is cached
+    # (core/prefix_aware_scheduler.py). A tradeoff: the held prompt is
+    # admitted later and computes no prefix its sibling computes. Exact; off
+    # admits it at once.
+    "TPU_PREFIX_AWARE_HOLD_SHARED_PREFIX": env_bool(
+        "TPU_PREFIX_AWARE_HOLD_SHARED_PREFIX"
     ),
     # Tile size for MLA transpose pipeline.
     "MLA_XPOSE_N_TILE_SIZE": lambda: int(os.getenv("MLA_XPOSE_N_TILE_SIZE", "160")),

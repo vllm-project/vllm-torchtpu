@@ -54,10 +54,17 @@ capping every long prefill keeps long prompts in flight longer, and short
 prompts then meet more of them. ShortPrefillFirstScheduler is the standalone
 form of this (core/short_prompts_first.py says when to use which).
 
+A waiting prompt whose first uncached block is a block a running prefill has
+not cached yet would compute that shared prefix a second time. With
+TPU_PREFIX_AWARE_HOLD_SHARED_PREFIX set, such a prompt, short or long, waits
+until the running prefill has cached the block, and with short prompts first
+that prefill keeps its full chunk.
+
 Enable with:
     --scheduler-cls vllm_torchtpu.core.prefix_aware_scheduler.PrefixAwareScheduler
     VLLM_TPU_FOLLOW_SHARED_PREFIX=1 (optional)
     TPU_PREFIX_AWARE_SHORT_PROMPTS=first (optional)
+    TPU_PREFIX_AWARE_HOLD_SHARED_PREFIX=1 (optional)
 """
 
 import enum
@@ -145,24 +152,33 @@ class PrefixAwareScheduler(ShortPromptsFirstScheduler):
             None if short_prompts == ShortPrompts.OFF else self._short_prompt_limit()
         )
         self._uncached_admitted: dict[str, int] = {}
+        self.hold_shared_prefix = envs.TPU_PREFIX_AWARE_HOLD_SHARED_PREFIX
+        self._carriers: set[str] = set()
 
-        if (
-            self.policy != SchedulingPolicy.FCFS
-            and self.short_prompt_tokens is not None
+        if self.policy != SchedulingPolicy.FCFS and (
+            self.short_prompt_tokens is not None or self.hold_shared_prefix
         ):
             raise NotImplementedError(
-                "Short prompts first needs the FCFS scheduling policy; use "
-                "--scheduling-policy fcfs or TPU_PREFIX_AWARE_SHORT_PROMPTS=off."
+                "Short prompts first and the shared-prefix hold need the FCFS "
+                "scheduling policy; use --scheduling-policy fcfs, or turn off "
+                "TPU_PREFIX_AWARE_SHORT_PROMPTS and "
+                "TPU_PREFIX_AWARE_HOLD_SHARED_PREFIX."
+            )
+        if self.hold_shared_prefix and not self.kv_cache_manager.enable_caching:
+            raise NotImplementedError(
+                "TPU_PREFIX_AWARE_HOLD_SHARED_PREFIX needs prefix caching; use "
+                "--enable-prefix-caching or unset it."
             )
 
         logger.info(
             "PrefixAwareScheduler ACTIVE (window=%d, follow shared prefix: %s, "
-            "short prompts first: %s)",
+            "short prompts first: %s; hold shared prefix: %s)",
             self.WINDOW,
             "on" if self.follow_shared_prefix else "off",
             "off"
             if self.short_prompt_tokens is None
             else f"at most {self.short_prompt_tokens} uncached tokens",
+            "on" if self.hold_shared_prefix else "off",
         )
 
     def _short_prompt_limit(self) -> int:
@@ -196,11 +212,22 @@ class PrefixAwareScheduler(ShortPromptsFirstScheduler):
         self._forget_blocks_hashed_last_step()
         if self.follow_shared_prefix:
             self._update_followers()
+        held = (
+            self._hold_prompts_behind_running_prefixes()
+            if self.hold_shared_prefix
+            else []
+        )
+        try:
+            if self.short_prompt_tokens is not None:
+                output = self._schedule_short_prompts_first(throttle_prefills)
+            else:
+                output = super().schedule(throttle_prefills)
+        finally:
+            self._carriers = set()
+            for request in reversed(held):
+                self.waiting.prepend_request(request)
         if self.short_prompt_tokens is not None:
-            output = self._schedule_short_prompts_first(throttle_prefills)
             self._note_admitted_prompts(output)
-        else:
-            output = super().schedule(throttle_prefills)
         if self.follow_shared_prefix:
             self._restore_rejoined_places()
         return output
@@ -209,8 +236,9 @@ class PrefixAwareScheduler(ShortPromptsFirstScheduler):
         """Let this step's lookups hit the blocks the last step hashed.
 
         The forward of the last step writes them before this step's forward
-        runs. Scheduler.schedule forgets them the same way, but the
-        short-prompt lookups run before it and would count them as misses.
+        runs. Scheduler.schedule forgets them the same way, but the hold and
+        the short-prompt lookups run before it and would count them as
+        misses.
         """
         pool_state = self.kv_cache_manager.block_pool.__dict__
         hashed_last_step = pool_state.get(BLOCKS_HASHED_THIS_STEP)
@@ -232,6 +260,48 @@ class PrefixAwareScheduler(ShortPromptsFirstScheduler):
         finally:
             self._running_prefill_budget = None
         return output
+
+    def _hold_prompts_behind_running_prefixes(self) -> list[Request]:
+        """Take out of the waiting queue, for this step, every prompt whose
+        first uncached block a running prefill has still to compute, and mark
+        those prefills as carriers."""
+        if self._pause_state != PauseState.UNPAUSED:
+            return []
+        prefills = [r for r in self.running if r.is_prefill_chunk]
+        if not prefills:
+            return []
+        held = []
+        for request in islice(self.waiting, self.WINDOW):
+            carrier = self._carrier_of(request, prefills)
+            if carrier is not None:
+                held.append(request)
+                self._carriers.add(carrier)
+        if held:
+            waiting = self.waiting
+            assert isinstance(waiting, FCFSRequestQueue)
+            waiting.remove_requests(held)
+        return held
+
+    def _carrier_of(self, request: Request, prefills: list[Request]) -> str | None:
+        """The running prefill whose prompt holds this waiting prompt's first
+        uncached block, which it has not cached yet, or None."""
+        if (
+            request.status != RequestStatus.WAITING
+            or request.num_computed_tokens > 0
+            or request.skip_reading_prefix_cache
+        ):
+            return None
+        index = self._cached_prefix_tokens(request) // self.hash_block_size
+        if index >= len(request.block_hashes):
+            return None
+        block = request.block_hashes[index]
+        for prefill in prefills:
+            if (
+                index < len(prefill.block_hashes)
+                and prefill.block_hashes[index] == block
+            ):
+                return prefill.request_id
+        return None
 
     def _lookahead_within_cap(
         self, request: Request, num_computed_tokens: int, num_new_tokens: int
@@ -261,7 +331,7 @@ class PrefixAwareScheduler(ShortPromptsFirstScheduler):
             for r in self.running
             if r.is_prefill_chunk and not self._is_short_prompt(r)
         )
-        return request is next(longs, None)
+        return request is next(longs, None) or request.request_id in self._carriers
 
     def _full_chunk_tokens(self) -> int:
         return sum(
