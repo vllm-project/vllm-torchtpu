@@ -170,7 +170,7 @@ def verify_pooled_step_hlo(
     hlo_kw = dict(kvh=kvh, hd=int(g.HD), min_pool_pages=max(16, num_pages))
     fio = cache_exec(ex).FUSED
     return cache.check_pooled_step_hlo(
-        hlo_text or "", page_size, fused_pool_io=fio, kernel_names=k_names, **hlo_kw
+        hlo_text, page_size, fused_pool_io=fio, kernel_names=k_names, **hlo_kw
     )
 
 
