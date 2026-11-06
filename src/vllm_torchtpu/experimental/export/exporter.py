@@ -28,6 +28,7 @@ from typing import Any
 from vllm_torchtpu import env_override
 from vllm_torchtpu.experimental.export import (
     api,
+    checkpoint,
     sampling,
     tpu_lowering,
     validator,
@@ -1336,6 +1337,8 @@ def export(
         "pipeline_parallel_size": pp_size,
         "data_parallel_size": dp_size,
         **_emit_model_companion_files(cfg, output_dir),
+        # How a checkpoint of this artifact is stored (Zarr v2 arrays in OCDBT).
+        "checkpoint_config": {"format": checkpoint.CHECKPOINT_FORMAT},
     }
     if cfg.speculative_config is not None:
         serving_config["speculative_config"] = cfg.speculative_config
