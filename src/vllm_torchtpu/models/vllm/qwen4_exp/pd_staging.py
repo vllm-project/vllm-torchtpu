@@ -33,6 +33,18 @@ from collections.abc import Sequence
 import numpy as np
 import torch
 
+try:
+    from . import pd_route
+except ImportError:  # loaded by path (tests, the landing microbench): no package
+    import importlib.util as _ilu
+    import pathlib as _pl
+
+    _spec = _ilu.spec_from_file_location(
+        "qwen4_exp_pd_route", _pl.Path(__file__).with_name("pd_route.py")
+    )
+    pd_route = _ilu.module_from_spec(_spec)
+    _spec.loader.exec_module(pd_route)
+
 ROW_SUBLANES = 4
 ROW_LANES = 256
 
@@ -154,6 +166,14 @@ def _pad(values, size: int):
     # A rank can own no rows (a DCP rank of a request shorter than its page);
     # row 0 is the null page's on both sides, which nothing reads.
     if isinstance(values, np.ndarray):
+        if values.ndim == 2:
+            # Routed GDN entries, [owners, staging pages]: repeat the last row
+            # (an empty list rewrites the null page's rows).
+            if len(values) == 0:
+                values = np.zeros((1, values.shape[1]), dtype=np.int64)
+            return np.concatenate(
+                (values, np.repeat(values[-1:], size - len(values), axis=0))
+            )
         if values.size == 0:
             values = np.zeros(1, dtype=np.int64)
         return np.concatenate(
@@ -291,6 +311,73 @@ def compressed_rows_split_np(
     return src, dst
 
 
+def main_dst_np(num_tokens, dst_pages, dst_block, rank, start=0) -> np.ndarray:
+    """``main_rows_np``'s destination rows alone (routed staging)."""
+    t = np.arange(start, num_tokens, dtype=np.int64)
+    d = rank.main_dcp
+    if d > 1:
+        t = t[(t // dst_block) % d == rank.dcp_rank]
+    dp = np.asarray(dst_pages, dtype=np.int64)
+    return dp[t // (d * dst_block)] * dst_block + t % dst_block
+
+
+def compressed_dst_np(
+    num_tokens, ratio, dst_pages, dst_block, start=0, dst_offset=0
+) -> np.ndarray:
+    """``compressed_rows_np``'s destination rows alone (routed staging)."""
+    span = 2 * ratio
+    if start % span:
+        raise ValueError(f"A repack must start on a compressed pair ({span} tokens)")
+    pairs = math.ceil(math.ceil(num_tokens / ratio) / 2)
+    t = np.arange(start // span, pairs, dtype=np.int64) * span
+    dp = np.asarray(dst_pages, dtype=np.int64)
+    return dp[t // dst_block] * dst_block + dst_offset + (t % dst_block) // span
+
+
+def route_geometry_for(cfg, src_layout, decode_layout, rank) -> "pd_route.RouteGeometry | None":
+    """The routed geometry this decode rank (or a producer, with ``rank``
+    describing its consumer) runs under QWEN4_EXP_PD_ROUTED_DST, or None.
+
+    ``rank`` needs ``tp_size``, ``main_dcp``; ``decode_layout`` ``block_size``
+    and ``token_bytes``. Both legs build it the same way; it is part of the
+    layout fingerprint, so a disagreement fails at admission."""
+    from vllm_torchtpu import envs
+
+    parsed = pd_route.parse_route_env(envs.QWEN4_EXP_PD_ROUTED_DST)
+    if parsed is None:
+        return None
+    tp, dcp, block = parsed
+    if (tp, dcp, block) != (rank.tp_size, rank.main_dcp, decode_layout.block_size):
+        raise ValueError(
+            f"QWEN4_EXP_PD_ROUTED_DST={tp},{dcp},{block} disagrees with the decode "
+            f"(tp={rank.tp_size}, dcp={rank.main_dcp}, block={decode_layout.block_size})"
+        )
+    row = ROW_SUBLANES * ROW_LANES
+    if src_layout.token_bytes != row or decode_layout.token_bytes != row:
+        raise ValueError("routed staging needs 1,024-byte rows on both legs")
+    if getattr(src_layout, "merged_compressed", False) or int(getattr(src_layout, "main_dcp", 1)) > 1:
+        # pd_route models a plain TP1 producer: one main-KV page per ID and
+        # unmerged compressed keys. Merged keys (QWEN4_EXP_MERGE_COMPRESSED_K /
+        # QWEN4_EXP_PD_PRODUCER_MERGED) and a PCP producer's split main KV
+        # (QWEN4_EXP_PD_PRODUCER_PCP > 1) are refused rather than mis-routed.
+        raise ValueError(
+            "QWEN4_EXP_PD_ROUTED_DST supports a plain TP1 producer only "
+            "(no merged compressed keys, no PCP split main KV)"
+        )
+    src_gdn = gdn_geometry(cfg, 1, src_layout.token_bytes)
+    dst_gdn = gdn_geometry(cfg, tp, decode_layout.token_bytes)
+    return pd_route.RouteGeometry(
+        tp=tp,
+        dcp=dcp,
+        dst_block=block,
+        src_block=src_layout.block_size,
+        ratio=int(cfg.model_config.hf_text_config.indexer_compress_ratio),
+        ssm_rows_src=src_gdn.ssm_tokens,
+        conv_rows_src=src_gdn.conv_tokens,
+        ssm_rows_dst=dst_gdn.ssm_tokens,
+    )
+
+
 def align_rows(rows: np.ndarray, tile: int = REPACK_TILE) -> np.ndarray:
     """Pad a row segment to a multiple of ``tile`` by repeating its last row.
 
@@ -400,8 +487,15 @@ def make_repack(
     v_head_start: int,
     channels: Sequence[int],
     write=None,
+    compact_gdn: tuple[int, int] | None = None,
 ):
     """``fn(pool, staging, main_src, main_dst, copy_src, copy_dst, gdn_src, gdn_dst)``.
+
+    ``compact_gdn = (stage_rows, pages)`` (QWEN4_EXP_PD_ROUTED_DST): a GDN
+    owner's staged state is this rank's SSM rows (its value heads, already in
+    its own order) followed by the producer's whole conv rows, over ``pages``
+    staging pages of ``stage_rows`` rows; ``gdn_src`` is then ``[owners,
+    pages]`` staging page ids.
 
     Row indices are flat (``page * B + row``) into the staging carrier
     (``src``) and the pool (``dst``); ``gdn_*`` are page ids, one per GDN
@@ -452,8 +546,25 @@ def make_repack(
             ]
         )
 
+    def gdn_page_compact(page, s: GdnGeometry, d: GdnGeometry):
+        """Routed staging: ``[this rank's SSM rows | producer conv rows]``."""
+        ssm = page[: d.ssm_tokens]
+        conv = _typed(page[d.ssm_tokens : d.ssm_tokens + s.conv_tokens], s.conv_itemsize)
+        conv = conv[: s.conv_width * s.conv_dim].reshape(s.conv_width, s.conv_dim)
+        conv = conv[:, jnp.asarray(chan)].reshape(-1)
+        return jnp.concatenate([ssm, _untyped(conv, d.conv_tokens, d.conv_itemsize)])
+
     has_gdn = src_gdn is not None and dst_gdn is not None
     d_rows = dst_gdn.ssm_tokens + dst_gdn.conv_tokens if has_gdn else 0
+    if compact_gdn is not None and has_gdn:
+        # The staged SSM rows are copied as-is: they must be exactly the
+        # rank's value heads in its own layout (no padded row).
+        if (
+            src_gdn.ssm_itemsize != dst_gdn.ssm_itemsize
+            or dst_gdn.ssm_tokens * ROW_SUBLANES * ROW_LANES
+            != dst_gdn.v_heads * dst_gdn.head_k_dim * dst_gdn.head_v_dim * dst_gdn.ssm_itemsize
+        ):
+            raise ValueError("routed GDN staging needs whole-row per-rank SSM state")
 
     def rows(
         staging: jax.Array, main_src: jax.Array, copy_src: jax.Array, gdn_src: jax.Array
@@ -470,7 +581,16 @@ def make_repack(
         main = jnp.concatenate([pair, jnp.zeros_like(pair)], axis=1)
         # Compressed keys, rings + tags, PLE state: bytes unchanged.
         copies = gather(copy_src)
-        if has_gdn:
+        if has_gdn and compact_gdn is not None:
+            s, d = src_gdn, dst_gdn
+            stage_rows, _ = compact_gdn
+            c_rows = d.ssm_tokens + s.conv_tokens
+            flat = gdn_src[:, :, None] * stage_rows + jnp.arange(stage_rows)
+            src_flat = flat.reshape(gdn_src.shape[0], -1)[:, :c_rows].reshape(-1)
+            region = gather(src_flat).reshape(-1, c_rows, ROW_SUBLANES, ROW_LANES)
+            gdn = jax.vmap(lambda page: gdn_page_compact(page, s, d))(region)
+            gdn = gdn.reshape(-1, ROW_SUBLANES, ROW_LANES)
+        elif has_gdn:
             s, d = src_gdn, dst_gdn
             s_rows = s.ssm_tokens + s.conv_tokens
             src_flat = (gdn_src[:, None] * src_block + jnp.arange(s_rows)).reshape(-1)
@@ -615,11 +735,19 @@ class StagedConsumer:
         self.src_groups = build_transfer_groups(get_kv_cache_groups(cfg, dict(src_specs)))
         self.src_block, self.dst_block = self.src_layout.block_size, decode_layout.block_size
         self.ratio = int(cfg.model_config.hf_text_config.indexer_compress_ratio)
-        self.pages = max(2, staging_bytes // self.src_layout.page_bytes)
+        # QWEN4_EXP_PD_ROUTED_DST: the producer routes each rank only its
+        # slice, into a dense compact space per rank (pd_route); staging pages
+        # are then route.stage_rows rows, else one producer page each.
+        self.route = route_geometry_for(cfg, self.src_layout, decode_layout, rank)
+        stage_rows = self.route.stage_rows if self.route else self.src_block
+        page_bytes = (
+            stage_rows * ROW_SUBLANES * ROW_LANES if self.route else self.src_layout.page_bytes
+        )
+        self.pages = max(2, staging_bytes // page_bytes)
         self.staging = torch.zeros(
             # The producer pools' carrier shape, one kernel page per manager
-            # page: the layout fingerprint compares it.
-            (self.pages, self.src_block, 1, ROW_SUBLANES, ROW_LANES),
+            # page: the layout fingerprint compares it (routed: per row).
+            (self.pages, stage_rows, 1, ROW_SUBLANES, ROW_LANES),
             dtype=pool.dtype,
             device=pool.device,
         )
@@ -634,8 +762,9 @@ class StagedConsumer:
         from .pd_manifest import compressed_live_bytes, page_regions, pool_tag
 
         # The producer sends a compressed-key page's keys only; the carrier
-        # declares the same region so both pool layouts agree.
-        compressed_live = compressed_live_bytes(self.src_layout)
+        # declares the same region so both pool layouts agree. Routed staging
+        # pages are dense: every byte of a page is live.
+        compressed_live = None if self.route else compressed_live_bytes(self.src_layout)
         # Merged producer keys: one block of `key_stride` bytes per main-KV ID.
         # Each lands at the start of its own staging page, so its block id is
         # the page id: raiden bounds every block id by every pool's num_blocks.
@@ -682,9 +811,9 @@ class StagedConsumer:
                     layer_name=f"{name}.pcp{r}" if split else name,
                     storage_index=0,
                     base_offset_bytes=0,
-                    block_stride_bytes=self.src_layout.page_bytes,
+                    block_stride_bytes=page_bytes,
                     num_blocks=self.pages,
-                    regions=page_regions(name, self.src_layout.page_bytes, compressed_live),
+                    regions=page_regions(name, page_bytes, compressed_live),
                     dtype_tag="qwen4-whole-fp8-page-v1",
                 )
                 for group in self.src_groups
@@ -738,6 +867,11 @@ class StagedConsumer:
             kv_head=rank.kv_head,
             v_head_start=rank.tp_rank * (dst_gdn.v_heads if dst_gdn else 0),
             channels=conv_channels(src_gdn, dst_gdn, rank) if src_gdn else [0],
+            compact_gdn=(
+                (self.route.stage_rows, self.route.gdn_rows // self.route.stage_rows)
+                if self.route
+                else None
+            ),
         )
         self._op = None
 
@@ -746,6 +880,19 @@ class StagedConsumer:
     def _owner_counts(self, num_tokens: int, skip_tokens: int):
         from .pd import skipped_source_pages
 
+        if self.route is not None:
+            # Compact pages per owner, identical on every rank (one destination
+            # page list per tag serves the whole engine).
+            owners = [pool.layer_name for pool in self.manifest.pools]
+            src_pages = [g.page_count(num_tokens) for g in self.src_groups]
+            counts = [
+                pd_route.staging_pages(
+                    owner_kind(name), num_tokens, src_pages[self._src_owner[name]],
+                    skip_tokens, self.route,
+                )
+                for name in owners
+            ]
+            return [0] * len(self.src_groups), owners, counts
         first = [skipped_source_pages(g, skip_tokens) for g in self.src_groups]
         group_counts = [
             g.page_count(num_tokens) - f for g, f in zip(self.src_groups, first)
@@ -832,7 +979,13 @@ class StagedConsumer:
     def skip_bytes(self, uuid: int) -> list[int]:
         """Per-tag destination clips, in ``destination`` order: the bytes of
         the source pages a prefix-aware load leaves out of each pool."""
-        _, first = self.skips.get(uuid, (0, [0] * len(self.src_groups)))
+        skip, first = self.skips.get(uuid, (0, [0] * len(self.src_groups)))
+        if self.route is not None:
+            return [
+                pd_route.skip_rows(owner_kind(pool.layer_name), skip, self.route)
+                * pd_route.ROW_BYTES
+                for pool in self.manifest.pools
+            ]
         # The clip is in the destination's live bytes: a merged key pool's
         # page carries `key_stride` of them (its single "keys" region's
         # unit), a trimmed compressed-key page its keys, else the stride.
@@ -856,6 +1009,8 @@ class StagedConsumer:
         there on are written (the destination's earlier rows are shared prefix
         pages); ``src_pages[owner]`` are that cache owner's staging pages and
         ``first[g]`` the source page group ``g``'s staging starts at."""
+        if self.route is not None:
+            return self._routed_indices(src_pages, dst_tables, num_tokens, skip_tokens)
         first = first or [0] * len(self.src_groups)
         main_s, main_d, copy_s, copy_d = [], [], [], []
         gdn_s, gdn_d = [], []
@@ -922,6 +1077,46 @@ class StagedConsumer:
         return (
             cat(main_s), cat(main_d), cat(copy_s), cat(copy_d),
             np.asarray(gdn_s, dtype=np.int64), np.asarray(gdn_d, dtype=np.int64),
+        )
+
+    def _routed_indices(self, src_pages, dst_tables, num_tokens, skip_tokens):
+        """``indices`` over routed compact staging: same destination rows in
+        the same order as the broadcast layout, read from compact rows."""
+        g, rank = self.route, self.rank
+        main_s, main_d, copy_s, copy_d = [], [], [], []
+        gdn_s, gdn_d = [], []
+        for name, (gi, offset) in self._dst_compressed.items():
+            copy_s.append(pd_route.compressed_src_rows(num_tokens, skip_tokens, src_pages[name], g))
+            copy_d.append(compressed_dst_np(
+                num_tokens, self.ratio, dst_tables[gi], self.dst_block, skip_tokens, offset
+            ))
+        for name, gi in self._dst_owner.items():
+            kind = owner_kind(name)
+            if kind == "compressed":
+                continue
+            dst = dst_tables[gi]
+            if kind == "main":
+                main_s.append(
+                    pd_route.main_src_rows(num_tokens, skip_tokens, rank.tp_rank, src_pages[name], g)
+                )
+                main_d.append(main_dst_np(num_tokens, dst, self.dst_block, rank, skip_tokens))
+            elif kind in ("ring", "ple"):
+                entry = dst[self._state_entry] if kind == "ple" else dst[0]
+                copy_s.append(pd_route.prefix_src_rows(src_pages[name], g))
+                copy_d.append(entry * self.dst_block + np.arange(g.prefix_rows, dtype=np.int64))
+        n_gdn = g.gdn_rows // g.stage_rows
+        for name in self._gdn_names:
+            gdn_s.append(list(src_pages[name][:n_gdn]))
+            gdn_d.append(dst_tables[self._dst_owner[name]][self._state_entry])
+
+        def cat(parts):
+            parts = [align_rows(p) for p in parts if len(p)]
+            return np.concatenate(parts) if parts else np.zeros(0, dtype=np.int64)
+
+        return (
+            cat(main_s), cat(main_d), cat(copy_s), cat(copy_d),
+            np.asarray(gdn_s, dtype=np.int64).reshape(-1, n_gdn),
+            np.asarray(gdn_d, dtype=np.int64),
         )
 
     def repack(self, uuid: int, dst_tables, num_tokens: int) -> None:

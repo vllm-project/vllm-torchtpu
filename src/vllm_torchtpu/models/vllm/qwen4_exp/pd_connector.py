@@ -268,6 +268,9 @@ class Qwen4ExpRaidenWorker(TPURaidenConnectorWorker):
         super().__init__(vllm_config)
         self._qwen_page_plan: QwenPagePlan | None = None
         self._qwen_semantics: dict[str, Any] | None = None
+        # QWEN4_EXP_PD_ROUTED_DST (pd_route): set at admission on a pipeline
+        # producer and on a staged consumer; None broadcasts as before.
+        self._qwen_route = None
         self.last_failed_recving: set[str] = set()
         # QWEN4_EXP_PD_SYNC_REPACK: destination req id -> (uuid, group tables,
         # tokens) of a load whose bytes landed on this rank and whose repack
@@ -342,8 +345,10 @@ class Qwen4ExpRaidenWorker(TPURaidenConnectorWorker):
             manifest = self._staging.manifest
             materialize_storages(manifest)
             plan_groups = self._staging.src_groups
+            self._qwen_route = self._staging.route
             self._log_hbm_after_staging(runner)
         else:
+            self._qwen_route = self._producer_route(cache.layout)
             manifest = build_transfer_manifest(
                 cache.native_config, cache.materialized, cache.layout
             )
@@ -372,6 +377,30 @@ class Qwen4ExpRaidenWorker(TPURaidenConnectorWorker):
         self._raiden_manifest = manifest
         self._raiden_transfer_engine = engine
         self._raiden_admission_summary = summary
+
+    def _producer_route(self, layout):
+        """QWEN4_EXP_PD_ROUTED_DST on a TP1 pipeline producer: its staged
+        consumer's geometry (decode TP, DCP, block), else None."""
+        from types import SimpleNamespace
+
+        from . import pd_route
+        from .pd_staging import route_geometry_for
+
+        parsed = pd_route.parse_route_env(envs.QWEN4_EXP_PD_ROUTED_DST)
+        if parsed is None:
+            return None
+        if not (self.is_producer and _engine_is_pipeline(self.vllm_config)):
+            raise ValueError(
+                "QWEN4_EXP_PD_ROUTED_DST routes a TP1 pipeline producer to a staged "
+                "TP>1 decode; this engine is neither"
+            )
+        tp, dcp, block = parsed
+        return route_geometry_for(
+            self.vllm_config,
+            layout,
+            SimpleNamespace(block_size=block, token_bytes=layout.token_bytes),
+            SimpleNamespace(tp_size=tp, main_dcp=dcp),
+        )
 
     def _staged_consumer(self) -> bool:
         """A TP>1 consumer of TP1 pipeline stages (per-layer pool tags)."""
@@ -590,7 +619,14 @@ class Qwen4ExpRaidenWorker(TPURaidenConnectorWorker):
         if self._qwen_semantics is None:
             raise RuntimeError("Qwen PD loaded-state identity has not been admitted")
         _, layout = measure_transfer_layout(manifest)
-        if _use_per_layer_pool_tags():
+        if self._qwen_route is not None:
+            if not _use_per_layer_pool_tags():
+                raise ValueError("QWEN4_EXP_PD_ROUTED_DST needs TPU_RAIDEN_POOL_TAGS_PER_LAYER=1")
+            payload = dict(
+                layout=_routed_layout(_owner_invariant_layout(layout), self._qwen_route),
+                semantics=_owner_invariant_semantics(self._qwen_semantics),
+            )
+        elif _use_per_layer_pool_tags():
             payload = dict(
                 layout=_owner_invariant_layout(layout),
                 semantics=_owner_invariant_semantics(self._qwen_semantics),
@@ -706,6 +742,8 @@ class Qwen4ExpRaidenWorker(TPURaidenConnectorWorker):
 
         compressed_bytes = compressed_live_bytes(self.runner.model_adapter.cache.layout)
         trim_compressed = compressed_bytes is not None
+        if self._qwen_route is not None:
+            return pages, self._routed_spans(plan, pages, num_tokens, translate, compressed_bytes)
         spans = []
         for pool, group_index in plan.pool_groups():
             ids = pages[group_index]
@@ -752,6 +790,47 @@ class Qwen4ExpRaidenWorker(TPURaidenConnectorWorker):
                 )
             )
         return pages, spans
+
+    def _routed_spans(self, plan, pages, num_tokens, translate, compressed_bytes):
+        """QWEN4_EXP_PD_ROUTED_DST: each destination rank's slice, at its
+        compact rank-local offsets (pd_route; ``dst_space_version=1``)."""
+        from . import pd_route
+        from .pd_staging import owner_kind
+
+        route = self._qwen_route
+        if compressed_bytes is not None and compressed_bytes != (
+            route.pairs_per_src_page * pd_route.ROW_BYTES
+        ):
+            raise ValueError("routed compressed keys need one pair row per 2*ratio tokens")
+        registrations = []
+        for pool, group_index in plan.pool_groups():
+            ids = pages[group_index]
+            if translate is not None:
+                ids = translate(group_index, ids)
+            routed = pd_route.producer_spans(
+                owner_kind(pool.layer_name), num_tokens, len(ids), route
+            )
+            spans = tuple(
+                PoolByteSpan(
+                    src_block_ordinal=src,
+                    src_offset_bytes=src_off,
+                    dst_block_index=0,
+                    dst_offset_bytes=dst_off,
+                    size_bytes=size,
+                    dst_unit_ordinal=unit,
+                )
+                for src, src_off, dst_off, size, unit in routed
+            )
+            registrations.append(
+                PoolSpanRegistration(
+                    tag=pool.tag,
+                    block_ids=ids,
+                    spans=spans,
+                    declared_bytes=sum(span.size_bytes for span in spans),
+                    dst_space_version=1,
+                )
+            )
+        return registrations
 
     def _stage3_grouped_destination_pages(
         self, req_meta: _Stage3LoadMeta, num_tokens: int
@@ -868,6 +947,30 @@ def _owner_invariant_layout(layout: dict[str, Any]) -> dict[str, Any]:
             # Split keys are tagged "<owner>.compressed_k.pcp<r>".
             if ".compressed_k" not in p["tag"]
         ),
+    )
+
+
+def _routed_layout(layout: dict[str, Any], route) -> dict[str, Any]:
+    """The routed page encoding (QWEN4_EXP_PD_ROUTED_DST): the producer's
+    pages and the decode's compact staging pages differ in rows per page, so
+    both describe a carrier per 1,024-byte row and name the routing geometry
+    instead; a peer routing for a different decode fails closed."""
+
+    def per_row(carrier):
+        carrier = dict(carrier)
+        shape = list(carrier["shape_per_kernel_page"])
+        carrier["shape_per_kernel_page"] = [1] + shape[1:]
+        return carrier
+
+    encoded = {json.dumps(per_row(c), sort_keys=True) for c in layout["carriers"]}
+    tags = {json.dumps({"dtype_tag": p["dtype_tag"]}, sort_keys=True) for p in layout["pages"]}
+    return dict(
+        schema="qwen4-routed-fp8-row-layout-v1",
+        torch_tpu=layout["torch_tpu"],
+        libtpu=layout["libtpu"],
+        carriers=[json.loads(c) for c in sorted(encoded)],
+        pages=[json.loads(t) for t in sorted(tags)],
+        routed=route.key(),
     )
 
 
