@@ -48,6 +48,7 @@ else:
     from oracle import AXIS, N, bf16_ulp
 
 TOKEN_BUCKETS = (16, 32, 64, 80, 96)
+CHUNKED_TOKEN_BUCKETS = (128, 160, 192, 224, 256)
 
 
 class _FakeDevice:
@@ -141,7 +142,7 @@ def _metrics_vs_f64(got_bf16: np.ndarray, ref_bf16: np.ndarray, live: int) -> di
 
 
 def test_supported_geometries_and_validation():
-    for tokens in TOKEN_BUCKETS:
+    for tokens in (*TOKEN_BUCKETS, *CHUNKED_TOKEN_BUCKETS):
         for world, local in ((8, 8), (8, 4), (8, 1), (16, 4), (16, 1)):
             heads = world * local
             for vdim in (256, 512):
@@ -152,6 +153,33 @@ def test_supported_geometries_and_validation():
                     tokens, heads, world, vdim, mode="flat"
                 )
 
+    assert comb.combine_token_chunks(96, 64, 16, 512, mode="pairs") == (96,)
+    assert comb.online_lse_combine_single_pass_supported(96, 64, 16, 512, mode="pairs")
+    assert comb.combine_token_chunks(128, 64, 16, 512, mode="pairs") == (64, 64)
+    assert not comb.online_lse_combine_single_pass_supported(
+        128, 64, 16, 512, mode="pairs"
+    )
+    assert comb.combine_token_chunks(192, 64, 16, 512, mode="pairs") == (96, 96)
+    assert comb.combine_token_chunks(224, 64, 16, 512, mode="pairs") == (80, 80, 64)
+    assert comb.combine_token_chunks(256, 64, 16, 512, mode="pairs") == (96, 80, 80)
+    # High-head geometry (128 heads on DCP16 -> local=8, D=512) fits single-pass
+    # up to 64 rows and chunks above 64 rows so VMEM never overflows 32 MiB.
+    assert comb.combine_token_chunks(64, 128, 16, 512, mode="pairs") == (64,)
+    assert comb.online_lse_combine_single_pass_supported(
+        64, 128, 16, 512, mode="pairs"
+    )
+    assert comb.combine_token_chunks(96, 128, 16, 512, mode="pairs") == (48, 48)
+    assert not comb.online_lse_combine_single_pass_supported(
+        96, 128, 16, 512, mode="pairs"
+    )
+    assert comb.combine_token_chunks(192, 128, 16, 512, mode="pairs") == (64, 64, 64)
+    assert comb.combine_token_chunks(256, 128, 16, 512, mode="pairs") == (
+        64,
+        64,
+        64,
+        64,
+    )
+
     assert not comb.online_lse_combine_supported(8, 64, 16, 512, mode="pairs")
     assert not comb.online_lse_combine_supported(24, 64, 16, 512, mode="flat")
     assert not comb.online_lse_combine_supported(16, 64, 16, 64, mode="pairs")
@@ -160,8 +188,15 @@ def test_supported_geometries_and_validation():
     assert not comb.online_lse_combine_supported(16, 4, 2, 256, mode="pairs")
     assert comb.online_lse_combine_supported(16, 4, 2, 256, mode="flat")
     assert not comb.online_lse_combine_supported(16, 64, 16, 256, mode="unknown")
-    # Header capacity: tokens * local <= 8 * vdim -> 512 * 8 = 4096 > 8 * 256.
-    assert not comb.online_lse_combine_supported(512, 64, 8, 256, mode="pairs")
+    # Prefill buckets (> MAX_COMBINE_TOKENS = 256) must return False on both
+    # DCP8 and DCP16 so chunked reduce-scatter / vspace_fused handle prefill.
+    for prefill_t in (272, 512, 1024, 2048):
+        assert not comb.online_lse_combine_supported(
+            prefill_t, 64, 16, 512, mode="pairs"
+        )
+        assert not comb.online_lse_combine_supported(
+            prefill_t, 64, 8, 256, mode="pairs"
+        )
 
     part = jnp.zeros((16, 64, 256), jnp.bfloat16)
     lse = jnp.zeros((16, 64), jnp.float32)
@@ -212,22 +247,45 @@ def test_mesh_has_chip_pairs_1d_and_2d():
     assert not comb.mesh_has_chip_pairs(_FakeMesh(bad_lane, ("dcp_lane", "dcp")), "dcp")
 
 
+def test_clean_part_masks_inf_and_nan_padding():
+    from jax.experimental import pallas as pl
+
+    raw_bf16 = jnp.zeros((16, 128), dtype=jnp.bfloat16)
+    raw_bf16 = raw_bf16.at[0, 0].set(jnp.bfloat16(2.5))
+    raw_bf16 = raw_bf16.at[0, 1].set(jnp.bfloat16(jnp.inf))
+    raw_bf16 = raw_bf16.at[0, 2].set(jnp.bfloat16(-jnp.inf))
+    raw_bf16 = raw_bf16.at[0, 3].set(jnp.bfloat16(jnp.nan))
+    raw_bf16 = raw_bf16.at[8:, :].set(jnp.bfloat16(-jnp.inf))
+    raw_i16 = jax.lax.bitcast_convert_type(raw_bf16, jnp.int16)
+
+    def _kernel(in_ref, out_ref):
+        live_mask = jax.lax.broadcasted_iota(jnp.int32, (16, 1), 0) < 4
+        out_ref[...] = comb._clean_part(in_ref[...], live_mask)
+
+    interp = pltpu.InterpretParams() if jax.default_backend() != "tpu" else False
+    cleaned = pl.pallas_call(
+        _kernel,
+        out_shape=jax.ShapeDtypeStruct((16, 128), jnp.float32),
+        interpret=interp,
+    )(raw_i16)
+    assert bool(jnp.all(jnp.isfinite(cleaned)))
+    assert float(cleaned[0, 0]) == 2.5
+    assert float(cleaned[0, 1]) == 0.0
+    assert float(cleaned[0, 2]) == 0.0
+    assert float(cleaned[0, 3]) == 0.0
+    assert float(jnp.max(jnp.abs(cleaned[4:, :]))) == 0.0
+
+
 def test_envs_defaults_and_oproj_limit_m(monkeypatch):
     from vllm_torchtpu import envs
     from vllm_torchtpu.kernels.quantized_matmul import fp8_oproj_all_reduce
 
     assert fp8_oproj_all_reduce.LIMIT_M == 96
     monkeypatch.delenv("TPU_DCP_ONLINE_LSE_COMBINE", raising=False)
-    monkeypatch.delenv("TPU_DCP_ONLINE_LSE_COMBINE_MAX_TOKENS", raising=False)
-    monkeypatch.delenv("TPU_DCP_ONLINE_LSE_COMBINE_MIN_TOKENS", raising=False)
-    monkeypatch.delenv("TPU_DCP_ONLINE_LSE_COMBINE_LIVE_TOKENS", raising=False)
-    monkeypatch.delenv("TPU_DCP_ONLINE_LSE_COMBINE_OUT_VMEM", raising=False)
     assert envs.TPU_DCP_ONLINE_LSE_COMBINE == ""
-    assert envs.TPU_DCP_ONLINE_LSE_COMBINE_MAX_TOKENS == 96
-    assert envs.TPU_DCP_ONLINE_LSE_COMBINE_MIN_TOKENS == 16
-    assert envs.TPU_DCP_ONLINE_LSE_COMBINE_LIVE_TOKENS is True
-    assert envs.TPU_DCP_ONLINE_LSE_COMBINE_OUT_VMEM is True
-    assert envs.bucket_gate_edge(envs.TPU_DCP_ONLINE_LSE_COMBINE_MIN_TOKENS) == 8
+    monkeypatch.setenv("TPU_DCP_ONLINE_LSE_COMBINE", "invalid_mode")
+    with pytest.raises(ValueError, match="TPU_DCP_ONLINE_LSE_COMBINE"):
+        _ = envs.TPU_DCP_ONLINE_LSE_COMBINE
 
 
 def test_adapter_env_gate_and_uv_compat(monkeypatch):
@@ -237,21 +295,19 @@ def test_adapter_env_gate_and_uv_compat(monkeypatch):
     from vllm_torchtpu.layers.adapter import cp_mla_attention as cp
 
     fake_group = types.SimpleNamespace(
-        world_size=16, rank_in_group=0, ranks=list(range(16))
+        world_size=16, rank_in_group=0, ranks=list(range(16)), cpu_group=None
     )
     monkeypatch.setattr(cp, "get_dcp_group", lambda: fake_group)
 
     # Default-off: unset env leaves all predicates False / unchanged.
     monkeypatch.setenv("TPU_DCP_ONLINE_LSE_COMBINE", "")
     assert cp.online_lse_combine_mode_requested() == ""
-    for t in (4, 8, 16, 32, 64, 80, 96, 128):
-        assert not cp.online_lse_combine_applies(t, True)
-        assert not cp.online_lse_combine_applies(t, False)
+    for t in (4, 8, 16, 24, 32, 64, 80, 96, 128, 192, 256, 512):
+        assert not cp.online_lse_combine_applies(t, True, num_heads=64, vdim=512)
+        assert not cp.online_lse_combine_applies(t, False, num_heads=64, vdim=512)
 
     for raw, want in (
         ("0", ""),
-        ("off", ""),
-        ("false", ""),
         ("1", "auto"),
         ("auto", "auto"),
         ("PAIRS", "pairs"),
@@ -260,20 +316,39 @@ def test_adapter_env_gate_and_uv_compat(monkeypatch):
         monkeypatch.setenv("TPU_DCP_ONLINE_LSE_COMBINE", raw)
         assert cp.online_lse_combine_mode_requested() == want
 
-    monkeypatch.setenv("TPU_DCP_ONLINE_LSE_COMBINE", "invalid_mode")
-    with pytest.raises(ValueError, match="TPU_DCP_ONLINE_LSE_COMBINE"):
-        cp.online_lse_combine_mode_requested()
-
     monkeypatch.setenv("TPU_DCP_ONLINE_LSE_COMBINE", "pairs")
-    monkeypatch.setenv("TPU_DCP_ONLINE_LSE_COMBINE_MIN_TOKENS", "16")
-    monkeypatch.setenv("TPU_DCP_ONLINE_LSE_COMBINE_MAX_TOKENS", "96")
-    for t in (1, 4, 8, 128, 256):
-        assert not cp.online_lse_combine_applies(t, True)
-    for t in TOKEN_BUCKETS:
-        assert cp.online_lse_combine_applies(t, True)
-        assert not cp.online_lse_combine_applies(t, False)
+    # Non-multiple-of-16 buckets (24, 40, 56, 72, 88, 104), tiny buckets (<=8),
+    # multi-chunk decode buckets (128..256, kept on single-collective XLA RS),
+    # prefill buckets (>256), and float32 partials must return False so
+    # send_layout / oproj_all_reduce / vspace_fused are not disabled when the
+    # single-pass kernel does not apply.
+    for t in (
+        1,
+        4,
+        8,
+        24,
+        40,
+        56,
+        72,
+        88,
+        104,
+        *CHUNKED_TOKEN_BUCKETS,
+        272,
+        512,
+        1024,
+        2048,
+    ):
+        assert not cp.online_lse_combine_applies(t, True, num_heads=64, vdim=512)
+    for t in (48, *TOKEN_BUCKETS):
+        assert cp.online_lse_combine_applies(t, True, num_heads=64, vdim=512)
+        assert not cp.online_lse_combine_applies(
+            t, True, num_heads=64, vdim=128, combine_dtype=torch.float32
+        )
+        assert not cp.online_lse_combine_applies(t, False, num_heads=64, vdim=512)
         assert not cp.send_layout_applies(t, 64, 512, torch.bfloat16, True)
-        assert not cp.vspace_fused_applies(t, True)
+        assert not cp.vspace_fused_applies(
+            t, True, num_heads=64, vdim=128, combine_dtype=torch.bfloat16
+        )
 
 
 def _run_16cpu_worker() -> dict:
@@ -326,14 +401,15 @@ def test_tpu7x_mosaic_lowering_and_fp8_oproj_chain(worker16_results):
         assert not info["has_partition_id"], (key, info)
 
 
+@pytest.mark.tpu_test
 @pytest.mark.multichip
 @pytest.mark.parametrize("mode", ["pairs", "flat"])
-@pytest.mark.parametrize("tokens", TOKEN_BUCKETS)
+@pytest.mark.parametrize("tokens", (*TOKEN_BUCKETS, 128, 192, 256))
 def test_multichip_tpu_dcp_online_lse_combine(mesh, mode, tokens):
-    """Compiled execution on the 8 TPU cores of one host across T=16..96."""
+    """Compiled execution on the 8 TPU cores of one host across T=16..256."""
     local = 8
     vdim = 512
-    live = max(0, tokens - 5)
+    live = 51 if tokens == 128 else max(0, tokens - 5)
     seed = 100 + tokens + (0 if mode == "pairs" else 1)
     part, lse = _make_inputs(N, tokens, local, vdim, live=live, seed=seed)
     ref_f64 = np.asarray(comb.reference_float64(part, lse, live_tokens=live))
@@ -572,13 +648,33 @@ def _worker16_main():
                     seed=10 + idx,
                 )
             )
-    # Full D=512 latent width at T=16, 64, 96 on DCP16, plus live=0 edge case.
-    for tokens, live in ((16, None), (16, 0), (64, 49), (96, 83)):
+    # Full D=512 latent width at T=16, 64, 96 and multi-chunk 128, 192, 224
+    # (including live=51 where chunk 1 of T=128 is completely dead).
+    for tokens, live, dma_m in (
+        (16, None, "on_wait"),
+        (16, 0, "on_wait"),
+        (64, 49, "on_wait"),
+        (96, 83, "on_wait"),
+        (128, 51, "eager"),
+        (192, 149, "eager"),
+        (224, 171, "on_wait"),
+    ):
         interpret_cases[f"w16_t{tokens}_l4_d512_pairs_live{live}"] = run_interpret_case(
-            mesh16, 16, tokens, 4, 512, mode="pairs", live=live, seed=200 + tokens
+            mesh16,
+            16,
+            tokens,
+            4,
+            512,
+            mode="pairs",
+            live=live,
+            dma_mode=dma_m,
+            seed=200 + tokens,
         )
-    # DCP8 1-lane (local=8, D=512) across T=16..96 + 2-lane TP16xDCP8 + axis_index.
-    for tokens in TOKEN_BUCKETS:
+    interpret_cases["w16_t128_l4_d256_flat_live91"] = run_interpret_case(
+        mesh16, 16, 128, 4, 256, mode="flat", live=91, dma_mode="eager", seed=260
+    )
+    # DCP8 1-lane (local=8, D=512) across T=16..96 + 192 + 2-lane TP16xDCP8.
+    for tokens in (*TOKEN_BUCKETS, 192):
         interpret_cases[f"w8_t{tokens}_l8_d512_pairs"] = run_interpret_case(
             mesh8,
             8,
@@ -650,7 +746,7 @@ def _worker16_main():
         )
     wrong_matches = bool(np.max(np.abs(got_bad - ref_bad)) < 1e-2)
 
-    # Register TPU_7X info and verify jax.export lowering across T=16..96.
+    # Register TPU_7X info and verify jax.export lowering across T=16..256.
     kind = devices[0].device_kind
     tpu_info.registry[kind] = lambda: tpu_info.get_tpu_info_for_chip(
         tpu_info.ChipVersion.TPU_7X, 1
@@ -669,9 +765,11 @@ def _worker16_main():
         heads = world * local
         sh = NamedSharding(mesh_obj, P("dcp"))
         sh_rep = NamedSharding(mesh_obj, P())
-        for tokens in TOKEN_BUCKETS:
-            for vdim in (256, 512):
-                for mode in ("pairs", "flat"):
+        for tokens in (*TOKEN_BUCKETS, 128, 192, 224, 256):
+            vdims = (256, 512) if tokens <= 96 else (512,)
+            modes = ("pairs", "flat") if tokens <= 128 else ("pairs",)
+            for vdim in vdims:
+                for mode in modes:
                     key = f"w{world}_t{tokens}_h{heads}_d{vdim}_{mode}"
 
                     def fn_exp(

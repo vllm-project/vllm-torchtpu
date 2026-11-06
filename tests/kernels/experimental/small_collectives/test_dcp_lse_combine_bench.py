@@ -34,6 +34,7 @@ from pathlib import Path
 import pytest
 
 TOKEN_BUCKETS = (16, 32, 64, 80, 96)
+CHUNKED_TOKEN_BUCKETS = (128, 160, 192, 224, 256)
 LAYERS = 32
 REPS = 20
 HIDDEN = 6144
@@ -138,17 +139,18 @@ def _project_dcp16_2host_us(
     """Analytical `est.` projection from measured 1-host DCP8 latency to 2-host
     DCP16 (`W=16`, `C=8` chips across 2 hosts, inter-host ICI hop ~1.6 us est.,
     per-link ICI unidirectional bandwidth ~180 GB/s est.)."""
-    block_bytes = (16 + tokens * local_dcp16) * vdim * 2
+    num_chunks = max(1, -(-tokens // 96))
+    block_bytes = (16 * num_chunks + tokens * local_dcp16) * vdim * 2
     if mode == "pairs":
         # DCP8 pairs sends 3 remote blocks; DCP16 pairs sends 7 remote blocks
         # (including 4 inter-host blocks over ICI) + 4 extra VPU slot terms.
         extra_bw_us = (4 * block_bytes) / (180e9 / 1e6)
-        inter_host_hop_us = 1.6
-        extra_vpu_us = 0.35
+        inter_host_hop_us = 1.6 * num_chunks
+        extra_vpu_us = 0.35 * num_chunks
         return round(dcp8_us + inter_host_hop_us + extra_bw_us + extra_vpu_us, 2)
     extra_bw_us = (8 * block_bytes) / (180e9 / 1e6)
-    inter_host_hop_us = 2.2
-    extra_vpu_us = 0.8
+    inter_host_hop_us = 2.2 * num_chunks
+    extra_vpu_us = 0.8 * num_chunks
     return round(dcp8_us + inter_host_hop_us + extra_bw_us + extra_vpu_us, 2)
 
 
@@ -296,7 +298,12 @@ def _run_bench() -> dict:
 
     for local, vdim in geometries:
         heads = world * local
-        for tokens in TOKEN_BUCKETS:
+        buckets = (
+            (*TOKEN_BUCKETS, *CHUNKED_TOKEN_BUCKETS)
+            if vdim == 512 and local in (4, 8)
+            else TOKEN_BUCKETS
+        )
+        for tokens in buckets:
             live = max(1, tokens - (tokens // 4))
             lv_full = jnp.asarray([tokens], dtype=jnp.int32)
             lv_part = jnp.asarray([live], dtype=jnp.int32)
