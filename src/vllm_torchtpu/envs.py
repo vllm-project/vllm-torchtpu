@@ -47,6 +47,9 @@ if TYPE_CHECKING:
     REQUANTIZE_BLOCK_SIZE: int | None = None
     REQUANTIZE_WEIGHT_DTYPE: str = "float8_e4m3fn"
     TPU_FP8_LINEAR_W8A16_MAX_ROWS: int = 0
+    DSV41_HC_PRE_FN3: bool = True
+    DSV41_FP32_MATMUL_PRECISION: str = "keep"
+    DSV41_ENGRAM_W8A16: bool = True
     MOE_REQUANTIZE_WEIGHT_DTYPE: str = "float8_e4m3fn"
     MOE_REQUANTIZE_BLOCK_SIZE: int | None = None
     TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL: bool | None = None
@@ -574,6 +577,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_FP8_LINEAR_W8A16_MAX_ROWS": env_nonnegative_int(
         "TPU_FP8_LINEAR_W8A16_MAX_ROWS", 0
     ),
+    # DeepSeek-V4.1 HC pre-mix: split fn into three exact bf16 parts (1, default)
+    # so the fp32 x @ fn.t() is exact at the default matmul precision.
+    "DSV41_HC_PRE_FN3": lambda: os.environ.get("DSV41_HC_PRE_FN3", "1") == "1",
+    # DeepSeek-V4.1: process-wide fp32 matmul precision set before compile
+    # ("keep", default, leaves torch's setting alone).
+    "DSV41_FP32_MATMUL_PRECISION": lambda: os.environ.get(
+        "DSV41_FP32_MATMUL_PRECISION", "keep"
+    ),
+    # DeepSeek-V4.1 Engram: run the wkv projection in W8A16 (1, default), not W8A8.
+    "DSV41_ENGRAM_W8A16": lambda: os.environ.get("DSV41_ENGRAM_W8A16", "1") == "1",
     # Specify dtype for quantized MoE weights
     "MOE_REQUANTIZE_WEIGHT_DTYPE": lambda: os.getenv(
         "MOE_REQUANTIZE_WEIGHT_DTYPE", "float8_e4m3fn"

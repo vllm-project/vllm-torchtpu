@@ -16,7 +16,6 @@
 from __future__ import annotations
 
 import copy
-import os
 import tempfile
 import weakref
 from collections.abc import Callable
@@ -35,10 +34,15 @@ from vllm.distributed import (
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_gather,
 )
+from vllm.logger import init_logger
 from vllm.models.deepseek_v41.common import engram as upstream
 from vllm.v1.attention.backends.mla.sparse_swa import DeepseekV4SWACache
 
+from vllm_torchtpu import envs
+
 from .cache import NativeCacheView, write_cache
+
+logger = init_logger(__name__)
 
 _INVALID_SCALE: int = 255
 _FP32_MANTISSA_BITS: int = 23
@@ -658,16 +662,20 @@ class Engram(upstream.Engram):
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
-        # Use W8A16 linear config: the signed-sqrt gate amplifies W8A8 quantization noise.. The signed-sqrt gate amplifies the W8A8
-        # projection error (W8A8 fails, W8A16 passes); a per-layer copy of the fp8 linear method keeps the
-        # change off every other fp8 linear (TPU_FP8_LINEAR_W8A16_MAX_ROWS is global by row bucket).
+        # Run the wkv projection in W8A16: the signed-sqrt gate amplifies the error of
+        # W8A8 activation quantization. A per-layer copy of the fp8 linear method keeps
+        # the change off every other fp8 linear (TPU_FP8_LINEAR_W8A16_MAX_ROWS is
+        # global by row bucket).
         qm = getattr(self.wkv, "quant_method", None)
-        if os.environ.get("DSV41_ENGRAM_W8A16", "1") == "1" and hasattr(qm, "w8a16_max_rows"):
+        if envs.DSV41_ENGRAM_W8A16 and hasattr(qm, "w8a16_max_rows"):
             qm = copy.copy(qm)
-            qm.w8a16_max_rows = 1 << 30
+            qm.w8a16_max_rows = 1 << 30  # pyrefly: ignore[missing-attribute]
             self.wkv.quant_method = qm
-        print(f"[deepseek_v41] engram wkv w8a16_max_rows={getattr(qm, 'w8a16_max_rows', None)} "
-              f"method={type(qm).__name__}", flush=True)
+        logger.info(
+            "[deepseek_v41] engram wkv w8a16_max_rows=%s method=%s",
+            getattr(qm, "w8a16_max_rows", None),
+            type(qm).__name__,
+        )
 
     def _create_embedding(
         self,

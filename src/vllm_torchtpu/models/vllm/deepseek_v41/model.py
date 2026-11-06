@@ -13,7 +13,6 @@
 # limitations under the License.
 """DeepSeek-V4.1 model assembly with 40L CED replay and delayed mHC on TPU."""
 
-import os
 from collections.abc import Callable, Sequence
 from copy import copy
 from dataclasses import replace
@@ -29,12 +28,14 @@ from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
 from vllm.distributed.parallel_state import get_dp_group
 from vllm.forward_context import DPMetadata, ForwardContext, override_forward_context
+from vllm.logger import init_logger
 from vllm.model_executor.kernels.mhc.torch import mhc_pre_delayed_torch
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from vllm.models.deepseek_v41.nvidia import model as upstream
 from vllm.sequence import IntermediateTensors
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.layers.adapter import token_padding
 from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4.deepseek_v4_mhc_op import (
     get_mhc_post_op,
@@ -51,6 +52,8 @@ from .attention import DeepseekV41Attention
 from .engram import Engram, NgramHashState
 from .metadata import active_cache, block_table, cache_slots
 from .moe import DeepseekV41MoE
+
+logger = init_logger(__name__)
 
 _ENC_DYNAMIC_DIMS: dict[str, int] = dict.fromkeys(
     ("input_ids", "positions", "inputs_embeds", "engram_hashes", "engram_mask"), 0
@@ -250,14 +253,18 @@ def mhc_post(
     return recombined.to(residual.dtype)
 
 
-# Split fn into three exact bf16 parts so the fp32 residual pre-mix stays exact on bf16 matmul hardware.. The
-# compiled TPU graph lowers the fp32 `x @ fn.t()` with bf16 operands at the default precision; x is the fp32 cast of the
-# bf16 residual stream (bf16-exact), so splitting fn into exact bf16 parts keeps every product exact.
-_HC_PRE_FN3 = os.environ.get("DSV41_HC_PRE_FN3", "1") == "1"
+# Split fn into three exact bf16 parts so the fp32 residual pre-mix stays exact on
+# bf16 matmul hardware: the TPU lowers the fp32 `x @ fn.t()` with bf16 operands at
+# the default precision, and x is the fp32 cast of the bf16 residual stream
+# (bf16-exact), so every partial product is exact.
+_HC_PRE_FN3 = envs.DSV41_HC_PRE_FN3
 
 
 def _split_bf16(t: Tensor, n: int) -> list[Tensor]:
-    """n fp32 tensors, each exactly bf16-representable, with t = sum(parts) + r (|r| <= 2^-(8n) |t|)."""
+    """n fp32 tensors, each exactly bf16-representable.
+
+    t = sum(parts) + r with |r| <= 2^-(8n) |t|.
+    """
     parts, r = [], t
     for _ in range(n):
         p = r.to(torch.bfloat16).to(t.dtype)
@@ -267,7 +274,10 @@ def _split_bf16(t: Tensor, n: int) -> list[Tensor]:
 
 
 def _mm_fn3(x: Tensor, fn: Tensor) -> Tensor:
-    """x @ fn^T with fn split into 3 bf16-exact parts stacked into one [3 * mix, K] matmul; parts summed in fp32."""
+    """x @ fn^T, fn split into 3 bf16-exact parts stacked into one [3 * mix, K] matmul.
+
+    The three partial products are summed in fp32.
+    """
     m = fn.shape[0]
     y = x @ torch.cat(_split_bf16(fn, 3), 0).t()
     return y[:, :m] + y[:, m : 2 * m] + y[:, 2 * m :]
@@ -286,7 +296,10 @@ def _mhc_pre_delayed_fn3(
     pre_mix: Tensor | None = None,
     x: Tensor | None = None,
 ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
-    """vLLM v0.32.0 mhc_pre_delayed_torch (kernels/mhc/torch.py:6-45) verbatim except the mixes matmul (fn3)."""
+    """vLLM v0.32.0 mhc_pre_delayed_torch (kernels/mhc/torch.py:6-45).
+
+    Verbatim except the mixes matmul, which uses the three-part fn split.
+    """
     hc_mult = residual.shape[1]
     x = (residual.flatten(1) if x is None else x).float()
     mixes = _mm_fn3(x, fn) * torch.rsqrt(x.square().mean(-1, keepdim=True) + rms_eps)
@@ -415,7 +428,7 @@ class DeepseekV41DecoderLayer(upstream.DeepseekV4DecoderLayer):
         scale = (self.hc_ffn_scale if is_ffn else self.hc_attn_scale).float()
         base = (self.hc_ffn_base if is_ffn else self.hc_attn_base).float()
         norm = self.ffn_norm if is_ffn else self.attn_norm
-        mhc_pre = _mhc_pre_delayed_fn3 if _HC_PRE_FN3 else mhc_pre_delayed_torch  # fix iii-fn3
+        mhc_pre = _mhc_pre_delayed_fn3 if _HC_PRE_FN3 else mhc_pre_delayed_torch
         post_mix, res_mix, raw_input, next_pre_mix = mhc_pre(
             residual,
             fn_weight.float(),
@@ -1152,13 +1165,19 @@ class DeepseekV41ForCausalLM(
                 parallelism is enabled without expert parallelism, or an
                 unsupported speculative decoding method is configured.
         """
-        # TPU-specific path.: HC pre runs an fp32 `x @ fn.t()` that torch_tpu lowers with bf16 operands at the
-        # default "medium" precision; torch_tpu precision is not Dynamo-traceable, so set it before compile.
-        _prec = os.environ.get("DSV41_FP32_MATMUL_PRECISION", "keep")  # fn3 arm: no global HIGHEST
+        # HC pre runs an fp32 `x @ fn.t()` that torch_tpu lowers with bf16 operands at
+        # the default "medium" precision; torch_tpu precision is not Dynamo-traceable,
+        # so an override is set here, before compile ("keep": no global change).
+        _prec = envs.DSV41_FP32_MATMUL_PRECISION
         if _prec != "keep":
             torch.set_float32_matmul_precision(_prec)
-        print(f"[deepseek_v41] fp32 matmul precision = {torch.get_float32_matmul_precision()} "
-              f"(DSV41_FP32_MATMUL_PRECISION={_prec}) hc_pre_fn3={_HC_PRE_FN3}", flush=True)
+        logger.info(
+            "[deepseek_v41] fp32 matmul precision = %s "
+            "(DSV41_FP32_MATMUL_PRECISION=%s) hc_pre_fn3=%s",
+            torch.get_float32_matmul_precision(),
+            _prec,
+            _HC_PRE_FN3,
+        )
         parallel_config = vllm_config.parallel_config
         dp_without_ep = (
             parallel_config.data_parallel_size != 1
