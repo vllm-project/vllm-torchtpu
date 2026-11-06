@@ -13,7 +13,11 @@
 # limitations under the License.
 """`build_jax_step_op` with TPU tensors under `torch.compile(backend="tpu",
 fullgraph=True)`: a donated output updates its input in place, and the
-outputs of a sharded spec have the shapes the fake kernel gives them."""
+outputs of a sharded spec have the shapes the fake kernel gives them.
+
+Self-contained (no `torch.distributed` group, as a bare `pytest` run has
+none): the mesh is this process's first TPU device. The sharded-shape math
+on wider meshes is covered by the CPU tests in `test_jax_bridge.py`."""
 
 from __future__ import annotations
 
@@ -21,6 +25,7 @@ from typing import Any
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 import pytest
 import torch
 from jax.sharding import PartitionSpec as P
@@ -30,10 +35,11 @@ from vllm_torchtpu.megakernel_runtime.jax_bridge import build_jax_step_op
 
 
 def _tpu_mesh() -> jax.sharding.Mesh:
+    """A one-device `("tp",)` mesh over this process's first TPU device: the
+    world-sized mesh of a single-process run, which needs no process group."""
     pytest.importorskip("torch_tpu")
-    from torch_tpu._internal.pallas import get_pallas_mesh
-
-    return get_pallas_mesh(axis_names=("tp",))
+    tpu = jax.devices("tpu")
+    return jax.sharding.Mesh(np.asarray(tpu[:1]), ("tp",))
 
 
 @pytest.mark.tpu_test
