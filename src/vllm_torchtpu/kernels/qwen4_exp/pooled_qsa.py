@@ -1403,11 +1403,18 @@ def qsa_cache_writes(
     req, logical, valid = _token_metadata(len(k), starts, context, slots)
     main_valid = valid
     span = pool.shape[1]
+    main_rows = logical
     if dcp is not None:
-        rank, size = dcp
+        from vllm_torchtpu.kernels.qwen4_exp.qsa_rpa import dcp_interleave, dcp_owner_row
+
+        rank, size = dcp[0], dcp[1]
         span = size * pool.shape[1]
-        owner = (logical // pool.shape[1]) % size
+        owner, row = dcp_owner_row(
+            logical, pool.shape[1], size, dcp_interleave(dcp, pool.shape[1])
+        )
         main_valid = valid & (owner == rank.reshape(()).astype(owner.dtype))
+        # The writers take the row as `logical % page`; `row` < page.
+        main_rows = row
     page = jnp.where(main_valid, main_table[req, logical // span], len(pool))
     fp8 = pool.dtype == jnp.float8_e4m3fn
     rows_packed = pack_rows(k, v, fp8=fp8, k_scale=k_scale, v_scale=v_scale)
@@ -1421,7 +1428,7 @@ def qsa_cache_writes(
         )
     )
     if not fused:
-        pool = write_main_cache(pool, rows_packed, page, logical, main_valid, **slot_kw)
+        pool = write_main_cache(pool, rows_packed, page, main_rows, main_valid, **slot_kw)
     ring_rows = math.ceil(compress_ratio / 8) * 8
     ring_elements = ring_rows * raw.shape[-1]
     # A RING_DMA_BATCH override keeps the ring reads on the batched reader.
@@ -1433,7 +1440,8 @@ def qsa_cache_writes(
     ring, tags = read_state(pool, ring_ids, ring_elements, ring_rows * 2)
     ring = ring.reshape(len(ring_ids), ring_rows, -1)
     tags = tags.reshape(len(ring_ids), ring_rows, 2)
-    main_logical = logical
+    # The fused writer also takes the main-KV row as `offset % page`.
+    main_logical = main_rows
     completed, complete, req, logical, ring, tags = _indexer_updates(
         raw,
         positions,
@@ -2343,6 +2351,7 @@ def pooled_qsa_dcp_step(
     compressed_slot: int = 0,
     main_slot: int = -1,
     max_query_len: int = 1,
+    dcp_interleave: int = 0,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
     """``pooled_qsa_step`` with the main KV split over a DCP group
     (VLLM_TPU_QSA_MAIN_KV_DCP): ``qgate`` holds the group's concatenated
@@ -2374,7 +2383,7 @@ def pooled_qsa_dcp_step(
         compressed_slot,
         main_slot,
         max_query_len=max_query_len,
-        dcp=(dcp_rank, dcp_size),
+        dcp=(dcp_rank, dcp_size, dcp_interleave),
     )
 
 

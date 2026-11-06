@@ -222,6 +222,7 @@ def _kernel(
     lean: bool = False,
     return_lse: bool = False,
     dcp_world: int = 1,
+    dcp_interleave: int = 0,
 ):
     lse_ref = refs[0] if return_lse else None
     kv0_ref, kv1_ref, sem0_ref, sem1_ref, max_ref, mass_ref, accumulator_ref = refs[
@@ -263,12 +264,20 @@ def _kernel(
         # One mask word covers ratio * 32 tokens. Split there because a
         # shared pool page may contain an odd number of these segments.
         copy_rows = min(tile_rows, physical_page_size, ratio * 32)
+        # DCP: a table entry covers dcp_world pages' worth of tokens and this
+        # rank's rows sit in that entry's page. With dcp_interleave, units of
+        # that many tokens alternate over the ranks, so this tile's rows start
+        # at row (tile offset in the entry // kv_tile) * tile_rows.
+        entry_span = physical_page_size * dcp_world
+        if dcp_world > 1 and dcp_interleave:
+            row_base = (tile * kv_tile) % entry_span // kv_tile * tile_rows
         for offset in range(0, tile_rows, copy_rows):
             logical = tile * kv_tile + offset
-            # DCP: a table entry covers dcp_world pages' worth of tokens and
-            # this rank's rows sit in that entry's page at t % page size.
-            page = logical // (physical_page_size * dcp_world)
-            in_page = logical % physical_page_size
+            page = logical // entry_span
+            if dcp_world > 1 and dcp_interleave:
+                in_page = row_base + offset
+            else:
+                in_page = logical % physical_page_size
             # An odd final logical page has no second half. Its selection
             # word is zero; repeat a valid DMA address without exposing it.
             address = block * pages_per_query + jnp.minimum(page, pages_per_query - 1)
@@ -520,6 +529,7 @@ def _kernel(
         "query_tile",
         "return_lse",
         "dcp_world",
+        "dcp_interleave",
     ),
 )
 def block_sparse_gqa_prefill(
@@ -541,6 +551,7 @@ def block_sparse_gqa_prefill(
     return_lse: bool = False,
     dcp_rank=None,
     dcp_world: int = 1,
+    dcp_interleave: int = 0,
 ):
     """Run exact selected-group attention with query-block KV reuse.
 
@@ -551,6 +562,13 @@ def block_sparse_gqa_prefill(
     tokens with ``(t // page) % dcp_world == dcp_rank``, held in the entry's
     page at row ``t % page``. Needs paired pages with ``kv_tile`` equal to
     one entry.
+
+    ``dcp_interleave`` (tokens, a multiple of 128 dividing the page; 0 = one
+    page): ownership alternates in units of that many tokens instead,
+    ``(t // I) % dcp_world``, at row ``(o // (I * D)) * I + o % I`` of the
+    entry's page (``o = t % (D * page)``, ``qsa_rpa.dcp_owner_row``); ``kv_tile``
+    is then ``D * I``. A TP1 stage's 3,200-row pages under PCP keep the paired
+    kernel this way.
 
     ``kv_head_offset`` skips that many KV heads of each cache row: a paired
     main KV page stores a second layer's head after the first layer's.
@@ -595,8 +613,13 @@ def block_sparse_gqa_prefill(
         raise ValueError("Cache packing does not match its dtype")
 
     dcp = dcp_rank is not None
-    if dcp and not (paired_pages and kv_tile == dcp_world * physical_page_size):
-        raise ValueError("DCP prefill needs paired pages, one table entry per KV tile")
+    interleave = dcp_interleave or physical_page_size
+    if dcp and (physical_page_size % interleave or interleave % (ratio * 32)):
+        raise ValueError("DCP interleave must divide the page in whole selection words")
+    if dcp and not (paired_pages and kv_tile == dcp_world * interleave):
+        raise ValueError(
+            "DCP prefill needs paired pages, one interleave unit per rank per KV tile"
+        )
     groups = page_table.shape[1] * physical_page_size * dcp_world // ratio
     num_kv_tiles = (groups * ratio + kv_tile - 1) // kv_tile
     words_per_tile = kv_tile // (ratio * 32)
@@ -613,7 +636,7 @@ def block_sparse_gqa_prefill(
         # One selection word covers ratio * 32 tokens, within one page's rows.
         word_tokens = jnp.arange(words, dtype=jnp.int32) * (ratio * 32)
         owned_words = (
-            (word_tokens // physical_page_size) % dcp_world
+            (word_tokens // interleave) % dcp_world
             == jnp.asarray(dcp_rank, jnp.int32).reshape(-1)[0]
         ).astype(jnp.int32)
     if envs.VLLM_TPU_QSA_PREFILL_BITSET_KERNEL:
@@ -738,6 +761,11 @@ def block_sparse_gqa_prefill(
             **({"lean": True} if envs.VLLM_TPU_QSA_PREFILL_LEAN else {}),
             **({"return_lse": True} if return_lse else {}),
             **({"dcp_world": dcp_world} if dcp else {}),
+            **(
+                {"dcp_interleave": interleave}
+                if dcp and interleave != physical_page_size
+                else {}
+            ),
         ),
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=4,
@@ -858,7 +886,9 @@ def block_sparse_gqa_attention(
     if return_lse:
         offset["return_lse"] = True
     if dcp is not None:
-        offset["dcp_rank"], offset["dcp_world"] = dcp
+        offset["dcp_rank"], offset["dcp_world"] = dcp[0], dcp[1]
+        if len(dcp) > 2 and dcp[2]:
+            offset["dcp_interleave"] = dcp[2]
 
     def run_aligned(_):
         return block_sparse_gqa_prefill(

@@ -38,6 +38,26 @@ def pack_rows(key, value, *, fp8, k_scale=1.0, v_scale=1.0):
     return joined
 
 
+def dcp_interleave(dcp, page_size: int) -> int:
+    """Tokens per ownership unit of a main-KV DCP ``dcp = (rank, D[, I])``:
+    ``I`` when given and nonzero, else one page (the decode's layout)."""
+    return dcp[2] if len(dcp) > 2 and dcp[2] else page_size
+
+
+def dcp_owner_row(t, page_size: int, world: int, interleave: int):
+    """Owner rank and in-page row of absolute position ``t`` under main-KV DCP.
+
+    A block-table entry covers ``world * page_size`` tokens; units of
+    ``interleave`` tokens alternate over the ranks, and each rank packs its
+    units of the entry into the entry's page in order. ``interleave ==
+    page_size`` gives ``((t // page) % world, t % page)``.
+    """
+    offset = t % (world * page_size)
+    owner = (offset // interleave) % world
+    row = offset // (interleave * world) * interleave + offset % interleave
+    return owner, row
+
+
 def virtual_page_metadata(
     blocks, lengths, table, *, ratio=4, page_size=128, dcp=None
 ):
@@ -86,7 +106,8 @@ def virtual_page_metadata(
 def _dcp_page_metadata(blocks, lengths, table, *, ratio, page_size, dcp):
     """:func:`virtual_page_metadata` for this DCP rank's owned groups; rows
     with no owned token get ``kv_lens`` 0 and no query (see ``cu_q_lens``)."""
-    rank, world = dcp
+    rank, world = dcp[0], dcp[1]
+    unit_groups = dcp_interleave(dcp, page_size) // ratio
     rank = jnp.asarray(rank, jnp.int32).reshape(-1)[0]
     batch, budget = blocks.shape
     page_groups = page_size // ratio
@@ -94,11 +115,11 @@ def _dcp_page_metadata(blocks, lengths, table, *, ratio, page_size, dcp):
     complete = lengths // ratio
     count = jnp.minimum(complete, budget)
     columns = jnp.arange(budget)[None, :]
-    owned = (columns < count[:, None]) & ((blocks // page_groups) % world == rank)
+    owned = (columns < count[:, None]) & ((blocks // unit_groups) % world == rank)
     # Owned groups ascending at the front, the rest after them.
     groups = jax.lax.sort(jnp.where(owned, blocks, big), dimension=1, is_stable=False)
     owned_count = jnp.sum(owned, axis=1, dtype=jnp.int32)
-    tail = ((lengths % ratio) > 0) & ((complete // page_groups) % world == rank)
+    tail = ((lengths % ratio) > 0) & ((complete // unit_groups) % world == rank)
     columns = jnp.arange(budget + 1)[None, :]
     groups = jnp.concatenate((groups, jnp.zeros((batch, 1), jnp.int32)), axis=1)
     groups = jnp.where(columns == owned_count[:, None], complete[:, None], groups)
@@ -116,7 +137,9 @@ def _dcp_page_metadata(blocks, lengths, table, *, ratio, page_size, dcp):
         jnp.arange(batch, dtype=jnp.int32),
         batch,
     )
-    pages = jnp.where(valid, physical * page_groups + safe % page_groups, 0)
+    # The group's row group in the entry's page (dcp_owner_row in group units).
+    _, row_group = dcp_owner_row(safe, page_groups, world, unit_groups)
+    pages = jnp.where(valid, physical * page_groups + row_group, 0)
     kv_lens = owned_count * ratio + jnp.where(tail, lengths % ratio, 0)
     cu_q_lens = jnp.concatenate(
         (jnp.zeros((1,), jnp.int32), jnp.cumsum((kv_lens > 0).astype(jnp.int32)))
@@ -552,9 +575,10 @@ def _prefill_attention(
         query, cache, kv_heads=kv_heads, ratio=ratio, with_query_tile=True
     )
     if dcp is not None:
-        # One KV tile per main-KV table entry (dcp pages' worth of tokens); the
-        # paired-page kernel then fetches this rank's page of each tile.
-        kv_tile = dcp[1] * cache.shape[1]
+        # One KV tile per ownership unit of every rank (a table entry, dcp
+        # pages' worth of tokens, by default); the paired-page kernel fetches
+        # this rank's rows of each tile.
+        kv_tile = dcp[1] * dcp_interleave(dcp, cache.shape[1])
         if query_block % 128 or query_block * query.shape[1] > 256 * 24:
             query_block, query_tile = 256, None
         if query_tile and query_block % query_tile:
@@ -630,6 +654,25 @@ def dcp_combine_step(
 ) -> jax.Array:
     """``dcp_combine`` with a fully annotated signature for ``jax_op``."""
     return dcp_combine(out_pair, lse_pair, gate, rank)
+
+
+def pcp_combine(out_pair, lse_pair, gate, *, out_dtype=jnp.bfloat16):
+    """Merge a PCP pair's partial attention over every head, then gate.
+
+    Under PCP each rank attends all heads of all the step's tokens over the
+    main-KV rows it owns, so ``out_pair`` [size, T, H, D] and ``lse_pair``
+    [size, T, H] hold every rank's partial result for the same heads (no
+    head slice as in :func:`dcp_combine`); ``gate`` [T, H, D]."""
+    size = out_pair.shape[0]
+    rank = jnp.zeros((1,), jnp.int32)
+    tile = lambda x: jnp.concatenate([x] * size, axis=2)  # noqa: E731
+    # dcp_combine slices heads [rank * H, (rank + 1) * H) of size * H heads.
+    return dcp_combine(tile(out_pair), tile(lse_pair), gate, rank, out_dtype=out_dtype)
+
+
+def pcp_combine_step(out_pair: jax.Array, lse_pair: jax.Array, gate: jax.Array) -> jax.Array:
+    """``pcp_combine`` with a fully annotated signature for ``jax_op``."""
+    return pcp_combine(out_pair, lse_pair, gate)
 
 
 def qsa_attention(
