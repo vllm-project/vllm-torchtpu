@@ -15,23 +15,9 @@
 
 The core weight loader (`megakernel.weights`) never imports `torch` or `vllm`
 and never branches on the concrete source type. Instead, every `WeightSource`
-exposes an `ops: ArrayOps` implementation with the 12-method protocol:
-
-- `slice_axis(x, axis, start, stop)` — slice `x` along `axis` in `[start, stop)`.
-- `concat(xs, axis)` — concatenate `xs` along `axis` into a contiguous buffer.
-- `reshape(x, shape)` — reshape `x` to `shape` (contiguous view where supported).
-- `transpose(x, perm)` — permute dimensions of `x` according to `perm`.
-- `pad(x, pad_widths)` — zero-pad trailing dimensions with `(before, after)` pairs.
-- `cast(x, dtype)` — convert `x` to `dtype` (`FP8`, `BF16`, `F32`, `I32`).
-- `is_fp8(x)` — return whether `x` has an FP8 (`float8_e4m3fn`) dtype.
-- `dequantize(x, scale, dtype)` — dequantize `x` by `scale` in `F32` and cast
-  to `dtype`.
-- `quantize_fp8(x)` — per-output-channel symmetric FP8 (`e4m3fn`) quantization of
-  a `[K, N]` weight tensor, returning `(w_fp8 [K, N], scale [N] f32)`.
-- `zeros(shape, dtype)` — allocate a zero-filled tensor of `shape` and `dtype`.
-- `stack_layers(xs)` — stack per-layer tensors along leading axis `0` into a
-  newly allocated contiguous base buffer (not a strided view).
-- `own(x)` — materialize `x` as a contiguous base buffer (`storage_offset == 0`).
+exposes an `ops: ArrayOps` implementation (`slice_axis`, `concat`, `reshape`,
+`transpose`, `pad`, `cast`, `is_fp8`, `dequantize`, `quantize_fp8`, `zeros`,
+`stack_layers`, `own`) and alias-resolution hooks.
 """
 
 from __future__ import annotations
@@ -211,21 +197,25 @@ def target_axis_widths(decl: HFParamDecl, R: int, split_axis: int) -> tuple[int,
     full_w = int(decl.shape[dim_ax])
     tf = decl.transform
     if tf.shard_axis is not None and (tf.shard_axis % len(decl.shape)) == dim_ax:
+        if full_w % R != 0:
+            raise ValueError(
+                f"HFParamDecl {decl.name!r} axis {dim_ax} width {full_w} "
+                f"is not divisible by R={R}"
+            )
         return full_w, full_w // R
     return full_w, full_w
 
 
 def apply_decl_pad(ops: ArrayOps, x: Any, decl: HFParamDecl) -> Any:
     """Apply `decl.transform.pad` (`(before, target_width)`) via `ops.pad`."""
-    pad_spec = decl.transform.pad
-    if pad_spec is None:
+    if decl.transform.pad is None:
         return x
     shape = tuple(int(d) for d in x.shape)
-    offset = len(shape) - len(pad_spec)
-    widths: list[tuple[int, int]] = []
-    for idx, (before, target_w) in enumerate(pad_spec):
-        cur = shape[offset + idx]
-        widths.append((before, max(0, target_w - cur - before)))
+    offset = len(shape) - len(decl.transform.pad)
+    widths = [
+        (before, max(0, target_w - shape[offset + idx] - before))
+        for idx, (before, target_w) in enumerate(decl.transform.pad)
+    ]
     return ops.pad(x, widths)
 
 
@@ -322,11 +312,11 @@ def slice_alias_targets(
             out[s_grp] = ops.cast(s_buf, s_first.dtype)
         return out
 
-    scale_by_target: dict[str, HFParamDecl] = {}
-    for sn in alias.scale_targets:
-        sd = scale_decls[sn]
-        if sd.transform.scale_for is not None:
-            scale_by_target[sd.transform.scale_for] = sd
+    scale_by_target = {
+        scale_decls[sn].transform.scale_for: scale_decls[sn]
+        for sn in alias.scale_targets
+        if scale_decls[sn].transform.scale_for is not None
+    }
 
     out = {}
     off = 0

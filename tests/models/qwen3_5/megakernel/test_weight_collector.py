@@ -860,6 +860,58 @@ def test_load_vllm_weights_validation_errors() -> None:
     packed_no_g = load_vllm_weights(TinyQwen35, bb_def, ex, tp_rank=0)
     assert len(packed_no_g["e13"]) == 4
 
+    # 6. `VLLMWeightSource.read_model_param` validates `EmbeddingModule` shards
+    # via `slice_alias_targets` and declines a padded `VocabParallelEmbedding`
+    # shard by name (`model.embed_tokens.weight`).
+    from types import SimpleNamespace
+
+    from vllm_torchtpu.megakernel.decls import ResolvedModuleGeometry
+    from vllm_torchtpu.megakernel.modules.norm import EmbeddingModule
+    from vllm_torchtpu.megakernel_runtime.weight_source import VLLMWeightSource
+
+    vocab = 64
+    emb_geom = ResolvedModuleGeometry(
+        EmbeddingModule, "model.embed_tokens", {"vocab": vocab, "H": g_default.H}
+    )
+    emb_decl = EmbeddingModule("model.embed_tokens").hf_params(g=emb_geom)[0]
+    bb_def.embed_tokens = SimpleNamespace(
+        weight=torch.nn.Parameter(
+            torch.ones((vocab // ex.R, g_default.H), dtype=torch.bfloat16),
+            requires_grad=False,
+        )
+    )
+    src_emb = VLLMWeightSource(bb_def, g_default)
+    emb_shard = src_emb.read_model_param(emb_decl, R=ex.R, tp_rank=0)
+    assert tuple(emb_shard.shape) == (vocab // ex.R, g_default.H)
+    bb_def.embed_tokens = SimpleNamespace(
+        weight=torch.nn.Parameter(
+            torch.ones((vocab // ex.R + 8, g_default.H), dtype=torch.bfloat16),
+            requires_grad=False,
+        )
+    )
+    with pytest.raises(
+        ValueError,
+        match=(
+            r"Alias 'model\.embed_tokens\.weight' \(already_sharded=True\) "
+            r"axis 0 width 40 != expected 32"
+        ),
+    ):
+        src_emb.read_model_param(emb_decl, R=ex.R, tp_rank=0)
+    bb_def.embed_tokens = SimpleNamespace(
+        weight=torch.nn.Parameter(
+            torch.ones((vocab // ex.R, g_default.H + 8), dtype=torch.bfloat16),
+            requires_grad=False,
+        )
+    )
+    with pytest.raises(
+        ValueError,
+        match=(
+            r"Model parameter 'embed_tokens' shard has shape \(32, 264\), "
+            r"expected \(32, 256\)"
+        ),
+    ):
+        src_emb.read_model_param(emb_decl, R=ex.R, tp_rank=0)
+
 
 def test_load_vllm_weights_non_qwen_synth_hybrid_model() -> None:
     """Verify `load_vllm_weights` loads a non-Qwen `ModelDef` (`att_every=2`)."""

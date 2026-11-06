@@ -371,7 +371,8 @@ class VLLMWeightSource:
         )
 
     def read_model_param(self, decl: HFParamDecl, *, R: int, tp_rank: int) -> Any:
-        del R, tp_rank
+        from vllm_torchtpu.megakernel.weights import slice_alias_targets
+
         candidates = [al.source for al in decl.vllm_aliases] + [decl.hf_name]
         for cand in candidates:
             for path in (cand, cand.removeprefix("model.")):
@@ -385,6 +386,35 @@ class VLLMWeightSource:
                     )
                     self._dev = t.device
                     self._ops._dev = t.device
+                    if decl.vllm_aliases and decl.transform.shard_axis is not None:
+                        res_slice = slice_alias_targets(
+                            self._ops,
+                            decl.vllm_aliases[0],
+                            t,
+                            None,
+                            (decl,),
+                            {},
+                            R=R,
+                            tp_rank=tp_rank,
+                        )[decl.name]
+                        t_shape = tuple(int(d) for d in res_slice.shape)
+                        sh_ax = decl.transform.shard_axis % len(decl.shape)
+                        exp_shape = tuple(
+                            int(d) // R if ax == sh_ax else int(d)
+                            for ax, d in enumerate(decl.shape)
+                        )
+                        _need(
+                            t_shape == exp_shape,
+                            f"Model parameter {decl.name!r} shard has shape "
+                            f"{t_shape}, expected {exp_shape}",
+                        )
+                        return res_slice
+                    t_shape = tuple(int(d) for d in t.shape)
+                    _need(
+                        t_shape == decl.shape,
+                        f"Model parameter {decl.name!r} has shape {t_shape}, "
+                        f"expected {decl.shape}",
+                    )
                     return t
         raise ValueError(f"Cannot resolve model parameter {decl.name!r} on backbone")
 

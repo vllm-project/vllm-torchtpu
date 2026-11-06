@@ -28,9 +28,14 @@ from tests.megakernel.megakernel_fakes import (
     FakeGeometry,
     FakeMixerModule,
 )
-from vllm_torchtpu.megakernel.decls import HFParamDecl, ParamTransform, VLLMAlias
+from vllm_torchtpu.megakernel.decls import (
+    HFParamDecl,
+    ParamTransform,
+    ResolvedModuleGeometry,
+    VLLMAlias,
+)
 from vllm_torchtpu.megakernel.exec_spec import ExecSpec
-from vllm_torchtpu.megakernel.modules.norm import NormModule
+from vllm_torchtpu.megakernel.modules.norm import EmbeddingModule, NormModule
 from vllm_torchtpu.megakernel.ops import BF16, F32, FP8, I32
 from vllm_torchtpu.megakernel.planner import plan, weight_shapes
 from vllm_torchtpu.megakernel.spec import LayerType, ModelSpec, SwitchSlot
@@ -251,6 +256,56 @@ def test_slice_alias_targets_quant_fastpath_and_dequant():
             R=2,
             tp_rank=0,
         )
+
+    # 4. `EmbeddingModule` (`already_sharded=True, shard_axis=0`): exact shard
+    # `(vocab // R, H)` passes; a padded `VocabParallelEmbedding` shard
+    # `(num_embeddings_padded // R, H)` with `num_embeddings_padded // R > vocab // R`
+    # or `vocab % R != 0` declines by name.
+    emb_mod = EmbeddingModule("model.embed_tokens")
+    emb_decl = emb_mod.hf_params(
+        g=ResolvedModuleGeometry(
+            EmbeddingModule, "model.embed_tokens", {"vocab": 64, "H": 16}
+        )
+    )[0]
+    emb_alias = emb_decl.vllm_aliases[0]
+    res_emb = slice_alias_targets(
+        ops,
+        emb_alias,
+        jnp.ones((32, 16), dtype=BF16),
+        None,
+        (emb_decl,),
+        {},
+        R=2,
+        tp_rank=0,
+    )
+    assert res_emb["embed_tokens"].shape == (32, 16)
+    with pytest.raises(
+        ValueError,
+        match=(
+            r"Alias 'model\.embed_tokens\.weight' \(already_sharded=True\) "
+            r"axis 0 width 40 != expected 32"
+        ),
+    ):
+        slice_alias_targets(
+            ops,
+            emb_alias,
+            jnp.ones((40, 16), dtype=BF16),
+            None,
+            (emb_decl,),
+            {},
+            R=2,
+            tp_rank=0,
+        )
+    odd_emb_decl = emb_mod.hf_params(
+        g=ResolvedModuleGeometry(
+            EmbeddingModule, "model.embed_tokens", {"vocab": 65, "H": 16}
+        )
+    )[0]
+    with pytest.raises(
+        ValueError,
+        match=r"HFParamDecl 'embed_tokens' axis 0 width 65 is not divisible by R=2",
+    ):
+        target_axis_widths(odd_emb_decl, R=2, split_axis=0)
 
 
 def test_switch_branch_and_pack_spec_logical_weights():
