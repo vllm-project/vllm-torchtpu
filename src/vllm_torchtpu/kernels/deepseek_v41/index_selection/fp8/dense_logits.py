@@ -12,6 +12,8 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from vllm_torchtpu import envs
+
 from .cache import PAGE_RECORDS, PAGE_ROWS, PackedFP8Layout
 from .common import (
     QueryTile,
@@ -439,8 +441,14 @@ def _kernel(
                         head_weights,
                         mxu_selector,
                         sublanes=sublanes,
+                        # Keyed to the tuned depth, so another issue depth
+                        # keeps each fragment's head-sum arithmetic.
                         use_mxu=_reduce_on_mxu(
-                            fragment, stage, count, every=4, drain=4
+                            fragment,
+                            fragment + PACKED_FP8_MQA_CONFIG.issue_depth,
+                            count,
+                            every=4,
+                            drain=4,
                         ),
                     )
                     store(fragment, values)
@@ -640,10 +648,16 @@ def fp8_paged_mqa_logits(
         )
     tile = paged_mqa_query_tile(query_size, heads)
     config = PACKED_FP8_MQA_CONFIG
+    depth = (
+        envs.TPU_DEEPSEEK_V41_INDEXER_ISSUE_DEPTH
+        if candidate_block_size is None
+        else envs.TPU_DEEPSEEK_V41_INDEXER_PUBLISH_ISSUE_DEPTH
+    )
     config = replace(
         config,
         query_tile=tile,
         key_tile=paged_mqa_key_tile(max_model_len, layout.page_size, config.key_tile),
+        issue_depth=depth or config.issue_depth,
     )
     width = pl.cdiv(max_model_len, config.key_tile) * config.key_tile
     if tokens == 0 or width == 0:
