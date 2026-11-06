@@ -234,7 +234,9 @@ def test_step_context_and_package_exports() -> None:
     assert mkr.suppressed is hooks.suppressed
     assert mkr.is_suppressed is hooks.is_suppressed
     assert mkr.MegakernelUnsupported is errors.MegakernelUnsupported
+    assert mkr.MegakernelPluginError is errors.MegakernelPluginError
     assert issubclass(errors.MegakernelUnsupported, RuntimeError)
+    assert issubclass(errors.MegakernelPluginError, RuntimeError)
 
 
 def test_suppressed_nests_and_restores_on_error() -> None:
