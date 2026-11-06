@@ -19,7 +19,8 @@ The model contract itself (`TpuMonoSpec`, the `MonoProgram` protocol,
 vocabularies) lives in the framework-free `megakernel.runtime.contract`;
 import it from there (its only import path). Here are the runtime's own
 facts about the runner, `RunnerView` (startup / bind) and `ForwardView` (per
-step), and the shorthand table of built-in templates.
+step), and the shorthands: the built-in table and the model folders
+discovered by their `SPEC` (`shorthands()`).
 
 Stdlib only at import (no torch / jax / vLLM).
 """
@@ -27,29 +28,108 @@ Stdlib only at import (no torch / jax / vLLM).
 from __future__ import annotations
 
 import dataclasses
+import functools
+import importlib
+import os
+import pkgutil
 from collections.abc import Callable, Mapping
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, NamedTuple
+
+from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.megakernel.runtime import contract as _contract
 
 if TYPE_CHECKING:
     from vllm_torchtpu.megakernel.runtime.contract import StepFn
 
+logger = init_logger(__name__)
+
+# Where model folders live: `<MODELS_PACKAGE>.<model>.megakernel`.
+MODELS_PACKAGE = "vllm_torchtpu.models"
+
 
 class Shorthand(NamedTuple):
-    """A built-in template selectable by name or by the checkpoint's HF arch.
+    """A template selectable by name or by the checkpoint's HF arch.
 
     `architectures` / `model_types` match the HF config's `architectures`
-    entries and `model_type` (also of its `text_config`). The template's own
-    settings live in its `SPEC`, not here.
+    entries and `model_type` (also of its `text_config`); `hf_fields`
+    (`(field, value)` pairs, read from the HF config or its `text_config`)
+    narrows a match, and an entry with `hf_fields` is preferred. The
+    template's own settings live in its `SPEC`, not here.
     """
 
     module: str
     architectures: tuple[str, ...]
     model_types: tuple[str, ...]
+    hf_fields: tuple[tuple[str, Any], ...] = ()
 
 
 # Built-in templates by shorthand name. Imported by string only, so the
 # runtime never imports a template at module load.
 SHORTHANDS: Mapping[str, Shorthand] = {}
+
+
+@functools.cache
+def discovered_shorthands() -> Mapping[str, Shorthand]:
+    """Model folders under `MODELS_PACKAGE` whose `SPEC` declares the
+    checkpoints it serves (`architectures` / `model_types`), by `SPEC.name`
+    (lowercased).
+
+    Found once per process: a package `<MODELS_PACKAGE>.<model>` with a
+    `megakernel/__init__.py` on disk is imported, which runs that package's
+    `__init__` and the folder's stdlib-only `__init__` (`SPEC`), never its
+    `create` target. Packages without a `megakernel` folder aren't imported.
+    A folder that fails to import is skipped with a warning. On a name clash
+    the first package in name order wins.
+    """
+    try:
+        models = importlib.import_module(MODELS_PACKAGE)
+    except Exception as exc:  # no model folders installed: nothing to find
+        logger.debug("megakernel: no %s (%s)", MODELS_PACKAGE, exc)
+        return MappingProxyType({})
+    found: dict[str, Shorthand] = {}
+    infos = pkgutil.iter_modules(getattr(models, "__path__", ()))
+    for info in sorted(infos, key=lambda i: i.name):
+        root = getattr(info.module_finder, "path", None)
+        if not info.ispkg or root is None:
+            continue
+        if not os.path.isfile(
+            os.path.join(root, info.name, "megakernel", "__init__.py")
+        ):
+            continue
+        module = f"{MODELS_PACKAGE}.{info.name}.megakernel"
+        try:
+            spec = getattr(importlib.import_module(module), "SPEC", None)
+        except Exception as exc:  # a broken folder: say so, and skip it
+            logger.warning(
+                "Megakernel: model folder %s failed to import (%s: %s); "
+                "skipping it, so the megakernel stays off for its models.",
+                module,
+                type(exc).__name__,
+                exc,
+            )
+            continue
+        if not isinstance(spec, _contract.TpuMonoSpec):
+            continue
+        name = spec.name.lower()
+        if not (spec.architectures or spec.model_types) or name in found:
+            continue
+        found[name] = Shorthand(
+            module=module,
+            architectures=spec.architectures,
+            model_types=spec.model_types,
+            hf_fields=spec.hf_fields,
+        )
+    return MappingProxyType(found)
+
+
+def shorthands() -> dict[str, Shorthand]:
+    """Every shorthand: `SHORTHANDS`, then the discovered model folders whose
+    name it doesn't already use (an explicit entry wins)."""
+    merged = dict(SHORTHANDS)
+    for name, entry in discovered_shorthands().items():
+        merged.setdefault(name, entry)
+    return merged
 
 
 class RunnerView:
@@ -219,8 +299,11 @@ class ForwardView:
 
 
 __all__ = [
+    "MODELS_PACKAGE",
     "SHORTHANDS",
     "ForwardView",
     "RunnerView",
     "Shorthand",
+    "discovered_shorthands",
+    "shorthands",
 ]
