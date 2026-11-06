@@ -1071,6 +1071,22 @@ class StagedConsumer:
         missing = (set(self._dst_owner) | set(self._dst_compressed)) - staged
         if any(not n.startswith("mtp.") for n in missing):
             raise ValueError(f"Qwen PD staging lacks producer pages for {sorted(missing)}")
+        # QWEN4_EXP_PD_ZERO_DRAFT_KV=1: the repack also writes zeros over the
+        # draft's rows of the landed tokens (staging row 0, the never-reserved
+        # null page, is zero). The scheduler skips zeroing blocks a load will
+        # fill, but no load fills the draft's, so without this they hold
+        # stale bytes and real (non-synthetic) MTP acceptance depends on what
+        # the pages last held. A determinism instrument for identity tests;
+        # synthetic acceptance never reads draft KV.
+        import os
+
+        self._zero_draft = {}
+        if os.environ.get("QWEN4_EXP_PD_ZERO_DRAFT_KV", "0").strip() == "1":
+            self._zero_draft = {
+                n: (self._dst_compressed[n] if n in self._dst_compressed
+                    else (self._dst_owner[n], 0))
+                for n in sorted(missing)
+            }
         self._dst_owner = {n: g for n, g in self._dst_owner.items() if n not in missing}
         self._dst_compressed = {
             n: v for n, v in self._dst_compressed.items() if n not in missing
@@ -1308,6 +1324,23 @@ class StagedConsumer:
         for name in self._gdn_names:
             gdn_s.append(src_pages[name][0])
             gdn_d.append(dst_tables[self._dst_owner[name]][self._state_entry])
+        for name, (gi, offset) in self._zero_draft.items():
+            dst = dst_tables[gi]
+            kind = owner_kind(name)
+            if kind == "compressed":
+                pairs = np.arange(skip_tokens // (2 * self.ratio),
+                                  math.ceil(math.ceil(num_tokens / self.ratio) / 2))
+                t = pairs * 2 * self.ratio
+                d = (np.asarray(dst, dtype=np.int64)[t // self.dst_block] * self.dst_block
+                     + offset + (t % self.dst_block) // (2 * self.ratio))
+            elif kind == "main":  # the draft's main KV is not DCP-split
+                t = np.arange(skip_tokens, num_tokens, dtype=np.int64)
+                d = (np.asarray(dst, dtype=np.int64)[t // self.dst_block] * self.dst_block
+                     + t % self.dst_block)
+            else:  # ring: its one page's rows
+                d = np.arange(self.dst_block, dtype=np.int64) + dst[0] * self.dst_block
+            copy_s.append(np.zeros(len(d), dtype=np.int64))
+            copy_d.append(d)
 
         def cat(parts):
             parts = [align_rows(p) for p in parts if len(p)]
