@@ -21,7 +21,8 @@
 - `make_typed_step_wrapper`: a fixed-arity, `jax.Array`-annotated wrapper of a
   `*args` step function (`JaxCallable` rejects `*args` signatures).
 - `torch_cpu_to_jax` / `jax_to_torch_cpu`: lossless CPU conversions for the
-  CPU interpret path of unit tests.
+  CPU interpret path of unit tests (a 64-bit dtype needs `jax_enable_x64`;
+  without it the conversion raises rather than narrowing).
 - `build_jax_step_op`: a JAX step function as a torch callable (a
   `torch.library` custom op over a `list[Tensor]` of operands):
   `sharded_jax_callable` with TPU tensors, the function run by JAX with CPU
@@ -85,8 +86,18 @@ def sharded_jax_callable(
 def torch_cpu_to_jax(
     t: torch.Tensor, sharding: NamedSharding | None = None
 ) -> jax.Array:
-    """Convert a CPU `torch.Tensor` to a `jax.Array` without precision loss."""
+    """Convert a CPU `torch.Tensor` to a `jax.Array` without precision loss.
+
+    Raises `ValueError` for a 64-bit tensor (int64 / float64 / ...) while
+    `jax_enable_x64` is off: JAX would narrow it to 32 bits silently.
+    """
     t_c = t.detach().cpu().contiguous()
+    if t_c.dtype.itemsize == 8 and not jax.config.jax_enable_x64:
+        raise ValueError(
+            f"torch_cpu_to_jax: a {t_c.dtype} tensor needs jax_enable_x64; "
+            "without it JAX narrows it to 32 bits. Pass a 32-bit tensor or "
+            "enable x64"
+        )
     if t_c.dtype == torch.float8_e4m3fn:
         arr = jnp.asarray(t_c.view(torch.uint8).numpy()).view(jnp.float8_e4m3fn)
     elif t_c.dtype == torch.bfloat16:

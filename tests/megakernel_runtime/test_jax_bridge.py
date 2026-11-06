@@ -206,7 +206,8 @@ def test_typed_step_wrapper_signature() -> None:
         assert param.default is inspect.Parameter.empty
     assert sig.return_annotation == tuple[jax.Array, jax.Array]
     assert typed(1, 2, 3) == (3, 2, 1) and seen == [(1, 2, 3)]
-    assert inspect.signature(make_typed_step_wrapper("f", step, 1, 1)).return_annotation
+    one = make_typed_step_wrapper("f", step, 1, 1)
+    assert inspect.signature(one, eval_str=True).return_annotation == tuple[jax.Array]
 
 
 @pytest.mark.parametrize(
@@ -219,6 +220,19 @@ def test_cpu_conversions_round_trip_bit_exactly(dtype: torch.dtype) -> None:
     back = jax_to_torch_cpu(arr, src)
     assert back.dtype == dtype
     assert torch.equal(back.view(torch.uint8), src.view(torch.uint8))
+
+
+@pytest.mark.parametrize("dtype", [torch.int64, torch.float64])
+def test_cpu_conversion_of_64_bit_dtypes(dtype: torch.dtype) -> None:
+    """Without `jax_enable_x64`, a 64-bit tensor raises instead of narrowing
+    silently; with it, the round trip is bit-exact."""
+    src = torch.tensor([[2**40 + 3, -(2**33)], [7, -1]]).to(dtype)
+    match = f"{dtype} tensor needs jax_enable_x64"
+    with jax.enable_x64(False), pytest.raises(ValueError, match=match):
+        torch_cpu_to_jax(src)
+    with jax.enable_x64(True):
+        back = jax_to_torch_cpu(torch_cpu_to_jax(src), src)
+    assert back.dtype == dtype and torch.equal(back, src)
 
 
 JAX_TOY_PLUGIN = '''
