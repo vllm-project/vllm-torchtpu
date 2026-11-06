@@ -34,6 +34,7 @@ from vllm_torchtpu.layers.core.ragged_a2a_moe import (
     _capacity_overflow,
     _gather_routing,
     _tile_rows,
+    default_capacity_factors,
     exchange_capacity,
     exchange_need,
     ragged_a2a_moe,
@@ -780,6 +781,36 @@ def test_exchange_capacity_route_factor():
     # Route bounds above the one-hot threshold are not bounded.
     kw["onehot_moe_permute_threshold"] = 512
     assert exchange_capacity(factor=2.5, route_factor=3.0, **kw) == (512, 5120)
+
+
+@pytest.mark.cpu_test
+def test_default_capacity_factors_by_group_size():
+    # Up to 8 members keep x2.5 / x3; larger groups hold fewer experts per
+    # rank, whose busiest rank sits further above the mean.
+    for dp_size in (1, 2, 4, 8):
+        assert default_capacity_factors(dp_size) == (2.5, 3.0)
+    assert default_capacity_factors(16) == (4.0, 5.0)
+    assert default_capacity_factors(32) == (7.0, 8.5)
+    # 23 requests per engine with 3 drafts at TP4: 16 and 32 members.
+    kw = dict(tp_size=4, num_tokens=92, topk=10, onehot_moe_permute_threshold=3840)
+    rows, routes = default_capacity_factors(16)
+    assert exchange_capacity(
+        dp_size=16,
+        local_num_experts=8,
+        factor=rows,
+        route_factor=routes,
+        use_sparse_core=True,
+        **kw,
+    ) == (880, 1152)
+    rows, routes = default_capacity_factors(32)
+    assert exchange_capacity(
+        dp_size=32,
+        local_num_experts=4,
+        factor=rows,
+        route_factor=routes,
+        use_sparse_core=True,
+        **kw,
+    ) == (1568, 2048)
 
 
 def _routes_only_ids(num_tokens, local):

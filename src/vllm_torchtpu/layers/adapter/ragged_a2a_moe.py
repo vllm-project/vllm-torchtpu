@@ -33,6 +33,7 @@ from vllm_torchtpu.layers.core.fused_moe_gmm import resolve_onehot_permute_thres
 from vllm_torchtpu.layers.core.ragged_a2a_moe import (
     DP_AXIS,
     TP_AXIS,
+    default_capacity_factors,
     exchange_capacity,
     ragged_a2a_moe,
 )
@@ -91,6 +92,17 @@ def get_dp_tp_mesh():
     return _MESH
 
 
+def capacity_factors(dp_size: int) -> tuple[float, float]:
+    """The ``(rows, routes)`` capacity factors: the env knobs where set, else
+    the defaults for ``dp_size`` members (a routes factor of 0 follows rows)."""
+    rows, routes = default_capacity_factors(dp_size)
+    if envs.TPU_MOE_A2A_CAPACITY is not None:
+        rows = envs.TPU_MOE_A2A_CAPACITY
+    if envs.TPU_MOE_A2A_ROUTE_CAPACITY is not None:
+        routes = envs.TPU_MOE_A2A_ROUTE_CAPACITY
+    return rows, routes or rows
+
+
 def _get_op(*, topk, activation, rhs_quant_dtype, skip_padded_tokens):
     key = (topk, activation, rhs_quant_dtype, skip_padded_tokens)
     op = _OPS.get(key)
@@ -102,7 +114,7 @@ def _get_op(*, topk, activation, rhs_quant_dtype, skip_padded_tokens):
     # path's rows, so the threshold follows the full decode step.
     decode_routed_rows = _decode_routed_rows(topk)
     onehot_threshold = resolve_onehot_permute_threshold(decode_routed_rows)
-    capacity_factor = envs.TPU_MOE_A2A_CAPACITY
+    capacity_factor, route_factor = capacity_factors(mesh.shape[DP_AXIS])
     run = functools.partial(
         ragged_a2a_moe,
         mesh=mesh,
@@ -113,7 +125,7 @@ def _get_op(*, topk, activation, rhs_quant_dtype, skip_padded_tokens):
         rhs_quant_dtype=rhs_quant_dtype,
         skip_padded_tokens=skip_padded_tokens,
         capacity_factor=capacity_factor,
-        route_factor=envs.TPU_MOE_A2A_ROUTE_CAPACITY,
+        route_factor=route_factor,
         direct_combine=envs.TPU_MOE_A2A_DIRECT_COMBINE,
     )
 
@@ -172,6 +184,7 @@ def _log_capacity(mesh, topk, onehot_threshold, decode_routed_rows) -> None:
     dp_size, tp_size = mesh.shape[DP_AXIS], mesh.shape[TP_AXIS]
     if not num_experts or not decode_routed_rows:
         return
+    factor, route_factor = capacity_factors(dp_size)
     decode_tokens = decode_routed_rows // (dp_size * topk)
     rows, routes = exchange_capacity(
         dp_size=dp_size,
@@ -179,16 +192,16 @@ def _log_capacity(mesh, topk, onehot_threshold, decode_routed_rows) -> None:
         num_tokens=decode_tokens,
         topk=topk,
         local_num_experts=num_experts // (dp_size * tp_size),
-        factor=envs.TPU_MOE_A2A_CAPACITY,
+        factor=factor,
         onehot_moe_permute_threshold=onehot_threshold,
         use_sparse_core=envs.USE_MOE_SPARSE_CORE,
-        route_factor=envs.TPU_MOE_A2A_ROUTE_CAPACITY or None,
+        route_factor=route_factor,
     )
     if rows >= dp_size * decode_tokens:
         logger.info(
             "Ragged A2A MoE capacity x%g | decode step: full-size exchange "
             "(capacity %d rows >= %d group tokens)",
-            envs.TPU_MOE_A2A_CAPACITY,
+            factor,
             rows,
             dp_size * decode_tokens,
         )
@@ -196,8 +209,8 @@ def _log_capacity(mesh, topk, onehot_threshold, decode_routed_rows) -> None:
     logger.info(
         "Ragged A2A MoE capacity x%g (routes x%g) | decode step: %d of %d rows, "
         "%d of %d routes per rank",
-        envs.TPU_MOE_A2A_CAPACITY,
-        envs.TPU_MOE_A2A_ROUTE_CAPACITY or envs.TPU_MOE_A2A_CAPACITY,
+        factor,
+        route_factor,
         rows,
         dp_size * decode_tokens,
         routes,

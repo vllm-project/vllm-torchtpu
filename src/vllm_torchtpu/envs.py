@@ -112,8 +112,8 @@ if TYPE_CHECKING:
     TPU_STREAMIDX_CHUNK_TOKENS: int | None = None
     TPU_MOE_COLLECTION_CHUNK_SIZE: int = 0
     TPU_MOE_RAGGED_A2A: bool = False
-    TPU_MOE_A2A_CAPACITY: float = 2.5
-    TPU_MOE_A2A_ROUTE_CAPACITY: float = 3.0
+    TPU_MOE_A2A_CAPACITY: float | None = None
+    TPU_MOE_A2A_ROUTE_CAPACITY: float | None = None
     TPU_MOE_A2A_DIRECT_COMBINE: bool = False
     TPU_MOE_ROUTING_REPLAY: str = ""
     PCP_FA_KERNEL_BLOCK_SIZE: int | None = None
@@ -306,6 +306,17 @@ def env_float(env_name: str, default: float) -> Callable[[], float]:
             ) from exc
 
     return _get_float_env
+
+
+def env_optional_float(env_name: str) -> Callable[[], float | None]:
+    """Float knob; unset or empty is None. An unparseable value raises."""
+    get = env_float(env_name, 0.0)
+
+    def _get_optional_float_env() -> float | None:
+        value = os.getenv(env_name)
+        return None if value is None or value.strip() == "" else get()
+
+    return _get_optional_float_env
 
 
 def env_str(env_name: str, default: str) -> Callable[[], str]:
@@ -823,12 +834,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_MOE_RAGGED_A2A": env_bool("TPU_MOE_RAGGED_A2A"),
     # Ragged all-to-all exchange: size the per-rank token rows and local routes
     # at this many times their uniform-routing mean (exact: a step that does
-    # not fit runs the full-size exchange). 0 = always full size.
-    "TPU_MOE_A2A_CAPACITY": env_float("TPU_MOE_A2A_CAPACITY", 2.5),
+    # not fit runs the full-size exchange). 0 = always full size. Unset = by
+    # DP group size (layers.core.ragged_a2a_moe.default_capacity_factors).
+    "TPU_MOE_A2A_CAPACITY": env_optional_float("TPU_MOE_A2A_CAPACITY"),
     # The local routes' factor (0 = TPU_MOE_A2A_CAPACITY): real routing skews
     # routes more than rows. Both factors are capped at 2 where the full-size
     # exchange stays on the one-hot path (its rerun is cheap there).
-    "TPU_MOE_A2A_ROUTE_CAPACITY": env_float("TPU_MOE_A2A_ROUTE_CAPACITY", 3.0),
+    "TPU_MOE_A2A_ROUTE_CAPACITY": env_optional_float("TPU_MOE_A2A_ROUTE_CAPACITY"),
     # Ragged all-to-all exchange: the fused expert kernel sends each expert
     # output row to its home rank as soon as it is computed, and the home rank
     # sums them, instead of a combine and a second exchange after the experts.

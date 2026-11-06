@@ -86,3 +86,22 @@ def test_ragged_a2a_op_threshold_covers_the_ep_decode_step(
     assert seen["onehot_moe_permute_threshold"] == expected
     assert seen["capacity_factor"] == 2.0
     assert seen["route_factor"] == 3.0
+
+
+@pytest.mark.parametrize(
+    "capacity,route,dp,expected",
+    [
+        (None, None, 8, (2.5, 3.0)),
+        (None, None, 16, (4.0, 5.0)),
+        (None, None, 32, (7.0, 8.5)),
+        (2.0, None, 32, (2.0, 8.5)),
+        (None, 0.0, 16, (4.0, 4.0)),
+        (3.0, 3.5, 16, (3.0, 3.5)),
+    ],
+)
+def test_capacity_factors_follow_group_size_unless_set(
+    monkeypatch, capacity, route, dp, expected
+):
+    monkeypatch.setattr(envs, "TPU_MOE_A2A_CAPACITY", capacity, raising=False)
+    monkeypatch.setattr(envs, "TPU_MOE_A2A_ROUTE_CAPACITY", route, raising=False)
+    assert ragged_a2a.capacity_factors(dp) == expected

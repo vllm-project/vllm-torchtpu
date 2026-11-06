@@ -164,6 +164,25 @@ def _unpack_routes(routes: jax.Array):
     return jnp.right_shift(routes, 16), weights
 
 
+def default_capacity_factors(dp_size: int) -> tuple[float, float]:
+    """Capacity factors ``(rows, routes)`` for a DP group of ``dp_size`` members.
+
+    Real routing concentrates on a few experts, and the fewer experts a rank
+    holds, the further the busiest rank sits above the mean. In captured
+    top-10-of-512 decode routing at TP4 (16 / 8 / 4 experts per rank) the
+    busiest rank receives about 1.8x / 2.5x / 4.1x the mean rows and 2.0x /
+    2.7x / 4.3x the mean routes at 8 / 16 / 32 members. Up to 8 members keep
+    x2.5 / x3 (1-2% of those layer steps overflow, measured cheaper than larger
+    buffers); 16 and 32 members take the smallest factors that keep the
+    captured routing on the capacity path in over 99.9% of layer steps.
+    """
+    if dp_size <= 8:
+        return 2.5, 3.0
+    if dp_size <= 16:
+        return 4.0, 5.0
+    return 7.0, 8.5
+
+
 def exchange_capacity(
     *,
     dp_size: int,
