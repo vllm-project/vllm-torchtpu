@@ -67,7 +67,7 @@ def _is_linear_quantization_disabled(quant_config: object | None) -> bool:
     if hasattr(quant_config, "linear"):
         linear = quant_config.linear
         if linear is None:
-            return getattr(quant_config, "moe", None) is not None
+            return True
         if hasattr(linear, "weight") and hasattr(linear, "activation"):
             return linear.weight is None and linear.activation is None
     return False

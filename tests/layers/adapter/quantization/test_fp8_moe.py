@@ -146,6 +146,34 @@ class TestFp8MoERegistration:
         passed_model_config = mock_get_qc.call_args[0][0]
         assert passed_model_config.quantization == "tpu-fp8_moe"
 
+    def test_get_tpu_quantization_config_moe_only_object_linear_none(self, monkeypatch):
+        """Test QuantizationConfigArgs-like object with linear=None."""
+        from vllm_torchtpu.layers.adapter.quantization import (
+            get_tpu_quantization_config,
+        )
+
+        class FakeQuantConfigArgs:
+            linear = None
+            moe = None
+
+        vllm_config = MagicMock()
+        vllm_config.model_config.quantization = quant_methods.FP8_PER_CHANNEL
+        vllm_config.model_config.quantization_config = FakeQuantConfigArgs()
+        vllm_config.load_config = MagicMock()
+        vllm_config.additional_config = {}
+
+        mock_instance = VllmFp8MoEConfig.from_config({})
+        mock_get_qc = MagicMock(return_value=mock_instance)
+        monkeypatch.setattr(
+            "vllm.config.VllmConfig.get_quantization_config", mock_get_qc
+        )
+
+        config = get_tpu_quantization_config(vllm_config)
+        assert isinstance(config, VllmFp8MoEConfig)
+        mock_get_qc.assert_called_once()
+        passed_model_config = mock_get_qc.call_args[0][0]
+        assert passed_model_config.quantization == "tpu-fp8_moe"
+
     def test_get_tpu_quantization_config_full_fp8(self, monkeypatch):
         from vllm_torchtpu.layers.adapter.quantization import (
             get_tpu_quantization_config,
