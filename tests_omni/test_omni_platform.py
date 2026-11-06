@@ -12,6 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import os
+import subprocess
+import sys
+import textwrap
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -35,7 +38,11 @@ from vllm_omni.diffusion.models.wan2_2.wan2_2_transformer import (
 )
 from vllm_omni.diffusion.worker.diffusion_worker import WorkerProc
 
-from vllm_torchtpu.omni import patches, register_omni_tpu_platform
+from vllm_torchtpu.omni import (
+    patches,
+    register_omni_general_plugins,
+    register_omni_tpu_platform,
+)
 from vllm_torchtpu.omni import rope as omni_rope
 from vllm_torchtpu.omni.attention import (
     TpuFlashAttentionBackend,
@@ -49,6 +56,7 @@ from vllm_torchtpu.omni.patches import (
     _SDPA_FALLBACK_PATCHED,
     _SPLIT_ROPE_PATCHED,
     _VOCODER_CPU_INIT_PATCHED,
+    _WARMUP_SYNC_PATCHED,
     _patch_diffusion_startup_warmup_sync,
     _patch_diffusion_worker_d2h_stream,
     _patch_ltx2_split_rope,
@@ -86,6 +94,49 @@ def test_register_omni_tpu_platform(monkeypatch):
 
     monkeypatch.setattr("vllm_torchtpu.omni.get_num_chips", lambda: 8)
     assert register_omni_tpu_platform() == "vllm_torchtpu.omni.platform.OmniTpuPlatform"
+
+
+def test_general_plugin_is_noop_without_tpu(monkeypatch):
+    def _unpatched(self):
+        return None
+
+    monkeypatch.setattr(DiffusionEngine, "run_startup_warmup", _unpatched)
+    monkeypatch.setattr("vllm_torchtpu.omni.get_num_chips", lambda: 0)
+    register_omni_general_plugins()
+    assert DiffusionEngine.run_startup_warmup is _unpatched
+
+
+def test_general_plugin_patches_warmup_sync_cold_import():
+    # A fresh process on a (simulated) TPU host in which vLLM-Omni loads its
+    # general plugins, as StageDiffusionProc.run_diffusion_proc does before
+    # building the engine, patches DiffusionEngine.run_startup_warmup.
+    code = textwrap.dedent(
+        """
+        import vllm_torchtpu.omni as torchtpu_omni
+
+        torchtpu_omni.get_num_chips = lambda: 8
+        import vllm_omni.diffusion.stage_diffusion_proc
+        from vllm_omni.plugins import load_omni_general_plugins
+
+        load_omni_general_plugins()
+
+        from vllm_omni.diffusion.diffusion_engine import DiffusionEngine
+        from vllm_torchtpu.omni.patches import _WARMUP_SYNC_PATCHED
+
+        assert getattr(
+            DiffusionEngine.run_startup_warmup, _WARMUP_SYNC_PATCHED, False
+        )
+        """
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        capture_output=True,
+        text=True,
+        timeout=300,
+    )
+    assert result.returncode == 0, result.stderr
+    for error in ("ImportError", "RecursionError", "Failed to load plugin"):
+        assert error not in result.stderr, result.stderr
 
 
 def test_vllm_platform_accepts_omni_knobs():
@@ -467,20 +518,27 @@ def test_omni_tpu_patches_configuration():
 
 
 def test_startup_warmup_device_sync(monkeypatch):
-    # The startup warmup must be followed by a device sync so that its pending
-    # deferred TPU ops are not fused into the first request.
+    # The startup warmup must be followed by a device sync on every worker so
+    # that its pending deferred TPU ops are not fused into the first request.
     calls = []
 
-    monkeypatch.setattr(
-        torch.accelerator, "synchronize", lambda device=None: calls.append("sync")
-    )
+    class _FakeEngine:
+        def collective_rpc(self, method, *args, **kwargs):
+            calls.append(method)
+
     monkeypatch.setattr(
         DiffusionEngine, "run_startup_warmup", lambda self: calls.append("warmup")
     )
+    monkeypatch.setattr("vllm_torchtpu.omni.get_num_chips", lambda: 8)
+    register_omni_general_plugins()
+    patched = DiffusionEngine.run_startup_warmup
+    assert getattr(patched, _WARMUP_SYNC_PATCHED, False)
+    register_omni_general_plugins()
     _patch_diffusion_startup_warmup_sync()
+    assert DiffusionEngine.run_startup_warmup is patched
 
-    DiffusionEngine.run_startup_warmup(object())
-    assert calls == ["warmup", "sync"]
+    DiffusionEngine.run_startup_warmup(_FakeEngine())
+    assert calls == ["warmup", "synchronize_device"]
 
 
 def _rms_norm(x, w, eps):
