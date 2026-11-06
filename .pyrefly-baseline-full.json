@@ -3451,6 +3451,36 @@
       "concise_description": "Unpacked keyword argument `int` is not assignable to parameter `opt_level` with type `OptLevel | None` in function `jax._src.pallas.mosaic.core.CompilerParams.__init__`"
     },
     {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/dspark.py",
+      "name": "bad-return",
+      "concise_description": "Returned type `dict[str, tuple[int] | tuple[int, int]]` is not assignable to declared return type `dict[str, tuple[int, ...]]`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/dspark.py",
+      "name": "unsupported-operation",
+      "concise_description": "Cannot set item in `list[None]`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/dspark.py",
+      "name": "unsupported-operation",
+      "concise_description": "Cannot set item in `dict[str, AsyncCopyDescriptor]`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/dspark.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of class `NoneType` has no attribute `wait`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/dspark.py",
+      "name": "unsupported-operation",
+      "concise_description": "Cannot set item in `dict[str, AsyncCopyDescriptor]`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/dspark.py",
+      "name": "unsupported-operation",
+      "concise_description": "`+` is not supported between `Array` and `None`"
+    },
+    {
       "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/mla_dcp.py",
       "name": "bad-argument-type",
       "concise_description": "Argument `Array | int` is not assignable to parameter `x` with type `Array` in function `jax._src.pallas.primitives.multiple_of`"
