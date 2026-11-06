@@ -59,6 +59,17 @@ SPEC = TpuMonoSpec("lay", "1", create="lay_mk_plugin:create",
 """
 
 
+# A built-in shorthand and a checkpoint arch it claims: conftest's
+# `mk_fake_template`, entered in the table for every test here.
+_SHORTHAND = "mkfake"
+_ENTRY = plugin_mod.Shorthand("mk_fake_template", ("MkFakeForCausalLM",), ("mk_fake",))
+
+
+@pytest.fixture(autouse=True)
+def _fake_template(mk_fake_template: str) -> None:
+    assert plugin_mod.SHORTHANDS[mk_fake_template] == _ENTRY
+
+
 def _compute_hash_fn() -> Any:
     """`compute_tpu_compilation_hash`, compiled from source with CPU stand-ins."""
     path = _SRC / "vllm_torchtpu" / "compilation" / "tpu_compiler.py"
@@ -99,7 +110,7 @@ def _vllm_config(megakernel: Any) -> Any:
         parallel_config=None,
         model_config=SimpleNamespace(
             max_model_len=1024,
-            hf_config=SimpleNamespace(architectures=["Qwen3_5MoeForCausalLM"]),
+            hf_config=SimpleNamespace(architectures=[_ENTRY.architectures[0]]),
         ),
         additional_config={} if megakernel is None else {"megakernel": megakernel},
     )
@@ -110,7 +121,8 @@ def test_stock_compile_hash_unchanged_with_megakernel_on(
 ) -> None:
     compute = _compute_hash_fn()
     base = compute(_vllm_config(None))
-    for mk in (True, "qwen35", {"plugin": "qwen35", "options": {"mode": "tp"}}):
+    shorthand_cfg = {"plugin": _SHORTHAND, "options": {"mode": "tp"}}
+    for mk in (True, _SHORTHAND, shorthand_cfg):
         assert compute(_vllm_config(mk)) == base
     monkeypatch.setenv("VLLM_TPU_MEGAKERNEL", "1")
     assert compute(_vllm_config(None)) == base
@@ -126,17 +138,6 @@ def test_stock_compile_hash_unchanged_with_megakernel_on(
         assert compute(_vllm_config(mk2)) not in (base, lay)
     finally:
         sys.modules.pop("lay_mk_plugin", None)
-
-
-# A built-in shorthand and a checkpoint arch it claims: conftest's
-# `mk_fake_template`, entered in the table for every test here.
-_SHORTHAND = "mkfake"
-_ENTRY = plugin_mod.Shorthand("mk_fake_template", ("MkFakeForCausalLM",), ("mk_fake",))
-
-
-@pytest.fixture(autouse=True)
-def _fake_template(mk_fake_template: str) -> None:
-    assert plugin_mod.SHORTHANDS[mk_fake_template] == _ENTRY
 
 
 def _salt_config(megakernel: Any) -> Any:
@@ -215,13 +216,13 @@ def test_driver_and_salt_resolve_the_same_plugin(
 
     monkeypatch.setattr(driver_mod, "import_plugin", spy("driver"))
     monkeypatch.setattr(salt_mod, "import_plugin", spy("salt"))
-    qwen_arch = SimpleNamespace(architectures=["Qwen3_5MoeForCausalLM"])
-    qwen_type = SimpleNamespace(architectures=None, model_type="qwen3_5_moe")
+    by_arch = SimpleNamespace(architectures=[_ENTRY.architectures[0]])
+    by_type = SimpleNamespace(architectures=None, model_type=_ENTRY.model_types[0])
     other = SimpleNamespace(architectures=["LlamaForCausalLM"])
     cases = [
-        (qwen_arch, True),
-        (qwen_type, "qwen35"),
-        (None, {"plugin": "qwen35"}),
+        (by_arch, True),
+        (by_type, _SHORTHAND),
+        (None, {"plugin": _SHORTHAND}),
         (other, True),
         (None, True),
         (other, {"plugin": "toy_mk_plugin"}),
@@ -229,7 +230,7 @@ def test_driver_and_salt_resolve_the_same_plugin(
     for hf, mk in cases:
         seen["driver"].clear()
         seen["salt"].clear()
-        model = type("Qwen3_5MoeForCausalLM", (), {})()  # never used to resolve
+        model = type(_ENTRY.architectures[0], (), {})()  # never used to resolve
         runner = testing.fake_runner(model=model, hf_config=hf, megakernel=mk)
         driver_mod.ProgramDriver.maybe_create(runner)
         salt_mod.compile_cache_salt(runner.vllm_config)
