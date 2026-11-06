@@ -44,10 +44,12 @@ GitHub merge-queue builds (`BUILDKITE_MERGE_QUEUE_BASE_BRANCH`) and `/ci run`
 builds (`CI_RUN_TPU=1`, with optional `CI_EXTRAS=perf-eval,nightly-suite`) use
 the same two-stage PR suites; merge-queue builds run at `post-merge` priority
 (11, uncapped), read optional `perf-eval`, `nightly-suite`, or `precheck-only`
-extras from the PR's `/ci merge` bot marker bound to the PR head SHA, and
-always run the `pr+nightly-suite` gate on `releases/vX.Y.Z` branches.
-`/ci precheck` builds (`CI_PRECHECK=1`) and PR pushes when
-`CI_PR_PUSH_CPU_ONLY=1` select `pr+cpu-only` (stage 0 only, no TPU).
+extras from the PR's `/ci merge` bot marker bound to the PR head SHA (and
+fail if they can't read it), and always run the `pr+nightly-suite` gate on
+`releases/vX.Y.Z` branches. `/ci precheck` builds (`CI_PRECHECK=1`) and PR
+pushes when `CI_PR_PUSH_CPU_ONLY=1` select `pr+cpu-only` (stage 0 only, no TPU).
+Merge-queue and `/ci` builds ignore PR labels. Once `CI_PR_PUSH_CPU_ONLY=1`,
+PR pushes and post-merge builds ignore them too.
 
 Releases and nightly images are published by the `vllm-torchtpu-release`
 pipeline in the TPU Release cluster; [`release/README.md`](https://github.com/vllm-project/vllm-torchtpu/blob/main/.buildkite/release/README.md)

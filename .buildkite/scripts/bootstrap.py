@@ -31,6 +31,7 @@ import pathlib
 import re
 import subprocess
 import sys
+import time
 import urllib.error
 import urllib.request
 from collections.abc import Mapping, Sequence
@@ -49,6 +50,10 @@ _GITHUB_API_URL = "https://api.github.com"
 PR_TPU_JOBS_PER_AUTHOR = 40
 
 _CI_MERGE_BOT_LOGIN = "github-actions[bot]"
+# A merge-queue build that can't read the PR's /ci merge marker retries, then
+# fails rather than drop the requested extras.
+_MQ_EXTRAS_ATTEMPTS = 3
+_MQ_EXTRAS_RETRY_SECONDS = 10
 _LABEL_EXTRAS = {"run-perf-eval": "perf-eval", "run-full-ci": "nightly-suite"}
 _PR_SUITE_LABELS = ("skip-tpu-ci", *_LABEL_EXTRAS)
 _VALID_CI_EXTRAS = frozenset(_LABEL_EXTRAS.values())
@@ -182,9 +187,7 @@ class BuildContext:
         from_labels = {
             _LABEL_EXTRAS[label] for label in self.labels if label in _LABEL_EXTRAS
         }
-        return frozenset(self.ci_extras) | (
-            from_labels if self.is_pr or self.ci_run_tpu else set()
-        )
+        return frozenset(self.ci_extras) | (from_labels if self.is_pr else set())
 
     # Whether this build runs TPU lanes at all.
     @property
@@ -223,9 +226,19 @@ class BuildContext:
         pr_raw = _env_or(env, "BUILDKITE_PULL_REQUEST", "false")
         pull_request = None if pr_raw == "false" else pr_raw
         mq_base_branch = env.get("BUILDKITE_MERGE_QUEUE_BASE_BRANCH", "")
+        ci_run_tpu = _env_or(env, "CI_RUN_TPU", "0") == "1"
+        ci_precheck = _env_or(env, "CI_PRECHECK", "0") == "1"
+        ci_pr_push_cpu_only = _env_or(env, "CI_PR_PUSH_CPU_ONLY", "0") == "1"
+        # PR labels drive PR pushes only, and only until cutover. Merge-queue and
+        # /ci builds name their extras explicitly (/ci merge marker, CI_EXTRAS).
         labels = (
             _split_labels(env.get("BUILDKITE_PULL_REQUEST_LABELS", ""))
-            if (pull_request is not None and not mq_base_branch)
+            if (
+                pull_request is not None
+                and not mq_base_branch
+                and not (ci_run_tpu or ci_precheck)
+                and not ci_pr_push_cpu_only
+            )
             else ()
         )
         author = _env_or(
@@ -251,9 +264,9 @@ class BuildContext:
             pr_tpu_concurrency_group_env=env.get("PR_TPU_CONCURRENCY_GROUP", ""),
             merge_queue_base_branch=mq_base_branch,
             merge_queue_base_commit=env.get("BUILDKITE_MERGE_QUEUE_BASE_COMMIT", ""),
-            ci_run_tpu=_env_or(env, "CI_RUN_TPU", "0") == "1",
-            ci_precheck=_env_or(env, "CI_PRECHECK", "0") == "1",
-            ci_pr_push_cpu_only=_env_or(env, "CI_PR_PUSH_CPU_ONLY", "0") == "1",
+            ci_run_tpu=ci_run_tpu,
+            ci_precheck=ci_precheck,
+            ci_pr_push_cpu_only=ci_pr_push_cpu_only,
             ci_extras=ci_extras,
         )
 
@@ -942,7 +955,12 @@ def run_bootstrap(
     """Execute the full Buildkite bootstrap flow and return an exit status."""
     child_env = dict(os.environ if env is None else env)
     ctx = BuildContext.from_env(child_env)
-    if ctx.is_post_merge and (pr := parse_merged_pr_number(ctx.message)):
+    # A post-merge build honors the merged PR's skip-tpu-ci label until cutover.
+    if (
+        ctx.is_post_merge
+        and not ctx.ci_pr_push_cpu_only
+        and (pr := parse_merged_pr_number(ctx.message))
+    ):
         ctx = replace(ctx, labels=_github_labels(pr, env=child_env))
     try:
         ctx.check_suite_labels()
@@ -1035,21 +1053,35 @@ def run_bootstrap(
         and not _RELEASE_BRANCH_RE.match(ctx.merge_queue_base_branch)
         and ctx.merge_queue_pr_number
     ):
-        mq_extras, mq_actor, mq_err = _merge_queue_pr_extras(
-            ctx.merge_queue_pr_number, env=child_env
-        )
+        mq_extras: tuple[str, ...] = ()
+        mq_actor = ""
+        mq_err: str | None = None
+        for attempt in range(1, _MQ_EXTRAS_ATTEMPTS + 1):
+            mq_extras, mq_actor, mq_err = _merge_queue_pr_extras(
+                ctx.merge_queue_pr_number, env=child_env
+            )
+            if mq_err is None:
+                break
+            print(f"Could not read /ci merge extras (attempt {attempt}): {mq_err}")
+            if attempt < _MQ_EXTRAS_ATTEMPTS:
+                time.sleep(_MQ_EXTRAS_RETRY_SECONDS * attempt)
         if mq_err is not None:
+            msg = (
+                f"ERROR: could not read /ci merge extras for PR "
+                f"#{ctx.merge_queue_pr_number}: {mq_err}. Add the PR to the merge "
+                "queue again to retry."
+            )
             _agent(
                 "annotate",
                 "--style",
-                "warning",
+                "error",
                 "--context",
                 "ci-merge-extras",
-                f"could not read /ci merge extras for PR "
-                f"#{ctx.merge_queue_pr_number}: {mq_err}; ran the default gate",
+                msg,
                 env=child_env,
             )
-        elif mq_extras:
+            raise BootstrapError(msg)
+        if mq_extras:
             print(
                 f"Merge-queue extras for PR #{ctx.merge_queue_pr_number}: "
                 f"{', '.join(mq_extras)} (by @{mq_actor})"

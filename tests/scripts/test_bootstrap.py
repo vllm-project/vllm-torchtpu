@@ -103,6 +103,10 @@ def _expand_env(text: str, env: Mapping[str, str]) -> str:
     return re.sub(r"\$\{([A-Za-z0-9_]+)(?::-([^}]*))?\}", _sub, text)
 
 
+# (extras, actor, error) as returned by `_merge_queue_pr_extras`.
+_MqMarker = tuple[tuple[str, ...], str, str | None]
+
+
 class _RunRecorder:
     """In-memory fake for `_agent`, `_git`, and `_github_labels` in bootstrap runs."""
 
@@ -111,12 +115,13 @@ class _RunRecorder:
         bp: Any,
         files: list[str] | None = None,
         labels: tuple[str, ...] = (),
-        mq_marker: tuple[tuple[str, ...], str, str | None] = ((), "", None),
+        mq_marker: _MqMarker | list[_MqMarker] = ((), "", None),
         fail_git_prefixes: tuple[tuple[str, ...], ...] = (),
     ) -> None:
         self.bp = bp
         self.files = ["src/vllm_torchtpu/envs.py"] if files is None else files
         self.labels = labels
+        # A list gives one result per attempt; the last one repeats.
         self.mq_marker = mq_marker
         self.fail_git_prefixes = fail_git_prefixes
         self.meta: list[tuple[str, str]] = []
@@ -124,6 +129,8 @@ class _RunRecorder:
         self.uploads: list[tuple[str, str, dict[str, str]]] = []
         self.git_calls: list[tuple[str, ...]] = []
         self.mq_extras_calls: list[str] = []
+        self.github_labels_calls: list[str] = []
+        self.sleeps: list[float] = []
         self.stdout_buf = io.StringIO()
         self.stderr_buf = io.StringIO()
         self._current_lane: str | None = None
@@ -198,13 +205,21 @@ class _RunRecorder:
     def github_labels(
         self, pr_number: str, *, env: Mapping[str, str] | None = None
     ) -> tuple[str, ...]:
+        self.github_labels_calls.append(pr_number)
         return self.labels
 
     def merge_queue_pr_extras(
         self, pr_number: str, *, env: Mapping[str, str] | None = None
-    ) -> tuple[tuple[str, ...], str, str | None]:
+    ) -> _MqMarker:
         self.mq_extras_calls.append(pr_number)
+        if isinstance(self.mq_marker, list):
+            return self.mq_marker[
+                min(len(self.mq_extras_calls), len(self.mq_marker)) - 1
+            ]
         return self.mq_marker
+
+    def sleep(self, seconds: float) -> None:
+        self.sleeps.append(seconds)
 
 
 class TestBootstrapUnits(unittest.TestCase):
@@ -238,8 +253,9 @@ class TestBootstrapUnits(unittest.TestCase):
         *,
         files: list[str] | None = None,
         labels: tuple[str, ...] = (),
-        mq_marker: tuple[tuple[str, ...], str, str | None] = ((), "", None),
+        mq_marker: _MqMarker | list[_MqMarker] = ((), "", None),
         fail_git_prefixes: tuple[tuple[str, ...], ...] = (),
+        raises: type[Exception] | None = None,
     ) -> _RunRecorder:
         bp = self.bp
         rec = _RunRecorder(
@@ -259,10 +275,15 @@ class TestBootstrapUnits(unittest.TestCase):
             mock.patch.object(
                 bp, "upload_with_priority", side_effect=rec.upload_with_priority
             ),
+            mock.patch.object(bp.time, "sleep", side_effect=rec.sleep),
             contextlib.redirect_stdout(rec.stdout_buf),
             contextlib.redirect_stderr(rec.stderr_buf),
         ):
-            self.assertEqual(bp.run_bootstrap(env, repo_root=_REPO_ROOT), 0)
+            if raises is None:
+                self.assertEqual(bp.run_bootstrap(env, repo_root=_REPO_ROOT), 0)
+            else:
+                with self.assertRaises(raises):
+                    bp.run_bootstrap(env, repo_root=_REPO_ROOT)
         return rec
 
     def _run_next_stage(
@@ -337,6 +358,25 @@ class TestBootstrapUnits(unittest.TestCase):
             ),
             (
                 {"CI_RUN_TPU": "1"},
+                "pre-merge",
+                (6, "pre-merge"),
+            ),
+            # /ci builds and post-cutover PR pushes ignore oncall-fix.
+            (
+                {
+                    "BUILDKITE_PULL_REQUEST": "123",
+                    "BUILDKITE_PULL_REQUEST_LABELS": "ready,oncall-fix",
+                    "CI_RUN_TPU": "1",
+                },
+                "pre-merge",
+                (6, "pre-merge"),
+            ),
+            (
+                {
+                    "BUILDKITE_PULL_REQUEST": "123",
+                    "BUILDKITE_PULL_REQUEST_LABELS": "ready,oncall-fix",
+                    "CI_PR_PUSH_CPU_ONLY": "1",
+                },
                 "pre-merge",
                 (6, "pre-merge"),
             ),
@@ -729,6 +769,36 @@ class TestBootstrapUnits(unittest.TestCase):
             ),
             ({"CI_RUN_TPU": "1", "CI_EXTRAS": "perf-eval"}, (), "pr+perf-eval"),
             ({"CI_RUN_TPU": "1", "CI_EXTRAS": "nightly-suite"}, (), "pr+nightly-suite"),
+            # /ci builds and post-cutover PR pushes ignore PR labels, including
+            # combinations that would fail a pre-cutover PR push.
+            (
+                {
+                    "BUILDKITE_PULL_REQUEST": "10",
+                    "BUILDKITE_PULL_REQUEST_LABELS": "run-full-ci",
+                    "CI_RUN_TPU": "1",
+                    "CI_EXTRAS": "perf-eval",
+                },
+                (),
+                "pr+perf-eval",
+            ),
+            (
+                {
+                    "BUILDKITE_PULL_REQUEST": "10",
+                    "BUILDKITE_PULL_REQUEST_LABELS": "skip-tpu-ci,run-perf-eval",
+                    "CI_PRECHECK": "1",
+                },
+                (),
+                "pr+cpu-only",
+            ),
+            (
+                {
+                    "BUILDKITE_PULL_REQUEST": "10",
+                    "BUILDKITE_PULL_REQUEST_LABELS": "run-full-ci,run-perf-eval",
+                    "CI_PR_PUSH_CPU_ONLY": "1",
+                },
+                (),
+                "pr+cpu-only",
+            ),
         ):
             with self.subTest(mq_env=mq_env, mq_extras=mq_extras):
                 self.assertEqual(
@@ -1359,6 +1429,21 @@ class TestBootstrapUnits(unittest.TestCase):
         )
         self.assertNotIn("NIGHTLY", main_pm.uploads[0][2])
 
+        # After cutover (CI_PR_PUSH_CPU_ONLY=1) a post-merge build doesn't look up
+        # the merged PR's labels, so skip-tpu-ci no longer skips TPU.
+        cutover_pm = self._run_bootstrap(
+            {
+                "BUILDKITE_BRANCH": "main",
+                "BUILDKITE_SOURCE": "webhook",
+                "BUILDKITE_MESSAGE": "fix: tweak (#99)",
+                "CI_PR_PUSH_CPU_ONLY": "1",
+            },
+            labels=("skip-tpu-ci",),
+        )
+        self.assertEqual(cutover_pm.github_labels_calls, [])
+        self.assertTrue(cutover_pm.annotations[0][2].startswith("CI suite: default: "))
+        self.assertEqual(main_pm.github_labels_calls, ["100"])
+
         # CI_SUITE takes precedence when CI_LANES is also set on a schedule.
         perf_sched = self._run_bootstrap(
             {"CI_SUITE": "perf", "CI_LANES": "perf", "BUILDKITE_BRANCH": "main"}
@@ -1576,26 +1661,41 @@ class TestBootstrapUnits(unittest.TestCase):
                     ["upload_stages", "cpu", "build"],
                 )
 
-        # Merge queue warning annotation on comment API failure or >5000 comments,
-        # then default gate.
+        # An unreadable /ci merge marker (API failure or >5000 comments) is retried,
+        # then fails the build rather than running the default gate without the
+        # requested extras.
+        mq_env = {
+            "BUILDKITE_BRANCH": "gh-readonly-queue/main/pr-42-deadbeef",
+            "BUILDKITE_MERGE_QUEUE_BASE_BRANCH": "main",
+        }
         for mq_err in ("HTTP 500", "comment history exceeds 5000 comments"):
-            mq_warn = self._run_bootstrap(
-                {
-                    "BUILDKITE_BRANCH": "gh-readonly-queue/main/pr-42-deadbeef",
-                    "BUILDKITE_MERGE_QUEUE_BASE_BRANCH": "main",
-                },
-                mq_marker=((), "", mq_err),
-            )
-            self.assertEqual(
-                mq_warn.annotations[0],
-                (
-                    "warning",
-                    "ci-merge-extras",
-                    f"could not read /ci merge extras for PR #42: {mq_err}; "
-                    "ran the default gate",
-                ),
-            )
-            self.assertTrue(mq_warn.annotations[1][2].startswith("CI suite: pr: "))
+            with self.subTest(mq_err=mq_err):
+                mq_fail = self._run_bootstrap(
+                    mq_env,
+                    mq_marker=((), "", mq_err),
+                    raises=self.bp.BootstrapError,
+                )
+                self.assertEqual(len(mq_fail.mq_extras_calls), 3)
+                self.assertEqual(mq_fail.sleeps, [10, 20])
+                self.assertEqual(
+                    mq_fail.annotations[-1],
+                    (
+                        "error",
+                        "ci-merge-extras",
+                        f"ERROR: could not read /ci merge extras for PR #42: {mq_err}. "
+                        "Add the PR to the merge queue again to retry.",
+                    ),
+                )
+                self.assertEqual(mq_fail.uploads, [])
+        mq_retry = self._run_bootstrap(
+            mq_env,
+            mq_marker=[((), "", "HTTP 502"), (("perf-eval",), "alice", None)],
+        )
+        self.assertEqual(len(mq_retry.mq_extras_calls), 2)
+        self.assertEqual(mq_retry.sleeps, [10])
+        self.assertTrue(
+            mq_retry.annotations[0][2].startswith("CI suite: pr+perf-eval: ")
+        )
 
         # Docs-only merge-queue build posts docs-only info annotation and skips upload.
         mq_docs = self._run_bootstrap(
