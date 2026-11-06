@@ -34,12 +34,54 @@ PD_CONNECTOR_MODULE = "vllm_torchtpu.models.vllm.qwen4_exp.pd_connector"
 # Host-DRAM prefix-cache offload through the shared Raiden store.
 OFFLOAD_CONNECTOR = "TPURaidenOffloadingConnector"
 OFFLOAD_CONNECTOR_MODULE = "vllm_torchtpu.offload.raiden_connector"
+# A PD producer with a host tier: the two connectors above as the children of
+# one TPUMultiConnector (kv_connector_extra_config["connectors"]).
+MULTI_CONNECTOR = "TPUMultiConnector"
+MULTI_CONNECTOR_MODULE = "vllm_torchtpu.distributed.kv_transfer.tpu_multi_connector"
+
+
+class _ChildTransfer:
+    """Attribute view of one child entry of a TPUMultiConnector config."""
+
+    def __init__(self, entry):
+        self._entry = entry
+
+    def __getattr__(self, name):
+        entry = self.__dict__["_entry"]
+        if isinstance(entry, dict):
+            return entry.get(name)
+        return getattr(entry, name, None)
+
+
+def transfer_children(cfg) -> list:
+    """The connectors an engine runs: the configured one, or a multi's children."""
+    transfer = getattr(cfg, "kv_transfer_config", None)
+    if transfer is None:
+        return []
+    if getattr(transfer, "kv_connector", None) != MULTI_CONNECTOR:
+        return [transfer]
+    extra = getattr(transfer, "kv_connector_extra_config", None) or {}
+    return [_ChildTransfer(entry) for entry in extra.get("connectors", None) or ()]
+
+
+def _child(cfg, name: str):
+    found = [c for c in transfer_children(cfg) if getattr(c, "kv_connector", None) == name]
+    return found[0] if found else None
+
+
+def pd_transfer_config(cfg):
+    """The PD connector's transfer config (a multi's child included), or None."""
+    return _child(cfg, PD_CONNECTOR)
+
+
+def host_offload_transfer_config(cfg):
+    """The host-offload connector's transfer config, or None."""
+    return _child(cfg, OFFLOAD_CONNECTOR)
 
 
 def pd_transfer_enabled(cfg) -> bool:
     """Whether this engine is one side of a Qwen4Exp PD pair."""
-    transfer = getattr(cfg, "kv_transfer_config", None)
-    return getattr(transfer, "kv_connector", None) == PD_CONNECTOR
+    return pd_transfer_config(cfg) is not None
 
 
 def pd_prefill_mtp_producer(cfg) -> bool:
@@ -146,8 +188,7 @@ def _register_non_prefix_cacheable_types() -> None:
 
 def host_offload_enabled(cfg) -> bool:
     """Whether prefix-cache pages are offloaded to host DRAM (Raiden store)."""
-    transfer = getattr(cfg, "kv_transfer_config", None)
-    return getattr(transfer, "kv_connector", None) == OFFLOAD_CONNECTOR
+    return host_offload_transfer_config(cfg) is not None
 
 
 def use_unified_pool() -> bool:
@@ -455,14 +496,15 @@ def hbm_pool_sizing(cfg) -> bool:
     The default for the unified pool. ``QWEN4_EXP_POOL_SIZING=static``
     restores ``native_cache_capacity``; PD keeps it (both sides must agree
     on the pool before profiling), and so does an explicit
-    ``--num-gpu-blocks-override``. Host offload sizes from HBM like a plain
-    server: its host capacity follows the planned pool, not the reverse.
+    ``--num-gpu-blocks-override``. Host offload alone sizes from HBM like a
+    plain server: its host capacity follows the planned pool, not the
+    reverse. A PD producer with a host tier stays a PD engine: static.
     """
     return (
         use_unified_pool()
         and (
             getattr(cfg, "kv_transfer_config", None) is None
-            or host_offload_enabled(cfg)
+            or (host_offload_enabled(cfg) and not pd_transfer_enabled(cfg))
         )
         and getattr(cfg.cache_config, "num_gpu_blocks_override", None) is None
         and os.environ.get("QWEN4_EXP_POOL_SIZING", "hbm").strip().lower() != "static"
@@ -871,9 +913,16 @@ def validate_config(cfg):
     if cfg.speculative_config is not None:
         validate_mtp_config(cfg)
     transfer = cfg.kv_transfer_config
+    if transfer is not None and transfer.kv_connector == MULTI_CONNECTOR:
+        validate_multi_connector_config(cfg)
     if host_offload_enabled(cfg):
         validate_host_offload_config(cfg)
-    elif transfer is not None:
+    if transfer is not None and (
+        pd_transfer_enabled(cfg) or not host_offload_enabled(cfg)
+    ):
+        # The PD connector's own config: the transfer config, or the PD
+        # child of a TPUMultiConnector (whose top-level role it shares).
+        transfer = pd_transfer_config(cfg) or transfer
         connector_module = PD_CONNECTOR_MODULE
         if (
             # One host per leg: TP x DP x PP x PCP covers its 8 cores. TP, DP
@@ -989,9 +1038,18 @@ def validate_host_offload_config(cfg):
     an HBM hit, resumes from the state saved at a block boundary, where the
     per-request QSA raw ring holds no history yet) and both store and load
     roles on one engine.
+
+    Pipeline stages are admitted: every stage registers its own pool regions
+    with the offload store, a (group, block) key holds that block's page on
+    every stage, and the store sizes host capacity from the sum of the
+    stages' bytes per block (``record_all_ranks_kv_bytes_per_block``). The
+    connector addresses pool rows by scheduler block ID, so a stage must not
+    remap IDs onto fewer pages (``QWEN4_EXP_PP_LOGICAL_BLOCKS_FACTOR`` > 1,
+    stage_pages.py). ``cpu_bytes_to_use`` is per engine: each DP engine runs
+    its own store.
     """
-    c, p = cfg.cache_config, cfg.parallel_config
-    transfer = cfg.kv_transfer_config
+    c = cfg.cache_config
+    transfer = host_offload_transfer_config(cfg)
     extra = transfer.kv_connector_extra_config or {}
     if (
         transfer.kv_connector_module_path not in (None, OFFLOAD_CONNECTOR_MODULE)
@@ -999,13 +1057,18 @@ def validate_host_offload_config(cfg):
         or not use_unified_pool()
         or not c.enable_prefix_caching
         or c.mamba_cache_mode != "align"
-        or p.pipeline_parallel_size != 1
     ):
         raise ValueError(
             "Qwen4Exp host KV offload requires "
             f"{OFFLOAD_CONNECTOR} from {OFFLOAD_CONNECTOR_MODULE} with "
-            "kv_role='kv_both', the unified pool, prefix caching, "
-            "mamba_cache_mode='align' and PP1"
+            "kv_role='kv_both', the unified pool, prefix caching and "
+            "mamba_cache_mode='align'"
+        )
+    if pp_logical_block_factor(cfg) > 1:
+        raise ValueError(
+            "Qwen4Exp host KV offload addresses pool rows by scheduler block ID; "
+            "it cannot run with QWEN4_EXP_PP_LOGICAL_BLOCKS_FACTOR > 1, where a "
+            "pipeline stage maps block IDs onto fewer pages"
         )
     cpu_bytes = extra.get("cpu_bytes_to_use")
     try:
@@ -1022,6 +1085,33 @@ def validate_host_offload_config(cfg):
         raise ValueError(
             "Qwen4Exp host KV offload stores one pool page per scheduler block; "
             "leave blocks_per_chunk/block_size unset"
+        )
+
+
+def validate_multi_connector_config(cfg):
+    """Admit a TPUMultiConnector only as a PD producer with a host tier.
+
+    Its children must be exactly this model's PD connector and the Raiden
+    offload connector, once each; the top-level role is the PD child's
+    (``is_kv_producer`` is read from the top level). The prefill leg is the
+    one that holds prefixes across turns; a decode-side host tier is not
+    admitted here.
+    """
+    transfer = cfg.kv_transfer_config
+    names = [getattr(c, "kv_connector", None) for c in transfer_children(cfg)]
+    pd = pd_transfer_config(cfg)
+    if (
+        transfer.kv_connector_module_path not in (None, MULTI_CONNECTOR_MODULE)
+        or sorted(names) != sorted([PD_CONNECTOR, OFFLOAD_CONNECTOR])
+        or pd is None
+        or pd.kv_role != "kv_producer"
+        or transfer.kv_role != pd.kv_role
+    ):
+        raise ValueError(
+            f"Qwen4Exp runs {MULTI_CONNECTOR} only as a PD producer with a host "
+            f"tier: children exactly {PD_CONNECTOR} (kv_role='kv_producer') and "
+            f"{OFFLOAD_CONNECTOR}, and the top-level kv_role 'kv_producer'; got "
+            f"children {names}, top-level role {transfer.kv_role!r}"
         )
 
 
