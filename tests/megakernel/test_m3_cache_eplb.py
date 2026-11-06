@@ -507,7 +507,9 @@ def test_paged_kv_fp8_nan_padding_guard(amask: int):
             ex_bad = _tiny_exec(
                 R=2, B=2, T=1, ctx=256, paged_kv=True, num_pages=32, amask=bad_amask
             )
-            with pytest.raises(AssertionError, match="paged_kv requires amask"):
+            with pytest.raises(
+                mk.MegakernelConfigError, match="paged_kv requires amask"
+            ):
                 qwen35.build(g, ex_bad)
 
 
