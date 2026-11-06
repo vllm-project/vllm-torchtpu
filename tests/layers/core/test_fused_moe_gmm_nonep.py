@@ -153,17 +153,19 @@ def test_nonep_choices_change_only_the_non_ep_program():
     assert "concatenate" in non_ep and "concatenate" not in jaxpr(False)
 
 
-def _ref_gmm(calls, tiles=None):
+def _ref_gmm(calls, tiles=None, hoists=None):
     """Pure-JAX stand-in for gmm_wrapper that records its n_window (and
     tile_m); every output column is computed independently, as the kernel's
     are."""
     tiles = [] if tiles is None else tiles
+    hoists = [] if hoists is None else hoists
 
     def gmm(lhs, rhs, rhs_scale, rhs_bias, group_sizes, group_offset, zero_initialize=False,
             fuse_act=None, preferred_element_type=None, rhs_quant_dtype=None, n_window=None,
-            tile_m=0):
+            tile_m=0, hoist_lhs_quant=False):
         calls.append(n_window)
         tiles.append(tile_m)
+        hoists.append(hoist_lhs_quant)
         r = (rhs.astype(jnp.float32) * rhs_scale[:, 0]).astype(jnp.bfloat16)
         if n_window is not None:
             r = r[..., n_window[0] : n_window[0] + n_window[1]]
@@ -244,7 +246,7 @@ def test_tiling_with_tile_m_overrides_only_the_m_tiling(monkeypatch):
 
 
 @pytest.mark.parametrize("use_ep", [False, True])
-def test_gmm_tile_m_reaches_both_gmms_on_the_non_ep_path_only(monkeypatch, use_ep):
+def test_gmm_tile_m_and_hoist_reach_both_gmms_on_the_non_ep_path_only(monkeypatch, use_ep):
     experts, hidden, inter, topk, tokens = 16, 512, 128, 4, 640
     k1, k2, k3 = jax.random.split(jax.random.key(4), 3)
     w1, s1 = _fp8_per_channel(k1, (experts, hidden, 2 * inter))
@@ -253,16 +255,18 @@ def test_gmm_tile_m_reaches_both_gmms_on_the_non_ep_path_only(monkeypatch, use_e
     rng = np.random.default_rng(6)
     ids = jnp.asarray(np.stack([rng.choice(experts, topk, replace=False) for _ in range(tokens)]), jnp.int32)
     w = jnp.asarray(rng.random((tokens, topk)), jnp.bfloat16)
-    calls, tiles = [], []
-    monkeypatch.setattr(fused_moe_gmm, "gmm_wrapper", _ref_gmm(calls, tiles))
+    calls, tiles, hoists = [], [], []
+    monkeypatch.setattr(fused_moe_gmm, "gmm_wrapper", _ref_gmm(calls, tiles, hoists))
     xs, gs, rev, wf, valid, tok = prepare_routed_gmm_inputs(
         x, ids, w, local_num_experts=experts, topk=topk, use_ep=False, use_sparse_core=False
     )
     fused_moe_gmm.moe_gmm(
         xs, w1, s1, None, w2, s2, None, gs, rev, wf, valid, tok, activation="silu",
         num_tokens=tokens, topk=topk, use_ep=use_ep, use_sparse_core=False, nonep_gmm_tile_m=1024,
+        nonep_gmm_hoist_quant=True,
     )
     assert tiles == ([0, 0] if use_ep else [1024, 1024])
+    assert hoists == ([False, False] if use_ep else [True, True])
 
 
 # --------------------------------------------------------------------------- TPU
@@ -322,6 +326,7 @@ def test_fused_moe_func_nonep_choices_bitwise_on_tpu(tokens):
         dict(nonep_gmm_tile_m=256),
         dict(nonep_gmm_tile_m=1024),
         dict(nonep_gmm_tile_m=2048),
+        dict(nonep_gmm_hoist_quant=True),
         dict(nonep_gather="xla_colchunk", nonep_combine_split=2, nonep_permute="two_sorts",
              nonep_gmm_tile_m=1024),
     ):

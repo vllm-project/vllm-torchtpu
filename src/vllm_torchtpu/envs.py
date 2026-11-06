@@ -83,6 +83,7 @@ if TYPE_CHECKING:
     TPU_MOE_NONEP_PERMUTE: str = "sorts"
     TPU_MOE_NONEP_COMBINE_SPLIT: str = "1"
     TPU_MOE_NONEP_GMM_TILE_M: str = "0"
+    TPU_MOE_NONEP_GMM_HOIST_QUANT: bool = False
     USE_MOE_TP_DECODE_KERNEL: bool = False
     RAGGED_GATHER_REDUCE_VERSION: str = "v2"
     USE_PHASED_PROFILER: bool = False
@@ -1166,6 +1167,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_MOE_NONEP_GMM_TILE_M": env_with_choices(
         "TPU_MOE_NONEP_GMM_TILE_M", "0", ["0", "256", "512", "1024", "2048"]
     ),
+    # The non-EP GMMs quantize each lhs k-block once per tile before the
+    # column loop (gmm_v2 hoist_lhs_quant) instead of once per mxu-wide column
+    # chunk. Same ops on the same values.
+    "TPU_MOE_NONEP_GMM_HOIST_QUANT": env_bool("TPU_MOE_NONEP_GMM_HOIST_QUANT"),
     # Serve eligible tensor-parallel MoE layers (sigmoid + correction-bias
     # top-k with renormalization, one shared expert, FP8 per-channel weights)
     # with one op that also covers the shared expert and the TP all-reduce:

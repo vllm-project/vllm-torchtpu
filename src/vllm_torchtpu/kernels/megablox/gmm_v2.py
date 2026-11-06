@@ -285,6 +285,10 @@ class GmmConfigs:
     # (start, width) output columns computed from rhs[..., start:start + width];
     # dims.size_n is then the window width. None computes every column.
     n_window: tuple[int, int] | None = None
+    # Quantize each lhs k-block once per tile, before the n loop, instead of
+    # inside it (where the same ops repeat tile_n // mxu_size times and the
+    # repeats are left to CSE). Same ops on the same values.
+    hoist_lhs_quant: bool = False
 
     @property
     def num_quant_blocks_per_tile_k(self) -> int:
@@ -514,6 +518,25 @@ def inner_kernel(
             # result of [tile_m, mxu_size] becomes available at the end of every k
             # inner loop which can be used to pipeline subsequent VPU or VST ops with
             # MXU ops for the next [tile_m, mxu_size].
+            def quantize_block(start_k):
+                end_k = min(cfgs.tiles.tile_k, start_k + q_block_size)
+                block_lhs = tiled_lhs[:, start_k:end_k]
+                block_abs_max = jnp.max(jnp.abs(block_lhs), axis=1, keepdims=True)
+                block_scale = block_abs_max / dtype_max
+
+                # If block_scale=0, it will cause division by zero and return either
+                # NaN or Inf. Since this can cause numeric issue when downcasting to
+                # quantized value, we convert them into 0.
+                block_scale_inv = jnp.where(block_scale == 0, 0, 1 / block_scale)
+                # Convert lhs into quantized dtype.
+                return (block_lhs * block_scale_inv).astype(lhs_q_dtype), block_scale
+
+            hoisted = (
+                {k: quantize_block(k) for k in range(0, cfgs.tiles.tile_k, q_block_size)}
+                if cfgs.hoist_lhs_quant
+                else None
+            )
+
             for start_n in range(0, rhs_tile_n, mxu_size):
                 end_n = min(rhs_tile_n, start_n + mxu_size)
                 col_size = end_n - start_n
@@ -522,21 +545,15 @@ def inner_kernel(
                 for start_k in range(0, cfgs.tiles.tile_k, q_block_size):
                     end_k = min(cfgs.tiles.tile_k, start_k + q_block_size)
 
-                    block_lhs = tiled_lhs[:, start_k:end_k]
                     block_rhs = tiled_rhs[start_k:end_k, start_n:end_n]
 
-                    # Perform lhs quantization. Note that for every block_lhs,
-                    # same computation will be performed tiles_n//mxu_size times.
-                    # But we can let compiler perform CSE and avoid recomputation.
-                    block_abs_max = jnp.max(jnp.abs(block_lhs), axis=1, keepdims=True)
-                    block_scale = block_abs_max / dtype_max
-
-                    # If block_scale=0, it will cause division by zero and return either
-                    # NaN or Inf. Since this can cause numeric issue when downcasting to
-                    # quantized value, we convert them into 0.
-                    block_scale_inv = jnp.where(block_scale == 0, 0, 1 / block_scale)
-                    # Convert lhs into quantized dtype.
-                    block_lhs_q = (block_lhs * block_scale_inv).astype(lhs_q_dtype)
+                    # Perform lhs quantization. Unless hoisted, for every block_lhs
+                    # the same computation is performed tiles_n//mxu_size times and
+                    # the repeats are left to the compiler's CSE.
+                    if hoisted is not None:
+                        block_lhs_q, block_scale = hoisted[start_k]
+                    else:
+                        block_lhs_q, block_scale = quantize_block(start_k)
 
                     # Unlike unquantized path, compiler may not perform implicit type
                     # conversion due to numeric concerns. As this can cause unsupported
@@ -1152,6 +1169,7 @@ def get_scope_name(cfgs: GmmConfigs) -> str:
     dims = cfgs.dims
     tiles = cfgs.tiles
     window = "" if cfgs.n_window is None else f"-nw_{cfgs.n_window[0]}"
+    window += "-hq" if cfgs.hoist_lhs_quant else ""
     return (
         f"gmm_v2-g_{dims.size_group}-m_{dims.size_m}-k_{dims.size_k}-act_{cfgs.fuse_act}"
         f"-n_{dims.size_n}{window}-tm_{tiles.tile_m}-tk_{tiles.tile_k}-tn_{tiles.tile_n}"
@@ -1175,6 +1193,7 @@ def make_gmm_configs(
     fuse_act: str | None = None,
     rhs_quant_dtype: jnp.dtype | None = None,
     n_window: tuple[int, int] | None = None,
+    hoist_lhs_quant: bool = False,
 ):
     """Fills the GMM config for the GMM kernel."""
 
@@ -1278,6 +1297,7 @@ def make_gmm_configs(
         zero_init=zero_initialize,
         fuse_act=fuse_act,
         n_window=n_window,
+        hoist_lhs_quant=hoist_lhs_quant,
     )
 
 
@@ -1304,6 +1324,7 @@ def get_metadata(cfgs: GmmConfigs) -> dict[str, str | int | float]:
         "fuse_act",
         "rhs_quant_dtype",
         "n_window",
+        "hoist_lhs_quant",
     ]
 )
 def gmm_v2(
@@ -1324,6 +1345,7 @@ def gmm_v2(
     fuse_act: str | None = None,
     rhs_quant_dtype: jnp.dtype | None = None,
     n_window: tuple[int, int] | None = None,
+    hoist_lhs_quant: bool = False,
 ) -> jax.Array:
     """GMM kernel implemented with emit_pipeline.
 
@@ -1353,6 +1375,8 @@ def gmm_v2(
             [start, start + width), reading only those rhs columns (lane
             aligned; not with fuse_act). Each column is computed exactly as
             without the window.
+        hoist_lhs_quant: Quantize each lhs k-block once per tile before the n
+            loop instead of once per mxu-wide column chunk. Same values.
 
     Returns:
         Output of shape [size_m, size_n] ([size_m, width] with n_window).
@@ -1394,6 +1418,7 @@ def gmm_v2(
         fuse_act=fuse_act,
         rhs_quant_dtype=rhs_quant_dtype,
         n_window=n_window,
+        hoist_lhs_quant=hoist_lhs_quant,
     )
     dims = cfgs.dims
     tiles = cfgs.tiles
