@@ -623,3 +623,27 @@ def test_zero_draft_kv_option_clears_only_the_landed_draft_rows(monkeypatch, zer
         # Rows the first turn landed (adopted now) and this turn's suffix.
         assert (values == (0 if zero else stale)).all()
     assert logical_mismatches(decode, conv, prompt, meta, tables) == [[]] * TP
+
+
+@pytest.mark.usefixtures("engine_patches")
+def test_staged_clips_count_destination_pages_by_live_bytes():
+    """dst_skip_bytes must be a whole multiple of the destination page's live
+    bytes (Raiden controller): a trimmed compressed-key page counts 409,600."""
+    from vllm_torchtpu.models.vllm.qwen4_exp.pd_manifest import compressed_live_bytes
+    from vllm_torchtpu.models.vllm.qwen4_exp.pd_staging import owner_kind
+
+    decode = Decode(decode_config())
+    staging = decode.ranks[0]
+    live = compressed_live_bytes(staging.src_layout)
+    assert live == 409_600 and staging.src_layout.page_bytes == 3_276_800
+    skip = 5 * ENTRY  # 10,240 tokens: 3 whole 3,200-token source pages
+    assert staging.reserve(77, 40_000, skip_tokens=skip)
+    clips = staging.skip_bytes(77)
+    for pool, clip in zip(staging.manifest.pools, clips):
+        kind = owner_kind(pool.layer_name)
+        if kind == "compressed":
+            assert clip == 3 * live
+        elif kind == "main":
+            assert clip == 3 * pool.block_stride_bytes
+        else:
+            assert clip == 0
