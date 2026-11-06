@@ -548,6 +548,9 @@ def test_static_indexer_backend_cache_and_owner_contract(
         assert len(captured) == 3
         assert len({item[0] for item in captured}) == 3
         assert captured[1][1].keywords["topk_backend"] is backend
+        assert all(
+            item[1].keywords["enable_sc_preparation"] is True for item in captured
+        )
         assert all(item[2]["donate_argnums"] == donated for item in captured)
         with pytest.raises(TypeError, match="unhashable"):
             factory(topk_backend={})
@@ -560,10 +563,7 @@ def test_static_indexer_backend_cache_and_owner_contract(
             )
         with pytest.raises(ValueError, match="requires an explicit"):
             factory(topk_backend_key="orphan-key")
-        assert (
-            captured[0][0]
-            == "qwen4_exp::" + factory_name[6:-3] + "_rebased_20261102_v3"
-        )
+        assert captured[0][0] == "qwen4_exp::" + factory_name[6:-3] + "_sc_prepare_v1"
         assert len(captured) == 3
     finally:
         cached.cache_clear()

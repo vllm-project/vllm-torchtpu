@@ -145,21 +145,40 @@ def _indexer_updates(
     norm_eps,
     rotary_dim,
     rope_axes=None,
+    *,
+    pooled_values: jax.Array | None = None,
 ):
     count = len(raw)
     req, logical, valid = _token_metadata(count, starts, context, slots)
     safe_slots = jnp.maximum(slots, 0)
     ratio = compress_ratio
     group_start = logical // ratio * ratio
-    members = group_start[:, None] + jnp.arange(ratio)[None]
-    chunk_indices = starts[req, None] + members - context[req, None]
-    current = raw[jnp.clip(chunk_indices, 0, count - 1)]
-    previous = ring[safe_slots[req, None], members % ratio]
-    previous = jnp.where((context[req] > 0)[:, None, None], previous, 0)
-    joined = jnp.where(
-        (chunk_indices >= starts[req, None])[..., None], current, previous
-    )
-    pooled = bf16(jnp.mean(joined.astype(jnp.float32), axis=1))
+    from .tuned_block_sizes import use_prefill_index_preparation
+
+    if pooled_values is not None:
+        pooled = pooled_values
+    elif use_prefill_index_preparation(raw, ratio, requests=len(context)):
+        from .index_pool_prepare import pool_index_groups
+
+        pooled = pool_index_groups(
+            raw,
+            ring,
+            starts,
+            context,
+            safe_slots,
+            req,
+            ratio,
+        )
+    else:
+        members = group_start[:, None] + jnp.arange(ratio)[None]
+        chunk_indices = starts[req, None] + members - context[req, None]
+        current = raw[jnp.clip(chunk_indices, 0, count - 1)]
+        previous = ring[safe_slots[req, None], members % ratio]
+        previous = jnp.where((context[req] > 0)[:, None, None], previous, 0)
+        joined = jnp.where(
+            (chunk_indices >= starts[req, None])[..., None], current, previous
+        )
+        pooled = bf16(jnp.mean(joined.astype(jnp.float32), axis=1))
     first_index = starts[req] + group_start - context[req]
     axial = positions.ndim == 2
     token_positions = positions.T if axial else positions[:, None]

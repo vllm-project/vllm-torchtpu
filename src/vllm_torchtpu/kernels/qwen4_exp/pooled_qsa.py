@@ -50,6 +50,7 @@ from vllm_torchtpu.kernels.qwen4_exp.tuned_block_sizes import (
     use_completed_rope_dma,
     use_compressed_preparation,
     use_decode_state_fusion,
+    use_prefill_index_preparation,
 )
 
 
@@ -370,6 +371,16 @@ def write_compressed(
             trig_rows=trig_rows,
         )
 
+    if (
+        not batch_pairs
+        and use_prefill_index_preparation(keys, ratio, requests=len(context))
+        and width == 128
+        and pool.dtype in (jnp.bfloat16, jnp.float8_e4m3fn)
+    ):
+        from .index_pool_prepare import write_indexed_pairs
+
+        return write_indexed_pairs(pool, keys, pair, write, mask, local, ratio)
+
     values = keys[jnp.clip(local, 0, len(keys) - 1)]
     values = jnp.pad(values, ((0, 0), (0, 0), (0, width - keys.shape[-1])))
 
@@ -643,6 +654,7 @@ def compact_pooled_qsa_step(
     topk_backend: TopKBackend | None = None,
     sc_min_context: int | None = None,
     rope_axes: tuple[int, ...] | None = None,
+    enable_sc_preparation: bool = False,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
     # Keep the persisted custom-op parameter name while naming its main owner.
     main_pool = pool
@@ -662,6 +674,60 @@ def compact_pooled_qsa_step(
     # Native BlockTable pads this one-block ring row to token alignment.
     # Only column zero owns storage; the remaining entries are padding.
     ring_ids = ring_ids.reshape(len(context), -1)[:, 0]
+    # Keep request metadata independent of layer-specific page IDs so XLA can
+    # share RPA schedules across layers.
+    active = starts[1:] > starts[:-1]
+    slots = jnp.where(active, jnp.arange(len(ring_ids), dtype=jnp.int32), -1)
+    req, logical, valid = _token_metadata(len(qgate), starts, context, slots)
+
+    index_dim = niq.shape[0]
+    # The persistent ring/tag ABI pads request rows to eight logical lanes.
+    ring_rows = pl.cdiv(compress_ratio, 8) * 8
+    tag_fields = (positions.shape[0] if positions.ndim == 2 else 1) + 1
+
+    def read_index_state(owner):
+        ring, tags = read_ring_and_tags(
+            owner, ring_ids, ring_rows * index_dim, ring_rows * tag_fields
+        )
+        return (
+            ring.reshape(len(ring_ids), ring_rows, index_dim),
+            tags.reshape(len(ring_ids), ring_rows, tag_fields),
+        )
+
+    early_state = None
+    early_pooled = None
+    preparation_group = None
+    early_raw = index_qk[:, -index_dim:]
+    if (
+        enable_sc_preparation
+        and scheduling_group_namespace > 0
+        and use_prefill_index_preparation(
+            early_raw, compress_ratio, requests=len(context)
+        )
+    ):
+        # Native main/index owners are independent allocations. Fork only reads
+        # here; compressed/state writes still consume the original owner barrier.
+        early_state = read_index_state(index_pool)
+        from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import config
+        from vllm_torchtpu.kernels.qwen4_exp.index_pool_prepare_sc import (
+            pool_index_groups_sc_async,
+        )
+
+        # Top-k uses at most two group IDs per nonempty query chunk. Reserve
+        # the next slot using the stable native namespace, including cache hits.
+        preparation_group = config.scoped_scheduling_group_id(
+            scheduling_group_namespace, 2 * len(early_raw)
+        )
+        early_pooled = pool_index_groups_sc_async(
+            early_raw,
+            early_state[0],
+            starts,
+            context,
+            jnp.maximum(slots, 0),
+            req,
+            compress_ratio,
+            scheduling_group_id=preparation_group,
+        )
     from .retained_preparation import produce_prepared, use_retained_preparation
 
     prepared = use_retained_preparation(
@@ -706,12 +772,6 @@ def compact_pooled_qsa_step(
             rotary_dim,
             rope_axes,
         )
-    # Native allocation supplies an owner for every nonempty query row;
-    # padded/idle rows have empty query ranges. Keep lengths independent of
-    # layer-specific page IDs so XLA can share RPA schedules across layers.
-    active = starts[1:] > starts[:-1]
-    slots = jnp.where(active, jnp.arange(len(ring_ids), dtype=jnp.int32), -1)
-    req, logical, valid = _token_metadata(len(q), starts, context, slots)
     page = jnp.where(
         valid, main_table[req, logical // main_pool.shape[1]], len(main_pool)
     )
@@ -723,13 +783,15 @@ def compact_pooled_qsa_step(
         logical,
         valid,
     )
+    if preparation_group is not None:
+        from jax.experimental import xla_metadata
+
+        main_pool = xla_metadata.set_xla_metadata(
+            main_pool,
+            _scheduling_group_id=preparation_group,
+        )
     # Retain the write dependency across the two owners.
     main_pool, index_pool = jax.lax.optimization_barrier((main_pool, index_pool))
-    # The persistent ring/tag ABI pads request rows to eight logical lanes;
-    # VMEM padding of those typed views is independently handled by lowering.
-    ring_rows = (compress_ratio + 7) // 8 * 8
-    ring_elements = ring_rows * raw.shape[-1]
-    tag_fields = (positions.shape[0] if positions.ndim == 2 else 1) + 1
     fused_state = use_decode_state_fusion(
         raw, index_pool, requests=len(context), ratio=compress_ratio
     )
@@ -769,11 +831,9 @@ def compact_pooled_qsa_step(
             index_pool, completed = state_result
         complete = valid & (logical % compress_ratio == compress_ratio - 1)
     else:
-        ring, tags = read_ring_and_tags(
-            index_pool, ring_ids, ring_elements, ring_rows * tag_fields
+        ring, tags = (
+            read_index_state(index_pool) if early_state is None else early_state
         )
-        ring = ring.reshape(len(ring_ids), ring_rows, -1)
-        tags = tags.reshape(len(ring_ids), ring_rows, tag_fields)
         completed, complete, req, logical, ring, tags = _indexer_updates(
             raw,
             positions,
@@ -788,6 +848,7 @@ def compact_pooled_qsa_step(
             norm_eps,
             rotary_dim,
             rope_axes,
+            pooled_values=early_pooled,
         )
         pending_state = (ring, tags)
     index_pool = write_compressed(

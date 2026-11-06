@@ -32,14 +32,14 @@ def _op_name(kind: str, backend: TopKBackend | None, backend_key: str | None) ->
     if backend is None:
         if backend_key is not None:
             raise ValueError("A backend key requires an explicit topk_backend")
-        return f"qwen4_exp::{kind}_rebased_20261102_v3"
+        return f"qwen4_exp::{kind}_sc_prepare_v1"
     if not isinstance(backend_key, str) or not backend_key:
         raise ValueError("Explicit topk_backend requires a stable topk_backend_key")
     previous = _backend_keys.setdefault(backend_key, backend)
     if previous != backend:
         raise ValueError("topk_backend_key already identifies a different backend")
     suffix = hashlib.sha256(backend_key.encode("utf-8")).hexdigest()
-    return f"qwen4_exp::{kind}_{suffix}_rebased_20261102_v3"
+    return f"qwen4_exp::{kind}_{suffix}_sc_prepare_v1"
 
 
 def build_compact_pooled_qsa_op(
@@ -53,9 +53,9 @@ def build_compact_pooled_qsa_op(
 
     Explicit keys must identify the implementation/version and all static
     configuration, consistently across processes. Different backends must not
-    reuse a key. The default selector retains its legacy operator name.
-    The TPU compiler binds scheduling_group_namespace per FX call site; zero
-    keeps direct native calls safe without cross-call scheduling annotations.
+    reuse a key. The operator identity versions the preparation implementation.
+    The TPU compiler binds scheduling_group_namespace per FX call site. Direct
+    calls with namespace zero use TC preparation.
     """
     sc_min_context = envs.environment_variables["VLLM_TPU_QSA_SC_MIN_CONTEXT"]()
     return _build_compact_pooled_qsa_op(
@@ -82,6 +82,7 @@ def _build_compact_pooled_qsa_op(
         topk_backend=topk_backend,
         sc_min_context=sc_min_context,
         rope_axes=rope_axes,
+        enable_sc_preparation=True,
     )
     op = pallas.jax_op(
         _op_name(kind, topk_backend, topk_backend_key),

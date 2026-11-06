@@ -67,13 +67,17 @@ def _kernel(
     query_block: int,
     k_scale: float,
     v_scale: float,
+    query_transposed: bool,
 ):
     block = pl.program_id(0)
     # The model produces BF16 queries.  A BF16 call boundary can avoid a large
     # FP32 input window while preserving the existing FP32 QK accumulation.
+    query = query_ref[...]
+    if query_transposed:
+        # Restore logical token/head/channel order within this VMEM block.
+        query = query.transpose(2, 0, 1)
     q = (
-        query_ref[...]
-        .astype(jnp.float32)
+        query.astype(jnp.float32)
         .reshape(query_block, kv_heads, q_heads_per_kv, head_dim)
         .transpose(1, 2, 0, 3)
     )
@@ -544,6 +548,7 @@ def block_sparse_gqa_prefill(
             k_scale=k_scale,
             v_scale=v_scale,
             bf16_io=bf16_io,
+            token_minor_query=bf16_io,
         )
 
     return _metadata_prefix_dispatch(
@@ -641,6 +646,7 @@ def _prefill(
     v_scale,
     bf16_io,
     prepared: PreparedTC | None = None,
+    token_minor_query=False,
 ):
     """Run exact selected-group attention with query-block KV reuse."""
     tokens, query_heads, head_dim = query.shape
@@ -669,6 +675,15 @@ def _prefill(
     original_head_dim = head_dim
     query = jnp.pad(query, ((0, 0), (0, 0), (0, cache_dim - head_dim)))
     head_dim = cache_dim
+    # The producer's tiled token-minor owner is a default-layout [H, D, T]
+    # view. Read that view instead of repacking the whole query in HBM.
+    # Pallas requires a minor-axis block to span the axis or align to 128 lanes.
+    query_transposed = (
+        token_minor_query
+        and bf16_io
+        and paired_pages
+        and (query_block == tokens or query_block % 128 == 0)
+    )
     if packing != (2 if cache.dtype == jnp.bfloat16 else 4):
         raise ValueError("Cache packing does not match its dtype")
     vmem_limit = prefill_vmem_limit()
@@ -736,14 +751,19 @@ def _prefill(
             query_block=query_block,
             k_scale=k_scale,
             v_scale=v_scale,
+            query_transposed=query_transposed,
         ),
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=4,
             grid=(nblocks,),
             in_specs=[
                 pl.BlockSpec(
-                    (query_block, query_heads, head_dim),
-                    lambda b, *_: (b, 0, 0),
+                    (query_heads, head_dim, query_block)
+                    if query_transposed
+                    else (query_block, query_heads, head_dim),
+                    (lambda b, *_: (0, 0, b))
+                    if query_transposed
+                    else (lambda b, *_: (b, 0, 0)),
                 ),
                 pl.BlockSpec(
                     (1, words, native_query_width),
@@ -804,7 +824,9 @@ def _prefill(
         active_tiles.reshape(-1),
         active_counts,
         last_page,
-        query.astype(jnp.bfloat16 if bf16_io else jnp.float32),
+        (query.transpose(1, 2, 0) if query_transposed else query).astype(
+            jnp.bfloat16 if bf16_io else jnp.float32
+        ),
         block_bits_native,
         lengths[:, None],
         cache.reshape(pages * physical_page_size, head_axis, packing, head_dim),

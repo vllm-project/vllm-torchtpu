@@ -33,8 +33,11 @@ def core_calls(monkeypatch):
     monkeypatch.setattr(pltpu, "get_tpu_info", lambda: info)
     calls = []
 
-    def pallas(kernel, *, grid_spec, **kwargs):
+    def pallas(kernel, *, grid_spec, out_shape, **kwargs):
         def run(table, tiles, counts, last, query, bits, lengths, cache):
+            if kernel.keywords["query_transposed"]:
+                query = query.transpose(2, 0, 1)
+            assert query.shape == out_shape.shape
             nblocks = grid_spec.grid[0]
             owners = table.reshape(nblocks, -1)[:, 0]
             owners = jnp.repeat(owners, len(query) // nblocks)

@@ -50,9 +50,18 @@ def test_qsa_main_cache_universal_tiled_writer_matches_scatter(fp8, starts):
 
 @pytest.mark.tpu_test
 @pytest.mark.parametrize("fp8", [False, True])
-@pytest.mark.parametrize("query_block", [32, 64, 128, 256])
+@pytest.mark.parametrize(
+    "tokens,query_block,kv_tile",
+    [
+        (32, 32, 128),
+        (64, 64, 128),
+        (128, 128, 128),
+        (256, 256, 128),
+        pytest.param(128, 64, 256, id="paired-pages-64-row-tiles"),
+    ],
+)
 def test_qsa_block_sparse_matches_exact_mask_with_partial_tail_and_nan(
-    fp8, query_block
+    fp8, tokens, query_block, kv_tile
 ):
     from vllm_torchtpu.kernels.qwen4_exp.block_sparse_gqa_prefill import (
         block_sparse_gqa_attention,
@@ -61,7 +70,7 @@ def test_qsa_block_sparse_matches_exact_mask_with_partial_tail_and_nan(
     from vllm_torchtpu.kernels.qwen4_exp.qsa_rpa import pack_rows
 
     rng = np.random.default_rng(731904)
-    tokens, context, page_size = query_block, 2304, 128
+    context, page_size = 2304, 128
     query = jnp.asarray(
         rng.standard_normal((tokens, 24, 256), dtype=np.float32) * 0.1,
         dtype=jnp.bfloat16,
@@ -111,7 +120,8 @@ def test_qsa_block_sparse_matches_exact_mask_with_partial_tail_and_nan(
         ratio=4,
         kv_heads=2,
         query_block=query_block,
-        bf16_io=query_block > 128,
+        kv_tile=kv_tile,
+        bf16_io=kv_tile == 256 or query_block > 128,
     )
     actual = np.asarray(actual, np.float32)
     assert np.isfinite(actual).all()

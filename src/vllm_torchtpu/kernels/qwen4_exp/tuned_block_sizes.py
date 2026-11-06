@@ -403,6 +403,24 @@ def use_query_prepare(qgate, norm, trig, rotary_dim):
 _COMPRESSED_PREPARATION_SHAPES = {((16, 128), 4, 64)}
 COMPLETED_ROPE_DMA_ROWS = 8
 
+_PREFILL_INDEX_PREPARATION_SHAPES = {((8192, 128), 4, 8)}
+
+
+def use_prefill_index_preparation(
+    values: _DmaArray, ratio: int, *, requests: int
+) -> bool:
+    """Admit only the measured BF16 prefill bucket on TPU7x."""
+    if (
+        values.shape,
+        ratio,
+        requests,
+    ) not in _PREFILL_INDEX_PREPARATION_SHAPES or values.dtype != jnp.bfloat16:
+        return False
+    if jax.default_backend() != "tpu":
+        return False
+    hw = _hardware()
+    return hw.chip_version == pltpu.ChipVersion.TPU_7X
+
 
 def use_compressed_preparation(raw, trig, ratio, rotary_dim):
     """Further preparation fusion only for measured state-fusion geometry."""

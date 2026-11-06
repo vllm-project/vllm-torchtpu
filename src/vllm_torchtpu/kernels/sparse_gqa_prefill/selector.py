@@ -241,6 +241,7 @@ def select_prefill(
                     v_scale=v_scale,
                     bf16_io=True,
                     prepared=prepared,
+                    token_minor_query=True,
                 )
                 return tc._gate_output(raw, gate, lengths), jnp.int32(route)
 
