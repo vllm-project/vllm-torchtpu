@@ -57,13 +57,11 @@ def _get_tp_group() -> Any | None:
 
 
 def dcp_spans_pcp() -> bool:
-    """True when the DCP group covers TP x PCP rather than borrowing from TP.
+    """True when the DCP group spans TP x PCP (head-tail PCP manager mode).
 
-    That is the PCP manager's layout (`validate_pcp_manager_config` enforces
-    it). Decided from the flag rather than the groups: looking a group up can
-    fail an assert, which `torch.compile` cannot trace.
+    Checked from flags rather than group lookups so `torch.compile` can trace it.
     """
-    return bool(envs.USE_TPU_PCP_MANAGER)
+    return envs.use_headtail_pcp_manager()
 
 
 def _head_group() -> Any | None:

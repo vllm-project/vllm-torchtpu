@@ -475,12 +475,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # lane-padded tiles cost a broadcast init, a relayout copy and padded
     # copies through the LSE merge. Bit-identical outputs.
     "TPU_MLA_SPARSE_SPLIT_Q": env_bool("TPU_MLA_SPARSE_SPLIT_Q", default=False),
-    # Run PCP through `runner/pcp/manager.py` (PCP x DCP KV gather).
+    # Use the runner PCP manager (`headtail` or `interleaved` sharding plan);
+    # `USE_TPU_PCP_MANAGER` will be removed once PcpManager supersedes the
+    # legacy sequence-layout planner at full feature parity.
     "USE_TPU_PCP_MANAGER": env_bool("USE_TPU_PCP_MANAGER", default=False),
     "TPU_PCP_SHARDING_PLAN": env_with_choices(
         "TPU_PCP_SHARDING_PLAN",
         "headtail",
-        ["headtail"],
+        ["headtail", "interleaved"],
         case_sensitive=False,
     ),
     # PCP manager: max context tokens one step's split prefills may gather.
@@ -1331,6 +1333,14 @@ def use_raiden_glm_admission() -> bool:
     """True when Raiden KV-cache manager and GLM Stage-3 admission are both enabled."""
     mod = sys.modules[__name__]
     return bool(mod.TPU_USE_RAIDEN_KV_CACHE_MANAGER and mod.TPU_RAIDEN_GLM_ADMISSION)
+
+
+def use_headtail_pcp_manager() -> bool:
+    """True when the PCP manager runs with the head-tail sharding plan."""
+    mod = sys.modules[__name__]
+    return bool(
+        mod.USE_TPU_PCP_MANAGER and mod.TPU_PCP_SHARDING_PLAN.lower() == "headtail"
+    )
 
 
 def is_indexer_kv_cache_mode_explicit() -> bool:
