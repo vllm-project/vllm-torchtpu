@@ -48,6 +48,7 @@ def _make_scheduler(
     raise_on_lookup: bool = False,
     tier_warmth: bool = False,
     connector: object | None = None,
+    max_wait_s: float = 0.0,
 ) -> PrefixAwareScheduler:
     s = PrefixAwareScheduler.__new__(PrefixAwareScheduler)
     q = FCFSRequestQueue()
@@ -62,6 +63,7 @@ def _make_scheduler(
     s._paw_prompt_tokens = 0
     s._paw_scoring_broken = False
     s._init_tier_warmth(tier_warmth)
+    s._init_aging(max_wait_s)
     s.connector = connector
 
     coordinator = MagicMock()
@@ -160,6 +162,67 @@ def _offload_connector(
 
 def test_default_knobs():
     assert PrefixAwareScheduler.WINDOW == 64
+    assert PrefixAwareScheduler.TIER_PROBE_MAX_CHUNKS == 64
+    assert PrefixAwareScheduler.MAX_WAIT_S == 0.0
+
+
+def test_env_knobs(monkeypatch):
+    from vllm_torchtpu import envs
+
+    monkeypatch.delenv("TPU_PREFIX_AWARE_TIER_PROBE_MAX_CHUNKS", raising=False)
+    monkeypatch.delenv("TPU_PREFIX_AWARE_MAX_WAIT_S", raising=False)
+    assert envs.TPU_PREFIX_AWARE_TIER_PROBE_MAX_CHUNKS == 64
+    assert envs.TPU_PREFIX_AWARE_MAX_WAIT_S == 0.0
+    monkeypatch.setenv("TPU_PREFIX_AWARE_TIER_PROBE_MAX_CHUNKS", "256")
+    monkeypatch.setenv("TPU_PREFIX_AWARE_MAX_WAIT_S", "60")
+    assert envs.TPU_PREFIX_AWARE_TIER_PROBE_MAX_CHUNKS == 256
+    assert envs.TPU_PREFIX_AWARE_MAX_WAIT_S == 60.0
+
+
+def test_aging_admits_a_long_waiting_cold_request_first():
+    now = time.time()
+    r_old = _make_request("old", num_tokens=600_000, arrival_time=now - 120)
+    r_new = _make_request("new", num_tokens=1000, arrival_time=now - 1)
+    warmth = {"old": 0, "new": 900}
+
+    s = _make_scheduler([r_old, r_new], warmth)
+    assert [r.request_id for r in s._select_waiting_queue_for_scheduling()] == [
+        "new",
+        "old",
+    ]
+    assert s._paw_aged == 0
+
+    s = _make_scheduler([r_old, r_new], warmth, max_wait_s=60.0)
+    assert [r.request_id for r in s._select_waiting_queue_for_scheduling()] == [
+        "old",
+        "new",
+    ]
+    assert s._paw_aged == 1
+
+
+def test_aged_requests_admit_oldest_first():
+    now = time.time()
+    r_warm = _make_request("warm_aged", num_tokens=5000, arrival_time=now - 90)
+    r_cold = _make_request("cold_older", num_tokens=5000, arrival_time=now - 200)
+    r_fresh = _make_request("fresh_warm", num_tokens=5000, arrival_time=now - 1)
+    s = _make_scheduler(
+        [r_warm, r_cold, r_fresh],
+        {"warm_aged": 4000, "cold_older": 0, "fresh_warm": 4999},
+        max_wait_s=60.0,
+    )
+    order = [r.request_id for r in s._select_waiting_queue_for_scheduling()]
+    assert order[0] == "cold_older"
+
+
+def test_preempted_still_outranks_aged():
+    now = time.time()
+    r_aged = _make_request("aged", num_tokens=5000, arrival_time=now - 300)
+    r_pre = _make_request(
+        "preempted", num_tokens=5000, arrival_time=now - 1, num_preemptions=1
+    )
+    s = _make_scheduler([r_aged, r_pre], {"aged": 0, "preempted": 0}, max_wait_s=60.0)
+    order = [r.request_id for r in s._select_waiting_queue_for_scheduling()]
+    assert order == ["preempted", "aged"]
 
 
 def test_promotes_warmest_within_window():
@@ -466,6 +529,19 @@ def test_tier_probe_caps_chunks_in_one_store_probe():
     assert manager.probed == [
         [_chunk_key(r, c) for c in range(s.TIER_PROBE_MAX_CHUNKS)]
     ]
+
+
+def test_tier_probe_cap_follows_the_instance_setting():
+    now = time.time()
+    r = _hashed_request("r", num_tokens=200 * 4096, arrival_time=now)
+    manager = _FakeTierManager(keys=[_chunk_key(r, c) for c in range(200)])
+    s = _make_scheduler(
+        [r], {"r": 0}, tier_warmth=True, connector=_offload_connector(manager)
+    )
+    s.TIER_PROBE_MAX_CHUNKS = 160
+    assert s._prefix_warmth(r) == 160 * 4096
+    assert manager.calls == 1
+    assert len(manager.probed[0]) == 160
 
 
 def test_tier_probe_asks_for_the_chunks_past_the_hbm_hit():

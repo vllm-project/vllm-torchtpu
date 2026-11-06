@@ -75,8 +75,13 @@ class PrefixAwareScheduler(AsyncScheduler):
     #: are not probed: they already rank as warm.
     TIER_PROBE_MIN_CHUNKS = 2
     #: Maximum tier chunks probed per request (~256K tokens at 4096 tokens/chunk),
-    #: bounding per-step store lookups on very long prompts.
+    #: bounding per-step store lookups on very long prompts. Overridden by
+    #: TPU_PREFIX_AWARE_TIER_PROBE_MAX_CHUNKS.
     TIER_PROBE_MAX_CHUNKS = 64
+    #: Seconds a request may wait before it is admitted ahead of warmer
+    #: requests, oldest first; 0 turns aging off. Overridden by
+    #: TPU_PREFIX_AWARE_MAX_WAIT_S.
+    MAX_WAIT_S = 0.0
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
@@ -85,12 +90,21 @@ class PrefixAwareScheduler(AsyncScheduler):
         self._paw_prompt_tokens = 0
         self._paw_scoring_broken = False
         self._init_tier_warmth(envs.TPU_PREFIX_AWARE_TIER_WARMTH)
+        self.TIER_PROBE_MAX_CHUNKS = envs.TPU_PREFIX_AWARE_TIER_PROBE_MAX_CHUNKS
+        self._init_aging(envs.TPU_PREFIX_AWARE_MAX_WAIT_S)
 
         logger.info(
-            "PrefixAwareScheduler ACTIVE (window=%d, tier_warmth=%s)",
+            "PrefixAwareScheduler ACTIVE (window=%d, tier_warmth=%s, "
+            "tier_probe_max_chunks=%d, max_wait_s=%g)",
             self.WINDOW,
             self._tier_warmth,
+            self.TIER_PROBE_MAX_CHUNKS,
+            self.MAX_WAIT_S,
         )
+
+    def _init_aging(self, max_wait_s: float) -> None:
+        self.MAX_WAIT_S = max(float(max_wait_s), 0.0)
+        self._paw_aged = 0
 
     def _init_tier_warmth(self, enabled: bool) -> None:
         self._tier_warmth = bool(enabled)
@@ -230,12 +244,20 @@ class PrefixAwareScheduler(AsyncScheduler):
         return self._prefix_warmth_and_tier(request)[0]
 
     def _rank_and_warmth(
-        self, request: Request
+        self, request: Request, now: float | None = None
     ) -> tuple[tuple[int, float, float], int, int]:
-        """Return ``(sort_key, warmth, tier_tokens)``. Lower sort_key admits first."""
+        """Return ``(sort_key, warmth, tier_tokens)``. Lower sort_key admits first.
+
+        A request that has waited longer than ``MAX_WAIT_S`` sorts ahead of every
+        warmer request in its priority tier, oldest first.
+        """
         warmth, tier_tokens = self._prefix_warmth_and_tier(request)
         cold_tokens = float(request.num_tokens - warmth)
         tier = _TIER_PREEMPTED if request.num_preemptions > 0 else _TIER_NORMAL
+        if self.MAX_WAIT_S > 0:
+            waited = (time.time() if now is None else now) - request.arrival_time
+            if waited > self.MAX_WAIT_S:
+                cold_tokens = -1.0
         return (tier, cold_tokens, request.arrival_time), warmth, tier_tokens
 
     def _select_waiting_queue_for_scheduling(self) -> RequestQueue | None:
@@ -251,7 +273,8 @@ class PrefixAwareScheduler(AsyncScheduler):
 
         window = list(islice(queue, self.WINDOW))
         head = window[0]
-        scored = [(self._rank_and_warmth(r), r) for r in window]
+        now = time.time()
+        scored = [(self._rank_and_warmth(r, now), r) for r in window]
         (best_rank, best_warmth, best_tier_tokens), best = min(
             scored, key=lambda t: t[0][0]
         )
@@ -265,14 +288,17 @@ class PrefixAwareScheduler(AsyncScheduler):
         self._paw_cold_tokens += max(best.num_tokens - best_warmth, 0)
         self._paw_prompt_tokens += best.num_tokens
         self._paw_tier_tokens += best_tier_tokens
+        if best_rank[1] < 0:
+            self._paw_aged += 1
 
         if self._paw_n % _LOG_EVERY == 0:
             logger.info(
                 "warmest-first: n=%d mean_cold_tokens=%.0f "
-                "cold_frac=%.3f tier_frac=%.3f queue_depth=%d",
+                "cold_frac=%.3f tier_frac=%.3f aged_frac=%.3f queue_depth=%d",
                 self._paw_n,
                 self._paw_cold_tokens / self._paw_n,
                 self._paw_cold_tokens / max(self._paw_prompt_tokens, 1),
                 self._paw_tier_tokens / max(self._paw_prompt_tokens, 1),
+                self._paw_aged / self._paw_n,
                 len(queue),
             )
