@@ -15,7 +15,7 @@ from vllm_torchtpu.megakernel.kimi_k3.kernels.prefill_moe.moe_down_valu import (
 pytestmark = pytest.mark.cpu_test
 
 
-@pytest.mark.parametrize("window", [512, 1024, 2048, 4096, 6144, 8192])
+@pytest.mark.parametrize("window", [512, 1024, 2048, 4096, 6144, 8192, 16384])
 @pytest.mark.parametrize("ep", [8, 16, 32])
 @pytest.mark.parametrize("enabled", [False, True])
 def test_factory_preserves_unsupported_shapes(monkeypatch, window, ep, enabled):
@@ -36,9 +36,44 @@ def test_factory_preserves_unsupported_shapes(monkeypatch, window, ep, enabled):
     )
     result = kernels.make_indexed_moe_sp_ring(None, seq_len=window)
     expected = "reference"
-    if enabled and ep in (8, 16) and window in (512, 1024, 2048, 4096, 8192):
+    if enabled and ep in (8, 16) and window in (512, 1024, 2048, 4096, 8192, 16384):
         expected = "fused"
     assert result == (expected, window)
+
+
+@pytest.mark.parametrize("window", [512, 1024, 2048, 4096, 6144, 8192, 16384])
+@pytest.mark.parametrize("ep", [8, 16, 32])
+@pytest.mark.parametrize("enabled", [False, True])
+def test_mixture_moe_factory_preserves_unsupported_shapes(
+    monkeypatch, window, ep, enabled
+):
+    cfg = config.KernelConfig(
+        prefill_expert_parallel=ep,
+        prefill_fused_moe=enabled,
+    )
+    monkeypatch.setattr(config, "active", lambda: cfg)
+    monkeypatch.setattr(
+        kernels,
+        "make_mixture_norm_sp",
+        lambda mesh, *, seq_len: lambda *a: jnp.int32(seq_len),
+    )
+    monkeypatch.setattr(
+        kernels,
+        "make_indexed_moe_sp_ring",
+        lambda mesh, *, seq_len: lambda h, *a: jnp.int32(100000) + h,
+    )
+    monkeypatch.setattr(
+        fused,
+        "make_indexed_mixture_moe_sp_ring",
+        lambda mesh, *, seq_len: ("fused_mix", seq_len),
+    )
+    result = kernels.make_indexed_mixture_moe_sp_ring(None, seq_len=window)
+    if enabled and ep in (8, 16) and window in (512, 1024, 2048, 4096, 8192, 16384):
+        assert result == ("fused_mix", window)
+    else:
+        assert callable(result)
+        z = jnp.int32(0)
+        assert int(result(z, z, z, z, z, z, z, z)) == 100000 + window
 
 
 def test_rollback_has_distinct_compile_cache_key():
@@ -100,7 +135,7 @@ def test_metadata_overflow_is_uniform_and_uncapped(monkeypatch, peak):
     )
 
 
-@pytest.mark.parametrize("tokens", [512, 1024, 2048, 4096, 8192])
+@pytest.mark.parametrize("tokens", [512, 1024, 2048, 4096, 8192, 16384])
 def test_fused_validity_matches_sequence_parallel_ownership(tokens):
     rows = tokens // 32
     stripe = min(rows, 64)

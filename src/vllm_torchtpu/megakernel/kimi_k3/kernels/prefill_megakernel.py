@@ -4837,13 +4837,14 @@ def expand_prefix_pages(pages, order, key_value_up):
     gathered page ``order[1 + i]`` (unified-pool layout
     ``[page_rows, packing, 640]``, lanes 0-575 the latent), up-projected
     exactly as ``mla_projections`` makes a new token's key and value. Rows
-    past the ``order[0]`` pages (rounded up to ``EXPAND_PAGES``) are never
+    past the ``order[0]`` pages (rounded up to ``expand_pages``) are never
     written: the flash kernel reads only each sequence's rows."""
     heads = key_value_up.shape[1] // 256
     page_rows, packing, lanes = pages.shape[1:]
     page_tokens = page_rows * packing
-    span = EXPAND_PAGES * page_tokens
     capacity = (order.shape[0] - 1) * page_tokens
+    expand_pages = 16 if capacity % (16 * page_tokens) == 0 else EXPAND_PAGES
+    span = expand_pages * page_tokens
     if capacity % span:
         raise ValueError(f"the prefix capacity must be a multiple of {span} tokens")
     hbm = pl.BlockSpec(memory_space=pltpu.HBM)
@@ -4857,7 +4858,7 @@ def expand_prefix_pages(pages, order, key_value_up):
             in_specs=[hbm, pl.BlockSpec(memory_space=pltpu.VMEM)],
             out_specs=(hbm, hbm),
             scratch_shapes=(
-                pltpu.VMEM((2, EXPAND_PAGES, page_rows, packing, lanes), pages.dtype),
+                pltpu.VMEM((2, expand_pages, page_rows, packing, lanes), pages.dtype),
                 pltpu.VMEM((2, heads, span, 256), out_dtype),
                 pltpu.VMEM((2, heads, 128, span), out_dtype),
                 pltpu.SemaphoreType.DMA((3, 2)),
@@ -6069,6 +6070,34 @@ def make_indexed_moe_sp_ring(mesh, *, seq_len=8192):
     return _make_indexed_moe_sp_ring_reference(mesh, seq_len=seq_len)
 
 
+def make_indexed_mixture_moe_sp_ring(mesh, *, seq_len=8192):
+    """Select a fused residual-mixture + RMSNorm + MoE layer when available."""
+    from ..config import active
+
+    cfg = active()
+    if (
+        cfg.prefill_fused_moe
+        and cfg.prefill_expert_parallel in (8, 16)
+        and seq_len in (512, 1024, 2048, 4096, 8192, 16384)
+    ):
+        from .prefill_moe.fused import (
+            make_indexed_mixture_moe_sp_ring as make_packed_mix_moe,
+        )
+
+        return make_packed_mix_moe(mesh, seq_len=seq_len)
+    mixture = make_mixture_norm_sp(mesh, seq_len=seq_len)
+    moe = make_indexed_moe_sp_ring(mesh, seq_len=seq_len)
+    return jax.jit(
+        lambda prefix, blocks, mlp_res, ffn_norm, mix_active, families, length, slot: moe(
+            mixture(prefix, blocks, mlp_res, ffn_norm, mix_active),
+            prefix,
+            families,
+            length,
+            slot,
+        )
+    )
+
+
 def _make_indexed_moe_sp_ring_reference(mesh, *, seq_len=8192):
     """SparseCore gather/combine path, for shapes the fused MoE does not cover
     or with ``prefill_fused_moe`` off."""
@@ -6591,7 +6620,6 @@ def make_regular_group4_sp_indexed(mesh, *, seq_len=8192, segments, prefix_capac
         raise ValueError("indexed four-layer group requires flat k3_sp TP32")
     check_window(seq_len, "indexed four-layer group")
     sharding = NamedSharding(mesh, P("k3_sp"))
-    mixture = make_mixture_norm_sp(mesh, seq_len=seq_len)
     norm_gather = make_norm_gather_sp(mesh, seq_len=seq_len, return_normalized=False)
     kda = make_norm_gather_kda_sp(mesh, seq_len=seq_len, segments=segments)
     kda_outputs = (3, 4, 6, 7)  # rec, hist, rec_at, hist_at in the KDA op's result
@@ -6599,7 +6627,7 @@ def make_regular_group4_sp_indexed(mesh, *, seq_len=8192, segments, prefix_capac
         mesh, seq_len=seq_len, flash_tile=mla_flash_tile, segments=segments,
         prefix_capacity=prefix_capacity,
     )
-    moe = make_indexed_moe_sp_ring(mesh, seq_len=seq_len)
+    mixture_moe = make_indexed_mixture_moe_sp_ring(mesh, seq_len=seq_len)
 
     def choose(family, slot):
         return jax.lax.dynamic_index_in_dim(
@@ -6654,13 +6682,20 @@ def make_regular_group4_sp_indexed(mesh, *, seq_len=8192, segments, prefix_capac
                 mla_cache = tuple(
                     put_state(family, update, slot)
                     for family, update in zip(mla_cache, updates, strict=True))
-            ffn_input = mixture(
-                after_attention, blocks, choose(common["mlp_res"], index),
-                choose(common["ffn_norm"], index), scalar(index // 12 + 1),
+            prefix, route = _route_update(
+                mixture_moe(
+                    after_attention,
+                    blocks,
+                    choose(common["mlp_res"], index),
+                    choose(common["ffn_norm"], index),
+                    scalar(index // 12 + 1),
+                    moe_families,
+                    length,
+                    scalar(index - 1),
+                ),
+                route,
+                index - 1,
             )
-            prefix, route = _route_update(moe(
-                ffn_input, after_attention, moe_families, length, scalar(index - 1),
-            ), route, index - 1)
         if route is not None:
             return prefix, blocks, kda_states, mla_cache, tap, route
         return prefix, blocks, kda_states, mla_cache, tap
@@ -6844,12 +6879,11 @@ def make_final_mla_sp_indexed(
         ))
 
     norm_gather = make_norm_gather_sp(mesh, seq_len=seq_len, return_normalized=False)
-    mixture = make_mixture_norm_sp(mesh, seq_len=seq_len)
     mla = make_indexed_mla_layer_sp_ring(
         mesh, seq_len=seq_len, flash_tile=mla_flash_tile, segments=segments,
         prefix_capacity=prefix_capacity,
     )
-    moe = make_indexed_moe_sp_ring(mesh, seq_len=seq_len)
+    mixture_moe = make_indexed_mixture_moe_sp_ring(mesh, seq_len=seq_len)
 
     def run(prefix, blocks, common, mla_families, moe_families,
             mla_state, length, segment_desc, arena, route=None):
@@ -6869,14 +6903,20 @@ def make_final_mla_sp_indexed(
             jax.lax.dynamic_update_slice(
                 family, update[:, None], (0, 23, *([0] * (family.ndim - 2))))
             for family, update in zip(mla_state, updates, strict=True))
-        ffn_input = mixture(
-            after_attention, blocks, common["mlp_res"][:, 92],
-            common["ffn_norm"][:, 92], active,
+        prefix, route = _route_update(
+            mixture_moe(
+                after_attention,
+                blocks,
+                common["mlp_res"][:, 92],
+                common["ffn_norm"][:, 92],
+                active,
+                moe_families,
+                length,
+                jnp.asarray([91], jnp.int32),
+            ),
+            route,
+            91,
         )
-        prefix, route = _route_update(moe(
-            ffn_input, after_attention, moe_families, length,
-            jnp.asarray([91], jnp.int32),
-        ), route, 91)
         if route is not None:
             return prefix, blocks, mla_cache, route
         return prefix, blocks, mla_cache
@@ -6927,7 +6967,7 @@ def make_prefill_stack_sp_indexed(mesh, *, seq_len=8192, depth=93, segments, pre
         mesh, seq_len=seq_len, flash_tile=mla_flash_tile, segments=segments,
         prefix_capacity=prefix_capacity,
     )
-    moe = make_indexed_moe_sp_ring(mesh, seq_len=seq_len)
+    mixture_moe = make_indexed_mixture_moe_sp_ring(mesh, seq_len=seq_len)
     dense = make_dense_ffn_sp(mesh, seq_len=seq_len)
 
     def choose(family, slot):
@@ -7014,13 +7054,20 @@ def make_prefill_stack_sp_indexed(mesh, *, seq_len=8192, depth=93, segments, pre
                 (index % 4 == 3) | (index == 92), mla_branch, kda_branch,
                 (kda_states, mla_cache),
             )
-            ffn_input = mixture(
-                after_attention, blocks, choose(common["mlp_res"], index),
-                choose(common["ffn_norm"], index), active(index // 12 + 1),
+            prefix, route = _route_update(
+                mixture_moe(
+                    after_attention,
+                    blocks,
+                    choose(common["mlp_res"], index),
+                    choose(common["ffn_norm"], index),
+                    active(index // 12 + 1),
+                    moe_families,
+                    length,
+                    active(index - 1),
+                ),
+                route,
+                index - 1,
             )
-            prefix, route = _route_update(moe(
-                ffn_input, after_attention, moe_families, length, active(index - 1),
-            ), route, index - 1)
             return prefix, blocks, kda_states, mla_cache, tap, route
 
         result = jax.lax.fori_loop(

@@ -642,6 +642,7 @@ def _prologue(
     *,
     counts_ready,
     metadata_ready,
+    pair_buf=None,
 ):
     """Router, latent projection and shared experts, with incremental collectives.
 
@@ -650,7 +651,11 @@ def _prologue(
     allocated. The initial HBM input load targets our half of the peer buffer;
     both the router and shared expert use this same copy.
     """
-    rows, hidden_size = hidden.shape
+    if hidden is None:
+        assert pair_buf is not None
+        rows, hidden_size = pair_buf.shape[0] // 2, pair_buf.shape[1]
+    else:
+        rows, hidden_size = hidden.shape
     rank = jax.lax.axis_index("k3_sp")
     parity, peer = rank % 2, rank ^ 1
     family = control[1]
@@ -663,23 +668,30 @@ def _prologue(
     vmem, dma = pltpu.VMEM, pltpu.SemaphoreType.DMA
 
     def body(s):
-        own = s["pair"].at[pl.ds(parity * rows, rows), :]
+        pair_v = pair_buf if pair_buf is not None else s["pair"]
+        own = pair_v.at[pl.ds(parity * rows, rows), :]
         if rows == 256:
             buffers = tuple(s["router_gu"].at[:, pl.ds(i * 256, 256)] for i in range(4))
             router_v = s["router_gu"].at[:, :896]
         else:
             buffers, router_v = s["gu_buffers"], s["router"]
-        copy = pltpu.make_async_copy(hidden, own, s["input_sem"])
+        copy = (
+            pltpu.make_async_copy(hidden, own, s["input_sem"])
+            if pair_buf is None
+            else None
+        )
         router_copy = pltpu.make_async_copy(router, router_v, s["gu_sems"][0])
         bias_copy = pltpu.make_async_copy(bias, s["bias"], s["gu_sems"][1])
-        copy.start()
+        if copy is not None:
+            copy.start()
         router_copy.start()
         bias_copy.start()
         _enter_mesh()
         pl.semaphore_signal(
             s["peer_credit"], 1, device_id=peer, device_id_type=pl.DeviceIdType.LOGICAL
         )
-        copy.wait()
+        if copy is not None:
+            copy.wait()
         pl.semaphore_wait(s["peer_credit"], 1)
         peer_input = pltpu.make_async_remote_copy(
             own,
@@ -843,7 +855,7 @@ def _prologue(
                 gu_copy(panel + 1, 0, gate_buffers, gate_sems).start()
                 gu_copy(panel + 1, 3072, up_buffers, up_sems).start()
             for row in (0, rows):
-                lhs = s["pair"][pl.ds(row, rows), :]
+                lhs = pair_v[pl.ds(row, rows), :]
                 gate = jnp.matmul(
                     lhs, gate_buffers[bank][...], preferred_element_type=jnp.float32
                 )
@@ -920,7 +932,7 @@ def _prologue(
                 pass
 
     scratch = dict(
-        pair=vmem((2 * rows, hidden_size), jnp.bfloat16),
+        pair=vmem((2 * rows, hidden_size), jnp.bfloat16) if pair_buf is None else None,
         router=vmem((hidden_size, 896), jnp.bfloat16) if rows <= 128 else None,
         router_gu=vmem((hidden_size, 1024), jnp.bfloat16) if rows == 256 else None,
         gu_buffers=tuple(vmem((hidden_size, 256), jnp.bfloat16) for _ in range(4))
@@ -928,7 +940,7 @@ def _prologue(
         else (),
         gu_sems=tuple(dma for _ in range(4)),
         bias=vmem((1, 896), jnp.float32),
-        input_sem=dma,
+        input_sem=dma if pair_buf is None else None,
         peer_send=dma,
         peer_recv=dma,
         peer_credit=pltpu.SemaphoreType.REGULAR,
@@ -1434,8 +1446,8 @@ def _routed_experts(
             )
             refs = (gu, w, middle.reshape(-1, sub, mid_width))
             scratches = (metadata, gu_partial, acts, act_sems)
-            if tokens == 8192:
-                # The 8K schedule already fills VMEM; retain its compact buffers.
+            if tokens == 8192 and mid_width != 768:
+                # The EP16 8K schedule fills VMEM; retain its compact buffers.
                 pltpu.emit_pipeline(joint, **specs)(*refs, scratches=scratches)
                 return
 
@@ -2103,6 +2115,7 @@ def _layer_kernel(
     fallback_shared=None,
     maximum=None,
     route_counts=None,
+    mixture_refs=None,
 ):
     """One launch owns all compute, metadata and communication on the fast path.
 
@@ -2110,7 +2123,7 @@ def _layer_kernel(
     shared output and the scalar routing metadata survive that boundary. At 8K
     all ranks take the same overflow branch; no routes are dropped to fit SMEM.
     """
-    rows = hidden.shape[0]
+    rows, hidden_size = prefix.shape if hidden is None else hidden.shape
     tokens = rows * 32
     local_experts = expert_gu.shape[1]
     capacity = tokens * 16 if tokens < 8192 else _COMPACT_8K_CAPACITY
@@ -2142,12 +2155,64 @@ def _layer_kernel(
                 s["prob_sem"],
             )
 
-        def prepare(ids_v, probs_v):
+        def prepare(ids_v, probs_v, pair_v=None):
             indices = pltpu.make_async_copy(
-                ids_v.at[: capacity // 128, :], s["ids"], s["index_sem"])
+                ids_v.at[: capacity // 128, :], s["ids"], s["index_sem"]
+            )
+
             def metadata_ready():
                 indices.start()
                 probability_copy(probs_v).start()
+
+            if mixture_refs is not None:
+                assert pair_v is not None
+                blocks_ref, mlp_res_ref, ffn_norm_ref = mixture_refs
+                mix_tile = min(128, rows)
+                parity = jax.lax.axis_index("k3_sp") % 2
+                own = pair_v.at[pl.ds(parity * rows, rows), :]
+                mix_specs = k.mixture_norm_tiled_scratch_shapes(
+                    hidden_size, mix_tile, store_output=False
+                )
+
+                def run_mix(*mix_s):
+                    (
+                        prefix_bufs,
+                        block_buf,
+                        numerator_buf,
+                        row_max_buf,
+                        row_sum_buf,
+                        folded_buf,
+                        norm_buf,
+                        prefix_sems,
+                        block_sem,
+                        weight_sems,
+                    ) = mix_s
+                    k.mixture_norm_tiled_body(
+                        control[2],
+                        prefix,
+                        blocks_ref,
+                        mlp_res_ref,
+                        ffn_norm_ref,
+                        None,
+                        prefix_bufs,
+                        block_buf,
+                        None,
+                        numerator_buf,
+                        row_max_buf,
+                        row_sum_buf,
+                        folded_buf,
+                        norm_buf,
+                        prefix_sems,
+                        block_sem,
+                        None,
+                        weight_sems,
+                        tile=mix_tile,
+                        eps=1e-5,
+                        output_vmem_ref=own,
+                    )
+
+                pl.run_scoped(run_mix, *mix_specs)
+
             _prologue(
                 tables,
                 control,
@@ -2165,6 +2230,7 @@ def _layer_kernel(
                 maximum,
                 counts_ready=counts_ready,
                 metadata_ready=metadata_ready,
+                pair_buf=pair_v,
             )
             count_copy().wait()
             if route_counts is not None:
@@ -2192,13 +2258,22 @@ def _layer_kernel(
             if tokens == 8192:
                 probability_copy(probs_v).wait()
 
+        pair_spec = (
+            (vmem((2 * rows, hidden_size), jnp.bfloat16),)
+            if mixture_refs is not None
+            else ()
+        )
         if tokens == 8192:
             # The compact path completes both metadata DMAs before expert work.
             # Reclaim the full probability array (512 KiB) for expert scratch.
-            pl.run_scoped(prepare, vmem(shape, jnp.int32), vmem(shape, jnp.float32))
+            pl.run_scoped(
+                prepare, vmem(shape, jnp.int32), vmem(shape, jnp.float32), *pair_spec
+            )
         else:
             pl.run_scoped(
-                lambda ids: prepare(ids, s["probs_v"]), vmem(shape, jnp.int32)
+                lambda ids, *extra: prepare(ids, s["probs_v"], *extra),
+                vmem(shape, jnp.int32),
+                *pair_spec,
             )
 
         def probabilities_ready():
@@ -2258,15 +2333,25 @@ def _layer_kernel(
 
 
 def make_indexed_moe_sp_ring(mesh, *, seq_len=8192):
-    """Build the fused EP16/TP2 prefill MoE for a supported serving window.
+    """Build the fused prefill MoE for a supported serving window."""
+    return _build_indexed_moe_sp_ring(mesh, seq_len=seq_len, with_mixture=False)
+
+
+def make_indexed_mixture_moe_sp_ring(mesh, *, seq_len=8192):
+    """Build the fused residual-mixture + RMSNorm + prefill MoE."""
+    return _build_indexed_moe_sp_ring(mesh, seq_len=seq_len, with_mixture=True)
+
+
+def _build_indexed_moe_sp_ring(mesh, *, seq_len=8192, with_mixture=False):
+    """Build the fused EP8/EP16 prefill MoE for a supported serving window.
 
     Inputs follow the prefill layer interface: rank-sharded normalized hidden
-    states, residual prefix, resident weight families, valid length and family
-    index. All fast-path operations execute in one Pallas kernel. Rare 8K route
-    overflow uses the uncapped production expert path with the same metadata.
+    states (or residual blocks + mixture/norm weights when ``with_mixture`` is
+    True), residual prefix, resident weight families, valid length and family
+    index. All fast-path operations execute in one Pallas kernel per 8K half.
     """
     if seq_len == 16384:
-        return _make_moe_16k(mesh)
+        return _make_moe_16k(mesh, with_mixture=with_mixture)
     if seq_len not in (512, 1024, 2048, 4096, 8192):
         raise ValueError(
             "Fused prefill MoE supports 512, 1024, 2048, 4096, 8192 and 16384 token windows"
@@ -2313,16 +2398,31 @@ def make_indexed_moe_sp_ring(mesh, *, seq_len=8192):
         for idx in (8, 9, 10, 11):
             if refs[idx].shape[1] != local_experts:
                 refs[idx] = refs[idx].at[:, pl.ds(0, local_experts)]
+        mix_refs = None
+        if with_mixture:
+            blocks_ref = refs[2]
+            refs[2] = None
+            ffn_norm_ref = refs.pop(16)
+            mlp_res_ref = refs.pop(15)
+            mix_refs = (blocks_ref, mlp_res_ref, ffn_norm_ref)
         if counting:
-            return _layer_kernel(*refs[:-1], route_counts=refs[-1])
-        return _layer_kernel(*refs)
+            return _layer_kernel(
+                *refs[:-1], route_counts=refs[-1], mixture_refs=mix_refs
+            )
+        return _layer_kernel(*refs, mixture_refs=mix_refs)
 
+    num_hbm_inputs = 15 if with_mixture else 13
+    kernel_name = (
+        f"fused_mixture_moe_pallas_{seq_len}"
+        if with_mixture
+        else f"fused_moe_pallas_{seq_len}"
+    )
     kernel = pl.pallas_call(
         body,
         out_shape=tuple(jax.ShapeDtypeStruct(s, d) for s, d in workspace_shapes),
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=2,
-            in_specs=(hbm,) * 13,
+            in_specs=(hbm,) * num_hbm_inputs,
             out_specs=tuple(output_specs),
         ),
         compiler_params=pltpu.CompilerParams(
@@ -2331,23 +2431,49 @@ def make_indexed_moe_sp_ring(mesh, *, seq_len=8192):
             disable_bounds_checks=True,
             shape_invariant_numerics=False,
         ),
-        name=f"fused_moe_pallas_{seq_len}",
+        name=kernel_name,
+    )
+
+    in_specs = (
+        (
+            P("k3_sp"),
+            P("k3_sp"),
+            P("k3_sp"),
+            P("k3_sp"),
+            P(),
+            P("k3_sp"),
+            P(),
+            P(),
+        )
+        if with_mixture
+        else (P("k3_sp"), P("k3_sp"), P("k3_sp"), P(), P())
     )
 
     @functools.partial(
         jax.shard_map,
         mesh=mesh,
-        in_specs=(P("k3_sp"), P("k3_sp"), P("k3_sp"), P(), P()),
+        in_specs=in_specs,
         out_specs=(P("k3_sp"), P("k3_sp")) if counting else P("k3_sp"),
         check_vma=False,
     )
-    def local(hidden, prefix, families, length, slot):
+    def local(*args):
+        if with_mixture:
+            prefix, blocks, mlp_res, ffn_norm, active, families, length, slot = args
+            control = jnp.concatenate(
+                (length.reshape(1), slot.reshape(1), active.reshape(1))
+            )
+            first_arg = blocks[0]
+            tail_args = (mlp_res[0], ffn_norm[0])
+        else:
+            hidden, prefix, families, length, slot = args
+            control = jnp.concatenate((length.reshape(1), slot.reshape(1)))
+            first_arg = hidden[0]
+            tail_args = ()
         w = {name: value[0] for name, value in families.items()}
-        control = jnp.concatenate((length.reshape(1), slot.reshape(1)))
         outputs = kernel(
             jnp.asarray(tables),
             control,
-            hidden[0],
+            first_arg,
             w["router"],
             w["router_bias"],
             w["latent_down"],
@@ -2360,6 +2486,7 @@ def make_indexed_moe_sp_ring(mesh, *, seq_len=8192):
             w["latent_norm"],
             w["latent_up"],
             prefix[0],
+            *tail_args,
         )
         routes = None
         if counting:
@@ -2407,13 +2534,14 @@ def make_indexed_moe_sp_ring(mesh, *, seq_len=8192):
     return jax.jit(local)
 
 
-def _make_moe_16k(mesh):
+def _make_moe_16k(mesh, *, with_mixture=False):
     """The 16K window as two 8K fused launches over the full rank rows.
 
-    Each launch reads and writes its 256-row half of the [512, 7168] hidden,
-    residual and output in place (the second aliases the first's output), so
-    the window is never split or concatenated in HBM. Routes that overflow
-    the compact 8K capacity fall back per half, as in the 8K op.
+    Each launch reads and writes its 256-row half of the [512, 7168] hidden
+    (or [8, 512, 7168] blocks when ``with_mixture`` is True), residual and
+    output in place (the second aliases the first's output), so the window is
+    never split or concatenated in HBM. Routes that overflow the compact 8K
+    capacity fall back per half, as in the 8K op.
     """
     if mesh.size != 32 or tuple(mesh.axis_names) != ("k3_sp",):
         raise ValueError("Fused prefill MoE requires a flat 32-rank k3_sp mesh")
@@ -2449,7 +2577,10 @@ def _make_moe_16k(mesh):
     if counting:
         workspace_shapes += [((local_experts,), jnp.int32)]
         output_specs += [pl.BlockSpec(memory_space=pltpu.SMEM)]
-    inputs = 13  # after the two scalar-prefetch operands
+    inputs = 15 if with_mixture else 13  # after the two scalar-prefetch operands
+    kernel_name = (
+        "fused_mixture_moe_pallas_8192" if with_mixture else "fused_moe_pallas_8192"
+    )
 
     def make_kernel(half):
         aliased = half == 1
@@ -2459,14 +2590,26 @@ def _make_moe_16k(mesh):
             if aliased:
                 del refs[2 + inputs]  # the first launch's output, aliased below
             own = pl.ds(half * rows, rows)
-            for index in (2, 1 + inputs, 2 + inputs):  # hidden, prefix, output
-                refs[index] = refs[index].at[own]
             for idx in (8, 9, 10, 11):  # expert_gu, expert_gus, expert_down, expert_ds
                 if refs[idx].shape[1] != local_experts:
                     refs[idx] = refs[idx].at[:, pl.ds(0, local_experts)]
+            mix_refs = None
+            if with_mixture:
+                blocks_ref = refs[2].at[:, own]
+                refs[2] = None
+                refs[14] = refs[14].at[own]
+                refs[2 + inputs] = refs[2 + inputs].at[own]
+                ffn_norm_ref = refs.pop(16)
+                mlp_res_ref = refs.pop(15)
+                mix_refs = (blocks_ref, mlp_res_ref, ffn_norm_ref)
+            else:
+                for index in (2, 1 + inputs, 2 + inputs):  # hidden, prefix, output
+                    refs[index] = refs[index].at[own]
             if counting:
-                return _layer_kernel(*refs[:-1], route_counts=refs[-1])
-            return _layer_kernel(*refs)
+                return _layer_kernel(
+                    *refs[:-1], route_counts=refs[-1], mixture_refs=mix_refs
+                )
+            return _layer_kernel(*refs, mixture_refs=mix_refs)
 
         return pl.pallas_call(
             body,
@@ -2483,22 +2626,45 @@ def _make_moe_16k(mesh):
                 disable_bounds_checks=True,
                 shape_invariant_numerics=False,
             ),
-            name="fused_moe_pallas_8192",
+            name=kernel_name,
         )
 
     kernels = (make_kernel(0), make_kernel(1))
+    in_specs = (
+        (
+            P("k3_sp"),
+            P("k3_sp"),
+            P("k3_sp"),
+            P("k3_sp"),
+            P(),
+            P("k3_sp"),
+            P(),
+            P(),
+        )
+        if with_mixture
+        else (P("k3_sp"), P("k3_sp"), P("k3_sp"), P(), P())
+    )
 
     @functools.partial(
         jax.shard_map,
         mesh=mesh,
-        in_specs=(P("k3_sp"), P("k3_sp"), P("k3_sp"), P(), P()),
+        in_specs=in_specs,
         out_specs=(P("k3_sp"), P("k3_sp")) if counting else P("k3_sp"),
         check_vma=False,
     )
-    def local(hidden, prefix, families, length, slot):
+    def local(*args):
+        if with_mixture:
+            prefix, blocks, mlp_res, ffn_norm, active, families, length, slot = args
+            first_arg = blocks[0]
+            tail_args = (mlp_res[0], ffn_norm[0])
+        else:
+            hidden, prefix, families, length, slot = args
+            active = None
+            first_arg = hidden[0]
+            tail_args = ()
         w = {name: value[0] for name, value in families.items()}
         operands = (
-            hidden[0],
+            first_arg,
             w["router"],
             w["router_bias"],
             w["latent_down"],
@@ -2511,11 +2677,18 @@ def _make_moe_16k(mesh):
             w["latent_norm"],
             w["latent_up"],
             prefix[0],
+            *tail_args,
         )
         lengths = (jnp.minimum(length, tokens), jnp.maximum(length - tokens, 0))
         halves, routes, previous = [], None, ()
         for half, kernel in enumerate(kernels):
-            control = jnp.concatenate((lengths[half].reshape(1), slot.reshape(1)))
+            if with_mixture:
+                assert active is not None
+                control = jnp.concatenate(
+                    (lengths[half].reshape(1), slot.reshape(1), active.reshape(1))
+                )
+            else:
+                control = jnp.concatenate((lengths[half].reshape(1), slot.reshape(1)))
             outputs = kernel(jnp.asarray(tables), control, *operands, *previous)
             if counting:
                 *outputs, counted = outputs

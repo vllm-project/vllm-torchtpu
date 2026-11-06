@@ -663,7 +663,7 @@ class PrefillProgram:
             (
                 "prefill",
                 "moe-bank8" if self._expert_banks else "moe-global",
-                "moe-fused" if fused_moe else "moe-ref",
+                "moe-mix-fused-v2" if fused_moe else "moe-ref",
                 "draft" if self.has_draft else "no-draft",
                 "logits" if self.compute_logits else "no-logits",
                 op,
