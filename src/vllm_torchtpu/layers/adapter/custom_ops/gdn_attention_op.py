@@ -634,8 +634,14 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         vllm_context = get_vllm_model_wrapper_context()
         if vllm_context.vllm_config is None:
             return False
-        parallel_config = cast(VllmConfig, vllm_context.vllm_config).parallel_config
-        return parallel_config.prefill_context_parallel_size > 1
+        from vllm_torchtpu.distributed.pcp import pcp_splits_tokens
+
+        vllm_config = cast(VllmConfig, vllm_context.vllm_config)
+        # A model that keeps whole steps under PCP (Qwen4Exp) runs the plain op.
+        return (
+            vllm_config.parallel_config.prefill_context_parallel_size > 1
+            and pcp_splits_tokens(vllm_config)
+        )
 
     def _build_gdn_op(self, *, pcp_streaming: bool = False):
         local_num_v_heads = self.num_v_heads // self.tp_size
