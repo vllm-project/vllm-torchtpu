@@ -27,7 +27,10 @@ from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.model_loader import get_model_loader
 
 from vllm_torchtpu.layers.adapter import token_padding
-from vllm_torchtpu.layers.adapter.attention import PallasAttentionBackendImpl
+from vllm_torchtpu.layers.adapter.attention import (
+    PallasAttentionBackendImpl,
+    PallasBatchedRPAAttentionBackendImpl,
+)
 from vllm_torchtpu.layers.core.attention_metadata import (
     AttentionMetadata,
     AttentionMetadataBuilderContext,
@@ -160,11 +163,50 @@ class DFlashProposer:
                 )
                 * self.block_size
             )
+            # Every request holds exactly block_size queries, so a batched-RPA
+            # draft can take the DECODE stage; otherwise route all to MIXED.
+            num_decode = padded_num_reqs if self._draft_uses_decode_stage() else 0
             rd = torch.tensor(
-                [0, 0, padded_num_reqs], dtype=torch.int32, device=self.runner.device
+                [num_decode, num_decode, padded_num_reqs],
+                dtype=torch.int32,
+                device=self.runner.device,
             )
             self._static_attn_tensors_cache[padded_num_reqs] = (qsl, rd)
         return self._static_attn_tensors_cache[padded_num_reqs]
+
+    def _draft_attn_impls(self) -> list[PallasAttentionBackendImpl]:
+        assert self.draft_model is not None
+        impls = []
+        for layer in self.draft_model.model.layers:
+            sub_attn = getattr(layer, "self_attn", None)
+            attn_obj = getattr(sub_attn, "attn", None) if sub_attn is not None else None
+            impl = getattr(attn_obj, "impl", None)
+            if isinstance(impl, PallasAttentionBackendImpl):
+                impls.append(impl)
+        return impls
+
+    def _draft_uses_decode_stage(self) -> bool:
+        """Whether the draft forward can route its requests to the DECODE stage.
+
+        Batched RPA's DECODE stage takes exactly `decode_query_size` queries per
+        request; for these short requests it is much faster than the MIXED
+        stage, which pads each request to a prefill-sized query tile. Only every
+        draft layer running the batched kernel with a DECODE tile one draft
+        block wide qualifies. RPA v3's DECODE stage takes one query, hd64 layers
+        reroute to RPA v3, and DSpark's block (K) is narrower than the K + 1
+        tile. A replicated draft also fails the check: the runner moves it to
+        the local RPA v3 kernel and sets its decode_query_size to 1, after this
+        proposer initializes its kernels, so it is checked here, at first use.
+        """
+        impls = self._draft_attn_impls()
+        batched_entry = PallasBatchedRPAAttentionBackendImpl._kernel_entry
+        return bool(impls) and all(
+            isinstance(impl, PallasBatchedRPAAttentionBackendImpl)
+            and impl._kernel_entry is batched_entry
+            and impl.rpa_kernel is not None
+            and impl.decode_query_size == self.block_size
+            for impl in impls
+        )
 
     bucketed_drafts = True
 
