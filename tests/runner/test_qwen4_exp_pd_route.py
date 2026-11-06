@@ -323,3 +323,11 @@ def test_routed_spans_and_layout_on_the_connector():
     assert pc._routed_layout(prod_layout, GEO) == pc._routed_layout(cons_layout, GEO)
     other = rt.RouteGeometry(**{**GEO.__dict__, "dcp": 4})
     assert pc._routed_layout(prod_layout, GEO) != pc._routed_layout(cons_layout, other)
+
+
+def test_route_env_takes_commas_or_colons():
+    # Recipes pass server env as a comma-separated list, so launchers write "8:4:512".
+    assert rt.parse_route_env("8,4,512") == rt.parse_route_env(" 8:4:512 ") == (8, 4, 512)
+    assert rt.parse_route_env("") is None
+    with pytest.raises(ValueError):
+        rt.parse_route_env("8:4")

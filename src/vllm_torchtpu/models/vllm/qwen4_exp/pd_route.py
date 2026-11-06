@@ -87,11 +87,15 @@ class RouteGeometry:
 
 
 def parse_route_env(value: str | None) -> tuple[int, int, int] | None:
-    """``"<decode tp>,<decode dcp>,<decode block>"`` or empty (routing off)."""
+    """``"<decode tp>,<decode dcp>,<decode block>"`` or empty (routing off).
+
+    ``":"`` separates too: the recipes' comma-separated ``*_EXTRA_SERVER_ENV``
+    lists cannot carry a comma inside a value.
+    """
     value = (value or "").strip()
     if not value:
         return None
-    parts = [int(x) for x in value.split(",")]
+    parts = [int(x) for x in value.replace(":", ",").split(",")]
     if len(parts) != 3 or min(parts) <= 0:
         raise ValueError(f"QWEN4_EXP_PD_ROUTED_DST must be 'tp,dcp,block', got {value!r}")
     return parts[0], parts[1], parts[2]
