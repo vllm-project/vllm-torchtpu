@@ -68,6 +68,7 @@ if TYPE_CHECKING:
     QWEN4_EXP_PD_ROUTED_DST: str = ""
     QWEN4_EXP_PD_SYNC_REPACK: bool = False
     QWEN4_EXP_PD_SYNC_REPACK_AB_S: int = 0
+    QWEN4_EXP_PD_SHARED_COMPRESSED: bool = False
     QWEN4_EXP_PD_BATCHED_ADMISSION: bool = False
     QWEN4_EXP_PD_BATCHED_ADMISSION_AB_PASSES: int = 0
     QWEN4_EXP_PD_BATCHED_ADMISSION_CHECK: int = 0
@@ -1148,6 +1149,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # on in odd periods of this many seconds, so one serving job measures
     # both arms on the same engines (an in-job A/B). Overrides the switch.
     "QWEN4_EXP_PD_SYNC_REPACK_AB_S": env_int("QWEN4_EXP_PD_SYNC_REPACK_AB_S", 0),
+    # Both legs (q38 XFER S4): a staged decode's compressed-key pairs cross
+    # once per decode host instead of once per rank. Page b of a tag's pair
+    # space goes to rank b % TP; the ranks all-gather them in the L1-named
+    # step (models/vllm/qwen4_exp/pd_shared_compressed.py; needs
+    # QWEN4_EXP_PD_SYNC_REPACK=1). Ported from the Qwen3.5 head-unique
+    # transfer (3eeddf339).
+    "QWEN4_EXP_PD_SHARED_COMPRESSED": env_bool("QWEN4_EXP_PD_SHARED_COMPRESSED"),
     # Stage-3 destination admission in ONE TP collective per connector pass
     # (distributed/kv_transfer/stage3_admission.py) instead of a free-map
     # all-reduce per load plus an expiry all-reduce per load that does not fit:
