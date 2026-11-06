@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import dataclasses
+import functools
 
 import jax
 import jax.numpy as jnp
@@ -20,6 +21,10 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.kernels.experimental.batched_rpa import configs, schedule
+
+# Decode steps whose every lane fetches a full cache block issue the page copies
+# with static offsets and sizes. Module-level for tests.
+_STATIC_FULL_BLOCK_COPIES = True
 
 
 def _page_id(page_indices_ref, logical_page, cfgs):
@@ -96,7 +101,59 @@ class KVBufferedRefSeqAlongLane(_BypassRef):
         block_idx = jnp.maximum(grid_indices[0], 0)
 
         vmem_dst_lane = self.window_ref.at[slot]
+        copy_pages = functools.partial(
+            self._copy_pages,
+            kv_cache_hbm,
+            new_kv_hbm,
+            schedule_ref,
+            page_indices_ref,
+            vmem_dst_lane,
+            sem,
+            block_idx,
+        )
+        if not _STATIC_FULL_BLOCK_COPIES or self.cfgs.mode != configs.RpaCase.DECODE:
+            copy_pages(full_blocks=False)
+            return
+        # When every lane fetches all bkv_p_cache pages and no new tokens, the
+        # copies have static sizes and offsets: skip their per-page lookups.
+        full = None
         for b in range(self.cfgs.batch_size):
+            last_page = schedule_ref.dma_kv_cache[
+                block_idx, b, self.cfgs.bkv_p_cache - 1, 2
+            ]
+            no_new = schedule_ref.dma_kv_new[block_idx, b, 0].fetch_val == 0
+            lane_full = (last_page == 1) & no_new
+            full = lane_full if full is None else full & lane_full
+        jax.lax.cond(
+            full,
+            functools.partial(copy_pages, full_blocks=True),
+            functools.partial(copy_pages, full_blocks=False),
+        )
+
+    def _copy_pages(
+        self,
+        kv_cache_hbm: jax.Ref,
+        new_kv_hbm: jax.Ref,
+        schedule_ref: schedule.RpaSchedule,
+        page_indices_ref: jax.Ref,
+        vmem_dst_lane: jax.Ref,
+        sem: jax.Ref,
+        block_idx: jax.Array,
+        *,
+        full_blocks: bool,
+    ):
+        page_size = self.cfgs.serve.page_size
+        for b in range(self.cfgs.batch_size):
+            if full_blocks:
+                for i in range(self.cfgs.bkv_p_cache):
+                    p_idx = schedule_ref.dma_kv_cache[block_idx, b, i, 0]
+                    hbm_p_idx = _page_id(page_indices_ref, p_idx, self.cfgs)
+                    pltpu.make_async_copy(
+                        kv_cache_hbm.at[hbm_p_idx],
+                        vmem_dst_lane.at[b, :, :, :, pl.ds(i * page_size, page_size)],
+                        sem,
+                    ).start()
+                continue
             for i in range(self.cfgs.bkv_p_cache):
                 p_idx, dst_off, dma_valid = schedule_ref.get_dma_kv_cache(
                     block_idx, b, i
