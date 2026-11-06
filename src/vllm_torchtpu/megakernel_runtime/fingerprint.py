@@ -185,6 +185,13 @@ def plugin_fingerprint(
         "config": dict(config),
         "raw_env": raw_env,
     }
+    for hook_key in ("layout_request", "load_tensor"):
+        hv = getattr(plugin, hook_key, None)
+        if hv is not None:
+            qual = getattr(hv, "__qualname__", getattr(hv, "__name__", ""))
+            doc[hook_key] = (
+                f"{getattr(hv, '__module__', '')}:{qual}" if callable(hv) else str(hv)
+            )
     return hashlib.sha256(canonical_json(doc).encode("utf-8")).hexdigest()
 
 

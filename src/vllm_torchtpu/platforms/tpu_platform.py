@@ -32,6 +32,7 @@ from vllm.platforms.interface import Platform, PlatformEnum
 
 from vllm_torchtpu import envs, patch_registry
 from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.megakernel_runtime.hooks import apply_layout_request
 from vllm_torchtpu.platforms.pcp_validation import PcpStaticSupportValidator
 from vllm_torchtpu.platforms.pp_validation import validate_pipeline_parallel_config
 from vllm_torchtpu.platforms.tpu_block_size_utils import (
@@ -1225,6 +1226,10 @@ class TpuPlatform(Platform):
                     cache_config.block_size = (  # type: ignore[assignment]
                         backend_cls.get_preferred_block_size(default)
                     )
+            # Pre-size cache_config before unified-layout derivation so page
+            # alignment matches the plugin's DMA granularity; stock backends
+            # also accept the aligned block size if the plugin declines at bind.
+            apply_layout_request(vllm_config)
             if unified_kv_layout_enabled(vllm_config):
                 update_tpu_block_size_and_slot_config(vllm_config, backend_cls)
 

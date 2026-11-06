@@ -18,7 +18,14 @@ from __future__ import annotations
 from typing import Any
 
 from .errors import MegakernelUnsupported
-from .hooks import StepContext, is_suppressed, suppressed
+from .hooks import (
+    StepContext,
+    apply_layout_request,
+    is_suppressed,
+    load_tensor_stream,
+    resolve_layout_request,
+    suppressed,
+)
 
 _DRIVER_EXPORTS = frozenset({"ProgramDriver"})
 _STEP_META_EXPORTS = frozenset({"TorchStepMetaOps"})
@@ -131,6 +138,7 @@ __all__ = [
     "TorchStepMetaOps",
     "VLLMWeightSource",
     "WEIGHT_FLIPPED_ATTR",
+    "apply_layout_request",
     "apply_tp_moe_flags",
     "build_jax_step_op",
     "build_pooled_step_op",
@@ -141,11 +149,13 @@ __all__ = [
     "get_routed_experts",
     "guard_weight_update",
     "is_suppressed",
+    "load_tensor_stream",
     "load_vllm_weights",
     "make_typed_step_wrapper",
     "maybe_create",
     "reshard_experts_ep_to_tp_local",
     "reshard_layer_experts_ep_to_tp",
+    "resolve_layout_request",
     "sharded_jax_callable",
     "suppressed",
 ]

@@ -25,7 +25,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
-import pytest
+import pytest  # pyrefly: ignore[missing-import]
 import torch
 
 import vllm_torchtpu.megakernel_runtime.agreement as agreement_mod
@@ -132,15 +132,21 @@ def test_toy_fingerprint_changes_with_options_and_source(
     toy: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _no_group(monkeypatch)
-    f1 = driver_mod.ProgramDriver.maybe_create(_runner({"scale": 2.0})).fingerprint
-    assert (
-        f1 == driver_mod.ProgramDriver.maybe_create(_runner({"scale": 2.0})).fingerprint
-    )
-    f2 = driver_mod.ProgramDriver.maybe_create(_runner({"scale": 5.0})).fingerprint
+    d1a = driver_mod.ProgramDriver.maybe_create(_runner({"scale": 2.0}))
+    d1b = driver_mod.ProgramDriver.maybe_create(_runner({"scale": 2.0}))
+    d2 = driver_mod.ProgramDriver.maybe_create(_runner({"scale": 5.0}))
+    assert isinstance(d1a, driver_mod.ProgramDriver)
+    assert isinstance(d1b, driver_mod.ProgramDriver)
+    assert isinstance(d2, driver_mod.ProgramDriver)
+    f1 = d1a.fingerprint
+    assert f1 == d1b.fingerprint
+    f2 = d2.fingerprint
     assert f2 != f1
     toy.write_text(TOY_PLUGIN + "\n# edited\n", encoding="utf-8")
     fp.clear_caches()
-    f3 = driver_mod.ProgramDriver.maybe_create(_runner({"scale": 2.0})).fingerprint
+    d3 = driver_mod.ProgramDriver.maybe_create(_runner({"scale": 2.0}))
+    assert isinstance(d3, driver_mod.ProgramDriver)
+    f3 = d3.fingerprint
     assert f3 != f1
 
 
@@ -195,6 +201,7 @@ def test_agreement_one_peer_decline_and_plugin_mismatch(
     assert drv.decline.code == "peer_declined:toy_declined"
     _vote_group(monkeypatch, [0], 12345)
     drv = driver_mod.ProgramDriver.maybe_create(_runner())
+    assert isinstance(drv, driver_mod.DeclinedDriver)
     assert drv.decline.code == "plugin_mismatch"
 
 
@@ -240,6 +247,7 @@ def test_pre_agreement_failures_vote_before_raising(
     # A peer that failed before its fingerprint: plugin_mismatch here.
     _vote_group(monkeypatch, [vote], 0)
     drv = driver_mod.ProgramDriver.maybe_create(_runner())
+    assert isinstance(drv, driver_mod.DeclinedDriver)
     assert drv.decline.code == "plugin_mismatch"
 
 
@@ -328,6 +336,7 @@ def test_bind_agreement_bucket_mismatch_installs_declined_driver(
     _no_group(monkeypatch)
     runner = _runner()
     drv = driver_mod.ProgramDriver.maybe_create(runner)
+    assert isinstance(drv, driver_mod.ProgramDriver)
     runner._megakernel = drv
     g = _vote_group(monkeypatch, [0], 7)
     drv.bind_and_warmup(runner)
@@ -716,6 +725,7 @@ def test_agreements_run_over_the_declared_domain_group(
     group, log = _record_agreements(monkeypatch)
     runner = _runner(options)
     drv = driver_mod.ProgramDriver.maybe_create(runner)
+    assert drv is not None
     assert drv.serving is not options.get("decline", False)
     runner._megakernel = drv
     drv.bind_and_warmup(runner)
@@ -723,24 +733,35 @@ def test_agreements_run_over_the_declared_domain_group(
 
 
 def test_agreement_group_resolves_the_tp_group(monkeypatch: pytest.MonkeyPatch) -> None:
-    tp = object()
+    tp, dcp, world = object(), object(), object()
     monkeypatch.setattr(agreement_mod, "_tp_cpu_group", lambda: tp)
+    monkeypatch.setattr(agreement_mod, "_dcp_cpu_group", lambda: dcp)
+    monkeypatch.setattr(agreement_mod, "_world_cpu_group", lambda: world)
     assert driver_mod.agreement_group("tp", None) is tp
-    for domain in ("tp_x_dcp", "kernel_mesh"):
-        with pytest.raises(driver_mod.MegakernelPluginError, match=domain):
-            driver_mod.agreement_group(domain, None)
+    assert driver_mod.agreement_group("tp_x_dcp", None) is tp
+    dcp_runner = testing.fake_runner()
+    dcp_runner.parallel_config.decode_context_parallel_size = 4
+    assert driver_mod.agreement_group("tp_x_dcp", dcp_runner) is dcp
+    assert driver_mod.agreement_group("kernel_mesh", None) is world
+    with pytest.raises(driver_mod.MegakernelPluginError, match="bogus_domain"):
+        driver_mod.agreement_group("bogus_domain", None)
 
 
 @pytest.mark.parametrize("domain", ["tp_x_dcp", "kernel_mesh"])
 def test_unsupported_collective_domain_declines_before_any_collective(
     toy: Path, monkeypatch: pytest.MonkeyPatch, domain: str
 ) -> None:
-    res = _check(testing.fake_runner(), collective_domain=domain)
-    assert res is not None and res.code == f"parallelism_unsupported:{domain}"
+    assert _check(testing.fake_runner(), collective_domain=domain) is None
     assert _check(testing.fake_runner(), collective_domain="tp") is None
-    src = toy.read_text("utf-8").replace(
-        'decline_codes=("toy_declined",)',
-        f'decline_codes=("toy_declined",), collective_domain="{domain}"',
+    bad_domain = f"unsupported_{domain}"
+    bad_spec = _spec()
+    object.__setattr__(bad_spec, "collective_domain", bad_domain)
+    runner = testing.fake_runner()
+    res = driver_mod.check_spec(runner, bad_spec, view=RunnerView(runner, tp_rank=0))
+    assert res is not None and res.code == f"parallelism_unsupported:{bad_domain}"
+    src = (
+        toy.read_text("utf-8")
+        + f'\nobject.__setattr__(SPEC, "collective_domain", "{bad_domain}")\n'
     )
     toy.write_text(src, encoding="utf-8")
     _forbid_create_and_collectives(monkeypatch)

@@ -50,12 +50,18 @@ from vllm_torchtpu.megakernel.runtime.contract import (
 
 
 class Shorthand(NamedTuple):
-    """A built-in template selectable by name or by the checkpoint's HF arch."""
+    """A built-in template selectable by name or by the checkpoint's HF arch.
+
+    `hf_fields` disambiguates model variants that share an `architectures`
+    class name via `(field_name, expected_value)` pairs on `hf_config` (or
+    `hf_config.text_config`), consumed by stacked multi-model registrations.
+    """
 
     module: str
     architectures: tuple[str, ...]
     model_types: tuple[str, ...]
     legacy_keys: frozenset[str]
+    hf_fields: tuple[tuple[str, Any], ...] = ()
 
 
 # Built-in templates by shorthand name. Imported by string only, so the

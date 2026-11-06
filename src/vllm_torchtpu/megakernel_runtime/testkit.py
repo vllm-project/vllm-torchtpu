@@ -45,7 +45,7 @@ from types import ModuleType, SimpleNamespace
 from typing import Any
 from unittest import mock
 
-import pytest
+import pytest  # pyrefly: ignore[missing-import]
 
 from .plugin import TpuMonoSpec
 from .testing import fake_runner
@@ -147,7 +147,7 @@ def route_lazy_loggers(monkeypatch: pytest.MonkeyPatch, *packages: str) -> None:
     for name in sorted(sys.modules):
         if not name.startswith(prefixes):
             continue
-        lazy = getattr(sys.modules[name], "logger", None)
+        lazy: Any = getattr(sys.modules[name], "logger", None)
         if not callable(getattr(lazy, "_resolve", None)):
             continue
         try:
@@ -217,6 +217,18 @@ def check_spec(
             "'module:attr' string (e.g. '.adapter:create'), so importing the "
             "plugin loads no torch / jax / vLLM"
         )
+    if (
+        lazy_create
+        and spec.load_tensor is not None
+        and (not isinstance(spec.load_tensor, str) or ":" not in spec.load_tensor)
+    ):
+        obs = spec.load_tensor
+        msg = (
+            f"SPEC {spec.name!r}: load_tensor={obs!r} should be a "
+            "lazy 'module:attr' string (e.g. '.adapter:load_tensor'), "
+            "so importing the plugin loads no torch / jax / vLLM"
+        )
+        raise AssertionError(msg)
     codes = list(spec.decline_codes)
     if any(not isinstance(c, str) or not c or c == "other" for c in codes):
         raise AssertionError(f"SPEC {spec.name!r}: bad decline_codes {codes}")
@@ -226,6 +238,8 @@ def check_spec(
         resolve_callable(spec.create, module, what="create")
         if isinstance(spec.layout_request, str):
             resolve_callable(spec.layout_request, module, what="layout_request")
+        if isinstance(spec.load_tensor, str):
+            resolve_callable(spec.load_tensor, module, what="load_tensor")
     return spec
 
 
@@ -253,13 +267,15 @@ class CpuE2EResult:
 
 def _set_plugin(runner: Any, plugin: str | ModuleType | None, options: Any) -> None:
     add_cfg = runner.vllm_config.additional_config
-    mk_cfg = add_cfg.get("megakernel")
-    mk_cfg = dict(mk_cfg) if isinstance(mk_cfg, Mapping) else {}
+    mk_raw = add_cfg.get("megakernel")
+    mk_cfg: dict[str, Any] = dict(mk_raw) if isinstance(mk_raw, Mapping) else {}
     if plugin is not None:
         mod, attr = _plugin_ref(plugin)
         mk_cfg["plugin"] = mod if attr == "SPEC" else f"{mod}:{attr}"
     if options is not None:
-        mk_cfg["options"] = {**mk_cfg.get("options", {}), **dict(options)}
+        prev_opts = mk_cfg.get("options")
+        prev_map = prev_opts if isinstance(prev_opts, Mapping) else {}
+        mk_cfg["options"] = {**prev_map, **dict(options)}
     add_cfg["megakernel"] = mk_cfg
 
 
@@ -336,6 +352,10 @@ for lazy in (d.logger, a.logger):
     except ModuleNotFoundError:
         lazy._logger = logging.getLogger("mk")
 a._tp_cpu_group = lambda: dist.group.WORLD
+a._dcp_cpu_group = lambda: dist.group.WORLD
+a._world_cpu_group = lambda: dist.group.WORLD
+d._get_pallas_mesh_fn = lambda: None
+d._local_tp_rank = dist.get_rank
 runner = testing.fake_runner(
     tp_size=2,
     megakernel={"plugin": plugin, "options": json.loads(options)},

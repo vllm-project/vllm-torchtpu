@@ -71,6 +71,7 @@ from vllm_torchtpu.megakernel_runtime.guards import (
     check_runner_features,
     check_spec,
     detect_parallelism,
+    domain_world_size,
     kv_connector_is_offloading,
     kv_connector_names,
 )
@@ -125,7 +126,9 @@ _VLLM_STARTUP_MESSAGES: dict[str, str] = {
 
 
 def _get_pallas_mesh_fn() -> Any:
-    """Return `torch_tpu`'s `get_pallas_mesh`, or `None` without `torch_tpu`."""
+    """Return `torch_tpu`'s `get_pallas_mesh`, or `None` when unavailable."""
+    if not (torch.distributed.is_available() and torch.distributed.is_initialized()):
+        return None
     try:
         from torch_tpu._internal.pallas import get_pallas_mesh
     except ImportError:
@@ -133,20 +136,24 @@ def _get_pallas_mesh_fn() -> Any:
     return get_pallas_mesh
 
 
-def check_mesh_size(tp_size: int, mesh_size: int) -> EligibilityResult | None:
-    """`mesh_size_mismatch` when the TP-rank mesh doesn't hold `tp_size`
-    devices (`None` if it does). The chip and the TP size are `check_spec`'s."""
-    if int(mesh_size) != int(tp_size):
+def check_mesh_size(expected_size: int, mesh_size: int) -> EligibilityResult | None:
+    """Check that the rank mesh holds the expected device count.
+
+    Returns `mesh_size_mismatch` when the rank mesh doesn't hold `expected_size`
+    devices (`None` if it does). The chip and rank count are checked by
+    `check_spec`.
+    """
+    if int(mesh_size) != int(expected_size):
         msg = (
-            f"Megakernel TP-rank mesh has {mesh_size} devices, "
-            f"expected {tp_size}; skipping."
+            f"Megakernel rank mesh has {mesh_size} devices, "
+            f"expected {expected_size}; skipping."
         )
         return EligibilityResult(False, "mesh_size_mismatch", msg)
     return None
 
 
 class MeshDecline(Exception):
-    """`_build_tp_rank_mesh` can't build a correctly ordered TP mesh."""
+    """`_build_tp_rank_mesh` can't build a correctly ordered rank mesh."""
 
     def __init__(self, result: EligibilityResult) -> None:
         super().__init__(result.message)
@@ -154,9 +161,10 @@ class MeshDecline(Exception):
 
 
 def _build_tp_rank_mesh(r_cnt: int, fallback_mesh: Any = None) -> Any:
-    """Build an `r_cnt`-device JAX `Mesh` with axis `'tp'` in TP-rank order.
+    """Build an `r_cnt`-device JAX `Mesh` with axis `'tp'` in rank order.
 
-    With `torch_tpu` this is always its Pallas mesh: `torch_tpu` binds
+    When `torch.distributed` is initialized with `torch_tpu`, this uses its
+    Pallas mesh: `torch_tpu` binds
     partition `p` to TP rank `p` and requires every Pallas kernel in a program
     to share one device assignment, while the runner mesh may list the devices
     in another order (e.g. ICI ring order), which would send the megakernel's
@@ -272,11 +280,14 @@ def _local_tp_rank() -> int:
     """This rank's TP rank (config-only, no collective)."""
     try:
         from vllm.distributed import get_tensor_model_parallel_rank
+
+        return int(get_tensor_model_parallel_rank())
     except ImportError:
         dist = torch.distributed
         ok = dist.is_available() and dist.is_initialized()
         return int(dist.get_rank()) if ok else 0
-    return int(get_tensor_model_parallel_rank())
+    except AssertionError:
+        return 0
 
 
 def _default_out_rows(b: int, token_paddings: Sequence[int]) -> int:
@@ -469,7 +480,6 @@ class ProgramDriver:
                 loaded_numerics_note(plugin.numerics, options),
                 fprint[:16],
             )
-            tp_size = view.tp_size
             el = check_spec(runner, plugin, view=view)
             if el is not None:
                 cls._log_startup_ineligible(el)
@@ -482,14 +492,15 @@ class ProgramDriver:
             out = create(view, dict(options))
             decline = _check_create_result(out, ref)
             if decline is None:
+                mesh_ranks = domain_world_size(domain, runner, view)
                 try:
                     mesh = _build_tp_rank_mesh(
-                        tp_size, fallback_mesh=getattr(runner, "mesh", None)
+                        mesh_ranks, fallback_mesh=getattr(runner, "mesh", None)
                     )
                 except MeshDecline as exc:
                     decline = exc.result
                 else:
-                    decline = check_mesh_size(tp_size, int(mesh.devices.size))
+                    decline = check_mesh_size(mesh_ranks, int(mesh.devices.size))
         except BaseException:
             _vote_startup_failure(token, codes, domain, runner)
             raise

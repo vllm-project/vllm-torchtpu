@@ -25,8 +25,14 @@ import torch
 
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.megakernel.runtime import stats as _stats
-from vllm_torchtpu.megakernel.runtime.contract import DOMAIN_TP, EligibilityResult
+from vllm_torchtpu.megakernel.runtime.contract import (
+    DOMAIN_KERNEL_MESH,
+    DOMAIN_TP,
+    DOMAIN_TP_X_DCP,
+    EligibilityResult,
+)
 from vllm_torchtpu.megakernel_runtime.errors import MegakernelPluginError
+from vllm_torchtpu.megakernel_runtime.guards import parallel_field
 from vllm_torchtpu.megakernel_runtime.hooks import StepContext, is_suppressed
 
 logger = init_logger(__name__)
@@ -66,25 +72,61 @@ def _decline_vote(
 
 
 def _tp_cpu_group() -> Any:
-    """The TP group's CPU (gloo) process group, or `None` on a single rank."""
+    """Return the TP group's CPU (gloo) process group, or `None` on a single rank."""
     if not (torch.distributed.is_available() and torch.distributed.is_initialized()):
         return None
     from vllm.distributed import get_tp_group
 
     tp_group = get_tp_group()
-    if int(getattr(tp_group, "world_size", 1)) <= 1:
+    if int(tp_group.world_size) <= 1:
         return None
+    if tp_group.cpu_group is None:
+        raise RuntimeError("TP group cpu_group is not initialized")
     return tp_group.cpu_group
 
 
+def _dcp_cpu_group() -> Any:
+    """Return the DCP group's CPU (gloo) process group, or `None` on a single rank."""
+    if not (torch.distributed.is_available() and torch.distributed.is_initialized()):
+        return None
+    from vllm.distributed import get_dcp_group
+
+    dcp_group = get_dcp_group()
+    if int(dcp_group.world_size) <= 1:
+        return None
+    if dcp_group.cpu_group is None:
+        raise RuntimeError("DCP group cpu_group is not initialized")
+    return dcp_group.cpu_group
+
+
+def _world_cpu_group() -> Any:
+    """Return the world group's CPU (gloo) process group, or `None` on a single rank."""
+    if not (torch.distributed.is_available() and torch.distributed.is_initialized()):
+        return None
+    from vllm.distributed import get_world_group
+
+    world_group = get_world_group()
+    if int(world_group.world_size) <= 1:
+        return None
+    if world_group.cpu_group is None:
+        raise RuntimeError("World group cpu_group is not initialized")
+    return world_group.cpu_group
+
+
 def agreement_group(domain: str, runner: Any) -> Any:
-    """The CPU process group a spec's agreements run over for its
+    """Return the CPU process group a spec's agreements run over for its
     `collective_domain` (`None` on a single rank): the ranks its kernel
-    communicates with. Only "tp" (the TP group) resolves today;
-    `check_spec` declines the other domains before any collective."""
-    del runner
+    communicates with."""
     if domain == DOMAIN_TP:
         return _tp_cpu_group()
+    if domain == DOMAIN_TP_X_DCP:
+        tp = parallel_field(runner, "tensor_parallel_size", 1)
+        dcp = parallel_field(runner, "decode_context_parallel_size", 1)
+        if dcp > tp:
+            return _dcp_cpu_group()
+        return _tp_cpu_group()
+    if domain == DOMAIN_KERNEL_MESH:
+        return _world_cpu_group()
     raise MegakernelPluginError(f"collective_domain {domain!r} has no agreement group")
 
 
@@ -106,7 +148,7 @@ def agree_on_decline(
     mismatch_code: str | None = None,
     codes: Sequence[str] = DECLINE_VOTE_CODES,
 ) -> EligibilityResult | None:
-    """Make a megakernel decline rank-uniform across the TP group.
+    """Make a megakernel decline rank-uniform across the agreement group.
 
     Every rank calls this at the same point with its own decline (`None` when
     it can serve) and, optionally, a `token` that must be equal on every rank
@@ -131,7 +173,7 @@ def agree_on_decline(
     vote, tok_max, tok_min = int(t[0]), int(t[1]), -int(t[2])
     if mismatch_code is not None and tok_max != tok_min:
         msg = (
-            "Megakernel plugin or runtime source differs across TP ranks "
+            "Megakernel plugin or runtime source differs across ranks "
             f"({mismatch_code}); skipping."
         )
         return EligibilityResult(False, mismatch_code, msg)
@@ -139,10 +181,10 @@ def agree_on_decline(
         if local is not None:
             return local
         code = codes[vote - 1] if vote <= len(codes) else "other"
-        msg = f"Megakernel declined on another TP rank ({code}); skipping."
+        msg = f"Megakernel declined on another rank ({code}); skipping."
         return EligibilityResult(False, f"peer_declined:{code}", msg)
     if tok_max != tok_min:
-        msg = "Megakernel compiled bucket sets differ across TP ranks; skipping."
+        msg = "Megakernel compiled bucket sets differ across ranks; skipping."
         return EligibilityResult(False, "bucket_set_mismatch", msg)
     return None
 
