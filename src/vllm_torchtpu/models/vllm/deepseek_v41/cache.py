@@ -743,6 +743,7 @@ def write_cache(
     after_read: bool = False,
     *,
     records: Tensor | None = None,
+    scratch_base: int | None = None,
 ) -> None:
     """Write ``values`` into ``cache`` at ``slots`` where ``valid`` is True.
 
@@ -753,6 +754,8 @@ def write_cache(
         valid: Boolean mask ``[num_tokens]`` selecting active token writes (Used).
         after_read: When ``True``, orders prior gathers before donated TPU writes.
         records: Optional pre-computed physical record indices ``[num_tokens]``.
+        scratch_base: First row of a dense cache's scratch tail (rows the reads
+            never address); ``None`` keeps the boolean-index write.
     """
     num_rows = values.shape[0]
     valid_mask = valid[:num_rows]
@@ -767,6 +770,20 @@ def write_cache(
             valid=valid_mask,
             after_read=after_read,
         )
+        return
+    if (
+        scratch_base is not None
+        and cache.ndim == values.ndim
+        and cache.shape[0] - scratch_base >= num_rows
+    ):
+        # Fix v: invalid row i lands on its own scratch row scratch_base + i, so the
+        # scatter is static-shaped [num_rows] (no per-count recompiles) and injective
+        # (duplicate scatter indices halt SparseCore, E0200; see ced.py).
+        scratch = scratch_base + torch.arange(
+            num_rows, device=slots.device, dtype=torch.long
+        )
+        rows = torch.where(valid_mask, slots[:num_rows].long(), scratch)
+        cache.index_copy_(0, rows, values)
         return
     valid_slots = slots[:num_rows].masked_fill(~valid_mask, -1)[valid_mask].long()
     if cache.ndim == values.ndim:

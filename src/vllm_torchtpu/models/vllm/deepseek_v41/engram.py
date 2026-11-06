@@ -18,6 +18,7 @@ from __future__ import annotations
 import copy
 import os
 import tempfile
+import weakref
 from collections.abc import Callable
 from contextlib import ExitStack
 from typing import cast
@@ -241,6 +242,14 @@ class NgramHashState(upstream.NgramHashState):
 
     _cached_cpu_tables: tuple[Tensor, Tensor, Tensor, Tensor] | None = None
 
+    def __init__(self, vllm_config, layout, swa_cache_module) -> None:
+        super().__init__(vllm_config, layout, swa_cache_module)
+        # Fix v: the slot cache gets a scratch tail of one row per batched token so
+        # invalid-token writes stay a static, injective scatter (see ``write_cache``).
+        self._scratch_rows = int(vllm_config.scheduler_config.max_num_batched_tokens)
+        self._real_num_slots = 0  # addressable slots; 0 = no scratch tail bound
+        self._scratch_cache_ref: weakref.ReferenceType[Tensor] | None = None
+
     def ensure_cache(self) -> bool:
         """Synchronize ``block_size`` with ``swa_cache_module`` and allocate slots.
 
@@ -267,7 +276,16 @@ class NgramHashState(upstream.NgramHashState):
         ):
             self.block_size = int(resolved_block_size)
             self._kv_cache_ref = None
-        return super().ensure_cache()
+        ready = super().ensure_cache()
+        cache = self._cache
+        if cache is None:
+            self._real_num_slots, self._scratch_cache_ref = 0, None
+        elif self._scratch_cache_ref is None or self._scratch_cache_ref() is not cache:
+            # Upstream just (re)allocated the zeroed slot cache: append the tail once.
+            self._real_num_slots = cache.numel()
+            self._cache = cache.new_zeros(cache.numel() + self._scratch_rows)
+            self._scratch_cache_ref = weakref.ref(self._cache)
+        return ready
 
     def hash_on_host(
         self,
@@ -328,7 +346,11 @@ class NgramHashState(upstream.NgramHashState):
             mapped_raw = self.token_map.index_select(0, input_ids.int())
             mapped_batch = mapped_raw.masked_fill(dead_mask, upstream.DEAD_ID)
             write_cache(
-                self._cache, slots, mapped_batch, slots >= min_block * self.block_size
+                self._cache,
+                slots,
+                mapped_batch,
+                slots >= min_block * self.block_size,
+                scratch_base=self._real_num_slots or None,
             )
 
         def fallback_slot_lookup(past: Tensor, reqs: Tensor, window: Tensor) -> Tensor:
@@ -345,8 +367,10 @@ class NgramHashState(upstream.NgramHashState):
                 .index_select(0, table_idx)
                 .view_as(logical_pos)
             )
+            # Reads never reach the scratch tail (fix v).
+            real_slots = self._real_num_slots or self._cache.numel()
             cache_slots = (blocks * block_size + logical_pos % block_size).clamp(
-                0, self._cache.numel() - 1
+                0, real_slots - 1
             )
             gathered = self._cache.index_select(0, cache_slots.reshape(-1)).view_as(
                 cache_slots
