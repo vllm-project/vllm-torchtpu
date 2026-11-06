@@ -12,8 +12,13 @@ from torch.utils._pytree import tree_leaves
 from vllm.compilation.backends import set_model_tag
 from vllm.compilation.decorators import support_torch_compile
 from vllm.forward_context import override_forward_context
+from vllm.model_executor.models.utils import AutoWeightsLoader
 from vllm.models.deepseek_v41.nvidia import model as upstream
+from vllm.models.deepseek_v41.nvidia import vl_model as upstream_vl
+from vllm.v1.worker.encoder_cudagraph_defs import EncoderCudaGraphConfig
 
+from vllm_torchtpu import envs
+from vllm_torchtpu.kernels.experimental import decode_preparation
 from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v41.deepseek_v41_mhc_op import (
     initialize_shifted_mhc,
 )
@@ -1245,6 +1250,8 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
     def __init__(self, *, vllm_config, prefix=""):
         self.prefix = prefix
         self._raw_dma_enabled = engram_cpu_offload(vllm_config)
+        # Read once outside traced code; regions consult it at trace time.
+        decode_preparation.configure(envs.TPU_DEEPSEEK_V41_DECODE_FUSION)
         initialize_cache_ops()
         initialize_delayed_mhc()
         initialize_shifted_mhc()
@@ -1474,4 +1481,62 @@ class DeepseekV41ForCausalLM(upstream.DeepseekV41LLMForCausalLM):
         # NVIDIA MXFP8 adapter selected by upstream uses weight_scale instead.
         self.hf_to_vllm_mapper = upstream._make_deepseek_v4_weights_mapper(
             getattr(self.config, "expert_dtype", "fp4"), "weight_scale_inv"
+        )
+
+
+class DeepseekV41VLForCausalLM(upstream_vl.DeepseekV41ForCausalLM):
+    """Upstream V4.1 vision tower and preprocessing around the TPU text model."""
+
+    # TODO: route image tokens with gate.bias_vl under fused EP; the kernel
+    # still selects their experts like text.
+    def __init__(self, *, vllm_config, prefix=""):
+        # TPU's FP8 linear adapter registers weight_scale_inv, as in the text model.
+        with device_hooks(
+            upstream_vl,
+            DeepseekV41LLMForCausalLM=DeepseekV41ForCausalLM,
+            _linear_scale_param_name=lambda *_: "weight_scale_inv",
+        ):
+            super().__init__(vllm_config=vllm_config, prefix=prefix)
+
+    def load_weights(self, weights):
+        # Upstream sorts every weight so the language model, which finalizes
+        # inside its load_weights, gets one contiguous delegation. Sorting
+        # holds the whole checkpoint shard in host memory and defeats the
+        # EP-sharded loader's streaming window. Hand the language model its
+        # weights as one stream instead, and load the few tower weights after.
+        prefix = "language_model."
+        rest = []
+
+        def language_weights():
+            for name, tensor in self.hf_to_vllm_mapper.apply(weights):
+                if name.startswith(prefix):
+                    yield name.removeprefix(prefix), tensor
+                else:
+                    rest.append((name, tensor))
+
+        loaded = {
+            prefix + name
+            for name in self.language_model.load_weights(language_weights())
+        }
+        loaded |= AutoWeightsLoader(self).load_weights(rest)
+        self._weights_finalized = True
+        return loaded
+
+    def get_encoder_cudagraph_config(self) -> EncoderCudaGraphConfig:
+        # Upstream rejects the TORCH_SDPA ViT backend it resolves on TPU, but
+        # TPU runs MMEncoderAttention through the Pallas forward_oot. Default
+        # zero padding of cu_seqlens is safe for its segment ids: trailing
+        # zeros shift every id equally and padding rows keep their own id.
+        return EncoderCudaGraphConfig(
+            modalities=["image"],
+            buffer_keys=[
+                "patches",
+                "vit_cos",
+                "vit_sin",
+                "cu_seqlens",
+                "max_seqlen",
+                "merge_idx",
+                "merge_mask",
+            ],
+            out_hidden_size=self.config.hidden_size,
         )

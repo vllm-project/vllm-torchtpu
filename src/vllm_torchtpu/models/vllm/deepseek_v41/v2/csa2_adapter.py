@@ -10,6 +10,7 @@ import jax.numpy as jnp
 import torch
 
 from vllm_torchtpu.kernels.deepseek_v4.o_projection import wo_a_projection
+from vllm_torchtpu.kernels.deepseek_v41 import output_projection
 from vllm_torchtpu.kernels.deepseek_v41.csa2.cache import (
     prepare_main_records,
     prepare_swa_metadata,
@@ -202,8 +203,77 @@ def _fake_metadata(table, starts, positions, minimum, page_size, *_):
     )
 
 
+def _prepare_publish_swa(
+    raw: jax.Array,
+    table: jax.Array,
+    starts: jax.Array,
+    positions: jax.Array,
+    minimum: jax.Array,
+    values: jax.Array,
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+    from vllm_torchtpu.kernels.experimental.decode_preparation import (
+        swa_prepare_publish,
+    )
+
+    owner, metadata, bounds, records = swa_prepare_publish(
+        (raw,), table, starts, positions, minimum, values
+    )
+    return owner, metadata, bounds, records
+
+
+def _prepare_publish_swa_banked(
+    raw: jax.Array,
+    high: jax.Array,
+    table: jax.Array,
+    starts: jax.Array,
+    positions: jax.Array,
+    minimum: jax.Array,
+    values: jax.Array,
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
+    from vllm_torchtpu.kernels.experimental.decode_preparation import (
+        swa_prepare_publish,
+    )
+
+    owner, upper, metadata, bounds, records = swa_prepare_publish(
+        (raw, high), table, starts, positions, minimum, values
+    )
+    return owner, upper, metadata, bounds, records
+
+
+def _fake_prepare_publish_swa(raw, table, starts, positions, minimum, values):
+    return torch.empty_like(raw), *_fake_metadata(table, starts, positions, minimum, 64)
+
+
+def _fake_prepare_publish_swa_banked(
+    raw, high, table, starts, positions, minimum, values
+):
+    return (
+        torch.empty_like(raw),
+        torch.empty_like(high),
+        *_fake_metadata(table, starts, positions, minimum, 64),
+    )
+
+
 def _project(output: jax.Array, weight: jax.Array, scales: jax.Array) -> jax.Array:
     return wo_a_projection(output, weight, scales.reshape(-1), None)
+
+
+def _project_out(
+    output: jax.Array,
+    wa: jax.Array,
+    sa: jax.Array,
+    wb: jax.Array,
+    sb: jax.Array,
+) -> jax.Array:
+    # wo_a then wo_b. On v7 with the DSv4.1 weights the fused kernel runs at
+    # every token count, in token tiles beyond one VMEM-resident tile, and is
+    # bitwise equal to the two-kernel chain, which other contracts still run.
+    from vllm_torchtpu.layers.adapter.linear_common import _quantized_matmul_jax
+
+    sa = sa.reshape(-1)
+    if output_projection.is_supported(output, wa, sa, wb, sb):
+        return output_projection.fused_output_projection(output, wa, sa, wb, sb)
+    return _quantized_matmul_jax(wo_a_projection(output, wa, sa, None), wb, sb)
 
 
 def _manual_bridge(function, mesh, tensor_args, out_specs):
@@ -238,6 +308,18 @@ def initialize_csa2_ops() -> None:
     mesh = get_vllm_model_wrapper_context().mesh
     definitions = (
         ("metadata", _metadata, (P(),) * 4 + (None,) * 4, _fake_metadata),
+        (
+            "prepare_publish_swa",
+            _prepare_publish_swa,
+            (P(),) * 6,
+            _fake_prepare_publish_swa,
+        ),
+        (
+            "prepare_publish_swa_banked",
+            _prepare_publish_swa_banked,
+            (P(),) * 7,
+            _fake_prepare_publish_swa_banked,
+        ),
         (
             "publish_main",
             _publish_main,
@@ -280,8 +362,16 @@ def initialize_csa2_ops() -> None:
             (P(),) * 3,
             lambda x, w, *_: x.new_empty((x.shape[0], w.shape[1])),
         ),
+        (
+            "project_out",
+            _project_out,
+            (P(),) * 5,
+            lambda x, wa, sa, wb, sb: x.new_empty((x.shape[0], wb.shape[1])),
+        ),
     )
     output_counts = {
+        "prepare_publish_swa": 4,
+        "prepare_publish_swa_banked": 5,
         "metadata": 3,
         "publish_main": 2,
         "publish_main_banked": 4,
@@ -289,6 +379,8 @@ def initialize_csa2_ops() -> None:
         "gather_attend": 4,
     }
     donated = {
+        "prepare_publish_swa": (0,),
+        "prepare_publish_swa_banked": (0, 1),
         "publish_main": (0, 1),
         "publish_main_banked": (0, 1, 2, 3),
         "publish_swa": (0,),
@@ -444,6 +536,18 @@ def project(
     return _ops["project"](output, weight, scales)
 
 
+def project_out(
+    output: torch.Tensor,
+    wa: torch.Tensor,
+    sa: torch.Tensor,
+    wb: torch.Tensor,
+    sb: torch.Tensor,
+) -> torch.Tensor:
+    """``wo_b(wo_a(output))``; ``wb`` is the canonical ``[k, n]`` FP8 weight
+    with a per-channel ``[n]`` scale."""
+    return _ops["project_out"](output, wa, sa, wb, sb)
+
+
 def prepare_swa(
     table: torch.Tensor,
     starts: torch.Tensor,
@@ -462,3 +566,25 @@ def prepare_swa(
         cache.row_offset,
         non_causal,
     )
+
+
+def prepare_publish_swa(
+    table: torch.Tensor,
+    starts: torch.Tensor,
+    positions: torch.Tensor,
+    minimum: torch.Tensor,
+    cache: "PagedCacheRows",
+    values: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Publish value-ready native pages while creating the shared metadata."""
+    args = (table.int(), starts.int(), positions.int(), minimum.int(), values)
+    if cache.raw_hi is None:
+        raw, metadata, bounds, records = _ops["prepare_publish_swa"](cache.raw, *args)
+        cache.raw.copy_(raw)
+    else:
+        raw, high, metadata, bounds, records = _ops["prepare_publish_swa_banked"](
+            cache.raw, cache.raw_hi, *args
+        )
+        cache.raw.copy_(raw)
+        cache.raw_hi.copy_(high)
+    return metadata, bounds, records

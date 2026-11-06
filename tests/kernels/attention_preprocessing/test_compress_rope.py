@@ -239,3 +239,65 @@ def test_scalar_prefetch_size_includes_tiling_padding():
     assert compress_rope.scalar_prefetch_bytes(2048, 512) == 33280
     assert compress_rope.scalar_prefetch_bytes(288, 288) == 5120
     assert compress_rope.scalar_prefetch_bytes(65536, 512) > 1024 * 1024
+
+
+@pytest.mark.parametrize("backend", ["cpu", "tpu"])
+@pytest.mark.parametrize(
+    ("n", "tb", "supported"),
+    [
+        (96, 96, True),
+        (192, 192, True),
+        (240, 240, True),
+        (256, 256, True),
+        (384, 192, True),
+        (128, 128, False),
+        (384, 384, True),
+        (96, 48, True),
+        (192, 96, True),
+        (240, 120, True),
+        (256, 128, True),
+        (512, 256, False),
+    ]
+    + [(288, tb, True) for tb in range(1, 289) if 288 % tb == 0],
+)
+def test_compact_dispatch_envelope(monkeypatch, backend, n, tb, supported):
+    """CPU stays scatter; TPU fuses any whole tiling of a measured record count."""
+    from unittest import mock
+
+    from vllm_torchtpu.kernels.experimental import decode_preparation
+
+    records = jnp.asarray(np.resize([-1, 0, 7, 8, 3], n), dtype=jnp.int32)
+    monkeypatch.setattr(jax, "default_backend", lambda: backend)
+    sentinel = object()
+    with mock.patch.object(
+        decode_preparation, "compact_records", return_value=sentinel
+    ) as compact:
+        result = compress_rope._compact(records, 8, n // tb, tb)
+    if backend == "tpu" and supported:
+        assert result is sentinel
+        compact.assert_called_once_with(records, 8, tb)
+    else:
+        compact.assert_not_called()
+        host = np.asarray(records)
+        valid = (host >= 0) & (host < 8)
+        expected = np.zeros((n, 2), np.int32)
+        expected[: valid.sum()] = np.stack((np.flatnonzero(valid), host[valid]), 1)
+        np.testing.assert_array_equal(result[0], expected.reshape(-1))
+        counts = valid.reshape(-1, tb).sum(axis=1)
+        np.testing.assert_array_equal(result[1], np.r_[0, counts.cumsum()])
+
+
+@pytest.mark.parametrize(("n", "tb"), [(96, 96), (288, 144), (384, 192)])
+def test_compact_rejects_inconsistent_tile_count(monkeypatch, n, tb):
+    from unittest import mock
+
+    from vllm_torchtpu.kernels.experimental import decode_preparation
+
+    records = jnp.zeros((n,), dtype=jnp.int32)
+    monkeypatch.setattr(jax, "default_backend", lambda: "tpu")
+    with (
+        mock.patch.object(decode_preparation, "compact_records") as compact,
+        pytest.raises(TypeError, match="reshape"),
+    ):
+        compress_rope._compact(records, 8, n // tb + 1, tb)
+    compact.assert_not_called()

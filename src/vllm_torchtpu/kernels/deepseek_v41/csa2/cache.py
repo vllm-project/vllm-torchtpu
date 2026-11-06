@@ -423,6 +423,24 @@ def prepare_main_records(
     """
     if selected.ndim != 2 or selected.shape[1] > 512 or page_size < 1:
         raise ValueError("CSA2 main selection width must be at most 512")
+    from vllm_torchtpu.kernels.experimental import decode_preparation as prep
+
+    if prep.admit(
+        "main_records",
+        prep.first_problem(
+            (selected.shape[1] == 512, f"selection width {selected.shape[1]}"),
+            (
+                physical_pages.ndim == 2
+                and physical_pages.shape[1] <= prep.MAIN_RECORD_MAX_COLUMNS,
+                f"page table {list(physical_pages.shape)} exceeds "
+                f"{prep.MAIN_RECORD_MAX_COLUMNS} columns",
+            ),
+        ),
+        tokens=(selected.shape[0], physical_pages.shape[0]),
+        buckets=prep.MAIN_RECORD_BATCHES,
+    ):
+        inputs = (selected, physical_pages, starts)
+        return prep.main_records_call(inputs, page_size=page_size)(*inputs)
     tokens, width = selected.shape
     req = _requests(starts, tokens)
     valid = (selected >= 0) & (jnp.arange(tokens)[:, None] < starts[-1])

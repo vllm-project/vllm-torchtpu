@@ -21,6 +21,7 @@ def compile_mock(monkeypatch):
 def manager(compile_mock):
     model = Mock()
     model.get_encoder_cudagraph_config.return_value = SimpleNamespace(
+        capture_axes=(),
         padding_logics={},
         paths={
             "global": SimpleNamespace(min_token_budget=None, allow_zero_tokens=False),

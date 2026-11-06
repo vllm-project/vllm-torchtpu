@@ -505,6 +505,8 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
     _q_projection_rope_op: Any = None
     # TP1 FP8-KV layers run the fused Q-A/KV, Q-B and compressor kernels.
     _fused_preprocess = False
+    _packed_compressor_op: Any = None
+    _address_compressor_op: Any = None
     _swa_query_group_size = 1
 
     @classmethod
@@ -541,6 +543,8 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
             and self.n_local_heads == 64
         )
         self._csa2 = bool(self.compress_ratio) and csa2_supported
+        # Set after weight loading, once wo_b's runtime layout is known.
+        self._fused_wo_b = False
         self._fused_preprocess = csa2_supported
         self.swa_cache_layer.native_pages = self._csa2
         if self.compress_ratio:
@@ -829,6 +833,25 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
             version_key = ("candidate_index_version", indexer.k_cache.prefix)
             stage_cache[version_key] = stage_cache.get(version_key, 0) + 1
 
+    def _compressor_layout_admitted(
+        self, region, state_cache, main_cache=None, index_cache=None
+    ) -> bool:
+        """Compare the bound cache geometry with the registered kernel layout."""
+        fields = dict(
+            state_capacity=state_cache.shape[1],
+            state_stride=state_cache.page_stride,
+            state_offset=state_cache.row_offset,
+            window=self.window_size,
+        )
+        if main_cache is not None and index_cache is not None:
+            fields.update(
+                main_capacity=main_cache.shape[1],
+                main_stride=main_cache.page_stride,
+                main_offset=main_cache.row_offset,
+                index_capacity=index_cache.shape[1],
+            )
+        return preprocess_ops.compressor_layout_admitted(region, **fields)
+
     def _write_csa2_global_kv(self, hidden_states, positions):
         """Fused compressor: one kernel projects, pools (reading and writing the
         ratio-2 state ring), normalizes, rotates and CSA2-encodes the records."""
@@ -839,21 +862,7 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
         ratio = self.compress_ratio
         kv_meta = metadata[self.prefix]
         index_k = self.indexer.k_cache
-        rows = torch.arange(positions.shape[0], device=positions.device)
-        valid = (rows < kv_meta.query_start_loc[-1]) & ((positions + 1) % ratio == 0)
         starts = _window_starts()
-        if starts is not None:
-            # Shared prefix rows must survive replay unchanged.
-            valid = valid & ~_replayed(kv_meta, positions, starts, self.window_size)
-        compressed_slots = _cache_slots(
-            self.kv_cache, kv_meta, positions, compress_ratio=ratio
-        )
-        index_slots = _cache_slots(
-            index_k.kv_cache,
-            metadata[index_k.prefix],
-            positions,
-            compress_ratio=index_k.compress_ratio,
-        )
         group_positions = self._group_positions(positions)
         args = [
             hidden_states,
@@ -861,47 +870,130 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
             compressor.norm.weight,
             self._rope_rows(group_positions, ratio),
         ]
-        pools = ()
-        if ratio == 1:
-            args += [torch.ones_like(positions[:, None]), valid[:, None].int()]
-        else:
-            state_meta = metadata[compressor.state_cache.prefix]
-            state_cache = compressor.state_cache.kv_cache
-            pools = tuple(
-                p for p in (state_cache.raw, state_cache.raw_hi) if p is not None
-            )
-            starts_loc = state_meta.query_start_loc
-            requests = _token_requests(state_meta, positions).clamp(
-                max=starts_loc.numel() - 2
-            )
-            # A request's first row pools with the ring's stored predecessor;
-            # only its last ring-capacity rows are stored.
-            has_prev = rows != starts_loc[requests]
-            slots = _cache_slots(state_cache, state_meta, positions, ring=True)
-            previous = _cache_slots(state_cache, state_meta, positions - 1, ring=True)
-            stored = (slots >= 0) & (
-                rows >= starts_loc[requests + 1] - state_cache.shape[1]
-            )
-            args += [
-                has_prev[:, None].int(),
-                valid[:, None].int(),
-                *pools,
-                state_cache.row_indices(slots).masked_fill(~stored, -1).int(),
-                state_cache.row_indices(previous)
-                .masked_fill(has_prev | (slots < 0), -1)
-                .int(),
-            ]
-        op = preprocess_ops.compress_rope(ratio, len(pools), compressor.rms_norm_eps)
-        latent, words, scales, *states = op(*args)
-        for pool, state in zip(pools, states, strict=True):
-            pool.copy_(state)
-        records = self.kv_cache.row_indices(compressed_slots.clamp(min=0))
-        csa2_adapter.publish_main(
-            self.kv_cache,
-            records.masked_fill(~valid | (compressed_slots < 0), -1),
-            words,
-            scales,
+        state_meta = metadata[compressor.state_cache.prefix] if ratio == 2 else None
+        state_cache = compressor.state_cache.kv_cache if ratio == 2 else None
+        # Only structural, non-token conditions are checked here. Token count,
+        # request count and table widths are dispatched inside the JAX bridge
+        # (decode_preparation.admit), so Dynamo keeps the token dim dynamic.
+        packed = (
+            self._packed_compressor_op is not None
+            and state_meta is not None
+            and isinstance(state_cache, PagedCacheRows)
+            and state_cache.raw_hi is not None
+            and starts is not None
+            and state_meta.seq_lens.numel() > 0
+            and self._compressor_layout_admitted("compressor_state", state_cache)
         )
+        index_meta = metadata[index_k.prefix]
+        addresses = (
+            packed
+            and self._address_compressor_op is not None
+            and isinstance(self.kv_cache, PagedCacheRows)
+            and isinstance(index_k.kv_cache, PackedFP8IndexCacheRows)
+            and index_k.compress_ratio == 2
+            # One shared request mapping: the kernel derives both caches'
+            # requests from kv query_start_loc.
+            and index_meta.query_start_loc is kv_meta.query_start_loc
+            and self._compressor_layout_admitted(
+                "compressor_addresses", state_cache, self.kv_cache, index_k.kv_cache
+            )
+        )
+        compressed_slots = index_slots = records = None
+        if not addresses:
+            compressed_slots = _cache_slots(
+                self.kv_cache, kv_meta, positions, compress_ratio=ratio
+            )
+            index_slots = _cache_slots(
+                index_k.kv_cache,
+                metadata[index_k.prefix],
+                positions,
+                compress_ratio=index_k.compress_ratio,
+            )
+        if addresses:
+            assert state_meta is not None and state_cache is not None
+            assert state_cache.raw_hi is not None
+            latent, words, scales, low, high, valid, records, index_slots = (
+                self._address_compressor_op(
+                    _block_table(state_meta),
+                    state_meta.query_start_loc,
+                    kv_meta.query_start_loc,
+                    positions,
+                    starts,
+                    *args,
+                    state_cache.raw,
+                    state_cache.raw_hi,
+                    _block_table(kv_meta),
+                    _block_table(index_meta),
+                )
+            )
+            state_cache.raw.copy_(low)
+            state_cache.raw_hi.copy_(high)
+        elif packed:
+            assert state_meta is not None and state_cache is not None
+            assert state_cache.raw_hi is not None
+            latent, words, scales, low, high, valid = self._packed_compressor_op(
+                _block_table(state_meta),
+                state_meta.query_start_loc,
+                kv_meta.query_start_loc,
+                positions,
+                starts,
+                *args,
+                state_cache.raw,
+                state_cache.raw_hi,
+            )
+            state_cache.raw.copy_(low)
+            state_cache.raw_hi.copy_(high)
+        else:
+            rows = torch.arange(positions.shape[0], device=positions.device)
+            valid = (rows < kv_meta.query_start_loc[-1]) & (
+                (positions + 1) % ratio == 0
+            )
+            if starts is not None:
+                valid = valid & ~_replayed(kv_meta, positions, starts, self.window_size)
+            pools = ()
+            if ratio == 1:
+                args += [torch.ones_like(positions[:, None]), valid[:, None].int()]
+            else:
+                state_meta = metadata[compressor.state_cache.prefix]
+                state_cache = compressor.state_cache.kv_cache
+                pools = tuple(
+                    p for p in (state_cache.raw, state_cache.raw_hi) if p is not None
+                )
+                starts_loc = state_meta.query_start_loc
+                requests = _token_requests(state_meta, positions).clamp(
+                    max=starts_loc.numel() - 2
+                )
+                # A request's first row pools with the ring's stored predecessor;
+                # only its last ring-capacity rows are stored.
+                has_prev = rows != starts_loc[requests]
+                slots = _cache_slots(state_cache, state_meta, positions, ring=True)
+                previous = _cache_slots(
+                    state_cache, state_meta, positions - 1, ring=True
+                )
+                stored = (slots >= 0) & (
+                    rows >= starts_loc[requests + 1] - state_cache.shape[1]
+                )
+                args += [
+                    has_prev[:, None].int(),
+                    valid[:, None].int(),
+                    *pools,
+                    state_cache.row_indices(slots).masked_fill(~stored, -1).int(),
+                    state_cache.row_indices(previous)
+                    .masked_fill(has_prev | (slots < 0), -1)
+                    .int(),
+                ]
+            op = preprocess_ops.compress_rope(
+                ratio, len(pools), compressor.rms_norm_eps
+            )
+            latent, words, scales, *states = op(*args)
+            for pool, state in zip(pools, states, strict=True):
+                pool.copy_(state)
+        if not addresses:
+            assert compressed_slots is not None
+            records = self.kv_cache.row_indices(compressed_slots.clamp(min=0))
+            records = records.masked_fill(~valid | (compressed_slots < 0), -1)
+        assert records is not None and index_slots is not None
+        csa2_adapter.publish_main(self.kv_cache, records, words, scales)
         self._produce_index_k(
             latent, group_positions, index_k.kv_cache, index_slots, valid
         )
@@ -1085,6 +1177,7 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
             else self.window_size
         )
         csa2_metadata = csa2_bounds = csa2_write_records = None
+        swa_published = False
         if self._csa2:
             if not isinstance(swa_cache, PagedCacheRows):
                 raise ValueError("CSA2 requires a native shared word-row cache")
@@ -1106,16 +1199,35 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
             )
             cached = stage_cache.get(meta_key) if stage_cache is not None else None
             if cached is None or cached[0] is not swa.block_tables:
-                csa2_metadata, csa2_bounds, csa2_write_records = (
-                    csa2_adapter.prepare_swa(
-                        swa_table,
-                        swa.query_start_loc,
-                        positions,
-                        minimum,
-                        swa_cache,
-                        non_causal,
+                if (
+                    self._fused_preprocess
+                    and swa_cache.native_swa
+                    and rows_per_page == swa_cache.page_stride == 64
+                    and swa_cache.row_offset == 0
+                    and not non_causal
+                ):
+                    csa2_metadata, csa2_bounds, csa2_write_records = (
+                        csa2_adapter.prepare_publish_swa(
+                            swa_table,
+                            swa.query_start_loc,
+                            positions,
+                            minimum,
+                            swa_cache,
+                            kv.reshape(-1, 512),
+                        )
                     )
-                )
+                    swa_published = True
+                else:
+                    csa2_metadata, csa2_bounds, csa2_write_records = (
+                        csa2_adapter.prepare_swa(
+                            swa_table,
+                            swa.query_start_loc,
+                            positions,
+                            minimum,
+                            swa_cache,
+                            non_causal,
+                        )
+                    )
                 if stage_cache is not None:
                     stage_cache[meta_key] = (
                         swa.block_tables,
@@ -1402,7 +1514,10 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
             kv = self._rotate(kv, positions)
         if self._csa2:
             assert csa2_write_records is not None
-            csa2_adapter.publish_swa(swa_cache, csa2_write_records, kv.reshape(-1, 512))
+            if not swa_published:
+                csa2_adapter.publish_swa(
+                    swa_cache, csa2_write_records, kv.reshape(-1, 512)
+                )
         else:
             _insert(swa_cache, swa_slots, kv, swa_valid)
         weights = None
@@ -2031,6 +2146,15 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
             preprocess_ops.qb_rope()
             if self.compressor is not None:
                 ratio = self.compress_ratio
+                if ratio == 2:
+                    self._packed_compressor_op = preprocess_ops.compress_rope_packed(
+                        self.compressor.rms_norm_eps
+                    )
+                    self._address_compressor_op = (
+                        preprocess_ops.compress_rope_addresses(
+                            self.compressor.rms_norm_eps
+                        )
+                    )
                 for banks in (0,) if ratio == 1 else (1, 2):
                     preprocess_ops.compress_rope(
                         ratio, banks, self.compressor.rms_norm_eps
@@ -2049,6 +2173,22 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
             self._q_projection_rope_op = initialize_projection_rope()
         if self.wo_a.weight.device.type == "tpu":
             _ = self.o_proj_op
+        # wo_b joins wo_a in one call when it is a plain TP1 per-channel FP8
+        # linear on the canonical (k, n) layout, which is what wo_b's own
+        # quantized_matmul would consume.
+        wo_b_scale = getattr(self.wo_b, "weight_scale", None)
+        self._fused_wo_b = (
+            self._csa2
+            and tp_size == 1
+            and getattr(self.wo_b, "bias", None) is None
+            and getattr(self.wo_b, WEIGHT_FLIPPED_ATTR, False)
+            and self.wo_b.weight.dtype == torch.float8_e4m3fn
+            and self.wo_b.weight.shape
+            == (self.n_groups * self.o_lora_rank, self.hidden_size)
+            and wo_b_scale is not None
+            and wo_b_scale.dtype == torch.float32
+            and wo_b_scale.shape == (self.hidden_size,)
+        )
 
     def _flip_compressor_weight(self):
         """Store the compressor projection as (k, n) for the fused kernel.
@@ -2124,6 +2264,14 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
         assert output.dtype == torch.bfloat16
         assert output.shape[1:] == (self.n_local_heads, self.head_dim)
         if self._csa2:
+            if self._fused_wo_b:
+                return csa2_adapter.project_out(
+                    output,
+                    self.wo_a.weight,
+                    self.wo_a.weight_scale,
+                    self.wo_b.weight,
+                    self.wo_b.weight_scale,
+                )
             projected = csa2_adapter.project(
                 output, self.wo_a.weight, self.wo_a.weight_scale
             )
