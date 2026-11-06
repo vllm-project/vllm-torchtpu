@@ -605,6 +605,31 @@ def test_split_weights_ref_blocks_equal_the_whole_tile(nsplit):
             np.testing.assert_array_equal(ref.weight_block(k0, k1, n0, n1), tile[k0:k1, n0:n1])
 
 
+@pytest.mark.parametrize("trim_rows", [True, False])
+def test_ragged_gather_v2_traces_with_either_trim_choice(monkeypatch, trim_rows):
+    """The real SparseCore gather traces (shape only, TPU 7x info pinned) with
+    trim_rows passed by keyword, as fused_moe_gmm passes it: trim_rows must be
+    static (a traced bool cannot pick the slice). mb4 j-7ac1df58 failed every
+    sc / sc_padded arm with TracerBoolConversionError before this was fixed."""
+    from jax._src import tpu_info as ti
+    from jax._src.pallas.mosaic import tpu_info as pti
+    from jax.experimental.pallas import tpu as pltpu
+
+    from vllm_torchtpu.kernels.sparse_core import ragged_gather_v2 as rg
+
+    info = ti.get_tpu_info_for_chip(ti.ChipVersion.TPU_7X, 1)
+    for mod in (pltpu, ti, pti):
+        monkeypatch.setattr(mod, "get_tpu_info", lambda: info, raising=False)
+    rows, hidden, n = 1000, 256, 3000
+    x = jax.ShapeDtypeStruct((rows, hidden), jnp.bfloat16)
+    idx = jax.ShapeDtypeStruct((n,), jnp.int32)
+    se = jax.ShapeDtypeStruct((1,), jnp.int32)
+    out = jax.eval_shape(lambda x_, i_, s_, e_: rg.ragged_gather_v2(x_, i_, s_, e_, trim_rows=trim_rows),
+                         x, idx, se, se)
+    assert out.shape[1] == hidden
+    assert (out.shape[0] == n) if trim_rows else (out.shape[0] >= n)
+
+
 def test_sc_padded_gather_matches_sc_and_keeps_padded_rows(monkeypatch):
     """TPU_MOE_NONEP_GATHER=sc_padded: the gathered rows keep the kernel's
     padded row blocks (no trimming copy), and the MoE output is bitwise the

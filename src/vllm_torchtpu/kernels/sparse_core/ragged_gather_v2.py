@@ -215,7 +215,7 @@ def main_kernel_v2(
     )(indices_hbm_ref)
 
 
-@jax.jit
+@functools.partial(jax.jit, static_argnames=("trim_rows",))
 def ragged_gather_v2(
     x: jax.Array,
     indices: jax.Array,
