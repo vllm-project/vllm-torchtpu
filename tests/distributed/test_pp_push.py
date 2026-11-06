@@ -362,6 +362,19 @@ def test_the_ring_keeps_half_the_stages_again_in_flight():
     assert [pp_push.ring_extra_steps(stages) for stages in (2, 4, 8)] == [1, 2, 4]
 
 
+@pytest.mark.parametrize("extra", [1, 6, 10])
+def test_ring_extra_steps_override(monkeypatch, extra):
+    monkeypatch.setenv("TPU_PP_RING_EXTRA_STEPS", str(extra))
+    assert pp_push.ring_extra_steps(4) == extra
+
+
+@pytest.mark.parametrize("value", ["-1", "invalid"])
+def test_ring_extra_steps_rejects_invalid_input(monkeypatch, value):
+    monkeypatch.setenv("TPU_PP_RING_EXTRA_STEPS", value)
+    with pytest.raises(ValueError, match="TPU_PP_RING_EXTRA_STEPS"):
+        pp_push.ring_extra_steps(4)
+
+
 def test_the_rings_hold_the_extra_steps(monkeypatch, ring, queue):
     assert pp_push.rpc_ring_chunks(8, 4) == 4 * 12 + 8
     _bare_executor_cls(monkeypatch)

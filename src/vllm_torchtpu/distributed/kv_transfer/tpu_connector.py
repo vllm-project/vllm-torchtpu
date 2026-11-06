@@ -5040,14 +5040,14 @@ class TPURaidenConnectorWorker:
             )
         return live_bytes // page_tokens
 
-    def _stage3_state_live_bytes(self, tag: str) -> int:
-        """Return the admitted whole-slot byte size for an exact state tag."""
-        manifest = self._raiden_manifest
-        if manifest is None or not hasattr(manifest, "geometry_by_tag"):
-            raise RuntimeError("GDN state reshard requires the admitted pool manifest")
+    @staticmethod
+    def _stage3_state_live_bytes(
+        geometry_by_tag: dict[str, dict[str, int]], tag: str
+    ) -> int:
+        """Read one exact state tag from this registration's geometry snapshot."""
         from vllm_torchtpu.distributed.kv_transfer.raiden.tags import class_tag
 
-        geometry = manifest.geometry_by_tag().get(class_tag(tag))
+        geometry = geometry_by_tag.get(class_tag(tag))
         if not geometry:
             raise RuntimeError(
                 f"GDN state tag {tag!r} is absent from the pool manifest"
@@ -5217,7 +5217,11 @@ class TPURaidenConnectorWorker:
             physical_granule = geometry.packing * geometry.page_tokens
 
         registrations = []
-        for exact_tag, ordinal in self._stage3_state_registration_tags():
+        state_tags = self._stage3_state_registration_tags()
+        # All tags in this registration see the same admitted manifest. Rebuild
+        # once per call (not per layer); do not cache across mutable manifests.
+        geometry_by_tag = self._raiden_manifest.geometry_by_tag() if state_tags else {}
+        for exact_tag, ordinal in state_tags:
             block_id = mamba_state_block_ids[ordinal]
             if aliased_raw and not self._stage3_kimi:
                 matching_pools = tuple(
@@ -5234,7 +5238,9 @@ class TPURaidenConnectorWorker:
                         "aliased raw GDN pool base and block stride must "
                         f"be physical-token aligned ({exact_tag})"
                     )
-            admitted_live_bytes = self._stage3_state_live_bytes(exact_tag)
+            admitted_live_bytes = self._stage3_state_live_bytes(
+                geometry_by_tag, exact_tag
+            )
             if self._stage3_kimi:
                 dst_shards = tpu_envs.TPU_RAIDEN_DST_SHARDS
                 assert dst_shards is not None
