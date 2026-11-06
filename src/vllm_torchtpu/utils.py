@@ -132,7 +132,7 @@ def local_device_kind() -> str:
 
 
 def get_device_name(num_devices: int | None = None):
-    kind = jax.devices()[0].device_kind
+    kind = local_device_kind()
     if "TPU" not in kind:
         raise RuntimeError("Expected TPU devices")
     suffix = ""
