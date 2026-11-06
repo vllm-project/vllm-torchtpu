@@ -190,7 +190,8 @@ def test_shorthands_do_not_collide_with_config_tokens() -> None:
     reserved = {"ep", "tp", "auto", *cfg_mod._TRUE_STRS, *cfg_mod._FALSE_STRS}
     assert not set(plugin_mod.SHORTHANDS) & reserved
     for entry in plugin_mod.SHORTHANDS.values():
-        assert not entry.legacy_keys & cfg_mod.RUNTIME_KEYS
+        spec = importlib.import_module(entry.module).SPEC
+        assert not spec.top_level_options & cfg_mod.RUNTIME_KEYS
 
 
 _FRESH_IMPORT = """

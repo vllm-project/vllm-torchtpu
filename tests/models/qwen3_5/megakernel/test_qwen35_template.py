@@ -71,14 +71,13 @@ def test_shorthand_table_matches_the_template() -> None:
     sh = SHORTHANDS["qwen35"]
     assert sh.architectures == qwen35.Qwen35.hf_architectures
     assert sh.model_types == qwen35.Qwen35.hf_model_type
-    assert sh.legacy_keys == adapter.OPTION_KEYS
     assert qwen_plugin.SPEC.top_level_options == adapter.OPTION_KEYS
     # The SPEC declares the same checkpoints, so the folder is also found
-    # without the table (the table adds the top-level template keys).
+    # without the table.
     assert qwen_plugin.SPEC.architectures == sh.architectures
     assert qwen_plugin.SPEC.model_types == sh.model_types
     found = discovered_shorthands()["qwen35"]
-    assert (found.module, found.legacy_keys) == (_MODULE, frozenset())
+    assert found == sh
     assert qwen_plugin.SPEC.name == "qwen35"
     assert qwen_plugin.SPEC.create == ".adapter:create"
     assert qwen_plugin.SPEC.features == frozenset(

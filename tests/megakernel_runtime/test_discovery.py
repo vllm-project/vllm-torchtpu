@@ -83,8 +83,7 @@ def test_the_built_in_folders_declare_what_the_table_lists() -> None:
         assert found[name].module == entry.module
         assert found[name].architectures == entry.architectures
         assert found[name].model_types == entry.model_types
-        assert found[name].legacy_keys == frozenset()
-        # The table entry (with its top-level template keys) wins.
+        # The table entry wins.
         assert shorthands()[name] is entry
     assert discovered_shorthands() is found  # once per process
 
@@ -113,7 +112,7 @@ def test_a_new_folder_is_found_by_architecture_and_model_type(
     ref, _ = cfg_mod.resolve_plugin_ref(cfg_mod.parse_config({"plugin": "FakeMK"}))
     assert (ref.module, ref.shorthand) == (module, "fakemk")
     assert cfg_mod.missing_template(ref, by_arch) is None
-    # Settings go through `options`: no top-level template keys.
+    # A top-level key its SPEC doesn't list as a top-level option raises.
     cfg = cfg_mod.parse_config({"plugin": "fakemk", "profile": "x"})
     with pytest.raises(MegakernelConfigError, match="unknown key 'profile'"):
         cfg_mod.resolve_plugin_ref(cfg)
@@ -165,7 +164,7 @@ def test_the_explicit_table_wins(
     models_dir: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _folder(models_dir, "zz_fake_mk", "fakemk", 'architectures=("FakeForCausalLM",)')
-    other = Shorthand("other.mk", ("FakeForCausalLM",), (), frozenset({"mode"}))
+    other = Shorthand("other.mk", ("FakeForCausalLM",), ())
     monkeypatch.setitem(SHORTHANDS, "zz_claim", other)
     hf = SimpleNamespace(architectures=["FakeForCausalLM"])
     assert cfg_mod.shorthand_for_arch(hf) == "zz_claim"

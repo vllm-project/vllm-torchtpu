@@ -41,10 +41,9 @@ copy's tests, serve it). Then adapt the `ModelDef` (`model.py`:
 `hf_architectures`, `hf_model_type`, geometry) and `SPEC.architectures` /
 `SPEC.model_types`: a folder under `vllm_torchtpu.models` whose `SPEC` lists a
 checkpoint's architecture or model type is picked for it, and selectable as
-`plugin=<SPEC.name>`, with no shared-code edit. An entry in
-`megakernel_runtime.plugin.SHORTHANDS` is needed only for top-level template
-keys or the bare `VLLM_TPU_MEGAKERNEL=<name>` form. See "Adapting this folder"
-below.
+`plugin=<SPEC.name>` or `VLLM_TPU_MEGAKERNEL=<SPEC.name>`, with no
+shared-code edit; `SPEC.top_level_options` lists the options a user may also
+set at the top level of the config. See "Adapting this folder" below.
 
 ### 2. Test (CPU, no TPU)
 

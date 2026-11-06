@@ -54,15 +54,14 @@ class Shorthand(NamedTuple):
     `architectures` / `model_types` match the HF config's `architectures`
     entries and `model_type` (also of its `text_config`); `hf_fields`
     (`(field, value)` pairs, read from the HF config or its `text_config`)
-    narrows a match, and an entry with `hf_fields` is preferred. Top-level
-    template keys (`legacy_keys`) are forwarded into `options` only for this
-    entry.
+    narrows a match, and an entry with `hf_fields` is preferred. The
+    template's own settings, including which may be set at the top level of
+    the config, are in its `SPEC` (`TpuMonoSpec.top_level_options`).
     """
 
     module: str
     architectures: tuple[str, ...]
     model_types: tuple[str, ...]
-    legacy_keys: frozenset[str]
     hf_fields: tuple[tuple[str, Any], ...] = ()
 
 
@@ -78,19 +77,6 @@ SHORTHANDS: Mapping[str, Shorthand] = {
             "Qwen3_5ForCausalLM",
         ),
         model_types=("qwen3_5_moe", "qwen3_5", "qwen3_5_moe_text"),
-        legacy_keys=frozenset(
-            {
-                "profile",
-                "mode",
-                "buckets",
-                "verify_buckets",
-                "fused_pool_io",
-                "fused_pool_io_max_b",
-                "fused_pool_io_min_b_hi",
-                "pool_gather",
-                "compile_hlo_check",
-            }
-        ),
     ),
 }
 
@@ -105,9 +91,8 @@ def discovered_shorthands() -> Mapping[str, Shorthand]:
     `megakernel/__init__.py` on disk is imported, which runs that package's
     `__init__` and the folder's stdlib-only `__init__` (`SPEC`), never its
     `create` target. Packages without a `megakernel` folder aren't imported.
-    A folder that fails to import is skipped with a warning. A discovered
-    folder takes settings through `options` only (no top-level template
-    keys); on a name clash the first package in name order wins.
+    A folder that fails to import is skipped with a warning. On a name clash
+    the first package in name order wins.
     """
     try:
         models = importlib.import_module(MODELS_PACKAGE)
@@ -145,7 +130,6 @@ def discovered_shorthands() -> Mapping[str, Shorthand]:
             module=module,
             architectures=spec.architectures,
             model_types=spec.model_types,
-            legacy_keys=frozenset(),
             hf_fields=spec.hf_fields,
         )
     return MappingProxyType(found)
