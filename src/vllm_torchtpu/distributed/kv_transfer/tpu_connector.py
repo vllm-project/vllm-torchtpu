@@ -6686,9 +6686,17 @@ class TPURaidenConnectorWorker:
                 got[dest] = what
         compared = [(d, w) for d, w in reference if d in got]
         mismatches = sum(1 for d, w in compared if got[d] != w)
+        # Direction. conservative: the batched pass parked (or expired) a load the
+        # per-load reference admitted; permissive: the reverse; expiry: both left it
+        # unadmitted but disagree on parked vs expired. A staging page released by
+        # another thread between the reference and the batched pass (e.g. a
+        # release-only cancellation) can produce either admission direction without
+        # any unsafety: the batched pass only ever allocates pages free on every rank.
+        conservative = sum(1 for d, w in compared if w == "reserved" and got[d] != "reserved")
+        permissive = sum(1 for d, w in compared if w != "reserved" and got[d] == "reserved")
         logger.info(
             "Stage-3 batched admission check rank%d: loads %d compared %d mismatches %d "
-            "collectives %d (per-load path: %d) (%d left)",
+            "collectives %d (per-load path: %d) (%d left) | conservative %d permissive %d expiry %d",
             self.tp_rank,
             len(reference),
             len(compared),
@@ -6696,6 +6704,9 @@ class TPURaidenConnectorWorker:
             admission.collectives,
             sum(1 + (w != "reserved") for _, w in compared),
             self._stage3_admission_checks_left,
+            conservative,
+            permissive,
+            mismatches - conservative - permissive,
         )
 
     def _stage3_admission_period_note(self, passes: int, on: bool) -> None:

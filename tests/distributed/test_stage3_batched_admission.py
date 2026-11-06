@@ -326,7 +326,16 @@ def test_connector_pass_wiring(monkeypatch):
     a.reference = [("a", "parked"), ("b", "parked")]
     w._stage3_admission_checks_left = 1
     W._stage3_admission_compare(w, a)
-    assert any("compared 2 mismatches 1" in m for m in logs), logs
+    assert any("compared 2 mismatches 1" in m and "conservative 0 permissive 1 expiry 0" in m for m in logs), logs
+    # ... and the other directions: batched parked what the reference admitted; parked vs expired.
+    a.reference = [("a", "reserved"), ("b", "reserved")]
+    w._stage3_admission_checks_left = 1
+    W._stage3_admission_compare(w, a)
+    assert any("mismatches 1" in m and "conservative 1 permissive 0 expiry 0" in m for m in logs), logs
+    a.reference = [("a", "reserved"), ("b", "expired")]
+    w._stage3_admission_checks_left = 1
+    W._stage3_admission_compare(w, a)
+    assert any("mismatches 1" in m and "conservative 0 permissive 0 expiry 1" in m for m in logs), logs
     # A/B: off for 2 passes, on for 2, off ... counted per pass
     envs_ns.QWEN4_EXP_PD_BATCHED_ADMISSION, envs_ns.QWEN4_EXP_PD_BATCHED_ADMISSION_AB_PASSES = False, 2
     w._stage3_admission_passes = 0
