@@ -207,15 +207,16 @@ def test_shorthand_table_entries() -> None:
             assert isinstance(key, str) and claimed.setdefault(key, name) == name
 
 
-def test_plugin_reexports_the_contract() -> None:
-    assert plugin_mod.TpuMonoSpec is contract.TpuMonoSpec
-    assert plugin_mod.EligibilityResult is mk_errors.EligibilityResult
-    assert plugin_mod.StepDecision is contract.StepDecision
-    assert issubclass(plugin_mod.LayoutDecline, mk_errors.MegakernelLayoutError)
-    dec = plugin_mod.Decline("too_small", "msg")
+def test_contract_types_have_one_import_path() -> None:
+    """The contract types are imported from `megakernel.runtime.contract`
+    only; `plugin` neither exports nor re-binds them."""
+    for name in contract.__all__:
+        assert not hasattr(plugin_mod, name), name
+    assert not set(plugin_mod.__all__) & set(contract.__all__)
+    assert contract.EligibilityResult is mk_errors.EligibilityResult
+    assert issubclass(contract.LayoutDecline, mk_errors.MegakernelLayoutError)
+    dec = contract.Decline("too_small", "msg")
     assert dec.result == mk_errors.EligibilityResult(False, "too_small", "msg")
-    with pytest.raises(AttributeError):
-        _ = plugin_mod.NoSuchName
 
 
 def test_step_context_and_package_exports() -> None:

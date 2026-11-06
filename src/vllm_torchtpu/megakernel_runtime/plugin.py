@@ -16,11 +16,11 @@
 The model contract itself (`TpuMonoSpec`, the `MonoProgram` protocol,
 `Bucket`, `RunnerShape`, `WarmupCase`, `Decline`, `LayoutDecline`,
 `StepDecision`, `EligibilityResult`, the feature / parallelism / `requires`
-vocabularies) lives in the framework-free `megakernel.runtime.contract` and is
-re-exported here. What stays here are the runtime's own facts about the
-runner: `RunnerView` (startup / bind) and `ForwardView` (per step), and the
-shorthands: the built-in table and the model folders discovered by their
-`SPEC` (`shorthands()`).
+vocabularies) lives in the framework-free `megakernel.runtime.contract`;
+import it from there (its only import path). Here are the runtime's own
+facts about the runner, `RunnerView` (startup / bind) and `ForwardView` (per
+step), and the shorthands: the built-in table and the model folders
+discovered by their `SPEC` (`shorthands()`).
 
 Stdlib only at import (no torch / jax / vLLM).
 """
@@ -34,26 +34,13 @@ import os
 import pkgutil
 from collections.abc import Callable, Mapping
 from types import MappingProxyType
-from typing import Any, NamedTuple
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 from vllm_torchtpu.logger import init_logger
-from vllm_torchtpu.megakernel.runtime.contract import (
-    API_VERSION,
-    FEATURES,
-    NUMERICS,
-    PARALLELISM,
-    REQUIRES_KEYS,
-    Bucket,
-    Decline,
-    EligibilityResult,
-    LayoutDecline,
-    MonoProgram,
-    RunnerShape,
-    StepDecision,
-    StepFn,
-    TpuMonoSpec,
-    WarmupCase,
-)
+from vllm_torchtpu.megakernel.runtime import contract as _contract
+
+if TYPE_CHECKING:
+    from vllm_torchtpu.megakernel.runtime.contract import StepFn
 
 logger = init_logger(__name__)
 
@@ -149,7 +136,7 @@ def discovered_shorthands() -> Mapping[str, Shorthand]:
                 exc,
             )
             continue
-        if not isinstance(spec, TpuMonoSpec):
+        if not isinstance(spec, _contract.TpuMonoSpec):
             continue
         name = spec.name.lower()
         if not (spec.architectures or spec.model_types) or name in found:
@@ -337,26 +324,11 @@ class ForwardView:
 
 
 __all__ = [
-    "API_VERSION",
-    "FEATURES",
-    "NUMERICS",
-    "PARALLELISM",
-    "REQUIRES_KEYS",
     "MODELS_PACKAGE",
     "SHORTHANDS",
-    "Bucket",
-    "Decline",
-    "EligibilityResult",
     "ForwardView",
-    "LayoutDecline",
-    "MonoProgram",
-    "RunnerShape",
     "RunnerView",
     "Shorthand",
-    "StepDecision",
-    "StepFn",
-    "TpuMonoSpec",
-    "WarmupCase",
     "discovered_shorthands",
     "shorthands",
 ]
