@@ -111,7 +111,8 @@ if TYPE_CHECKING:
     TPU_STREAMIDX_CHUNK_TOKENS: int | None = None
     TPU_MOE_COLLECTION_CHUNK_SIZE: int = 0
     TPU_MOE_RAGGED_A2A: bool = False
-    TPU_MOE_A2A_CAPACITY: float = 2.0
+    TPU_MOE_A2A_CAPACITY: float = 2.5
+    TPU_MOE_A2A_ROUTE_CAPACITY: float = 3.0
     TPU_MOE_ROUTING_REPLAY: str = ""
     PCP_FA_KERNEL_BLOCK_SIZE: int | None = None
     PCP_GDN_COMM_CHUNK_SIZE: int | None = None
@@ -816,7 +817,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Ragged all-to-all exchange: size the per-rank token rows and local routes
     # at this many times their uniform-routing mean (exact: a step that does
     # not fit runs the full-size exchange). 0 = always full size.
-    "TPU_MOE_A2A_CAPACITY": env_float("TPU_MOE_A2A_CAPACITY", 2.0),
+    "TPU_MOE_A2A_CAPACITY": env_float("TPU_MOE_A2A_CAPACITY", 2.5),
+    # The local routes' factor (0 = TPU_MOE_A2A_CAPACITY): real routing skews
+    # routes more than rows. Both factors are capped at 2 where the full-size
+    # exchange stays on the one-hot path (its rerun is cheap there).
+    "TPU_MOE_A2A_ROUTE_CAPACITY": env_float("TPU_MOE_A2A_ROUTE_CAPACITY", 3.0),
     # Profiling only: the router emits the expert ids captured in this .npz
     # (ids [layers, windows, positions, topk]); see
     # layers/adapter/routing_replay.py. Model output is meaningless.

@@ -40,7 +40,8 @@ With many DP members, a rank receives only a fraction of the group's tokens
 still. The capacity exchange sizes its buffers and the local MoE for a
 multiple of those means instead of the whole group; a step whose routing does
 not fit on some rank runs the full-size exchange, so results never depend on
-the capacity.
+the capacity. Real routing loads the busiest rank with about twice the mean
+rows and more than twice the mean routes, so the routes take their own factor.
 """
 
 import functools
@@ -57,6 +58,9 @@ TP_AXIS = "tp"
 # Capacity buffers grow in whole bf16 row tiles and whole GMM row tiles.
 _ROW_TILE = 16
 _ROUTE_TILE = 128
+# Largest factor used where the full-size exchange stays on the one-hot path:
+# its rerun is cheap there, so larger buffers cost more than they save.
+_ONEHOT_FALLBACK_FACTOR = 2.0
 
 
 def _member_index(
@@ -164,18 +168,25 @@ def exchange_capacity(
     factor: float,
     onehot_moe_permute_threshold: int,
     use_sparse_core: bool,
+    route_factor: float | None = None,
 ) -> tuple[int, int]:
     """Static sizes of the capacity exchange: ``(rows, routes)``.
 
     ``rows`` bounds the token rows each rank sends and receives, ``routes``
-    the routes hitting its local experts: ``factor`` times their mean under
-    uniform routing, rounded up to whole tiles and capped at the sizes that
-    always fit (``dp_size * num_tokens`` rows, ``topk`` routes per row). The
-    route bound only applies where the bounded routes fit the one-hot path.
+    the routes hitting its local experts: ``factor`` (``route_factor`` for
+    the routes, when given) times their mean under uniform routing, rounded
+    up to whole tiles and capped at the sizes that always fit (``dp_size *
+    num_tokens`` rows, ``topk`` routes per row). The route bound only applies
+    where the bounded routes fit the one-hot path. Where the full-size
+    exchange's routes fit it too, both factors are capped at
+    ``_ONEHOT_FALLBACK_FACTOR``.
     """
     slots = dp_size * num_tokens
     if factor <= 0:
         return slots, slots * topk
+    if use_sparse_core and slots * topk <= onehot_moe_permute_threshold:
+        factor = min(factor, _ONEHOT_FALLBACK_FACTOR)
+        route_factor = min(route_factor or factor, _ONEHOT_FALLBACK_FACTOR)
     num_ranks = dp_size * tp_size
     num_experts = num_ranks * local_num_experts
     miss = 1.0  # a token's topk distinct experts all on other ranks
@@ -183,7 +194,7 @@ def exchange_capacity(
         miss *= max(num_experts - local_num_experts - i, 0) / (num_experts - i)
     rows = -(-math.ceil(factor * slots * (1 - miss)) // _ROW_TILE) * _ROW_TILE
     rows = min(rows, slots)
-    routes = math.ceil(factor * slots * topk / num_ranks)
+    routes = math.ceil((route_factor or factor) * slots * topk / num_ranks)
     routes = min(-(-routes // _ROUTE_TILE) * _ROUTE_TILE, rows * topk)
     if not (use_sparse_core and routes <= onehot_moe_permute_threshold):
         return rows, rows * topk
@@ -444,6 +455,7 @@ def ragged_a2a_moe_local(
     rhs_quant_dtype=None,
     skip_padded_tokens: bool = False,
     capacity_factor: float = 0.0,
+    route_factor: float = 0.0,
 ) -> jax.Array:
     """Per-rank body (inside shard_map over the (dp, tp) mesh).
 
@@ -452,7 +464,8 @@ def ragged_a2a_moe_local(
     rank's [S, H] sum over its DP group, before the TP all-reduce.
 
     With ``capacity_factor`` > 0 and fewer capacity rows than DP-group tokens,
-    the exchange and the local MoE are sized by ``exchange_capacity``; a step
+    the exchange and the local MoE are sized by ``exchange_capacity`` (the
+    routes by ``route_factor`` when it is > 0); a step
     whose routing exceeds those sizes on any rank runs the full-size exchange
     instead. Both give the same result.
     """
@@ -508,6 +521,7 @@ def ragged_a2a_moe_local(
         factor=capacity_factor,
         onehot_moe_permute_threshold=onehot_moe_permute_threshold,
         use_sparse_core=use_sparse_core,
+        route_factor=route_factor or None,
     )
     if rows >= slots:
         # Bounding the routes alone saves less than the conditional costs
@@ -558,6 +572,7 @@ def ragged_a2a_moe(
     rhs_quant_dtype=None,
     skip_padded_tokens: bool = False,
     capacity_factor: float = 0.0,
+    route_factor: float = 0.0,
 ) -> jax.Array:
     """Global-view entry: every operand is the ranks' local arrays stacked on
     two leading axes [dp, tp, ...], and so is the result [dp, tp, S, H]."""
@@ -573,6 +588,7 @@ def ragged_a2a_moe(
         rhs_quant_dtype=rhs_quant_dtype,
         skip_padded_tokens=skip_padded_tokens,
         capacity_factor=capacity_factor,
+        route_factor=route_factor,
     )
 
     def body(*args):

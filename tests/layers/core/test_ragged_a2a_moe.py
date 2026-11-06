@@ -14,6 +14,7 @@
 """Ragged all-to-all EP exchange against the all-gather + reduce-scatter path."""
 
 import functools
+import os
 
 import jax
 import jax.numpy as jnp
@@ -488,6 +489,7 @@ def ra_capacity(**kw):
 
 
 @pytest.mark.multichip
+@pytest.mark.parametrize("route_factor", [0.0, 3.0])
 @pytest.mark.parametrize("factor", [0.5, 1.0, 2.0])
 @pytest.mark.parametrize(
     "dp_size,tp_size,num_tokens,topk,skew",
@@ -501,7 +503,7 @@ def ra_capacity(**kw):
     ],
 )
 def test_capacity_exchange_matches_full_exchange(
-    dp_size, tp_size, num_tokens, topk, skew, factor
+    dp_size, tp_size, num_tokens, topk, skew, factor, route_factor
 ):
     """Bitwise the full-size exchange, whether the step fits the capacity
     buffers or overflows into the full-size path (factor 0.5 always
@@ -527,9 +529,14 @@ def test_capacity_exchange_matches_full_exchange(
     full = np.asarray(full)
     assert np.isfinite(full.astype(np.float32)).all()
     assert np.abs(full.astype(np.float32)).max() > 0
-    got = jax.jit(functools.partial(ragged_a2a_moe, capacity_factor=factor, **common))(
-        *stacked
-    )
+    got = jax.jit(
+        functools.partial(
+            ragged_a2a_moe,
+            capacity_factor=factor,
+            route_factor=route_factor,
+            **common,
+        )
+    )(*stacked)
     np.testing.assert_array_equal(np.asarray(got).view(np.uint16), full.view(np.uint16))
 
 
@@ -746,3 +753,154 @@ def test_local_routes_matches_onehot_path(num_tokens, max_local_routes, skip_pad
     assert np.isfinite(want.astype(np.float32)).all()
     assert np.abs(want.astype(np.float32)).max() > 0
     np.testing.assert_array_equal(np.asarray(got).view(np.uint16), want.view(np.uint16))
+
+
+@pytest.mark.cpu_test
+def test_exchange_capacity_route_factor():
+    # 4 hosts dp8 x tp4, 12 requests per engine with 3 drafts: ~105 rows and
+    # 120 routes per rank on average.
+    kw = dict(
+        dp_size=8,
+        tp_size=4,
+        num_tokens=48,
+        topk=10,
+        local_num_experts=16,
+        onehot_moe_permute_threshold=3840,
+        use_sparse_core=True,
+    )
+    assert exchange_capacity(factor=2.0, **kw) == (224, 256)
+    # The full-size exchange's 3840 routes stay one-hot: factors capped at 2.
+    assert exchange_capacity(factor=2.5, route_factor=3.0, **kw) == (224, 256)
+    kw["onehot_moe_permute_threshold"] = 3839
+    assert exchange_capacity(factor=2.0, route_factor=3.0, **kw) == (224, 384)
+    assert exchange_capacity(factor=2.5, route_factor=3.0, **kw) == (272, 384)
+    # 23 requests per engine: 7360 routes leave the one-hot path.
+    kw.update(num_tokens=92, onehot_moe_permute_threshold=3840)
+    assert exchange_capacity(factor=2.5, route_factor=3.0, **kw) == (512, 768)
+    # Route bounds above the one-hot threshold are not bounded.
+    kw["onehot_moe_permute_threshold"] = 512
+    assert exchange_capacity(factor=2.5, route_factor=3.0, **kw) == (512, 5120)
+
+
+def _routes_only_ids(num_tokens, local):
+    """Top-2 routing on 8 members of 8 experts: token n routes to experts
+    n % 64 and (n + 32) % 64, so every member gets 2 * tokens / 8 rows and
+    routes; tokens whose first expert is on member 0 send their second route
+    there too, which raises member 0's routes by half and keeps its rows."""
+    n = np.arange(8 * num_tokens)
+    ids = np.stack([n % 64, (n + 32) % 64], axis=1)
+    on0 = ids[:, 0] // local == 0
+    ids[on0, 1] = (ids[on0, 0] + 1) % local
+    return ids.reshape(8, num_tokens, 2).astype(np.int32)
+
+
+@pytest.mark.multichip
+def test_route_factor_keeps_route_only_overflow_off_the_full_exchange():
+    """A step whose rows fit and whose busiest rank's routes pass the row
+    factor's route bound: with the route factor it stays on the capacity
+    path; both match the full-size exchange bitwise."""
+    devices = _require_eight_tpu_devices()
+    mesh = Mesh(np.asarray(devices).reshape(8, 1), (DP_AXIS, TP_AXIS))
+    num_tokens, local, topk = 48, 8, 2
+    threshold = resolve_onehot_permute_threshold(8 * num_tokens * topk)
+    sizing = dict(
+        dp_size=8,
+        tp_size=1,
+        num_tokens=num_tokens,
+        topk=topk,
+        local_num_experts=local,
+        onehot_moe_permute_threshold=threshold,
+        use_sparse_core=True,
+    )
+    ids = _routes_only_ids(num_tokens, local)
+    common = dict(
+        mesh=mesh,
+        topk=topk,
+        activation="silu",
+        use_sparse_core=True,
+        onehot_moe_permute_threshold=threshold,
+    )
+    base = _inputs(8, 1, num_tokens, 64, skew=False, topk=topk)
+    args = base[:6] + (jnp.asarray(ids.reshape(-1, topk)), base[7])
+    stacked = tuple(a.reshape(8, 1, -1, *a.shape[1:]) for a in args)
+    full = np.asarray(jax.jit(functools.partial(ragged_a2a_moe, **common))(*stacked))
+    assert np.abs(full.astype(np.float32)).max() > 0
+    for route_factor, overflow in [(0.0, True), (2.5, False)]:
+        rows, routes = exchange_capacity(
+            factor=1.25, route_factor=route_factor or None, **sizing
+        )
+        assert rows < 8 * num_tokens
+        assert _overflow_reference(ids, 1, local, rows, routes) == overflow
+        got = jax.jit(
+            functools.partial(
+                ragged_a2a_moe,
+                capacity_factor=1.25,
+                route_factor=route_factor,
+                **common,
+            )
+        )(*stacked)
+        np.testing.assert_array_equal(
+            np.asarray(got).view(np.uint16), full.view(np.uint16)
+        )
+
+
+@pytest.mark.multichip
+@pytest.mark.skipif(
+    not os.environ.get("RAGGED_A2A_REAL_ROUTES"),
+    reason="RAGGED_A2A_REAL_ROUTES=<npz of captured ids [layers, windows, 4, 10]>",
+)
+def test_capacity_exchange_real_routing():
+    """Captured real routing (top-10 of 512 experts; a request = 4 positions of
+    a window, 12 requests per engine) on one TP rank's DP group of DP8 x TP4:
+    8 members with 16 experts each, routes to the other TP ranks' experts
+    dropped. Every capacity variant matches the full-size exchange bitwise on
+    every captured layer, whether the layer fits or overflows. The module
+    sizes for the 8 ranks present, which reach ~3x more tokens than one of 32
+    ranks, so the factors here are ~0.3x the served ones (0.75 ~ x2.5)."""
+    devices = _require_eight_tpu_devices()
+    mesh = Mesh(np.asarray(devices).reshape(8, 1), (DP_AXIS, TP_AXIS))
+    real = np.load(os.environ["RAGGED_A2A_REAL_ROUTES"])["ids"]
+    num_layers, num_windows, positions, topk = real.shape
+    hidden, inter, local, requests = 256, 256, 16, 12
+    num_tokens = requests * positions
+    k1, k2, kx, kw = jax.random.split(jax.random.key(0), 4)
+    w1 = jax.random.normal(k1, (8 * local, hidden, 2 * inter)) / 8
+    w2 = jax.random.normal(k2, (8 * local, inter, hidden)) / 8
+    w1, s1 = quantize_to_native_fp4_kmajor(w1, 256, pack=False)
+    w2, s2 = quantize_to_native_fp4_kmajor(w2, 256, pack=False)
+    es = jnp.arange(8, dtype=jnp.int32) * local
+    x = (jax.random.normal(kx, (8 * num_tokens, hidden)) / 4).astype(jnp.bfloat16)
+    weights = jax.nn.softmax(jax.random.normal(kw, (8 * num_tokens, topk)), -1)
+    weights = weights.astype(jnp.bfloat16)
+    threshold = resolve_onehot_permute_threshold(8 * num_tokens * topk)
+    common = dict(
+        mesh=mesh,
+        topk=topk,
+        activation="silu",
+        use_sparse_core=True,
+        onehot_moe_permute_threshold=threshold,
+    )
+    variants = {
+        "full": {},
+        "rows": dict(capacity_factor=0.6),
+        "routes": dict(capacity_factor=0.6, route_factor=0.8),
+        "both": dict(capacity_factor=0.75, route_factor=0.8),
+        "tight": dict(capacity_factor=0.45, route_factor=0.4),
+    }
+    runs = {
+        name: jax.jit(functools.partial(ragged_a2a_moe, **knobs, **common))
+        for name, knobs in variants.items()
+    }
+    rng = np.random.default_rng(0)
+    for layer in range(num_layers):
+        win = rng.integers(0, num_windows, size=(8, requests))
+        ids = real[layer, win].reshape(-1, topk).astype(np.int32)
+        args = (x, w1, w2, s1, s2, weights, jnp.asarray(ids), es)
+        stacked = tuple(a.reshape(8, 1, -1, *a.shape[1:]) for a in args)
+        full = np.asarray(runs["full"](*stacked))
+        assert np.abs(full.astype(np.float32)).max() > 0
+        for name, run in runs.items():
+            got = np.asarray(run(*stacked)).view(np.uint16)
+            np.testing.assert_array_equal(
+                got, full.view(np.uint16), err_msg=f"layer {layer} {name}"
+            )

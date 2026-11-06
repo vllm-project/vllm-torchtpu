@@ -113,6 +113,7 @@ def _get_op(*, topk, activation, rhs_quant_dtype, skip_padded_tokens):
         rhs_quant_dtype=rhs_quant_dtype,
         skip_padded_tokens=skip_padded_tokens,
         capacity_factor=capacity_factor,
+        route_factor=envs.TPU_MOE_A2A_ROUTE_CAPACITY,
     )
 
     # torch_tpu infers static argnums from annotations: every operand is jax.Array.
@@ -178,6 +179,7 @@ def _log_capacity(mesh, topk, onehot_threshold, decode_routed_rows) -> None:
         factor=envs.TPU_MOE_A2A_CAPACITY,
         onehot_moe_permute_threshold=onehot_threshold,
         use_sparse_core=envs.USE_MOE_SPARSE_CORE,
+        route_factor=envs.TPU_MOE_A2A_ROUTE_CAPACITY or None,
     )
     if rows >= dp_size * decode_tokens:
         logger.info(
@@ -189,9 +191,10 @@ def _log_capacity(mesh, topk, onehot_threshold, decode_routed_rows) -> None:
         )
         return
     logger.info(
-        "Ragged A2A MoE capacity x%g | decode step: %d of %d rows, %d of %d "
-        "routes per rank",
+        "Ragged A2A MoE capacity x%g (routes x%g) | decode step: %d of %d rows, "
+        "%d of %d routes per rank",
         envs.TPU_MOE_A2A_CAPACITY,
+        envs.TPU_MOE_A2A_ROUTE_CAPACITY or envs.TPU_MOE_A2A_CAPACITY,
         rows,
         dp_size * decode_tokens,
         routes,
