@@ -122,6 +122,9 @@ torchtpu = "vllm_torchtpu.platforms:register_tpu_platform"
 [project.entry-points."vllm_omni.platform_plugins"]
 torchtpu = "vllm_torchtpu.omni:register_omni_tpu_platform"
 
+[project.entry-points."vllm_omni.general_plugins"]
+torchtpu = "vllm_torchtpu.omni:register_omni_general_plugins"
+
 [project.entry-points."vllm.general_plugins"]
 torchtpu_layers = "vllm_torchtpu.layers:register_layers"
 

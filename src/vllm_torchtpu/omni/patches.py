@@ -18,8 +18,10 @@ vLLM-Omni's DiffusionEngine rather than through TPUWorker's worker_init /
 model_load lifecycle stages, so OmniTpuPlatform applies the Omni patches
 itself: apply_omni_tpu_patches() when the platform is constructed, and
 apply_omni_model_specific_patches() at attention backend selection
-(get_diffusion_attn_backend_cls). Tracked in #1862 for unification with
-patch_registry.py.
+(get_diffusion_attn_backend_cls). Patches that must run in the engine
+process before startup warmup also run from the vllm_omni.general_plugins
+entry point (apply_omni_general_plugin_patches). Tracked in #1862 for
+unification with patch_registry.py.
 """
 
 from functools import cache as run_once
@@ -84,6 +86,16 @@ def apply_omni_model_specific_patches() -> None:
     _patch_wan_fresh_timestep()
     _patch_sdpa_fallback_dispatch()
     _patch_ltx2_vocoder_cpu_init()
+
+
+def apply_omni_general_plugin_patches() -> None:
+    """Apply the patches that must be in place before a diffusion engine starts.
+
+    Run from the vllm_omni.general_plugins entry point in every vLLM-Omni
+    process (see register_omni_general_plugins). Each patch is idempotent, and
+    apply_omni_model_specific_patches() applies them again.
+    """
+    _patch_diffusion_startup_warmup_sync()
 
 
 def _patch_diffusion_ipc_cpu_pack() -> None:
@@ -261,11 +273,14 @@ class _CurrentDeviceWorkerProxy:
         setattr(self._worker, name, value)
 
 
-# TODO: Remove once vLLM-Omni synchronizes the device at the end of its
-# startup warmup (e.g. self.executor.collective_rpc("synchronize_device") in
-# _dummy_run).
+_WARMUP_SYNC_PATCHED = "_tpu_warmup_sync_patched"
+
+
+# TODO(vllm-omni#9462): Remove once vLLM-Omni synchronizes the device at the
+# end of its startup warmup (e.g.
+# self.executor.collective_rpc("synchronize_device") in _dummy_run).
 def _patch_diffusion_startup_warmup_sync() -> None:
-    """Synchronize the device after vLLM-Omni's diffusion startup warmup.
+    """Synchronize every worker's device after vLLM-Omni's diffusion startup warmup.
 
     Root cause: ``DiffusionEngine._dummy_run`` (startup warmup) drops its output
     without a host sync. Under torch_tpu DEFER_AND_FUSE the warmup's tail ops
@@ -276,22 +291,23 @@ def _patch_diffusion_startup_warmup_sync() -> None:
     The first request after startup therefore differs numerically from later
     same-seed requests.
 
-    Scope: this only takes effect when the engine runs its worker in-process
-    (the uniproc executor, the single-device default). With the mp executor,
-    only the worker processes install this patch, and they never call
-    run_startup_warmup.
+    The sync goes through ``DiffusionEngine.collective_rpc``, so it reaches the
+    workers of both the uniproc and the mp executor. The patch is installed
+    from the vllm_omni.general_plugins entry point, which runs in the process
+    that builds the engine.
     """
     from vllm_omni.diffusion.diffusion_engine import DiffusionEngine
 
     orig_run_startup_warmup = DiffusionEngine.run_startup_warmup
+    if getattr(orig_run_startup_warmup, _WARMUP_SYNC_PATCHED, False):
+        return
 
-    def _synced_run_startup_warmup(self: Any) -> None:
-        orig_run_startup_warmup(self)
-        # TODO: Once the vllm-omni pin is >= 0.30, sync every worker with
-        # self.executor.collective_rpc("synchronize_device") and install this
-        # patch at platform init, so that mp engines are covered too.
-        torch.accelerator.synchronize()
+    def _synced_run_startup_warmup(self: Any, *args: Any, **kwargs: Any) -> Any:
+        result = orig_run_startup_warmup(self, *args, **kwargs)
+        self.collective_rpc("synchronize_device")
+        return result
 
+    setattr(_synced_run_startup_warmup, _WARMUP_SYNC_PATCHED, True)
     DiffusionEngine.run_startup_warmup = _synced_run_startup_warmup
     logger.info("Applied TPU patch: device sync after diffusion startup warmup.")
 
