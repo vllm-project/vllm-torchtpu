@@ -31,16 +31,16 @@ meta() {
   buildkite-agent meta-data get "$1" --default "$2"
 }
 
-# Every tests-lane step a nightly runs (every key but the (PR) ones') passed,
-# from both of the lane's files: the CPU steps and the TPU steps. The TPU keys
-# are read as v7x's upload names them, with an empty ${TPU_KEY_PREFIX}; the v6e
-# steps soft-fail until their tests skip what v6e cannot run, so they do not
-# hold back a pair.
-# A step the report did not wait for may have no outcome yet, which counts as
-# not passed: a nightly test missing from the step's depends_on can stop a
-# pair being recorded, never let one through.
+# Every CPU and tests-lane step a nightly runs (every key but the (PR) steps'
+# `_pr` ones) passed. TPU keys are read as v7x's upload names them, with an
+# empty ${TPU_KEY_PREFIX}; the v6e steps soft-fail until their tests skip what
+# v6e cannot run, so they do not hold back a pair. A step the report did not
+# wait for may have no outcome yet, which counts as not passed: a nightly test
+# missing from the step's depends_on can stop a pair being recorded, never let
+# one through.
+
 tests_lane_passed() {
-  local files=(.buildkite/pipeline_tests_cpu.yml .buildkite/pipeline_tests.yml)
+  local files=(".buildkite/pipeline_cpu.yml" ".buildkite/pipeline_tests.yml")
   local key outcome passed=true
   while IFS= read -r key; do
     outcome=$(buildkite-agent step get outcome --step "${key}" 2>/dev/null || true)

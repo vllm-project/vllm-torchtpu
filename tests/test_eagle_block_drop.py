@@ -90,6 +90,32 @@ def test_config_places_worker_and_manager_checkpoint_at_the_same_position(
     assert offsets.tolist() == [position]
 
 
+@pytest.mark.parametrize(
+    ("num_tokens", "lookahead", "position"), [(8191, 1, 6144), (6145, 2, 3072)]
+)
+def test_lookahead_hashes_place_worker_and_manager_checkpoint_at_the_same_position(
+    num_tokens, lookahead, position
+):
+    # The scheduler builds the manager without the drop under lookahead hashes.
+    geometry = Geometry(3072, 3072, 1, False, 16384, 0, lookahead)
+    manager = make_kv_cache_manager(geometry)
+    request = make_request("r", list(range(num_tokens)), 3072, lookahead)
+    assert manager.allocate_slots(request, num_tokens) is not None
+    mamba = manager.coordinator.single_type_managers[1]
+    assert mamba._checkpoints["r"] == (position, 1)
+    units = PrefillCheckpointUnits(
+        hash_block_size=3072,
+        cache_hit_alignment_tokens=mamba.cache_hit_alignment_tokens,
+        mamba_block_size=3072,
+        alignment=64,
+        drop_eagle_block=False,
+        num_hash_lookahead_tokens=lookahead,
+    )
+    offsets = np.zeros(1, dtype=np.int32)
+    units.fill_offsets(offsets, np.array([num_tokens]), np.array([num_tokens]))
+    assert offsets.tolist() == [position]
+
+
 def test_platform_discovery_imports_config_without_a_cycle():
     result = subprocess.run(
         [sys.executable, "-c", "import vllm.engine.arg_utils"],

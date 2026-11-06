@@ -12,13 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# The TPU steps of the unit test suite on the Kueue fleet; bootstrap.sh uploads
-# it with pipeline_tests_cpu.yml, the suite's CPU steps, and the image build
-# from pipeline_build.yml. It goes up once per TPU generation, v6e and v7x side
+# The TPU unit test suite on the Kueue fleet; bootstrap.py uploads it with the
+# image build from pipeline_build.yml (CPU checks live in pipeline_cpu.yml).
+# It goes up once per TPU generation, v6e and v7x side
 # by side, with the same steps and tests on each: TPU_GENERATION_FILES in
 # bootstrap.py fills in the generation's name, which the group name and every
 # label start with, its shapes, its key prefix and soft_fail.
-#
+
 # The `tests` plugin runs on the agent and exports BUILDKITE_TEST_ENGINE_*;
 # bktec runs in the pod, and run.sh forwards that configuration across - see
 # common.sh for what happens to the credentials.
@@ -63,10 +63,6 @@ x-shape-multi: &shape_multi "${KUBE_SHAPE_MULTI:-tpu7x-standard-4t/2x2x1}"
 
 steps:
   - group: "Unit Tests on TPU ${TPU_GENERATION:-v7x}"
-    # Set by bootstrap.sh for skip-tpu-ci and filled in when this file is
-    # uploaded; build.env() would not see it, since it reads only the
-    # environment the build was created with.
-    if: '"${SKIP_TPU_CI:-0}" != "1"'
     steps:
       # test_speculative_decoding.py gets steps of its own so it runs on its
       # own chips rather than serializing behind everything else; the general

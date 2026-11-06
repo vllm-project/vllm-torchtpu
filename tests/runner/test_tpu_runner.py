@@ -16,6 +16,7 @@ import contextlib
 import copy
 import inspect
 import weakref
+from collections import defaultdict
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -69,6 +70,10 @@ from vllm_torchtpu.runner.tpu_runner_async_output import (
 )
 
 
+def _warmup_requests():
+    return defaultdict(lambda: SimpleNamespace(output_token_ids=[]))
+
+
 def test_idle_dp_rank_encodes_before_decoder_pairing():
     order = []
     runner = SimpleNamespace(
@@ -119,6 +124,7 @@ def test_spec_warmup_request_counts_blocks_in_block_table_units(
         sample_tokens=lambda _: None,
         take_draft_token_ids=lambda: None,
         _warmup_spec_decode_cleanup=lambda rids: True,
+        requests=_warmup_requests(),
     )
 
     assert TPUModelRunner._warmup_one_spec_request(runner, 8192, idx=0)
@@ -657,6 +663,7 @@ def test_spec_batch_warmup_holds_at_most_max_num_seqs_requests(R):
         sample_tokens=lambda _: None,
         take_draft_token_ids=lambda: None,
         _warmup_spec_decode_cleanup=lambda rids: True,
+        requests=_warmup_requests(),
     )
 
     TPUModelRunner._warmup_spec_batch(runner, R, 16, short=True, mixed=True)
@@ -664,6 +671,36 @@ def test_spec_batch_warmup_holds_at_most_max_num_seqs_requests(R):
     # Each mixed variant that fits ran: the peak is R decoders plus two
     # prefills, capped at max_num_seqs, so a swallowed failure shows here too.
     assert max(sizes) == min(R + 2, 4)
+
+
+def test_spec_warmup_keeps_optimistic_output_placeholders():
+    captured = []
+    requests = _warmup_requests()
+    spec = SimpleNamespace(max_num_blocks_per_req=lambda _config, _max_pos: 1)
+
+    def execute_model(so):
+        if so.scheduled_cached_reqs.req_ids:
+            captured.append(list(so.scheduled_cached_reqs.num_output_tokens))
+        rid = "__spec_warmup_0__"
+        requests[rid].output_token_ids.extend([0] * 8)
+
+    runner = SimpleNamespace(
+        max_model_len=256,
+        speculative_config=SimpleNamespace(num_speculative_tokens=7),
+        kv_cache_config=SimpleNamespace(
+            num_blocks=4096, kv_cache_groups=[SimpleNamespace(kv_cache_spec=spec)]
+        ),
+        vllm_config=SimpleNamespace(),
+        execute_model=execute_model,
+        sample_tokens=lambda _: None,
+        take_draft_token_ids=lambda: None,
+        _warmup_spec_decode_cleanup=lambda rids: True,
+        requests=requests,
+    )
+
+    assert TPUModelRunner._warmup_one_spec_request(runner, 1, idx=0)
+
+    assert captured == [[8 * (t + 1)] for t in range(9)]
 
 
 def test_mtp_prefill_warmup_retries_each_bucket_without_a_pipeline():
@@ -3641,6 +3678,7 @@ def test_runner_sampling_paths_draw_float32_uniform_noise(monkeypatch):
             _is_dspark_pd_producer=False,
             _fence_spec_kv_under_token_copy=False,
             _min_tokens_batch_state=lambda: {},
+            _adaptive_verification=None,
             is_pooling_model=False,
             drafter=SimpleNamespace(),
             spec_decode_manager=SimpleNamespace(

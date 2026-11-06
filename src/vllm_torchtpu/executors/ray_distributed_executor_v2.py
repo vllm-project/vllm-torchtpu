@@ -701,8 +701,7 @@ class RayDistributedExecutorV2(RayExecutorV2):
             # Bind the first bundle to the current node (vLLM engine node).
             # Under DP every engine runs on the head node, so pinning would
             # crowd all of them onto it and split each engine's TP group
-            # across hosts; upstream skips this for RayExecutorV2 entirely
-            # (require_gpu_on_driver=False).
+            # across hosts; upstream RayExecutorV2 never pins it.
             current_ip = get_ip()
             current_node_id = ray.get_runtime_context().get_node_id()
             current_node_info = next(
@@ -743,6 +742,11 @@ class RayDistributedExecutorV2(RayExecutorV2):
         # (6456..6459 at TP=32) when this path demanded exact agreement.
         adopt_worker_num_gpu_blocks_override(self)
         return specs
+
+    def determine_available_memory(self) -> list[int]:
+        available = super().determine_available_memory()
+        adopt_worker_num_gpu_blocks_override(self)
+        return available
 
     def initialize_from_config(self, kv_cache_configs: list[KVCacheConfig]) -> None:
         super().initialize_from_config(kv_cache_configs)

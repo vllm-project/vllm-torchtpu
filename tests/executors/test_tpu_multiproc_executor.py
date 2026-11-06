@@ -38,6 +38,12 @@ def _make_executor(engine_override, worker_overrides, pipeline_parallel_size=1):
     return executor
 
 
+def test_workers_start_one_at_a_time():
+    # Each start sets its worker's binding in the parent's os.environ.
+    executor = TpuMultiprocExecutor.__new__(TpuMultiprocExecutor)
+    assert executor._can_start_workers_concurrently(None) is False
+
+
 @patch.object(MultiprocExecutor, "get_kv_cache_specs", return_value=_SPECS)
 def test_copies_override_from_workers_when_engine_unset(mock_super):
     """Engine override is None -> copy the agreed worker value to the engine."""
@@ -222,31 +228,38 @@ def test_ray_executor_raises_on_real_disagreement():
         executor.get_kv_cache_specs()
 
 
-def test_ray_v1_executor_copies_override_from_workers():
-    """The Ray V1 executor (VLLM_USE_RAY_V2_EXECUTOR_BACKEND=0) must adopt the
-    workers' compact-mamba override too: workers that set it skip their profile
-    run, so an engine left without it would size the KV pool from their
-    unprofiled HBM budget."""
-    from vllm.v1.executor.ray_executor import (
-        RayDistributedExecutor as RayDistributedExecutorV1,
-    )
+def _executor_and_parent(kind, engine_override, worker_overrides):
+    """An executor of each kind, and the vLLM class whose
+    determine_available_memory it extends."""
+    if kind == "multiproc":
+        return _make_executor(engine_override, worker_overrides), MultiprocExecutor
+    from vllm.v1.executor.ray_executor_v2 import RayExecutorV2
 
-    from vllm_torchtpu.executors.ray_distributed_executor import (
-        RayDistributedExecutor,
-    )
+    return _make_ray_executor(engine_override, worker_overrides), RayExecutorV2
 
-    executor = RayDistributedExecutor.__new__(RayDistributedExecutor)
-    executor.vllm_config = MagicMock()
-    executor.vllm_config.cache_config = MagicMock(spec=CacheConfig)
-    executor.vllm_config.cache_config.num_gpu_blocks_override = None
-    executor.vllm_config.parallel_config.world_size = 4
-    executor.vllm_config.parallel_config.pipeline_parallel_size = 1
-    executor.collective_rpc = MagicMock(return_value=[49966, 49965, 49967, 49965])
-    with patch.object(
-        RayDistributedExecutorV1, "get_kv_cache_specs", return_value=_SPECS
-    ):
-        specs = executor.get_kv_cache_specs()
 
-    assert specs is _SPECS
+@pytest.mark.parametrize("kind", ["multiproc", "ray_v2"])
+def test_adopts_the_count_workers_set_after_the_profile_run(kind):
+    """Compact-mamba sizing sets the workers' count in determine_available_memory,
+    after their profile run, so get_kv_cache_specs found none to copy; every
+    executor must copy it after determine_available_memory."""
+    executor, parent = _executor_and_parent(kind, None, [5310, 5312])
+
+    with patch.object(parent, "determine_available_memory", return_value=[1 << 30]):
+        assert executor.determine_available_memory() == [1 << 30]
+
     executor.collective_rpc.assert_called_once_with("get_num_gpu_blocks_override")
-    assert executor.vllm_config.cache_config.num_gpu_blocks_override == 49965
+    assert executor.vllm_config.cache_config.num_gpu_blocks_override == 5310
+
+
+@pytest.mark.parametrize("kind", ["multiproc", "ray_v2"])
+def test_engine_override_is_kept_after_the_profile_run(kind):
+    """A count the engine already has (--num-gpu-blocks-override, or one copied
+    in get_kv_cache_specs) is not queried again."""
+    executor, parent = _executor_and_parent(kind, 1234, [5310, 5312])
+
+    with patch.object(parent, "determine_available_memory", return_value=[1 << 30]):
+        executor.determine_available_memory()
+
+    executor.collective_rpc.assert_not_called()
+    assert executor.vllm_config.cache_config.num_gpu_blocks_override == 1234

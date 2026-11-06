@@ -2656,6 +2656,7 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
         slot_mapping: torch.Tensor,
         kv_cache_dtype: str,
         k_scale: torch.Tensor,
+        skip_scale: bool = False,
     ) -> None:
         """Structural no-op. KV cache updates occur in-place during
         ragged paged attention kernel run."""

@@ -21,7 +21,16 @@ from unittest.mock import patch
 
 import pytest
 
+from tests.compilation.test_graph_fingerprint import (
+    _trace_all_reduce_graph,
+    install_group_stand_ins,
+)
 from vllm_torchtpu.env_override import _TPU_VMEM_BYTES_PER_TENSOR_CORE
+
+
+@pytest.fixture
+def group_stand_ins(monkeypatch):
+    return install_group_stand_ins(monkeypatch)
 
 
 class TestTpuCompilerCache:
@@ -336,6 +345,7 @@ class TestTpuCompilerCache:
             "TPU_RAIDEN_STAGE3_STATUS_PROBE_S",
             "TPU_RAIDEN_TEST_REGISTRATION_DELAY_S",
             "TPU_RAIDEN_TRANSFER_NUM_SLOTS",
+            "TPU_RAIDEN_TRANSFER_STREAMS",
             "TPU_SIDE_CHANNEL_PORT",
             "TPU_USE_RAIDEN_CONNECTOR",
             "DEBUG_TPU_LOCAL_RANK_OFFSET",
@@ -946,6 +956,25 @@ class TestTpuCompilerCache:
         assert not os.path.samefile(path, os.path.join(a.cache_dir, key))
         with open(path, "rb") as f:
             assert pickle.load(f).fingerprint is None
+
+    def test_a_peer_artifact_is_replayed_across_c10d_subgroups(
+        self, tmp_path, monkeypatch, group_stand_ins
+    ):
+        """Ranks in distinct DP/TP subgroups trace different rank-local c10d
+        group_name strings for the same collective role, yet replay the first
+        rank's compiled artifact."""
+        (a, b), compile, compiled, replayed = self._peer_compilers(
+            tmp_path, monkeypatch
+        )
+        compile(a, _trace_all_reduce_graph("1"))
+        fn, handle = compile(b, _trace_all_reduce_graph("7"))
+
+        assert compiled == [0]
+        assert replayed == ["entry-from-rank-0"]
+        assert fn() == "entry-from-rank-0"
+        key, path, _ = handle
+        assert a.cache_dir is not None
+        assert os.path.samefile(path, os.path.join(a.cache_dir, key))
 
 
 def test_deserialize_entry_does_not_copy_the_entry():
