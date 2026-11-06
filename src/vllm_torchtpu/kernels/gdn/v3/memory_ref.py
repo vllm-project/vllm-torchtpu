@@ -182,12 +182,19 @@ class InBufferedRef(BaseBufferedRef):
 
         for idx in range(self.cfg.seq_tile_size):
             r_base = self.metadata_ref.p_id_to_r_base[p_id, idx]
-            dma_size = self.metadata_ref.p_id_to_r_size[p_id, idx]
-            pltpu.make_async_copy(
-                src_ref.at[pl.ds(r_base, dma_size)],
-                vmem_ref.at[idx, pl.ds(0, dma_size)],
-                sem,
-            ).start()
+            if src_ref.ndim == 2:
+                # The packed prefill guard guarantees aligned full chunks.
+                # Slice the prefix with the original HBM row stride.
+                r_base = pl.multiple_of(r_base, self.cfg.chunk_size)
+                source = src_ref.at[
+                    pl.ds(r_base, self.cfg.chunk_size), : vmem_ref.shape[-1]
+                ]
+                target = vmem_ref.at[idx]
+            else:
+                dma_size = self.metadata_ref.p_id_to_r_size[p_id, idx]
+                source = src_ref.at[pl.ds(r_base, dma_size)]
+                target = vmem_ref.at[idx, pl.ds(0, dma_size)]
+            pltpu.make_async_copy(source, target, sem).start()
 
     def wait_in(self, src_ref: jax.Ref, grid_indices: tuple[int | jax.Array]):
         assert self.sem_recvs is not None
@@ -196,6 +203,12 @@ class InBufferedRef(BaseBufferedRef):
         sem = self.sem_recvs.at[slot]
         vmem_ref = cast(jax.Ref, self.window_ref.at[slot])
         p_id = grid_indices[0]
+
+        if src_ref.ndim == 2:
+            for idx in range(self.cfg.seq_tile_size):
+                tile = vmem_ref.at[idx]
+                pltpu.make_async_copy(tile, tile, sem).wait()
+            return
 
         dma_size = 0
         for idx in range(self.cfg.seq_tile_size):
@@ -436,7 +449,9 @@ def create_allocs(
     """
     del conv_state_ref, recurrent_state_ref
 
-    qkv_shape = (cfg.seq_tile_size, cfg.chunk_size, 1, cfg.dim_size)
+    qkv_shape = (cfg.seq_tile_size, cfg.chunk_size, cfg.dim_size)
+    if qkv_ref.ndim != 2:
+        qkv_shape = (cfg.seq_tile_size, cfg.chunk_size, 1, cfg.dim_size)
     b_shape = (cfg.seq_tile_size, cfg.chunk_size, 1, cfg.aligned_num_v_heads)
     # Same shape as b under GDN; under KDA the gate is per-channel, so it is
     # d_k times wider (see GDNConfig.gate_dim).

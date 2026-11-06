@@ -96,6 +96,20 @@ def load_compact_to_large(vmem_ref: jax.Ref) -> jax.Array:
     return jnp.concat(vreg_list, axis=-1).reshape(new_shape)
 
 
+def load_row_tiled_heads(
+    vmem_ref: jax.Ref, num_heads: int, head_dim: int, lane_offset: int = 0
+) -> jax.Array:
+    """Load heads from an FP32 row-tiled [tokens, channels] ref."""
+    offset = lane_offset * pltpu.get_tpu_info().num_lanes
+    return jnp.stack(
+        [
+            vmem_ref[:, offset + h * head_dim : offset + (h + 1) * head_dim]
+            for h in range(num_heads)
+        ],
+        axis=0,
+    )
+
+
 def load_and_select_states(
     metadata_ref: memory_ref.MetadataRef,
     p_id: jax.Array,
@@ -220,6 +234,7 @@ def load_activation_as_large(
 
     num_lanes = pltpu.get_tpu_info().num_lanes
     kq_lanes = cfgs.num_kq_heads * (cfgs.kq_head_dim // num_lanes)
+    load_heads = load_row_tiled_heads if qkv_vmem_ref.ndim == 3 else load_strided_heads
 
     q_large_list = []
     k_large_list = []
@@ -227,16 +242,12 @@ def load_activation_as_large(
     a_large_list = []
     for idx in range(cfgs.seq_tile_size):
         qkv_slot = qkv_vmem_ref.at[idx]
-        q_large_list.append(
-            load_strided_heads(qkv_slot, cfgs.num_kq_heads, cfgs.kq_head_dim)
-        )
+        q_large_list.append(load_heads(qkv_slot, cfgs.num_kq_heads, cfgs.kq_head_dim))
         k_large_list.append(
-            load_strided_heads(qkv_slot, cfgs.num_kq_heads, cfgs.kq_head_dim, kq_lanes)
+            load_heads(qkv_slot, cfgs.num_kq_heads, cfgs.kq_head_dim, kq_lanes)
         )
         v_large_list.append(
-            load_strided_heads(
-                qkv_slot, cfgs.num_v_heads, cfgs.v_head_dim, 2 * kq_lanes
-            )
+            load_heads(qkv_slot, cfgs.num_v_heads, cfgs.v_head_dim, 2 * kq_lanes)
         )
         if cfgs.is_kda:
             # Per-channel gate: split into heads and transpose like q/k/v.

@@ -1157,6 +1157,17 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             )
             z_size = self.value_dim // self.tp_size
             mixed_qkv, z = mixed_qkvz.split([qkv_size, z_size], dim=-1)
+            if (
+                kv_cache is not None
+                and len(kv_cache) == 1
+                and self.tp_size == 1
+                and self.num_spec == 0
+                and mixed_qkvz.dtype == torch.bfloat16
+                and (qkv_size, z_size) == (10240, 6144)
+            ):
+                # The pooled wrapper selects the conversion from the runtime
+                # request distribution, since decode can use the same bucket.
+                mixed_qkv = mixed_qkvz
             z = z.reshape(z.size(0), -1, self.head_v_dim)
             b, a = ba.chunk(2, dim=-1)
             b = b.contiguous()

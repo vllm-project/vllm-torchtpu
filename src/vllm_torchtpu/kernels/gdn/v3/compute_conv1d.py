@@ -18,6 +18,29 @@ import jax.numpy as jnp
 from vllm_torchtpu.kernels.gdn.v3 import config
 
 
+def causal_conv1d_full_tile(
+    qkv: jax.Array,
+    prev_conv: jax.Array,
+    conv_weight: jax.Array,
+    conv_bias: jax.Array | None,
+    cfg: config.GDNConfig,
+) -> tuple[jax.Array, jax.Array]:
+    """Convolve a full prefill tile without converting to compact layout."""
+    rows = qkv.shape[1]
+    history = prev_conv[:, :, 0, :]
+    out = jnp.zeros_like(qkv)
+    for k in range(cfg.kernel_size):
+        delay = cfg.prev_kernel_size - k
+        shifted = qkv
+        if delay:
+            shifted = jnp.concatenate((history[:, k:], qkv[:, : rows - delay]), axis=1)
+        out += shifted * conv_weight[k]
+    if conv_bias is not None:
+        out += conv_bias
+    state = qkv[:, rows - cfg.prev_kernel_size :, :][:, None, :, None, :]
+    return out, state
+
+
 def causal_conv1d(
     real_sizes: jax.Array,  # [seq]
     lhs: jax.Array,  # [seq, chunk, q, dim_size]

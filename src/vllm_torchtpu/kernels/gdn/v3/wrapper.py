@@ -17,6 +17,7 @@ import functools
 import jax
 import jax.numpy as jnp
 from jax.experimental import pallas as pl
+from jax.experimental.layout import Layout, with_layout_constraint
 from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu import envs
@@ -52,6 +53,7 @@ def inner_kernel(
     weights_ref: memory_ref.WeightRefs,
     carry_conv_scratch_ref: jax.Ref | None,
     carry_recurrent_scratch_ref: jax.Ref | None,
+    conv_output_scratch_ref: jax.Ref | None,
     *,
     cfg: config.GDNConfig,
     p_id: jax.Array | None = None,
@@ -99,13 +101,16 @@ def inner_kernel(
     )
 
     # Step 1: Conv1D.
-    # NOTE: Conv1D requires performing sliding window where inputs are slided
-    # across rows. If typical 2D layout was used, multiple rows are stored in a
-    # single register which necessitate costly shuffling for every sliding.
-    # Therefore, it is extremely important to leverage compact layout that
-    # ensures 1 register only stores data from 1 row.
-    qkv_in_compact = qkv_slot_ref[...].astype(jnp.float32)
-    qkv_in_compact = jnp.concat([prev_conv, qkv_in_compact], axis=1)
+    qkv_in = qkv_slot_ref[...].astype(jnp.float32)
+    row_tiled = (
+        conv_output_scratch_ref is not None and conv_output_scratch_ref.ndim == 3
+    )
+    if conv_output_scratch_ref is not None:
+        if not row_tiled:
+            qkv_in = qkv_in[:, :, None, :]
+        qkv_work_ref = conv_output_scratch_ref
+    else:
+        qkv_work_ref = qkv_slot_ref
 
     # Prepare conv1d weights.
     conv_weight = weights_ref.conv.weight[...].astype(jnp.float32)
@@ -113,13 +118,20 @@ def inner_kernel(
     if weights_ref.conv.bias is not None:
         conv_bias = weights_ref.conv.bias[...].astype(jnp.float32)
 
-    qkv_out_compact, new_conv_state = compute_conv1d.causal_conv1d(
-        real_sizes=real_sizes,
-        lhs=qkv_in_compact,
-        conv_weight=conv_weight,
-        conv_bias=conv_bias,
-        cfg=cfg,
-    )
+    if row_tiled:
+        qkv_out, new_conv_state = compute_conv1d.causal_conv1d_full_tile(
+            qkv_in, prev_conv, conv_weight, conv_bias, cfg
+        )
+    else:
+        # The per-token convolution needs a compact layout where a vector
+        # register never spans multiple rows.
+        qkv_out, new_conv_state = compute_conv1d.causal_conv1d(
+            real_sizes=real_sizes,
+            lhs=jnp.concat([prev_conv, qkv_in], axis=1),
+            conv_weight=conv_weight,
+            conv_bias=conv_bias,
+            cfg=cfg,
+        )
 
     conv_state_out_slot_ref[...] = new_conv_state
     if carry_conv_scratch_ref is not None:
@@ -128,7 +140,7 @@ def inner_kernel(
         carry_conv_scratch_ref[...] = new_conv_state[:, -1]
 
     # Apply activation function.
-    qkv_out_compact = jax.nn.silu(qkv_out_compact)
+    qkv_out = jax.nn.silu(qkv_out)
 
     # Step 2: GDN.
 
@@ -152,8 +164,8 @@ def inner_kernel(
         )
         q_compact, k_compact, v_compact, b_compact, a_compact = (
             vmem_ldst.load_activation_as_compact(
-                qkv_vreg=qkv_out_compact,
-                qkv_vmem_ref=qkv_slot_ref,
+                qkv_vreg=qkv_out,
+                qkv_vmem_ref=qkv_work_ref,
                 b_vmem_ref=b_slot_ref,
                 a_vmem_ref=a_slot_ref,
                 cfgs=cfg,
@@ -177,8 +189,8 @@ def inner_kernel(
         chunked_fn = compute_kda.chunked_kda if cfg.is_kda else compute_gdn.chunked_gdn
         q_large, k_large, v_large, b_large, a_large = (
             vmem_ldst.load_activation_as_large(
-                qkv_vreg=qkv_out_compact,
-                qkv_vmem_ref=qkv_slot_ref,
+                qkv_vreg=qkv_out,
+                qkv_vmem_ref=qkv_work_ref,
                 b_vmem_ref=b_slot_ref,
                 a_vmem_ref=a_slot_ref,
                 cfgs=cfg,
@@ -224,6 +236,7 @@ def outer_kernel(
     # Scratches.
     carry_conv_scratch_ref: jax.Array | None,
     carry_recurrent_scratch_ref: jax.Array | None,
+    conv_output_scratch_ref: jax.Ref | None,
     *,
     cfg: config.GDNConfig,
 ):
@@ -301,6 +314,7 @@ def outer_kernel(
                 weights_ref,
                 carry_conv_scratch_ref,
                 carry_recurrent_scratch_ref,
+                conv_output_scratch_ref,
             ),
             allocations=allocations,
         )
@@ -321,6 +335,8 @@ def outer_kernel(
         "mixed_tile_size",
         "batched_only",
         "prefill_only",
+        "fuse_packed_prefill_cast",
+        "packed_conv_row_tiled",
         "zero_initialize_out",
         "compute_precision",
         "recurrent_dtype",
@@ -330,7 +346,7 @@ def outer_kernel(
     ),
 )
 def fused_conv1d_gdn(
-    qkv: jax.Array,  # [batch_size, n_kq * d_k * 2 + n_v * d_v = dim_size]
+    qkv: jax.Array,
     b: jax.Array,  # [batch_size, n_v]
     a: jax.Array,  # [batch_size, n_v]; [batch_size, n_v * d_k] for KDA
     states: jax.Array | tuple[jax.Array, jax.Array],
@@ -357,6 +373,8 @@ def fused_conv1d_gdn(
     num_spec_tokens: int = 0,
     batched_only: bool = False,
     prefill_only: bool = False,
+    fuse_packed_prefill_cast: bool = False,
+    packed_conv_row_tiled: bool = False,
     zero_initialize_out: bool = True,
     compute_precision: jnp.dtype = jnp.float32.dtype,
     # TODO(kyuyeunk): Calculate tile size based on input dimensions.
@@ -367,7 +385,8 @@ def fused_conv1d_gdn(
 
     Args:
         qkv: Mixed query, key, value input tensor of shape [batch_size, dim_size],
-            where `dim_size = n_kq * d_k * 2 + n_v * d_v`.
+            where `dim_size = n_kq * d_k * 2 + n_v * d_v`. The pooled GDN
+            path also accepts packed BF16 QKVZ with trailing value-width Z.
         b: b tensor (for beta) of shape [batch_size, n_v].
         a: a tensor (for g) of shape [batch_size, n_v].
         states: FP32 convolution and BF16/FP32 recurrent state tensors as
@@ -416,6 +435,10 @@ def fused_conv1d_gdn(
         batched_only: Run only the leading decode/verify segment.
         prefill_only: Run only PER_SEQ, leaving decode/verify checkpoints
             untouched. Mutually exclusive with batched_only.
+        fuse_packed_prefill_cast: Enable the aligned 8K packed BF16 prefill
+            kernel when the runtime batch is eligible.
+        packed_conv_row_tiled: Keep the aligned packed convolution and its
+            FP32 output scratch in the row-tiled layout.
         zero_initialize_out: Whether to zero-initialize the output buffer before
             executing non-batched sequences.
         compute_precision: Computation precision dtype.
@@ -452,9 +475,6 @@ def fused_conv1d_gdn(
             f"state; got conv={conv_dtype} recurrent={recurrent_dtype}."
         )
 
-    b = b.astype(jnp.float32)
-    a = a.astype(jnp.float32)
-
     # Step 1: Validate inputs.
     is_kda = attention_mode == config.AttentionMode.KDA
     if gate_lower_bound is not None:
@@ -475,7 +495,12 @@ def fused_conv1d_gdn(
             )
 
     num_seqs = state_indices.size
-    batch_size, dim = qkv.shape
+    batch_size, input_dim = qkv.shape
+    dim = conv_weight.shape[0]
+    packed_qkvz = input_dim != dim
+    if packed_qkvz:
+        assert is_shared and not is_kda and num_spec_tokens == 0
+        assert qkv.dtype == jnp.bfloat16 and input_dim == dim + n_v * d_v
     assert conv_weight.shape == (dim, 1, kernel_size)
     if conv_bias is not None:
         assert conv_bias.shape == (dim,)
@@ -500,7 +525,6 @@ def fused_conv1d_gdn(
         ckpt_indices = state_indices.reshape(-1, 1) + spec_offset
 
     act_in_dtype = jnp.dtype(jnp.float32)
-    assert a.dtype == b.dtype == act_in_dtype
 
     num_lanes = pltpu.get_tpu_info().num_lanes
     packing = 4 // act_in_dtype.itemsize
@@ -567,13 +591,37 @@ def fused_conv1d_gdn(
         # verify tiles are sized by a KDA-aware VMEM estimate.
         decode_tile_size = 1
 
+    packed_prefill_kernel = (
+        fuse_packed_prefill_cast
+        and packed_qkvz
+        and not batched_only
+        and (batch_size, dim, input_dim, mixed_tile_size) == (8192, 10240, 16384, 64)
+    )
+    if packed_prefill_kernel:
+        # Preserve the baseline BF16 gate projection layout with both
+        # Pallas branches live.
+        gate_layout = Layout((0, 1), tiling=((8, 128), (2, 1)))
+        if b.dtype == jnp.bfloat16:
+            b = with_layout_constraint(b, gate_layout)
+        if a.dtype == jnp.bfloat16:
+            a = with_layout_constraint(a, gate_layout)
+    b = b.astype(jnp.float32)
+    a = a.astype(jnp.float32)
+
     batch_padding_size = padded_batch_size - batch_size
     num_v_padding_size = aligned_num_v_heads - n_v
     # KDA's gate carries d_k channels per value head, so it pads out to a
     # lane multiple of n_v * d_k rather than of n_v.
     gate_dim = n_v * d_k if is_kda else n_v
     gate_padding_size = (pl.cdiv(gate_dim, num_lanes) * num_lanes) - gate_dim
-    qkv = conv_input.cast_conv_input(qkv, padded_batch_size)
+
+    def prepare_conv_input(activation: jax.Array) -> jax.Array:
+        if packed_qkvz:
+            return conv_input.cast_packed_conv_input(
+                activation, padded_batch_size, dim, distribution
+            )
+        return conv_input.cast_conv_input(activation, padded_batch_size)
+
     b = jnp.pad(b, ((0, batch_padding_size), (0, num_v_padding_size)))
     a = jnp.pad(a, ((0, batch_padding_size), (0, gate_padding_size)))
 
@@ -609,6 +657,7 @@ def fused_conv1d_gdn(
     weights_spec = jax.tree.map(lambda _: vmem_spec, weights)
 
     def call_kernel(
+        activation: jax.Array,
         in_states: jax.Array | tuple[jax.Array, jax.Array],
         in_act: jax.Array | None,
         mode: config.GDNMode,
@@ -691,6 +740,21 @@ def fused_conv1d_gdn(
 
         vmem_limit_bytes = config.GDNConfig.get_vmem_limit_bytes(window_size)
 
+        packed_tile = activation.ndim == 2
+        scratch_shapes = cfg.get_scratch_shape_dict()
+        kernel_name = cfg.get_kernel_name()
+        if packed_tile:
+            kernel_name += "_packed_tile_cast"
+            if packed_conv_row_tiled:
+                kernel_name += "_row_tiled"
+        conv_out_shape = (
+            (1, cfg.chunk_size, cfg.dim_size)
+            if packed_conv_row_tiled
+            else (1, cfg.chunk_size, 1, cfg.dim_size)
+        )
+        scratch_shapes["conv_output_scratch_ref"] = (
+            pltpu.VMEM(conv_out_shape, jnp.float32) if packed_tile else None
+        )
         return pl.pallas_call(
             functools.partial(outer_kernel, cfg=cfg),
             out_shape=(out_shape, in_states),
@@ -704,17 +768,17 @@ def fused_conv1d_gdn(
                 weights_spec,
             ),
             out_specs=(hbm_spec, state_spec),
-            scratch_shapes=cfg.get_scratch_shape_dict(),
+            scratch_shapes=scratch_shapes,
             input_output_aliases=input_output_aliases,
             compiler_params=pltpu.CompilerParams(
                 disable_bounds_checks=True,
                 vmem_limit_bytes=vmem_limit_bytes,
             ),
-            name=cfg.get_kernel_name(),
+            name=kernel_name,
             metadata=cfg.get_metadata(),
         )(
             metadata_obj,
-            qkv,
+            activation,
             b,
             a,
             in_states,
@@ -727,11 +791,51 @@ def fused_conv1d_gdn(
     if batched_only and prefill_only:
         raise ValueError("batched_only and prefill_only are mutually exclusive")
 
-    out_act, out_states = None, states
-    if not prefill_only:
-        out_act, out_states = call_kernel(states, None, config.GDNMode.BATCHED)
-    if not batched_only:
-        out_act, out_states = call_kernel(out_states, out_act, config.GDNMode.PER_SEQ)
+    def call_standard_path(activation, pool):
+        activation = prepare_conv_input(activation)
+        out_act, out_states = None, pool
+        if not prefill_only:
+            out_act, out_states = call_kernel(
+                activation, pool, None, config.GDNMode.BATCHED
+            )
+        if not batched_only:
+            out_act, out_states = call_kernel(
+                activation, out_states, out_act, config.GDNMode.PER_SEQ
+            )
+        return out_act, out_states
+
+    if packed_prefill_kernel:
+        count = distribution[2]
+        active = jnp.arange(num_seqs) < count
+        starts, ends = query_start_loc[:-1], query_start_loc[1:]
+        aligned = jnp.all(
+            ~active
+            | (
+                (starts >= 0)
+                & (ends <= batch_size)
+                & (ends > starts)
+                & (starts % mixed_tile_size == 0)
+                & (ends % mixed_tile_size == 0)
+            )
+        )
+        use_packed = (
+            aligned
+            & (distribution[0] == 0)
+            & (distribution[1] == 0)
+            & (count > 0)
+            & (count <= num_seqs)
+        )
+        out_act, out_states = jax.lax.cond(
+            use_packed,
+            lambda activation, pool: call_kernel(
+                activation, pool, None, config.GDNMode.PER_SEQ
+            ),
+            call_standard_path,
+            qkv,
+            states,
+        )
+    else:
+        out_act, out_states = call_standard_path(qkv, states)
 
     out_act = out_act.reshape(padded_batch_size, -1)[:batch_size]
     # TODO(kyuyeunk): Ensure no reshape is needed and convert to assertion.

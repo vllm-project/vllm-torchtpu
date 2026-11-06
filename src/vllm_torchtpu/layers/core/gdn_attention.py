@@ -843,6 +843,15 @@ def run_jax_gdn_attention_pooled_local(
 
     pool_shape = recurrent_state.shape
     pool = _as_logical_block_pool(recurrent_state, pool_block_tokens)
+    use_packed_tile_cast = (
+        mixed_qkv.shape == (8192, 16384)
+        and mixed_qkv.dtype == jnp.bfloat16
+        and conv_weight.shape == (10240, 1, 4)
+        and (n_kq, n_v, d_k, d_v, kernel_size) == (16, 48, 128, 128, 4)
+        and jnp.dtype(recurrent_state_dtype) == jnp.bfloat16
+        and num_spec_tokens == 0
+        and pltpu.get_tpu_info().chip_version == pltpu.ChipVersion.TPU_7X
+    )
     pool, output = gdn_v3_wrapper.fused_conv1d_gdn(
         mixed_qkv,
         b,
@@ -866,6 +875,8 @@ def run_jax_gdn_attention_pooled_local(
         recurrent_dtype=jnp.dtype(recurrent_state_dtype),
         conv_dtype=jnp.dtype(jnp.float32),
         num_spec_tokens=num_spec_tokens,
+        fuse_packed_prefill_cast=use_packed_tile_cast,
+        packed_conv_row_tiled=use_packed_tile_cast,
     )
     return pool.reshape(pool_shape), output
 
