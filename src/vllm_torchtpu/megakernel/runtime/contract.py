@@ -279,6 +279,12 @@ class TpuMonoSpec:
     its `text_config`), and `hf_fields` (`(field, value)` pairs, read from the
     HF config or its `text_config`) narrows that to configs with those
     values; a folder with `hf_fields` is preferred when both match.
+
+    `top_level_options` names the `options` keys a user may also set at the
+    top level of the megakernel config (e.g. `VLLM_TPU_MEGAKERNEL=
+    "mode=ep,buckets=8"`); the runtime forwards those into `options`. It reads
+    them from `SPEC` when the config has top-level keys, so the module that
+    defines `SPEC` must stay stdlib-only at import.
     """
 
     name: str
@@ -298,6 +304,7 @@ class TpuMonoSpec:
     architectures: tuple[str, ...] = ()
     model_types: tuple[str, ...] = ()
     hf_fields: tuple[tuple[str, Any], ...] = ()
+    top_level_options: frozenset[str] = frozenset()
 
     def __post_init__(self) -> None:
         def fix(name: str, value: Any) -> None:
@@ -354,6 +361,8 @@ class TpuMonoSpec:
             else _items(where, "hf_fields", fields)
         )
         fix("hf_fields", tuple((str(k), v) for k, v in pairs))
+        values = _items(where, "top_level_options", self.top_level_options)
+        fix("top_level_options", frozenset(str(v) for v in values))
 
 
 __all__ = [
