@@ -385,6 +385,7 @@ def staging(transport, monkeypatch):
         )
 
     layer = namespace["Staging"]()
+    layer.uses_hbm_lookup = False
     layer.layer_hash_index = 0
     layer.embed_tokens = types.SimpleNamespace(
         host_offload=True,
