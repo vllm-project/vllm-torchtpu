@@ -35,6 +35,7 @@ def _expert_name(expert_id: int, suffix: str) -> str:
 def test_remote_expert_packed_and_scale_skipped():
     assert _should_skip_weight_tpu(_expert_name(500, ".weight_packed"), _LOCAL)
     assert _should_skip_weight_tpu(_expert_name(500, ".weight_scale"), _LOCAL)
+    assert _should_skip_weight_tpu(_expert_name(500, ".weight_scale_inv"), _LOCAL)
     assert _should_skip_weight_tpu(_expert_name(500, ".weight"), _LOCAL)
 
 
@@ -48,6 +49,7 @@ def test_remote_expert_dsv4_scale_skipped():
 def test_local_expert_packed_and_scale_kept():
     assert not _should_skip_weight_tpu(_expert_name(27, ".weight_packed"), _LOCAL)
     assert not _should_skip_weight_tpu(_expert_name(27, ".weight_scale"), _LOCAL)
+    assert not _should_skip_weight_tpu(_expert_name(27, ".weight_scale_inv"), _LOCAL)
 
 
 def test_remote_expert_input_scale_kept():

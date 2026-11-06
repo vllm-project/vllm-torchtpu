@@ -21,6 +21,7 @@ forward-context metadata, which the runner's MTP proposer builds for step 0
 """
 
 import copy
+import itertools
 import re
 from collections.abc import Iterable
 from typing import Any, cast
@@ -49,6 +50,7 @@ from .model import (
     Qwen4ExpForCausalLM,
     _parameter_storage_key,
     hc_config,
+    load_layer_mlp_weights,
     moe_weights_mapper,
     verify_moe_checkpoint,
 )
@@ -381,6 +383,9 @@ class Qwen4ExpMTP(nn.Module):
     def compute_logits(self, hidden_states, spec_step_idx: int = 0):
         return self.logits_processor(self.lm_head, hidden_states)
 
+    def is_unused_checkpoint_weight(self, weight_name: str) -> bool:
+        return mtp_checkpoint_name(weight_name) is None
+
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         parameters = dict(self.named_parameters())
         moe_mapper = moe_weights_mapper()
@@ -390,34 +395,54 @@ class Qwen4ExpMTP(nn.Module):
         ]
         loaded: set[str] = set()
         source: set[str] = set()
-        for original, weight in weights:
-            name = mtp_checkpoint_name(original)
-            if name is None:
+
+        def _classified_weights():
+            for original, weight in weights:
+                name = mtp_checkpoint_name(original)
+                if name is None:
+                    continue
+                if name in source:
+                    raise ValueError(f"Duplicate checkpoint tensor {original}")
+                source.add(name)
+                if name.startswith("model.layers."):
+                    _, _, idx, family, relative = name.split(".", 4)
+                    if int(idx) >= len(layers):
+                        raise ValueError(f"Unexpected Qwen4Exp MTP layer {original}")
+                    if family == "mlp":
+                        yield ("mlp", int(idx)), (original, name, relative, weight)
+                        continue
+                yield None, (original, name, "", weight)
+
+        for group_key, group in itertools.groupby(
+            _classified_weights(), key=lambda item: item[0]
+        ):
+            if group_key is not None:
+                _, layer_idx = group_key
+                loaded.update(
+                    load_layer_mlp_weights(
+                        moe_loaders[layer_idx],
+                        cast(nn.Module, layers[layer_idx].mlp),
+                        ((relative, weight) for _, (_, _, relative, weight) in group),
+                        moe_mapper,
+                        layer_idx,
+                    )
+                )
                 continue
-            if name in source:
-                raise ValueError(f"Duplicate checkpoint tensor {original}")
-            source.add(name)
-            if name.startswith("model.layers."):
-                _, _, idx, family, relative = name.split(".", 4)
-                if int(idx) >= len(layers):
-                    raise ValueError(f"Unexpected Qwen4Exp MTP layer {original}")
-                layer = cast(Qwen4ExpDecoderLayer, layers[int(idx)])
-                if family == "mlp":
-                    targets = moe_loaders[int(idx)].load_weights(
-                        iter([(relative, weight)]), mapper=moe_mapper
+
+            for _, (original, name, _, weight) in group:
+                if name.startswith("model.layers."):
+                    _, _, idx, family, relative = name.split(".", 4)
+                    layer = cast(Qwen4ExpDecoderLayer, layers[int(idx)])
+                    if family == "self_attn":
+                        layer.self_attn.load_weights([(relative, weight)])
+                        continue
+                if name not in parameters:
+                    raise ValueError(
+                        f"Unknown Qwen4Exp MTP checkpoint tensor {original}"
                     )
-                    loaded.update(
-                        f"model.layers.{idx}.mlp.{target}" for target in targets
-                    )
-                    continue
-                if family == "self_attn":
-                    layer.self_attn.load_weights([(relative, weight)])
-                    continue
-            if name not in parameters:
-                raise ValueError(f"Unknown Qwen4Exp MTP checkpoint tensor {original}")
-            param = parameters[name]
-            getattr(param, "weight_loader", default_weight_loader)(param, weight)
-            loaded.add(name)
+                param = parameters[name]
+                getattr(param, "weight_loader", default_weight_loader)(param, weight)
+                loaded.add(name)
         for i, layer in enumerate(layers):
             verify_moe_checkpoint(
                 layer.mlp,

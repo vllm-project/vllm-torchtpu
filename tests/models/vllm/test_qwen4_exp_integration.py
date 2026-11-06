@@ -261,3 +261,89 @@ def test_ordinary_loader_maps_hc_names_and_skips_mtp():
         torch.testing.assert_close(
             param, weights[name.replace("model.", "model.language_model.", 1)]
         )
+
+
+def test_load_weights_batches_consecutive_layer_mlp_tensors(monkeypatch):
+    from vllm_torchtpu.models.vllm.qwen4_exp import mtp as qwen4_mtp
+
+    calls = []
+
+    class FakeLoader:
+        def __init__(self, module):
+            self.module = module
+
+        def load_weights(self, weights, mapper=None):
+            batch = [name for name, _ in weights]
+            calls.append(batch)
+            return set(batch)
+
+    monkeypatch.setattr(qwen4_model, "AutoWeightsLoader", FakeLoader)
+    monkeypatch.setattr(qwen4_model, "verify_moe_checkpoint", lambda *args: None)
+
+    model = qwen4_model.Qwen4ExpForCausalLM.__new__(qwen4_model.Qwen4ExpForCausalLM)
+    nn.Module.__init__(model)
+    model._pd_weight_identity_enabled = False
+    model.model = nn.Module()
+    layer = nn.Module()
+    layer.mlp = nn.Module()
+    layer.mlp.experts = SimpleNamespace(
+        routed_experts=SimpleNamespace(use_ep=False, global_num_experts=16)
+    )
+    layer.ple = None
+    layer.layer_type = "full_attention"
+    layer.self_attn = nn.Module()
+    layer.self_attn.finalize_weights = lambda: None
+    model.model.layers = nn.ModuleList([layer])
+
+    stream = [
+        (
+            f"model.language_model.layers.0.mlp.experts.{e}.gate_proj.weight",
+            torch.zeros(1),
+        )
+        for e in range(16)
+    ]
+    model.load_weights(iter(stream))
+    assert len(calls) == 1
+    assert len(calls[0]) == 16
+
+    draft = qwen4_mtp.Qwen4ExpMTP.__new__(qwen4_mtp.Qwen4ExpMTP)
+    nn.Module.__init__(draft)
+    assert draft.is_unused_checkpoint_weight("model.language_model.embed_tokens.weight")
+    assert not draft.is_unused_checkpoint_weight("mtp.fc_hidden.weight")
+
+    # Verify that under use_ep=True and _pd_weight_identity_enabled=True, non-local
+    # experts and visual/MTP tensors are skipped before LoadedWeightIdentity.
+    calls.clear()
+    model._pd_weight_identity_enabled = True
+    layer.mlp.experts = SimpleNamespace(
+        routed_experts=SimpleNamespace(
+            use_ep=True,
+            global_num_experts=16,
+            _map_global_expert_id_to_local_expert_id=lambda eid: (
+                0 if eid in (2, 3) else -1
+            ),
+        )
+    )
+    layer.ple = SimpleNamespace(
+        load_checkpoint=lambda items: None,
+        finalize_weights=lambda: None,
+    )
+    ep_stream = [
+        (
+            f"model.language_model.layers.0.mlp.experts.{e}.gate_proj.weight",
+            torch.full((2,), float(e)),
+        )
+        for e in range(16)
+    ] + [
+        ("model.visual.patch_embed.weight", torch.ones(2)),
+        ("mtp.fc_hidden.weight", torch.ones(2)),
+        ("model.language_model.layers.0.ple.table.weight", torch.ones(2)),
+    ]
+    model.load_weights(iter(ep_stream))
+    assert len(calls) == 1
+    assert calls[0] == [
+        "experts.2.gate_proj.weight",
+        "experts.3.gate_proj.weight",
+    ]
+    assert model.pd_loaded_weight_identity is not None
+    assert model.pd_loaded_ple_identity is not None
