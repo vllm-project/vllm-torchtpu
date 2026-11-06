@@ -238,6 +238,20 @@ class GDNConfig:
     # previous tile's write-back.
     SPLIT_BATCHED_STATE_IO = True
 
+    # GDN verify-window tiles run window_tile: one window position and one
+    # value head at a time, with dense activations. False computes them in
+    # wrapper.inner_kernel like every other tile.
+    PER_HEAD_WINDOWS = True
+
+    @property
+    def per_head_windows(self) -> bool:
+        return (
+            self.PER_HEAD_WINDOWS
+            and self.mode == GDNMode.BATCHED
+            and self.window_size > 1
+            and not self.is_kda
+        )
+
     def get_vmem_limit_bytes(self) -> int:
         tpu_info = pltpu.get_tpu_info()
         fraction = (
@@ -263,7 +277,32 @@ class GDNConfig:
             carry_conv_scratch = pltpu.VMEM(conv_shape, jnp.float32)
             carry_recurrent_scratch = pltpu.VMEM(recurrent_shape, jnp.float32)
 
+        window_scratches = None
+        if self.per_head_windows:
+            num_lanes = pltpu.get_tpu_info().num_lanes
+            window_scratches = (
+                pltpu.VMEM(recurrent_shape, jnp.float32),
+                pltpu.VMEM(
+                    (
+                        self.seq_tile_size,
+                        self.chunk_size + self.prev_kernel_size,
+                        pl.cdiv(self.dim_size, num_lanes),
+                        num_lanes,
+                    ),
+                    jnp.float32,
+                ),
+                pltpu.VMEM(
+                    (
+                        self.kernel_size + 1,
+                        pl.cdiv(self.dim_size, num_lanes),
+                        num_lanes,
+                    ),
+                    jnp.float32,
+                ),
+            )
+
         return dict(
             carry_conv_scratch_ref=carry_conv_scratch,
             carry_recurrent_scratch_ref=carry_recurrent_scratch,
+            window_scratch_refs=window_scratches,
         )

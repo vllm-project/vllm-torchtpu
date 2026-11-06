@@ -28,6 +28,7 @@ from vllm_torchtpu.kernels.gdn.v3 import (
     memory_ref,
     metadata,
     vmem_ldst,
+    window_tile,
 )
 
 
@@ -45,6 +46,7 @@ def inner_kernel(
     weights_ref: memory_ref.WeightRefs,
     carry_conv_scratch_ref: jax.Array | None,
     carry_recurrent_scratch_ref: jax.Array | None,
+    window_scratch_refs: tuple[jax.Array, ...] | None = None,
     *,
     cfg: config.GDNConfig,
     p_id: jax.Array | None = None,
@@ -73,6 +75,9 @@ def inner_kernel(
             convolution carry.
         carry_recurrent_scratch_ref: Optional VMEM scratch reference for inter-tile
             recurrent state carry.
+        window_scratch_refs: Optional VMEM scratches of window_tile (head
+            states, conv inputs, conv weights); verify-window tiles it
+            supports run there.
         cfg: GDN configuration object.
         p_id: Optional explicit tile index. Communication-fused outer kernels
             pass their global compute-tile index because their surrounding
@@ -91,6 +96,26 @@ def inner_kernel(
         conv_state_out_ref = conv_state_slot_ref
     if recurrent_out_ref is None:
         recurrent_out_ref = recurrent_slot_ref
+
+    if window_scratch_refs is not None and window_tile.supported(
+        cfg, recurrent_out_ref.shape[3:], recurrent_out_ref.dtype
+    ):
+        window_tile.run(
+            qkv_slot_ref,
+            b_slot_ref,
+            a_slot_ref,
+            conv_state_slot_ref,
+            recurrent_slot_ref,
+            out_slot_ref,
+            conv_state_out_ref,
+            recurrent_out_ref,
+            metadata_ref,
+            weights_ref,
+            *window_scratch_refs,
+            cfg=cfg,
+            p_id=p_id,
+        )
+        return
 
     # Prepare states.
     real_sizes, prev_conv, prev_recurrent = vmem_ldst.load_and_select_states(
@@ -269,6 +294,7 @@ def outer_kernel(
     # Scratches.
     carry_conv_scratch_ref: jax.Array | None,
     carry_recurrent_scratch_ref: jax.Array | None,
+    window_scratch_refs: tuple[jax.Array, ...] | None = None,
     *,
     cfg: config.GDNConfig,
 ):
@@ -306,6 +332,7 @@ def outer_kernel(
         weights_ref,
         carry_conv_scratch_ref,
         carry_recurrent_scratch_ref,
+        window_scratch_refs,
     )
 
     num_tiles = metadata_ref.num_tiles[...]

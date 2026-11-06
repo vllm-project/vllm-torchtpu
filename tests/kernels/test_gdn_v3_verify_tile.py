@@ -294,3 +294,55 @@ def test_dense_batched_tiles_match_reference(schedule, state_dtype, monkeypatch)
             monkeypatch, _dense_call, ref_states, step, weights
         )
         _assert_same((out, states), (ref_out, ref_states), f"{schedule} step {i}")
+
+
+def _inner_kernel_reference(monkeypatch, call, *args):
+    """The served tile computed by wrapper.inner_kernel instead of
+    window_tile."""
+    with monkeypatch.context() as m:
+        m.setattr(config.GDNConfig, "PER_HEAD_WINDOWS", False)
+        jax.clear_caches()
+        result = call(*args)
+    jax.clear_caches()
+    return result
+
+
+WINDOW_SCHEDULES = dict(
+    SCHEDULES,
+    # The 4-host operating point: 24 sequences per engine, full windows,
+    # then every rollback offset.
+    verify_served=(
+        3,
+        [
+            dict(lens=[W] * 24, dist=(24,) * 3),
+            dict(lens=[W] * 24, dist=(24,) * 3, offsets=np.arange(24) % W),
+        ],
+    ),
+    # An odd live count leaves a padded slot in the last tile; a lone live
+    # sequence pads the only tile. Like the served request arrays, the
+    # per-sequence arrays cover whole tiles.
+    verify_odd=(
+        3,
+        [dict(lens=[W] * 24, dist=(23,) * 3, offsets=np.arange(24) % W, num_tokens=96)],
+    ),
+    verify_one=(
+        3,
+        [dict(lens=[3, 1, 1, 1], dist=(1, 1, 1), offsets=[2, 0, 0, 0], num_tokens=4)],
+    ),
+)
+
+
+@pytest.mark.parametrize("schedule", sorted(WINDOW_SCHEDULES))
+def test_window_tile_matches_inner_kernel(schedule, monkeypatch):
+    num_spec, steps = WINDOW_SCHEDULES[schedule]
+    seqs = len(steps[0]["lens"])
+    weights = _weights(5)
+    pool = _pool(6, 1 + seqs * (num_spec + 1) + 1)
+    ref_pool = jnp.array(pool, copy=True)
+    for i, spec in enumerate(steps):
+        step = _step(30 + i, num_spec, **spec)
+        pool, out = _pooled_call(pool, step, weights)
+        ref_pool, ref_out = _inner_kernel_reference(
+            monkeypatch, _pooled_call, ref_pool, step, weights
+        )
+        _assert_same((out, pool), (ref_out, ref_pool), f"{schedule} step {i}")
