@@ -235,6 +235,9 @@ def test_fp8_experts_register_compressed_tensors_scale_names(
     for proj in ("gate", "up", "down"):
         list(layer.load_weights([(f"0.{proj}_proj.weight_scale", scales)]))
     torch.testing.assert_close(w2_scale[0], scales)
+    gate, up = params["w13_weight_scale"][0].reshape(2, *scales.shape)
+    torch.testing.assert_close(gate, scales)
+    torch.testing.assert_close(up, scales)
 
     # Building the Pallas kernel needs a TPU.
     monkeypatch.setattr(
