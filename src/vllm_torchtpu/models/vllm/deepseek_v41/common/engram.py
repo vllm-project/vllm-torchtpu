@@ -17,7 +17,12 @@ from vllm.config import get_current_vllm_config_or_none
 from vllm.models.deepseek_v41.common import engram as upstream
 
 from vllm_torchtpu import envs
+from vllm_torchtpu.kernels.engram.vllm_adapter import (
+    fused_engram_torch,
+    is_supported_by_fused_engram,
+)
 from vllm_torchtpu.layers.adapter.custom_ops.packed_suffix_op import packed_suffix
+from vllm_torchtpu.layers.adapter.quantization.fp8 import VllmFp8LinearMethodTPU
 from vllm_torchtpu.layers.adapter.upstream_bindings import (
     bind_device_ops,
     device_hooks,
@@ -30,6 +35,8 @@ from .host_exchange import start_exchange_rows
 from .host_gather import gather_weight_scale
 
 if TYPE_CHECKING:
+    from vllm_torchtpu.layers.adapter.quantization.configs import TpuLinear
+
     from .host_transfer import PreparedEngramUpload
 
 logger = init_logger(__name__)
@@ -951,7 +958,52 @@ class Engram(upstream.Engram):
         local = gathered[:, rank * chunk : (rank + 1) * chunk]
         return local.transpose(0, 1).flatten(1, 2)[:, :cols]
 
+    def _uses_fused_offload(
+        self, hidden_states: torch.Tensor, token_mask: torch.Tensor | None
+    ) -> bool:
+        if hidden_states.device.type != "tpu" or hidden_states.shape[0] != 288:
+            return False
+        if (
+            self.use_sequence_parallel
+            or not self.embed_tokens.host_offload
+            or self.embed_tokens.tp_size != 1
+            or self.embed_tokens.dp_size != 1
+            or self.embed_tokens.block_size != 32
+            or not isinstance(self.wkv.quant_method, VllmFp8LinearMethodTPU)
+            or self._active_raw is None
+            or self._hbm_rows is not None
+        ):
+            return False
+        wkv = cast("TpuLinear", self.wkv)
+        return is_supported_by_fused_engram(
+            self._active_raw,
+            hidden_states,
+            wkv.weight,
+            wkv.weight_scale,
+            self.q_weight,
+            self.k_weight,
+            token_mask,
+        )
+
     def forward(self, hidden_states, hash_ids, token_mask=None):
+        if self._uses_fused_offload(hidden_states, token_mask):
+            if token_mask is None:
+                token_mask = torch.ones_like(hidden_states[:, 0, 0], dtype=torch.bool)
+            wkv = cast("TpuLinear", self.wkv)
+            return fused_engram_torch(
+                cast(torch.Tensor, self._active_raw).flatten(),
+                hidden_states,
+                wkv.weight,
+                wkv.weight_scale,
+                self.q_weight,
+                self.k_weight,
+                token_mask,
+                self.eps,
+                self.clamp_value,
+            )
+        return self._forward_unfused(hidden_states, hash_ids, token_mask)
+
+    def _forward_unfused(self, hidden_states, hash_ids, token_mask=None):
         if self.use_sequence_parallel:
             tp = self.embed_tokens.tp_size
             chunk = -(-hash_ids.shape[0] // tp)
