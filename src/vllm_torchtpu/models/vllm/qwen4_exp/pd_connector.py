@@ -8,6 +8,7 @@ This connector does not borrow another model's native pool admission.
 import json
 import math
 import time
+import os
 from dataclasses import dataclass
 from typing import Any
 
@@ -172,6 +173,9 @@ class Qwen4ExpRaidenConnector(TPURaidenConnector):
 
         self._shared_compressed = self._sync_repack and _shared_enabled()
         self._load_requests: dict[str, Any] = {}
+        self._qwen_divergent_hits = bool(cache.enable_prefix_caching) and os.environ.get(
+            "QWEN4_EXP_PD_DIVERGENT_HITS", "1"
+        ).strip() not in ("0", "false", "False")
 
     # --- QWEN4_EXP_PD_SYNC_REPACK -----------------------------------------
 
@@ -290,7 +294,21 @@ class Qwen4ExpRaidenConnector(TPURaidenConnector):
 
     @property
     def supports_divergent_local_hybrid_hits(self) -> bool:
-        return False
+        """A caching consumer adopts only token pages from its local cache.
+
+        Every load moves the request-state pages whole (GDN, PLE and ring at
+        the published extent; ``supports_stage3_grouped_prefix_loads``), so
+        a local hit needs no GDN/PLE checkpoint at its boundary: only the
+        attention groups' cached prefix
+        (``core.divergent_hybrid_hits``). With MTP no exact decode-boundary
+        state exists, and a handoff at ``prompt - 1`` lands its state off any
+        block boundary, so a hit that needed a local state would never
+        occur. ``QWEN4_EXP_PD_DIVERGENT_HITS=0`` restores that requirement.
+        """
+        return (
+            getattr(self, "_qwen_divergent_hits", False)
+            and super().supports_divergent_local_hybrid_hits
+        )
 
     if _REQUEST_LEVEL_LOAD_FAILURES:
 
