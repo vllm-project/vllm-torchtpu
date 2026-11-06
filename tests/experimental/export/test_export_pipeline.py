@@ -41,6 +41,12 @@ from vllm_torchtpu.experimental.export import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _tpu_accelerator_type(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Gives these CPU tests a TPU generation: the export refuses to guess one."""
+    monkeypatch.setenv("TPU_ACCELERATOR_TYPE", "v6e-8")
+
+
 def _mock_lower_torch_callable_to_mlir(
     fn: Any,
     arg_specs: Sequence[api.ShapeDtypeStruct],
