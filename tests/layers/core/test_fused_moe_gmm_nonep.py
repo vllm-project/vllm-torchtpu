@@ -412,6 +412,16 @@ def test_dense_runs_reproduce_the_all_valid_route_to_token_map(topk):
         )
 
 
+def test_moe_kernel_knobs_are_in_the_compile_cache_key():
+    """The TPU compile caches hash every registered env (tpu_compiler
+    _tpu_compile_env_factors). A knob read at trace time but not registered
+    would let an arm reuse another arm's compiled program."""
+    from vllm_torchtpu import envs
+
+    for name in ("TPU_MOE_NONEP_GATHER", "TPU_MOE_NONEP_GMM_EXPERTS_PER_VISIT", "TPU_SC_COMBINE_DENSE"):
+        assert name in envs.environment_variables, name
+
+
 def test_dense_combine_mode_is_read_and_checked(monkeypatch):
     from vllm_torchtpu.kernels.sparse_core.ragged_gather_reduce_v3 import _dense_mode
 

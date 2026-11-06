@@ -86,6 +86,7 @@ if TYPE_CHECKING:
     TPU_MOE_NONEP_GMM_HOIST_QUANT: bool = False
     TPU_MOE_NONEP_GMM2_RHS_SPLIT: str = "1"
     TPU_MOE_NONEP_GMM_EXPERTS_PER_VISIT: str = "1"
+    TPU_SC_COMBINE_DENSE: str = ""
     USE_MOE_TP_DECODE_KERNEL: bool = False
     RAGGED_GATHER_REDUCE_VERSION: str = "v2"
     USE_PHASED_PROFILER: bool = False
@@ -1190,6 +1191,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_MOE_NONEP_GMM_EXPERTS_PER_VISIT": env_with_choices(
         "TPU_MOE_NONEP_GMM_EXPERTS_PER_VISIT", "1", ["1", "2", "4"]
     ),
+    # SparseCore combine accumulation for all-valid blocks: "reg" (run table,
+    # register sums), "addupdate" (run table, contiguous memory adds) or unset
+    # (indexed scatter-add). Read at trace time by ragged_gather_reduce_v3;
+    # registered here so the compile-cache key sees it. Bitwise the same output.
+    "TPU_SC_COMBINE_DENSE": lambda: os.getenv("TPU_SC_COMBINE_DENSE", "").strip(),
     # Serve eligible tensor-parallel MoE layers (sigmoid + correction-bias
     # top-k with renormalization, one shared expert, FP8 per-channel weights)
     # with one op that also covers the shared expert and the TP all-reduce:
