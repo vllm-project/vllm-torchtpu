@@ -240,6 +240,32 @@ def test_unreused_reply_loss_and_thinking_suffix_boundary():
     )
     assert res_dropped.total_tokens == len(t2_dropped_prompt)
 
+    # 4. On an edited turn (system prompt mutated at token 5) with dropped reasoning tokens,
+    # prefix_mutation_loss also stops at the old reply's <|im_end|> (170) so new tokens after
+    # the old reply (120) count as new_input rather than prefix_mutation_loss.
+    tracker.record_turn_completion(
+        "sess-edited-dropped", t1_think_on, t1_long_reasoning_output, turn_id=1
+    )
+    t2_mutated_prefix = list(range(150))
+    t2_mutated_prefix[5] = 999999
+    t2_edited_dropped_prompt = (
+        t2_mutated_prefix + t2_carried_reply + t2_new_user_turn
+    )
+    res_edited_dropped = tracker.classify_prefill(
+        t2_edited_dropped_prompt,
+        num_cached_tokens=0,
+        session_id="sess-edited-dropped",
+        turn_id=2,
+    )
+    assert res_edited_dropped == TokenBreakdown(
+        cache_hit=0,
+        prefix_mutation_loss=170,
+        unreused_reply_loss=0,
+        new_input=120,
+        mutation_offset_token_idx=5,
+    )
+    assert res_edited_dropped.total_tokens == len(t2_edited_dropped_prompt)
+
 
 def test_negative_category_raises():
     with pytest.raises(ValueError, match="must be >= 0"):
