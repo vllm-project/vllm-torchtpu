@@ -12,7 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Source provenance: inferact/k3-megakernel@30c9ba966b tools/megakernel/harness.py
+# Source provenance: inferact/k3-megakernel@30c9ba966b
+# tools/megakernel/harness.py
 """Launching and bringing up a megakernel program without vLLM.
 
 :func:`launch` (on the login node) re-runs the tool as one process per TPU
@@ -25,15 +26,18 @@ build their ops exactly as they do inside the server.
 
 from __future__ import annotations
 
+import importlib
 import json
 import os
-import random
-import subprocess
+import secrets
 import sys
 import time
 from pathlib import Path
+from typing import NoReturn, Protocol
 
-from vllm_torchtpu.models.kimi_k3.megakernel import settings
+import torch
+
+from .. import settings
 
 T0 = time.perf_counter()
 REPO = next(
@@ -42,27 +46,64 @@ REPO = next(
 )
 LOCAL_WORLD = 8
 WORKER_ENV = "MEGAKERNEL_TOOL_WORKER"
+_REQUIRED_HOSTS = 4
+_BASE_MASTER_PORT = 20000
+_PORT_SPAN = 20000
+
+
+class ConfigKeyLike(Protocol):
+    """Protocol for configuration objects exposing a ``key()`` digest."""
+
+    def key(self) -> str:
+        """Return short configuration digest string."""
+        ...
+
+
+def _capture_stdout(args: list[str]) -> str:
+    """Spawn ``args`` via ``os.posix_spawnp`` and return its captured stdout."""
+    read_fd, write_fd = os.pipe()
+    actions = [
+        (os.POSIX_SPAWN_DUP2, write_fd, 1),
+        (os.POSIX_SPAWN_CLOSE, read_fd),
+    ]
+    pid = os.posix_spawnp(args[0], args, os.environ, file_actions=actions)
+    os.close(write_fd)
+    with os.fdopen(read_fd, encoding="utf-8") as handle:
+        output = handle.read()
+    os.waitpid(pid, 0)
+    return output
+
+
+def _spawn_wait(args: list[str], env: dict[str, str]) -> int:
+    """Spawn ``args`` with ``env`` and return its process exit code."""
+    pid = os.posix_spawnp(args[0], args, env)
+    _, status = os.waitpid(pid, 0)
+    return os.waitstatus_to_exitcode(status)
 
 
 def is_worker() -> bool:
+    """Return True when running inside a spawned per-device worker process."""
     return settings.MEGAKERNEL_TOOL_WORKER == "1"
 
 
 def rank() -> int:
+    """Return the current process rank from ``SLURM_PROCID``."""
     return settings.SLURM_PROCID
 
 
 def log_host(msg: str) -> None:
-    """A line from every process, tagged with its host (host-side tools)."""
-    print(
-        f"[{time.perf_counter() - T0:7.1f}s host {settings.SLURM_NODEID}] {msg}",
-        flush=True,
-    )
+    """Write a host-tagged status line from the current process."""
+    elapsed = time.perf_counter() - T0
+    sys.stdout.write(f"[{elapsed:7.1f}s host {settings.SLURM_NODEID}] {msg}\n")
+    sys.stdout.flush()
 
 
 def log(msg: str) -> None:
+    """Write a rank-0 status line to standard output."""
     if rank() == 0:
-        print(f"[{time.perf_counter() - T0:7.1f}s r{rank():02d}] {msg}", flush=True)
+        elapsed = time.perf_counter() - T0
+        sys.stdout.write(f"[{elapsed:7.1f}s r{rank():02d}] {msg}\n")
+        sys.stdout.flush()
 
 
 def launch(
@@ -72,34 +113,28 @@ def launch(
     extra_env: dict[str, str],
     per_host: int = LOCAL_WORLD,
 ) -> int:
-    """Run ``python -m vllm_torchtpu.models.kimi_k3.megakernel.tools argv`` on the four hosts of ``jobid``,
-    ``per_host`` processes each (default one per TPU device)."""
-    nodelist = subprocess.run(
-        ["squeue", "-j", jobid, "-h", "-o", "%N"], capture_output=True, text=True
-    ).stdout.strip()
+    """Run ``python -m vllm_torchtpu.models.kimi_k3.megakernel.tools`` on ``jobid``."""
+    nodelist = _capture_stdout(["squeue", "-j", jobid, "-h", "-o", "%N"]).strip()
     if not nodelist:
-        raise SystemExit(f"job {jobid} is not running")
-    hosts = subprocess.run(
-        ["scontrol", "show", "hostnames", nodelist], capture_output=True, text=True
-    ).stdout.split()
-    if len(hosts) != 4:
-        raise SystemExit(
-            f"job {jobid} holds {len(hosts)} hosts; the K3 programs need 4 (32 devices)"
+        msg = f"job {jobid} is not running"
+        raise SystemExit(msg)
+    hosts = _capture_stdout(["scontrol", "show", "hostnames", nodelist]).split()
+    if len(hosts) != _REQUIRED_HOSTS:
+        msg = (
+            f"job {jobid} holds {len(hosts)} hosts; "
+            f"the K3 programs need {_REQUIRED_HOSTS} (32 devices)"
         )
-    ips = [
-        subprocess.run(
-            ["getent", "hosts", h], capture_output=True, text=True
-        ).stdout.split()[0]
-        for h in hosts
-    ]
+        raise SystemExit(msg)
+    ips = [_capture_stdout(["getent", "hosts", h]).split()[0] for h in hosts]
     env = dict(os.environ)
     env.update(extra_env)
+    default_port = str(_BASE_MASTER_PORT + secrets.randbelow(_PORT_SPAN))
     env.update(
         {
             WORKER_ENV: "1",
             "PYTHONPATH": f"{REPO / 'src'}:{REPO}:{env.get('PYTHONPATH', '')}",
             "TP32_HOST_IPS": ",".join(ips),
-            "MASTER_PORT": env.get("MASTER_PORT", str(20000 + random.randrange(20000))),
+            "MASTER_PORT": env.get("MASTER_PORT", default_port),
             "TP32_SESSION": str(time.time_ns()),
             "HF_HUB_OFFLINE": "1",
             "JAX_PLATFORMS": env.get("JAX_PLATFORMS", ""),
@@ -109,8 +144,8 @@ def launch(
         "srun",
         f"--jobid={jobid}",
         "--overlap",
-        "--nodes=4",
-        f"--ntasks={4 * per_host}",
+        f"--nodes={_REQUIRED_HOSTS}",
+        f"--ntasks={_REQUIRED_HOSTS * per_host}",
         f"--ntasks-per-node={per_host}",
         "--kill-on-bad-exit=1",
         "--unbuffered",
@@ -121,11 +156,11 @@ def launch(
         "vllm_torchtpu.models.kimi_k3.megakernel.tools",
         *argv,
     ]
-    return subprocess.call(command, env=env)
+    return _spawn_wait(command, env)
 
 
 def init() -> None:
-    """Bring up torch_tpu and the ``tpu_dist`` process group in a worker."""
+    """Bring up ``torch_tpu`` and the ``tpu_dist`` process group in a worker."""
     host_ips = settings.TP32_HOST_IPS.split(",")
     base_port = settings.TORCH_TPU_BASE_PORT
     os.environ.update(
@@ -145,8 +180,7 @@ def init() -> None:
         }
     )
     os.environ.setdefault("TORCH_TPU_XPROF_SESSION_ID", settings.TP32_SESSION)
-    import torch
-    import torch_tpu  # noqa: F401
+    importlib.import_module("torch_tpu")
 
     log("torch_tpu imported")
     torch.distributed.init_process_group(
@@ -159,37 +193,38 @@ def init() -> None:
 
 
 def sync() -> None:
-    import torch
-
+    """Synchronize all workers across the distributed process group."""
     torch.distributed.barrier()
 
 
 def git_revision() -> str:
-    out = subprocess.run(
-        ["git", "-C", str(REPO), "rev-parse", "--short", "HEAD"],
-        capture_output=True,
-        text=True,
-    )
-    dirty = subprocess.run(
-        ["git", "-C", str(REPO), "status", "--porcelain", "--untracked-files=no"],
-        capture_output=True,
-        text=True,
-    ).stdout.strip()
-    return out.stdout.strip() + ("+dirty" if dirty else "")
+    """Return the short git HEAD revision, suffixed with ``+dirty`` if modified."""
+    out = _capture_stdout(["git", "-C", str(REPO), "rev-parse", "--short", "HEAD"])
+    dirty = _capture_stdout(
+        ["git", "-C", str(REPO), "status", "--porcelain", "--untracked-files=no"]
+    ).strip()
+    return out.strip() + ("+dirty" if dirty else "")
 
 
 class Records:
     """One JSON record per result (rank 0), with what produced it."""
 
-    def __init__(self, path: str | None, command: str, config) -> None:
+    def __init__(
+        self,
+        path: str | None,
+        command: str,
+        config: ConfigKeyLike,
+    ) -> None:
+        """Initialize JSONL record writer for ``command`` and ``config``."""
         self.path, self.command = path, command
-        self.context = {
+        self.context: dict[str, object] = {
             "git": git_revision(),
             "config": config.key(),
             "jobid": settings.SLURM_JOB_ID,
         }
 
-    def add(self, **fields) -> None:
+    def add(self, **fields: object) -> None:
+        """Append one JSON record with ``fields`` on rank 0 when ``path`` is set."""
         if rank() != 0 or not self.path:
             return
         record = {
@@ -198,10 +233,11 @@ class Records:
             **self.context,
             "time": time.strftime("%Y-%m-%dT%H:%M:%S"),
         }
-        with open(self.path, "a") as handle:
+        with Path(self.path).open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(record) + "\n")
 
 
-def fail(message: str) -> None:
+def fail(message: str) -> NoReturn:
+    """Log failure ``message`` and exit with status code 1."""
     log(f"FAIL: {message}")
     sys.exit(1)

@@ -12,47 +12,58 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Source provenance: inferact/k3-megakernel@30c9ba966b tools/megakernel/bench.py
-"""Kernel-only timing of the serving ops (``bench decode`` / ``bench prefill``).
-
-**Decode** times ``KimiDecoder.step`` over vLLM's 24 unified pools for every
-``--batches`` x ``--contexts`` case (``--mix``: one batch of rows at different
-contexts), or with ``--dspark [CHECKPOINT]`` the DSpark verify + draft step
-(serving's draft schedule: seven drafts through batch four, three through
-eight; ``--acceptance`` fixes the accepted drafts per position so drafts
-compare at equal acceptance). Each request starts at its context over
-synthetic KV pages and a clean KDA state, with distinct tokens per row (they
-set MoE routing); ``--steps`` steps are enqueued back to back and timed with
-one host read, median of ``--repeats``. DSpark's own tokens per step on
-synthetic contexts are not representative.
-
-**Prefill** times :class:`KimiPrefiller.step` per ``--prompts`` case: ``LENxN``
-is one step of ``N`` prompts of ``LEN`` new tokens, ``LENxN@PREFIX`` appends
-them to a page-aligned cached prefix. Each line names the compiled windows the
-case packs into.
-
-``--trace DIR`` (both): rank 0 saves an xprof trace of each case's last repeat.
-"""
+# Source provenance: inferact/k3-megakernel@30c9ba966b
+# tools/megakernel/bench.py
+"""Kernel-only timing of the serving ops (``bench decode`` / ``bench prefill``)."""
 
 from __future__ import annotations
 
-import os
+import importlib
 import statistics
 import time
 from contextlib import contextmanager
+from pathlib import Path
+from typing import TYPE_CHECKING, cast
 
 import numpy as np
+import torch
 
-from vllm_torchtpu.models.kimi_k3.megakernel import settings
-from vllm_torchtpu.models.kimi_k3.megakernel.tools import harness, k3
+from .. import config, settings
+from .. import prefill as k3_prefill
+from .. import program as k3_program
+from ..decode_ops import Control, DecodeOps
+from ..draft import draft_class
+from ..runtime_shim import bridge
+from ..runtime_shim import program as mk
+from . import harness, k3
+
+if TYPE_CHECKING:
+    import argparse
+    from collections.abc import Callable, Iterator
+
+_MAX_WIDE_DRAFTS_BATCH = 4
+_MAX_SPEC_BATCH = 8
+_WIDE_DRAFTS = 7
+_SHORT_DRAFTS = 3
+_RANDOM_TOKEN_LOW = 1000
+_RANDOM_TOKEN_HIGH = 100000
+_STEP_SLACK_TOKENS = 64
+_DRAFT_POS_SLACK = 256
+_DEFAULT_TOP_P = 0.95
+_DEFAULT_SEED = 7
+_VERIFY_WIDTH = 8
+_KDA_GROUPS = 3
 
 
-def add_arguments(parser, profile: bool = False) -> None:
+def add_arguments(parser: argparse.ArgumentParser) -> None:
+    """Register ``decode`` and ``prefill`` subparsers on ``parser``."""
     sub = parser.add_subparsers(dest="role", required=True)
     decode = sub.add_parser("decode", help="the decode ops")
     decode.add_argument("--batches", default="1,8")
     decode.add_argument(
-        "--contexts", default="1152", help="per-request context (all rows of a batch)"
+        "--contexts",
+        default="1152",
+        help="per-request context (all rows of a batch)",
     )
     decode.add_argument(
         "--mix",
@@ -72,32 +83,26 @@ def add_arguments(parser, profile: bool = False) -> None:
         "--dspark",
         default="",
         metavar="CHECKPOINT",
-        help="time DSpark verify + draft steps with this speculator (batches "
-        "up to eight); without the flag every step is plain",
+        help="time DSpark verify + draft steps with this speculator",
     )
     decode.add_argument(
         "--drafts",
         type=int,
-        choices=(3, 7),
+        choices=(_SHORT_DRAFTS, _WIDE_DRAFTS),
         default=0,
-        help="with --dspark: this many drafts at every batch up to eight "
-        "(default: serving's schedule)",
+        help="with --dspark: this many drafts at every batch up to eight",
     )
     decode.add_argument(
         "--acceptance",
         default="",
-        help="with --dspark: synthetic per-position acceptance rates of the "
-        "seven drafts (comma separated; three drafts take the first three), "
-        "e.g. 0.92,0.83,0.73,0.65,0.57,0.50,0.43; default: the drafts' own",
+        help="with --dspark: synthetic per-position acceptance rates of seven drafts",
     )
     decode.add_argument(
         "--spec-drafts",
         type=int,
-        choices=(0, 3, 7),
+        choices=(0, _SHORT_DRAFTS, _WIDE_DRAFTS),
         default=0,
-        help="with --dspark: this many drafts at every batch, any size (e.g. "
-        "attention DP2's batched verify + draft); default: --drafts or "
-        "serving's schedule",
+        help="with --dspark: this many drafts at every batch, any size",
     )
     decode.add_argument(
         "--save-tokens",
@@ -108,15 +113,13 @@ def add_arguments(parser, profile: bool = False) -> None:
     prefill.add_argument(
         "--prompts",
         default="8192x1,2048x4",
-        help="cases LENxN[@PREFIX]: N prompts of LEN new tokens per step, each "
-        "appended to a cached prefix of PREFIX tokens (a page-aligned hit)",
+        help="cases LENxN[@PREFIX]: N prompts of LEN new tokens per step",
     )
     prefill.add_argument("--repeats", type=int, default=3)
     prefill.add_argument(
         "--token-file",
         default="",
-        help="a .npy of int32 token ids: each prompt is a random slice of it "
-        "(real text) instead of uniform random ids",
+        help="a .npy of int32 token ids for real text slices",
     )
     for role in (decode, prefill):
         role.add_argument(
@@ -124,37 +127,33 @@ def add_arguments(parser, profile: bool = False) -> None:
             default="",
             help="directory: rank 0 saves an xprof trace of each case",
         )
-        if profile:
-            role.add_argument(
-                "--llo", default="", help="directory for the compiled LLO of every op"
-            )
 
 
-def _prompt_tokens(rng, corpus, size):
-    """``size`` token ids: uniform random, or a random slice of ``corpus``."""
+def _prompt_tokens(
+    rng: np.random.Generator,
+    corpus: np.ndarray | None,
+    size: int,
+) -> np.ndarray:
+    """Return ``size`` token ids from ``corpus`` or uniform random integers."""
     if corpus is None:
-        return rng.integers(1000, 100000, size, dtype=np.int32)
+        return rng.integers(_RANDOM_TOKEN_LOW, _RANDOM_TOKEN_HIGH, size, dtype=np.int32)
     if size > corpus.size:
-        raise SystemExit(
-            f"--token-file holds {corpus.size} tokens, a prompt needs {size}"
-        )
+        harness.fail(f"--token-file holds {corpus.size} tokens, a prompt needs {size}")
     start = int(rng.integers(0, corpus.size - size + 1))
     return corpus[start : start + size]
 
 
 @contextmanager
-def _trace(directory: str, tag: str, last: bool):
-    """Rank 0 saves an xprof trace of the last repeat under ``directory``
-    (``TRACE_RANKS``, e.g. ``0,8,16,24``: those ranks, under ``rank<r>/``)."""
+def _trace(directory: str, tag: str, *, last: bool) -> Iterator[None]:
+    """Save an xprof trace of the last repeat under ``directory`` on trace ranks."""
     ranks = [int(r) for r in settings.TRACE_RANKS.split(",")]
     if not (directory and last and harness.rank() in ranks):
         yield
         return
-    from torch_tpu._internal.profiler import _impl as profiler
+    profiler = importlib.import_module("torch_tpu._internal.profiler._impl")
 
-    path = os.path.join(directory, tag)
-    if ranks != [0]:
-        path = os.path.join(directory, f"rank{harness.rank()}", tag)
+    base = Path(directory)
+    path = str(base / tag if ranks == [0] else base / f"rank{harness.rank()}" / tag)
     profiler.start_trace(path)
     try:
         yield
@@ -163,18 +162,70 @@ def _trace(directory: str, tag: str, last: bool):
         harness.log(f"trace of {tag}: {path}")
 
 
-def run(args, records: harness.Records) -> None:
+def run(args: argparse.Namespace, records: harness.Records) -> None:
+    """Dispatch ``args.role`` to ``run_decode`` or ``run_prefill``."""
     (run_decode if args.role == "decode" else run_prefill)(args, records)
 
 
-def run_decode(args, records: harness.Records) -> None:
-    import torch
+def _drafts_at(args: argparse.Namespace, batch: int) -> int:
+    """Return speculative draft count for ``batch`` under ``args``."""
+    if args.spec_drafts:
+        return int(args.spec_drafts)
+    if args.drafts:
+        return int(args.drafts) if batch <= _MAX_SPEC_BATCH else 0
+    if batch <= _MAX_WIDE_DRAFTS_BATCH:
+        return _WIDE_DRAFTS
+    return _SHORT_DRAFTS if batch <= _MAX_SPEC_BATCH else 0
 
-    from vllm_torchtpu.models.kimi_k3.megakernel import config
-    from vllm_torchtpu.models.kimi_k3.megakernel.decode_ops import Control, DecodeOps
-    from vllm_torchtpu.models.kimi_k3.megakernel.runtime_shim import bridge
-    from vllm_torchtpu.models.kimi_k3.megakernel.runtime_shim import program as mk
 
+def _build_draft_and_schedule(
+    args: argparse.Namespace,
+    cases: list[tuple[int, int | list[int]]],
+    max_context: int,
+    max_num_seqs: int,
+) -> tuple[object | None, tuple[tuple[int, int, int], ...] | None]:
+    """Build optional DSpark draft instance and per-batch schedule tuple."""
+    if not (args.dspark and any(_drafts_at(args, b) for b, _ in cases)):
+        return None, None
+    rates = None
+    if args.acceptance:
+        seven = tuple(float(r) for r in args.acceptance.split(","))
+        if len(seven) != _WIDE_DRAFTS:
+            msg = "--acceptance takes seven rates"
+            raise SystemExit(msg)
+        rates = {_WIDE_DRAFTS: seven, _SHORT_DRAFTS: seven[:_SHORT_DRAFTS]}
+    max_pos = max_context + _VERIFY_WIDTH * args.steps * args.repeats + _DRAFT_POS_SLACK
+    draft = draft_class(args.dspark)(
+        max_position=max_pos,
+        checkpoint=args.dspark,
+        presharded=args.presharded,
+        synthetic_rates_by_width=rates,
+    )
+    if args.spec_drafts:
+        return draft, ((1, max_num_seqs, int(args.spec_drafts)),)
+    if args.drafts:
+        spans = [(1, min(_MAX_SPEC_BATCH, max_num_seqs), int(args.drafts))]
+        if max_num_seqs > _MAX_SPEC_BATCH:
+            spans.append((_MAX_SPEC_BATCH + 1, max_num_seqs, 0))
+        return draft, tuple(spans)
+    spans = [(1, min(_MAX_WIDE_DRAFTS_BATCH, max_num_seqs), _WIDE_DRAFTS)]
+    if max_num_seqs > _MAX_WIDE_DRAFTS_BATCH:
+        spans.append(
+            (
+                _MAX_WIDE_DRAFTS_BATCH + 1,
+                min(_MAX_SPEC_BATCH, max_num_seqs),
+                _SHORT_DRAFTS,
+            )
+        )
+    if max_num_seqs > _MAX_SPEC_BATCH:
+        spans.append((_MAX_SPEC_BATCH + 1, max_num_seqs, 0))
+    return draft, tuple(spans)
+
+
+def _decode_cases(
+    args: argparse.Namespace,
+) -> tuple[list[tuple[int, int | list[int]]], int]:
+    """Parse ``--batches``, ``--contexts``, and ``--mix`` into benchmark cases."""
     batches = [int(b) for b in args.batches.split(",")]
     contexts = [int(c) for c in args.contexts.split(",")]
     mix = [
@@ -182,15 +233,61 @@ def run_decode(args, records: harness.Records) -> None:
         for part in filter(None, args.mix.split(","))
         for _ in range(int(part.split("x")[1]))
     ]
-    cases = [(batch, context) for context in contexts for batch in batches] + (
-        [(len(mix), mix)] if mix else []
+    cases: list[tuple[int, int | list[int]]] = [
+        (batch, context) for context in contexts for batch in batches
+    ]
+    if mix:
+        cases.append((len(mix), mix))
+    return cases, max(contexts + mix)
+
+
+def _rows_for_decode(
+    args: argparse.Namespace,
+    pools: k3.Pools,
+    pages: int,
+    draft: object | None,
+    case_spec: tuple[int, int | list[int], bool, str],
+) -> mk.StepInput:
+    """Build ``StepInput`` for one benchmark decode step."""
+    batch, context, first, tag = case_spec
+    dp = config.active().attention_dp
+    sampling = (
+        args.temperature,
+        _DEFAULT_TOP_P if args.temperature > 0 else 1.0,
+        0,
+        _DEFAULT_SEED,
     )
-    max_context = max(contexts + mix)
+    per_row = context if isinstance(context, list) else [context] * batch
+    out: list[mk.RequestInput] = []
+    for r in range(batch):
+        table = pools.scheduled([1 + r // dp * pages + p for p in range(pages)], r)
+        speculating = draft is not None and _drafts_at(args, batch) > 0 and not first
+        query = _drafts_at(args, batch) + 1 if speculating else 1
+        tokens: list[int] | np.ndarray = (
+            [_RANDOM_TOKEN_LOW + 37 * r] if first else np.zeros(query, np.int32)
+        )
+        computed = per_row[r] - 1 if first else 0
+        out.append(k3.request(f"{tag}-{r}", tokens, table, sampling, computed))
+    return mk.StepInput(out)
+
+
+def run_decode(args: argparse.Namespace, records: harness.Records) -> None:
+    """Run kernel-only decode timing benchmark across ``args`` cases."""
+    cases, max_context = _decode_cases(args)
     rows = max(batch for batch, _ in cases)
     max_num_seqs = args.max_num_seqs or rows
     sub_base = 2 * max_num_seqs + 1
-    pages = -(-(max_context + 8 * args.steps * args.repeats + 64) // k3.logical()) + 1
-    # Under attention DP a rank's pools hold only its own group's requests.
+    pages = (
+        -(
+            -(
+                max_context
+                + _VERIFY_WIDTH * args.steps * args.repeats
+                + _STEP_SLACK_TOKENS
+            )
+            // k3.logical()
+        )
+        + 1
+    )
     dp = config.active().attention_dp
     blocks = 1 + -(-rows // dp) * pages
     sizes = tuple(sorted({b for b, _ in cases if b > 1} | {1}))
@@ -200,49 +297,8 @@ def run_decode(args, records: harness.Records) -> None:
         batch_sizes=sizes,
     )
     pools = k3.Pools(blocks, pages, 1, pattern=True)
-
-    # Serving's DSpark schedule: seven drafts through batch four, three
-    # through eight, none above. --spec-drafts: that many at every batch;
-    # --drafts: at every batch up to eight.
-    def drafts_at(batch: int) -> int:
-        if args.spec_drafts:
-            return args.spec_drafts
-        if args.drafts:
-            return args.drafts if batch <= 8 else 0
-        return 7 if batch <= 4 else 3 if batch <= 8 else 0
-
-    draft = None
-    if args.dspark and any(drafts_at(batch) for batch, _ in cases):
-        from vllm_torchtpu.models.kimi_k3.megakernel.draft import draft_class
-
-        rates = None
-        if args.acceptance:
-            seven = tuple(float(r) for r in args.acceptance.split(","))
-            if len(seven) != 7:
-                raise SystemExit("--acceptance takes seven rates")
-            rates = {7: seven, 3: seven[:3]}
-        draft = draft_class(args.dspark)(
-            max_position=max_context + 8 * args.steps * args.repeats + 256,
-            checkpoint=args.dspark,
-            presharded=args.presharded,
-            synthetic_rates_by_width=rates,
-        )
-    schedule = None
-    if draft is not None and args.spec_drafts:
-        schedule = ((1, max_num_seqs, args.spec_drafts),)
-    elif draft is not None and args.drafts:
-        spans = [(1, min(8, max_num_seqs), args.drafts)]
-        if max_num_seqs > 8:
-            spans.append((9, max_num_seqs, 0))
-        schedule = tuple(spans)
-    elif draft is not None:
-        spans = [(1, min(4, max_num_seqs), 7)]
-        if max_num_seqs > 4:
-            spans.append((5, min(8, max_num_seqs), 3))
-        if max_num_seqs > 8:
-            spans.append((9, max_num_seqs, 0))
-        schedule = tuple(spans)
-    decoder = k3.decoder(
+    draft, schedule = _build_draft_and_schedule(args, cases, max_context, max_num_seqs)
+    dec = k3.decoder(
         ops,
         pools,
         max_num_seqs=max_num_seqs,
@@ -251,52 +307,45 @@ def run_decode(args, records: harness.Records) -> None:
         schedule=schedule,
     )
     harness.sync()
-    decoder.warmup()
+    dec.warmup()
     harness.log(
         f"warm: {len(pools.tensors)} pools of {blocks} blocks, batch sizes {sizes}"
     )
-    sampling = (args.temperature, 0.95 if args.temperature > 0 else 1.0, 0, 7)
-
-    def rows_for(batch, context, first, tag):
-        """The step's requests: on the first, each reset at its context with
-        a clean KDA state; then continuing (the device holds their inputs)."""
-        per_row = context if isinstance(context, list) else [context] * batch
-        out = []
-        for r in range(batch):
-            table = pools.scheduled([1 + r // dp * pages + p for p in range(pages)], r)
-            speculating = draft is not None and drafts_at(batch) and not first
-            query = drafts_at(batch) + 1 if speculating else 1
-            tokens = [1000 + 37 * r] if first else np.zeros(query, np.int32)
-            computed = per_row[r] - 1 if first else 0
-            out.append(k3.request(f"{tag}-{r}", tokens, table, sampling, computed))
-        return mk.StepInput(out)
-
-    results = []
-    streams = {}
+    results, streams = [], {}
     for batch, context in cases:
-        label = context if not isinstance(context, list) else "mix " + args.mix
+        label: int | str = (
+            context if not isinstance(context, list) else f"mix {args.mix}"
+        )
         tag = f"b{batch}c{context if not isinstance(context, list) else 'mix'}"
-        # First step: rows reset at the context.
-        decoder.step(rows_for(batch, context, True, tag))
-        bridge.materialize(decoder.step(rows_for(batch, context, False, tag)).tokens)
+        dec.step(
+            _rows_for_decode(args, pools, pages, draft, (batch, context, True, tag))
+        )
+        bridge.materialize(
+            dec.step(
+                _rows_for_decode(
+                    args, pools, pages, draft, (batch, context, False, tag)
+                )
+            ).tokens
+        )
         times, outs = [], []
         for repeat in range(args.repeats):
-            with _trace(args.trace, tag, repeat == args.repeats - 1):
+            with _trace(args.trace, tag, last=repeat == args.repeats - 1):
                 started = time.perf_counter()
                 for _ in range(args.steps):
-                    outs.append(
-                        decoder.step(rows_for(batch, context, False, tag)).tokens
+                    step_in = _rows_for_decode(
+                        args, pools, pages, draft, (batch, context, False, tag)
                     )
+                    outs.append(dec.step(step_in).tokens)
                 bridge.materialize(outs[-1])
                 times.append(1e3 * (time.perf_counter() - started) / args.steps)
         ms = statistics.median(times)
-        dspark = draft is not None and drafts_at(batch) > 0
+        dspark = draft is not None and _drafts_at(args, batch) > 0
         if dspark:
-            tokens = torch.cat([o[:batch] for o in outs]).cpu()
-            per_step = float((tokens >= 0).sum()) / len(outs) / batch
+            tok_mat = torch.cat([o[:batch] for o in outs]).cpu()
+            per_step = float((tok_mat >= 0).sum()) / len(outs) / batch
             rate = 1e3 * per_step * batch / ms
             line = (
-                f"B{batch} ctx {label}: DSpark x{drafts_at(batch)} "
+                f"B{batch} ctx {label}: DSpark x{_drafts_at(args, batch)} "
                 f"{ms:.2f} ms per step, "
                 f"{per_step:.2f} tokens per request step -> {rate:.0f} tok/s"
             )
@@ -317,25 +366,21 @@ def run_decode(args, records: harness.Records) -> None:
         results.append((batch, label, ms))
         if args.save_tokens:
             streams[tag] = torch.stack([o[:batch, 0] for o in outs]).cpu().numpy()
-        decoder.forget([f"{tag}-{r}" for r in range(batch)])
+        dec.forget([f"{tag}-{r}" for r in range(batch)])
     if args.save_tokens and harness.rank() == 0:
-        np.savez(args.save_tokens, **streams)
-    harness.log("summary: " + "; ".join(f"B{b}@{c}={ms:.2f}ms" for b, c, ms in results))
+        savez_fn = cast("Callable[..., None]", np.savez)
+        savez_fn(args.save_tokens, **streams)
+    summary = "; ".join(f"B{b}@{c}={ms:.2f}ms" for b, c, ms in results)
+    harness.log(f"summary: {summary}")
 
 
-def run_prefill(args, records: harness.Records) -> None:
-    import torch
-
-    from vllm_torchtpu.models.kimi_k3.megakernel import prefill as k3_prefill
-    from vllm_torchtpu.models.kimi_k3.megakernel import program as k3_program
-    from vllm_torchtpu.models.kimi_k3.megakernel.runtime_shim import bridge
-    from vllm_torchtpu.models.kimi_k3.megakernel.runtime_shim import program as mk
-
-    cases = []
+def _parse_prefill_cases(args: argparse.Namespace) -> list[tuple[int, int, int]]:
+    """Parse ``--prompts`` specifications into ``(length, count, prefix)`` tuples."""
+    cases: list[tuple[int, int, int]] = []
     for part in filter(None, args.prompts.split(",")):
-        prompt, _, prefix = part.partition("@")
+        prompt, _, prefix_str = part.partition("@")
         length, count = (int(x) for x in prompt.split("x"))
-        prefix = int(prefix) if prefix else 0
+        prefix = int(prefix_str) if prefix_str else 0
         if length * count > k3_program.MAX_STEP_TOKENS or count > k3_prefill.SLOTS:
             harness.fail(
                 f"prefill case {part}: N * LEN must fit one 8192-token step, "
@@ -347,28 +392,22 @@ def run_prefill(args, records: harness.Records) -> None:
                 f"@PREFIX must be a multiple of {k3.PAGE}"
             )
         cases.append((length, count, prefix))
-    max_seqs = max(count for _, count, _ in cases)
+    return cases
+
+
+def _prefill_tables(
+    cases: list[tuple[int, int, int]],
+    max_seqs: int,
+    max_model_len: int,
+) -> tuple[k3.Pools, list[tuple[np.ndarray, ...]]]:
+    """Allocate stand-in prefill pools and per-slot block tables."""
     totals = [length + prefix for length, _, prefix in cases]
-    max_model_len = -(-max(totals) // k3.LOGICAL) * k3.LOGICAL
-    prefiller = k3_program.build(
-        k3.engine_config(
-            "prefill",
-            max_num_seqs=max_seqs,
-            max_model_len=max_model_len,
-            max_num_batched_tokens=k3_program.MAX_STEP_TOKENS,
-        ),
-        args.presharded,
-        tp_rank=torch.distributed.get_rank(),
-    )
-    prefiller.load_weights()
-    # Per request slot: real MLA pages for the longest case that uses it (the
-    # window reads and writes them), but a KDA state block only at the
-    # columns a step touches -- a hit's and the final one; the rest of the
-    # row is the null block, so a long-context case costs its MLA pages only.
-    slot_layout = []
+    slot_layout: list[tuple[int, list[int]]] = []
     for slot in range(max_seqs):
         longest = max(
-            total for total, (_, count, _) in zip(totals, cases) if count > slot
+            total
+            for total, (_, count, _) in zip(totals, cases, strict=True)
+            if count > slot
         )
         columns = sorted(
             {
@@ -381,24 +420,47 @@ def run_prefill(args, records: harness.Records) -> None:
         )
         slot_layout.append((-(-longest // k3.LOGICAL), columns))
     pools = k3.Pools(
-        1 + sum(mla + 3 * len(columns) for mla, columns in slot_layout),
+        1 + sum(mla + _KDA_GROUPS * len(columns) for mla, columns in slot_layout),
         max_model_len // k3.LOGICAL,
         max_model_len // k3.PAGE,
         pattern=True,
     )
-    prefiller.bind_kv_caches(pools.caches, pools.groups)
-    prefiller.warmup()
-    harness.sync()
-    # Each request gets its own blocks once; repeats reuse them under new ids.
-    tables = []
+    tables: list[tuple[np.ndarray, ...]] = []
     for mla, columns in slot_layout:
-        kda = []
-        for _ in range(3):
+        kda: list[np.ndarray] = []
+        for _ in range(_KDA_GROUPS):
             row = np.zeros(max_model_len // k3.PAGE, np.int32)
             for column in columns:
                 row[column] = pools.fresh(1)[0]
             kda.append(row)
         tables.append(pools.tables(pools.fresh(mla), kda))
+    return pools, tables
+
+
+def run_prefill(args: argparse.Namespace, records: harness.Records) -> None:
+    """Run kernel-only prefill timing benchmark across ``args`` prompt cases."""
+    cases = _parse_prefill_cases(args)
+    max_seqs = max(count for _, count, _ in cases)
+    totals = [length + prefix for length, _, prefix in cases]
+    max_model_len = -(-max(totals) // k3.LOGICAL) * k3.LOGICAL
+    prefiller = cast(
+        "k3_prefill.KimiPrefiller",
+        k3_program.build(
+            k3.engine_config(
+                "prefill",
+                max_num_seqs=max_seqs,
+                max_model_len=max_model_len,
+                max_num_batched_tokens=k3_program.MAX_STEP_TOKENS,
+            ),
+            args.presharded,
+            tp_rank=torch.distributed.get_rank(),
+        ),
+    )
+    prefiller.load_weights()
+    pools, tables = _prefill_tables(cases, max_seqs, max_model_len)
+    prefiller.bind_kv_caches(pools.caches, pools.groups)
+    prefiller.warmup()
+    harness.sync()
     rng = np.random.default_rng(0)
     corpus = np.load(args.token_file).astype(np.int32) if args.token_file else None
     largest = prefiller.program.windows[-1]
@@ -418,8 +480,8 @@ def run_prefill(args, records: harness.Records) -> None:
                 prefiller.program.capacity,
             )
         )
-        times = []
-        for repeat in range(args.repeats + 1):  # the first is a warm-up of this shape
+        times: list[float] = []
+        for repeat in range(args.repeats + 1):
             rows = [
                 mk.RequestInput(
                     req_id=f"{tag}-{repeat}-{r}",
@@ -432,7 +494,7 @@ def run_prefill(args, records: harness.Records) -> None:
                 )
                 for r in range(count)
             ]
-            with _trace(args.trace, tag, repeat == args.repeats):
+            with _trace(args.trace, tag, last=repeat == args.repeats):
                 started = time.perf_counter()
                 bridge.materialize(prefiller.step(mk.StepInput(rows)).tokens)
                 elapsed = 1e3 * (time.perf_counter() - started)

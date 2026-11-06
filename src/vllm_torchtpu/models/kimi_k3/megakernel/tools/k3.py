@@ -12,141 +12,157 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Source provenance: inferact/k3-megakernel@30c9ba966b tools/megakernel/k3.py
-"""Kimi-K3 fixtures for the standalone tools: stand-in unified pools laid out
-as vLLM's, their KV cache groups, the fixed prompt."""
+# Source provenance: inferact/k3-megakernel@30c9ba966b
+# tools/megakernel/k3.py
+"""Kimi-K3 fixtures for the standalone tools.
+
+Stand-in unified pools laid out as vLLM's, their KV cache groups, and the fixed
+prompt.
+"""
 
 from __future__ import annotations
 
-import glob
 from pathlib import Path
+from typing import TYPE_CHECKING, cast
 
 import numpy as np
+import torch
+
+from .. import config, layout
+from ..decode import KimiDecoder
+from ..program import kernel_modules
+from ..runtime_shim import program as mk
+from ..runtime_shim.config import MegakernelEngineConfig
+
+if TYPE_CHECKING:
+    from collections.abc import Sequence
+
+    from ..decode_ops import DecodeOps
 
 PAGE, DCP = 256, 32
-LOGICAL = PAGE * DCP  # tokens per vLLM DCP block
+LOGICAL = PAGE * DCP
 CACHE_DTYPE = "auto"
+_ROPE_START = 576
+_BASE_TILE_TOKENS = 256
+_NUM_MLA_POOLS = 24
+_KDA_GROUPS = 3
+_DEFAULT_MAX_BATCHED_TOKENS = 512
+_DEFAULT_SPEC_TOKENS = 7
 
 
 def configure_cache(dtype: str) -> None:
     """Configure standalone fixtures from the same cache option as serving."""
-    from vllm_torchtpu.models.kimi_k3.megakernel.layout import cache_layout
-
-    global PAGE, LOGICAL, CACHE_DTYPE
-    PAGE = cache_layout(dtype).tokens_per_block
-    LOGICAL = PAGE * DCP
-    CACHE_DTYPE = dtype
+    page_tokens = layout.cache_layout(dtype).tokens_per_block
+    globals().update(
+        PAGE=page_tokens,
+        LOGICAL=page_tokens * DCP,
+        CACHE_DTYPE=dtype,
+    )
 
 
 def logical() -> int:
-    """Tokens per DCP block under the installed kernel config's DCP group."""
-    from vllm_torchtpu.models.kimi_k3.megakernel import config
-
+    """Return tokens per DCP block under the installed kernel config's DCP group."""
     return PAGE * config.active().dcp_group
 
 
-def fixed_prompt(count: int, checkpoint: str):
-    """``(tokens, tokenizer)``: the first ``count`` tokens of a fixed text, the
-    model repository's own Python sources (``checkpoint``: the Kimi-K3
-    checkpoint directory)."""
-    from vllm_torchtpu.models.kimi_k3.megakernel.program import kernel_modules
-
+def fixed_prompt(count: int, checkpoint: str) -> tuple[list[int], object]:
+    """Return ``(tokens, tokenizer)`` from the first ``count`` tokens."""
     (load,) = kernel_modules("load")
     tokenizer = load.load_tokenizer(checkpoint)
     text = "".join(
-        Path(path).read_text() for path in sorted(glob.glob(f"{checkpoint}/*.py"))
+        path.read_text(encoding="utf-8")
+        for path in sorted(Path(checkpoint).glob("*.py"))
     )
-    return tokenizer.encode(text, disallowed_special=())[:count], tokenizer
+    return list(tokenizer.encode(text, disallowed_special=())[:count]), tokenizer
 
 
 class Pools:
-    """24 unified pools laid out per ``cache_layout(CACHE_DTYPE)`` (one MLA
-    layer and three KDA layers each, as vLLM allocates them) and the KV cache
-    groups: the MLA layers' (``logical()``-token blocks, ``mla_width`` entries a
-    row) and three KDA groups (a state column per ``PAGE`` tokens,
-    ``state_width`` entries), KDA layer k in group k % 3. Block 0 is the null
-    block."""
+    """24 unified pools laid out per ``cache_layout(CACHE_DTYPE)`` and KV groups."""
 
     def __init__(
-        self, num_blocks: int, mla_width: int, state_width: int, pattern: bool = False
+        self,
+        num_blocks: int,
+        mla_width: int,
+        state_width: int,
+        *,
+        pattern: bool = False,
     ) -> None:
-        import torch
-
-        from vllm_torchtpu.models.kimi_k3.megakernel import layout
-        from vllm_torchtpu.models.kimi_k3.megakernel.runtime_shim import program as mk
-
+        """Allocate ``num_blocks`` stand-in unified pool blocks on TPU."""
         cache = layout.cache_layout(CACHE_DTYPE)
         dtype = getattr(torch, cache.dtype)
-        if pattern:  # synthetic latents: a random bf16 pattern (the rope lanes zero)
-            # One seed on every rank: every page holds the same tokens, whatever
-            # the DCP layout that places it.
+        if pattern:
             generator = torch.Generator().manual_seed(0)
             page = (
                 torch.randn((1, 128, 2, 640), dtype=torch.float32, generator=generator)
                 * 0.5
             )
-            page[..., 576:] = 0
+            page[..., _ROPE_START:] = 0
             page = page.to(torch.bfloat16)
-            # Keep the same BF16 fixture across page geometries: a 512-token
-            # FP8 page repeats the 256-token tile.
             page = (
-                page.reshape(1, 256, 640)
-                .repeat(1, cache.tokens_per_block // 256, 1)
+                page.reshape(1, _BASE_TILE_TOKENS, 640)
+                .repeat(1, cache.tokens_per_block // _BASE_TILE_TOKENS, 1)
                 .reshape(1, *cache.block_shape)
                 .to(dtype)
             )
             self.tensors = [
-                page.to("tpu").repeat(num_blocks, 1, 1, 1) for _ in range(24)
+                page.to("tpu").repeat(num_blocks, 1, 1, 1)
+                for _ in range(_NUM_MLA_POOLS)
             ]
         else:
             self.tensors = [
                 torch.zeros((num_blocks, *cache.block_shape), dtype=dtype).to("tpu")
-                for _ in range(24)
+                for _ in range(_NUM_MLA_POOLS)
             ]
         mla_names = [
             f"model.layers.{layer}.self_attn.mla_attn.attn" for layer in layout.MLA
         ]
         kda_names = [f"model.layers.{layer}.self_attn" for layer in layout.KDA]
-        self.caches = {name: self.tensors[m] for m, name in enumerate(mla_names)}
+        self.caches: dict[str, torch.Tensor] = {
+            name: self.tensors[m] for m, name in enumerate(mla_names)
+        }
         self.caches.update(
-            {name: self.tensors[k // 3] for k, name in enumerate(kda_names)}
+            {name: self.tensors[k // _KDA_GROUPS] for k, name in enumerate(kda_names)}
         )
         self.groups = [mk.KVGroup(tuple(mla_names), logical(), mla_width)]
         self.groups += [
             mk.KVGroup(
-                tuple(n for k, n in enumerate(kda_names) if k % 3 == g),
+                tuple(n for k, n in enumerate(kda_names) if k % _KDA_GROUPS == g),
                 PAGE,
                 state_width,
             )
-            for g in range(3)
+            for g in range(_KDA_GROUPS)
         ]
         self.num_blocks = num_blocks
         self.mla_width, self.state_width = mla_width, state_width
         self._next = 1
 
-    def scheduled(self, table, index: int) -> np.ndarray:
-        """MLA ``table`` as the decode scheduler issues it to the ``index``-th
-        request admitted: under attention DP that request is in DP group
-        ``g = index % dp`` (fewest requests first) and its pages are ids
-        ``g * num_blocks + row`` (``megakernel.dp_blocks``); the null block
-        stays shared."""
-        from vllm_torchtpu.models.kimi_k3.megakernel import config
-
+    def scheduled(self, table: Sequence[int] | np.ndarray, index: int) -> np.ndarray:
+        """Return MLA ``table`` offset for the ``index``-th request's DP group."""
         group = index % config.active().attention_dp
-        table = np.asarray(table, np.int32)
-        return np.where(table > 0, table + group * self.num_blocks, 0).astype(np.int32)
+        arr = np.asarray(table, np.int32)
+        return np.where(arr > 0, arr + group * self.num_blocks, 0).astype(np.int32)
 
     def fresh(self, n: int) -> list[int]:
+        """Allocate and return ``n`` fresh pool block indices."""
         out = list(range(self._next, self._next + n))
         self._next += n
         return out
 
-    def tables(self, mla: list[int], kda: list[list[int]]) -> tuple[np.ndarray, ...]:
-        def padded(table, width):
-            return np.asarray(list(table) + [0] * (width - len(table)), np.int32)
+    def tables(
+        self,
+        mla: Sequence[int] | np.ndarray,
+        kda: Sequence[Sequence[int] | np.ndarray],
+    ) -> tuple[np.ndarray, ...]:
+        """Pad ``mla`` and ``kda`` block lists to table width and return tuple."""
 
-        return (padded(mla, self.mla_width),) + tuple(
-            padded(t, self.state_width) for t in kda
+        def padded(table: Sequence[int] | np.ndarray, width: int) -> np.ndarray:
+            """Right-pad ``table`` with zeros to ``width`` int32 entries."""
+            items = [int(x) for x in table]
+            return np.asarray(items + [0] * (width - len(items)), np.int32)
+
+        return (
+            padded(mla, self.mla_width),
+            *(padded(t, self.state_width) for t in kda),
         )
 
 
@@ -156,83 +172,74 @@ def engine_config(
     max_num_seqs: int,
     max_model_len: int,
     max_num_batched_tokens: int,
-    num_speculative_tokens: int = 0,
-    num_speculative_tokens_per_batch_size: tuple[tuple[int, int, int], ...]
-    | None = None,
-):
-    """The serving configuration's megakernel view, for the TP32 / DCP32
-    deployment (DCP over each group under the installed kernel config's
-    attention DP) with the configured cache (``configure_cache``)."""
-    from vllm_torchtpu.models.kimi_k3.megakernel import config
-    from vllm_torchtpu.models.kimi_k3.megakernel.runtime_shim.config import (
-        MegakernelEngineConfig,
-    )
-
+    **spec_kwargs: int | tuple[tuple[int, int, int], ...] | None,
+) -> MegakernelEngineConfig:
+    """Build ``MegakernelEngineConfig`` for the TP32 / DCP32 deployment."""
     dp = config.active().attention_dp
+    num_spec = cast("int", spec_kwargs.get("num_speculative_tokens", 0))
+    sched = cast(
+        "tuple[tuple[int, int, int], ...] | None",
+        spec_kwargs.get("num_speculative_tokens_per_batch_size"),
+    )
     return MegakernelEngineConfig(
         role=role,
-        tensor_parallel_size=32,
+        tensor_parallel_size=DCP,
         decode_context_parallel_size=DCP // dp,
         block_size=PAGE,
         kv_cache_dtype=CACHE_DTYPE,
         max_num_seqs=max_num_seqs,
         max_model_len=max_model_len,
         max_num_batched_tokens=max_num_batched_tokens,
-        num_speculative_tokens=num_speculative_tokens,
-        num_speculative_tokens_per_batch_size=num_speculative_tokens_per_batch_size,
+        num_speculative_tokens=num_spec,
+        num_speculative_tokens_per_batch_size=sched,
         attention_dp=dp,
     )
 
 
 def decoder(
-    ops,
+    ops: DecodeOps,
     pools: Pools,
     *,
     max_num_seqs: int,
     max_model_len: int,
-    draft=None,
-    schedule: tuple[tuple[int, int, int], ...] | None = None,
-):
-    """A :class:`KimiDecoder` over shared ``ops`` (and ``draft``) and the
-    fixture ``pools``, bound and ready to warm. ``schedule``: vLLM's
-    per-batch-size draft count (None: plain steps only). Pages are owned by
-    mesh position, as the fixtures lay them out."""
-    from vllm_torchtpu.models.kimi_k3.megakernel.decode import KimiDecoder
-
-    config = engine_config(
+    **spec_options: object,
+) -> KimiDecoder:
+    """Build and bind a ``KimiDecoder`` over ``ops`` and fixture ``pools``."""
+    draft = cast("Path | str | None", spec_options.get("draft"))
+    schedule = cast(
+        "tuple[tuple[int, int, int], ...] | None",
+        spec_options.get("schedule"),
+    )
+    cfg = engine_config(
         "decode",
         max_num_seqs=max_num_seqs,
         max_model_len=max_model_len,
-        max_num_batched_tokens=512,
-        num_speculative_tokens=7 if schedule else 0,
+        max_num_batched_tokens=_DEFAULT_MAX_BATCHED_TOKENS,
+        num_speculative_tokens=_DEFAULT_SPEC_TOKENS if schedule else 0,
         num_speculative_tokens_per_batch_size=schedule,
     )
-    decoder = KimiDecoder(config, ops, draft if schedule else None, tp_rank=ops.rank)
-    decoder.bind_kv_caches(pools.caches, pools.groups)
-    return decoder
+    dec = KimiDecoder(cfg, ops, draft if schedule else None, tp_rank=ops.rank)
+    dec.bind_kv_caches(pools.caches, pools.groups)
+    return dec
 
 
 def request(
     req_id: str,
-    tokens,
+    tokens: Sequence[int] | np.ndarray,
     table: np.ndarray,
     sampling: tuple[float, float, int, int] = (0.0, 1.0, 0, 0),
     computed: int = 0,
-):
-    """A decode step's request scheduling ``tokens`` after ``computed`` ones,
-    MLA pages ``table``. Its KDA tables hold only the null block, so a
-    decoder that has not seen it starts it from a clean state (no import)."""
-    from vllm_torchtpu.models.kimi_k3.megakernel.runtime_shim import program as mk
-
-    tokens = np.asarray(tokens, np.int32)
-    end = computed + len(tokens)
+) -> mk.RequestInput:
+    """Build a decode ``RequestInput`` scheduling ``tokens`` after ``computed``."""
+    tok_arr = np.asarray(tokens, np.int32)
+    end = computed + len(tok_arr)
     token_ids = np.zeros(end, np.int32)
-    token_ids[computed:] = tokens
+    token_ids[computed:] = tok_arr
     null = np.zeros(1, np.int32)
     return mk.RequestInput(
         req_id=req_id,
         computed=computed,
-        scheduled=len(tokens),
+        scheduled=len(tok_arr),
         token_ids=token_ids,
         num_tokens=end,
         num_prompt_tokens=end,
