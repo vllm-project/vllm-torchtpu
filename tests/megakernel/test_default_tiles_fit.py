@@ -43,6 +43,7 @@ def test_default_tiles_fit_vmem_for_every_model_config(name: str, paged: bool):
     """`fit_default_tiles` gives an in-budget plan on every bucket."""
     spec = MODEL_SPECS[name]
     shrunk = False
+    nbes: set[int] = set()
     for T, B in _buckets():
         ex = mk.ExecSpec(
             B=B,
@@ -58,9 +59,12 @@ def test_default_tiles_fit_vmem_for_every_model_config(name: str, paged: bool):
         # Only the ring depths move, and only downwards.
         assert dataclasses.replace(t, nbd=default.nbd, nbe=default.nbe) == default
         assert t.nbd <= default.nbd and t.nbe <= default.nbe
+        nbes.add(t.nbe)
         shrunk |= (t.nbd, t.nbe) != (default.nbd, default.nbe)
         core_plan, _ = vmem.build_scratch(spec, fitted)  # raises if over budget
         assert core_plan.vmem_bytes <= vmem.fit_vmem_budget_bytes(t)
+    # One `nbe` per model across every bucket (`nbe` is `approx` in `TILE_NUMERICS`).
+    assert len(nbes) == 1
     if name.startswith("synth_full"):
         assert shrunk  # the 64-row buckets need shallower rings
 

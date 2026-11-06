@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import dataclasses
+import functools
 import logging
 import math
 from dataclasses import dataclass
@@ -28,7 +29,7 @@ from .. import exec_spec
 from ..collectives.params import CommParams, comm_params, ring_scratch, stage_scratch
 from ..errors import MegakernelConfigError
 from ..exec_spec import ExecSpec
-from ..ops import BF16, F32, FP8
+from ..ops import BF16, F32, FP8, round_up
 from ..planner import Plan, extra_inputs, plan
 from ..profiles.default import chip_budget
 from ..spec import ModelSpec, ScratchReq
@@ -452,6 +453,62 @@ def _ring_bytes(core_plan: CorePlan) -> tuple[int, int]:
 
 
 _LOGGED_FIT_KEYS: set[tuple[str, int, int, int, int, int, int]] = set()
+# Default bucket row ceiling across which `fit_default_tiles` pins one
+# model-wide `nbe` (the minimum over the model's buckets, since `nbe` is
+# `approx` in `TILE_NUMERICS` and gates module pipelining paths).
+DEFAULT_FIT_MAX_ROWS = 64
+
+
+def _fit_ring_depths_uncached(
+    model_spec: ModelSpec,
+    probe_ex: ExecSpec,
+    t: exec_spec.Tiles,
+    budget: int,
+    shrink_nbe: bool,
+) -> tuple[exec_spec.Tiles | None, int, exec_spec.Tiles]:
+    while True:
+        probe = dataclasses.replace(
+            probe_ex, tiles=dataclasses.replace(t, vmem_mib=_PROBE_VMEM_MIB)
+        )
+        core_plan, _ = build_scratch(model_spec, probe)
+        if core_plan.vmem_bytes <= budget:
+            return t, core_plan.vmem_bytes, t
+        dense, expert = _ring_bytes(core_plan)
+        can_e = shrink_nbe and expert > 0 and t.nbe > MIN_RING_DEPTH
+        can_d = dense > 0 and t.nbd > MIN_RING_DEPTH
+        if can_e and (expert >= dense or not can_d):
+            t = dataclasses.replace(t, nbe=t.nbe - 1)
+        elif can_d:
+            t = dataclasses.replace(t, nbd=t.nbd - 1)
+        elif expert > 0 and t.nbe > MIN_RING_DEPTH:
+            t = dataclasses.replace(t, nbe=t.nbe - 1)
+        else:
+            return None, core_plan.vmem_bytes, t
+
+
+@functools.lru_cache(maxsize=256)
+def _fit_ring_depths_cached(
+    model_spec: ModelSpec,
+    probe_ex: ExecSpec,
+    t: exec_spec.Tiles,
+    budget: int,
+    shrink_nbe: bool,
+) -> tuple[exec_spec.Tiles | None, int, exec_spec.Tiles]:
+    return _fit_ring_depths_uncached(model_spec, probe_ex, t, budget, shrink_nbe)
+
+
+def _fit_ring_depths(
+    model_spec: ModelSpec,
+    probe_ex: ExecSpec,
+    t: exec_spec.Tiles,
+    budget: int,
+    *,
+    shrink_nbe: bool = True,
+) -> tuple[exec_spec.Tiles | None, int, exec_spec.Tiles]:
+    try:
+        return _fit_ring_depths_cached(model_spec, probe_ex, t, budget, shrink_nbe)
+    except TypeError:
+        return _fit_ring_depths_uncached(model_spec, probe_ex, t, budget, shrink_nbe)
 
 
 def fit_default_tiles(model_spec: ModelSpec, ex: ExecSpec) -> ExecSpec:
@@ -459,63 +516,66 @@ def fit_default_tiles(model_spec: ModelSpec, ex: ExecSpec) -> ExecSpec:
 
     No-op when `ex.tiles` is set (explicit and profile tiles are never changed;
     an over-budget plan raises in `build_scratch`). Otherwise starts from
-    `default_tiles(B, R)` sized for the device's chip (`chip_budget()`) and,
-    while the planned VMEM scratch exceeds `fit_vmem_budget_bytes(t)`
-    (`vmem_mib - FIT_VMEM_HEADROOM_MIB`), drops one slot from the larger
-    allocated weight ring (dense `nbd` or expert `nbe`), down to
-    `MIN_RING_DEPTH`. Raises `MegakernelConfigError` if the plan does not fit
-    even then.
+    `default_tiles(B, R)` sized for the device's chip (`chip_budget()`), pins
+    one model-wide `nbe` (the minimum fitted `nbe` over the model's buckets up
+    to `max(ex.B, DEFAULT_FIT_MAX_ROWS)` across `T in (1, 2, ex.T)`, so `nbe`
+    never varies across buckets of a model and cannot flip module pipelining
+    paths), and then shrinks `nbd` (down to `MIN_RING_DEPTH`) until the bucket's
+    planned VMEM scratch fits `fit_vmem_budget_bytes(t)`
+    (`vmem_mib - FIT_VMEM_HEADROOM_MIB`). Raises `MegakernelConfigError` if the
+    plan does not fit even then.
     """
     if ex.tiles is not None:
         return ex
     t0 = exec_spec.default_tiles(ex.B, R=ex.R, chip=chip_budget())
-    t = t0
-    budget = fit_vmem_budget_bytes(t)
-    while True:
-        probe = dataclasses.replace(
-            ex, tiles=dataclasses.replace(t, vmem_mib=_PROBE_VMEM_MIB)
+    budget = fit_vmem_budget_bytes(t0)
+    max_rows = max(ex.B, DEFAULT_FIT_MAX_ROWS)
+    model_nbe = t0.nbe
+    for tw in dict.fromkeys((1, 2, ex.T)):
+        bw = round_up(max_rows, tw)
+        w_ex = dataclasses.replace(ex, B=bw, T=tw)
+        t_w, _, _ = _fit_ring_depths(model_spec, w_ex, t0, budget, shrink_nbe=True)
+        if t_w is not None:
+            model_nbe = min(model_nbe, t_w.nbe)
+    t_fit, vmem_bytes, t_last = _fit_ring_depths(
+        model_spec,
+        ex,
+        dataclasses.replace(t0, nbe=model_nbe),
+        budget,
+        shrink_nbe=False,
+    )
+    if t_fit is None:
+        need = vmem_bytes / (1024 * 1024)
+        raise MegakernelConfigError(
+            f"default tiles do not fit the {t_last.vmem_mib} MiB VMEM budget for "
+            f"ModelSpec {model_spec.name!r} (B={ex.B}, T={ex.T}, R={ex.R}): "
+            f"{need:.2f} MiB with ring depths nbd={t_last.nbd}, nbe={t_last.nbe}; "
+            "pass explicit tiles or a named profile"
         )
-        core_plan, _ = build_scratch(model_spec, probe)
-        if core_plan.vmem_bytes <= budget:
-            if (t.nbd, t.nbe) != (t0.nbd, t0.nbe):
-                log_key = (
-                    model_spec.name,
-                    ex.B,
-                    ex.R,
-                    t0.nbd,
-                    t0.nbe,
-                    t.nbd,
-                    t.nbe,
-                )
-                if log_key not in _LOGGED_FIT_KEYS:
-                    _LOGGED_FIT_KEYS.add(log_key)
-                    logger.info(
-                        "fit_default_tiles shrunk ring depths for ModelSpec %r "
-                        "(B=%d, R=%d): nbd %d->%d, nbe %d->%d "
-                        "(%.2f MiB / %.2f MiB budget)",
-                        model_spec.name,
-                        ex.B,
-                        ex.R,
-                        t0.nbd,
-                        t.nbd,
-                        t0.nbe,
-                        t.nbe,
-                        core_plan.vmem_bytes / (1024 * 1024),
-                        budget / (1024 * 1024),
-                    )
-            return dataclasses.replace(ex, tiles=t)
-        dense, expert = _ring_bytes(core_plan)
-        can_e = expert > 0 and t.nbe > MIN_RING_DEPTH
-        can_d = dense > 0 and t.nbd > MIN_RING_DEPTH
-        if can_e and (expert >= dense or not can_d):
-            t = dataclasses.replace(t, nbe=t.nbe - 1)
-        elif can_d:
-            t = dataclasses.replace(t, nbd=t.nbd - 1)
-        else:
-            need = core_plan.vmem_bytes / (1024 * 1024)
-            raise MegakernelConfigError(
-                f"default tiles do not fit the {t.vmem_mib} MiB VMEM budget for "
-                f"ModelSpec {model_spec.name!r} (B={ex.B}, T={ex.T}, R={ex.R}): "
-                f"{need:.2f} MiB with ring depths nbd={t.nbd}, nbe={t.nbe}; "
-                "pass explicit tiles or a named profile"
+    if (t_fit.nbd, t_fit.nbe) != (t0.nbd, t0.nbe):
+        log_key = (
+            model_spec.name,
+            ex.B,
+            ex.R,
+            t0.nbd,
+            t0.nbe,
+            t_fit.nbd,
+            t_fit.nbe,
+        )
+        if log_key not in _LOGGED_FIT_KEYS:
+            _LOGGED_FIT_KEYS.add(log_key)
+            logger.info(
+                "fit_default_tiles shrunk ring depths for ModelSpec %r "
+                "(B=%d, R=%d): nbd %d->%d, nbe %d->%d "
+                "(%.2f MiB / %.2f MiB budget)",
+                model_spec.name,
+                ex.B,
+                ex.R,
+                t0.nbd,
+                t_fit.nbd,
+                t0.nbe,
+                t_fit.nbe,
+                vmem_bytes / (1024 * 1024),
+                budget / (1024 * 1024),
             )
+    return dataclasses.replace(ex, tiles=t_fit)

@@ -155,6 +155,13 @@ def test_fit_default_tiles_on_fake_model_spec(monkeypatch, caplog):
     cp, _ = vmem.build_scratch(ms_large, fitted)
     assert cp.vmem_bytes <= vmem.fit_vmem_budget_bytes(fitted.tiles)
 
+    # Every bucket of the same model gets the same `nbe` (the minimum over its
+    # buckets), while `nbd` can stay deeper on smaller buckets.
+    fitted_4 = vmem.fit_default_tiles(ms_large, ExecSpec(B=4, T=1, R=2, ctx=4096))
+    assert fitted_4.tiles is not None
+    assert fitted_4.tiles.nbe == fitted.tiles.nbe
+    assert fitted_4.tiles.nbd >= fitted.tiles.nbd
+
     ex_explicit = ExecSpec(B=64, T=1, R=2, ctx=4096, tiles=default_64)
     assert vmem.fit_default_tiles(ms_large, ex_explicit) is ex_explicit
 
