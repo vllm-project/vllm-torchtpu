@@ -155,7 +155,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--target-tpu",
         type=str,
         default=None,
-        help="Target TPU generation label ('v6e', 'v5p'). Auto-detected if omitted.",
+        help=(
+            "Target TPU generation label ('v6e', '7x'). Detected from "
+            "TPU_ACCELERATOR_TYPE or GCE metadata if omitted; the export fails "
+            "when it cannot be detected."
+        ),
     )
     export_group.add_argument(
         "--token-buckets",

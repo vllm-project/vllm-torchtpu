@@ -41,6 +41,12 @@ from vllm_torchtpu.experimental.export import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _tpu_accelerator_type(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Gives these CPU tests a TPU generation: the export refuses to guess one."""
+    monkeypatch.setenv("TPU_ACCELERATOR_TYPE", "v6e-8")
+
+
 def _mock_lower_torch_callable_to_mlir(
     fn: Any,
     arg_specs: Sequence[api.ShapeDtypeStruct],
@@ -1463,6 +1469,38 @@ def test_build_export_config_rejects_data_and_pipeline_parallelism(
         universal_adapter.build_export_config_from_vllm(
             _parallel_vllm_cfg(tmp_path, 1, dp, pp)
         )
+
+
+def test_build_export_config_fails_when_the_tpu_generation_is_unknown(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The kernels in the artifact are tuned for one TPU generation, so the
+    # export must record the real one rather than guess.
+    from vllm_torchtpu import tpu_info
+
+    monkeypatch.setattr(tpu_info, "get_tpu_type", lambda: None)
+    with pytest.raises(RuntimeError, match="--target-tpu"):
+        universal_adapter.build_export_config_from_vllm(
+            _parallel_vllm_cfg(tmp_path, 1, 1, 1)
+        )
+
+
+def test_build_export_config_records_the_detected_tpu_generation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from vllm_torchtpu import tpu_info
+
+    monkeypatch.setattr(tpu_info, "get_tpu_type", lambda: "tpu7x-8")
+    cfg = universal_adapter.build_export_config_from_vllm(
+        _parallel_vllm_cfg(tmp_path, 1, 1, 1)
+    )
+    assert cfg.target_tpu == "7x"
+    # An explicit --target-tpu is kept as given, with no detection.
+    monkeypatch.setattr(tpu_info, "get_tpu_type", lambda: None)
+    cfg = universal_adapter.build_export_config_from_vllm(
+        _parallel_vllm_cfg(tmp_path, 1, 1, 1), target_tpu="v6e"
+    )
+    assert cfg.target_tpu == "v6e"
 
 
 @pytest.mark.parametrize("tp", [1, 2, 4])

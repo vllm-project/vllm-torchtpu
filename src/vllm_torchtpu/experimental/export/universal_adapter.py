@@ -203,6 +203,23 @@ def resolve_hf_checkpoint_dir(model: str | None) -> str | None:
     return os.path.dirname(config_path)
 
 
+def _detect_target_tpu() -> str:
+    """The TPU generation of this host, as `ChipVersion` names it ('7x', 'v6e').
+
+    The artifact's kernels are tuned for one generation, so an export that
+    cannot tell which one it runs on fails instead of guessing.
+    """
+    from vllm_torchtpu import tpu_info
+
+    accelerator_type = tpu_info.get_tpu_type()
+    if not accelerator_type:
+        raise RuntimeError(
+            "Cannot detect the TPU generation (neither TPU_ACCELERATOR_TYPE nor "
+            "the GCE metadata accelerator-type is available); pass --target-tpu."
+        )
+    return str(tpu_info.get_chip_version(accelerator_type).value)
+
+
 @trace("export.build_export_config")
 def build_export_config_from_vllm(
     vllm_config: Any,
@@ -242,12 +259,7 @@ def build_export_config_from_vllm(
     dp_size, pp_size = check_supported_parallelism(parallel_cfg)
 
     if target_tpu is None:
-        with contextlib.suppress(Exception):
-            from vllm_torchtpu.tpu_info import get_chip_version
-
-            target_tpu = str(get_chip_version().value)
-        if not target_tpu:
-            target_tpu = "v6e"
+        target_tpu = _detect_target_tpu()
 
     vocab_size = int(
         (
