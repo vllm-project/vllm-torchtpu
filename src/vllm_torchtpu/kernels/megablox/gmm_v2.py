@@ -801,7 +801,11 @@ def inner_kernel(
         is_first_k_step = k_id == 0
         is_last_k_step = k_id == (num_k - 1)
 
-        if bucket_m == cfgs.tiles.tile_m:
+        if cfgs.tiles.tile_k >= cfgs.dims.size_k:
+            # One k step: only first_last can run; emit just it (code size
+            # grows with the number of buckets).
+            matmul_first_last()
+        elif bucket_m == cfgs.tiles.tile_m:
             lax.cond(
                 is_first_k_step,
                 lambda: lax.cond(is_last_k_step, matmul_first_last, matmul_first),
@@ -829,7 +833,8 @@ def inner_kernel(
     branches = []
     for bucket_idx in range(cfgs.tiles.tile_m // cfgs.tiles.bucket_base):
         branches.append(functools.partial(run_matmul_step, bucket_idx=bucket_idx))
-    bucket_idx = m_end_local // cfgs.tiles.bucket_base
+    # Smallest bucket covering rows [0, m_end_local).
+    bucket_idx = (m_end_local - 1) // cfgs.tiles.bucket_base
     lax.switch(bucket_idx, branches)
 
 

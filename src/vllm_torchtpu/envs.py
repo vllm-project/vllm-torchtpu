@@ -95,6 +95,7 @@ if TYPE_CHECKING:
     TPU_MOE_NONEP_GMM_EXPERTS_PER_VISIT: str = "1"
     TPU_SC_COMBINE_DENSE: str = ""
     TPU_MOE_NONEP_COMBINE_PACKED: bool = False
+    TPU_MOE_NONEP_GMM_BUCKET: str = "0"
     USE_MOE_TP_DECODE_KERNEL: bool = False
     RAGGED_GATHER_REDUCE_VERSION: str = "v2"
     USE_PHASED_PROFILER: bool = False
@@ -1323,6 +1324,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # gathers single rows instead of row pairs: half the gather bytes.
     # Bitwise the same output.
     "TPU_MOE_NONEP_COMBINE_PACKED": env_bool("TPU_MOE_NONEP_COMBINE_PACKED"),
+    # Row-bucket base of both non-EP GMMs (gmm_v2 tile bucket_base): a visit
+    # computes its rows rounded up to a bucket; 0 = default (128 at prefill).
+    # Rows are independent, so the output is bitwise the same.
+    "TPU_MOE_NONEP_GMM_BUCKET": env_with_choices(
+        "TPU_MOE_NONEP_GMM_BUCKET", "0", ["0", "32", "64"]
+    ),
     # Serve eligible tensor-parallel MoE layers (sigmoid + correction-bias
     # top-k with renormalization, one shared expert, FP8 per-channel weights)
     # with one op that also covers the shared expert and the TP all-reduce:

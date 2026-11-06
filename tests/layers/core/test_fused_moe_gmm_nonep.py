@@ -153,7 +153,7 @@ def test_nonep_choices_change_only_the_non_ep_program():
     assert "concatenate" in non_ep and "concatenate" not in jaxpr(False)
 
 
-def _ref_gmm(calls, tiles=None, hoists=None, splits=None, epvs=None, packs=None):
+def _ref_gmm(calls, tiles=None, hoists=None, splits=None, epvs=None, packs=None, buckets=None):
     """Pure-JAX stand-in for gmm_wrapper that records its n_window (and
     tile_m); every output column is computed independently, as the kernel's
     are."""
@@ -162,11 +162,13 @@ def _ref_gmm(calls, tiles=None, hoists=None, splits=None, epvs=None, packs=None)
     splits = [] if splits is None else splits
     epvs = [] if epvs is None else epvs
     packs = [] if packs is None else packs
+    buckets = [] if buckets is None else buckets
 
     def gmm(lhs, rhs, rhs_scale, rhs_bias, group_sizes, group_offset, zero_initialize=False,
             fuse_act=None, preferred_element_type=None, rhs_quant_dtype=None, n_window=None,
-            tile_m=0, hoist_lhs_quant=False, rhs_split=1, experts_per_visit=1, pack_out=False):
+            tile_m=0, hoist_lhs_quant=False, rhs_split=1, experts_per_visit=1, pack_out=False, bucket=0):
         calls.append(n_window)
+        buckets.append(bucket)
         epvs.append(experts_per_visit)
         packs.append(pack_out)
         tiles.append(tile_m)
@@ -310,6 +312,50 @@ def test_experts_per_visit_reaches_every_gmm_on_the_non_ep_path_only(monkeypatch
     # gmm1, then gmm2 once per column block when the combine is split
     assert len(epvs) == 1 + split
     assert epvs == [1] * (1 + split) if use_ep else epvs == [4] * (1 + split)
+
+
+def test_tiling_with_bucket_only_refines_the_row_buckets(monkeypatch):
+    from vllm_torchtpu.kernels.megablox.gmm_v2 import TileSizes
+
+    fused_moe_gmm.tiling_with_bucket.cache_clear()
+    fused_moe_gmm.tiling_with_tile_m.cache_clear()
+    t0 = TileSizes(tile_m=512, tile_k=2560, tile_n=640, bucket_base=128)
+    monkeypatch.setattr(fused_moe_gmm, "calculate_tiling", lambda *a, **k: t0)
+    for bucket, base in ((0, 128), (32, 32), (64, 64), (128, 128), (256, 128), (48, 128)):
+        t = fused_moe_gmm.tiling_with_bucket(0, bucket)(None, None, None, 0)
+        assert (t.tile_m, t.tile_k, t.tile_n, t.bucket_base) == (512, 2560, 640, base), (bucket, t)
+    # composes with the m-tile override
+    from vllm_torchtpu.kernels.megablox.gmm_v2 import Dimensions
+
+    dims = Dimensions(size_m=1 << 20, size_k=2560, size_n=1280, size_group=512, size_lhs_group=512,
+                      size_lhs_sublane=16)
+    t = fused_moe_gmm.tiling_with_bucket(1024, 64)(dims, None, None, 0)
+    assert (t.tile_m, t.bucket_base) == (1024, 64)
+    assert fused_moe_gmm.tiling_with_bucket(0, 32) is fused_moe_gmm.tiling_with_bucket(0, 32)
+    fused_moe_gmm.tiling_with_bucket.cache_clear()
+    fused_moe_gmm.tiling_with_tile_m.cache_clear()
+
+
+@pytest.mark.parametrize("use_ep", [False, True])
+def test_gmm_bucket_reaches_both_gmms_on_the_non_ep_path_only(monkeypatch, use_ep):
+    experts, hidden, inter, topk, tokens = 16, 512, 128, 4, 640
+    k1, k2, k3 = jax.random.split(jax.random.key(10), 3)
+    w1, s1 = _fp8_per_channel(k1, (experts, hidden, 2 * inter))
+    w2, s2 = _fp8_per_channel(k2, (experts, inter, hidden))
+    x = (jax.random.normal(k3, (tokens, hidden), jnp.float32) / 4).astype(jnp.bfloat16)
+    rng = np.random.default_rng(11)
+    ids = jnp.asarray(np.stack([rng.choice(experts, topk, replace=False) for _ in range(tokens)]), jnp.int32)
+    w = jnp.asarray(rng.random((tokens, topk)), jnp.bfloat16)
+    calls, buckets = [], []
+    monkeypatch.setattr(fused_moe_gmm, "gmm_wrapper", _ref_gmm(calls, buckets=buckets))
+    xs, gs, rev, wf, valid, tok = prepare_routed_gmm_inputs(
+        x, ids, w, local_num_experts=experts, topk=topk, use_ep=False, use_sparse_core=False
+    )
+    fused_moe_gmm.moe_gmm(
+        xs, w1, s1, None, w2, s2, None, gs, rev, wf, valid, tok, activation="silu",
+        num_tokens=tokens, topk=topk, use_ep=use_ep, use_sparse_core=False, nonep_gmm_bucket=32,
+    )
+    assert buckets == ([0, 0] if use_ep else [32, 32])
 
 
 class _FakeRef:

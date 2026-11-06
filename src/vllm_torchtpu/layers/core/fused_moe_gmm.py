@@ -218,6 +218,25 @@ def tiling_with_tile_m(tile_m: int):
     return tiling
 
 
+@functools.lru_cache(maxsize=None)
+def tiling_with_bucket(tile_m: int, bucket: int):
+    """tiling_with_tile_m(tile_m) (default tiling when 0) with a row-bucket
+    base of ``bucket`` rows when it is finer than the default and divides the
+    m-tile. A visit computes its m-tile's rows rounded up to a bucket; at
+    prefill sizes an expert has ~125 rows, so with the default 128-row base
+    most visits compute 256 rows. Every row is computed exactly as before
+    (rows are independent), only fewer padding rows are."""
+    base_tiling = tiling_with_tile_m(tile_m) if tile_m else calculate_tiling
+
+    def tiling(dims, lhs_cfgs, rhs_cfgs, vmem_limit_bytes, fuse_act=None):
+        t = base_tiling(dims, lhs_cfgs, rhs_cfgs, vmem_limit_bytes, fuse_act)
+        if not bucket or bucket >= t.bucket_base or t.tile_m % bucket:
+            return t
+        return dataclasses.replace(t, bucket_base=bucket)
+
+    return tiling
+
+
 def align_to_multiple(x: int, a: int) -> int:
     return -(-x // a) * a
 
@@ -239,6 +258,7 @@ def gmm_wrapper(
     rhs_split=1,
     experts_per_visit=1,
     pack_out=False,
+    bucket=0,
 ):
     # fp4 weights: keep bf16 activations. Quantizing activations to fp8 collapses
     # fp4 accuracy (error compounds across MoE layers) with no decode speedup
@@ -260,7 +280,8 @@ def gmm_wrapper(
         maybe_quantize_lhs=not is_fp4_weight,
         rhs_quant_dtype=rhs_quant_dtype,
         n_window=n_window,
-        **({"tile_info": tiling_with_tile_m(tile_m)} if tile_m else {}),
+        **({"tile_info": tiling_with_bucket(tile_m, bucket)} if bucket
+           else {"tile_info": tiling_with_tile_m(tile_m)} if tile_m else {}),
         **({"hoist_lhs_quant": True} if hoist_lhs_quant else {}),
         **({"rhs_split": rhs_split} if rhs_split > 1 else {}),
         **({"experts_per_visit": experts_per_visit} if experts_per_visit > 1 else {}),
@@ -640,6 +661,7 @@ def moe_gmm(
     nonep_gmm2_rhs_split: int = 1,
     nonep_gmm_experts_per_visit: int = 1,
     nonep_combine_packed: bool = False,
+    nonep_gmm_bucket: int = 0,
 ) -> jax.Array:
     """Run grouped GEMM for routed tokens and reduce back to tokens.
 
@@ -661,6 +683,8 @@ def moe_gmm(
     # Consecutive experts per gmm_v2 pipeline step in both GMMs (non-EP: all
     # groups local, no group offset).
     epv = 1 if use_ep else nonep_gmm_experts_per_visit
+    # Finer row buckets for both non-EP GMMs (TPU_MOE_NONEP_GMM_BUCKET); 0 = default.
+    bucket = 0 if use_ep else nonep_gmm_bucket
 
     gmm1_res = gmm_wrapper(
         x,
@@ -675,6 +699,7 @@ def moe_gmm(
         tile_m=tile_m,
         hoist_lhs_quant=hoist,
         experts_per_visit=epv,
+        bucket=bucket,
     )
     packing_factor = get_packing_factor(w2.dtype, rhs_quant_dtype)
     gmm1_res = gmm1_res[:, : w2.shape[1] * packing_factor]
@@ -718,6 +743,7 @@ def moe_gmm(
                 hoist_lhs_quant=hoist,
                 rhs_split=rhs_split,
                 experts_per_visit=epv,
+                bucket=bucket,
             )
             blocks.append(
                 ragged_gather_reduce_v3(
@@ -761,6 +787,7 @@ def moe_gmm(
         rhs_split=rhs_split,
         experts_per_visit=epv,
         pack_out=packed,
+        bucket=bucket,
     )
     if packed:
         return ragged_gather_reduce_v3(
@@ -870,6 +897,7 @@ def moe_gmm(
         "nonep_gmm2_rhs_split",
         "nonep_gmm_experts_per_visit",
         "nonep_combine_packed",
+        "nonep_gmm_bucket",
     ),
 )
 def fused_moe_func(
@@ -900,6 +928,7 @@ def fused_moe_func(
     nonep_gmm2_rhs_split: int = 1,
     nonep_gmm_experts_per_visit: int = 1,
     nonep_combine_packed: bool = False,
+    nonep_gmm_bucket: int = 0,
 ) -> jax.Array:
     """Run MoE with precomputed expert ids and weights.
 
@@ -1027,5 +1056,6 @@ def fused_moe_func(
         nonep_gmm2_rhs_split=nonep_gmm2_rhs_split,
         nonep_gmm_experts_per_visit=nonep_gmm_experts_per_visit,
         nonep_combine_packed=nonep_combine_packed,
+        nonep_gmm_bucket=nonep_gmm_bucket,
     )
     return x[:num_tokens, :hidden_size]
