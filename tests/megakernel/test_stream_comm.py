@@ -456,6 +456,15 @@ def test_tworing_consumption_order_and_nesting_guards():
     ):
         pass
 
+    # dmatmul(lazy=...) disagreeing with enclosing segment(lazy=...) raises ValueError
+    for seg_lazy in (False, True):
+        ring_mismatch = stream.TwoRing(sp, {}, {}, interpret=True)
+        with (
+            pytest.raises(ValueError, match="disagrees with enclosing stream.segment"),
+            ring_mismatch.segment(lazy=seg_lazy),
+        ):
+            ring_mismatch.dmatmul("w1", None, 256, g0=0, lazy=not seg_lazy)
+
 
 @pytest.mark.parametrize(
     "dense_acc_pair,dmm_unroll,rel_fetch",

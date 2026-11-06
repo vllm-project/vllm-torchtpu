@@ -561,6 +561,11 @@ class TwoRing:
             self.cursor = g0 + n_t
             self._seg_tiles += n_t
             self._cursor_delta += n_t
+        if self._in_segment and lazy is not None and bool(lazy) != bool(self._lazy):
+            raise ValueError(
+                f"dmatmul({kind!r}, lazy={lazy}) disagrees with enclosing "
+                f"stream.segment(lazy={self._lazy})"
+            )
         use_lazy = self._lazy if lazy is None else lazy
         if use_lazy and self._in_segment:
             assert self._seg_tiles <= sp.NBD, (
