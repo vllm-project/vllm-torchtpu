@@ -1638,11 +1638,11 @@ def test_tpu_mosaic_lowering_glm52_abstract(
     assert f"fused_moe_prefill_nvfp4-t_{tokens}" in hlo
     if tokens == 4096:
         assert "_flat" in hlo
-        if cfg["i"] > 256:
-            assert f"-m_256-{act_mode}-nb4-nc2048" in hlo
-            assert "-r32" not in hlo
-        else:
-            assert f"-m_256-{act_mode}-nb4-nc2048-r32" in hlo
+        assert f"-m_256-{act_mode}-nb4-nc2048" in hlo
+        assert "-r32" not in hlo
+    else:
+        assert f"-m_128-{act_mode}-nb4-nc2048" in hlo
+        assert "-r32" not in hlo
 
 
 @pytest.mark.parametrize("cfg", [SMALL_EP2TP4, SMALL_TP8])
@@ -2234,24 +2234,128 @@ def test_tpu_hardware_correctness(
 
 
 # ==============================================================================
-# 5. Code-Size-Aware Rung Rule, Env Flag, & moe_tp_decode_nvfp4 Adapter Tests
+# 5. Default Rung Rule, Env Flag, & moe_tp_decode_nvfp4 Adapter Tests
 # ==============================================================================
 
 
 def test_tall_rung_rows_for_rule():
-    """Verify code-size-aware rung step selection from (tile_rows, i)."""
+    """Verify default rung step selects 4 rungs (None)."""
     assert mod.STAGE_A_NVFP4["tall_rung_rows"] == "auto"
-    assert mod.tall_rung_rows_for(64, 256) is None
-    assert mod.tall_rung_rows_for(64, 512) is None
-    assert mod.tall_rung_rows_for(128, 256) is None
-    assert mod.tall_rung_rows_for(128, 512) is None
-    # At tile_rows=256: fits in 8 MiB IMEM when tile_rows * i <= 65_536 (TP8 I=256)
-    assert mod.tall_rung_rows_for(256, 128) == 32
-    assert mod.tall_rung_rows_for(256, 256) == 32
-    # Exceeds 8 MiB IMEM when tile_rows * i > 65_536 (EP2xTP4 I=512 -> 4 rungs)
-    assert mod.tall_rung_rows_for(256, 384) is None
-    assert mod.tall_rung_rows_for(256, 512) is None
-    assert mod.tall_rung_rows_for(256, 2048) is None
+    for tile_rows in (64, 128, 192, 256, 512):
+        for i_rank in (128, 256, 384, 512, 2048):
+            assert mod.tall_rung_rows_for(tile_rows, i_rank) is None
+
+
+@pytest.mark.parametrize("cfg", [GLM52_EP2TP4, GLM52_TP8])
+@pytest.mark.parametrize("act_mode", ["w4a16", "w4a8"])
+def test_default_and_override_rung_selection_by_layout_and_act_mode(
+    monkeypatch: pytest.MonkeyPatch,
+    cfg: dict[str, int],
+    act_mode: mod.ActMode,
+):
+    """Verify default 4-rung selection at T=4096 and tall_rung_rows override."""
+    _install_mock_tpu7x(monkeypatch)
+    mesh = _cpu_or_any_mesh()
+    rep = NamedSharding(mesh, P())
+    shd = NamedSharding(mesh, P("d"))
+    sds = jax.ShapeDtypeStruct
+
+    h, e, i, i_s, topk, qb1, bk2, ep = (
+        cfg["h"],
+        cfg["e"],
+        cfg["i"],
+        cfg["i_s"],
+        cfg["topk"],
+        cfg["qb1"],
+        cfg["bk2"],
+        cfg["ep"],
+    )
+    el = e // ep
+    b13 = h // qb1
+    b2 = i // bk2
+    tokens = 4096
+
+    s_args = (
+        sds((tokens, h), BF16, sharding=rep),
+        sds((N_RANKS * el, h, 2 * i), FP4, sharding=shd),
+        sds((N_RANKS * el, i, h), FP4, sharding=shd),
+        sds((N_RANKS * el, b13, 1, 2 * i), F32, sharding=shd),
+        sds((N_RANKS * el, b2, 1, h), F32, sharding=shd),
+        sds((N_RANKS * h, 2 * i_s), FP8, sharding=shd),
+        sds((N_RANKS * 2 * i_s,), F32, sharding=shd),
+        sds((N_RANKS * i_s, h), FP8, sharding=shd),
+        sds((N_RANKS * h,), F32, sharding=shd),
+        sds((tokens, topk), BF16, sharding=rep),
+        sds((tokens, topk), jnp.int32, sharding=rep),
+        sds((N_RANKS, 1), jnp.int32, sharding=shd),
+    )
+
+    for tall_r, want_r32 in (("auto", False), (None, False), (32, True)):
+
+        def body(
+            x_,
+            w1_,
+            w2_,
+            s1_,
+            s2_,
+            sw1_,
+            ss1_,
+            sw2_,
+            ss2_,
+            tw_,
+            tids_,
+            e0_,
+            _tr: mod.TallRungRows = tall_r,
+        ):
+            return mod.fused_moe_prefill_nvfp4(
+                x_,
+                w1_,
+                w2_,
+                s1_,
+                s2_,
+                sw1_,
+                ss1_,
+                sw2_,
+                ss2_,
+                None,
+                tw_,
+                tids_,
+                axis_name="d",
+                expert_start=e0_.reshape(()) if ep > 1 else None,
+                routed_scale=ROUTED_SCALE,
+                act_mode=act_mode,
+                tall_rung_rows=_tr,
+            )
+
+        hlo = (
+            jax.jit(
+                jax.shard_map(
+                    body,
+                    mesh=mesh,
+                    in_specs=(
+                        P(),
+                        P("d"),
+                        P("d"),
+                        P("d"),
+                        P("d"),
+                        P("d"),
+                        P("d"),
+                        P("d"),
+                        P("d"),
+                        P(),
+                        P(),
+                        P("d"),
+                    ),
+                    out_specs=P(),
+                    check_vma=False,
+                )
+            )
+            .trace(*s_args)
+            .lower(lowering_platforms=("tpu",))
+            .as_text()
+        )
+        assert f"-m_256-{act_mode}-nb4-nc2048" in hlo
+        assert ("-r32" in hlo) is want_r32
 
 
 def test_fused_moe_prefill_nvfp4_env_flag_parsing(monkeypatch: pytest.MonkeyPatch):

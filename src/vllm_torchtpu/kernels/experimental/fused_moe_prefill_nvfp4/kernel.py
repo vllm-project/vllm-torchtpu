@@ -83,7 +83,6 @@ _H_ALIGN = 512
 _PAIR_COLS = 2 * _LANES
 _DEFAULT_W2_N_CHUNK = 2048
 _STATIC_MAX_TILE_ROWS = 256
-_MAX_8RUNG_TILE_I_ELEMS = 256 * 256
 _VMEM_ADMISSION_FRACTION = 0.875
 _REF_BITCAST_JAX_VERSION = "0.9.1"
 
@@ -98,30 +97,17 @@ STAGE_A_NVFP4: dict[str, Any] = dict(
 
 
 def tall_rung_rows_for(tile_rows: int, i: int) -> int | None:
-    """Select code-size-aware ``rung_rows`` for ``(tile_rows, i)``.
+    """Select default ``rung_rows`` for ``(tile_rows, i)``.
 
-    At ``tile_rows <= 128``, ``rung_rows = None`` already gives the 4 base rungs
-    ``[32, 64, 96, 128]``. At ``tile_rows = 256``, unrolling 8 rungs
-    (``rung_rows = 32``) doubles ``tpu.matmul`` count inside the single
-    ``scf.while`` tile loop from ``4 * (b13 + n_chunks * b2 + 2)`` to
-    ``8 * (...)``, while each rung's gate+up ``float32`` accumulator
-    ``acc1 [tile_rows, 2 * i]`` scales with ``tile_rows * i``:
-
-      - ``tile_rows * i <= 65_536`` (e.g. ``TP8`` with ``tile_rows = 256,
-        I_rank = 256``, ``acc1 = 512 KiB``): 8 rungs stays within TPU v7x's
-        8 MiB on-chip IMEM instruction-overlay budget (``8.33-8.75 MiB`` total
-        HLO code) -> returns ``32`` (8 rungs ``[32..256]``).
-      - ``tile_rows * i > 65_536`` (e.g. ``EP2xTP4`` with ``tile_rows = 256,
-        I_rank = 512``, ``acc1 = 1.0 MiB`` = 1,024 MXU ``f32`` ACC rows): 8
-        rungs spills multi-MiB SSA vectors across all 8 branches and pushes
-        compiled code to ``9.16-10.45 MiB``, thrashing IMEM overlays on every
-        tile iteration; 4 rungs (``[64, 128, 192, 256]``) keeps compiled code
-        at ``7.21-7.64 MiB`` -> returns ``None`` (4 rungs).
+    ``tile_rows_for`` returns ``128`` or ``256``. At ``tile_rows = 128``,
+    ``None`` already yields the 4 base rungs ``[32, 64, 96, 128]``. At
+    ``256``-row tiles, 8 rungs (``rung_rows = 32``) were measured much slower
+    for ``W4A16`` (``EP2 x TP4`` and ``TP8``; ``TP8``, ``256``-row tiles:
+    ``509-546`` vs ``83-113 ms`` per 75 layers) and no faster for ``W4A8``, so
+    4 rungs (``None``, ``[64, 128, 192, 256]``) are used at ``256``-row tiles;
+    ``tall_rung_rows`` still overrides.
     """
-    if tile_rows <= 128:
-        return None
-    if tile_rows * i <= _MAX_8RUNG_TILE_I_ELEMS:
-        return 32
+    del tile_rows, i
     return None
 
 
