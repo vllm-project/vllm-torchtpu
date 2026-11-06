@@ -27,7 +27,9 @@ from vllm_torchtpu.kernels.megablox.gmm_v2 import (
     get_packing_factor,
     gmm_v2,
     gmm_v2_mlp,
+    gmm_v2_mlp_scatter,
     mlp_supported,
+    scatter_rows_supported,
 )
 from vllm_torchtpu.kernels.megablox.moe_onehot_unpermute import (
     blockwise_onehot_unpermute,
@@ -711,6 +713,167 @@ def onehot_moe_local_routes(
     gmm2_res = jnp.where(computed[:, None], gmm2_res, 0)
     combine = onehot.T.astype(gmm2_res.dtype) * weights_sorted * valid_sorted
     return (combine @ gmm2_res).astype(x.dtype)
+
+
+def scatter_moe_supported(
+    hidden_states,
+    w1,
+    w2,
+    w1_scale,
+    w2_scale,
+    *,
+    num_routes: int,
+    max_local_routes: int,
+    activation: str,
+    use_sparse_core: bool,
+    onehot_moe_permute_threshold: int,
+    rhs_quant_dtype=None,
+) -> bool:
+    """Whether `fused_moe_scatter` takes these static shapes: the EP step runs
+    the local-routes one-hot path of `fused_moe_func` with `gmm_v2_mlp`."""
+    if w1_scale is None or w2_scale is None:
+        return False
+    if w1_scale.ndim == 3:
+        w1_scale = jax.ShapeDtypeStruct(
+            w1_scale.shape[:2] + (1,) + w1_scale.shape[2:], w1_scale.dtype
+        )
+    if w2_scale.ndim == 3:
+        w2_scale = jax.ShapeDtypeStruct(
+            w2_scale.shape[:2] + (1,) + w2_scale.shape[2:], w2_scale.dtype
+        )
+    num_tokens, hidden_size = hidden_states.shape
+    local_routes = min(max_local_routes or num_routes, num_routes)
+    if not (
+        use_sparse_core
+        and local_routes <= onehot_moe_permute_threshold
+        and envs.TPU_MOE_OWNER_OUTPUT_MODE.lower() != "on"
+        and not (0 < num_tokens <= _DENSE_EXPERT_THRESHOLD)
+        and local_routes <= _MLP_KERNEL_MAX_ROWS
+        and w1.dtype == w2.dtype
+        and get_packing_factor(w1.dtype, rhs_quant_dtype) == 1
+        and w1.shape[1] == hidden_size
+        and w2.shape[2] == hidden_size
+        and scatter_rows_supported(hidden_states.dtype, hidden_size)
+    ):
+        return False
+    rows = jax.ShapeDtypeStruct((local_routes, hidden_size), hidden_states.dtype)
+    return mlp_supported(
+        rows,
+        w1,
+        w1_scale,
+        w2,
+        w2_scale,
+        jax.ShapeDtypeStruct((w1.shape[0],), jnp.int32),
+        fuse_act=activation,
+        maybe_quantize_lhs=not _is_fp4_weight(w1),
+        rhs_quant_dtype=rhs_quant_dtype,
+    )
+
+
+@functools.partial(
+    jax.jit,
+    static_argnames=(
+        "topk",
+        "activation",
+        "rhs_quant_dtype",
+        "skip_padded_tokens",
+        "max_local_routes",
+        "num_recv_rows",
+        "axis",
+        "num_members",
+        "collective_id",
+    ),
+)
+def fused_moe_scatter(
+    hidden_states: jax.Array,
+    w1: jax.Array,
+    w2: jax.Array,
+    w1_scale: jax.Array,
+    w2_scale: jax.Array,
+    topk_weights: jax.Array,
+    topk_ids: jax.Array,
+    experts_start: jax.Array,
+    row_member: jax.Array,
+    row_dest: jax.Array,
+    me: jax.Array,
+    expected: jax.Array,
+    *,
+    topk: int,
+    activation: str,
+    rhs_quant_dtype=None,
+    skip_padded_tokens: bool = False,
+    max_local_routes: int,
+    num_recv_rows: int,
+    axis: str,
+    num_members: int,
+    collective_id: int,
+) -> jax.Array:
+    """The EP local-routes path of `fused_moe_func` up to the expert outputs,
+    which go to their owners instead of being combined here.
+
+    Row `r` of ``hidden_states`` belongs to member ``row_member[r]``; its
+    route ``k`` lands at row ``row_dest[r, k]`` of that member's receive
+    buffer, unweighted (the owner applies the routing weights). Returns this
+    member's receive buffer (see `gmm_v2_mlp_scatter`); ``expected`` counts the
+    rows other members send here. Expert outputs are the ones `fused_moe_func`
+    combines (same permute, same GMM rows).
+    """
+    if w1_scale.ndim == 3:
+        w1_scale = jnp.expand_dims(w1_scale, 2)
+    if w2_scale.ndim == 3:
+        w2_scale = jnp.expand_dims(w2_scale, 2)
+    num_tokens = hidden_states.shape[0]
+    local_num_experts = w1.shape[0]
+    topk_weights = topk_weights.astype(hidden_states.dtype)
+    # As fused_moe_func's one-hot paths: non-finite values stay with their token.
+    hidden_states = jnp.where(jnp.isfinite(hidden_states), hidden_states, 0)
+    topk_weights = jnp.where(jnp.isfinite(topk_weights), topk_weights, 0)
+    local_ids = topk_ids - experts_start
+    valid = (local_ids >= 0) & (local_ids < local_num_experts)
+    topk_weights = jnp.where(valid, topk_weights, jnp.zeros_like(topk_weights))
+    topk_ids = jnp.where(valid, local_ids, jnp.full_like(local_ids, -1))
+
+    # onehot_moe_local_routes up to the GMM.
+    num_routes = num_tokens * topk
+    ids = topk_ids.reshape(-1)
+    weights = topk_weights.reshape(-1)
+    valid = (ids >= 0) & (weights != 0) if skip_padded_tokens else ids >= 0
+    keys = jnp.where(valid, ids, local_num_experts)
+    route_bits = max(1, (num_routes - 1).bit_length())
+    assert local_num_experts.bit_length() + route_bits < 32
+    route = jnp.arange(num_routes, dtype=jnp.int32)
+    packed = jax.lax.sort(jnp.left_shift(keys, route_bits) | route)
+    packed = packed[:max_local_routes]
+    route_sorted = jnp.bitwise_and(packed, (1 << route_bits) - 1)
+    token_sorted = route_sorted // topk
+    group_sizes = jax.nn.one_hot(
+        jnp.where(valid, ids, 0), local_num_experts, dtype=jnp.int32
+    ) * valid[:, None].astype(jnp.int32)
+    group_sizes = group_sizes.sum(axis=0)
+    onehot = jax.nn.one_hot(token_sorted, num_tokens, dtype=hidden_states.dtype)
+    x = onehot @ hidden_states
+    dest_member = row_member[token_sorted]
+    dest_row = row_dest.reshape(-1)[route_sorted]
+    return gmm_v2_mlp_scatter(
+        x,
+        w1,
+        w2,
+        group_sizes,
+        w1_scale,
+        w2_scale,
+        jnp.array([0], dtype=jnp.int32),
+        dest_member,
+        dest_row,
+        me,
+        expected,
+        num_recv_rows=num_recv_rows,
+        axis=axis,
+        num_members=num_members,
+        collective_id=collective_id,
+        fuse_act=activation,
+        maybe_quantize_lhs=not _is_fp4_weight(w1),
+        rhs_quant_dtype=rhs_quant_dtype,
+    )
 
 
 @functools.partial(

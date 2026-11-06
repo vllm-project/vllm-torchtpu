@@ -114,6 +114,7 @@ def _get_op(*, topk, activation, rhs_quant_dtype, skip_padded_tokens):
         skip_padded_tokens=skip_padded_tokens,
         capacity_factor=capacity_factor,
         route_factor=envs.TPU_MOE_A2A_ROUTE_CAPACITY,
+        direct_combine=envs.TPU_MOE_A2A_DIRECT_COMBINE,
     )
 
     # torch_tpu infers static argnums from annotations: every operand is jax.Array.
@@ -145,13 +146,15 @@ def _get_op(*, topk, activation, rhs_quant_dtype, skip_padded_tokens):
     _OPS[key] = op
     logger.info_once(
         "Ragged A2A MoE armed | topk=%d activation=%s dp=%d tp=%d | one-hot "
-        "permute threshold %d routed rows (full decode step: %d routed rows)",
+        "permute threshold %d routed rows (full decode step: %d routed rows) | "
+        "direct combine %s",
         topk,
         activation,
         mesh.shape[DP_AXIS],
         mesh.shape[TP_AXIS],
         onehot_threshold,
         decode_routed_rows,
+        "on" if envs.TPU_MOE_A2A_DIRECT_COMBINE else "off",
     )
     _log_capacity(mesh, topk, onehot_threshold, decode_routed_rows)
     return op
