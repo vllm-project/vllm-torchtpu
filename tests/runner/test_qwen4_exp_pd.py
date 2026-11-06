@@ -150,13 +150,28 @@ def test_align_state_tables_are_positional_single_page_states():
     assert not any(g.positional_state for g in build_transfer_groups(cache_groups()))
 
 
-def test_refuse_speculative_state_and_duplicate_owners():
+def test_speculative_align_state_is_one_positional_request_state_page():
+    # Decode-only MTP with decode prefix caching: align-mode state tables
+    # with speculative blocks still transfer one committed state page.
+    groups = align_cache_groups()
+    for index in (3, 4):
+        groups[index] = replace(
+            groups[index],
+            kv_cache_spec=replace(groups[index].kv_cache_spec, num_speculative_blocks=3),
+        )
+    plan = build_transfer_groups(groups)
+    assert [g.extent for g in plan[3:]] == [TransferExtent.REQUEST_STATE] * 2
+    assert all(g.positional_state for g in plan[3:])
+    assert [g.page_count(1000) for g in plan[3:]] == [1, 1]
+
+
+def test_refuse_unknown_state_mode_and_duplicate_owners():
     groups = align_cache_groups()
     groups[3] = replace(
         groups[3],
-        kv_cache_spec=replace(groups[3].kv_cache_spec, num_speculative_blocks=1),
+        kv_cache_spec=replace(groups[3].kv_cache_spec, mamba_cache_mode="all"),
     )
-    with pytest.raises(NotImplementedError, match="MTP off"):
+    with pytest.raises(NotImplementedError, match="none or align"):
         build_transfer_groups(groups)
     groups = cache_groups()
     groups.append(groups[0])
