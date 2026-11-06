@@ -37,9 +37,16 @@ from vllm_torchtpu.megakernel_runtime import plugin as plugin_mod
 from vllm_torchtpu.megakernel_runtime.errors import MegakernelPluginError
 
 _SRC = Path(plugin_mod.__file__).resolve().parents[2]
-# A built-in shorthand and a checkpoint arch it claims.
-_SHORTHAND, _ENTRY = next(iter(plugin_mod.SHORTHANDS.items()))
+# A built-in shorthand and a checkpoint arch it claims: conftest's
+# `mk_fake_template`, entered in the table for every test here.
+_SHORTHAND = "mkfake"
+_ENTRY = plugin_mod.Shorthand("mk_fake_template", ("MkFakeForCausalLM",), ("mk_fake",))
 _ARCH_HF = SimpleNamespace(architectures=[_ENTRY.architectures[0]])
+
+
+@pytest.fixture(autouse=True)
+def _fake_template(mk_fake_template: str) -> None:
+    assert plugin_mod.SHORTHANDS[mk_fake_template] == _ENTRY
 
 
 # --- Source hash ----------------------------------------------------------------
