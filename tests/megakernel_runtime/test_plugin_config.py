@@ -26,7 +26,16 @@ import vllm_torchtpu.megakernel_runtime.driver as driver_mod
 from vllm_torchtpu.megakernel_runtime import config as cfg_mod
 from vllm_torchtpu.megakernel_runtime import plugin as plugin_mod
 
-_QWEN_HF = SimpleNamespace(architectures=["Qwen3_5MoeForCausalLM"])
+# A built-in shorthand and a checkpoint arch it claims: conftest's
+# `mk_fake_template` (its top-level options are the library runtime config's
+# template keys), entered in the table for every test here.
+_SHORTHAND = "mkfake"
+_HF = SimpleNamespace(architectures=["MkFakeForCausalLM"])
+
+
+@pytest.fixture(autouse=True)
+def _fake_template(mk_fake_template: str) -> None:
+    assert mk_fake_template == _SHORTHAND
 
 
 # --- VLLM_TPU_MEGAKERNEL / additional_config matrix ---------------------------------
@@ -143,10 +152,10 @@ def test_legacy_inputs_match_parse_runtime_config(env: Any, add: Any) -> None:
     new = cfg_mod.parse_config(env, add, raw_env=env)
     assert new.enabled == _enabled_by_rule(env, add)
     assert new.ab == old["ab"] and new.stats_period_s == old["stats_period_s"]
-    resolved = cfg_mod.resolve_plugin_ref(new, _QWEN_HF)
+    resolved = cfg_mod.resolve_plugin_ref(new, _HF)
     assert resolved is not None
     ref, options = resolved
-    assert ref.shorthand == "qwen35"
+    assert ref.shorthand == _SHORTHAND
     tmpl = parse_runtime_config(options)
     assert {k: tmpl[k] for k in _TEMPLATE_KEYS} == {k: old[k] for k in _TEMPLATE_KEYS}
 
@@ -160,11 +169,11 @@ def test_missing_shorthand_template_leaves_the_megakernel_off(
 
     from vllm_torchtpu.megakernel_runtime import testing
 
-    gone = plugin_mod.SHORTHANDS["qwen35"]._replace(
+    gone = plugin_mod.SHORTHANDS[_SHORTHAND]._replace(
         module="no_such_mk_folder.megakernel"
     )
-    monkeypatch.setitem(plugin_mod.SHORTHANDS, "qwen35", gone)
-    hf = _QWEN_HF
+    monkeypatch.setitem(plugin_mod.SHORTHANDS, _SHORTHAND, gone)
+    hf = _HF
     ref, _ = cfg_mod.resolve_plugin_ref(cfg_mod.parse_config("1"), hf)
     msg = cfg_mod.missing_template(ref, hf)
     assert msg is not None
