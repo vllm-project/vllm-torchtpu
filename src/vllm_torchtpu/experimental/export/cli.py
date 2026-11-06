@@ -19,6 +19,7 @@ import argparse
 import dataclasses
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -295,6 +296,39 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     return args
 
 
+# A repository in the HuggingFace hub cache: `.../models--{org}--{name}/snapshots/...`.
+_HF_CACHE_REPO = re.compile(r"(?:^|/)models--([^/]+?)--([^/]+)(?:/|$)")
+
+
+def artifact_model_name(model: str | None, served_model_name: Any = None) -> str | None:
+    """The model id the artifact records as `metadata.json`'s `model_name`.
+
+    `model_name` names the model, not where its checkpoint was read from: two exports
+    of one model must record the same value, since the KV transfer fingerprint
+    covers it. It is the first `--served-model-name` when given; else `model` when
+    that is a hub id; else, for a checkpoint location, the repository of a hub cache
+    path or the location's last component.
+    """
+    if served_model_name:
+        if isinstance(served_model_name, (list, tuple)):
+            return str(served_model_name[0])
+        return str(served_model_name)
+    if not model or ("://" not in model and not os.path.exists(model)):
+        return model
+    path = model.replace(os.sep, "/").rstrip("/")
+    if "://" not in model:
+        path = os.path.abspath(model).replace(os.sep, "/")
+    repo = _HF_CACHE_REPO.search(path)
+    if repo:
+        return f"{repo.group(1)}/{repo.group(2)}"
+    name = path.rsplit("/", 1)[-1]
+    sys.stderr.write(
+        f"[export] model_name {name!r} is the last component of {model}; pass "
+        "--served-model-name <model id> to record the model id instead\n"
+    )
+    return name
+
+
 # Speculative methods the artifact can declare, with the fields each takes: ngram
 # drafts on the host from the sequence itself; mtp drafts with the model's MTP
 # layer (the adapter's `mtp_draft()`), which the export lowers as the drafter
@@ -431,7 +465,9 @@ def run_export_from_args(
 
     export_cfg = universal_adapter.build_export_config_from_vllm(
         vllm_config,
-        model_name=getattr(args, "model", None),
+        model_name=artifact_model_name(
+            getattr(args, "model", None), getattr(args, "served_model_name", None)
+        ),
         hf_checkpoint_dir=getattr(args, "model", None),
         target_tpu=target_tpu,
         token_buckets=token_buckets,
