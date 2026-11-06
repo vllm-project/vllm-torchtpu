@@ -660,8 +660,13 @@ class Qwen4ExpRaidenWorker(TPURaidenConnectorWorker):
                             src_block_ordinal=index,
                             src_offset_bytes=0,
                             dst_block_index=0 if global_space else index,
+                            # The request-global destination space counts
+                            # destination pages by their live bytes (the
+                            # controller splits it, and checks dst_skip_bytes,
+                            # in those units): a trimmed compressed-key page
+                            # is 409,600 bytes there, not its 3.2 MB stride.
                             dst_offset_bytes=(
-                                index * pool.block_stride_bytes if global_space else 0
+                                index * size_bytes if global_space else 0
                             ),
                             size_bytes=size_bytes,
                             # A pipeline stage's pages go to every decode unit
@@ -731,7 +736,7 @@ class Qwen4ExpRaidenWorker(TPURaidenConnectorWorker):
             plan = self._page_plan()
             clips = [
                 skipped_source_pages(plan.groups[group_index], skip_tokens)
-                * pool.block_stride_bytes
+                * _live_page_bytes(pool)
                 for pool, group_index in plan.pool_groups()
             ]
         if len(clips) != num_tags or num_tags != fa_tag_count:
@@ -740,6 +745,16 @@ class Qwen4ExpRaidenWorker(TPURaidenConnectorWorker):
                 f"clips={len(clips)}, tags={num_tags}, grouped={fa_tag_count}"
             )
         return clips
+
+
+def _live_page_bytes(pool) -> int:
+    """A pool page's live bytes: its single leading region's unit (a trimmed
+    compressed-key page's keys), else the whole stride. The request-global
+    destination byte space and its dst_skip_bytes clips are in these units."""
+    regions = getattr(pool, "regions", ()) or ()
+    if len(regions) == 1 and getattr(regions[0], "num_units", 1) == 1:
+        return int(regions[0].unit_bytes)
+    return int(pool.block_stride_bytes)
 
 
 def _speculative_blocks(group) -> int:

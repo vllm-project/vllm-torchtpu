@@ -773,6 +773,21 @@ def test_qwen_producer_for_a_caching_decode_declares_clippable_token_pages(
     # a decode-local prefix; request-state pools stay page-indexed.
     monkeypatch.setenv("TPU_RAIDEN_HANDOFF_ALIGN_TOKENS", "128")
     worker = qwen_worker(monkeypatch, tp=2, rank=1)
+    # An unpacked compressed-key page sends only its keys (512 of 4096 bytes
+    # here, pd_manifest.compressed_live_bytes).
+    worker.runner = SimpleNamespace(
+        model_adapter=SimpleNamespace(
+            cache=SimpleNamespace(
+                layout=SimpleNamespace(
+                    compressed_slots=1,
+                    block_size=128,
+                    kernel_block_size=128,
+                    compressed_kernel_bytes=512,
+                    page_bytes=4096,
+                )
+            )
+        )
+    )
     metadata = TPUConnectorMetadata()
     metadata.reqs_to_send["qwen"] = send_pages(num_tokens=300)
     worker.process_send_load(metadata)
@@ -781,12 +796,15 @@ def test_qwen_producer_for_a_caching_decode_declares_clippable_token_pages(
     ]
     assert [r.dst_space_version for r in registrations] == [1, 1, 0, 0, 0]
     assert [len(r.block_ids) for r in registrations] == [3, 3, 1, 1, 1]
-    for reg in registrations[:2]:
+    # The global space counts destination pages by their live bytes (the
+    # controller rejects a trimmed page at i * stride: "Byte span destination
+    # index 16 exceeds the transfer's 13 destination blocks", j-22e0b09a).
+    for reg, live in zip(registrations[:2], (4096, 512)):
         assert [(s.dst_block_index, s.dst_offset_bytes) for s in reg.spans] == [
             (0, 0),
-            (0, 4096),
-            (0, 8192),
+            (0, live),
+            (0, 2 * live),
         ]
-        assert all(s.size_bytes == 4096 and s.dst_unit_ordinal == 1 for s in reg.spans)
+        assert all(s.size_bytes == live and s.dst_unit_ordinal == 1 for s in reg.spans)
     for reg in registrations[2:]:
         assert [(s.dst_block_index, s.dst_offset_bytes) for s in reg.spans] == [(0, 0)]

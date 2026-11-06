@@ -84,6 +84,16 @@ def without_speculation(cfg):
     return out
 
 
+def _live_page_bytes(pool) -> int:
+    """A carrier page's live bytes (the units of the request-global
+    destination space and of dst_skip_bytes): a trimmed compressed-key
+    page's keys, else the whole stride (pd_connector._live_page_bytes)."""
+    regions = getattr(pool, "regions", ()) or ()
+    if len(regions) == 1 and getattr(regions[0], "num_units", 1) == 1:
+        return int(regions[0].unit_bytes)
+    return int(pool.block_stride_bytes)
+
+
 def owner_kind(name: str) -> str:
     if name.endswith(".compressed_k"):
         return "compressed"
@@ -795,11 +805,11 @@ class StagedConsumer:
         """Per-tag destination clips, in ``destination`` order: the bytes of
         the source pages a prefix-aware load leaves out of each pool."""
         _, first = self.skips.get(uuid, (0, [0] * len(self.src_groups)))
-        # The clip is in the destination's live bytes: a key pool's page
-        # carries `key_stride` of them.
+        # The clip is in the destination's live bytes: a merged key pool's
+        # page carries `key_stride` of them (its single "keys" region's
+        # unit), a trimmed compressed-key page its keys, else the stride.
         return [
-            first[self._pool_group[pool.layer_name]]
-            * (self.key_stride if pool.layer_name in self._key_pools else pool.block_stride_bytes)
+            first[self._pool_group[pool.layer_name]] * _live_page_bytes(pool)
             for pool in self.manifest.pools
         ]
 
