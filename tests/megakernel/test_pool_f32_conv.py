@@ -241,3 +241,22 @@ def test_f32_conv_gather_and_scatter_on_tpu(T: int):
             np.asarray(out_tpu[0]).view(np.uint8),
             np.asarray(out_ref[0]).view(np.uint8),
         )
+        out_gpr = jax.jit(
+            lambda r, p, pt_i, kn, vn, cv, rc, ck: pool.scatter_pool_states(
+                lay,
+                pool.with_cache(ex_tpu, pool_gather=True),
+                r,
+                p,
+                pt_i,
+                kn,
+                vn,
+                cv,
+                rc,
+                ck,
+                interpret=False,
+            )
+        )(raw_pools, pos, pt, knew, vnew, conv_in, rec_in, ckpt)
+        np.testing.assert_array_equal(
+            np.asarray(out_gpr[0]).view(np.uint8),
+            np.asarray(out_ref[0]).view(np.uint8),
+        )
