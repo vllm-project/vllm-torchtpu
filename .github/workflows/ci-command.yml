@@ -61,4 +61,7 @@ jobs:
           ACTOR_LOGIN: ${{ github.event.comment.user.login || github.event.pull_request.user.login }}
           ACTOR_TYPE: ${{ github.event.comment.user.type || github.event.pull_request.user.type }}
           COMMENT_BODY: ${{ github.event.comment.body }}
+          # Until this repo variable is "true", only PRs based on mq-canary get
+          # /ci replies, builds, and the guide comment.
+          CI_COMMANDS_LIVE: ${{ vars.CI_COMMANDS_LIVE }}
         run: python3 .github/scripts/ci_command.py

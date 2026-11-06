@@ -32,6 +32,7 @@ assert _SPEC and _SPEC.loader
 ci_command = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(ci_command)
 BK_URL = ci_command.BUILDKITE_BUILDS_URL
+CANARY_URL = ci_command.CANARY_BUILDS_URL
 GQL_URL = ci_command.GITHUB_GRAPHQL_URL
 BK_WEB = "https://buildkite.com/vllm/vllm-torchtpu-ci/builds/9999"
 REPO = "vllm-project/vllm-torchtpu"
@@ -54,6 +55,7 @@ class TestCiCommand(unittest.TestCase):
         active_builds: list[dict[str, Any]] | None = None,
         workflow_runs: list[dict[str, Any]] | None = None,
         fail_approve_ids: set[int] | None = None,
+        gql_error: str | None = None,
     ) -> tuple[Any, list[tuple[str, str, dict[str, Any] | None]]]:
         calls: list[tuple[str, str, dict[str, Any] | None]] = []
         comments: list[dict[str, str]] = []
@@ -116,11 +118,14 @@ class TestCiCommand(unittest.TestCase):
                         )
                 return {}
             if url == GQL_URL:
+                if gql_error is not None:
+                    return {"errors": [{"message": gql_error}]}
                 state["auto_merge"] = {"merge_method": "squash"}
                 return {"data": {"enablePullRequestAutoMerge": {"pullRequest": {}}}}
-            if url.startswith(f"{BK_URL}?"):
+            bk = next((b for b in (BK_URL, CANARY_URL) if url.startswith(b)), None)
+            if bk is not None and url.startswith(f"{bk}?"):
                 return list(active_builds or [])
-            if url.startswith(f"{BK_URL}/") and url.endswith("/cancel"):
+            if bk is not None and url.startswith(f"{bk}/") and url.endswith("/cancel"):
                 if url.endswith("/905/cancel"):
                     raise urllib.error.HTTPError(
                         url,
@@ -130,7 +135,7 @@ class TestCiCommand(unittest.TestCase):
                         io.BytesIO(),
                     )
                 return {"state": "canceled"}
-            return {"web_url": BK_WEB} if url == BK_URL else {"id": 1}
+            return {"web_url": BK_WEB} if url in (BK_URL, CANARY_URL) else {"id": 1}
 
         return fake_api, calls
 
@@ -409,9 +414,8 @@ class TestCiCommand(unittest.TestCase):
                     "email": "ext.author@company.com",
                 },
             )
-            self.assertEqual(
-                bk_calls[0]["pull_request_labels"], ["ready", "oncall-fix"]
-            )
+            # /ci builds ignore PR labels, so none are sent.
+            self.assertNotIn("pull_request_labels", bk_calls[0])
             self.assertEqual(
                 bk_calls[0]["env"], {"CI_RUN_TPU": "1", "CI_EXTRAS": expected_extras}
             )
@@ -456,6 +460,34 @@ class TestCiCommand(unittest.TestCase):
         self.assertIn("SQUASH", gql_calls[0]["query"])
         self.assertEqual(gql_calls[0]["variables"], {"id": "PR_kwDO1234"})
         self.assertFalse(any(u.startswith(BK_URL) for _, u, _ in calls))
+        # The marker is posted before auto-merge is enabled, so a PR that enters
+        # the queue at once already has it.
+        first_comment = next(
+            i for i, (m, u, _) in enumerate(calls) if m == "POST" and "/issues/" in u
+        )
+        first_gql = next(i for i, (_, u, _) in enumerate(calls) if u == GQL_URL)
+        self.assertLess(first_comment, first_gql)
+
+        # If enabling auto-merge fails, a follow-up reply clears the marker.
+        fake_err, err_calls = self._mock_api(
+            gql_error="Pull request is in clean status"
+        )
+        with mock.patch.object(ci_command, "_api_json", side_effect=fake_err):
+            err = ci_command.handle_comment(
+                REPO, 42, "alice", "/ci merge perf-eval", "gh-tok", ""
+            )
+        self.assertEqual(
+            err,
+            "@alice, could not enable auto-merge on PR #42: Pull request is in clean "
+            "status\n\n<!-- ci-merge-extras: -->",
+        )
+        bodies = [
+            p["body"]
+            for m, u, p in err_calls
+            if m == "POST" and "/issues/" in u and p is not None
+        ]
+        self.assertEqual(len(bodies), 2)
+        self.assertIn("<!-- ci-merge-extras: perf-eval -->", bodies[0])
 
         # After a new push updates head.sha, a new `/ci merge` binds to the new SHA.
         new_head = {
@@ -589,6 +621,52 @@ class TestCiCommand(unittest.TestCase):
         self.assertIn("<!-- ci-merge-extras: -->", dis_reply)
         self.assertEqual(len(dis_calls), 1)
         self.assertEqual(dis_calls[0][0], "POST")
+
+    def test_inert_until_live_except_canary_prs_which_use_canary_pipeline(
+        self,
+    ) -> None:
+        # Before cutover, a PR based on main gets no reply, build, or comment.
+        for cmd in ("/ci help", "/ci run", "/ci merge", "/ci typo"):
+            fake_api, calls = self._mock_api(base_ref="main")
+            with mock.patch.object(ci_command, "_api_json", side_effect=fake_api):
+                reply = ci_command.handle_comment(
+                    REPO, 42, "alice", cmd, "gh-tok", "bk-tok", live=False
+                )
+            self.assertIsNone(reply)
+            self.assertEqual([m for m, _, _ in calls], ["GET"])
+        fake_api, calls = self._mock_api(base_ref="main")
+        with mock.patch.object(ci_command, "_api_json", side_effect=fake_api):
+            self.assertIsNone(
+                ci_command.handle_pr_info(REPO, 42, "alice", "gh-tok", live=False)
+            )
+            self.assertIsNone(
+                ci_command.handle_auto_merge_disabled(REPO, 42, "gh-tok", live=False)
+            )
+        self.assertFalse(any(m == "POST" for m, _, _ in calls))
+
+        # A PR based on mq-canary works before cutover and builds on the canary
+        # pipeline; so does `/ci cancel`. After cutover the routing still follows
+        # the base branch.
+        for live in (False, True):
+            fake_api, calls = self._mock_api(
+                base_ref="mq-canary",
+                active_builds=[
+                    {"number": 7, "branch": "feat/example", "commit": "x"},
+                ],
+            )
+            with mock.patch.object(ci_command, "_api_json", side_effect=fake_api):
+                run = ci_command.handle_comment(
+                    REPO, 42, "alice", "/ci run", "gh-tok", "bk-tok", live=live
+                )
+                cancel = ci_command.handle_comment(
+                    REPO, 42, "alice", "/ci cancel", "gh-tok", "bk-tok", live=live
+                )
+            assert run is not None and cancel is not None
+            self.assertIn(BK_WEB, run)
+            self.assertIn("Cancelled build #7.", cancel)
+            bk_urls = [u for _, u, _ in calls if "api.buildkite.com" in u]
+            self.assertTrue(bk_urls)
+            self.assertTrue(all(u.startswith(CANARY_URL) for u in bk_urls))
 
     def test_closed_pr_does_not_trigger_build_or_merge(self) -> None:
         for cmd in ("/ci precheck", "/ci run", "/ci merge"):

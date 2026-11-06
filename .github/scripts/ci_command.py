@@ -51,6 +51,13 @@ HELP_TEXT = (
 BUILDKITE_BUILDS_URL = (
     "https://api.buildkite.com/v2/organizations/vllm/pipelines/vllm-torchtpu-ci/builds"
 )
+# Until cutover (repo variable CI_COMMANDS_LIVE=true), /ci answers only PRs based
+# on the canary branch, and their builds go to the canary pipeline.
+CANARY_BASE = "mq-canary"
+CANARY_BUILDS_URL = (
+    "https://api.buildkite.com/v2/organizations/vllm/pipelines/"
+    "vllm-torchtpu-ci-mq-canary/builds"
+)
 GITHUB_GRAPHQL_URL = "https://api.github.com/graphql"
 _AUTO_MERGE_MUTATION = (
     "mutation($id: ID!) { "
@@ -134,6 +141,22 @@ def _api_json(
         return json.loads(raw) if raw else {}
 
 
+def _base_ref(pr: dict[str, Any]) -> str:
+    return (pr.get("base") or {}).get("ref") or ""
+
+
+def _builds_url(pr: dict[str, Any]) -> str:
+    return CANARY_BUILDS_URL if _base_ref(pr) == CANARY_BASE else BUILDKITE_BUILDS_URL
+
+
+def _is_inert(repo: str, pr_number: int, gh_token: str, *, live: bool) -> bool:
+    """Before cutover, ignore every PR that isn't based on the canary branch."""
+    if live:
+        return False
+    pr = _api_json(f"https://api.github.com/repos/{repo}/pulls/{pr_number}", gh_token)
+    return _base_ref(pr) != CANARY_BASE
+
+
 def _err_summary(exc: Exception) -> str:
     if isinstance(exc, urllib.error.HTTPError):
         return f"HTTP {exc.code}"
@@ -198,16 +221,10 @@ def _trigger_build(
     )
     if author_name or author_email:
         payload["author"] = {"name": author_name, "email": author_email}
-    labels = [
-        lbl["name"]
-        for lbl in (pr.get("labels") or [])
-        if isinstance(lbl, dict) and isinstance(lbl.get("name"), str) and lbl["name"]
-    ]
-    if labels:
-        payload["pull_request_labels"] = labels
+    # No pull_request_labels: /ci builds take extras only from CI_EXTRAS.
     if is_fork and head_repo.get("clone_url"):
         payload["pull_request_repository"] = head_repo["clone_url"]
-    return _api_json(BUILDKITE_BUILDS_URL, bk_token, method="POST", payload=payload)
+    return _api_json(_builds_url(pr), bk_token, method="POST", payload=payload)
 
 
 def _run_pr_actions_prechecks(
@@ -285,7 +302,8 @@ def _cancel_pr_builds(
     target_branch = head.get("label") if is_fork else head.get("ref")
     base_ref = (pr.get("base") or {}).get("ref", "main")
     query = "state[]=scheduled&state[]=running&state[]=failing&per_page=100"
-    builds = _api_json(f"{BUILDKITE_BUILDS_URL}?{query}", bk_token)
+    builds_url = _builds_url(pr)
+    builds = _api_json(f"{builds_url}?{query}", bk_token)
     cancelled: list[int] = []
     for b in builds:
         b_branch = b.get("branch") or ""
@@ -301,9 +319,7 @@ def _cancel_pr_builds(
         if pr_id == str(pr_number) or b.get("commit") == head["sha"] or same_branch:
             num = int(b["number"])
             try:
-                _api_json(
-                    f"{BUILDKITE_BUILDS_URL}/{num}/cancel", bk_token, method="PUT"
-                )
+                _api_json(f"{builds_url}/{num}/cancel", bk_token, method="PUT")
                 cancelled.append(num)
             except urllib.error.HTTPError as exc:
                 if exc.code != 422:
@@ -319,9 +335,12 @@ def handle_pr_info(
     *,
     draft: bool = False,
     is_bot: bool = False,
+    live: bool = True,
 ) -> str | None:
     """Post the one-time CI info comment on non-draft, non-bot PRs."""
     if draft or is_bot or author.endswith("[bot]"):
+        return None
+    if _is_inert(repo, pr_number, gh_token, live=live):
         return None
     comments_url = f"https://api.github.com/repos/{repo}/issues/{pr_number}/comments"
     page = 1
@@ -368,8 +387,12 @@ def handle_pr_info(
     return body
 
 
-def handle_auto_merge_disabled(repo: str, pr_number: int, gh_token: str) -> str:
+def handle_auto_merge_disabled(
+    repo: str, pr_number: int, gh_token: str, *, live: bool = True
+) -> str | None:
     """Post an empty `/ci merge` marker when auto-merge is disabled on a PR."""
+    if _is_inert(repo, pr_number, gh_token, live=live):
+        return None
     comments_url = f"https://api.github.com/repos/{repo}/issues/{pr_number}/comments"
     body = (
         "Auto-merge disabled; cleared `/ci merge` extras.\n\n<!-- ci-merge-extras: -->"
@@ -385,10 +408,12 @@ def handle_comment(
     comment_body: str,
     gh_token: str,
     bk_token: str,
+    *,
+    live: bool = True,
 ) -> str | None:
     """Process a PR comment and return the posted reply (or None if ignored)."""
     line = find_ci_line(comment_body)
-    if line is None:
+    if line is None or _is_inert(repo, pr_number, gh_token, live=live):
         return None
     comments_url = f"https://api.github.com/repos/{repo}/issues/{pr_number}/comments"
 
@@ -434,6 +459,34 @@ def handle_comment(
         base_ref = (pr.get("base") or {}).get("ref") or ""
         if "precheck-only" in extras and base_ref.startswith("releases/"):
             return reply("`releases/*` merges always run the full gate.")
+        extras_csv = ",".join(extras)
+        marker = (
+            f"<!-- ci-merge-extras: {extras_csv} -->\n"
+            f"<!-- ci-merge-actor: {author} -->\n"
+            f"<!-- ci-merge-sha: {pr['head']['sha']} -->"
+            if extras_csv
+            else "<!-- ci-merge-extras: -->"
+        )
+        if extras == ["precheck-only"]:
+            text = (
+                "Queued for merge with prechecks only (no TPU) once approved and "
+                "green. To leave the queue, click **Disable auto-merge** or "
+                "**Remove from queue** on the GitHub PR page.\n\n"
+                f"{marker}"
+            )
+        else:
+            extras_note = ", ".join(extras) if extras else "none"
+            if "nightly-suite" in extras:
+                extras_note += ", ~3–4h of TPU; the queue waits for it"
+            text = (
+                f"Queued for merge once approved and green (extras: {extras_note}). "
+                "To cancel, click **Disable auto-merge** or **Remove from queue** "
+                "on the GitHub PR page.\n\n"
+                f"{marker}"
+            )
+        # Post the marker before enabling auto-merge: an approved, green PR enters
+        # the queue at once, and its queue build reads the marker from comments.
+        posted = reply(text)
         if not pr.get("auto_merge"):
             gql = _api_json(
                 GITHUB_GRAPHQL_URL,
@@ -448,32 +501,9 @@ def handle_comment(
                 reason = gql["errors"][0].get("message", "GraphQL error")
                 return reply(
                     f"@{author}, could not enable auto-merge on PR #{pr_number}: "
-                    f"{reason}"
+                    f"{reason}\n\n<!-- ci-merge-extras: -->"
                 )
-        extras_csv = ",".join(extras)
-        marker = (
-            f"<!-- ci-merge-extras: {extras_csv} -->\n"
-            f"<!-- ci-merge-actor: {author} -->\n"
-            f"<!-- ci-merge-sha: {pr['head']['sha']} -->"
-            if extras_csv
-            else "<!-- ci-merge-extras: -->"
-        )
-        if extras == ["precheck-only"]:
-            return reply(
-                "Queued for merge with prechecks only (no TPU) once approved and "
-                "green. To leave the queue, click **Disable auto-merge** or "
-                "**Remove from queue** on the GitHub PR page.\n\n"
-                f"{marker}"
-            )
-        extras_note = ", ".join(extras) if extras else "none"
-        if "nightly-suite" in extras:
-            extras_note += ", ~3–4h of TPU; the queue waits for it"
-        return reply(
-            f"Queued for merge once approved and green (extras: {extras_note}). "
-            "To cancel, click **Disable auto-merge** or **Remove from queue** "
-            "on the GitHub PR page.\n\n"
-            f"{marker}"
-        )
+        return posted
     if subcmd == "precheck":
         head_sha = pr["head"]["sha"]
         sha7 = head_sha[:7]
@@ -516,9 +546,10 @@ def handle_comment(
 if __name__ == "__main__":
     repo, pr_num = os.environ["GITHUB_REPOSITORY"], int(os.environ["PR_NUMBER"])
     actor, gh_tok = os.environ["ACTOR_LOGIN"], os.environ["GH_TOKEN"]
+    live = os.environ.get("CI_COMMANDS_LIVE", "").lower() == "true"
     if os.environ.get("GITHUB_EVENT_NAME") == "pull_request_target":
         if os.environ.get("GITHUB_EVENT_ACTION") == "auto_merge_disabled":
-            handle_auto_merge_disabled(repo, pr_num, gh_tok)
+            handle_auto_merge_disabled(repo, pr_num, gh_tok, live=live)
         else:
             handle_pr_info(
                 repo,
@@ -527,11 +558,12 @@ if __name__ == "__main__":
                 gh_tok,
                 draft=os.environ.get("PR_DRAFT", "").lower() == "true",
                 is_bot=os.environ.get("ACTOR_TYPE") == "Bot",
+                live=live,
             )
     else:
         body, bk_tok = (
             os.environ.get("COMMENT_BODY", ""),
             os.environ.get("BUILDKITE_API_TOKEN", ""),
         )
-        handle_comment(repo, pr_num, actor, body, gh_tok, bk_tok)
+        handle_comment(repo, pr_num, actor, body, gh_tok, bk_tok, live=live)
     sys.exit(0)
