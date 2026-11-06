@@ -28,6 +28,7 @@ import pytest
 
 from vllm_torchtpu.kernels.megablox import gmm_v2 as gmm_v2_module
 from vllm_torchtpu.kernels.megablox.gmm_v2 import (
+    Dimensions,
     TileSizes,
     apply_act_fn,
     calculate_tiling,
@@ -37,6 +38,7 @@ from vllm_torchtpu.kernels.megablox.gmm_v2 import (
     interleave_lane,
     make_gmm_configs,
     situ_and_mul,
+    stream_head,
     use_decode_stream,
 )
 
@@ -539,6 +541,48 @@ def test_gmm_decode_stream_matches_pipeline(
         np.asarray(actual[first_row:]).view(np.uint16),
         np.asarray(expected[first_row:]).view(np.uint16),
     )
+
+
+@pytest.mark.parametrize(
+    "group_sizes, group_offset, size_group",
+    [
+        ([3, 0, 2, 140, 1, 0, 0, 14], 0, 8),
+        ([0, 0, 5, 0, 7, 0], 0, 6),
+        ([9, 0, 23, 40, 0, 6], 1, 4),
+        ([4, 4, 0, 0, 0, 2], 2, 3),
+        ([0, 0, 0, 0], 0, 4),
+    ],
+)
+def test_stream_head_matches_fill_metadata(group_sizes, group_offset, size_group):
+    """stream_head gives fill_metadata's first group and row extent."""
+    # fill_metadata's walk: groups before group_offset or without rows get no
+    # gm tile, but their rows still advance the offsets.
+    row, start_row, end_row, first_group = 0, 0, 0, size_group
+    for lhs_group_id in range(group_offset + size_group):
+        group_id = lhs_group_id - group_offset
+        size = group_sizes[lhs_group_id]
+        if size > 0 and group_id >= 0:
+            if first_group == size_group:
+                first_group, start_row = group_id, row
+            end_row = row + size
+        row += size
+
+    dims = Dimensions(
+        size_m=512,
+        size_k=128,
+        size_n=128,
+        size_group=size_group,
+        size_lhs_group=len(group_sizes),
+        size_lhs_sublane=16,
+    )
+    head = stream_head(
+        jnp.array(group_sizes, dtype=jnp.int32),
+        jnp.array([group_offset], dtype=jnp.int32),
+        dims=dims,
+    )
+    assert int(head[0]) == first_group
+    if first_group < size_group:
+        assert (int(head[1]), int(head[2])) == (start_row, end_row)
 
 
 @pytest.mark.tpu_test

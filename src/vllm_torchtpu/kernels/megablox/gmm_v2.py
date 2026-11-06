@@ -762,6 +762,34 @@ def fill_metadata(
     return num_gm
 
 
+def stream_head(
+    lhs_group_sizes_ref: jax.Array,  # int32[size_lhs_group]
+    group_offset_ref: jax.Array,  # int32[1]
+    *,
+    dims: Dimensions,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """(first group with rows, its first lhs row, last group's end row).
+
+    The values `fill_metadata` leaves in gm_id_to_group_id[0],
+    gm_id_to_m_offset[0] and gm_id_to_m_offset[num_gm] when num_gm > 0, read
+    without walking the gm tiles. The first group is size_group when no group
+    has rows. Unrolled over every entry of the group sizes, so its scalar code
+    grows with size_lhs_group.
+    """
+    group_offset = group_offset_ref[0]
+    first_group = jnp.int32(dims.size_group)
+    start_row = end_row = jnp.int32(0)
+    # Reversed, so the lowest group with rows is the one kept.
+    for lhs_group_id in reversed(range(dims.size_lhs_group)):
+        size = lhs_group_sizes_ref[lhs_group_id]
+        group_id = lhs_group_id - group_offset
+        start_row += jnp.where(group_id < 0, size, 0)
+        end_row += jnp.where(group_id < dims.size_group, size, 0)
+        has_rows = (group_id >= 0) & (group_id < dims.size_group) & (size > 0)
+        first_group = jnp.where(has_rows, group_id, first_group)
+    return first_group, start_row, end_row
+
+
 def zero_out_start(
     out_ref: jax.Array,  # [size_m, size_n]
     zero_ref: jax.Array,  # [tile_zero_m, num_lanes]
@@ -1173,20 +1201,16 @@ def decode_stream_kernel(
     num_panels = cfgs.out_size_n // cols
     m_offsets = metadata_ref.gm_id_to_m_offset
 
-    num_gm = fill_metadata(
-        lhs_group_sizes_ref, group_offset_ref, metadata_ref, cfgs=cfgs
+    first_group, start_row, end_row = stream_head(
+        lhs_group_sizes_ref, group_offset_ref, dims=dims
     )
-    num_chunks = num_gm * num_panels
-    first_slab = m_offsets[0] // sublane
-    num_slabs = pl.cdiv(m_offsets[num_gm], sublane) - first_slab
+    first_slab = start_row // sublane
+    num_slabs = pl.cdiv(end_row, sublane) - first_slab
 
     lhs_slabs = lhs_ref.reshape(-1, sublane, dims.size_k)
     out_slabs = out_ref.reshape(-1, sublane, out_ref.shape[-1])
 
-    def chunk_copies(chunk):
-        gm_id, panel = chunk // num_panels, chunk % num_panels
-        group_id = metadata_ref.gm_id_to_group_id[gm_id]
-        slot = chunk % DECODE_SLOTS
+    def group_copies(group_id, panel, slot):
         copies = []
         for half in range(halves):
             col = half * cfgs.out_size_n + panel * cols
@@ -1203,6 +1227,30 @@ def decode_stream_kernel(
                 ),
             ]
         return copies
+
+    lhs_copy = pltpu.make_async_copy(
+        lhs_slabs.at[pl.ds(first_slab, num_slabs)],
+        lhs_vmem.at[pl.ds(first_slab, num_slabs)],
+        io_sems.at[0],
+    )
+
+    # The lhs and chunk 0 need only the rows' extent and the first group with
+    # rows, so they stream while fill_metadata walks every group.
+    @pl.when(first_group < dims.size_group)
+    def _():
+        lhs_copy.start()
+        for copy in group_copies(first_group, 0, 0):
+            copy.start()
+
+    num_gm = fill_metadata(
+        lhs_group_sizes_ref, group_offset_ref, metadata_ref, cfgs=cfgs
+    )
+    num_chunks = num_gm * num_panels
+
+    def chunk_copies(chunk):
+        gm_id, panel = chunk // num_panels, chunk % num_panels
+        group_id = metadata_ref.gm_id_to_group_id[gm_id]
+        return group_copies(group_id, panel, chunk % DECODE_SLOTS)
 
     def multiply_chunk(chunk):
         gm_id, panel = chunk // num_panels, chunk % num_panels
@@ -1249,14 +1297,6 @@ def decode_stream_kernel(
 
     @pl.when(num_chunks > 0)
     def _():
-        lhs_copy = pltpu.make_async_copy(
-            lhs_slabs.at[pl.ds(first_slab, num_slabs)],
-            lhs_vmem.at[pl.ds(first_slab, num_slabs)],
-            io_sems.at[0],
-        )
-        lhs_copy.start()
-        for copy in chunk_copies(0):
-            copy.start()
         lhs_copy.wait()
 
         def start_chunk(chunk):
@@ -1456,12 +1496,11 @@ def decode_mlp_stream_kernel(
     chunks_per_gm = num_up_panels + num_down_panels
     m_offsets = metadata_ref.gm_id_to_m_offset
 
-    num_gm = fill_metadata(
-        lhs_group_sizes_ref, group_offset_ref, metadata_ref, cfgs=up_cfgs
+    first_group, start_row, end_row = stream_head(
+        lhs_group_sizes_ref, group_offset_ref, dims=up_dims
     )
-    num_chunks = num_gm * chunks_per_gm
-    first_slab = m_offsets[0] // sublane
-    num_slabs = pl.cdiv(m_offsets[num_gm], sublane) - first_slab
+    first_slab = start_row // sublane
+    num_slabs = pl.cdiv(end_row, sublane) - first_slab
 
     lhs_slabs = lhs_ref.reshape(-1, sublane, up_dims.size_k)
     out_slabs = out_ref.reshape(-1, sublane, out_ref.shape[-1])
@@ -1469,9 +1508,8 @@ def decode_mlp_stream_kernel(
     def copy(src, dst, sem):
         return pltpu.make_async_copy(src, dst, sem)
 
-    def start_chunk(chunk):
-        gm_id, step = chunk // chunks_per_gm, chunk % chunks_per_gm
-        group_id = metadata_ref.gm_id_to_group_id[gm_id]
+    def start_chunk(chunk, group_id):
+        step = chunk % chunks_per_gm
         slot = chunk % DECODE_SLOTS
 
         @pl.when(step < num_up_panels)
@@ -1507,6 +1545,24 @@ def decode_mlp_stream_kernel(
                     ],
                     scale_sems.at[half, slot],
                 ).start()
+
+    lhs_copy = copy(
+        lhs_slabs.at[pl.ds(first_slab, num_slabs)],
+        lhs_vmem.at[pl.ds(first_slab, num_slabs)],
+        io_sems.at[0],
+    )
+
+    # As in decode_stream_kernel: the lhs and chunk 0 stream while
+    # fill_metadata walks every group.
+    @pl.when(first_group < up_dims.size_group)
+    def _():
+        lhs_copy.start()
+        start_chunk(0, first_group)
+
+    num_gm = fill_metadata(
+        lhs_group_sizes_ref, group_offset_ref, metadata_ref, cfgs=up_cfgs
+    )
+    num_chunks = num_gm * chunks_per_gm
 
     def wait_chunk(chunk):
         # Either kind of chunk fills each half of its slot, so one wait sized
@@ -1607,19 +1663,13 @@ def decode_mlp_stream_kernel(
 
     @pl.when(num_chunks > 0)
     def _():
-        lhs_copy = copy(
-            lhs_slabs.at[pl.ds(first_slab, num_slabs)],
-            lhs_vmem.at[pl.ds(first_slab, num_slabs)],
-            io_sems.at[0],
-        )
-        lhs_copy.start()
-        start_chunk(0)
         lhs_copy.wait()
 
         def start_next(chunk):
             @pl.when(chunk < num_chunks)
             def _():
-                start_chunk(chunk)
+                gm_id = chunk // chunks_per_gm
+                start_chunk(chunk, metadata_ref.gm_id_to_group_id[gm_id])
 
         def stream_step(chunk, carry):
             wait_chunk(chunk)
