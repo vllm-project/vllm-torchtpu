@@ -18,6 +18,7 @@ import torch
 from jax.sharding import PartitionSpec as P
 from torch_tpu._internal import pallas
 
+from vllm_torchtpu.kernels import swa_metadata as swa_metadata_kernel
 from vllm_torchtpu.kernels.attention_preprocessing import (
     compress_rope as compress_kernel,
 )
@@ -79,6 +80,70 @@ def rope_rows() -> Any:
             lambda cache, pos: cache.new_empty((pos.shape[0], cache.shape[1])),
         ),
     )
+
+
+def _swa_records_bridge(
+    window_size: int, page_size: int, page_stride: int, row_offset: int
+):
+    def records(
+        query_start_loc: jax.Array,
+        positions: jax.Array,
+        window_starts: jax.Array,
+        block_table: jax.Array,
+    ) -> tuple[jax.Array, jax.Array, jax.Array]:
+        # Keep the slice inside the op so split graphs consume inputs in the
+        # same order as the fallback, including oversized replay-start buffers.
+        result = swa_metadata_kernel.swa_attention_records(
+            query_start_loc,
+            positions,
+            window_starts[: query_start_loc.shape[0] - 1],
+            block_table,
+            window_size=window_size,
+            page_size=page_size,
+            page_stride=page_stride,
+            row_offset=row_offset,
+        )
+        return tuple(result)
+
+    return records
+
+
+def _swa_records_fake(window_size: int):
+    def fake(query_start_loc, positions, window_starts, block_table):
+        shape = positions.shape
+        return (
+            positions.new_empty(shape, dtype=torch.int32),
+            positions.new_empty(shape, dtype=torch.bool),
+            positions.new_empty((shape[0], window_size), dtype=torch.int32),
+        )
+
+    return fake
+
+
+@torch.compiler.assume_constant_result
+def _register_swa_records(
+    window_size: int, page_size: int, page_stride: int, row_offset: int
+) -> str:
+    # A layout may first appear inside compiled forward. Register in Python
+    # setup so Dynamo never traces the Pallas registration machinery.
+    name = f"swa_records_w{window_size}_p{page_size}_s{page_stride}_o{row_offset}"
+    _get(
+        name,
+        lambda: (
+            _swa_records_bridge(window_size, page_size, page_stride, row_offset),
+            _swa_records_fake(window_size),
+        ),
+    )
+    return name
+
+
+def swa_records(
+    window_size: int, page_size: int, page_stride: int, row_offset: int
+) -> Any:
+    """``(starts, positions, window_starts, table) -> slots, valid, records``."""
+    name = _register_swa_records(window_size, page_size, page_stride, row_offset)
+    # Dynamo's traced _ops dictionary cannot see registration's Python writes.
+    return getattr(torch.ops.pallas, f"dsv41_{name}").default
 
 
 def _qa(x, weight, scale, gamma_qr, gamma_kv, rows, *, eps, emit_qr):

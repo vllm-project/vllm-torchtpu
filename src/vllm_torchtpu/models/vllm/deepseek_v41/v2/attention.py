@@ -21,6 +21,8 @@ from vllm.models.deepseek_v41 import attention as upstream
 from vllm.models.deepseek_v41 import compressor as compressor_upstream
 from vllm.v1.attention.backends.mla.sparse_swa import DeepseekV4SWACache
 
+from vllm_torchtpu import envs
+from vllm_torchtpu.kernels.swa_metadata import supports_swa_attention_metadata
 from vllm_torchtpu.layers.adapter.linear_common import (
     KEEP_VLLM_LAYOUT_ATTR,
     WEIGHT_FLIPPED_ATTR,
@@ -508,6 +510,7 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
     _packed_compressor_op: Any = None
     _address_compressor_op: Any = None
     _swa_query_group_size = 1
+    _swa_records_fusion = False
 
     @classmethod
     def get_padded_num_q_heads(cls, num_heads):
@@ -532,6 +535,11 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
         # FP8 main KV uses DSV4's packed record (448 e4m3 + 64 e8m0 bytes)
         # plus a BF16 RoPE companion; see cache.encode_fp8_kv.
         self._fp8_kv = self.kv_cache_torch_dtype == torch.float8_e4m3fn
+        self._swa_records_fusion = envs.TPU_DEEPSEEK_V41_SWA_RECORDS_FUSION
+        logger.info_once(
+            "DeepSeek-V4.1 ordinary SWA records fusion: %s (admitted decode only)",
+            "enabled" if self._swa_records_fusion else "disabled",
+        )
         speculative = vllm_config.speculative_config
         if speculative is not None and speculative.num_speculative_tokens is not None:
             self._swa_query_group_size = speculative.num_speculative_tokens + 1
@@ -1161,6 +1169,10 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
         swa = metadata[self.swa_cache_layer.prefix]
         swa_cache = self.swa_cache_layer.kv_cache
         swa_table = _block_table(swa)
+        # Consume the token-size symbol before either metadata path so split
+        # prefill/decode graphs retain the same submodule input ordering.
+        count = positions.shape[0]
+        main_records = positions.new_empty((count, 0))
         tiled = isinstance(swa_cache, PagedCacheRows) and self.window_size % 64 == 0
         has_fast_swa_offset = isinstance(getattr(swa_cache, "row_offset", None), int)
         stage_cache = _active_stage_attn_cache
@@ -1175,6 +1187,41 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
             * 64
             if non_causal
             else self.window_size
+        )
+        minimum = (
+            get_forward_context().additional_kwargs["deepseek_v41_replay_starts"]
+            if self._ced_decoder
+            else _window_starts()
+        )
+        use_fused_swa_records = (
+            self._swa_records_fusion
+            and stage_cache is not None
+            and rows_per_page is not None
+            and swa.seq_lens.numel() > 0
+            and not non_causal
+            and tiled
+            and swa_table.shape[1] > 0
+            and not self.compress_ratio
+            and has_fast_swa_offset
+            and isinstance(swa_cache.page_stride, int)
+            and swa_table.dtype == torch.int32
+            and positions.dtype == torch.int32
+            and swa.query_start_loc.dtype == torch.int32
+            and (
+                minimum is None
+                or (
+                    minimum.dtype == torch.int32
+                    and minimum.shape[0] >= swa_table.shape[0]
+                )
+            )
+            and supports_swa_attention_metadata(
+                positions.shape[0],
+                swa_table.shape[0],
+                self.window_size,
+                rows_per_page,
+                self._swa_query_group_size,
+            )
+            and get_tensor_model_parallel_world_size() == 1
         )
         csa2_metadata = csa2_bounds = csa2_write_records = None
         swa_published = False
@@ -1241,6 +1288,39 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
             swa_invalid_3d = (~swa_valid)[:, None, None]
             requests = _token_requests(swa, positions).clamp(max=swa_table.shape[0] - 1)
             swa_slots = records = valid_window = logical = None
+        elif use_fused_swa_records:
+            assert stage_cache is not None and rows_per_page is not None
+            records_key = (
+                "swa_records",
+                swa_table.shape,
+                rows_per_page,
+                swa_cache.page_stride,
+                swa_cache.row_offset,
+                self.window_size,
+                self._ced_decoder,
+            )
+            record_entries = stage_cache.get(records_key, ())
+            cached_records = None
+            for cached_table, cached_values in record_entries:
+                if cached_table is swa.block_tables:
+                    cached_records = cached_values
+                    break
+            if cached_records is None:
+                if minimum is None:
+                    minimum = torch.zeros_like(swa.query_start_loc[:-1])
+                cached_records = preprocess_ops.swa_records(
+                    self.window_size,
+                    rows_per_page,
+                    swa_cache.page_stride,
+                    swa_cache.row_offset,
+                )(swa.query_start_loc, positions, minimum, swa_table)
+                stage_cache[records_key] = (
+                    *record_entries,
+                    (swa.block_tables, cached_records),
+                )
+            swa_slots, swa_valid, records = cached_records
+            swa_invalid_3d = (~swa_valid)[:, None, None]
+            requests = logical = valid_window = None
         else:
             if (
                 stage_cache is not None
@@ -1532,12 +1612,10 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                 * self.indexer.head_dim**-0.5
                 * self.indexer.n_head**-0.5
             )
-        count = positions.shape[0]
         window = None if tiled else _read_rows(swa_cache, swa_table, requests, logical)
         rows = window
         valid_rows = valid_window
         main_cache = swa_cache
-        main_records = positions.new_empty((count, 0))
         pages = starts = None
         if self.compress_ratio:
             comp_key = (
