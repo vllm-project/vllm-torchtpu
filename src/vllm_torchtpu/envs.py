@@ -101,6 +101,7 @@ if TYPE_CHECKING:
     TPU_ROPE_CACHE_TRUNCATE: bool = False
     TPU_ROPE_CACHE_ROW_MAJOR: bool = False
     TPU_LM_HEAD_HIDDEN_MAJOR: bool = False
+    TPU_CANDIDATE_SAMPLING: bool = True
     TPU_MOE_HASH_TABLE_ROW_MAJOR: bool = False
     TPU_PARALLEL_PRECOMPILE: bool = False
     TPU_STREAMIDX_CHUNK_TOKENS: int | None = None
@@ -755,6 +756,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # so the vocab projection is a plain matmul. Changes the accumulation
     # order of the logits (last-bit differences), hence opt-in.
     "TPU_LM_HEAD_HIDDEN_MAJOR": env_bool("TPU_LM_HEAD_HIDDEN_MAJOR", default=False),
+    # Non-greedy spec-decode verify steps whose requests all keep at most 48
+    # tokens (top_k) sample from per-vocab-shard top-k candidates instead of
+    # all-gathered logits (layers/core/candidate_sampling.py). Same
+    # distributions; 0 samples from the all-gathered logits.
+    "TPU_CANDIDATE_SAMPLING": env_bool("TPU_CANDIDATE_SAMPLING", default=True),
     "TPU_MOE_HASH_TABLE_ROW_MAJOR": env_bool(
         "TPU_MOE_HASH_TABLE_ROW_MAJOR", default=False
     ),
