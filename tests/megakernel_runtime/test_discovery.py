@@ -124,14 +124,17 @@ def test_a_new_folder_is_found_by_architecture_and_model_type(
     assert cfg.enabled and cfg.plugin == "fakemk"
 
 
-def test_a_module_reference_does_not_discover(models_dir: Path) -> None:
+def test_a_module_reference_does_not_discover(
+    models_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Model folders are imported only when a name or the checkpoint needs
-    them, not for an explicit `module[:attr]` plugin."""
+    them, not for an explicit `module[:attr]` plugin or a table entry."""
     _folder(models_dir, "zz_fake_mk", "fakemk", 'architectures=("FakeArch",)')
+    monkeypatch.setitem(SHORTHANDS, "zz_table", Shorthand("x.mk", ("TableArch",), ()))
     for plugin in ("my.pkg", "my_pkg:SPEC"):
         ref, _ = cfg_mod.resolve_plugin_ref(cfg_mod.parse_config({"plugin": plugin}))
         assert ref.shorthand is None
-    for src in ("1", "ep", "ab=1", '{"plugin": "my.pkg"}', "qwen35"):
+    for src in ("1", "ep", "ab=1", '{"plugin": "my.pkg"}', "zz_table"):
         cfg_mod.parse_config(src)
     assert discovered_shorthands.cache_info().currsize == 0
     with pytest.raises(MegakernelConfigError, match="Invalid megakernel config"):
