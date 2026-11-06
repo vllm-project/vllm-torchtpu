@@ -507,10 +507,15 @@ class TPUWorker(WorkerBase):
         # accounting misses those bytes. Ask the active connector how much
         # to reserve and subtract from the KV-cache budget. Returns 0 if no
         # connector needs a reserve. The connector owns the size formula.
+        # The pipeline ring hand-off allocates its buffers after profile_run
+        # too (0 with the wave).
         kv_connector_hbm_reserve = utils.estimate_kv_connector_hbm_reserve(
             self.vllm_config
         )
-        local_available = budget.available - kv_connector_hbm_reserve
+        pp_handoff_hbm_reserve = self.model_runner.pp_handoff_hbm_reserve_bytes()
+        local_available = (
+            budget.available - kv_connector_hbm_reserve - pp_handoff_hbm_reserve
+        )
         # A model adapter that owns its cache (Qwen4Exp's unified pool) can
         # report the bytes its cache may take, e.g. after profiling on a
         # scratch pool and with graph-time pool copies reserved.
@@ -518,13 +523,16 @@ class TPUWorker(WorkerBase):
         adapter_budget = getattr(adapter, "kv_cache_memory_budget", None)
         sized = adapter_budget() if callable(adapter_budget) else None
         if isinstance(sized, int):
-            local_available = sized
+            # The adapter sized its cache from HBM before the ring's buffers
+            # exist; leave them free.
+            local_available = sized - pp_handoff_hbm_reserve
         available = utils.min_across_ep_dp(self.parallel_config, local_available)
 
         total_hbm_limit_gb = round(budget.total_limit / utils.GBYTES, 2)
         total_hbm_limit_cap_gb = round(budget.cap / utils.GBYTES, 2)
         total_hbm_used_gb = round(budget.total_used / utils.GBYTES, 2)
         kv_connector_hbm_reserve_gb = round(kv_connector_hbm_reserve / utils.GBYTES, 2)
+        pp_handoff_hbm_reserve_gb = round(pp_handoff_hbm_reserve / utils.GBYTES, 2)
         total_hbm_avail_gb = round(available / utils.GBYTES, 2)
         logger.info(
             "Memory statistics | "
@@ -532,17 +540,21 @@ class TPUWorker(WorkerBase):
             "total_hbm_limit_cap_gb=%rGiB | "
             "total_hbm_used_gb=%rGiB | "
             "kv_connector_hbm_reserve_gb=%rGiB | "
+            "pp_handoff_hbm_reserve_gb=%rGiB | "
             "total_hbm_avail_gb=%rGiB",
             total_hbm_limit_gb,
             total_hbm_limit_cap_gb,
             total_hbm_used_gb,
             kv_connector_hbm_reserve_gb,
+            pp_handoff_hbm_reserve_gb,
             total_hbm_avail_gb,
         )
 
         if available <= 0:
             raise ValueError(
-                f"{total_hbm_used_gb=}GiB exceeds "
+                f"{total_hbm_used_gb=}GiB plus the HBM reserved after the "
+                f"memory profile ({kv_connector_hbm_reserve_gb=}GiB, "
+                f"{pp_handoff_hbm_reserve_gb=}GiB) exceeds "
                 f"{total_hbm_limit_cap_gb=}GiB by "
                 f"{-total_hbm_avail_gb}GiB. Please consider "
                 f"increasing --gpu-memory-utilization from "

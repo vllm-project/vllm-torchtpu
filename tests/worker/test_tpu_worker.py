@@ -318,6 +318,8 @@ def _ep_dp_worker(monkeypatch, dp_size, expert_parallel, local, peer):
     worker.vllm_config = SimpleNamespace(kv_transfer_config=None)
     worker.devices = []
     worker.model_runner = MagicMock(is_pooling_model=False)
+    # No ring hand-off, so nothing is reserved for it.
+    worker.model_runner.pp_handoff_hbm_reserve_bytes.return_value = 0
     return worker
 
 
@@ -344,6 +346,41 @@ def test_determine_available_memory_fails_on_every_ep_dp_engine(monkeypatch):
 
     with pytest.raises(ValueError, match="gpu-memory-utilization"):
         worker.determine_available_memory()
+
+
+def test_determine_available_memory_reserves_the_pp_hand_off_buffers(monkeypatch):
+    """The ring hand-off allocates its buffers after profile_run, so the KV
+    cache leaves room for them."""
+    worker = _ep_dp_worker(
+        monkeypatch, dp_size=1, expert_parallel=False, local=7 * utils.GBYTES, peer=0
+    )
+    worker.model_runner.pp_handoff_hbm_reserve_bytes.return_value = utils.GBYTES
+
+    assert worker.determine_available_memory() == 6 * utils.GBYTES
+
+
+def test_out_of_memory_error_shows_the_pp_hand_off_reserve(monkeypatch):
+    """The used HBM is under the cap and only the ring's buffers push the
+    budget below zero, so the error must show that reserve."""
+    worker = _ep_dp_worker(
+        monkeypatch, dp_size=1, expert_parallel=False, local=0, peer=0
+    )
+    budget = utils.HbmBudget(
+        total_limit=32 * utils.GBYTES,
+        total_used=18 * utils.GBYTES,
+        cap=19 * utils.GBYTES,
+        available=utils.GBYTES,
+    )
+    monkeypatch.setattr(utils, "compute_hbm_budget", lambda *_: budget)
+    worker.model_runner.pp_handoff_hbm_reserve_bytes.return_value = 2 * utils.GBYTES
+
+    with pytest.raises(ValueError) as error:
+        worker.determine_available_memory()
+
+    message = str(error.value)
+    assert "total_hbm_used_gb=18.0GiB" in message
+    assert "pp_handoff_hbm_reserve_gb=2.0GiB" in message
+    assert "by 1.0GiB" in message
 
 
 @patch("vllm_torchtpu.worker.tpu_worker.get_pp_group")

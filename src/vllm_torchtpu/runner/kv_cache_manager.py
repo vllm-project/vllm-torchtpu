@@ -835,9 +835,11 @@ class KVCacheManager:
         `gpu_memory_utilization` cap minus
         `utils.estimate_kv_connector_hbm_reserve` (HBM a connector allocates
         after profile_run, such as the offload H2D
-        staging pool). Sizing overrides against this budget keeps them from
-        filling the connector reserve back up with KV blocks and defeating
-        the worker-side subtraction.
+        staging pool), and minus the pipeline ring hand-off's buffers
+        (`TPUModelRunner.pp_handoff_hbm_reserve_bytes`, 0 with the wave).
+        Sizing overrides against this budget keeps them from filling either
+        reserve back up with KV blocks and defeating the worker-side
+        subtraction.
         """
         if kv_cache_memory_bytes := self.runner.cache_config.kv_cache_memory_bytes:
             return kv_cache_memory_bytes
@@ -847,7 +849,8 @@ class KVCacheManager:
         return utils.min_across_ep_dp(
             self.runner.vllm_config.parallel_config,
             budget.available
-            - utils.estimate_kv_connector_hbm_reserve(self.runner.vllm_config),
+            - utils.estimate_kv_connector_hbm_reserve(self.runner.vllm_config)
+            - self.runner.pp_handoff_hbm_reserve_bytes(),
         )
 
     def _maybe_set_compact_mamba_num_blocks_override(
