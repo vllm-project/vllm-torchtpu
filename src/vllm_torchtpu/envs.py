@@ -62,6 +62,9 @@ if TYPE_CHECKING:
     QWEN4_EXP_PD_STAGING_BYTES: int = 8 << 30
     QWEN4_EXP_PD_SYNC_REPACK: bool = False
     QWEN4_EXP_PD_SYNC_REPACK_AB_S: int = 0
+    QWEN4_EXP_PD_BATCHED_ADMISSION: bool = False
+    QWEN4_EXP_PD_BATCHED_ADMISSION_AB_PASSES: int = 0
+    QWEN4_EXP_PD_BATCHED_ADMISSION_CHECK: int = 0
     QWEN4_EXP_PP_LOGICAL_BLOCKS_FACTOR: int = 1
     TPU_KV_CACHE_GROUP_SIZE_RULE: str = "gcd"
     QWEN4_EXP_PREFILL_SP_MIN_TOKENS: int = 1024
@@ -1017,6 +1020,24 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # on in odd periods of this many seconds, so one serving job measures
     # both arms on the same engines (an in-job A/B). Overrides the switch.
     "QWEN4_EXP_PD_SYNC_REPACK_AB_S": env_int("QWEN4_EXP_PD_SYNC_REPACK_AB_S", 0),
+    # Stage-3 destination admission in ONE TP collective per connector pass
+    # (distributed/kv_transfer/stage3_admission.py) instead of a free-map
+    # all-reduce per load plus an expiry all-reduce per load that does not fit:
+    # the same admission and expiry decisions, in the same order. Host-side
+    # only (q38 D-MK; FR1b c48 spent ~14 ms per step in 16 such all-reduces).
+    "QWEN4_EXP_PD_BATCHED_ADMISSION": env_bool("QWEN4_EXP_PD_BATCHED_ADMISSION"),
+    # > 0: alternate the batched admission off / on every this many connector
+    # passes, off first; every rank counts the same passes, so all flip
+    # together (an in-job A/B on the same engines). Overrides the switch.
+    "QWEN4_EXP_PD_BATCHED_ADMISSION_AB_PASSES": env_int(
+        "QWEN4_EXP_PD_BATCHED_ADMISSION_AB_PASSES", 0
+    ),
+    # With the batched admission on: on the first N passes that admit a load,
+    # also run today's per-load decisions on copies of the state and log the
+    # mismatch count (an inline exactness check; costs today's collectives).
+    "QWEN4_EXP_PD_BATCHED_ADMISSION_CHECK": env_int(
+        "QWEN4_EXP_PD_BATCHED_ADMISSION_CHECK", 0
+    ),
     # A Qwen4Exp pipeline engine with prefix caching gives the scheduler this
     # many block IDs per physical pool page. Every stage shares the block-ID
     # space but writes only its own groups' pages (2-4 of a block's 24), so

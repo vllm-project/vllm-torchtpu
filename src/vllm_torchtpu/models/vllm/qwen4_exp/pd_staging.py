@@ -743,16 +743,9 @@ class StagedConsumer:
 
     # --- allocation (identical on every rank of the engine) ---
 
-    def reserve(
-        self, uuid: int, num_tokens: int, tp_group=None, *, skip_tokens: int = 0
-    ) -> bool:
-        """Staging pages for one load. A prefix-aware load (``skip_tokens``:
-        the decode-local prefix) stages each token group from the first source
-        page not wholly inside that prefix; request-state pages stage whole."""
+    def _owner_counts(self, num_tokens: int, skip_tokens: int):
         from .pd import skipped_source_pages
 
-        if uuid in self.reservations:
-            return True
         first = [skipped_source_pages(g, skip_tokens) for g in self.src_groups]
         group_counts = [
             g.page_count(num_tokens) - f for g, f in zip(self.src_groups, first)
@@ -761,13 +754,46 @@ class StagedConsumer:
             raise ValueError("A prefix-aware load must leave every group a suffix")
         owners = [pool.layer_name for pool in self.manifest.pools]
         counts = [group_counts[self._pool_group[name]] for name in owners]
-        free = self.free.clone()
-        if tp_group is not None and getattr(tp_group, "world_size", 1) > 1:
-            import torch.distributed as dist
+        return first, owners, counts
 
-            # Ranks free pages at their own receive terminals; allocate only
-            # pages free on all of them, in the same order everywhere.
-            dist.all_reduce(free, op=dist.ReduceOp.MIN, group=tp_group.cpu_group)
+    def pages_needed(self, uuid: int, num_tokens: int, *, skip_tokens: int = 0) -> int:
+        """Staging pages ``reserve`` would take for this load (0 if it holds
+        them already); raises as ``reserve`` does for an invalid prefix."""
+        if uuid in self.reservations:
+            return 0
+        return sum(self._owner_counts(num_tokens, skip_tokens)[2])
+
+    def reserve(
+        self,
+        uuid: int,
+        num_tokens: int,
+        tp_group=None,
+        *,
+        skip_tokens: int = 0,
+        reduced_free=None,
+    ) -> bool:
+        """Staging pages for one load. A prefix-aware load (``skip_tokens``:
+        the decode-local prefix) stages each token group from the first source
+        page not wholly inside that prefix; request-state pages stage whole.
+
+        ``reduced_free`` (QWEN4_EXP_PD_BATCHED_ADMISSION): the pass's free map,
+        already the MIN over the TP group (``stage3_admission.prepare``); used
+        instead of this load's own all-reduce, and its allocated pages are
+        zeroed in it as well, so the next load sees what its own all-reduce
+        would have returned."""
+        if uuid in self.reservations:
+            return True
+        first, owners, counts = self._owner_counts(num_tokens, skip_tokens)
+        if reduced_free is not None:
+            free = reduced_free
+        else:
+            free = self.free.clone()
+            if tp_group is not None and getattr(tp_group, "world_size", 1) > 1:
+                import torch.distributed as dist
+
+                # Ranks free pages at their own receive terminals; allocate only
+                # pages free on all of them, in the same order everywhere.
+                dist.all_reduce(free, op=dist.ReduceOp.MIN, group=tp_group.cpu_group)
         available = torch.nonzero(free, as_tuple=False).flatten().tolist()
         if len(available) < sum(counts):
             return False
@@ -777,6 +803,8 @@ class StagedConsumer:
             cursor += count
         for owner_pages in pages.values():
             self.free[owner_pages] = 0
+            if reduced_free is not None:
+                reduced_free[owner_pages] = 0
         self.reservations[uuid] = pages
         self.skips[uuid] = (skip_tokens, first)
         return True

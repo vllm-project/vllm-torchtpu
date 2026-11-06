@@ -396,6 +396,50 @@ class Qwen4ExpRaidenWorker(TPURaidenConnectorWorker):
             )
         return ok
 
+    # --- QWEN4_EXP_PD_BATCHED_ADMISSION hooks (distributed/kv_transfer/stage3_admission.py) ---
+
+    def _stage3_admission_free_map(self):
+        staging = getattr(self, "_staging", None)
+        return None if staging is None else staging.free
+
+    def _stage3_reserve_destination_reduced(self, req_meta, reduced_free) -> bool:
+        staging = getattr(self, "_staging", None)
+        if staging is None:
+            return True
+        return staging.reserve(
+            int(req_meta.uuid),
+            int(req_meta.num_tokens),
+            skip_tokens=int(getattr(req_meta, "skip_tokens", 0) or 0),
+            reduced_free=reduced_free,
+        )
+
+    def _stage3_destination_pages_needed(self, req_meta) -> int:
+        staging = getattr(self, "_staging", None)
+        if staging is None:
+            return 0
+        return staging.pages_needed(
+            int(req_meta.uuid),
+            int(req_meta.num_tokens),
+            skip_tokens=int(getattr(req_meta, "skip_tokens", 0) or 0),
+        )
+
+    def _stage3_admission_snapshot(self):
+        staging = getattr(self, "_staging", None)
+        if staging is None:
+            return None
+        return (staging.free.clone(), dict(staging.reservations), dict(staging.skips))
+
+    def _stage3_admission_restore(self, saved) -> None:
+        staging = getattr(self, "_staging", None)
+        if staging is None or saved is None:
+            return
+        free, reservations, skips = saved
+        staging.free.copy_(free)
+        staging.reservations.clear()
+        staging.reservations.update(reservations)
+        staging.skips.clear()
+        staging.skips.update(skips)
+
     def _stage3_finish_destination(self, destination_req_id, ok) -> None:
         staging = getattr(self, "_staging", None)
         if staging is None:

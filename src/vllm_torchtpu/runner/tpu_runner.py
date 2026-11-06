@@ -3991,6 +3991,7 @@ class TPUModelRunner(GPUModelRunner):
                 wait_for_completion=raiden_inline,
                 report_completion=not raiden_inline,
             )
+        host_phases.mark("kv_connector")
 
         while chunk_index < target_num_chunks:
             if start_index >= self.input_batch.num_reqs:

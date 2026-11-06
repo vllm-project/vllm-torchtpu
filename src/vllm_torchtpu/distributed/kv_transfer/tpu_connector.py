@@ -5770,6 +5770,7 @@ class TPURaidenConnectorWorker:
             for d, meta in metadata.reqs_to_load.items()
             if d not in self._stage3_destination_waits
         ]
+        admission = self._stage3_batched_admission(loads, tp_group)
         for destination_req_id, req_meta in loads:
             if not isinstance(req_meta, _Stage3LoadMeta):
                 raise TypeError(
@@ -5852,10 +5853,29 @@ class TPURaidenConnectorWorker:
             self._stage3_load_start_times[destination_req_id] = time.perf_counter()
             local_blocks = list(req_meta.local_block_ids)
             self._load_block_ids[destination_req_id] = local_blocks
-            if self._stage3_reserve_destination(destination_req_id, req_meta, tp_group):
+            batched = admission is not None and destination_req_id in admission
+            if (
+                admission.reserve(
+                    destination_req_id,
+                    req_meta,
+                    self._stage3_reserve_destination_reduced,
+                    self._stage3_destination_pages_needed,
+                )
+                if batched
+                else self._stage3_reserve_destination(destination_req_id, req_meta, tp_group)
+            ):
                 self._stage3_destination_waits.pop(destination_req_id, None)
-            elif not self._stage3_destination_wait_expired(
-                destination_req_id, req_meta, tp_group
+            elif not (
+                admission.expired(
+                    destination_req_id,
+                    req_meta,
+                    self._stage3_destination_waits,
+                    self._log_stage3_destination_expired,
+                )
+                if batched
+                else self._stage3_destination_wait_expired(
+                    destination_req_id, req_meta, tp_group
+                )
             ):
                 # No model-owned destination room yet: park the load and
                 # re-attempt it on the next submit pass. The metadata and
@@ -6021,6 +6041,7 @@ class TPURaidenConnectorWorker:
             ):
                 self._dispatch_stage3_load_submit(pending, synchronous)
 
+        self._stage3_admission_after_pass(admission)
         if tp_group is not None and synchronous:
             self._drain_stage3_submit_outcomes()
 
@@ -6514,6 +6535,194 @@ class TPURaidenConnectorWorker:
                     self._stage3_pending_controller_failures[req_id] = (
                         time.time() + float(dist_utils.get_p2p_wait_pull_timeout())
                     )
+
+    def _stage3_batched_admission(self, loads: list, tp_group: Any) -> Any:
+        """QWEN4_EXP_PD_BATCHED_ADMISSION: one TP collective for the whole pass
+        (``stage3_admission``) instead of one per load that reaches admission
+        plus one per load that does not fit. None: today's per-load path.
+
+        Counts passes on every rank alike (one per ``_submit_stage3_loads``),
+        so ``QWEN4_EXP_PD_BATCHED_ADMISSION_AB_PASSES`` flips every rank on the
+        same pass. The candidates are the loads the loop sends to admission:
+        load metadata that is neither release-only nor fail-only nor already
+        submitted (a candidate the loop rejects earlier is simply unused)."""
+        from vllm_torchtpu.distributed.kv_transfer import stage3_admission as adm
+
+        passes = getattr(self, "_stage3_admission_passes", 0) + 1
+        self._stage3_admission_passes = passes
+        ab = int(tpu_envs.QWEN4_EXP_PD_BATCHED_ADMISSION_AB_PASSES)
+        on = adm.ab_mode(passes, ab, bool(tpu_envs.QWEN4_EXP_PD_BATCHED_ADMISSION))
+        self._stage3_pass_meta = None
+        if not on and ab <= 0:
+            return None  # today's path, nothing else
+        self._stage3_admission_period_note(passes, on)
+        # A connector whose destination admission (`_stage3_reserve_destination`)
+        # is not paired with a batched one in the same class stays per-load.
+        r1 = getattr(type(self), "_stage3_reserve_destination", None)
+        r2 = getattr(type(self), "_stage3_reserve_destination_reduced", None)
+        if (
+            on
+            and r1 is not None
+            and r2 is not None
+            and r1.__qualname__.rsplit(".", 1)[0] != r2.__qualname__.rsplit(".", 1)[0]
+        ):
+            if not getattr(self, "_stage3_admission_refused", False):
+                self._stage3_admission_refused = True
+                logger.warning(
+                    "QWEN4_EXP_PD_BATCHED_ADMISSION: %s has no batched destination "
+                    "admission; per-load path", type(self).__name__,
+                )
+            on = False
+        candidates = [
+            (d, m)
+            for d, m in loads
+            if isinstance(m, _Stage3LoadMeta)
+            and not m.release_only
+            and not m.fail_only
+            and self._stage3_submitted_loads.get(d) is None
+        ]
+        self._stage3_pass_meta = (on, time.perf_counter(), len(candidates))
+        if not on or not candidates:
+            return None
+        if getattr(self, "_stage3_admission_checks_left", None) is None:
+            self._stage3_admission_checks_left = int(
+                tpu_envs.QWEN4_EXP_PD_BATCHED_ADMISSION_CHECK
+            )
+        reference = (
+            self._stage3_admission_reference(candidates, tp_group)
+            if self._stage3_admission_checks_left > 0
+            else None
+        )
+        admission = adm.prepare(
+            candidates,
+            self._stage3_admission_free_map(),
+            self._stage3_destination_waits,
+            0.5 * float(dist_utils.get_p2p_wait_pull_timeout()),
+            time.time(),
+            tp_group,
+        )
+        if reference is not None:
+            admission.reference = reference
+        self._stage3_last_admission = admission
+        return admission
+
+    def _stage3_admission_reference(self, candidates: list, tp_group: Any) -> list:
+        """QWEN4_EXP_PD_BATCHED_ADMISSION_CHECK: today's per-load decisions for the
+        same candidates, on copies of the destination state and the parked-load
+        deadlines (real reserve / expiry code, real per-load collectives), to
+        compare with the batched pass's decisions after the loop."""
+        saved = self._stage3_admission_snapshot()
+        waits = self._stage3_destination_waits
+        self._stage3_destination_waits = dict(waits)
+        out = []
+        try:
+            for dest, meta in candidates:
+                if self._stage3_reserve_destination(dest, meta, tp_group):
+                    out.append((dest, "reserved"))
+                elif self._stage3_destination_wait_expired(dest, meta, tp_group):
+                    out.append((dest, "expired"))
+                else:
+                    out.append((dest, "parked"))
+        finally:
+            self._stage3_destination_waits = waits
+            self._stage3_admission_restore(saved)
+        return out
+
+    def _stage3_admission_after_pass(self, admission: Any) -> None:
+        """After the loop: the inline check (if one ran) and the A/B statistics."""
+        meta = getattr(self, "_stage3_pass_meta", None)
+        if meta is None:
+            return
+        on, t0, n_candidates = meta
+        stats = self.__dict__.setdefault("_stage3_admission_stats", {})
+        st = stats.setdefault(on, {"passes": 0, "ms": [], "cand": 0, "coll": 0})
+        st["passes"] += 1
+        st["ms"].append((time.perf_counter() - t0) * 1e3)
+        st["cand"] += n_candidates
+        st["coll"] += admission.collectives if admission is not None else 0
+        if st["passes"] % 500 == 0:
+            ms = sorted(st["ms"])
+            logger.info(
+                "Stage-3 admission A/B stats rank%d mode=%s passes=%d pass_ms mean=%.3f "
+                "p50=%.3f p90=%.3f candidates/pass=%.2f batched_collectives/pass=%.2f",
+                self.tp_rank,
+                "ON" if on else "OFF",
+                st["passes"],
+                sum(ms) / len(ms),
+                ms[len(ms) // 2],
+                ms[min(len(ms) - 1, int(0.9 * len(ms)))],
+                st["cand"] / 500,
+                st["coll"] / 500,
+            )
+            st["ms"], st["cand"], st["coll"] = [], 0, 0
+        if admission is not None:
+            self._stage3_admission_compare(admission)
+
+    def _stage3_admission_compare(self, admission: Any) -> None:
+        """The batched pass's decisions against the reference (inline check)."""
+        self._stage3_last_admission = None
+        reference = getattr(admission, "reference", None)
+        if reference is None:
+            return
+        self._stage3_admission_checks_left -= 1
+        got = {}
+        for dest, what in admission.decisions:
+            if what in ("reserved", "expired", "parked"):
+                got[dest] = what
+        compared = [(d, w) for d, w in reference if d in got]
+        mismatches = sum(1 for d, w in compared if got[d] != w)
+        logger.info(
+            "Stage-3 batched admission check rank%d: loads %d compared %d mismatches %d "
+            "collectives %d (per-load path: %d) (%d left)",
+            self.tp_rank,
+            len(reference),
+            len(compared),
+            mismatches,
+            admission.collectives,
+            sum(1 + (w != "reserved") for _, w in compared),
+            self._stage3_admission_checks_left,
+        )
+
+    def _stage3_admission_period_note(self, passes: int, on: bool) -> None:
+        """Logs each switch of the batched admission (the A/B periods) and, every
+        500 passes, the passes' host time and collectives by mode."""
+        last = getattr(self, "_stage3_admission_last_mode", None)
+        if on != last:
+            logger.info(
+                "Stage-3 batched admission %s from pass %d (rank%d)",
+                "ON" if on else "OFF",
+                passes,
+                self.tp_rank,
+            )
+        self._stage3_admission_last_mode = on
+
+    def _stage3_admission_free_map(self) -> Any:
+        """The local free map of model-owned destination storage, or None."""
+        return None
+
+    def _stage3_admission_snapshot(self) -> Any:
+        return None
+
+    def _stage3_admission_restore(self, saved: Any) -> None:
+        del saved
+
+    def _stage3_reserve_destination_reduced(self, req_meta: Any, reduced_free: Any) -> bool:
+        """``_stage3_reserve_destination`` against the pass's reduced free map
+        (no collective). Without model-owned destination storage: True."""
+        del req_meta, reduced_free
+        return True
+
+    def _stage3_destination_pages_needed(self, req_meta: Any) -> int:
+        del req_meta
+        return 0
+
+    def _log_stage3_destination_expired(self, destination_req_id: str) -> None:
+        logger.warning(
+            "Stage-3 load found no destination room within %.0fs; the decode "
+            "recomputes it destination_req_id=%s",
+            0.5 * float(dist_utils.get_p2p_wait_pull_timeout()),
+            destination_req_id,
+        )
 
     def _stage3_destination_wait_expired(self, destination_req_id, req_meta, tp_group) -> bool:
         """Whether a load without destination room has waited long enough.

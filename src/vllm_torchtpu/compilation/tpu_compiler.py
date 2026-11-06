@@ -255,6 +255,12 @@ _TPU_COMPILE_ENV_IGNORED = {
     # When a staged Qwen PD decode runs its (unchanged) repack program.
     "QWEN4_EXP_PD_SYNC_REPACK",
     "QWEN4_EXP_PD_SYNC_REPACK_AB_S",
+    # Host-side Stage-3 admission collectives (same decisions; q38 D-MK).
+    "QWEN4_EXP_PD_BATCHED_ADMISSION",
+    "QWEN4_EXP_PD_BATCHED_ADMISSION_AB_PASSES",
+    "QWEN4_EXP_PD_BATCHED_ADMISSION_CHECK",
+    # Per-step host phase logging (runner/host_phases.py).
+    "VLLM_TPU_HOST_PHASES",
     "TPU_RAIDEN_STAGE3_DEFERRED_SUBMIT",
     "TPU_RAIDEN_STAGE3_REGISTRATION_WAIT_S",
     "TPU_RAIDEN_STAGE3_STATUS_PROBE_S",
