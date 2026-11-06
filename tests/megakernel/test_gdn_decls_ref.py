@@ -1,0 +1,345 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Standalone unit tests for slice L-7a (`modules/gdn` params, decls, and reference)."""
+
+from __future__ import annotations
+
+import dataclasses
+
+import jax
+import jax.numpy as jnp
+import numpy as np
+import pytest
+from jax import lax
+
+from tests.megakernel.megakernel_fakes import (
+    TINY_TILES,
+    FakeFFNModule,
+    FakeGeometry,
+    FakeMixerModule,
+)
+from vllm_torchtpu.megakernel.decls import (
+    ModuleBinding,
+    RecurrentCacheDecl,
+    ResolvedModuleGeometry,
+)
+from vllm_torchtpu.megakernel.errors import MegakernelConfigError
+from vllm_torchtpu.megakernel.exec_spec import ExecSpec
+from vllm_torchtpu.megakernel.modules.gdn.decls import (
+    GDN_FIELD_ALIASES,
+    GDN_GEOMETRY_FIELDS,
+    GDN_GEOMETRY_METHODS,
+    GDN_OPTIONS,
+    GDN_PARAM_NAMES,
+    GDN_WEIGHT_NAMES,
+    gdn_cache_decl,
+    gdn_hf_params,
+    resolve_gdn_binding,
+    validate_gdn_options,
+)
+from vllm_torchtpu.megakernel.modules.gdn.gate import (
+    GDN_GATE_ACTS,
+    gdn_gate_act,
+    validate_gdn_gate,
+)
+from vllm_torchtpu.megakernel.modules.gdn.params import (
+    GDNTunables,
+    checked_pool_layout,
+    derive_params,
+    gdn_lin_in_layout,
+)
+from vllm_torchtpu.megakernel.modules.gdn.reference import gdn_reference
+from vllm_torchtpu.megakernel.ops import BF16, F32, round_bf16
+from vllm_torchtpu.megakernel.planner import plan
+from vllm_torchtpu.megakernel.pool import CacheExec, PoolBackend, PoolLayout
+from vllm_torchtpu.megakernel.spec import LayerType, ModelSpec
+
+
+def test_gdn_gate_act_and_validate_gdn_gate():
+    """Verify `validate_gdn_gate` and `gdn_gate_act` for valid and invalid gates."""
+    assert set(GDN_GATE_ACTS) == {"silu", "sigmoid"}
+    assert validate_gdn_gate("silu") == "silu"
+    assert validate_gdn_gate("sigmoid") == "sigmoid"
+    assert gdn_gate_act("silu") is jax.nn.silu
+    assert gdn_gate_act("sigmoid") is jax.nn.sigmoid
+
+    x = jnp.array([-1.0, 0.0, 2.0], dtype=F32)
+    np.testing.assert_allclose(gdn_gate_act("silu")(x), jax.nn.silu(x))
+    np.testing.assert_allclose(gdn_gate_act("sigmoid")(x), jax.nn.sigmoid(x))
+
+    for bad in ("relu", "", None, 123):
+        with pytest.raises(ValueError, match="'silu' or 'sigmoid'"):
+            validate_gdn_gate(bad)
+        with pytest.raises(MegakernelConfigError, match="'silu' or 'sigmoid'"):
+            gdn_gate_act(bad, err_cls=MegakernelConfigError)
+
+
+def test_gdn_tunables_lin_in_layout_and_derive_params():
+    """Verify GDN tunables, `lin_in` layout, `derive_params`, and pool layout."""
+    field_names = {f.name for f in dataclasses.fields(GDNTunables)}
+    assert set(GDNTunables.NUMERICS.keys()) == field_names
+
+    g = FakeGeometry(L=2, att_every=2, H=256, KH=4, VH=8, KD=128, VD=128)
+    tiles = dataclasses.replace(TINY_TILES, bank=512 << 10, wide_rows=4)
+    ex = ExecSpec(B=4, T=1, R=2, ctx=256, stack_e=True, tiles=tiles)
+    lay = gdn_lin_in_layout(g, ex)
+    assert lay == gdn_lin_in_layout(g, 2)
+    assert lay.kh == 2 and lay.vh == 4
+    assert lay.QKV == 2 * 2 * 128 + 4 * 128
+    assert lay.Z == 4 * 128
+    assert lay.BA == lay.QKV + lay.Z and lay.A_OFF == lay.BA + 64
+    assert lay.NLI == lay.BA + 128
+
+    ms = ModelSpec(
+        "gdn_p",
+        config=g,
+        layer_type=LayerType("lt", slots=(FakeMixerModule(), FakeFFNModule())),
+    )
+    p = plan(ms, ex)
+    gp = derive_params(g, ex, p, GDNTunables(), "fake_gqa", gate="sigmoid")
+    assert gp.GCH is False and gp.CB == 4 and gp.NCH == 1 and gp.gate == "sigmoid"
+
+    # Chunked verify (`GCH=True`) when B=16, T=4, gdn_rows=8, gdn_bufs=2
+    ex_v = ExecSpec(B=16, T=4, R=2, ctx=256, stack_e=True, tiles=tiles)
+    p_v = plan(ms, ex_v)
+    tt_gch = GDNTunables(gdn_rows=8, gdn_bufs=2, gdn_head_major=True)
+    gp_v = derive_params(g, ex_v, p_v, tt_gch, "fake_gqa")
+    assert gp_v.GCH is True and gp_v.CB == 8 and gp_v.NCH == 2 and gp_v.NRB == 2
+    assert gp_v.head_major is True
+
+    with pytest.raises(MegakernelConfigError, match="gdn_bufs >= 2"):
+        derive_params(g, ex_v, p_v, GDNTunables(gdn_rows=8, gdn_bufs=1), "fake_gqa")
+    with pytest.raises(MegakernelConfigError, match="'silu' or 'sigmoid'"):
+        derive_params(g, ex, p, GDNTunables(), "fake_gqa", gate="bad_gate")
+
+    # checked_pool_layout validation
+    with pytest.raises(MegakernelConfigError, match="needs a pool backend"):
+        checked_pool_layout(p, ex, g_per_att=1, ssm_u32_rows=256)
+
+    pl_ok = PoolLayout(
+        num_pools=1,
+        slots_per_pool=1,
+        kh=2,
+        vh=4,
+        rec_pages_per_slot=4,
+        conv_pages_per_slot=1,
+        conv_taps=3,
+        conv_dtype=BF16,
+    )
+    ex_pool = ExecSpec(
+        B=4,
+        T=1,
+        R=2,
+        ctx=256,
+        stack_e=True,
+        tiles=tiles,
+        cache=CacheExec(paged_kv=True, page_size=128, num_pages=32),
+    )
+    ms_pool = dataclasses.replace(
+        ms,
+        cache_backend=PoolBackend(layout=pl_ok, kernel_names=("kv_pool_0",)),
+    )
+    p_pool = plan(ms_pool, ex_pool)
+    assert checked_pool_layout(p_pool, ex_pool, 1, 256) is pl_ok
+    with pytest.raises(MegakernelConfigError, match="slots_per_pool"):
+        checked_pool_layout(p_pool, ex_pool, 2, 256)
+    with pytest.raises(MegakernelConfigError, match="exceeds the pool layout"):
+        checked_pool_layout(p_pool, ex_pool, 1, 1024)
+
+
+def test_gdn_decls_options_binding_and_hf_params():
+    """Verify GDN options, binding resolution, HF parameter keys, and cache decl."""
+    assert GDN_WEIGHT_NAMES == ("lin_in", "lin_out")
+    assert "lin_q" in GDN_PARAM_NAMES and "conv" in GDN_PARAM_NAMES
+    assert "H" in GDN_FIELD_ALIASES and "hidden" in GDN_GEOMETRY_FIELDS
+    assert set(GDN_OPTIONS.keys()) == {"gate", "weight_dtypes"}
+
+    validate_gdn_options(
+        {"gate": "sigmoid", "weight_dtypes": {"lin_in": "bf16", "lin_out": "fp8"}}
+    )
+    with pytest.raises(MegakernelConfigError, match="gate"):
+        validate_gdn_options({"gate": "bad"})
+    with pytest.raises(MegakernelConfigError, match="weight_dtypes"):
+        validate_gdn_options({"weight_dtypes": {"bad": "bf16"}})
+
+    binding = ModuleBinding(
+        module_cls=FakeMixerModule,
+        prefix="linear_attn",
+        options={"gate": "sigmoid"},
+        rename={"lin_q": "q_ssm"},
+    )
+    raw_res = ResolvedModuleGeometry(
+        module_cls=FakeMixerModule,
+        prefix="linear_attn",
+        values={
+            "hidden": 256,
+            "k_heads": 4,
+            "v_heads": 8,
+            "k_dim": 128,
+            "v_dim": 128,
+            "conv_kernel": 4,
+            "eps": 1e-6,
+            "gdn_l2_eps": 1e-6,
+            "gate": "sigmoid",
+        },
+        options=binding.options,
+        rename=binding.rename,
+    )
+    res = resolve_gdn_binding(FakeMixerModule, binding, raw_res)
+    assert res.H == 256 and res.KH == 4 and res.VH == 8 and res.conv_taps == 3
+    assert res.gate == "sigmoid" and res.gdn_gate == "sigmoid"
+    assert GDN_GEOMETRY_METHODS["kh"](res, 2) == 2
+    assert GDN_GEOMETRY_METHODS["vh"](res, 2) == 4
+
+    bad_res = dataclasses.replace(raw_res, values={**raw_res.values, "conv_kernel": 5})
+    with pytest.raises(MegakernelConfigError, match="conv_kernel == 4"):
+        resolve_gdn_binding(FakeMixerModule, binding, bad_res)
+
+    decls_fp8 = gdn_hf_params("linear_attn", res)
+    names_fp8 = {d.name for d in decls_fp8}
+    assert "q_ssm" in names_fp8 and "lin_q_s" in names_fp8 and "lin_out_s" in names_fp8
+    decls_bf16 = gdn_hf_params(
+        "linear_attn", res, weight_dtypes={"lin_in": "bf16", "lin_out": "bf16"}
+    )
+    names_bf16 = {d.name for d in decls_bf16}
+    assert "lin_q_s" not in names_bf16 and "lin_out_s" not in names_bf16
+
+    cdecl = gdn_cache_decl(res)
+    assert isinstance(cdecl, RecurrentCacheDecl)
+    assert cdecl.kh == 4 and cdecl.vh == 8 and cdecl.conv_taps == 3
+
+
+@pytest.mark.parametrize(("T", "gate"), [(1, "silu"), (2, "sigmoid")])
+def test_gdn_reference_matches_direct_computation(T: int, gate: str):
+    """Compare `gdn_reference` against direct causal conv + gated delta rule."""
+    B = 4
+    g = FakeGeometry(L=1, att_every=1, H=256, KH=2, VH=4, KD=128, VD=128)
+    ex = ExecSpec(B=B, T=T, R=1, ctx=256, tiles=TINY_TILES)
+    lay = gdn_lin_in_layout(g, ex)
+    kh, vh, KD, VD = lay.kh, lay.vh, lay.KD, lay.VD
+    QKV, Z, BA, A_OFF, NLI = lay.QKV, lay.Z, lay.BA, lay.A_OFF, lay.NLI
+
+    keys = jax.random.split(jax.random.PRNGKey(50 + T), 9)
+    x = jax.random.normal(keys[0], (B, g.H), dtype=BF16) * 0.2
+    w_in = jax.random.normal(keys[1], (1, g.H, NLI), dtype=BF16) * 0.1
+    w_out = jax.random.normal(keys[2], (1, Z, g.H), dtype=BF16) * 0.1
+    conv_w = jax.random.normal(keys[3], (1, 4 * QKV), dtype=F32) * 0.1
+    alog = jax.random.normal(keys[4], (1, vh), dtype=F32) * 0.1 - 1.0
+    dtb = jax.random.normal(keys[5], (1, vh), dtype=F32) * 0.1
+    gnorm = jax.random.normal(keys[6], (1, VD), dtype=F32) * 0.05 + 1.0
+    conv_st = jax.random.normal(keys[7], (1, ex.NS, 3, QKV), dtype=F32) * 0.05
+    rec_st = jax.random.normal(keys[8], (1, ex.NS, vh, KD, VD), dtype=BF16) * 0.05
+
+    params = {
+        "lin_in": w_in,
+        "lin_out": w_out,
+        "conv": conv_w,
+        "alog": alog,
+        "dtb": dtb,
+        "gnorm": gnorm,
+    }
+    ref_out, ref_st = gdn_reference(
+        params,
+        x,
+        {"conv": conv_st, "rec": rec_st},
+        g=g,
+        ex=ex,
+        multi_layer=False,
+        gate=gate,
+    )
+
+    if T == 1:
+        conv_packed = jnp.swapaxes(conv_st[0], 0, 1).reshape(1, 3 * B, QKV)
+        rec_flat = rec_st.reshape(1, B * vh, KD, VD)
+        ref_out_p, _ = gdn_reference(
+            params,
+            x,
+            {"conv": conv_packed, "rec": rec_flat},
+            g=g,
+            ex=ex,
+            multi_layer=False,
+            packed_conv=True,
+            flat_rec=True,
+            gate=gate,
+        )
+        np.testing.assert_allclose(ref_out_p, ref_out, rtol=0, atol=0)
+
+    # Direct single-rank math
+    xb = x.astype(BF16).astype(F32)
+    ybuf = round_bf16(xb @ w_in[0].astype(F32))
+    taps = [conv_w[0, t * QKV : (t + 1) * QKV] for t in range(4)]
+    if T == 1:
+        u = round_bf16(
+            jax.nn.silu(
+                conv_st[0, :, 0] * taps[0]
+                + conv_st[0, :, 1] * taps[1]
+                + conv_st[0, :, 2] * taps[2]
+                + ybuf[:, :QKV] * taps[3]
+            )
+        )
+    else:
+        us = []
+        for s_idx in range(ex.NS):
+            h_s = jnp.concatenate(
+                [conv_st[0, s_idx], ybuf[s_idx * T : (s_idx + 1) * T, :QKV]], axis=0
+            )
+            u_s = round_bf16(
+                jax.nn.silu(
+                    h_s[0:T] * taps[0]
+                    + h_s[1 : 1 + T] * taps[1]
+                    + h_s[2 : 2 + T] * taps[2]
+                    + h_s[3 : 3 + T] * taps[3]
+                )
+            )
+            us.append(u_s)
+        u = jnp.concatenate(us, axis=0)
+
+    g_act = gdn_gate_act(gate)
+    mix_rows = []
+    rec_rows = []
+    rec_prev = rec_st[0, 0]
+    for b in range(B):
+        s_idx, t_idx = divmod(b, T)
+        st = rec_st[0, s_idx].astype(F32) if t_idx == 0 else rec_prev.astype(F32)
+        q = u[b, : kh * KD].reshape(kh, KD)
+        k = u[b, kh * KD : 2 * kh * KD].reshape(kh, KD)
+        v = u[b, 2 * kh * KD :].reshape(vh, VD)
+        q = q * lax.rsqrt(jnp.sum(q * q, axis=-1, keepdims=True) + 1e-6) * (KD**-0.5)
+        k = k * lax.rsqrt(jnp.sum(k * k, axis=-1, keepdims=True) + 1e-6)
+        qc = jnp.repeat(q, vh // kh, axis=0)[:, :, None]
+        kc = jnp.repeat(k, vh // kh, axis=0)[:, :, None]
+        beta = round_bf16(jax.nn.sigmoid(ybuf[b, BA : BA + vh]))
+        decay = -jnp.exp(alog[0]) * jax.nn.softplus(
+            ybuf[b, A_OFF : A_OFF + vh] + dtb[0]
+        )
+        st = st * jnp.exp(decay)[:, None, None]
+        st = st + kc * ((v - jnp.sum(st * kc, axis=1)) * beta[:, None])[:, None, :]
+        out_b = round_bf16(jnp.sum(st * qc, axis=1))
+        rec_prev = st.astype(BF16)
+        rec_rows.append(rec_prev)
+        val = out_b * lax.rsqrt(jnp.mean(out_b * out_b, axis=-1, keepdims=True) + g.eps)
+        val = (gnorm[0].astype(BF16)[None, :] * val.astype(BF16)).astype(F32)
+        zz = ybuf[b, QKV : QKV + Z].reshape(vh, VD)
+        mix_rows.append(round_bf16(val * g_act(zz)).reshape(Z))
+
+    expected = (
+        (jnp.stack(mix_rows, axis=0).astype(BF16).astype(F32) @ w_out[0].astype(F32))
+        .astype(BF16)
+        .astype(F32)
+    )
+    np.testing.assert_allclose(ref_out, expected, rtol=1e-5, atol=1e-5)
+    rec_key = "rec_ckpt" if T > 1 else "rec"
+    np.testing.assert_allclose(
+        ref_st[rec_key][0], jnp.concatenate(rec_rows, axis=0), rtol=1e-5, atol=1e-5
+    )
