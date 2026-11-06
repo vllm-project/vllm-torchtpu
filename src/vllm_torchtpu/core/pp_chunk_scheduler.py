@@ -121,10 +121,17 @@ class TpuPipelineChunkScheduler(Scheduler):
         pending."""
         if self._cost is None:
             return None
+        # TPU_PP_SPREAD_MAX_PREFIX (q38): requests this deep into their
+        # prompt stay out of the spread and are cut by the time budget alone.
+        # The cost model is fit at short prefixes and prices each spread with
+        # no prefix at all, so it splits a long-context chunk into halves
+        # that cost nearly as much as the whole (sparse attention at 100K of
+        # context costs about the same for 3,200 and 6,400 tokens).
+        max_prefix = int(envs.TPU_PP_SPREAD_MAX_PREFIX)
         pending = 0
-        for request in self.running:
-            pending += max(_prefill_end(request) - request.num_computed_tokens, 0)
-        for request in self.waiting:
+        for request in (*self.running, *self.waiting):
+            if max_prefix > 0 and request.num_computed_tokens >= max_prefix:
+                continue
             pending += max(_prefill_end(request) - request.num_computed_tokens, 0)
         if pending == 0:
             return None

@@ -288,6 +288,9 @@ _TPU_COMPILE_ENV_IGNORED = {
     "TPU_PP_EXTRA_STEPS_IN_FLIGHT",
     "TPU_PP_RING_VERIFY",
     "TPU_PP_RING_VERIFY_MUTANT",
+    # The chunk scheduler's spread (engine side): it changes which buckets
+    # steps use, not the compiled programs.
+    "TPU_PP_SPREAD_MAX_PREFIX",
     # Startup and host-side knobs: ports, an IPC secret, two raiden startup
     # checks, the raiden offload storage tier, offload retry and drain
     # limits, a weight-load sync cadence, a debug log switch, and the

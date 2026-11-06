@@ -193,6 +193,7 @@ if TYPE_CHECKING:
     TPU_PP_EXTRA_STEPS_IN_FLIGHT: int = -1
     TPU_PP_RING_VERIFY: int = 0
     TPU_PP_RING_VERIFY_MUTANT: int = -1
+    TPU_PP_SPREAD_MAX_PREFIX: int = 0
     TPU_ROPE_CACHE_TRUNCATE: bool = False
     TPU_ROPE_CACHE_ROW_MAJOR: bool = False
     TPU_MOE_HASH_TABLE_ROW_MAJOR: bool = False
@@ -1484,6 +1485,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # digests a copy of what it received with one bit flipped, so its link
     # must report mismatches; the forward reads the unchanged tensor. -1: off.
     "TPU_PP_RING_VERIFY_MUTANT": env_int("TPU_PP_RING_VERIFY_MUTANT", -1),
+    # Pipeline chunk scheduler: pending prefill of requests that have at least
+    # this many tokens computed is left out of the spread over the stages, so
+    # their chunks are cut by the step's time budget alone (full steps at long
+    # context instead of halves). 0: every request spreads (core/pp_chunk_
+    # scheduler.py _pending_step_limit).
+    "TPU_PP_SPREAD_MAX_PREFIX": env_int("TPU_PP_SPREAD_MAX_PREFIX", 0),
     # Enable pre-compile rotation to speed up the startup time.
     "TPU_PARALLEL_PRECOMPILE": env_bool("TPU_PARALLEL_PRECOMPILE", default=False),
     # Under TPU_PARALLEL_PRECOMPILE, take a subgraph's ranges biggest first,

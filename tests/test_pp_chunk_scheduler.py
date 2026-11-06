@@ -389,3 +389,61 @@ def test_the_step_estimate_prices_the_step_the_cost_model_sees():
     step.total_num_scheduled_tokens = 20000
     assert scheduler.step_estimate_ms(step) == cost.step_ms(16384, pairs, squares)
     assert _scheduler().step_estimate_ms(step) is None
+
+
+# q38: TPU_PP_SPREAD_MAX_PREFIX keeps long-context chunks whole. q38's served
+# shape: an 8,192-token step, a 3,200-token granule, buckets at 3,200 and 6,400,
+# and the cost model aa2's startup fit (M): prefix-free 3,200 -> 34.5 ms,
+# 6,400 -> 72.9 ms, 8,192 -> 73.0 ms, attention 2.38e-9 ms per token pair.
+Q38_BUCKETS = [3200, 6400, 8192]
+
+
+def _q38_model():
+    linear = {3200: 34.5, 6400: 72.9, 8192: 73.0}
+    attn = 2.38e-9
+    full = linear[8192] + attn * 8192**2 / 2
+    return StepCostModel(Q38_BUCKETS, linear, attn, full * 1.1, 3200)
+
+
+def _q38_limit(monkeypatch, running, waiting=(), max_prefix=None):
+    if max_prefix is None:
+        monkeypatch.delenv("TPU_PP_SPREAD_MAX_PREFIX", raising=False)
+    else:
+        monkeypatch.setenv("TPU_PP_SPREAD_MAX_PREFIX", str(max_prefix))
+    scheduler = _scheduler(cost=_q38_model(), running=running, waiting=waiting)
+    with patch.object(Scheduler, "schedule", return_value=_EMPTY_STEP):
+        scheduler.schedule()
+    return scheduler
+
+
+def test_q38_today_a_lone_long_context_request_is_split_in_halves(monkeypatch):
+    # The served behaviour the flag addresses: one 6,400-token turn behind a
+    # 102,400-token cached prefix is held to 3,200-token steps.
+    lone = [_request(102400, 108800)]
+    assert _q38_limit(monkeypatch, lone)._step_limit == 3200
+    # four such requests at once: still 3,200 (8 steps instead of 4)
+    four = [_request(102400, 108800, f"r{i}") for i in range(4)]
+    assert _q38_limit(monkeypatch, four)._step_limit == 3200
+
+
+def test_q38_the_flag_keeps_long_context_chunks_whole(monkeypatch):
+    lone = [_request(102400, 108800)]
+    scheduler = _q38_limit(monkeypatch, lone, max_prefix=32768)
+    assert scheduler._step_limit is None
+    # the time budget alone then takes the whole 6,400-token turn in one step
+    assert scheduler._mamba_block_aligned_split(lone[0], 6400) == 6400
+    four = [_request(102400, 108800, f"r{i}") for i in range(4)]
+    assert _q38_limit(monkeypatch, four, max_prefix=32768)._step_limit is None
+
+
+def test_q38_short_context_requests_still_spread(monkeypatch):
+    # A fresh 12,800-token prompt still spreads over the stages.
+    fresh = [_request(0, 12800)]
+    assert _q38_limit(monkeypatch, fresh, max_prefix=32768)._step_limit == 3200
+    # and a short request beside a long one sets the step limit by itself
+    mixed = [_request(0, 12800, "short"), _request(102400, 108800, "long")]
+    assert _q38_limit(monkeypatch, mixed, max_prefix=32768)._step_limit == 3200
+    # the threshold is inclusive: a request at exactly max_prefix is left out
+    edge = [_request(32768, 39168)]
+    assert _q38_limit(monkeypatch, edge, max_prefix=32768)._step_limit is None
+    assert _q38_limit(monkeypatch, edge, max_prefix=32769)._step_limit == 3200
