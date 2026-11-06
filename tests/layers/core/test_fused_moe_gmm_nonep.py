@@ -380,6 +380,51 @@ def test_check_experts_per_visit_rejects_what_the_kernel_cannot_do():
             check_experts_per_visit(e, **{**ok, **bad})
 
 
+@pytest.mark.parametrize("topk", [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 16, 20])
+def test_dense_runs_reproduce_the_all_valid_route_to_token_map(topk):
+    """The combine's run table: in an all-valid block route r belongs to
+    token r // topk. Every chunk's runs cover its 16 lanes in order, each run
+    is one token's maximal stretch of consecutive lanes, and the tokens are
+    the true ones for every chunk of a 64-token block."""
+    from vllm_torchtpu.kernels.sparse_core.ragged_gather_reduce_v3 import dense_runs
+
+    n_phase, tok_per_period, table = dense_runs(topk)
+    assert n_phase * 16 == tok_per_period * topk  # one period, in chunks and in tokens
+    assert len(table) == n_phase
+    for chunk in range(64 * topk // 16):
+        period, phase = divmod(chunk, n_phase)
+        lanes = []
+        for tok, first, length in table[phase]:
+            assert length >= 1
+            for lane in range(first, first + length):
+                lanes.append(lane)
+                assert period * tok_per_period + tok == (chunk * 16 + lane) // topk
+        assert lanes == list(range(16))
+        toks = [t for t, _, _ in table[phase]]
+        assert toks == sorted(set(toks))  # maximal runs: one per token, in order
+    if topk == 10:
+        assert table == (
+            ((0, 0, 10), (1, 10, 6)),
+            ((1, 0, 4), (2, 4, 10), (3, 14, 2)),
+            ((3, 0, 8), (4, 8, 8)),
+            ((4, 0, 2), (5, 2, 10), (6, 12, 4)),
+            ((6, 0, 6), (7, 6, 10)),
+        )
+
+
+def test_dense_combine_mode_is_read_and_checked(monkeypatch):
+    from vllm_torchtpu.kernels.sparse_core.ragged_gather_reduce_v3 import _dense_mode
+
+    for value, expected in (("", ""), ("reg", "reg"), (" addupdate ", "addupdate")):
+        monkeypatch.setenv("TPU_SC_COMBINE_DENSE", value)
+        assert _dense_mode() == expected
+    monkeypatch.delenv("TPU_SC_COMBINE_DENSE")
+    assert _dense_mode() == ""
+    monkeypatch.setenv("TPU_SC_COMBINE_DENSE", "registers")
+    with pytest.raises(ValueError):
+        _dense_mode()
+
+
 # --------------------------------------------------------------------------- TPU
 
 

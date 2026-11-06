@@ -21,6 +21,7 @@ BF16 tiles.
 """
 
 import functools
+import math
 import os
 
 import jax
@@ -42,8 +43,46 @@ def _bench_mode() -> str:
     """Bench-only attribution knob (TPU_SC_COMBINE_BENCH, ported from the
     Qwen3.5 branch): "skip_math" keeps the row gathers and drops the
     scatter-adds, "half_cols" scatter-adds the first half of each column
-    partition. Must stay unset in serving (the output is then wrong)."""
+    partition. With TPU_SC_COMBINE_DENSE=reg, "dense_pairadd" reassociates
+    each run's sums and "dense_forcegate" sends partial blocks through the
+    run table: must-fail controls of the hash comparison. Must stay unset in
+    serving (the output is then wrong)."""
     return os.environ.get("TPU_SC_COMBINE_BENCH", "").strip()
+
+
+def _dense_mode() -> str:
+    """TPU_SC_COMBINE_DENSE: accumulate all-valid blocks with a static run
+    table instead of indexed scatter-adds. "reg" sums each destination's
+    consecutive routes in registers (one load and one store per run);
+    "addupdate" keeps the memory-side add but as contiguous row updates.
+    Unset = the indexed scatter-add for every block. Same additions in the
+    same order either way."""
+    mode = os.environ.get("TPU_SC_COMBINE_DENSE", "").strip()
+    if mode not in ("", "reg", "addupdate"):
+        raise ValueError(f"TPU_SC_COMBINE_DENSE={mode!r}: expected reg, addupdate or unset")
+    return mode
+
+
+def dense_runs(topk: int, lanes: int = _TOKEN_SUBCHUNK):
+    """Run table of an all-valid destination block.
+
+    With every route valid, the stable compaction keeps routes in order, so
+    route r of the block belongs to destination token r // topk. The pattern
+    of 16-route chunks repeats every lcm(topk, 16) routes. Returns
+    (chunks_per_period, tokens_per_period, table), where table[k] lists the
+    runs (token offset in the period, first lane, length) of chunk phase k.
+    """
+    period = math.lcm(topk, lanes)
+    table = []
+    for k in range(period // lanes):
+        runs, lane = [], 0
+        while lane < lanes:
+            tok = (k * lanes + lane) // topk
+            end = min(lanes, (tok + 1) * topk - k * lanes)
+            runs.append((tok, lane, end - lane))
+            lane = end
+        table.append(tuple(runs))
+    return period // lanes, period // topk, tuple(table)
 
 
 def _align_to(value: int, alignment: int) -> int:
@@ -119,6 +158,7 @@ def _main_kernel(
     blocks_per_row_partition: int,
     topk: int,
     bench_mode: str = "",
+    dense_mode: str = "",
 ):
     sc_info = pltpu.get_tpu_info().sparse_core
     assert sc_info is not None
@@ -284,7 +324,76 @@ def _main_kernel(
                     fixed_two_route_column_loop
                 )
 
-            @pl.when(jnp.logical_not(fixed_two_routes))
+            # All-valid blocks (every non-EP block at a step size that is a
+            # multiple of 64): a static run table replaces the indexed
+            # scatter-adds. Each destination's routes are added in lane order
+            # starting from the stored value (the zeroed +0.0 or the carried
+            # partial sum), exactly the scatter-add's sequence.
+            use_dense = dense_mode in ("reg", "addupdate") and topk != 2
+            dense = jnp.bool_(False)
+            if use_dense:
+                n_phase, tok_per_period, table = dense_runs(topk)
+                dense = valid_route_count == metadata_block_size
+                if bench_mode == "dense_forcegate":  # must-fail control: partial blocks too
+                    dense = valid_route_count > 0
+                period = route_chunk // n_phase
+                phase = route_chunk - period * n_phase
+                base_token = period * tok_per_period
+                pair_add = bench_mode == "dense_pairadd"  # must-fail control
+
+                def weighted(route_lane, col_slice):
+                    value_i32 = gather_ref[route_lane, col_slice]
+                    shift = jnp.where(
+                        jnp.bitwise_and(source_indices[route_lane], 1) == 0, 16, 0
+                    )
+                    shifted = jnp.bitwise_and(
+                        jnp.left_shift(value_i32, shift), jnp.int32(-65536)
+                    )
+                    value_f32 = plsc.bitcast(shifted, jnp.float32)
+                    value_f32 *= route_weights[route_lane]
+                    return value_f32
+
+                def dense_column_loop(runs):
+                    def body(col_offset):
+                        col_slice = pl.ds(col_offset, _TOKEN_SUBCHUNK)
+                        for tok, first, length in runs:
+                            row = base_token + tok
+                            lanes = range(first, first + length)
+                            if dense_mode == "addupdate":
+                                for route_lane in lanes:
+                                    plsc.addupdate(
+                                        accum_vmem_ref.at[row, col_slice],
+                                        weighted(route_lane, col_slice),
+                                    )
+                                continue
+                            acc = accum_vmem_ref[row, col_slice]
+                            if pair_add:
+                                lanes = list(lanes)
+                                while len(lanes) >= 2:
+                                    acc = acc + (
+                                        weighted(lanes[0], col_slice)
+                                        + weighted(lanes[1], col_slice)
+                                    )
+                                    lanes = lanes[2:]
+                            for route_lane in lanes:
+                                acc = acc + weighted(route_lane, col_slice)
+                            accum_vmem_ref[row, col_slice] = acc
+
+                    return body
+
+                for k, runs in enumerate(table):
+
+                    @pl.when(jnp.logical_and(dense, phase == k))
+                    def run_dense_path(runs=runs):
+                        plsc.parallel_loop(0, math_col_size, step=_TOKEN_SUBCHUNK)(
+                            dense_column_loop(runs)
+                        )
+
+            @pl.when(
+                jnp.logical_and(
+                    jnp.logical_not(fixed_two_routes), jnp.logical_not(dense)
+                )
+            )
             def run_generic_path():
                 plsc.parallel_loop(0, math_col_size, step=_TOKEN_SUBCHUNK)(
                     generic_column_loop
@@ -460,6 +569,7 @@ def ragged_gather_reduce(
         subcore_axis_name="subcore",
     )
     bench_mode = _bench_mode()
+    dense_mode = _dense_mode()
     out = core_map_helper.kernel(
         functools.partial(
             _main_kernel,
@@ -470,6 +580,7 @@ def ragged_gather_reduce(
             blocks_per_row_partition=blocks_per_row_partition,
             topk=reduce_group_size,
             bench_mode=bench_mode,
+            dense_mode=dense_mode,
         ),
         out_type=jax.ShapeDtypeStruct((padded_num_tokens, hidden_size), jnp.bfloat16),
         compiler_params=pltpu.CompilerParams(
@@ -483,6 +594,8 @@ def ragged_gather_reduce(
             pltpu.SemaphoreType.DMA((2,)),
         ),
         mesh=vector_mesh,
-        name="sc_ragged_gather_reduce_v3" + (f"_{bench_mode}" if bench_mode else ""),
+        name="sc_ragged_gather_reduce_v3"
+        + (f"_{bench_mode}" if bench_mode else "")
+        + (f"_dense_{dense_mode}" if dense_mode else ""),
     )(x, route_metadata, route_weights, route_counts)
     return out[:num_tokens]
