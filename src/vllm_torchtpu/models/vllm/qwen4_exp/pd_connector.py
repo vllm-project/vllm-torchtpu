@@ -90,13 +90,22 @@ class Qwen4ExpRaidenConnector(TPURaidenConnector):
             and parallel.pipeline_parallel_size == 1
             and parallel.tensor_parallel_size > 1
         )
+        # A PCP producer (TP1, PCP ranks splitting main KV by token) ships one
+        # transfer unit per PCP rank; its decode stages them (pd_staging).
+        pcp_producer = (
+            parallel.prefill_context_parallel_size > 1
+            and transfer is not None
+            and transfer.is_kv_producer
+            and parallel.tensor_parallel_size == 1
+        )
         if (
-            parallel.prefill_context_parallel_size != 1
+            (parallel.prefill_context_parallel_size != 1 and not pcp_producer)
             or parallel.decode_context_parallel_size != 1
             or (vllm_config.speculative_config is not None and not decode_only_mtp)
         ):
             raise NotImplementedError(
-                "Qwen PD first requires CP1, and MTP only on a staged TP>1 decode"
+                "Qwen PD first requires DCP1, PCP only on a TP1 producer, and MTP "
+                "only on a staged TP>1 decode"
             )
         # A pipeline producer (Qwen3.5's prefill shape): each TP1 stage ships
         # its own layers' pages whole, paired with a TP1 consumer's pools by
@@ -401,6 +410,10 @@ class Qwen4ExpRaidenWorker(TPURaidenConnectorWorker):
             for g in self._page_plan().groups
             if g.extent is TransferExtent.TOKEN_PAGES
         }
+        if len(token_sizes) == 2 and max(token_sizes) % min(token_sizes) == 0:
+            # A PCP producer's (or its decode's staged) split main KV: entries of
+            # P pages over P ranks, each rank's page as long as every other's.
+            token_sizes = {min(token_sizes)}
         if len(token_sizes) != 1:
             raise ValueError("Qwen PD requires one native token-page size")
         fingerprint = canonical_layout_fingerprint(payload)
@@ -420,9 +433,13 @@ class Qwen4ExpRaidenWorker(TPURaidenConnectorWorker):
     def _validate_stage3_transfer_parallelism(self, transfer_parallelism: int) -> None:
         parallel = self.vllm_config.parallel_config
         pp = int(parallel.pipeline_parallel_size or 1)
+        pcp = int(parallel.prefill_context_parallel_size or 1)
         if pp > 1:
-            # A pipeline producer: one transfer unit per TP1 stage.
-            units = self.is_producer and self.tp_size == 1 and transfer_parallelism == pp
+            # A pipeline producer: one transfer unit per TP1 stage, and per PCP
+            # rank of a stage (tpu_connector._local_raiden_transfer_rank).
+            units = (
+                self.is_producer and self.tp_size == 1 and transfer_parallelism == pp * pcp
+            )
         elif _use_per_layer_pool_tags() and not self.is_producer:
             # A consumer of pipeline stages pulls every stage's layers: whole
             # pages at TP1, through the staging repack at TP>1.
@@ -432,7 +449,7 @@ class Qwen4ExpRaidenWorker(TPURaidenConnectorWorker):
             units = transfer_parallelism == self.tp_size
         if (
             not units
-            or parallel.prefill_context_parallel_size != 1
+            or (pcp != 1 and not (self.is_producer and self.tp_size == 1))
             or parallel.decode_context_parallel_size != 1
             or (
                 self.vllm_config.speculative_config is not None

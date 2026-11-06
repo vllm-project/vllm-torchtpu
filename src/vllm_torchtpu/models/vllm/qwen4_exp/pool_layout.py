@@ -197,6 +197,7 @@ def pooled_cache_specs(
     main_dcp: int | None = None,
     pack_compressed: bool | None = None,
     merge_compressed: bool | None = None,
+    main_interleave: int | None = None,
 ):
     """Derive uniform physical pages without widening compressed-key coverage.
 
@@ -322,8 +323,9 @@ def pooled_cache_specs(
             )
     # PCP: the group splits main KV by token (main-KV DCP over the PCP ranks,
     # in pcp_interleave() units); everything else stays replicated.
+    # ``main_dcp`` with ``main_interleave`` describes a PCP peer (pd_staging).
     pcp = int(getattr(cfg.parallel_config, "prefill_context_parallel_size", 1) or 1)
-    interleave = 0
+    interleave = main_interleave or 0
     if pcp > 1 and main_dcp is None:
         if main_kv_dcp() > 1 or tp != 1:
             raise ValueError(f"PCP replaces {MAIN_KV_DCP_ENV} and runs TP1 stages")
