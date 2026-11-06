@@ -30,6 +30,7 @@ from vllm_torchtpu.megakernel.profile import (
     DEFAULT_PROFILE,
     Baseline,
     Profile,
+    TileContext,
     approx_features,
     get_profile,
     list_profiles,
@@ -60,7 +61,8 @@ def _isolated_profile_state(monkeypatch: pytest.MonkeyPatch):
 
 
 def test_profile_imports_only_exec_spec_pool_and_profiles():
-    """`profile.py` imports only stdlib, `exec_spec`, `pool`, and `profiles`."""
+    """`profile.py` imports only stdlib, `exec_spec`, `pool`, `profiles` and
+    the stdlib-only `_builtins` loader."""
     path = Path(profile.__file__)
     tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
     for node in ast.walk(tree):
@@ -74,7 +76,8 @@ def test_profile_imports_only_exec_spec_pool_and_profiles():
             else:
                 assert node.level == 1
                 roots = [mod.split(".")[0]] if mod else [a.name for a in node.names]
-                assert set(roots) <= {"exec_spec", "pool", "profiles"}, roots
+                allowed = {"_builtins", "exec_spec", "pool", "profiles"}
+                assert set(roots) <= allowed, roots
 
 
 def test_default_profile_and_baseline_metadata():
@@ -133,24 +136,22 @@ def test_profile_validation_and_numerics_enforcement():
             model_default=True,
         )
 
-    def _approx_module_rule(B: int, *, moe_tp: bool = False, R: int = 8) -> Tiles:
-        return default_tiles(B, moe_tp=moe_tp, R=R).with_modules(
-            {_TEST_MODULE: {"width": 256}}
-        )
+    def _approx_module_rule(tc: TileContext) -> Tiles:
+        return default_tiles(tc).with_modules({_TEST_MODULE: {"width": 256}})
 
-    def _approx_core_rule(B: int, *, moe_tp: bool = False, R: int = 8) -> Tiles:
-        return dataclasses.replace(
-            default_tiles(B, moe_tp=moe_tp, R=R), dense_acc_pair=True
-        )
+    def _approx_core_rule(tc: TileContext) -> Tiles:
+        return dataclasses.replace(default_tiles(tc), dense_acc_pair=True)
 
     with pytest.raises(ValueError, match=f"tiles.{_TEST_MODULE}.width"):
         Profile(name="bad-exact-module", tiles=_approx_module_rule)
     with pytest.raises(ValueError, match=r"tiles\.dense_acc_pair"):
         Profile(name="bad-exact-core", tiles=_approx_core_rule)
 
-    def _approx_high_b_rule(B: int, *, moe_tp: bool = False, R: int = 8) -> Tiles:
-        t = default_tiles(B, moe_tp=moe_tp, R=R)
-        return dataclasses.replace(t, dense_acc_pair=True) if B == MAX_BATCH_ROWS else t
+    def _approx_high_b_rule(tc: TileContext) -> Tiles:
+        t = default_tiles(tc)
+        return (
+            dataclasses.replace(t, dense_acc_pair=True) if tc.B == MAX_BATCH_ROWS else t
+        )
 
     with pytest.raises(ValueError, match=r"tiles\.dense_acc_pair"):
         Profile(name="bad-exact-b128", tiles=_approx_high_b_rule)
@@ -160,9 +161,9 @@ def test_profile_validation_and_numerics_enforcement():
         Profile(name="bad-exact-pg", pool_gather=True)
 
     # Exact-class changes keep an exact profile exact.
-    def _exact_sched_rule(B: int, *, moe_tp: bool = False, R: int = 8) -> Tiles:
+    def _exact_sched_rule(tc: TileContext) -> Tiles:
         return dataclasses.replace(
-            default_tiles(B, moe_tp=moe_tp, R=R), nbd=10, rel_fetch=True
+            default_tiles(tc), nbd=10, rel_fetch=True
         ).with_modules({_TEST_MODULE: {"fast": True}})
 
     exact_prof = Profile(name="sched-only", tiles=_exact_sched_rule, pool_gather=None)
@@ -191,10 +192,8 @@ def test_profile_validation_and_numerics_enforcement():
 
 
 def test_approx_features_against_default_and_model_reference():
-    def _ref_rule(B: int, *, moe_tp: bool = False, R: int = 8) -> Tiles:
-        return default_tiles(B, moe_tp=moe_tp, R=R).with_modules(
-            {_TEST_MODULE: {"width": 256}}
-        )
+    def _ref_rule(tc: TileContext) -> Tiles:
+        return default_tiles(tc).with_modules({_TEST_MODULE: {"width": 256}})
 
     ref = register_profile(
         Profile(
@@ -207,11 +206,9 @@ def test_approx_features_against_default_and_model_reference():
     # A model default profile is its own reference, even with approx knobs set.
     assert approx_features(ref) == ()
 
-    def _tuned_rule(B: int, *, moe_tp: bool = False, R: int = 8) -> Tiles:
-        base = _ref_rule(B, moe_tp=moe_tp, R=R).with_modules(
-            {_TEST_MODULE: {"fast": True}}
-        )
-        if B == 64 and R == 16 and moe_tp:
+    def _tuned_rule(tc: TileContext) -> Tiles:
+        base = _ref_rule(tc).with_modules({_TEST_MODULE: {"fast": True}})
+        if tc.B == 64 and tc.R == 16 and tc.moe_tp:
             return dataclasses.replace(base, dense_acc_pair=True, dmm_unroll=8)
         return base
 
@@ -280,10 +277,10 @@ def test_with_overrides_relabels_and_derives_numerics():
 
 
 def test_model_profile_without_tiles_inherits_model_default_rule():
-    def _ref_rule(B: int, *, moe_tp: bool = False, R: int = 8) -> Tiles:
+    def _ref_rule(tc: TileContext) -> Tiles:
         return dataclasses.replace(
-            default_tiles(B, moe_tp=moe_tp, R=R),
-            nbd=10 if moe_tp else 12,
+            default_tiles(tc),
+            nbd=10 if tc.moe_tp else 12,
         ).with_modules({_TEST_MODULE: {"width": 256}})
 
     ref = register_profile(
@@ -299,9 +296,9 @@ def test_model_profile_without_tiles_inherits_model_default_rule():
     assert approx_features(p) == ()
     assert p.tiles_for(8, R=2) == ref.tiles_for(8, R=2)
     ex = p.exec_for(ExecSpec(R=2), B=8, T=1)
-    assert ex.tiles == _ref_rule(8, R=2)
+    assert ex.tiles == _ref_rule(TileContext(B=8, R=2))
     ex_tp = p.exec_for(ExecSpec(R=2), B=8, T=1, g=types.SimpleNamespace(moe_tp=True))
-    assert ex_tp.tiles == _ref_rule(8, R=2, moe_tp=True)
+    assert ex_tp.tiles == _ref_rule(TileContext(B=8, R=2, moe_tp=True))
 
     # Without a model (or for a model with no default profile), `tile_rule()`
     # is None and `exec_for` leaves `tiles` unset for build-time VMEM fitting.
@@ -314,10 +311,8 @@ def test_model_profile_without_tiles_inherits_model_default_rule():
 
 
 def test_exec_for_specializes_bucket_and_respects_explicit_base_settings():
-    def _custom_rule(B: int, *, moe_tp: bool = False, R: int = 8) -> Tiles:
-        return dataclasses.replace(
-            default_tiles(B, moe_tp=moe_tp, R=R), nbd=10 if moe_tp else 12
-        )
+    def _custom_rule(tc: TileContext) -> Tiles:
+        return dataclasses.replace(default_tiles(tc), nbd=10 if tc.moe_tp else 12)
 
     prof_auto = Profile(name="custom-auto", tiles=_custom_rule, pool_gather=None)
     prof_elig = Profile(
@@ -332,12 +327,12 @@ def test_exec_for_specializes_bucket_and_respects_explicit_base_settings():
 
     ex_auto = prof_auto.exec_for(base, B=16, T=4, g=g_ep)
     assert (ex_auto.B, ex_auto.T) == (16, 4)
-    assert ex_auto.tiles == _custom_rule(16, moe_tp=False, R=4)
+    assert ex_auto.tiles == _custom_rule(TileContext(B=16, T=4, R=4, moe_tp=False))
     assert cache_exec(ex_auto).pool_gather is None
 
     ex_elig = prof_elig.exec_for(base, B=24, T=2, g=g_tp)
     assert (ex_elig.B, ex_elig.T) == (24, 2)
-    assert ex_elig.tiles == _custom_rule(24, moe_tp=True, R=4)
+    assert ex_elig.tiles == _custom_rule(TileContext(B=24, T=2, R=4, moe_tp=True))
     assert cache_exec(ex_elig).pool_gather == "eligible"
 
     # Explicit `pool_gather` on `base` (including `"split"`) wins over profile.
@@ -408,10 +403,8 @@ def test_registry_lookup_idempotency_and_replacement():
 
 
 def test_registration_order_cannot_bypass_exact_enforcement():
-    def _model_ref_rule(B: int, *, moe_tp: bool = False, R: int = 8) -> Tiles:
-        return dataclasses.replace(
-            default_tiles(B, moe_tp=moe_tp, R=R), dense_acc_pair=True
-        )
+    def _model_ref_rule(tc: TileContext) -> Tiles:
+        return dataclasses.replace(default_tiles(tc), dense_acc_pair=True)
 
     # Constructed before `ord_model` registers its default: matches library
     # `DEFAULT_PROFILE` at construction time, but diverges from `_model_ref_rule`.
@@ -478,3 +471,25 @@ def test_registration_order_cannot_bypass_exact_enforcement():
             replace=True,
         )
     assert model_default_profile("ord_model") is m_def
+
+
+def test_tile_context_fields_and_tiles_for_requires_r():
+    seen: list[TileContext] = []
+
+    def _ctx_rule(tc: TileContext) -> Tiles:
+        seen.append(tc)
+        nbd = 8 if (tc.T > 1 and tc.NS == 4 and tc.ctx >= 8192) else 12
+        return dataclasses.replace(default_tiles(tc), nbd=nbd)
+
+    prof = Profile(name="ctx-prof", tiles=_ctx_rule)
+    g_obj = types.SimpleNamespace(moe_tp=True)
+    t_ver = prof.tiles_for(16, R=4, T=4, ctx=8192, moe_tp=True, g=g_obj)
+    assert t_ver.nbd == 8
+    assert seen[-1] == TileContext(B=16, T=4, R=4, moe_tp=True, ctx=8192, g=g_obj)
+    assert seen[-1].NS == 4
+
+    tc_direct = TileContext(B=8, T=1, R=2, ctx=2048)
+    assert prof.tiles_for(tc_direct).nbd == 12
+
+    with pytest.raises(TypeError, match="requires explicit R"):
+        prof.tiles_for(8)

@@ -68,10 +68,10 @@ class FrozenDict(Mapping[str, Any]):
         return hash(frozenset(self._dict.items()))
 
     def __eq__(self, other: object) -> Any:
-        if isinstance(other, Mapping):
-            other_d = other if isinstance(other, FrozenDict) else FrozenDict(other)
-            return self._dict == other_d._dict
-        return NotImplemented
+        if not isinstance(other, Mapping):
+            return NotImplemented
+        od = other if isinstance(other, FrozenDict) else FrozenDict(other)
+        return self._dict == od._dict
 
     def __repr__(self) -> str:
         return f"FrozenDict({self._dict!r})"
@@ -110,6 +110,14 @@ class RecurrentCacheDecl:
 
 
 @dataclass(frozen=True)
+class ParamInit:
+    """Declarative synthetic initialization parameters for an `HFParamDecl`."""
+
+    mean: float = 0.0
+    std: float = 0.05
+
+
+@dataclass(frozen=True)
 class ParamTransform:
     """Declarative transform rules for a canonical module parameter."""
 
@@ -129,16 +137,15 @@ class ParamTransform:
     channel_splits: tuple[int, ...] | None = None
     flatten_tail: bool = False
     expert_axis: int | None = None
+    small_field: str | None = None
 
     def __post_init__(self) -> None:
         if self.transpose is not None and (
             not isinstance(self.transpose, tuple)
-            or not all(
-                isinstance(i, int) and not isinstance(i, bool) for i in self.transpose
-            )
+            or not all(type(i) is int for i in self.transpose)
         ):
             raise TypeError(
-                f"ParamTransform.transpose must be an int permutation tuple or None, "
+                "ParamTransform.transpose must be a permutation tuple or None, "
                 f"got {self.transpose!r}"
             )
 
@@ -154,7 +161,6 @@ class VLLMAlias:
     targets: tuple[str, ...]
     scale_targets: tuple[str, ...] = ()
     scale_source: str | None = None
-    router_scale_source: str | None = None
     shard_axis: int | None = None
     already_sharded: bool = True
     already_fp8: bool = True
@@ -165,9 +171,10 @@ class VLLMAlias:
 class HFParamDecl:
     """Canonical parameter declaration (`shape` in MK layout, `hf_shape` in raw HF).
 
-    When `hf_shape` is 2D and `shape` is multi-dimensional with a `transpose`
-    permutation, raw HF weights are first reshaped to the inverse-permuted
-    `shape` and then permuted by `transform.transpose` into `shape`.
+    When `hf_shape` is omitted, it is derived by inverting `transform.transpose`
+    on `shape` (or equals `shape` when `transpose` is None). When a 2D `hf_shape`
+    differs in rank from `shape`, the loader first reshapes the raw HF tensor to
+    the inverse-permuted `shape` before applying `transform.transpose`.
     """
 
     name: str
@@ -177,6 +184,7 @@ class HFParamDecl:
     hf_shape: tuple[int, ...] | None = None
     transform: ParamTransform = ParamTransform()
     vllm_aliases: tuple[VLLMAlias, ...] = ()
+    init: ParamInit | None = None
 
     def __post_init__(self) -> None:
         perm = self.transform.transpose
@@ -256,10 +264,9 @@ def _lookup_raw_key(cfg: Any, key: str) -> Any:
         for s in ("rope_parameters", "rope_scaling")
         if (sub := _sub_cfg(r, s)) is not None
     ]
-    for c in (*roots, *subs):
-        if (val := _sub_cfg(c, key)) is not None:
-            return val
-    return REQUIRED
+    return next(
+        (v for c in (*roots, *subs) if (v := _sub_cfg(c, key)) is not None), REQUIRED
+    )
 
 
 def _resolve_field_spec(
@@ -299,37 +306,27 @@ def validate_rename_and_transforms(
     param_name_override: str | None = None,
 ) -> None:
     """Validate `rename` and `transforms` keys against `module_cls.PARAM_NAMES`."""
-    allowed = set(getattr(module_cls, "PARAM_NAMES", ())) | (
-        {param_name_override} if param_name_override else set()
-    )
+    cls_n = module_cls.__name__
+    extra = {param_name_override} if param_name_override else set()
+    allowed = set(getattr(module_cls, "PARAM_NAMES", ())) | extra
     seen: set[str] = set()
     for k, v in rename.items():
         if allowed and k not in allowed:
-            raise ValueError(f"{module_cls.__name__}.bind got unknown rename key {k!r}")
+            raise ValueError(f"{cls_n}.bind got unknown rename key {k!r}")
         if not isinstance(v, str) or not v:
-            raise ValueError(f"{module_cls.__name__}.bind invalid rename[{k!r}]={v!r}")
+            raise ValueError(f"{cls_n}.bind invalid rename[{k!r}]={v!r}")
         if (v in allowed and v != k) or v in seen:
-            raise ValueError(
-                f"{module_cls.__name__}.bind rename target collision {v!r}"
-            )
+            raise ValueError(f"{cls_n}.bind rename target collision {v!r}")
         seen.add(v)
     allowed_tf = allowed | seen
     for k, v in transforms.items():
         if allowed_tf and k not in allowed_tf:
-            raise ValueError(
-                f"{module_cls.__name__}.bind got unknown transforms key {k!r}"
-            )
+            raise ValueError(f"{cls_n}.bind got unknown transforms key {k!r}")
         if isinstance(v, Mapping):
-            if bad := (set(v) - _TRANSFORM_FIELD_NAMES):
-                raise ValueError(
-                    f"{module_cls.__name__}.bind transforms[{k!r}] got unknown "
-                    f"fields {sorted(bad)}"
-                )
+            if bad := sorted(set(v) - _TRANSFORM_FIELD_NAMES):
+                raise ValueError(f"{cls_n}.bind transforms[{k!r}] unknown fields {bad}")
         elif not isinstance(v, ParamTransform):
-            raise TypeError(
-                f"{module_cls.__name__}.bind transforms[{k!r}] invalid type "
-                f"{type(v).__name__}"
-            )
+            raise TypeError(f"{cls_n}.bind transforms[{k!r}] invalid type")
 
 
 @dataclass(frozen=True)
@@ -412,3 +409,35 @@ class ModuleBinding:
 
     def cache_decl(self, hf_config: Any) -> KVCacheDecl | RecurrentCacheDecl | None:
         return self.resolve(hf_config).cache_decl()
+
+
+def normalize_weight_dtypes(
+    raw: Any,
+    allowed: Sequence[str],
+    module_name: str,
+    err_cls: type[Exception] = ValueError,
+) -> FrozenDict:
+    """Validate and normalize per-weight dtype policies (`'fp8' | 'bf16'`)."""
+    out = {k: "fp8" for k in allowed}
+    if raw is None:
+        return FrozenDict(out)
+    if not isinstance(raw, Mapping):
+        raise err_cls(
+            f"{module_name} weight_dtypes must be a Mapping, got {type(raw).__name__}"
+        )
+    allowed_set = set(allowed)
+    for k, v in raw.items():
+        if k not in allowed_set:
+            raise err_cls(
+                f"{module_name} weight_dtypes got unknown weight {k!r}; "
+                f"supported: {sorted(allowed_set)}"
+            )
+        if v in ("fp8", "fp8_channel", "per_channel_fp8"):
+            out[k] = "fp8"
+        elif v == "bf16":
+            out[k] = "bf16"
+        else:
+            raise err_cls(
+                f"{module_name} weight_dtypes[{k!r}] must be 'fp8' or 'bf16', got {v!r}"
+            )
+    return FrozenDict(out)
