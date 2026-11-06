@@ -94,6 +94,9 @@ if TYPE_CHECKING:
     TPU_ENABLE_GDN_DYNAMIC_TILING: bool = False
     VLLM_TPU_QSA_DECODE_QUERY_BLOCK: int = 0
     VLLM_TPU_QSA_TOPK_STATS: int = 0
+    VLLM_TPU_QSA_PREFILL_INDEXER_CHUNK: int = 0
+    VLLM_TPU_QSA_PREFILL_INDEXER_BQ: int = 128
+    VLLM_TPU_QSA_PREFILL_INDEXER_BKV: int = 256
     VLLM_TPU_QSA_DECODE_KV_BLOCK: int = 1024
     VLLM_TPU_QSA_DECODE_SINGLE_KV_BLOCK: int = 256
     VLLM_TPU_QSA_RING_SELECT: bool = False
@@ -548,6 +551,25 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # of selected groups, overlap of a request's verify rows) from a host
     # callback. 0 (default) adds nothing to the program.
     "VLLM_TPU_QSA_TOPK_STATS": env_nonnegative_int("VLLM_TPU_QSA_TOPK_STATS", 0),
+    # Qwen4-exp ragged prefill indexer: score/select in chunks of this many
+    # tokens, overlapping chunk g's SparseCore top-k with chunk g+1's scoring.
+    # 0 (default) keeps 512-token chunks for steps that are a multiple of 512
+    # and one unchunked call otherwise. A value that does not divide the step
+    # (or is not a multiple of 8) falls back to the default. Per-row scores
+    # and winners do not depend on the chunking.
+    "VLLM_TPU_QSA_PREFILL_INDEXER_CHUNK": env_nonnegative_int(
+        "VLLM_TPU_QSA_PREFILL_INDEXER_CHUNK", 0
+    ),
+    # Qwen4-exp ragged prefill indexer tiles: queries per block of the prefill
+    # passes and compressed keys per KV block (a multiple of 256). Defaults
+    # 128 / 256 are the served tiles. Each score keeps its own expression, so
+    # the winners do not depend on the tiling.
+    "VLLM_TPU_QSA_PREFILL_INDEXER_BQ": env_nonnegative_int(
+        "VLLM_TPU_QSA_PREFILL_INDEXER_BQ", 128
+    ),
+    "VLLM_TPU_QSA_PREFILL_INDEXER_BKV": env_nonnegative_int(
+        "VLLM_TPU_QSA_PREFILL_INDEXER_BKV", 256
+    ),
     # Compressed keys per KV block of the shared-stream pass above (a multiple
     # of 128). Only read when VLLM_TPU_QSA_DECODE_QUERY_BLOCK > 0.
     "VLLM_TPU_QSA_DECODE_KV_BLOCK": env_nonnegative_int(
