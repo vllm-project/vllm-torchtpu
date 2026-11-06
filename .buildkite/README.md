@@ -27,6 +27,15 @@ Steps that run only on v7x as written - those that go through
 those that set `TPU_ACCELERATOR_TYPE=tpu7x` - carry an `if` comparing
 `TPU_GENERATION` with `v7x`, so v6e's upload leaves them out.
 
+A build started by hand or over the API can run one generation alone: with
+`TPU_VERSION=tpu6e` or `TPU_VERSION=tpu7x`, each file in `TPU_GENERATION_FILES`
+goes up for that generation only, with its slice shapes, so the build sets no
+`KUBE_SHAPE_*`. Without it every generation runs. Other lanes go up as they
+are, so `perf` stays on v7x. Nightly, tag and integration builds refuse it -
+the nightly report waits on v7x's steps by key, and LKG promotion must not pass
+on one generation - and so does a build that runs neither `tests` nor
+`integration`.
+
 `pipeline_perf.yml` holds the perf/eval
 steps. Post-merge builds do not run them, and PR builds run them only when the
 PR has the `run-perf-eval` label (or `run-full-ci`, which sets `NIGHTLY=1` and

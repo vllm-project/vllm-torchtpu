@@ -136,6 +136,11 @@ TPU_GENERATION_FILES: Mapping[str, tuple[TpuGeneration, ...]] = {
     ".buildkite/pipeline_tests.yml": (TPU_V6E, TPU_V7X),
     ".buildkite/pipeline_integration.yml": (TPU_V6E, TPU_V7X),
 }
+# What a build started by hand sets TPU_VERSION to, to run one generation of
+# the files above alone, by the names tpu-inference gives them. The generation
+# brings its shapes, so the build names no KUBE_SHAPE_* of its own. Without
+# TPU_VERSION every generation runs.
+TPU_VERSIONS: Mapping[str, TpuGeneration] = {"tpu6e": TPU_V6E, "tpu7x": TPU_V7X}
 
 DEFAULT_INTEGRATION_SLUG = "vllm-torchtpu-integration"
 DEFAULT_DEV_PIPELINE_FILE = ".buildkite/pipeline_dev.yml"
@@ -201,6 +206,7 @@ class BuildContext:
     torchtpu_nightly_env: bool
     ci_lanes_raw: str
     skip_tpu_ci_env: bool
+    tpu_version: str
     vllm_commit_override: str
     pr_tpu_concurrency_group_env: str
     pr_tpu_jobs_per_author: int
@@ -243,6 +249,7 @@ class BuildContext:
             torchtpu_nightly_env=_env_or(env, "TORCHTPU_NIGHTLY", "0") == "1",
             ci_lanes_raw=env.get("CI_LANES", ""),
             skip_tpu_ci_env=_env_or(env, "SKIP_TPU_CI", "0") == "1",
+            tpu_version=env.get("TPU_VERSION", "").strip(),
             vllm_commit_override=env.get("VLLM_COMMIT_HASH_OVERRIDE", ""),
             pr_tpu_concurrency_group_env=env.get("PR_TPU_CONCURRENCY_GROUP", ""),
             pr_tpu_jobs_per_author=PR_TPU_JOBS_PER_AUTHOR,
@@ -288,6 +295,7 @@ class UploadPlan:
     post_lane_annotations: tuple[Annotation, ...]
     invalid_ci_lanes_error: str | None
     missing_ci_lanes_error: str | None
+    invalid_tpu_version_error: str | None
 
 
 @dataclass(frozen=True)
@@ -439,14 +447,20 @@ def files_for_lane(lane: str) -> tuple[str, ...]:
     return LANE_FILES.get(lane, (f".buildkite/pipeline_{lane}.yml",))
 
 
-def upload_envs(path: str) -> tuple[dict[str, str], ...]:
+def upload_envs(path: str, tpu_version: str = "") -> tuple[dict[str, str], ...]:
     """Return the extra variables of each upload of `path`, in upload order.
 
     A file in TPU_GENERATION_FILES goes up once per TPU generation, with that
-    generation's variables; any other file goes up once, with none.
+    generation's variables - or, when `tpu_version` (a key of TPU_VERSIONS)
+    names one, for that generation alone; any other file goes up once, with
+    none.
     """
-    generations = TPU_GENERATION_FILES.get(path, ())
-    return tuple(generation.upload_env() for generation in generations) or ({},)
+    if path not in TPU_GENERATION_FILES:
+        return ({},)
+    generations = TPU_GENERATION_FILES[path]
+    if tpu_version:
+        generations = tuple(g for g in generations if g is TPU_VERSIONS[tpu_version])
+    return tuple(generation.upload_env() for generation in generations)
 
 
 def plan_uploads(
@@ -550,6 +564,54 @@ def plan_uploads(
                 )
             )
 
+    # TPU_VERSION runs one TPU generation of the files in TPU_GENERATION_FILES
+    # alone (see upload_envs), for a build started by hand. A nightly, tag or
+    # integration build runs every generation: the nightly report waits on
+    # v7x's steps by key, and LKG promotion must not pass on one generation's
+    # steps. A build with no lane that goes up per generation would ignore it,
+    # so it is refused too.
+    tpu_version_error: str | None = None
+    if ctx.tpu_version:
+        per_generation = [
+            lane
+            for lane in ALL_LANES
+            if any(path in TPU_GENERATION_FILES for path in files_for_lane(lane))
+        ]
+        in_build = [
+            lane
+            for lane in per_generation
+            if any(path in lane_files for path in files_for_lane(lane))
+        ]
+        if ctx.tpu_version not in TPU_VERSIONS:
+            tpu_version_error = (
+                f"ERROR: TPU_VERSION is '{ctx.tpu_version}'; "
+                f"TPU versions are: {' '.join(TPU_VERSIONS)}"
+            )
+        elif nightly or ctx.tag or ctx.is_integration:
+            tpu_version_error = (
+                "ERROR: TPU_VERSION runs one TPU generation; nightly, tag and "
+                "integration builds run every generation"
+            )
+        elif invalid_error is None and not in_build:
+            tpu_version_error = (
+                "ERROR: TPU_VERSION picks the TPU generation of the "
+                f"{' and '.join(per_generation)} lanes, and this build runs none"
+            )
+        elif in_build and not skip_tpu_ci:
+            lanes = " and ".join(in_build)
+            noun = "lanes" if len(in_build) > 1 else "lane"
+            pre_annotations.append(
+                Annotation(
+                    style="info",
+                    context="tpu-version",
+                    body=(
+                        f"Runs only the TPU {TPU_VERSIONS[ctx.tpu_version].name} "
+                        f"steps of the {lanes} {noun} "
+                        f"(`TPU_VERSION={ctx.tpu_version}`)."
+                    ),
+                )
+            )
+
     # pipeline_build.yml skips the -omni image build when this is non-empty.
     # Buildkite rejects the upload if a skip reason is over 70 characters.
     if "tests" not in requested_lanes:
@@ -572,6 +634,7 @@ def plan_uploads(
         post_lane_annotations=tuple(post_annotations),
         invalid_ci_lanes_error=invalid_error,
         missing_ci_lanes_error=missing_error,
+        invalid_tpu_version_error=tpu_version_error,
     )
 
 
@@ -956,9 +1019,11 @@ def run_bootstrap(
 
     if upload_plan.invalid_ci_lanes_error is not None:
         raise BootstrapError(upload_plan.invalid_ci_lanes_error)
+    if upload_plan.invalid_tpu_version_error is not None:
+        raise BootstrapError(upload_plan.invalid_tpu_version_error)
 
     for lane_file in upload_plan.lane_files:
-        for extra_env in upload_envs(lane_file):
+        for extra_env in upload_envs(lane_file, ctx.tpu_version):
             suffix = f" for TPU {extra_env['TPU_GENERATION']}" if extra_env else ""
             print(f"Uploading {lane_file}{suffix}")
             upload_with_priority(

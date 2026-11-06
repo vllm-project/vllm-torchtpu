@@ -779,6 +779,95 @@ class TestBootstrapUnits(unittest.TestCase):
             run({"BUILDKITE_PULL_REQUEST": "42"}, files=["README.md"]).uploads, []
         )
 
+        # TPU_VERSION on a build started by hand: each file that goes up per
+        # generation goes up for that generation alone, with its shapes; the
+        # rest go up as before.
+        for version, gen in bp.TPU_VERSIONS.items():
+            one = run({"BUILDKITE_BRANCH": "dev/x", "TPU_VERSION": version})
+            self.assertEqual(one.annotations, ["tpu-version"])
+            self.assertEqual(
+                [u[0] for u in one.uploads],
+                [
+                    "verify",
+                    f"integration:{gen.name}",
+                    f"tests:{gen.name}",
+                    "tests_cpu",
+                    "build",
+                ],
+            )
+            for tag, _, upload_env in one.uploads:
+                if ":" in tag:
+                    self.assertEqual(upload_env["KUBE_SHAPE_SINGLE"], gen.shape_single)
+                    self.assertEqual(upload_env["KUBE_SHAPE_MULTI"], gen.shape_multi)
+        # A build that must run every generation is refused before any upload.
+        refused = FakeEffects()
+        with self.assertRaises(bp.BootstrapError):
+            bp.run_bootstrap(
+                {"NIGHTLY": "1", "TPU_VERSION": "tpu6e"},
+                repo_root=_REPO_ROOT,
+                effects=refused,
+            )
+        self.assertEqual(refused.uploads, [])
+
+    def test_tpu_version_runs_one_generation(self) -> None:
+        bp = self.bp
+        self.assertEqual(
+            {version: gen.name for version, gen in bp.TPU_VERSIONS.items()},
+            {"tpu6e": "v6e", "tpu7x": "v7x"},
+        )
+        # Unset, a per-generation file goes up once per generation; set, once,
+        # for the generation it names. Any other file goes up once, as it is.
+        for path, generations in bp.TPU_GENERATION_FILES.items():
+            self.assertEqual(
+                bp.upload_envs(path), tuple(g.upload_env() for g in generations)
+            )
+            for version, gen in bp.TPU_VERSIONS.items():
+                self.assertEqual(bp.upload_envs(path, version), (gen.upload_env(),))
+        for version in ("", *bp.TPU_VERSIONS):
+            self.assertEqual(
+                bp.upload_envs(".buildkite/pipeline_perf.yml", version), ({},)
+            )
+
+        def plan(env: dict[str, str]) -> Any:
+            return bp.plan_uploads(
+                bp.BuildContext.from_env(env),
+                merged_labels=(),
+                existing_lane_files=_ALL_LANE_FILES,
+            )
+
+        manual = plan({"TPU_VERSION": "tpu6e"})
+        self.assertIsNone(manual.invalid_tpu_version_error)
+        self.assertEqual(
+            [a.context for a in manual.pre_lane_annotations], ["tpu-version"]
+        )
+        self.assertIn("v6e", manual.pre_lane_annotations[0].body)
+        # With skip-tpu-ci no TPU step runs, so there is nothing to annotate.
+        skip = plan({"TPU_VERSION": "tpu6e", "SKIP_TPU_CI": "1"})
+        self.assertIsNone(skip.invalid_tpu_version_error)
+        self.assertEqual(
+            [a.context for a in skip.pre_lane_annotations], ["skip-tpu-ci"]
+        )
+        # Unset, there is nothing to refuse, on any build.
+        self.assertIsNone(plan({"NIGHTLY": "1"}).invalid_tpu_version_error)
+        # Refused: a name it does not know, builds that must run every
+        # generation, and a build with no lane that goes up per generation.
+        for env in (
+            {"TPU_VERSION": "v6e"},
+            {"TPU_VERSION": "tpu6e", "NIGHTLY": "1"},
+            {
+                "TPU_VERSION": "tpu6e",
+                "BUILDKITE_PULL_REQUEST": "10",
+                "BUILDKITE_PULL_REQUEST_LABELS": "run-full-ci",
+            },
+            {"TPU_VERSION": "tpu7x", "BUILDKITE_TAG": "v0.33.0"},
+            {
+                "TPU_VERSION": "tpu7x",
+                "BUILDKITE_PIPELINE_SLUG": "vllm-torchtpu-integration",
+            },
+            {"TPU_VERSION": "tpu6e", "CI_LANES": "perf"},
+        ):
+            self.assertIsNotNone(plan(env).invalid_tpu_version_error, env)
+
     def test_tests_lane_tpu_generations(self) -> None:
         import yaml  # pyrefly: ignore[missing-import]
 
