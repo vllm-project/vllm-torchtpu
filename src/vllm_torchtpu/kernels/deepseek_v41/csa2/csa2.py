@@ -5,6 +5,7 @@
 
 import functools
 import math
+from typing import cast
 
 import jax
 import jax.numpy as jnp
@@ -130,7 +131,7 @@ def _csa2_kernel(
     bounds_ref,
     # Inputs
     q_hbm,  # [T', H, 512], BF16; this call's T queries start at query_offset
-    kv_hbm,  # [T, 512, 128], INT32
+    kv_hbm,  # [T, 512, 128], INT32, or None for SWA-only attention
     scales_hbm,
     swa_hbm,
     sink_ref,
@@ -183,7 +184,8 @@ def _csa2_kernel(
     num_pages = 256 // page_size
     tile_capacity = tile_scratch.shape[0] // 3
     fixed_tiles = batch == 1 and tokens % bq == 0
-    resident_metadata = scales_buf is None
+    resident_metadata = rope_buf is None
+    has_main = kv_hbm is not None
     tiles_ref = tile_scratch
     if fixed_tiles:
         count = tokens // bq
@@ -224,9 +226,13 @@ def _csa2_kernel(
         return pl.ds(offset + start, bq)
 
     def input_copies(tile, bank):
-        sources = ((q_hbm, q_buf, query_offset), (kv_hbm, kv_buf, 0))
+        sources = ((q_hbm, q_buf, query_offset),)
+        if has_main:
+            sources += ((kv_hbm, kv_buf, 0),)
         if not resident_metadata:
-            sources += ((scales_hbm, scales_buf, 0), (rope_hbm, rope_buf, 0))
+            if has_main:
+                sources += ((scales_hbm, scales_buf, 0),)
+            sources += ((rope_hbm, rope_buf, 0),)
         return tuple(
             pltpu.make_async_copy(
                 source.at[rows(tile, offset)], target.at[bank], input_sems.at[bank, i]
@@ -392,9 +398,13 @@ def _csa2_kernel(
         if not resident_metadata:
             rope_saved[bank] = rope_buf[sb]
         q_ref = q_buf.at[sb]
-        main_cache_ref = kv_buf.at[sb]
+        main_cache_ref = kv_buf.at[sb] if has_main else None
         main_scale_ref = (
-            scales_hbm.at[rows(tile)] if resident_metadata else scales_buf.at[sb]
+            None
+            if not has_main
+            else scales_hbm.at[rows(tile)]
+            if resident_metadata
+            else scales_buf.at[sb]
         )
         main_kv_ref = decoded
         swa_ref = swa_work.at[bank]
@@ -484,7 +494,7 @@ def _csa2_kernel(
             for i in indices:
                 for row in range(0, 512, unpack_rows):
                     rows = pl.ds(row, unpack_rows)
-                    words = main_cache_ref[i, rows, :]
+                    words = cast(jax.Ref, main_cache_ref)[i, rows, :]
                     for subrow in range(0, unpack_rows, 16):
                         subwords = words[pl.ds(subrow, 16)]
                         for group in range(4):
@@ -525,7 +535,7 @@ def _csa2_kernel(
             for r, i in enumerate(indices):
                 main_logits = qk_values[r]
                 # Scale each key column after QK, using FP32 KV scales.
-                kv_scales = main_scale_ref[i]
+                kv_scales = cast(jax.Ref, main_scale_ref)[i]
                 main_logits = main_logits * (kv_scales * (scale * log2_e))
 
                 sink = sink_ref[...] * log2_e
@@ -546,7 +556,7 @@ def _csa2_kernel(
                 exponentials = exponentials / denominator
                 # The denominator uses unscaled weights; fold KV scales into
                 # main PV weights and round once to BF16.
-                kv_scales = main_scale_ref[i]
+                kv_scales = cast(jax.Ref, main_scale_ref)[i]
                 main_p_ref[i] = (exponentials[:, :512] * kv_scales).astype(jnp.bfloat16)
                 swa_p_ref[i] = exponentials[:, 512:].astype(jnp.bfloat16)
 
@@ -577,7 +587,9 @@ def _csa2_kernel(
                         lhs,
                         load_staged_rhs=tile_index % 2,
                     )
+            swa_pv(indices)
 
+        def swa_pv(indices):
             for mxu in range(2):
                 pltpu.matmul_push_rhs(swa_ref[:, pl.ds(mxu * 256, 256)], 0, mxu)
                 for r, i in enumerate(indices):
@@ -591,6 +603,29 @@ def _csa2_kernel(
                         preload_next(mxu)
 
         indices = tuple(range(bq))
+        if not has_main:
+            # SWA-only layers: the window is the whole key set.
+            swa_qk_compute(0, bq)
+            prepare_next()
+            if not first_tile:
+                finish(tile - 1, 1 - bank)
+            swa_qk_pop(0, bq)
+            sink = sink_ref[...] * log2_e
+            for r in indices:
+                swa_logits = swa_score_ref[r]
+                maximum = jnp.maximum(sink, jnp.max(swa_logits, axis=1, keepdims=True))
+                exponentials = jnp.exp2(swa_logits - maximum)
+                denominator = jnp.exp2(sink - maximum) + jnp.sum(
+                    exponentials, axis=1, keepdims=True
+                )
+                # One reciprocal per row: a per-element divide costs 9 us/call
+                # here (62 vs 71 us); the full form keeps its divide (measured
+                # slower with the reciprocal).
+                swa_p_ref[r] = (exponentials * (1.0 / denominator)).astype(jnp.bfloat16)
+            swa_pv(indices)
+            if not first_tile:
+                output_copy(tile - 1, 1 - bank).start()
+            return
         swa_qk_compute(0, bq)
         prepare_next()
         main_unpack(indices)
@@ -702,8 +737,8 @@ def _csa2_kernel(
 )
 def csa2(
     q: jax.Array,
-    main_kv: jax.Array,
-    main_kv_scale: jax.Array,
+    main_kv: jax.Array | None,
+    main_kv_scale: jax.Array | None,
     swa_kv: jax.Array | tuple[jax.Array, jax.Array],
     starts: jax.Array,
     positions: jax.Array,
@@ -735,13 +770,22 @@ def csa2(
     output update or gathered-KV concatenation. ``new_owners`` instead
     returns two newly allocated owners of those shapes; only this call's rows
     are written.
+
+    ``main_kv=None`` (with ``main_kv_scale=None``) is SWA-only attention, the
+    layers whose compress ratio is 0: the window is the whole key set and the
+    kernel moves and computes no main KV.
     """
+    has_main = main_kv is not None
+    if has_main != (main_kv_scale is not None):
+        raise ValueError("CSA2 main KV and its scales are given together")
     non_causal = swa_bounds is not None
     destinations = out is not None
     if destinations != (kv_out is not None):
         raise ValueError("CSA2 out and kv_out must be given together")
     if destinations and new_owners:
         raise ValueError("CSA2 new_owners excludes out and kv_out")
+    if not has_main and (destinations or new_owners):
+        raise ValueError("SWA-only CSA2 has no main KV owner to return")
     owners = "aliased" if destinations else "new" if new_owners else "none"
     if q.ndim != 3 or q.shape[2] != 512:
         raise ValueError("CSA2 q must be [T,H,512]")
@@ -790,12 +834,20 @@ def csa2(
         cache_page_size < 128 or cache_page_size % 128
     ):
         raise ValueError("SWA page size must be 8,16,32,64 or a multiple of 128")
-    if main_lengths is None:
+    if not has_main:
+        main_lengths = jnp.zeros((tokens,), jnp.int32)
+    elif main_lengths is None:
         main_lengths = jnp.minimum((positions + 1) // compress_ratio, 512)
-    specs = (
+    main_specs = (
+        (
+            (main_kv, (tokens, 512, 128), jnp.int32),
+            (main_kv_scale, (tokens, 512), jnp.float32),
+        )
+        if has_main
+        else ()
+    )
+    specs = main_specs + (
         (q, (q.shape[0], heads, 512), jnp.bfloat16),
-        (main_kv, (tokens, 512, 128), jnp.int32),
-        (main_kv_scale, (tokens, 512), jnp.float32),
         (starts, (batch + 1,), jnp.int32),
         (positions, (tokens,), jnp.int32),
         (main_lengths, (tokens,), jnp.int32),
@@ -831,7 +883,7 @@ def csa2(
     )
     # Reserve three quarters of VMEM for four Q/KV buffers, decoded KV,
     # probabilities and compiler temporaries. Large batches stream metadata.
-    metadata_bytes = main_kv_scale.nbytes + rope_cache.nbytes
+    metadata_bytes = rope_cache.nbytes + (main_kv_scale.nbytes if has_main else 0)
     resident_metadata = metadata_bytes <= pltpu.get_tpu_info().vmem_capacity_bytes // 4
     page_size = min(cache_page_size, 64)
     num_pages = 256 // page_size
@@ -839,13 +891,20 @@ def csa2(
     metadata_space = pltpu.VMEM if resident_metadata else pltpu.HBM
     spaces = (
         pltpu.HBM,
-        pltpu.HBM,
-        metadata_space,
+        pltpu.HBM if has_main else None,
+        metadata_space if has_main else None,
         tuple(pltpu.HBM for _ in banks),
         pltpu.VMEM,
         metadata_space,
     )
-    inputs = (q, main_kv, main_kv_scale[:, None, :], banks, sink[:, None], rope_cache)
+    inputs = (
+        q,
+        main_kv,
+        main_kv_scale[:, None, :] if main_kv_scale is not None else None,
+        banks,
+        sink[:, None],
+        rope_cache,
+    )
     # Pin the attention output to HBM. As a plain ShapeDtypeStruct XLA may
     # place it in VMEM, and the output projection, which takes its input in
     # HBM, then waits on a blocking copy of the whole [T, heads, 512] result.
@@ -886,18 +945,20 @@ def csa2(
             out_specs=out_specs,
             scratch_shapes=(
                 pltpu.VMEM((4, bq, heads, 512), jnp.bfloat16),
-                pltpu.VMEM((4, bq, 512, 128), jnp.int32),
-                None if resident_metadata else pltpu.VMEM((4, bq, 1, 512), jnp.float32),
+                pltpu.VMEM((4, bq, 512, 128), jnp.int32) if has_main else None,
+                None
+                if resident_metadata or not has_main
+                else pltpu.VMEM((4, bq, 1, 512), jnp.float32),
                 None if resident_metadata else pltpu.VMEM((4, bq, 2, 128), jnp.float32),
                 None if resident_metadata else pltpu.VMEM((2, bq, 2, 128), jnp.float32),
                 pltpu.VMEM(
                     (4, num_pages * len(banks), 1, page_size, 512), jnp.bfloat16
                 ),
                 pltpu.VMEM((2, bq, heads, 512), jnp.bfloat16),
-                pltpu.VMEM((bq, 512, 512), jnp.bfloat16),
+                pltpu.VMEM((bq, 512, 512), jnp.bfloat16) if has_main else None,
                 pltpu.VMEM((2, 256, 512), jnp.bfloat16),
                 pltpu.VMEM((bq, heads, 256), jnp.float32),
-                pltpu.VMEM((bq, heads, 512), jnp.bfloat16),
+                pltpu.VMEM((bq, heads, 512), jnp.bfloat16) if has_main else None,
                 pltpu.VMEM((bq, heads, 256), jnp.bfloat16),
                 pltpu.SemaphoreType.DMA((4, 2 if resident_metadata else 4)),
                 pltpu.SemaphoreType.DMA((4, num_pages * len(banks))),

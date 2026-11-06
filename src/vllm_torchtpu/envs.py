@@ -12,6 +12,9 @@ if TYPE_CHECKING:
     TPU_DEEPSEEK_V41_ENGRAM_CPU_OFFLOAD: bool = False
     TPU_DEEPSEEK_V41_ENGRAM_HBM: str = "auto"
     TPU_DEEPSEEK_V41_DECODE_FUSION: str = "auto"
+    TPU_DEEPSEEK_V41_BLOCKED_ROPE_GATHER: bool = True
+    TPU_DEEPSEEK_V41_QB_ROPE_EXACT_ROWS: bool = True
+    TPU_DEEPSEEK_V41_CSA2_DEEP_GATHER: bool = True
     TPU_K3_SP_PREFILL: bool = False
     TPU_INCREMENTAL_BLOCK_TABLE_UPLOAD: bool = True
     TPU_VERIFY_INCREMENTAL_BLOCK_TABLE: bool = False
@@ -405,6 +408,24 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "auto",
         ["auto", "off", "require"],
         case_sensitive=False,
+    ),
+    # Gather RoPE table rows (attention preprocessing, CSA2 inverse RoPE) as
+    # 256-row gathers when a step has 257..1024 rows
+    # (`rope_gather.by_row_blocks`). Data movement only; outputs unchanged.
+    "TPU_DEEPSEEK_V41_BLOCKED_ROPE_GATHER": env_bool(
+        "TPU_DEEPSEEK_V41_BLOCKED_ROPE_GATHER", default=True
+    ),
+    # Fused Q-B/RoPE at token counts that are not a multiple of 32 (the DSpark
+    # drafter's 240 rows): write only the real rows instead of slicing a padded
+    # [256, 64, 512] result. Same values (bit-exact).
+    "TPU_DEEPSEEK_V41_QB_ROPE_EXACT_ROWS": env_bool(
+        "TPU_DEEPSEEK_V41_QB_ROPE_EXACT_ROWS", default=True
+    ),
+    # CSA2 SparseCore word/scale gather: three staging slots in flight and
+    # DMA-zeroed invalid rows instead of two slots cleared by vector stores
+    # (csa2/cache.py). Gathered rows are unchanged.
+    "TPU_DEEPSEEK_V41_CSA2_DEEP_GATHER": env_bool(
+        "TPU_DEEPSEEK_V41_CSA2_DEEP_GATHER", default=True
     ),
     # Opt in to K3 TP32/EP32 sequence-parallel prefill.
     "TPU_K3_SP_PREFILL": env_bool("TPU_K3_SP_PREFILL", default=False),
