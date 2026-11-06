@@ -226,3 +226,40 @@ def test_ray_executor_raises_on_real_disagreement():
         pytest.raises(ValueError, match="workers disagree"),
     ):
         executor.get_kv_cache_specs()
+
+
+def _executor_and_parent(kind, engine_override, worker_overrides):
+    """An executor of each kind, and the vLLM class whose
+    determine_available_memory it extends."""
+    if kind == "multiproc":
+        return _make_executor(engine_override, worker_overrides), MultiprocExecutor
+    from vllm.v1.executor.ray_executor_v2 import RayExecutorV2
+
+    return _make_ray_executor(engine_override, worker_overrides), RayExecutorV2
+
+
+@pytest.mark.parametrize("kind", ["multiproc", "ray_v2"])
+def test_adopts_the_count_workers_set_after_the_profile_run(kind):
+    """Compact-mamba sizing sets the workers' count in determine_available_memory,
+    after their profile run, so get_kv_cache_specs found none to copy; every
+    executor must copy it after determine_available_memory."""
+    executor, parent = _executor_and_parent(kind, None, [5310, 5312])
+
+    with patch.object(parent, "determine_available_memory", return_value=[1 << 30]):
+        assert executor.determine_available_memory() == [1 << 30]
+
+    executor.collective_rpc.assert_called_once_with("get_num_gpu_blocks_override")
+    assert executor.vllm_config.cache_config.num_gpu_blocks_override == 5310
+
+
+@pytest.mark.parametrize("kind", ["multiproc", "ray_v2"])
+def test_engine_override_is_kept_after_the_profile_run(kind):
+    """A count the engine already has (--num-gpu-blocks-override, or one copied
+    in get_kv_cache_specs) is not queried again."""
+    executor, parent = _executor_and_parent(kind, 1234, [5310, 5312])
+
+    with patch.object(parent, "determine_available_memory", return_value=[1 << 30]):
+        executor.determine_available_memory()
+
+    executor.collective_rpc.assert_not_called()
+    assert executor.vllm_config.cache_config.num_gpu_blocks_override == 1234

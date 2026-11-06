@@ -44,6 +44,11 @@ class TpuMultiprocExecutor(MultiprocExecutor):
         adopt_worker_num_gpu_blocks_override(self)
         return specs
 
+    def determine_available_memory(self) -> list[int]:
+        available = super().determine_available_memory()
+        adopt_worker_num_gpu_blocks_override(self)
+        return available
+
     def initialize_from_config(self, kv_cache_configs: list[KVCacheConfig]) -> None:
         super().initialize_from_config(kv_cache_configs)
         # Per-shape H2D prewarm: each shape is its own collective_rpc call with
