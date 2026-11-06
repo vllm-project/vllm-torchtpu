@@ -209,6 +209,8 @@ def _detect_target_tpu() -> str:
     The artifact's kernels are tuned for one generation, so an export that
     cannot tell which one it runs on fails instead of guessing.
     """
+    from jax.experimental.pallas import tpu as pltpu
+
     from vllm_torchtpu import tpu_info
 
     accelerator_type = tpu_info.get_tpu_type()
@@ -217,7 +219,15 @@ def _detect_target_tpu() -> str:
             "Cannot detect the TPU generation (neither TPU_ACCELERATOR_TYPE nor "
             "the GCE metadata accelerator-type is available); pass --target-tpu."
         )
-    return str(tpu_info.get_chip_version(accelerator_type).value)
+    name = accelerator_type.strip().lower().split("-")[0].removeprefix("tpu")
+    name = {"v5litepod": "v5e", "v7x": "7x"}.get(name, name)
+    try:
+        return str(pltpu.ChipVersion(name).value)
+    except ValueError as e:
+        raise RuntimeError(
+            f"Unrecognized TPU accelerator type {accelerator_type!r}; "
+            "pass --target-tpu."
+        ) from e
 
 
 @trace("export.build_export_config")
