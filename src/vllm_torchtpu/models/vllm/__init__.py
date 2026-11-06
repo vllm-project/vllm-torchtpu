@@ -11,6 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import os
+
 from vllm.model_executor.models.config import VerifyAndUpdateConfig
 
 from vllm_torchtpu.gqa_head_padding import update_gqa_head_padding_config
@@ -64,3 +66,7 @@ def register_models() -> None:
     MODELS_CONFIG_MAP["Qwen4ExpForCausalLM"] = TPUQwen4ExpConfig
     MODELS_CONFIG_MAP["Qwen4ExpForConditionalGeneration"] = TPUQwen4ExpConfig
     MODELS_CONFIG_MAP["Qwen2ForCausalLM"] = _TPUQwen2Config
+    # TPU-native Qwen3MoeForCausalLM; opt in per run, the built-in stays the default.
+    ModelRegistry.register_model("TPUQwen3MoeForCausalLM", "vllm_torchtpu.models.vllm.qwen3_moe_tpu:TPUQwen3MoeForCausalLM")
+    if os.environ.get("VLLM_TORCHTPU_NATIVE_MODELS", "0") == "1":
+        ModelRegistry.register_model("Qwen3MoeForCausalLM", "vllm_torchtpu.models.vllm.qwen3_moe_tpu:TPUQwen3MoeForCausalLM")
