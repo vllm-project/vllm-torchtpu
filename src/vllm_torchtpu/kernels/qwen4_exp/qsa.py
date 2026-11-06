@@ -16,6 +16,7 @@
 import jax
 import jax.numpy as jnp
 
+from .rope import select_rope_rows
 from .rounding import bf16
 
 
@@ -28,11 +29,11 @@ def gemma_norm(x, weight, norm_eps):
     )
 
 
-def _rope_parts(x, positions, cache, rotary_dim):
+def _rope_parts(x, positions, cache, rotary_dim, rope_axes=None):
     # Gather complete aligned rows before slicing the logical cos/sin values.
     # Folding the slice into the gather lowers to serial partial-row reads;
     # a [positions, 2, half] owner instead incurs a whole-table layout copy.
-    rows = jax.lax.optimization_barrier(cache[positions])
+    rows = select_rope_rows(positions, cache, rotary_dim, rope_axes)
     half = rotary_dim // 2
     cs = rows[:, :rotary_dim].reshape(len(x), 2, half).astype(jnp.float32)
     shape = (len(x),) + (1,) * (x.ndim - 2) + (half,)
@@ -44,17 +45,17 @@ def _rope_parts(x, positions, cache, rotary_dim):
     )
 
 
-def main_rope(x, positions, cache, rotary_dim):
+def main_rope(x, positions, cache, rotary_dim, rope_axes=None):
     """Main rotary uses promoted BF16 trig and FP32 two-product arithmetic."""
-    a, b, c, s = _rope_parts(x, positions, cache, rotary_dim)
+    a, b, c, s = _rope_parts(x, positions, cache, rotary_dim, rope_axes)
     return jnp.concatenate(
         [bf16(a * c - b * s), bf16(b * c + a * s), x[..., rotary_dim:]], -1
     )
 
 
-def index_rope(x, positions, cache, rotary_dim):
+def index_rope(x, positions, cache, rotary_dim, rope_axes=None):
     """FP32 outer arithmetic with BF16 inner products and BF16 outputs."""
-    a, b, c, s = _rope_parts(x, positions, cache, rotary_dim)
+    a, b, c, s = _rope_parts(x, positions, cache, rotary_dim, rope_axes)
     return jnp.concatenate(
         [
             bf16(a * c - bf16(b * s)),
@@ -66,7 +67,18 @@ def index_rope(x, positions, cache, rotary_dim):
 
 
 def produce(
-    qgate, key, value, index_qk, nq, nk, niq, positions, trig, norm_eps, rotary_dim
+    qgate,
+    key,
+    value,
+    index_qk,
+    nq,
+    nk,
+    niq,
+    positions,
+    trig,
+    norm_eps,
+    rotary_dim,
+    rope_axes=None,
 ):
     head_dim, index_dim = nq.shape[0], niq.shape[0]
     qgate = qgate.reshape(len(qgate), qgate.shape[1] // (2 * head_dim), 2 * head_dim)
@@ -76,12 +88,20 @@ def produce(
     from .tuned_block_sizes import use_query_prepare
 
     if use_query_prepare(qgate, nq, trig, rotary_dim):
-        q = prepare_query_values(qgate, nq, positions, trig, norm_eps, rotary_dim)
+        q = prepare_query_values(
+            qgate, nq, positions, trig, norm_eps, rotary_dim, rope_axes
+        )
     else:
         q = main_rope(
-            gemma_norm(qgate[..., :head_dim], nq, norm_eps), positions, trig, rotary_dim
+            gemma_norm(qgate[..., :head_dim], nq, norm_eps),
+            positions,
+            trig,
+            rotary_dim,
+            rope_axes,
         )
-    key = main_rope(gemma_norm(key, nk, norm_eps), positions, trig, rotary_dim)
+    key = main_rope(
+        gemma_norm(key, nk, norm_eps), positions, trig, rotary_dim, rope_axes
+    )
     index_heads = index_qk.shape[1] // index_dim - 1
     iq = index_rope(
         gemma_norm(
@@ -92,6 +112,7 @@ def produce(
         positions,
         trig,
         rotary_dim,
+        rope_axes,
     )
     return q, key, value, qgate[..., head_dim:], iq, index_qk[:, -index_dim:]
 
@@ -123,6 +144,7 @@ def _indexer_updates(
     compress_ratio,
     norm_eps,
     rotary_dim,
+    rope_axes=None,
 ):
     count = len(raw)
     req, logical, valid = _token_metadata(count, starts, context, slots)
@@ -139,17 +161,24 @@ def _indexer_updates(
     )
     pooled = bf16(jnp.mean(joined.astype(jnp.float32), axis=1))
     first_index = starts[req] + group_start - context[req]
-    old_position = tags[safe_slots[req], group_start % ratio, 0]
+    axial = positions.ndim == 2
+    token_positions = positions.T if axial else positions[:, None]
+    axes = token_positions.shape[1]
+    if tags.shape[-1] != axes + 1:
+        raise ValueError("Indexer tags do not match the position-axis state ABI")
+    old_position = tags[safe_slots[req], group_start % ratio, :axes]
     first_position = jnp.where(
-        first_index >= starts[req],
-        positions[jnp.clip(first_index, 0, count - 1)],
+        (first_index >= starts[req])[:, None],
+        token_positions[jnp.clip(first_index, 0, count - 1)],
         old_position,
     )
+    first_position = first_position.T if axial else first_position[:, 0]
     completed = index_rope(
         gemma_norm(pooled, norm_k, norm_eps),
         jnp.maximum(first_position, 0),
         trig,
         rotary_dim,
+        rope_axes,
     )
     complete = valid & (logical % ratio == ratio - 1)
 
@@ -165,8 +194,8 @@ def _indexer_updates(
     old_tags = jnp.where((context > 0)[:, None, None], old_tags, -1)
     new_lane = (lanes < ratio) & (last >= context[:, None]) & (last < end[:, None])
     rr = jnp.where(new_lane[..., None], raw[jnp.clip(local, 0, count - 1)], old_ring)
-    pp = positions[jnp.clip(local, 0, count - 1)]
-    tag_pairs = jnp.stack([pp, jnp.zeros_like(pp)], -1)
+    pp = token_positions[jnp.clip(local, 0, count - 1)]
+    tag_pairs = jnp.concatenate([pp, jnp.zeros((*pp.shape[:-1], 1), pp.dtype)], -1)
     tt = jnp.where(new_lane[..., None], tag_pairs, old_tags)
     dest = jnp.where((lengths > 0) & (slots >= 0), slots, ring.shape[0])
     ring = ring.at[dest].set(rr, mode="drop")

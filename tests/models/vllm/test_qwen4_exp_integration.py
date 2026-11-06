@@ -50,9 +50,16 @@ def test_qwen4_exp_is_registered(arch, monkeypatch):
     monkeypatch.setattr(ModelRegistry, "models", dict(ModelRegistry.models))
     monkeypatch.setitem(MODELS_CONFIG_MAP, arch, MODELS_CONFIG_MAP.get(arch))
     register_models()
-    assert (
-        ModelRegistry.models[arch].load_model_cls() is qwen4_model.Qwen4ExpForCausalLM
+    from vllm_torchtpu.models.vllm.qwen4_exp.multimodal import (
+        Qwen4ExpForConditionalGeneration,
     )
+
+    expected = (
+        Qwen4ExpForConditionalGeneration
+        if arch.endswith("ConditionalGeneration")
+        else qwen4_model.Qwen4ExpForCausalLM
+    )
+    assert ModelRegistry.models[arch].load_model_cls() is expected
     assert MODELS_CONFIG_MAP[arch] is TPUQwen4ExpConfig
     assert arch in POOLED_GDN_ARCHITECTURES
 

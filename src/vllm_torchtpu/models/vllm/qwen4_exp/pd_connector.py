@@ -155,7 +155,11 @@ class Qwen4ExpRaidenWorker(TPURaidenConnectorWorker):
         if not self._raiden_stage3_enabled():
             raise ValueError("Qwen PD requires the Raiden Stage-3 transport")
         self._validate_stage3_transfer_parallelism(self._raiden_transfer_parallelism())
-        manifest = build_transfer_manifest(cache.native_config, cache.materialized)
+        manifest = build_transfer_manifest(
+            cache.native_config,
+            cache.materialized,
+            index_tag_fields=cache.layout.index_tag_fields,
+        )
         verify_storage_binding(
             manifest, self.named_kv_caches, runner.kv_cache_raw_tensors
         )

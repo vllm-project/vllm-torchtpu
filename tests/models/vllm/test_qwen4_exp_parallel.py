@@ -30,6 +30,7 @@ def config(tp=1, dp=8):
     text = q4exp_text_config()
     return NS(
         model_config=NS(
+            multimodal_config=None,
             hf_text_config=text,
             hf_config=PretrainedConfig.from_dict(
                 {

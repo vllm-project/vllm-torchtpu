@@ -54,7 +54,7 @@ from vllm_torchtpu.layers.adapter.quantization.unquantized import (
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
 
 from .config import require_unified_pool
-from .qsa_geometry import validate_qsa_geometry
+from .qsa_geometry import rope_axis_assignment, validate_qsa_geometry
 
 
 @dataclass(frozen=True)
@@ -95,7 +95,13 @@ def get_qsa_cache_specs(config, tp_size, cache_dtype):
     # 8192 B/slot covers the observed T(2,128)/T(8,128) tag layouts for
     # 2..65 slots. Retain that placement allowance and budget larger raw
     # payloads explicitly; actual TPU allocation remains independently checked.
-    ring_bytes = max(8192, ring_rows * (((index_dim + 127) // 128 * 128) * 2 + 8))
+    axes = rope_axis_assignment(
+        config.rope_parameters, int(head_dim * config.partial_rotary_factor)
+    )
+    tag_fields = 4 if axes is not None else 2
+    ring_bytes = max(
+        8192, ring_rows * (((index_dim + 127) // 128 * 128) * 2 + 4 * tag_fields)
+    )
     main = FullAttentionSpec(
         block_size=QSA_BLOCK_SIZE,
         num_kv_heads=max(int(config.num_key_value_heads) // tp_size, 1),
@@ -315,9 +321,15 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
         self.register_buffer("output_weight_tiles", None, persistent=False)
         self.register_buffer("k_norm_multiplier", None, persistent=False)
         self._loaded: set[str] = set()
+        self.rope_axes = rope_axis_assignment(
+            config.rope_parameters,
+            int(self.head_dim * self.config.partial_rotary_factor),
+        )
         self._op = partial(
             build_compact_pooled_qsa_op(
-                topk_backend=self.topk_backend, topk_backend_key=self.topk_backend_key
+                topk_backend=self.topk_backend,
+                topk_backend_key=self.topk_backend_key,
+                rope_axes=self.rope_axes,
             ),
             compress_ratio=self.compress_ratio,
             token_topk=self.token_topk,
@@ -467,6 +479,7 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
                     topk_backend=self.topk_backend,
                     topk_backend_key=self.topk_backend_key,
                     project_output=True,
+                    rope_axes=self.rope_axes,
                 ),
                 compress_ratio=self.compress_ratio,
                 token_topk=self.token_topk,

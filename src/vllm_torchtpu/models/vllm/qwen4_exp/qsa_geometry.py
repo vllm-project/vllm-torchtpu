@@ -14,7 +14,8 @@
 """Shared QSA projection and compression geometry checks."""
 
 import math
-from typing import TYPE_CHECKING
+from collections.abc import Mapping
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from transformers.models.qwen4_exp.configuration_qwen4_exp import Qwen4ExpTextConfig
@@ -75,6 +76,7 @@ def validate_qsa_geometry(
     rope = config.rope_parameters
     if rope is None:
         raise ValueError("QSA requires RoPE parameters")
+    rope_axis_assignment(rope, rotary_dim)
     theta = rope["rope_theta"]
     epsilon = config.rms_norm_eps
     if (
@@ -88,3 +90,22 @@ def validate_qsa_geometry(
         raise ValueError("QSA RoPE theta and norm epsilon must be finite and positive")
     if cache_dtype in ("fp8", "fp8_e4m3") and head_dim % 2:
         raise ValueError("QSA FP8 cache requires an even head_dim")
+
+
+def rope_axis_assignment(
+    parameters: Mapping[str, Any], rotary_dim: int
+) -> tuple[int, ...] | None:
+    """Select each rotary frequency's temporal/height/width coordinate."""
+    sections = parameters.get("mrope_section")
+    if sections is None:
+        return None
+    half = rotary_dim // 2
+    if len(sections) != 3 or sum(sections) != half or min(sections) < 0:
+        raise ValueError("MRoPE sections must partition the rotary frequencies")
+    if parameters.get("mrope_interleaved", False):
+        axes = [0] * half
+        for axis in (1, 2):
+            for frequency in range(axis, min(half, sections[axis] * 3), 3):
+                axes[frequency] = axis
+        return tuple(axes)
+    return tuple(axis for axis, count in enumerate(sections) for _ in range(count))

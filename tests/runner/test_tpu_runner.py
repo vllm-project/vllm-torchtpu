@@ -86,6 +86,36 @@ def test_idle_dp_rank_encodes_before_decoder_pairing():
     assert order == ["encoder", ("decoder", 8), ("decoder", 8), ("draft", 2)]
 
 
+@pytest.mark.parametrize("modality", ["image", "video", "audio"])
+def test_coordinated_encoder_uses_manager_modality_contract(monkeypatch, modality):
+    manager = MagicMock()
+    manager.supports_modality.side_effect = lambda name: name in ("image", "video")
+    output = torch.ones(2, 3)
+    manager.execute_dp_coordinated.return_value = [output]
+    kwargs = {"pixels": torch.zeros(8, 2)}
+    scheduler = SimpleNamespace(ec_manager_metadata=None, free_encoder_mm_hashes=[])
+    runner = SimpleNamespace(
+        _dp_step_has_encoder_inputs=True,
+        encoder_cudagraph_manager=manager,
+        lora_config=None,
+        device=torch.device("cpu"),
+        _batch_mm_inputs_from_scheduler=lambda _: (["item"], [(modality, {})], []),
+        _cache_encoder_output=MagicMock(),
+    )
+    monkeypatch.setattr(tpu_runner, "synchronize_tensors", MagicMock())
+    monkeypatch.setattr(
+        tpu_runner, "group_and_batch_mm_kwargs", lambda *a, **kw: [(0, 1, kwargs)]
+    )
+    TPUModelRunner._execute_dp_mm_encoder(runner, scheduler)
+    if modality in ("image", "video"):
+        manager.execute_dp_coordinated.assert_called_once_with(kwargs, input_error=None)
+        runner._cache_encoder_output.assert_called_once_with("item", output, None, [])
+    else:
+        args, kw = manager.execute_dp_coordinated.call_args
+        assert args == (None,)
+        assert "supported modalities" in kw["input_error"]
+
+
 def test_spec_warmup_all_token_ids_matches_current_sequence_lengths():
     all_token_ids = tpu_runner._spec_warmup_all_token_ids(
         ["request-0", "request-1"], [7, 12]

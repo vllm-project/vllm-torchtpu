@@ -47,6 +47,7 @@ def build_compact_pooled_qsa_op(
     topk_backend: TopKBackend | None = None,
     topk_backend_key: str | None = None,
     project_output: bool = False,
+    rope_axes: tuple[int, ...] | None = None,
 ):
     """Bind a selector under a stable persisted-graph identity.
 
@@ -58,7 +59,7 @@ def build_compact_pooled_qsa_op(
     """
     sc_min_context = envs.environment_variables["VLLM_TPU_QSA_SC_MIN_CONTEXT"]()
     return _build_compact_pooled_qsa_op(
-        topk_backend, topk_backend_key, project_output, sc_min_context
+        topk_backend, topk_backend_key, project_output, sc_min_context, rope_axes
     )
 
 
@@ -68,15 +69,19 @@ def _build_compact_pooled_qsa_op(
     topk_backend_key: str | None,
     project_output: bool,
     sc_min_context: int | None,
+    rope_axes: tuple[int, ...] | None,
 ):
     kind = "compact_pooled_qsa_projected_v2" if project_output else "compact_pooled_qsa"
     if sc_min_context is not None:
         suffix = hashlib.sha256(str(sc_min_context).encode("utf-8")).hexdigest()
         kind += f"_sc_min_context_{suffix}"
+    if rope_axes is not None:
+        kind += "_mrope_" + hashlib.sha256(repr(rope_axes).encode()).hexdigest()
     core = functools.partial(
         compact_pooled_qsa_step,
         topk_backend=topk_backend,
         sc_min_context=sc_min_context,
+        rope_axes=rope_axes,
     )
     op = pallas.jax_op(
         _op_name(kind, topk_backend, topk_backend_key),

@@ -61,11 +61,19 @@ def test_preparation_depends_on_compute_layout_not_serving_capacity(
 
 @pytest.mark.tpu_test
 @pytest.mark.parametrize("rope_rows", [128, 65536])
-def test_prepared_producer_matches_original_values_for_other_rope_capacities(rope_rows):
+@pytest.mark.parametrize("axial", [False, True])
+def test_prepared_producer_matches_original_values_for_other_rope_capacities(
+    rope_rows, axial
+):
     import torch
+
+    # Each static operator pair is an independent compilation experiment.
+    torch._dynamo.reset()
     from torch_tpu._internal import pallas
 
     from vllm_torchtpu.kernels.qwen4_exp.qsa import produce
+
+    rope_axes = tuple([0, 1, 2] * 10 + [0, 1]) if axial else None
 
     def build(prepared):
         def core(
@@ -92,10 +100,15 @@ def test_prepared_producer_matches_original_values_for_other_rope_capacities(rop
                     trig,
                     1e-6,
                     64,
+                    rope_axes,
                 )
-            return produce(q, k, v, iqk, nq, nk, niq, positions, trig, 1e-6, 64)
+            return produce(
+                q, k, v, iqk, nq, nk, niq, positions, trig, 1e-6, 64, rope_axes
+            )
 
-        op = pallas.jax_op(f"qsa_prepare_test::producer_{rope_rows}_{prepared}", core)
+        op = pallas.jax_op(
+            f"qsa_prepare_test::producer_{rope_rows}_{prepared}_{axial}", core
+        )
 
         @op.register_fake
         def fake(q, k, v, iqk, nq, nk, niq, positions, trig):
@@ -123,7 +136,10 @@ def test_prepared_producer_matches_original_values_for_other_rope_capacities(rop
         torch.randn(s, generator=generator).bfloat16().to("tpu")
         for s in [(16, 12288), (16, 512), (16, 512), (16, 640), (256,), (256,), (128,)]
     ]
-    positions = torch.linspace(0, rope_rows - 1, 16).int().to("tpu")
+    positions = torch.linspace(0, rope_rows - 1, 16).int()
+    if axial:
+        positions = torch.stack([positions, positions.roll(1), positions.roll(2)])
+    positions = positions.to("tpu")
     trig = torch.randn((rope_rows, 128), generator=generator).bfloat16().to("tpu")
     inputs += [positions, trig]
     with torch.inference_mode():

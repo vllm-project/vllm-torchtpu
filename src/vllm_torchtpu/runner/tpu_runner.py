@@ -3625,7 +3625,10 @@ class TPUModelRunner(GPUModelRunner):
                 is_multimodal=is_mm_embed,
             )
 
-            return None, inputs_embeds
+            return (
+                input_ids if self.model.requires_raw_input_tokens else None,
+                inputs_embeds,
+            )
         else:
             # For text-only models, we use token ids as input.
             # While it is possible to use embeddings as input just like the
@@ -3797,9 +3800,12 @@ class TPUModelRunner(GPUModelRunner):
                     scheduler_output
                 )
                 if mm_kwargs:
-                    if self.lora_config or any(m != "image" for m, _ in mm_kwargs):
+                    if self.lora_config or any(
+                        not manager.supports_modality(m) for m, _ in mm_kwargs
+                    ):
                         raise ValueError(
-                            "Coordinated encoding supports images without LoRA"
+                            "Coordinated encoding requires supported modalities "
+                            "without LoRA"
                         )
                     batches = list(
                         group_and_batch_mm_kwargs(
@@ -3808,7 +3814,7 @@ class TPUModelRunner(GPUModelRunner):
                     )
                     if len(batches) != 1:
                         raise ValueError(
-                            "Coordinated encoding requires one image batch"
+                            "Coordinated encoding requires one modality batch"
                         )
                     kwargs = batches[0][2]
         except (KeyError, TypeError, ValueError) as exc:

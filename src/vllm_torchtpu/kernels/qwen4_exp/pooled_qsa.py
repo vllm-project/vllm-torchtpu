@@ -642,6 +642,7 @@ def compact_pooled_qsa_step(
     *,
     topk_backend: TopKBackend | None = None,
     sc_min_context: int | None = None,
+    rope_axes: tuple[int, ...] | None = None,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
     # Keep the persisted custom-op parameter name while naming its main owner.
     main_pool = pool
@@ -688,6 +689,7 @@ def compact_pooled_qsa_step(
             trig,
             norm_eps,
             rotary_dim,
+            rope_axes,
         )
     else:
         q, k, v, gate, iq, raw = produce(
@@ -702,6 +704,7 @@ def compact_pooled_qsa_step(
             trig,
             norm_eps,
             rotary_dim,
+            rope_axes,
         )
     # Native allocation supplies an owner for every nonempty query row;
     # padded/idle rows have empty query ranges. Keep lengths independent of
@@ -726,6 +729,7 @@ def compact_pooled_qsa_step(
     # VMEM padding of those typed views is independently handled by lowering.
     ring_rows = (compress_ratio + 7) // 8 * 8
     ring_elements = ring_rows * raw.shape[-1]
+    tag_fields = (positions.shape[0] if positions.ndim == 2 else 1) + 1
     fused_state = use_decode_state_fusion(
         raw, index_pool, requests=len(context), ratio=compress_ratio
     )
@@ -747,6 +751,7 @@ def compact_pooled_qsa_step(
             norm_eps=norm_eps,
             rotary_dim=rotary_dim,
             rotate=not defer_rope,
+            rope_axes=rope_axes,
         )
         if defer_rope:
             assert len(state_result) == 3
@@ -754,17 +759,21 @@ def compact_pooled_qsa_step(
             if use_completed_rope_dma(trig, first_positions):
                 compressed_positions = first_positions
             else:
-                trig_rows = jax.lax.optimization_barrier(trig[first_positions])
+                from .rope import select_rope_rows
+
+                trig_rows = select_rope_rows(
+                    first_positions, trig, rotary_dim, rope_axes
+                )
         else:
             assert len(state_result) == 2
             index_pool, completed = state_result
         complete = valid & (logical % compress_ratio == compress_ratio - 1)
     else:
         ring, tags = read_ring_and_tags(
-            index_pool, ring_ids, ring_elements, ring_rows * 2
+            index_pool, ring_ids, ring_elements, ring_rows * tag_fields
         )
         ring = ring.reshape(len(ring_ids), ring_rows, -1)
-        tags = tags.reshape(len(ring_ids), ring_rows, 2)
+        tags = tags.reshape(len(ring_ids), ring_rows, tag_fields)
         completed, complete, req, logical, ring, tags = _indexer_updates(
             raw,
             positions,
@@ -778,6 +787,7 @@ def compact_pooled_qsa_step(
             compress_ratio,
             norm_eps,
             rotary_dim,
+            rope_axes,
         )
         pending_state = (ring, tags)
     index_pool = write_compressed(

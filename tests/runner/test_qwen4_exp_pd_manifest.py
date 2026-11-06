@@ -31,6 +31,9 @@ from vllm_torchtpu.models.vllm.qwen4_exp.pool_layout import pooled_cache_specs
 
 def live_pool(tp=1, device="cpu", num_blocks=64, ssm="bfloat16", **text_overrides):
     cfg = pool_config(tp=tp, ssm=ssm)
+    # These are normalized text-only pool/transfer fixtures.
+    cfg.model_config.hf_text_config.rope_parameters.pop("mrope_section", None)
+    cfg.model_config.hf_text_config.rope_parameters.pop("mrope_interleaved", None)
     for key, value in text_overrides.items():
         setattr(cfg.model_config.hf_text_config, key, value)
     cfg.cache_config.enable_prefix_caching = False

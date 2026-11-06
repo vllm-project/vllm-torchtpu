@@ -21,6 +21,8 @@ from jax.experimental.pallas import tpu as pltpu
 from vllm_torchtpu.kernels.qwen4_exp.qsa import gemma_norm
 from vllm_torchtpu.kernels.qwen4_exp.rounding import bf16
 
+from .rope import select_rope_rows
+
 
 def prepare_query_reader_layout(
     qgate: jax.Array,
@@ -29,10 +31,11 @@ def prepare_query_reader_layout(
     trig: jax.Array,
     norm_eps: float,
     rotary_dim: int,
+    rope_axes: tuple[int, ...] | None = None,
 ) -> jax.Array:
     count, heads, doubled = qgate.shape
     width = doubled // 2
-    selected = jax.lax.optimization_barrier(trig[positions])
+    selected = select_rope_rows(positions, trig, rotary_dim, rope_axes)
     shape = (2, count, heads // 2, 1, width)
     kv_heads = 2
     assert (count, heads, width) == (16, 24, 256)

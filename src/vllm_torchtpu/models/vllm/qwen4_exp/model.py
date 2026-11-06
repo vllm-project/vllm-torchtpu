@@ -332,7 +332,7 @@ class Qwen4ExpDecoderLayer(nn.Module):
 @support_torch_compile(
     dynamic_arg_dims={
         "input_ids": 0,
-        "positions": 0,
+        "positions": -1,
         "inputs_embeds": 0,
         "valid_tokens": 0,
     }
@@ -510,6 +510,10 @@ class Qwen4ExpForCausalLM(nn.Module, HasInnerState, IsHybrid):
 
     def forward(self, input_ids, positions, inputs_embeds=None, **kwargs):
         return self.model(input_ids, positions, inputs_embeds, **kwargs)
+
+    def get_language_model(self) -> "Qwen4ExpForCausalLM":
+        """Return the native owner of decoder layers and persistent state."""
+        return self
 
     def embed_input_ids(self, input_ids):
         return self.model.embed_tokens(input_ids)

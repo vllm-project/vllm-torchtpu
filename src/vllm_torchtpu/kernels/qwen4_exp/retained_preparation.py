@@ -20,6 +20,7 @@ from jax.experimental.pallas import tpu as pltpu
 from .preparation_candidates import norm_with_multiplier, prepare_index_query
 from .qsa import main_rope
 from .query_reader_prepare import prepare_query_reader_layout
+from .rope import select_rope_rows
 from .tuned_block_sizes import _hardware
 
 
@@ -70,15 +71,22 @@ def produce_prepared(
     trig: jax.Array,
     norm_eps: float,
     rotary_dim: int,
+    rope_axes: tuple[int, ...] | None = None,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
     width = nq.shape[0]
     qgate = qgate.reshape(len(qgate), -1, 2 * width)
     key = key.reshape(len(key), -1, width)
     value = value.reshape(len(value), -1, width)
-    q = prepare_query_reader_layout(qgate, nq, positions, trig, norm_eps, rotary_dim)
-    key = main_rope(
-        norm_with_multiplier(key, multiplier, norm_eps), positions, trig, rotary_dim
+    q = prepare_query_reader_layout(
+        qgate, nq, positions, trig, norm_eps, rotary_dim, rope_axes
     )
-    angles = jax.lax.optimization_barrier(trig[positions])
+    key = main_rope(
+        norm_with_multiplier(key, multiplier, norm_eps),
+        positions,
+        trig,
+        rotary_dim,
+        rope_axes,
+    )
+    angles = select_rope_rows(positions, trig, rotary_dim, rope_axes)
     iq = prepare_index_query(index_qk, niq, angles, norm_eps)
     return q, key, value, qgate[..., width:], iq, index_qk[:, -niq.shape[0] :]

@@ -21,6 +21,7 @@ from vllm.config.engram import EngramConfig
 from vllm.config.utils import config, get_hash_factors, hash_factors
 from vllm.model_executor.models.config import (
     Qwen4ExpForCausalLMConfig,
+    Qwen4ExpForConditionalGenerationConfig,
     VerifyAndUpdateConfig,
 )
 from vllm.v1.kv_cache_interface import KVCacheSpec
@@ -144,9 +145,12 @@ def native_cache_capacity(cfg, specs):
 class TPUQwen4ExpConfig(VerifyAndUpdateConfig):
     @staticmethod
     def verify_and_update_config(vllm_config):
-        # Reuse upstream's text/config normalization, including removal of
-        # mrope even though this class truthfully does not support vision.
-        Qwen4ExpForCausalLMConfig.verify_and_update_config(vllm_config)
+        normalizer = (
+            Qwen4ExpForCausalLMConfig
+            if vllm_config.model_config.multimodal_config is None
+            else Qwen4ExpForConditionalGenerationConfig
+        )
+        normalizer.verify_and_update_config(vllm_config)
         tile = envs.VLLM_TPU_HC_PREFILL_TILE
         validate_hc_prefill_mode("auto" if tile is None else tile, full_mix=True)
         validate_config(vllm_config)

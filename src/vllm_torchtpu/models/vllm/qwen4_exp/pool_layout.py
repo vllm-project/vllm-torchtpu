@@ -22,6 +22,7 @@ from vllm_torchtpu.gdn_pool_layout import derive_pooled_gdn_state_layout
 
 from .config import native_cache_specs
 from .qsa import QSA_BLOCK_SIZE, get_qsa_cache_specs
+from .qsa_geometry import rope_axis_assignment
 
 # Existing RPA/StreamIndex format ABI, independently checked against worker
 # TPUInfo. Sixteen BF16 rows cover both pinned small/large sublane layouts.
@@ -42,6 +43,7 @@ class Qwen4ExpPoolLayout:
     compressed_width: int
     main_page_bytes: int
     index_page_bytes: int
+    index_tag_fields: int = 2
 
     def validate_capacity(self, blocks: int) -> None:
         if blocks <= 0 or blocks * max(self.block_size, self.index_rows // 2) >= 2**31:
@@ -129,6 +131,12 @@ def pooled_cache_specs(cfg):
         compressed_width=width,
         main_page_bytes=main_bytes,
         index_page_bytes=index_bytes,
+        index_tag_fields=4
+        if rope_axis_assignment(
+            text.rope_parameters, int(text.head_dim * text.partial_rotary_factor)
+        )
+        is not None
+        else 2,
     )
     pooled: dict[str, KVCacheSpec] = {}
     mamba_mode = "align" if cfg.cache_config.enable_prefix_caching else "none"

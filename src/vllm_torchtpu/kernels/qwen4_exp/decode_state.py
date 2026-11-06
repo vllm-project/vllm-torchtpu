@@ -38,6 +38,7 @@ def update_decode_state(
     norm_eps: float,
     rotary_dim: int,
     rotate: bool = True,
+    rope_axes: tuple[int, ...] | None = None,
 ) -> tuple[jax.Array, jax.Array] | tuple[jax.Array, jax.Array, jax.Array]:
     """Update small request batches; return normalized/rotated completed keys.
 
@@ -47,8 +48,11 @@ def update_decode_state(
     """
     count, width = raw.shape
     ring_rows = (ratio + 7) // 8 * 8
+    axial = positions.ndim == 2
+    axes = positions.shape[0] if axial else 1
+    tag_fields = axes + 1
     ring_tokens, _ = region_rows(pool, ring_rows * width, jnp.bfloat16)
-    tag_tokens, tag_rows = region_rows(pool, ring_rows * 2, jnp.int32)
+    tag_tokens, tag_rows = region_rows(pool, ring_rows * tag_fields, jnp.int32)
     tokens = ring_tokens + tag_tokens
     # At most one nonempty request per query token. Its first token is a unique
     # DMA staging slot, even when active metadata rows are not a dense prefix.
@@ -101,7 +105,9 @@ def update_decode_state(
                 ring = jnp.where(old_context > 0, ring, 0)
                 words = jnp.arange(tag_rows * width).reshape(tag_rows, width)
                 tags = jnp.where(
-                    words < ring_rows * 2, jnp.where(old_context > 0, tags, -1), 0
+                    words < ring_rows * tag_fields,
+                    jnp.where(old_context > 0, tags, -1),
+                    0,
                 )
                 typed_ldst.store_typed(ring_ref, ring)
                 typed_ldst.store_typed(tag_ref, tags)
@@ -125,8 +131,14 @@ def update_decode_state(
                     ring = jnp.where(
                         jnp.arange(ring_rows)[:, None] == slot, raw_token, ring
                     )
-                    tags = jnp.where(words == 2 * slot, positions_ref[i], tags)
-                    tags = jnp.where(words == 2 * slot + 1, 0, tags)
+                    for axis in range(axes):
+                        coordinate = (
+                            positions_ref[axis, i] if axial else positions_ref[i]
+                        )
+                        tags = jnp.where(
+                            words == tag_fields * slot + axis, coordinate, tags
+                        )
+                    tags = jnp.where(words == tag_fields * slot + axes, 0, tags)
                     typed_ldst.store_typed(ring_ref, ring)
                     typed_ldst.store_typed(tag_ref, tags)
                     tags_ref[...] = jnp.where(
@@ -201,7 +213,9 @@ def update_decode_state(
         input_output_aliases={6: 0},
         name="qsa_decode_ring_update",
     )(ids, starts, context, positions, raw, norm, pool)
+    first_positions = first_tags[:, :axes].T if axial else first_tags[:, 0]
+    first_positions = jnp.maximum(first_positions, 0)
     if not rotate:
-        return pool, normalized, jnp.maximum(first_tags[:, 0], 0)
-    keys = index_rope(normalized, jnp.maximum(first_tags[:, 0], 0), trig, rotary_dim)
+        return pool, normalized, first_positions
+    keys = index_rope(normalized, first_positions, trig, rotary_dim, rope_axes)
     return pool, keys

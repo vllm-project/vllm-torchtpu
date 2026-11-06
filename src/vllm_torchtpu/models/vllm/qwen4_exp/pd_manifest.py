@@ -46,7 +46,10 @@ from .pd import build_transfer_groups
 
 
 def build_transfer_manifest(
-    config: KVCacheConfig, materialized: MaterializedKVCache
+    config: KVCacheConfig,
+    materialized: MaterializedKVCache,
+    *,
+    index_tag_fields: int = 2,
 ) -> PoolManifest:
     """Bind scheduler owners and co-owned compressed keys to live byte pages."""
     if materialized.bm_pool_layout is not None:
@@ -116,7 +119,11 @@ def build_transfer_manifest(
                         block_stride_bytes=page_bytes,
                         num_blocks=config.num_blocks,
                         regions=(RegionSpec("page", 0, page_bytes, page_bytes, 1),),
-                        dtype_tag=f"qwen4-{role}-{dtype}-page-v2",
+                        dtype_tag=(
+                            f"qwen4-{role}-{dtype}-page-v2"
+                            if role != "index" or index_tag_fields == 2
+                            else f"qwen4-{role}-{dtype}-page-v3-tags{index_tag_fields}"
+                        ),
                     )
                 )
     if referenced != set(range(len(storages))):

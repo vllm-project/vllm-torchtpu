@@ -115,3 +115,32 @@ def test_dummy_fa_table_uses_context_and_page_geometry(
         assert torch.count_nonzero(row[pages:]) == 0
         next_page += pages
     assert next_page <= adapter.cache.pages
+
+
+@pytest.mark.parametrize("idle", [False, True])
+def test_mm_dummy_and_idle_keep_three_axes_and_flat_raw_ids(monkeypatch, idle):
+    captured = {}
+    adapter = _make_adapter(
+        monkeypatch,
+        captured,
+        page_size=128,
+        context_limit=4096,
+        tokens=16,
+        requests=8,
+    )
+    adapter.config.rope_parameters["mrope_section"] = [11, 11, 10]
+    adapter.runner.uses_mrope = True
+    adapter.runner.supports_mm_inputs = True
+    adapter.runner._get_model_inputs = lambda ids, mm: (
+        ids,
+        torch.zeros((len(ids), 1)),
+    )
+    if idle:
+        adapter._idle_run(16, 8, 32, use_max_model_len=True, through_handoff=False)
+    else:
+        adapter.dummy_run(16, 8)
+    assert captured["positions"].shape == (3, 16)
+    assert captured["input_ids"].shape == (16,)
+    assert captured["inputs_embeds"].shape == (16, 1)
+    torch.testing.assert_close(captured["positions"][0], captured["positions"][1])
+    torch.testing.assert_close(captured["positions"][0], captured["positions"][2])

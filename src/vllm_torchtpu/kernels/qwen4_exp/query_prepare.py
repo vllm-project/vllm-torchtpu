@@ -21,11 +21,15 @@ from jax.experimental.pallas import tpu as pltpu
 from vllm_torchtpu.kernels.qwen4_exp.qsa import gemma_norm
 from vllm_torchtpu.kernels.qwen4_exp.rounding import bf16
 
+from .rope import select_rope_rows
 
-def prepare_query_values(qgate, norm, positions, trig, norm_eps, rotary_dim):
+
+def prepare_query_values(
+    qgate, norm, positions, trig, norm_eps, rotary_dim, rope_axes=None
+):
     count, heads, doubled = qgate.shape
     width = doubled // 2
-    selected = jax.lax.optimization_barrier(trig[positions])
+    selected = select_rope_rows(positions, trig, rotary_dim, rope_axes)
     shape = (count, heads, width)
     half = rotary_dim // 2
 

@@ -44,7 +44,8 @@ logger = init_logger(__name__)
 class Qwen4ExpPooledCache:
     def __init__(self, runner, model):
         require_unified_pool()
-        self.runner, self.model = runner, model
+        self.runner = runner
+        self.model = None if model is None else model.get_language_model()
         self.requested_blocks = runner.cache_config.num_gpu_blocks_override
         self.materialized = None
 
@@ -130,6 +131,7 @@ class Qwen4ExpPooledCache:
             runner.vllm_config, config, self.layout, runner.device
         )
         caches = self.materialized.kv_caches
+        assert self.model is not None, "Bind a native language model before allocation"
         for i, layer in enumerate(self.model.model.layers):
             prefix = f"model.layers.{i}"
             if layer.layer_type == "linear_attention":

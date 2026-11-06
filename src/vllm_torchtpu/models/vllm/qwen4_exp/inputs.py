@@ -202,6 +202,8 @@ class Qwen4ExpAdapter:
         positions_cpu = torch.nn.functional.pad(
             positions_cpu, (0, num_tokens - sum(lengths))
         )
+        if self.config.rope_parameters.get("mrope_section") is not None:
+            positions_cpu = positions_cpu[None].expand(3, -1).contiguous()
         tables_cpu = torch.zeros((num_reqs, columns), dtype=torch.int32, device="cpu")
         next_page = 1
         for i, q in enumerate(lengths):
@@ -266,6 +268,8 @@ class Qwen4ExpAdapter:
         context = torch.zeros(num_reqs, dtype=torch.int64, device=device)
         slots = torch.full((num_reqs,), -1, dtype=torch.int32, device=device)
         positions = torch.zeros(num_tokens, dtype=torch.int32, device=device)
+        if self.config.rope_parameters.get("mrope_section") is not None:
+            positions = positions[None].expand(3, -1).contiguous()
         table = torch.zeros(
             (num_reqs, columns),
             dtype=torch.int32,
@@ -291,7 +295,7 @@ class Qwen4ExpAdapter:
             valid_tokens=torch.zeros(num_tokens, dtype=torch.bool, device=device),
         )
         return self._dummy_forward(
-            torch.zeros_like(positions),
+            torch.zeros(num_tokens, dtype=torch.int32, device=device),
             positions,
             kwargs,
             metadata,
