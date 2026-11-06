@@ -20,7 +20,14 @@ that arrives behind it waits until that prefill ends. A scheduler built on
 ShortPromptsFirstScheduler keeps part of the step's budget for short waiting
 prompts and caps the chunks of running prefills at the budget left.
 
-ShortPrefillFirstScheduler (TPU_SHORT_PREFILL_FIRST_TOKENS) builds on it.
+Two schedulers use it:
+- ShortPrefillFirstScheduler (TPU_SHORT_PREFILL_FIRST_TOKENS) is the
+  standalone one: it promotes short prompts in arrival order and caps every
+  running prefill. Use it when nothing else picks the scheduler.
+- PrefixAwareScheduler with short prompts first (TPU_PREFIX_AWARE_SHORT_PROMPTS)
+  ranks short prompts by their uncached tokens, as its admission does, and
+  keeps the oldest long prefill's full chunk. Use it with prefix caching,
+  where PrefixAwareScheduler is the scheduler.
 """
 
 from collections.abc import Iterable

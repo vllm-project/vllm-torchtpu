@@ -109,6 +109,9 @@ def _make_scheduler(
 
     kvm = MagicMock()
     kvm.enable_caching = enable_caching
+    kvm.prefix_cache_lookup_enabled.side_effect = lambda request: (
+        enable_caching and not request.skip_reading_prefix_cache
+    )
     kvm.coordinator = coordinator
     s.kv_cache_manager = kvm
     return s
@@ -546,7 +549,12 @@ BUDGET = 192
 
 
 def make_scheduler(
-    follow: bool, num_blocks: int = 4000, max_model_len: int = 2048
+    follow: bool,
+    num_blocks: int = 4000,
+    max_model_len: int = 2048,
+    budget: int = BUDGET,
+    max_num_seqs: int = 8,
+    policy: str = "fcfs",
 ) -> PrefixAwareScheduler:
     model_config = ModelConfig(
         model="facebook/opt-125m",
@@ -556,8 +564,9 @@ def make_scheduler(
         max_model_len=max_model_len,
     )
     scheduler_config = SchedulerConfig(
-        max_num_seqs=8,
-        max_num_batched_tokens=BUDGET,
+        max_num_seqs=max_num_seqs,
+        max_num_batched_tokens=budget,
+        policy=policy,
         max_model_len=max_model_len,
         long_prefill_token_threshold=CHUNK,
         enable_chunked_prefill=True,
@@ -907,3 +916,260 @@ def test_finished_and_waiting_requests_leave_or_keep_their_entries():
     assert not scheduler._followers
     assert scheduler._num_rejoins == 1
     assert scheduler._num_followed_tokens == 4 * BLOCK
+
+
+# PrefixAwareScheduler with TPU_PREFIX_AWARE_SHORT_PROMPTS, driven one
+# finished step at a time. A step of two chunks, so two running long prefills
+# fill it; a prompt is short when it takes at most one full step from each.
+
+CHUNKS_PER_STEP = 2
+SHORT = CHUNKS_PER_STEP * CHUNKS_PER_STEP * CHUNK
+
+
+def short_first_scheduler(
+    monkeypatch,
+    on: bool = True,
+    follow: bool = False,
+    budget: int = CHUNKS_PER_STEP * CHUNK,
+    max_num_seqs: int = 8,
+) -> PrefixAwareScheduler:
+    monkeypatch.setenv("TPU_PREFIX_AWARE_SHORT_PROMPTS", "first" if on else "off")
+    return make_scheduler(follow, budget=budget, max_num_seqs=max_num_seqs)
+
+
+def add(scheduler, request_id: str, num_tokens: int, first_token: int = 0):
+    prompt = list(range(first_token, first_token + num_tokens))
+    scheduler.add_request(make_request(request_id, prompt))
+
+
+def step(scheduler) -> dict[str, int]:
+    """Schedule one step and finish it at once; the tokens each request got."""
+    out = scheduler.schedule()
+    req_ids = list(out.num_scheduled_tokens)
+    sampled = [[] if scheduler.requests[r].is_prefill_chunk else [7] for r in req_ids]
+    scheduler.update_from_output(
+        out,
+        ModelRunnerOutput(
+            req_ids=req_ids,
+            req_id_to_index={r: i for i, r in enumerate(req_ids)},
+            sampled_token_ids=sampled,
+        ),
+    )
+    return dict(out.num_scheduled_tokens)
+
+
+def two_long_prefills(scheduler):
+    add(scheduler, "long1", 480, first_token=20_000)
+    add(scheduler, "long2", 2000, first_token=30_000)
+    assert step(scheduler) == {"long1": CHUNK, "long2": CHUNK}
+
+
+def test_a_short_prompt_shares_the_step_with_two_long_prefills(monkeypatch):
+    off = short_first_scheduler(monkeypatch, on=False)
+    on = short_first_scheduler(monkeypatch)
+    for scheduler in (off, on):
+        two_long_prefills(scheduler)
+        add(scheduler, "short", 55, first_token=50_000)
+    assert step(off) == {"long1": CHUNK, "long2": CHUNK}
+    assert step(on) == {"long1": CHUNK, "long2": CHUNK - 55, "short": 55}
+
+
+@pytest.mark.parametrize(
+    ("budget", "limit"), [(2 * CHUNK, SHORT), (3 * CHUNK, 3 * 3 * CHUNK)]
+)
+def test_a_prompt_is_short_when_it_fits_in_a_long_prefills_step_of_steps(
+    monkeypatch, budget, limit
+):
+    scheduler = short_first_scheduler(monkeypatch, budget=budget)
+    assert scheduler.short_prompt_tokens == limit
+    assert short_first_scheduler(monkeypatch, on=False).short_prompt_tokens is None
+
+
+@pytest.mark.parametrize("budget", [CHUNK // 2, CHUNK, CHUNK + CHUNK // 2])
+def test_short_prompts_first_needs_a_step_of_two_chunks(monkeypatch, budget):
+    with pytest.raises(NotImplementedError, match="--long-prefill-token-threshold"):
+        short_first_scheduler(monkeypatch, budget=budget)
+
+
+def test_short_prompts_first_needs_the_fcfs_policy(monkeypatch):
+    monkeypatch.setenv("TPU_PREFIX_AWARE_SHORT_PROMPTS", "first")
+    with pytest.raises(NotImplementedError, match="FCFS"):
+        make_scheduler(False, policy="priority")
+
+
+def test_an_unknown_short_prompts_mode_is_refused(monkeypatch):
+    monkeypatch.setenv("TPU_PREFIX_AWARE_SHORT_PROMPTS", "sometimes")
+    with pytest.raises(ValueError, match="sometimes"):
+        make_scheduler(False)
+
+
+def test_long_prefills_alone_keep_the_whole_budget(monkeypatch):
+    scheduler = short_first_scheduler(monkeypatch)
+    two_long_prefills(scheduler)
+    assert step(scheduler) == {"long1": CHUNK, "long2": CHUNK}
+
+
+def test_a_waiting_long_prompt_gets_no_reservation(monkeypatch):
+    scheduler = short_first_scheduler(monkeypatch)
+    two_long_prefills(scheduler)
+    add(scheduler, "other", SHORT + 25, first_token=50_000)
+    assert step(scheduler) == {"long1": CHUNK, "long2": CHUNK}
+
+
+def test_a_short_prompt_keeps_its_chunks_after_its_first_step(monkeypatch):
+    scheduler = short_first_scheduler(monkeypatch)
+    two_long_prefills(scheduler)
+    add(scheduler, "short", 2 * CHUNK + 60, first_token=50_000)
+    assert step(scheduler) == {"long1": CHUNK, "short": CHUNK}
+    assert step(scheduler) == {"long1": CHUNK, "short": CHUNK}
+    assert step(scheduler) == {"long1": CHUNK, "long2": CHUNK - 60, "short": 60}
+
+
+def test_cached_tokens_do_not_count_toward_the_short_limit(monkeypatch):
+    scheduler = short_first_scheduler(monkeypatch)
+    add(scheduler, "warm", SHORT + 8 * BLOCK)
+    while "warm" in scheduler.requests:
+        step(scheduler)
+    two_long_prefills(scheduler)
+    add(scheduler, "turn", SHORT + 8 * BLOCK + 12)
+    assert step(scheduler) == {"long1": CHUNK, "long2": CHUNK - 12, "turn": 12}
+
+
+def test_blocks_the_last_step_cached_count_toward_the_short_limit(monkeypatch):
+    scheduler = short_first_scheduler(monkeypatch)
+    two_long_prefills(scheduler)
+    add(scheduler, "warm", SHORT)
+    while "warm" in scheduler.requests:
+        step(scheduler)
+    add(scheduler, "turn", SHORT + 200)
+    assert step(scheduler) == {"long1": CHUNK, "turn": CHUNK}
+
+
+def test_the_oldest_long_prefill_keeps_its_full_chunk(monkeypatch):
+    scheduler = short_first_scheduler(monkeypatch)
+    two_long_prefills(scheduler)
+    for i in range(3):
+        add(scheduler, f"s{i}", 47, first_token=50_000 + 100 * i)
+    assert step(scheduler) == {"long1": CHUNK, "long2": CHUNK - 47, "s0": 47}
+
+
+def test_fewest_uncached_tokens_go_first(monkeypatch):
+    scheduler = short_first_scheduler(monkeypatch)
+    two_long_prefills(scheduler)
+    add(scheduler, "big", 94, first_token=50_000)
+    add(scheduler, "small", 31, first_token=60_000)
+    assert step(scheduler) == {"long1": CHUNK, "long2": CHUNK - 31, "small": 31}
+
+
+def test_a_preempted_short_prompt_gets_the_reservation_first(monkeypatch):
+    scheduler = short_first_scheduler(monkeypatch)
+    two_long_prefills(scheduler)
+    add(scheduler, "preempted", 94, first_token=50_000)
+    add(scheduler, "small", 31, first_token=60_000)
+    scheduler.requests["preempted"].num_preemptions = 1
+    assert step(scheduler) == {"long1": CHUNK, "preempted": CHUNK}
+
+
+def test_a_long_prefill_resumed_a_step_later_stays_long(monkeypatch):
+    """A preempted prefill keeps the uncached tokens it had at admission when
+    it is resumed in a later step (vLLM resumes the requests it preempts
+    itself no earlier than the next step), so the tokens it has left later
+    on do not make it short."""
+    scheduler = short_first_scheduler(monkeypatch)
+    add(scheduler, "long1", 480, first_token=20_000)
+    add(scheduler, "resumed", SHORT + 2 * CHUNK + 16, first_token=30_000)
+    assert step(scheduler) == {"long1": CHUNK, "resumed": CHUNK}
+    resumed = scheduler.requests["resumed"]
+    scheduler.running.remove(resumed)
+    scheduler._preempt_request(resumed, time.monotonic())
+    scheduler._pause_state = PauseState.PAUSED_NEW
+    assert step(scheduler) == {"long1": CHUNK}
+    scheduler._pause_state = PauseState.UNPAUSED
+    for _ in range(2):
+        assert step(scheduler) == {"long1": CHUNK, "resumed": CHUNK}
+    assert resumed.num_tokens - resumed.num_computed_tokens < SHORT
+    add(scheduler, "short", 31, first_token=50_000)
+    assert step(scheduler) == {"long1": CHUNK, "resumed": CHUNK - 31, "short": 31}
+
+
+def test_a_failing_prefix_cache_lookup_raises_only_in_the_short_prompt_count(
+    monkeypatch,
+):
+    """The short-prompt count raises on a failed lookup instead of counting
+    the prompt as cold; admission ranking keeps its fallback to FCFS."""
+    scheduler = short_first_scheduler(monkeypatch)
+    add(scheduler, "r", 100)
+
+    def fail(block_hashes, max_cache_hit_length):
+        raise RuntimeError("lookup failed")
+
+    coordinator = scheduler.kv_cache_manager.coordinator
+    monkeypatch.setattr(coordinator, "find_longest_cache_hit", fail)
+    with pytest.raises(RuntimeError, match="lookup failed"):
+        scheduler._uncached_waiting_tokens(scheduler.requests["r"])
+    assert scheduler._prefix_warmth(scheduler.requests["r"]) == 0
+    assert scheduler._paw_scoring_broken is True
+
+
+def test_a_paused_scheduler_reserves_nothing(monkeypatch):
+    scheduler = short_first_scheduler(monkeypatch)
+    two_long_prefills(scheduler)
+    add(scheduler, "short", 55, first_token=50_000)
+    scheduler._pause_state = PauseState.PAUSED_NEW
+    assert step(scheduler) == {"long1": CHUNK, "long2": CHUNK}
+
+
+def test_no_free_sequence_slot_means_no_reservation(monkeypatch):
+    scheduler = short_first_scheduler(monkeypatch, max_num_seqs=2)
+    two_long_prefills(scheduler)
+    add(scheduler, "short", 16, first_token=50_000)
+    assert step(scheduler) == {"long1": CHUNK, "long2": CHUNK}
+
+
+@pytest.mark.parametrize("follow", [False, True])
+def test_every_prompt_token_is_computed_once(monkeypatch, follow):
+    rng = random.Random(0)
+    sizes = [2, 22, 59, CHUNK + 1, 156, SHORT, SHORT + 1, 937]
+    prompts = {f"r{i}": rng.choice(sizes) for i in range(24)}
+    scheduler = short_first_scheduler(monkeypatch, follow=follow, max_num_seqs=6)
+    computed = dict.fromkeys(prompts, 0)
+    pending = list(prompts.items())
+    for n in range(1000):
+        if pending and n % 2 == 0:
+            request_id, num_tokens = pending.pop(0)
+            add(
+                scheduler,
+                request_id,
+                num_tokens,
+                first_token=10_000 * int(request_id[1:]),
+            )
+        scheduled = step(scheduler)
+        assert sum(scheduled.values()) <= 2 * CHUNK
+        assert all(tokens <= CHUNK for tokens in scheduled.values())
+        for request_id, tokens in scheduled.items():
+            computed[request_id] += tokens
+        if not pending and not scheduler.requests:
+            break
+    assert computed == prompts
+    scheduler.schedule()
+    assert not scheduler._uncached_admitted
+    assert not scheduler._uncached_by_request
+
+
+def run_with_short_prompts_first(
+    monkeypatch, follow: bool, arrivals
+) -> tuple[Run, int]:
+    scheduler = short_first_scheduler(monkeypatch, follow=follow, budget=BUDGET)
+    return run_engine(follow, arrivals, scheduler=scheduler), scheduler._num_rejoins
+
+
+@pytest.mark.parametrize("seed", range(12))
+def test_short_prompts_first_keeps_followers_and_every_read_correct(monkeypatch, seed):
+    """Short prompts first caps a long prefill's chunk before the follower
+    check, so a capped prefill whose capped chunk is cached still follows."""
+    off, _ = run_with_short_prompts_first(monkeypatch, False, tree_arrivals(seed))
+    on, rejoins = run_with_short_prompts_first(monkeypatch, True, tree_arrivals(seed))
+    assert sum(on.computed.values()) <= sum(off.computed.values())
+    assert on.reads_checked > 0
+    if seed == 0:
+        assert rejoins > 0
