@@ -119,7 +119,6 @@ if TYPE_CHECKING:
     TPU_MOE_TP_DECODE_SHARED_META: bool = True
     USE_MOE_TP_DECODE_NVFP4_KERNEL: bool = False
     FUSED_MOE_PREFILL_NVFP4_KERNEL: bool = False
-    FUSED_MOE_PREFILL_NVFP4_MIN_TOKENS: int = 2048
     FUSED_MOE_PREFILL_NVFP4_ACT_MODE: str = "w4a16"
     RAGGED_GATHER_REDUCE_VERSION: str = "v2"
     USE_PHASED_PROFILER: bool = False
@@ -1211,24 +1210,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # TPU_MOE_SKIP_PADDED_TOKENS=1. Remove once the path is the default for
     # these layers or is folded into moe_tp_decode.
     "USE_MOE_TP_DECODE_NVFP4_KERNEL": env_bool("USE_MOE_TP_DECODE_NVFP4_KERNEL"),
-    # With USE_MOE_TP_DECODE_NVFP4_KERNEL: serve mixed / prefill buckets of at
-    # least FUSED_MOE_PREFILL_NVFP4_MIN_TOKENS tokens (and > 64) on admitted
-    # NVFP4 TP or EP x TP MoE layers with fused_moe_prefill_nvfp4 (Stage A,
-    # W4A16 default, code-size-aware rung count) inside the same jax_op instead
-    # of the GMM + shared-expert TP chain plus psum. Default off.
+    # With USE_MOE_TP_DECODE_NVFP4_KERNEL: serve mixed / prefill buckets at or
+    # above the mode's measured crossover (2048 tokens for w4a16, 512 for w4a8)
+    # on admitted NVFP4 TP or EP x TP MoE layers with fused_moe_prefill_nvfp4
+    # (Stage A) inside the same jax_op instead of the GMM + shared-expert TP
+    # chain plus psum. Default off.
     "FUSED_MOE_PREFILL_NVFP4_KERNEL": env_bool("FUSED_MOE_PREFILL_NVFP4_KERNEL"),
-    # Minimum bucket token count dispatched to fused_moe_prefill_nvfp4 when
-    # FUSED_MOE_PREFILL_NVFP4_KERNEL=1 (clamped above 64, the largest decode
-    # bucket; smaller n > 64 buckets keep the GMM + shared-expert TP chain, as
-    # W4A16 whole-expert streaming is slower than GMM at 512 and ties at 1024).
-    # Default 2048.
-    "FUSED_MOE_PREFILL_NVFP4_MIN_TOKENS": env_int(
-        "FUSED_MOE_PREFILL_NVFP4_MIN_TOKENS", 2048
-    ),
     # Activation mode for fused_moe_prefill_nvfp4 when
     # FUSED_MOE_PREFILL_NVFP4_KERNEL=1: "w4a16" (default, BF16 activations and
-    # BF16 x BF16 MXU dots) or "w4a8" (per-row FP8 activations and FP8 x FP8
-    # MXU dots, e.g. when lowering FUSED_MOE_PREFILL_NVFP4_MIN_TOKENS=512).
+    # BF16 x BF16 MXU dots at >= 2048 tokens) or "w4a8" (per-row FP8
+    # activations and FP8 x FP8 MXU dots at >= 512 tokens).
     "FUSED_MOE_PREFILL_NVFP4_ACT_MODE": env_with_choices(
         "FUSED_MOE_PREFILL_NVFP4_ACT_MODE", "w4a16", ["w4a16", "w4a8"]
     ),

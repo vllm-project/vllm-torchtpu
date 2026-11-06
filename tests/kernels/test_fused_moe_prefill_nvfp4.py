@@ -16,8 +16,7 @@ Covers:
            shared expert summed once across 8 ranks (never 2x under EP2xTP4),
            unaffected by ``routed_scale``.
       (3)  Non-tile-multiple ``T = 1000`` and ``T = 128``, NaN-poisoned padded
-           rows, gated & ungated shared expert, ``w2_n_chunk`` invariance, and
-           pre-quantized ``(x_q, x_scale)`` equivalence.
+           rows, gated & ungated shared expert, and ``w2_n_chunk`` invariance.
   - Real TPU Mosaic + StableHLO compiler lowering (``lowering_platforms=("tpu",)``)
     on CPU for ``SMALL_*`` and abstract ``GLM-5.2`` ``ShapeDtypeStruct``s (zero
     host RAM allocation for ``GLM-5.2`` weights).
@@ -25,11 +24,12 @@ Covers:
 
 from __future__ import annotations
 
+import dataclasses
 import os
+import re
+import subprocess
+import sys
 from typing import Any
-
-# Ensure 8 host CPU devices are available when pytest starts JAX on CPU.
-os.environ.setdefault("XLA_FLAGS", "--xla_force_host_platform_device_count=8")
 
 import jax
 import jax.numpy as jnp
@@ -102,17 +102,64 @@ def _install_mock_tpu7x(monkeypatch: pytest.MonkeyPatch) -> None:
         pass
 
 
-def _cpu_or_any_mesh() -> Mesh:
-    devs = (
-        jax.devices("cpu")
-        if "cpu" in {d.platform for d in jax.devices()}
-        else jax.devices()
+_CPU8_WORKER_ENV = "_FUSED_MOE_PREFILL_NVFP4_CPU8_WORKER"
+
+
+@pytest.fixture(scope="module")
+def _cpu8_worker_run(request: pytest.FixtureRequest) -> bool:
+    """Run 8-CPU-device tests in an isolated subprocess with XLA_FLAGS set.
+
+    Avoids mutating ``os.environ["XLA_FLAGS"]`` or initializing JAX in the
+    parent pytest process.
+    """
+    if os.environ.get(_CPU8_WORKER_ENV) == "1":
+        return True
+    targets = [
+        f"{__file__}::{item.nodeid.split('::', 1)[1]}"
+        for item in request.session.items
+        if item.path == request.path and "_cpu8_worker_run" in item.fixturenames
+    ]
+    assert targets
+    flags = re.sub(
+        r"--xla_force_host_platform_device_count=\S+",
+        "",
+        os.environ.get("XLA_FLAGS", ""),
+    ).strip()
+    env = dict(
+        os.environ,
+        JAX_PLATFORMS="cpu",
+        XLA_FLAGS=(f"{flags} --xla_force_host_platform_device_count={N_RANKS}".strip()),
     )
-    if len(devs) < N_RANKS:
-        pytest.skip(
-            f"needs >= {N_RANKS} JAX devices "
-            "(set --xla_force_host_platform_device_count=8)"
+    env[_CPU8_WORKER_ENV] = "1"
+    proc = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pytest",
+            "-o",
+            "addopts=",
+            "-q",
+            "--tb=short",
+            *targets,
+        ],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=600,
+    )
+    if proc.returncode != 0:
+        pytest.fail(
+            f"8-CPU-device subprocess failed (exit {proc.returncode}):\n"
+            f"{proc.stdout[-4000:]}\n{proc.stderr[-4000:]}"
         )
+    return False
+
+
+def _cpu_or_any_mesh() -> Mesh:
+    devs = sorted(jax.devices("cpu"), key=lambda d: d.id)
+    assert len(devs) >= N_RANKS, (
+        f"Expected >= {N_RANKS} CPU devices inside worker, got {len(devs)}"
+    )
     return Mesh(np.asarray(devs[:N_RANKS]), ("d",))
 
 
@@ -372,7 +419,6 @@ def _install_cpu_expert_emulator(monkeypatch: pytest.MonkeyPatch) -> None:
         nb: int = 4,
         rung_rows: int | None = None,
         w2_n_chunk: int = 2048,
-        include_shared: bool = True,
     ):
         del nb
         has_act_scale = act_mode == "w4a8"
@@ -384,7 +430,7 @@ def _install_cpu_expert_emulator(monkeypatch: pytest.MonkeyPatch) -> None:
         qb1 = h // b13
         bk2 = i // b2
         n_chunk = min(h, w2_n_chunk)
-        slab_rows = routes + (tokens if include_shared else 1) + tile_rows
+        slab_rows = routes + tokens + tile_rows
         scale_rows = (_cdiv_py(slab_rows, _LANES) + 1) if has_act_scale else 0
         token_rows = _cdiv_py(routes, _LANES) * _LANES + window
 
@@ -398,16 +444,12 @@ def _install_cpu_expert_emulator(monkeypatch: pytest.MonkeyPatch) -> None:
                 row_scale_hbm = None
                 rest = call_args[6:]
             w1_hbm, w2_hbm, w1_scale_hbm, w2_scale_hbm = rest[:4]
-            if include_shared:
-                (
-                    shared_w1_hbm,
-                    shared_w2_hbm,
-                    shared_w1_scale_hbm,
-                    shared_w2_scale_hbm,
-                ) = rest[4:8]
-            else:
-                shared_w1_hbm = shared_w2_hbm = None
-                shared_w1_scale_hbm = shared_w2_scale_hbm = None
+            (
+                shared_w1_hbm,
+                shared_w2_hbm,
+                shared_w1_scale_hbm,
+                shared_w2_scale_hbm,
+            ) = rest[4:8]
 
             n_visit = num_visits[0]
             x_flat = x_hbm.reshape(tokens, h).astype(act_dtype)
@@ -433,7 +475,7 @@ def _install_cpu_expert_emulator(monkeypatch: pytest.MonkeyPatch) -> None:
                 row_iota = jnp.arange(tile_rows, dtype=jnp.int32)
                 sh_idx = jnp.minimum(t * tile_rows + row_iota, tokens - 1)
                 rt_idx = row_token_hbm[start + row_iota]
-                tok_idx = jnp.where(is_sh, sh_idx, rt_idx) if include_shared else rt_idx
+                tok_idx = jnp.where(is_sh, sh_idx, rt_idx)
                 act_full = x_flat[tok_idx]  # [tile_rows, h]
                 valid_r = (row_iota < rung_h)[:, None]
                 act = jnp.where(valid_r, act_full, 0)
@@ -448,12 +490,6 @@ def _install_cpu_expert_emulator(monkeypatch: pytest.MonkeyPatch) -> None:
                     act_scale = None
 
                 def run_shared():
-                    assert (
-                        shared_w1_hbm is not None
-                        and shared_w2_hbm is not None
-                        and shared_w1_scale_hbm is not None
-                        and shared_w2_scale_hbm is not None
-                    )
                     sw1 = shared_w1_hbm[0]
                     sw2 = shared_w2_hbm[0]
                     ss1 = shared_w1_scale_hbm[0]
@@ -542,11 +578,9 @@ def _install_cpu_expert_emulator(monkeypatch: pytest.MonkeyPatch) -> None:
                         chunks.append(out_c)
                     return jnp.concatenate(chunks, axis=1)
 
-                tile_out = (
-                    lax.cond(is_sh, run_shared, run_routed)
-                    if include_shared
-                    else run_routed()
-                ).reshape(tile_rows, lane_blocks, _LANES)
+                tile_out = lax.cond(is_sh, run_shared, run_routed).reshape(
+                    tile_rows, lane_blocks, _LANES
+                )
                 cur = lax.dynamic_slice_in_dim(slab, start, tile_rows, axis=0)
                 keep = (row_iota < live)[:, None, None]
                 merged = jnp.where(keep, tile_out, cur)
@@ -925,7 +959,9 @@ def test_admission_refusal(monkeypatch: pytest.MonkeyPatch):
     assert not mod.can_use_fused_moe_prefill_nvfp4(*base)
 
 
-def test_input_validation_errors():
+def test_input_validation_errors(_cpu8_worker_run: bool):
+    if not _cpu8_worker_run:
+        return
     x, w1, w2, s1, s2, sw1, ss1, sw2, ss2, tw, tids, _ = _shapes(16, SMALL_EP2TP4)
 
     def z(s: jax.ShapeDtypeStruct) -> jax.Array:
@@ -948,9 +984,9 @@ def test_input_validation_errors():
             axis_name="d",
             act_mode="invalid",  # type: ignore[arg-type]
         )
-    with pytest.raises(ValueError, match="x_q and x_scale"):
+    with pytest.raises(ValueError, match="bfloat16"):
         mod.fused_moe_prefill_nvfp4(
-            z(x),
+            jnp.zeros(x.shape, F32),
             z(w1),
             z(w2),
             z(s1),
@@ -963,9 +999,22 @@ def test_input_validation_errors():
             z(tw),
             z(tids),
             axis_name="d",
-            act_mode="w4a16",
-            x_q=jnp.zeros((16, 4, 128), FP8),
-            x_scale=jnp.ones((16,), F32),
+        )
+    with pytest.raises(ValueError, match="shared_w1 and shared_w2"):
+        mod.fused_moe_prefill_nvfp4(
+            z(x),
+            z(w1),
+            z(w2),
+            z(s1),
+            z(s2),
+            None,
+            z(ss1),
+            z(sw2),
+            z(ss2),
+            None,
+            z(tw),
+            z(tids),
+            axis_name="d",
         )
 
 
@@ -976,9 +1025,11 @@ def test_input_validation_errors():
 
 @pytest.mark.parametrize("act_mode", ["w4a16", "w4a8"])
 def test_ep_some_tokens_zero_local_routes(
-    monkeypatch: pytest.MonkeyPatch, act_mode: mod.ActMode
+    _cpu8_worker_run: bool, monkeypatch: pytest.MonkeyPatch, act_mode: mod.ActMode
 ):
     """Mandatory case (1a): subset of tokens has ALL routes on the remote EP group."""
+    if not _cpu8_worker_run:
+        return
     _install_cpu_expert_emulator(monkeypatch)
     mesh = _cpu_or_any_mesh()
     rep = NamedSharding(mesh, P())
@@ -1043,9 +1094,14 @@ def test_ep_some_tokens_zero_local_routes(
 @pytest.mark.parametrize("route_mode", ["ep0_all_routes", "ep1_all_routes"])
 @pytest.mark.parametrize("act_mode", ["w4a16", "w4a8"])
 def test_ep_one_group_gets_all_routes(
-    monkeypatch: pytest.MonkeyPatch, route_mode: str, act_mode: mod.ActMode
+    _cpu8_worker_run: bool,
+    monkeypatch: pytest.MonkeyPatch,
+    route_mode: str,
+    act_mode: mod.ActMode,
 ):
     """Mandatory case (1b): one EP group gets 100% of routes (0 on the other group)."""
+    if not _cpu8_worker_run:
+        return
     _install_cpu_expert_emulator(monkeypatch)
     mesh = _cpu_or_any_mesh()
     rep = NamedSharding(mesh, P())
@@ -1099,11 +1155,14 @@ def test_ep_one_group_gets_all_routes(
 
 
 def test_shared_expert_counted_once_and_matches_tp_chain(
+    _cpu8_worker_run: bool,
     monkeypatch: pytest.MonkeyPatch,
 ):
     """Mandatory case (2): zero routed weights -> shared expert counted once (not 2x)
     under EP2xTP4, bit-identical in W4A16 to ``_tp_chain``'s ``xla_quantized_matmul``
     shared expert, and invariant to ``routed_scale``."""
+    if not _cpu8_worker_run:
+        return
     _install_cpu_expert_emulator(monkeypatch)
     mesh = _cpu_or_any_mesh()
     rep = NamedSharding(mesh, P())
@@ -1256,12 +1315,15 @@ def test_shared_expert_counted_once_and_matches_tp_chain(
 @pytest.mark.parametrize("tokens", [128, 1000])
 @pytest.mark.parametrize("act_mode", ["w4a16", "w4a8"])
 def test_token_counts_128_and_1000(
+    _cpu8_worker_run: bool,
     monkeypatch: pytest.MonkeyPatch,
     cfg: dict[str, int],
     tokens: int,
     act_mode: mod.ActMode,
 ):
     """Mandatory case (3): T = 128 and T = 1000 across EP2xTP4 & TP8."""
+    if not _cpu8_worker_run:
+        return
     _install_cpu_expert_emulator(monkeypatch)
     mesh = _cpu_or_any_mesh()
     rep = NamedSharding(mesh, P())
@@ -1318,9 +1380,11 @@ def test_token_counts_128_and_1000(
 
 @pytest.mark.parametrize("act_mode", ["w4a16", "w4a8"])
 def test_nan_padded_rows_and_gated_shared_expert(
-    monkeypatch: pytest.MonkeyPatch, act_mode: mod.ActMode
+    _cpu8_worker_run: bool, monkeypatch: pytest.MonkeyPatch, act_mode: mod.ActMode
 ):
     """NaN-poisoned padded rows stay finite and gated shared expert matches oracle."""
+    if not _cpu8_worker_run:
+        return
     _install_cpu_expert_emulator(monkeypatch)
     mesh = _cpu_or_any_mesh()
     rep = NamedSharding(mesh, P())
@@ -1418,8 +1482,10 @@ def test_nan_padded_rows_and_gated_shared_expert(
     assert _rel_l2(got_nan, ref) <= (0.05 if act_mode == "w4a16" else 0.08)
 
 
-def test_w2_n_chunk_and_prequantized_invariance(monkeypatch: pytest.MonkeyPatch):
-    """Chunk width (256 vs 512) and pre-quantized (x_q, x_scale) are bit-identical."""
+def test_w2_n_chunk_invariance(_cpu8_worker_run: bool, monkeypatch: pytest.MonkeyPatch):
+    """Chunk width (256 vs 512) produces bit-identical outputs."""
+    if not _cpu8_worker_run:
+        return
     _install_cpu_expert_emulator(monkeypatch)
     mesh = _cpu_or_any_mesh()
     rep = NamedSharding(mesh, P())
@@ -1472,74 +1538,6 @@ def test_w2_n_chunk_and_prequantized_invariance(monkeypatch: pytest.MonkeyPatch)
         )
         np.testing.assert_array_equal(np.asarray(c256), np.asarray(c512))
 
-    # Pre-quantized (x_q, x_scale) in w4a8 matches internal _quantize_rows bit-for-bit.
-    def body_preq(x_, w1_, w2_, s1_, s2_, sw1_, ss1_, sw2_, ss2_, tw_, tids_, e0_):
-        xq, xs = prefill_v2._quantize_rows(x_, FP8)
-        return mod.fused_moe_prefill_nvfp4_stage_a(
-            None,
-            w1_,
-            w2_,
-            s1_,
-            s2_,
-            sw1_,
-            ss1_,
-            sw2_,
-            ss2_,
-            None,
-            tw_,
-            tids_,
-            axis_name="d",
-            expert_start=e0_.reshape(()),
-            routed_scale=ROUTED_SCALE,
-            act_mode="w4a8",
-            w2_n_chunk=512,
-            x_q=xq,
-            x_scale=xs,
-        )
-
-    got_preq = jax.jit(
-        jax.shard_map(
-            body_preq,
-            mesh=mesh,
-            in_specs=(
-                P(),
-                P("d"),
-                P("d"),
-                P("d"),
-                P("d"),
-                P("d"),
-                P("d"),
-                P("d"),
-                P("d"),
-                P(),
-                P(),
-                P("d"),
-            ),
-            out_specs=P(),
-            check_vma=False,
-        )
-    )(x, w1, w2, s1, s2, sw1, ss1, sw2, ss2, tw, tids, e0)
-    got_internal = _run_kernel(
-        mesh,
-        SMALL_EP2TP4,
-        x,
-        w1,
-        w2,
-        s1,
-        s2,
-        sw1,
-        ss1,
-        sw2,
-        ss2,
-        None,
-        tw,
-        tids,
-        e0,
-        act_mode="w4a8",
-        w2_n_chunk=512,
-    )
-    np.testing.assert_array_equal(np.asarray(got_preq), np.asarray(got_internal))
-
 
 # ==============================================================================
 # 3. Real TPU Mosaic / StableHLO Lowering Tests on CPU (Zero GLM-5.2 Allocation)
@@ -1550,12 +1548,15 @@ def test_w2_n_chunk_and_prequantized_invariance(monkeypatch: pytest.MonkeyPatch)
 @pytest.mark.parametrize("act_mode", ["w4a16", "w4a8"])
 @pytest.mark.parametrize("tokens", [128, 1000, 4096])
 def test_tpu_mosaic_lowering_glm52_abstract(
+    _cpu8_worker_run: bool,
     monkeypatch: pytest.MonkeyPatch,
     cfg: dict[str, int],
     act_mode: mod.ActMode,
     tokens: int,
 ):
     """Lower full GLM-5.2 shapes to TPU Mosaic MLIR using ShapeDtypeStructs only."""
+    if not _cpu8_worker_run:
+        return
     _install_mock_tpu7x(monkeypatch)
     mesh = _cpu_or_any_mesh()
     rep = NamedSharding(mesh, P())
@@ -1645,104 +1646,11 @@ def test_tpu_mosaic_lowering_glm52_abstract(
         assert "-r32" not in hlo
 
 
-@pytest.mark.parametrize("cfg", [SMALL_EP2TP4, SMALL_TP8])
-@pytest.mark.parametrize("act_mode", ["w4a16", "w4a8"])
-def test_cpu_routed_only_and_combine_chunk_tokens(
-    monkeypatch: pytest.MonkeyPatch,
-    cfg: dict[str, int],
-    act_mode: mod.ActMode,
+def test_glm52_4k_sweep_tpu_hlo_lowerings(
+    _cpu8_worker_run: bool, monkeypatch: pytest.MonkeyPatch
 ):
-    _install_cpu_expert_emulator(monkeypatch)
-    mesh = _cpu_or_any_mesh()
-    rep = NamedSharding(mesh, P())
-    w1, w2, s1, s2, sw1, ss1, sw2, ss2, e0 = _build_small_sharded_weights(
-        mesh, cfg, seed=131
-    )
-    tokens = 128
-    route_mode = "ep0_all_routes" if cfg["ep"] > 1 else "uniform"
-    x_np, tw_np, ids_np = _make_inputs(
-        tokens, cfg, mode=route_mode, seed=132, pad_tokens=8, poison_pad_nan=True
-    )
-    x = jax.device_put(jnp.asarray(x_np, dtype=BF16), rep)
-    tw = jax.device_put(jnp.asarray(tw_np, dtype=BF16), rep)
-    tids = jax.device_put(jnp.asarray(ids_np, dtype=jnp.int32), rep)
-
-    # Zero-shared weights run with include_shared=True must match include_shared=False.
-    z_sw1 = jnp.zeros_like(sw1)
-    z_sw2 = jnp.zeros_like(sw2)
-
-    def run_opt(*, inc_sh: bool, cchunk: int):
-        ep = cfg["ep"]
-        in_sp = (
-            (
-                P(),
-                P("d"),
-                P("d"),
-                P("d"),
-                P("d"),
-                P("d"),
-                P("d"),
-                P("d"),
-                P("d"),
-                P(),
-                P(),
-                P("d"),
-            )
-            if inc_sh
-            else (P(), P("d"), P("d"), P("d"), P("d"), P(), P(), P("d"))
-        )
-
-        def body(*bargs):
-            if inc_sh:
-                x_, w1_, w2_, s1_, s2_, sw1_, ss1_, sw2_, ss2_, tw_, tids_, e0_ = bargs
-            else:
-                x_, w1_, w2_, s1_, s2_, tw_, tids_, e0_ = bargs
-                sw1_ = ss1_ = sw2_ = ss2_ = None
-            return mod.fused_moe_prefill_nvfp4(
-                x_,
-                w1_,
-                w2_,
-                s1_,
-                s2_,
-                sw1_,
-                ss1_,
-                sw2_,
-                ss2_,
-                None,
-                tw_,
-                tids_,
-                axis_name="d",
-                expert_start=e0_.reshape(()) if ep > 1 else None,
-                routed_scale=ROUTED_SCALE,
-                act_mode=act_mode,
-                nb=2,
-                include_shared=inc_sh,
-                combine_chunk_tokens=cchunk,
-                w2_n_chunk=512,
-            )
-
-        fn = jax.jit(
-            jax.shard_map(
-                body, mesh=mesh, in_specs=in_sp, out_specs=P(), check_vma=False
-            )
-        )
-        if inc_sh:
-            return fn(x, w1, w2, s1, s2, z_sw1, ss1, z_sw2, ss2, tw, tids, e0)
-        return fn(x, w1, w2, s1, s2, tw, tids, e0)
-
-    got_routed = run_opt(inc_sh=False, cchunk=2048)
-    got_chunk512 = run_opt(inc_sh=False, cchunk=512)
-    got_chunk64 = run_opt(inc_sh=False, cchunk=64)
-    got_zero_sh = run_opt(inc_sh=True, cchunk=2048)
-    assert np.isfinite(np.asarray(got_routed)).all()
-    assert _rel_l2(got_routed, got_zero_sh) <= 1e-6
-    assert _rel_l2(got_routed, got_chunk512) <= 1e-6
-    # Chunking `[128, H]` into two `[64, H]` BF16 reduce-scatter passes across
-    # 8 ranks can shift boundary values by 1 BF16 ULP (~1.8e-3 rel_l2).
-    assert _rel_l2(got_routed, got_chunk64) <= 3e-3
-
-
-def test_glm52_4k_sweep_tpu_hlo_lowerings(monkeypatch: pytest.MonkeyPatch):
+    if not _cpu8_worker_run:
+        return
     _install_mock_tpu7x(monkeypatch)
     mesh = _cpu_or_any_mesh()
     shd = NamedSharding(mesh, P("d"))
@@ -1773,11 +1681,11 @@ def test_glm52_4k_sweep_tpu_hlo_lowerings(monkeypatch: pytest.MonkeyPatch):
     tids = sds((tokens, topk), jnp.int32, sharding=rep)
     e0 = sds((N_RANKS, 1), jnp.int32, sharding=shd)
 
-    for tile_min, nb, tall_r, inc_sh, cchunk in (
-        (8192, 4, 32, True, 2048),
-        (8192, 2, 32, True, 2048),
-        (4096, 4, None, True, 2048),
-        (8192, 4, 32, False, 4096),
+    for tile_min, nb, tall_r in (
+        (8192, 4, 32),
+        (8192, 2, 32),
+        (4096, 4, None),
+        (4096, 4, 32),
     ):
         assert mod.can_use_fused_moe_prefill_nvfp4(
             sds((tokens, h), BF16),
@@ -1785,14 +1693,13 @@ def test_glm52_4k_sweep_tpu_hlo_lowerings(monkeypatch: pytest.MonkeyPatch):
             sds((el, i, h), FP4),
             sds((el, 12, 1, 2 * i), F32),
             sds((el, 1, 1, h), F32),
-            sds((h, 2 * i_s), FP8) if inc_sh else None,
-            sds((2 * i_s,), F32) if inc_sh else None,
-            sds((i_s, h), FP8) if inc_sh else None,
-            sds((h,), F32) if inc_sh else None,
+            sds((h, 2 * i_s), FP8),
+            sds((2 * i_s,), F32),
+            sds((i_s, h), FP8),
+            sds((h,), F32),
             sds((tokens, topk), BF16),
             sds((tokens, topk), jnp.int32),
             nb=nb,
-            include_shared=inc_sh,
         )
 
         def body(
@@ -1811,8 +1718,6 @@ def test_glm52_4k_sweep_tpu_hlo_lowerings(monkeypatch: pytest.MonkeyPatch):
             _tm=tile_min,
             _nb=nb,
             _tr=tall_r,
-            _is=inc_sh,
-            _cc=cchunk,
         ):
             return mod.fused_moe_prefill_nvfp4(
                 x_,
@@ -1820,10 +1725,10 @@ def test_glm52_4k_sweep_tpu_hlo_lowerings(monkeypatch: pytest.MonkeyPatch):
                 w2_,
                 s1_,
                 s2_,
-                sw1_ if _is else None,
-                ss1_ if _is else None,
-                sw2_ if _is else None,
-                ss2_ if _is else None,
+                sw1_,
+                ss1_,
+                sw2_,
+                ss2_,
                 None,
                 tw_,
                 tids_,
@@ -1834,8 +1739,6 @@ def test_glm52_4k_sweep_tpu_hlo_lowerings(monkeypatch: pytest.MonkeyPatch):
                 nb=_nb,
                 tile_min=_tm,
                 tall_rung_rows=_tr,
-                include_shared=_is,
-                combine_chunk_tokens=_cc,
             )
 
         fn = jax.jit(
@@ -1864,16 +1767,17 @@ def test_glm52_4k_sweep_tpu_hlo_lowerings(monkeypatch: pytest.MonkeyPatch):
         hlo = tr.lower(lowering_platforms=("tpu",)).as_text()
         expect_m = 128 if tile_min == 8192 else 256
         assert f"-m_{expect_m}-" in hlo
-        if not inc_sh:
-            assert "-routed" in hlo
 
 
 def test_scale_4d_no_reshape_in_jaxpr_and_tpu_hlo_and_3d_bitwise(
+    _cpu8_worker_run: bool,
     monkeypatch: pytest.MonkeyPatch,
 ):
     """4D routed scales reach ``pallas_call`` / ``@tpu_custom_call`` as
     ``[E_local, B, 1, cols]`` with zero ``reshape`` in jaxpr or TPU HLO, and 3D
     callers produce 0-ULP bitwise identical outputs."""
+    if not _cpu8_worker_run:
+        return
     _install_mock_tpu7x(monkeypatch)
     mesh = _cpu_or_any_mesh()
     rep = NamedSharding(mesh, P())
@@ -1953,7 +1857,6 @@ def test_scale_4d_no_reshape_in_jaxpr_and_tpu_hlo_and_3d_bitwise(
                     nb=4,
                     w2_n_chunk=2048,
                     info=info,
-                    include_shared=True,
                 )
                 assert need is not None and need <= cap_bytes
 
@@ -2154,6 +2057,8 @@ def test_scale_4d_no_reshape_in_jaxpr_and_tpu_hlo_and_3d_bitwise(
 # ==============================================================================
 
 
+@pytest.mark.tpu_test
+@pytest.mark.multichip
 @pytest.mark.parametrize("cfg", [SMALL_EP2TP4, SMALL_TP8])
 @pytest.mark.parametrize("act_mode", ["w4a16", "w4a8"])
 @pytest.mark.parametrize(
@@ -2238,22 +2143,24 @@ def test_tpu_hardware_correctness(
 # ==============================================================================
 
 
-def test_tall_rung_rows_for_rule():
-    """Verify default rung step selects 4 rungs (None)."""
-    assert mod.STAGE_A_NVFP4["tall_rung_rows"] == "auto"
-    for tile_rows in (64, 128, 192, 256, 512):
-        for i_rank in (128, 256, 384, 512, 2048):
-            assert mod.tall_rung_rows_for(tile_rows, i_rank) is None
+def test_stage_a_default_tall_rung_rows():
+    """Verify Stage-A defaults directly to tall_rung_rows=None (4 rungs)."""
+    assert mod.STAGE_A_NVFP4["tall_rung_rows"] is None
+    assert not hasattr(mod, "tall_rung_rows_for")
+    assert not hasattr(mod, "TallRungRows")
 
 
 @pytest.mark.parametrize("cfg", [GLM52_EP2TP4, GLM52_TP8])
 @pytest.mark.parametrize("act_mode", ["w4a16", "w4a8"])
 def test_default_and_override_rung_selection_by_layout_and_act_mode(
+    _cpu8_worker_run: bool,
     monkeypatch: pytest.MonkeyPatch,
     cfg: dict[str, int],
     act_mode: mod.ActMode,
 ):
     """Verify default 4-rung selection at T=4096 and tall_rung_rows override."""
+    if not _cpu8_worker_run:
+        return
     _install_mock_tpu7x(monkeypatch)
     mesh = _cpu_or_any_mesh()
     rep = NamedSharding(mesh, P())
@@ -2290,7 +2197,7 @@ def test_default_and_override_rung_selection_by_layout_and_act_mode(
         sds((N_RANKS, 1), jnp.int32, sharding=shd),
     )
 
-    for tall_r, want_r32 in (("auto", False), (None, False), (32, True)):
+    for tall_r, want_r32 in ((None, False), (32, True)):
 
         def body(
             x_,
@@ -2305,7 +2212,7 @@ def test_default_and_override_rung_selection_by_layout_and_act_mode(
             tw_,
             tids_,
             e0_,
-            _tr: mod.TallRungRows = tall_r,
+            _tr: int | None = tall_r,
         ):
             return mod.fused_moe_prefill_nvfp4(
                 x_,
@@ -2362,6 +2269,9 @@ def test_fused_moe_prefill_nvfp4_env_flag_parsing(monkeypatch: pytest.MonkeyPatc
     import vllm_torchtpu.envs as envs
 
     envs_mod: Any = envs
+    assert "FUSED_MOE_PREFILL_NVFP4_MIN_TOKENS" not in envs.environment_variables
+    assert not hasattr(envs, "FUSED_MOE_PREFILL_NVFP4_MIN_TOKENS")
+
     monkeypatch.delenv("FUSED_MOE_PREFILL_NVFP4_KERNEL", raising=False)
     assert envs_mod.FUSED_MOE_PREFILL_NVFP4_KERNEL is False
     assert envs.is_set("FUSED_MOE_PREFILL_NVFP4_KERNEL") is False
@@ -2383,22 +2293,6 @@ def test_fused_moe_prefill_nvfp4_env_flag_parsing(monkeypatch: pytest.MonkeyPatc
     monkeypatch.setenv("FUSED_MOE_PREFILL_NVFP4_KERNEL", "invalid")
     with pytest.raises(ValueError, match="FUSED_MOE_PREFILL_NVFP4_KERNEL"):
         _ = envs_mod.FUSED_MOE_PREFILL_NVFP4_KERNEL
-
-    monkeypatch.delenv("FUSED_MOE_PREFILL_NVFP4_MIN_TOKENS", raising=False)
-    assert envs_mod.FUSED_MOE_PREFILL_NVFP4_MIN_TOKENS == 2048
-    assert envs.is_set("FUSED_MOE_PREFILL_NVFP4_MIN_TOKENS") is False
-
-    monkeypatch.setenv("FUSED_MOE_PREFILL_NVFP4_MIN_TOKENS", "512")
-    assert envs_mod.FUSED_MOE_PREFILL_NVFP4_MIN_TOKENS == 512
-    assert envs.is_set("FUSED_MOE_PREFILL_NVFP4_MIN_TOKENS") is True
-
-    monkeypatch.setenv("FUSED_MOE_PREFILL_NVFP4_MIN_TOKENS", "")
-    assert envs_mod.FUSED_MOE_PREFILL_NVFP4_MIN_TOKENS == 2048
-    assert envs.is_set("FUSED_MOE_PREFILL_NVFP4_MIN_TOKENS") is False
-
-    monkeypatch.setenv("FUSED_MOE_PREFILL_NVFP4_MIN_TOKENS", "invalid")
-    with pytest.raises(ValueError, match="FUSED_MOE_PREFILL_NVFP4_MIN_TOKENS"):
-        _ = envs_mod.FUSED_MOE_PREFILL_NVFP4_MIN_TOKENS
 
     monkeypatch.delenv("FUSED_MOE_PREFILL_NVFP4_ACT_MODE", raising=False)
     assert envs_mod.FUSED_MOE_PREFILL_NVFP4_ACT_MODE == "w4a16"
@@ -2477,16 +2371,29 @@ def _load_nvfp4_adapter_for_test(monkeypatch: pytest.MonkeyPatch) -> Any:
         ),
     )
 
-    _put_mod("vllm", __path__=[])
-    _put_mod(
+    warnings_once_seen: set[tuple[Any, ...]] = set()
+    warnings_once_msgs: list[str] = []
+
+    def _warning_once(msg: str, *args: Any, **_kw: Any) -> None:
+        key = (msg, *args)
+        hash(key)
+        if key not in warnings_once_seen:
+            warnings_once_seen.add(key)
+            warnings_once_msgs.append(msg % args if args else msg)
+
+    vllm_mod = _put_mod("vllm", __path__=[])
+    vllm_logger_mod = _put_mod(
         "vllm.logger",
+        _print_warning_once=SimpleNamespace(cache_clear=warnings_once_seen.clear),
         init_logger=lambda _name: SimpleNamespace(
             info=lambda *_a, **_k: None,
             info_once=lambda *_a, **_k: None,
             warning=lambda *_a, **_k: None,
+            warning_once=_warning_once,
             debug=lambda *_a, **_k: None,
         ),
     )
+    vllm_mod.logger = vllm_logger_mod  # type: ignore[attr-defined]
     _put_mod("vllm.model_executor", __path__=[])
     _put_mod("vllm.model_executor.layers", __path__=[])
     _put_mod("vllm.model_executor.layers.fused_moe", __path__=[])
@@ -2517,6 +2424,7 @@ def _load_nvfp4_adapter_for_test(monkeypatch: pytest.MonkeyPatch) -> Any:
         w, ids = _route(x, scores, bias, is_pad, st)
         row_fin = jnp.all(jnp.isfinite(x), axis=-1, keepdims=True)
         xc = jnp.where(row_fin, x, jnp.zeros_like(x))
+        xc_bf16 = xc.astype(BF16)
         gu_s = xla_quantized_matmul(xc, sw13, ss13)
         fs = sw2.shape[0]
         sact = jax.nn.silu(gu_s[:, :fs].astype(F32)).astype(x.dtype) * gu_s[:, fs:]
@@ -2542,7 +2450,7 @@ def _load_nvfp4_adapter_for_test(monkeypatch: pytest.MonkeyPatch) -> Any:
             acc1 = None
             for b in range(b13):
                 p1 = lax.dot_general(
-                    xc[:, b * qb1 : (b + 1) * qb1],
+                    xc_bf16[:, b * qb1 : (b + 1) * qb1],
                     w1_e[b * qb1 : (b + 1) * qb1, :],
                     DN,
                     preferred_element_type=F32,
@@ -2569,10 +2477,10 @@ def _load_nvfp4_adapter_for_test(monkeypatch: pytest.MonkeyPatch) -> Any:
         y_all = lax.map(exp_out, jnp.arange(el, dtype=jnp.int32))
         safe_ids = jnp.where(valid, local_ids, 0)
         tok_iota = jnp.arange(x.shape[0], dtype=jnp.int32)[:, None]
-        picked = y_all[safe_ids, tok_iota]
+        picked = y_all[safe_ids, tok_iota].astype(x.dtype)
         w_eff = jnp.where(valid, w, jnp.zeros_like(w))
         routed = jnp.sum(picked * w_eff[:, :, None], axis=1).astype(x.dtype)
-        return shared + routed * st.routed_scale
+        return (shared + routed * st.routed_scale).astype(x.dtype)
 
     src_root = pathlib.Path(envs.__file__).resolve().parent
     for pkg_name, rel in (
@@ -2690,6 +2598,7 @@ def _load_nvfp4_adapter_for_test(monkeypatch: pytest.MonkeyPatch) -> Any:
         torch=fake_torch,
         VllmNvfp4MoEMethod=nvfp4_qm_cls,
         fp8_decode=fp8_decode_mod,
+        warnings_once=warnings_once_msgs,
     )
 
 
@@ -2767,6 +2676,13 @@ ADAPTER_SMALL_EP2TP4 = dict(
     h=1024, e=16, i=256, i_s=256, topk=4, qb1=512, bk2=256, ep=2
 )
 ADAPTER_SMALL_TP8 = dict(h=1024, e=16, i=128, i_s=256, topk=4, qb1=512, bk2=128, ep=1)
+# Admitted by moe_tp_decode_nvfp4 (m <= 64), refused by Stage-A prefill VMEM plan.
+ADAPTER_DECODE_ONLY_A = dict(
+    h=6144, e=256, i=768, i_s=256, topk=8, qb1=512, bk2=256, ep=2
+)
+ADAPTER_DECODE_ONLY_B = dict(
+    h=6144, e=128, i=768, i_s=256, topk=8, qb1=512, bk2=256, ep=2
+)
 
 
 @pytest.mark.parametrize(
@@ -2780,7 +2696,7 @@ def test_adapter_flag_off_unchanged_and_flag_on_admission(
     _install_mock_tpu7x(monkeypatch)
     monkeypatch.setenv("FUSED_MOE_DECODE_KERNEL", "0")
     monkeypatch.setenv("TPU_MOE_FP8_ALL_GATHER", "0")
-    monkeypatch.delenv("FUSED_MOE_PREFILL_NVFP4_MIN_TOKENS", raising=False)
+    monkeypatch.delenv("FUSED_MOE_PREFILL_NVFP4_ACT_MODE", raising=False)
     rt = _load_nvfp4_adapter_for_test(monkeypatch)
     adapter = rt.adapter
     runner = _make_stub_runner(rt, cfg)
@@ -2788,99 +2704,121 @@ def test_adapter_flag_off_unchanged_and_flag_on_admission(
     # 1. Flag OFF (default): prefill_above is None and prefill admission is not called.
     monkeypatch.delenv("FUSED_MOE_PREFILL_NVFP4_KERNEL", raising=False)
     probe_calls: list[int] = []
-    orig_can = adapter.prefill_nvfp4.can_use_fused_moe_prefill_nvfp4
+    orig_reason = adapter.prefill_nvfp4.fused_moe_prefill_nvfp4_unsupported_reason
 
-    def spy_can(*a: Any, **kw: Any) -> bool:
+    def spy_reason(*a: Any, **kw: Any) -> str | None:
         probe_calls.append(1)
-        return orig_can(*a, **kw)
+        return orig_reason(*a, **kw)
 
     monkeypatch.setattr(
-        adapter.prefill_nvfp4, "can_use_fused_moe_prefill_nvfp4", spy_can
+        adapter.prefill_nvfp4,
+        "fused_moe_prefill_nvfp4_unsupported_reason",
+        spy_reason,
     )
     adm_off = adapter._admit(runner, N_RANKS)
     assert not isinstance(adm_off, str), adm_off
     assert adm_off.rows == adapter.kernel.ROW_BUCKETS
     assert adm_off.statics.prefill_above is None
     assert probe_calls == []
+    assert rt.warnings_once == []
 
-    # 2. Flag ON (default min_tokens=2048): prefill_above == 2047 (n >= 2048).
+    # 2. Flag ON (default w4a16 -> min_tokens=2048): prefill_above == 2047.
     monkeypatch.setenv("FUSED_MOE_PREFILL_NVFP4_KERNEL", "1")
     adm_on = adapter._admit(runner, N_RANKS)
     assert not isinstance(adm_on, str), adm_on
     assert adm_on.rows == adapter.kernel.ROW_BUCKETS
     assert adm_on.statics.prefill_above == 2047
     assert len(probe_calls) == 1
+    assert rt.warnings_once == []
 
     # 3. Flag ON when prefill admission refuses: decode still arms cleanly,
-    #    prefill_above falls back to None (_tp_chain + lax.psum).
+    #    prefill_above falls back to None, and warning_once logs the refusal.
     monkeypatch.setattr(
         adapter.prefill_nvfp4,
-        "can_use_fused_moe_prefill_nvfp4",
-        lambda *_a, **_k: False,
+        "fused_moe_prefill_nvfp4_unsupported_reason",
+        lambda *_a, **_k: "synthetic test refusal",
     )
     adm_refused = adapter._admit(runner, N_RANKS)
     assert not isinstance(adm_refused, str), adm_refused
     assert adm_refused.rows == adapter.kernel.ROW_BUCKETS
     assert adm_refused.statics.prefill_above is None
+    assert len(rt.warnings_once) == 1
+    assert "synthetic test refusal" in rt.warnings_once[0]
 
 
-@pytest.mark.parametrize(
-    "cfg", [GLM52_EP2TP4, GLM52_TP8, ADAPTER_SMALL_EP2TP4, ADAPTER_SMALL_TP8]
-)
-def test_adapter_prefill_min_tokens_threshold_resolution(
+def test_adapter_mode_cutoffs_and_prefill_refusal_warning_once(
     monkeypatch: pytest.MonkeyPatch,
-    cfg: dict[str, int],
 ):
-    """FUSED_MOE_PREFILL_NVFP4_MIN_TOKENS resolves prefill_above = max(64, min - 1)."""
+    """Mode cutoffs live in code, and prefill refusals warn once per layer shape."""
+    import vllm_torchtpu.envs as envs
+
     _install_mock_tpu7x(monkeypatch)
     monkeypatch.setenv("FUSED_MOE_DECODE_KERNEL", "0")
     monkeypatch.setenv("TPU_MOE_FP8_ALL_GATHER", "0")
+    monkeypatch.delenv("FUSED_MOE_PREFILL_NVFP4_ACT_MODE", raising=False)
     rt = _load_nvfp4_adapter_for_test(monkeypatch)
     adapter = rt.adapter
-    runner = _make_stub_runner(rt, cfg)
 
-    # Flag off ignores min_tokens override completely.
+    assert adapter._PREFILL_MIN_TOKENS == {"w4a16": 2048, "w4a8": 512}
+    assert not hasattr(envs, "FUSED_MOE_PREFILL_NVFP4_MIN_TOKENS")
+
+    r_a1 = _make_stub_runner(rt, ADAPTER_DECODE_ONLY_A)
+    r_a2 = _make_stub_runner(rt, ADAPTER_DECODE_ONLY_A)
+    r_b = _make_stub_runner(rt, ADAPTER_DECODE_ONLY_B)
+
+    # 1. Flag OFF: decode admits (16, 32), prefill stays off, zero warnings logged.
     monkeypatch.delenv("FUSED_MOE_PREFILL_NVFP4_KERNEL", raising=False)
-    monkeypatch.setenv("FUSED_MOE_PREFILL_NVFP4_MIN_TOKENS", "512")
-    adm_off = adapter._admit(runner, N_RANKS)
+    adm_off = adapter._admit(r_a1, N_RANKS)
     assert not isinstance(adm_off, str), adm_off
+    assert adm_off.rows == (16, 32)
     assert adm_off.statics.prefill_above is None
+    assert rt.warnings_once == []
 
+    # 2. Flag ON (w4a16): repeated layers of the same shape warn only once,
+    #    naming act_mode, weight/scale shapes, and the VMEM refusal reason.
     monkeypatch.setenv("FUSED_MOE_PREFILL_NVFP4_KERNEL", "1")
+    for rnr in (r_a1, r_a2):
+        adm = adapter._admit(rnr, N_RANKS)
+        assert not isinstance(adm, str), adm
+        assert adm.rows == (16, 32)
+        assert adm.statics.prefill_above is None
+    assert len(rt.warnings_once) == 1
+    msg_a_w4a16 = rt.warnings_once[0]
+    assert "act_mode=w4a16" in msg_a_w4a16
+    assert "w13=(128, 6144, 768) float4_e2m1fn_x2" in msg_a_w4a16
+    assert "w2=(128, 768, 3072)" in msg_a_w4a16
+    assert "s13=(128, 12, 1, 1536)" in msg_a_w4a16
+    assert "s2=(128, 3, 1, 6144)" in msg_a_w4a16
+    assert "shared_w13=(6144, 512)" in msg_a_w4a16
+    assert "exceeds VMEM admission budget" in msg_a_w4a16
 
-    # 1. Default (unset -> 2048) -> prefill_above == 2047 (dispatches n >= 2048).
-    monkeypatch.delenv("FUSED_MOE_PREFILL_NVFP4_MIN_TOKENS", raising=False)
-    adm_def = adapter._admit(runner, N_RANKS)
-    assert not isinstance(adm_def, str), adm_def
-    assert adm_def.statics.prefill_above == 2047
+    # 3. A different act_mode or a different layer shape logs once more each.
+    monkeypatch.setenv("FUSED_MOE_PREFILL_NVFP4_ACT_MODE", "w4a8")
+    _ = adapter._admit(r_a1, N_RANKS)
+    _ = adapter._admit(r_a2, N_RANKS)
+    assert len(rt.warnings_once) == 2
+    assert "act_mode=w4a8" in rt.warnings_once[1]
 
-    # 2. Explicit overrides above 64 (e.g. 512, 1024, 4096) -> min_tokens - 1.
-    for min_tok, want_above in ((512, 511), (1024, 1023), (4096, 4095)):
-        monkeypatch.setenv("FUSED_MOE_PREFILL_NVFP4_MIN_TOKENS", str(min_tok))
-        adm_ov = adapter._admit(runner, N_RANKS)
-        assert not isinstance(adm_ov, str), adm_ov
-        assert adm_ov.statics.prefill_above == want_above
-
-    # 3. Values <= 64 (65 -> 64, 64 -> 64, 32 -> 64, 0 -> 64, -5 -> 64) clamp to
-    #    ROW_BUCKETS[-1] == 64 so decode buckets (<= 64) never dispatch to prefill.
-    for raw_low in ("65", "64", "32", "1", "0", "-5"):
-        monkeypatch.setenv("FUSED_MOE_PREFILL_NVFP4_MIN_TOKENS", raw_low)
-        adm_clamped = adapter._admit(runner, N_RANKS)
-        assert not isinstance(adm_clamped, str), adm_clamped
-        assert adm_clamped.statics.prefill_above == 64
+    _ = adapter._admit(r_b, N_RANKS)
+    assert len(rt.warnings_once) == 3
+    assert "w13=(64, 6144, 768)" in rt.warnings_once[2]
 
 
 @pytest.mark.parametrize("cfg", [ADAPTER_SMALL_EP2TP4, ADAPTER_SMALL_TP8])
 def test_adapter_op_body_flag_off_vs_flag_on_dispatch_small_shapes(
+    _cpu8_worker_run: bool,
     monkeypatch: pytest.MonkeyPatch,
     cfg: dict[str, int],
 ):
-    """Single _op_body dispatches decode at n<=64, _tp_chain when flag off, and
-    fused_moe_prefill_nvfp4_stage_a (W4A16) at n>64 when flag on."""
+    """Single _op_body dispatches decode at n<=64, _tp_chain when flag off or
+    non-bf16 x, and fused_moe_prefill_nvfp4_stage_a (W4A16) above prefill_above."""
+    if not _cpu8_worker_run:
+        return
     _install_mock_tpu7x(monkeypatch)
     _install_cpu_expert_emulator(monkeypatch)
     monkeypatch.setenv("FUSED_MOE_DECODE_KERNEL", "0")
     monkeypatch.setenv("TPU_MOE_FP8_ALL_GATHER", "0")
+    monkeypatch.delenv("FUSED_MOE_PREFILL_NVFP4_ACT_MODE", raising=False)
     rt = _load_nvfp4_adapter_for_test(monkeypatch)
     adapter = rt.adapter
 
@@ -2921,17 +2859,14 @@ def test_adapter_op_body_flag_off_vs_flag_on_dispatch_small_shapes(
 
     runner = _make_stub_runner(rt, cfg)
     monkeypatch.delenv("FUSED_MOE_PREFILL_NVFP4_KERNEL", raising=False)
-    monkeypatch.delenv("FUSED_MOE_PREFILL_NVFP4_MIN_TOKENS", raising=False)
     adm_off = adapter._admit(runner, N_RANKS)
     assert not isinstance(adm_off, str)
     monkeypatch.setenv("FUSED_MOE_PREFILL_NVFP4_KERNEL", "1")
     adm_on_default = adapter._admit(runner, N_RANKS)
     assert not isinstance(adm_on_default, str)
     assert adm_on_default.statics.prefill_above == 2047
-    monkeypatch.setenv("FUSED_MOE_PREFILL_NVFP4_MIN_TOKENS", "128")
-    adm_on = adapter._admit(runner, N_RANKS)
-    assert not isinstance(adm_on, str)
-    assert adm_on.statics.prefill_above == 127
+    # Lower prefill_above on a copy of statics so CPU tests exercise n=128 cleanly.
+    statics_on_128 = dataclasses.replace(adm_on_default.statics, prefill_above=127)
 
     specs = (
         P(),
@@ -2969,7 +2904,7 @@ def test_adapter_op_body_flag_off_vs_flag_on_dispatch_small_shapes(
     )
     fn_on = jax.jit(
         jax.shard_map(
-            adapter._op_body(adm_on.statics, N_RANKS, "d"),
+            adapter._op_body(statics_on_128, N_RANKS, "d"),
             mesh=mesh,
             in_specs=specs,
             out_specs=P("d"),
@@ -3113,7 +3048,7 @@ def test_adapter_op_body_flag_off_vs_flag_on_dispatch_small_shapes(
     ).reshape(N_RANKS, n_pre, h)
     np.testing.assert_array_equal(got_off_all, want_off_all)
 
-    # With default min_tokens=2048 (prefill_above=2047), n=128 stays on _tp_chain.
+    # With default w4a16 cutoff=2048 (prefill_above=2047), n=128 stays on _tp_chain.
     got_on_def_all = np.asarray(
         fn_on_default(
             x_pre,
@@ -3136,7 +3071,7 @@ def test_adapter_op_body_flag_off_vs_flag_on_dispatch_small_shapes(
     assert tp_chain_calls == [n_pre, n_pre]
     assert prefill_calls == []
 
-    # With min_tokens=128 (prefill_above=127), n=128 dispatches to _prefill_chain.
+    # With prefill_above=127, bf16 x at n=128 dispatches to _prefill_chain.
     got_on_all = np.asarray(
         fn_on(
             x_pre,
@@ -3164,6 +3099,49 @@ def test_adapter_op_body_flag_off_vs_flag_on_dispatch_small_shapes(
     assert _rel_l2(got_on_all[0, :n_valid], got_off_all[0, :n_valid]) <= 5e-3
     assert _cos_sim(got_on_all[0, :n_valid], got_off_all[0, :n_valid]) >= 0.9999
 
+    # 3. Trace-time x dtype guard: if an armed layer is called with non-bf16 x
+    #    (e.g. float32), _above falls back cleanly to _tp_chain + lax.psum.
+    x_f32 = jax.device_put(jnp.asarray(x_np, F32), rep)
+    got_f32_all = np.asarray(
+        fn_on(
+            x_f32,
+            sc_pre,
+            bias,
+            pm_pre,
+            w1,
+            w2,
+            s1,
+            s2,
+            sw1,
+            ss1,
+            sw2,
+            ss2,
+            ranks,
+            e0,
+        )
+    ).reshape(N_RANKS, n_pre, h)
+    want_f32_all = np.asarray(
+        ref_fn(
+            x_f32,
+            sc_pre,
+            bias,
+            pm_pre,
+            w1,
+            w2,
+            s1,
+            s2,
+            sw1,
+            ss1,
+            sw2,
+            ss2,
+            e0,
+        )
+    ).reshape(N_RANKS, n_pre, h)
+    assert prefill_calls == [n_pre]  # prefill kernel was NOT traced for f32 x
+    assert tp_chain_calls == [n_pre, n_pre, n_pre]
+    assert got_f32_all.dtype == np.float32
+    np.testing.assert_array_equal(got_f32_all, want_f32_all)
+
 
 @pytest.mark.parametrize(
     "cfg", [GLM52_EP2TP4, GLM52_TP8, ADAPTER_SMALL_EP2TP4, ADAPTER_SMALL_TP8]
@@ -3172,7 +3150,7 @@ def test_adapter_prefill_act_mode_admission(
     monkeypatch: pytest.MonkeyPatch,
     cfg: dict[str, int],
 ):
-    """FUSED_MOE_PREFILL_NVFP4_ACT_MODE populates _OpStatics.prefill_act_mode."""
+    """FUSED_MOE_PREFILL_NVFP4_ACT_MODE selects both act_mode and min_tokens cutoff."""
     _install_mock_tpu7x(monkeypatch)
     monkeypatch.setenv("FUSED_MOE_DECODE_KERNEL", "0")
     monkeypatch.setenv("TPU_MOE_FP8_ALL_GATHER", "0")
@@ -3181,14 +3159,16 @@ def test_adapter_prefill_act_mode_admission(
     runner = _make_stub_runner(rt, cfg)
 
     probed_modes: list[str] = []
-    orig_can = adapter.prefill_nvfp4.can_use_fused_moe_prefill_nvfp4
+    orig_reason = adapter.prefill_nvfp4.fused_moe_prefill_nvfp4_unsupported_reason
 
-    def spy_can(*a: Any, **kw: Any) -> bool:
+    def spy_reason(*a: Any, **kw: Any) -> str | None:
         probed_modes.append(kw.get("act_mode", "w4a16"))
-        return orig_can(*a, **kw)
+        return orig_reason(*a, **kw)
 
     monkeypatch.setattr(
-        adapter.prefill_nvfp4, "can_use_fused_moe_prefill_nvfp4", spy_can
+        adapter.prefill_nvfp4,
+        "fused_moe_prefill_nvfp4_unsupported_reason",
+        spy_reason,
     )
 
     # 1. Flag off ignores FUSED_MOE_PREFILL_NVFP4_ACT_MODE completely.
@@ -3200,9 +3180,8 @@ def test_adapter_prefill_act_mode_admission(
     assert adm_off.statics.prefill_act_mode == "w4a16"
     assert probed_modes == []
 
-    # 2. Flag on default -> min_tokens=2048 (prefill_above=2047), act_mode="w4a16".
+    # 2. Flag on default -> cutoff=2048 (prefill_above=2047), act_mode="w4a16".
     monkeypatch.setenv("FUSED_MOE_PREFILL_NVFP4_KERNEL", "1")
-    monkeypatch.delenv("FUSED_MOE_PREFILL_NVFP4_MIN_TOKENS", raising=False)
     monkeypatch.delenv("FUSED_MOE_PREFILL_NVFP4_ACT_MODE", raising=False)
     adm_def = adapter._admit(runner, N_RANKS)
     assert not isinstance(adm_def, str), adm_def
@@ -3210,8 +3189,7 @@ def test_adapter_prefill_act_mode_admission(
     assert adm_def.statics.prefill_act_mode == "w4a16"
     assert probed_modes[-1] == "w4a16"
 
-    # 3. Flag on with MIN_TOKENS=512 + ACT_MODE=w4a8 -> prefill_above=511, w4a8.
-    monkeypatch.setenv("FUSED_MOE_PREFILL_NVFP4_MIN_TOKENS", "512")
+    # 3. Flag on with ACT_MODE=w4a8 -> cutoff=512 (prefill_above=511), act_mode="w4a8".
     monkeypatch.setenv("FUSED_MOE_PREFILL_NVFP4_ACT_MODE", "w4a8")
     adm_w4a8 = adapter._admit(runner, N_RANKS)
     assert not isinstance(adm_w4a8, str), adm_w4a8
@@ -3229,16 +3207,18 @@ def test_adapter_prefill_act_mode_admission(
 
 @pytest.mark.parametrize("cfg", [ADAPTER_SMALL_EP2TP4, ADAPTER_SMALL_TP8])
 def test_adapter_op_body_w4a8_min_tokens_512_dispatch_small_shapes(
+    _cpu8_worker_run: bool,
     monkeypatch: pytest.MonkeyPatch,
     cfg: dict[str, int],
 ):
-    """MIN_TOKENS=512 + ACT_MODE=w4a8 keeps 128 on _tp_chain and runs w4a8 at 512."""
+    """ACT_MODE=w4a8 sets cutoff=512: keeps 128 on _tp_chain and runs w4a8 at 512."""
+    if not _cpu8_worker_run:
+        return
     _install_mock_tpu7x(monkeypatch)
     _install_cpu_expert_emulator(monkeypatch)
     monkeypatch.setenv("FUSED_MOE_DECODE_KERNEL", "0")
     monkeypatch.setenv("TPU_MOE_FP8_ALL_GATHER", "0")
     monkeypatch.setenv("FUSED_MOE_PREFILL_NVFP4_KERNEL", "1")
-    monkeypatch.setenv("FUSED_MOE_PREFILL_NVFP4_MIN_TOKENS", "512")
     monkeypatch.setenv("FUSED_MOE_PREFILL_NVFP4_ACT_MODE", "w4a8")
     rt = _load_nvfp4_adapter_for_test(monkeypatch)
     adapter = rt.adapter
