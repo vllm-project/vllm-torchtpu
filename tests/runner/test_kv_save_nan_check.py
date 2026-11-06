@@ -333,6 +333,7 @@ def test_runner_execute_model_and_sample_tokens_forward_step_nan_check(
         "_readmit_trimmed_drafts",
         "maybe_wait_for_kv_save",
         "get_finished_kv_transfers",
+        "_build_kv_connector_output",
         "_sample_tokens_pp_intermediate_stage",
         "sample_tokens",
         "execute_model",

@@ -636,6 +636,7 @@ def _plain_step_runner(num_output, logits, req_id="r0"):
         "_num_output_tokens",
         "maybe_wait_for_kv_save",
         "get_finished_kv_transfers",
+        "_build_kv_connector_output",
     ):
         setattr(runner, name, getattr(TPUModelRunner, name).__get__(runner))
     return runner
