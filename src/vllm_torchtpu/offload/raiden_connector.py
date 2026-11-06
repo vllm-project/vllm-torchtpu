@@ -430,6 +430,18 @@ class TPURaidenOffloadingConnector(OffloadingConnector):
                 storage = tensor.untyped_storage()
                 pool_storages.setdefault(storage.data_ptr(), (storage, tensor.device))
 
+        from vllm_torchtpu.models.vllm.qwen4_exp.offload import is_qwen4_exp, pool_regions
+
+        if is_qwen4_exp(getattr(self, "_vllm_config", None)):
+            # A worker's unified pool is several raw regions under the gcd
+            # group rule (2 per PP8 stage); every one must be registered.
+            expected = pool_regions(self.connector_worker.kv_cache_config)
+            assert len(pool_storages) == expected, (
+                "Qwen4Exp offload registers every pool region: found "
+                f"{len(pool_storages)} distinct storages, the KV cache config "
+                f"plans {expected}"
+            )
+
         pool_tensors: list[CanonicalKVCacheTensor] = []
         for storage, device in pool_storages.values():
             storage_bytes = storage.nbytes()
