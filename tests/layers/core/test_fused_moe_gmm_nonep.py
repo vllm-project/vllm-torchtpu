@@ -153,19 +153,21 @@ def test_nonep_choices_change_only_the_non_ep_program():
     assert "concatenate" in non_ep and "concatenate" not in jaxpr(False)
 
 
-def _ref_gmm(calls, tiles=None, hoists=None):
+def _ref_gmm(calls, tiles=None, hoists=None, splits=None):
     """Pure-JAX stand-in for gmm_wrapper that records its n_window (and
     tile_m); every output column is computed independently, as the kernel's
     are."""
     tiles = [] if tiles is None else tiles
     hoists = [] if hoists is None else hoists
+    splits = [] if splits is None else splits
 
     def gmm(lhs, rhs, rhs_scale, rhs_bias, group_sizes, group_offset, zero_initialize=False,
             fuse_act=None, preferred_element_type=None, rhs_quant_dtype=None, n_window=None,
-            tile_m=0, hoist_lhs_quant=False):
+            tile_m=0, hoist_lhs_quant=False, rhs_split=1):
         calls.append(n_window)
         tiles.append(tile_m)
         hoists.append(hoist_lhs_quant)
+        splits.append(rhs_split)
         r = (rhs.astype(jnp.float32) * rhs_scale[:, 0]).astype(jnp.bfloat16)
         if n_window is not None:
             r = r[..., n_window[0] : n_window[0] + n_window[1]]
@@ -255,18 +257,20 @@ def test_gmm_tile_m_and_hoist_reach_both_gmms_on_the_non_ep_path_only(monkeypatc
     rng = np.random.default_rng(6)
     ids = jnp.asarray(np.stack([rng.choice(experts, topk, replace=False) for _ in range(tokens)]), jnp.int32)
     w = jnp.asarray(rng.random((tokens, topk)), jnp.bfloat16)
-    calls, tiles, hoists = [], [], []
-    monkeypatch.setattr(fused_moe_gmm, "gmm_wrapper", _ref_gmm(calls, tiles, hoists))
+    calls, tiles, hoists, splits = [], [], [], []
+    monkeypatch.setattr(fused_moe_gmm, "gmm_wrapper", _ref_gmm(calls, tiles, hoists, splits))
     xs, gs, rev, wf, valid, tok = prepare_routed_gmm_inputs(
         x, ids, w, local_num_experts=experts, topk=topk, use_ep=False, use_sparse_core=False
     )
     fused_moe_gmm.moe_gmm(
         xs, w1, s1, None, w2, s2, None, gs, rev, wf, valid, tok, activation="silu",
         num_tokens=tokens, topk=topk, use_ep=use_ep, use_sparse_core=False, nonep_gmm_tile_m=1024,
-        nonep_gmm_hoist_quant=True,
+        nonep_gmm_hoist_quant=True, nonep_gmm2_rhs_split=4,
     )
     assert tiles == ([0, 0] if use_ep else [1024, 1024])
     assert hoists == ([False, False] if use_ep else [True, True])
+    # the weight-DMA split applies to gmm2 only (gmm1 already has gate/up DMAs)
+    assert splits == ([1, 1] if use_ep else [1, 4])
 
 
 # --------------------------------------------------------------------------- TPU
@@ -385,3 +389,36 @@ def test_sc_combine_bench_knob_is_read_from_the_environment(monkeypatch, value, 
     else:
         monkeypatch.setenv("TPU_SC_COMBINE_BENCH", value)
     assert v3._bench_mode() == expected
+
+
+
+def test_split_part_maps_columns_to_one_part():
+    from vllm_torchtpu.kernels.megablox.gmm_v2 import split_part
+
+    assert split_part(0, 256, 640) == (0, 0, 256)
+    assert split_part(512, 640, 640) == (0, 512, 640)
+    assert split_part(640, 896, 640) == (1, 0, 256)
+    assert split_part(2304, 2560, 640) == (3, 384, 640)
+    for bad in ((512, 768), (0, 0)):
+        with pytest.raises(ValueError):
+            split_part(*bad, 640)
+
+
+@pytest.mark.parametrize("nsplit", [2, 4, 5])
+def test_split_weights_ref_blocks_equal_the_whole_tile(nsplit):
+    """Every mxu-wide block read from the parts equals the same block of the
+    whole tile, and the concatenation of the parts is the tile."""
+    from vllm_torchtpu.kernels.megablox.gmm_v2 import SplitWeightsRef, WeightsRef
+
+    k, n, mxu = 640, 2560, 256
+    tile = np.arange(k * n, dtype=np.int32).reshape(k, n)
+    w = n // nsplit
+    ref = SplitWeightsRef(parts=tuple(WeightsRef(weight=tile[:, j * w:(j + 1) * w], scale=None, bias=None)
+                                      for j in range(nsplit)))
+    np.testing.assert_array_equal(np.asarray(ref.get_weight()), tile)
+    for n0 in range(0, n, mxu):
+        n1 = min(n, n0 + mxu)
+        if n0 // w != (n1 - 1) // w:
+            continue   # the kernel requires blocks inside one part (lane-aligned parts, mxu-aligned chunks)
+        for k0, k1 in ((0, 512), (512, 640)):
+            np.testing.assert_array_equal(ref.weight_block(k0, k1, n0, n1), tile[k0:k1, n0:n1])

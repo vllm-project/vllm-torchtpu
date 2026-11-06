@@ -214,6 +214,46 @@ class FusedWeightsRef(RhsRef):
         return interleave_lane(b_gate, b_up)
 
 
+def split_part(n0: int, n1: int, part_width: int) -> tuple[int, int, int]:
+    """(part, local start, local end) of output columns [n0, n1), which must
+    lie inside one part of ``part_width`` columns."""
+    part = n0 // part_width
+    if n1 > (part + 1) * part_width or n1 <= n0:
+        raise ValueError(f"columns [{n0}, {n1}) cross a {part_width}-column part")
+    return part, n0 - part * part_width, n1 - part * part_width
+
+
+@jax.tree_util.register_dataclass
+@dataclasses.dataclass(frozen=True)
+class SplitWeightsRef(RhsRef):
+    """One weight tile delivered as several column parts, each its own
+    pipeline input, so each part is its own concurrent DMA. Blocks are read
+    from the part that holds them; the values are those of the whole tile."""
+
+    parts: tuple
+
+    @property
+    def part_width(self) -> int:
+        return self.parts[0].weight.shape[-1]
+
+    def get_weight(self) -> jax.Array:
+        return jnp.concatenate([p.get_weight() for p in self.parts], axis=-1)
+
+    def get_scale(self, replicate_size: int | None = None) -> jax.Array:
+        return jnp.concatenate([p.get_scale(replicate_size) for p in self.parts], axis=-1)
+
+    def get_bias(self) -> jax.Array:
+        return jnp.concatenate([p.get_bias() for p in self.parts], axis=-1)
+
+    def weight_block(self, k0: int, k1: int, n0: int, n1: int) -> jax.Array:
+        part, a, b = split_part(n0, n1, self.part_width)
+        return self.parts[part].weight[k0:k1, a:b]
+
+    def scale_block(self, b_id, replicate_size: int, n0: int, n1: int) -> jax.Array:
+        part, a, b = split_part(n0, n1, self.part_width)
+        return self.parts[part].get_scale(replicate_size=replicate_size)[b_id, :, a:b]
+
+
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True)
 class MetadataRef:
@@ -296,6 +336,9 @@ class GmmConfigs:
     # --xla_enable_custom_call_region_trace=true. Profiling builds only: a
     # scoped build is not guaranteed bit-identical.
     trace_scopes: int = 0
+    # Deliver each weight tile as this many column parts (one pipeline input,
+    # hence one concurrent DMA, each). Non-fused GMM with one N tile only.
+    rhs_split: int = 1
 
     @property
     def num_quant_blocks_per_tile_k(self) -> int:
@@ -461,12 +504,24 @@ def inner_kernel(
 
         # Step 1: Input pre-processing.
         tiled_lhs = tiled_lhs_ref.reshape(-1, cfgs.tiles.tile_k)[:bucket_m]
-        tiled_rhs = tiled_rhs_ref.get_weight()
+        split = isinstance(tiled_rhs_ref, SplitWeightsRef)
+        # A split tile is read block by block from its parts (rhs_block below).
+        tiled_rhs = None if split else tiled_rhs_ref.get_weight()
 
         # This should only be taken in the case where we don't requantize
         # the scales and thus we need to dequantize inside VMEM to avoid small
         # contracting dimmensions
-        rhs_tile_n = tiled_rhs.shape[1]
+        rhs_tile_n = cfgs.tiles.tile_n if split else tiled_rhs.shape[1]
+
+        def rhs_block(k0, k1, n0, n1):
+            if split:
+                return tiled_rhs_ref.weight_block(k0, k1, n0, n1)
+            return tiled_rhs[k0:k1, n0:n1]
+
+        def rhs_scale_block(b_id, n0, col):
+            if split:
+                return tiled_rhs_ref.scale_block(b_id, bucket_m, n0, n0 + col)
+            return tiled_rhs_ref.get_scale(replicate_size=bucket_m)[b_id, :, n0 : n0 + col]
         rhs_qbs = cfgs.rhs_cfgs.quant_block_size
         if cfgs.rhs_cfgs.should_dequantize_before_matmul:
             tiled_rhs_scale = tiled_rhs_ref.get_scale(replicate_size=rhs_qbs).astype(
@@ -499,15 +554,13 @@ def inner_kernel(
 
                     block_acc = jnp.matmul(
                         tiled_lhs[:, start_k:end_k],
-                        tiled_rhs[start_k:end_k, start_n:end_n],
+                        rhs_block(start_k, end_k, start_n, end_n),
                         preferred_element_type=jnp.float32,
                     ).astype(acc_ref.dtype)
 
                     if cfgs.rhs_cfgs.should_dequantize_after_matmul:
                         b_id = start_k // rhs_qbs
-                        rhs_scale_replicated = tiled_rhs_ref.get_scale(
-                            replicate_size=bucket_m
-                        )[b_id, :, start_n : start_n + col_size]
+                        rhs_scale_replicated = rhs_scale_block(b_id, start_n, col_size)
                         block_acc *= rhs_scale_replicated.astype(acc_ref.dtype)
 
                     acc_n += block_acc
@@ -558,7 +611,7 @@ def inner_kernel(
                 for start_k in range(0, cfgs.tiles.tile_k, q_block_size):
                     end_k = min(cfgs.tiles.tile_k, start_k + q_block_size)
 
-                    block_rhs = tiled_rhs[start_k:end_k, start_n:end_n]
+                    block_rhs = rhs_block(start_k, end_k, start_n, end_n)
 
                     # Perform lhs quantization. Unless hoisted, for every block_lhs
                     # the same computation is performed tiles_n//mxu_size times and
@@ -586,9 +639,7 @@ def inner_kernel(
                     # Apply rhs subchannel scale per quant block.
                     if cfgs.rhs_cfgs.should_dequantize_after_matmul:
                         b_id = start_k // rhs_qbs
-                        rhs_scale_replicated = tiled_rhs_ref.get_scale(
-                            replicate_size=bucket_m
-                        )[b_id, :, start_n : start_n + col_size]
+                        rhs_scale_replicated = rhs_scale_block(b_id, start_n, col_size)
                         block_acc *= rhs_scale_replicated.astype(acc_ref.dtype)
 
                     acc_n += block_acc
@@ -943,6 +994,24 @@ def kernel_main(
             gate=rhs_spec,
             up=rhs_spec,
         )
+    elif cfgs.rhs_split > 1:
+        width = cfgs.tiles.tile_n // cfgs.rhs_split
+        rhs_ref = SplitWeightsRef(
+            parts=tuple(
+                jax.tree.map(lambda x, j=j: x.at[..., j * width : (j + 1) * width], rhs_ref)
+                for j in range(cfgs.rhs_split)
+            )
+        )
+        part_spec = jax.tree.map(
+            lambda bs: pl.BlockSpec(
+                (*bs.block_shape[:-1], width),
+                bs.index_map,
+                **({"pipeline_mode": bs.pipeline_mode} if getattr(bs, "pipeline_mode", None) else {}),
+            ),
+            rhs_spec,
+            is_leaf=lambda x: isinstance(x, pl.BlockSpec),
+        )
+        rhs_spec = SplitWeightsRef(parts=(part_spec,) * cfgs.rhs_split)
 
     # Execute the inner kernel.
     pipeline_fn = pltpu.emit_pipeline(
@@ -1188,6 +1257,7 @@ def get_scope_name(cfgs: GmmConfigs) -> str:
     window = "" if cfgs.n_window is None else f"-nw_{cfgs.n_window[0]}"
     window += "-hq" if cfgs.hoist_lhs_quant else ""
     window += f"-sc{cfgs.trace_scopes}" if cfgs.trace_scopes else ""
+    window += f"-rs{cfgs.rhs_split}" if cfgs.rhs_split > 1 else ""
     return (
         f"gmm_v2-g_{dims.size_group}-m_{dims.size_m}-k_{dims.size_k}-act_{cfgs.fuse_act}"
         f"-n_{dims.size_n}{window}-tm_{tiles.tile_m}-tk_{tiles.tile_k}-tn_{tiles.tile_n}"
@@ -1213,6 +1283,7 @@ def make_gmm_configs(
     n_window: tuple[int, int] | None = None,
     hoist_lhs_quant: bool = False,
     trace_scopes: int = 0,
+    rhs_split: int = 1,
 ):
     """Fills the GMM config for the GMM kernel."""
 
@@ -1306,6 +1377,22 @@ def make_gmm_configs(
     else:
         tiles = tile_info(dims, lhs_cfgs, rhs_cfgs, vmem_limit_bytes, fuse_act)
 
+    if rhs_split > 1:
+        num_lanes = pltpu.get_tpu_info().num_lanes
+        if not (
+            fuse_act is None
+            and tiles.tile_n == dims.size_n
+            and dims.size_n % rhs_split == 0
+            and (dims.size_n // rhs_split) % num_lanes == 0
+            and dims.size_k % tiles.tile_k == 0
+            and not rhs_cfgs.should_dequantize_before_matmul
+            and get_packing_factor(rhs_cfgs.dtype, rhs_cfgs.quant_dtype) == 1
+        ):
+            raise ValueError(
+                f"{rhs_split=} needs a non-fused GMM with one lane-aligned N tile "
+                f"({dims=}, {tiles=})"
+            )
+
     return GmmConfigs(
         dims=dims,
         tiles=tiles,
@@ -1318,6 +1405,7 @@ def make_gmm_configs(
         n_window=n_window,
         hoist_lhs_quant=hoist_lhs_quant,
         trace_scopes=trace_scopes,
+        rhs_split=rhs_split,
     )
 
 
@@ -1346,6 +1434,7 @@ def get_metadata(cfgs: GmmConfigs) -> dict[str, str | int | float]:
         "n_window",
         "hoist_lhs_quant",
         "trace_scopes",
+        "rhs_split",
     ]
 )
 def gmm_v2(
@@ -1368,6 +1457,7 @@ def gmm_v2(
     n_window: tuple[int, int] | None = None,
     hoist_lhs_quant: bool = False,
     trace_scopes: int = 0,
+    rhs_split: int = 1,
 ) -> jax.Array:
     """GMM kernel implemented with emit_pipeline.
 
@@ -1402,6 +1492,9 @@ def gmm_v2(
         trace_scopes: >= 2 adds phase trace scopes (gmm_quant, gmm_mxu,
             gmm_epilogue) for in-kernel profiling with libtpu's
             --xla_enable_custom_call_region_trace=true. Profiling only.
+        rhs_split: Deliver each weight tile as this many column parts, each
+            its own pipeline input (a concurrent DMA). Non-fused GMM with one
+            N tile; every output column is computed as without the split.
 
     Returns:
         Output of shape [size_m, size_n] ([size_m, width] with n_window).
@@ -1445,6 +1538,7 @@ def gmm_v2(
         n_window=n_window,
         hoist_lhs_quant=hoist_lhs_quant,
         trace_scopes=trace_scopes,
+        rhs_split=rhs_split,
     )
     dims = cfgs.dims
     tiles = cfgs.tiles

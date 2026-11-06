@@ -235,6 +235,7 @@ def gmm_wrapper(
     n_window=None,
     tile_m=0,
     hoist_lhs_quant=False,
+    rhs_split=1,
 ):
     # fp4 weights: keep bf16 activations. Quantizing activations to fp8 collapses
     # fp4 accuracy (error compounds across MoE layers) with no decode speedup
@@ -258,6 +259,7 @@ def gmm_wrapper(
         n_window=n_window,
         **({"tile_info": tiling_with_tile_m(tile_m)} if tile_m else {}),
         **({"hoist_lhs_quant": True} if hoist_lhs_quant else {}),
+        **({"rhs_split": rhs_split} if rhs_split > 1 else {}),
     )
 
 
@@ -620,6 +622,7 @@ def moe_gmm(
     nonep_combine_split: int = 1,
     nonep_gmm_tile_m: int = 0,
     nonep_gmm_hoist_quant: bool = False,
+    nonep_gmm2_rhs_split: int = 1,
 ) -> jax.Array:
     """Run grouped GEMM for routed tokens and reduce back to tokens.
 
@@ -636,6 +639,8 @@ def moe_gmm(
     # m-tile override of the non-EP GMMs (TPU_MOE_NONEP_GMM_TILE_M); 0 = default.
     tile_m = 0 if use_ep else nonep_gmm_tile_m
     hoist = nonep_gmm_hoist_quant and not use_ep
+    # gmm2's weight tile as this many concurrent column-part DMAs (non-EP).
+    rhs_split = 1 if use_ep else nonep_gmm2_rhs_split
 
     gmm1_res = gmm_wrapper(
         x,
@@ -690,6 +695,7 @@ def moe_gmm(
                 n_window=(start, split_width),
                 tile_m=tile_m,
                 hoist_lhs_quant=hoist,
+                rhs_split=rhs_split,
             )
             blocks.append(
                 ragged_gather_reduce_v3(
@@ -714,6 +720,7 @@ def moe_gmm(
         rhs_quant_dtype=rhs_quant_dtype,
         tile_m=tile_m,
         hoist_lhs_quant=hoist,
+        rhs_split=rhs_split,
     )
     # The destination-major kernel packs source indices into 20 bits and
     # processes 16-lane SparseCore tiles.
@@ -811,6 +818,7 @@ def moe_gmm(
         "nonep_combine_split",
         "nonep_gmm_tile_m",
         "nonep_gmm_hoist_quant",
+        "nonep_gmm2_rhs_split",
     ),
 )
 def fused_moe_func(
@@ -838,6 +846,7 @@ def fused_moe_func(
     nonep_combine_split: int = 1,
     nonep_gmm_tile_m: int = 0,
     nonep_gmm_hoist_quant: bool = False,
+    nonep_gmm2_rhs_split: int = 1,
 ) -> jax.Array:
     """Run MoE with precomputed expert ids and weights.
 
@@ -962,5 +971,6 @@ def fused_moe_func(
         nonep_combine_split=nonep_combine_split,
         nonep_gmm_tile_m=nonep_gmm_tile_m,
         nonep_gmm_hoist_quant=nonep_gmm_hoist_quant,
+        nonep_gmm2_rhs_split=nonep_gmm2_rhs_split,
     )
     return x[:num_tokens, :hidden_size]

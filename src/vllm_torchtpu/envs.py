@@ -84,6 +84,7 @@ if TYPE_CHECKING:
     TPU_MOE_NONEP_COMBINE_SPLIT: str = "1"
     TPU_MOE_NONEP_GMM_TILE_M: str = "0"
     TPU_MOE_NONEP_GMM_HOIST_QUANT: bool = False
+    TPU_MOE_NONEP_GMM2_RHS_SPLIT: str = "1"
     USE_MOE_TP_DECODE_KERNEL: bool = False
     RAGGED_GATHER_REDUCE_VERSION: str = "v2"
     USE_PHASED_PROFILER: bool = False
@@ -1173,6 +1174,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # column loop (gmm_v2 hoist_lhs_quant) instead of once per mxu-wide column
     # chunk. Same ops on the same values.
     "TPU_MOE_NONEP_GMM_HOIST_QUANT": env_bool("TPU_MOE_NONEP_GMM_HOIST_QUANT"),
+    # The non-EP second GMM receives each expert's weight tile as this many
+    # column parts, each its own pipeline input (a concurrent DMA) (gmm_v2
+    # rhs_split). Its visits are paced by the weight DMA at prefill sizes.
+    # Bitwise the same output.
+    "TPU_MOE_NONEP_GMM2_RHS_SPLIT": env_with_choices(
+        "TPU_MOE_NONEP_GMM2_RHS_SPLIT", "1", ["1", "2", "4", "5"]
+    ),
     # Serve eligible tensor-parallel MoE layers (sigmoid + correction-bias
     # top-k with renormalization, one shared expert, FP8 per-channel weights)
     # with one op that also covers the shared expert and the TP all-reduce:
