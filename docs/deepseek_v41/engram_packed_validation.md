@@ -60,8 +60,11 @@ to establish that its measured requests use the new kernel.
 - CPU abstract tracing with JAX 0.10.2 accepts the packed bool-mask interface
   and returns one BF16 `[288, 4, 5120]` tensor. This checks tracing, not TPU
   lowering or execution against the branch's newer runtime pins.
-- Full-environment type checking requires the CI container; the local
-  machine has no Docker.
+- Full-environment type checking in the pinned TPU benchmark environment
+  returns 1 for both implementation `80f01d83` and base `690f3df5`.
+  Both report the same 100 diagnostics when compared by file and error
+  message, ignoring shifted line numbers; neither full check passes.
+  The baselines were not changed.
 - The production kernel has run on TPU v7 with JAX/jaxlib 0.11.2 and
   libtpu 0.0.50. Experiment `exp-pivkjv7ghf` captured 30 device calls per
   input form in alternating AB/BA order. Device custom-call medians were
@@ -82,6 +85,20 @@ to establish that its measured requests use the new kernel.
   misses this trace layout, and Pallas analysis `an-63e5qdh2li` discovers
   native files but returns zero instruction-family counts. Those are
   analysis coverage gaps, not evidence of zero device work or zero spill.
-- Torch single-layer integration and complete model A/B results are still
-  pending. They must validate actual fused dispatch and capture separate
-  model profiles; the JAX-only measurement above cannot replace them.
+- The separate official XProf summary `an-sl9vy3yon4` also passed and read
+  this XPlane plus its trace JSON. It classifies the custom call's roofline
+  bound as `Unknown`; zero arithmetic-intensity/FLOP fields do not establish
+  a bandwidth or compute bottleneck. The profile lacks embedded HLO, so
+  static-memory and copy-layout analyses remain unavailable. Its runtime
+  BFC allocation peak is not a VMEM or register-spill measurement.
+- The kernel writes only its newly allocated output; input HBM is read-only
+  and VMEM/semaphores are local scratch. It therefore uses the default pure
+  Pallas effect metadata. The former `has_side_effects=True` marker blocked
+  the real Torch SPMD compilation and was unnecessary for a consumed full
+  output. The direct Torch adapter compiles and executes with this fix.
+- The first real single-layer replay selects distinct unfused/fused graphs
+  and captures both profiles, but fails the original `atol=0.02, rtol=0.01`
+  output comparison: maximum absolute difference 0.125 and mean absolute
+  difference 0.0003613378. Outputs are finite and masked rows are preserved.
+  This result is being diagnosed; it is not a successful numerical or
+  full-model validation. Full-model A/B remains pending behind this gate.

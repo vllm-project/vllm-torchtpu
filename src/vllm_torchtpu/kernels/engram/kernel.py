@@ -487,9 +487,7 @@ def fused_engram(
             pltpu.SemaphoreType.DMA((2,)),
             pltpu.SemaphoreType.DMA,
         ),
-        compiler_params=pltpu.CompilerParams(
-            has_side_effects=True, vmem_limit_bytes=TUNING.vmem_limit_bytes
-        ),
+        compiler_params=pltpu.CompilerParams(vmem_limit_bytes=TUNING.vmem_limit_bytes),
         name="engram_offload_dq_wkv_bn2560",
     )(
         *(

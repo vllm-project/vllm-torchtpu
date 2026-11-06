@@ -47,6 +47,7 @@ def main() -> None:
         init_distributed_environment,
     )
     from vllm.model_executor.layers.linear import ColumnParallelLinear
+    from vllm.platforms import current_platform
 
     from vllm_torchtpu.layers.adapter.quantization.fp8 import VllmFp8Config
     from vllm_torchtpu.layers.core.quantization import quantize_tensor
@@ -69,6 +70,7 @@ def main() -> None:
         "eps": 1e-20,
         "clamp_value": 1e-6,
         "passed": False,
+        "distributed_backend": current_platform.get_worker_distributed_backend(1),
     }
 
     def save() -> None:
@@ -85,7 +87,7 @@ def main() -> None:
             rank=0,
             local_rank=0,
             distributed_init_method=f"file://{rendezvous.name}/rendezvous",
-            backend="tpu_dist",
+            backend=current_platform.get_worker_distributed_backend(1),
         )
         initialized = True
         with set_current_vllm_config(VllmConfig()):
@@ -148,115 +150,129 @@ def main() -> None:
         if not holder._uses_fused_offload(hidden, token_mask):
             raise RuntimeError("The fixture does not select the fused Engram path")
 
-        # Record the graphs that really reach the TPU backend; testing the
-        # predicate alone would miss a bridge or dispatch wiring failure.
-        graphs: dict[str, list[list[str]]] = {"before": [], "after": []}
-        tpu_backend = lookup_backend("tpu")
+        # Register the existing baseline bridge before Dynamo enters its lock.
+        from vllm_torchtpu.layers.adapter.linear_common import _get_quantized_matmul_op
 
-        def backend_for(name):
-            def backend(graph, example_inputs):
-                graphs[name].append([str(node.target) for node in graph.graph.nodes])
-                return tpu_backend(graph, example_inputs)
+        _get_quantized_matmul_op()
 
-            return backend
+        from scripts.dsv41_bench import common
 
-        paths = {
-            "before": torch.compile(
-                holder._forward_unfused, backend=backend_for("before"), fullgraph=True
-            ),
-            "after": torch.compile(
-                holder, backend=backend_for("after"), fullgraph=True
-            ),
-        }
+        with common.model_wrapper_context():
+            # Record the graphs that really reach the TPU backend; testing the
+            # predicate alone would miss a bridge or dispatch wiring failure.
+            graphs: dict[str, list[list[str]]] = {"before": [], "after": []}
+            tpu_backend = lookup_backend("tpu")
 
-        def run(name):
-            output = paths[name](hidden, hash_ids, token_mask)
-            sync.synchronize(tensors=[output], wait=True)
-            return output
+            def backend_for(name):
+                def backend(graph, example_inputs):
+                    graphs[name].append(
+                        [str(node.target) for node in graph.graph.nodes]
+                    )
+                    return tpu_backend(graph, example_inputs)
 
-        with torch.inference_mode():
-            outputs = {name: run(name).cpu() for name in paths}
-            result["graphs"] = graphs
-            selected = any(
-                "engram_packed_fused" in target
-                for graph in graphs["after"]
-                for target in graph
-            )
-            baseline_selected = any(
-                "engram_packed_fused" in target
-                for graph in graphs["before"]
-                for target in graph
-            )
-            if not selected or baseline_selected:
-                raise RuntimeError("Compiled A/B graphs do not select distinct paths")
-            reference, actual = outputs["before"], outputs["after"]
-            difference = (actual.float() - reference.float()).abs()
-            hidden_cpu = hidden.cpu()
-            masked_preserved = torch.equal(actual[~mask_cpu], hidden_cpu[~mask_cpu])
-            finite = bool(torch.isfinite(actual).all())
-            within_tolerance = torch.allclose(
-                actual, reference, atol=args.atol, rtol=args.rtol
-            )
-            result["correctness"] = {
-                "max_abs": difference.max().item(),
-                "mean_abs": difference.mean().item(),
-                "atol": args.atol,
-                "rtol": args.rtol,
-                "within_tolerance": within_tolerance,
-                "finite": finite,
-                "masked_rows_preserved": masked_preserved,
-                "numeric_difference": "fused K statistics retain FP32 projection",
+                return backend
+
+            paths = {
+                "before": torch.compile(
+                    holder._forward_unfused,
+                    backend=backend_for("before"),
+                    fullgraph=True,
+                ),
+                "after": torch.compile(
+                    holder, backend=backend_for("after"), fullgraph=True
+                ),
             }
-            for name in paths:
-                for _ in range(args.warmup):
-                    run(name)
-            samples = {name: [] for name in paths}
-            rng = random.Random(args.seed)
-            for _ in range(args.iterations):
-                order = list(paths)
-                rng.shuffle(order)
-                for name in order:
-                    start = time.perf_counter_ns()
-                    run(name)
-                    samples[name].append((time.perf_counter_ns() - start) / 1e6)
-            result["timings"] = {
-                name: {
-                    "median_ms": statistics.median(values),
-                    "samples_ms": values,
+
+            def run(name):
+                output = paths[name](hidden, hash_ids, token_mask)
+                sync.synchronize(tensors=[output], wait=True)
+                return output
+
+            with torch.inference_mode():
+                outputs = {name: run(name).cpu() for name in paths}
+                result["graphs"] = graphs
+                selected = any(
+                    "engram_packed_fused" in target
+                    for graph in graphs["after"]
+                    for target in graph
+                )
+                baseline_selected = any(
+                    "engram_packed_fused" in target
+                    for graph in graphs["before"]
+                    for target in graph
+                )
+                if not selected or baseline_selected:
+                    raise RuntimeError(
+                        "Compiled A/B graphs do not select distinct paths"
+                    )
+                reference, actual = outputs["before"], outputs["after"]
+                difference = (actual.float() - reference.float()).abs()
+                hidden_cpu = hidden.cpu()
+                masked_preserved = torch.equal(actual[~mask_cpu], hidden_cpu[~mask_cpu])
+                finite = bool(torch.isfinite(actual).all())
+                within_tolerance = torch.allclose(
+                    actual, reference, atol=args.atol, rtol=args.rtol
+                )
+                result["correctness"] = {
+                    "max_abs": difference.max().item(),
+                    "mean_abs": difference.mean().item(),
+                    "atol": args.atol,
+                    "rtol": args.rtol,
+                    "within_tolerance": within_tolerance,
+                    "finite": finite,
+                    "masked_rows_preserved": masked_preserved,
+                    "numeric_difference": "fused K statistics retain FP32 projection",
                 }
-                for name, values in samples.items()
-            }
-            result["speedup"] = statistics.median(samples["before"]) / (
-                statistics.median(samples["after"])
-            )
-            save()
-            if args.profile is not None:
-                from torch_tpu._internal.profiler import TpuProfilerConfig
-
                 for name in paths:
-                    destination = str((args.profile / name).resolve())
-                    Path(destination).mkdir(parents=True, exist_ok=True)
-                    with torch.profiler.profile(
-                        activities=[
-                            torch.profiler.ProfilerActivity.CPU,
-                            torch.profiler.ProfilerActivity.PrivateUse1,
-                        ],
-                        on_trace_ready=torch.profiler.tensorboard_trace_handler(
-                            destination, use_gzip=True
-                        ),
-                        experimental_config=TpuProfilerConfig(
-                            run_dir=destination,
-                            host_tracer_level=2,
-                            device_tracer_level=1,
-                            python_tracer_level=1,
-                        ),
-                    ):
-                        for _ in range(args.profile_steps):
-                            run(name)
-                result["profile"] = str(args.profile.resolve())
-            if not (finite and masked_preserved and within_tolerance):
-                raise RuntimeError("Single-layer numerical validation failed")
-            result["passed"] = True
+                    for _ in range(args.warmup):
+                        run(name)
+                samples = {name: [] for name in paths}
+                rng = random.Random(args.seed)
+                for _ in range(args.iterations):
+                    order = list(paths)
+                    rng.shuffle(order)
+                    for name in order:
+                        start = time.perf_counter_ns()
+                        run(name)
+                        samples[name].append((time.perf_counter_ns() - start) / 1e6)
+                result["timings"] = {
+                    name: {
+                        "median_ms": statistics.median(values),
+                        "samples_ms": values,
+                    }
+                    for name, values in samples.items()
+                }
+                result["speedup"] = statistics.median(samples["before"]) / (
+                    statistics.median(samples["after"])
+                )
+                save()
+                if args.profile is not None:
+                    from torch_tpu._internal.profiler import TpuProfilerConfig
+
+                    for name in paths:
+                        destination = str((args.profile / name).resolve())
+                        Path(destination).mkdir(parents=True, exist_ok=True)
+                        with torch.profiler.profile(
+                            activities=[
+                                torch.profiler.ProfilerActivity.CPU,
+                                torch.profiler.ProfilerActivity.PrivateUse1,
+                            ],
+                            on_trace_ready=torch.profiler.tensorboard_trace_handler(
+                                destination, use_gzip=True
+                            ),
+                            experimental_config=TpuProfilerConfig(
+                                run_dir=destination,
+                                host_tracer_level=2,
+                                device_tracer_level=1,
+                                python_tracer_level=1,
+                            ),
+                        ):
+                            for _ in range(args.profile_steps):
+                                run(name)
+                    result["profile"] = str(args.profile.resolve())
+                if not (finite and masked_preserved and within_tolerance):
+                    raise RuntimeError("Single-layer numerical validation failed")
+                result["passed"] = True
     except Exception as error:
         result["error"] = f"{type(error).__name__}: {error}"
         raise
