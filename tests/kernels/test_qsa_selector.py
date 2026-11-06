@@ -49,6 +49,33 @@ def run(xs, profile):
     return sel.select_prefill(*xs, cost_model=profile, kv_heads=2, ratio=4)
 
 
+@pytest.mark.parametrize(
+    "entry", [sel.select_prefill, sel.owner_window.owner_window_attention]
+)
+def test_invalid_compact_tail_mode_rejected_at_trace_time(entry, monkeypatch):
+    shape = jax.ShapeDtypeStruct
+    args = (
+        shape((256, 24, 256), jnp.bfloat16),
+        shape((256, 24, 256), jnp.bfloat16),
+        shape((256, 512), jnp.int32),
+        shape((256,), jnp.int32),
+        shape((256, 2), jnp.int32),
+        shape((3, 1664, 1, 4, 256), jnp.float8_e4m3fn),
+        shape((2,), jnp.int32),
+    )
+
+    def run_invalid(*xs):
+        return entry(*xs, kv_heads=2, ratio=4, tail_mode="typo_compact")
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("Invalid tail_mode reached dispatch")
+
+    monkeypatch.setattr(sel.owner_window, "is_supported_by_owner_window", forbidden)
+    monkeypatch.setattr(sel.owner_window, "window_data_pages", forbidden)
+    with pytest.raises(ValueError, match="Invalid tail_mode: 'typo_compact'"):
+        jax.eval_shape(run_invalid, *args)
+
+
 @pytest.mark.parametrize("ratio,page,qb", [(2, 640, 32), (4, 1664, 256), (8, 128, 32)])
 @pytest.mark.parametrize("seed", [7, 31, 99])
 def test_bounds_use_original_membership_and_match_independent_sets(

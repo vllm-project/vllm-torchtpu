@@ -180,8 +180,24 @@ def stage_pages(cache, physical, count):
     )(physical, count.reshape(1), cache)
 
 
+def _validate_tail_mode(tail_mode: str) -> None:
+    if tail_mode not in ("", "prefix_bf16", "prefix_bf16_compact"):
+        raise ValueError(f"Invalid tail_mode: {tail_mode!r}")
+
+
 def _lookahead_prefill(
-    q, gate, blocks, lengths, table, cache, *, chunk_size, kv_heads, ratio, padding_rows
+    q,
+    gate,
+    blocks,
+    lengths,
+    table,
+    cache,
+    *,
+    chunk_size,
+    kv_heads,
+    ratio,
+    padding_rows,
+    tail_mode="",
 ):
     # Full microchunks use null-page padding for inactive rows.
     query = q
@@ -192,8 +208,21 @@ def _lookahead_prefill(
     cores = info.num_cores * info.num_subcores
     head_axes = cache.shape[2]
     capacity = pl.cdiv(blocks.shape[1] * ratio + ratio - 1, 256) * 256
+    tail_rows = 0
+    if tail_mode == "prefix_bf16_compact":
+        tail_mode = "prefix_bf16"
+        if (
+            blocks.shape[1] == 512
+            and ratio == 4
+            and head_axes == 1
+            and cache.dtype == jnp.float8_e4m3fn
+        ):
+            # At top-512 and ratio 4, the last tile holds at most three
+            # causal tokens per query. A 64-row segment is SC-aligned.
+            tail_rows = 64
+    stored = capacity - 256 + tail_rows if tail_rows else capacity
     granularity = math.lcm(rows_per_core * cores, head_axes)
-    rows = pl.cdiv(chunk_size * capacity * head_axes, granularity) * granularity
+    rows = pl.cdiv(chunk_size * stored * head_axes, granularity) * granularity
     shape = (rows, *cache.shape[3:])
     slab = slab_gather.pack_query_metadata(blocks, lengths, table)
     slotA = jax.ref.new_ref(jnp.zeros(shape, cache.dtype), memory_space=pltpu.HBM)
@@ -212,6 +241,7 @@ def _lookahead_prefill(
             padding_rows=padding_rows,
             query_base=chunk * chunk_size,
             chunk_queries=chunk_size,
+            tail_rows=tail_rows,
         )
 
     def consume(slot, chunk, output):
@@ -230,6 +260,8 @@ def _lookahead_prefill(
             tile_k=256,
             capacity=capacity,
             budget=blocks.shape[1],
+            tail_mode=tail_mode,
+            tail_rows=tail_rows,
         )
         return lax.dynamic_update_slice_in_dim(output, y, chunk * chunk_size, 0)
 
@@ -267,6 +299,7 @@ def owner_window_attention(
     ratio: int,
     kv_tile: int = 256,
     workspace_bytes: int | None = None,
+    tail_mode: str = "",
 ) -> jax.Array:
     """Read-only prefill; an uncertified window uses TC.
 
@@ -274,6 +307,7 @@ def owner_window_attention(
     null page. None uses the existing SparseCore parameter byte limit. The
     owner is never donated, updated or returned by this entry.
     """
+    _validate_tail_mode(tail_mode)
 
     def fallback(_):
         return adaptive._tc(
@@ -351,6 +385,7 @@ def owner_window_attention(
             kv_heads=kv_heads,
             ratio=ratio,
             padding_rows=cache.shape[1] * cache.shape[2],
+            tail_mode=tail_mode,
         )
         return meta._gate_output(attention[: len(query)], gate, lengths)
 

@@ -142,12 +142,15 @@ def select_prefill(
     ratio: int,
     k_scale: float = 1.0,
     v_scale: float = 1.0,
+    tail_mode: str | None = None,
 ):
     """Return attention and route: 0 cheap TC, 1 prepared TC, 2/3 SC, 4 safe TC.
 
     Work estimates derive from the live tensor geometry and hardware. Other
     request schedules and scales retain their original TC semantics.
     """
+    if tail_mode is not None:
+        owner_window._validate_tail_mode(tail_mode)
     query_block, kv_tile = 256, 256
 
     def original(_):
@@ -354,6 +357,20 @@ def select_prefill(
     chosen, route = lax.cond(eligible, choose, original, None)
 
     def run_sc(_):
+        mode = tail_mode
+        if mode is None:
+            compact_bf16 = (
+                ratio == 4
+                and kv_heads == 2
+                and query.dtype == jnp.bfloat16
+                and query.shape[1:] == (24, 256)
+                and blocks.ndim == 2
+                and blocks.shape[1] == 512
+                and cache.ndim == 5
+                and cache.shape[2:] == (1, 4, 256)
+                and cache.dtype == jnp.float8_e4m3fn
+            )
+            mode = "prefix_bf16_compact" if compact_bf16 else ""
         return owner_window.owner_window_attention(
             query,
             gate,
@@ -366,6 +383,7 @@ def select_prefill(
             ratio=ratio,
             kv_tile=kv_tile,
             workspace_bytes=None,
+            tail_mode=mode,
         )
 
     output = lax.cond((route == 2) | (route == 3), run_sc, lambda _: chosen, None)

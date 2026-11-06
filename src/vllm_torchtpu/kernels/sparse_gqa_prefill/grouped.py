@@ -86,11 +86,15 @@ def _attention_block(
     ratio,
     k_scale,
     v_scale,
+    tail_mode="",
+    tail_rows=0,
+    batch=0,
 ):
     rows = query_group * head_group
     width = query_group * tile_k
     packing = 32 // jax.dtypes.itemsize_bits(compact_ref.dtype)
     head_axes = compact_ref.shape[1]
+    use_full_prefix = tail_mode == "prefix_bf16"
     selected = [
         jnp.minimum(lengths_ref[block * query_group + i] // ratio, budget) * ratio
         + lengths_ref[block * query_group + i] % ratio
@@ -99,9 +103,12 @@ def _attention_block(
     query_owner = jnp.arange(rows)[:, None] % query_group
     row_lengths = jnp.zeros((rows, 128), jnp.int32)
     max_length = selected[0]
+    min_length = selected[0]
     for i in range(query_group):
         row_lengths = jnp.where(query_owner == i, selected[i], row_lengths)
         max_length = jnp.maximum(max_length, selected[i])
+        if use_full_prefix:
+            min_length = jnp.minimum(min_length, selected[i])
     row_lengths = row_lengths[:, :1]
     tile_count = jnp.maximum(1, pl.cdiv(max_length, tile_k))
 
@@ -109,19 +116,45 @@ def _attention_block(
         groups_per_source = source_group // query_group
         source_block = block // groups_per_source
         subgroup = block % groups_per_source
-        offset = (
-            source_block * (capacity // tile_k) + tile
-        ) * source_group * tile_k + subgroup * width
-        pltpu.make_async_copy(
-            compact_ref.at[pl.ds(offset, width)], kv_ref.at[buf], sem_ref.at[buf]
-        ).start()
+
+        def full():
+            tiles = capacity // tile_k - bool(tail_rows)
+            offset = (
+                source_block * tiles + tile
+            ) * source_group * tile_k + subgroup * width
+            pltpu.make_async_copy(
+                compact_ref.at[pl.ds(offset, width)], kv_ref.at[buf], sem_ref.at[buf]
+            ).start()
+
+        if tail_rows:
+
+            @pl.when(tile == capacity // tile_k - 1)
+            def packed_tail():
+                size = query_group * tail_rows
+                offset = batch * (capacity - tile_k) + block * size
+                pltpu.make_async_copy(
+                    compact_ref.at[pl.ds(offset, size)],
+                    kv_ref.at[buf, pl.ds(0, size)],
+                    sem_ref.at[buf],
+                ).start()
+
+            pl.when(tile != capacity // tile_k - 1)(full)
+        else:
+            full()
 
     m_ref[...] = jnp.full(m_ref.shape, -jnp.inf, jnp.float32)
     l_ref[...] = jnp.zeros(l_ref.shape, jnp.float32)
     acc_ref[...] = jnp.zeros(acc_ref.shape, jnp.float32)
     start(0, 0)
 
-    def step(tile, _):
+    def step(tile, _, *, fully_live=False):
+        bf16_qk = (
+            fully_live
+            and tail_mode == "prefix_bf16"
+            and q_ref.dtype == jnp.bfloat16
+            and compact_ref.dtype == jnp.float8_e4m3fn
+        )
+        qk_dtype = jnp.bfloat16 if bf16_qk else jnp.float32
         buf = tile % 2
         dst = kv_ref.at[buf]
         pltpu.make_async_copy(dst, dst, sem_ref.at[buf]).wait()
@@ -130,12 +163,13 @@ def _attention_block(
         def prefetch():
             start(tile + 1, 1 - buf)
 
-        token = lax.broadcasted_iota(jnp.int32, (width, dim), 0)
-        live = jnp.zeros((width, dim), jnp.bool_)
-        for i in range(query_group):
-            live |= (token // tile_k == i) & (
-                tile * tile_k + token % tile_k < selected[i]
-            )
+        if not fully_live:
+            token = lax.broadcasted_iota(jnp.int32, (width, dim), 0)
+            live = jnp.zeros((width, dim), jnp.bool_)
+            for i in range(query_group):
+                live |= (token // tile_k == i) & (
+                    tile * tile_k + token % tile_k < selected[i]
+                )
         words = dst.bitcast(jnp.uint32).reshape(-1, dim)
         for head in range(kv_heads):
             packed = utils.strided_load(
@@ -144,18 +178,26 @@ def _attention_block(
             key, value = utils.convert_to_target_bitwidth(
                 packed, target_bitwidth=32 // packing, kv_dtype=compact_ref.dtype
             )[head % (packing // 2)]
-            key = key.astype(jnp.float32)
+            key = key.astype(qk_dtype)
             value = value.astype(jnp.float32)
             if compact_ref.dtype == jnp.float8_e4m3fn:
-                key = jnp.where(live & jnp.isfinite(key), key, 0)
-                value = jnp.where(live & jnp.isfinite(value), value, 0)
-            else:
+                if bf16_qk:
+                    key_live = jnp.abs(key) <= float(jnp.finfo(compact_ref.dtype).max)
+                else:
+                    key_live = jnp.isfinite(key)
+                value_live = jnp.isfinite(value)
+                if not fully_live:
+                    key_live &= live
+                    value_live &= live
+                key = jnp.where(key_live, key, 0)
+                value = jnp.where(value_live, value, 0)
+            elif not fully_live:
                 key = jnp.where(live, key, 0)
                 value = jnp.where(live, value, 0)
             # Batch by the actual KV-list owner; no cross-query scores.
             query = (
                 q_ref[head]
-                .astype(jnp.float32)
+                .astype(qk_dtype)
                 .reshape(head_group, query_group, dim)
                 .transpose(1, 0, 2)
             )
@@ -167,9 +209,14 @@ def _attention_block(
                 dimension_numbers=(((2,), (2,)), ((0,), (0,))),
                 preferred_element_type=jnp.float32,
             ) * (dim**-0.5 * k_scale)
-            lengths = row_lengths.reshape(head_group, query_group, 1).transpose(1, 0, 2)
-            valid_batch = tile * tile_k + jnp.arange(tile_k)[None, None, :] < lengths
-            score = jnp.where(valid_batch, score, -jnp.inf)
+            if not fully_live:
+                lengths = row_lengths.reshape(head_group, query_group, 1).transpose(
+                    1, 0, 2
+                )
+                valid_batch = (
+                    tile * tile_k + jnp.arange(tile_k)[None, None, :] < lengths
+                )
+                score = jnp.where(valid_batch, score, -jnp.inf)
             old_m = (
                 m_ref[head, :, :1]
                 .reshape(head_group, query_group, 1)
@@ -182,7 +229,9 @@ def _attention_block(
             )
             next_m = jnp.maximum(old_m, jnp.max(score, axis=2, keepdims=True))
             safe_m = jnp.where(jnp.isfinite(next_m), next_m, 0)
-            prob = jnp.where(valid_batch, jnp.exp(score - safe_m), 0)
+            prob = jnp.exp(score - safe_m)
+            if not fully_live:
+                prob = jnp.where(valid_batch, prob, 0)
             alpha = jnp.exp(old_m - safe_m)
             weighted = lax.dot_general(
                 prob,
@@ -203,7 +252,80 @@ def _attention_block(
             )
         return None
 
-    lax.fori_loop(0, tile_count, step, None)
+    if use_full_prefix and compact_ref.dtype == jnp.float8_e4m3fn and head_axes == 1:
+        tail_width = 8
+        remaining = max_length % tile_k
+        short = (remaining > 0) & (remaining <= tail_width)
+        full_tiles = tile_count - short.astype(jnp.int32)
+        # SC admission certifies the selected prefix. The shortest row
+        # bounds the tiles that need no per-token mask for any query.
+        prefix_tiles = jnp.minimum(full_tiles, min_length // tile_k)
+        lax.fori_loop(
+            0,
+            prefix_tiles,
+            lambda tile, state: step(tile, state, fully_live=True),
+            None,
+        )
+        lax.fori_loop(prefix_tiles, full_tiles, step, None)
+
+        @pl.when(short)
+        def finish_short():
+            tile = full_tiles
+            buf = tile % 2
+            dst = kv_ref.at[buf]
+
+            def read_full():
+                pltpu.make_async_copy(dst, dst, sem_ref.at[buf]).wait()
+                return dst.bitcast(jnp.uint32).reshape(query_group, tile_k, dim)[
+                    :, :tail_width, :
+                ]
+
+            if tail_rows:
+
+                def read_packed():
+                    local = dst.at[pl.ds(0, query_group * tail_rows)]
+                    pltpu.make_async_copy(local, local, sem_ref.at[buf]).wait()
+                    return local.bitcast(jnp.uint32).reshape(
+                        query_group, tail_rows, dim
+                    )[:, :tail_width, :]
+
+                raw = lax.cond(tile == capacity // tile_k - 1, read_packed, read_full)
+            else:
+                raw = read_full()
+            words = raw.reshape(query_group * tail_width, dim)
+            pairs = utils.convert_to_target_bitwidth(
+                words, target_bitwidth=8, kv_dtype=compact_ref.dtype
+            )
+            for head in range(kv_heads):
+                key, value = (x.astype(jnp.float32) for x in pairs[head])
+                key, value = (jnp.where(jnp.isfinite(x), x, 0) for x in (key, value))
+                q = q_ref[head].astype(jnp.float32)
+                dot = (((1,), (1,)), ((), ()))
+                score = lax.dot_general(q, key, dot, preferred_element_type=jnp.float32)
+                sources = jnp.arange(query_group * tail_width, dtype=jnp.int32)
+                valid = (sources[None, :] // tail_width == query_owner) & (
+                    tile * tile_k + sources[None, :] % tail_width < row_lengths
+                )
+                score = jnp.where(valid, score * (dim**-0.5 * k_scale), -jnp.inf)
+                old_m = m_ref[head, :, :1]
+                old_l = l_ref[head, :, :1]
+                next_m = jnp.maximum(old_m, jnp.max(score, axis=1, keepdims=True))
+                safe_m = jnp.where(jnp.isfinite(next_m), next_m, 0)
+                prob = jnp.where(valid, jnp.exp(score - safe_m), 0)
+                alpha = jnp.exp(old_m - safe_m)
+                weighted = lax.dot_general(
+                    prob,
+                    value,
+                    (((1,), (0,)), ((), ())),
+                    preferred_element_type=jnp.float32,
+                )
+                acc_ref[head] = acc_ref[head] * alpha + weighted * v_scale
+                m_ref[head] = jnp.broadcast_to(next_m, (rows, 128))
+                l_ref[head] = jnp.broadcast_to(
+                    old_l * alpha + prob.sum(axis=1, keepdims=True), (rows, 128)
+                )
+    else:
+        lax.fori_loop(0, tile_count, step, None)
     for head in range(kv_heads):
         mass = l_ref[head, :, :1]
         result = acc_ref[head] / jnp.where(mass > 0, mass, 1)
@@ -232,6 +354,8 @@ def _attend_compact_ref(
     scheduling_group_id: int | None = None,
     k_scale: float = 1.0,
     v_scale: float = 1.0,
+    tail_mode: str = "",
+    tail_rows: int = 0,
 ) -> jax.Array:
     packing = 32 // jax.dtypes.itemsize_bits(destination.dtype)
     head_axes = pl.cdiv(2 * kv_heads, packing)
@@ -295,6 +419,9 @@ def _attend_compact_ref(
             ratio=ratio,
             k_scale=k_scale,
             v_scale=v_scale,
+            tail_mode=tail_mode,
+            tail_rows=tail_rows,
+            batch=batch,
         )
 
     y = pl.pallas_call(
@@ -329,7 +456,11 @@ def _attend_compact_ref(
             + lengths.nbytes
             + block_ids.nbytes,
         ),
-        name="destination_ref_block_id_tc_attention",
+        name=(
+            "destination_ref_block_id_tc_attention"
+            + (f"_tail_{tail_mode}" if tail_mode else "")
+            + (f"_pack{tail_rows}" if tail_rows else "")
+        ),
     )(lengths, block_ids, packed_query, packed_gate)
     if scheduling_group_id is not None:
         y = xla_metadata.set_xla_metadata(y, _scheduling_group_id=scheduling_group_id)

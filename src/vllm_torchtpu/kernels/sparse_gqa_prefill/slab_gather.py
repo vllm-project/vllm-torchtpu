@@ -132,6 +132,7 @@ def _gather_from_slab_ref(
     padding_rows,
     query_base,
     chunk_queries,
+    tail_rows=0,
 ):
     return _gather_from_slab_impl(
         slab,
@@ -145,6 +146,7 @@ def _gather_from_slab_ref(
         query_base=query_base,
         chunk_queries=chunk_queries,
         destination=destination,
+        tail_rows=tail_rows,
     )
 
 
@@ -161,6 +163,7 @@ def _gather_from_slab_impl(
     query_base=None,
     chunk_queries=None,
     destination=None,
+    tail_rows=0,
 ):
     cache_shape = cache.shape
     info = pltpu.get_tpu_info()
@@ -175,7 +178,12 @@ def _gather_from_slab_impl(
     tc_tile = layout["TC_tile"]
     batch = slab.shape[0] if chunk_queries is None else chunk_queries
     capacity = pl.cdiv(budget * ratio + ratio - 1, tile_k) * tile_k
-    logical_rows = batch * capacity * head_axes
+    full_tiles = capacity // tile_k - bool(tail_rows)
+    # Store all full tiles first, then one aligned tail segment per query.
+    full_rows = batch * full_tiles * tile_rows
+    logical_rows = full_rows + batch * tail_rows * head_axes
+    if tail_rows:
+        assert full_tiles > 0 and tail_rows * head_axes % rows_per_core == 0
     granularity = math.lcm(rows_per_core * cores, head_axes)
     block_count = (
         pl.cdiv(logical_rows, granularity) * granularity // (rows_per_core * cores)
@@ -195,10 +203,17 @@ def _gather_from_slab_impl(
         def coordinates(block, stream):
             row = (block * cores + core) * rows_per_core + stream * lanes
             group_tile = row // (query_group * tile_rows)
-            group = group_tile // (capacity // tile_k)
-            tile = group_tile % (capacity // tile_k)
+            group = group_tile // full_tiles
+            tile = group_tile % full_tiles
             query = group * query_group + row // tile_rows % query_group
-            return (row, tile, query, row % tile_rows)
+            local = row % tile_rows
+            if tail_rows:
+                tail = row >= full_rows
+                tail_row = row - full_rows
+                tile = jnp.where(tail, full_tiles, tile)
+                query = jnp.where(tail, tail_row // (tail_rows * head_axes), query)
+                local = jnp.where(tail, tail_row % (tail_rows * head_axes), local)
+            return row, tile, query, local
 
         def shared_query(block):
             return jnp.clip(coordinates(block, 0)[2], 0, batch - 1)
