@@ -8,6 +8,10 @@ from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     TPU_DEEPSEEK_V41_CED: bool = False
+    TPU_DEEPSEEK_V41_ENGRAM_FUSED_HASH: bool = True
+    TPU_DEEPSEEK_V41_ENGRAM_MASKS_IN_HASH: bool = True
+    TPU_DEEPSEEK_V41_ENGRAM_INT32_SLOT_WRITE: bool = True
+    TPU_DEEPSEEK_V41_ENGRAM_TILE_SCATTER: bool = True
     TPU_DEEPSEEK_V41_IMPL: str = "v2"
     TPU_DEEPSEEK_V41_ENGRAM_CPU_OFFLOAD: bool = False
     TPU_DEEPSEEK_V41_ENGRAM_HBM: str = "auto"
@@ -384,6 +388,31 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Decoder SWA bounded replay is approximate. Keep full-forward as the
     # default/reference until matched model-quality and performance validation.
     "TPU_DEEPSEEK_V41_CED": env_bool("TPU_DEEPSEEK_V41_CED"),
+    # Engram n-gram hash on device as one fused program with exact 64-bit
+    # arithmetic on uint32 pairs (kernels/engram_hash.py), instead of the
+    # eager int64 torch ops XLA emulates op by op. Hash ids are unchanged.
+    "TPU_DEEPSEEK_V41_ENGRAM_FUSED_HASH": env_bool(
+        "TPU_DEEPSEEK_V41_ENGRAM_FUSED_HASH", default=True
+    ),
+    # With the fused Engram hash, derive the image-sentinel dead masks of the
+    # input and lookback ids inside the slot-cache write and the hash program
+    # instead of in two eager compare programs ahead of them. Same integers
+    # (bit-exact). Requires TPU_DEEPSEEK_V41_ENGRAM_FUSED_HASH. Default off.
+    "TPU_DEEPSEEK_V41_ENGRAM_MASKS_IN_HASH": env_bool(
+        "TPU_DEEPSEEK_V41_ENGRAM_MASKS_IN_HASH", default=True
+    ),
+    # Engram slot-cache write: derive the slots and map the token ids in int32,
+    # one compiled program each (v2/engram.py), instead of eager int64 torch
+    # ops. Same slots, same cache contents.
+    "TPU_DEEPSEEK_V41_ENGRAM_INT32_SLOT_WRITE": env_bool(
+        "TPU_DEEPSEEK_V41_ENGRAM_INT32_SLOT_WRITE", default=True
+    ),
+    # With the int32 slot write: scatter into the slot cache by 128-entry tile
+    # read-modify-writes (kernels/deepseek_v41/tile_scatter.py), costing per
+    # touched tile instead of XLA's pass over the whole cache. Same contents.
+    "TPU_DEEPSEEK_V41_ENGRAM_TILE_SCATTER": env_bool(
+        "TPU_DEEPSEEK_V41_ENGRAM_TILE_SCATTER", default=True
+    ),
     # Deprecated aliases, resolved by the DSV41 serving-policy verifier.
     # Serving supports v2; v1 remains only as a standalone reference.
     "TPU_DEEPSEEK_V41_IMPL": env_with_choices(
