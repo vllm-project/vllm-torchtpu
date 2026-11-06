@@ -358,3 +358,18 @@ def test_gmm_v2_n_window_is_a_bitwise_column_slice_on_tpu(tokens):
     quarter = _bits(gmm_v2(lhs, w2, gs, n_window=(640, 640), **kw))
     np.testing.assert_array_equal(quarter, full[:, 640:1280])
     assert (halves[1] != full[:, :1280]).any()
+
+
+@pytest.mark.parametrize("scopes,level,on", [(0, 2, False), (1, 2, False), (2, 2, True), (3, 2, True)])
+def test_gmm_v2_trace_scopes_gate(scopes, level, on):
+    """Phase trace scopes exist only when asked for; off is a no-op context."""
+    import contextlib
+
+    from vllm_torchtpu.kernels.megablox.gmm_v2 import GmmConfigs, trace_scope
+
+    cfgs = GmmConfigs(tiles=None, dims=None, lhs_cfgs=None, rhs_cfgs=None, out_dtype=None,
+                      acc_dtype=None, zero_init=False, fuse_act=None, trace_scopes=scopes)
+    scope = trace_scope(cfgs, "gmm_mxu", level)
+    assert isinstance(scope, contextlib.nullcontext) is (not on)
+    with scope:
+        pass

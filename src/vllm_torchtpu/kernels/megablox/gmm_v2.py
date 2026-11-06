@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import contextlib
 import dataclasses
 import functools
 from abc import ABC, abstractmethod
@@ -289,6 +290,12 @@ class GmmConfigs:
     # inside it (where the same ops repeat tile_n // mxu_size times and the
     # repeats are left to CSE). Same ops on the same values.
     hoist_lhs_quant: bool = False
+    # Phase trace scopes inside each visit (0 off; >= 2 adds gmm_quant, gmm_mxu,
+    # gmm_epilogue under the existing per-visit bm<rows>_* scopes). They appear
+    # on xprof's "XLA TraceMe" line only with libtpu's
+    # --xla_enable_custom_call_region_trace=true. Profiling builds only: a
+    # scoped build is not guaranteed bit-identical.
+    trace_scopes: int = 0
 
     @property
     def num_quant_blocks_per_tile_k(self) -> int:
@@ -303,6 +310,11 @@ class GmmConfigs:
 
 
 TileFn = Callable[[Dimensions, InputConfigs, InputConfigs, int, str | None], TileSizes]
+
+
+def trace_scope(cfgs: "GmmConfigs", name: str, level: int):
+    """A named device scope when cfgs.trace_scopes >= level, else a no-op."""
+    return jax.named_scope(name) if cfgs.trace_scopes >= level else contextlib.nullcontext()
 
 
 class IndexMaps:
@@ -519,17 +531,18 @@ def inner_kernel(
             # inner loop which can be used to pipeline subsequent VPU or VST ops with
             # MXU ops for the next [tile_m, mxu_size].
             def quantize_block(start_k):
-                end_k = min(cfgs.tiles.tile_k, start_k + q_block_size)
-                block_lhs = tiled_lhs[:, start_k:end_k]
-                block_abs_max = jnp.max(jnp.abs(block_lhs), axis=1, keepdims=True)
-                block_scale = block_abs_max / dtype_max
+                with trace_scope(cfgs, "gmm_quant", 2):
+                    end_k = min(cfgs.tiles.tile_k, start_k + q_block_size)
+                    block_lhs = tiled_lhs[:, start_k:end_k]
+                    block_abs_max = jnp.max(jnp.abs(block_lhs), axis=1, keepdims=True)
+                    block_scale = block_abs_max / dtype_max
 
-                # If block_scale=0, it will cause division by zero and return either
-                # NaN or Inf. Since this can cause numeric issue when downcasting to
-                # quantized value, we convert them into 0.
-                block_scale_inv = jnp.where(block_scale == 0, 0, 1 / block_scale)
-                # Convert lhs into quantized dtype.
-                return (block_lhs * block_scale_inv).astype(lhs_q_dtype), block_scale
+                    # If block_scale=0, it will cause division by zero and return either
+                    # NaN or Inf. Since this can cause numeric issue when downcasting to
+                    # quantized value, we convert them into 0.
+                    block_scale_inv = jnp.where(block_scale == 0, 0, 1 / block_scale)
+                    # Convert lhs into quantized dtype.
+                    return (block_lhs * block_scale_inv).astype(lhs_q_dtype), block_scale
 
             hoisted = (
                 {k: quantize_block(k) for k in range(0, cfgs.tiles.tile_k, q_block_size)}
@@ -561,11 +574,12 @@ def inner_kernel(
                     if not tpu_info.is_matmul_supported(lhs_q_dtype, block_rhs.dtype):
                         block_rhs = block_rhs.astype(lhs_q_dtype)
 
-                    block_acc = jnp.matmul(
-                        block_lhs_q,
-                        block_rhs,
-                        preferred_element_type=preferred_element_type,
-                    ).astype(acc_ref.dtype)
+                    with trace_scope(cfgs, "gmm_mxu", 2):
+                        block_acc = jnp.matmul(
+                            block_lhs_q,
+                            block_rhs,
+                            preferred_element_type=preferred_element_type,
+                        ).astype(acc_ref.dtype)
 
                     block_acc *= block_scale.astype(acc_ref.dtype)
 
@@ -582,6 +596,8 @@ def inner_kernel(
         acc = jnp.concatenate(acc_list, axis=1)
 
         # Step 3: Output post-processing.
+        epilogue_scope = trace_scope(cfgs, "gmm_epilogue", 2)
+        epilogue_scope.__enter__()
         if not is_first_k_step:
             acc = jnp.pad(acc, ((cfgs.tiles.tile_m - bucket_m, 0), (0, 0)))
             acc += acc_ref[...]
@@ -631,6 +647,7 @@ def inner_kernel(
             )
         else:
             acc_ref[:acc_m] = acc
+        epilogue_scope.__exit__(None, None, None)
 
     def run_matmul_step(bucket_idx: int):
         bucket_m = cfgs.tiles.bucket_base * (bucket_idx + 1)
@@ -1170,6 +1187,7 @@ def get_scope_name(cfgs: GmmConfigs) -> str:
     tiles = cfgs.tiles
     window = "" if cfgs.n_window is None else f"-nw_{cfgs.n_window[0]}"
     window += "-hq" if cfgs.hoist_lhs_quant else ""
+    window += f"-sc{cfgs.trace_scopes}" if cfgs.trace_scopes else ""
     return (
         f"gmm_v2-g_{dims.size_group}-m_{dims.size_m}-k_{dims.size_k}-act_{cfgs.fuse_act}"
         f"-n_{dims.size_n}{window}-tm_{tiles.tile_m}-tk_{tiles.tile_k}-tn_{tiles.tile_n}"
@@ -1194,6 +1212,7 @@ def make_gmm_configs(
     rhs_quant_dtype: jnp.dtype | None = None,
     n_window: tuple[int, int] | None = None,
     hoist_lhs_quant: bool = False,
+    trace_scopes: int = 0,
 ):
     """Fills the GMM config for the GMM kernel."""
 
@@ -1298,6 +1317,7 @@ def make_gmm_configs(
         fuse_act=fuse_act,
         n_window=n_window,
         hoist_lhs_quant=hoist_lhs_quant,
+        trace_scopes=trace_scopes,
     )
 
 
@@ -1325,6 +1345,7 @@ def get_metadata(cfgs: GmmConfigs) -> dict[str, str | int | float]:
         "rhs_quant_dtype",
         "n_window",
         "hoist_lhs_quant",
+        "trace_scopes",
     ]
 )
 def gmm_v2(
@@ -1346,6 +1367,7 @@ def gmm_v2(
     rhs_quant_dtype: jnp.dtype | None = None,
     n_window: tuple[int, int] | None = None,
     hoist_lhs_quant: bool = False,
+    trace_scopes: int = 0,
 ) -> jax.Array:
     """GMM kernel implemented with emit_pipeline.
 
@@ -1377,6 +1399,9 @@ def gmm_v2(
             without the window.
         hoist_lhs_quant: Quantize each lhs k-block once per tile before the n
             loop instead of once per mxu-wide column chunk. Same values.
+        trace_scopes: >= 2 adds phase trace scopes (gmm_quant, gmm_mxu,
+            gmm_epilogue) for in-kernel profiling with libtpu's
+            --xla_enable_custom_call_region_trace=true. Profiling only.
 
     Returns:
         Output of shape [size_m, size_n] ([size_m, width] with n_window).
@@ -1419,6 +1444,7 @@ def gmm_v2(
         rhs_quant_dtype=rhs_quant_dtype,
         n_window=n_window,
         hoist_lhs_quant=hoist_lhs_quant,
+        trace_scopes=trace_scopes,
     )
     dims = cfgs.dims
     tiles = cfgs.tiles
