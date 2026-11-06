@@ -1008,10 +1008,8 @@ def _prepare_metadata_bounded(
 ):
     tokens = blocks.shape[0]
     assert tokens % query_block == 0
-    dcp = dcp_rank is not None
-    if dcp and not (paired_pages and kv_tile == dcp_world * physical_page_size):
-        raise ValueError("DCP prefill needs paired pages, one table entry per KV tile")
-    groups = page_table.shape[1] * physical_page_size * dcp_world // ratio
+    # Only the non-DCP branch of block_sparse_gqa_prefill calls this.
+    groups = page_table.shape[1] * physical_page_size // ratio
     num_kv_tiles = (groups * ratio + kv_tile - 1) // kv_tile
     words_per_tile = kv_tile // (ratio * 32)
     words = ((num_kv_tiles * words_per_tile + 127) // 128) * 128
