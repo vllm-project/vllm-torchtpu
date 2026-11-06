@@ -467,7 +467,7 @@ def patch_runai_sharded_expert_streaming() -> None:
             local_expert_ids = None
         if local_expert_ids is None:
             return original_get_iterator(
-                self, model_or_path, revision
+                self, model_or_path, revision, is_unused_weight
             )
         if getattr(self, "_is_distributed", False):
             # Per-rank fetch plans differ, so the streamer's cross-rank

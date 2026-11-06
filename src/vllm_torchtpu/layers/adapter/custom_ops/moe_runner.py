@@ -55,7 +55,7 @@ class VllmMoERunner(MoERunner):
             # replaces the logits before a monolithic kernel (or raises for
             # strategies without monolithic support). The TPU MoE methods
             # simulate routing themselves from the real logits (moe_routing).
-            object.__setattr__(self.router, "prepare_monolithic_logits", lambda router_logits: router_logits)
+            self.router.prepare_monolithic_logits = lambda router_logits: router_logits
 
     def _take_over_moe_quant_config_init(self) -> None:
         routed_experts = self.routed_experts

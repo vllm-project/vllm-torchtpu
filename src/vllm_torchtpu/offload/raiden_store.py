@@ -166,7 +166,7 @@ _all_ranks_kv_bytes_per_block: int | None = None
 def _worker_kv_bytes_per_block(kv_cache_config: Any) -> int:
     """One worker's bytes per block, as vLLM's ``build_offloading_config``
     derives ``worker_kv_bytes_per_block`` from that worker's config."""
-    from vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler import (
+    from vllm.distributed.kv_transfer.kv_connector.v1.offloading.config import (
         _group_kv_bytes_per_block,
         get_offloading_group_ids,
     )

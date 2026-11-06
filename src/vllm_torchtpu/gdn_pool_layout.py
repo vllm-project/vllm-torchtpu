@@ -241,7 +241,7 @@ class PrefillCheckpointUnits:
     mamba_block_size: int
     alignment: int
     drop_eagle_block: bool
-    
+    num_hash_lookahead_tokens: int = 0
 
     def fill_offsets(
         self, out: np.ndarray, seq_lens: np.ndarray, query_lens: np.ndarray
@@ -268,6 +268,6 @@ class PrefillCheckpointUnits:
                 checkpoint_alignment=self.alignment,
                 drop_eagle_block=self.drop_eagle_block,
                 cache_hit_alignment_tokens=self.cache_hit_alignment_tokens,
-                
+                num_hash_lookahead_tokens=self.num_hash_lookahead_tokens,
             )
             out[rows] = np.asarray(offsets, dtype=np.int32)
