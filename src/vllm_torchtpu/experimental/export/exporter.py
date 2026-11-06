@@ -344,8 +344,42 @@ def _req_dist_len(model: api.ExportableTextOnlyLLM) -> int:
     return 6 if recurrent and model.export_config.recurrent_window > 1 else 3
 
 
+def _kv_cache_groups(model: api.ExportableTextOnlyLLM) -> list[api.KvCacheGroup]:
+    """The model's KV cache groups; none when every layer reads `block_tables`."""
+    groups_fn = getattr(model, "kv_cache_groups", None)
+    return list(groups_fn()) if callable(groups_fn) else []
+
+
+def _block_tables_name(model: api.ExportableTextOnlyLLM) -> str:
+    """The name of the fourth user input: `block_tables`, or with KV cache
+    groups the first group's page table (the others follow the state)."""
+    groups = _kv_cache_groups(model)
+    return f"{groups[0].name}_block_tables" if groups else "block_tables"
+
+
+def _kv_cache_groups_serving_config(
+    model: api.ExportableTextOnlyLLM,
+) -> dict[str, list[dict[str, Any]]]:
+    """`kv_cache_groups` for a model with KV cache groups, else nothing."""
+    groups = _kv_cache_groups(model)
+    if not groups:
+        return {}
+    return {
+        "kv_cache_groups": [
+            {
+                "name": g.name,
+                "retention": "all" if g.window is None else {"window": g.window},
+            }
+            for g in groups
+        ]
+    }
+
+
 def _user_inputs(
-    cfg: api.TextOnlyLLMExportConfig, bucket_size: int, req_dist_len: int = 3
+    cfg: api.TextOnlyLLMExportConfig,
+    bucket_size: int,
+    req_dist_len: int = 3,
+    block_tables_name: str = "block_tables",
 ) -> list[tuple[str, tuple[int, ...]]]:
     """Returns `(name, shape)` of the int32 user inputs of `forward_bucket{B}`."""
     pos_shape = (
@@ -359,7 +393,10 @@ def _user_inputs(
         (cfg.max_cu_seqs,),
         (req_dist_len,),
     )
-    return list(zip(_USER_INPUT_NAMES, shapes, strict=True))
+    names = tuple(
+        block_tables_name if n == "block_tables" else n for n in _USER_INPUT_NAMES
+    )
+    return list(zip(names, shapes, strict=True))
 
 
 def _weight_slots(
@@ -566,7 +603,9 @@ def _params_read_by_forward(
     bucket = min(cfg.token_buckets)
     mlir_text = tpu_lowering.lower_torch_forward_to_mlir(
         model,
-        user_inputs=_user_inputs(cfg, bucket, _req_dist_len(model)),
+        user_inputs=_user_inputs(
+            cfg, bucket, _req_dist_len(model), _block_tables_name(model)
+        ),
         forward_names=names,
         params_map=_norm_params(params_map),
         state_specs=_state_specs(model),
@@ -700,7 +739,9 @@ def _export_text_only_llm_functions(
 
     forward_variants: dict[str, Any] = {}
     for b_idx, bucket_size in enumerate(cfg.token_buckets):
-        user_inputs = _user_inputs(cfg, bucket_size, _req_dist_len(model))
+        user_inputs = _user_inputs(
+            cfg, bucket_size, _req_dist_len(model), _block_tables_name(model)
+        )
         fwd_mlir = tpu_lowering.lower_torch_forward_to_mlir(
             model,
             user_inputs=user_inputs,
@@ -1287,6 +1328,7 @@ def export(
         "block_size": cfg.block_size,
         "num_blocks": cfg.num_blocks,
         **_recurrent_serving_config(model),
+        **_kv_cache_groups_serving_config(model),
         "max_model_len": cfg.max_model_len,
         "tensor_parallel_size": tp_size,
         "pipeline_parallel_size": pp_size,
