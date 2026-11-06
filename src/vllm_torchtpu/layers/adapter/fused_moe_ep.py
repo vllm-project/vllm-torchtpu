@@ -188,8 +188,12 @@ def _build_op(
     logical_intermediate_size: int | None = None,
     has_expert_slot=False,
     has_expert_load=False,
+    row_score_bias=False,
 ):
     """The op for this closure, built once per distinct closure and reused.
+
+    `row_score_bias` takes `score_bias` as [tokens, experts], sharded like the
+    tokens, instead of one replicated row.
 
     `has_expert_slot` adds the expert layout's slot table as one more
     replicated operand (expert_placement.py): the table's values are data, so
@@ -233,6 +237,7 @@ def _build_op(
         logical_intermediate_size,
         has_expert_slot,
         has_expert_load,
+        row_score_bias,
         envs.MOE_FUSED_EP_KERNEL_IMPL,
         tuple(sorted(impl_kw.items())),
     )
@@ -487,7 +492,7 @@ def _build_op(
     # exported program per MoE layer.
     input_specs = (
         (spec,) * 7
-        + ((PartitionSpec(),) if has_score_bias else ())
+        + (((spec if row_score_bias else PartitionSpec()),) if has_score_bias else ())
         + ((spec,) if has_hash_ids else ())
         # The slot table is indexed by global expert id too: replicated.
         + ((PartitionSpec(),) if has_expert_slot else ())
@@ -574,8 +579,9 @@ def fused_moe_ep(
     only call this when that said yes.
 
     `score_bias` is the layer's `e_score_correction_bias`, [global experts]
-    f32, and `hash_ids` is `hash_topk_ids_operand`'s [tokens, topk] i32 table
-    lookup; `expert_slot` is a placed layer's slot table
+    f32, or [tokens, global experts] with one row per token when prebuild was
+    given `row_score_bias`; `hash_ids` is `hash_topk_ids_operand`'s [tokens,
+    topk] i32 table lookup; `expert_slot` is a placed layer's slot table
     (`expert_placement.expert_slot_table`); `expert_load` is the layer's
     routed-row accumulator (`expert_load.operand`), donated to the op and
     written back here. Each must be passed exactly when
@@ -710,6 +716,7 @@ def prebuild_fused_moe_ep(
     supplies_hash_ids=False,
     logical_intermediate_size: int | None = None,
     policy: FusedEPPolicy = FusedEPPolicy.LEGACY,
+    row_score_bias: bool = False,
 ) -> Any | None:
     """Resolve the mesh and build the fused-EP op for one layer.
 
@@ -736,6 +743,8 @@ def prebuild_fused_moe_ep(
     them; the built op closes over configuration, never these tensors.
     `logical_intermediate_size` certifies trailing zero-padded gate/up and
     down weights; only the loader that creates that padding may supply it.
+    `row_score_bias` says the caller will pass `score_bias` as [tokens,
+    experts], one row per token, instead of the staged [experts] vector.
     """
     if policy == FusedEPPolicy.LEGACY:
         if not envs.USE_MOE_FUSED_EP_KERNEL:
@@ -914,6 +923,7 @@ def prebuild_fused_moe_ep(
         logical_intermediate_size=logical_intermediate_size,
         has_expert_slot=placed is not None,
         has_expert_load=placed is not None and expert_load_tap.enabled(),
+        row_score_bias=row_score_bias,
     )
     logger.info_once(
         "Fused EP MoE armed | hidden=%d inter=%d local_experts=%d ep=%d "

@@ -327,6 +327,7 @@ class VllmMxfp4MoEMethod(TpuMoEActivationMixin, Mxfp4MoEMethod):
         x: torch.Tensor,
         router_logits: torch.Tensor,
         input_ids: torch.Tensor | None = None,
+        score_bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Forward pass using GMM kernel."""
         layer = cast("TpuRoutedExperts", layer)
@@ -342,7 +343,7 @@ class VllmMxfp4MoEMethod(TpuMoEActivationMixin, Mxfp4MoEMethod):
         # input_ids is forwarded for DeepSeek-V4 hash routing; mxfp4 is the only
         # method that supplies it, matching the pre-consolidation behavior.
         topk_weights, topk_ids = moe_routing.route(
-            layer, x, router_logits, input_ids=input_ids
+            layer, x, router_logits, input_ids=input_ids, score_bias=score_bias
         )
 
         kwargs = {
@@ -499,6 +500,9 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
                 else None
             ),
             policy=FusedEPPolicy.REQUIRED if self.fused_ep else FusedEPPolicy.LEGACY,
+            # DeepseekV41MoE mirrors bias_vl onto vision layers; the forward
+            # below then hands the kernel one bias row per token.
+            row_score_bias=getattr(layer, "bias_vl", None) is not None,
         )
         if self.fused_ep and op is None:
             raise ValueError(
@@ -817,6 +821,7 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
         x: torch.Tensor,
         router_logits: torch.Tensor,
         input_ids: torch.Tensor | None = None,
+        score_bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
         from vllm_torchtpu.layers.adapter.fused_moe_ep import (
             fused_moe_ep,
@@ -826,11 +831,11 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
         )
 
         layer = cast("TpuRoutedExperts", layer)
+        rows = router_logits.shape[0]
         if fused_moe_ep_supported(self):
             # This rank's own tokens in and out: the kernel scores, selects,
-            # dispatches, runs both matmuls and combines inside one program,
-            # so `input_ids` has no reader here -- hash-routed layers are
-            # refused at admission and take the branch below instead.
+            # dispatches, runs both matmuls and combines inside one program.
+            # `input_ids` select hash-routed and image rows.
             return fused_moe_ep(
                 self,
                 x,
@@ -839,9 +844,33 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
                 layer._tpu_fused_w13_scale,
                 layer._tpu_fused_w2_scale,
                 router_logits,
-                score_bias_operand(layer),
+                _with_image_bias(layer, score_bias_operand(layer), input_ids, rows),
                 hash_topk_ids_operand(layer, input_ids),
                 expert_placement.expert_slot_table(layer),
                 expert_load.operand(layer),
             )
-        return super()._forward_monolithic_tpu(layer, x, router_logits, input_ids)
+        return super()._forward_monolithic_tpu(
+            layer,
+            x,
+            router_logits,
+            input_ids,
+            score_bias=_with_image_bias(
+                layer, layer.e_score_correction_bias, input_ids, rows
+            ),
+        )
+
+
+def _with_image_bias(layer, bias, input_ids, rows):
+    """`bias` per routed row, `bias_vl` on DeepSeek-V4.1 image rows.
+
+    DeepseekV41MoE mirrors bias_vl onto vision layers; image tokens select
+    with it, as upstream's router does. Other layers keep `bias` as is.
+    `rows` is the router logits' row count: this rank's own tokens, which
+    `input_ids` must match.
+    """
+    bias_vl = getattr(layer, "bias_vl", None)
+    if bias_vl is None:
+        return bias
+    ids = input_ids.reshape(rows, 1)
+    image = (ids >= layer.image_sentinel_lo) & (ids < layer.image_sentinel_hi)
+    return torch.where(image, bias_vl.float(), bias.float())

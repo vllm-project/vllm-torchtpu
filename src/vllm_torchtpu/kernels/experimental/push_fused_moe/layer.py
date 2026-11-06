@@ -344,11 +344,15 @@ def fused_ep_moe_push(
     has_hash_ids = hash_topk_ids is not None
     if scoring_fn not in SCORING_FNS:
         raise ValueError(f"scoring_fn must be one of {SCORING_FNS}; got {scoring_fn!r}")
-    if has_score_bias and score_bias.shape != (e_logical,):
+    if has_score_bias and score_bias.shape not in (
+        (e_logical,),
+        (gating.shape[0], e_logical),
+    ):
         raise ValueError(
-            f"score_bias must be one value per global expert, [{e_logical}]; "
-            f"got {tuple(score_bias.shape)}"
+            f"score_bias must be one value per global expert, [{e_logical}], "
+            f"or one such row per token; got {tuple(score_bias.shape)}"
         )
+    row_bias = score_bias is not None and score_bias.ndim == 2
     if has_hash_ids and (
         hash_topk_ids.shape != (x.shape[0], topk)
         or not jnp.issubdtype(hash_topk_ids.dtype, jnp.integer)
@@ -456,6 +460,8 @@ def fused_ep_moe_push(
     def select_local(gate_l, hash_l, score_bias_l, row_scale_l, expert_slot_l, rank_l):
         """v2's: top-k, router weights, and this shard's routing payload."""
         me = rank_l[0, 0]
+        if row_bias:
+            score_bias_l = token_layout.split(score_bias_l, me)
         scores = _apply_scoring_fn(gate_l, scoring_fn)
         select_rows = MAX_ROUTING_BLOCK
         while t_local % select_rows:
@@ -471,7 +477,7 @@ def fused_ep_moe_push(
             )
         else:
             topk_weights, topk_idx = pallas_select(
-                scores + score_bias_l.astype(jnp.float32)[None, :],
+                scores + score_bias_l.astype(jnp.float32),
                 topk=topk,
                 block_rows=select_rows,
                 weight_scores=scores,
@@ -755,8 +761,9 @@ def fused_ep_moe_push(
     expert_load_args = (expert_load,) if has_expert_load else ()
     in_specs = (
         (P(ax),) * (5 + len(scale_args) + len(hash_args))
-        + (P(),)
-        * (len(score_bias_args) + len(expert_slot_args) + len(expert_load_args))
+        # A per-token score bias rides with the gating rows.
+        + (P(ax) if row_bias else P(),) * len(score_bias_args)
+        + (P(),) * (len(expert_slot_args) + len(expert_load_args))
         + (P(ax),) * len(bias_args)
     )
     args = (
@@ -798,6 +805,7 @@ def fused_ep_moe_push(
         has_w2_bias and w2_bias.dtype,
         scoring_fn,
         has_score_bias and cast(jax.Array, score_bias).dtype,
+        row_bias,
         has_hash_ids and cast(jax.Array, hash_topk_ids).dtype,
         has_expert_slot and tuple(cast(jax.Array, expert_slot).shape),
         has_expert_load,

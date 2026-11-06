@@ -12,15 +12,12 @@ from vllm_torchtpu.layers.adapter.quantization.deepseek_v4_fp8 import (
     VllmDeepseekV4Fp8Config,
 )
 from vllm_torchtpu.layers.adapter.upstream_bindings import device_hooks
-from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.models.vllm.deepseek_v4.layers import DeepseekV4MLP
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.fused_moe.config import FusedMoEConfig
 
     from .mxfp4 import VllmDeepseekV4Mxfp4MoEMethod
-
-logger = init_logger(__name__)
 
 
 @register_quantization_config("tpu-deepseek_v41_fp8")
@@ -69,13 +66,19 @@ class DeepseekV41MoE(DeepseekV4MoE):
         ):
             super().__init__(vllm_config, *args, **kwargs)
         # Only upstream's router gets bias_vl; mirror it onto the experts for
-        # `moe_routing.select_experts`, as DeepseekV4MoE does with its hash
+        # `VllmDeepseekV4Mxfp4MoEMethod`, which builds the per-token score
+        # bias for both MoE backends, as DeepseekV4MoE does with its hash
         # table. The DSpark loader maps draft layers' bias_vl to their gate
-        # bias, so theirs is never loaded.
+        # bias, so theirs is never loaded. A language-only server sees no
+        # images, so it keeps the one-row score bias.
+        if self.gate.bias_vl is None:
+            return
+        model_config = vllm_config.model_config
+        mm_config = model_config.multimodal_config
         if (
-            self.gate.bias_vl is not None
+            not (mm_config is not None and mm_config.language_model_only)
             and extract_layer_index(self.prefix)
-            < vllm_config.model_config.hf_config.num_hidden_layers
+            < model_config.hf_config.num_hidden_layers
         ):
             experts = self.experts.routed_experts
             lo = self.image_sentinel_lo
@@ -83,17 +86,6 @@ class DeepseekV41MoE(DeepseekV4MoE):
             object.__setattr__(experts, "image_sentinel_lo", lo)
             # Upstream's router matches the five sentinel ids from lo.
             object.__setattr__(experts, "image_sentinel_hi", lo + 5)
-            from vllm_torchtpu.models.vllm.deepseek_v41.config import (
-                DeepseekV41Config,
-                MoEBackend,
-            )
-
-            policy = DeepseekV41Config.from_vllm_config(vllm_config)
-            if policy.moe == MoEBackend.FUSED_EP_W4A8:
-                logger.warning_once(
-                    "DeepSeek-V4.1 fused EP MoE routes image tokens like text; "
-                    "bias_vl is applied only with moe=gmm"
-                )
 
     def forward(self, hidden_states, input_ids=None, mega_gate_metadata=None):
         if (

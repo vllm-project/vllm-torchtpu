@@ -642,3 +642,46 @@ def test_specialized_softplus_preserves_finite_and_nonfinite_scores(dtype):
     np.testing.assert_array_equal(np.isnan(specialized), np.isnan(generic))
     np.testing.assert_array_equal(np.isposinf(specialized), np.isposinf(generic))
     np.testing.assert_allclose(specialized, generic, rtol=2e-6, atol=1e-6)
+
+
+@pytest.mark.cpu_test
+def test_per_token_score_bias_selects_each_row_with_its_own_bias(monkeypatch):
+    """A [tokens, experts] score bias routes every row as its own 1-D bias would."""
+    from vllm_torchtpu.kernels.fused_moe.v2 import host, layer
+
+    monkeypatch.setattr(
+        layer,
+        "pallas_select",
+        functools.partial(router_ops.pallas_select, interpret=True),
+    )
+    monkeypatch.setattr(layer, "_LAYER_SM_CACHE", {})
+    rng = np.random.default_rng(5)
+    with jax.default_device(jax.devices("cpu")[0]):
+        gate = jnp.asarray(rng.normal(size=(288, 384)), jnp.float32)
+        text = jnp.asarray(rng.normal(size=384) * 4, jnp.float32)
+        image = jnp.asarray(rng.normal(size=384) * 4, jnp.float32)
+        rows = (np.arange(288) % 3 == 0)[:, None]
+        mesh = jax.sharding.Mesh(np.array(jax.devices("cpu")[:1]), ("d",))
+
+        def route(score_bias):
+            _, _, payload = layer.fused_ep_moe_v2(
+                jnp.zeros((288, 128), jnp.bfloat16),
+                jnp.zeros((384, 128, 256), jnp.bfloat16),
+                jnp.zeros((384, 128, 128), jnp.bfloat16),
+                None,
+                None,
+                gate,
+                topk=6,
+                renormalize=True,
+                mesh=mesh,
+                capacity=128,
+                weight_format=host.WeightFormat.BF16,
+                scoring_fn="sqrtsoftplus",
+                score_bias=score_bias,
+                stage="route",
+            )
+            return np.asarray(payload)[0, : 288 * 6].reshape(288, 6)
+
+        mixed = route(jnp.where(rows, image, text))
+        want = np.where(rows, route(image), route(text))
+    np.testing.assert_array_equal(mixed, want)

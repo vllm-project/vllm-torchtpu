@@ -403,6 +403,10 @@ def fused_ep_moe_v2(
     selection -- renormalization, the routed scale, the empty-row mask,
     dispatch, the matmuls and the combine -- is the top-k path unchanged.
 
+    score_bias is [experts] f32, replicated, or [tokens, experts] f32 sharded
+    like gating when the bias differs per token. Either way it shifts only
+    the selection.
+
     expert_slot [experts, R] i32, replicated, places the experts: the
     weights' expert axis is in SLOT order, and row e lists the slots holding
     global expert e, padded with -1 past its last replica. A token's
@@ -557,11 +561,15 @@ def fused_ep_moe_v2(
     has_expert_slot = expert_slot is not None
     if scoring_fn not in SCORING_FNS:
         raise ValueError(f"scoring_fn must be one of {SCORING_FNS}; got {scoring_fn!r}")
-    if has_score_bias and score_bias.shape != (e_router,):
+    if has_score_bias and score_bias.shape not in (
+        (e_router,),
+        (gating.shape[0], e_router),
+    ):
         raise ValueError(
-            f"score_bias must be one value per global expert, [{e_router}]; "
-            f"got {tuple(score_bias.shape)}"
+            f"score_bias must be one value per global expert, [{e_router}], "
+            f"or one such row per token; got {tuple(score_bias.shape)}"
         )
+    row_bias = score_bias is not None and score_bias.ndim == 2
     if has_expert_slot and (
         expert_slot.ndim != 2
         or expert_slot.shape[0] != e_router
@@ -684,6 +692,8 @@ def fused_ep_moe_v2(
         histogram the routing plan reads alongside the gathered payload.
         """
         me = rank_l[0, 0]
+        if row_bias:
+            score_bias_l = token_layout.split(score_bias_l, me)
         select_rows = MAX_ROUTING_BLOCK
         while t_local % select_rows:
             select_rows //= 2
@@ -712,7 +722,7 @@ def fused_ep_moe_v2(
         if fused_finalize:
             assert score_bias_l is not None
             topk_weights, topk_idx, row_routes = select_finalize_normalized_router(
-                scores + score_bias_l.astype(jnp.float32)[None, :],
+                scores + score_bias_l.astype(jnp.float32),
                 scores,
                 gate_l,
                 scale=routed_scaling_factor,
@@ -734,7 +744,7 @@ def fused_ep_moe_v2(
                 # Selection is based on (scores + score_bias_l); the weights come
                 # from the scores.
                 topk_weights, topk_idx = pallas_select(
-                    scores + score_bias_l.astype(jnp.float32)[None, :],
+                    scores + score_bias_l.astype(jnp.float32),
                     topk=topk,
                     block_rows=select_rows,
                     weight_scores=scores,
@@ -1159,7 +1169,8 @@ def fused_ep_moe_v2(
     # it is indexed by GLOBAL expert id and every shard scores the full
     # expert set, so `P()` hands each shard the whole [e_total] vector.
     # Sharding it would give each shard a 1/ep slice of the experts and
-    # silently bias the wrong ones.
+    # silently bias the wrong ones. A per-token bias rides with the gating
+    # rows instead.
     score_bias_args = (score_bias,) if has_score_bias else ()
     hash_args = (hash_topk_ids,) if has_hash_ids else ()
     # Replicated for the same reason: it is indexed by global expert id.
@@ -1167,8 +1178,8 @@ def fused_ep_moe_v2(
     expert_load_args = (expert_load,) if has_expert_load else ()
     in_specs = (
         (P(ax),) * (5 + len(scale_args) + len(hash_args))
-        + (P(),)
-        * (len(score_bias_args) + len(expert_slot_args) + len(expert_load_args))
+        + (P(ax) if row_bias else P(),) * len(score_bias_args)
+        + (P(),) * (len(expert_slot_args) + len(expert_load_args))
         + (P(ax),) * len(bias_args)
     )
     args = (
@@ -1215,6 +1226,7 @@ def fused_ep_moe_v2(
         has_w2_bias and w2_bias.dtype,
         scoring_fn,
         has_score_bias and cast(jax.Array, score_bias).dtype,
+        row_bias,
         has_hash_ids and hash_topk_ids.dtype,
         has_expert_slot and tuple(cast(jax.Array, expert_slot).shape),
         has_expert_load,
