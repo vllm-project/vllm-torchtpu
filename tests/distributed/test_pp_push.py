@@ -583,3 +583,13 @@ def test_q38_worker_rings_follow_the_override(monkeypatch, fresh_steps, queue):
     monkeypatch.setenv("TPU_PP_EXTRA_STEPS_IN_FLIGHT", "5")
     pp_push.widen_message_rings(_config(8))
     assert queue(1, 1).kwargs["max_chunks"] == pp_push.rpc_ring_chunks(8, 5)
+
+
+def test_q38_a_worker_states_its_steps_in_flight(monkeypatch, fresh_steps, queue):
+    lines = []
+    monkeypatch.setattr(
+        pp_push.logger, "info", lambda fmt, *a, **k: lines.append(fmt % a)
+    )
+    monkeypatch.setenv("TPU_PP_HANDOFF", "ring")
+    pp_push.widen_message_rings(_config(8))
+    assert lines[-1].startswith("PP ring hand-off: 12 steps in flight (8 stages + 4)")

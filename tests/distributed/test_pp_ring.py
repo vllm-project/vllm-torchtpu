@@ -907,6 +907,21 @@ def _run_verified(monkeypatch, stages, verify, mutant=-1, period=2):
 
     monkeypatch.setattr(pp_ring.logger, "info", info)
     transport, rings = _build(monkeypatch, stages)
+    # A device reads a received tensor only once its data has landed (the
+    # runtime orders the read after the copy); the fake transport's receive
+    # returns at once, so the digest waits as the device would.
+    digest = pp_ring.activation_digest
+
+    def landed_digest(x, flip=False):
+        with transport.cv:
+            received = id(x) in transport.landed or any(
+                t is x for t in transport.posted.values()
+            )
+        if received:
+            transport.wait_landed(x)
+        return digest(x, flip=flip)
+
+    monkeypatch.setattr(pp_ring, "activation_digest", landed_digest)
     steps = [([16, 8], True), ([32], True), ([], True), ([64, 16, 8], True), ([8], False)]
     results = _run(rings, transport, steps)
     _check(results, steps, stages - 1)
@@ -951,3 +966,22 @@ def test_q38_a_failing_digest_turns_verification_off_and_serving_goes_on(monkeyp
     monkeypatch.setattr(pp_ring, "activation_digest", boom)
     lines = _run_verified(monkeypatch, stages=3, verify=3)
     assert lines == {}
+
+
+def test_q38_every_device_logs_that_its_self_test_passed(monkeypatch):
+    lines = []
+    real_info = pp_ring.logger.info
+
+    def info(fmt, *args, **kwargs):
+        if isinstance(fmt, str) and "self-test passed" in fmt:
+            lines.append(fmt % args)
+        return real_info(fmt, *args, **kwargs)
+
+    monkeypatch.setattr(pp_ring.logger, "info", info)
+    transport, rings = _build(monkeypatch, stages=3)
+    _run(rings, transport, [([8], True)])
+    assert sorted(lines) == [
+        "PP ring rank 0: hand-off self-test passed (from None, to 1)",
+        "PP ring rank 1: hand-off self-test passed (from 0, to 2)",
+        "PP ring rank 2: hand-off self-test passed (from 1, to None)",
+    ]

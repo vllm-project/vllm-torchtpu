@@ -302,6 +302,17 @@ def widen_message_rings(vllm_config: Any) -> None:
         _widen_rpc_ring(stages, extra)
         if extra:
             _raise_steps_in_flight(extra)
+        # The engine core's own install line does not reach the pod log; a
+        # worker states the depth it was built for (q38 proof line).
+        logger.info(
+            "PP %s hand-off: %d steps in flight (%d stages + %d), message "
+            "rings %d chunks",
+            "ring" if ring_handoff() else "wave",
+            stages + extra,
+            stages,
+            extra,
+            _ring_chunks_needed,
+        )
 
 
 def ring_handoff() -> bool:

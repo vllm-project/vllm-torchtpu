@@ -456,6 +456,7 @@ class PPRing:
                 f"{_LIBTPU_REQUIREMENT}."
             ) from exc
         if self.prev is None:
+            self._log_self_test_passed()
             return
         # Reading the received tensors waited for their data to land.
         self.landed_through = self.transfers
@@ -468,6 +469,17 @@ class PPRing:
                     f"{key!r} received {values}, expected {want} from global "
                     f"rank {self.prev}. {_LIBTPU_REQUIREMENT}."
                 )
+        self._log_self_test_passed()
+
+    def _log_self_test_passed(self) -> None:
+        """One line per worker that proves the ring runs there (q38): the
+        wave logs ``PP wave: rank`` instead."""
+        logger.info(
+            "PP ring rank %d: hand-off self-test passed (from %s, to %s)",
+            self.rank,
+            self.prev,
+            self.next,
+        )
 
     def begin_step(self, rows_per_forward: list[int]) -> None:
         """Called before the first forward of a scheduler step with the
