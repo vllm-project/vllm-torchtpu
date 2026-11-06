@@ -20,7 +20,7 @@ import dataclasses
 import pytest
 
 from tests.megakernel.test_moe_routing_ring import _simulate_expert_ring_no_collision
-from vllm_torchtpu.megakernel import vmem
+from vllm_torchtpu.megakernel import CacheExec, vmem
 from vllm_torchtpu.megakernel.exec_spec import ExecSpec, Tiles
 from vllm_torchtpu.models.qwen3_5.megakernel.model import (
     Qwen35Geometry,
@@ -70,7 +70,13 @@ def test_moe_deployment_ring_invariants():
                     continue
                 for tile_fn in (baseline_tiles, candidate30_tiles):
                     tiles = tile_fn(B, moe_tp=moe_tp, R=8)
-                    ex = ExecSpec(R=8, B=B, T=T, tiles=tiles)
+                    ex = ExecSpec(
+                        R=8,
+                        B=B,
+                        T=T,
+                        tiles=tiles,
+                        cache=CacheExec(paged_kv=True),
+                    )
                     cp, _ = vmem.build_scratch(ms, ex)
                     mp = cp.module("moe")
                     assert mp.NSS >= 3 + (mp.NBE - 1) // mp.TE

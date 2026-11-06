@@ -105,9 +105,8 @@ def test_m2_recorded_full_ep_hybrid_build_invariants():
     assert p.s_names == ("conv", "rec", "kc", "vc")
     assert p.o_names == ("hidden", "conv", "rec", "knew", "vnew")
     assert info_4k["T_TOTAL"] == 840
-    # M4b: 49,760,256; +2,048 B of always-allocated M5 GQA scratch (`rcs`;
-    # `rope` is allocated only under `gqa_qv`)
-    assert info_4k["vmem_scratch_bytes"] == 49_762_304
+    # Under `(8 * packing, 128)`-tiled `pool_alias.storage_size` VMEM accounting:
+    assert info_4k["vmem_scratch_bytes"] == 52_187_136
     assert info_4k["vmem_scratch_bytes"] <= ex_4k.resolved_tiles.vmem_mib * (1 << 20)
     assert "recb" in info_4k["vmem_shapes"]
     assert "sbuf" in info_4k["vmem_shapes"]
@@ -125,7 +124,7 @@ def test_m2_recorded_full_ep_hybrid_build_invariants():
 
     ex_10k = ExecSpec(B=4, T=1, R=8, ctx=10240, tiles=baseline_tiles(4, R=8))
     _, info_10k = qwen35.build(g, ex_10k)
-    assert info_10k["vmem_scratch_bytes"] == 49_762_304
+    assert info_10k["vmem_scratch_bytes"] == 52_187_136
 
 
 def test_m2_gdn_module_invariants_and_layout():

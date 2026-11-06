@@ -75,10 +75,9 @@ def test_m1_recorded_full_ep_build_invariants():
     assert info["T_TOTAL"] == 840
     assert p.module_params["moe"].TE == 12
     assert p.module_params["moe"].NSS == 3
-    # GDN-free M1 omits `recb`/`sbuf`/`convb` -> 48,033,792 < full hybrid's 49,178,624.
-    # (M4b: 48,031,744; +2,048 B of always-allocated M5 GQA scratch `rcs`. The
-    # `rope` table and the QV staging slabs are allocated only under `gqa_qv`.)
-    assert info["vmem_scratch_bytes"] == 48_033_792 < 49_178_624
+    # GDN-free M1 omits `recb`/`sbuf`/`convb` -> 50,085,888 < full hybrid's 52,187,136
+    # under `(8 * packing, 128)`-tiled `pool_alias.storage_size` VMEM accounting.
+    assert info["vmem_scratch_bytes"] == 50_085_888 < 52_187_136
     assert info["vmem_scratch_bytes"] <= ex.resolved_tiles.vmem_mib * (1 << 20)
     assert "recb" not in info["vmem_shapes"]
     assert "sbuf" not in info["vmem_shapes"]
