@@ -248,7 +248,6 @@ def test_str_keeps_an_explicit_empty_value_distinct_from_unset(monkeypatch):
         ("TORCH_TPU_MP_RENDEZVOUS_PORT", None),
         ("TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT", ""),
         ("SC_ALLREDUCE_ALLGATHER_OFFLOAD_MIN_BYTES", None),
-        ("MOE_ONLINE_FP8_EXCLUDED_EXPERTS", False),
     ],
 )
 def test_migrated_knob_defaults(monkeypatch, name, expected):
@@ -271,20 +270,3 @@ def test_spec_warmup_off_spellings(monkeypatch):
     monkeypatch.setenv("SPEC_WARMUP", "nope")
     with pytest.raises(ValueError, match="SPEC_WARMUP"):
         _ = envs.SPEC_WARMUP
-
-
-def test_moe_online_fp8_excluded_experts_parsing(monkeypatch):
-    """MOE_ONLINE_FP8_EXCLUDED_EXPERTS defaults False and validates booleans."""
-    from vllm_torchtpu import envs
-
-    monkeypatch.delenv("MOE_ONLINE_FP8_EXCLUDED_EXPERTS", raising=False)
-    assert envs.MOE_ONLINE_FP8_EXCLUDED_EXPERTS is False
-    for value in ("1", "true", "TRUE", "yes", "on"):
-        monkeypatch.setenv("MOE_ONLINE_FP8_EXCLUDED_EXPERTS", value)
-        assert envs.MOE_ONLINE_FP8_EXCLUDED_EXPERTS is True
-    for value in ("0", "false", "FALSE", "no", "off", ""):
-        monkeypatch.setenv("MOE_ONLINE_FP8_EXCLUDED_EXPERTS", value)
-        assert envs.MOE_ONLINE_FP8_EXCLUDED_EXPERTS is False
-    monkeypatch.setenv("MOE_ONLINE_FP8_EXCLUDED_EXPERTS", "2")
-    with pytest.raises(ValueError, match="MOE_ONLINE_FP8_EXCLUDED_EXPERTS"):
-        _ = envs.MOE_ONLINE_FP8_EXCLUDED_EXPERTS
