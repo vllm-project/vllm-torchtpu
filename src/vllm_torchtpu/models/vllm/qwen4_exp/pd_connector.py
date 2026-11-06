@@ -7,6 +7,7 @@ This connector does not borrow another model's native pool admission.
 
 import json
 import math
+import time
 from dataclasses import dataclass
 from typing import Any
 
@@ -55,6 +56,26 @@ from .pd_identity import canonical_rank_identity
 from .pd_manifest import build_transfer_manifest, measure_transfer_layout
 
 logger = init_logger(__name__)
+
+def sync_repack_enabled() -> bool:
+    """QWEN4_EXP_PD_SYNC_REPACK, or its wall-clock A/B, is configured."""
+    return bool(envs.QWEN4_EXP_PD_SYNC_REPACK) or int(envs.QWEN4_EXP_PD_SYNC_REPACK_AB_S) > 0
+
+
+def sync_repack_on(now: float | None = None) -> bool:
+    """Whether a load landing now waits for the scheduler-named step.
+
+    QWEN4_EXP_PD_SYNC_REPACK_AB_S > 0 alternates by wall clock (off in even
+    periods, on in odd ones), so one serving job holds both arms. Every
+    process of an engine reads the same host clock; a load deferred in an on
+    period is flushed at the first step of the next off period.
+    """
+    period = int(envs.QWEN4_EXP_PD_SYNC_REPACK_AB_S)
+    if period > 0:
+        t = time.time() if now is None else now
+        return int(t // period) % 2 == 1
+    return bool(envs.QWEN4_EXP_PD_SYNC_REPACK)
+
 
 # A hybrid pool's block IDs are only unique within a group, so vLLM rejects
 # invalid_block_ids for it; failed loads go back as request-level failures.
@@ -132,6 +153,51 @@ class Qwen4ExpRaidenConnector(TPURaidenConnector):
         ):
             raise ValueError("Qwen PD cannot use another model's pool admission")
         super().__init__(vllm_config, role, kv_cache_config)
+        # QWEN4_EXP_PD_SYNC_REPACK: the scheduler names the loads that landed
+        # on every rank; each rank's staged repack runs in the step that
+        # names them (start_load_kv, before the forward), on all ranks alike.
+        self._sync_repack = sync_repack_enabled() and not (
+            transfer is not None and transfer.is_kv_producer
+        )
+        self._landed_on_all_ranks: list[str] = []
+        self._failed_on_some_rank: list[str] = []
+
+    # --- QWEN4_EXP_PD_SYNC_REPACK -----------------------------------------
+
+    def update_connector_output(self, connector_output: Any) -> None:
+        super().update_connector_output(connector_output)
+        if not self._sync_repack or self.connector_scheduler is None:
+            return
+        # vLLM's aggregator reports a receive only once every rank has, and
+        # a failure on any rank in failed_recving beside it. A failed load
+        # recomputes locally: no rank repacks it, and every rank frees the
+        # pages it staged for it in the named step.
+        finished = set(connector_output.finished_recving or ())
+        failed = set(getattr(connector_output, "failed_recving", None) or ())
+        for req_id in sorted(finished - failed):
+            self._landed_on_all_ranks.append(req_id)
+        for req_id in sorted(finished & failed):
+            self._failed_on_some_rank.append(req_id)
+
+    def build_connector_meta(self, scheduler_output):
+        meta = super().build_connector_meta(scheduler_output)
+        if self._sync_repack:
+            meta.qwen_repack_req_ids = self._landed_on_all_ranks
+            meta.qwen_drop_req_ids = self._failed_on_some_rank
+            self._landed_on_all_ranks, self._failed_on_some_rank = [], []
+        return meta
+
+    def start_load_kv(self, *args, **kwargs) -> None:
+        worker = self.connector_worker
+        if self._sync_repack and worker is not None:
+            # Before this step's forward, so a request admitted in this step
+            # reads its repacked pages.
+            meta = self._connector_metadata
+            worker.repack_landed(
+                getattr(meta, "qwen_repack_req_ids", ()),
+                drop=getattr(meta, "qwen_drop_req_ids", ()),
+            )
+        super().start_load_kv(*args, **kwargs)
 
     @staticmethod
     def _build_stage3_transfer_groups(
@@ -203,6 +269,12 @@ class Qwen4ExpRaidenWorker(TPURaidenConnectorWorker):
         self._qwen_page_plan: QwenPagePlan | None = None
         self._qwen_semantics: dict[str, Any] | None = None
         self.last_failed_recving: set[str] = set()
+        # QWEN4_EXP_PD_SYNC_REPACK: destination req id -> (uuid, group tables,
+        # tokens) of a load whose bytes landed on this rank and whose repack
+        # waits for the step the scheduler names it in (repack_landed).
+        self._sync_repack = sync_repack_enabled()
+        self._sync_on = sync_repack_on
+        self._pending_repacks: dict[str, tuple[int, list[list[int]], int]] = {}
 
     def get_finished(self, finished_req_ids: set[str] | None = None):
         failed_before = set(self._failed_recving)
@@ -328,15 +400,66 @@ class Qwen4ExpRaidenWorker(TPURaidenConnectorWorker):
         staging = getattr(self, "_staging", None)
         if staging is None:
             return
+        if not ok:
+            # Cleaned up (aborted, failed or finished) before the scheduler
+            # named it for the synchronized repack: free its staging pages.
+            pending = self._pending_repacks.pop(destination_req_id, None)
+            if pending is not None:
+                staging.release(pending[0])
+                return
         req_meta = self._stage3_submitted_load_metas.get(destination_req_id)
         if req_meta is None or int(req_meta.uuid) not in staging.reservations:
             return
         uuid = int(req_meta.uuid)
+        if ok and self._sync_repack and self._sync_on():
+            # Keep the staged pages; every rank repacks in the step the
+            # scheduler names this load in, after it landed on all of them.
+            self._pending_repacks[destination_req_id] = (
+                uuid,
+                [list(table) for table in req_meta.group_block_ids],
+                int(req_meta.num_tokens),
+            )
+            return
         try:
             if ok:
                 staging.repack(uuid, req_meta.group_block_ids, int(req_meta.num_tokens))
         finally:
             staging.release(uuid)
+
+    def repack_landed(self, req_ids, drop=()) -> None:
+        """Repack the named loads (QWEN4_EXP_PD_SYNC_REPACK). The scheduler
+        names a load only once every rank reported it landed, and every rank
+        receives the same names in the same step. ``drop``: loads that
+        failed on some rank; their staged pages are freed unrepacked."""
+        staging = getattr(self, "_staging", None)
+        if staging is None:
+            return
+        for req_id in drop:
+            pending = self._pending_repacks.pop(req_id, None)
+            if pending is not None:
+                staging.release(pending[0])
+        names = list(req_ids)
+        if not self._sync_on():
+            # An off period of the A/B: loads deferred in the last on period
+            # repack now, before any of them can be scheduled.
+            names += [r for r in self._pending_repacks if r not in names]
+        for req_id in names:
+            pending = self._pending_repacks.pop(req_id, None)
+            if pending is None:
+                # Repacked on landing (an off period of the A/B), never staged
+                # on this rank, or cleaned up first: not this repack's pages.
+                if int(envs.QWEN4_EXP_PD_SYNC_REPACK_AB_S) <= 0:
+                    logger.warning(
+                        "Qwen4ExpRaidenWorker rank%d --> no staged load to repack for %s",
+                        self.tp_rank,
+                        req_id,
+                    )
+                continue
+            uuid, tables, num_tokens = pending
+            try:
+                staging.repack(uuid, tables, num_tokens)
+            finally:
+                staging.release(uuid)
 
     def _ensure_raiden_transfer_engine(self):
         if self._raiden_transfer_engine is None:
