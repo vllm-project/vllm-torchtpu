@@ -261,6 +261,7 @@ if TYPE_CHECKING:
     VLLM_TPU_LOG_POST_WARMUP_COMPILES: bool = False
     VLLM_TPU_CPU_PIN: str = "off"
     VLLM_TPU_HOST_PHASES: int = 0
+    VLLM_TPU_LOG_STEP_BUCKETS: int = 0
     VLLM_TPU_SERIALIZE_COPY_WAIT: bool = False
     VLLM_TPU_PINNED_TOKEN_COPY: bool = False
     VLLM_TPU_SAMPLING_PARAMS_REUSE: bool = False
@@ -1665,6 +1666,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Log each rank's per-step host time by runner phase every N steps
     # (0 = off); runner/host_phases.py.
     "VLLM_TPU_HOST_PHASES": env_nonnegative_int("VLLM_TPU_HOST_PHASES", 0),
+    # Log each rank's cumulative step counts per padded token bucket every N
+    # steps (0 = off); runner/step_buckets.py.
+    "VLLM_TPU_LOG_STEP_BUCKETS": env_nonnegative_int("VLLM_TPU_LOG_STEP_BUCKETS", 0),
     # Let only one thread synchronize a sampled-token copy at a time (the
     # async-output thread and the deferred previous-results wait share one).
     "VLLM_TPU_SERIALIZE_COPY_WAIT": env_bool("VLLM_TPU_SERIALIZE_COPY_WAIT"),

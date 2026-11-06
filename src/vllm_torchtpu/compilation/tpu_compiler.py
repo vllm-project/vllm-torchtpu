@@ -261,6 +261,8 @@ _TPU_COMPILE_ENV_IGNORED = {
     "QWEN4_EXP_PD_BATCHED_ADMISSION_CHECK",
     # Per-step host phase logging (runner/host_phases.py).
     "VLLM_TPU_HOST_PHASES",
+    # Per-step token-bucket counts (runner/step_buckets.py).
+    "VLLM_TPU_LOG_STEP_BUCKETS",
     "TPU_RAIDEN_STAGE3_DEFERRED_SUBMIT",
     "TPU_RAIDEN_STAGE3_REGISTRATION_WAIT_S",
     "TPU_RAIDEN_STAGE3_STATUS_PROBE_S",

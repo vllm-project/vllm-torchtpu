@@ -146,6 +146,7 @@ from vllm_torchtpu.runner.speculative_decoding_manager import (
 )
 from vllm_torchtpu.runner.stage_timing import RunnerStageTiming
 from vllm_torchtpu.runner import host_phases
+from vllm_torchtpu.runner import step_buckets
 from vllm_torchtpu.runner.tpu_pooling import (
     StaticPoolerChunkOutput,
     StaticPoolerSpec,
@@ -4095,6 +4096,7 @@ class TPUModelRunner(GPUModelRunner):
             assert sizing_input is not None
             num_tokens_padded = sizing_input.shape[0]
             self._token_padding_update(num_tokens_padded)
+            step_buckets.count(num_tokens_padded)
             intermediate_tensors = None
             if self._pp_wave is not None:
                 intermediate_tensors = self._pp_wave.start_forward(num_tokens_padded)
