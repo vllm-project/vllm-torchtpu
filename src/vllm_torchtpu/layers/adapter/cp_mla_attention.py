@@ -1836,9 +1836,18 @@ def online_lse_combine_applies(
     combine_dtype: torch.dtype = torch.bfloat16,
 ) -> bool:
     """Whether backbone ``merge_lse_partials_scatter_heads`` routes ``num_tokens``
-    through ``dcp_online_lse_combine`` at trace time."""
+    through ``dcp_online_lse_combine`` at trace time.
+
+    ``num_tokens`` is symbolic under the dynamic-shape compile, so it is only
+    compared at bucket edges (see ``envs.bucket_gate_edge``) and tested for
+    16-row alignment; the geometry check takes no token count. A lower bound
+    such as ``T >= 16`` next to another gate's ``T <= 16`` would pin the traced
+    token count and fail the compile.
+    """
     from vllm_torchtpu.kernels.experimental.small_collectives.dcp_lse_combine import (
-        online_lse_combine_supported,
+        MAX_COMBINE_TOKENS,
+        TILE_ROWS,
+        online_lse_combine_geometry_supported,
     )
 
     req = online_lse_combine_mode_requested()
@@ -1854,9 +1863,11 @@ def online_lse_combine_applies(
     # buckets keep the existing send_layout / small-A2A path.
     if num_tokens <= envs.bucket_gate_edge(16):
         return False
+    if num_tokens > MAX_COMBINE_TOKENS or num_tokens % TILE_ROWS != 0:
+        return False
     heads = int(num_heads) if num_heads is not None else 4 * world
     check_mode = "pairs" if req == "pairs" else "flat"
-    return online_lse_combine_supported(num_tokens, heads, world, vdim, mode=check_mode)
+    return online_lse_combine_geometry_supported(heads, world, vdim, mode=check_mode)
 
 
 def _dcp_chip_pairs_ok(mesh: Any, group: Any | None = None) -> bool:

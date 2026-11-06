@@ -192,22 +192,46 @@ def test_supported_geometries_and_validation():
         )
 
 
-def test_supported_gate_traces_under_torch_compile():
-    """MLA dispatch evaluates the gate at ``torch.compile`` trace time with a
-    symbolic token count. The gate must trace and route each bucket as in eager
-    mode (a builtin Dynamo cannot model on symbolic ints crashes engine start)."""
+def test_geometry_supported_bounds_every_admitted_bucket():
+    for mode in ("pairs", "flat"):
+        assert comb.online_lse_combine_geometry_supported(64, 16, 512, mode=mode)
+        assert comb.online_lse_combine_geometry_supported(64, 8, 512, mode=mode)
+        # 128 heads over 16 cores fit at 32 tokens but not at the largest
+        # admitted bucket, so trace-time dispatch keeps the XLA merge.
+        assert comb.online_lse_combine_supported(32, 128, 16, 512, mode=mode)
+        assert not comb.online_lse_combine_geometry_supported(128, 16, 512, mode=mode)
+        # Header capacity at the largest bucket: 96 * 16 > 8 * 128.
+        assert not comb.online_lse_combine_geometry_supported(256, 16, 128, mode=mode)
+    assert not comb.online_lse_combine_geometry_supported(12, 3, 256, mode="pairs")
+    assert comb.online_lse_combine_geometry_supported(12, 3, 256, mode="flat")
+    assert not comb.online_lse_combine_geometry_supported(64, 16, 512, mode="unknown")
+
+
+def test_trace_time_gate_keeps_the_token_count_dynamic():
+    """MLA dispatch evaluates the gate inside vLLM's compile, which marks the
+    token dimension dynamic. Token gates must not pin it (for example a lower
+    bound ``T >= 16`` next to another gate's ``T <= 16``), and the gate must not
+    use builtins Dynamo cannot model on symbolic ints."""
     torch = pytest.importorskip("torch")
 
     def route(x):
-        if comb.online_lse_combine_supported(x.shape[0], 64, 16, 512, mode="pairs"):
-            return x + 1
-        return x - 1
+        t = x.shape[0]
+        y = x * 2 if t <= 16 else x  # another decode gate at the 16-token edge
+        if (
+            t > 8
+            and t <= comb.MAX_COMBINE_TOKENS
+            and t % comb.TILE_ROWS == 0
+            and comb.online_lse_combine_geometry_supported(64, 16, 512, mode="pairs")
+        ):
+            return y + 1
+        return y - 1
 
-    torch._dynamo.reset()
-    compiled = torch.compile(route, dynamic=True, fullgraph=True, backend="eager")
-    for tokens in (32, 96, 192):
-        want = 1.0 if tokens <= comb.MAX_COMBINE_TOKENS else -1.0
-        assert float(compiled(torch.zeros(tokens))[0]) == want
+    for tokens, want in ((16, 3.0), (32, 2.0), (96, 2.0), (192, 0.0)):
+        torch._dynamo.reset()
+        x = torch.ones(tokens)
+        torch._dynamo.mark_dynamic(x, 0)
+        compiled = torch.compile(route, fullgraph=True, backend="eager")
+        assert float(compiled(x)[0]) == want
 
 
 def test_mesh_has_chip_pairs_1d_and_2d():
@@ -312,12 +336,13 @@ def test_adapter_env_gate_and_uv_compat(monkeypatch):
         assert cp.online_lse_combine_mode_requested() == want
 
     monkeypatch.setenv("TPU_DCP_ONLINE_LSE_COMBINE", "pairs")
-    # Non-multiple-of-16 buckets (24, 40, 48, 56, 72, 88), tiny buckets (<=8),
-    # oversized buckets (>96 at local=4, vdim=512), and float32 partials must
-    # return False so send_layout / oproj_all_reduce / vspace_fused are not
-    # disabled when the kernel cannot run.
-    for t in (1, 4, 8, 24, 40, 48, 56, 72, 88, 128, 256):
+    # Non-multiple-of-16 buckets (24, 40, 56, 72, 88), tiny buckets (<=8),
+    # oversized buckets (>96), and float32 partials must return False so
+    # send_layout / oproj_all_reduce / vspace_fused are not disabled when the
+    # kernel cannot run.
+    for t in (1, 4, 8, 24, 40, 56, 72, 88, 128, 256):
         assert not cp.online_lse_combine_applies(t, True, num_heads=64, vdim=512)
+    assert cp.online_lse_combine_applies(48, True, num_heads=64, vdim=512)
     for t in TOKEN_BUCKETS:
         assert cp.online_lse_combine_applies(t, True, num_heads=64, vdim=512)
         assert not cp.online_lse_combine_applies(
@@ -331,8 +356,10 @@ def test_adapter_env_gate_and_uv_compat(monkeypatch):
 
 
 def test_adapter_gate_traces_under_torch_compile(monkeypatch):
-    """``online_lse_combine_applies`` runs inside the compiled MLA forward, so it
-    must trace with a symbolic token count and keep the eager routing."""
+    """``online_lse_combine_applies`` runs inside vLLM's compile of the MLA
+    forward, which marks the token dimension dynamic. The gate must trace
+    without pinning the token count next to another gate at the 16-token edge,
+    and keep the eager routing."""
     pytest.importorskip("torch")
     import torch
 
@@ -345,14 +372,18 @@ def test_adapter_gate_traces_under_torch_compile(monkeypatch):
     monkeypatch.setenv("TPU_DCP_ONLINE_LSE_COMBINE", "pairs")
 
     def route(x):
-        if cp.online_lse_combine_applies(x.shape[0], True, num_heads=64, vdim=512):
-            return x + 1
-        return x - 1
+        t = x.shape[0]
+        y = x * 2 if t <= 16 else x  # another decode gate at the 16-token edge
+        if cp.online_lse_combine_applies(t, True, num_heads=64, vdim=512):
+            return y + 1
+        return y - 1
 
-    torch._dynamo.reset()
-    compiled = torch.compile(route, dynamic=True, fullgraph=True, backend="eager")
-    for tokens, want in ((32, 1.0), (96, 1.0), (192, -1.0)):
-        assert float(compiled(torch.zeros(tokens))[0]) == want
+    for tokens, want in ((16, 3.0), (32, 2.0), (96, 2.0), (192, 0.0)):
+        torch._dynamo.reset()
+        x = torch.ones(tokens)
+        torch._dynamo.mark_dynamic(x, 0)
+        compiled = torch.compile(route, fullgraph=True, backend="eager")
+        assert float(compiled(x)[0]) == want
 
 
 def _run_16cpu_worker() -> dict:

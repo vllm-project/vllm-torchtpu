@@ -112,6 +112,42 @@ def _vmem_buffer_bytes(
     return partial_bytes + lse_bytes + scratch_bytes + out_bytes
 
 
+def online_lse_combine_geometry_supported(
+    num_heads: int,
+    num_cores: int,
+    vdim: int,
+    mode: str = "pairs",
+    vmem_limit_bytes: int = DEFAULT_VMEM_LIMIT_BYTES,
+) -> bool:
+    """Whether every 16-row bucket up to ``MAX_COMBINE_TOKENS`` fits the kernel
+    for ``num_heads`` x ``vdim`` over ``num_cores`` ranks in ``mode``.
+
+    Takes no token count, so trace-time dispatch can pair it with bucket-edge
+    token gates without constraining the symbolic token count. Buffers grow
+    with the token count, so the largest bucket bounds them all.
+    """
+    if mode not in ("pairs", "flat"):
+        return False
+    if (
+        num_cores < 2
+        or num_heads < num_cores
+        or num_heads % num_cores != 0
+        or vdim < LANES
+        or vdim % LANES != 0
+    ):
+        return False
+    if mode == "pairs" and (num_cores < 4 or num_cores % 2 != 0):
+        return False
+    local = num_heads // num_cores
+    if MAX_COMBINE_TOKENS * local > 8 * vdim:
+        return False
+    budget = int(vmem_limit_bytes * VMEM_BUFFER_FRACTION)
+    return (
+        _vmem_buffer_bytes(MAX_COMBINE_TOKENS, num_heads, num_cores, vdim, mode)
+        <= budget
+    )
+
+
 def online_lse_combine_supported(
     tokens: int,
     num_heads: int,
@@ -123,8 +159,9 @@ def online_lse_combine_supported(
     """Whether ``[tokens, num_heads, vdim]`` over ``num_cores`` ranks is valid
     for ``dcp_online_lse_combine`` in ``mode`` (``'pairs'`` or ``'flat'``).
 
-    MLA dispatch calls this at ``torch.compile`` trace time, where ``tokens``
-    can be a symbolic size, so it uses only integer arithmetic and comparisons.
+    For a concrete token count (kernel entry, the XLA-fallback check inside the
+    traced JAX function). Trace-time dispatch on a symbolic token count uses
+    bucket-edge gates and ``online_lse_combine_geometry_supported`` instead.
     """
     if mode not in ("pairs", "flat"):
         return False
