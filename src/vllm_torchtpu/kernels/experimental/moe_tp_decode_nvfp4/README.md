@@ -102,10 +102,11 @@ layers after model load when `USE_MOE_TP_DECODE_NVFP4_KERNEL=1` and
   (such as GLM-5.2's BF16 MTP drafter layer 78) are refused by `_admit` and
   keep their existing execution path. When `USE_MOE_TP_DECODE_NVFP4_KERNEL=0`
   (the default), weight loading, custom-op dispatch, and HLO renders are
-  unchanged. Because this kernel quantizes routed-expert activations to FP8
-  (W4A8) where today's NVFP4 path (`gmm_v2`) keeps BF16 activations (W4A16),
-  end-to-end model quality (GSM8K and MTP acceptance) is not yet validated, and
-  the flag stays off by default until it is.
+  unchanged. Although this kernel quantizes routed-expert decode activations to
+  FP8 (W4A8) where `_tp_chain` (`gmm_v2`) keeps BF16 activations (W4A16), 5-shot
+  GSM8K accuracy and real MTP acceptance match the `gmm_v2` W4A16 fallback (see
+  [End-to-end model quality](#end-to-end-model-quality) below); the flag stays
+  off (`0`) by default.
 
 | Environment variable | Default | Effect |
 | :--- | :--- | :--- |
@@ -199,15 +200,21 @@ output of `moe_tp_decode_nvfp4` match the pure-JAX W4A8 oracle (`exp_body`) to
 **0 ULP** (`expected_rel_l2 = 0.0`), while the measured spread between two
 valid W4A8 oracle rounding/accumulation orderings on CPU is `0.0295–0.0436`.
 
-On TPU7x hardware across the 68 single-host screening correctness cases,
-measured `rel_l2(kernel, exp_body)` is `0.0087–0.0190` while both the kernel
-and `exp_body` have virtually identical distance to the dequantized `f32`
-reference (`rel_l2 = 0.0437–0.0515`,
-`|rel_l2(kernel, f32) - rel_l2(exp_body, f32)| <= 0.0007`,
-`cos = 0.9987–0.9990`), and all bitwise (`fast` vs `slow`, `hbm_operands`,
-`split_meta`, `w2_n_chunk=2048` vs `6144`, `group_cols` / `num_buffers`,
-`contig_dma`, `overlap_schedule`, `skip_tail`), rank-identity, `+0.0` padding,
-and `NaN=0` checks matched to 0 ULP on hardware. Comparing the Mosaic MLIR
+On 8-rank TPU7x hardware at the branch tip (measured), the TPU-only cases of
+`tests/kernels/test_moe_tp_decode_nvfp4.py` passed twice across two pods (`51`
+passed + `1` by-design parametrization skip, `0` failed; the remaining `63` CPU
+cases pass on CPU). Across the per-layer benchmark's `25` correctness cases
+(`n_valid = 0..64`, uniform/concentrated/tie routing), `16` timed cells (`39`
+non-empty cells), `4` `all_reduce` cases, and `6` schedule-variant suites,
+measured `rel_l2(kernel, exp_body)` is `0.0119–0.0161` (within the
+`0.0388–0.0434` hardware spread between two valid W4A8 oracle orderings) while
+both the kernel and `exp_body` have virtually identical distance to the
+dequantized `f32` reference (`rel_l2 = 0.0438–0.0468`,
+`|rel_l2(kernel, f32) - rel_l2(exp_body, f32)| <= 0.0005`,
+`cos = 0.9989–0.9990`), and all hardware bitwise (`fast` vs `slow`,
+`group_cols=2048, num_buffers=3` vs default across all `14` fitting cells,
+`hbm_operands`, `split_meta`, and the pytest schedule levers), rank-identity,
+`+0.0` padding, and `NaN=0` checks matched to 0 ULP. Comparing the Mosaic MLIR
 against XLA:TPU StableHLO shows two lowering differences immediately before
 `.astype(float8_e4m3fn)`:
 
@@ -222,44 +229,54 @@ step), a 1-ULP `f32`/`bf16` difference prior to `.astype(float8_e4m3fn)` flips
 boundary elements into adjacent FP8 quantization buckets before the subsequent
 MXU matmuls.
 
-## Measured per-layer latency (single-host 8-rank TPU7x kernel screening)
+## Measured per-layer latency
 
-Single-host 8-rank TPU7x kernel screening, GLM-5.2 shapes, seed 2026;
-full-layer `us/layer [x75 ms] (speedup vs old default)` (`H = 6144`, `E = 256`,
-`topk = 8`, `I_shared_rank = 256`, in-graph `lax.fori_loop` with calibrated
-loop overhead subtracted; `n = 4, 8` run via `pad_to_m = 16`):
+8-rank TPU7x per-layer benchmark at the branch tip (measured), GLM-5.2 shapes
+(`H = 6144`, `E = 256`, `topk = 8`, `I_shared_rank = 256`, seed `2026`; full MoE
+layer in `us/layer [x75 ms]`, in-graph `lax.fori_loop` with calibrated loop
+overhead subtracted; `n = 4, 8` run via `pad_to_m = 16`):
 
-### Uniform routing (`us/layer [x75 ms] (speedup vs old default)`)
+### Uniform routing (`us/layer [x75 ms]`)
 
-| Layout | `n` | Old default (`us/layer [x75 ms]`) | New default (`us/layer [x75 ms] (speedup vs old default)`) |
-| :--- | ---: | :--- | :--- |
-| `EP2xTP4` (`b512/b512`: old `g=2, nb=3` -> new `g=1, nb=4`) | `4` | `48.13 [3.610]` | `42.50 [3.187] (1.133x)` |
-| `EP2xTP4` (`b512/b512`: old `g=2, nb=3` -> new `g=1, nb=4`) | `8` | `67.40 [5.055]` | `59.41 [4.456] (1.134x)` |
-| `EP2xTP4` (`b512/b512`: old `g=2, nb=3` -> new `g=1, nb=4`) | `16` | `101.49 [7.612]` | `88.03 [6.602] (1.153x)` |
-| `EP2xTP4` (`b512/b512`: old `g=2, nb=3` -> new `g=1, nb=4`) | `32` | `154.14 [11.561]` | `135.01 [10.126] (1.142x)` |
-| `EP2xTP4` (`b512/b512`: old `g=2, nb=3` -> new `g=1, nb=4`) | `64` | `208.34 [15.626]` | `196.11 [14.709] (1.062x)` |
-| `TP8` (`b512/b256`: old `g=4, nb=3` -> new `g=2, nb=4`) | `4` | `45.85 [3.439]` | `40.12 [3.009] (1.143x)` |
-| `TP8` (`b512/b256`: old `g=4, nb=3` -> new `g=2, nb=4`) | `8` | `65.40 [4.905]` | `58.47 [4.386] (1.119x)` |
-| `TP8` (`b512/b256`: old `g=4, nb=3` -> new `g=2, nb=4`) | `16` | `95.91 [7.193]` | `83.53 [6.265] (1.148x)` |
-| `TP8` (`b512/b256`: old `g=4, nb=3` -> new `g=2, nb=4`) | `32` | `149.57 [11.218]` | `133.69 [10.027] (1.119x)` |
-| `TP8` (`b512/b256`: old `g=4, nb=3` -> new `g=2, nb=4`) | `64` | `209.97 [15.747]` | `202.74 [15.205] (1.036x)` |
+| Layout | `n` | New default (`g=1/g=2, nb=4`) | Previous default (`group_cols=2048, num_buffers=3`) | FP8 TP decode (`#1763`) | `gmm_v2` W4A16 |
+| :--- | ---: | ---: | ---: | ---: | ---: |
+| `EP2xTP4` (`b512/b512`) | `4` | `42.96 [3.22]` | `48.40 [3.63]` | `65.17 [4.89]` | `65.22 [4.89]` |
+| `EP2xTP4` (`b512/b512`) | `8` | `59.71 [4.48]` | `67.73 [5.08]` | `101.16 [7.59]` | `102.23 [7.67]` |
+| `EP2xTP4` (`b512/b512`) | `16` | `90.83 [6.81]` | `103.44 [7.76]` | `163.64 [12.27]` | `156.61 [11.75]` |
+| `EP2xTP4` (`b512/b512`) | `32` | `139.46 [10.46]` | `158.71 [11.90]` | `252.19 [18.91]` | `231.21 [17.34]` |
+| `EP2xTP4` (`b512/b512`) | `64` | `203.77 [15.28]` | refused (`m = 64` VMEM limit) | `319.91 [23.99]` | `294.99 [22.12]` |
+| `TP8` (`b512/b256`) | `4` | `40.77 [3.06]` | `45.97 [3.45]` | `61.00 [4.57]` | `93.49 [7.01]` |
+| `TP8` (`b512/b256`) | `8` | `59.04 [4.43]` | `65.79 [4.93]` | `98.74 [7.41]` | `151.27 [11.35]` |
+| `TP8` (`b512/b256`) | `16` | `85.45 [6.41]` | `97.76 [7.33]` | `152.43 [11.43]` | `214.54 [16.09]` |
+| `TP8` (`b512/b256`) | `32` | `136.83 [10.26]` | `155.40 [11.65]` | `238.76 [17.91]` | `332.86 [24.96]` |
+| `TP8` (`b512/b256`) | `64` | `214.14 [16.06]` | refused (`m = 64` VMEM limit) | `309.17 [23.19]` | `436.90 [32.77]` |
 
-### Concentrated routing (`us/layer (speedup vs old default)`)
+### Concentrated routing (`us/layer`)
 
-| Layout | `n` | Old default (`us/layer`) | New default (`us/layer (speedup vs old default)`) |
-| :--- | ---: | ---: | :--- |
-| `EP2xTP4` (`b512/b512`: old `g=2, nb=3` -> new `g=1, nb=4`) | `4` | `32.39` | `28.62 (1.132x)` |
-| `EP2xTP4` (`b512/b512`: old `g=2, nb=3` -> new `g=1, nb=4`) | `8` | `32.59` | `28.67 (1.137x)` |
-| `EP2xTP4` (`b512/b512`: old `g=2, nb=3` -> new `g=1, nb=4`) | `16` | `30.91` | `26.97 (1.146x)` |
-| `TP8` (`b512/b256`: old `g=4, nb=3` -> new `g=2, nb=4`) | `4` | `33.12` | `29.36 (1.128x)` |
-| `TP8` (`b512/b256`: old `g=4, nb=3` -> new `g=2, nb=4`) | `8` | `33.09` | `29.39 (1.126x)` |
-| `TP8` (`b512/b256`: old `g=4, nb=3` -> new `g=2, nb=4`) | `16` | `31.49` | `27.70 (1.137x)` |
+| Layout | `n` | New default (`g=1/g=2, nb=4`) | Previous default (`group_cols=2048, num_buffers=3`) | FP8 TP decode (`#1763`) | `gmm_v2` W4A16 |
+| :--- | ---: | ---: | ---: | ---: | ---: |
+| `EP2xTP4` (`b512/b512`) | `4` | `32.50` | `34.08` | `42.54` | `42.55` |
+| `EP2xTP4` (`b512/b512`) | `8` | `32.17` | `34.59` | `42.70` | `52.69` |
+| `EP2xTP4` (`b512/b512`) | `16` | `32.04` | `33.68` | `41.96` | `53.66` |
+| `TP8` (`b512/b256`) | `4` | `26.46` | `27.86` | `31.22` | `56.14` |
+| `TP8` (`b512/b256`) | `8` | `26.80` | `27.59` | `31.41` | `64.43` |
+| `TP8` (`b512/b256`) | `16` | `25.97` | `27.48` | `30.56` | `66.98` |
 
-Outputs are bitwise identical (`0 ULP`) vs the old default
-(`group_cols=2048, num_buffers=3`) on TPU7x hardware across all screened arms.
-For reference, the `#1763` W8A8 FP8 `TP8` fused decode kernel measures
-`59.83 [4.49]`, `147.51 [11.06]`, `231.97 [17.40]`, and `301.85 [22.64]`
-`us/layer [x75 ms]` at `n = 4, 16, 32, 64` under uniform routing on the same
-harness (`1.49–1.77x` slower than the new `TP8` default). `w2_n_chunk=2048` and
-`w2_n_chunk=6144` produce bitwise-identical outputs and are within `0.5 us`
-across all token counts.
+- **FP8 reference caveat:** The `#1763` FP8 TP decode kernel arm runs on the
+  same synthetic weights requantized to per-channel FP8, so it is a timing
+  reference, not an accuracy reference.
+- **Schedule notes:** At `m = 64`, `group_cols=2048, num_buffers=3` is refused
+  by the `56.00 MiB` VMEM budget cap, whereas the `group_cols=1024,
+  num_buffers=4` default fits at `43.79–44.73 MiB`. Across all `14` fitting
+  cells (`n = 4..32` uniform, `n = 4..16` concentrated), outputs are bitwise
+  identical (`0 ULP`) to `group_cols=2048, num_buffers=3`; `w2_n_chunk=2048` and
+  `w2_n_chunk=6144` stay within `0.02–1.02 us` across all uniform token counts.
+
+## End-to-end model quality
+
+On GSM8K 5-shot, `n = 1,319`, `c8`, real MTP (`k = 3`), measured on 4-chip
+TPU7x (`EP2xTP4`) for GLM-5.2-NVFP4 with `moe_tp_decode_nvfp4` (W4A8) on decode
+and `_tp_chain` (`gmm_v2` W4A16) on prefill, exact match is `0.9689 ± 0.0048`
+with `3.585` mean MTP acceptance, matching the 4-chip `EP8` `gmm_v2` W4A16
+fallback (`0.9682 ± 0.0048`, `3.594` MTP acceptance) and 8-chip FP8
+(`0.9682 ± 0.0048`, `3.541` MTP acceptance).
