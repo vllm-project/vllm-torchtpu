@@ -31,6 +31,9 @@ from vllm_torchtpu.layers.adapter.attention import (
     PallasAttentionBackendImpl,
     PallasBatchedRPAAttentionBackendImpl,
 )
+from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4.deepseek_v4_indexer import (
+    static_verify_q_len,
+)
 from vllm_torchtpu.layers.core.attention_metadata import (
     AttentionMetadata,
     AttentionMetadataBuilderContext,
@@ -133,6 +136,7 @@ class DFlashProposer:
         self._draft_has_moe_cache: bool | None = None
         self._draft_attn_layer_names: set[str] | None = None
         self.draft_chunks: list[DraftChunkInputs] | None = None
+        self._logged_draft_stage = False
         self._static_attn_tensors_cache: dict[
             int, tuple[torch.Tensor, torch.Tensor]
         ] = {}
@@ -163,16 +167,67 @@ class DFlashProposer:
                 )
                 * self.block_size
             )
-            # Every request holds exactly block_size queries, so a batched-RPA
-            # draft can take the DECODE stage; otherwise route all to MIXED.
-            num_decode = padded_num_reqs if self._draft_uses_decode_stage() else 0
             rd = torch.tensor(
-                [num_decode, num_decode, padded_num_reqs],
+                self._draft_request_distribution(padded_num_reqs),
                 dtype=torch.int32,
                 device=self.runner.device,
             )
             self._static_attn_tensors_cache[padded_num_reqs] = (qsl, rd)
         return self._static_attn_tensors_cache[padded_num_reqs]
+
+    def _draft_prefill_stage_size(self) -> int | None:
+        """chunk_prefill_size to request for the draft's RPA v3 kernels.
+
+        Every draft request holds exactly one block of queries, so RPA v3 can
+        run them in its fixed-length PREFILL stage. The same kernels also run
+        the context-KV update on the target's verify metadata, whose PREFILL
+        segment holds the 1 + K token static verify windows when the target has
+        them (DeepSeek-V4); the stage must then be exactly that long, or it
+        would misread them.
+        """
+        verify_len = static_verify_q_len(self.vllm_config)
+        return self.block_size if verify_len in (None, self.block_size) else None
+
+    def _draft_request_distribution(self, num_reqs: int) -> list[int]:
+        """[decode_end, prefill_end, mixed_end] for a draft forward.
+
+        Every request holds exactly block_size queries, so it can use a
+        fixed-length stage instead of MIXED, which pads short requests to a
+        prefill-sized query tile. Batched RPA's DECODE stage and RPA v3's
+        PREFILL stage are both that fixed-length stage.
+        """
+        if self._draft_uses_decode_stage():
+            stage, dist = "DECODE (batched RPA)", [num_reqs, num_reqs, num_reqs]
+        elif self._draft_uses_prefill_stage():
+            stage, dist = "PREFILL (RPA v3)", [0, num_reqs, num_reqs]
+        else:
+            stage, dist = "MIXED", [0, 0, num_reqs]
+        if not self._logged_draft_stage:
+            self._logged_draft_stage = True
+            logger.info(
+                "DFlash draft forward runs its %d-query requests in the %s "
+                "attention stage.",
+                self.block_size,
+                stage,
+            )
+        return dist
+
+    def _draft_uses_prefill_stage(self) -> bool:
+        """Whether every draft layer's RPA v3 kernel has a PREFILL stage one
+        draft block long.
+
+        Checks what each layer-major kernel was actually built with: only RPA
+        v3 entries take chunk_prefill_size (not batched RPA, hd64, PCP), and a
+        request routed to a stage the kernel lacks is silently skipped. Block-
+        major pools run the bundled kernel, which has no PREFILL stage.
+        """
+        impls = self._draft_attn_impls()
+        return bool(impls) and all(
+            impl.rpa_kernel is not None
+            and impl._rpa_kernel_chunk_prefill_size == self.block_size
+            and not impl._bm_kernel
+            for impl in impls
+        )
 
     def _draft_attn_layers(self) -> list[tuple[int, Any, PallasAttentionBackendImpl]]:
         """(layer index, attention layer, Pallas impl) for each draft layer
@@ -303,12 +358,14 @@ class DFlashProposer:
         else:
             raise RuntimeError("Draft model does not support get_draft_attn_causal")
 
+        prefill_stage_size = self._draft_prefill_stage_size()
         with set_vllm_model_wrapper_context(
             mesh=self.runner.mesh, vllm_config=self.vllm_config
         ):
             for i, attn_obj, attn_impl in self._draft_attn_layers():
                 attn_impl.layer_idx = i
                 attn_impl.use_causal_mask = layer_causal_list[i]
+                attn_impl.chunk_prefill_size = prefill_stage_size
                 attn_impl.initialize_kernel(attn_obj)
 
     def _load_draft_model(self) -> None:
