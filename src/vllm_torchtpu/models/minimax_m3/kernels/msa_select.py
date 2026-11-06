@@ -16,9 +16,13 @@
 A row tile of block scores stays in VMEM while `topk` rounds of max /
 first-index-of-max / mask-out pick the blocks, so the selection costs one
 read of the scores instead of a sort (or `topk` passes) over HBM.
+
+A decode batch's folded scores (`msa_indexer.folded_block_scores`) are
+selected in place: each round scans only the pages some token can see.
 """
 
 import functools
+import math
 
 import jax
 import jax.numpy as jnp
@@ -30,6 +34,8 @@ _NEG_INF = float("-inf")
 _FORCED_LOCAL_SCORE = 1e29
 _FORCED_INIT_SCORE = 1e30
 _VMEM_LIMIT_BYTES = 48 * 1024 * 1024
+# Folded score rows per step of `_folded_kernel`'s scan.
+FOLDED_CHUNK_ROWS = 64
 
 
 def _kernel(
@@ -118,4 +124,197 @@ def select_blocks(
         interpret=interpret,
         name="minimax_m3_msa_select_blocks",
     )(s, p)[:num_tokens]
+    return picked[:, None, :]
+
+
+def _merge(a, b, topk):
+    """Top `topk` of two pick lists ``(score, page)``, each ``[topk, L]``
+    in selection order (score down, page up); every lane merges its own.
+
+    Each pick's place is its index in its list plus the picks of the other
+    list ahead of it; the lists' pages differ, except the -1 of missing
+    picks, where the first list goes ahead."""
+    (a_score, a_page), (b_score, b_page) = a, b
+    rows = jax.lax.broadcasted_iota(jnp.int32, a_score.shape, 0)
+    a_place, b_place = rows, rows
+    for j in range(topk):
+        score, page = b_score[j : j + 1], b_page[j : j + 1]
+        ahead = (score > a_score) | ((score == a_score) & (page < a_page))
+        a_place = a_place + ahead
+        behind = topk - jnp.sum(ahead.astype(jnp.int32), axis=0, keepdims=True)
+        b_place = jnp.where(rows == j, b_place + behind, b_place)
+    merged_score = jnp.zeros_like(a_score)
+    merged_page = jnp.zeros_like(a_page)
+    for place, score, page in ((a_place, a_score, a_page), (b_place, b_score, b_page)):
+        for i in range(topk):
+            here = rows == place[i : i + 1]
+            merged_score = jnp.where(here, score[i : i + 1], merged_score)
+            merged_page = jnp.where(here, page[i : i + 1], merged_page)
+    return merged_score, merged_page
+
+
+def _folded_kernel(
+    # Scalar prefetch
+    pos_ref,  # [T] absolute position of each token
+    # In
+    scores_ref,  # [P / F, F * W] folded scores: page r * F + k, token t at
+    # row r, lane k * W + t
+    # Out
+    out_ref,  # [T, topk]
+    # Scratch
+    s_ref,  # [P / F, F * W] the scores as masked so far
+    *,
+    width,
+    chunk_rows,
+    block_size,
+    topk,
+    init_blocks,
+    local_blocks,
+):
+    """`_kernel` over folded scores. Every lane picks the top `topk` of its
+    fold's pages, a round being one pass over the rows that hold a visible
+    page; the folds' picks of a token are then merged, which needs lane
+    rotations only once instead of in every round. Pages no token sees are
+    -inf in `_kernel`, so leaving them out changes no pick."""
+    num_tokens = pos_ref.shape[0]
+    rows, lanes = scores_ref.shape
+    folds = lanes // width
+    lane = jax.lax.broadcasted_iota(jnp.int32, (1, lanes), 1)
+    tok = lane % width
+
+    def gather_pos(t, carry):
+        lane_pos, last = carry
+        return jnp.where(tok == t, pos_ref[t], lane_pos), jnp.maximum(last, pos_ref[t])
+
+    # Lanes past the batch get position -1, so no visible page.
+    lane_pos, last = jax.lax.fori_loop(
+        0, num_tokens, gather_pos, (jnp.full_like(lane, -1), -1), unroll=True
+    )
+    num_visible = lane_pos // block_size + 1
+    live = last // block_size + 1
+    num_chunks = jnp.minimum(
+        pl.cdiv(pl.cdiv(live, folds), chunk_rows), rows // chunk_rows
+    )
+    chunk_page = (
+        jax.lax.broadcasted_iota(jnp.int32, (chunk_rows, lanes), 0) * folds
+        + lane // width
+    )
+
+    def scan(load, prev, store):
+        def chunk(c, carry):
+            best, first = carry
+            row = pl.multiple_of(c * chunk_rows, chunk_rows)
+            page = chunk_page + row * folds
+            s = load(pl.ds(row, chunk_rows), page)
+            if prev is not None:
+                s = jnp.where(page == prev, _NEG_INF, s)
+            if store:
+                s_ref[pl.ds(row, chunk_rows), :] = s
+            # Pages rise along a lane's chunks: a tie keeps the first.
+            return jnp.maximum(best, s), jnp.where(s > best, page, first)
+
+        best, first = jax.lax.fori_loop(
+            0,
+            num_chunks,
+            chunk,
+            (
+                jnp.full((chunk_rows, lanes), _NEG_INF, jnp.float32),
+                jnp.zeros((chunk_rows, lanes), jnp.int32),
+            ),
+        )
+        score = jnp.max(best, axis=0, keepdims=True)
+        first = jnp.where(best == score, first, rows * folds)
+        page = jnp.min(first, axis=0, keepdims=True)
+        found = score > _NEG_INF
+        return page, (jnp.where(found, score, _NEG_INF), jnp.where(found, page, -1))
+
+    def load_scores(chunk_rows, page):
+        s = scores_ref[chunk_rows, :]
+        visible = page < num_visible
+        s = jnp.where(visible, s, _NEG_INF)
+        s = jnp.where(
+            visible & (page >= num_visible - local_blocks), _FORCED_LOCAL_SCORE, s
+        )
+        return jnp.where(visible & (page < init_blocks), _FORCED_INIT_SCORE, s)
+
+    prev, pick = scan(load_scores, None, topk > 1)
+    picked = [pick]
+    for k in range(1, topk):
+        prev, pick = scan(
+            lambda chunk_rows, _: s_ref[chunk_rows, :], prev, k + 1 < topk
+        )
+        picked.append(pick)
+    picks = tuple(jnp.concatenate(p, axis=0) for p in zip(*picked))
+    shift = width
+    while shift < lanes:
+        picks = _merge(picks, tuple(pltpu.roll(p, shift, 1) for p in picks), topk)
+        shift *= 2
+    # [topk, lanes] -> [lanes, topk]: transpose a whole lane tile.
+    pages = jnp.concatenate(
+        [picks[1], jnp.zeros((lanes - topk, lanes), jnp.int32)], axis=0
+    ).T
+    out_ref[...] = pages[:num_tokens, :topk]
+
+
+@functools.partial(
+    jax.jit,
+    static_argnames=(
+        "width",
+        "block_size",
+        "topk",
+        "init_blocks",
+        "local_blocks",
+        "chunk_rows",
+        "interpret",
+    ),
+)
+def select_folded_blocks(
+    scores: jax.Array,
+    pos: jax.Array,
+    *,
+    width: int,
+    block_size: int,
+    topk: int,
+    init_blocks: int,
+    local_blocks: int,
+    chunk_rows: int = FOLDED_CHUNK_ROWS,
+    interpret: bool = False,
+) -> jax.Array:
+    """`select_blocks` over folded scores.
+
+    Args:
+      scores: ``[P / F, F * W]`` scores from
+        `msa_indexer.folded_block_scores`, ``W = width``.
+      pos: ``[T]`` absolute position of each token, ``T <= W``.
+    """
+    rows, lanes = scores.shape
+    (num_tokens,) = pos.shape
+    if num_tokens > width or lanes % width or topk > lanes:
+        raise ValueError(
+            f"{num_tokens} tokens, {topk} picks do not fit folded scores of "
+            f"{lanes} lanes, {width} per fold."
+        )
+    chunk_rows = math.gcd(chunk_rows, rows)
+    picked = pl.pallas_call(
+        functools.partial(
+            _folded_kernel,
+            width=width,
+            chunk_rows=chunk_rows,
+            block_size=block_size,
+            topk=topk,
+            init_blocks=init_blocks,
+            local_blocks=local_blocks,
+        ),
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=1,
+            grid=(1,),
+            in_specs=[pl.BlockSpec((rows, lanes), lambda i, *_: (0, 0))],
+            out_specs=pl.BlockSpec((num_tokens, topk), lambda i, *_: (0, 0)),
+            scratch_shapes=[pltpu.VMEM((rows, lanes), jnp.float32)],
+        ),
+        out_shape=jax.ShapeDtypeStruct((num_tokens, topk), jnp.int32),
+        compiler_params=pltpu.CompilerParams(vmem_limit_bytes=_VMEM_LIMIT_BYTES),
+        interpret=interpret,
+        name="minimax_m3_msa_select_folded_blocks",
+    )(pos, scores)
     return picked[:, None, :]

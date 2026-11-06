@@ -212,6 +212,58 @@ def _block_scores(
     )
 
 
+def _score_and_select(
+    index_q,
+    index_cache,
+    seq_lens,
+    block_tables,
+    cu_q_lens,
+    num_seqs,
+    pos,
+    *,
+    block_size,
+    topk,
+    init_blocks,
+    local_blocks,
+    interpret,
+):
+    """Selected blocks ``[T, 1, topk]``. A batch the indexer scores as one
+    tile keeps its scores folded (`msa_indexer.folded_block_scores`) for
+    the selection."""
+    num_tokens = index_q.shape[0]
+    max_num_seqs = seq_lens.shape[0]
+    select = dict(
+        block_size=block_size,
+        topk=topk,
+        init_blocks=init_blocks,
+        local_blocks=local_blocks,
+        interpret=interpret,
+    )
+    if msa_indexer.is_one_tile(
+        num_tokens,
+        max_num_seqs,
+        block_tables.shape[0] // max_num_seqs,
+        block_q=msa_indexer.DEFAULT_BLOCK_Q,
+    ):
+        scores = msa_indexer.folded_block_scores(
+            index_q,
+            index_cache,
+            seq_lens,
+            block_tables,
+            cu_q_lens,
+            num_seqs,
+            interpret=interpret,
+        )
+        width = msa_indexer.fold_width(
+            num_tokens, msa_indexer.DEFAULT_SMALL_PAGES_PER_STEP
+        )
+        return msa_select.select_folded_blocks(scores, pos, width=width, **select)
+    scores = _block_scores(
+        index_q, index_cache, seq_lens, block_tables, cu_q_lens, num_seqs, interpret
+    )
+    return msa_select.select_blocks(scores, pos, **select)
+
+
 def msa_forward(
     q: jax.Array,
     k: jax.Array,
@@ -251,28 +303,30 @@ def msa_forward(
     kv_cache = write(kv_cache, jnp.concatenate([k, v], axis=-1)[:, 0])
     index_cache = write(index_cache, index_k)
 
-    scores = _block_scores(
+    selected = _score_and_select(
         index_q,
         index_cache,
         seq_lens,
         block_tables,
         cu_q_lens,
         distribution[2],
-        interpret,
+        pos,
+        block_size=block_size,
+        topk=topk,
+        init_blocks=init_blocks,
+        local_blocks=local_blocks,
+        interpret=interpret,
     )
-    out = _select_and_attend(
+    out = sparse_attention(
         q,
         kv_cache,
-        scores,
+        selected,
         block_tables_2d,
         seq_id,
         pos,
         pages,
         valid,
         sm_scale=sm_scale,
-        topk=topk,
-        init_blocks=init_blocks,
-        local_blocks=local_blocks,
         interpret=interpret,
     )
     return kv_cache, index_cache, out

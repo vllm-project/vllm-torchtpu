@@ -21,7 +21,10 @@ import numpy as np
 import pytest
 from jax.sharding import AbstractDevice, AbstractMesh, use_abstract_mesh
 
-from vllm_torchtpu.models.minimax_m3.kernels.msa_select import select_blocks
+from vllm_torchtpu.models.minimax_m3.kernels.msa_select import (
+    select_blocks,
+    select_folded_blocks,
+)
 
 BLOCK = 16
 
@@ -62,6 +65,43 @@ def test_matches_reference(init_blocks, local_blocks):
     )
 
 
+def _fold(scores, width, lanes=128):
+    """``[T, P]`` -> `msa_indexer.folded_block_scores`' layout; padding lanes
+    hold NaN, which the selection must never read."""
+    num_tokens, num_blocks = scores.shape
+    padded = np.full((num_blocks, width), np.nan, np.float32)
+    padded[:, :num_tokens] = scores.T
+    return padded.reshape(num_blocks * width // lanes, lanes)
+
+
+@pytest.mark.parametrize("init_blocks,local_blocks", [(0, 1), (2, 1), (0, 3)])
+@pytest.mark.parametrize("num_tokens,width", [(5, 8), (64, 64), (100, 128)])
+def test_folded_matches_reference(num_tokens, width, init_blocks, local_blocks):
+    rng = np.random.default_rng(num_tokens + init_blocks + local_blocks)
+    num_blocks, topk = 256, 16
+    # Few distinct values: many exact ties, broken by the lower block.
+    scores = rng.integers(0, 6, (num_tokens, num_blocks)).astype(np.float32)
+    # Short contexts leave whole chunks of pages unscanned; NaN marks the
+    # scores no token may see.
+    pos = rng.integers(0, 90 * BLOCK, num_tokens).astype(np.int32)
+    scores[np.arange(num_blocks)[None] > (pos // BLOCK)[:, None]] = np.nan
+    picked = select_folded_blocks(
+        jnp.asarray(_fold(scores, width)),
+        jnp.asarray(pos),
+        width=width,
+        block_size=BLOCK,
+        topk=topk,
+        init_blocks=init_blocks,
+        local_blocks=local_blocks,
+        chunk_rows=8,
+        interpret=True,
+    )
+    np.testing.assert_array_equal(
+        np.asarray(picked)[:, 0],
+        _reference(scores, pos, topk, init_blocks, local_blocks),
+    )
+
+
 def test_lowers_for_tpu():
     """Pallas -> Mosaic lowering and verification run without a TPU."""
     args = (
@@ -70,6 +110,26 @@ def test_lowers_for_tpu():
     )
     select = functools.partial(
         select_blocks, block_size=128, topk=16, init_blocks=0, local_blocks=1
+    )
+    tpu7x = AbstractMesh((), (), (), abstract_device=AbstractDevice("TPU7x", 1, "tpu"))
+    with use_abstract_mesh(tpu7x):
+        lowered = jax.jit(select).trace(*args).lower(lowering_platforms=("tpu",))
+    assert "tpu_custom_call" in lowered.as_text()
+
+
+@pytest.mark.parametrize("num_tokens,width", [(4, 8), (64, 64), (96, 128)])
+def test_folded_lowers_for_tpu(num_tokens, width):
+    args = (
+        jax.ShapeDtypeStruct((2048 * width // 128, 128), jnp.float32),
+        jax.ShapeDtypeStruct((num_tokens,), jnp.int32),
+    )
+    select = functools.partial(
+        select_folded_blocks,
+        width=width,
+        block_size=128,
+        topk=16,
+        init_blocks=0,
+        local_blocks=1,
     )
     tpu7x = AbstractMesh((), (), (), abstract_device=AbstractDevice("TPU7x", 1, "tpu"))
     with use_abstract_mesh(tpu7x):
