@@ -23,6 +23,7 @@ if TYPE_CHECKING:
     TPU_ATTN_MOE_OVERLAP: bool = False
     TPU_K3_SP_PREFILL: bool = False
     TPU_DCP_MLA_TOPK_CAP: int = 0
+    TPU_DCP_MLA_TOPK_CAP_RATIO: int = 2
     TPU_DCP_MLA_TOPK_CAP_CHUNK: int = 256
     TPU_DCP_LSE_MERGE_A2A: bool = False
     TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS: int = 64
@@ -448,6 +449,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # recomputed exactly in-kernel over all their windows
     # (`sparse_ragged_paged_attention(topk_cap=...)`). Opt-in; 0 = off.
     "TPU_DCP_MLA_TOPK_CAP": env_int("TPU_DCP_MLA_TOPK_CAP", 0),
+    # When TPU_DCP_MLA_TOPK_CAP is 0: the cap as this multiple of a rank's
+    # even share of the top-k (topk / dcp), rounded up to a legal cap. Exact
+    # either way; 0 = off. Default 2 (e.g. 256 of 2048 at DCP16).
+    "TPU_DCP_MLA_TOPK_CAP_RATIO": env_int("TPU_DCP_MLA_TOPK_CAP_RATIO", 2),
     # Gather/attention chunk (query tokens) of the capped path: fewer, larger
     # chunks amortise the per-chunk calls; each chunk's static gather buffer
     # is chunk * topk rows (~335 MB at 256), of which only the live windows

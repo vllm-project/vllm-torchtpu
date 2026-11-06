@@ -93,6 +93,26 @@ def sparse_mla_chunk_kwargs() -> dict[str, int]:
     return {"gather_and_attention_chunk_size": chunk}
 
 
+def dcp_topk_cap_from_ratio(topk: int, dcp_size: int, ratio: int) -> int:
+    """The DCP sparse-MLA top-k cap as `ratio` times a rank's even share.
+
+    Under DCP a rank owns about `topk / dcp_size` of each token's top-k slots,
+    so the capped path (exact: tokens owning more are recomputed in-kernel)
+    sizes its window from that share. Returns the smallest legal cap (a
+    multiple of the SparseCore gather atom that divides `topk`) at or above
+    `ratio * topk / dcp_size`, or 0 (off) when the ratio is off, there is no
+    DCP, or no legal cap is below `topk`.
+    """
+    if ratio <= 0 or dcp_size <= 1 or topk <= 0:
+        return 0
+    atom = sparse_mla_kernel.GATHER_ATOM_ROWS
+    target = -(-ratio * topk // dcp_size)
+    for cap in range(atom, topk, atom):
+        if cap >= target and topk % cap == 0:
+            return cap
+    return 0
+
+
 def _resolve_sparse_mla_split_q(ql_nope: jax.Array, q_pe: jax.Array) -> bool:
     """Whether to pass `q_pe` separately to `sparse_ragged_paged_attention`."""
     if not envs.TPU_MLA_SPARSE_SPLIT_Q:
@@ -1242,6 +1262,10 @@ def sparse_mla_attention_dcp(
         # The capped path (and its chunk) applies only where the kernel takes
         # it: SparseCore caches and a top-k wider than the cap.
         topk_cap = envs.TPU_DCP_MLA_TOPK_CAP
+        if not topk_cap:
+            topk_cap = dcp_topk_cap_from_ratio(
+                topk_idx.shape[-1], dcp_size, envs.TPU_DCP_MLA_TOPK_CAP_RATIO
+            )
         if not (
             topk_cap
             and cache_layout == sparse_mla_kernel.SPARSECORE_CACHE_LAYOUT
