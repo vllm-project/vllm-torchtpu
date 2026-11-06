@@ -215,7 +215,7 @@ def _compressed_tensors_fp8_config(weights: dict) -> VllmCompressedTensorsConfig
     ],
 )
 def test_fp8_experts_register_compressed_tensors_scale_names(
-    make_fp8_experts, monkeypatch, weights, w13_scale_shape, w2_scale_shape
+    make_fp8_experts, weights, w13_scale_shape, w2_scale_shape
 ):
     """compressed-tensors names every scale `weight_scale`; the fused layer must
     register that name, not the DeepSeek-style `weight_scale_inv`."""
@@ -239,11 +239,6 @@ def test_fp8_experts_register_compressed_tensors_scale_names(
     torch.testing.assert_close(gate, scales)
     torch.testing.assert_close(up, scales)
 
-    # Building the Pallas kernel needs a TPU.
-    monkeypatch.setattr(
-        "vllm_torchtpu.layers.adapter.quantization.fp8.prebuild_fused_moe_kernel",
-        lambda **kwargs: None,
-    )
     layer.quant_method.process_weights_after_loading(layer)
     params = dict(layer.named_parameters())
     assert "w13_weight_scale" not in params and "w2_weight_scale" not in params
