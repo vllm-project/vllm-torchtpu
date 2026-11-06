@@ -208,6 +208,122 @@ def build_plain_inputs(
     return seen_mask, penalties
 
 
+def _fill_prefix_rows(
+    seen_mask: np.ndarray,
+    penalties: np.ndarray,
+    base_mask: np.ndarray,
+    penalty: float,
+    draft_tokens: Sequence[int],
+    row_indices: Sequence[int],
+    draft_prefixes: Sequence[int],
+    vocab_size: int,
+) -> None:
+    """Populate rows whose seen set is ``base_mask`` plus ``draft_tokens[:p]``."""
+    for row, prefix_len in zip(row_indices, draft_prefixes):
+        seen_mask[row] = base_mask
+        for tok in draft_tokens[:prefix_len]:
+            if 0 <= tok < vocab_size:
+                seen_mask[row, tok] = True
+        penalties[row, 0] = penalty
+
+
+def build_verify_logits_inputs(
+    state: RepetitionPenaltyState,
+    start: int,
+    draft_lengths: Sequence[int],
+    draft_tokens_by_req: Sequence[Sequence[int]],
+    num_rows: int,
+    vocab_size: int,
+) -> tuple[np.ndarray, np.ndarray] | None:
+    """Host-side ``(seen_mask, penalties)`` for an unsplit spec-verify logits
+    chunk (draft positions ``0..n-1`` followed by the bonus position ``n``)."""
+    indices = _in_chunk(state, start, start + len(draft_lengths))
+    if not indices or vocab_size <= 0:
+        return None
+    offsets = np.cumsum([0, *(int(n) + 1 for n in draft_lengths)])
+    seen_mask = np.zeros((num_rows, vocab_size), dtype=np.bool_)
+    penalties = np.ones((num_rows, 1), dtype=np.float32)
+    for batch_idx in indices:
+        k = batch_idx - start
+        n = int(draft_lengths[k])
+        first = int(offsets[k])
+        row_state = state[batch_idx]
+        base_mask = row_state.entry.seen_mask(row_state.committed_output, vocab_size)
+        drafts = draft_tokens_by_req[k] if k < len(draft_tokens_by_req) else ()
+        _fill_prefix_rows(
+            seen_mask,
+            penalties,
+            base_mask,
+            row_state.penalty,
+            drafts,
+            range(first, first + n + 1),
+            range(n + 1),
+            vocab_size,
+        )
+    return seen_mask, penalties
+
+
+def build_verify_split_inputs(
+    state: RepetitionPenaltyState,
+    start: int,
+    draft_lengths: Sequence[int],
+    draft_tokens_by_req: Sequence[Sequence[int]],
+    num_target_rows: int,
+    num_bonus_rows: int,
+    vocab_size: int,
+) -> tuple[
+    tuple[np.ndarray, np.ndarray] | None,
+    tuple[np.ndarray, np.ndarray] | None,
+]:
+    """Host-side ``(target_inputs, bonus_inputs)`` after target/bonus gathers."""
+    indices = _in_chunk(state, start, start + len(draft_lengths))
+    if not indices or vocab_size <= 0:
+        return None, None
+    offsets = np.cumsum([0, *draft_lengths])
+    target_mask: np.ndarray | None = None
+    target_penalties: np.ndarray | None = None
+    bonus_mask = np.zeros((num_bonus_rows, vocab_size), dtype=np.bool_)
+    bonus_penalties = np.ones((num_bonus_rows, 1), dtype=np.float32)
+    for batch_idx in indices:
+        k = batch_idx - start
+        n = int(draft_lengths[k])
+        row_state = state[batch_idx]
+        base_mask = row_state.entry.seen_mask(row_state.committed_output, vocab_size)
+        drafts = draft_tokens_by_req[k] if k < len(draft_tokens_by_req) else ()
+        if n > 0:
+            if target_mask is None:
+                target_mask = np.zeros((num_target_rows, vocab_size), dtype=np.bool_)
+                target_penalties = np.ones((num_target_rows, 1), dtype=np.float32)
+            assert target_penalties is not None
+            first = int(offsets[k])
+            _fill_prefix_rows(
+                target_mask,
+                target_penalties,
+                base_mask,
+                row_state.penalty,
+                drafts,
+                range(first, first + n),
+                range(n),
+                vocab_size,
+            )
+        _fill_prefix_rows(
+            bonus_mask,
+            bonus_penalties,
+            base_mask,
+            row_state.penalty,
+            drafts,
+            (k,),
+            (n,),
+            vocab_size,
+        )
+    target_inputs = (
+        None
+        if target_mask is None or target_penalties is None
+        else (target_mask, target_penalties)
+    )
+    return target_inputs, (bonus_mask, bonus_penalties)
+
+
 def apply_penalties_table(
     logits: torch.Tensor,
     seen_mask_np: np.ndarray,
