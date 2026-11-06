@@ -189,7 +189,7 @@ def _window_kernel(
     o_ref,  # aliased with cache_ref
     # Scratch
     buf,  # [N, WINDOW_ROWS, p, W] the windows
-    sems,  # DMA semaphores [2, N]
+    sems,  # DMA semaphores [N], one per window: its store starts after its fetch
     windows_ref,  # [4, N] page, first row, first token and end token of each
 ):
     """A window is a maximal span of consecutive tokens whose slots fall in
@@ -228,10 +228,10 @@ def _window_kernel(
         return ref.at[page_ref[w], pl.ds(row_ref[w], rows)]
 
     def fetch(w):
-        return pltpu.make_async_copy(window(cache_ref, w), buf.at[w], sems.at[0, w])
+        return pltpu.make_async_copy(window(cache_ref, w), buf.at[w], sems.at[w])
 
     def store(w):
-        return pltpu.make_async_copy(buf.at[w], window(o_ref, w), sems.at[1, w])
+        return pltpu.make_async_copy(buf.at[w], window(o_ref, w), sems.at[w])
 
     # Windows are disjoint, so every fetch can be in flight before any store.
     @pl.loop(0, num_windows)
@@ -277,7 +277,7 @@ def _write_windows(cache, word_bits, pages, slots, max_windows, interpret):
             out_specs=pl.BlockSpec(memory_space=pl.ANY),
             scratch_shapes=[
                 pltpu.VMEM((max_windows, rows, packing, width), cache.dtype),
-                pltpu.SemaphoreType.DMA((2, max_windows)),
+                pltpu.SemaphoreType.DMA((max_windows,)),
                 pltpu.SMEM((4, max_windows), jnp.int32),
             ],
         ),
