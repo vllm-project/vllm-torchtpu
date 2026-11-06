@@ -251,6 +251,61 @@ class ShardedRaggedPagedAttentionValidationTest(parameterized.TestCase):
             )
 
 
+class ShardedRaggedPagedAttentionPrefillStageTest(parameterized.TestCase):
+    """`chunk_prefill_size` reaches RPA v3 and gets a capped PREFILL block."""
+
+    def _call(self, chunk_prefill_size, head_dim=128):
+        q = jnp.zeros((16, 4, head_dim))
+        k = jnp.zeros((16, 2, head_dim))
+        kv_cache = jnp.zeros((8, 16, 2, 2, head_dim))
+        seen = {}
+
+        def fake_rpa(*args, **kwargs):
+            seen.update(kwargs)
+            return args[0], args[3]
+
+        default_blocks = {"bq_sz": 32, "bkv_sz": 4096, "bq_csz": 32, "bkv_csz": 2048}
+        with mock.patch.object(
+            attention_interface.rpa_default,
+            "get_default_block_sizes",
+            return_value=default_blocks,
+        ):
+            attention_interface.sharded_ragged_paged_attention(
+                None,  # mesh: unused on the local (shard=False) path
+                q,
+                k,
+                k,
+                kv_cache,
+                jnp.zeros((8,), jnp.int32),
+                jnp.zeros((8,), jnp.int32),
+                jnp.zeros((9,), jnp.int32),
+                jnp.zeros((3,), jnp.int32),
+                None,
+                sm_scale=1.0,
+                rpa_func=fake_rpa,
+                shard=False,
+                kv_block_cap=1024,
+                chunk_prefill_size=chunk_prefill_size,
+            )
+        return seen
+
+    def test_local_path_forwards_size_and_caps_prefill_block(self):
+        seen = self._call(chunk_prefill_size=16)
+        self.assertEqual(seen["chunk_prefill_size"], 16)
+        # bkv capped to 1024 tokens like the DECODE and MIXED stages.
+        self.assertEqual(seen["p_block_sizes"], (32, 1024, 32, 1024))
+        self.assertEqual(seen["d_block_sizes"], (32, 1024, 32, 1024))
+
+    def test_without_size_the_prefill_stage_stays_out(self):
+        seen = self._call(chunk_prefill_size=None)
+        self.assertNotIn("chunk_prefill_size", seen)
+        self.assertNotIn("p_block_sizes", seen)
+
+    def test_hd64_rejects_a_prefill_stage(self):
+        with self.assertRaisesRegex(NotImplementedError, "hd64"):
+            self._call(chunk_prefill_size=16, head_dim=64)
+
+
 class SparseMlaAttentionLayoutValidationTest(parameterized.TestCase):
     """Argument checks in `sparse_mla_attention` that fail fast, before the
     function builds the sharded kernel call."""

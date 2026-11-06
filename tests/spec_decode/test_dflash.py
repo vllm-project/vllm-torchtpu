@@ -1048,10 +1048,20 @@ def test_compiled_input_builders_compile_no_program_per_request_count(device, bu
     )
 
 
-def _fake_attn_impl(cls, decode_query_size, *, kernel_entry=None, built=True):
+def _fake_attn_impl(
+    cls,
+    decode_query_size,
+    *,
+    kernel_entry=None,
+    built=True,
+    built_prefill_size=None,
+    block_major=False,
+):
     impl = cls.__new__(cls)
     impl.decode_query_size = decode_query_size
     impl.rpa_kernel = object() if built else None
+    impl._rpa_kernel_chunk_prefill_size = built_prefill_size
+    impl._bm_kernel = block_major
     if kernel_entry is not None:
         impl._kernel_entry = kernel_entry
     return impl
@@ -1114,3 +1124,68 @@ def test_draft_forward_stays_mixed_without_a_matching_decode_tile(impls):
     assert proposer._draft_uses_decode_stage() is False
     _, rd = proposer._get_static_attn_tensors(3)
     assert rd.tolist() == [0, 0, 3]
+
+
+def _v3(built_prefill_size, **kwargs):
+    return _fake_attn_impl(
+        attention_adapter.PallasAttentionBackendImpl,
+        1,
+        built_prefill_size=built_prefill_size,
+        **kwargs,
+    )
+
+
+def test_draft_forward_takes_prefill_stage_on_rpa_v3():
+    proposer = _make_proposer()  # K = 4, so 5 queries per request.
+    _set_draft_impls(proposer, [_v3(5), _v3(5)])
+    assert proposer._draft_uses_prefill_stage()
+    _, rd = proposer._get_static_attn_tensors(3)
+    assert rd.tolist() == [0, 3, 3]
+
+
+@pytest.mark.parametrize(
+    "impls",
+    [
+        # The kernel was built without the stage: RPA v3 would skip the rows.
+        [_v3(None)],
+        # Built with a stage of the wrong length.
+        [_v3(4)],
+        [_v3(6)],
+        # One layer without the stage is enough to keep MIXED.
+        [_v3(5), _v3(None)],
+        # Block-major pools run the bundled kernel, which has no PREFILL stage.
+        [_v3(5, block_major=True)],
+        [_v3(5, built=False)],
+        # A layer that wants DECODE next to one that wants PREFILL.
+        [_batched(5), _v3(5)],
+    ],
+    ids=[
+        "not_built",
+        "short_stage",
+        "long_stage",
+        "one_layer_without",
+        "block_major",
+        "no_layer_major_kernel",
+        "decode_and_prefill_mix",
+    ],
+)
+def test_draft_forward_stays_mixed_without_a_matching_prefill_stage(impls):
+    proposer = _make_proposer()
+    _set_draft_impls(proposer, impls)
+    _, rd = proposer._get_static_attn_tensors(3)
+    assert rd.tolist() == [0, 0, 3]
+
+
+@pytest.mark.parametrize(
+    "verify_len, expected",
+    [(None, 5), (5, 5), (6, None)],
+    ids=["no_static_verify", "verify_len_matches_block", "verify_len_differs"],
+)
+def test_draft_prefill_stage_size_respects_static_verify(
+    monkeypatch, verify_len, expected
+):
+    # The context-KV update runs the same kernels on the target's verify
+    # metadata, whose PREFILL segment then holds 1 + K token windows.
+    proposer = _make_proposer()
+    monkeypatch.setattr(dflash_module, "static_verify_q_len", lambda _: verify_len)
+    assert proposer._draft_prefill_stage_size() == expected
