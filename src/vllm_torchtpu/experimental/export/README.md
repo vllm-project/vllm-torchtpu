@@ -153,7 +153,9 @@ The artifact's weights are the ones vLLM actually serves with, including what it
 does to some weights while loading them: FP8 checkpoints are dequantized and
 requantized to the runtime format, and checkpoint tensors are cast to the model
 dtype. They are saved as an Orbax checkpoint (Zarr v2 arrays `array_{i}`, one per
-`abstract_params` input, without OCDBT) in `serving_checkpoint/data/`:
+`abstract_params` input, in a TensorStore OCDBT database) in
+`serving_checkpoint/data/`, with `"format": "zarr2_ocdbt"` recorded in
+`serving_config.checkpoint_config`:
 
 | `--export-mode` | Runs on | Weights loaded | Writes |
 |---|---|---|---|
