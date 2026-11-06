@@ -1556,6 +1556,7 @@ def get_scope_name(cfgs: GmmConfigs) -> str:
     return (
         f"gmm_v2-g_{dims.size_group}-m_{dims.size_m}-k_{dims.size_k}-act_{cfgs.fuse_act}"
         f"-n_{dims.size_n}{window}-tm_{tiles.tile_m}-tk_{tiles.tile_k}-tn_{tiles.tile_n}"
+        f"-bb_{tiles.bucket_base}"
     )
 
 
