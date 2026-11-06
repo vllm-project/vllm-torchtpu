@@ -236,6 +236,7 @@ def make_scheduler(
     max_num_seqs: int = 8,
     policy: str = "fcfs",
     prefix_caching: bool = True,
+    compile_sizes: list[int] | None = None,
 ) -> PrefixAwareScheduler:
     model_config = ModelConfig(
         model="facebook/opt-125m",
@@ -267,6 +268,8 @@ def make_scheduler(
         cache_config=cache_config,
         device_config=DeviceConfig(device="cpu"),
     )
+    if compile_sizes is not None:
+        vllm_config.compilation_config.compile_sizes = compile_sizes
     kv_cache_config = KVCacheConfig(
         num_blocks=num_blocks,
         kv_cache_tensors=[],
@@ -290,12 +293,12 @@ def make_scheduler(
     return scheduler
 
 
-def make_request(request_id: str, prompt: list[int]) -> Request:
+def make_request(request_id: str, prompt: list[int], max_tokens: int = 1) -> Request:
     init_none_hash(sha256)
     return Request(
         request_id=request_id,
         prompt_token_ids=prompt,
-        sampling_params=SamplingParams(max_tokens=1, ignore_eos=True),
+        sampling_params=SamplingParams(max_tokens=max_tokens, ignore_eos=True),
         pooling_params=None,
         block_hasher=get_request_block_hasher(BLOCK, sha256),
     )
@@ -596,10 +599,20 @@ def short_first_scheduler(
     budget: int = CHUNKS_PER_STEP * CHUNK,
     max_num_seqs: int = 8,
     hold: bool = False,
+    short_step: bool = False,
+    compile_sizes: tuple[int, ...] = (16, CHUNK, 2 * CHUNK, BUDGET),
 ) -> PrefixAwareScheduler:
-    monkeypatch.setenv("TPU_PREFIX_AWARE_SHORT_PROMPTS", "first" if on else "off")
+    monkeypatch.setenv(
+        "TPU_PREFIX_AWARE_SHORT_PROMPTS",
+        ("first-short-step" if short_step else "first") if on else "off",
+    )
     monkeypatch.setenv("TPU_PREFIX_AWARE_HOLD_SHARED_PREFIX", "1" if hold else "0")
-    return make_scheduler(follow, budget=budget, max_num_seqs=max_num_seqs)
+    return make_scheduler(
+        follow,
+        budget=budget,
+        max_num_seqs=max_num_seqs,
+        compile_sizes=list(compile_sizes),
+    )
 
 
 def add(scheduler, request_id: str, num_tokens: int, first_token: int = 0):
@@ -681,14 +694,16 @@ def test_an_unknown_short_prompts_mode_is_refused(monkeypatch):
         make_scheduler(False)
 
 
-def test_long_prefills_alone_keep_the_whole_budget(monkeypatch):
-    scheduler = short_first_scheduler(monkeypatch)
+@pytest.mark.parametrize("short_step", [False, True])
+def test_long_prefills_alone_keep_the_whole_budget(monkeypatch, short_step):
+    scheduler = short_first_scheduler(monkeypatch, short_step=short_step)
     two_long_prefills(scheduler)
     assert step(scheduler) == {"long1": CHUNK, "long2": CHUNK}
 
 
-def test_a_waiting_long_prompt_gets_no_reservation(monkeypatch):
-    scheduler = short_first_scheduler(monkeypatch)
+@pytest.mark.parametrize("short_step", [False, True])
+def test_a_waiting_long_prompt_gets_no_reservation(monkeypatch, short_step):
+    scheduler = short_first_scheduler(monkeypatch, short_step=short_step)
     two_long_prefills(scheduler)
     add(scheduler, "other", SHORT + 25, first_token=50_000)
     assert step(scheduler) == {"long1": CHUNK, "long2": CHUNK}
@@ -802,12 +817,15 @@ def test_no_free_sequence_slot_means_no_reservation(monkeypatch):
     assert step(scheduler) == {"long1": CHUNK, "long2": CHUNK}
 
 
+@pytest.mark.parametrize("short_step", [False, True])
 @pytest.mark.parametrize("follow", [False, True])
-def test_every_prompt_token_is_computed_once(monkeypatch, follow):
+def test_every_prompt_token_is_computed_once(monkeypatch, follow, short_step):
     rng = random.Random(0)
     sizes = [2, 22, 59, CHUNK + 1, 156, SHORT, SHORT + 1, 937]
     prompts = {f"r{i}": rng.choice(sizes) for i in range(24)}
-    scheduler = short_first_scheduler(monkeypatch, follow=follow, max_num_seqs=6)
+    scheduler = short_first_scheduler(
+        monkeypatch, follow=follow, max_num_seqs=6, short_step=short_step
+    )
     computed = dict.fromkeys(prompts, 0)
     pending = list(prompts.items())
     for n in range(1000):
@@ -833,18 +851,27 @@ def test_every_prompt_token_is_computed_once(monkeypatch, follow):
 
 
 def run_with_short_prompts_first(
-    monkeypatch, follow: bool, arrivals
+    monkeypatch, follow: bool, arrivals, short_step: bool = False
 ) -> tuple[Run, int]:
-    scheduler = short_first_scheduler(monkeypatch, follow=follow, budget=BUDGET)
+    scheduler = short_first_scheduler(
+        monkeypatch, follow=follow, budget=BUDGET, short_step=short_step
+    )
     return run_engine(follow, arrivals, scheduler=scheduler), scheduler._num_rejoins
 
 
+@pytest.mark.parametrize("short_step", [False, True])
 @pytest.mark.parametrize("seed", range(12))
-def test_short_prompts_first_keeps_followers_and_every_read_correct(monkeypatch, seed):
+def test_short_prompts_first_keeps_followers_and_every_read_correct(
+    monkeypatch, seed, short_step
+):
     """Short prompts first caps a long prefill's chunk before the follower
     check, so a capped prefill whose capped chunk is cached still follows."""
-    off, _ = run_with_short_prompts_first(monkeypatch, False, tree_arrivals(seed))
-    on, rejoins = run_with_short_prompts_first(monkeypatch, True, tree_arrivals(seed))
+    off, _ = run_with_short_prompts_first(
+        monkeypatch, False, tree_arrivals(seed), short_step
+    )
+    on, rejoins = run_with_short_prompts_first(
+        monkeypatch, True, tree_arrivals(seed), short_step
+    )
     assert sum(on.computed.values()) <= sum(off.computed.values())
     assert on.reads_checked > 0
     if seed == 0:
@@ -945,3 +972,67 @@ def test_a_sibling_held_in_the_queue_never_follows(monkeypatch):
     assert both.computed["follower"] == 5 * BLOCK
     assert both.computed["leader"] == alone.computed["leader"]
     assert both.reads_checked > 0
+
+
+def test_a_short_step_starts_a_short_prompt_in_one_chunk_of_tokens(monkeypatch):
+    scheduler = short_first_scheduler(monkeypatch, short_step=True)
+    two_long_prefills(scheduler)
+    add(scheduler, "short", 55, first_token=50_000)
+    assert step(scheduler) == {"long1": CHUNK - 55, "short": 55}
+    assert step(scheduler) == {"long1": CHUNK, "long2": CHUNK}
+
+
+def test_a_short_step_needs_room_for_a_waiting_short_prompt(monkeypatch):
+    """While a short prefill's chunk fills the short step, a waiting short
+    prompt cannot start in it, so the step keeps its full size."""
+    scheduler = short_first_scheduler(monkeypatch, short_step=True)
+    two_long_prefills(scheduler)
+    add(scheduler, "s1", 2 * CHUNK + 60, first_token=50_000)
+    assert step(scheduler) == {"s1": CHUNK}
+    add(scheduler, "s2", 31, first_token=60_000)
+    assert step(scheduler) == {"long1": CHUNK, "s1": CHUNK}
+    assert step(scheduler) == {"long1": CHUNK, "long2": CHUNK - 60, "s1": 60}
+    assert step(scheduler) == {"long1": CHUNK - 31, "s2": 31}
+
+
+def test_a_short_step_needs_a_running_long_prefill(monkeypatch):
+    scheduler = short_first_scheduler(monkeypatch, short_step=True)
+    add(scheduler, "a", 31, first_token=10_000)
+    add(scheduler, "b", 47, first_token=20_000)
+    add(scheduler, "c", 94, first_token=30_000)
+    assert sum(step(scheduler).values()) == 2 * CHUNK
+
+
+def test_a_decoding_request_keeps_the_full_step(monkeypatch):
+    scheduler = short_first_scheduler(monkeypatch, short_step=True)
+    scheduler.add_request(make_request("decoder", list(range(16)), max_tokens=50))
+    step(scheduler)
+    add(scheduler, "long1", 480, first_token=20_000)
+    add(scheduler, "long2", 2000, first_token=30_000)
+    step(scheduler)
+    add(scheduler, "short", 55, first_token=50_000)
+    scheduled = step(scheduler)
+    assert "short" in scheduled
+    assert sum(scheduled.values()) == 2 * CHUNK
+
+
+@pytest.mark.parametrize(
+    "compile_sizes, short_step",
+    [((16, 32, 96, 128), 96), ((16, CHUNK, 128), CHUNK)],
+)
+def test_the_short_step_is_the_smallest_compiled_size_for_a_chunk(
+    monkeypatch, compile_sizes, short_step
+):
+    scheduler = short_first_scheduler(
+        monkeypatch, short_step=True, compile_sizes=compile_sizes
+    )
+    assert scheduler.short_step_tokens == short_step
+    assert short_first_scheduler(monkeypatch).short_step_tokens is None
+
+
+@pytest.mark.parametrize("compile_sizes", [(16, 32), (16, 32, 2 * CHUNK)])
+def test_a_short_step_needs_a_compiled_size_below_the_full_step(
+    monkeypatch, compile_sizes
+):
+    with pytest.raises(NotImplementedError, match="compile_sizes"):
+        short_first_scheduler(monkeypatch, short_step=True, compile_sizes=compile_sizes)

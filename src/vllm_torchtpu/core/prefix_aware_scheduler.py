@@ -60,10 +60,22 @@ TPU_PREFIX_AWARE_HOLD_SHARED_PREFIX set, such a prompt, short or long, waits
 until the running prefill has cached the block, and with short prompts first
 that prefill keeps its full chunk.
 
+With TPU_PREFIX_AWARE_SHORT_PROMPTS=first-short-step, a step that starts a
+short waiting prompt beside a running long prefill holds fewer tokens: short
+prompts' chunks first, then running long prefills in admission order; in such
+a step the oldest long prefill does not keep its full chunk, so a lone long
+prompt is slowed down too. A step's time grows with its tokens, so the smaller
+step reaches the short prompt's first token sooner. Its size is the smallest
+compiled step size (compilation_config.compile_sizes) that holds one full
+chunk (long_prefill_token_threshold) and is smaller than the full step, so a
+short prompt's first chunk fits and the step pads to no larger size. The chunk
+limit and every request's tokens stay the same; only the order and grouping of
+prompt chunks change.
+
 Enable with:
     --scheduler-cls vllm_torchtpu.core.prefix_aware_scheduler.PrefixAwareScheduler
     VLLM_TPU_FOLLOW_SHARED_PREFIX=1 (optional)
-    TPU_PREFIX_AWARE_SHORT_PROMPTS=first (optional)
+    TPU_PREFIX_AWARE_SHORT_PROMPTS=first or first-short-step (optional)
     TPU_PREFIX_AWARE_HOLD_SHARED_PREFIX=1 (optional)
 """
 
@@ -107,6 +119,7 @@ class ShortPrompts(enum.StrEnum):
 
     OFF = "off"
     FIRST = "first"
+    FIRST_SHORT_STEP = "first-short-step"
 
 
 @dataclass
@@ -153,6 +166,12 @@ class PrefixAwareScheduler(ShortPromptsFirstScheduler):
         )
         self._uncached_admitted: dict[str, int] = {}
         self.hold_shared_prefix = envs.TPU_PREFIX_AWARE_HOLD_SHARED_PREFIX
+        self.short_step_tokens = (
+            self._smallest_step_below_the_full_step()
+            if short_prompts == ShortPrompts.FIRST_SHORT_STEP
+            else None
+        )
+        self._short_step = False
         self._carriers: set[str] = set()
 
         if self.policy != SchedulingPolicy.FCFS and (
@@ -172,13 +191,16 @@ class PrefixAwareScheduler(ShortPromptsFirstScheduler):
 
         logger.info(
             "PrefixAwareScheduler ACTIVE (window=%d, follow shared prefix: %s, "
-            "short prompts first: %s; hold shared prefix: %s)",
+            "short prompts first: %s; hold shared prefix: %s; short step: %s)",
             self.WINDOW,
             "on" if self.follow_shared_prefix else "off",
             "off"
             if self.short_prompt_tokens is None
             else f"at most {self.short_prompt_tokens} uncached tokens",
             "on" if self.hold_shared_prefix else "off",
+            "off"
+            if self.short_step_tokens is None
+            else f"{self.short_step_tokens} tokens",
         )
 
     def _short_prompt_limit(self) -> int:
@@ -207,6 +229,23 @@ class PrefixAwareScheduler(ShortPromptsFirstScheduler):
                 f"of the {step}-token step."
             )
         return step // chunk * step
+
+    def _smallest_step_below_the_full_step(self) -> int:
+        """The smallest compiled step size that holds one full chunk and is
+        smaller than the full step."""
+        step = self.max_num_scheduled_tokens
+        chunk = self.scheduler_config.long_prefill_token_threshold
+        compile_sizes = self.vllm_config.compilation_config.compile_sizes
+        assert compile_sizes is not None, "the TPU platform sets compile_sizes"
+        sizes = [int(size) for size in compile_sizes if chunk <= int(size) < step]
+        if not sizes:
+            raise NotImplementedError(
+                "TPU_PREFIX_AWARE_SHORT_PROMPTS=first-short-step needs a "
+                f"compiled step size of at least the {chunk}-token chunk and "
+                f"below the {step}-token step; add one to compile_sizes or use "
+                "TPU_PREFIX_AWARE_SHORT_PROMPTS=first."
+            )
+        return min(sizes)
 
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         self._forget_blocks_hashed_last_step()
@@ -246,6 +285,11 @@ class PrefixAwareScheduler(ShortPromptsFirstScheduler):
             hashed_last_step.clear()
 
     def _schedule_short_prompts_first(self, throttle_prefills: bool) -> SchedulerOutput:
+        full_step = self.max_num_scheduled_tokens
+        self._short_step = self._starts_short_step()
+        if self._short_step:
+            assert self.short_step_tokens is not None
+            self.max_num_scheduled_tokens = self.short_step_tokens
         reserved = self._reserve_for_short_prompts()
         if reserved:
             self._running_prefill_budget = max(
@@ -258,8 +302,36 @@ class PrefixAwareScheduler(ShortPromptsFirstScheduler):
         try:
             output = super().schedule(throttle_prefills)
         finally:
+            self.max_num_scheduled_tokens = full_step
+            self._short_step = False
             self._running_prefill_budget = None
         return output
+
+    def _starts_short_step(self) -> bool:
+        """Whether this step holds at most the short step's tokens: a long
+        prefill is running and a short waiting prompt's first chunk fits in
+        the short step beside the chunks of running short prefills."""
+        if (
+            self.short_step_tokens is None
+            or self._pause_state != PauseState.UNPAUSED
+            or self._decode_tokens() > 0
+        ):
+            return False
+        prefills = [r for r in self.running if r.is_prefill_chunk]
+        if all(self._is_short_prompt(r) for r in prefills):
+            return False
+        running_short = sum(
+            self._chunk(r.num_tokens - r.num_computed_tokens)
+            for r in prefills
+            if self._is_short_prompt(r)
+        )
+        _, started = fit_short_prompts(
+            ((None, chunk) for chunk in self._short_waiting_chunks()),
+            running_short,
+            self.short_step_tokens,
+            self._free_sequence_slots(),
+        )
+        return bool(started)
 
     def _hold_prompts_behind_running_prefixes(self) -> list[Request]:
         """Take out of the waiting queue, for this step, every prompt whose
@@ -326,6 +398,8 @@ class PrefixAwareScheduler(ShortPromptsFirstScheduler):
         )
 
     def _keeps_full_chunk(self, request: Request) -> bool:
+        if self._short_step:
+            return False
         longs = (
             r
             for r in self.running

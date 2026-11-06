@@ -1500,9 +1500,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # which prompts are short).
     # A tradeoff: short prompts reach their first token sooner, and a second
     # running long prefill gets fewer tokens per step. "off" schedules as
-    # before; "first" serves short prompts first.
+    # before; "first" serves short prompts first; "first-short-step" also
+    # starts them in a smaller step, the smallest compiled size that holds one
+    # chunk, where the oldest long prefill gets fewer tokens too.
     "TPU_PREFIX_AWARE_SHORT_PROMPTS": env_with_choices(
-        "TPU_PREFIX_AWARE_SHORT_PROMPTS", "off", ["off", "first"]
+        "TPU_PREFIX_AWARE_SHORT_PROMPTS", "off", ["off", "first", "first-short-step"]
     ),
     # PrefixAwareScheduler: a waiting prompt whose first uncached block a
     # running prefill is still computing waits until that block is cached
