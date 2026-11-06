@@ -251,6 +251,9 @@ _TPU_COMPILE_ENV_IGNORED = {
     # load (layers/adapter/expert_placement.py); every program is the unplaced
     # model's, so a placed server reuses its compile cache.
     "TPU_EXPERT_PLACEMENT",
+    # Publishes the parallel config from the API server's lifespan; never
+    # touches the compiled graph.
+    "VLLM_TPU_EMIT_PLACEMENT",
     # Pooling: the static pooler is a separate backend="tpu" helper outside the
     # backbone graph, and the KV cap reaches the hash through num_gpu_blocks.
     "VLLM_TPU_STATIC_POOLER",
