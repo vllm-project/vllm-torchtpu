@@ -1193,7 +1193,7 @@ class UniversalVllmExportableLLM(api.ExportableTextOnlyLLM):
             return []
         from vllm.model_executor.layers.attention import Attention
         from vllm.v1.attention.backend import AttentionType
-        from vllm.v1.core.kv_cache_utils import get_kv_cache_groups
+        from vllm.v1.core.kv_cache_planning import get_kv_cache_groups
         from vllm.v1.kv_cache_interface import FullAttentionSpec, SlidingWindowSpec
 
         from vllm_torchtpu.kv_cache_spec_normalizer import (
