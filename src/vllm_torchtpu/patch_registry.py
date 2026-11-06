@@ -140,6 +140,10 @@ PATCHES = (
         "vllm_torchtpu.platforms.tpu_platform:_patch_api_server_kernel_reload_endpoint",
         _ACTIVE,
     ),
+    Patch(
+        "vllm_torchtpu.tracing.utils:_patch_vllm_engine_core_tracing_attribution",
+        _ENGINE,
+    ),
     # Model-specific patches.
     # Append patches for new models here with
     # stages=("platform_activation", "model_load") and model_config=True.

@@ -236,6 +236,7 @@ def test_manifest_preserves_lifecycle_dependencies():
         "_patch_vllm_raiden_pd_completion",
         "_patch_vllm_same_step_prefix_hits",
         "_patch_vllm_merge_multimodal_embeddings",
+        "_patch_vllm_engine_core_tracing_attribution",
     ]
     assert stages["platform_activation"] == (
         stages["worker_init"] + stages["model_load"]
