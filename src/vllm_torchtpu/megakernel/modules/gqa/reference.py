@@ -24,6 +24,7 @@ import jax.numpy as jnp
 from ...exec_spec import ExecSpec
 from ...ops import BF16, F32, FP8, rmsnorm, rope_partial, round_bf16
 from ...pool.config import cache_exec
+from .params import GQATunables
 
 
 def gqa_reference(
@@ -43,15 +44,15 @@ def gqa_reference(
     R, B, T, NS, ctx = ex.R, ex.B, ex.T, ex.NS, ex.ctx
     a = int(att_idx)
     lyr = a if layer_idx is None else int(layer_idx)
-    L = int(getattr(g, "L", 1))
+    L = int(g.L)
     nh = int(g.NH) // R
     HD = int(g.HD)
-    ROT = int(getattr(g, "ROT", HD))
+    ROT = int(g.ROT)
     theta = float(g.theta)
-    eps = float(getattr(g, "eps", 1e-6))
-    zc = bool(getattr(g, "zero_centered_norm", True))
+    eps = float(g.eps)
+    zc = bool(g.zero_centered_norm)
     use_paged_kv = cache_exec(ex).paged_kv if paged_kv is None else bool(paged_kv)
-    rope_round = not ex.resolve_tiles(g).module(module_name).rope_fp32
+    rope_round = not ex.resolve_tiles(g).module(module_name, GQATunables).rope_fp32
 
     half = ROT // 2
     inv = 1.0 / (theta ** (jnp.arange(half, dtype=F32)[None, :] * 2.0 / ROT))

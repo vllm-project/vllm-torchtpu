@@ -15,16 +15,27 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import Any, ClassVar
 
 from jax.experimental.pallas import tpu as pltpu
 
 from ...errors import MegakernelConfigError
-from ...exec_spec import ExecSpec, NumericsClass
+from ...exec_spec import ExecSpec, NumericsClass, register_tunables
 from ...fused_io_hook import fused_io
 from ...ops import BF16, F32, FP8, I32, round_up
 from ...pool.config import cache_exec, resolved_max_pages_per_seq
+
+logger = logging.getLogger(__name__)
+_WARNED_GQA_KEYS: set[tuple[Any, ...]] = set()
+
+
+def _warn_gqa_once(key: tuple[Any, ...], msg: str, *args: Any) -> None:
+    if key not in _WARNED_GQA_KEYS:
+        _WARNED_GQA_KEYS.add(key)
+        logger.warning(msg, *args)
+
 
 NN = (((1,), (0,)), ((), ()))
 NT = (((1,), (1,)), ((), ()))
@@ -122,6 +133,9 @@ class GQATunables:
     }
 
 
+register_tunables("gqa", GQATunables)
+
+
 def derive_params(
     g: Any,
     ex: ExecSpec,
@@ -139,30 +153,41 @@ def derive_params(
     BLK = tt.kv_blk
     PAIR_KV = tt.pair_kv
     NKV = max(tt.nkv, 4) if PAIR_KV else tt.nkv
-    assert ex.ctx % BLK == 0 and BLK % 128 == 0, (ex.ctx, BLK)
+    if PAIR_KV and tt.nkv < 4:
+        _warn_gqa_once(
+            ("pair_kv_nkv", tt.nkv),
+            "GQATunables.pair_kv=True raised nkv from %d to 4",
+            tt.nkv,
+        )
+    if ex.ctx <= 0 or BLK <= 0 or ex.ctx % BLK != 0 or BLK % 128 != 0:
+        raise MegakernelConfigError(
+            f"GQA requires ctx ({ex.ctx}) % kv_blk ({BLK}) == 0 and kv_blk % 128 == 0"
+        )
+    if tt.amask not in (0, 1, 2, 3, 4):
+        raise MegakernelConfigError(
+            f"GQATunables.amask must be in {{0, 1, 2, 3, 4}}, got {tt.amask!r}"
+        )
     if cache_exec(ex).paged_kv:
-        assert g.HD % 4 == 0, f"paged_kv requires HD % 4 == 0, got {g.HD}"
-        assert (
-            cache_exec(ex).page_size > 0
-            and cache_exec(ex).page_size % 128 == 0
-            and BLK % cache_exec(ex).page_size == 0
-        ), (
-            BLK,
-            cache_exec(ex).page_size,
-        )
-        assert (
-            ex.ctx % cache_exec(ex).page_size == 0
-            and cache_exec(ex).num_pages >= 1
-            and resolved_max_pages_per_seq(ex) >= ex.ctx // cache_exec(ex).page_size
-        ), (
-            cache_exec(ex).page_size,
-            ex.ctx,
-            cache_exec(ex).num_pages,
-            resolved_max_pages_per_seq(ex),
-        )
-        assert tt.amask not in (3, 4), (
-            f"paged_kv requires amask in {{0, 1, 2}}, got {tt.amask}"
-        )
+        if g.HD % 4 != 0:
+            raise MegakernelConfigError(f"paged_kv requires HD % 4 == 0, got HD={g.HD}")
+        ps = cache_exec(ex).page_size
+        if ps <= 0 or ps % 128 != 0 or BLK % ps != 0:
+            raise MegakernelConfigError(
+                f"paged_kv requires page_size ({ps}) % 128 == 0 and "
+                f"kv_blk ({BLK}) % page_size == 0"
+            )
+        npages = cache_exec(ex).num_pages
+        mpps = resolved_max_pages_per_seq(ex)
+        if ex.ctx % ps != 0 or npages < 1 or mpps < ex.ctx // ps:
+            raise MegakernelConfigError(
+                f"paged_kv requires ctx ({ex.ctx}) % page_size ({ps}) == 0, "
+                f"num_pages ({npages}) >= 1, and max_pages_per_seq ({mpps}) "
+                f">= ctx // page_size ({ex.ctx // ps})"
+            )
+        if tt.amask in (3, 4):
+            raise MegakernelConfigError(
+                f"paged_kv requires amask in {{0, 1, 2}}, got {tt.amask}"
+            )
     KV_ITEM = 2 * (g.HD // 4) * BLK * 4
     EBROWS = tiles.ebank // 128
     # KVE stages KV blocks in the (idle) expert ring. On TPU this aliases the
@@ -177,6 +202,26 @@ def derive_params(
         and tiles.ebank >= KV_ITEM
         and g.HD == KVE_HD
     )
+    if tt.kv_ering and not KVE:
+        _warn_gqa_once(
+            (
+                "kv_ering",
+                cache_exec(ex).paged_kv,
+                tiles.nbe,
+                NKV,
+                tiles.ebank,
+                KV_ITEM,
+                g.HD,
+            ),
+            "GQATunables.kv_ering=True turned off (paged_kv=%s, nbe=%d vs NKV=%d, "
+            "ebank=%d vs KV_ITEM=%d, HD=%d)",
+            cache_exec(ex).paged_kv,
+            tiles.nbe,
+            NKV,
+            tiles.ebank,
+            KV_ITEM,
+            g.HD,
+        )
     if KVE:
         dyn_owners = {plan.weight_owners[k] for k in plan.dynamic_kinds}
         if not all(plan.module_layer_counts.get(m, 0) == g.L for m in dyn_owners):
@@ -188,9 +233,16 @@ def derive_params(
     if NKV < 2:
         raise MegakernelConfigError(f"GQA KV ring requires nkv >= 2 (got {NKV})")
     SUB = tt.kv_sub or BLK
-    assert BLK % SUB == 0 and SUB % 128 == 0, (BLK, SUB)
+    if SUB <= 0 or BLK % SUB != 0 or SUB % 128 != 0:
+        raise MegakernelConfigError(
+            f"GQA requires kv_blk ({BLK}) % kv_sub ({SUB}) == 0 and kv_sub % 128 == 0"
+        )
     SPLIT = tt.split and G > 1
-    assert not SPLIT or (G & (G - 1) == 0), G
+    if SPLIT and (G & (G - 1)) != 0:
+        raise MegakernelConfigError(
+            f"GQA split attention requires G = R // NKV to be a power of two, "
+            f"got G={G} (R={ex.R}, NKV={g.NKV})"
+        )
     TS = G if SPLIT else 1
     QR = round_up(G * nh, 8) if SPLIT else 8
     TQ = ex.T * QR
@@ -214,6 +266,19 @@ def derive_params(
         and nh <= 8
         and (not PACK or PB * nh == 8)
     )
+    if tt.gqa_qv and not QV:
+        _warn_gqa_once(
+            ("gqa_qv", SPLIT, ex.VER, g.HD, nh, PACK, PB),
+            (
+                "GQATunables.gqa_qv=True turned off "
+                "(SPLIT=%s, VER=%s, HD=%d, nh=%d, PB=%d)"
+            ),
+            SPLIT,
+            ex.VER,
+            g.HD,
+            nh,
+            PB,
+        )
     if tt.gq_pack and not tt.gqa_qv:
         raise MegakernelConfigError("GQATunables.gq_pack requires gqa_qv")
     QG = ex.T * nh
@@ -227,6 +292,20 @@ def derive_params(
         and ex.NS <= 64
         and g.HD == GQ_ML_LANES
     )
+    if tt.gq_pack and not GQ:
+        _warn_gqa_once(
+            ("gq_pack", QV, SPLIT, ex.VER, G * nh, QR, QG, ex.NS, g.HD),
+            (
+                "GQATunables.gq_pack=True turned off "
+                "(QV=%s, SPLIT=%s, VER=%s, QG=%d, NS=%d, HD=%d)"
+            ),
+            QV,
+            SPLIT,
+            ex.VER,
+            QG,
+            ex.NS,
+            g.HD,
+        )
     MLW = 128 // ex.NS if GQ else 0
     if GQ:
         SR = nh

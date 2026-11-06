@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Standalone unit tests for slice L-6a (`modules/gqa/{params,decls,reference}`)."""
+"""Standalone unit tests for GQA parameters, declarations, and reference."""
 
 from __future__ import annotations
 
@@ -28,13 +28,14 @@ from tests.megakernel.megakernel_fakes import (
     FakeGeometry,
     FakeMixerModule,
 )
+from vllm_torchtpu.megakernel import module_options
 from vllm_torchtpu.megakernel.decls import (
     KVCacheDecl,
     ModuleBinding,
     ResolvedModuleGeometry,
 )
 from vllm_torchtpu.megakernel.errors import MegakernelConfigError
-from vllm_torchtpu.megakernel.exec_spec import ExecSpec, register_tunables
+from vllm_torchtpu.megakernel.exec_spec import ExecSpec
 from vllm_torchtpu.megakernel.modules.gqa.decls import (
     GQA_FIELD_ALIASES,
     GQA_GEOMETRY_FIELDS,
@@ -140,6 +141,23 @@ def test_gqa_tunables_and_derive_params_validation():
         derive_params(g, ex, p, GQATunables(kv_blk=128, nkv=1, pair_kv=False))
     with pytest.raises(MegakernelConfigError, match="gq_pack requires gqa_qv"):
         derive_params(g, ex, p, GQATunables(kv_blk=128, nkv=2, gq_pack=True))
+    with pytest.raises(MegakernelConfigError, match="kv_blk"):
+        derive_params(g, ex, p, GQATunables(kv_blk=100, nkv=2))
+    with pytest.raises(MegakernelConfigError, match="kv_sub"):
+        derive_params(g, ex, p, GQATunables(kv_blk=128, nkv=2, kv_sub=64))
+    with pytest.raises(MegakernelConfigError, match="amask"):
+        derive_params(g, ex, p, GQATunables(kv_blk=128, nkv=2, amask=5))
+    with pytest.raises(MegakernelConfigError, match="paged_kv requires amask"):
+        derive_params(g, ex_paged, p_paged, GQATunables(kv_blk=128, nkv=2, amask=3))
+    ex_bad_ps = dataclasses.replace(
+        ex_paged, cache=CacheExec(paged_kv=True, page_size=64, num_pages=16)
+    )
+    with pytest.raises(MegakernelConfigError, match="page_size"):
+        derive_params(g, ex_bad_ps, p_paged, GQATunables(kv_blk=128, nkv=2))
+    g_bad_g = FakeGeometry(L=2, att_every=1, H=256, NH=12, NKV=2, HD=256, ROT=64)
+    ex_r6 = ExecSpec(B=4, T=1, R=6, ctx=256, stack_e=True, tiles=tiles)
+    with pytest.raises(MegakernelConfigError, match="power of two"):
+        derive_params(g_bad_g, ex_r6, p, GQATunables(kv_blk=128, nkv=2, split=True))
 
 
 def test_gqa_decls_options_binding_and_hf_params():
@@ -190,6 +208,22 @@ def test_gqa_decls_options_binding_and_hf_params():
     assert GQA_GEOMETRY_METHODS["G"](resolved, 2) == 1
     assert GQA_GEOMETRY_METHODS["NAI"](resolved, 2) == (2 * 2 + 2) * 64
 
+    # Whole-number partial_rotary_factor=1 (int) resolves to full HD (64),
+    # and odd or >HD rotary dimensions raise MegakernelConfigError.
+    res_int1 = resolve_gqa_binding(
+        FakeMixerModule,
+        binding,
+        dataclasses.replace(raw_res, values={**raw_res.values, "rot": 1}),
+    )
+    assert res_int1.ROT == 64
+    for bad_rot in (0, 33, 128, True):
+        with pytest.raises(MegakernelConfigError, match="ROT|rot"):
+            resolve_gqa_binding(
+                FakeMixerModule,
+                binding,
+                dataclasses.replace(raw_res, values={**raw_res.values, "rot": bad_rot}),
+            )
+
     decls_fp8 = gqa_hf_params("self_attn", resolved)
     names_fp8 = {d.name for d in decls_fp8}
     assert "q_custom" in names_fp8 and "q_proj_s" in names_fp8 and "qn" in names_fp8
@@ -206,62 +240,147 @@ def test_gqa_decls_options_binding_and_hf_params():
     assert gqa_cache_decl(None, pool_layout=play).hd == 128
 
 
+@pytest.mark.parametrize("use_fp8", [False, True], ids=["bf16_w", "fp8_w"])
+@pytest.mark.parametrize("paged_kv", [False, True], ids=["direct_hbm", "paged_kv"])
 @pytest.mark.parametrize("T", [1, 2], ids=["decode_t1", "verify_t2"])
-def test_gqa_reference_matches_direct_computation(T: int):
-    """Compare `gqa_reference` against a direct step-by-step computation."""
+def test_gqa_reference_matches_direct_computation(
+    monkeypatch: pytest.MonkeyPatch, T: int, paged_kv: bool, use_fp8: bool
+):
+    """Compare `gqa_reference` against an independent computation across modes."""
     R, B, ctx = 2, 2 * T, 128
-    g = FakeGeometry(L=1, att_every=1, H=256, NH=4, NKV=2, HD=128, ROT=32)
-    register_tunables("fake_gqa_ref", GQATunables)
-    ex = ExecSpec(B=B, T=T, R=R, ctx=ctx, tiles=TINY_TILES)
+    L = 2 if use_fp8 else 1
+    att_idx = 1 if use_fp8 else 0
+    g = FakeGeometry(L=L, att_every=1, H=256, NH=4, NKV=2, HD=128, ROT=32)
+    # "gqa" is registered by `gqa/params.py`; also test isolated custom name.
+    assert TINY_TILES.module("gqa") == GQATunables()
+    monkeypatch.setitem(module_options._TUNABLES, "custom_gqa_test", GQATunables)
+    cache = (
+        CacheExec(paged_kv=True, page_size=128, num_pages=16)
+        if paged_kv
+        else CacheExec()
+    )
+    ex = ExecSpec(B=B, T=T, R=R, ctx=ctx, tiles=TINY_TILES, cache=cache)
     nh = g.NH // R
     nai = (2 * nh + 2) * g.HD
     koff = nh * 2 * g.HD
 
-    keys = jax.random.split(jax.random.PRNGKey(7 + T), 6)
-    x = jax.random.normal(keys[0], (B, g.H), dtype=BF16) * 0.2
-    w_in = jax.random.normal(keys[1], (R, g.H, nai), dtype=BF16) * 0.1
-    w_out = jax.random.normal(keys[2], (R, nh * g.HD, g.H), dtype=BF16) * 0.1
-    qn = jax.random.normal(keys[3], (R, g.HD), dtype=F32) * 0.1
-    kn = jax.random.normal(keys[4], (R, g.HD), dtype=F32) * 0.1
-    kc = jax.random.normal(keys[5], (R, ex.NS, ctx, g.HD), dtype=BF16) * 0.1
-    vc = jax.random.normal(keys[5], (R, ex.NS, ctx, g.HD), dtype=BF16) * 0.05
+    keys = jax.random.split(
+        jax.random.PRNGKey(7 + T + 10 * int(paged_kv) + 20 * int(use_fp8)), 9
+    )
+    x = jax.random.normal(keys[0], (B, g.H), dtype=BF16) * 0.5
+    qn = jax.random.normal(keys[3], (R, L, g.HD), dtype=F32) * 0.2 + 1.0
+    kn = jax.random.normal(keys[4], (R, L, g.HD), dtype=F32) * 0.2 + 1.0
+    kc = jax.random.normal(keys[5], (R, L, ex.NS, ctx, g.HD), dtype=BF16) * 0.4
+    vc = jax.random.normal(keys[6], (R, L, ex.NS, ctx, g.HD), dtype=BF16) * 0.4
     pos = jnp.array([4 + (b % T) for b in range(B)], dtype=I32)
 
-    params = {"att_in": w_in, "att_out": w_out, "qn": qn, "kn": kn}
+    if use_fp8:
+        w_in = jax.random.normal(keys[1], (R, L, g.H, nai), dtype=BF16).astype(FP8)
+        w_out = jax.random.normal(keys[2], (R, L, nh * g.HD, g.H), dtype=BF16).astype(
+            FP8
+        )
+        in_s = jax.random.uniform(
+            keys[7], (R, L, nai), dtype=F32, minval=0.05, maxval=0.2
+        )
+        out_s = jax.random.uniform(
+            keys[8], (R, L, g.H), dtype=F32, minval=0.05, maxval=0.2
+        )
+        params = {
+            "att_in": w_in,
+            "att_in_s": in_s,
+            "att_out": w_out,
+            "att_out_s": out_s,
+            "qn": qn,
+            "kn": kn,
+        }
+    else:
+        w_in = jax.random.normal(keys[1], (R, g.H, nai), dtype=BF16) * 0.2
+        w_out = jax.random.normal(keys[2], (R, nh * g.HD, g.H), dtype=BF16) * 0.2
+        in_s = None
+        out_s = None
+        params = {"att_in": w_in, "att_out": w_out, "qn": qn[:, 0], "kn": kn[:, 0]}
+        kc = kc[:, 0]
+        vc = vc[:, 0]
+
     state = {"kc": kc, "vc": vc}
     delta, new_state = gqa_reference(
-        params, x, state, g=g, ex=ex, pos=pos, module_name="fake_gqa_ref"
+        params,
+        x,
+        state,
+        g=g,
+        ex=ex,
+        pos=pos,
+        att_idx=att_idx,
+        layer_idx=att_idx,
     )
     assert delta.shape == (B, g.H)
     assert new_state["kc"].shape == kc.shape
 
-    # Direct single-sequence check for rank 0, token 0 (sq=0, tb=0)
+    # Independent computation of token 0 (`b=0`, `sq=0`, `tb=0`) across all ranks `r`.
     xb0 = x[0:1].astype(BF16).astype(F32)
-    y0 = round_bf16(xb0 @ w_in[0].astype(F32))
-    qg0 = y0[0, :koff].reshape(nh, 2 * g.HD)
-    gate0 = round_bf16(jax.nn.sigmoid(qg0[:, g.HD :].reshape(nh * g.HD)))
     half = g.ROT // 2
     inv = 1.0 / (g.theta ** (jnp.arange(half, dtype=F32)[None, :] * 2.0 / g.ROT))
     ang0 = pos[0].astype(F32) * inv
     cos0, sin0 = round_bf16(jnp.cos(ang0)), round_bf16(jnp.sin(ang0))
-    q0 = round_bf16(
-        rope_partial(
-            rmsnorm(qg0[:, : g.HD], qn[0], g.eps, zero_centered=True),
+    plen0 = int(pos[0])
+
+    expected_delta0 = jnp.zeros((g.H,), dtype=F32)
+    for r in range(R):
+        w_in_r = (w_in[r, att_idx] if use_fp8 else w_in[r]).astype(F32)
+        w_out_r = (w_out[r, att_idx] if use_fp8 else w_out[r]).astype(F32)
+        qn_r = qn[r, att_idx]
+        kn_r = kn[r, att_idx]
+        y_raw = xb0 @ w_in_r
+        y0 = round_bf16(y_raw * in_s[r, att_idx] if in_s is not None else y_raw)
+        qg0 = y0[0, :koff].reshape(nh, 2 * g.HD)
+        gate0 = round_bf16(jax.nn.sigmoid(qg0[:, g.HD :].reshape(nh * g.HD)))
+        q0 = round_bf16(
+            rope_partial(
+                rmsnorm(qg0[:, : g.HD], qn_r, g.eps, zero_centered=True),
+                cos0,
+                sin0,
+                g.ROT,
+                round_intermediates=True,
+            )
+            * (g.HD**-0.5)
+        )
+        k0 = rope_partial(
+            rmsnorm(y0[:, koff : koff + g.HD], kn_r, g.eps, zero_centered=True),
             cos0,
             sin0,
             g.ROT,
             round_intermediates=True,
+        )[0]
+        v0 = y0[0, koff + g.HD : koff + 2 * g.HD]
+        if paged_kv:
+            k0 = jnp.clip(k0, -448.0, 448.0).astype(FP8).astype(F32)
+            v0 = jnp.clip(v0, -448.0, 448.0).astype(FP8).astype(F32)
+        kc_r0 = kc[r, att_idx, 0] if use_fp8 else kc[r, 0]
+        vc_r0 = vc[r, att_idx, 0] if use_fp8 else vc[r, 0]
+        if paged_kv:
+            kc_r0 = jnp.clip(kc_r0.astype(F32), -448.0, 448.0).astype(FP8).astype(BF16)
+            vc_r0 = jnp.clip(vc_r0.astype(F32), -448.0, 448.0).astype(FP8).astype(BF16)
+        kc_out_r0 = new_state["kc"][r, att_idx, 0] if use_fp8 else new_state["kc"][r, 0]
+        vc_out_r0 = new_state["vc"][r, att_idx, 0] if use_fp8 else new_state["vc"][r, 0]
+        np.testing.assert_allclose(kc_out_r0[plen0], k0.astype(BF16))
+        np.testing.assert_allclose(vc_out_r0[plen0], v0.astype(BF16))
+
+        k_valid = jnp.concatenate([kc_r0[:plen0].astype(F32), k0[None, :]], axis=0)
+        v_valid = jnp.concatenate([vc_r0[:plen0].astype(F32), v0[None, :]], axis=0)
+        scores0 = q0.astype(BF16).astype(F32) @ k_valid.T
+        probs0 = jax.nn.softmax(scores0, axis=-1)
+        att0 = round_bf16(probs0 @ v_valid).reshape(nh * g.HD)
+        mix0 = round_bf16(att0 * gate0).astype(BF16).astype(F32)
+        yo_raw = mix0 @ w_out_r
+        yo0 = (
+            (yo_raw * out_s[r, att_idx] if out_s is not None else yo_raw)
+            .astype(BF16)
+            .astype(F32)
         )
-        * (g.HD**-0.5)
-    )
-    k0 = rope_partial(
-        rmsnorm(y0[:, koff : koff + g.HD], kn[0], g.eps, zero_centered=True),
-        cos0,
-        sin0,
-        g.ROT,
-        round_intermediates=True,
-    )[0]
-    v0 = y0[0, koff + g.HD : koff + 2 * g.HD]
-    np.testing.assert_allclose(new_state["kc"][0, 0, pos[0]], k0.astype(BF16))
-    np.testing.assert_allclose(new_state["vc"][0, 0, pos[0]], v0.astype(BF16))
-    assert jnp.all(jnp.isfinite(delta)) and jnp.all(jnp.isfinite(q0 * gate0[: g.HD]))
+        expected_delta0 = expected_delta0 + yo0
+
+    np.testing.assert_allclose(delta[0], expected_delta0, rtol=1e-2, atol=1e-2)
+    with pytest.raises(AssertionError):
+        np.testing.assert_allclose(
+            delta[0] + 0.1, expected_delta0, rtol=1e-5, atol=1e-5
+        )

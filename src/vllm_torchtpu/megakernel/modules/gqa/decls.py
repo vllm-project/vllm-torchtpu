@@ -31,6 +31,7 @@ from ...decls import (
 )
 from ...errors import MegakernelConfigError
 from ...ops import BF16, F32, FP8
+from ...pool.layout import VALIDATED_KVH, VALIDATED_PAGE_SIZE
 
 GQA_WEIGHT_NAMES: tuple[str, ...] = ("att_in", "att_out")
 
@@ -113,11 +114,20 @@ def resolve_gqa_binding(
     hd_raw = vals.get("head_dim")
     hd = H // NH if hd_raw is None else int(hd_raw)
     rot_raw = vals.get("rot", 1.0)
+    if isinstance(rot_raw, bool) or not isinstance(rot_raw, (int, float)):
+        raise MegakernelConfigError(
+            f"GQAModule rot must be an int or float, got {rot_raw!r}"
+        )
     rot_val = (
-        int(round(rot_raw * hd))
-        if isinstance(rot_raw, float) and 0.0 < rot_raw <= 1.0
-        else int(rot_raw)
+        int(round(float(rot_raw) * hd)) if 0.0 < float(rot_raw) <= 1.0 else int(rot_raw)
     )
+    if rot_val <= 0 or rot_val > hd or rot_val % 2 != 0:
+        raise MegakernelConfigError(
+            f"GQAModule resolved ROT={rot_val} (from rot={rot_raw!r}, HD={hd}) "
+            f"must be a positive even integer <= HD ({hd})"
+        )
+    vals.setdefault("L", 1)
+    vals.setdefault("zero_centered_norm", True)
     vals.update(
         {
             "head_dim": hd,
@@ -390,7 +400,7 @@ def gqa_cache_decl(geom: Any | None, *, pool_layout: Any = None) -> KVCacheDecl:
     assert geom is not None
     return KVCacheDecl(
         hd=int(geom.HD),
-        kvh=int(getattr(geom, "kvh", 1)),
-        page_size=int(getattr(geom, "page_size", 128)),
+        kvh=VALIDATED_KVH,
+        page_size=VALIDATED_PAGE_SIZE,
         page_dtype=FP8,
     )
