@@ -153,13 +153,17 @@ def test_nonep_choices_change_only_the_non_ep_program():
     assert "concatenate" in non_ep and "concatenate" not in jaxpr(False)
 
 
-def _ref_gmm(calls):
-    """Pure-JAX stand-in for gmm_wrapper that records its n_window; every
-    output column is computed independently, as the kernel's are."""
+def _ref_gmm(calls, tiles=None):
+    """Pure-JAX stand-in for gmm_wrapper that records its n_window (and
+    tile_m); every output column is computed independently, as the kernel's
+    are."""
+    tiles = [] if tiles is None else tiles
 
     def gmm(lhs, rhs, rhs_scale, rhs_bias, group_sizes, group_offset, zero_initialize=False,
-            fuse_act=None, preferred_element_type=None, rhs_quant_dtype=None, n_window=None):
+            fuse_act=None, preferred_element_type=None, rhs_quant_dtype=None, n_window=None,
+            tile_m=0):
         calls.append(n_window)
+        tiles.append(tile_m)
         r = (rhs.astype(jnp.float32) * rhs_scale[:, 0]).astype(jnp.bfloat16)
         if n_window is not None:
             r = r[..., n_window[0] : n_window[0] + n_window[1]]
@@ -218,6 +222,49 @@ def test_combine_split_matches_one_gmm_and_one_combine(monkeypatch, split):
     assert np.asarray(ref, np.float32).std() > 0
 
 
+def test_tiling_with_tile_m_overrides_only_the_m_tiling(monkeypatch):
+    from vllm_torchtpu.kernels.megablox.gmm_v2 import Dimensions, TileSizes
+
+    default = TileSizes(tile_m=512, tile_k=2560, tile_n=640, bucket_base=128)
+    monkeypatch.setattr(fused_moe_gmm, "calculate_tiling", lambda *a, **k: default)
+    fused_moe_gmm.tiling_with_tile_m.cache_clear()
+    dims = Dimensions(size_m=64000, size_k=2560, size_n=1280, size_group=512,
+                      size_lhs_group=512, size_lhs_sublane=16)
+    t = lambda tm, d=dims: fused_moe_gmm.tiling_with_tile_m(tm)(d, None, None, 0, "silu")  # noqa: E731
+    assert t(1024) == TileSizes(1024, 2560, 640, 256)
+    assert t(2048) == TileSizes(2048, 2560, 640, 512)
+    assert t(256) == TileSizes(256, 2560, 640, 128)
+    assert t(512) == default
+    # small steps never get a tile larger than their (bucket-aligned) row count
+    small = Dimensions(size_m=300, size_k=2560, size_n=1280, size_group=512,
+                       size_lhs_group=512, size_lhs_sublane=16)
+    assert t(2048, small).tile_m == 384
+    # the factory returns one function per value: a stable static argument
+    assert fused_moe_gmm.tiling_with_tile_m(1024) is fused_moe_gmm.tiling_with_tile_m(1024)
+
+
+@pytest.mark.parametrize("use_ep", [False, True])
+def test_gmm_tile_m_reaches_both_gmms_on_the_non_ep_path_only(monkeypatch, use_ep):
+    experts, hidden, inter, topk, tokens = 16, 512, 128, 4, 640
+    k1, k2, k3 = jax.random.split(jax.random.key(4), 3)
+    w1, s1 = _fp8_per_channel(k1, (experts, hidden, 2 * inter))
+    w2, s2 = _fp8_per_channel(k2, (experts, inter, hidden))
+    x = (jax.random.normal(k3, (tokens, hidden), jnp.float32) / 4).astype(jnp.bfloat16)
+    rng = np.random.default_rng(6)
+    ids = jnp.asarray(np.stack([rng.choice(experts, topk, replace=False) for _ in range(tokens)]), jnp.int32)
+    w = jnp.asarray(rng.random((tokens, topk)), jnp.bfloat16)
+    calls, tiles = [], []
+    monkeypatch.setattr(fused_moe_gmm, "gmm_wrapper", _ref_gmm(calls, tiles))
+    xs, gs, rev, wf, valid, tok = prepare_routed_gmm_inputs(
+        x, ids, w, local_num_experts=experts, topk=topk, use_ep=False, use_sparse_core=False
+    )
+    fused_moe_gmm.moe_gmm(
+        xs, w1, s1, None, w2, s2, None, gs, rev, wf, valid, tok, activation="silu",
+        num_tokens=tokens, topk=topk, use_ep=use_ep, use_sparse_core=False, nonep_gmm_tile_m=1024,
+    )
+    assert tiles == ([0, 0] if use_ep else [1024, 1024])
+
+
 # --------------------------------------------------------------------------- TPU
 
 
@@ -272,6 +319,11 @@ def test_fused_moe_func_nonep_choices_bitwise_on_tpu(tokens):
         dict(nonep_combine_split=2),
         dict(nonep_combine_split=4),
         dict(nonep_combine_split=2, nonep_gather="xla_colchunk"),
+        dict(nonep_gmm_tile_m=256),
+        dict(nonep_gmm_tile_m=1024),
+        dict(nonep_gmm_tile_m=2048),
+        dict(nonep_gather="xla_colchunk", nonep_combine_split=2, nonep_permute="two_sorts",
+             nonep_gmm_tile_m=1024),
     ):
         np.testing.assert_array_equal(_bits(run(**kw)), ref, err_msg=str(kw))
     # The comparison must be able to fail: moving token 0's first route to an

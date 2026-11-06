@@ -82,6 +82,7 @@ if TYPE_CHECKING:
     TPU_MOE_NONEP_GATHER_CHUNK: int = 16384
     TPU_MOE_NONEP_PERMUTE: str = "sorts"
     TPU_MOE_NONEP_COMBINE_SPLIT: str = "1"
+    TPU_MOE_NONEP_GMM_TILE_M: str = "0"
     USE_MOE_TP_DECODE_KERNEL: bool = False
     RAGGED_GATHER_REDUCE_VERSION: str = "v2"
     USE_PHASED_PROFILER: bool = False
@@ -1157,6 +1158,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # combine. Bitwise the same output.
     "TPU_MOE_NONEP_COMBINE_SPLIT": env_with_choices(
         "TPU_MOE_NONEP_COMBINE_SPLIT", "1", ["1", "2", "4"]
+    ),
+    # Rows per m-tile of the non-EP GMMs (gmm_v2 tile_m); "0" keeps gmm_v2's
+    # default (512 at prefill sizes). Each tile boundary inside an expert's
+    # rows streams that expert's weights again, so larger tiles stream fewer
+    # weight bytes. Bitwise the same output.
+    "TPU_MOE_NONEP_GMM_TILE_M": env_with_choices(
+        "TPU_MOE_NONEP_GMM_TILE_M", "0", ["0", "256", "512", "1024", "2048"]
     ),
     # Serve eligible tensor-parallel MoE layers (sigmoid + correction-bias
     # top-k with renormalization, one shared expert, FP8 per-channel weights)

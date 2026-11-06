@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import dataclasses
 import functools
 
 import jax
@@ -23,7 +24,11 @@ from vllm_torchtpu.kernels.experimental.moe_dense_expert import (
     can_use_dense_expert,
     dense_expert_moe,
 )
-from vllm_torchtpu.kernels.megablox.gmm_v2 import get_packing_factor, gmm_v2
+from vllm_torchtpu.kernels.megablox.gmm_v2 import (
+    calculate_tiling,
+    get_packing_factor,
+    gmm_v2,
+)
 from vllm_torchtpu.kernels.megablox.moe_onehot_unpermute import (
     blockwise_onehot_unpermute,
     can_use_blockwise_onehot_unpermute,
@@ -191,6 +196,31 @@ def quantize_to_native_fp4_kmajor(
     return packed, scale
 
 
+@functools.lru_cache(maxsize=None)
+def tiling_with_tile_m(tile_m: int):
+    """gmm_v2's default tiling with ``tile_m`` rows per m-tile (one cached
+    function per value, so it is a stable static argument). A tile boundary
+    inside an expert's rows streams that expert's weights once more, so
+    larger m-tiles stream fewer weight bytes. The bucket base grows with the
+    tile to keep at most four row buckets. Only the m-tiling changes: every
+    row is computed exactly as before."""
+
+    def tiling(dims, lhs_cfgs, rhs_cfgs, vmem_limit_bytes, fuse_act=None):
+        t = calculate_tiling(dims, lhs_cfgs, rhs_cfgs, vmem_limit_bytes, fuse_act)
+        tm = min(tile_m, align_to_multiple(dims.size_m, t.bucket_base))
+        if tm == t.tile_m or tm % t.bucket_base:
+            return t
+        return dataclasses.replace(
+            t, tile_m=tm, bucket_base=max(t.bucket_base, tm // 4)
+        )
+
+    return tiling
+
+
+def align_to_multiple(x: int, a: int) -> int:
+    return -(-x // a) * a
+
+
 def gmm_wrapper(
     lhs,
     rhs,
@@ -203,6 +233,7 @@ def gmm_wrapper(
     preferred_element_type=None,
     rhs_quant_dtype=None,
     n_window=None,
+    tile_m=0,
 ):
     # fp4 weights: keep bf16 activations. Quantizing activations to fp8 collapses
     # fp4 accuracy (error compounds across MoE layers) with no decode speedup
@@ -224,6 +255,7 @@ def gmm_wrapper(
         maybe_quantize_lhs=not is_fp4_weight,
         rhs_quant_dtype=rhs_quant_dtype,
         n_window=n_window,
+        **({"tile_info": tiling_with_tile_m(tile_m)} if tile_m else {}),
     )
 
 
@@ -365,6 +397,7 @@ def prepare_routed_gmm_inputs(
         else None
     )
     token_indices_sorted: jax.Array | None = None
+    sorted_key_counts: jax.Array | None = None
     # The whole-expert path above the single-sort cap: one argsort for the
     # forward permutation, then either a second argsort (its inverse) and a
     # packed sort (the token ids), or the token ids by division, or the
@@ -374,6 +407,16 @@ def prepare_routed_gmm_inputs(
             sorted_indices = jnp.argsort(sort_keys)
         # jnp.argsort is stable, so this is the packed sort's token order.
         token_indices_sorted = sorted_indices // topk
+        if nonep_permute == "two_sorts":
+            # Group sizes from the sorted keys: bucket boundaries by binary
+            # search instead of a [rows, experts] one-hot reduction. Invalid
+            # rows carry the sentinel key, which sorts after every expert.
+            bounds = jnp.searchsorted(
+                sort_keys[sorted_indices],
+                jnp.arange(local_num_experts + 1, dtype=sort_keys.dtype),
+                side="left",
+            ).astype(jnp.int32)
+            sorted_key_counts = bounds[1:] - bounds[:-1]
         if nonep_permute == "counting":
             argsort_revert_indices, bucket_counts = _counting_sort_positions(
                 sort_keys, local_num_experts + 1, block=_NONEP_COUNTING_SORT_BLOCK
@@ -394,11 +437,14 @@ def prepare_routed_gmm_inputs(
             )
         else:
             argsort_revert_indices = jnp.argsort(sorted_indices)
-        topk_indices_for_count = jnp.where(valid_mask, topk_indices_flat, 0)
-        group_sizes_local = jax.nn.one_hot(
-            topk_indices_for_count, local_num_experts, dtype=jnp.int32
-        ) * valid_mask[:, None].astype(jnp.int32)
-        group_sizes_local = group_sizes_local.sum(axis=0)
+        if sorted_key_counts is not None:
+            group_sizes_local = sorted_key_counts
+        else:
+            topk_indices_for_count = jnp.where(valid_mask, topk_indices_flat, 0)
+            group_sizes_local = jax.nn.one_hot(
+                topk_indices_for_count, local_num_experts, dtype=jnp.int32
+            ) * valid_mask[:, None].astype(jnp.int32)
+            group_sizes_local = group_sizes_local.sum(axis=0)
 
     if token_indices_sorted is None:
         if packable:
@@ -570,6 +616,7 @@ def moe_gmm(
     onehot_moe_permute_threshold: int = 0,
     rhs_quant_dtype: jnp.dtype | None = None,
     nonep_combine_split: int = 1,
+    nonep_gmm_tile_m: int = 0,
 ) -> jax.Array:
     """Run grouped GEMM for routed tokens and reduce back to tokens.
 
@@ -583,6 +630,8 @@ def moe_gmm(
     EP uses SparseCore ragged_gather + ragged_gather_reduce for token movement.
     """
     group_offset = jnp.array([0], dtype=jnp.int32)
+    # m-tile override of the non-EP GMMs (TPU_MOE_NONEP_GMM_TILE_M); 0 = default.
+    tile_m = 0 if use_ep else nonep_gmm_tile_m
 
     gmm1_res = gmm_wrapper(
         x,
@@ -594,6 +643,7 @@ def moe_gmm(
         zero_initialize=False,
         fuse_act=activation,
         rhs_quant_dtype=rhs_quant_dtype,
+        tile_m=tile_m,
     )
     packing_factor = get_packing_factor(w2.dtype, rhs_quant_dtype)
     gmm1_res = gmm1_res[:, : w2.shape[1] * packing_factor]
@@ -633,6 +683,7 @@ def moe_gmm(
                 preferred_element_type=x.dtype,
                 rhs_quant_dtype=rhs_quant_dtype,
                 n_window=(start, split_width),
+                tile_m=tile_m,
             )
             blocks.append(
                 ragged_gather_reduce_v3(
@@ -655,6 +706,7 @@ def moe_gmm(
         zero_initialize=False,
         preferred_element_type=x.dtype,
         rhs_quant_dtype=rhs_quant_dtype,
+        tile_m=tile_m,
     )
     # The destination-major kernel packs source indices into 20 bits and
     # processes 16-lane SparseCore tiles.
@@ -750,6 +802,7 @@ def moe_gmm(
         "nonep_gather_cols",
         "nonep_gather_chunk",
         "nonep_combine_split",
+        "nonep_gmm_tile_m",
     ),
 )
 def fused_moe_func(
@@ -775,6 +828,7 @@ def fused_moe_func(
     nonep_gather_cols: int = 0,
     nonep_gather_chunk: int = 16384,
     nonep_combine_split: int = 1,
+    nonep_gmm_tile_m: int = 0,
 ) -> jax.Array:
     """Run MoE with precomputed expert ids and weights.
 
@@ -897,5 +951,6 @@ def fused_moe_func(
         onehot_moe_permute_threshold=onehot_moe_permute_threshold,
         rhs_quant_dtype=rhs_quant_dtype,
         nonep_combine_split=nonep_combine_split,
+        nonep_gmm_tile_m=nonep_gmm_tile_m,
     )
     return x[:num_tokens, :hidden_size]
