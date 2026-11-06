@@ -87,6 +87,18 @@ def item_front(cx: GQAEmit, kv: KVRing, col: Any, col_v: Any, i: Any) -> Any:
         else:
             kj = kbuf[s] if SUB == BLK else kbuf[s, j * SUB : (j + 1) * SUB]
             vj = vbuf[s] if SUB == BLK else vbuf[s, j * SUB : (j + 1) * SUB]
+            if AMASK == 0:
+                vj = jnp.where(col_v + off < plen, vj, jnp.zeros_like(vj))
+            elif AMASK == 1:
+                vj = jnp.where(col_v < rem, vj, jnp.zeros_like(vj))
+            elif AMASK == 2:
+                vj = lax.cond(
+                    full_blk,
+                    lambda v_val=vj: v_val,
+                    lambda v_val=vj, r_val=rem: jnp.where(
+                        col_v < r_val, v_val, jnp.zeros_like(v_val)
+                    ),
+                )
             scores = stream.mm(qrows, kj, NT)
         if AMASK == 0:
             scores = jnp.where(col + off < plen, scores, -jnp.inf)
@@ -128,7 +140,11 @@ def att_core(cx: GQAEmit, kv: KVRing) -> None:
         col_v: Any = (
             lax.broadcasted_iota(I32, (HD, SUB), 1)
             if (cache_exec(ex).paged_kv and AMASK == 0)
-            else None
+            else (
+                lax.broadcasted_iota(I32, (SUB, 1), 0)
+                if (not cache_exec(ex).paged_kv and AMASK in (0, 1, 2))
+                else None
+            )
         )
         am[...] = jnp.full(am.shape, -1e30, F32)
         al[...] = jnp.zeros(al.shape, F32)

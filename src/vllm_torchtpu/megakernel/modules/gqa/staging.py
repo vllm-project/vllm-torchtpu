@@ -28,7 +28,7 @@ from .context import GQAEmit
 from .params import GQAParams
 
 
-def rms_zc(ap: GQAParams, x_in: Any, w_in: Any) -> Any:
+def gqa_rms(ap: GQAParams, x_in: Any, w_in: Any) -> Any:
     return rmsnorm(x_in, w_in, ap.eps, zero_centered=ap.zero_centered_norm)
 
 
@@ -66,7 +66,7 @@ def att_q(cx: GQAEmit, slot: Any) -> tuple[Any, Any, int, int, Any]:
             sin = scr["rope"][1, :B, :half]
             for h in range(nh):
                 q0_ = h * 2 * HD
-                qh = rms_zc(ap, ybuf[:B, q0_ : q0_ + HD], qn)
+                qh = gqa_rms(ap, ybuf[:B, q0_ : q0_ + HD], qn)
                 qh = round_bf16(rope(ap, qh, cos, sin) * HD**-0.5)
                 for j in range(NHH):
                     scr["qg"][
@@ -90,7 +90,7 @@ def att_q(cx: GQAEmit, slot: Any) -> tuple[Any, Any, int, int, Any]:
                 rcs[0, b : b + 1, :] = cos
                 rcs[1, b : b + 1, :] = sin
                 qg = ybuf[b, :koff].reshape(nh, 2 * HD)
-                q = rms_zc(ap, qg[:, :HD], qn)
+                q = gqa_rms(ap, qg[:, :HD], qn)
                 q = round_bf16(rope(ap, q, cos, sin) * HD**-0.5)
                 if PACK:
                     t_, o_ = ap.qrow(b)
@@ -141,7 +141,7 @@ def kv_new(
                 scr["gate"][:B, h * HD : (h + 1) * HD] = ybuf[
                     :B, q0_ + HD : q0_ + 2 * HD
                 ]
-            k = rms_zc(ap, ybuf[:B, koff : koff + HD], kn)
+            k = gqa_rms(ap, ybuf[:B, koff : koff + HD], kn)
             v = ybuf[:B, koff + HD : koff + 2 * HD]
             k = rope(ap, k, cos, sin)
             if cache_exec(ex).paged_kv:
@@ -157,7 +157,7 @@ def kv_new(
                 cos, sin = rcs[0, b : b + 1, :], rcs[1, b : b + 1, :]
                 qg = ybuf[b, :koff].reshape(nh, 2 * HD)
                 scr["gate"][b, :] = qg[:, HD:].reshape(nh * HD)
-                k = rms_zc(ap, ybuf[b : b + 1, koff : koff + HD], kn)
+                k = gqa_rms(ap, ybuf[b : b + 1, koff : koff + HD], kn)
                 v = ybuf[b : b + 1, koff + HD : koff + 2 * HD]
                 k = rope(ap, k, cos, sin)
                 if cache_exec(ex).paged_kv:

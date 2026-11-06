@@ -78,6 +78,9 @@ def att_new(cx: GQAEmit) -> None:
                 for j in range(NHH):
                     scr["ost"][j, r0 : r0 + QG, :] = ob[:, j * 128 : (j + 1) * 128]
         else:
+            # When `SPLIT` is True, `split_merge` (`merge.py`) has already run:
+            # it merged this rank's `nh` heads into `am`/`al`/`aacc` at `q0 : q0 + NR`
+            # and applied `round_bf16(sigmoid)` to `scr["gate"]` in place.
             NR = nh if PACK else 8
             for b in range(B):
                 sq, tb = divmod(b, T)
