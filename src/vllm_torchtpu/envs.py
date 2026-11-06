@@ -130,7 +130,7 @@ if TYPE_CHECKING:
     TPU_SPEC_STATIC_VERIFY: bool = True
     TPU_DCP_INDEXER_A2A_MERGE: bool = False
     TPU_DCP_INDEXER_A2A_MIN_TOKENS: int = 64
-    TPU_STREAMIDX_SMALL_BUCKET_BQ: int | None = None
+    TPU_STREAMIDX_SMALL_BUCKET_BQ: int | None = 4
     TPU_STREAMIDX_SMALL_BUCKET_BKVP: int | None = None
     TPU_STREAMIDX_SMALL_BUCKET_TOKENS: int = 64
     VLLM_TPU_INDEXER_KV_CACHE_MODE: str = "sal"
@@ -966,10 +966,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # MIXED-pass query block for StreamIndex top-k token buckets of at most
     # TPU_STREAMIDX_SMALL_BUCKET_TOKENS. Under MTP every decode request has
     # q_len = gamma + 1 and runs in the MIXED pass, whose default 128-row block
-    # scores ~124 padding rows per request. 4 is the recommended value. Unset
-    # keeps 128 everywhere.
-    "TPU_STREAMIDX_SMALL_BUCKET_BQ": env_positive_int_or_none(
-        "TPU_STREAMIDX_SMALL_BUCKET_BQ"
+    # scores ~124 padding rows per request. Default 4 (unset); set it empty to
+    # keep 128 everywhere.
+    "TPU_STREAMIDX_SMALL_BUCKET_BQ": lambda: (
+        4
+        if os.environ.get("TPU_STREAMIDX_SMALL_BUCKET_BQ") is None
+        else env_positive_int_or_none("TPU_STREAMIDX_SMALL_BUCKET_BQ")()
     ),
     # MIXED-pass KV pages per block for those buckets; unset takes 8. Read only
     # when TPU_STREAMIDX_SMALL_BUCKET_BQ is set.
