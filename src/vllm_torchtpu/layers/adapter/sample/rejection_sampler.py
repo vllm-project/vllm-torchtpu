@@ -366,8 +366,6 @@ def _random_rejection_sample_with_segment(
     synthetic_mode: bool,
 ) -> torch.Tensor:
     """Vectorized non-greedy speculative decoding validation in Torch."""
-    total_tokens = draft_token_ids.shape[0]
-    batch_size = num_draft_tokens.shape[0]
     device = draft_token_ids.device
     vocab_size = target_logits.shape[-1]
 
@@ -441,6 +439,36 @@ def _random_rejection_sample_with_segment(
         is_greedy, target_logits_argmax, recovered_token_ids
     )
 
+    return assemble_rejection_output(
+        accepted,
+        recovered_token_ids,
+        draft_token_ids,
+        num_draft_tokens,
+        bonus_token_ids,
+        segment_ids,
+        group_indices,
+        max_draft_tokens,
+    )
+
+
+def assemble_rejection_output(
+    accepted: torch.Tensor,
+    recovered_token_ids: torch.Tensor,
+    draft_token_ids: torch.Tensor,
+    num_draft_tokens: torch.Tensor,
+    bonus_token_ids: torch.Tensor,
+    segment_ids: torch.Tensor,
+    group_indices: torch.Tensor,
+    max_draft_tokens: int,
+) -> torch.Tensor:
+    """[batch_size, max_draft_tokens + 1] tokens from per-slot decisions.
+
+    accepted / recovered_token_ids: per draft slot, whether the draft passed
+    and the token that replaces it at the first rejection.
+    """
+    total_tokens = draft_token_ids.shape[0]
+    batch_size = num_draft_tokens.shape[0]
+    device = draft_token_ids.device
     batch_indices = torch.arange(batch_size, device=device).unsqueeze(1)
     match_mask = segment_ids.unsqueeze(0) == batch_indices
     # Only declared draft slots may participate in rejection sampling.
@@ -535,3 +563,28 @@ def _random_rejection_sample_with_segment(
     selected_tokens[batch_range, accepted_count] = bonus_token_at_accepted_count
 
     return selected_tokens[:batch_size]
+
+
+@torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+def candidate_rejection_output(
+    accepted: torch.Tensor,
+    recovered_token_ids: torch.Tensor,
+    draft_token_ids: torch.Tensor,
+    num_draft_tokens: torch.Tensor,
+    bonus_token_ids: torch.Tensor,
+    segment_ids: torch.Tensor,
+    group_indices: torch.Tensor,
+    max_draft_tokens: int,
+) -> torch.Tensor:
+    """``assemble_rejection_output`` for the int32 decisions of the candidate
+    verify program (layers/core/candidate_sampling.py)."""
+    return assemble_rejection_output(
+        accepted != 0,
+        recovered_token_ids,
+        draft_token_ids,
+        num_draft_tokens,
+        bonus_token_ids,
+        segment_ids,
+        group_indices,
+        max_draft_tokens,
+    )

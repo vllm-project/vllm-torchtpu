@@ -272,6 +272,9 @@ class StateBufferedRef(BaseBufferedRef):
         (no lookahead); tile p reuses the slot last used by p-buffer_count.
         """
         assert not self.use_lookahead
+        if not self.is_output:
+            # An input-only state ref shares no slot with a write-back.
+            return
         p_id = grid_indices[0]
 
         @pl.when(p_id >= self.buffer_count)
@@ -288,7 +291,11 @@ class StateBufferedRef(BaseBufferedRef):
         Earlier outputs were already consumed by _wait_before_slot_reuse.
         Waiting for them again would consume the same DMA semaphore twice.
         Keep emit_pipeline's slot advancement, but only wait for the tail.
+        An output-only state ref waits for every output like other outputs.
         """
+        if not self.is_input:
+            self._wait_out_dma(dst_ref, grid_indices)
+            return
         tail_start = self.metadata_ref.num_tiles[...] - self.buffer_count
 
         @pl.when(grid_indices[0] >= tail_start)
@@ -604,6 +611,34 @@ class ExternalStateBufferedRef(StateBufferedRef):
         pltpu.make_async_copy(wait_ref, wait_ref, sem).wait()
 
 
+def _state_allocs(
+    cls,
+    split: bool,
+    block_spec_partial,
+    shape: tuple[int, ...],
+    ref: jax.Array,
+    kwargs: dict,
+):
+    """One state's buffered ref, or its (input, output) pair when split.
+
+    `shape` is the [seq_tile_size, window_size, ...] checkpoint tile; the
+    split input tile keeps only the window position the state is read into.
+    """
+    if not split:
+        return cls.input_output(
+            spec=block_spec_partial(block_shape=shape), dtype_or_type=ref, **kwargs
+        )
+    in_shape = (shape[0], 1, *shape[2:])
+    return (
+        cls.input(
+            spec=block_spec_partial(block_shape=in_shape), dtype_or_type=ref, **kwargs
+        ),
+        cls.output(
+            spec=block_spec_partial(block_shape=shape), dtype_or_type=ref, **kwargs
+        ),
+    )
+
+
 def create_allocs(
     metadata_ref: MetadataRef,
     qkv_ref: jax.Array,
@@ -615,14 +650,23 @@ def create_allocs(
     cfg: config.GDNConfig,
     conv_state_output_ref: jax.Array | None = None,
     recurrent_state_output_ref: jax.Array | None = None,
+    split_state_io: bool = False,
 ) -> tuple[
     InBufferedRef,
     InBufferedRef,
     InBufferedRef,
-    StateBufferedRef,
-    StateBufferedRef,
+    StateBufferedRef | tuple[StateBufferedRef, StateBufferedRef],
+    StateBufferedRef | tuple[StateBufferedRef, StateBufferedRef],
     OutBufferedRef,
 ]:
+    """Pipeline allocations of one fused kernel call.
+
+    With `split_state_io` each state gets an input buffer holding the one
+    state a tile reads and a separate output buffer holding its
+    checkpoints, returned as an (input, output) pair. A tile's prefetch
+    then never waits for the previous tile's write-back to leave the shared
+    slot, so the write-back overlaps the next tile's compute.
+    """
     compact_state_output = conv_state_output_ref is not None
     if compact_state_output != (recurrent_state_output_ref is not None):
         raise ValueError(
@@ -635,6 +679,8 @@ def create_allocs(
             "Compact external state outputs do not support checkpoint "
             f"windows, got window_size={cfg.window_size}."
         )
+    if compact_state_output and split_state_io:
+        raise ValueError("Compact external state outputs are not split.")
 
     qkv_shape = (cfg.seq_tile_size, cfg.chunk_size, 1, cfg.dim_size)
     b_shape = (cfg.seq_tile_size, cfg.chunk_size, 1, cfg.aligned_num_v_heads)
@@ -698,20 +744,27 @@ def create_allocs(
             cfg.kq_head_dim,
             cfg.v_head_dim,
         )
-        state_buffered_partial = functools.partial(
-            StateBufferedRef.input_output,
+        state_kwargs = dict(
             buffer_count=pipeline_mode.buffer_count,
             use_lookahead=pipeline_mode.use_lookahead,
             cfg=cfg,
             metadata_ref=metadata_ref,
         )
-        conv_alloc = state_buffered_partial(
-            spec=block_spec_partial(block_shape=conv_shape),
-            dtype_or_type=conv_state_ref,
+        conv_alloc = _state_allocs(
+            StateBufferedRef,
+            split_state_io,
+            block_spec_partial,
+            conv_shape,
+            conv_state_ref,
+            state_kwargs,
         )
-        recurrent_alloc = state_buffered_partial(
-            spec=block_spec_partial(block_shape=recurrent_shape),
-            dtype_or_type=recurrent_state_ref,
+        recurrent_alloc = _state_allocs(
+            StateBufferedRef,
+            split_state_io,
+            block_spec_partial,
+            recurrent_shape,
+            recurrent_state_ref,
+            state_kwargs,
         )
     else:
         # Both state regions stream from the one external source ref
@@ -750,25 +803,36 @@ def create_allocs(
                 plan.recurrent.nrows,
                 *payload,
             )
-        state_buffered_partial = functools.partial(
-            ExternalStateBufferedRef.input_output,
+        state_kwargs = dict(
             buffer_count=pipeline_mode.buffer_count,
             use_lookahead=pipeline_mode.use_lookahead,
             cfg=cfg,
             metadata_ref=metadata_ref,
             stride=plan.stride,
         )
-        conv_alloc = state_buffered_partial(
-            spec=block_spec_partial(block_shape=conv_shape),
-            dtype_or_type=conv_state_ref,
-            region=plan.conv,
-            compact_output_ref=conv_state_output_ref,
+        conv_alloc = _state_allocs(
+            ExternalStateBufferedRef,
+            split_state_io,
+            block_spec_partial,
+            conv_shape,
+            conv_state_ref,
+            dict(
+                state_kwargs,
+                region=plan.conv,
+                compact_output_ref=conv_state_output_ref,
+            ),
         )
-        recurrent_alloc = state_buffered_partial(
-            spec=block_spec_partial(block_shape=recurrent_shape),
-            dtype_or_type=conv_state_ref,
-            region=plan.recurrent,
-            compact_output_ref=recurrent_state_output_ref,
+        recurrent_alloc = _state_allocs(
+            ExternalStateBufferedRef,
+            split_state_io,
+            block_spec_partial,
+            recurrent_shape,
+            conv_state_ref,
+            dict(
+                state_kwargs,
+                region=plan.recurrent,
+                compact_output_ref=recurrent_state_output_ref,
+            ),
         )
 
     return qkv_alloc, b_alloc, a_alloc, conv_alloc, recurrent_alloc, out_alloc

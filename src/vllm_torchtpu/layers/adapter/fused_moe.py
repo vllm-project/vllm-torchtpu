@@ -29,6 +29,9 @@ from vllm_torchtpu.layers.core.fused_moe_gmm import (
     resolve_onehot_permute_threshold,
     unpack_fp4_to_e2m1,
 )
+from vllm_torchtpu.logger import init_logger
+
+logger = init_logger(__name__)
 
 _kernel_instance_counter = 0
 _fused_moe_kernel_cache: dict[tuple[int, str, bool, Any, bool], Callable] = {}
@@ -143,6 +146,32 @@ def quantize_native_fp4_kmajor(
     return op(w)
 
 
+def _decode_routed_rows(topk: int) -> int:
+    """Routed rows one EP MoE call sees in a full decode step, or 0 if unknown.
+
+    A full decode step pads ``max_num_seqs x (1 + draft tokens)`` to its token
+    bucket on every DP rank, and the EP dispatch gathers the rows of all DP
+    ranks before the MoE.
+    """
+    from vllm.config import get_current_vllm_config_or_none
+
+    cfg = get_current_vllm_config_or_none()
+    if cfg is None:
+        return 0
+    max_num_seqs = cfg.scheduler_config.max_num_seqs
+    if not isinstance(max_num_seqs, int):
+        return 0
+    spec = cfg.speculative_config
+    tokens = max_num_seqs * (1 + (spec.num_speculative_tokens if spec else 0))
+    buckets = sorted(
+        int(s) for s in cfg.compilation_config.compile_sizes or () if isinstance(s, int)
+    )
+    if buckets:
+        tokens = min(tokens, buckets[-1])
+        tokens = next(b for b in buckets if b >= tokens)
+    return tokens * cfg.parallel_config.data_parallel_size * topk
+
+
 def _allocate_kernel_instance_id() -> int:
     global _kernel_instance_counter
     kernel_instance_id = _kernel_instance_counter
@@ -168,6 +197,15 @@ def _build_fused_moe_custom_op(
     # RPA onto --attention-backend CUSTOM. Note MoEBackend has no CUSTOM slot
     # yet, so that also needs an upstream OOT-backend hook.
     use_sparse_core = envs.USE_MOE_SPARSE_CORE
+    decode_routed_rows = _decode_routed_rows(topk) if use_ep else 0
+    onehot_threshold = resolve_onehot_permute_threshold(decode_routed_rows)
+    if use_ep:
+        logger.info_once(
+            "EP MoE one-hot permute threshold: %d routed rows "
+            "(full decode step: %d routed rows)",
+            onehot_threshold,
+            decode_routed_rows,
+        )
 
     # Pass experts_start as a runtime tensor rather than static closure arg so every EP
     # rank compiles an identical program.
@@ -178,7 +216,7 @@ def _build_fused_moe_custom_op(
         activation=activation,
         use_ep=use_ep,
         use_sparse_core=use_sparse_core,
-        onehot_moe_permute_threshold=resolve_onehot_permute_threshold(),
+        onehot_moe_permute_threshold=onehot_threshold,
         rhs_quant_dtype=rhs_quant_dtype,
         skip_padded_tokens=skip_padded_tokens,
     )

@@ -19,6 +19,7 @@ from vllm.v1.kv_cache_interface import FullAttentionSpec
 
 from vllm_torchtpu import envs
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadataBuilderContext
+from vllm_torchtpu.layers.core.sequence_layout import DEFAULT_SEQUENCE_LAYOUT_DESCRIPTOR
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
     set_vllm_model_wrapper_context,
@@ -260,6 +261,8 @@ class Eagle3Proposer:
         )
         draft_attn_layer_names = set(all_attn_layers.keys()) - target_attn_layer_names
         self._draft_attn_layer_names = draft_attn_layer_names
+        if envs.TPU_BATCHED_RPA_DRAFT_ONE_QUERY:
+            self._mark_one_query_draft_layers(all_attn_layers, draft_attn_layer_names)
 
         if self.runner._pcp_enabled and self.runner._mtp_enabled:
             self._validate_pcp_draft_model(draft_attn_layer_names)
@@ -334,6 +337,29 @@ class Eagle3Proposer:
                 "advance per draft step, which cross-model KV sharing "
                 "freezes; the combination is unvalidated."
             )
+
+    @staticmethod
+    def _mark_one_query_draft_layers(layers: dict, names: set[str]) -> None:
+        """Give the draft's verify-window attention layers the one-query kernel.
+
+        Draft steps after the first carry one query per request; these layers
+        then pick the one-query decode kernel on device (`_with_one_query_steps`
+        in the attention adapter) instead of the verify-window kernel.
+        """
+        from vllm_torchtpu.layers.adapter.attention import (
+            PallasBatchedRPAAttentionBackendImpl,
+        )
+
+        marked = []
+        for name in sorted(names):
+            impl = getattr(layers[name], "impl", None)
+            if (
+                isinstance(impl, PallasBatchedRPAAttentionBackendImpl)
+                and impl.decode_query_size > 1
+            ):
+                impl.one_query_steps = True
+                marked.append(name)
+        logger.info("Batched RPA one-query draft steps on layers %s", marked)
 
     def _validate_mtp_layer_count(self) -> None:
         """One nextn layer only: the proposer's per-step wiring assumes it.
@@ -1028,7 +1054,10 @@ class Eagle3Proposer:
         # and pre-lm-head hidden in one compiled region. Run raw (advanced
         # indexing), these three gathers are eager ops the DEFER_AND_FUSE path
         # fuses with the step's seq_lens/positions arithmetic into a per-context
-        # program. index_select is value-identical to hidden[indices].
+        # program. index_select is value-identical to hidden[indices]. A
+        # negative index marks a row this rank does not own (PCP); clamped, it
+        # reads row 0 instead of wrapping to the buffer's last row.
+        indices = indices.clamp_min(0)
         pos_carry = (
             torch.index_select(positions, 1, indices)
             if positions.ndim == 2
@@ -1282,24 +1311,24 @@ class Eagle3Proposer:
             # [p, h] / [p] carries + first-pass draft token, computed in compiled
             # regions (the three gathers, then lm-head+argmax) so torch-tpu's
             # eager DEFER_AND_FUSE path can't fuse them into per-context programs.
-            owner_mask = last_token_indices.ge(0)
-            safe_gather_indices = last_token_indices.clamp_min(0)
             if self._share_mtp_indices:
                 # Clamped, not raw: a PCP-localized index is -1 for a row this
                 # rank does not own, and -1 would wrap to the buffer's last row.
                 saved_topk_per_chunk.append(
-                    self._mtp_compact_and_save(safe_gather_indices)
+                    self._mtp_compact_and_save(last_token_indices.clamp_min(0))
                 )
             hidden_carry, positions_carry, last_hidden_carry = (
                 self._draft_gather_carries(
-                    hidden, positions, last_hidden, safe_gather_indices
+                    hidden, positions, last_hidden, last_token_indices
                 )
             )
-            last_hidden_carry = (
-                chunk.sequence_layout_plan.aggregate_request_aligned_tensor(
-                    last_hidden_carry, owner_mask
+            layout_plan = chunk.sequence_layout_plan
+            # The default layout owns every row, and aggregation returns its
+            # input unchanged there.
+            if layout_plan.descriptor != DEFAULT_SEQUENCE_LAYOUT_DESCRIPTOR:
+                last_hidden_carry = layout_plan.aggregate_request_aligned_tensor(
+                    last_hidden_carry, last_token_indices.ge(0)
                 )
-            )
             hidden_carry_per_chunk.append(hidden_carry)
             positions_carry_per_chunk.append(positions_carry)
             with set_model_tag("eagle_head"):
