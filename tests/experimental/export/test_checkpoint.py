@@ -249,3 +249,84 @@ def _save_and_check(tmp_path: Path, ts: Any) -> None:
         for i in range(3)
     ]
     assert dtypes == ["bfloat16", "float8_e4m3fn", "<i8"]
+
+
+# One tensor-parallel rank of a two-process save (see the test below).
+_TWO_RANK_SAVE = r"""
+import sys
+
+import numpy as np
+
+from vllm_torchtpu.experimental.export import checkpoint
+
+rank, coordinator, data_dir = int(sys.argv[1]), sys.argv[2], sys.argv[3]
+checkpoint.init_jax(rank, 2, coordinator)
+norm = np.arange(16, dtype=np.float32).reshape(2, 8)
+weight = np.arange(256, dtype=np.float32).reshape(4, 64) * 0.5
+bias = np.arange(6, dtype=np.float32)
+scale = np.arange(512, dtype=np.float32)
+inputs = [
+    {"name": "norm", "shape": [2, 8], "dtype": "f32", "sharding": ["model", None]},
+    {"name": "weight", "shape": [4, 64], "dtype": "f32", "sharding": [None, "model"]},
+    {"name": "bias", "shape": [6], "dtype": "f32", "sharding": [None]},
+    {"name": "scale", "shape": [512], "dtype": "f32", "sharding": [None]},
+]
+shards = [norm[rank : rank + 1], weight[:, 32 * rank : 32 * rank + 32], bias, scale]
+checkpoint.save_checkpoint(
+    inputs, shards, {"data": 1, "model": 2}, data_dir, small_array_bytes=512
+)
+"""
+
+
+def test_small_sharded_arrays_are_saved_as_one_chunk(tmp_path: Path) -> None:
+    """Two ranks save small arrays as one chunk; larger ones as before.
+
+    Orbax writes one chunk per shard and splits a replicated array among its
+    replicas; both apply only above `small_array_bytes` (512 here).
+    """
+    pytest.importorskip("orbax.checkpoint")
+    ts = pytest.importorskip("tensorstore")
+    import os
+    import subprocess
+    import sys
+
+    import portpicker
+
+    data_dir = tmp_path / "serving_checkpoint" / "data"
+    coordinator = f"localhost:{portpicker.pick_unused_port()}"
+    env = dict(os.environ, **checkpoint.CPU_ENV)
+    procs = [
+        subprocess.Popen(
+            [sys.executable, "-c", _TWO_RANK_SAVE, str(r), coordinator, str(data_dir)],
+            env=env,
+        )
+        for r in range(2)
+    ]
+    assert [p.wait(timeout=300) for p in procs] == [0, 0]
+
+    def chunks(i: int) -> list[str]:
+        return sorted(
+            f.name
+            for f in (data_dir / f"array_{i}").iterdir()
+            if not f.name.startswith(".")
+        )
+
+    def read(i: int) -> np.ndarray:
+        path = str(data_dir / f"array_{i}")
+        spec = {"driver": "zarr", "kvstore": {"driver": "file", "path": path}}
+        return np.asarray(ts.open(spec).result().read().result())
+
+    # 64 bytes in all: one chunk. 1 KiB, over the limit: one chunk per shard.
+    assert chunks(0) == ["0.0"]
+    assert chunks(1) == ["0.0", "0.1"]
+    # Replicated, 24 bytes: one chunk, not one per replica. 2 KiB: split as before.
+    assert chunks(2) == ["0"]
+    assert chunks(3) == ["0", "1"]
+    np.testing.assert_array_equal(
+        read(0), np.arange(16, dtype=np.float32).reshape(2, 8)
+    )
+    np.testing.assert_array_equal(
+        read(1), np.arange(256, dtype=np.float32).reshape(4, 64) * 0.5
+    )
+    np.testing.assert_array_equal(read(2), np.arange(6, dtype=np.float32))
+    np.testing.assert_array_equal(read(3), np.arange(512, dtype=np.float32))
