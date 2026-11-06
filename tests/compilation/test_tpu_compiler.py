@@ -60,6 +60,27 @@ class TestTpuCompilerCache:
         assert base != different_batch
         assert base != different_kv
 
+    def test_tpu_hash_uses_blocks_not_memory_utilization(self):
+        """Once the pool is sized, the utilization that produced it does not
+        split the cache; before that it does."""
+        from vllm_torchtpu.compilation.tpu_compiler import compute_tpu_compilation_hash
+
+        def config(gmu, blocks):
+            c = self._config(num_gpu_blocks=blocks)
+            c.cache_config.gpu_memory_utilization = gmu
+            return c
+
+        with patch(
+            "vllm_torchtpu.compilation.tpu_compiler._iter_runtime_cache_key_files",
+            return_value=[],
+        ):
+            assert compute_tpu_compilation_hash(
+                config(0.88, 1024)
+            ) == compute_tpu_compilation_hash(config(0.92, 1024))
+            assert compute_tpu_compilation_hash(
+                config(0.88, None)
+            ) != compute_tpu_compilation_hash(config(0.92, None))
+
     def test_tpu_hash_covers_plugin_compile_env(self):
         from vllm_torchtpu.compilation.tpu_compiler import compute_tpu_compilation_hash
 
