@@ -12,6 +12,7 @@ if TYPE_CHECKING:
     TPU_DEEPSEEK_V41_ENGRAM_MASKS_IN_HASH: bool = True
     TPU_DEEPSEEK_V41_ENGRAM_INT32_SLOT_WRITE: bool = True
     TPU_DEEPSEEK_V41_ENGRAM_TILE_SCATTER: bool = True
+    TPU_DEEPSEEK_V41_ENGRAM_FUSED_PREP: bool = True
     TPU_DEEPSEEK_V41_IMPL: str = "v2"
     TPU_DEEPSEEK_V41_ENGRAM_CPU_OFFLOAD: bool = False
     TPU_DEEPSEEK_V41_ENGRAM_HBM: str = "auto"
@@ -412,6 +413,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # touched tile instead of XLA's pass over the whole cache. Same contents.
     "TPU_DEEPSEEK_V41_ENGRAM_TILE_SCATTER": env_bool(
         "TPU_DEEPSEEK_V41_ENGRAM_TILE_SCATTER", default=True
+    ),
+    # With the fused hash, masks in hash and the int32 slot write: issue the
+    # decode Engram slot derivation, slot write, hash and keep mask as one op
+    # call (kernels/engram_hash.py engram_prep) instead of five, to cut host
+    # dispatch time ahead of the encoder. Same hashes and cache contents.
+    "TPU_DEEPSEEK_V41_ENGRAM_FUSED_PREP": env_bool(
+        "TPU_DEEPSEEK_V41_ENGRAM_FUSED_PREP", default=True
     ),
     # Deprecated aliases, resolved by the DSV41 serving-policy verifier.
     # Serving supports v2; v1 remains only as a standalone reference.
