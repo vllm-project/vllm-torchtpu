@@ -340,7 +340,7 @@ def test_plugin_key_and_arch_resolution() -> None:
 @pytest.mark.parametrize(
     "src, match",
     [
-        ('{"profiel": "x"}', "unknown key 'profiel'"),
+        ('{"bad key": "x"}', "invalid key 'bad key'"),
         ({"buckets": "8", "options": {"buckets": "16"}}, "both at top level"),
         ('{"options": "nope"}', "options must be a JSON object"),
         ("enabled=maybe", "invalid boolean"),
@@ -353,14 +353,51 @@ def test_config_errors_name_the_problem(src: Any, match: str) -> None:
         cfg_mod.parse_config(src)
 
 
-def test_top_level_template_keys_forward_to_shorthands_only() -> None:
-    cfg = cfg_mod.parse_config(json.dumps({"plugin": "my.pkg", "profile": "x"}))
-    with pytest.raises(MegakernelConfigError, match="unknown key 'profile'"):
-        cfg_mod.resolve_plugin_ref(cfg)
-    legacy = sorted(_ENTRY.legacy_keys)[0]
-    cfg = cfg_mod.parse_config(json.dumps({"plugin": _SHORTHAND, legacy: "x"}))
+_TOP_LEVEL_PLUGIN = """
+from vllm_torchtpu.megakernel.runtime.contract import TpuMonoSpec
+
+SPEC = TpuMonoSpec("t", "1", create="m:c", top_level_options={top!r})
+"""
+
+
+def test_top_level_keys_forward_as_the_spec_declares(mod_dir: Path) -> None:
+    """A top-level plugin key is forwarded into `options` when the plugin's
+    `SPEC.top_level_options` lists it; read from `SPEC`, for any plugin."""
+    _write(mod_dir / "mk_top_yes.py", _TOP_LEVEL_PLUGIN.format(top={"profile"}))
+    _write(mod_dir / "mk_top_no.py", _TOP_LEVEL_PLUGIN.format(top=set()))
+    importlib.invalidate_caches()
+    cfg = cfg_mod.parse_config({"plugin": "mk_top_yes", "profile": "x"})
+    assert dict(cfg.legacy) == {"profile": "x"}
     _, options = cfg_mod.resolve_plugin_ref(cfg)
-    assert options == {legacy: "x"}
+    assert options == {"profile": "x"}
+    # A later `options.profile` wins; without top-level keys, no SPEC import.
+    cfg = cfg_mod.parse_config("profile=x", {"plugin": "mk_top_yes"})
+    assert cfg_mod.resolve_plugin_ref(cfg)[1] == {"profile": "x"}
+    for src in ({"plugin": "mk_top_no", "profile": "x"}, "plugin=mk_top_yes,profiel=x"):
+        bad = "profiel" if "profiel" in str(src) else "profile"
+        with pytest.raises(MegakernelConfigError, match=f"unknown key '{bad}'"):
+            cfg_mod.resolve_plugin_ref(cfg_mod.parse_config(src))
+    # The shorthand template's keys come from its SPEC too.
+    top = sorted(_spec_of(_ENTRY.module).top_level_options)[0]
+    cfg = cfg_mod.parse_config(json.dumps({"plugin": _SHORTHAND, top: "x"}))
+    assert cfg_mod.resolve_plugin_ref(cfg)[1] == {top: "x"}
+
+
+def test_top_level_keys_for_an_uninstalled_template_are_not_checked(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Without the template installed there is no SPEC to read: the keys pass
+    through, and `missing_template` turns the megakernel off."""
+    gone = _ENTRY._replace(module="no_such_mk_folder.megakernel")
+    monkeypatch.setitem(plugin_mod.SHORTHANDS, _SHORTHAND, gone)
+    cfg = cfg_mod.parse_config({"plugin": _SHORTHAND, "anything": 1})
+    ref, options = cfg_mod.resolve_plugin_ref(cfg)
+    assert options == {"anything": 1}
+    assert cfg_mod.missing_template(ref) is not None
+
+
+def _spec_of(module: str) -> Any:
+    return importlib.import_module(module).SPEC
 
 
 def test_import_plugin_errors(mod_dir: Path) -> None:

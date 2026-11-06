@@ -23,10 +23,12 @@ plugin), a JSON object, or `k=v,k=v` (`options` needs JSON).
 Precedence is per key, the later source winning; `parse_config` states the
 rule, including how `enabled` is decided.
 
-Runtime keys: `plugin`, `options`, `enabled`, `ab`, `stats_period_s`. A
-top-level template key (e.g. `profile`) is forwarded into `options` only when
-the resolved plugin is a shorthand template that lists it; any other key is a
-`MegakernelConfigError` naming it.
+Runtime keys: `plugin`, `options`, `enabled`, `ab`, `stats_period_s`. Any
+other top-level key (e.g. `profile`) is a plugin setting: `resolve_plugin_ref`
+forwards it into `options` when the resolved plugin's `SPEC.top_level_options`
+lists it, and raises a `MegakernelConfigError` naming it otherwise. The
+runtime reads `SPEC` by importing the plugin's module (stdlib-only at import,
+so none of the plugin's heavy code), and only when such keys are set.
 """
 
 from __future__ import annotations
@@ -46,7 +48,6 @@ from vllm_torchtpu.megakernel.runtime.contract import API_VERSION, TpuMonoSpec
 from .plugin import SHORTHANDS, Shorthand, shorthands
 
 RUNTIME_KEYS = frozenset({"plugin", "options", "enabled", "ab", "stats_period_s"})
-_LEGACY_KEYS = frozenset().union(*(s.legacy_keys for s in SHORTHANDS.values()))
 _TRUE_STRS = ("1", "true", "yes", "on")
 _FALSE_STRS = ("0", "false", "no", "off", "none", "")
 DEFAULT_STATS_PERIOD_S = 60.0
@@ -174,10 +175,10 @@ def _apply_mapping_source(state: _ParseState, source: Mapping[str, Any]) -> None
     template_keys: dict[str, Any] = {}
     for k, v in source.items():
         k = str(k)
-        if k not in RUNTIME_KEYS and k not in _LEGACY_KEYS:
+        if k not in RUNTIME_KEYS and not k.isidentifier():
             raise MegakernelConfigError(
-                f"megakernel config: unknown key {k!r}; runtime keys are "
-                f"{sorted(RUNTIME_KEYS)} and template settings go in 'options'"
+                f"megakernel config: invalid key {k!r}; runtime keys are "
+                f"{sorted(RUNTIME_KEYS)} and plugin settings go in 'options'"
             )
         if v is None:
             continue
@@ -374,10 +375,10 @@ def resolve_plugin_ref(
     """Resolve the plugin and its `options` (`None` if no template matches the
     arch): a shorthand name (`SHORTHANDS` or a discovered model folder), a
     `module[:attr]` reference, or the shorthand claiming the checkpoint.
-    Top-level template keys are forwarded into `options` only for a
-    shorthand template that lists them. Model folders are discovered only
-    when a name or the checkpoint needs them, not for a `module[:attr]`
-    reference."""
+    Top-level plugin keys are forwarded into `options` when the plugin's
+    `SPEC.top_level_options` lists them (see `_top_level_options`). Model
+    folders are discovered only when a name or the checkpoint needs them, not
+    for a `module[:attr]` reference."""
     name = None if cfg.plugin is None else cfg.plugin.strip().lower()
     entries: Mapping[str, Shorthand] = SHORTHANDS
     if name is not None and name not in SHORTHANDS and _could_be_shorthand(name):
@@ -395,14 +396,29 @@ def resolve_plugin_ref(
         ref = PluginRef(entries[name].module, shorthand=name)
     options = dict(cfg.options)
     if cfg.legacy:
-        allowed = entries[ref.shorthand].legacy_keys if ref.shorthand else ()
-        if bad := sorted(k for k in cfg.legacy if k not in allowed):
+        allowed = _top_level_options(ref)
+        if allowed is not None and (
+            bad := sorted(k for k in cfg.legacy if k not in allowed)
+        ):
             raise MegakernelConfigError(
                 f"megakernel config: unknown key {bad[0]!r} for plugin "
-                f"{ref.module!r}; put plugin settings in 'options'"
+                f"{ref.module!r}; runtime keys are {sorted(RUNTIME_KEYS)}, its "
+                f"SPEC.top_level_options are {sorted(allowed)}, and other plugin "
+                "settings go in 'options'"
             )
         options = {**cfg.legacy, **options}
     return ref, options
+
+
+def _top_level_options(ref: PluginRef) -> frozenset[str] | None:
+    """The plugin's `SPEC.top_level_options`, read by importing the module
+    that defines `SPEC` (stdlib-only at import; the plugin's heavy code is
+    imported later, from `create`). `None` for a shorthand template that
+    isn't installed: then `missing_template` turns the megakernel off."""
+    if ref.shorthand is not None and missing_template(ref) is not None:
+        return None
+    spec, _ = import_plugin(ref)
+    return spec.top_level_options
 
 
 def select_plugin(
