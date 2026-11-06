@@ -116,7 +116,9 @@ def _adaptive_dspark_config(device):
     config = _config(device=device, method="dspark")
     config.speculative_config.enable_adaptive_verification = True
     config.lora_config = None
-    config.model_config = SimpleNamespace(is_diffusion=False, enforce_eager=False)
+    config.model_config = SimpleNamespace(
+        is_diffusion=False, enforce_eager=False, architecture=""
+    )
     config.compilation_config.cudagraph_mode = CUDAGraphMode.NONE
     return config
 
