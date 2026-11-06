@@ -170,6 +170,12 @@ class Qwen4ExpPooledCache:
             physical_available=budget.total_limit - budget.total_used + scratch,
             min_blocks=min_blocks,
         )
+        if self.layout.merged_compressed:
+            # Leave room for the compressed-key pages appended to `blocks`.
+            total, cols = blocks, self.layout.compressed_columns_per_page
+            blocks = total * cols // (cols + 1)
+            while blocks + self.layout.compressed_region_pages(blocks) > total:
+                blocks -= 1
         logger.info(
             "Qwen4Exp unified pool sizing: hbm_limit=%.2fGiB used=%.2fGiB "
             "(scratch pool %.2fGiB) cap_available=%.2fGiB -> %d blocks "
@@ -216,15 +222,24 @@ class Qwen4ExpPooledCache:
         # The planner applies --num-gpu-blocks-override, which under
         # QWEN4_EXP_PP_LOGICAL_BLOCKS_FACTOR is the scheduler's block-ID
         # count, larger than this stage's pool: plan the pool's own pages.
-        if override is not None and override != pages:
-            cache_config.num_gpu_blocks_override = pages
-        try:
-            config = get_kv_cache_config_from_groups(
-                runner.vllm_config, self.groups, pages * self.block_bytes
-            )
-        finally:
-            cache_config.num_gpu_blocks_override = override
+        def plan(num_blocks):
+            cache_config.num_gpu_blocks_override = num_blocks
+            try:
+                return get_kv_cache_config_from_groups(
+                    runner.vllm_config, self.groups, num_blocks * self.block_bytes
+                )
+            finally:
+                cache_config.num_gpu_blocks_override = override
+
+        config = plan(pages)
         assert config.num_blocks == pages, (config.num_blocks, pages)
+        # QWEN4_EXP_MERGE_COMPRESSED_K: the carriers also hold the compressed
+        # keys of every block, in pages appended after the scheduler's `pages`.
+        # The scheduler plan stays `config`; only the allocation grows.
+        alloc_pages = pages + self.layout.compressed_region_pages(pages)
+        alloc = plan(alloc_pages) if alloc_pages != pages else config
+        assert alloc.num_blocks == alloc_pages, (alloc.num_blocks, alloc_pages)
+        self.scheduler_pages = pages
         # EngineCore attaches the resolved layout after invoking the planner.
         # Profiling allocates earlier, so preserve that same final contract.
         config.kv_cache_layout = runner.cache_config.kv_cache_layout
@@ -244,7 +259,7 @@ class Qwen4ExpPooledCache:
         budget = compute_hbm_budget(
             [runner.device], runner.cache_config.gpu_memory_utilization
         )
-        required = max(t.size for t in config.kv_cache_tensors)
+        required = max(t.size for t in alloc.kv_cache_tensors)
         if not self.hbm_sizing and required + TEMP_HEADROOM > budget.available:
             raise ValueError(
                 f"Qwen4Exp unified pool needs {required} bytes plus {TEMP_HEADROOM} "
@@ -265,7 +280,7 @@ class Qwen4ExpPooledCache:
                     "QWEN4_EXP_MAX_POOL_BYTES or QWEN4_EXP_POOL_HEADROOM_BYTES"
                 )
         self.materialized = materialize_kv_cache_tensors(
-            kv_cache_config=config,
+            kv_cache_config=alloc,
             attn_groups=self.attn_groups,
             kernel_block_sizes=self.kernel_block_sizes,
             device=runner.device,
@@ -287,6 +302,14 @@ class Qwen4ExpPooledCache:
         self.pages, self.final = pages, final
         if final:
             self.native_config = config
+        if alloc_pages != pages:
+            logger.info(
+                "Qwen4Exp merged compressed keys: %d region pages after %d "
+                "scheduler pages (%d blocks of keys per page)",
+                alloc_pages - pages,
+                pages,
+                self.layout.compressed_columns_per_page,
+            )
         logger.info(
             "Qwen4Exp unified pool%s: manager_tokens=%d page_bytes=%d "
             "blocks=%d pools=%d bytes=%d",
@@ -356,6 +379,9 @@ class Qwen4ExpPooledCache:
 
     def _bind_qsa(self, attention, name, caches) -> None:
         owner = self.layout.compressed_owner(name)
+        if self.layout.merged_compressed:
+            # The keys' region starts after the scheduler's pages.
+            owner = (owner[0], self.layout.merged_compressed_slot(self.scheduler_pages))
         main_owner = self.layout.main_owner(name)
         main = caches[main_owner[0]]
         assert main is caches[owner[0]] is caches[name + ".raw_ring"], (
