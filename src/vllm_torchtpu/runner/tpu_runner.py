@@ -1919,7 +1919,7 @@ class TPUModelRunner(GPUModelRunner):
         )
         logger.info(
             "GDN internal prefill checkpoints enabled: hash_block_size=%d "
-            "cache_hit_alignment_tokens=%d mamba_block_size=%d alignment=%d "
+            "cache_hit_alignment_tokens=%d mamba_block_size=%d alignment=%d drop_eagle_block=%d",
             units.hash_block_size,
             units.cache_hit_alignment_tokens,
             units.mamba_block_size,
