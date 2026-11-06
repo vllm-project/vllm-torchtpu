@@ -688,6 +688,24 @@ def test_metadata_has_no_xla_flags_without_libtpu_init_args(
     assert "env_option_overrides" not in _export_metadata(tmp_path)["compile_options"]
 
 
+def test_build_arg_parser_uses_vllm_common_cli_args(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import vllm.entrypoints.common.cli_args as common_cli_args
+
+    calls: list[Any] = []
+
+    def _spy_make_arg_parser(parser: Any) -> Any:
+        calls.append(parser)
+        parser.add_argument("--export-spy-marker", action="store_true")
+        return parser
+
+    monkeypatch.setattr(common_cli_args, "make_arg_parser", _spy_make_arg_parser)
+    parser = cli.build_arg_parser()
+    assert len(calls) == 1
+    assert "--export-spy-marker" in parser._option_string_actions
+
+
 def test_parse_args_takes_the_vllm_serve_command_line(capsys) -> None:
     # What a `vllm serve` benchmark config passes, model tag included: engine
     # arguments shape the artifact, frontend options are reported and ignored.

@@ -149,8 +149,10 @@ def _clone_txt_freqs(forward: Any) -> Any:
 def _patch_wan_pair_swap_rope() -> None:
     # -------------------------------------------------------------------------
     # TODO: Remove this patch once torch_tpu lowers size-2 minor unflatten/stack
-    # without relayouts, or vLLM-Omni's CustomOp gains an out-of-tree dispatch
-    # hook (then make this the TPU forward of RotaryEmbeddingWan).
+    # without relayouts. vLLM-Omni's CustomOp.register_oot (0.33) is not used
+    # because its registry is keyed by exact class: RotaryEmbeddingWanS2V would
+    # need its own registration, while this class patch covers it through
+    # super().forward.
     #
     # RotaryEmbeddingWan.forward_native (the CustomOp path non-CUDA platforms
     # take) rotates interleaved pairs via unflatten(-1, (-1, 2)) / stack(-1).
