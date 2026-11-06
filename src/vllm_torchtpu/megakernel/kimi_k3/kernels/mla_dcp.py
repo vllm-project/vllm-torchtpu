@@ -292,7 +292,16 @@ def native_pages(batch, heads=HEADS_PER_RANK, sequence_rows=1, cache_dtype=jnp.b
     MXU's native tile (retiled by the DMA) rather than as the pool's
     ``[span * 128, packing, 640]`` blocks, whose loads relayout every tile:
     attention DP2's plain B96 and B128 (48 and 64 group rows of six heads)
-    and FP8 B64 (32; not under the opt-in ``mla_decode_ktile=2048``)."""
+    and FP8 B64 (32), plus DP1's FP8 B16, B32 and B64 (not under the opt-in
+    ``mla_decode_ktile=2048``)."""
+    if (
+        heads == HEADS_PER_RANK
+        and sequence_rows == 1
+        and batch in (16, 32, 64)
+        and cache_dtype == jnp.float8_e4m3fn
+        and _config().mla_decode_ktile == 1024
+    ):
+        return True
     return heads == 6 and sequence_rows == 1 and (
         batch in (48, 64) or batch == 32 and cache_dtype == jnp.float8_e4m3fn
         and _config().mla_decode_ktile == 1024)
@@ -300,11 +309,12 @@ def native_pages(batch, heads=HEADS_PER_RANK, sequence_rows=1, cache_dtype=jnp.b
 
 def staged_folds(batch, heads=HEADS_PER_RANK, sequence_rows=1, cache_dtype=jnp.bfloat16) -> int:
     """Softmax folds per page step. Attention DP2's FP8 B64 and B96 (32 and
-    48 group rows) stage two: one page wait, row lookup, pool pick and QK per
-    2048 tokens, folded as two 1024-token parts in order (the normalization
-    and FP8 probability boundaries of 1024-token steps, so outputs are
-    unchanged). Their rows end with a static tail
-    (``DcpAttention._staged_tail``), which B128 has no VMEM for."""
+    48 group rows) and DP1's FP8 B32 stage two: one page wait, row lookup,
+    pool pick and QK per 2048 tokens, folded as two 1024-token parts in order
+    (the normalization and FP8 probability boundaries of 1024-token steps, so
+    outputs are unchanged). Their rows end with a static tail
+    (``DcpAttention._staged_tail``), which DP1 B16/B64 and DP2 B128 omit to
+    preserve VMEM reserve."""
     return 2 if (native_pages(batch, heads, sequence_rows, cache_dtype) and batch in (32, 48)
                  and cache_dtype == jnp.float8_e4m3fn and _config().mla_decode_ktile == 1024) else 1
 
@@ -1448,9 +1458,9 @@ def _attend_chunked(self, queries, new_latents, between, *, keys=None, key_valid
             return
         if self.sequence_rows == 1 or self.cache_verify_rows:
             unroll = (4 if (self.heads == 6 and (batch == 64 or batch == 48 and self.fp8))
-                      or (self.heads == HEADS_PER_RANK and batch == 32 and self.fp8)
+                      or (self.heads == HEADS_PER_RANK and batch in (32, 64) and self.fp8)
                       else 1)
-            # Attention DP2's B128/FP8 B96 and DP1's FP8 B32 merge four peers a step.
+            # Attention DP2's B128/FP8 B96 and DP1's FP8 B32/B64 merge four peers a step.
             ws.merged[c, :rows, :] = _merge_received(
                 ws.receive.at[ring(c)], ws.own_rows[c, :rows, :], ws.new_rows[c, :rows, :], group,
                 unroll=unroll)

@@ -1359,9 +1359,22 @@ def _routed_experts(
 
             def start(g, bank):
                 raw_start, first, n_active = active_bounds(g)
+                unroll = 8
+                full = (n_active // unroll) * unroll
 
-                @pl.loop(0, n_active)
-                def row(i):
+                @pl.loop(0, n_active // unroll)
+                def row_vec(blk):
+                    base = blk * unroll
+                    sources = [destinations[raw_start + base + u] for u in range(unroll)]
+                    for u in range(unroll):
+                        pltpu.make_async_copy(
+                            latent.at[pl.ds(sources[u], 1)],
+                            acts.at[bank, pl.ds(first + base + u, 1)],
+                            act_sems.at[bank],
+                        ).start()
+
+                @pl.loop(full, n_active)
+                def row_rem(i):
                     source = destinations[raw_start + i]
                     pltpu.make_async_copy(
                         latent.at[pl.ds(source, 1)],

@@ -8946,7 +8946,10 @@ def stack(
                     ),
                     after_experts=after_experts,
                     after_routing_scores=after_routing_scores,
-                    overlap_router_latent=(attention_dp == 2 and batch_size == 128 and sequence_rows == 1),
+                    overlap_router_latent=(
+                        (attention_dp == 2 and batch_size == 128 and sequence_rows == 1)
+                        or (attention_dp == 1 and batch_size in (16, 32) and sequence_rows == 1)
+                    ),
                     # Verify steps of 64 rows overlap it too; at 128 verify rows it is slower.
                     overlap_shared_reduction=(
                         batch_size in (16, 32, 64)
