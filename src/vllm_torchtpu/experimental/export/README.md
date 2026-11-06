@@ -16,6 +16,9 @@ python -m vllm_torchtpu.experimental.export \
 The exporter loads dummy weights, so it reads only the checkpoint's config and
 tokenizer files.
 
+[RESULTS.md](RESULTS.md) compares exported models served by rvllm with `vllm serve`:
+nightly throughput and accuracy, plus Muse Spark Open.
+
 ## Static parameters: pass them explicitly to match `vllm serve`
 
 `vllm serve` settles several sizes at startup, some of them by measuring the
