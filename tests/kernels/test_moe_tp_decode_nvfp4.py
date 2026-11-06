@@ -596,20 +596,9 @@ def test_refuses_misaligned_w2_n_chunk(monkeypatch):
     )
 
 
-def test_tuning_levers_admission_vmem_and_kernel_name(monkeypatch):
+def test_default_vmem_headroom_and_kernel_name(monkeypatch):
     info = _tpu7x()
     monkeypatch.setattr(pltpu, "get_tpu_info", lambda: info)
-
-    # New defaults: g=2 at TP8 (I=256), g=1 at EP2xTP4 (I=512), nb=4.
-    assert kernel.group_size(256, 256) == 2
-    assert kernel.group_size(256, 256, max_group=1) == 1
-    assert kernel.group_size(512, 128) == 1
-    assert kernel.group_size(256, 256, group_cols=2048) == 4
-    assert kernel.group_size(512, 128, group_cols=2048) == 2
-    with pytest.raises(ValueError, match="max_group"):
-        kernel.group_size(512, 128, max_group=0)
-    with pytest.raises(ValueError, match="group_cols"):
-        kernel.group_size(512, 128, group_cols=0)
 
     default_ep = kernel.kernel_name(128, 16, 6144, 512, 256, N_RANKS, 256, fast=True)
     assert default_ep == (
@@ -619,47 +608,13 @@ def test_tuning_levers_admission_vmem_and_kernel_name(monkeypatch):
     assert default_tp8 == (
         "moe_tp_decode_nvfp4-e_256-m_16-h_6144-i_256-g_2-fs_256-nb_4-n_8-sm-fast"
     )
-    legacy_ep = kernel.kernel_name(
-        128,
-        16,
-        6144,
-        512,
-        256,
-        N_RANKS,
-        256,
-        fast=True,
-        group_cols=2048,
-        num_buffers=3,
-    )
-    assert legacy_ep == (
-        "moe_tp_decode_nvfp4-e_128-m_16-h_6144-i_512-g_2-fs_256-nb_3-n_8-sm-ne_256-fast"
-    )
-    tuned_tp8 = kernel.kernel_name(
-        256,
-        16,
-        6144,
-        256,
-        256,
-        N_RANKS,
-        256,
-        fast=True,
-        contig_dma=True,
-        overlap_schedule=True,
-        skip_tail=True,
-    )
-    assert "-g_2-" in tuned_tp8 and "-nb_4-" in tuned_tp8
-    assert tuned_tp8.endswith("-fast-cdma-ovlp-stail")
 
     # VMEM plan & admission across EP2xTP4 (g=1, nb=4) and TP8 (g=2, nb=4) at
-    # m=16,32,64 with >11 MiB headroom below the 56 MiB cap, plus legacy
-    # (group_cols=2048, num_buffers=3) admission at m=16,32 and contig_dma
-    # zero-byte delta.
+    # m=16,32,64 with >11 MiB headroom below the 56 MiB cap.
     cap_bytes = int(info.vmem_capacity_bytes * nvfp4_kernel_impl.VMEM_FRACTION)
-    for cfg, exp_g, legacy_g in ((GLM52_EP2TP4, 1, 2), (GLM52_TP8, 2, 4)):
+    for cfg, exp_g in ((GLM52_EP2TP4, 1), (GLM52_TP8, 2)):
         g_def = kernel.group_size(cfg["i"], cfg["e"] // cfg["ep"])
         assert g_def == exp_g
-        g_leg = kernel.group_size(cfg["i"], cfg["e"] // cfg["ep"], group_cols=2048)
-        assert g_leg == legacy_g
         b13 = cfg["h"] // cfg["b13"]
         b2 = cfg["i"] // cfg["b2"]
         for rows in kernel.ROW_BUCKETS:
@@ -677,109 +632,21 @@ def test_tuning_levers_admission_vmem_and_kernel_name(monkeypatch):
                 info,
                 spec,
             )
-            plan_cdma = nvfp4_kernel_impl._vmem_plan(
-                rows,
-                cfg["h"],
-                cfg["i"],
-                b13,
-                b2,
-                g_def,
-                cfg["e"],
-                cfg["fs"],
-                info,
-                spec,
-                contig_dma=True,
-            )
-            assert plan_def is not None and plan_cdma == plan_def
+            assert plan_def is not None
             assert cap_bytes - plan_def[1] >= 11 * 2**20
-            plan_leg = nvfp4_kernel_impl._vmem_plan(
-                rows,
-                cfg["h"],
-                cfg["i"],
-                b13,
-                b2,
-                g_leg,
-                cfg["e"],
-                cfg["fs"],
-                info,
-                spec,
-                num_buffers=3,
-            )
-            plan_leg_cdma = nvfp4_kernel_impl._vmem_plan(
-                rows,
-                cfg["h"],
-                cfg["i"],
-                b13,
-                b2,
-                g_leg,
-                cfg["e"],
-                cfg["fs"],
-                info,
-                spec,
-                num_buffers=3,
-                contig_dma=True,
-            )
-            assert plan_leg_cdma == plan_leg
             assert kernel.can_use_moe_tp_decode_nvfp4(
                 *shps, topk=cfg["topk"], n_ranks=N_RANKS
             )
-            assert kernel.can_use_moe_tp_decode_nvfp4(
-                *shps, topk=cfg["topk"], n_ranks=N_RANKS, contig_dma=True
-            )
-            if rows in (16, 32):
-                assert plan_leg is not None
-                assert kernel.can_use_moe_tp_decode_nvfp4(
-                    *shps,
-                    topk=cfg["topk"],
-                    n_ranks=N_RANKS,
-                    group_cols=2048,
-                    num_buffers=3,
-                )
-            else:
-                assert plan_leg is None
-                assert not kernel.can_use_moe_tp_decode_nvfp4(
-                    *shps,
-                    topk=cfg["topk"],
-                    n_ranks=N_RANKS,
-                    group_cols=2048,
-                    num_buffers=3,
-                )
-            assert kernel.can_use_moe_tp_decode_nvfp4(
-                *shps,
-                topk=cfg["topk"],
-                n_ranks=N_RANKS,
-                group_cols=2048,
-                num_buffers=2,
-            )
-            # Legacy wide group (g=2/4) with 4 buffers exceeds the 56 MiB VMEM cap.
-            assert not kernel.can_use_moe_tp_decode_nvfp4(
-                *shps,
-                topk=cfg["topk"],
-                n_ranks=N_RANKS,
-                group_cols=2048,
-                num_buffers=4,
-            )
-
-    shps16 = _shapes(16, GLM52_EP2TP4)
-    assert not kernel.can_use_moe_tp_decode_nvfp4(
-        *shps16, topk=8, n_ranks=N_RANKS, max_group=0
-    )
-    assert not kernel.can_use_moe_tp_decode_nvfp4(
-        *shps16, topk=8, n_ranks=N_RANKS, group_cols=0
-    )
-    assert not kernel.can_use_moe_tp_decode_nvfp4(
-        *shps16, topk=8, n_ranks=N_RANKS, num_buffers=1
-    )
 
 
-def test_tuning_levers_tpu7x_lowering(monkeypatch):
+def test_kept_levers_tpu7x_lowering(monkeypatch):
     monkeypatch.setattr(pltpu, "get_tpu_info", _tpu7x)
     devs = jax.devices()[:1]
     mesh = Mesh(np.asarray(devs), ("d",))
     sds = jax.ShapeDtypeStruct
     specs = (P("d"), P("d"), P(), P(), P("d"), P("d")) + (P("d"),) * 8
 
-    def lower_case(cfg: dict, rows: int, **kw) -> str:
+    def lower_case(cfg: dict, rows: int, *, hbm_operands: bool = True, **kw) -> str:
         shps = _shapes(rows, cfg)
         abstract_args = (
             shps[0],
@@ -803,7 +670,7 @@ def test_tuning_levers_tpu7x_lowering(monkeypatch):
                 routed_scale=ROUTED_SCALE,
                 topk=cfg["topk"],
                 n_ranks=N_RANKS,
-                hbm_operands=True,
+                hbm_operands=hbm_operands,
                 **kw,
             )
 
@@ -814,45 +681,26 @@ def test_tuning_levers_tpu7x_lowering(monkeypatch):
         )
         return fn.trace(*abstract_args).lower(lowering_platforms=("tpu",)).as_text()
 
-    for cfg, def_tag, leg_tag in (
-        (GLM52_EP2TP4, "-g_1-fs_256-nb_4-", "-g_2-fs_256-nb_3-"),
-        (GLM52_TP8, "-g_2-fs_256-nb_4-", "-g_4-fs_256-nb_3-"),
+    for cfg, def_tag in (
+        (GLM52_EP2TP4, "-g_1-fs_256-nb_4-"),
+        (GLM52_TP8, "-g_2-fs_256-nb_4-"),
     ):
         hlo_def = lower_case(cfg, 16, fast=True)
         assert "tpu_custom_call" in hlo_def and def_tag in hlo_def
-        hlo_leg = lower_case(cfg, 16, fast=True, group_cols=2048, num_buffers=3)
-        assert "tpu_custom_call" in hlo_leg and leg_tag in hlo_leg
-        kw_cases: tuple[dict[str, Any], ...] = (
-            dict(fast=True, contig_dma=True),
-            dict(fast=True, overlap_schedule=True),
-            dict(fast=True, skip_tail=True),
-            dict(
-                fast=True,
-                contig_dma=True,
-                overlap_schedule=True,
-                skip_tail=True,
-            ),
-            dict(
-                fast=False,
-                contig_dma=True,
-                overlap_schedule=True,
-                skip_tail=True,
-            ),
-            dict(
-                fast=True,
-                max_group=1,
-                overlap_schedule=True,
-            ),
-        )
-        for kw in kw_cases:
+        for kw in (
+            dict(fast=False),
+            dict(fast=True, hbm_operands=False),
+            dict(fast=True, split_meta=False),
+            dict(fast=True, w2_n_chunk=6144),
+        ):
             hlo = lower_case(cfg, 16, **kw)
             assert "tpu_custom_call" in hlo
 
 
-def test_tuning_levers_cpu_kernel_bitwise_and_dma_invariants(monkeypatch):
+def test_cpu_kernel_fast_vs_slow_bitwise_and_dma_invariants(monkeypatch):
     """Execute ``_kernel`` directly on CPU across partial/tail active counts,
-    verifying 0-ULP bitwise identity vs default, clean semaphore pairing, and
-    exact ``4 * active_count`` routed DMAs under ``skip_tail=True``."""
+    verifying ``fast=True`` vs ``fast=False`` and ``w2_n_chunk`` 0-ULP bitwise
+    identity plus clean semaphore pairing and NaN-poisoned padding masking."""
     info = _tpu7x()
     monkeypatch.setattr(pltpu, "get_tpu_info", lambda: info)
 
@@ -999,6 +847,7 @@ def test_tuning_levers_cpu_kernel_bitwise_and_dma_invariants(monkeypatch):
 
     m, h, fs, topk = 16, 1024, 128, 4
     b13, b2 = h // Q_BLOCK, 1
+    nb = nvfp4_kernel_impl._NUM_BUFFERS
     for cfg_i, el, counts in (
         (512, 8, (-1, 0, 1, 3, 5, 7)),
         (256, 16, (-1, 0, 1, 3, 5, 11, 13)),
@@ -1035,12 +884,7 @@ def test_tuning_levers_cpu_kernel_bitwise_and_dma_invariants(monkeypatch):
             *,
             tied: bool = False,
             fast: bool = True,
-            max_group: int = 4,
-            group_cols: int = 1024,
-            num_buffers: int = 4,
-            contig_dma: bool = False,
-            overlap_schedule: bool = False,
-            skip_tail: bool = False,
+            w2_n_chunk: int = 512,
             _el: int = el,
             _e: int = e,
             _i: int = cfg_i,
@@ -1055,7 +899,7 @@ def test_tuning_levers_cpu_kernel_bitwise_and_dma_invariants(monkeypatch):
             _ss2: np.ndarray = ss2,
             _spec: Any = spec,
         ) -> tuple[np.ndarray, int]:
-            g = kernel.group_size(_i, _el, max_group=max_group, group_cols=group_cols)
+            g = kernel.group_size(_i, _el)
             scores = np.full((m, _e), 0.01, np.float32)
             bias = np.zeros((_e,), np.float32)
             nv = 0 if count_target == -1 else 14
@@ -1080,21 +924,10 @@ def test_tuning_levers_cpu_kernel_bitwise_and_dma_invariants(monkeypatch):
             bias_pad = np.pad(bias, (0, e_pad - _e), constant_values=-np.inf).reshape(
                 1, e_pad
             )
-            use_cdma = contig_dma and g > 1
-            w1_scr = np.zeros(
-                (num_buffers, g, h // 8, 2 * _i)
-                if use_cdma
-                else (num_buffers, h // 8, g * 2 * _i),
-                np.uint32,
-            )
-            s1_scr = np.zeros(
-                (num_buffers, g, b13, 1, 2 * _i)
-                if use_cdma
-                else (num_buffers, b13, 1, g * 2 * _i),
-                np.float32,
-            )
+            w1_scr = np.zeros((nb, h // 8, g * 2 * _i), np.uint32)
+            s1_scr = np.zeros((nb, b13, 1, g * 2 * _i), np.float32)
             out = np.array(jnp.full((m, h), -1.0, dtype=BF16), copy=True)
-            ring_sem = _FakeSem((num_buffers, 4 * g))
+            ring_sem = _FakeSem((nb, 4 * g))
             shared_sem = _FakeSem((4,))
             hit_sem = _FakeSem((1,))
 
@@ -1113,9 +946,9 @@ def test_tuning_levers_cpu_kernel_bitwise_and_dma_invariants(monkeypatch):
                 _FakeRef(_ss2),
                 _FakeRef(out),
                 _FakeRef(w1_scr),
-                _FakeRef(np.zeros((num_buffers, g, _i // 8, h), np.uint32)),
+                _FakeRef(np.zeros((nb, g, _i // 8, h), np.uint32)),
                 _FakeRef(s1_scr),
-                _FakeRef(np.zeros((num_buffers, g, b2, 1, h), np.float32)),
+                _FakeRef(np.zeros((nb, g, b2, 1, h), np.float32)),
                 _FakeRef(np.array(jnp.zeros((h, 2 * fs), FP8), copy=True)),
                 _FakeRef(np.zeros((1, 2 * fs), np.float32)),
                 _FakeRef(np.array(jnp.zeros((fs, h), FP8), copy=True)),
@@ -1139,11 +972,7 @@ def test_tuning_levers_cpu_kernel_bitwise_and_dma_invariants(monkeypatch):
                 routed_scale=ROUTED_SCALE,
                 ar_spec=_spec,
                 fast=fast,
-                w2_n_chunk=512,
-                num_buffers=num_buffers,
-                contig_dma=contig_dma,
-                overlap_schedule=overlap_schedule,
-                skip_tail=skip_tail,
+                w2_n_chunk=w2_n_chunk,
             )
             for sem in (ring_sem, shared_sem, hit_sem):
                 for key, queue in sem.pending.items():
@@ -1152,53 +981,18 @@ def test_tuning_levers_cpu_kernel_bitwise_and_dma_invariants(monkeypatch):
             assert np.all(out[max(nv, 0) :].view(np.uint16) == 0)
             return out, ring_sem.routed_dmas
 
-        kw_cases: tuple[dict[str, Any], ...] = (
-            dict(fast=True, contig_dma=True),
-            dict(fast=True, overlap_schedule=True),
-            dict(fast=True, skip_tail=True),
-            dict(
-                fast=True,
-                contig_dma=True,
-                overlap_schedule=True,
-                skip_tail=True,
-            ),
-            dict(
-                fast=False,
-                contig_dma=True,
-                overlap_schedule=True,
-                skip_tail=True,
-            ),
-            dict(fast=True, group_cols=2048, num_buffers=3),
-            dict(fast=True, group_cols=2048, num_buffers=3, skip_tail=True),
-            dict(
-                fast=True,
-                group_cols=2048,
-                num_buffers=3,
-                contig_dma=True,
-                overlap_schedule=True,
-                skip_tail=True,
-            ),
-        )
         for cnt in counts:
             base, base_dmas = run_one(cnt, fast=True)
             base_bits = base.view(np.uint16)
             if cfg_i == 512 and cnt >= 0:
                 assert base_dmas == 4 * cnt
-            for kw in kw_cases:
-                got, dmas = run_one(cnt, **kw)
-                assert np.array_equal(got.view(np.uint16), base_bits)
-                if kw.get("skip_tail") and cnt >= 0:
-                    assert dmas == 4 * cnt
+            got_slow, _ = run_one(cnt, fast=False)
+            assert np.array_equal(got_slow.view(np.uint16), base_bits)
+            got_nc, _ = run_one(cnt, fast=True, w2_n_chunk=1024)
+            assert np.array_equal(got_nc.view(np.uint16), base_bits)
 
         base_tied, _ = run_one(4, tied=True, fast=True)
-        got_tied, _ = run_one(
-            4,
-            tied=True,
-            fast=True,
-            contig_dma=True,
-            overlap_schedule=True,
-            skip_tail=True,
-        )
+        got_tied, _ = run_one(4, tied=True, fast=False)
         assert np.array_equal(got_tied.view(np.uint16), base_tied.view(np.uint16))
 
 
@@ -1266,14 +1060,13 @@ def test_scale_4d_no_reshape_in_jaxpr_and_tpu_hlo_and_3d_compat(monkeypatch):
         topk = cfg["topk"]
         shps = _shapes(16, cfg)
 
-        def call_direct(*d_args, _tk: int = topk, _h: bool = False, _c: bool = False):
+        def call_direct(*d_args, _tk: int = topk, _h: bool = False):
             return kernel.moe_tp_decode_nvfp4(
                 *d_args,
                 routed_scale=ROUTED_SCALE,
                 topk=_tk,
                 n_ranks=N_RANKS,
                 hbm_operands=_h,
-                contig_dma=_c,
             )
 
         # 1. Direct jaxpr inspection: 4D s13 and s2 invars flow straight into
@@ -1288,20 +1081,17 @@ def test_scale_4d_no_reshape_in_jaxpr_and_tpu_hlo_and_3d_compat(monkeypatch):
             sds((), jnp.int32),
         )
         for hbm_ops in (False, True):
-            for cdma in (False, True):
-                closed = jax.make_jaxpr(
-                    lambda *a, _f=call_direct, _h=hbm_ops, _c=cdma: _f(*a, _h=_h, _c=_c)
-                )(*direct_args)
-                s1_var, s2_var = closed.jaxpr.invars[7], closed.jaxpr.invars[8]
-                assert aval_shape(s1_var) == (el, b13, 1, two_i)
-                assert aval_shape(s2_var) == (el, b2, 1, h)
-                pallas_scale_shapes = trace_scales_to_pallas(
-                    closed.jaxpr, [s1_var, s2_var]
-                )
-                assert pallas_scale_shapes == [
-                    (el, b13, 1, two_i),
-                    (el, b2, 1, h),
-                ]
+            closed = jax.make_jaxpr(
+                lambda *a, _f=call_direct, _h=hbm_ops: _f(*a, _h=_h)
+            )(*direct_args)
+            s1_var, s2_var = closed.jaxpr.invars[7], closed.jaxpr.invars[8]
+            assert aval_shape(s1_var) == (el, b13, 1, two_i)
+            assert aval_shape(s2_var) == (el, b2, 1, h)
+            pallas_scale_shapes = trace_scales_to_pallas(closed.jaxpr, [s1_var, s2_var])
+            assert pallas_scale_shapes == [
+                (el, b13, 1, two_i),
+                (el, b2, 1, h),
+            ]
 
         # 2. TPU7x StableHLO lowering: @tpu_custom_call receives 4D scale tensors
         #    directly with zero stablehlo.reshape on the scale shapes.
@@ -1320,57 +1110,50 @@ def test_scale_4d_no_reshape_in_jaxpr_and_tpu_hlo_and_3d_compat(monkeypatch):
         s2_3d_mlir = f"tensor<{el}x{b2}x{h}xf32>"
 
         for hbm_ops in (False, True):
-            for cdma in (False, True):
 
-                def rank_body(
+            def rank_body(
+                x_s,
+                s_s,
+                b_s,
+                nv_s,
+                r_s,
+                e0_s,
+                *ws_s,
+                _tk: int = topk,
+                _h: bool = hbm_ops,
+            ):
+                return kernel.moe_tp_decode_nvfp4(
                     x_s,
                     s_s,
                     b_s,
-                    nv_s,
-                    r_s,
-                    e0_s,
+                    nv_s[0],
+                    r_s.reshape(()),
                     *ws_s,
-                    _tk: int = topk,
-                    _h: bool = hbm_ops,
-                    _c: bool = cdma,
-                ):
-                    return kernel.moe_tp_decode_nvfp4(
-                        x_s,
-                        s_s,
-                        b_s,
-                        nv_s[0],
-                        r_s.reshape(()),
-                        *ws_s,
-                        e0_s.reshape(()),
-                        routed_scale=ROUTED_SCALE,
-                        topk=_tk,
-                        n_ranks=N_RANKS,
-                        hbm_operands=_h,
-                        contig_dma=_c,
-                    )
+                    e0_s.reshape(()),
+                    routed_scale=ROUTED_SCALE,
+                    topk=_tk,
+                    n_ranks=N_RANKS,
+                    hbm_operands=_h,
+                )
 
-                fn = jax.jit(
-                    jax.shard_map(
-                        rank_body,
-                        mesh=mesh,
-                        in_specs=specs,
-                        out_specs=P("d"),
-                        check_vma=False,
-                    )
+            fn = jax.jit(
+                jax.shard_map(
+                    rank_body,
+                    mesh=mesh,
+                    in_specs=specs,
+                    out_specs=P("d"),
+                    check_vma=False,
                 )
-                hlo = (
-                    fn.trace(*abstract_args)
-                    .lower(lowering_platforms=("tpu",))
-                    .as_text()
-                )
-                assert s1_3d_mlir not in hlo
-                assert s2_3d_mlir not in hlo
-                cc_lines = [ln for ln in hlo.splitlines() if "@tpu_custom_call" in ln]
-                assert len(cc_lines) == 1
-                assert s1_mlir in cc_lines[0] and s2_mlir in cc_lines[0]
-                for ln in hlo.splitlines():
-                    if "reshape" in ln:
-                        assert s1_mlir not in ln and s2_mlir not in ln
+            )
+            hlo = fn.trace(*abstract_args).lower(lowering_platforms=("tpu",)).as_text()
+            assert s1_3d_mlir not in hlo
+            assert s2_3d_mlir not in hlo
+            cc_lines = [ln for ln in hlo.splitlines() if "@tpu_custom_call" in ln]
+            assert len(cc_lines) == 1
+            assert s1_mlir in cc_lines[0] and s2_mlir in cc_lines[0]
+            for ln in hlo.splitlines():
+                if "reshape" in ln:
+                    assert s1_mlir not in ln and s2_mlir not in ln
 
         # 3. 3D scale callers expand cleanly to 4D; invalid 4D dim-2 raises ValueError.
         args_3d = list(direct_args)
@@ -1541,7 +1324,7 @@ def test_cpu_served_per_expert_shapes_stage_audit_and_oracle_spread(cfg: dict):
         jnp.zeros((rows, h), BF16),
     )
 
-    # 2b. Kernel grouped (g=4/2) stage-by-stage mirror with w2_n_chunk=2048, 6144
+    # 2b. Kernel grouped (g=2/1) stage-by-stage mirror with w2_n_chunk=2048, 6144
     for nc in (2048, 6144):
         owner_k = jnp.zeros((rows, h), F32)
         for eg in range(0, el, g):
@@ -1688,12 +1471,6 @@ def _run_kernel_case(
     hbm_operands: bool = False,
     split_meta: bool = True,
     w2_n_chunk: int = 2048,
-    max_group: int = 4,
-    group_cols: int = 1024,
-    num_buffers: int = 4,
-    contig_dma: bool = False,
-    overlap_schedule: bool = False,
-    skip_tail: bool = False,
 ) -> np.ndarray:
     specs = (P("d"), P("d"), P(), P(), P("d"), P("d")) + (P("d"),) * 8
     ranks = jnp.arange(N_RANKS, dtype=jnp.int32).reshape(N_RANKS, 1)
@@ -1708,10 +1485,6 @@ def _run_kernel_case(
             topk=cfg["topk"],
             n_ranks=N_RANKS,
             w2_n_chunk=w2_n_chunk,
-            max_group=max_group,
-            group_cols=group_cols,
-            num_buffers=num_buffers,
-            contig_dma=contig_dma,
         )
         return kernel.moe_tp_decode_nvfp4(
             x_s,
@@ -1728,12 +1501,6 @@ def _run_kernel_case(
             hbm_operands=hbm_operands,
             split_meta=split_meta,
             w2_n_chunk=w2_n_chunk,
-            max_group=max_group,
-            group_cols=group_cols,
-            num_buffers=num_buffers,
-            contig_dma=contig_dma,
-            overlap_schedule=overlap_schedule,
-            skip_tail=skip_tail,
         )
 
     fn = jax.jit(
@@ -1786,6 +1553,7 @@ def _eval_oracles(mesh: Mesh, cfg: dict, sharded_weights, x, scores, bias, n_val
 
 
 @pytest.mark.tpu_test
+@pytest.mark.multichip
 @pytest.mark.parametrize(
     "rows, n_valid",
     [
@@ -1826,6 +1594,7 @@ def test_small_shape_kernel_padding_and_buckets(rows: int, n_valid: int):
 
 
 @pytest.mark.tpu_test
+@pytest.mark.multichip
 @pytest.mark.parametrize("n", [1, 2, 4, 8, 16, 32, 64])
 def test_op_body_across_decode_token_counts(n: int):
     mesh = _require_tpu_mesh()
@@ -1889,6 +1658,7 @@ def test_op_body_across_decode_token_counts(n: int):
 
 
 @pytest.mark.tpu_test
+@pytest.mark.multichip
 @pytest.mark.parametrize("cfg", [SMALL_TP8, SMALL_EP2TP4])
 def test_op_body_above_64_falls_back_to_tp_chain(cfg: dict):
     mesh = _require_tpu_mesh()
@@ -1953,6 +1723,7 @@ def test_op_body_above_64_falls_back_to_tp_chain(cfg: dict):
 
 
 @pytest.mark.tpu_test
+@pytest.mark.multichip
 @pytest.mark.parametrize(
     "cfg_name, cfg",
     [
@@ -1992,6 +1763,7 @@ def test_glm52_shapes_and_concentrated_routing(
 
 
 @pytest.mark.tpu_test
+@pytest.mark.multichip
 def test_ep2tp4_zero_active_experts_on_one_ep_group():
     mesh = _require_tpu_mesh()
     ws = _build_sharded_weights(mesh, GLM52_EP2TP4, seed=9)
@@ -2010,6 +1782,7 @@ def test_ep2tp4_zero_active_experts_on_one_ep_group():
 
 
 @pytest.mark.tpu_test
+@pytest.mark.multichip
 @pytest.mark.parametrize("mode", ["uniform", "concentrated_tail", "ties"])
 def test_fast_hbm_operands_and_split_meta_are_bitwise(mode: str):
     mesh = _require_tpu_mesh()
@@ -2035,64 +1808,6 @@ def test_fast_hbm_operands_and_split_meta_are_bitwise(mode: str):
     assert np.array_equal(got_nosm.view(np.uint16), b_slow)
     assert np.array_equal(got_nc512.view(np.uint16), b_slow)
     assert np.array_equal(got_nc6144.view(np.uint16), b_slow)
-
-
-@pytest.mark.tpu_test
-@pytest.mark.parametrize(
-    "cfg_name, cfg",
-    [
-        ("small_ep2tp4", SMALL_EP2TP4),
-        ("small_tp8", SMALL_TP8),
-    ],
-)
-@pytest.mark.parametrize(
-    "mode",
-    [
-        "uniform",
-        "concentrated_tail",
-        "concentrated_sub_group",
-        "concentrated_ep0",
-        "ties",
-    ],
-)
-def test_tuning_levers_tpu_bitwise_vs_default(cfg_name: str, cfg: dict, mode: str):
-    del cfg_name
-    if mode == "concentrated_ep0" and cfg["ep"] == 1:
-        pytest.skip("concentrated_ep0 requires EP > 1")
-    mesh = _require_tpu_mesh()
-    ws = _build_sharded_weights(mesh, cfg, seed=17)
-    x, scores, bias = _make_routing_inputs(16, cfg, mode=mode, seed=707)
-    x = x.at[12:].set(jnp.nan)
-    scores = scores.at[12:].set(jnp.nan)
-    base = _run_kernel_case(mesh, cfg, ws, x, scores, bias, 12, fast=True)
-    b_base = base.view(np.uint16)
-    kw_cases: tuple[dict[str, Any], ...] = (
-        dict(fast=True, contig_dma=True),
-        dict(fast=True, overlap_schedule=True),
-        dict(fast=False, overlap_schedule=True),
-        dict(fast=True, skip_tail=True),
-        dict(fast=False, skip_tail=True),
-        dict(
-            fast=True,
-            group_cols=2048,
-            num_buffers=3,
-        ),
-        dict(
-            fast=True,
-            contig_dma=True,
-            overlap_schedule=True,
-            skip_tail=True,
-        ),
-        dict(
-            fast=False,
-            contig_dma=True,
-            overlap_schedule=True,
-            skip_tail=True,
-        ),
-    )
-    for kw in kw_cases:
-        got = _run_kernel_case(mesh, cfg, ws, x, scores, bias, 12, **kw)
-        assert np.array_equal(got.view(np.uint16), b_base), kw
 
 
 # ---------------------------------------------------------------------------
