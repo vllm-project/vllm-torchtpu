@@ -27,7 +27,7 @@ from vllm_torchtpu.megakernel_runtime import new, provenance
 _LICENSE = "# Copyright 2026 Google LLC\n#\n# Licensed under the Apache License.\n"
 _FILES = {
     "__init__.py": '''"""A template; its SPEC is "tpl"."""
-from vllm_torchtpu.megakernel_runtime.plugin import TpuMonoSpec
+from vllm_torchtpu.megakernel.runtime.contract import TpuMonoSpec
 
 SPEC = TpuMonoSpec(name="tpl", version="1", create=".adapter:create")
 ''',
