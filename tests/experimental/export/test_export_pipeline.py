@@ -1484,6 +1484,12 @@ def test_build_export_config_fails_when_the_tpu_generation_is_unknown(
             _parallel_vllm_cfg(tmp_path, 1, 1, 1)
         )
 
+    monkeypatch.setattr(tpu_info, "get_tpu_type", lambda: "foo-8")
+    with pytest.raises(RuntimeError, match=r"foo-8.*--target-tpu"):
+        universal_adapter.build_export_config_from_vllm(
+            _parallel_vllm_cfg(tmp_path, 1, 1, 1)
+        )
+
 
 def test_build_export_config_records_the_detected_tpu_generation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch

@@ -15,10 +15,14 @@
 from __future__ import annotations
 
 import json
+import os
+import subprocess
+import sys
 from pathlib import Path
 from typing import Any
 
 import numpy as np
+import portpicker
 import pytest
 import torch
 import torch.nn as nn
@@ -304,6 +308,29 @@ checkpoint.save_checkpoint(
 """
 
 
+def _wait_all_or_kill(
+    procs: list[subprocess.Popen[bytes]], timeout: float = 120
+) -> list[int]:
+    try:
+        return [proc.wait(timeout=timeout) for proc in procs]
+    finally:
+        for proc in procs:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait()
+
+
+def test_wait_all_or_kill_stops_remaining_ranks_on_failure() -> None:
+    procs = [
+        subprocess.Popen([sys.executable, "-c", "raise SystemExit(1)"]),
+        subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"]),
+    ]
+    assert _wait_all_or_kill([procs[0]]) == [1]
+    with pytest.raises(subprocess.TimeoutExpired):
+        _wait_all_or_kill(procs, timeout=0.05)
+    assert all(proc.poll() is not None for proc in procs)
+
+
 def test_small_sharded_arrays_are_saved_as_one_chunk(tmp_path: Path) -> None:
     """Two ranks save small arrays as one chunk; larger ones as before.
 
@@ -312,11 +339,6 @@ def test_small_sharded_arrays_are_saved_as_one_chunk(tmp_path: Path) -> None:
     """
     pytest.importorskip("orbax.checkpoint")
     ts = pytest.importorskip("tensorstore")
-    import os
-    import subprocess
-    import sys
-
-    import portpicker
 
     data_dir = tmp_path / "serving_checkpoint" / "data"
     coordinator = f"localhost:{portpicker.pick_unused_port()}"
@@ -328,7 +350,7 @@ def test_small_sharded_arrays_are_saved_as_one_chunk(tmp_path: Path) -> None:
         )
         for r in range(2)
     ]
-    assert [p.wait(timeout=300) for p in procs] == [0, 0]
+    assert _wait_all_or_kill(procs) == [0, 0]
 
     keys = [
         k.decode() for k in ts.KvStore.open(_ocdbt(data_dir)).result().list().result()
