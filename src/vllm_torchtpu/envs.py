@@ -33,6 +33,8 @@ if TYPE_CHECKING:
     TPU_ONEHOT_TABLE_LOOKUP: bool = True
     TPU_INLINE_DEDUPLICATED_CALLS: bool = True
     TPU_VERIFY_INCREMENTAL_BLOCK_TABLE: bool = False
+    TPU_BLOCK_TABLE_DELTA_BUCKETS: bool = True
+    TPU_FUSED_SPEC_NEXT_INPUTS: bool = True
     LIBTPU_INIT_ARGS: str = ""
     JAX_PLATFORMS: str = ""
     TPU_ACCELERATOR_TYPE: str | None = None
@@ -551,6 +553,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_VERIFY_INCREMENTAL_BLOCK_TABLE": env_bool(
         "TPU_VERIFY_INCREMENTAL_BLOCK_TABLE", default=False
     ),
+    # Pad each block-table delta upload to 64, 512 or 8192 entries, whichever
+    # first holds it, instead of always 8192 (layers/core/block_table_delta.py).
+    # Same table contents; the device scatter's cost follows the padded length.
+    "TPU_BLOCK_TABLE_DELTA_BUCKETS": env_bool(
+        "TPU_BLOCK_TABLE_DELTA_BUCKETS", default=True
+    ),
+    # Async spec decode: build the next step's substitution source and rejected
+    # counts, and correct seq_lens/positions by them, each as one compiled
+    # program with vector table lookups instead of a program per eager op
+    # (runner/tpu_runner_async_output.py). Integer-exact.
+    "TPU_FUSED_SPEC_NEXT_INPUTS": env_bool("TPU_FUSED_SPEC_NEXT_INPUTS", default=True),
     # QK pair-blocked pooled GDN conv layout: full-width states interleave
     # Q and K row-pairs per tap so a TP-rank shard's first conv token maps
     # to one whole destination pool token (2 contiguous transfer spans per
