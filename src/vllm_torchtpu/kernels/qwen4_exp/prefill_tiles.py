@@ -4,6 +4,7 @@
 import jax
 from jax.experimental.pallas import tpu as pltpu
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
@@ -135,6 +136,23 @@ def _get_sparse_prefill_tiles(query, cache, *, kv_heads, ratio):
         tiles = SPARSE_PREFILL_TILES.get(full)
         if tiles is not None and tokens % tiles[0] == 0:
             return tiles
+        # VLLM_TPU_QSA_PREFILL_Q128_FALLBACK (P-ATTN CP3, gated): a TP1 stage's
+        # 3200-token bucket is not a multiple of the 256-row query block, so it
+        # fell back to the unpaired Q256/KV128 kernel (42.4 ms per FA layer at
+        # 102K against 20.6 for paired Q128/KV512, j-98803584). Half the query
+        # block keeps the paired KV tile; its output equals the Q256/KV512
+        # computation bit for bit (query rows are independent), so 3200-token
+        # steps match the 4096/6400/8192 buckets. Not bitwise against today's
+        # 3200-token output (the online softmax regroups at 512 keys).
+        if (
+            envs.VLLM_TPU_QSA_PREFILL_Q128_FALLBACK
+            and tiles is not None
+            and cache.shape[1] == 3200
+            and tiles[0] == 256
+            and tokens % 128 == 0
+            and tokens >= 1024  # the plan's scope: large prefill steps (served: 3200 only)
+        ):
+            return 128, tiles[1]
     if key not in SPARSE_PREFILL_TILES:
         logger.warning_once("QSA uses default prefill tiles for key: %s", key)
         # Keep query/state windows within the measured Q24/D256 footprint

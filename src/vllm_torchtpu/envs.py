@@ -117,6 +117,7 @@ if TYPE_CHECKING:
     VLLM_TPU_QSA_PREFILL_BITSET_KERNEL: bool = True
     VLLM_TPU_QSA_PREFILL_BF16_MXU: bool = False
     VLLM_TPU_QSA_PREFILL_LEAN: bool = False
+    VLLM_TPU_QSA_PREFILL_Q128_FALLBACK: bool = False
     VLLM_TPU_QSA_MAIN_KV_DCP: int = 0
     VLLM_TPU_QSA_MTP_KV_DCP: bool = False
     VLLM_TPU_QSA_COMPRESSED_DCP: bool = False
@@ -747,6 +748,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # qwen4_exp QSA sparse prefill: skip the FP8 key finite/written guard,
     # which the score mask select already covers (bit-identical output).
     "VLLM_TPU_QSA_PREFILL_LEAN": env_bool("VLLM_TPU_QSA_PREFILL_LEAN"),
+    # Qwen4-exp QSA prefill on a TP1 stage's 3200-token pages: run token counts
+    # that are a multiple of 128 but not of 256 (the 3200-token bucket) on the
+    # paired Q128/KV512 kernel instead of the unpaired Q256/KV128 fallback.
+    # Not bitwise against the fallback (the online softmax regroups at 512
+    # keys); identity/accuracy gated (reports/prereg/q38_attn_tile3200_plan_DRAFT.md).
+    "VLLM_TPU_QSA_PREFILL_Q128_FALLBACK": env_bool(
+        "VLLM_TPU_QSA_PREFILL_Q128_FALLBACK", default=False
+    ),
     # Main KV of the target QSA layers split over TP rank pairs that share a
     # KV head (2; 0/1 = off): each rank stores and attends half the tokens,
     # the pair's partial attention is LSE-combined.
