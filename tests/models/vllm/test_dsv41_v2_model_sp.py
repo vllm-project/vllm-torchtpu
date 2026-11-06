@@ -286,6 +286,9 @@ def test_prepare_engram_full_path(monkeypatch: pytest.MonkeyPatch):
         def ensure_cache(self) -> bool:
             return True
 
+        def fuses_dead_masks(self, input_ids: torch.Tensor) -> bool:
+            return False
+
         def dummy_hashes(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
             return torch.zeros((x.shape[0], 3, 1)), torch.ones(
                 x.shape[0], dtype=torch.bool
@@ -1258,10 +1261,14 @@ def test_prepare_engram_enqueues_deferred_device_hashes(monkeypatch):
     device_hashes = torch.ones(4, 3, 1, dtype=torch.int32).as_subclass(_TpuTensor)
 
     class Hash:
+        use_slot_cache = False
         swa_cache_module = SimpleNamespace(kv_cache=None)
 
         def ensure_cache(self):
             return True
+
+        def fuses_dead_masks(self, input_ids: torch.Tensor) -> bool:
+            return False
 
         def __call__(self, *args):
             return device_hashes

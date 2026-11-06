@@ -19,6 +19,7 @@ import torch
 from vllm.v1.spec_decode.utils import unconditional_to_conditional_rates
 
 from vllm_torchtpu.layers.adapter.sample.top_k_top_p import apply_top_k_top_p
+from vllm_torchtpu.layers.core import table_lookup
 
 if TYPE_CHECKING:
     from vllm.config.speculative import SpeculativeConfig
@@ -321,7 +322,9 @@ def _greedy_rejection_sample_from_token_ids(
     if total_tokens > 0:
         # Clamp padding segment sentinels for a safe gather.
         safe_segment_ids = segment_ids.clamp(min=0, max=batch_size - 1)
-        first_mismatch_idx_broadcast = first_mismatch_idx_per_segment[safe_segment_ids]
+        first_mismatch_idx_broadcast = table_lookup.take(
+            first_mismatch_idx_per_segment, safe_segment_ids
+        )
 
         before_mismatch = valid_slot_mask & (
             group_indices < first_mismatch_idx_broadcast

@@ -25,6 +25,7 @@ from vllm_torchtpu.layers.adapter.linear_common import (
     KEEP_VLLM_LAYOUT_ATTR,
     WEIGHT_FLIPPED_ATTR,
 )
+from vllm_torchtpu.layers.core import table_lookup
 from vllm_torchtpu.utils import synchronize_tensors
 
 from . import csa2_adapter, preprocess_ops
@@ -153,9 +154,12 @@ def _block_table(metadata):
     return metadata.block_tables.reshape(metadata.seq_lens.shape[0], -1)
 
 
-def _token_requests(metadata, positions):
-    rows = torch.arange(positions.shape[0], device=positions.device)
-    return torch.bucketize(rows, metadata.query_start_loc[1:], right=True)
+def _token_requests(metadata, positions, out_int32=False):
+    dtype = torch.int32 if out_int32 else torch.int64
+    rows = torch.arange(positions.shape[0], device=positions.device, dtype=dtype)
+    return table_lookup.bucketize_right(
+        rows, metadata.query_start_loc[1:], out_int32=out_int32
+    )
 
 
 def _window_starts():
@@ -166,7 +170,7 @@ def _window_starts():
 def _replayed(metadata, positions, starts, window):
     """Tokens a prefix hit replays: their prefix-cached KV must stay as is."""
     requests = _token_requests(metadata, positions).clamp(max=starts.shape[0] - 1)
-    start = starts[requests]
+    start = table_lookup.take(starts, requests)
     return (start > 0) & (positions >= start) & (positions < start + window)
 
 
@@ -177,15 +181,17 @@ def _cache_slots(
     *,
     compress_ratio=1,
     ring=False,
+    wide=True,
     offset=0,
 ):
     """Addresses of ``positions + offset`` from the shared TPU metadata contract.
 
+    ``wide=False`` computes in int32, for a cache whose slots fit in it.
     Layers of one cache group read the same tables, so a stage computes each
     address set once (~4 us of lookups per call).
     """
     stage_cache = _active_stage_attn_cache
-    key = ("cache_slots", cache.shape[1], compress_ratio, ring, offset)
+    key = ("cache_slots", cache.shape[1], compress_ratio, ring, wide, offset)
     if stage_cache is not None:
         for tables, starts, cached_positions, slots in stage_cache.get(key, ()):
             if (
@@ -200,6 +206,7 @@ def _cache_slots(
         positions + offset if offset else positions,
         compress_ratio=compress_ratio,
         ring=ring,
+        wide=wide,
     )
     if stage_cache is not None:
         entry = (metadata.block_tables, metadata.query_start_loc, positions, slots)
@@ -207,19 +214,26 @@ def _cache_slots(
     return slots
 
 
-def _compute_cache_slots(cache, metadata, positions, *, compress_ratio, ring):
+def _compute_cache_slots(cache, metadata, positions, *, compress_ratio, ring, wide):
     if metadata.seq_lens.numel() == 0:
         return torch.full_like(positions, -1)
     table = _block_table(metadata)
-    requests = _token_requests(metadata, positions).clamp(max=table.shape[0] - 1)
+    requests = _token_requests(metadata, positions, out_int32=not wide).clamp(
+        max=table.shape[0] - 1
+    )
     rows_per_page = cache.shape[1]
     logical = positions // compress_ratio
     columns = torch.zeros_like(logical) if ring else logical // rows_per_page
-    blocks = table[requests, columns.clamp(max=table.shape[1] - 1).long()].long()
+    columns = columns.clamp(max=table.shape[1] - 1)
+    blocks = table[requests, columns.long() if wide else columns]
+    if wide:
+        blocks = blocks.long()
     slots = blocks * rows_per_page + logical % rows_per_page
     # Padded request boundaries repeat the last real token offset. Keep the
     # mask on device, including dummy runs and batches with no active tokens.
     rows = torch.arange(positions.shape[0], device=positions.device)
+    if not wide:
+        rows = rows.int()
     return slots.masked_fill(rows >= metadata.query_start_loc[-1], -1)
 
 
@@ -261,8 +275,8 @@ def save_compress_norm(
         cache = state_cache
         rows = torch.arange(kv_score.shape[0], device=kv_score.device)
         requests = token_to_req_indices.long().clamp(max=query_start_loc.numel() - 2)
-        starts = query_start_loc[requests]
-        ends = query_start_loc[requests + 1]
+        starts = table_lookup.take(query_start_loc, requests)
+        ends = table_lookup.take(query_start_loc, requests + 1)
         previous_slots = (
             slot_mapping.clamp(min=0) // capacity * capacity
             + (positions - 1) % capacity
@@ -1003,13 +1017,15 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                 )
                 # A request's first row pools with the ring's stored predecessor;
                 # only its last ring-capacity rows are stored.
-                has_prev = rows != starts_loc[requests]
+                has_prev = rows != table_lookup.take(starts_loc, requests)
                 slots = _cache_slots(state_cache, state_meta, positions, ring=True)
                 previous = _cache_slots(
                     state_cache, state_meta, positions, ring=True, offset=-1
                 )
                 stored = (slots >= 0) & (
-                    rows >= starts_loc[requests + 1] - state_cache.shape[1]
+                    rows
+                    >= table_lookup.take(starts_loc, requests + 1)
+                    - state_cache.shape[1]
                 )
                 args += [
                     has_prev[:, None].int(),
@@ -1320,11 +1336,10 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                     pos_rem = positions % rows_per_page
                     if non_causal:
                         req_idx = requests.clamp(max=swa.seq_lens.shape[0] - 1)
-                        end_pos = swa.seq_lens[req_idx]
-                        query_len = (
-                            swa.query_start_loc[req_idx + 1]
-                            - swa.query_start_loc[req_idx]
-                        )
+                        end_pos = table_lookup.take(swa.seq_lens, req_idx)
+                        query_len = table_lookup.take(
+                            swa.query_start_loc, req_idx + 1
+                        ) - table_lookup.take(swa.query_start_loc, req_idx)
                         prefix_len = (end_pos - query_len).clamp(min=0)
                         start_pos = (prefix_len - self.window_size).clamp(min=0)
                         logical = (
@@ -1351,7 +1366,8 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                             "deepseek_v41_replay_starts"
                         ]
                         base_valid_window = base_valid_window & (
-                            logical >= replay_starts[requests, None]
+                            logical
+                            >= table_lookup.take(replay_starts, requests)[:, None]
                         )
                     if use_3page_swa:
                         safe = logical.clamp(
@@ -1452,10 +1468,10 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                 )
                 if non_causal and swa.seq_lens.numel() > 0:
                     req_idx = requests.clamp(max=swa.seq_lens.shape[0] - 1)
-                    end_pos = swa.seq_lens[req_idx]
-                    query_len = (
-                        swa.query_start_loc[req_idx + 1] - swa.query_start_loc[req_idx]
-                    )
+                    end_pos = table_lookup.take(swa.seq_lens, req_idx)
+                    query_len = table_lookup.take(
+                        swa.query_start_loc, req_idx + 1
+                    ) - table_lookup.take(swa.query_start_loc, req_idx)
                     prefix_len = (end_pos - query_len).clamp(min=0)
                     start_pos = (prefix_len - self.window_size).clamp(min=0)
                     logical = (
@@ -1482,7 +1498,7 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                         "deepseek_v41_replay_starts"
                     ]
                     valid_window = valid_window & (
-                        logical >= replay_starts[requests, None]
+                        logical >= table_lookup.take(replay_starts, requests)[:, None]
                     )
                 raw_row_slots = (
                     _row_slots(swa_cache, swa_table, requests, logical)
@@ -1500,7 +1516,10 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
             if not self._ced_decoder and (starts := _window_starts()) is not None:
                 # Apply before records are built, including the tiled/local-Q path.
                 valid_window = valid_window & (
-                    logical >= starts[requests.clamp(max=starts.shape[0] - 1), None]
+                    logical
+                    >= table_lookup.take(
+                        starts, requests.clamp(max=starts.shape[0] - 1)
+                    )[:, None]
                 )
             records = (
                 (

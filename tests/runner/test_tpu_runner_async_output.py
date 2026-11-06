@@ -257,3 +257,39 @@ def test_get_output_skips_wait_when_all_requests_discarded():
     ).get_output()
     assert out.sampled_token_ids == [[]]
     assert out.logprobs is None
+
+
+def test_fused_spec_next_inputs_match_eager(device):
+    from vllm_torchtpu.runner.tpu_runner_async_output import (
+        spec_chunk_next_inputs,
+        subtract_num_rejected_tokens_fused,
+    )
+    from vllm_torchtpu.spec_decode.utils import fit_rows
+
+    gen = torch.Generator().manual_seed(0)
+    rows, num_reqs, k, tokens = 48, 40, 5, 288
+    num_valid = torch.randint(1, k + 2, (rows,), generator=gen)
+    next_tokens = torch.randint(0, 1 << 17, (rows, k + 1), generator=gen)
+    next_tokens[torch.arange(k + 1) >= num_valid[:, None]] = INVALID_TOKEN_ID
+    next_tokens = next_tokens.to(torch.int32).to(device)
+    drafts = torch.randint(0, 1 << 17, (rows, k), generator=gen).to(device)
+    num_draft = torch.full((num_reqs,), k, dtype=torch.int32).to(device)
+
+    src, num_rejected = spec_chunk_next_inputs(
+        next_tokens, drafts, num_draft, rows, None
+    )
+    ref_src = assemble_spec_next_tokens(next_tokens, fit_rows(drafts, rows))
+    ref_rej = compute_num_rejected(next_tokens, fit_rows(num_draft, rows))
+    assert torch.equal(src.cpu(), ref_src.cpu())
+    assert torch.equal(num_rejected.cpu(), ref_rej.cpu())
+
+    seq_lens = torch.randint(100, 9000, (64,), generator=gen).to(torch.int32)
+    positions = torch.randint(100, 9000, (tokens,), generator=gen).to(torch.int32)
+    seq_idx = torch.randint(-1, rows, (64,), generator=gen).to(torch.int32)
+    pos_idx = torch.randint(-1, rows, (tokens,), generator=gen).to(torch.int32)
+    args = [t.to(device) for t in (seq_lens, positions)]
+    idx = [t.to(device) for t in (seq_idx, pos_idx)]
+    new_seq, new_pos = subtract_num_rejected_tokens_fused(*args, num_rejected, *idx)
+    ref_seq, ref_pos = subtract_num_rejected_tokens(*args, num_rejected, *idx)
+    assert torch.equal(new_seq.cpu(), ref_seq.cpu())
+    assert torch.equal(new_pos.cpu(), ref_pos.cpu())
