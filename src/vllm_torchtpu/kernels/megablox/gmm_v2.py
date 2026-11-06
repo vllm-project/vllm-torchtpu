@@ -1458,6 +1458,10 @@ def gmm_v2(
 
 # Row buckets of gmm_v2_mlp below the row tile (the tile is always the last).
 DEFAULT_MLP_BUCKETS = (32, 64)
+# Rows per gm tile of gmm_v2_mlp: tiles past it run as more tiles of the same
+# expert, which reuse the expert's weights in VMEM; larger tiles add matmul code
+# for every bucket and push the kernel into instruction overlays.
+DEFAULT_MLP_TILE_ROWS = 64
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1467,6 +1471,7 @@ class MlpConfigs:
     num_parts: int  # column parts of the gate/up weights per expert
     down_parts: int  # column parts of the down weights per expert
     bucket_ms: tuple[int, ...]  # row buckets of the matmuls, ascending, last = tile_m
+    tile_m: int  # rows per gm tile of this kernel (gate/up kernel: up.tiles.tile_m)
 
     @property
     def size_inter(self) -> int:
@@ -1494,6 +1499,7 @@ def make_mlp_configs(
     num_parts: int,
     down_parts: int,
     buckets: tuple[int, ...] | None = None,
+    tile_rows: int | None = None,
     maybe_quantize_lhs: bool = False,
     rhs_quant_dtype: jnp.dtype | None = None,
 ) -> MlpConfigs | None:
@@ -1540,7 +1546,7 @@ def make_mlp_configs(
         fuse_act=None,
         rhs_quant_dtype=rhs_quant_dtype,
     )
-    tile_m = up.tiles.tile_m
+    tile_m = min(tile_rows or DEFAULT_MLP_TILE_ROWS, up.tiles.tile_m)
     if buckets is None:
         # Decode steps route a few rows to each expert: most tiles fit 32 rows,
         # larger batches or skewed routing 64.
@@ -1553,6 +1559,7 @@ def make_mlp_configs(
         num_parts=num_parts,
         down_parts=down_parts,
         bucket_ms=tuple(buckets),
+        tile_m=tile_m,
     )
     num_lanes = pltpu.get_tpu_info().num_lanes
     mxu_size = pltpu.get_tpu_info().mxu_column_size
@@ -1575,6 +1582,7 @@ def make_mlp_configs(
         or cfgs.part_size % num_lanes
         or cfgs.down_part_size % mxu_size
         or any(b <= 0 or b % up.dims.size_lhs_sublane for b in buckets)
+        or up.tiles.tile_m % tile_m
     ):
         return None
     return cfgs
@@ -1602,6 +1610,7 @@ def mlp_kernel_main(
     inter_ref: jax.Array,  # [tile_m // size_lhs_sublane, size_lhs_sublane, size_inter]
     partial_out_ref: jax.Array,  # [size_lhs_sublane, size_n]
     metadata_ref: MetadataRef,
+    group_start_ref: jax.Array,  # SMEM int32[1]: first row of the current group
     sems: jax.Array,  # DMA[num_parts + down_parts]
     *,
     cfgs: MlpConfigs,
@@ -1611,7 +1620,7 @@ def mlp_kernel_main(
     up, down = cfgs.up, cfgs.down
     dims = up.dims
     sub = dims.size_lhs_sublane
-    tile_m = up.tiles.tile_m
+    tile_m = cfgs.tile_m
     size_k = dims.size_k
     size_inter = cfgs.size_inter
     part = cfgs.part_size
@@ -1680,7 +1689,10 @@ def mlp_kernel_main(
         for q in range(cfgs.down_parts):
             start(down_copies(q, group_id))
 
-    num_gm = fill_metadata(lhs_group_sizes_ref, group_offset_ref, metadata_ref, cfgs=up)
+    tiled = dataclasses.replace(up, tiles=dataclasses.replace(up.tiles, tile_m=tile_m))
+    num_gm = fill_metadata(
+        lhs_group_sizes_ref, group_offset_ref, metadata_ref, cfgs=tiled
+    )
 
     def scaled_matmul(tiled_lhs, rhs: RhsRef, c: GmmConfigs, bucket_m: int):
         """Step 2 of `inner_kernel._matmul` on the unquantized-lhs path."""
@@ -1784,9 +1796,21 @@ def mlp_kernel_main(
             def _():
                 start(up_copies(p, next_group_id))
 
-        # The gate/up kernel stores its rows with `out[0] += partial`, and the
-        # next tile adds this tile's last partial sublane block: x + 0 there.
-        inter_ref[0] = inter_ref[0] + jnp.zeros_like(inter_ref[0])
+        # The gate/up kernel stores its rows with `out[0] += partial` in each of
+        # its gm tiles, and the next tile adds this tile's last partial sublane
+        # block: x + 0 there. Its tiles start where a group starts and every
+        # up.tiles.tile_m rows after the group's first sublane block.
+        @pl.when(is_new_group)
+        def _():
+            group_start_ref[0] = m_start
+
+        group_block = group_start_ref[0] - group_start_ref[0] % sub
+
+        @pl.when(
+            jnp.logical_or(is_new_group, (m_start - group_block) % up.tiles.tile_m == 0)
+        )
+        def _():
+            inter_ref[0] = inter_ref[0] + jnp.zeros_like(inter_ref[0])
 
         @pl.when(jnp.logical_and(m_end_local % sub != 0, has_next))
         def _():
@@ -1846,6 +1870,7 @@ def mlp_supported(
     num_parts: int = 2,
     down_parts: int = 1,
     buckets: tuple[int, ...] | None = None,
+    tile_rows: int | None = None,
     maybe_quantize_lhs: bool = False,
     rhs_quant_dtype: jnp.dtype | None = None,
 ) -> bool:
@@ -1871,6 +1896,7 @@ def mlp_supported(
         num_parts=num_parts,
         down_parts=down_parts,
         buckets=buckets,
+        tile_rows=tile_rows,
         maybe_quantize_lhs=maybe_quantize_lhs,
         rhs_quant_dtype=rhs_quant_dtype,
     )
@@ -1908,6 +1934,7 @@ class MlpIndexMaps:
         "num_parts",
         "down_parts",
         "buckets",
+        "tile_rows",
         "vmem_limit_bytes",
         "maybe_quantize_lhs",
         "rhs_quant_dtype",
@@ -1926,6 +1953,7 @@ def gmm_v2_mlp(
     num_parts: int = 2,
     down_parts: int = 1,
     buckets: tuple[int, ...] | None = None,
+    tile_rows: int | None = None,
     vmem_limit_bytes: int | None = None,
     maybe_quantize_lhs: bool = True,
     rhs_quant_dtype: jnp.dtype | None = None,
@@ -1965,6 +1993,7 @@ def gmm_v2_mlp(
         num_parts=num_parts,
         down_parts=down_parts,
         buckets=buckets,
+        tile_rows=tile_rows,
         maybe_quantize_lhs=maybe_quantize_lhs,
         rhs_quant_dtype=rhs_quant_dtype,
     )
@@ -1973,7 +2002,6 @@ def gmm_v2_mlp(
     up, down = cfgs.up, cfgs.down
     dims = up.dims
     sub = dims.size_lhs_sublane
-    tiles = up.tiles
     part = cfgs.part_size
     down_part = cfgs.down_part_size
     size_n = down.dims.size_n
@@ -1983,7 +2011,7 @@ def gmm_v2_mlp(
     nb1 = w1_scale.shape[1]
     nb2 = w2_scale.shape[1]
 
-    max_num_gm = dims.size_group + pl.cdiv(dims.size_m, tiles.tile_m) - 1
+    max_num_gm = dims.size_group + pl.cdiv(dims.size_m, cfgs.tile_m) - 1
     scratch_shapes = [
         pltpu.VMEM((num_parts, dims.size_k, part), w1.dtype),
         pltpu.VMEM((num_parts, dims.size_k, part), w1.dtype),
@@ -1991,12 +2019,13 @@ def gmm_v2_mlp(
         pltpu.VMEM((num_parts, nb1, 1, part), jnp.float32),
         pltpu.VMEM((down_parts, cfgs.size_inter, down_part), w2.dtype),
         pltpu.VMEM((down_parts, nb2, 1, down_part), jnp.float32),
-        pltpu.VMEM((tiles.tile_m // sub, sub, cfgs.size_inter), up.out_dtype),
+        pltpu.VMEM((cfgs.tile_m // sub, sub, cfgs.size_inter), up.out_dtype),
         pltpu.VMEM((sub, size_n), down.out_dtype),
         MetadataRef(
             gm_id_to_group_id=pltpu.SMEM((max_num_gm,), jnp.int32),
             gm_id_to_m_offset=pltpu.SMEM((max_num_gm + 1,), jnp.int32),
         ),
+        pltpu.SMEM((1,), jnp.int32),
         pltpu.SemaphoreType.DMA((num_parts + down_parts,)),
     ]
 
@@ -2012,7 +2041,7 @@ def gmm_v2_mlp(
     )
     name = (
         f"gmm_v2_mlp-g_{dims.size_group}-m_{dims.size_m}-k_{dims.size_k}"
-        f"-act_{fuse_act}-n_{dims.size_n}-n2_{size_n}-tm_{tiles.tile_m}"
+        f"-act_{fuse_act}-n_{dims.size_n}-n2_{size_n}-tm_{cfgs.tile_m}"
         f"-bm_{'_'.join(map(str, cfgs.bucket_ms))}-p_{num_parts}-q_{down_parts}"
     )
     hbm = pl.BlockSpec(memory_space=pltpu.HBM)

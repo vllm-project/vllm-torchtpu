@@ -519,10 +519,16 @@ def _assert_mlp_bitwise(
     num_parts,
     down_parts=1,
     buckets=None,
+    tile_rows=None,
 ):
     group_sizes = jnp.asarray(sizes, jnp.int32)
     offset = jnp.asarray([group_offset], jnp.int32)
-    kwargs = dict(num_parts=num_parts, down_parts=down_parts, buckets=buckets)
+    kwargs = dict(
+        num_parts=num_parts,
+        down_parts=down_parts,
+        buckets=buckets,
+        tile_rows=tile_rows,
+    )
     assert mlp_supported(lhs, w1, s1, w2, s2, group_sizes, fuse_act="silu", **kwargs)
     expected = _two_call_mlp(lhs, w1, s1, w2, s2, group_sizes, offset)
     actual = gmm_v2_mlp(
@@ -547,15 +553,17 @@ def _assert_mlp_bitwise(
 
 
 @pytest.mark.parametrize(
-    "num_parts, down_parts, buckets",
+    "num_parts, down_parts, buckets, tile_rows",
     [
-        (1, 1, None),
-        (2, 1, None),
-        (4, 1, None),
-        (2, 2, None),
-        (2, 1, (64, 128, 192, 256)),
-        (4, 2, (16, 32, 256)),
-        (2, 1, (16, 256)),
+        (1, 1, None, None),
+        (2, 1, None, None),
+        (4, 1, None, None),
+        (2, 2, None, None),
+        # Row tiles as large as the gate/up kernel's.
+        (2, 1, (64, 128, 192, 256), 256),
+        (4, 2, (16, 32, 256), 256),
+        (2, 1, (16, 256), 256),
+        (2, 1, (16, 32), 32),
     ],
 )
 @pytest.mark.parametrize(
@@ -570,7 +578,7 @@ def _assert_mlp_bitwise(
     ],
 )
 def test_gmm_v2_mlp_matches_two_calls_bitwise(
-    size_m, sizes, group_offset, num_parts, down_parts, buckets
+    size_m, sizes, group_offset, num_parts, down_parts, buckets, tile_rows
 ):
     _require_tpu()
 
@@ -587,16 +595,19 @@ def test_gmm_v2_mlp_matches_two_calls_bitwise(
         num_parts,
         down_parts,
         buckets,
+        tile_rows,
     )
 
 
-@pytest.mark.parametrize("buckets", [None, (64, 128), (16, 32, 128)])
+@pytest.mark.parametrize(
+    "buckets, tile_rows", [(None, None), (None, 128), (16, 128), (64, 128)]
+)
 @pytest.mark.parametrize(
     "size_m, num_groups, num_rows",
     [(256, 16, 120), (960, 64, 120), (240, 64, 30)],
 )
 def test_gmm_v2_mlp_matches_two_calls_bitwise_served_shapes(
-    size_m, num_groups, num_rows, buckets
+    size_m, num_groups, num_rows, buckets, tile_rows
 ):
     _require_tpu()
 
@@ -608,7 +619,10 @@ def test_gmm_v2_mlp_matches_two_calls_bitwise_served_shapes(
     # Large activations drive some gate pre-activations below the sigmoid's
     # underflow, so the activation holds signed zeros.
     lhs = jax.random.uniform(jax.random.key(2), (size_m, 8192), jnp.bfloat16, -50, 50)
-    _assert_mlp_bitwise(lhs, w1, s1, w2, s2, sizes, 0, 2, buckets=buckets)
+    buckets = (buckets,) if buckets else None
+    _assert_mlp_bitwise(
+        lhs, w1, s1, w2, s2, sizes, 0, 2, buckets=buckets, tile_rows=tile_rows
+    )
 
 
 def test_gmm_v2_mlp_supported_shapes():
