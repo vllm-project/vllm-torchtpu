@@ -90,9 +90,10 @@ def test_matches_reference(
 
 @pytest.mark.parametrize("kernel", ["v1", "v2", "v3"])
 @pytest.mark.parametrize("dtype", CACHE_DTYPES)
-def test_lowers_for_tpu(dtype, kernel):
+@pytest.mark.parametrize("tokens", [64, 256])
+def test_lowers_for_tpu(tokens, dtype, kernel):
     """Pallas -> Mosaic lowering and verification run without a TPU."""
-    tokens, max_seqs, pages_per_seq = 256, 16, 2048
+    max_seqs, pages_per_seq = 16, 2048
     args = (
         jax.ShapeDtypeStruct((tokens, 1, HEAD_DIM), jnp.bfloat16),
         jax.ShapeDtypeStruct(
