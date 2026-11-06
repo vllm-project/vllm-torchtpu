@@ -15,7 +15,6 @@
 
 from __future__ import annotations
 
-import copy
 from collections.abc import Mapping
 from typing import Any
 
@@ -100,14 +99,6 @@ class GQAModule(Module):
             opts["weight_dtypes"] = self.weight_dtypes
         self._validate_options(opts)
         self.options = FrozenDict(opts)
-
-    def with_cache_layout(self, layout: Any) -> GQAModule:
-        """Return a shallow copy bound to `layout` when `pool_layout` differs."""
-        if self.pool_layout is layout:
-            return self
-        cloned = copy.copy(self)
-        cloned.pool_layout = layout
-        return cloned
 
     @classmethod
     def _validate_options(cls, options: Mapping[str, Any]) -> None:
