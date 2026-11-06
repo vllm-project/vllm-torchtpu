@@ -28,7 +28,9 @@ from tests.megakernel.conftest import register_megakernel_cpu_plugin
 _RUNTIME = "vllm_torchtpu.megakernel_runtime."
 
 # A built-in shorthand for tests: a stdlib-only template package on a temp
-# path, entered in `plugin.SHORTHANDS` (the table itself may be empty).
+# path, entered in `plugin.SHORTHANDS` (the table itself may be empty, and
+# model-folder discovery may be absent). Its top-level options are the
+# library runtime config's template keys; its `create` declines.
 FAKE_SHORTHAND = "mkfake"
 FAKE_TEMPLATE = "mk_fake_template"
 FAKE_ARCH = "MkFakeForCausalLM"
@@ -37,8 +39,29 @@ _FAKE_SPEC = """
 from vllm_torchtpu.megakernel.runtime.contract import TpuMonoSpec
 
 SPEC = TpuMonoSpec(
-    "mkfake", "1", create=".adapter:create", top_level_options={"mode", "profile"}
+    "mkfake",
+    "1",
+    create=".adapter:create",
+    decline_codes=("mkfake_declined",),
+    top_level_options={
+        "profile",
+        "mode",
+        "buckets",
+        "verify_buckets",
+        "fused_pool_io",
+        "fused_pool_io_max_b",
+        "fused_pool_io_min_b_hi",
+        "pool_gather",
+        "compile_hlo_check",
+    },
 )
+"""
+_FAKE_ADAPTER = """
+from vllm_torchtpu.megakernel.runtime.contract import Decline
+
+
+def create(view, options):
+    return Decline("mkfake_declined", "the fake template serves nothing")
 """
 
 
@@ -69,9 +92,11 @@ def mk_fake_template(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterato
     pkg = tmp_path / "fake_template" / FAKE_TEMPLATE
     pkg.mkdir(parents=True)
     (pkg / "__init__.py").write_text(_FAKE_SPEC, encoding="utf-8")
+    (pkg / "adapter.py").write_text(_FAKE_ADAPTER, encoding="utf-8")
     monkeypatch.syspath_prepend(str(pkg.parent))
     importlib.invalidate_caches()
     entry = plugin.Shorthand(FAKE_TEMPLATE, (FAKE_ARCH,), (FAKE_MODEL_TYPE,))
     monkeypatch.setitem(plugin.SHORTHANDS, FAKE_SHORTHAND, entry)
     yield FAKE_SHORTHAND
-    sys.modules.pop(FAKE_TEMPLATE, None)
+    for name in (FAKE_TEMPLATE, f"{FAKE_TEMPLATE}.adapter"):
+        sys.modules.pop(name, None)
