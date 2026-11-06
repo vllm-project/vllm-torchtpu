@@ -92,6 +92,8 @@ def select_blocks(
         raise NotImplementedError(
             f"MSA block selection expects one index head per rank, got {num_heads}."
         )
+    # Decode batches hold far fewer tokens than a full row tile.
+    block_rows = min(block_rows, max(8, -(-num_tokens // 8) * 8))
     pad = -num_tokens % block_rows
     s = jnp.pad(scores[:, 0], ((0, pad), (0, 0)))
     p = jnp.pad(pos, (0, pad))[:, None]
