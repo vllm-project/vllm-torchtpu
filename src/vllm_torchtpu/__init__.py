@@ -540,10 +540,7 @@ def _patch_vllm_compile_all_ranges() -> None:
             compile_rotated(pairs, local_rank)
             return
 
-        from vllm_torchtpu.compilation.tpu_compiler import (
-            PEER_WAIT_S,
-            wait_for_peer_artifact,
-        )
+        from vllm_torchtpu.compilation.tpu_compiler import wait_for_peer_artifact
 
         host = host_slot()
         if host is None:
@@ -574,7 +571,7 @@ def _patch_vllm_compile_all_ranges() -> None:
 
         for backend, range_entry in mine:
             compile_entry(backend, range_entry)
-        with wait_for_peer_artifact(PEER_WAIT_S):
+        with wait_for_peer_artifact(envs.TPU_PRECOMPILE_PEER_WAIT_S):
             for _, _, backend, range_entry in sorted(others, key=lambda o: o[:2]):
                 compile_entry(backend, range_entry)
 
@@ -769,6 +766,8 @@ def _patch_vllm_offloading_config_build() -> None:
     hybrid configs ``build_offloading_config`` trips its own
     ``tokens_per_block % tokens_per_hash`` assert (the PCP-patched resolve
     returns logical hash sizes while the group sizes stay rank-local).
+    Each group's ``sliding_window_size_in_chunks`` is recomputed against the
+    logical chunk span for the same reason.
     """
     import sys
     from dataclasses import replace
@@ -776,6 +775,7 @@ def _patch_vllm_offloading_config_build() -> None:
     from vllm.distributed.kv_transfer.kv_connector.v1.offloading import (
         config as offloading_config_module,
     )
+    from vllm.v1.kv_cache_interface import iter_layer_specs
 
     if getattr(offloading_config_module, "_tpu_offloading_config_patch", False):
         return
@@ -811,12 +811,25 @@ def _patch_vllm_offloading_config_build() -> None:
         _, tokens_per_hash = kv_cache_utils.resolve_kv_cache_block_sizes(
             kv_cache_config, vllm_config
         )
+        blocks_per_chunk = config.cache.blocks_per_chunk
+
+        def logical_group(group):
+            tokens_per_block = group.tokens_per_block * pcp
+            group_spec = kv_cache_config.kv_cache_groups[group.group_id].kv_cache_spec
+            layer_spec = next(iter(iter_layer_specs(group_spec)))
+            return replace(
+                group,
+                tokens_per_block=tokens_per_block,
+                sliding_window_size_in_chunks=(
+                    offloading_config_module.get_sliding_window_size_in_chunks(
+                        layer_spec, tokens_per_block * blocks_per_chunk
+                    )
+                ),
+            )
+
         config = replace(
             config,
-            groups=tuple(
-                replace(group, tokens_per_block=group.tokens_per_block * pcp)
-                for group in config.groups
-            ),
+            groups=tuple(logical_group(group) for group in config.groups),
             cache=replace(config.cache, tokens_per_hash=tokens_per_hash),
         )
         for group in config.groups:
@@ -936,7 +949,7 @@ def _patch_vllm_hybrid_pcp_block_sizes() -> None:
     from dataclasses import replace
 
     from vllm.utils.math_utils import cdiv
-    from vllm.v1.core import kv_cache_coordinator, kv_cache_utils
+    from vllm.v1.core import kv_cache_coordinator, kv_cache_planning, kv_cache_utils
     from vllm.v1.kv_cache_interface import (
         AttentionSpec,
         FullAttentionSpec,
@@ -1091,6 +1104,7 @@ def _patch_vllm_hybrid_pcp_block_sizes() -> None:
             scheduler_block_size,
             hash_block_size,
             metrics_collector=None,
+            num_hash_lookahead_tokens=0,
             num_prefill_lookahead=0,
             allow_partial_hash_hits: bool = True,
             **kwargs,
@@ -1164,6 +1178,7 @@ def _patch_vllm_hybrid_pcp_block_sizes() -> None:
                 scheduler_block_size,
                 hash_block_size,
                 metrics_collector,
+                num_hash_lookahead_tokens=num_hash_lookahead_tokens,
                 num_prefill_lookahead=num_prefill_lookahead,
                 allow_partial_hash_hits=allow_partial_hash_hits,
                 **kwargs,
@@ -1198,26 +1213,25 @@ def _patch_vllm_hybrid_pcp_block_sizes() -> None:
     # uniform KV cache spec across groups, raising ValueError when encountering
     # heterogeneous layer configurations (e.g. hybrid attention/Mamba models,
     # pure linear state layers, or disaggregated PCP configurations with
-    # per-group block sizing). We patch it to catch ValueError and return an
-    # empty dict so initialization falls back cleanly to the TPU hybrid/PCP
-    # cache coordinator without crashing.
-    original_promote = getattr(kv_cache_utils, "_promote_local_kv_cache_specs", None)
-    if original_promote is not None and not getattr(
-        original_promote, "_tpu_hybrid_promote_patch", False
-    ):
+    # per-group block sizing). We patch it to catch ValueError and return the
+    # unmodified kv_cache_spec dict so initialization falls back cleanly to the
+    # TPU hybrid/PCP cache coordinator without crashing or logging a false
+    # promotion warning.
+    from vllm.v1.kv_cache_interface import KVCacheSpec
 
-        def patched_promote(specs):
+    original_promote = kv_cache_planning._promote_local_kv_cache_specs
+    if not getattr(original_promote, "_tpu_hybrid_promote_patch", False):
+
+        def patched_promote(
+            kv_cache_spec: dict[str, KVCacheSpec],
+        ) -> dict[str, KVCacheSpec]:
             try:
-                return original_promote(specs)
+                return original_promote(kv_cache_spec)
             except ValueError:
-                return {}
+                return kv_cache_spec
 
         patched_promote._tpu_hybrid_promote_patch = True
-        kv_cache_utils._promote_local_kv_cache_specs = patched_promote
-        for module_name in ("vllm.v1.engine.core", "vllm.v1.core.kv_cache_utils"):
-            mod = sys.modules.get(module_name)
-            if mod is not None and hasattr(mod, "_promote_local_kv_cache_specs"):
-                mod._promote_local_kv_cache_specs = patched_promote
+        kv_cache_planning._promote_local_kv_cache_specs = patched_promote
 
     if not getattr(EngineCoreProc, "_tpu_engine_core_patch_wrapper", False):
         EngineCoreProc._tpu_original_run_engine_core = EngineCoreProc.run_engine_core
@@ -1461,7 +1475,7 @@ def _patch_vllm_dcp_fine_prefix_hits() -> None:
         self.pcp_world_size = init_args["pcp_world_size"]
         self.block_size = manager.block_size
         self.hash_block_size = hash_block_size
-        manager.use_eagle = 0 in self.eagle_group_ids
+        manager.use_eagle = 0 in self.drop_eagle_group_ids
         if not type(manager).supports_fine_grained_hash_lookup:
             raise ValueError(
                 f"{type(manager).__name__} does not support prefix hits finer "
@@ -1474,7 +1488,7 @@ def _patch_vllm_dcp_fine_prefix_hits() -> None:
             )
         # EAGLE/MTP drops one hash unit (not a whole block) from each hit; it
         # must still cover the multi-module prefill lookahead.
-        if self.eagle_group_ids and hash_block_size < num_prefill_lookahead:
+        if self.drop_eagle_group_ids and hash_block_size < num_prefill_lookahead:
             raise ValueError(
                 f"prefix_match_unit={hash_block_size} must be >= "
                 f"num_speculative_tokens={num_prefill_lookahead}."
@@ -1497,7 +1511,7 @@ def _patch_vllm_dcp_fine_prefix_hits() -> None:
             kv_cache_group_ids=[0],
             block_pool=self.block_pool,
             kv_cache_spec=self.kv_cache_spec,
-            drop_eagle_block=0 in self.eagle_group_ids,
+            drop_eagle_block=0 in self.drop_eagle_group_ids,
             alignment_tokens=self.hash_block_size,
             dcp_world_size=self.dcp_world_size,
             pcp_world_size=self.pcp_world_size,
@@ -1770,83 +1784,17 @@ def _patch_dflash_bypass_v2_runner_check() -> None:
     logger.info("Applied TPU patch: bypass DFlash V2 runner check on TPU.")
 
 
-def _patch_dflash_drafting_slot_budget() -> None:
-    """Stop charging DFlash/DSpark drafting slots against the token budget.
-
-    vLLM's scheduler charges every scheduled request
-    ``SpeculativeConfig.max_num_new_slots_for_drafting`` tokens (K for DFlash,
-    K - 1 for DSpark) against ``max_num_batched_tokens``, for drafters that
-    append those slots to the target's tokens in one forward. The TPU
-    DFlashProposer drafts ``num_reqs * block_size`` tokens in a separate
-    forward, so the charge only takes tokens away from prefill; return 0 for
-    these methods. Other methods keep the upstream value.
-
-    Without the charge, a request scheduled fewer than ``block_size`` tokens
-    still drafts a full block, so a step's draft can outgrow the largest
-    target bucket; ``DFlashProposer._draft_token_paddings`` covers that.
-    """
-    # TODO: let the platform declare the per-request drafting slots upstream
-    # instead of overriding the SpeculativeConfig property here.
-    from functools import wraps
-
-    from vllm.config.speculative import SpeculativeConfig
-
-    upstream = SpeculativeConfig.__dict__["max_num_new_slots_for_drafting"]
-    assert isinstance(upstream, property) and upstream.fget is not None
-    if getattr(upstream.fget, "_tpu_drafting_slots_patch", False):
-        return
-    upstream_fget = upstream.fget
-
-    @wraps(upstream_fget)
-    def max_num_new_slots_for_drafting(self) -> int:
-        # Methods tpu_runner serves with DFlashProposer or its DSpark subclass.
-        if self.method in ("dflash", "dspark"):
-            return 0
-        return upstream_fget(self)
-
-    setattr(max_num_new_slots_for_drafting, "_tpu_drafting_slots_patch", True)  # noqa: B010
-    SpeculativeConfig.max_num_new_slots_for_drafting = property(
-        max_num_new_slots_for_drafting
-    )
-    logger.info("Applied TPU patch: DFlash/DSpark drafting slots are not charged.")
-
-
-def _patch_vllm_config_triton_tpu() -> None:
-    """Bypass V2 model runner Triton check on TPU.
-
-    The config forces use_v2_model_runner=True for hybrid DFlash drafters.
-    When it validates V2, it crashes on TPU because HAS_TRITON is False.
-    TPU uses TPUModelRunner instead, so we can safely bypass this.
-    """
-    from vllm.config.vllm import VllmConfig
-
-    if getattr(VllmConfig, "_tpu_triton_patch_applied", False):
-        return
-
-    original_validate = VllmConfig._validate_v2_model_runner
-
-    def patched_validate(self):
-        if (
-            getattr(self, "device_config", None)
-            and self.device_config.device_type == "tpu"
-        ):
-            return
-        return original_validate(self)
-
-    VllmConfig._validate_v2_model_runner = patched_validate
-    VllmConfig._tpu_triton_patch_applied = True
-    logger.info("Applied TPU patch: bypass V2 model runner Triton check.")
-
-
 def _patch_vllm_force_v1_runner_tpu() -> None:
     """Keep TPU's V1 scheduler contract and validate its own capabilities.
 
     vLLM 0.29 defaults to GPU Model Runner V2 when Triton is available and
     rejects GPU V2-only features when V1 is selected. TPUModelRunner owns
-    PCP, DSpark, and mixed-attention DFlash implementations, but consumes
-    V1-shaped scheduler output. Keep that default regardless of Triton and
-    remove only those implemented features from the native V1 rejection
-    list. The other native checks and TPU's combination checks still apply.
+    PCP, DSpark (with adaptive verification), and mixed-attention DFlash
+    implementations, but consumes V1-shaped scheduler output. Keep that
+    default regardless of Triton and remove only those implemented features
+    from the native V1 rejection list. The other native checks and TPU's
+    combination checks still apply. Adaptive verification's native check
+    requires full CUDA graphs, so TPU validates it against its own runner.
     An explicit VLLM_USE_V2_MODEL_RUNNER retains upstream precedence.
     """
     from collections.abc import Callable
@@ -1886,16 +1834,32 @@ def _patch_vllm_force_v1_runner_tpu() -> None:
         if device_config is None or device_config.device_type != "tpu":
             return unsupported
         # These are limitations of the upstream GPU V1 runner. Do not bypass
-        # the validator: adaptive verification, DFlash2, and future features
-        # must remain rejected until TPU implements them.
+        # the validator: DFlash2 and future features must remain rejected
+        # until TPU implements them. Adaptive verification is DSpark-only.
         implemented = {
             "prefill context parallel",
             "dspark speculative decoding",
             "mixed sliding/full dflash drafts",
         }
+        spec = self.speculative_config
+        if spec is not None and spec.method == "dspark":
+            implemented.add("adaptive draft verification")
         return [feature for feature in unsupported if feature not in implemented]
 
+    original_validate_adaptive = VllmConfig._validate_adaptive_verification
+
+    def patched_validate_adaptive(self):
+        device_config = getattr(self, "device_config", None)
+        if device_config is None or device_config.device_type != "tpu":
+            return original_validate_adaptive(self)
+        from vllm_torchtpu.spec_decode.adaptive_verification import (
+            validate_adaptive_verification_config,
+        )
+
+        validate_adaptive_verification_config(self)
+
     VllmConfig._get_v1_model_runner_unsupported_features = patched_unsupported
+    VllmConfig._validate_adaptive_verification = patched_validate_adaptive
     VllmConfig.use_v2_model_runner = property(patched_use_v2)
     VllmConfig._tpu_force_v1_runner_patch = True
     logger.info("Applied TPU patch: force V1 model runner semantics on TPU.")
@@ -1935,42 +1899,6 @@ if "proxy" in envs.JAX_PLATFORMS:
         logger.error(
             "Error occurred while importing pathwaysutils or logging TPU info: %s", e
         )
-
-
-def _patch_vllm_block_pool_lifo_free() -> None:
-    """Restore pre-#48017 LIFO block reuse when prefix caching is off.
-
-    vllm a82f1b38 switched hashless freed blocks from prepend (LIFO reuse
-    of a small hot set of block ids) to append (FIFO) when prefix caching
-    is disabled. On TPU v7x the FIFO order cycles the entire KV block-id
-    space under sustained load and an indexed SparseCore-offloaded op on
-    the paged-KV path traps with E0200 RuntimeUnexpectedCoreHalt (UserFatal
-    on SC2). Bisect evidence: docs/sc2-sparsecore-halt-2026-08.md on branch
-    mhhua/sc2-sparsecore-halt-evidence, vllm-torchtpu-dev builds 136-146.
-    Behavior with prefix caching enabled is unchanged. Remove once the
-    SparseCore index handling is fixed in the TPU runtime.
-    """
-    from vllm.v1.core.block_pool import BlockPool
-
-    if BlockPool.__dict__.get("_tpu_lifo_free_patch", False):
-        return
-
-    def free_blocks(self, ordered_blocks) -> None:
-        blocks_with_hash = []
-        blocks_without_hash = []
-        for block in ordered_blocks:
-            block.ref_cnt -= 1
-            if block.ref_cnt == 0 and not block.is_null:
-                if block.block_hash is None:
-                    blocks_without_hash.append(block)
-                else:
-                    blocks_with_hash.append(block)
-        self.free_block_queue.prepend_n(blocks_without_hash)
-        self.free_block_queue.append_n(blocks_with_hash)
-
-    BlockPool.free_blocks = free_blocks
-    BlockPool._tpu_lifo_free_patch = True
-    logger.info("Applied LIFO free-block patch (pre-vllm#48017 order) to BlockPool")
 
 
 def _patch_vllm_abort_on_preemption() -> None:

@@ -25,10 +25,9 @@ import dataclasses
 import math
 import os
 import time
-from collections.abc import Callable, Collection, Iterator
+from collections.abc import Callable, Collection, Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from importlib import metadata as importlib_metadata
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, Concatenate, cast
 
@@ -62,11 +61,9 @@ from vllm.forward_context import set_forward_context
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.mamba.abstract import MambaBase
 from vllm.model_executor.layers.rotary_embedding import (
+    DeepseekScalingRotaryEmbedding,
     MRotaryEmbedding,
     RotaryEmbedding,
-)
-from vllm.model_executor.layers.rotary_embedding.mrope_interleaved import (
-    MRotaryEmbeddingInterleaved,
 )
 from vllm.model_executor.model_loader import get_model_loader
 from vllm.model_executor.models import supports_lora
@@ -109,6 +106,10 @@ from vllm_torchtpu.distributed.kv_transfer.tpu_connector_stats import (
 from vllm_torchtpu.distributed.pp_push import ring_handoff
 from vllm_torchtpu.distributed.pp_ring import PPRing, hbm_reserve_bytes
 from vllm_torchtpu.distributed.pp_wave import PPWave, pp_rank_flags
+from vllm_torchtpu.gdn_pool_layout import (
+    PrefillCheckpointUnits,
+    prefill_checkpoint_enabled,
+)
 from vllm_torchtpu.kernels.experimental.batched_rpa import configs as rpa_configs
 from vllm_torchtpu.kernels.experimental.batched_rpa import wrapper as rpa_batched
 from vllm_torchtpu.kernels.mla import dispatch as mla_dispatch
@@ -187,6 +188,10 @@ from vllm_torchtpu.runner.tpu_runner_async_output import (
     AsyncTPUModelRunnerOutput,
     SpecLogprobsChunk,
 )
+from vllm_torchtpu.spec_decode.adaptive_verification import (
+    AdaptiveVerificationManager,
+    StepCostTable,
+)
 from vllm_torchtpu.spec_decode.dflash import DFlashProposer
 from vllm_torchtpu.spec_decode.dspark import DSparkProposer
 from vllm_torchtpu.spec_decode.eagle3 import Eagle3Proposer
@@ -197,6 +202,7 @@ from vllm_torchtpu.spec_decode.utils import (
     normalize_draft_config,
 )
 from vllm_torchtpu.structured_decoding import StructuredDecodingManager
+from vllm_torchtpu.tpu_info import get_libtpu_version, get_tpu_library_path
 from vllm_torchtpu.tracing.annotation import TraceAnnotation
 from vllm_torchtpu.tracing.options import resolve_profile_dir_and_opts
 from vllm_torchtpu.tracing.utils import (
@@ -451,6 +457,15 @@ def _rotate_precompile_sweep(items: Collection[Any], sweep: str) -> list[Any]:
     return items[start:] + items[:start]
 
 
+def _spec_warmup_num_output_tokens(requests: Any, req_ids: list[str]) -> list[int]:
+    """Report each synthetic request's current output length.
+
+    A smaller count truncates the request back to it, which under async
+    scheduling drops the optimistic placeholders the next rollback expects.
+    """
+    return [len(requests[req_id].output_token_ids) for req_id in req_ids]
+
+
 def _spec_warmup_all_token_ids(
     req_ids: list[str], num_computed_tokens: list[int]
 ) -> dict[str, list[int]]:
@@ -496,9 +511,9 @@ def _build_kv_connector_output(
 ) -> KVConnectorOutput:
     """Build the runner's KVConnectorOutput.
 
-    ``failed_recving`` needs vLLM >= 0.31 (the pin is v0.32.0).
+    ``failed_recving`` needs vLLM >= 0.31 (the pin is v0.33.0).
     ``invalid_block_group_index`` is passed only when ``KVConnectorOutput``
-    has it. v0.32.0 does not, so it rejects block-level load failures on
+    has it. v0.33.0 does not, so it rejects block-level load failures on
     multi-group KV layouts; connectors for those layouts must report failed
     requests through ``failed_recving``.
     """
@@ -526,7 +541,24 @@ def _get_sequence_layout_planner_for_runner(runner: Any):
 
 def _validate_libtpu_version() -> None:
     """Validate libtpu opportunistically if it is present."""
-    libtpu_version = importlib_metadata.version("libtpu")
+    library_path = get_tpu_library_path()
+    if library_path is not None:
+        # JAX loads TPU_LIBRARY_PATH in preference to the pip package and
+        # treats a custom library as head, so its version is not checkable.
+        logger.warning_once(
+            "Using the libtpu library at TPU_LIBRARY_PATH=%s; skipping the "
+            "libtpu package version check.",
+            library_path,
+        )
+        return
+    libtpu_version = get_libtpu_version()
+    if libtpu_version is None:
+        logger.warning_once(
+            "libtpu package metadata not found (TPU_LIBRARY_PATH=%s); "
+            "skipping the libtpu version check.",
+            envs.TPU_LIBRARY_PATH or "",
+        )
+        return
     parsed_version = version.parse(libtpu_version)
     if parsed_version < version.parse("0.0.35"):
         raise RuntimeError("Argmax is having accuracy issue with libtpu < 0.0.35")
@@ -632,9 +664,13 @@ class TPUModelRunner(GPUModelRunner):
     # pyrefly: ignore[bad-override-mutable-attribute]
     input_ids: torch.Tensor
     empty_slot_mappings: dict[int, torch.Tensor]
-    # Default for a runner built without __init__.
+    # Defaults for a runner built without __init__.
     _pp_wave: PPWave | PPRing | None = None
     _dp_step_other_decode: bool = False
+    _adaptive_verification: AdaptiveVerificationManager | None = None
+    # 1.0 on TP rank 0, else 0.0; set when TP > 1. Kept apart from the draft
+    # pin's mask, whose dtype follows the draft tokens.
+    _tp_rank0_confidence_mask: torch.Tensor | None = None
 
     @property
     def _async_drafter(self) -> DFlashProposer | Eagle3Proposer:
@@ -817,6 +853,11 @@ class TPUModelRunner(GPUModelRunner):
         self._mamba_ckpt_window: int = (
             num_ckpts if unified_kv_layout_enabled(self.vllm_config) else 1
         )
+        # Set by initialize_kv_cache when Mamba groups declare prefill
+        # checkpoint blocks.
+        self._prefill_ckpt_units: PrefillCheckpointUnits | None = None
+        self._prefill_ckpt_offsets_cpu: torch.Tensor | None = None
+        self._prefill_ckpt_zero_offsets: dict[int, torch.Tensor] = {}
         # True once the slot pool is initialized (hybrid model with mamba
         # layers); gates per-step mamba_state_indices construction.
         self._has_mamba_state: bool = False
@@ -1377,22 +1418,24 @@ class TPUModelRunner(GPUModelRunner):
                 )
 
     def _relayout_tables(self, model: torch.nn.Module | None) -> None:
-        """Give ``model`` the row-major table layouts the env knobs ask for.
+        """Give ``model`` the table shapes and row-major layouts the env knobs ask for.
 
-        ``load_model`` relayouts the target inline; this applies the same to
-        the draft, which feeds the same cached Pallas ops and so must share
-        the target's table layout.
+        ``load_model`` truncates and relayouts the target inline; this applies
+        the same to the draft, which feeds the same cached Pallas ops and so
+        must share the target's table shape and layout.
         """
         if model is None:
             return
+        if envs.TPU_ROPE_CACHE_TRUNCATE:
+            self._truncate_rope_caches(model)
         if envs.TPU_ROPE_CACHE_ROW_MAJOR:
             runner_utils.relayout_rope_caches(model)
         if envs.TPU_MOE_HASH_TABLE_ROW_MAJOR:
             runner_utils.relayout_hash_tables(model)
 
-    def _truncate_rope_caches(self) -> None:
-        """Slice rotary cos_sin caches to max_model_len which can reduce
-        the overhead of xla layout data copy. Applicable to text-only.
+    def _truncate_rope_caches(self, model: torch.nn.Module) -> None:
+        """Slice rotary cos_sin caches to max_model_len (plus speculative slack)
+        which can reduce the overhead of xla layout data copy. Applicable to text-only.
         """
         multimodal_config = self.model_config.multimodal_config
         if self.model_config.is_multimodal_model and not (
@@ -1403,18 +1446,31 @@ class TPUModelRunner(GPUModelRunner):
                 "not bounded by max_model_len"
             )
             return
+        spec_cfg = self.speculative_config
+        spec_tokens = int(getattr(spec_cfg, "num_speculative_tokens", 0) or 0)
         max_len = self.model_config.max_model_len
+        if spec_tokens > 0:
+            # K > 1 MTP/EAGLE draft steps advance positions past max_model_len - 1
+            # without clamping; keep speculative slack rounded up to an 8-row
+            # sublane multiple so unchecked Pallas HBM DMAs (e.g. DeepSeek-V4
+            # RoPE) stay in bounds and sublane-aligned.
+            max_len = cdiv(max_len + spec_tokens, 8) * 8
         num_eligible = 0
         num_truncated = 0
-        for name, module in self.model.named_modules():
+        # Share one truncated tensor across modules that share a buffer.
+        truncated_by_id: dict[int, torch.Tensor] = {}
+        for name, module in model.named_modules():
             # isinstance, not an exact type match: on TPU these are the
-            # out-of-tree subclasses from layers/adapter/rotary_embedding.py.
+            # out-of-tree subclasses from layers/adapter/rotary_embedding.py
+            # and layers/adapter/custom_ops/mla_attention_op.py. DeepSeek
+            # scaling (YaRN for MLA models, and DeepSeek-V4's subclass)
+            # derives from RotaryEmbeddingBase, not RotaryEmbedding.
             if not isinstance(
                 module,
                 (
                     RotaryEmbedding,
                     MRotaryEmbedding,
-                    MRotaryEmbeddingInterleaved,
+                    DeepseekScalingRotaryEmbedding,
                 ),
             ):
                 continue
@@ -1424,9 +1480,13 @@ class TPUModelRunner(GPUModelRunner):
                     continue
                 num_eligible += 1
                 if buf.ndim >= 1 and buf.shape[0] > max_len:
-                    truncated = buf[:max_len].clone(
-                        memory_format=torch.contiguous_format
-                    )
+                    buf_id = id(buf)
+                    truncated = truncated_by_id.get(buf_id)
+                    if truncated is None:
+                        truncated = buf[:max_len].clone(
+                            memory_format=torch.contiguous_format
+                        )
+                        truncated_by_id[buf_id] = truncated
                     setattr(module, buf_name, truncated)
                     num_truncated += 1
                     logger.info(
@@ -1437,7 +1497,12 @@ class TPUModelRunner(GPUModelRunner):
                         max_len,
                     )
         if num_eligible:
-            logger.info("Truncated %d of %d rope caches", num_truncated, num_eligible)
+            logger.info(
+                "Truncated %d of %d rope caches (%d unique buffers)",
+                num_truncated,
+                num_eligible,
+                len(truncated_by_id),
+            )
         else:
             logger.warning(
                 "TPU_ROPE_CACHE_TRUNCATE is set but the model has no "
@@ -1781,8 +1846,91 @@ class TPUModelRunner(GPUModelRunner):
             return self.kv_cache_manager.get_kv_cache_spec()
 
     def initialize_kv_cache(self, kv_cache_config: KVCacheConfig) -> None:
+        self._init_prefill_checkpoint_units(kv_cache_config)
         with set_current_vllm_config(self.vllm_config):
             self.kv_cache_manager.initialize_kv_cache(kv_cache_config)
+
+    def _init_prefill_checkpoint_units(self, kv_cache_config: KVCacheConfig) -> None:
+        """Initializes the units the worker places prefill checkpoints with.
+
+        They must match the engine core's: the hash block and cache-hit
+        alignment it resolved into kv_cache_config, the Mamba block at the
+        column stride the metadata builder reads the block table with, the eagle
+        bit including the TPU override, and the lookahead block hashes, which
+        replace the eagle drop.
+        """
+        self._prefill_ckpt_units = None
+        self._prefill_ckpt_offsets_cpu = None
+        self._prefill_ckpt_zero_offsets = {}
+        if not prefill_checkpoint_enabled(self.vllm_config):
+            return
+        specs = [
+            group.kv_cache_spec
+            for group in kv_cache_config.kv_cache_groups
+            if isinstance(group.kv_cache_spec, MambaSpec)
+            and group.kv_cache_spec.num_prefill_checkpoint_blocks > 0
+        ]
+        if not specs:
+            return
+        alignments = {spec.prefill_checkpoint_alignment for spec in specs}
+        block_sizes = {spec.block_size for spec in specs}
+        if len(alignments) != 1 or len(block_sizes) != 1:
+            raise ValueError(
+                "Mamba groups with prefill checkpoint blocks must share one "
+                f"alignment and block size: alignments={alignments}, "
+                f"block sizes={block_sizes}."
+            )
+        (alignment,) = alignments
+        assert alignment is not None
+        hash_block_size = kv_cache_config.hash_block_size
+        cache_hit_alignment_tokens = kv_cache_config.cache_hit_alignment_tokens
+        if hash_block_size is None or cache_hit_alignment_tokens is None:
+            # MambaManager reserves a checkpoint block either way; a worker
+            # that skipped the export would leave it hashed but unwritten.
+            raise ValueError(
+                "GDN prefill checkpoints need the hash_block_size and "
+                "cache_hit_alignment_tokens the engine core resolves into "
+                f"kv_cache_config; got {hash_block_size=} "
+                f"{cache_hit_alignment_tokens=}."
+            )
+        speculative_config = self.vllm_config.speculative_config
+        num_hash_lookahead_tokens = self.vllm_config.num_hash_lookahead_tokens
+        units = PrefillCheckpointUnits(
+            hash_block_size=hash_block_size,
+            cache_hit_alignment_tokens=cache_hit_alignment_tokens,
+            mamba_block_size=specs[0].block_size * get_pcp_group().world_size,
+            alignment=alignment,
+            drop_eagle_block=(
+                speculative_config is not None
+                and speculative_config.use_eagle_block_drop()
+                and not num_hash_lookahead_tokens
+            ),
+            num_hash_lookahead_tokens=num_hash_lookahead_tokens,
+        )
+        self._prefill_ckpt_units = units
+        self._prefill_ckpt_offsets_cpu = torch.zeros(
+            self.max_num_reqs, dtype=torch.int32, device="cpu", pin_memory=PIN_MEMORY
+        )
+        logger.info(
+            "GDN internal prefill checkpoints enabled: hash_block_size=%d "
+            "cache_hit_alignment_tokens=%d mamba_block_size=%d alignment=%d "
+            "drop_eagle_block=%s num_hash_lookahead_tokens=%d",
+            units.hash_block_size,
+            units.cache_hit_alignment_tokens,
+            units.mamba_block_size,
+            units.alignment,
+            units.drop_eagle_block,
+            units.num_hash_lookahead_tokens,
+        )
+
+    def _dummy_prefill_ckpt_offsets(self, num_reqs: int) -> torch.Tensor:
+        """Returns cached all-zero prefill checkpoint offsets for a dummy batch
+        bucket of size num_reqs."""
+        offsets = self._prefill_ckpt_zero_offsets.get(num_reqs)
+        if offsets is None:
+            offsets = torch.zeros((num_reqs,), dtype=torch.int32).to(self.device)
+            self._prefill_ckpt_zero_offsets[num_reqs] = offsets
+        return offsets
 
     def get_kv_prewarm_shapes(self) -> list[int]:
         return self.kv_cache_manager.get_kv_prewarm_shapes()
@@ -2878,6 +3026,96 @@ class TPUModelRunner(GPUModelRunner):
             off += n
         return out
 
+    def _scheduled_draft_counts(
+        self,
+        req_offset: int,
+        num_reqs: int,
+        padded_num_reqs: int,
+        md: SpecDecodeMetadata | None,
+    ) -> torch.Tensor | None:
+        """Each chunk row's scheduled draft count, or None when adaptive
+        verification trimmed none of the chunk's drafts.
+
+        The scheduler advanced positions by every draft it scheduled, so the
+        async rollback counts a trimmed draft as rejected."""
+        manager = self._adaptive_verification
+        if manager is None or not manager.step_trimmed:
+            return None
+        req_ids = cast(
+            list[str], self.input_batch.req_ids[req_offset : req_offset + num_reqs]
+        )
+        trimmed = np.fromiter(
+            (manager.step_trimmed.get(r, 0) for r in req_ids),
+            dtype=np.int32,
+            count=num_reqs,
+        )
+        if not trimmed.any():
+            return None
+        if md is not None:
+            trimmed += md.draft_lengths_cpu
+        counts = zeros_h2d_source(self, padded_num_reqs)
+        counts[:num_reqs] = torch.from_numpy(trimmed)
+        # The copy is asynchronous, so the staging fence keeps its CPU source.
+        return stage_h2d_upload(self, counts)
+
+    def _record_draft_confidences(self) -> None:
+        """Hand this step's proposal confidences to adaptive verification."""
+        manager = self._adaptive_verification
+        assert manager is not None and isinstance(self.drafter, DSparkProposer)
+        confidences = self.drafter.take_draft_confidences()
+        if confidences is None:
+            return
+        chunks = confidences.chunks
+        if self._tp_rank0_confidence_mask is not None:
+            # Every TP rank must trim alike, and drafters do not promise
+            # bit-identical confidences across ranks.
+            chunks = [
+                self._tpu_pin_drafts_to_rank0(c, self._tp_rank0_confidence_mask)
+                for c in chunks
+            ]
+        req_ids = [
+            cast(str, req_id)
+            for start, num_reqs in confidences.spans
+            for req_id in self.input_batch.req_ids[start : start + num_reqs]
+        ]
+        manager.record_confidences(
+            req_ids, chunks, [num_reqs for _, num_reqs in confidences.spans]
+        )
+
+    def _readmit_trimmed_drafts(
+        self,
+        scheduler_output: "SchedulerOutput",
+        local_num_chunks: int,
+        target_num_chunks: int,
+    ) -> "tuple[SchedulerOutput, int, int] | None":
+        """Under DP lockstep, carry this rank's trimmed drafts in the padding
+        of the DP-wide bucket (`AdaptiveVerificationManager.expand`).
+
+        Returns the expanded scheduler output, with the input batch's spec
+        tokens and segment order updated to it, and its
+        `(num_decode, num_windowed)` split; None when nothing changes."""
+        manager = self._adaptive_verification
+        if (
+            manager is None
+            or self._dp_target_bucket is None
+            or not local_num_chunks == target_num_chunks == 1
+        ):
+            return None
+        expanded = manager.expand(
+            self._dp_target_bucket - scheduler_output.total_num_scheduled_tokens
+        )
+        if expanded is None:
+            return None
+        scheduler_output, changed_req_ids = expanded
+        for req_id in changed_req_ids:
+            self.input_batch.update_req_spec_token_ids(
+                self.requests[req_id], scheduler_output.scheduled_spec_decode_tokens
+            )
+        num_decode_reqs, num_windowed_reqs = self._reorder_batch_for_rpa(
+            scheduler_output
+        )
+        return scheduler_output, num_decode_reqs, num_windowed_reqs
+
     def _assemble_async_spec_substitution(self, drafts, next_tokens_per_chunk, state):
         """Async-spec substitution assembler.
 
@@ -2922,21 +3160,25 @@ class TPUModelRunner(GPUModelRunner):
             src = assemble_spec_next_tokens(
                 nt_chunk, drafts_chunk, None if bucketed else num_reqs
             )
+            scheduled = self._scheduled_draft_counts(
+                req_offset, num_reqs, chunk_padded_num_reqs, md
+            )
             if md is not None:
-                num_rejected_chunks.append(
-                    compute_num_rejected(
-                        nt_chunk, fit_rows(md.draft_lengths, chunk_padded_num_reqs)
-                    )
-                )
+                if scheduled is None:
+                    scheduled = fit_rows(md.draft_lengths, chunk_padded_num_reqs)
+                num_rejected_chunks.append(compute_num_rejected(nt_chunk, scheduled))
                 for r in range(num_reqs):
                     num_draft_per_req[req_offset + r] = int(md.draft_lengths_cpu[r])
             else:
-                # No drafts were verified this step, so there is no rejection
-                # correction or speculative output-placeholder rollback.
+                # No drafts were verified this step, so there is no
+                # speculative output-placeholder rollback; drafts trimmed by
+                # adaptive verification still roll back as rejected.
                 num_rejected_chunks.append(
                     torch.zeros(
                         chunk_padded_num_reqs, dtype=torch.int32, device=nt_chunk.device
                     )
+                    if scheduled is None
+                    else scheduled
                 )
             next_tokens_tpu_chunks.append(src)
             for r in range(num_reqs):
@@ -2991,8 +3233,15 @@ class TPUModelRunner(GPUModelRunner):
                 [bonus.to(drafts_chunk.dtype), drafts_chunk], dim=1
             )  # [chunk_padded_num_reqs, 1+K] = [bonus, draft_1..K]
             next_tokens_tpu_chunks.append(src.reshape(-1))
+            # A step whose drafts adaptive verification trimmed entirely runs
+            # here; the trimmed drafts roll back as rejected.
+            scheduled = self._scheduled_draft_counts(
+                req_offset, n, chunk_padded_num_reqs, None
+            )
             num_rejected_chunks.append(
                 torch.zeros(chunk_padded_num_reqs, dtype=torch.int32, device=src.device)
+                if scheduled is None
+                else scheduled
             )
             for r in range(n):
                 next_token_indices[req_offset + r] = padded_req_offset + r
@@ -3154,6 +3403,13 @@ class TPUModelRunner(GPUModelRunner):
             ]
             + num_scheduled_tokens_per_req
         )
+        if self._prefill_ckpt_units is not None:
+            assert self._prefill_ckpt_offsets_cpu is not None
+            self._prefill_ckpt_units.fill_offsets(
+                self._prefill_ckpt_offsets_cpu.numpy(),
+                self.seq_lens_np[:num_reqs],
+                num_scheduled_tokens_per_req,
+            )
         self._check_attention_schedule(
             num_reqs,
             num_scheduled_tokens_per_req,
@@ -3328,6 +3584,28 @@ class TPUModelRunner(GPUModelRunner):
             and layout_plan.logits_indices_cpu is None
         )
 
+        # For the V3 kernel, request_distribution is
+        # [decode_end, prefill_end, mixed_end]. We put decode requests first,
+        # no dedicated prefill-only bucket, and all remaining requests in
+        # mixed mode.
+        chunk_num_decode = max(0, min(rpa_num_decode_reqs - start_index, num_reqs))
+        # [decode_end, static-q verify end, mixed_end]; the middle
+        # segment is empty unless static-q verify windows are present
+        # (see _init_speculative_decoding).
+        chunk_static_verify_end = max(
+            chunk_num_decode,
+            min(
+                num_decode_reqs
+                + getattr(self, "_num_static_verify_reqs", 0)
+                - start_index,
+                num_reqs,
+            ),
+        )
+        if self.mamba_slot_read_offsets is None:
+            self._request_distribution_cpu[0] = chunk_num_decode
+            self._request_distribution_cpu[1] = chunk_static_verify_end
+            self._request_distribution_cpu[2] = num_reqs
+
         if (
             can_cache_decode_metadata
             and decode_cache_key == self._decode_device_cache_key
@@ -3363,27 +3641,7 @@ class TPUModelRunner(GPUModelRunner):
                     self.query_start_loc_cpu[1 : padded_num_reqs + 1] - 1
                 ).to(self.device, non_blocking=True)
 
-            # For the V3 kernel, request_distribution is
-            # [decode_end, prefill_end, mixed_end]. We put decode requests first,
-            # no dedicated prefill-only bucket, and all remaining requests in
-            # mixed mode.
-            chunk_num_decode = max(0, min(rpa_num_decode_reqs - start_index, num_reqs))
-            # [decode_end, static-q verify end, mixed_end]; the middle
-            # segment is empty unless static-q verify windows are present
-            # (see _init_speculative_decoding).
-            chunk_static_verify_end = max(
-                chunk_num_decode,
-                min(
-                    num_decode_reqs
-                    + getattr(self, "_num_static_verify_reqs", 0)
-                    - start_index,
-                    num_reqs,
-                ),
-            )
             if self.mamba_slot_read_offsets is None:
-                self._request_distribution_cpu[0] = chunk_num_decode
-                self._request_distribution_cpu[1] = chunk_static_verify_end
-                self._request_distribution_cpu[2] = num_reqs
                 request_distribution = self._request_distribution_cpu.to(
                     self.device, non_blocking=True
                 )
@@ -3443,6 +3701,16 @@ class TPUModelRunner(GPUModelRunner):
             mamba_request_distribution = combined_device[3:6]
         assert request_distribution is not None
 
+        prefill_ckpt_offsets = None
+        if self._prefill_ckpt_units is not None:
+            # Always pass an offsets tensor (including all-zeros during decode)
+            # to keep the GDN op signature static across steps.
+            assert self._prefill_ckpt_offsets_cpu is not None
+            prefill_ckpt_offsets = self._upload_unless_unchanged(
+                "prefill_ckpt_offsets",
+                self._prefill_ckpt_offsets_cpu[:target_num_reqs],
+            )
+
         self._attn_metadata_builder_ctx = AttentionMetadataBuilderContext(
             num_reqs=num_reqs,
             start_index=start_index,
@@ -3454,6 +3722,7 @@ class TPUModelRunner(GPUModelRunner):
             mamba_slot_read_offsets=self.mamba_slot_read_offsets,
             mamba_ckpt_window=self._mamba_ckpt_window,
             mamba_request_distribution=mamba_request_distribution,
+            mamba_prefill_ckpt_offsets=prefill_ckpt_offsets,
             # Unified pool + spec decode: the mamba group builders append
             # their per-request state block ids here for the post-sampling
             # read-offset scatter.
@@ -3874,6 +4143,10 @@ class TPUModelRunner(GPUModelRunner):
                 "State error: sample_tokens() must be called "
                 "after execute_model() returns None."
             )
+        if self._adaptive_verification is not None:
+            # Before anything reads the step layout, the DP token sync
+            # included: the rest of the step runs on the trimmed copy.
+            scheduler_output = self._adaptive_verification.trim(scheduler_output)
         # Update cached state
         self._update_states(scheduler_output)
         if self.scheduler_config.async_scheduling:
@@ -3919,6 +4192,11 @@ class TPUModelRunner(GPUModelRunner):
             local_any_decode=self._any_decode(scheduler_output),
         )
         self._dp_step_num_chunks = target_num_chunks
+        readmitted = self._readmit_trimmed_drafts(
+            scheduler_output, local_num_chunks, target_num_chunks
+        )
+        if readmitted is not None:
+            scheduler_output, num_decode_reqs, num_windowed_reqs = readmitted
         if isinstance(self._pp_wave, PPRing) and not self._pp_is_first:
             # Post this step's receives first, so the previous stage can send
             # while this one prepares its inputs.
@@ -4746,6 +5024,7 @@ class TPUModelRunner(GPUModelRunner):
                 min_tokens_rows = min_tokens_mask.verify_rows(
                     min_toks, cur_start_idx, draft_lengths.tolist()
                 )
+        draft_token_ids = md.draft_token_ids
         if all_greedy and grammar_output is None:
             bonus_token_ids, target_logits = self.spec_bonus_and_target_logits(
                 logits, md.bonus_logits_indices, md.target_logits_indices
@@ -4767,6 +5046,15 @@ class TPUModelRunner(GPUModelRunner):
                     )
                 )
                 assert target_logits is not None
+                draft_token_ids = (
+                    self.structured_decoding_manager.mask_invalid_draft_tokens(
+                        draft_token_ids,
+                        grammar_output,
+                        cur_start_idx,
+                        cur_end_idx,
+                        draft_lengths_cpu=md.draft_lengths_cpu,
+                    )
+                )
             if min_tokens_rows is not None:
                 target_rows, bonus_rows = min_tokens_rows
                 target_logits = self._mask_min_tokens(
@@ -4802,14 +5090,14 @@ class TPUModelRunner(GPUModelRunner):
         assert self.speculative_config is not None
         if self.rejection_sampler.synthetic_mode or not all_greedy:
             accept_u = torch.rand(
-                md.draft_token_ids.shape,
+                draft_token_ids.shape,
                 dtype=torch.float32,
                 device=target_logits.device,
                 generator=sampling_generator,
             )
         if all_greedy:
             return self.rejection_sampler(
-                draft_token_ids=md.draft_token_ids,
+                draft_token_ids=draft_token_ids,
                 num_draft_tokens=md.draft_lengths,
                 target_logits=target_logits,
                 bonus_token_ids=bonus_token_ids,
@@ -4826,7 +5114,7 @@ class TPUModelRunner(GPUModelRunner):
             target_logits, dtype=torch.float32, generator=sampling_generator
         )
         return self.rejection_sampler(
-            draft_token_ids=md.draft_token_ids,
+            draft_token_ids=draft_token_ids,
             num_draft_tokens=md.draft_lengths,
             target_logits=target_logits,
             bonus_token_ids=bonus_token_ids,
@@ -5256,6 +5544,8 @@ class TPUModelRunner(GPUModelRunner):
                         return_device=is_async,
                         device_seed=device_seed,
                     )
+        if self._adaptive_verification is not None:
+            self._record_draft_confidences()
 
         if self._is_dspark_pd_producer:
             assert isinstance(self.drafter, DFlashProposer)
@@ -5535,7 +5825,7 @@ class TPUModelRunner(GPUModelRunner):
                 # -1 is "no token": a row of it attends to nothing.
                 self._pp_topk_buffer.fill_(-1)
         if envs.TPU_ROPE_CACHE_TRUNCATE:
-            self._truncate_rope_caches()
+            self._truncate_rope_caches(self.model)
         if envs.TPU_ROPE_CACHE_ROW_MAJOR:
             runner_utils.relayout_rope_caches(self.model)
         if envs.TPU_MOE_HASH_TABLE_ROW_MAJOR:
@@ -5559,6 +5849,28 @@ class TPUModelRunner(GPUModelRunner):
             # shared op rejects them with RuntimeProgramInputMismatch while
             # precompiling the draft buckets.
             self._relayout_tables(getattr(self.drafter, "draft_model", None))
+            if isinstance(self.drafter, DSparkProposer) and (
+                self.drafter.use_confidence_head
+            ):
+                from vllm.distributed import (
+                    get_tensor_model_parallel_rank,
+                    get_tensor_model_parallel_world_size,
+                )
+
+                assert self.speculative_config is not None
+                tp_size = get_tensor_model_parallel_world_size()
+                self._adaptive_verification = AdaptiveVerificationManager(
+                    self.speculative_config.num_speculative_tokens,
+                    draft_block_size=self.drafter.block_size,
+                    async_scheduling=bool(self.scheduler_config.async_scheduling),
+                    calibrate_overhead=tp_size == 1,
+                )
+                if tp_size > 1:
+                    self._tp_rank0_confidence_mask = torch.tensor(
+                        1.0 if get_tensor_model_parallel_rank() == 0 else 0.0,
+                        dtype=torch.float32,
+                        device=self.device,
+                    )
 
         # After the drafter, so its MTP layer is armed too.
         if envs.FUSED_MOE_DECODE_KERNEL:
@@ -5811,6 +6123,7 @@ class TPUModelRunner(GPUModelRunner):
         dp_lockstep: bool = False,
         profile_prefix: int | None = None,
         through_handoff: bool = False,
+        profile_decode_query_lens: Sequence[int] | None = None,
     ) -> float | None:
         """Run the forward at one bucket shape.
 
@@ -5818,6 +6131,13 @@ class TPUModelRunner(GPUModelRunner):
         ``num_tokens`` tokens behind that many computed tokens (the same
         program: only the metadata values differ), and the forward's wall
         time in ms is returned once its outputs have materialized.
+
+        With ``profile_decode_query_lens`` as well, the profile batch is
+        decode-shaped instead: requests of those query lengths, each behind
+        ``profile_prefix`` computed tokens, in the step layout's order
+        (single tokens, then full verify windows, then the rest). Their sum
+        is the real token count; the rest of ``num_tokens`` is padding,
+        marked as a serving step marks it.
 
         With ``through_handoff`` a pipeline stage takes its input from the
         hand-off and passes its output on, as a serving step does; every
@@ -5829,6 +6149,7 @@ class TPUModelRunner(GPUModelRunner):
         self._wait_input_staging_fence()
         kv_cache_initialized = self.kv_cache_config is not None
         profiling = profile_prefix is not None
+        assert profile_decode_query_lens is None or profiling
 
         # A profile batch carries random values so every token row routes
         # on its own, as real tokens do; a warmup batch traces shapes only.
@@ -5837,12 +6158,19 @@ class TPUModelRunner(GPUModelRunner):
             input_ids = self._profile_input("ids", (self.max_num_tokens,), torch.int32)[
                 :num_tokens
             ].to(self.device)
-            # One prefill request, or several of at most the model length
-            # when a bucket exceeds it.
-            left = num_tokens
-            while left > 0:
-                profile_query_lens.append(min(left, self.max_model_len))
-                left -= profile_query_lens[-1]
+            if profile_decode_query_lens is not None:
+                profile_query_lens = list(profile_decode_query_lens)
+                assert sum(profile_query_lens) <= num_tokens, (
+                    profile_query_lens,
+                    num_tokens,
+                )
+            else:
+                # One prefill request, or several of at most the model length
+                # when a bucket exceeds it.
+                left = num_tokens
+                while left > 0:
+                    profile_query_lens.append(min(left, self.max_model_len))
+                    left -= profile_query_lens[-1]
             actual_num_reqs = len(profile_query_lens)
             assert actual_num_reqs <= num_reqs, (
                 f"profiling {num_tokens} tokens needs {actual_num_reqs} "
@@ -5866,16 +6194,27 @@ class TPUModelRunner(GPUModelRunner):
             torch.tensor([0] + query_lens, dtype=torch.int32), dim=0, dtype=torch.int32
         ).to(self.device)
         seq_lens_cpu = torch.ones((num_reqs,), dtype=torch.int32)
-        if profiling:
+        if profile_prefix is not None:
             for i, q in enumerate(profile_query_lens):
                 seq_lens_cpu[i] = q
-            seq_lens_cpu[0] += profile_prefix
+            if profile_decode_query_lens is not None:
+                seq_lens_cpu[:actual_num_reqs] += profile_prefix
+            else:
+                seq_lens_cpu[0] += profile_prefix
         seq_lens = seq_lens_cpu.to(self.device)
         # V3: request_distribution = [decode_end, prefill_end, mixed_end].
         # Dummy runs use one scheduled token per active request, so model
         # them as pure decode to match the real single-chip path; a profile
-        # run holds mixed requests, as a real prefill chunk does.
-        distribution = [0, 0, actual_num_reqs] if profiling else [actual_num_reqs] * 3
+        # run holds mixed requests, as a real prefill chunk does, and a
+        # decode-shaped profile run the segments a verify step has.
+        if profile_decode_query_lens is not None:
+            num_single = sum(q == 1 for q in profile_query_lens)
+            num_static = sum(q == self._static_verify_q_len for q in profile_query_lens)
+            distribution = [num_single, num_single + num_static, actual_num_reqs]
+        elif profiling:
+            distribution = [0, 0, actual_num_reqs]
+        else:
+            distribution = [actual_num_reqs] * 3
         request_distribution = torch.tensor(distribution, dtype=torch.int32).to(
             self.device
         )
@@ -5907,6 +6246,11 @@ class TPUModelRunner(GPUModelRunner):
                 )
                 request_distribution = combined_device[0:3]
                 dummy_mamba_request_distribution = combined_device[3:6]
+            dummy_prefill_ckpt_offsets = (
+                self._dummy_prefill_ckpt_offsets(num_reqs)
+                if self._prefill_ckpt_units is not None
+                else None
+            )
             self._attn_metadata_builder_ctx = AttentionMetadataBuilderContext(
                 num_reqs=num_reqs,
                 start_index=0,
@@ -5919,6 +6263,7 @@ class TPUModelRunner(GPUModelRunner):
                 mamba_slot_read_offsets=self.mamba_slot_read_offsets,
                 mamba_ckpt_window=self._mamba_ckpt_window,
                 mamba_request_distribution=dummy_mamba_request_distribution,
+                mamba_prefill_ckpt_offsets=dummy_prefill_ckpt_offsets,
                 sequence_layout_descriptor=dummy_layout_plan.descriptor,
             )
             slot_mappings = self.empty_slot_mappings
@@ -5961,9 +6306,11 @@ class TPUModelRunner(GPUModelRunner):
 
         padding_state = getattr(self, "_token_padding_state", None)
         if padding_state is not None:
-            # Every row of a warmup step is padding; every row of a profile
-            # step is a real token.
-            padding_state.update(num_tokens if profiling else 0, num_tokens)
+            # Every row of a warmup step is padding; a profile step's real
+            # tokens are its requests' query tokens.
+            padding_state.update(
+                sum(profile_query_lens) if profiling else 0, num_tokens
+            )
         self._record_input_staging_fence()
         intermediate_tensors = None
         if through_handoff:
@@ -6426,6 +6773,11 @@ class TPUModelRunner(GPUModelRunner):
                     ].to(self.device),
                     self._dummy_logits(num_tokens),
                     arange,
+                )
+                synchronize_tensors(out)
+                out = self.structured_decoding_manager.pin_invalid_draft_tokens(
+                    torch.zeros((num_tokens,), dtype=torch.bool).to(self.device),
+                    torch.zeros((num_tokens,), dtype=torch.int32).to(self.device),
                 )
                 synchronize_tensors(out)
                 logger.info("  -- target_logits_length: %d", num_tokens)
@@ -6986,6 +7338,8 @@ class TPUModelRunner(GPUModelRunner):
                 # request would otherwise compile new graphs. Warm those
                 # through the real two-phase spec-decode path.
                 self._warmup_spec_decode()
+                if self._adaptive_verification is not None:
+                    self._init_adaptive_verification()
 
     def _check_draft_buckets(self) -> None:
         """Refuses to start a producer whose draft lacks a target bucket.
@@ -7499,6 +7853,202 @@ class TPUModelRunner(GPUModelRunner):
                 grid.append(R)
         return grid
 
+    def _init_adaptive_verification(self) -> None:
+        """Profile the step costs adaptive verification budgets against, then
+        warm the trimmed verify steps it can schedule."""
+        manager = self._adaptive_verification
+        assert manager is not None
+        warmup_plan, max_num_reqs = self._adaptive_verification_warmup_plan()
+        manager.max_num_reqs = max_num_reqs
+        manager.cost_table = self._profile_adaptive_verification_costs(max_num_reqs)
+        self._warmup_adaptive_verification(warmup_plan)
+        manager.reset()
+
+    def _profile_adaptive_verification_costs(self, max_num_reqs: int) -> StepCostTable:
+        """Time the decode-shaped verify steps of
+        `_adaptive_verification_profile_plan` and the draft forward at every
+        draft bucket.
+
+        Every TP rank must choose the same budget, so the ranks agree on the
+        slowest timing of each point."""
+        import vllm.envs as vllm_envs
+        from vllm.distributed.parallel_state import get_tp_group
+
+        assert self.speculative_config is not None
+        drafter = self.drafter
+        assert isinstance(drafter, DSparkProposer)
+        K = self.speculative_config.num_speculative_tokens
+        pads = list(self.num_tokens_paddings)
+        # Every request sits behind the profiled context, as far as the
+        # model length leaves room for a full window.
+        context_len = vllm_envs.VLLM_ADAPTIVE_VERIFICATION_PROFILE_CONTEXT_LEN
+        prefix = max(0, min(context_len, self.max_model_len - (1 + K)))
+        plan = self._adaptive_verification_profile_plan(max_num_reqs)
+        draft_buckets = drafter.draft_forward_buckets()
+        timings: list[float] = []
+        with self._precompile_timed("adaptive verification cost profile"):
+            for _, num_tokens, query_lens in plan:
+                runs = []
+                # The first run may still compile; keep the fastest.
+                for _ in range(3):
+                    elapsed_ms = self._dummy_run(
+                        _get_padded_token_len(pads, num_tokens),
+                        # The attention metadata's request rows, as in a
+                        # serving step and the backbone warmup; the query
+                        # lengths say how many are live.
+                        self.num_reqs_max_model_len,
+                        self.max_num_blocks_per_req,
+                        use_max_model_len=True,
+                        profile_prefix=prefix,
+                        profile_decode_query_lens=query_lens,
+                    )
+                    assert elapsed_ms is not None
+                    runs.append(elapsed_ms)
+                timings.append(min(runs))
+            timings.extend(drafter.profile_draft_ms(b) for b in draft_buckets)
+        synced = torch.tensor(timings, dtype=torch.float64)
+        tp_group = get_tp_group()
+        if tp_group.world_size > 1:
+            torch.distributed.all_reduce(
+                synced, op=torch.distributed.ReduceOp.MAX, group=tp_group.cpu_group
+            )
+        verify = [
+            (num_reqs, num_tokens, ms)
+            for (num_reqs, num_tokens, _), ms in zip(plan, synced[: len(plan)].tolist())
+        ]
+        draft = list(zip(draft_buckets, synced[len(plan) :].tolist()))
+        by_reqs: dict[int, list[str]] = {}
+        for num_reqs, num_tokens, ms in verify:
+            by_reqs.setdefault(num_reqs, []).append(f"{num_tokens}: {ms:.2f}")
+        logger.info(
+            "Adaptive verification step costs (ms by tokens): verify %s; draft %s",
+            "; ".join(f"{n} reqs {', '.join(v)}" for n, v in by_reqs.items()),
+            ", ".join(f"{b}: {ms:.2f}" for b, ms in draft),
+        )
+        return StepCostTable.from_samples(pads, verify, draft)
+
+    def _adaptive_verification_profile_plan(
+        self, max_num_reqs: int
+    ) -> list[tuple[int, int, list[int]]]:
+        """(request count, real tokens, query lengths) of each decode-shaped
+        verify step the cost profile times, for steps of up to `max_num_reqs`
+        requests.
+
+        Request counts run in powers of two up to the most a trimmed step
+        holds, so neighbors differ by at most 2 <= 1 + K and their token spans
+        overlap (see `StepCostTable.verify_cost`). For each, the token counts
+        run from one token per request to a full window each, at both ends of
+        every token bucket on the way. A step's drafts are spread evenly over
+        its requests."""
+        assert self.speculative_config is not None
+        K = self.speculative_config.num_speculative_tokens
+        pads = list(self.num_tokens_paddings)
+        max_window_tokens = min(pads[-1], int(self.max_num_tokens))
+        max_reqs = min(max_num_reqs, int(self.num_reqs_max_model_len))
+        grid = sorted({1 << i for i in range(max_reqs.bit_length())} | {max_reqs})
+        plan: list[tuple[int, int, list[int]]] = []
+        for num_reqs in grid:
+            lo, hi = num_reqs, min(num_reqs * (1 + K), max_window_tokens)
+            points = {lo, hi}
+            for bucket in pads:
+                if lo <= bucket < hi:
+                    points.update((bucket, bucket + 1))
+            for num_tokens in sorted(points):
+                drafts, extra = divmod(num_tokens - num_reqs, num_reqs)
+                query_lens = [2 + drafts] * extra + [1 + drafts] * (num_reqs - extra)
+                # The step layout's order: single tokens, full verify
+                # windows, then partial ones.
+                query_lens.sort(key=lambda q: (q != 1, q != self._static_verify_q_len))
+                plan.append((num_reqs, num_tokens, query_lens))
+        return plan
+
+    def _adaptive_verification_warmup_plan(
+        self,
+    ) -> tuple[list[tuple[int, int]], int]:
+        """(request count, draft budget) pairs covering the program buckets of
+        every trimmed decode step that the full-window warmup leaves cold, and
+        the most requests a step may hold to be trimmed.
+
+        A trimmed step keeps its request pad and draft-row bucket but drops to
+        a lower token (and logits-row) bucket, or verifies no draft at all and
+        takes the non-spec sampling path. The pairs run through full windows,
+        so they reach only request counts whose full windows fit the largest
+        token bucket. A step with more requests, whose windows the token
+        budget cut short, is trimmed only while every shape trimming can give
+        it is already warmed."""
+        assert self.speculative_config is not None
+        K = self.speculative_config.num_speculative_tokens
+        drafter = self.drafter
+        assert isinstance(drafter, DSparkProposer)
+        pads = list(self.num_tokens_paddings)
+        max_reqs = int(self.max_num_reqs)
+
+        # The same program-bucket key as `_spec_warmup_bucket_grid`'s decode
+        # steps, plus whether any draft is verified.
+        def key(num_reqs: int, budget: int) -> tuple:
+            return (
+                budget > 0,
+                _get_padded_num_reqs_with_upper_limit(num_reqs, max_reqs),
+                _get_padded_token_len(pads, num_reqs + budget),
+                _get_padded_token_len(pads, num_reqs * drafter.block_size),
+            )
+
+        max_window_tokens = min(pads[-1], int(self.max_num_tokens))
+        max_seqs = int(self.scheduler_config.max_num_seqs)
+        counts = [
+            num_reqs
+            for num_reqs in range(1, max_seqs + 1)
+            if num_reqs * (1 + K) <= max_window_tokens
+        ]
+        warmed = {key(num_reqs, num_reqs * K) for num_reqs in counts}
+        plan: list[tuple[int, int]] = []
+        for num_reqs in counts:
+            for budget in range(num_reqs * K):
+                if (k := key(num_reqs, budget)) not in warmed:
+                    warmed.add(k)
+                    plan.append((num_reqs, budget))
+        max_num_reqs = len(counts)
+        for num_reqs in range(max_num_reqs + 1, min(max_seqs, max_window_tokens) + 1):
+            # Such a step schedules at most the drafts that fit beside its
+            # tokens, and a trimmed one verifies fewer.
+            if num_reqs * drafter.block_size > pads[-1] or any(
+                key(num_reqs, budget) not in warmed
+                for budget in range(max_window_tokens - num_reqs)
+            ):
+                break
+            max_num_reqs = num_reqs
+        return plan, max_num_reqs
+
+    def _warmup_adaptive_verification(self, plan: list[tuple[int, int]]) -> None:
+        """Run `_adaptive_verification_warmup_plan`'s pairs through the real
+        spec-decode path, the manager forced to each pair's budget."""
+        manager = self._adaptive_verification
+        assert manager is not None
+        if not envs.SPEC_WARMUP:
+            return
+        logger.info(
+            "adaptive verification warmup: %d (requests, drafts) steps %s",
+            len(plan),
+            plan,
+        )
+        P = int(self.num_tokens_paddings[0])
+        n0 = self.num_xla_graphs
+        with (
+            _suspend_kv_transfer_group(),
+            self._precompile_timed("adaptive verification warmup"),
+        ):
+            for R, budget in plan:
+                manager.forced_budget = budget
+                try:
+                    for greedy in (True, False):
+                        self._warmup_spec_batch(R, P, greedy=greedy, short=True)
+                finally:
+                    manager.forced_budget = None
+        logger.info(
+            "adaptive verification warmup compiled %d graphs",
+            self.num_xla_graphs - n0,
+        )
+
     def _warmup_spec_batch(
         self,
         R: int,
@@ -7546,8 +8096,8 @@ class TPUModelRunner(GPUModelRunner):
         sp = SamplingParams(temperature=0.0 if greedy else 1.0)
         logger.info("spec-decode warmup batch: R=%d P=%d greedy=%s", R, P, greedy)
         try:
-            # Match the low-block working set used by the LIFO BlockPool
-            # workaround. High physical block ids can trigger the v7x SC2
+            # Match the low-block working set that vLLM's LIFO reuse of freed
+            # blocks keeps in service. High physical block ids can trigger the v7x SC2
             # indexed-KV halt even though they are inside the allocated pool.
             # Warmup runs before serving, with no live scheduler requests;
             # reserve block 0 and keep each synthetic request's range disjoint.
@@ -7593,7 +8143,9 @@ class TPUModelRunner(GPUModelRunner):
                     all_token_ids=all_token_ids,
                     new_block_ids=[None] * R,
                     num_computed_tokens=list(nct),
-                    num_output_tokens=[t + 1] * R,
+                    num_output_tokens=_spec_warmup_num_output_tokens(
+                        self.requests, rids
+                    ),
                 )
                 so = SchedulerOutput.make_empty()
                 so.scheduled_cached_reqs = creq
@@ -7658,7 +8210,9 @@ class TPUModelRunner(GPUModelRunner):
                         all_token_ids=all_token_ids,
                         new_block_ids=[None] * R,
                         num_computed_tokens=list(nct),
-                        num_output_tokens=[n_decode + 1 + vi] * R,
+                        num_output_tokens=_spec_warmup_num_output_tokens(
+                            self.requests, rids
+                        ),
                     )
                     so = SchedulerOutput.make_empty()
                     so.scheduled_new_reqs = extras
@@ -7708,8 +8262,8 @@ class TPUModelRunner(GPUModelRunner):
         room = self.max_model_len - P
         n_dec = min(max(5, K + 2), max(0, room // (1 + K) - 1))
         decode_ncts = [P + t for t in range(n_dec)]
-        # Reuse low physical block ids, as in _warmup_spec_batch and the LIFO
-        # BlockPool workaround, rather than exercising the SC2-sensitive end
+        # Reuse low physical block ids, as in _warmup_spec_batch and vLLM's
+        # LIFO reuse of freed blocks, rather than exercising the SC2-sensitive end
         # of the pool. Warmup runs before serving and tears down each request;
         # real requests overwrite their valid KV positions on first prefill.
         # Cover the highest context this request reaches, reserving block 0.
@@ -7763,7 +8317,9 @@ class TPUModelRunner(GPUModelRunner):
                     all_token_ids=all_token_ids,
                     new_block_ids=[None],
                     num_computed_tokens=[nct],
-                    num_output_tokens=[t + 1],
+                    num_output_tokens=_spec_warmup_num_output_tokens(
+                        self.requests, [rid]
+                    ),
                 )
                 so = SchedulerOutput.make_empty()
                 so.scheduled_cached_reqs = creq
@@ -8068,7 +8624,7 @@ class TPUModelRunner(GPUModelRunner):
         Groups whose kernel block is smaller than their manager block get a
         `KernelBlockTable`, so the block tables hold the kernel block ids TPU
         attention reads. `kernel_block_sizes` is required; its `None` default
-        only matches the vLLM 0.32 base signature.
+        only matches the vLLM 0.33.0 base signature.
         """
         if kernel_block_sizes is None:
             raise ValueError("kernel_block_sizes is required on TPU")

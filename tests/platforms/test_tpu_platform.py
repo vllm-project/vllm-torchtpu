@@ -132,6 +132,7 @@ def test_scheduler_mamba_split_accepts_external_kv_tokens():
         block_size=16,
         use_eagle=False,
         use_eagle_block_drop=False,
+        num_hash_lookahead_tokens=0,
         mamba_partial_cache_hit=False,
         mamba_has_prefill_checkpoint_blocks=False,
         mamba_shared_prefix_checkpoint=False,
@@ -416,6 +417,18 @@ class TestTpuPlatform:
             # deployments alike.
             vllm_config.kv_transfer_config = MagicMock()
             assert unified_kv_layout_enabled(vllm_config)
+
+    @pytest.mark.parametrize("method", ["block", "fly"])
+    @patch("vllm_torchtpu.patch_registry.apply")
+    @patch(
+        "vllm_torchtpu.platforms.tpu_platform.TpuPlatform._prepare_singlehost_tpu_env"
+    )
+    def test_check_and_update_config_rejects_unsupported_rejection_sampling(
+        self, mock_prepare_env, mock_apply_patches, vllm_config, method
+    ):
+        vllm_config.speculative_config = MagicMock(rejection_sample_method=method)
+        with pytest.raises(NotImplementedError, match="rejection_sample_method"):
+            TpuPlatform.check_and_update_config(vllm_config)
 
     @pytest.mark.parametrize(
         ("mamba_cache_mode", "speculative_config", "async_scheduling", "message"),
@@ -1566,4 +1579,16 @@ def test_peer_replay_requires_the_compile_cache(
         with pytest.raises(ValueError, match="VLLM_DISABLE_COMPILE_CACHE"):
             _validate_peer_replay_config()
     else:
+        _validate_peer_replay_config()
+
+
+@pytest.mark.parametrize("wait", ["-1", "nan", "soon"])
+def test_a_bad_peer_wait_fails_at_startup(monkeypatch, wait):
+    """TPU_PRECOMPILE_PEER_WAIT_S is first read by the precompile, after the
+    model has loaded; the startup check parses it so a typo fails the launch."""
+    monkeypatch.setenv("TPU_PARALLEL_PRECOMPILE", "1")
+    monkeypatch.setenv("TPU_PRECOMPILE_PEER_REPLAY", "1")
+    monkeypatch.setenv("VLLM_DISABLE_COMPILE_CACHE", "0")
+    monkeypatch.setenv("TPU_PRECOMPILE_PEER_WAIT_S", wait)
+    with pytest.raises(ValueError, match="TPU_PRECOMPILE_PEER_WAIT_S"):
         _validate_peer_replay_config()

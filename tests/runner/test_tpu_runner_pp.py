@@ -369,6 +369,8 @@ class TestRingStepPosting:
             _count_input_chunks=lambda _so: (2, 1),
             _any_decode=lambda _so: False,
             _dp_coordinated_step=lambda *_a, **_kw: (None, 2),
+            _adaptive_verification=None,
+            _readmit_trimmed_drafts=lambda *_a: None,
             _pp_wave=wave,
             _pp_is_first=first,
             _pp_forward_rows=lambda _so: [32, 16],

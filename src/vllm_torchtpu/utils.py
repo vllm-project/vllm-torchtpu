@@ -72,6 +72,13 @@ def get_dp_size(parallel_config) -> int:
     )
 
 
+def min_over_group(value: int, cpu_group: Any) -> int:
+    """Return the minimum of `value` over the ranks of a gloo `cpu_group`."""
+    t = torch.tensor([value], dtype=torch.int64, device="cpu")
+    torch.distributed.all_reduce(t, op=torch.distributed.ReduceOp.MIN, group=cpu_group)
+    return int(t.item())
+
+
 def min_across_ep_dp(parallel_config, value: int) -> int:
     """Return the minimum of `value` across the DP engines coupled by EP.
 
@@ -82,11 +89,7 @@ def min_across_ep_dp(parallel_config, value: int) -> int:
         return value
     from vllm.distributed.parallel_state import get_dp_group
 
-    t = torch.tensor([value], dtype=torch.int64, device="cpu")
-    torch.distributed.all_reduce(
-        t, op=torch.distributed.ReduceOp.MIN, group=get_dp_group().cpu_group
-    )
-    return int(t.item())
+    return min_over_group(value, get_dp_group().cpu_group)
 
 
 def hbm_usage_bytes(devices: Any) -> list[tuple[int, int]]:
@@ -378,6 +381,20 @@ def synchronize_tensors(
     sync.synchronize(tensors=tensors, wait=wait)
 
 
+# Copied by `fresh_buffer` through bfloat16, which holds each of their non-NaN
+# values exactly. Not `float4_e2m1fn_x2`: it packs two values per element, and
+# a bfloat16 round trip corrupts it.
+_FLOAT8_DTYPES = frozenset(
+    {
+        torch.float8_e4m3fn,
+        torch.float8_e5m2,
+        torch.float8_e8m0fnu,
+        torch.float8_e4m3fnuz,
+        torch.float8_e5m2fnuz,
+    }
+)
+
+
 def fresh_buffer(t: torch.Tensor) -> torch.Tensor:
     """Return a copy of `t` backed by a fresh device buffer of its own shape.
 
@@ -389,11 +406,23 @@ def fresh_buffer(t: torch.Tensor) -> torch.Tensor:
 
     `torch.empty(...).copy_(t)` is not enough: torch_tpu may satisfy a
     same-shape, same-dtype `copy_` by aliasing the destination's storage to
-    `t`'s base buffer, which keeps the shape mismatch. On TPU the `+ 0` forces
-    a real op whose output buffer has `t`'s logical shape. Other devices get a
-    plain contiguous clone (CPU has no `add` kernel for float8 dtypes).
+    `t`'s base buffer, which keeps the shape mismatch. On TPU a real op forces
+    an output buffer of `t`'s logical shape: `+ 0`, or for float8 a round trip
+    through bfloat16. Other devices get a plain contiguous clone (CPU has no
+    `add` kernel for float8 dtypes).
+
+    Float8 takes the round trip because torch_tpu builds since commit cf43c606
+    (google-pytorch/torch_tpu) have no float8 `add`, while casts stay
+    supported. Every non-NaN value comes back bit-identical; a NaN stays NaN
+    but may lose its sign or payload. A uint8 `+ 0` viewed back as float8 is no
+    substitute: the result is a dtype view, and a model loaded that way halted
+    at its first warmup step in torch_tpu's `tt_jit_execute_as_strided`
+    programs.
     """
     out = torch.clone(t, memory_format=torch.contiguous_format)
     if out.device.type == "tpu":
-        out = out + 0
+        if out.dtype in _FLOAT8_DTYPES:
+            out = out.to(torch.bfloat16).to(out.dtype)
+        else:
+            out = out + 0
     return out
