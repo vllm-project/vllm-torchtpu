@@ -597,13 +597,13 @@
     },
     {
       "path": "src/vllm_torchtpu/kernels/gdn/v3/memory_ref.py",
-      "name": "bad-override",
-      "concise_description": "Class member `BaseBufferedRef.create` overrides parent class `BufferedRef` in an inconsistent manner"
+      "name": "missing-attribute",
+      "concise_description": "Object of class `Ref` has no attribute `bitcast`"
     },
     {
       "path": "src/vllm_torchtpu/kernels/gdn/v3/memory_ref.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `Ref` has no attribute `bitcast`"
+      "name": "bad-override",
+      "concise_description": "Class member `BaseBufferedRef.create` overrides parent class `BufferedRef` in an inconsistent manner"
     },
     {
       "path": "src/vllm_torchtpu/kernels/gdn/v3/memory_ref.py",
@@ -1054,6 +1054,21 @@
       "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/draft_layers.py",
       "name": "bad-argument-type",
       "concise_description": "Argument `K3DSparkConfig` is not assignable to parameter `config` with type `KimiLinearConfig` in function `vllm_torchtpu.models.vllm.kimi_k3.attention.MultiHeadLatentAttention.__init__`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/draft_mla.py",
+      "name": "not-callable",
+      "concise_description": "Expected a callable, got `object`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/draft_mla_prefill.py",
+      "name": "not-callable",
+      "concise_description": "Expected a callable, got `object`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/draft_ring.py",
+      "name": "not-callable",
+      "concise_description": "Expected a callable, got `object`"
     },
     {
       "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/draft_ring.py",
@@ -3322,6 +3337,16 @@
     },
     {
       "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-argument-type",
+      "concise_description": "Argument `int | object` is not assignable to parameter `chunks` with type `int` in function `_chunk_sizes`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "`*` is not supported between `object` and `int`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
       "name": "unsupported-operation",
       "concise_description": "`None` is not subscriptable"
     },
@@ -3389,6 +3414,41 @@
       "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
       "name": "unsupported-operation",
       "concise_description": "`None` is not subscriptable"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "`%` is not supported between `object` and `Literal[1]`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "`%` is not supported between `object` and `Literal[2]`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "`%` is not supported between `object` and `Literal[4]`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "`//` is not supported between `object` and `Literal[1]`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "`//` is not supported between `object` and `Literal[2]`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "`//` is not supported between `object` and `Literal[4]`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
+      "name": "bad-argument-type",
+      "concise_description": "Argument `int | object` is not assignable to parameter `chunks` with type `int` in function `_chunk_sizes`"
     },
     {
       "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/kernels/decode_megakernel.py",
@@ -3841,9 +3901,19 @@
       "concise_description": "Argument `MemoryRef` is not assignable to parameter `gm_id_to_m_offset` with type `Array` in function `vllm_torchtpu.models.kimi_k3.megakernel.kernels.prefill_megakernel.MetadataRef.__init__`"
     },
     {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/pools.py",
+      "name": "not-callable",
+      "concise_description": "Expected a callable, got `object`"
+    },
+    {
       "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/prefill.py",
       "name": "bad-argument-type",
       "concise_description": "Argument `Tensor` is not assignable to parameter `source` with type `Storage | TypedStorage | UntypedStorage` in function `torch._C.TensorBase.set_`"
+    },
+    {
+      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/prefill.py",
+      "name": "unsupported-operation",
+      "concise_description": "Cannot set item in `dict[Any, dict[str, Any]]`"
     },
     {
       "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/prefill.py",

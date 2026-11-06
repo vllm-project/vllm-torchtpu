@@ -22,12 +22,13 @@ worker (Slurm-style ranks, host list, session, base port).
 from __future__ import annotations
 
 import sys
-from collections.abc import Callable
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 from vllm_torchtpu.envs import env_int, env_str
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     JOBID: str = ""
     K3_VENV_DIR: str = ""
     LIBTPU_INIT_ARGS: str = ""
@@ -43,11 +44,25 @@ if TYPE_CHECKING:
 
 
 def _required(name: str) -> Callable[[], str]:
-    """A string knob that must be set; reading it unset raises ``KeyError``."""
+    """Build a lazy reader for an environment variable that must be non-empty.
+
+    Args:
+        name: Environment variable name.
+
+    Returns:
+        Zero-argument callable returning the non-empty environment string.
+    """
     read = env_str(name, "")
 
     def _get() -> str:
-        """Return the value, or raise when the variable is unset or empty."""
+        """Return the environment variable value, or raise when unset or empty.
+
+        Returns:
+            Non-empty string value read from ``name``.
+
+        Raises:
+            KeyError: If the environment variable is unset or empty.
+        """
         value = read()
         if not value:
             raise KeyError(name)
@@ -56,7 +71,7 @@ def _required(name: str) -> Callable[[], str]:
     return _get
 
 
-environment_variables: dict[str, Callable[[], Any]] = {
+environment_variables: dict[str, Callable[[], object]] = {
     # Four-host allocation the bring-up tools launch on.
     "JOBID": env_str("JOBID", ""),
     # Python environment the launched workers run; defaults to this one.
@@ -78,13 +93,28 @@ environment_variables: dict[str, Callable[[], Any]] = {
 }
 
 
-def __getattr__(name: str) -> Any:
-    """Read a knob lazily."""
+def __getattr__(name: str) -> object:
+    """Read an environment knob lazily at attribute access (PEP 562).
+
+    Args:
+        name: Knob name, a key of ``environment_variables``.
+
+    Returns:
+        Current value of the knob's environment variable.
+
+    Raises:
+        AttributeError: If ``name`` is not a knob of this module.
+    """
     if name in environment_variables:
         return environment_variables[name]()
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    msg = f"module {__name__!r} has no attribute {name!r}"
+    raise AttributeError(msg)
 
 
 def __dir__() -> list[str]:
-    """List the knobs."""
-    return list(environment_variables.keys())
+    """List the environment knobs of this module.
+
+    Returns:
+        Names of every key in ``environment_variables``.
+    """
+    return list(environment_variables)

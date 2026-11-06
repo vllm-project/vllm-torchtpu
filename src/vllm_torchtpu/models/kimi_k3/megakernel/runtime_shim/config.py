@@ -12,7 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Source provenance: inferact/k3-megakernel@30c9ba966b src/vllm_torchtpu/megakernel/config.py
+# Source provenance: inferact/k3-megakernel@30c9ba966b
+# src/vllm_torchtpu/megakernel/config.py
 """Megakernel configuration, whatever the model.
 
 * :class:`MegakernelEngineConfig` is what vLLM's configuration fixes for a
@@ -31,16 +32,18 @@ stay free of both.
 from __future__ import annotations
 
 import dataclasses
-from typing import Any, Protocol
+from typing import Protocol
 
-from vllm_torchtpu.models.kimi_k3.megakernel.runtime_shim import backend
+from . import backend
 
 
 @dataclasses.dataclass(frozen=True)
 class MegakernelEngineConfig:
-    """What vLLM's configuration fixes for a program, as plain values (the
-    same on every rank). Serving builds it with :meth:`from_vllm_config`;
-    the standalone tools construct it directly."""
+    """Engine parameters that vLLM's configuration fixes for a megakernel program.
+
+    Serving builds this config with :meth:`from_vllm_config`; standalone tools
+    construct it directly.
+    """
 
     role: str  # "prefill" or "decode"
     tensor_parallel_size: int
@@ -70,29 +73,41 @@ class MegakernelEngineConfig:
     attention_dp: int = 1
 
     @classmethod
-    def from_vllm_config(cls, vllm_config: Any) -> MegakernelEngineConfig:
-        """The configuration of the role ``vllm_config`` selects (raises when
-        it does not select the megakernel backend)."""
-        role = backend.role(vllm_config)
-        if role is None:
-            raise ValueError(
-                "the megakernel backend is not selected (--load-format megakernel)"
-            )
-        parallel, scheduler = vllm_config.parallel_config, vllm_config.scheduler_config
-        spec = vllm_config.speculative_config
+    def from_vllm_config(cls, vllm_config: object) -> MegakernelEngineConfig:
+        """Build the engine configuration for the role selected by ``vllm_config``.
+
+        Args:
+            vllm_config: Active vLLM engine configuration object.
+
+        Returns:
+            Populated :class:`MegakernelEngineConfig` instance.
+
+        Raises:
+            ValueError: If ``vllm_config`` does not select the megakernel backend.
+        """
+        selected_role = backend.role(vllm_config)
+        if selected_role is None:
+            msg = "the megakernel backend is not selected (--load-format megakernel)"
+            raise ValueError(msg)
+        vllm_attrs = vars(vllm_config)
+        parallel = vllm_attrs["parallel_config"]
+        scheduler = vllm_attrs["scheduler_config"]
+        cache_config = vllm_attrs["cache_config"]
+        model_config = vllm_attrs["model_config"]
+        spec = vllm_attrs.get("speculative_config")
         schedule = (
             spec.num_speculative_tokens_per_batch_size if spec is not None else None
         )
         return cls(
-            role=role,
+            role=selected_role,
             tensor_parallel_size=int(parallel.tensor_parallel_size),
             decode_context_parallel_size=int(parallel.decode_context_parallel_size),
-            block_size=int(vllm_config.cache_config.block_size),
-            kv_cache_dtype=str(vllm_config.cache_config.cache_dtype),
-            mamba_ssm_cache_dtype=str(vllm_config.cache_config.mamba_ssm_cache_dtype),
+            block_size=int(cache_config.block_size),
+            kv_cache_dtype=str(cache_config.cache_dtype),
+            mamba_ssm_cache_dtype=str(cache_config.mamba_ssm_cache_dtype),
             cp_kv_cache_interleave_size=int(parallel.cp_kv_cache_interleave_size),
             max_num_seqs=int(scheduler.max_num_seqs),
-            max_model_len=int(vllm_config.model_config.max_model_len),
+            max_model_len=int(model_config.max_model_len),
             max_num_batched_tokens=int(scheduler.max_num_batched_tokens),
             num_speculative_tokens=int(spec.num_speculative_tokens)
             if spec is not None
@@ -114,24 +129,41 @@ class MegakernelEngineConfig:
 
 
 def _rates_by_width(
-    spec: Any, lengths: dict[int, float] | None
+    spec: object,
+    lengths: dict[int, float] | None,
 ) -> tuple[tuple[int, tuple[float, ...]], ...] | None:
-    """Each draft width's synthetic rates from its mean acceptance length,
-    by vLLM's own rule (``SpeculativeConfig._acceptance_length_to_rates``)."""
+    """Compute per-draft-width synthetic acceptance rates from mean lengths.
+
+    Uses ``SpeculativeConfig._acceptance_length_to_rates`` to convert each width's
+    target mean acceptance length into per-position rates.
+
+    Args:
+        spec: vLLM ``SpeculativeConfig`` object, or ``None``.
+        lengths: Mapping from draft width to mean acceptance length, or ``None``.
+
+    Returns:
+        Sorted tuple of ``(width, rates_tuple)`` pairs, or ``None``.
+
+    Raises:
+        ValueError: If synthetic rejection sampling is not enabled or a mean
+            acceptance length falls outside ``[1, width + 1]``.
+    """
     if lengths is None:
         return None
-    if spec is None or spec.rejection_sample_method != "synthetic":
-        raise ValueError(
+    if spec is None or vars(spec).get("rejection_sample_method") != "synthetic":
+        msg = (
             "synthetic_acceptance_lengths needs --speculative-config "
             "rejection_sample_method synthetic"
         )
+        raise ValueError(msg)
     for width, length in lengths.items():
         if width < 1 or not 1.0 <= length <= width + 1:
-            raise ValueError(
+            msg = (
                 f"synthetic_acceptance_lengths: {width} drafts take a mean "
                 f"acceptance length in [1, {width + 1}], not {length}"
             )
-    to_rates = type(spec)._acceptance_length_to_rates
+            raise ValueError(msg)
+    to_rates = vars(type(spec))["_acceptance_length_to_rates"]
     return tuple(
         (width, tuple(to_rates(length, width)))
         for width, length in sorted(lengths.items())
@@ -139,10 +171,10 @@ def _rates_by_width(
 
 
 class KernelConfig(Protocol):
-    """A model's kernel settings."""
+    """Protocol for a model's compile-time kernel settings."""
 
     def key(self) -> str:
-        """A stable digest of the settings, for caches of compiled kernels."""
+        """Return a stable digest of the settings for compiled kernel caches."""
         ...
 
 
@@ -150,11 +182,18 @@ _ACTIVE: KernelConfig | None = None
 
 
 def set_active_kernel_config(config: KernelConfig) -> None:
-    """Record the process's kernel config (the model's install does it)."""
-    global _ACTIVE
-    _ACTIVE = config
+    """Record the process-wide active kernel configuration.
+
+    Args:
+        config: Model ``KernelConfig`` instance being installed.
+    """
+    globals()["_ACTIVE"] = config
 
 
 def get_active_kernel_config() -> KernelConfig | None:
-    """The active model's kernel config (None: none is installed)."""
+    """Return the active model's kernel config, or ``None`` if none is installed.
+
+    Returns:
+        Installed :class:`KernelConfig` instance, or ``None``.
+    """
     return _ACTIVE
