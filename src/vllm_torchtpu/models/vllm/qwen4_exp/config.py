@@ -921,20 +921,27 @@ def validate_mtp_config(cfg):
         # Decode-only MTP: a staged TP>1 consumer behind TP1 pipeline stages
         # (pd_staging builds the producer's plan without the draft). The
         # producer ships no draft KV; the draft's prompt KV starts empty, so
-        # this is meant for synthetic rejection sampling. Its state tables
-        # must be the none mode (decode prefix caching off).
+        # this is meant for synthetic rejection sampling. Decode prefix
+        # caching is admitted in align mode: speculative state blocks follow
+        # the block columns, the load lands the producer's state in the
+        # committed entry (_Stage3TransferGroup.transfer_pages), and a local
+        # hit adopts only token pages (the state always comes from the
+        # producer, Qwen4ExpRaidenConnector.supports_divergent_local_hybrid_hits).
         transfer = cfg.kv_transfer_config
         if (
             transfer.is_kv_producer
             or p.pipeline_parallel_size != 1
             or p.tensor_parallel_size < 2
-            or cfg.cache_config.enable_prefix_caching
+            or (
+                cfg.cache_config.enable_prefix_caching
+                and getattr(cfg.cache_config, "mamba_cache_mode", "none") != "align"
+            )
             or not envs.TPU_RAIDEN_POOL_TAGS_PER_LAYER
         ):
             raise ValueError(
                 "Qwen4Exp PD runs MTP only on a staged TP>1 decode behind "
                 "pipeline stages (TPU_RAIDEN_POOL_TAGS_PER_LAYER=1), with "
-                "decode prefix caching off"
+                "decode prefix caching off or in mamba_cache_mode='align'"
             )
     if getattr(cfg.cache_config, "mamba_cache_mode", "none") not in ("none", "align"):
         raise ValueError("Qwen4Exp MTP requires mamba_cache_mode 'none' or 'align'")

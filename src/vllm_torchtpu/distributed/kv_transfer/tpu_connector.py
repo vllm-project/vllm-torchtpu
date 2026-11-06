@@ -195,9 +195,12 @@ class _Stage3TransferGroup:
     # (align-mode Mamba under prefix caching): the running state is the last
     # of ``ceil(num_tokens / page_tokens)`` entries, and only it moves.
     positional_state: bool = False
-    # A request-state group with speculative checkpoints (an MTP decode,
-    # none mode): the table is the committed state then ``K`` speculative
-    # entries, and only the committed one is a transfer target.
+    # A request-state group with speculative checkpoints (an MTP decode):
+    # the committed state is followed by ``K`` speculative entries, and only
+    # the committed one is a transfer target. In none mode the table is
+    # exactly those ``K + 1`` entries; in align mode (a positional table) the
+    # ``K`` entries follow the block columns, so the committed state is the
+    # ``-(K + 1)``th of ``ceil(num_tokens / page_tokens) + K`` entries.
     speculative_blocks: int = 0
 
     def page_count(self, num_tokens: int) -> int:
@@ -212,9 +215,10 @@ class _Stage3TransferGroup:
         moves: the live state page of a positional state table (None if the
         table is not a committed prefix of that length), the table otherwise.
         """
-        if self.request_state and self.speculative_blocks and not self.positional_state:
+        speculative = self.speculative_blocks if self.request_state else 0
+        if speculative and not self.positional_state:
             pages = list(ids)
-            if num_tokens <= 0 or len(pages) != self.speculative_blocks + 1:
+            if num_tokens <= 0 or len(pages) != speculative + 1:
                 return None
             return pages[: 1]
         if not self.positional_state:
@@ -222,9 +226,10 @@ class _Stage3TransferGroup:
         pages = list(ids)
         if num_tokens <= 0 or len(pages) != (
             num_tokens + self.page_tokens - 1
-        ) // self.page_tokens:
+        ) // self.page_tokens + speculative:
             return None
-        return pages[-1:]
+        committed = pages[-(speculative + 1)]
+        return [committed]
 
 
 def _stage3_handoff_prefix(num_prompt_tokens: int, align_tokens: int) -> int:

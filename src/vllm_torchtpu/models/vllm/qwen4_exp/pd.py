@@ -105,14 +105,14 @@ def build_transfer_groups(
                 # (prefix caching): one state block per block column, the
                 # running state in the last; the transfer still carries one.
                 # Speculative state blocks (a decode-only MTP draft) follow
-                # the committed state in the table; the transfer still moves
-                # one committed state (pd_staging lands it there).
-                if spec.mamba_cache_mode not in ("none", "align") or (
-                    spec.num_speculative_blocks and spec.mamba_cache_mode != "none"
-                ):
+                # the committed state in the table in either mode, so the
+                # committed entry is the -(K + 1)th; the transfer moves only
+                # it (_Stage3TransferGroup.transfer_pages) and pd_staging
+                # lands the producer's state there.
+                if spec.mamba_cache_mode not in ("none", "align"):
                     raise NotImplementedError(
                         "Qwen PD request-state transfer requires the none or "
-                        "align Mamba cache mode, and none with MTP"
+                        "align Mamba cache mode"
                     )
                 extents.add(TransferExtent.REQUEST_STATE)
                 positional.add(spec.mamba_cache_mode == "align")
