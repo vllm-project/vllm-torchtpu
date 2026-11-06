@@ -25,6 +25,7 @@ from vllm.v1.structured_output import StructuredOutputManager
 from vllm_torchtpu.core.short_prefill_first_scheduler import (
     ShortPrefillFirstScheduler,
 )
+from vllm_torchtpu.core.short_prompts_first import fit_short_prompts
 
 BUDGET = 4096
 BLOCK = 16
@@ -260,3 +261,25 @@ def test_a_reservation_the_kv_cache_cannot_hold_does_not_stall_the_prefill(
     for _ in range(3):
         _step(scheduler)
     assert scheduler.requests["long"].num_computed_tokens >= 4_500
+
+
+def test_fit_short_prompts_takes_what_fits_in_order():
+    candidates = [("a", 30), ("b", 80), ("c", 20), ("d", 10)]
+    taken = fit_short_prompts(candidates, reserved=10, free_tokens=70, free_slots=3)
+    assert taken == (70, ["a", "c", "d"])
+    taken = fit_short_prompts(candidates, reserved=0, free_tokens=200, free_slots=2)
+    assert taken == (110, ["a", "b"])
+
+
+def test_fit_short_prompts_draws_no_candidate_once_full():
+    drawn = []
+
+    def candidates():
+        for prompt, tokens in [("a", 50), ("b", 50), ("c", 50)]:
+            drawn.append(prompt)
+            yield prompt, tokens
+
+    assert fit_short_prompts(
+        candidates(), reserved=0, free_tokens=100, free_slots=5
+    ) == (100, ["a", "b"])
+    assert drawn == ["a", "b"]
