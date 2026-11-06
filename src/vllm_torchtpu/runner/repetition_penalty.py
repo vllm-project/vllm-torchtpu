@@ -24,6 +24,13 @@ For each tracked request, ``seen_mask`` marks every in-range vocabulary id
 tokens wider than a codec head are ignored). Positive logits on seen tokens are
 divided by ``penalty`` and non-positive logits are multiplied by ``penalty`` in
 ``float32`` before casting back to ``logits.dtype``.
+
+Under plain ``async_scheduling`` (no speculative drafts), ``output_token_ids``
+ends with one optimistic ``0`` placeholder while the previous step's sampled
+token is still on device in ``next_tokens_tpu``. Rather than stalling the host
+on a D2H copy or falsely penalizing token ``0``, the host reads
+``output_token_ids[:-1]`` and ``mark_pending_async_tokens`` scatters the single
+on-device pending token into ``seen_mask`` before scaling logits.
 """
 
 from __future__ import annotations
@@ -94,6 +101,7 @@ class RepetitionPenaltyRowState:
     penalty: float
     entry: RepetitionPenaltyRequest
     committed_output: Sequence[int]
+    pending_slot: int = -1
 
 
 # persistent-batch index -> resolved repetition penalty state for this step.
@@ -138,27 +146,29 @@ class RepetitionPenaltyTracker:
     def batch_state(
         self,
         req_id_to_index: Mapping[str, int],
-        lookup_output: Callable[[str], Sequence[int] | None],
+        lookup_output: Callable[[str], tuple[Sequence[int], int] | None],
     ) -> RepetitionPenaltyState:
         """Build per-batch-index state for tracked requests in the current step.
 
-        ``lookup_output(req_id)`` returns the committed output token ids for
-        active requests, or ``None`` if the request is no longer in
+        ``lookup_output(req_id)`` returns ``(committed_output, pending_slot)``
+        for active requests, or ``None`` if the request is no longer in
         ``runner.requests`` (in which case it is evicted). Requests temporarily
         absent from ``req_id_to_index`` (e.g. preempted) remain tracked.
         """
         state: RepetitionPenaltyState = {}
         for req_id, req in list(self.requests.items()):
-            committed_output = lookup_output(req_id)
-            if committed_output is None:
+            looked_up = lookup_output(req_id)
+            if looked_up is None:
                 del self.requests[req_id]
                 continue
             index = req_id_to_index.get(req_id)
             if index is not None:
+                committed_output, pending_slot = looked_up
                 state[index] = RepetitionPenaltyRowState(
                     penalty=req.penalty,
                     entry=req,
                     committed_output=committed_output,
+                    pending_slot=pending_slot,
                 )
         return state
 
@@ -190,14 +200,15 @@ def build_plain_inputs(
     end: int,
     num_rows: int,
     vocab_size: int,
-) -> tuple[np.ndarray, np.ndarray] | None:
-    """Host-side ``(seen_mask, penalties)`` for a plain 1-row/req logits chunk,
-    or ``None`` when no request in ``[start, end)`` is tracked."""
+) -> tuple[np.ndarray, np.ndarray, np.ndarray | None] | None:
+    """Host-side ``(seen_mask, penalties, pre_indices)`` for a plain 1-row/req
+    logits chunk, or ``None`` when no request in ``[start, end)`` is tracked."""
     indices = _in_chunk(state, start, end)
     if not indices or vocab_size <= 0:
         return None
     seen_mask = np.zeros((num_rows, vocab_size), dtype=np.bool_)
     penalties = np.ones((num_rows, 1), dtype=np.float32)
+    pre_indices: np.ndarray | None = None
     for batch_idx in indices:
         row = batch_idx - start
         row_state = state[batch_idx]
@@ -205,19 +216,54 @@ def build_plain_inputs(
             row_state.committed_output, vocab_size
         )
         penalties[row, 0] = row_state.penalty
-    return seen_mask, penalties
+        if row_state.pending_slot >= 0:
+            if pre_indices is None:
+                pre_indices = np.full((num_rows,), -1, dtype=np.int32)
+            pre_indices[row] = row_state.pending_slot
+    return seen_mask, penalties, pre_indices
 
 
 def apply_penalties_table(
     logits: torch.Tensor,
     seen_mask_np: np.ndarray,
     penalties_np: np.ndarray,
+    pre_indices_np: np.ndarray | None = None,
+    next_tokens_tpu: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Stage host penalty tables to ``logits.device`` and apply scaling."""
     device = logits.device
     seen_mask = torch.from_numpy(seen_mask_np).to(device)
+    if pre_indices_np is not None and next_tokens_tpu is not None:
+        pre_indices = torch.from_numpy(pre_indices_np).to(device)
+        seen_mask = mark_pending_async_tokens(seen_mask, next_tokens_tpu, pre_indices)
     penalties = torch.from_numpy(penalties_np).to(device)
     return apply_repetition_penalty(logits, seen_mask, penalties)
+
+
+@torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+def mark_pending_async_tokens(
+    seen_mask: torch.Tensor,
+    next_tokens_tpu: torch.Tensor,
+    pre_indices: torch.Tensor,
+) -> torch.Tensor:
+    return _mark_pending_async_tokens(seen_mask, next_tokens_tpu, pre_indices)
+
+
+def _mark_pending_async_tokens(
+    seen_mask: torch.Tensor,
+    next_tokens_tpu: torch.Tensor,
+    pre_indices: torch.Tensor,
+) -> torch.Tensor:
+    """Scatter each row's unsettled async token from ``next_tokens_tpu`` into
+    ``seen_mask``. Rows with ``pre_indices == -1`` or out-of-range tokens write
+    their existing column value back as a no-op."""
+    vocab_size = seen_mask.shape[1]
+    safe_slots = pre_indices.clamp(min=0).long()
+    tok = next_tokens_tpu.index_select(0, safe_slots).long()
+    valid = (pre_indices >= 0) & (tok >= 0) & (tok < vocab_size)
+    col = tok.clamp(min=0, max=vocab_size - 1).unsqueeze(1)
+    prev = seen_mask.gather(1, col)
+    return seen_mask.scatter(1, col, prev | valid.unsqueeze(1))
 
 
 @torch.compile(backend="tpu", fullgraph=True, dynamic=False)

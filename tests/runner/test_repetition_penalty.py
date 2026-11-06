@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """``repetition_penalty`` on the TPU sampler: request tracking, scaling math,
-sync decode integration, and TPU compilation."""
+zero-stall async pending-token handling, and TPU compilation."""
 
 from __future__ import annotations
 
@@ -31,7 +31,10 @@ from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 from vllm_torchtpu.runner import min_tokens
 from vllm_torchtpu.runner import repetition_penalty as rep_pen
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
-from vllm_torchtpu.runner.tpu_runner_async_output import AsyncTPUCopyState
+from vllm_torchtpu.runner.tpu_runner_async_output import (
+    AsyncPreResults,
+    AsyncTPUCopyState,
+)
 
 NEG_INF = float("-inf")
 
@@ -83,7 +86,7 @@ class TestTracker:
         tracker.add("gone", SamplingParams(repetition_penalty=1.1), [2])
 
         def lookup(req_id: str):
-            return [3] if req_id == "keep" else None
+            return ([3], -1) if req_id == "keep" else None
 
         # "keep" is temporarily absent from req_id_to_index (preempted).
         assert tracker.batch_state({}, lookup) == {}
@@ -256,19 +259,53 @@ class TestRunnerIntegration:
         assert out.sampled_token_ids == [[2]]
         assert seen_logprob_logits[0][0, 4].item() == pytest.approx(3.0)
 
-    @pytest.mark.parametrize(
-        ("async_scheduling", "spec"), [(True, None), (False, object())]
-    )
-    def test_unsupported_modes_skip_penalty_with_warning(self, async_scheduling, spec):
+    def test_plain_async_step_penalizes_pending_device_token_without_zero_leak(self):
+        """Under async_scheduling=True (no drafts), output_token_ids ends with
+        placeholder [0] while the true previous token (5) lives in
+        pre.next_tokens_tpu. Token 0 must NOT be penalized, token 5 MUST be
+        penalized, and _modify_prev_results must NOT be called early."""
         logits = torch.zeros(1, 8)
-        runner = _plain_runner(logits, async_scheduling=async_scheduling, spec=spec)
+        # Token 5 (pending on TPU): 3.0 -> 3.0 / 2.0 = 1.5
+        # Token 0 (placeholder in output_token_ids, NOT truly seen): 2.6 -> 2.6
+        # Token 3 (unseen runner-up): 2.4 -> 2.4
+        logits[0, 5], logits[0, 0], logits[0, 3] = 3.0, 2.6, 2.4
+        runner = _plain_runner(logits, async_scheduling=True)
+        r0 = runner.requests["r0"]
+        r0.output_token_ids = [0]  # single optimistic async placeholder!
+        runner._repetition_penalty.add(
+            "r0", SamplingParams(repetition_penalty=2.0), [4]
+        )
+        runner._pre_async_results = AsyncPreResults(
+            req_ids=["r0"],
+            next_tokens_tpu=torch.tensor([5, 0, 0, 0], dtype=torch.int64),
+            request_seq_lens=[(0, r0, 2, "r0")],
+            discard_sampled_tokens_req_indices=[],
+            req_id_to_index_copy={"r0": 0},
+            num_draft_per_req=None,
+        )
+
+        # Verify batch_state itself never calls _modify_prev_results early.
+        state = runner._repetition_penalty_batch_state()
+        runner._modify_prev_results.assert_not_called()
+        assert list(state[0].committed_output) == []
+        assert state[0].pending_slot == 0
+
+        async_out = _run_sample_tokens(runner)
+        # sample_tokens calls _modify_prev_results once at its normal post-sample point.
+        assert runner._modify_prev_results.call_count == 1
+        assert async_out.get_output().sampled_token_ids == [[0]]
+
+    @pytest.mark.parametrize("async_scheduling", [False, True])
+    def test_spec_decode_skips_penalty_with_warning(self, async_scheduling):
+        logits = torch.zeros(1, 8)
+        runner = _plain_runner(logits, async_scheduling=async_scheduling, spec=object())
         runner._repetition_penalty.add(
             "r0", SamplingParams(repetition_penalty=1.5), [4]
         )
         with patch("vllm_torchtpu.runner.tpu_runner.logger") as log:
             assert runner._repetition_penalty_batch_state() == {}
         log.warning_once.assert_called_once()
-        assert "async_scheduling=False" in log.warning_once.call_args.args[0]
+        assert "speculative_config" in log.warning_once.call_args.args[0]
 
     def test_batch_reorder_and_top_tokens_gate(self):
         batch = InputBatch(
@@ -361,15 +398,15 @@ class TestRunnerIntegration:
         assert not runner._repetition_penalty
 
     @pytest.mark.parametrize(
-        ("async_scheduling", "spec", "expected"),
+        ("async_scheduling", "spec", "expected", "expected_async"),
         [
-            (False, None, [(8, 12), (16, 12)]),
-            (True, None, []),
-            (False, object(), []),
+            (False, None, [(8, 12), (16, 12)], []),
+            (True, None, [(8, 12), (16, 12)], [(8, 8), (8, 16), (16, 8), (16, 16)]),
+            (False, object(), [], []),
         ],
     )
     def test_precompile_covers_supported_buckets_only(
-        self, async_scheduling, spec, expected
+        self, async_scheduling, spec, expected, expected_async
     ):
         runner = object.__new__(TPUModelRunner)
         runner.num_reqs_paddings = [8, 16]
@@ -379,20 +416,30 @@ class TestRunnerIntegration:
         runner._dummy_logits = lambda n: torch.zeros(n, 12, dtype=torch.bfloat16)
         runner._precompile_timed = MagicMock()
         apply_shapes: list[tuple[int, int]] = []
+        async_shapes: list[tuple[int, int]] = []
         orig_apply = rep_pen.apply_repetition_penalty
+        orig_mark = rep_pen.mark_pending_async_tokens
 
         def spy_apply(logits, seen_mask, penalties):
             apply_shapes.append(tuple(logits.shape))
             return orig_apply(logits, seen_mask, penalties)
 
-        with patch.object(rep_pen, "apply_repetition_penalty", side_effect=spy_apply):
+        def spy_mark(seen_mask, next_tokens, pre_indices):
+            async_shapes.append((seen_mask.shape[0], next_tokens.shape[0]))
+            return orig_mark(seen_mask, next_tokens, pre_indices)
+
+        with (
+            patch.object(rep_pen, "apply_repetition_penalty", side_effect=spy_apply),
+            patch.object(rep_pen, "mark_pending_async_tokens", side_effect=spy_mark),
+        ):
             runner._precompile_repetition_penalty()
 
         assert apply_shapes == expected
+        assert async_shapes == expected_async
 
 
 @pytest.mark.tpu_test
-def test_compiled_repetition_penalty_on_tpu():
+def test_compiled_repetition_penalty_and_async_pending_on_tpu():
     import torch_tpu  # noqa: F401
 
     device = torch.device("tpu")
@@ -406,12 +453,26 @@ def test_compiled_repetition_penalty_on_tpu():
     penalties_np = np.ones((8, 1), dtype=np.float32)
     penalties_np[0, 0] = 1.05
     penalties_np[2, 0] = 1.5
+    pre_indices_np = np.full((8,), -1, dtype=np.int32)
+    pre_indices_np[0] = 3  # pending async token at slot 3 -> token id 77
+    pre_indices_np[2] = 1  # out-of-range token id 9999 -> ignored
+    next_tokens_cpu = torch.tensor([0, 9999, 0, 77, 0, 0, 0, 0], dtype=torch.int64)
 
     with torch.compiler.set_stance("force_eager"):
-        ref = rep_pen.apply_penalties_table(logits_cpu, seen_np, penalties_np)
+        ref = rep_pen.apply_penalties_table(
+            logits_cpu,
+            seen_np,
+            penalties_np,
+            pre_indices_np,
+            next_tokens_cpu,
+        )
 
     got = rep_pen.apply_penalties_table(
-        logits_cpu.to(device), seen_np, penalties_np
+        logits_cpu.to(device),
+        seen_np,
+        penalties_np,
+        pre_indices_np,
+        next_tokens_cpu.to(device),
     ).cpu()
 
     assert got.dtype == torch.bfloat16
