@@ -20,6 +20,7 @@ X-data-parallel-rank，保证落在 P / D 的同一个 DP 副本、命中同一�
 文本用 tokenizer 里「空格+小写单词」的 token 拼成，pre-tokenizer 按空格切分，所以编码后 token 数不变。
 """
 import argparse
+import os
 import asyncio
 import json
 import random
@@ -144,8 +145,8 @@ async def main():
     ap.add_argument("--repeats", type=int, default=5, help="正式轮数（另加 --warmup-rounds 轮不计入）")
     ap.add_argument("--warmup-rounds", type=int, default=1, help="先跑几轮丢弃，排除首次编译")
     ap.add_argument("--max-tokens", type=int, default=8)
-    ap.add_argument("--proxy", default="http://10.128.0.175:8000")
-    ap.add_argument("--prefill-metrics", default="http://10.128.0.175:8100/metrics")
+    ap.add_argument("--proxy", default=os.environ.get("PROXY_URL", "http://10.128.0.175:8000"))
+    ap.add_argument("--prefill-metrics", default=os.environ.get("PREFILL_METRICS_URL", "http://10.128.0.175:8100/metrics"))
     ap.add_argument("--model", default="deepseek-v41")
     ap.add_argument("--tokenizer", default="/tmp/dsv41-tokenizer/tokenizer.json")
     ap.add_argument("--seed", type=int, default=None)

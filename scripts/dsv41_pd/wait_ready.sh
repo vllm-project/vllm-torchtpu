@@ -6,8 +6,8 @@ P=/zzlfs/temu/logs/prefill-epic-$T.log
 D=/zzlfs/temu/logs/decode-epic-$T.log
 FATAL="EngineDeadError|Engine core initialization failed|PjRtClient is not initialized|ValueError:|ManifestError|NameError|requires Linux with glibc|Traceback \(most recent call last\)"
 for i in $(seq 400); do
-  p=$(curl -s -m 5 -o /dev/null -w "%{http_code}" http://10.128.0.175:8100/health)
-  d=$(curl -s -m 5 -o /dev/null -w "%{http_code}" http://10.128.0.177:8200/health)
+  p=$(curl -s -m 5 -o /dev/null -w "%{http_code}" http://${P_ADDR:-10.128.0.175}:8100/health)
+  d=$(curl -s -m 5 -o /dev/null -w "%{http_code}" http://${D_ADDR:-10.128.0.177}:8200/health)
   if [[ "$p$d" == 200200 ]]; then echo "READY $(date +%T) P=$P D=$D"; exit 0; fi
   if grep -qE "$FATAL" "$P" "$D" 2>/dev/null; then
     echo "ERROR $(date +%T)"
