@@ -193,6 +193,7 @@ def _route_logical(
     hidden_states: torch.Tensor,
     router_logits: torch.Tensor,
     input_ids: torch.Tensor | None = None,
+    score_bias: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, bool]:
     """Compute logical `(topk_weights, topk_ids, already_gathered)`."""
     topk = layer.moe_config.experts_per_token
@@ -228,6 +229,7 @@ def _route_logical(
             scoring_fn=layer.scoring_func,
             layer=layer,
             input_ids=local_input_ids,
+            score_bias=score_bias,
         )
         weights, ids = _gather_partitioned_topk(group, local_weights, local_ids, topk)
         return weights, ids, True
@@ -239,6 +241,7 @@ def _route_logical(
         scoring_fn=layer.scoring_func,
         layer=layer,
         input_ids=input_ids,
+        score_bias=score_bias,
     )
     return weights, ids, False
 
@@ -325,6 +328,7 @@ def route(
     hidden_states: torch.Tensor,
     router_logits: torch.Tensor,
     input_ids: torch.Tensor | None = None,
+    score_bias: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Quantization-independent routing entry point for the TPU MoE methods.
 
@@ -334,10 +338,11 @@ def route(
     priority if enabled, else a model-supplied ``custom_routing_function`` if
     present, else our own ``select_experts``. When Dynamic EPLB places ``layer``,
     the selected logical expert IDs are remapped to physical slot IDs and
-    accumulated into ``layer._tpu_expert_load``.
+    accumulated into ``layer._tpu_expert_load``. ``score_bias`` replaces the
+    layer's ``e_score_correction_bias`` (see ``select_experts``).
     """
     topk_weights, topk_ids, already_gathered = _route_logical(
-        layer, hidden_states, router_logits, input_ids=input_ids
+        layer, hidden_states, router_logits, input_ids=input_ids, score_bias=score_bias
     )
     topk_ids = _apply_placement_and_load(
         layer,
@@ -400,6 +405,7 @@ def select_experts(
     scoring_fn: str,
     layer=None,
     input_ids: torch.Tensor | None = None,
+    score_bias: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Compute local routed expert IDs and weights for non-EP execution.
 
@@ -410,7 +416,8 @@ def select_experts(
     2. Grouped top-k routing (if `layer.use_grouped_topk` is enabled AND the group
        config actually requires grouped selection).
     3. Classic top-k routing with configurable scoring_fn (e.g. `sqrtsoftplus` for
-       DeepSeek-V4) and optional `e_score_correction_bias`.
+       DeepSeek-V4) and optional `e_score_correction_bias`. A caller's
+       `score_bias`, [experts] or one row per scored token, replaces it.
     """
     # Profiling-only override; a no-op unless a routing-simulation strategy is
     # set. Replaces the whole routing output, so return early.
@@ -461,24 +468,11 @@ def select_experts(
         return topk_weights.to(hidden_states.dtype), topk_ids.to(torch.int32)
 
     scores = _apply_scoring_fn(scoring_fn, router_logits.float())
-    e_score_correction_bias = (
-        layer.e_score_correction_bias if layer is not None else None
-    )
+    if score_bias is None and layer is not None:
+        score_bias = layer.e_score_correction_bias
 
-    if e_score_correction_bias is not None:
-        bias_shape = [1] * (scores.dim() - 1) + [-1]
-        bias = e_score_correction_bias.float().view(bias_shape)
-        # Set by DeepseekV41MoE on vision checkpoints: image tokens select
-        # with bias_vl, as upstream's router does.
-        bias_vl = getattr(layer, "bias_vl", None)
-        if bias_vl is not None:
-            assert layer is not None and input_ids is not None
-            # One id per scored row; raises if the ids were not gathered with
-            # the hidden states.
-            ids = input_ids.reshape(*scores.shape[:-1], 1)
-            image = (ids >= layer.image_sentinel_lo) & (ids < layer.image_sentinel_hi)
-            bias = torch.where(image, bias_vl.float().view(bias_shape), bias)
-        scores_for_choice = scores + bias
+    if score_bias is not None:
+        scores_for_choice = scores + score_bias.float()
         _, topk_ids = _topk(scores_for_choice, topk)
         topk_weights = _gather_expert_scores(scores, topk_ids)
     else:

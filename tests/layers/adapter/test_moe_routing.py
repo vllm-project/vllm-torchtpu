@@ -274,23 +274,15 @@ def test_gather_expert_scores_ignores_nonfinite_unselected_scores():
     assert torch.equal(got, torch.tensor([[0.25, 0.5]]))
 
 
-def test_route_selects_image_rows_with_bias_vl(monkeypatch):
+def test_route_selects_each_row_with_its_score_bias(monkeypatch):
     import torch
 
     monkeypatch.setattr(moe_routing, "_ROUTER_TOPK", "sort")
-    lo = 129264
     layer = _routing_layer(topk=1, renormalize=False)
-    layer.e_score_correction_bias = torch.tensor([10.0, 0.0, 0.0, 0.0])
-    hidden = torch.ones(3, 4)
-    logits = torch.zeros(3, 4)
-    input_ids = torch.tensor([7, lo, lo + 4])
-    text_ids = moe_routing.route(layer, hidden, logits, input_ids=input_ids)[1]
-    assert text_ids.tolist() == [[0], [0], [0]]
-    layer.bias_vl = torch.tensor([0.0, 0.0, 0.0, 10.0])
-    layer.image_sentinel_lo = lo
-    layer.image_sentinel_hi = lo + 5
-    weights, ids = moe_routing.route(layer, hidden, logits, input_ids=input_ids)
-    # Text picks with e_score_correction_bias, image rows with bias_vl; the
-    # weights are the unbiased scores either way.
-    assert ids.tolist() == [[0], [3], [3]]
-    torch.testing.assert_close(weights, torch.full((3, 1), 0.25))
+    bias = torch.tensor([[10.0, 0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 10.0]])
+    weights, ids = moe_routing.route(
+        layer, torch.ones(2, 4), torch.zeros(2, 4), score_bias=bias
+    )
+    # Each row selects with its own bias; the weights are the unbiased scores.
+    assert ids.tolist() == [[0], [3]]
+    torch.testing.assert_close(weights, torch.full((2, 1), 0.25))

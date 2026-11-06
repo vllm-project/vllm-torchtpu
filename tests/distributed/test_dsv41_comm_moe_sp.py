@@ -282,10 +282,15 @@ def test_moe_forward_sp_input_ids_gathering(
         assert captured_args["input_ids"] is input_ids
 
 
-@pytest.mark.parametrize("layer,expected", [(3, True), (43, False)])
-@pytest.mark.parametrize("moe", ["gmm", "fused_ep_w4a8"])
-def test_moe_init_mirrors_bias_vl_onto_the_experts(monkeypatch, layer, expected, moe):
-    """Target layers get bias_vl on the experts; DSpark draft layers do not."""
+@pytest.mark.parametrize(
+    "layer,language_only,expected",
+    [(3, False, True), (43, False, False), (3, True, False)],
+)
+def test_moe_init_mirrors_bias_vl_onto_the_experts(
+    monkeypatch, layer, language_only, expected
+):
+    """Target layers get bias_vl on the experts; DSpark draft layers and
+    language-only servers do not."""
     bias_vl = torch.nn.Parameter(torch.zeros(4), requires_grad=False)
     experts = SimpleNamespace()
 
@@ -296,13 +301,13 @@ def test_moe_init_mirrors_bias_vl_onto_the_experts(monkeypatch, layer, expected,
         self.experts = SimpleNamespace(routed_experts=experts)
 
     monkeypatch.setattr(moe_quant.DeepseekV4MoE, "__init__", mock_super_init)
-    warn = Mock()
-    monkeypatch.setattr(moe_quant.logger, "warning_once", warn)
     vllm_config = SimpleNamespace(
         parallel_config=SimpleNamespace(enable_eplb=False),
         kernel_config=SimpleNamespace(moe_backend="native"),
-        model_config=SimpleNamespace(hf_config=SimpleNamespace(num_hidden_layers=43)),
-        additional_config={"deepseek_v41": {"moe": moe}},
+        model_config=SimpleNamespace(
+            hf_config=SimpleNamespace(num_hidden_layers=43),
+            multimodal_config=SimpleNamespace(language_model_only=language_only),
+        ),
     )
     moe_quant.DeepseekV41MoE(vllm_config)
     if expected:
@@ -313,4 +318,3 @@ def test_moe_init_mirrors_bias_vl_onto_the_experts(monkeypatch, layer, expected,
         )
     else:
         assert vars(experts) == {}
-    assert warn.called == (expected and moe == "fused_ep_w4a8")
