@@ -464,6 +464,22 @@ def test_pack_halves_round_trips_every_non_nan_bf16_value():
         np.testing.assert_array_equal(np.asarray(unpack(packed)).view(np.uint16), np.asarray(v).view(np.uint16))
 
 
+def test_packed_combine_uses_half_the_column_partitions():
+    """mb7 j-96c738be: the packed combine with the unpacked partitioning (320
+    words per partition, not lane-tile aligned) failed to compile; with half
+    the column partitions (640 words) it ran bitwise."""
+    from jax._src import tpu_info as ti
+
+    from vllm_torchtpu.kernels.sparse_core import ragged_gather_reduce_v3 as v3
+
+    info = ti.get_tpu_info_for_chip(ti.ChipVersion.TPU_7X, 1)
+    assert v3.partition_counts(2560, info) == (4, 8)
+    assert v3.partition_counts(2560, info, packed=True) == (2, 16)
+    assert v3.packed_gather_words(2560, info) % info.num_lanes == 0
+    assert v3.packed_gather_words(2560, info) == 640
+    assert v3.token_block_alignment(2560, info, packed=True) == 2 * v3.token_block_alignment(2560, info)
+
+
 def test_packed_combine_fallback_equals_the_unpacked_combine(monkeypatch):
     """Without SparseCores the packed combine unpacks and runs the reference
     combine: the same bf16 output as the unpacked rows."""

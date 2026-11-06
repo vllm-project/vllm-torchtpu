@@ -43,8 +43,7 @@ def _bench_mode() -> str:
     """Bench-only attribution knob (TPU_SC_COMBINE_BENCH, ported from the
     Qwen3.5 branch): "skip_math" keeps the row gathers and drops the
     scatter-adds, "half_cols" scatter-adds the first half of each column
-    partition. "packed_wide" halves the column partitions of the packed-row
-    variant. With TPU_SC_COMBINE_DENSE=reg, "dense_pairadd" reassociates
+    partition. With TPU_SC_COMBINE_DENSE=reg, "dense_pairadd" reassociates
     each run's sums and "dense_forcegate" sends partial blocks through the
     run table: must-fail controls of the hash comparison. Must stay unset in
     serving (the output is then wrong)."""
@@ -127,19 +126,32 @@ def _calculate_num_column_partitions(
     return num_column_partitions
 
 
-def partition_counts(hidden_size: int, tpu_info) -> tuple[int, int]:
-    """Column and row partition counts of the SparseCore subcores for a width."""
+def partition_counts(hidden_size: int, tpu_info, packed: bool = False) -> tuple[int, int]:
+    """Column and row partition counts of the SparseCore subcores for a width.
+
+    packed (gmm_v2 pack_out rows): half as many column partitions, so a route's
+    single-row gather is as large as an unpacked row-pair gather and its
+    column offset stays lane-tile aligned (mb7 j-96c738be: with the unpacked
+    partitioning, 320 words per partition, it failed to compile: "offsets
+    along tiled dimensions must be aligned to tiles")."""
     sc_info = tpu_info.sparse_core
     num_cores = sc_info.num_cores * sc_info.num_subcores
     num_column_partitions = _calculate_num_column_partitions(
         hidden_size, num_cores, tpu_info.num_lanes
     )
+    if packed and num_column_partitions % 2 == 0:
+        num_column_partitions //= 2
     return num_column_partitions, num_cores // num_column_partitions
 
 
-def token_block_alignment(hidden_size: int, tpu_info) -> int:
+def packed_gather_words(hidden_size: int, tpu_info) -> int:
+    """32-bit words a packed route gathers per column partition."""
+    return hidden_size // 2 // partition_counts(hidden_size, tpu_info, packed=True)[0]
+
+
+def token_block_alignment(hidden_size: int, tpu_info, packed: bool = False) -> int:
     """Destination-token granularity: one 64-token block per row partition."""
-    return partition_counts(hidden_size, tpu_info)[1] * _TOKEN_BLOCK
+    return partition_counts(hidden_size, tpu_info, packed)[1] * _TOKEN_BLOCK
 
 
 def _main_kernel(
@@ -561,11 +573,13 @@ def ragged_gather_reduce(
         hidden = 2 * x.shape[-1]
         sc_info = pltpu.get_tpu_info().sparse_core
         num_column_partitions = (
-            partition_counts(hidden, pltpu.get_tpu_info())[0] if sc_info is not None else 1
+            partition_counts(hidden, pltpu.get_tpu_info(), packed=True)[0]
+            if sc_info is not None
+            else 1
         )
         if (
             sc_info is None
-            or (hidden // 2) % (num_column_partitions * _TOKEN_SUBCHUNK) != 0
+            or (hidden // 2) % (num_column_partitions * pltpu.get_tpu_info().num_lanes) != 0
             or jnp.size(x) * 4 * 2 < pltpu.get_tpu_info().vmem_capacity_bytes * 0.6
         ):
             return _fallback_implementation(
@@ -608,13 +622,8 @@ def ragged_gather_reduce(
             f"{1 << _ROUTE_INDEX_BITS} source rows, got {x.shape[0]}"
         )
     num_column_partitions, num_row_partitions = partition_counts(
-        hidden_size, pltpu.get_tpu_info()
+        hidden_size, pltpu.get_tpu_info(), packed=x_packed
     )
-    if x_packed and _bench_mode() == "packed_wide" and num_column_partitions % 2 == 0:
-        # bench-only: half as many column partitions, so each packed route DMA is as
-        # large as an unpacked one (half the descriptors, half the bytes)
-        num_column_partitions //= 2
-        num_row_partitions *= 2
 
     token_alignment = num_row_partitions * _TOKEN_BLOCK
     padded_num_tokens = _align_to(num_tokens, token_alignment)

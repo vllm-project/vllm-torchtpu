@@ -43,6 +43,7 @@ from vllm_torchtpu.kernels.sparse_core.ragged_gather_reduce_v3 import (
     ragged_gather_reduce as ragged_gather_reduce_v3,
 )
 from vllm_torchtpu.kernels.sparse_core.ragged_gather_reduce_v3 import (
+    packed_gather_words,
     token_block_alignment,
 )
 from vllm_torchtpu.kernels.sparse_core.ragged_gather_v2 import ragged_gather_v2
@@ -567,6 +568,7 @@ def _local_ragged_combine_eligible(
     num_routes: int,
     onehot_moe_permute_threshold: int,
     num_tokens: int,
+    packed: bool = False,
 ) -> bool:
     """Whether the non-EP combine of a [num_rows, width] expert output runs on
     the destination-major SparseCore kernel (ragged_gather_reduce_v3)."""
@@ -603,7 +605,10 @@ def _local_ragged_combine_eligible(
     # The kernel pads destination tokens to one 64-token block per SparseCore
     # row partition: require at least one full block and padding of at most
     # half the batch.
-    alignment = token_block_alignment(width, tpu_info)
+    alignment = token_block_alignment(width, tpu_info, packed)
+    if packed and packed_gather_words(width, tpu_info) % tpu_info.num_lanes:
+        # partition offsets must be lane-tile aligned (mb7: 320 words failed to compile)
+        return False
     padded_tokens = -(-num_tokens // alignment) * alignment
     return num_tokens >= alignment and padded_tokens * 2 <= num_tokens * 3
 
@@ -737,7 +742,9 @@ def moe_gmm(
         and x.dtype == jnp.bfloat16
         and get_packing_factor(w2.dtype, rhs_quant_dtype) == 1
         and (size_n // 2) % 128 == 0
-        and _local_ragged_combine_eligible(gmm1_res.shape[0], size_n, x.dtype, **combine_kw)
+        and _local_ragged_combine_eligible(
+            gmm1_res.shape[0], size_n, x.dtype, packed=True, **combine_kw
+        )
     )
     gmm2_res = gmm_wrapper(
         gmm1_res,
