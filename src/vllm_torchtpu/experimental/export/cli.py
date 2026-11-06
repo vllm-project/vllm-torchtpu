@@ -195,7 +195,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help=(
             "Comma-separated glob patterns of module names (e.g. "
             "'model.layers.3.self_attn,mtp.fc'; MTP draft modules start with "
-            "'mtp.'). Also exports forward and mtp_draft for the smallest token "
+            "'mtp.'). Also exports forward and draft for the smallest token "
             "bucket with those modules' outputs as extra results, under "
             "assets.extra/debug/, for comparing intermediates against vLLM. The "
             "serving artifact is unchanged."
@@ -297,7 +297,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
 # Speculative methods the artifact can declare, with the fields each takes: ngram
 # drafts on the host from the sequence itself; mtp drafts with the model's MTP
-# layer, which the export lowers as `mtp_draft`.
+# layer (the adapter's `mtp_draft()`), which the export lowers as the drafter
+# `draft` / `draft_bucket{B}`.
 _SPECULATIVE_FIELDS = {
     "ngram": frozenset(
         {"method", "num_speculative_tokens", "prompt_lookup_max", "prompt_lookup_min"}
