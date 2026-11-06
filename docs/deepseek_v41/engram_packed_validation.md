@@ -100,5 +100,30 @@ to establish that its measured requests use the new kernel.
   and captures both profiles, but fails the original `atol=0.02, rtol=0.01`
   output comparison: maximum absolute difference 0.125 and mean absolute
   difference 0.0003613378. Outputs are finite and masked rows are preserved.
-  This result is being diagnosed; it is not a successful numerical or
-  full-model validation. Full-model A/B remains pending behind this gate.
+  Of 5,898,240 values, 1,967 exceed tolerance, in three token/head pairs.
+- Actual TPU intermediate exports reproduce the original fused Y exactly.
+  Q bytes, sx FP32 bits and all ten FP32 projection results match the
+  original path exactly. Applying `BF16((C * sx) * weight_scale)` also
+  matches its full BF16 KV exactly. Same-C CPU reconstruction with FP32 K
+  reproduces all 1,967 failures; restoring BF16 K yields zero failures.
+  Near-zero gate scores amplify this rounding difference through the
+  signed square root. The pushed design retains FP32 K; its original
+  accuracy result remains failed and is not relabeled as passing.
+- Existing five-call real Torch device profiles measure primary modules
+  at 183.515006 us unfused and 109.960384 us fused, with a fused custom-call
+  median of 101.570228 us. A separate `as_strided` module adds about
+  3.43 us in either path. The host synchronized timing medians are
+  515.7135 us and 437.231 us. These boundaries differ; neither this
+  single-layer comparison nor the earlier JAX fixture is full-model E2E.
+- An independent BF16-K compatibility snapshot restores the K boundary
+  before statistics and removes the deferred sx factors. Its real-layer
+  replay passes the original tolerance, with maximum error 0.015625 and
+  mean error about 6.72e-8. Its separate five-call profile measures a
+  100.903962 us custom call inside a 109.306122 us module. These separate
+  captures do not establish a speedup over FP32 K, and this snapshot is
+  not the pushed default.
+- Full-model performance diagnostics use the pushed FP32-K design, with
+  `validation_status=known_precision_difference`; accuracy remains a
+  separate failed comparison. Real model A/B has started, and its serving
+  timings, fused-call coverage and profiles remain pending. This is not
+  a model-quality validation.
