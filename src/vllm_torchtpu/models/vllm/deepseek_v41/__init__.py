@@ -1,0 +1,67 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""DeepSeek-V4.1 model modules for TPU."""
+
+from .attention import (
+    AttentionBackend,
+    CompressorStateCache,
+    DeepseekCompressor,
+    DeepseekV41Attention,
+    DeepseekV41Indexer,
+    IndexerCache,
+    SWACache,
+    TpuSparseAttnIndexer,
+    publish_candidate_blocks,
+    save_compress_norm,
+)
+from .cache import NativeCacheView, PagedCacheRows
+from .ced import DecoderReplayPlan, build_decoder_inverse_rows
+from .dspark import DSparkDeepseekV41ForCausalLM, DSparkDeepseekV41Model
+from .engram import (
+    Engram,
+    NgramHashState,
+    ParallelEngramEmbedding,
+    TpuDPSharedEngramStorage,
+    dequant_fp8_rows,
+)
+from .model import DeepseekV41DecoderLayer, DeepseekV41ForCausalLM, DeepseekV41Model
+from .moe import DeepseekV41MoE
+
+__all__ = [
+    "AttentionBackend",
+    "CompressorStateCache",
+    "DSparkDeepseekV41ForCausalLM",
+    "DSparkDeepseekV41Model",
+    "DecoderReplayPlan",
+    "DeepseekCompressor",
+    "DeepseekV41Attention",
+    "DeepseekV41DecoderLayer",
+    "DeepseekV41ForCausalLM",
+    "DeepseekV41Indexer",
+    "DeepseekV41MoE",
+    "DeepseekV41Model",
+    "Engram",
+    "IndexerCache",
+    "NativeCacheView",
+    "NgramHashState",
+    "PagedCacheRows",
+    "ParallelEngramEmbedding",
+    "SWACache",
+    "TpuDPSharedEngramStorage",
+    "TpuSparseAttnIndexer",
+    "build_decoder_inverse_rows",
+    "dequant_fp8_rows",
+    "publish_candidate_blocks",
+    "save_compress_norm",
+]

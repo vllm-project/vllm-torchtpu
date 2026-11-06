@@ -108,6 +108,8 @@ PATCHES = (
         _ENGINE,
     ),
     Patch("vllm_torchtpu:_patch_dflash_drafting_slot_budget", _ENGINE),
+    Patch("vllm_torchtpu:_patch_dflash_sliding_window_retained_tokens", _ENGINE),
+    Patch("vllm_torchtpu:_patch_circular_buffer_block_zeroing", _ENGINE),
     Patch("vllm_torchtpu:_patch_vllm_kimi_kda_layer_counts", _ACTIVE),
     # Process setup and runner selection.
     Patch("vllm_torchtpu:_patch_multiproc_worker_global_rank_env", _ACTIVE),

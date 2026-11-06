@@ -500,6 +500,16 @@ class TPUWorker(WorkerBase):
         # f"hbm={utils.hbm_usage_gb(self.devices)}GiB")
         vllm_utils.report_usage_stats(self.vllm_config)
 
+    def _reserve_native_kv_companion_memory(self, available: int, *, auto: bool) -> int:
+        """Deduct companion KV pool HBM via the first `NativeKVCacheLayer`."""
+        forward_context = self.vllm_config.compilation_config.static_forward_context
+        for layer in forward_context.values():
+            if isinstance(layer, utils.NativeKVCacheLayer):
+                return layer.reserve_companion_memory(
+                    self.vllm_config, available, auto=auto
+                )
+        return available
+
     def determine_available_memory(self) -> int:
         # To determine a reasonable kv_cache_memory_bytes for a specific vllm
         # setup, users can run vllm without this flag, and collect the
@@ -516,7 +526,9 @@ class TPUWorker(WorkerBase):
                 "correspondingly."
             )
             logger.info(msg)
-            return kv_cache_memory_bytes
+            return self._reserve_native_kv_companion_memory(
+                kv_cache_memory_bytes, auto=False
+            )
 
         # VLLM directive of the percentage of HBM memory the model executor can use
         self.model_runner.profile_run(self.model_runner.max_num_tokens)
@@ -588,7 +600,7 @@ class TPUWorker(WorkerBase):
                 (available - cap) / utils.GBYTES,
             )
             available = cap
-        return available
+        return self._reserve_native_kv_companion_memory(available, auto=True)
 
     def _pooling_kv_cache_cap_bytes(self) -> int | None:
         """Deterministic KV budget for pure pooling models, or None.
@@ -843,9 +855,6 @@ class TPUWorker(WorkerBase):
 
     def get_kv_cache_spec(self):
         return self.model_runner.get_kv_cache_spec()
-
-    def reset_encoder_cache(self) -> None:
-        self.model_runner.reset_encoder_cache()
 
     def add_lora(self, lora_request: LoRARequest) -> bool:
         return self.model_runner.add_lora(lora_request)

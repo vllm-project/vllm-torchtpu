@@ -11,7 +11,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from vllm.model_executor.models.config import VerifyAndUpdateConfig
+from vllm.config import ModelConfig
+from vllm.model_executor.models.config import (
+    DeepseekV4ForCausalLMConfig,
+    VerifyAndUpdateConfig,
+)
 
 from vllm_torchtpu.gqa_head_padding import update_gqa_head_padding_config
 
@@ -22,9 +26,22 @@ _K3_DSPARK_MODEL = "vllm_torchtpu.models.vllm.kimi_k3:K3DSparkForCausalLM"
 _DSV4_DSPARK_MODEL = (
     "vllm_torchtpu.models.vllm.deepseek_v4.dspark:DSparkDeepseekV4ForCausalLM"
 )
+_DSV41_MODEL = "vllm_torchtpu.models.vllm.deepseek_v41.model:DeepseekV41ForCausalLM"
+_DSV41_DSPARK_MODEL = (
+    "vllm_torchtpu.models.vllm.deepseek_v41.dspark:DSparkDeepseekV41ForCausalLM"
+)
 _QWEN35_MTP_MODEL = "vllm_torchtpu.models.vllm.qwen3_5_mtp:Qwen3_5MTP"
 _QWEN35_MOE_MTP_MODEL = "vllm_torchtpu.models.vllm.qwen3_5_mtp:Qwen3_5MoeMTP"
 _QWEN4_EXP_MODEL = "vllm_torchtpu.models.vllm.qwen4_exp.model:Qwen4ExpForCausalLM"
+
+
+class _TPUDeepseekV41Config(DeepseekV4ForCausalLMConfig):
+    """Refresh ``model_arch_config`` after ``deepseek_v4_fp8`` method rewrite."""
+
+    @staticmethod
+    def verify_and_update_model_config(model_config: ModelConfig) -> None:
+        DeepseekV4ForCausalLMConfig.verify_and_update_model_config(model_config)
+        model_config.model_arch_config = model_config.get_model_arch_config()
 
 
 class _TPUKimiK3Config(VerifyAndUpdateConfig):
@@ -51,8 +68,10 @@ def register_models() -> None:
     ModelRegistry.register_model("KimiLinearForCausalLM", _KIMI_MODEL)
     ModelRegistry.register_model("KimiK3ForConditionalGeneration", _KIMI_K3_MODEL)
     ModelRegistry.register_model("DeepseekV4ForCausalLM", _DSV4_MODEL)
+    ModelRegistry.register_model("DeepseekV41ForCausalLM", _DSV41_MODEL)
     ModelRegistry.register_model("K3DSparkModel", _K3_DSPARK_MODEL)
     ModelRegistry.register_model("DSparkDraftModel", _DSV4_DSPARK_MODEL)
+    ModelRegistry.register_model("DSparkV41DraftModel", _DSV41_DSPARK_MODEL)
     # The Qwen3.5 MTP drafts, so a pipeline-parallel producer can load them.
     ModelRegistry.register_model("Qwen3_5MTP", _QWEN35_MTP_MODEL)
     ModelRegistry.register_model("Qwen3_5MoeMTP", _QWEN35_MOE_MTP_MODEL)
@@ -60,6 +79,7 @@ def register_models() -> None:
     # The released checkpoint declares the vision-language arch; serve it with
     # the text-only model.
     ModelRegistry.register_model("Qwen4ExpForConditionalGeneration", _QWEN4_EXP_MODEL)
+    MODELS_CONFIG_MAP["DeepseekV41ForCausalLM"] = _TPUDeepseekV41Config
     MODELS_CONFIG_MAP["KimiK3ForConditionalGeneration"] = _TPUKimiK3Config
     MODELS_CONFIG_MAP["Qwen4ExpForCausalLM"] = TPUQwen4ExpConfig
     MODELS_CONFIG_MAP["Qwen4ExpForConditionalGeneration"] = TPUQwen4ExpConfig
