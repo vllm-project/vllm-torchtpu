@@ -1,3 +1,21 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+import dataclasses
+from typing import Any
+
+import torch.distributed.distributed_c10d as c10d
+from vllm.distributed import parallel_state
 from vllm.utils.network_utils import get_ip
 
 from vllm_torchtpu import envs
@@ -298,3 +316,112 @@ def configure_raiden_telemetry(backends: list[str] | set[str] | None = None) -> 
             logger.info("Configured TPU Raiden C++ telemetry backends")
     except Exception as e:
         logger.warning("Failed to configure TPU Raiden C++ telemetry: %s", e)
+
+
+@dataclasses.dataclass(frozen=True)
+class _GroupMetadata:
+    kind: str | None = None
+    role: str | None = None
+    size: int | None = None
+    ranks: tuple[int, ...] | None = None
+    group_ranks: tuple[tuple[int, ...], ...] | None = None
+
+
+def _find_vllm_group(group_name: str) -> Any | None:
+    """Find a registered vLLM `GroupCoordinator` by `unique_name` or `device_group`."""
+    group_ref = parallel_state._groups.get(group_name)
+    if group_ref is not None:
+        group = group_ref()
+        if group is not None:
+            return group
+    for group_ref in parallel_state._groups.values():
+        group = group_ref()
+        if (
+            group is not None
+            and group.device_group is not None
+            and group.device_group.group_name == group_name
+        ):
+            return group
+    return None
+
+
+def _resolve_group_metadata(group_name: str) -> _GroupMetadata:
+    """Resolve `GroupCoordinator` or `c10d` metadata for `group_name`."""
+    group = _find_vllm_group(group_name)
+    if group is not None:
+        role = group.unique_name.partition(":")[0]
+        ranks = tuple(int(r) for r in group.ranks)
+        group_ranks = (
+            tuple(tuple(int(r) for r in sg) for sg in group.group_ranks)
+            if group.group_ranks
+            else None
+        )
+        return _GroupMetadata(
+            kind="vllm_pg",
+            role=role,
+            size=int(group.world_size),
+            ranks=ranks,
+            group_ranks=group_ranks,
+        )
+
+    try:
+        pg = c10d._resolve_process_group(c10d.GroupName(group_name))
+        ranks = tuple(int(r) for r in c10d.get_process_group_ranks(pg))
+    except (KeyError, ValueError, RuntimeError):
+        return _GroupMetadata()
+    if ranks:
+        return _GroupMetadata(
+            kind="c10d_pg",
+            size=len(ranks),
+            ranks=ranks,
+        )
+    return _GroupMetadata()
+
+
+def _canonicalize_process_group_name(
+    group_name: str,
+    ordinal: int,
+    *,
+    global_tiling: bool = True,
+) -> str:
+    """Map a rank-local process-group handle to a canonical token.
+
+    When `global_tiling` is True (TorchTPU >= 0.2.0 with `GatherAllSubgroups`,
+    or any graph containing a world-sized op that forces an all-device
+    `DeviceAssignment`), ranks in different subgroups compile identical
+    all-device SPMD executables. When a vLLM `GroupCoordinator` is registered
+    for `group_name` (either by `unique_name` or `device_group.group_name`),
+    its full `group_ranks` partition is encoded directly so wrap-around subgroup
+    layouts (such as `tpu7x` topology-aware PCP/TP meshes) match across all
+    subgroups. Raw `c10d` groups fall back to subgroup size and rank-stride
+    geometry.
+
+    When `global_tiling` is False (legacy TorchTPU < 0.2.0 compiling a pure
+    subgroup graph with no world-sized op), the compiled executable's
+    `DeviceAssignment` is bound to that subgroup's physical devices, so the
+    token preserves the subgroup's rank membership (`ranks=...`). Ranks within
+    the same subgroup still share the same token and replay from their subgroup
+    leader, while ranks in different subgroups get distinct tokens.
+    """
+    meta = _resolve_group_metadata(group_name)
+    strides = (
+        tuple(meta.ranks[i + 1] - meta.ranks[i] for i in range(len(meta.ranks) - 1))
+        if meta.ranks is not None and len(meta.ranks) > 1
+        else ()
+    )
+    if meta.kind == "vllm_pg":
+        if global_tiling:
+            if meta.group_ranks is not None:
+                return (
+                    f"vllm_pg:{ordinal}:{meta.role}:size={meta.size}"
+                    f":group_ranks={meta.group_ranks}"
+                )
+            return f"vllm_pg:{ordinal}:{meta.role}:size={meta.size}:strides={strides}"
+        if meta.ranks is not None:
+            return f"vllm_pg:{ordinal}:{meta.role}:size={meta.size}:ranks={meta.ranks}"
+        return f"vllm_pg:{ordinal}:{group_name}:size={meta.size}"
+    if meta.kind == "c10d_pg":
+        if global_tiling:
+            return f"c10d_pg:{ordinal}:size={meta.size}:strides={strides}"
+        return f"c10d_pg:{ordinal}:size={meta.size}:ranks={meta.ranks}"
+    raise ValueError(f"Cannot resolve process group {group_name!r}")

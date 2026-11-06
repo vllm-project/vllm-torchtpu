@@ -729,7 +729,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Replay a bucket another rank of the host compiled instead of compiling
     # it again: under TPU_PARALLEL_PRECOMPILE each bucket gets one owner rank
     # per host and the others wait for its artifact. Off compiles every bucket
-    # on every rank, sharing only through the Tier-2 cache.
+    # on every rank, sharing only through the Tier-2 cache. A graph with a
+    # rooted or point-to-point collective, or a process group that neither
+    # parallel_state nor c10d resolves, gets fingerprint None, so every rank
+    # compiles it and logs one "Could not fingerprint graph" warning.
     "TPU_PRECOMPILE_PEER_REPLAY": env_bool("TPU_PRECOMPILE_PEER_REPLAY", default=False),
     # Token-axis chunk size for the GLM-5.2 / DSv4 StreamIndex top-k kernel.
     # Cutting the flat token axis into `chunk_tokens`-sized pieces lets each

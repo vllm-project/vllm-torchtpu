@@ -11,7 +11,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
 """TPU compiler adaptor for vLLM's VLLM_COMPILE mode.
 
 This module implements the CompilerInterface for TPU, enabling
@@ -48,6 +47,10 @@ from vllm.config.utils import Range
 
 from vllm_torchtpu import envs, utils
 from vllm_torchtpu.compilation import shape_variants
+from vllm_torchtpu.compilation.graph_fingerprint import (
+    _graph_fingerprint,
+    _has_subgroup_follower_role,
+)
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
@@ -93,9 +96,6 @@ _tpu_backend = TpuBackend()
 # than stalling startup for an hour.
 PEER_WAIT_S = 600.0
 _PEER_POLL_S = 0.5
-# get_attr tensors up to this size are hashed by value; bigger ones, which are
-# weights rather than constants, by dtype and shape.
-_FINGERPRINT_MAX_NUMEL = 1 << 16
 
 _peer_wait = threading.local()
 
@@ -115,41 +115,6 @@ def wait_for_peer_artifact(timeout_s: float):
         _peer_wait.timeout_s = 0.0
 
 
-def _graph_fingerprint(graph: fx.GraphModule) -> str | None:
-    """Hash of the code of `graph` and its submodules and of their constants.
-
-    Two ranks with the same fingerprint traced the same program, so either can
-    replay the other's artifact. A rank-dependent value baked into the graph,
-    e.g. a Python int from `rank_in_group`, changes the code and so the hash.
-    None if the graph cannot be hashed; its artifact is then only replayed by
-    the rank that saved it.
-    """
-    try:
-        h = hashlib.sha256()
-        for name, module in graph.named_modules():
-            if not isinstance(module, fx.GraphModule):
-                continue
-            h.update(f"{name}\n{module.code}".encode())
-            for node in module.graph.nodes:
-                if node.op != "get_attr":
-                    continue
-                value = module
-                for atom in str(node.target).split("."):
-                    value = getattr(value, atom)
-                h.update(str(node.target).encode())
-                if not isinstance(value, torch.Tensor):
-                    h.update(type(value).__qualname__.encode())
-                    continue
-                h.update(f"{value.dtype}{tuple(value.shape)}".encode())
-                if value.numel() <= _FINGERPRINT_MAX_NUMEL:
-                    flat = value.detach().to("cpu").contiguous().reshape(-1)
-                    h.update(flat.view(torch.uint8).numpy().tobytes())
-        return h.hexdigest()
-    except Exception as e:
-        logger.warning("[TpuCompilerAdaptor] Could not fingerprint graph: %s", e)
-        return None
-
-
 def _deserialize_entry(entry: Any) -> Callable[..., Any]:
     """Rebuild a runnable from a bundled AOTAutograd entry.
 
@@ -166,11 +131,20 @@ def _deserialize_entry(entry: Any) -> Callable[..., Any]:
         deserialize_bundled_cache_entry,
     )
 
-    # Upstream PR #2068: Torch deep-copies the entry for reserialization,
-    # which vLLM never uses. CompiledArtifact.__reduce__ reloads the executable.
+    # `deserialize_bundled_cache_entry` deep-copies `entry` so the runnable can
+    # be serialized again. `CompiledArtifact` has no `__deepcopy__`, so the copy
+    # goes through `__reduce__` and loads a second PJRT executable per graph.
+    # vllm-torchtpu never re-serializes a replayed runnable, so return `entry`
+    # itself from `__deepcopy__` and reuse the loaded executable. Remove the
+    # temporary override in `finally:` so we do not leave an unpicklable lambda
+    # attribute on the caller's `entry` object.
     with contextlib.suppress(AttributeError, TypeError):
         entry.__deepcopy__ = lambda _memo: entry
-    return deserialize_bundled_cache_entry(entry)
+    try:
+        return deserialize_bundled_cache_entry(entry)
+    finally:
+        with contextlib.suppress(AttributeError, TypeError):
+            entry.__dict__.pop("__deepcopy__", None)
 
 
 _TPU_COMPILE_ENV_IGNORED = {
@@ -706,20 +680,28 @@ class TpuCompilerAdaptor(CompilerInterface):
     ) -> tuple[Callable[..., Any], str] | None:
         """Replay the artifact another rank saved for this bucket.
 
-        Waits for one to appear inside `wait_for_peer_artifact`. Returns the
-        runnable and the peer's path, or None to compile: nothing appeared in
-        time, or what appeared was built from a different graph -- then the
-        ranks do not trace the same program and waiting on would not help.
+        Waits for one to appear inside `wait_for_peer_artifact`. Scans all
+        available peer artifacts for one whose fingerprint matches `graph`, so
+        subgroup-bound executables (where each TP subgroup compiles its own
+        device assignment) match the peer from the same subgroup rather than
+        stopping at `paths[0]`.
         """
         deadline = time.monotonic() + getattr(_peer_wait, "timeout_s", 0.0)
-        paths = self._peer_paths(key)
-        while not paths and time.monotonic() < deadline:
+        keep_waiting_on_mismatch = _has_subgroup_follower_role(graph)
+        tried: set[str] = set()
+        while True:
+            for path in self._peer_paths(key):
+                if path in tried:
+                    continue
+                tried.add(path)
+                compiled_fn = self._replay(path, graph, was_wrapped, fingerprint)
+                if compiled_fn is not None:
+                    return compiled_fn, path
+            if tried and not keep_waiting_on_mismatch:
+                return None
+            if time.monotonic() >= deadline:
+                return None
             time.sleep(_PEER_POLL_S)
-            paths = self._peer_paths(key)
-        if not paths:
-            return None
-        compiled_fn = self._replay(paths[0], graph, was_wrapped, fingerprint)
-        return None if compiled_fn is None else (compiled_fn, paths[0])
 
     @staticmethod
     def _link_artifact(src: str, dst: str) -> bool:
@@ -844,6 +826,7 @@ class TpuCompilerAdaptor(CompilerInterface):
         # recompile path in `load`, not this one.
         handle = None
         if caching and entry is not None:
+            assert self.cache_dir is not None
             save_path = os.path.join(self.cache_dir, key)
             if self._save_handle(
                 key, save_path, entry, graph, was_wrapped, fingerprint

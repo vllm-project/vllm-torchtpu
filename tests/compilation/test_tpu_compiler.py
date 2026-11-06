@@ -14,13 +14,36 @@
 
 import importlib
 import os
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
 
+try:
+    from tests.compilation.test_graph_fingerprint import (
+        _trace_all_reduce_graph,
+        install_group_stand_ins,
+    )
+except ModuleNotFoundError:
+    from test_graph_fingerprint import (  # type: ignore[import-not-found]
+        _trace_all_reduce_graph,
+        install_group_stand_ins,
+    )
+from vllm_torchtpu.compilation import (
+    graph_fingerprint as graph_fingerprint_mod,
+)
+from vllm_torchtpu.compilation import (
+    tpu_compiler as tpu_compiler_mod,
+)
+from vllm_torchtpu.compilation.tpu_compiler import wait_for_peer_artifact
 from vllm_torchtpu.env_override import _TPU_VMEM_BYTES_PER_TENSOR_CORE
+
+
+@pytest.fixture
+def group_stand_ins(monkeypatch):
+    return install_group_stand_ins(monkeypatch)
 
 
 class TestTpuCompilerCache:
@@ -711,20 +734,136 @@ class TestTpuCompilerCache:
         with open(path, "rb") as f:
             assert pickle.load(f).fingerprint is None
 
+    def test_a_peer_artifact_is_replayed_across_c10d_subgroups(
+        self, tmp_path, monkeypatch, group_stand_ins
+    ):
+        """Ranks in distinct DP/TP subgroups trace different rank-local c10d
+        group_name strings for the same collective role, yet replay the first
+        rank's compiled artifact."""
+        (a, b), compile, compiled, replayed = self._peer_compilers(
+            tmp_path, monkeypatch
+        )
+        compile(a, _trace_all_reduce_graph("1"))
+        fn, handle = compile(b, _trace_all_reduce_graph("7"))
+
+        assert compiled == [0]
+        assert replayed == ["entry-from-rank-0"]
+        assert fn() == "entry-from-rank-0"
+        key, path, _ = handle
+        assert a.cache_dir is not None
+        assert os.path.samefile(path, os.path.join(a.cache_dir, key))
+
+    def test_replay_from_peer_scans_all_candidate_paths_for_subgroup_peers(
+        self, tmp_path, monkeypatch, group_stand_ins
+    ):
+        """In 8-rank 4xTP2 subgroup-bound mode, each follower skips earlier
+        subgroups' artifacts in _peer_paths and replays its own subgroup
+        leader's artifact."""
+        monkeypatch.setattr(graph_fingerprint_mod, "_distributed_world_size", lambda: 8)
+        monkeypatch.setattr(
+            graph_fingerprint_mod, "_supports_global_subgroup_tiling", lambda: False
+        )
+
+        tls = threading.local()
+        monkeypatch.setattr(
+            graph_fingerprint_mod,
+            "_distributed_rank",
+            lambda: getattr(tls, "rank", None),
+        )
+
+        compilers, compile, compiled, _replayed = self._peer_compilers(
+            tmp_path, monkeypatch, n=8
+        )
+        rank_to_pg = {
+            0: "1",
+            1: "1",
+            2: "3",
+            3: "3",
+            4: "5",
+            5: "5",
+            6: "7",
+            7: "7",
+        }
+
+        def _compile_rank(r: int):
+            tls.rank = r
+            return compile(compilers[r], _trace_all_reduce_graph(rank_to_pg[r]))
+
+        _compile_rank(0)
+
+        follower_threads: list[threading.Thread] = []
+        results: dict[int, tuple] = {}
+        followers_waiting = threading.Barrier(5)
+        orig_peer_paths = tpu_compiler_mod.TpuCompilerAdaptor._peer_paths
+
+        def _synced_peer_paths(adaptor, key):
+            if getattr(tls, "first_poll", False):
+                tls.first_poll = False
+                followers_waiting.wait(timeout=5.0)
+            return orig_peer_paths(adaptor, key)
+
+        monkeypatch.setattr(
+            tpu_compiler_mod.TpuCompilerAdaptor, "_peer_paths", _synced_peer_paths
+        )
+
+        def _run_waiter(r: int, is_follower: bool = False) -> None:
+            tls.first_poll = is_follower
+            with wait_for_peer_artifact(5.0):
+                results[r] = _compile_rank(r)
+
+        for r in (1, 3, 5, 7):
+            t = threading.Thread(target=_run_waiter, args=(r, True))
+            t.start()
+            follower_threads.append(t)
+
+        followers_waiting.wait(timeout=5.0)
+        for r in (2, 4, 6):
+            _run_waiter(r)
+
+        for t in follower_threads:
+            t.join(5.0)
+            assert not t.is_alive()
+
+        assert sorted(compiled) == [0, 2, 4, 6]
+        for follower, leader in ((1, 0), (3, 2), (5, 4), (7, 6)):
+            fn, (_, follower_path, _) = results[follower]
+            assert fn() == f"entry-from-rank-{leader}"
+            leader_cache_dir = compilers[leader].cache_dir
+            assert leader_cache_dir is not None
+            leader_path = os.path.join(leader_cache_dir, "artifact_bucket")
+            assert os.path.samefile(follower_path, leader_path)
+
+
+class _FakeBundledAOTEntry:
+    def __init__(self, *, fail: bool = False):
+        self.guards_expr = "guards"
+        self.sanitized_aot_config = None
+        self.fail = fail
+
+    def wrap_post_compile(self, example_inputs, aot_config, options):
+        if self.fail:
+            raise RuntimeError("wrap_post_compile failed")
+        return lambda boxed_args: sum(boxed_args)
+
+    def __deepcopy__(self, memo):
+        raise AssertionError("replay must not deepcopy the entry")
+
 
 def test_deserialize_entry_does_not_copy_the_entry():
-    """Replay rebuilds the runnable from the entry itself: a deepcopy would load
-    a second TPU executable."""
+    """Replay rebuilds the runnable from the entry itself without leaving a
+    __deepcopy__ override on the entry instance, even when deserialization
+    raises."""
+    import pickle
+
     from vllm_torchtpu.compilation.tpu_compiler import _deserialize_entry
 
-    class Entry:
-        def __init__(self):
-            self.guards_expr = "guards"
-            self.sanitized_aot_config = object()
+    entry = _FakeBundledAOTEntry()
+    assert _deserialize_entry(entry)(2, 3, 7) == 12
+    assert "__deepcopy__" not in entry.__dict__
+    assert isinstance(pickle.loads(pickle.dumps(entry)), _FakeBundledAOTEntry)
 
-        def wrap_post_compile(self, example_inputs, aot_config, options):
-            return lambda boxed_args: sum(boxed_args)
-
-    entry = Entry()
-    runnable = _deserialize_entry(entry)
-    assert runnable(1, 2, 3) == 6
+    failing_entry = _FakeBundledAOTEntry(fail=True)
+    with pytest.raises(RuntimeError, match="wrap_post_compile failed"):
+        _deserialize_entry(failing_entry)
+    assert "__deepcopy__" not in failing_entry.__dict__
+    assert isinstance(pickle.loads(pickle.dumps(failing_entry)), _FakeBundledAOTEntry)
