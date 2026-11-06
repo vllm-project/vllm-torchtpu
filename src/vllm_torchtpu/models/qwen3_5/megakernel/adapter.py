@@ -45,6 +45,13 @@ from vllm_torchtpu.megakernel import (
 )
 from vllm_torchtpu.megakernel import pool as pool_pkg
 from vllm_torchtpu.megakernel import runtime as mk_rt
+from vllm_torchtpu.megakernel.runtime.contract import (
+    Bucket,
+    Decline,
+    LayoutDecline,
+    RunnerShape,
+    WarmupCase,
+)
 from vllm_torchtpu.megakernel_runtime import (
     TorchStepMetaOps,
     build_pooled_step_op,
@@ -54,15 +61,7 @@ from vllm_torchtpu.megakernel_runtime import (
     load_vllm_weights,
     reshard_layer_experts_ep_to_tp,
 )
-from vllm_torchtpu.megakernel_runtime.plugin import (
-    Bucket,
-    Decline,
-    ForwardView,
-    LayoutDecline,
-    RunnerShape,
-    RunnerView,
-    WarmupCase,
-)
+from vllm_torchtpu.megakernel_runtime.plugin import ForwardView, RunnerView
 from vllm_torchtpu.megakernel_runtime.pool_facts import (
     conv_qk_pair_layout_enabled,
     framework_pool_layout_facts,
