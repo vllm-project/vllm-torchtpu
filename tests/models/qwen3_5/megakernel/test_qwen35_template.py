@@ -405,7 +405,8 @@ _QWEN_DECLINES = frozenset(
 def _false_result_codes(path: Path, *func_names: str) -> set[str]:
     """Literal codes of `EligibilityResult(False, <code>, ...)` / `Decline(<code>,
     ...)` in the named functions of `path` (all functions if none); a `code`
-    variable assigned string literals (or a conditional of them) counts too."""
+    variable assigned string literals (or a conditional of them) counts too,
+    and so does a decline-code constant of `megakernel.runtime.contract`."""
     tree = ast.parse(path.read_text(encoding="utf-8"))
     funcs = [
         n
@@ -414,9 +415,16 @@ def _false_result_codes(path: Path, *func_names: str) -> set[str]:
     ]
     assert not func_names or len(funcs) == len(func_names), func_names
 
+    from vllm_torchtpu.megakernel.runtime import contract
+
     def literals(expr: ast.AST) -> set[str]:
         if isinstance(expr, ast.Constant) and isinstance(expr.value, str):
             return {expr.value}
+        # A decline-code constant of the contract (e.g. `MESH_SIZE_MISMATCH`).
+        if isinstance(expr, ast.Name) and isinstance(
+            getattr(contract, expr.id, None), str
+        ):
+            return {getattr(contract, expr.id)}
         if isinstance(expr, ast.IfExp):
             return literals(expr.body) | literals(expr.orelse)
         return set()
