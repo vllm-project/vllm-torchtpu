@@ -177,16 +177,17 @@ def pcp_shard(x: torch.Tensor) -> torch.Tensor:
     from vllm_torchtpu.distributed.pcp import get_pcp_rank
 
     size = pcp_world_size()
-    # State that the step divides by the group, so the gathered result's
-    # size * (tokens // size) rows trace as the step's own token count.
-    torch._check(x.shape[0] % size == 0)
+    # Zero rows up to a multiple of the group (buckets need not divide by
+    # it); pcp_gather(...).narrow(0, 0, tokens) drops them again.
+    x = pad_shard(x, size)
     rows = x.shape[0] // size
     return x.narrow(0, get_pcp_rank() * rows, rows)
 
 
-def pcp_gather(x: torch.Tensor) -> torch.Tensor:
-    """All PCP ranks' shards back as the step-wide tensor, in token order."""
+def pcp_gather(x: torch.Tensor, num_tokens) -> torch.Tensor:
+    """All PCP ranks' shards back as the step's ``num_tokens`` rows, in token
+    order (the padding :func:`pcp_shard` added dropped)."""
     from vllm_torchtpu.distributed.pcp import all_gather_equal_tokens
 
-    return all_gather_equal_tokens(x, dim=0)
+    return all_gather_equal_tokens(x, dim=0).narrow(0, 0, num_tokens)
 
