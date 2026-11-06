@@ -28,13 +28,13 @@ MAX_SEQS = 4
 NUM_PAGES = 40
 
 
-def _xla_write_rows(cache, rows, pages, slots, *, max_runs, interpret=False):
+def _xla_write_rows(cache, rows, pages, slots, *, max_num_seqs, interpret=False):
     """`msa_write.write_rows` as an XLA scatter (same contract).
 
     The Pallas write is covered by test_msa_write; this keeps the test on the
     sharding logic and runnable where interpret mode lacks bitcasts.
     """
-    del max_runs, interpret
+    del max_num_seqs, interpret
     packing = cache.shape[2]
     return cache.at[pages, slots // packing, slots % packing].set(rows, mode="drop")
 

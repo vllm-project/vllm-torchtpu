@@ -98,22 +98,16 @@ def write_rows(
 ) -> jax.Array:
     """Write one row per token into a packed ``[pages, S / p, p, W]`` cache.
 
-    Only the pages that receive rows are rewritten (`msa_write`). A request's
+    Only the rows that change are rewritten (`msa_write`). A request's
     tokens must be consecutive with consecutive positions. `max_num_seqs`
     bounds the requests in the batch (default: one per token).
     """
-    num_tokens = rows.shape[0]
-    max_runs = msa_write.max_write_runs(
-        num_tokens,
-        num_tokens if max_num_seqs is None else max_num_seqs,
-        page_size(cache),
-    )
     return msa_write.write_rows(
         cache,
         _cache_rows(cache, rows),
         pages,
         pos % page_size(cache),
-        max_runs=max_runs,
+        max_num_seqs=rows.shape[0] if max_num_seqs is None else max_num_seqs,
         interpret=interpret,
     )
 
@@ -326,7 +320,7 @@ def write_index_shard(
         _cache_rows(index_cache, index_k[take]),
         own_pages,
         (pos[take] % block_size) // shards,
-        max_runs=msa_write.max_write_runs(size, max_num_seqs, shard_page),
+        max_num_seqs=max_num_seqs,
         interpret=interpret,
     )
 
