@@ -276,7 +276,7 @@ def _kernel_v3_batch(
 ):
     """`_kernel_v3` with the whole batch as one query tile: each work item
     scores one page group of one request against every token and keeps the
-    scores of its request's tokens."""
+    scores of its request's tokens and of the requests sharing those pages."""
     consume = _page_ring(
         lambda entry: entry >> _TILE_SHIFT,
         work_ref,
@@ -469,11 +469,36 @@ def _batch_scores(
     seq_pages = -(-seq_lens // page_size)
     groups = jnp.maximum(-(-seq_pages // pages_per_step), 1)
     group = jnp.arange(num_groups_per_seq, dtype=jnp.int32)
+    seq_ids = jnp.arange(max_num_seqs, dtype=jnp.int32)[:, None]
 
-    item_cols = starts | (ends << _TILE_SHIFT)
+    # Request r shares page group g with r - 1 when every page r reads there
+    # is the page r - 1 reads (a prefix-cache hit): r - 1's item, which
+    # scores every token, then keeps r's tokens too.
+    tables = block_tables.reshape(max_num_seqs, pages_per_seq)
+    reads = jnp.arange(pages_per_seq) < seq_pages[:, None]
+    same = ~reads[1:] | (reads[:-1] & (tables[1:] == tables[:-1]))
+    same = jnp.pad(
+        same, ((0, 0), (0, padded_pages - pages_per_seq)), constant_values=True
+    )
+    same = jnp.all(
+        same.reshape(max_num_seqs - 1, num_groups_per_seq, pages_per_step), axis=2
+    )
+    shares = jnp.pad((live[1:] & live[:-1])[:, None] & same, ((1, 0), (0, 0)))
+    # Each item keeps its request's tokens and those of the run of sharers
+    # that follows it.
+    next_break = jax.lax.cummin(
+        jnp.pad(
+            jnp.where(shares, max_num_seqs, seq_ids)[1:],
+            ((0, 1), (0, 0)),
+            constant_values=max_num_seqs,
+        ),
+        axis=0,
+        reverse=True,
+    )
+    item_cols = starts[:, None] | (ends[next_break - 1] << _TILE_SHIFT)
 
-    # Work list: every page group of every request, request-major.
-    item_ok = live[:, None] & (group < groups[:, None])
+    # Work list: the unshared page groups of every request, request-major.
+    item_ok = live[:, None] & (group < groups[:, None]) & ~shares
     item_ends = jnp.cumsum(item_ok.reshape(-1))
     num_items = item_ends[-1]
     w = jnp.arange(item_ends.shape[0], dtype=jnp.int32)
@@ -483,7 +508,7 @@ def _batch_scores(
     )
     work = ((item // num_groups_per_seq) << _TILE_SHIFT) | (item % num_groups_per_seq)
     # With no item, the single grid step keeps no token.
-    work_cols = jnp.where(w < num_items, item_cols[item // num_groups_per_seq], 0)
+    work_cols = jnp.where(w < num_items, item_cols.reshape(-1)[item], 0)
 
     page_shape = (pages_per_step, rows_per_page, packing, head_dim)
     return pl.pallas_call(

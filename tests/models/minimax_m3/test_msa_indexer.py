@@ -34,15 +34,24 @@ NUM_PAGES = 40
 @pytest.mark.parametrize("kernel", ["v1", "v2", "v3"])
 @pytest.mark.parametrize("dtype", CACHE_DTYPES)
 @pytest.mark.parametrize(
-    "q_lens,ctx_lens,block_q,large_block_q,pages_per_step",
+    "q_lens,ctx_lens,block_q,large_block_q,pages_per_step,shared_pages",
     [
         # small (decode, 3 tokens) and large (130 tokens: 3 large tiles)
-        ([1, 130, 3], [300, 200, 0], 64, 48, 4),
-        ([1, 1], [1000, 5], 128, 512, 2),  # small class only, page groups
+        ([1, 130, 3], [300, 200, 0], 64, 48, 4, 0),
+        ([1, 1], [1000, 5], 128, 512, 2, 0),  # small class only, page groups
+        # requests sharing a 5-page prefix: 2 shared page groups, 1 partly
+        ([2, 3, 1, 2], [700, 650, 900, 700], 128, 512, 2, 5),
     ],
 )
 def test_matches_reference(
-    q_lens, ctx_lens, block_q, large_block_q, pages_per_step, dtype, kernel
+    q_lens,
+    ctx_lens,
+    block_q,
+    large_block_q,
+    pages_per_step,
+    shared_pages,
+    dtype,
+    kernel,
 ):
     rng = np.random.default_rng(len(q_lens))
     num_seqs = len(q_lens)
@@ -56,6 +65,7 @@ def test_matches_reference(
     tables[:num_seqs] = rng.permutation(np.arange(1, NUM_PAGES))[
         : num_seqs * PAGES_PER_SEQ
     ].reshape(num_seqs, PAGES_PER_SEQ)
+    tables[1:num_seqs, :shared_pages] = tables[0, :shared_pages]
     keys = rounded(rng.standard_normal((NUM_PAGES, PAGE, HEAD_DIM)), dtype)
     cache = pack(keys, dtype)
     index_q = jnp.asarray(rng.standard_normal((num_tokens, 1, HEAD_DIM))).astype(
