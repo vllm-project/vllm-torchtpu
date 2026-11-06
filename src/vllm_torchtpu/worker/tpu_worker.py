@@ -523,9 +523,20 @@ class TPUWorker(WorkerBase):
         adapter_budget = getattr(adapter, "kv_cache_memory_budget", None)
         sized = adapter_budget() if callable(adapter_budget) else None
         if isinstance(sized, int):
-            # The adapter sized its cache from HBM before the ring's buffers
-            # exist; leave them free.
-            local_available = sized - pp_handoff_hbm_reserve
+            local_available = sized
+            if pp_handoff_hbm_reserve:
+                # The adapter sized its pool from HBM before the ring's buffers
+                # exist. The pool may take at most what is left once they are
+                # reserved; a pool already capped below that (for example by
+                # QWEN4_EXP_MAX_POOL_BYTES) keeps its size, so the ring does not
+                # change the pool, and with it the compiled programs, of a
+                # capped configuration.
+                local_available = min(
+                    sized,
+                    budget.available
+                    - kv_connector_hbm_reserve
+                    - pp_handoff_hbm_reserve,
+                )
         available = utils.min_across_ep_dp(self.parallel_config, local_available)
 
         total_hbm_limit_gb = round(budget.total_limit / utils.GBYTES, 2)

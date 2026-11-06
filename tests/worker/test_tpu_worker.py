@@ -589,3 +589,38 @@ def _run_spawn_probes():
 
 if __name__ == "__main__":
     _run_spawn_probes()
+
+
+# q38: the ring's reserve against a model adapter that sizes its own pool from
+# HBM (Qwen4Exp's unified pool in the benches): a capped pool keeps its size.
+
+
+def _sized_worker(monkeypatch, available, sized, ring):
+    worker = _ep_dp_worker(
+        monkeypatch, dp_size=1, expert_parallel=False, local=available, peer=available
+    )
+    worker.model_runner.model_adapter = SimpleNamespace(
+        kv_cache_memory_budget=lambda: sized
+    )
+    worker.model_runner.pp_handoff_hbm_reserve_bytes.return_value = ring
+    return worker
+
+
+def test_q38_a_capped_pool_keeps_its_size_under_the_ring(monkeypatch):
+    # aa2: the pool is capped at 34,078,720,000 B while ~70 GiB of HBM is left.
+    pool = 34_078_720_000
+    worker = _sized_worker(monkeypatch, 70 * utils.GBYTES, pool, int(2.47 * utils.GBYTES))
+    assert worker.determine_available_memory() == pool
+
+
+def test_q38_an_uncapped_pool_leaves_room_for_the_ring(monkeypatch):
+    worker = _sized_worker(monkeypatch, 10 * utils.GBYTES, int(9.5 * utils.GBYTES), 2 * utils.GBYTES)
+    assert worker.determine_available_memory() == 8 * utils.GBYTES
+
+
+def test_q38_the_wave_keeps_the_adapters_pool_exactly(monkeypatch):
+    # No ring: the adapter's figure stands even above the measured headroom
+    # (it counts the scratch pool it frees), as before the port.
+    sized = int(10.3 * utils.GBYTES)
+    worker = _sized_worker(monkeypatch, 10 * utils.GBYTES, sized, 0)
+    assert worker.determine_available_memory() == sized
