@@ -102,10 +102,19 @@ class TPUARModelRunner(OmniTPUModelRunner, OmniConnectorModelRunnerMixin):
     def _precompile_mm_inputs(self) -> None:
         if self.mm_budget is None or not self.mm_budget.mm_max_toks_per_item:
             return
+        # Sort modalities so every TP worker runs the same encoder (and its TP
+        # collectives) in lockstep; MultiModalBudget builds its dict from a set
+        # whose iteration order varies across processes with PYTHONHASHSEED.
+        modalities = sorted(self.mm_budget.mm_max_toks_per_item)
+        if "image" in modalities and "video" in modalities:
+            # Image and video share the vision tower; warming "image" compiles
+            # the max patch bucket in one pass instead of synthesizing and
+            # chunking a full max_model_len dummy video.
+            modalities.remove("video")
         with self._precompile_timed("multimodal encoders and merge"):
             sample_embed: torch.Tensor | None = None
             sample_modality: str | None = None
-            for modality in self.mm_budget.mm_max_toks_per_item:
+            for modality in modalities:
                 batched_dummy_mm_inputs = self._get_mm_dummy_batch(modality, 1)
                 dummy_encoder_outputs = self.model.embed_multimodal(
                     **batched_dummy_mm_inputs
@@ -124,27 +133,23 @@ class TPUARModelRunner(OmniTPUModelRunner, OmniConnectorModelRunnerMixin):
             self.mm_budget.reset_cache()
             if sample_embed is None or sample_modality is None:
                 return
+            num_tokens = next((n for n in self.num_tokens_paddings if n > 0), 16)
             dummy_mm = set_mm_embedding_modality(
                 torch.zeros_like(sample_embed[:1]), sample_modality
             )
-            last_input_ids: torch.Tensor | None = None
-            for num_tokens in self.num_tokens_paddings:
-                if num_tokens <= 0:
-                    continue
-                last_input_ids = torch.zeros(
-                    (num_tokens,), dtype=torch.int32, device=self.device
-                )
-                is_multimodal = torch.zeros((num_tokens,), dtype=torch.bool)
-                is_multimodal[0] = True
-                _, inputs_embeds = super()._get_model_inputs(
-                    last_input_ids, ([dummy_mm], is_multimodal)
-                )
-                if inputs_embeds is not None:
-                    synchronize_tensors(inputs_embeds)
-            if last_input_ids is not None:
-                _, inputs_embeds = super()._get_model_inputs(last_input_ids, None)
-                if inputs_embeds is not None:
-                    synchronize_tensors(inputs_embeds)
+            dummy_input_ids = torch.zeros(
+                (num_tokens,), dtype=torch.int32, device=self.device
+            )
+            is_multimodal = torch.zeros((num_tokens,), dtype=torch.bool)
+            is_multimodal[0] = True
+            _, inputs_embeds = super()._get_model_inputs(
+                dummy_input_ids, ([dummy_mm], is_multimodal)
+            )
+            if inputs_embeds is not None:
+                synchronize_tensors(inputs_embeds)
+            _, inputs_embeds = super()._get_model_inputs(dummy_input_ids, None)
+            if inputs_embeds is not None:
+                synchronize_tensors(inputs_embeds)
 
     def _get_model_inputs(
         self,

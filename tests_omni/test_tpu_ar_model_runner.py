@@ -157,7 +157,7 @@ def test_tpu_ar_model_runner_capture_model_precompiles_mm_buckets():
     seen_merges: list[tuple[int, tuple[tuple[int, ...], str] | None]] = []
     reset_cache = MagicMock()
     runner.mm_budget = SimpleNamespace(
-        mm_max_toks_per_item={"audio": 390, "video": 4096},
+        mm_max_toks_per_item={"video": 65536, "audio": 390, "image": 4096},
         reset_cache=reset_cache,
     )
     runner._get_mm_dummy_batch = lambda modality, count: {"modality": modality}
@@ -188,12 +188,11 @@ def test_tpu_ar_model_runner_capture_model_precompiles_mm_buckets():
     with patch.object(OmniTPUModelRunner, "capture_model") as mock_super_capture:
         runner.capture_model()
         mock_super_capture.assert_called_once_with()
-        assert seen_modalities == ["audio", "video"]
+        assert seen_modalities == ["audio", "image"]
         reset_cache.assert_called_once_with()
         assert seen_merges == [
-            (16, ((1, 32), "video")),
-            (64, ((1, 32), "video")),
-            (64, None),
+            (16, ((1, 32), "image")),
+            (16, None),
         ]
 
         # Non-MM stage skips MM encoder precompilation
