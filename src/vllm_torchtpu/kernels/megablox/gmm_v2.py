@@ -1508,8 +1508,7 @@ def decode_mlp_stream_kernel(
     def copy(src, dst, sem):
         return pltpu.make_async_copy(src, dst, sem)
 
-    def start_chunk(chunk, group_id):
-        step = chunk % chunks_per_gm
+    def start_chunk(chunk, step, group_id):
         slot = chunk % DECODE_SLOTS
 
         @pl.when(step < num_up_panels)
@@ -1557,7 +1556,7 @@ def decode_mlp_stream_kernel(
     @pl.when(first_group < up_dims.size_group)
     def _():
         lhs_copy.start()
-        start_chunk(0, first_group)
+        start_chunk(0, 0, first_group)
 
     num_gm = fill_metadata(
         lhs_group_sizes_ref, group_offset_ref, metadata_ref, cfgs=up_cfgs
@@ -1574,8 +1573,7 @@ def decode_mlp_stream_kernel(
             scales = scale_slots.at[half, slot]
             copy(scales, scales, scale_sems.at[half, slot]).wait()
 
-    def multiply_chunk(chunk):
-        gm_id, step = chunk // chunks_per_gm, chunk % chunks_per_gm
+    def multiply_chunk(chunk, gm_id, step):
         slot = chunk % DECODE_SLOTS
         m_start = m_offsets[gm_id]
         m_end = m_offsets[gm_id + 1]
@@ -1665,27 +1663,39 @@ def decode_mlp_stream_kernel(
     def _():
         lhs_copy.wait()
 
-        def start_next(chunk):
+        def start_next(chunk, gm_id, step):
             @pl.when(chunk < num_chunks)
             def _():
-                gm_id = chunk // chunks_per_gm
-                start_chunk(chunk, metadata_ref.gm_id_to_group_id[gm_id])
+                start_chunk(chunk, step, metadata_ref.gm_id_to_group_id[gm_id])
+
+        def next_position(gm_id, step):
+            """(gm tile, step) of the chunk after the one at (gm_id, step)."""
+            last = step == chunks_per_gm - 1
+            return jnp.where(last, gm_id + 1, gm_id), jnp.where(last, 0, step + 1)
+
+        # Chunk 0 streams alone, then DECODE_SLOTS - 1 chunks stay in flight,
+        # as in decode_stream_kernel; here the ring is filled before the loop
+        # and chunk positions are carried, so a step does no division and no
+        # first-chunk check.
+        wait_chunk(0)
+        for ahead in range(1, DECODE_SLOTS - 1):
+            start_next(ahead, *divmod(ahead, chunks_per_gm))
 
         def stream_step(chunk, carry):
-            wait_chunk(chunk)
+            gm_id, step, ahead_gm, ahead_step = carry
+            # The chunk DECODE_SLOTS - 1 on reuses the slot the previous step
+            # multiplied.
+            start_next(chunk + DECODE_SLOTS - 1, ahead_gm, ahead_step)
+            multiply_chunk(chunk, gm_id, step)
 
-            # As in decode_stream_kernel: chunk 0 streams alone, then
-            # DECODE_SLOTS - 1 chunks stay in flight.
-            @pl.when(chunk == 0)
+            @pl.when(chunk + 1 < num_chunks)
             def _():
-                for ahead in range(1, DECODE_SLOTS - 1):
-                    start_next(ahead)
+                wait_chunk(chunk + 1)
 
-            start_next(chunk + DECODE_SLOTS - 1)
-            multiply_chunk(chunk)
-            return carry
+            return (*next_position(gm_id, step), *next_position(ahead_gm, ahead_step))
 
-        lax.fori_loop(0, num_chunks, stream_step, 0)
+        positions = (0, 0, *divmod(DECODE_SLOTS - 1, chunks_per_gm))
+        lax.fori_loop(0, num_chunks, stream_step, tuple(map(jnp.int32, positions)))
 
         out_copies = [
             copy(
