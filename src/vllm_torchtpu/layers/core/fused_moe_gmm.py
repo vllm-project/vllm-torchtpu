@@ -236,6 +236,7 @@ def gmm_wrapper(
     tile_m=0,
     hoist_lhs_quant=False,
     rhs_split=1,
+    experts_per_visit=1,
 ):
     # fp4 weights: keep bf16 activations. Quantizing activations to fp8 collapses
     # fp4 accuracy (error compounds across MoE layers) with no decode speedup
@@ -260,6 +261,7 @@ def gmm_wrapper(
         **({"tile_info": tiling_with_tile_m(tile_m)} if tile_m else {}),
         **({"hoist_lhs_quant": True} if hoist_lhs_quant else {}),
         **({"rhs_split": rhs_split} if rhs_split > 1 else {}),
+        **({"experts_per_visit": experts_per_visit} if experts_per_visit > 1 else {}),
     )
 
 
@@ -629,6 +631,7 @@ def moe_gmm(
     nonep_gmm_tile_m: int = 0,
     nonep_gmm_hoist_quant: bool = False,
     nonep_gmm2_rhs_split: int = 1,
+    nonep_gmm_experts_per_visit: int = 1,
 ) -> jax.Array:
     """Run grouped GEMM for routed tokens and reduce back to tokens.
 
@@ -647,6 +650,9 @@ def moe_gmm(
     hoist = nonep_gmm_hoist_quant and not use_ep
     # gmm2's weight tile as this many concurrent column-part DMAs (non-EP).
     rhs_split = 1 if use_ep else nonep_gmm2_rhs_split
+    # Consecutive experts per gmm_v2 pipeline step in both GMMs (non-EP: all
+    # groups local, no group offset).
+    epv = 1 if use_ep else nonep_gmm_experts_per_visit
 
     gmm1_res = gmm_wrapper(
         x,
@@ -660,6 +666,7 @@ def moe_gmm(
         rhs_quant_dtype=rhs_quant_dtype,
         tile_m=tile_m,
         hoist_lhs_quant=hoist,
+        experts_per_visit=epv,
     )
     packing_factor = get_packing_factor(w2.dtype, rhs_quant_dtype)
     gmm1_res = gmm1_res[:, : w2.shape[1] * packing_factor]
@@ -702,6 +709,7 @@ def moe_gmm(
                 tile_m=tile_m,
                 hoist_lhs_quant=hoist,
                 rhs_split=rhs_split,
+                experts_per_visit=epv,
             )
             blocks.append(
                 ragged_gather_reduce_v3(
@@ -727,6 +735,7 @@ def moe_gmm(
         tile_m=tile_m,
         hoist_lhs_quant=hoist,
         rhs_split=rhs_split,
+        experts_per_visit=epv,
     )
     # The destination-major kernel packs source indices into 20 bits and
     # processes 16-lane SparseCore tiles.
@@ -825,6 +834,7 @@ def moe_gmm(
         "nonep_gmm_tile_m",
         "nonep_gmm_hoist_quant",
         "nonep_gmm2_rhs_split",
+        "nonep_gmm_experts_per_visit",
     ),
 )
 def fused_moe_func(
@@ -853,6 +863,7 @@ def fused_moe_func(
     nonep_gmm_tile_m: int = 0,
     nonep_gmm_hoist_quant: bool = False,
     nonep_gmm2_rhs_split: int = 1,
+    nonep_gmm_experts_per_visit: int = 1,
 ) -> jax.Array:
     """Run MoE with precomputed expert ids and weights.
 
@@ -978,5 +989,6 @@ def fused_moe_func(
         nonep_gmm_tile_m=nonep_gmm_tile_m,
         nonep_gmm_hoist_quant=nonep_gmm_hoist_quant,
         nonep_gmm2_rhs_split=nonep_gmm2_rhs_split,
+        nonep_gmm_experts_per_visit=nonep_gmm_experts_per_visit,
     )
     return x[:num_tokens, :hidden_size]

@@ -153,18 +153,20 @@ def test_nonep_choices_change_only_the_non_ep_program():
     assert "concatenate" in non_ep and "concatenate" not in jaxpr(False)
 
 
-def _ref_gmm(calls, tiles=None, hoists=None, splits=None):
+def _ref_gmm(calls, tiles=None, hoists=None, splits=None, epvs=None):
     """Pure-JAX stand-in for gmm_wrapper that records its n_window (and
     tile_m); every output column is computed independently, as the kernel's
     are."""
     tiles = [] if tiles is None else tiles
     hoists = [] if hoists is None else hoists
     splits = [] if splits is None else splits
+    epvs = [] if epvs is None else epvs
 
     def gmm(lhs, rhs, rhs_scale, rhs_bias, group_sizes, group_offset, zero_initialize=False,
             fuse_act=None, preferred_element_type=None, rhs_quant_dtype=None, n_window=None,
-            tile_m=0, hoist_lhs_quant=False, rhs_split=1):
+            tile_m=0, hoist_lhs_quant=False, rhs_split=1, experts_per_visit=1):
         calls.append(n_window)
+        epvs.append(experts_per_visit)
         tiles.append(tile_m)
         hoists.append(hoist_lhs_quant)
         splits.append(rhs_split)
@@ -273,6 +275,111 @@ def test_gmm_tile_m_and_hoist_reach_both_gmms_on_the_non_ep_path_only(monkeypatc
     assert splits == ([1, 1] if use_ep else [1, 4])
 
 
+@pytest.mark.parametrize("use_ep", [False, True])
+@pytest.mark.parametrize("split", [1, 2])
+def test_experts_per_visit_reaches_every_gmm_on_the_non_ep_path_only(monkeypatch, use_ep, split):
+    experts, hidden, inter, topk, tokens = 16, 512, 128, 4, 640
+    k1, k2, k3 = jax.random.split(jax.random.key(5), 3)
+    w1, s1 = _fp8_per_channel(k1, (experts, hidden, 2 * inter))
+    w2, s2 = _fp8_per_channel(k2, (experts, inter, hidden))
+    x = (jax.random.normal(k3, (tokens, hidden), jnp.float32) / 4).astype(jnp.bfloat16)
+    rng = np.random.default_rng(7)
+    ids = jnp.asarray(np.stack([rng.choice(experts, topk, replace=False) for _ in range(tokens)]), jnp.int32)
+    w = jnp.asarray(rng.random((tokens, topk)), jnp.bfloat16)
+    calls, epvs = [], []
+    monkeypatch.setattr(fused_moe_gmm, "gmm_wrapper", _ref_gmm(calls, epvs=epvs))
+    monkeypatch.setattr(fused_moe_gmm, "_local_ragged_combine_eligible", lambda *a, **k: True)
+    monkeypatch.setattr(fused_moe_gmm, "ragged_gather_reduce_v3",
+                        lambda rows, rev, wts, valid, reduce_group_size: _ref_combine(
+                            rows, rev, wts, valid, reduce_group_size))
+    xs, gs, rev, wf, valid, tok = prepare_routed_gmm_inputs(
+        x, ids, w, local_num_experts=experts, topk=topk, use_ep=False, use_sparse_core=False
+    )
+    fused_moe_gmm.moe_gmm(
+        xs, w1, s1, None, w2, s2, None, gs, rev, wf, valid, tok, activation="silu",
+        num_tokens=tokens, topk=topk, use_ep=use_ep, use_sparse_core=False,
+        nonep_combine_split=split, nonep_gmm_experts_per_visit=4,
+    )
+    # gmm1, then gmm2 once per column block when the combine is split
+    assert len(epvs) == 1 + split
+    assert epvs == [1] * (1 + split) if use_ep else epvs == [4] * (1 + split)
+
+
+class _FakeRef:
+    """Minimal ref stand-in: .at[idx] is a view (here a numpy slice)."""
+
+    def __init__(self, a):
+        self.a = a
+
+    @property
+    def at(self):
+        return _FakeAt(self.a)
+
+
+class _FakeAt:
+    def __init__(self, a):
+        self.a = a
+
+    def __getitem__(self, idx):
+        return _FakeRef(self.a[idx])
+
+
+def test_weights_ref_select_takes_one_expert_of_the_block():
+    from vllm_torchtpu.kernels.megablox.gmm_v2 import FusedWeightsRef, WeightsRef
+
+    e, k, n = 4, 8, 6
+    w = np.arange(e * k * 2 * n).reshape(e, k, 2 * n)
+    sc = np.arange(e * 2 * 2 * n).reshape(e, 2, 1, 2 * n)
+    b = np.arange(e * 2 * n).reshape(e, 1, 2 * n)
+    gate = WeightsRef(weight=_FakeRef(w[..., :n]), scale=_FakeRef(sc[..., :n]), bias=_FakeRef(b[..., :n]))
+    up = WeightsRef(weight=_FakeRef(w[..., n:]), scale=_FakeRef(sc[..., n:]), bias=None)
+    for i in range(e):
+        one = WeightsRef(weight=_FakeRef(w), scale=None, bias=None).select(i)
+        np.testing.assert_array_equal(one.weight.a, w[i])
+        assert one.scale is None and one.bias is None
+        f = FusedWeightsRef(gate=gate, up=up).select(i)
+        np.testing.assert_array_equal(f.gate.weight.a, w[i, :, :n])
+        np.testing.assert_array_equal(f.up.weight.a, w[i, :, n:])
+        np.testing.assert_array_equal(f.gate.scale.a, sc[i, ..., :n])
+        np.testing.assert_array_equal(f.gate.bias.a, b[i, ..., :n])
+        assert f.up.bias is None
+
+
+@pytest.mark.parametrize("tile_m,bucket_base", [(512, 128), (256, 64), (128, 32)])
+def test_sub_expert_window_covers_the_rows_inside_the_tile(tile_m, bucket_base):
+    """Every sub-expert row range [lo, hi) of a tile gets a sublane-aligned
+    window [start, start + bucket) that covers it, stays inside the tile, and
+    uses the smallest bucket that covers [lo-rounded-down, hi) when it fits."""
+    from vllm_torchtpu.kernels.megablox.gmm_v2 import sub_expert_window
+
+    sub = 16
+    for lo in range(0, tile_m):
+        for hi in range(lo + 1, tile_m + 1, 3):
+            idx, start = sub_expert_window(lo, hi, sublane=sub, bucket_base=bucket_base, tile_m=tile_m)
+            bucket = bucket_base * (idx + 1)
+            assert 0 <= idx < tile_m // bucket_base
+            assert start % sub == 0 and 0 <= start <= lo
+            assert start + bucket >= hi and start + bucket <= tile_m
+            assert bucket - bucket_base < hi - (lo // sub) * sub
+    # traced values give the same window
+    idx, start = sub_expert_window(jnp.int32(130), jnp.int32(260), sublane=sub,
+                                   bucket_base=bucket_base, tile_m=tile_m)
+    assert (int(idx), int(start)) == sub_expert_window(130, 260, sublane=sub,
+                                                       bucket_base=bucket_base, tile_m=tile_m)
+
+
+def test_check_experts_per_visit_rejects_what_the_kernel_cannot_do():
+    from vllm_torchtpu.kernels.megablox.gmm_v2 import check_experts_per_visit
+
+    ok = dict(size_group=512, size_lhs_group=512, size_k=640, tile_k=640, rhs_split=1)
+    for e in (2, 4):
+        check_experts_per_visit(e, **ok)
+    for e, bad in ((3, {}), (8, {}), (2, dict(size_group=511, size_lhs_group=511)),
+                   (2, dict(size_lhs_group=1024)), (2, dict(tile_k=320)), (2, dict(rhs_split=2))):
+        with pytest.raises(ValueError):
+            check_experts_per_visit(e, **{**ok, **bad})
+
+
 # --------------------------------------------------------------------------- TPU
 
 
@@ -362,6 +469,35 @@ def test_gmm_v2_n_window_is_a_bitwise_column_slice_on_tpu(tokens):
     quarter = _bits(gmm_v2(lhs, w2, gs, n_window=(640, 640), **kw))
     np.testing.assert_array_equal(quarter, full[:, 640:1280])
     assert (halves[1] != full[:, :1280]).any()
+
+
+@pytest.mark.tpu_test
+@pytest.mark.parametrize("tokens", [3200, 6400])
+@pytest.mark.parametrize("epv", [2, 4])
+def test_gmm_v2_experts_per_visit_is_bitwise_on_tpu(tokens, epv):
+    """Both served GMM shapes (gmm1 fused SiLU k 2560, gmm2 k 640), Qwen3.8
+    routing sizes: E consecutive experts per visit give bitwise the one-expert
+    output, including signed zeros."""
+    _require_tpu()
+    from vllm_torchtpu.kernels.megablox.gmm_v2 import gmm_v2
+
+    experts, hidden, inter, topk = 512, 2560, 640, 10
+    rng = np.random.default_rng(tokens + epv)
+    rows = tokens * topk
+    sizes = rng.multinomial(rows, rng.dirichlet(np.ones(experts)))
+    sizes[rng.integers(0, experts, 8)] = 0
+    sizes[0] += rows - sizes.sum()
+    gs = jnp.asarray(sizes, jnp.int32)
+    k1, k2, k3 = jax.random.split(jax.random.key(tokens), 3)
+    w1, s1 = _fp8_per_channel(k1, (experts, hidden, 2 * inter))
+    w2, s2 = _fp8_per_channel(k2, (experts, inter, hidden))
+    x = (jax.random.normal(k3, (rows, hidden), jnp.float32) / 4).astype(jnp.bfloat16)
+    for lhs, w, s, act in ((x, w1, s1, "silu"), (x[:, :inter], w2, s2, None)):
+        outs = [gmm_v2(lhs, w, gs, rhs_scale=s, zero_initialize=False, fuse_act=act,
+                       preferred_element_type=jnp.bfloat16, experts_per_visit=e)
+                for e in (1, epv)]
+        a, b = (np.asarray(o).view(np.uint16) for o in outs)
+        assert np.array_equal(a, b), (act, int((a != b).sum()))
 
 
 @pytest.mark.parametrize("scopes,level,on", [(0, 2, False), (1, 2, False), (2, 2, True), (3, 2, True)])

@@ -189,6 +189,14 @@ class WeightsRef(RhsRef):
         assert self.bias is not None
         return self.bias[...]
 
+    def select(self, i: int) -> "WeightsRef":
+        """Expert ``i`` of a multi-expert block (leading dim), as a plain ref."""
+        return WeightsRef(
+            weight=self.weight.at[i],
+            scale=None if self.scale is None else self.scale.at[i],
+            bias=None if self.bias is None else self.bias.at[i],
+        )
+
 
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True)
@@ -212,6 +220,9 @@ class FusedWeightsRef(RhsRef):
         b_gate = self.gate.get_bias()
         b_up = self.up.get_bias()
         return interleave_lane(b_gate, b_up)
+
+    def select(self, i: int) -> "FusedWeightsRef":
+        return FusedWeightsRef(gate=self.gate.select(i), up=self.up.select(i))
 
 
 def split_part(n0: int, n1: int, part_width: int) -> tuple[int, int, int]:
@@ -259,6 +270,9 @@ class SplitWeightsRef(RhsRef):
 class MetadataRef:
     gm_id_to_group_id: jax.Array
     gm_id_to_m_offset: jax.Array
+    # experts_per_visit > 1: global row bounds of each expert of a visit's
+    # block, E + 1 per gm tile; unused (size 1) otherwise.
+    gm_id_to_sub_bounds: jax.Array
 
 
 @dataclasses.dataclass(frozen=True)
@@ -339,6 +353,9 @@ class GmmConfigs:
     # Deliver each weight tile as this many column parts (one pipeline input,
     # hence one concurrent DMA, each). Non-fused GMM with one N tile only.
     rhs_split: int = 1
+    # Consecutive experts per pipeline step (one block of E experts' weights,
+    # one visit over their rows). Amortizes the per-step fixed cost.
+    experts_per_visit: int = 1
 
     @property
     def num_quant_blocks_per_tile_k(self) -> int:
@@ -421,20 +438,23 @@ def generate_block_specs(
         index_map.lhs_index_map,
     )
 
+    # One expert per step squeezes the group dim; a multi-expert visit loads a
+    # block of E consecutive experts (block index = the visit's block id).
+    lead = None if cfgs.experts_per_visit == 1 else cfgs.experts_per_visit
     rhs_weight_spec = pl.BlockSpec(
-        (None, cfgs.tiles.tile_k, cfgs.tiles.tile_n),
+        (lead, cfgs.tiles.tile_k, cfgs.tiles.tile_n),
         index_map.rhs_weight_index_map,
         pipeline_mode=pl.Buffered(buffer_count=3),
     )
     rhs_scale_block_spec = rhs_bias_block_spec = None
     if cfgs.rhs_cfgs.has_bias:
         rhs_bias_block_spec = pl.BlockSpec(
-            (None, 1, cfgs.tiles.tile_n),
+            (lead, 1, cfgs.tiles.tile_n),
             index_map.rhs_bias_index_map,
         )
     if cfgs.rhs_cfgs.has_scale:
         rhs_scale_block_spec = pl.BlockSpec(
-            (None, cfgs.num_quant_blocks_per_tile_k, 1, cfgs.tiles.tile_n),
+            (lead, cfgs.num_quant_blocks_per_tile_k, 1, cfgs.tiles.tile_n),
             index_map.rhs_scale_index_map,
         )
 
@@ -497,13 +517,30 @@ def inner_kernel(
 
     m_start_local = m_start - m_offset
     m_end_local = m_end - m_offset
+    tiled_rhs_ref_ = tiled_rhs_ref
 
-    def _matmul(is_first_k_step: bool, is_last_k_step: bool, bucket_m: int):
+    def _matmul(
+        is_first_k_step: bool,
+        is_last_k_step: bool,
+        bucket_m: int,
+        rhs_ref: RhsRef | None = None,
+        row_start: jax.Array | None = None,
+    ):
+        # Sub-expert mode (experts_per_visit > 1): rows [row_start,
+        # row_start + bucket_m) against one expert of the block; returns the
+        # pre-epilogue accumulator (single k step), the caller merges.
+        sub_mode = row_start is not None
+        tiled_rhs_ref = tiled_rhs_ref_ if rhs_ref is None else rhs_ref
         tpu_info = pltpu.get_tpu_info()
         mxu_size = tpu_info.mxu_column_size
 
         # Step 1: Input pre-processing.
-        tiled_lhs = tiled_lhs_ref.reshape(-1, cfgs.tiles.tile_k)[:bucket_m]
+        if sub_mode:
+            tiled_lhs = tiled_lhs_ref.reshape(-1, cfgs.tiles.tile_k)[
+                pl.ds(row_start, bucket_m)
+            ]
+        else:
+            tiled_lhs = tiled_lhs_ref.reshape(-1, cfgs.tiles.tile_k)[:bucket_m]
         split = isinstance(tiled_rhs_ref, SplitWeightsRef)
         # A split tile is read block by block from its parts (rhs_block below).
         tiled_rhs = None if split else tiled_rhs_ref.get_weight()
@@ -645,6 +682,8 @@ def inner_kernel(
                     acc_n += block_acc
                 acc_list.append(acc_n)
         acc = jnp.concatenate(acc_list, axis=1)
+        if sub_mode:
+            return acc
 
         # Step 3: Output post-processing.
         epilogue_scope = trace_scope(cfgs, "gmm_epilogue", 2)
@@ -734,11 +773,166 @@ def inner_kernel(
             # partial m is only invoked at last matmul.
             lax.cond(is_first_k_step, matmul_first_last, matmul_last)
 
+    if cfgs.experts_per_visit > 1:
+        _multi_expert_visit(
+            _matmul,
+            tiled_rhs_ref,
+            tiled_out_ref,
+            partial_out_ref,
+            metadata_ref,
+            gm_id=gm_id,
+            m_offset=m_offset,
+            m_start_local=m_start_local,
+            m_end_local=m_end_local,
+            cfgs=cfgs,
+        )
+        return
+
     branches = []
     for bucket_idx in range(cfgs.tiles.tile_m // cfgs.tiles.bucket_base):
         branches.append(functools.partial(run_matmul_step, bucket_idx=bucket_idx))
     bucket_idx = m_end_local // cfgs.tiles.bucket_base
     lax.switch(bucket_idx, branches)
+
+
+def sub_expert_window(lo, hi, *, sublane: int, bucket_base: int, tile_m: int):
+    """Row window [start, start + bucket) of one sub-expert's rows [lo, hi).
+
+    start is lo rounded down to the sublane tile; the bucket is the smallest
+    multiple of bucket_base covering [start, hi), and start is pulled back so
+    the window stays inside the tile. Returns (bucket_idx, start) for the
+    bucket bucket_base * (bucket_idx + 1). Works on ints and int arrays.
+    """
+    num_buckets = tile_m // bucket_base
+    start = (lo // sublane) * sublane
+    need = hi - start
+    bucket_idx = (need - 1) // bucket_base
+    if isinstance(bucket_idx, int):
+        bucket_idx = max(0, min(num_buckets - 1, bucket_idx))
+        start = min(start, tile_m - bucket_base * (bucket_idx + 1))
+    else:
+        bucket_idx = jnp.clip(bucket_idx, 0, num_buckets - 1)
+        start = jnp.minimum(start, tile_m - bucket_base * (bucket_idx + 1))
+    return bucket_idx, start
+
+
+def _multi_expert_visit(
+    matmul,
+    tiled_rhs_ref,
+    tiled_out_ref,
+    partial_out_ref,
+    metadata_ref,
+    *,
+    gm_id,
+    m_offset,
+    m_start_local,
+    m_end_local,
+    cfgs: GmmConfigs,
+):
+    """One pipeline step over a block of E consecutive experts' rows.
+
+    Each sub-expert s with rows [lo, hi) in this tile runs the base matmul on
+    a sublane-aligned window covering [lo, hi) with its own weights, and its
+    rows are merged into the output tile: rows below lo keep what earlier
+    sub-experts wrote (zero below the tile's first row), rows from hi up are
+    zero. Each row is computed by the same ops as the one-expert kernel.
+
+    Signed zeros: the one-expert kernel adds the carried partial sublane
+    (+0.0 on the current expert's rows) to the first sublane group of each of
+    its tiles, and the next tile adds a group-sharing expert's last partial
+    group to +0.0. Both turn -0.0 into +0.0 on exactly those rows. The merge
+    adds a (runtime) +0.0 to the same rows (rule A: first group of each
+    one-expert tile; rule B: last partial group when a later tile exists),
+    and the carry here only touches rows below the tile's first row, so the
+    output is bitwise equal including the sign of zero.
+    """
+    e = cfgs.experts_per_visit
+    sub = e + 1
+    sublane = cfgs.dims.size_lhs_sublane
+    tile_n = cfgs.tiles.tile_n
+    bucket_base = cfgs.tiles.bucket_base
+    num_buckets = cfgs.tiles.tile_m // bucket_base
+    tiled_out_2d_ref = tiled_out_ref.reshape(-1, tile_n)
+
+    tile_m = cfgs.tiles.tile_m
+    total = metadata_ref.gm_id_to_m_offset[pl.num_programs(1)]
+    # +0.0 that the compiler cannot fold away (x + 0.0 -> x drops the sign rule).
+    dyn_zero = jnp.where(gm_id < 0, 1.0, 0.0).astype(tiled_out_ref.dtype)
+
+    def gbound(j):
+        return metadata_ref.gm_id_to_sub_bounds[gm_id * sub + j]
+
+    def sub_expert(s, carry):
+        # A loop, not an unrolled block: one copy of the bucketed matmul for
+        # all E sub-experts keeps the kernel's code size near the base's.
+        gstart = gbound(s)
+        gend = gbound(s + 1)
+        lo = jnp.clip(gstart - m_offset, m_start_local, m_end_local)
+        hi = jnp.clip(gend - m_offset, m_start_local, m_end_local)
+        rhs_s = tiled_rhs_ref.select(s)
+
+        def run_sub(bucket_idx):
+            bucket_m = bucket_base * (bucket_idx + 1)
+
+            @jax.named_scope(f"bm{bucket_m}_sub")
+            def body():
+                _, start = sub_expert_window(
+                    lo, hi, sublane=sublane, bucket_base=bucket_base, tile_m=tile_m
+                )
+                start = pl.multiple_of(start, sublane)
+                acc = matmul(True, True, bucket_m, rhs_ref=rhs_s, row_start=start)
+                if cfgs.rhs_cfgs.has_bias:
+                    acc += rhs_s.get_bias().astype(acc.dtype)
+                acc = apply_act_fn(acc, cfgs.fuse_act)
+                rows = start + lax.broadcasted_iota(jnp.int32, acc.shape, 0)
+                mine = jnp.logical_and(lo <= rows, rows < hi)
+                keep = jnp.logical_and(rows < lo, lo > m_start_local)
+                val = acc.astype(tiled_out_ref.dtype)
+                grow = m_offset + rows
+                norm_a = (grow - (gstart // sublane) * sublane) % tile_m < sublane
+                norm_b = jnp.logical_and(
+                    grow >= (gend // sublane) * sublane,
+                    jnp.logical_and(gend % sublane != 0, gend != total),
+                )
+                val = jnp.where(jnp.logical_or(norm_a, norm_b), val + dyn_zero, val)
+                old = tiled_out_2d_ref[pl.ds(start, bucket_m)]
+                zeros = jnp.zeros_like(old)
+                tiled_out_2d_ref[pl.ds(start, bucket_m)] = jnp.where(
+                    mine, val, jnp.where(keep, old, zeros)
+                )
+
+            body()
+
+        @pl.when(hi > lo)
+        def _():
+            bucket_idx, _ = sub_expert_window(
+                lo, hi, sublane=sublane, bucket_base=bucket_base, tile_m=tile_m
+            )
+            lax.switch(
+                bucket_idx,
+                [functools.partial(run_sub, i) for i in range(num_buckets)],
+            )
+
+        return carry
+
+    lax.fori_loop(0, e, sub_expert, 0)
+
+    # Partial-sublane carry as in the one-expert last-k epilogue, applied only
+    # to the rows below this tile's first row (the previous tile's rows).
+    partial_out_zeros = jnp.zeros_like(partial_out_ref)
+    first_group = tiled_out_ref[0]
+    group_rows = lax.broadcasted_iota(jnp.int32, first_group.shape, 0)
+    tiled_out_ref[0] = jnp.where(
+        group_rows < m_start_local,
+        first_group + jnp.where(gm_id == 0, partial_out_zeros, partial_out_ref[...]),
+        first_group,
+    )
+    last_row = m_end_local // sublane
+    partial_out_ref[...] = jnp.where(
+        m_end_local % sublane == 0,
+        partial_out_zeros,
+        tiled_out_ref[last_row],
+    )
 
 
 def fill_metadata(
@@ -828,6 +1022,55 @@ def fill_metadata(
         return next_num_gm, end_m_offset
 
     num_gm, _ = lax.fori_loop(0, max_num_group, outer_group_loop, (0, 0))
+    return num_gm
+
+
+def fill_metadata_blocks(
+    lhs_group_sizes_ref: jax.Array,  # int32[size_lhs_group]
+    metadata_ref: MetadataRef,
+    *,
+    cfgs: GmmConfigs,
+) -> jax.Array:
+    """fill_metadata for experts_per_visit = E > 1 (non-EP: group offset 0).
+
+    Groups are taken in blocks of E consecutive experts. Each block's rows
+    (contiguous, since lhs rows are sorted by expert) are cut into m tiles
+    exactly as fill_metadata cuts one group's rows; every tile records the
+    block id (its rhs block index) and the global row bounds of the block's E
+    experts, so the kernel can give each row its own expert's weights.
+    """
+    e = cfgs.experts_per_visit
+    num_blocks = cfgs.dims.size_group // e
+    sub = e + 1
+    metadata_ref.gm_id_to_m_offset[0] = 0
+
+    def outer_block_loop(block_id, carry):
+        num_gm, start_m_offset = carry
+        sizes = [lhs_group_sizes_ref[block_id * e + j] for j in range(e)]
+        block_size = functools.reduce(lambda a, b: a + b, sizes)
+        end_m_offset = start_m_offset + block_size
+        local_offset = start_m_offset % cfgs.dims.size_lhs_sublane
+        curr_num_gm = pl.cdiv(block_size + local_offset, cfgs.tiles.tile_m)
+        curr_num_gm = jnp.where(block_size > 0, curr_num_gm, 0)
+        next_num_gm = num_gm + curr_num_gm
+
+        def tm_loop(tm_id, curr_m_offset):
+            lo = curr_m_offset % cfgs.dims.size_lhs_sublane
+            tm_size = jnp.minimum(cfgs.tiles.tile_m - lo, end_m_offset - curr_m_offset)
+            metadata_ref.gm_id_to_group_id[tm_id] = block_id
+            metadata_ref.gm_id_to_m_offset[tm_id] = curr_m_offset
+            metadata_ref.gm_id_to_m_offset[tm_id + 1] = curr_m_offset + tm_size
+            bound = start_m_offset
+            metadata_ref.gm_id_to_sub_bounds[tm_id * sub] = bound
+            for j in range(e):
+                bound = bound + sizes[j]
+                metadata_ref.gm_id_to_sub_bounds[tm_id * sub + j + 1] = bound
+            return curr_m_offset + tm_size
+
+        lax.fori_loop(num_gm, next_num_gm, tm_loop, start_m_offset)
+        return next_num_gm, end_m_offset
+
+    num_gm, _ = lax.fori_loop(0, num_blocks, outer_block_loop, (0, 0))
     return num_gm
 
 
@@ -967,12 +1210,15 @@ def kernel_main(
         rhs_ref = jax.tree.map(lambda x: x.at[..., start : start + width], rhs_ref)
 
     # Fill metadata buffer and return number of group & m interations.
-    num_gm = fill_metadata(
-        lhs_group_sizes_ref,
-        group_offset_ref,
-        metadata_ref,
-        cfgs=cfgs,
-    )
+    if cfgs.experts_per_visit > 1:
+        num_gm = fill_metadata_blocks(lhs_group_sizes_ref, metadata_ref, cfgs=cfgs)
+    else:
+        num_gm = fill_metadata(
+            lhs_group_sizes_ref,
+            group_offset_ref,
+            metadata_ref,
+            cfgs=cfgs,
+        )
 
     if cfgs.zero_init:
         zero_size = zero_out_start(
@@ -1258,6 +1504,7 @@ def get_scope_name(cfgs: GmmConfigs) -> str:
     window += "-hq" if cfgs.hoist_lhs_quant else ""
     window += f"-sc{cfgs.trace_scopes}" if cfgs.trace_scopes else ""
     window += f"-rs{cfgs.rhs_split}" if cfgs.rhs_split > 1 else ""
+    window += f"-ev{cfgs.experts_per_visit}" if cfgs.experts_per_visit > 1 else ""
     return (
         f"gmm_v2-g_{dims.size_group}-m_{dims.size_m}-k_{dims.size_k}-act_{cfgs.fuse_act}"
         f"-n_{dims.size_n}{window}-tm_{tiles.tile_m}-tk_{tiles.tile_k}-tn_{tiles.tile_n}"
@@ -1284,6 +1531,7 @@ def make_gmm_configs(
     hoist_lhs_quant: bool = False,
     trace_scopes: int = 0,
     rhs_split: int = 1,
+    experts_per_visit: int = 1,
 ):
     """Fills the GMM config for the GMM kernel."""
 
@@ -1394,6 +1642,16 @@ def make_gmm_configs(
                 f"({dims=}, {tiles=})"
             )
 
+    if experts_per_visit > 1:
+        check_experts_per_visit(
+            experts_per_visit,
+            size_group=dims.size_group,
+            size_lhs_group=dims.size_lhs_group,
+            size_k=dims.size_k,
+            tile_k=tiles.tile_k,
+            rhs_split=rhs_split,
+        )
+
     return GmmConfigs(
         dims=dims,
         tiles=tiles,
@@ -1407,7 +1665,38 @@ def make_gmm_configs(
         hoist_lhs_quant=hoist_lhs_quant,
         trace_scopes=trace_scopes,
         rhs_split=rhs_split,
+        experts_per_visit=experts_per_visit,
     )
+
+
+def sub_bounds_size(cfgs: GmmConfigs) -> int:
+    """SMEM words for gm_id_to_sub_bounds: E + 1 bounds per m tile, with at
+    most (size_group / E) + cdiv(size_m, tile_m) - 1 tiles (1 when unused)."""
+    e = cfgs.experts_per_visit
+    if e == 1:
+        return 1
+    max_tiles = cfgs.dims.size_group // e + pl.cdiv(cfgs.dims.size_m, cfgs.tiles.tile_m) - 1
+    return max_tiles * (e + 1)
+
+
+def check_experts_per_visit(
+    e: int, *, size_group: int, size_lhs_group: int, size_k: int, tile_k: int,
+    rhs_split: int,
+) -> None:
+    """Multi-expert visits need whole blocks of E experts covering every
+    group (no expert-parallel offset), one k step, and no column split."""
+    if not (
+        e in (2, 4)
+        and size_group % e == 0
+        and size_lhs_group == size_group
+        and tile_k >= size_k
+        and rhs_split == 1
+    ):
+        raise ValueError(
+            f"experts_per_visit={e} needs E in (2, 4), E | size_group, all "
+            f"groups local, a single k tile and rhs_split 1 ({size_group=}, "
+            f"{size_lhs_group=}, {size_k=}, {tile_k=}, {rhs_split=})"
+        )
 
 
 def get_metadata(cfgs: GmmConfigs) -> dict[str, str | int | float]:
@@ -1436,6 +1725,7 @@ def get_metadata(cfgs: GmmConfigs) -> dict[str, str | int | float]:
         "hoist_lhs_quant",
         "trace_scopes",
         "rhs_split",
+        "experts_per_visit",
     ]
 )
 def gmm_v2(
@@ -1459,6 +1749,7 @@ def gmm_v2(
     hoist_lhs_quant: bool = False,
     trace_scopes: int = 0,
     rhs_split: int = 1,
+    experts_per_visit: int = 1,
 ) -> jax.Array:
     """GMM kernel implemented with emit_pipeline.
 
@@ -1496,6 +1787,10 @@ def gmm_v2(
         rhs_split: Deliver each weight tile as this many column parts, each
             its own pipeline input (a concurrent DMA). Non-fused GMM with one
             N tile; every output column is computed as without the split.
+        experts_per_visit: Visit E consecutive experts per pipeline step (one
+            E-expert weight block, one pass over their rows), amortizing the
+            fixed per-step cost. All groups local (no group offset), one k
+            tile. Every row is computed exactly as with one expert per step.
 
     Returns:
         Output of shape [size_m, size_n] ([size_m, width] with n_window).
@@ -1540,6 +1835,7 @@ def gmm_v2(
         hoist_lhs_quant=hoist_lhs_quant,
         trace_scopes=trace_scopes,
         rhs_split=rhs_split,
+        experts_per_visit=experts_per_visit,
     )
     dims = cfgs.dims
     tiles = cfgs.tiles
@@ -1565,6 +1861,7 @@ def gmm_v2(
         MetadataRef(
             gm_id_to_group_id=pltpu.SMEM((max_num_gm,), jnp.int32),
             gm_id_to_m_offset=pltpu.SMEM((max_num_gm + 1,), jnp.int32),
+            gm_id_to_sub_bounds=pltpu.SMEM((sub_bounds_size(cfgs),), jnp.int32),
         ),
     ]
 

@@ -85,6 +85,7 @@ if TYPE_CHECKING:
     TPU_MOE_NONEP_GMM_TILE_M: str = "0"
     TPU_MOE_NONEP_GMM_HOIST_QUANT: bool = False
     TPU_MOE_NONEP_GMM2_RHS_SPLIT: str = "1"
+    TPU_MOE_NONEP_GMM_EXPERTS_PER_VISIT: str = "1"
     USE_MOE_TP_DECODE_KERNEL: bool = False
     RAGGED_GATHER_REDUCE_VERSION: str = "v2"
     USE_PHASED_PROFILER: bool = False
@@ -1182,6 +1183,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Bitwise the same output.
     "TPU_MOE_NONEP_GMM2_RHS_SPLIT": env_with_choices(
         "TPU_MOE_NONEP_GMM2_RHS_SPLIT", "1", ["1", "2", "5"]
+    ),
+    # Both non-EP GMMs visit this many consecutive experts per pipeline step
+    # (gmm_v2 experts_per_visit): one E-expert weight block and one pass over
+    # their rows, amortizing the fixed per-step cost. Bitwise the same output.
+    "TPU_MOE_NONEP_GMM_EXPERTS_PER_VISIT": env_with_choices(
+        "TPU_MOE_NONEP_GMM_EXPERTS_PER_VISIT", "1", ["1", "2", "4"]
     ),
     # Serve eligible tensor-parallel MoE layers (sigmoid + correction-bias
     # top-k with renormalization, one shared expert, FP8 per-channel weights)
