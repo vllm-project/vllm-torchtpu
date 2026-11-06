@@ -41,7 +41,11 @@ from vllm_torchtpu.megakernel.errors import MegakernelLayoutError
 from vllm_torchtpu.megakernel.runtime import stats as _stats
 from vllm_torchtpu.megakernel.runtime.contract import (
     DOMAIN_TP,
+    Bucket,
+    Decline,
     EligibilityResult,
+    RunnerShape,
+    StepFn,
 )
 from vllm_torchtpu.megakernel_runtime.agreement import (
     DECLINE_VOTE_CODES,
@@ -74,14 +78,7 @@ from vllm_torchtpu.megakernel_runtime.guards import (
     kv_connector_names,
 )
 from vllm_torchtpu.megakernel_runtime.hooks import StepContext, is_suppressed
-from vllm_torchtpu.megakernel_runtime.plugin import (
-    Bucket,
-    Decline,
-    ForwardView,
-    RunnerShape,
-    RunnerView,
-    StepFn,
-)
+from vllm_torchtpu.megakernel_runtime.plugin import ForwardView, RunnerView
 
 logger = init_logger(__name__)
 

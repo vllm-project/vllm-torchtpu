@@ -34,15 +34,11 @@ import vllm_torchtpu.megakernel_runtime.agreement as agreement_mod
 import vllm_torchtpu.megakernel_runtime.driver as driver_mod
 from vllm_torchtpu import megakernel_runtime as mkr
 from vllm_torchtpu.megakernel import errors as mk_errors
+from vllm_torchtpu.megakernel.runtime.contract import Bucket, RunnerShape, TpuMonoSpec
 from vllm_torchtpu.megakernel_runtime import fingerprint as fp
 from vllm_torchtpu.megakernel_runtime import testing, testkit
 from vllm_torchtpu.megakernel_runtime.hooks import StepContext
-from vllm_torchtpu.megakernel_runtime.plugin import (
-    Bucket,
-    RunnerShape,
-    RunnerView,
-    TpuMonoSpec,
-)
+from vllm_torchtpu.megakernel_runtime.plugin import RunnerView
 from vllm_torchtpu.megakernel_runtime.testkit import (
     TOY_PLUGIN,
     assert_rank_uniform_declines,

@@ -47,7 +47,8 @@ from unittest import mock
 
 import pytest  # pyrefly: ignore[missing-import]
 
-from .plugin import TpuMonoSpec
+from vllm_torchtpu.megakernel.runtime.contract import TpuMonoSpec
+
 from .testing import fake_runner
 
 _SRC = Path(__file__).resolve().parents[2]
@@ -57,8 +58,11 @@ HEAVY_IMPORTS = ("jax", "torch", "vllm")
 
 TOY_PLUGIN = '''
 """A toy megakernel plugin: y = x * scale + B, in pure torch."""
-from vllm_torchtpu.megakernel_runtime.plugin import (
-    Bucket, Decline, TpuMonoSpec, WarmupCase,
+from vllm_torchtpu.megakernel.runtime.contract import (
+    Bucket,
+    Decline,
+    TpuMonoSpec,
+    WarmupCase,
 )
 
 
@@ -100,7 +104,7 @@ class ToyProgram:
         return WarmupCase((torch.ones(shape.tok_pad),), check)
 
     def decide(self, ctx, fwd):
-        from vllm_torchtpu.megakernel_runtime.plugin import StepDecision
+        from vllm_torchtpu.megakernel.runtime.contract import StepDecision
 
         n = int(ctx.input_ids.shape[0])
         b = next((b for b in (4, 8) if b >= n), None)

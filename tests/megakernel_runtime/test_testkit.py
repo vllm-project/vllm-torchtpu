@@ -28,7 +28,7 @@ from vllm_torchtpu.megakernel_runtime.config import MegakernelConfigError
 
 _INIT = '''
 """A plugin package."""
-from vllm_torchtpu.megakernel_runtime.plugin import TpuMonoSpec
+from vllm_torchtpu.megakernel.runtime.contract import TpuMonoSpec
 {extra}
 SPEC = TpuMonoSpec("pkg", "1", create={create!r})
 '''
