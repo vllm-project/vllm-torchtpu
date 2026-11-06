@@ -291,56 +291,6 @@
       "concise_description": "Object of class `NoneType` has no attribute `vmem_capacity_bytes`"
     },
     {
-      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/decode.py",
-      "name": "bad-argument-count",
-      "concise_description": "Expected 4 positional arguments, got 6 in function `vllm_torchtpu.models.kimi_k3.megakernel.pools.KdaImporter.import_state`"
-    },
-    {
-      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/decode.py",
-      "name": "bad-argument-count",
-      "concise_description": "Expected 4 positional arguments, got 6 in function `vllm_torchtpu.models.kimi_k3.megakernel.pools.KdaImporter.import_state`"
-    },
-    {
-      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/draft_mla.py",
-      "name": "not-callable",
-      "concise_description": "Expected a callable, got `object`"
-    },
-    {
-      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/draft_mla_prefill.py",
-      "name": "not-callable",
-      "concise_description": "Expected a callable, got `object`"
-    },
-    {
-      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/draft_ring.py",
-      "name": "not-callable",
-      "concise_description": "Expected a callable, got `object`"
-    },
-    {
-      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/pools.py",
-      "name": "not-callable",
-      "concise_description": "Expected a callable, got `object`"
-    },
-    {
-      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/prefill.py",
-      "name": "unsupported-operation",
-      "concise_description": "Cannot set item in `dict[Any, dict[str, Any]]`"
-    },
-    {
-      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/prefill.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `read_states`"
-    },
-    {
-      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/prefill.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `mla_pools`"
-    },
-    {
-      "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/prefill.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `write_packed`"
-    },
-    {
       "path": "src/vllm_torchtpu/models/kimi_k3/megakernel/tools/bench.py",
       "name": "missing-attribute",
       "concise_description": "Object of class `KimiDecoder` has no attribute `program`"
