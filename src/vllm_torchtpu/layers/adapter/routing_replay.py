@@ -31,6 +31,8 @@ class RoutingReplay:
         if ids.ndim != 4:
             raise ValueError(f"{path}: ids must be [layers, windows, positions, topk]")
         self.num_layers, self.num_windows, self.positions, self.topk = ids.shape
+        if ids.min() < 0 or ids.max() >= 1 << 16:
+            raise ValueError(f"{path}: ids must lie in [0, 2**16)")
         self._ids = ids.astype(np.int32)
 
     def table(self, layer, device: torch.device) -> torch.Tensor:
@@ -84,8 +86,15 @@ class RoutingReplay:
         pick = window * positions + row % positions
         slots = torch.arange(table.shape[0], device=device, dtype=torch.int32)
         onehot = (pick[:, None] == slots[None, :]).float()
-        # Expert ids < 2**24: exact in float32.
-        topk_ids = (onehot @ table.float()).round().to(torch.int32)
+        # A TPU matmul may round float32 operands to bfloat16, which holds
+        # integers exactly only up to 256: look the ids up as two base-256
+        # digits (ids < 2**16), each found exactly.
+        digits = torch.cat(
+            [table % 256, torch.div(table, 256, rounding_mode="floor")], 1
+        )
+        found = onehot @ digits.float()
+        low, high = found[:, : self.topk], found[:, self.topk :]
+        topk_ids = (low + 256.0 * high).round().to(torch.int32)
         topk_ids = torch.remainder(topk_ids, num_experts)
         probs = router_logits.float().softmax(dim=-1)
         experts = torch.arange(num_experts, device=device, dtype=torch.int32)
