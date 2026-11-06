@@ -198,7 +198,8 @@ def test_config_pins_block_size_to_sparse_block(cache_dtype, indexer_kv_dtype) -
             ),
             ValueError,
         ),
-        (dict(tensor_parallel_size=8, decode_context_parallel_size=4), ValueError),
+        # DCP must divide TP (wider groups up to TP span several KV heads).
+        (dict(tensor_parallel_size=8, decode_context_parallel_size=3), ValueError),
         (
             dict(
                 tensor_parallel_size=8,
@@ -215,11 +216,12 @@ def test_config_rejects_unsupported(overrides, error) -> None:
         TPUMiniMaxM3Config.verify_and_update_config(_hook_config(**overrides))
 
 
+@pytest.mark.parametrize("dcp", [2, 4, 8])
 @pytest.mark.parametrize("interleave", [1, 128])
-def test_config_dcp_keeps_whole_blocks_per_rank(interleave) -> None:
+def test_config_dcp_keeps_whole_blocks_per_rank(interleave, dcp) -> None:
     config = _hook_config(
         tensor_parallel_size=8,
-        decode_context_parallel_size=2,
+        decode_context_parallel_size=dcp,
         cp_kv_cache_interleave_size=interleave,
     )
     TPUMiniMaxM3Config.verify_and_update_config(config)
@@ -473,3 +475,38 @@ def test_checkpoint_loads_and_mxfp8_dequantizes(tiny_model, monkeypatch) -> None
     x = torch.randn(3, HIDDEN, dtype=torch.bfloat16)
     out, _ = attn.qkv_proj(x)
     torch.testing.assert_close(out, x @ expected.T)
+
+
+def test_vllm_gqa_dcp_cap_is_lifted_for_registered_models(monkeypatch) -> None:
+    """vLLM caps GQA DCP at tp // num_kv_heads (2 for M3 at TP8). For a
+    registered architecture the cap check sees the capped size, so DCP 8
+    passes it; other checks and other models are unchanged."""
+    from vllm.config.model import ModelConfig
+
+    from vllm_torchtpu.distributed import dcp as dcp_mod
+
+    seen = []
+    monkeypatch.setattr(
+        ModelConfig,
+        "verify_with_parallel_config",
+        lambda self, pc: seen.append(pc.decode_context_parallel_size),
+    )
+    monkeypatch.setattr(dcp_mod, "_KV_HEAD_SPANNING_DCP_ARCHITECTURES", set())
+    dcp_mod._patch_vllm_gqa_dcp_limit()
+    dcp_mod.register_kv_head_spanning_dcp_architectures("MiniMaxM3SparseForCausalLM")
+
+    def model(arch, use_mla=False):
+        return SimpleNamespace(
+            architectures=[arch],
+            use_mla=use_mla,
+            get_total_num_kv_heads=lambda: NUM_KV_HEADS,
+        )
+
+    pc = SimpleNamespace(decode_context_parallel_size=8, tensor_parallel_size=8)
+    ModelConfig.verify_with_parallel_config(model("MiniMaxM3SparseForCausalLM"), pc)
+    ModelConfig.verify_with_parallel_config(model("OtherForCausalLM"), pc)
+    ModelConfig.verify_with_parallel_config(
+        model("MiniMaxM3SparseForCausalLM", use_mla=True), pc
+    )
+    assert seen == [2, 8, 8]
+    assert pc.decode_context_parallel_size == 8  # the caller's config is untouched

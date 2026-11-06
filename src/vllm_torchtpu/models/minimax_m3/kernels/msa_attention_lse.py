@@ -128,11 +128,14 @@ def _attention_call(
     sm_scale,
     block_q,
     pages_per_step,
+    head,
     interpret,
 ):
     """One kernel call over a token count that is a multiple of block_q."""
     num_tokens, num_heads, head_dim = q.shape
-    _, rows_per_page, packing, row_width = kv_cache.shape
+    _, rows_per_page, packing, _ = kv_cache.shape
+    # One KV head's [K | V] slice of each row.
+    row_width = 2 * head_dim
     topk = selected.shape[1]
     pages, meta, num_groups = msa_attention._work_list(
         selected, block_q, pages_per_step
@@ -146,7 +149,8 @@ def _attention_call(
 
     def page_block(g):
         def index_map(w, pages, meta, table):
-            return (table[jnp.maximum(pages[w * pages_per_step + g], 0)], 0, 0, 0)
+            page = table[jnp.maximum(pages[w * pages_per_step + g], 0)]
+            return (page, 0, 0, head)
 
         return pl.BlockSpec((1, rows_per_page, packing, row_width), index_map)
 
@@ -197,7 +201,8 @@ def _attention_call(
 
 
 @functools.partial(
-    jax.jit, static_argnames=("sm_scale", "block_q", "pages_per_step", "interpret")
+    jax.jit,
+    static_argnames=("sm_scale", "block_q", "pages_per_step", "head", "interpret"),
 )
 def msa_sparse_attention_lse(
     q: jax.Array,
@@ -210,6 +215,7 @@ def msa_sparse_attention_lse(
     sm_scale: float,
     block_q: int = msa_attention.DEFAULT_BLOCK_Q,
     pages_per_step: int = msa_attention.DEFAULT_PAGES_PER_STEP,
+    head: int = 0,
     interpret: bool = False,
 ) -> tuple[jax.Array, jax.Array]:
     """`msa_attention.msa_sparse_attention` (kernel v2, page keys translated
@@ -217,12 +223,17 @@ def msa_sparse_attention_lse(
 
     A token with no selected page (or a padding token) gets a zero output
     and ``lse = -inf``, so it carries no weight in a log-sum-exp merge.
+    Cache rows may hold several KV heads, ``[K_0 | V_0 | K_1 | V_1 ...]``;
+    `head` picks the one these queries attend (a 2D-wide block of each page).
     """
     num_tokens, _, head_dim = q.shape
     check_page_dtype(kv_cache.shape[2], kv_cache.dtype)
-    if kv_cache.shape[3] != 2 * head_dim:
+    if kv_cache.shape[3] % (2 * head_dim) or not (
+        0 <= head < kv_cache.shape[3] // (2 * head_dim)
+    ):
         raise ValueError(
-            f"Cache rows hold [K | V] of width {2 * head_dim}, got {kv_cache.shape}."
+            f"Cache rows hold [K | V] of width {2 * head_dim} per KV head; got "
+            f"{kv_cache.shape} for head {head}."
         )
     pad = -num_tokens % block_q
     if pad:
@@ -235,6 +246,7 @@ def msa_sparse_attention_lse(
         sm_scale=sm_scale,
         block_q=block_q,
         pages_per_step=pages_per_step,
+        head=head,
         interpret=interpret,
     )
     limit = msa_attention.MAX_TOKENS_PER_CALL

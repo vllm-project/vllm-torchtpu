@@ -54,7 +54,9 @@ class MiniMaxM3Cache(nn.Module, TpuOwnedKVCache):
     Under DCP a page holds whole blocks: vLLM's logical block ``j`` of
     ``dcp * S`` tokens is block ``j * dcp + r`` on DCP rank ``r``
     (`kernels.msa_dcp`); the spec is per rank and DCP-sharded, so the
-    scheduler counts ``dcp`` times the tokens per page.
+    scheduler counts ``dcp`` times the tokens per page. A DCP group wider
+    than a KV head's replicas stores all of its ``G`` KV heads per row,
+    ``[K_0 | V_0 | ... | K_G-1 | V_G-1]``.
     """
 
     def __init__(
@@ -212,9 +214,13 @@ class MiniMaxM3SparseAttention(nn.Module):
                 f"additional_config.{SHARD_INDEX_CACHE_KEY} does not combine with "
                 "--decode-context-parallel-size."
             )
+        # TP ranks per KV head; a DCP group wider than that spans several KV
+        # heads, and each rank stores all of their rows for its blocks.
+        self.kv_head_replicas = max(1, tp_size // config.num_key_value_heads)
+        self.dcp_kv_heads = max(1, self.dcp_size // self.kv_head_replicas)
         dtype = cache_dtype(cache_config)
         self.kv_cache = MiniMaxM3Cache(
-            2 * self.head_dim, dtype, prefix=f"{prefix}.attn"
+            2 * self.head_dim * self.dcp_kv_heads, dtype, prefix=f"{prefix}.attn"
         )
         self.index_cache = MiniMaxM3Cache(
             self.index_head_dim,
@@ -236,7 +242,9 @@ class MiniMaxM3SparseAttention(nn.Module):
                     f"DCP group of {get_dcp_world_size()} ranks, expected "
                     f"{self.dcp_size}."
                 )
-            self.msa_op = get_msa_dcp_op(*msa_config, get_dcp_rank(), self.dcp_size)
+            self.msa_op = get_msa_dcp_op(
+                *msa_config, get_dcp_rank(), self.dcp_size, self.kv_head_replicas
+            )
         elif self.index_shards > 1:
             self.msa_op = get_msa_sharded_op(
                 *msa_config, get_tensor_model_parallel_rank(), self.index_shards

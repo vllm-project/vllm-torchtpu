@@ -153,3 +153,53 @@ def get_or_create_dcp_mesh(axis_name: str | None = None) -> Any:
     )
     _MESH_CACHE[cache_key] = mesh
     return mesh
+
+
+# Architectures whose attention runs DCP groups wider than a KV head's TP
+# replicas (each rank then stores several KV heads for its share of the
+# blocks). vLLM caps GQA DCP at tensor_parallel_size // num_kv_heads.
+_KV_HEAD_SPANNING_DCP_ARCHITECTURES: set[str] = set()
+
+
+def register_kv_head_spanning_dcp_architectures(*architectures: str) -> None:
+    """Declare that these architectures support DCP up to the TP size."""
+    _KV_HEAD_SPANNING_DCP_ARCHITECTURES.update(architectures)
+
+
+def _patch_vllm_gqa_dcp_limit() -> None:
+    """Let registered GQA architectures run DCP wider than a KV head's
+    replicas.
+
+    `ModelConfig.verify_with_parallel_config` rejects GQA DCP beyond
+    ``tensor_parallel_size // num_kv_heads``: a stock attention backend keeps
+    one KV head per rank. For a registered architecture, run that check with
+    DCP clamped to the cap, so the other checks still apply; the model's own
+    config hook validates the wider group.
+    """
+    import copy
+
+    from vllm.config.model import ModelConfig
+
+    original = ModelConfig.verify_with_parallel_config
+    if getattr(original, "_tpu_gqa_dcp_limit_patch", False):
+        return
+
+    def verify_with_parallel_config(self, parallel_config):
+        dcp = parallel_config.decode_context_parallel_size
+        architectures = getattr(self, "architectures", None) or ()
+        if (
+            dcp > 1
+            and not self.use_mla
+            and any(a in _KV_HEAD_SPANNING_DCP_ARCHITECTURES for a in architectures)
+        ):
+            tp = parallel_config.tensor_parallel_size
+            cap = tp // max(1, self.get_total_num_kv_heads())
+            if cap >= 1 and dcp > cap:
+                clamped = copy.copy(parallel_config)
+                clamped.decode_context_parallel_size = cap
+                return original(self, clamped)
+        return original(self, parallel_config)
+
+    verify_with_parallel_config._tpu_gqa_dcp_limit_patch = True  # type: ignore[attr-defined]
+    ModelConfig.verify_with_parallel_config = verify_with_parallel_config
+    logger.info("Applied TPU patch: GQA DCP up to the TP size for registered models.")

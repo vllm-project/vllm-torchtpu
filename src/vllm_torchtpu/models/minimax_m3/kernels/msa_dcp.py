@@ -32,6 +32,12 @@ lives on rank ``b % dcp``, whole, and every block-level step stays local:
    attends every query head of the KV head over the selected blocks it
    holds and returns the partial output with its log-sum-exp; the caller
    merges the ranks' partials (`cp_mla_attention.merge_lse_partials_scatter_heads`).
+
+A DCP group wider than a KV head's TP replicas (e.g. DCP 8 at TP 8 with 4
+KV heads) spans ``G = dcp / replicas`` KV heads: every rank then stores all
+``G`` heads' K/V rows (and the one shared index-key head) for its blocks,
+and runs both steps per head; the caller all-gathers the new K/V and index
+queries of the group's heads along with the query heads.
 """
 
 import functools
@@ -219,6 +225,16 @@ def merge_candidates(candidates: jax.Array, topk: int) -> jax.Array:
     return jnp.concatenate(picked, axis=1)
 
 
+def merge_head_candidates(candidates: jax.Array, topk: int) -> jax.Array:
+    """`merge_candidates` per KV head: ``[dcp, T, G * 2 * topk]`` (each
+    rank's `pack_candidates` of its ``G`` heads, head-major) -> selection
+    ``[T, G, topk]``."""
+    dcp, num_tokens, width = candidates.shape
+    num_heads = width // (2 * topk)
+    rows = candidates.reshape(dcp, num_tokens * num_heads, 2 * topk)
+    return merge_candidates(rows, topk).reshape(num_tokens, num_heads, topk)
+
+
 def msa_write_and_candidates_dcp(
     k: jax.Array,
     v: jax.Array,
@@ -241,11 +257,15 @@ def msa_write_and_candidates_dcp(
     """First half of the DCP forward: write this rank's tokens, score its
     blocks and pick its candidates.
 
-    Shapes as `msa.msa_forward`; ``block_tables`` are vLLM's logical DCP
-    blocks of ``dcp * block_size`` tokens. Returns ``(kv_cache, index_cache,
-    candidates [T, 2 * topk] f32)`` (`pack_candidates`).
+    Shapes as `msa.msa_forward`, except that a rank may hold ``G >= 1`` KV
+    heads (DCP wider than a KV head's replicas): ``k``/``v``/``index_q
+    [T, G, D]``, cache rows ``[K_0 | V_0 | ... | K_G-1 | V_G-1]``, and the
+    single index-key head shared by all. ``block_tables`` are vLLM's logical
+    DCP blocks of ``dcp * block_size`` tokens. Returns ``(kv_cache,
+    index_cache, candidates [T, G * 2 * topk] f32)``: `pack_candidates` per
+    head, head-major.
     """
-    num_tokens = k.shape[0]
+    num_tokens, num_heads, _ = k.shape
     block_size = msa.page_size(kv_cache)
     max_num_seqs = seq_lens.shape[0]
     block_tables_2d = block_tables.reshape(max_num_seqs, -1)
@@ -266,20 +286,36 @@ def msa_write_and_candidates_dcp(
         max_num_seqs=max_num_seqs,
         interpret=interpret,
     )
-    kv_cache = write(kv_cache, jnp.concatenate([k, v], axis=-1)[:, 0])
+    kv_rows = jnp.concatenate([k, v], axis=-1).reshape(num_tokens, -1)
+    kv_cache = write(kv_cache, kv_rows)
     index_cache = write(index_cache, index_k)
-    scores = msa._block_scores(
-        index_q,
-        index_cache,
-        local_seq_lens(seq_lens, block_size=block_size, rank=rank, dcp=dcp),
-        block_tables,
-        cu_q_lens,
-        distribution[2],
-        interpret,
-    )
+    local_lens = local_seq_lens(seq_lens, block_size=block_size, rank=rank, dcp=dcp)
+    if num_heads == 1:
+        scores = msa._block_scores(
+            index_q,
+            index_cache,
+            local_lens,
+            block_tables,
+            cu_q_lens,
+            distribution[2],
+            interpret,
+        )
+    else:
+        # All heads in one pass over this rank's index pages: [G, T, P],
+        # head-major rows for the selection.
+        scores = msa.partial_block_scores(
+            index_q,
+            index_cache,
+            local_lens,
+            block_tables,
+            cu_q_lens,
+            distribution[2],
+            shards=1,
+            interpret=interpret,
+        ).reshape(num_heads * num_tokens, 1, -1)
     cand_scores, cand_blocks = local_candidates(
         scores,
-        pos,
+        jnp.tile(pos, num_heads),
         block_size=block_size,
         topk=topk,
         init_blocks=init_blocks,
@@ -288,7 +324,9 @@ def msa_write_and_candidates_dcp(
         dcp=dcp,
         interpret=interpret,
     )
-    return kv_cache, index_cache, pack_candidates(cand_scores, cand_blocks)
+    packed = pack_candidates(cand_scores, cand_blocks)  # [G * T, 2 * topk]
+    packed = packed.reshape(num_heads, num_tokens, -1).transpose(1, 0, 2)
+    return kv_cache, index_cache, packed.reshape(num_tokens, -1)
 
 
 def msa_attend_dcp(
@@ -308,9 +346,10 @@ def msa_attend_dcp(
     """Second half of the DCP forward: attend over the selected blocks this
     rank holds.
 
-    ``q [T, H, D]`` holds every query head of the group's KV head;
-    ``candidates [dcp, T, 2 * topk]`` every rank's `pack_candidates`.
-    Returns the partial ``(out [T, H, D], lse [T, H] f32)``.
+    ``q [T, G * Hg, D]`` holds every query head of the group's ``G`` KV heads
+    (KV head ``h`` owns query heads ``[h * Hg, (h + 1) * Hg)``);
+    ``candidates [dcp, T, G * 2 * topk]`` every rank's candidates. Returns
+    the partial ``(out [T, G * Hg, D], lse [T, G * Hg] f32)``.
     """
     num_tokens = q.shape[0]
     block_size = msa.page_size(kv_cache)
@@ -318,25 +357,37 @@ def msa_attend_dcp(
     block_tables_2d = block_tables.reshape(max_num_seqs, -1)
     pages_per_seq = block_tables_2d.shape[1]
     seq_id, pos, valid = msa.token_positions(num_tokens, seq_lens, cu_q_lens)
-    selected = merge_candidates(candidates, topk)
-    # Page keys (seq * pages_per_seq + logical block), as `msa.sparse_attention`.
-    mine = (selected >= 0) & (selected % dcp == rank) & valid[:, None]
-    keys = jnp.where(mine, seq_id[:, None] * pages_per_seq + selected // dcp, -1)
+    selected = merge_head_candidates(candidates, topk)  # [T, G, topk]
+    num_heads = selected.shape[1]
+    q_per_head = q.shape[1] // num_heads
     own_block = pos // block_size
     local_key = jnp.where(
         valid & (own_block % dcp == rank),
         seq_id * pages_per_seq + own_block // dcp,
         -1,
     )
-    return msa_attention_lse.msa_sparse_attention_lse(
-        q,
-        kv_cache,
-        keys,
-        local_key,
-        pos % block_size + 1,
-        block_tables.reshape(-1),
-        sm_scale=sm_scale,
-        block_q=msa_attention.DEFAULT_BLOCK_Q,
-        pages_per_step=msa_attention.DEFAULT_PAGES_PER_STEP,
-        interpret=interpret,
-    )
+    outs, lses = [], []
+    for head in range(num_heads):
+        sel = selected[:, head]
+        # Page keys (seq * pages_per_seq + logical block), as
+        # `msa.sparse_attention`.
+        mine = (sel >= 0) & (sel % dcp == rank) & valid[:, None]
+        keys = jnp.where(mine, seq_id[:, None] * pages_per_seq + sel // dcp, -1)
+        out, lse = msa_attention_lse.msa_sparse_attention_lse(
+            q[:, head * q_per_head : (head + 1) * q_per_head],
+            kv_cache,
+            keys,
+            local_key,
+            pos % block_size + 1,
+            block_tables.reshape(-1),
+            sm_scale=sm_scale,
+            block_q=msa_attention.DEFAULT_BLOCK_Q,
+            pages_per_step=msa_attention.DEFAULT_PAGES_PER_STEP,
+            head=head,
+            interpret=interpret,
+        )
+        outs.append(out)
+        lses.append(lse)
+    if num_heads == 1:
+        return outs[0], lses[0]
+    return jnp.concatenate(outs, axis=1), jnp.concatenate(lses, axis=1)

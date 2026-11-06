@@ -97,17 +97,20 @@ class TPUMiniMaxM3Config(VerifyAndUpdateConfig):
 
 
 def _verify_dcp(vllm_config: "VllmConfig", block_size: int) -> None:
-    """DCP splits a KV head's context over the ranks that replicate it, one
-    whole sparse block per rank in turn (`kernels.msa_dcp`)."""
+    """DCP splits the context over contiguous TP ranks, one whole sparse
+    block per rank in turn (`kernels.msa_dcp`). A group within one KV head's
+    replicas shares that head; a wider group (up to the whole TP group)
+    spans several KV heads, each rank storing all of them for its blocks."""
     parallel_config = vllm_config.parallel_config
     dcp = parallel_config.decode_context_parallel_size
     tp_size = parallel_config.tensor_parallel_size
     num_kv_heads = vllm_config.model_config.hf_text_config.num_key_value_heads
-    if tp_size % (num_kv_heads * dcp):
+    replicas = tp_size // num_kv_heads
+    if tp_size % dcp or (replicas % dcp and dcp % replicas):
         raise ValueError(
-            f"MiniMax M3 DCP splits the {tp_size // num_kv_heads} ranks that "
-            f"replicate a KV head; --decode-context-parallel-size {dcp} must "
-            "divide them."
+            f"MiniMax M3 DCP needs --decode-context-parallel-size ({dcp}) to "
+            f"divide --tensor-parallel-size ({tp_size}) and to divide, or be a "
+            f"multiple of, the {replicas} ranks that replicate a KV head."
         )
     interleave = parallel_config.cp_kv_cache_interleave_size
     if interleave == 1:

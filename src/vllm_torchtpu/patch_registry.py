@@ -115,6 +115,7 @@ PATCHES = (
     Patch("vllm_torchtpu:_patch_vllm_force_v1_runner_tpu", _ACTIVE),
     Patch("vllm_torchtpu:_patch_dflash_bypass_v2_runner_check", _ACTIVE),
     Patch("vllm_torchtpu:_patch_vllm_config_triton_tpu", _ACTIVE),
+    Patch("vllm_torchtpu.distributed.dcp:_patch_vllm_gqa_dcp_limit", _ACTIVE),
     # Weight loading and embeddings.
     Patch(
         "vllm_torchtpu.model_loader_patches:patch_default_loader_ep_weight_filter",

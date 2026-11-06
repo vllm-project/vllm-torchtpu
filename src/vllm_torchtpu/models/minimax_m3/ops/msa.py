@@ -258,6 +258,27 @@ def get_msa_sharded_op(
     return op
 
 
+def split_group_heads(
+    gathered: torch.Tensor, dcp: int, q_heads: int, kv_head_replicas: int
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Split the DCP all-gather of every rank's ``[q | k | v | index_q]``
+    (``[T, dcp * (q_heads + 3), D]``, rank-major) into the group's query
+    heads ``[T, dcp * q_heads, D]`` and the ``k``/``v``/``index_q
+    [T, dcp // kv_head_replicas, D]`` of its KV heads: rank ``i`` of the
+    group holds KV head ``i // kv_head_replicas``, so every
+    ``kv_head_replicas``-th rank supplies the next head."""
+    num_tokens, _, head_dim = gathered.shape
+    gathered = gathered.view(num_tokens, dcp, q_heads + 3, head_dim)
+    q_all = gathered[:, :, :q_heads].reshape(num_tokens, dcp * q_heads, head_dim)
+    per_head = gathered[:, ::kv_head_replicas, q_heads:]
+    return (
+        q_all,
+        per_head[:, :, 0].contiguous(),
+        per_head[:, :, 1].contiguous(),
+        per_head[:, :, 2].contiguous(),
+    )
+
+
 @functools.cache
 def get_msa_dcp_op(
     sm_scale: float,
@@ -266,9 +287,15 @@ def get_msa_dcp_op(
     local_blocks: int,
     rank: int,
     dcp: int,
+    kv_head_replicas: int = 1,
 ) -> Callable[..., torch.Tensor]:
     """`get_msa_op` for a KV head's context split over ``dcp`` ranks
     (`kernels.msa_dcp`).
+
+    ``kv_head_replicas`` is the TP ranks per KV head. A DCP group wider than
+    that spans ``dcp // kv_head_replicas`` KV heads; one all-gather then also
+    brings every rank the group's new K/V and index queries (the GLM DCP
+    pattern: one gather in, the LSE merge and reduce-scatter out).
 
     Two JAX ops: the first writes this rank's tokens and returns its local
     top-k candidates; an all-gather over the DCP group brings every rank all
@@ -282,6 +309,13 @@ def get_msa_dcp_op(
         all_gather_heads,
         merge_lse_partials_scatter_heads,
     )
+
+    if dcp % kv_head_replicas and kv_head_replicas % dcp:
+        raise ValueError(
+            f"DCP size {dcp} and the {kv_head_replicas} replicas of a KV head "
+            "must divide one another."
+        )
+    kv_heads = max(1, dcp // kv_head_replicas)
 
     def _score_jax(
         k: jax.Array,
@@ -336,6 +370,7 @@ def get_msa_dcp_op(
 
     suffix = (
         f"t{topk}_i{init_blocks}_l{local_blocks}_s{sm_scale:.8f}_r{rank}of{dcp}"
+        f"_g{kv_heads}"
     ).replace(".", "p")
     score_op = pallas.jax_op(
         f"pallas::minimax_m3_msa_dcp_score_{suffix}",
@@ -350,7 +385,11 @@ def get_msa_dcp_op(
         return (
             torch.empty_like(kv_cache),
             torch.empty_like(index_cache),
-            torch.empty((k.shape[0], 2 * topk), dtype=torch.float32, device=k.device),
+            torch.empty(
+                (k.shape[0], k.shape[1] * 2 * topk),
+                dtype=torch.float32,
+                device=k.device,
+            ),
         )
 
     def _attend_fake(q, *args):
@@ -372,6 +411,19 @@ def get_msa_dcp_op(
         index_cache: torch.Tensor,
         metadata: AttentionMetadata,
     ) -> torch.Tensor:
+        group = get_dcp_group()
+        assert group is not None, "DCP group is not initialized"
+        if kv_heads == 1:
+            q_all = all_gather_heads(q)
+        else:
+            # One gather of [q | k | v | index_q] per rank; every
+            # kv_head_replicas-th rank contributes the K/V of the next head.
+            gathered = group.all_gather(
+                torch.cat([q, k, v, index_q], dim=1).contiguous(), dim=1
+            )
+            q_all, k, v, index_q = split_group_heads(
+                gathered, dcp, q.shape[1], kv_head_replicas
+            )
         new_kv_cache, new_index_cache, candidates = score_op(
             k,
             v,
@@ -386,11 +438,9 @@ def get_msa_dcp_op(
         )
         kv_cache.copy_(new_kv_cache)
         index_cache.copy_(new_index_cache)
-        group = get_dcp_group()
-        assert group is not None, "DCP group is not initialized"
         candidates = group.all_gather(candidates.unsqueeze(0), dim=0)
         out, lse = attend_op(
-            all_gather_heads(q),
+            q_all,
             kv_cache,
             candidates,
             metadata.seq_lens,
