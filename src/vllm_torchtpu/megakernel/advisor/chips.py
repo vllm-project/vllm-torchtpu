@@ -393,8 +393,14 @@ def _scale_megacore(
     ici_bw_gbps: float | None,
     collective_latency_us: float | None,
 ) -> ChipSpec:
-    """Scale a single-core `ChipSpec` across `num_cores` and apply user overrides."""
+    """Scale a `ChipSpec` by `num_cores` and apply user overrides."""
     vmem_cap = base.vmem_capacity_bytes * num_cores
+    base_usable = (
+        base.vmem_usable_bytes
+        if base.vmem_usable_bytes > 0
+        else max(0, base.vmem_capacity_bytes - _USABLE_VMEM_RESERVE_BYTES)
+    )
+    vmem_usable = base_usable * num_cores
     egress = (
         base.ici_egress_bw_bytes_per_s * num_cores
         if ici_bw_gbps is None
@@ -410,12 +416,18 @@ def _scale_megacore(
         if collective_latency_us is None
         else (collective_latency_us, collective_latency_us)
     )
+    total_cores = base.cores_per_device * num_cores
+    chip_name = (
+        f"{base.name}_megacore"
+        if total_cores == _MEGACORE_CORES and not base.name.endswith("_megacore")
+        else base.name
+    )
     return replace(
         base,
-        name=f"{base.name}_megacore" if num_cores == _MEGACORE_CORES else base.name,
-        cores_per_device=num_cores,
+        name=chip_name,
+        cores_per_device=total_cores,
         vmem_capacity_bytes=vmem_cap,
-        vmem_usable_bytes=vmem_cap - _USABLE_VMEM_RESERVE_BYTES,
+        vmem_usable_bytes=vmem_usable,
         hbm_capacity_bytes=base.hbm_capacity_bytes * num_cores,
         hbm_bw_bytes_per_s=base.hbm_bw_bytes_per_s * num_cores,
         bf16_flops_per_s=base.bf16_flops_per_s * num_cores,
@@ -480,9 +492,10 @@ def resolve_chip_spec(
         return chip
     if chip_spec_path is not None:
         loaded = load_chip_spec_file(chip_spec_path, fallback_name=str(chip))
-        return _scale_megacore(
-            loaded, loaded.cores_per_device, ici_bw_gbps, collective_latency_us
-        )
+        scale = _MEGACORE_CORES if (megacore and loaded.cores_per_device == 1) else 1
+        if scale == 1 and ici_bw_gbps is None and collective_latency_us is None:
+            return loaded
+        return _scale_megacore(loaded, scale, ici_bw_gbps, collective_latency_us)
     raw = str(chip).strip().lower().removeprefix("tpu_")
     auto_cores: int | None = None
     if raw == "auto":

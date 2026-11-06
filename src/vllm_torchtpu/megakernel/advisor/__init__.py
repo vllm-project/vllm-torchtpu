@@ -307,6 +307,12 @@ class ScopeEstimate:
     step_bound_us: float
     break_even_op_overhead_us: float = 0.0
     step_upper_us: float = 0.0
+    compute_us: float = 0.0
+    hbm_us: float = 0.0
+    comm_us: float = 0.0
+    fill_drain_us: float = 0.0
+    repass_spill_us: float = 0.0
+    launch_us: float = 0.0
 
     @property
     def max_vmem_tokens(self) -> int:
@@ -404,6 +410,7 @@ class RegimeEntry:
     unresolved_assumptions: tuple[dict[str, object], ...] = ()
     # Floor, upper, launches, and passes of every scope, for the report ledger.
     scopes: tuple[dict[str, object], ...] = ()
+    workload: dict[str, object] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -1029,6 +1036,12 @@ def _evaluate_scopes(
                 step_bound_us=round(step_us, 2),
                 break_even_op_overhead_us=break_even,
                 step_upper_us=round(step_upper_us, 2),
+                compute_us=round(t_matmul * 1e6, 2),
+                hbm_us=round(((hbm_int + act_bytes) / bw_hbm) * 1e6, 2),
+                comm_us=round(t_comm * 1e6, 2),
+                fill_drain_us=round(pipeline_fill_drain_s * 1e6, 2),
+                repass_spill_us=round(repass_spill_us, 2),
+                launch_us=round(n_ops * workload.op_overhead_us, 2),
             )
         )
 
@@ -2015,6 +2028,15 @@ def advise(
 
     dtypes_bw = _validate_advise_inputs(prof, eff_wl)
     chip_spec = resolve_chip_spec(chip, chip_spec_path=cs_path)
+    max_usable_mib = chip_spec.vmem_usable_bytes / (1 << 20)
+    if eff_wl.vmem_budget_mib is not None and eff_wl.vmem_budget_mib > max_usable_mib:
+        phys_mib = chip_spec.vmem_capacity_bytes / (1 << 20)
+        msg = (
+            f"vmem_budget_mib ({eff_wl.vmem_budget_mib}) exceeds usable VMEM "
+            f"ceiling ({max_usable_mib:.1f} MiB usable out of {phys_mib:.1f} MiB "
+            f"physical) on chip {chip_spec.name!r}"
+        )
+        raise errors.MegakernelConfigError(msg)
     ctx = _build_scope_context(prof, eff_wl, chip_spec, dtypes_bw, plan_error)
     box = _assumed_box(
         ctx, eff_wl, _resolve_calibrated_priors(eff_wl, chip_spec, ctx, meas)
@@ -2735,14 +2757,51 @@ def advise_regimes(
                     {
                         "scope": s.scope,
                         "feasible": s.feasible,
+                        "reason": s.reason,
                         "step_bound_us": s.step_bound_us,
                         "step_upper_us": s.step_upper_us,
+                        "roof_floor_us": s.roof_floor_us,
+                        "compute_us": s.compute_us,
+                        "hbm_us": s.hbm_us,
+                        "comm_us": s.comm_us,
+                        "fill_drain_us": s.fill_drain_us,
+                        "repass_spill_us": s.repass_spill_us,
+                        "launch_us": s.launch_us,
                         "ops_per_step": s.ops_per_step,
                         "n_splits": s.n_splits,
                         "t_vmem_max": s.t_vmem_max,
+                        "vmem_static_mib": s.vmem_static_mib,
+                        "w_step_gb": s.w_step_gb,
+                        "act_hbm_mb": s.act_hbm_mb,
+                        "moe_flop_factor": s.moe_flop_factor,
                     }
                     for s in rep.scopes
                 ),
+                workload={
+                    "phase": wl.phase,
+                    "batch": wl.batch,
+                    "isl": wl.isl,
+                    "osl": wl.osl,
+                    "context": rep.effective_context,
+                    "spec_tokens": wl.spec_tokens,
+                    "chunk_size": wl.chunk_size,
+                    "prefix_hit_rate": wl.prefix_hit_rate,
+                    "microbatches": wl.microbatches,
+                    "segment_layers": wl.segment_layers,
+                    "tp": wl.tp,
+                    "ep": wl.ep,
+                    "dp": wl.dp,
+                    "pp": wl.pp,
+                    "dcp": wl.dcp,
+                    "pcp": wl.pcp,
+                    "kv_split": wl.kv_split,
+                    "layer_groups": list(wl.layer_groups),
+                    "moe_mode": wl.moe_mode,
+                    "vmem_alias": wl.vmem_alias,
+                    "vmem_fit_headroom": wl.vmem_fit_headroom,
+                    "op_overhead_us": wl.op_overhead_us,
+                    "dma_buffers": wl.dma_buffers,
+                },
             )
         )
 
