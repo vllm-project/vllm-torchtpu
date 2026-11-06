@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import contextlib
+import importlib
 import json
 import re
 from types import SimpleNamespace
@@ -59,7 +60,11 @@ from vllm_torchtpu.models.kimi_k3.megakernel import (
     draft_mla,
     layout,
     pools,
+    program,
     weight_stream,
+)
+from vllm_torchtpu.models.kimi_k3.megakernel import (
+    spec as k3_spec,
 )
 from vllm_torchtpu.models.kimi_k3.megakernel.adapter import create
 from vllm_torchtpu.models.kimi_k3.megakernel.kernels import (
@@ -78,6 +83,15 @@ from vllm_torchtpu.models.kimi_k3.megakernel.kernels.load import (
 )
 from vllm_torchtpu.models.kimi_k3.megakernel.kernels.load import (
     _family_layers as canonical_family_layers,
+)
+from vllm_torchtpu.models.kimi_k3.megakernel.spec import (
+    CONV_HEAD_ROWS,
+    HIDDEN_SIZE,
+    KDA_LAYERS,
+    MLA_LAYERS,
+    NUM_LAYERS,
+    RECURRENT_HEAD_ROWS,
+    VERIFY_TOKENS,
 )
 
 if TYPE_CHECKING:
@@ -138,8 +152,8 @@ def _assert_raises(exc_type: type[BaseException], match: str) -> Iterator[None]:
 
 def _kimi_hf_config(
     *,
-    num_hidden_layers: int = 93,
-    hidden_size: int = 7168,
+    num_hidden_layers: int = NUM_LAYERS,
+    hidden_size: int = HIDDEN_SIZE,
     arch: str = "KimiK3ForConditionalGeneration",
 ) -> SimpleNamespace:
     """Build a synthetic Kimi K3 HuggingFace config namespace."""
@@ -1150,11 +1164,14 @@ def _assert_tpu_bridge_upload(cfg: Config) -> None:
         )
     )
     pkg = weight_stream.__package__
+    assert pkg is not None
     shim_mods = {
+        "torch_tpu": None,
         f"{pkg}.runtime_shim": SimpleNamespace(__path__=[]),
         f"{pkg}.runtime_shim.bridge": fake_bridge,
     }
     with mock.patch.dict("sys.modules", shim_mods):
+        assert importlib.import_module(".runtime_shim.bridge", pkg) is fake_bridge
         tpu_streamer = adapter.RankWeightStreamer(0, num_layers=2, device="tpu")
         res = tpu_streamer.consume(
             "model.norm.weight", torch.ones((cfg.dim,), dtype=torch.bfloat16)
@@ -1322,9 +1339,9 @@ AOT_SCATTER_BATCH = 8
 AOT_NUM_SLOTS = 8
 AOT_NUM_BLOCKS = 16
 AOT_PAGE_WIDTH = 8
-K3_HIDDEN_DIM = 7168
-KDA_SSM_ROW_COUNT = 77
-KDA_CONV_ROW_COUNT = 4
+K3_HIDDEN_DIM = HIDDEN_SIZE
+KDA_SSM_ROW_COUNT = RECURRENT_HEAD_ROWS
+KDA_CONV_ROW_COUNT = CONV_HEAD_ROWS
 U32_WEIGHT_KEYS = frozenset({"expert_gu", "expert_down"})
 U8_WEIGHT_KEYS = frozenset({"expert_gus", "expert_ds"})
 F32_WEIGHT_KEYS = frozenset(
@@ -2523,3 +2540,29 @@ def test_mono_program_verify8_expands_block_tables_and_dp_slots() -> None:
     for null_slot in [0, 16, 32, 48]:
         assert float(prog.conv_slots[0, null_slot].abs().max().item()) == 0.0
         assert float(prog.recurrent_slots[0, null_slot].abs().max().item()) == 0.0
+
+
+def test_k3_spec_single_source_geometry_constants() -> None:
+    """Verify `spec.py` exports single-source Kimi-K3 geometry and pool constants."""
+    assert k3_spec.NUM_LAYERS == NUM_LAYERS == layout.NUM_LAYERS
+    assert (
+        k3_spec.KDA_LAYERS
+        == KDA_LAYERS
+        == pools.KDA_LAYERS
+        == len(layout.LAYOUT.state_layers)
+    )
+    assert (
+        k3_spec.MLA_LAYERS
+        == MLA_LAYERS
+        == pools.MLA_LAYERS
+        == len(layout.LAYOUT.attention_layers)
+    )
+    assert k3_spec.CONV_HEAD_ROWS == CONV_HEAD_ROWS == layout.CONV_HEAD_ROWS
+    assert (
+        k3_spec.RECURRENT_HEAD_ROWS
+        == RECURRENT_HEAD_ROWS
+        == pools.SSM_ROWS
+        == layout.LAYOUT.region("recurrent").rows
+    )
+    assert k3_spec.HIDDEN_SIZE == HIDDEN_SIZE == program.HIDDEN_SIZE
+    assert k3_spec.VERIFY_TOKENS == VERIFY_TOKENS == (program.DRAFT_TOKENS + 1,)
