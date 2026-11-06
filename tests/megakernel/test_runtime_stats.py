@@ -35,7 +35,9 @@ def test_qsl_and_mrope_uniformity() -> None:
     assert check_qsl_uniform([0, 1, 2, 3], 3) == BatchShape(True, 3, 1, "ok")
     assert check_qsl_uniform([0, 4, 8], 2) == BatchShape(True, 2, 4, "ok")
     assert check_qsl_uniform([0, 1, 5], 2) == BatchShape(False, 2, 0, "stock_mixed")
-    assert check_qsl_uniform([0, 8], 1) == BatchShape(False, 1, 0, "stock_q8")
+    assert check_qsl_uniform([0, 8], 1) == BatchShape(
+        eligible=True, num_reqs=1, tokens_per_seq=8, reason="ok"
+    )
     assert check_qsl_uniform([0], 2) == BatchShape(False, 0, 0, "stock_n0")
     assert check_qsl_uniform([0, 0], 1) == BatchShape(False, 1, 0, "stock_q0")
 

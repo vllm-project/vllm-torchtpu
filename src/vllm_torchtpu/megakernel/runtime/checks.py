@@ -170,7 +170,7 @@ def verify_pooled_step_hlo(
     hlo_kw = dict(kvh=kvh, hd=int(g.HD), min_pool_pages=max(16, num_pages))
     fio = cache_exec(ex).FUSED
     return cache.check_pooled_step_hlo(
-        hlo_text, page_size, fused_pool_io=fio, kernel_names=k_names, **hlo_kw
+        hlo_text or "", page_size, fused_pool_io=fio, kernel_names=k_names, **hlo_kw
     )
 
 
@@ -311,14 +311,16 @@ def build_warmup_plan(
     runner_tok_pads: Sequence[int] = (),
     req_block_pairs: Sequence[tuple[int, int]] = (),
     is_eager: bool = False,
+    verify_tokens: Sequence[int] = (MTP_VERIFY_TOKENS,),
 ) -> tuple[list[WarmupStepPlan], list[tuple[int, int]], int]:
     """Build `(warmup_steps, warmed_buckets, n_save)` for `warmup()`."""
     num_pages, max_pages_per_seq = int(num_pages), int(max_pages_per_seq)
     ckpt_cols, is_eager = max(1, int(ckpt_window)), bool(is_eager)
     pinfo = pool_schedule_info(spec)
     pps, spp = pinfo.pages_per_slot, pinfo.slots_per_pool
-    spv = spp * MTP_VERIFY_TOKENS
-    all_bkts = [(1, b) for b in buckets] + [(4, b) for b in verify_buckets]
+    vt = tuple(int(t) for t in verify_tokens)
+    spv = spp * max((1, *vt))
+    all_bkts = [(1, b) for b in buckets] + [(t, b) for t in vt for b in verify_buckets]
     fio, gpr = bucket_fused_io, bucket_gpr
     n_var = len(
         {(k[0], bool(fio.get(k, False)), bool(gpr.get(k, False))) for k in all_bkts}
