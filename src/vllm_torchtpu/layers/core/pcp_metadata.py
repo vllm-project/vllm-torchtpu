@@ -50,7 +50,6 @@ import torch
 class PcpMetadata:
     """Every sharding plan fills only its own fields and leaves the rest None."""
 
-
     # Head-Tail Sharding Plan metadata
 
     # The split prefills, request-major: block tables, seq_lens,

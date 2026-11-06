@@ -163,7 +163,7 @@ def merge_lse_partials_scatter_heads(
     if not spans_pcp:
         return cp_lse_ag_out_rs(output, lse, group, rs_dtype=rs_dtype)
 
-    else: 
+    else:
         # dcp = pcp x tp
         weighted = _weight_by_lse(output, lse, group)
         if rs_dtype is not None:
