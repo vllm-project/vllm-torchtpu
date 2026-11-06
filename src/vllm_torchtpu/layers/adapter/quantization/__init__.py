@@ -133,6 +133,10 @@ def get_tpu_quantization_config(
     model_config.quantization = quant_methods.get_tpu_quant_method(
         quant_config_cls.get_name()
     )
+    # Clear model_config.quantization_config before calling get_quantization_config
+    # so upstream does not attach CUDA-only OnlineQuantizationConfig
+    model_config.quantization_config = None
     config = VllmConfig.get_quantization_config(model_config, vllm_config.load_config)
     assert config is not None
+    config.online_quantization_config = None
     return attach_online_fp8(config, vllm_config)
