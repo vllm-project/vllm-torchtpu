@@ -46,6 +46,10 @@ from vllm_torchtpu.kernels.experimental.batched_rpa import (
     utils,
 )
 
+# Skip the kernel of a mode (decode / mixed) that has no sequences in the
+# call. Module-level for tests.
+_SKIP_EMPTY_MODES = True
+
 
 def prepare_inputs(
     q: jax.Array,
@@ -946,14 +950,23 @@ def ragged_paged_attention(
             )
             # Only this conditional captures layer-specific data. Metadata's
             # conditional has identical operands across layers and can be CSE'd.
-            state = jax.lax.cond(
-                use_compact,
-                lambda args, cfg=compact_cfgs, meta=compact_metadata: run_rpa_kernel(
-                    cfg, meta, compact_indices, *args
-                ),
-                lambda args, cfg=cfgs, meta=streamed_metadata: run_rpa_kernel(
-                    cfg, meta, page_indices, *args
-                ),
+            # A mode without sequences schedules no step and leaves the state
+            # as it is, so its kernel is skipped.
+            lo, hi = mode.get_range(distribution)
+            branch = jnp.where(use_compact, 1, 2)
+            if _SKIP_EMPTY_MODES:
+                branch = jnp.where(hi > lo, branch, 0)
+            state = jax.lax.switch(
+                branch,
+                [
+                    lambda args: args,
+                    lambda args, cfg=compact_cfgs, meta=compact_metadata: (
+                        run_rpa_kernel(cfg, meta, compact_indices, *args)
+                    ),
+                    lambda args, cfg=cfgs, meta=streamed_metadata: run_rpa_kernel(
+                        cfg, meta, page_indices, *args
+                    ),
+                ],
                 state,
             )
         else:
