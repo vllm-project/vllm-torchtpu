@@ -161,11 +161,13 @@ class Qwen4ExpRaidenConnector(TPURaidenConnector):
         )
         self._landed_on_all_ranks: list[str] = []
         self._failed_on_some_rank: list[str] = []
-        # QWEN4_EXP_PD_SHARED_COMPRESSED: a named load runs a TP all-gather
-        # on every rank, so the scheduler names only a load whose request
-        # still waits for it (3eeddf339's rule) and drops a name whose
-        # request finished before the metadata went out (its blocks may
-        # already belong to another request). req id -> request.
+        # The aborted-while-landing guard (``_guards_landing``): whenever L1
+        # names loads, the scheduler names only a load whose request still
+        # waits for it (3eeddf339's rule) and drops a name whose request
+        # finished before the metadata went out: its blocks may already
+        # belong to another request, so repacking (L1) or gathering (S4,
+        # QWEN4_EXP_PD_SHARED_COMPRESSED) into them would corrupt it.
+        # req id -> request.
         from .pd_shared_compressed import enabled as _shared_enabled
 
         self._shared_compressed = self._sync_repack and _shared_enabled()
@@ -173,9 +175,19 @@ class Qwen4ExpRaidenConnector(TPURaidenConnector):
 
     # --- QWEN4_EXP_PD_SYNC_REPACK -----------------------------------------
 
+    def _guards_landing(self) -> bool:
+        """The aborted-while-landing guard is on whenever L1 names loads
+        (QWEN4_EXP_PD_SYNC_REPACK, which S4 requires)."""
+        return bool(getattr(self, "_sync_repack", False))
+
+    def _loads(self) -> dict[str, Any]:
+        # Created on first use: connectors assembled without __init__ (tests)
+        # behave as one that has recorded no load yet.
+        return self.__dict__.setdefault("_load_requests", {})
+
     def update_state_after_alloc(self, request, blocks, num_external_tokens):
-        if getattr(self, "_shared_compressed", False) and num_external_tokens > 0:
-            self._load_requests[request.request_id] = request
+        if self._guards_landing() and num_external_tokens > 0:
+            self._loads()[request.request_id] = request
         return super().update_state_after_alloc(request, blocks, num_external_tokens)
 
     def update_connector_output(self, connector_output: Any) -> None:
@@ -188,19 +200,19 @@ class Qwen4ExpRaidenConnector(TPURaidenConnector):
         # pages it staged for it in the named step.
         finished = set(connector_output.finished_recving or ())
         failed = set(getattr(connector_output, "failed_recving", None) or ())
-        shared = getattr(self, "_shared_compressed", False)
+        guard = self._guards_landing()
         for req_id in sorted(finished - failed):
-            if shared and not self._still_waiting(req_id):
-                # Aborted while landing: naming it would gather into blocks
-                # vLLM freed; every rank frees its staged pages instead.
+            if guard and not self._still_waiting(req_id):
+                # Aborted while landing: naming it would repack (or gather)
+                # into blocks vLLM freed; every rank frees its staged pages.
                 self._failed_on_some_rank.append(req_id)
-                self._load_requests.pop(req_id, None)
+                self._loads().pop(req_id, None)
                 continue
             self._landed_on_all_ranks.append(req_id)
         for req_id in sorted(finished & failed):
             self._failed_on_some_rank.append(req_id)
-            if shared:
-                self._load_requests.pop(req_id, None)
+            if guard:
+                self._loads().pop(req_id, None)
 
     def _still_waiting(self, req_id: str) -> bool:
         """A recorded load whose request still waits for it. A load with no
@@ -208,25 +220,26 @@ class Qwen4ExpRaidenConnector(TPURaidenConnector):
         load is not recomputed)."""
         from vllm.v1.request import RequestStatus
 
-        request = self._load_requests.get(req_id)
+        request = self._loads().get(req_id)
         return request is None or request.status == RequestStatus.WAITING_FOR_REMOTE_KVS
 
     def build_connector_meta(self, scheduler_output):
         meta = super().build_connector_meta(scheduler_output)
         if self._sync_repack:
             named = self._landed_on_all_ranks
-            if getattr(self, "_shared_compressed", False):
+            if self._guards_landing():
+                loads = self._loads()
                 keep = []
                 for req_id in named:
-                    request = self._load_requests.pop(req_id, None)
+                    request = loads.pop(req_id, None)
                     if request is not None and request.is_finished():
                         self._failed_on_some_rank.append(req_id)
                     else:
                         keep.append(req_id)
                 named = keep
                 # Requests that finished before landing never get named.
-                for req_id in [r for r, q in self._load_requests.items() if q.is_finished()]:
-                    self._load_requests.pop(req_id)
+                for req_id in [r for r, q in loads.items() if q.is_finished()]:
+                    loads.pop(req_id)
             meta.qwen_repack_req_ids = named
             meta.qwen_drop_req_ids = self._failed_on_some_rank
             self._landed_on_all_ranks, self._failed_on_some_rank = [], []

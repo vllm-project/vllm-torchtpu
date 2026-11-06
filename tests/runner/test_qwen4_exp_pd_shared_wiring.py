@@ -331,14 +331,33 @@ def test_scheduler_names_only_loads_still_waiting(shared):
         c.update_state_after_alloc(r, None, 4096)
     b.status = RequestStatus.FINISHED_ABORTED  # aborted while landing
     c.update_connector_output(out(finished={"a", "b", "c"}))  # c: no record
-    if shared:  # the guard acts when the landing is reported, not only at build
-        assert c._landed_on_all_ranks == ["a", "c"] and c._failed_on_some_rank == ["b"]
+    # The guard acts when the landing is reported, not only at build, and
+    # under L1 alone too (shared=False): repacking b would write into blocks
+    # vLLM already freed (lead, 21:15Z).
+    assert c._landed_on_all_ranks == ["a", "c"] and c._failed_on_some_rank == ["b"]
     meta = c.build_connector_meta(None)
-    if shared:
-        assert meta.qwen_repack_req_ids == ["a", "c"] and meta.qwen_drop_req_ids == ["b"]
-        assert c._load_requests == {}
-    else:  # L1 unchanged with the flag off
-        assert meta.qwen_repack_req_ids == ["a", "b", "c"] and meta.qwen_drop_req_ids == []
+    assert meta.qwen_repack_req_ids == ["a", "c"] and meta.qwen_drop_req_ids == ["b"]
+    assert c._load_requests == {}
+
+
+def test_without_l1_nothing_is_named_or_recorded():
+    from vllm.v1.request import RequestStatus
+
+    c = scheduler(shared=False)
+    c._sync_repack = False
+    c.update_state_after_alloc(Req("a", RequestStatus.WAITING_FOR_REMOTE_KVS), None, 4096)
+    assert c._load_requests == {}
+    c.update_connector_output(out(finished={"a"}))
+    assert c._landed_on_all_ranks == [] and c._failed_on_some_rank == []
+
+
+def test_guard_works_on_a_connector_built_without_load_records():
+    """L1's own tests assemble the connector with object.__new__ and no
+    _load_requests: an unrecorded load is named as before."""
+    c = scheduler(shared=False)
+    del c._load_requests
+    c.update_connector_output(out(finished={"a"}))
+    assert c.build_connector_meta(None).qwen_repack_req_ids == ["a"]
 
 
 def test_scheduler_drops_a_name_whose_request_finished_before_the_metadata():
