@@ -175,7 +175,7 @@ def test_moe_module_declarations_and_emit_in_pallas_interpret(fake_ex: ExecSpec)
         out_refs = dict(zip(p.o_names, rest[n_w : n_w + n_o]))
         scr = dict(zip(s_names, rest[n_w + n_o :]))
         me = jnp.int32(0)
-        ring = stream.TwoRing(cp.stream, W, scr, me, interpret=True)
+        ring = stream.TwoRing(cp.stream, W, scr, interpret=True)
         ar = collectives.AllReduceRing(cp.comm, scr, me)
         ctx = MiniCtx(
             g=g,
@@ -358,7 +358,7 @@ def test_moe_module_numerical_parity(moe_tp: bool, R: int, pipe: bool):
                 )
             pl.semaphore_wait(barrier, R - 1)
 
-        ring = stream.TwoRing(cp.stream, W, scr, me, interpret=True)
+        ring = stream.TwoRing(cp.stream, W, scr, interpret=True)
         ar = collectives.AllReduceRing(cp.comm, scr, me)
         ctx = MiniCtx(
             g=g,
@@ -643,7 +643,7 @@ def test_moe_dynamic_dma_race_invariants(
                 )
             pl.semaphore_wait(barrier, R - 1)
 
-            ring = stream.TwoRing(cp.stream, W, scr, me, interpret=True)
+            ring = stream.TwoRing(cp.stream, W, scr, interpret=True)
             ar = collectives.AllReduceRing(cp.comm, scr, me)
             ctx = MiniCtx(
                 g=g,
@@ -808,7 +808,7 @@ def test_moe_routing_and_ring_helpers_in_pallas_interpret(
         wn_out_ref, nhit_out_ref, e13_out_ref = rest[n_w : n_w + 3]
         scr = dict(zip(s_names, rest[n_w + 3 :]))
         me = jnp.int32(0)
-        two_ring = stream.TwoRing(cp.stream, W, scr, me, interpret=True)
+        two_ring = stream.TwoRing(cp.stream, W, scr, interpret=True)
         ctx = MiniCtx(g, ex, cp, None, W, {}, {}, scr, me, stream=two_ring, comm=None)
         scr["hitv"][...] = jnp.zeros((ex.MR, 128), I32)
         _sync_copy(scr["hitv"].at[pl.ds(0, 8)], scr["seen"], scr["misc_sem"])

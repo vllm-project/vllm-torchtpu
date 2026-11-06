@@ -118,7 +118,7 @@ def test_gdn_emit_in_pallas_interpret_matches_reference(T: int, B: int, chunked:
         out_refs = dict(zip(p.o_names, rest[n_w + n_s : n_w + n_s + n_o]))
         scr = dict(zip(s_names, rest[n_w + n_s + n_o :]))
         me = jnp.int32(0)
-        ring = stream.TwoRing(cp.stream, W, scr, me, interpret=True)
+        ring = stream.TwoRing(cp.stream, W, scr, interpret=True)
         ar = collectives.AllReduceRing(cp.comm, scr, me)
         ctx = MiniCtx(
             g=g,

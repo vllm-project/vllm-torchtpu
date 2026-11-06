@@ -156,7 +156,7 @@ def build(
         row_m = lax.broadcasted_iota(I32, (ex.MB, 1), 0)
         live = row_m < ex.B
 
-        stream = TwoRing(sp, W, scr, me, interpret=bool(ex.interpret), skip=skip, sc=sc)
+        stream = TwoRing(sp, W, scr, interpret=bool(ex.interpret), skip=skip, sc=sc)
         comm = AllReduceRing(cp, scr, me, skip=skip, sc=sc)
         ctx = KernelContext(
             g=g,
