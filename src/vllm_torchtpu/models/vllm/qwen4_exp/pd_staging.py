@@ -844,6 +844,10 @@ class StagedConsumer:
     # the broadcast path. A class default, so a consumer assembled without
     # __init__ (tests, tools) takes today's path instead of failing.
     route = None
+    # QWEN4_EXP_PD_SHARED_COMPRESSED geometry and landing buffers (set by
+    # __init__ / enable_shared); the same class defaults, for the same reason.
+    shared = None
+    landing = None
 
     def __init__(self, cfg, decode_layout, decode_groups, pool, rank: RankSlice, staging_bytes: int):
         from vllm.v1.core.kv_cache_utils import get_kv_cache_groups
@@ -1145,7 +1149,9 @@ class StagedConsumer:
                 reduced_free[owner_pages] = 0
         self.reservations[uuid] = pages
         self.skips[uuid] = (skip_tokens, first)
-        self.tokens[uuid] = int(num_tokens)
+        # Per-load token counts (shared loads' clips); created on first use so
+        # a consumer assembled without __init__ (D-MK's admission tests) works.
+        self.__dict__.setdefault("tokens", {})[uuid] = int(num_tokens)
         return True
 
     def destination(self, uuid: int) -> tuple[list[str], list[int], list[int]]:
@@ -1173,7 +1179,7 @@ class StagedConsumer:
         the source pages a prefix-aware load leaves out of each pool."""
         skip, first = self.skips.get(uuid, (0, [0] * len(self.src_groups)))
         if self.route is not None:
-            shared = self._shared_load(self.tokens.get(uuid, 0))
+            shared = self._shared_load(getattr(self, "tokens", {}).get(uuid, 0))
 
             def rows(kind):
                 if shared and kind == "compressed":

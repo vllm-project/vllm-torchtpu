@@ -344,7 +344,7 @@ def test_a_consumer_built_without_init_takes_the_broadcast_path():
     from vllm_torchtpu.models.vllm.qwen4_exp.pd import TransferExtent, TransferGroup
 
     s = object.__new__(pd_staging.StagedConsumer)
-    assert s.route is None
+    assert s.route is None and s.shared is None and s.landing is None
     s.src_groups = [TransferGroup(0, ("fa",), 16, TransferExtent.TOKEN_PAGES),
                     TransferGroup(1, ("gdn",), 16, TransferExtent.REQUEST_STATE)]
     s.manifest = types.SimpleNamespace(pools=[types.SimpleNamespace(layer_name=n) for n in ("fa0", "gdn0")])
