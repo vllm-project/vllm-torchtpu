@@ -722,6 +722,28 @@ def test_parse_args_takes_the_vllm_serve_command_line(capsys) -> None:
         assert flag not in ignored, ignored
 
 
+def test_artifact_model_name_records_the_model_id_not_its_location(
+    tmp_path, capsys
+) -> None:
+    snapshot = tmp_path / "hub" / "models--Qwen--Qwen3-0.6B" / "snapshots" / "main"
+    snapshot.mkdir(parents=True)
+    local = tmp_path / "Qwen3.5-0.8B"
+    local.mkdir()
+
+    assert cli.artifact_model_name("Qwen/Qwen3-0.6B") == "Qwen/Qwen3-0.6B"
+    assert cli.artifact_model_name(str(snapshot)) == "Qwen/Qwen3-0.6B"
+    assert cli.artifact_model_name(str(snapshot) + "/") == "Qwen/Qwen3-0.6B"
+    assert capsys.readouterr().err == ""
+    assert cli.artifact_model_name(str(local)) == "Qwen3.5-0.8B"
+    assert "--served-model-name" in capsys.readouterr().err
+    assert cli.artifact_model_name("gs://bucket/ckpt/hf/Kimi-K3") == "Kimi-K3"
+    assert cli.artifact_model_name(str(local), ["Qwen/Qwen3.5-0.8B"]) == (
+        "Qwen/Qwen3.5-0.8B"
+    )
+    assert cli.artifact_model_name(str(snapshot), "my-model") == "my-model"
+    assert cli.artifact_model_name(None) is None
+
+
 def test_export_speculative_config_keeps_vllm_field_names() -> None:
     assert cli.export_speculative_config(None) is None
     assert cli.export_speculative_config(
