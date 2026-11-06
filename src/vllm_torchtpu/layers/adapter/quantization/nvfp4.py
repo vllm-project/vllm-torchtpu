@@ -102,6 +102,9 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+# Matches moe_tp_decode_nvfp4's 512-column w13 quantization block (_Q_BLOCK).
+_TP_DECODE_NVFP4_Q_BLOCK = 512
+
 
 def _to_kernel_scale(scale_f32: torch.Tensor) -> torch.Tensor:
     """[*, out, num_blocks] fp32 -> [*, num_blocks, 1, out] fp32 (gmm_v2 rhs
@@ -168,8 +171,6 @@ def _prepare_moe_weights(
 ):
     """Prepare a candidate weight set without replacing checkpoint tensors."""
     w13, w2 = layer.w13_weight.data, layer.w2_weight.data
-    if clamp_per_matrix and not requant_block:
-        requant_block = 512
     if requant_block:
         requant_block = int(requant_block)
         hidden, inter = w13.shape[-1] * 2, w2.shape[-1] * 2
@@ -423,7 +424,7 @@ class VllmNvfp4MoEMethod(TpuMoEActivationMixin, FusedMoEMethodBase):
             op, requant_block = _prebuild_w4a8(layer, activation_str, configured_block)
         tp_decode_nvfp4 = envs.USE_MOE_TP_DECODE_NVFP4_KERNEL and op is None
         if tp_decode_nvfp4 and requant_block is None:
-            requant_block = 512
+            requant_block = _TP_DECODE_NVFP4_Q_BLOCK
         weights, mode = _prepare_moe_weights(
             layer,
             w13_scale_f,

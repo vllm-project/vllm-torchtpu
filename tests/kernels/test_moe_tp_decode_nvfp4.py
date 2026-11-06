@@ -1954,10 +1954,12 @@ def _load_runtime_modules(monkeypatch):
     fake_torch = _put_mod(
         "torch",
         Tensor=_FakeTensor,
+        device=object,
         nn=fake_nn,
         library=fake_lib,
         float32="float32",
         bfloat16="bfloat16",
+        int32="int32",
         uint8="uint8",
         float8_e4m3fn="float8_e4m3fn",
         float4_e2m1fn_x2="float4_e2m1fn_x2",
@@ -2073,6 +2075,7 @@ def _load_runtime_modules(monkeypatch):
                 TORCH_TO_JAX_DTYPE_MAP={
                     "float32": jnp.float32,
                     "bfloat16": jnp.bfloat16,
+                    "int32": jnp.int32,
                     "uint8": jnp.uint8,
                     "float8_e4m3fn": jnp.float8_e4m3fn,
                     "float4_e2m1fn_x2": jnp.float4_e2m1fn,
@@ -2151,13 +2154,6 @@ def _load_runtime_modules(monkeypatch):
         "vllm_torchtpu.layers.adapter.token_padding",
         _padding_state=None,
     )
-    fp8_decode_stub = _put_mod(
-        "vllm_torchtpu.layers.adapter.moe_tp_decode",
-        _SELFTEST_DONE=False,
-        moe_tp_decode_supported=lambda qm: (
-            getattr(qm, "_moe_tp_decode_op", None) is not None
-        ),
-    )
     monkeypatch.setattr(
         sys.modules["vllm_torchtpu.layers.adapter"],
         "moe_routing",
@@ -2170,11 +2166,37 @@ def _load_runtime_modules(monkeypatch):
         token_padding_stub,
         raising=False,
     )
-    monkeypatch.setattr(
-        sys.modules["vllm_torchtpu.layers.adapter"],
-        "moe_tp_decode",
-        fp8_decode_stub,
-        raising=False,
+    parallel_state_stub = SimpleNamespace(
+        get_tp_group=lambda: SimpleNamespace(
+            ranks=tuple(range(N_RANKS)), world_size=1, cpu_group=None
+        )
+    )
+    _put_mod("vllm.distributed", parallel_state=parallel_state_stub)
+    _put_mod("vllm_torchtpu.distributed", __path__=[])
+    _put_mod(
+        "vllm_torchtpu.distributed.ep_mesh",
+        build_ep_mesh=lambda: None,
+        ep_mesh_index=lambda: 0,
+        get_ep_group=lambda: None,
+    )
+    _put_mod(
+        "vllm_torchtpu.env_override",
+        SC_ALL_REDUCE_FLAG="--xla_tpu_spmd_rng_bit_generator_unsafe",
+        sc_all_reduce_floor=lambda: "0",
+    )
+    _put_mod(
+        "vllm_torchtpu.kernels.router_topk",
+        select=lambda *_a, **_k: None,
+        select_bias=lambda *_a, **_k: None,
+    )
+    _put_mod(
+        "vllm_torchtpu.kernels.experimental.fused_moe_prefill",
+        fused_moe_prefill=lambda *a, **_k: a[0],
+        plan_blocks=lambda *_a, **_k: None,
+    )
+    _put_mod(
+        "vllm_torchtpu.kernels.experimental.fused_moe_prefill.fused_moe_prefill_kernel_v2",
+        fused_moe_prefill_stage_a=lambda *a, **_k: a[0],
     )
     _put_mod(
         "vllm_torchtpu.layers.adapter.fused_moe",
@@ -2236,6 +2258,11 @@ def _load_runtime_modules(monkeypatch):
     loaded = {}
     for key, mod_name, rel_file in (
         (
+            "fp8_decode",
+            "vllm_torchtpu.layers.adapter.moe_tp_decode",
+            "layers/adapter/moe_tp_decode.py",
+        ),
+        (
             "adapter",
             "vllm_torchtpu.layers.adapter.moe_tp_decode_nvfp4",
             "layers/adapter/moe_tp_decode_nvfp4.py",
@@ -2257,6 +2284,12 @@ def _load_runtime_modules(monkeypatch):
         monkeypatch.setitem(sys.modules, mod_name, mod)
         spec.loader.exec_module(mod)
         loaded[key] = mod
+    monkeypatch.setattr(
+        sys.modules["vllm_torchtpu.layers.adapter"],
+        "moe_tp_decode",
+        loaded["fp8_decode"],
+        raising=False,
+    )
     monkeypatch.setattr(
         sys.modules["vllm_torchtpu.layers.adapter"],
         "moe_tp_decode_nvfp4",
@@ -2613,7 +2646,7 @@ def test_arm_target_nvfp4_and_refuse_bf16_drafter(monkeypatch):
     VllmMoERunner = rt.moe_runner.VllmMoERunner
     monkeypatch.setattr(pltpu, "get_tpu_info", _tpu7x)
     adapter._OPS.clear()
-    monkeypatch.setattr(adapter, "_SELFTEST_DONE", False)
+    monkeypatch.setattr(adapter.fp8_decode, "_SELFTESTED_BUCKETS", set())
 
     fake_mesh = SimpleNamespace(size=N_RANKS, axis_names=("ep",))
     topo = SimpleNamespace(mesh=fake_mesh, mesh_index=0)
@@ -2719,7 +2752,7 @@ def test_arm_target_nvfp4_and_refuse_bf16_drafter(monkeypatch):
 
     # 1. Without TPU_MOE_SKIP_PADDED_TOKENS=1, arming refuses cleanly.
     monkeypatch.setenv("TPU_MOE_SKIP_PADDED_TOKENS", "0")
-    monkeypatch.setattr(adapter.token_padding, "_padding_state", None)
+    monkeypatch.setattr(adapter.fp8_decode.token_padding, "_padding_state", None)
     assert adapter.arm(target_model, draft_model) == 0
     assert not adapter.moe_tp_decode_nvfp4_supported(nvfp4_qm)
 
@@ -2729,7 +2762,7 @@ def test_arm_target_nvfp4_and_refuse_bf16_drafter(monkeypatch):
     monkeypatch.setenv("USE_MOE_FUSED_EP_KERNEL", "0")
     monkeypatch.setenv("TPU_MOE_TP_DECODE_HBM_OPERANDS", "drafter")
     monkeypatch.setattr(
-        adapter.token_padding,
+        adapter.fp8_decode.token_padding,
         "_padding_state",
         SimpleNamespace(local_padding_mask=t.zeros(64, dtype=t.uint8)),
     )
@@ -2754,7 +2787,7 @@ def test_arm_ep2_tp4_and_forward_dispatch(monkeypatch):
     VllmMoERunner = rt.moe_runner.VllmMoERunner
     monkeypatch.setattr(pltpu, "get_tpu_info", _tpu7x)
     adapter._OPS.clear()
-    monkeypatch.setattr(adapter, "_SELFTEST_DONE", False)
+    monkeypatch.setattr(adapter.fp8_decode, "_SELFTESTED_BUCKETS", set())
 
     fake_mesh = SimpleNamespace(size=N_RANKS, axis_names=("ep",))
     topo = SimpleNamespace(mesh=fake_mesh, mesh_index=5)
@@ -2907,7 +2940,7 @@ def test_arm_ep2_tp4_and_forward_dispatch(monkeypatch):
     monkeypatch.setenv("TPU_MOE_TP_DECODE_HBM_OPERANDS", "0")
     pad_mask = t.zeros(64, dtype=t.uint8)
     monkeypatch.setattr(
-        adapter.token_padding,
+        adapter.fp8_decode.token_padding,
         "_padding_state",
         SimpleNamespace(local_padding_mask=pad_mask),
     )
@@ -3174,8 +3207,7 @@ def _build_precedence_harness(monkeypatch):
     monkeypatch.setattr(pm.fp8_decode, "_check_ranks_agree", lambda _d: None)
     monkeypatch.setattr(pm.fp8_decode, "_selftest", lambda *_a: [])
     monkeypatch.setattr(pm.fp8_decode, "_gather", lambda d: [d])
-    monkeypatch.setattr(pm.fp8_decode, "_SELFTEST_DONE", False)
-    monkeypatch.setattr(pm.adapter, "_SELFTEST_DONE", False)
+    monkeypatch.setattr(pm.fp8_decode, "_SELFTESTED_BUCKETS", set())
     pm.fp8_decode._OPS.clear()
     pm.fused_decode._OPS.clear()
     pm.adapter._OPS.clear()
@@ -3371,7 +3403,6 @@ def _build_precedence_harness(monkeypatch):
             if envs.TPU_MOE_SKIP_PADDED_TOKENS
             else None
         )
-        monkeypatch.setattr(pm.adapter.token_padding, "_padding_state", pad_state)
         monkeypatch.setattr(pm.fp8_decode.token_padding, "_padding_state", pad_state)
         runner_obj = SimpleNamespace(
             model=model,
@@ -3824,3 +3855,44 @@ def test_flag_precedence_fused_ep_and_token_count_dispatch(monkeypatch):
         ("tp_chain", 128),
         ("prefill", 512),
     ]
+
+
+def test_selftest_covers_only_untested_buckets(monkeypatch):
+    """NVFP4 arm self-tests any (rows, hidden) buckets FP8 did not cover."""
+    h = _build_precedence_harness(monkeypatch)
+    for k, v in {
+        "USE_MOE_TP_DECODE_NVFP4_KERNEL": "1",
+        "TPU_MOE_SKIP_PADDED_TOKENS": "1",
+        "USE_MOE_TP_DECODE_KERNEL": "1",
+        "FUSED_MOE_DECODE_KERNEL": "0",
+        "TPU_MOE_TP_DECODE_HBM_OPERANDS": "0",
+    }.items():
+        monkeypatch.setenv(k, v)
+
+    tested: list[list[tuple[int, int]]] = []
+    monkeypatch.setattr(
+        h.pm.fp8_decode,
+        "_selftest",
+        lambda _topo, buckets, _dev: tested.append(list(buckets)) or [],
+    )
+    # Pre-seed one bucket as if an earlier FP8 arm covered only (16, 2048) and
+    # a different hidden size (32, 4096).
+    monkeypatch.setattr(
+        h.pm.fp8_decode, "_SELFTESTED_BUCKETS", {(16, 2048), (32, 4096)}
+    )
+    nvfp4_runner = h.make_runner("model.layers.0.mlp", "nvfp4")
+    monkeypatch.setenv("USE_MOE_TP_DECODE_KERNEL", "0")
+    h.arm_in_runner_order(h.Model(nvfp4_runner))
+    assert tested == [[(32, 2048), (64, 2048)]]
+    got_buckets = set(h.pm.fp8_decode._SELFTESTED_BUCKETS)
+    assert got_buckets == {
+        (16, 2048),
+        (32, 2048),
+        (64, 2048),
+        (32, 4096),
+    }
+
+    # Re-arming another layer with the same (rows, hidden) buckets skips selftest.
+    nvfp4_runner2 = h.make_runner("model.layers.1.mlp", "nvfp4")
+    h.arm_in_runner_order(h.Model(nvfp4_runner2))
+    assert len(tested) == 1
