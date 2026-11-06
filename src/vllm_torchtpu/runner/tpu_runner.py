@@ -4987,10 +4987,9 @@ class TPUModelRunner(GPUModelRunner):
             return {}
         if not self._repetition_penalty_supported():
             logger.warning_once(
-                "repetition_penalty is not yet applied on TPU with "
-                "async_scheduling or speculative decoding; requests run without "
-                "it. Run with async_scheduling=False and no speculative_config "
-                "to apply it."
+                "repetition_penalty is not yet applied on TPU with speculative "
+                "decoding; requests run without it. Run without "
+                "speculative_config to apply it."
             )
             return {}
         return self._repetition_penalty.batch_state(
@@ -5000,16 +4999,24 @@ class TPUModelRunner(GPUModelRunner):
 
     def _repetition_penalty_supported(self) -> bool:
         """Whether this runner mode applies ``repetition_penalty``."""
-        return (
-            not self.scheduler_config.async_scheduling
-            and self.speculative_config is None
-        )
+        return self.speculative_config is None
 
-    def _lookup_repetition_penalty_output(self, req_id: str) -> Sequence[int] | None:
+    def _lookup_repetition_penalty_output(
+        self, req_id: str
+    ) -> tuple[Sequence[int], int] | None:
+        """``(committed_output, pending_slot)`` for ``req_id``.
+
+        Under ``async_scheduling`` the last output id is an optimistic ``0``
+        placeholder; the real token is still on device at ``pending_slot`` of
+        ``next_tokens_tpu``, so it is excluded here and scattered on TPU.
+        """
         req_state = self.requests.get(req_id)
         if req_state is None:
             return None
-        return req_state.output_token_ids
+        pre = self._pre_async_results
+        if pre is not None and req_id in pre.req_id_to_index_copy:
+            return req_state.output_token_ids[:-1], pre.req_id_to_index_copy[req_id]
+        return req_state.output_token_ids, -1
 
     def _apply_repetition_penalty_plain(
         self,
@@ -5025,7 +5032,15 @@ class TPUModelRunner(GPUModelRunner):
         )
         if inputs is None:
             return logits
-        return repetition_penalty_ops.apply_penalties_table(logits, *inputs)
+        seen_mask, penalties, pre_indices = inputs
+        next_tokens_tpu = (
+            self._pre_async_results.next_tokens_tpu
+            if self._pre_async_results is not None
+            else None
+        )
+        return repetition_penalty_ops.apply_penalties_table(
+            logits, seen_mask, penalties, pre_indices, next_tokens_tpu
+        )
 
     def _sample_spec_verify_chunk(
         self,
@@ -6917,6 +6932,24 @@ class TPUModelRunner(GPUModelRunner):
                 )
                 synchronize_tensors(out)
                 logger.info("  -- num_rows: %d", num_rows)
+            if self.scheduler_config.async_scheduling:
+                for num_rows in self.num_reqs_paddings:
+                    seen_mask = torch.zeros(
+                        (num_rows, self._dummy_logits(num_rows).shape[1]),
+                        dtype=torch.bool,
+                        device=self.device,
+                    )
+                    pre_indices = torch.full(
+                        (num_rows,), -1, dtype=torch.int32, device=self.device
+                    )
+                    for nlen in self.num_reqs_paddings:
+                        next_tokens = torch.zeros(
+                            (nlen,), dtype=torch.int64, device=self.device
+                        )
+                        out_mask = repetition_penalty_ops.mark_pending_async_tokens(
+                            seen_mask, next_tokens, pre_indices
+                        )
+                        synchronize_tensors(out_mask)
 
     def _precompile_sample_from_logits(self) -> None:
         with self._precompile_timed("sample_from_logits"):
