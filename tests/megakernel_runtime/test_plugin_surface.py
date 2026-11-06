@@ -118,7 +118,12 @@ def test_kv_cache_properties_need_the_kv_cache() -> None:
     """Before `initialize_kv_cache` (what `create` sees), reading a property
     that describes the KV cache raises, naming it; the rest still read."""
     view = RunnerView(testing.fake_runner(kv_cache_initialized=False), tp_rank=0)
-    for name in ("req_block_pairs", "max_pages_per_seq", "mamba_slot_read_offsets"):
+    for name in (
+        "cache_block_size",
+        "req_block_pairs",
+        "max_pages_per_seq",
+        "mamba_slot_read_offsets",
+    ):
         with pytest.raises(RuntimeError, match=rf"RunnerView\.{name} describes the KV"):
             getattr(view, name)
     assert view.tp_size == 1 and view.ckpt_window == 1 and view.token_paddings
@@ -255,18 +260,18 @@ def test_suppressed_nests_and_restores_on_error() -> None:
 
 _NO_FRAMEWORKS = """
 import sys
-for name in ("torch", "jax", "jaxlib", "vllm"):
+for name in ("torch", "jax", "jaxlib", "vllm", "numpy"):
     sys.modules[name] = None
+import vllm_torchtpu.megakernel_runtime.errors
 import vllm_torchtpu.megakernel_runtime.hooks
 import vllm_torchtpu.megakernel_runtime.plugin
-loaded = [n for n in ("torch", "jax", "vllm") if sys.modules.get(n) is not None]
-assert not loaded, loaded
 """
 
 
 def test_hooks_and_plugin_import_no_framework() -> None:
-    """`hooks` and `plugin` import with torch, jax and vLLM blocked (a model
-    folder's stdlib-only `__init__` imports `plugin`)."""
+    """`errors`, `hooks` and `plugin` import with torch, jax, vLLM and numpy
+    blocked (a model folder's stdlib-only `__init__` imports `plugin`); an
+    import of any of them would fail the subprocess."""
     src = Path(plugin_mod.__file__).resolve().parents[2]
     res = subprocess.run(
         [sys.executable, "-c", _NO_FRAMEWORKS],

@@ -55,8 +55,7 @@ class Shorthand(NamedTuple):
     entries and `model_type` (also of its `text_config`); `hf_fields`
     (`(field, value)` pairs, read from the HF config or its `text_config`)
     narrows a match, and an entry with `hf_fields` is preferred. The
-    template's own settings, including which may be set at the top level of
-    the config, are in its `SPEC` (`TpuMonoSpec.top_level_options`).
+    template's own settings live in its `SPEC`, not here.
     """
 
     module: str
@@ -153,10 +152,10 @@ class RunnerView:
     through: a program may mutate it only after all TP ranks have agreed to
     load the program (in `load`), and the stock forward must stay valid.
 
-    `req_block_pairs`, `max_pages_per_seq` and `mamba_slot_read_offsets`
-    describe the KV cache: they raise until the runner's KV cache is
-    initialized (`runner.kv_cache_config` is set by `initialize_kv_cache`),
-    so `create` can't read them, and `bind` can.
+    `cache_block_size`, `req_block_pairs`, `max_pages_per_seq` and
+    `mamba_slot_read_offsets` describe the KV cache: they raise until the
+    runner's KV cache is initialized (`runner.kv_cache_config` is set by
+    `initialize_kv_cache`), so `create` can't read them, and `bind` can.
     """
 
     __slots__ = ("_runner", "_tp_rank")
@@ -210,7 +209,10 @@ class RunnerView:
     @property
     def cache_block_size(self) -> int:
         """`cache_config.block_size`: the KV / state cache block size (the
-        attention kernel's page size can differ; see `max_pages_per_seq`)."""
+        attention kernel's page size can differ; see `max_pages_per_seq`).
+        vLLM finalizes it after `load_model`, so it needs the KV cache
+        initialized."""
+        self._require_kv_cache("cache_block_size")
         return int(self._runner.cache_config.block_size)
 
     @property
