@@ -469,6 +469,19 @@ def write_main_cache(
     )
 
 
+def compressed_region(slot: int) -> int:
+    """First compressed-key column of the merged region for ``slot`` < 0.
+
+    ``QWEN4_EXP_MERGE_COMPRESSED_K``: a layer's compressed keys live in its
+    main KV carrier, after the scheduler's ``N`` pages. One block's keys are
+    ``1 / cols`` of a page (``cols = page_bytes / keys_per_block``), so block
+    ``c``'s keys are column ``cols * N + c`` of that region, counted in
+    blocks' worth of keys. The layer binds ``compressed_slot = -cols * N``.
+    """
+    assert slot < 0, slot
+    return -slot
+
+
 def compressed_pairs(
     pool, keys, complete, req, logical, starts, context, table, ratio, slot=0, dcp=None
 ):
@@ -495,11 +508,19 @@ def compressed_pairs(
         span = size * pool.shape[1]
         owner = (logical // pool.shape[1]) % size
         write = write & (owner == jnp.asarray(rank).reshape(()).astype(owner.dtype))
-    pair = table[req, logical // span] * pairs_per_page + (
-        logical % pool.shape[1]
-    ) // (2 * ratio)
-    if slot:
-        layer_pairs = pool.shape[1] // (2 * ratio)
+    layer_pairs = pool.shape[1] // (2 * ratio)
+    if slot < 0:
+        # Merged keys: a block's keys fill one column of the pool's
+        # compressed-key region, column ``table + region`` in layer_pairs units.
+        assert dcp is None, "merged compressed keys do not support compressed DCP"
+        pair = (table[req, logical // span] + compressed_region(slot)) * layer_pairs + (
+            logical % pool.shape[1]
+        ) // (2 * ratio)
+    else:
+        pair = table[req, logical // span] * pairs_per_page + (
+            logical % pool.shape[1]
+        ) // (2 * ratio)
+    if slot > 0:
         assert (slot + 1) * layer_pairs <= pairs_per_page, (
             "packed compressed-key slot exceeds its pool page"
         )
@@ -985,20 +1006,33 @@ def token_shard_step(starts, context, shard_index, rows):
     return base, sub_starts, (context + before).astype(context.dtype)
 
 
+def _compressed_expansion(logical_pages: int, physical_pages: int, slot: int):
+    """StreamIndex ``table_expansion`` for a compressed block table (see
+    ``compressed_kernel_pages``): kernel page ``k`` of column ``c`` is
+    ``c * stride + offset + k % logical_pages``."""
+    if slot < 0:
+        return (logical_pages, logical_pages, compressed_region(slot) * logical_pages)
+    return (logical_pages, physical_pages, slot * logical_pages)
+
+
 def compressed_kernel_pages(pages: jax.Array, pool: jax.Array, slot: int = 0, ratio: int = 4) -> jax.Array:
     """Flat kernel-page ids of compressed block-table columns `pages`.
 
     Each column (a pool block of `pool.shape[1]` tokens) holds `pool.shape[1] // 128` kernel
     pages of `128 // ratio` compressed keys for this layer, at `slot` times that within the
-    block's physical pages: column `c` -> `c * physical_pages + slot * logical_pages + j`. The
+    block's physical pages: column `c` -> `c * physical_pages + slot * logical_pages + j`
+    (merged keys, `slot` < 0: `(c + compressed_region(slot)) * logical_pages + j`). The
     one addressing of compressed keys, shared by the stock selection and the whole-step
     megakernel's page tables.
     """
     rows = 128 // ratio
     physical_pages = math.prod(pool.shape[1:]) * pool.dtype.itemsize // (rows * pool.shape[-1] * 2)
     logical_pages = pool.shape[1] // 128
-    scaled = pages[..., None] * physical_pages
     first = jnp.arange(logical_pages)
+    if slot < 0:
+        # Merged keys (``compressed_region``): column ``c`` -> ``(c + region) * logical_pages + j``.
+        return ((pages[..., None] + compressed_region(slot)) * logical_pages + first).reshape(-1)
+    scaled = pages[..., None] * physical_pages
     if slot:
         first = first + slot * logical_pages
     return (scaled + first).reshape(-1)
@@ -1085,7 +1119,7 @@ def _select_blocks(
     )
     logical_pages = pool.shape[1] // 128
     cache = pool.reshape(-1, rows // 2, packing, width)
-    assert not slot or (slot + 1) * logical_pages <= physical_pages, (
+    assert slot <= 0 or (slot + 1) * logical_pages <= physical_pages, (
         "packed compressed-key slot exceeds its pool page"
     )
 
@@ -1167,7 +1201,7 @@ def _select_blocks(
             and len(table) * table.shape[1] * logical_pages * 4
             > PREFILL_PAGE_TABLE_SMEM_BYTES
         ):
-            expansion = (logical_pages, physical_pages, slot * logical_pages)
+            expansion = _compressed_expansion(logical_pages, physical_pages, slot)
         else:
             pages = expand_pages(table).reshape(len(table), -1)
         return topk(
@@ -1241,7 +1275,7 @@ def _select_blocks(
                 -max(256, kv_block, decode_kv_block) // (rows * logical_pages)
             )
             chunk_size = min(len(query), decode_query_chunk_size(pool_pages))
-            expansion = (logical_pages, physical_pages, slot * logical_pages)
+            expansion = _compressed_expansion(logical_pages, physical_pages, slot)
         return _select_shared_stream(
             query,
             starts,

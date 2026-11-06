@@ -39,6 +39,26 @@ def pack_compressed_k_enabled() -> bool:
     return value in ("1", "true", "yes", "on")
 
 
+MERGE_COMPRESSED_K_ENV = "QWEN4_EXP_MERGE_COMPRESSED_K"
+
+# ``compressed_owners`` slot of a merged layer; bound as ``-cols * N`` once the
+# pool's scheduler block count ``N`` is known (``Qwen4ExpPoolLayout``).
+MERGED_COMPRESSED_SLOT = -1
+
+
+def merge_compressed_k_enabled() -> bool:
+    """Whether each QSA layer's compressed keys live in its main KV carrier.
+
+    Off by default. ``QWEN4_EXP_MERGE_COMPRESSED_K=1`` drops the
+    compressed-key cache groups: a layer's keys for block ``c`` sit in a
+    region appended after the carrier's ``N`` scheduler pages and are
+    addressed through the layer's main KV block table; see
+    ``pooled_cache_specs``.
+    """
+    value = os.environ.get(MERGE_COMPRESSED_K_ENV, "0").strip().lower()
+    return value in ("1", "true", "yes", "on")
+
+
 PACK_MAIN_KV_ENV = "QWEN4_EXP_PACK_MAIN_KV"
 
 
@@ -100,6 +120,9 @@ class Qwen4ExpPoolLayout:
     # Main KV owner groups whose block size is scaled (the draft's with
     # VLLM_TPU_QSA_MTP_KV_DCP).
     main_dcp_owners: tuple[str, ...] = field(default=())
+    # QWEN4_EXP_MERGE_COMPRESSED_K: compressed keys live in a region of each
+    # main KV carrier after its scheduler pages (``merged_compressed_slot``).
+    merged_compressed: bool = False
 
     def compressed_owner(self, attention_prefix: str) -> tuple[str, int]:
         """Cache owner name and in-page slot of a QSA layer's compressed keys."""
@@ -131,6 +154,23 @@ class Qwen4ExpPoolLayout:
     def compressed_physical_pages(self):
         return self.page_bytes // self.compressed_kernel_bytes
 
+    @property
+    def compressed_columns_per_page(self) -> int:
+        """Blocks' worth of one layer's compressed keys that fill a page."""
+        return self.compressed_physical_pages // self.main_kernel_pages
+
+    def compressed_region_pages(self, num_blocks: int) -> int:
+        """Pages a merged carrier appends after ``num_blocks`` scheduler pages."""
+        if not self.merged_compressed:
+            return 0
+        return -(-num_blocks // self.compressed_columns_per_page)
+
+    def merged_compressed_slot(self, num_blocks: int) -> int:
+        """``compressed_slot`` of a merged layer in a pool of ``num_blocks``
+        scheduler pages: ``-cols * N`` (``pooled_qsa.compressed_region``)."""
+        assert self.merged_compressed
+        return -self.compressed_columns_per_page * num_blocks
+
 
 def pooled_cache_specs(
     cfg,
@@ -138,6 +178,7 @@ def pooled_cache_specs(
     tp: int | None = None,
     main_dcp: int | None = None,
     pack_compressed: bool | None = None,
+    merge_compressed: bool | None = None,
 ):
     """Derive uniform physical pages without widening compressed-key coverage.
 
@@ -211,7 +252,25 @@ def pooled_cache_specs(
     owners: list[tuple[str, str, int]] = []
     if pack_compressed is None:
         pack_compressed = pack_compressed_k_enabled()
-    if pack_compressed and packed_slots > 1:
+    merged = merge_compressed_k_enabled() if merge_compressed is None else merge_compressed
+    if merged:
+        if pack_compressed or pack_main_kv_enabled():
+            raise ValueError(
+                f"{MERGE_COMPRESSED_K_ENV}=1 replaces {PACK_COMPRESSED_K_ENV} and "
+                f"is not combined with {PACK_MAIN_KV_ENV}"
+            )
+        if page_bytes % (block_size // QSA_BLOCK_SIZE * compressed_bytes):
+            raise ValueError(
+                "Qwen4Exp merged compressed keys need a page of whole blocks of keys"
+            )
+        # Each layer's keys ride its own main KV block table (one block ID per
+        # token span for both); the slot is bound once the pool size is known.
+        owners = [
+            (prefix, prefix, MERGED_COMPRESSED_SLOT)
+            for prefix in (name.removesuffix(".compressed_k") for name in compressed_names)
+        ]
+        packed_slots = 1
+    elif pack_compressed and packed_slots > 1:
         # Consecutive QSA layers (the MTP draft's last) share one owner
         # group; one block table and one page lifetime cover all of them,
         # since compressed keys of every layer track the same token span.
@@ -244,6 +303,8 @@ def pooled_cache_specs(
                 for slot, name in enumerate(targets[start : start + 2])
             )
     dcp = main_kv_dcp() if main_dcp is None else main_dcp
+    if merged and dcp > 1:
+        raise ValueError(f"{MERGE_COMPRESSED_K_ENV}=1 is not combined with {MAIN_KV_DCP_ENV}")
     draft_attention = {prefix + ".self_attn" for prefix in mtp_layer_prefixes(cfg)}
     paired_away = {name for name, owner, _ in main_owners if name != owner}
     dcp_owners: tuple[str, ...] = ()
@@ -311,11 +372,14 @@ def pooled_cache_specs(
         main_owners=tuple(main_owners),
         main_dcp=dcp,
         main_dcp_owners=dcp_owners,
+        merged_compressed=merged,
     )
     # Members other than their group's owner get no scheduler group.
     packed_away = {prefix + ".compressed_k" for prefix, owner, _ in owners} - {
         owner for _, owner, _ in owners
     }
+    # Merged: owners are the main KV caches themselves, so every
+    # ``.compressed_k`` spec drops out (above) and no group is planned for it.
     packed_away |= {name for name, owner, _ in main_owners if name != owner}
     pooled: dict[str, KVCacheSpec] = {}
     # Upstream uses one persistent Mamba state block per request without APC.
@@ -372,10 +436,15 @@ def check_packed_compressed_groups(layout: Qwen4ExpPoolLayout, groups) -> None:
     Members address slots of their owner's pages, so two owners sharing one
     group (one block ID per token span) would overwrite each other's slots.
     """
+    if layout.merged_compressed:
+        # Merged keys sit in the owner layer's own carrier slot, never shared.
+        compressed = set()
+    else:
+        compressed = {owner for _, owner, _ in layout.compressed_owners}
     for kind, owners, env in (
         (
             "compressed keys",
-            {owner for _, owner, _ in layout.compressed_owners},
+            compressed,
             PACK_COMPRESSED_K_ENV,
         ),
         ("main KV", {owner for _, owner, _ in layout.main_owners}, PACK_MAIN_KV_ENV),

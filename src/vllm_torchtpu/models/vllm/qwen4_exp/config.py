@@ -206,6 +206,18 @@ def native_cache_capacity(cfg, specs=None):
     max_pool_bytes = int(os.environ.get("QWEN4_EXP_MAX_POOL_BYTES", str(48 * 1024**3)))
     if bytes_per_block > 0 and max_pool_bytes > 0:
         max_pages = max_pool_bytes // bytes_per_block
+        from .pool_layout import merge_compressed_k_enabled, pooled_cache_specs
+
+        if merge_compressed_k_enabled():
+            # The carriers append one page of compressed keys per `cols`
+            # scheduler pages (Qwen4ExpPooledCache._materialize).
+            layout = pooled_cache_specs(cfg)[0]
+            total = max_pages
+            max_pages = total * layout.compressed_columns_per_page // (
+                layout.compressed_columns_per_page + 1
+            )
+            while max_pages + layout.compressed_region_pages(max_pages) > total:
+                max_pages -= 1
         if max_pages > 1:
             # Static sizing plans just enough pages for max_num_seqs
             # full-length requests; the rest of the pool budget is idle HBM.
