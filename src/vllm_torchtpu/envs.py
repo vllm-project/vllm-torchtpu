@@ -1157,8 +1157,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # run while the TensorCore computes the next block's GMM, instead of the
     # TensorCore waiting for one whole combine. 1 keeps one GMM and one
     # combine. Bitwise the same output.
+    # (4 blocks was measured NOT bitwise on TPU in q38-pmoe-mb1, j-49e001c7, so
+    # it is not offered.)
     "TPU_MOE_NONEP_COMBINE_SPLIT": env_with_choices(
-        "TPU_MOE_NONEP_COMBINE_SPLIT", "1", ["1", "2", "4"]
+        "TPU_MOE_NONEP_COMBINE_SPLIT", "1", ["1", "2"]
     ),
     # Rows per m-tile of the non-EP GMMs (gmm_v2 tile_m); "0" keeps gmm_v2's
     # default (512 at prefill sizes). Each tile boundary inside an expert's
