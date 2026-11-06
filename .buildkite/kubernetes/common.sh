@@ -89,6 +89,8 @@ FORWARD=(
   CI_RUNNER SKIP_SPANNER_UPLOAD
   BENCHMARK_WARMUP_RUNS RUN_CODE_EVAL RUN_LM_EVAL RUN_TYPE MODEL_PATH MODEL_URI
   EVAL_SOFT_FAIL
+  # 1 on a TPU generation without perf baselines yet; see run_eval_flow.sh.
+  SKIP_PERF_CHECK
   # Lets a one-off build force an xprof capture; unset leaves the day rule in
   # benchmark_with_profile.sh to decide.
   CAPTURE_PROFILE

@@ -88,9 +88,11 @@ class TpuGeneration:
 
     A file in TPU_GENERATION_FILES reads them when it is uploaded: its shapes,
     its name, which its group name and each step's label start with, a prefix
-    on each step's key, and soft_fail. The name keeps one generation's labels
-    apart from another's, since GitHub names a step's commit status after its
-    label, and the prefix its keys, since Buildkite rejects a duplicate key.
+    on each step's key, soft_fail, the TPU_ACCELERATOR_TYPE its perf steps
+    tell the server and the results upload, and whether those steps skip the
+    perf gate. The name keeps one generation's labels apart from another's,
+    since GitHub names a step's commit status after its label, and the prefix
+    its keys, since Buildkite rejects a duplicate key.
     """
 
     name: str
@@ -98,6 +100,12 @@ class TpuGeneration:
     shape_multi: str
     key_prefix: str
     soft_fail: bool
+    # As tpu_info.get_chip_version reads it, which takes anything it does not
+    # know for TPU7x.
+    accelerator_type: str
+    # True while no perf baselines have been measured on the generation: its
+    # perf steps report their numbers without gating on another chip's.
+    skip_perf_check: bool
 
     def upload_env(self) -> dict[str, str]:
         return {
@@ -106,6 +114,8 @@ class TpuGeneration:
             "KUBE_SHAPE_MULTI": self.shape_multi,
             "TPU_KEY_PREFIX": self.key_prefix,
             "TPU_SOFT_FAIL": "true" if self.soft_fail else "false",
+            "TPU_ACCELERATOR": self.accelerator_type,
+            "TPU_SKIP_PERF_CHECK": "1" if self.skip_perf_check else "0",
         }
 
 
@@ -114,13 +124,16 @@ class TpuGeneration:
 # generation like v6e's, which renames its GitHub statuses; the repo's rules
 # require only the build's own status, not a step's. v6e soft-fails while
 # remaining v7x-assumed tests (such as two-TensorCore single-chip or v7x-only
-# chip-budget assumptions) are audited on v6e.
+# chip-budget assumptions) are audited on v6e, and its perf steps skip the
+# perf gate, whose baselines were all measured on v7x.
 TPU_V7X = TpuGeneration(
     name="v7x",
     shape_single="tpu7x-standard-1t/1x1x1",
     shape_multi="tpu7x-standard-4t/2x2x1",
     key_prefix="",
     soft_fail=False,
+    accelerator_type="tpu7x",
+    skip_perf_check=False,
 )
 TPU_V6E = TpuGeneration(
     name="v6e",
@@ -128,6 +141,8 @@ TPU_V6E = TpuGeneration(
     shape_multi="ct6e-standard-8t/2x4",
     key_prefix="tpu6e_",
     soft_fail=True,
+    accelerator_type="v6e",
+    skip_perf_check=True,
 )
 # The TPU generations a file's TPU steps run on, side by side. The file goes up
 # once per generation in this order, so the last one shows (and queues) first;
@@ -135,11 +150,16 @@ TPU_V6E = TpuGeneration(
 TPU_GENERATION_FILES: Mapping[str, tuple[TpuGeneration, ...]] = {
     ".buildkite/pipeline_tests.yml": (TPU_V6E, TPU_V7X),
     ".buildkite/pipeline_integration.yml": (TPU_V6E, TPU_V7X),
+    ".buildkite/pipeline_perf.yml": (TPU_V6E, TPU_V7X),
 }
+# Lanes whose own script sends up a group per TPU generation, and reads
+# TPU_VERSION itself: verify's upload_models_and_features.sh, on the nightly
+# builds its steps run on.
+SCRIPT_TPU_GENERATION_LANES: tuple[str, ...] = ("verify",)
 # What a build started by hand sets TPU_VERSION to, to run one generation of
-# the files above alone, by the names tpu-inference gives them. The generation
-# brings its shapes, so the build names no KUBE_SHAPE_* of its own. Without
-# TPU_VERSION every generation runs.
+# the files above and of those lanes alone, by the names tpu-inference gives
+# them. The generation brings its shapes, so the build names no KUBE_SHAPE_*
+# of its own. Without TPU_VERSION every generation runs.
 TPU_VERSIONS: Mapping[str, TpuGeneration] = {"tpu6e": TPU_V6E, "tpu7x": TPU_V7X}
 
 DEFAULT_INTEGRATION_SLUG = "vllm-torchtpu-integration"
@@ -180,6 +200,11 @@ def _env_or(env: Mapping[str, str], key: str, default: str) -> str:
 
 def _split_labels(raw: str) -> tuple[str, ...]:
     return tuple(item for item in raw.split(",") if item)
+
+
+def _and_list(items: Sequence[str]) -> str:
+    """Join `items` as prose: "a", "a and b", "a, b and c"."""
+    return " and ".join(filter(None, (", ".join(items[:-1]), items[-1])))
 
 
 # ---------------------------------------------------------------------------
@@ -564,52 +589,65 @@ def plan_uploads(
                 )
             )
 
-    # TPU_VERSION runs one TPU generation of the files in TPU_GENERATION_FILES
-    # alone (see upload_envs), for a build started by hand. A nightly, tag or
-    # integration build runs every generation: the nightly report waits on
-    # v7x's steps by key, and LKG promotion must not pass on one generation's
-    # steps. A build with no lane that goes up per generation would ignore it,
-    # so it is refused too.
+    # TPU_VERSION runs one TPU generation alone, for a build started by hand:
+    # each file in TPU_GENERATION_FILES goes up for it only (see upload_envs),
+    # and a lane in SCRIPT_TPU_GENERATION_LANES sends up only its group.
+    # Integration, scheduled and tag builds run every generation: LKG
+    # promotion must not pass on one generation, and a schedule or a release
+    # checks them all. A nightly started by hand may run one; the nightly
+    # report, which waits on every generation's steps, leaves itself out (see
+    # pipeline_verify.yml). A build with no lane that follows TPU_VERSION
+    # would ignore it, so it is refused too.
     tpu_version_error: str | None = None
     if ctx.tpu_version:
         per_generation = [
             lane
             for lane in ALL_LANES
-            if any(path in TPU_GENERATION_FILES for path in files_for_lane(lane))
+            if lane in SCRIPT_TPU_GENERATION_LANES
+            or any(path in TPU_GENERATION_FILES for path in files_for_lane(lane))
         ]
+        # A lane's script runs only on the nightly builds its steps run on.
         in_build = [
             lane
             for lane in per_generation
             if any(path in lane_files for path in files_for_lane(lane))
+            and (nightly or lane not in SCRIPT_TPU_GENERATION_LANES)
         ]
         if ctx.tpu_version not in TPU_VERSIONS:
             tpu_version_error = (
                 f"ERROR: TPU_VERSION is '{ctx.tpu_version}'; "
                 f"TPU versions are: {' '.join(TPU_VERSIONS)}"
             )
-        elif nightly or ctx.tag or ctx.is_integration:
+        elif ctx.is_integration or ctx.source == "schedule" or ctx.tag:
             tpu_version_error = (
-                "ERROR: TPU_VERSION runs one TPU generation; nightly, tag and "
-                "integration builds run every generation"
+                "ERROR: TPU_VERSION runs one TPU generation; integration, "
+                "scheduled and tag builds run every generation"
             )
         elif invalid_error is None and not in_build:
             tpu_version_error = (
                 "ERROR: TPU_VERSION picks the TPU generation of the "
-                f"{' and '.join(per_generation)} lanes, and this build runs none"
+                f"{_and_list(per_generation)} lanes, and this build runs none"
             )
         elif in_build and not skip_tpu_ci:
-            lanes = " and ".join(in_build)
-            noun = "lanes" if len(in_build) > 1 else "lane"
-            pre_annotations.append(
-                Annotation(
-                    style="info",
-                    context="tpu-version",
-                    body=(
-                        f"Runs only the TPU {TPU_VERSIONS[ctx.tpu_version].name} "
-                        f"steps of the {lanes} {noun} "
-                        f"(`TPU_VERSION={ctx.tpu_version}`)."
-                    ),
+            others = [
+                lane
+                for lane in ALL_LANES
+                if lane in requested_lanes and lane not in per_generation
+            ]
+            body = (
+                f"Runs only the TPU {TPU_VERSIONS[ctx.tpu_version].name} steps of "
+                f"the {_and_list(in_build)} lane{'s' if len(in_build) > 1 else ''} "
+                f"(`TPU_VERSION={ctx.tpu_version}`)."
+            )
+            if others:
+                body += (
+                    f" It does not apply to the {_and_list(others)} "
+                    f"lane{'s' if len(others) > 1 else ''}."
                 )
+            if nightly:
+                body += " The nightly report is left out: it needs every generation."
+            pre_annotations.append(
+                Annotation(style="info", context="tpu-version", body=body)
             )
 
     # pipeline_build.yml skips the -omni image build when this is non-empty.

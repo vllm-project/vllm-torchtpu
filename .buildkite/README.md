@@ -30,11 +30,14 @@ those that set `TPU_ACCELERATOR_TYPE=tpu7x` - carry an `if` comparing
 A build started by hand or over the API can run one generation alone: with
 `TPU_VERSION=tpu6e` or `TPU_VERSION=tpu7x`, each file in `TPU_GENERATION_FILES`
 goes up for that generation only, with its slice shapes, so the build sets no
-`KUBE_SHAPE_*`. Without it every generation runs. Other lanes go up as they
-are, so `perf` stays on v7x. Nightly, tag and integration builds refuse it -
-the nightly report waits on v7x's steps by key, and LKG promotion must not pass
-on one generation - and so does a build that runs neither `tests` nor
-`integration`.
+`KUBE_SHAPE_*`; on a nightly, the verify lane's `upload_models_and_features.sh`
+sends up only that generation's group. Without it every generation runs. A
+lane's file follows `TPU_VERSION` once it is in `TPU_GENERATION_FILES`; until
+then it goes up as it is. A nightly started by hand leaves out the nightly
+report, which needs every generation's steps. Integration, scheduled and tag
+builds refuse `TPU_VERSION` - LKG promotion must not pass on one generation,
+and a schedule or a release checks them all - and so does a build with no lane
+that follows it.
 
 `pipeline_perf.yml` holds the perf/eval
 steps. Post-merge builds do not run them, and PR builds run them only when the
@@ -47,6 +50,16 @@ all of them. Between nightlies, schedules on `vllm-torchtpu-ci` that set
 steps not gated on it. The schedules keep clear of the hours the nightly's
 perf steps take. The integration pipeline also runs the lane, because its LKG
 promotion waits on two of its steps.
+
+The perf lane goes up once per generation too. A v6e 2x4 slice holds 256 GB of
+HBM to a v7x-8's 768 GB, so v6e runs only what fits and needs neither fp4 nor
+`run_multihost.sh`: a General suite of the four configs that fit, qwen3-0.6b,
+and the nightly general suite. Every other step carries an `if` comparing
+`TPU_GENERATION` with `v7x`. The steps set `TPU_ACCELERATOR_TYPE` from the
+generation, since the server reads the chip from it and the results upload
+names the device after it. The perf baselines were all measured on v7x, so
+v6e's steps set `SKIP_PERF_CHECK=1` and report their numbers without that
+gate; the accuracy gate still applies.
 
 A PR labeled `skip-tpu-ci` (it still needs `ready`) runs only the `tests` lane
 and the image build, and the lane's `Unit Tests on TPU` groups are skipped
