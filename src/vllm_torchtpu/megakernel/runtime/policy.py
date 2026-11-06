@@ -11,20 +11,17 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Framework-free bucket policy: the `T=1` decode and `T=4` MTP verify bucket
-lists, their parsing, and bucket selection (`BucketPolicy`).
+"""The bucket policy: the `T=1` decode and `T=4` MTP verify bucket lists,
+their parsing, and bucket selection (`BucketPolicy`).
 
-The runtime config parser and the per-bucket `ExecSpec` setup, which need the
-profile registry and the cache planner, are in `exec_policy`.
+Framework-free: imports no jax, torch or vLLM (stdlib only at run time).
 """
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Iterator, Sequence
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
-
-from ..ops import round_up
+from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from ..profile import Profile
@@ -33,21 +30,20 @@ DEFAULT_BUCKETS: tuple[int, ...] = (8, 16, 32)
 DEFAULT_VERIFY_BUCKETS: tuple[int, ...] = (4, 8, 12, 16, 20, 24, 32, 40, 48, 56, 64)
 MTP_VERIFY_TOKENS: int = 4
 MTP_SPECULATIVE_TOKENS: int = MTP_VERIFY_TOKENS - 1
-_TRUE_STRS = ("1", "true", "yes", "on")
 _FALSE_STRS = ("0", "false", "no", "off", "none", "")
 
 
 def _need(cond: bool, msg: str) -> None:
     if not cond:
-        raise ValueError(f"MegakernelDriver: {msg}")
+        raise ValueError(f"Megakernel: {msg}")
 
 
 def _parse_bucket_list(
-    val: str | Iterable[int], *, valid_fn: Any, label: str
+    val: str | Iterable[int], *, valid_fn: Callable[[int], bool], label: str
 ) -> tuple[int, ...]:
     if not isinstance(val, str):
         if not isinstance(val, Iterable) or isinstance(val, (bytes, bytearray)):
-            raise ValueError(f"MegakernelDriver: invalid {label}={val!r}")
+            raise ValueError(f"Megakernel: invalid {label}={val!r}")
         bs = sorted({int(x) for x in val})
         _need(all(valid_fn(b) for b in bs), f"invalid {label}={val!r}")
         return tuple(bs)
@@ -140,7 +136,7 @@ class BucketPolicy:
 
     def out_rows(self, b: int, m_rows: int | None = None) -> int:
         """Return output row count for bucket `b` given `token_paddings`."""
-        eff_m = max(16, round_up(b, 16)) if m_rows is None else int(m_rows)
+        eff_m = max(16, (b + 15) // 16 * 16) if m_rows is None else int(m_rows)
         return next((p for p in self.token_paddings if p >= b), eff_m)
 
     def iter_buckets(self) -> Iterator[tuple[int, int]]:

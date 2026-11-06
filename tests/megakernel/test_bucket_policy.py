@@ -18,9 +18,19 @@ profile registry."""
 
 from __future__ import annotations
 
+import subprocess
+import sys
+from pathlib import Path
+
 import pytest
 
 from vllm_torchtpu.megakernel.profile import Profile
+from vllm_torchtpu.megakernel.runtime.contract import (
+    MESH_SIZE_MISMATCH,
+    UNSUPPORTED_TP_SIZE,
+    UNSUPPORTED_TPU_CHIP,
+    EligibilityResult,
+)
 from vllm_torchtpu.megakernel.runtime.eligibility import (
     check_post_mesh_eligibility,
     check_startup_eligibility,
@@ -37,6 +47,38 @@ from vllm_torchtpu.megakernel.runtime.policy import (
     select_bucket,
 )
 from vllm_torchtpu.megakernel.runtime.stats import BatchShape
+
+_SRC = Path(__file__).resolve().parents[2] / "src"
+
+_IMPORT_PROBE = """
+import sys
+for name in {blocked!r}:
+    sys.modules[name] = None
+import vllm_torchtpu.megakernel.runtime.{module}
+print("OK")
+"""
+
+
+@pytest.mark.parametrize(
+    "module, blocked",
+    [
+        # policy is framework-free: no jax either.
+        ("policy", ("jax", "jaxlib", "torch", "vllm")),
+        # eligibility imports no torch or vLLM (jax through the chip table).
+        ("eligibility", ("torch", "vllm")),
+    ],
+)
+def test_import_without_frameworks(module: str, blocked: tuple[str, ...]) -> None:
+    """The module imports with `blocked` unimportable (an import of any of them
+    would fail the subprocess)."""
+    out = subprocess.run(
+        [sys.executable, "-c", _IMPORT_PROBE.format(blocked=blocked, module=module)],
+        capture_output=True,
+        text=True,
+        env={"PYTHONPATH": str(_SRC), "PATH": "/usr/bin:/bin", "JAX_PLATFORMS": "cpu"},
+        timeout=300,
+    )
+    assert out.returncode == 0 and out.stdout.strip() == "OK", out.stderr[-3000:]
 
 
 def test_bucket_list_parsing_and_selection() -> None:
@@ -200,6 +242,8 @@ def test_startup_eligibility_table_driven(
     assert res.level == expected_level
     assert expected_substr in res.message
 
+
+def test_post_mesh_eligibility() -> None:
     post_ok = check_post_mesh_eligibility(
         tp_size=8,
         mesh_size=8,
@@ -208,10 +252,10 @@ def test_startup_eligibility_table_driven(
     )
     assert post_ok.eligible and post_ok.reason == "ok"
     res_mesh = check_post_mesh_eligibility(tp_size=4, mesh_size=2)
-    assert not res_mesh.eligible and res_mesh.reason == "mesh_size_mismatch"
+    assert not res_mesh.eligible and res_mesh.reason == MESH_SIZE_MISMATCH
     assert "mesh has 2 devices, expected 4" in res_mesh.message
     res_chip = check_post_mesh_eligibility(tp_size=8, mesh_size=8, device_kind="TPU v5")
-    assert not res_chip.eligible and res_chip.reason == "unsupported_tpu_chip"
+    assert not res_chip.eligible and res_chip.reason == UNSUPPORTED_TPU_CHIP
     res_bkts = check_post_mesh_eligibility(
         tp_size=8, mesh_size=8, bucket_policy=BucketPolicy((), ())
     )
@@ -335,3 +379,39 @@ def test_step_eligibility_cases():
         input_rows=16,
     )
     assert not dec_nobkt.eligible and dec_nobkt.reason == "stock_t1_nobkt"
+
+
+_STARTUP_OK = dict(num_layers=60, expected_num_layers=60)
+
+
+def test_startup_disabled_and_hf_config_decline_come_first() -> None:
+    res = check_startup_eligibility(enabled=False, num_layers=1, expected_num_layers=2)
+    assert not res.eligible and (res.code, res.level) == ("disabled", "debug")
+    hf_bad = EligibilityResult(False, "non_moe_checkpoint", "dense")
+    res = check_startup_eligibility(
+        hf_config_result=hf_bad, num_layers=1, expected_num_layers=2
+    )
+    assert res is hf_bad
+    hf_ok = EligibilityResult(True, "ok", "")
+    res = check_startup_eligibility(hf_config_result=hf_ok, **_STARTUP_OK)
+    assert res.eligible
+
+
+def test_startup_without_tp_size_skips_the_tp_and_mesh_checks() -> None:
+    """`tp_size=None` checks neither the TP size nor the mesh size (the
+    runtime does), but still the chip and the buckets; a `mesh_size` without
+    `tp_size` is an error, since nothing would check it."""
+    assert check_startup_eligibility(supported_tp_sizes=(), **_STARTUP_OK).eligible
+    res = check_startup_eligibility(device_kind="TPU v5", **_STARTUP_OK)
+    assert not res.eligible and res.code == UNSUPPORTED_TPU_CHIP
+    res = check_startup_eligibility(bucket_policy=BucketPolicy((), ()), **_STARTUP_OK)
+    assert not res.eligible and res.code == "empty_buckets"
+    with pytest.raises(ValueError, match="mesh_size=8 needs tp_size"):
+        check_startup_eligibility(mesh_size=8, **_STARTUP_OK)
+    # With tp_size, the mesh size is checked.
+    res = check_startup_eligibility(
+        tp_size=8, supported_tp_sizes=(8,), mesh_size=4, **_STARTUP_OK
+    )
+    assert not res.eligible and res.code == MESH_SIZE_MISMATCH
+    res = check_startup_eligibility(tp_size=4, supported_tp_sizes=(8,), **_STARTUP_OK)
+    assert res.code == UNSUPPORTED_TP_SIZE

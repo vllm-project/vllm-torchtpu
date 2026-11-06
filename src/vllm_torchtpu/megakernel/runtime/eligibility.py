@@ -11,9 +11,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Startup / post-mesh / step eligibility rules (policy-bound).
+"""Startup / post-mesh / step eligibility rules.
 
-The framework-free step statistics (`BatchShape`, `inspect_batch_shape`,
+No torch or vLLM imports. It imports jax through the TPU chip table
+(`profiles.default`), but runs no jax code: the chip check takes the device
+kind as an argument. The step statistics (`BatchShape`, `inspect_batch_shape`,
 `StepMixTracker`, `MKABCalibrator`, ...) live in `stats` and are re-exported
 here.
 """
@@ -24,7 +26,14 @@ from collections.abc import Container, Mapping, Sequence
 
 from ..errors import MegakernelConfigError
 from ..profiles.default import chip_budget
-from .contract import EligibilityResult, StepDecision
+from .contract import (
+    MESH_SIZE_MISMATCH,
+    PAR_DP_LOCKSTEP,
+    UNSUPPORTED_TP_SIZE,
+    UNSUPPORTED_TPU_CHIP,
+    EligibilityResult,
+    StepDecision,
+)
 from .policy import MTP_VERIFY_TOKENS, BucketPolicy
 from .stats import (
     BatchShape,
@@ -44,7 +53,7 @@ _STARTUP_FLAG_RULES = (
     ("lora_enabled", "does not support LoRA adapters"),
     ("pipeline_parallel", "requires single-stage pipeline execution"),
     ("context_parallel", "does not support context parallelism"),
-    ("dp_lockstep", "does not support data-parallel lockstep"),
+    (PAR_DP_LOCKSTEP, "does not support data-parallel lockstep"),
     ("aux_hidden_states", "does not support auxiliary hidden-state capture"),
 )
 
@@ -62,13 +71,13 @@ def check_post_mesh_eligibility(
             f"Megakernel TP-rank mesh has {mesh_size} devices, "
             f"expected {tp_size}; skipping."
         )
-        return EligibilityResult(False, "mesh_size_mismatch", msg)
+        return EligibilityResult(False, MESH_SIZE_MISMATCH, msg)
     if device_kind is not None:
         try:
             chip_budget(str(device_kind))
         except MegakernelConfigError as exc:
             msg = f"Megakernel disabled: {exc}; skipping."
-            return EligibilityResult(False, "unsupported_tpu_chip", msg)
+            return EligibilityResult(False, UNSUPPORTED_TPU_CHIP, msg)
     if (
         bucket_policy is not None
         and not bucket_policy.buckets
@@ -100,9 +109,16 @@ def check_startup_eligibility(
 ) -> EligibilityResult:
     """Validate framework-neutral startup compatibility for the megakernel runtime.
 
-    `tp_size=None` skips the TP-size check (a runtime that enforces the TP
-    sizes itself, e.g. from a spec's `tp_sizes`).
+    `tp_size=None` skips the TP-size and mesh-size checks (a runtime that
+    enforces them itself, e.g. from a spec's `tp_sizes` and its mesh); passing
+    `mesh_size` without `tp_size` is then an error, since nothing would check
+    it.
     """
+    if tp_size is None and mesh_size is not None:
+        raise ValueError(
+            f"check_startup_eligibility: mesh_size={mesh_size} needs tp_size to "
+            "check it against (tp_size=None skips the mesh-size check)"
+        )
     if not enabled:
         return EligibilityResult(False, "disabled", "", "debug")
     if hf_config_result is not None and not hf_config_result.eligible:
@@ -130,7 +146,7 @@ def check_startup_eligibility(
         msg = (
             "Megakernel model does not declare any supported TPU mesh sizes; skipping."
         )
-        return EligibilityResult(False, "unsupported_tp_size", msg)
+        return EligibilityResult(False, UNSUPPORTED_TP_SIZE, msg)
     if int(tp_size) not in allowed_tp:
         msg = (
             f"Megakernel requires {allowed_tp[0]} TPU devices in mesh, "
@@ -139,7 +155,7 @@ def check_startup_eligibility(
             else f"Megakernel requires TPU mesh size in {allowed_tp}, "
             f"got {tp_size}; skipping."
         )
-        return EligibilityResult(False, "unsupported_tp_size", msg)
+        return EligibilityResult(False, UNSUPPORTED_TP_SIZE, msg)
     return check_post_mesh_eligibility(
         tp_size=tp_size,
         mesh_size=mesh_size,

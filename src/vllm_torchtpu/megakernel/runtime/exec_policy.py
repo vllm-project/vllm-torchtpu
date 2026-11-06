@@ -31,7 +31,6 @@ from ..profile import Profile, get_profile, model_default_profile
 from ..spec import ModelSpec
 from .policy import (
     _FALSE_STRS,
-    _TRUE_STRS,
     DEFAULT_BUCKETS,
     DEFAULT_VERIFY_BUCKETS,
     _need,
@@ -39,6 +38,7 @@ from .policy import (
     parse_mk_verify_buckets,
 )
 
+_TRUE_STRS = ("1", "true", "yes", "on")
 DEFAULT_FUSED_POOL_IO_MAX_B: int = 24
 DEFAULT_FUSED_POOL_IO_MIN_B_HI: int = 56
 _SPLIT_STRS = (*_FALSE_STRS, "split", "3stage")
