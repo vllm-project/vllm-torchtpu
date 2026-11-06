@@ -40,6 +40,21 @@ SPEC = TpuMonoSpec(
         "Qwen3_5ForCausalLM",
     ),
     model_types=("qwen3_5_moe", "qwen3_5", "qwen3_5_moe_text"),
+    # The options also accepted at the top level of the megakernel config
+    # (`VLLM_TPU_MEGAKERNEL="mode=ep,buckets=8"`); `adapter.OPTION_KEYS`.
+    top_level_options=frozenset(
+        {
+            "profile",
+            "mode",
+            "buckets",
+            "verify_buckets",
+            "fused_pool_io",
+            "fused_pool_io_max_b",
+            "fused_pool_io_min_b_hi",
+            "pool_gather",
+            "compile_hlo_check",
+        }
+    ),
     # Of the default profile (qwen35-candidate30-fused); qwen35-baseline is
     # exact. The program logs the resolved profile's numerics at bind.
     numerics="approx",

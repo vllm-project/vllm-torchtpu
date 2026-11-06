@@ -72,6 +72,7 @@ def test_shorthand_table_matches_the_template() -> None:
     assert sh.architectures == qwen35.Qwen35.hf_architectures
     assert sh.model_types == qwen35.Qwen35.hf_model_type
     assert sh.legacy_keys == adapter.OPTION_KEYS
+    assert qwen_plugin.SPEC.top_level_options == adapter.OPTION_KEYS
     # The SPEC declares the same checkpoints, so the folder is also found
     # without the table (the table adds the top-level template keys).
     assert qwen_plugin.SPEC.architectures == sh.architectures
