@@ -96,6 +96,10 @@ _OPS: dict[tuple, Any] = {}
 _RANK_BUFFER: Any = None
 _RANK_BUFFER_START = 0
 _RANK_BUFFER_INDEX: int | None = None
+# Per first-global-expert rank buffers (target and drafter can differ); each
+# armed layer holds its own as the non-persistent buffer _LAYER_RANK_BUFFER.
+_RANK_BUFFERS: dict[int, Any] = {}
+_LAYER_RANK_BUFFER = "_fmd_rank"
 
 
 def fused_moe_decode_supported(quant_method: Any) -> bool:
@@ -562,12 +566,22 @@ def arm_fused_moe_decode(model: torch.nn.Module, what: str = "model") -> int:
                 device=w13_weight.device,
             )
             _RANK_BUFFER_START = start
-        elif start != _RANK_BUFFER_START:
-            # A collective kernel must arm on every rank or none.
-            raise RuntimeError(
-                "fused MoE decode kernel: layers on this rank start at different "
-                f"experts ({_RANK_BUFFER_START} vs {start})"
+        # The target model and the drafter (MTP) may place a different number
+        # of experts per rank, so each start gets its own [[index, start]]
+        # buffer; layers that share a start share one tensor.
+        rank_buffer = _RANK_BUFFERS.get(start)
+        if rank_buffer is None:
+            rank_buffer = (
+                _RANK_BUFFER
+                if start == _RANK_BUFFER_START
+                else torch.tensor(
+                    [[_RANK_BUFFER_INDEX, start]],
+                    dtype=torch.int32,
+                    device=w13_weight.device,
+                )
             )
+            _RANK_BUFFERS[start] = rank_buffer
+        layer.register_buffer(_LAYER_RANK_BUFFER, rank_buffer, persistent=False)
         shared_gated = shared[4] is not None
         if not shared_gated:
             # Placeholder for the op's fixed gate operand; the program ignores it.
@@ -645,7 +659,7 @@ def fused_moe_decode(
         shared_gate_weight,
         topk_weights,
         topk_ids,
-        _RANK_BUFFER,
+        getattr(layer, _LAYER_RANK_BUFFER, _RANK_BUFFER),
     )
 
 
