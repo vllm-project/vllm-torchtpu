@@ -27,19 +27,19 @@ from types import SimpleNamespace
 import pytest
 
 from vllm_torchtpu.megakernel.errors import MegakernelConfigError
+from vllm_torchtpu.megakernel.runtime.contract import TpuMonoSpec
 from vllm_torchtpu.megakernel_runtime import config as cfg_mod
 from vllm_torchtpu.megakernel_runtime import plugin as plugin_mod
 from vllm_torchtpu.megakernel_runtime.plugin import (
     MODELS_PACKAGE,
     SHORTHANDS,
     Shorthand,
-    TpuMonoSpec,
     discovered_shorthands,
     shorthands,
 )
 
 _SPEC = """
-from vllm_torchtpu.megakernel_runtime.plugin import TpuMonoSpec
+from vllm_torchtpu.megakernel.runtime.contract import TpuMonoSpec
 
 SPEC = TpuMonoSpec("{name}", "1", create=".adapter:create", {fields})
 """
