@@ -65,7 +65,6 @@ bucketing in ``_padded_encoder_forward``, ``_padded_vit_forward``, and
 
 from __future__ import annotations
 
-from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -88,11 +87,14 @@ _QWEN3_OMNI_ARCH = "Qwen3OmniMoeForConditionalGeneration"
 _AUDIO_CHUNK_LENGTHS_PATCHED = "_tpu_audio_chunk_lengths_patched"
 _OMNI_STATIC_PADDED_ATTR = "_is_omni_static_padded"
 
-# Each 100-frame window (n_window * 2) is 1 s of 16 kHz audio. 500 windows
-# covers clips up to 500 s (~8.3 min, 63 8-window attention segments -> 64
-# cu_seqlens bounds); longer clips fall back to 8-window alignment.
-_AUDIO_CHUNK_BUCKETS: tuple[int, ...] = (8, 16, 32, 64, 128, 256, 500)
-_VISION_PATCH_BUCKETS: tuple[int, ...] = (512, 1024, 2048, 4096, 8192, 16384)
+# Each 100-frame window (n_window * 2) is 1 s of 16 kHz audio. The first
+# bucket (32 windows = 32 s) covers WhisperFeatureExtractor.chunk_length
+# (30 s), so a single max-length dummy audio item warms up all clips <= 32 s.
+# 500 windows covers clips up to 500 s (~8.3 min, 63 8-window attention
+# segments -> 64 cu_seqlens bounds); longer clips fall back to 8-window
+# alignment.
+_AUDIO_CHUNK_BUCKETS: tuple[int, ...] = (32, 64, 128, 256, 500)
+_VISION_PATCH_BUCKETS: tuple[int, ...] = (16384,)
 
 
 def _select_bucket(
@@ -447,6 +449,13 @@ def maybe_patch_qwen3_omni_thinker(model_config: ModelConfig | None = None) -> b
             *,
             is_multimodal: torch.Tensor | None = None,
         ) -> torch.Tensor:
+            cleared_deepstack = (
+                self.use_deepstack and self.deepstack_input_embeds_num_tokens > 0
+            )
+            if cleared_deepstack:
+                self._clear_deepstack_input_embeds(
+                    self.deepstack_input_embeds_num_tokens
+                )
             if multimodal_embeddings:
                 multimodal_embeddings = list(multimodal_embeddings)
             # Matches GPUModelRunner, where `is_mm_embed` stays on CPU so
@@ -461,12 +470,14 @@ def maybe_patch_qwen3_omni_thinker(model_config: ModelConfig | None = None) -> b
                 is_multimodal=is_multimodal,
             )
             if (
-                multimodal_embeddings
+                (multimodal_embeddings or cleared_deepstack)
                 and isinstance(out, torch.Tensor)
                 and out.device.type == "tpu"
             ):
                 sync_tensors = [out]
-                if self.use_deepstack and self.deepstack_input_embeds_num_tokens > 0:
+                if self.use_deepstack and (
+                    self.deepstack_input_embeds_num_tokens > 0 or cleared_deepstack
+                ):
                     sync_tensors.extend(self.deepstack_input_embeds)
                 synchronize_tensors(sync_tensors)
             return out
@@ -476,70 +487,3 @@ def maybe_patch_qwen3_omni_thinker(model_config: ModelConfig | None = None) -> b
 
     logger.info("Applied TPU patch: Qwen3-Omni Thinker encoders and multimodal merge.")
     return True
-
-
-@torch.no_grad()
-def precompile_qwen3_omni_thinker_mm(
-    model: Any,
-    token_buckets: Sequence[int],
-) -> None:
-    """Precompile Qwen3-Omni Thinker audio, vision, and MM merge buckets."""
-    audio_tower = model.audio_tower
-    if audio_tower is not None:
-        device = audio_tower.conv2d1.weight.device
-        dtype = audio_tower.conv2d1.weight.dtype
-        window_size = audio_tower.n_window * 2
-        tokens_per_chunk = (((window_size + 1) // 2 + 1) // 2 + 1) // 2
-        mel_bins = audio_tower.num_mel_bins
-        for num_chunks in _AUDIO_CHUNK_BUCKETS:
-            feat_len = num_chunks * window_size
-            cnn_len = num_chunks * tokens_per_chunk
-            dummy_features = torch.zeros(
-                (mel_bins, feat_len), dtype=dtype, device=device
-            )
-            dummy_feat_lens = torch.tensor([feat_len], dtype=torch.int32)
-            dummy_cnn_lens = torch.tensor([cnn_len], dtype=torch.int32)
-            out = audio_tower(dummy_features, dummy_feat_lens, dummy_cnn_lens)
-            if device.type == "tpu":
-                synchronize_tensors(out)
-            logger.info("  -- audio_chunks: %d (tokens: %d)", num_chunks, cnn_len)
-
-    visual = model.visual
-    if visual is not None:
-        device = visual.patch_embed.proj.weight.device
-        dtype = visual.dtype
-        patch_dim = int(visual.patch_embed.proj.weight[0].numel())
-        for num_patches in _VISION_PATCH_BUCKETS:
-            dummy_x = torch.zeros((num_patches, patch_dim), dtype=dtype, device=device)
-            dummy_grid = torch.tensor([[1, 16, num_patches // 16]], dtype=torch.int32)
-            out = visual(dummy_x, dummy_grid)
-            if device.type == "tpu":
-                synchronize_tensors(out)
-            logger.info("  -- vision_patches: %d", num_patches)
-
-    param = next(model.parameters(), None)
-    device = param.device if param is not None else torch.device("cpu")
-    dtype = param.dtype if param is not None else torch.bfloat16
-    hidden_size = model.config.text_config.hidden_size
-    multiscale_dim = model.multiscale_dim
-    for num_tokens in token_buckets:
-        if num_tokens <= 0:
-            continue
-        dummy_ids = torch.zeros((num_tokens,), dtype=torch.int32, device=device)
-        dummy_mask = torch.zeros((num_tokens,), dtype=torch.bool)
-        dummy_mask[0] = True
-        dummy_mm = torch.zeros(
-            (1, hidden_size + multiscale_dim), dtype=dtype, device=device
-        )
-        out = model.embed_input_ids(
-            dummy_ids,
-            multimodal_embeddings=[dummy_mm],
-            is_multimodal=dummy_mask,
-        )
-        model._clear_deepstack_input_embeds(num_tokens)
-        if device.type == "tpu":
-            sync_list = [out]
-            if model.use_deepstack:
-                sync_list.extend(model.deepstack_input_embeds)
-            synchronize_tensors(sync_list)
-        logger.info("  -- mm_merge_tokens: %d", num_tokens)

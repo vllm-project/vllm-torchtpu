@@ -38,14 +38,10 @@ from vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_moe_thinker import (
 
 import vllm_torchtpu
 from vllm_torchtpu.omni.patches.qwen3omni_thinker import (
-    _AUDIO_CHUNK_BUCKETS,
     _AUDIO_CHUNK_LENGTHS_PATCHED,
-    _VISION_PATCH_BUCKETS,
     _select_bucket,
     maybe_patch_qwen3_omni_thinker,
-    precompile_qwen3_omni_thinker_mm,
 )
-from vllm_torchtpu.utils import align_to
 
 pytestmark = pytest.mark.omni
 
@@ -250,8 +246,15 @@ def test_maybe_patch_qwen3_omni_thinker_static_bucketing_and_mm_merge(monkeypatc
             return torch.ones(n, 4), torch.zeros(n, 4)
 
     class DummyMixin:
-        use_deepstack = False
-        deepstack_input_embeds_num_tokens = 0
+        use_deepstack = True
+        deepstack_input_embeds_num_tokens = 12
+
+        def __init__(self):
+            self.cleared_tokens: list[int] = []
+
+        def _clear_deepstack_input_embeds(self, num_tokens: int) -> None:
+            self.cleared_tokens.append(num_tokens)
+            self.deepstack_input_embeds_num_tokens = 0
 
         def embed_input_ids(
             self, input_ids, multimodal_embeddings=None, *, is_multimodal=None
@@ -281,7 +284,7 @@ def test_maybe_patch_qwen3_omni_thinker_static_bucketing_and_mm_merge(monkeypatc
                 torch.tensor([alen], dtype=torch.long),
             )
             assert out.shape == (alen, 8)
-        assert seen_layer_seq_lens == [128, 128, 128, 128]
+        assert seen_layer_seq_lens == [512, 512, 512, 512]
         assert _select_bucket(5, (8, 16), align=8) == 8
         assert _select_bucket(19, (8, 16), align=8) == 24
 
@@ -291,13 +294,15 @@ def test_maybe_patch_qwen3_omni_thinker_static_bucketing_and_mm_merge(monkeypatc
             torch.ones(20000, 8), torch.tensor([[5, 40, 100]], dtype=torch.int32)
         )
         assert out_vit.shape == (5000, 16)
-        assert vit.blk.seen_shapes == [16384, 4096]
+        assert vit.blk.seen_shapes == [16384, 16384]
         assert vit.device == vit.patch_embed.proj.weight.device
 
-        # 3. Verify embed_input_ids keeps embeddings on-device & preserves modality
+        # 3. Verify embed_input_ids keeps embeddings on-device, preserves modality,
+        # and clears any unconsumed deepstack buffer on entry.
         vid_emb = torch.ones(6, 32)
         vid_emb.modality = "video"
-        kw_embeds, kw_mask = DummyMixin().embed_input_ids(
+        mixin = DummyMixin()
+        kw_embeds, kw_mask = mixin.embed_input_ids(
             input_ids=torch.zeros(5, dtype=torch.long),
             multimodal_embeddings=(vid_emb,),
             is_multimodal=torch.ones(5, dtype=torch.bool),
@@ -305,43 +310,8 @@ def test_maybe_patch_qwen3_omni_thinker_static_bucketing_and_mm_merge(monkeypatc
         assert kw_embeds[0] is vid_emb
         assert kw_embeds[0].modality == "video"
         assert kw_mask.device.type == "cpu"
-
-        # 4. Verify startup precompilation across all audio, vision, and token buckets
-        seen_layer_seq_lens.clear()
-        vit.blk.seen_shapes.clear()
-        seen_mm_merges: list[tuple[int, tuple[int, ...]]] = []
-        cleared_tokens: list[int] = []
-
-        class DummyThinkerModel(nn.Module):
-            multiscale_dim = 24
-            use_deepstack = False
-
-            def __init__(self):
-                super().__init__()
-                self.audio_tower = enc
-                self.visual = vit
-                self.config = SimpleNamespace(
-                    text_config=SimpleNamespace(hidden_size=8)
-                )
-
-            def embed_input_ids(
-                self, input_ids, multimodal_embeddings=None, *, is_multimodal=None
-            ):
-                seen_mm_merges.append(
-                    (int(input_ids.shape[0]), tuple(multimodal_embeddings[0].shape))
-                )
-                return torch.zeros(input_ids.shape[0], 8)
-
-            def _clear_deepstack_input_embeds(self, num_tokens: int) -> None:
-                cleared_tokens.append(num_tokens)
-
-        precompile_qwen3_omni_thinker_mm(DummyThinkerModel(), [16, 64])
-        assert seen_layer_seq_lens == [
-            align_to(b * 13, 128) for b in _AUDIO_CHUNK_BUCKETS
-        ]
-        assert vit.blk.seen_shapes == list(_VISION_PATCH_BUCKETS)
-        assert seen_mm_merges == [(16, (1, 32)), (64, (1, 32))]
-        assert cleared_tokens == [16, 64]
+        assert mixin.cleared_tokens == [12]
+        assert mixin.deepstack_input_embeds_num_tokens == 0
 
 
 def test_qwen3_omni_thinker_interleaved_mm_merge(monkeypatch):

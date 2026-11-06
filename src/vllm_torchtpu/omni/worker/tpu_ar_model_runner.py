@@ -18,7 +18,10 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any
 
 import torch
-from vllm.multimodal.utils import copy_mm_embedding_modality
+from vllm.multimodal.utils import (
+    copy_mm_embedding_modality,
+    set_mm_embedding_modality,
+)
 from vllm.sequence import IntermediateTensors
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.worker.omni_connector_model_runner_mixin import (
@@ -26,11 +29,8 @@ from vllm_omni.worker.omni_connector_model_runner_mixin import (
     needs_omni_connector,
 )
 
-from vllm_torchtpu.omni.patches.qwen3omni_thinker import (
-    _QWEN3_OMNI_ARCH,
-    precompile_qwen3_omni_thinker_mm,
-)
 from vllm_torchtpu.omni.worker.tpu_model_runner import OmniTPUModelRunner
+from vllm_torchtpu.utils import synchronize_tensors
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
@@ -94,15 +94,57 @@ class TPUARModelRunner(OmniTPUModelRunner, OmniConnectorModelRunnerMixin):
 
     def capture_model(self) -> None:
         super().capture_model()
-        if (
-            self.enforce_eager
-            or not self.supports_mm_inputs
-            or not self._pp_is_first
-            or _QWEN3_OMNI_ARCH not in self.model_config.architectures
-        ):
+        if self.enforce_eager or not self.supports_mm_inputs or not self._pp_is_first:
+            return
+        self._precompile_mm_inputs()
+
+    @torch.no_grad()
+    def _precompile_mm_inputs(self) -> None:
+        if self.mm_budget is None or not self.mm_budget.mm_max_toks_per_item:
             return
         with self._precompile_timed("multimodal encoders and merge"):
-            precompile_qwen3_omni_thinker_mm(self.model, self.num_tokens_paddings)
+            sample_embed: torch.Tensor | None = None
+            sample_modality: str | None = None
+            for modality in self.mm_budget.mm_max_toks_per_item:
+                batched_dummy_mm_inputs = self._get_mm_dummy_batch(modality, 1)
+                dummy_encoder_outputs = self.model.embed_multimodal(
+                    **batched_dummy_mm_inputs
+                )
+                if not dummy_encoder_outputs:
+                    continue
+                outputs_list = list(dummy_encoder_outputs)
+                synchronize_tensors(outputs_list)
+                first_embed = outputs_list[0]
+                if (
+                    sample_embed is None
+                    or first_embed.shape[-1] > sample_embed.shape[-1]
+                ):
+                    sample_embed = first_embed
+                    sample_modality = modality
+            self.mm_budget.reset_cache()
+            if sample_embed is None or sample_modality is None:
+                return
+            dummy_mm = set_mm_embedding_modality(
+                torch.zeros_like(sample_embed[:1]), sample_modality
+            )
+            last_input_ids: torch.Tensor | None = None
+            for num_tokens in self.num_tokens_paddings:
+                if num_tokens <= 0:
+                    continue
+                last_input_ids = torch.zeros(
+                    (num_tokens,), dtype=torch.int32, device=self.device
+                )
+                is_multimodal = torch.zeros((num_tokens,), dtype=torch.bool)
+                is_multimodal[0] = True
+                _, inputs_embeds = super()._get_model_inputs(
+                    last_input_ids, ([dummy_mm], is_multimodal)
+                )
+                if inputs_embeds is not None:
+                    synchronize_tensors(inputs_embeds)
+            if last_input_ids is not None:
+                _, inputs_embeds = super()._get_model_inputs(last_input_ids, None)
+                if inputs_embeds is not None:
+                    synchronize_tensors(inputs_embeds)
 
     def _get_model_inputs(
         self,

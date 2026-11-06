@@ -28,7 +28,6 @@ from vllm_omni.worker.omni_connector_model_runner_mixin import (
     OmniConnectorModelRunnerMixin,
 )
 
-from vllm_torchtpu.omni.worker import tpu_ar_model_runner as ar_runner_mod
 from vllm_torchtpu.omni.worker.tpu_ar_model_runner import TPUARModelRunner
 from vllm_torchtpu.omni.worker.tpu_model_runner import OmniTPUModelRunner
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
@@ -146,37 +145,64 @@ def test_tpu_ar_model_runner_mixed_dim_mm_slicing():
 
 
 def test_tpu_ar_model_runner_capture_model_precompiles_mm_buckets():
-    runner = _build(
-        _stage_config(
-            model_stage="thinker",
-            stage_id=0,
-            model_arch_config=SimpleNamespace(
-                architectures=["Qwen3OmniMoeForConditionalGeneration"]
-            ),
-        )
-    )
+    runner = _build(_stage_config(model_stage="thinker", stage_id=0))
+    runner.device = torch.device("cpu")
     runner.enforce_eager = False
     runner.supports_mm_inputs = True
     runner._pp_is_first = True
     runner.num_tokens_paddings = [16, 64]
-    runner.model = SimpleNamespace()
     runner._update_num_xla_graphs = MagicMock()
 
-    with (
-        patch.object(OmniTPUModelRunner, "capture_model") as mock_super_capture,
-        patch.object(
-            ar_runner_mod, "precompile_qwen3_omni_thinker_mm"
-        ) as mock_precompile_mm,
-    ):
+    seen_modalities: list[str] = []
+    seen_merges: list[tuple[int, tuple[tuple[int, ...], str] | None]] = []
+    reset_cache = MagicMock()
+    runner.mm_budget = SimpleNamespace(
+        mm_max_toks_per_item={"audio": 390, "video": 4096},
+        reset_cache=reset_cache,
+    )
+    runner._get_mm_dummy_batch = lambda modality, count: {"modality": modality}
+
+    def _embed_multimodal(**kwargs):
+        modality = kwargs["modality"]
+        seen_modalities.append(modality)
+        width = 8 if modality == "audio" else 32
+        return (torch.ones(4, width),)
+
+    def _embed_input_ids(input_ids, multimodal_embeddings=None, *, is_multimodal=None):
+        mm_info = (
+            None
+            if multimodal_embeddings is None
+            else (
+                tuple(multimodal_embeddings[0].shape),
+                multimodal_embeddings[0].modality,
+            )
+        )
+        seen_merges.append((int(input_ids.shape[0]), mm_info))
+        return torch.zeros(input_ids.shape[0], 8)
+
+    runner.model = SimpleNamespace(
+        embed_multimodal=_embed_multimodal,
+        embed_input_ids=_embed_input_ids,
+    )
+
+    with patch.object(OmniTPUModelRunner, "capture_model") as mock_super_capture:
         runner.capture_model()
         mock_super_capture.assert_called_once_with()
-        mock_precompile_mm.assert_called_once_with(runner.model, [16, 64])
+        assert seen_modalities == ["audio", "video"]
+        reset_cache.assert_called_once_with()
+        assert seen_merges == [
+            (16, ((1, 32), "video")),
+            (64, ((1, 32), "video")),
+            (64, None),
+        ]
 
         # Non-MM stage skips MM encoder precompilation
-        mock_precompile_mm.reset_mock()
+        seen_modalities.clear()
+        seen_merges.clear()
         runner.supports_mm_inputs = False
         runner.capture_model()
-        mock_precompile_mm.assert_not_called()
+        assert seen_modalities == []
+        assert seen_merges == []
 
 
 def test_tpu_ar_model_runner_forward_model_unwraps_omni_output():
