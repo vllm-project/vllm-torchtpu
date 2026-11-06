@@ -721,6 +721,12 @@ def qsa_attention(
         prefill_fn = _with_lse_channel(_prefill_attention)
     else:
         decode_fn, prefill_fn = decode_attention, _prefill_attention
+    if dcp is not None and dcp_interleave(dcp, cache.shape[1]) != cache.shape[1]:
+        # Interleaved ownership is the PCP prefill's layout: a prefill engine,
+        # so every row (short ones too) runs on the paired prefill kernel
+        # rather than the decode path's micro-page RPA.
+        output, cache = prefill_fn(query, gate, blocks, lengths, table, cache, starts, **options)
+        return _split_lse_channel(output, lengths, cache)
     if len(query) <= (len(starts) - 1) * max_query_len:
         output, cache = decode_fn(query, gate, blocks, lengths, table, cache, **options)
         return _split_lse_channel(output, lengths, cache) if dcp is not None else (output, cache)
