@@ -126,8 +126,8 @@ def _kernel_v2(
     o_ref[...] = maxima[0] if len(maxima) == 1 else jnp.concatenate(maxima, axis=0)
 
 
-def _scores_v3(q, page_refs, o_ref):
-    """`_kernel_v2`'s scoring over pages already in VMEM."""
+def _scores_v3(q, page_refs):
+    """`_kernel_v2`'s scoring over pages already in VMEM: ``[G, Bq]`` maxima."""
     block_q = q.shape[0]
     pages_per_step = len(page_refs)
     rows, packing, _ = page_refs[0].shape
@@ -147,35 +147,24 @@ def _scores_v3(q, page_refs, o_ref):
             keys, q, (((1,), (1,)), ((), ())), preferred_element_type=jnp.float32
         )
         maxima.append(jnp.max(s.reshape(len(group), page_size, block_q), axis=1))
-    o_ref[...] = maxima[0] if len(maxima) == 1 else jnp.concatenate(maxima, axis=0)
+    return maxima[0] if len(maxima) == 1 else jnp.concatenate(maxima, axis=0)
 
 
-def _kernel_v3(
-    # Scalar prefetch
-    work_ref,  # [groups] tile << _TILE_SHIFT | page group within the request
-    tile_seq_ref,  # [tiles] request of each tile
-    block_tables_ref,  # [max_num_seqs * pages_per_seq]
-    seq_pages_ref,  # [max_num_seqs] pages of each request
-    # In
-    q_ref,  # [Bq, D]
-    cache_ref,  # [pages, S / p, p, D] index cache, left in HBM
-    # Out
-    o_ref,  # [G, Bq]
-    # Scratch
-    buf0,  # [G, S / p, p, D] pages of even steps
-    buf1,  # [G, S / p, p, D] pages of odd steps
-    sems,  # DMA semaphores [2, G]
+def _page_ring(
+    seq_of, work_ref, block_tables_ref, seq_pages_ref, cache_ref, buf0, buf1, sems
 ):
-    """`_kernel_v2` with the pages fetched by a hand-written double-buffered
-    DMA ring: one scalar address per page and no copy for pages past the
-    request's end (their scores are never read)."""
+    """Double-buffered DMA ring over the work list: one scalar address per
+    page and no copy for pages past the request's end (their scores are
+    never read). `seq_of` maps a work entry to its request. Returns
+    ``consume(consumer)``, which waits for this step's pages and passes them,
+    in VMEM, to `consumer`."""
     pages_per_step = buf0.shape[0]
     pages_per_seq = block_tables_ref.shape[0] // seq_pages_ref.shape[0]
     step, num_steps = pl.program_id(0), pl.num_programs(0)
 
     def copies(w, buf, slot):
         entry = work_ref[w]
-        seq = tile_seq_ref[entry >> _TILE_SHIFT]
+        seq = seq_of(entry)
         first = (entry & _GROUP_MASK) * pages_per_step
         live = jnp.maximum(seq_pages_ref[seq] - first, 1)
         base = seq * pages_per_seq + first
@@ -217,17 +206,53 @@ def _kernel_v3(
         def _():
             start(step + 1, buf0, 0)
 
+    def consume(consumer):
+        @pl.when(even)
+        def _():
+            wait(step, buf0, 0)
+            consumer([buf0.at[g] for g in range(pages_per_step)])
+
+        @pl.when(jnp.logical_not(even))
+        def _():
+            wait(step, buf1, 1)
+            consumer([buf1.at[g] for g in range(pages_per_step)])
+
+    return consume
+
+
+def _kernel_v3(
+    # Scalar prefetch
+    work_ref,  # [groups] tile << _TILE_SHIFT | page group within the request
+    tile_seq_ref,  # [tiles] request of each tile
+    block_tables_ref,  # [max_num_seqs * pages_per_seq]
+    seq_pages_ref,  # [max_num_seqs] pages of each request
+    # In
+    q_ref,  # [Bq, D]
+    cache_ref,  # [pages, S / p, p, D] index cache, left in HBM
+    # Out
+    o_ref,  # [G, Bq]
+    # Scratch
+    buf0,  # [G, S / p, p, D] pages of even steps
+    buf1,  # [G, S / p, p, D] pages of odd steps
+    sems,  # DMA semaphores [2, G]
+):
+    """`_kernel_v2` with the pages fetched by `_page_ring`."""
+    consume = _page_ring(
+        lambda entry: tile_seq_ref[entry >> _TILE_SHIFT],
+        work_ref,
+        block_tables_ref,
+        seq_pages_ref,
+        cache_ref,
+        buf0,
+        buf1,
+        sems,
+    )
     q = q_ref[...]
 
-    @pl.when(even)
-    def _():
-        wait(step, buf0, 0)
-        _scores_v3(q, [buf0.at[g] for g in range(pages_per_step)], o_ref)
+    def store(page_refs):
+        o_ref[...] = _scores_v3(q, page_refs)
 
-    @pl.when(jnp.logical_not(even))
-    def _():
-        wait(step, buf1, 1)
-        _scores_v3(q, [buf1.at[g] for g in range(pages_per_step)], o_ref)
+    consume(store)
 
 
 _KERNELS = {"v1": _kernel_v1, "v2": _kernel_v2}
