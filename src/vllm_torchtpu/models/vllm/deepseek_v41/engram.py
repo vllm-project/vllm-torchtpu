@@ -15,6 +15,8 @@
 
 from __future__ import annotations
 
+import copy
+import os
 import tempfile
 from collections.abc import Callable
 from contextlib import ExitStack
@@ -629,6 +631,19 @@ class Engram(upstream.Engram):
     # constructs ``torch.cuda.Stream``/``Event`` and invokes Triton
     # ``_fused_engram_post_wkv_kernel``.
     """
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        # Use W8A16 linear config: the signed-sqrt gate amplifies W8A8 quantization noise.. The signed-sqrt gate amplifies the W8A8
+        # projection error (W8A8 fails, W8A16 passes); a per-layer copy of the fp8 linear method keeps the
+        # change off every other fp8 linear (TPU_FP8_LINEAR_W8A16_MAX_ROWS is global by row bucket).
+        qm = getattr(self.wkv, "quant_method", None)
+        if os.environ.get("DSV41_ENGRAM_W8A16", "1") == "1" and hasattr(qm, "w8a16_max_rows"):
+            qm = copy.copy(qm)
+            qm.w8a16_max_rows = 1 << 30
+            self.wkv.quant_method = qm
+        print(f"[deepseek_v41] engram wkv w8a16_max_rows={getattr(qm, 'w8a16_max_rows', None)} "
+              f"method={type(qm).__name__}", flush=True)
 
     def _create_embedding(
         self,
