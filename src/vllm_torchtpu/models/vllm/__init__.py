@@ -70,3 +70,9 @@ def register_models() -> None:
     ModelRegistry.register_model("TPUQwen3MoeForCausalLM", "vllm_torchtpu.models.vllm.qwen3_moe_tpu:TPUQwen3MoeForCausalLM")
     if os.environ.get("VLLM_TORCHTPU_NATIVE_MODELS", "0") == "1":
         ModelRegistry.register_model("Qwen3MoeForCausalLM", "vllm_torchtpu.models.vllm.qwen3_moe_tpu:TPUQwen3MoeForCausalLM")
+    # TPU-native NemotronHForCausalLM (Mamba2 + relu2 MoE layers); same opt-in switch.
+    ModelRegistry.register_model("TPUNemotronHForCausalLM", "vllm_torchtpu.models.vllm.nemotron_h_tpu:TPUNemotronHForCausalLM")
+    if "NemotronHForCausalLM" in MODELS_CONFIG_MAP:  # mamba_ssm_cache_dtype float32 hook under the new name too
+        MODELS_CONFIG_MAP["TPUNemotronHForCausalLM"] = MODELS_CONFIG_MAP["NemotronHForCausalLM"]
+    if os.environ.get("VLLM_TORCHTPU_NATIVE_MODELS", "0") == "1":
+        ModelRegistry.register_model("NemotronHForCausalLM", "vllm_torchtpu.models.vllm.nemotron_h_tpu:TPUNemotronHForCausalLM")
