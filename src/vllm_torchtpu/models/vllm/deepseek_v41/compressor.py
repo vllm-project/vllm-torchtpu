@@ -263,7 +263,8 @@ class DeepseekCompressor(compressor_upstream.DeepseekCompressor):
         ratio = self.compress_ratio
         if meta is not None and k_cache.numel():
             rotated = rotate_rope(
-                latent, positions // ratio, rotary_emb, self.kv_rope_op
+                # TPU-specific path.: group j is rotated at position j * ratio (HF model.py:538,753)
+                latent, positions // ratio * ratio, rotary_emb, self.kv_rope_op
             )
             slots = cache_slots(k_cache, meta, positions, compress_ratio=ratio)
             keep = ((positions + 1) % ratio == 0) & not_replayed(

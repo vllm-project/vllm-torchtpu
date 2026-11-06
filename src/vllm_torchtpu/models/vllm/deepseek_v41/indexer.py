@@ -296,7 +296,8 @@ class DeepseekV41Indexer(upstream.DeepseekV4Indexer):
         k_pre, _ = self.wk(latent)
         k_rotated = rotate_rope(
             self.k_norm(k_pre),
-            positions // ratio,
+            # TPU-specific path.: group j is rotated at position j * ratio (HF model.py:538,753)
+            positions // ratio * ratio,
             rotary_emb,
             self.kv_rope_op,
         )
