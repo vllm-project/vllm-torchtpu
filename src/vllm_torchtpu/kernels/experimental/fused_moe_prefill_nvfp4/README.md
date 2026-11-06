@@ -92,3 +92,57 @@ out = fused_moe_prefill_nvfp4(
   `"w4a16"` (default, BF16 activations) or `"w4a8"` (per-row FP8 activations and
   `FP8 x FP8` MXU dots, e.g. when lowering
   `FUSED_MOE_PREFILL_NVFP4_MIN_TOKENS=512`).
+
+## Per-layer latency
+
+8-rank TPU7x per-layer benchmark at the branch tip, GLM-5.2 shapes (`H = 6144`,
+`E = 256`, `topk = 8`), full MoE layer (routing + Stage-A + combine), ms per
+step across 75 layers:
+
+EP2xTP4 (uniform / skewed routing):
+
+| Tokens | Kernel W4A16 | Kernel W4A8 | gmm_v2 W4A16 | gmm_v2 W4A8 |
+| --: | :-- | :-- | :-- | :-- |
+| 512 | 50.9 / 50.8 | 32.2 / 32.5 | 46.7 / 47.5 | 48.8 / 49.5 |
+| 1024 | 59.3 / 59.6 | 41.5 / 41.7 | 58.9 / 60.9 | 60.5 / 61.6 |
+| 2048 | 77.3 / 77.4 | 60.1 / 61.9 | 85.1 / 86.6 | 80.3 / 81.3 |
+| 4096 | 103.8 / 109.3 | 93.5 / 97.8 | 135.4 / 142.5 | 130.2 / 135.1 |
+
+TP8 (uniform routing; `#1559` / `#1935` FP8 Stage-A timing reference):
+
+| Tokens | Kernel W4A16 | Kernel W4A8 | FP8 Stage-A reference |
+| --: | :-- | :-- | :-- |
+| 512 | 55.0 | 38.8 | 42.4 |
+| 1024 | 64.2 | 48.3 | 52.2 |
+| 2048 | 83.8 | 69.7 | 71.5 |
+| 4096 | 113.0 | 111.1 | 112.5 |
+
+Under `EP2 x TP4`, `w4a16` is slower than `gmm_v2` at `512` tokens and ties at
+`1024`, so `FUSED_MOE_PREFILL_NVFP4_MIN_TOKENS` defaults to `2048`; `w4a8` is
+faster than `gmm_v2` from `512` tokens up (`MIN_TOKENS = 512`). `8` rungs at
+`256`-row tiles were measured much slower for `W4A16` (`EP2 x TP4` and `TP8`)
+and no faster for `W4A8`, so `4` rungs are used at `256`-row tiles
+(`tall_rung_rows` still overrides).
+
+TPU-only cases of `tests/kernels/test_fused_moe_prefill_nvfp4.py` passed twice
+across two 8-rank TPU7x pods at the branch tip (`12` passed + `4` by-design
+parametrization skips, `0` failed), and all `136` CPU interpret-mode and
+adapter-dispatch tests pass on CPU.
+
+## End-to-end model quality
+
+Measured on 4-chip TPU7x (`EP2 x TP4`) for GLM-5.2-NVFP4: on GSM8K 5-shot,
+`n = 1,319`, `c8`, real MTP (`k = 3`), exact match is `0.9712 ± 0.0046` (`3.577`
+MTP acceptance) with `w4a16` (`>= 2048`) and `0.9689 ± 0.0048` (`3.578` MTP
+acceptance) with `w4a8` (`>= 512`, plus online-FP8 drafter experts), vs
+`0.9689 ± 0.0048` (`3.585` MTP acceptance) with the prefill kernel off
+(`_tp_chain` `gmm_v2` W4A16). On LongBench-v2, `503` items, paired against the
+prefill kernel off (`46.5%`, `234 / 503`; `c8`, thinking off, `temperature = 0`,
+`256` new tokens, `32K` middle truncation), `w4a16` (`>= 2048`) measures
+`-0.2 pp` (`46.3%`, 95% CI `-2.4..+2.0 pp`, McNemar `p = 1.0`, `90.7%`
+agreement; `-0.6 pp` on the pre-registered `n = 180` short subset); for `w4a8`
+(`>= 512`), the pre-registered `n = 180` short-subset reading was `-2.8 pp`
+(`96` vs `101` of `180`, `INVESTIGATE` band) and its prescribed `503`-item
+follow-up gave `+0.6 pp` (`47.1%`, 95% CI `-1.8..+3.0 pp`, McNemar `p = 0.74`,
+`88.1%` agreement; per-length correct counts `w4a8` vs off: short `96` vs `101`
+[`n = 180`], medium `84` vs `85` [`n = 215`], long `57` vs `48` [`n = 108`]).
