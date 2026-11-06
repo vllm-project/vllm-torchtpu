@@ -293,7 +293,7 @@ def plan_bucket_stats(
     from vllm_torchtpu.megakernel.modules.gqa import GQAModule, GQATunables
     from vllm_torchtpu.megakernel.modules.moe import MoEModule, MoETunables
     from vllm_torchtpu.megakernel.profile import Profile, get_profile
-    from vllm_torchtpu.megakernel.runtime.policy import (
+    from vllm_torchtpu.megakernel.runtime.exec_policy import (
         align_cache_exec,
         bucket_exec_spec,
     )
@@ -696,7 +696,7 @@ def compile_bucket_in_process(
     from vllm_torchtpu.megakernel import cache
     from vllm_torchtpu.megakernel.exec_spec import ExecSpec
     from vllm_torchtpu.megakernel.profile import Profile, get_profile
-    from vllm_torchtpu.megakernel.runtime.policy import (
+    from vllm_torchtpu.megakernel.runtime.exec_policy import (
         align_cache_exec,
         bucket_exec_spec,
     )

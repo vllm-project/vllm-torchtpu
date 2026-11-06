@@ -19,7 +19,16 @@ import importlib
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:  # eager imports for type checkers and IDEs
-    from . import checks, contract, eligibility, layout_facts, policy, stats, step_meta
+    from . import (
+        checks,
+        contract,
+        eligibility,
+        exec_policy,
+        layout_facts,
+        policy,
+        stats,
+        step_meta,
+    )
     from .checks import (
         PoolScheduleInfo,
         SentinelVariantPlan,
@@ -56,6 +65,15 @@ if TYPE_CHECKING:  # eager imports for type checkers and IDEs
         check_startup_eligibility,
         check_step_eligibility,
     )
+    from .exec_policy import (
+        DEFAULT_FUSED_POOL_IO_MAX_B,
+        DEFAULT_FUSED_POOL_IO_MIN_B_HI,
+        align_cache_exec,
+        bucket_exec_spec,
+        explicit_profile_settings,
+        parse_runtime_config,
+        resolve_driver_profile,
+    )
     from .layout_facts import (
         PoolLayoutFacts,
         compare_layout_facts,
@@ -63,19 +81,12 @@ if TYPE_CHECKING:  # eager imports for type checkers and IDEs
     )
     from .policy import (
         DEFAULT_BUCKETS,
-        DEFAULT_FUSED_POOL_IO_MAX_B,
-        DEFAULT_FUSED_POOL_IO_MIN_B_HI,
         DEFAULT_VERIFY_BUCKETS,
         MTP_SPECULATIVE_TOKENS,
         MTP_VERIFY_TOKENS,
         BucketPolicy,
-        align_cache_exec,
-        bucket_exec_spec,
-        explicit_profile_settings,
         parse_mk_buckets,
         parse_mk_verify_buckets,
-        parse_runtime_config,
-        resolve_driver_profile,
         select_bucket,
     )
     from .stats import (
@@ -105,6 +116,7 @@ _SUBMODULES = frozenset(
         "stats",
         "checks",
         "eligibility",
+        "exec_policy",
         "layout_facts",
         "policy",
         "step_meta",
@@ -151,19 +163,19 @@ _LAZY: dict[str, str] = {
     "compare_layout_facts": ".layout_facts",
     "facts_from_pool_layout": ".layout_facts",
     "DEFAULT_BUCKETS": ".policy",
-    "DEFAULT_FUSED_POOL_IO_MAX_B": ".policy",
-    "DEFAULT_FUSED_POOL_IO_MIN_B_HI": ".policy",
+    "DEFAULT_FUSED_POOL_IO_MAX_B": ".exec_policy",
+    "DEFAULT_FUSED_POOL_IO_MIN_B_HI": ".exec_policy",
     "DEFAULT_VERIFY_BUCKETS": ".policy",
     "MTP_SPECULATIVE_TOKENS": ".policy",
     "MTP_VERIFY_TOKENS": ".policy",
     "BucketPolicy": ".policy",
-    "align_cache_exec": ".policy",
-    "bucket_exec_spec": ".policy",
-    "explicit_profile_settings": ".policy",
+    "align_cache_exec": ".exec_policy",
+    "bucket_exec_spec": ".exec_policy",
+    "explicit_profile_settings": ".exec_policy",
     "parse_mk_buckets": ".policy",
     "parse_mk_verify_buckets": ".policy",
-    "parse_runtime_config": ".policy",
-    "resolve_driver_profile": ".policy",
+    "parse_runtime_config": ".exec_policy",
+    "resolve_driver_profile": ".exec_policy",
     "select_bucket": ".policy",
     "JaxStepMetaOps": ".step_meta",
     "StepMeta": ".step_meta",
@@ -221,6 +233,7 @@ __all__ = [
     "contract",
     "compare_layout_facts",
     "eligibility",
+    "exec_policy",
     "explicit_profile_settings",
     "facts_from_pool_layout",
     "inspect_batch_shape",

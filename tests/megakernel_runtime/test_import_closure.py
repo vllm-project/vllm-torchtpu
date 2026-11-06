@@ -91,6 +91,7 @@ def test_runtime_imports_without_the_megakernel_library() -> None:
     for must_block in (
         "vllm_torchtpu.megakernel.cache",
         "vllm_torchtpu.megakernel.runtime.policy",
+        "vllm_torchtpu.megakernel.runtime.exec_policy",
         "vllm_torchtpu.megakernel.runtime.checks",
         "vllm_torchtpu.megakernel.runtime.step_meta",
         "vllm_torchtpu.megakernel.weights",
