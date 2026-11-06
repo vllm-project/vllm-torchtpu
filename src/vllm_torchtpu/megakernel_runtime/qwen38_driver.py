@@ -656,6 +656,13 @@ class Qwen38SegmentDriver:
         drv.warm = _parse_flag(raw, "warm", False)
         drv.noaot = _parse_flag(raw, "noaot", False)
         drv.whole = _parse_flag(raw, "whole", False)
+        from .qwen38_guards import whole_step_allowed
+
+        drv.whole, refusal = whole_step_allowed(
+            drv.whole, int(envs.VLLM_TPU_QSA_MAIN_KV_DCP or 0), dcp_capable=False
+        )
+        if refusal:
+            logger.warning("Qwen3.8 megakernel: %s", refusal)
         drv.whole_dry = _parse_flag(raw, "wholedry", False)
         cap = _parse_int(raw, "wholecap")
         if cap is not None:
