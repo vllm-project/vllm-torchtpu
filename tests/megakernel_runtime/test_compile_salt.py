@@ -49,7 +49,7 @@ def _no_env(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 _LAYOUT_PLUGIN = """
-from vllm_torchtpu.megakernel_runtime.plugin import TpuMonoSpec
+from vllm_torchtpu.megakernel.runtime.contract import TpuMonoSpec
 
 def layout_request(vllm_config, options):
     return {"kv": "stacked", "n": options.get("n", 1)}
