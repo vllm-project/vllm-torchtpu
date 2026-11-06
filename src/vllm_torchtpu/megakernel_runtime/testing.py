@@ -140,6 +140,7 @@ def fake_runner(
         _pp_is_last=True,
         _pcp_enabled=False,
         _dp_lockstep_enabled=lambda: False,
+        _megakernel=None,
     )
     for k, v in extra.items():
         setattr(runner, k, v)
