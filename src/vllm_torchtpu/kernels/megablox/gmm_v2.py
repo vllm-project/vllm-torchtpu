@@ -1299,6 +1299,360 @@ def decode_stream_kernel(
             copy.wait()
 
 
+def decode_mlp_geometry(
+    up_cfgs: GmmConfigs, down_cfgs: GmmConfigs
+) -> tuple[int, int, int]:
+    """(cols, gate_up panels, down panels) of the fused decode MLP stream.
+
+    Every chunk fills one ring slot of [2, up size_k, cols] weights: a gate_up
+    chunk is `cols` gate and `cols` up columns over all of k, a down chunk is
+    2 * (up size_k // down size_k) column strips of `cols` over all of k,
+    stacked along the slot's k rows.
+    """
+    cols = decode_chunk_cols(up_cfgs)
+    k_parts = up_cfgs.dims.size_k // down_cfgs.dims.size_k
+    down_cols = 2 * k_parts * cols
+    return cols, up_cfgs.out_size_n // cols, down_cfgs.out_size_n // down_cols
+
+
+def decode_mlp_vmem_bytes(up_cfgs: GmmConfigs, down_cfgs: GmmConfigs) -> int:
+    """VMEM `decode_mlp_stream_kernel` needs, with room for its chunk temporaries."""
+    up_dims, down_dims = up_cfgs.dims, down_cfgs.dims
+    cols, _, num_down_panels = decode_mlp_geometry(up_cfgs, down_cfgs)
+    act_bytes = jnp.dtype(up_cfgs.out_dtype).itemsize
+    tile_m = up_cfgs.tiles.tile_m
+    rhs_cfgs = up_cfgs.rhs_cfgs
+    rhs_bits = jax.dtypes.itemsize_bits(rhs_cfgs.quant_dtype or rhs_cfgs.dtype)
+    lhs_bytes = jnp.dtype(up_cfgs.lhs_cfgs.dtype).itemsize
+    num_quant_blocks = up_dims.size_k // rhs_cfgs.quant_block_size
+    lhs = up_dims.size_m * up_dims.size_k * lhs_bytes
+    act = down_dims.size_m * down_dims.size_k * act_bytes
+    out = (
+        down_dims.size_m
+        * down_cfgs.out_size_n
+        * jnp.dtype(down_cfgs.out_dtype).itemsize
+    )
+    slots = DECODE_SLOTS * 2 * cols * (up_dims.size_k * rhs_bits // 8)
+    scales = DECODE_SLOTS * 2 * cols * num_quant_blocks * 4
+    dequantized = up_dims.size_k * 2 * cols * lhs_bytes
+    down_lhs = tile_m * down_dims.size_k * act_bytes
+    acc = tile_m * max(2 * cols, down_cfgs.out_size_n // num_down_panels) * 4
+    return lhs + act + out + slots + scales + dequantized + down_lhs + acc
+
+
+def use_decode_mlp_stream(
+    up_cfgs: GmmConfigs, down_cfgs: GmmConfigs, vmem_limit_bytes: int
+) -> bool:
+    """Whether `decode_mlp_stream_kernel` can run a gate_up and a down call.
+
+    Both calls must take the decode weight stream on their own, over the same
+    gm tiles (same rows, tile_m and bucket_base), with the down call reading
+    exactly the gate_up call's output columns, and the two calls' chunks must
+    fill the same ring slots.
+    """
+    up_dims, down_dims = up_cfgs.dims, down_cfgs.dims
+    if not (
+        up_cfgs.fuse_act is not None
+        and down_cfgs.fuse_act is None
+        and use_decode_stream(up_cfgs, vmem_limit_bytes)
+        and use_decode_stream(down_cfgs, vmem_limit_bytes)
+        and up_cfgs.tiles.tile_m == down_cfgs.tiles.tile_m
+        and up_cfgs.tiles.bucket_base == down_cfgs.tiles.bucket_base
+        and up_dims.size_m == down_dims.size_m
+        and up_dims.size_group == down_dims.size_group
+        and up_dims.size_lhs_group == down_dims.size_lhs_group
+        and up_dims.size_lhs_sublane == down_dims.size_lhs_sublane
+        and down_dims.size_k == up_cfgs.out_size_n
+        and down_cfgs.lhs_cfgs.dtype == up_cfgs.out_dtype
+        and up_cfgs.rhs_cfgs == down_cfgs.rhs_cfgs
+        and up_dims.size_k % down_dims.size_k == 0
+    ):
+        return False
+    cols, num_up_panels, num_down_panels = decode_mlp_geometry(up_cfgs, down_cfgs)
+    k_parts = up_dims.size_k // down_dims.size_k
+    return (
+        # Down strips are multiplied per MXU column block as on their own.
+        cols % pltpu.get_tpu_info().mxu_column_size == 0
+        and num_up_panels * cols == up_cfgs.out_size_n
+        and num_down_panels * 2 * k_parts * cols == down_cfgs.out_size_n
+        and down_dims.size_k % up_cfgs.rhs_cfgs.quant_block_size == 0
+        and decode_mlp_vmem_bytes(up_cfgs, down_cfgs) <= vmem_limit_bytes
+    )
+
+
+def decode_mlp_scratch_shapes(up_cfgs: GmmConfigs, down_cfgs: GmmConfigs) -> list:
+    """Scratch shapes of `decode_mlp_stream_kernel` after its metadata."""
+    assert DECODE_SLOTS >= 2, DECODE_SLOTS
+    up_dims = up_cfgs.dims
+    sublane = up_dims.size_lhs_sublane
+    slabs = up_dims.size_m // sublane
+    cols, num_up_panels, num_down_panels = decode_mlp_geometry(up_cfgs, down_cfgs)
+    down_cols = down_cfgs.out_size_n // num_down_panels
+    num_quant_blocks = up_dims.size_k // up_cfgs.rhs_cfgs.quant_block_size
+    rhs_dtype = up_cfgs.rhs_cfgs.quant_dtype or up_cfgs.rhs_cfgs.dtype
+    return [
+        # lhs_vmem
+        pltpu.VMEM((slabs, sublane, up_dims.size_k), up_cfgs.lhs_cfgs.dtype),
+        # act_vmem: the gate_up output, the down lhs
+        pltpu.VMEM((num_up_panels, slabs, sublane, cols), up_cfgs.out_dtype),
+        # out_vmem
+        pltpu.VMEM((num_down_panels, slabs, sublane, down_cols), down_cfgs.out_dtype),
+        # weight_slots
+        pltpu.VMEM((2, DECODE_SLOTS, up_dims.size_k, cols), rhs_dtype),
+        # scale_slots
+        pltpu.VMEM((2, DECODE_SLOTS, num_quant_blocks, 1, cols), jnp.float32),
+        # weight_sems, scale_sems
+        pltpu.SemaphoreType.DMA((2, DECODE_SLOTS)),
+        pltpu.SemaphoreType.DMA((2, DECODE_SLOTS)),
+        # io_sems: lhs fetch, then one output writeback per down panel
+        pltpu.SemaphoreType.DMA((1 + num_down_panels,)),
+    ]
+
+
+def decode_mlp_stream_kernel(
+    # Scalar prefetch
+    lhs_group_sizes_ref: jax.Array,  # int32[size_lhs_group]
+    group_offset_ref: jax.Array,  # int32[1]
+    # In
+    lhs_ref: jax.Array,  # [size_m, up size_k]
+    up_ref: WeightsRef,  # [size_group, up size_k, 2 * down size_k]
+    down_ref: WeightsRef,  # [size_group, down size_k, down size_n]
+    # Out
+    out_ref: jax.Array,  # [size_m, down size_n]
+    # Scratch memory
+    metadata_ref: MetadataRef,
+    lhs_vmem: jax.Array,  # [size_m // sublane, sublane, up size_k]
+    act_vmem: jax.Array,  # [num_up_panels, size_m // sublane, sublane, cols]
+    out_vmem: jax.Array,  # [num_down_panels, size_m // sublane, sublane, down_cols]
+    weight_slots: jax.Array,  # [2, DECODE_SLOTS, up size_k, cols]
+    scale_slots: jax.Array,  # [2, DECODE_SLOTS, num_quant_blocks, 1, cols]
+    weight_sems: jax.Array,  # DMA[2, DECODE_SLOTS]
+    scale_sems: jax.Array,  # DMA[2, DECODE_SLOTS]
+    io_sems: jax.Array,  # DMA[1 + num_down_panels]
+    *,
+    up_cfgs: GmmConfigs,
+    down_cfgs: GmmConfigs,
+):
+    """An expert MLP (gate_up GMM, activation, down GMM) as one weight stream.
+
+    `decode_stream_kernel`'s schedule over both projections: per gm tile, the
+    gate_up chunks then the down chunks go through one ring of DECODE_SLOTS
+    buffers, so the down weights are in flight while gate_up multiplies and
+    the next tile's gate_up weights while down multiplies. Each gate_up chunk
+    is multiplied and activated as `decode_stream_kernel` does and rounded
+    to the gate_up output dtype into a VMEM-resident activation, which the
+    tile's down chunks read as their lhs; down chunks are multiplied strip by
+    strip and stored as `decode_stream_kernel` stores them.
+    """
+    up_dims, down_dims = up_cfgs.dims, down_cfgs.dims
+    tiles = up_cfgs.tiles
+    sublane = up_dims.size_lhs_sublane
+    cols, num_up_panels, num_down_panels = decode_mlp_geometry(up_cfgs, down_cfgs)
+    k_parts = up_dims.size_k // down_dims.size_k
+    num_strips = 2 * k_parts
+    down_cols = num_strips * cols
+    down_k = down_dims.size_k
+    down_quant_blocks = down_k // up_cfgs.rhs_cfgs.quant_block_size
+    chunks_per_gm = num_up_panels + num_down_panels
+    m_offsets = metadata_ref.gm_id_to_m_offset
+
+    num_gm = fill_metadata(
+        lhs_group_sizes_ref, group_offset_ref, metadata_ref, cfgs=up_cfgs
+    )
+    num_chunks = num_gm * chunks_per_gm
+    first_slab = m_offsets[0] // sublane
+    num_slabs = pl.cdiv(m_offsets[num_gm], sublane) - first_slab
+
+    lhs_slabs = lhs_ref.reshape(-1, sublane, up_dims.size_k)
+    out_slabs = out_ref.reshape(-1, sublane, out_ref.shape[-1])
+
+    def copy(src, dst, sem):
+        return pltpu.make_async_copy(src, dst, sem)
+
+    def start_chunk(chunk):
+        gm_id, step = chunk // chunks_per_gm, chunk % chunks_per_gm
+        group_id = metadata_ref.gm_id_to_group_id[gm_id]
+        slot = chunk % DECODE_SLOTS
+
+        @pl.when(step < num_up_panels)
+        def _():
+            for half in range(2):
+                col = half * up_cfgs.out_size_n + step * cols
+                copy(
+                    up_ref.weight.at[group_id, :, pl.ds(col, cols)],
+                    weight_slots.at[half, slot],
+                    weight_sems.at[half, slot],
+                ).start()
+                copy(
+                    up_ref.scale.at[group_id, :, :, pl.ds(col, cols)],
+                    scale_slots.at[half, slot],
+                    scale_sems.at[half, slot],
+                ).start()
+
+        @pl.when(step >= num_up_panels)
+        def _():
+            panel = step - num_up_panels
+            for strip in range(num_strips):
+                half, part = divmod(strip, k_parts)
+                col = (panel * num_strips + strip) * cols
+                copy(
+                    down_ref.weight.at[group_id, :, pl.ds(col, cols)],
+                    weight_slots.at[half, slot, pl.ds(part * down_k, down_k)],
+                    weight_sems.at[half, slot],
+                ).start()
+                copy(
+                    down_ref.scale.at[group_id, :, :, pl.ds(col, cols)],
+                    scale_slots.at[
+                        half, slot, pl.ds(part * down_quant_blocks, down_quant_blocks)
+                    ],
+                    scale_sems.at[half, slot],
+                ).start()
+
+    def wait_chunk(chunk):
+        # Either kind of chunk fills each half of its slot, so one wait sized
+        # to the half covers its copies.
+        slot = chunk % DECODE_SLOTS
+        for half in range(2):
+            weights = weight_slots.at[half, slot]
+            copy(weights, weights, weight_sems.at[half, slot]).wait()
+            scales = scale_slots.at[half, slot]
+            copy(scales, scales, scale_sems.at[half, slot]).wait()
+
+    def multiply_chunk(chunk):
+        gm_id, step = chunk // chunks_per_gm, chunk % chunks_per_gm
+        slot = chunk % DECODE_SLOTS
+        m_start = m_offsets[gm_id]
+        m_end = m_offsets[gm_id + 1]
+        m_offset = m_start - m_start % sublane
+
+        def up_bucket(bucket_idx: int):
+            bucket_m, _, bucket_slabs = decode_bucket_rows(
+                m_offset, bucket_idx, cfgs=up_cfgs
+            )
+            tiled_lhs = lhs_vmem[bucket_slabs].reshape(bucket_m, up_dims.size_k)
+            rhs = FusedWeightsRef(
+                *(
+                    WeightsRef(
+                        weight=weight_slots.at[half, slot],
+                        scale=scale_slots.at[half, slot],
+                        bias=None,
+                    )
+                    for half in range(2)
+                )
+            )
+            acc = dequant_matmul(
+                tiled_lhs, rhs, is_last_k_step=True, bucket_m=bucket_m, cfgs=up_cfgs
+            )
+            acc = apply_act_fn(acc, up_cfgs.fuse_act)
+            # Rows outside the tile are never read for it: matmul rows are
+            # independent and the down store masks them.
+            act_tile_ref = act_vmem.at[step, bucket_slabs]
+            act_tile_ref[...] = acc.astype(act_vmem.dtype).reshape(act_tile_ref.shape)
+
+        def down_bucket(bucket_idx: int):
+            bucket_m, row_start, bucket_slabs = decode_bucket_rows(
+                m_offset, bucket_idx, cfgs=down_cfgs
+            )
+            tiled_lhs = jnp.concatenate(
+                [
+                    act_vmem[panel, bucket_slabs].reshape(bucket_m, cols)
+                    for panel in range(num_up_panels)
+                ],
+                axis=1,
+            )
+            strips = []
+            for strip in range(num_strips):
+                half, part = divmod(strip, k_parts)
+                rhs = WeightsRef(
+                    weight=weight_slots.at[half, slot, pl.ds(part * down_k, down_k)],
+                    scale=scale_slots.at[
+                        half, slot, pl.ds(part * down_quant_blocks, down_quant_blocks)
+                    ],
+                    bias=None,
+                )
+                strips.append(
+                    dequant_matmul(
+                        tiled_lhs,
+                        rhs,
+                        is_last_k_step=True,
+                        bucket_m=bucket_m,
+                        cfgs=down_cfgs,
+                    )
+                )
+            store_decode_tile(
+                out_vmem.at[step - num_up_panels, bucket_slabs],
+                jnp.concatenate(strips, axis=1),
+                row_start=row_start,
+                gm_id=gm_id,
+                m_start=m_start,
+                m_end=m_end,
+                sublane=sublane,
+            )
+
+        bucket_idx = (m_end - m_offset) // tiles.bucket_base
+        num_buckets = tiles.tile_m // tiles.bucket_base
+
+        def multiply(bucket_fn):
+            branches = [
+                functools.partial(bucket_fn, bucket_idx=idx)
+                for idx in range(num_buckets)
+            ]
+            lax.switch(bucket_idx, branches)
+
+        lax.cond(
+            step < num_up_panels,
+            functools.partial(multiply, up_bucket),
+            functools.partial(multiply, down_bucket),
+        )
+
+    @pl.when(num_chunks > 0)
+    def _():
+        lhs_copy = copy(
+            lhs_slabs.at[pl.ds(first_slab, num_slabs)],
+            lhs_vmem.at[pl.ds(first_slab, num_slabs)],
+            io_sems.at[0],
+        )
+        lhs_copy.start()
+        start_chunk(0)
+        lhs_copy.wait()
+
+        def start_next(chunk):
+            @pl.when(chunk < num_chunks)
+            def _():
+                start_chunk(chunk)
+
+        def stream_step(chunk, carry):
+            wait_chunk(chunk)
+
+            # As in decode_stream_kernel: chunk 0 streams alone, then
+            # DECODE_SLOTS - 1 chunks stay in flight.
+            @pl.when(chunk == 0)
+            def _():
+                for ahead in range(1, DECODE_SLOTS - 1):
+                    start_next(ahead)
+
+            start_next(chunk + DECODE_SLOTS - 1)
+            multiply_chunk(chunk)
+            return carry
+
+        lax.fori_loop(0, num_chunks, stream_step, 0)
+
+        out_copies = [
+            copy(
+                out_vmem.at[panel, pl.ds(first_slab, num_slabs)],
+                out_slabs.at[
+                    pl.ds(first_slab, num_slabs), :, pl.ds(panel * down_cols, down_cols)
+                ],
+                io_sems.at[1 + panel],
+            )
+            for panel in range(num_down_panels)
+        ]
+        for out_copy in out_copies:
+            out_copy.start()
+        for out_copy in out_copies:
+            out_copy.wait()
+
+
 def calculate_tiling(
     dims: Dimensions,
     lhs_cfgs: InputConfigs,
@@ -1797,3 +2151,237 @@ def gmm_v2(
         cost_estimate=get_cost_estimate(cfgs),
         metadata=get_metadata(cfgs),
     )(group_sizes, group_offset, lhs, rhs_weights)[:size_m, : cfgs.out_size_n]
+
+
+def decode_mlp_configs(
+    lhs: jax.Array,  # [size_m, size_k]
+    up: jax.Array,  # [size_group, size_k, 2 * inter_size]
+    up_scale: jax.Array | None,
+    up_bias: jax.Array | None,
+    down: jax.Array,  # [size_group, inter_size, size_n]
+    down_scale: jax.Array | None,
+    down_bias: jax.Array | None,
+    group_sizes: jax.Array,  # int32[size_lhs_group]
+    *,
+    vmem_limit_bytes: int,
+    preferred_element_type: jnp.dtype | None,
+    maybe_quantize_lhs: bool,
+    fuse_act: str | None,
+    rhs_quant_dtype: jnp.dtype | None,
+) -> tuple[GmmConfigs, GmmConfigs]:
+    """The configs gmm_v2 makes for an expert MLP's gate_up and down calls.
+
+    The gate_up call takes `lhs` with `fuse_act`; the down call takes the
+    gate_up output and returns `preferred_element_type`.
+    """
+    size_m = align_to(lhs.shape[0], _get_lhs_sublane_size(lhs.dtype, lhs.shape[0]))
+    group_offset = jax.ShapeDtypeStruct((1,), jnp.int32)
+    common = dict(
+        tile_info=calculate_tiling,
+        vmem_limit_bytes=vmem_limit_bytes,
+        acc_dtype=None,
+        maybe_quantize_lhs=maybe_quantize_lhs,
+        zero_initialize=False,
+        rhs_quant_dtype=rhs_quant_dtype,
+    )
+    up_cfgs = make_gmm_configs(
+        jax.ShapeDtypeStruct((size_m, lhs.shape[1]), lhs.dtype),
+        up,
+        up_scale,
+        up_bias,
+        group_sizes,
+        group_offset,
+        out_dtype=None,
+        fuse_act=fuse_act,
+        **common,
+    )
+    down_size_k = down.shape[1] * get_packing_factor(down.dtype, rhs_quant_dtype)
+    down_cfgs = make_gmm_configs(
+        jax.ShapeDtypeStruct((size_m, down_size_k), up_cfgs.out_dtype),
+        down,
+        down_scale,
+        down_bias,
+        group_sizes,
+        group_offset,
+        out_dtype=preferred_element_type,
+        fuse_act=None,
+        **common,
+    )
+    return up_cfgs, down_cfgs
+
+
+def gmm_v2_mlp_supported(
+    lhs: jax.Array,
+    up: jax.Array,
+    up_scale: jax.Array | None,
+    up_bias: jax.Array | None,
+    down: jax.Array,
+    down_scale: jax.Array | None,
+    down_bias: jax.Array | None,
+    group_sizes: jax.Array,
+    *,
+    fuse_act: str | None,
+    vmem_limit_bytes: int | None = None,
+    preferred_element_type: jnp.dtype | None = None,
+    maybe_quantize_lhs: bool = True,
+    rhs_quant_dtype: jnp.dtype | None = None,
+) -> bool:
+    """Whether `gmm_v2_mlp` can run the gate_up and down gmm_v2 calls given."""
+    # What `use_decode_mlp_stream` rejects anyway, checked before any TPU query.
+    if (
+        fuse_act is None
+        or up_scale is None
+        or down_scale is None
+        or up_bias is not None
+        or down_bias is not None
+        or lhs.shape[0] > DECODE_MAX_ROWS
+        or jax.dtypes.itemsize_bits(rhs_quant_dtype or up.dtype) != 4
+    ):
+        return False
+    if vmem_limit_bytes is None:
+        vmem_limit_bytes = int(pltpu.get_tpu_info().vmem_capacity_bytes * 0.9)
+    up_cfgs, down_cfgs = decode_mlp_configs(
+        lhs,
+        up,
+        up_scale,
+        up_bias,
+        down,
+        down_scale,
+        down_bias,
+        group_sizes,
+        vmem_limit_bytes=vmem_limit_bytes,
+        preferred_element_type=preferred_element_type,
+        maybe_quantize_lhs=maybe_quantize_lhs,
+        fuse_act=fuse_act,
+        rhs_quant_dtype=rhs_quant_dtype,
+    )
+    return use_decode_mlp_stream(up_cfgs, down_cfgs, vmem_limit_bytes)
+
+
+@jax.jit(
+    static_argnames=[
+        "vmem_limit_bytes",
+        "preferred_element_type",
+        "maybe_quantize_lhs",
+        "fuse_act",
+        "rhs_quant_dtype",
+    ]
+)
+def gmm_v2_mlp(
+    lhs: jax.Array,  # [size_m, size_k]
+    up: jax.Array,  # [size_group, size_k, 2 * inter_size]
+    down: jax.Array,  # [size_group, inter_size, size_n]
+    group_sizes: jax.Array,  # int32[size_lhs_group]
+    up_scale: jax.Array,  # [size_group, num_blocks, 1, 2 * inter_size]
+    down_scale: jax.Array,  # [size_group, num_blocks, 1, size_n]
+    group_offset: jax.Array | None = None,  # int32[1]
+    *,
+    fuse_act: str,
+    vmem_limit_bytes: int | None = None,
+    preferred_element_type: jnp.dtype | None = None,
+    maybe_quantize_lhs: bool = True,
+    rhs_quant_dtype: jnp.dtype | None = None,
+) -> jax.Array:
+    """An expert MLP's two gmm_v2 calls as one decode weight stream.
+
+    Computes, bit for bit,
+    gmm_v2(gmm_v2(lhs, up, fuse_act=fuse_act)[:, :inter_size], down) with
+    zero_initialize=False and the rest of the arguments shared, without the
+    gate_up output leaving VMEM (see `decode_mlp_stream_kernel`). Only for
+    calls `gmm_v2_mlp_supported` accepts. Rows outside the groups processed
+    are left undefined.
+
+    Returns:
+        Output of shape [size_m, size_n].
+    """
+    size_m = lhs.shape[0]
+    size_lhs_sublane = _get_lhs_sublane_size(lhs.dtype, size_m)
+    padded_size_m = align_to(size_m, size_lhs_sublane)
+    if padded_size_m != size_m:
+        lhs = jnp.pad(lhs, ((0, padded_size_m - size_m), (0, 0)))
+
+    if group_offset is None:
+        group_offset = jnp.array([0], dtype=jnp.int32)
+    elif jnp.isscalar(group_offset):
+        group_offset = group_offset[None]
+
+    if vmem_limit_bytes is None:
+        vmem_limit_bytes = int(pltpu.get_tpu_info().vmem_capacity_bytes * 0.9)
+
+    up_cfgs, down_cfgs = decode_mlp_configs(
+        lhs,
+        up,
+        up_scale,
+        None,
+        down,
+        down_scale,
+        None,
+        group_sizes,
+        vmem_limit_bytes=vmem_limit_bytes,
+        preferred_element_type=preferred_element_type,
+        maybe_quantize_lhs=maybe_quantize_lhs,
+        fuse_act=fuse_act,
+        rhs_quant_dtype=rhs_quant_dtype,
+    )
+    if not use_decode_mlp_stream(up_cfgs, down_cfgs, vmem_limit_bytes):
+        raise ValueError(
+            f"gmm_v2_mlp does not support {up_cfgs=} with {down_cfgs=}; "
+            "check gmm_v2_mlp_supported first."
+        )
+
+    max_num_gm = (
+        up_cfgs.dims.size_group + pl.cdiv(padded_size_m, up_cfgs.tiles.tile_m) - 1
+    )
+    scratch_shapes = [
+        MetadataRef(
+            gm_id_to_group_id=pltpu.SMEM((max_num_gm,), jnp.int32),
+            gm_id_to_m_offset=pltpu.SMEM((max_num_gm + 1,), jnp.int32),
+        ),
+        *decode_mlp_scratch_shapes(up_cfgs, down_cfgs),
+    ]
+
+    aligned_n = align_to(down_cfgs.out_size_n, pltpu.get_tpu_info().num_lanes)
+    out_init = jax.ShapeDtypeStruct((padded_size_m, aligned_n), down_cfgs.out_dtype)
+    hbm = pl.BlockSpec(memory_space=pltpu.HBM)
+    weights_spec = WeightsRef(weight=hbm, scale=hbm, bias=None)
+
+    up_cost, down_cost = get_cost_estimate(up_cfgs), get_cost_estimate(down_cfgs)
+    act_bytes = padded_size_m * up_cfgs.out_size_n * up_cfgs.out_dtype.itemsize
+    cost_estimate = pl.CostEstimate(
+        flops=up_cost.flops + down_cost.flops,
+        bytes_accessed=up_cost.bytes_accessed
+        + down_cost.bytes_accessed
+        - 2 * act_bytes,
+        transcendentals=0,
+    )
+    metadata = {
+        **{f"up.{k}": v for k, v in get_metadata(up_cfgs).items()},
+        **{f"down.{k}": v for k, v in get_metadata(down_cfgs).items()},
+    }
+
+    return pl.pallas_call(
+        functools.partial(
+            decode_mlp_stream_kernel, up_cfgs=up_cfgs, down_cfgs=down_cfgs
+        ),
+        out_shape=out_init,
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=2,
+            in_specs=[hbm, weights_spec, weights_spec],
+            out_specs=hbm,
+            scratch_shapes=scratch_shapes,
+        ),
+        compiler_params=pltpu.CompilerParams(
+            vmem_limit_bytes=vmem_limit_bytes,
+            disable_bounds_checks=True,
+        ),
+        name=get_scope_name(up_cfgs).replace("gmm_v2", "gmm_v2_mlp", 1)
+        + f"-down_k_{down_cfgs.dims.size_k}-down_n_{down_cfgs.dims.size_n}",
+        cost_estimate=cost_estimate,
+        metadata=metadata,
+    )(
+        group_sizes,
+        group_offset,
+        lhs,
+        WeightsRef(weight=up, scale=up_scale.astype(jnp.float32), bias=None),
+        WeightsRef(weight=down, scale=down_scale.astype(jnp.float32), bias=None),
+    )[:size_m, : down_cfgs.out_size_n]

@@ -32,6 +32,8 @@ from vllm_torchtpu.kernels.megablox.gmm_v2 import (
     apply_act_fn,
     calculate_tiling,
     gmm_v2,
+    gmm_v2_mlp,
+    gmm_v2_mlp_supported,
     interleave_lane,
     make_gmm_configs,
     situ_and_mul,
@@ -531,6 +533,103 @@ def test_gmm_decode_stream_matches_pipeline(
     actual = gmm_v2(lhs, rhs, group_sizes, zero_initialize=False, **kwargs)
     # Zero initialization keeps the call on kernel_main.
     expected = gmm_v2(lhs, rhs, group_sizes, zero_initialize=True, **kwargs)
+
+    first_row = int(jnp.sum(group_sizes[: group_offset[0]]))
+    np.testing.assert_array_equal(
+        np.asarray(actual[first_row:]).view(np.uint16),
+        np.asarray(expected[first_row:]).view(np.uint16),
+    )
+
+
+@pytest.mark.tpu_test
+@pytest.mark.parametrize("group_offset", [0, 2])
+@pytest.mark.parametrize(
+    "hidden_size, inter_size, chunk_bytes",
+    [(1024, 512, 256 * 1024), (1024, 1024, 512 * 1024)],
+)
+def test_gmm_v2_mlp_matches_two_calls(
+    monkeypatch, request, group_offset, hidden_size, inter_size, chunk_bytes
+):
+    """The fused decode MLP gives the two gmm_v2 calls' output bit for bit."""
+    _require_tpu()
+    monkeypatch.setattr(gmm_v2_module, "DECODE_CHUNK_BYTES", chunk_bytes)
+    # Traces read the patched constant: drop any built before and after.
+    jax.clear_caches()
+    request.addfinalizer(jax.clear_caches)
+
+    block_size = 128
+    # Unaligned groups, a group spanning two m tiles, and empty groups.
+    group_sizes = jnp.array([3, 0, 2, 140, 1, 0, 0, 14], dtype=jnp.int32)
+    batch_size = int(jnp.sum(group_sizes))
+    num_local_groups = group_sizes.size - group_offset
+    w1_key, w2_key, s1_key, s2_key, x_key = jax.random.split(jax.random.key(0), 5)
+
+    lhs = jax.random.normal(x_key, (batch_size, hidden_size), dtype=jnp.bfloat16)
+    fp4_values = jnp.array([0, 0.5, 1, 1.5, 2, 3, 4, 6, -0.5, -1, -3, -6])
+
+    def weights(w_key, s_key, in_size, out_size):
+        rhs = jax.random.choice(
+            w_key, fp4_values, (num_local_groups, in_size, out_size)
+        ).astype(jnp.float4_e2m1fn)
+        rhs_scale = jax.random.uniform(
+            s_key,
+            (num_local_groups, in_size // block_size, 1, out_size),
+            minval=0.01,
+            maxval=0.1,
+        )
+        return rhs, rhs_scale
+
+    w1, w1_scale = weights(w1_key, s1_key, hidden_size, 2 * inter_size)
+    w2, w2_scale = weights(w2_key, s2_key, inter_size, hidden_size)
+    group_offset = jnp.array([group_offset], dtype=jnp.int32)
+    kwargs = dict(maybe_quantize_lhs=False)
+
+    assert gmm_v2_mlp_supported(
+        lhs,
+        w1,
+        w1_scale,
+        None,
+        w2,
+        w2_scale,
+        None,
+        group_sizes,
+        fuse_act="swigluoai",
+        preferred_element_type=jnp.bfloat16,
+        **kwargs,
+    )
+    actual = gmm_v2_mlp(
+        lhs,
+        w1,
+        w2,
+        group_sizes,
+        w1_scale,
+        w2_scale,
+        group_offset,
+        fuse_act="swigluoai",
+        preferred_element_type=jnp.bfloat16,
+        **kwargs,
+    )
+    # Zero initialization keeps both calls on kernel_main.
+    act = gmm_v2(
+        lhs,
+        w1,
+        group_sizes,
+        rhs_scale=w1_scale,
+        group_offset=group_offset,
+        zero_initialize=True,
+        fuse_act="swigluoai",
+        **kwargs,
+    )
+    expected = gmm_v2(
+        act[:, :inter_size],
+        w2,
+        group_sizes,
+        rhs_scale=w2_scale,
+        group_offset=group_offset,
+        zero_initialize=True,
+        preferred_element_type=jnp.bfloat16,
+        **kwargs,
+    )
 
     first_row = int(jnp.sum(group_sizes[: group_offset[0]]))
     np.testing.assert_array_equal(
