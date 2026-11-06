@@ -1,0 +1,115 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# epic/dsv41 only: the DeepSeek-V4.1-Flash DP16 C768 decode benchmark on the two
+# hosts of one v7x 2x2x2 slice, TP1/DP16/EP16, eight DP ranks per host. Each
+# pod runs .buildkite/scripts/run_dsv41_dp16_pod.sh, which runs the benchmark
+# for its host under scripts/dsv41_bench/server_steps/coordinate_multihost.py;
+# the head (index 0) audits both hosts, publishes the GitHub check and uploads
+# the artifacts. Submitted by the dsv41_flash_dp16_c768_decode step in
+# pipeline_dsv41.yml.
+#
+# Slice shaping as mp-multihost-slice.yaml: one Job of two Indexed pods, so GKE
+# places both on one slice.
+#
+# ${WORKLOAD_NAME} and ${IMAGE} are substituted; a literal dollar is $$.
+
+apiVersion: jobset.x-k8s.io/v1alpha2
+kind: JobSet
+metadata:
+  annotations:
+    # The fleet's pod setup - caches, tolerations, retries. See
+    # manifests/README.md.
+    tpu-ci.google.com/defaults: standard
+spec:
+  # <jobset>-slice-0-<index> under a headless service named for the JobSet,
+  # which is what HEAD_HOST is built from.
+  network:
+    enableDNSHostnames: true
+  replicatedJobs:
+    - name: slice
+      replicas: 1
+      template:
+        spec:
+          parallelism: 2
+          completions: 2
+          completionMode: Indexed
+          # The head decides the run: it exits only after the worker has
+          # stopped and sent its logs, or after failing the run. Its success
+          # ends the Job, and Kubernetes then terminates anything left.
+          successPolicy:
+            rules:
+              - succeededIndexes: "0"
+          # Five hours, the single-host serving steps' TPU_MAX_RUNTIME_SECONDS:
+          # a cold DSV4.1 compile, input preparation and the rounds took most
+          # of the VM lane's three hours, and the pods pull the image first.
+          activeDeadlineSeconds: 18000
+          # A recreated pod cannot rejoin a live DP world, and a re-run head
+          # would repeat a three-hour benchmark: fail instead. Disruptions
+          # the fleet's retry rules ignore do not count against this.
+          backoffLimit: 0
+          template:
+            spec:
+              nodeSelector:
+                cloud.google.com/gke-tpu-topology: 2x2x2
+                cloud.google.com/gke-tpu-accelerator: tpu7x
+              containers:
+                - name: workload
+                  image: ${IMAGE}
+                  command: ["/bin/bash", "-lc"]
+                  args:
+                    - >-
+                      exec bash /workspace/vllm-torchtpu/.buildkite/scripts/run_dsv41_dp16_pod.sh
+                      gs://wdhongtw-hf-flat/deepseek-ai/DeepSeek-V4.1-Flash
+                      perf_eval_results/deepseek-v41-flash-dp16-96k-c768-decode
+                  env:
+                    - name: HEAD_HOST
+                      value: ${WORKLOAD_NAME}-slice-0-0.${WORKLOAD_NAME}
+                    - name: TPU_ACCELERATOR_TYPE
+                      value: tpu7x
+                    - name: VLLM_ENGINE_READY_TIMEOUT_S
+                      value: "7200"
+                    # The compiler scratch run.py makes under TMPDIR is tens of
+                    # GB, more than the pod's ephemeral storage.
+                    - name: TMPDIR
+                      value: /dev/shm
+                    - name: RAY_TMPDIR
+                      value: /tmp
+                    # The head uploads everything under it.
+                    - name: ARTIFACTS_DIR
+                      value: perf_eval_results
+                  ports:
+                    # The head's API server and coordinate_multihost.py.
+                    - containerPort: 8000
+                    - containerPort: 18000
+                  # Only the chips: the pod holds every chip on the node, and a
+                  # cpu request here can stop the pool scaling up at all.
+                  resources:
+                    limits:
+                      google.com/tpu: "4"
+                    requests:
+                      google.com/tpu: "4"
+                  volumeMounts:
+                    # The VM recipe's --shm-size=256g, over the fleet's 128Gi
+                    # dshm: TMPDIR (the compiler scratch) is here, and the
+                    # eight DP ranks share their engine IPC through it. Named
+                    # dshm to take the place of the fleet's volume; how the
+                    # defaults merge a volume of the same name is unverified.
+                    - name: dshm
+                      mountPath: /dev/shm
+              volumes:
+                - name: dshm
+                  emptyDir:
+                    medium: Memory
+                    sizeLimit: 256Gi

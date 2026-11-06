@@ -4,7 +4,7 @@
 tests_omni/ holds tests that need the real vllm-omni package, which only the
 ``-omni`` CI image installs. It sits outside tests/ so the general CI lanes,
 which glob ``tests/**`` in the dev image, never collect it; only the Omni lanes
-in .buildkite/pipeline_tests.yml run it.
+in main's .buildkite/pipeline_tests.yml run it (epic/dsv41 has none).
 
 tests/conftest.py does not apply here, so the environment defaults that
 engine-starting tests rely on are repeated below. Keep them in sync with it.

@@ -48,9 +48,9 @@ docs/
 # results into BigQuery.
 !.buildkite/kubernetes/
 !.buildkite/scripts/
-# CPU regressions inspect the decode pipeline and execute its publication hook.
-!.buildkite/pipeline_dsv41.yml
-!.buildkite/hooks/post-command
+# test_bootstrap.py runs bootstrap.py, which reads .buildkite/pipeline_*.yml;
+# the dsv41 CPU regressions inspect pipeline_dsv41.yml.
+!.buildkite/pipeline_*.yml
 .github/
 mkdocs.yml
 .readthedocs.yaml

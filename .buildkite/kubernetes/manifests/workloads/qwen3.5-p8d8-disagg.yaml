@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# The PCP8/DP8 disaggregation correctness test as a Kueue workload.
+# The PCP8 -> TP2xDP4 disaggregation correctness test as a Kueue workload.
 #
 # Two single-host slices, not one two-host slice: each engine is eight devices,
 # which is one whole tpu7x-standard-4t host, and they reach each other over the
@@ -20,10 +20,8 @@
 # benchmark beside it - a role per engine, both 2x2x1 - and not like
 # ray-multihost-slice.yaml, where the pods are the hosts of one slice.
 #
-# Each role addresses the other by pod name and itself by the downward API,
-# which is the whole of the difference from the bare-metal job: there an
-# orchestrator discovers both VMs from GCP metadata and ssh's to the second to
-# start ROLE=decode. The test script is the one the VMs run, unchanged.
+# Each role addresses the other by pod name and itself by the downward API, so
+# the test script needs no orchestration of its own.
 #
 # ${WORKLOAD_NAME} and ${IMAGE} are substituted before submission, so a literal
 # dollar is $$. Every container is named `workload`: the launcher forwards step

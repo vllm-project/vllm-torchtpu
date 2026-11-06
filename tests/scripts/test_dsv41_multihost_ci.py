@@ -5,6 +5,7 @@ import datetime
 import json
 import os
 import signal
+import socket
 import subprocess
 import sys
 from contextlib import suppress
@@ -16,6 +17,7 @@ import yaml
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "scripts/dsv41_bench/server_steps"))
 
+import coordinate_multihost as coordinator  # noqa: E402
 from audit_multihost import audit  # noqa: E402
 from bench_decode import summarize  # noqa: E402
 from test_dsv41_decode_accounting import multihost_records  # noqa: E402
@@ -136,166 +138,296 @@ def test_host_audit_rejects_a_different_decode_recipe(tmp_path, key, value):
         audit(tmp_path)
 
 
-def test_pipeline_moves_only_decode_and_preserves_kernel_coverage():
+def _pipeline_steps():
     pipeline = yaml.safe_load((ROOT / ".buildkite/pipeline_dsv41.yml").read_text())
-    steps = {
+    return {
         step["key"]: step
         for group in pipeline["steps"]
         for step in group.get("steps", [group])
     }
+
+
+_TPU_8 = "tpu7x-standard-4t/2x2x1"
+_TPU_2 = "tpu7x-standard-1t/1x1x1"
+_SHAPES = {
+    "dsv41_layout_parity": _TPU_2,
+    "dsv41_greedy_head": _TPU_2,
+    "dsv41_output_projection": _TPU_2,
+    "dsv41_projection_rope": _TPU_2,
+    "dsv41_swa_parity": _TPU_2,
+    "dsv41_benchmark_scripts_cpu": "cpu",
+    "dsv41_kernel_config_cpu": "cpu",
+    "dsv41_flash_dp8_ep_gsm8k": _TPU_8,
+    "dsv41_decode_kernel_parity": _TPU_8,
+    "dsv41_flash_dp8_c8_cached_extend": _TPU_8,
+    # The manifest names its own hardware.
+    "dsv41_flash_dp16_c768_decode": None,
+}
+
+
+def test_pipeline_runs_every_step_on_the_kube_fleet():
+    text = (ROOT / ".buildkite/pipeline_dsv41.yml").read_text()
+    for gone in ("run_in_docker", "tpu_v7x_", "CPU_ONLY", "CONTAINER_SHM_SIZE"):
+        assert gone not in text, gone
+    assert "/perf_eval_results" not in text
+    steps = _pipeline_steps()
+    assert set(steps) == set(_SHAPES)
+    for key, step in steps.items():
+        assert step["agents"]["queue"] == "kube", key
+        assert step["plugins"] == [{"kubernetes": {"podTemplate": "tpu-launcher"}}]
+        assert step["timeout_in_minutes"] >= 120, key
+        assert "artifact_paths" not in step, key
+        env = step.get("env", {})
+        assert env.get("SHAPE") == _SHAPES[key], key
+        if _SHAPES[key] == "cpu":
+            assert env["JAX_PLATFORMS"] == "cpu"
+        launcher = (
+            ".buildkite/kubernetes/run_multihost.sh"
+            if _SHAPES[key] is None
+            else ".buildkite/kubernetes/run.sh"
+        )
+        assert all(c.startswith(launcher) for c in step["commands"]), key
+
+
+def test_pipeline_keeps_checks_and_order():
+    steps = _pipeline_steps()
+    checks = {
+        key: step["notify"][0]["github_check"]["name"]
+        for key, step in steps.items()
+        if "notify" in step
+    }
+    assert checks == {
+        "dsv41_flash_dp8_ep_gsm8k": "DeepSeek-V4.1 DP8 GSM8K eval",
+        "dsv41_flash_dp16_c768_decode": "DeepSeek-V4.1 DP16 Decode throughput",
+        "dsv41_flash_dp8_c8_cached_extend": "DeepSeek-V4.1 DP8 Prefill throughput",
+    }
     decode = steps["dsv41_flash_dp16_c768_decode"]
-    assert decode["agents"]["queue"] == "tpu_v7x_16_queue"
-    assert decode["env"]["CONTAINER_SHM_SIZE"] == "256g"
-    assert "--backend mp --dsv41-decode" in decode["commands"][0]
     assert decode["depends_on"] == "dsv41_decode_kernel_parity"
-    for key in (
-        "dsv41_flash_dp8_ep_gsm8k",
-        "dsv41_flash_dp8_c8_cached_extend",
-        "dsv41_decode_kernel_parity",
-    ):
-        assert steps[key]["agents"]["queue"] == "tpu_v7x_8_queue"
+    assert decode["commands"] == [
+        ".buildkite/kubernetes/run_multihost.sh --manifest dsv41-dp16-decode.yaml"
+    ]
+    extend = " ".join(steps["dsv41_flash_dp8_c8_cached_extend"]["commands"])
+    # The throughput check is published from the pod, around the benchmark.
+    assert "dsv41_publish_check.sh" in extend
+    assert extend.index("dsv41_publish_check.sh") < extend.index("encoder_extend")
 
 
-@pytest.mark.parametrize(
-    "failure",
-    ["", "head", "worker", "audit", "probe_once", "probe_always", "probe_error"],
-)
-def test_shell_coordinator_propagates_failure_and_stops_both_hosts(tmp_path, failure):
+def _manifest():
+    path = ROOT / ".buildkite/kubernetes/manifests/workloads/dsv41-dp16-decode.yaml"
+    return yaml.safe_load(path.read_text())
+
+
+def test_manifest_is_one_two_host_slice_with_a_large_shm():
+    manifest = _manifest()
+    assert manifest["metadata"]["annotations"]["tpu-ci.google.com/defaults"] == (
+        "standard"
+    )
+    assert manifest["spec"]["network"]["enableDNSHostnames"] is True
+    [job] = manifest["spec"]["replicatedJobs"]
+    spec = job["template"]["spec"]
+    assert (spec["parallelism"], spec["completions"]) == (2, 2)
+    assert spec["completionMode"] == "Indexed"
+    assert spec["successPolicy"]["rules"] == [{"succeededIndexes": "0"}]
+    assert spec["backoffLimit"] == 0
+    pod = spec["template"]["spec"]
+    assert pod["nodeSelector"] == {
+        "cloud.google.com/gke-tpu-topology": "2x2x2",
+        "cloud.google.com/gke-tpu-accelerator": "tpu7x",
+    }
+    [container] = pod["containers"]
+    assert container["resources"]["limits"] == {"google.com/tpu": "4"}
+    assert coordinator.DEFAULT_PORT in [p["containerPort"] for p in container["ports"]]
+    env = {e["name"]: e.get("value") for e in container["env"]}
+    assert env["HEAD_HOST"] == "${WORKLOAD_NAME}-slice-0-0.${WORKLOAD_NAME}"
+    assert env["ARTIFACTS_DIR"] == "perf_eval_results"
+    assert env["TMPDIR"] == "/dev/shm"
+    [mount] = container["volumeMounts"]
+    assert mount["mountPath"] == "/dev/shm"
+    [volume] = [v for v in pod["volumes"] if v["name"] == mount["name"]]
+    assert volume["emptyDir"] == {"medium": "Memory", "sizeLimit": "256Gi"}
+    command = container["args"][0].split()
+    script = command[command.index("exec") + 2]
+    assert script.startswith("/workspace/vllm-torchtpu/")
+    assert (ROOT / script.removeprefix("/workspace/vllm-torchtpu/")).is_file()
+    # Results land under ARTIFACTS_DIR, where the head uploads them.
+    assert command[-1].startswith("perf_eval_results/")
+
+
+@pytest.mark.parametrize("index", ["0", "1", "2"])
+def test_pod_entry_picks_its_role(tmp_path, index):
     binary = tmp_path / "bin"
     binary.mkdir()
-    (tmp_path / "perf_eval_results").mkdir()
-    out = tmp_path / "persist/perf_eval_results/result/benchmark"
-    out.mkdir(parents=True)
-    out.parent.chmod(0o777)
-    (out.parent / "task.log").write_text("head log")
-    peer = tmp_path / "peer/persist/perf_eval_results/result"
-    (peer / "worker/benchmark").mkdir(parents=True)
-    peer.chmod(0o755)
-    (peer / "task.log").write_text("must not overwrite the head log")
-    (peer / "worker/benchmark/server.log").write_text("worker log")
-    # Simulate the remote worker and Docker control plane; no SSH or containers.
-    fake = binary / "fake"
-    fake.write_text("""#!/usr/bin/env python3
-import os, pathlib, subprocess, sys, time
-root = pathlib.Path(os.environ["TEST_ROOT"])
-failure = os.environ["TEST_FAILURE"]
-name = pathlib.Path(sys.argv[0]).name
-command = sys.argv[-1]
-if name == "sleep":
-    time.sleep(0.01)
-elif name == "docker":
-    if sys.argv[1] == "stop":
-        (root / "head-stop").touch()
-    else:
-        (root / "audited").touch()
-        sys.exit(1 if failure == "audit" else 0)
-elif "bash ~/multihost/run_cluster_mp.sh" in command:
-    (root / "worker-command").write_text(command)
-    (root / "worker-start").touch()
-    if failure == "worker":
-        sys.exit(17)
-    while not (root / "worker-stop").exists():
-        time.sleep(0.01)
-    (root / "worker-finished").touch()
-elif "docker exec" in command or "docker stop" in command:
-    (root / "worker-stop").touch()
-elif "test -f" in command:
-    probes = root / "probes"
-    count = int(probes.read_text()) + 1 if probes.exists() else 1
-    probes.write_text(str(count))
-    if failure == "probe_always" or (failure == "probe_once" and count == 1):
-        sys.exit(255)
-    if failure == "probe_error":
-        sys.exit(2)
-    sys.exit(0 if (root / "worker-start").exists() else 1)
-elif "launch-permitted" in command:
-    (root / "worker-launch-permitted").touch()
-elif "tar -C" in command:
-    sys.exit(subprocess.run(
-        ["bash", "-c", command], env={**os.environ, "HOME": str(root / "peer")}
-    ).returncode)
-elif "cat >" in command or "bash -s" in command:
-    sys.stdin.read()
-""")
-    fake.chmod(0o755)
-    for name in ("ssh", "docker", "sleep"):
-        (binary / name).symlink_to(fake)
-    head = tmp_path / "run_cluster_mp.sh"
-    head.write_text("""#!/bin/bash
-out="$TEST_ROOT/persist/perf_eval_results/result/benchmark"
-printf '%s\\n' "$@" > "$TEST_ROOT/head-command"
-if [[ "$TEST_FAILURE" == head ]]; then exit 23; fi
-while [[ ! -f "$TEST_ROOT/worker-start" ]]; do sleep 0.01; done
-touch "${out%/benchmark}/ready-to-launch"
-while [[ ! -f "${out%/benchmark}/launch-permitted" && ! -f "$TEST_ROOT/head-stop" ]]; do
-  sleep 0.01
-done
-if [[ -f "$TEST_ROOT/head-stop" ]]; then exit 1; fi
-test -f "$TEST_ROOT/worker-launch-permitted" || exit 41
-if [[ "$TEST_FAILURE" != worker ]]; then touch "$out/formal-complete"; fi
-while [[ ! -f "$out/shutdown-permitted" && ! -f "$TEST_ROOT/head-stop" ]]; do
-  sleep 0.01
-done
-if [[ -f "$out/shutdown-permitted" ]]; then
-  test -f "$TEST_ROOT/worker-finished" || exit 42
-fi
-""")
-    script = """
-set -euo pipefail
-NUM_HOSTS=2
-WORKER_IPS_ARRAY=(worker)
-CONTAINER_ENV_COMMON=(-e TPU_MULTIHOST_BACKEND=mp)
-CONTAINER_ENV_HEAD=(-e TPU_MULTIHOST_BACKEND=mp)
-SSH_OPTS=(-o BatchMode=yes)
-SSH_USER=ci
-HEAD_INTERNAL_IP=10.0.0.1
-IMAGE_TAG=test-image
-HOST_HF_HOME="$TEST_ROOT/hf"
-PERSIST_ROOT="$TEST_ROOT/persist"
-RUN_CLUSTER_MP="$TEST_ROOT/run_cluster_mp.sh"
-SCRIPT_DIR="$REPO/.buildkite/scripts"
-MULTIHOST_RUN_LOG=perf_eval_results/head.log
-ssh_retry() { ssh "$@"; }
-source "$SCRIPT_DIR/run_dsv41_dp16_multihost.sh"
-status=0
-run_dsv41_dp16_multihost gs://test/model /perf_eval_results/result || status=$?
-exit "$status"
-"""
-    process = subprocess.Popen(
-        ["bash", "-c", script],
-        cwd=tmp_path,
-        env={
-            **os.environ,
-            "PATH": f"{binary}:{os.environ['PATH']}",
-            "REPO": str(ROOT),
-            "TEST_ROOT": str(tmp_path),
-            "TEST_FAILURE": failure,
-            "BUILDKITE_COMMIT": "a" * 40,
-        },
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        start_new_session=True,
+    # Stubs for what a pod has and a Mac does not.
+    (binary / "getent").write_text("#!/bin/sh\necho '10.0.0.1 STREAM head'\n")
+    (binary / "python3").write_text(
+        '#!/bin/sh\nprintf "%s\\n" "$@" >> "$TEST_ROOT/python3-calls"\n'
     )
+    for name in ("getent", "python3"):
+        (binary / name).chmod(0o755)
+    env = {key: value for key, value in os.environ.items() if key != "ARTIFACTS_DIR"}
+    result = subprocess.run(
+        [
+            "bash",
+            str(ROOT / ".buildkite/scripts/run_dsv41_dp16_pod.sh"),
+            "gs://bucket/model",
+            "perf_eval_results/dp16",
+        ],
+        env={
+            **env,
+            "PATH": f"{binary}:{os.environ['PATH']}",
+            "TEST_ROOT": str(tmp_path),
+            "HEAD_HOST": "head.example",
+            "JOB_COMPLETION_INDEX": index,
+        },
+        capture_output=True,
+        text=True,
+    )
+    if index == "2":
+        assert result.returncode == 2
+        return
+    assert result.returncode == 0, result.stdout + result.stderr
+    calls = (tmp_path / "python3-calls").read_text().splitlines()
+    assert calls[0].endswith("coordinate_multihost.py")
+    start = calls.index("--") + 1
+    bench = calls[start : start + 5]
+    assert bench[0] == "bash" and bench[1].endswith("run_dsv41_benchmark.sh")
+    assert bench[2:] == ["decode_dp16", "gs://bucket/model", "perf_eval_results/dp16"]
+    if index == "0":
+        assert calls[1:4] == ["head", "--results", "perf_eval_results/dp16"]
+        # The head publishes the check after its coordinator returns.
+        assert calls[-5].endswith("dsv41_check_summary.py")
+        assert calls[-4:-2] == ["perf_eval_results/dp16/benchmark", "0"]
+    else:
+        assert calls[1:6] == [
+            "worker",
+            "--results",
+            "perf_eval_results/dp16",
+            "--head",
+            "10.0.0.1",
+        ]
+        assert not any(c.endswith("dsv41_check_summary.py") for c in calls)
+
+
+# Stands in for run_dsv41_benchmark.sh decode_dp16 on either host: the same
+# handshake files, and run.py's SIGTERM-as-orderly-stop on the worker.
+_FAKE_BENCH = r"""
+import os, pathlib, signal, subprocess, sys, time
+role, results, failure = sys.argv[1], pathlib.Path(sys.argv[2]), sys.argv[3]
+if role == "worker":
+    results = results / "worker"
+out = results / "benchmark"
+out.mkdir(parents=True)
+(out / "server.log").write_text(role + " log")
+(out / "bench.pid").write_text(str(os.getpid()))
+if role == "head" and failure == "head":
+    sys.exit(3)
+(results / "ready-to-launch").touch()
+while not (results / "launch-permitted").exists():
+    time.sleep(0.02)
+(out / "launched").touch()
+if role == "head":
+    (out / "formal-complete").touch()
+    while not (out / "shutdown-permitted").exists():
+        time.sleep(0.02)
+    sys.exit(0)
+if failure == "worker":
+    sys.exit(17)
+stopped = []
+signal.signal(signal.SIGTERM, lambda *_: stopped.append(1))
+pid = os.getpid()
+if failure == "stuck":
+    # The launcher stops on SIGTERM but its benchmark wrapper never exits.
+    pid = subprocess.Popen(["sleep", "600"]).pid
+(out / "launcher.pid").write_text(str(pid))
+while not stopped:
+    time.sleep(0.02)
+(out / "shutdown_requested").touch()
+"""
+
+
+def _free_port():
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
+
+
+@pytest.mark.parametrize("failure", ["", "head", "worker", "stuck", "audit", "lost"])
+def test_coordinator_fails_closed_and_collects_the_worker(tmp_path, failure):
+    results = tmp_path / "results"
+    bench = tmp_path / "bench.py"
+    bench.write_text(_FAKE_BENCH)
+    audit_stub = tmp_path / "audit.py"
+    audit_stub.write_text(
+        "import pathlib, sys\n"
+        "pathlib.Path(sys.argv[1], 'audited').touch()\n"
+        f"sys.exit({1 if failure == 'audit' else 0})\n"
+    )
+    port = str(_free_port())
+    script = str(ROOT / "scripts/dsv41_bench/server_steps/coordinate_multihost.py")
+    common = ["--results", str(results), "--port", port, "--poll", "0.05"]
+    head = subprocess.Popen(
+        [sys.executable, script, "head", *common, "--bind", "127.0.0.1",
+         "--worker-stop-timeout", "6", "--collect-timeout", "10",
+         "--worker-lost-after", "2", "--audit", str(audit_stub),
+         "--", sys.executable, str(bench), "head", str(results), failure],
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+        start_new_session=True,
+    )  # fmt: skip
+    worker = subprocess.Popen(
+        [sys.executable, script, "worker", *common, "--head", "127.0.0.1",
+         "--stop-timeout", "2", "--head-lost-after", "3",
+         "--connect-timeout", "10",
+         "--", sys.executable, str(bench), "worker", str(results), failure],
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+        start_new_session=True,
+    )  # fmt: skip
     try:
-        stdout, stderr = process.communicate(timeout=20)
+        if failure == "lost":
+            # The worker pod vanishes mid-run, without a word to the head.
+            launched = results / "worker/benchmark/launched"
+            deadline = 100
+            while not launched.exists() and deadline:
+                deadline -= 1
+                with suppress(subprocess.TimeoutExpired):
+                    worker.wait(timeout=0.1)
+            os.killpg(worker.pid, signal.SIGKILL)
+            # A pod's death takes its benchmark with it; here the benchmark
+            # has a session of its own and would keep the worker's stdout open.
+            pid = int((results / "worker/benchmark/bench.pid").read_text())
+            with suppress(ProcessLookupError, PermissionError):
+                os.killpg(pid, signal.SIGKILL)
+        head_out, _ = head.communicate(timeout=40)
+        worker_out, _ = worker.communicate(timeout=40)
     finally:
-        with suppress(ProcessLookupError):
-            os.killpg(process.pid, signal.SIGKILL)
-        process.wait()
-    assert (process.returncode == 0) == (failure in ("", "probe_once")), stdout + stderr
-    assert (tmp_path / "audited").exists() == (failure in ("", "probe_once", "audit"))
-    assert (out.parent / "task.log").read_text() == "head log"
-    assert out.parent.stat().st_mode & 0o777 == 0o777
-    assert (out.parent / "worker/benchmark/server.log").read_text() == "worker log"
-    if failure in ("probe_once", "probe_always", "probe_error"):
-        assert (
-            int((tmp_path / "probes").read_text())
-            == {"probe_once": 2, "probe_always": 5, "probe_error": 1}[failure]
-        )
-    if failure != "worker":
-        assert (tmp_path / "worker-finished").exists()
-    for path in ("head-command", "worker-command"):
-        command = (tmp_path / path).read_text()
-        assert "--shm-size=256g" in command
-        assert "DSV41_HEAD_ADDRESS=10.0.0.1" in command
+        for process in (head, worker):
+            with suppress(ProcessLookupError, PermissionError):
+                os.killpg(process.pid, signal.SIGKILL)
+            process.wait()
+    log = head_out + (worker_out or "")
+    assert (head.returncode == 0) == (failure == ""), log
+    if failure != "lost":
+        # The worker never fails the Job; the head owns the verdict.
+        assert worker.returncode == 0, log
+        assert (results / "worker/benchmark/server.log").read_text() == "worker log"
+    assert (results / "audited").exists() == (failure in ("", "audit")), log
+    if failure in ("", "audit"):
+        assert (results / "worker/benchmark/shutdown_requested").exists()
+        assert (results / "benchmark/shutdown-permitted").exists()
+    else:
+        assert not (results / "benchmark/shutdown-permitted").exists()
+    if failure == "head":
+        # Neither host was allowed to start serving.
+        assert not (results / "worker/benchmark/launched").exists()
+
+
+def test_head_rejects_a_second_worker_after_launch(tmp_path):
+    state = coordinator.HeadState(tmp_path)
+    state.check_worker("a")
+    state.check_worker("b")
+    # Before launch a recreated worker just replaces the first and re-registers.
+    assert state.worker_id == "b" and not state.abort
+    state.launch = True
+    state.check_worker("b")
+    assert not state.abort
+    state.check_worker("c")
+    assert state.abort and "second worker" in (state.error or "")

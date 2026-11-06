@@ -34,39 +34,18 @@ fi
 : "${HEAD_HOST:?HEAD_HOST must name index 0 of the slice}"
 : "${NUM_HOSTS:?NUM_HOSTS must be set}"
 INDEX="${JOB_COMPLETION_INDEX:-0}"
-REPO_DIR="${REPO_DIR:-/workspace/vllm-torchtpu}"
-cd "$REPO_DIR" || { echo "$0: no such directory: $REPO_DIR" >&2; exit 2; }
 
-# Where the benchmark scripts write. The pod is deleted when the run ends, so
-# the head uploads this before exiting.
-# Everything under ARTIFACTS_DIR is uploaded by the head pod before it exits.
-# The step names it; unset means this run keeps nothing.
-[ -n "${ARTIFACTS_DIR:-}" ] && mkdir -p "$ARTIFACTS_DIR"
-
-# Core dumps are gigabytes each and fill the node's ephemeral storage.
-ulimit -c 0
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=.buildkite/kubernetes/multihost_lib.sh
+# shellcheck disable=SC1091
+source "${HERE}/multihost_lib.sh"
+pod_setup
 
 export RAY_EXPERIMENTAL_NOSET_TPU_VISIBLE_CHIPS=1
 export TPU_MULTIHOST_BACKEND=ray
 export JAX_PLATFORMS=""
-# Ray addresses the chips; in a pod the metadata server would describe the node
-# rather than the workload.
-export TPU_SKIP_MDS_QUERY=1
 
 RAY_PORT=6379
-
-# Is something listening on the head's Ray port? A worker asks this both before
-# it has joined anything and after the head has gone, so `ray status` cannot
-# answer it.
-#
-# Bounded, because the probe has to be able to fail and /dev/tcp has no deadline
-# of its own. A completed pod stays a ready endpoint of the headless service, so
-# this keeps resolving after the head exits - to an address that no longer
-# answers and drops rather than refuses. An unbounded connect hangs there, the
-# miss is never counted, and the worker waits out the deadline holding chips.
-head_listening() {
-  timeout 5 bash -c "exec 3<>/dev/tcp/${HEAD_HOST}/${RAY_PORT}" 2>/dev/null
-}
 
 # How many Ray nodes the head can see, or 0 if it could not ask.
 #
@@ -105,21 +84,12 @@ report_last_error() {
   rm -f "$err"
 }
 
-publish_results() {
-  [ -n "${ARTIFACTS_DIR:-}" ] || return 0
-  [ -n "$(ls -A "$ARTIFACTS_DIR" 2>/dev/null)" ] || return 0
-  # Not `|| true`: these artifacts are this lane's only output, so a lost upload
-  # has to fail the step.
-  if ! buildkite-agent artifact upload "$ARTIFACTS_DIR/**/*"; then
-    echo "ERROR: artifacts were produced but could not be uploaded"
-    return 1
-  fi
-}
-
 run_worker() {
   # `ray start --address` fails outright against a head that has not come up.
+  # A port probe rather than `ray status`, which cannot answer before this
+  # worker has joined anything, nor after the head has gone.
   local deadline=$((SECONDS + 1800))
-  until head_listening; do
+  until head_listening "$HEAD_HOST" "$RAY_PORT"; do
     if [ "$SECONDS" -ge "$deadline" ]; then
       echo "ERROR: no Ray head at ${HEAD_HOST}:${RAY_PORT} after 30 minutes"
       return 1
@@ -132,17 +102,7 @@ run_worker() {
   # can never complete.
   ray start --address="${HEAD_HOST}:${RAY_PORT}" || return 1
   echo "worker ${INDEX} joined ${HEAD_HOST}; waiting for the head to finish"
-  # Three consecutive refusals, not one: a DNS blip on the headless service
-  # looks identical to a closed port from here, and leaving is irreversible.
-  local misses=0
-  while [ "$misses" -lt 3 ]; do
-    if head_listening; then
-      misses=0
-    else
-      misses=$((misses + 1))
-    fi
-    sleep 15
-  done
+  wait_for_head_to_go "$HEAD_HOST" "$RAY_PORT"
   echo "worker ${INDEX}: head is gone; exiting"
   ray stop --force >/dev/null 2>&1 || true
 }

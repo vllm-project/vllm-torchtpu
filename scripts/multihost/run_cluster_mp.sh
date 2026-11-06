@@ -10,8 +10,7 @@
 # cross-host rendezvous directly between those processes. This script is
 # the shared "run this command in a TPU-privileged container" primitive
 # used by both the head (foreground `vllm serve`) and each worker
-# (foreground `vllm serve --headless ...`) in
-# .buildkite/scripts/run_multihost.sh (--backend mp).
+# (foreground `vllm serve --headless ...`).
 #
 # Usage:
 #   run_cluster_mp.sh <docker_image> <path_to_huggingface_cache> \
@@ -45,7 +44,7 @@ trap cleanup EXIT
 # --network host: allows the head/worker vllm serve processes to reach each
 # other directly via host networking (data-parallel-address/rpc-port).
 # --shm-size=128G: shared memory; the torch_tpu compile cache lives in
-# /dev/shm/torch_tpu_cache (see run_multihost.sh for the DP>=4 rationale).
+# /dev/shm/torch_tpu_cache.
 # -v HF_HOME: mounts the HuggingFace cache (tokenizer/config only here;
 # weights stream from GCS via runai_streamer).
 docker run \

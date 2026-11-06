@@ -282,8 +282,10 @@ no performance or accuracy claim is made for those modes.
 
 ## Default decode CI: DP16, C768, eight physical chips
 
-The default decode job uses `tpu_v7x_16_queue`: two v7x hosts, each with four
-physical chips/eight logical devices (2x2x2 chip topology). TP1/DP16/EP16/PP1
+The default decode job runs on the Kueue fleet as a two-pod JobSet,
+`.buildkite/kubernetes/manifests/workloads/dsv41-dp16-decode.yaml`: two v7x
+hosts of one slice, each with four physical chips/eight logical devices
+(2x2x2 chip topology). TP1/DP16/EP16/PP1
 keeps 48 requests per DP rank and raises global concurrency from 384 to 768.
 Each request uses a 98304-token cached prefix and 512 output tokens, with
 DSpark K5. Local target/draft shapes remain 288/240 rows and the target
@@ -303,17 +305,24 @@ FP4 expert transfers and `libibverbs1` in the shared CI image (#2758).
 The worker audit requires an EP16 mesh, the push parameters above and dynamic
 EPLB enabled. Both host manifests record these settings and the tpu-sync
 version, and the multihost audit rejects a host with EPLB disabled.
-Each container gets 256 GiB of `/dev/shm`. This decode job clears the CI image's
-tcmalloc preload and enables `TPU_RECLAIM_COMPILE_MEMORY=1` with glibc.
-GSM8K and cached-extend retain their DP8 recipes and allocator settings.
+Each pod gets a 256 GiB in-memory `/dev/shm`, which also holds `TMPDIR`. This
+decode job clears the CI image's tcmalloc preload and enables
+`TPU_RECLAIM_COMPILE_MEMORY=1` with glibc. GSM8K and cached-extend retain
+their DP8 recipes and allocator settings.
 
-`run_multihost.sh --backend mp --dsv41-decode` starts both containers and
-waits for image/model/input preparation before releasing MP rendezvous. After
-one warmup and one formal round, it stops the worker before the DP master and
-collects both hosts' logs. Worker exits, failed SSH sessions, missing logs or
-compiler events during either host's formal window fail the job. The existing
-single-host decode kernel checks run in a separate prerequisite on the
-8-device queue.
+Each pod runs `.buildkite/scripts/run_dsv41_dp16_pod.sh`, which starts
+`run_dsv41_benchmark.sh decode_dp16` for its host under
+`coordinate_multihost.py`. The head pod (index 0) serves a small HTTP control
+endpoint on port 18000; the worker polls it. Neither host starts serving until
+both have finished image/model/input preparation, so preparation does not
+consume the MP rendezvous timeout. After one warmup and one formal round, the
+head asks the worker to stop; the worker stops its launcher before the DP
+master and posts its `worker/` logs to the head as a tar, and only then does the
+head shut down. The head then audits both hosts, publishes the GitHub check and
+uploads the artifacts. An early worker exit, a silent or replaced peer, missing
+logs or compiler events during either host's formal window fail the job and
+stop both hosts. The existing single-host decode kernel checks run in a
+separate prerequisite step on one 8-device host.
 
 The audit requires all 16 ranks and verifies both hosts' source/runtime/model
 identities. Cadence is calculated within each host's monotonic clock, taking

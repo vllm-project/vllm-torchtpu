@@ -12,218 +12,251 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# The only lane on epic/dsv41 (see ALL_LANES in scripts/bootstrap.sh). The
-# branch targets DeepSeek-V4.1-Flash alone, so the other models' suites are
-# not run here.
+# The only lane on epic/dsv41 (see _TPU in scripts/bootstrap.py). The branch
+# targets DeepSeek-V4.1-Flash alone, so the other models' suites are not run
+# here. Every step runs on the Kueue fleet, as main's lanes do: run.sh for one
+# pod, run_multihost.sh for the two-host DP16 decode.
+#
+# Only what common.sh's FORWARD list names (and BUILDKITE_*) reaches a pod.
+# SHAPE and TPU_MAX_RUNTIME_SECONDS are read by the launcher on the agent; any
+# other setting goes inside the command or into a script.
+
+# Every step writes its results under this directory, relative to the
+# checkout in the pod, and the pod uploads whatever it finds there under the
+# same relative names the VM lane's `perf_eval_results/**/*` artifacts had.
+env:
+  ARTIFACTS_DIR: "perf_eval_results"
+
+x-kube-plugin: &kube_plugin
+  kubernetes:
+    podTemplate: tpu-launcher
+
+# Covers queueing as well as running, so it cannot be set from how long the
+# work takes: the launcher's limits stop a workload before this does.
+x-tpu-step-defaults: &tpu_step
+  depends_on: "build_docker"
+  timeout_in_minutes: 1440
+  agents:
+    queue: "kube"
+
+x-cpu-step-defaults: &cpu_step
+  depends_on: "build_docker"
+  timeout_in_minutes: 120
+  agents:
+    queue: "kube"
+
+# Eight TensorCores, which is four v7x chips on one host, and one chip (two
+# TensorCores): the two single-host shapes the VM lane's queues offered.
+x-shape-8-core: &shape_8_core "tpu7x-standard-4t/2x2x1"
+x-shape-2-core: &shape_2_core "tpu7x-standard-1t/1x1x1"
+
+# The serving benchmarks' workload deadline, over the fleet's three-hour
+# default and under the step budget: a cold DSV4.1 compile, the input
+# preparation and the formal rounds took most of the VM lane's 180 minutes,
+# and a pod also pulls the image first.
+x-serving-runtime: &serving_runtime "18000"
 
 steps:
-  - label: "DeepSeek-V4.1 layout: aux mean and packed scale parity"
-    key: "dsv41_layout_parity"
-    depends_on: "build_docker"
-    timeout_in_minutes: 30
-    agents:
-      queue: "tpu_v7x_2_queue"
-    commands:
-      - >-
-        bash .buildkite/scripts/run_in_docker.sh
-        python -m pytest
-        tests/models/vllm/test_dsv41_common_mhc.py
-        tests/models/vllm/test_dsv41_common_v1_v2_engram.py
-        -k 'test_aux_mean_preserves_tpu_reduction_order or test_ready_rows_packed_scales_match_tpu_and_cpu'
-        -q --junitxml=/perf_eval_results/dsv41-layout-parity.xml
-    artifact_paths:
-      - "perf_eval_results/**/*"
+  # Grouped as main's lanes are; `bk pipeline validate` also rejects a
+  # plugins list on an ungrouped step.
+  - group: "DeepSeek-V4.1 parity on TPU"
+    steps:
+      - label: "DeepSeek-V4.1 layout: aux mean and packed scale parity"
+        key: "dsv41_layout_parity"
+        <<: *tpu_step
+        env:
+          SHAPE: *shape_2_core
+        plugins:
+          - *kube_plugin
+        commands:
+          - >-
+            .buildkite/kubernetes/run.sh python -m pytest
+            tests/models/vllm/test_dsv41_common_mhc.py
+            tests/models/vllm/test_dsv41_common_v1_v2_engram.py
+            -k 'test_aux_mean_preserves_tpu_reduction_order or test_ready_rows_packed_scales_match_tpu_and_cpu'
+            -q --junitxml=perf_eval_results/dsv41-layout-parity.xml
 
-  - label: "DeepSeek-V4.1 greedy head: CPU reference and rejection parity"
-    key: "dsv41_greedy_head"
-    depends_on: "build_docker"
-    timeout_in_minutes: 30
-    agents:
-      queue: "tpu_v7x_2_queue"
-    commands:
-      - >-
-        bash .buildkite/scripts/run_in_docker.sh
-        python -m pytest
-        tests/kernels/test_fused_greedy_head.py
-        tests/spec_decode/test_rejection_sampler.py
-        --use-tpu -q --junitxml=/perf_eval_results/dsv41-greedy-head.xml
-    artifact_paths:
-      - "perf_eval_results/**/*"
+      - label: "DeepSeek-V4.1 greedy head: CPU reference and rejection parity"
+        key: "dsv41_greedy_head"
+        <<: *tpu_step
+        env:
+          SHAPE: *shape_2_core
+        plugins:
+          - *kube_plugin
+        commands:
+          - >-
+            .buildkite/kubernetes/run.sh python -m pytest
+            tests/kernels/test_fused_greedy_head.py
+            tests/spec_decode/test_rejection_sampler.py
+            --use-tpu -q --junitxml=perf_eval_results/dsv41-greedy-head.xml
 
-  - label: "DeepSeek-V4.1 output projection: dispatch, parity and export"
-    key: "dsv41_output_projection"
-    depends_on: "build_docker"
-    timeout_in_minutes: 30
-    agents:
-      queue: "tpu_v7x_2_queue"
-    commands:
-      - >-
-        bash .buildkite/scripts/run_in_docker.sh
-        bash -euc '
-        python -m pytest tests/models/vllm/test_dsv41_output_projection.py
-        -q --junitxml=/perf_eval_results/dsv41-output-projection.xml;
-        export LIBTPU_INIT_ARGS="--xla_tpu_dvfs_p_state=7 --xla_enable_custom_call_region_trace=false";
-        python scripts/dsv41_bench/bench_output_projection.py --tokens 240
-        --output /perf_eval_results/output-projection-240;
-        python scripts/dsv41_bench/bench_output_projection.py --tokens 288
-        --output /perf_eval_results/output-projection-288'
-    artifact_paths:
-      - "perf_eval_results/**/*"
+      - label: "DeepSeek-V4.1 output projection: dispatch, parity and export"
+        key: "dsv41_output_projection"
+        <<: *tpu_step
+        env:
+          SHAPE: *shape_2_core
+        plugins:
+          - *kube_plugin
+        commands:
+          - >-
+            .buildkite/kubernetes/run.sh bash -euc '
+            python -m pytest tests/models/vllm/test_dsv41_output_projection.py
+            -q --junitxml=perf_eval_results/dsv41-output-projection.xml;
+            export LIBTPU_INIT_ARGS="--xla_tpu_dvfs_p_state=7 --xla_enable_custom_call_region_trace=false";
+            python scripts/dsv41_bench/bench_output_projection.py --tokens 240
+            --output perf_eval_results/output-projection-240;
+            python scripts/dsv41_bench/bench_output_projection.py --tokens 288
+            --output perf_eval_results/output-projection-288'
 
-  - label: "DeepSeek-V4.1 projection/RoPE: dispatch, parity and export"
-    key: "dsv41_projection_rope"
-    depends_on: "build_docker"
-    timeout_in_minutes: 30
-    agents:
-      queue: "tpu_v7x_2_queue"
-    commands:
-      - >-
-        bash .buildkite/scripts/run_in_docker.sh
-        python -m pytest tests/models/vllm/test_dsv41_projection_rope.py
-        -q --junitxml=/perf_eval_results/dsv41-projection-rope.xml
-    artifact_paths:
-      - "perf_eval_results/**/*"
+      - label: "DeepSeek-V4.1 projection/RoPE: dispatch, parity and export"
+        key: "dsv41_projection_rope"
+        <<: *tpu_step
+        env:
+          SHAPE: *shape_2_core
+        plugins:
+          - *kube_plugin
+        commands:
+          - >-
+            .buildkite/kubernetes/run.sh python -m pytest
+            tests/models/vllm/test_dsv41_projection_rope.py
+            -q --junitxml=perf_eval_results/dsv41-projection-rope.xml
 
-  - label: "DeepSeek-V4.1 SWA: shared windows and guard fallback"
-    key: "dsv41_swa_parity"
-    depends_on: "build_docker"
-    timeout_in_minutes: 30
-    agents:
-      queue: "tpu_v7x_2_queue"
-    commands:
-      - >-
-        bash .buildkite/scripts/run_in_docker.sh
-        python -m pytest tests/models/vllm/test_dsv41_v2_attention_addressing.py
-        -k 'test_pure_swa_pallas_preserves_cache_addressing or test_swa_query_group_bridge_keeps_token_count_dynamic'
-        -q --junitxml=/perf_eval_results/dsv41-swa-parity.xml
-      - >-
-        bash .buildkite/scripts/run_in_docker.sh
-        env JAX_PLATFORMS=cpu python -m pytest
-        tests/models/vllm/test_dsv41_v2_attention.py
-        -k test_dsv41_attention_init_buffers_and_flags_bfloat16
-        -q --junitxml=/perf_eval_results/dsv41-swa-config.xml
-    artifact_paths:
-      - "perf_eval_results/**/*"
+      # One pod for both checks: the CPU-only config test needs the image, not
+      # another chip from the queue.
+      - label: "DeepSeek-V4.1 SWA: shared windows and guard fallback"
+        key: "dsv41_swa_parity"
+        <<: *tpu_step
+        env:
+          SHAPE: *shape_2_core
+        plugins:
+          - *kube_plugin
+        commands:
+          - >-
+            .buildkite/kubernetes/run.sh bash -euc '
+            python -m pytest tests/models/vllm/test_dsv41_v2_attention_addressing.py
+            -k "test_pure_swa_pallas_preserves_cache_addressing or test_swa_query_group_bridge_keeps_token_count_dynamic"
+            -q --junitxml=perf_eval_results/dsv41-swa-parity.xml;
+            env JAX_PLATFORMS=cpu python -m pytest
+            tests/models/vllm/test_dsv41_v2_attention.py
+            -k test_dsv41_attention_init_buffers_and_flags_bfloat16
+            -q --junitxml=perf_eval_results/dsv41-swa-config.xml'
 
-  - label: "DeepSeek-V4.1 benchmark scripts: CPU regression tests"
-    key: "dsv41_benchmark_scripts_cpu"
-    depends_on: "build_docker"
-    timeout_in_minutes: 10
-    agents:
-      queue: "cpu_64_core"
-    env:
-      CPU_ONLY: "1"
-    commands:
-      - >-
-        bash .buildkite/scripts/run_in_docker.sh
-        python -m pytest --confcutdir=tests/scripts
-        tests/scripts/test_dsv41_server_session.py
-        tests/scripts/test_dsv41_check_summary.py
-        tests/scripts/test_dsv41_decode_worker_capture.py
-        tests/scripts/test_dsv41_decode_accounting.py
-        tests/scripts/test_dsv41_serve_recipe.py
-        tests/scripts/test_dsv41_multihost_ci.py
-        -q --junitxml=/perf_eval_results/dsv41-benchmark-cpu.xml
-    artifact_paths:
-      - "perf_eval_results/**/*"
+  - group: "DeepSeek-V4.1 CPU checks"
+    steps:
+      - label: "DeepSeek-V4.1 benchmark scripts: CPU regression tests"
+        key: "dsv41_benchmark_scripts_cpu"
+        <<: *cpu_step
+        env:
+          SHAPE: "cpu"
+          # Without it JAX looks for a TPU.
+          JAX_PLATFORMS: "cpu"
+        plugins:
+          - *kube_plugin
+        commands:
+          - >-
+            .buildkite/kubernetes/run.sh python -m pytest --confcutdir=tests/scripts
+            tests/scripts/test_dsv41_server_session.py
+            tests/scripts/test_dsv41_check_summary.py
+            tests/scripts/test_dsv41_decode_worker_capture.py
+            tests/scripts/test_dsv41_decode_accounting.py
+            tests/scripts/test_dsv41_serve_recipe.py
+            tests/scripts/test_dsv41_multihost_ci.py
+            -q --junitxml=perf_eval_results/dsv41-benchmark-cpu.xml
 
-  - label: "DeepSeek-V4.1 index configuration: CPU contracts"
-    key: "dsv41_kernel_config_cpu"
-    depends_on: "build_docker"
-    timeout_in_minutes: 15
-    agents:
-      queue: "cpu_64_core"
-    env:
-      CPU_ONLY: "1"
-    commands:
-      - >-
-        bash .buildkite/scripts/run_in_docker.sh
-        python -m pytest
-        tests/models/vllm/test_dsv41_config.py
-        tests/models/vllm/test_dsv41_v2_model_full.py
-        tests/models/vllm/test_dsv41_v2_model_sp.py
-        tests/models/vllm/test_dsv41_v2_local_q.py
-        tests/models/vllm/test_dsv41_v2_prefix_replay.py
-        tests/layers/adapter/test_fused_moe_ep.py
-        tests/kernels/test_dsv41_decode_tuning.py
-        tests/kernels/test_decode_preparation.py
-        tests/kernels/test_decode_bridge.py
-        tests/kernels/test_dsv41_decode_index_scores.py
-        tests/models/vllm/test_dsv41_decode_indexer_route.py
-        tests/models/vllm/test_csa2_chunk_cache.py
-        tests/models/vllm/test_native_swa_manager.py
-        tests/compilation/test_moe_schedule.py
-        tests/kernels/deepseek_v41/test_csa2_prefill.py
-        -q --junitxml=/perf_eval_results/dsv41-kernel-config.xml
-    artifact_paths:
-      - "perf_eval_results/**/*"
+      - label: "DeepSeek-V4.1 index configuration: CPU contracts"
+        key: "dsv41_kernel_config_cpu"
+        <<: *cpu_step
+        env:
+          SHAPE: "cpu"
+          JAX_PLATFORMS: "cpu"
+        plugins:
+          - *kube_plugin
+        commands:
+          - >-
+            .buildkite/kubernetes/run.sh python -m pytest
+            tests/models/vllm/test_dsv41_config.py
+            tests/models/vllm/test_dsv41_v2_model_full.py
+            tests/models/vllm/test_dsv41_v2_model_sp.py
+            tests/models/vllm/test_dsv41_v2_local_q.py
+            tests/models/vllm/test_dsv41_v2_prefix_replay.py
+            tests/layers/adapter/test_fused_moe_ep.py
+            tests/kernels/test_dsv41_decode_tuning.py
+            tests/kernels/test_decode_preparation.py
+            tests/kernels/test_decode_bridge.py
+            tests/kernels/test_dsv41_decode_index_scores.py
+            tests/models/vllm/test_dsv41_decode_indexer_route.py
+            tests/models/vllm/test_csa2_chunk_cache.py
+            tests/models/vllm/test_native_swa_manager.py
+            tests/compilation/test_moe_schedule.py
+            tests/kernels/deepseek_v41/test_csa2_prefill.py
+            -q --junitxml=perf_eval_results/dsv41-kernel-config.xml
 
   - group: "DeepSeek-V4.1-Flash on TPU"
     depends_on: "build_docker"
     steps:
+      # The server pulls config, tokenizer and custom code from MODEL_URI
+      # itself, so this step needs no local copy of the checkpoint.
       - label: "DeepSeek-V4.1-Flash: DP8 C384 DSpark + full GSM8K"
         key: "dsv41_flash_dp8_ep_gsm8k"
+        <<: *tpu_step
         notify:
           - github_check:
               name: "DeepSeek-V4.1 DP8 GSM8K eval"
-        timeout_in_minutes: 180
-        agents:
-          queue: "tpu_v7x_8_queue"
         env:
-          CONTAINER_SHM_SIZE: "256g"
+          SHAPE: *shape_8_core
           TPU_ACCELERATOR_TYPE: "tpu7x"
           VLLM_ENGINE_READY_TIMEOUT_S: "7200"
+          TPU_MAX_RUNTIME_SECONDS: *serving_runtime
+          # See common.sh: a DSV4 compile outgrows the pod's ephemeral
+          # storage.
+          TMPDIR: "/dev/shm"
+          RAY_TMPDIR: "/tmp"
+        plugins:
+          - *kube_plugin
         commands:
           - >-
-            bash .buildkite/scripts/run_in_docker.sh
+            .buildkite/kubernetes/run.sh
             env MODEL_URI=gs://wdhongtw-hf-flat/deepseek-ai/DeepSeek-V4.1-Flash
             bash ./scripts/vllm/benchmarking/run_eval_flow.sh
             --config deepseek-v41-flash-dp8-ep
             --run-lm-eval --lm-eval-limit none --skip-perf-check
-            --results-dir /perf_eval_results/deepseek-v41-flash-dp8-ep
-        artifact_paths:
-          - "perf_eval_results/**/*"
+            --results-dir perf_eval_results/deepseek-v41-flash-dp8-ep
 
       - label: "DeepSeek-V4.1 decode kernels: TPU parity"
         key: "dsv41_decode_kernel_parity"
-        timeout_in_minutes: 30
-        agents:
-          queue: "tpu_v7x_8_queue"
+        <<: *tpu_step
+        env:
+          SHAPE: *shape_8_core
+        plugins:
+          - *kube_plugin
         commands:
           - >-
-            bash .buildkite/scripts/run_in_docker.sh
+            .buildkite/kubernetes/run.sh
             bash .buildkite/scripts/run_dsv41_decode_kernel_checks.sh
-            /perf_eval_results/dsv41-decode-kernels
-        artifact_paths:
-          - "perf_eval_results/**/*"
+            perf_eval_results/dsv41-decode-kernels
 
+      # Two hosts of one 2x2x2 slice, eight devices/four chips each, with push
+      # and dynamic EPLB. The manifest names the hardware and carries the
+      # per-pod command, the 256Gi /dev/shm and the environment; the head pod
+      # audits both hosts, publishes the check and uploads the artifacts.
       - label: "DeepSeek-V4.1-Flash: DP16 C768 steady DSpark decode (8 chips, EPLB)"
         key: "dsv41_flash_dp16_c768_decode"
+        <<: *tpu_step
         depends_on: "dsv41_decode_kernel_parity"
-        # Two hosts, eight devices/four chips each, with push and dynamic EPLB.
         notify:
           - github_check:
               name: "DeepSeek-V4.1 DP16 Decode throughput"
               output:
                 title: "DP16 C768 DSpark decode (8 chips, EPLB, L1 Engram HBM)"
                 summary: "No valid throughput result has been published yet."
-        timeout_in_minutes: 180
-        agents:
-          queue: "tpu_v7x_16_queue"
-        env:
-          CONTAINER_SHM_SIZE: "256g"
-          TPU_ACCELERATOR_TYPE: "tpu7x"
-          VLLM_ENGINE_READY_TIMEOUT_S: "7200"
+        plugins:
+          - *kube_plugin
         commands:
-          - >-
-            bash .buildkite/scripts/run_multihost.sh --backend mp --dsv41-decode
-            gs://wdhongtw-hf-flat/deepseek-ai/DeepSeek-V4.1-Flash
-            /perf_eval_results/deepseek-v41-flash-dp16-96k-c768-decode
-        artifact_paths:
-          - "perf_eval_results/**/*"
+          - .buildkite/kubernetes/run_multihost.sh --manifest dsv41-dp16-decode.yaml
 
       - label: "DeepSeek-V4.1-Flash: DP8 C8 cached 96K + 16K extend"
         key: "dsv41_flash_dp8_c8_cached_extend"
+        <<: *tpu_step
         # Exercise halfplane Index-K in the TP1/DP8 benchmark path.
         notify:
           - github_check:
@@ -231,19 +264,23 @@ steps:
               output:
                 title: "DP8 C8 cached 96K + 16K extend"
                 summary: "No valid throughput result has been published yet."
-        timeout_in_minutes: 180
-        agents:
-          queue: "tpu_v7x_8_queue"
         env:
-          CONTAINER_SHM_SIZE: "256g"
+          SHAPE: *shape_8_core
           TPU_ACCELERATOR_TYPE: "tpu7x"
           VLLM_ENGINE_READY_TIMEOUT_S: "7200"
+          TPU_MAX_RUNTIME_SECONDS: *serving_runtime
+          TMPDIR: "/dev/shm"
+          RAY_TMPDIR: "/tmp"
+        plugins:
+          - *kube_plugin
         commands:
+          # dsv41_publish_check.sh updates the GitHub check from inside the
+          # pod, after the benchmark and before the pod uploads its artifacts.
           - >-
-            bash .buildkite/scripts/run_in_docker.sh
+            .buildkite/kubernetes/run.sh
+            bash .buildkite/scripts/dsv41_publish_check.sh
+            perf_eval_results/deepseek-v41-flash-dp8-96k-c8-cached-extend/benchmark
             bash .buildkite/scripts/run_dsv41_benchmark.sh
             encoder_extend
             gs://wdhongtw-hf-flat/deepseek-ai/DeepSeek-V4.1-Flash
-            /perf_eval_results/deepseek-v41-flash-dp8-96k-c8-cached-extend
-        artifact_paths:
-          - "perf_eval_results/**/*"
+            perf_eval_results/deepseek-v41-flash-dp8-96k-c8-cached-extend
