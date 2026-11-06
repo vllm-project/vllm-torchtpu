@@ -29,6 +29,7 @@ from vllm.v1.request import Request
 from vllm_torchtpu.models.vllm.deepseek_v41.v2.swa_cache import (
     DeepseekV41SWAManager,
     DeepseekV41SWASpec,
+    merge_swa_groups,
     num_physical_blocks,
     register_swa_specs,
     swa_pool_bytes,
@@ -427,4 +428,128 @@ def test_upstream_grouping_preserves_private_pool_contract():
     assert all(
         g.kv_cache_spec.pool_capacity == spec(lookahead=5).pool_capacity
         for g in swa_groups
+    )
+
+
+def _planned(num_swa):
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(max_model_len=32768, original_max_model_len=32768),
+        parallel_config=SimpleNamespace(
+            tensor_parallel_size=1, decode_context_parallel_size=1
+        ),
+        scheduler_config=SimpleNamespace(disable_hybrid_kv_cache_manager=False),
+        attention_config=SimpleNamespace(hisparse_config=None),
+        speculative_config=None,
+        cache_config=SimpleNamespace(
+            num_gpu_blocks_override=None,
+            prefix_cache_retention_interval=None,
+            get_resolved_kv_cache_layout=lambda: KVCacheLayout.LBHNC,
+        ),
+        max_in_flight_tokens=512,
+        num_prefill_lookahead_tokens=0,
+    )
+    specs = {
+        "main": MLAAttentionSpec(
+            block_size=32,
+            num_kv_heads=1,
+            head_size=512,
+            dtype=torch.uint8,
+            tokens_per_state=2,
+        ),
+        **{f"swa.{i}": spec(lookahead=5) for i in range(num_swa)},
+    }
+    reservation = swa_pool_bytes(specs)
+    return get_kv_cache_configs(config, [specs], [(256 << 20) - reservation])[0]
+
+
+def test_merge_folds_swa_layers_and_keeps_the_shared_layout():
+    planned = _planned(5)
+    assert len(planned.kv_cache_groups) > 2
+    merged = merge_swa_groups(planned)
+    swa_groups = [
+        g
+        for g in merged.kv_cache_groups
+        if isinstance(g.kv_cache_spec, DeepseekV41SWASpec)
+    ]
+    assert len(swa_groups) == 1
+    assert swa_groups[0].layer_names == [f"swa.{i}" for i in range(5)]
+    assert swa_groups[0].kv_cache_spec == spec(lookahead=5)
+    assert merged.num_blocks == planned.num_blocks
+    assert merged.kv_cache_tensors == planned.kv_cache_tensors
+    others = [
+        g
+        for g in planned.kv_cache_groups
+        if not isinstance(g.kv_cache_spec, DeepseekV41SWASpec)
+    ]
+    assert [g for g in merged.kv_cache_groups if g not in swa_groups] == others
+    # Every layer is still in exactly one group.
+    names = [n for g in merged.kv_cache_groups for n in g.layer_names]
+    assert sorted(names) == sorted(
+        n for g in planned.kv_cache_groups for n in g.layer_names
+    )
+
+
+def test_merge_keeps_draft_and_mismatched_swa_groups_apart():
+    other = replace(spec(), sliding_window=256)
+    config = KVCacheConfig(
+        num_blocks=64,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(["swa.0"], spec()),
+            KVCacheGroupSpec(["swa.1"], spec()),
+            KVCacheGroupSpec(["swa.2"], other),
+            KVCacheGroupSpec(["draft.0"], spec(), is_eagle_group=True),
+        ],
+    )
+    merged = merge_swa_groups(config)
+    assert [(g.layer_names, g.is_eagle_group) for g in merged.kv_cache_groups] == [
+        (["swa.0", "swa.1"], False),
+        (["swa.2"], False),
+        (["draft.0"], True),
+    ]
+    # Already merged configs are returned unchanged.
+    assert merge_swa_groups(merged) is merged
+
+
+def test_merged_manager_issues_the_ids_of_every_per_layer_manager():
+    """One shared table must equal what each per-layer manager would issue."""
+    swa_spec = spec(sequences=4, in_flight=1024, lookahead=5)
+    split = manager(swa_spec, groups=3)
+    merged_config = merge_swa_groups(split.kv_cache_config)
+    assert len(merged_config.kv_cache_groups) == 2
+    merged = KVCacheManager(
+        merged_config,
+        max_model_len=1 << 20,
+        scheduler_block_size=swa_spec.block_size,
+        hash_block_size=swa_spec.block_size,
+        max_in_flight_tokens=swa_spec.max_in_flight_tokens,
+        enable_caching=False,
+    )
+    pairs = [
+        (request(f"r{i}", tokens=600), request(f"r{i}", tokens=600)) for i in range(3)
+    ]
+    # Prefill chunks, then decode steps of K+1 that cross block boundaries and
+    # slide the window, then free one request mid-way.
+    schedule = [256, 256, 88] + [6] * 40
+    for step, count in enumerate(schedule):
+        for i, (a, b) in enumerate(pairs):
+            if a is None:
+                continue
+            for cache, req in ((split, a), (merged, b)):
+                assert cache.allocate_slots(req, count, num_lookahead_tokens=5)
+                req.num_computed_tokens += count
+            split_ids = split.get_block_ids(a.request_id)
+            merged_ids = merged.get_block_ids(b.request_id)
+            assert split_ids[0] == merged_ids[0]
+            for swa_ids in split_ids[1:]:
+                assert swa_ids == merged_ids[1]
+        if step == 20:
+            a, b = pairs[1]
+            split.free(a)
+            merged.free(b)
+            pairs[1] = (None, None)
+    (swa,) = swa_managers(merged)
+    assert all(
+        m.block_pool.get_num_free_blocks() == swa.block_pool.get_num_free_blocks()
+        for m in swa_managers(split)
     )
