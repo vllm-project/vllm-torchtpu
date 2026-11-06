@@ -45,6 +45,21 @@ except ImportError:  # loaded by path (tests, the landing microbench): no packag
     pd_route = _ilu.module_from_spec(_spec)
     _spec.loader.exec_module(pd_route)
 
+try:
+    from . import pd_shared_compressed
+except ImportError:  # loaded by path: no package
+    import importlib.util as _ilu
+    import pathlib as _pl
+    import sys as _sys
+
+    _spec = _ilu.spec_from_file_location(
+        "qwen4_exp_pd_shared_compressed",
+        _pl.Path(__file__).with_name("pd_shared_compressed.py"),
+    )
+    pd_shared_compressed = _ilu.module_from_spec(_spec)
+    _sys.modules[_spec.name] = pd_shared_compressed  # its dataclasses look it up
+    _spec.loader.exec_module(pd_shared_compressed)
+
 ROW_SUBLANES = 4
 ROW_LANES = 256
 
@@ -635,6 +650,159 @@ def make_repack(
     return fn
 
 
+def make_shared_scatter(write=None):
+    """``fn(pool, gathered, src, dst)`` (QWEN4_EXP_PD_SHARED_COMPRESSED): write
+    rows ``src`` of the landing gather's buffer (``[G * Q, stage_rows, 1, 4,
+    256]`` of the pool dtype) to flat pool rows ``dst``, in place. No rank
+    enters it as a constant: every rank runs the same program."""
+    import jax
+    import jax.numpy as jnp
+
+    if write is None:
+        import functools
+
+        from vllm_torchtpu.kernels.qwen4_exp.pooled_qsa import (
+            _write_main_cache_universal,
+        )
+
+        write = functools.partial(
+            _write_main_cache_universal, tile=REPACK_TILE, overlap_edges=True
+        )
+
+    def fn(pool: jax.Array, gathered: jax.Array, src: jax.Array, dst: jax.Array) -> jax.Array:
+        rows = gathered.reshape(-1, *pool.shape[2:])
+        if rows.dtype != pool.dtype:
+            rows = jax.lax.bitcast_convert_type(rows, pool.dtype)
+        values = rows[src]
+        flat = dst.astype(jnp.int32)
+        valid = jnp.ones(flat.shape, jnp.bool_)
+        tail = -len(flat) % REPACK_TILE  # the writer takes whole tiles
+        values = jnp.pad(values, ((0, tail),) + ((0, 0),) * (values.ndim - 1))
+        flat = jnp.pad(flat, (0, tail))
+        valid = jnp.pad(valid, (0, tail))
+        return write(pool, values, flat // pool.shape[1], flat, valid)
+
+    return fn
+
+
+@dataclasses.dataclass
+class RepackPlan:
+    """One load's landing, planned before any device work: the shared
+    compressed-key gather passes (``pd_shared_compressed.GatherPass``), then
+    the repack chunks (``repack_chunks``)."""
+
+    passes: list
+    chunks: list
+
+
+class SharedLanding:
+    """The landing gather's device side (QWEN4_EXP_PD_SHARED_COMPRESSED, TPU).
+
+    Per pass: ``pack`` copies this rank's compact staging pages into the send
+    buffer and the send buffer is all-gathered over the TP device group, in
+    one compiled program per bucket (``GroupCoordinator.all_gather``, i.e.
+    ``all_gather_into_tensor`` on the device group, the call the compiled
+    forward makes; ``tpu_runner._tpu_pin_drafts_to_rank0``: eager collectives
+    wedge the cores); then a donated scatter writes the gathered rows into the
+    pool (``make_shared_scatter``). Every buffer is allocated here, before any
+    collective (3eeddf339: a rank blocked on an allocation inside the
+    collective hangs its group). ``selftest`` compiles every bucket and
+    checks the gather on rank-tagged data; it is collective.
+    """
+
+    def __init__(self, staging: torch.Tensor, pool: torch.Tensor, group, geo):
+        self.staging, self.pool, self.group, self.geo = staging, pool, group, geo
+        q = pd_shared_compressed.GATHER_PAGE_BUCKETS[-1]
+        page = tuple(staging.shape[1:])
+        self.send = torch.empty((q,) + page, dtype=staging.dtype, device=staging.device)
+        self.gathered = torch.empty(
+            (geo.group * q,) + page, dtype=staging.dtype, device=staging.device
+        )
+        self._gathers: dict[int, object] = {}
+        self._scatter = None
+
+    @property
+    def buffer_bytes(self) -> int:
+        return (self.send.numel() + self.gathered.numel()) * self.send.element_size()
+
+    def _gather_fn(self, bucket: int):
+        fn = self._gathers.get(bucket)
+        if fn is None:
+            group = self.group
+
+            @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+            def gather(staging, pack, send, gathered):
+                send.copy_(staging[pack])
+                rows = group.all_gather(send.view(torch.int8), dim=0)
+                gathered.copy_(rows.view(gathered.dtype))
+                return pack[0]
+
+            fn = self._gathers[bucket] = gather
+        return fn
+
+    def _scatter_fn(self):
+        if self._scatter is None:
+            from torch_tpu._internal import pallas
+
+            fn = make_shared_scatter()
+
+            def scatter_fn(pool, gathered, src, dst):
+                return fn(pool, gathered, src, dst), src[0]
+
+            op = pallas.jax_op("pallas::qwen4_pd_shared_scatter", scatter_fn, donate_argnums=(0,))
+            op.register_fake(
+                lambda pool, gathered, src, dst: (
+                    torch.empty_like(pool),
+                    torch.empty((), dtype=src.dtype, device=src.device),
+                )
+            )
+
+            @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+            def run(pool, gathered, src, dst):
+                new_pool, marker = op(pool, gathered, src, dst)
+                pool.copy_(new_pool)
+                return marker
+
+            self._scatter = run
+        return self._scatter
+
+    def run(self, passes) -> None:
+        device = self.pool.device
+        g = self.geo.group
+
+        def dev(values):
+            return torch.from_numpy(np.ascontiguousarray(values, dtype=np.int32)).to(device)
+
+        for p in passes:
+            send, gathered = self.send[: p.bucket], self.gathered[: g * p.bucket]
+            self._gather_fn(p.bucket)(self.staging, dev(p.pack), send, gathered)
+            self._scatter_fn()(self.pool, gathered, dev(p.scatter_src), dev(p.scatter_dst))
+
+    def selftest(self, rank: int) -> list[int]:
+        """Compile the gather and the scatter of every bucket and check the
+        gather's bytes; returns the failing buckets. Writes ``rank + 1`` into
+        staging page 0 (the null page) and restores it; each scatter rewrites
+        pool row 0 (the null page's, which nothing reads)."""
+        g, device = self.geo.group, self.pool.device
+        failures = []
+        null_page = self.staging[0].clone()
+        try:
+            self.staging[0].view(torch.uint8).fill_(rank + 1)
+            for bucket in pd_shared_compressed.GATHER_PAGE_BUCKETS:
+                pack = torch.zeros(bucket, dtype=torch.int32, device=device)
+                gathered = self.gathered[: g * bucket]
+                self._gather_fn(bucket)(self.staging, pack, self.send[:bucket], gathered)
+                seen = gathered.view(torch.uint8)[:, 0].reshape(g * bucket, -1)[:, 0].cpu()
+                want = torch.arange(1, g + 1, dtype=torch.uint8).repeat_interleave(bucket)
+                if not torch.equal(seen, want):
+                    failures.append(bucket)
+                rows = torch.zeros(g * bucket * self.geo.page_rows, dtype=torch.int32, device=device)
+                self._scatter_fn()(self.pool, gathered, rows, rows)
+        finally:
+            self.staging[0].copy_(null_page)
+        return failures
+
+
 # ---------------------------------------------------------------------------
 # The consumer: staging carrier, allocator, manifest and the repack call
 # ---------------------------------------------------------------------------
@@ -764,6 +932,21 @@ class StagedConsumer:
         self.reservations: dict[int, dict[str, list[int]]] = {}
         # uuid -> (decode-local prefix tokens, first staged source page per group)
         self.skips: dict[int, tuple[int, list[int]]] = {}
+        # uuid -> tokens of the load (QWEN4_EXP_PD_SHARED_COMPRESSED decides
+        # per load whether its compressed keys are shared).
+        self.tokens: dict[int, int] = {}
+        # QWEN4_EXP_PD_SHARED_COMPRESSED (pd_shared_compressed): compressed
+        # pairs land on one rank each and are all-gathered at landing; the
+        # device side (SharedLanding) is built by enable_shared.
+        self.shared = None
+        self.landing = None
+        if pd_shared_compressed.enabled():
+            if self.route is None:
+                raise ValueError(
+                    "QWEN4_EXP_PD_SHARED_COMPRESSED lands into routed compact staging: "
+                    "set QWEN4_EXP_PD_ROUTED_DST"
+                )
+            self.shared = pd_shared_compressed.geometry_for(self.route)
         from .pd_manifest import compressed_live_bytes, page_regions, pool_tag
 
         # The producer sends a compressed-key page's keys only; the carrier
@@ -883,21 +1066,24 @@ class StagedConsumer:
     # --- allocation (identical on every rank of the engine) ---
 
     def _owner_counts(self, num_tokens: int, skip_tokens: int):
-        from .pd import skipped_source_pages
-
         if self.route is not None:
             # Compact pages per owner, identical on every rank (one destination
             # page list per tag serves the whole engine).
             owners = [pool.layer_name for pool in self.manifest.pools]
             src_pages = [g.page_count(num_tokens) for g in self.src_groups]
+            shared = self._shared_load(num_tokens)
             counts = [
-                pd_route.staging_pages(
+                self.shared.staged_pages(num_tokens, skip_tokens)
+                if shared and owner_kind(name) == "compressed"
+                else pd_route.staging_pages(
                     owner_kind(name), num_tokens, src_pages[self._src_owner[name]],
                     skip_tokens, self.route,
                 )
                 for name in owners
             ]
             return [0] * len(self.src_groups), owners, counts
+        from .pd import skipped_source_pages
+
         first = [skipped_source_pages(g, skip_tokens) for g in self.src_groups]
         group_counts = [
             g.page_count(num_tokens) - f for g, f in zip(self.src_groups, first)
@@ -959,6 +1145,7 @@ class StagedConsumer:
                 reduced_free[owner_pages] = 0
         self.reservations[uuid] = pages
         self.skips[uuid] = (skip_tokens, first)
+        self.tokens[uuid] = int(num_tokens)
         return True
 
     def destination(self, uuid: int) -> tuple[list[str], list[int], list[int]]:
@@ -986,9 +1173,16 @@ class StagedConsumer:
         the source pages a prefix-aware load leaves out of each pool."""
         skip, first = self.skips.get(uuid, (0, [0] * len(self.src_groups)))
         if self.route is not None:
+            shared = self._shared_load(self.tokens.get(uuid, 0))
+
+            def rows(kind):
+                if shared and kind == "compressed":
+                    # Whole pages, the same pairs' share on every rank.
+                    return self.shared.clip_pages(skip) * self.shared.page_rows
+                return pd_route.skip_rows(kind, skip, self.route)
+
             return [
-                pd_route.skip_rows(owner_kind(pool.layer_name), skip, self.route)
-                * pd_route.ROW_BYTES
+                rows(owner_kind(pool.layer_name)) * pd_route.ROW_BYTES
                 for pool in self.manifest.pools
             ]
         # The clip is in the destination's live bytes: a merged key pool's
@@ -1001,6 +1195,7 @@ class StagedConsumer:
 
     def release(self, uuid: int) -> dict[str, list[int]] | None:
         self.skips.pop(uuid, None)
+        getattr(self, "tokens", {}).pop(uuid, None)
         pages = self.reservations.pop(uuid, None)
         if pages is not None:
             for owner_pages in pages.values():
@@ -1090,7 +1285,10 @@ class StagedConsumer:
         g, rank = self.route, self.rank
         main_s, main_d, copy_s, copy_d = [], [], [], []
         gdn_s, gdn_d = [], []
-        for name, (gi, offset) in self._dst_compressed.items():
+        # A shared load's compressed keys are written by the landing gather
+        # (shared_passes), not by the repack.
+        compressed = {} if self._shared_load(num_tokens) else self._dst_compressed
+        for name, (gi, offset) in compressed.items():
             copy_s.append(pd_route.compressed_src_rows(num_tokens, skip_tokens, src_pages[name], g))
             copy_d.append(compressed_dst_np(
                 num_tokens, self.ratio, dst_tables[gi], self.dst_block, skip_tokens, offset
@@ -1124,17 +1322,72 @@ class StagedConsumer:
             np.asarray(gdn_d, dtype=np.int64),
         )
 
-    def repack(self, uuid: int, dst_tables, num_tokens: int) -> None:
+    def _shared_load(self, num_tokens: int) -> bool:
+        """Whether this load's compressed keys go once per host."""
+        shared = getattr(self, "shared", None)
+        return shared is not None and shared.shared(num_tokens)
+
+    def shared_passes(self, src_pages, dst_tables, num_tokens, skip_tokens=0):
+        """The landing gather's passes of a shared load (else none): the same
+        on every rank, since staging pages and decode tables are."""
+        if not self._shared_load(num_tokens):
+            return []
+        tags = [
+            pd_shared_compressed.SharedTag(
+                tuple(int(x) for x in src_pages[name]),
+                tuple(int(x) for x in dst_tables[gi]),
+                offset,
+            )
+            for name, (gi, offset) in self._dst_compressed.items()
+        ]
+        return pd_shared_compressed.gather_passes(
+            num_tokens, tags, self.dst_block, self.shared, skip_tokens=skip_tokens
+        )
+
+    def enable_shared(self, group, rank: int, selftest: bool = True) -> None:
+        """Build the landing gather's buffers and compiled programs (TPU), and
+        self-test the all-gather of every bucket. Collective: every rank of
+        the TP group calls it at the same point of its startup."""
+        if self.shared is None:
+            return
+        self.landing = SharedLanding(self.staging, self.pool, group, self.shared)
+        if selftest:
+            failures = self.landing.selftest(rank)
+            if failures:
+                raise RuntimeError(
+                    f"QWEN4_EXP_PD_SHARED_COMPRESSED self-test: the TP all-gather "
+                    f"returned wrong bytes for buckets {failures}"
+                )
+
+    def plan_repack(self, uuid: int, dst_tables, num_tokens: int) -> RepackPlan:
+        """Every index of one load's landing, in numpy, before any device work
+        (and before any collective)."""
         pages = self.reservations[uuid]
         skip, first = self.skips.get(uuid, (0, None))
-        main_s, main_d, copy_s, copy_d, gdn_s, gdn_d = self.indices(
-            pages, dst_tables, num_tokens, skip, first
+        idx = self.indices(pages, dst_tables, num_tokens, skip, first)
+        passes = (
+            self.shared_passes(pages, dst_tables, num_tokens, skip)
+            if getattr(self, "route", None) is not None
+            else []
         )
+        return RepackPlan(passes=passes, chunks=list(repack_chunks(*idx)))
+
+    def run_repack(self, plan: RepackPlan) -> None:
+        if plan.passes:
+            if getattr(self, "landing", None) is None:
+                raise RuntimeError("a shared load landed before enable_shared")
+            self.landing.run(plan.passes)
+        self._run_chunks(plan.chunks)
+
+    def repack(self, uuid: int, dst_tables, num_tokens: int) -> None:
+        self.run_repack(self.plan_repack(uuid, dst_tables, num_tokens))
+
+    def _run_chunks(self, chunks) -> None:
         device = self.pool.device
 
         if self._op is None:
             self._op = self._build_op()
-        for chunk in repack_chunks(main_s, main_d, copy_s, copy_d, gdn_s, gdn_d):
+        for chunk in chunks:
             args = [
                 torch.from_numpy(np.ascontiguousarray(v, dtype=np.int32)).to(device)
                 for v in chunk

@@ -93,8 +93,6 @@ class SharedGeometry:
         if self.src_rows < self.page_rows:
             # The filler of a last page's tail reads one producer page.
             raise ValueError("a producer page must hold at least one staging page")
-        if self.page_rows % TILE:
-            raise ValueError(f"a staging page must hold whole {TILE}-row runs")
 
     @property
     def pair_tokens(self) -> int:
@@ -104,6 +102,11 @@ class SharedGeometry:
     def src_rows(self) -> int:
         """Live pair rows of one producer page (400)."""
         return self.src_block // self.pair_tokens
+
+    @property
+    def tile(self) -> int:
+        """Scatter segments are padded to this many rows (a DMA tile)."""
+        return min(TILE, self.page_rows)
 
     @property
     def clip_tokens(self) -> int:
@@ -153,7 +156,23 @@ class SharedGeometry:
         return self.group * min(k, own - 1) + unit
 
 
-def producer_runs(num_tokens: int, geo: SharedGeometry) -> np.ndarray:
+def enabled() -> bool:
+    from vllm_torchtpu import envs
+
+    return bool(envs.QWEN4_EXP_PD_SHARED_COMPRESSED)
+
+
+def geometry_for(route) -> SharedGeometry:
+    """The shared geometry of a routed decode (``pd_route.RouteGeometry``):
+    the group is its TP, pages are its compact staging pages."""
+    return SharedGeometry(
+        group=route.tp, ratio=route.ratio, src_block=route.src_block, page_rows=route.stage_rows
+    )
+
+
+def producer_runs(
+    num_tokens: int, geo: SharedGeometry, num_src_pages: int | None = None
+) -> np.ndarray:
     """One compressed tag's producer runs, ``[n, 5]`` int64 rows of
     ``(unit, dst_row, src_page_ordinal, src_row, rows)``.
 
@@ -170,6 +189,10 @@ def producer_runs(num_tokens: int, geo: SharedGeometry) -> np.ndarray:
     if not geo.shared(num_tokens):
         raise ValueError("a load with fewer pages than ranks stays broadcast")
     n_src = -(-num_tokens // geo.src_block)
+    if num_src_pages is not None and num_src_pages != n_src:
+        raise ValueError(
+            f"a {num_tokens}-token load has {n_src} producer pages, not {num_src_pages}"
+        )
     avail = n_src * geo.src_rows
     pr, sr = geo.page_rows, geo.src_rows
     out = []
@@ -187,6 +210,33 @@ def producer_runs(num_tokens: int, geo: SharedGeometry) -> np.ndarray:
                 out.append((unit, dst + q - lo, page, row, rows))
                 q += rows
     return np.asarray(out, dtype=np.int64).reshape(-1, 5)
+
+
+def shared_spans(num_tokens: int, num_src_pages: int, geo: SharedGeometry, row_bytes: int):
+    """``producer_runs`` as ``pd_route`` spans: (src page ordinal, src byte
+    offset, dst byte offset, bytes, dst unit). A run never leaves its
+    producer page, so ``pd_route.subpage_spans`` keeps each in its slot."""
+    return [
+        (int(page), int(row) * row_bytes, int(dst) * row_bytes, int(rows) * row_bytes, int(unit))
+        for unit, dst, page, row, rows in producer_runs(num_tokens, geo, num_src_pages)
+    ]
+
+
+def agree_named_loads(present, cpu_group=None) -> list[bool]:
+    """Which named loads every rank of the TP group holds (MIN over ranks).
+
+    Run before the first landing collective of a step: a load some rank
+    lacks (its staged pages were already released) must be dropped on every
+    rank, or the ranks that hold it would wait in an all-gather the other
+    never enters. One CPU all-reduce of a few int32 (gloo ``cpu_group``)."""
+    import torch
+
+    have = torch.tensor([1 if p else 0 for p in present], dtype=torch.int32)
+    if cpu_group is not None and len(have):
+        import torch.distributed as dist
+
+        dist.all_reduce(have, op=dist.ReduceOp.MIN, group=cpu_group)
+    return [bool(x) for x in have.tolist()]
 
 
 def gather_bucket(pages: int) -> int:
@@ -230,8 +280,8 @@ def pair_dst(pairs: np.ndarray, dst_pages, dst_block: int, ratio: int, dst_offse
     return dp[t // dst_block] * dst_block + dst_offset + (t % dst_block) // (2 * ratio)
 
 
-def _align(rows: np.ndarray) -> np.ndarray:
-    pad = -len(rows) % TILE
+def _align(rows: np.ndarray, tile: int = TILE) -> np.ndarray:
+    pad = -len(rows) % tile
     return rows if not pad else np.concatenate((rows, np.full(pad, rows[-1], rows.dtype)))
 
 
@@ -288,8 +338,10 @@ def gather_passes(
                 if not len(q):
                     continue
                 tag = tags[t]
-                src.append(_align((unit * bucket + slot) * pr + q - b * pr))
-                dst.append(_align(pair_dst(q, tag.dst_pages, dst_block, geo.ratio, tag.dst_offset)))
+                src.append(_align((unit * bucket + slot) * pr + q - b * pr, geo.tile))
+                dst.append(_align(
+                    pair_dst(q, tag.dst_pages, dst_block, geo.ratio, tag.dst_offset), geo.tile
+                ))
         length = g * bucket * pr
         if src:
             src_rows, dst_rows = np.concatenate(src), np.concatenate(dst)

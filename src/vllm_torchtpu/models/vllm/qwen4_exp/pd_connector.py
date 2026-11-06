@@ -161,8 +161,22 @@ class Qwen4ExpRaidenConnector(TPURaidenConnector):
         )
         self._landed_on_all_ranks: list[str] = []
         self._failed_on_some_rank: list[str] = []
+        # QWEN4_EXP_PD_SHARED_COMPRESSED: a named load runs a TP all-gather
+        # on every rank, so the scheduler names only a load whose request
+        # still waits for it (3eeddf339's rule) and drops a name whose
+        # request finished before the metadata went out (its blocks may
+        # already belong to another request). req id -> request.
+        from .pd_shared_compressed import enabled as _shared_enabled
+
+        self._shared_compressed = self._sync_repack and _shared_enabled()
+        self._load_requests: dict[str, Any] = {}
 
     # --- QWEN4_EXP_PD_SYNC_REPACK -----------------------------------------
+
+    def update_state_after_alloc(self, request, blocks, num_external_tokens):
+        if getattr(self, "_shared_compressed", False) and num_external_tokens > 0:
+            self._load_requests[request.request_id] = request
+        return super().update_state_after_alloc(request, blocks, num_external_tokens)
 
     def update_connector_output(self, connector_output: Any) -> None:
         super().update_connector_output(connector_output)
@@ -174,15 +188,46 @@ class Qwen4ExpRaidenConnector(TPURaidenConnector):
         # pages it staged for it in the named step.
         finished = set(connector_output.finished_recving or ())
         failed = set(getattr(connector_output, "failed_recving", None) or ())
+        shared = getattr(self, "_shared_compressed", False)
         for req_id in sorted(finished - failed):
+            if shared and not self._still_waiting(req_id):
+                # Aborted while landing: naming it would gather into blocks
+                # vLLM freed; every rank frees its staged pages instead.
+                self._failed_on_some_rank.append(req_id)
+                self._load_requests.pop(req_id, None)
+                continue
             self._landed_on_all_ranks.append(req_id)
         for req_id in sorted(finished & failed):
             self._failed_on_some_rank.append(req_id)
+            if shared:
+                self._load_requests.pop(req_id, None)
+
+    def _still_waiting(self, req_id: str) -> bool:
+        """A recorded load whose request still waits for it. A load with no
+        record is named as L1 names it (never dropped on a guess: a dropped
+        load is not recomputed)."""
+        from vllm.v1.request import RequestStatus
+
+        request = self._load_requests.get(req_id)
+        return request is None or request.status == RequestStatus.WAITING_FOR_REMOTE_KVS
 
     def build_connector_meta(self, scheduler_output):
         meta = super().build_connector_meta(scheduler_output)
         if self._sync_repack:
-            meta.qwen_repack_req_ids = self._landed_on_all_ranks
+            named = self._landed_on_all_ranks
+            if getattr(self, "_shared_compressed", False):
+                keep = []
+                for req_id in named:
+                    request = self._load_requests.pop(req_id, None)
+                    if request is not None and request.is_finished():
+                        self._failed_on_some_rank.append(req_id)
+                    else:
+                        keep.append(req_id)
+                named = keep
+                # Requests that finished before landing never get named.
+                for req_id in [r for r, q in self._load_requests.items() if q.is_finished()]:
+                    self._load_requests.pop(req_id)
+            meta.qwen_repack_req_ids = named
             meta.qwen_drop_req_ids = self._failed_on_some_rank
             self._landed_on_all_ranks, self._failed_on_some_rank = [], []
         return meta
@@ -271,6 +316,8 @@ class Qwen4ExpRaidenWorker(TPURaidenConnectorWorker):
         # QWEN4_EXP_PD_ROUTED_DST (pd_route): set at admission on a pipeline
         # producer and on a staged consumer; None broadcasts as before.
         self._qwen_route = None
+        # QWEN4_EXP_PD_SHARED_COMPRESSED (pd_shared_compressed) on either leg.
+        self._qwen_shared = None
         self.last_failed_recving: set[str] = set()
         # QWEN4_EXP_PD_SYNC_REPACK: destination req id -> (uuid, group tables,
         # tokens) of a load whose bytes landed on this rank and whose repack
@@ -346,9 +393,13 @@ class Qwen4ExpRaidenWorker(TPURaidenConnectorWorker):
             materialize_storages(manifest)
             plan_groups = self._staging.src_groups
             self._qwen_route = self._staging.route
+            self._qwen_shared = self._staging.shared
+            if self._qwen_shared is not None:
+                self._enable_shared_compressed()
             self._log_hbm_after_staging(runner)
         else:
             self._qwen_route = self._producer_route(cache.layout)
+            self._qwen_shared = self._producer_shared(self._qwen_route)
             manifest = build_transfer_manifest(
                 cache.native_config, cache.materialized, cache.layout
             )
@@ -400,6 +451,56 @@ class Qwen4ExpRaidenWorker(TPURaidenConnectorWorker):
             layout,
             SimpleNamespace(block_size=block, token_bytes=layout.token_bytes),
             SimpleNamespace(tp_size=tp, main_dcp=dcp),
+        )
+
+    @staticmethod
+    def _producer_shared(route):
+        """QWEN4_EXP_PD_SHARED_COMPRESSED on a producer: its routed decode's
+        shared geometry (the decode must run it too; the fingerprint pins
+        it), else None."""
+        from . import pd_shared_compressed
+
+        if not pd_shared_compressed.enabled():
+            return None
+        if route is None:
+            raise ValueError(
+                "QWEN4_EXP_PD_SHARED_COMPRESSED routes compressed keys over "
+                "QWEN4_EXP_PD_ROUTED_DST; set it on both legs"
+            )
+        return pd_shared_compressed.geometry_for(route)
+
+    def _tp_cpu_group(self):
+        return get_tp_group().cpu_group
+
+    def _enable_shared_compressed(self) -> None:
+        """The decode half of QWEN4_EXP_PD_SHARED_COMPRESSED: refuse a decode
+        without L1, then allocate the landing buffers and compile and check
+        the all-gather of every bucket. Collective: every TP worker reaches
+        register_runner at the same point of its startup (3eeddf339's
+        head-unique setup relies on the same)."""
+        import faulthandler
+
+        from . import pd_shared_compressed
+
+        parallel = self.vllm_config.parallel_config
+        pd_shared_compressed.check_admissible(
+            tp_size=int(parallel.tensor_parallel_size),
+            sync_repack=bool(envs.QWEN4_EXP_PD_SYNC_REPACK),
+            sync_repack_ab_s=int(envs.QWEN4_EXP_PD_SYNC_REPACK_AB_S),
+        )
+        # A peer that never arrives would hang the self-test's all-gather:
+        # dump every stack and exit instead.
+        faulthandler.dump_traceback_later(600, exit=True)
+        try:
+            self._staging.enable_shared(get_tp_group(), int(self.tp_rank))
+        finally:
+            faulthandler.cancel_dump_traceback_later()
+        logger.info(
+            "Qwen PD shared compressed keys rank%d: landing buffers %.1f MiB, "
+            "buckets %s self-tested",
+            self.tp_rank,
+            self._staging.landing.buffer_bytes / 2**20,
+            list(pd_shared_compressed.GATHER_PAGE_BUCKETS),
         )
 
     def _staged_consumer(self) -> bool:
@@ -481,18 +582,26 @@ class Qwen4ExpRaidenWorker(TPURaidenConnectorWorker):
         staging = getattr(self, "_staging", None)
         if staging is None:
             return None
-        return (staging.free.clone(), dict(staging.reservations), dict(staging.skips))
+        return (
+            staging.free.clone(),
+            dict(staging.reservations),
+            dict(staging.skips),
+            dict(getattr(staging, "tokens", {})),
+        )
 
     def _stage3_admission_restore(self, saved) -> None:
         staging = getattr(self, "_staging", None)
         if staging is None or saved is None:
             return
-        free, reservations, skips = saved
+        free, reservations, skips = saved[:3]
         staging.free.copy_(free)
         staging.reservations.clear()
         staging.reservations.update(reservations)
         staging.skips.clear()
         staging.skips.update(skips)
+        if len(saved) > 3 and hasattr(staging, "tokens"):
+            staging.tokens.clear()
+            staging.tokens.update(saved[3])
 
     def _stage3_finish_destination(self, destination_req_id, ok) -> None:
         staging = getattr(self, "_staging", None)
@@ -537,6 +646,9 @@ class Qwen4ExpRaidenWorker(TPURaidenConnectorWorker):
             if pending is not None:
                 staging.release(pending[0])
         names = list(req_ids)
+        if getattr(staging, "shared", None) is not None:
+            self._repack_landed_shared(staging, names)
+            return
         if not self._sync_on():
             # An off period of the A/B: loads deferred in the last on period
             # repack now, before any of them can be scheduled.
@@ -556,6 +668,50 @@ class Qwen4ExpRaidenWorker(TPURaidenConnectorWorker):
             uuid, tables, num_tokens = pending
             try:
                 staging.repack(uuid, tables, num_tokens)
+            finally:
+                staging.release(uuid)
+
+    def _repack_landed_shared(self, staging, names) -> None:
+        """``repack_landed`` under QWEN4_EXP_PD_SHARED_COMPRESSED, whose
+        landing runs TP all-gathers: every rank must run the same loads'
+        passes in the same order. So (1) the ranks agree, in one CPU MIN
+        all-reduce, on which named loads all of them still hold, and drop the
+        rest on every rank; (2) every load's passes and chunks are planned
+        before the first collective; (3) the landings run in name order."""
+        from . import pd_shared_compressed
+
+        present = [name in self._pending_repacks for name in names]
+        agreed = pd_shared_compressed.agree_named_loads(present, self._tp_cpu_group())
+        loads = []
+        for name, keep in zip(names, agreed):
+            pending = self._pending_repacks.pop(name, None)
+            if keep:
+                loads.append((name, pending))
+                continue
+            if pending is not None:
+                staging.release(pending[0])
+            logger.error(
+                "Qwen4ExpRaidenWorker rank%d --> %s is not staged on every rank (here: %s); "
+                "dropped on all ranks without its landing gather",
+                self.tp_rank,
+                name,
+                "staged" if pending is not None else "absent",
+            )
+        plans = []
+        try:
+            for name, (uuid, tables, num_tokens) in loads:
+                plans.append((uuid, staging.plan_repack(uuid, tables, num_tokens)))
+        except BaseException:
+            for _, (uuid, _, _) in loads:
+                staging.release(uuid)
+            raise
+        for i, (uuid, plan) in enumerate(plans):
+            try:
+                staging.run_repack(plan)
+            except BaseException:
+                for later, _ in plans[i + 1 :]:
+                    staging.release(later)
+                raise
             finally:
                 staging.release(uuid)
 
@@ -623,7 +779,11 @@ class Qwen4ExpRaidenWorker(TPURaidenConnectorWorker):
             if not _use_per_layer_pool_tags():
                 raise ValueError("QWEN4_EXP_PD_ROUTED_DST needs TPU_RAIDEN_POOL_TAGS_PER_LAYER=1")
             payload = dict(
-                layout=_routed_layout(_owner_invariant_layout(layout), self._qwen_route),
+                layout=_routed_layout(
+                    _owner_invariant_layout(layout),
+                    self._qwen_route,
+                    shared=getattr(self, "_qwen_shared", None) is not None,
+                ),
                 semantics=_owner_invariant_semantics(self._qwen_semantics),
             )
         elif _use_per_layer_pool_tags():
@@ -807,9 +967,16 @@ class Qwen4ExpRaidenWorker(TPURaidenConnectorWorker):
             ids = pages[group_index]
             if translate is not None:
                 ids = translate(group_index, ids)
-            routed = pd_route.producer_spans(
-                owner_kind(pool.layer_name), num_tokens, len(ids), route
-            )
+            kind = owner_kind(pool.layer_name)
+            shared = getattr(self, "_qwen_shared", None)
+            if kind == "compressed" and shared is not None and shared.shared(num_tokens):
+                # QWEN4_EXP_PD_SHARED_COMPRESSED: page b of the pair space to
+                # rank b % TP only (the decode all-gathers at landing).
+                from .pd_shared_compressed import shared_spans
+
+                routed = shared_spans(num_tokens, len(ids), shared, pd_route.ROW_BYTES)
+            else:
+                routed = pd_route.producer_spans(kind, num_tokens, len(ids), route)
             spans = tuple(
                 PoolByteSpan(
                     src_block_ordinal=src,
@@ -950,7 +1117,7 @@ def _owner_invariant_layout(layout: dict[str, Any]) -> dict[str, Any]:
     )
 
 
-def _routed_layout(layout: dict[str, Any], route) -> dict[str, Any]:
+def _routed_layout(layout: dict[str, Any], route, shared: bool = False) -> dict[str, Any]:
     """The routed page encoding (QWEN4_EXP_PD_ROUTED_DST): the producer's
     pages and the decode's compact staging pages differ in rows per page, so
     both describe a carrier per 1,024-byte row and name the routing geometry
@@ -971,6 +1138,9 @@ def _routed_layout(layout: dict[str, Any], route) -> dict[str, Any]:
         carriers=[json.loads(c) for c in sorted(encoded)],
         pages=[json.loads(t) for t in sorted(tags)],
         routed=route.key(),
+        # QWEN4_EXP_PD_SHARED_COMPRESSED changes where compressed pairs land:
+        # a peer on the other side of the flag fails closed.
+        **({"shared_compressed": 1} if shared else {}),
     )
 
 
