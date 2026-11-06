@@ -74,6 +74,7 @@ def _fake_runner(method, is_async, verify, propose, fence=False):
     runner = SimpleNamespace(
         _pp_wave=None,
         _dp_step_other_decode=False,
+        _thinking_budget=None,
         execute_model_state=SimpleNamespace(
             scheduler_output=scheduler_output,
             draft_chunks=[],
