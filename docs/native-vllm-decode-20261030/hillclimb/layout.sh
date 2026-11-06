@@ -10,6 +10,9 @@
 #   dp4tp8dcp2  : one engine per host, TP8 over the host's 4 chips, KV pages striped over 2 cores
 #   tp32dcp8    : one engine over all 4 hosts, TP32, KV pages striped over 8 cores (production decode shape)
 #   dp2tp16dcp4 : two engines of 2 hosts each (experimental launch form, see README)
+# Eight- and sixteen-host presets (2x4x4 = 32 chips, 4x4x4 = 64 chips): two engines of TP4 per host, as dp8tp4.
+#   dp16tp4     : 16 engines of TP4 over 8 hosts (EP over 64 ranks, 16 members per TP rank's DP group)
+#   dp32tp4     : 32 engines of TP4 over 16 hosts (EP over 128 ranks, 32 members per TP rank's DP group)
 # Single-host presets cover the 4 chips / 8 TensorCores of one 2x2x1 host (NATIVE_HOST_IPS has one address).
 #   tp8         : one engine, TP8, no DCP
 #   tp8xdcp2    : one engine, TP8, KV pages striped over 2 cores
@@ -22,9 +25,9 @@ MTP_K=${MTP_K:-3}
 MNBT=${MNBT:-1024}
 HEADLESS_ARGS=()
 case "$LAYOUT" in
-  dp8tp4)
-    ENGINES=8
-    PAR_ARGS=(--data-parallel-size 8 --data-parallel-size-local 2 --nnodes 1
+  dp8tp4|dp16tp4|dp32tp4)
+    ENGINES=${LAYOUT%tp4}; ENGINES=${ENGINES#dp}
+    PAR_ARGS=(--data-parallel-size "$ENGINES" --data-parallel-size-local 2 --nnodes 1
               --tensor-parallel-size 4 --decode-context-parallel-size 1
               --data-parallel-start-rank $((HOST_RANK * 2)) --data-parallel-hybrid-lb --master-port 29500
               --data-parallel-address "$MASTER_ADDRESS" --data-parallel-rpc-port 29650) ;;
@@ -66,7 +69,11 @@ case "$LAYOUT" in
               --data-parallel-address "$MASTER_ADDRESS" --data-parallel-rpc-port 29650) ;;
   *) echo "unknown LAYOUT=$LAYOUT" >&2; return 2 ;;
 esac
-case "$LAYOUT" in tp8|tp8xdcp2|dp2xtp4|dp4xtp2|dp8xtp1) LAYOUT_HOSTS=1 ;; *) LAYOUT_HOSTS=4 ;; esac
+case "$LAYOUT" in
+  tp8|tp8xdcp2|dp2xtp4|dp4xtp2|dp8xtp1) LAYOUT_HOSTS=1 ;;
+  dp16tp4|dp32tp4) LAYOUT_HOSTS=$((ENGINES / 2)) ;;
+  *) LAYOUT_HOSTS=4 ;;
+esac
 if [[ "${#HOST_IPS[@]}" != "$LAYOUT_HOSTS" ]]; then
   echo "LAYOUT=$LAYOUT needs $LAYOUT_HOSTS host address(es), got ${#HOST_IPS[@]}" >&2; return 2
 fi

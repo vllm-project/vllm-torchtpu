@@ -39,6 +39,13 @@ expert bytes per core as the 92-layer model does on the 32-core presets.
 | `tp8xdcp2` | 1 | TP8 = 1 host | striped over 2 cores | TP all-reduce and EP inside the host |
 | `dp2xtp4` | 2 | TP4 = 2 chips | one core per KV head | TP all-reduce inside 2 chips; EP and DP lockstep across the host |
 
+Larger slices keep two TP4 engines per host and shard the experts over every core:
+
+| LAYOUT | Slice | Engines | Experts per core | DP group of a TP rank (EP exchange members) |
+|---|---|---|---|---|
+| `dp16tp4` | 2x4x4, 8 hosts, 32 chips | 16 | 8 | 16 |
+| `dp32tp4` | 4x4x4, 16 hosts, 64 chips | 32 | 4 | 32 |
+
 Why these: the model's 4 KV heads make TP4 the largest tensor-parallel degree without
 KV-head replication; above it, decode context parallel (`--decode-context-parallel-size`)
 turns the replicas into page stripes, so a request's 131K-token KV is read by 2, 4 or 8
@@ -65,6 +72,15 @@ LAYOUT=tp32dcp8 GLOBAL_SEQS=96 "$PYTHON_BIN" bench_sweep.py --stage <arm> --inpu
 `bench_sweep.py` asserts that every request produced exactly `--output` tokens and prints a
 `SUMMARY` line; the `steady` block carries the comparable numbers (`tokens_per_second`,
 `mean_request_tpot_ms`). `cached_tokens_hist` must show `131071` for every request.
+`BENCH_TEMPERATURE`, `BENCH_TOP_P` and `BENCH_TOP_K` set the request sampling (greedy by default).
+
+On a cluster, [recipes/](recipes) holds one JobSet per slice (`q38-decode-4h`, `-8h`, `-16h`) that
+runs a list of arms on one slice: boot, measured run, device step from the `pjrt_client` log
+([pjrt_step.py](pjrt_step.py)) and a `RESULT` line ([arm_result.py](arm_result.py)); optionally a second
+boot with a short profile summarized per step ([trace_summary.py](trace_summary.py)) and a `ROW` line
+that adds the trace's exchange share, capacity fallbacks and sampling fallbacks. With the ragged
+all-to-all exchange (`MOE_A2A=1`), set `MNBT` to the decode step's tokens (requests per engine x 4 at
+`MTP_K=3`) so no larger step runs.
 
 ## Knobs
 

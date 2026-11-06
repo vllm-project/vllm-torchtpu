@@ -1,0 +1,492 @@
+# SPDX-License-Identifier: Apache-2.0
+# Qwen3.8 92-layer dummy-weight decode on one 8-host 2x4x4 slice (32 chips, 64 TensorCores):
+# dp16tp4 (two engines of TP4 per host), MTP K=3, 128K synthetic KV, P131072/D1024, launched with
+# hillclimb/serve_sweep.sh of each arm's code bundle. cdk JobSet recipe; template values are KEY=VALUE at job creation.
+#
+# Inputs (gs://, http(s):// or a path inside the image):
+#   OVDIR       directory holding overlay-<name>.tgz: a tar.gz with src/vllm_torchtpu and
+#               docs/native-vllm-decode-20261030 of this repository (git archive of the commit under test)
+#   MODEL_URL   directory with the dummy model's config.json, generation_config.json and tokenizer files
+#   WHEEL_URL   optional torch_tpu wheel installed over the image's (empty = keep the image's)
+#   REPLAY_URL  optional .npz of captured expert ids, fetched to /root/real_routes.npz (replay arms set
+#               TPU_MOE_ROUTING_REPLAY=/root/real_routes.npz)
+# ARMS='name:overlay:seqs:kv[:VAR=val+VAR=val]' (space-separated, run in order); seqs = GLOBAL_SEQS (all engines);
+#   kv = KV_BYTES per worker (bytes or auto). The arm env reaches the launcher and the client (BENCH_TEMPERATURE /
+#   BENCH_TOP_P / BENCH_TOP_K = request sampling, BENCH_SAVE_IDS=1 = token-id digest); MTP_K=<k> in it overrides K=3.
+#   seqs = max (kv ignored): the most requests per engine that the previous measured arm's memory allows, from its
+#   steady true free memory (>= 0.4 GiB left, and room for the first-request pool zero's temporary copy of one raw
+#   KV tensor, about pool / 24); KV_BYTES and MNBT follow; skipped when that is not above the previous arm.
+# Per arm: boot B (fresh compile caches) -> one measured run (bench_sweep.py), device step from the pjrt_client log
+#   (pjrt_step.py), then one RESULT line (arm_result.py). With TRACE=1 and the arm in TRACE_ARMS (empty = all):
+#   boot A (warm caches, sampling-fallback counter on) -> a TRACE_S-second profile on every host while all requests
+#   decode; TRACE_RANKS are summarized per step (trace_summary.py: exchange share, capacity fallbacks), "auto" = the
+#   TP group of engine 0 plus the DP group of TP rank 0; XPlanes of TRACE_KEEP ranks are archived.
+#   Host 0 prints ROW lines that merge the RESULT with the trace summaries and the sampling-fallback counts.
+# Host 0 serves the phase (port 7000), drives the arms and runs the client; every host serves its state (port 7001).
+# A boot that fails with a TPU-init error on any host is retried once.
+apiVersion: jobset.x-k8s.io/v1alpha2
+kind: JobSet
+metadata:
+  name: q38-decode-8h
+spec:
+  network:
+    enableDNSHostnames: true
+  successPolicy:
+    operator: All
+    targetReplicatedJobs:
+      - server
+  replicatedJobs:
+    - name: server
+      replicas: 1
+      template:
+        spec:
+          # One Indexed Job holds every host of the slice (multi-host TPU placement).
+          parallelism: 8
+          completions: 8
+          completionMode: Indexed
+          backoffLimit: 0
+          template:
+            spec:
+              restartPolicy: Never
+              nodeSelector:
+                cloud.google.com/gke-tpu-topology: 2x4x4
+                cloud.google.com/gke-tpu-accelerator: tpu7x
+              initContainers:
+                - name: tpu-node-setup
+                  image: busybox
+                  securityContext:
+                    privileged: true
+                  command: ["/bin/sh", "-c"]
+                  args:
+                    - |
+                      sysctl -w vm.max_map_count=8388608
+                      if [ -f /sys/module/vfio_iommu_type1/parameters/dma_entry_limit ]; then
+                        echo 2000000 > /sys/module/vfio_iommu_type1/parameters/dma_entry_limit
+                      fi
+              containers:
+              - name: server
+                image: {{ .IMAGE | default "us-central1-docker.pkg.dev/cloud-ullm-inference-ci-cd/vllm-torchtpu/torchtpu-vllm-dev:nightly-20260927" }}
+                imagePullPolicy: IfNotPresent
+                command: ["/bin/bash", "-c", "--"]
+                args:
+                  - |
+                    set -o pipefail
+                    : "${CDK_OUTPUT_DIR:=/tmp/cdk-outputs}"; mkdir -p "$CDK_OUTPUT_DIR"
+                    OUT="$CDK_OUTPUT_DIR"; H="${JOB_COMPLETION_INDEX:-$POD_COMPLETION_INDEX}"; [ -n "$H" ] || { echo "no completion index"; exit 1; }
+                    log() { echo "[$(date -u +%FT%TZ)] h$H $*"; }
+                    fatal() { log "FATAL: $*"; sleep 30; exit 1; }
+                    ARMS='{{ .ARMS | default "" }}'
+                    OVDIR='{{ .OVDIR | default "" }}'
+                    MODEL_URL='{{ .MODEL_URL | default "" }}'
+                    WHEEL_URL='{{ .WHEEL_URL | default "" }}'
+                    REPLAY_URL='{{ .REPLAY_URL | default "" }}'
+                    TRACE='{{ .TRACE | default "1" }}'
+                    TRACE_S='{{ .TRACE_S | default "2.5" }}'
+                    TRACE_RANKS='{{ .TRACE_RANKS | default "auto" }}'
+                    TRACE_KEEP='{{ .TRACE_KEEP | default "0" }}'
+                    TRACE_ARMS='{{ .TRACE_ARMS | default "" }}'
+                    BOOT_TIMEOUT='{{ .BOOT_TIMEOUT | default "7200" }}'
+                    LAYOUT=dp16tp4; MTP_K=3; NHOST=8; CHIPS=32; ENGINES=$((NHOST * 2))
+                    [ -n "$ARMS" ] && [ -n "$OVDIR" ] && [ -n "$MODEL_URL" ] || fatal "ARMS, OVDIR and MODEL_URL are required"
+                    if [ "$TRACE_RANKS" = auto ]; then
+                      TRACE_RANKS="0 1 2 3"; for d in $(seq 1 $((ENGINES - 1))); do TRACE_RANKS="$TRACE_RANKS $((d * 4))"; done
+                    fi
+                    fetch() {  # fetch SRC DST [dir]
+                      case "$1" in
+                        gs://*) if [ "$3" = dir ]; then gcloud storage cp -r "$1" "$(dirname "$2")/"; else gcloud storage cp "$1" "$2"; fi ;;
+                        http://*|https://*) curl -fsSL -o "$2" "$1" ;;
+                        *) cp -r "$1" "$2" ;;
+                      esac
+                    }
+                    log "BOOT pod=$(hostname) ip=$MY_POD_IP slice=2x4x4 layout=$LAYOUT arms=$ARMS trace=$TRACE trace_arms=${TRACE_ARMS:-all} trace_s=$TRACE_S trace_ranks=$TRACE_RANKS"
+                    log "PLATFORM_ENV TPU_TOPOLOGY=${TPU_TOPOLOGY:-} TPU_HOST_BOUNDS=${TPU_HOST_BOUNDS:-} TPU_TOPOLOGY_WRAP=${TPU_TOPOLOGY_WRAP:-} TPU_ACCELERATOR_TYPE=${TPU_ACCELERATOR_TYPE:-} TPU_WORKER_ID=${TPU_WORKER_ID:-}"
+                    PKG_DIR=$(python3 -c "import vllm_torchtpu, os; print(os.path.dirname(vllm_torchtpu.__file__))")
+                    if [ -n "$WHEEL_URL" ]; then
+                      WHL=/tmp/$(basename "$WHEEL_URL")
+                      fetch "$WHEEL_URL" "$WHL" || fatal "wheel fetch failed"
+                      pip install --force-reinstall --no-deps "$WHL" >/tmp/pip.log 2>&1 || { tail -20 /tmp/pip.log; fatal "wheel install failed"; }
+                    fi
+                    export MODEL_PATH=/root/$(basename "${MODEL_URL%/}")
+                    fetch "${MODEL_URL%/}" "$MODEL_PATH" dir || fatal "model config fetch failed"
+                    [ -f "$MODEL_PATH/config.json" ] || fatal "no config.json under $MODEL_PATH"
+                    if [ -n "$REPLAY_URL" ]; then fetch "$REPLAY_URL" /root/real_routes.npz || fatal "replay table fetch failed"; fi
+                    ver() { pip show "$1" 2>/dev/null | awk '/^Version:/{print $2}'; }
+                    VERS="vllm=$(ver vllm) torch_tpu=$(ver torch_tpu) torch=$(ver torch) libtpu=$(ver libtpu) jax=$(ver jax) transformers=$(ver transformers) python=$(python3 -V 2>&1 | cut -d' ' -f2)"
+                    log "VERSIONS $VERS"; echo "$VERS" > "$OUT/versions-h$H.txt"
+                    for spec in $ARMS; do
+                      IFS=: read -r _ OV _ <<< "$spec"
+                      [ -d "/root/ov/$OV" ] && continue
+                      mkdir -p "/root/ov/$OV" && fetch "$OVDIR/overlay-$OV.tgz" "/root/ov/$OV.tgz" && tar -xzf "/root/ov/$OV.tgz" -C "/root/ov/$OV" || fatal "overlay $OV fetch failed"
+                      [ -f "/root/ov/$OV/docs/native-vllm-decode-20261030/hillclimb/serve_sweep.sh" ] || fatal "overlay $OV has no launcher"
+                      log "OVERLAY $OV sha=$(sha256sum /root/ov/$OV.tgz | cut -c1-12)"
+                    done
+                    if ! command -v numactl >/dev/null; then
+                      (apt-get update -qq && apt-get install -y -qq numactl) >/tmp/apt.log 2>&1 || log "numactl install failed: $(tail -2 /tmp/apt.log)"
+                    fi
+                    TCM=/usr/lib/x86_64-linux-gnu/libtcmalloc.so.4
+                    if [ ! -e "$TCM" ]; then
+                      (apt-get update -qq && apt-get install -y -qq libgoogle-perftools4) >>/tmp/apt.log 2>&1 || log "tcmalloc install failed: $(tail -2 /tmp/apt.log)"
+                    fi
+                    if ! command -v numactl >/dev/null; then
+                      mkdir -p /root/shim && printf '#!/bin/bash\n[ "$1" = --interleave=all ] && shift\nexec "$@"\n' > /root/shim/numactl && chmod +x /root/shim/numactl
+                      export PATH=/root/shim:$PATH; log "NUMACTL_SHIM numactl unavailable, launching without NUMA interleave"
+                    fi
+                    log "TOOLS numactl=$(command -v numactl) tcmalloc=$(ls $TCM 2>/dev/null)"
+                    unset TPU_PROCESS_ADDRESSES TPU_PROCESS_PORT TPU_WORKER_HOSTNAMES TPU_WORKER_ID TPU_NAME MEGASCALE_COORDINATOR_ADDRESS MEGASCALE_PORT MEGASCALE_NUM_SLICES MEGASCALE_SLICE_ID TPU_VISIBLE_CHIPS TPU_VISIBLE_DEVICES
+                    IPS=()
+                    for i in $(seq 0 $((NHOST - 1))); do
+                      ip=""
+                      for t in $(seq 1 900); do ip=$(getent hosts "${JS_NAME}-server-0-$i.${JS_NAME}" | awk '{print $1}' | head -1); [ -n "$ip" ] && break; sleep 2; done
+                      [ -n "$ip" ] || fatal "cannot resolve host $i"
+                      IPS+=("$ip")
+                    done
+                    [ "${IPS[$H]}" = "$MY_POD_IP" ] || log "WARN own address ${IPS[$H]} != pod ip $MY_POD_IP"
+                    HOST0=${IPS[0]}
+                    export NATIVE_HOST_IPS=$(IFS=,; echo "${IPS[*]}") PYTHON_BIN="$(command -v python3)" VLLM_BIN="$(command -v vllm)"
+                    log "HOSTS $NATIVE_HOST_IPS node=$NODE_NAME"
+                    KEYRE='HILLCLIMB|Ragged A2A MoE|LM head stored|KV cache|Maximum concurrency|SYNTHETIC_DECODE_POOL_READY|SYNTHETIC_DECODE_HBM|SYNTHETIC_DECODE_SAMPLING_FALLBACK|Relayouted|Row-major|Batched RPA|verify block|one-query|Packed dispatch|packed dispatch|TPU mp multihost|routing replay|Truncated|Application startup|ERROR|Error|Traceback|RESOURCE_EXHAUSTED|Out of memory|START_SESSION|PjRtClient'
+                    # Server process pattern assembled at run time: this script's own command line (bash -c) must not match it.
+                    SERVE_RE="vllm"" serve|VLL""M::|Engine""Core"
+                    phase() { curl -sf --max-time 5 "http://$HOST0:7000/phase" 2>/dev/null | tr -d '[:space:]'; }
+                    setstate() { echo "$*" > /tmp/st/state.tmp && mv /tmp/st/state.tmp /tmp/st/state; }
+                    arm_fields() {
+                      local spec; spec=$(echo $ARMS | tr ' ' '\n' | sed -n "$(( $1 + 1 ))p"); IFS=: read -r NAME OV SEQS KVB XENV <<< "$spec"
+                      if [ "$SEQS" = max ]; then
+                        spec=$(curl -sf --max-time 5 "http://$HOST0:7000/arm-$1" 2>/dev/null)
+                        [ -n "$spec" ] && IFS=: read -r NAME OV SEQS KVB XENV <<< "$spec"
+                      fi
+                      ARM_K=$(echo "$XENV" | tr '+' '\n' | sed -n 's/^MTP_K=//p' | tail -1); ARM_K=${ARM_K:-$MTP_K}
+                    }
+                    NARMS=$(echo $ARMS | wc -w)
+                    # ---- per-host server control (every host; on host 0 in the background) ----
+                    start_server() {
+                      arm_fields "$k"
+                      D=/root/runs/$NAME; mkdir -p "$D" "$OUT/$NAME"
+                      if [ "$tag" = B ] && [ "$att" = 1 ]; then
+                        # Fresh compile caches per arm: arms that share a graph differ only inside kernels or entry layouts.
+                        rm -rf /dev/shm/torch_tpu_cache /root/vcache /tmp/torchinductor_* /root/.cache/vllm 2>/dev/null
+                      fi
+                      rm -rf "$PKG_DIR" && cp -r "/root/ov/$OV/src/vllm_torchtpu" "$PKG_DIR"
+                      BUNDLE=/root/ov/$OV/docs/native-vllm-decode-20261030
+                      read -r -a XENV_ARGS <<< "$(echo "$XENV" | tr '+' ' ')"
+                      DIAG=(); [ "$tag" = A ] && DIAG=(SYNTHETIC_DECODE_SAMPLING_FALLBACKS=1)
+                      LOGF=$D/server-$tag$att-h$H.log
+                      env "${XENV_ARGS[@]}" "${DIAG[@]}" LAYOUT=$LAYOUT GLOBAL_SEQS=$SEQS MTP_K=$ARM_K KV_BYTES=$KVB VLLM_CACHE_ROOT="/root/vcache/$NAME" \
+                        EXTRA_ARGS="--profiler-config.profiler torch --profiler-config.torch_profiler_dir $D/xprof-$tag$att --profiler-config.ignore_frontend true --profiler-config.torch_profiler_with_stack false" \
+                        TPU_STDERR_LOG_LEVEL=0 TPU_VMODULE=tpu_pjrt_client=1 PYTHON_TRACER_LEVEL=0 \
+                        setsid bash "$BUNDLE/hillclimb/serve_sweep.sh" "$H" > "$LOGF" 2>&1 &
+                      SPID=$!
+                      echo "{\"arm\":\"$NAME\",\"overlay\":\"$OV\",\"layout\":\"$LAYOUT\",\"global_seqs\":$SEQS,\"mtp_k\":$ARM_K,\"kv\":\"$KVB\",\"extra_env\":\"$XENV\",\"boot\":\"$tag$att\",\"host\":$H,\"node\":\"$NODE_NAME\",\"server_start_unix\":$(date +%s.%N)}" > "$OUT/$NAME/arm-$tag$att-h$H.json"
+                      setstate "booting $k:$tag:$att"
+                      log "SERVE_START $NAME/$tag$att overlay=$OV seqs=$SEQS kv=$KVB env=$XENV ${DIAG[*]} pid=$SPID"
+                    }
+                    stop_server() {
+                      if [ -n "$SPID" ]; then
+                        kill -TERM -- -"$SPID" 2>/dev/null
+                        for i in $(seq 1 12); do kill -0 "$SPID" 2>/dev/null || break; sleep 5; done
+                        kill -KILL -- -"$SPID" 2>/dev/null
+                      fi
+                      pkill -9 -f "$SERVE_RE" 2>/dev/null
+                      for i in $(seq 1 30); do pgrep -f "$SERVE_RE" >/dev/null || break; sleep 2; done
+                      left=$(pgrep -f "$SERVE_RE" | wc -l)
+                      sleep 20
+                      grep -aE "$KEYRE" "$LOGF" | grep -av tpu_pjrt_client | head -600 > "$OUT/$NAME/server-key-$tag$att-h$H.log"
+                      grep -av tpu_pjrt_client "$LOGF" | tail -200 > "$OUT/$NAME/server-tail-$tag$att-h$H.log"
+                      log "KEYCHECK $NAME/$tag$att lines=$(wc -l < "$LOGF") pjrt=$(grep -ac tpu_pjrt_client "$LOGF") left=$left $(grep -a -m1 -o 'HILLCLIMB.*' "$LOGF" | cut -c1-600) | $(grep -a -m1 -o 'Ragged A2A MoE capacity.*' "$LOGF" | cut -c1-160) | $(grep -a -m2 -oE 'GPU KV cache size: [0-9,]+ tokens|Maximum concurrency for [0-9,]+ tokens per request: [0-9.]+x' "$LOGF" | sort -u | tr '\n' ' ')"
+                      if [ "$tag" = A ]; then
+                        # Last sampling-fallback count of each worker, for host 0's ROW line.
+                        grep -a -v tpu_pjrt_client "$LOGF" | grep -a 'SYNTHETIC_DECODE_SAMPLING_FALLBACK load_call' | sed -E 's/^\(([^ ]*) pid.*load_call=([0-9]+) calls=([0-9]+) fallbacks=([0-9]+).*/\1 \2 \3 \4/' | awk '{c[$1]=$3; f[$1]=$4} END {for (w in c) print w, c[w], f[w]}' > "/tmp/st/sfb-$NAME-$tag$att" 2>/dev/null
+                      fi
+                      gzip -1 -c "$LOGF" > "$OUT/$NAME/server-$tag$att-h$H.log.gz" && rm -f "$LOGF"
+                      if [ "$tag" = A ] && [ -d "$D/xprof-$tag$att" ]; then
+                        (cd "$D" && find "xprof-$tag$att" -name '*.xplane.pb' -exec ls -la {} \;) > "$OUT/$NAME/xprof-list-$tag$att-h$H.txt" 2>&1
+                        keep=(); : > "/tmp/st/trace-$NAME-$tag$att"
+                        while IFS= read -r f; do
+                          r=$(echo "$f" | sed -nE 's#.*/rank([0-9]+)_[^/]*\.xplane\.pb$#\1#p; s#.*/rank_([0-9]+)/.*\.xplane\.pb$#\1#p' | head -1)
+                          for want in $TRACE_RANKS; do
+                            [ "$r" = "$want" ] || continue
+                            echo "rank=$r $(timeout 600 python3 "$BUNDLE/hillclimb/trace_summary.py" "$D/$f" --mtp-k "$ARM_K" 2>&1 | tail -1)" >> "/tmp/st/trace-$NAME-$tag$att"
+                          done
+                          for want in $TRACE_KEEP; do [ "$r" = "$want" ] && keep+=("$f"); done
+                        done < <(cd "$D" && find "xprof-$tag$att" -name '*.xplane.pb')
+                        cp "/tmp/st/trace-$NAME-$tag$att" "$OUT/$NAME/trace-summary-$tag$att-h$H.txt"
+                        if [ ${#keep[@]} -gt 0 ]; then (cd "$D" && tar -cf "$OUT/$NAME/xprof-$tag$att-h$H.tar" "${keep[@]}"); fi
+                        log "XPROF $NAME/$tag$att files=$(wc -l < "$OUT/$NAME/xprof-list-$tag$att-h$H.txt") summarized=$(wc -l < "/tmp/st/trace-$NAME-$tag$att") kept=${#keep[@]} $(du -sh "$D/xprof-$tag$att" | cut -f1)"
+                        rm -rf "$D/xprof-$tag$att"
+                      fi
+                      SPID=""
+                    }
+                    host_loop() {
+                      local cur="" misses=0 exited=0 p key it=0
+                      SPID=""
+                      while :; do
+                        it=$((it + 1))
+                        if [ -n "$SPID" ] && [ $exited = 0 ] && [ $((it % 150)) = 0 ]; then
+                          log "PROGRESS $cur lines=$(wc -l < "$LOGF") last: $(grep -av tpu_pjrt_client "$LOGF" | tail -1 | cut -c1-220)"
+                        fi
+                        p=$(phase)
+                        if [ -z "$p" ]; then
+                          misses=$((misses + 1))
+                          if [ $misses -gt 900 ]; then log "FATAL: phase server unreachable for 30 min"; stop_server; exit 1; fi
+                          sleep 2; continue
+                        fi
+                        misses=0
+                        case "$p" in
+                          done) [ -n "$SPID" ] && stop_server; setstate done; log "HOST_DONE"; return 0 ;;
+                          *:run)
+                            key=${p%:run}
+                            if [ "$key" != "$cur" ]; then
+                              [ -n "$SPID" ] && stop_server
+                              IFS=: read -r k tag att <<< "$key"
+                              start_server; cur=$key; exited=0
+                            fi ;;
+                          *:stop)
+                            key=${p%:stop}
+                            if [ "$key" = "$cur" ] && [ "$(cat /tmp/st/state)" != "stopped $key" ]; then
+                              stop_server; setstate "stopped $key"; log "STOPPED $key"
+                            fi ;;
+                        esac
+                        if [ -n "$SPID" ] && [ $exited = 0 ] && ! kill -0 "$SPID" 2>/dev/null; then
+                          wait "$SPID"; rc=$?
+                          ti=$(grep -acE 'START_SESSION failed|PjRtClient is not initialized|MaybeInitializeSliceBuilder failed' "$LOGF")
+                          setstate "exited $cur rc=$rc tpuinit=$ti"; exited=1
+                          log "SERVER_EXITED $cur rc=$rc tpuinit=$ti"
+                          grep -av tpu_pjrt_client "$LOGF" | grep -aE "Error|error|Traceback|RESOURCE_EXHAUSTED|OOM|Killed" | tail -30
+                        fi
+                        sleep 2
+                      done
+                    }
+                    mkdir -p /tmp/st && setstate idle
+                    if [ "$H" != 0 ]; then
+                      (cd /tmp/st && exec python3 -m http.server 7001 --bind 0.0.0.0 >/dev/null 2>&1) &
+                      host_loop; rc=$?
+                      log "ALL_PHASES_DONE rc=$rc"; sleep 60; exit $rc
+                    fi
+                    # ---- host 0: prompts, phase server, client and phase driver ----
+                    FIRST_OV=$(echo "$ARMS" | awk '{print $1}' | cut -d: -f2)
+                    (cd "/root/ov/$FIRST_OV/docs/native-vllm-decode-20261030" && python3 make_prompts.py --model "$MODEL_PATH" --output /root/prompts.json) >/tmp/prompts.log 2>&1 || { cat /tmp/prompts.log; fatal "prompt generation failed"; }
+                    export NATIVE_BENCH_DATASET=/root/prompts.json
+                    log "PROMPTS $(tail -1 /tmp/prompts.log)"
+                    mkdir -p /tmp/phase && printf wait > /tmp/phase/phase
+                    (cd /tmp/phase && exec python3 -m http.server 7000 --bind 0.0.0.0 >/dev/null 2>&1) &
+                    (cd /tmp/st && exec python3 -m http.server 7001 --bind 0.0.0.0 >/dev/null 2>&1) &
+                    host_loop & HLPID=$!
+                    setphase() { printf %s "$1" > /tmp/phase/phase.tmp && mv /tmp/phase/phase.tmp /tmp/phase/phase; log "PHASE $1"; }
+                    hstate() { curl -sf --max-time 5 "http://$1:7001/state" 2>/dev/null; }
+                    health() { curl -sf --max-time 5 "http://$1:8000/health" >/dev/null 2>&1; }
+                    running_total() {
+                      local s=0 v
+                      for ip in "${IPS[@]}"; do
+                        v=$(curl -s --max-time 5 "http://$ip:8000/metrics" 2>/dev/null | awk '/^vllm:num_requests_running[{ ]/ {s+=$NF} END {printf "%d", s}')
+                        s=$((s + ${v:-0}))
+                      done
+                      echo $s
+                    }
+                    for t in $(seq 1 360); do
+                      n=0; for ip in "${IPS[@]}"; do [ "$(hstate $ip)" = idle ] && n=$((n + 1)); done
+                      [ $n = $NHOST ] && break; sleep 5
+                    done
+                    [ $n = $NHOST ] || fatal "only $n of $NHOST hosts ready for phases"
+                    log "ALL_HOSTS_IDLE"
+                    clean_run() {
+                      local R=$D/B$att; mkdir -p "$R"
+                      local CENV; read -r -a CENV <<< "$(echo "$XENV" | tr '+' ' ')"
+                      env "${CENV[@]}" LAYOUT=$LAYOUT GLOBAL_SEQS=$SEQS NATIVE_BENCH_OUTPUT_DIR=$R timeout 1200 python3 "$BUNDLE/hillclimb/bench_sweep.py" --stage "$NAME" --input 131072 --output 1024 --arrival-interval 0.25 > "$R/bench.log" 2>&1
+                      local rc=$?
+                      log "RUN_DONE $NAME/B$att rc=$rc $(grep -a '^SUMMARY' "$R/bench.log" | cut -c1-2500)"
+                      [ $rc = 0 ] || tail -20 "$R/bench.log"
+                      cp -r "$R" "$OUT/$NAME/" 2>/dev/null
+                    }
+                    trace_run() {
+                      local R=$D/A$att ok=0 t_all=0 w0 r p0 p1 p2 p3 pids
+                      mkdir -p "$R"
+                      local CENV; read -r -a CENV <<< "$(echo "$XENV" | tr '+' ' ')"
+                      env "${CENV[@]}" LAYOUT=$LAYOUT GLOBAL_SEQS=$SEQS NATIVE_BENCH_OUTPUT_DIR=$R timeout 2400 python3 "$BUNDLE/hillclimb/bench_sweep.py" --stage "$NAME-trace" --input 131072 --output 1024 --arrival-interval 0.25 > "$R/bench.log" 2>&1 &
+                      local BPID=$!
+                      w0=$(date +%s)
+                      while [ $(( $(date +%s) - w0 )) -lt 900 ]; do
+                        r=$(running_total)
+                        if [ "${r:-0}" -ge "$SEQS" ]; then ok=$((ok + 1)); [ "$t_all" = 0 ] && t_all=$(date +%s.%N); [ $ok -ge 2 ] && break; else ok=0; t_all=0; fi
+                        kill -0 $BPID 2>/dev/null || break
+                        sleep 0.5
+                      done
+                      sleep 3
+                      p0=$(date +%s.%N); pids=()
+                      for ip in "${IPS[@]}"; do curl -s -o /dev/null -w '%{http_code}' -X POST --max-time 600 "http://$ip:8000/start_profile" > "$R/start-code-$ip" & pids+=($!); done
+                      wait "${pids[@]}"; p1=$(date +%s.%N)
+                      sleep "$TRACE_S"
+                      p2=$(date +%s.%N); pids=()
+                      for ip in "${IPS[@]}"; do curl -s -o /dev/null -w '%{http_code}' -X POST --max-time 1800 "http://$ip:8000/stop_profile" > "$R/stop-code-$ip" & pids+=($!); done
+                      wait "${pids[@]}"; p3=$(date +%s.%N)
+                      echo "{\"start_call\":[$p0,$p1],\"stop_call\":[$p2,$p3],\"trace_s\":$TRACE_S,\"all_running_since\":$t_all,\"running_at_stop\":$(running_total),\"start_codes\":\"$(cat $R/start-code-* | tr '\n' ' ')\",\"stop_codes\":\"$(cat $R/stop-code-* | tr '\n' ' ')\"}" > "$R/profile_window.json"
+                      log "PROFILE $NAME/A$att $(cat $R/profile_window.json)"
+                      # Let every request finish, so each worker logs its sampling-fallback count at 1000 steps.
+                      wait $BPID 2>/dev/null
+                      log "TRACE_RUN_DONE $NAME/A$att $(grep -a '^SUMMARY' "$R/bench.log" | cut -c1-300)"
+                    }
+                    row() {  # merge the arm's RESULT with every host's trace summaries and sampling-fallback counts
+                      local res=$1 att=$2 ip tr sf
+                      tr=/tmp/trace-all-$NAME; sf=/tmp/sfb-all-$NAME; : > "$tr"; : > "$sf"
+                      for ip in "${IPS[@]}"; do
+                        curl -sf --max-time 10 "http://$ip:7001/trace-$NAME-A$att" >> "$tr" 2>/dev/null
+                        curl -sf --max-time 10 "http://$ip:7001/sfb-$NAME-A$att" >> "$sf" 2>/dev/null
+                      done
+                      python3 - "$res" "$tr" "$sf" "$NAME" <<'PYEOF'
+                    import json, statistics, sys
+                    res = json.loads(sys.argv[1]) if sys.argv[1] else {}
+                    res.setdefault("arm", sys.argv[4])
+                    sums = []
+                    for line in open(sys.argv[2]):
+                        try:
+                            sums.append(json.loads(line.split(" ", 1)[1]))
+                        except (IndexError, ValueError):
+                            pass
+                    calls = fb = 0
+                    for line in open(sys.argv[3]):
+                        p = line.split()
+                        if len(p) == 3:
+                            calls += int(p[1]); fb += int(p[2])
+                    fbs = [s["capacity_fallbacks_per_step"] for s in sums if s.get("capacity_fallbacks_per_step") is not None]
+                    sh = [s["exchange_share"] for s in sums if s.get("exchange_share") is not None]
+                    res.update(trace_ranks=len(sums), capacity_fallbacks_per_step_max=max(fbs) if fbs else None,
+                               exchange_share_median=round(statistics.median(sh), 4) if sh else None,
+                               exchange_share_max=max(sh) if sh else None,
+                               sampling_fallbacks=f"{fb}/{calls}" if calls else None)
+                    print("ROW " + json.dumps(res), flush=True)
+                    PYEOF
+                    }
+                    resolve_max() {  # resolve_max K: write the max arm's spec from the last measured arm
+                      local spec; spec=$(echo $ARMS | tr ' ' '\n' | sed -n "$(( $1 + 1 ))p")
+                      python3 - "$spec" "$LAST_RESULT" "$LAST_SEQS" "$LAST_KVB" "$ENGINES" <<'PYEOF'
+                    import json, sys
+                    spec, res, seqs, kvb, engines = sys.argv[1:6]
+                    name, ov, _, _, env = (spec.split(":", 4) + [""])[:5]
+                    try:
+                        free = json.loads(res)["true_free_gib_min"]
+                        n0, kvb = int(seqs) // int(engines), int(kvb)
+                    except (ValueError, KeyError, TypeError):
+                        print("SKIP no measured reference arm with a memory log"); sys.exit()
+                    block = kvb // (73 * n0 + 2)
+                    gib = 2**30
+                    best = n0
+                    for n in range(n0 + 1, 4 * n0):
+                        left = free - 73 * block * (n - n0) / gib
+                        zero = (73 * n + 2) * block / 24 / gib  # one raw KV tensor, copied by the first-request zero
+                        if left >= 0.4 and left + 1.0 >= zero + 0.2:
+                            best = n
+                    if best <= n0:
+                        print(f"SKIP no headroom above {n0}/engine (true free {free:.2f} GiB)"); sys.exit()
+                    k = next((int(x[6:]) for x in env.split("+") if x.startswith("MTP_K=")), 3)
+                    env = "+".join([x for x in env.split("+") if x and not x.startswith("MNBT=")] + [f"MNBT={best * (k + 1)}"])
+                    print(f"{name}:{ov}:{best * int(engines)}:{(73 * best + 2) * block}:{env}")
+                    PYEOF
+                    }
+                    LAST_RESULT=""; LAST_SEQS=""; LAST_KVB=""
+                    for k in $(seq 0 $((NARMS - 1))); do
+                      arm_fields "$k"
+                      if [ "$SEQS" = max ]; then
+                        mspec=$(resolve_max "$k")
+                        case "$mspec" in
+                          SKIP*) log "ROW {\"arm\":\"$NAME\",\"skipped\":\"${mspec#SKIP }\"}"; continue ;;
+                        esac
+                        printf %s "$mspec" > "/tmp/phase/arm-$k"; arm_fields "$k"
+                        log "MAX_ARM $NAME resolved seqs=$SEQS kv=$KVB env=$XENV"
+                      fi
+                      D=/root/runs/$NAME; mkdir -p "$D" "$OUT/$NAME"
+                      BUNDLE=/root/ov/$OV/docs/native-vllm-decode-20261030
+                      log "ARM_START $NAME overlay=$OV layout=$LAYOUT seqs=$SEQS k=$ARM_K kv=$KVB env=$XENV"
+                      TAGS="B"; RESULT_JSON=""; ROWED=0
+                      if [ "$TRACE" = 1 ] && { [ -z "$TRACE_ARMS" ] || echo " $TRACE_ARMS " | grep -q " $NAME "; }; then TAGS="B A"; fi
+                      for tag in $TAGS; do
+                        att=1
+                        while :; do
+                          key=$k:$tag:$att
+                          setphase "$key:run"; t0=$(date +%s); ready=0; failed=""
+                          while [ $(( $(date +%s) - t0 )) -lt "$BOOT_TIMEOUT" ]; do
+                            n=0; for ip in "${IPS[@]}"; do health "$ip" && n=$((n + 1)); done
+                            [ $n = $NHOST ] && { ready=1; break; }
+                            failed=""; for ip in "${IPS[@]}"; do s=$(hstate "$ip"); case "$s" in "exited $key "*) failed="$failed [$ip $s]" ;; esac; done
+                            [ -n "$failed" ] && break
+                            sleep 10
+                          done
+                          if [ $ready = 1 ]; then
+                            log "ARM_READY $NAME/$tag$att boot=$(( $(date +%s) - t0 ))s $(grep -aoE 'GPU KV cache size: [0-9,]+ tokens|Maximum concurrency for [0-9,]+ tokens per request: [0-9.]+x|Ragged A2A MoE (mesh|armed|capacity)[^\"]{0,100}|LM head stored[^\"]{0,60}|Batched RPA (verify block|one-query draft steps)[^\"]{0,90}' $D/server-$tag$att-h0.log | grep -v pjrt | sort -u | head -8 | tr '\n' ' ')"
+                            if [ "$tag" = B ]; then clean_run; else trace_run; fi
+                          else
+                            log "ARM_BOOT_FAILED $NAME/$tag$att after=$(( $(date +%s) - t0 ))s failed=$failed"
+                          fi
+                          setphase "$key:stop"
+                          for t in $(seq 1 240); do
+                            n=0; for ip in "${IPS[@]}"; do [ "$(hstate $ip)" = "stopped $key" ] && n=$((n + 1)); done
+                            [ $n = $NHOST ] && break; sleep 5
+                          done
+                          log "ALL_STOPPED $key hosts=$n"
+                          if [ $ready = 1 ] && [ "$tag" = B ] && [ -f "$OUT/$NAME/server-B$att-h0.log.gz" ]; then
+                            rd=$(dirname "$(ls $D/B$att/benchmarks/*/request-0.json 2>/dev/null | head -1)")
+                            [ -d "$rd" ] && log "DEVICE_STEP $NAME/B$att $(timeout 900 python3 -I "$BUNDLE/hillclimb/pjrt_step.py" "$OUT/$NAME/server-B$att-h0.log.gz" "$rd" --tz +0800 2>&1 | tee "$D/B$att/device-step-h0.json" | python3 -c 'import json,sys; d=json.loads(sys.stdin.read()); c=d.get("cores",{}); f=sorted(c)[:2]; print(json.dumps(dict(median=d.get("step_ms_median"), min=d.get("step_ms_min"), max=d.get("step_ms_max"), window_s=d.get("window_s"), cores=dict((x, c[x]) for x in f))))' 2>&1 | cut -c1-600)"
+                            RESULT_JSON=$(python3 -I "$BUNDLE/hillclimb/arm_result.py" --arm "$NAME" --chips "$CHIPS" --summary "$D/B$att/$NAME.summary.json" --device-step "$D/B$att/device-step-h0.json" --log "$OUT/$NAME/server-B$att-h0.log.gz" 2>&1 | grep -a '^RESULT ' | cut -c8-)
+                            log "RESULT $RESULT_JSON"
+                            case "$RESULT_JSON" in *true_free_gib_min*) LAST_RESULT=$RESULT_JSON; LAST_SEQS=$SEQS; LAST_KVB=$KVB ;; esac
+                            cp "$D/B$att/device-step-h0.json" "$OUT/$NAME/" 2>/dev/null
+                          fi
+                          if [ $ready = 1 ] && [ "$tag" = A ]; then row "$RESULT_JSON" "$att" | while IFS= read -r l; do log "$l"; done; ROWED=1; fi
+                          if [ $ready != 1 ] && [ $att = 1 ] && echo "$failed" | grep -q 'tpuinit=[1-9]'; then
+                            log "ARM_RETRY $NAME/$tag after TPU-init failure"; att=2; sleep 90; continue
+                          fi
+                          break
+                        done
+                        if [ "$tag" = B ] && [ $ready != 1 ]; then log "ROW {\"arm\":\"$NAME\",\"failed\":\"boot\",\"detail\":\"$(echo "$failed" | tr -d '"' | cut -c1-200)\"}"; ROWED=1; break; fi
+                      done
+                      if [ $ROWED != 1 ]; then
+                        if [ -n "$RESULT_JSON" ]; then log "ROW $RESULT_JSON"; else log "ROW {\"arm\":\"$NAME\",\"failed\":\"no result\"}"; fi
+                      fi
+                      cp -r "$D"/. "$OUT/$NAME/" 2>/dev/null
+                      log "ARM_SAVED $NAME $(du -sh "$OUT/$NAME" | cut -f1)"
+                      rm -rf "$D"
+                    done
+                    setphase done
+                    wait $HLPID
+                    log "ALL_ARMS_DONE"; sleep 60
+                env:
+                - name: JS_NAME
+                  valueFrom:
+                    fieldRef:
+                      fieldPath: metadata.labels['jobset.sigs.k8s.io/jobset-name']
+                - name: POD_COMPLETION_INDEX
+                  valueFrom:
+                    fieldRef:
+                      fieldPath: metadata.annotations['batch.kubernetes.io/job-completion-index']
+                - name: MY_POD_IP
+                  valueFrom:
+                    fieldRef:
+                      fieldPath: status.podIP
+                - name: NODE_NAME
+                  valueFrom:
+                    fieldRef:
+                      fieldPath: spec.nodeName
+                - name: VLLM_LOGGING_LEVEL
+                  value: "INFO"
+                - name: HF_HUB_OFFLINE
+                  value: "1"
+                - name: PYTHONUNBUFFERED
+                  value: "1"
+                - name: TPU_STDERR_LOG_LEVEL
+                  value: "0"
+                - name: TPU_VMODULE
+                  value: "tpu_pjrt_client=1"
+                volumeMounts:
+                - name: dshm
+                  mountPath: /dev/shm
+                resources:
+                  limits:
+                    memory: 850Gi
+                    cpu: "200"
+                    google.com/tpu: 4
+                  requests:
+                    memory: 850Gi
+                    cpu: "200"
+                    google.com/tpu: 4
+              volumes:
+              - name: dshm
+                emptyDir:
+                  medium: Memory

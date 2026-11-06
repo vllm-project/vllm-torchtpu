@@ -16,6 +16,7 @@ run, so the MTP acceptance per draft position can be derived.
 
 import argparse
 import asyncio
+import hashlib
 import json
 import os
 import statistics
@@ -31,9 +32,22 @@ HOSTS = os.environ["NATIVE_HOST_IPS"].split(",")
 LAYOUT = os.environ.get("LAYOUT", "dp8tp4")
 GLOBAL_SEQS = int(os.environ.get("GLOBAL_SEQS", "96"))
 
+# Sampling sent with every request: greedy unless BENCH_TEMPERATURE is set.
+SAMPLING = {"temperature": float(os.environ.get("BENCH_TEMPERATURE", "0") or 0)}
+if os.environ.get("BENCH_TOP_P"):
+    SAMPLING["top_p"] = float(os.environ["BENCH_TOP_P"])
+if os.environ.get("BENCH_TOP_K"):
+    SAMPLING["top_k"] = int(os.environ["BENCH_TOP_K"])
+
+# BENCH_SAVE_IDS=1 keeps every request's token ids (request-*.json) and adds their
+# digest to the summary (greedy identity checks).
+SAVE_IDS = os.environ.get("BENCH_SAVE_IDS") == "1"
+
 # engine -> (host index, local data-parallel rank or None)
 ENGINE_MAP = {
     "dp8tp4": [(i // 2, i % 2) for i in range(8)],
+    "dp16tp4": [(i // 2, i % 2) for i in range(16)],
+    "dp32tp4": [(i // 2, i % 2) for i in range(32)],
     "dp4tp8dcp2": [(i, 0) for i in range(4)],
     "dp4tp8": [(i, 0) for i in range(4)],
     "tp32dcp8": [(0, None)],
@@ -112,11 +126,16 @@ async def run(a):
             host_idx, local_rank = engines[engine]
             # 128 prompts x 262144 tokens: index by (engine, slot); beyond 128 take the
             # second half of a prompt so every request still has distinct content.
+            # Beyond 256, later rounds take evenly spaced windows inside the prompt.
             k = engine * per_engine + slot
             item = dataset[k % len(dataset)]
             suffix = item["suffix_ids"]
             body_len = a.input - len(suffix)
             offset = (k // len(dataset)) * body_len
+            rounds = -(-GLOBAL_SEQS // len(dataset))
+            if rounds > 2:
+                span = len(item["token_ids"]) - body_len
+                offset = (k // len(dataset)) * (span // (rounds - 1))
             prompt = item["token_ids"][offset : offset + body_len] + suffix
             assert len(prompt) == a.input, (len(prompt), a.input)
             await ready.wait()
@@ -138,7 +157,7 @@ async def run(a):
                 "max_tokens": a.output,
                 "min_tokens": a.output,
                 "ignore_eos": True,
-                "temperature": 0.0,
+                **SAMPLING,
                 "stream": True,
                 "stream_options": {"include_usage": True},
                 "return_token_ids": True,
@@ -176,6 +195,8 @@ async def run(a):
                                 events.append(
                                     {"time": time.perf_counter(), "tokens": len(ids)}
                                 )
+                                if SAVE_IDS:
+                                    row.setdefault("ids", []).extend(ids)
                             if c.get("finish_reason"):
                                 row["finish_reason"] = c["finish_reason"]
             except Exception as e:
@@ -197,7 +218,10 @@ async def run(a):
             )
             print(
                 json.dumps(
-                    {"completed": i, **{k: v for k, v in row.items() if k != "usage"}}
+                    {
+                        "completed": i,
+                        **{k: v for k, v in row.items() if k not in ("usage", "ids")},
+                    }
                 ),
                 flush=True,
             )
@@ -217,6 +241,7 @@ async def run(a):
         "global_seqs": GLOBAL_SEQS,
         "engines": len(engines),
         "parameters": vars(a),
+        "sampling": SAMPLING,
         "requests": rows,
         "metrics_before": before,
         "metrics_after": after,
@@ -226,6 +251,12 @@ async def run(a):
             r["tokens"] == a.output and "error" not in r for r in rows
         ),
     }
+    if SAVE_IDS:
+        ids = json.dumps([r.get("ids", []) for r in rows]).encode()
+        result["ids_sha256"] = hashlib.sha256(ids).hexdigest()[:16]
+        result["requests"] = [
+            {k: v for k, v in r.items() if k != "ids"} for r in result["requests"]
+        ]
     tpots = [r["tpot_ms"] for r in rows if "tpot_ms" in r]
     result["full_request_mean_tpot_ms"] = statistics.mean(tpots) if tpots else None
     ttfts = [r["ttft_s"] for r in rows if "ttft_s" in r]

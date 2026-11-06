@@ -5,6 +5,7 @@
 #   LAYOUT=tp32dcp8 bash serve_sweep.sh <host-rank>
 # Knobs (env, defaults = the 2026-10-30 baseline):
 #   LAYOUT        dp8tp4 | dp4tp8dcp2 | dp4tp8 | tp32dcp8 | tp32dcp4 | dp2tp16dcp4   (layout.sh)
+#                 eight hosts: dp16tp4; sixteen hosts: dp32tp4
 #                 single host: tp8 | tp8xdcp2 | dp2xtp4
 #   GLOBAL_SEQS   total concurrent requests across the slice (max-num-seqs = GLOBAL_SEQS / engines)
 #   MTP_K         draft tokens per step; 0 disables speculative decoding
@@ -40,7 +41,7 @@
 #   EXTRA_ARGS    appended verbatim to vllm serve
 set -euo pipefail
 # shellcheck disable=SC1091
-source "$(dirname -- "$0")/../env.sh" "${1:?Pass host rank 0..3}"
+source "$(dirname -- "$0")/../env.sh" "${1:?Pass the host rank}"
 # shellcheck disable=SC1091
 source "$(dirname -- "$0")/layout.sh"
 KV_BYTES=${KV_BYTES:-auto}
@@ -163,7 +164,7 @@ elif [[ -n "$HOT_SET" ]]; then
   [[ "${HS_SPREAD:-}" == spread ]] && export TPU_MOE_HOT_SET_SPREAD=1
 fi
 export TORCH_TPU_TIER2_COMPILATION_CACHE="native_decode_${LAYOUT}_${POD_IP}"
-echo "HILLCLIMB layout=$LAYOUT host=$HOST_RANK engines=$ENGINES seqs/engine=$SEQS_PER_ENGINE mtp=$MTP_K mnbt=$MNBT compile=$COMPILE_SIZES kv=$KV_BYTES async=$ASYNC_SCHED fused_ep=$FUSED_EP w4a8=$W4A8 expert_block=${EXPERT_BLOCK:-16} attn_block=${ATTN_BLOCK:-default} verify_block=${VERIFY_BLOCK:-default} draft_one_query=$DRAFT_ONE_QUERY moe_a2a=$MOE_A2A a2a_sc_offload=${A2A_SC_OFFLOAD:-default} fused_draft=$FUSED_DRAFT fast_subst=$FAST_SUBST lm_head_hidden_major=$LM_HEAD_HIDDEN_MAJOR embed_shard=${EMBED_SHARD:-tp} packed_dispatch=$PACKED_DISPATCH fused_combine=$FUSED_COMBINE weights=$WEIGHTS kv_mode=$KV_MODE synth_accept=${SYNTH_ACCEPT:-none} candidate_sampling=$CANDIDATE_SAMPLING hot_set=${HOT_SET:-none} headless=${HEADLESS_ARGS[*]:-no}"
+echo "HILLCLIMB layout=$LAYOUT host=$HOST_RANK topology=$TPU_TOPOLOGY wrap=$TPU_TOPOLOGY_WRAP engines=$ENGINES seqs/engine=$SEQS_PER_ENGINE mtp=$MTP_K mnbt=$MNBT compile=$COMPILE_SIZES kv=$KV_BYTES async=$ASYNC_SCHED fused_ep=$FUSED_EP w4a8=$W4A8 expert_block=${EXPERT_BLOCK:-16} attn_block=${ATTN_BLOCK:-default} verify_block=${VERIFY_BLOCK:-default} draft_one_query=$DRAFT_ONE_QUERY moe_a2a=$MOE_A2A a2a_sc_offload=${A2A_SC_OFFLOAD:-default} fused_draft=$FUSED_DRAFT fast_subst=$FAST_SUBST lm_head_hidden_major=$LM_HEAD_HIDDEN_MAJOR embed_shard=${EMBED_SHARD:-tp} packed_dispatch=$PACKED_DISPATCH fused_combine=$FUSED_COMBINE weights=$WEIGHTS kv_mode=$KV_MODE synth_accept=${SYNTH_ACCEPT:-none} candidate_sampling=$CANDIDATE_SAMPLING hot_set=${HOT_SET:-none} headless=${HEADLESS_ARGS[*]:-no}"
 
 exec numactl --interleave=all "$VLLM_BIN" serve \
   --pipeline-parallel-size 1 \

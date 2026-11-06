@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 set -euo pipefail
 # shellcheck source-path=SCRIPTDIR
-source "$(dirname -- "$0")/env.sh" "${1:?Pass host rank 0..3}"
+source "$(dirname -- "$0")/env.sh" "${1:?Pass the host rank}"
 MODE=${2:-synthetic}
 case "$MODE" in
   synthetic)
@@ -14,7 +14,7 @@ esac
 cd "$NATIVE_RUN_DIR"
 exec numactl --interleave=all "$VLLM_BIN" serve \
   --pipeline-parallel-size 1 \
-  --data-parallel-size 8 \
+  --data-parallel-size "$((NUM_HOSTS * 2))" \
   --data-parallel-size-local 2 \
   --nnodes 1 \
   --distributed-executor-backend mp \

@@ -1,14 +1,26 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: Apache-2.0
 # Source in the container: source ./env.sh HOST_RANK
-HOST_RANK=${1:?Pass host rank 0, 1, 2 or 3 (0 on a single host)}
-: "${NATIVE_HOST_IPS:?Set one or four comma-separated host addresses in rank order}"
+HOST_RANK=${1:?Pass the host rank (0 on a single host)}
+: "${NATIVE_HOST_IPS:?Set 1, 4, 8 or 16 comma-separated host addresses in rank order}"
 : "${MODEL_PATH:?Set the model configuration and tokenizer directory}"
 IFS=',' read -r -a HOST_IPS <<< "$NATIVE_HOST_IPS"
 NUM_HOSTS=${#HOST_IPS[@]}
-if [[ ! "$NUM_HOSTS" =~ ^[14]$ || ! "$HOST_RANK" =~ ^[0-3]$ ]] || (( HOST_RANK >= NUM_HOSTS )); then
-  echo 'Expected one or four host addresses and a host rank below that count' >&2
+# Slice per host count (each host holds 2x2x1 chips): topology and host bounds.
+case "$NUM_HOSTS" in
+  1|4) SLICE_TOPOLOGY=2x2x$NUM_HOSTS SLICE_HOST_BOUNDS=1,1,$NUM_HOSTS ;;
+  8) SLICE_TOPOLOGY=2x4x4 SLICE_HOST_BOUNDS=1,2,4 ;;
+  16) SLICE_TOPOLOGY=4x4x4 SLICE_HOST_BOUNDS=2,2,4 ;;
+  *) SLICE_TOPOLOGY="" ;;
+esac
+if [[ -z "$SLICE_TOPOLOGY" || ! "$HOST_RANK" =~ ^[0-9]+$ ]] || (( HOST_RANK >= NUM_HOSTS )); then
+  echo 'Expected 1, 4, 8 or 16 host addresses and a host rank below that count' >&2
   return 2
+fi
+# A 4x4x4 slice may have wraparound links: keep the platform's setting for it.
+SLICE_WRAP=false,false,false
+if [[ "$SLICE_TOPOLOGY" == 4x4x4 && "${TPU_TOPOLOGY:-}" == 4x4x4 && -n "${TPU_TOPOLOGY_WRAP:-}" ]]; then
+  SLICE_WRAP=$TPU_TOPOLOGY_WRAP
 fi
 export POD_IP=${HOST_IPS[$HOST_RANK]}
 export MASTER_ADDRESS=${HOST_IPS[0]}
@@ -29,9 +41,9 @@ export MALLOC_ARENA_MAX=16
 export LIBTPU_INIT_ARGS='--xla_tpu_use_dynamic_smem_negotiation=true --xla_tpu_sparse_core_all_reduce_offload_min_size_in_bytes=67108864 --xla_tpu_sparse_core_all_gather_offload_min_size_in_bytes=67108864 --xla_tpu_enable_diagnostic_coordinator=false --tpu_core_dump_directory=/dev/shm/tpu_core_dumps --tpu_core_dump_arch_states=TPU_CORE_DUMP_ARCH_STATE_MINIMAL,TPU_CORE_DUMP_ARCH_STATE_TC,TPU_CORE_DUMP_ARCH_STATE_SCS,TPU_CORE_DUMP_ARCH_STATE_SC_TEC,TPU_CORE_DUMP_ARCH_STATE_SC_SGE --xla_tpu_report_hlo_details_in_core_dump=true --xla_tpu_use_enhanced_launch_barrier=true'
 export TPU_ACCELERATOR_TYPE=tpu7x-$((NUM_HOSTS * 8))
 export TPU_CHIPS_PER_HOST_BOUNDS=2,2,1
-export TPU_HOST_BOUNDS=1,1,$NUM_HOSTS
-export TPU_TOPOLOGY=2x2x$NUM_HOSTS
-export TPU_TOPOLOGY_WRAP=false,false,false
+export TPU_HOST_BOUNDS=$SLICE_HOST_BOUNDS
+export TPU_TOPOLOGY=$SLICE_TOPOLOGY
+export TPU_TOPOLOGY_WRAP=$SLICE_WRAP
 export TPU_SKIP_MDS_QUERY=true
 export TPU_VISIBLE_CHIPS=0,1,2,3,4,5,6,7
 export TPU_MULTIHOST_BACKEND=mp
