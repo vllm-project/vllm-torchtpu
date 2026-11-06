@@ -279,6 +279,7 @@ def test_connector_pass_wiring(monkeypatch):
                                     QWEN4_EXP_PD_BATCHED_ADMISSION_CHECK=0)
     logs = []
     ns = {"time": time, "torch": torch, "Any": object, "tpu_envs": envs_ns, "_Stage3LoadMeta": _LoadMeta,
+          "_STAGE3_ADMISSION_STATS_EVERY": 2,
           "dist_utils": types.SimpleNamespace(get_p2p_wait_pull_timeout=lambda: 2 * BUDGET),
           "logger": types.SimpleNamespace(info=lambda *a: logs.append(a[0] % a[1:]), warning=lambda *a, **k: None)}
     W = type("W", (), {})
@@ -335,3 +336,7 @@ def test_connector_pass_wiring(monkeypatch):
         W._stage3_admission_after_pass(w, None)
     assert modes == [False, False, True, True, False, False]
     assert sum("Stage-3 batched admission ON from pass 3" in m for m in logs) == 1
+    # Parked loads are reported with the pass time (one parked load, "b", in every pass).
+    stats = [m for m in logs if "A/B stats" in m]
+    assert stats and all("parked/pass=1.00" in m and "passes_with_parked=" in m for m in stats), stats
+    assert any("mode=ON" in m for m in stats) and any("mode=OFF" in m for m in stats)

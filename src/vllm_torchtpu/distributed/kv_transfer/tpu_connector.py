@@ -133,6 +133,8 @@ _STAGE3_REGISTRY_STATUS_CANCELLED = 4
 # Deferred-submit re-attempts ride cheap no-forward steps, which can cycle at
 # kHz while a load waits; rate-limit the controller RPCs per parked request.
 _STAGE3_REGISTRATION_REATTEMPT_MIN_INTERVAL_S = 0.05
+# QWEN4_EXP_PD_BATCHED_ADMISSION A/B statistics: connector passes per log line, per mode.
+_STAGE3_ADMISSION_STATS_EVERY = 200
 _STAGE3_REGISTRATION_CANCELLED_ERROR = "Request block registration was cancelled"
 # Pool selection is vLLM policy expressed as request data: the connector names
 # the manifest tags to move and raiden resolves them against both peers'
@@ -6635,26 +6637,39 @@ class TPURaidenConnectorWorker:
             return
         on, t0, n_candidates = meta
         stats = self.__dict__.setdefault("_stage3_admission_stats", {})
-        st = stats.setdefault(on, {"passes": 0, "ms": [], "cand": 0, "coll": 0})
+        st = stats.setdefault(on, {"passes": 0, "ms": [], "cand": 0, "coll": 0, "parked": 0, "ms_parked": []})
         st["passes"] += 1
-        st["ms"].append((time.perf_counter() - t0) * 1e3)
+        ms_pass = (time.perf_counter() - t0) * 1e3
+        st["ms"].append(ms_pass)
         st["cand"] += n_candidates
         st["coll"] += admission.collectives if admission is not None else 0
-        if st["passes"] % 500 == 0:
+        # Loads still parked after this pass (rank-identical): the cost follows the
+        # backlog, so a window without parked loads must not read as a null.
+        parked = len(self._stage3_destination_waits)
+        st["parked"] += parked
+        if parked:
+            st["ms_parked"].append(ms_pass)
+        n = len(st["ms"])
+        if n >= _STAGE3_ADMISSION_STATS_EVERY:
             ms = sorted(st["ms"])
+            mp = st["ms_parked"]
             logger.info(
                 "Stage-3 admission A/B stats rank%d mode=%s passes=%d pass_ms mean=%.3f "
-                "p50=%.3f p90=%.3f candidates/pass=%.2f batched_collectives/pass=%.2f",
+                "p50=%.3f p90=%.3f candidates/pass=%.2f batched_collectives/pass=%.2f "
+                "parked/pass=%.2f passes_with_parked=%d pass_ms_with_parked=%.3f",
                 self.tp_rank,
                 "ON" if on else "OFF",
                 st["passes"],
-                sum(ms) / len(ms),
-                ms[len(ms) // 2],
-                ms[min(len(ms) - 1, int(0.9 * len(ms)))],
-                st["cand"] / 500,
-                st["coll"] / 500,
+                sum(ms) / n,
+                ms[n // 2],
+                ms[min(n - 1, int(0.9 * n))],
+                st["cand"] / n,
+                st["coll"] / n,
+                st["parked"] / n,
+                len(mp),
+                sum(mp) / len(mp) if mp else 0.0,
             )
-            st["ms"], st["cand"], st["coll"] = [], 0, 0
+            st["ms"], st["cand"], st["coll"], st["parked"], st["ms_parked"] = [], 0, 0, 0, []
         if admission is not None:
             self._stage3_admission_compare(admission)
 
