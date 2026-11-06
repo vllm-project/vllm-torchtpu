@@ -386,6 +386,10 @@ class Qwen4ExpDecoderLayer(nn.Module):
         block = torch.where(valid_tokens[:, None], block, 0)
         if sequence_parallel:
             moe = self._sequence_parallel_moe(block, num_tokens)
+        elif sp.pcp_world_size() > 1:
+            # PCP: experts are split over the group, whose MoE runner takes
+            # each rank's own rows (sequence_parallel.pcp_shard).
+            moe = sp.pcp_gather(self.mlp(sp.pcp_shard(block)))
         else:
             moe = self.mlp(block)
         return self.mlp_hyper_connection.combine(sp.pad_shard(moe, sp_pad), residual)

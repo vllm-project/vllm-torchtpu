@@ -157,3 +157,33 @@ def reduce(x: torch.Tensor, sequence_parallel: bool) -> torch.Tensor:
     if sequence_parallel:
         return tensor_model_parallel_reduce_scatter(x, 0)
     return tensor_model_parallel_all_reduce(x)
+
+
+def pcp_world_size() -> int:
+    """Prefill-context-parallel group size (1 without PCP)."""
+    from vllm_torchtpu.distributed.pcp import get_pcp_world_size
+
+    return get_pcp_world_size()
+
+
+def pcp_shard(x: torch.Tensor) -> torch.Tensor:
+    """This PCP rank's contiguous rows of a step-wide [tokens, ...] tensor.
+
+    Under PCP qwen4_exp runs every step's tokens on every rank of the group;
+    vLLM's MoE runner, with experts split over the group, all-gathers each
+    rank's own rows and reduce-scatters the result back (__init__.py
+    ``_patch_moe_explicit_pcp_collectives``), so the MoE takes this shard.
+    """
+    from vllm_torchtpu.distributed.pcp import get_pcp_rank
+
+    size = pcp_world_size()
+    rows = x.shape[0] // size
+    return x.narrow(0, get_pcp_rank() * rows, rows)
+
+
+def pcp_gather(x: torch.Tensor) -> torch.Tensor:
+    """All PCP ranks' shards back as the step-wide tensor, in token order."""
+    from vllm_torchtpu.distributed.pcp import all_gather_equal_tokens
+
+    return all_gather_equal_tokens(x, dim=0)
+

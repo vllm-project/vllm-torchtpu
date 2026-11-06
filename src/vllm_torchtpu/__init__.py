@@ -1029,8 +1029,11 @@ def _patch_vllm_hybrid_pcp_block_sizes() -> None:
         # Specs describe physical, rank-local pages. Capacity admission and
         # auto-fit run before the coordinator converts them to logical PCP
         # pages, so account for context sharding here as well as for DCP.
+        # Qwen4Exp's specs are already logical (see resolve below).
+        from vllm_torchtpu.models.vllm.qwen4_exp.offload import is_qwen4_exp
+
         parallel = vllm_config.parallel_config
-        cp_size = max(
+        cp_size = 1 if is_qwen4_exp(vllm_config) else max(
             parallel.prefill_context_parallel_size,
             parallel.decode_context_parallel_size,
         )
@@ -1114,9 +1117,17 @@ def _patch_vllm_hybrid_pcp_block_sizes() -> None:
         if not _is_attention_mamba_hybrid(groups):
             return original_resolve(kv_cache_config, vllm_config)
 
-        group_block_sizes = [
-            _effective_block_size(group.kv_cache_spec, pcp) for group in groups
-        ]
+        from vllm_torchtpu.models.vllm.qwen4_exp.offload import is_qwen4_exp
+
+        if is_qwen4_exp(vllm_config):
+            # Qwen4Exp's specs already state logical blocks under PCP: its
+            # main KV entries cover PCP pages (pool_layout, like main-KV
+            # DCP), and everything else is replicated per rank, not split.
+            group_block_sizes = [group.kv_cache_spec.block_size for group in groups]
+        else:
+            group_block_sizes = [
+                _effective_block_size(group.kv_cache_spec, pcp) for group in groups
+            ]
         scheduler_block_size = math.lcm(*group_block_sizes)
 
         connector_enabled = vllm_config.kv_transfer_config is not None

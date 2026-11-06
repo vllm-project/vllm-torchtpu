@@ -46,6 +46,26 @@ def get_pcp_group() -> Any | None:
         return None
 
 
+def pcp_splits_tokens(vllm_config: Any) -> bool:
+    """Whether prefill context parallelism shards this model's step tokens.
+
+    Qwen4Exp runs every step's tokens on every rank of a PCP group and splits
+    only its QSA main KV, by token, inside the model (pool_layout,
+    qsa_op.build_pooled_qsa_pcp_op); for it the runner keeps the whole-step
+    layout and block strides, as without PCP."""
+    from vllm_torchtpu.models.vllm.qwen4_exp.offload import is_qwen4_exp
+
+    return not is_qwen4_exp(vllm_config)
+
+
+def token_pcp_world_size(vllm_config: Any) -> int:
+    """PCP size the runner shards tokens and state cadences by: the PCP world
+    size, or 1 for a model that keeps whole steps (``pcp_splits_tokens``)."""
+    if vllm_config is not None and not pcp_splits_tokens(vllm_config):
+        return 1
+    return get_pcp_world_size()
+
+
 def get_pcp_rank() -> int:
     group = get_pcp_group()
     return 0 if group is None else int(group.rank_in_group)

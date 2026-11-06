@@ -624,17 +624,43 @@ def validate_config(cfg):
     # hook. TPU's existing platform_activation patch disables it afterward;
     # rejecting that intermediate property would block every mixed TP/DP.
     if (
-        p.prefill_context_parallel_size != 1
-        or p.decode_context_parallel_size != 1
+        p.decode_context_parallel_size != 1
         or p.enable_dbo
         or p.enable_eplb
         or p.expert_placement_strategy != "linear"
         or p.enable_elastic_ep
     ):
         raise ValueError(
-            "Qwen4Exp TPU requires CP1, "
+            "Qwen4Exp TPU requires DCP1, "
             "linear expert placement and no DBO/EPLB/elastic EP"
         )
+    if p.prefill_context_parallel_size > 1:
+        from .pool_layout import (
+            merge_compressed_k_enabled,
+            pack_compressed_k_enabled,
+            pack_main_kv_enabled,
+            main_kv_dcp,
+        )
+
+        # Prefill context parallelism: every rank of a PCP group runs the
+        # step's tokens and heads; QSA main KV is split by token over the
+        # group (pool_layout.pcp_interleave, qsa_op.build_pooled_qsa_pcp_op)
+        # and the routed experts over the group (expert parallelism).
+        if (
+            p.tensor_parallel_size != 1
+            or not p.enable_expert_parallel
+            or not use_unified_pool()
+            or main_kv_dcp() > 1
+            or pack_compressed_k_enabled()
+            or pack_main_kv_enabled()
+            or merge_compressed_k_enabled()
+            or cfg.speculative_config is not None
+        ):
+            raise ValueError(
+                "Qwen4Exp PCP requires TP1, --enable-expert-parallel, the unified "
+                "pool, no VLLM_TPU_QSA_MAIN_KV_DCP, unpacked and unmerged "
+                "compressed keys, unpacked main KV and speculative decoding off"
+            )
     if p.pipeline_parallel_size > 1:
         from .pool_layout import pack_compressed_k_enabled
 
