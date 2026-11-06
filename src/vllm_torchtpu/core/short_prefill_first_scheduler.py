@@ -22,8 +22,9 @@ ShortPrefillFirstScheduler moves waiting requests with at most
 TPU_SHORT_PREFILL_FIRST_TOKENS uncached tokens to the head of the waiting
 queue, in arrival order, and caps the running prefill chunks of the step at
 the budget those requests leave. The budget and every request's tokens stay
-the same; only the order of prompt chunks changes. The cap and the lookups
-are in core/short_prompts_first.py.
+the same; only the order of prompt chunks changes. PrefixAwareScheduler
+serves short prompts the same way with prefix caching; core/short_prompts_first.py
+says when to use which.
 
 Enable with:
     TPU_SHORT_PREFILL_FIRST_TOKENS=2048

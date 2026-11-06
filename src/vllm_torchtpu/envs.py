@@ -142,6 +142,7 @@ if TYPE_CHECKING:
     TPU_SHORT_PREFILL_FIRST_TOKENS: int = 0
     TPU_DEFER_STEP: bool = False
     VLLM_TPU_FOLLOW_SHARED_PREFIX: bool = False
+    TPU_PREFIX_AWARE_SHORT_PROMPTS: str = "off"
     MLA_XPOSE_N_TILE_SIZE: int = 160
     MIXED_Q_SPLIT: int | None = None
     MIXED_NUM_QUERIES_PER_BLOCK: int | None = None
@@ -1493,6 +1494,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # has already cached waits instead of computing it, then takes the cached
     # tokens (core/prefix_aware_scheduler.py). Exact; off computes every chunk.
     "VLLM_TPU_FOLLOW_SHARED_PREFIX": env_bool("VLLM_TPU_FOLLOW_SHARED_PREFIX"),
+    # PrefixAwareScheduler serves short prompts beside running longer
+    # prefills (core/prefix_aware_scheduler.py, _short_prompt_limit says
+    # which prompts are short).
+    # A tradeoff: short prompts reach their first token sooner, and a second
+    # running long prefill gets fewer tokens per step. "off" schedules as
+    # before; "first" serves short prompts first.
+    "TPU_PREFIX_AWARE_SHORT_PROMPTS": env_with_choices(
+        "TPU_PREFIX_AWARE_SHORT_PROMPTS", "off", ["off", "first"]
+    ),
     # Tile size for MLA transpose pipeline.
     "MLA_XPOSE_N_TILE_SIZE": lambda: int(os.getenv("MLA_XPOSE_N_TILE_SIZE", "160")),
     "MIXED_Q_SPLIT": env_optional_int("MIXED_Q_SPLIT"),
