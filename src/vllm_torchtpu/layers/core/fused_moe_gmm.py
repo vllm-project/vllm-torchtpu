@@ -482,12 +482,18 @@ def prepare_routed_gmm_inputs(
                 jnp.array([0], dtype=jnp.int32),
                 valid_count[None],
             )
-    elif not use_ep and nonep_gather == "sc":
+    elif not use_ep and nonep_gather in ("sc", "sc_padded"):
+        # "sc_padded" keeps the kernel's whole row blocks (64,000 routed rows
+        # come back as 65,536): the GMMs visit only rows inside expert groups
+        # and the combine reads rows by index, so the extra rows are never read,
+        # and the trimming copy (1.2 ms per 6,400-token stage step in screen1)
+        # goes away. The rows that are read are the same.
         x = ragged_gather_v2(
             hidden_states_local,
             token_indices_sorted,
             jnp.array([0], dtype=jnp.int32),
             jnp.array([token_indices_sorted.shape[0]], dtype=jnp.int32),
+            trim_rows=nonep_gather == "sc",
         )
     elif not use_ep and nonep_gather == "xla_colchunk":
         x = column_chunked_gather(

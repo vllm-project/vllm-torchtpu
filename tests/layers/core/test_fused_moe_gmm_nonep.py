@@ -422,3 +422,38 @@ def test_split_weights_ref_blocks_equal_the_whole_tile(nsplit):
             continue   # the kernel requires blocks inside one part (lane-aligned parts, mxu-aligned chunks)
         for k0, k1 in ((0, 512), (512, 640)):
             np.testing.assert_array_equal(ref.weight_block(k0, k1, n0, n1), tile[k0:k1, n0:n1])
+
+
+def test_sc_padded_gather_matches_sc_and_keeps_padded_rows(monkeypatch):
+    """TPU_MOE_NONEP_GATHER=sc_padded: the gathered rows keep the kernel's
+    padded row blocks (no trimming copy), and the MoE output is bitwise the
+    trimmed path's, because no GMM visit or combine index reaches the extra rows."""
+    experts, hidden, inter, topk, tokens = 16, 512, 128, 4, 640
+    k1, k2, k3 = jax.random.split(jax.random.key(9), 3)
+    w1, s1 = _fp8_per_channel(k1, (experts, hidden, 2 * inter))
+    w2, s2 = _fp8_per_channel(k2, (experts, inter, hidden))
+    x = (jax.random.normal(k3, (tokens, hidden), jnp.float32) / 4).astype(jnp.bfloat16)
+    rng = np.random.default_rng(8)
+    ids = jnp.asarray(np.stack([rng.choice(experts, topk, replace=False) for _ in range(tokens)]), jnp.int32)
+    w = jnp.asarray(rng.random((tokens, topk)), jnp.bfloat16)
+
+    def fake_sc_gather(src, idx, start, end, trim_rows=True):
+        # the kernel writes whole 2,048-row blocks; padded slots gather row 0
+        pad = -idx.shape[0] % 2048
+        out = src[jnp.pad(idx, (0, pad))]
+        return out[: idx.shape[0]] if trim_rows else out
+
+    monkeypatch.setattr(fused_moe_gmm, "ragged_gather_v2", fake_sc_gather)
+    monkeypatch.setattr(fused_moe_gmm, "gmm_wrapper", _ref_gmm([]))
+    padded = prepare_routed_gmm_inputs(x, ids, w, local_num_experts=experts, topk=topk, use_ep=False,
+                                       use_sparse_core=True, nonep_gather="sc_padded")[0]
+    assert padded.shape[0] == 4096 and tokens * topk == 2560
+
+    def run(gather):
+        return fused_moe_gmm.fused_moe_func.__wrapped__(
+            x, w1, w2, s1, s2, None, None, w, ids, topk=topk, activation="silu",
+            use_ep=False, use_sparse_core=True, nonep_gather=gather)
+
+    ref = _bits(run("xla"))
+    np.testing.assert_array_equal(_bits(run("sc")), ref)
+    np.testing.assert_array_equal(_bits(run("sc_padded")), ref)

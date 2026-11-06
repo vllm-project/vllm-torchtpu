@@ -1378,12 +1378,13 @@ def make_gmm_configs(
         tiles = tile_info(dims, lhs_cfgs, rhs_cfgs, vmem_limit_bytes, fuse_act)
 
     if rhs_split > 1:
-        num_lanes = pltpu.get_tpu_info().num_lanes
+        # Parts must hold whole mxu-wide column chunks: the inner loop reads one
+        # chunk at a time from one part.
         if not (
             fuse_act is None
             and tiles.tile_n == dims.size_n
             and dims.size_n % rhs_split == 0
-            and (dims.size_n // rhs_split) % num_lanes == 0
+            and (dims.size_n // rhs_split) % pltpu.get_tpu_info().mxu_column_size == 0
             and dims.size_k % tiles.tile_k == 0
             and not rhs_cfgs.should_dequantize_before_matmul
             and get_packing_factor(rhs_cfgs.dtype, rhs_cfgs.quant_dtype) == 1

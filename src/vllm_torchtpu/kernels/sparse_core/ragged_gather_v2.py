@@ -217,9 +217,17 @@ def main_kernel_v2(
 
 @jax.jit
 def ragged_gather_v2(
-    x: jax.Array, indices: jax.Array, start: jax.Array, end: jax.Array
+    x: jax.Array,
+    indices: jax.Array,
+    start: jax.Array,
+    end: jax.Array,
+    trim_rows: bool = True,
 ) -> jax.Array:
-    """Perform gather on indices within dynamic array start and end using BlockSpec."""
+    """Perform gather on indices within dynamic array start and end using BlockSpec.
+
+    The kernel writes whole row blocks. ``trim_rows=False`` returns them as they
+    are (rows past ``indices.size`` hold row ``x[0]``), which spares the copy that
+    trimming a large output costs when the consumer never reads those rows."""
 
     assert x.ndim == 2, "Ragged gather only supports 2d inputs."
     assert indices.ndim == 1, "Ragged gather only supports 1d indices."
@@ -268,7 +276,7 @@ def ragged_gather_v2(
         core_axis_name="core",
         subcore_axis_name="subcore",
     )
-    return core_map_helper.kernel(
+    out = core_map_helper.kernel(
         functools.partial(
             main_kernel_v2,
             core_axis_name=vector_mesh.core_axis_name,
@@ -290,4 +298,5 @@ def ragged_gather_v2(
         ],
         mesh=vector_mesh,
         name="sc_ragged_gather_v2",
-    )(start, end, x, indices)[:out_size, :hidden_size]
+    )(start, end, x, indices)
+    return out[:out_size, :hidden_size] if trim_rows else out[:, :hidden_size]

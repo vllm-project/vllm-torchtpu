@@ -1129,10 +1129,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     #   "xla_chunked"  the same gather in pieces of TPU_MOE_NONEP_GATHER_CHUNK
     #                  rows (the source table is unchanged; a control).
     #   "sc"           the SparseCore ragged_gather_v2 kernel.
+    #   "sc_padded"    the same, keeping the kernel's padded row blocks (no
+    #                  trimming copy; the extra rows are never read).
     "TPU_MOE_NONEP_GATHER": env_with_choices(
         "TPU_MOE_NONEP_GATHER",
         "xla",
-        ["xla", "xla_colchunk", "xla_chunked", "sc"],
+        ["xla", "xla_colchunk", "xla_chunked", "sc", "sc_padded"],
         case_sensitive=False,
     ),
     # Columns per block for "xla_colchunk". 0 picks the widest block (a
@@ -1179,7 +1181,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # rhs_split). Its visits are paced by the weight DMA at prefill sizes.
     # Bitwise the same output.
     "TPU_MOE_NONEP_GMM2_RHS_SPLIT": env_with_choices(
-        "TPU_MOE_NONEP_GMM2_RHS_SPLIT", "1", ["1", "2", "4", "5"]
+        "TPU_MOE_NONEP_GMM2_RHS_SPLIT", "1", ["1", "2", "5"]
     ),
     # Serve eligible tensor-parallel MoE layers (sigmoid + correction-bias
     # top-k with renormalization, one shared expert, FP8 per-channel weights)
