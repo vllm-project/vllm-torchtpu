@@ -47,6 +47,20 @@ def compressed_live_bytes(layout) -> int | None:
     return live if 0 < live < layout.page_bytes else None
 
 
+def pool_tag(group_index: int, name: str, *, pcp_rank: int = 0, split: bool = False) -> str:
+    """Raiden pool tag of a cache owner's pages.
+
+    A PCP producer is one transfer unit per PCP rank of a stage. Its main-KV
+    owners hold different tokens on every rank (``split``), so their tags
+    carry the rank; the other owners are identical on every rank, and only
+    rank 0's keep the plain tag a consumer pulls (the others' ``.pcp{r}`` tags
+    are never requested)."""
+    tag = f"qwen4.g{group_index}.{name}"
+    if split or pcp_rank > 0:
+        tag += f".pcp{pcp_rank}"
+    return tag
+
+
 def page_regions(name: str, page_bytes: int, compressed_live: int | None):
     """A pool's live region: whole pages, or a compressed-key page's keys."""
     if compressed_live is not None and name.endswith(".compressed_k"):
@@ -98,6 +112,11 @@ def build_transfer_manifest(
     pools = []
     referenced = set()
     compressed_live = compressed_live_bytes(layout)
+    from vllm_torchtpu.distributed.pcp import get_pcp_rank, get_pcp_world_size
+
+    pcp = get_pcp_world_size()
+    pcp_rank = get_pcp_rank() if pcp > 1 else 0
+    split_owners = set(getattr(layout, "main_dcp_owners", ())) if pcp > 1 else set()
     for group in groups:
         page_bytes = config.kv_cache_groups[
             group.group_index
@@ -129,7 +148,9 @@ def build_transfer_manifest(
                 raise ManifestError(f"Qwen PD owner {name} has incompatible FP8 pages")
             pools.append(
                 PoolEntry(
-                    tag=f"qwen4.g{group.group_index}.{name}",
+                    tag=pool_tag(
+                        group.group_index, name, pcp_rank=pcp_rank, split=name in split_owners
+                    ),
                     layer_name=name,
                     storage_index=index,
                     base_offset_bytes=0,

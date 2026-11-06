@@ -178,18 +178,33 @@ def main_rows(
 
 
 def main_rows_np(
-    num_tokens, src_pages, src_block, dst_pages, dst_block, rank, start=0, src_first=0
+    num_tokens, src_pages, src_block, dst_pages, dst_block, rank, start=0, src_first=0,
+    src_pcp=None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """``main_rows`` as int64 arrays, vectorized (a 100k-token load has a
     row per token per layer: the Python loop took ~0.7 s per request on the
-    decode's worker thread, stalling its steps)."""
+    decode's worker thread, stalling its steps).
+
+    ``src_pcp = (P, I)``: a PCP producer split this owner's main KV over its P
+    ranks in units of I tokens (``qsa_rpa.dcp_owner_row``); ``src_pages`` is
+    then one staged page list per producer rank, a page per P-page entry, and
+    ``src_first`` counts entries."""
     t = np.arange(start, num_tokens, dtype=np.int64)
     d = rank.main_dcp
     if d > 1:
         t = t[(t // dst_block) % d == rank.dcp_rank]
-    sp = np.asarray(src_pages, dtype=np.int64)
     dp = np.asarray(dst_pages, dtype=np.int64)
-    src = sp[t // src_block - src_first] * src_block + t % src_block
+    if src_pcp is not None:
+        p, interleave = src_pcp
+        span = p * src_block
+        offset = t % span
+        owner = (offset // interleave) % p
+        row = offset // (interleave * p) * interleave + offset % interleave
+        by_rank = np.asarray(src_pages, dtype=np.int64)  # [P, entries staged]
+        src = by_rank[owner, t // span - src_first] * src_block + row
+    else:
+        sp = np.asarray(src_pages, dtype=np.int64)
+        src = sp[t // src_block - src_first] * src_block + t % src_block
     dst = dp[t // (d * dst_block)] * dst_block + t % dst_block
     return src, dst
 
@@ -529,8 +544,22 @@ class StagedConsumer:
         # and no MTP draft: a decode-only draft (this engine's
         # speculative_config) adds draft owners and speculative state blocks
         # the producer's plan does not have.
+        # A PCP producer (QWEN4_EXP_PD_PRODUCER_PCP=P, the prefill leg's PCP
+        # size) splits its main KV over its P ranks in pcp_interleave() units.
+        import os
+
+        from .pool_layout import pcp_interleave
+
+        self.src_pcp = int(os.environ.get("QWEN4_EXP_PD_PRODUCER_PCP", "1"))
         self.src_layout, src_specs = pooled_cache_specs(
-            without_speculation(cfg), tp=1, main_dcp=1, pack_compressed=False
+            without_speculation(cfg),
+            tp=1,
+            main_dcp=self.src_pcp,
+            pack_compressed=False,
+            main_interleave=pcp_interleave() if self.src_pcp > 1 else None,
+        )
+        self._src_split = (
+            set(self.src_layout.main_dcp_owners) if self.src_pcp > 1 else set()
         )
         from .config import ensure_kv_group_size_rule
 
@@ -554,7 +583,7 @@ class StagedConsumer:
         self.reservations: dict[int, dict[str, list[int]]] = {}
         # uuid -> (decode-local prefix tokens, first staged source page per group)
         self.skips: dict[int, tuple[int, list[int]]] = {}
-        from .pd_manifest import compressed_live_bytes, page_regions
+        from .pd_manifest import compressed_live_bytes, page_regions, pool_tag
 
         # The producer sends a compressed-key page's keys only; the carrier
         # declares the same region so both pool layouts agree.
@@ -564,8 +593,10 @@ class StagedConsumer:
             [self.staging],
             [
                 PoolEntry(
-                    tag=f"qwen4.g{group.group_index}.{name}",
-                    layer_name=name,
+                    # A PCP producer's split main KV: one pool per producer rank,
+                    # staged separately ("<owner>.pcp<r>").
+                    tag=pool_tag(group.group_index, name, pcp_rank=r, split=split),
+                    layer_name=f"{name}.pcp{r}" if split else name,
                     storage_index=0,
                     base_offset_bytes=0,
                     block_stride_bytes=self.src_layout.page_bytes,
@@ -575,9 +606,17 @@ class StagedConsumer:
                 )
                 for group in self.src_groups
                 for name in group.layer_names
+                for split in (name in self._src_split,)
+                for r in (range(self.src_pcp) if split else (0,))
             ],
         )
         self._src_owner = {n: g.group_index for g in self.src_groups for n in g.layer_names}
+        # Staging pool name -> producer group (a split owner's per-rank pools too).
+        self._pool_group = dict(self._src_owner) | {
+            f"{n}.pcp{r}": self._src_owner[n]
+            for n in self._src_split
+            for r in range(self.src_pcp)
+        }
         self._dst_owner = {n: g.group_index for g in self.dst_groups for n in g.layer_names}
         # Compressed-key owner -> (destination group, row offset in its page):
         # a packed member sits in its owner's group at slot * member rows.
@@ -633,7 +672,7 @@ class StagedConsumer:
         if any(count <= 0 for count in group_counts):
             raise ValueError("A prefix-aware load must leave every group a suffix")
         owners = [pool.layer_name for pool in self.manifest.pools]
-        counts = [group_counts[self._src_owner[name]] for name in owners]
+        counts = [group_counts[self._pool_group[name]] for name in owners]
         free = self.free.clone()
         if tp_group is not None and getattr(tp_group, "world_size", 1) > 1:
             import torch.distributed as dist
@@ -679,7 +718,7 @@ class StagedConsumer:
         the source pages a prefix-aware load leaves out of each pool."""
         _, first = self.skips.get(uuid, (0, [0] * len(self.src_groups)))
         return [
-            first[self._src_owner[pool.layer_name]] * pool.block_stride_bytes
+            first[self._pool_group[pool.layer_name]] * pool.block_stride_bytes
             for pool in self.manifest.pools
         ]
 
@@ -713,12 +752,21 @@ class StagedConsumer:
             kind = owner_kind(name)
             if kind == "compressed":
                 continue
-            src = src_pages[name]
+            # A PCP producer's split main KV is staged per rank (below).
+            src = src_pages.get(name)
             src_first = first[self._src_owner[name]]
             dst = dst_tables[gi]
             if kind == "main":
+                pcp = None
+                if name in self._src_split:
+                    from .pool_layout import pcp_interleave
+
+                    # One staged page list per producer rank (same length).
+                    src = [src_pages[f"{name}.pcp{r}"] for r in range(self.src_pcp)]
+                    pcp = (self.src_pcp, pcp_interleave())
                 s, d = main_rows_np(num_tokens, src, self.src_block, dst, self.dst_block,
-                                    self.rank, start=skip_tokens, src_first=src_first)
+                                    self.rank, start=skip_tokens, src_first=src_first,
+                                    src_pcp=pcp)
                 main_s.append(s)
                 main_d.append(d)
             elif kind in ("ring", "ple"):
