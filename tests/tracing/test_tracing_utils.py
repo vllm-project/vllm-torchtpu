@@ -11,9 +11,18 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
+from vllm.sampling_params import RequestOutputKind
+from vllm.v1.engine import EngineCoreOutput
+from vllm.v1.engine.output_processor import OutputProcessor, RequestState
+
 from vllm_torchtpu.tracing.utils import (
+    SPAN_ATTR_CACHED_TOKENS,
+    SPAN_ATTR_TIME_BEFORE_QUEUE,
+    _patch_vllm_request_tracing_phase_gaps,
     extract_kv_lens_for_tracing,
     extract_request_ids_for_tracing,
     trim_request_id_suffix,
@@ -86,3 +95,63 @@ def test_extract_kv_lens_for_tracing():
     # Case C: Empty slice yields no kwargs and no summary stats
     res_3 = extract_kv_lens_for_tracing(num_computed_tokens, start_index=4, num_reqs=2)
     assert res_3 == {}
+
+
+def test_patch_vllm_request_tracing_phase_gaps_emits_attributes(monkeypatch):
+    import vllm.v1.engine.output_processor as op_mod
+
+    _patch_vllm_request_tracing_phase_gaps()
+    # Calling a second time must be idempotent.
+    _patch_vllm_request_tracing_phase_gaps()
+    assert getattr(OutputProcessor, "_tpu_phase_gaps_patched", False) is True
+
+    req_state = RequestState(
+        request_id="req-internal-1",
+        external_req_id="cmpl-bench-2p2d-0",
+        parent_req=None,
+        request_index=0,
+        lora_request=None,
+        output_kind=RequestOutputKind.FINAL_ONLY,
+        prompt="hello",
+        prompt_token_ids=[1, 2, 3, 4, 5, 6, 7, 8],
+        prompt_embeds=None,
+        logprobs_processor=None,
+        detokenizer=None,
+        max_tokens_param=64,
+        arrival_time=1000.0,
+        queue=None,
+        log_stats=True,
+        stream_interval=1,
+    )
+    assert req_state.stats is not None
+
+    req_state.num_cached_tokens = 112
+    req_state.stats.queued_ts = 508.601
+    req_state.stats.scheduled_ts = 508.6655
+    req_state.stats.first_token_ts = 508.7073
+    req_state.stats.last_token_ts = 509.1444
+    req_state.stats.first_token_latency = 8.7073
+    req_state.stats.num_generation_tokens = 64
+
+    captured: dict[str, object] = {}
+
+    def fake_instrument_manual(**kwargs):
+        captured.update(kwargs)
+
+    monkeypatch.setattr(op_mod, "instrument_manual", fake_instrument_manual)
+
+    processor = OutputProcessor(tokenizer=None, log_stats=True, tracing_enabled=True)
+    engine_core_output = EngineCoreOutput(
+        request_id="req-internal-1",
+        new_token_ids=[42],
+        trace_headers={"traceparent": "00-90d86cb618c6615e4dd701e734a854a7-0123456789abcdef-01"},
+    )
+    iteration_stats = SimpleNamespace(iteration_timestamp=1009.1525)
+
+    processor.do_tracing(engine_core_output, req_state, iteration_stats)  # type: ignore[arg-type]
+
+    assert op_mod.instrument_manual is fake_instrument_manual
+    attrs = captured["attributes"]
+    assert isinstance(attrs, dict)
+    assert attrs[SPAN_ATTR_TIME_BEFORE_QUEUE] == pytest.approx(8.601, abs=1e-6)
+    assert attrs[SPAN_ATTR_CACHED_TOKENS] == 112

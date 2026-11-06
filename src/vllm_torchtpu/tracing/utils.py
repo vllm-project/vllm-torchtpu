@@ -13,10 +13,14 @@
 # limitations under the License.
 """Helper utilities for request ID and KV cache profiler tracing."""
 
+import functools
 import logging
 from typing import Any
 
 logger = logging.getLogger(__name__)
+
+SPAN_ATTR_TIME_BEFORE_QUEUE = "gen_ai.latency.time_before_queue"
+SPAN_ATTR_CACHED_TOKENS = "gen_ai.usage.cached_tokens"
 
 
 def trim_request_id_suffix(request_id: str) -> str:
@@ -59,3 +63,68 @@ def extract_kv_lens_for_tracing(
         "max_kv_len": max(active_lens),
         "avg_kv_len": sum(active_lens) // len(active_lens),
     }
+
+
+def _patch_vllm_request_tracing_phase_gaps() -> None:
+    """Enrich vLLM's ``llm_request`` OpenTelemetry span with pre-queue and cache attributes.
+
+    vLLM v1 starts the ``llm_request`` span at ``metrics.arrival_time``, but only
+    records ``metrics.queued_ts`` when ``EngineCore`` drains its ZMQ input queue
+    between engine steps. Any time a request waits in the ZMQ input queue while
+    ``EngineCore`` is busy falls outside ``gen_ai.latency.time_in_queue`` and
+    ``gen_ai.latency.time_in_model_inference``.
+
+    Adds two attributes to ``llm_request`` spans in ``OutputProcessor.do_tracing``:
+      * ``gen_ai.latency.time_before_queue``: ``first_token_latency - (first_token_ts - queued_ts)``,
+        using pure wall-clock and pure ``EngineCore`` monotonic intervals without
+        comparing ``time.monotonic()`` across processes.
+      * ``gen_ai.usage.cached_tokens``: prefix-cached prompt tokens (local or
+        remote P-worker hit).
+    """
+    import vllm.v1.engine.output_processor as output_processor_mod
+    from vllm.v1.engine.output_processor import OutputProcessor
+
+    if getattr(OutputProcessor, "_tpu_phase_gaps_patched", False):
+        return
+
+    orig_do_tracing = OutputProcessor.do_tracing
+
+    @functools.wraps(orig_do_tracing)
+    def _patched_do_tracing(
+        self: OutputProcessor,
+        engine_core_output: Any,
+        req_state: Any,
+        iteration_stats: Any,
+    ) -> None:
+        metrics = req_state.stats
+        extra_attrs: dict[str, Any] = {}
+        if (
+            metrics is not None
+            and metrics.queued_ts > 0
+            and metrics.first_token_ts > 0
+            and metrics.first_token_latency > 0
+        ):
+            extra_attrs[SPAN_ATTR_TIME_BEFORE_QUEUE] = max(
+                0.0,
+                metrics.first_token_latency - (metrics.first_token_ts - metrics.queued_ts),
+            )
+        extra_attrs[SPAN_ATTR_CACHED_TOKENS] = int(
+            getattr(req_state, "num_cached_tokens", 0) or 0
+        )
+
+        orig_instrument_manual = output_processor_mod.instrument_manual
+
+        def _wrapped_instrument_manual(*args: Any, **kwargs: Any) -> Any:
+            attrs = kwargs.get("attributes")
+            if isinstance(attrs, dict):
+                attrs.update(extra_attrs)
+            return orig_instrument_manual(*args, **kwargs)
+
+        output_processor_mod.instrument_manual = _wrapped_instrument_manual
+        try:
+            orig_do_tracing(self, engine_core_output, req_state, iteration_stats)
+        finally:
+            output_processor_mod.instrument_manual = orig_instrument_manual
+
+    OutputProcessor.do_tracing = _patched_do_tracing  # type: ignore[method-assign]
+    OutputProcessor._tpu_phase_gaps_patched = True  # type: ignore[attr-defined]
