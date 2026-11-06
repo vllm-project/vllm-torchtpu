@@ -87,16 +87,15 @@ class TpuGeneration:
     """The upload-time variables a TPU generation fills a TPU file in with.
 
     A file in TPU_GENERATION_FILES reads them when it is uploaded: its shapes,
-    its group name, a prefix on each step's label and key, and soft_fail. The
-    prefixes keep one generation's keys apart from another's, since Buildkite
-    rejects a duplicate key, and its labels too, since GitHub names a step's
-    commit status after its label.
+    its name, which its group name and each step's label start with, a prefix
+    on each step's key, and soft_fail. The name keeps one generation's labels
+    apart from another's, since GitHub names a step's commit status after its
+    label, and the prefix its keys, since Buildkite rejects a duplicate key.
     """
 
     name: str
     shape_single: str
     shape_multi: str
-    label_prefix: str
     key_prefix: str
     soft_fail: bool
 
@@ -105,21 +104,21 @@ class TpuGeneration:
             "TPU_GENERATION": self.name,
             "KUBE_SHAPE_SINGLE": self.shape_single,
             "KUBE_SHAPE_MULTI": self.shape_multi,
-            "TPU_LABEL_PREFIX": self.label_prefix,
             "TPU_KEY_PREFIX": self.key_prefix,
             "TPU_SOFT_FAIL": "true" if self.soft_fail else "false",
         }
 
 
-# v7x keeps the labels and keys its steps had before v6e ran beside it, so its
-# GitHub statuses and the keys the nightly report checks stay the same. v6e
-# soft-fails while remaining v7x-assumed tests (such as two-TensorCore single-
-# chip or v7x-only chip-budget assumptions) are audited on v6e.
+# v7x keeps the keys its steps had before v6e ran beside it, so the keys the
+# nightly report and its depends_on name stay the same. Its labels gained the
+# generation like v6e's, which renames its GitHub statuses; the repo's rules
+# require only the build's own status, not a step's. v6e soft-fails while
+# remaining v7x-assumed tests (such as two-TensorCore single-chip or v7x-only
+# chip-budget assumptions) are audited on v6e.
 TPU_V7X = TpuGeneration(
     name="v7x",
     shape_single="tpu7x-standard-1t/1x1x1",
     shape_multi="tpu7x-standard-4t/2x2x1",
-    label_prefix="",
     key_prefix="",
     soft_fail=False,
 )
@@ -127,7 +126,6 @@ TPU_V6E = TpuGeneration(
     name="v6e",
     shape_single="ct6e-standard-1t/1x1",
     shape_multi="ct6e-standard-8t/2x4",
-    label_prefix="v6e ",
     key_prefix="tpu6e_",
     soft_fail=True,
 )
@@ -136,6 +134,7 @@ TPU_V6E = TpuGeneration(
 # a file not named here goes up once, as it is.
 TPU_GENERATION_FILES: Mapping[str, tuple[TpuGeneration, ...]] = {
     ".buildkite/pipeline_tests.yml": (TPU_V6E, TPU_V7X),
+    ".buildkite/pipeline_integration.yml": (TPU_V6E, TPU_V7X),
 }
 
 DEFAULT_INTEGRATION_SLUG = "vllm-torchtpu-integration"

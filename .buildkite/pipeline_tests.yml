@@ -16,8 +16,8 @@
 # it with pipeline_tests_cpu.yml, the suite's CPU steps, and the image build
 # from pipeline_build.yml. It goes up once per TPU generation, v6e and v7x side
 # by side, with the same steps and tests on each: TPU_GENERATION_FILES in
-# bootstrap.py fills in the generation's shapes, group name, label and key
-# prefixes and soft_fail.
+# bootstrap.py fills in the generation's name, which the group name and every
+# label start with, its shapes, its key prefix and soft_fail.
 #
 # The `tests` plugin runs on the agent and exports BUILDKITE_TEST_ENGINE_*;
 # bktec runs in the pod, and run.sh forwards that configuration across - see
@@ -74,7 +74,7 @@ steps:
       #
       # Split by file, not by example, so a file that shares one engine
       # across its tests starts it in one shard only.
-      - label: "${TPU_LABEL_PREFIX:-}Unit Tests - General (PR)"
+      - label: "${TPU_GENERATION:-v7x} Unit Tests - General (PR)"
         key: "${TPU_KEY_PREFIX:-}unit_tests_general_pr"
         <<: *tpu_step
         if: 'build.env("NIGHTLY") != "1"'
@@ -88,7 +88,7 @@ steps:
               test-file-exclude-pattern: "tests/entrypoints/llm/test_speculative_decoding.py"
               test-cmd: "pytest -sv --timeout=600 -m 'tpu_test and not nightly and not multichip' --junit-xml={{resultPath}} {{testExamples}}"
 
-      - label: "${TPU_LABEL_PREFIX:-}Unit Tests - Multichip (PR)"
+      - label: "${TPU_GENERATION:-v7x} Unit Tests - Multichip (PR)"
         key: "${TPU_KEY_PREFIX:-}unit_tests_multichip_pr"
         <<: *tpu_step
         if: 'build.env("NIGHTLY") != "1"'
@@ -104,7 +104,7 @@ steps:
       # Representative correctness cases run on PRs; the full parameter matrix
       # and acceptance-rate tests run nightly. Split by example because the
       # suite is a single file.
-      - label: "${TPU_LABEL_PREFIX:-}Unit Tests - Speculative Decoding (PR)"
+      - label: "${TPU_GENERATION:-v7x} Unit Tests - Speculative Decoding (PR)"
         key: "${TPU_KEY_PREFIX:-}unit_tests_spec_decode_pr"
         <<: *tpu_step
         if: 'build.env("NIGHTLY") != "1"'
@@ -124,7 +124,7 @@ steps:
               test-file-pattern: "tests/entrypoints/llm/test_speculative_decoding.py"
               test-cmd: "pytest -sv --timeout=1800 -m 'not nightly and not multichip' --junit-xml={{resultPath}} {{testExamples}}"
 
-      - label: "${TPU_LABEL_PREFIX:-}Unit Tests - Speculative Decoding Multichip (PR)"
+      - label: "${TPU_GENERATION:-v7x} Unit Tests - Speculative Decoding Multichip (PR)"
         key: "${TPU_KEY_PREFIX:-}unit_tests_spec_decode_multichip_pr"
         <<: *tpu_step
         if: 'build.env("NIGHTLY") != "1"'
@@ -142,7 +142,7 @@ steps:
       # $HF_HOME/hub is the shared cache, so the pod stages golden/ from the
       # bucket. The weights come through the shared cache, downloaded by the
       # first run that needs them.
-      - label: "${TPU_LABEL_PREFIX:-}Unit Tests - Omni (PR)"
+      - label: "${TPU_GENERATION:-v7x} Unit Tests - Omni (PR)"
         key: "${TPU_KEY_PREFIX:-}unit_tests_omni_pr"
         <<: *tpu_step
         depends_on: "build_docker_omni"
@@ -163,7 +163,7 @@ steps:
               fail-on-no-tests: true
               test-cmd: "pytest -sv --timeout=1200 -m 'not nightly' --junit-xml={{resultPath}} {{testExamples}}"
 
-      - label: "${TPU_LABEL_PREFIX:-}Unit Tests - Speculative Decoding (Nightly)"
+      - label: "${TPU_GENERATION:-v7x} Unit Tests - Speculative Decoding (Nightly)"
         key: "${TPU_KEY_PREFIX:-}unit_tests_spec_decode_nightly"
         <<: *tpu_step
         if: 'build.env("NIGHTLY") == "1"'
@@ -182,7 +182,7 @@ steps:
       # The data-parallel MTP tests in the same file need DP*TP chips and
       # self-skip on the one-chip shape above, so this step is the only place
       # they run.
-      - label: "${TPU_LABEL_PREFIX:-}Unit Tests - Speculative Decoding Multichip (Nightly)"
+      - label: "${TPU_GENERATION:-v7x} Unit Tests - Speculative Decoding Multichip (Nightly)"
         key: "${TPU_KEY_PREFIX:-}unit_tests_spec_decode_multichip_nightly"
         <<: *tpu_step
         if: 'build.env("NIGHTLY") == "1"'
@@ -204,7 +204,7 @@ steps:
               test-file-pattern: "tests/entrypoints/llm/test_speculative_decoding.py"
               test-cmd: "pytest -sv --timeout=3600 -m 'multichip' --junit-xml={{resultPath}} {{testExamples}}"
 
-      - label: "${TPU_LABEL_PREFIX:-}Unit Tests - General (Nightly)"
+      - label: "${TPU_GENERATION:-v7x} Unit Tests - General (Nightly)"
         key: "${TPU_KEY_PREFIX:-}unit_tests_general_nightly"
         <<: *tpu_step
         if: 'build.env("NIGHTLY") == "1"'
@@ -218,7 +218,7 @@ steps:
               test-file-exclude-pattern: "tests/entrypoints/llm/test_speculative_decoding.py"
               test-cmd: "pytest -sv --timeout=600 -m 'tpu_test and not multichip' --junit-xml={{resultPath}} {{testExamples}}"
 
-      - label: "${TPU_LABEL_PREFIX:-}Unit Tests - Multichip (Nightly)"
+      - label: "${TPU_GENERATION:-v7x} Unit Tests - Multichip (Nightly)"
         key: "${TPU_KEY_PREFIX:-}unit_tests_multichip_nightly"
         <<: *tpu_step
         if: 'build.env("NIGHTLY") == "1"'
@@ -231,7 +231,7 @@ steps:
               test-file-exclude-pattern: "tests/entrypoints/llm/test_speculative_decoding.py"
               test-cmd: "pytest -sv --timeout=600 -m 'multichip' --junit-xml={{resultPath}} {{testExamples}}"
 
-      - label: "${TPU_LABEL_PREFIX:-}Unit Tests - Omni (Nightly)"
+      - label: "${TPU_GENERATION:-v7x} Unit Tests - Omni (Nightly)"
         key: "${TPU_KEY_PREFIX:-}unit_tests_omni_nightly"
         <<: *tpu_step
         depends_on: "build_docker_omni"
@@ -249,7 +249,7 @@ steps:
               fail-on-no-tests: true
               test-cmd: "pytest -sv --timeout=1800 -m 'not multichip' --junit-xml={{resultPath}} {{testExamples}}"
 
-      - label: "${TPU_LABEL_PREFIX:-}Unit Tests - Omni Multichip (Nightly)"
+      - label: "${TPU_GENERATION:-v7x} Unit Tests - Omni Multichip (Nightly)"
         key: "${TPU_KEY_PREFIX:-}unit_tests_omni_multichip_nightly"
         <<: *tpu_step
         depends_on: "build_docker_omni"

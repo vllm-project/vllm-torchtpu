@@ -12,7 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# The integration suite on the Kueue fleet.
+# The integration suite on the Kueue fleet. Like pipeline_tests.yml, it goes up
+# once per TPU generation, v6e and v7x side by side: TPU_GENERATION_FILES in
+# bootstrap.py fills in the generation's name, which the group name and every
+# label start with, its shapes, its key prefix and soft_fail. A step that runs
+# only on v7x as written - one that goes through run_multihost.sh, whose
+# topology and JobSets assume 4-chip v7x hosts, or one that sets
+# TPU_ACCELERATOR_TYPE=tpu7x - carries an `if` that compares TPU_GENERATION
+# with "v7x", so v6e's upload leaves it out.
 #
 # qwen35-pcp8-2tp4dp-disagg-correctness and qwen35-gpc-correctness run a second
 # role on a second host (ROLE=decode or GPC_ROLE=worker). That is not one command on a Ray head, which is what
@@ -36,22 +43,28 @@ x-integration-step-defaults: &integration_step
   # work takes. The sum of the launcher's two limits, so a step is stopped by
   # whichever of those it exceeded and not by this.
   timeout_in_minutes: 1440
+  # "true" for a generation whose failures should not fail the build yet. A
+  # string, as interpolation leaves it; Buildkite takes "true" and "false".
+  soft_fail: "${TPU_SOFT_FAIL:-false}"
   agents:
     queue: "kube"
 
 # Eight TensorCores, which is four v7x chips on one host. Machine type names
 # chips, the queue names cores, so the two numbers differ for one shape.
-x-shape-8-core: &shape_8_core "tpu7x-standard-4t/2x2x1"
-x-shape-2-core: &shape_2_core "tpu7x-standard-1t/1x1x1"
+# The generation's shapes, from bootstrap.py; the defaults are v7x's, for an
+# upload of this file on its own. A v6e chip is one TensorCore, so there the
+# eight cores are eight chips (2x4), and the single-chip shape has one core.
+x-shape-8-core: &shape_8_core "${KUBE_SHAPE_MULTI:-tpu7x-standard-4t/2x2x1}"
+x-shape-2-core: &shape_2_core "${KUBE_SHAPE_SINGLE:-tpu7x-standard-1t/1x1x1}"
 
 steps:
-  - group: "Integration Tests on TPU"
-    key: "integration_tpu"
+  - group: "Integration Tests on TPU ${TPU_GENERATION:-v7x}"
+    key: "${TPU_KEY_PREFIX:-}integration_tpu"
     steps:
       # RUN_ROOT is relative: a pod has no writable /perf_eval_results, and only
       # what is under ARTIFACTS_DIR is uploaded before the pod is deleted.
-      - label: "Integration: qwen35-pcp4-dp4-disagg-correctness"
-        key: "integration_qwen35_pcp4_dp4_disagg_correctness"
+      - label: "${TPU_GENERATION:-v7x} Integration: qwen35-pcp4-dp4-disagg-correctness"
+        key: "${TPU_KEY_PREFIX:-}integration_qwen35_pcp4_dp4_disagg_correctness"
         env:
           SHAPE: *shape_8_core
           TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL: "1"
@@ -64,8 +77,8 @@ steps:
 
       # The same test on the production settings (qwen35_pd_disagg_common_env.sh);
       # the step above stays on the defaults.
-      - label: "Integration: qwen35-pcp4-2tp2dp-disagg-correctness"
-        key: "integration_qwen35_pcp4_2tp2dp_disagg_correctness"
+      - label: "${TPU_GENERATION:-v7x} Integration: qwen35-pcp4-2tp2dp-disagg-correctness"
+        key: "${TPU_KEY_PREFIX:-}integration_qwen35_pcp4_2tp2dp_disagg_correctness"
         env:
           SHAPE: *shape_8_core
           TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL: "1"
@@ -79,8 +92,9 @@ steps:
       # The prefill and decode layout (ROLE, PREFILL_*, DECODE_*,
       # TPU_RAIDEN_DST_SHARDS, VLLM_KV_CACHE_LAYOUT) is the script's own default;
       # those names do not reach the pod.
-      - label: "Integration: qwen35-pcp4tp1-tp4dcp2-disagg-correctness"
-        key: "integration_qwen35_pcp4tp1_tp4dcp2_disagg_correctness"
+      - label: "${TPU_GENERATION:-v7x} Integration: qwen35-pcp4tp1-tp4dcp2-disagg-correctness"
+        key: "${TPU_KEY_PREFIX:-}integration_qwen35_pcp4tp1_tp4dcp2_disagg_correctness"
+        if: '"${TPU_GENERATION:-v7x}" == "v7x"'
         env:
           SHAPE: *shape_8_core
           TPU_ACCELERATOR_TYPE: "tpu7x"
@@ -93,8 +107,8 @@ steps:
           - .buildkite/kubernetes/run.sh bash ./scripts/vllm/integration/run_qwen35_pcp_tp_dcp_disagg_correctness.sh
 
       # PR builds only; a nightly does not run it.
-      - label: "Presubmit: disagg-single-host"
-        key: "presubmit_disagg_single_host"
+      - label: "${TPU_GENERATION:-v7x} Presubmit: disagg-single-host"
+        key: "${TPU_KEY_PREFIX:-}presubmit_disagg_single_host"
         if: "build.pull_request.id != null"
         env:
           SHAPE: *shape_8_core
@@ -116,8 +130,8 @@ steps:
             DECODE_EXTRA_ARGS="--max-num-batched-tokens 128 --max-num-seqs 128"
             bash ./examples/disagg/run_disagg_single_host.sh
 
-      - label: "Integration: qwen35-apc-correctness"
-        key: "integration_qwen35_apc_correctness"
+      - label: "${TPU_GENERATION:-v7x} Integration: qwen35-apc-correctness"
+        key: "${TPU_KEY_PREFIX:-}integration_qwen35_apc_correctness"
         env:
           SHAPE: *shape_8_core
           RUN_ROOT: "perf_eval_results/qwen35_apc_ci"
@@ -127,8 +141,8 @@ steps:
         commands:
           - .buildkite/kubernetes/run.sh bash ./scripts/vllm/integration/run_qwen35_apc_correctness.sh
 
-      - label: "Integration: qwen35-gpc-global-dram-pool"
-        key: "integration_qwen35_gpc_global_dram_pool"
+      - label: "${TPU_GENERATION:-v7x} Integration: qwen35-gpc-global-dram-pool"
+        key: "${TPU_KEY_PREFIX:-}integration_qwen35_gpc_global_dram_pool"
         env:
           SHAPE: *shape_8_core
           RUN_ROOT: "perf_eval_results/qwen35_gpc_dram_pool_ci"
@@ -140,8 +154,8 @@ steps:
 
       # Nightly only: an opt-in layout no default-path test
       # reaches, behind a P/D boot that dominates the step.
-      - label: "Integration: Nightly qwen35-block-major-disagg-offload"
-        key: "integration_nightly_qwen35_block_major_disagg_offload"
+      - label: "${TPU_GENERATION:-v7x} Integration: Nightly qwen35-block-major-disagg-offload"
+        key: "${TPU_KEY_PREFIX:-}integration_nightly_qwen35_block_major_disagg_offload"
         if: 'build.env("NIGHTLY") == "1"'
         env:
           SHAPE: *shape_8_core
@@ -155,8 +169,8 @@ steps:
 
       # Nightly only: pipeline parallelism behind a P/D boot that dominates
       # the step.
-      - label: "Integration: Nightly qwen35-pp4-disagg-offload"
-        key: "integration_nightly_qwen35_pp4_disagg_offload"
+      - label: "${TPU_GENERATION:-v7x} Integration: Nightly qwen35-pp4-disagg-offload"
+        key: "${TPU_KEY_PREFIX:-}integration_nightly_qwen35_pp4_disagg_offload"
         if: 'build.env("NIGHTLY") == "1"'
         env:
           SHAPE: *shape_8_core
@@ -168,8 +182,8 @@ steps:
         commands:
           - .buildkite/kubernetes/run.sh bash ./scripts/vllm/integration/run_qwen35_pp_disagg_offload.sh
 
-      - label: "Integration: compilation-cache-e2e"
-        key: "integration_compilation_cache_e2e"
+      - label: "${TPU_GENERATION:-v7x} Integration: compilation-cache-e2e"
+        key: "${TPU_KEY_PREFIX:-}integration_compilation_cache_e2e"
         env:
           SHAPE: *shape_2_core
         <<: *integration_step
@@ -189,9 +203,9 @@ steps:
 
       # Nightly only: a full DSv4 boot is ~27 min of weight
       # load plus compile before the smoke starts.
-      - label: "Integration: Nightly dsv4-offload-correctness"
-        key: "integration_nightly_dsv4_offload_correctness"
-        if: 'build.env("NIGHTLY") == "1"'
+      - label: "${TPU_GENERATION:-v7x} Integration: Nightly dsv4-offload-correctness"
+        key: "${TPU_KEY_PREFIX:-}integration_nightly_dsv4_offload_correctness"
+        if: 'build.env("NIGHTLY") == "1" && "${TPU_GENERATION:-v7x}" == "v7x"'
         env:
           SHAPE: *shape_8_core
           TPU_ACCELERATOR_TYPE: "tpu7x"
@@ -222,9 +236,9 @@ steps:
       # runai's GCS backend resolves the prefix through get_bucket(), which
       # needs storage.buckets.get rather than object access, so the tpu-workload
       # service account the pod runs as needs bucket metadata read on the bucket.
-      - label: "Integration: Nightly glm52-fp4-offload-correctness"
-        key: "integration_nightly_glm52_fp4_offload_correctness"
-        if: 'build.env("NIGHTLY") == "1"'
+      - label: "${TPU_GENERATION:-v7x} Integration: Nightly glm52-fp4-offload-correctness"
+        key: "${TPU_KEY_PREFIX:-}integration_nightly_glm52_fp4_offload_correctness"
+        if: 'build.env("NIGHTLY") == "1" && "${TPU_GENERATION:-v7x}" == "v7x"'
         env:
           SHAPE: *shape_8_core
           TPU_ACCELERATOR_TYPE: "tpu7x"
@@ -242,8 +256,9 @@ steps:
       # Kimi-K3 (hybrid MLA + KDA) prefix caching and host KV offload in one
       # boot. Not staged: the rig's default MODEL is the gs:// copy, streamed
       # with runai_streamer, since ~443 GiB does not fit an agent's disk.
-      - label: "Integration: k3-pruned75-apc-offload-correctness"
-        key: "integration_k3_pruned75_apc_offload_correctness"
+      - label: "${TPU_GENERATION:-v7x} Integration: k3-pruned75-apc-offload-correctness"
+        key: "${TPU_KEY_PREFIX:-}integration_k3_pruned75_apc_offload_correctness"
+        if: '"${TPU_GENERATION:-v7x}" == "v7x"'
         env:
           SHAPE: *shape_8_core
           TPU_ACCELERATOR_TYPE: "tpu7x"
@@ -261,8 +276,9 @@ steps:
       #
       # This is the only step in either integration lane that exercises the fleet's
       # 2x2x2 profile, which has held zero chip-hours since the fleet was built.
-      - label: "Multihost TorchTPU Presubmit (v7x 16-chip)"
-        key: "vllm_torchtpu_multihost_presubmit"
+      - label: "${TPU_GENERATION:-v7x} Multihost TorchTPU Presubmit (v7x 16-chip)"
+        key: "${TPU_KEY_PREFIX:-}vllm_torchtpu_multihost_presubmit"
+        if: '"${TPU_GENERATION:-v7x}" == "v7x"'
         <<: *integration_step
         plugins:
           - *kube_plugin
@@ -292,16 +308,18 @@ steps:
       # None uploads artifacts. The pod is deleted when the run ends and these
       # submit a manifest rather than going through run.sh's upload wrapper, so the
       # logs are the record - as for the multihost step above.
-      - label: "Integration: qwen35-pcp8-2tp4dp-disagg-correctness"
-        key: "integration_qwen35_pcp8_2tp4dp_disagg_correctness"
+      - label: "${TPU_GENERATION:-v7x} Integration: qwen35-pcp8-2tp4dp-disagg-correctness"
+        key: "${TPU_KEY_PREFIX:-}integration_qwen35_pcp8_2tp4dp_disagg_correctness"
+        if: '"${TPU_GENERATION:-v7x}" == "v7x"'
         <<: *integration_step
         plugins:
           - *kube_plugin
         commands:
           - .buildkite/kubernetes/run_multihost.sh --manifest qwen3.5-p8d8-disagg.yaml
 
-      - label: "Integration: qwen35-gpc-correctness"
-        key: "integration_qwen35_gpc_correctness"
+      - label: "${TPU_GENERATION:-v7x} Integration: qwen35-gpc-correctness"
+        key: "${TPU_KEY_PREFIX:-}integration_qwen35_gpc_correctness"
+        if: '"${TPU_GENERATION:-v7x}" == "v7x"'
         <<: *integration_step
         plugins:
           - *kube_plugin
@@ -310,9 +328,9 @@ steps:
 
       # Nightly only: a DSv4 boot is ~27 min of weight streaming
       # and compile before the probes start.
-      - label: "Integration: Nightly dsv4-pd-disagg-correctness"
-        key: "integration_nightly_dsv4_pd_disagg_correctness"
-        if: 'build.env("NIGHTLY") == "1"'
+      - label: "${TPU_GENERATION:-v7x} Integration: Nightly dsv4-pd-disagg-correctness"
+        key: "${TPU_KEY_PREFIX:-}integration_nightly_dsv4_pd_disagg_correctness"
+        if: 'build.env("NIGHTLY") == "1" && "${TPU_GENERATION:-v7x}" == "v7x"'
         <<: *integration_step
         plugins:
           - *kube_plugin

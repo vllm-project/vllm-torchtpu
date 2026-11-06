@@ -8,15 +8,24 @@ The `tests` lane is two files. `pipeline_tests_cpu.yml` runs the type check and
 unmarked unit tests in `tests/` in CPU pods, and `pipeline_tests.yml` runs
 tests marked `tpu_test` (or `multichip`) on TPU v7x slices (1x1x1 and 2x2x1)
 and, side by side, the same tests on TPU v6e slices (1x1 and 2x4): bootstrap
-uploads it once per generation in `TPU_GENERATION_FILES`. The v6e steps carry a
-`v6e`/`tpu6e_` prefix on their labels and keys, the v7x ones keep their names,
-and the v6e steps soft-fail until the tests that fail rather than skip on v6e
-skip there. A new TPU step takes the `${TPU_LABEL_PREFIX:-}` and
-`${TPU_KEY_PREFIX:-}` prefixes, or the second generation's upload is rejected
-for a duplicate key.
+uploads it once per generation in `TPU_GENERATION_FILES`. Every step's label
+starts with its generation (`v6e ...`, `v7x ...`), v6e's keys carry a `tpu6e_`
+prefix while v7x's keep their names, and the v6e steps soft-fail until the
+tests that fail rather than skip on v6e skip there. A new TPU step's label
+starts with `${TPU_GENERATION:-v7x}`, so each generation gets its own GitHub
+status, and its key with `${TPU_KEY_PREFIX:-}`, or the second generation's
+upload is rejected for a duplicate key.
 PR steps exclude `nightly` tests; nightly steps include them. Both use the CI
 image built by `pipeline_build.yml`. The CPU steps set `JAX_PLATFORMS=cpu` so
 JAX does not look for a TPU.
+
+The `integration` lane, `pipeline_integration.yml`, goes up the same way, once
+per generation in `TPU_GENERATION_FILES`, with the same names and soft-fail
+on v6e: its eight-core steps take a v6e 2x4 slice where v7x's take a 2x2x1.
+Steps that run only on v7x as written - those that go through
+`run_multihost.sh`, whose topology and JobSets assume 4-chip v7x hosts, and
+those that set `TPU_ACCELERATOR_TYPE=tpu7x` - carry an `if` comparing
+`TPU_GENERATION` with `v7x`, so v6e's upload leaves them out.
 
 `pipeline_perf.yml` holds the perf/eval
 steps. Post-merge builds do not run them, and PR builds run them only when the
