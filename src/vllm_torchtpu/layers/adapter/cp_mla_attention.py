@@ -162,9 +162,44 @@ def merge_lse_partials_all_to_all(
     # Destination-major: [world, T, local, V] and [world, T, local].
     o_send = output.reshape(num_tokens, world, local, vdim).transpose(0, 1)
     l_send = lse.to(torch.float32).reshape(num_tokens, world, local).transpose(0, 1)
-    o_recv = _all_to_all(o_send, group)
-    l_recv = _all_to_all(l_send, group)
+    if output.dtype != torch.bfloat16:
+        o_recv = _all_to_all(o_send, group)
+        l_recv = _all_to_all(l_send, group)
+        return _merge_received(o_recv, l_recv).to(output.dtype)
+    # One collective instead of two: the f32 lse rides in the bf16 output
+    # payload as an exact 3-term bf16 split plus a finite flag (the 2 KiB lse
+    # all-to-all is pure latency at decode sizes).
+    o_flat = o_send.reshape(world, num_tokens * local * vdim)
+    l_flat = _pack_lse_bf16(l_send).reshape(world, num_tokens * local * _LSE_PACK)
+    recv = _all_to_all(torch.cat([o_flat, l_flat], dim=1), group)
+    o_recv = recv[:, : o_flat.shape[1]].reshape(world, num_tokens, local, vdim)
+    l_recv = _unpack_lse_bf16(
+        recv[:, o_flat.shape[1] :].reshape(world, num_tokens, local, _LSE_PACK)
+    )
     return _merge_received(o_recv, l_recv).to(output.dtype)
+
+
+# bf16 words per packed f32 lse: hi, mid, lo (24 mantissa bits) + finite flag.
+_LSE_PACK = 4
+
+
+def _pack_lse_bf16(lse: torch.Tensor) -> torch.Tensor:
+    """f32 `[...]` -> bf16 `[..., 4]`: `hi + mid + lo` reproduces every finite
+    value; the flag (1 finite, 0 not) restores `-inf`."""
+    finite = torch.isfinite(lse)
+    x = torch.where(finite, lse, torch.zeros_like(lse))
+    hi = x.to(torch.bfloat16)
+    rest = x - hi.to(torch.float32)
+    mid = rest.to(torch.bfloat16)
+    lo = (rest - mid.to(torch.float32)).to(torch.bfloat16)
+    return torch.stack([hi, mid, lo, finite.to(torch.bfloat16)], dim=-1)
+
+
+def _unpack_lse_bf16(packed: torch.Tensor) -> torch.Tensor:
+    """Inverse of `_pack_lse_bf16`: bf16 `[..., 4]` -> f32 `[...]`."""
+    parts = packed.to(torch.float32)
+    value = parts[..., 0] + parts[..., 1] + parts[..., 2]
+    return torch.where(parts[..., 3] > 0, value, torch.full_like(value, float("-inf")))
 
 
 def _merge_received(o_recv: torch.Tensor, l_recv: torch.Tensor) -> torch.Tensor:
