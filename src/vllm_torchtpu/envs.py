@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     TPU_DEEPSEEK_V41_CED: bool = False
+    TPU_DEEPSEEK_V41_CED_IDENTITY_REPLAY: bool = True
     TPU_DEEPSEEK_V41_ENGRAM_FUSED_HASH: bool = True
     TPU_DEEPSEEK_V41_ENGRAM_MASKS_IN_HASH: bool = True
     TPU_DEEPSEEK_V41_ENGRAM_INT32_SLOT_WRITE: bool = True
@@ -19,6 +20,7 @@ if TYPE_CHECKING:
     TPU_DEEPSEEK_V41_DECODE_FUSION: str = "auto"
     TPU_DEEPSEEK_V41_INDEXER_ISSUE_DEPTH: int | None = 8
     TPU_DEEPSEEK_V41_INDEXER_PUBLISH_ISSUE_DEPTH: int | None = 7
+    TPU_DEEPSEEK_V41_REUSE_WINDOW_STARTS: bool = True
     TPU_DEEPSEEK_V41_MHC_RESIDENT_GATES: bool = True
     TPU_DEEPSEEK_V41_MHC_EARLY_PREP: bool = True
     TPU_DEEPSEEK_V41_MHC_SHIFTED_T16: bool = True
@@ -389,6 +391,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Decoder SWA bounded replay is approximate. Keep full-forward as the
     # default/reference until matched model-quality and performance validation.
     "TPU_DEEPSEEK_V41_CED": env_bool("TPU_DEEPSEEK_V41_CED"),
+    # CED: when the decoder replays every row in place (steady decode), pass
+    # the encoder outputs straight to the decoder stage and return its output
+    # as is, instead of eager gathers and an index_copy scatter by the
+    # identity (v2/model.py). Outputs are unchanged.
+    "TPU_DEEPSEEK_V41_CED_IDENTITY_REPLAY": env_bool(
+        "TPU_DEEPSEEK_V41_CED_IDENTITY_REPLAY", default=True
+    ),
     # Engram n-gram hash on device as one fused program with exact 64-bit
     # arithmetic on uint32 pairs (kernels/engram_hash.py), instead of the
     # eager int64 torch ops XLA emulates op by op. Hash ids are unchanged.
@@ -467,6 +476,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "TPU_DEEPSEEK_V41_INDEXER_PUBLISH_ISSUE_DEPTH": env_positive_int_or_none(
         "TPU_DEEPSEEK_V41_INDEXER_PUBLISH_ISSUE_DEPTH", default=7
+    ),
+    # CED decode: reuse the per-request SWA window-starts device tensor while
+    # the replay starts are unchanged, instead of building and uploading it in
+    # every step's host path ahead of the encoder. Same values (bit-exact).
+    # Default off until measured.
+    "TPU_DEEPSEEK_V41_REUSE_WINDOW_STARTS": env_bool(
+        "TPU_DEEPSEEK_V41_REUSE_WINDOW_STARTS", default=True
     ),
     # Shifted mHC: emit the next layer's gates T tokens wide (not padded to a
     # multiple of 128) and read them as compiler-managed VMEM inputs, so the
