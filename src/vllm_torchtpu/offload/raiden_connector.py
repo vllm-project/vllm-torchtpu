@@ -366,12 +366,15 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
         c = self.wb_counters
         logger.info(
             "KV write-back: %d steps, %.1f blocks allocated/step, %d requests "
-            "stored, %d dropped (blocks reused before the flush), %d held",
+            "stored, %d dropped (blocks reused before the flush), %d held "
+            "(%d blocks; free and still cached: holding defers only the "
+            "connector's finish, never the blocks)",
             c["steps"],
             c["allocated_blocks"] / max(c["steps"], 1),
             c["flushed_requests"],
             c["dropped_requests"],
             c["held_requests"],
+            len(self._wb_owners),
         )
         held = c["held_requests"]
         c.clear()
