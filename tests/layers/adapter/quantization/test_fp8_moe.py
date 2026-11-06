@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Unit tests for VllmFp8MoEConfig (quantization="fp8_moe")."""
+"""Unit tests for VllmFp8MoEConfig (MoE-scoped FP8 quantization)."""
 
 from unittest.mock import MagicMock
 
@@ -86,7 +86,7 @@ class TestFp8MoERegistration:
 
     def test_vllm_quantization_registry(self):
         with pytest.raises(ValueError, match="Invalid quantization method"):
-            get_quantization_config("fp8_moe")
+            get_quantization_config("nonexistent_quant_method")
         assert (
             get_quantization_config(
                 quant_methods.get_tpu_quant_method(quant_methods.FP8_MOE)
