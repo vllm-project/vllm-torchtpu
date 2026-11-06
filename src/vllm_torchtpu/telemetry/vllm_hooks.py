@@ -59,6 +59,7 @@ SPAN_ATTRIBUTE_KEYS: tuple[str, ...] = (
 _ACTIVE_TRACE_HEADERS: contextvars.ContextVar[dict[str, str] | None] = (
     contextvars.ContextVar("_ACTIVE_TRACE_HEADERS", default=None)
 )
+_BLOCK_SIZE_SYNC_PATH = "/tmp/.vllm_tpu_agentic_block_size"
 
 
 def _resolve_trace_headers(
@@ -126,13 +127,16 @@ class AgenticTelemetryService:
             if span_log_path is not None
             else getattr(envs, "VLLM_TPU_AGENTIC_SPAN_LOG", "")
         )
-        self._explicit_block_size = block_size is not None or (
-            session_tracker is not None
+        env_bs = os.environ.get("VLLM_TPU_AGENTIC_BLOCK_SIZE")
+        self._explicit_block_size = (
+            block_size is not None
+            or session_tracker is not None
+            or bool(env_bs)
         )
         resolved_block_size = (
             block_size
             if block_size is not None
-            else int(os.environ.get("VLLM_TPU_AGENTIC_BLOCK_SIZE", "16") or 16)
+            else int(env_bs or 16)
         )
         self.session_tracker = session_tracker or SessionTurnTracker(
             block_size=resolved_block_size
@@ -145,6 +149,26 @@ class AgenticTelemetryService:
         """Auto-detect `cache_config.block_size` (e.g. 64/128 on TPU) once if not explicitly set."""
         if self._explicit_block_size:
             return
+        env_bs = os.environ.get("VLLM_TPU_AGENTIC_BLOCK_SIZE")
+        if env_bs:
+            try:
+                bs = int(env_bs)
+                if bs > 0:
+                    self.session_tracker.block_size = bs
+                    self._explicit_block_size = True
+                    return
+            except ValueError:
+                pass
+        if envs.VLLM_TPU_AGENTIC_TELEMETRY and os.path.exists(_BLOCK_SIZE_SYNC_PATH):
+            try:
+                with open(_BLOCK_SIZE_SYNC_PATH, encoding="utf-8") as f:
+                    bs = int(f.read().strip())
+                if bs > 0:
+                    self.session_tracker.block_size = bs
+                    self._explicit_block_size = True
+                    return
+            except (OSError, ValueError):
+                pass
         try:
             from vllm.config.vllm import get_current_vllm_config
 
@@ -554,12 +578,49 @@ def patch_output_processor(
     output_processor_cls._tpu_agentic_output_patch = True
 
 
+def _sync_block_size_from_config(vllm_config: Any) -> None:
+    """Sync `cache_config.block_size` into env, IPC file, and active service."""
+    bs = getattr(getattr(vllm_config, "cache_config", None), "block_size", None)
+    if isinstance(bs, int) and bs > 0:
+        os.environ.setdefault("VLLM_TPU_AGENTIC_BLOCK_SIZE", str(bs))
+        try:
+            with open(_BLOCK_SIZE_SYNC_PATH, "w", encoding="utf-8") as f:
+                f.write(str(bs))
+        except OSError:
+            pass
+        if _SERVICE is not None and not _SERVICE._explicit_block_size:
+            _SERVICE.session_tracker.block_size = bs
+            _SERVICE._explicit_block_size = True
+
+
+def patch_tpu_block_size() -> None:
+    """Hook `TpuPlatform.update_block_size_for_backend` to sync TPU KV block size."""
+    try:
+        from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
+
+        if getattr(TpuPlatform, "_tpu_agentic_block_size_patch", False):
+            return
+        orig_update = TpuPlatform.update_block_size_for_backend
+
+        @classmethod  # type: ignore[misc]
+        def _wrapped_update_block_size(cls: Any, vllm_config: Any) -> Any:
+            res = orig_update(vllm_config)
+            _sync_block_size_from_config(vllm_config)
+            return res
+
+        TpuPlatform.update_block_size_for_backend = _wrapped_update_block_size
+        TpuPlatform._tpu_agentic_block_size_patch = True
+    except Exception:
+        logger.debug("Skipping TpuPlatform block_size sync patch")
+
+
 def install_agentic_telemetry_patches() -> None:
     """Install CUJ-2 agentic telemetry hooks when `VLLM_TPU_AGENTIC_TELEMETRY=1`."""
     if not envs.VLLM_TPU_AGENTIC_TELEMETRY:
         return
 
     patch_trace_headers()
+    patch_tpu_block_size()
     try:
         patch_block_pool()
     except ImportError:
