@@ -27,6 +27,7 @@ from ..ops import F32
 from . import pool_alias
 from .vmem import StreamParams
 
+# lax.dot_general dimension_numbers for a standard [M, K] @ [K, N] -> [M, N] matmul.
 NN = (((1,), (0,)), ((), ()))
 
 
@@ -45,7 +46,6 @@ class TwoRing:
         sp: StreamParams,
         W: dict[str, Any],
         scr: dict[str, Any],
-        me: Any,
         *,
         interpret: bool = False,
         skip: frozenset[str] = frozenset(),
@@ -54,7 +54,6 @@ class TwoRing:
         self.sp = sp
         self.W = W
         self.scr = scr
-        self.me = me
         self.interpret = interpret
         self.skip = skip
         self.sc = sc if sc is not None else (lambda *_: contextlib.nullcontext())
@@ -97,25 +96,38 @@ class TwoRing:
         g0 = jnp.asarray(self.cursor, dtype=jnp.int32)
         prev_active = self._active_branches
         prev_delta = self._cursor_delta
+        prev_offsets = (
+            list(self._branch_offsets) if self._branch_offsets is not None else None
+        )
         dt_box = [0]
         df_box = [0]
+        t_off_box: list[list[int] | None] = [None]
+        f_off_box: list[list[int] | None] = [None]
 
         def _t():
             self.cursor = g0
             self._cursor_delta = 0
+            if prev_offsets is not None:
+                self._branch_offsets = list(prev_offsets)
             if len(self.sp.branch_counts) >= 2:
                 self._active_branches = (true_branch,)
             out = true_fn()
             dt_box[0] = self._cursor_delta
+            if self._branch_offsets is not None:
+                t_off_box[0] = list(self._branch_offsets)
             return out
 
         def _f():
             self.cursor = g0
             self._cursor_delta = 0
+            if prev_offsets is not None:
+                self._branch_offsets = list(prev_offsets)
             if len(self.sp.branch_counts) >= 2:
                 self._active_branches = (false_branch,)
             out = false_fn()
             df_box[0] = self._cursor_delta
+            if self._branch_offsets is not None:
+                f_off_box[0] = list(self._branch_offsets)
             return out
 
         self._cond_depth += 1
@@ -126,6 +138,22 @@ class TwoRing:
             self._active_branches = prev_active
             self._cursor_delta = prev_delta
         dt, df = dt_box[0], df_box[0]
+        if (
+            prev_offsets is not None
+            and t_off_box[0] is not None
+            and f_off_box[0] is not None
+        ):
+            if len(self.sp.branch_counts) >= 2:
+                merged = list(prev_offsets)
+                merged[true_branch] = t_off_box[0][true_branch]
+                merged[false_branch] = f_off_box[0][false_branch]
+                self._branch_offsets = merged
+            else:
+                assert t_off_box[0] == f_off_box[0], (
+                    f"Single-branch cond_branches() arms ended at different "
+                    f"layer tile offsets: {t_off_box[0]} vs {f_off_box[0]}"
+                )
+                self._branch_offsets = t_off_box[0]
         step = jnp.int32(dt) if dt == df else jnp.where(pred, dt, df)
         self.cursor = g0 + step
         if dt == df:
@@ -206,11 +234,13 @@ class TwoRing:
                         self.flush(g_start, n_tiles)
 
     def mm(self, x, w, dims=NN):
+        """Compute `dot_general(x, w, dims)` in `F32`, casting `w` in interpret mode."""
         if self.interpret and x.dtype != w.dtype:
             w = w.astype(x.dtype)
         return lax.dot_general(x, w, dims, preferred_element_type=F32)
 
     def dview(self, kind: str, bank):
+        """Return a typed `(t_k, N)` VMEM view into dense bank `bank` for `kind`."""
         sp = self.sp
         if sp.typed:
             return self.scr["dring_" + kind].at[bank]
@@ -247,6 +277,7 @@ class TwoRing:
         return self.scr["epool"]
 
     def eview(self, kind: str, bank):
+        """Return a typed VMEM view into expert ring bank `bank` for `kind`."""
         sp = self.sp
         if sp.typed:
             return self.scr["ering_" + kind].at[bank]
@@ -260,11 +291,13 @@ class TwoRing:
         )
 
     def dcopy(self, kind: str, src, bank):
+        """Create an async DMA descriptor between `src` and dense bank `bank`."""
         return pltpu.make_async_copy(
             src, self.dview(kind, bank), self.scr["dsem"].at[bank]
         )
 
     def ecopy(self, kind: str, src, bank):
+        """Create an async DMA descriptor between `src` and expert bank `bank`."""
         return pltpu.make_async_copy(
             src, self.eview(kind, bank), self.scr["esem"].at[bank]
         )
@@ -390,6 +423,7 @@ class TwoRing:
             )
 
     def dtake(self, kind: str, g):
+        """Wait for dense tile `g` on `dsem[g % NBD]` and return its VMEM view."""
         bank = g % self.sp.NBD
         if "dense" not in self.skip:
             with self.sc("dwait", 3):
@@ -397,6 +431,7 @@ class TwoRing:
         return self.dview(kind, bank)
 
     def dgive(self, g):
+        """Release dense bank `g % NBD` by prefetching tile `g + NBD` into it."""
         self.fetch(g + self.sp.NBD)
 
     def flush(self, g0, n: int):
@@ -420,6 +455,7 @@ class TwoRing:
         n_t, t_k = sp.nt[kind], sp.tk[kind]
         acc = self.scr["acc"]
         DMU = min(sp.dmm_unroll, sp.NBD)
+        # Column-chunk width (four 128-lane tiles) for paired accumulator updates.
         DCW = 512
         U = n_t if n_t <= DMU else (2 if n_t % 2 == 0 and N > DCW else 1)
         chunks = [(c0, min(DCW, N - c0)) for c0 in range(0, N, DCW)]
@@ -526,6 +562,11 @@ class TwoRing:
             self._seg_tiles += n_t
             self._cursor_delta += n_t
         use_lazy = self._lazy if lazy is None else lazy
+        if use_lazy and self._in_segment:
+            assert self._seg_tiles <= sp.NBD, (
+                f"Lazy stream.segment() exceeded ring depth on dmatmul({kind!r}): "
+                f"segment tiles {self._seg_tiles} > NBD={sp.NBD}"
+            )
         DMU = min(sp.dmm_unroll, sp.NBD)
         if n_t <= DMU or sp.dense_acc_pair:
             return self.dmatmul_pair(kind, g0, xsrc, N, lazy=use_lazy, dmm_ctx=dmm_ctx)
