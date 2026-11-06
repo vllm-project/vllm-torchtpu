@@ -62,3 +62,27 @@ class TPUMultiConnector(MultiConnector):
                 )
             index = child_index
         return index
+
+    def get_finished_count(self) -> int | None:
+        """The one report count every child's completions need, else an error.
+
+        The executor's KVOutputAggregator applies a single expected count to
+        finished_sending and finished_recving alike. A child returning None
+        (or 0, the TPU connector's legacy marker) counts on every worker
+        reporting, i.e. the world size. Upstream returns None whenever any
+        child does, which silently imposes the world size on a child that
+        expects fewer reports (its requests would then never finish). Here
+        the children must agree after that normalization; a PD producer of
+        PP stages (one report per stage) and the Raiden offload connector
+        (one echo per worker) both count world-size reports.
+        """
+        world = int(self._vllm_config.parallel_config.world_size)
+        counts = {c.get_finished_count() or world for c in self._connectors}
+        if len(counts) > 1:
+            raise ValueError(
+                "TPUMultiConnector children expect different numbers of "
+                f"completion reports per request ({sorted(counts)}, world "
+                f"size {world}); the executor applies one count to all"
+            )
+        count = counts.pop() if counts else None
+        return None if count == world else count
