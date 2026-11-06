@@ -944,9 +944,7 @@ class VllmTPUMLAAttention(MLAAttention):
             if original_selector_get_backend is not None:
                 selector.get_mla_prefill_backend = original_selector_get_backend
 
-        # Set after super(), not through it: upstream's
-        # process_weights_after_loading gathers W_UK_T on the flag too, and
-        # this class does that itself once the weight is on device.
+        # process_weights_after_loading masks this around upstream's copy.
         self.dcp_q_replicate = dcp_q_replicate
         # The shared top-k table. A layer that reuses an earlier layer's
         # indices has no indexer, so this is where its top-k width is stated.
@@ -964,6 +962,33 @@ class VllmTPUMLAAttention(MLAAttention):
                 self.kv_cache_dtype.lower().strip()
             )
 
+    def _gather_dcp_qrep_weights(self) -> None:
+        """Query replication attends with the whole DCP group's heads, so the
+        absorbed W_UK_T has to span them too. Gathered once here rather than
+        gathering q every step -- that trade is the point of qrep."""
+        self.W_UK_T_dcp_qrep = None
+        self.W_UK_T_dcp_qrep_scale = None
+        if not self.dcp_q_replicate:
+            return
+        dcp_group = get_dcp_group()
+        if dcp_group is None or int(dcp_group.world_size) <= 1:
+            raise RuntimeError(
+                "dcp_q_replicate is set but no DCP group is initialized, "
+                "so W_UK_T cannot be gathered across the group."
+            )
+        # Upstream MLAAttention registers W_UK_T_dcp_qrep as a Parameter.
+        self.W_UK_T_dcp_qrep = Parameter(
+            fresh_buffer(dcp_group.all_gather(self.W_UK_T.contiguous(), dim=0)),
+            requires_grad=False,
+        )
+        if hasattr(self, "W_UK_T_scale"):
+            self.W_UK_T_dcp_qrep_scale = Parameter(
+                fresh_buffer(
+                    dcp_group.all_gather(self.W_UK_T_scale.contiguous(), dim=0)
+                ),
+                requires_grad=False,
+            )
+
     def process_weights_after_loading(self, act_dtype: torch.dtype):
         # Upstream `MLAAttention.process_weights_after_loading` reads this
         # weight raw -- `get_and_maybe_dequant_weights(kv_b_proj).T` -- and
@@ -979,9 +1004,13 @@ class VllmTPUMLAAttention(MLAAttention):
             self.kv_b_proj.weight = Parameter(
                 kv_b_weight.transpose(0, 1).contiguous(), requires_grad=False
             )
+        # Upstream would gather W_UK_T across DCP too; _gather_dcp_qrep_weights
+        # does it once, on device.
+        dcp_q_replicate, self.dcp_q_replicate = self.dcp_q_replicate, False
         try:
             super().process_weights_after_loading(act_dtype)
         finally:
+            self.dcp_q_replicate = dcp_q_replicate
             if flipped:
                 assert kv_b_weight is not None
                 self.kv_b_proj.weight = kv_b_weight
@@ -1016,25 +1045,7 @@ class VllmTPUMLAAttention(MLAAttention):
         self.W_UK_T = Parameter(self.W_UK_T.to(device), requires_grad=False)
         self.W_UV = Parameter(self.W_UV.to(device), requires_grad=False)
 
-        # Query replication attends with the whole DCP group's heads, so the
-        # absorbed W_UK_T has to span them too. Gathered once here rather than
-        # gathering q every step -- that trade is the point of qrep.
-        self.W_UK_T_dcp_qrep = None
-        self.W_UK_T_dcp_qrep_scale = None
-        if self.dcp_q_replicate:
-            dcp_group = get_dcp_group()
-            if dcp_group is None or int(dcp_group.world_size) <= 1:
-                raise RuntimeError(
-                    "dcp_q_replicate is set but no DCP group is initialized, "
-                    "so W_UK_T cannot be gathered across the group."
-                )
-            self.W_UK_T_dcp_qrep = fresh_buffer(
-                dcp_group.all_gather(self.W_UK_T.contiguous(), dim=0)
-            )
-            if hasattr(self, "W_UK_T_scale"):
-                self.W_UK_T_dcp_qrep_scale = fresh_buffer(
-                    dcp_group.all_gather(self.W_UK_T_scale.contiguous(), dim=0)
-                )
+        self._gather_dcp_qrep_weights()
 
         # Safely detach and clear kv_b_proj parameter buffers without breaking
         # PyTorch attribute integrity
@@ -1046,7 +1057,7 @@ class VllmTPUMLAAttention(MLAAttention):
                 delattr(self.kv_b_proj, key)
 
         if self.W_UK_T.device.type == "tpu":
-            tensors = [self.W_UK_T, self.W_UV]
+            tensors: list[torch.Tensor] = [self.W_UK_T, self.W_UV]
             if hasattr(self, "W_UK_T_scale"):
                 tensors.extend([self.W_UK_T_scale, self.W_UV_scale])
             tensors.extend(

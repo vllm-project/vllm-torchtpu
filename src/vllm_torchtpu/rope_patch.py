@@ -11,12 +11,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Pure in-graph RotaryEmbedding and MRotaryEmbedding patch for AOT StableHLO export.
+"""Pure in-graph RotaryEmbedding and MRotaryEmbedding patching.
 
-Eliminates the `cos_sin_cache` module buffer on eligible rotary embedding modules
-(both 1-D standard `RotaryEmbedding` and 2-D `[3, num_tokens]` multimodal
-`MRotaryEmbedding` / `MRotaryEmbeddingInterleaved`) during export so that `@main`
-does not take an extra static cache buffer input, computing `cos` and `sin`
+Eliminates static `cos_sin_cache` module buffers on eligible rotary embedding
+modules (both 1-D standard `RotaryEmbedding` and 2-D `[3, num_tokens]` multimodal
+`MRotaryEmbedding` / `MRotaryEmbeddingInterleaved`), computing `cos` and `sin`
 directly in-graph from `positions` and `inv_freq`.
 """
 
