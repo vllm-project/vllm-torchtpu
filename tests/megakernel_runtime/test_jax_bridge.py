@@ -226,8 +226,11 @@ JAX_TOY_PLUGIN = '''
 from jax.sharding import PartitionSpec as P
 
 from vllm_torchtpu.megakernel_runtime.jax_bridge import build_jax_step_op
-from vllm_torchtpu.megakernel_runtime.plugin import (
-    Bucket, StepDecision, TpuMonoSpec, WarmupCase,
+from vllm_torchtpu.megakernel.runtime.contract import (
+    Bucket,
+    StepDecision,
+    TpuMonoSpec,
+    WarmupCase,
 )
 
 
