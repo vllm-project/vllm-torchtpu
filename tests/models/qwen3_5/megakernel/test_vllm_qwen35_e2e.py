@@ -105,7 +105,7 @@ _REAL_FRAMEWORK_SLOT_FACTS = Qwen35Program._framework_slot_facts
 def _bind_runner(model: Any, **kw: Any) -> Any:
     """A fake runner for `bind`: no token paddings, 2 pages per sequence."""
     return testing.fake_runner(
-        model=model, token_paddings=(), max_pages_per_seq=2, **kw
+        model=model, token_paddings=(), req_block_pairs=((8, 2),), **kw
     )
 
 
@@ -2130,7 +2130,7 @@ def test_can_run_real_tpu_runner_metadata(monkeypatch: pytest.MonkeyPatch) -> No
     runner = testing.fake_runner(
         model=model,
         mesh=mesh,
-        max_pages_per_seq=2,
+        req_block_pairs=((8, 2),),
         token_paddings=(2, 4, 8),
         _attn_metadata_builder_ctx=SimpleNamespace(num_reqs=2),
         _request_distribution_cpu=req_dist_cpu,

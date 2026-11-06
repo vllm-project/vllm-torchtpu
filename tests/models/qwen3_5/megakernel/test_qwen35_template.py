@@ -268,7 +268,6 @@ def tiny_template(monkeypatch: pytest.MonkeyPatch) -> Any:
             mamba_ssm_cache_dtype="bfloat16",
             token_paddings=(2, 4, 8),
             req_block_pairs=((4, 2),),
-            max_pages_per_seq=2,
             _attn_metadata_builder_ctx=SimpleNamespace(num_reqs=2),
             query_start_loc_np=qsl,
             _cached_comb_key=None,
