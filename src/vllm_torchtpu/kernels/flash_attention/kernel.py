@@ -503,8 +503,8 @@ def _flash_attention_kernel_single_batch_single_step(
     if l_ref is not None:
         l_ref[batch_idx] = lax.broadcast_in_dim(l, l_ref.shape[2:], range(2))
 
-    # Normalize after PV, as the multi-step path does: the row max of
-    # exp(s - m) is exactly 1.0 in bf16, so only the fp32 output divides by l.
+    # Round P before normalizing, like the multi-step path: the row max of
+    # exp(s - m) is exactly 1.0 in bf16, and only the fp32 output divides by l.
     v = v_tile_ref[batch_idx]
     o = jax.lax.dot(p.astype(v.dtype), v, preferred_element_type=jnp.float32)
     o_tile_ref[batch_idx] = (o / l).astype(o_tile_ref.dtype)
