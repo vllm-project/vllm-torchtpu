@@ -282,6 +282,9 @@ class GmmConfigs:
     acc_dtype: jnp.dtype
     zero_init: bool
     fuse_act: str | None
+    # (start, width) output columns computed from rhs[..., start:start + width];
+    # dims.size_n is then the window width. None computes every column.
+    n_window: tuple[int, int] | None = None
 
     @property
     def num_quant_blocks_per_tile_k(self) -> int:
@@ -871,6 +874,13 @@ def kernel_main(
         rhs_weight = rhs_ref.weight.bitcast(cfgs.rhs_cfgs.quant_dtype)
         rhs_ref = dataclasses.replace(rhs_ref, weight=rhs_weight)
 
+    if cfgs.n_window is not None:
+        # A column window of the weights, scales and bias as a ref view (as
+        # the fused activation's up half below): the DMAs read only these
+        # columns and nothing is copied.
+        start, width = cfgs.n_window
+        rhs_ref = jax.tree.map(lambda x: x.at[..., start : start + width], rhs_ref)
+
     # Fill metadata buffer and return number of group & m interations.
     num_gm = fill_metadata(
         lhs_group_sizes_ref,
@@ -1141,9 +1151,10 @@ def get_cost_estimate(cfgs: GmmConfigs):
 def get_scope_name(cfgs: GmmConfigs) -> str:
     dims = cfgs.dims
     tiles = cfgs.tiles
+    window = "" if cfgs.n_window is None else f"-nw_{cfgs.n_window[0]}"
     return (
         f"gmm_v2-g_{dims.size_group}-m_{dims.size_m}-k_{dims.size_k}-act_{cfgs.fuse_act}"
-        f"-n_{dims.size_n}-tm_{tiles.tile_m}-tk_{tiles.tile_k}-tn_{tiles.tile_n}"
+        f"-n_{dims.size_n}{window}-tm_{tiles.tile_m}-tk_{tiles.tile_k}-tn_{tiles.tile_n}"
     )
 
 
@@ -1163,6 +1174,7 @@ def make_gmm_configs(
     zero_initialize: bool,
     fuse_act: str | None = None,
     rhs_quant_dtype: jnp.dtype | None = None,
+    n_window: tuple[int, int] | None = None,
 ):
     """Fills the GMM config for the GMM kernel."""
 
@@ -1178,6 +1190,21 @@ def make_gmm_configs(
         fuse_act,
         packing_factor,
     )
+
+    if n_window is not None:
+        start, width = n_window
+        num_lanes = pltpu.get_tpu_info().num_lanes
+        if fuse_act is not None:
+            raise ValueError("n_window does not combine with fuse_act")
+        if not (
+            0 <= start
+            and 0 < width
+            and start + width <= dims.size_n
+            and start % num_lanes == 0
+            and width % num_lanes == 0
+        ):
+            raise ValueError(f"{n_window=} must be a lane-aligned part of {dims.size_n=}")
+        dims = dataclasses.replace(dims, size_n=width)
 
     if rhs_scale is not None:
         has_scale = True
@@ -1250,6 +1277,7 @@ def make_gmm_configs(
         acc_dtype=jnp.dtype(acc_dtype),
         zero_init=zero_initialize,
         fuse_act=fuse_act,
+        n_window=n_window,
     )
 
 
@@ -1275,6 +1303,7 @@ def get_metadata(cfgs: GmmConfigs) -> dict[str, str | int | float]:
         "zero_initialize",
         "fuse_act",
         "rhs_quant_dtype",
+        "n_window",
     ]
 )
 def gmm_v2(
@@ -1294,6 +1323,7 @@ def gmm_v2(
     zero_initialize: bool = True,
     fuse_act: str | None = None,
     rhs_quant_dtype: jnp.dtype | None = None,
+    n_window: tuple[int, int] | None = None,
 ) -> jax.Array:
     """GMM kernel implemented with emit_pipeline.
 
@@ -1319,9 +1349,13 @@ def gmm_v2(
         fuse_act: Activation function to fuse with GMM, None if no fusion.
         rhs_quant_dtype: Quantized dtype encoded by a pre-packed RHS carrier.
             Packed along k-axis
+        n_window: Optional (start, width): compute only output columns
+            [start, start + width), reading only those rhs columns (lane
+            aligned; not with fuse_act). Each column is computed exactly as
+            without the window.
 
     Returns:
-        Output of shape [size_m, size_n].
+        Output of shape [size_m, size_n] ([size_m, width] with n_window).
     """
 
     del precision
@@ -1359,6 +1393,7 @@ def gmm_v2(
         zero_initialize=zero_initialize,
         fuse_act=fuse_act,
         rhs_quant_dtype=rhs_quant_dtype,
+        n_window=n_window,
     )
     dims = cfgs.dims
     tiles = cfgs.tiles

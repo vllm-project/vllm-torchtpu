@@ -153,6 +153,71 @@ def test_nonep_choices_change_only_the_non_ep_program():
     assert "concatenate" in non_ep and "concatenate" not in jaxpr(False)
 
 
+def _ref_gmm(calls):
+    """Pure-JAX stand-in for gmm_wrapper that records its n_window; every
+    output column is computed independently, as the kernel's are."""
+
+    def gmm(lhs, rhs, rhs_scale, rhs_bias, group_sizes, group_offset, zero_initialize=False,
+            fuse_act=None, preferred_element_type=None, rhs_quant_dtype=None, n_window=None):
+        calls.append(n_window)
+        r = (rhs.astype(jnp.float32) * rhs_scale[:, 0]).astype(jnp.bfloat16)
+        if n_window is not None:
+            r = r[..., n_window[0] : n_window[0] + n_window[1]]
+        out = jax.lax.ragged_dot(lhs, r, group_sizes, preferred_element_type=jnp.float32)
+        if fuse_act == "silu":
+            h = out.shape[1] // 2
+            out = jax.nn.silu(out[:, :h]) * out[:, h:]
+        return out.astype(preferred_element_type or lhs.dtype)
+
+    return gmm
+
+
+def _ref_combine(rows, revert, weights, valid, reduce_group_size):
+    """Destination-major weighted sum in f32, per column."""
+    t = revert.shape[0] // reduce_group_size
+    picked = rows[revert].astype(jnp.float32).reshape(t, reduce_group_size, -1)
+    w = (weights.astype(jnp.float32) * valid).reshape(t, reduce_group_size, 1)
+    return (picked * w).sum(axis=1)
+
+
+@pytest.mark.parametrize("split", [2, 4])
+def test_combine_split_matches_one_gmm_and_one_combine(monkeypatch, split):
+    """TPU_MOE_NONEP_COMBINE_SPLIT: per-column-block GMM2 + combine gives the
+    unsplit output bitwise, and each block's GMM2 reads its own columns."""
+    experts, hidden, inter, topk, tokens = 16, 512, 128, 4, 640  # 2,560 routes: the prefill (multi-sort) path
+    k1, k2, k3 = jax.random.split(jax.random.key(3), 3)
+    w1, s1 = _fp8_per_channel(k1, (experts, hidden, 2 * inter))
+    w2, s2 = _fp8_per_channel(k2, (experts, inter, hidden))
+    x = (jax.random.normal(k3, (tokens, hidden), jnp.float32) / 4).astype(jnp.bfloat16)
+    rng = np.random.default_rng(5)
+    ids = jnp.asarray(np.stack([rng.choice(experts, topk, replace=False) for _ in range(tokens)]), jnp.int32)
+    w = jnp.asarray(rng.random((tokens, topk)), jnp.bfloat16)
+    calls = []
+    monkeypatch.setattr(fused_moe_gmm, "gmm_wrapper", _ref_gmm(calls))
+    monkeypatch.setattr(fused_moe_gmm, "ragged_gather_reduce_v3", _ref_combine)
+    monkeypatch.setattr(fused_moe_gmm, "_local_ragged_combine_eligible", lambda *a, **k: True)
+    xs, gs, rev, wf, valid, tok = prepare_routed_gmm_inputs(
+        x, ids, w, local_num_experts=experts, topk=topk, use_ep=False, use_sparse_core=True
+    )
+
+    def run(n):
+        return fused_moe_gmm.moe_gmm(
+            xs, w1, s1, None, w2, s2, None, gs, rev, wf, valid, tok, activation="silu",
+            num_tokens=tokens, topk=topk, use_ep=False, use_sparse_core=True,
+            nonep_combine_split=n,
+        )
+
+    ref = run(1)
+    assert calls == [None, None]
+    calls.clear()
+    got = run(split)
+    width = hidden // split
+    assert calls == [None] + [(j * width, width) for j in range(split)]
+    assert got.shape == ref.shape == (tokens, hidden)
+    np.testing.assert_array_equal(_bits(got), _bits(ref))
+    assert np.asarray(ref, np.float32).std() > 0
+
+
 # --------------------------------------------------------------------------- TPU
 
 
@@ -204,9 +269,35 @@ def test_fused_moe_func_nonep_choices_bitwise_on_tpu(tokens):
         dict(nonep_permute="two_sorts"),
         dict(nonep_permute="counting"),
         dict(nonep_permute="two_sorts", nonep_gather="xla_colchunk"),
+        dict(nonep_combine_split=2),
+        dict(nonep_combine_split=4),
+        dict(nonep_combine_split=2, nonep_gather="xla_colchunk"),
     ):
         np.testing.assert_array_equal(_bits(run(**kw)), ref, err_msg=str(kw))
     # The comparison must be able to fail: moving token 0's first route to an
     # expert it does not use changes its output row.
     unused = int(np.setdiff1d(np.arange(EXPERTS), np.asarray(ids[0]))[0])
     assert (_bits(run(route_ids=ids.at[0, 0].set(unused))) != ref).any()
+
+
+@pytest.mark.tpu_test
+@pytest.mark.parametrize("tokens", [3200, 6400])
+def test_gmm_v2_n_window_is_a_bitwise_column_slice_on_tpu(tokens):
+    """gmm_v2(n_window=(start, width)) returns exactly columns [start, start +
+    width) of the full output, and a different window does not."""
+    _require_tpu()
+    from vllm_torchtpu.kernels.megablox.gmm_v2 import gmm_v2
+
+    k1, k2 = jax.random.split(jax.random.key(11))
+    w2, s2 = _fp8_per_channel(k1, (EXPERTS, INTER, HIDDEN))
+    lhs = (jax.random.normal(k2, (tokens * TOPK, INTER), jnp.float32) / 4).astype(jnp.bfloat16)
+    ids, _ = _routing(tokens)
+    gs = jnp.bincount(ids.reshape(-1), length=EXPERTS).astype(jnp.int32)
+    kw = dict(rhs_scale=s2, group_offset=jnp.array([0], jnp.int32), zero_initialize=False,
+              preferred_element_type=jnp.bfloat16)
+    full = _bits(gmm_v2(lhs, w2, gs, **kw))
+    halves = [_bits(gmm_v2(lhs, w2, gs, n_window=(st, 1280), **kw)) for st in (0, 1280)]
+    np.testing.assert_array_equal(np.concatenate(halves, axis=1), full)
+    quarter = _bits(gmm_v2(lhs, w2, gs, n_window=(640, 640), **kw))
+    np.testing.assert_array_equal(quarter, full[:, 640:1280])
+    assert (halves[1] != full[:, :1280]).any()

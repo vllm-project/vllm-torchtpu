@@ -202,6 +202,7 @@ def gmm_wrapper(
     fuse_act=None,
     preferred_element_type=None,
     rhs_quant_dtype=None,
+    n_window=None,
 ):
     # fp4 weights: keep bf16 activations. Quantizing activations to fp8 collapses
     # fp4 accuracy (error compounds across MoE layers) with no decode speedup
@@ -222,6 +223,7 @@ def gmm_wrapper(
         preferred_element_type=preferred_element_type,
         maybe_quantize_lhs=not is_fp4_weight,
         rhs_quant_dtype=rhs_quant_dtype,
+        n_window=n_window,
     )
 
 
@@ -494,6 +496,58 @@ def column_chunked_gather(x: jax.Array, indices: jax.Array, cols: int) -> jax.Ar
     return jnp.concatenate(pieces, axis=1)
 
 
+def _local_ragged_combine_eligible(
+    num_rows: int,
+    width: int,
+    dtype: jnp.dtype,
+    *,
+    use_sparse_core: bool,
+    use_ep: bool,
+    topk: int,
+    num_routes: int,
+    onehot_moe_permute_threshold: int,
+    num_tokens: int,
+) -> bool:
+    """Whether the non-EP combine of a [num_rows, width] expert output runs on
+    the destination-major SparseCore kernel (ragged_gather_reduce_v3)."""
+    if not (
+        # Local SparseCore path; route-pair metadata needs at least two routes.
+        use_sparse_core
+        and not use_ep
+        and topk >= 2
+        # TensorCore combine handles top-8 batches.
+        and topk != 8
+        # Honor the configured SparseCore dispatch cutoff.
+        and num_routes > onehot_moe_permute_threshold
+        # BF16 kernel input.
+        and dtype == jnp.bfloat16
+        # Packed source-index capacity.
+        and num_rows <= 1 << 20
+    ):
+        return False
+    try:
+        tpu_info = pltpu.get_tpu_info()
+    except ValueError:
+        # get_tpu_info raises for unsupported device kinds (e.g. CPU hosts).
+        return False
+    sc_info = tpu_info.sparse_core
+    # Lane-aligned width, 16-lane SparseCore, and v3's own cutoff (two BF16
+    # buffers use at least 60% of VMEM).
+    if (
+        sc_info is None
+        or sc_info.num_lanes != 16
+        or width % tpu_info.num_lanes != 0
+        or num_rows * width * 4 < tpu_info.vmem_capacity_bytes * 0.6
+    ):
+        return False
+    # The kernel pads destination tokens to one 64-token block per SparseCore
+    # row partition: require at least one full block and padding of at most
+    # half the batch.
+    alignment = token_block_alignment(width, tpu_info)
+    padded_tokens = -(-num_tokens // alignment) * alignment
+    return num_tokens >= alignment and padded_tokens * 2 <= num_tokens * 3
+
+
 def moe_gmm(
     x: jax.Array,
     w1: jax.Array,
@@ -515,8 +569,14 @@ def moe_gmm(
     use_sparse_core: bool,
     onehot_moe_permute_threshold: int = 0,
     rhs_quant_dtype: jnp.dtype | None = None,
+    nonep_combine_split: int = 1,
 ) -> jax.Array:
     """Run grouped GEMM for routed tokens and reduce back to tokens.
+
+    ``nonep_combine_split`` > 1 (``TPU_MOE_NONEP_COMBINE_SPLIT``) runs the
+    second GMM and the SparseCore combine per block of output columns, so each
+    block's combine can run on the SparseCores while the TensorCore computes
+    the next block. Every column is computed and reduced exactly as unsplit.
 
     The valid-mask gating below is a no-op for non-EP runs (mask is all
     True) and keeps the single code path uniform for both EP and non-EP.
@@ -541,6 +601,50 @@ def moe_gmm(
     topk_weights = topk_weights_flat.reshape((num_tokens, topk))
     valid_mask = valid_mask_flat.reshape((num_tokens, topk))
 
+    combine_kw = dict(
+        use_sparse_core=use_sparse_core,
+        use_ep=use_ep,
+        topk=topk,
+        num_routes=argsort_revert_indices.size,
+        onehot_moe_permute_threshold=onehot_moe_permute_threshold,
+        num_tokens=num_tokens,
+    )
+    size_n = w2.shape[-1]
+    split_width = size_n // nonep_combine_split if nonep_combine_split > 1 else 0
+    if (
+        split_width
+        and size_n % nonep_combine_split == 0
+        and w2_bias is None
+        and get_packing_factor(w2.dtype, rhs_quant_dtype) == 1
+        and _local_ragged_combine_eligible(
+            gmm1_res.shape[0], split_width, x.dtype, **combine_kw
+        )
+    ):
+        blocks = []
+        for start in range(0, size_n, split_width):
+            block = gmm_wrapper(
+                gmm1_res,
+                w2,
+                w2_scale,
+                w2_bias,
+                group_sizes,
+                group_offset,
+                zero_initialize=False,
+                preferred_element_type=x.dtype,
+                rhs_quant_dtype=rhs_quant_dtype,
+                n_window=(start, split_width),
+            )
+            blocks.append(
+                ragged_gather_reduce_v3(
+                    block,
+                    argsort_revert_indices,
+                    topk_weights_flat,
+                    valid_mask_flat,
+                    reduce_group_size=topk,
+                ).astype(x.dtype)
+            )
+        return jnp.concatenate(blocks, axis=1)
+
     gmm2_res = gmm_wrapper(
         gmm1_res,
         w2,
@@ -554,48 +658,16 @@ def moe_gmm(
     )
     # The destination-major kernel packs source indices into 20 bits and
     # processes 16-lane SparseCore tiles.
-    use_local_ragged_combine = (
-        # Local SparseCore path; route-pair metadata needs at least two routes.
-        use_sparse_core
-        and not use_ep
-        and topk >= 2
-        # TensorCore combine handles top-8 batches.
-        and topk != 8
-        # Honor the configured SparseCore dispatch cutoff.
-        and argsort_revert_indices.size > onehot_moe_permute_threshold
-        # BF16 kernel input.
-        and gmm2_res.dtype == jnp.bfloat16
-        # Packed source-index capacity.
-        and gmm2_res.shape[0] <= 1 << 20
-    )
-    if use_local_ragged_combine:
-        try:
-            tpu_info = pltpu.get_tpu_info()
-        except ValueError:
-            # get_tpu_info raises for unsupported device kinds (e.g. CPU hosts).
-            tpu_info = None
-        sc_info = tpu_info.sparse_core if tpu_info is not None else None
-        # Lane-aligned width, 16-lane SparseCore, and v3's own cutoff (two
-        # BF16 buffers use at least 60% of VMEM).
-        if (
-            sc_info is not None
-            and sc_info.num_lanes == 16
-            and gmm2_res.shape[-1] % tpu_info.num_lanes == 0
-            and gmm2_res.size * 4 >= tpu_info.vmem_capacity_bytes * 0.6
-        ):
-            # The kernel pads destination tokens to one 64-token block per
-            # SparseCore row partition: require at least one full block and
-            # padding of at most half the batch.
-            alignment = token_block_alignment(gmm2_res.shape[-1], tpu_info)
-            padded_tokens = -(-num_tokens // alignment) * alignment
-            if num_tokens >= alignment and padded_tokens * 2 <= num_tokens * 3:
-                return ragged_gather_reduce_v3(
-                    gmm2_res,
-                    argsort_revert_indices,
-                    topk_weights_flat,
-                    valid_mask_flat,
-                    reduce_group_size=topk,
-                ).astype(x.dtype)
+    if _local_ragged_combine_eligible(
+        gmm2_res.shape[0], gmm2_res.shape[-1], gmm2_res.dtype, **combine_kw
+    ):
+        return ragged_gather_reduce_v3(
+            gmm2_res,
+            argsort_revert_indices,
+            topk_weights_flat,
+            valid_mask_flat,
+            reduce_group_size=topk,
+        ).astype(x.dtype)
     if use_ep and use_sparse_core:
         if argsort_revert_indices.size <= onehot_moe_permute_threshold:
             # Use onehot + matmul for unpermutation, which can be faster
@@ -677,6 +749,7 @@ def moe_gmm(
         "nonep_gather",
         "nonep_gather_cols",
         "nonep_gather_chunk",
+        "nonep_combine_split",
     ),
 )
 def fused_moe_func(
@@ -701,6 +774,7 @@ def fused_moe_func(
     nonep_gather: str = "xla",
     nonep_gather_cols: int = 0,
     nonep_gather_chunk: int = 16384,
+    nonep_combine_split: int = 1,
 ) -> jax.Array:
     """Run MoE with precomputed expert ids and weights.
 
@@ -822,5 +896,6 @@ def fused_moe_func(
         use_sparse_core=use_sparse_core,
         onehot_moe_permute_threshold=onehot_moe_permute_threshold,
         rhs_quant_dtype=rhs_quant_dtype,
+        nonep_combine_split=nonep_combine_split,
     )
     return x[:num_tokens, :hidden_size]

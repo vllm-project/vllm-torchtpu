@@ -81,6 +81,7 @@ if TYPE_CHECKING:
     TPU_MOE_NONEP_GATHER_COLS: int = 0
     TPU_MOE_NONEP_GATHER_CHUNK: int = 16384
     TPU_MOE_NONEP_PERMUTE: str = "sorts"
+    TPU_MOE_NONEP_COMBINE_SPLIT: str = "1"
     USE_MOE_TP_DECODE_KERNEL: bool = False
     RAGGED_GATHER_REDUCE_VERSION: str = "v2"
     USE_PHASED_PROFILER: bool = False
@@ -1148,6 +1149,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "sorts",
         ["sorts", "two_sorts", "counting"],
         case_sensitive=False,
+    ),
+    # Blocks of output columns for the non-EP second GMM and its SparseCore
+    # combine: with N > 1 each block's combine (an async SparseCore call) can
+    # run while the TensorCore computes the next block's GMM, instead of the
+    # TensorCore waiting for one whole combine. 1 keeps one GMM and one
+    # combine. Bitwise the same output.
+    "TPU_MOE_NONEP_COMBINE_SPLIT": env_with_choices(
+        "TPU_MOE_NONEP_COMBINE_SPLIT", "1", ["1", "2", "4"]
     ),
     # Serve eligible tensor-parallel MoE layers (sigmoid + correction-bias
     # top-k with renormalization, one shared expert, FP8 per-channel weights)
