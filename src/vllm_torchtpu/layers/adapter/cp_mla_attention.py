@@ -1838,7 +1838,7 @@ def online_lse_combine_applies(
     """Whether backbone ``merge_lse_partials_scatter_heads`` routes ``num_tokens``
     through ``dcp_online_lse_combine`` at trace time."""
     from vllm_torchtpu.kernels.experimental.small_collectives.dcp_lse_combine import (
-        online_lse_combine_single_pass_supported,
+        online_lse_combine_supported,
     )
 
     req = online_lse_combine_mode_requested()
@@ -1855,14 +1855,8 @@ def online_lse_combine_applies(
     if num_tokens <= envs.bucket_gate_edge(16):
         return False
     heads = int(num_heads) if num_heads is not None else 4 * world
-    check_mode = (
-        "pairs"
-        if (req == "pairs" or (req == "auto" and world >= 4 and world % 2 == 0))
-        else "flat"
-    )
-    return online_lse_combine_single_pass_supported(
-        num_tokens, heads, world, vdim, mode=check_mode
-    )
+    check_mode = "pairs" if req == "pairs" else "flat"
+    return online_lse_combine_supported(num_tokens, heads, world, vdim, mode=check_mode)
 
 
 def _dcp_chip_pairs_ok(mesh: Any, group: Any | None = None) -> bool:

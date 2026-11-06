@@ -55,16 +55,6 @@ With ``live_tokens`` (``int32[1]`` in SMEM, identical across ranks), trailing
 padding tokens ``t >= live_tokens`` sit at the end of every token-major block:
 both intra-chip and inter-chip DMAs move only ``16 + align16(live * local)``
 rows and dead rows past ``live_tokens`` are zeroed.
-
-For larger decode buckets (``96 < T <= 256``, or high-head geometries whose
-single-pass VMEM footprint would exceed budget), ``dcp_online_lse_combine``
-splits ``T`` into balanced ``16``-token-aligned chunks that each fit within
-scoped VMEM and concatenates the combined ``bf16[tc, local, D]`` slices in HBM,
-while ``online_lse_combine_single_pass_supported`` lets MLA runtime dispatch
-route only single-pass VMEM-chained buckets (keeping multi-chunk ``T > 96`` on
-single-collective XLA reduce-scatter). Prefill buckets ``T > 256`` return
-``False`` from ``online_lse_combine_supported`` so bandwidth-bound prefill
-merges keep the chunked reduce-scatter path.
 """
 
 from __future__ import annotations
@@ -89,102 +79,37 @@ from vllm_torchtpu.kernels.experimental.small_collectives.common import (
 
 # Distinct barrier semaphore group: MoE uses 0, all-reduce / fp8_oproj_ar 5,
 # reduce-scatter 7, all-gather 9, small all-to-all 11, sparse MLA send 13,
-# rotated collectives 15, prefill row all-gather 17, combine-scatter 19,
-# indexer score all-to-all 23. Multi-chunk steps cycle (21, 22, 24, 25).
+# rotated collectives 15, prefill row all-gather 17, combine-scatter 19.
 COLLECTIVE_ID = 21
-CHUNK_COLLECTIVE_OFFSETS = (0, 1, 3, 4)
 HEADER_ROWS = 16
 TILE_ROWS = 16
-MAX_SINGLE_PASS_TOKENS = 96
-MAX_COMBINE_TOKENS = 256
-MAX_COMBINE_CHUNKS = 4
 MAX_LIVE_STEPS = 8
 DEFAULT_VMEM_LIMIT_BYTES = 32 * 1024 * 1024
-VMEM_BUFFER_FRACTION = 0.80
+# Largest decode bucket validated on TPU v7x (numerics, race detector and
+# Mosaic lowering at DCP8 and DCP16). Larger buckets keep the XLA all-gather +
+# reduce-scatter merge.
+MAX_COMBINE_TOKENS = 96
+# Share of the scoped VMEM limit that the kernel's buffers may take; the rest
+# is left for Mosaic temporaries.
+VMEM_BUFFER_FRACTION = 0.8
 
 
-def _single_pass_vmem_bytes(
+def _vmem_buffer_bytes(
     tokens: int,
     num_heads: int,
     num_cores: int,
     vdim: int,
     mode: str,
 ) -> int:
-    """Static VMEM buffer bytes required by one unchunked kernel invocation."""
+    """VMEM bytes of the kernel's input, scratch and output buffers."""
     local = num_heads // num_cores
     block_rows = HEADER_ROWS + tokens * local
-    part_bytes = tokens * num_heads * vdim * 2
-    lse_cols = ((num_heads + LANES - 1) // LANES) * LANES
-    lse_bytes = tokens * lse_cols * 4
-    scratch_slots = 2 * num_cores if mode == "flat" else 4 * (num_cores // 2)
-    scratch_bytes = scratch_slots * block_rows * vdim * 2
-    local_padded = ((local + 7) // 8) * 8
-    out_bytes = tokens * local_padded * vdim * 2
-    return part_bytes + lse_bytes + scratch_bytes + out_bytes
-
-
-def _single_pass_supported(
-    tokens: int,
-    num_heads: int,
-    num_cores: int,
-    vdim: int,
-    mode: str,
-    vmem_limit_bytes: int = DEFAULT_VMEM_LIMIT_BYTES,
-) -> bool:
-    if (
-        tokens < TILE_ROWS
-        or tokens > MAX_SINGLE_PASS_TOKENS
-        or tokens % TILE_ROWS != 0
-    ):
-        return False
-    local = num_heads // num_cores
-    if tokens * local > 8 * vdim:
-        return False
-    budget = int(vmem_limit_bytes * VMEM_BUFFER_FRACTION)
-    return _single_pass_vmem_bytes(tokens, num_heads, num_cores, vdim, mode) <= budget
-
-
-def combine_token_chunks(
-    tokens: int,
-    num_heads: int,
-    num_cores: int,
-    vdim: int,
-    mode: str = "pairs",
-    vmem_limit_bytes: int = DEFAULT_VMEM_LIMIT_BYTES,
-) -> tuple[int, ...]:
-    """Balanced ``16``-token chunk sizes for ``dcp_online_lse_combine``, or
-    ``()`` when the geometry is unsupported or exceeds ``MAX_COMBINE_TOKENS``."""
-    if mode not in ("pairs", "flat"):
-        return ()
-    if (
-        tokens < TILE_ROWS
-        or tokens > MAX_COMBINE_TOKENS
-        or tokens % TILE_ROWS != 0
-        or num_cores < 2
-        or num_heads < num_cores
-        or num_heads % num_cores != 0
-        or vdim < LANES
-        or vdim % LANES != 0
-    ):
-        return ()
-    if mode == "pairs" and (num_cores < 4 or num_cores % 2 != 0):
-        return ()
-    tiles = tokens // TILE_ROWS
-    for num_chunks in range(1, min(tiles, MAX_COMBINE_CHUNKS) + 1):
-        max_chunk_tokens = -(-tiles // num_chunks) * TILE_ROWS
-        if _single_pass_supported(
-            max_chunk_tokens,
-            num_heads,
-            num_cores,
-            vdim,
-            mode,
-            vmem_limit_bytes=vmem_limit_bytes,
-        ):
-            q, r = divmod(tiles, num_chunks)
-            return tuple(
-                ((q + 1) if idx < r else q) * TILE_ROWS for idx in range(num_chunks)
-            )
-    return ()
+    partial_bytes = tokens * num_heads * vdim * 2
+    lse_bytes = tokens * ((num_heads + LANES - 1) // LANES * LANES) * 4
+    slots = 2 * num_cores if mode == "flat" else 4 * (num_cores // 2)
+    scratch_bytes = slots * block_rows * vdim * 2
+    out_bytes = tokens * ((local + 7) // 8 * 8) * vdim * 2
+    return partial_bytes + lse_bytes + scratch_bytes + out_bytes
 
 
 def online_lse_combine_supported(
@@ -196,41 +121,31 @@ def online_lse_combine_supported(
     vmem_limit_bytes: int = DEFAULT_VMEM_LIMIT_BYTES,
 ) -> bool:
     """Whether ``[tokens, num_heads, vdim]`` over ``num_cores`` ranks is valid
-    for ``dcp_online_lse_combine`` in ``mode`` (``'pairs'`` or ``'flat'``)."""
-    return bool(
-        combine_token_chunks(
-            tokens,
-            num_heads,
-            num_cores,
-            vdim,
-            mode=mode,
-            vmem_limit_bytes=vmem_limit_bytes,
-        )
-    )
+    for ``dcp_online_lse_combine`` in ``mode`` (``'pairs'`` or ``'flat'``).
 
-
-def online_lse_combine_single_pass_supported(
-    tokens: int,
-    num_heads: int,
-    num_cores: int,
-    vdim: int,
-    mode: str = "pairs",
-    vmem_limit_bytes: int = DEFAULT_VMEM_LIMIT_BYTES,
-) -> bool:
-    """Whether ``dcp_online_lse_combine`` executes in one unchunked VMEM pass."""
-    return (
-        len(
-            combine_token_chunks(
-                tokens,
-                num_heads,
-                num_cores,
-                vdim,
-                mode=mode,
-                vmem_limit_bytes=vmem_limit_bytes,
-            )
-        )
-        == 1
-    )
+    MLA dispatch calls this at ``torch.compile`` trace time, where ``tokens``
+    can be a symbolic size, so it uses only integer arithmetic and comparisons.
+    """
+    if mode not in ("pairs", "flat"):
+        return False
+    if (
+        tokens < TILE_ROWS
+        or tokens > MAX_COMBINE_TOKENS
+        or tokens % TILE_ROWS != 0
+        or num_cores < 2
+        or num_heads < num_cores
+        or num_heads % num_cores != 0
+        or vdim < LANES
+        or vdim % LANES != 0
+    ):
+        return False
+    if mode == "pairs" and (num_cores < 4 or num_cores % 2 != 0):
+        return False
+    local = num_heads // num_cores
+    if tokens * local > 8 * vdim:
+        return False
+    budget = int(vmem_limit_bytes * VMEM_BUFFER_FRACTION)
+    return _vmem_buffer_bytes(tokens, num_heads, num_cores, vdim, mode) <= budget
 
 
 def mesh_has_chip_pairs(mesh: jax.sharding.Mesh, axis: str) -> bool:
@@ -419,12 +334,12 @@ def _unpack_lse_header(hdr_i16: jax.Array, part_rows: int) -> jax.Array:
 
 def _clean_part(part_i16: jax.Array, live_mask_col: jax.Array | None) -> jax.Array:
     """Bitcast ``int16[rows, vdim]`` to ``bf16``, widen to ``float32``, and zero
-    non-finite values (plus dead rows when ``live_mask_col`` is given)."""
-    part_f32 = pltpu.bitcast(part_i16, jnp.bfloat16).astype(jnp.float32)
-    valid = jnp.isfinite(part_f32)
+    non-finite values (and dead rows when ``live_mask_col`` is given)."""
+    part = pltpu.bitcast(part_i16, jnp.bfloat16).astype(jnp.float32)
+    valid = jnp.isfinite(part)
     if live_mask_col is not None:
         valid = valid & live_mask_col
-    return jnp.where(valid, part_f32, 0.0)
+    return jnp.where(valid, part, 0.0)
 
 
 def _merge_two_blocks(
@@ -500,7 +415,7 @@ def _merge_n_slots(
     return acc.astype(jnp.bfloat16)
 
 
-def _dcp_online_lse_combine_single(
+def dcp_online_lse_combine(
     partial: jax.Array,
     lse: jax.Array,
     *,
@@ -514,11 +429,60 @@ def _dcp_online_lse_combine_single(
     out_vmem: bool = True,
     vmem_limit_bytes: int = DEFAULT_VMEM_LIMIT_BYTES,
     collective_id: int = COLLECTIVE_ID,
-    double_barrier: bool = False,
-    name_suffix: str = "",
     interpret: bool | pltpu.InterpretParams = False,
 ) -> jax.Array:
+    """Combine ``partial`` ``bf16[T, H, D]`` and ``lse`` ``f32[T, H]`` across
+    ``num_cores`` ranks of ``axis`` into ``bf16[T, H // num_cores, D]`` inside a
+    ``shard_map``.
+
+    Args:
+      partial: ``bf16[T, H, D]``, ``T`` a multiple of 16, ``D`` a multiple of 128.
+      lse: ``f32[T, H]``, per-token per-head log-sum-exp (``-inf`` when empty).
+      num_cores: size of mesh axis ``axis``.
+      axis: DCP mesh axis name.
+      rank: optional ``int32[1]`` core index on ``axis`` (avoids ``partition-id``
+        under SPMD export); ``None`` uses ``lax.axis_index(axis)``.
+      lane_axis: optional second mesh axis name (e.g. ``'dcp_lane'``).
+      lane: optional ``int32[1]`` index on ``lane_axis`` (when ``lane_axis`` has
+        size 1, ``lane`` may be ``None`` and constant ``0`` is used when
+        ``rank`` is provided).
+      live_tokens: optional ``int32[1]`` valid token count (same across ranks).
+      mode: ``'pairs'`` (chip-pair-first 2-stage) or ``'flat'`` (1-stage).
+      out_vmem: when ``True``, keep the ``[T, local, D]`` output in VMEM so a
+        downstream VMEM consumer (e.g. ``fp8_uv_oproj_all_reduce`` /
+        ``fp8_oproj_all_reduce``) avoids an HBM round-trip.
+      vmem_limit_bytes: scoped VMEM limit for Mosaic compilation.
+      collective_id: barrier semaphore ID (default ``21``).
+      interpret: Pallas CPU interpret mode for unit testing.
+    """
+    if partial.ndim != 3 or lse.ndim != 2:
+        raise ValueError(
+            f"dcp_online_lse_combine expects partial [T, H, D] and lse [T, H], "
+            f"got {partial.shape} and {lse.shape}"
+        )
+    if partial.dtype != jnp.bfloat16 or lse.dtype != jnp.float32:
+        raise ValueError(
+            f"dcp_online_lse_combine expects bf16 partial and f32 lse, "
+            f"got {partial.dtype} and {lse.dtype}"
+        )
     tokens, num_heads, vdim = partial.shape
+    if lse.shape != (tokens, num_heads):
+        raise ValueError(
+            f"lse shape {lse.shape} does not match partial {partial.shape[:2]}"
+        )
+    if not online_lse_combine_supported(
+        tokens,
+        num_heads,
+        num_cores,
+        vdim,
+        mode=mode,
+        vmem_limit_bytes=vmem_limit_bytes,
+    ):
+        raise ValueError(
+            f"Unsupported dcp_online_lse_combine geometry: tokens={tokens}, "
+            f"heads={num_heads}, cores={num_cores}, vdim={vdim}, mode={mode!r}"
+        )
+
     local = num_heads // num_cores
     part_rows = tokens * local
     block_rows = HEADER_ROWS + part_rows
@@ -574,17 +538,11 @@ def _dcp_online_lse_combine_single(
 
         return peer_id
 
-    def run_barrier(peer_id, barrier2_sem: Any = None):
+    def run_barrier(peer_id):
         sem = pltpu.get_barrier_semaphore()
         for j in range(num_cores):
             pl.semaphore_signal(sem, 1, device_id=peer_id(j), device_id_type=MESH)
         pl.semaphore_wait(sem, num_cores)
-        if barrier2_sem is not None:
-            for j in range(num_cores):
-                pl.semaphore_signal(
-                    barrier2_sem, 1, device_id=peer_id(j), device_id_type=MESH
-                )
-            pl.semaphore_wait(barrier2_sem, num_cores)
 
     def slice_block(buf_ref, idx, part_sz):
         total_sz = HEADER_ROWS + part_sz
@@ -603,7 +561,6 @@ def _dcp_online_lse_combine_single(
         def flat_kernel(*refs):
             refs_list = list(refs)
             me, my_lane, sizes, live_mask_col = pop_headers(refs_list)
-            barrier2_sem: Any = refs_list.pop() if double_barrier else None
             out_sem: Any = None
             v_out: Any = None
             if not out_vmem:
@@ -620,7 +577,7 @@ def _dcp_online_lse_combine_single(
                 loc_sem,
             ) = refs_list
             peer_id = make_peer_fn(my_lane)
-            run_barrier(peer_id, barrier2_sem)
+            run_barrier(peer_id)
 
             p_wtld = pltpu.einshape(
                 "t(wl)d->w(tl)d", part_ref[...], w=num_cores, l=local
@@ -705,7 +662,6 @@ def _dcp_online_lse_combine_single(
         def pairs_kernel(*refs):
             refs_list = list(refs)
             me, my_lane, sizes, live_mask_col = pop_headers(refs_list)
-            barrier2_sem: Any = refs_list.pop() if double_barrier else None
             out_sem: Any = None
             v_out: Any = None
             if not out_vmem:
@@ -729,7 +685,7 @@ def _dcp_online_lse_combine_single(
             chip = lax.div(me, 2)
             mate = lax.bitwise_xor(me, 1)
             peer_id = make_peer_fn(my_lane)
-            run_barrier(peer_id, barrier2_sem)
+            run_barrier(peer_id)
 
             # One hardware relayout splits even/odd head-blocks:
             # q=0 holds blocks {0, 2, ..., 2*(chips-1)}, q=1 holds {1, 3, ...}.
@@ -878,8 +834,6 @@ def _dcp_online_lse_combine_single(
             pltpu.VMEM((tokens, local, vdim), jnp.bfloat16),
             pltpu.SemaphoreType.DMA,
         ]
-    if double_barrier:
-        scratch = [*scratch, pltpu.SemaphoreType.REGULAR]
 
     smem = pl.BlockSpec(memory_space=pltpu.SMEM)
     vmem = pl.BlockSpec(memory_space=pltpu.VMEM)
@@ -897,7 +851,6 @@ def _dcp_online_lse_combine_single(
         f"dcp_online_lse_combine_{mode}_n{num_cores}_t{tokens}_h{num_heads}_d{vdim}"
         + ("_live" if sized else "")
         + ("_ov" if out_vmem else "")
-        + name_suffix
     )
     return pl.pallas_call(
         kernel_fn,
@@ -912,134 +865,3 @@ def _dcp_online_lse_combine_single(
         interpret=interpret,
         name=name,
     )(*scalars, partial, lse)
-
-
-def dcp_online_lse_combine(
-    partial: jax.Array,
-    lse: jax.Array,
-    *,
-    num_cores: int,
-    axis: str,
-    rank: jax.Array | None = None,
-    lane_axis: str | None = None,
-    lane: jax.Array | None = None,
-    live_tokens: jax.Array | None = None,
-    mode: str = "pairs",
-    out_vmem: bool = True,
-    vmem_limit_bytes: int = DEFAULT_VMEM_LIMIT_BYTES,
-    collective_id: int = COLLECTIVE_ID,
-    interpret: bool | pltpu.InterpretParams = False,
-) -> jax.Array:
-    """Combine ``partial`` ``bf16[T, H, D]`` and ``lse`` ``f32[T, H]`` across
-    ``num_cores`` ranks of ``axis`` into ``bf16[T, H // num_cores, D]`` inside a
-    ``shard_map``.
-
-    Args:
-      partial: ``bf16[T, H, D]``, ``T`` a multiple of 16 up to ``256``, ``D`` a
-        multiple of 128.
-      lse: ``f32[T, H]``, per-token per-head log-sum-exp (``-inf`` when empty).
-      num_cores: size of mesh axis ``axis``.
-      axis: DCP mesh axis name.
-      rank: optional ``int32[1]`` core index on ``axis`` (avoids ``partition-id``
-        under SPMD export); ``None`` uses ``lax.axis_index(axis)``.
-      lane_axis: optional second mesh axis name (e.g. ``'dcp_lane'``).
-      lane: optional ``int32[1]`` index on ``lane_axis`` (when ``lane_axis`` has
-        size 1, ``lane`` may be ``None`` and constant ``0`` is used when
-        ``rank`` is provided).
-      live_tokens: optional ``int32[1]`` valid token count (same across ranks).
-      mode: ``'pairs'`` (chip-pair-first 2-stage) or ``'flat'`` (1-stage).
-      out_vmem: when ``True`` and ``T`` fits in one single-pass VMEM call, keep
-        the ``[T, local, D]`` output in VMEM so a downstream VMEM consumer
-        (e.g. ``fp8_uv_oproj_all_reduce`` / ``fp8_oproj_all_reduce``) avoids an
-        HBM round-trip. Multi-chunk steps write ``bf16[T, local, D]`` to HBM.
-      vmem_limit_bytes: scoped VMEM limit for Mosaic compilation.
-      collective_id: base barrier semaphore ID (default ``21``).
-      interpret: Pallas CPU interpret mode for unit testing.
-    """
-    if partial.ndim != 3 or lse.ndim != 2:
-        raise ValueError(
-            f"dcp_online_lse_combine expects partial [T, H, D] and lse [T, H], "
-            f"got {partial.shape} and {lse.shape}"
-        )
-    if partial.dtype != jnp.bfloat16 or lse.dtype != jnp.float32:
-        raise ValueError(
-            f"dcp_online_lse_combine expects bf16 partial and f32 lse, "
-            f"got {partial.dtype} and {lse.dtype}"
-        )
-    tokens, num_heads, vdim = partial.shape
-    if lse.shape != (tokens, num_heads):
-        raise ValueError(
-            f"lse shape {lse.shape} does not match partial {partial.shape[:2]}"
-        )
-    chunks = combine_token_chunks(
-        tokens,
-        num_heads,
-        num_cores,
-        vdim,
-        mode=mode,
-        vmem_limit_bytes=vmem_limit_bytes,
-    )
-    if not chunks:
-        raise ValueError(
-            f"Unsupported dcp_online_lse_combine geometry: tokens={tokens}, "
-            f"heads={num_heads}, cores={num_cores}, vdim={vdim}, mode={mode!r}"
-        )
-
-    if len(chunks) == 1:
-        return _dcp_online_lse_combine_single(
-            partial,
-            lse,
-            num_cores=num_cores,
-            axis=axis,
-            rank=rank,
-            lane_axis=lane_axis,
-            lane=lane,
-            live_tokens=live_tokens,
-            mode=mode,
-            out_vmem=out_vmem,
-            vmem_limit_bytes=vmem_limit_bytes,
-            collective_id=collective_id,
-            double_barrier=False,
-            interpret=interpret,
-        )
-
-    live_vec = (
-        None
-        if live_tokens is None
-        else jnp.reshape(live_tokens, (-1,))[:1].astype(jnp.int32)
-    )
-    chunk_outs: list[jax.Array] = []
-    offset = 0
-    for idx, chunk_tokens in enumerate(chunks):
-        chunk_live = (
-            None
-            if live_vec is None
-            else jnp.clip(live_vec - offset, 0, chunk_tokens)
-        )
-        cid_offset = CHUNK_COLLECTIVE_OFFSETS[idx % len(CHUNK_COLLECTIVE_OFFSETS)]
-        chunk_cid = (
-            collective_id + cid_offset
-            if collective_id == COLLECTIVE_ID
-            else collective_id
-        )
-        chunk_outs.append(
-            _dcp_online_lse_combine_single(
-                partial[offset : offset + chunk_tokens],
-                lse[offset : offset + chunk_tokens],
-                num_cores=num_cores,
-                axis=axis,
-                rank=rank,
-                lane_axis=lane_axis,
-                lane=lane,
-                live_tokens=chunk_live,
-                mode=mode,
-                out_vmem=False,
-                vmem_limit_bytes=vmem_limit_bytes,
-                collective_id=chunk_cid,
-                double_barrier=True,
-                name_suffix=f"_c{idx}of{len(chunks)}",
-                interpret=interpret,
-            )
-        )
-        offset += chunk_tokens
-    return jnp.concatenate(chunk_outs, axis=0)
