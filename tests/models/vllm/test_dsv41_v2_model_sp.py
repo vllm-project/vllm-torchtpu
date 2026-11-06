@@ -423,7 +423,7 @@ def test_ced_dispatches_encoder_before_host_bucket_coordination(monkeypatch):
     mix = torch.ones(4, 4).as_subclass(TpuTensor)
     auxiliary = torch.ones(4, 16).as_subclass(TpuTensor)
 
-    def encoder(*args):
+    def encoder(*args, **kwargs):
         order.append("encoder")
         return hidden, mix, [auxiliary]
 
@@ -1109,7 +1109,7 @@ def test_split_encoder_stages_tail_engram_after_head_dispatch(monkeypatch):
     order = []
     carry = tuple(torch.ones(4, 16).as_subclass(TpuTensor) for _ in range(5))
 
-    def head(*args):
+    def head(*args, **kwargs):
         order.append("head")
         return carry
 
@@ -1178,7 +1178,7 @@ def test_split_encoder_downloads_deferred_hashes_after_head_dispatch(monkeypatch
     pending, gathered = object(), object()
 
     def stage(name):
-        def call(*args):
+        def call(*args, **kwargs):
             order.append(name)
             return "encoded" if name == "tail" else carry
 
@@ -1432,7 +1432,7 @@ def test_early_split_enqueues_before_host_lookup(monkeypatch):
     carry = tuple(torch.ones(2, 4).as_subclass(TpuTensor) for _ in range(5))
 
     def stage(name):
-        def call(*args):
+        def call(*args, **kwargs):
             order.append(name)
             return carry
 
@@ -1519,7 +1519,7 @@ def test_tail_only_split_stages_tail_engram_after_head_dispatch(monkeypatch):
     hashes = object()
 
     def stage(name):
-        def call(*args):
+        def call(*args, **kwargs):
             order.append(name)
             return "encoded" if name == "tail" else carry
 

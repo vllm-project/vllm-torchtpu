@@ -160,7 +160,6 @@ def dequant(raw: jax.Array, scale: jax.Array, block_size: int) -> jax.Array:
 
 def make_lookup(
     mesh,
-    num_tokens: int,
     n_cols: int,
     part_cols: int,
     rows: int,
@@ -171,7 +170,10 @@ def make_lookup(
 ):
     """The SPMD lookup over ``mesh``: (hashes [W*T, C] i32, tables
     [W*rows, dim] u8, scales [W*rows, B] u8, ranks [W, 1] i32), all sharded on
-    axis 0, -> bf16 rows [W*T, part_cols * node_size, dim]."""
+    axis 0, -> bf16 rows [W*T, part_cols * node_size, dim].
+
+    The token count ``T`` comes from the hashes' shape, so one lookup serves
+    every token bucket and can be traced into each bucket's compiled graph."""
     world = len(meta)
     if world % node_size:
         raise ValueError(f"EP size {world} is not a multiple of node size {node_size}")
@@ -190,6 +192,7 @@ def make_lookup(
         # A rank operand rather than lax.axis_index, which lowers to
         # partition-id and is rejected on this SPMD path.
         me = rank[0, 0]
+        num_tokens = h.shape[0]
         hashes = jax.lax.all_gather(
             h, _AXIS, axis=0, tiled=False, axis_index_groups=groups
         )  # [node, T, C]
@@ -230,12 +233,11 @@ def make_lookup(
     return lookup
 
 
-# One entry per (layer, token bucket); never evict, or a rebuilt op would
-# re-register the same op name while serving.
+# One entry per layer, shared by every token bucket; never evict, or a rebuilt
+# op would re-register the same op name while serving.
 @cache
 def build_lookup_op(
     layer: int,
-    num_tokens: int,
     n_cols: int,
     part_cols: int,
     rows: int,
@@ -244,7 +246,10 @@ def build_lookup_op(
     node_size: int,
     meta: tuple[tuple[int, int, int, int], ...],
 ):
-    """Torch op for ``make_lookup`` over the EP mesh, one per layer and shape."""
+    """Torch op for ``make_lookup`` over the EP mesh, one per layer.
+
+    The op is called inside the compiled encoder graph (``Engram._ready_rows``),
+    so its fake derives the output from the (possibly symbolic) token dim."""
     from torch_tpu._internal.pallas import jax_op
 
     from vllm_torchtpu.distributed.ep_mesh import build_ep_mesh
@@ -253,11 +258,11 @@ def build_lookup_op(
     if mesh is None:
         raise RuntimeError("Engram HBM lookup needs an expert-parallel mesh")
     lookup = make_lookup(
-        mesh, num_tokens, n_cols, part_cols, rows, dim, block_size, node_size, meta
+        mesh, n_cols, part_cols, rows, dim, block_size, node_size, meta
     )
     cols = part_cols * node_size
     op = jax_op(
-        f"pallas::dsv41_engram_hbm_l{layer}_t{num_tokens}",
+        f"pallas::dsv41_engram_hbm_l{layer}",
         lookup,
         mesh=mesh,
         input_partition_specs=(P(_AXIS, None),) * 4,
@@ -265,13 +270,12 @@ def build_lookup_op(
     )
 
     def fake(h, w, s, rank):
-        return h.new_empty((num_tokens, cols, dim), dtype=torch.bfloat16)
+        return h.new_empty((h.shape[0], cols, dim), dtype=torch.bfloat16)
 
     op.register_fake(fake)
     logger.info(
-        "[DSV41] Engram HBM lookup: layer=%d tokens=%d heads=%d rows/rank=%d",
+        "[DSV41] Engram HBM lookup: layer=%d heads=%d rows/rank=%d",
         layer,
-        num_tokens,
         cols,
         rows,
     )
