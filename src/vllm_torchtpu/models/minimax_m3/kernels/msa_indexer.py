@@ -23,10 +23,12 @@ once per tile. The cache packs consecutive tokens into 32-bit words
 mind.
 
 Scores are produced transposed, ``[pages, tiles * block_q]``, so each output
-block is lane-aligned, and gathered back to ``[tokens, pages]``.
+block is lane-aligned, and gathered back to ``[tokens, pages]``. A batch that
+is one query tile keeps them folded instead (`folded_block_scores`).
 """
 
 import functools
+import math
 
 import jax
 import jax.numpy as jnp
@@ -48,9 +50,10 @@ DEFAULT_SMALL_PAGES_PER_STEP = 128
 DEFAULT_KERNEL = "v3"
 # Large prefill tiles: v3's DMA ring is slower there on fp8 (1.79 vs 1.51 ms).
 DEFAULT_LARGE_KERNEL = "v2"
-# Budget for `_batch_scores`' double-buffered [P, T] f32 output block, which
-# stays resident in VMEM; larger batches use the tiled path.
+# Budget for `_batch_scores`' double-buffered folded [P, W] f32 output block,
+# which stays resident in VMEM; larger batches use the tiled path.
 _BATCH_OUT_VMEM_BYTES = 16 * 1024 * 1024
+_LANES = 128
 _TILE_SHIFT = 16
 _GROUP_MASK = (1 << _TILE_SHIFT) - 1
 
@@ -265,18 +268,24 @@ def _kernel_v3_batch(
     block_tables_ref,  # [max_num_seqs * pages_per_seq]
     seq_pages_ref,  # [max_num_seqs] pages of each request
     # In
-    q_ref,  # [T, D] every token of the batch
+    q_ref,  # [T, D] every token of the batch, T padded to a multiple of 8
     cache_ref,  # [pages, S / p, p, D] index cache, left in HBM
     # Out
-    o_ref,  # [P, T] resident across the grid
+    o_ref,  # [P / F, F * W] folded scores, resident across the grid
     # Scratch
     buf0,
     buf1,
     sems,
+    *,
+    width,  # W: lanes per token group, F = o_ref.shape[1] // W folds
 ):
     """`_kernel_v3` with the whole batch as one query tile: each work item
     scores one page group of one request against every token and keeps the
-    scores of its request's tokens and of the requests sharing those pages."""
+    scores of its request's tokens and of the requests sharing those pages.
+
+    The query tile is repeated in every fold's lanes, so one dot over the
+    pages of fold ``k`` (``g % F == k``) leaves their scores in that fold's
+    lanes; the MXU and the page max cost the same as on ``W`` lanes."""
     consume = _page_ring(
         lambda entry: entry >> _TILE_SHIFT,
         work_ref,
@@ -287,17 +296,29 @@ def _kernel_v3_batch(
         buf1,
         sems,
     )
-    q = q_ref[...]
+    lanes = o_ref.shape[1]
+    folds = lanes // width
+    # Repeated in f32: 8-row pieces are whole tiles there, not in bf16.
+    q = q_ref[...].astype(jnp.float32)
+    if width > q.shape[0]:
+        q = jnp.concatenate([q, jnp.zeros((width - q.shape[0], q.shape[1]), q.dtype)])
+    q = jnp.concatenate([q] * folds).astype(q_ref.dtype)
     w = pl.program_id(0)
     pages_per_step = buf0.shape[0]
-    first = pl.multiple_of((work_ref[w] & _GROUP_MASK) * pages_per_step, pages_per_step)
+    rows_per_step = pages_per_step // folds
+    first = pl.multiple_of((work_ref[w] & _GROUP_MASK) * rows_per_step, rows_per_step)
     cols = cols_ref[w]
-    lane = jax.lax.broadcasted_iota(jnp.int32, (pages_per_step, q.shape[0]), 1)
-    mine = (lane >= (cols & _GROUP_MASK)) & (lane < (cols >> _TILE_SHIFT))
+    lane = jax.lax.broadcasted_iota(jnp.int32, (rows_per_step, lanes), 1)
+    tok = lane % width
+    mine = (tok >= (cols & _GROUP_MASK)) & (tok < (cols >> _TILE_SHIFT))
 
     def merge(page_refs):
-        rows = pl.ds(first, pages_per_step)
-        o_ref[rows, :] = jnp.where(mine, _scores_v3(q, page_refs), o_ref[rows, :])
+        scores = None
+        for k in range(folds):
+            fold = _scores_v3(q, page_refs[k::folds])
+            scores = fold if k == 0 else jnp.where(lane // width == k, fold, scores)
+        rows = pl.ds(first, rows_per_step)
+        o_ref[rows, :] = jnp.where(mine, scores, o_ref[rows, :])
 
     consume(merge)
 
@@ -454,9 +475,8 @@ def _batch_scores(
     pages_per_step,
     interpret,
 ):
-    """Transposed scores ``[P, T]``, token ``t`` in column ``t``, of a batch
-    small enough to be one query tile, so no query or score gather is needed.
-    """
+    """Folded scores (`folded_block_scores`) of a batch small enough to be
+    one query tile, so no query or score gather is needed."""
     num_tokens, _, head_dim = index_q.shape
     _, rows_per_page, packing, _ = index_cache.shape
     page_size = rows_per_page * packing
@@ -510,28 +530,97 @@ def _batch_scores(
     # With no item, the single grid step keeps no token.
     work_cols = jnp.where(w < num_items, item_cols.reshape(-1)[item], 0)
 
+    width = fold_width(num_tokens, pages_per_step)
+    lanes = max(_LANES, width)
+    q = index_q[:, 0]
+    if num_tokens % 8:
+        q = jnp.pad(q, ((0, -num_tokens % 8), (0, 0)))
     page_shape = (pages_per_step, rows_per_page, packing, head_dim)
+    out_shape = (padded_pages * width // lanes, lanes)
     return pl.pallas_call(
-        _kernel_v3_batch,
+        functools.partial(_kernel_v3_batch, width=width),
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=4,
             grid=(jnp.maximum(num_items, 1),),
             in_specs=[
-                pl.BlockSpec((num_tokens, head_dim), lambda *_: (0, 0)),
+                pl.BlockSpec(q.shape, lambda *_: (0, 0)),
                 pl.BlockSpec(memory_space=pl.ANY),
             ],
-            out_specs=pl.BlockSpec((padded_pages, num_tokens), lambda *_: (0, 0)),
+            out_specs=pl.BlockSpec(out_shape, lambda *_: (0, 0)),
             scratch_shapes=[
                 pltpu.VMEM(page_shape, index_cache.dtype),
                 pltpu.VMEM(page_shape, index_cache.dtype),
                 pltpu.SemaphoreType.DMA((2, pages_per_step)),
             ],
         ),
-        out_shape=jax.ShapeDtypeStruct((padded_pages, num_tokens), jnp.float32),
+        out_shape=jax.ShapeDtypeStruct(out_shape, jnp.float32),
         compiler_params=pltpu.CompilerParams(dimension_semantics=("arbitrary",)),
         interpret=interpret,
         name="minimax_m3_msa_block_scores",
-    )(work, work_cols, block_tables, seq_pages, index_q[:, 0], index_cache)
+    )(work, work_cols, block_tables, seq_pages, q, index_cache)
+
+
+def fold_width(num_tokens: int, pages_per_step: int) -> int:
+    """Lanes per token group of folded scores: the batch rounded up to a
+    power of two of at least 8 (a 128-page group then folds to whole 8-row
+    tiles), and wide enough that the folds divide a page group."""
+    width = max(8, 1 << (num_tokens - 1).bit_length())
+    return max(width, _LANES // math.gcd(pages_per_step, _LANES))
+
+
+def is_one_tile(
+    num_tokens: int,
+    max_num_seqs: int,
+    pages_per_seq: int,
+    *,
+    block_q: int = DEFAULT_BLOCK_Q,
+    small_pages_per_step: int = DEFAULT_SMALL_PAGES_PER_STEP,
+    kernel: str = DEFAULT_KERNEL,
+) -> bool:
+    """Whether `block_scores` scores the batch as one query tile."""
+    # Large requests have more than block_q tokens each.
+    if min(max_num_seqs, num_tokens // (block_q + 1)) or kernel != "v3":
+        return False
+    padded_pages = -(-pages_per_seq // small_pages_per_step) * small_pages_per_step
+    width = fold_width(num_tokens, small_pages_per_step)
+    return 2 * padded_pages * width * 4 <= _BATCH_OUT_VMEM_BYTES
+
+
+@functools.partial(jax.jit, static_argnames=("pages_per_step", "interpret"))
+def folded_block_scores(
+    index_q: jax.Array,
+    index_cache: jax.Array,
+    seq_lens: jax.Array,
+    block_tables: jax.Array,
+    cu_q_lens: jax.Array,
+    num_seqs: jax.Array,
+    *,
+    pages_per_step: int = DEFAULT_SMALL_PAGES_PER_STEP,
+    interpret: bool = False,
+) -> jax.Array:
+    """`block_scores` of a batch that `is_one_tile`, folded to
+    ``[P * W / L, L]`` with ``W = fold_width(T, pages_per_step)`` and
+    ``L = max(128, W)``: page ``p``, token ``t`` sits at row ``p // (L / W)``,
+    lane ``(p % (L / W)) * W + t``, so a decode batch of fewer than 128 tokens
+    still fills the lanes. `unfold_scores` gives ``[T, 1, P]``.
+    """
+    check_page_dtype(index_cache.shape[2], index_cache.dtype)
+    active = jnp.arange(seq_lens.shape[0], dtype=jnp.int32) < num_seqs
+    return _batch_scores(
+        index_q,
+        index_cache,
+        seq_lens,
+        block_tables,
+        cu_q_lens,
+        active,
+        pages_per_step=pages_per_step,
+        interpret=interpret,
+    )
+
+
+def unfold_scores(scores: jax.Array, num_tokens: int, width: int) -> jax.Array:
+    """`folded_block_scores` layout -> ``[T, 1, P]``."""
+    return scores.reshape(-1, width)[:, :num_tokens].T[:, None, :]
 
 
 @functools.partial(
@@ -604,21 +693,29 @@ def block_scores(
         cu_q_lens,
         interpret=interpret,
     )
-    # Large requests have more than block_q tokens each.
-    max_large = min(max_num_seqs, num_tokens // (block_q + 1))
-    page_groups = -(-block_tables.shape[0] // max_num_seqs // small_pages_per_step)
-    batch_out_bytes = 2 * page_groups * small_pages_per_step * num_tokens * 4
-    if max_large == 0 and kernel == "v3" and batch_out_bytes <= _BATCH_OUT_VMEM_BYTES:
-        return _batch_scores(
+    pages_per_seq = block_tables.shape[0] // max_num_seqs
+    if is_one_tile(
+        num_tokens,
+        max_num_seqs,
+        pages_per_seq,
+        block_q=block_q,
+        small_pages_per_step=small_pages_per_step,
+        kernel=kernel,
+    ):
+        scores = folded_block_scores(
             index_q,
             index_cache,
             seq_lens,
             block_tables,
             cu_q_lens,
-            active,
+            num_seqs,
             pages_per_step=small_pages_per_step,
             interpret=interpret,
-        ).T[:, None, :]
+        )
+        width = fold_width(num_tokens, small_pages_per_step)
+        return unfold_scores(scores, num_tokens, width)
+    # Large requests have more than block_q tokens each.
+    max_large = min(max_num_seqs, num_tokens // (block_q + 1))
     small, small_col = score(
         active & ~is_large,
         block_q=block_q,
