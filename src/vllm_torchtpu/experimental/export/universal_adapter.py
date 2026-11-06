@@ -1239,7 +1239,7 @@ class UniversalVllmExportableLLM(api.ExportableTextOnlyLLM):
             specs = normalize_kv_cache_specs_for_tpu(
                 specs,
                 tpu_lowering.torch_dtype(per_layer[0][0].dtype),
-                attention_backend=TpuPlatform._find_non_ssm_backend(self._vllm_config),
+                attention_backend=cast(Any, TpuPlatform._find_non_ssm_backend(self._vllm_config)),
             )
             groups = get_kv_cache_groups(self._vllm_config, specs)
         if len(groups) <= 1:
