@@ -47,6 +47,8 @@ if TYPE_CHECKING:
     REQUANTIZE_BLOCK_SIZE: int | None = None
     REQUANTIZE_WEIGHT_DTYPE: str = "float8_e4m3fn"
     TPU_FP8_LINEAR_W8A16_MAX_ROWS: int = 0
+    VLLM_TORCHTPU_NATIVE_MODELS: bool = False
+    VLLM_TORCHTPU_NEMOTRON_MOE_IMPL: str = "dense"
     MOE_REQUANTIZE_WEIGHT_DTYPE: str = "float8_e4m3fn"
     MOE_REQUANTIZE_BLOCK_SIZE: int | None = None
     TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL: bool | None = None
@@ -573,6 +575,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # 0 (default) keeps W8A8 everywhere.
     "TPU_FP8_LINEAR_W8A16_MAX_ROWS": env_nonnegative_int(
         "TPU_FP8_LINEAR_W8A16_MAX_ROWS", 0
+    ),
+    # Serve Qwen3MoeForCausalLM / NemotronHForCausalLM checkpoints with the
+    # TPU-native model classes (1) instead of the built-in ones (0, default).
+    "VLLM_TORCHTPU_NATIVE_MODELS": lambda: os.environ.get(
+        "VLLM_TORCHTPU_NATIVE_MODELS", "0"
+    )
+    == "1",
+    # TPUNemotronHMoE expert implementation (see nemotron_h_tpu.EXPERT_IMPLS).
+    "VLLM_TORCHTPU_NEMOTRON_MOE_IMPL": lambda: os.environ.get(
+        "VLLM_TORCHTPU_NEMOTRON_MOE_IMPL", "dense"
     ),
     # Specify dtype for quantized MoE weights
     "MOE_REQUANTIZE_WEIGHT_DTYPE": lambda: os.getenv(

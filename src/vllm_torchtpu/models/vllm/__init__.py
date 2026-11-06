@@ -11,10 +11,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import os
-
 from vllm.model_executor.models.config import VerifyAndUpdateConfig
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.gqa_head_padding import update_gqa_head_padding_config
 
 _KIMI_MODEL = "vllm_torchtpu.models.vllm.kimi_k3:KimiLinearForCausalLM"
@@ -67,12 +66,28 @@ def register_models() -> None:
     MODELS_CONFIG_MAP["Qwen4ExpForConditionalGeneration"] = TPUQwen4ExpConfig
     MODELS_CONFIG_MAP["Qwen2ForCausalLM"] = _TPUQwen2Config
     # TPU-native Qwen3MoeForCausalLM; opt in per run, the built-in stays the default.
-    ModelRegistry.register_model("TPUQwen3MoeForCausalLM", "vllm_torchtpu.models.vllm.qwen3_moe_tpu:TPUQwen3MoeForCausalLM")
-    if os.environ.get("VLLM_TORCHTPU_NATIVE_MODELS", "0") == "1":
-        ModelRegistry.register_model("Qwen3MoeForCausalLM", "vllm_torchtpu.models.vllm.qwen3_moe_tpu:TPUQwen3MoeForCausalLM")
+    ModelRegistry.register_model(
+        "TPUQwen3MoeForCausalLM",
+        "vllm_torchtpu.models.vllm.qwen3_moe_tpu:TPUQwen3MoeForCausalLM",
+    )
+    if envs.VLLM_TORCHTPU_NATIVE_MODELS:
+        ModelRegistry.register_model(
+            "Qwen3MoeForCausalLM",
+            "vllm_torchtpu.models.vllm.qwen3_moe_tpu:TPUQwen3MoeForCausalLM",
+        )
     # TPU-native NemotronHForCausalLM (Mamba2 + relu2 MoE layers); same opt-in switch.
-    ModelRegistry.register_model("TPUNemotronHForCausalLM", "vllm_torchtpu.models.vllm.nemotron_h_tpu:TPUNemotronHForCausalLM")
-    if "NemotronHForCausalLM" in MODELS_CONFIG_MAP:  # mamba_ssm_cache_dtype float32 hook under the new name too
-        MODELS_CONFIG_MAP["TPUNemotronHForCausalLM"] = MODELS_CONFIG_MAP["NemotronHForCausalLM"]
-    if os.environ.get("VLLM_TORCHTPU_NATIVE_MODELS", "0") == "1":
-        ModelRegistry.register_model("NemotronHForCausalLM", "vllm_torchtpu.models.vllm.nemotron_h_tpu:TPUNemotronHForCausalLM")
+    ModelRegistry.register_model(
+        "TPUNemotronHForCausalLM",
+        "vllm_torchtpu.models.vllm.nemotron_h_tpu:TPUNemotronHForCausalLM",
+    )
+    if (
+        "NemotronHForCausalLM" in MODELS_CONFIG_MAP
+    ):  # mamba_ssm_cache_dtype float32 hook under the new name too
+        MODELS_CONFIG_MAP["TPUNemotronHForCausalLM"] = MODELS_CONFIG_MAP[
+            "NemotronHForCausalLM"
+        ]
+    if envs.VLLM_TORCHTPU_NATIVE_MODELS:
+        ModelRegistry.register_model(
+            "NemotronHForCausalLM",
+            "vllm_torchtpu.models.vllm.nemotron_h_tpu:TPUNemotronHForCausalLM",
+        )
