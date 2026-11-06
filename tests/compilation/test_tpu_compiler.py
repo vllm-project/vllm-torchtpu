@@ -336,6 +336,7 @@ class TestTpuCompilerCache:
             "TPU_RAIDEN_STAGE3_STATUS_PROBE_S",
             "TPU_RAIDEN_TEST_REGISTRATION_DELAY_S",
             "TPU_RAIDEN_TRANSFER_NUM_SLOTS",
+            "TPU_RAIDEN_TRANSFER_STREAMS",
             "TPU_SIDE_CHANNEL_PORT",
             "TPU_USE_RAIDEN_CONNECTOR",
             "DEBUG_TPU_LOCAL_RANK_OFFSET",
