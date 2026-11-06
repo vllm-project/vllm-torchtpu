@@ -73,6 +73,21 @@ def pack_main_kv_enabled() -> bool:
 
 
 MAIN_KV_DCP_ENV = "VLLM_TPU_QSA_MAIN_KV_DCP"
+PCP_INTERLEAVE_ENV = "QWEN4_EXP_PCP_INTERLEAVE"
+
+
+def pcp_interleave() -> int:
+    """Tokens per main-KV ownership unit under prefill context parallelism.
+
+    A PCP group splits main KV by token like main-KV DCP, but a TP1 stage's
+    page (3,200 rows) is too long to be one rank's share of a paired prefill
+    KV tile, so units of this many tokens alternate over the ranks instead
+    (``qsa_rpa.dcp_owner_row``). 128 by default: a 256-token tile at PCP2.
+    """
+    value = int(os.environ.get(PCP_INTERLEAVE_ENV, "128"))
+    if value <= 0 or value % 128:
+        raise ValueError(f"{PCP_INTERLEAVE_ENV} must be a positive multiple of 128")
+    return value
 
 
 def main_kv_dcp() -> int:
@@ -117,6 +132,9 @@ class Qwen4ExpPoolLayout:
     # them per page. MTP draft main KV keeps ``block_size`` unless
     # VLLM_TPU_QSA_MTP_KV_DCP splits it too.
     main_dcp: int = 1
+    # Tokens per ownership unit of the main-KV split (0 = one page: main-KV
+    # DCP); PCP uses pcp_interleave().
+    main_dcp_interleave: int = 0
     # Main KV owner groups whose block size is scaled (the draft's with
     # VLLM_TPU_QSA_MTP_KV_DCP).
     main_dcp_owners: tuple[str, ...] = field(default=())
@@ -302,13 +320,41 @@ def pooled_cache_specs(
                 (name, owner, slot)
                 for slot, name in enumerate(targets[start : start + 2])
             )
+    # PCP: the group splits main KV by token (main-KV DCP over the PCP ranks,
+    # in pcp_interleave() units); everything else stays replicated.
+    pcp = int(getattr(cfg.parallel_config, "prefill_context_parallel_size", 1) or 1)
+    interleave = 0
+    if pcp > 1 and main_dcp is None:
+        if main_kv_dcp() > 1 or tp != 1:
+            raise ValueError(f"PCP replaces {MAIN_KV_DCP_ENV} and runs TP1 stages")
+        main_dcp, interleave = pcp, pcp_interleave()
+        if block_size % interleave:
+            raise ValueError(
+                f"{PCP_INTERLEAVE_ENV}={interleave} must divide the {block_size}-token page"
+            )
     dcp = main_kv_dcp() if main_dcp is None else main_dcp
     if merged and dcp > 1:
         raise ValueError(f"{MERGE_COMPRESSED_K_ENV}=1 is not combined with {MAIN_KV_DCP_ENV}")
     draft_attention = {prefix + ".self_attn" for prefix in mtp_layer_prefixes(cfg)}
     paired_away = {name for name, owner, _ in main_owners if name != owner}
     dcp_owners: tuple[str, ...] = ()
-    if dcp > 1:
+    if dcp > 1 and interleave:
+        from vllm_torchtpu.kernels.qwen4_exp.block_sparse_gqa_prefill import (
+            PAIRED_KV_TILES,
+        )
+
+        if dcp * interleave not in PAIRED_KV_TILES or main.dtype != torch.float8_e4m3fn:
+            raise ValueError(
+                f"PCP{dcp} with {PCP_INTERLEAVE_ENV}={interleave} needs a {dcp * interleave}-token "
+                f"paired prefill tile ({PAIRED_KV_TILES}) and an FP8 main KV cache"
+            )
+        draft = {prefix + ".self_attn" for prefix in mtp_layer_prefixes(cfg)}
+        dcp_owners = tuple(
+            name
+            for name in specs
+            if name.endswith(".self_attn") and name not in draft and name not in paired_away
+        )
+    elif dcp > 1:
         p = cfg.parallel_config
         if tp < 2 or tp % dcp:
             raise ValueError(
@@ -371,6 +417,7 @@ def pooled_cache_specs(
         compressed_owners=tuple(owners),
         main_owners=tuple(main_owners),
         main_dcp=dcp,
+        main_dcp_interleave=interleave,
         main_dcp_owners=dcp_owners,
         merged_compressed=merged,
     )

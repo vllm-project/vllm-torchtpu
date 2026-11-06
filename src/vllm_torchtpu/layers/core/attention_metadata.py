@@ -318,8 +318,10 @@ class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
         self.is_mamba_group = isinstance(kv_cache_spec, MambaSpec)
         self.target_block_size = self.kv_cache_spec.block_size
         if self.is_mamba_group:
+            from vllm_torchtpu.distributed.pcp import token_pcp_world_size
+
             try:
-                cp_world_size = get_pcp_group().world_size
+                cp_world_size = token_pcp_world_size(vllm_config)
             except Exception:
                 cp_world_size = 1
             self.target_block_size *= cp_world_size

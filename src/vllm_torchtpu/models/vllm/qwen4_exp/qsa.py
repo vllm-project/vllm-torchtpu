@@ -381,8 +381,26 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
         # rank pairs sharing a KV head; the MTP draft keeps whole pages unless
         # VLLM_TPU_QSA_MTP_KV_DCP splits it the same way.
         self.main_kv_dcp = 1
+        # Prefill context parallelism: every rank of a PCP group runs the
+        # step's tokens and heads, and the group splits main KV by token like
+        # main-KV DCP, in units of pcp_interleave() tokens (pool_layout).
+        from vllm_torchtpu.distributed.pcp import get_pcp_rank, get_pcp_world_size
+
+        self.pcp = get_pcp_world_size() if pooled and "mtp" not in prefix else 1
+        self.dcp_interleave = 0
         dcp = int(envs.VLLM_TPU_QSA_MAIN_KV_DCP or 0)
-        if dcp > 1 and pooled and ("mtp" not in prefix or envs.VLLM_TPU_QSA_MTP_KV_DCP):
+        if self.pcp > 1:
+            from .pool_layout import pcp_interleave
+
+            assert dcp <= 1 and tp_size == 1, "PCP replaces main-KV DCP and runs TP1"
+            self.main_kv_dcp = self.pcp
+            self.dcp_interleave = pcp_interleave()
+            self.register_buffer(
+                "dcp_rank",
+                torch.full((1,), get_pcp_rank(), dtype=torch.int32, device=device),
+                persistent=False,
+            )
+        elif dcp > 1 and pooled and ("mtp" not in prefix or envs.VLLM_TPU_QSA_MTP_KV_DCP):
             assert dcp in (2, 4) and tp_size % dcp == 0, "main-KV DCP groups of 2 or 4"
             self.main_kv_dcp = dcp
             self.register_buffer(
@@ -522,7 +540,17 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
             )
         self._dcp_op = None
         self._token_shard_dcp_op = None
-        if self.main_kv_dcp > 1:
+        if self.pcp > 1:
+            from vllm_torchtpu.distributed.pcp import get_pcp_group
+            from vllm_torchtpu.layers.adapter.custom_ops.qsa_op import (
+                build_pooled_qsa_pcp_op,
+            )
+
+            self._dcp_op = partial(
+                build_pooled_qsa_pcp_op(get_pcp_group(), self.pcp, self.dcp_interleave),
+                **keywords,
+            )
+        elif self.main_kv_dcp > 1:
             from vllm.distributed import get_tp_group
 
             from vllm_torchtpu.layers.adapter.custom_ops.qsa_op import (

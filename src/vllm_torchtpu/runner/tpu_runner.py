@@ -785,8 +785,12 @@ class TPUModelRunner(GPUModelRunner):
         # wrong scope and fails silently. See `_init_phased_profiling`.
         self._profiler_rank = profiler_rank
         self._profiler_world_size = profiler_world_size
+        from vllm_torchtpu.distributed.pcp import pcp_splits_tokens
+
         pcp_config = PcpStaticSupportValidator.from_vllm_config(vllm_config)
-        self._pcp_enabled = pcp_config.enabled
+        # A model that keeps whole steps under PCP (Qwen4Exp) runs the runner's
+        # non-PCP token path; only its model splits work over the group.
+        self._pcp_enabled = pcp_config.enabled and pcp_splits_tokens(vllm_config)
         self._mtp_enabled = pcp_config.speculative_method == "mtp"
         # Pipeline parallelism: this worker runs one stage's layer slice.
         # Stages before the last hand their hidden states to the next stage
@@ -2034,8 +2038,10 @@ class TPUModelRunner(GPUModelRunner):
         # cannot diverge. A smaller divisor visits columns the scheduler
         # never filled: beyond the row width it raises IndexError, within it
         # the null block silently swallows the recurrent state.
+        from vllm_torchtpu.distributed.pcp import token_pcp_world_size
+
         try:
-            cp_world_size = get_pcp_group().world_size
+            cp_world_size = token_pcp_world_size(self.vllm_config)
         except Exception:
             cp_world_size = 1
         assert self._mamba_state_block_size is not None
@@ -6288,7 +6294,11 @@ class TPUModelRunner(GPUModelRunner):
         # A bucket counts this rank's rows; under prefill context parallelism
         # a step of that many rows per rank is pcp times as long, and the
         # scheduler sizes steps in tokens.
-        pcp = self.parallel_config.prefill_context_parallel_size
+        pcp = (
+            self.parallel_config.prefill_context_parallel_size
+            if self._pcp_enabled
+            else 1
+        )
         step = self.scheduler_config.max_num_batched_tokens
         buckets = [b for b in self.num_tokens_paddings if b * pcp <= step]
         points = profile_points(
@@ -7074,7 +7084,11 @@ class TPUModelRunner(GPUModelRunner):
             return
         if self.enforce_eager or self.speculative_config is None:
             return
-        pcp = max(1, int(self.parallel_config.prefill_context_parallel_size))
+        pcp = (
+            max(1, int(self.parallel_config.prefill_context_parallel_size))
+            if self._pcp_enabled
+            else 1
+        )
         longest = min(
             self.max_model_len, int(self.scheduler_config.max_num_batched_tokens)
         )

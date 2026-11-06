@@ -123,8 +123,14 @@ class PcpSequenceLayoutEligibility:
         parallel_config = vllm_config.parallel_config
         scheduler_config = vllm_config.scheduler_config
 
+        from vllm_torchtpu.distributed.pcp import pcp_splits_tokens
+
         return cls(
-            pcp_size=parallel_config.prefill_context_parallel_size,
+            # A model that keeps whole steps under PCP (Qwen4Exp) takes the
+            # all-tokens layout on every rank.
+            pcp_size=parallel_config.prefill_context_parallel_size
+            if pcp_splits_tokens(vllm_config)
+            else 1,
             interleave_size=parallel_config.cp_kv_cache_interleave_size,
             dcp_size=parallel_config.decode_context_parallel_size,
             pipeline_parallel_size=parallel_config.pipeline_parallel_size,
