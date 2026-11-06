@@ -967,7 +967,6 @@ class Engram(upstream.Engram):
             self.use_sequence_parallel
             or not self.embed_tokens.host_offload
             or self.embed_tokens.tp_size != 1
-            or self.embed_tokens.dp_size != 1
             or self.embed_tokens.block_size != 32
             or not isinstance(self.wkv.quant_method, VllmFp8LinearMethodTPU)
             or self._active_raw is None
