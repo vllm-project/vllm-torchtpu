@@ -30,6 +30,7 @@ from typing import Any
 import pytest
 
 from vllm_torchtpu.megakernel.errors import MegakernelConfigError
+from vllm_torchtpu.megakernel.runtime.contract import TpuMonoSpec
 from vllm_torchtpu.megakernel_runtime import config as cfg_mod
 from vllm_torchtpu.megakernel_runtime import fingerprint as fp
 from vllm_torchtpu.megakernel_runtime import plugin as plugin_mod
@@ -171,7 +172,7 @@ def test_runtime_src_hash_covers_the_runtime_sources() -> None:
 
 
 def test_fingerprint_and_tokens() -> None:
-    plug = plugin_mod.TpuMonoSpec("toy", "1", create=lambda v, o: None)
+    plug = TpuMonoSpec("toy", "1", create=lambda v, o: None)
     kw = dict(module="m", attr="SPEC", plugin=plug, source_hash="s", raw_env="")
     f1 = fp.plugin_fingerprint(config={"options": {"a": 1}}, **kw)
     assert f1 == fp.plugin_fingerprint(config={"options": {"a": 1}}, **kw)
@@ -201,9 +202,8 @@ import vllm_torchtpu.megakernel.errors as errors
 import vllm_torchtpu.megakernel_runtime.plugin as p
 import vllm_torchtpu.megakernel_runtime.config as c
 import vllm_torchtpu.megakernel_runtime.fingerprint as f
-assert p.TpuMonoSpec and c.parse_config and f.source_hash
-assert p.TpuMonoSpec is contract.TpuMonoSpec
-assert issubclass(p.LayoutDecline, errors.MegakernelLayoutError)
+assert p.RunnerView and c.parse_config and f.source_hash
+assert issubclass(contract.LayoutDecline, errors.MegakernelLayoutError)
 assert errors.EligibilityResult is contract.EligibilityResult
 print("OK")
 """
@@ -373,7 +373,7 @@ def test_import_plugin_errors(mod_dir: Path) -> None:
     _write(
         mod_dir / "future_plugin.py",
         """
-        from vllm_torchtpu.megakernel_runtime.plugin import TpuMonoSpec
+        from vllm_torchtpu.megakernel.runtime.contract import TpuMonoSpec
         SPEC = TpuMonoSpec("f", "1", create=".x:y", api_version=99)
         """,
     )

@@ -41,8 +41,9 @@ from types import ModuleType
 from typing import Any
 
 from vllm_torchtpu.megakernel.errors import MegakernelConfigError
+from vllm_torchtpu.megakernel.runtime.contract import API_VERSION, TpuMonoSpec
 
-from .plugin import API_VERSION, SHORTHANDS, Shorthand, TpuMonoSpec, shorthands
+from .plugin import SHORTHANDS, Shorthand, shorthands
 
 RUNTIME_KEYS = frozenset({"plugin", "options", "enabled", "ab", "stats_period_s"})
 _LEGACY_KEYS = frozenset().union(*(s.legacy_keys for s in SHORTHANDS.values()))
