@@ -50,7 +50,9 @@ if TYPE_CHECKING:
     from vllm.v1.attention.backends.registry import AttentionBackendEnum
     from vllm.v1.attention.selector import AttentionSelectorConfig
 
-    class _TpuAttentionBackend(Protocol):
+    from vllm_torchtpu.platforms.tpu_block_size_utils import TpuAttentionBackendLike
+
+    class _TpuAttentionBackend(TpuAttentionBackendLike, Protocol):
         """Typing-only view of the TPU classmethods on our attention backends."""
 
         @staticmethod
@@ -1227,11 +1229,13 @@ class TpuPlatform(Platform):
                         backend_cls.get_preferred_block_size(default)
                     )
             # Pre-size cache_config before unified-layout derivation so page
-            # alignment matches the plugin's DMA granularity; stock backends
+            # alignment matches the plugin's DMA granularity; baseline backends
             # also accept the aligned block size if the plugin declines at bind.
-            apply_layout_request(vllm_config)
+            layout_req = apply_layout_request(vllm_config)
             if unified_kv_layout_enabled(vllm_config):
-                update_tpu_block_size_and_slot_config(vllm_config, backend_cls)
+                update_tpu_block_size_and_slot_config(
+                    vllm_config, backend_cls, layout_request=layout_req
+                )
 
             min_page_size = backend_cls.get_min_page_size(vllm_config)
             if min_page_size > cache_config.block_size:

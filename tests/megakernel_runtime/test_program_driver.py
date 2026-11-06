@@ -25,7 +25,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
-import pytest  # pyrefly: ignore[missing-import]
+import pytest
 import torch
 
 import vllm_torchtpu.megakernel_runtime.agreement as agreement_mod
@@ -33,6 +33,7 @@ import vllm_torchtpu.megakernel_runtime.driver as driver_mod
 import vllm_torchtpu.megakernel_runtime.guards as guards_mod
 from vllm_torchtpu import megakernel_runtime as mkr
 from vllm_torchtpu.megakernel import errors as mk_errors
+from vllm_torchtpu.megakernel.errors import MegakernelConfigError
 from vllm_torchtpu.megakernel_runtime import fingerprint as fp
 from vllm_torchtpu.megakernel_runtime import testing, testkit
 from vllm_torchtpu.megakernel_runtime.hooks import StepContext
@@ -739,15 +740,18 @@ def test_agreement_group_resolves_the_tp_group(monkeypatch: pytest.MonkeyPatch) 
     monkeypatch.setattr(agreement_mod, "_world_cpu_group", lambda: world)
     assert driver_mod.agreement_group("tp", None) is tp
     assert driver_mod.agreement_group("tp_x_dcp", None) is tp
-    dcp_runner = testing.fake_runner()
-    dcp_runner.parallel_config.decode_context_parallel_size = 4
+    dcp_runner = testing.fake_runner(dcp_size=4)
+    assert driver_mod.agreement_group("dcp", dcp_runner) is dcp
     assert driver_mod.agreement_group("tp_x_dcp", dcp_runner) is dcp
+    bad_dcp_runner = testing.fake_runner(tp_size=6, dcp_size=4)
+    with pytest.raises(MegakernelConfigError, match="Incompatible TP=6"):
+        driver_mod.agreement_group("tp_x_dcp", bad_dcp_runner)
     assert driver_mod.agreement_group("kernel_mesh", None) is world
     with pytest.raises(driver_mod.MegakernelPluginError, match="bogus_domain"):
         driver_mod.agreement_group("bogus_domain", None)
 
 
-@pytest.mark.parametrize("domain", ["tp_x_dcp", "kernel_mesh"])
+@pytest.mark.parametrize("domain", ["dcp", "tp_x_dcp", "kernel_mesh"])
 def test_unsupported_collective_domain_declines_before_any_collective(
     toy: Path, monkeypatch: pytest.MonkeyPatch, domain: str
 ) -> None:
@@ -758,7 +762,8 @@ def test_unsupported_collective_domain_declines_before_any_collective(
     object.__setattr__(bad_spec, "collective_domain", bad_domain)
     runner = testing.fake_runner()
     res = driver_mod.check_spec(runner, bad_spec, view=RunnerView(runner, tp_rank=0))
-    assert res is not None and res.code == f"parallelism_unsupported:{bad_domain}"
+    assert res is not None
+    assert res.code == f"parallelism_unsupported:{bad_domain}"
     src = (
         toy.read_text("utf-8")
         + f'\nobject.__setattr__(SPEC, "collective_domain", "{bad_domain}")\n'

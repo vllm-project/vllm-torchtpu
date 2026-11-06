@@ -97,10 +97,11 @@ NUMERICS: frozenset[str] = frozenset({"exact", "approx"})
 # span ("tp", "tp_x_dcp", or "kernel_mesh"). Unknown domains decline at
 # startup with `parallelism_unsupported:<domain>`.
 DOMAIN_TP = "tp"
+DOMAIN_DCP = "dcp"
 DOMAIN_TP_X_DCP = "tp_x_dcp"
 DOMAIN_KERNEL_MESH = "kernel_mesh"
 COLLECTIVE_DOMAINS: frozenset[str] = frozenset(
-    {DOMAIN_TP, DOMAIN_TP_X_DCP, DOMAIN_KERNEL_MESH}
+    {DOMAIN_TP, DOMAIN_DCP, DOMAIN_TP_X_DCP, DOMAIN_KERNEL_MESH}
 )
 
 # --- Decline codes the runtime itself can produce.
@@ -241,6 +242,44 @@ class MonoProgram(Protocol):
     def forward(self, decision: StepDecision | None, ctx: Any, fwd: Any) -> Any: ...
 
 
+_LAYOUT_FIELDS = ("block_size", "cp_kv_cache_interleave_size", "mamba_slot_tokens")
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class LayoutRequest:
+    """Typed cache and context-parallel pre-sizing request returned by a plugin."""
+
+    block_size: int | None = None
+    cp_kv_cache_interleave_size: int | None = None
+    mamba_slot_tokens: int | None = None
+
+    def __post_init__(self) -> None:
+        """Validate positive integer fields and interleave divisibility."""
+        for field_name in _LAYOUT_FIELDS:
+            value = getattr(self, field_name)
+            if value is not None and (
+                isinstance(value, bool) or not isinstance(value, int) or value <= 0
+            ):
+                msg = (
+                    f"layout_request.{field_name} must be a positive int, got {value!r}"
+                )
+                raise MegakernelConfigError(msg)
+        interleave = self.cp_kv_cache_interleave_size
+        if self.block_size and interleave and self.block_size % interleave != 0:
+            msg = f"block_size={self.block_size} is not divisible by {interleave}"
+            raise MegakernelConfigError(msg)
+
+    @property
+    def slot_tokens_floor(self) -> int | None:
+        """Return the minimum cache-slot token capacity requested by the plugin."""
+        floors = [x for x in (self.block_size, self.mamba_slot_tokens) if x is not None]
+        return max(floors, default=None)
+
+    def to_dict(self) -> dict[str, int]:
+        """Return non-None canonical fields for deterministic salt hashing."""
+        return {k: v for k in _LAYOUT_FIELDS if (v := getattr(self, k)) is not None}
+
+
 def _frozen_strs(values: Any) -> frozenset[str]:
     return frozenset(str(v) for v in values)
 
@@ -318,11 +357,28 @@ class TpuMonoSpec:
                 f"{where}: collective_domain={self.collective_domain!r}; "
                 f"expected one of {sorted(COLLECTIVE_DOMAINS)}"
             )
+        for hook_field in ("create", "layout_request", "load_tensor"):
+            val = getattr(self, hook_field)
+            if (val is None and hook_field != "create") or callable(val):
+                continue
+            if isinstance(val, str):
+                mod, sep, attr = val.partition(":")
+                if sep and mod and attr:
+                    continue
+            msg = (
+                f"{where}: {hook_field} must be a callable or 'module:attr' "
+                f"string, got {val!r}"
+            )
+            raise MegakernelConfigError(msg)
 
 
 __all__ = [
     "API_VERSION",
     "COLLECTIVE_DOMAINS",
+    "DOMAIN_DCP",
+    "DOMAIN_KERNEL_MESH",
+    "DOMAIN_TP",
+    "DOMAIN_TP_X_DCP",
     "FEATURES",
     "NUMERICS",
     "PARALLELISM",
@@ -331,6 +387,7 @@ __all__ = [
     "Decline",
     "EligibilityResult",
     "LayoutDecline",
+    "LayoutRequest",
     "MonoProgram",
     "RunnerShape",
     "StepDecision",

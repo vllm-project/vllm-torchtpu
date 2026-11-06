@@ -17,12 +17,23 @@ from __future__ import annotations
 
 from typing import Any
 
+from vllm_torchtpu.megakernel.runtime.contract import (
+    COLLECTIVE_DOMAINS,
+    DOMAIN_DCP,
+    DOMAIN_KERNEL_MESH,
+    DOMAIN_TP,
+    DOMAIN_TP_X_DCP,
+    LayoutRequest,
+)
+
 from .errors import MegakernelUnsupported
 from .hooks import (
+    WEIGHT_CONSUMED,
     StepContext,
     apply_layout_request,
     is_suppressed,
     load_tensor_stream,
+    observe_model_loader,
     resolve_layout_request,
     suppressed,
 )
@@ -130,6 +141,12 @@ def __getattr__(name: str) -> Any:
 
 
 __all__ = [
+    "COLLECTIVE_DOMAINS",
+    "DOMAIN_DCP",
+    "DOMAIN_KERNEL_MESH",
+    "DOMAIN_TP",
+    "DOMAIN_TP_X_DCP",
+    "LayoutRequest",
     "MegakernelUnsupported",
     "PooledStepExport",
     "ProgramDriver",
@@ -137,6 +154,7 @@ __all__ = [
     "TorchArrayOps",
     "TorchStepMetaOps",
     "VLLMWeightSource",
+    "WEIGHT_CONSUMED",
     "WEIGHT_FLIPPED_ATTR",
     "apply_layout_request",
     "apply_tp_moe_flags",
@@ -153,6 +171,7 @@ __all__ = [
     "load_vllm_weights",
     "make_typed_step_wrapper",
     "maybe_create",
+    "observe_model_loader",
     "reshard_experts_ep_to_tp_local",
     "reshard_layer_experts_ep_to_tp",
     "resolve_layout_request",

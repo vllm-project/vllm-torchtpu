@@ -29,8 +29,8 @@ from vllm_torchtpu.gdn_pool_layout import (
 from vllm_torchtpu.kernels.gdn.head_geometry import derive_gdn_head_geometry
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.megakernel_runtime.hooks import (
-    LAYOUT_FLOOR_KEYS,
-    apply_layout_request,
+    LayoutRequest,
+    resolve_layout_request,
 )
 
 if TYPE_CHECKING:
@@ -48,6 +48,27 @@ if TYPE_CHECKING:
         def get_mamba_state_dtype_from_config(
             cls, vllm_config: VllmConfig
         ) -> tuple[torch.dtype, ...]: ...
+
+    class TpuAttentionBackendLike(Protocol):
+        """Typing-only view of the attention backend classmethods read here."""
+
+        @staticmethod
+        def get_name() -> str:
+            """Return backend identifier."""
+
+        @staticmethod
+        def get_min_page_size(vllm_config: VllmConfig, /) -> int:
+            """Return minimum page size in tokens."""
+
+        @staticmethod
+        def get_supported_kernel_block_sizes() -> Sequence[int | object]:
+            """Return supported kernel block sizes."""
+
+        @staticmethod
+        def get_kv_cache_page_size_bytes(
+            block_size: int, /, *args: object, **kwargs: object
+        ) -> int:
+            """Return physical KV page byte size."""
 
 else:
     VllmConfig = None
@@ -353,9 +374,10 @@ class _TpuBlockSlotDerivation(TypedDict):
 
 def _derive_tpu_block_slot_config(
     vllm_config: VllmConfig,
-    backend_cls,
+    backend_cls: "type[TpuAttentionBackendLike]",
     *,
     input_block_size: int,
+    layout_request: LayoutRequest | None = None,
 ) -> _TpuBlockSlotDerivation:
     supported = backend_cls.get_supported_kernel_block_sizes()
     # The pool row (the pool tensor's shape[1] unit) is the quantum the GDN
@@ -392,29 +414,17 @@ def _derive_tpu_block_slot_config(
     final_block_size = input_block_size
     block_size_source = "input_block_size"
 
-    plugin_token_floor: int | None = None
-    layout_req = apply_layout_request(vllm_config)
-    if isinstance(layout_req, dict):
-        floors: list[int] = []
-        for k in LAYOUT_FLOOR_KEYS:
-            raw_floor = layout_req.get(k)
-            if raw_floor is not None:
-                val = int(raw_floor)
-                if val <= 0:
-                    raise ValueError(
-                        "megakernel layout_request block/slot floor must be > 0, "
-                        f"got {k}={raw_floor!r}"
-                    )
-                floors.append(val)
-        if floors:
-            plugin_token_floor = max(floors)
-
-    cache_cfg = getattr(vllm_config, "cache_config", None)
-    user_specified = cache_cfg is not None and getattr(
-        cache_cfg, "user_specified_block_size", False
+    resolved_req = (
+        resolve_layout_request(vllm_config)
+        if layout_request is None
+        else layout_request
     )
-    if user_specified:
-        plugin_token_floor = None
+    user_specified = vllm_config.cache_config.user_specified_block_size
+    plugin_token_floor = (
+        None
+        if user_specified or resolved_req is None
+        else resolved_req.slot_tokens_floor
+    )
 
     if mamba_layout is not None or plugin_token_floor is not None:
         if mamba_layout is not None:
@@ -559,7 +569,13 @@ def _log_tpu_block_size_derivation(derivation: _TpuBlockSlotDerivation) -> None:
     )
 
 
-def update_tpu_block_size_and_slot_config(vllm_config: VllmConfig, backend_cls) -> None:
+def update_tpu_block_size_and_slot_config(
+    vllm_config: VllmConfig,
+    backend_cls: "type[TpuAttentionBackendLike]",
+    *,
+    layout_request: LayoutRequest | None = None,
+) -> None:
+    """Derive and apply unified TPU KV/Mamba block size and physical slot bytes."""
     cache_config = vllm_config.cache_config
     input_block_size = cache_config.block_size
     if not input_block_size:
@@ -569,6 +585,7 @@ def update_tpu_block_size_and_slot_config(vllm_config: VllmConfig, backend_cls) 
         vllm_config,
         backend_cls,
         input_block_size=input_block_size,
+        layout_request=layout_request,
     )
     _log_tpu_block_size_derivation(derivation)
 

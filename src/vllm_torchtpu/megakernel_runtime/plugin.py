@@ -28,10 +28,16 @@ from __future__ import annotations
 
 import dataclasses
 from collections.abc import Callable, Iterator, Mapping
-from typing import Any, NamedTuple
+from typing import Any
 
+from vllm_torchtpu.megakernel.errors import MegakernelConfigError
 from vllm_torchtpu.megakernel.runtime.contract import (
     API_VERSION,
+    COLLECTIVE_DOMAINS,
+    DOMAIN_DCP,
+    DOMAIN_KERNEL_MESH,
+    DOMAIN_TP,
+    DOMAIN_TP_X_DCP,
     FEATURES,
     NUMERICS,
     PARALLELISM,
@@ -40,6 +46,7 @@ from vllm_torchtpu.megakernel.runtime.contract import (
     Decline,
     EligibilityResult,
     LayoutDecline,
+    LayoutRequest,
     MonoProgram,
     RunnerShape,
     StepDecision,
@@ -49,7 +56,8 @@ from vllm_torchtpu.megakernel.runtime.contract import (
 )
 
 
-class Shorthand(NamedTuple):
+@dataclasses.dataclass(frozen=True, slots=True)
+class Shorthand:
     """A built-in template selectable by name or by the checkpoint's HF arch.
 
     `hf_fields` disambiguates model variants that share an `architectures`
@@ -61,7 +69,17 @@ class Shorthand(NamedTuple):
     architectures: tuple[str, ...]
     model_types: tuple[str, ...]
     legacy_keys: frozenset[str]
-    hf_fields: tuple[tuple[str, Any], ...] = ()
+    hf_fields: tuple[tuple[str, object], ...] = ()
+
+    def __post_init__(self) -> None:
+        """Validate `hf_fields` keys are non-empty strings."""
+        if any(not isinstance(k, str) or not k for k, _ in self.hf_fields):
+            msg = "Shorthand.hf_fields keys must be non-empty strings"
+            raise MegakernelConfigError(msg)
+
+    def _replace(self, **changes: object) -> Shorthand:
+        """Return a copy of `self` with `changes` applied."""
+        return dataclasses.replace(self, **changes)
 
 
 # Built-in templates by shorthand name. Imported by string only, so the
@@ -272,6 +290,11 @@ class ForwardView:
 
 __all__ = [
     "API_VERSION",
+    "COLLECTIVE_DOMAINS",
+    "DOMAIN_DCP",
+    "DOMAIN_KERNEL_MESH",
+    "DOMAIN_TP",
+    "DOMAIN_TP_X_DCP",
     "FEATURES",
     "NUMERICS",
     "PARALLELISM",
@@ -282,6 +305,7 @@ __all__ = [
     "EligibilityResult",
     "ForwardView",
     "LayoutDecline",
+    "LayoutRequest",
     "MonoProgram",
     "RunnerShape",
     "RunnerView",

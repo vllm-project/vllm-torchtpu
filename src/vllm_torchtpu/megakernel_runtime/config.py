@@ -30,6 +30,7 @@ from __future__ import annotations
 import dataclasses
 import importlib
 import importlib.util
+import itertools
 import json
 from collections.abc import Callable, Mapping
 from types import ModuleType
@@ -241,27 +242,26 @@ def _hf_field_value(hf_config: object, key: str) -> object:
     return None
 
 
-def _matches_hf_fields(sh: Shorthand, hf_config: object) -> bool:
-    """Return whether an HF config matches all shorthand constraints."""
+def _matches_shorthand(sh: Shorthand, cand: str, hf_config: object) -> bool:
+    """Return whether `cand` and `hf_config` satisfy `sh`'s architecture rules."""
+    if cand not in sh.architectures and cand not in sh.model_types:
+        return False
     if not sh.hf_fields:
         return True
-    if hf_config is None:
-        return False
-    return all(_hf_field_value(hf_config, k) == v for k, v in sh.hf_fields)
+    return hf_config is not None and all(
+        _hf_field_value(hf_config, k) == v for k, v in sh.hf_fields
+    )
 
 
-def shorthand_for_arch(hf_config: Any) -> str | None:
-    """The shorthand template that serves this checkpoint's arch, if any (from
-    the HF config's `architectures` / `model_type` only)."""
+def shorthand_for_arch(hf_config: object) -> str | None:
+    """Return the shorthand template serving `hf_config`'s architecture, if any."""
     candidates = _hf_arch_candidates(hf_config)
-    for with_fields in (True, False):
-        for cand in candidates:
-            for name, sh in SHORTHANDS.items():
-                if bool(sh.hf_fields) != with_fields:
-                    continue
-                is_arch = cand in sh.architectures or cand in sh.model_types
-                if is_arch and _matches_hf_fields(sh, hf_config):
-                    return name
+    for require_fields in (True, False):
+        for cand, (name, sh) in itertools.product(candidates, SHORTHANDS.items()):
+            if bool(sh.hf_fields) is require_fields and _matches_shorthand(
+                sh, cand, hf_config
+            ):
+                return name
     return None
 
 

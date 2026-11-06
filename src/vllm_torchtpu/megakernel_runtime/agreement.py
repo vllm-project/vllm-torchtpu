@@ -11,32 +11,38 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Rank-uniform megakernel declines: the vote table, the agreement group of a
-spec's collective domain, the one-all-reduce agreement and the declined
-driver that serves the stock path."""
+"""Rank-uniform megakernel declines across a spec's collective domain.
+
+Provides the vote table, the host Gloo process group for a spec's collective
+domain, the single all-reduce agreement, and the declined driver stand-in.
+"""
 
 from __future__ import annotations
 
+import importlib
 import zlib
-from collections.abc import Sequence
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 
 from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.megakernel.errors import MegakernelConfigError
 from vllm_torchtpu.megakernel.runtime import stats as _stats
 from vllm_torchtpu.megakernel.runtime.contract import (
-    DOMAIN_KERNEL_MESH,
+    COLLECTIVE_DOMAINS,
+    DOMAIN_DCP,
     DOMAIN_TP,
     DOMAIN_TP_X_DCP,
     EligibilityResult,
 )
 from vllm_torchtpu.megakernel_runtime.errors import MegakernelPluginError
-from vllm_torchtpu.megakernel_runtime.guards import parallel_field
+from vllm_torchtpu.megakernel_runtime.guards import ParallelTopology
 from vllm_torchtpu.megakernel_runtime.hooks import StepContext, is_suppressed
 
-logger = init_logger(__name__)
+if TYPE_CHECKING:
+    from collections.abc import Sequence
 
+logger = init_logger(__name__)
 
 # Decline codes a rank can vote with in `agree_on_decline` (index + 1 is the
 # vote; 0 means "can serve"). Unlisted codes vote as `other`.
@@ -57,7 +63,7 @@ DECLINE_VOTE_CODES: tuple[str, ...] = (
 
 
 def vote_codes(extra: Sequence[str] = ()) -> tuple[str, ...]:
-    """The vote table: the runtime's codes, a plugin's own codes, then `other`."""
+    """Return the runtime vote codes, any plugin codes, and trailing `other`."""
     base = DECLINE_VOTE_CODES[:-1]
     return (*base, *(c for c in extra if c not in base and c != "other"), "other")
 
@@ -65,78 +71,103 @@ def vote_codes(extra: Sequence[str] = ()) -> tuple[str, ...]:
 def _decline_vote(
     result: EligibilityResult | None, codes: Sequence[str] = DECLINE_VOTE_CODES
 ) -> int:
+    """Encode `result` as a 1-based index into `codes`, or 0 when eligible."""
     if result is None:
         return 0
     code = result.code if result.code in codes else "other"
     return list(codes).index(code) + 1
 
 
-def _tp_cpu_group() -> Any:
-    """Return the TP group's CPU (gloo) process group, or `None` on a single rank."""
+def _coordinator_group(getter_name: str) -> object | None:
+    """Return a live vLLM `GroupCoordinator` when distributed is initialized."""
     if not (torch.distributed.is_available() and torch.distributed.is_initialized()):
         return None
-    from vllm.distributed import get_tp_group
-
-    tp_group = get_tp_group()
-    if int(tp_group.world_size) <= 1:
+    try:
+        vllm_dist = importlib.import_module("vllm.distributed")
+    except ImportError:
         return None
-    if tp_group.cpu_group is None:
-        raise RuntimeError("TP group cpu_group is not initialized")
-    return tp_group.cpu_group
-
-
-def _dcp_cpu_group() -> Any:
-    """Return the DCP group's CPU (gloo) process group, or `None` on a single rank."""
-    if not (torch.distributed.is_available() and torch.distributed.is_initialized()):
+    getter = getattr(vllm_dist, getter_name)
+    try:
+        return getter()
+    except AssertionError:
         return None
-    from vllm.distributed import get_dcp_group
 
-    dcp_group = get_dcp_group()
-    if int(dcp_group.world_size) <= 1:
+
+def _coordinator_cpu_group(getter_name: str, label: str) -> object | None:
+    """Return a vLLM `GroupCoordinator`'s CPU Gloo group, or `None` for 1 rank."""
+    coord = _coordinator_group(getter_name)
+    if coord is None or int(getattr(coord, "world_size", 1)) <= 1:
         return None
-    if dcp_group.cpu_group is None:
-        raise RuntimeError("DCP group cpu_group is not initialized")
-    return dcp_group.cpu_group
+    cpu_group = getattr(coord, "cpu_group", None)
+    if cpu_group is None:
+        msg = f"{label} group cpu_group is not initialized"
+        raise RuntimeError(msg)
+    return cpu_group
 
 
-def _world_cpu_group() -> Any:
-    """Return the world group's CPU (gloo) process group, or `None` on a single rank."""
-    if not (torch.distributed.is_available() and torch.distributed.is_initialized()):
-        return None
-    from vllm.distributed import get_world_group
-
-    world_group = get_world_group()
-    if int(world_group.world_size) <= 1:
-        return None
-    if world_group.cpu_group is None:
-        raise RuntimeError("World group cpu_group is not initialized")
-    return world_group.cpu_group
+def _tp_cpu_group() -> object | None:
+    """Return the TP group's CPU (Gloo) process group, or `None` on a single rank."""
+    return _coordinator_cpu_group("get_tp_group", "TP")
 
 
-def agreement_group(domain: str, runner: Any) -> Any:
-    """Return the CPU process group a spec's agreements run over for its
-    `collective_domain` (`None` on a single rank): the ranks its kernel
-    communicates with."""
+def _dcp_cpu_group() -> object | None:
+    """Return the DCP group's CPU (Gloo) process group, or `None` on a single rank."""
+    return _coordinator_cpu_group("get_dcp_group", "DCP")
+
+
+def _world_cpu_group() -> object | None:
+    """Return the world group's CPU (Gloo) process group, or `None` on a single rank."""
+    return _coordinator_cpu_group("get_world_group", "World")
+
+
+def _verify_nested_tp_dcp_ranks() -> None:
+    """Verify live TP and DCP coordinator rank sets nest when `.ranks` exist."""
+    tp_coord = _coordinator_group("get_tp_group")
+    dcp_coord = _coordinator_group("get_dcp_group")
+    tp_ranks = getattr(tp_coord, "ranks", None)
+    dcp_ranks = getattr(dcp_coord, "ranks", None)
+    if tp_ranks is None or dcp_ranks is None:
+        return
+    tp_set = set(tp_ranks)
+    dcp_set = set(dcp_ranks)
+    if not (dcp_set <= tp_set or tp_set <= dcp_set):
+        msg = (
+            f"TP ranks {sorted(tp_set)} and DCP ranks {sorted(dcp_set)} are not "
+            "nested; no single coordinator spans tp_x_dcp"
+        )
+        raise MegakernelPluginError(msg)
+
+
+def agreement_group(domain: str, runner: object) -> object | None:
+    """Return the CPU process group spanning `domain` (`None` on a single rank).
+
+    Validates topology compatibility via `ParallelTopology.domain_error` so
+    pure `dcp` requires `TP=1` and `tp_x_dcp` requires nested `(TP, PCP, DCP)`
+    groups before selecting the outer coordinator.
+    """
+    if domain not in COLLECTIVE_DOMAINS:
+        msg = f"collective_domain {domain!r} has no agreement group"
+        raise MegakernelPluginError(msg)
+    topo = ParallelTopology.from_runner(runner)
+    if err := topo.domain_error(domain):
+        raise MegakernelConfigError(err)
     if domain == DOMAIN_TP:
         return _tp_cpu_group()
+    if domain == DOMAIN_DCP:
+        return _dcp_cpu_group()
     if domain == DOMAIN_TP_X_DCP:
-        tp = parallel_field(runner, "tensor_parallel_size", 1)
-        dcp = parallel_field(runner, "decode_context_parallel_size", 1)
-        if dcp > tp:
-            return _dcp_cpu_group()
-        return _tp_cpu_group()
-    if domain == DOMAIN_KERNEL_MESH:
-        return _world_cpu_group()
-    raise MegakernelPluginError(f"collective_domain {domain!r} has no agreement group")
+        _verify_nested_tp_dcp_ranks()
+        return _dcp_cpu_group() if topo.dcp > topo.tp else _tp_cpu_group()
+    return _world_cpu_group()
 
 
 def _all_reduce_max(t: torch.Tensor, group: Any) -> None:
+    """Run an in-place MAX all-reduce of `t` across `group`."""
     torch.distributed.all_reduce(t, op=torch.distributed.ReduceOp.MAX, group=group)
 
 
 def buckets_token(keys: Sequence[tuple[int, int]], salt: str = "") -> int:
-    """A rank-independent 32-bit digest of a set of `(T, B)` bucket keys
-    (salted, e.g. with the plugin fingerprint)."""
+    """Return a rank-independent 32-bit digest of `(T, B)` bucket keys."""
     return zlib.crc32((salt + repr(sorted(keys))).encode("ascii"))
 
 
@@ -144,24 +175,18 @@ def agree_on_decline(
     local: EligibilityResult | None,
     *,
     token: int | None = None,
-    group: Any = None,
+    group: object | None = None,
     mismatch_code: str | None = None,
     codes: Sequence[str] = DECLINE_VOTE_CODES,
 ) -> EligibilityResult | None:
     """Make a megakernel decline rank-uniform across the agreement group.
 
     Every rank calls this at the same point with its own decline (`None` when
-    it can serve) and, optionally, a `token` that must be equal on every rank
+    it can serve) and, optionally, a `token` that must match on every rank
     (e.g. `buckets_token` of the compiled buckets). One MAX all-reduce of
-    `(vote, token, -token)`: if any rank declined, every rank declines, and
-    ranks that could serve get `peer_declined:<code>` with the declining
-    rank's code (the highest vote when several decline); if the tokens differ,
-    every rank declines with `bucket_set_mismatch`. A rank-local decline while
-    the other ranks run the megakernel's collectives would hang the job.
-
-    With `mismatch_code` (startup agreement #1: the token is the plugin
-    fingerprint), differing tokens win over votes, since the ranks may not
-    even share a vote table, and every rank declines with that code.
+    `(vote, token, -token)` ensures that if any rank declines, every rank
+    declines, and if tokens differ, every rank declines with `mismatch_code`
+    or `bucket_set_mismatch`.
     """
     if group is None:
         group = _tp_cpu_group()
@@ -190,12 +215,10 @@ def agree_on_decline(
 
 
 class DeclinedDriver:
-    """Stands in for a megakernel the adapter enabled but had to decline.
+    """Stand-in for a megakernel the adapter enabled but had to decline.
 
-    Every forward falls through to the stock model and is counted as
-    `stock_<code>` in the same periodic step-mix stats a serving driver logs,
-    so the decline shows up in serving stats and not only in the startup log.
-    It holds no weights or compiled programs.
+    Every forward falls through to the baseline model and is counted in the
+    periodic step-mix stats so declines remain visible during serving.
     """
 
     serving = False
@@ -210,6 +233,7 @@ class DeclinedDriver:
         codes: Sequence[str] = DECLINE_VOTE_CODES,
         domain: str = DOMAIN_TP,
     ) -> None:
+        """Initialize declined driver state for `domain`."""
         self.decline = result
         self.tp_rank, self._display_name = int(tp_rank), display_name
         self._codes = tuple(codes)
@@ -218,7 +242,7 @@ class DeclinedDriver:
         self._step_key = f"stock_{result.code}"
 
     def bind_and_warmup(self, runner: Any) -> None:
-        # Join the bind-time agreement the serving drivers on other ranks run.
+        """Join the bind-time agreement run by serving peers in `domain`."""
         group = agreement_group(self._domain, runner)
         agree_on_decline(self.decline, group=group, codes=self._codes)
         logger.warning(
@@ -229,13 +253,16 @@ class DeclinedDriver:
         )
 
     def reset_stats(self) -> None:
+        """Reset periodic step-mix counters."""
         self.step_mix_tracker.reset()
 
     def on_warmup_done(self, runner: Any) -> None:
-        del runner
+        """No-op post-warmup hook matching `ProgramDriver`."""
+        _ = runner
 
     def try_forward(self, runner: Any, ctx: StepContext) -> tuple[bool, Any]:
-        del ctx
+        """Record a fallback step when unsuppressed and return `(False, None)`."""
+        _ = ctx
         if is_suppressed(runner):
             return False, None
         _, summary = self.step_mix_tracker.note_step(self._step_key, False)

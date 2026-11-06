@@ -24,6 +24,84 @@ from types import SimpleNamespace
 from typing import Any
 
 
+def _pop_int(overrides: dict[str, object], key: str, default: int) -> int:
+    """Pop an integer override from `overrides` with `default`."""
+    val = overrides.pop(key, default)
+    if isinstance(val, bool) or not isinstance(val, int):
+        msg = f"fake_vllm_config {key} must be int, got {val!r}"
+        raise TypeError(msg)
+    return val
+
+
+def fake_vllm_config(
+    *,
+    megakernel: object = None,
+    block_size: int = 256,
+    cp_kv_cache_interleave_size: int = 1,
+    kv_cache_dtype: object = "auto",
+    **overrides: object,
+) -> SimpleNamespace:
+    """Build a structured CPU `VllmConfig` stand-in matching `VllmConfigLike`."""
+    user_specified = bool(overrides.pop("user_specified_block_size", False))
+    dcp_interleave = _pop_int(
+        overrides, "dcp_kv_cache_interleave_size", cp_kv_cache_interleave_size
+    )
+    hf_config = overrides.pop("hf_config", None)
+    is_hybrid = bool(overrides.pop("is_hybrid", False))
+    tp_size = _pop_int(overrides, "tp_size", 1)
+    dp_size = _pop_int(overrides, "dp_size", 1)
+    pp_size = _pop_int(overrides, "pp_size", 1)
+    pcp_size = _pop_int(overrides, "pcp_size", 1)
+    dcp_size = _pop_int(overrides, "dcp_size", 1)
+    if overrides:
+        unknown = sorted(overrides)
+        msg = f"Unsupported fake_vllm_config overrides: {unknown}"
+        raise TypeError(msg)
+    model_cfg = SimpleNamespace(
+        hf_config=hf_config,
+        enable_sleep_mode=False,
+        multimodal_config=None,
+        quantization=None,
+        is_hybrid=is_hybrid,
+        dtype="bfloat16",
+        get_num_kv_heads=lambda *_: 8,
+        get_head_size=lambda: 128,
+    )
+    parallel_cfg = SimpleNamespace(
+        tensor_parallel_size=tp_size,
+        data_parallel_size=dp_size,
+        pipeline_parallel_size=pp_size,
+        prefill_context_parallel_size=pcp_size,
+        decode_context_parallel_size=dcp_size,
+        cp_kv_cache_interleave_size=int(cp_kv_cache_interleave_size),
+        dcp_kv_cache_interleave_size=dcp_interleave,
+        enable_eplb=False,
+        enable_expert_parallel=False,
+    )
+    cache_cfg = SimpleNamespace(
+        block_size=int(block_size),
+        user_specified_block_size=user_specified,
+        enable_prefix_caching=False,
+        cache_dtype=kv_cache_dtype,
+        mamba_ssm_cache_dtype="auto",
+        mamba_cache_mode="none",
+        mamba_block_size=int(block_size),
+        mamba_page_size_padded=0,
+    )
+    add_cfg = {} if megakernel is None else {"megakernel": megakernel}
+    return SimpleNamespace(
+        model_config=model_cfg,
+        parallel_config=parallel_cfg,
+        cache_config=cache_cfg,
+        speculative_config=None,
+        kv_transfer_config=None,
+        load_config=SimpleNamespace(),
+        device_config=SimpleNamespace(device=SimpleNamespace(type="cpu")),
+        quant_config=None,
+        additional_config=add_cfg,
+    )
+
+
 def fake_runner(
     *,
     model: Any = None,
@@ -73,11 +151,17 @@ def fake_runner(
         enable_sleep_mode=False,
         multimodal_config=multimodal_config,
     )
+    dp_size = int(extra.pop("dp_size", 1))
+    pp_size = int(extra.pop("pp_size", 1))
+    pcp_size = int(extra.pop("pcp_size", 1))
+    dcp_size = int(extra.pop("dcp_size", 1))
+    dp_lockstep = bool(extra.pop("dp_lockstep", False))
     parallel_cfg = SimpleNamespace(
         tensor_parallel_size=int(tp_size),
-        data_parallel_size=1,
-        prefill_context_parallel_size=1,
-        decode_context_parallel_size=1,
+        data_parallel_size=dp_size,
+        pipeline_parallel_size=pp_size,
+        prefill_context_parallel_size=pcp_size,
+        decode_context_parallel_size=dcp_size,
         enable_eplb=bool(enable_eplb),
         enable_expert_parallel=bool(enable_expert_parallel),
     )
@@ -116,10 +200,10 @@ def fake_runner(
         supports_mm_inputs=bool(supports_mm_inputs),
         lora_config=None,
         _pp_is_first=True,
-        _pp_is_last=True,
-        _pcp_enabled=False,
-        _dcp_enabled=False,
-        _dp_lockstep_enabled=lambda: False,
+        _pp_is_last=pp_size == 1,
+        _pcp_enabled=pcp_size > 1,
+        _dcp_enabled=dcp_size > 1,
+        _dp_lockstep_enabled=lambda: dp_lockstep,
         _megakernel=None,
     )
     if ckpt_window is not None:
@@ -129,4 +213,4 @@ def fake_runner(
     return runner
 
 
-__all__ = ["fake_runner"]
+__all__ = ["fake_runner", "fake_vllm_config"]

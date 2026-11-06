@@ -45,7 +45,7 @@ from types import ModuleType, SimpleNamespace
 from typing import Any
 from unittest import mock
 
-import pytest  # pyrefly: ignore[missing-import]
+import pytest
 
 from .plugin import TpuMonoSpec
 from .testing import fake_runner
@@ -217,18 +217,19 @@ def check_spec(
             "'module:attr' string (e.g. '.adapter:create'), so importing the "
             "plugin loads no torch / jax / vLLM"
         )
-    if (
-        lazy_create
-        and spec.load_tensor is not None
-        and (not isinstance(spec.load_tensor, str) or ":" not in spec.load_tensor)
-    ):
-        obs = spec.load_tensor
-        msg = (
-            f"SPEC {spec.name!r}: load_tensor={obs!r} should be a "
-            "lazy 'module:attr' string (e.g. '.adapter:load_tensor'), "
-            "so importing the plugin loads no torch / jax / vLLM"
-        )
-        raise AssertionError(msg)
+    for hook_attr in ("load_tensor", "layout_request"):
+        hook_val = getattr(spec, hook_attr, None)
+        if (
+            lazy_create
+            and hook_val is not None
+            and (not isinstance(hook_val, str) or ":" not in hook_val)
+        ):
+            msg = (
+                f"SPEC {spec.name!r}: {hook_attr}={hook_val!r} should be a "
+                f"lazy 'module:attr' string (e.g. '.adapter:{hook_attr}'), "
+                "so importing the plugin loads no torch / jax / vLLM"
+            )
+            raise AssertionError(msg)
     codes = list(spec.decline_codes)
     if any(not isinstance(c, str) or not c or c == "other" for c in codes):
         raise AssertionError(f"SPEC {spec.name!r}: bad decline_codes {codes}")
@@ -356,10 +357,12 @@ a._dcp_cpu_group = lambda: dist.group.WORLD
 a._world_cpu_group = lambda: dist.group.WORLD
 d._get_pallas_mesh_fn = lambda: None
 d._local_tp_rank = dist.get_rank
+rkw = json.loads(runner_kw)
+tp_sz = int(rkw.pop("tp_size", 2))
 runner = testing.fake_runner(
-    tp_size=2,
+    tp_size=tp_sz,
     megakernel={"plugin": plugin, "options": json.loads(options)},
-    **json.loads(runner_kw),
+    **rkw,
 )
 res = {}
 try:
@@ -406,6 +409,7 @@ def run_two_ranks(
     into a per-rank directory first, e.g. to skew it on one rank;
     `runner_kwargs` (JSON values) go to `fake_runner`.
     """
+    tmp_path.mkdir(parents=True, exist_ok=True)
     script = tmp_path / "rank.py"
     script.write_text(_RANK_SCRIPT, encoding="utf-8")
     env = _subprocess_env()

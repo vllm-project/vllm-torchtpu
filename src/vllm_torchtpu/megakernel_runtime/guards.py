@@ -17,6 +17,7 @@ config, before `create`. Config and local device facts only: no collective."""
 
 from __future__ import annotations
 
+import dataclasses
 import os
 from collections.abc import Mapping
 from typing import Any
@@ -25,6 +26,7 @@ from vllm_torchtpu import _OFFLOADING_CONNECTORS
 from vllm_torchtpu.megakernel.errors import MegakernelConfigError
 from vllm_torchtpu.megakernel.runtime.contract import (
     COLLECTIVE_DOMAINS,
+    DOMAIN_DCP,
     DOMAIN_KERNEL_MESH,
     DOMAIN_TP,
     DOMAIN_TP_X_DCP,
@@ -173,62 +175,123 @@ def _dp_size(runner: object) -> int:
     )
 
 
+@dataclasses.dataclass(frozen=True, slots=True)
+class ParallelTopology:
+    """Normalized parallel group sizes and active flags extracted from a runner."""
+
+    tp: int = 1
+    dcp: int = 1
+    pcp: int = 1
+    dp: int = 1
+    pp: int = 1
+    ep_wide: bool = False
+    ep_in_tp: bool = False
+    dp_lockstep: bool = False
+    pp_multi: bool = False
+    dcp_active: bool = False
+    pcp_active: bool = False
+
+    @classmethod
+    def from_runner(
+        cls,
+        runner: object,
+        *,
+        tp_size: int | None = None,
+        default_tp: int = 1,
+    ) -> ParallelTopology:
+        """Read config and group sizes from `runner` without running collectives."""
+        tp_raw = (
+            int(tp_size)
+            if tp_size is not None
+            else parallel_field(runner, "tensor_parallel_size", default_tp or 1)
+        )
+        tp = max(1, tp_raw)
+        dcp = max(1, parallel_field(runner, "decode_context_parallel_size", 1))
+        pcp = max(1, parallel_field(runner, "prefill_context_parallel_size", 1))
+        pp = max(1, parallel_field(runner, "pipeline_parallel_size", 1))
+        dp = max(1, _dp_size(runner))
+        p_cfg = _runner_cfg(runner, "parallel_config")
+        ep_on = bool(getattr(p_cfg, "enable_expert_parallel", False))
+        ep_wide = _ep_group_size() > tp or (ep_on and dp * pcp > 1)
+        dp_fn = getattr(runner, "_dp_lockstep_enabled", None)
+        pp_ends = getattr(runner, "_pp_is_first", True) and getattr(
+            runner, "_pp_is_last", True
+        )
+        return cls(
+            tp=tp,
+            dcp=dcp,
+            pcp=pcp,
+            dp=dp,
+            pp=pp,
+            ep_wide=ep_wide,
+            ep_in_tp=ep_on and not ep_wide,
+            dp_lockstep=bool(callable(dp_fn) and dp_fn()),
+            pp_multi=(not pp_ends) or pp > 1,
+            dcp_active=bool(getattr(runner, "_dcp_enabled", False)) or dcp > 1,
+            pcp_active=bool(getattr(runner, "_pcp_enabled", False)) or pcp > 1,
+        )
+
+    def is_nested_tp_dcp(self) -> bool:
+        """Return whether TP and DCP groups nest so one coordinator spans both."""
+        return (
+            self.dcp <= 1
+            or self.tp == 1
+            or (self.pcp == 1 and self.tp % self.dcp == 0)
+            or self.dcp == self.tp * self.pcp
+        )
+
+    def domain_error(self, domain: str) -> str | None:
+        """Return an error string when `domain` cannot span `(tp, pcp, dcp)`."""
+        if domain not in COLLECTIVE_DOMAINS:
+            return f"Unsupported collective_domain {domain!r}"
+        if domain == DOMAIN_DCP and self.tp > 1:
+            return (
+                f"Incompatible TP={self.tp} and DCP={self.dcp} for {DOMAIN_DCP}: "
+                f"pure DCP requires TP=1 (use {DOMAIN_TP_X_DCP})"
+            )
+        if domain == DOMAIN_TP_X_DCP and not self.is_nested_tp_dcp():
+            return (
+                f"Incompatible TP={self.tp}, PCP={self.pcp}, DCP={self.dcp} "
+                f"for {DOMAIN_TP_X_DCP}: TP and DCP groups do not nest"
+            )
+        return None
+
+    def world_size(self, domain: str) -> int:
+        """Return the device count of the JAX mesh built for `domain`."""
+        if err := self.domain_error(domain):
+            raise MegakernelConfigError(err)
+        sizes = {
+            DOMAIN_TP: self.tp,
+            DOMAIN_DCP: self.dcp,
+            DOMAIN_TP_X_DCP: max(self.tp, self.dcp),
+            DOMAIN_KERNEL_MESH: self.dp * self.pp * self.pcp * self.tp,
+        }
+        return sizes[domain]
+
+    def active_kinds(self) -> list[str]:
+        """Return active parallelism kinds beyond `'tp'` in check order."""
+        flags = (
+            ("dp", self.dp > 1),
+            ("ep_wider_than_tp", self.ep_wide),
+            ("dp_lockstep", self.dp_lockstep),
+            ("pp", self.pp_multi),
+            ("dcp", self.dcp_active),
+            ("pcp", self.pcp_active),
+            ("ep_in_tp", self.ep_in_tp),
+        )
+        return [kind for kind, on in flags if on]
+
+
 def domain_world_size(domain: str, runner: object, view: RunnerView) -> int:
-    """Return the rank count a spec's collective domain communicates across.
-
-    For `DOMAIN_KERNEL_MESH`, in single-stage (`pp=1`) TPU serving the Pallas
-    mesh and world group span all `dp * tp` devices across the slice; plugins
-    index the mesh axis via `jax.lax.axis_index` / global rank while
-    `RunnerView.tp_rank` stays the local TP rank.
-    """
-    tp = parallel_field(
-        runner, "tensor_parallel_size", getattr(view, "tp_size", 1) or 1
-    )
-    if domain == DOMAIN_TP:
-        return tp
-    if domain == DOMAIN_TP_X_DCP:
-        dcp = parallel_field(runner, "decode_context_parallel_size", 1)
-        if tp > 1 and dcp > 1 and (tp % dcp != 0 and dcp % tp != 0):
-            msg = f"Incompatible TP={tp} and DCP={dcp} for {DOMAIN_TP_X_DCP}"
-            raise MegakernelConfigError(msg)
-        return max(tp, dcp)
-    if domain == DOMAIN_KERNEL_MESH:
-        return _dp_size(runner) * tp
-    return tp
+    """Return the device count of the JAX mesh built for `domain`."""
+    return ParallelTopology.from_runner(
+        runner, default_tp=view.tp_size or 1
+    ).world_size(domain)
 
 
-def detect_parallelism(runner: Any, tp_size: int) -> list[str]:
-    """The parallelism kinds (beyond "tp") the runner uses, in check order.
-    Reads config and group sizes only: no collective."""
-    vcfg = getattr(runner, "vllm_config", None)
-    p_cfg = getattr(vcfg, "parallel_config", None) or getattr(
-        runner, "parallel_config", None
-    )
-    dp = _dp_size(runner)
-    ep_wide = _ep_group_size() > max(1, int(tp_size))
-    dp_fn = getattr(runner, "_dp_lockstep_enabled", None)
-    pp_multi = not (
-        getattr(runner, "_pp_is_first", True) and getattr(runner, "_pp_is_last", True)
-    )
-    dcp = (
-        bool(getattr(runner, "_dcp_enabled", False))
-        or int(getattr(p_cfg, "decode_context_parallel_size", 1) or 1) > 1
-    )
-    pcp = (
-        bool(getattr(runner, "_pcp_enabled", False))
-        or int(getattr(p_cfg, "prefill_context_parallel_size", 1) or 1) > 1
-    )
-    ep_in_tp = bool(getattr(p_cfg, "enable_expert_parallel", False)) and not ep_wide
-    flags = (
-        ("dp", dp > 1),
-        ("ep_wider_than_tp", ep_wide),
-        ("dp_lockstep", bool(callable(dp_fn) and dp_fn())),
-        ("pp", pp_multi),
-        ("dcp", dcp),
-        ("pcp", pcp),
-        ("ep_in_tp", ep_in_tp),
-    )
-    return [kind for kind, on in flags if on]
+def detect_parallelism(runner: object, tp_size: int) -> list[str]:
+    """Return the parallelism kinds (beyond `'tp'`) active on `runner`."""
+    return ParallelTopology.from_runner(runner, tp_size=int(tp_size)).active_kinds()
 
 
 def _requires_value(runner: Any, key: str) -> str:
@@ -271,6 +334,9 @@ def check_spec(runner: Any, spec: Any, *, view: RunnerView) -> EligibilityResult
             f"{PARALLELISM_UNSUPPORTED}:{domain}",
             f"collective_domain {domain!r} is unsupported (supported: {supported})",
         )
+    topo = ParallelTopology.from_runner(runner, default_tp=tp_size or 1)
+    if domain_err := topo.domain_error(domain):
+        return _decline(f"{PARALLELISM_UNSUPPORTED}:{domain}", domain_err)
     for kind in detect_parallelism(runner, tp_size):
         if kind not in spec.parallelism:
             return _decline(
