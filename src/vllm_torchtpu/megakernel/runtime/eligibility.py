@@ -168,10 +168,12 @@ def check_step_eligibility(
     num_reqs, T = batch_shape.num_reqs, batch_shape.tokens_per_seq
     if not mrope_ok:
         return StepDecision(False, "stock_mrope", num_reqs, T)
-    if T not in (1, 4):
+    v_tokens = bucket_policy.verify_tokens
+    if T not in (1, *v_tokens):
         return StepDecision(False, f"stock_q{T}", num_reqs, T)
-    b_list = bucket_policy.verify_buckets if T == 4 else bucket_policy.buckets
-    max_b = bucket_policy.max_verify_bucket if T == 4 else bucket_policy.max_bucket
+    is_v = T in v_tokens
+    b_list = bucket_policy.verify_buckets if is_v else bucket_policy.buckets
+    max_b = bucket_policy.max_verify_bucket if is_v else bucket_policy.max_bucket
     active_rows = num_reqs * T
     if not b_list or active_rows > max_b:
         return StepDecision(False, f"stock_t{T}_n{num_reqs}", num_reqs, T)
