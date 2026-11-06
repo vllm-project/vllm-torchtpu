@@ -60,6 +60,8 @@ if TYPE_CHECKING:
     TPU_QWEN4_HC_DECODE_FUSED: bool = False
     QWEN4_EXP_PREFILL_SP: bool = False
     QWEN4_EXP_PD_STAGING_BYTES: int = 8 << 30
+    QWEN4_EXP_PD_SYNC_REPACK: bool = False
+    QWEN4_EXP_PD_SYNC_REPACK_AB_S: int = 0
     QWEN4_EXP_PP_LOGICAL_BLOCKS_FACTOR: int = 1
     TPU_KV_CACHE_GROUP_SIZE_RULE: str = "gcd"
     QWEN4_EXP_PREFILL_SP_MIN_TOKENS: int = 1024
@@ -968,6 +970,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # (models/vllm/qwen4_exp/pd_staging.py). Bytes of that carrier per rank;
     # a load that does not fit recomputes on the decode.
     "QWEN4_EXP_PD_STAGING_BYTES": env_int("QWEN4_EXP_PD_STAGING_BYTES", 8 << 30),
+    # A staged Qwen4Exp decode runs each load's repack in the step after the
+    # scheduler sees the load complete on EVERY rank, on all ranks together,
+    # instead of on each rank in the step its own bytes land. Ranks land a
+    # load up to ~0.7 s apart, and every rank's repack holds the whole TP
+    # group at the next collective, so one load stalled 2-3.5 decode steps.
+    # Host-side scheduling only: the repack program and its inputs are
+    # unchanged.
+    "QWEN4_EXP_PD_SYNC_REPACK": env_bool("QWEN4_EXP_PD_SYNC_REPACK"),
+    # > 0: alternate QWEN4_EXP_PD_SYNC_REPACK by wall clock, off in even and
+    # on in odd periods of this many seconds, so one serving job measures
+    # both arms on the same engines (an in-job A/B). Overrides the switch.
+    "QWEN4_EXP_PD_SYNC_REPACK_AB_S": env_int("QWEN4_EXP_PD_SYNC_REPACK_AB_S", 0),
     # A Qwen4Exp pipeline engine with prefix caching gives the scheduler this
     # many block IDs per physical pool page. Every stage shares the block-ID
     # space but writes only its own groups' pages (2-4 of a block's 24), so
