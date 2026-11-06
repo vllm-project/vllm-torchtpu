@@ -917,7 +917,8 @@ def _dcp_ops():
     def step_fake(qgate, key, value, index_qk, nq, nk, niq, nik, positions, trig, pool,
                   starts, context, ring_ids, main_table, compressed_table, dcp_rank,
                   compress_ratio, token_topk, norm_eps, rotary_dim, dcp_size=2, k_scale=1.0,
-                  v_scale=1.0, compressed_slot=0, main_slot=-1, max_query_len=1):
+                  v_scale=1.0, compressed_slot=0, main_slot=-1, max_query_len=1,
+                  dcp_interleave=0):
         return partial_shapes(qgate, nq, positions, pool, compress_ratio, token_topk)
 
     select = pallas.jax_op(
@@ -979,6 +980,51 @@ def _dcp_finish(out, lse, qgate, head_dim, dcp_rank, pair_group, combine):
     out_pair = pair_group.all_gather(out.unsqueeze(0).contiguous(), dim=0)
     lse_pair = pair_group.all_gather(lse.unsqueeze(0).contiguous(), dim=0)
     return combine(out_pair, lse_pair, gate, dcp_rank).reshape(tokens, heads * head_dim)
+
+
+@functools.cache
+def _pcp_combine_op():
+    from vllm_torchtpu.kernels.qwen4_exp.qsa_rpa import pcp_combine_step
+
+    combine = pallas.jax_op("qwen4_exp::qsa_pcp_combine", pcp_combine_step)
+
+    @combine.register_fake
+    def combine_fake(out_pair, lse_pair, gate):
+        return gate.new_empty(gate.shape, dtype=torch.bfloat16)
+
+    return combine
+
+
+def build_pooled_qsa_pcp_op(pcp_group, size: int, interleave: int):
+    """``build_pooled_qsa_op`` for a prefill-context-parallel group.
+
+    Every rank of ``pcp_group`` runs the step on all of its tokens and heads
+    (qwen4_exp replicates the token work under PCP) but stores and attends only
+    the main-KV rows it owns: units of ``interleave`` tokens alternate over
+    the ranks (``qsa_rpa.dcp_owner_row``). The ranks' partial attention is then
+    merged over every head (``qsa_rpa.pcp_combine``). Takes a trailing
+    ``dcp_rank`` (int32 ``[1]``, the PCP rank) keyword."""
+    step = _dcp_ops()[0]
+    combine = _pcp_combine_op()
+
+    def run(*args, dcp_rank, **kwargs):
+        args = list(args)
+        for index in (8, 11, 12, 13, 14, 15):
+            args[index] = args[index].to(torch.int32)
+        qgate = args[0]
+        head_dim = args[4].shape[0]
+        updated, out, lse, blocks = step(
+            *args, dcp_rank, dcp_size=size, dcp_interleave=interleave, **kwargs
+        )
+        args[10].copy_(updated)
+        tokens = qgate.shape[0]
+        heads = qgate.shape[1] // (2 * head_dim)
+        gate = qgate.reshape(tokens, heads, 2 * head_dim)[..., head_dim:]
+        out_pair = pcp_group.all_gather(out.unsqueeze(0).contiguous(), dim=0)
+        lse_pair = pcp_group.all_gather(lse.unsqueeze(0).contiguous(), dim=0)
+        return combine(out_pair, lse_pair, gate).reshape(tokens, heads * head_dim), blocks
+
+    return run
 
 
 def build_pooled_qsa_dcp_op(pair_group, size: int):
