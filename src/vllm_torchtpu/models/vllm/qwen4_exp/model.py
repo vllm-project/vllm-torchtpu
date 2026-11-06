@@ -389,7 +389,7 @@ class Qwen4ExpDecoderLayer(nn.Module):
         elif sp.pcp_world_size() > 1:
             # PCP: experts are split over the group, whose MoE runner takes
             # each rank's own rows (sequence_parallel.pcp_shard).
-            moe = sp.pcp_gather(self.mlp(sp.pcp_shard(block)))
+            moe = sp.pcp_gather(self.mlp(sp.pcp_shard(block)), block.shape[0])
         else:
             moe = self.mlp(block)
         return self.mlp_hyper_connection.combine(sp.pad_shard(moe, sp_pad), residual)
