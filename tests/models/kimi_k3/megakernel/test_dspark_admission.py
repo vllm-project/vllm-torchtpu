@@ -15,11 +15,13 @@
 
 from __future__ import annotations
 
-import pytest
+import importlib
+from typing import Any
 
 from vllm_torchtpu.models.kimi_k3.megakernel.kernels import dspark_mla_kernel
 from vllm_torchtpu.models.kimi_k3.megakernel.kernels.dspark_mla import MlaDraftConfig
 
+pytest: Any = importlib.import_module("pytest")
 PAGES = 16
 
 
