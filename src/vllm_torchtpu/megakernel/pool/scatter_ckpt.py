@@ -50,11 +50,6 @@ def prepare_ckpt(
                 "scatter_pool_states requires conv, rec, and ckpt_indices when "
                 f"layout.slots_per_pool ({layout.slots_per_pool}) > 0"
             )
-        if layout.pages_per_slot > layout.reserved_pages:
-            raise ValueError(
-                f"PoolLayout.pages_per_slot ({layout.pages_per_slot}) exceeds "
-                f"reserved_pages ({layout.reserved_pages})"
-            )
         vh, KD, VD = layout.vh_per_rank(ex.R), layout.KD, layout.VD
         QKV = layout.qkv_per_rank(ex.R)
         taps = layout.conv_taps

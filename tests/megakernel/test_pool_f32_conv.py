@@ -166,7 +166,7 @@ def test_f32_conv_rejects_partial_conv_page_writes():
             "all",
         )
     )(raw[0], pos, pt, knew, vnew, conv, rec, ckpt)
-    assert "scatter_pool_states" in str(jaxpr)
+    assert "name=scatter_pool_states" in str(jaxpr)
 
 
 @pytest.mark.tpu_test
@@ -174,38 +174,34 @@ def test_f32_conv_rejects_partial_conv_page_writes():
 def test_f32_conv_gather_and_scatter_on_tpu(T: int):
     """On TPU (`interpret=False`), gather and scatter f32 conv states (`T=1` and
     direct-window `T=2` with `qkv_128=8` aligned to `conv_tile=8`) and compare
-    bit-for-bit against the interpret-mode reference."""
+    bit-for-bit against the CPU interpret-mode reference."""
     try:
         tpu_devs = jax.devices("tpu")
     except RuntimeError:
         tpu_devs = []
     if not tpu_devs:
         pytest.skip("Requires TPU device")
+    cpu_dev = jax.devices("cpu")[0]
+    tpu_dev = tpu_devs[0]
     lay = _f32(ts._layout(1, num_pools=1))
     assert lay.qkv_per_rank(1) // 128 == 8 and lay.conv_tile == 8
     ex_ref = ts._exec(R=1, B=2 * T, T=T)
     ex_tpu = replace(ex_ref, interpret=False)
-    with jax.default_device(tpu_devs[0]):
+    with jax.default_device(cpu_dev):
         st = tg._random_states(lay, ex_ref, seed=301 + T)
-        pt, ckpt, roff = tg._tables(lay, ex_ref, 3)
-        raw_pools = tuple(pool.states_to_pool(lay, ex_ref, st, pt, ckpt, roff))
-        conv_ref, rec_ref = pool.gather_gdn_states(
-            lay, ex_ref, raw_pools, ckpt, roff, interpret=True
+        pt_cpu, ckpt_cpu, roff_cpu = tg._tables(lay, ex_ref, 3)
+        raw_pools_cpu = tuple(
+            pool.states_to_pool(lay, ex_ref, st, pt_cpu, ckpt_cpu, roff_cpu)
         )
-        conv_tpu, rec_tpu = jax.jit(
-            lambda r, c, ro: pool.gather_gdn_states(
-                lay, ex_tpu, r, c, ro, interpret=False
-            )
-        )(raw_pools, ckpt, roff)
-        np.testing.assert_array_equal(np.asarray(conv_tpu), np.asarray(conv_ref))
-        np.testing.assert_array_equal(np.asarray(rec_tpu), np.asarray(rec_ref))
-
+        conv_ref, rec_ref = pool.gather_gdn_states(
+            lay, ex_ref, raw_pools_cpu, ckpt_cpu, roff_cpu, interpret=True
+        )
         k = jax.random.split(jax.random.key(321 + T), 4)
-        pos = jnp.arange(ex_ref.B, dtype=jnp.int32)
-        knew = (jax.random.normal(k[0], (1, ex_ref.MR, lay.hd)) * 0.2).astype(
+        pos_cpu = jnp.arange(ex_ref.B, dtype=jnp.int32)
+        knew_cpu = (jax.random.normal(k[0], (1, ex_ref.MR, lay.hd)) * 0.2).astype(
             jnp.float8_e4m3fn
         )
-        vnew = (jax.random.normal(k[1], (1, ex_ref.MR, lay.hd)) * 0.2).astype(
+        vnew_cpu = (jax.random.normal(k[1], (1, ex_ref.MR, lay.hd)) * 0.2).astype(
             jnp.float8_e4m3fn
         )
         qkv = lay.qkv_per_rank(1)
@@ -215,23 +211,42 @@ def test_f32_conv_gather_and_scatter_on_tpu(T: int):
             if T == 1
             else (1, ex_ref.NS, 8, qkv)
         )
-        conv_in = _full_f32(k[2], conv_shape)
-        rec_in = (
+        conv_in_cpu = _full_f32(k[2], conv_shape)
+        rec_in_cpu = (
             jax.random.normal(k[3], (1, ex_ref.B * vh, lay.KD, lay.VD)) * 0.1
         ).astype(jnp.bfloat16)
         out_ref = pool.scatter_pool_states(
             lay,
             ex_ref,
-            raw_pools,
-            pos,
-            pt,
-            knew,
-            vnew,
-            conv_in,
-            rec_in,
-            ckpt,
+            raw_pools_cpu,
+            pos_cpu,
+            pt_cpu,
+            knew_cpu,
+            vnew_cpu,
+            conv_in_cpu,
+            rec_in_cpu,
+            ckpt_cpu,
             interpret=True,
         )
+
+    with jax.default_device(tpu_dev):
+        raw_pools = jax.device_put(raw_pools_cpu, tpu_dev)
+        pt = jax.device_put(pt_cpu, tpu_dev)
+        ckpt = jax.device_put(ckpt_cpu, tpu_dev)
+        roff = jax.device_put(roff_cpu, tpu_dev)
+        pos = jax.device_put(pos_cpu, tpu_dev)
+        knew = jax.device_put(knew_cpu, tpu_dev)
+        vnew = jax.device_put(vnew_cpu, tpu_dev)
+        conv_in = jax.device_put(conv_in_cpu, tpu_dev)
+        rec_in = jax.device_put(rec_in_cpu, tpu_dev)
+        conv_tpu, rec_tpu = jax.jit(
+            lambda r, c, ro: pool.gather_gdn_states(
+                lay, ex_tpu, r, c, ro, interpret=False
+            )
+        )(raw_pools, ckpt, roff)
+        np.testing.assert_array_equal(np.asarray(conv_tpu), np.asarray(conv_ref))
+        np.testing.assert_array_equal(np.asarray(rec_tpu), np.asarray(rec_ref))
+
         out_tpu = jax.jit(
             lambda r, p, pt_i, kn, vn, cv, rc, ck: pool.scatter_pool_states(
                 lay, ex_tpu, r, p, pt_i, kn, vn, cv, rc, ck, interpret=False

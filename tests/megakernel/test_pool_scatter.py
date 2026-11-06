@@ -236,7 +236,7 @@ def test_scatter_direct_conv_window_traces_for_24_lane_rows(T: int):
     jaxpr = jax.make_jaxpr(
         lambda *a: pool.scatter_pool_states(lay, ex, *a, ckpt_indices=ckpt)
     )(*args)
-    assert "scatter_pool_states" in str(jaxpr)
+    assert "name=scatter_pool_states" in str(jaxpr)
 
 
 @pytest.mark.parametrize("R,kh,vh", [(1, 8, 8), (4, 32, 32)])
