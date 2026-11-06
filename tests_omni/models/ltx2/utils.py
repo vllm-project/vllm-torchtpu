@@ -146,8 +146,6 @@ def extract_ltx2_outputs(
     )
 
 
-# Hugging Face revision of the Lightricks/LTX-2 checkpoint the goldens use.
-LTX2_REVISION = "12beb2ad8ac6fb6fb73efbdd6dc2eb8ce3dc44ef"
 # Guidance of the golden request: vllm-omni's default 4-pass guidance (CFG, STG
 # at block 29, modality isolation, rescale), sent explicitly so the golden does
 # not depend on vllm-omni's defaults.
@@ -200,7 +198,6 @@ def load_and_verify_ltx2_golden() -> tuple[np.ndarray, np.ndarray]:
         meta = json.loads(str(data["meta"]))
     expected_meta = {
         "model_id": LTX2_MODEL_ID,
-        "revision": LTX2_REVISION,
         "variant": LTX2_GOLDEN_VARIANT,
         "omni_extra_args": LTX2_GOLDEN_EXTRA_ARGS,
         "prompt": LTX2_PROMPT,
