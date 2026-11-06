@@ -647,3 +647,38 @@ def test_multi_routes_host_loads_and_keeps_the_pd_hold():
     assert offload.allocs == [3 * BLOCK] and pd.allocs == [0]
     # The PD hold survives: blocks stay until the decode pulls.
     assert m.request_finished_all_groups(req, ([1],)) == (True, {"remote": "params"})
+
+
+# -- shutdown against the real Raiden binding's eviction-callback signature ------
+
+
+def test_shutdown_unregisters_eviction_callback_with_a_callable():
+    """The image's KVCacheStore.set_eviction_callback(self, callback: object)
+    rejects None with a TypeError (M: tpu-sync-torch 0.0.1.dev20261012084241,
+    CPU probe in the served image; j-46084fb7 hit it at connector shutdown).
+    A stub with that contract must see shutdown succeed, the manager's own
+    callback detached and the job drain still reached."""
+    from tests.offload.test_raiden_store_offload import FakeKVCacheStore, make_manager
+
+    class BindingFaithfulStore(FakeKVCacheStore):
+        def set_eviction_callback(self, callback) -> None:
+            if callback is None or not callable(callback):
+                raise TypeError(
+                    "set_eviction_callback(): incompatible function arguments. The "
+                    "following argument types are supported:\n    1. "
+                    "set_eviction_callback(self, callback: object) -> None"
+                )
+            super().set_eviction_callback(callback)
+
+    store = BindingFaithfulStore()
+    manager = make_manager(store)
+    assert store.eviction_callback == manager._on_eviction
+    drained = []
+    manager._admissions = {7: object()}
+    manager.drain_jobs = lambda ids: drained.append(set(ids)) or []
+    manager.shutdown()
+    assert callable(store.eviction_callback)
+    assert store.eviction_callback != manager._on_eviction
+    store.simulate_evict([b"x" * 40])  # a late eviction is ignored, not queued
+    assert manager.take_events() == []
+    assert drained == [{7}]
