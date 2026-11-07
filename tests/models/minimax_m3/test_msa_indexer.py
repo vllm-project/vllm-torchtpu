@@ -182,7 +182,10 @@ def test_fp4_matches_dequantized_reference(
         for t in range(cu_q[r], cu_q[r + 1]):
             for b in range(num_pages):
                 expected = (keys[tables[r, b]] @ queries[t]).max()
-                np.testing.assert_allclose(scores[t, b], expected, rtol=1e-4, atol=1e-3)
+                # Folded pages scale the keys in bf16 (msa_indexer.SCALE_KEYS):
+                # the scale and the scaled key are each rounded to bf16.
+                rtol = 1e-2 if layout == "folded" else 1e-4
+                np.testing.assert_allclose(scores[t, b], expected, rtol=rtol, atol=1e-3)
 
 
 @pytest.mark.parametrize("kernel", ["v2", "v3"])

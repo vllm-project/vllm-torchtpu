@@ -98,6 +98,12 @@ def _page_keys(page_ref) -> jax.Array:
     return _words_keys(words, page_ref.dtype)
 
 
+# Folded 4-bit pages: scale the keys (``[S, D]`` bf16, before the dot) rather
+# than the f32 scores (``[S, Bq]``, after it): fewer elements per page, the
+# same per-key scale (rounded to bf16 with the key, far finer than fp8 keys).
+SCALE_KEYS = True
+
+
 def _folded_keys(words: jax.Array) -> tuple[jax.Array, jax.Array]:
     """A 4-bit page with its scales folded in (`msa_fp4.scales_in_page`):
     ``[S / 8 + 1, D]`` words -> (unscaled bf16 keys ``[S, D]``, the per-slot
@@ -167,11 +173,14 @@ def _kernel_v2(
         else:
             keys = [_page_keys(r) for r in group]
         keys = keys[0] if len(keys) == 1 else jnp.concatenate(keys, axis=0)
+        col = _scale_rows_to_column([c for _, c in pairs]) if folded else None
+        if folded and SCALE_KEYS:
+            keys = keys * col.astype(jnp.bfloat16)
         s = jax.lax.dot_general(
             keys, q, (((1,), (1,)), ((), ())), preferred_element_type=jnp.float32
         )
-        if folded:
-            s = s * _scale_rows_to_column([c for _, c in pairs])
+        if folded and not SCALE_KEYS:
+            s = s * col
         elif scale_row is not None:
             cols = [
                 _scale_column(r[0], scale_row)
@@ -213,11 +222,14 @@ def _scores_v3(q, page_refs, o_ref, scale_refs=None, scale_row=None):
             else:
                 keys.append(_words_keys(words, r.dtype))
         keys = keys[0] if len(keys) == 1 else jnp.concatenate(keys, axis=0)
+        col = _scale_rows_to_column(cols) if folded else None
+        if folded and SCALE_KEYS:
+            keys = keys * col.astype(jnp.bfloat16)
         s = jax.lax.dot_general(
             keys, q, (((1,), (1,)), ((), ())), preferred_element_type=jnp.float32
         )
-        if folded:
-            s = s * _scale_rows_to_column(cols)
+        if folded and not SCALE_KEYS:
+            s = s * col
         elif scale_row is not None:
             cols = [
                 _scale_column(r[...], scale_row)
