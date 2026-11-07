@@ -47,7 +47,7 @@ def test_spec_imports_only_exec_spec_lazily_or_under_type_checking():
     for mod_obj, top_rel, all_rel in (
         (decls, set(), {"module"}),
         (module_mod, {"decls"}, {"decls", "exec_spec", "spec"}),
-        (spec_mod, {"decls", "module"}, {"decls", "module"}),
+        (spec_mod, {"decls", "module"}, {"decls", "module", "pool.config"}),
     ):
         path = Path(mod_obj.__file__)
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
@@ -211,3 +211,104 @@ def test_switch_slot_and_model_spec_all_modules():
         SwitchSlot("bad", branches=(a, b), branch_counts=(1,))
     with pytest.raises(AssertionError):
         SwitchSlot("bad_zero", branches=(a, b), branch_counts=(0, 0))
+
+
+def test_state_decl_role_and_compare_validation():
+    assert StateDecl("s", (4, 8), BF16).compare == "close"
+    assert StateDecl("tok", (4,), BF16, role="token").compare == "exact"
+    assert (
+        StateDecl("tok_none", (4,), BF16, role="token", compare="none").compare
+        == "none"
+    )
+    assert StateDecl("tap", (4, 8), F32, role="tap", compare="cos").compare == "cos"
+
+    with pytest.raises(ValueError, match="invalid role='bogus'"):
+        StateDecl("bad_role", (4,), BF16, role="bogus")  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="invalid compare='bogus'"):
+        StateDecl("bad_cmp", (4,), BF16, compare="bogus")  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="role='token' requires compare in"):
+        StateDecl("bad_tok_cmp", (4,), BF16, role="token", compare="close")
+
+
+def test_normalize_weight_dtypes_and_host_update_states_passthrough():
+    norm = decls.normalize_weight_dtypes(
+        {"w1": "bf16", "w2": "per_channel_fp8"}, ("w1", "w2", "w3"), "toy"
+    )
+    assert dict(norm) == {"w1": "bf16", "w2": "fp8", "w3": "fp8"}
+    assert dict(decls.normalize_weight_dtypes(None, ("w1",), "toy")) == {"w1": "fp8"}
+
+    with pytest.raises(ValueError, match="weight_dtypes must be a Mapping"):
+        decls.normalize_weight_dtypes(["w1"], ("w1",), "toy")
+    with pytest.raises(ValueError, match="unknown weight 'w_bad'"):
+        decls.normalize_weight_dtypes({"w_bad": "fp8"}, ("w1",), "toy")
+    with pytest.raises(
+        ValueError,
+        match=(
+            r"must be 'fp8' or 'bf16' \(or alias 'fp8_channel', "
+            r"'per_channel_fp8'\), got 'int8'"
+        ),
+    ):
+        decls.normalize_weight_dtypes({"w1": "int8"}, ("w1",), "toy")
+
+    class _OutModule(Module):
+        name = "out_mod"
+
+        def outputs(self, g, ex):
+            return [
+                StateDecl("out_a", (4, 8), F32, "w"),
+                StateDecl("out_b", (4, 8), F32, "w"),
+            ]
+
+    m = _OutModule()
+    ex = ExecSpec(B=4, T=1, R=2)
+    assert m.host_update_states(
+        None, ex, None, {}, {"out_a": "val_a", "other": "ignored"}
+    ) == {"out_a": "val_a"}
+
+
+def test_model_spec_with_layout_rebinds_plain_slot_and_switch_slot():
+    from vllm_torchtpu.megakernel.pool import PoolLayout, make_pool_backend
+
+    @dataclasses.dataclass(frozen=True)
+    class _LayoutModule(Module):
+        name: str = "layout_mod"
+        bound_layout: object = None
+
+        def with_cache_layout(self, layout):
+            return dataclasses.replace(self, bound_layout=layout)
+
+    class _PlainModule(Module):
+        name = "plain_mod"
+
+    lay1 = PoolLayout(
+        num_pools=2, slots_per_pool=1, hd=256, kvh=1, kh=2, vh=4, KD=128, VD=128
+    )
+    lay2 = dataclasses.replace(lay1, conv_dtype=F32)
+    pb1 = make_pool_backend(lay1)
+
+    m_sw = _LayoutModule(name="sw_layout_mod")
+    m_plain = _LayoutModule(name="plain_layout_mod")
+    sw = SwitchSlot("mixer", branches=(m_sw, _PlainModule()))
+    ms1 = ModelSpec(
+        name="rebind_model",
+        config=None,
+        layer_type=LayerType("l", slots=(sw, m_plain)),
+        cache_backend=pb1,
+    )
+    sw1 = ms1.layer_type.slots[0]
+    assert isinstance(sw1, SwitchSlot)
+    assert sw1.branches[0].bound_layout is lay1
+    assert ms1.layer_type.slots[1].bound_layout is lay1
+
+    ms2 = ms1.with_layout(lay2)
+    assert ms2.cache_backend.layout is lay2
+    sw2 = ms2.layer_type.slots[0]
+    assert isinstance(sw2, SwitchSlot)
+    assert sw2.branches[0].bound_layout is lay2
+    assert ms2.layer_type.slots[1].bound_layout is lay2
+
+    ms_no_cb = ModelSpec(
+        name="no_cb", config=None, layer_type=LayerType("l", slots=(_PlainModule(),))
+    )
+    with pytest.raises(ValueError, match="has no cache_backend"):
+        ms_no_cb.with_layout(lay2)

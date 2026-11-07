@@ -110,6 +110,14 @@ class RecurrentCacheDecl:
 
 
 @dataclass(frozen=True)
+class ParamInit:
+    """Declarative synthetic initialization parameters for an `HFParamDecl`."""
+
+    mean: float = 0.0
+    std: float = 0.05
+
+
+@dataclass(frozen=True)
 class ParamTransform:
     """Declarative transform rules for a canonical module parameter."""
 
@@ -129,6 +137,7 @@ class ParamTransform:
     channel_splits: tuple[int, ...] | None = None
     flatten_tail: bool = False
     expert_axis: int | None = None
+    small_field: str | None = None
 
     def __post_init__(self) -> None:
         if self.transpose is not None and (
@@ -154,7 +163,6 @@ class VLLMAlias:
     targets: tuple[str, ...]
     scale_targets: tuple[str, ...] = ()
     scale_source: str | None = None
-    router_scale_source: str | None = None
     shard_axis: int | None = None
     already_sharded: bool = True
     already_fp8: bool = True
@@ -177,6 +185,7 @@ class HFParamDecl:
     hf_shape: tuple[int, ...] | None = None
     transform: ParamTransform = ParamTransform()
     vllm_aliases: tuple[VLLMAlias, ...] = ()
+    init: ParamInit | None = None
 
     def __post_init__(self) -> None:
         perm = self.transform.transpose
@@ -412,3 +421,36 @@ class ModuleBinding:
 
     def cache_decl(self, hf_config: Any) -> KVCacheDecl | RecurrentCacheDecl | None:
         return self.resolve(hf_config).cache_decl()
+
+
+def normalize_weight_dtypes(
+    raw: Any,
+    allowed: Sequence[str],
+    module_name: str,
+    err_cls: type[Exception] = ValueError,
+) -> FrozenDict:
+    """Validate and normalize per-weight dtype policies (`'fp8' | 'bf16'`)."""
+    out = {k: "fp8" for k in allowed}
+    if raw is None:
+        return FrozenDict(out)
+    if not isinstance(raw, Mapping):
+        raise err_cls(
+            f"{module_name} weight_dtypes must be a Mapping, got {type(raw).__name__}"
+        )
+    allowed_set = set(allowed)
+    for k, v in raw.items():
+        if k not in allowed_set:
+            raise err_cls(
+                f"{module_name} weight_dtypes got unknown weight {k!r}; "
+                f"supported: {sorted(allowed_set)}"
+            )
+        if v in ("fp8", "fp8_channel", "per_channel_fp8"):
+            out[k] = "fp8"
+        elif v == "bf16":
+            out[k] = "bf16"
+        else:
+            raise err_cls(
+                f"{module_name} weight_dtypes[{k!r}] must be 'fp8' or 'bf16' "
+                f"(or alias 'fp8_channel', 'per_channel_fp8'), got {v!r}"
+            )
+    return FrozenDict(out)
