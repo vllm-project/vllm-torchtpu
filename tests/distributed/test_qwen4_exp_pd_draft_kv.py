@@ -306,3 +306,11 @@ def test_a_one_sided_draft_kv_flag_fails_the_peer_handshake(monkeypatch):
     assert producer_on == decode_on and producer_off == decode_off
     # ... and fail closed when only one does.
     assert producer_on != decode_off and producer_off != decode_on
+
+
+def test_flag_is_off_by_default_and_out_of_the_compile_key():
+    from vllm_torchtpu import envs
+    from vllm_torchtpu.compilation.tpu_compiler import _TPU_COMPILE_ENV_IGNORED
+
+    assert envs.environment_variables["QWEN4_EXP_PD_DRAFT_KV"]() is False
+    assert "QWEN4_EXP_PD_DRAFT_KV" in _TPU_COMPILE_ENV_IGNORED
