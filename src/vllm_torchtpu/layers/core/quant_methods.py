@@ -15,8 +15,12 @@ UNQUANTIZED = "unquantized"
 MXFP4 = "mxfp4"
 AWQ = "awq"
 FP8 = "fp8"
+# Upstream online-quantization shorthand. On TPU this is an alias of FP8:
+# load-time FP8 on TPU is always per-channel weight / dynamic activation.
 FP8_PER_CHANNEL = "fp8_per_channel"
-FP8_MOE = "fp8_moe"
+# Upstream "use --quantization-config" entry point. On TPU the resolved
+# QuantizationConfigArgs are translated onto VllmFp8Config.
+ONLINE = "online"
 COMPRESSED_TENSORS = "compressed-tensors"
 # vLLM's native detection name for ModelOpt NVFP4 checkpoints
 # (ModelOptNvFp4Config.get_name()).

@@ -468,6 +468,7 @@ class TpuPlatform(Platform):
         "modelopt_fp4",
         "deepseek_v4_fp8",
         "fp8_per_channel",
+        "online",
     ]
 
     additional_env_vars: list[str] = [
