@@ -238,7 +238,7 @@ class MiniMaxM3DSparkModel(Qwen3DSparkModel):
             k = _per_head_norm(k, attn.k_norm, attn.head_dim)
             k, _ = attn.rotary_emb(positions, k, None)
             impl = attn.attn.impl
-            if impl.sharded_draft_dcp is not None:
+            if getattr(impl, "sharded_draft_dcp", None) is not None:
                 # DCP-sharded draft KV (`cp_draft_attention`): owner ranks write.
                 impl.write_sharded_draft_kv(
                     attn.attn, k, v, attn.attn.kv_cache, layer_metadata
