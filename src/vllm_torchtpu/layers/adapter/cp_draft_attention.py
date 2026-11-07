@@ -48,6 +48,8 @@ from typing import Any
 import jax
 import jax.numpy as jnp
 import torch
+from jax.experimental import pallas as pl
+from jax.experimental.pallas import tpu as pltpu
 
 _NEG_INF = float("-inf")
 
@@ -114,6 +116,42 @@ def write_kv(
     return kv_cache.at[page, pos % page_size].set(rows, mode="drop")
 
 
+def gather_pages(kv_cache: jax.Array, pages: jax.Array, *, interpret: bool = False) -> jax.Array:
+    """``kv_cache[pages]`` for ``pages [R, L]`` by one page DMA per grid step.
+
+    An XLA gather of whole pages from the paged cache converts the cache's
+    layout on SparseCore on every call (~1 ms per draft layer at c16 DCP2,
+    scaling with the cache), so copy the pages with a Pallas kernel instead.
+    """
+    num_rows, num_cols = pages.shape
+    page_shape = kv_cache.shape[1:]
+    zeros = (0,) * len(page_shape)
+
+    def kernel(pages_ref, page_ref, o_ref):
+        del pages_ref
+        o_ref[0] = page_ref[...]
+
+    return pl.pallas_call(
+        kernel,
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=1,
+            grid=(num_rows, num_cols),
+            in_specs=[
+                pl.BlockSpec(
+                    (1, *page_shape),
+                    lambda r, c, pages_ref: (pages_ref[r * num_cols + c], *zeros),
+                )
+            ],
+            out_specs=pl.BlockSpec(
+                (1, 1, *page_shape), lambda r, c, pages_ref: (r, c, *zeros)
+            ),
+        ),
+        out_shape=jax.ShapeDtypeStruct((num_rows, num_cols, *page_shape), kv_cache.dtype),
+        interpret=interpret,
+        name="dcp_draft_gather_pages",
+    )(pages.reshape(-1).astype(jnp.int32), kv_cache)
+
+
 def _read_heads(pages: jax.Array, kv_heads: int, head_dim: int):
     """Gathered pages ``[..., S, 2G' / p, p, D]`` -> K, V ``[..., S, G, D]``."""
     shape = pages.shape
@@ -137,6 +175,7 @@ def attend_cached(
     rank: jax.Array,
     k_scale: float | None = None,
     v_scale: float | None = None,
+    interpret: bool = False,
 ) -> tuple[jax.Array, jax.Array]:
     """Partial attention of ``q [T, H, D]`` (every query head of the group,
     head ``i`` reading KV head ``i * G // H``) over the cached tokens of the
@@ -159,7 +198,7 @@ def attend_cached(
     first_mine = first + (rank - first) % dcp
     blocks = first_mine[:, None] + dcp * jnp.arange(local_blocks)[None, :]  # [R, L]
     pages = tables[jnp.arange(max_seqs)[:, None], jnp.minimum(blocks // dcp, tables.shape[1] - 1)]
-    k, v = _read_heads(kv_cache[pages], kv_heads, head_dim)  # [R, L, S, G, D]
+    k, v = _read_heads(gather_pages(kv_cache, pages, interpret=interpret), kv_heads, head_dim)
     k = k.reshape(max_seqs, -1, kv_heads, head_dim).astype(jnp.float32)
     v = v.reshape(max_seqs, -1, kv_heads, head_dim).astype(jnp.float32)
     if k_scale is not None:

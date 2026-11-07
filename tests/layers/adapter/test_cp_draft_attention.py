@@ -119,6 +119,7 @@ def test_sharded_matches_replicated(dcp, kv_heads, q_heads, dtype, causal):
             q, cache_r, jnp.asarray(total), tables.reshape(-1), cu_q,
             kv_heads=kv_heads, max_query_len=max_q, sliding_window=WINDOW,
             sm_scale=sm_scale, dcp=dcp, rank=jnp.int32(r), k_scale=scale, v_scale=scale,
+            interpret=True,
         )
         outs.append(o)
         lses.append(l)
@@ -175,3 +176,23 @@ def test_write_kv_keeps_only_owned_blocks():
         else:  # global block 1 -> page 1 (logical block 0 of rank 1)
             assert written[1].all() and not written[2].any()
         assert not written[0].any()
+
+
+def test_gather_pages_lowers_for_tpu():
+    from jax.sharding import AbstractDevice, AbstractMesh, use_abstract_mesh
+
+    tpu7x = AbstractMesh((), (), (), abstract_device=AbstractDevice("TPU7x", 1, "tpu"))
+    args = (
+        jax.ShapeDtypeStruct((4096, PAGE, 2, 4, HEAD_DIM), jnp.float8_e4m3fn),
+        jax.ShapeDtypeStruct((64, 6), jnp.int32),
+    )
+    with use_abstract_mesh(tpu7x):
+        lowered = jax.jit(cda.gather_pages).trace(*args).lower(lowering_platforms=("tpu",))
+    assert "tpu_custom_call" in lowered.as_text()
+
+
+def test_gather_pages_matches_take():
+    rng = np.random.default_rng(9)
+    cache = jnp.asarray(rng.standard_normal((10, PAGE, 1, 2, HEAD_DIM)), jnp.bfloat16)
+    pages = jnp.asarray(rng.integers(0, 10, (3, 4)), jnp.int32)
+    np.testing.assert_array_equal(cda.gather_pages(cache, pages, interpret=True), cache[pages])
