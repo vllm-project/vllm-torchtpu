@@ -74,17 +74,26 @@ def write_hosts(root):
                 }
             )
         )
-    from check_repetition import ATTEMPTS, MAX_TOKENS, REQUEST_SHA256
+    from check_repetition import (
+        ATTEMPTS,
+        MAX_TOKENS,
+        REQUEST_SHA256,
+        digest,
+    )
 
     repetition = root / "benchmark/repetition"
     repetition.mkdir()
+    (repetition / "evidence.tar.gz").write_bytes(b"test evidence archive")
     (repetition / "summary.json").write_text(
         json.dumps(
             {
                 "status": "passed",
                 "request_sha256": REQUEST_SHA256,
                 "max_tokens": MAX_TOKENS,
-                "evidence_uploaded": True,
+                "prompt_tokens": 332447,
+                "expected_prompt_tokens": 332447,
+                "archive_file": "evidence.tar.gz",
+                "archive_sha256": digest(b"test evidence archive"),
                 "attempts": [{"status": "passed"}] * ATTEMPTS,
             }
         )
@@ -463,13 +472,15 @@ def test_head_rejects_a_second_worker_after_launch(tmp_path):
 
 
 @pytest.mark.parametrize(
-    "invalid", ["missing", "failure", "partial", "archive", "reset"]
+    "invalid", ["missing", "failure", "partial", "archive", "missing_archive", "reset"]
 )
 def test_repetition_failure_cannot_publish_passing_ci(tmp_path, invalid):
     write_hosts(tmp_path)
     path = tmp_path / "benchmark/repetition/summary.json"
     if invalid == "missing":
         path.unlink()
+    elif invalid == "missing_archive":
+        (path.parent / "evidence.tar.gz").unlink()
     elif invalid == "reset":
         (path.parent / "final-reset.json").write_text('{"success": false}')
     else:
@@ -479,7 +490,7 @@ def test_repetition_failure_cannot_publish_passing_ci(tmp_path, invalid):
         elif invalid == "partial":
             data["attempts"].pop()
         else:
-            data["evidence_uploaded"] = False
+            (path.parent / "evidence.tar.gz").write_bytes(b"corrupted")
         path.write_text(json.dumps(data))
     with pytest.raises((ValueError, OSError)):
         audit(tmp_path)

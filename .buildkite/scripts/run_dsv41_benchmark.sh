@@ -75,9 +75,9 @@ if [[ "${DSV41_HOST_RANK:-0}" == 0 ]]; then
     --tokenizer "$MODEL_PATH" --out "$results/inputs.json"
   sha256sum "$results/inputs.json" > "$results/input.sha256"
   if [[ "$scenario" == decode_dp16 ]]; then
-    # Private fixture and evidence access must work before the two-host serve.
+    # Verify the repository fixture before the two-host serve; no Falcon GCS access.
     python scripts/dsv41_bench/server_steps/check_repetition.py prepare \
-      --out "$scratch/deepswe"
+      --tokenizer "$MODEL_PATH" --out "$scratch/deepswe"
     launch_args+=(--repetition-request "$scratch/deepswe/request.json")
   fi
 fi

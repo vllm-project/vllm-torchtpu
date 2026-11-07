@@ -22,32 +22,37 @@ No production numerical fix is claimed.
 
 The `dsv41_flash_dp16_c768_decode` Buildkite step now runs, in order:
 
-1. Before the two-host serve, download the immutable private fixture, verify its
-   SHA256, and verify write access to the private evidence destination. Missing
-   data or access fails the job; the regression is never silently skipped.
+1. Before the two-host serve, decompress the repository fixture, verify both
+   compressed and request SHA256, and tokenize locally with the mounted V4.1
+   checkpoint. Missing or changed data fails the job; no Falcon bucket is used.
 2. Start the existing decode-benchmark serve once, run its original C768 formal
    performance measurement, and keep both hosts alive.
 3. Drain/reset all 16 engines, then issue up to **five serial** seq201 requests.
-   Each performs the full 332,523-token prefill plus bounded decode. Reset
+   Each performs the full roughly 332K-token prefill plus bounded decode. Reset
    between requests and after the suite. Never execute generated tool calls.
 4. Stop sending requests on the first sustained-loop candidate, HTTP/protocol
-   failure, deadline or unsuccessful drain/reset. Archive evidence privately;
+   failure, deadline or unsuccessful drain/reset. Archive evidence under the
+   existing `perf_eval_results` Buildkite artifact mount;
    then stop both hosts through the existing coordinator. The final CI audit
-   requires all five checks, successful resets and a successful evidence upload.
+   requires all five checks, successful resets and the local archive SHA256.
+   Buildkite then uploads that archive through its existing artifact collection.
 
 The implementation is
 [`check_repetition.py`](../../scripts/dsv41_bench/server_steps/check_repetition.py).
 It changes only the fixture's served-model alias, `stream=true`, and
 `max_tokens=8192`. Temperature 1, top-p 0.95 and the absence of a seed are retained.
-The original fixture SHA is fixed; every effective request and received SSE
-body has its own recorded SHA. `/tokenize` must still report 332,523 tokens.
+The redacted fixture SHA is fixed; every effective request and received SSE
+body has its own recorded SHA. The exact token count is computed with the CI
+checkpoint before serve, recorded with both tokenizer file hashes, and must
+match the service's `/tokenize` result. It must also lie in 332,000–333,000: the
+redaction changes tokenization slightly, but must not shorten the long prefill.
 
 | Setting | Regression policy |
 | --- | --- |
 | Attempts | 5 serial requests, no retries or extra samples |
 | Per-request bound | 300 seconds wall time, including prefill, and 8,192 generated tokens |
 | Drain/reset | 60 seconds each; all 16 engines must be idle; no forced cancellation |
-| Whole checker | 2,100 seconds, including resets and private archive upload |
+| Whole checker | 2,100 seconds, including resets and local evidence archiving |
 | Loop detection | 1–256 word periods, at least 8 repeats/32 words; unseparated character loops; sustained punctuation loops |
 | Valid bounded result | Supported finish reason plus `[DONE]`, no detected loop, valid complete tool JSON where applicable |
 | Failure classification | A loop fails the regression; HTTP, malformed/incomplete SSE, timeout, identity mismatch or reset failure is inconclusive and also fails CI |
@@ -56,7 +61,7 @@ Five attempts reflect the observed third-request failures in the adjacent,
 restored and instrumented sessions. Normal historical completions took roughly
 37–254 seconds, so 300 seconds retains that observed range. Five full time
 budgets are 25 minutes; normal early completions shorten this. The checker has
-35 minutes total including reset/upload overhead. Neither an additional
+35 minutes total including reset/archive overhead. Neither an additional
 30–40 minutes nor the entire CI wall time is guaranteed: loading, compilation,
 the formal benchmark and the existing job deadline still apply.
 
@@ -80,20 +85,32 @@ later-onset failures remain outside its coverage.
 
 ### Fixture access and artifacts
 
-The original request and generated text contain a full agent trajectory and
-remain in the existing private Falcon evidence bucket. The CI helper uses a
-fixed object URI and SHA; it does not change ACLs or publish the fixture. The
-Buildkite service account needs read access to that object and write access to
-the dedicated `ci-replays/deepswe/` prefix. This patch has not verified those
-permissions from the CI identity. The pre-serve access check deliberately fails
-if provisioning is incomplete.
+The fixture is included as
+[`oxvg-seq201.json.gz`](../../scripts/dsv41_bench/fixtures/oxvg-seq201.json.gz),
+with a [manifest](../../scripts/dsv41_bench/fixtures/oxvg-seq201.manifest.json).
+It decompresses to 1,737,362 bytes / 402 messages. Four proxy URL userinfo fields
+in message 117 are replaced with `redacted:redacted`; all other request bytes
+are retained. This public variant has SHA256
+`4feb222f1577a2da266691824150c7575793ce2d9af41d93abbaad7c12acb971`.
+It is not byte-identical to the historical request, and its ability to reproduce
+the historical failure must be established separately. No unredacted fixture or
+credential is included. See the [fixture README](../../scripts/dsv41_bench/fixtures/README.md).
 
-Raw request, effective request, exact received SSE body, reconstructed
-reasoning/content/tool arguments and capture stderr are uploaded in a private
-archive. Public `perf_eval_results` contains only timings, hashes, loop kind,
-period/count, finish reasons and engine/reset receipts. The serve uses
-`--max-log-len 0` so request logging does not expose the private prompt. Review
-private text on a red check before calling a detector candidate a model defect.
+Fixture preparation and result archiving need no private Falcon GCS access.
+The existing model-weight mount and LongBench benchmark input are unchanged.
+The helper writes `benchmark/repetition/evidence.tar.gz`, its SHA256 in
+`summary.json`, and `evidence-files.json` with every archived file's byte length
+and SHA256. The archive includes the redacted input, effective requests, exact
+SSE, reconstructed reasoning/content/tool arguments, capture stderr, summaries
+and reset receipts. It is retained on checker failures as well as passes and
+uploaded by the existing `perf_eval_results/**/*` Buildkite artifact rule.
+The archived summary precedes computation of the archive's own hash; the
+adjacent final summary records that hash. Local archive validation does not
+claim an upload has already occurred: confirm Buildkite artifacts after the job.
+
+The serve uses `--max-log-len 0` to avoid flooding server logs with the prompt.
+Review the complete archived output on a red check before calling a detector
+candidate a model defect. Generated tool calls are data and are never executed.
 
 CPU tests exercise malformed/fragmented SSE, tool assembly, the three loop
 families, long word periods, first-failure stopping, the five-request cap,
@@ -163,13 +180,11 @@ original JSON has no `stream` field. The replay changes only `stream=true`.
 The prompt token count is from the recorded service; identical text with a
 different tokenizer or chat template is a different experiment.
 
-**The raw request and generated trajectory are not included in this PR.**
-They contain a full agent conversation and require a redistribution review.
-Contributors who already have an approved copy can use the hashes below.
-The shared CI above reads the existing private object with an explicit access
-preflight; outside that environment, obtain authorized access before claiming
-an exact reproduction. A hash does not make the case self-contained. Never
-upload credentials or unreviewed agent traces into public CI artifacts.
+The identities below describe the **historical unredacted experiment**, not
+this PR's public CI fixture. CI uses the credential-redacted variant described
+above. The unredacted request and old generated trajectories remain outside
+the repository; their hashes retain the provenance of the causal experiments.
+Do not treat the public variant's first CI result as a rerun of those exact bytes.
 
 | Input | SHA256 |
 | --- | --- |
@@ -263,7 +278,7 @@ Record actual argv, relevant environment, source HEAD and tracked diff, installe
 runtime, checkpoint metadata and startup logs on **both** hosts. The headless
 worker does not expose an independent port-8000 health endpoint.
 
-## Replay protocol
+## Historical replay protocol
 
 Use the head's root URL as `SERVER_URL`, without `/v1`. Do not replay on a
 shared service: resetting its prefix cache would affect other users.
@@ -373,8 +388,9 @@ launches as separate records with **zero requests**, never as quality failures.
 
 For public discussion, attach a reviewed summary with source/runtime identity,
 request hash, full versus partial completion, request index, loop evidence and
-artifact checksums. Keep the raw trace in an approved location until it is
-cleared for redistribution. Distinguish new measurements from this snapshot.
+artifact checksums. This PR publishes only the reviewed, credential-redacted
+fixture and its new CI outputs. Other historical raw traces require a separate
+review before redistribution. Distinguish new measurements from this snapshot.
 
 ## Remaining kernel investigation
 

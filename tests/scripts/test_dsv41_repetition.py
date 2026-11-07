@@ -1,10 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 """CPU tests for bounded replay, loop detection and failure evidence."""
 
+import gzip
 import json
+import re
 import signal
 import subprocess
 import sys
+import tarfile
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -16,6 +19,7 @@ sys.path.insert(
 import check_repetition as check  # noqa: E402
 
 pytestmark = pytest.mark.cpu_test
+TEST_PROMPT_TOKENS = 332447
 
 
 @pytest.mark.parametrize(
@@ -179,9 +183,9 @@ def test_reset_never_forces_running_requests(tmp_path, monkeypatch):
 
 
 def fixture(tmp_path, monkeypatch):
-    private = tmp_path / "private"
-    private.mkdir()
-    path = private / "request.json"
+    replay = tmp_path / "replay"
+    replay.mkdir()
+    path = replay / "request.json"
     path.write_text(
         json.dumps(
             {
@@ -195,7 +199,11 @@ def fixture(tmp_path, monkeypatch):
     )
     monkeypatch.setattr(check, "REQUEST_SHA256", check.digest(path.read_bytes()))
     check.write_json(
-        private / "provenance.json", {"evidence_uri": "gs://private/unit-test"}
+        replay / "provenance.json",
+        {
+            "request_sha256": check.REQUEST_SHA256,
+            "expected_prompt_tokens": TEST_PROMPT_TOKENS,
+        },
     )
     return path
 
@@ -227,11 +235,10 @@ def test_suite_runs_at_most_five_and_stops_on_first_failure(
         lambda *a, **kw: response({"data": [{"max_model_len": 524288}]}),
     )
     monkeypatch.setattr(
-        check.requests, "post", lambda *a, **kw: response({"count": 332523})
+        check.requests, "post", lambda *a, **kw: response({"count": TEST_PROMPT_TOKENS})
     )
-    resets, uploads, launches, signals = [], [], [], []
+    resets, launches, signals = [], [], []
     monkeypatch.setattr(check, "reset", lambda path: resets.append(path.name))
-    monkeypatch.setattr(check, "gcs_copy", lambda *args: uploads.append(args))
 
     class Process:
         returncode = 0
@@ -268,8 +275,21 @@ def test_suite_runs_at_most_five_and_stops_on_first_failure(
         *(f"reset-{i}.json" for i in range(1, expected + 1)),
         "final-reset.json",
     ]
-    assert len(uploads) == 1 and uploads[0][1].endswith("evidence.tar.gz")
+    archive = tmp_path / "out/evidence.tar.gz"
+    assert archive.is_file()
+    with tarfile.open(archive) as bundle:
+        manifest = json.load(bundle.extractfile("evidence-files.json"))
+        assert "replay/request.json" in manifest
+        assert "summary/summary.json" in manifest
+        assert (
+            len([name for name in manifest if name.endswith("result.json")]) == expected
+        )
+        for name, identity in manifest.items():
+            raw = bundle.extractfile(name).read()
+            assert {"bytes": len(raw), "sha256": check.digest(raw)} == identity
     report = json.loads((tmp_path / "out/summary.json").read_text())
+    assert report["archive_sha256"] == check.digest(archive.read_bytes())
+    assert report["archive_file"] == "evidence.tar.gz"
     assert len(report["attempts"]) == expected
     assert report["status"] == (
         "passed"
@@ -362,11 +382,10 @@ def test_identity_failure_stops_before_first_generation(tmp_path, monkeypatch, i
         check.requests,
         "post",
         lambda *a, **kw: response(
-            {"count": 100 if invalid == "token_count" else 332523}
+            {"count": 100 if invalid == "token_count" else TEST_PROMPT_TOKENS}
         ),
     )
     monkeypatch.setattr(check, "reset", lambda path: None)
-    monkeypatch.setattr(check, "gcs_copy", lambda *args: None)
     monkeypatch.setattr(
         check.subprocess, "Popen", lambda *a, **kw: pytest.fail("must not generate")
     )
@@ -374,3 +393,106 @@ def test_identity_failure_stops_before_first_generation(tmp_path, monkeypatch, i
         check.run_suite(path, tmp_path / "out")
     report = json.loads((tmp_path / "out/summary.json").read_text())
     assert report["status"] == "inconclusive" and not report["attempts"]
+
+
+def test_bundled_fixture_prepares_without_network_or_cloud_tools(tmp_path, monkeypatch):
+    def forbidden(*args, **kwargs):
+        pytest.fail("Bundled fixture preparation must not use the network or CLI")
+
+    monkeypatch.setattr(check.subprocess, "run", forbidden)
+    monkeypatch.setattr(check.requests, "get", forbidden)
+    monkeypatch.setattr(check.requests, "post", forbidden)
+    monkeypatch.setattr(
+        check,
+        "tokenize_fixture",
+        lambda payload, model: {"expected_prompt_tokens": TEST_PROMPT_TOKENS},
+    )
+    path = check.prepare(tmp_path / "replay", tmp_path / "model")
+    manifest = json.loads(
+        check.FIXTURE.with_name("oxvg-seq201.manifest.json").read_text()
+    )
+    raw = path.read_bytes()
+    assert len(raw) == manifest["request_bytes"]
+    assert check.digest(raw) == manifest["request_sha256"] == check.REQUEST_SHA256
+    assert manifest["prompt_token_range"] == list(check.PROMPT_TOKEN_RANGE)
+    assert manifest["gzip_sha256"] == check.FIXTURE_SHA256
+    assert check.FIXTURE.stat().st_size == manifest["gzip_bytes"]
+    request = json.loads(raw)
+    assert len(request["messages"]) == 402
+    assert len(request["tools"]) == 1
+    assert request["reasoning_effort"] == "max"
+    userinfos = re.findall(rb"https?://([^\s/\"<>:@]+:[^\s/\"<>@]+)@", raw)
+    assert userinfos == [b"redacted:redacted"] * 4
+    provenance = json.loads((path.parent / "provenance.json").read_text())
+    assert provenance["effective_request_sha256"] == check.digest(
+        json.dumps(check.load_request(path), ensure_ascii=False).encode()
+    )
+
+
+@pytest.mark.parametrize("invalid", ["gzip", "request", "sampling"])
+def test_invalid_bundled_fixture_fails_before_serve(tmp_path, monkeypatch, invalid):
+    raw = gzip.decompress(check.FIXTURE.read_bytes())
+    if invalid == "request":
+        raw += b" "
+    elif invalid == "sampling":
+        request = json.loads(raw)
+        request["seed"] = 1
+        raw = json.dumps(request).encode()
+        monkeypatch.setattr(check, "REQUEST_SHA256", check.digest(raw))
+    compressed = gzip.compress(raw, mtime=0)
+    path = tmp_path / "fixture.json.gz"
+    path.write_bytes(compressed)
+    monkeypatch.setattr(check, "FIXTURE", path)
+    if invalid != "gzip":
+        monkeypatch.setattr(check, "FIXTURE_SHA256", check.digest(compressed))
+    else:
+        path.write_bytes(compressed + b"corrupted")
+    with pytest.raises(ValueError, match="SHA256|sampling"):
+        check.prepare(tmp_path / "prepared", tmp_path / "model")
+
+
+@pytest.mark.parametrize("count", [332451, 224000, 400000])
+def test_prepare_uses_local_v41_tokenizer_and_preserves_full_input(
+    tmp_path, monkeypatch, count
+):
+    module = SimpleNamespace()
+    calls = []
+
+    class Tokenizer:
+        @classmethod
+        def from_pretrained(cls, path, **kwargs):
+            assert path == tmp_path and kwargs == {"local_files_only": True}
+            return cls()
+
+        def apply_chat_template(self, messages, **kwargs):
+            calls.append((messages, kwargs))
+            return range(count)
+
+    module.DeepseekV41Tokenizer = Tokenizer
+    monkeypatch.setitem(sys.modules, "vllm.tokenizers.deepseek_v41", module)
+    for name in ("tokenizer.json", "tokenizer_config.json"):
+        (tmp_path / name).write_text("test tokenizer")
+    payload = {
+        "messages": [{"role": "user", "content": "input"}],
+        "tools": [],
+        "reasoning_effort": "max",
+    }
+    if count != 332451:
+        with pytest.raises(ValueError, match="332K prefill range"):
+            check.tokenize_fixture(payload, tmp_path)
+        return
+    result = check.tokenize_fixture(payload, tmp_path)
+    assert result["expected_prompt_tokens"] == count
+    assert result["tokenizer_sha256"]["tokenizer.json"] == check.digest(
+        b"test tokenizer"
+    )
+    assert calls == [
+        (
+            payload["messages"],
+            {
+                "tools": [],
+                "reasoning_effort": "max",
+                "tokenize": True,
+            },
+        )
+    ]

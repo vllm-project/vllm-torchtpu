@@ -2,6 +2,7 @@
 """Bounded serial DeepSWE checks on the DP16 benchmark's existing server."""
 
 import argparse
+import gzip
 import hashlib
 import json
 import math
@@ -11,19 +12,15 @@ import subprocess
 import sys
 import tarfile
 import time
-import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 
 import requests
 
-REQUEST_SHA256 = "45871ebc0e5c9adb23e877b82bb605749a0124c3bd4b5f998412ee6e2adb4f1f"
-FIXTURE_URI = (
-    "gs://tpu-for-training-falcon-logs/experiments/exp-8243e2um0p/"
-    "artifacts/art-ainhcr1xnw/seq201-ab/run-01/capture/original-request.json"
-)
-EVIDENCE_ROOT = "gs://tpu-for-training-falcon-logs/ci-replays/deepswe"
-PROMPT_TOKENS = 332523
+REQUEST_SHA256 = "4feb222f1577a2da266691824150c7575793ce2d9af41d93abbaad7c12acb971"
+FIXTURE = Path(__file__).resolve().parents[1] / "fixtures/oxvg-seq201.json.gz"
+FIXTURE_SHA256 = "fe425b3f00a899388b3aa463df9a22461fa9a7e23eafdefc98bccb48f53654d2"
+PROMPT_TOKEN_RANGE = (332000, 333000)
 MODEL_WINDOW = 524288
 ATTEMPTS = 5
 MAX_TOKENS = 8192
@@ -60,35 +57,72 @@ def load_request(path: Path) -> dict:
     }
 
 
-def gcs_copy(source: str, destination: str) -> None:
-    subprocess.run(
-        ["gcloud", "storage", "cp", source, destination],
-        check=True,
-        capture_output=True,
-        timeout=120,
+def tokenize_fixture(payload: dict, model: Path) -> dict:
+    """Compute the redacted prompt's exact count using CI's mounted checkpoint."""
+    from vllm.tokenizers.deepseek_v41 import DeepseekV41Tokenizer
+
+    identities = {
+        name: digest((model / name).read_bytes())
+        for name in ("tokenizer.json", "tokenizer_config.json")
+    }
+    tokenizer = DeepseekV41Tokenizer.from_pretrained(model, local_files_only=True)
+    tokens = tokenizer.apply_chat_template(
+        payload["messages"],
+        tools=payload["tools"],
+        reasoning_effort=payload["reasoning_effort"],
+        tokenize=True,
     )
+    count = len(tokens)
+    if not PROMPT_TOKEN_RANGE[0] <= count <= PROMPT_TOKEN_RANGE[1]:
+        raise ValueError(f"Bundled fixture is outside the 332K prefill range: {count}")
+    return {"expected_prompt_tokens": count, "tokenizer_sha256": identities}
 
 
-def prepare(directory: Path) -> Path:
-    """Check fixture/read and private evidence/write access before launching TPU."""
+def prepare(directory: Path, tokenizer: Path) -> Path:
+    """Validate the bundled, credential-redacted fixture before launching TPU."""
+    compressed = FIXTURE.read_bytes()
+    if digest(compressed) != FIXTURE_SHA256:
+        raise ValueError("DeepSWE compressed fixture SHA256 mismatch")
     directory.mkdir(parents=True, exist_ok=False)
     request = directory / "request.json"
-    gcs_copy(FIXTURE_URI, str(request))
+    request.write_bytes(gzip.decompress(compressed))
     effective = load_request(request)
-    evidence_uri = f"{EVIDENCE_ROOT}/{uuid.uuid4()}"
     write_json(
         directory / "provenance.json",
         {
             "request_sha256": REQUEST_SHA256,
-            "fixture_uri": FIXTURE_URI,
+            "fixture": FIXTURE.name,
+            "fixture_sha256": FIXTURE_SHA256,
+            **tokenize_fixture(effective, tokenizer),
             "effective_request_sha256": digest(
                 json.dumps(effective, ensure_ascii=False).encode()
             ),
-            "evidence_uri": evidence_uri,
         },
     )
-    gcs_copy(str(directory / "provenance.json"), f"{evidence_uri}/provenance.json")
     return request
+
+
+def archive_evidence(replay: Path, out: Path) -> Path:
+    """Keep raw evidence in the existing Buildkite artifact mount, even on failure."""
+    archive = out / "evidence.tar.gz"
+    manifest = out / "evidence-files.json"
+    files = {}
+    for root, prefix in ((replay, "replay"), (out, "summary")):
+        for path in sorted(root.rglob("*")):
+            if path.is_file() and path not in (archive, manifest):
+                files[f"{prefix}/{path.relative_to(root)}"] = path
+    write_json(
+        manifest,
+        {
+            name: {"bytes": path.stat().st_size, "sha256": digest(path.read_bytes())}
+            for name, path in files.items()
+        },
+    )
+    with tarfile.open(archive, "w:gz") as bundle:
+        for name, path in files.items():
+            bundle.add(path, arcname=name)
+        bundle.add(manifest, arcname="evidence-files.json")
+    return archive
 
 
 def repetition(text: str) -> dict | None:
@@ -328,8 +362,8 @@ def reset(directory: Path, engines: int = 16) -> None:
 
 
 def run_suite(request: Path, out: Path) -> None:
-    private = request.parent
-    provenance = json.loads((private / "provenance.json").read_text())
+    replay = request.parent
+    provenance = json.loads((replay / "provenance.json").read_text())
     result = {
         **provenance,
         "status": "inconclusive",
@@ -347,12 +381,17 @@ def run_suite(request: Path, out: Path) -> None:
             raise ValueError("Repetition check requires the 512K service window")
         tokenized = requests.post(ROOT + "/tokenize", json=payload, timeout=60)
         tokenized.raise_for_status()
-        if tokenized.json()["count"] != PROMPT_TOKENS:
+        result["prompt_tokens"] = tokenized.json()["count"]
+        expected = provenance["expected_prompt_tokens"]
+        if (
+            not PROMPT_TOKEN_RANGE[0] <= expected <= PROMPT_TOKEN_RANGE[1]
+            or result["prompt_tokens"] != expected
+        ):
             raise ValueError("Frozen prompt token count changed")
         for index in range(1, ATTEMPTS + 1):
             reset(out / f"reset-{index}.json")
-            directory = private / f"run-{index}"
-            with (private / f"capture-{index}.log").open("w") as log:
+            directory = replay / f"run-{index}"
+            with (replay / f"capture-{index}.log").open("w") as log:
                 process = subprocess.Popen(
                     [
                         sys.executable,
@@ -407,18 +446,12 @@ def run_suite(request: Path, out: Path) -> None:
             raise
         finally:
             result["finished_at"] = time.time()
-            # Public artifacts contain only metadata; raw prompts and model/tool
-            # text go to the same private bucket as the original trajectory.
+            # This snapshot is archived before adding the archive's own hash.
             write_json(out / "summary.json", result)
-            archive = private.parent / "deepswe-evidence.tar.gz"
-            with tarfile.open(archive, "w:gz") as bundle:
-                bundle.add(private, arcname="replay")
-                bundle.add(out, arcname="summary")
-            result["archive_sha256"] = digest(archive.read_bytes())
-            result["archive_uri"] = f"{provenance['evidence_uri']}/evidence.tar.gz"
             try:
-                gcs_copy(str(archive), result["archive_uri"])
-                result["evidence_uploaded"] = True
+                archive = archive_evidence(replay, out)
+                result["archive_sha256"] = digest(archive.read_bytes())
+                result["archive_file"] = archive.name
             finally:
                 write_json(out / "summary.json", result)
 
@@ -427,10 +460,13 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("action", choices=("prepare", "capture", "check"))
     parser.add_argument("--request", type=Path)
+    parser.add_argument("--tokenizer", type=Path)
     parser.add_argument("--out", type=Path, required=True)
     args = parser.parse_args()
     if args.action == "prepare":
-        prepare(args.out)
+        if args.tokenizer is None:
+            parser.error("--tokenizer is required for prepare")
+        prepare(args.out, args.tokenizer)
     elif args.request is None:
         parser.error("--request is required for capture/check")
     elif args.action == "capture":
