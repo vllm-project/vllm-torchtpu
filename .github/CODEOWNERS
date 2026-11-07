@@ -188,11 +188,11 @@
 /tests/structured_decoding/ @maxwillzq @silkyarora
 
 # Multi-LoRA
-/src/vllm_torchtpu/lora/ @vanbasten23 @haotianxue-google
-/tests/lora/ @vanbasten23 @haotianxue-google
+/src/vllm_torchtpu/lora/ @aman2930 @haotianxue-google
+/tests/lora/ @aman2930 @haotianxue-google
 
 # Omni & Diffusion Support
-/src/vllm_torchtpu/omni/ @mbohlool @pi314ever @chandrasekhard2
+/src/vllm_torchtpu/omni/ @mbohlool @pi314ever @chandrasekhard2 @yixinshi
 /tests_omni/ @mbohlool @pi314ever @chandrasekhard2
 
 # Experimental Model Export
