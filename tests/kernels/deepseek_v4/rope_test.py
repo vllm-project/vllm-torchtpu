@@ -155,6 +155,43 @@ class RopeTest(parameterized.TestCase):
         )
         np.testing.assert_array_equal(actual[..., :-ROTARY_DIM], x[..., :-ROTARY_DIM])
 
+    # tile_n is capped at 128, so >= 384 tokens means >= 3 tiles: the first
+    # point where the pipeline reuses a VMEM slot that already held a written-
+    # back tile. The cases above top out at 2 tiles and never reach it.
+    @parameterized.product(
+        num_tokens=(384, 2048),
+        dtype=(np.float32, jnp.bfloat16),
+    )
+    def test_matches_reference_many_tiles(self, num_tokens, dtype):
+        actual, expected = self._run(
+            (num_tokens, NUM_HEADS, HEAD_DIM), num_tokens, False, dtype
+        )
+        tol = 1e-6 if dtype == np.float32 else 1e-2
+        np.testing.assert_allclose(
+            actual.astype(np.float32),
+            np.asarray(expected).astype(np.float32),
+            rtol=tol,
+            atol=tol,
+        )
+
+    def test_deterministic_across_runs(self):
+        """Same input, many runs, bit-identical output.
+
+        A slot-reuse race between the input prefetch and an in-flight output
+        DMA is timing dependent; a single run can pass by luck.
+        """
+        num_tokens, num_runs = 2048, 32  # 16 tiles
+        rng = np.random.default_rng(11)
+        x = rng.normal(size=(num_tokens, NUM_HEADS, HEAD_DIM)).astype(jnp.bfloat16)
+        positions = rng.integers(0, 4096, size=(num_tokens,)).astype(np.int32)
+        cos_sin_cache = jnp.asarray(make_cos_sin_cache(4096, ROTARY_DIM))
+        positions = jnp.asarray(positions)
+
+        # ``x`` is donated, so every run gets a fresh device copy.
+        first = np.asarray(rope(jnp.asarray(x), positions, cos_sin_cache))
+        for _ in range(num_runs - 1):
+            assert_bits_equal(rope(jnp.asarray(x), positions, cos_sin_cache), first)
+
 
 class RopeQuantTest(parameterized.TestCase):
     """RoPE fused with the indexer's per-row fp8 quantization."""
