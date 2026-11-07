@@ -56,7 +56,7 @@ def item_front(cx: GQAEmit, kv: KVRing, col: Any, col_v: Any, i: Any) -> Any:
             k_u32 = kvbuf.at[s, 0].bitcast(U32).reshape(HD // 4, BLK)[...]
             v_u32 = kvbuf.at[s, 1].bitcast(U32).reshape(HD // 4, BLK)[...]
         k_full = pltpu.bitcast(k_u32, FP8)
-        if AMASK in (0, 3, 4):
+        if AMASK == 0:
             v_full = pltpu.bitcast(v_u32, FP8)
     outs = []
     for j in range(BLK // SUB):
@@ -89,9 +89,9 @@ def item_front(cx: GQAEmit, kv: KVRing, col: Any, col_v: Any, i: Any) -> Any:
             vj = vbuf[s] if SUB == BLK else vbuf[s, j * SUB : (j + 1) * SUB]
             if AMASK == 0:
                 vj = jnp.where(col_v + off < plen, vj, jnp.zeros_like(vj))
-            elif AMASK == 1:
+            elif AMASK in (1, 4):
                 vj = jnp.where(col_v < rem, vj, jnp.zeros_like(vj))
-            elif AMASK == 2:
+            else:
                 vj = lax.cond(
                     full_blk,
                     lambda v_val=vj: v_val,
@@ -142,7 +142,7 @@ def att_core(cx: GQAEmit, kv: KVRing) -> None:
             if (cache_exec(ex).paged_kv and AMASK == 0)
             else (
                 lax.broadcasted_iota(I32, (SUB, 1), 0)
-                if (not cache_exec(ex).paged_kv and AMASK in (0, 1, 2))
+                if not cache_exec(ex).paged_kv
                 else None
             )
         )

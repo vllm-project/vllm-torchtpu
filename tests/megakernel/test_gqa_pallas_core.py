@@ -129,7 +129,7 @@ class _FakeCorePlan:
 
 
 def test_gqa_staging_gqa_rms_and_rope_helpers():
-    """Verify `gqa_rms` and `rope` (`rope_fp32=False` vs `True`) helpers."""
+    """Verify `gqa_rms` and `rope` (`rope_fp32` flag mapping and rotation formula)."""
     g = FakeGeometry(L=1, att_every=1, H=256, NH=2, NKV=1, HD=128, ROT=32)
     ms = ModelSpec("m", config=g, layer_type=LayerType("lt", (FakeMixerModule(),)))
     ex = ExecSpec(B=4, T=1, R=1, ctx=256, tiles=TINY_TILES)
@@ -144,13 +144,20 @@ def test_gqa_staging_gqa_rms_and_rope_helpers():
     )
     cos = jnp.cos(jnp.arange(16, dtype=F32))[None, :]
     sin = jnp.sin(jnp.arange(16, dtype=F32))[None, :]
+    half = g.ROT // 2
+    x0, x1 = x[:, :half], x[:, half : g.ROT]
+    direct_rot = jnp.concatenate(
+        [x0 * cos - x1 * sin, x1 * cos + x0 * sin, x[:, g.ROT :]], axis=-1
+    )
     np.testing.assert_allclose(
         rope(ap_bf16, x, cos, sin),
         rope_partial(x, cos, sin, g.ROT, round_intermediates=True),
     )
     np.testing.assert_allclose(
         rope(ap_fp32, x, cos, sin),
-        rope_partial(x, cos, sin, g.ROT, round_intermediates=False),
+        direct_rot,
+        rtol=1e-6,
+        atol=1e-6,
     )
 
 
@@ -162,13 +169,18 @@ def _run_gqa_pallas_core_case(
     pair_kv: bool,
     gqa_qv: bool,
     interpret: bool,
+    kv_blk: int = 128,
+    kv_sub: int = 0,
+    amask: int = 1,
 ) -> None:
     """Run GQA Pallas core helpers and compare against `gqa_reference`."""
     B = 4
     ctx_len = 256
     g = FakeGeometry(L=1, att_every=1, H=256, NH=1, NKV=1, HD=256, ROT=32)
     tt = GQATunables(
-        kv_blk=128,
+        kv_blk=kv_blk,
+        kv_sub=kv_sub,
+        amask=amask,
         nkv=2,
         split=False,
         pair_kv=pair_kv,
@@ -394,6 +406,10 @@ def _run_gqa_pallas_core_case(
             pt, ckpt, roff, _ = pool.allocate_test_layout(lay, ref_ex)
             kc_fp8 = jnp.clip(kc.astype(F32), -448.0, 448.0).astype(FP8)
             vc_fp8 = jnp.clip(vc.astype(F32), -448.0, 448.0).astype(FP8)
+            nan_fp8 = lax.bitcast_convert_type(jnp.uint8(0x7F), FP8)
+            for sq in range(ex.NS):
+                p_end = int(pos[sq * T])
+                vc_fp8 = vc_fp8.at[:, sq, p_end:, :].set(nan_fp8)
             raw_pools = pool.states_to_pool(
                 lay,
                 ref_ex,
@@ -408,11 +424,11 @@ def _run_gqa_pallas_core_case(
         else:
             pt_arg = jnp.zeros((ex.NS, 2), dtype=I32)
             st0_arg = kc
-            # Poison DirectHBM `vc` past each sequence's `plen + T` with NaN to
-            # verify that `item_front` masks V rows past `plen` before `pr @ vj`.
+            # Poison DirectHBM `vc` from each sequence's `plen` on with NaN to
+            # verify that `item_front` masks V rows from `plen` on before `pr @ vj`.
             vc_poisoned = vc
             for sq in range(ex.NS):
-                p_end = int(pos[sq * T]) + T
+                p_end = int(pos[sq * T])
                 vc_poisoned = vc_poisoned.at[:, sq, p_end:, :].set(
                     jnp.asarray(jnp.nan, dtype=BF16)
                 )
@@ -464,22 +480,33 @@ def _run_gqa_pallas_core_case(
 
 
 @pytest.mark.parametrize(
-    ("T", "paged_kv", "kv_ering", "pair_kv", "gqa_qv"),
+    ("T", "paged_kv", "kv_ering", "pair_kv", "gqa_qv", "kv_blk", "kv_sub", "amask"),
     [
-        (1, False, False, False, False),
-        (2, False, False, True, True),
-        (1, True, False, False, False),
-        (2, True, True, True, True),
+        (1, False, False, False, False, 128, 0, 1),
+        (2, False, False, True, True, 128, 0, 0),
+        (1, False, False, False, False, 256, 128, 2),
+        (1, True, False, False, False, 128, 0, 0),
+        (2, True, True, True, True, 128, 0, 1),
+        (2, True, False, False, True, 256, 128, 2),
     ],
     ids=[
-        "decode_t1_direct_hbm",
-        "verify_t2_direct_hbm_odd_items",
-        "decode_t1_paged_kv_no_kve",
-        "verify_t2_paged_kv_kve_odd_items",
+        "decode_t1_direct_hbm_amask1",
+        "verify_t2_direct_hbm_odd_items_amask0",
+        "decode_t1_direct_hbm_sub128_amask2",
+        "decode_t1_paged_kv_no_kve_amask0",
+        "verify_t2_paged_kv_kve_odd_items_amask1",
+        "verify_t2_paged_kv_sub128_amask2",
     ],
 )
 def test_gqa_pallas_core_helpers_match_gqa_reference(
-    T: int, paged_kv: bool, kv_ering: bool, pair_kv: bool, gqa_qv: bool
+    T: int,
+    paged_kv: bool,
+    kv_ering: bool,
+    pair_kv: bool,
+    gqa_qv: bool,
+    kv_blk: int,
+    kv_sub: int,
+    amask: int,
 ):
     """Execute GQA Pallas core helpers in CPU interpret mode vs `gqa_reference`."""
     _run_gqa_pallas_core_case(
@@ -489,25 +516,39 @@ def test_gqa_pallas_core_helpers_match_gqa_reference(
         pair_kv=pair_kv,
         gqa_qv=gqa_qv,
         interpret=True,
+        kv_blk=kv_blk,
+        kv_sub=kv_sub,
+        amask=amask,
     )
 
 
 @pytest.mark.tpu_test
 @pytest.mark.parametrize(
-    ("T", "paged_kv", "kv_ering", "pair_kv", "gqa_qv"),
+    ("T", "paged_kv", "kv_ering", "pair_kv", "gqa_qv", "kv_blk", "kv_sub", "amask"),
     [
-        (1, False, False, False, False),
-        (2, True, False, True, True),
-        (2, True, True, True, True),
+        (1, False, False, False, False, 128, 0, 1),
+        (1, False, False, False, False, 256, 128, 2),
+        (2, True, False, True, True, 128, 0, 0),
+        (2, True, True, True, True, 128, 0, 1),
+        (2, True, False, False, True, 256, 128, 2),
     ],
     ids=[
-        "tpu_direct_hbm_t1",
-        "tpu_paged_kv_no_kve_t2",
-        "tpu_paged_kv_kve_t2",
+        "tpu_direct_hbm_t1_amask1",
+        "tpu_direct_hbm_t1_sub128_amask2",
+        "tpu_paged_kv_no_kve_t2_amask0",
+        "tpu_paged_kv_kve_t2_amask1",
+        "tpu_paged_kv_no_kve_t2_sub128_amask2",
     ],
 )
 def test_gqa_pallas_core_helpers_on_tpu(
-    T: int, paged_kv: bool, kv_ering: bool, pair_kv: bool, gqa_qv: bool
+    T: int,
+    paged_kv: bool,
+    kv_ering: bool,
+    pair_kv: bool,
+    gqa_qv: bool,
+    kv_blk: int,
+    kv_sub: int,
+    amask: int,
 ):
     """Execute GQA Pallas core helpers on TPU (`interpret=False`) vs CPU reference."""
     try:
@@ -523,4 +564,7 @@ def test_gqa_pallas_core_helpers_on_tpu(
         pair_kv=pair_kv,
         gqa_qv=gqa_qv,
         interpret=False,
+        kv_blk=kv_blk,
+        kv_sub=kv_sub,
+        amask=amask,
     )
