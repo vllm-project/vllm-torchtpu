@@ -16,6 +16,7 @@
 import torch
 from torch import nn
 from transformers import PreTrainedConfig
+from vllm import ir
 from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
 from vllm.distributed import (
     get_tensor_model_parallel_rank,
@@ -36,7 +37,11 @@ from vllm.v1.kv_cache_interface import KVCacheSpec, MLAAttentionSpec
 from vllm_torchtpu.layers.adapter.attention import PallasMLAttentionBackend
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
 from vllm_torchtpu.layers.core.owned_kv_cache import TpuOwnedKVCache
-from vllm_torchtpu.models.minimax_m3.ops.msa import get_msa_op, get_msa_sharded_op
+from vllm_torchtpu.models.minimax_m3.ops.msa import (
+    get_msa_dcp_op,
+    get_msa_op,
+    get_msa_sharded_op,
+)
 
 
 class MiniMaxM3Cache(nn.Module, TpuOwnedKVCache):
@@ -47,6 +52,12 @@ class MiniMaxM3Cache(nn.Module, TpuOwnedKVCache):
     layout is involved. With ``token_shards > 1`` a page holds only every
     ``token_shards``-th token of its block (the index-cache shard of one
     tensor-parallel rank), packed as ``[pages, S / shards / p, p, W]``.
+    Under DCP a page holds whole blocks: vLLM's logical block ``j`` of
+    ``dcp * S`` tokens is block ``j * dcp + r`` on DCP rank ``r``
+    (`kernels.msa_dcp`); the spec is per rank and DCP-sharded, so the
+    scheduler counts ``dcp`` times the tokens per page. A DCP group wider
+    than a KV head's replicas stores all of its ``G`` KV heads per row,
+    ``[K_0 | V_0 | ... | K_G-1 | V_G-1]``.
     """
 
     def __init__(
@@ -120,8 +131,55 @@ def cache_dtype(cache_config: CacheConfig | None) -> torch.dtype:
     )
 
 
-def _per_head_norm(x: torch.Tensor, norm: GemmaRMSNorm, head_dim: int) -> torch.Tensor:
-    return norm(x.reshape(-1, head_dim)).reshape(x.shape)
+def norm_rope_heads(
+    qkv: torch.Tensor,
+    positions: torch.Tensor,
+    num_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+    norms: tuple[GemmaRMSNorm, GemmaRMSNorm, GemmaRMSNorm, GemmaRMSNorm],
+    rotary_emb: nn.Module,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Split ``[q | k | v | index_q | index_k]`` and norm + rotate all but v.
+
+    The four Gemma RMSNorms differ only in their weights and RoPE acts on each
+    head alone, so one norm over the stacked q, k, index_q and index_k heads
+    with a per-head ``1 + w`` table, then one rotation, gives the same values
+    as four norms and two rotations in fewer, larger ops.
+
+    Returns ``(q, k, v, index_q, index_k)`` with shapes ``[T, num_heads * D]``,
+    ``[T, num_kv_heads * D]`` (x3) and ``[T, D]``.
+    """
+    num_tokens = qkv.shape[0]
+    heads = qkv.view(num_tokens, -1, head_dim)
+    nq, nkv = num_heads, num_kv_heads
+    v = heads[:, nq + nkv : nq + 2 * nkv]
+    x = torch.cat([heads[:, : nq + nkv], heads[:, nq + 2 * nkv :]], dim=1)
+    q_norm, k_norm, index_q_norm, index_k_norm = norms
+    weight = (
+        torch.cat(
+            [
+                q_norm.weight.expand(nq, head_dim),
+                k_norm.weight.expand(nkv, head_dim),
+                index_q_norm.weight.expand(nkv, head_dim),
+                index_k_norm.weight.expand(1, head_dim),
+            ]
+        ).float()
+        + 1.0
+    )
+    eps = q_norm.variance_epsilon
+    assert all(n.variance_epsilon == eps for n in norms)
+    x = ir.ops.rms_norm(x, weight, eps)
+    x, _ = rotary_emb(positions, x.reshape(num_tokens, -1), None)
+    x = x.view(num_tokens, -1, head_dim)
+    q, k, index_q, index_k = x.split([nq, nkv, nkv, 1], dim=1)
+    return (
+        q.reshape(num_tokens, -1),
+        k.reshape(num_tokens, -1),
+        v.reshape(num_tokens, -1),
+        index_q.reshape(num_tokens, -1),
+        index_k.reshape(num_tokens, -1),
+    )
 
 
 class MiniMaxM3SparseAttention(nn.Module):
@@ -195,9 +253,22 @@ class MiniMaxM3SparseAttention(nn.Module):
                 f"per rank (tensor parallel size {config.num_key_value_heads}), "
                 f"got {tp_size}."
             )
+        # Decode context parallelism: the ranks sharing this KV head split its
+        # context by whole sparse blocks (`kernels.msa_dcp`).
+        vllm_config = get_current_vllm_config()
+        self.dcp_size = vllm_config.parallel_config.decode_context_parallel_size
+        if self.dcp_size > 1 and self.index_shards > 1:
+            raise NotImplementedError(
+                f"additional_config.{SHARD_INDEX_CACHE_KEY} does not combine with "
+                "--decode-context-parallel-size."
+            )
+        # TP ranks per KV head; a DCP group wider than that spans several KV
+        # heads, and each rank stores all of their rows for its blocks.
+        self.kv_head_replicas = max(1, tp_size // config.num_key_value_heads)
+        self.dcp_kv_heads = max(1, self.dcp_size // self.kv_head_replicas)
         dtype = cache_dtype(cache_config)
         self.kv_cache = MiniMaxM3Cache(
-            2 * self.head_dim, dtype, prefix=f"{prefix}.attn"
+            2 * self.head_dim * self.dcp_kv_heads, dtype, prefix=f"{prefix}.attn"
         )
         self.index_cache = MiniMaxM3Cache(
             self.index_head_dim,
@@ -211,7 +282,25 @@ class MiniMaxM3SparseAttention(nn.Module):
             sparse_cfg.get("sparse_init_block", 0),
             sparse_cfg.get("sparse_local_block", 0),
         )
-        if self.index_shards > 1:
+        if self.dcp_size > 1:
+            from vllm_torchtpu.distributed.dcp import get_dcp_rank, get_dcp_world_size
+
+            if get_dcp_world_size() != self.dcp_size:
+                raise RuntimeError(
+                    f"DCP group of {get_dcp_world_size()} ranks, expected "
+                    f"{self.dcp_size}."
+                )
+            self.msa_op = get_msa_dcp_op(
+                *msa_config, self.dcp_size, self.kv_head_replicas
+            )
+            # A buffer, not a Python int, so the rank is a graph input and
+            # every DCP rank compiles the same program (see get_msa_dcp_op).
+            self.register_buffer(
+                "dcp_rank",
+                torch.tensor([get_dcp_rank()], dtype=torch.int32),
+                persistent=False,
+            )
+        elif self.index_shards > 1:
             self.msa_op = get_msa_sharded_op(
                 *msa_config, get_tensor_model_parallel_rank(), self.index_shards
             )
@@ -222,22 +311,15 @@ class MiniMaxM3SparseAttention(nn.Module):
         self, positions: torch.Tensor, hidden_states: torch.Tensor
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
-        q, k, v, index_q, index_k = qkv.split(
-            [
-                self.q_size,
-                self.kv_size,
-                self.kv_size,
-                self.kv_size,
-                self.index_head_dim,
-            ],
-            dim=-1,
+        q, k, v, index_q, index_k = norm_rope_heads(
+            qkv,
+            positions,
+            self.num_heads,
+            self.num_kv_heads,
+            self.head_dim,
+            (self.q_norm, self.k_norm, self.index_q_norm, self.index_k_norm),
+            self.rotary_emb,
         )
-        q = _per_head_norm(q, self.q_norm, self.head_dim)
-        k = _per_head_norm(k, self.k_norm, self.head_dim)
-        index_q = _per_head_norm(index_q, self.index_q_norm, self.index_head_dim)
-        index_k = self.index_k_norm(index_k)
-        q, k = self.rotary_emb(positions, q, k)
-        index_q, index_k = self.rotary_emb(positions, index_q, index_k)
 
         num_tokens = hidden_states.shape[0]
         metadata = get_forward_context().attn_metadata
@@ -252,6 +334,7 @@ class MiniMaxM3SparseAttention(nn.Module):
             if self.index_shards > 1:
                 # Every rank scores all index heads on its share of the keys.
                 index_q = get_tp_group().all_gather(index_q.contiguous(), dim=1)
+            extra = {"dcp_rank": self.dcp_rank} if self.dcp_size > 1 else {}
             attn_output = self.msa_op(
                 q.view(num_tokens, self.num_heads, self.head_dim),
                 k.view(num_tokens, self.num_kv_heads, self.head_dim),
@@ -261,6 +344,7 @@ class MiniMaxM3SparseAttention(nn.Module):
                 kv_cache,
                 self.index_cache.kv_cache,
                 layer_metadata,
+                **extra,
             ).reshape(num_tokens, self.q_size)
         output, _ = self.o_proj(attn_output)
         return output

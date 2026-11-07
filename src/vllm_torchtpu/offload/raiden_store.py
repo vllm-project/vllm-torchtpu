@@ -166,6 +166,7 @@ def _get_ephemeral_port_range(
 # recorded from the per-worker KV cache configs before the offloading spec is
 # built (see ``_patch_vllm_offload_all_ranks_kv_bytes``). None until recorded.
 _all_ranks_kv_bytes_per_block: int | None = None
+_all_ranks_draft_kv_bytes_per_block: int | None = None
 
 
 def _worker_kv_bytes_per_block(kv_cache_config: Any) -> int:
@@ -189,6 +190,113 @@ def _worker_kv_bytes_per_block(kv_cache_config: Any) -> int:
     )
 
 
+_CGROUP_DIR = "/sys/fs/cgroup"
+# Headroom kept below the cgroup limit for the page cache, kernel memory and
+# growth after registration.
+_HOST_POOL_CGROUP_MARGIN = 0.03
+
+
+def _read_cgroup_memory(cgroup_dir: str = _CGROUP_DIR) -> tuple[int, int] | None:
+    """(memory.max, non-reclaimable bytes in use) of this cgroup (v2), or None.
+
+    Non-reclaimable = anon + shmem from memory.stat: process heaps and tmpfs
+    (/dev/shm compile caches) cannot be dropped to make room for pinned pages,
+    while the page cache (e.g. checkpoint reads) can.
+    """
+    try:
+        with open(os.path.join(cgroup_dir, "memory.max")) as f:
+            raw_max = f.read().strip()
+        if raw_max == "max":
+            return None
+        limit = int(raw_max)
+        stats: dict[str, int] = {}
+        with open(os.path.join(cgroup_dir, "memory.stat")) as f:
+            for line in f:
+                key, _, value = line.partition(" ")
+                if key in ("anon", "shmem"):
+                    stats[key] = int(value)
+    except (OSError, ValueError):
+        return None
+    if len(stats) != 2:
+        return None
+    return limit, stats["anon"] + stats["shmem"]
+
+
+def check_host_pool_fits_cgroup(pool_bytes: int, cgroup_dir: str = _CGROUP_DIR) -> None:
+    """Raise if pinning `pool_bytes` more would exceed the container limit.
+
+    Logs the figures either way; does nothing when the cgroup is unreadable or
+    unlimited.
+    """
+    memory = _read_cgroup_memory(cgroup_dir)
+    if memory is None:
+        return
+    limit, in_use = memory
+    budget = int(limit * (1 - _HOST_POOL_CGROUP_MARGIN))
+    gib = float(1 << 30)
+    logger.info(
+        "TPURaidenOffloadingConnector: host pool %.1f GiB to pin; container "
+        "limit %.1f GiB, non-reclaimable in use (anon+shmem) %.1f GiB",
+        pool_bytes / gib,
+        limit / gib,
+        in_use / gib,
+    )
+    if in_use + pool_bytes > budget:
+        raise ValueError(
+            "TPURaidenOffloadingConnector: the host pool does not fit the "
+            f"container: pinning {pool_bytes / gib:.1f} GiB on top of "
+            f"{in_use / gib:.1f} GiB non-reclaimable (anon+shmem) exceeds "
+            f"{budget / gib:.1f} GiB ({1 - _HOST_POOL_CGROUP_MARGIN:.0%} of the "
+            f"{limit / gib:.1f} GiB limit); lower cpu_bytes_to_use "
+            "(--kv-offloading-size)"
+        )
+
+
+def draft_kv_layer_names(kv_cache_config: Any) -> set[str]:
+    """Layers holding a speculative drafter's K/V in a multi-shape KV group.
+
+    With the hybrid manager off, a sliding-window drafter's layers (DSpark)
+    are promoted to `FullAttentionSpec` that keeps its `sliding_window`, and
+    join the target's MLA caches in one `UniformTypeKVCacheSpecs` group. Those
+    leaves -- non-MLA full attention with a window, next to MLA leaves -- are
+    what `skip_draft_kv` leaves out of the host store. The rule only reads
+    specs; the operator asserts by setting `skip_draft_kv` that such layers
+    are the drafter's (a target sliding-window layer must not be skipped).
+    """
+    from vllm.v1.kv_cache_interface import MLAAttentionSpec, UniformTypeKVCacheSpecs
+
+    names: set[str] = set()
+    for group in getattr(kv_cache_config, "kv_cache_groups", None) or ():
+        spec = group.kv_cache_spec
+        if not isinstance(spec, UniformTypeKVCacheSpecs):
+            continue
+        leaves = spec.kv_cache_specs
+        if not any(isinstance(leaf, MLAAttentionSpec) for leaf in leaves.values()):
+            continue
+        for name, leaf in leaves.items():
+            if (
+                isinstance(leaf, FullAttentionSpec)
+                and not isinstance(leaf, MLAAttentionSpec)
+                and getattr(leaf, "sliding_window", None) is not None
+            ):
+                names.add(name)
+    return names
+
+
+def _worker_draft_kv_bytes_per_block(kv_cache_config: Any) -> int:
+    """One worker's bytes per block in `draft_kv_layer_names` leaves."""
+    if kv_cache_config.num_blocks <= 0:
+        return 0
+    names = draft_kv_layer_names(kv_cache_config)
+    if not names:
+        return 0
+    total = 0
+    for group in kv_cache_config.kv_cache_groups:
+        leaves = getattr(group.kv_cache_spec, "kv_cache_specs", None) or {}
+        total += sum(leaves[name].page_size_bytes for name in names if name in leaves)
+    return total
+
+
 def record_all_ranks_kv_bytes_per_block(kv_cache_configs: Sequence[Any]) -> int:
     """Sum the per-worker bytes per block over all workers and remember it.
 
@@ -198,14 +306,23 @@ def record_all_ranks_kv_bytes_per_block(kv_cache_configs: Sequence[Any]) -> int:
     over the per-worker configs is what one worker's figure times the world
     size cannot give.
     """
-    global _all_ranks_kv_bytes_per_block
+    global _all_ranks_kv_bytes_per_block, _all_ranks_draft_kv_bytes_per_block
     total = sum(_worker_kv_bytes_per_block(cfg) for cfg in kv_cache_configs)
     _all_ranks_kv_bytes_per_block = total
+    _all_ranks_draft_kv_bytes_per_block = sum(
+        _worker_draft_kv_bytes_per_block(cfg) for cfg in kv_cache_configs
+    )
     return total
 
 
 def all_ranks_kv_bytes_per_block() -> int | None:
     return _all_ranks_kv_bytes_per_block
+
+
+def all_ranks_draft_kv_bytes_per_block() -> int | None:
+    """The drafter's share of `all_ranks_kv_bytes_per_block` (see
+    `draft_kv_layer_names`), recorded from the same per-worker configs."""
+    return _all_ranks_draft_kv_bytes_per_block
 
 
 def iter_leaf_kv_cache_specs(kv_cache_spec):
@@ -700,6 +817,28 @@ class RaidenOffloadingManager(OffloadingManager):
         if not all_local:
             self._remote_slices.update(remote_slices)
         return LookupResult.HIT
+
+    def count_resident_prefix(self, keys: Sequence[OffloadKey]) -> int:
+        """Number of leading `keys` whose bytes are (or are being saved) on host.
+
+        For admission ranking only (`ExternalPrefixProbe`): one unpinned probe,
+        so it leaves no pins, no LRU reorder and no per-request state. A save
+        in flight counts as resident, as `lookup` would answer HIT_PENDING.
+        Peer and storage-tier entries are not counted.
+        """
+        if not keys:
+            return 0
+        sub_hashes = self._expand_keys(list(keys))
+        resident = 0
+        for sub_hash, block in self._probe(sub_hashes):
+            status = block.status
+            if status in (self._block_status.HOST, self._block_status.HOST_AND_HBM) or (
+                status == self._block_status.HBM and sub_hash in self._hash_to_admission
+            ):
+                resident += 1
+            else:
+                break
+        return resident // self._device_block_size_factor
 
     def touch(self, keys, req_context: ReqContext) -> None:
         # A lookup pins what it finds and releasing drops the entry back at
@@ -1479,6 +1618,7 @@ def derive_offload_namespace(
     cp_geometry: tuple[int, ...] = (),
     block_major_contract: BlockMajorContract | None = None,
     offloaded_group_ids: tuple[int, ...] | None = None,
+    skip_draft_kv: bool = False,
 ) -> bytes:
     """Derive a deterministic compatibility namespace prefixed to every store and
     registry key.
@@ -1544,6 +1684,9 @@ def derive_offload_namespace(
         # a group never stores its keys, so a peer expecting them would miss
         # on every block.
         material_fields += ("tpu-raiden-offload-ns3-groups", offloaded_group_ids)
+    if skip_draft_kv:
+        # Host blocks without the drafter's arrays are a different layout.
+        material_fields += ("tpu-raiden-offload-ns4-skip-draft-kv",)
     material = repr(material_fields)
     return hashlib.sha256(material.encode()).digest()[:16]
 
@@ -2584,6 +2727,32 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
             bytes_per_block_all_ranks = (
                 config.worker_kv_bytes_per_block * self.world_size
             )
+        # skip_draft_kv: keep the speculative drafter's K/V out of the host
+        # store. Its layers are sliding-window, so after a host hit only its
+        # last window is missing and the cost is draft acceptance on that
+        # request; the target output is unaffected. Workers skip registering
+        # those arrays (TPURaidenOffloadingConnector.register_kv_caches), so
+        # the host bytes per block shrink by the same amount on every rank.
+        self.skip_draft_kv = _parse_storage_flag(
+            self.extra_config.get("skip_draft_kv"),
+            default=False,
+            what="kv_connector_extra_config.skip_draft_kv",
+        )
+        if self.skip_draft_kv:
+            if vllm_config.speculative_config is None:
+                raise ValueError(
+                    "TPURaidenOffloadingConnector: skip_draft_kv needs a "
+                    "speculative drafter (--speculative-config)"
+                )
+            draft_bytes = all_ranks_draft_kv_bytes_per_block()
+            if not draft_bytes or all_ranks_kv_bytes_per_block() is None:
+                raise ValueError(
+                    "TPURaidenOffloadingConnector: skip_draft_kv found no "
+                    "drafter K/V layers in a multi-shape KV group (needs "
+                    "sliding-window drafter layers promoted to full attention "
+                    "by --disable-hybrid-kv-cache-manager next to MLA caches)"
+                )
+            bytes_per_block_all_ranks -= draft_bytes
         assert bytes_per_block_all_ranks > 0
         self.offload_logical_blocks_capacity = int(
             int(cpu_bytes_to_use) // bytes_per_block_all_ranks
@@ -2594,6 +2763,16 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
         )
         self.kernel_physical_blocks_capacity = (
             self.offload_logical_blocks_capacity * self.device_block_size_factor
+        )
+        # The workers pin the whole host pool when they register, which is
+        # after warmup -- when compile caches and worker heaps are at their
+        # peak. A pool that does not fit gets the container OOM-killed with no
+        # trace, so check it here (the scheduler builds its spec right before
+        # waiting for those registrations) and fail with the numbers instead.
+        # Per engine: under DP another engine's pool may already be pinned and
+        # counted in use, so counting it again could refuse a pool that fits.
+        check_host_pool_fits_cgroup(
+            self.offload_logical_blocks_capacity * bytes_per_block_all_ranks
         )
 
         # Cross-instance KV sharing: configured via extra_config. Setting
@@ -2624,6 +2803,7 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
             cp_geometry=cp_geometry,
             block_major_contract=self.block_major_contract,
             offloaded_group_ids=tuple(group.group_id for group in config.groups),
+            skip_draft_kv=self.skip_draft_kv,
         )
 
         # Shared-memory host pools (RAIDEN_SHM_KEY) are currently unsupported.

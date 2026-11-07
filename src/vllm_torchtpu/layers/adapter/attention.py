@@ -902,6 +902,11 @@ class PallasAttentionBackendImpl(AttentionImpl):
         # when decode_context_parallel_size > 1.
         self.dcp_world_size = 1
         self.dcp_rank = 0
+        # Set before initialize_kernel() to keep this layer's KV whole on every
+        # DCP rank (see `kv_cache_manager.dcp_replicated_page_tokens`): it then
+        # attends like a non-DCP layer, over pages of block_size * dcp tokens
+        # that line up with the DCP-sharded layers' logical blocks.
+        self.kv_replicated_over_dcp = False
         self.rpa_dcp_cache_kernel = None  # CACHE_ONLY pass, returns (out, lse)
         self.rpa_dcp_new_kernel = None  # NEW_TOKENS_ONLY pass, returns (out, lse)
         # Block-major bundled kernel and pre-allocated layer index. Initialized by
@@ -1370,6 +1375,7 @@ class PallasAttentionBackendImpl(AttentionImpl):
         dcp_configured = (
             parallel_config is not None
             and getattr(parallel_config, "decode_context_parallel_size", 1) > 1
+            and not self.kv_replicated_over_dcp
         )
         if dcp_configured:
             # These backends allocate NHD even when the global layout is HND.

@@ -253,6 +253,12 @@ class DFlashProposer:
         else:
             raise RuntimeError("Draft model does not support get_draft_attn_causal")
 
+        # Under DCP the draft keeps its KV whole on every rank: its context KV
+        # write and its block attention see the full context through the
+        # target's logical block table, with no DCP merge.
+        dcp = getattr(
+            self.vllm_config.parallel_config, "decode_context_parallel_size", 1
+        )
         with set_vllm_model_wrapper_context(
             mesh=self.runner.mesh, vllm_config=self.vllm_config
         ):
@@ -267,6 +273,7 @@ class DFlashProposer:
                 if isinstance(attn_impl, PallasAttentionBackendImpl):
                     attn_impl.layer_idx = i
                     attn_impl.use_causal_mask = layer_causal_list[i]
+                    attn_impl.kv_replicated_over_dcp = dcp > 1
                     attn_impl.initialize_kernel(attn_obj)
 
     def _load_draft_model(self) -> None:

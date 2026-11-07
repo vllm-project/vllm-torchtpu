@@ -34,6 +34,9 @@ def register() -> None:
     from vllm.model_executor.models import ModelRegistry
     from vllm.model_executor.models.config import MODELS_CONFIG_MAP
 
+    from vllm_torchtpu.distributed.dcp import (
+        register_kv_head_spanning_dcp_architectures,
+    )
     from vllm_torchtpu.layers.adapter.quantization import register_tpu_quant_config
     from vllm_torchtpu.models.minimax_m3.hooks import TPUMiniMaxM3Config
     from vllm_torchtpu.models.minimax_m3.quant import (
@@ -52,3 +55,5 @@ def register() -> None:
     # The [K | V] and index caches differ in row width, so KV offload
     # registers them array by array.
     register_multi_shapes_kv_architectures(*_ARCHITECTURES)
+    # DCP up to the TP size: a wide group stores several KV heads per rank.
+    register_kv_head_spanning_dcp_architectures(*_ARCHITECTURES)

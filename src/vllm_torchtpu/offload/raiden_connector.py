@@ -85,8 +85,10 @@ from vllm.v1.kv_offload.base import (
     CanonicalKVCacheTensor,
     GPULoadStoreSpec,
     OffloadKey,
+    make_offload_key,
 )
 from vllm.v1.outputs import KVConnectorOutput
+from vllm.v1.request import Request
 
 from vllm_torchtpu import envs as tpu_envs
 from vllm_torchtpu.logger import init_logger
@@ -95,6 +97,7 @@ from vllm_torchtpu.offload.raiden_store import (
     RaidenLoadStoreSpec,
     RaidenOffloadingManager,
     TPURaidenStoreOffloadingSpec,
+    draft_kv_layer_names,
 )
 
 if TYPE_CHECKING:
@@ -303,6 +306,43 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
             failed_load_req_ids=failed_load_req_ids,
         )
 
+    def peek_external_prefix_tokens(
+        self, request: Request, num_local_tokens: int
+    ) -> int:
+        """Prompt tokens past `num_local_tokens` resident in the host store.
+
+        Side-effect free (see `ExternalPrefixProbe`). Prefix groups only: if a
+        sliding-window group is offloaded the estimate is 0, since its hit is
+        a suffix window that this probe does not model.
+        """
+        if request.skip_reading_prefix_cache:
+            return 0
+        block_hashes = request.block_hashes
+        limit = max(request.num_tokens - 1, 0)
+        hit_end: int | None = None
+        for group_config in self.config.kv_group_configs:
+            if group_config.is_eagle_group:
+                continue
+            if group_config.sliding_window_size_in_chunks is not None:
+                return 0
+            tokens_per_chunk = group_config.tokens_per_chunk
+            hashes_per_chunk = group_config.hashes_per_chunk
+            start_chunk = num_local_tokens // tokens_per_chunk
+            keys = [
+                make_offload_key(block_hashes[idx], group_config.group_idx)
+                for idx in range(
+                    (start_chunk + 1) * hashes_per_chunk - 1,
+                    len(block_hashes),
+                    hashes_per_chunk,
+                )
+            ]
+            num_chunks = self._raiden_manager.count_resident_prefix(keys)
+            group_end = (start_chunk + num_chunks) * tokens_per_chunk
+            hit_end = group_end if hit_end is None else min(hit_end, group_end)
+        if hit_end is None:
+            return 0
+        return max(0, min(hit_end, limit) - num_local_tokens)
+
     def update_connector_output(self, connector_output: KVConnectorOutput):
         meta = connector_output.kv_connector_worker_meta
         if isinstance(meta, RaidenOffloadingWorkerMetadata) and meta.fenced_jobs:
@@ -389,6 +429,7 @@ class TPURaidenOffloadingConnector(OffloadingConnector):
         spec = TPURaidenStoreOffloadingSpec(
             offloading_config, vllm_config, kv_cache_config
         )
+        self._skip_draft_kv = spec.skip_draft_kv
 
         # pyrefly: ignore[bad-override-mutable-attribute]
         self.connector_scheduler: TPURaidenOffloadingScheduler | None = None
@@ -430,6 +471,16 @@ class TPURaidenOffloadingConnector(OffloadingConnector):
             return self.connector_scheduler.take_events()
         return []
 
+    def peek_external_prefix_tokens(
+        self, request: Request, num_local_tokens: int
+    ) -> int:
+        """`ExternalPrefixProbe`: host-resident prompt tokens past the local hit."""
+        if self.connector_scheduler is None:
+            return 0
+        return self.connector_scheduler.peek_external_prefix_tokens(
+            request, num_local_tokens
+        )
+
     # -- worker-side hooks -------------------------------------------------
     def register_kv_caches(
         self, kv_caches: Mapping[str, torch.Tensor | list[torch.Tensor]]
@@ -442,10 +493,20 @@ class TPURaidenOffloadingConnector(OffloadingConnector):
         each as an `int8` byte view.
         """
         assert self.connector_worker is not None
-        num_blocks = self.connector_worker.kv_cache_config.num_blocks
+        kv_cache_config = self.connector_worker.kv_cache_config
+        num_blocks = kv_cache_config.num_blocks
+
+        # skip_draft_kv: the drafter's arrays stay out of the host store (the
+        # spec already sized the host pool without them).
+        skipped_layers = (
+            draft_kv_layer_names(kv_cache_config)
+            if getattr(self, "_skip_draft_kv", False)
+            else set()
+        )
 
         pool_storages: dict[int, tuple[torch.UntypedStorage, torch.device]] = {}
-        for layer_kv_cache in kv_caches.values():
+        skipped_storages: set[int] = set()
+        for layer_name, layer_kv_cache in kv_caches.items():
             state_tensors = (
                 [layer_kv_cache]
                 if isinstance(layer_kv_cache, torch.Tensor)
@@ -453,7 +514,19 @@ class TPURaidenOffloadingConnector(OffloadingConnector):
             )
             for tensor in state_tensors:
                 storage = tensor.untyped_storage()
+                if layer_name in skipped_layers:
+                    skipped_storages.add(storage.data_ptr())
+                    continue
                 pool_storages.setdefault(storage.data_ptr(), (storage, tensor.device))
+        shared = skipped_storages & pool_storages.keys()
+        assert not shared, (
+            "TPURaidenOffloadingConnector: skip_draft_kv needs the drafter's K/V "
+            "in arrays of their own; it shares storage with offloaded layers"
+        )
+        assert not skipped_layers or skipped_storages, (
+            "TPURaidenOffloadingConnector: skip_draft_kv found drafter layers "
+            f"{sorted(skipped_layers)} in the KV config but none in kv_caches"
+        )
 
         pool_tensors: list[CanonicalKVCacheTensor] = []
         for storage, device in pool_storages.values():

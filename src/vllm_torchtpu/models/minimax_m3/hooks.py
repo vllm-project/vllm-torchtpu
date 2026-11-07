@@ -78,6 +78,12 @@ class TPUMiniMaxM3Config(VerifyAndUpdateConfig):
                 f"({kv_dtype}); set indexer_kv_dtype to {kv_dtype!r} in "
                 f"--attention-config, got {indexer_dtype!r}."
             )
+        if parallel_config.prefill_context_parallel_size > 1:
+            raise NotImplementedError(
+                "MiniMax M3 on TPU does not support prefill context parallelism."
+            )
+        if parallel_config.decode_context_parallel_size > 1:
+            _verify_dcp(vllm_config, block_size)
         if vllm_config.speculative_config is not None:
             from vllm_torchtpu.models.minimax_m3.dspark import (
                 configure_dspark_draft,
@@ -88,10 +94,51 @@ class TPUMiniMaxM3Config(VerifyAndUpdateConfig):
             raise NotImplementedError(
                 "MiniMax M3 on TPU requires pipeline_parallel_size=1."
             )
-        if (
-            parallel_config.prefill_context_parallel_size > 1
-            or parallel_config.decode_context_parallel_size > 1
-        ):
-            raise NotImplementedError(
-                "MiniMax M3 on TPU does not support context parallelism yet."
-            )
+
+
+def _verify_dcp(vllm_config: "VllmConfig", block_size: int) -> None:
+    """DCP splits the context over contiguous TP ranks, one whole sparse
+    block per rank in turn (`kernels.msa_dcp`). A group within one KV head's
+    replicas shares that head; a wider group (up to the whole TP group)
+    spans several KV heads, each rank storing all of them for its blocks."""
+    parallel_config = vllm_config.parallel_config
+    dcp = parallel_config.decode_context_parallel_size
+    tp_size = parallel_config.tensor_parallel_size
+    num_kv_heads = vllm_config.model_config.hf_text_config.num_key_value_heads
+    replicas = tp_size // num_kv_heads
+    if tp_size % dcp or (replicas % dcp and dcp % replicas):
+        raise ValueError(
+            f"MiniMax M3 DCP needs --decode-context-parallel-size ({dcp}) to "
+            f"divide --tensor-parallel-size ({tp_size}) and to divide, or be a "
+            f"multiple of, the {replicas} ranks that replicate a KV head."
+        )
+    interleave = parallel_config.cp_kv_cache_interleave_size
+    if interleave == 1:
+        parallel_config.cp_kv_cache_interleave_size = block_size
+    elif interleave != block_size:
+        raise ValueError(
+            "MiniMax M3 DCP keeps whole sparse blocks on a rank: use "
+            f"--cp-kv-cache-interleave-size {block_size} (or leave it unset), "
+            f"got {interleave}."
+        )
+    cache_config = vllm_config.cache_config
+    if (
+        getattr(cache_config, "enable_prefix_caching", False)
+        and getattr(cache_config, "prefix_match_unit", None) is None
+    ):
+        # The DCP manager block is block_size * dcp tokens; without a finer
+        # unit a prefix hit stops at that boundary (DCP 8: 1024 tokens). Hit
+        # at sparse-block granularity, as without DCP (the patched single-
+        # group coordinator copy-on-writes a partly shared block).
+        cache_config.prefix_match_unit = block_size
+    if (
+        vllm_config.speculative_config is not None
+        and vllm_config.scheduler_config.disable_hybrid_kv_cache_manager is False
+    ):
+        # The DSpark draft keeps its sliding-window KV whole on every DCP rank
+        # inside the target's KV cache group (`kv_cache_manager.
+        # dcp_replicated_page_tokens`), which needs the unified group.
+        raise NotImplementedError(
+            "MiniMax M3 DSpark with --decode-context-parallel-size needs "
+            "--disable-hybrid-kv-cache-manager."
+        )

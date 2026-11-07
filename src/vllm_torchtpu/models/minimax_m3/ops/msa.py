@@ -23,7 +23,7 @@ from torch_tpu._internal import pallas
 from vllm.distributed import get_tp_group
 
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
-from vllm_torchtpu.models.minimax_m3.kernels import msa, msa_indexer
+from vllm_torchtpu.models.minimax_m3.kernels import msa, msa_dcp, msa_indexer
 
 _KV_CACHE_ARG = 5
 _INDEX_CACHE_ARG = 6
@@ -200,9 +200,15 @@ def get_msa_sharded_op(
     def _score_fake(
         k, v, index_q, index_k, kv_cache, index_cache, seq_lens, block_tables, *args
     ):
+        # block_scores pads both tile classes to the wider page-group multiple.
         pages_per_seq = block_tables.shape[0] // seq_lens.shape[0]
-        step = msa_indexer.DEFAULT_PAGES_PER_STEP
-        padded_pages = -(-pages_per_seq // step) * step
+        padded_pages = max(
+            -(-pages_per_seq // step) * step
+            for step in (
+                msa_indexer.DEFAULT_PAGES_PER_STEP,
+                msa_indexer.DEFAULT_SMALL_PAGES_PER_STEP,
+            )
+        )
         return (
             torch.empty_like(kv_cache),
             torch.empty_like(index_cache),
@@ -248,6 +254,211 @@ def get_msa_sharded_op(
             metadata.block_tables,
             metadata.query_start_loc,
         )
+
+    return op
+
+
+def split_group_heads(
+    gathered: torch.Tensor, dcp: int, q_heads: int, kv_head_replicas: int
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Split the DCP all-gather of every rank's ``[q | k | v | index_q]``
+    (``[T, dcp * (q_heads + 3), D]``, rank-major) into the group's query
+    heads ``[T, dcp * q_heads, D]`` and the ``k``/``v``/``index_q
+    [T, dcp // kv_head_replicas, D]`` of its KV heads: rank ``i`` of the
+    group holds KV head ``i // kv_head_replicas``, so every
+    ``kv_head_replicas``-th rank supplies the next head."""
+    num_tokens, _, head_dim = gathered.shape
+    gathered = gathered.view(num_tokens, dcp, q_heads + 3, head_dim)
+    q_all = gathered[:, :, :q_heads].reshape(num_tokens, dcp * q_heads, head_dim)
+    per_head = gathered[:, ::kv_head_replicas, q_heads:]
+    return (
+        q_all,
+        per_head[:, :, 0].contiguous(),
+        per_head[:, :, 1].contiguous(),
+        per_head[:, :, 2].contiguous(),
+    )
+
+
+@functools.cache
+def get_msa_dcp_op(
+    sm_scale: float,
+    topk: int,
+    init_blocks: int,
+    local_blocks: int,
+    dcp: int,
+    kv_head_replicas: int = 1,
+) -> Callable[..., torch.Tensor]:
+    """`get_msa_op` for a KV head's context split over ``dcp`` ranks
+    (`kernels.msa_dcp`).
+
+    The returned op takes this rank's DCP rank as an ``int32[1]`` device
+    tensor (``dcp_rank``, a module buffer of the caller), not a Python int:
+    the rank then reaches the kernels as an input, every rank lowers to the
+    same program, and one compile and one cache entry serve all ranks.
+
+    ``kv_head_replicas`` is the TP ranks per KV head. A DCP group wider than
+    that spans ``dcp // kv_head_replicas`` KV heads; one all-gather then also
+    brings every rank the group's new K/V and index queries (the GLM DCP
+    pattern: one gather in, the LSE merge and reduce-scatter out).
+
+    Two JAX ops: the first writes this rank's tokens and returns its local
+    top-k candidates; an all-gather over the DCP group brings every rank all
+    ``dcp * topk`` candidates and the query heads of the whole group; the
+    second merges the candidates into the exact selection and attends over
+    the selected blocks this rank holds; a log-sum-exp merge (shared with the
+    MLA DCP path) combines the ranks' partials and keeps this rank's heads.
+    """
+    from vllm_torchtpu.distributed.dcp import get_dcp_group
+    from vllm_torchtpu.layers.adapter.cp_mla_attention import (
+        all_gather_heads,
+        merge_lse_partials_scatter_heads,
+    )
+
+    if dcp % kv_head_replicas and kv_head_replicas % dcp:
+        raise ValueError(
+            f"DCP size {dcp} and the {kv_head_replicas} replicas of a KV head "
+            "must divide one another."
+        )
+    kv_heads = max(1, dcp // kv_head_replicas)
+
+    def _score_jax(
+        k: jax.Array,
+        v: jax.Array,
+        index_q: jax.Array,
+        index_k: jax.Array,
+        kv_cache: jax.Array,
+        index_cache: jax.Array,
+        seq_lens: jax.Array,
+        block_tables: jax.Array,
+        query_start_loc: jax.Array,
+        request_distribution: jax.Array,
+        dcp_rank: jax.Array,
+    ) -> tuple[jax.Array, jax.Array, jax.Array]:
+        return msa_dcp.msa_write_and_candidates_dcp(
+            k,
+            v,
+            index_q,
+            index_k,
+            kv_cache,
+            index_cache,
+            seq_lens,
+            block_tables,
+            query_start_loc,
+            request_distribution,
+            topk=topk,
+            init_blocks=init_blocks,
+            local_blocks=local_blocks,
+            rank=dcp_rank,
+            dcp=dcp,
+        )
+
+    def _attend_jax(
+        q: jax.Array,
+        kv_cache: jax.Array,
+        candidates: jax.Array,
+        seq_lens: jax.Array,
+        block_tables: jax.Array,
+        query_start_loc: jax.Array,
+        dcp_rank: jax.Array,
+    ) -> tuple[jax.Array, jax.Array]:
+        return msa_dcp.msa_attend_dcp(
+            q,
+            kv_cache,
+            candidates,
+            seq_lens,
+            block_tables,
+            query_start_loc,
+            sm_scale=sm_scale,
+            topk=topk,
+            rank=dcp_rank,
+            dcp=dcp,
+        )
+
+    # No rank in the name: the op (and the program it lowers to) is the same
+    # on every rank of the group.
+    suffix = (
+        f"t{topk}_i{init_blocks}_l{local_blocks}_s{sm_scale:.8f}_dcp{dcp}_g{kv_heads}"
+    ).replace(".", "p")
+    score_op = pallas.jax_op(
+        f"pallas::minimax_m3_msa_dcp_score_{suffix}",
+        _score_jax,
+        donate_argnums=(_SHARD_KV_CACHE_ARG, _SHARD_INDEX_CACHE_ARG),
+    )
+    attend_op = pallas.jax_op(
+        f"pallas::minimax_m3_msa_dcp_attend_{suffix}", _attend_jax
+    )
+
+    def _score_fake(k, v, index_q, index_k, kv_cache, index_cache, *args):
+        return (
+            torch.empty_like(kv_cache),
+            torch.empty_like(index_cache),
+            torch.empty(
+                (k.shape[0], k.shape[1] * 2 * topk),
+                dtype=torch.float32,
+                device=k.device,
+            ),
+        )
+
+    def _attend_fake(q, *args):
+        return (
+            torch.empty_like(q),
+            torch.empty(q.shape[:2], dtype=torch.float32, device=q.device),
+        )
+
+    score_op.register_fake(_score_fake)
+    attend_op.register_fake(_attend_fake)
+
+    def op(
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        index_q: torch.Tensor,
+        index_k: torch.Tensor,
+        kv_cache: torch.Tensor,
+        index_cache: torch.Tensor,
+        metadata: AttentionMetadata,
+        *,
+        dcp_rank: torch.Tensor,
+    ) -> torch.Tensor:
+        group = get_dcp_group()
+        assert group is not None, "DCP group is not initialized"
+        if kv_heads == 1:
+            q_all = all_gather_heads(q)
+        else:
+            # One gather of [q | k | v | index_q] per rank; every
+            # kv_head_replicas-th rank contributes the K/V of the next head.
+            gathered = group.all_gather(
+                torch.cat([q, k, v, index_q], dim=1).contiguous(), dim=1
+            )
+            q_all, k, v, index_q = split_group_heads(
+                gathered, dcp, q.shape[1], kv_head_replicas
+            )
+        new_kv_cache, new_index_cache, candidates = score_op(
+            k,
+            v,
+            index_q,
+            index_k,
+            kv_cache,
+            index_cache,
+            metadata.seq_lens,
+            metadata.block_tables,
+            metadata.query_start_loc,
+            metadata.request_distribution,
+            dcp_rank,
+        )
+        kv_cache.copy_(new_kv_cache)
+        index_cache.copy_(new_index_cache)
+        candidates = group.all_gather(candidates.unsqueeze(0), dim=0)
+        out, lse = attend_op(
+            q_all,
+            kv_cache,
+            candidates,
+            metadata.seq_lens,
+            metadata.block_tables,
+            metadata.query_start_loc,
+            dcp_rank,
+        )
+        return merge_lse_partials_scatter_heads(out, lse)
 
     return op
 

@@ -40,6 +40,13 @@ from vllm_torchtpu.models.minimax_m3.kernels.packed_page import (
 )
 
 DEFAULT_BLOCK_Q = 16
+# Batches of at most this many tokens (decode, MTP verify) use 8-token tiles:
+# an 8-token verify group then fills a tile alone instead of sharing a
+# 16-token tile (and its page union) with the next request. Twin, c64 verify
+# (32 req x 8 tokens): 416 -> 350 us per call (j-cae78264 vs j-2c36aed7);
+# prefill chunks keep 16 (8 is 7% slower there, j-3eb5e8aa).
+SMALL_BATCH_TOKENS = 1024
+SMALL_BATCH_BLOCK_Q = 8
 DEFAULT_PAGES_PER_STEP = 16
 DEFAULT_KERNEL = "v2"
 # Tokens per kernel call. The work list lives in SMEM, sized for the worst
@@ -295,7 +302,8 @@ def _work_list(selected: jax.Array, block_q: int, pages_per_step: int):
     max_groups_per_tile = -(-union_size // pages_per_step)
     w = jnp.arange(num_tiles * max_groups_per_tile, dtype=jnp.int32)
     tile = jnp.minimum(
-        jnp.searchsorted(ends, w, side="right").astype(jnp.int32), num_tiles - 1
+        jnp.searchsorted(ends, w, side="right", method="compare_all").astype(jnp.int32),
+        num_tiles - 1,
     )
     group = w - (ends[tile] - groups_in_tile[tile])
     grouped = jnp.pad(

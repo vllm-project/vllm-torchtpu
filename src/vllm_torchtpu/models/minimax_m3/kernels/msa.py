@@ -40,7 +40,9 @@ def token_positions(
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Per-token ``(sequence id, absolute position, is-real-token)``."""
     tok = jnp.arange(num_tokens, dtype=jnp.int32)
-    seq_id = jnp.searchsorted(cu_q_lens[1:], tok, side="right").astype(jnp.int32)
+    seq_id = jnp.searchsorted(
+        cu_q_lens[1:], tok, side="right", method="compare_all"
+    ).astype(jnp.int32)
     seq_id = jnp.minimum(seq_id, seq_lens.shape[0] - 1)
     q_len = cu_q_lens[seq_id + 1] - cu_q_lens[seq_id]
     pos = seq_lens[seq_id] - q_len + (tok - cu_q_lens[seq_id])
@@ -155,7 +157,11 @@ def sparse_attention(
         local_key,
         pos % block_size + 1,
         sm_scale=sm_scale,
-        block_q=msa_attention.DEFAULT_BLOCK_Q,
+        block_q=(
+            msa_attention.SMALL_BATCH_BLOCK_Q
+            if q.shape[0] <= msa_attention.SMALL_BATCH_TOKENS
+            else msa_attention.DEFAULT_BLOCK_Q
+        ),
         pages_per_step=msa_attention.DEFAULT_PAGES_PER_STEP,
         page_table=block_tables_2d.reshape(-1),
         interpret=interpret,
@@ -214,6 +220,7 @@ def _block_scores(
         block_q=msa_indexer.DEFAULT_BLOCK_Q,
         large_block_q=msa_indexer.DEFAULT_LARGE_BLOCK_Q,
         pages_per_step=msa_indexer.DEFAULT_PAGES_PER_STEP,
+        small_pages_per_step=msa_indexer.DEFAULT_SMALL_PAGES_PER_STEP,
         interpret=interpret,
     )
 
