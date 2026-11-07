@@ -32,6 +32,7 @@ def _runner(**attrs):
     runner._pp_intermediate_template = None
     runner._pp_topk_buffer = None
     runner._pp_pending_kv_save_nan_check = None
+    runner._megakernel = None
     for name in (
         "forward_model",
         "_pp_intermediate_tensors",
