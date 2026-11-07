@@ -39,6 +39,7 @@ from ..advisor.models import (
     resolve_model_profile,
     supports_hf_config,
 )
+from .calibrate import calibrate_trace
 from .chips import (
     BUILTIN_CHIP_SPECS,
     REQUIRED_CHIP_SPEC_KEYS,
@@ -3001,8 +3002,9 @@ __all__ = [
     "advise_from_spec",
     "advise_regimes",
     "build_arg_parser",
-    "compute_all_reduce_transfer_cost",
+    "calibrate_trace",
     "compare_parallelism_candidates",
+    "compute_all_reduce_transfer_cost",
     "compute_per_token_vmem_bytes",
     "default_double_buffer_ring_plan",
     "fit_vmem_budget_bytes",
