@@ -696,6 +696,11 @@ class VllmFp8Config(Fp8Config, VllmQuantConfig):
             store_dtype=store_dtype,
         )
         self.is_checkpoint_fp8_serialized = is_checkpoint_fp8_serialized
+        # Layer-kind scope, set from the resolved `--quantization-config`
+        # (QuantizationConfigArgs.linear / .moe) by get_tpu_quantization_config.
+        # A kind that is switched off keeps its checkpoint dtype.
+        self.quantize_linear = True
+        self.quantize_moe = True
 
     @classmethod
     def get_name(cls) -> QuantizationMethods:
@@ -734,27 +739,23 @@ class VllmFp8Config(Fp8Config, VllmQuantConfig):
         layer: torch.nn.Module,
         prefix: str,
     ) -> QuantizeMethodBase | None:
+        skipped = is_layer_skipped(
+            prefix=prefix,
+            ignored_layers=self.ignored_layers,
+            fused_mapping=self.packed_modules_mapping,
+        )
         if isinstance(layer, RoutedExperts):
-            if is_layer_skipped(
-                prefix=prefix,
-                ignored_layers=self.ignored_layers,
-                fused_mapping=self.packed_modules_mapping,
-            ):
+            moe_config = self.get_moe_config(layer)
+            if skipped or not self.quantize_moe:
                 from vllm_torchtpu.layers.adapter.quantization.unquantized import (
                     VllmUnquantizedFusedMoEMethod,
                 )
 
-                moe_config = self.get_moe_config(layer)
                 return VllmUnquantizedFusedMoEMethod(moe_config)
-            moe_config = self.get_moe_config(layer)
             return VllmFp8MoEMethodTPU(self, moe_config)
 
         if isinstance(layer, LinearBase):
-            if is_layer_skipped(
-                prefix=prefix,
-                ignored_layers=self.ignored_layers,
-                fused_mapping=self.packed_modules_mapping,
-            ):
+            if skipped or not self.quantize_linear:
                 from vllm_torchtpu.layers.adapter.quantization.unquantized import (
                     VllmUnquantizedLinearMethod,
                 )
