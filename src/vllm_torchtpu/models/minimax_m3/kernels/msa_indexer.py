@@ -98,6 +98,25 @@ def _page_keys(page_ref) -> jax.Array:
     return _words_keys(words, page_ref.dtype)
 
 
+def _folded_keys(words: jax.Array) -> tuple[jax.Array, jax.Array]:
+    """A 4-bit page with its scales folded in (`msa_fp4.scales_in_page`):
+    ``[S / 8 + 1, D]`` words -> (unscaled bf16 keys ``[S, D]``, the per-slot
+    scales of the last word row as a ``[1, S]`` f32 lane vector)."""
+    keys = pltpu.bitcast(words[:-1], jnp.int4).astype(jnp.bfloat16)
+    return keys, pltpu.bitcast(words[-1:], jnp.float32)
+
+
+def _scale_rows_to_column(rows: list[jax.Array]) -> jax.Array:
+    """The group's ``[1, S]`` slot-scale rows -> one ``[n * S, 1]`` column in
+    the score rows' (page-major) order, non-finite read as 0. One transpose
+    of the stacked ``[n, S]`` rows per dot group: a ``[1, S] -> [S, 1]``
+    transpose per page made the 4-bit indexer 50% slower than fp8."""
+    stacked = rows[0] if len(rows) == 1 else jnp.concatenate(rows, axis=0)  # [n, S]
+    stacked = jnp.where(jnp.isfinite(stacked), stacked, 0.0)
+    cols = stacked.T  # [S, n]
+    return jnp.concatenate([cols[:, g : g + 1] for g in range(len(rows))], axis=0)
+
+
 def _words_keys(words: jax.Array, dtype) -> jax.Array:
     """Packed ``[S / p, D]`` words -> bf16 ``[S, D]`` keys. A 4-bit (uint8)
     cache's int4 values come out unscaled, in slot order (`msa_fp4`)."""
@@ -139,14 +158,21 @@ def _kernel_v2(
         1, min(pages_per_step, _MAX_SCORE_ELEMS // (page_size * block_q))
     )
     maxima = []
+    folded = msa_fp4.scales_in_page(page_refs[0].shape[1], page_refs[0].dtype)
     for first in range(0, pages_per_step, pages_per_dot):
         group = page_refs[first : first + pages_per_dot]
-        keys = [_page_keys(r) for r in group]
+        if folded:
+            pairs = [_folded_keys(r.bitcast(jnp.uint32)[0, :, 0, :]) for r in group]
+            keys = [k for k, _ in pairs]
+        else:
+            keys = [_page_keys(r) for r in group]
         keys = keys[0] if len(keys) == 1 else jnp.concatenate(keys, axis=0)
         s = jax.lax.dot_general(
             keys, q, (((1,), (1,)), ((), ())), preferred_element_type=jnp.float32
         )
-        if scale_row is not None:
+        if folded:
+            s = s * _scale_rows_to_column([c for _, c in pairs])
+        elif scale_row is not None:
             cols = [
                 _scale_column(r[0], scale_row)
                 for r in scale_refs[first : first + pages_per_dot]
@@ -157,10 +183,11 @@ def _kernel_v2(
 
 
 def _page_tokens(rows_per_page: int, dtype) -> int:
-    """Tokens per page: 4-bit (uint8) caches hold 8 per 32-bit word."""
-    return rows_per_page * (
-        msa_fp4.TOKENS_PER_WORD if dtype == jnp.uint8 else 4 // jnp.dtype(dtype).itemsize
-    )
+    """Tokens per page: 4-bit (uint8) caches hold 8 per 32-bit word (a folded
+    page's extra word row holds scales, not tokens)."""
+    if dtype == jnp.uint8:
+        return msa_fp4.data_rows(rows_per_page) * msa_fp4.TOKENS_PER_WORD
+    return rows_per_page * (4 // jnp.dtype(dtype).itemsize)
 
 
 def _scores_v3(q, page_refs, o_ref, scale_refs=None, scale_row=None):
@@ -173,17 +200,25 @@ def _scores_v3(q, page_refs, o_ref, scale_refs=None, scale_row=None):
         1, min(pages_per_step, _MAX_SCORE_ELEMS // (page_size * block_q))
     )
     maxima = []
+    folded = msa_fp4.scales_in_page(rows, page_refs[0].dtype)
     for first in range(0, pages_per_step, pages_per_dot):
         group = page_refs[first : first + pages_per_dot]
-        keys = []
+        keys, cols = [], []
         for r in group:
             words = r.bitcast(jnp.uint32)[:, 0, :]
-            keys.append(_words_keys(words, r.dtype))
+            if folded:
+                k, c = _folded_keys(words)
+                keys.append(k)
+                cols.append(c)
+            else:
+                keys.append(_words_keys(words, r.dtype))
         keys = keys[0] if len(keys) == 1 else jnp.concatenate(keys, axis=0)
         s = jax.lax.dot_general(
             keys, q, (((1,), (1,)), ((), ())), preferred_element_type=jnp.float32
         )
-        if scale_row is not None:
+        if folded:
+            s = s * _scale_rows_to_column(cols)
+        elif scale_row is not None:
             cols = [
                 _scale_column(r[...], scale_row)
                 for r in scale_refs[first : first + pages_per_dot]
@@ -441,7 +476,11 @@ def _class_scores(
             scale_buf = pltpu.VMEM(
                 (pages_per_step, scale_cache.shape[1], msa_fp4.SCALE_LANES), jnp.float32
             )
-            scratch += [scale_buf, scale_buf, pltpu.SemaphoreType.DMA((2, pages_per_step))]
+            scratch += [
+                scale_buf,
+                scale_buf,
+                pltpu.SemaphoreType.DMA((2, pages_per_step)),
+            ]
             hbm.append(pl.BlockSpec(memory_space=pl.ANY))
             operands.append(scale_cache)
         scores_t = pl.pallas_call(
@@ -540,7 +579,8 @@ def block_scores(
       large_kernel: the same choice for the `large_block_q` tiles.
       pages_per_step / small_pages_per_step: pages per grid step of the large
         and the block_q tile classes.
-      scale_cache, scale_row: for a 4-bit (uint8) index cache (`msa_fp4`),
+      scale_cache, scale_row: for a 4-bit (uint8) index cache without folded
+        scales (`msa_fp4.scales_in_page`),
         the ``[pages, 8, 128]`` f32 scale cache and the row of the index-key
         scales. `index_q` must then be rotated (`msa_fp4.rotate_queries`).
     Pages past a token's own page hold scores of keys it must not see, and
@@ -551,7 +591,11 @@ def block_scores(
         raise NotImplementedError(
             f"MSA indexer scores one index head per rank, got {num_heads}."
         )
-    if msa_fp4.is_fp4(index_cache):
+    if msa_fp4.is_fp4(index_cache) and msa_fp4.scales_in_page(
+        index_cache.shape[1], index_cache.dtype
+    ):
+        scale_cache = scale_row = None  # the pages carry their own scales
+    elif msa_fp4.is_fp4(index_cache):
         if scale_cache is None or scale_row is None:
             raise ValueError("a 4-bit index cache needs scale_cache and scale_row")
     else:

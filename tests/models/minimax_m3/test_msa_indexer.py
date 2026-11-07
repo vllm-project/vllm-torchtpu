@@ -113,17 +113,18 @@ def test_lowers_for_tpu(dtype, kernel):
     assert "tpu_custom_call" in lowered.as_text()
 
 
-@pytest.mark.parametrize("kv_heads", [1, 4])
+@pytest.mark.parametrize("layout", ["folded", "scale_page"])
 @pytest.mark.parametrize("kernel", ["v2", "v3"])
 @pytest.mark.parametrize(
     "q_lens,ctx_lens,block_q,large_block_q,pages_per_step",
     [([1, 130, 3], [300, 200, 0], 64, 48, 4), ([1, 1], [1000, 5], 128, 512, 2)],
 )
 def test_fp4_matches_dequantized_reference(
-    q_lens, ctx_lens, block_q, large_block_q, pages_per_step, kernel, kv_heads
+    q_lens, ctx_lens, block_q, large_block_q, pages_per_step, kernel, layout
 ):
     """4-bit index cache: scores equal rotated queries against the dequantized
-    rotated keys; the other scale-page rows are never read."""
+    rotated keys. "folded": the scales sit in each page's last word row (the
+    served layout); "scale_page": a separate scale page row (NaN elsewhere)."""
     from vllm_torchtpu.models.minimax_m3.kernels import msa_fp4
 
     rng = np.random.default_rng(7 + len(q_lens))
@@ -138,16 +139,23 @@ def test_fp4_matches_dequantized_reference(
     tables[:num_seqs] = rng.permutation(np.arange(1, NUM_PAGES))[
         : num_seqs * PAGES_PER_SEQ
     ].reshape(num_seqs, PAGES_PER_SEQ)
-    raw = rng.standard_normal((NUM_PAGES, PAGE, HEAD_DIM)) * rng.uniform(0.1, 5, (1, 1, HEAD_DIM))
-    nib, scale = msa_fp4.quantize(msa_fp4.rotate_keys(jnp.asarray(raw, jnp.float32)))
-    cache = msa_fp4.pack_rows(nib)
-    row = msa_fp4.index_scale_row(kv_heads)
-    scale_cache = np.full(
-        (NUM_PAGES, msa_fp4.scale_rows(kv_heads), msa_fp4.SCALE_LANES), np.nan, np.float32
+    raw = rng.standard_normal((NUM_PAGES, PAGE, HEAD_DIM)) * rng.uniform(
+        0.1, 5, (1, 1, HEAD_DIM)
     )
+    nib, scale = msa_fp4.quantize(msa_fp4.rotate_keys(jnp.asarray(raw, jnp.float32)))
+    row = 2
+    scale_cache = np.full((NUM_PAGES, 8, msa_fp4.SCALE_LANES), np.nan, np.float32)
     scale_cache[:, row] = np.asarray(scale)
+    if layout == "folded":
+        cache = msa_fp4.pack_rows(nib, scales=scale)
+        scale_kwargs = {}
+    else:
+        cache = msa_fp4.pack_rows(nib)
+        scale_kwargs = dict(scale_cache=jnp.asarray(scale_cache), scale_row=row)
     keys = np.asarray(msa_fp4.dequantize(nib, scale))
-    index_q = jnp.asarray(rng.standard_normal((num_tokens, 1, HEAD_DIM))).astype(jnp.bfloat16)
+    index_q = jnp.asarray(rng.standard_normal((num_tokens, 1, HEAD_DIM))).astype(
+        jnp.bfloat16
+    )
     q_rot = msa_fp4.rotate_queries(index_q)
 
     scores = block_scores(
@@ -163,9 +171,8 @@ def test_fp4_matches_dequantized_reference(
         small_pages_per_step=pages_per_step,
         kernel=kernel,
         large_kernel=kernel,
-        scale_cache=jnp.asarray(scale_cache),
-        scale_row=row,
         interpret=True,
+        **scale_kwargs,
     )
 
     queries = np.asarray(q_rot.astype(jnp.float32))[:, 0]
@@ -176,6 +183,24 @@ def test_fp4_matches_dequantized_reference(
             for b in range(num_pages):
                 expected = (keys[tables[r, b]] @ queries[t]).max()
                 np.testing.assert_allclose(scores[t, b], expected, rtol=1e-4, atol=1e-3)
+
+
+@pytest.mark.parametrize("kernel", ["v2", "v3"])
+def test_fp4_folded_lowers_for_tpu(kernel):
+    tokens, max_seqs, pages_per_seq = 256, 16, 2048
+    args = (
+        jax.ShapeDtypeStruct((tokens, 1, HEAD_DIM), jnp.bfloat16),
+        jax.ShapeDtypeStruct((4096, PAGE // 8 + 1, 4, HEAD_DIM), jnp.uint8),
+        jax.ShapeDtypeStruct((max_seqs,), jnp.int32),
+        jax.ShapeDtypeStruct((max_seqs * pages_per_seq,), jnp.int32),
+        jax.ShapeDtypeStruct((max_seqs + 1,), jnp.int32),
+        jax.ShapeDtypeStruct((), jnp.int32),
+    )
+    tpu7x = AbstractMesh((), (), (), abstract_device=AbstractDevice("TPU7x", 1, "tpu"))
+    fn = functools.partial(block_scores, kernel=kernel, large_kernel=kernel)
+    with use_abstract_mesh(tpu7x):
+        lowered = jax.jit(fn).trace(*args).lower(lowering_platforms=("tpu",))
+    assert "tpu_custom_call" in lowered.as_text()
 
 
 @pytest.mark.parametrize("kernel", ["v2", "v3"])
@@ -194,8 +219,16 @@ def test_fp4_lowers_for_tpu(kernel):
 
     def f(q, cache, seq_lens, tables, cu_q, n, scales):
         return block_scores(
-            q, cache, seq_lens, tables, cu_q, n, kernel=kernel, large_kernel=kernel,
-            scale_cache=scales, scale_row=2,
+            q,
+            cache,
+            seq_lens,
+            tables,
+            cu_q,
+            n,
+            kernel=kernel,
+            large_kernel=kernel,
+            scale_cache=scales,
+            scale_row=2,
         )
 
     with use_abstract_mesh(tpu7x):
