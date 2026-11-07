@@ -414,8 +414,9 @@ def _check_draft(meta: dict[str, Any], functions: dict[str, Any]) -> None:
 
     An artifact declaring a drafter method (`speculative_config.method` in
     `DRAFTER_METHODS`) exports `draft` for exactly the `forward` buckets;
-    each variant takes the forward's `hidden_states` and returns
-    `draft_tokens` `[max_num_seqs, k]`.
+    each variant takes intermediates the forward returns under the same name
+    and shape (`hidden_states` for an MTP layer, `aux_hidden_states` for a
+    DSpark draft model) and returns `draft_tokens` `[max_num_seqs, k]`.
     """
     serving = meta.get("serving_config") or {}
     speculative = serving.get("speculative_config") or {}
@@ -438,29 +439,34 @@ def _check_draft(meta: dict[str, Any], functions: dict[str, Any]) -> None:
     want_draft = [int(serving.get("max_num_seqs", 0)), k]
     for bucket, spec in draft.items():
         where = f"draft_bucket{bucket}"
-        hidden_in = [
+        returned = {
+            o.get("name"): o
+            for o in forward[bucket].get("outputs", [])
+            if o.get("argument_type") == "intermediate"
+        }
+        taken = [
             i
             for i in spec.get("inputs", [])
             if i.get("argument_type") == "intermediate"
-            and i.get("name") == "hidden_states"
         ]
-        hidden_out = [
-            o
-            for o in forward[bucket].get("outputs", [])
-            if o.get("argument_type") == "intermediate"
-            and o.get("name") == "hidden_states"
-        ]
-        if len(hidden_in) != 1 or not hidden_out:
-            raise ValueError(f"{where} must take forward's hidden_states intermediate")
-        if (hidden_in[0].get("shape"), hidden_in[0].get("dtype")) != (
-            hidden_out[0].get("shape"),
-            hidden_out[0].get("dtype"),
-        ):
-            raise ValueError(
-                f"{where} takes hidden_states {hidden_in[0].get('dtype')}"
-                f"{hidden_in[0].get('shape')}, forward returns "
-                f"{hidden_out[0].get('dtype')}{hidden_out[0].get('shape')}"
-            )
+        if not taken:
+            raise ValueError(f"{where} must take an intermediate forward returns")
+        for inp in taken:
+            name = inp.get("name")
+            out = returned.get(name)
+            if out is None:
+                raise ValueError(
+                    f"{where} takes intermediate {name}, which forward_bucket"
+                    f"{bucket} does not return (it returns {sorted(returned)})"
+                )
+            if (inp.get("shape"), inp.get("dtype")) != (
+                out.get("shape"),
+                out.get("dtype"),
+            ):
+                raise ValueError(
+                    f"{where} takes {name} {inp.get('dtype')}{inp.get('shape')}, "
+                    f"forward returns {out.get('dtype')}{out.get('shape')}"
+                )
         draft_out = [
             o for o in spec.get("outputs", []) if o.get("name") == "draft_tokens"
         ]
