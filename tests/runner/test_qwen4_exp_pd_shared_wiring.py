@@ -479,3 +479,58 @@ def test_shared_scatter_passes_jax_op_registration():
     landing = object.__new__(pd_staging.SharedLanding)
     landing._scatter = None
     assert callable(landing._scatter_fn())
+
+
+def test_selftest_never_touches_the_staging_carrier():
+    """register_runner's S4 self-test runs before KVCacheManager registers the
+    staging carrier for raw transfers. q38-xfer-tputest-s4-i1 run 2
+    (j-c9b417d2): the first self-test wrote rank tags into staging page 0
+    through a uint8 view and restored it, and every rank's manager then refused
+    the carrier ("Tensor's leading (block) dimension does not match its base
+    storage buffer"). On CPU (compiled gather and scatter replaced by
+    emulations) no torch op of the self-test may take a tensor that shares the
+    staging carrier's storage, and the carrier's bytes stay unchanged."""
+    import torch
+    from torch.overrides import TorchFunctionMode
+
+    from vllm_torchtpu.models.vllm.qwen4_exp import pd_staging
+
+    G, PAGES = 2, 5
+    staging = torch.arange(PAGES * 8 * 4 * 16, dtype=torch.int64).remainder(251).to(torch.uint8)
+    staging = staging.view(torch.float8_e4m3fn).reshape(PAGES, 8, 1, 4, 16)
+    pool = torch.zeros(6, 8, 1, 4, 16, dtype=torch.float8_e4m3fn)
+    geo = SimpleNamespace(group=G, page_rows=8)
+    landing = pd_staging.SharedLanding(staging, pool, None, geo)
+    rank = 0
+
+    def gather_emulation(bucket):
+        def gather(src, pack, send, gathered):  # what G ranks' all-gather returns
+            send.copy_(src[pack])
+            for u in range(G):
+                chunk = send.view(torch.uint8).clone()
+                chunk.fill_(u + 1)
+                gathered[u * bucket:(u + 1) * bucket] = chunk.view(gathered.dtype)
+            return pack[0]
+        return gather
+
+    landing._gather_fn = gather_emulation
+    landing._scatter_fn = lambda: (lambda pool, gathered, src, dst: src[0])
+    before = staging.view(torch.uint8).clone()
+    ptr = staging.untyped_storage().data_ptr()
+    touched = []
+
+    class Watch(TorchFunctionMode):
+        def __torch_function__(self, func, types, args=(), kwargs=None):
+            kwargs = kwargs or {}
+            if getattr(func, "__name__", "") == "__get__":  # .shape / .dtype metadata reads
+                return func(*args, **kwargs)
+            for a in list(args) + list(kwargs.values()):
+                if isinstance(a, torch.Tensor) and a.untyped_storage().data_ptr() == ptr:
+                    touched.append(getattr(func, "__name__", str(func)))
+            return func(*args, **kwargs)
+
+    with Watch():
+        failures = landing.selftest(rank)
+    assert failures == []
+    assert touched == [], f"the self-test touched the staging carrier: {sorted(set(touched))}"
+    assert torch.equal(staging.view(torch.uint8), before)

@@ -786,26 +786,33 @@ class SharedLanding:
 
     def selftest(self, rank: int) -> list[int]:
         """Compile the gather and the scatter of every bucket and check the
-        gather's bytes; returns the failing buckets. Writes ``rank + 1`` into
-        staging page 0 (the null page) and restores it; each scatter rewrites
-        pool row 0 (the null page's, which nothing reads)."""
+        gather's bytes; returns the failing buckets. Collective.
+
+        It never touches the staging carrier. KVCacheManager registers that
+        tensor for raw transfers and refuses it once torch_tpu has re-backed
+        its storage: the first version wrote rank tags into staging page 0
+        through a uint8 view and restored it, and every decode rank's manager
+        then rejected the carrier ("Tensor's leading (block) dimension does not
+        match its base storage buffer", q38-xfer-tputest-s4-i1 run 2,
+        j-c9b417d2). The gather's source here is a scratch bucket of pages
+        built on the host; each scatter rewrites pool row 0 (the null page's,
+        which nothing reads), as the repack op writes the pool."""
         g, device = self.geo.group, self.pool.device
+        q = pd_shared_compressed.GATHER_PAGE_BUCKETS[-1]
+        page = tuple(self.staging.shape[1:])
+        host = torch.full((q,) + page, rank + 1, dtype=torch.uint8)
+        source = host.view(self.staging.dtype).to(device)
         failures = []
-        null_page = self.staging[0].clone()
-        try:
-            self.staging[0].view(torch.uint8).fill_(rank + 1)
-            for bucket in pd_shared_compressed.GATHER_PAGE_BUCKETS:
-                pack = torch.zeros(bucket, dtype=torch.int32, device=device)
-                gathered = self.gathered[: g * bucket]
-                self._gather_fn(bucket)(self.staging, pack, self.send[:bucket], gathered)
-                seen = gathered.view(torch.uint8)[:, 0].reshape(g * bucket, -1)[:, 0].cpu()
-                want = torch.arange(1, g + 1, dtype=torch.uint8).repeat_interleave(bucket)
-                if not torch.equal(seen, want):
-                    failures.append(bucket)
-                rows = torch.zeros(g * bucket * self.geo.page_rows, dtype=torch.int32, device=device)
-                self._scatter_fn()(self.pool, gathered, rows, rows)
-        finally:
-            self.staging[0].copy_(null_page)
+        for bucket in pd_shared_compressed.GATHER_PAGE_BUCKETS:
+            pack = torch.zeros(bucket, dtype=torch.int32, device=device)
+            gathered = self.gathered[: g * bucket]
+            self._gather_fn(bucket)(source, pack, self.send[:bucket], gathered)
+            seen = gathered.view(torch.uint8)[:, 0].reshape(g * bucket, -1)[:, 0].cpu()
+            want = torch.arange(1, g + 1, dtype=torch.uint8).repeat_interleave(bucket)
+            if not torch.equal(seen, want):
+                failures.append(bucket)
+            rows = torch.zeros(g * bucket * self.geo.page_rows, dtype=torch.int32, device=device)
+            self._scatter_fn()(self.pool, gathered, rows, rows)
         return failures
 
 
