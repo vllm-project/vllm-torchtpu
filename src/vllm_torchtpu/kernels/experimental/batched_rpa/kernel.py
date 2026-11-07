@@ -373,6 +373,7 @@ def generate_mask(
     *,
     bq_start: int,
     step_meta: ComputeMetadata,
+    stitch_meta: StitchMetadata | None = None,
     cfgs: configs.RpaConfigs,
 ) -> jax.Array:
     """Generates causal, sliding window, and attention scope mask for QK computation."""
@@ -396,9 +397,19 @@ def generate_mask(
         # Step 2
         #   offset = causal_offset - bq_start
         offset = step_meta.causal_offset[b_idx] - bq_start
-        mask_b = q_kv_diff >= offset
-        if (sliding_window := cfgs.model.sliding_window) is not None:
-            mask_b = jnp.logical_and(mask_b, q_kv_diff < sliding_window + offset)
+        if cfgs.model.use_causal_mask:
+            mask_b = q_kv_diff >= offset
+            if (sliding_window := cfgs.model.sliding_window) is not None:
+                mask_b = jnp.logical_and(mask_b, q_kv_diff < sliding_window + offset)
+        else:
+            if stitch_meta is not None:
+                valid_k = (
+                    stitch_meta.bkv_sz_frm_cache[b_idx]
+                    + stitch_meta.bkv_sz_frm_new[b_idx]
+                )
+                mask_b = kv_iota < valid_k
+            else:
+                mask_b = jnp.broadcast_to(True, (k_heads, tq, s))
 
         if step_meta.local_k_start is not None:
             mask_b = jnp.logical_and(mask_b, kv_iota >= step_meta.local_k_start[b_idx])
@@ -640,6 +651,7 @@ def rpa_body(
             ),
             bq_start=bq_start,
             step_meta=step_meta,
+            stitch_meta=stitch_meta,
             cfgs=cfgs,
         )
 

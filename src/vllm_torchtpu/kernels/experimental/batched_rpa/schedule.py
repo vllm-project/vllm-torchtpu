@@ -758,14 +758,19 @@ class BaseMetadataComputer:
         q_sz_task = jnp.clip(q_end - q_src, 0, cfgs.bq_sz)
 
         start_k_idx = 0
-        if (sliding_window := cfgs.model.sliding_window) is not None:
+        if cfgs.model.use_causal_mask and (
+            sliding_window := cfgs.model.sliding_window
+        ) is not None:
             sw_start_idx = q_offset + q_idx * cfgs.bq_sz - sliding_window + 1
             start_k_idx = jnp.maximum(0, sw_start_idx) // cfgs.bkv_sz
 
-        end_k_idx_causal = (
-            q_offset + q_idx * cfgs.bq_sz + q_sz_task - 1
-        ) // cfgs.bkv_sz + 1
-        end_k_idx = jnp.minimum(num_k, end_k_idx_causal)
+        if cfgs.model.use_causal_mask:
+            end_k_idx_causal = (
+                q_offset + q_idx * cfgs.bq_sz + q_sz_task - 1
+            ) // cfgs.bkv_sz + 1
+            end_k_idx = jnp.minimum(num_k, end_k_idx_causal)
+        else:
+            end_k_idx = num_k
         if cfgs.serve.attention_scope == configs.AttentionScope.NEW_TOKENS_ONLY:
             start_k_idx = jnp.maximum(start_k_idx, kv_cache_len // cfgs.bkv_sz)
         k_loop_fn = functools.partial(
