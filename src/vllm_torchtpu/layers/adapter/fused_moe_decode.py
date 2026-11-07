@@ -32,7 +32,10 @@ computes what the runner would have with the kernel off: the regular GMM MoE
 all-reduce of their sum. The token count is static there, so the branch costs
 nothing at run time; branching in torch instead gives the two sides different
 graph inputs, which vLLM's per-bucket specialization of one traced graph
-refuses (``compilation.shape_variants``).
+refuses (``compilation.shape_variants``). With ``FUSED_MOE_PREFILL_KERNEL=1``
+the steps above the cap of a TP-expert layer run ``fused_moe_prefill`` instead
+of the GMM path, in the same program and with the same conventions; EP layers
+keep the GMM path for now.
 
 Two shared-expert conventions are served, each as vLLM's MoERunner computes it
 with the kernel off: a shared expert gated by sigmoid(x . w_g) (Qwen3.5,
@@ -65,6 +68,10 @@ from vllm_torchtpu.kernels.experimental.fused_moe_decode import (
 from vllm_torchtpu.kernels.experimental.fused_moe_decode import (
     plan_weight_ring,
     vmem_bytes,
+)
+from vllm_torchtpu.kernels.experimental.fused_moe_prefill import (
+    fused_moe_prefill,
+    plan_blocks,
 )
 from vllm_torchtpu.layers.adapter.linear_common import _quantized_matmul_jax
 from vllm_torchtpu.layers.core.fused_moe_gmm import (
@@ -164,6 +171,60 @@ def _gmm_layer(
     return jax.lax.psum(shared + routed, EP_AXIS_NAME)
 
 
+def _prefill_layer(
+    x,
+    w1,
+    w2,
+    w1_scale,
+    w2_scale,
+    shared_w1,
+    shared_w1_scale,
+    shared_w2,
+    shared_w2_scale,
+    shared_gate_weight,
+    tw,
+    ti,
+    start,
+    *,
+    shared_gated,
+    routed_scale,
+):
+    """Above the cap of a layer armed with the prefill kernel (TP experts with
+    FUSED_MOE_PREFILL_KERNEL=1): the fused MoE prefill kernel, all-reduced.
+    Per rank, inside shard_map."""
+    # Trace-time, once per token bucket: the evidence that the prefill kernel
+    # serves this shape, and in which mode (the kernel's name carries it too).
+    blocks = plan_blocks(
+        x.shape[0], x.shape[1], w2.shape[1], shared_w2.shape[0], w1.dtype
+    )
+    logger.info(
+        "Fused MoE prefill kernel traced for %d tokens (%s)",
+        x.shape[0],
+        "whole experts"
+        if blocks is None
+        else "blocked ib={} ring={} chunk_rows={}".format(*blocks),
+    )
+    return fused_moe_prefill(
+        x,
+        w1,
+        w2,
+        w1_scale,
+        w2_scale,
+        shared_w1,
+        shared_w1_scale,
+        shared_w2,
+        shared_w2_scale,
+        shared_gate_weight if shared_gated else None,
+        # Route weights rounded to the activation dtype, as the decode kernel
+        # and the GMM path round them.
+        tw.astype(x.dtype),
+        ti,
+        axis_name=EP_AXIS_NAME,
+        expert_start=start,
+        routed_scale=routed_scale,
+    )
+
+
 def _layer(
     rank,
     x,
@@ -185,13 +246,20 @@ def _layer(
     max_tokens,
     shared_gated=True,
     routed_scale=1.0,
+    prefill_kernel=False,
 ):
-    """Per-rank body of the op: the kernel up to `max_tokens`, GMM MoE above.
-    An ungated layer still passes its placeholder shared_gate_weight operand
-    (fixed op arity); shared_gated=False ignores it."""
+    """Per-rank body of the op: the kernel up to `max_tokens`; above, the
+    prefill kernel when `prefill_kernel`, else GMM MoE. An ungated layer still
+    passes its placeholder shared_gate_weight operand (fixed op arity);
+    shared_gated=False ignores it."""
     start = rank[0, 1] if expert_parallel else None
     if x.shape[0] > max_tokens:
-        return _gmm_layer(
+        above = (
+            _prefill_layer
+            if prefill_kernel
+            else functools.partial(_gmm_layer, topk=topk)
+        )
+        return above(
             x,
             w1,
             w2,
@@ -205,7 +273,6 @@ def _layer(
             tw,
             ti,
             start,
-            topk=topk,
             shared_gated=shared_gated,
             routed_scale=routed_scale,
         )
@@ -254,6 +321,7 @@ def _build_op(
     max_tokens: int,
     shared_gated: bool = True,
     routed_scale: float = 1.0,
+    prefill_kernel: bool = False,
 ):
     key = (
         id(mesh),
@@ -263,6 +331,7 @@ def _build_op(
         max_tokens,
         shared_gated,
         routed_scale,
+        prefill_kernel,
     )
     op = _OPS.get(key)
     if op is not None:
@@ -276,6 +345,7 @@ def _build_op(
         max_tokens=max_tokens,
         shared_gated=shared_gated,
         routed_scale=routed_scale,
+        prefill_kernel=prefill_kernel,
     )
 
     # torch_tpu infers static arguments from annotations: every operand is a
@@ -510,6 +580,13 @@ def _check_same_arming_on_every_rank(signature: tuple, what: str) -> None:
         )
 
 
+def _serves_prefill_kernel(expert_parallel: bool) -> bool:
+    """FUSED_MOE_PREFILL_KERNEL applies to TP-expert layers only for now: an EP
+    layer keeps the GMM path above the cap, which at GLM-5.2 shapes was faster
+    than the prefill kernel's blocked mode at 4,096 tokens."""
+    return envs.FUSED_MOE_PREFILL_KERNEL and not expert_parallel
+
+
 def arm_fused_moe_decode(model: torch.nn.Module, what: str = "model") -> int:
     """Arm every eligible MoE layer of `model`; returns how many were armed.
 
@@ -590,6 +667,7 @@ def arm_fused_moe_decode(model: torch.nn.Module, what: str = "model") -> int:
                 max_tokens,
                 shared_gated,
                 routed_scale,
+                _serves_prefill_kernel(expert_parallel),
             ),
         )
         for name, tensor in zip(_SHARED_BUFFERS, shared):
@@ -605,7 +683,7 @@ def arm_fused_moe_decode(model: torch.nn.Module, what: str = "model") -> int:
     logger.info(
         "Armed the fused MoE decode kernel on %d of %d MoE layers of the %s "
         "(ep_mesh_index %s, experts_start %s, %d ranks, shared gate %s, "
-        "routed_scale %s, up to %d tokens; GMM MoE above)",
+        "routed_scale %s, up to %d tokens; %s above)",
         armed,
         len(runners),
         what,
@@ -615,7 +693,16 @@ def arm_fused_moe_decode(model: torch.nn.Module, what: str = "model") -> int:
         sorted({s[2] for s in signature[1]}),
         sorted({s[3] for s in signature[1]}),
         max_tokens,
+        "the fused MoE prefill kernel"
+        if any(_serves_prefill_kernel(s[1]) for s in signature[1])
+        else "GMM MoE",
     )
+    if envs.FUSED_MOE_PREFILL_KERNEL and any(s[1] for s in signature[1]):
+        logger.info(
+            "FUSED_MOE_PREFILL_KERNEL applies to TP-expert layers only: the EP "
+            "layers keep the GMM MoE path above %d tokens",
+            max_tokens,
+        )
     return armed
 
 
@@ -625,8 +712,8 @@ def fused_moe_decode(
     """Forward for an armed layer: the all-reduced (shared + routed) output.
 
     One torch op for every token count; above the cap the exported program
-    runs the GMM MoE path (with its own all-reduce), so an armed layer always
-    returns the reduced sum.
+    runs the prefill kernel or the GMM MoE path (each with its own
+    all-reduce), so an armed layer always returns the reduced sum.
     """
     shared_w1, shared_w1_scale, shared_w2, shared_w2_scale, shared_gate_weight = (
         getattr(layer, name) for name in _SHARED_BUFFERS
