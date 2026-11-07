@@ -292,6 +292,7 @@ class TestKVCacheManager:
         self.runner.runner_only_attn_layers = set()
         self.runner.enforce_eager = False
         self.runner.speculative_config = None
+        self.runner.pcp_manager = None
         # No LoRA, so adapter swaps reserve no HBM.
         self.runner.lora_slot_write_hbm_bytes.return_value = 0
         # No ring hand-off, so no buffers are reserved for it.
