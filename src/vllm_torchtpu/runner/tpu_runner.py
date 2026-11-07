@@ -5589,11 +5589,10 @@ class TPUModelRunner(GPUModelRunner):
             runner_utils.relayout_rope_caches(self.model)
         if envs.TPU_MOE_HASH_TABLE_ROW_MAJOR:
             runner_utils.relayout_hash_tables(self.model)
-        if (
-            envs.TPU_GREEDY_TOP_TOKENS
-            and self._pp_is_last
-            and not self.is_pooling_model
-        ):
+        greedy_top_tokens_on = envs.TPU_GREEDY_TOP_TOKENS
+        if greedy_top_tokens_on is None:
+            greedy_top_tokens_on = greedy_top_tokens.logits_from_lm_head(self.model)
+        if greedy_top_tokens_on and self._pp_is_last and not self.is_pooling_model:
             self._greedy_head_owner = greedy_top_tokens.resolve_head_owner(self.model)
 
         # If using eagle3/mtp or dflash speculative decoding, load the draft model and

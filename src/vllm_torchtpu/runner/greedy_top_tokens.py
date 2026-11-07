@@ -13,7 +13,8 @@
 # limitations under the License.
 """Greedy steps sampled from the vocabulary-parallel argmax.
 
-With ``TPU_GREEDY_TOP_TOKENS``, a step whose requests are all greedy, ask for
+With ``TPU_GREEDY_TOP_TOKENS`` (by default for a model that declares
+``logits_from_lm_head``), a step whose requests are all greedy, ask for
 no logprobs and carry no grammar takes vLLM's
 ``LogitsProcessor.get_top_tokens``: each rank argmaxes its slice of the LM
 head and only the (value, index) pairs are exchanged, so the full logits are
@@ -47,6 +48,11 @@ logger = init_logger(__name__)
 LOGITS_FROM_LM_HEAD_ATTR = "logits_from_lm_head"
 
 
+def logits_from_lm_head(model: torch.nn.Module) -> bool:
+    """Whether ``model`` declares its logits are the LM head alone."""
+    return bool(getattr(type(model), LOGITS_FROM_LM_HEAD_ATTR, False))
+
+
 def resolve_head_owner(model: torch.nn.Module) -> torch.nn.Module:
     """The module holding ``lm_head`` and its ``logits_processor``.
 
@@ -56,7 +62,7 @@ def resolve_head_owner(model: torch.nn.Module) -> torch.nn.Module:
     compute_logits = getattr(type(model), "compute_logits", None)
     if getattr(compute_logits, "__module__", "").startswith(
         "vllm_torchtpu."
-    ) and not getattr(type(model), LOGITS_FROM_LM_HEAD_ATTR, False):
+    ) and not logits_from_lm_head(model):
         raise NotImplementedError(
             f"TPU_GREEDY_TOP_TOKENS: {type(model).__name__} computes its logits "
             "in a TPU-specific compute_logits that get_top_tokens does not "

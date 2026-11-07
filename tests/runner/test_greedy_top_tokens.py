@@ -270,6 +270,8 @@ def test_resolve_head_owner_takes_tpu_models_whose_logits_are_the_lm_head():
     owner = TpuHeadModel(_shards(torch.zeros(8, 2), 1)[0])
 
     assert greedy_top_tokens.resolve_head_owner(owner) is owner
+    assert greedy_top_tokens.logits_from_lm_head(owner)
+    assert not greedy_top_tokens.logits_from_lm_head(_Owner(owner.lm_head))
 
 
 def _runner(weight, speculative_config=None):
