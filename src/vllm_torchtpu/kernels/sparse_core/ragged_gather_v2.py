@@ -24,9 +24,12 @@ from jax.experimental.pallas import tpu_sc as plsc
 from vllm_torchtpu.kernels.sparse_core import core_map_helper
 
 
-def calculate_col_size(hidden_size: int, packing: int) -> int:
-    """Calculates the max column size bounded by VMEM limits and
-    hidden_size divisibility."""
+COPY_MODES = ("vector", "dma")
+
+
+def max_safe_col_size(packing: int) -> int:
+    """The largest 128-aligned column block whose double-buffered gather and
+    output blocks fit the per-subcore VMEM target."""
     tpu_info = pltpu.get_tpu_info()
     sc_info = tpu_info.sparse_core
     assert sc_info is not None, "SparseCore info is missing."
@@ -43,7 +46,13 @@ def calculate_col_size(hidden_size: int, packing: int) -> int:
     # Calculate max safe column size based on VMEM budget and aligne to 128.
     num_buffers = 2
     bytes_per_col = (lanes + lanes // packing) * 4 * num_buffers
-    max_safe_col = int((target_bytes // bytes_per_col) // 128) * 128
+    return int((target_bytes // bytes_per_col) // 128) * 128
+
+
+def calculate_col_size(hidden_size: int, packing: int) -> int:
+    """Calculates the max column size bounded by VMEM limits and
+    hidden_size divisibility."""
+    max_safe_col = max_safe_col_size(packing)
 
     # Search for the largest divisor of hidden_size bounded by max_safe_col.
     # The first divisor found is the maximum.
@@ -52,6 +61,60 @@ def calculate_col_size(hidden_size: int, packing: int) -> int:
         if hidden_size % c == 0:
             return c
     return max_safe_col
+
+
+def gather_kernel_name(
+    row_subchunks: int | None = None,
+    col_size: int | None = None,
+    copy_mode: str = "vector",
+) -> str:
+    """The kernel name: every diagnosis knob that is set appears in it, so the
+    variant that ran can be read from the op names. With no knob set it is the
+    served name, sc_ragged_gather_v2."""
+    name = "sc_ragged_gather_v2"
+    if row_subchunks is not None:
+        name += f"-rs_{row_subchunks}"
+    if col_size is not None:
+        name += f"-cs_{col_size}"
+    if copy_mode != "vector":
+        name += f"-{copy_mode}"
+    return name
+
+
+def _check_knobs(
+    hidden_size: int,
+    packing: int,
+    row_subchunks: int | None,
+    col_size: int | None,
+    copy_mode: str,
+) -> None:
+    if copy_mode not in COPY_MODES:
+        raise ValueError(f"copy_mode must be one of {COPY_MODES}, got {copy_mode!r}")
+    if row_subchunks is not None and (
+        not isinstance(row_subchunks, int)
+        or isinstance(row_subchunks, bool)
+        or row_subchunks < 1
+    ):
+        raise ValueError(f"row_subchunks must be a positive int, got {row_subchunks!r}")
+    if col_size is not None:
+        if (
+            not isinstance(col_size, int)
+            or isinstance(col_size, bool)
+            or col_size < 128
+            or col_size % 128
+        ):
+            raise ValueError(
+                f"col_size must be a positive multiple of 128, got {col_size!r}"
+            )
+        if hidden_size % col_size:
+            raise ValueError(
+                f"col_size {col_size} must divide the row width {hidden_size}"
+            )
+        if col_size > max_safe_col_size(packing):
+            raise ValueError(
+                f"col_size {col_size} exceeds the VMEM budget "
+                f"({max_safe_col_size(packing)} columns)"
+            )
 
 
 def main_kernel_v2(
@@ -67,15 +130,14 @@ def main_kernel_v2(
     core_axis_name: str,
     subcore_axis_name: str,
     num_row_subchunks: int,
+    col_size: int,
+    copy_mode: str = "vector",
 ):
     tpu_info = pltpu.get_tpu_info()
     sc_info = tpu_info.sparse_core
     assert sc_info is not None
     num_simd_lanes = sc_info.num_lanes
     hidden_size = in_hbm_ref.shape[-1]
-    dtype_bits = jax.dtypes.itemsize_bits(out_hbm_ref.dtype)
-    packing = 32 // dtype_bits
-    col_size = calculate_col_size(hidden_size, packing)
 
     assert isinstance(hidden_size, int), (
         f"hidden_size must be int, got {type(hidden_size)}"
@@ -174,6 +236,45 @@ def main_kernel_v2(
         )
         plsc.parallel_loop(0, num_phys_cols, step=unpack_col_chunk)(col_loop_fn)
 
+    def inner_dma(gather_ref, b_global):
+        # copy_mode="dma" (diagnosis prototype): the gathered block, 16 rows of
+        # the 32-bit view (each holding `packing` source rows), goes from VMEM to
+        # the output by DMA, with no vector copy and no unpacking. Output row j
+        # of the 32-bit view is x_32bit[indices[j] >> log2(packing)].
+        r = pl.program_id(0)
+        col_id = pl.program_id(1)
+        row0 = (
+            (b_global * num_cores + core_index) * num_row_subchunks + r
+        ) * row_subchunk_size
+        copy = pltpu.make_async_copy(
+            gather_ref,
+            out_hbm_i32.at[
+                pl.ds(pl.multiple_of(row0, row_subchunk_size), row_subchunk_size),
+                pl.ds(pl.multiple_of(col_id * num_phys_cols, 128), num_phys_cols),
+            ],
+            recv_sem,
+        )
+        copy.start()
+        copy.wait()
+
+    def outer_pipeline_dma(idx_ref):
+        b_global = pl.program_id(0) + block_start
+        shift_amount = packing.bit_length() - 1
+        pltpu.emit_pipeline(
+            functools.partial(inner_dma, b_global=b_global),
+            grid=(num_row_subchunks, num_cols),
+            in_specs=pl.BlockSpec(
+                (pl.Indirect(row_subchunk_size), num_phys_cols),
+                lambda r, col_id: (
+                    jnp.bitwise_right_shift(
+                        idx_ref[pl.ds(r * row_subchunk_size, row_subchunk_size)],
+                        shift_amount,
+                    ),
+                    col_id,
+                ),
+            ),
+        )(in_hbm_i32)
+
     def outer_pipeline(idx_ref):
         b = pl.program_id(0)
         b_global = b + block_start
@@ -206,7 +307,7 @@ def main_kernel_v2(
         )(in_hbm_i32, out_hbm_i32)
 
     pltpu.emit_pipeline(
-        outer_pipeline,
+        outer_pipeline_dma if copy_mode == "dma" else outer_pipeline,
         grid=(num_blocks,),
         in_specs=pl.BlockSpec(
             (row_chunk_size,),
@@ -215,19 +316,36 @@ def main_kernel_v2(
     )(indices_hbm_ref)
 
 
-@functools.partial(jax.jit, static_argnames=("trim_rows",))
+@functools.partial(
+    jax.jit, static_argnames=("trim_rows", "row_subchunks", "col_size", "copy_mode")
+)
 def ragged_gather_v2(
     x: jax.Array,
     indices: jax.Array,
     start: jax.Array,
     end: jax.Array,
     trim_rows: bool = True,
+    *,
+    row_subchunks: int | None = None,
+    col_size: int | None = None,
+    copy_mode: str = "vector",
 ) -> jax.Array:
     """Perform gather on indices within dynamic array start and end using BlockSpec.
 
     The kernel writes whole row blocks. ``trim_rows=False`` returns them as they
     are (rows past ``indices.size`` hold row ``x[0]``), which spares the copy that
-    trimming a large output costs when the consumer never reads those rows."""
+    trimming a large output costs when the consumer never reads those rows.
+
+    Diagnosis knobs (default off; each one that is set is named in the kernel
+    name, see gather_kernel_name; with none set the kernel is unchanged):
+      row_subchunks: 16-row subchunks per outer row block (default 1..4 by size).
+      col_size: column block width (default calculate_col_size).
+      copy_mode: "vector" (served) or "dma", a DMA-only prototype that writes
+        each gathered VMEM block to the output with no vector copy. For a packed
+        dtype (``packing = 32 // bits > 1``) it returns the gathered 32-bit rows
+        unpacked: ``out[packing * j + h] == x[packing * (indices[j] // packing) + h]``,
+        so ``x[indices[j]] == out[packing * j + indices[j] % packing]``.
+    """
 
     assert x.ndim == 2, "Ragged gather only supports 2d inputs."
     assert indices.ndim == 1, "Ragged gather only supports 1d indices."
@@ -241,8 +359,12 @@ def ragged_gather_v2(
     if dtype not in (jnp.bfloat16, jnp.float32, jnp.int8, jnp.int4):
         raise ValueError(f"dtype must be f32, bf16, int8, or int4, but got {dtype}")
 
+    if copy_mode not in COPY_MODES:
+        raise ValueError(f"copy_mode must be one of {COPY_MODES}, got {copy_mode!r}")
     sc_info = pltpu.get_tpu_info().sparse_core
     if sc_info is None:
+        if copy_mode != "vector":
+            raise ValueError("copy_mode='dma' needs a SparseCore")
         return x[indices]
 
     hidden_size = x.shape[-1]
@@ -250,7 +372,10 @@ def ragged_gather_v2(
 
     dtype_bits = jax.dtypes.itemsize_bits(dtype)
     packing = 32 // dtype_bits
-    col_size = calculate_col_size(hidden_size, packing)
+    _check_knobs(hidden_size, packing, row_subchunks, col_size, copy_mode)
+    kernel_name = gather_kernel_name(row_subchunks, col_size, copy_mode)
+    if col_size is None:
+        col_size = calculate_col_size(hidden_size, packing)
 
     aligned_hidden_size = ((hidden_size + col_size - 1) // col_size) * col_size
 
@@ -262,6 +387,8 @@ def ragged_gather_v2(
     num_row_subchunks = max(
         1, min(4, (out_size + base_block_size - 1) // base_block_size)
     )
+    if row_subchunks is not None:
+        num_row_subchunks = row_subchunks
 
     row_subchunk_size = num_simd_lanes
     row_chunk_size = row_subchunk_size * num_row_subchunks
@@ -269,6 +396,9 @@ def ragged_gather_v2(
 
     out_pad_size = ((out_size + block_size - 1) // block_size) * block_size - out_size
     indices = jnp.pad(indices, ((0, out_pad_size)))
+    # copy_mode="dma" writes every gathered 32-bit row whole: `packing` rows of
+    # the output dtype per index.
+    out_rows_mult = packing if copy_mode == "dma" else 1
 
     vector_mesh = plsc.VectorSubcoreMesh(
         num_cores=sc_info.num_cores,
@@ -282,9 +412,11 @@ def ragged_gather_v2(
             core_axis_name=vector_mesh.core_axis_name,
             subcore_axis_name=vector_mesh.subcore_axis_name,
             num_row_subchunks=num_row_subchunks,
+            col_size=col_size,
+            copy_mode=copy_mode,
         ),
         out_type=jax.ShapeDtypeStruct(
-            (out_size + out_pad_size, aligned_hidden_size), dtype
+            (out_rows_mult * (out_size + out_pad_size), aligned_hidden_size), dtype
         ),
         compiler_params=pltpu.CompilerParams(
             use_tc_tiling_on_sc=True,
@@ -297,6 +429,9 @@ def ragged_gather_v2(
             pltpu.SemaphoreType.DMA((1,)),
         ],
         mesh=vector_mesh,
-        name="sc_ragged_gather_v2",
+        name=kernel_name,
     )(start, end, x, indices)
+    if copy_mode == "dma":
+        rows = out_rows_mult * (out_size if trim_rows else out_size + out_pad_size)
+        return out[:rows, :hidden_size]
     return out[:out_size, :hidden_size] if trim_rows else out[:, :hidden_size]
