@@ -444,8 +444,11 @@ def compute_tpu_compilation_hash(vllm_config: VllmConfig) -> str:
             else None,
         },
     }
-    # A megakernel plugin's cache-layout request digest, or None: then no
-    # factor is added and stock compile keys stay byte-identical.
+    # The megakernel settings (VLLM_TPU_MEGAKERNEL in "env",
+    # additional_config["megakernel"] in VllmConfig.compute_hash) key the
+    # stock graphs like any other setting: a plugin may change the stock
+    # model, e.g. reshard its experts in place. A plugin's cache-layout
+    # request adds its digest; without one (None) no factor is added.
     mk_salt = compile_cache_salt(vllm_config)
     if mk_salt is not None:
         factors["megakernel_layout"] = mk_salt

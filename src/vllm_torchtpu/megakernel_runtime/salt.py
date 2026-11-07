@@ -15,8 +15,10 @@
 
 The salt is the digest of the plugin's cache-layout request, or `None` when
 the plugin makes none. It carries no plugin fingerprint or source hash, so
-stock compile keys stay byte-identical with a megakernel on, and editing a
-plugin never re-keys stock graphs.
+editing a plugin never re-keys stock graphs. The megakernel settings
+themselves (`VLLM_TPU_MEGAKERNEL`, `additional_config["megakernel"]`) are
+hashed with the other settings: a plugin may change the stock model (e.g.
+reshard its experts in place).
 """
 
 from __future__ import annotations

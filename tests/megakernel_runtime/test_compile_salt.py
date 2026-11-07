@@ -13,7 +13,7 @@
 # limitations under the License.
 """The megakernel compile-cache salt: the digest of a plugin's cache-layout
 request (`None` without one), the same plugin resolution as the driver, and
-stock compile keys unchanged."""
+the megakernel settings in the stock compile key."""
 
 from __future__ import annotations
 
@@ -70,22 +70,41 @@ def _fake_template(mk_fake_template: str) -> None:
     assert plugin_mod.SHORTHANDS[mk_fake_template] == _ENTRY
 
 
+_HASH_DEFS = (
+    "_TPU_COMPILE_ENV_IGNORED",
+    "_NATIVE_TPU_COMPILE_ENV_VARS",
+    "_tpu_compile_env_factors",
+    "compute_tpu_compilation_hash",
+)
+
+
 def _compute_hash_fn() -> Any:
-    """`compute_tpu_compilation_hash`, compiled from source with CPU stand-ins."""
+    """`compute_tpu_compilation_hash`, compiled from source (with the real env
+    factors) and CPU stand-ins for the package versions and the rest."""
     path = _SRC / "vllm_torchtpu" / "compilation" / "tpu_compiler.py"
     src = path.read_text(encoding="utf-8")
-    fn = next(
-        n
-        for n in ast.walk(ast.parse(src))
-        if isinstance(n, ast.FunctionDef) and n.name == "compute_tpu_compilation_hash"
-    )
+    defs = {
+        name: n
+        for n in ast.parse(src).body
+        for name in (
+            [n.name]
+            if isinstance(n, ast.FunctionDef)
+            else [t.id for t in n.targets if isinstance(t, ast.Name)]
+            if isinstance(n, ast.Assign)
+            else []
+        )
+        if name in _HASH_DEFS
+    }
+    assert set(defs) == set(_HASH_DEFS), sorted(defs)
     import hashlib
 
+    import vllm_torchtpu.envs as envs
+
     ns: dict[str, Any] = {
+        "Any": Any,
+        "envs": envs,
         "torch": torch,
         "importlib_metadata": SimpleNamespace(version=lambda _n: "0"),
-        "_tpu_compile_env_factors": dict,
-        "_NATIVE_TPU_COMPILE_ENV_VARS": (),
         "os": os,
         "utils": SimpleNamespace(get_dp_size=lambda _p: 1),
         "Path": Path,
@@ -98,7 +117,9 @@ def _compute_hash_fn() -> Any:
         "VllmConfig": Any,
         "prefill_checkpoint_enabled": lambda _cfg: False,
     }
-    exec(compile(ast.get_source_segment(src, fn) or "", str(path), "exec"), ns)
+    for name in _HASH_DEFS:
+        code = ast.get_source_segment(src, defs[name]) or ""
+        exec(compile(code, str(path), "exec"), ns)
     return ns["compute_tpu_compilation_hash"]
 
 
@@ -116,17 +137,25 @@ def _vllm_config(megakernel: Any) -> Any:
     )
 
 
-def test_stock_compile_hash_unchanged_with_megakernel_on(
+def test_stock_compile_hash_keys_the_megakernel_settings(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """The megakernel settings key the stock graphs like any other setting (a
+    plugin may change the stock model); a layout request adds its digest."""
     compute = _compute_hash_fn()
     base = compute(_vllm_config(None))
+    # VLLM_TPU_MEGAKERNEL is one of the hashed env factors.
+    monkeypatch.setenv("VLLM_TPU_MEGAKERNEL", "1")
+    on = compute(_vllm_config(None))
+    assert on != base
+    monkeypatch.setenv("VLLM_TPU_MEGAKERNEL", "mode=tp")
+    assert compute(_vllm_config(None)) not in (base, on)
+    monkeypatch.delenv("VLLM_TPU_MEGAKERNEL")
+    # additional_config["megakernel"] reaches the key through
+    # VllmConfig.compute_hash (next test); this hash adds only the salt.
     shorthand_cfg = {"plugin": _SHORTHAND, "options": {"mode": "tp"}}
     for mk in (True, _SHORTHAND, shorthand_cfg):
         assert compute(_vllm_config(mk)) == base
-    monkeypatch.setenv("VLLM_TPU_MEGAKERNEL", "1")
-    assert compute(_vllm_config(None)) == base
-    monkeypatch.delenv("VLLM_TPU_MEGAKERNEL")
     # A plugin with a cache-layout request keys its graphs by the request only.
     (tmp_path / "lay_mk_plugin.py").write_text(_LAYOUT_PLUGIN, encoding="utf-8")
     monkeypatch.syspath_prepend(str(tmp_path))
@@ -138,6 +167,13 @@ def test_stock_compile_hash_unchanged_with_megakernel_on(
         assert compute(_vllm_config(mk2)) not in (base, lay)
     finally:
         sys.modules.pop("lay_mk_plugin", None)
+
+
+def test_megakernel_additional_config_is_not_hash_ignored() -> None:
+    """`VllmConfig.compute_hash` (the AOT / piecewise cache key) keeps
+    `additional_config["megakernel"]`."""
+    utils = pytest.importorskip("vllm_torchtpu.runner.utils", reason="needs vLLM")
+    assert "megakernel" not in utils.HASH_IGNORED_ADDITIONAL_CONFIG_KEYS
 
 
 def _salt_config(megakernel: Any) -> Any:
