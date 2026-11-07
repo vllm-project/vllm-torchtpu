@@ -354,6 +354,38 @@ def test_gmm_weight_quantized_block_larger_than_tile_k():
 
 
 @pytest.mark.tpu_test
+@pytest.mark.parametrize("quantized", [False, True])
+def test_gmm_partial_row_bucket_accumulates_across_k_tiles(quantized):
+    """Groups ending mid-tile run a row bucket below tile_m; with tile_k < K
+    that bucket must accumulate every k tile, not only the first and last."""
+    _require_tpu()
+
+    in_size, out_size, num_groups = 1024, 256, 4
+    tile_info = TileSizes(tile_m=128, bucket_base=32, tile_k=256, tile_n=out_size)
+    key = jax.random.key(1)
+    group_sizes = jnp.array([40, 0, 100, 7], dtype=jnp.int32)
+    lhs = jax.random.uniform(key, (160, in_size), jnp.bfloat16, -1, 1)
+    rhs = jax.random.uniform(key, (num_groups, in_size, out_size), jnp.bfloat16, -1, 1)
+    rhs_scale = None
+    if quantized:
+        rhs, rhs_scale = quantize_tensor(rhs, jnp.float8_e4m3fn, axis=1, block_size=256)
+        rhs_scale = jnp.expand_dims(rhs_scale, axis=2)
+
+    expected = reference_gmm(lhs, rhs, group_sizes, rhs_scale=rhs_scale)
+    actual = gmm_v2(
+        lhs,
+        rhs,
+        group_sizes,
+        rhs_scale=rhs_scale,
+        tile_info=tile_info,
+        maybe_quantize_lhs=False,
+    ).astype(lhs.dtype)
+
+    valid = int(group_sizes.sum())
+    _assert_allclose(actual[:valid], expected[:valid], atol=3e-1, rtol=3e-1)
+
+
+@pytest.mark.tpu_test
 @pytest.mark.parametrize(
     "group_config",
     [
