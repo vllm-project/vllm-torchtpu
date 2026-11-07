@@ -4686,6 +4686,17 @@ class TestTPURaidenConnectorWorker:
                 "Control RPC connection failed before sending request to another:27000",
                 False,
             ),
+            (
+                "Remote Controller Server execution failed: Layout fingerprint "
+                "mismatch between source and destination",
+                True,
+            ),
+            (
+                "Remote Controller Server execution failed: Raiden remote native "
+                "execution failed: Layout fingerprint mismatch between source and "
+                "destination",
+                False,
+            ),
         ],
     )
     def test_stage3_only_exact_prearm_failure_releases_blocks(
@@ -4725,6 +4736,8 @@ class TestTPURaidenConnectorWorker:
             "registration was cancelled for req_id=src-late, uuid=1003",
             "Control RPC connection failed before sending request to "
             "prefill-controller.test:27000",
+            "Remote Controller Server execution failed: Layout fingerprint "
+            "mismatch between source and destination",
         ],
     )
     def test_stage3_prearm_reply_does_not_release_previously_armed_load(
@@ -4748,6 +4761,30 @@ class TestTPURaidenConnectorWorker:
             assert "dst-late" in worker._stage3_pending_controller_failures
             assert worker._load_block_ids["dst-late"] == [11, 12]
         assert facade.start_transfer.call_count == 1
+
+    def test_stage3_layout_mismatch_log_names_the_fingerprints_to_compare(self):
+        worker = _make_raiden_worker(
+            is_producer=False, tp_rank=0, tp_size=1, block_size=1024
+        )
+        self._park_missing_registration_load(
+            worker,
+            [
+                RuntimeError(
+                    "Remote Controller Server execution failed: Layout "
+                    "fingerprint mismatch between source and destination"
+                )
+            ],
+            registration_wait_s=30.0,
+        )
+        with (
+            patch(f"{_MOD}.tpu_envs.TPU_KV_RESHARD_TRANSPORT", "raiden", create=True),
+            patch(f"{_MOD}.logger.error") as log,
+        ):
+            assert worker.get_finished() == (set(), {"dst-late"})
+        log.assert_called_once()
+        message = log.call_args.args[0] % log.call_args.args[1:]
+        assert "before receiver arming" in message
+        assert "compare layout_fingerprint" in message
 
     def test_stage3_missing_registration_then_cancelled_does_not_retry(self):
         worker = _make_raiden_worker(

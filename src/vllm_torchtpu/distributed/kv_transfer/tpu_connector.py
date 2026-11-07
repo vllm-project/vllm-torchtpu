@@ -6149,30 +6149,46 @@ class TPURaidenConnectorWorker:
                 and destination_req_id not in self._stage3_controller_accepted
                 and destination_req_id not in self._stage3_pending_controller_failures
             )
+            # The source controller compares both sides' layout fingerprints
+            # while it plans the transfer, before it arms any receiver.
+            layout_mismatch = (
+                str(exc)
+                == (
+                    "Remote Controller Server execution failed: Layout "
+                    "fingerprint mismatch between source and destination"
+                )
+                and destination_req_id not in self._stage3_controller_accepted
+                and destination_req_id not in self._stage3_pending_controller_failures
+            )
             if (
                 missing_registration
                 or cancelled_registration
                 or unsent_connection_failure
+                or layout_mismatch
             ):
-                # These registration lookup replies precede receiver arming
-                # for this submission, and an exact pre-send connection
-                # failure never reached the source. Match the connection
-                # failure exactly: nested worker errors or a prior uncertain
-                # attempt cannot prove that destination blocks are safe to
-                # release. Unlike a missing registration, cancellation and
-                # connection failure must not be retried against the same
-                # source here. A scheduler-finished request also resolves its
-                # delayed free.
+                # These registration lookup replies and the layout comparison
+                # precede receiver arming for this submission, and an exact
+                # pre-send connection failure never reached the source. Match
+                # the replies exactly: nested worker errors or a prior
+                # uncertain attempt cannot prove that destination blocks are
+                # safe to release. Unlike a missing registration, the others
+                # must not be retried against the same source here. A
+                # scheduler-finished request also resolves its delayed free.
                 self._record_stage3_load_failure(
                     destination_req_id, pending.local_blocks
                 )
                 logger.error(
                     "Stage-3 controller transfer failed before receiver "
-                    "arming req_id=%s destination_req_id=%s uuid=%d: %s",
+                    "arming req_id=%s destination_req_id=%s uuid=%d: %s%s",
                     source_req_id,
                     destination_req_id,
                     uuid,
                     exc,
+                    " (prefill and decode registered different KV layouts; "
+                    "compare layout_fingerprint in each side's 'Raiden work "
+                    "unit registered' log line)"
+                    if layout_mismatch
+                    else "",
                 )
                 return
             # Generic RPC rejection can occur after receiver arming.
