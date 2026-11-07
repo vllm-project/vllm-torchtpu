@@ -43,14 +43,16 @@ def _kernel(
     page_ref,  # [1, S / p, p, W] the page before the write
     # Out
     o_ref,  # [1, S / p, p, W] aliased with the cache
+    *,
+    bits: int,
 ):
     run = pl.program_id(0)
     active = run < num_runs_ref[0]
 
     @pl.when(active)
     def _():
-        rows, packing, width = page_ref.shape[1:]
-        bits = 32 // packing
+        rows, _, width = page_ref.shape[1:]
+        packing = 32 // bits
         words = page_ref.bitcast(jnp.uint32)[0, :, 0, :]
         lo, hi = run_lo_ref[run], run_hi_ref[run]
         row = jax.lax.broadcasted_iota(jnp.int32, (rows, width), 0)
@@ -95,7 +97,7 @@ def _runs(pages: jax.Array, slots: jax.Array, num_pages: int, max_runs: int):
     return num_runs, run_page, run_lo, run_lo + count, run_tok0
 
 
-@functools.partial(jax.jit, static_argnames=("max_runs", "interpret"))
+@functools.partial(jax.jit, static_argnames=("max_runs", "bits", "interpret"))
 def write_rows(
     cache: jax.Array,
     rows: jax.Array,
@@ -103,6 +105,7 @@ def write_rows(
     slots: jax.Array,
     *,
     max_runs: int,
+    bits: int | None = None,
     interpret: bool = False,
 ) -> jax.Array:
     """Write ``rows [T, W]`` (cache dtype) at ``(pages[t], slots[t])``.
@@ -111,29 +114,38 @@ def write_rows(
     run must take consecutive slots of one page, as a request's new tokens do;
     a run boundary is wherever that breaks. `max_runs` bounds the number of
     runs (see `max_write_runs`).
+
+    `bits` per slot defaults to the cache dtype's width. With ``bits=4`` (the
+    uint8 4-bit caches of `msa_fp4`) `rows` are uint8 values below 16, and
+    each 32-bit word holds 8 slots.
     """
-    num_pages, rows_per_page, packing, width = cache.shape
+    num_pages, rows_per_page, word_bytes, width = cache.shape
+    if bits is None:
+        bits = 32 // word_bytes
+    packing = 32 // bits
     page_size = rows_per_page * packing
     num_tokens = rows.shape[0]
-    bits = 32 // packing
     num_runs, run_page, run_lo, run_hi, run_tok0 = _runs(
         pages, slots, num_pages, max_runs
     )
     # Each run's rows laid out by slot ([run, j, r] = slot r * p + j), so the
     # kernel merges whole packing slots without strided loads.
-    word_bits = jax.lax.bitcast_convert_type(rows, _UINT_BY_BITS[bits]).astype(
-        jnp.uint32
-    )
+    if bits == 4:
+        word_bits = rows.astype(jnp.uint32) & 0xF
+    else:
+        word_bits = jax.lax.bitcast_convert_type(rows, _UINT_BY_BITS[bits]).astype(
+            jnp.uint32
+        )
     src = run_tok0[:, None] + jnp.arange(page_size, dtype=jnp.int32) - run_lo[:, None]
     new = word_bits[jnp.clip(src, 0, num_tokens - 1)]
     new = new.reshape(max_runs, rows_per_page, packing, width).transpose(0, 2, 1, 3)
 
     page_block = pl.BlockSpec(
-        (1, rows_per_page, packing, width),
+        (1, rows_per_page, word_bytes, width),
         lambda r, n, run_page, *_: (run_page[r], 0, 0, 0),
     )
     return pl.pallas_call(
-        _kernel,
+        functools.partial(_kernel, bits=bits),
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=4,
             grid=(max_runs,),

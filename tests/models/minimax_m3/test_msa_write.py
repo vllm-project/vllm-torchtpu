@@ -99,3 +99,27 @@ def test_lowers_for_tpu(dtype):
     text = lowered.as_text()
     assert "tpu_custom_call" in text
     assert "minimax_m3_msa_write_rows" in text
+
+
+def test_fp4_rows_land_in_their_nibbles():
+    """bits=4 on a uint8 4-bit cache: runs across and within pages, the rest
+    of every page (other slots' nibbles) unchanged."""
+    from vllm_torchtpu.models.minimax_m3.kernels import msa_fp4, msa_write
+
+    rng = np.random.default_rng(3)
+    num_pages, page, width = 6, 128, 256
+    before = jnp.asarray(rng.integers(0, 16, (num_pages, page, width)), jnp.uint8)
+    cache = msa_fp4.pack_rows(before)
+    # Request A: slots 120..135 over pages 2 -> 4; request B: 5 tokens in page 1; one dropped token.
+    pages = np.array([2] * 8 + [4] * 8 + [1] * 5 + [99], np.int32)
+    slots = np.array(list(range(120, 128)) + list(range(8)) + list(range(40, 45)) + [0], np.int32)
+    rows = jnp.asarray(rng.integers(0, 16, (len(pages), width)), jnp.uint8)
+    out = msa_write.write_rows(
+        cache, rows, jnp.asarray(pages), jnp.asarray(slots),
+        max_runs=msa_write.max_write_runs(len(pages), 3, page), bits=4, interpret=True,
+    )
+    expected = np.asarray(before).copy()
+    for t, (p, s) in enumerate(zip(pages, slots)):
+        if p < num_pages:
+            expected[p, s] = np.asarray(rows[t])
+    np.testing.assert_array_equal(msa_fp4.unpack_rows(out), expected)
