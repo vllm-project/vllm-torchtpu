@@ -18,6 +18,10 @@ Key arguments:
 * `--num-iters-warmup` / `--num-iters` — warmup iterations (not traced) and
   profiled iterations. Warmup matters: the first iterations pay XLA compilation.
 * `--profile-result-dir` — where the trace lands.
+* `--profile-prefix` — optional subdirectory name under `--profile-result-dir`.
+* `--profiler-kwargs` — optional JSON dictionary of per-session TPU profiler
+  options passed to `llm.start_profile(...)` (see
+  [Dynamic profiling options](server.md#dynamic-profiling-options-profiler_kwargs-and-profile_prefix)).
 * All standard vLLM `EngineArgs` are accepted (`--tensor-parallel-size`,
   `--max-model-len`, `--enable-expert-parallel`, ...).
 
