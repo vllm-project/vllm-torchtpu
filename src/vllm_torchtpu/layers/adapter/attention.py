@@ -280,6 +280,7 @@ def _pallas_rpa_kernel_impl(
     use_causal_mask: bool = True,
     kv_layout: batched_rpa_configs.KVLayout | None = None,
     block_major: bool = False,
+    subpage_split: int = 1,
 ) -> tuple[jax.Array, jax.Array]:
     pool_shape = kv_cache.shape
     # Fold the block-major pool's `(num_blocks, rows_per_block, *page)` layout so
@@ -319,7 +320,13 @@ def _pallas_rpa_kernel_impl(
             kv_cache.reshape(packed_pool_shape),
             (pool_shape[0] * page_stride, *native_shape[1:]),
         )
-        block_tables = block_tables * page_stride
+        assert page_stride % subpage_split == 0, (
+            f"page_stride ({page_stride}) must be divisible by "
+            f"subpage_split ({subpage_split})"
+        )
+        rem_stride = page_stride // subpage_split
+        if rem_stride > 1:
+            block_tables = block_tables * rem_stride
     metadata = AttentionMetadata(
         # NOTE: vLLM applies RoPE before attention,
         # so input_positions is not consumed here.
@@ -382,6 +389,7 @@ def _pallas_rpa_kernel_default(
     skip_kv_update: bool,
     use_causal_mask: bool = True,
     block_major: bool = False,
+    subpage_split: int = 1,
 ) -> tuple[jax.Array, jax.Array]:
     """Default Pallas RPA kernel entry — used by `PallasAttentionBackendImpl`.
 
@@ -409,6 +417,7 @@ def _pallas_rpa_kernel_default(
         soft_cap=soft_cap,
         use_causal_mask=use_causal_mask,
         block_major=block_major,
+        subpage_split=subpage_split,
     )
 
 
@@ -439,6 +448,7 @@ def _pallas_rpa_kernel_local(
     soft_cap: float | None = None,
     skip_kv_update: bool,
     use_causal_mask: bool = True,
+    subpage_split: int = 1,
 ) -> tuple[jax.Array, jax.Array]:
     """Local (non-shard_map) RPA entry for the tp=1 eagle3 draft.
 
@@ -469,6 +479,7 @@ def _pallas_rpa_kernel_local(
         shard=False,
         kv_block_cap=_DRAFT_KV_BLOCK_CAP,
         use_causal_mask=use_causal_mask,
+        subpage_split=subpage_split,
     )
 
 
@@ -554,6 +565,7 @@ def _pallas_rpa_kernel_batched(
     kv_layout: batched_rpa_configs.KVLayout,
     decode_query_size: int = 1,
     block_major: bool = False,
+    subpage_split: int = 1,
 ) -> tuple[jax.Array, jax.Array]:
     """Batched-RPA Pallas kernel entry — used by
     `PallasBatchedRPAAttentionBackendImpl`."""
@@ -585,6 +597,7 @@ def _pallas_rpa_kernel_batched(
         use_causal_mask=use_causal_mask,
         kv_layout=kv_layout,
         block_major=block_major,
+        subpage_split=subpage_split,
     )
 
 
@@ -948,6 +961,24 @@ class PallasAttentionBackendImpl(AttentionImpl):
         # `(pool_index, layout)` identifying this layer's region in the merged
         # block-major unified pool; populated by `set_block_major_pool()`.
         self._bm_region: tuple[int, BlockMajorPoolLayout] | None = None
+        # Sub-page split factor when `KernelBlockTable` expands manager blocks
+        # into `split` consecutive native sub-pages inside a shared 4D pool.
+        self._subpage_split: int = 1
+        self._kv_cache_ndim: int = 5
+
+    def set_subpage_split(self, subpage_split: int) -> None:
+        """Records the `KernelBlockTable` sub-page split factor for this layer."""
+        assert subpage_split >= 1
+        if self._subpage_split != subpage_split:
+            self._subpage_split = subpage_split
+            self._kernel_config_cache.clear()
+
+    def set_kv_cache_ndim(self, kv_cache_ndim: int) -> None:
+        """Records the allocated `kv_cache` tensor rank (4D pool vs 5D native)."""
+        assert kv_cache_ndim in (4, 5, 6)
+        if self._kv_cache_ndim != kv_cache_ndim:
+            self._kv_cache_ndim = kv_cache_ndim
+            self._kernel_config_cache.clear()
 
     def set_block_major_pool(
         self, pool_index: int, layout: BlockMajorPoolLayout
@@ -971,7 +1002,9 @@ class PallasAttentionBackendImpl(AttentionImpl):
         use_pcp_streaming: bool = False,
         cp_kv_cache_interleave_size: int = 0,
         block_major: bool = False,
+        kv_cache_ndim: int | None = None,
     ):
+        effective_ndim = self._kv_cache_ndim if kv_cache_ndim is None else kv_cache_ndim
         ctx = get_vllm_model_wrapper_context()
         vllm_config = cast("VllmConfig | None", ctx.vllm_config)
         max_model_len = (
@@ -996,6 +1029,8 @@ class PallasAttentionBackendImpl(AttentionImpl):
             pcp_kv_layout,
             self.decode_query_size,
             block_major,
+            self._subpage_split,
+            effective_ndim,
         )
         existing = self._kernel_config_cache.get(config_key)
         if existing is not None:
@@ -1038,6 +1073,8 @@ class PallasAttentionBackendImpl(AttentionImpl):
             pcp_kv_layout,
             self.decode_query_size,
             block_major,
+            self._subpage_split,
+            effective_ndim,
         )
         existing = self._kernel_registry.get(registry_key)
         if existing is not None:
@@ -1087,6 +1124,13 @@ class PallasAttentionBackendImpl(AttentionImpl):
                         "pool"
                     )
                 entry_kwargs["block_major"] = True
+            if self._subpage_split > 1:
+                if "subpage_split" not in entry_params:
+                    raise NotImplementedError(
+                        f"{type(self).__name__} kernel {self._kernel_entry.__name__} "
+                        "does not support sub-page split KV cache blocks"
+                    )
+                entry_kwargs["subpage_split"] = self._subpage_split
             wrapped_fn = functools.partial(
                 self._kernel_entry,
                 mesh=mesh,
@@ -1622,6 +1666,7 @@ class PallasAttentionBackendImpl(AttentionImpl):
             use_pcp_streaming=use_pcp_streaming,
             cp_kv_cache_interleave_size=cp_kv_cache_interleave_size,
             block_major=self._bm_kernel,
+            kv_cache_ndim=kv_cache.ndim,
         )
 
         # TODO (geyuhao) the support of this API is pending discussion.
