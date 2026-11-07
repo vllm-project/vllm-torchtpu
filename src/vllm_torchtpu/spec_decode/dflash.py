@@ -54,6 +54,10 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+# --additional-config key: keep an opted-in drafter's KV DCP-sharded or whole
+# per rank (`_shards_draft_kv_over_dcp`). Part of the compile-cache key.
+DRAFT_KV_OVER_DCP_KEY = "draft_kv_over_dcp"
+
 
 def _draft_has_moe_layers(draft_model: torch.nn.Module) -> bool:
     """Whether a draft carries MoE layers, i.e. emits EP collectives.
@@ -287,13 +291,38 @@ class DFlashProposer:
 
     def _shards_draft_kv_over_dcp(self, attn_impl: PallasAttentionBackendImpl) -> bool:
         """Whether this draft layer keeps its KV DCP-sharded like the target's
-        (`cp_draft_attention`): drafters opt in (`shards_draft_kv_over_dcp`),
-        for sliding-window layers (causal or not)."""
+        (`cp_draft_attention`) rather than whole on every rank.
+
+        Drafters opt in (`shards_draft_kv_over_dcp`), for sliding-window
+        layers. ``--additional-config '{"draft_kv_over_dcp": ...}'`` picks
+        ``"sharded"``, ``"replicated"`` or ``"auto"`` (default: sharded when
+        the DCP group is wider than a draft KV head's replicas, where a
+        replicated draft costs the most HBM).
+        """
+        additional = self.vllm_config.additional_config
+        mode = (additional if isinstance(additional, dict) else {}).get(
+            DRAFT_KV_OVER_DCP_KEY, "auto"
+        )
+        if mode not in ("auto", "sharded", "replicated"):
+            raise ValueError(
+                f"additional_config.{DRAFT_KV_OVER_DCP_KEY} must be auto, sharded or "
+                f"replicated, got {mode!r}"
+            )
         opted_in = getattr(self.draft_model, "shards_draft_kv_over_dcp", False)
-        shard = opted_in and attn_impl.sliding_window is not None
+        dcp = self.vllm_config.parallel_config.decode_context_parallel_size
+        shard = (
+            opted_in
+            and attn_impl.sliding_window is not None
+            and (
+                mode == "sharded"
+                or (mode == "auto" and dcp > self._draft_kv_head_replicas())
+            )
+        )
         logger.info_once(
-            "Draft KV under DCP: %s (opt-in=%s, draft=%s, sliding_window=%s, causal=%s)",
+            "Draft KV under DCP: %s (%s=%s, opt-in=%s, draft=%s, sliding_window=%s, causal=%s)",
             "sharded" if shard else "replicated",
+            DRAFT_KV_OVER_DCP_KEY,
+            mode,
             opted_in,
             type(self.draft_model).__name__,
             attn_impl.sliding_window,
