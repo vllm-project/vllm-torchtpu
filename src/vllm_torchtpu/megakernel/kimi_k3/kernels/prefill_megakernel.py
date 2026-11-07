@@ -3365,13 +3365,25 @@ def kda_chunk(q, k, v, gate, beta, state, *, sub_block=_KDA_SUB_BLOCK, invert=No
 # ---------------------------------------------------------------------------
 
 
-def mla_projections(hidden, weights, *, epsilon=1e-5, return_latent=False, query_scale=1.0,
-                    sp_axis=None, gather_tables=None, gather_collective_id=45):
+def mla_projections(
+    hidden,
+    weights,
+    *,
+    epsilon=1e-5,
+    return_latent=False,
+    query_scale=1.0,
+    sp_axis=None,
+    gather_tables=None,
+    gather_collective_id=45,
+    head_major=False,
+    length=None,
+):
     """MLA Q/K/V projections for a token window (per-rank layout).
 
     ``hidden``: [T, hidden] BF16. Returns (query [T,3,256] times
     ``query_scale`` before its BF16 rounding, new_key [T,3,256],
-    new_value [T,3,128], output_gate [T,384]), all BF16; with
+    new_value [T,3,128], output_gate [T,384]) — or ``[3,T,D]`` slabs with
+    ``length`` masking fused in when ``head_major=True`` — all BF16; with
     ``return_latent`` also the compressed KV that vLLM's MLA cache stores,
     ``[T, 576]`` BF16: the normalized 512-lane latent then the 64 rope lanes
     (K3's MLA is NoPE; the rope lanes are used unrotated). It is the same on
@@ -3430,20 +3442,56 @@ def mla_projections(hidden, weights, *, epsilon=1e-5, return_latent=False, query
             rope = both[:, width + 512 :]
     else:
         output_gate = _dot(hidden, weights.output_gate_projection).astype(jnp.bfloat16)
-    query = (_dot(query_latent, weights.query_up_projection) * query_scale).astype(jnp.bfloat16)
-    query = query.reshape(tokens, _HEADS, 256)
+    if head_major:
+        real_1d = (
+            (jnp.arange(tokens) < length.reshape(()))[:, None]
+            if length is not None
+            else None
+        )
+        rope_m = jnp.where(real_1d, rope, 0) if real_1d is not None else rope
+        zeros_64 = jnp.zeros((tokens, 64), jnp.bfloat16)
+        q_heads, k_heads, v_heads = [], [], []
+        for h in range(_HEADS):
+            sl = slice(h * 256, (h + 1) * 256)
+            q_h = (
+                _dot(query_latent, weights.query_up_projection[:, sl]) * query_scale
+            ).astype(jnp.bfloat16)
+            kv_h = _dot(kv_latent, weights.key_value_up_projection[:, sl]).astype(
+                jnp.bfloat16
+            )
+            k_nope = (
+                jnp.where(real_1d, kv_h[:, :128], 0)
+                if real_1d is not None
+                else kv_h[:, :128]
+            )
+            v_h = (
+                jnp.where(real_1d, kv_h[:, 128:], 0)
+                if real_1d is not None
+                else kv_h[:, 128:]
+            )
+            q_heads.append(q_h)
+            k_heads.append(jnp.concatenate((k_nope, rope_m, zeros_64), axis=1))
+            v_heads.append(v_h)
+        query = jnp.stack(q_heads, axis=0)
+        new_key = jnp.stack(k_heads, axis=0)
+        new_value = jnp.stack(v_heads, axis=0)
+    else:
+        query = (_dot(query_latent, weights.query_up_projection) * query_scale).astype(
+            jnp.bfloat16
+        )
+        query = query.reshape(tokens, _HEADS, 256)
 
-    expanded = _dot(kv_latent, weights.key_value_up_projection).astype(jnp.bfloat16)
-    expanded = expanded.reshape(tokens, _HEADS, 256)
-    new_key = jnp.concatenate(
-        (
-            expanded[:, :, :128],
-            jnp.broadcast_to(rope[:, None, :], (tokens, _HEADS, 64)),
-            jnp.zeros((tokens, _HEADS, 64), jnp.bfloat16),
-        ),
-        axis=2,
-    )
-    new_value = expanded[:, :, 128:]
+        expanded = _dot(kv_latent, weights.key_value_up_projection).astype(jnp.bfloat16)
+        expanded = expanded.reshape(tokens, _HEADS, 256)
+        new_key = jnp.concatenate(
+            (
+                expanded[:, :, :128],
+                jnp.broadcast_to(rope[:, None, :], (tokens, _HEADS, 64)),
+                jnp.zeros((tokens, _HEADS, 64), jnp.bfloat16),
+            ),
+            axis=2,
+        )
+        new_value = expanded[:, :, 128:]
     if return_latent:
         latent = jnp.concatenate((kv_latent, rope), axis=1)
         return query, new_key, new_value, output_gate, latent
@@ -5528,13 +5576,16 @@ def make_mla_attention_layer_sp_ring(mesh, *, seq_len, segments, prefix_capacity
             *(local_weights[name] for name in _PROJECTION_NAMES)
         )
         query, new_key, new_value, output_gate, latent = mla_projections(
-            full_hidden, projections, return_latent=True, query_scale=SCALE_LOG2,
-            sp_axis="k3_sp", gather_tables=gather_tables)
-        tokens = query.shape[0]
-        real = (jnp.arange(tokens) < length.reshape(()))[None, :, None]
-        new_key = jnp.where(real, new_key.transpose(1, 0, 2), 0)
-        new_value = jnp.where(real, new_value.transpose(1, 0, 2), 0)
-        query = query.transpose(1, 0, 2)  # [3, T, 256]
+            full_hidden,
+            projections,
+            return_latent=True,
+            query_scale=SCALE_LOG2,
+            sp_axis="k3_sp",
+            gather_tables=gather_tables,
+            head_major=True,
+            length=length,
+        )
+        tokens = query.shape[1]
         pages, order = gathered_prefix_pages(
             pool, ids[0], local[0], tables, "k3_sp", count=segments,
             capacity=prefix_capacity, counts=counts, order=order,

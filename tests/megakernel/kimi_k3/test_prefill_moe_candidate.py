@@ -211,3 +211,153 @@ def test_metadata_steps_ep16_and_ep8(local_experts):
             np.asarray(probs_out).reshape(-1)[:total_local],
             np.array([p for _, p in expected_routes], dtype=np.float32),
         )
+
+
+def test_mla_projections_head_major_matches_transposed_masked():
+    rng = np.random.default_rng(20261106)
+    tokens, hidden_dim, q_rank, heads = 16, 128, 64, 3
+    hidden = jnp.asarray(
+        rng.standard_normal((tokens, hidden_dim), dtype=np.float32) * 0.1,
+        dtype=jnp.bfloat16,
+    )
+    weights = kernels.ProjectionWeights(
+        query_down_projection=jnp.asarray(
+            rng.standard_normal((hidden_dim, q_rank), dtype=np.float32) * 0.1,
+            dtype=jnp.bfloat16,
+        ),
+        query_normalization=jnp.ones((q_rank,), dtype=jnp.bfloat16),
+        query_up_projection=jnp.asarray(
+            rng.standard_normal((q_rank, heads * 256), dtype=np.float32) * 0.1,
+            dtype=jnp.bfloat16,
+        ),
+        key_value_down_projection=jnp.asarray(
+            rng.standard_normal((hidden_dim, 576), dtype=np.float32) * 0.1,
+            dtype=jnp.bfloat16,
+        ),
+        key_value_normalization=jnp.ones((512,), dtype=jnp.bfloat16),
+        key_value_up_projection=jnp.asarray(
+            rng.standard_normal((512, heads * 256), dtype=np.float32) * 0.1,
+            dtype=jnp.bfloat16,
+        ),
+        output_gate_projection=jnp.asarray(
+            rng.standard_normal((hidden_dim, heads * 128), dtype=np.float32) * 0.1,
+            dtype=jnp.bfloat16,
+        ),
+    )
+    length = jnp.asarray([11], dtype=jnp.int32)
+    q_ref, k_ref, v_ref, g_ref, lat_ref = kernels.mla_projections(
+        hidden, weights, return_latent=True, query_scale=kernels.SCALE_LOG2
+    )
+    real = (jnp.arange(tokens) < length.reshape(()))[None, :, None]
+    k_ref = jnp.where(real, k_ref.transpose(1, 0, 2), 0)
+    v_ref = jnp.where(real, v_ref.transpose(1, 0, 2), 0)
+    q_ref = q_ref.transpose(1, 0, 2)
+
+    q_hm, k_hm, v_hm, g_hm, lat_hm = kernels.mla_projections(
+        hidden,
+        weights,
+        return_latent=True,
+        query_scale=kernels.SCALE_LOG2,
+        head_major=True,
+        length=length,
+    )
+    np.testing.assert_array_equal(np.asarray(lat_hm), np.asarray(lat_ref))
+    np.testing.assert_array_equal(np.asarray(g_hm), np.asarray(g_ref))
+    np.testing.assert_allclose(
+        np.asarray(q_hm, dtype=np.float32),
+        np.asarray(q_ref, dtype=np.float32),
+        rtol=1e-2,
+        atol=2e-3,
+    )
+    np.testing.assert_allclose(
+        np.asarray(k_hm, dtype=np.float32),
+        np.asarray(k_ref, dtype=np.float32),
+        rtol=1e-2,
+        atol=2e-3,
+    )
+    np.testing.assert_allclose(
+        np.asarray(v_hm, dtype=np.float32),
+        np.asarray(v_ref, dtype=np.float32),
+        rtol=1e-2,
+        atol=2e-3,
+    )
+    np.testing.assert_array_equal(np.asarray(k_hm[:, 11:, :]), 0)
+    np.testing.assert_array_equal(np.asarray(v_hm[:, 11:, :]), 0)
+
+
+def test_intermediate_window_elides_logits_and_sampler():
+    import types
+
+    import torch
+
+    from vllm_torchtpu.megakernel.kimi_k3.prefill import KimiPrefiller
+    from vllm_torchtpu.megakernel.program import RequestInput, StepInput
+
+    prefiller = KimiPrefiller.__new__(KimiPrefiller)
+    prefiller._writer = object()
+    prefiller.draft_latents = None
+    prefiller.program = types.SimpleNamespace(
+        windows=(512, 1024, 2048, 4096, 8192, 16384),
+        capacity=98304,
+    )
+    prefiller.slots = 16
+    prefiller.page_tokens = 256
+    prefiller.compute_logits = True
+    prefiller._requests = {}
+    prefiller._kda_groups = []
+    prefiller.config = types.SimpleNamespace(max_num_seqs=4)
+
+    window_calls = []
+    first_token_calls = []
+
+    def fake_read_hit_states(rows, hits):
+        pass
+
+    def fake_run_window(rows, by_row, window, members, *, need_logits=True):
+        window_calls.append((window, len(members), need_logits))
+        if not need_logits:
+            return None
+        out = torch.zeros((len(members), 8), dtype=torch.float32)
+        for s, (piece, _) in enumerate(members):
+            out[s, 0] = float(100 + piece.row)
+        return out
+
+    def fake_first_tokens(rows, logits, done):
+        first_token_calls.append((dict(logits), set(done)))
+        if not done:
+            return torch.full((max(len(rows), 1), 1), -1, dtype=torch.int32)
+        return torch.tensor(
+            [
+                [int(logits[i][0, 0].item()) if i in done else -1]
+                for i in range(len(rows))
+            ],
+            dtype=torch.int32,
+        )
+
+    prefiller._read_hit_states = fake_read_hit_states
+    prefiller._run_window = fake_run_window
+    prefiller._first_tokens = fake_first_tokens
+
+    tokens = np.zeros(80128, dtype=np.int32)
+    blocks = (np.zeros(400, dtype=np.int32),)
+
+    # Step 1: intermediate 16384-token chunk -> need_logits=False, done is empty.
+    r0 = RequestInput("r0", 0, 16384, tokens, 80128, 80128, blocks)
+    out1 = prefiller.step(StepInput(requests=[r0]))
+    assert window_calls == [(16384, 1, False)]
+    assert first_token_calls == [({}, set())]
+    assert out1.tokens.tolist() == [[-1]]
+
+    # Step 2: packed window with finishing r0 + intermediate r1.
+    window_calls.clear()
+    first_token_calls.clear()
+    prefiller._requests["r0"].start = 65536
+    r0_end = RequestInput("r0", 65536, 14592, tokens, 80128, 80128, blocks)
+    r1_beg = RequestInput("r1", 0, 1792, tokens, 80128, 80128, blocks)
+    out2 = prefiller.step(StepInput(requests=[r0_end, r1_beg]))
+    assert window_calls == [(16384, 2, True)]
+    assert len(first_token_calls) == 1
+    logits_map, done_set = first_token_calls[0]
+    assert done_set == {0}
+    assert set(logits_map.keys()) == {0}
+    assert out2.tokens.tolist() == [[100], [-1]]

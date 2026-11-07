@@ -387,6 +387,13 @@ class PrefillProgram:
     def _count(self, *groups: str) -> int:
         return sum(len(self.names[g]) for g in groups)
 
+    def _nl_groups(self) -> tuple[str, ...]:
+        return (
+            ("common", "mla", "moe")
+            if active().prefill_route_counts
+            else ("common", "mla")
+        )
+
     def window_slots(self, window: int) -> int:
         """The sequence slots a window's ops are compiled for: ``slots``, or
         fewer when the window holds fewer pages (each sequence starts a
@@ -437,6 +444,18 @@ class PrefillProgram:
             segments=count,
             prefix_capacity=self.capacity,
             compute_logits=self.compute_logits,
+        )
+        final_nl = (
+            self._kernels.make_final_mla_sp_indexed(
+                mesh,
+                seq_len=window,
+                mla_flash_tile=256,
+                segments=count,
+                prefix_capacity=self.capacity,
+                compute_logits=False,
+            )
+            if self.compute_logits
+            else None
         )
         logits_op = (
             self._kernels.make_prefill_logits_sp(
@@ -637,6 +656,40 @@ class PrefillProgram:
             ),
             export_key=self._export_key(f"{name}_final", window),
         )
+        if self.compute_logits:
+            assert final_nl is not None
+            nl_groups = self._nl_groups()
+
+            def run_final_nologits(prefix, blocks, latents, *rest):
+                routes, (length, segments, *args) = rest[:nroute], rest[nroute:]
+                arena, args = split(args, 1)
+                w, _ = self._unflat(args, *nl_groups)
+                prefix, blocks, (latents,), *routes = final_nl(
+                    prefix,
+                    blocks,
+                    w["common"],
+                    w["mla"],
+                    w.get("moe"),
+                    (latents,),
+                    length,
+                    segment_desc=segments,
+                    arena=arena,
+                    route=routes[0] if routes else None,
+                )
+                return (latents, *routes)
+
+            ops["final_nologits"] = register_global_op(
+                self._op_name(f"{name}_final_nologits", window),
+                mesh,
+                run_final_nologits,
+                (sharded,) * (3 + nroute)
+                + (replicated,) * 2
+                + prefix_specs(1)
+                + (sharded,) * self._count(*nl_groups),
+                (sharded,) + (sharded,) * nroute,
+                donate_argnums=tuple(range(2, 3 + nroute)),
+                export_key=self._export_key(f"{name}_final_nologits", window),
+            )
         if not self._pairs:
             self._pairs = [
                 torch.tensor([pair], dtype=torch.int32).to("tpu")
@@ -661,7 +714,7 @@ class PrefillProgram:
         )
         return repr(
             (
-                "prefill",
+                "prefill-mla-hm",
                 "moe-bank8" if self._expert_banks else "moe-global",
                 "moe-mix-fused-v2" if fused_moe else "moe-ref",
                 "draft" if self.has_draft else "no-draft",
@@ -684,6 +737,8 @@ class PrefillProgram:
         ids: torch.Tensor,
         local: torch.Tensor,
         ring: Any = None,
+        *,
+        need_logits: bool = True,
     ):
         """Prefill a packed window: ``shard`` [1, W/32] this rank's token
         ids (its SP stripes, :meth:`sp_order`), ``extent`` [1] the end of
@@ -741,11 +796,16 @@ class PrefillProgram:
         if ring is not None:
             # The last pair's middle: entering layer 88; its tap: entering 90.
             ring(blocks, prefix, middle, tap3, tap90)
-        final_groups = (
-            ("io", "common", "mla", "moe")
-            if self.compute_logits
-            else ("common", "mla", "moe")
-        )
+        use_logits = self.compute_logits and need_logits
+        if use_logits:
+            final_groups = ("io", "common", "mla", "moe")
+            final_op = ops["final"]
+        elif self.compute_logits:
+            final_groups = self._nl_groups()
+            final_op = ops["final_nologits"]
+        else:
+            final_groups = ("common", "mla", "moe")
+            final_op = ops["final"]
         final_args = (
             prefix,
             blocks,
@@ -757,11 +817,11 @@ class PrefillProgram:
             *tail,
             *self._flat(*final_groups, expert_bank=12),
         )
-        if self.compute_logits:
-            logits, latents, *routes = ops["final"](*final_args)
+        if use_logits:
+            logits, latents, *routes = final_op(*final_args)
         else:
             logits = None
-            latents, *routes = ops["final"](*final_args)
+            latents, *routes = final_op(*final_args)
         self.last_routes = routes[0] if routes else None
         return logits, latents, rec, hist, rec_at, hist_at
 
@@ -1487,18 +1547,23 @@ class KimiPrefiller:
         self._read_hit_states(rows, hits)
         logits: dict[int, torch.Tensor] = {}
         by_row = {i: (state, stops) for i, state, _, stops, _ in work}
+        done = {i for i, _, _, _, finishes in work if finishes}
         for wave in range(max((len(pieces) for _, _, pieces, _, _ in work), default=0)):
             pieces = [p[wave] for _, _, p, _, _ in work if len(p) > wave]
             last = {i for i, _, p, _, _ in work if len(p) == wave + 1}
             for window, members in pack_windows(
                 pieces, self.program.windows, self.slots, self.program.capacity
             ):
-                out = self._run_window(rows, by_row, window, members)
+                need_logits = self.compute_logits and any(
+                    piece.row in last and piece.row in done for piece, _ in members
+                )
+                out = self._run_window(
+                    rows, by_row, window, members, need_logits=need_logits
+                )
                 if out is not None:
                     for s, (piece, _) in enumerate(members):
-                        if piece.row in last:
+                        if piece.row in last and piece.row in done:
                             logits[piece.row] = out[s : s + 1]
-        done = {i for i, _, _, _, finishes in work if finishes}
         for i, state, _, _, finishes in work:
             if finishes:
                 del self._requests[state.req_id]
@@ -1522,6 +1587,10 @@ class KimiPrefiller:
         if len(rows) > count:
             raise RuntimeError(
                 f"K3 prefill: {len(rows)} rows exceed max_num_seqs {count}"
+            )
+        if not done:
+            return torch.full(
+                (max(len(rows), 1), 1), -1, dtype=torch.int32, device="tpu"
             )
         stacked = torch.cat(
             [logits.get(i, self._zeros()) for i in range(len(rows))]
@@ -1630,12 +1699,19 @@ class KimiPrefiller:
         return self._zero_pair
 
     def _run_window(
-        self, rows: Sequence[RequestInput], by_row, window: int, members
-    ) -> torch.Tensor:
+        self,
+        rows: Sequence[RequestInput],
+        by_row,
+        window: int,
+        members,
+        *,
+        need_logits: bool = True,
+    ) -> torch.Tensor | None:
         """One packed window: run it on the members' prefixes, write each
         member's pages (from its first uncached one) and KDA states (final,
         and at its checkpoint), keep its state. Returns the ``[slots,
-        VOCAB]`` logits (the window's slots)."""
+        VOCAB]`` logits (the window's slots), or ``None`` when logits are not
+        needed."""
         count, local = self.program.window_slots(window), window // 32
         tokens = np.full(window, -1, np.int32)
         offsets, lengths, checkpoints, bases, cached = [], [], [], [], []
@@ -1740,6 +1816,7 @@ class KimiPrefiller:
                 ids,
                 local_bases,
                 ring_hook,
+                need_logits=need_logits,
             )
         )
         self._count_routes()
@@ -1947,6 +2024,23 @@ class KimiPrefiller:
                 ),
                 priority=window,
             )
+            if "final_nologits" in ops:
+                nl_groups = program._nl_groups()
+                add(
+                    ops["final_nologits"],
+                    (
+                        stream,
+                        blocks,
+                        latents,
+                        *routes,
+                        extent,
+                        segments,
+                        mla[MLA_LAYERS - 1],
+                        *tail,
+                        *program._flat(*nl_groups, expert_bank=12),
+                    ),
+                    priority=window,
+                )
             one = (recurrent[:, :, 0], conv[:, :, 0])
             add(
                 program._state_op("stack", count), (one[0],) * count + (one[1],) * count
@@ -2112,6 +2206,23 @@ class KimiPrefiller:
             )
             if logits is not None:
                 outputs.append(logits)
+            if self.compute_logits:
+                recurrent_nl, conv_nl = self.program.stack_states(
+                    [self.program.zero_state() for _ in range(count)]
+                )
+                _, latents_nl, *_ = self.program.run_packed(
+                    torch.zeros((1, window // 32), dtype=torch.int32).to("tpu"),
+                    _device_i32([1]),
+                    _device_i32(desc),
+                    recurrent_nl,
+                    conv_nl,
+                    writer.mla_pools(),
+                    _rank_zeros_i32(1 + self.cp_capacity // self.page_tokens),
+                    _rank_zeros_i32(2 * count),
+                    None,
+                    need_logits=False,
+                )
+                outputs.append(latents_nl)
             outputs.append(self.program.split_states(recurrent, conv)[0][0])
             for live in write_sizes(count):
                 for has_ckpt in (False, True):
