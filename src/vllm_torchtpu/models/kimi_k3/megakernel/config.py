@@ -12,7 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Source provenance: inferact/k3-megakernel@30c9ba966b src/vllm_torchtpu/megakernel/kimi_k3/config.py
+# Source provenance: inferact/k3-megakernel@30c9ba966b
+# src/vllm_torchtpu/megakernel/kimi_k3/config.py
 """Kernel settings for the Kimi-K3 megakernels.
 
 Kernel modules read their settings from :func:`active` when they are
@@ -21,18 +22,25 @@ be installed with :func:`install` before the first kernel import. Serving and
 the standalone tools install overrides before building the program.
 """
 
+from __future__ import annotations
+
 import dataclasses
 import hashlib
 import json
-from typing import Any
 
-from vllm_torchtpu.models.kimi_k3.megakernel.runtime_shim.config import (
-    set_active_kernel_config,
-)
+from .runtime_shim.config import set_active_kernel_config
+
+_MLA_DEFAULT_KTILE = 1024
+_MLA_EXPERIMENTAL_KTILE = 2048
+_EXPERIMENTAL_KTILE_ATTN_DP = 2
+_EXPERIMENTAL_KTILE_DCP_GROUP = 16
+_TRUTHY_STRINGS = frozenset({"1", "true", "yes", "on"})
 
 
 @dataclasses.dataclass(frozen=True)
 class KernelConfig:
+    """Compile-time tile, VMEM, and collective settings for Kimi-K3 megakernels."""
+
     # Decode context parallel attention.
     dcp_group: int = 32
     # Attention data parallelism of the decoder (TP32 / dp heads per DP group
@@ -44,7 +52,7 @@ class KernelConfig:
     # MLA decode key tile (tokens per page fold). 2048 is opt-in and applies
     # only to FP8 plain decode at attention_dp=2, dcp_group=16 with 32 rows per
     # DP group (B64); everything else uses 1024.
-    mla_decode_ktile: int = 1024
+    mla_decode_ktile: int = _MLA_DEFAULT_KTILE
     # Routed experts (MXFP4, the pre-shard format).
     mxfp4_block: int = 2048
     mxfp4_pair_tile: int = 512
@@ -61,10 +69,10 @@ class KernelConfig:
     compact_overflow: bool = True
     b4_attention_gather: bool = True
     fused_cache_commit: bool = True
-    decode_no_hlo_calls: bool = True  # no deduplicated HLO calls at B8..B128, DP B2/B4
+    decode_no_hlo_calls: bool = True
     shard_routing: bool = False
     kda_staged: bool = False
-    weight_streams: tuple[tuple[str, tuple], ...] = ()  # (weight, (axis, streams))
+    weight_streams: tuple[tuple[str, tuple[object, ...]], ...] = ()
     # VMEM and compiler settings.
     vmem_limit_mb: int = 64
     vmem_spill_reserve_mb: float = 5.0
@@ -92,51 +100,93 @@ class KernelConfig:
     vmem_pad_kb: int = 0
 
     def __post_init__(self) -> None:
+        """Validate dtype and MLA decode tile invariants.
+
+        Raises:
+            ValueError: If ``moe_reduce_dtype`` or ``mla_decode_ktile`` is invalid.
+        """
         if self.moe_reduce_dtype not in ("float32", "bfloat16"):
-            raise ValueError("moe_reduce_dtype is float32 or bfloat16")
-        if self.mla_decode_ktile not in (1024, 2048):
-            raise ValueError("mla_decode_ktile supports 1024 or experimental 2048")
-        if self.mla_decode_ktile == 2048 and (
-            self.attention_dp != 2 or self.dcp_group != 16
+            msg = "moe_reduce_dtype is float32 or bfloat16"
+            raise ValueError(msg)
+        if self.mla_decode_ktile not in (_MLA_DEFAULT_KTILE, _MLA_EXPERIMENTAL_KTILE):
+            msg = "mla_decode_ktile supports 1024 or experimental 2048"
+            raise ValueError(msg)
+        if self.mla_decode_ktile == _MLA_EXPERIMENTAL_KTILE and (
+            self.attention_dp != _EXPERIMENTAL_KTILE_ATTN_DP
+            or self.dcp_group != _EXPERIMENTAL_KTILE_DCP_GROUP
         ):
-            raise ValueError(
-                "mla_decode_ktile=2048 requires attention_dp=2 and dcp_group=16"
-            )
+            msg = "mla_decode_ktile=2048 requires attention_dp=2 and dcp_group=16"
+            raise ValueError(msg)
 
     def key(self) -> str:
-        """A stable digest of every field, for caches of compiled kernels."""
+        """Compute a stable 16-hex-character digest across all config fields.
+
+        Returns:
+            Hex digest prefix suitable for keying persistent compilation caches.
+        """
         blob = json.dumps(dataclasses.asdict(self), sort_keys=True, default=list)
         return hashlib.sha256(blob.encode()).hexdigest()[:16]
 
-    def replace(self, **fields: Any) -> "KernelConfig":
-        return dataclasses.replace(
-            self, **{name: _coerce(self, name, value) for name, value in fields.items()}
-        )
+    def replace(self, **fields: object) -> KernelConfig:
+        """Return a copy of this configuration with coerced ``fields`` overrides.
+
+        Args:
+            **fields: Field values or CLI strings keyed by ``KernelConfig`` field name.
+
+        Returns:
+            New ``KernelConfig`` instance with the coerced overrides applied.
+        """
+        coerced = {name: _coerce(self, name, value) for name, value in fields.items()}
+        return dataclasses.replace(self, **coerced)
 
 
-def _coerce(config: KernelConfig, name: str, value: Any) -> Any:
-    """Parse a command-line string into the field's type."""
-    current = getattr(config, name)
+def _coerce_optional(name: str, value: str) -> object:
+    """Parse a string override for an optional field whose default is ``None``.
+
+    Args:
+        name: Dataclass field name on ``KernelConfig``.
+        value: Raw string value to parse.
+
+    Returns:
+        Parsed ``None``, ``bool``, ``int``, or raw string value.
+    """
+    lowered = value.lower()
+    if lowered in ("", "none"):
+        return None
+    kind = str(KernelConfig.__dataclass_fields__[name].type)
+    if kind.startswith("bool"):
+        return lowered in _TRUTHY_STRINGS
+    if kind.startswith("int"):
+        return int(value)
+    return value
+
+
+def _coerce(config: KernelConfig, name: str, value: object) -> object:
+    """Parse a command-line string into the target field's Python type.
+
+    Args:
+        config: Base ``KernelConfig`` instance providing default field values.
+        name: Field name on ``KernelConfig``.
+        value: Override value (already typed or a CLI string).
+
+    Returns:
+        Coerced field value matching the target attribute's type.
+    """
+    current = vars(config)[name]
     if not isinstance(value, str):
         return value
-    if current is None:  # an optional override: parse by the declared type
-        if value.lower() in ("", "none"):
-            return None
-        kind = str(KernelConfig.__dataclass_fields__[name].type)
-        if kind.startswith("bool"):
-            return value.lower() in ("1", "true", "yes", "on")
-        if kind.startswith("int"):
-            return int(value)
+    if current is None:
+        return _coerce_optional(name, value)
     if isinstance(current, bool):
-        return value.lower() in ("1", "true", "yes", "on")
-    if isinstance(current, int):
-        return int(value)
-    if isinstance(current, float):
-        return float(value)
-    if name == "weight_streams":
-        return tuple(sorted((k, tuple(v)) for k, v in json.loads(value).items()))
+        return value.lower() in _TRUTHY_STRINGS
+    if isinstance(current, (int, float)):
+        return type(current)(value)
     if isinstance(current, tuple):
-        return tuple(filter(None, value.split(",")))
+        return (
+            tuple(sorted((k, tuple(v)) for k, v in json.loads(value).items()))
+            if name == "weight_streams"
+            else tuple(filter(None, value.split(",")))
+        )
     return value
 
 
@@ -144,19 +194,32 @@ _ACTIVE: KernelConfig | None = None
 
 
 def install(config: KernelConfig) -> KernelConfig:
-    """Fix the process's kernel config. Kernel modules read it at import, so
-    installing a different config after the first import is an error."""
-    global _ACTIVE
+    """Fix the process-wide kernel configuration before kernel modules are imported.
+
+    Args:
+        config: ``KernelConfig`` to install as the process singleton.
+
+    Returns:
+        The installed ``KernelConfig`` instance.
+
+    Raises:
+        RuntimeError: If a different ``KernelConfig`` was already installed.
+    """
     if _ACTIVE is not None and config != _ACTIVE:
-        raise RuntimeError(
+        msg = (
             f"K3 kernel config is already fixed ({_ACTIVE}); install {config} before "
             "the first kernel import"
         )
-    _ACTIVE = config
+        raise RuntimeError(msg)
+    globals()["_ACTIVE"] = config
     set_active_kernel_config(config)
     return config
 
 
 def active() -> KernelConfig:
-    """The installed config, or the defaults (installed on first use)."""
+    """Return the installed ``KernelConfig``, installing defaults on first access.
+
+    Returns:
+        Active ``KernelConfig`` singleton for the current process.
+    """
     return _ACTIVE if _ACTIVE is not None else install(KernelConfig())

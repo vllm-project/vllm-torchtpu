@@ -12,5 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Source provenance: inferact/k3-megakernel@30c9ba966b src/vllm_torchtpu/megakernel/common/__init__.py
+# Source provenance: inferact/k3-megakernel@30c9ba966b
+# src/vllm_torchtpu/megakernel/common/__init__.py
 """Shared Kimi-K3 megakernel VMEM pool, collective, and aliasing helpers."""
+
+from __future__ import annotations
+
+from vllm_torchtpu.megakernel import pool_alias
+
+__all__ = ["pool_alias"]
