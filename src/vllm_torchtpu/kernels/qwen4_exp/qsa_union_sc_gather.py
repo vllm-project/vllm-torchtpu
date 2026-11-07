@@ -51,6 +51,38 @@ helpers below are shared by the kernels and the CPU emulation in
 
 Status: CPU-traced and lowered to Mosaic under an abstract TPU7x mesh; the
 SparseCore compile and the outputs are unverified until a TPU run.
+
+Run-table walk (``union_walk_kernel(run_tables=..., listed_lines=...)``, i1n:
+0.88x the listed walk, bitwise) needs two more SparseCore steps:
+
+``union_sc_lines`` returns ``qsa_union_dense.union_lines_reference``'s lines:
+the gather step's line path without the KV gather (same plan, items, streams
+and helpers; optional dead-tile skip).
+
+``union_sc_run_tables`` returns ``qsa_union_dense.union_run_tables_xla``'s
+``(counts, entries)``. The flat tile space ``ngroups * cap_tiles`` splits into
+pipeline steps of ``tiles_per_step`` whole tiles; each vector subcore owns a
+contiguous run of steps. Per tile (``run_table_tile``), two passes over its
+16-lane vectors:
+
+- Pass A, in rank order with the run count carried across vectors: start
+  flags against each rank's previous rank (a ``load_gather`` one slot back;
+  ``union_run_tables_xla``'s ``~join``); the start slots are compacted into a
+  run list (carried ``store_compressed``) and each rank's run number is the
+  carried count plus a ``cumsum`` of the flags. The tile size is then
+  appended to the run list as a sentinel.
+- Pass B: each rank's run start and end are ``runs[id]`` and ``runs[id + 1]``
+  (two gathers: the spec's ``cummax`` / reverse ``cummin`` scans, without a
+  max scan or a reverse pass). From offset and length, the piece flags per
+  size (``piece_flags``) and the entry ``(row >> log2(ratio)) << 9 | slot``;
+  each size's entries are compacted into its own list in rank order.
+
+The lists are then concatenated in size order (largest first) into a tile
+buffer with 16 slots of slack, the rest zero-filled, and copied out aligned.
+Every unaligned store is a full-vector ``store_compressed`` whose overflow the
+next store overwrites, so lanes past a compressed store's popcount may hold
+anything. The tile code takes its primitives from an ``ops`` object so that the
+CPU test runs this exact code on numpy stand-ins.
 """
 
 import dataclasses
@@ -153,9 +185,12 @@ def kv_row_index(rows, ratio):
 def bits_row_index(ids, gwords):
     """Row of the flat bitset ``[ngroups * words, width]`` holding id ``ids``.
 
-    Padding ids (-1) read the group's word 0; their lines are zeroed.
+    Padding ids (-1) read one of the group's first 8 words by lane (their lines are zeroed, so the row is free):
+    every padding rank reading word 0 made one 512 B row a hot spot (i1k2: the padding hot spot dominated the
+    gather). ``words`` is a multiple of 8, so the rows exist.
     """
-    return gwords + lax.shift_right_logical(jnp.maximum(ids, 0), 5)
+    lane = lax.broadcasted_iota(jnp.int32, jnp.shape(ids), jnp.ndim(ids) - 1) & 7
+    return gwords + jnp.where(ids >= 0, lax.shift_right_logical(jnp.maximum(ids, 0), 5), lane)
 
 
 def live_rank_end(usize, *, cap_ranks, ratio, kv_tile):
@@ -449,6 +484,64 @@ def item_live_steps(usize, plan: GatherPlan, *, ratio, kv_tile):
     return part_steps(end, part, plan)
 
 
+def _window(ref, step, stream, plan: GatherPlan):
+    """An inner step's stream window (``lanes`` ranks) of a staged item block."""
+    return ref[pl.ds(window_offset(step, stream, plan), plan.lanes)]
+
+
+def _bits_specs(ids_v, gwords, width, plan: GatherPlan):
+    """One indirect bitset-row gather per stream (the rows of the window's ids)."""
+
+    def bits_index(step, s):
+        return bits_row_index(_window(ids_v, step, s, plan), gwords), 0
+
+    return tuple(
+        pl.BlockSpec(
+            (pl.Indirect(plan.lanes), width), functools.partial(bits_index, s=s)
+        )
+        for s in range(plan.streams)
+    )
+
+
+def _lines_spec(item, plan: GatherPlan, repeat, width):
+    """The inner step's block of ``chunk * repeat`` output lines."""
+    return pl.BlockSpec(
+        (plan.chunk * repeat, width), lambda step: (lines_block(item, step, plan), 0)
+    )
+
+
+def _store_lines(bit_buf, gids, lines_o, stream, plan: GatherPlan, repeat):
+    """A stream window's lines: per rank, ``line_of`` its gathered bitset row."""
+    for j in range(plan.lanes):
+        line = line_of(bit_buf[pl.ds(j, 1), :], gids[j])
+        for t in range(repeat):
+            lines_o[pl.ds(line_row(stream, j, t, plan, repeat), 1), :] = line
+
+
+def _item_steps(steps_v, plan: GatherPlan):
+    """An item's inner step count: staged (dead-tile skip) or every step."""
+    if steps_v is None:
+        return plan.steps_per_part
+    # The item's live step count, broadcast to one 16-lane block.
+    return steps_v[pl.ds(0, plan.lanes)][0]
+
+
+def _emit_items(item_step, worker, plan: GatherPlan, staged, steps_hbm):
+    """The outer pipeline: per item, stage ``part_ranks`` of each staged array (and its step count)."""
+
+    def item_block(k):
+        return (staged_block(worker_item(worker, k, plan), plan),)
+
+    in_specs = [pl.BlockSpec((plan.part_ranks,), item_block)] * len(staged)
+    operands = list(staged)
+    if steps_hbm is not None:
+        in_specs.append(pl.BlockSpec((plan.lanes,), item_block))
+        operands.append(steps_hbm)
+    pltpu.emit_pipeline(
+        item_step, grid=(plan.items_per_worker,), in_specs=tuple(in_specs)
+    )(*operands)
+
+
 def _gather_kernel(
     pool_hbm,
     bits_hbm,
@@ -479,15 +572,7 @@ def _gather_kernel(
     def item_step(rows_v, ids_v, steps_v=None):
         item = worker_item(worker, pl.program_id(0), plan)
         g, part, rank0 = item_coords(item, plan)
-        gwords = g * words
-        if skip_dead:
-            # The item's live step count, broadcast to one 16-lane block.
-            steps = steps_v[pl.ds(0, lanes)][0]
-        else:
-            steps = plan.steps_per_part
-
-        def window(ref, step, stream):
-            return ref[pl.ds(window_offset(step, stream, plan), lanes)]
+        steps = _item_steps(steps_v, plan)
 
         def body(*bufs):
             step = pl.program_id(0)
@@ -503,20 +588,14 @@ def _gather_kernel(
                 copy.start()
                 copies.append(copy)
             for s in range(streams):
-                gids = window(ids_v, step, s)
-                for j in range(lanes):
-                    line = line_of(bit_bufs[s][pl.ds(j, 1), :], gids[j])
-                    for t in range(repeat):
-                        lines_o[pl.ds(line_row(s, j, t, plan, repeat), 1), :] = line
+                gids = _window(ids_v, step, s, plan)
+                _store_lines(bit_bufs[s], gids, lines_o, s, plan, repeat)
             for copy in copies:
                 copy.wait()
 
         def kv_index(step, s):
-            rows = kv_row_index(window(rows_v, step, s), ratio)
+            rows = kv_row_index(_window(rows_v, step, s, plan), ratio)
             return (rows,) + (0,) * len(group_shape)
-
-        def bits_index(step, s):
-            return bits_row_index(window(ids_v, step, s), gwords), 0
 
         kv_specs = tuple(
             pl.BlockSpec(
@@ -524,17 +603,8 @@ def _gather_kernel(
             )
             for s in range(streams)
         )
-        bit_specs = tuple(
-            pl.BlockSpec(
-                (pl.Indirect(lanes), bits_hbm.shape[1]),
-                functools.partial(bits_index, s=s),
-            )
-            for s in range(streams)
-        )
-        lines_spec = pl.BlockSpec(
-            (plan.chunk * repeat, lines_hbm.shape[1]),
-            lambda step: (lines_block(item, step, plan), 0),
-        )
+        bit_specs = _bits_specs(ids_v, g * words, bits_hbm.shape[1], plan)
+        lines_spec = _lines_spec(item, plan, repeat, lines_hbm.shape[1])
 
         @pl.when(jnp.logical_and(item < plan.items, steps > 0))
         def _():
@@ -545,17 +615,7 @@ def _gather_kernel(
                 out_specs=(lines_spec,),
             )(*([pool_w] * streams), *([bits_hbm] * streams), lines_hbm)
 
-    def item_block(k):
-        return (staged_block(worker_item(worker, k, plan), plan),)
-
-    in_specs = [pl.BlockSpec((plan.part_ranks,), item_block)] * 2
-    operands = [rows_hbm, ids_hbm]
-    if skip_dead:
-        in_specs.append(pl.BlockSpec((lanes,), item_block))
-        operands.append(steps_hbm)
-    pltpu.emit_pipeline(
-        item_step, grid=(plan.items_per_worker,), in_specs=tuple(in_specs)
-    )(*operands)
+    _emit_items(item_step, worker, plan, (rows_hbm, ids_hbm), steps_hbm)
 
 
 def gather_vmem_bytes(streams, part_ranks, *, group_bytes, width, repeat, lanes=LANES):
@@ -684,3 +744,494 @@ def union_sc_gather(
         name=name + ("_mm" if line_matmul else "") + ("_live" if skip else ""),
     )(*operands)
     return kv.reshape(ranks * ratio, head_axis, packing, dim), lines
+
+
+# Lines step.
+
+
+def _lines_kernel(
+    bits_hbm,
+    ids_hbm,
+    *refs,
+    plan: GatherPlan,
+    words,
+    ratio,
+    line_matmul,
+    skip_dead,
+):
+    if skip_dead:
+        steps_hbm, lines_hbm = refs
+    else:
+        (lines_hbm,) = refs
+        steps_hbm = None
+    streams = plan.streams
+    repeat = 1 if line_matmul else ratio
+    worker = lax.axis_index(("core", "subcore"))
+
+    def item_step(ids_v, steps_v=None):
+        item = worker_item(worker, pl.program_id(0), plan)
+        g, _, _ = item_coords(item, plan)
+        steps = _item_steps(steps_v, plan)
+
+        def body(*bufs):
+            step = pl.program_id(0)
+            lines_o = bufs[streams]
+            for s in range(streams):
+                gids = _window(ids_v, step, s, plan)
+                _store_lines(bufs[s], gids, lines_o, s, plan, repeat)
+
+        @pl.when(jnp.logical_and(item < plan.items, steps > 0))
+        def _():
+            pltpu.emit_pipeline(
+                body,
+                grid=(steps,),
+                in_specs=_bits_specs(ids_v, g * words, bits_hbm.shape[1], plan),
+                out_specs=(_lines_spec(item, plan, repeat, lines_hbm.shape[1]),),
+            )(*([bits_hbm] * streams), lines_hbm)
+
+    _emit_items(item_step, worker, plan, (ids_hbm,), steps_hbm)
+
+
+def union_sc_lines(
+    bits, ids, *, ratio, line_matmul, usize=None, kv_tile=None, streams=None
+):
+    """SparseCore lines step: ``union_lines_reference``'s lines, bit for bit.
+
+    ``bits`` int32[ngroups, words, width]: the plan's per-row bitset; ``ids``
+    int32[ngroups, cap_ranks]: the list step's group ids (-1 padding). Returns
+    int32[ngroups * cap_ranks * (1 if line_matmul else ratio), width]: per
+    rank, ``(bits[g, id >> 5, :] >> (id & 31)) & 1``, 0 for padding, once per
+    rank (``line_matmul``) or ``ratio`` times.
+
+    ``usize``/``kv_tile`` (optional) skip the tiles the attention kernel never
+    reads, as ``union_sc_gather``'s; those lines are then unspecified.
+    ``streams``: concurrent bitset-row gathers per pipeline step.
+    """
+    ngroups, cap_ranks = ids.shape
+    bgroups, words, width = bits.shape
+    if bgroups != ngroups:
+        raise ValueError("ids and bits must share the query groups")
+    _log2(ratio)
+    if (usize is None) != (kv_tile is None):
+        raise ValueError("the dead-tile skip needs both usize and kv_tile")
+    if kv_tile is not None:
+        _log2(kv_tile)
+        if cap_ranks % (kv_tile // ratio):
+            raise ValueError("cap_ranks must be whole KV tiles")
+    sc = _sc_geometry()
+    repeat = 1 if line_matmul else ratio
+    plan = choose_gather_plan(
+        ngroups,
+        cap_ranks,
+        workers=sc.num_cores * sc.num_subcores,
+        group_bytes=0,
+        width=width,
+        repeat=repeat,
+        streams=streams,
+    )
+    skip = usize is not None
+    operands = [
+        # Free when words % 8 == 0 (union_bits_plan pads words to 8).
+        bits.reshape(ngroups * words, width),
+        ids.astype(jnp.int32).reshape(-1),
+    ]
+    if skip:
+        steps = item_live_steps(usize, plan, ratio=ratio, kv_tile=kv_tile)
+        steps = jnp.broadcast_to(steps[:, None], (plan.items, LANES))
+        operands.append(steps.reshape(-1))
+    name = f"qsa_union_sc_lines_s{plan.streams}_p{plan.parts}"
+    return core_map_helper.kernel(
+        functools.partial(
+            _lines_kernel,
+            plan=plan,
+            words=words,
+            ratio=ratio,
+            line_matmul=line_matmul,
+            skip_dead=skip,
+        ),
+        out_type=jax.ShapeDtypeStruct((ngroups * cap_ranks * repeat, width), jnp.int32),
+        mesh=_mesh(sc),
+        compiler_params=pltpu.CompilerParams(
+            use_tc_tiling_on_sc=True,
+            needs_layout_passes=True,
+            disable_bounds_checks=True,
+        ),
+        name=name + ("_mm" if line_matmul else "") + ("_live" if skip else ""),
+    )(*operands)
+
+
+# Run tables: pure per-vector math, shared by the kernel and the CPU emulation.
+
+
+def run_sizes(max_run):
+    """Piece sizes, descending: ``max_run``, ..., 2, 1 (the counts' last axis)."""
+    return [1 << k for k in reversed(range(_log2(max_run) + 1))]
+
+
+def prev_index(off, lane):
+    """Gather index of each lane's previous rank in the staged block.
+
+    ``off``: the vector's first index in the block. Lane 0 of the block's first
+    vector would read index -1; it reads 0 instead, and its join is off anyway
+    (slot 0 of a tile always starts a run).
+    """
+    return jnp.maximum(off - 1 + lane, 0)
+
+
+def start_flags(rows, ids, prev_rows, prev_ids, slot, ratio):
+    """A rank starts a run (``union_run_tables_xla``'s ``~join``).
+
+    It does at tile slot 0 (runs end at tile boundaries), where live and
+    padding meet (the ids' sign bits differ), and at a live rank that is not
+    pool-contiguous with the previous rank. Padding after padding joins.
+    Compares, ``&`` and ``|`` only.
+    """
+    kind_changes = (ids ^ prev_ids) < 0
+    breaks = (ids >= 0) & (rows != prev_rows + ratio)
+    return (slot == 0) | kind_changes | breaks
+
+
+def run_ids(start, runs_before, cumsum):
+    """Each rank's run number in its tile: the runs started before the vector plus the inclusive count of starts, less 1."""
+    return runs_before + cumsum(start.astype(jnp.int32)) - 1
+
+
+def piece_flags(slot, run_start, run_end, max_run):
+    """Per size (descending), whether a piece of that size starts at the rank.
+
+    A run of length ``L`` is cut into ``L >> log2(max_run)`` pieces of
+    ``max_run``, then one piece per set bit of the remainder, largest first
+    (``union_run_tables_xla``'s rule, with shifts and masks for the divisions:
+    lengths and offsets are never negative).
+    """
+    log_max = _log2(max_run)
+    length = run_end - run_start
+    offset = slot - run_start
+    full = lax.shift_left(lax.shift_right_logical(length, log_max), log_max)
+    rem, past = length - full, offset - full
+    flags = [(offset < full) & ((offset & (max_run - 1)) == 0)]
+    for size in run_sizes(max_run)[1:]:
+        flags.append(((rem & size) != 0) & (past == (rem & ~((size << 1) - 1))))
+    return flags
+
+
+def run_entry(rows, slot, ratio):
+    """A piece's entry: its first pool group (``rows >> log2(ratio)``) above its 9-bit tile slot."""
+    return (lax.shift_right_logical(rows, _log2(ratio)) << 9) | slot
+
+
+def list_base(size_index, gpt):
+    """Start of a size's piece list in the lists scratch (each list has 16 slots of slack)."""
+    return size_index * (gpt + LANES)
+
+
+def counts_vector(counts, lane):
+    """The tile's piece counts on lanes 0..nsizes-1, zeros above."""
+    vec = jnp.zeros((LANES,), jnp.int32)
+    for c, n in enumerate(counts):
+        vec = jnp.where(lane == c, n, vec)
+    return vec
+
+
+class ScOps:
+    """The SparseCore primitives ``run_table_tile`` uses.
+
+    The CPU test passes a numpy stand-in with the same methods, so its
+    emulation runs ``run_table_tile`` itself.
+    """
+
+    @staticmethod
+    def lane():
+        return lax.iota(jnp.int32, LANES)
+
+    @staticmethod
+    def load(ref, at):
+        return ref[pl.ds(at, LANES)]
+
+    @staticmethod
+    def store(ref, at, x):
+        ref[pl.ds(at, LANES)] = x
+
+    @staticmethod
+    def store_compressed(ref, at, x, mask):
+        plsc.store_compressed(ref.at[pl.ds(at, LANES)], x, mask=mask)
+
+    @staticmethod
+    def gather(ref, index):
+        return plsc.load_gather(ref, [index])
+
+    @staticmethod
+    def cumsum(x):
+        return plsc.cumsum(x)
+
+    @staticmethod
+    def popcount(mask):
+        return plsc.all_reduce_population_count(mask)[0]
+
+    @staticmethod
+    def loop(lower, upper, *, carry=None, unroll=1):
+        return plsc.parallel_loop(lower, upper, unroll=unroll, carry=carry)
+
+
+def carry_pad(nsizes, even_carry=True):
+    """Dummy counts that make pass B's tuple carry even: 1 for an odd carry above 1 (R4: 3 sizes, R16: 5), else 0.
+
+    i1o (M, TPU): R4 tables at KV1024 failed and halted the device on mixed-size tiles, while R1/R2/R8/R32 (carries of
+    1/2/4/6 counts) passed and the CPU emulation of R4 passed. R4 was the only odd carry above 1 tested. Hypothesis
+    (I, unconfirmed): an odd scalar-tuple carry in ``parallel_loop(unroll=2)`` miscompiles on the SparseCore. The
+    dummy is carried unchanged and never read. ``even_carry=False`` keeps the old carry (TPU diagnosis only).
+    """
+    return int(even_carry and nsizes > 1 and nsizes % 2 == 1)
+
+
+def run_table_tile(ops, rows, ids, counts_out, entries_out, t, scratch, *, gpt, ratio, max_run,
+                   even_carry=True, copy_unroll=1):
+    """One KV tile's run table: tile ``t`` of the staged ``rows``/``ids`` block.
+
+    Writes the tile's ``gpt`` entries at ``entries_out[t * gpt]`` and its counts
+    vector at ``counts_out[t * 16]``. ``scratch``: (run list [gpt + 16], run
+    ids [gpt], size lists [nsizes * (gpt + 16)], tile [gpt + 16]), reused
+    across tiles (only slots written for this tile are read).
+    """
+    runs, rid_v, lists, tile = scratch
+    lane = ops.lane()
+    every = lane >= 0
+    base = t * gpt
+    vectors = gpt // LANES
+    nsizes = len(run_sizes(max_run))
+    pad = carry_pad(nsizes, even_carry)
+
+    # Pass A: start flags and run numbers (cumsum), the run count carried
+    # across the tile's vectors; start slots compacted into the run list.
+    def scan(v, runs_before):
+        off = base + v * LANES
+        slot = v * LANES + lane
+        at = prev_index(off, lane)
+        start = start_flags(
+            ops.load(rows, off),
+            ops.load(ids, off),
+            ops.gather(rows, at),
+            ops.gather(ids, at),
+            slot,
+            ratio,
+        )
+        ops.store_compressed(runs, runs_before, slot, start)
+        rid = run_ids(start, runs_before, ops.cumsum)
+        ops.store(rid_v, v * LANES, rid)
+        return rid[LANES - 1] + 1
+
+    nruns = ops.loop(0, vectors, carry=jnp.int32(0), unroll=2)(scan)
+    # Sentinel: the last run ends at the tile's end.
+    ops.store_compressed(runs, nruns, jnp.full((LANES,), gpt, jnp.int32), every)
+
+    # Pass B: a rank's run starts at runs[id] and ends at the next run's start;
+    # pieces per size, compacted into each size's list in rank order.
+    def place(v, counts):
+        off = base + v * LANES
+        slot = v * LANES + lane
+        rid = ops.load(rid_v, v * LANES)
+        run_start = ops.gather(runs, rid)
+        run_end = ops.gather(runs, rid + 1)
+        flags = piece_flags(slot, run_start, run_end, max_run)
+        entry = run_entry(ops.load(rows, off), slot, ratio)
+        new = []
+        for c, (flag, n) in enumerate(zip(flags, counts[:nsizes])):
+            ops.store_compressed(lists, list_base(c, gpt) + n, entry, flag)
+            new.append(n + ops.popcount(flag))
+        return tuple(new) + tuple(counts[nsizes:])  # the dummy, unchanged
+
+    counts = ops.loop(0, vectors, carry=(jnp.int32(0),) * (nsizes + pad), unroll=2)(place)[:nsizes]
+
+    # Concatenate the size lists (largest first), zero the rest, copy out.
+    at = jnp.int32(0)
+    for c, n in enumerate(counts):
+
+        def copy(i, c=c, at=at):
+            vec = ops.load(lists, list_base(c, gpt) + i * LANES)
+            ops.store_compressed(tile, at + i * LANES, vec, every)
+
+        ops.loop(0, pad_vectors(0, n), unroll=copy_unroll)(copy)
+        at = at + n
+    zeros = jnp.zeros((LANES,), jnp.int32)
+
+    def fill(i):
+        ops.store_compressed(tile, at + i * LANES, zeros, every)
+
+    ops.loop(0, pad_vectors(at, gpt), unroll=copy_unroll)(fill)
+
+    def out(i):
+        ops.store(entries_out, base + i * LANES, ops.load(tile, i * LANES))
+
+    ops.loop(0, vectors, unroll=4)(out)
+    ops.store(counts_out, t * LANES, counts_vector(counts, lane))
+
+
+@dataclasses.dataclass(frozen=True)
+class TablePlan:
+    """Static work split of the run-table step.
+
+    The flat tile space ``ngroups * tiles`` (tile ``i`` is query group
+    ``i // tiles``'s tile ``i % tiles``, ranks ``[i * gpt, (i + 1) * gpt)``)
+    splits into ``steps`` pipeline steps of ``tiles_per_step`` tiles; worker
+    ``w`` owns steps ``[w * steps_per_worker, (w + 1) * steps_per_worker)``.
+    """
+
+    ngroups: int
+    tiles: int
+    gpt: int
+    workers: int
+    tiles_per_step: int
+
+    @property
+    def total(self) -> int:
+        return self.ngroups * self.tiles
+
+    @property
+    def steps(self) -> int:
+        return self.total // self.tiles_per_step
+
+    @property
+    def steps_per_worker(self) -> int:
+        return -(-self.steps // self.workers)
+
+
+def table_scratch_sizes(gpt, nsizes):
+    """int32 slots of ``run_table_tile``'s scratch: run list (with its sentinel), run ids, size lists, tile.
+
+    The run list, each size list and the tile take 16 slots of slack for the
+    overflow of their last full-vector store.
+    """
+    return (gpt + LANES, gpt, nsizes * (gpt + LANES), gpt + LANES)
+
+
+def table_vmem_bytes(gpt, tiles_per_step, nsizes):
+    """VMEM per subcore: double-buffered rows/ids/entries/counts blocks plus the tile scratch."""
+    blocks = 2 * 4 * tiles_per_step * (3 * gpt + LANES)
+    return blocks + 4 * sum(table_scratch_sizes(gpt, nsizes))
+
+
+def table_plan(
+    ngroups, tiles, gpt, *, workers, tiles_per_step=None, max_tiles_per_step=16,
+    bubble_tiles=0.5,
+):
+    """Tiles per step: a divisor of the tile count, fewest steps-per-worker x (tiles + bubble)."""
+    total = ngroups * tiles
+    if tiles_per_step is not None:
+        if total % tiles_per_step:
+            raise ValueError(f"tiles_per_step={tiles_per_step} must divide {total} tiles")
+        return TablePlan(ngroups, tiles, gpt, workers, tiles_per_step)
+    best, best_cost = None, None
+    for k in range(1, max_tiles_per_step + 1):
+        if total % k:
+            continue
+        plan = TablePlan(ngroups, tiles, gpt, workers, k)
+        cost = plan.steps_per_worker * (k + bubble_tiles)
+        if best_cost is None or cost < best_cost:
+            best, best_cost = plan, cost
+    return best
+
+
+def worker_steps(worker, plan: TablePlan):
+    """(first step, step count) of a worker's contiguous run of steps: no division."""
+    first = worker * plan.steps_per_worker
+    return first, jnp.clip(plan.steps - first, 0, plan.steps_per_worker)
+
+
+def _tables_kernel(
+    rows_hbm, ids_hbm, counts_hbm, entries_hbm, *scratch, plan: TablePlan, ratio, max_run,
+    even_carry=True, copy_unroll=1,
+):
+    worker = lax.axis_index(("core", "subcore"))
+    first, count = worker_steps(worker, plan)
+    k, gpt = plan.tiles_per_step, plan.gpt
+
+    def step(rows_b, ids_b, counts_b, entries_b):
+        def tile(t, carry):
+            run_table_tile(
+                ScOps, rows_b, ids_b, counts_b, entries_b, t, scratch,
+                gpt=gpt, ratio=ratio, max_run=max_run, even_carry=even_carry, copy_unroll=copy_unroll,
+            )
+            return carry
+
+        lax.fori_loop(0, k, tile, None)
+
+    def block(i):
+        return (first + i,)
+
+    @pl.when(count > 0)
+    def _():
+        pltpu.emit_pipeline(
+            step,
+            grid=(count,),
+            in_specs=(pl.BlockSpec((k * gpt,), block),) * 2,
+            out_specs=(
+                pl.BlockSpec((k * LANES,), block),
+                pl.BlockSpec((k * gpt,), block),
+            ),
+        )(rows_hbm, ids_hbm, counts_hbm, entries_hbm)
+
+
+def check_run_table_args(rows_shape, ids_shape, *, ratio, kv_tile, max_run):
+    """``union_run_tables_xla``'s checks, plus 16-lane tiles. Returns (gpt, tiles)."""
+    if max_run & (max_run - 1) or not 1 <= max_run <= 32:
+        raise ValueError("max_run must be a power of two from 1 to 32")
+    if tuple(ids_shape) != tuple(rows_shape):
+        raise ValueError("rows and ids must have the same shape")
+    _log2(ratio)
+    _log2(kv_tile)
+    gpt = kv_tile // ratio
+    _, cap_ranks = rows_shape
+    if cap_ranks % gpt or gpt > 512:
+        raise ValueError("the list must hold whole tiles of at most 512 groups")
+    if gpt % LANES:
+        raise ValueError(f"a tile must hold a multiple of {LANES} groups")
+    return gpt, cap_ranks // gpt
+
+
+def union_sc_run_tables(rows, ids, *, ratio, kv_tile, max_run=8, tiles_per_step=None, even_carry=True,
+                        copy_unroll=1):
+    """SparseCore run-table step: ``union_run_tables_xla``'s ``(counts, entries)``, bit for bit.
+
+    ``rows``/``ids`` int32[ngroups, cap_ranks]: the list step's. Returns
+    ``counts`` int32[ngroups, cap_tiles, log2(max_run) + 1] (pieces per size,
+    sizes descending) and ``entries`` int32[ngroups, cap_ranks] (per tile, each
+    size's pieces in rank order, sizes descending, ``(pool group << 9) |
+    slot``; unused slots 0). ``tiles_per_step``: tiles per pipeline step (a
+    divisor of ``ngroups * cap_tiles``; default from ``table_plan``). ``even_carry``: see ``carry_pad`` (keep
+    the default; False only to diagnose the old R4/R16 carry on TPU). ``copy_unroll``: unroll of the tile's
+    list-concatenation and zero-fill loops (dynamic trip counts). 1, the default since i1u (M): at 2, R4 tables at
+    KV512 and KV1024 put the size-2 list late (overlapping full-vector stores reordered, I) and a walk on them halted
+    the device; at 1 every R4 case matches the host reference. 2 is kept only to reproduce that on TPU.
+    """
+    gpt, tiles = check_run_table_args(
+        rows.shape, ids.shape, ratio=ratio, kv_tile=kv_tile, max_run=max_run
+    )
+    ngroups, cap_ranks = rows.shape
+    nsizes = len(run_sizes(max_run))
+    sc = _sc_geometry()
+    plan = table_plan(
+        ngroups, tiles, gpt, workers=sc.num_cores * sc.num_subcores,
+        tiles_per_step=tiles_per_step,
+    )
+    need = table_vmem_bytes(gpt, plan.tiles_per_step, nsizes)
+    if need > _GATHER_VMEM_BUDGET:
+        raise ValueError(f"run-table buffers need {need} bytes of VMEM per subcore")
+    counts, entries = core_map_helper.kernel(
+        functools.partial(_tables_kernel, plan=plan, ratio=ratio, max_run=max_run, even_carry=even_carry,
+                          copy_unroll=copy_unroll),
+        out_type=(
+            jax.ShapeDtypeStruct((plan.total * LANES,), jnp.int32),
+            jax.ShapeDtypeStruct((ngroups * cap_ranks,), jnp.int32),
+        ),
+        mesh=_mesh(sc),
+        scratch_types=tuple(
+            pltpu.VMEM((n,), jnp.int32) for n in table_scratch_sizes(gpt, nsizes)
+        ),
+        compiler_params=pltpu.CompilerParams(
+            disable_bounds_checks=True, needs_layout_passes=False
+        ),
+        name=f"qsa_union_sc_run_tables_g{gpt}_r{max_run}_k{plan.tiles_per_step}"
+        + ("_ec" if carry_pad(nsizes, even_carry) else "") + ("" if copy_unroll == 1 else f"_cu{copy_unroll}"),
+    )(rows.astype(jnp.int32).reshape(-1), ids.astype(jnp.int32).reshape(-1))
+    counts = counts.reshape(plan.total, LANES)[:, :nsizes]
+    return counts.reshape(ngroups, tiles, nsizes), entries.reshape(ngroups, cap_ranks)

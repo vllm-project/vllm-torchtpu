@@ -65,7 +65,9 @@ def kernels(monkeypatch):
                  "VLLM_TPU_QSA_PREFILL_UNION_CAP", "VLLM_TPU_QSA_PREFILL_UNION_KV_TILE",
                  "VLLM_TPU_QSA_PREFILL_LEAN", "VLLM_TPU_QSA_PREFILL_UNION_LISTED",
                  "VLLM_TPU_QSA_PREFILL_UNION_SHARE_BITS", "VLLM_TPU_QSA_PREFILL_UNION_ALPHA",
-                 "VLLM_TPU_QSA_PREFILL_UNION_QK16"):
+                 "VLLM_TPU_QSA_PREFILL_UNION_QK16", "VLLM_TPU_QSA_PREFILL_UNION_RUN_TABLES",
+                 "VLLM_TPU_QSA_PREFILL_UNION_LAZY_SHARE", "VLLM_TPU_QSA_PREFILL_UNION_GATHERED",
+                 "VLLM_TPU_QSA_PREFILL_UNION_GATHER_CHUNKS"):
         monkeypatch.delenv(name, raising=False)
     yield
     jax.clear_caches()
@@ -304,7 +306,8 @@ def test_flag_on_dispatch_takes_the_walk(kernels, monkeypatch):
     got = _dispatch(step)
     assert calls == [dict(kv_heads=2, ratio=RATIO, k_scale=1.0, v_scale=1.0, group=128, kv_tile=1024,
                           union_cap=CAP, min_context=1000, lean=True, listed=None, share_bits=False,
-                          union_alpha=0.0, qk16=False)]
+                          union_alpha=0.0, qk16=False, run_tables=False, lazy_share=False, gathered=None,
+                          gather_chunks=4)]
     jax.clear_caches()
     want = _walk(step, union_cap=CAP, min_context=1000, lean=True)
     np.testing.assert_array_equal(_bits(got), _bits(want))
@@ -576,6 +579,223 @@ def test_share_bits_at_g64(kernels):
     np.testing.assert_array_equal(_bits(shared), _bits(unshared))
 
 
+def test_share_bits_skips_unpaired_served_tiles(kernels, monkeypatch):
+    """share_bits on a bucket whose served tiles are unpaired (1,152 rows on 3,200-row pages without
+    Q128_FALLBACK: served Q256/KV128, as the 3,200 bucket at int-2) runs the unshared walk and falls back to the
+    served call, instead of failing at trace time (int-2 screen j-0b8938d2); it warns once per bucket.
+
+    Engaged: the over-cap step runs the same bitset builds as share_bits off (the plan's, then the served call's
+    own), so the skip is real; output alone cannot show it (a shared bitset gives the same bits)."""
+    from unittest.mock import MagicMock
+
+    from vllm_torchtpu.kernels.qwen4_exp import prefill_tiles
+
+    monkeypatch.setattr(prefill_tiles, "logger", MagicMock())  # the default-tiles warning (vllm logger)
+    monkeypatch.delenv("VLLM_TPU_QSA_PREFILL_Q128_FALLBACK", raising=False)
+    monkeypatch.setattr(ud, "_SHARE_BITS_SKIPPED", set())
+    logged = []
+    monkeypatch.setattr(ud, "_share_bits_skip_log", lambda msg, *args: logged.append(args))
+    rows, cached = BUCKET
+    step = _packed_step(91, rows, cached, tokens=1152)
+    q, _, _, _, _, pool, _ = step
+    served_qb, served_kt = get_sparse_prefill_tiles(q, pool, kv_heads=2, ratio=RATIO)
+    assert (served_qb, served_kt) == (256, 128) and served_kt not in bsp.PAIRED_KV_TILES
+    served = _served(step)
+    jax.clear_caches()
+    unshared = _walk(step, group=64)
+    jax.clear_caches()
+    shared = _walk(step, group=64, share_bits=True)
+    np.testing.assert_array_equal(_bits(shared), _bits(unshared))
+    assert not np.array_equal(_bits(shared), _bits(served))  # the walk ran
+    ran = []
+    original = bsp._selection_bitset
+
+    def recording(*args, **kwargs):
+        out = original(*args, **kwargs)
+        block = kwargs["query_block"]
+        jax.debug.callback(lambda: ran.append(block))
+        return out
+
+    monkeypatch.setattr(bsp, "_selection_bitset", recording)
+    builds = {}
+    for share in (False, True):
+        jax.clear_caches()
+        ran.clear()
+        fallback = _walk(step, group=64, union_cap=32, share_bits=share)
+        jax.effects_barrier()
+        builds[share] = sorted(ran)
+        np.testing.assert_array_equal(_bits(fallback), _bits(served))
+    assert builds[True] == builds[False] and served_qb in builds[True], builds
+    assert logged == [(1152, 64, 256, 128)], logged  # two share_bits traces, one warning
+
+
+# --- lazy share: walk on group-aligned rows, build the served layout only on a fallback ----------------------------
+
+# Requests that are multiples of 64 rows but not of 256: share_bits aligns them to the served 256-row block (a padded
+# layout); lazy share keeps the identity layout at G64.
+A64 = ((64, 192, 320, 128, 320), (5000, 1500, 4000, 700, 2900))
+# Every request a multiple of 256 rows: share_bits' and lazy share's layouts are both the identity.
+A256 = ((256, 512, 256), (3000, 4500, 1000))
+
+
+@pytest.mark.parametrize("layout", [SPARE, WORST, ALIGNED, A64, A256])
+def test_lazy_share_fallback_is_the_served_call(kernels, layout):
+    """A lazy-share fallback (the served call on a layout built from the plan's bitset) is bitwise the served call."""
+    rows, cached = layout
+    tokens = 2048 if sum(-(-n // 256) * 256 for n in rows) > 1024 else 1024
+    step = _packed_step(23 + len(rows) + sum(rows) % 7, rows, cached, tokens=tokens)
+    served = _served(step)
+    jax.clear_caches()
+    tiny = _walk(step, group=64, union_cap=32, share_bits=True, lazy_share=True)
+    np.testing.assert_array_equal(_bits(tiny), _bits(served))
+    jax.clear_caches()
+    over = _walk(step, group=64, union_cap=_max_union(step, 64) - 1, share_bits=True, lazy_share=True)
+    np.testing.assert_array_equal(_bits(over), _bits(served))
+
+
+@pytest.mark.parametrize("layout", [SPARE, A64])
+def test_lazy_share_walk_is_the_unshared_walk(kernels, layout):
+    """The lazy walk aligns to the group (identity layout for group-aligned requests), not the served block, and is
+    the unshared walk bit for bit; share_bits without lazy aligns to 256 (recorded at trace time)."""
+    rows, cached = layout
+    tokens = 2048 if sum(-(-n // 256) * 256 for n in rows) > 1024 else 1024
+    step = _packed_step(33 + len(rows), rows, cached, tokens=tokens)
+    unshared = _walk(step, group=64)
+    jax.clear_caches()
+    ud._WALK_ALIGN.clear()
+    lazy = _walk(step, group=64, share_bits=True, lazy_share=True)
+    assert ud._WALK_ALIGN[tokens] == (64, True), ud._WALK_ALIGN
+    np.testing.assert_array_equal(_bits(lazy), _bits(unshared))
+    assert not np.array_equal(_bits(lazy), _bits(_served(step)))  # the walk ran
+    jax.clear_caches()
+    ud._WALK_ALIGN.clear()
+    _walk(step, group=64, share_bits=True)
+    assert ud._WALK_ALIGN[tokens] == (256, False), ud._WALK_ALIGN
+
+
+def test_lazy_share_fallback_reuses_the_plan_bitset(kernels, monkeypatch):
+    """Engaged: an over-cap lazy-share step runs only the plan's bitset build (no served-layout build), as share_bits
+    does; without sharing it also runs the served call's 256-row build."""
+    rows, cached = A64
+    step = _packed_step(62, rows, cached)
+    ran = []
+    original = bsp._selection_bitset
+
+    def recording(*args, **kwargs):
+        out = original(*args, **kwargs)
+        block = kwargs["query_block"]
+        jax.debug.callback(lambda: ran.append(block))
+        return out
+
+    monkeypatch.setattr(bsp, "_selection_bitset", recording)
+    by_mode = {}
+    for mode in ("off", "lazy"):
+        jax.clear_caches()
+        ran.clear()
+        _walk(step, group=64, union_cap=32, share_bits=mode == "lazy", lazy_share=mode == "lazy")
+        jax.effects_barrier()
+        by_mode[mode] = sorted(ran)
+    assert by_mode["off"] == [128, 256], by_mode
+    assert by_mode["lazy"] == [128], by_mode
+
+
+@pytest.mark.parametrize("layout,direct", [(A256, True), (A64, False)])
+def test_lazy_share_fallback_layout(kernels, monkeypatch, layout, direct):
+    """Engaged: on a step whose requests are all 256-aligned, the lazy fallback runs the served kernel on the original
+    rows (no padded layout); on a 64-aligned step it runs on the padded served layout."""
+    rows, cached = layout
+    step = _packed_step(64 + len(rows), rows, cached)
+    ran = []
+    original = bsp.block_sparse_gqa_prefill
+
+    def recording(query, *args, **kwargs):
+        out = original(query, *args, **kwargs)
+        n = query.shape[0]
+        jax.debug.callback(lambda: ran.append(n))
+        return out
+
+    monkeypatch.setattr(bsp, "block_sparse_gqa_prefill", recording)
+    jax.clear_caches()
+    out = _walk(step, group=64, union_cap=32, share_bits=True, lazy_share=True)
+    jax.effects_barrier()
+    tokens = step[0].shape[0]
+    assert ran and (all(n == tokens for n in ran) if direct else all(n > tokens for n in ran)), (ran, tokens)
+    monkeypatch.setattr(bsp, "block_sparse_gqa_prefill", original)
+    jax.clear_caches()
+    np.testing.assert_array_equal(_bits(out), _bits(_served(step)))
+
+
+def test_lazy_share_dispatch(kernels, monkeypatch):
+    """VLLM_TPU_QSA_PREFILL_UNION_LAZY_SHARE reaches union_walk_prefill."""
+    rows, cached = A64
+    step = _packed_step(63, rows, cached)
+    for name, value in (("VLLM_TPU_QSA_PREFILL_UNION_WALK", "64"), ("VLLM_TPU_QSA_PREFILL_UNION_MIN_CONTEXT", "0"),
+                        ("VLLM_TPU_QSA_PREFILL_UNION_SHARE_BITS", "1"), ("VLLM_TPU_QSA_PREFILL_UNION_LAZY_SHARE", "1")):
+        monkeypatch.setenv(name, value)
+    calls = _spy(monkeypatch)
+    _dispatch(step)
+    assert calls[0]["share_bits"] is True and calls[0]["lazy_share"] is True, calls
+
+
+# --- the chunked gathered walk on the served path (gathered=...; SparseCore gather on TPU) --------------------------
+
+
+@pytest.mark.parametrize("layout,chunks", [(SPARE, 1), (SPARE, 4), (WORST, 3), (A64, 4)])
+def test_gathered_prefill_is_the_walk(kernels, layout, chunks):
+    """gathered="reference": the walk-free kernel on gathered tiles, in chunks of whole query groups, is the G64 walk bit
+    for bit on packed unaligned steps, and it is what runs (gathered kernels traced, no listed walk)."""
+    rows, cached = layout
+    tokens = 2048 if sum(-(-n // 256) * 256 for n in rows) > 1024 else 1024
+    step = _packed_step(91 + chunks + len(rows), rows, cached, tokens=tokens)
+    walk = _walk(step, group=64)
+    jax.clear_caches()
+    got = _walk(step, group=64, listed="reference", gathered="reference", gather_chunks=chunks)
+    np.testing.assert_array_equal(_bits(got), _bits(walk))
+    assert not np.array_equal(_bits(walk), _bits(_served(step)))  # the walk ran
+    names = _traced_names(step, group=64, listed="reference", gathered="reference", gather_chunks=chunks)
+    assert any("_gathered" in n for n in names) and not any(n.endswith("_listed") for n in names), names
+
+
+def test_gathered_with_lazy_share_and_fallback(kernels):
+    """With lazy share: the gathered walk is still the walk; an over-cap step is still the served call bit for bit."""
+    rows, cached = A64
+    step = _packed_step(97, rows, cached)
+    walk = _walk(step, group=64)
+    jax.clear_caches()
+    opts = dict(group=64, listed="reference", gathered="reference", gather_chunks=2, share_bits=True, lazy_share=True)
+    np.testing.assert_array_equal(_bits(_walk(step, **opts)), _bits(walk))
+    jax.clear_caches()
+    np.testing.assert_array_equal(_bits(_walk(step, union_cap=32, **opts)), _bits(_served(step)))
+
+
+def test_gathered_args_are_checked(kernels):
+    rows, cached = SPARE
+    step = _packed_step(98, rows, cached)
+    with pytest.raises(ValueError, match="gathered needs listed"):
+        _walk(step, group=64, gathered="reference")
+    with pytest.raises(ValueError, match="gathered needs listed"):
+        _walk(step, group=64, listed="reference", gathered="reference", run_tables=True)
+    with pytest.raises(ValueError, match="gathered: None"):
+        _walk(step, group=64, listed="reference", gathered="xla")
+
+
+def test_gathered_dispatch(kernels, monkeypatch):
+    """VLLM_TPU_QSA_PREFILL_UNION_GATHERED / _GATHER_CHUNKS reach union_walk_prefill and give the direct call's bits."""
+    rows, cached = A64
+    step = _packed_step(99, rows, cached)
+    for name, value in (("VLLM_TPU_QSA_PREFILL_UNION_WALK", "64"), ("VLLM_TPU_QSA_PREFILL_UNION_MIN_CONTEXT", "0"),
+                        ("VLLM_TPU_QSA_PREFILL_UNION_LISTED", "reference"),
+                        ("VLLM_TPU_QSA_PREFILL_UNION_GATHERED", "reference"),
+                        ("VLLM_TPU_QSA_PREFILL_UNION_GATHER_CHUNKS", "2")):
+        monkeypatch.setenv(name, value)
+    calls = _spy(monkeypatch)
+    got = _dispatch(step)
+    assert calls[0]["gathered"] == "reference" and calls[0]["gather_chunks"] == 2, calls
+    jax.clear_caches()
+    np.testing.assert_array_equal(_bits(got), _bits(_walk(step, group=64, union_cap=calls[0]["union_cap"],
+                                                         listed="reference", gathered="reference", gather_chunks=2)))
+
+
 def test_full_stack_dispatch(kernels, monkeypatch):
     """The int-2 flags (G64, listed, share_bits, alpha 0.9, cap 16,384, qk16) reach union_walk_prefill and give the
     direct call's bits; without alpha and qk16 the stack is the plain G64 walk bit for bit (qk16 itself is gated
@@ -591,7 +811,8 @@ def test_full_stack_dispatch(kernels, monkeypatch):
     got = _dispatch(step)
     assert calls == [dict(kv_heads=2, ratio=RATIO, k_scale=1.0, v_scale=1.0, group=64, kv_tile=1024,
                           union_cap=16384, min_context=0, lean=True, listed="reference", share_bits=True,
-                          union_alpha=0.9, qk16=False)]
+                          union_alpha=0.9, qk16=False, run_tables=False, lazy_share=False, gathered=None,
+                          gather_chunks=4)]
     stack = dict(group=64, union_cap=16384, listed="reference", share_bits=True)
     jax.clear_caches()
     np.testing.assert_array_equal(_bits(got), _bits(_walk(step, union_alpha=0.9, **stack)))
@@ -607,3 +828,36 @@ def test_full_stack_dispatch(kernels, monkeypatch):
     monkeypatch.setenv("VLLM_TPU_QSA_PREFILL_UNION_LISTED", "bogus")
     with pytest.raises(ValueError, match="listed"):
         _dispatch(step)
+
+
+@pytest.mark.parametrize("group,layout", [(64, SPARE), (64, WORST), (128, SPARE)])
+def test_run_tables_prefill_is_the_walk(kernels, group, layout):
+    """run_tables=True (XLA builders): each tile from run tables + precomputed lines, per-group page rows of a packed
+    step; bitwise the walk, and the run-table kernel is what runs."""
+    rows, cached = layout
+    tokens = 2048 if sum(-(-n // 256) * 256 for n in rows) > 1024 else 1024
+    step = _packed_step(91 + group + len(rows), rows, cached, tokens=tokens)
+    walk = _walk(step, group=group)
+    jax.clear_caches()
+    runs = _walk(step, group=group, listed="reference", run_tables=True)
+    np.testing.assert_array_equal(_bits(runs), _bits(walk))
+    names = _traced_names(step, group=group, listed="reference", run_tables=True)
+    assert any("_runs" in n for n in names), names
+    with pytest.raises(ValueError, match="run_tables needs listed"):
+        _walk(step, group=group, run_tables=True)
+
+
+def test_run_tables_dispatch(kernels, monkeypatch):
+    rows, cached = SPARE
+    step = _packed_step(93, rows, cached, tokens=2048)
+    for name, value in (("VLLM_TPU_QSA_PREFILL_UNION_WALK", "64"), ("VLLM_TPU_QSA_PREFILL_UNION_MIN_CONTEXT", "0"),
+                        ("VLLM_TPU_QSA_PREFILL_UNION_CAP", "16384"), ("VLLM_TPU_QSA_PREFILL_LEAN", "1"),
+                        ("VLLM_TPU_QSA_PREFILL_UNION_LISTED", "reference"),
+                        ("VLLM_TPU_QSA_PREFILL_UNION_SHARE_BITS", "1"),
+                        ("VLLM_TPU_QSA_PREFILL_UNION_RUN_TABLES", "1")):
+        monkeypatch.setenv(name, value)
+    calls = _spy(monkeypatch)
+    got = _dispatch(step)
+    assert calls[0]["run_tables"] is True and calls[0]["listed"] == "reference"
+    jax.clear_caches()
+    np.testing.assert_array_equal(_bits(got), _bits(_walk(step, group=64, union_cap=16384)))

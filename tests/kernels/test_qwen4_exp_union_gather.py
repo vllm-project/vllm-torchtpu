@@ -213,3 +213,96 @@ def test_listed_kernel_with_precomputed_lines_is_the_walk(kernels, group, kv_til
     np.testing.assert_array_equal(got.view(np.uint16), walk.view(np.uint16))
     with pytest.raises(ValueError, match="listed_lines"):
         ud.union_walk_kernel(q, *plan, pool, table_row, listed_lines=lines, **options)
+
+
+# --- run tables (step 4): the union's pool-contiguous runs as per-size piece lists, one static copy size per loop ---
+
+
+def _decode(counts, entries, g, t, gpt, sizes):
+    out, at = [], t * gpt
+    for c, s in enumerate(sizes):
+        for e in entries[g, at:at + counts[g, t, c]]:
+            out.append((int(e) >> 9, int(e) & 511, s))
+        at += int(counts[g, t, c])
+    return out
+
+
+@pytest.mark.parametrize("kv_tile,max_run", [(512, 8), (1024, 4)])
+def test_run_tables_cover_each_slot_once_with_contiguous_pieces(kernels, kv_tile, max_run):
+    group = 64
+    q, blocks, lengths, pool, table_row, cap, plan = _plan(13 + kv_tile + max_run, group)
+    bits, ubits, usize, vlengths = plan
+    rows, ids = ud.union_gather_list_reference(ubits, usize, table_row, ratio=RATIO, page_size=PAGE,
+                                               union_cap=cap, kv_tile=kv_tile)
+    counts, entries = ud.union_run_tables_reference(rows, ids, ratio=RATIO, kv_tile=kv_tile, max_run=max_run)
+    rows, ids = np.asarray(rows), np.asarray(ids)
+    gpt = kv_tile // RATIO
+    sizes = [1 << k for k in reversed(range(max_run.bit_length()))]
+    assert counts.shape == (rows.shape[0], rows.shape[1] // gpt, len(sizes))
+    pieces_total = live_total = 0
+    for g in range(rows.shape[0]):
+        for t in range(rows.shape[1] // gpt):
+            covered = np.zeros(gpt, np.int64)
+            for src_group, slot, s in _decode(counts, entries, g, t, gpt, sizes):
+                covered[slot:slot + s] += 1
+                r = t * gpt + slot
+                live = ids[g, r:r + s] >= 0
+                assert live.all() or not live.any(), "a piece mixes live and padding ranks"
+                if live.all():  # live: the piece's pool rows are the ranks' rows, consecutive
+                    np.testing.assert_array_equal(src_group * RATIO + np.arange(s) * RATIO, rows[g, r:r + s])
+                else:  # padding: word 0's first rows, as the walk's padding copies
+                    assert src_group * RATIO == rows[g, r]
+                pieces_total += 1
+            np.testing.assert_array_equal(covered, 1)
+            live_total += int((ids[g, t * gpt:(t + 1) * gpt] >= 0).sum())
+            # maximal runs (recomputed independently), each cut into the fewest power-of-two pieces <= max_run
+            rr, li = rows[g, t * gpt:(t + 1) * gpt], ids[g, t * gpt:(t + 1) * gpt] >= 0
+            joins = np.concatenate([[False], (li[1:] == li[:-1]) & (~li[1:] | (rr[1:] == rr[:-1] + RATIO))])
+            starts = np.flatnonzero(~joins)
+            lens = np.diff(np.concatenate([starts, [gpt]]))
+            fewest = sum(n // max_run + bin(n % max_run).count("1") for n in lens)
+            assert len(_decode(counts, entries, g, t, gpt, sizes)) == fewest
+    assert pieces_total < live_total, (pieces_total, live_total)  # runs were coalesced
+
+
+@pytest.mark.parametrize("group,kv_tile,line_matmul,max_run", [(64, 512, False, 8), (128, 1024, True, 4)])
+def test_run_table_kernel_is_the_walk(kernels, group, kv_tile, line_matmul, max_run):
+    q, blocks, lengths, pool, table_row, cap, plan = _plan(group + kv_tile + max_run + 7, group)
+    bits, ubits, usize, vlengths = plan
+    options = dict(group=group, union_cap=cap, kv_tile=kv_tile, lean=True, fast_walk=True, line_matmul=line_matmul)
+    walk = np.asarray(ud.union_walk_kernel(q, *plan, pool, table_row, **options))
+    rows, ids = ud.union_gather_list_reference(ubits, usize, table_row, ratio=RATIO, page_size=PAGE,
+                                               union_cap=cap, kv_tile=kv_tile)
+    _, lines = ud.union_gather_reference(pool, bits, rows, ids, ratio=RATIO, line_matmul=line_matmul)
+    tables = ud.union_run_tables_reference(rows, ids, ratio=RATIO, kv_tile=kv_tile, max_run=max_run)
+    jax.clear_caches()
+    got = np.asarray(ud.union_walk_kernel(q, *plan, pool, table_row, run_tables=tables, listed_lines=lines,
+                                          **options))
+    np.testing.assert_array_equal(got.view(np.uint16), walk.view(np.uint16))
+    with pytest.raises(ValueError, match="run tables"):
+        ud.union_walk_kernel(q, *plan, pool, table_row, run_tables=tables, **options)
+
+
+@pytest.mark.parametrize("group,kv_tile,max_run", [(64, 512, 8), (64, 1024, 4), (128, 1024, 8), (32, 256, 2)])
+def test_xla_run_tables_are_the_reference(kernels, group, kv_tile, max_run):
+    """union_run_tables_xla (traceable; the SparseCore builder's spec) is union_run_tables_reference bit for bit."""
+    q, blocks, lengths, pool, table_row, cap, plan = _plan(group + kv_tile + max_run + 11, group)
+    bits, ubits, usize, vlengths = plan
+    rows, ids = ud.union_gather_list_reference(ubits, usize, table_row, ratio=RATIO, page_size=PAGE,
+                                               union_cap=cap, kv_tile=kv_tile)
+    want = ud.union_run_tables_reference(rows, ids, ratio=RATIO, kv_tile=kv_tile, max_run=max_run)
+    got = jax.jit(lambda r, i: ud.union_run_tables_xla(r, i, ratio=RATIO, kv_tile=kv_tile, max_run=max_run))(rows, ids)
+    np.testing.assert_array_equal(np.asarray(got[0]), want[0])
+    np.testing.assert_array_equal(np.asarray(got[1]), want[1])
+
+
+def test_lines_reference_is_the_gather_lines(kernels):
+    group, kv_tile = 64, 512
+    q, blocks, lengths, pool, table_row, cap, plan = _plan(19, group)
+    bits, ubits, usize, vlengths = plan
+    rows, ids = ud.union_gather_list_reference(ubits, usize, table_row, ratio=RATIO, page_size=PAGE,
+                                               union_cap=cap, kv_tile=kv_tile)
+    for line_matmul in (False, True):
+        _, lines = ud.union_gather_reference(pool, bits, rows, ids, ratio=RATIO, line_matmul=line_matmul)
+        np.testing.assert_array_equal(
+            np.asarray(ud.union_lines_reference(bits, ids, ratio=RATIO, line_matmul=line_matmul)), np.asarray(lines))

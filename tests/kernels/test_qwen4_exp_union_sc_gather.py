@@ -3,7 +3,9 @@
 
 ``union_sc_list`` must return ``qsa_union_dense.union_gather_list_reference``'s
 ``(rows, ids)`` and ``union_sc_gather`` its ``union_gather_reference``'s
-``(gathered_kv, lines)``, bit for bit.
+``(gathered_kv, lines)``, bit for bit. For the run-table walk,
+``union_sc_run_tables`` must return ``union_run_tables_xla``'s ``(counts,
+entries)`` and ``union_sc_lines`` ``union_lines_reference``'s lines.
 
 Two kinds of test:
 
@@ -11,14 +13,20 @@ Two kinds of test:
   kernels call. Two numpy emulations replay each kernel's loop structure (the
   list step's carried-rank compressed stores and padding fill; the gather
   step's items, streams, windows, KV rows, bitset rows, lines and dead-tile
-  skip) through those same helpers and must equal the references. A lowering
-  test traces every kernel variant and lowers it to Mosaic for an abstract
-  TPU7x device. These check the index math and the Pallas-level lowering, not
-  the SparseCore compile or the primitives' hardware semantics.
+  skip) through those same helpers and must equal the references. The
+  run-table emulation goes further: it runs the kernel's own tile code
+  (``run_table_tile``) on numpy stand-ins for the SparseCore primitives, whose
+  compressed store writes garbage past the popcount. A lowering test traces
+  every kernel variant and lowers it to Mosaic for an abstract TPU7x device.
+  These check the index math and the Pallas-level lowering, not the SparseCore
+  compile or the primitives' hardware semantics.
 - TPU (skip off a SparseCore TPU). The real kernels against the references on
   synthetic and ``union_bits_plan`` inputs, one realistic size (50 query
   groups, cap 10,624, kv_tile 1024), and end to end: the attention kernel on
-  the SparseCore-gathered tiles is bitwise the walk.
+  the SparseCore-gathered tiles is bitwise the walk. The run tables and lines
+  likewise, on ``union_bits_plan`` inputs at small sizes and at 50 query groups
+  with a cap near 10K (G64 and G128), and end to end: the run-table walk on the
+  SparseCore list, tables and lines is bitwise the walk.
 """
 
 import functools
@@ -27,6 +35,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from jax import lax
+from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.kernels.qwen4_exp import qsa_union_dense as ud
@@ -223,19 +233,24 @@ def _emulate_gather(pool, bits, rows, ids, *, line_matmul, plan, item_steps=None
     """``union_sc_gather``: every worker's items, steps and streams, kernel-indexed.
 
     Returns the KV bytes, the lines and per-row write counts (rows never
-    written keep sentinels).
+    written keep sentinels). ``pool`` and ``rows`` None: ``union_sc_lines``
+    (lines only; KV and its write counts are None).
     """
-    ngroups, cap_ranks = rows.shape
+    ngroups, cap_ranks = ids.shape
     _, words, width = bits.shape
     repeat = 1 if line_matmul else RATIO
-    pool_u8 = _u8(pool)
-    groups = pool_u8.reshape(-1, RATIO, *pool_u8.shape[2:])
     ranks = ngroups * cap_ranks
-    kv = np.full((ranks, *groups.shape[1:]), 0xA5, np.uint8)
+    with_kv = pool is not None
+    kv = kv_writes = None
+    if with_kv:
+        pool_u8 = _u8(pool)
+        groups = pool_u8.reshape(-1, RATIO, *pool_u8.shape[2:])
+        kv = np.full((ranks, *groups.shape[1:]), 0xA5, np.uint8)
+        kv_writes = np.zeros(ranks, np.int32)
+        rows_f = np.asarray(rows).reshape(-1)
     lines = np.full((ranks * repeat, width), -7, np.int32)
-    kv_writes = np.zeros(ranks, np.int32)
     line_writes = np.zeros(ranks * repeat, np.int32)
-    rows_f, ids_f = np.asarray(rows).reshape(-1), np.asarray(ids).reshape(-1)
+    ids_f = np.asarray(ids).reshape(-1)
     bits_f = np.asarray(bits).reshape(ngroups * words, width)
     jlane = jnp.arange(plan.lanes, dtype=jnp.int32)
     span = plan.lanes
@@ -244,7 +259,7 @@ def _emulate_gather(pool, bits, rows, ids, *, line_matmul, plan, item_steps=None
             item = int(sg.worker_item(worker, k, plan))
             block = int(sg.staged_block(item, plan))
             staged = slice(block * plan.part_ranks, (block + 1) * plan.part_ranks)
-            rows_v, ids_v = rows_f[staged], ids_f[staged]
+            ids_v = ids_f[staged]
             g, part, rank0 = (int(x) for x in sg.item_coords(jnp.int32(item), plan))
             if item_steps is None:
                 steps = plan.steps_per_part
@@ -255,12 +270,13 @@ def _emulate_gather(pool, bits, rows, ids, *, line_matmul, plan, item_steps=None
             for step in range(steps):
                 for s in range(plan.streams):
                     off = int(sg.window_offset(step, s, plan))
-                    rw = jnp.asarray(rows_v[off : off + span])
                     iw = jnp.asarray(ids_v[off : off + span])
-                    dst = int(sg.window_rank(rank0, step, s, plan))
-                    kv_rows = np.asarray(sg.kv_row_index(rw, RATIO))
-                    kv[dst : dst + span] = groups[kv_rows]
-                    kv_writes[dst : dst + span] += 1
+                    if with_kv:
+                        rw = jnp.asarray(rows_f[staged][off : off + span])
+                        dst = int(sg.window_rank(rank0, step, s, plan))
+                        kv_rows = np.asarray(sg.kv_row_index(rw, RATIO))
+                        kv[dst : dst + span] = groups[kv_rows]
+                        kv_writes[dst : dst + span] += 1
                     brows = bits_f[np.asarray(sg.bits_row_index(iw, g * words))]
                     line = np.asarray(sg.line_of(jnp.asarray(brows), iw[:, None]))
                     base = int(sg.lines_block(item, step, plan)) * plan.chunk * repeat
@@ -269,6 +285,224 @@ def _emulate_gather(pool, bits, rows, ids, *, line_matmul, plan, item_steps=None
                         lines[at] = line
                         line_writes[at] += 1
     return kv, lines, kv_writes, line_writes
+
+
+# Run tables: the kernel's own tile code on numpy stand-ins for the primitives.
+
+GARBAGE = -777  # what the stand-in compressed store leaves past the popcount
+TABLE_CASES = [(64, 512, 8), (64, 1024, 4), (128, 1024, 8), (32, 256, 2), (64, 512, 32), (64, 1024, 1),
+               (64, 1024, 16)]  # R16: 5 sizes, the other odd carry above 1 (carry_pad)
+TABLE_EDGE_CASES = ["one_run", "vector_edges", "padding_contiguity", "decreasing", "all_padding", "mixed"]
+
+
+class _NumpyOps:
+    """``sg.ScOps`` on numpy buffers, so the emulation runs ``sg.run_table_tile`` itself.
+
+    ``store_compressed`` writes the selected lanes packed, then ``GARBAGE`` on
+    the rest of its 16 slots: the hardware may leave those slots alone, and the
+    kernel must not depend on either. Every access asserts it stays inside its
+    buffer (the kernel runs with bounds checks off).
+    """
+
+    @staticmethod
+    def lane():
+        return jnp.arange(LANES, dtype=jnp.int32)
+
+    @staticmethod
+    def _at(ref, at):
+        at = int(at)
+        assert 0 <= at and at + LANES <= ref.size, (at, ref.size)
+        return at
+
+    def load(self, ref, at):
+        at = self._at(ref, at)
+        return jnp.asarray(ref[at : at + LANES])
+
+    def store(self, ref, at, x):
+        at = self._at(ref, at)
+        ref[at : at + LANES] = np.asarray(x)
+
+    def store_compressed(self, ref, at, x, mask):
+        at = self._at(ref, at)
+        keep = np.asarray(mask)
+        n = int(keep.sum())
+        ref[at : at + n] = np.asarray(x)[keep]
+        ref[at + n : at + LANES] = GARBAGE
+
+    @staticmethod
+    def gather(ref, index):
+        index = np.asarray(index)
+        assert (index >= 0).all() and (index < ref.size).all(), index
+        return jnp.asarray(ref[index])
+
+    @staticmethod
+    def cumsum(x):
+        return jnp.cumsum(x, dtype=jnp.int32)
+
+    @staticmethod
+    def popcount(mask):
+        return int(np.asarray(mask).sum())
+
+    @staticmethod
+    def loop(lower, upper, *, carry=None, unroll=1):
+        def run(body):
+            state = carry
+            for i in range(int(lower), int(upper)):
+                if carry is None:
+                    body(i)
+                else:
+                    state = body(i, state)
+            return state
+
+        return run
+
+
+def _emulate_tables(rows, ids, *, max_run, plan, even_carry=True, copy_unroll=1):
+    """``union_sc_run_tables``: every worker's steps, every tile through ``sg.run_table_tile``.
+
+    The scratch persists across a worker's tiles and starts as sentinels; each
+    step's output blocks are written back whole, stale slots included (as the
+    pipeline does). Returns ``(counts, entries)`` shaped as the kernel's and
+    per-step write-back counts.
+    """
+    rows_f = np.asarray(rows, np.int32).reshape(-1)
+    ids_f = np.asarray(ids, np.int32).reshape(-1)
+    gpt, k = plan.gpt, plan.tiles_per_step
+    nsizes = len(sg.run_sizes(max_run))
+    counts = np.full(plan.total * LANES, -3, np.int32)
+    entries = np.full(rows_f.size, -3, np.int32)
+    writes = np.zeros(plan.steps, np.int32)
+    ops = _NumpyOps()
+    for worker in range(plan.workers):
+        scratch = tuple(
+            np.full(n, -5, np.int32) for n in sg.table_scratch_sizes(gpt, nsizes)
+        )
+        counts_b = np.full(k * LANES, -9, np.int32)
+        entries_b = np.full(k * gpt, -9, np.int32)
+        first, count = (int(x) for x in sg.worker_steps(worker, plan))
+        for i in range(count):
+            step = first + i
+            ranks = slice(step * k * gpt, (step + 1) * k * gpt)
+            rows_b, ids_b = rows_f[ranks].copy(), ids_f[ranks].copy()
+            for t in range(k):
+                sg.run_table_tile(
+                    ops, rows_b, ids_b, counts_b, entries_b, t, scratch,
+                    gpt=gpt, ratio=RATIO, max_run=max_run, even_carry=even_carry,
+                    copy_unroll=copy_unroll,
+                )
+            entries[ranks] = entries_b
+            counts[step * k * LANES : (step + 1) * k * LANES] = counts_b
+            writes[step] += 1
+    counts = counts.reshape(plan.total, LANES)[:, :nsizes]
+    return (
+        counts.reshape(plan.ngroups, plan.tiles, nsizes),
+        entries.reshape(plan.ngroups, -1),
+        writes,
+    )
+
+
+def _tables_plan_for(rows, kv_tile, *, workers=WORKERS, tiles_per_step=None):
+    gpt = kv_tile // RATIO
+    ngroups, cap_ranks = rows.shape
+    return sg.table_plan(
+        ngroups, cap_ranks // gpt, gpt, workers=workers, tiles_per_step=tiles_per_step
+    )
+
+
+def _table_edge_case(case, kv_tile):
+    """(rows, ids): 2 query groups x 3 tiles of hand-built runs (any rows/ids are valid input)."""
+    gpt = kv_tile // RATIO
+    n = 3 * gpt
+    rng = np.random.default_rng(TABLE_EDGE_CASES.index(case) + kv_tile)
+    pad_row = 3200 * 5
+    rows = np.full((2, n), pad_row, np.int32)
+    ids = np.full((2, n), -1, np.int32)
+
+    def runs(lengths, start_row, gap):
+        """Live runs of the given lengths, ``gap`` groups apart in the pool."""
+        out, row = [], start_row
+        for length in lengths:
+            out.extend(row + RATIO * np.arange(length))
+            row = out[-1] + RATIO * (1 + gap)
+        return np.asarray(out[:n], np.int32)
+
+    if case == "one_run":  # every rank live and contiguous: cut only at tile boundaries
+        rows[:] = 7 * 3200 + RATIO * np.arange(n)
+        ids[:] = np.arange(n)
+    elif case == "vector_edges":  # run ends on both sides of the 16-lane boundaries
+        lengths = [15, 1, 16, 17, 31, 33, 8, 7, 9, 64, 3, 5, 2, 47, 49, 10, 6, 11, 12, 13] * 8
+        rows[0] = runs(lengths, 3 * 3200, 1)
+        rows[1] = runs(lengths[::-1], 9 * 3200, 3)
+        ids[:] = np.arange(n)
+    elif case == "padding_contiguity":  # contiguous rows across a live/padding edge never join
+        live0 = gpt + 37
+        rows[0, :live0] = pad_row - RATIO * live0 + RATIO * np.arange(live0)
+        ids[0, :live0] = np.arange(live0)
+        live1 = slice(50, n - 20)
+        rows[1, live1] = pad_row + RATIO * (1 + np.arange(n - 70))
+        ids[1, live1] = np.arange(n - 70)
+    elif case == "decreasing":  # no contiguity at all: every live run has length 1
+        rows[:] = 20 * 3200 - RATIO * np.arange(n)
+        ids[:] = np.arange(n)
+    elif case == "mixed":  # random runs, gaps and padding stretches
+        for g in range(2):
+            j = 0
+            while j < n:
+                length = int(rng.integers(1, 41))
+                if rng.random() < 0.25:
+                    j += length  # a padding stretch
+                    continue
+                row = int(rng.integers(0, 4000)) * RATIO
+                stop = min(n, j + length)
+                rows[g, j:stop] = row + RATIO * np.arange(stop - j)
+                ids[g, j:stop] = j + np.arange(stop - j)
+                j = stop
+    return jnp.asarray(rows), jnp.asarray(ids)
+
+
+def _plan_tables_inputs(seed, group, kv_tile, **plan_kwargs):
+    """``union_bits_plan`` inputs and the list reference's ``(rows, ids)``."""
+    q, pool, table_row, cap, plan = _plan_inputs(seed, group, **plan_kwargs)
+    bits, ubits, usize, _ = plan
+    rows, ids = _reference_list(
+        ubits, usize, table_row, cap=cap, kv_tile=kv_tile, page_size=3200
+    )
+    return q, pool, table_row, cap, plan, rows, ids
+
+
+@pytest.fixture
+def plan_kernels(monkeypatch):
+    """``union_bits_plan`` off TPU: its Pallas kernel in interpret mode (as test_qwen4_exp_union_gather)."""
+    if jax.default_backend() != "tpu":
+        from jax._src import tpu_info
+
+        monkeypatch.setitem(
+            tpu_info.registry,
+            jax.devices()[0].device_kind,
+            lambda: tpu_info._get_tpu_info_impl(tpu_info.ChipVersion.TPU_7X, 1),
+        )
+        original = pl.pallas_call
+
+        def interpreted(*args, **kwargs):
+            kwargs["interpret"] = True
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(pl, "pallas_call", interpreted)
+    yield
+    jax.clear_caches()
+
+
+def _xla_tables(rows, ids, kv_tile, max_run):
+    counts, entries = ud.union_run_tables_xla(
+        rows, ids, ratio=RATIO, kv_tile=kv_tile, max_run=max_run
+    )
+    return np.asarray(counts), np.asarray(entries)
+
+
+def _assert_tables_equal(got, want):
+    np.testing.assert_array_equal(np.asarray(got[0]), want[0])
+    np.testing.assert_array_equal(np.asarray(got[1]), want[1])
+
 
 
 # CPU tests.
@@ -441,6 +675,141 @@ def test_dead_tile_skip_writes_exactly_the_tiles_the_attention_kernel_reads():
     np.testing.assert_array_equal(lines[read], np.asarray(want_lines)[read])
 
 
+@pytest.mark.parametrize("group,kv_tile,max_run", TABLE_CASES)
+def test_tables_emulation_is_the_xla_tables(plan_kernels, group, kv_tile, max_run):
+    """``run_table_tile`` on ``union_bits_plan`` lists, through the kernel's work split."""
+    *_, rows, ids = _plan_tables_inputs(group + kv_tile + max_run, group, kv_tile)
+    want = _xla_tables(rows, ids, kv_tile, max_run)
+    plan = _tables_plan_for(rows, kv_tile)
+    counts, entries, writes = _emulate_tables(rows, ids, max_run=max_run, plan=plan)
+    np.testing.assert_array_equal(writes, 1)
+    _assert_tables_equal((counts, entries), want)
+    # Live runs coalesced and padding present: the inputs exercise both.
+    assert (np.asarray(ids) < 0).any() and want[0][..., 0].sum() > 0
+
+
+@pytest.mark.parametrize("case", ["vector_edges", "padding_contiguity", "mixed"])
+def test_tables_emulation_copy_unroll_1(case):
+    """The default copy/fill unroll (1 since i1u) keeps the XLA tables in the emulation on the R4 edge cases."""
+    rows, ids = _table_edge_case(case, 1024)
+    want = _xla_tables(rows, ids, 1024, 4)
+    plan = _tables_plan_for(rows, 1024, workers=3, tiles_per_step=1)
+    counts, entries, writes = _emulate_tables(rows, ids, max_run=4, plan=plan, copy_unroll=1)
+    np.testing.assert_array_equal(writes, 1)
+    _assert_tables_equal((counts, entries), want)
+
+
+def test_carry_pad_makes_odd_carries_even():
+    """One dummy count for an odd carry above 1 (R4: 3 sizes, R16: 5), none otherwise or with even_carry=False."""
+    assert [sg.carry_pad(len(sg.run_sizes(r))) for r in (1, 2, 4, 8, 16, 32)] == [0, 0, 1, 0, 1, 0]
+    assert [sg.carry_pad(len(sg.run_sizes(r)), even_carry=False) for r in (4, 16)] == [0, 0]
+
+
+@pytest.mark.parametrize("even_carry", [True, False])
+@pytest.mark.parametrize("case", ["vector_edges", "padding_contiguity", "mixed"])
+@pytest.mark.parametrize("max_run", [4, 16])
+def test_tables_emulation_padded_carry_keeps_the_tables(case, max_run, even_carry):
+    """The i1o R4 failures' mixed-size tiles (and R16's): the padded carry and the old one both give the XLA tables in
+    the emulation (the TPU failure is a lowering question, settled on TPU); the dummy never reaches the counts."""
+    rows, ids = _table_edge_case(case, 1024)
+    want = _xla_tables(rows, ids, 1024, max_run)
+    plan = _tables_plan_for(rows, 1024, workers=3, tiles_per_step=1)
+    counts, entries, writes = _emulate_tables(rows, ids, max_run=max_run, plan=plan, even_carry=even_carry)
+    np.testing.assert_array_equal(writes, 1)
+    _assert_tables_equal((counts, entries), want)
+    assert (np.asarray(want[0]) > 0).sum(axis=(0, 1)).min() > 0 or max_run == 16  # every size used (R4)
+
+
+@pytest.mark.parametrize("case", TABLE_EDGE_CASES)
+@pytest.mark.parametrize(
+    "kv_tile,max_run,workers,tiles_per_step",
+    [(512, 8, WORKERS, None), (1024, 4, 3, 1), (512, 32, 2, 3), (1024, 1, WORKERS, None)],
+)
+def test_tables_emulation_edge_cases(case, kv_tile, max_run, workers, tiles_per_step):
+    """Tile and vector boundaries, live/padding edges, no runs, one run; multi-step workers."""
+    rows, ids = _table_edge_case(case, kv_tile)
+    want = _xla_tables(rows, ids, kv_tile, max_run)
+    plan = _tables_plan_for(rows, kv_tile, workers=workers, tiles_per_step=tiles_per_step)
+    counts, entries, writes = _emulate_tables(rows, ids, max_run=max_run, plan=plan)
+    np.testing.assert_array_equal(writes, 1)
+    _assert_tables_equal((counts, entries), want)
+
+
+def test_tables_edge_cases_hit_what_they_claim():
+    """The edge inputs really contain what their names say (else the tests above prove less)."""
+    gpt = 128
+    rows, ids = (np.asarray(x) for x in _table_edge_case("one_run", 512))
+    counts, _ = _xla_tables(rows, ids, 512, 8)
+    np.testing.assert_array_equal(counts[..., 0], gpt // 8)  # one run per tile, cut at the boundary
+    rows, ids = (np.asarray(x) for x in _table_edge_case("padding_contiguity", 512))
+    edge = np.flatnonzero(np.diff((ids[0] >= 0).astype(int)))[0]
+    assert rows[0, edge + 1] == rows[0, edge] + RATIO  # contiguous rows, live then padding
+    edge = np.flatnonzero(np.diff((ids[1] >= 0).astype(int)))[0]
+    assert rows[1, edge + 1] == rows[1, edge] + RATIO  # contiguous rows, padding then live
+    counts, _ = _xla_tables(*_table_edge_case("decreasing", 512), 512, 8)
+    assert counts[..., :-1].sum() == 0  # pieces of 1 only
+
+
+@pytest.mark.parametrize(
+    "ngroups,tiles,workers",
+    [(50, 42, 32), (100, 42, 32), (50, 21, 32), (2, 3, 32), (1, 41, 32), (7, 5, 3)],
+)
+def test_table_plan_covers_every_tile_once(ngroups, tiles, workers):
+    plan = sg.table_plan(ngroups, tiles, 256, workers=workers)
+    assert plan.total % plan.tiles_per_step == 0
+    hits = np.zeros(plan.total, np.int32)
+    for worker in range(workers):
+        first, count = (int(x) for x in sg.worker_steps(worker, plan))
+        for step in range(first, first + count):
+            hits[step * plan.tiles_per_step : (step + 1) * plan.tiles_per_step] += 1
+    np.testing.assert_array_equal(hits, 1)
+    for gpt in (128, 256, 512):
+        need = sg.table_vmem_bytes(gpt, plan.tiles_per_step, 6)
+        assert need <= sg._GATHER_VMEM_BUDGET
+
+
+def test_run_table_args_are_checked():
+    for bad in (dict(max_run=3), dict(max_run=64), dict(kv_tile=4096)):
+        args = dict(ratio=RATIO, kv_tile=1024, max_run=8) | bad
+        with pytest.raises(ValueError):
+            sg.check_run_table_args((2, 2048), (2, 2048), **args)
+    with pytest.raises(ValueError, match="whole tiles"):
+        sg.check_run_table_args((2, 300), (2, 300), ratio=RATIO, kv_tile=1024, max_run=8)
+    assert sg.check_run_table_args((2, 768), (2, 768), ratio=RATIO, kv_tile=1024, max_run=8) == (256, 3)
+
+
+def _lines_plan_for(bits, cap_ranks, line_matmul, streams=None):
+    return sg.choose_gather_plan(
+        bits.shape[0],
+        cap_ranks,
+        workers=WORKERS,
+        group_bytes=0,
+        width=bits.shape[2],
+        repeat=1 if line_matmul else RATIO,
+        streams=streams,
+    )
+
+
+@pytest.mark.parametrize("line_matmul", [True, False])
+@pytest.mark.parametrize("skip_dead", [False, True])
+def test_lines_emulation_is_the_reference(line_matmul, skip_dead):
+    """``union_sc_lines``: the gather's line path alone (lines-only plan, optional dead-tile skip)."""
+    pool, bits, rows, ids, usize, kv_tile, _, _, read = _dead_tile_case()
+    want = np.asarray(ud.union_lines_reference(bits, ids, ratio=RATIO, line_matmul=line_matmul))
+    plan = _lines_plan_for(bits, ids.shape[1], line_matmul)
+    assert plan.streams == 2  # no KV buffers: two streams fit for both line forms
+    steps = sg.item_live_steps(usize, plan, ratio=RATIO, kv_tile=kv_tile) if skip_dead else None
+    kv, lines, _, line_writes = _emulate_gather(
+        None, bits, None, ids, line_matmul=line_matmul, plan=plan, item_steps=steps
+    )
+    assert kv is None
+    repeat = 1 if line_matmul else RATIO
+    read = np.repeat(read, repeat) if skip_dead else np.ones(want.shape[0], bool)
+    np.testing.assert_array_equal(line_writes, read.astype(np.int32))
+    np.testing.assert_array_equal(lines[read], want[read])
+    assert want[read].any()
+
+
 @pytest.fixture
 def tpu7x_abstract():
     """Trace and lower for a TPU7x device without one (``use_abstract_mesh``)."""
@@ -455,13 +824,58 @@ def tpu7x_abstract():
 
 @pytest.mark.parametrize(
     "variant",
-    ["list", "list_shared", "gather_mm", "gather", "gather_mm_live", "gather_s1"],
+    [
+        "list",
+        "list_shared",
+        "gather_mm",
+        "gather",
+        "gather_mm_live",
+        "gather_s1",
+        "lines_mm",
+        "lines",
+        "lines_mm_live",
+        "tables_g256_r8",
+        "tables_g128_r4",
+        "tables_g256_r4",
+        "tables_g256_r16",
+        "tables_g256_r4_cu2",
+        "tables_g512_r32",
+    ],
 )
 def test_kernels_lower_to_mosaic_for_tpu7x(tpu7x_abstract, variant):
     """Pallas -> Mosaic lowering at the realistic size (no SC compile, no run)."""
     ngroups, words, cap_ranks = 50, 784, 10752
     spec = jax.ShapeDtypeStruct
-    if variant.startswith("list"):
+    if variant.startswith("tables"):
+        gpt, max_run = (int(x[1:]) for x in variant.split("_")[1:3])
+        unroll = 2 if variant.endswith("_cu2") else 1
+        fn = jax.jit(
+            functools.partial(
+                sg.union_sc_run_tables, ratio=RATIO, kv_tile=gpt * RATIO, max_run=max_run,
+                copy_unroll=unroll,
+            )
+        )
+        args = (spec((ngroups, cap_ranks), jnp.int32),) * 2
+    elif variant.startswith("lines"):
+        live = variant.endswith("live")
+
+        def lines(bits, ids, usize):
+            return sg.union_sc_lines(
+                bits,
+                ids,
+                ratio=RATIO,
+                line_matmul="mm" in variant,
+                usize=usize if live else None,
+                kv_tile=1024 if live else None,
+            )
+
+        fn = jax.jit(lines)
+        args = (
+            spec((ngroups, words, 128), jnp.int32),
+            spec((ngroups, cap_ranks), jnp.int32),
+            spec((ngroups,), jnp.int32),
+        )
+    elif variant.startswith("list"):
         shared = variant == "list_shared"
         physw = spec((words,) if shared else (ngroups, words), jnp.int32)
         fn = jax.jit(functools.partial(sg.union_sc_list, cap_ranks=cap_ranks))
@@ -492,6 +906,27 @@ def test_kernels_lower_to_mosaic_for_tpu7x(tpu7x_abstract, variant):
         )
     lowered = fn.trace(*args).lower(lowering_platforms=("tpu",)).as_text()
     assert "tpu_custom_call" in lowered
+
+
+def test_copy_unroll_reaches_the_table_kernel(tpu7x_abstract, monkeypatch):
+    """copy_unroll reaches the tile code inside the SparseCore kernel (recorded while it traces), and the default is 1
+    (i1u, M: 2 corrupts R4 tables on TPU)."""
+    seen = []
+    original = sg.run_table_tile
+
+    def recording(*args, **kwargs):
+        seen.append(kwargs.get("copy_unroll"))
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(sg, "run_table_tile", recording)
+    spec = jax.ShapeDtypeStruct
+    args = (spec((50, 10752), jnp.int32),) * 2
+    for unroll in (1, 2, None):
+        seen.clear()
+        kw = {} if unroll is None else {"copy_unroll": unroll}
+        fn = jax.jit(functools.partial(sg.union_sc_run_tables, ratio=RATIO, kv_tile=1024, max_run=4, **kw))
+        fn.trace(*args).lower(lowering_platforms=("tpu",))
+        assert seen and set(seen) == {1 if unroll is None else unroll}, (unroll, seen)
 
 
 # TPU tests: the real SparseCore kernels.
@@ -622,8 +1057,14 @@ def test_sc_list_and_gather_at_the_realistic_size(skip_dead):
     assert _device_mismatches(got_lines, want_lines) == 0
 
 
-def _plan_inputs(seed, group, page=3200, tokens=256, context=6000, topk=512):
-    """As test_qwen4_exp_union_gather: overlapping selections on a permuted table."""
+def _plan_inputs(
+    seed, group, page=3200, tokens=256, context=6000, topk=512, pages=3, picks=40
+):
+    """As test_qwen4_exp_union_gather: overlapping selections on a permuted table.
+
+    ``pages``: pool pages (the table is a permutation of them); ``picks``:
+    random groups per token on top of the recent window and the shared spans.
+    """
     from vllm_torchtpu.kernels.qwen4_exp import qsa_union_prefill as up
     from vllm_torchtpu.kernels.qwen4_exp.qsa_union_plan import union_bits_plan
 
@@ -639,18 +1080,18 @@ def _plan_inputs(seed, group, page=3200, tokens=256, context=6000, topk=512):
         chosen = set(range(max(0, complete - 48), complete))
         for s in spans[(i // 8) % 56 : (i // 8) % 56 + 8]:
             chosen |= set(range(int(s), min(int(s) + 12, complete)))
-        chosen |= set(rng.integers(0, complete, size=40).tolist())
+        chosen |= set(rng.integers(0, complete, size=picks).tolist())
         pick = rng.permutation(sorted(chosen))[:topk]
         blocks[i, : len(pick)] = pick
     q = jnp.asarray(rng.normal(0, 0.5, (tokens, 24, 256)), jnp.bfloat16)
-    raw = rng.integers(0, 0x40, size=(3, page, 1, 4, 256), dtype=np.uint8)
+    raw = rng.integers(0, 0x40, size=(pages, page, 1, 4, 256), dtype=np.uint8)
     raw |= rng.integers(0, 2, size=raw.shape, dtype=np.uint8) << 7
     pool = jax.lax.bitcast_convert_type(jnp.asarray(raw), jnp.float8_e4m3fn)
-    table_row = jnp.asarray(rng.permutation(3), jnp.int32)
+    table_row = jnp.asarray(rng.permutation(pages), jnp.int32)
     blocks, lengths = jnp.asarray(blocks), jnp.asarray(lengths)
     cap = int(-(-up.union_sizes(blocks, lengths, group=group).max() // 32) * 32)
     plan = union_bits_plan(
-        blocks, lengths, group=group, union_cap=cap, groups_cap=3 * page // RATIO
+        blocks, lengths, group=group, union_cap=cap, groups_cap=pages * page // RATIO
     )
     return q, pool, table_row, cap, plan
 
@@ -706,3 +1147,161 @@ def test_padding_rows_broadcast_word_zero():
     """The padding row is word 0's base on every lane (i1l: the SparseCore's zero-index gather gave physw[lane])."""
     bases = jnp.arange(16, dtype=jnp.int32) * 128 + 3200 * 7
     np.testing.assert_array_equal(np.asarray(sg.padding_rows(bases)), np.full(16, 3200 * 7, np.int32))
+
+
+# TPU tests: run tables and lines.
+
+
+@tpu_only
+@pytest.mark.parametrize("group,kv_tile,max_run", TABLE_CASES)
+def test_sc_run_tables_is_the_xla_tables(group, kv_tile, max_run):
+    *_, rows, ids = _plan_tables_inputs(group + kv_tile + max_run, group, kv_tile)
+    want = _xla_tables(rows, ids, kv_tile, max_run)
+    got = sg.union_sc_run_tables(rows, ids, ratio=RATIO, kv_tile=kv_tile, max_run=max_run)
+    _assert_tables_equal(got, want)
+
+
+@tpu_only
+@pytest.mark.parametrize("case", TABLE_EDGE_CASES)
+@pytest.mark.parametrize(
+    "kv_tile,max_run,tiles_per_step", [(512, 8, None), (1024, 4, 1), (512, 32, 3), (1024, 1, None)]
+)
+def test_sc_run_tables_edge_cases(case, kv_tile, max_run, tiles_per_step):
+    rows, ids = _table_edge_case(case, kv_tile)
+    want = _xla_tables(rows, ids, kv_tile, max_run)
+    got = sg.union_sc_run_tables(
+        rows, ids, ratio=RATIO, kv_tile=kv_tile, max_run=max_run, tiles_per_step=tiles_per_step
+    )
+    _assert_tables_equal(got, want)
+
+
+@tpu_only
+@pytest.mark.parametrize("line_matmul", [True, False])
+@pytest.mark.parametrize("skip_dead", [False, True])
+def test_sc_lines_is_the_reference(line_matmul, skip_dead):
+    pool, bits, rows, ids, usize, kv_tile, _, _, read = _dead_tile_case()
+    want = np.asarray(ud.union_lines_reference(bits, ids, ratio=RATIO, line_matmul=line_matmul))
+    got = np.asarray(
+        sg.union_sc_lines(
+            bits,
+            ids,
+            ratio=RATIO,
+            line_matmul=line_matmul,
+            usize=usize if skip_dead else None,
+            kv_tile=kv_tile if skip_dead else None,
+        )
+    )
+    if skip_dead:
+        read = np.repeat(read, 1 if line_matmul else RATIO)
+        got, want = got[read], want[read]
+    np.testing.assert_array_equal(got, want)
+
+
+@functools.lru_cache(maxsize=2)
+def _realistic_plan(group):
+    """50 query groups, unions near 10K groups over a 21-22 page permuted table."""
+    tokens, context, page = 50 * group, 60000, 3200
+    pages = -(-(context + tokens) // page) + 1
+    return _plan_inputs(
+        41 + group,
+        group,
+        page=page,
+        tokens=tokens,
+        context=context,
+        pages=pages,
+        picks=16000 // group,
+    )
+
+
+@tpu_only
+@pytest.mark.parametrize("group", [64, 128])
+def test_sc_run_tables_and_lines_at_the_realistic_size(group):
+    """50 query groups x cap near 10K, kv_tile 1024: tables and both line forms on the SparseCore list."""
+    kv_tile = 1024
+    q, pool, table_row, cap, plan = _realistic_plan(group)
+    bits, ubits, usize, _ = plan
+    assert ubits.shape[0] == 50 and int(np.median(np.asarray(usize))) > 8000 and cap < 14000
+    want_rows, want_ids = _reference_list(
+        ubits, usize, table_row, cap=cap, kv_tile=kv_tile, page_size=3200
+    )
+    rows, ids = sg.union_sc_list_pages(
+        ubits, usize, table_row, ratio=RATIO, page_size=3200, union_cap=cap, kv_tile=kv_tile
+    )
+    assert _device_mismatches(rows, want_rows) == 0 and _device_mismatches(ids, want_ids) == 0
+    want = ud.union_run_tables_xla(want_rows, want_ids, ratio=RATIO, kv_tile=kv_tile)
+    got = sg.union_sc_run_tables(rows, ids, ratio=RATIO, kv_tile=kv_tile)
+    assert _device_mismatches(got[0], want[0]) == 0
+    assert _device_mismatches(got[1], want[1]) == 0
+    assert (np.asarray(want[0]).sum(axis=(0, 1)) > 0).all()  # pieces of every size
+    for line_matmul in (True, False):
+        want_lines = ud.union_lines_reference(bits, want_ids, ratio=RATIO, line_matmul=line_matmul)
+        got_lines = sg.union_sc_lines(bits, ids, ratio=RATIO, line_matmul=line_matmul)
+        assert _device_mismatches(got_lines, want_lines) == 0
+        del want_lines, got_lines
+
+
+def _run_table_walk(q, pool, table_row, cap, plan, *, group, kv_tile, line_matmul, max_run,
+                    skip_dead):
+    """The walk, and the run-table walk on the SparseCore list, tables and lines."""
+    bits, ubits, usize, _ = plan
+    options = dict(
+        group=group, union_cap=cap, kv_tile=kv_tile, lean=True, fast_walk=True,
+        line_matmul=line_matmul,
+    )
+    walk = np.asarray(ud.union_walk_kernel(q, *plan, pool, table_row, **options))
+    rows, ids = sg.union_sc_list_pages(
+        ubits, usize, table_row, ratio=RATIO, page_size=3200, union_cap=cap, kv_tile=kv_tile
+    )
+    tables = sg.union_sc_run_tables(rows, ids, ratio=RATIO, kv_tile=kv_tile, max_run=max_run)
+    lines = sg.union_sc_lines(
+        bits,
+        ids,
+        ratio=RATIO,
+        line_matmul=line_matmul,
+        usize=usize if skip_dead else None,
+        kv_tile=kv_tile if skip_dead else None,
+    )
+    got = ud.union_walk_kernel(
+        q, *plan, pool, table_row, run_tables=tables, listed_lines=lines, **options
+    )
+    return np.asarray(got), walk
+
+
+@tpu_only
+@pytest.mark.parametrize(
+    "group,kv_tile,line_matmul,max_run,skip_dead",
+    [(64, 512, False, 8, False), (128, 1024, True, 8, True), (64, 1024, True, 4, False)],
+)
+def test_sc_run_table_attention_is_the_walk(group, kv_tile, line_matmul, max_run, skip_dead):
+    """End to end on ``union_bits_plan`` inputs: SparseCore list -> tables + lines -> run-table walk."""
+    q, pool, table_row, cap, plan = _plan_inputs(group + kv_tile + max_run + 23, group)
+    got, walk = _run_table_walk(
+        q, pool, table_row, cap, plan, group=group, kv_tile=kv_tile,
+        line_matmul=line_matmul, max_run=max_run, skip_dead=skip_dead,
+    )
+    np.testing.assert_array_equal(got.view(np.uint16), walk.view(np.uint16))
+    assert np.abs(walk.astype(np.float32)).max() > 0
+
+
+@tpu_only
+@pytest.mark.parametrize("group", [64, 128])
+def test_sc_run_table_attention_is_the_walk_at_the_realistic_size(group):
+    """End to end at 50 query groups x cap near 10K: kv_tile 1024, R8, matmul lines (i1n's arms), dead-tile skip on."""
+    line_matmul = True
+    q, pool, table_row, cap, plan = _realistic_plan(group)
+    got, walk = _run_table_walk(
+        q, pool, table_row, cap, plan, group=group, kv_tile=1024,
+        line_matmul=line_matmul, max_run=8, skip_dead=True,
+    )
+    np.testing.assert_array_equal(got.view(np.uint16), walk.view(np.uint16))
+    assert np.abs(walk.astype(np.float32)).max() > 0
+
+
+def test_padding_bits_rows_spread_over_word_rows():
+    """Padding ranks read distinct rows among the group's first 8 words (no single hot row); live ids their word."""
+    ids = jnp.asarray([[-1] * 16, [33, 64, -1, 5] * 4], jnp.int32)
+    rows = np.asarray(sg.bits_row_index(ids, 1000))
+    np.testing.assert_array_equal(rows[0], 1000 + (np.arange(16) & 7))
+    live = np.asarray(ids[1]) >= 0
+    np.testing.assert_array_equal(rows[1][live], 1000 + (np.asarray(ids[1])[live] >> 5))
+    assert len(set(rows[0].tolist())) == 8
