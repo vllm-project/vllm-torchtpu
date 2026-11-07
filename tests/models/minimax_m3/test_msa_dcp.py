@@ -269,6 +269,120 @@ def test_merge_candidates_breaks_ties_to_lower_block():
     np.testing.assert_array_equal(got, [[1, 4, 3]])
 
 
+def _rank_candidates(rng, dcp, rows, topk, *, num_blocks, ties):
+    """Candidates as `local_candidates` emits them: rank ``r``'s distinct
+    blocks ``= r (mod dcp)`` in (score descending, block) order, forced
+    scores first, ``(-inf, -1)`` for missing picks. With `ties` the scores
+    come from a few values, so most comparisons tie."""
+    scores = np.full((dcp, rows, topk), -np.inf, np.float32)
+    blocks = np.full((dcp, rows, topk), -1, np.int32)
+    for r in range(dcp):
+        owned = np.arange(r, num_blocks, dcp)
+        for t in range(rows):
+            n = min(int(rng.integers(0, topk + 1)), len(owned))
+            if t % 5 == 0:
+                n = min(topk, len(owned))
+            b = rng.choice(owned, n, replace=False)
+            if ties:
+                s = rng.integers(-2, 3, n).astype(np.float32)
+            else:
+                s = rng.standard_normal(n).astype(np.float32)
+            s[b < 2] = msa_select._FORCED_INIT_SCORE
+            s[(b >= num_blocks - 3) & (b >= 2)] = msa_select._FORCED_LOCAL_SCORE
+            order = np.lexsort((b, -s))
+            scores[r, t, :n] = s[order]
+            blocks[r, t, :n] = b[order]
+    return scores, blocks
+
+
+def _assert_merge_matches_serial(scores, blocks, topk):
+    """Bit-exact against the serial merge; NaN scores count as -inf (the
+    serial merge's NaN handling follows the backend's max)."""
+    pack = jax.vmap(msa_dcp.pack_candidates)
+    packed = pack(jnp.asarray(scores), jnp.asarray(blocks))
+    ref_scores = np.where(np.isnan(scores), -np.inf, scores)
+    ref_packed = pack(jnp.asarray(ref_scores), jnp.asarray(blocks))
+    serial = jax.jit(msa_dcp.merge_candidates_serial, static_argnums=1)
+    want = np.asarray(serial(ref_packed, topk))
+    got = np.asarray(jax.jit(msa_dcp.merge_candidates, static_argnums=1)(packed, topk))
+    assert got.dtype == want.dtype and got.shape == want.shape
+    np.testing.assert_array_equal(got, want)
+    pairwise = jax.jit(msa_dcp.merge_candidates_pairwise, static_argnums=1)
+    np.testing.assert_array_equal(np.asarray(pairwise(packed, topk)), want)
+    return got
+
+
+# rows = tokens * KV heads per rank: DCP 8 at TP 8 spans 4 KV heads, DCP 2
+# one. Decode is c64 with 8 tokens per request (DSpark k=7).
+_MERGE_SHAPES = [
+    pytest.param(8, 4 * 512, id="dcp8-decode"),
+    pytest.param(8, 4 * 2048, id="dcp8-prefill2048"),
+    pytest.param(8, 4 * 8192, id="dcp8-prefill8192"),
+    pytest.param(2, 512, id="dcp2-decode"),
+    pytest.param(2, 2048, id="dcp2-prefill2048"),
+]
+
+
+@pytest.mark.parametrize("ties", [False, True], ids=["distinct", "ties"])
+@pytest.mark.parametrize("dcp,rows", _MERGE_SHAPES)
+def test_merge_candidates_matches_serial_merge(dcp, rows, ties):
+    """The sort-based merge picks the serial merge's blocks in its order."""
+    rng = np.random.default_rng(dcp * 1000 + rows + ties)
+    topk = 16
+    # Per-row generation is slow in Python: generate a pool and tile it.
+    pool = min(rows, 512)
+    scores, blocks = _rank_candidates(
+        rng, dcp, pool, topk, num_blocks=int(rng.integers(dcp, 40 * dcp)), ties=ties
+    )
+    reps = -(-rows // pool)
+    scores = np.tile(scores, (1, reps, 1))[:, :rows]
+    blocks = np.tile(blocks, (1, reps, 1))[:, :rows]
+    # Short contexts: fewer candidates than k over all ranks.
+    scores[1:, ::7], blocks[1:, ::7] = -np.inf, -1
+    scores[0, ::7, 3:], blocks[0, ::7, 3:] = -np.inf, -1
+    # Permute rows so neighbouring rows differ in every tile.
+    perm = rng.permutation(rows)
+    got = _assert_merge_matches_serial(scores[:, perm], blocks[:, perm], topk)
+    assert np.any(got == -1) and np.any(got >= 0)
+
+
+@pytest.mark.parametrize("dcp", [2, 8])
+def test_merge_candidates_matches_serial_merge_adversarial(dcp):
+    """Inputs no rank emits, for which the two merges still agree: a block
+    listed by several ranks (at different and equal scores), all scores
+    equal, -0 vs +0, +inf, finite scores on block -1, blocks out of rank
+    order, a NaN, fewer candidates than k, and no candidate at all."""
+    rng = np.random.default_rng(dcp)
+    topk, rows = 16, 4096
+    scores = rng.integers(-3, 4, (dcp, rows, topk)).astype(np.float32)
+    blocks = rng.integers(-1, 12, (dcp, rows, topk)).astype(np.int32)  # many dups
+    kind = np.arange(rows) % 12
+    scores[:, kind == 1] = 7.0  # all equal
+    blocks[:, kind == 2] = 5  # one block everywhere
+    sel = kind == 3
+    scores[:, sel] = rng.choice([0.0, -0.0], (dcp, sel.sum(), topk))
+    sel = kind == 4
+    scores[:, sel] = rng.choice([np.inf, -np.inf, 1.0], (dcp, sel.sum(), topk))
+    scores[:, kind == 5] = -np.inf  # no candidates
+    blocks[:, kind == 5] = -1
+    sel = kind == 6  # few valid candidates
+    scores[:, sel, 1:] = -np.inf
+    blocks[:, sel, 1:] = -1
+    scores[0, kind == 7, 3] = np.nan
+    sel = kind == 8  # large, distinct ids
+    blocks[:, sel] = rng.permutation(2**20)[: dcp * sel.sum() * topk].reshape(
+        dcp, sel.sum(), topk
+    )
+    scores[:, kind == 9] = msa_select._FORCED_INIT_SCORE
+    scores[:, kind == 10] = np.float32(1.0) + np.float32(2**-23) * rng.integers(
+        0, 2, (dcp, (kind == 10).sum(), topk)
+    )
+    got = _assert_merge_matches_serial(scores, blocks, topk)
+    assert np.all(got[kind == 5] == -1)
+    nan_rows = np.isnan(scores).any(axis=(0, 2))
+    assert nan_rows.any() and np.any(got[nan_rows] >= 0)
+
+
 def _flush_like_a_tpu_collective(x: jax.Array) -> jax.Array:
     """Subnormals to zero and NaNs canonical, as a TPU collective may."""
     tiny = jnp.finfo(jnp.float32).tiny

@@ -219,15 +219,25 @@ def pack_candidates(scores: jax.Array, blocks: jax.Array) -> jax.Array:
     return jnp.concatenate([scores, blocks.astype(jnp.float32)], axis=-1)
 
 
-def merge_candidates(candidates: jax.Array, topk: int) -> jax.Array:
-    """Global selection ``[T, topk]`` (``-1`` padded) from every rank's
-    packed candidates ``[dcp, T, 2 * topk]``, in `msa_select.select_blocks`'s
-    order: score descending, ties to the lower block."""
+def _flat_candidates(candidates: jax.Array, topk: int) -> tuple[jax.Array, jax.Array]:
+    """Every rank's candidates of a row side by side: ``(scores, blocks)``
+    ``[T, dcp * topk]``."""
     dcp, num_tokens, _ = candidates.shape
     scores = candidates[..., :topk]
     blocks = candidates[..., topk:].astype(jnp.int32)
     s = scores.transpose(1, 0, 2).reshape(num_tokens, dcp * topk)
     b = blocks.transpose(1, 0, 2).reshape(num_tokens, dcp * topk)
+    return s, b
+
+
+def merge_candidates_serial(candidates: jax.Array, topk: int) -> jax.Array:
+    """`merge_candidates` as ``topk`` rounds of max / min / mask.
+
+    The reference the sort-based merge is tested and benchmarked against;
+    each round is a dependent pass over the row (two XLA fusions), so it
+    costs ``2 * topk`` serial fusions per layer.
+    """
+    s, b = _flat_candidates(candidates, topk)
     no_block = jnp.iinfo(jnp.int32).max
     picked = []
     for _ in range(topk):
@@ -236,6 +246,58 @@ def merge_candidates(candidates: jax.Array, topk: int) -> jax.Array:
         picked.append(jnp.where(best_score > _NEG_INF, best, -1))
         s = jnp.where(b == best, _NEG_INF, s)
     return jnp.concatenate(picked, axis=1)
+
+
+def merge_candidates(candidates: jax.Array, topk: int) -> jax.Array:
+    """Global selection ``[T, topk]`` (``-1`` padded) from every rank's
+    packed candidates ``[dcp, T, 2 * topk]``, in `msa_select.select_blocks`'s
+    order: score descending, ties to the lower block.
+
+    A block listed more than once counts once, at its highest score, and
+    blocks scored ``-inf`` are never picked: exactly
+    `merge_candidates_serial`, as two row sorts instead of ``topk``
+    dependent rounds. Sort by (block, score descending) and drop every copy
+    but a block's first, then sort by (score descending, block).
+
+    A NaN score is never picked (as ``-inf``); the serial merge's result
+    there depends on whether the backend's max propagates NaN.
+    """
+    s, b = _flat_candidates(candidates, topk)
+    # Sort keys ascend; the sort canonicalizes -0 to +0.
+    neg = jnp.where(jnp.isnan(s), jnp.inf, -s)
+    b, neg = jax.lax.sort((b, neg), dimension=1, num_keys=2)
+    dup = jnp.concatenate(
+        [jnp.zeros_like(b[:, :1], dtype=bool), b[:, 1:] == b[:, :-1]], axis=1
+    )
+    neg = jnp.where(dup, jnp.inf, neg)
+    neg, b = jax.lax.sort((neg, b), dimension=1, num_keys=2)
+    return jnp.where(neg[:, :topk] < jnp.inf, b[:, :topk], -1)
+
+
+def merge_candidates_pairwise(candidates: jax.Array, topk: int) -> jax.Array:
+    """`merge_candidates` by all-pairs comparison instead of sorting.
+
+    Entry ``j`` is ahead of ``i`` when it has a higher score, or the same
+    score and a lower block, or the same both and a lower position. An entry
+    is kept unless an entry ahead of it holds the same block, or its score is
+    ``-inf``; a kept entry's output slot is the number of kept entries ahead
+    of it. ``O((dcp * topk)**2)`` element-wise work per row with no sort and
+    no serial dependence; bit-exact with `merge_candidates`.
+    """
+    s, b = _flat_candidates(candidates, topk)
+    s = jnp.where(jnp.isnan(s), _NEG_INF, s)
+    width = s.shape[1]
+    pos = jnp.arange(width, dtype=jnp.int32)
+    si, sj = s[:, :, None], s[:, None, :]
+    bi, bj = b[:, :, None], b[:, None, :]
+    ahead = (sj > si) | (
+        (sj == si) & ((bj < bi) | ((bj == bi) & (pos[None, :] < pos[:, None])))
+    )  # [rows, i, j]: j ahead of i
+    kept = ~jnp.any(ahead & (bj == bi), axis=2) & (s > _NEG_INF)
+    slot = jnp.sum(ahead & kept[:, None, :], axis=2, dtype=jnp.int32)
+    slot = jnp.where(kept, slot, topk)  # [rows, width]
+    hit = slot[:, :, None] == jnp.arange(topk, dtype=jnp.int32)
+    return jnp.sum(jnp.where(hit, b[:, :, None] + 1, 0), axis=1) - 1
 
 
 def merge_head_candidates(candidates: jax.Array, topk: int) -> jax.Array:
