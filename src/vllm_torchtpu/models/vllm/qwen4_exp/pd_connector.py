@@ -98,11 +98,17 @@ class Qwen4ExpRaidenConnector(TPURaidenConnector):
         # running state of its align-mode state tables (and ordinary, possibly
         # shared, token pages); a consumer adopts its local prefix and pulls
         # the suffix (supports_stage3_grouped_prefix_loads).
-        # MTP is admitted on a consumer behind TP1 pipeline stages only: the
-        # staging repack builds the producer's plan without the draft and
-        # lands states in the committed entry of a speculative table. The
-        # producer ships no draft KV, so the draft's prompt KV starts empty
-        # (meant for synthetic rejection sampling).
+        # MTP is admitted on a consumer behind TP1 pipeline stages: the
+        # staging repack builds the producer's plan and lands states in the
+        # committed entry of a speculative table. Without
+        # QWEN4_EXP_PD_DRAFT_KV the producer ships no draft KV, so the
+        # draft's prompt KV starts empty (meant for synthetic rejection
+        # sampling). With it (q38 F2), a TP1 pipeline producer runs
+        # prefill-only MTP (K = 1) on its last stage and ships the draft
+        # layer's caches (config.pd_prefill_mtp_producer); any other
+        # producer MTP stays refused.
+        from .config import pd_prefill_mtp_producer
+
         transfer = vllm_config.kv_transfer_config
         decode_only_mtp = (
             vllm_config.speculative_config is not None
@@ -120,14 +126,19 @@ class Qwen4ExpRaidenConnector(TPURaidenConnector):
             and transfer.is_kv_producer
             and parallel.tensor_parallel_size == 1
         )
+        producer_mtp = pd_prefill_mtp_producer(vllm_config)
         if (
             (parallel.prefill_context_parallel_size != 1 and not pcp_producer)
             or parallel.decode_context_parallel_size != 1
-            or (vllm_config.speculative_config is not None and not decode_only_mtp)
+            or (
+                vllm_config.speculative_config is not None
+                and not (decode_only_mtp or producer_mtp)
+            )
         ):
             raise NotImplementedError(
                 "Qwen PD first requires DCP1, PCP only on a TP1 producer, and MTP "
-                "only on a staged TP>1 decode"
+                "only on a staged TP>1 decode (or prefill-only MTP K=1 on a TP1 "
+                "pipeline producer with QWEN4_EXP_PD_DRAFT_KV=1)"
             )
         # A pipeline producer (Qwen3.5's prefill shape): each TP1 stage ships
         # its own layers' pages whole, paired with a TP1 consumer's pools by
@@ -835,6 +846,8 @@ class Qwen4ExpRaidenWorker(TPURaidenConnectorWorker):
         return self._raiden_transfer_engine
 
     def _collect_pd_semantics(self, runner) -> dict[str, Any]:
+        from .pd_staging import draft_kv_enabled
+
         model = runner.model_adapter.cache.model
         if model.pd_gdn_qk_pair_layout != envs.TPU_GDN_CONV_QK_PAIR_LAYOUT:
             raise ValueError("Qwen PD GDN layout changed since model construction")
@@ -879,6 +892,11 @@ class Qwen4ExpRaidenWorker(TPURaidenConnectorWorker):
                 # Prefix caching is a per-leg choice: the pages that cross are
                 # the same encoding either way (a positional state table ships
                 # its running-state page), so it is not part of the identity.
+                # QWEN4_EXP_PD_DRAFT_KV (q38 F2) is not: the producer then
+                # ships draft owners the decode must land, so a one-sided flag
+                # fails the handshake. Present only when on, so the identity
+                # with the flag off is unchanged.
+                **({"mtp_draft_kv": True} if draft_kv_enabled() else {}),
             ),
         )
         records: list[Any] = [None] * group.world_size
@@ -933,6 +951,8 @@ class Qwen4ExpRaidenWorker(TPURaidenConnectorWorker):
         return fingerprint, payload, token_sizes.pop()
 
     def _validate_stage3_transfer_parallelism(self, transfer_parallelism: int) -> None:
+        from .config import pd_prefill_mtp_producer
+
         parallel = self.vllm_config.parallel_config
         pp = int(parallel.pipeline_parallel_size or 1)
         pcp = int(parallel.prefill_context_parallel_size or 1)
@@ -956,11 +976,14 @@ class Qwen4ExpRaidenWorker(TPURaidenConnectorWorker):
             or (
                 self.vllm_config.speculative_config is not None
                 and (self.is_producer or self.tp_size == 1)
+                and not pd_prefill_mtp_producer(self.vllm_config)
             )
         ):
             raise ValueError(
                 "Qwen PD requires matching TP (or a TP1 pipeline producer with "
-                "a TP1 consumer), CP1 and MTP off"
+                "a TP1 consumer), CP1 and MTP off (but on a staged TP>1 decode, "
+                "or prefill-only MTP K=1 on a TP1 pipeline producer with "
+                "QWEN4_EXP_PD_DRAFT_KV=1)"
             )
 
     def _raiden_interleave_tokens(

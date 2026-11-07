@@ -259,6 +259,10 @@ _TPU_COMPILE_ENV_IGNORED = {
     "QWEN4_EXP_PD_SYNC_REPACK_AB_S",
     # When a staged decode's released staging pages may be reused (host-only).
     "QWEN4_EXP_PD_STAGING_QUARANTINE_STEPS",
+    # Whether a TP1 pipeline producer ships its MTP draft's KV and the staged
+    # decode lands it (q38 F2): admission and host-side staging indices only;
+    # the producer's draft itself is keyed by its speculative config.
+    "QWEN4_EXP_PD_DRAFT_KV",
     # Where a staged decode's compressed keys land (once per host, then a
     # landing all-gather): adds shape-keyed landing programs, changes none.
     "QWEN4_EXP_PD_SHARED_COMPRESSED",

@@ -133,6 +133,101 @@ def quarantine_steps() -> int:
     return int(envs.QWEN4_EXP_PD_STAGING_QUARANTINE_STEPS)
 
 
+def draft_kv_enabled() -> bool:
+    """QWEN4_EXP_PD_DRAFT_KV (q38 F2; envs; read directly when this module is
+    loaded by path, without the package)."""
+    try:
+        from vllm_torchtpu import envs
+    except ImportError:
+        import os
+
+        value = os.environ.get("QWEN4_EXP_PD_DRAFT_KV", "").strip().lower()
+        return value in ("1", "true", "yes", "on")
+    return bool(envs.QWEN4_EXP_PD_DRAFT_KV)
+
+
+# Draft tokens of the producer's prefill-only MTP under QWEN4_EXP_PD_DRAFT_KV
+# (config.pd_prefill_mtp_producer admits exactly this depth): its GDN and PLE
+# state tables carry one speculative block, whatever the decode's K.
+PRODUCER_DRAFT_TOKENS = 1
+
+
+def producer_geometry(cfg):
+    """The producer's page plan as this staged decode must rebuild it:
+    ``(cfg_for_layout, tp, main_dcp, pack_compressed)``, the arguments of
+    ``pool_layout.pooled_cache_specs``.
+
+    The producer is assumed to be TP1 pipeline stages: ``tp=1``, no main-KV
+    DCP (``main_dcp=1``) and unpacked compressed keys
+    (``pack_compressed=False``; config.validate_config refuses
+    QWEN4_EXP_PACK_COMPRESSED_K=1 under PP). This is the single place a
+    non-TP1 producer extends: a TP2 or PCP2 producer returns its own TP,
+    DCP and packing here (and the repack then needs that geometry's source
+    slicing; ``RankSlice`` and ``make_repack`` assume TP1 source pages).
+
+    The draft. Without QWEN4_EXP_PD_DRAFT_KV the producer runs no MTP, so its
+    plan has no draft owners and no speculative state blocks: the layout is
+    built from ``without_speculation(cfg)`` (a decode-only draft's prompt KV
+    starts empty). With it, the producer's last stage runs prefill-only MTP
+    at ``num_speculative_tokens=1`` (``tpu_runner._prefill_only_mtp``) and
+    allocates the draft's owners like any QSA layer's: the layout is built
+    from a copy of ``cfg`` whose speculative config is a shallow copy at
+    ``PRODUCER_DRAFT_TOKENS``. This decode must then run the MTP draft that
+    lands those pages.
+    """
+    if not draft_kv_enabled():
+        return without_speculation(cfg), 1, 1, False
+    spec = getattr(cfg, "speculative_config", None)
+    if spec is None or getattr(spec, "method", None) != "mtp":
+        raise ValueError(
+            "QWEN4_EXP_PD_DRAFT_KV=1 lands the producer's MTP draft KV in this "
+            "decode's draft: the decode needs an MTP speculative config, got "
+            f"{getattr(spec, 'method', None)!r}"
+        )
+    producer_spec = copy.copy(spec)
+    object.__setattr__(producer_spec, "num_speculative_tokens", PRODUCER_DRAFT_TOKENS)
+    out = copy.copy(cfg)
+    object.__setattr__(out, "speculative_config", producer_spec)
+    return out, 1, 1, False
+
+
+def check_draft_kv(missing, dst_owners, main_dcp: int, main_dcp_owners) -> None:
+    """QWEN4_EXP_PD_DRAFT_KV's refusals when a staged decode is built.
+
+    The producer ships the MTP draft's caches, so the decode lands them like
+    any QSA layer's. ``missing``: decode owners (and packed compressed
+    members) with no producer pages; ``dst_owners``: the decode's cache
+    owners; ``main_dcp`` / ``main_dcp_owners``: its layout's main-KV split.
+    """
+    import os
+
+    if missing:
+        raise ValueError(
+            f"QWEN4_EXP_PD_DRAFT_KV=1: the producer's plan has no pages for "
+            f"{sorted(missing)}; every decode owner, the MTP draft's included, "
+            "must land from the producer"
+        )
+    if os.environ.get("QWEN4_EXP_PD_ZERO_DRAFT_KV", "0").strip() == "1":
+        raise ValueError(
+            "QWEN4_EXP_PD_ZERO_DRAFT_KV=1 would zero the draft KV that "
+            "QWEN4_EXP_PD_DRAFT_KV=1 lands; unset one of them"
+        )
+    if main_dcp > 1:
+        split = set(main_dcp_owners)
+        unsplit = sorted(
+            name
+            for name in dst_owners
+            if name.startswith("mtp.") and owner_kind(name) == "main" and name not in split
+        )
+        if unsplit:
+            raise ValueError(
+                f"QWEN4_EXP_PD_DRAFT_KV=1 on a main-KV DCP decode "
+                f"(VLLM_TPU_QSA_MAIN_KV_DCP={main_dcp}) needs "
+                f"VLLM_TPU_QSA_MTP_KV_DCP=1: the repack lands the draft's main KV "
+                f"{unsplit} as one more DCP-split owner"
+            )
+
+
 def owner_kind(name: str) -> str:
     if name.endswith(".compressed_k"):
         return "compressed"
@@ -1018,16 +1113,20 @@ class StagedConsumer:
         self.cfg, self.rank, self.pool = cfg, rank, pool
         self.dst_layout = decode_layout
         self.dst_groups = decode_groups
-        # The producer: TP1 stages, no main-KV DCP, unpacked compressed keys,
-        # and no MTP draft: a decode-only draft (this engine's
-        # speculative_config) adds draft owners and speculative state blocks
-        # the producer's plan does not have.
+        # The producer (producer_geometry): TP1 stages, no main-KV DCP,
+        # unpacked compressed keys. Without QWEN4_EXP_PD_DRAFT_KV it runs no
+        # MTP draft: a decode-only draft (this engine's speculative_config)
+        # adds draft owners and speculative state blocks the producer's plan
+        # does not have. With it, the producer's prefill-only MTP (K = 1)
+        # allocates and ships the draft's owners too.
         # A PCP producer (QWEN4_EXP_PD_PRODUCER_PCP=P, the prefill leg's PCP
         # size) splits its main KV over its P ranks in pcp_interleave() units.
         import os
 
         from .pool_layout import pcp_interleave
 
+        draft_kv = draft_kv_enabled()
+        layout_cfg, src_tp, src_dcp, src_pack = producer_geometry(cfg)
         self.src_pcp = int(os.environ.get("QWEN4_EXP_PD_PRODUCER_PCP", "1"))
         # QWEN4_EXP_PD_PRODUCER_MERGED=1: the producer runs
         # QWEN4_EXP_MERGE_COMPRESSED_K=1, so its keys ride the main-KV IDs in
@@ -1039,11 +1138,17 @@ class StagedConsumer:
         self.src_split_keys = self.src_merged and (
             os.environ.get("QWEN4_EXP_PD_PRODUCER_SPLIT_KEYS", "0") == "1"
         )
+        if draft_kv and (self.src_pcp > 1 or self.src_merged):
+            # F2 models a plain TP1 pipeline producer's draft owners only.
+            raise ValueError(
+                "QWEN4_EXP_PD_DRAFT_KV=1 supports a plain TP1 pipeline producer only "
+                "(not QWEN4_EXP_PD_PRODUCER_PCP > 1 or QWEN4_EXP_PD_PRODUCER_MERGED=1)"
+            )
         self.src_layout, src_specs = pooled_cache_specs(
-            without_speculation(cfg),
-            tp=1,
-            main_dcp=self.src_pcp,
-            pack_compressed=False,
+            layout_cfg,
+            tp=src_tp,
+            main_dcp=self.src_pcp if self.src_pcp > 1 else src_dcp,
+            pack_compressed=src_pack,
             merge_compressed=self.src_merged,
             split_compressed=self.src_split_keys,
             main_interleave=pcp_interleave() if self.src_pcp > 1 else None,
@@ -1176,12 +1281,19 @@ class StagedConsumer:
         )
         # Decode-only MTP: the draft layer's owners (and its packed compressed
         # slot) have no producer pages; its prompt KV starts empty (synthetic
-        # acceptance does not read it).
+        # acceptance does not read it). QWEN4_EXP_PD_DRAFT_KV: the producer
+        # ships them, so no owner may be missing, and each lands like a
+        # target QSA layer's (the draft's main KV DCP-split on a DCP decode).
         # Split keys are staged per producer rank ("<owner>.pcp<r>"), as split
         # main KV is; either way the logical owner is covered.
         staged = set(self._src_owner) | {n.rsplit(".pcp", 1)[0] for n in self._key_pools}
         missing = (set(self._dst_owner) | set(self._dst_compressed)) - staged
-        if any(not n.startswith("mtp.") for n in missing):
+        if draft_kv:
+            check_draft_kv(
+                missing, self._dst_owner, rank.main_dcp,
+                getattr(decode_layout, "main_dcp_owners", ()),
+            )
+        elif any(not n.startswith("mtp.") for n in missing):
             raise ValueError(f"Qwen PD staging lacks producer pages for {sorted(missing)}")
         # QWEN4_EXP_PD_ZERO_DRAFT_KV=1: the repack also writes zeros over the
         # draft's rows of the landed tokens (staging row 0, the never-reserved

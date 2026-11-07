@@ -67,6 +67,7 @@ if TYPE_CHECKING:
     QWEN4_EXP_PD_STAGING_BYTES: int = 8 << 30
     QWEN4_EXP_PD_STAGING_QUARANTINE_STEPS: int = 3
     QWEN4_EXP_PD_STAGING_LEASES: int = 0
+    QWEN4_EXP_PD_DRAFT_KV: bool = False
     QWEN4_EXP_PD_ROUTED_DST: str = ""
     QWEN4_EXP_PD_SYNC_REPACK: bool = False
     QWEN4_EXP_PD_SYNC_REPACK_AB_S: int = 0
@@ -1166,6 +1167,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # is full. 0 (the default) keeps the full mirror. Deliberately not
     # TPU_RAIDEN_POOL_STAGING_LEASES, whose default of 8 would turn this on.
     "QWEN4_EXP_PD_STAGING_LEASES": env_nonnegative_int("QWEN4_EXP_PD_STAGING_LEASES", 0),
+    # BOTH legs of a TP1 pipeline producer -> staged TP>1 Qwen4Exp decode
+    # (q38 F2): the producer's last stage runs the MTP draft over its prefill
+    # chunks (prefill-only MTP, num_speculative_tokens=1) and ships the draft
+    # layer's caches (main KV, compressed keys, raw ring) like any QSA layer's;
+    # the decode lands them in its draft's owners, so the draft no longer
+    # attends unwritten prompt KV. A main-KV DCP decode also needs
+    # VLLM_TPU_QSA_MTP_KV_DCP=1 (the draft is then one more DCP-split owner).
+    # Part of the PD identity, so a one-sided flag fails the handshake.
+    # Host-only (admission and the staging plan): in the compile-key ignore set.
+    "QWEN4_EXP_PD_DRAFT_KV": env_bool("QWEN4_EXP_PD_DRAFT_KV"),
     # "<decode tp>,<decode dcp>,<decode block>" on BOTH legs of a TP1 pipeline
     # producer -> staged TP>1 Qwen4Exp decode: the producer routes each decode
     # rank only its slice (main-KV DCP runs, its GDN heads; compressed keys,

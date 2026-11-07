@@ -389,3 +389,87 @@ def test_aligned_segments_fill_whole_tiles():
         _, d = st.compressed_rows_np(100_000, 4, list(range(1, 40)), 3200, dst_pages, 512)
         segs.append(st.align_rows(d))
     assert _bulk_tiles(np.concatenate(segs)) > 0.99
+
+
+# --- q38 F2: QWEN4_EXP_PD_DRAFT_KV (the producer ships the MTP draft's KV) ---
+# The decode-side byte identity, the refusals through StagedConsumer and the
+# multi-turn path are in tests/distributed/test_qwen4_exp_decode_prefix_cache.py;
+# these pin the two pure helpers that StagedConsumer calls.
+
+_DRAFT = "mtp.layers.48.self_attn"
+_TARGET = "model.layers.3.self_attn"
+_DST = [_TARGET, _TARGET + ".raw_ring", _DRAFT, _DRAFT + ".raw_ring"]
+
+
+def _decode_cfg(k=3, method="mtp"):
+    import dataclasses as dc
+    from types import SimpleNamespace
+
+    @dc.dataclass
+    class Cfg:
+        speculative_config: object
+        other: int = 3
+
+    spec = None if k is None else SimpleNamespace(
+        method=method, num_speculative_tokens=k, draft_tensor_parallel_size=None
+    )
+    return Cfg(speculative_config=spec)
+
+
+def test_producer_geometry_without_the_flag_is_the_tp1_plan_without_the_draft(monkeypatch):
+    monkeypatch.delenv("QWEN4_EXP_PD_DRAFT_KV", raising=False)
+    cfg = _decode_cfg(3)
+    layout_cfg, tp, dcp, pack = st.producer_geometry(cfg)
+    assert (tp, dcp, pack) == (1, 1, False)
+    assert layout_cfg.speculative_config is None and layout_cfg.other == 3
+    assert cfg.speculative_config.num_speculative_tokens == 3
+
+
+def test_producer_geometry_with_the_flag_is_the_k1_mtp_producer(monkeypatch):
+    monkeypatch.setenv("QWEN4_EXP_PD_DRAFT_KV", "1")
+    cfg = _decode_cfg(3)
+    layout_cfg, tp, dcp, pack = st.producer_geometry(cfg)
+    assert (tp, dcp, pack) == (1, 1, False)
+    spec = layout_cfg.speculative_config
+    assert (spec.method, spec.num_speculative_tokens) == ("mtp", 1)
+    assert spec.draft_tensor_parallel_size is None and layout_cfg.other == 3
+    # The decode's own config is untouched: its draft still verifies K = 3.
+    assert layout_cfg is not cfg and spec is not cfg.speculative_config
+    assert cfg.speculative_config.num_speculative_tokens == 3
+
+
+@pytest.mark.parametrize(
+    "k,method", [pytest.param(None, "mtp", id="no_spec"), pytest.param(3, "eagle3", id="eagle3")]
+)
+def test_producer_geometry_with_the_flag_needs_an_mtp_decode(monkeypatch, k, method):
+    monkeypatch.setenv("QWEN4_EXP_PD_DRAFT_KV", "1")
+    with pytest.raises(ValueError, match="MTP speculative config"):
+        st.producer_geometry(_decode_cfg(k, method))
+
+
+def test_check_draft_kv_admits_a_complete_split_landing(monkeypatch):
+    monkeypatch.delenv("QWEN4_EXP_PD_ZERO_DRAFT_KV", raising=False)
+    st.check_draft_kv(set(), _DST, 4, (_TARGET, _DRAFT))
+    # Without main-KV DCP every rank keeps all of the draft's rows.
+    st.check_draft_kv(set(), _DST, 1, ())
+
+
+def test_check_draft_kv_refuses_missing_owners(monkeypatch):
+    monkeypatch.delenv("QWEN4_EXP_PD_ZERO_DRAFT_KV", raising=False)
+    missing = {_DRAFT, _DRAFT + ".compressed_k"}
+    with pytest.raises(ValueError, match="no pages for") as err:
+        st.check_draft_kv(missing, _DST, 4, (_TARGET, _DRAFT))
+    assert all(name in str(err.value) for name in missing)
+
+
+def test_check_draft_kv_refuses_zero_draft(monkeypatch):
+    monkeypatch.setenv("QWEN4_EXP_PD_ZERO_DRAFT_KV", "1")
+    with pytest.raises(ValueError, match="QWEN4_EXP_PD_ZERO_DRAFT_KV=1 would zero"):
+        st.check_draft_kv(set(), _DST, 4, (_TARGET, _DRAFT))
+
+
+def test_check_draft_kv_refuses_an_unsplit_draft_on_a_dcp_decode(monkeypatch):
+    monkeypatch.delenv("QWEN4_EXP_PD_ZERO_DRAFT_KV", raising=False)
+    with pytest.raises(ValueError, match="needs VLLM_TPU_QSA_MTP_KV_DCP=1") as err:
+        st.check_draft_kv(set(), _DST, 4, (_TARGET,))
+    assert _DRAFT in str(err.value)

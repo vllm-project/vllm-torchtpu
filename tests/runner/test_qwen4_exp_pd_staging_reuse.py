@@ -191,3 +191,74 @@ def test_env_default_and_compile_key():
 
     assert envs.environment_variables["QWEN4_EXP_PD_STAGING_QUARANTINE_STEPS"]() == 3
     assert "QWEN4_EXP_PD_STAGING_QUARANTINE_STEPS" in _TPU_COMPILE_ENV_IGNORED
+
+
+# --- q38 F2 (QWEN4_EXP_PD_DRAFT_KV): a target owner and the MTP draft's per load.
+# The draft's pages are entries of the same reservation, so release() must
+# quarantine them with the target's and advance_quarantine() return them
+# together; a draft page freed at release would let the next load land in it
+# before the old load's repack reads it.
+
+DRAFT = "mtp.layers.48.self_attn"
+
+
+def draft_consumer(queue):
+    """``consumer`` whose loads stage a target owner (2 pages) and the MTP
+    draft's owner (1 page); one plan repacks both (pd_staging's one indices
+    plan per load), run on the modelled device queue."""
+    st = consumer(queue)
+    st._owner_counts = lambda num_tokens, skip_tokens: ([0], [OWNER, DRAFT], [2, 1])
+    run_repack = st.run_repack
+
+    def plan_repack(uuid, dst_tables, num_tokens):
+        pages = st.reservations[uuid]
+        src = list(pages[OWNER]) + list(pages[DRAFT])
+        return RepackPlan(passes=[], chunks=[(src, list(dst_tables[0]) + list(dst_tables[1]))])
+
+    st.plan_repack = plan_repack
+    st.repack = lambda uuid, tables, num_tokens: run_repack(plan_repack(uuid, tables, num_tokens))
+    return st
+
+
+def admit_and_land_draft(w, req_id, uuid, dst, draft_dst, value):
+    """``admit_and_land`` for both owners: the target's pages hold ``value``,
+    the draft's ``value + 50``."""
+    st = w._staging
+    assert st.reserve(uuid, 1024)
+    target, draft = list(st.reservations[uuid][OWNER]), list(st.reservations[uuid][DRAFT])
+    st.staging[target] = value
+    st.staging[draft] = value + 50
+    w._stage3_submitted_load_metas[req_id] = SimpleNamespace(
+        uuid=uuid, group_block_ids=[list(dst), list(draft_dst)], num_tokens=1024
+    )
+    w._stage3_finish_destination(req_id, True)  # L1: pending until named
+    return target, draft
+
+
+def test_draft_pages_are_quarantined_and_returned_with_the_targets(monkeypatch):
+    monkeypatch.setenv("QWEN4_EXP_PD_STAGING_QUARANTINE_STEPS", "3")
+    q = DeviceQueue()
+    w = worker(draft_consumer(q))
+    st = w._staging
+    target, draft = admit_and_land_draft(w, "a", 1, dst=[10, 11], draft_dst=[12], value=101)
+    step(w, named=["a"])  # released in this step
+    assert st.quarantined_pages() == 3
+    assert not any(int(st.free[p]) for p in target + draft), "a page left quarantine at release"
+    step(w)
+    step(w)
+    assert not any(int(st.free[p]) for p in target + draft), "freed before 3 step starts"
+    step(w)
+    assert all(int(st.free[p]) for p in target + draft) and st.quarantined_pages() == 0
+
+
+def test_a_load_is_never_repacked_from_draft_pages_another_load_landed_in(monkeypatch):
+    monkeypatch.delenv("QWEN4_EXP_PD_STAGING_QUARANTINE_STEPS", raising=False)
+    q = DeviceQueue()
+    w = worker(draft_consumer(q))
+    a_target, a_draft = admit_and_land_draft(w, "a", 1, dst=[10, 11], draft_dst=[12], value=101)
+    step(w, named=["a"])  # A's repack is enqueued and A's pages released...
+    b_target, b_draft = admit_and_land_draft(w, "b", 2, dst=[20, 21], draft_dst=[22], value=202)
+    q.flush()  # ...B landed first; the device runs A's repack now
+    assert not set(a_target + a_draft) & set(b_target + b_draft), "B was given A's pages"
+    assert torch.all(w._staging.pool[[10, 11]] == 101), "A's target blocks hold B's KV"
+    assert torch.all(w._staging.pool[[12]] == 151), "A's draft block holds B's draft KV"

@@ -42,6 +42,38 @@ def pd_transfer_enabled(cfg) -> bool:
     return getattr(transfer, "kv_connector", None) == PD_CONNECTOR
 
 
+def pd_prefill_mtp_producer(cfg) -> bool:
+    """Whether this engine is the prefill-only MTP producer of q38 F2.
+
+    With QWEN4_EXP_PD_DRAFT_KV=1, a TP1 pipeline-stage KV producer with
+    per-layer pool tags runs the checkpoint's MTP draft over its prefill
+    chunks on its last stage (``tpu_runner._prefill_only_mtp``; it never
+    verifies) and ships the draft layer's caches like any QSA layer's, so a
+    staged decode's draft reads the prompt KV it would have written itself.
+    Exactly ``method == "mtp"`` with ``num_speculative_tokens == 1``. The one
+    predicate behind every admission of that producer (validate_config's
+    pipeline and MTP rules, the PD connector and its transfer-parallelism
+    check); everything else keeps its refusal.
+    """
+    spec = getattr(cfg, "speculative_config", None)
+    if spec is None:
+        return False
+    from .pd_staging import draft_kv_enabled
+
+    transfer = getattr(cfg, "kv_transfer_config", None)
+    p = cfg.parallel_config
+    return bool(
+        draft_kv_enabled()
+        and transfer is not None
+        and getattr(transfer, "is_kv_producer", False)
+        and int(getattr(p, "pipeline_parallel_size", 1) or 1) > 1
+        and int(p.tensor_parallel_size) == 1
+        and envs.TPU_RAIDEN_POOL_TAGS_PER_LAYER
+        and getattr(spec, "method", None) == "mtp"
+        and getattr(spec, "num_speculative_tokens", None) == 1
+    )
+
+
 def host_offload_enabled(cfg) -> bool:
     """Whether prefix-cache pages are offloaded to host DRAM (Raiden store)."""
     transfer = getattr(cfg, "kv_transfer_config", None)
@@ -648,17 +680,20 @@ def validate_config(cfg):
         # Pipeline stages run TP1, as Qwen3.5's PP prefill does (TPU stages
         # cannot run TP collectives yet, see platforms/pp_validation.py), on
         # the unified pool, whose packed compressed-key groups would span
-        # stages; the MTP draft would sit on the last stage.
+        # stages. The MTP draft sits on the last stage, admitted only as
+        # q38 F2's prefill-only producer draft (pd_prefill_mtp_producer).
         if (
             p.tensor_parallel_size != 1
             or not use_unified_pool()
             or pack_compressed_k_enabled()
-            or cfg.speculative_config is not None
+            or (cfg.speculative_config is not None and not pd_prefill_mtp_producer(cfg))
         ):
             raise ValueError(
                 "Qwen4Exp pipeline parallelism requires TP1 stages, the unified "
                 "pool with QWEN4_EXP_PACK_COMPRESSED_K=0, and speculative "
-                "decoding off"
+                "decoding off, except prefill-only MTP with "
+                "num_speculative_tokens=1 on a PD producer with "
+                "QWEN4_EXP_PD_DRAFT_KV=1"
             )
     from .pool_layout import MAIN_KV_DCP_ENV, main_kv_dcp
 
@@ -917,11 +952,14 @@ def validate_mtp_config(cfg):
         )
     if p.data_parallel_size != 1:
         raise ValueError("Qwen4Exp TPU MTP currently requires data_parallel_size=1")
-    if pd_transfer_enabled(cfg):
+    if pd_transfer_enabled(cfg) and not pd_prefill_mtp_producer(cfg):
+        # (q38 F2's producer, pd_prefill_mtp_producer, is admitted: it runs
+        # the draft over its prefill chunks only and ships its KV.)
         # Decode-only MTP: a staged TP>1 consumer behind TP1 pipeline stages
-        # (pd_staging builds the producer's plan without the draft). The
-        # producer ships no draft KV; the draft's prompt KV starts empty, so
-        # this is meant for synthetic rejection sampling. Decode prefix
+        # (pd_staging builds the producer's plan without the draft, or with
+        # it under QWEN4_EXP_PD_DRAFT_KV). Without that flag the producer
+        # ships no draft KV; the draft's prompt KV starts empty, so this is
+        # meant for synthetic rejection sampling. Decode prefix
         # caching is admitted in align mode: speculative state blocks follow
         # the block columns, the load lands the producer's state in the
         # committed entry (_Stage3TransferGroup.transfer_pages), and a local

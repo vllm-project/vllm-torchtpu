@@ -51,6 +51,22 @@ def served_decode_env(monkeypatch):
     }.items():
         monkeypatch.setenv(name, value)
     monkeypatch.delenv("QWEN4_EXP_PD_DIVERGENT_HITS", raising=False)
+    # q38 F2 stays off unless a test asks for it (the draft_kv fixture).
+    for name in (
+        "QWEN4_EXP_PD_DRAFT_KV",
+        "VLLM_TPU_QSA_MTP_KV_DCP",
+        "QWEN4_EXP_PD_ZERO_DRAFT_KV",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+
+@pytest.fixture
+def draft_kv(monkeypatch):
+    """q38 F2: the producer ships the MTP draft's KV (QWEN4_EXP_PD_DRAFT_KV=1)
+    and this DCP4 decode splits the draft's main KV like a target layer's
+    (VLLM_TPU_QSA_MTP_KV_DCP=1)."""
+    monkeypatch.setenv("QWEN4_EXP_PD_DRAFT_KV", "1")
+    monkeypatch.setenv("VLLM_TPU_QSA_MTP_KV_DCP", "1")
 
 
 @pytest.fixture
@@ -202,6 +218,9 @@ class Decode:
                 self.ranks.append(staging)
         assert page_bytes == PAGE * self.layout.token_bytes
         self.src_block = self.ranks[0].src_block
+        # q38 F2: the producer ships the draft's caches, so read() also
+        # checks them (read_draft), from this decode's own plan.
+        self.draft_kv = pd_staging.draft_kv_enabled()
         self.pools = [np.zeros(NUM_BLOCKS * PAGE, dtype=np.int64) for _ in range(TP)]
         self.landed_rows = 0
         self.serial = 0
@@ -374,6 +393,72 @@ class Decode:
                 bad.append((names[0], "entry"))
             if pool[ids[0] * PAGE] != state_value(conv, names[0], n, 0):
                 bad.append((names[0], "state"))
+        if self.draft_kv:
+            bad.extend(self.read_draft(rank, conv, meta, full_tables))
+        return bad
+
+    def draft_owners(self):
+        """The MTP draft's cache owners in this decode's own plan (its
+        scheduler groups and packed compressed slots, not the staging's
+        view of them): name -> (group, row offset in the group's page)."""
+        from vllm_torchtpu.models.vllm.qwen4_exp.pd_staging import owner_kind
+
+        group_of = {
+            name: gi
+            for gi, group in enumerate(self.kvc.kv_cache_groups)
+            for name in group.layer_names
+        }
+        owners = {
+            name: (gi, 0)
+            for name, gi in group_of.items()
+            if name.startswith("mtp.") and owner_kind(name) != "compressed"
+        }
+        if self.layout.compressed_owners:
+            member_rows = PAGE // 8  # pair rows of one member (ratio 4)
+            for prefix, owner, slot in self.layout.compressed_owners:
+                if prefix.startswith("mtp."):
+                    owners[prefix + ".compressed_k"] = (group_of[owner], slot * member_rows)
+        else:
+            owners.update(
+                (name, (gi, 0))
+                for name, gi in group_of.items()
+                if name.startswith("mtp.") and owner_kind(name) == "compressed"
+            )
+        return owners
+
+    def read_draft(self, rank, conv, meta, full_tables):
+        """Mismatched draft rows this rank would read (q38 F2): main KV per
+        DCP rank at its group's entry size, the packed compressed slot, and
+        every ring row the repack copies, against the producer's values."""
+        from vllm_torchtpu.models.vllm.qwen4_exp.pd_staging import owner_kind
+
+        staging = self.ranks[rank]
+        n = meta.num_tokens
+        pool = self.pools[rank]
+        bad = []
+        for name, (gi, offset) in sorted(self.draft_owners().items()):
+            table = full_tables[gi]
+            kind = owner_kind(name)
+            if kind == "main":
+                entry = self.kvc.kv_cache_groups[gi].kv_cache_spec.block_size
+                split = entry // PAGE  # DCP ranks sharing one table entry
+                for t in range(n):
+                    if split > 1 and (t // PAGE) % split != staging.rank.dcp_rank:
+                        continue
+                    row = table[t // entry] * PAGE + t % PAGE
+                    if pool[row] != main_value(conv, name, t):
+                        bad.append((name, t))
+            elif kind == "compressed":
+                for p in range(math.ceil(math.ceil(n / 4) / 2)):
+                    t = 8 * p
+                    row = table[t // PAGE] * PAGE + offset + (t % PAGE) // 8
+                    if pool[row] != pair_value(conv, name, p, n):
+                        bad.append((name, p))
+            else:
+                assert kind == "ring", name
+                for r in range(PAGE):
+                    if pool[table[0] * PAGE + r] != state_value(conv, name, n, r):
+                        bad.append((name, "ring", r))
         return bad
 
 
@@ -647,3 +732,135 @@ def test_staged_clips_count_destination_pages_by_live_bytes():
             assert clip == 3 * pool.block_stride_bytes
         else:
             assert clip == 0
+
+
+# -- q38 F2: the producer ships the MTP draft's KV (QWEN4_EXP_PD_DRAFT_KV) -------
+#
+# The producer's last stage runs prefill-only MTP at K = 1 and ships the draft
+# layer's main KV, compressed keys and ring like any QSA layer's. The staged
+# decode rebuilds that plan (pd_staging.producer_geometry), stages and repacks
+# the draft's pages with the target's, and its draft reads the producer's rows
+# instead of unwritten ones. _produce emits every owner of the rebuilt plan;
+# read() then also checks the draft from the decode's own plan (read_draft).
+
+_DRAFT = "mtp.layers.48.self_attn"
+
+
+@pytest.mark.usefixtures("engine_patches", "draft_kv")
+def test_draft_kv_ships_the_draft_and_every_rank_reads_the_producer_rows():
+    """Byte identity of the draft's pages from producer to decode rows: main
+    KV per DCP rank (split like a target layer's), its packed compressed slot
+    and its whole ring, on all 8 ranks."""
+    from vllm_torchtpu.models.vllm.qwen4_exp.pd_staging import owner_kind
+    from vllm_torchtpu.models.vllm.qwen4_exp.pool_layout import pooled_cache_specs
+
+    decode = Decode(decode_config())
+    assert decode.draft_kv
+    # The decode splits the draft's main KV (VLLM_TPU_QSA_MTP_KV_DCP=1).
+    assert _DRAFT in decode.layout.main_dcp_owners
+    # The staging source plan is a K=1 MTP producer's (TP1 stages, no DCP,
+    # unpacked compressed keys), built here from its own config.
+    _, producer = pooled_cache_specs(
+        decode_config(mtp=1), tp=1, main_dcp=1, pack_compressed=False
+    )
+    assert {_DRAFT, _DRAFT + ".compressed_k", _DRAFT + ".raw_ring"} <= set(producer)
+    for staging in decode.ranks:
+        assert set(staging._src_owner) == set(producer)
+        assert {pool.layer_name for pool in staging.manifest.pools} == set(producer)
+    owners = decode.draft_owners()
+    assert sorted(owner_kind(name) for name in owners) == ["compressed", "main", "ring"]
+    conv, prompt = "conv-f2", tokens(20000, 11)
+    req, meta, hit, ext, tables = serve(decode, conv, prompt)
+    assert (hit, meta.skip_tokens) == (0, 0)
+    assert [decode.read_draft(r, conv, meta, tables) for r in range(TP)] == [[]] * TP
+    assert logical_mismatches(decode, conv, prompt, meta, tables) == [[]] * TP
+
+
+@pytest.mark.usefixtures("engine_patches", "draft_kv")
+def test_draft_kv_multi_turn_hits_land_only_the_suffix_and_read_identically():
+    """The multi-turn prefix-caching run with the draft's KV shipped: every
+    turn's logical rows, the draft's included, are right on a caching and a
+    non-caching decode, and hits still land only the suffix."""
+    test_multi_turn_decode_hits_land_only_the_suffix_and_read_identically()
+
+
+@pytest.mark.usefixtures("engine_patches", "draft_kv")
+@pytest.mark.parametrize("kind", ["main", "compressed", "draft"])
+def test_draft_kv_hit_after_partial_eviction_reads_no_unwritten_draft_rows(kind):
+    """With the draft's rows landed, a token group (the draft's main KV among
+    them) that lost a tail block still bounds the hit, and every rank reads
+    the producer's draft rows."""
+    test_hit_is_the_shortest_token_group_hit_after_partial_eviction(kind)
+
+
+@pytest.mark.usefixtures("engine_patches", "draft_kv")
+def test_draft_kv_refuses_zero_draft_kv(monkeypatch):
+    monkeypatch.setenv("QWEN4_EXP_PD_ZERO_DRAFT_KV", "1")
+    with pytest.raises(ValueError, match="QWEN4_EXP_PD_ZERO_DRAFT_KV=1 would zero"):
+        Decode(decode_config())
+
+
+@pytest.mark.usefixtures("engine_patches")
+def test_draft_kv_refuses_a_dcp_decode_without_mtp_kv_dcp(monkeypatch):
+    """Without VLLM_TPU_QSA_MTP_KV_DCP the draft's main KV is not DCP-split on
+    this DCP4 decode, and the repack would slice it as if it were."""
+    monkeypatch.setenv("QWEN4_EXP_PD_DRAFT_KV", "1")
+    with pytest.raises(ValueError, match="needs VLLM_TPU_QSA_MTP_KV_DCP=1") as err:
+        Decode(decode_config())
+    assert _DRAFT in str(err.value)
+
+
+@pytest.mark.usefixtures("engine_patches", "draft_kv")
+def test_draft_kv_refuses_a_producer_plan_without_draft_owners(monkeypatch):
+    """A producer plan with no draft pages (as without MTP on the producer)
+    may not leave the decode's draft owners unlanded."""
+    from vllm_torchtpu.models.vllm.qwen4_exp import pd_staging
+
+    monkeypatch.setattr(
+        pd_staging,
+        "producer_geometry",
+        lambda cfg: (pd_staging.without_speculation(cfg), 1, 1, False),
+    )
+    with pytest.raises(ValueError, match="no pages for") as err:
+        Decode(decode_config())
+    assert _DRAFT in str(err.value) and _DRAFT + ".raw_ring" in str(err.value)
+
+
+@pytest.mark.usefixtures("draft_kv")
+def test_draft_kv_refuses_a_decode_without_mtp():
+    """No draft on this engine: nothing would land the producer's draft pages."""
+    import torch
+
+    from vllm_torchtpu.models.vllm.qwen4_exp import pd_staging
+    from vllm_torchtpu.models.vllm.qwen4_exp.pd import build_transfer_groups
+
+    cfg = decode_config()
+    layout, native, _ = scheduler_plan(cfg)
+    cfg.speculative_config = None
+    with pytest.raises(ValueError, match="MTP speculative config"):
+        pd_staging.StagedConsumer(
+            cfg,
+            layout,
+            build_transfer_groups(native.kv_cache_groups),
+            torch.zeros(1, dtype=torch.float8_e4m3fn),
+            pd_staging.RankSlice(
+                tp_size=TP,
+                tp_rank=0,
+                num_kv_heads=int(cfg.model_config.hf_text_config.num_key_value_heads),
+                main_dcp=DCP,
+            ),
+            staging_bytes=2 * layout.page_bytes * 8,
+        )
+
+
+@pytest.mark.usefixtures("engine_patches")
+def test_flag_off_producer_plan_has_no_draft_owners():
+    """q38 F2 off: the staging source plan (the producer's) has no mtp. owner,
+    and the decode lands none (its draft's prompt KV starts empty)."""
+    decode = Decode(decode_config())
+    assert not decode.draft_kv
+    for staging in decode.ranks:
+        assert not [n for n in staging._src_owner if n.startswith("mtp.")]
+        assert not [p.layer_name for p in staging.manifest.pools if p.layer_name.startswith("mtp.")]
+        assert not [n for n in staging._dst_owner if n.startswith("mtp.")]
+        assert not [n for n in staging._dst_compressed if n.startswith("mtp.")]
