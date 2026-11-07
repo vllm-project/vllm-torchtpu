@@ -2124,10 +2124,23 @@ def _gathered_chunks(query, bits, ubits, usize, vlengths, cache, page_rows, rows
 _WALK_ALIGN = {}  # step rows -> (walk layout alignment, lazy_share), recorded at trace time (tests)
 
 
+def _served_words(*, groups_cap, ratio, served_kt):
+    """The served kernel's bitset word count (``block_sparse_gqa_prefill``'s ``words``)."""
+    return -(-(-(-groups_cap * ratio // served_kt)) * (served_kt // (ratio * 32)) // 128) * 128
+
+
+def _compact_bits(bits, *, words_s, group):
+    """The plan's bitset cut to the served word count and the group's own lanes: [groups, words_s, group]."""
+    shared = bits[:, : min(words_s, bits.shape[1]), :group]
+    if words_s > shared.shape[1]:
+        shared = jnp.pad(shared, ((0, 0), (0, words_s - shared.shape[1]), (0, 0)))
+    return shared
+
+
 def _served_block_bits(bits, *, groups_cap, ratio, served_kt, served_qb, group):
     """The plan's bitset ([groups, words, 128], a group's rows on lanes 0..group-1) as the served kernel's
     ``block_bits``: its word count, with served_qb // group consecutive groups side by side per served block."""
-    words_s = -(-(-(-groups_cap * ratio // served_kt)) * (served_kt // (ratio * 32)) // 128) * 128
+    words_s = _served_words(groups_cap=groups_cap, ratio=ratio, served_kt=served_kt)
     shared = bits[:, : min(words_s, bits.shape[1])]
     if words_s > shared.shape[1]:
         shared = jnp.pad(shared, ((0, 0), (0, words_s - shared.shape[1]), (0, 0)))
@@ -2177,14 +2190,18 @@ def _lazy_served(query, blocks, lengths, table, starts, offsets, real, bits, lay
         def place(array, fill):
             return jnp.full((size, *array.shape[1:]), fill, array.dtype).at[slots].set(array, mode="drop")
 
+        # Each plan group straight into its served block's lane slot, only its own lanes and the served words
+        # (i1v, M: the zero-filled 128-lane scatter plus the regroup cost +0.31-0.68 ms on misaligned fallbacks).
+        per = served_qb // group
         target = jnp.where(g_live, s_off[g_req] // group + g_local, size // group)
-        sbits = jnp.zeros((size // group, *bits.shape[1:]), bits.dtype).at[target].set(bits, mode="drop")
+        words_s = _served_words(groups_cap=groups_cap, ratio=ratio, served_kt=served_kt)
+        served_bits = jnp.zeros((size // served_qb, words_s, per, group), bits.dtype).at[
+            target // per, :, target % per, :].set(_compact_bits(bits, words_s=words_s, group=group), mode="drop")
         out = bsp.block_sparse_gqa_prefill(
             place(query, 0), place(blocks, -1), place(lengths, 0), place(table, 0), cache, ratio=ratio,
             kv_heads=kv_heads, query_block=served_qb, kv_tile=served_kt, k_scale=k_scale, v_scale=v_scale,
             bf16_io=True, **({"query_tile": served_qt} if served_qt else {}),
-            block_bits=_served_block_bits(sbits, groups_cap=groups_cap, ratio=ratio, served_kt=served_kt,
-                                          served_qb=served_qb, group=group),
+            block_bits=served_bits.reshape(size // served_qb, words_s, served_qb),
         )
         back = jnp.where(t_live, s_off[t_req] + t_pos, 0)
         return jnp.where(t_live[:, None, None], out[back], 0).astype(jnp.bfloat16)

@@ -636,9 +636,11 @@ def test_share_bits_skips_unpaired_served_tiles(kernels, monkeypatch):
 A64 = ((64, 192, 320, 128, 320), (5000, 1500, 4000, 700, 2900))
 # Every request a multiple of 256 rows: share_bits' and lazy share's layouts are both the identity.
 A256 = ((256, 512, 256), (3000, 4500, 1000))
+# Requests that end at their pages' reach (2 x 3,200 rows): the recent window lands in the bitset's top words.
+FULLPAGE = ((192, 512), (6000, 5888))
 
 
-@pytest.mark.parametrize("layout", [SPARE, WORST, ALIGNED, A64, A256])
+@pytest.mark.parametrize("layout", [SPARE, WORST, ALIGNED, A64, A256, FULLPAGE])
 def test_lazy_share_fallback_is_the_served_call(kernels, layout):
     """A lazy-share fallback (the served call on a layout built from the plan's bitset) is bitwise the served call."""
     rows, cached = layout
