@@ -56,6 +56,7 @@ if TYPE_CHECKING:
     TPU_MLA_FUSED_SMALL_A2A_MERGE: bool = True
     TPU_MLA_FUSED_SMALL_A2A_MERGE_MAX_TOKENS: int = 4
     TPU_SMALL_COLL_HBM_OPERAND: bool = True
+    TPU_SMALL_ALL_REDUCE_PLACEMENT: str = ""
     TPU_DCP_MERGE_CHUNKED_SMALL: int = 2
     TPU_DCP_MLA_MERGE_PIECES: int = 2
     TPU_DCP_MLA_MERGE_PIECES_MIN_TOKENS: int = 2048
@@ -690,6 +691,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # right before the call, exposed (~0.9-1.1 us per call at decode); the
     # kernels only DMA the operand, so the bytes and the results are the same.
     "TPU_SMALL_COLL_HBM_OPERAND": env_bool("TPU_SMALL_COLL_HBM_OPERAND", default=True),
+    # empty/"0"/"off" (default) keeps the existing small_all_reduce kernel;
+    # "1" or "f32" selects the die-placement-aware D2D-first two-shot kernel with f32
+    # chip partials above ONE_SHOT_MAX_BYTES; "bf16" selects bfloat16 chip partials;
+    # "ordered" selects the flat slowest-first XOR two-shot kernel.
+    "TPU_SMALL_ALL_REDUCE_PLACEMENT": env_str("TPU_SMALL_ALL_REDUCE_PLACEMENT", ""),
     # The reduce-scatter merge of a backbone bucket of at least
     # TPU_DCP_MERGE_CHUNKED_MIN_TOKENS tokens, split into this many equal token
     # chunks (0/1 = unsplit; a bucket that does not split into multiples of 8
