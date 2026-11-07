@@ -76,7 +76,8 @@ if TYPE_CHECKING:
 # mHC router math
 # ----------------------------------------------------------------------------
 def mhc_sinkhorn(logits: torch.Tensor, iterations: int) -> torch.Tensor:
-    """Log-space Sinkhorn over the last two axes (rows, then columns), fp32; HF remote code `sinkhorn`."""
+    """Log-space Sinkhorn over the last two axes (rows, then columns), fp32;
+    HF remote code `sinkhorn`."""
     logits = logits.float()
     for _ in range(iterations):
         logits = logits - torch.logsumexp(logits, dim=-1, keepdim=True)
@@ -84,28 +85,37 @@ def mhc_sinkhorn(logits: torch.Tensor, iterations: int) -> torch.Tensor:
     return logits.exp()
 
 
-def mhc_route(streams: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor, iterations: int):
-    """mHC router (HF MHCRouter.forward): streams [T, S, H] bf16 -> branch [T, H] (streams dtype), post [T, S]
-    and mix [T, S, S] fp32. The S-way contractions run as fp32 multiply-adds (= a bf16 matmul with fp32
-    accumulation, rounded once), not as a batched [1, S] x [S, H] matmul."""
+def mhc_route(
+    streams: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor, iterations: int
+):
+    """mHC router (HF MHCRouter.forward): streams [T, S, H] bf16 -> branch [T, H]
+    (streams dtype), post [T, S] and mix [T, S, S] fp32. The S-way contractions
+    run as fp32 multiply-adds (= a bf16 matmul with fp32 accumulation, rounded
+    once), not as a batched [1, S] x [S, H] matmul."""
     s = streams.shape[-2]
     flat = streams.flatten(-2).float()
     normed = flat * torch.rsqrt(flat.square().mean(-1, keepdim=True) + 1e-6)
     logits = torch.nn.functional.linear(normed, weight, bias)
     pre = logits[..., :s].sigmoid()
-    post = 2 * logits[..., s:2 * s].sigmoid()
-    mix = mhc_sinkhorn(logits[..., 2 * s:].unflatten(-1, (s, s)), iterations)
-    pre_q = pre.to(streams.dtype).float()  # HF rounds pre to the stream dtype before the matmul
+    post = 2 * logits[..., s : 2 * s].sigmoid()
+    mix = mhc_sinkhorn(logits[..., 2 * s :].unflatten(-1, (s, s)), iterations)
+    # HF rounds pre to the stream dtype before the matmul
+    pre_q = pre.to(streams.dtype).float()
     branch = (pre_q.unsqueeze(-1) * streams.float()).sum(-2).to(streams.dtype)
     return branch, post, mix
 
 
-def mhc_merge(streams: torch.Tensor, branch: torch.Tensor, post: torch.Tensor, mix: torch.Tensor) -> torch.Tensor:
-    """HF MHCRouter.merge: mix @ streams + post (x) branch, [T, S, H]; mix / post rounded to the stream dtype as HF
-    does, the sum accumulated in fp32 and rounded once."""
+def mhc_merge(
+    streams: torch.Tensor, branch: torch.Tensor, post: torch.Tensor, mix: torch.Tensor
+) -> torch.Tensor:
+    """HF MHCRouter.merge: mix @ streams + post (x) branch, [T, S, H]; mix / post
+    rounded to the stream dtype as HF does, the sum accumulated in fp32 and rounded
+    once."""
     mix_q, post_q = mix.to(streams.dtype).float(), post.to(streams.dtype).float()
     mixed = (mix_q.unsqueeze(-1) * streams.float().unsqueeze(-3)).sum(-2)
-    return (mixed + post_q.unsqueeze(-1) * branch.float().unsqueeze(-2)).to(streams.dtype)
+    return (mixed + post_q.unsqueeze(-1) * branch.float().unsqueeze(-2)).to(
+        streams.dtype
+    )
 
 
 class SenseNovaMHCRouter(nn.Module):
@@ -345,9 +355,11 @@ class SenseNovaLoopModel(nn.Module):
                 # (the pending fused add, rounded once as HF's bf16 add is).
                 if residual is not None:
                     hidden_states, residual = hidden_states + residual, None
-                streams = hidden_states.unsqueeze(-2).expand(
-                    -1, mhc["streams"], -1
-                ).contiguous()
+                streams = (
+                    hidden_states.unsqueeze(-2)
+                    .expand(-1, mhc["streams"], -1)
+                    .contiguous()
+                )
             streams = layer.forward_streams(positions, streams)
             if physical == mhc["end"] - 1:
                 # Remote code `leave`: mean over streams (fp32, rounded once).

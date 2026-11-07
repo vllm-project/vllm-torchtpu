@@ -43,12 +43,17 @@ def execution_plan(hf_config: Any, num_layers: int) -> tuple[int, ...]:
         raise ValueError("SenseNova-Loop needs an explicit loop_settings")
     start, end, count = (loop.get(key) for key in ("start", "end", "eval_count"))
     if any(type(value) is not int for value in (start, end, count)) or not (
+        # pyrefly: ignore[unsupported-operation]
         0 <= start < end <= num_layers and count >= 1
     ):
         raise ValueError(f"Invalid Loop interval or eval_count: {loop}")
     if loop.get("counts") != [count]:
         raise ValueError("Only fixed-count Loop checkpoints are supported")
+    # start, end and count are ints (checked above); pyrefly does not narrow
+    # through any(), so it still sees Optional values here.
+    # pyrefly: ignore[bad-argument-type, unsupported-operation]
     loop_visits = tuple(range(start, end)) * count
+    # pyrefly: ignore[bad-argument-type]
     return tuple(range(start)) + loop_visits + tuple(range(end, num_layers))
 
 
@@ -64,11 +69,13 @@ def mhc_settings(hf_config: Any, num_layers: int) -> dict | None:
         mhc.get(key) for key in ("start", "end", "streams", "iterations")
     )
     if any(type(v) is not int for v in (start, end, streams, iterations)) or not (
+        # pyrefly: ignore[unsupported-operation]
         0 <= start < end <= num_layers and streams in (2, 4) and iterations >= 1
     ):
         raise ValueError(f"Invalid mHC range, streams or iterations: {mhc}")
     loop = cast(dict, _setting(hf_config, "loop_settings"))
     bounds = (0, loop["start"], loop["end"], num_layers)
+    # pyrefly: ignore[unsupported-operation]
     if not any(lo <= start < end <= hi for lo, hi in zip(bounds, bounds[1:])):
         raise ValueError("mHC cannot cross a Loop phase boundary")
     # The fixed-identity mix and the branch pre-scale are valid checkpoints,
