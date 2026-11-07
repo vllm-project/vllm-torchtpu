@@ -230,6 +230,9 @@ def test_manifest_preserves_lifecycle_dependencies():
     assert {"platform_activation", "engine_core"} <= set(
         next(p.stages for p in reg.PATCHES if p.target == backlog)
     )
+    affinity = "vllm_torchtpu.core.dp_prefix_affinity:install_if_enabled"
+    front_end = [p.target for p in reg.PATCHES if "platform_activation" in p.stages]
+    assert front_end.index(backlog) < front_end.index(affinity)
     for names in (stages["platform_activation"], stages["worker_init"]):
         assert names.index("_patch_vllm_force_v1_runner_tpu") < names.index(
             "_patch_vllm_config_triton_tpu"
