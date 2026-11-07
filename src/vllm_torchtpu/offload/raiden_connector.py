@@ -181,17 +181,67 @@ class RaidenOffloadingWorkerMetadata(OffloadingWorkerMetadata):
         )
 
 
-def _cgroup_memory() -> dict[str, int | None]:
-    """The container's memory (cgroup v2): current, peak and limit bytes."""
+_V1_UNLIMITED = 1 << 62   # cgroup v1 reports "no limit" as a page-rounded 2**63 - 1
 
-    def read(name: str) -> int | None:
+
+def _own_cgroup_paths(proc_cgroup: str) -> tuple[str | None, str | None]:
+    """This process's cgroup path for v2 (``0::<path>``) and for the v1 memory controller (``N:...memory...:<path>``)."""
+    v2 = v1 = None
+    try:
+        with open(proc_cgroup) as f:
+            for line in f:
+                parts = line.rstrip("\n").split(":", 2)
+                if len(parts) != 3:
+                    continue
+                hier, controllers, path = parts
+                if hier == "0" and controllers == "":
+                    v2 = path
+                elif "memory" in controllers.split(","):
+                    v1 = path
+    except OSError:
+        pass
+    return v2, v1
+
+
+def _cgroup_memory(
+    root: str = "/sys/fs/cgroup", proc_cgroup: str = "/proc/self/cgroup"
+) -> dict[str, int | str | None]:
+    """The container's memory: current, peak and limit bytes, and the files they came from (``source``).
+
+    Tried in order, first readable usage wins:
+      v2 at this process's own cgroup (``<root><path>/memory.{current,peak,max}``; a container that sees the host
+      hierarchy, as CP3's serving container appears to, has no ``memory.*`` files at the root), then v2 at the root
+      (a namespaced container), then v1 at the own path and at the root
+      (``<root>/memory[<path>]/memory.{usage_in_bytes,max_usage_in_bytes,limit_in_bytes}``).
+    "No limit" (v2 ``max``, v1 >= 2**62) reads as None. Nothing readable: all None, ``source`` = "none".
+    """
+
+    def read(path: str) -> int | None:
         try:
-            with open(f"/sys/fs/cgroup/{name}") as f:
+            with open(path) as f:
                 return int(f.read().strip())
         except (OSError, ValueError):
             return None
 
-    return {k: read(f"memory.{k}") for k in ("current", "peak", "max")}
+    v2, v1 = _own_cgroup_paths(proc_cgroup)
+    cands: list[tuple[str, str, tuple[str, str, str]]] = []
+    v2_files = ("memory.current", "memory.peak", "memory.max")
+    v1_files = ("memory.usage_in_bytes", "memory.max_usage_in_bytes", "memory.limit_in_bytes")
+    if v2 and v2 != "/":
+        cands.append(("v2:own", root + v2, v2_files))
+    cands.append(("v2:root", root, v2_files))
+    if v1 and v1 != "/":
+        cands.append(("v1:own", f"{root}/memory{v1}", v1_files))
+    cands.append(("v1:root", f"{root}/memory", v1_files))
+    for source, base, (cur_f, peak_f, max_f) in cands:
+        current = read(f"{base}/{cur_f}")
+        if current is None:
+            continue
+        limit = read(f"{base}/{max_f}")
+        if limit is not None and source.startswith("v1") and limit >= _V1_UNLIMITED:
+            limit = None
+        return {"current": current, "peak": read(f"{base}/{peak_f}"), "max": limit, "source": source}
+    return {"current": None, "peak": None, "max": None, "source": "none"}
 
 
 @dataclass
@@ -243,7 +293,7 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
         return (
             f"offload-tier telemetry: {counters} fence_pending={len(self._fence_pending)} "
             f"mem_current={gib(mem['current'])} mem_peak={gib(mem['peak'])} "
-            f"mem_max={gib(mem['max'])}"
+            f"mem_max={gib(mem['max'])} mem_src={mem['source']}"
         )
 
     def _maybe_log_telemetry(self) -> None:
