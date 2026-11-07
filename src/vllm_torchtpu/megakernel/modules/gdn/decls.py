@@ -32,6 +32,7 @@ from ...decls import (
     normalize_weight_dtypes,
 )
 from ...errors import MegakernelConfigError
+from ...module import Module
 from ...ops import BF16, F32, FP8
 from .gate import GDN_GATE_ACTS as GDN_GATE_ACTS
 from .gate import validate_gdn_gate as _validate_gdn_gate
@@ -139,13 +140,13 @@ def bind_gdn_module(
             isinstance(kw[k], tuple) and len(kw[k]) == 2 and isinstance(kw[k][0], str)
         ):
             gate_lit = validate_gdn_gate(kw.pop(k))
-            b = super(cls, cls).bind(prefix, **kw)
+            b = Module.bind.__func__(cls, prefix, **kw)
             return dataclasses.replace(
                 b,
                 fields={**b.fields, "gate": ("gdn_gate", gate_lit)},
                 options={**b.options, "gate": gate_lit},
             )
-    return super(cls, cls).bind(prefix, **kw)
+    return Module.bind.__func__(cls, prefix, **kw)
 
 
 def resolve_gdn_binding(

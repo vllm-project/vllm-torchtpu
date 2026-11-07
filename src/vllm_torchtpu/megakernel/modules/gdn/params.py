@@ -201,6 +201,12 @@ def derive_params(
         and ngdn > 0
         and not cache_exec(ex).FUSED
     )
+    if GCH and tt.gdn_head_major and 2 * lay.kh > lay.vh:
+        raise MegakernelConfigError(
+            f"GDN gdn_head_major=True requires 2 * kh <= vh on the chunked "
+            f"recurrence path, got kh={lay.kh}, vh={lay.vh} "
+            f"(KH={g.KH}, VH={g.VH}, R={R})"
+        )
     CB = tt.gdn_rows if GCH else B
     if GCH and CB % 8 != 0:
         raise MegakernelConfigError(
@@ -234,7 +240,7 @@ def derive_params(
     SSM_U32_CAP = REC_PAGES * 128
     pool_layout = None
     if cache_exec(ex).FUSED or GPR:
-        pool_layout = checked_pool_layout(plan, ex, g_per_att, ssm_u32_rows)
+        pool_layout = checked_pool_layout(plan, ex, g_per_att, ssm_u32_rows, g)
         REC_PAGES = pool_layout.rec_pages_per_slot
         GDN_PAGES = pool_layout.pages_per_slot
         SSM_U32_CAP = pool_layout.rec_u32_rows
@@ -321,7 +327,7 @@ def derive_params(
 
 
 def checked_pool_layout(
-    plan: Any, ex: ExecSpec, g_per_att: int, ssm_u32_rows: int
+    plan: Any, ex: ExecSpec, g_per_att: int, ssm_u32_rows: int, g: Any
 ) -> Any:
     """The model's `PoolLayout`, checked against this module's geometry.
 
@@ -337,6 +343,20 @@ def checked_pool_layout(
         )
     layout = pb.layout
     layout.validate(ex)
+    for layout_attr, geom_attr in (
+        ("kh", "KH"),
+        ("vh", "VH"),
+        ("KD", "KD"),
+        ("VD", "VD"),
+    ):
+        l_val = getattr(layout, layout_attr)
+        g_val = getattr(g, geom_attr)
+        if l_val != g_val:
+            raise MegakernelConfigError(
+                f"GDN in-kernel pool I/O: module geometry has "
+                f"{geom_attr}={g_val}, but the pool layout has "
+                f"{layout_attr}={l_val}"
+            )
     if g_per_att <= 0 or layout.slots_per_pool != g_per_att:
         raise MegakernelConfigError(
             f"GDN in-kernel pool I/O: {g_per_att} recurrent layer(s) per "

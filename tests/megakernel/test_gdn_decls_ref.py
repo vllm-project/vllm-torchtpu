@@ -16,12 +16,12 @@
 from __future__ import annotations
 
 import dataclasses
+from typing import Any
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from jax import lax
 
 from tests.megakernel.megakernel_fakes import (
     TINY_TILES,
@@ -62,7 +62,7 @@ from vllm_torchtpu.megakernel.modules.gdn.params import (
     gdn_lin_in_layout,
 )
 from vllm_torchtpu.megakernel.modules.gdn.reference import gdn_reference
-from vllm_torchtpu.megakernel.ops import BF16, F32, FP8, round_bf16
+from vllm_torchtpu.megakernel.ops import BF16, F32, FP8
 from vllm_torchtpu.megakernel.planner import plan
 from vllm_torchtpu.megakernel.pool import CacheExec, PoolBackend, PoolLayout
 from vllm_torchtpu.megakernel.spec import LayerType, ModelSpec
@@ -80,7 +80,8 @@ def test_gdn_gate_act_and_validate_gdn_gate():
     np.testing.assert_allclose(gdn_gate_act("silu")(x), jax.nn.silu(x))
     np.testing.assert_allclose(gdn_gate_act("sigmoid")(x), jax.nn.sigmoid(x))
 
-    for bad in ("relu", "", None, 123):
+    bad_cases: tuple[Any, ...] = ("relu", "", None, 123)
+    for bad in bad_cases:
         with pytest.raises(ValueError, match="'silu' or 'sigmoid'"):
             validate_gdn_gate(bad)
         with pytest.raises(MegakernelConfigError, match="'silu' or 'sigmoid'"):
@@ -139,16 +140,22 @@ def test_gdn_tunables_lin_in_layout_and_derive_params():
     g_bad_h = dataclasses.replace(g, H=192)
     with pytest.raises(MegakernelConfigError, match="multiple of 128"):
         derive_params(g_bad_h, ex, p, GDNTunables(), "fake_gqa")
+    g_eq_hv = dataclasses.replace(g, KH=4, VH=4)
+    with pytest.raises(
+        MegakernelConfigError,
+        match=r"gdn_head_major=True requires 2 \* kh <= vh.*kh=2, vh=2",
+    ):
+        derive_params(g_eq_hv, ex_v, p_v, tt_gch, "fake_gqa")
 
     # checked_pool_layout validation and derive_params pool-I/O branch (FUSED & GPR)
     with pytest.raises(MegakernelConfigError, match="needs a pool backend"):
-        checked_pool_layout(p, ex, g_per_att=1, ssm_u32_rows=256)
+        checked_pool_layout(p, ex, g_per_att=1, ssm_u32_rows=256, g=g)
 
     pl_bf16 = PoolLayout(
         num_pools=1,
         slots_per_pool=1,
-        kh=2,
-        vh=4,
+        kh=4,
+        vh=8,
         rec_pages_per_slot=4,
         conv_pages_per_slot=1,
         conv_taps=3,
@@ -157,8 +164,8 @@ def test_gdn_tunables_lin_in_layout_and_derive_params():
     pl_f32 = PoolLayout(
         num_pools=1,
         slots_per_pool=1,
-        kh=2,
-        vh=4,
+        kh=4,
+        vh=8,
         rec_pages_per_slot=4,
         conv_pages_per_slot=1,
         conv_taps=3,
@@ -173,16 +180,27 @@ def test_gdn_tunables_lin_in_layout_and_derive_params():
         tiles=tiles,
         cache=CacheExec(paged_kv=True, page_size=128, num_pages=32, fused_pool_io=True),
     )
+    k_names = ("gather_pool_states", "scatter_pool_states")
     ms_pool_bf16 = dataclasses.replace(
         ms,
-        cache_backend=PoolBackend(layout=pl_bf16, kernel_names=("kv_pool_0",)),
+        cache_backend=PoolBackend(layout=pl_bf16, kernel_names=k_names),
     )
     p_pool_bf16 = plan(ms_pool_bf16, ex_pool)
-    assert checked_pool_layout(p_pool_bf16, ex_pool, 1, 256) is pl_bf16
+    assert checked_pool_layout(p_pool_bf16, ex_pool, 1, 256, g) is pl_bf16
     with pytest.raises(MegakernelConfigError, match="slots_per_pool"):
-        checked_pool_layout(p_pool_bf16, ex_pool, 2, 256)
+        checked_pool_layout(p_pool_bf16, ex_pool, 2, 256, g)
     with pytest.raises(MegakernelConfigError, match="exceeds the pool layout"):
-        checked_pool_layout(p_pool_bf16, ex_pool, 1, 1024)
+        checked_pool_layout(p_pool_bf16, ex_pool, 1, 1024, g)
+    ms_pool_bad_kh = dataclasses.replace(
+        ms,
+        cache_backend=PoolBackend(
+            layout=dataclasses.replace(pl_bf16, kh=2, vh=4),
+            kernel_names=k_names,
+        ),
+    )
+    p_pool_bad_kh = plan(ms_pool_bad_kh, ex_pool)
+    with pytest.raises(MegakernelConfigError, match=r"KH=4.*kh=2"):
+        checked_pool_layout(p_pool_bad_kh, ex_pool, 1, 256, g)
 
     gp_fused_bf16 = derive_params(g, ex_pool, p_pool_bf16, GDNTunables(), "fake_gqa")
     assert gp_fused_bf16.pool_layout is pl_bf16
@@ -193,7 +211,7 @@ def test_gdn_tunables_lin_in_layout_and_derive_params():
 
     ms_pool_f32 = dataclasses.replace(
         ms,
-        cache_backend=PoolBackend(layout=pl_f32, kernel_names=("kv_pool_0",)),
+        cache_backend=PoolBackend(layout=pl_f32, kernel_names=k_names),
     )
     p_pool_f32 = plan(ms_pool_f32, ex_pool)
     gp_fused_f32 = derive_params(g, ex_pool, p_pool_f32, GDNTunables(), "fake_gqa")
@@ -234,6 +252,10 @@ class _BoundGDNModule(Module):
         )
 
 
+class _SubBoundGDNModule(_BoundGDNModule):
+    name = "gdn_test_bind_sub"
+
+
 def test_gdn_decls_options_binding_and_hf_params():
     """Verify GDN options, binding resolution, HF parameter keys, and cache decl."""
     assert GDN_WEIGHT_NAMES == ("lin_in", "lin_out")
@@ -270,6 +292,24 @@ def test_gdn_decls_options_binding_and_hf_params():
         }
     )
     assert res_from_bind.gate == "sigmoid" and res_from_bind.gdn_gate == "sigmoid"
+
+    # Subclass B(A) of a delegating module A must bind without infinite recursion
+    sub_plain = _SubBoundGDNModule.bind(
+        "linear_attn",
+        hidden="hidden_size",
+        k_heads="linear_num_key_heads",
+        v_heads="linear_num_value_heads",
+    )
+    assert sub_plain.module_cls is _SubBoundGDNModule
+    sub_sig = _SubBoundGDNModule.bind(
+        "linear_attn",
+        hidden="hidden_size",
+        k_heads="linear_num_key_heads",
+        v_heads="linear_num_value_heads",
+        gate="sigmoid",
+    )
+    assert sub_sig.module_cls is _SubBoundGDNModule
+    assert sub_sig.options["gate"] == "sigmoid"
 
     # Explicit option in ModuleBinding beats the geometry default ("silu")
     binding = ModuleBinding(
@@ -320,50 +360,113 @@ def test_gdn_decls_options_binding_and_hf_params():
     assert cdecl.kh == 4 and cdecl.vh == 8 and cdecl.conv_taps == 3
 
 
+def _numpy_recurrent_gated_delta_rule(
+    query: np.ndarray,
+    key: np.ndarray,
+    value: np.ndarray,
+    g: np.ndarray,
+    beta: np.ndarray,
+    initial_state: np.ndarray,
+    *,
+    l2_eps: float = 1e-6,
+) -> tuple[np.ndarray, np.ndarray]:
+    """NumPy port of HuggingFace `torch_recurrent_gated_delta_rule`."""
+    q = query / np.sqrt(np.sum(query * query, axis=-1, keepdims=True) + l2_eps)
+    k = key / np.sqrt(np.sum(key * key, axis=-1, keepdims=True) + l2_eps)
+    q = q * (query.shape[-1] ** -0.5)
+    NS, T, vh, VD = value.shape
+    kh, KD = q.shape[2], q.shape[3]
+    if vh > kh:
+        q = np.repeat(q, vh // kh, axis=2)
+        k = np.repeat(k, vh // kh, axis=2)
+
+    core_attn_out = np.zeros((NS, T, vh, VD), dtype=np.float32)
+    step_states = np.zeros((NS, T, vh, KD, VD), dtype=np.float32)
+    last_recurrent_state = initial_state.astype(np.float32).copy()
+    for i in range(T):
+        q_t = q[:, i]
+        k_t = k[:, i]
+        v_t = value[:, i]
+        g_t = np.exp(g[:, i])[..., None, None]
+        beta_t = beta[:, i][..., None]
+        last_recurrent_state = last_recurrent_state * g_t
+        kv_mem = np.einsum("shk,shkv->shv", k_t, last_recurrent_state)
+        delta = (v_t - kv_mem) * beta_t
+        last_recurrent_state = last_recurrent_state + np.einsum(
+            "shk,shv->shkv", k_t, delta
+        )
+        core_attn_out[:, i] = np.einsum("shkv,shk->shv", last_recurrent_state, q_t)
+        step_states[:, i] = last_recurrent_state
+    return core_attn_out, step_states
+
+
+@pytest.mark.parametrize("multi_layer", [False, True], ids=["single_l", "multi_l"])
+@pytest.mark.parametrize("R", [1, 2], ids=["r1", "r2"])
 @pytest.mark.parametrize(("T", "gate"), [(1, "silu"), (2, "sigmoid"), (4, "silu")])
-def test_gdn_reference_matches_direct_computation(T: int, gate: str):
-    """Compare `gdn_reference` against direct causal conv + gated delta rule."""
+def test_gdn_reference_matches_direct_computation(
+    T: int, gate: str, R: int, multi_layer: bool
+):
+    """Compare `gdn_reference` against an independent NumPy port of HF GatedDeltaNet."""
     B = 4
-    g = FakeGeometry(L=1, att_every=1, H=256, KH=2, VH=4, KD=128, VD=128)
-    ex = ExecSpec(B=B, T=T, R=1, ctx=256, tiles=TINY_TILES)
+    NGDN = 2 if multi_layer else 1
+    gdn_idx = 1 if multi_layer else 0
+    g = FakeGeometry(L=NGDN, att_every=1, H=256, KH=2 * R, VH=4 * R, KD=128, VD=128)
+    ex = ExecSpec(B=B, T=T, R=R, ctx=256, tiles=TINY_TILES)
     lay = gdn_lin_in_layout(g, ex)
     kh, vh, KD, VD = lay.kh, lay.vh, lay.KD, lay.VD
     QKV, Z, BA, A_OFF, NLI = lay.QKV, lay.Z, lay.BA, lay.A_OFF, lay.NLI
 
-    keys = jax.random.split(jax.random.PRNGKey(50 + T), 9)
+    keys = jax.random.split(
+        jax.random.PRNGKey(50 + T + 7 * R + 13 * int(multi_layer)), 9
+    )
     x = jax.random.normal(keys[0], (B, g.H), dtype=BF16) * 0.2
-    w_in = jax.random.normal(keys[1], (1, g.H, NLI), dtype=BF16) * 0.1
-    w_out = jax.random.normal(keys[2], (1, Z, g.H), dtype=BF16) * 0.1
-    conv_w = jax.random.normal(keys[3], (1, 4 * QKV), dtype=F32) * 0.1
-    alog = jax.random.normal(keys[4], (1, vh), dtype=F32) * 0.1 - 1.0
-    dtb = jax.random.normal(keys[5], (1, vh), dtype=F32) * 0.1
-    gnorm = jax.random.normal(keys[6], (1, VD), dtype=F32) * 0.05 + 1.0
-    conv_st = jax.random.normal(keys[7], (1, ex.NS, 3, QKV), dtype=F32) * 0.05
-    rec_st = jax.random.normal(keys[8], (1, ex.NS, vh, KD, VD), dtype=BF16) * 0.05
+    w_in_4d = jax.random.normal(keys[1], (R, NGDN, g.H, NLI), dtype=BF16) * 0.1
+    w_out_4d = jax.random.normal(keys[2], (R, NGDN, Z, g.H), dtype=BF16) * 0.1
+    conv_w_3d = jax.random.normal(keys[3], (R, NGDN, 4 * QKV), dtype=F32) * 0.1
+    alog_3d = jax.random.normal(keys[4], (R, NGDN, vh), dtype=F32) * 0.1 - 1.0
+    dtb_3d = jax.random.normal(keys[5], (R, NGDN, vh), dtype=F32) * 0.1
+    gnorm_3d = jax.random.normal(keys[6], (R, NGDN, VD), dtype=F32) * 0.05 + 1.0
+    conv_st_all = jax.random.normal(keys[7], (R, NGDN, ex.NS, 3, QKV), dtype=F32) * 0.2
+    rec_st_all = (
+        jax.random.normal(keys[8], (R, NGDN, ex.NS, vh, KD, VD), dtype=BF16) * 0.2
+    )
 
-    params = {
-        "lin_in": w_in,
-        "lin_out": w_out,
-        "conv": conv_w,
-        "alog": alog,
-        "dtb": dtb,
-        "gnorm": gnorm,
-    }
-    if T == 1:
+    if multi_layer:
+        params = {
+            "lin_in": w_in_4d,
+            "lin_out": w_out_4d,
+            "conv": conv_w_3d,
+            "alog": alog_3d,
+            "dtb": dtb_3d,
+            "gnorm": gnorm_3d,
+        }
+        state_in: dict[str, jax.Array] = {"conv": conv_st_all, "rec": rec_st_all}
+    else:
+        params = {
+            "lin_in": w_in_4d[:, 0],
+            "lin_out": w_out_4d[:, 0],
+            "conv": conv_w_3d[:, 0],
+            "alog": alog_3d[:, 0],
+            "dtb": dtb_3d[:, 0],
+            "gnorm": gnorm_3d[:, 0],
+        }
+        state_in = {"conv": conv_st_all[:, 0], "rec": rec_st_all[:, 0]}
+
+    if T == 1 and R == 1 and not multi_layer:
         with pytest.raises(MegakernelConfigError, match="FP8 'lin_in' requires"):
             gdn_reference(
-                {**params, "lin_in": w_in.astype(FP8)},
+                {**params, "lin_in": params["lin_in"].astype(FP8)},
                 x,
-                {"conv": conv_st, "rec": rec_st},
+                state_in,
                 g=g,
                 ex=ex,
                 multi_layer=False,
             )
         with pytest.raises(MegakernelConfigError, match="FP8 'lin_out' requires"):
             gdn_reference(
-                {**params, "lin_out": w_out.astype(FP8)},
+                {**params, "lin_out": params["lin_out"].astype(FP8)},
                 x,
-                {"conv": conv_st, "rec": rec_st},
+                state_in,
                 g=g,
                 ex=ex,
                 multi_layer=False,
@@ -371,16 +474,17 @@ def test_gdn_reference_matches_direct_computation(T: int, gate: str):
     ref_out, ref_st = gdn_reference(
         params,
         x,
-        {"conv": conv_st, "rec": rec_st},
+        state_in,
         g=g,
         ex=ex,
-        multi_layer=False,
+        gdn_idx=gdn_idx,
+        multi_layer=multi_layer,
         gate=gate,
     )
 
-    if T == 1:
-        conv_packed = jnp.swapaxes(conv_st[0], 0, 1).reshape(1, 3 * B, QKV)
-        rec_flat = rec_st.reshape(1, B * vh, KD, VD)
+    if T == 1 and not multi_layer:
+        conv_packed = jnp.swapaxes(state_in["conv"], 1, 2).reshape(R, 3 * B, QKV)
+        rec_flat = state_in["rec"].reshape(R, B * vh, KD, VD)
         ref_out_p, _ = gdn_reference(
             params,
             x,
@@ -394,71 +498,114 @@ def test_gdn_reference_matches_direct_computation(T: int, gate: str):
         )
         np.testing.assert_allclose(ref_out_p, ref_out, rtol=0, atol=0)
 
-    # Direct single-rank math
-    xb = x.astype(BF16).astype(F32)
-    ybuf = round_bf16(xb @ w_in[0].astype(F32))
-    taps = [conv_w[0, t * QKV : (t + 1) * QKV] for t in range(4)]
-    if T == 1:
-        u = round_bf16(
-            jax.nn.silu(
-                conv_st[0, :, 0] * taps[0]
-                + conv_st[0, :, 1] * taps[1]
-                + conv_st[0, :, 2] * taps[2]
-                + ybuf[:, :QKV] * taps[3]
-            )
-        )
-    else:
-        us = []
-        for s_idx in range(ex.NS):
-            h_s = jnp.concatenate(
-                [conv_st[0, s_idx], ybuf[s_idx * T : (s_idx + 1) * T, :QKV]], axis=0
-            )
-            u_s = round_bf16(
-                jax.nn.silu(
-                    h_s[0:T] * taps[0]
-                    + h_s[1 : 1 + T] * taps[1]
-                    + h_s[2 : 2 + T] * taps[2]
-                    + h_s[3 : 3 + T] * taps[3]
+    # Independent unsharded NumPy HF GatedDeltaNet oracle across all KH/VH heads
+    NS = ex.NS
+    x_np = np.asarray(x.astype(F32), dtype=np.float32)
+    w_in_np = np.asarray(w_in_4d[:, gdn_idx].astype(F32), dtype=np.float32)
+    w_out_np = np.asarray(w_out_4d[:, gdn_idx].astype(F32), dtype=np.float32)
+    conv_w_np = np.asarray(conv_w_3d[:, gdn_idx], dtype=np.float32).reshape(R, 4, QKV)
+    alog_np = np.asarray(alog_3d[:, gdn_idx], dtype=np.float32).reshape(R * vh)
+    dtb_np = np.asarray(dtb_3d[:, gdn_idx], dtype=np.float32).reshape(R * vh)
+    gnorm_np = np.asarray(gnorm_3d[:, gdn_idx], dtype=np.float32)
+    conv_st_np = np.asarray(conv_st_all[:, gdn_idx], dtype=np.float32)
+    rec_st_np = np.asarray(rec_st_all[:, gdn_idx].astype(F32), dtype=np.float32)
+
+    q_all = np.zeros((NS, T, R * kh, KD), dtype=np.float32)
+    k_all = np.zeros((NS, T, R * kh, KD), dtype=np.float32)
+    v_all = np.zeros((NS, T, R * vh, VD), dtype=np.float32)
+    z_all = np.zeros((NS, T, R * vh, VD), dtype=np.float32)
+    g_all = np.zeros((NS, T, R * vh), dtype=np.float32)
+    beta_all = np.zeros((NS, T, R * vh), dtype=np.float32)
+    conv_next_r = []
+
+    for r in range(R):
+        proj_r = x_np @ w_in_np[r]
+        qkv_r = proj_r[:, :QKV].reshape(NS, T, QKV)
+        # Depthwise causal conv1d over the 4-tap window [hist_0, hist_1, hist_2, new...]
+        win_r = np.concatenate([conv_st_np[r], qkv_r], axis=1)  # (NS, 3 + T, QKV)
+        conv_pre = np.stack(
+            [
+                np.einsum(
+                    "tkc,kc->tc",
+                    np.stack([win_r[s, t : t + 4] for t in range(T)], axis=0),
+                    conv_w_np[r],
                 )
-            )
-            us.append(u_s)
-        u = jnp.concatenate(us, axis=0)
-
-    g_act = gdn_gate_act(gate)
-    mix_rows = []
-    rec_rows = []
-    rec_prev = rec_st[0, 0]
-    for b in range(B):
-        s_idx, t_idx = divmod(b, T)
-        st = rec_st[0, s_idx].astype(F32) if t_idx == 0 else rec_prev.astype(F32)
-        q = u[b, : kh * KD].reshape(kh, KD)
-        k = u[b, kh * KD : 2 * kh * KD].reshape(kh, KD)
-        v = u[b, 2 * kh * KD :].reshape(vh, VD)
-        q = q * lax.rsqrt(jnp.sum(q * q, axis=-1, keepdims=True) + 1e-6) * (KD**-0.5)
-        k = k * lax.rsqrt(jnp.sum(k * k, axis=-1, keepdims=True) + 1e-6)
-        qc = jnp.repeat(q, vh // kh, axis=0)[:, :, None]
-        kc = jnp.repeat(k, vh // kh, axis=0)[:, :, None]
-        beta = round_bf16(jax.nn.sigmoid(ybuf[b, BA : BA + vh]))
-        decay = -jnp.exp(alog[0]) * jax.nn.softplus(
-            ybuf[b, A_OFF : A_OFF + vh] + dtb[0]
+                for s in range(NS)
+            ],
+            axis=0,
         )
-        st = st * jnp.exp(decay)[:, None, None]
-        st = st + kc * ((v - jnp.sum(st * kc, axis=1)) * beta[:, None])[:, None, :]
-        out_b = round_bf16(jnp.sum(st * qc, axis=1))
-        rec_prev = st.astype(BF16)
-        rec_rows.append(rec_prev)
-        val = out_b * lax.rsqrt(jnp.mean(out_b * out_b, axis=-1, keepdims=True) + g.eps)
-        val = (gnorm[0].astype(BF16)[None, :] * val.astype(BF16)).astype(F32)
-        zz = ybuf[b, QKV : QKV + Z].reshape(vh, VD)
-        mix_rows.append(round_bf16(val * g_act(zz)).reshape(Z))
+        u_r = conv_pre / (1.0 + np.exp(-conv_pre))
+        if T == 1:
+            conv_next_r.append(win_r[:, -3:, :].transpose(1, 0, 2).reshape(3 * B, QKV))
+        else:
+            conv_next_r.append(win_r)
+        q_all[:, :, r * kh : (r + 1) * kh, :] = u_r[:, :, : kh * KD].reshape(
+            NS, T, kh, KD
+        )
+        k_all[:, :, r * kh : (r + 1) * kh, :] = u_r[
+            :, :, kh * KD : 2 * kh * KD
+        ].reshape(NS, T, kh, KD)
+        v_all[:, :, r * vh : (r + 1) * vh, :] = u_r[:, :, 2 * kh * KD :].reshape(
+            NS, T, vh, VD
+        )
+        z_all[:, :, r * vh : (r + 1) * vh, :] = proj_r[:, QKV : QKV + Z].reshape(
+            NS, T, vh, VD
+        )
+        b_r = proj_r[:, BA : BA + vh].reshape(NS, T, vh)
+        a_r = proj_r[:, A_OFF : A_OFF + vh].reshape(NS, T, vh)
+        beta_all[:, :, r * vh : (r + 1) * vh] = 1.0 / (1.0 + np.exp(-b_r))
+        sp_r = np.logaddexp(0.0, a_r + dtb_np[r * vh : (r + 1) * vh])
+        g_all[:, :, r * vh : (r + 1) * vh] = (
+            -np.exp(alog_np[r * vh : (r + 1) * vh]) * sp_r
+        )
 
-    expected = (
-        (jnp.stack(mix_rows, axis=0).astype(BF16).astype(F32) @ w_out[0].astype(F32))
-        .astype(BF16)
-        .astype(F32)
+    init_rec_full = rec_st_np.transpose(1, 0, 2, 3, 4).reshape(NS, R * vh, KD, VD)
+    core_out, step_states = _numpy_recurrent_gated_delta_rule(
+        q_all, k_all, v_all, g_all, beta_all, init_rec_full, l2_eps=g.gdn_l2_eps
     )
-    np.testing.assert_allclose(ref_out, expected, rtol=1e-5, atol=1e-5)
+    # RMSNormGated + gate activation + unsharded out_proj (`(R * Z, H)`)
+    rms = core_out / np.sqrt(
+        np.mean(core_out * core_out, axis=-1, keepdims=True) + g.eps
+    )
+    gnorm_full = np.repeat(gnorm_np, vh, axis=0)  # (R * vh, VD)
+    normed = rms * gnorm_full[None, None, :, :]
+    gate_val = (
+        z_all / (1.0 + np.exp(-z_all))
+        if gate == "silu"
+        else 1.0 / (1.0 + np.exp(-z_all))
+    )
+    gated_full = (normed * gate_val).reshape(B, R * Z)
+    w_out_full = w_out_np.reshape(R * Z, g.H)
+    expected_np = gated_full @ w_out_full
+
+    np.testing.assert_allclose(np.asarray(ref_out), expected_np, rtol=2e-2, atol=3e-2)
     rec_key = "rec_ckpt" if T > 1 else "rec"
-    np.testing.assert_allclose(
-        ref_st[rec_key][0], jnp.concatenate(rec_rows, axis=0), rtol=1e-5, atol=1e-5
+    expected_rec = (
+        step_states.reshape(NS, T, R, vh, KD, VD)
+        .transpose(2, 0, 1, 3, 4, 5)
+        .reshape(R, B * vh, KD, VD)
     )
+    np.testing.assert_allclose(
+        np.asarray(ref_st[rec_key]), expected_rec, rtol=1e-2, atol=1e-2
+    )
+    conv_key = "conv_ckpt" if T > 1 else "conv"
+    for r in range(R):
+        if T == 1:
+            np.testing.assert_allclose(
+                np.asarray(ref_st[conv_key][r, : 3 * B]),
+                conv_next_r[r],
+                rtol=1e-2,
+                atol=1e-2,
+            )
+        else:
+            np.testing.assert_allclose(
+                np.asarray(ref_st[conv_key][r, :, : 3 + T]),
+                conv_next_r[r],
+                rtol=1e-2,
+                atol=1e-2,
+            )
+    # Must-fail control: inverted output fails at the same tolerance
+    with pytest.raises(AssertionError):
+        np.testing.assert_allclose(
+            np.asarray(ref_out), -expected_np, rtol=2e-2, atol=3e-2
+        )
