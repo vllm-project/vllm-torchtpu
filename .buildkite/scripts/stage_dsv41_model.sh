@@ -61,7 +61,10 @@ gcloud storage ls -l -r "$dest/**" 2>/dev/null \
   | awk -v p="$dest/" '$1 ~ /^[0-9]+$/ && index($3, p) == 1 {
       print substr($3, length(p) + 1) "\t" $1 }' > "$scratch/existing.tsv" || true
 
-awk -F'\t' 'NR == FNR { have[$1] = $2; next } have[$1] != $2 { print $1 }' \
+# FILENAME, not NR == FNR: the listing is empty on a first run, and NR == FNR
+# would then hold for every line of the file list too.
+awk -F'\t' -v have_file="$scratch/existing.tsv" \
+  'FILENAME == have_file { have[$1] = $2; next } have[$1] != $2 { print $1 }' \
   "$scratch/existing.tsv" "$scratch/files.tsv" > "$scratch/todo.txt"
 echo "--- Copying $(wc -l < "$scratch/todo.txt" | tr -d ' ') files to ${dest}"
 
@@ -89,10 +92,12 @@ xargs -P "$jobs" -I{} bash -c '
 ' _ {} < "$scratch/todo.txt"
 
 echo "--- Verifying object sizes"
-gcloud storage ls -l -r "$dest/**" \
+# An empty prefix makes `ls` fail; the size check below reports it instead.
+gcloud storage ls -l -r "$dest/**" 2>/dev/null \
   | awk -v p="$dest/" '$1 ~ /^[0-9]+$/ && index($3, p) == 1 {
-      print substr($3, length(p) + 1) "\t" $1 }' > "$scratch/existing.tsv"
-missing="$(awk -F'\t' 'NR == FNR { have[$1] = $2; next }
+      print substr($3, length(p) + 1) "\t" $1 }' > "$scratch/existing.tsv" || true
+missing="$(awk -F'\t' -v have_file="$scratch/existing.tsv" \
+  'FILENAME == have_file { have[$1] = $2; next }
   have[$1] != $2 { print $1 " (want " $2 ", have " (have[$1] == "" ? "none" : have[$1]) ")" }' \
   "$scratch/existing.tsv" "$scratch/files.tsv")"
 if [[ -n "$missing" ]]; then
