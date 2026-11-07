@@ -1361,7 +1361,10 @@ def fused_mlp_kernel_main(
     either way. The output is therefore bit-identical (interpret check with
     signed-zero-rich cases: scratch/pmoe/q38_pmoe_interp_fmlp.py).
     """
-    num_gm = fill_metadata(lhs_group_sizes_ref, group_offset_ref, metadata_ref, cfgs=cfgs1)
+    if cfgs1.experts_per_visit > 1:
+        num_gm = fill_metadata_blocks(lhs_group_sizes_ref, metadata_ref, cfgs=cfgs1)
+    else:
+        num_gm = fill_metadata(lhs_group_sizes_ref, group_offset_ref, metadata_ref, cfgs=cfgs1)
     (lhs_spec, rhs1_spec), _ = generate_block_specs(metadata_ref, cfgs1)
     (_, rhs2_spec), out_spec = generate_block_specs(metadata_ref, cfgs2)
     rhs_up_ref = jax.tree.map(lambda x: x.at[..., cfgs1.out_size_n :], rhs1_ref)
@@ -1401,10 +1404,13 @@ def gmm_mlp_v2(
     rhs_quant_dtype: jnp.dtype | None = None,
     pack_out: bool = False,
     vmem_limit_bytes: int | None = None,
+    experts_per_visit: int = 1,
 ) -> jax.Array:
     """gmm_v2(gmm_v2(lhs, w1, fuse_act), w2) as one kernel (fused expert MLP),
-    bitwise equal to the two calls with zero_initialize=False, one expert per
-    visit and the same tilings. Non-EP only (group offset 0)."""
+    bitwise equal to the two calls with zero_initialize=False and the same
+    tilings, at experts_per_visit E in (1, 2, 4) (both stages visit the same E
+    consecutive experts per step; the two-kernel path is bitwise across E).
+    Non-EP only (group offset 0)."""
     tile_info1 = calculate_tiling if tile_info1 is None else tile_info1
     tile_info2 = calculate_tiling if tile_info2 is None else tile_info2
     size_m = lhs.shape[0]
@@ -1417,7 +1423,8 @@ def gmm_mlp_v2(
         vmem_limit_bytes = int(pltpu.get_tpu_info().vmem_capacity_bytes * 0.9)
     inter = w1.shape[2] // 2
     common = dict(vmem_limit_bytes=vmem_limit_bytes, acc_dtype=None, maybe_quantize_lhs=True,
-                  zero_initialize=False, rhs_quant_dtype=rhs_quant_dtype)
+                  zero_initialize=False, rhs_quant_dtype=rhs_quant_dtype,
+                  experts_per_visit=experts_per_visit)
     cfgs1 = make_gmm_configs(lhs, w1, w1_scale, None, group_sizes, group_offset, tile_info=tile_info1,
                              out_dtype=lhs.dtype, fuse_act=fuse_act, **common)
     act_shape = jax.ShapeDtypeStruct((lhs.shape[0], inter), lhs.dtype)
@@ -1460,7 +1467,7 @@ def gmm_mlp_v2(
         MetadataRef(
             gm_id_to_group_id=pltpu.SMEM((max_num_gm,), jnp.int32),
             gm_id_to_m_offset=pltpu.SMEM((max_num_gm + 1,), jnp.int32),
-            gm_id_to_sub_bounds=pltpu.SMEM((1,), jnp.int32),
+            gm_id_to_sub_bounds=pltpu.SMEM((sub_bounds_size(cfgs1),), jnp.int32),
         ),
     ]
     hbm = pl.BlockSpec(memory_space=pltpu.HBM)
