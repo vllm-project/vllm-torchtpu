@@ -851,7 +851,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # layers/adapter/routing_replay.py. Model output is meaningless.
     "TPU_MOE_ROUTING_REPLAY": lambda: os.getenv("TPU_MOE_ROUTING_REPLAY", ""),
     # Place each named MoE layer's experts by this .npz (logical expert ->
-    # physical slot, e.g. balanced on routing counts; see
+    # physical slot, e.g. balanced on routing counts, optionally with copies
+    # of the busiest experts in extra slots per rank; see
     # layers/core/expert_permutation.py). Unset = linear placement.
     "TPU_MOE_EXPERT_PLACEMENT": lambda: os.getenv("TPU_MOE_EXPERT_PLACEMENT", ""),
     # Override the PCP full-attention kernel page without changing KV manager pages.

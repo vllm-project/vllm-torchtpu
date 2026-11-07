@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Ragged all-to-all EP MoE under a static expert placement: the experts' weights
-moved to their slots and the routed ids replaced by the slots give the linear
-placement's result, bitwise where every member's partial sums keep their order."""
+moved to their slots (copies of the busiest experts in extra slots) and the
+routed ids replaced by the slots give the linear placement's result, bitwise
+where every member's partial sums keep their order."""
 
 import functools
 
@@ -120,4 +121,75 @@ def test_balanced_placement_matches_linear_up_to_sum_order(dp_size, tp_size, kno
     assert np.abs(b).max() > 0 and np.isfinite(g).all()
     differ = (g != b).mean()
     print(f"dp{dp_size} tp{tp_size} {knobs}: {differ:.4%} of engine sums differ")
+    np.testing.assert_allclose(g, b, rtol=2e-2, atol=2e-2)
+
+
+def _copied(args, slots):
+    """Weights and scales copied into every slot of their expert (an extra slot
+    per rank), each routed id replaced by the copy its routing weight picks."""
+    x, w1, w2, s1, s2, weights, ids, es = args
+    local = EXPERTS // RANKS + 1
+    experts = np.full(RANKS * local, -1)
+    e, _ = np.nonzero(slots >= 0)
+    experts[slots[slots >= 0]] = e
+    assert (experts >= 0).all()  # every spare slot holds a copy
+    logical = jnp.asarray(experts)
+    w1, w2, s1, s2 = (a[logical] for a in (w1, w2, s1, s2))
+    ids = np.asarray(ids)
+    copies = (slots >= 0).sum(axis=1)
+    bits = (np.asarray(weights.astype(jnp.float32)).view(np.int32) >> 16) & 0xFFFF
+    placed = slots[ids, bits % copies[ids]]
+    es = jnp.arange(RANKS, dtype=jnp.int32) * local
+    return x, w1, w2, s1, s2, weights, jnp.asarray(placed, jnp.int32), es
+
+
+@pytest.mark.multichip
+@pytest.mark.parametrize("knobs", list(KNOBS))
+@pytest.mark.parametrize("dp_size,tp_size", [(8, 1), (2, 4)])
+def test_copies_top1_is_bitwise(dp_size, tp_size, knobs):
+    """Top-1: each token has one route, so no sum changes order when its route
+    moves to a copy on another member."""
+    num_tokens, topk = 24, 1
+    args = _inputs(tp_size, num_tokens, topk, skew=True)
+    counts = np.bincount(np.asarray(args[6]).ravel(), minlength=EXPERTS)
+    slots = core.replicate(counts, RANKS, 1)
+    assert (slots >= 0).sum(axis=1).max() > 1
+    base = _run(args, dp_size, tp_size, topk, num_tokens, **KNOBS[knobs])
+    got = _run(
+        _copied(args, slots),
+        dp_size,
+        tp_size,
+        topk,
+        num_tokens,
+        **KNOBS[knobs],
+    )
+    assert np.abs(base.astype(np.float32)).max() > 0
+    b, g = (a.astype(np.float32).sum(axis=1) for a in (base, got))  # [dp, S, H]
+    np.testing.assert_array_equal(g, b)
+
+
+@pytest.mark.multichip
+@pytest.mark.parametrize("knobs", list(KNOBS))
+@pytest.mark.parametrize("dp_size,tp_size", [(8, 1), (4, 2), (2, 4)])
+def test_copies_match_linear_up_to_sum_order(dp_size, tp_size, knobs):
+    """Top-10 under skewed routing with copies of the busiest experts: the
+    routes regroup into other members' partial sums, so only the rounding of
+    the sums may differ (engine sums over TP ranks compared)."""
+    num_tokens, topk = 24, 10
+    args = _inputs(tp_size, num_tokens, topk, skew=True)
+    counts = np.bincount(np.asarray(args[6]).ravel(), minlength=EXPERTS)
+    slots = core.replicate(counts, RANKS, 1)
+    base = _run(args, dp_size, tp_size, topk, num_tokens, **KNOBS[knobs])
+    got = _run(
+        _copied(args, slots),
+        dp_size,
+        tp_size,
+        topk,
+        num_tokens,
+        **KNOBS[knobs],
+    )
+    b, g = (a.astype(np.float32).sum(axis=1) for a in (base, got))
+    assert np.abs(b).max() > 0 and np.isfinite(g).all()
+    differ = (g != b).mean()
+    print(f"copies dp{dp_size} tp{tp_size} {knobs}: {differ:.4%} of engine sums differ")
     np.testing.assert_allclose(g, b, rtol=2e-2, atol=2e-2)

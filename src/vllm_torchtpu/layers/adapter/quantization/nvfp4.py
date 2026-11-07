@@ -45,7 +45,6 @@ import math
 import zlib
 from typing import TYPE_CHECKING
 
-import numpy as np
 import torch
 from vllm.config import get_current_vllm_config_or_none
 from vllm.model_executor.layers.attention import Attention
@@ -341,6 +340,8 @@ class VllmNvfp4MoEMethod(TpuMoEActivationMixin, FusedMoEMethodBase):
         **extra_weight_attrs,
     ):
         layer.params_dtype = params_dtype
+        # A placement file with copies gives every rank more expert slots.
+        num_experts = expert_permutation.slots_per_rank(layer, num_experts)
         ModelOptNvFp4FusedMoE.create_weights(
             self,
             layer,
@@ -399,11 +400,11 @@ class VllmNvfp4MoEMethod(TpuMoEActivationMixin, FusedMoEMethodBase):
         )
         # Experts placed by TPU_MOE_EXPERT_PLACEMENT draw from a generator per
         # logical expert, so the dummy model is the same under any placement.
-        slots = expert_permutation.host_slots(layer)
+        slots = expert_permutation.slot_experts(layer)
         if slots is not None:
             local = layer.w13_weight.shape[0]
             start = int(self.moe.ep_rank) * local
-            logical = np.argsort(slots)[start : start + local]
+            logical = slots[start : start + local]
             generators = [
                 torch.Generator(device="cpu").manual_seed(seed + int(e) * 104729)
                 for e in logical

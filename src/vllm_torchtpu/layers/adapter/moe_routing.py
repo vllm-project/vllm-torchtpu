@@ -196,7 +196,7 @@ def route(
     topk_weights, topk_ids = _route_logical(
         layer, hidden_states, router_logits, input_ids
     )
-    return topk_weights, expert_permutation.to_slots(layer, topk_ids)
+    return topk_weights, expert_permutation.to_slots(layer, topk_ids, topk_weights)
 
 
 def _route_logical(
@@ -379,11 +379,14 @@ def get_experts_start(layer) -> int | None:
     placement (``vllm/model_executor/layers/fused_moe/layer.py``), so this is
     a pure function of ``ep_rank``, ``ep_size``, and ``global_num_experts`` --
     known at layer construction time. ``validate_linear_ep_placement`` enforces
-    that the placement is linear before this value is used.
+    that the placement is linear before this value is used. A placement file
+    with copies (``TPU_MOE_EXPERT_PLACEMENT``) sets the slots per rank.
     """
     if not layer.moe_config.moe_parallel_config.use_ep:
         return None
-    base = layer.global_num_experts // layer.moe_config.ep_size
+    base = expert_permutation.slots_per_rank(
+        layer, layer.global_num_experts // layer.moe_config.ep_size
+    )
     remainder = layer.global_num_experts % layer.moe_config.ep_size
     return layer.moe_config.ep_rank * base + min(layer.moe_config.ep_rank, remainder)
 
