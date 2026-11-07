@@ -46,6 +46,7 @@ def producer_env(monkeypatch):
         "QWEN4_EXP_PD_SHARED_COMPRESSED",
         "QWEN4_EXP_PD_ROUTED_DST",
         "QWEN4_EXP_PD_DIVERGENT_HITS",
+        "QWEN4_EXP_PD_DRAFT_KV_FORCE_GAP",
     ):
         monkeypatch.delenv(name, raising=False)
 
@@ -65,7 +66,7 @@ def set_flag(monkeypatch, on):
 # -- configs ----------------------------------------------------------------------
 
 
-def producer_config(k=1, tp=1, pp=8, prefix_caching=False):
+def producer_config(k=1, tp=1, pp=8, prefix_caching=False, role="kv_producer"):
     """A Qwen PD producer of the test model with an MTP draft of ``k`` tokens:
     by default the served prefill shape, PP8 x TP1 (TP x DP x PP = 8)."""
     from tests.models.vllm.test_qwen4_exp_mtp import spec_config
@@ -82,8 +83,8 @@ def producer_config(k=1, tp=1, pp=8, prefix_caching=False):
     cfg.kv_transfer_config = NS(
         kv_connector=qconfig.PD_CONNECTOR,
         kv_connector_module_path=None,
-        kv_role="kv_producer",
-        is_kv_producer=True,
+        kv_role=role,
+        is_kv_producer=role == "kv_producer",
     )
     return cfg
 
@@ -314,3 +315,150 @@ def test_flag_is_off_by_default_and_out_of_the_compile_key():
 
     assert envs.environment_variables["QWEN4_EXP_PD_DRAFT_KV"]() is False
     assert "QWEN4_EXP_PD_DRAFT_KV" in _TPU_COMPILE_ENV_IGNORED
+
+
+def test_force_gap_is_off_by_default_and_out_of_the_compile_key():
+    from vllm_torchtpu import envs
+    from vllm_torchtpu.compilation.tpu_compiler import _TPU_COMPILE_ENV_IGNORED
+
+    assert envs.environment_variables["QWEN4_EXP_PD_DRAFT_KV_FORCE_GAP"]() == 0.0
+    assert "QWEN4_EXP_PD_DRAFT_KV_FORCE_GAP" in _TPU_COMPILE_ENV_IGNORED
+
+
+# -- q38 F2 option (a): the producer never caches draft KV -----------------------------
+
+
+def _schedule(conn, new=(), cached=(), resumed=()):
+    """One scheduler step's ``build_connector_meta`` on ``conn`` (the shared
+    Stage-3 half stubbed): ``new`` / ``cached`` are (req id, computed tokens)."""
+    from vllm_torchtpu.distributed.kv_transfer.tpu_connector import TPURaidenConnector
+
+    output = NS(
+        scheduled_new_reqs=[NS(req_id=r, num_computed_tokens=c) for r, c in new],
+        scheduled_cached_reqs=NS(
+            req_ids=[r for r, _ in cached],
+            resumed_req_ids=set(resumed),
+            num_computed_tokens=[c for _, c in cached],
+        ),
+    )
+    meta = NS()
+    with patch.object(TPURaidenConnector, "build_connector_meta", lambda self, so: meta):
+        assert conn.build_connector_meta(output) is meta
+
+
+def _finish(conn, req_id, num_cached_tokens=-1, num_tokens=12799):
+    """``request_finished_all_groups`` with the shared half publishing a send
+    of ``num_tokens``; returns the consumer-facing params."""
+    from vllm_torchtpu.distributed.kv_transfer.tpu_connector import TPURaidenConnector
+
+    published = {"uuid": 5, "num_tokens": num_tokens}
+    with patch.object(
+        TPURaidenConnector, "request_finished_all_groups", lambda self, r, ids: (True, dict(published))
+    ):
+        delay, params = conn.request_finished_all_groups(
+            NS(request_id=req_id, num_cached_tokens=num_cached_tokens), ([],)
+        )
+    assert delay
+    return params
+
+
+@pytest.mark.usefixtures("flag")
+def test_producer_publishes_the_prefix_hit_it_was_last_scheduled_with():
+    from vllm_torchtpu.models.vllm.qwen4_exp.pd_staging import PRODUCER_HIT_PARAM
+
+    conn = build_connector(connector_config())
+    _schedule(conn, new=[("r1", 6400), ("r2", 0), ("r5", 3200)])
+    # r1 is preempted and resumes with a longer hit; r2 just continues.
+    _schedule(conn, cached=[("r1", 9600), ("r2", 3000)], resumed=["r1"])
+    assert _finish(conn, "r1")[PRODUCER_HIT_PARAM] == 9600
+    assert PRODUCER_HIT_PARAM not in _finish(conn, "r2")  # no hit
+    assert _finish(conn, "r3", num_cached_tokens=3200)[PRODUCER_HIT_PARAM] == 3200  # never seen
+    assert _finish(conn, "r4", num_cached_tokens=99999)[PRODUCER_HIT_PARAM] == 12799  # capped
+    assert PRODUCER_HIT_PARAM not in _finish(conn, "r6")  # vLLM's count unset (-1)
+    assert conn._producer_hits == {"r5": 3200}
+
+
+def test_only_the_f2_producer_publishes_a_hit(monkeypatch):
+    from vllm_torchtpu.models.vllm.qwen4_exp.pd_staging import PRODUCER_HIT_PARAM
+
+    cfg = connector_config()
+    cfg.speculative_config = None  # a producer without the draft
+    for on in (False, True):
+        set_flag(monkeypatch, on)
+        conn = build_connector(cfg)
+        _schedule(conn, new=[("r1", 6400)])
+        assert conn._producer_hits is None
+        assert PRODUCER_HIT_PARAM not in _finish(conn, "r1", num_cached_tokens=6400)
+
+
+def test_worker_hands_the_carried_hit_to_the_staging_and_keeps_it_in_the_snapshot():
+    from vllm_torchtpu.models.vllm.qwen4_exp.pd_connector import Qwen4ExpRaidenWorker
+
+    calls = []
+
+    class Staging:
+        pages = 4
+        free = None
+        reservations, skips, tokens = {}, {}, {}
+
+        def reserve(self, uuid, num_tokens, tp_group=None, **kwargs):
+            calls.append((uuid, kwargs.get("draft_zero_until")))
+            return True
+
+    worker = object.__new__(Qwen4ExpRaidenWorker)
+    worker._staging = Staging()
+    meta = NS(uuid=7, num_tokens=20000, skip_tokens=2048, src_cached_tokens=9600)
+    assert worker._stage3_reserve_destination("d7", meta, None)
+    assert worker._stage3_reserve_destination_reduced(meta, reduced_free=None)
+    assert calls == [(7, 9600), (7, 9600)]
+    # The batched admission's snapshot restores the per-load hits too.
+    import torch
+
+    staging = worker._staging
+    staging.free = torch.ones(4, dtype=torch.int32)
+    staging.draft_zero = {7: 9600}
+    saved = worker._stage3_admission_snapshot()
+    staging.draft_zero[8] = 3200
+    worker._stage3_admission_restore(saved)
+    assert staging.draft_zero == {7: 9600}
+
+
+def test_producer_draft_specs_are_non_prefix_cacheable_on_both_legs(monkeypatch):
+    """The producer engine (native_cache_specs on pd_prefill_mtp_producer) and
+    a decode rebuilding its plan (producer_geometry) both give the draft's
+    owners non-prefix-cacheable specs, in groups of their own; the targets'
+    and the decode's own draft stay cacheable. PENDING the vLLM probe: this is
+    the served image's verdict on config.non_prefix_cacheable."""
+    from vllm.v1.core.kv_cache_utils import get_kv_cache_groups
+
+    from vllm_torchtpu.models.vllm.qwen4_exp import pd_staging
+    from vllm_torchtpu.models.vllm.qwen4_exp.config import (
+        ensure_kv_group_size_rule,
+        pd_prefill_mtp_producer,
+    )
+    from vllm_torchtpu.models.vllm.qwen4_exp.pool_layout import pooled_cache_specs
+
+    monkeypatch.setenv("QWEN4_EXP_PD_DRAFT_KV", "1")
+    ensure_kv_group_size_rule()
+    producer = producer_config()
+    decode = producer_config(k=3, tp=8, pp=1, role="kv_consumer")
+    assert pd_prefill_mtp_producer(producer) and not pd_prefill_mtp_producer(decode)
+    _, own = pooled_cache_specs(producer)
+    layout_cfg, tp, dcp, pack, cacheable = pd_staging.producer_geometry(decode)
+    _, rebuilt = pooled_cache_specs(
+        layout_cfg, tp=tp, main_dcp=dcp, pack_compressed=pack, draft_prefix_cacheable=cacheable
+    )
+    draft = "mtp.layers.48.self_attn"
+    owners = {draft, draft + ".compressed_k", draft + ".raw_ring"}
+    assert {n for n in own if n.startswith("mtp.")} == owners
+    assert {n for n in rebuilt if n.startswith("mtp.")} == owners
+    for specs in (own, rebuilt):
+        assert not any(specs[n].prefix_cacheable for n in owners)
+        targets = [n for n in specs if n.endswith((".self_attn", ".compressed_k")) and n not in owners]
+        assert targets and all(specs[n].prefix_cacheable for n in targets)
+    assert {n: type(own[n]) for n in owners} == {n: type(rebuilt[n]) for n in owners}
+    for cfg, specs in ((producer, own), (decode, rebuilt)):
+        assert pd_staging.draft_group_problems(get_kv_cache_groups(cfg, dict(specs))) == []
+    # The decode's own draft keeps its prefix cache.
+    _, decode_own = pooled_cache_specs(decode)
+    assert decode_own[draft].prefix_cacheable and decode_own[draft + ".compressed_k"].prefix_cacheable

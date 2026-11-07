@@ -55,16 +55,15 @@ def pd_prefill_mtp_producer(cfg) -> bool:
     pipeline and MTP rules, the PD connector and its transfer-parallelism
     check); everything else keeps its refusal.
     """
-    spec = getattr(cfg, "speculative_config", None)
-    if spec is None:
-        return False
     from .pd_staging import draft_kv_enabled
 
+    spec = getattr(cfg, "speculative_config", None)
+    if spec is None or not draft_kv_enabled():
+        return False
     transfer = getattr(cfg, "kv_transfer_config", None)
     p = cfg.parallel_config
     return bool(
-        draft_kv_enabled()
-        and transfer is not None
+        transfer is not None
         and getattr(transfer, "is_kv_producer", False)
         and int(getattr(p, "pipeline_parallel_size", 1) or 1) > 1
         and int(p.tensor_parallel_size) == 1
@@ -72,6 +71,74 @@ def pd_prefill_mtp_producer(cfg) -> bool:
         and getattr(spec, "method", None) == "mtp"
         and getattr(spec, "num_speculative_tokens", None) == 1
     )
+
+
+def non_prefix_cacheable(spec):
+    """``spec`` as a KV-cache spec vLLM's prefix cache neither hashes nor
+    counts in a hit (q38 F2 option (a): the producer never caches draft KV,
+    so the hybrid hit Hp comes from the target groups only and the draft
+    gets fresh blocks; ``core/divergent_hybrid_hits._token_groups``).
+
+    PENDING the CPU probe (scratch/dmk/vm/q38_f2_vllm_probe.py): vLLM is not
+    installed on the Mac, and how the pinned fork defines
+    ``prefix_cacheable`` is unknown. Best guess, in order: a dataclass field
+    (replaced), else a read-only property (a subclass reporting False,
+    registered at import, ``_NON_PREFIX_CACHEABLE``). A spec that already
+    reports False (the raw ring) comes back as it is. Whether vLLM's group
+    merge keeps the result is checked where the groups are built
+    (pd_staging.draft_group_problems).
+    """
+    if not getattr(spec, "prefix_cacheable", True):
+        return spec
+    import dataclasses
+
+    if "prefix_cacheable" in getattr(spec, "__dataclass_fields__", {}):
+        out = dataclasses.replace(spec, prefix_cacheable=False)
+    else:
+        cls = _NON_PREFIX_CACHEABLE.get(type(spec)) or _non_prefix_cacheable_type(type(spec))
+        out = cls(
+            **{f.name: getattr(spec, f.name) for f in dataclasses.fields(spec) if f.init}
+        )
+    if out.prefix_cacheable:
+        raise ValueError(f"Qwen4Exp could not make {type(spec).__name__} non-prefix-cacheable")
+    return out
+
+
+# Spec type -> its non-prefix-cacheable subclass, when vLLM defines
+# ``prefix_cacheable`` as a property (non_prefix_cacheable). Created at import
+# for the attention spec types and registered as module attributes, so a
+# pickled KV-cache config naming them unpickles in any process that imports
+# this module.
+_NON_PREFIX_CACHEABLE: dict[type, type] = {}
+
+
+def _non_prefix_cacheable_type(cls: type) -> type:
+    name = f"NonPrefixCacheable{cls.__name__}"
+    sub = type(
+        name,
+        (cls,),
+        {
+            "prefix_cacheable": property(lambda self: False),
+            "__module__": __name__,
+            "__qualname__": name,
+        },
+    )
+    globals()[name] = sub
+    _NON_PREFIX_CACHEABLE[cls] = sub
+    return sub
+
+
+def _register_non_prefix_cacheable_types() -> None:
+    import inspect
+
+    from vllm.v1.kv_cache_interface import FullAttentionSpec, MLAAttentionSpec
+
+    for cls in (FullAttentionSpec, MLAAttentionSpec):
+        # Not a field: a property or a class attribute (the subclass path).
+        if "prefix_cacheable" not in getattr(cls, "__dataclass_fields__", {}) and (
+            inspect.getattr_static(cls, "prefix_cacheable", None) is not None
+        ):
+            _non_prefix_cacheable_type(cls)
 
 
 def host_offload_enabled(cfg) -> bool:
@@ -162,12 +229,21 @@ def gdn_cache_spec(cfg, tp: int | None = None):
     )
 
 
-def native_cache_specs(cfg, tp: int | None = None) -> dict[str, KVCacheSpec]:
+def native_cache_specs(
+    cfg, tp: int | None = None, *, draft_prefix_cacheable: bool | None = None
+) -> dict[str, KVCacheSpec]:
     """Describe model-owned caches before allocating any model weights.
 
     ``tp`` describes another engine's ranks (a PD peer's geometry).
+    ``draft_prefix_cacheable=False`` gives the MTP draft's owners
+    non-prefix-cacheable specs (q38 F2 option (a)); by default only on this
+    engine when it is the F2 producer (pd_prefill_mtp_producer). A decode
+    rebuilding that producer's plan passes it explicitly
+    (pd_staging.producer_geometry).
     """
     tp = cfg.parallel_config.tensor_parallel_size if tp is None else tp
+    if draft_prefix_cacheable is None:
+        draft_prefix_cacheable = not pd_prefill_mtp_producer(cfg)
     from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
     from vllm.v1.kv_cache_interface import MambaSpec
 
@@ -178,10 +254,14 @@ def native_cache_specs(cfg, tp: int | None = None) -> dict[str, KVCacheSpec]:
     main, auxiliary = get_qsa_cache_specs(t, tp, cfg.cache_config.cache_dtype)
     specs: dict[str, KVCacheSpec] = {}
 
-    def add_qsa(prefix):
-        specs[prefix + ".self_attn"] = main
+    def add_qsa(prefix, cacheable=True):
+        wrap = (lambda spec: spec) if cacheable else non_prefix_cacheable
+        specs[prefix + ".self_attn"] = wrap(main)
         specs.update(
-            {prefix + ".self_attn." + role: spec for role, spec in auxiliary.items()}
+            {
+                prefix + ".self_attn." + role: wrap(spec)
+                for role, spec in auxiliary.items()
+            }
         )
 
     for index, layer_type in enumerate(t.layer_types):
@@ -203,7 +283,7 @@ def native_cache_specs(cfg, tp: int | None = None) -> dict[str, KVCacheSpec]:
     # The MTP draft's full-attention QSA layers own ordinary request pages in
     # the same native pool (main KV, compressed keys and raw ring).
     for prefix in mtp_layer_prefixes(cfg):
-        add_qsa(prefix)
+        add_qsa(prefix, cacheable=draft_prefix_cacheable)
     return specs
 
 
@@ -983,3 +1063,6 @@ def validate_mtp_config(cfg):
             )
     if getattr(cfg.cache_config, "mamba_cache_mode", "none") not in ("none", "align"):
         raise ValueError("Qwen4Exp MTP requires mamba_cache_mode 'none' or 'align'")
+
+
+_register_non_prefix_cacheable_types()

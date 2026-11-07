@@ -18,6 +18,7 @@ written shows up as a mismatch.
 """
 
 import math
+import os
 from types import SimpleNamespace as NS
 from unittest.mock import patch
 
@@ -56,6 +57,8 @@ def served_decode_env(monkeypatch):
         "QWEN4_EXP_PD_DRAFT_KV",
         "VLLM_TPU_QSA_MTP_KV_DCP",
         "QWEN4_EXP_PD_ZERO_DRAFT_KV",
+        "QWEN4_EXP_PD_DRAFT_KV_FORCE_GAP",
+        "VLLM_TPU_QSA_COMPRESSED_DCP",
     ):
         monkeypatch.delenv(name, raising=False)
 
@@ -221,14 +224,18 @@ class Decode:
         # q38 F2: the producer ships the draft's caches, so read() also
         # checks them (read_draft), from this decode's own plan.
         self.draft_kv = pd_staging.draft_kv_enabled()
+        # uuid -> the producer's prefix hit Hp (q38 F2 option (a)): it computed
+        # no draft rows below it (_produce stages garbage there).
+        self.hp: dict[int, int] = {}
         self.pools = [np.zeros(NUM_BLOCKS * PAGE, dtype=np.int64) for _ in range(TP)]
         self.landed_rows = 0
         self.serial = 0
 
     # -- the request lifecycle the scheduler drives --
 
-    def admit(self, conv, prompt):
-        """Admit a turn whose producer published ``len(prompt) - 1`` tokens."""
+    def admit(self, conv, prompt, producer_hit=0):
+        """Admit a turn whose producer published ``len(prompt) - 1`` tokens
+        (and, with ``producer_hit``, its prefix hit, as an F2 producer does)."""
         from tests.runner.test_qwen4_exp_offload import _request
 
         self.serial += 1
@@ -247,6 +254,11 @@ class Decode:
             "dst_tp_size": TP,
             "dst_dcp_size": 1,
         }
+        if producer_hit:
+            from vllm_torchtpu.models.vllm.qwen4_exp.pd_staging import PRODUCER_HIT_PARAM
+
+            req.kv_transfer_params[PRODUCER_HIT_PARAM] = producer_hit
+        self.hp[1000 + self.serial] = producer_hit
         self.sched.on_new_request(req)
         if self.conn.supports_divergent_local_hybrid_hits:
             blocks, hit, _, diverged = self.kvm.get_computed_blocks_for_connector(req)
@@ -266,7 +278,8 @@ class Decode:
             delay_cache_blocks=True,
         )
         assert new is not None
-        self.sched.update_state_after_alloc(req, self.kvm.get_blocks(rid), ext)
+        # Through the connector, as vLLM calls it (it carries the producer's hit).
+        self.conn.update_state_after_alloc(req, self.kvm.get_blocks(rid), ext)
         req.num_computed_tokens = hit + ext
         meta = self.sched.reqs_to_load.pop(rid)
         return req, meta, hit, ext
@@ -276,13 +289,20 @@ class Decode:
         n = meta.num_tokens
         skip = int(meta.skip_tokens or 0)
         for rank, staging in enumerate(self.ranks):
-            assert staging.reserve(meta.uuid, n, skip_tokens=skip)
+            assert staging.reserve(
+                meta.uuid, n, skip_tokens=skip,
+                draft_zero_until=int(getattr(meta, "src_cached_tokens", 0) or 0),
+            )
             staging.destination(meta.uuid)  # alignment checks
             stage = self._produce(conv, prompt, n, staging, meta.uuid)
             pages = staging.reservations[meta.uuid]
             _, first = staging.skips[meta.uuid]
+            if self.draft_kv:
+                # The plan the worker runs (it counts the draft rows, draft_stats).
+                staging.plan_repack(meta.uuid, meta.group_block_ids, n)
             main_s, main_d, copy_s, copy_d, gdn_s, gdn_d = staging.indices(
-                pages, meta.group_block_ids, n, skip, first
+                pages, meta.group_block_ids, n, skip, first,
+                draft_zero_until=staging.draft_zero_end(meta.uuid, n),
             )
             pool = self.pools[rank]
             # Shared prefix pages adopted from the cache are never written.
@@ -333,19 +353,26 @@ class Decode:
         stage = np.zeros(staging.pages * sb, dtype=np.int64)
         pages = staging.reservations[uuid]
         _, first = staging.skips[uuid]
+        # F2 option (a): the producer's draft blocks below its hit were never
+        # written (not prefix-cacheable there): they hold unrelated bytes.
+        hp = self.hp.get(uuid, 0)
         for name, owner_pages in pages.items():
             kind = owner_kind(name)
             f = first[staging._src_owner[name]]
+            unwritten = hp if name.startswith("mtp.") else 0
             for i, page in enumerate(owner_pages):
                 base = page * sb
                 if kind == "main":
                     t = (f + i) * sb + np.arange(sb)
                     vals = np.array([main_value(conv, name, x) for x in t])
+                    vals = np.where(t < unwritten, UNWRITTEN, vals)
                     stage[base : base + sb] = np.where(t < n, vals, 0)
                 elif kind == "compressed":
                     pairs = (f + i) * sb // 8 + np.arange(sb // 8)
                     stage[base : base + sb // 8] = [
-                        pair_value(conv, name, p, n) if 8 * p < n else 0 for p in pairs
+                        (UNWRITTEN if 8 * p < unwritten else pair_value(conv, name, p, n))
+                        if 8 * p < n else 0
+                        for p in pairs
                     ]
                 else:  # ring, PLE, GDN: one state page at the extent
                     stage[base : base + PAGE] = [
@@ -362,6 +389,8 @@ class Decode:
         for name, gi in staging._dst_owner.items():
             kind = name.rsplit(".", 1)[-1]
             table = full_tables[gi]
+            if self.draft_kv and name.startswith("mtp."):
+                continue  # read_draft, with option (a)'s zero-filled gap
             if name.endswith(".self_attn"):
                 for t in range(n):
                     if (t // PAGE) % DCP != staging.rank.dcp_rank:
@@ -374,6 +403,8 @@ class Decode:
                 if pool[row] != state_value(conv, name, n, 0):
                     bad.append((name, "ring"))
         for name, (gi, offset) in staging._dst_compressed.items():
+            if self.draft_kv and name.startswith("mtp."):
+                continue
             table = full_tables[gi]
             for p in range(math.ceil(math.ceil(n / 4) / 2)):
                 t = 8 * p
@@ -426,6 +457,17 @@ class Decode:
             )
         return owners
 
+    def draft_gap(self, meta):
+        """[lo, hi): the draft tokens this load must read as zero (q38 F2
+        option (a)), derived here from the load alone: above the decode's
+        local hit, below the producer's hit raised to the forced gap
+        (QWEN4_EXP_PD_DRAFT_KV_FORCE_GAP of the tokens, down to a pair)."""
+        n = meta.num_tokens
+        lo = int(meta.skip_tokens or 0)
+        fraction = float(os.environ.get("QWEN4_EXP_PD_DRAFT_KV_FORCE_GAP") or 0)
+        hi = min(max(self.hp.get(meta.uuid, 0), int(fraction * n) // 8 * 8), n)
+        return (lo, max(lo, hi)) if self.draft_kv else (lo, lo)
+
     def read_draft(self, rank, conv, meta, full_tables):
         """Mismatched draft rows this rank would read (q38 F2): main KV per
         DCP rank at its group's entry size, the packed compressed slot, and
@@ -435,6 +477,7 @@ class Decode:
         staging = self.ranks[rank]
         n = meta.num_tokens
         pool = self.pools[rank]
+        lo, hi = self.draft_gap(meta)
         bad = []
         for name, (gi, offset) in sorted(self.draft_owners().items()):
             table = full_tables[gi]
@@ -446,13 +489,15 @@ class Decode:
                     if split > 1 and (t // PAGE) % split != staging.rank.dcp_rank:
                         continue
                     row = table[t // entry] * PAGE + t % PAGE
-                    if pool[row] != main_value(conv, name, t):
+                    want = 0 if lo <= t < hi else main_value(conv, name, t)
+                    if pool[row] != want:
                         bad.append((name, t))
             elif kind == "compressed":
                 for p in range(math.ceil(math.ceil(n / 4) / 2)):
                     t = 8 * p
                     row = table[t // PAGE] * PAGE + offset + (t % PAGE) // 8
-                    if pool[row] != pair_value(conv, name, p, n):
+                    want = 0 if lo <= t < hi else pair_value(conv, name, p, n)
+                    if pool[row] != want:
                         bad.append((name, p))
             else:
                 assert kind == "ring", name
@@ -460,6 +505,10 @@ class Decode:
                     if pool[table[0] * PAGE + r] != state_value(conv, name, n, r):
                         bad.append((name, "ring", r))
         return bad
+
+
+# What an F2 producer's never-written draft rows hold in this emulation.
+UNWRITTEN = -0x5EED
 
 
 def main_value(conv, owner, t):
@@ -484,8 +533,8 @@ def full_tables(decode, rid):
     return [list(ids) for ids in decode.kvm.get_block_ids(rid)]
 
 
-def serve(decode, conv, prompt, steps=6):
-    req, meta, hit, ext = decode.admit(conv, prompt)
+def serve(decode, conv, prompt, steps=6, producer_hit=0):
+    req, meta, hit, ext = decode.admit(conv, prompt, producer_hit)
     tables = full_tables(decode, req.request_id)
     decode.land(conv, prompt, req, meta)
     return req, meta, hit, ext, tables
@@ -819,7 +868,7 @@ def test_draft_kv_refuses_a_producer_plan_without_draft_owners(monkeypatch):
     monkeypatch.setattr(
         pd_staging,
         "producer_geometry",
-        lambda cfg: (pd_staging.without_speculation(cfg), 1, 1, False),
+        lambda cfg: (pd_staging.without_speculation(cfg), 1, 1, False, True),
     )
     with pytest.raises(ValueError, match="no pages for") as err:
         Decode(decode_config())
@@ -864,3 +913,123 @@ def test_flag_off_producer_plan_has_no_draft_owners():
         assert not [p.layer_name for p in staging.manifest.pools if p.layer_name.startswith("mtp.")]
         assert not [n for n in staging._dst_owner if n.startswith("mtp.")]
         assert not [n for n in staging._dst_compressed if n.startswith("mtp.")]
+
+
+# -- q38 F2 option (a): the producer never caches draft KV ------------------------
+#
+# The producer's draft groups are not prefix-cacheable, so it computes draft rows
+# only from its own prefix hit Hp and publishes Hp
+# (pd_staging.PRODUCER_HIT_PARAM). A decode with local hit Hd keeps its own draft
+# rows in [0, Hd), lands the producer's from max(Hd, Hp), and zero-fills [Hd, Hp)
+# when Hp > Hd. _produce stages UNWRITTEN below Hp; read_draft expects zeros in
+# Decode.draft_gap, which it derives from the load alone.
+
+
+@pytest.mark.usefixtures("engine_patches", "draft_kv")
+@pytest.mark.parametrize("case", ["above", "below"])
+def test_draft_kv_producer_hit_above_the_decode_hit_zero_fills_the_gap(case):
+    """Draft rows in [Hd, Hp) read zero, [Hp, N) the producer's values and
+    [0, Hd) the decode's own cached rows; a producer hit below the decode's
+    zero-fills nothing."""
+    decode = Decode(decode_config())
+    conv = "conv-hp"
+    prompt = tokens(20000, 21)
+    req, meta, hit, _, _ = serve(decode, conv, prompt)
+    assert (hit, meta.src_cached_tokens) == (0, 0)
+    decode.decode(req, steps=4)
+    decode.finish(req)
+    hd = len(prompt) // ENTRY * ENTRY  # the decode's own hit: 18,432
+    prompt = prompt + tokens(3000, 22)
+    n = len(prompt) - 1
+    # A producer hit on its 3200-token page boundary above Hd, or below Hd.
+    hp = n // 3200 * 3200 if case == "above" else hd - ENTRY
+    req, meta, hit, _, tables = serve(decode, conv, prompt, producer_hit=hp)
+    assert hit == meta.skip_tokens == hd
+    assert meta.src_cached_tokens == hp  # carried from the transfer params
+    gap = (hd, hp) if case == "above" else (hd, hd)
+    assert decode.draft_gap(meta) == gap and (case == "below" or hp - hd == 3968)
+    assert [decode.read_draft(r, conv, meta, tables) for r in range(TP)] == [[]] * TP
+    assert logical_mismatches(decode, conv, prompt, meta, tables) == [[]] * TP
+    stats = decode.ranks[0].draft_stats()
+    assert stats["loads"] == 2 and stats["hp_minus_hd"] == hp - hd
+    assert (stats["gap_loads"], stats["gap_tokens"]) == ((1, hp - hd) if case == "above" else (0, 0))
+    assert (stats["rows_zeroed"] > 0) == (case == "above") and stats["rows_landed"] > 0
+
+
+@pytest.mark.usefixtures("engine_patches", "draft_kv")
+def test_draft_kv_forced_gap_zero_fills_exactly_the_requested_span(monkeypatch):
+    """QWEN4_EXP_PD_DRAFT_KV_FORCE_GAP=0.3 with no producer hit: the draft rows
+    of the first 5,992 of 19,999 tokens (int(0.3 n) down to a pair) read zero,
+    the rest the producer's values."""
+    monkeypatch.setenv("QWEN4_EXP_PD_DRAFT_KV_FORCE_GAP", "0.3")
+    decode = Decode(decode_config())
+    conv, prompt = "conv-gap", tokens(20000, 23)
+    req, meta, hit, _, tables = serve(decode, conv, prompt)
+    assert (hit, meta.num_tokens) == (0, 19999)
+    assert decode.draft_gap(meta) == (0, 5992)
+    assert [decode.read_draft(r, conv, meta, tables) for r in range(TP)] == [[]] * TP
+    assert logical_mismatches(decode, conv, prompt, meta, tables) == [[]] * TP
+    stats = decode.ranks[0].draft_stats()
+    assert (stats["gap_loads"], stats["gap_tokens"]) == (1, 5992) and stats["rows_zeroed"] > 0
+
+
+@pytest.mark.usefixtures("engine_patches")
+def test_flag_off_ignores_a_published_producer_hit():
+    """Without QWEN4_EXP_PD_DRAFT_KV a published hit changes nothing: it is not
+    carried, nothing is zero-filled, every target row reads as before."""
+    decode = Decode(decode_config())
+    conv, prompt = "conv-off", tokens(20000, 24)
+    req, meta, hit, _, tables = serve(decode, conv, prompt, producer_hit=12800)
+    assert meta.src_cached_tokens == 0
+    assert decode.ranks[0].draft_stats() == {}
+    assert logical_mismatches(decode, conv, prompt, meta, tables) == [[]] * TP
+
+
+@pytest.mark.usefixtures("engine_patches", "draft_kv")
+def test_draft_kv_warns_when_the_decode_prefix_cache_is_off(monkeypatch):
+    from vllm_torchtpu.models.vllm.qwen4_exp import pd_staging
+
+    seen = []
+    monkeypatch.setattr(
+        pd_staging,
+        "logger",
+        NS(warning=lambda msg, *a: seen.append(msg % a if a else msg), info=lambda *a, **k: None),
+    )
+    want = "zero-fills draft KV on every producer prefix hit when the decode prefix cache is off"
+    Decode(decode_config(prefix_caching=False))
+    assert sum(want in m for m in seen) == TP  # one per rank; a warning, not a refusal
+    seen.clear()
+    Decode(decode_config())
+    assert not any(want in m for m in seen)
+
+
+@pytest.mark.usefixtures("draft_kv")
+def test_draft_kv_refuses_compressed_dcp(monkeypatch):
+    """VLLM_TPU_QSA_COMPRESSED_DCP splits compressed keys over DCP ranks; the
+    staging repack lands them unsplit."""
+    import torch
+
+    from vllm_torchtpu.models.vllm.qwen4_exp import pd_staging
+    from vllm_torchtpu.models.vllm.qwen4_exp.pd import build_transfer_groups
+
+    monkeypatch.setenv("VLLM_TPU_QSA_COMPRESSED_DCP", "1")
+    cfg = decode_config()
+    layout, native, _ = scheduler_plan(cfg)
+    assert any(name.endswith(".compressed_k") for name in layout.main_dcp_owners)
+    with (
+        patch.object(pd_staging, "make_repack", lambda **kw: None),
+        pytest.raises(ValueError, match="VLLM_TPU_QSA_COMPRESSED_DCP=1"),
+    ):
+        pd_staging.StagedConsumer(
+            cfg,
+            layout,
+            build_transfer_groups(native.kv_cache_groups),
+            torch.zeros(1, dtype=torch.float8_e4m3fn),
+            pd_staging.RankSlice(
+                tp_size=TP,
+                tp_rank=0,
+                num_kv_heads=int(cfg.model_config.hf_text_config.num_key_value_heads),
+                main_dcp=DCP,
+            ),
+            staging_bytes=2 * layout.page_bytes * 8,
+        )

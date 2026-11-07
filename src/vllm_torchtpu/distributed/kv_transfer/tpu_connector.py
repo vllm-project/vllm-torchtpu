@@ -465,6 +465,11 @@ class _Stage3LoadMeta:
     report_completion: bool = False
     # The scheduler rejected this load after allocation.
     fail_only: bool = False
+    # Tokens the producer served from its own prefix cache: a Qwen4Exp F2
+    # producer publishes it (models/vllm/qwen4_exp/pd_connector.py), and its
+    # staged decode zero-fills the MTP draft rows the producer never computed.
+    # 0 when absent. The transfer itself ignores it.
+    src_cached_tokens: int = 0
 
 
 @dataclass

@@ -28,6 +28,7 @@ byte first (``kernels/typed_ldst.py``, ``megakernel_runtime/qwen38_gdn_state``).
 import copy
 import dataclasses
 import math
+import time
 from collections.abc import Sequence
 
 import numpy as np
@@ -59,6 +60,15 @@ except ImportError:  # loaded by path: no package
     pd_shared_compressed = _ilu.module_from_spec(_spec)
     _sys.modules[_spec.name] = pd_shared_compressed  # its dataclasses look it up
     _spec.loader.exec_module(pd_shared_compressed)
+
+try:
+    from vllm_torchtpu.logger import init_logger
+
+    logger = init_logger(__name__)
+except ImportError:  # loaded by path without the package
+    import logging
+
+    logger = logging.getLogger(__name__)
 
 ROW_SUBLANES = 4
 ROW_LANES = 256
@@ -146,6 +156,35 @@ def draft_kv_enabled() -> bool:
     return bool(envs.QWEN4_EXP_PD_DRAFT_KV)
 
 
+def force_gap_fraction() -> float:
+    """QWEN4_EXP_PD_DRAFT_KV_FORCE_GAP (q38 F2-3's forced-gap arm), a fraction
+    in [0, 1); read directly when this module is loaded by path."""
+    try:
+        from vllm_torchtpu import envs
+
+        value = float(envs.QWEN4_EXP_PD_DRAFT_KV_FORCE_GAP)
+    except ImportError:
+        import os
+
+        value = float(os.environ.get("QWEN4_EXP_PD_DRAFT_KV_FORCE_GAP", "") or 0.0)
+    if not 0.0 <= value < 1.0:
+        raise ValueError(f"QWEN4_EXP_PD_DRAFT_KV_FORCE_GAP must be in [0, 1), got {value}")
+    return value
+
+
+# The producer's prefix hit in its kv_transfer_params (q38 F2 option (a)):
+# draft rows below it were never computed there (its draft KV is not
+# prefix-cacheable), so a decode with a shorter local hit zero-fills them.
+PRODUCER_HIT_PARAM = "qwen_producer_hit_tokens"
+
+
+def published_hit_tokens(params) -> int:
+    """The producer's published prefix hit, in tokens; 0 when absent or
+    invalid (an older producer, or no hit)."""
+    value = params.get(PRODUCER_HIT_PARAM) if isinstance(params, dict) else None
+    return value if type(value) is int and value > 0 else 0
+
+
 # Draft tokens of the producer's prefill-only MTP under QWEN4_EXP_PD_DRAFT_KV
 # (config.pd_prefill_mtp_producer admits exactly this depth): its GDN and PLE
 # state tables carry one speculative block, whatever the decode's K.
@@ -154,8 +193,8 @@ PRODUCER_DRAFT_TOKENS = 1
 
 def producer_geometry(cfg):
     """The producer's page plan as this staged decode must rebuild it:
-    ``(cfg_for_layout, tp, main_dcp, pack_compressed)``, the arguments of
-    ``pool_layout.pooled_cache_specs``.
+    ``(cfg_for_layout, tp, main_dcp, pack_compressed, draft_prefix_cacheable)``,
+    the arguments of ``pool_layout.pooled_cache_specs``.
 
     The producer is assumed to be TP1 pipeline stages: ``tp=1``, no main-KV
     DCP (``main_dcp=1``) and unpacked compressed keys
@@ -173,10 +212,11 @@ def producer_geometry(cfg):
     allocates the draft's owners like any QSA layer's: the layout is built
     from a copy of ``cfg`` whose speculative config is a shallow copy at
     ``PRODUCER_DRAFT_TOKENS``. This decode must then run the MTP draft that
-    lands those pages.
+    lands those pages. The producer never prefix-caches them (option (a),
+    ``draft_prefix_cacheable=False``), as its own native_cache_specs does.
     """
     if not draft_kv_enabled():
-        return without_speculation(cfg), 1, 1, False
+        return without_speculation(cfg), 1, 1, False, True
     spec = getattr(cfg, "speculative_config", None)
     if spec is None or getattr(spec, "method", None) != "mtp":
         raise ValueError(
@@ -188,7 +228,9 @@ def producer_geometry(cfg):
     object.__setattr__(producer_spec, "num_speculative_tokens", PRODUCER_DRAFT_TOKENS)
     out = copy.copy(cfg)
     object.__setattr__(out, "speculative_config", producer_spec)
-    return out, 1, 1, False
+    # Option (a): the producer's draft owners are not prefix-cacheable
+    # (config.native_cache_specs on the producer, pd_prefill_mtp_producer).
+    return out, 1, 1, False, False
 
 
 def check_draft_kv(missing, dst_owners, main_dcp: int, main_dcp_owners) -> None:
@@ -212,6 +254,11 @@ def check_draft_kv(missing, dst_owners, main_dcp: int, main_dcp_owners) -> None:
             "QWEN4_EXP_PD_ZERO_DRAFT_KV=1 would zero the draft KV that "
             "QWEN4_EXP_PD_DRAFT_KV=1 lands; unset one of them"
         )
+    if any(name.endswith(".compressed_k") for name in main_dcp_owners):
+        raise ValueError(
+            "QWEN4_EXP_PD_DRAFT_KV=1 refuses VLLM_TPU_QSA_COMPRESSED_DCP=1: the "
+            "staging repack lands compressed keys unsplit"
+        )
     if main_dcp > 1:
         split = set(main_dcp_owners)
         unsplit = sorted(
@@ -226,6 +273,57 @@ def check_draft_kv(missing, dst_owners, main_dcp: int, main_dcp_owners) -> None:
                 f"VLLM_TPU_QSA_MTP_KV_DCP=1: the repack lands the draft's main KV "
                 f"{unsplit} as one more DCP-split owner"
             )
+
+
+def draft_group_problems(groups) -> list[str]:
+    """q38 F2 option (a): the KV-cache groups of the producer's plan that
+    break "the draft's groups are non-prefix-cacheable and hold draft owners
+    only" (so the producer's hit Hp comes from the target groups alone).
+
+    Both legs build the plan with the same helper (config.non_prefix_cacheable),
+    so a break leaves them matched; it costs option (a)'s intent: the
+    producer caches draft KV (its IDs), or a target group stops caching.
+    Pending the CPU probe of how the pinned vLLM merges group specs."""
+    problems = []
+    for index, group in enumerate(groups):
+        names = list(group.layer_names)
+        draft = [n for n in names if n.startswith("mtp.")]
+        if draft and (
+            len(draft) != len(names) or getattr(group.kv_cache_spec, "prefix_cacheable", True)
+        ):
+            problems.append(f"group {index} {names}")
+    return problems
+
+
+def warn_draft_groups(groups, leg: str) -> None:
+    problems = draft_group_problems(groups)
+    if problems:
+        logger.warning(
+            "F2 option (a) on the %s: the producer plan's MTP draft groups are not "
+            "non-prefix-cacheable draft-only groups (%s); the producer would cache "
+            "draft KV or stop caching a target group (config.non_prefix_cacheable, "
+            "pending the vLLM probe)",
+            leg,
+            "; ".join(problems),
+        )
+
+
+def main_tokens_np(num_tokens, dst_block, rank, start=0) -> np.ndarray:
+    """The tokens ``main_rows_np`` / ``main_dst_np`` / ``pd_route.main_src_rows``
+    list for ``rank``, in their order."""
+    t = np.arange(start, num_tokens, dtype=np.int64)
+    d = rank.main_dcp
+    if d > 1:
+        t = t[(t // dst_block) % d == rank.dcp_rank]
+    return t
+
+
+def pair_tokens_np(num_tokens, ratio, start=0) -> np.ndarray:
+    """The first token of each compressed pair ``compressed_rows_np`` /
+    ``compressed_dst_np`` / ``pd_route.compressed_src_rows`` list, in order."""
+    span = 2 * ratio
+    pairs = math.ceil(math.ceil(num_tokens / ratio) / 2)
+    return np.arange(start // span, pairs, dtype=np.int64) * span
 
 
 def owner_kind(name: str) -> str:
@@ -1077,6 +1175,47 @@ def gdn_geometry(cfg, tp: int, layout_token_bytes: int) -> GdnGeometry:
     )
 
 
+class _DraftGap:
+    """One load's MTP draft rows of tokens below ``end`` (q38 F2 option (a)):
+    the producer never computed them. ``split`` keeps them out of a draft
+    owner's landing rows and collects their destinations, ``emit`` appends
+    those as zero-fill rows (from staging row 0, the never-reserved null
+    page) to the plan's copy rows. A destination is then written once in the
+    plan, never landed and zeroed both. ``end`` 0: nothing changes."""
+
+    def __init__(self, end: int):
+        self.end = int(end)
+        self.zero_rows: list[np.ndarray] = []
+        self.landed = 0
+        self.zeroed = 0
+
+    def split(self, name, s, d, tokens):
+        """``s``, ``d``: an owner's landing rows; ``tokens()``: their tokens,
+        in the same order (main_tokens_np / pair_tokens_np)."""
+        if not name.startswith("mtp."):
+            return s, d
+        if self.end <= 0:
+            self.landed += len(d)
+            return s, d
+        t = tokens()
+        if len(t) != len(d):
+            raise AssertionError(f"draft gap of {name}: {len(t)} tokens for {len(d)} rows")
+        below = t < self.end
+        self.zero_rows.append(d[below])
+        self.zeroed += int(below.sum())
+        self.landed += int(len(d) - below.sum())
+        return s[~below], d[~below]
+
+    def count(self, name, rows: int) -> None:
+        if name.startswith("mtp."):
+            self.landed += int(rows)
+
+    def emit(self, copy_s, copy_d) -> None:
+        for d in self.zero_rows:
+            copy_s.append(np.zeros(len(d), dtype=np.int64))
+            copy_d.append(d)
+
+
 class StagedConsumer:
     """One TP-T decode rank's staging carrier for TP1 pipeline-producer pages."""
 
@@ -1088,6 +1227,9 @@ class StagedConsumer:
     # __init__ / enable_shared); the same class defaults, for the same reason.
     shared = None
     landing = None
+    # QWEN4_EXP_PD_DRAFT_KV (q38 F2), set by __init__; off for a consumer
+    # assembled without it.
+    draft_kv = False
 
     def __init__(self, cfg, decode_layout, decode_groups, pool, rank: RankSlice, staging_bytes: int):
         from vllm.v1.core.kv_cache_utils import get_kv_cache_groups
@@ -1126,7 +1268,9 @@ class StagedConsumer:
         from .pool_layout import pcp_interleave
 
         draft_kv = draft_kv_enabled()
-        layout_cfg, src_tp, src_dcp, src_pack = producer_geometry(cfg)
+        # Option (a)'s range zero-fill (draft_zero_end) runs only with it on.
+        self.draft_kv = draft_kv
+        layout_cfg, src_tp, src_dcp, src_pack, src_draft_cacheable = producer_geometry(cfg)
         self.src_pcp = int(os.environ.get("QWEN4_EXP_PD_PRODUCER_PCP", "1"))
         # QWEN4_EXP_PD_PRODUCER_MERGED=1: the producer runs
         # QWEN4_EXP_MERGE_COMPRESSED_K=1, so its keys ride the main-KV IDs in
@@ -1144,8 +1288,7 @@ class StagedConsumer:
                 "QWEN4_EXP_PD_DRAFT_KV=1 supports a plain TP1 pipeline producer only "
                 "(not QWEN4_EXP_PD_PRODUCER_PCP > 1 or QWEN4_EXP_PD_PRODUCER_MERGED=1)"
             )
-        self.src_layout, src_specs = pooled_cache_specs(
-            layout_cfg,
+        layout_kwargs = dict(
             tp=src_tp,
             main_dcp=self.src_pcp if self.src_pcp > 1 else src_dcp,
             pack_compressed=src_pack,
@@ -1153,13 +1296,25 @@ class StagedConsumer:
             split_compressed=self.src_split_keys,
             main_interleave=pcp_interleave() if self.src_pcp > 1 else None,
         )
+        if not src_draft_cacheable:
+            layout_kwargs["draft_prefix_cacheable"] = False
+        self.src_layout, src_specs = pooled_cache_specs(layout_cfg, **layout_kwargs)
         self._src_split = (
             set(self.src_layout.main_dcp_owners) if self.src_pcp > 1 else set()
         )
         from .config import ensure_kv_group_size_rule
 
         ensure_kv_group_size_rule()
-        self.src_groups = build_transfer_groups(get_kv_cache_groups(cfg, dict(src_specs)))
+        src_kv_groups = get_kv_cache_groups(cfg, dict(src_specs))
+        if draft_kv:
+            warn_draft_groups(src_kv_groups, "decode")
+            if not cfg.cache_config.enable_prefix_caching:
+                logger.warning(
+                    "F2 option (a) zero-fills draft KV on every producer prefix hit "
+                    "when the decode prefix cache is off (QWEN4_EXP_PD_DRAFT_KV=1 "
+                    "without --enable-prefix-caching on this decode)"
+                )
+        self.src_groups = build_transfer_groups(src_kv_groups)
         self.src_block, self.dst_block = self.src_layout.block_size, decode_layout.block_size
         self.ratio = int(cfg.model_config.hf_text_config.indexer_compress_ratio)
         # QWEN4_EXP_PD_ROUTED_DST: the producer routes each rank only its
@@ -1386,6 +1541,7 @@ class StagedConsumer:
         *,
         skip_tokens: int = 0,
         reduced_free=None,
+        draft_zero_until: int = 0,
     ) -> bool:
         """Staging pages for one load. A prefix-aware load (``skip_tokens``:
         the decode-local prefix) stages each token group from the first source
@@ -1395,7 +1551,11 @@ class StagedConsumer:
         already the MIN over the TP group (``stage3_admission.prepare``); used
         instead of this load's own all-reduce, and its allocated pages are
         zeroed in it as well, so the next load sees what its own all-reduce
-        would have returned."""
+        would have returned.
+
+        ``draft_zero_until`` (q38 F2 option (a)): the producer's published
+        prefix hit Hp; draft rows below it were never computed there, and the
+        repack zero-fills those above the local prefix (``draft_zero_end``)."""
         if uuid in self.reservations:
             return True
         first, owners, counts = self._owner_counts(num_tokens, skip_tokens)
@@ -1425,6 +1585,8 @@ class StagedConsumer:
         # Per-load token counts (shared loads' clips); created on first use so
         # a consumer assembled without __init__ (D-MK's admission tests) works.
         self.__dict__.setdefault("tokens", {})[uuid] = int(num_tokens)
+        if draft_zero_until > 0:
+            self.__dict__.setdefault("draft_zero", {})[uuid] = int(draft_zero_until)
         return True
 
     def destination(self, uuid: int) -> tuple[list[str], list[int], list[int]]:
@@ -1481,6 +1643,7 @@ class StagedConsumer:
         for those reads."""
         self.skips.pop(uuid, None)
         getattr(self, "tokens", {}).pop(uuid, None)
+        self.__dict__.get("draft_zero", {}).pop(uuid, None)
         pages = self.reservations.pop(uuid, None)
         if pages is not None:
             held = [int(p) for owner_pages in pages.values() for p in owner_pages]
@@ -1514,18 +1677,77 @@ class StagedConsumer:
     def quarantined_pages(self) -> int:
         return sum(len(entry[1]) for entry in self.__dict__.get("quarantine", ()))
 
+    # --- q38 F2 option (a): draft rows the producer never computed ---
+
+    def draft_zero_end(self, uuid: int, num_tokens: int) -> int:
+        """End of the MTP draft rows a load zero-fills, or 0 (flag off).
+
+        The producer prefix-caches no draft KV, so it computed draft rows only
+        from its prefix hit Hp on (``reserve(draft_zero_until=Hp)``). Above
+        this decode's local prefix (``skip_tokens``, whose draft rows are its
+        own) the repack zero-fills [skip, end) instead of landing the
+        producer's unwritten rows. QWEN4_EXP_PD_DRAFT_KV_FORCE_GAP raises the
+        end to that fraction of the load's tokens, down to a compressed pair
+        (q38 F2-3's forced-gap arm)."""
+        if not getattr(self, "draft_kv", False):
+            return 0
+        hit = self.__dict__.get("draft_zero", {}).get(uuid, 0)
+        span = 2 * self.ratio
+        forced = int(force_gap_fraction() * num_tokens) // span * span
+        return min(max(hit, forced), int(num_tokens))
+
+    def draft_stats(self) -> dict[str, int]:
+        """Cumulative option (a) counters of this rank (F2-2 / F2-3 engagement):
+        loads, loads with a zero-filled gap, gap tokens, sum of Hp - Hd, and
+        the draft rows landed and zeroed by the repack."""
+        return dict(self.__dict__.get("draft_counters", {}))
+
+    def _count_draft(self, uuid: int, skip: int, zero_end: int) -> None:
+        if not getattr(self, "draft_kv", False):
+            return
+        stats = self.__dict__.setdefault(
+            "draft_counters",
+            dict(loads=0, gap_loads=0, gap_tokens=0, hp_minus_hd=0, rows_landed=0, rows_zeroed=0),
+        )
+        hit = self.__dict__.get("draft_zero", {}).get(uuid, 0)
+        landed, zeroed = getattr(self, "last_draft_rows", (0, 0))
+        stats["loads"] += 1
+        stats["hp_minus_hd"] += hit - skip
+        if zero_end > skip:
+            stats["gap_loads"] += 1
+            stats["gap_tokens"] += zero_end - skip
+        stats["rows_landed"] += landed
+        stats["rows_zeroed"] += zeroed
+        now = time.monotonic()
+        if self.rank.tp_rank == 0 and now - self.__dict__.get("_draft_logged", -1e9) >= 60.0:
+            self._draft_logged = now
+            logger.info(
+                "Qwen PD F2 draft KV rank0: last load Hp=%d Hd=%d zero-filled [%d, %d) "
+                "draft rows landed %d zeroed %d | cumulative %s",
+                hit, skip, skip, max(skip, zero_end), landed, zeroed, stats,
+            )
+
     # --- the repack ---
 
-    def indices(self, src_pages, dst_tables, num_tokens, skip_tokens=0, first=None):
+    def indices(
+        self, src_pages, dst_tables, num_tokens, skip_tokens=0, first=None, draft_zero_until=0
+    ):
         """Row indices of the repack. With ``skip_tokens`` only tokens from
         there on are written (the destination's earlier rows are shared prefix
         pages); ``src_pages[owner]`` are that cache owner's staging pages and
-        ``first[g]`` the source page group ``g``'s staging starts at."""
+        ``first[g]`` the source page group ``g``'s staging starts at.
+
+        ``draft_zero_until`` (q38 F2 option (a), ``draft_zero_end``): the MTP
+        draft's main-KV rows and compressed pairs of tokens in
+        [skip_tokens, draft_zero_until) are zero-filled instead of landed."""
         if self.route is not None:
-            return self._routed_indices(src_pages, dst_tables, num_tokens, skip_tokens)
+            return self._routed_indices(
+                src_pages, dst_tables, num_tokens, skip_tokens, draft_zero_until
+            )
         first = first or [0] * len(self.src_groups)
         main_s, main_d, copy_s, copy_d = [], [], [], []
         gdn_s, gdn_d = [], []
+        gap = _DraftGap(draft_zero_until if draft_zero_until > skip_tokens else 0)
         for name, (gi, offset) in self._dst_compressed.items():
             if self.src_split_keys:
                 # Keys of token t come from producer rank (t // B) % P, in that
@@ -1549,6 +1771,7 @@ class StagedConsumer:
                 src_first=first[self._src_owner[name]], dst_offset=offset,
                 src_page_rows=self.src_block if merged else None,
             )
+            s, d = gap.split(name, s, d, lambda: pair_tokens_np(num_tokens, self.ratio, skip_tokens))
             copy_s.append(s)
             copy_d.append(d)
         for name, gi in self._dst_owner.items():
@@ -1570,6 +1793,10 @@ class StagedConsumer:
                 s, d = main_rows_np(num_tokens, src, self.src_block, dst, self.dst_block,
                                     self.rank, start=skip_tokens, src_first=src_first,
                                     src_pcp=pcp)
+                s, d = gap.split(
+                    name, s, d,
+                    lambda: main_tokens_np(num_tokens, self.dst_block, self.rank, skip_tokens),
+                )
                 main_s.append(s)
                 main_d.append(d)
             elif kind in ("ring", "ple"):
@@ -1578,9 +1805,12 @@ class StagedConsumer:
                                         min(self.src_block, self.dst_block))
                 copy_s.append(np.asarray(s, dtype=np.int64))
                 copy_d.append(np.asarray(d, dtype=np.int64))
+                gap.count(name, len(d))
         for name in self._gdn_names:
             gdn_s.append(src_pages[name][0])
             gdn_d.append(dst_tables[self._dst_owner[name]][self._state_entry])
+        gap.emit(copy_s, copy_d)
+        self.last_draft_rows = (gap.landed, gap.zeroed)
         for name, (gi, offset) in self._zero_draft.items():
             dst = dst_tables[gi]
             kind = owner_kind(name)
@@ -1608,38 +1838,57 @@ class StagedConsumer:
             np.asarray(gdn_s, dtype=np.int64), np.asarray(gdn_d, dtype=np.int64),
         )
 
-    def _routed_indices(self, src_pages, dst_tables, num_tokens, skip_tokens):
+    def _routed_indices(self, src_pages, dst_tables, num_tokens, skip_tokens, draft_zero_until=0):
         """``indices`` over routed compact staging: same destination rows in
         the same order as the broadcast layout, read from compact rows."""
         g, rank = self.route, self.rank
         main_s, main_d, copy_s, copy_d = [], [], [], []
         gdn_s, gdn_d = [], []
+        gap = _DraftGap(draft_zero_until if draft_zero_until > skip_tokens else 0)
+
+        def pairs():
+            return pair_tokens_np(num_tokens, self.ratio, skip_tokens)
+
         # A shared load's compressed keys are written by the landing gather
-        # (shared_passes), not by the repack.
-        compressed = {} if self._shared_load(num_tokens) else self._dst_compressed
-        for name, (gi, offset) in compressed.items():
-            copy_s.append(pd_route.compressed_src_rows(num_tokens, skip_tokens, src_pages[name], g))
-            copy_d.append(compressed_dst_np(
+        # (shared_passes), not by the repack. The gather runs first, so a
+        # draft gap's zero rows (from the repack) overwrite what it wrote.
+        shared = self._shared_load(num_tokens)
+        for name, (gi, offset) in self._dst_compressed.items():
+            d = compressed_dst_np(
                 num_tokens, self.ratio, dst_tables[gi], self.dst_block, skip_tokens, offset
-            ))
+            )
+            if shared:
+                gap.split(name, d, d, pairs)
+                continue
+            s = pd_route.compressed_src_rows(num_tokens, skip_tokens, src_pages[name], g)
+            s, d = gap.split(name, s, d, pairs)
+            copy_s.append(s)
+            copy_d.append(d)
         for name, gi in self._dst_owner.items():
             kind = owner_kind(name)
             if kind == "compressed":
                 continue
             dst = dst_tables[gi]
             if kind == "main":
-                main_s.append(
-                    pd_route.main_src_rows(num_tokens, skip_tokens, rank.tp_rank, src_pages[name], g)
+                s, d = gap.split(
+                    name,
+                    pd_route.main_src_rows(num_tokens, skip_tokens, rank.tp_rank, src_pages[name], g),
+                    main_dst_np(num_tokens, dst, self.dst_block, rank, skip_tokens),
+                    lambda: main_tokens_np(num_tokens, self.dst_block, rank, skip_tokens),
                 )
-                main_d.append(main_dst_np(num_tokens, dst, self.dst_block, rank, skip_tokens))
+                main_s.append(s)
+                main_d.append(d)
             elif kind in ("ring", "ple"):
                 entry = dst[self._state_entry] if kind == "ple" else dst[0]
                 copy_s.append(pd_route.prefix_src_rows(src_pages[name], g))
                 copy_d.append(entry * self.dst_block + np.arange(g.prefix_rows, dtype=np.int64))
+                gap.count(name, g.prefix_rows)
         n_gdn = g.gdn_rows // g.stage_rows
         for name in self._gdn_names:
             gdn_s.append(list(src_pages[name][:n_gdn]))
             gdn_d.append(dst_tables[self._dst_owner[name]][self._state_entry])
+        gap.emit(copy_s, copy_d)
+        self.last_draft_rows = (gap.landed, gap.zeroed)
 
         def cat(parts):
             parts = [align_rows(p) for p in parts if len(p)]
@@ -1699,7 +1948,9 @@ class StagedConsumer:
         (and before any collective)."""
         pages = self.reservations[uuid]
         skip, first = self.skips.get(uuid, (0, None))
-        idx = self.indices(pages, dst_tables, num_tokens, skip, first)
+        zero_end = self.draft_zero_end(uuid, num_tokens)
+        idx = self.indices(pages, dst_tables, num_tokens, skip, first, draft_zero_until=zero_end)
+        self._count_draft(uuid, skip, zero_end)
         passes = (
             self.shared_passes(pages, dst_tables, num_tokens, skip)
             if getattr(self, "route", None) is not None

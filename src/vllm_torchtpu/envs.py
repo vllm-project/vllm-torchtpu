@@ -68,6 +68,7 @@ if TYPE_CHECKING:
     QWEN4_EXP_PD_STAGING_QUARANTINE_STEPS: int = 3
     QWEN4_EXP_PD_STAGING_LEASES: int = 0
     QWEN4_EXP_PD_DRAFT_KV: bool = False
+    QWEN4_EXP_PD_DRAFT_KV_FORCE_GAP: float = 0.0
     QWEN4_EXP_PD_ROUTED_DST: str = ""
     QWEN4_EXP_PD_SYNC_REPACK: bool = False
     QWEN4_EXP_PD_SYNC_REPACK_AB_S: int = 0
@@ -1177,6 +1178,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Part of the PD identity, so a one-sided flag fails the handshake.
     # Host-only (admission and the staging plan): in the compile-key ignore set.
     "QWEN4_EXP_PD_DRAFT_KV": env_bool("QWEN4_EXP_PD_DRAFT_KV"),
+    # With QWEN4_EXP_PD_DRAFT_KV on a staged decode (q38 F2-3's forced-gap
+    # arm): also zero-fill the MTP draft's rows of each load's first
+    # <fraction> of tokens (down to a compressed pair), through the path that
+    # zero-fills the rows the producer never computed (above the decode's
+    # local hit, below the producer's). In [0, 1); 0 is off. Host-only.
+    "QWEN4_EXP_PD_DRAFT_KV_FORCE_GAP": env_float("QWEN4_EXP_PD_DRAFT_KV_FORCE_GAP", 0.0),
     # "<decode tp>,<decode dcp>,<decode block>" on BOTH legs of a TP1 pipeline
     # producer -> staged TP>1 Qwen4Exp decode: the producer routes each decode
     # rank only its slice (main-KV DCP runs, its GDN heads; compressed keys,

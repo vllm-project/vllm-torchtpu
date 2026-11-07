@@ -263,6 +263,9 @@ _TPU_COMPILE_ENV_IGNORED = {
     # decode lands it (q38 F2): admission and host-side staging indices only;
     # the producer's draft itself is keyed by its speculative config.
     "QWEN4_EXP_PD_DRAFT_KV",
+    # How much of each load's draft KV a staged decode zero-fills (q38 F2-3's
+    # forced-gap arm): host-side repack indices only.
+    "QWEN4_EXP_PD_DRAFT_KV_FORCE_GAP",
     # Where a staged decode's compressed keys land (once per host, then a
     # landing all-gather): adds shape-keyed landing programs, changes none.
     "QWEN4_EXP_PD_SHARED_COMPRESSED",

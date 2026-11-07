@@ -419,8 +419,8 @@ def _decode_cfg(k=3, method="mtp"):
 def test_producer_geometry_without_the_flag_is_the_tp1_plan_without_the_draft(monkeypatch):
     monkeypatch.delenv("QWEN4_EXP_PD_DRAFT_KV", raising=False)
     cfg = _decode_cfg(3)
-    layout_cfg, tp, dcp, pack = st.producer_geometry(cfg)
-    assert (tp, dcp, pack) == (1, 1, False)
+    layout_cfg, tp, dcp, pack, draft_cacheable = st.producer_geometry(cfg)
+    assert (tp, dcp, pack, draft_cacheable) == (1, 1, False, True)
     assert layout_cfg.speculative_config is None and layout_cfg.other == 3
     assert cfg.speculative_config.num_speculative_tokens == 3
 
@@ -428,8 +428,9 @@ def test_producer_geometry_without_the_flag_is_the_tp1_plan_without_the_draft(mo
 def test_producer_geometry_with_the_flag_is_the_k1_mtp_producer(monkeypatch):
     monkeypatch.setenv("QWEN4_EXP_PD_DRAFT_KV", "1")
     cfg = _decode_cfg(3)
-    layout_cfg, tp, dcp, pack = st.producer_geometry(cfg)
-    assert (tp, dcp, pack) == (1, 1, False)
+    layout_cfg, tp, dcp, pack, draft_cacheable = st.producer_geometry(cfg)
+    # Option (a): the producer's draft owners are not prefix-cacheable.
+    assert (tp, dcp, pack, draft_cacheable) == (1, 1, False, False)
     spec = layout_cfg.speculative_config
     assert (spec.method, spec.num_speculative_tokens) == ("mtp", 1)
     assert spec.draft_tensor_parallel_size is None and layout_cfg.other == 3
@@ -473,3 +474,193 @@ def test_check_draft_kv_refuses_an_unsplit_draft_on_a_dcp_decode(monkeypatch):
     with pytest.raises(ValueError, match="needs VLLM_TPU_QSA_MTP_KV_DCP=1") as err:
         st.check_draft_kv(set(), _DST, 4, (_TARGET,))
     assert _DRAFT in str(err.value)
+
+
+# --- q38 F2 option (a): the producer never caches draft KV --------------------
+# The producer computes draft rows only from its prefix hit Hp; a decode with a
+# shorter local hit Hd zero-fills the draft rows in [Hd, Hp) (and a forced gap,
+# QWEN4_EXP_PD_DRAFT_KV_FORCE_GAP) instead of landing unwritten ones.
+
+
+def test_check_draft_kv_refuses_compressed_dcp(monkeypatch):
+    monkeypatch.delenv("QWEN4_EXP_PD_ZERO_DRAFT_KV", raising=False)
+    owners = (_TARGET, _DRAFT, _TARGET + ".compressed_k", _DRAFT + ".compressed_k")
+    with pytest.raises(ValueError, match="VLLM_TPU_QSA_COMPRESSED_DCP=1"):
+        st.check_draft_kv(set(), _DST, 4, owners)
+
+
+@pytest.mark.parametrize(
+    "raw,want",
+    [(None, 0.0), ("", 0.0), ("0", 0.0), ("0.25", 0.25), ("1", None), ("-0.1", None)],
+    ids=["unset", "empty", "zero", "quarter", "one", "negative"],
+)
+def test_force_gap_fraction_reads_a_fraction_below_one(monkeypatch, raw, want):
+    if raw is None:
+        monkeypatch.delenv("QWEN4_EXP_PD_DRAFT_KV_FORCE_GAP", raising=False)
+    else:
+        monkeypatch.setenv("QWEN4_EXP_PD_DRAFT_KV_FORCE_GAP", raw)
+    if want is None:
+        with pytest.raises(ValueError, match="QWEN4_EXP_PD_DRAFT_KV_FORCE_GAP"):
+            st.force_gap_fraction()
+    else:
+        assert st.force_gap_fraction() == want
+
+
+@pytest.mark.parametrize(
+    "params,want",
+    [
+        ({st.PRODUCER_HIT_PARAM: 6400}, 6400),
+        ({}, 0),
+        (None, 0),
+        ({st.PRODUCER_HIT_PARAM: -5}, 0),
+        ({st.PRODUCER_HIT_PARAM: "6400"}, 0),
+        ({st.PRODUCER_HIT_PARAM: True}, 0),
+    ],
+    ids=["int", "absent", "none", "negative", "string", "bool"],
+)
+def test_published_hit_tokens_is_zero_unless_a_positive_int(params, want):
+    assert st.published_hit_tokens(params) == want
+
+
+def _zero_end_consumer(hit=0, draft_kv=True):
+    c = object.__new__(st.StagedConsumer)
+    c.draft_kv, c.ratio = draft_kv, 4
+    if hit:
+        c.draft_zero = {7: hit}
+    return c
+
+
+@pytest.mark.parametrize(
+    "hit,fraction,want",
+    [
+        pytest.param(0, None, 0, id="no_hit"),
+        pytest.param(9600, None, 9600, id="hit"),
+        pytest.param(0, "0.3", 5992, id="forced"),  # int(0.3 * 19999) = 5999 -> 5992
+        pytest.param(9600, "0.3", 9600, id="hit_above_forced"),
+        pytest.param(3200, "0.3", 5992, id="forced_above_hit"),
+        pytest.param(25600, None, 19999, id="capped"),
+    ],
+)
+def test_draft_zero_end_is_the_hit_raised_to_the_forced_gap(monkeypatch, hit, fraction, want):
+    if fraction is None:
+        monkeypatch.delenv("QWEN4_EXP_PD_DRAFT_KV_FORCE_GAP", raising=False)
+    else:
+        monkeypatch.setenv("QWEN4_EXP_PD_DRAFT_KV_FORCE_GAP", fraction)
+    assert _zero_end_consumer(hit).draft_zero_end(7, 19999) == want
+
+
+def test_draft_zero_end_is_zero_with_the_flag_off(monkeypatch):
+    monkeypatch.setenv("QWEN4_EXP_PD_DRAFT_KV_FORCE_GAP", "0.5")
+    assert _zero_end_consumer(9600, draft_kv=False).draft_zero_end(7, 19999) == 0
+
+
+@pytest.mark.parametrize("dcp,tp_rank", [(1, 0), (4, 0), (4, 3), (4, 6)])
+@pytest.mark.parametrize("num_tokens,start", [(1, 0), (7521, 0), (20000, 4096), (20000, 18432)])
+def test_token_enumerations_match_the_row_planners(dcp, tp_rank, num_tokens, start):
+    """The draft gap splits landing rows by token: main_tokens_np and
+    pair_tokens_np must list exactly the tokens of main_rows_np's and
+    compressed_rows_np's rows, in order."""
+    rank = st.RankSlice(tp_size=8, tp_rank=tp_rank, num_kv_heads=2, main_dcp=dcp)
+    dst, src, first = list(range(100, 160)), np.arange(1, 9), start // 3200
+    s, d = st.main_rows_np(num_tokens, src, 3200, dst, 512, rank, start=start, src_first=first)
+    t = st.main_tokens_np(num_tokens, 512, rank, start)
+    assert len(t) == len(d)
+    # The source rows name the token itself (destinations repeat across a
+    # DCP entry's ranks).
+    assert np.array_equal(src[t // 3200 - first] * 3200 + t % 3200, s)
+    assert np.array_equal(np.asarray(dst)[t // (dcp * 512)] * 512 + t % 512, d)
+    s, d = st.compressed_rows_np(num_tokens, 4, src, 3200, dst, 512, start=start, src_first=first)
+    p = st.pair_tokens_np(num_tokens, 4, start)
+    assert len(p) == len(d)
+    assert np.array_equal(src[p // 3200 - first] * 3200 + (p % 3200) // 8, s)
+    assert np.array_equal(np.asarray(dst)[p // 512] * 512 + (p % 512) // 8, d)
+
+
+def test_draft_gap_zero_fills_only_the_draft_tokens_below_its_end():
+    t = np.arange(4096, 8192, dtype=np.int64)
+    s, d = t + 1_000_000, t + 2_000_000
+    gap = st._DraftGap(6000)
+    s2, d2 = gap.split(_DRAFT, s, d, lambda: t)
+    assert np.array_equal(d2, d[t >= 6000]) and np.array_equal(s2, s[t >= 6000])
+    # A target owner is untouched, whatever the gap.
+    s3, d3 = gap.split(_TARGET, s, d, lambda: (_ for _ in ()).throw(AssertionError))
+    assert s3 is s and d3 is d
+    copy_s, copy_d = [], []
+    gap.emit(copy_s, copy_d)
+    assert np.array_equal(np.concatenate(copy_d), d[t < 6000])
+    assert not np.concatenate(copy_s).any()  # from the null staging row
+    assert (gap.landed, gap.zeroed) == (int((t >= 6000).sum()), int((t < 6000).sum()))
+    # No gap: everything lands.
+    none = st._DraftGap(0)
+    s4, d4 = none.split(_DRAFT, s, d, lambda: t)
+    assert s4 is s and d4 is d and none.zeroed == 0
+    copy_s, copy_d = [], []
+    none.emit(copy_s, copy_d)
+    assert copy_d == []
+
+
+def test_draft_group_problems_names_cacheable_or_mixed_draft_groups():
+    from types import SimpleNamespace as NS
+
+    def group(names, cacheable):
+        return NS(layer_names=names, kv_cache_spec=NS(prefix_cacheable=cacheable))
+
+    good = [group([_TARGET], True), group([_DRAFT], False), group([_DRAFT + ".raw_ring"], False)]
+    assert st.draft_group_problems(good) == []
+    bad = [group([_TARGET], True), group([_DRAFT], True), group([_TARGET + "x", _DRAFT + ".c"], False)]
+    problems = st.draft_group_problems(bad)
+    assert len(problems) == 2 and _DRAFT in problems[0]
+
+
+def _gap_consumer(mode):
+    """A staged TP8 / DCP4 rank (tp_rank 1) with the draft's and one target's
+    main KV, packed compressed slots and ring: broadcast staging, routed
+    compact staging (QWEN4_EXP_PD_ROUTED_DST), or routed with S4's landing
+    gather (QWEN4_EXP_PD_SHARED_COMPRESSED)."""
+    c = object.__new__(st.StagedConsumer)
+    c.rank = st.RankSlice(tp_size=8, tp_rank=1, num_kv_heads=2, main_dcp=4)
+    c.ratio, c.dst_block, c.src_block, c._state_entry = 4, 512, 3200, 0
+    c.route = None if mode == "broadcast" else st.pd_route.RouteGeometry(
+        tp=8, dcp=4, dst_block=512, src_block=3200, ratio=4,
+        ssm_rows_src=2048, conv_rows_src=256, ssm_rows_dst=256,
+    )
+    c.shared = st.pd_shared_compressed.geometry_for(c.route) if mode == "s4_shared" else None
+    c._dst_owner = {_DRAFT: 0, _TARGET: 1, _DRAFT + ".raw_ring": 2}
+    c._dst_compressed = {_DRAFT + ".compressed_k": (3, 64), _TARGET + ".compressed_k": (3, 0)}
+    names = list(c._dst_owner) + list(c._dst_compressed)
+    c._src_owner = {name: i for i, name in enumerate(names)}
+    c.src_groups = [None] * len(names)
+    c._gdn_names, c._zero_draft = [], {}
+    return c
+
+
+@pytest.mark.parametrize("mode", ["broadcast", "routed", "s4_shared"])
+def test_every_landing_path_zero_fills_the_draft_gap(mode):
+    """``indices`` with a draft gap [skip, hi): the draft's main-KV rows of
+    this rank's DCP slice and its compressed pairs in the gap are zero-filled
+    from the null row and not landed; everything else plans as with no gap.
+    Under S4 the gather lands compressed pairs, and the repack's zero rows
+    (enqueued after it) overwrite the gap's."""
+    c = _gap_consumer(mode)
+    n, skip, hi = 20000, 4096, 9600
+    assert c._shared_load(n) == (mode == "s4_shared")
+    pages = {name: list(range(1, 400)) for name in c._src_owner}
+    tables = [list(range(1000, 1100)), list(range(2000, 2100)), [3000],
+              list(range(4000, 4100))]
+    first = [skip // 3200] * len(c.src_groups)  # staging begins at that source page
+    ms0, md0, cs0, cd0, _, _ = c.indices(pages, tables, n, skip, first)
+    ms1, md1, cs1, cd1, _, _ = c.indices(pages, tables, n, skip, first, draft_zero_until=hi)
+    gap_main = set(st.main_dst_np(hi, tables[0], 512, c.rank, skip).tolist())
+    gap_pairs = set(st.compressed_dst_np(hi, 4, tables[3], 512, skip, 64).tolist())
+    assert gap_main and gap_pairs
+    # Main KV: the draft's gap rows leave the landing; nothing else changes.
+    assert set(md1.tolist()) == set(md0.tolist()) - gap_main
+    assert not set(md1.tolist()) & gap_main
+    # Copies: the zero rows (source row 0) are exactly the draft's gap.
+    zero = {int(d) for s, d in zip(cs1, cd1) if s == 0}
+    assert zero == gap_main | gap_pairs
+    landed1 = {int(d) for s, d in zip(cs1, cd1) if s != 0}
+    landed0 = {int(d) for s, d in zip(cs0, cd0) if s != 0}
+    assert landed1 == landed0 - gap_pairs
+    assert not landed1 & zero
+    assert c.last_draft_rows[1] == len(gap_main) + len(gap_pairs)

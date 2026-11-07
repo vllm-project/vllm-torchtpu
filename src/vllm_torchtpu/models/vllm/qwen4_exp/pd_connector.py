@@ -187,6 +187,11 @@ class Qwen4ExpRaidenConnector(TPURaidenConnector):
         self._qwen_divergent_hits = bool(cache.enable_prefix_caching) and os.environ.get(
             "QWEN4_EXP_PD_DIVERGENT_HITS", "1"
         ).strip() not in ("0", "false", "False")
+        # q38 F2 option (a), producer: req id -> the prefix hit the request was
+        # last (re)scheduled with. Its draft KV is not prefix-cacheable, so its
+        # draft rows start there; the hit goes to the decode in the transfer
+        # params (pd_staging.PRODUCER_HIT_PARAM). None on every other engine.
+        self._producer_hits: dict[str, int] | None = {} if producer_mtp else None
 
     # --- QWEN4_EXP_PD_SYNC_REPACK -----------------------------------------
 
@@ -203,7 +208,58 @@ class Qwen4ExpRaidenConnector(TPURaidenConnector):
     def update_state_after_alloc(self, request, blocks, num_external_tokens):
         if self._guards_landing() and num_external_tokens > 0:
             self._loads()[request.request_id] = request
-        return super().update_state_after_alloc(request, blocks, num_external_tokens)
+        result = super().update_state_after_alloc(request, blocks, num_external_tokens)
+        self._carry_producer_hit(request)
+        return result
+
+    # --- q38 F2 option (a): the producer's prefix hit Hp -------------------
+
+    def _carry_producer_hit(self, request) -> None:
+        """Decode: the producer's published prefix hit rides this request's
+        load metadata to the staging repack, which zero-fills the draft rows
+        the producer never computed (pd_staging.StagedConsumer.draft_zero_end).
+        Absent, it is 0."""
+        from .pd_staging import draft_kv_enabled, published_hit_tokens
+
+        scheduler = getattr(self, "connector_scheduler", None)
+        if scheduler is None or not draft_kv_enabled():
+            return
+        meta = getattr(scheduler, "reqs_to_load", {}).get(request.request_id)
+        if meta is not None and hasattr(meta, "src_cached_tokens"):
+            meta.src_cached_tokens = published_hit_tokens(request.kv_transfer_params)
+
+    def _record_producer_hits(self, scheduler_output) -> None:
+        """Producer: the tokens each newly scheduled or resumed request did
+        not compute (its prefix hit). A resumed request's hit replaces its
+        first one: its draft rows were recomputed only from the new hit."""
+        hits = getattr(self, "_producer_hits", None)
+        if hits is None:
+            return
+        for new_req in getattr(scheduler_output, "scheduled_new_reqs", None) or ():
+            hits[new_req.req_id] = int(new_req.num_computed_tokens)
+        cached = getattr(scheduler_output, "scheduled_cached_reqs", None)
+        if cached is None:
+            return
+        resumed = set(getattr(cached, "resumed_req_ids", None) or ())
+        for index, req_id in enumerate(cached.req_ids):
+            if req_id in resumed:
+                hits[req_id] = int(cached.num_computed_tokens[index])
+
+    def request_finished_all_groups(self, request, block_ids):
+        delay_free_blocks, params = super().request_finished_all_groups(request, block_ids)
+        hits = getattr(self, "_producer_hits", None)
+        if hits is None:
+            return delay_free_blocks, params
+        hit = hits.pop(request.request_id, None)
+        if hit is None:  # never seen scheduled: vLLM's own count, if any
+            hit = int(getattr(request, "num_cached_tokens", 0) or 0)
+        num_tokens = params.get("num_tokens") if isinstance(params, dict) else None
+        if type(num_tokens) is int and hit > 0:
+            from .pd_staging import PRODUCER_HIT_PARAM
+
+            params = dict(params)
+            params[PRODUCER_HIT_PARAM] = min(hit, num_tokens)
+        return delay_free_blocks, params
 
     def update_connector_output(self, connector_output: Any) -> None:
         super().update_connector_output(connector_output)
@@ -240,6 +296,7 @@ class Qwen4ExpRaidenConnector(TPURaidenConnector):
 
     def build_connector_meta(self, scheduler_output):
         meta = super().build_connector_meta(scheduler_output)
+        self._record_producer_hits(scheduler_output)
         if self._sync_repack:
             named = self._landed_on_all_ranks
             if self._guards_landing():
@@ -446,6 +503,14 @@ class Qwen4ExpRaidenWorker(TPURaidenConnectorWorker):
                 self._enable_shared_compressed()
             self._log_hbm_after_staging(runner)
         else:
+            from .config import pd_prefill_mtp_producer
+
+            if pd_prefill_mtp_producer(self.vllm_config):
+                # q38 F2 option (a): the draft's groups stay out of this
+                # producer's prefix cache, as the decode's model of it assumes.
+                from .pd_staging import warn_draft_groups
+
+                warn_draft_groups(cache.native_config.kv_cache_groups, "producer")
             self._qwen_route = self._producer_route(cache.layout)
             self._qwen_shared = self._producer_shared(self._qwen_route)
             manifest = build_transfer_manifest(
@@ -643,6 +708,7 @@ class Qwen4ExpRaidenWorker(TPURaidenConnectorWorker):
             int(req_meta.num_tokens),
             tp_group,
             skip_tokens=int(getattr(req_meta, "skip_tokens", 0) or 0),
+            draft_zero_until=int(getattr(req_meta, "src_cached_tokens", 0) or 0),
         )
         if not ok:
             # The load parks and is re-attempted each step until room frees
@@ -691,6 +757,7 @@ class Qwen4ExpRaidenWorker(TPURaidenConnectorWorker):
             int(req_meta.num_tokens),
             skip_tokens=int(getattr(req_meta, "skip_tokens", 0) or 0),
             reduced_free=reduced_free,
+            draft_zero_until=int(getattr(req_meta, "src_cached_tokens", 0) or 0),
         )
 
     def _stage3_destination_pages_needed(self, req_meta) -> int:
@@ -712,6 +779,7 @@ class Qwen4ExpRaidenWorker(TPURaidenConnectorWorker):
             dict(staging.reservations),
             dict(staging.skips),
             dict(getattr(staging, "tokens", {})),
+            dict(staging.__dict__.get("draft_zero", {})),
         )
 
     def _stage3_admission_restore(self, saved) -> None:
@@ -727,6 +795,10 @@ class Qwen4ExpRaidenWorker(TPURaidenConnectorWorker):
         if len(saved) > 3 and hasattr(staging, "tokens"):
             staging.tokens.clear()
             staging.tokens.update(saved[3])
+        if len(saved) > 4:
+            draft_zero = staging.__dict__.setdefault("draft_zero", {})
+            draft_zero.clear()
+            draft_zero.update(saved[4])
 
     def _stage3_finish_destination(self, destination_req_id, ok) -> None:
         staging = getattr(self, "_staging", None)

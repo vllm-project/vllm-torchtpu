@@ -229,6 +229,7 @@ def pooled_cache_specs(
     merge_compressed: bool | None = None,
     main_interleave: int | None = None,
     split_compressed: bool | None = None,
+    draft_prefix_cacheable: bool | None = None,
 ):
     """Derive uniform physical pages without widening compressed-key coverage.
 
@@ -260,10 +261,11 @@ def pooled_cache_specs(
     KV keep ``B``, so prefix hashing and the draft are unchanged.
     ``VLLM_TPU_QSA_MTP_KV_DCP`` gives the draft's main KV groups ``2 * B`` too.
     """
-    # ``tp`` / ``main_dcp`` / ``pack_compressed`` describe another engine (a
-    # PD peer's geometry, pd_staging); by default this engine's.
+    # ``tp`` / ``main_dcp`` / ``pack_compressed`` / ``draft_prefix_cacheable``
+    # describe another engine (a PD peer's geometry, pd_staging); by default
+    # this engine's (config.native_cache_specs).
     tp = cfg.parallel_config.tensor_parallel_size if tp is None else tp
-    specs = native_cache_specs(cfg, tp)
+    specs = native_cache_specs(cfg, tp, draft_prefix_cacheable=draft_prefix_cacheable)
     text = cfg.model_config.hf_text_config
     main = specs[f"model.layers.{text.layer_types.index('full_attention')}.self_attn"]
     token_bytes = main.page_size_bytes // main.block_size
