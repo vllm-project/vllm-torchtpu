@@ -662,6 +662,7 @@ def moe_gmm(
     nonep_gmm_experts_per_visit: int = 1,
     nonep_combine_packed: bool = False,
     nonep_gmm_bucket: int = 0,
+    nonep_gmm2_experts_per_visit: int = 0,
 ) -> jax.Array:
     """Run grouped GEMM for routed tokens and reduce back to tokens.
 
@@ -683,6 +684,10 @@ def moe_gmm(
     # Consecutive experts per gmm_v2 pipeline step in both GMMs (non-EP: all
     # groups local, no group offset).
     epv = 1 if use_ep else nonep_gmm_experts_per_visit
+    # gmm2's own experts per step (TPU_MOE_NONEP_GMM2_EXPERTS_PER_VISIT); 0 =
+    # gmm1's. gmm2's per-expert weight block is half gmm1's, so it streams
+    # slower; more experts per step give it larger blocks.
+    epv2 = epv if use_ep or not nonep_gmm2_experts_per_visit else nonep_gmm2_experts_per_visit
     # Finer row buckets for both non-EP GMMs (TPU_MOE_NONEP_GMM_BUCKET); 0 = default.
     bucket = 0 if use_ep else nonep_gmm_bucket
 
@@ -742,7 +747,7 @@ def moe_gmm(
                 tile_m=tile_m,
                 hoist_lhs_quant=hoist,
                 rhs_split=rhs_split,
-                experts_per_visit=epv,
+                experts_per_visit=epv2,
                 bucket=bucket,
             )
             blocks.append(
@@ -785,7 +790,7 @@ def moe_gmm(
         tile_m=tile_m,
         hoist_lhs_quant=hoist,
         rhs_split=rhs_split,
-        experts_per_visit=epv,
+        experts_per_visit=epv2,
         pack_out=packed,
         bucket=bucket,
     )
@@ -898,6 +903,7 @@ def moe_gmm(
         "nonep_gmm_experts_per_visit",
         "nonep_combine_packed",
         "nonep_gmm_bucket",
+        "nonep_gmm2_experts_per_visit",
     ),
 )
 def fused_moe_func(
@@ -929,6 +935,7 @@ def fused_moe_func(
     nonep_gmm_experts_per_visit: int = 1,
     nonep_combine_packed: bool = False,
     nonep_gmm_bucket: int = 0,
+    nonep_gmm2_experts_per_visit: int = 0,
 ) -> jax.Array:
     """Run MoE with precomputed expert ids and weights.
 
@@ -1057,5 +1064,6 @@ def fused_moe_func(
         nonep_gmm_experts_per_visit=nonep_gmm_experts_per_visit,
         nonep_combine_packed=nonep_combine_packed,
         nonep_gmm_bucket=nonep_gmm_bucket,
+        nonep_gmm2_experts_per_visit=nonep_gmm2_experts_per_visit,
     )
     return x[:num_tokens, :hidden_size]

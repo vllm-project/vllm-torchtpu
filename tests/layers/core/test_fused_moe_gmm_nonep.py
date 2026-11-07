@@ -314,6 +314,48 @@ def test_experts_per_visit_reaches_every_gmm_on_the_non_ep_path_only(monkeypatch
     assert epvs == [1] * (1 + split) if use_ep else epvs == [4] * (1 + split)
 
 
+@pytest.mark.parametrize("use_ep", [False, True])
+@pytest.mark.parametrize("split", [1, 2])
+@pytest.mark.parametrize("e1,e2,want2", [(2, 4, 4), (2, 0, 2), (4, 1, 1), (1, 2, 2)])
+def test_gmm2_experts_per_visit_overrides_gmm2_only(monkeypatch, use_ep, split, e1, e2, want2):
+    """TPU_MOE_NONEP_GMM2_EXPERTS_PER_VISIT sets gmm2's E (every column block of a
+    split combine); 0 keeps gmm1's; gmm1 keeps its own; EP stays at 1."""
+    experts, hidden, inter, topk, tokens = 16, 512, 128, 4, 640
+    k1, k2, k3 = jax.random.split(jax.random.key(5), 3)
+    w1, s1 = _fp8_per_channel(k1, (experts, hidden, 2 * inter))
+    w2, s2 = _fp8_per_channel(k2, (experts, inter, hidden))
+    x = (jax.random.normal(k3, (tokens, hidden), jnp.float32) / 4).astype(jnp.bfloat16)
+    rng = np.random.default_rng(7)
+    ids = jnp.asarray(np.stack([rng.choice(experts, topk, replace=False) for _ in range(tokens)]), jnp.int32)
+    w = jnp.asarray(rng.random((tokens, topk)), jnp.bfloat16)
+    calls, epvs = [], []
+    monkeypatch.setattr(fused_moe_gmm, "gmm_wrapper", _ref_gmm(calls, epvs=epvs))
+    monkeypatch.setattr(fused_moe_gmm, "_local_ragged_combine_eligible", lambda *a, **k: True)
+    monkeypatch.setattr(fused_moe_gmm, "ragged_gather_reduce_v3",
+                        lambda rows, rev, wts, valid, reduce_group_size: _ref_combine(
+                            rows, rev, wts, valid, reduce_group_size))
+    xs, gs, rev, wf, valid, tok = prepare_routed_gmm_inputs(
+        x, ids, w, local_num_experts=experts, topk=topk, use_ep=False, use_sparse_core=False
+    )
+    fused_moe_gmm.moe_gmm(
+        xs, w1, s1, None, w2, s2, None, gs, rev, wf, valid, tok, activation="silu",
+        num_tokens=tokens, topk=topk, use_ep=use_ep, use_sparse_core=False,
+        nonep_combine_split=split, nonep_gmm_experts_per_visit=e1, nonep_gmm2_experts_per_visit=e2,
+    )
+    assert epvs == ([1] * (1 + split) if use_ep else [e1] + [want2] * split)
+
+
+def test_gmm2_experts_per_visit_env_reaches_the_bridge(monkeypatch):
+    from vllm_torchtpu import envs
+    monkeypatch.setenv("TPU_MOE_NONEP_GMM2_EXPERTS_PER_VISIT", "4")
+    assert int(envs.TPU_MOE_NONEP_GMM2_EXPERTS_PER_VISIT) == 4
+    monkeypatch.setenv("TPU_MOE_NONEP_GMM2_EXPERTS_PER_VISIT", "3")
+    with pytest.raises(Exception):
+        envs.TPU_MOE_NONEP_GMM2_EXPERTS_PER_VISIT
+    monkeypatch.delenv("TPU_MOE_NONEP_GMM2_EXPERTS_PER_VISIT")
+    assert envs.TPU_MOE_NONEP_GMM2_EXPERTS_PER_VISIT == "0"
+
+
 def test_tiling_with_bucket_only_refines_the_row_buckets(monkeypatch):
     from vllm_torchtpu.kernels.megablox.gmm_v2 import TileSizes
 

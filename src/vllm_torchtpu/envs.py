@@ -94,6 +94,7 @@ if TYPE_CHECKING:
     TPU_MOE_NONEP_GMM_HOIST_QUANT: bool = False
     TPU_MOE_NONEP_GMM2_RHS_SPLIT: str = "1"
     TPU_MOE_NONEP_GMM_EXPERTS_PER_VISIT: str = "1"
+    TPU_MOE_NONEP_GMM2_EXPERTS_PER_VISIT: str = "0"
     TPU_SC_COMBINE_DENSE: str = ""
     TPU_MOE_NONEP_COMBINE_PACKED: bool = False
     TPU_MOE_NONEP_GMM_BUCKET: str = "0"
@@ -1338,6 +1339,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # their rows, amortizing the fixed per-step cost. Bitwise the same output.
     "TPU_MOE_NONEP_GMM_EXPERTS_PER_VISIT": env_with_choices(
         "TPU_MOE_NONEP_GMM_EXPERTS_PER_VISIT", "1", ["1", "2", "4"]
+    ),
+    # The non-EP second GMM's own experts per pipeline step; "0" = the first
+    # GMM's (TPU_MOE_NONEP_GMM_EXPERTS_PER_VISIT). gmm2's per-expert weight
+    # block is half gmm1's and streams slower. Bitwise the same output.
+    "TPU_MOE_NONEP_GMM2_EXPERTS_PER_VISIT": env_with_choices(
+        "TPU_MOE_NONEP_GMM2_EXPERTS_PER_VISIT", "0", ["0", "1", "2", "4"]
     ),
     # SparseCore combine accumulation for all-valid blocks: "reg" (run table,
     # register sums), "addupdate" (run table, contiguous memory adds) or unset
