@@ -19,6 +19,7 @@ if TYPE_CHECKING:
     TPU_DCP_MLA_UV_BEFORE_MERGE: bool = False
     TPU_DCP_MLA_UV_BEFORE_MERGE_MIN_TOKENS: int = 0
     TPU_DCP_MERGE_VSPACE_FUSED: bool = False
+    TPU_DCP_MERGE_LSE_ROW_PAIRS: bool = False
     TPU_DCP_MLA_OPROJ_ALL_REDUCE: bool = False
     TPU_DCP_MLA_OPROJ_ALL_REDUCE_CHUNK_TOKENS: int = 512
     TPU_MLA_SPARSE_SPLIT_Q: bool = True
@@ -339,6 +340,8 @@ if TYPE_CHECKING:
     TPU_FUSED_NORM_QKVA: bool = False
     TPU_PREFILL_SEQ_PARALLEL: bool = False
     TPU_PREFILL_SEQ_PARALLEL_MIN_TOKENS: int = 256
+    TPU_PREFILL_SEQ_PARALLEL_EP: bool = False
+    TPU_PREFILL_SEQ_PARALLEL_EP_ROTATED_SCATTER: bool = False
     TPU_MOE_PREFILL_GATHER_ONCE: bool = False
     TPU_MOE_PREFILL_ROTATED_COLLECTIVES: bool = False
     TPU_MOE_PREFILL_COMBINE_SCATTER: bool = False
@@ -911,6 +914,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # DCP8: P90 TTFT -10..-12% (the separate W_UV bmm, concat and relayouts
     # cost ~36 ms per 4096-token step).
     "TPU_DCP_MERGE_VSPACE_FUSED": env_bool("TPU_DCP_MERGE_VSPACE_FUSED"),
+    # The V-space merge's lse all-gather sends f32[T, 64] rows, which sit in
+    # 8 x 128 tiles with half of each row padding, so the gather moves twice
+    # its bytes. On: gather the rows in pairs side by side, [T / 2, 128]. Only
+    # the layout of the sent values changes; the merge arithmetic is the same.
+    # Migration switch: delete it, gathering row pairs whenever
+    # TPU_DCP_MERGE_VSPACE_FUSED is on, once a serving run shows it no slower
+    # at every prefill size.
+    "TPU_DCP_MERGE_LSE_ROW_PAIRS": env_bool("TPU_DCP_MERGE_LSE_ROW_PAIRS"),
     # Where W_UV is replicated over the DCP group (TPU_DCP_MLA_UV_BEFORE_MERGE),
     # replicate o_proj too, so the backbone buckets that apply W_UV before the
     # merge (TPU_DCP_MLA_UV_BEFORE_MERGE_MIN_TOKENS) and would reduce-scatter
@@ -2463,6 +2474,27 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_PREFILL_SEQ_PARALLEL": env_bool("TPU_PREFILL_SEQ_PARALLEL"),
     "TPU_PREFILL_SEQ_PARALLEL_MIN_TOKENS": env_int(
         "TPU_PREFILL_SEQ_PARALLEL_MIN_TOKENS", 256
+    ),
+    # TPU_PREFILL_SEQ_PARALLEL with expert-parallel MoE layers
+    # (--enable-expert-parallel, no stage-A prefill kernel): the split also
+    # arms on them. Each core routes its own rows, all-gathers the rows and
+    # their routes, runs the layer's EP experts and its slice of the shared
+    # expert on every row as today, and reduce-scatters the sum instead of
+    # all-reducing it, so the residual stream stays split across the layer.
+    # Same terms in every sum; the reduce-scatter may add them in another order.
+    # Migration switch: delete it, arming EP layers whenever
+    # TPU_PREFILL_SEQ_PARALLEL is on, once an EP model's serving run shows the
+    # split no slower at every prefill size.
+    "TPU_PREFILL_SEQ_PARALLEL_EP": env_bool("TPU_PREFILL_SEQ_PARALLEL_EP"),
+    # TPU_PREFILL_SEQ_PARALLEL_EP on a 2x2x2 slice of 2-core chips: the split
+    # EP MoE op's reduce-scatter runs as the rotated halving-doubling kernel
+    # (kernels/experimental/rotated_collectives.py) on the TensorCores, one
+    # kernel per combine chunk, instead of XLA's reduce-scatter. Same rows on
+    # each core; the bf16 sums may add their terms in another order. Other
+    # meshes log a warning and keep XLA's. Migration switch: delete it, taking
+    # the rotated kernel on every 2x2x2 slice, with TPU_PREFILL_SEQ_PARALLEL_EP.
+    "TPU_PREFILL_SEQ_PARALLEL_EP_ROTATED_SCATTER": env_bool(
+        "TPU_PREFILL_SEQ_PARALLEL_EP_ROTATED_SCATTER"
     ),
     # TPU_PREFILL_SEQ_PARALLEL: the split MoE op all-gathers each core's rows
     # once, in core order, instead of once per combine chunk: the routes, their

@@ -54,6 +54,7 @@ from vllm_torchtpu.kernels.experimental import rotated_collectives
 from vllm_torchtpu.kernels.experimental.fused_moe_prefill.fused_moe_prefill_kernel_v2 import (  # noqa: E501
     gather_rows,
     own_rows,
+    rotated_scatter_rows,
     scatter_rows,
     token_chunks,
 )
@@ -123,12 +124,7 @@ def rotated_fn(mesh, kind: str, places):
     )
 
     def scatter(x, rank):
-        chunk = x.shape[0] // token_chunks(x.shape[0])
-        if not rotated_collectives.reduce_scatter_supports(chunk, x.shape[1]):
-            return scatter_rows(x, axis)
-        return rotated_collectives.reduce_scatter_chunks(
-            x, rank, jnp.asarray(table), axis=axis, chunk=chunk
-        )
+        return rotated_scatter_rows(x, rank, table, axis)
 
     def gather(x, rank):
         return _rotated_gather(x, rank, table, axis, ranks)
@@ -327,11 +323,7 @@ def fused_projection_fn(mesh, places):
             )
         ):
             partial = xla_quantized_matmul(x, w_q, w_s)
-            if rotated_collectives.reduce_scatter_supports(chunk, partial.shape[1]):
-                return rotated_collectives.reduce_scatter_chunks(
-                    partial, rank, jnp.asarray(table), axis=axis, chunk=chunk
-                )
-            return scatter_rows(partial, axis)
+            return rotated_scatter_rows(partial, rank, table, axis)
         x_q, x_scale = quantize_tensor(x, w_q.dtype)
         return rotated_collectives.matmul_reduce_scatter_chunks(
             x_q, x_scale, w_q, w_s, rank, jnp.asarray(table), axis=axis, chunk=chunk

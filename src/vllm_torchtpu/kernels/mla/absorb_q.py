@@ -36,8 +36,6 @@ MAX_BLOCK_TOKENS = 128
 # Below this, XLA's matmul is as fast: it prefetches W_UK into VMEM under the
 # previous op, while the kernel has to read it itself (measured at decode).
 MIN_TOKENS = 256
-# The 2-D input leaves VMEM for 256 tokens per grid step beside W_UK.
-MAX_HEAD_BLOCK_TOKENS = 256
 # The raw q head lanes the sparse MLA attention kernel reads with its
 # in-kernel rope: q_nope[128:192] | q_pe.
 HEAD_TAIL_LANES = 128
@@ -69,6 +67,33 @@ def _head_kernel(q_ref, w_ref, o_ref, pe_ref):
     pe_ref[...] = pltpu.einshape("htd->thd", jnp.stack(pe))
 
 
+def head_block_tokens(
+    tokens: int,
+    heads: int,
+    width: int,
+    nope: int,
+    rank: int,
+    itemsize: int,
+    vmem: int,
+    sublanes: int,
+) -> int:
+    """The largest power-of-two token block of `absorb_q_head` whose VMEM fits
+    `vmem` beside the single-buffered W_UK: per token, the double-buffered
+    input row and both outputs, and the stacked copy of each output the
+    kernel builds before its relayout. 256 tokens at 32 heads, 128 at 64
+    (heads x nope 192 x rank 512, bf16, 56 MiB)."""
+    w_uk = heads * nope * rank
+    per_token = heads * (2 * width + 3 * rank + 3 * HEAD_TAIL_LANES)
+    fit = (vmem // itemsize - w_uk) // per_token
+    # Token blocks are a multiple of the sublane count.
+    if fit < sublanes:
+        raise ValueError(
+            f"absorb_q_head: {heads} heads x {width} x rank {rank} leave VMEM "
+            f"for {fit} tokens per block, under {sublanes}"
+        )
+    return min(tokens, 1 << (fit.bit_length() - 1))
+
+
 def absorb_q_head(q2d: jax.Array, w_uk_t: jax.Array) -> tuple[jax.Array, jax.Array]:
     """`out[t, h] = q[t, h, :nope] @ w_uk_t[h]` (the same bits as `absorb_q`
     of that slice) and `pe[t, h] = q[t, h, -HEAD_TAIL_LANES:]`, with `q` the
@@ -83,10 +108,22 @@ def absorb_q_head(q2d: jax.Array, w_uk_t: jax.Array) -> tuple[jax.Array, jax.Arr
       `[T, H, R]` and `[T, H, HEAD_TAIL_LANES]` in `q2d.dtype`.
     """
     tokens = q2d.shape[0]
-    heads, _, rank = w_uk_t.shape
+    heads, nope, rank = w_uk_t.shape
     pe_lanes = HEAD_TAIL_LANES
     assert tokens >= MIN_TOKENS, tokens
-    block = min(tokens, MAX_HEAD_BLOCK_TOKENS)
+    info = pltpu.get_tpu_info()
+    vmem_limit = info.vmem_capacity_bytes * 7 // 8
+    width = q2d.shape[1] // heads
+    block = head_block_tokens(
+        tokens,
+        heads,
+        width,
+        nope,
+        rank,
+        q2d.dtype.itemsize,
+        vmem_limit,
+        info.num_sublanes,
+    )
     return pl.pallas_call(
         _head_kernel,
         grid=(pl.cdiv(tokens, block),),
@@ -106,7 +143,7 @@ def absorb_q_head(q2d: jax.Array, w_uk_t: jax.Array) -> tuple[jax.Array, jax.Arr
         ],
         compiler_params=pltpu.CompilerParams(
             dimension_semantics=("parallel",),
-            vmem_limit_bytes=pltpu.get_tpu_info().vmem_capacity_bytes * 7 // 8,
+            vmem_limit_bytes=vmem_limit,
         ),
     )(q2d, w_uk_t)
 
