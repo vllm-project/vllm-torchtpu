@@ -1250,19 +1250,26 @@ class TpuPlatform(Platform):
 
         check_attention_backend_config(vllm_config)
 
+        from vllm_torchtpu.core.tpu_scheduler import (
+            TPU_DP_SCHEDULER_CLS,
+            warn_if_prefill_wave_inactive,
+        )
+
         if envs.DP_SCHED_ENABLED and parallel_config.data_parallel_size > 1:
-            dp_sched_cls = "vllm_torchtpu.core.tpu_scheduler.TpuDpScheduler"
             if scheduler_config.scheduler_cls is None:
-                scheduler_config.scheduler_cls = dp_sched_cls
+                scheduler_config.scheduler_cls = TPU_DP_SCHEDULER_CLS
                 logger.info(
                     "Enabled TpuDpScheduler (DP_SCHED_ENABLED=1) for DP=%d.",
                     parallel_config.data_parallel_size,
                 )
-            elif scheduler_config.scheduler_cls != dp_sched_cls:
+            elif scheduler_config.scheduler_cls != TPU_DP_SCHEDULER_CLS:
                 logger.warning(
                     "DP scheduler is off: scheduler %s is configured.",
                     scheduler_config.scheduler_cls,
                 )
+        warn_if_prefill_wave_inactive(
+            parallel_config.data_parallel_size, scheduler_config.scheduler_cls
+        )
 
         kv_transfer_config = vllm_config.kv_transfer_config
         if kv_transfer_config is not None:

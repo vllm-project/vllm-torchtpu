@@ -29,6 +29,7 @@ At startup, `vllm-torchtpu` reports set environment variables that neither vLLM 
 | Variable | Default | Description |
 | :--- | :--- | :--- |
 | `DP_SCHED_ENABLED` | `False` | Enables TPU data-parallel request scheduling optimizations. |
+| `TPU_DP_SCHED_PREFILL_WAVE` | `False` | Holds completed prefills in `TpuDpScheduler` until the KV-bounded prefill wave fills so chunked prefill steps stay pure prefill and all requests in the wave decode together without preemption. The next wave starts once the running wave has shrunk to a quarter of its peak size. Trades higher TTFT for lower decode ITL under bursty load. |
 | `VLLM_TPU_SRPT_MAX_CONSECUTIVE_HOLDS` | `8` | Consecutive `schedule()` steps a running prefill chunk may go without getting at least one KV block of tokens in `SrptPrefillScheduler` (held back or crowded out by shorter prefills) before it moves ahead of the other prefill chunks and is no longer held until it gets a block (`0` disables hold-back). |
 | `VLLM_TPU_SRPT_ATTN_WORK_CAP` | `0` | In `SrptPrefillScheduler`, cap on a step's attention work (`sum(n * (c + n / 2))` over scheduled chunks with `n` new tokens after `c` computed ones); while this rank decodes, or another DP rank decodes under EP lockstep (`DP > 1` with expert parallel), prefill chunks are shrunk to stay under it (`0` disables). |
 | `VLLM_TPU_SRPT_ATTN_TILE_TOKENS` | `32` | In `SrptPrefillScheduler`, a chunk shrunk by `VLLM_TPU_SRPT_ATTN_WORK_CAP` ends on a multiple of this many tokens, rounded down (the attention kernel's query tile). |
