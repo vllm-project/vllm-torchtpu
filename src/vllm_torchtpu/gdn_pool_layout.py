@@ -45,6 +45,9 @@ QWEN_GDN_ARCHITECTURES = frozenset(
         "Qwen3_5MoeForConditionalGeneration",
         "Qwen4ExpForCausalLM",
         "Qwen4ExpForConditionalGeneration",
+        # Qwen3.5 GDN layers, one per Loop visit; the pool holds every visit's
+        # state, which prefix caching on a hybrid model requires on TPU.
+        "SenseNovaLoopForConditionalGeneration",
     }
 )
 POOLED_GDN_ARCHITECTURES = QWEN_GDN_ARCHITECTURES | frozenset(
