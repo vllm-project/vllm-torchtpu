@@ -60,6 +60,18 @@ class TpuDeviceCommunicator(DeviceCommunicatorBase):
         group = self._moe_group(is_sequence_parallel)
         if group is None:
             return hidden_states, router_logits
+        if (
+            is_sequence_parallel
+            and hidden_states.dtype == router_logits.dtype
+            and hidden_states.ndim == 2
+            and router_logits.ndim == 2
+            and hidden_states.shape[0] == router_logits.shape[0]
+        ):
+            width = hidden_states.shape[-1]
+            packed = group.all_gather(
+                torch.cat([hidden_states, router_logits], dim=-1), dim=0
+            )
+            return packed[:, :width], packed[:, width:]
         hidden_states = group.all_gather(hidden_states, dim=0)
         router_logits = group.all_gather(router_logits, dim=0)
         return hidden_states, router_logits
