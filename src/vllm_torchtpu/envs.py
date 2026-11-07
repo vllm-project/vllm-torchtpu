@@ -137,6 +137,10 @@ if TYPE_CHECKING:
     VLLM_TPU_QSA_PREFILL_UNION_CAP: int = 12288
     VLLM_TPU_QSA_PREFILL_UNION_KV_TILE: int = 1024
     VLLM_TPU_QSA_PREFILL_UNION_COUNT: int = 0
+    VLLM_TPU_QSA_PREFILL_UNION_LISTED: str = ""
+    VLLM_TPU_QSA_PREFILL_UNION_SHARE_BITS: bool = False
+    VLLM_TPU_QSA_PREFILL_UNION_ALPHA: float = 0.0
+    VLLM_TPU_QSA_PREFILL_UNION_QK16: bool = False
     VLLM_TPU_QSA_MAIN_KV_DCP: int = 0
     VLLM_TPU_QSA_MTP_KV_DCP: bool = False
     VLLM_TPU_QSA_COMPRESSED_DCP: bool = False
@@ -810,6 +814,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_TPU_QSA_PREFILL_UNION_COUNT": env_nonnegative_int(
         "VLLM_TPU_QSA_PREFILL_UNION_COUNT", 0
     ),
+    # Union walk options (all off by default; bitwise unless noted):
+    # LISTED: issue the walk's copies from a union id list instead of scanning
+    # the union bitset; "sparsecore" (union_sc_list, TPU) or "reference" (XLA).
+    # SHARE_BITS: a cap fallback reuses the walk plan's selection bitset.
+    # ALPHA: also fall back when a group's union exceeds this fraction of its
+    # visible groups (0 = off). QK16: QK as one BF16 MXU pass (exact operands,
+    # power-of-two score scales only; bitwise on TPU in q38-attn-exact-i1k2).
+    "VLLM_TPU_QSA_PREFILL_UNION_LISTED": env_str("VLLM_TPU_QSA_PREFILL_UNION_LISTED", ""),
+    "VLLM_TPU_QSA_PREFILL_UNION_SHARE_BITS": env_bool("VLLM_TPU_QSA_PREFILL_UNION_SHARE_BITS"),
+    "VLLM_TPU_QSA_PREFILL_UNION_ALPHA": env_float("VLLM_TPU_QSA_PREFILL_UNION_ALPHA", 0.0),
+    "VLLM_TPU_QSA_PREFILL_UNION_QK16": env_bool("VLLM_TPU_QSA_PREFILL_UNION_QK16"),
     # Main KV of the target QSA layers split over TP rank pairs that share a
     # KV head (2; 0/1 = off): each rank stores and attends half the tokens,
     # the pair's partial attention is LSE-combined.

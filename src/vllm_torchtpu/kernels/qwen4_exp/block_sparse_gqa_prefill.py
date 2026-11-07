@@ -552,6 +552,7 @@ def block_sparse_gqa_prefill(
     dcp_rank=None,
     dcp_world: int = 1,
     dcp_interleave: int = 0,
+    block_bits=None,
 ):
     """Run exact selected-group attention with query-block KV reuse.
 
@@ -639,8 +640,16 @@ def block_sparse_gqa_prefill(
             (word_tokens // interleave) % dcp_world
             == jnp.asarray(dcp_rank, jnp.int32).reshape(-1)[0]
         ).astype(jnp.int32)
+    if block_bits is not None:
+        # P-ATTN D2 fallback (union_walk_prefill share_bits): the caller already
+        # built this step's selection bitset in this layout (the same bits
+        # _selection_bitset would produce: [blocks, words, native width]).
+        if dcp or parts != 1 or not envs.VLLM_TPU_QSA_PREFILL_BITSET_KERNEL:
+            raise ValueError("a precomputed bitset needs one 256-row part, no DCP and the bitset kernel")
+        if tuple(block_bits.shape) != (nblocks, words, part_width):
+            raise ValueError(f"block_bits {block_bits.shape} != {(nblocks, words, part_width)}")
     if envs.VLLM_TPU_QSA_PREFILL_BITSET_KERNEL:
-        block_bits_native = _selection_bitset(
+        block_bits_native = block_bits if block_bits is not None else _selection_bitset(
             blocks,
             lengths,
             ratio=ratio,

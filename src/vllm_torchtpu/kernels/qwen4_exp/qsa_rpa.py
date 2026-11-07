@@ -600,6 +600,10 @@ def _prefill_attention(
             union_cap=envs.VLLM_TPU_QSA_PREFILL_UNION_CAP,
             min_context=envs.VLLM_TPU_QSA_PREFILL_UNION_MIN_CONTEXT,
             lean=envs.VLLM_TPU_QSA_PREFILL_LEAN,
+            listed=envs.VLLM_TPU_QSA_PREFILL_UNION_LISTED or None,
+            share_bits=envs.VLLM_TPU_QSA_PREFILL_UNION_SHARE_BITS,
+            union_alpha=envs.VLLM_TPU_QSA_PREFILL_UNION_ALPHA,
+            qk16=envs.VLLM_TPU_QSA_PREFILL_UNION_QK16,
         )
     from vllm_torchtpu.kernels.qwen4_exp.block_sparse_gqa_prefill import (
         block_sparse_gqa_attention,

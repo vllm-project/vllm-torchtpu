@@ -63,7 +63,9 @@ def kernels(monkeypatch):
         monkeypatch.setattr(bsp.pl, "pallas_call", interpreted)
     for name in ("VLLM_TPU_QSA_PREFILL_UNION_WALK", "VLLM_TPU_QSA_PREFILL_UNION_MIN_CONTEXT",
                  "VLLM_TPU_QSA_PREFILL_UNION_CAP", "VLLM_TPU_QSA_PREFILL_UNION_KV_TILE",
-                 "VLLM_TPU_QSA_PREFILL_LEAN"):
+                 "VLLM_TPU_QSA_PREFILL_LEAN", "VLLM_TPU_QSA_PREFILL_UNION_LISTED",
+                 "VLLM_TPU_QSA_PREFILL_UNION_SHARE_BITS", "VLLM_TPU_QSA_PREFILL_UNION_ALPHA",
+                 "VLLM_TPU_QSA_PREFILL_UNION_QK16"):
         monkeypatch.delenv(name, raising=False)
     yield
     jax.clear_caches()
@@ -301,7 +303,8 @@ def test_flag_on_dispatch_takes_the_walk(kernels, monkeypatch):
     calls = _spy(monkeypatch)
     got = _dispatch(step)
     assert calls == [dict(kv_heads=2, ratio=RATIO, k_scale=1.0, v_scale=1.0, group=128, kv_tile=1024,
-                          union_cap=CAP, min_context=1000, lean=True)]
+                          union_cap=CAP, min_context=1000, lean=True, listed=None, share_bits=False,
+                          union_alpha=0.0, qk16=False)]
     jax.clear_caches()
     want = _walk(step, union_cap=CAP, min_context=1000, lean=True)
     np.testing.assert_array_equal(_bits(got), _bits(want))
@@ -321,4 +324,286 @@ def test_flag_on_dispatch_keeps_short_steps_and_rejects_bad_groups(kernels, monk
     np.testing.assert_array_equal(_bits(got), _bits(_served(step)))
     monkeypatch.setenv("VLLM_TPU_QSA_PREFILL_UNION_WALK", "100")
     with pytest.raises(ValueError, match="divisor of 128"):
+        _dispatch(step)
+
+
+# --- relative cap (union_alpha) and the shared-bitset fallback (share_bits): both opt-in -------------------------
+
+
+@pytest.mark.parametrize("layout", [SPARE, WORST, ALIGNED])
+def test_share_bits_fallback_is_the_served_call(kernels, layout):
+    """A cap fallback that reuses the walk plan's bitset is bitwise the served call (packed, unaligned steps)."""
+    rows, cached = layout
+    tokens = 2048 if sum(-(-n // 256) * 256 for n in rows) > 1024 else 1024
+    step = _packed_step(21 + len(rows), rows, cached, tokens=tokens)
+    served = _served(step)
+    jax.clear_caches()
+    over = _walk(step, union_cap=_max_union(step, 128) - 1, share_bits=True)
+    jax.clear_caches()
+    tiny = _walk(step, union_cap=32, share_bits=True)
+    np.testing.assert_array_equal(_bits(over), _bits(served))
+    np.testing.assert_array_equal(_bits(tiny), _bits(served))
+
+
+@pytest.mark.parametrize("layout", [SPARE, WORST])
+def test_share_bits_walk_is_the_unshared_walk(kernels, layout):
+    """Aligning requests to the served query block moves only padding rows: the walk's output is unchanged."""
+    rows, cached = layout
+    tokens = 2048 if sum(-(-n // 256) * 256 for n in rows) > 1024 else 1024
+    step = _packed_step(31 + len(rows), rows, cached, tokens=tokens)
+    unshared = _walk(step)
+    jax.clear_caches()
+    shared = _walk(step, share_bits=True)
+    np.testing.assert_array_equal(_bits(shared), _bits(unshared))
+    assert not np.array_equal(_bits(shared), _bits(_served(step)))  # the walk ran
+
+
+def test_union_alpha_falls_back_on_dense_unions(kernels):
+    """union_alpha: a union above alpha x the group's visible groups takes the served call; below it, the walk."""
+    rows, cached = SPARE
+    step = _packed_step(41, rows, cached)
+    served = _served(step)
+    walk = _walk(step)
+    jax.clear_caches()
+    dense = _walk(step, union_alpha=0.01)          # every union is above 1% of its visible groups
+    jax.clear_caches()
+    roomy = _walk(step, union_alpha=1.0)           # no union exceeds all visible groups
+    jax.clear_caches()
+    dense_shared = _walk(step, union_alpha=0.01, share_bits=True)
+    np.testing.assert_array_equal(_bits(dense), _bits(served))
+    np.testing.assert_array_equal(_bits(dense_shared), _bits(served))
+    np.testing.assert_array_equal(_bits(roomy), _bits(walk))
+
+
+def _dot_operand_dtypes(jaxpr):
+    """The operand dtypes of every dot_general in a jaxpr, kernels (pallas_call bodies) included."""
+    found = []
+    for eqn in jaxpr.eqns:
+        if eqn.primitive.name == "dot_general":
+            found.append(tuple(str(v.aval.dtype) for v in eqn.invars))
+        for param in eqn.params.values():
+            for item in param if isinstance(param, (tuple, list)) else (param,):
+                inner = getattr(item, "jaxpr", item)
+                if hasattr(inner, "eqns"):
+                    found += _dot_operand_dtypes(inner)
+    return found
+
+
+def test_qk16_operands_are_the_fp32_operands():
+    """Exhaustive: qk16 hands the MXU the same operand values as the FP32 dot.
+
+    Keys: all 256 FP8 E4M3 codes convert to the same value through BF16 as
+    through FP32. Queries: every one of the 65,536 BF16 values times the served
+    score scale 2**-4 (head_dim 256, k_scale 1.0: the checkpoint has no KV scale
+    tensors) is still a BF16 value, except where FP32 itself turns subnormal.
+    """
+    codes = jax.lax.bitcast_convert_type(jnp.arange(256, dtype=jnp.uint8), jnp.float8_e4m3fn)
+    via32 = np.asarray(codes.astype(jnp.float32))
+    via16 = np.asarray(codes.astype(jnp.bfloat16).astype(jnp.float32))
+    finite = np.isfinite(via32)
+    assert finite.sum() == 254  # E4M3FN: two NaN codes, no infinities
+    np.testing.assert_array_equal(via16[finite].view(np.uint32), via32[finite].view(np.uint32))
+    assert np.isnan(via16[~finite]).all()
+
+    q = jax.lax.bitcast_convert_type(jnp.arange(65536, dtype=jnp.uint32).astype(jnp.uint16), jnp.bfloat16)
+    scaled = q.astype(jnp.float32) * jnp.float32(256**-0.5 * 1.0)
+    recast = np.asarray(scaled.astype(jnp.bfloat16).astype(jnp.float32))
+    scaled = np.asarray(scaled)
+    normal = np.isfinite(scaled) & ((np.abs(scaled) >= 2.0**-126) | (scaled == 0))
+    np.testing.assert_array_equal(recast[normal].view(np.uint32), scaled[normal].view(np.uint32))
+    # The exceptions: nonzero |q| < 2**-122 (and NaN/inf, which stay NaN/inf).
+    tiny = np.isfinite(scaled) & ~normal
+    assert np.all(np.abs(np.asarray(q.astype(jnp.float32))[tiny]) < 2.0**-122)
+
+
+def test_qk16_walk_engaged_and_only_reorders_the_sum(kernels):
+    """qk16 runs a BF16 QK dot (PV stays FP32) and changes only the QK accumulation order.
+
+    Off TPU, XLA's CPU BF16 dot sums in another order than its FP32 dot, so the
+    outputs are not bitwise here: under 0.1% of outputs move, each by about one
+    BF16 unit in the last place (of the ungated output, then the gate's rounding),
+    and the float64 2x rule of the FP32 walk holds.
+    A precision cut (e.g. BF16 PV probabilities) moves far more outputs. The
+    bitwise keep rule is the TPU replay against today's walk.
+    """
+    rows, cached = SPARE
+    step = _packed_step(51, rows, cached)
+    plain = _walk(step)
+    jax.clear_caches()
+    fast = _walk(step, qk16=True)
+    a, b = fast.astype(np.float32), plain.astype(np.float32)
+    # A move is at most one BF16 unit in the last place of the ungated output plus the gated
+    # output's own rounding (2**-6 of the larger output), or of the (row, head) vector's RMS
+    # where the output itself is near zero (cancellation).
+    rms = np.sqrt(np.mean(b.astype(np.float64) ** 2, axis=-1, keepdims=True)) + 1e-30
+    moved = a != b
+    drift = np.abs(a - b) / np.maximum(np.maximum(np.abs(a), np.abs(b)), rms)
+    print(f"qk16 vs FP32 walk: {moved.mean():.2e} of outputs moved, max {drift.max():.2e} of max(|out|, RMS)")
+    assert moved.mean() < 1e-3, moved.mean()
+    assert drift.max() <= 2.0**-6, drift.max()
+    starts = np.asarray(step[-1])
+    rows_sel = np.concatenate([np.linspace(starts[r], starts[r + 1] - 1, 4).astype(int) for r in range(len(rows))])
+    ref = _f64_reference(step, rows_sel)
+    rms = np.sqrt(np.mean(ref**2, axis=-1, keepdims=True)) + 1e-30
+
+    def err(x):
+        e = np.abs(x[rows_sel].astype(np.float32).astype(np.float64) - ref) / rms
+        return e.max(), np.quantile(e, 0.99)
+
+    (plain_max, plain_p99), (fast_max, fast_p99) = err(plain), err(fast)
+    assert fast_max <= 2 * plain_max and fast_p99 <= 2 * plain_p99, (fast_max, fast_p99, plain_max, plain_p99)
+
+    q, gate, blocks, lengths, table, pool, starts = step
+    params = dict(kv_heads=2, ratio=RATIO, group=128, kv_tile=1024, union_cap=CAP, min_context=0,
+                  lean=True)
+    traced = {
+        flag: _dot_operand_dtypes(jax.make_jaxpr(
+            lambda: ud.union_walk_prefill(q, gate, blocks, lengths, table, pool, starts, qk16=flag,
+                                          **params)
+        )().jaxpr)
+        for flag in (False, True)
+    }
+    assert ("bfloat16", "bfloat16") in traced[True]
+    assert ("float32", "float32") in traced[True]  # PV
+    assert ("bfloat16", "bfloat16") not in traced[False]
+
+
+def test_qk16_refuses_an_inexact_score_scale(kernels):
+    """A score scale that is not a power of two would round the pre-scaled queries: refused."""
+    rows, cached = SPARE
+    step = _packed_step(52, rows, cached)
+    with pytest.raises(ValueError, match="power-of-two"):
+        _walk(step, qk16=True, k_scale=1.1)
+    with pytest.raises(ValueError, match="power-of-two"):
+        _walk(step, qk16=True, k_scale=3.0)
+    _walk(step, qk16=True, k_scale=0.5)  # 2**-5: exact
+
+
+def test_share_bits_fallback_reuses_the_plan_bitset(kernels, monkeypatch):
+    """Engaged: an over-cap step with share_bits runs no served-layout bitset build.
+
+    Output equality alone cannot show this (a rebuilt bitset is the same bits).
+    Each bitset build reports its query block when it runs (a callback runs only
+    in the branch taken; the min-context path still holds a served call that a
+    long step never takes): without share_bits the step runs the plan's
+    128-lane build and then the served call's 256-row build; with it, only the
+    plan's.
+    """
+    rows, cached = SPARE
+    step = _packed_step(61, rows, cached)
+    q, gate, blocks, lengths, table, pool, starts = step
+    served_qb = get_sparse_prefill_tiles(q, pool, kv_heads=2, ratio=RATIO)[0]
+    assert served_qb == 256
+    ran = []
+    original = bsp._selection_bitset
+
+    def recording(*args, **kwargs):
+        out = original(*args, **kwargs)
+        block = kwargs["query_block"]
+        jax.debug.callback(lambda: ran.append(block))
+        return out
+
+    monkeypatch.setattr(bsp, "_selection_bitset", recording)
+    by_mode = {}
+    for share in (False, True):
+        jax.clear_caches()
+        ran.clear()
+        out = _walk(step, union_cap=32, share_bits=share)
+        jax.effects_barrier()
+        by_mode[share] = sorted(ran)
+        if share:
+            np.testing.assert_array_equal(_bits(out), _bits(shared_reference))
+        else:
+            shared_reference = out
+    assert by_mode[False] == [128, served_qb], by_mode
+    assert by_mode[True] == [128], by_mode
+
+
+# --- the listed walk on the served path, G64, and the full int-2 stack behind the flags ---------------------------
+
+
+def _kernel_names(jaxpr):
+    """Names of every pallas_call in a jaxpr, cond/switch branches included."""
+    found = []
+    for eqn in jaxpr.eqns:
+        if eqn.primitive.name == "pallas_call":
+            found.append(str(eqn.params.get("name")))
+        for param in eqn.params.values():
+            for item in param if isinstance(param, (tuple, list)) else (param,):
+                inner = getattr(item, "jaxpr", item)
+                if hasattr(inner, "eqns"):
+                    found += _kernel_names(inner)
+    return found
+
+
+def _traced_names(step, **options):
+    q, gate, blocks, lengths, table, pool, starts = step
+    params = dict(group=128, kv_tile=1024, union_cap=CAP, min_context=0, lean=True)
+    params.update(options)
+    return _kernel_names(jax.make_jaxpr(lambda: ud.union_walk_prefill(
+        q, gate, blocks, lengths, table, pool, starts, kv_heads=2, ratio=RATIO, **params))().jaxpr)
+
+
+@pytest.mark.parametrize("group,layout", [(128, SPARE), (64, SPARE), (64, WORST)])
+def test_listed_prefill_is_the_walk(kernels, group, layout):
+    """listed="reference": the listed walk on each group's page row, bitwise the walk, and it is what runs."""
+    rows, cached = layout
+    tokens = 2048 if sum(-(-n // 256) * 256 for n in rows) > 1024 else 1024
+    step = _packed_step(71 + group + len(rows), rows, cached, tokens=tokens)
+    walk = _walk(step, group=group)
+    jax.clear_caches()
+    listed = _walk(step, group=group, listed="reference")
+    np.testing.assert_array_equal(_bits(listed), _bits(walk))
+    assert not np.array_equal(_bits(walk), _bits(_served(step)))  # the walk ran
+    names = _traced_names(step, group=group, listed="reference")
+    assert any("_listed" in n for n in names), names
+    assert not any("_listed" in n for n in _traced_names(step, group=group)), "listed off must not list"
+
+
+def test_share_bits_at_g64(kernels):
+    """share_bits at G64 (four 64-row groups per served 256-row block): the fallback is the served call and the
+    walk is the unshared walk."""
+    rows, cached = SPARE
+    step = _packed_step(81, rows, cached, tokens=2048)
+    served = _served(step)
+    jax.clear_caches()
+    fallback = _walk(step, group=64, union_cap=32, share_bits=True)
+    np.testing.assert_array_equal(_bits(fallback), _bits(served))
+    jax.clear_caches()
+    unshared = _walk(step, group=64)
+    jax.clear_caches()
+    shared = _walk(step, group=64, share_bits=True)
+    np.testing.assert_array_equal(_bits(shared), _bits(unshared))
+
+
+def test_full_stack_dispatch(kernels, monkeypatch):
+    """The int-2 flags (G64, listed, share_bits, alpha 0.9, cap 16,384, qk16) reach union_walk_prefill and give the
+    direct call's bits; without alpha and qk16 the stack is the plain G64 walk bit for bit (qk16 itself is gated
+    bitwise on TPU, i1k2)."""
+    rows, cached = SPARE
+    step = _packed_step(82, rows, cached, tokens=2048)
+    for name, value in (("VLLM_TPU_QSA_PREFILL_UNION_WALK", "64"), ("VLLM_TPU_QSA_PREFILL_UNION_MIN_CONTEXT", "0"),
+                        ("VLLM_TPU_QSA_PREFILL_UNION_CAP", "16384"), ("VLLM_TPU_QSA_PREFILL_LEAN", "1"),
+                        ("VLLM_TPU_QSA_PREFILL_UNION_LISTED", "reference"),
+                        ("VLLM_TPU_QSA_PREFILL_UNION_SHARE_BITS", "1"), ("VLLM_TPU_QSA_PREFILL_UNION_ALPHA", "0.9")):
+        monkeypatch.setenv(name, value)
+    calls = _spy(monkeypatch)
+    got = _dispatch(step)
+    assert calls == [dict(kv_heads=2, ratio=RATIO, k_scale=1.0, v_scale=1.0, group=64, kv_tile=1024,
+                          union_cap=16384, min_context=0, lean=True, listed="reference", share_bits=True,
+                          union_alpha=0.9, qk16=False)]
+    stack = dict(group=64, union_cap=16384, listed="reference", share_bits=True)
+    jax.clear_caches()
+    np.testing.assert_array_equal(_bits(got), _bits(_walk(step, union_alpha=0.9, **stack)))
+    # Without alpha (these synthetic unions are near-dense, so alpha 0.9 sends the step to the shared fallback):
+    # listed + share_bits + cap 16,384 at G64 is the plain G64 walk bit for bit.
+    jax.clear_caches()
+    np.testing.assert_array_equal(_bits(_walk(step, **stack)), _bits(_walk(step, group=64, union_cap=16384)))
+    monkeypatch.setenv("VLLM_TPU_QSA_PREFILL_UNION_QK16", "1")
+    calls.clear()
+    jax.clear_caches()
+    _dispatch(step)
+    assert calls[0]["qk16"] is True
+    monkeypatch.setenv("VLLM_TPU_QSA_PREFILL_UNION_LISTED", "bogus")
+    with pytest.raises(ValueError, match="listed"):
         _dispatch(step)
