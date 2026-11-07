@@ -41,6 +41,7 @@ def write_hosts(root):
                 {
                     "completed": True,
                     "formal_status": "passed" if index == 0 else "pending",
+                    "repetition_status": "passed" if index == 0 else "disabled",
                     "shutdown_requested": index == 1,
                 }
             )
@@ -49,6 +50,7 @@ def write_hosts(root):
             json.dumps(
                 {
                     "scenario": "decode_dp16",
+                    "max_model_len": 524288,
                     "host_rank": index,
                     "hostname": f"host-{index}",
                     "compile_sizes": [288, 2048],
@@ -72,6 +74,23 @@ def write_hosts(root):
                 }
             )
         )
+    from check_repetition import ATTEMPTS, MAX_TOKENS, REQUEST_SHA256
+
+    repetition = root / "benchmark/repetition"
+    repetition.mkdir()
+    (repetition / "summary.json").write_text(
+        json.dumps(
+            {
+                "status": "passed",
+                "request_sha256": REQUEST_SHA256,
+                "max_tokens": MAX_TOKENS,
+                "evidence_uploaded": True,
+                "attempts": [{"status": "passed"}] * ATTEMPTS,
+            }
+        )
+    )
+    for name in [*(f"reset-{i}" for i in range(1, ATTEMPTS + 1)), "final-reset"]:
+        (repetition / f"{name}.json").write_text('{"success": true}')
     fixed = root / "benchmark/fixed"
     fixed.mkdir()
     (fixed / "manifest.json").write_text(json.dumps({"rounds": 1}))
@@ -441,3 +460,26 @@ def test_head_rejects_a_second_worker_after_launch(tmp_path):
     assert not state.abort
     state.check_worker("c")
     assert state.abort and "second worker" in (state.error or "")
+
+
+@pytest.mark.parametrize(
+    "invalid", ["missing", "failure", "partial", "archive", "reset"]
+)
+def test_repetition_failure_cannot_publish_passing_ci(tmp_path, invalid):
+    write_hosts(tmp_path)
+    path = tmp_path / "benchmark/repetition/summary.json"
+    if invalid == "missing":
+        path.unlink()
+    elif invalid == "reset":
+        (path.parent / "final-reset.json").write_text('{"success": false}')
+    else:
+        data = json.loads(path.read_text())
+        if invalid == "failure":
+            data["attempts"][0]["status"] = "repetition"
+        elif invalid == "partial":
+            data["attempts"].pop()
+        else:
+            data["evidence_uploaded"] = False
+        path.write_text(json.dumps(data))
+    with pytest.raises((ValueError, OSError)):
+        audit(tmp_path)

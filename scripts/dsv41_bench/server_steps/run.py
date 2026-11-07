@@ -23,6 +23,7 @@ from bench_cached_extend import (
     load_frozen_input,
     summarize_startup,
 )
+from check_repetition import MODEL_WINDOW
 from server_step_worker import SCENARIOS
 
 
@@ -117,11 +118,16 @@ def main() -> None:
     parser.add_argument("--head-address")
     parser.add_argument("--rounds", type=int)
     parser.add_argument("--profile", action="store_true")
+    parser.add_argument("--repetition-request", type=Path)
     args = parser.parse_args()
     multihost = args.scenario == "decode_dp16"
     worker = multihost and args.host_rank == 1
     if multihost != bool(args.head_address) or (args.host_rank and not multihost):
         parser.error("decode_dp16 requires --head-address and two host ranks")
+    if args.repetition_request is not None and (not multihost or worker):
+        parser.error("--repetition-request requires the DP16 head")
+    if multihost and not worker and args.repetition_request is None:
+        parser.error("DP16 CI requires --repetition-request")
     if multihost and args.profile:
         parser.error("The CI multihost launcher runs formal measurements only")
     scenario = SCENARIOS[args.scenario]
@@ -188,7 +194,11 @@ def main() -> None:
         MAX_SEQS=str(scenario.local_concurrency),
     )
     if decode:
-        env["MAX_MODEL_LEN"] = str(scenario.prefix_tokens + scenario.output_tokens)
+        env["MAX_MODEL_LEN"] = str(
+            MODEL_WINDOW
+            if multihost
+            else scenario.prefix_tokens + scenario.output_tokens
+        )
     else:
         env.pop("MAX_MODEL_LEN", None)
     env["USE_PHASED_PROFILER"] = "0"
@@ -280,6 +290,7 @@ def main() -> None:
     }
     if multihost:
         manifest.update(
+            max_model_len=MODEL_WINDOW,
             host_rank=args.host_rank,
             hostname=socket.gethostname(),
             engram_hbm="first",
@@ -327,6 +338,7 @@ def main() -> None:
         "launch_wall_ns": time.time_ns(),
         "completed": False,
         "formal_status": "pending",
+        "repetition_status": "pending" if multihost and not worker else "disabled",
         "profile_status": "pending" if args.profile else "disabled",
     }
     try:
@@ -437,6 +449,29 @@ def main() -> None:
                     )
                 timing["profile_status"] = "passed"
             if multihost:
+                timing["repetition_status"] = "failed"
+                with (args.out / "repetition-client.log").open("w") as check_log:
+                    checker = subprocess.Popen(
+                        [
+                            sys.executable,
+                            str(here / "check_repetition.py"),
+                            "check",
+                            "--request",
+                            str(args.repetition_request.resolve()),
+                            "--out",
+                            str((args.out / "repetition").resolve()),
+                        ],
+                        env=env,
+                        stdout=check_log,
+                        stderr=subprocess.STDOUT,
+                        start_new_session=True,
+                    )
+                    try:
+                        if checker.wait(timeout=2100) != 0:
+                            raise RuntimeError("DeepSWE repetition check failed")
+                    finally:
+                        stop(checker)
+                timing["repetition_status"] = "passed"
                 # Keep the head alive until the host coordinator has stopped
                 # the worker. Killing the DP master first looks like a peer crash.
                 (args.out / "formal-complete").touch()

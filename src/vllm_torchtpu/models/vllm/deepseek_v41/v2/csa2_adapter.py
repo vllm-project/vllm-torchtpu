@@ -32,13 +32,9 @@ _ops: dict[str, Any] = {}
 
 
 def _publish_main(
-    raw: jax.Array,
-    scales: jax.Array,
-    records: jax.Array,
-    words: jax.Array,
-    word_scales: jax.Array,
+    raw: jax.Array, scales: jax.Array, records: jax.Array, values: jax.Array
 ) -> tuple[jax.Array, jax.Array]:
-    return publish_csa2_kv(raw, scales, records, words, word_scales)
+    return publish_csa2_kv(raw, scales, records, values)
 
 
 def _publish_main_banked(
@@ -47,13 +43,10 @@ def _publish_main_banked(
     scales: jax.Array,
     high_scales: jax.Array,
     records: jax.Array,
-    words: jax.Array,
-    word_scales: jax.Array,
+    values: jax.Array,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
-    banks, scale = publish_csa2_kv(
-        (raw, high), (scales, high_scales), records, words, word_scales
-    )
-    return *banks, *scale
+    words, scale = publish_csa2_kv((raw, high), (scales, high_scales), records, values)
+    return *words, *scale
 
 
 def _publish_swa(raw: jax.Array, records: jax.Array, values: jax.Array) -> jax.Array:
@@ -366,13 +359,13 @@ def initialize_csa2_ops() -> None:
         (
             "publish_main",
             _publish_main,
-            (P(),) * 5,
+            (P(),) * 4,
             lambda r, s, *_: (torch.empty_like(r), torch.empty_like(s)),
         ),
         (
             "publish_main_banked",
             _publish_main_banked,
-            (P(),) * 7,
+            (P(),) * 6,
             lambda r, h, s, hs, *_: tuple(torch.empty_like(x) for x in (r, h, s, hs)),
         ),
         (
@@ -455,22 +448,17 @@ def initialize_csa2_ops() -> None:
 
 
 def publish_main(
-    cache: "PagedCacheRows",
-    records: torch.Tensor,
-    words: torch.Tensor,
-    scales: torch.Tensor,
+    cache: "PagedCacheRows", records: torch.Tensor, values: torch.Tensor
 ) -> None:
-    """Publish the fused compressor's CSA2 words/scales at physical ``records``."""
     assert cache.scale is not None
-    args = (records.int(), words, scales.reshape(-1))
     if cache.raw_hi is None:
-        raw, scale = _ops["publish_main"](cache.raw, cache.scale, *args)
+        raw, scale = _ops["publish_main"](cache.raw, cache.scale, records.int(), values)
         cache.raw.copy_(raw)
         cache.scale.copy_(scale)
     else:
         assert cache.scale_hi is not None
         raw, high, scale, high_scale = _ops["publish_main_banked"](
-            cache.raw, cache.raw_hi, cache.scale, cache.scale_hi, *args
+            cache.raw, cache.raw_hi, cache.scale, cache.scale_hi, records.int(), values
         )
         cache.raw.copy_(raw)
         cache.raw_hi.copy_(high)

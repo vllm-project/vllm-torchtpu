@@ -7,6 +7,7 @@ from pathlib import Path
 
 from bench_cached_extend import assert_no_compilation
 from bench_decode import rank_results, summarize
+from check_repetition import ATTEMPTS, MAX_TOKENS, MODEL_WINDOW, REQUEST_SHA256
 
 
 def audit(root: Path) -> dict:
@@ -17,10 +18,29 @@ def audit(root: Path) -> dict:
         raise ValueError("Both hosts must complete")
     if timings[0]["formal_status"] != "passed" or not timings[1]["shutdown_requested"]:
         raise ValueError("Expected a completed head and orderly worker shutdown")
+    checks = json.loads((paths[0] / "repetition/summary.json").read_text())
+    if (
+        timings[0]["repetition_status"] != "passed"
+        or checks["status"] != "passed"
+        or checks["request_sha256"] != REQUEST_SHA256
+        or checks.get("evidence_uploaded") is not True
+        or checks["max_tokens"] != MAX_TOKENS
+        or len(checks["attempts"]) != ATTEMPTS
+        or any(x["status"] != "passed" for x in checks["attempts"])
+    ):
+        raise ValueError("Missing or failed DeepSWE repetition checks")
+    for index in range(1, ATTEMPTS + 1):
+        reset = json.loads((paths[0] / f"repetition/reset-{index}.json").read_text())
+        if reset["success"] is not True:
+            raise ValueError("DeepSWE request cache reset did not succeed")
+    final_reset = json.loads((paths[0] / "repetition/final-reset.json").read_text())
+    if final_reset["success"] is not True:
+        raise ValueError("DeepSWE final cache reset did not succeed")
     for index, manifest in enumerate(manifests):
         if manifest["host_rank"] != index or manifest["scenario"] != "decode_dp16":
             raise ValueError("Unexpected host rank or scenario")
         for key, expected in {
+            "max_model_len": MODEL_WINDOW,
             "compile_sizes": [288, 2048],
             "cache_mode": "disabled",
             "engram_hbm": "first",

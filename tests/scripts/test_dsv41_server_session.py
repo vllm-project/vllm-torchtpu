@@ -182,6 +182,7 @@ def test_ci_launch_and_optional_profile_share_one_server(
     buckets,
     profile,
     model_uri,
+    checker_failure=None,
 ):
     monkeypatch.chdir(tmp_path)
     (tmp_path / "config.json").write_text("{}")
@@ -206,7 +207,11 @@ def test_ci_launch_and_optional_profile_share_one_server(
             "results",
             "--startup-timeout",
             "7200",
-            *(["--head-address", "127.0.0.1"] if scenario == "decode_dp16" else []),
+            *(
+                ["--head-address", "127.0.0.1", "--repetition-request", "fixture.json"]
+                if scenario == "decode_dp16"
+                else []
+            ),
             *(["--profile"] if profile != "disabled" else []),
         ],
     )
@@ -233,7 +238,20 @@ def test_ci_launch_and_optional_profile_share_one_server(
     starts, clients, stopped, audits = [], [], [], []
     server = SimpleNamespace(poll=lambda: None)
 
+    def check_wait(**kwargs):
+        assert kwargs["timeout"] == 2100
+        if checker_failure == "timeout":
+            raise subprocess.TimeoutExpired("checker", 2100)
+        return 1 if checker_failure else 0
+
+    checker = SimpleNamespace(wait=check_wait)
+
     def start(command, *, env, **kwargs):
+        if "check" in command:
+            assert len(clients) == 1 and len(starts) == 1
+            assert not (tmp_path / "results/formal-complete").exists()
+            assert "--request" in command and "check_repetition.py" in command[1]
+            return checker
         starts.append(command)
         compiler_roots.append(Path(env["VLLM_CACHE_ROOT"]))
         assert compiler_roots[-1].is_dir()
@@ -253,7 +271,7 @@ def test_ci_launch_and_optional_profile_share_one_server(
             assert env["TPU_MOE_EPLB_DYNAMIC"] == "1"
             assert env["MOE_FUSED_EP_PREPROCESS_BACKEND"] == "topology"
             assert env["MAX_SEQS"] == "48"
-            assert env["MAX_MODEL_LEN"] == "98816"
+            assert env["MAX_MODEL_LEN"] == "524288"
             assert env["LD_PRELOAD"] == ""
             assert env["TPU_RECLAIM_COMPILE_MEMORY"] == "1"
             assert json.loads(env["ENGRAM_CONFIG"]) == {
@@ -293,12 +311,17 @@ def test_ci_launch_and_optional_profile_share_one_server(
     monkeypatch.setattr(
         launcher, "assert_no_compilation", lambda log, x: audits.append(x)
     )
-    if profile == "failed":
+    if checker_failure:
+        with pytest.raises((RuntimeError, subprocess.TimeoutExpired)):
+            launcher.main()
+        assert not (tmp_path / "results/formal-complete").exists()
+    elif profile == "failed":
         with pytest.raises(subprocess.CalledProcessError):
             launcher.main()
     else:
         launcher.main()
-    assert len(starts) == 1 and stopped == [server]
+    assert len(starts) == 1
+    assert stopped == ([checker, server] if scenario == "decode_dp16" else [server])
     assert not (tmp_path / "persistent-cache").exists()
     assert all(not root.exists() for root in compiler_roots)
     manifest = json.loads((tmp_path / "results/manifest.json").read_text())
@@ -329,7 +352,11 @@ def test_ci_launch_and_optional_profile_share_one_server(
     status = json.loads((tmp_path / "results/startup.json").read_text())
     assert status["formal_status"] == "passed"
     assert status["profile_status"] == profile
-    assert status["completed"] == (profile != "failed")
+    assert status["completed"] == (profile != "failed" and not checker_failure)
+    if scenario == "decode_dp16":
+        assert status["repetition_status"] == (
+            "failed" if checker_failure else "passed"
+        )
 
 
 def test_dp16_ci_launch_keeps_local_shapes_and_selects_hbm(tmp_path, monkeypatch):
@@ -341,6 +368,22 @@ def test_dp16_ci_launch_keeps_local_shapes_and_selects_hbm(tmp_path, monkeypatch
         [288, 2048],
         "disabled",
         "gs://test-bucket/checkpoint",
+    )
+
+
+@pytest.mark.parametrize("failure", ["loop", "timeout"])
+def test_dp16_repetition_failure_closes_server_without_success_marker(
+    tmp_path, monkeypatch, failure
+):
+    test_ci_launch_and_optional_profile_share_one_server(
+        tmp_path,
+        monkeypatch,
+        "decode_dp16",
+        1,
+        [288, 2048],
+        "disabled",
+        "gs://test-bucket/checkpoint",
+        checker_failure=failure,
     )
 
 

@@ -9,21 +9,13 @@ import jax.numpy as jnp
 from .cache import gather_csa2_kv_sc
 from .csa2 import csa2
 
-# Measured v7x TP1, 64 heads, page 64, bq 6: the DSpark K5 decode bucket of
-# 48 x 6 queries takes 257 us in 96-row chunks against 285 us in one chunk,
-# with bitwise-equal results. 144-, 72- and 48-row chunks were all slower
-# than one chunk, so other small buckets keep a single chunk until measured.
-_SMALL_CHUNKS = {288: 96}
-
 
 def csa2_gather_chunk_size(num_tokens: int) -> int:
     # On v7x TP1 with 64 heads, 128-row chunks overlap SC gather with TC
     # attention while retaining full gathered KV for subsequent layers.
-    # Up to 512 queries, one gather and one attention is the default; see
-    # `_SMALL_CHUNKS` for the measured exceptions.
-    if num_tokens > 512:
-        return 128
-    return _SMALL_CHUNKS.get(num_tokens, num_tokens)
+    # Up to 512 queries, launch and concatenation costs erase the stage-level
+    # benefit; use one gather and one attention without extra staging HBM.
+    return num_tokens if num_tokens <= 512 else 128
 
 
 @functools.partial(
@@ -62,11 +54,8 @@ def csa2_pipeline(
     attention i-1 bounds the prefetch distance without placing either operation
     behind the other. Gather into independent arrays; a shared destination
     would serialize its writer with the preceding chunk's attention reader.
-    Each attention chunk writes its output rows and copies its staged KV rows
-    in place into two whole-T owners, so later layers reuse contiguous KV with
-    one persistent attention launch, without a per-chunk output update or a
-    KV-word concatenation after the pipeline. Only the small FP32 scale
-    chunks are still joined.
+    Join the gathered outputs once, after the pipeline, so later layers reuse
+    them with one persistent attention launch rather than one launch per chunk.
     Only query boundaries become chunk-relative; SWA metadata and noncausal
     bounds retain their absolute positions, including future draft tokens.
 
@@ -77,37 +66,8 @@ def csa2_pipeline(
         raise ValueError("CSA2 pipeline requires nonempty queries and positive chunks")
     if records.shape != (q.shape[0], 512) or counts.shape != q.shape[:1]:
         raise ValueError("CSA2 pipeline requires [T,512] records and [T] counts")
-    kwargs = dict(
-        swa_metadata=metadata,
-        swa_bounds=bounds,
-        scale=scale,
-        compress_ratio=compress_ratio,
-        bq=bq,
-    )
-    if q.shape[0] <= chunk_size:
-        gathered_words, gathered_scales = gather_csa2_kv_sc(
-            words, scales, records, deep=deep_gather
-        )
-        output = csa2(
-            q,
-            gathered_words,
-            gathered_scales,
-            swa,
-            starts,
-            positions,
-            sink,
-            rope,
-            main_lengths=counts,
-            **kwargs,
-        )
-        return output, gathered_words, gathered_scales
-
-    scale_chunks = []
-    # Every row of both owners is written by exactly one chunk. The first
-    # chunk allocates them as its own outputs: XLA merges identical
-    # `lax.empty` buffers across layers, then copies one layer's owners so
-    # the two in-place writers stay disjoint.
-    owners = None
+    word_chunks, scale_chunks = [], []
+    output = jnp.empty_like(q)
     previous = None
     current = gather_csa2_kv_sc(words, scales, records[:chunk_size], deep=deep_gather)
     for offset in range(0, q.shape[0], chunk_size):
@@ -116,8 +76,11 @@ def csa2_pipeline(
         if previous is not None:
             # Consume every barrier result. Gating only the small index array
             # avoids carrying the multi-GiB source pools through the barrier.
-            owners, current, next_ids = jax.lax.optimization_barrier(
+            previous, current, next_ids = jax.lax.optimization_barrier(
                 (previous, current, next_ids)
+            )
+            output = jax.lax.dynamic_update_slice_in_dim(
+                output, previous, offset - chunk_size, axis=0
             )
         elif end < q.shape[0]:
             # Otherwise the scheduler can gather chunk 1 before chunk 0 and
@@ -129,14 +92,10 @@ def csa2_pipeline(
             else None
         )
         chunk_words, chunk_scales = current
+        word_chunks.append(chunk_words)
         scale_chunks.append(chunk_scales)
-        destinations = (
-            dict(new_owners=True)
-            if owners is None
-            else dict(out=owners[0], kv_out=owners[1])
-        )
         previous = csa2(
-            q,
+            q[offset:end],
             chunk_words,
             chunk_scales,
             swa,
@@ -144,13 +103,16 @@ def csa2_pipeline(
             positions[offset:end],
             sink,
             rope[offset:end],
+            swa_metadata=metadata,
+            swa_bounds=bounds,
             main_lengths=counts[offset:end],
-            query_offset=offset,
-            **destinations,
-            **kwargs,
+            scale=scale,
+            compress_ratio=compress_ratio,
+            bq=bq,
         )
         if following is not None:
             current = following
     assert previous is not None
-    output, gathered_words = previous
-    return output, gathered_words, jnp.concatenate(scale_chunks)
+    last_offset = (q.shape[0] - 1) // chunk_size * chunk_size
+    output = jax.lax.dynamic_update_slice_in_dim(output, previous, last_offset, axis=0)
+    return output, jnp.concatenate(word_chunks), jnp.concatenate(scale_chunks)

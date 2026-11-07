@@ -74,6 +74,12 @@ if [[ "${DSV41_HOST_RANK:-0}" == 0 ]]; then
     --scenario "$scenario" --dataset "$scratch/longbench.json" \
     --tokenizer "$MODEL_PATH" --out "$results/inputs.json"
   sha256sum "$results/inputs.json" > "$results/input.sha256"
+  if [[ "$scenario" == decode_dp16 ]]; then
+    # Private fixture and evidence access must work before the two-host serve.
+    python scripts/dsv41_bench/server_steps/check_repetition.py prepare \
+      --out "$scratch/deepswe"
+    launch_args+=(--repetition-request "$scratch/deepswe/request.json")
+  fi
 fi
 
 if [[ "$scenario" == decode_dp16 ]]; then

@@ -2,18 +2,109 @@
 
 # DeepSWE long-context repetition: reproduction and CI handoff
 
-This is an investigation snapshot from 2026-11-06 UTC. A frozen oxvg request
-reproduced sustained repetition in a fresh DeepSeek-V4.1-Flash service. Source
-bisection reached the adjacent commits `b57e23d7` and `8421301c`
-([#2566](https://github.com/vllm-project/vllm-torchtpu/pull/2566)).
-The specific defect and a production fix are **not established**. Full rollback
-and restoration validation remain incomplete. This document provides the
-protocol and evidence boundaries so another contributor can reproduce, review,
-or reduce the case without repeating the entire agent evaluation.
+The frozen oxvg sequence-201 request exposes sustained repetition after
+[#2566](https://github.com/vllm-project/vllm-torchtpu/pull/2566), commit
+`8421301cf61f9e9ef2b08881cbd11832710136b1`. The November 6 investigation completed
+an adjacent-source comparison and a full rollback/restoration experiment.
+Those bounded observations support reverting the PR; they do **not** identify
+a particular kernel defect or prove all historical DeepSWE failures share it.
 
-The commands below describe the historical experiment, not the defaults of the
-current epic branch. Keep the source, runtime, model, request and topology
-identities together when comparing results.
+This change reverts #2566 on the current epic branch and adds a regression check
+to the existing DP16 decode benchmark server. Conflict resolution keeps later
+SWA-only attention, steady/drain pipelining, HBM output placement and blocked
+inverse-RoPE gathering; it removes fused QA/QB/compressor preprocessing, CSA2
+in-place output/KV owners and the other changes introduced by #2566, including
+its Engram hash-download deferral and MoE metadata-wait scheduling. It is an
+adapted revert on the current epic, not a checkout of the historical parent tree.
+No production numerical fix is claimed.
+
+## Shared-server CI regression
+
+The `dsv41_flash_dp16_c768_decode` Buildkite step now runs, in order:
+
+1. Before the two-host serve, download the immutable private fixture, verify its
+   SHA256, and verify write access to the private evidence destination. Missing
+   data or access fails the job; the regression is never silently skipped.
+2. Start the existing decode-benchmark serve once, run its original C768 formal
+   performance measurement, and keep both hosts alive.
+3. Drain/reset all 16 engines, then issue up to **five serial** seq201 requests.
+   Each performs the full 332,523-token prefill plus bounded decode. Reset
+   between requests and after the suite. Never execute generated tool calls.
+4. Stop sending requests on the first sustained-loop candidate, HTTP/protocol
+   failure, deadline or unsuccessful drain/reset. Archive evidence privately;
+   then stop both hosts through the existing coordinator. The final CI audit
+   requires all five checks, successful resets and a successful evidence upload.
+
+The implementation is
+[`check_repetition.py`](../../scripts/dsv41_bench/server_steps/check_repetition.py).
+It changes only the fixture's served-model alias, `stream=true`, and
+`max_tokens=8192`. Temperature 1, top-p 0.95 and the absence of a seed are retained.
+The original fixture SHA is fixed; every effective request and received SSE
+body has its own recorded SHA. `/tokenize` must still report 332,523 tokens.
+
+| Setting | Regression policy |
+| --- | --- |
+| Attempts | 5 serial requests, no retries or extra samples |
+| Per-request bound | 300 seconds wall time, including prefill, and 8,192 generated tokens |
+| Drain/reset | 60 seconds each; all 16 engines must be idle; no forced cancellation |
+| Whole checker | 2,100 seconds, including resets and private archive upload |
+| Loop detection | 1–256 word periods, at least 8 repeats/32 words; unseparated character loops; sustained punctuation loops |
+| Valid bounded result | Supported finish reason plus `[DONE]`, no detected loop, valid complete tool JSON where applicable |
+| Failure classification | A loop fails the regression; HTTP, malformed/incomplete SSE, timeout, identity mismatch or reset failure is inconclusive and also fails CI |
+
+Five attempts reflect the observed third-request failures in the adjacent,
+restored and instrumented sessions. Normal historical completions took roughly
+37–254 seconds, so 300 seconds retains that observed range. Five full time
+budgets are 25 minutes; normal early completions shorten this. The checker has
+35 minutes total including reset/upload overhead. Neither an additional
+30–40 minutes nor the entire CI wall time is guaranteed: loading, compilation,
+the formal benchmark and the existing job deadline still apply.
+
+The current CI recipe stays TP1/DP16/EP16, 8 physical chips/2 hosts, push SC2/TC1,
+**dynamic EPLB enabled**, first-layer Engram in HBM, DSpark K5, 48 sequences per
+rank and compile buckets 288/2048. Both hosts' model window increases from
+98,816 to **524,288**, because the existing 96K benchmark window cannot accept
+the 333K fixture. Formal benchmark inputs remain 96K prefix/512 output and C768;
+its timing window ends before these checks. The larger model window can affect
+memory, compilation and performance: record it with results rather than treating
+old 98K-window measurements as an identical baseline. No throughput threshold
+is relaxed by this change.
+
+The current EPLB-on recipe is intentionally different from the historical
+EPLB-off triage. This latest-config mitigation plus CI still requires actual
+TPU validation, including resource fit at 512K. A five-request pass is bounded
+coverage, not proof that repetition is absent. A `length` finish is a completed
+bounded observation, not a complete tool invocation or a correct oxvg solution.
+The 8,192-token cap is a new CI limit, not part of the historical causal replay;
+later-onset failures remain outside its coverage.
+
+### Fixture access and artifacts
+
+The original request and generated text contain a full agent trajectory and
+remain in the existing private Falcon evidence bucket. The CI helper uses a
+fixed object URI and SHA; it does not change ACLs or publish the fixture. The
+Buildkite service account needs read access to that object and write access to
+the dedicated `ci-replays/deepswe/` prefix. This patch has not verified those
+permissions from the CI identity. The pre-serve access check deliberately fails
+if provisioning is incomplete.
+
+Raw request, effective request, exact received SSE body, reconstructed
+reasoning/content/tool arguments and capture stderr are uploaded in a private
+archive. Public `perf_eval_results` contains only timings, hashes, loop kind,
+period/count, finish reasons and engine/reset receipts. The serve uses
+`--max-log-len 0` so request logging does not expose the private prompt. Review
+private text on a red check before calling a detector candidate a model defect.
+
+CPU tests exercise malformed/fragmented SSE, tool assembly, the three loop
+families, long word periods, first-failure stopping, the five-request cap,
+16-engine drain/reset, fixture/token-count mismatches and coordinator cleanup.
+An offline scan of 24 previously archived streams flagged all six manually
+confirmed loops and none of the 18 complete non-loop streams: parent (5),
+full rollback (5), adjacent candidate (2), restoration (2), instrumented run
+(2), and fresh-A (2). This is recorder validation against existing evidence,
+not a new model run or a general quality oracle. The observed word, unseparated
+`AgainAnd` and punctuation failures are all covered; tool argument text is
+parsed as JSON and is not subjected to prose-loop heuristics.
 
 ## Observations and search boundary
 
@@ -29,6 +120,9 @@ prefix-cache reset before each request and after the suite.
 | `3605c0b7` | Request 1 complete; request 2 loops | Move upper boundary earlier |
 | `b57e23d7` | 5 complete tool calls, no target loop | Exploratory adjacent lower boundary |
 | `8421301c` | Requests 1–2 complete; request 3 loops | Adjacent upper boundary at #2566 |
+| `8421301c` + complete 33-file reverse patch | 5 complete tool calls, no target loop | Bounded rollback observation; effective source tree equals the parent before the runtime pin |
+| Original `8421301c` restored | Requests 1–2 complete; request 3 repeats `AgainAnd` 12,220 times | Symptom returns after restoring the PR |
+| `8421301c` + diagnostic QA/QB capture | Requests 1–2 complete; request 3 degrades to fragments and sustained punctuation | Instrumented run also reproduces; nine real QA/QB packets preserved |
 
 The adjacent source identities are:
 
@@ -53,11 +147,12 @@ Later SWA #2720 and dynamic EPLB #2523 changes are not necessary for the
 interactions. #2566 changes 33 files, including integration and cache ownership;
 its title does not identify which mechanism is responsible.
 
-The complete #2566 rollback attempts failed before model requests: first an
-oversized shell argument, then a source-patch text assertion. They provide no
-model-quality result. A future rollback must verify the resulting tree rather
-than assume that equal HEADs or differently serialized patches imply equal
-effective source.
+Two earlier rollback launches failed before requests (oversized shell argument
+and patch-text assertion). The third verified the effective source tree on both
+hosts and completed five requests without the loop. The restored PR reproduced
+it on request 3. All associated request/SSE hashes, complete text, tool JSON,
+per-request/final resets and archives were reviewed before resource release.
+The failed launches remain infrastructure failures, not model-quality evidence.
 
 ## Fixture and runtime identity
 
@@ -71,10 +166,10 @@ different tokenizer or chat template is a different experiment.
 **The raw request and generated trajectory are not included in this PR.**
 They contain a full agent conversation and require a redistribution review.
 Contributors who already have an approved copy can use the hashes below.
-Otherwise request a reviewed fixture through this PR before claiming an exact
-reproduction. A hash identifies data; it does not make the case self-contained.
-Do not upload private paths, credentials, bucket locations or unreviewed agent
-traces into public CI artifacts.
+The shared CI above reads the existing private object with an explicit access
+preflight; outside that environment, obtain authorized access before claiming
+an exact reproduction. A hash does not make the case self-contained. Never
+upload credentials or unreviewed agent traces into public CI artifacts.
 
 | Input | SHA256 |
 | --- | --- |
@@ -281,66 +376,30 @@ request hash, full versus partial completion, request index, loop evidence and
 artifact checksums. Keep the raw trace in an approved location until it is
 cleared for redistribution. Distinguish new measurements from this snapshot.
 
-## Kernel reduction and CI proposal
+## Remaining kernel investigation
 
-Single-kernel checks on exact `8421301c` have not yet isolated the model defect.
-The completed synthetic checks include T288 compressor, QA/QB, and CSA2
-chunk/direct and owner-reuse comparisons; a T2048 CSA2 case covered ragged
-request boundaries and all-padding chunks. Those pipeline comparisons matched
-the direct path, with independent mathematical references also checked.
-The T2048 short compressor's updated FP32 ring differed by at most
-`4.76837158203125e-7`, while effective latent/FP8 outputs matched. A longer
-T2048 case produced three differing packed FP8 words and is under review.
-Neither these differences nor the passing cases establish an E2E cause.
-Actual failing intermediate model tensors have not been captured.
+Single-kernel tests on exact `8421301c` did not isolate the defect. T288/T2048
+QA/QB/compressor, ragged CSA2/chunk/owner reuse, two-step Torch bridge, KV-only
+and draft-T40 checks completed. QB matched the old 512K fallback bitwise. QA
+had small BF16 differences. The long compressor case differed at three effective
+FP8 bytes, each by one adjacent FP8 value; scale was equal, and CPU reconstruction
+crossed quantization midpoints. FP32 ring max absolute difference was
+`4.76837158203125e-7`; near-zero ULP distances were larger. These observations
+do not establish the cause of the generation loop.
 
-Reuse the existing correctness suites when reducing a concrete failure:
+The final instrumented DP16 run preserved nine real QA/QB packets: a final
+T2048 prefill bucket with 1,395 real rows and two early T288 decode buckets with
+six real rows for each of three requests. Packet arrays, metadata and provenance
+were verified and archived. These are early-step samples from sessions including
+a failing request, not proof they contain the first divergent operation.
+Old/new/independent-reference replay of these actual packets has not run.
+Compressor/ring/cache state and the full later failure trajectory remain gaps.
+All remote investigation resources were released; no further experiment is
+started by this documentation change.
 
-```bash
-python -m pytest -q tests/kernels/attention_preprocessing/test_compress_rope.py
-python -m pytest -q tests/kernels/attention_preprocessing/test_qa_rope.py
-python -m pytest -q tests/kernels/attention_preprocessing/test_qb_rope.py
-python -m pytest -q tests/kernels/deepseek_v41/test_csa2_pipeline.py
-```
-
-These commands are entry points for the checked-out source, not a claim that
-the current epic tests reproduce the historical loop. Require actual TPU
-execution for DMA/kernel cases and inspect skipped tests. For a new numerical
-case, preserve inputs and outputs, masks, positions, ring/page mappings,
-scales and untouched-cache sentinels. Compare the previous implementation,
-candidate and independent mathematical reference on the **same** inputs.
-For a bridge/alias suspicion, include the actual compiled Torch bridge and
-consecutive state updates, not only a stateless JAX call.
-
-At epic base `9311c49ab`, the current
-[pipeline](https://github.com/vllm-project/vllm-torchtpu/blob/9311c49ab8f0a02b02afc62d37857967ba50a764/.buildkite/pipeline_dsv41.yml) has CPU contracts, a TPU parity
-step, DP8 quality, DP16 C768 throughput with dynamic EPLB, and cached-extend
-performance. The
-[TPU parity runner](https://github.com/vllm-project/vllm-torchtpu/blob/9311c49ab8f0a02b02afc62d37857967ba50a764/.buildkite/scripts/run_dsv41_decode_kernel_checks.sh)
-selects scorer, indexer-route and MoE-scale checks. It does not run the frozen
-seq201 protocol above. Green throughput or kernel CI is not this regression's
-quality result.
-
-Proposed integration, with no new CI lane enabled by this document:
-
-1. **CPU capture-contract tests:** add fixtures for SSE reasoning/tool assembly,
-   malformed events, incomplete streams, the 176-word repeat pattern and
-   missing/non-idle DP engines. Wire these into the existing CPU benchmark
-   harness step; they validate the recorder, not model quality.
-2. **TPU regression unit test:** once a real failing tensor/state is isolated,
-   reduce it into the existing preprocessing or CSA2 suite, prove it fails
-   without the fix, and explicitly select it in the TPU parity runner. Preserve
-   the real dtype, shape and state boundary; a synthetic pass is not a substitute.
-3. **Opt-in DP16 diagnostic lane:** first publish an approved, immutable fixture
-   with licensing/access and hashes, then implement the bounded replay protocol
-   on a dedicated two-host allocation. Always upload reviewed diagnostics for
-   pass, candidate and inconclusive outcomes. Start as a diagnostic lane, not a
-   probabilistic merge gate. Define the reviewed oracle and baseline behavior
-   before promoting it to a required check.
-
-Useful contributions now are a matched replay of the adjacent sources, a
-minimal failing tensor/state capture, review of the 33-file integration change,
-or a fixture/CI implementation following this protocol. Label changes to seed,
-runtime, topology, checkpoint, CED, Engram or MoE mode as separate experiments.
-Finish with the smallest rollback/restoration check needed to demonstrate
-causality; do not expand the matrix simply to accumulate passing runs.
+A future kernel fix should compare the previous implementation, candidate and
+independent reference on the same real inputs and state, then return to the
+frozen failing request. Preserve dtype, positions, scales, page/ring mappings
+and untouched-cache sentinels. For alias suspicions, include the compiled Torch
+bridge and consecutive state updates. Once a localized failing case exists,
+add it to the TPU parity lane as well as retaining this end-to-end guard.

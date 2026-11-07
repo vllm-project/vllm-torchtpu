@@ -129,8 +129,6 @@ class _DownloadBuffer:
     buffer: Any
     physical_words: int
     layout: Any
-    # Logical destination for layouts whose tiles must be reordered.
-    logical: torch.Tensor | None = None
 
     @cached_property
     def words(self) -> torch.Tensor:
@@ -176,11 +174,8 @@ class EngramHashDownload:
         )
         with torch.profiler.record_function("engram::hash_d2h"):
             transfer.d2h()
-        words = storage.words.view(physical_shape).permute(permutation)
-        if not words.is_contiguous():
-            # Reordering tiles needs a copy. Reuse its destination like the
-            # host buffer: allocating it took ~200 us per decode step.
-            if storage.logical is None:
-                storage.logical = torch.empty(padded, dtype=words.dtype)
-            words = storage.logical.view(words.shape).copy_(words)
-        return words.view(padded)[tuple(slice(0, size) for size in shape)]
+        return (
+            storage.words.view(physical_shape)
+            .permute(permutation)
+            .reshape(padded)[tuple(slice(0, size) for size in shape)]
+        )
