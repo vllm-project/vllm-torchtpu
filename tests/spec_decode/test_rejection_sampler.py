@@ -1211,3 +1211,99 @@ def test_rejection_sampler_greedy_path_ignores_draft_probs(device):
     assert torch.equal(output, expected)
     log.warning_once.assert_called_once()
     assert "ignored" in log.warning_once.call_args.args[0]
+
+
+@pytest.mark.parametrize("with_draft_probs", [False, True])
+@pytest.mark.parametrize("apply_topk_topp", [True, False])
+def test_rejection_sampler_synthetic_recovers_rejected_rows_only(
+    device, apply_topk_topp, with_draft_probs
+):
+    """Synthetic sampling recovers one row per request. The tokens must match
+    recovering every draft row and keeping the first rejected slot, at the
+    served bucket (64 requests x 7 drafts) with padding, short drafts, greedy
+    rows and top-k rows."""
+    from vllm_torchtpu.layers.adapter.sample.rejection_sampler import (
+        _recover_tokens,
+    )
+
+    num_reqs, k, vocab_size = 64, 7, 128 * 64
+    rates = [0.9, 0.75, 0.6, 0.5, 0.4, 0.3, 0.2]
+    sampler = _synthetic_sampler(rates, device)
+    gen = torch.Generator().manual_seed(0)
+    lengths = [k] * num_reqs
+    for i in range(1, num_reqs, 5):
+        lengths[i] = i % k
+    rows = num_reqs * k
+    used = sum(lengths)
+    segment_ids, group_indices = _segment_info(lengths, device)
+    # Rows past the last draft are bucket padding with a sentinel segment.
+    segment_ids = torch.cat(
+        [segment_ids, torch.full((rows - used,), num_reqs, device=device)]
+    )
+    group_indices = torch.cat(
+        [group_indices, torch.zeros((rows - used,), dtype=torch.int64, device=device)]
+    )
+    logits = torch.randn(rows, vocab_size, generator=gen) * 4
+    drafts = torch.where(
+        torch.rand(rows, generator=gen) < 0.5,
+        logits.argmax(dim=-1),
+        torch.randint(0, vocab_size, (rows,), generator=gen),
+    )
+    drafts[used:] = -1
+    temperatures = torch.ones((rows, 1))
+    temperatures[::9] = 0.0
+    top_k = torch.zeros((rows, 1), dtype=torch.int32)
+    top_k[::4] = 40
+    top_p = torch.full((rows, 1), 0.95)
+    draft_probs = None
+    if with_draft_probs:
+        draft_probs = torch.softmax(
+            torch.randn(rows, vocab_size, generator=gen), dim=-1
+        ).to(device)
+    kwargs = dict(
+        draft_token_ids=drafts.to(torch.int32).to(device),
+        num_draft_tokens=torch.tensor(lengths, dtype=torch.int32, device=device),
+        target_logits=logits.to(device),
+        bonus_token_ids=torch.arange(num_reqs, dtype=torch.int32, device=device),
+        segment_ids=segment_ids,
+        group_indices=group_indices,
+        max_draft_tokens=k,
+        temperatures=temperatures.to(device),
+        top_k=top_k.to(device),
+        top_p=top_p.to(device),
+        accept_u=torch.rand(rows, generator=gen).to(device),
+        recover_u=torch.rand(rows, vocab_size, generator=gen).to(device),
+        do_sampling=True,
+        apply_topk_topp=apply_topk_topp,
+        draft_probs=draft_probs,
+    )
+    output = sampler(**kwargs).cpu()
+
+    # Reference: recover every row, then take the first rejected slot.
+    recovered = _recover_tokens(
+        kwargs["target_logits"],
+        kwargs["draft_token_ids"].to(torch.int64),
+        kwargs["temperatures"],
+        kwargs["top_k"],
+        kwargs["top_p"],
+        kwargs["recover_u"],
+        0,
+        apply_topk_topp,
+        draft_probs,
+    ).cpu()
+    conditional = sampler.synthetic_conditional_rates.cpu()
+    accept_u = kwargs["accept_u"].cpu()
+    expected = torch.full((num_reqs, k + 1), PLACEHOLDER_TOKEN_ID, dtype=torch.int32)
+    row = 0
+    for req, length in enumerate(lengths):
+        for slot in range(length):
+            token = int(drafts[row + slot])
+            if token >= 0 and accept_u[row + slot] < conditional[slot]:
+                expected[req, slot] = token
+            else:
+                expected[req, slot] = recovered[row + slot]
+                break
+        else:
+            expected[req, length] = req
+        row += length
+    assert torch.equal(output, expected)
