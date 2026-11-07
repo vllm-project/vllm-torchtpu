@@ -39,6 +39,7 @@ def _runner(**attrs):
     runner._pp_intermediate_template = None
     runner._pp_topk_buffer = None
     runner._pp_pending_kv_save_nan_check = None
+    runner._megakernel = None
     for name in (
         "forward_model",
         "_pp_intermediate_tensors",
@@ -225,6 +226,7 @@ class TestHandOffConstruction:
     def _runner(self):
         runner = SimpleNamespace(
             _add_pipeline_chunk_buckets=lambda: None,
+            _megakernel=None,
             parallel_config=SimpleNamespace(pipeline_parallel_size=4),
             _pp_wave=None,
             _pp_intermediate_template=None,
