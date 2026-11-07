@@ -6166,12 +6166,11 @@ class TPUModelRunner(GPUModelRunner):
                 dummy_top_p = torch.ones((num_reqs, 1), dtype=torch.float32).to(
                     self.device
                 )
-                # (all_greedy, topk_candidates, apply_topk_topp): under
-                # speculative decoding the random path has a no-top-k/top-p
-                # graph next to the full one (_sampler_applies_topk_topp).
-                variants = [(False, 0, True), (True, 0, True)]
-                if self.speculative_config is not None:
-                    variants.insert(1, (False, 0, False))
+                # (all_greedy, topk_candidates, apply_topk_topp): the random
+                # path has a no-top-k/top-p graph next to the full one
+                # (_sampler_applies_topk_topp), with or without speculative
+                # decoding.
+                variants = [(False, 0, True), (False, 0, False), (True, 0, True)]
                 if blocks := self._topk_candidate_blocks():
                     variants.append((False, blocks, True))
                 for all_greedy, topk_candidates, apply_topk_topp in variants:
@@ -7892,8 +7891,7 @@ class TPUModelRunner(GPUModelRunner):
         return num_blocks
 
     def _sampler_applies_topk_topp(self) -> bool:
-        """False when speculative decoding is on and no running request sets
-        top-k or top-p.
+        """False when no running request sets top-k or top-p.
 
         `apply_top_k_top_p` runs two 31-step bisections over the whole
         vocabulary per row (7.5 ms for 512 verify rows on Flash) and is the
@@ -7901,11 +7899,13 @@ class TPUModelRunner(GPUModelRunner):
         GPU sampler skips it in the same case, keyed on the same
         `InputBatch.no_top_k` / `no_top_p`. The samplers skip it on a
         separate compiled graph that the precompiles warm next to the full
-        one. Without speculative decoding the sampler keeps its single
-        full-path graph.
+        one, with or without speculative decoding. Skipping is exact: on
+        all-False predicates the full path's `torch.where` returns the
+        unmasked logits bit for bit. Without speculative decoding the full
+        path costs about 25 us per padded row per decode step on Qwen3.5's
+        248,320-token vocabulary, for every RL rollout that samples with
+        top_k=-1 and top_p=1.
         """
-        if self.speculative_config is None:
-            return True
         return not (self.input_batch.no_top_k and self.input_batch.no_top_p)
 
     def _sampler_topk_candidates(
