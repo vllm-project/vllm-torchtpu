@@ -276,6 +276,8 @@ def model_name():
 # suffix. Same counters, so both transports derive their names from here.
 SPEC_DRAFT_METRIC = "vllm:spec_decode_num_draft_tokens"
 SPEC_ACCEPTED_METRIC = "vllm:spec_decode_num_accepted_tokens"
+# Request-steps that verified at least one draft.
+SPEC_NUM_DRAFTS_METRIC = "vllm:spec_decode_num_drafts"
 
 
 def _assert_no_spec_divergence(
@@ -415,6 +417,14 @@ class _InProcessEngine:
         # callers can check per-engine counts without knowing the transport.
         return num_draft_tokens, num_accepted_tokens, {"0": num_draft_tokens}
 
+    def num_drafts(self) -> float:
+        num_drafts = 0.0
+        for metric in self._llm.get_metrics():
+            if metric.name == SPEC_NUM_DRAFTS_METRIC:
+                assert isinstance(metric, Counter)
+                num_drafts += metric.value
+        return num_drafts
+
     def shutdown(self) -> None:
         self._llm.llm_engine.engine_core.shutdown()
 
@@ -529,6 +539,58 @@ def test_eagle3_correctness_greedy(
         },
         max_num_seqs=max_num_seqs,
         async_scheduling=async_scheduling,
+    )
+
+
+@pytest.mark.timeout(1800)
+@pytest.mark.parametrize(
+    "async_scheduling",
+    [
+        pytest.param(False, id="sync"),
+        pytest.param(True, id="async", marks=pytest.mark.nightly),
+    ],
+)
+def test_eagle3_dynamic_schedule_cuts_verified_drafts(
+    sampling_config: SamplingParams,
+    async_scheduling: bool,
+):
+    """A num_speculative_tokens_per_batch_size schedule below the drafter's K
+    sets how many drafts each step verifies, and greedy output is unchanged.
+
+    The drafter still proposes K. Sync scheduling verifies every draft the
+    runner returns, so the runner cuts them; async sizes the next window in
+    the scheduler.
+    """
+    model_name = "NousResearch/Meta-Llama-3.1-8B-Instruct"
+    speculative_config = {
+        "method": "eagle3",
+        "model": "yuhuili/EAGLE3-LLaMA3.1-Instruct-8B",
+        "num_speculative_tokens": 3,
+        "draft_tensor_parallel_size": 1,
+        # One draft per request and step, at every batch size.
+        "num_speculative_tokens_per_batch_size": [[1, 10, 1]],
+    }
+    prompts = get_eagle3_test_prompts()
+    kwargs = {
+        "max_model_len": 256,
+        "max_num_batched_tokens": MAX_NUM_BATCHED_TOKENS,
+        "max_num_seqs": 10,
+        "tensor_parallel_size": _get_tensor_parallel_size(),
+        "async_scheduling": async_scheduling,
+        "disable_log_stats": False,
+    }
+    with _engine(model_name, None, kwargs) as ref_engine:
+        ref_texts = ref_engine.generate(prompts, sampling_config)
+    with _engine(model_name, speculative_config, kwargs) as spec_engine:
+        spec_texts = spec_engine.generate(prompts, sampling_config)
+        num_draft_tokens, _, _ = spec_engine.spec_counters()
+        num_drafts = spec_engine.num_drafts()
+
+    _assert_no_spec_divergence(prompts, ref_texts, spec_texts)
+    print(f"num_drafts={num_drafts} num_draft_tokens={num_draft_tokens}")
+    assert num_drafts > 0
+    assert num_draft_tokens == num_drafts, (
+        "every verifying step must carry the one draft the schedule allows"
     )
 
 

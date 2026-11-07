@@ -8279,10 +8279,14 @@ class TPUModelRunner(GPUModelRunner):
                 num_computed_tokens=0,
                 lora_request=None,
             )
+            # The drafts each step proposes are verified by the next one, so
+            # every step asks for K of them (a dynamic speculative decoding
+            # schedule trims host drafts to num_spec_tokens_to_schedule).
             so = SchedulerOutput.make_empty()
             so.scheduled_new_reqs = [new_req]
             so.num_scheduled_tokens = {rid: P}
             so.total_num_scheduled_tokens = P
+            so.num_spec_tokens_to_schedule = K
             assert self.execute_model(so) is None
             self.sample_tokens(None)
             d = self.take_draft_token_ids()
@@ -8305,6 +8309,7 @@ class TPUModelRunner(GPUModelRunner):
                 so.scheduled_cached_reqs = creq
                 so.num_scheduled_tokens = {rid: 1 + K}
                 so.total_num_scheduled_tokens = 1 + K
+                so.num_spec_tokens_to_schedule = K
                 so.scheduled_spec_decode_tokens = {rid: [int(x) for x in list(cur)[:K]]}
                 assert self.execute_model(so) is None
                 self.sample_tokens(None)
