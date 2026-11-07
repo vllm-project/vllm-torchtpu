@@ -394,7 +394,13 @@ def msa_attend_dcp(
     keys = jnp.where(mine, seq_id[:, None, None] * pages_per_seq + selected // dcp, -1)
     common = dict(
         sm_scale=sm_scale,
-        block_q=msa_attention.DEFAULT_BLOCK_Q,
+        # As `msa.sparse_attention`: an 8-token verify group fills a tile alone
+        # (no padding rows, half the page union of a 16-token tile).
+        block_q=(
+            msa_attention.SMALL_BATCH_BLOCK_Q
+            if num_tokens <= msa_attention.SMALL_BATCH_TOKENS
+            else msa_attention.DEFAULT_BLOCK_Q
+        ),
         pages_per_step=msa_attention.DEFAULT_PAGES_PER_STEP,
         interpret=interpret,
     )
