@@ -303,8 +303,9 @@ class StepRouting:
         `(False, None)` to fall through to the runner's stock model forward.
         Always `(False, None)` inside `megakernel_runtime.suppressed(runner)`
         (dummy / precompile / profile runs), so those runs compile the stock
-        graphs, and when `ctx.model_kwargs` is non-empty (the program doesn't
-        consume extra model inputs).
+        graphs, and when `ctx.model_kwargs` is non-empty: the program doesn't
+        consume extra model inputs. The runner's stock forward passes none
+        today, so this only guards a runner that starts to.
         """
         if is_suppressed(runner) or ctx.model_kwargs:
             self._pending = None
