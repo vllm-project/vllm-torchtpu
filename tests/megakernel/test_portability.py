@@ -202,3 +202,13 @@ def test_pool_package_is_framework_free():
     and its own modules.
     """
     _assert_package_is_framework_free("pool")
+
+
+def test_collectives_package_is_framework_free():
+    """`megakernel/collectives/` imports only stdlib, jax, numpy and core spec modules.
+
+    Collectives stay model-free and below the kernel builder: no `models/`,
+    `modules/`, `vmem`, `kernel` or cache imports, so any model or runtime can
+    reuse them.
+    """
+    _assert_package_is_framework_free("collectives")
