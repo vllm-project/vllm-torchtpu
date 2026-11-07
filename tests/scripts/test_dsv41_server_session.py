@@ -261,7 +261,11 @@ def test_ci_launch_and_optional_profile_share_one_server(
         if scenario in ("decode", "decode_dp16"):
             assert "--enable-log-requests" in command
             assert command[command.index("--max-log-len") + 1] == "0"
+        assert ("--enable-auto-tool-choice" in command) == (scenario == "decode_dp16")
         if scenario == "decode_dp16":
+            assert "--enable-auto-tool-choice" in command
+            assert command[command.index("--tool-call-parser") + 1] == "deepseek_v41"
+            assert command[command.index("--reasoning-parser") + 1] == "deepseek_v41"
             assert env["HEADLESS"] == "0"
             assert env["HOST"] == "127.0.0.1"
             assert env["TPU_DEEPSEEK_V41_ENGRAM_HBM"] == "first"
@@ -433,6 +437,9 @@ def test_dp16_worker_waits_for_shutdown_and_never_runs_client(
         assert env["MOE_FUSED_EP_PUSH_TC_EXCHANGE"] == "1"
         assert env["TPU_MOE_EPLB_DYNAMIC"] == "1"
         assert command[command.index("--data-parallel-start-rank") + 1] == "8"
+        assert "--enable-auto-tool-choice" not in command
+        assert "--tool-call-parser" not in command
+        assert "--reasoning-parser" not in command
         return server
 
     monkeypatch.setattr(launcher.subprocess, "Popen", start)

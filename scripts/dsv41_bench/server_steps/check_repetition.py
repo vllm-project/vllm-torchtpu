@@ -26,6 +26,7 @@ ATTEMPTS = 5
 MAX_TOKENS = 8192
 REQUEST_SECONDS = 300
 RESET_SECONDS = 60
+HTTP_ERROR_BYTES = 64 * 1024
 ROOT = "http://127.0.0.1:8000"
 
 
@@ -244,8 +245,16 @@ def capture(request: Path, directory: Path) -> None:
             ) as response,
             raw.open("wb") as output,
         ):
-            response.raise_for_status()
             report["http_status"] = response.status_code
+            if response.status_code >= 400:
+                body = bytearray()
+                for chunk in response.iter_content(chunk_size=1024):
+                    body.extend(chunk)
+                    if len(body) > HTTP_ERROR_BYTES:
+                        break
+                (directory / "http-error.bin").write_bytes(body[:HTTP_ERROR_BYTES])
+                report["http_error_truncated"] = len(body) > HTTP_ERROR_BYTES
+            response.raise_for_status()
             lines = []
             pending = b""
             total = 0

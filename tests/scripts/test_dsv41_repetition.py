@@ -2,6 +2,7 @@
 """CPU tests for bounded replay, loop detection and failure evidence."""
 
 import gzip
+import io
 import json
 import re
 import signal
@@ -12,6 +13,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+import requests
 
 sys.path.insert(
     0, str(Path(__file__).resolve().parents[2] / "scripts/dsv41_bench/server_steps")
@@ -364,6 +366,33 @@ def test_http_capture_preserves_transcript_and_fails_closed(
         (out / "effective-request.json").read_bytes()
     )
     assert (out / "partial-text.json").exists()
+
+
+@pytest.mark.parametrize("oversized", [False, True])
+def test_http_error_retains_bounded_body_and_remains_inconclusive(
+    tmp_path, monkeypatch, oversized
+):
+    path = fixture(tmp_path, monkeypatch)
+    body = (
+        b"x" * (check.HTTP_ERROR_BYTES + 100)
+        if oversized
+        else b'{"error":{"message":"auto tool choice requires a tool parser"}}'
+    )
+    response = requests.Response()
+    response.status_code = 400
+    response.url = check.ROOT + "/v1/chat/completions"
+    response.raw = io.BytesIO(body)
+    monkeypatch.setattr(check.requests, "post", lambda *a, **kw: response)
+    out = tmp_path / "capture"
+    with pytest.raises(requests.HTTPError, match="400"):
+        check.capture(path, out)
+    result = json.loads((out / "result.json").read_text())
+    assert result["http_status"] == 400
+    assert result["status"] == "inconclusive"
+    assert result["http_error_truncated"] is oversized
+    assert result["events"] == 0 and result["candidate"] is None
+    assert (out / "http-error.bin").read_bytes() == body[: check.HTTP_ERROR_BYTES]
+    assert (out / "response.sse").read_bytes() == b""
 
 
 @pytest.mark.parametrize("invalid", ["window", "token_count", "fixture"])

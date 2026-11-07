@@ -22,6 +22,9 @@ exactly that count from `/tokenize` before any replay. Do not silently use the
 original count after redaction or skip a failed identity check.
 
 CI changes only the served-model alias, `stream=true` and `max_tokens=8192`.
+The shared DP16 API enables automatic tool choice and the `deepseek_v41` tool
+and reasoning parsers. HTTP failures remain inconclusive; the evidence archive
+retains the status and up to 64 KiB of the error body for diagnosis.
 It reuses the DP16 decode benchmark's serve for up to five serial requests,
 300 seconds per request, with drain/reset before each request and at the end.
 The first loop or infrastructure/protocol failure stops further requests.

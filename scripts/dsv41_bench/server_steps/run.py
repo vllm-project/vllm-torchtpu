@@ -258,6 +258,15 @@ def main() -> None:
         # headless remote engines. Only the headless worker needs the offset.
         if worker:
             server_command += ["--data-parallel-start-rank", "8"]
+        else:
+            # The shared API also handles the replay's chat tools and reasoning.
+            server_command += [
+                "--enable-auto-tool-choice",
+                "--tool-call-parser",
+                "deepseek_v41",
+                "--reasoning-parser",
+                "deepseek_v41",
+            ]
     if args.profile:
         server_command += [
             "--profiler-config",
