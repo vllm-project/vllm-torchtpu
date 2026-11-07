@@ -47,6 +47,7 @@ def inner_kernel(
     carry_conv_scratch_ref: jax.Array | None,
     carry_recurrent_scratch_ref: jax.Array | None,
     window_scratch_refs: tuple[jax.Array, ...] | None = None,
+    packed_scratch_refs: tuple[jax.Array, ...] | None = None,
     *,
     cfg: config.GDNConfig,
     p_id: jax.Array | None = None,
@@ -78,6 +79,9 @@ def inner_kernel(
         window_scratch_refs: Optional VMEM scratches of window_tile (head
             states, conv inputs, conv weights); verify-window tiles it
             supports run there.
+        packed_scratch_refs: With `cfg.packed_tokens` outside window_tile,
+            the VMEM qkv, b and a tiles built from the packed tile in
+            `qkv_slot_ref`.
         cfg: GDN configuration object.
         p_id: Optional explicit tile index. Communication-fused outer kernels
             pass their global compute-tile index because their surrounding
@@ -116,6 +120,12 @@ def inner_kernel(
             p_id=p_id,
         )
         return
+
+    if cfg.packed_tokens:
+        assert packed_scratch_refs is not None
+        qkv_slot_ref, b_slot_ref, a_slot_ref = _unpack_tokens(
+            qkv_slot_ref, packed_scratch_refs, cfg
+        )
 
     # Prepare states.
     real_sizes, prev_conv, prev_recurrent = vmem_ldst.load_and_select_states(
@@ -277,6 +287,25 @@ def inner_kernel(
         carry_recurrent_scratch_ref[...] = new_recurrent_state[:, -1]
 
 
+def _unpack_tokens(
+    packed_ref: jax.Array,  # [seq, chunk, dim_size / 128 + 2, 128]
+    scratch_refs: tuple[jax.Array, jax.Array, jax.Array],
+    cfg: config.GDNConfig,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """Copies a packed tile's qkv, b and a rows into the [seq, chunk, 1,
+    width] tiles inner_kernel reads; values are unchanged."""
+    qkv_ref, b_ref, a_ref = scratch_refs
+    lanes = pltpu.get_tpu_info().num_lanes
+    rows = cfg.dim_size // lanes
+    for idx in range(cfg.seq_tile_size):
+        qkv_rows = qkv_ref.at[idx].reshape(-1, lanes)
+        for t in range(cfg.chunk_size):
+            qkv_rows[pl.ds(t * rows, rows)] = packed_ref[idx, t, pl.ds(0, rows)]
+            b_ref[idx, t] = packed_ref[idx, t, pl.ds(rows, 1)]
+            a_ref[idx, t] = packed_ref[idx, t, pl.ds(rows + 1, 1)]
+    return qkv_ref, b_ref, a_ref
+
+
 def outer_kernel(
     # Inputs.
     metadata_ref: memory_ref.MetadataRef,
@@ -295,6 +324,7 @@ def outer_kernel(
     carry_conv_scratch_ref: jax.Array | None,
     carry_recurrent_scratch_ref: jax.Array | None,
     window_scratch_refs: tuple[jax.Array, ...] | None = None,
+    packed_scratch_refs: tuple[jax.Array, ...] | None = None,
     *,
     cfg: config.GDNConfig,
 ):
@@ -333,6 +363,7 @@ def outer_kernel(
         carry_conv_scratch_ref,
         carry_recurrent_scratch_ref,
         window_scratch_refs,
+        packed_scratch_refs,
     )
 
     num_tiles = metadata_ref.num_tiles[...]
@@ -381,6 +412,15 @@ def outer_kernel(
         refs = (qkv_ref, b_ref, a_ref, conv_state_ref, recurrent_state_ref, out_ref)
     # qkv, b, a and the two state reads; the rest are outputs.
     num_inputs = 5
+    if cfg.packed_tokens:
+        # b and a ride in the packed qkv tile.
+        allocs = (allocs[0], *allocs[3:])
+        refs = (refs[0], *refs[3:])
+        num_inputs = 3
+        unpacked_body = body
+
+        def body(tokens, *rest):
+            unpacked_body(tokens, None, None, *rest)
 
     pipeline_func = pltpu.emit_pipeline(
         body=body,
@@ -464,6 +504,7 @@ def windowed_decode_tile_size(
         "state_plan",
         "attention_mode",
         "gate_lower_bound",
+        "packed_tokens",
     ),
 )
 def fused_conv1d_gdn(
@@ -500,6 +541,7 @@ def fused_conv1d_gdn(
     # TODO(kyuyeunk): Calculate tile size based on input dimensions.
     decode_tile_size: int = 4,
     mixed_tile_size: int = 64,
+    packed_tokens: bool = False,
 ) -> tuple[tuple[jax.Array, jax.Array], jax.Array] | tuple[jax.Array, jax.Array]:
     """Perform conv1d and gdn in a single fused kernel.
 
@@ -571,6 +613,10 @@ def fused_conv1d_gdn(
         decode_tile_size: Tile size along sequence dimension for decode sequences.
         mixed_tile_size: Tile size along token/chunk dimension for prefill/mixed
             sequences.
+        packed_tokens: Pass qkv, b and a to both kernels as one [tokens,
+            dim / 128 + 2, 128] array (GDNConfig.packed_tokens) where the
+            verify windows run window_tile, instead of one [tokens, 1, width]
+            array each.
 
     Returns:
         (new_conv_state, new_recurrent_state): Updated convolution state cache and
@@ -705,9 +751,62 @@ def fused_conv1d_gdn(
     b = jnp.pad(b, ((0, batch_padding_size), (0, num_v_padding_size)))
     a = jnp.pad(a, ((0, batch_padding_size), (0, gate_padding_size)))
 
-    qkv = qkv.reshape(padded_batch_size, 1, -1)
-    b = b.reshape(padded_batch_size, 1, -1)
-    a = a.reshape(padded_batch_size, 1, -1)
+    def make_cfg(mode: config.GDNMode, packed: bool = False) -> config.GDNConfig:
+        if mode == config.GDNMode.PER_SEQ:
+            tile_size = mixed_tile_size
+            # Prefill / mixed sequences keep a single state checkpoint.
+            window_size = 1
+        else:
+            tile_size = decode_tile_size
+            window_size = num_spec_tokens + 1
+        return config.GDNConfig(
+            mode=mode,
+            batch_size=padded_batch_size,
+            kernel_size=kernel_size,
+            tile_size=tile_size,
+            window_size=window_size,
+            dim_size=dim,
+            num_kq_heads=n_kq,
+            num_v_heads=n_v,
+            kq_head_dim=d_k,
+            v_head_dim=d_v,
+            attention_mode=attention_mode,
+            gate_lower_bound=gate_lower_bound,
+            dtypes=config.Dtypes(
+                act_in=act_in_dtype,
+                act_out=act_out_dtype,
+                compute=compute_precision,
+                recurrent_state=(
+                    jnp.float32.dtype if pooled else recurrent_state.dtype
+                ),
+                conv_state=(jnp.float32.dtype if pooled else conv_state.dtype),
+            ),
+            state_plan=state_plan,
+            packed_tokens=packed,
+        )
+
+    # Packed activations: only where window_tile runs the verify windows.
+    batched_cfg = make_cfg(config.GDNMode.BATCHED)
+    packed = (
+        packed_tokens
+        and pooled
+        and dim % num_lanes == 0
+        and gate_dim <= num_lanes
+        and aligned_num_v_heads == num_lanes
+        and batched_cfg.per_head_windows
+        and window_tile.supported(
+            batched_cfg, state_source.shape[1:], state_source.dtype
+        )
+    )
+    if packed:
+        tokens = jnp.concat([qkv, b, a], axis=1).reshape(
+            padded_batch_size, -1, num_lanes
+        )
+        qkv = b = a = tokens
+    else:
+        qkv = qkv.reshape(padded_batch_size, 1, -1)
+        b = b.reshape(padded_batch_size, 1, -1)
+        a = a.reshape(padded_batch_size, 1, -1)
 
     # Step 3: States and weights pre-processing.
     # TODO(kyuyeunk): To eliminate runtime cost, move this logic into model
@@ -737,38 +836,7 @@ def fused_conv1d_gdn(
     ) -> tuple[jax.Array, jax.Array, jax.Array | None]:
         # With a state source, it rides the conv-state slot and the dense
         # recurrent-state input is absent.
-        if mode == config.GDNMode.PER_SEQ:
-            tile_size = mixed_tile_size
-            # Prefill / mixed sequences keep a single state checkpoint.
-            window_size = 1
-        else:
-            tile_size = decode_tile_size
-            window_size = num_spec_tokens + 1
-
-        cfg = config.GDNConfig(
-            mode=mode,
-            batch_size=padded_batch_size,
-            kernel_size=kernel_size,
-            tile_size=tile_size,
-            window_size=window_size,
-            dim_size=dim,
-            num_kq_heads=n_kq,
-            num_v_heads=n_v,
-            kq_head_dim=d_k,
-            v_head_dim=d_v,
-            attention_mode=attention_mode,
-            gate_lower_bound=gate_lower_bound,
-            dtypes=config.Dtypes(
-                act_in=act_in_dtype,
-                act_out=act_out_dtype,
-                compute=compute_precision,
-                recurrent_state=(
-                    jnp.float32.dtype if pooled else in_recurrent_state.dtype
-                ),
-                conv_state=(jnp.float32.dtype if pooled else in_conv_state.dtype),
-            ),
-            state_plan=state_plan,
-        )
+        cfg = make_cfg(mode, packed)
 
         # Step 6: Metadata preprocessing. Will be executed multiple times per-layer
         # but will be CSEed by compiler.

@@ -122,6 +122,11 @@ class GDNConfig:
     # shapes and loops can be sized off it unconditionally and the extra axis
     # / iterations fold away in the non-speculative paths.
     window_size: int = 1
+    # The activations arrive as one [tokens, dim_size / 128 + 2, 128] FP32
+    # array: each token's qkv rows, then its b row and its a row (lanes
+    # padded with zeros). window_tile reads it directly; per-sequence tiles
+    # build their one-token-per-register tiles from it in VMEM.
+    packed_tokens: bool = False
 
     @property
     def chunk_size(self) -> int:
@@ -301,8 +306,20 @@ class GDNConfig:
                 ),
             )
 
-        return dict(
+        packed_scratches = None
+        if self.packed_tokens and not self.per_head_windows:
+            act_shape = (self.seq_tile_size, self.chunk_size, 1)
+            packed_scratches = (
+                pltpu.VMEM((*act_shape, self.dim_size), jnp.float32),
+                pltpu.VMEM((*act_shape, self.aligned_num_v_heads), jnp.float32),
+                pltpu.VMEM((*act_shape, self.aligned_gate_dim), jnp.float32),
+            )
+
+        scratches = dict(
             carry_conv_scratch_ref=carry_conv_scratch,
             carry_recurrent_scratch_ref=carry_recurrent_scratch,
             window_scratch_refs=window_scratches,
         )
+        if packed_scratches is not None:
+            scratches["packed_scratch_refs"] = packed_scratches
+        return scratches

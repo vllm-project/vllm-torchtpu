@@ -153,9 +153,9 @@ def _store_conv_ckpt(slot_ref: jax.Ref, cfg: config.GDNConfig, taps) -> None:
 
 
 def run(
-    qkv_slot_ref: jax.Ref,  # [seq, chunk, 1, dim_size] FP32
-    b_slot_ref: jax.Ref,  # [seq, chunk, 1, lanes]
-    a_slot_ref: jax.Ref,  # [seq, chunk, 1, lanes]
+    qkv_slot_ref: jax.Ref,  # [seq, chunk, 1, dim_size] FP32 or packed tokens
+    b_slot_ref: jax.Ref | None,  # [seq, chunk, 1, lanes]; None when packed
+    a_slot_ref: jax.Ref | None,  # [seq, chunk, 1, lanes]; None when packed
     conv_in_ref: jax.Ref,  # [seq, 1, nblocks, *block]
     rec_in_ref: jax.Ref,  # [seq, 1, nblocks, *block]
     out_slot_ref: jax.Ref,  # [seq, chunk, num_v_heads, v_head_dim]
@@ -195,9 +195,12 @@ def run(
         )
         for tap in range(prev):
             lhs_ref[idx, tap] = prev_taps[tap * rows : (tap + 1) * rows]
-        tokens = qkv_slot_ref.at[idx].reshape(-1, lanes)
         for t in range(cfg.chunk_size):
-            lhs_ref[idx, prev + t] = _to_stored(tokens[pl.ds(t * rows, rows)], cfg)
+            if cfg.packed_tokens:
+                token = qkv_slot_ref[idx, t, pl.ds(0, rows)]
+            else:
+                token = qkv_slot_ref.at[idx].reshape(-1, lanes)[pl.ds(t * rows, rows)]
+            lhs_ref[idx, prev + t] = _to_stored(token, cfg)
     for k in range(ks):
         weight = weights_ref.conv.weight.at[k].reshape(-1, lanes)[...]
         conv_w_ref[k] = _to_stored(weight.astype(jnp.float32), cfg)
@@ -249,12 +252,13 @@ def run(
                 [lhs_ref[idx, start + j] for j in range(prev)],
             )
 
-            beta = jnp.where(
-                valid, jax.nn.sigmoid(b_slot_ref[idx, pos].astype(compute)), 0
-            )
-            gating = neg_a * jax.nn.softplus(
-                a_slot_ref[idx, pos].astype(compute) + dt_bias
-            )
+            if cfg.packed_tokens:
+                b_row = qkv_slot_ref[idx, pos, pl.ds(rows, 1)]
+                a_row = qkv_slot_ref[idx, pos, pl.ds(rows + 1, 1)]
+            else:
+                b_row, a_row = b_slot_ref[idx, pos], a_slot_ref[idx, pos]
+            beta = jnp.where(valid, jax.nn.sigmoid(b_row.astype(compute)), 0)
+            gating = neg_a * jax.nn.softplus(a_row.astype(compute) + dt_bias)
             gating = jnp.exp(jnp.where(valid, gating, 0))
 
             out_rows = []

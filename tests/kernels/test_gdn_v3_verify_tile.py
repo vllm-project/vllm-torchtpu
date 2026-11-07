@@ -346,3 +346,19 @@ def test_window_tile_matches_inner_kernel(schedule, monkeypatch):
             monkeypatch, _pooled_call, ref_pool, step, weights
         )
         _assert_same((out, pool), (ref_out, ref_pool), f"{schedule} step {i}")
+
+
+@pytest.mark.parametrize("schedule", sorted(WINDOW_SCHEDULES))
+def test_packed_tokens_match_per_token_tiles(schedule):
+    # Packed activations change only the operand layout: verify windows,
+    # prefill chunks after them and one-token decodes keep every bit.
+    num_spec, steps = WINDOW_SCHEDULES[schedule]
+    seqs = len(steps[0]["lens"])
+    weights = _weights(7)
+    pool = _pool(8, 1 + seqs * (num_spec + 1) + 1)
+    ref_pool = jnp.array(pool, copy=True)
+    for i, spec in enumerate(steps):
+        step = _step(40 + i, num_spec, **spec)
+        pool, out = _pooled_call(pool, dict(step, packed_tokens=True), weights)
+        ref_pool, ref_out = _pooled_call(ref_pool, step, weights)
+        _assert_same((out, pool), (ref_out, ref_pool), f"{schedule} step {i}")

@@ -683,6 +683,14 @@ def create_allocs(
         raise ValueError("Compact external state outputs are not split.")
 
     qkv_shape = (cfg.seq_tile_size, cfg.chunk_size, 1, cfg.dim_size)
+    if cfg.packed_tokens:
+        num_lanes = pltpu.get_tpu_info().num_lanes
+        qkv_shape = (
+            cfg.seq_tile_size,
+            cfg.chunk_size,
+            pl.cdiv(cfg.dim_size, num_lanes) + 2,
+            num_lanes,
+        )
     b_shape = (cfg.seq_tile_size, cfg.chunk_size, 1, cfg.aligned_num_v_heads)
     # Same shape as b under GDN; under KDA the gate is per-channel, so it is
     # d_k times wider (see GDNConfig.gate_dim).
@@ -715,8 +723,10 @@ def create_allocs(
         metadata_ref=metadata_ref,
     )
     qkv_alloc = in_buffered_partial(spec=qkv_spec, dtype_or_type=qkv_ref)
-    b_alloc = in_buffered_partial(spec=b_spec, dtype_or_type=b_ref)
-    a_alloc = in_buffered_partial(spec=a_spec, dtype_or_type=a_ref)
+    b_alloc = a_alloc = None
+    if not cfg.packed_tokens:
+        b_alloc = in_buffered_partial(spec=b_spec, dtype_or_type=b_ref)
+        a_alloc = in_buffered_partial(spec=a_spec, dtype_or_type=a_ref)
 
     out_alloc = OutBufferedRef.output(
         spec=block_spec_partial(block_shape=out_shape),
