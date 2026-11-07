@@ -28,7 +28,7 @@ MAX_SEQS = 4
 NUM_PAGES = 40
 
 
-def _xla_write_rows(cache, rows, pages, slots, *, max_runs, interpret=False):
+def _xla_write_rows(cache, rows, pages, slots, *, max_runs, bits=None, interpret=False):
     """`msa_write.write_rows` as an XLA scatter (same contract).
 
     The Pallas write is covered by test_msa_write; this keeps the test on the
@@ -39,7 +39,17 @@ def _xla_write_rows(cache, rows, pages, slots, *, max_runs, interpret=False):
     return cache.at[pages, slots // packing, slots % packing].set(rows, mode="drop")
 
 
-def _small_steps_block_scores(index_q, index_cache, seq_lens, tables, cu_q, n, interp):
+def _small_steps_block_scores(
+    index_q,
+    index_cache,
+    seq_lens,
+    tables,
+    cu_q,
+    n,
+    interp,
+    scale_cache=None,
+    scale_row=None,
+):
     """`msa._block_scores` with 4 pages per grid step in both tile classes.
 
     The served defaults (up to 128 pages per step) are far too slow to run
@@ -58,6 +68,8 @@ def _small_steps_block_scores(index_q, index_cache, seq_lens, tables, cu_q, n, i
         pages_per_step=4,
         small_pages_per_step=4,
         interpret=interp,
+        scale_cache=scale_cache,
+        scale_row=scale_row,
     )
 
 
