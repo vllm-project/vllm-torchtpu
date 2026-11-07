@@ -32,9 +32,11 @@ import jax
 import numpy as np
 import torch
 
+from vllm_torchtpu.megakernel.errors import MegakernelConfigError
 from vllm_torchtpu.megakernel.runtime.contract import EligibilityResult
 from vllm_torchtpu.megakernel.runtime.eligibility import check_step_eligibility
 from vllm_torchtpu.megakernel.runtime.policy import BucketPolicy
+from vllm_torchtpu.megakernel_runtime.hooks import WEIGHT_CONSUMED
 from vllm_torchtpu.megakernel_runtime.plugin import (
     Bucket,
     Decline,
@@ -65,6 +67,7 @@ from .program import (
     HIDDEN_SIZE,
     TP_SIZE,
 )
+from .weight_stream import RankWeightStreamer, StreamStats
 
 KIMI_K3_NUM_EXPERTS = 896
 KIMI_K3_EP_GROUPS = 8
@@ -129,6 +132,84 @@ def observed_weights_snapshot() -> dict[str, ObservedMxfp4Entry]:
 def clear_observed_weights() -> None:
     """Clear the module-local MXFP4 weight observation store."""
     WEIGHT_STORE.clear()
+
+
+class StreamingWeightStore:
+    """Thread-safe per-rank single-copy streaming repacker store."""
+
+    def __init__(self) -> None:
+        """Initialize an empty per-rank streaming store."""
+        self._lock = threading.Lock()
+        self._streamers: dict[int, RankWeightStreamer] = {}
+
+    def consume(
+        self,
+        rank: int,
+        name: str,
+        tensor: torch.Tensor,
+        *,
+        opts: tuple[int, str] = (NUM_LAYERS, "tpu"),
+    ) -> object:
+        """Route `tensor` to the rank streamer and return `WEIGHT_CONSUMED`."""
+        num_layers, device = opts
+        with self._lock:
+            streamer = self._streamers.get(rank)
+            if (
+                streamer is None
+                or streamer.num_layers != num_layers
+                or streamer.device != device
+            ):
+                streamer = RankWeightStreamer(
+                    rank, num_layers=num_layers, device=device
+                )
+                self._streamers[rank] = streamer
+        return streamer.consume(name, tensor)
+
+    def snapshot(self, rank: int = 0) -> dict[str, torch.Tensor]:
+        """Return a shallow copy of uploaded device tensors for `rank`."""
+        with self._lock:
+            streamer = self._streamers.get(rank)
+            return dict(streamer.device_tensors) if streamer is not None else {}
+
+    def stats(self, rank: int = 0) -> StreamStats | None:
+        """Return staging telemetry for `rank`, or `None` if uninitialized."""
+        with self._lock:
+            streamer = self._streamers.get(rank)
+            return streamer.stats() if streamer is not None else None
+
+    def verify_complete(self, rank: int = 0) -> None:
+        """Assert stream completeness and clean staging buffers for `rank`."""
+        with self._lock:
+            streamer = self._streamers.get(rank)
+            if streamer is None:
+                raise MegakernelConfigError(f"no weights were streamed for rank {rank}")
+            streamer.verify_complete()
+
+    def clear(self, rank: int | None = None) -> None:
+        """Evict streamer state for `rank` or all ranks when `rank` is `None`."""
+        with self._lock:
+            if rank is None:
+                self._streamers.clear()
+            else:
+                self._streamers.pop(rank, None)
+
+
+STREAM_STORE = StreamingWeightStore()
+
+
+def streamed_weights_snapshot(rank: int = 0) -> dict[str, torch.Tensor]:
+    """Return uploaded device tensors captured by `load_tensor` on `rank`."""
+    return STREAM_STORE.snapshot(rank)
+
+
+def streamed_staging_stats(rank: int = 0) -> StreamStats | None:
+    """Return staging telemetry for `rank` or None when uninitialized."""
+    return STREAM_STORE.stats(rank)
+
+
+def clear_streamed_weights(rank: int | None = None) -> None:
+    """Evict per-rank or global weight streamer caches from `STREAM_STORE`."""
+    STREAM_STORE.clear(rank)
 
 
 def _is_fp8_cache_dtype(dtype_str: str) -> bool:
@@ -207,16 +288,24 @@ def _default_kernel_position() -> int:
     return ids.index(dev_id)
 
 
-def _resolve_kernel_position(opts: Mapping[str, object]) -> int:
+def _resolve_kernel_position(
+    opts: Mapping[str, object], default_pos: int | None = None
+) -> int:
     """Return ascending-`device.id` rank position `p` in `0..31`."""
     raw_pos = opts.get("kernel_rank", opts.get("device_position"))
-    if raw_pos is None:
-        pos = _default_kernel_position()
-    elif isinstance(raw_pos, bool) or not isinstance(raw_pos, (int, str)):
-        msg = f"kernel_rank must be an integer, got {raw_pos!r}"
-        raise ValueError(msg)
+    if raw_pos is not None:
+        if isinstance(raw_pos, bool) or not isinstance(raw_pos, (int, str, np.integer)):
+            raise ValueError(f"kernel_rank must be an integer, got {raw_pos!r}")
+        try:
+            pos = int(raw_pos)
+        except (ValueError, TypeError) as err:
+            raise ValueError(
+                f"kernel_rank must be an integer, got {raw_pos!r}"
+            ) from err
+    elif default_pos is not None:
+        pos = int(default_pos)
     else:
-        pos = int(raw_pos)
+        pos = _default_kernel_position()
     if not 0 <= pos < TP_SIZE:
         msg = f"kernel_rank position must be in 0..{TP_SIZE - 1}, got {pos}"
         raise ValueError(msg)
@@ -317,11 +406,24 @@ def _slice_expert_shard(
 
 def load_tensor(
     name: str, tensor: torch.Tensor, options: Mapping[str, object] | None = None
-) -> None:
-    """Capture `1/32` rank-sliced routed-expert MXFP4 bytes and E8M0 scales before delattr."""
+) -> object:
+    """Stream single-copy TP32 weights or capture `1/32` routed-expert MXFP4 shards."""
     opts = dict(options) if isinstance(options, Mapping) else {}
     if not opts.get("load_tensors", False):
-        return
+        if bool(opts.get("consume_weights", False)):
+            raise ValueError("consume_weights=True requires load_tensors=True")
+        return None
+    low = name.lower()
+    if not bool(opts.get("consume_weights", False)) and "shared_expert" in low:
+        return None
+    if bool(opts.get("consume_weights", False)):
+        if tensor is None or not isinstance(tensor, torch.Tensor):
+            return WEIGHT_CONSUMED
+        position = _resolve_kernel_position(opts)
+        num_layers = _as_int(opts.get("num_layers", NUM_LAYERS), default=NUM_LAYERS)
+        raw_dev = opts.get("device", "tpu")
+        dev = raw_dev if isinstance(raw_dev, str) and raw_dev else "tpu"
+        return STREAM_STORE.consume(position, name, tensor, opts=(num_layers, dev))
     low = name.lower()
     if "shared_experts" in low:
         return
@@ -548,6 +650,11 @@ def validate_tpu_topology(
     dcp_raw = getattr(par_cfg, "decode_context_parallel_size", None)
     dcp_size = _as_int(dcp_raw) if dcp_raw is not None else None
     expected_dcp = TP_SIZE // max(1, attention_dp)
+    stream_rank = _resolve_kernel_position(opts, default_pos=view.tp_rank)
+    has_mxfp4 = bool(observed_weights) or (
+        bool(opts.get("consume_weights", False))
+        and bool(streamed_weights_snapshot(stream_rank))
+    )
     checks: tuple[tuple[bool, str, str], ...] = (
         (
             n_layers is None or hidden is None,
@@ -576,7 +683,7 @@ def validate_tpu_topology(
             "Kimi K3 TPU megakernel requires a loaded model",
         ),
         (
-            bool(opts.get("require_observed_mxfp4", False)) and not observed_weights,
+            bool(opts.get("require_observed_mxfp4", False)) and not has_mxfp4,
             "missing_mxfp4_weights",
             "no MXFP4 weights captured by load_tensor prior to create()",
         ),
@@ -619,6 +726,9 @@ class KimiK3ProgramConfig:
     observed_weights: Mapping[str, ObservedMxfp4Entry] = dataclasses.field(
         default_factory=dict
     )
+    streamed_weights: Mapping[str, torch.Tensor] = dataclasses.field(
+        default_factory=dict
+    )
 
 
 def create(
@@ -626,11 +736,17 @@ def create(
 ) -> KimiK3MonoProgram | Decline:
     """Validate Kimi K3 topology, snapshot observed weights, and clear store."""
     observed = observed_weights_snapshot()
+    opts = dict(options or {})
+    consume_mode = bool(opts.get("consume_weights", False))
+    stream_rank = _resolve_kernel_position(opts, default_pos=view.tp_rank)
     try:
-        opts = dict(options or {})
         hf_cfg = view.hf_config
         n_layers, hidden, hf_decline = _validate_hf_config(hf_cfg)
         if hf_decline is not None:
+            if consume_mode:
+                raise MegakernelConfigError(
+                    f"Kimi-K3 checkpoint weights were consumed; cannot decline megakernel: {hf_decline.message}"
+                )
             return hf_decline
 
         raw_dev_type = getattr(view.device, "type", "cpu")
@@ -651,16 +767,27 @@ def create(
                 observed,
             )
             if tpu_decline is not None:
+                if consume_mode:
+                    raise MegakernelConfigError(
+                        f"Kimi-K3 checkpoint weights were consumed; cannot decline megakernel: {tpu_decline.message}"
+                    )
                 return tpu_decline
         elif tp_size not in SUPPORTED_CPU_TP_SIZES:
-            return Decline(
-                "unsupported_tp_size",
-                f"CPU test runner tp_size={tp_size} outside {SUPPORTED_CPU_TP_SIZES}",
-            )
+            msg = f"CPU test runner tp_size={tp_size} outside {SUPPORTED_CPU_TP_SIZES}"
+            if consume_mode:
+                raise MegakernelConfigError(
+                    f"Kimi-K3 checkpoint weights were consumed; cannot decline megakernel: {msg}"
+                )
+            return Decline("unsupported_tp_size", msg)
 
         decode_buckets, verify_buckets = _resolve_buckets(opts)
         if not decode_buckets and not verify_buckets:
-            return Decline("empty_buckets", "no decode or verify buckets configured")
+            msg = "no decode or verify buckets configured"
+            if consume_mode:
+                raise MegakernelConfigError(
+                    f"Kimi-K3 checkpoint weights were consumed; cannot decline megakernel: {msg}"
+                )
+            return Decline("empty_buckets", msg)
 
         default_hidden = (
             _as_int(
@@ -677,6 +804,17 @@ def create(
             opts.get("max_slots", DEFAULT_MAX_SLOTS), default=DEFAULT_MAX_SLOTS
         )
 
+        if consume_mode:
+            try:
+                STREAM_STORE.verify_complete(stream_rank)
+            except (ValueError, MegakernelConfigError) as err:
+                raise MegakernelConfigError(
+                    f"Kimi-K3 streaming weight verification failed: {err}"
+                ) from err
+            streamed = streamed_weights_snapshot(stream_rank)
+        else:
+            streamed = {}
+
         return KimiK3MonoProgram(
             KimiK3ProgramConfig(
                 tp_rank=view.tp_rank,
@@ -690,10 +828,13 @@ def create(
                 options=opts,
                 view=view,
                 observed_weights=observed,
+                streamed_weights=streamed,
             )
         )
     finally:
         clear_observed_weights()
+        if consume_mode:
+            clear_streamed_weights(stream_rank)
 
 
 class KimiK3MonoProgram:
@@ -716,6 +857,7 @@ class KimiK3MonoProgram:
         self.observed_weights: dict[str, ObservedMxfp4Entry] = dict(
             config.observed_weights
         )
+        self.streamed_weights: dict[str, torch.Tensor] = dict(config.streamed_weights)
         self.decoder: object = None
         self.bound_pools: object = None
         self.bucket_out_rows: dict[tuple[int, int], int] = {}
@@ -1005,7 +1147,14 @@ __all__ = [
     "KimiK3MonoProgram",
     "KimiK3ProgramConfig",
     "ObservedMxfp4Entry",
+    "RankWeightStreamer",
+    "StreamStats",
+    "StreamingWeightStore",
+    "STREAM_STORE",
     "clear_observed_weights",
+    "clear_streamed_weights",
+    "streamed_staging_stats",
+    "streamed_weights_snapshot",
     "create",
     "layout_request",
     "load_tensor",

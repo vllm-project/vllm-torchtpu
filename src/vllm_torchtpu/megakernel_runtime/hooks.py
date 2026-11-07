@@ -176,6 +176,9 @@ def apply_layout_request(vllm_config: object) -> dict[str, Any] | None:
     return req
 
 
+WEIGHT_CONSUMED: object = object()
+
+
 def load_tensor_stream(
     vllm_config: object,
     weights: Iterable[tuple[str, object]],
@@ -188,11 +191,15 @@ def load_tensor_stream(
     fn, options = res
     for name, tensor in weights:
         out = fn(name, tensor, options)
+        if out is WEIGHT_CONSUMED:
+            continue
         yield out if isinstance(out, tuple) and len(out) == 2 else (name, tensor)
 
 
 __all__ = [
     "StepContext",
+    "WEIGHT_CONSUMED",
+    "load_tensor_stream",
     "apply_layout_request",
     "is_suppressed",
     "load_tensor_stream",

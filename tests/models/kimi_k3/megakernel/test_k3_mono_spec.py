@@ -15,13 +15,17 @@
 
 from __future__ import annotations
 
+import json
+from collections.abc import Iterator
 from types import SimpleNamespace
 from typing import TYPE_CHECKING
+from unittest import mock
 
 import numpy as np
 import pytest
 import torch
 
+from vllm_torchtpu.megakernel.errors import MegakernelConfigError
 from vllm_torchtpu.megakernel.runtime.contract import (
     DOMAIN_KERNEL_MESH,
     PAR_DP,
@@ -42,9 +46,19 @@ from vllm_torchtpu.megakernel_runtime.testkit import (
     run_cpu_e2e,
     run_two_ranks,
 )
-from vllm_torchtpu.models.kimi_k3.megakernel import SPEC, adapter
+from vllm_torchtpu.models.kimi_k3.megakernel import SPEC, adapter, weight_stream
 from vllm_torchtpu.models.kimi_k3.megakernel.adapter import create
-from vllm_torchtpu.models.kimi_k3.megakernel.kernels.load import pack_expert_bytes
+from vllm_torchtpu.models.kimi_k3.megakernel.kernels import Config
+from vllm_torchtpu.models.kimi_k3.megakernel.kernels.load import (
+    BF16,
+    PREFIX,
+    Checkpoint,
+    pack_expert_bytes,
+    selected_local_shapes,
+)
+from vllm_torchtpu.models.kimi_k3.megakernel.kernels.load import (
+    _family_layers as canonical_family_layers,
+)
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -758,3 +772,455 @@ def test_k3_verify_buckets_validation_invalid(bad_verify: object) -> None:
             RunnerView(cpu_runner, tp_rank=0),
             {"buckets": [2], "verify_buckets": bad_verify},
         )
+
+
+SYNTH_NUM_LAYERS = 2
+SYNTH_TP_RANKS = 32
+
+
+def _family_layers(cfg: Config, fam: str, total_layers: int) -> list[int] | None:
+    """Return layer indices contributing to stacked `fam` array, or None."""
+    return canonical_family_layers(cfg, fam, total_layers)
+
+
+def _max_bit_diff(got_t: torch.Tensor, ref_np: np.ndarray) -> float:
+    """Compute maximum absolute difference between device tensor and NumPy reference."""
+    g = got_t.squeeze(0).cpu().contiguous()
+    if g.dtype == torch.bfloat16:
+        g_arr = g.view(torch.uint16).numpy().view(BF16)
+    else:
+        g_arr = g.numpy()
+    assert g_arr.shape == ref_np.shape, (g_arr.shape, ref_np.shape)
+    g_raw = np.ascontiguousarray(g_arr).view(np.uint8)
+    ref_raw = np.ascontiguousarray(ref_np).view(np.uint8)
+    diff = np.abs(g_raw.astype(np.int32) - ref_raw.astype(np.int32))
+    return float(np.max(diff))
+
+
+def _tensor_view(
+    mm: np.memmap, shape: tuple[int, ...], dt_name: str, a: int, b: int
+) -> torch.Tensor:
+    """Slice `mm[a:b]` as a zero-copy torch tensor with target shape/dtype."""
+    raw = mm[a:b]
+    if dt_name == "BF16":
+        arr = raw.view(np.uint16).reshape(shape)
+        return torch.from_numpy(arr).view(torch.bfloat16)
+    if dt_name == "F32":
+        arr = raw.view(np.float32).reshape(shape)
+        return torch.from_numpy(arr)
+    arr = raw.view(np.uint8).reshape(shape)
+    return torch.from_numpy(arr)
+
+
+def _write_synthetic_k3_checkpoint(
+    ckpt_dir: Path,
+) -> tuple[list[tuple[str, tuple[int, ...], str, int, int]], int]:
+    """Write a minimal 2-layer Kimi K3 safetensors checkpoint with valid E8M0 scales."""
+    cfg = Config()
+    entries = _build_synthetic_checkpoint_entries(cfg)
+    _write_synthetic_k3_config(ckpt_dir, cfg)
+    spans, data_base = _write_safetensors_file(ckpt_dir / "model.safetensors", entries)
+    index_json = {
+        "metadata": {"total_size": spans[-1][-1] if spans else 0},
+        "weight_map": {name: "model.safetensors" for name, *_ in entries},
+    }
+    with open(ckpt_dir / "model.safetensors.index.json", "w") as f:
+        json.dump(index_json, f)
+    return spans, data_base
+
+
+def _write_safetensors_file(
+    path: Path, entries: list[tuple[str, tuple[int, ...], str]]
+) -> tuple[list[tuple[str, tuple[int, ...], str, int, int]], int]:
+    """Serialize entry metadata and contiguous payload into a valid safetensors file."""
+    import json
+    hdr: dict[str, object] = {}
+    cur = 0
+    spans: list[tuple[str, tuple[int, ...], str, int, int]] = []
+    dtype_map = {"BF16": ("BF16", 2), "U8": ("U8", 1), "F32": ("F32", 4)}
+    for name, sh, dt in entries:
+        st_dt, sz = dtype_map[dt]
+        nbytes = int(np.prod(sh)) * sz
+        hdr[name] = {
+            "dtype": st_dt,
+            "shape": list(sh),
+            "data_offsets": [cur, cur + nbytes],
+        }
+        spans.append((name, sh, dt, cur, cur + nbytes))
+        cur += nbytes
+    hdr_bytes = json.dumps(hdr).encode("utf-8")
+    hdr_len = len(hdr_bytes)
+    with open(path, "wb") as f:
+        f.write(int(hdr_len).to_bytes(8, "little"))
+        f.write(hdr_bytes)
+        for name, sh, dt, a, b in spans:
+            sz = b - a
+            if "weight_scale" in name or "e8m0" in name:
+                f.write(np.full(sz, 128, dtype=np.uint8).tobytes())
+            elif dt == "BF16":
+                f.write(np.arange(sz // 2, dtype=np.uint16).tobytes())
+            elif dt == "F32":
+                f.write(np.zeros(sz // 4, dtype=np.float32).tobytes())
+            else:
+                f.write(np.zeros(sz, dtype=np.uint8).tobytes())
+    return spans, 8 + hdr_len
+
+
+def _build_synthetic_checkpoint_entries(
+    cfg: Config,
+) -> list[tuple[str, tuple[int, ...], str]]:
+    """Assemble expected checkpoint parameter tensor metadata for a 2-layer model."""
+    h, lat, eh = cfg.dim, cfg.latent, cfg.expert_hidden
+    entries: list[tuple[str, tuple[int, ...], str]] = [
+        (f"{PREFIX}embed_tokens.weight", (cfg.vocab, h), "BF16"),
+    ]
+    for l_id in range(SYNTH_NUM_LAYERS):
+        p = f"{PREFIX}layers.{l_id}."
+        entries.extend([
+            (f"{p}input_layernorm.weight", (h,), "BF16"),
+            (f"{p}post_attention_layernorm.weight", (h,), "BF16"),
+            (f"{p}self_attention_res_norm.weight", (h,), "BF16"),
+            (f"{p}self_attention_res_proj.weight", (1, h), "F32"),
+            (f"{p}mlp_res_norm.weight", (h,), "BF16"),
+            (f"{p}mlp_res_proj.weight", (1, h), "F32"),
+        ])
+        if l_id == 0:
+            entries.extend([
+                (f"{p}mlp.gate_proj.weight", (cfg.dense_hidden, h), "BF16"),
+                (f"{p}mlp.up_proj.weight", (cfg.dense_hidden, h), "BF16"),
+                (f"{p}mlp.down_proj.weight", (h, cfg.dense_hidden), "BF16"),
+            ])
+        else:
+            mp = f"{p}block_sparse_moe."
+            entries.extend([
+                (f"{mp}gate.weight", (cfg.experts, h), "BF16"),
+                (f"{mp}gate.e_score_correction_bias", (cfg.experts,), "BF16"),
+                (f"{mp}routed_expert_norm.weight", (lat,), "BF16"),
+                (f"{mp}routed_expert_down_proj.weight", (lat, h), "BF16"),
+                (f"{mp}routed_expert_up_proj.weight", (h, lat), "BF16"),
+                (
+                    f"{mp}shared_experts.gate_proj.weight",
+                    (cfg.shared_hidden, h),
+                    "BF16",
+                ),
+                (
+                    f"{mp}shared_experts.up_proj.weight",
+                    (cfg.shared_hidden, h),
+                    "BF16",
+                ),
+                (
+                    f"{mp}shared_experts.down_proj.weight",
+                    (h, cfg.shared_hidden),
+                    "BF16",
+                ),
+            ])
+            for eid in range(cfg.experts):
+                ep = f"{mp}experts.{eid}."
+                entries.extend([
+                    (f"{ep}w1.weight_packed", (eh, lat // 2), "U8"),
+                    (f"{ep}w1.weight_scale", (eh, lat // 32), "U8"),
+                    (f"{ep}w3.weight_packed", (eh, lat // 2), "U8"),
+                    (f"{ep}w3.weight_scale", (eh, lat // 32), "U8"),
+                    (f"{ep}w2.weight_packed", (lat, eh // 2), "U8"),
+                    (f"{ep}w2.weight_scale", (lat, eh // 32), "U8"),
+                ])
+        entries.extend([
+            (f"{p}self_attn.q_proj.weight", (cfg.heads * cfg.head_dim, h), "BF16"),
+            (f"{p}self_attn.k_proj.weight", (cfg.heads * cfg.head_dim, h), "BF16"),
+            (f"{p}self_attn.v_proj.weight", (cfg.heads * cfg.head_dim, h), "BF16"),
+            (f"{p}self_attn.g_proj.weight", (cfg.heads * cfg.head_dim, h), "BF16"),
+            (f"{p}self_attn.b_proj.weight", (cfg.heads, h), "BF16"),
+            (
+                f"{p}self_attn.q_conv1d.weight",
+                (cfg.heads * cfg.head_dim, 1, cfg.conv_size),
+                "BF16",
+            ),
+            (
+                f"{p}self_attn.k_conv1d.weight",
+                (cfg.heads * cfg.head_dim, 1, cfg.conv_size),
+                "BF16",
+            ),
+            (
+                f"{p}self_attn.v_conv1d.weight",
+                (cfg.heads * cfg.head_dim, 1, cfg.conv_size),
+                "BF16",
+            ),
+            (f"{p}self_attn.A_log", (cfg.heads,), "BF16"),
+            (f"{p}self_attn.dt_bias", (cfg.heads * cfg.head_dim,), "BF16"),
+            (f"{p}self_attn.f_a_proj.weight", (128, h), "BF16"),
+            (f"{p}self_attn.f_b_proj.weight", (cfg.heads * cfg.head_dim, 128), "BF16"),
+            (f"{p}self_attn.o_norm.weight", (cfg.head_dim,), "BF16"),
+            (f"{p}self_attn.o_proj.weight", (h, cfg.heads * cfg.head_dim), "BF16"),
+        ])
+    mla_p = f"{PREFIX}layers.3.self_attn."
+    entries.extend([
+        (f"{mla_p}q_a_proj.weight", (cfg.q_rank, h), "BF16"),
+        (f"{mla_p}kv_a_proj_with_mqa.weight", (cfg.kv_rank + cfg.qk_extra, h), "BF16"),
+        (f"{mla_p}q_b_proj.weight", (cfg.heads * 192, cfg.q_rank), "BF16"),
+        (f"{mla_p}kv_b_proj.weight", (cfg.heads * 256, cfg.kv_rank), "BF16"),
+        (f"{mla_p}g_proj.weight", (cfg.heads * cfg.head_dim, h), "BF16"),
+        (f"{mla_p}o_proj.weight", (h, cfg.heads * cfg.head_dim), "BF16"),
+        (f"{mla_p}q_a_layernorm.weight", (cfg.q_rank,), "BF16"),
+        (f"{mla_p}kv_a_layernorm.weight", (cfg.kv_rank,), "BF16"),
+        (f"{PREFIX}output_attn_res_norm.weight", (h,), "BF16"),
+        (f"{PREFIX}output_attn_res_proj.weight", (1, h), "F32"),
+        (f"{PREFIX}norm.weight", (h,), "BF16"),
+        ("language_model.lm_head.weight", (cfg.vocab, h), "BF16"),
+    ])
+    return entries
+
+
+def _write_synthetic_k3_config(ckpt_dir: Path, cfg: Config) -> None:
+    """Write synthetic Kimi K3 text_config to `config.json`."""
+    import json
+    hf_json = {
+        "text_config": {
+            "hidden_size": cfg.dim,
+            "routed_expert_hidden_size": cfg.latent,
+            "moe_intermediate_size": cfg.expert_hidden,
+            "num_shared_experts": cfg.shared_hidden // cfg.expert_hidden,
+            "intermediate_size": cfg.dense_hidden,
+            "num_experts": cfg.experts,
+            "num_experts_per_token": cfg.top_k,
+            "num_hidden_layers": cfg.layers,
+            "num_attention_heads": cfg.heads,
+            "q_lora_rank": cfg.q_rank,
+            "kv_lora_rank": cfg.kv_rank,
+            "qk_rope_head_dim": cfg.qk_extra,
+            "vocab_size": cfg.vocab,
+            "attn_res_block_size": cfg.residual_block,
+            "rms_norm_eps": cfg.eps,
+            "activation_situ_beta": cfg.situ_beta,
+            "activation_situ_linear_beta": cfg.situ_linear_beta,
+            "mla_use_nope": True,
+            "mla_use_output_gate": True,
+            "latent_moe_use_norm": True,
+            "moe_renormalize": True,
+            "moe_router_activation_func": "sigmoid",
+            "hidden_act": "situ",
+            "first_k_dense_replace": 1,
+            "moe_layer_freq": 1,
+            "num_expert_group": 1,
+            "routed_scaling_factor": 1.0,
+            "linear_attn_config": {
+                "use_full_rank_gate": True,
+                "head_dim": cfg.head_dim,
+                "short_conv_kernel_size": cfg.conv_size,
+                "gate_lower_bound": cfg.gate_lower_bound,
+                "full_attn_layers": [i + 1 for i in cfg.full_attention],
+            },
+        }
+    }
+    with open(ckpt_dir / "config.json", "w") as f:
+        json.dump(hf_json, f)
+
+
+def _verify_rank_parity(
+    ckpt: Checkpoint,
+    cfg: Config,
+    rank: int,
+    dev_tensors: dict[str, torch.Tensor],
+    expected_2l: dict[str, tuple[int, ...]],
+) -> float:
+    """Verify bit-exact parity between streamed tensors and reference loader."""
+    worst = 0.0
+    first = (cfg.experts // 8) * (rank // 4)
+    count = cfg.experts // 8
+    part = rank % 4
+    gu, gus, dn, ds = ckpt.experts(1, first, count, part=part, parts=4)
+    exp_refs = {
+        "expert_gu": np.asarray(gu, np.uint32)[None, ...],
+        "expert_gus": np.asarray(gus, np.uint8)[None, ...],
+        "expert_down": np.asarray(dn, np.uint32)[None, ...],
+        "expert_ds": np.asarray(ds, np.uint8)[None, ...],
+    }
+    for fam, exp_sh in expected_2l.items():
+        got = dev_tensors[fam]
+        assert tuple(got.shape) == (1, *exp_sh), (rank, fam, got.shape, exp_sh)
+        if fam in exp_refs:
+            worst = max(worst, _max_bit_diff(got, exp_refs[fam]))
+            continue
+        l_ids = _family_layers(cfg, fam, SYNTH_NUM_LAYERS)
+        if l_ids is None:
+            ref = ckpt.dense_selected(fam, 0, rank)
+        else:
+            ref = np.stack([ckpt.dense_selected(fam, l_id, rank) for l_id in l_ids], 0)
+        worst = max(worst, _max_bit_diff(got, ref))
+    return worst
+
+
+def _assert_tpu_bridge_upload(cfg: Config) -> None:
+    """Verify TPU device mode delegates directly to `bridge.upload`."""
+    fake_bridge = SimpleNamespace(
+        upload=mock.Mock(
+            side_effect=lambda arr: torch.zeros((1, *arr.shape), dtype=torch.uint8)
+        )
+    )
+    pkg = weight_stream.__package__
+    shim_mods = {
+        f"{pkg}.runtime_shim": SimpleNamespace(__path__=[]),
+        f"{pkg}.runtime_shim.bridge": fake_bridge,
+    }
+    with mock.patch.dict("sys.modules", shim_mods):
+        tpu_streamer = adapter.RankWeightStreamer(0, num_layers=2, device="tpu")
+        res = tpu_streamer.consume(
+            "model.norm.weight", torch.ones((cfg.dim,), dtype=torch.bfloat16)
+        )
+        assert res is hooks_mod.WEIGHT_CONSUMED
+        assert fake_bridge.upload.call_count == 1
+        assert "final_norm" in tpu_streamer.device_tensors
+
+
+def test_single_copy_weight_consumed_stream(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Verify 32-rank bit-exact single-copy Kimi K3 streaming and host eviction."""
+    cfg = Config()
+    spans, data_base = _write_synthetic_k3_checkpoint(tmp_path)
+    ckpt = Checkpoint(tmp_path)
+    mm = np.memmap(
+        tmp_path / "model.safetensors", mode="r+", dtype=np.uint8, offset=data_base
+    )
+    expected_2l = selected_local_shapes(SYNTH_NUM_LAYERS, cfg.dim, vocab=cfg.vocab)
+
+    with mock.patch.object(
+        hooks_mod,
+        "_plugin_hook",
+        return_value=(adapter.load_tensor, {"load_tensors": True, "kernel_rank": 0}),
+    ):
+        passthrough = list(
+            hooks_mod.load_tensor_stream(
+                SimpleNamespace(),
+                [
+                    (spans[0][0], _tensor_view(mm, *spans[0][1:])),
+                    (spans[1][0], _tensor_view(mm, *spans[1][1:])),
+                ],
+            )
+        )
+    expected_passthrough_len = 2
+    assert len(passthrough) == expected_passthrough_len
+    adapter.clear_observed_weights()
+
+    _assert_tpu_bridge_upload(cfg)
+
+    max_diff = 0.0
+    max_peak_staging = 0
+    elem_bytes: dict[str, int] = {}
+    for rank in range(SYNTH_TP_RANKS):
+        opts: dict[str, object] = {
+            "load_tensors": True,
+            "consume_weights": True,
+            "kernel_rank": rank,
+            "num_layers": SYNTH_NUM_LAYERS,
+            "device": "cpu",
+        }
+
+        def _raw_iter() -> Iterator[tuple[str, torch.Tensor]]:
+            """Yield synthetic checkpoint tensors in shard order."""
+            for key, shape, dt, a, b in spans:
+                yield key, _tensor_view(mm, shape, dt, a, b)
+
+        with mock.patch.object(
+            hooks_mod, "_plugin_hook", return_value=(adapter.load_tensor, dict(opts))
+        ):
+            yielded = list(hooks_mod.load_tensor_stream(SimpleNamespace(), _raw_iter()))
+        assert yielded == []
+
+        stats = adapter.streamed_staging_stats(rank)
+        assert stats is not None
+        assert stats.peak_in_flight_layers == 1
+        assert stats.active_host_staging_bytes == 0
+        max_peak_staging = max(max_peak_staging, stats.peak_host_staging_bytes)
+
+        dev_tensors = adapter.streamed_weights_snapshot(rank)
+        if rank == 0:
+            elem_bytes = {k: v.element_size() for k, v in dev_tensors.items()}
+            fake = fake_runner(
+                hf_config=_kimi_hf_config(),
+                block_size=EXPECTED_BF16_BLOCK_SIZE,
+                token_paddings=(1, 4),
+            )
+            view = RunnerView(fake, tp_rank=0)
+            prog = create(view, {**opts, "buckets": (1, 4)})
+            assert not isinstance(prog, LayoutDecline)
+            assert hasattr(prog, "streamed_weights")
+            assert set(prog.streamed_weights) == set(expected_2l)
+            assert adapter.streamed_weights_snapshot(0) == {}
+        rank_diff = _verify_rank_parity(ckpt, cfg, rank, dev_tensors, expected_2l)
+        max_diff = max(max_diff, rank_diff)
+        adapter.clear_streamed_weights(rank)
+
+    assert max_diff == 0.0
+    shapes_93 = adapter.RankWeightStreamer(
+        0, num_layers=cfg.layers, device="cpu"
+    ).expected_shapes
+    total_93_bytes = sum(
+        int(np.prod((1, *sh))) * elem_bytes[fam] for fam, sh in shapes_93.items()
+    )
+    gib = float(1 << 30)
+    hbm_gib_per_tc = total_93_bytes / gib
+    staging_gib_per_tc = max_peak_staging / gib
+    assert hbm_gib_per_tc > 0
+    assert staging_gib_per_tc > 0
+
+
+def test_consume_weights_declined_raises_error() -> None:
+    """Verify consume_weights=True raises MegakernelConfigError when declined."""
+    fake = fake_runner(
+        hf_config=_kimi_hf_config(),
+        block_size=EXPECTED_BF16_BLOCK_SIZE,
+        token_paddings=(1, 4),
+    )
+    view = RunnerView(fake, tp_rank=0)
+    opts = {
+        "load_tensors": True,
+        "consume_weights": True,
+        "kernel_rank": 0,
+        "buckets": (),
+        "verify_buckets": (),
+    }
+    with pytest.raises(MegakernelConfigError, match="cannot decline megakernel"):
+        create(view, opts)
+
+
+def test_consume_weights_incomplete_stream_raises_error() -> None:
+    """Verify create raises MegakernelConfigError when stream has missing tensors."""
+    adapter.clear_streamed_weights(0)
+    fake = fake_runner(
+        hf_config=_kimi_hf_config(),
+        block_size=EXPECTED_BF16_BLOCK_SIZE,
+        token_paddings=(1, 4),
+    )
+    view = RunnerView(fake, tp_rank=0)
+    opts = {
+        "load_tensors": True,
+        "consume_weights": True,
+        "kernel_rank": 0,
+        "num_layers": 2,
+        "buckets": (1, 4),
+    }
+    with pytest.raises(
+        MegakernelConfigError, match="streaming weight verification failed|no weights"
+    ):
+        create(view, opts)
+
+
+def test_consume_weights_without_load_tensors_raises_value_error() -> None:
+    """Verify consume_weights=True without load_tensors=True raises ValueError."""
+    with pytest.raises(
+        ValueError, match="consume_weights=True requires load_tensors=True"
+    ):
+        adapter.load_tensor(
+            "model.norm.weight",
+            torch.ones((64,), dtype=torch.bfloat16),
+            {"consume_weights": True, "load_tensors": False},
+        )
+
+
+def test_resolve_kernel_position_rank_keys() -> None:
+    """Verify rank position resolution across explicit, device_position, and default."""
+    assert adapter._resolve_kernel_position({"kernel_rank": 7}) == 7
+    assert adapter._resolve_kernel_position({"device_position": 12}) == 12
+    assert adapter._resolve_kernel_position({}, default_pos=3) == 3
+    with pytest.raises(ValueError, match="position must be in 0..31"):
+        adapter._resolve_kernel_position({"kernel_rank": 32})

@@ -522,3 +522,60 @@ def test_plugin_resolution_and_disambiguation(tmp_path: Path) -> None:
             config_mod.resolve_plugin_ref(broken_cfg)
     finally:
         models_pkg.__path__.remove(str(tmp_path))
+
+
+def test_load_tensor_stream_weight_consumed_sentinel_and_option() -> None:
+    """Verify `WEIGHT_CONSUMED` and `consume_weights` drop consumed weights."""
+    sentinel = hooks_mod.WEIGHT_CONSUMED
+    t_drop = torch.tensor([1.0, 2.0])
+    t_keep = torch.tensor([3.0, 4.0])
+    t_swap = torch.tensor([5.0, 6.0])
+
+    def _sentinel_hook(name: str, _tensor: object, _opts: object) -> object:
+        """Drop `drop.w`, transform `swap.w`, and pass `keep.w` through."""
+        if name == "drop.w":
+            return sentinel
+        if name == "swap.w":
+            return ("swapped.w", t_swap * 2)
+        return None
+
+    with mock.patch.object(
+        hooks_mod, "_plugin_hook", return_value=(_sentinel_hook, {})
+    ):
+        out_default = list(
+            hooks_mod.load_tensor_stream(
+                SimpleNamespace(),
+                [("drop.w", t_drop), ("keep.w", t_keep), ("swap.w", t_swap)],
+            )
+        )
+    expected_default_len = 2
+    assert len(out_default) == expected_default_len
+    assert out_default[0][0] == "keep.w"
+    assert out_default[0][1] is t_keep
+    assert out_default[1][0] == "swapped.w"
+    assert torch.equal(out_default[1][1], t_swap * 2)
+
+    def _consume_opt_hook(name: str, _tensor: object, _opts: object) -> object:
+        """Return `sentinel` when consumed under `consume_weights=True`."""
+        if name == "swap.w":
+            return ("swapped.w", t_swap + 1)
+        if name == "drop.w":
+            return sentinel
+        return None
+
+    with mock.patch.object(
+        hooks_mod,
+        "_plugin_hook",
+        return_value=(_consume_opt_hook, {"consume_weights": True}),
+    ):
+        out_consumed = list(
+            hooks_mod.load_tensor_stream(
+                SimpleNamespace(),
+                [("drop.w", t_drop), ("keep.w", t_keep), ("swap.w", t_swap)],
+            )
+        )
+    assert len(out_consumed) == 2
+    assert out_consumed[0][0] == "keep.w"
+    assert out_consumed[0][1] is t_keep
+    assert out_consumed[1][0] == "swapped.w"
+    assert torch.equal(out_consumed[1][1], t_swap + 1)

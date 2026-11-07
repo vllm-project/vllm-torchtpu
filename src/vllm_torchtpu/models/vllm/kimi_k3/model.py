@@ -15,14 +15,12 @@
 
 from __future__ import annotations
 
-from collections.abc import Hashable, Iterable
-from typing import cast
+from typing import TYPE_CHECKING, cast
 from unittest.mock import patch
 
 import torch
 from torch import nn
 from vllm.compilation.decorators import support_torch_compile
-from vllm.config import VllmConfig
 from vllm.distributed import get_tp_group, tensor_model_parallel_all_gather
 from vllm.model_executor.layers.fused_moe import fused_moe_make_expert_params_mapping
 from vllm.model_executor.layers.layernorm import RMSNorm
@@ -31,7 +29,6 @@ from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateCopyFunc,
     MambaStateCopyFuncCalculator,
 )
-from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.quantization.compressed_tensors import (
     compressed_tensors,
 )
@@ -43,6 +40,7 @@ from vllm.model_executor.models import vision as vision_utils
 from vllm.model_executor.models.interfaces import (
     HasInnerState,
     IsHybrid,
+    MultiModalEmbeddings,
     SupportsEncoderCudaGraph,
     SupportsMultiModal,
     SupportsQuant,
@@ -68,11 +66,13 @@ from vllm.models.kimi_k3.common.mm_preprocess import (
     KimiK3ProcessingInfo,
 )
 from vllm.multimodal import MULTIMODAL_REGISTRY
-from vllm.multimodal.inputs import NestedTensors
 from vllm.platforms import current_platform
-from vllm.sequence import IntermediateTensors
-from vllm.transformers_utils.configs.kimi_k3 import KimiK3Config
-from vllm.transformers_utils.configs.kimi_linear import KimiLinearConfig
+from vllm.v1.worker.encoder_cudagraph_defs import (
+    EncoderCudaGraphCaptureInputs,
+    EncoderCudaGraphConfig,
+    EncoderCudaGraphReplayBuffers,
+    EncoderItemSpec,
+)
 
 from vllm_torchtpu import envs
 from vllm_torchtpu.logger import init_logger
@@ -84,16 +84,36 @@ from .kimi_vit import KimiK3MoonViT3dPretrainedModel
 from .layers import AttentionResidual, KimiMLP
 from .moe import KimiMoE
 
+if TYPE_CHECKING:
+    from collections.abc import Callable, Iterable, Iterator
+
+    from vllm.config import VllmConfig
+    from vllm.model_executor.layers.quantization import QuantizationConfig
+    from vllm.multimodal.inputs import NestedTensors
+    from vllm.sequence import IntermediateTensors
+    from vllm.transformers_utils.configs.kimi_k3 import KimiK3Config
+    from vllm.transformers_utils.configs.kimi_linear import KimiLinearConfig
+
 logger = init_logger(__name__)
+
+ASSERT_SP_PREFILL_TP_SIZE = 32
+ASSERT_GRID_THW_NDIM = 2
+ASSERT_GRID_THW_COLS = 3
+ASSERT_CONV_HEAD_GROUPS = 3
+_SHARD_ID_ATTR = "shard_id"
+_WEIGHT_LOADER_ATTR = "weight_loader"
 
 
 class KimiDecoderLayer(nn.Module):
+    """Single Kimi-K3 decoder layer combining KDA or MLA with dense MLP or MoE."""
+
     def __init__(
         self,
         config: KimiLinearConfig,
         vllm_config: VllmConfig,
         prefix: str,
     ) -> None:
+        """Initialize attention, feed-forward, norm, and block-residual modules."""
         super().__init__()
         self.layer_idx = int(prefix.rsplit(".", 1)[1])
         if config.is_kda_layer(self.layer_idx):
@@ -152,8 +172,10 @@ class KimiDecoderLayer(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         block_residuals: torch.Tensor | None,
+        *,
         sequence_parallel: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Apply attention, block-residual routing, and MLP/MoE to hidden states."""
         if self.attn_res_block_size is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
@@ -173,7 +195,9 @@ class KimiDecoderLayer(nn.Module):
                 )
             return residual + hidden_states, None
 
-        assert block_residuals is not None
+        if block_residuals is None:
+            msg = "block_residuals is required when attn_res_block_size is set"
+            raise ValueError(msg)
         prefix_sum = hidden_states
         if block_residuals.shape[-2] > 0:
             hidden_states = self.self_attention_res(prefix_sum, block_residuals)
@@ -207,9 +231,12 @@ class KimiDecoderLayer(nn.Module):
     }
 )
 class KimiModel(nn.Module):
+    """Kimi-Linear text backbone with optional sequence-parallel prefill."""
+
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
+        """Initialize token embeddings, decoder stack, and output norm."""
         super().__init__()
-        config = cast(KimiLinearConfig, vllm_config.model_config.hf_text_config)
+        config = cast("KimiLinearConfig", vllm_config.model_config.hf_text_config)
         logger.info(
             "Kimi optional features: mla_use_output_gate=%s, hidden_act=%s, "
             "activation_situ_beta=%s, activation_situ_linear_beta=%s, "
@@ -225,12 +252,13 @@ class KimiModel(nn.Module):
         if self.sp_prefill:
             parallel = vllm_config.parallel_config
             if (
-                parallel.tensor_parallel_size != 32
+                parallel.tensor_parallel_size != ASSERT_SP_PREFILL_TP_SIZE
                 or not parallel.enable_expert_parallel
                 or parallel.pipeline_parallel_size != 1
                 or parallel.data_parallel_size != 1
             ):
-                raise ValueError("K3 SP prefill requires TP32/EP32 and PP1/DP1")
+                msg = "K3 SP prefill requires TP32/EP32 and PP1/DP1"
+                raise ValueError(msg)
             self.sp_group = TokenShardCollectives(get_tp_group())
 
         self.embed_tokens = VocabParallelEmbedding(
@@ -259,6 +287,7 @@ class KimiModel(nn.Module):
             )
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+        """Look up token embeddings for `input_ids`."""
         return self.embed_tokens(input_ids)
 
     def forward(
@@ -267,10 +296,13 @@ class KimiModel(nn.Module):
         positions: torch.Tensor,
         inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]]:
+        """Propagate token embeddings or hidden states through decoder layers."""
         if inputs_embeds is not None:
             hidden_states = inputs_embeds
         else:
-            assert input_ids is not None
+            if input_ids is None:
+                msg = "Either input_ids or inputs_embeds must be provided"
+                raise ValueError(msg)
             hidden_states = self.embed_input_ids(input_ids)
         num_tokens = hidden_states.shape[0]
         sequence_parallel = (
@@ -289,7 +321,6 @@ class KimiModel(nn.Module):
             if self.attn_res_block_size is not None
             else None
         )
-        assert hidden_states is not None
 
         aux_hidden_states: list[torch.Tensor] = []
         if 0 in self.aux_hidden_state_layers:
@@ -356,8 +387,9 @@ class KimiLinearForCausalLM(nn.Module, HasInnerState, IsHybrid):
     )
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
+        """Initialize the Kimi text model, LM head, and logits processor."""
         super().__init__()
-        self.config = cast(KimiLinearConfig, vllm_config.model_config.hf_text_config)
+        self.config = cast("KimiLinearConfig", vllm_config.model_config.hf_text_config)
         self.model = KimiModel(
             vllm_config=vllm_config,
             prefix=maybe_prefix(prefix, "model"),
@@ -371,12 +403,15 @@ class KimiLinearForCausalLM(nn.Module, HasInnerState, IsHybrid):
         self.logits_processor = LogitsProcessor(self.config.vocab_size)
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+        """Look up token embeddings via the inner `KimiModel`."""
         return self.model.embed_input_ids(input_ids)
 
     def set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
+        """Configure auxiliary hidden-state capture layer indices."""
         invalid = [idx for idx in layers if idx < 0 or idx > len(self.model.layers)]
         if invalid:
-            raise ValueError(f"Invalid Kimi aux hidden-state layers: {invalid}")
+            msg = f"Invalid Kimi aux hidden-state layers: {invalid}"
+            raise ValueError(msg)
         self.model.aux_hidden_state_layers = tuple(layers)
 
     def forward(
@@ -385,9 +420,11 @@ class KimiLinearForCausalLM(nn.Module, HasInnerState, IsHybrid):
         positions: torch.Tensor,
         inputs_embeds: torch.Tensor | None = None,
         intermediate_tensors: object | None = None,
-    ) -> torch.Tensor:
+    ) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]]:
+        """Compute language-model hidden states across local decoder layers."""
         if intermediate_tensors is not None:
-            raise ValueError("The TPU Kimi model does not support PP")
+            msg = "The TPU Kimi model does not support PP"
+            raise ValueError(msg)
         return self.model(
             input_ids,
             positions,
@@ -395,6 +432,7 @@ class KimiLinearForCausalLM(nn.Module, HasInnerState, IsHybrid):
         )
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
+        """Project `hidden_states` to vocabulary logits."""
         return self.logits_processor(self.lm_head, hidden_states)
 
     def process_weights_after_loading(self) -> None:
@@ -416,6 +454,7 @@ class KimiLinearForCausalLM(nn.Module, HasInnerState, IsHybrid):
         cls,
         vllm_config: VllmConfig,
     ) -> tuple[torch.dtype, torch.dtype]:
+        """Return `(conv_state_dtype, ssm_state_dtype)` for KDA state caches."""
         # Same helper the layer uses. vLLM sizes the cache from here and
         # allocates from get_state_dtype, so the two cannot diverge.
         return kda_state_dtype(vllm_config)
@@ -424,19 +463,26 @@ class KimiLinearForCausalLM(nn.Module, HasInnerState, IsHybrid):
     def get_mamba_state_shape_from_config(
         cls,
         vllm_config: VllmConfig,
-    ) -> tuple[tuple[int, ...], tuple[int, int, int]]:
-        config = cast(KimiLinearConfig, vllm_config.model_config.hf_text_config)
+    ) -> tuple[tuple[int, int], tuple[int, int, int]]:
+        """Return `(conv_state_shape, ssm_state_shape)` for KDA state caches."""
+        config = cast("KimiLinearConfig", vllm_config.model_config.hf_text_config)
         kda_config = config.linear_attn_config
-        assert kda_config is not None
+        if kda_config is None:
+            msg = "KimiLinearConfig requires linear_attn_config for KDA state shapes"
+            raise ValueError(msg)
         local_heads = (
             kda_config["num_heads"] // vllm_config.parallel_config.tensor_parallel_size
         )
-        return (
+        conv_shape = cast(
+            "tuple[int, int]",
             (
                 kda_config["short_conv_kernel_size"] - 1,
                 1,
-                3 * local_heads * kda_config["head_dim"],
+                ASSERT_CONV_HEAD_GROUPS * local_heads * kda_config["head_dim"],
             ),
+        )
+        return (
+            conv_shape,
             (local_heads, kda_config["head_dim"], kda_config["head_dim"]),
         )
 
@@ -444,9 +490,32 @@ class KimiLinearForCausalLM(nn.Module, HasInnerState, IsHybrid):
     def get_mamba_state_copy_func(
         cls,
     ) -> tuple[MambaStateCopyFunc, MambaStateCopyFunc]:
+        """Return KDA state copy functions for prefix caching."""
         return MambaStateCopyFuncCalculator.kda_state_copy_func()
 
+    def _remap_fused_attention_weight(
+        self,
+        weight_key: str,
+        loaded_weight: torch.Tensor,
+        params_dict: dict[str, nn.Parameter],
+    ) -> str:
+        """Remap unfused attention projection names onto fused parameter shards."""
+        for (
+            weight_name,
+            param_name,
+            shard_id,
+        ) in self.fused_attention_params_mapping:
+            if weight_name not in weight_key:
+                continue
+            candidate = weight_key.replace(weight_name, param_name)
+            if candidate not in params_dict:
+                continue
+            setattr(loaded_weight, _SHARD_ID_ATTR, shard_id)
+            return candidate
+        return weight_key
+
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        """Stream and load dense, attention, and routed MoE weights."""
         expert_params_mapping = (
             fused_moe_make_expert_params_mapping(
                 self,
@@ -474,26 +543,19 @@ class KimiLinearForCausalLM(nn.Module, HasInnerState, IsHybrid):
         # 944 GB host at 8 ranks before loading finishes). Lazily interleaving
         # expert dispatch with AutoWeightsLoader consumption frees each host
         # tensor as soon as its parameter is loaded.
-        def _ordinary_weights():
-            for name, loaded_weight in mapper.apply(weights):
-                if name.startswith(("vision_tower.", "mm_projector.")):
+        def _ordinary_weights() -> Iterator[tuple[str, torch.Tensor]]:
+            """Yield non-expert weights while dispatching routed experts eagerly."""
+            for raw_name, loaded_weight in mapper.apply(weights):
+                if raw_name.startswith(("vision_tower.", "mm_projector.")):
                     continue
-                if experts_use_weight and name.endswith(".weight_packed"):
-                    name = name.replace(".weight_packed", ".weight")
-
-                for (
-                    weight_name,
-                    param_name,
-                    shard_id,
-                ) in self.fused_attention_params_mapping:
-                    if weight_name not in name:
-                        continue
-                    candidate = name.replace(weight_name, param_name)
-                    if candidate not in params_dict:
-                        continue
-                    name = candidate
-                    loaded_weight.shard_id = shard_id
-                    break
+                weight_key = (
+                    raw_name.replace(".weight_packed", ".weight")
+                    if experts_use_weight and raw_name.endswith(".weight_packed")
+                    else raw_name
+                )
+                weight_key = self._remap_fused_attention_weight(
+                    weight_key, loaded_weight, params_dict
+                )
 
                 for (
                     param_name,
@@ -501,21 +563,22 @@ class KimiLinearForCausalLM(nn.Module, HasInnerState, IsHybrid):
                     expert_id,
                     expert_shard_id,
                 ) in expert_params_mapping:
-                    if weight_name not in name:
+                    if weight_name not in weight_key:
                         continue
-                    name = name.replace(weight_name, param_name)
-                    parameter = params_dict[name]
-                    parameter.weight_loader(
+                    mapped_key = weight_key.replace(weight_name, param_name)
+                    parameter = params_dict[mapped_key]
+                    weight_loader = getattr(parameter, _WEIGHT_LOADER_ATTR)
+                    weight_loader(
                         parameter,
                         loaded_weight,
-                        name,
+                        mapped_key,
                         expert_id=expert_id,
                         shard_id=expert_shard_id,
                     )
-                    loaded_experts.add(name)
+                    loaded_experts.add(mapped_key)
                     break
                 else:
-                    yield name, loaded_weight
+                    yield weight_key, loaded_weight
 
         loader = AutoWeightsLoader(self)
         skip_mapper = (
@@ -565,19 +628,20 @@ class KimiK3ForConditionalGeneration(
 
     @classmethod
     def get_placeholder_str(cls, modality: str, i: int) -> str | None:
-        del i
-        if modality == "image":
+        """Return multimodal placeholder token string for `modality`."""
+        if modality == "image" and i >= 0:
             return "<|kimi_image_placeholder|>"
-        raise ValueError(f"Unsupported modality: {modality}")
+        msg = f"Unsupported modality: {modality}"
+        raise ValueError(msg)
 
     def __init__(self, vllm_config: VllmConfig, prefix: str = "") -> None:
+        """Initialize the vision tower, multimodal projector, and language model."""
         super().__init__()
         model_config = vllm_config.model_config
-        config = cast(KimiK3Config, model_config.hf_config)
+        config = cast("KimiK3Config", model_config.hf_config)
         if model_config.multimodal_config is None:
-            raise ValueError(
-                "KimiK3ForConditionalGeneration requires multimodal config"
-            )
+            msg = "KimiK3ForConditionalGeneration requires multimodal config"
+            raise ValueError(msg)
 
         self.config = config
         self.hidden_size = config.text_config.hidden_size
@@ -595,12 +659,13 @@ class KimiK3ForConditionalGeneration(
             )
             if vision_quant_config is None:
                 self.vision_tower = self.vision_tower.to(
-                    device=self.device, dtype=cast(torch.dtype, model_config.dtype)
+                    device=self.device, dtype=cast("torch.dtype", model_config.dtype)
                 )
             else:
                 self.vision_tower = self.vision_tower.to(device=self.device)
 
-            self.mm_projector = KimiK25MultiModalProjector(
+            projector_cls = cast("Callable[..., nn.Module]", KimiK25MultiModalProjector)
+            self.mm_projector = projector_cls(
                 config=config.vision_config,
                 out_hidden_size=config.text_config.hidden_size,
                 use_data_parallel=self.use_data_parallel,
@@ -608,13 +673,13 @@ class KimiK3ForConditionalGeneration(
                 prefix=maybe_prefix(prefix, "mm_projector"),
             )
             self.mm_projector = self.mm_projector.to(
-                device=self.device, dtype=cast(torch.dtype, model_config.dtype)
+                device=self.device, dtype=cast("torch.dtype", model_config.dtype)
             )
 
         self.quant_config = vllm_config.quant_config
         with self._mark_language_model(vllm_config):
             self.language_model = cast(
-                KimiLinearForCausalLM,
+                "KimiLinearForCausalLM",
                 init_vllm_registered_model(
                     vllm_config=vllm_config,
                     hf_config=config.text_config,
@@ -625,14 +690,17 @@ class KimiK3ForConditionalGeneration(
         self.media_placeholder = config.media_placeholder_token_id
 
     def set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
+        """Forward auxiliary hidden-state layer indices to the language model."""
         if not hasattr(self.language_model, "set_aux_hidden_state_layers"):
-            raise RuntimeError("Kimi language model does not expose aux hidden states")
+            msg = "Kimi language model does not expose aux hidden states"
+            raise RuntimeError(msg)
         self.language_model.set_aux_hidden_state_layers(layers)
 
     @staticmethod
     def _maybe_ignore_quant_config(
         quant_config: QuantizationConfig | None,
     ) -> QuantizationConfig | None:
+        """Strip `CompressedTensorsConfig` for the unquantized vision tower."""
         if isinstance(quant_config, compressed_tensors.CompressedTensorsConfig):
             return None
         return quant_config
@@ -640,18 +708,20 @@ class KimiK3ForConditionalGeneration(
     def _parse_and_validate_media_input(
         self, **kwargs: object
     ) -> KimiK25MediaPixelInputs | None:
+        """Validate and normalize `pixel_values` and `grid_thws` inputs."""
         pixel_values = kwargs.pop("pixel_values", None)
         grid_thws = kwargs.pop("grid_thws", None)
         if pixel_values is None:
             return None
 
         if isinstance(pixel_values, list):
-            pixel_values = torch.cat(cast(list[torch.Tensor], pixel_values), dim=0)
+            pixel_values = torch.cat(cast("list[torch.Tensor]", pixel_values), dim=0)
         if not isinstance(pixel_values, torch.Tensor):
-            raise TypeError(
+            msg = (
                 "pixel_values must be a tensor or list of tensors, "
                 f"got {type(pixel_values)}"
             )
+            raise TypeError(msg)
 
         if pixel_values.ndim in (3, 5):
             pixel_values = pixel_values.reshape(
@@ -660,19 +730,25 @@ class KimiK3ForConditionalGeneration(
         pixel_values = pixel_values.to(dtype=next(self.vision_tower.parameters()).dtype)
 
         if not isinstance(grid_thws, torch.Tensor):
-            raise TypeError(f"grid_thws must be a tensor, got {type(grid_thws)}")
+            msg = f"grid_thws must be a tensor, got {type(grid_thws)}"
+            raise TypeError(msg)
         grid_thws = grid_thws.reshape(-1, grid_thws.shape[-1])
-        if grid_thws.ndim != 2 or grid_thws.shape[1] != 3:
-            raise ValueError(f"unexpected grid_thws shape: {grid_thws.shape}")
+        if (
+            grid_thws.ndim != ASSERT_GRID_THW_NDIM
+            or grid_thws.shape[1] != ASSERT_GRID_THW_COLS
+        ):
+            msg = f"unexpected grid_thws shape: {grid_thws.shape}"
+            raise ValueError(msg)
 
         return KimiK25MediaPixelInputs(
             type="pixel_values", pixel_values=pixel_values, grid_thws=grid_thws
         )
 
-    def embed_multimodal(self, **kwargs: object) -> NestedTensors | None:
+    def embed_multimodal(self, **kwargs: object) -> MultiModalEmbeddings:
+        """Compute vision tower and projector embeddings for multimodal inputs."""
         media_input = self._parse_and_validate_media_input(**kwargs)
         if media_input is None:
-            return None
+            return []
         if self.use_data_parallel:
             # Keep upstream's DP sharding/reassembly, but isolate its TPU
             # collective from the rank-local lazy encoder graphs.
@@ -700,9 +776,8 @@ class KimiK3ForConditionalGeneration(
 
     supports_encoder_cudagraph = True
 
-    def get_encoder_cudagraph_config(self):
-        from vllm.v1.worker.encoder_cudagraph_defs import EncoderCudaGraphConfig
-
+    def get_encoder_cudagraph_config(self) -> EncoderCudaGraphConfig:
+        """Return encoder compilation configuration for image inputs."""
         return EncoderCudaGraphConfig(
             modalities=["image"],
             buffer_keys=[
@@ -718,16 +793,19 @@ class KimiK3ForConditionalGeneration(
         )
 
     def get_input_modality(self, mm_kwargs: dict[str, object]) -> str:
-        del mm_kwargs
-        return "image"
+        """Return the active multimodal input modality."""
+        modality = mm_kwargs.get("modality")
+        return modality if isinstance(modality, str) else "image"
 
     def get_max_frames_per_video(self) -> int:
+        """Return maximum frames per video item."""
         return 1
 
     def get_encoder_cudagraph_budget_range(
         self,
         vllm_config: VllmConfig,
     ) -> tuple[int, int]:
+        """Return `(min_budget, max_budget)` in output vision tokens."""
         # Min: a 224x224 image -> 16x16 patches (patch_size=14) -> 2x2
         # merge -> 8x8 = 64 output tokens (mirrors Qwen2.5-VL's estimate).
         min_budget = 64
@@ -739,13 +817,15 @@ class KimiK3ForConditionalGeneration(
 
     @staticmethod
     def _grid_thw_list(grid_thws: object) -> list[list[int]]:
+        """Convert `grid_thws` tensor or nested list into `list[list[int]]`."""
         if isinstance(grid_thws, torch.Tensor):
-            grid_thws = cast(torch.Tensor, grid_thws).tolist()
-        return cast(list[list[int]], grid_thws)
+            grid_thws = cast("torch.Tensor", grid_thws).tolist()
+        return cast("list[list[int]]", grid_thws)
 
-    def get_encoder_cudagraph_item_specs(self, mm_kwargs: dict[str, object]):
-        from vllm.v1.worker.encoder_cudagraph_defs import EncoderItemSpec
-
+    def get_encoder_cudagraph_item_specs(
+        self, mm_kwargs: dict[str, object]
+    ) -> list[EncoderItemSpec]:
+        """Compute per-item patch counts and merged output token counts."""
         merge_h, merge_w = self.vision_tower.merge_kernel_size
         grid_thw_list = self._grid_thw_list(mm_kwargs["grid_thws"])
         return [
@@ -761,8 +841,9 @@ class KimiK3ForConditionalGeneration(
         mm_kwargs: dict[str, object],
         indices: list[int],
     ) -> dict[str, object]:
-        pixel_values = cast(torch.Tensor, mm_kwargs["pixel_values"])
-        grid_thws = cast(torch.Tensor, mm_kwargs["grid_thws"])
+        """Slice `pixel_values` and `grid_thws` for selected item `indices`."""
+        pixel_values = cast("torch.Tensor", mm_kwargs["pixel_values"])
+        grid_thws = cast("torch.Tensor", mm_kwargs["grid_thws"])
         grid_thw_list = self._grid_thw_list(grid_thws)
 
         if len(indices) == 0:
@@ -773,8 +854,8 @@ class KimiK3ForConditionalGeneration(
 
         patches_per_item = [t * h * w for t, h, w in grid_thw_list]
         cum = [0]
-        for p in patches_per_item:
-            cum.append(cum[-1] + p)
+        for patch_count in patches_per_item:
+            cum.append(cum[-1] + patch_count)
         selected_pv = torch.cat([pixel_values[cum[i] : cum[i + 1]] for i in indices])
         return {
             "pixel_values": selected_pv,
@@ -783,19 +864,28 @@ class KimiK3ForConditionalGeneration(
 
     def prepare_encoder_cudagraph_capture_inputs(
         self,
-        token_budget: int,
-        max_batch_size: int,
-        max_frames_per_batch: int,
-        device: torch.device,
-        dtype: torch.dtype,
-        path: str = "default",
-        axis_keys: tuple[Hashable, ...] | None = None,
-    ):
-        from vllm.v1.worker.encoder_cudagraph_defs import EncoderCudaGraphCaptureInputs
-
-        del max_frames_per_batch  # image-only modality
+        *args: object,
+        **kwargs: object,
+    ) -> EncoderCudaGraphCaptureInputs:
+        """Create dummy vision inputs and metadata for encoder graph capture."""
+        arg_names = (
+            "token_budget",
+            "max_batch_size",
+            "max_items",
+            "device",
+            "dtype",
+            "vllm_config",
+            "axis_keys",
+        )
+        merged = {**kwargs, **dict(zip(arg_names, args, strict=False))}
+        token_budget = int(cast("int", merged["token_budget"]))
+        max_batch_size = int(cast("int", merged["max_batch_size"]))
+        device = cast("torch.device", merged["device"])
+        dtype = cast("torch.dtype", merged["dtype"])
+        axis_keys = merged.get("axis_keys")
         if axis_keys:
-            raise ValueError("Kimi K3 does not define encoder capture axes")
+            msg = "Kimi K3 does not define encoder capture axes"
+            raise ValueError(msg)
 
         merge_h, merge_w = self.vision_tower.merge_kernel_size
         # Ceil so captured capacity is never smaller than token_budget when
@@ -810,7 +900,7 @@ class KimiK3ForConditionalGeneration(
         out_w = min(per_item_output, rope.max_width // merge_w)
         out_h = (per_item_output + out_w - 1) // out_w
         if out_h * merge_h > rope.max_height:
-            raise ValueError(
+            msg = (
                 f"Encoder cudagraph budget {token_budget} over "
                 f"{max_batch_size} items needs {per_item_output} tokens per "
                 f"item, more than Kimi K3's "
@@ -818,6 +908,7 @@ class KimiK3ForConditionalGeneration(
                 "lower max_num_batched_tokens or raise "
                 "encoder_cudagraph_max_vision_items_per_batch."
             )
+            raise ValueError(msg)
         grid_config = [
             [1, out_h * merge_h, out_w * merge_w] for _ in range(max_batch_size)
         ]
@@ -856,11 +947,12 @@ class KimiK3ForConditionalGeneration(
         max_batch_size: int,
         max_frames_per_batch: int,
         path: str = "default",
-    ):
-        from vllm.v1.worker.encoder_cudagraph_defs import EncoderCudaGraphReplayBuffers
-
-        del max_frames_per_batch
-        pixel_values = cast(torch.Tensor, mm_kwargs["pixel_values"])
+    ) -> EncoderCudaGraphReplayBuffers:
+        """Build per-step replay buffers for a captured encoder graph."""
+        if max_frames_per_batch < 0 or not path:
+            msg = "invalid encoder replay buffer configuration"
+            raise ValueError(msg)
+        pixel_values = cast("torch.Tensor", mm_kwargs["pixel_values"])
         grid_thw_list = self._grid_thw_list(mm_kwargs["grid_thws"])
         metadata = self.vision_tower.prepare_encoder_cudagraph_metadata(
             grid_thw_list,
@@ -876,6 +968,10 @@ class KimiK3ForConditionalGeneration(
         inputs: dict[str, torch.Tensor],
         path: str = "default",
     ) -> torch.Tensor:
+        """Encode vision patches and project multimodal embeddings in graph mode."""
+        if not path:
+            msg = "encoder_cudagraph_forward path must be non-empty"
+            raise ValueError(msg)
         pixel_values = inputs.pop("pixel_values")
         merge_gather_idx = inputs.pop("merge_gather_idx")
         pos_embeds = inputs.pop("pos_embeds")
@@ -893,6 +989,10 @@ class KimiK3ForConditionalGeneration(
         mm_kwargs: dict[str, object],
         path: str = "default",
     ) -> torch.Tensor:
+        """Encode rank-local vision patches eagerly before cross-rank gather."""
+        if not path:
+            msg = "encoder_eager_forward path must be non-empty"
+            raise ValueError(msg)
         # LOCAL-ONLY forward, mirroring Qwen3-VL's encoder_eager_forward.
         # Under mm-encoder-tp-mode=data the manager/runner has ALREADY
         # sharded the batch across TP ranks before calling this, so
@@ -905,7 +1005,7 @@ class KimiK3ForConditionalGeneration(
         # "No available shared memory broadcast block found" every 60s with
         # workers idle). Process only this rank's own subset: the runner
         # gathers the per-rank outputs at the DP level afterwards.
-        pixel_values = cast(torch.Tensor, mm_kwargs["pixel_values"])
+        pixel_values = cast("torch.Tensor", mm_kwargs["pixel_values"])
         grid_thw_list = self._grid_thw_list(mm_kwargs["grid_thws"])
         encoder_metadata = self.vision_tower.encoder.prepare_encoder_metadata(
             grid_thw_list, device=pixel_values.device
@@ -925,6 +1025,7 @@ class KimiK3ForConditionalGeneration(
         *,
         is_multimodal: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        """Embed text tokens and merge multimodal embeddings at placeholders."""
         inputs_embeds = self._embed_text_input_ids(
             input_ids,
             self.get_language_model().embed_input_ids,
@@ -933,7 +1034,8 @@ class KimiK3ForConditionalGeneration(
         if multimodal_embeddings is None or len(multimodal_embeddings) == 0:
             return inputs_embeds
         if is_multimodal is None:
-            raise ValueError("is_multimodal is required when merging vision embeddings")
+            msg = "is_multimodal is required when merging vision embeddings"
+            raise ValueError(msg)
 
         mm_embeds = _flatten_embeddings(multimodal_embeddings).to(
             device=inputs_embeds.device, dtype=inputs_embeds.dtype
@@ -942,10 +1044,11 @@ class KimiK3ForConditionalGeneration(
         expected = int(mask_cpu.sum().item())
         actual = mm_embeds.shape[0]
         if actual != expected:
-            raise ValueError(
+            msg = (
                 f"Attempted to assign {actual} multimodal tokens to "
                 f"{expected} placeholders"
             )
+            raise ValueError(msg)
         if actual == 0:
             return inputs_embeds
 
@@ -970,9 +1073,9 @@ class KimiK3ForConditionalGeneration(
         positions: torch.Tensor,
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
-        **kwargs: object,
-    ) -> torch.Tensor:
-        del kwargs
+        **_kwargs: object,
+    ) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]]:
+        """Forward pass delegating to the underlying Kimi language model."""
         return self.language_model(
             input_ids=input_ids,
             positions=positions,
@@ -981,12 +1084,13 @@ class KimiK3ForConditionalGeneration(
         )
 
     def compute_logits(
-        self, hidden_states: torch.Tensor, **kwargs: object
+        self, hidden_states: torch.Tensor, **_kwargs: object
     ) -> torch.Tensor | None:
-        del kwargs
+        """Compute next-token vocabulary logits from `hidden_states`."""
         return self.language_model.compute_logits(hidden_states)
 
     def process_weights_after_loading(self) -> None:
+        """Finalize post-load attention-residual and MoE weights on the model."""
         # The language model walks its own AttentionResidual modules.
         self.language_model.process_weights_after_loading()
 
@@ -995,6 +1099,7 @@ class KimiK3ForConditionalGeneration(
         cls,
         vllm_config: VllmConfig,
     ) -> tuple[torch.dtype, torch.dtype]:
+        """Return `(conv_state_dtype, ssm_state_dtype)` from text config."""
         text_config = vllm_config.model_config.hf_config.text_config
         return KimiLinearForCausalLM.get_mamba_state_dtype_from_config(
             vllm_config.with_hf_config(text_config)
@@ -1005,15 +1110,20 @@ class KimiK3ForConditionalGeneration(
         cls,
         vllm_config: VllmConfig,
     ) -> tuple[tuple[int, int], tuple[int, int, int]]:
+        """Return `(conv_state_shape, ssm_state_shape)` from text config."""
         text_config = vllm_config.model_config.hf_config.text_config
         return KimiLinearForCausalLM.get_mamba_state_shape_from_config(
             vllm_config.with_hf_config(text_config)
         )
 
     @classmethod
-    def get_mamba_state_copy_func(cls):
+    def get_mamba_state_copy_func(
+        cls,
+    ) -> tuple[MambaStateCopyFunc, MambaStateCopyFunc]:
+        """Return KDA state copy functions for prefix caching."""
         return KimiLinearForCausalLM.get_mamba_state_copy_func()
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        """Load vision, projector, and language-model checkpoint weights."""
         loader = AutoWeightsLoader(self)
         return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
