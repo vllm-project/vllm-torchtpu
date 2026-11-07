@@ -22,8 +22,9 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from ..ops import BF16, FP8, U32
+from ..ops import BF16, F32, FP8, U32
 from .backend import kernel_debug_check
+from .checks import safe_page_base
 from .config import cache_exec
 from .layout import LANES, PoolLayout
 from .scatter_ctx import ScatterKernel, is_active
@@ -54,7 +55,8 @@ def prepare_ckpt(
         taps = layout.conv_taps
         ssm_u32_rows = (vh * KD) // 2
         conv_rows = (taps * QKV) // LANES
-        conv_rows_pad = ((conv_rows + 15) // 16) * 16
+        conv_rows_pad = layout.conv_rows_pad(ex.R)
+        conv_tile = layout.conv_tile  # sublane tile rows: 16 bf16 / 8 f32
         qkv_128 = QKV // LANES
         # The direct path reads `taps + 1` rows per token (the last one masked
         # to zero) when `tail_row` is true (`(taps + 1) * qkv_128 == conv_rows_pad`),
@@ -71,7 +73,7 @@ def prepare_ckpt(
             T > 1
             and conv.ndim == 4
             and conv.shape[2] >= min_direct_rows
-            and ((conv.shape[2] * qkv_128) % 16 == 0 or bool(interpret))
+            and ((conv.shape[2] * qkv_128) % conv_tile == 0 or bool(interpret))
         )
         if direct_conv:
             conv_in = conv
@@ -94,7 +96,7 @@ def prepare_ckpt(
                     conv_4d[:, :, None, 0:taps, :],
                     (conv_4d.shape[0], NS, T, taps, QKV),
                 )
-            conv_flat = conv_win.astype(BF16).reshape(
+            conv_flat = conv_win.astype(layout.conv_dtype).reshape(
                 conv_4d.shape[0], NS * T, conv_rows, LANES
             )
             if conv_rows_pad > conv_rows:
@@ -104,7 +106,7 @@ def prepare_ckpt(
                 )
             conv_in = conv_flat.reshape(conv_4d.shape[0], NS * T * conv_rows_pad, LANES)
             conv_buf_shape = (2, T * conv_rows_pad, LANES)
-            conv_buf_dt = BF16
+            conv_buf_dt = layout.conv_dtype
         ckpt_is_3d = ckpt_indices.ndim == 3
         ckpt_t_off = ckpt_indices.shape[-1] - T
     else:
@@ -127,6 +129,7 @@ def prepare_ckpt(
         qkv_128=qkv_128,
         direct_conv=direct_conv,
         conv_tail_row=direct_conv and tail_row,
+        conv_store_dt=F32 if layout.conv_itemsize == 4 else BF16,
         ckpt_is_3d=ckpt_is_3d,
         ckpt_t_off=ckpt_t_off,
         ckpt_ndim=ckpt_indices.ndim if has_gdn else 0,
@@ -148,11 +151,16 @@ def pb_for(kc: ScatterKernel, sub: Any, s: Any, t: Any, span: int) -> Any:
         "GDN scatter checkpoint slot maps outside [0, num_pages)",
         interpret=bool(interpret),
     )
-    return jnp.clip(pb, 0, cache_exec(ex).num_pages - span)
+    return safe_page_base(pb, span, cache_exec(ex).num_pages)
 
 
 def is_contig_ckpt(kc: ScatterKernel, sub: Any, s: Any) -> Any:
-    """Whether sequence `s`'s `T` checkpoint slots are consecutive."""
+    """Whether sequence `s`'s `T` checkpoint slots are consecutive and in-bounds.
+
+    When `pps * T > layout.reserved_pages`, also require `pb0` to be in
+    `[reserved_pages, num_pages - pps * T]` so out-of-range slots fall back to
+    per-token writes of length `pps <= reserved_pages` on shared null page `0`.
+    """
     sg, ckpt_ref = kc.sg, kc.ckpt_ref
     T, ckpt_is_3d, ckpt_t_off = sg.T, sg.ckpt_is_3d, sg.ckpt_t_off
     if not ckpt_is_3d or T <= 1:
@@ -161,6 +169,15 @@ def is_contig_ckpt(kc: ScatterKernel, sub: Any, s: Any) -> Any:
     ok = jnp.bool_(True)
     for t in range(1, T):
         ok = jnp.logical_and(ok, ckpt_ref[sub, s, t + ckpt_t_off] == s0 + t)
+    if sg.pps * T > sg.layout.reserved_pages:
+        pb0 = sg.layout.page_base(s0, sub, sg.ckpt_ndim)
+        ok = jnp.logical_and(
+            ok,
+            jnp.logical_and(
+                pb0 >= sg.layout.reserved_pages,
+                pb0 + sg.pps * T <= cache_exec(sg.ex).num_pages,
+            ),
+        )
     return ok
 
 
@@ -190,10 +207,12 @@ def start_scatter_seq(
     KD, VD, taps, ssm_u32_rows = sg.KD, sg.VD, sg.taps, sg.ssm_u32_rows
     conv_rows, conv_rows_pad = sg.conv_rows, sg.conv_rows_pad
     direct_conv, conv_tail_row = sg.direct_conv, sg.conv_tail_row
+    store_dt = sg.conv_store_dt
+    store_isz = jnp.dtype(store_dt).itemsize
 
     @pl.when(is_active(kc, s))
     def _():
-        conv_bf16: Any = conv_buf[slot, 0].astype(BF16) if conv_tail_row else None
+        conv_st: Any = conv_buf[slot, 0].astype(store_dt) if conv_tail_row else None
         for t in range(T):
             s_km = rec_buf[slot, pl.ds(t * vh, vh)]
             if bool(interpret):
@@ -222,14 +241,14 @@ def start_scatter_seq(
                 if conv_tail_row:
                     w4 = jnp.where(
                         w4_row_iota < taps,
-                        conv_bf16[1 + t : 2 + taps + t, :],
-                        jnp.bfloat16(0.0),
+                        conv_st[1 + t : 2 + taps + t, :],
+                        store_dt(0.0),  # scalar zero in conv_store_dt
                     )
                     conv_taps = w4.reshape(conv_rows_pad, LANES)
                 else:
                     taps_128 = (
                         conv_buf[slot, 0, 1 + t : 1 + taps + t, :]
-                        .astype(BF16)
+                        .astype(store_dt)
                         .reshape(conv_rows, LANES)
                     )
                     if conv_rows_pad > conv_rows:
@@ -254,7 +273,7 @@ def start_scatter_seq(
                         conv_pad.reshape(
                             page_shape[0],
                             page_shape[1],
-                            page_shape[2] // 2,
+                            page_shape[2] // store_isz,
                             page_shape[3],
                         ),
                         FP8,
@@ -263,7 +282,7 @@ def start_scatter_seq(
                     .reshape(page_shape)
                 )
             else:
-                page_buf.at[slot, t * pps + conv_page].bitcast(BF16).reshape(
+                page_buf.at[slot, t * pps + conv_page].bitcast(store_dt).reshape(
                     conv_page_rows, LANES
                 )[:conv_rows_pad, :] = conv_taps
 

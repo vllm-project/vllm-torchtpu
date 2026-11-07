@@ -72,8 +72,10 @@ class CacheExec:
     ckpt_2d: bool = False  # True: 2D (NS, K); False: 3D (slots_per_pool, NS, K)
     ckpt_k: int = 0  # Last-axis width of ckpt_indices (0 -> T)
     roff_1d: bool = False  # True: 1D (NS,); False: 2D (slots_per_pool, NS)
-    # Host-side ckpt_indices bounds validation on every eager pooled-step call
-    # (device-to-host sync + Python loop). In-kernel clamps always apply.
+    # Validate KV pos/page bounds, uniqueness, and ckpt_indices slot bounds on
+    # every pooled-step call. When True, also runs under jax.jit via
+    # force_under_jit=True (jax.debug.callback device-to-host sync + Python
+    # validation). In-kernel routing to shared null page 0 always applies.
     check_ckpt_bounds: bool = False
 
     def __post_init__(self) -> None:
@@ -148,6 +150,15 @@ class PoolBackend:
     page_table_state_name: str = "page_table"
     supports_fused_io: bool = False
     supports_pool_gather: bool = False
+    # `layout -> PoolBackend` with the same callbacks and options (set by
+    # `make_pool_backend`); see `with_layout`.
+    rebuild: Any = dataclasses.field(default=None, compare=False, repr=False)
+
+    def with_layout(self, layout: PoolLayout) -> PoolBackend:
+        """The same backend over `layout` (e.g. another conv storage dtype)."""
+        if self.rebuild is None:
+            raise ValueError("this PoolBackend was not built by make_pool_backend")
+        return self.rebuild(layout)
 
     @property
     def num_pools(self) -> int:
