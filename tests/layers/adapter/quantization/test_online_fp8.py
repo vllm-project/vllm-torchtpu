@@ -310,13 +310,13 @@ def test_existing_jax_matmul_accepts_online_weights(keep_layout, monkeypatch, sc
     from vllm_torchtpu.layers.adapter.quantization import fp8
 
     # Only replace the TorchTPU bridge; execute the existing JAX math on CPU.
-    def cpu_bridge(x, w, scale, w8a16_max_rows=0, bf16_act_quant=False):
+    def cpu_bridge(x, w, scale, w8a16_max_rows=0, act_quant_scale_dtype=None):
         result = linear_common._quantized_matmul_jax(
             jnp.asarray(x.float().numpy(), dtype=jnp.bfloat16),
             jnp.asarray(w.float().numpy(), dtype=jnp.float8_e4m3fn),
             jnp.asarray(scale.numpy()),
             w8a16_max_rows=w8a16_max_rows,
-            bf16_act_quant=bf16_act_quant,
+            act_quant_scale_dtype=act_quant_scale_dtype,
         )
         return torch.from_numpy(np.asarray(result.astype(jnp.float32)).copy()).to(
             x.dtype
