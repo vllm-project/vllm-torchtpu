@@ -15,12 +15,15 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import Any, ClassVar
 
 from ...errors import MegakernelConfigError
-from ...exec_spec import ExecSpec, NumericsClass
+from ...exec_spec import ExecSpec, NumericsClass, register_debug, register_tunables
 from ...ops import col_chunk, round_up
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -116,6 +119,10 @@ class MoEDebug:
     row_mask: bool = False
 
 
+register_tunables("moe", MoETunables)
+register_debug("moe", MoEDebug)
+
+
 def derive_moe_params(
     g: Any,
     ex: ExecSpec,
@@ -140,6 +147,17 @@ def derive_moe_params(
     er = g.E // ex.R
     isr = g.IS // ex.R
     ir = g.I // ex.R if moe_tp else g.I
+    if e_slots < 0:
+        raise MegakernelConfigError(f"e_slots={e_slots} must be >= 0")
+    if moe_tp and e_slots not in (0, g.E):
+        raise MegakernelConfigError(
+            "moe_tp=True does not support redundant expert slots "
+            f"(got e_slots={e_slots} for E={g.E})"
+        )
+    if not moe_tp and 0 < e_slots < er:
+        raise MegakernelConfigError(
+            f"e_slots={e_slots} must be 0 or >= ER={er} when moe_tp=False"
+        )
     ew = e_slots if e_slots > 0 else (g.E if moe_tp else er)
     extra = ew - er
     if g.H <= 0 or g.H % 128 != 0:
@@ -155,7 +173,11 @@ def derive_moe_params(
     n_moe = plan.nt["router"] + plan.nt["sh13"] + plan.nt["sh2"]
     lazy_moe = tiles.lazy and n_moe <= tiles.nbd
     ecopy = not moe_tp and e_slots > er
-    assert not (dbg.row_mask and ecopy), "row_mask: identity expert placement only"
+    if dbg.row_mask and ecopy:
+        raise MegakernelConfigError(
+            "MoEDebug.row_mask requires identity expert placement "
+            f"(got ecopy=True with moe_tp=False, e_slots={e_slots} > ER={er})"
+        )
     if tt.topk and not (g.E > 0 and (g.E - 1).bit_length() <= 9):
         raise MegakernelConfigError(
             "topk_packed requires 1 <= E <= 512 ((E - 1).bit_length() <= 9 "
@@ -172,6 +194,19 @@ def derive_moe_params(
         and ex.R * extra + ex.R + 1 <= 128  # NCP + R + 1 <= 128 VREG lanes
         and nb_picks >= er  # elist/wlist capacity covers ER local slots
     )
+    if tt.route_vec and not route_vec:
+        logger.debug(
+            "MoETunables.route_vec=True disabled for E=%d, R=%d, B=%d, MR=%d, "
+            "ecopy=%s, extra=%d, nb_picks=%d, er=%d",
+            g.E,
+            ex.R,
+            ex.B,
+            ex.MR,
+            ecopy,
+            extra,
+            nb_picks,
+            er,
+        )
     return MoEParams(
         H=g.H,
         E=g.E,

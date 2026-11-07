@@ -140,6 +140,7 @@ def resolve_moe_binding(
             "e_slots": int(opts.get("e_slots", 0)),
         }
     )
+    vals.setdefault("zero_centered_norm", True)
     return ResolvedModuleGeometry(
         cls, binding.prefix, vals, opts, binding.rename, binding.transforms
     )
