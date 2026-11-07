@@ -89,9 +89,14 @@ FORWARD=(
   CI_RUNNER SKIP_SPANNER_UPLOAD
   BENCHMARK_WARMUP_RUNS RUN_CODE_EVAL RUN_LM_EVAL RUN_TYPE MODEL_PATH MODEL_URI
   EVAL_SOFT_FAIL
-  # Lets a one-off build force an xprof capture; unset leaves the day rule in
-  # benchmark_with_profile.sh to decide.
-  CAPTURE_PROFILE
+  # Profiling: see benchmark_with_profile.sh, run_benchmarks.sh,
+  # src/vllm_torchtpu/tracing/options.py, and src/vllm_torchtpu/envs.py. Unset
+  # CAPTURE_PROFILE leaves the day rule in benchmark_with_profile.sh to decide.
+  CAPTURE_PROFILE PROFILE_GCS_BASE PROFILE_NUM_PROMPTS EXTRA_SERVE_ARGS
+  USE_PHASED_PROFILER
+  PYTHON_TRACER_LEVEL HOST_TRACER_LEVEL DEVICE_TRACER_LEVEL
+  TPU_TRACE_MODE TPU_NUM_SPARSE_CORES_TO_TRACE TPU_NUM_SPARSE_CORE_TILES_TO_TRACE
+  LIBTPU_INIT_ARGS
   # Scratch, which steps needing more than the pod's disk point at /dev/shm. A
   # DSv4 compile writes ~40 GB of inductor cache per host and a capture run
   # ~30 GB of temp JSON, which is an evicted pod if it lands on ephemeral
@@ -126,6 +131,20 @@ FORWARD=(
   # another than the manifest's default (a Kimi-K3 megakernel recipe point).
   K3_PD_CONFIG
 )
+
+# One-off escape hatch so a step can forward additional variables (e.g.
+# EXTRA_FORWARD="VAR1 VAR2") without editing FORWARD above.
+if [[ -n "${EXTRA_FORWARD:-}" ]]; then
+  IFS=$' \t\n' read -r -d '' -a _extra_forward <<< "${EXTRA_FORWARD}" || true
+  for _name in "${_extra_forward[@]}"; do
+    if [[ ! "${_name}" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+      echo "$0: invalid variable name in EXTRA_FORWARD: '${_name}'" >&2
+      exit 2
+    fi
+    FORWARD+=("${_name}")
+  done
+  unset _extra_forward _name
+fi
 
 # The `tests` plugin mints these on the agent and their two-hour life starts
 # before admission, node scale-up and image pull. Unset rather than
