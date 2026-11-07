@@ -161,6 +161,7 @@ steps:
             tests/scripts/test_dsv41_decode_accounting.py
             tests/scripts/test_dsv41_serve_recipe.py
             tests/scripts/test_dsv41_multihost_ci.py
+            tests/scripts/test_dsv41_repetition.py
             -q --junitxml=perf_eval_results/dsv41-benchmark-cpu.xml
 
       - label: "DeepSeek-V4.1 index configuration: CPU contracts"
@@ -262,7 +263,7 @@ steps:
       # and dynamic EPLB. The manifest names the hardware and carries the
       # per-pod command, the 256Gi /dev/shm and the environment; the head pod
       # audits both hosts, publishes the check and uploads the artifacts.
-      - label: "DeepSeek-V4.1-Flash: DP16 C768 steady DSpark decode (8 chips, EPLB)"
+      - label: "DeepSeek-V4.1-Flash: DP16 C768 steady DSpark decode + DeepSWE regression (8 chips, EPLB)"
         key: "dsv41_flash_dp16_c768_decode"
         <<: *tpu_step
         depends_on:

@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "fixture": "oxvg-seq201.json.gz",
+  "request_bytes": 1737362,
+  "request_sha256": "4feb222f1577a2da266691824150c7575793ce2d9af41d93abbaad7c12acb971",
+  "gzip_bytes": 334592,
+  "gzip_sha256": "fe425b3f00a899388b3aa463df9a22461fa9a7e23eafdefc98bccb48f53654d2",
+  "messages": 402,
+  "historical_request_sha256": "45871ebc0e5c9adb23e877b82bb605749a0124c3bd4b5f998412ee6e2adb4f1f",
+  "historical_prompt_tokens": 332523,
+  "redaction": {
+    "kind": "proxy URL userinfo replaced with redacted:redacted",
+    "occurrences": 4,
+    "message_indices": [
+      117
+    ]
+  },
+  "prompt_token_range": [
+    332000,
+    333000
+  ],
+  "exact_prompt_tokens": "Computed before serve with the mounted V4.1 tokenizer; must equal /tokenize."
+}

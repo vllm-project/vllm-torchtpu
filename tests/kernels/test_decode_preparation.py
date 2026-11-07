@@ -6,7 +6,6 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from vllm_torchtpu.kernels.attention_preprocessing import compress_rope
 from vllm_torchtpu.kernels.deepseek_v41.csa2 import cache
 from vllm_torchtpu.kernels.experimental import decode_preparation as prep
 
@@ -209,9 +208,12 @@ def test_compressor_state_packed_matches_native(tokens, requests, total):
     np.testing.assert_array_equal(prev[:, 0], n_prev)
     np.testing.assert_array_equal(valid[:, 0], n_valid)
     for pairs, offsets, records in ((wp, wo, write), (rp, ro, read)):
-        expected = compress_rope._compact(records, total, 1, tokens)  # CPU scatter
-        np.testing.assert_array_equal(pairs, expected[0])
-        np.testing.assert_array_equal(offsets, expected[1])
+        records = np.asarray(records)
+        live = np.flatnonzero((records >= 0) & (records < total))
+        expected = np.zeros((tokens, 2), dtype=np.int32)
+        expected[: live.size] = np.stack((live, records[live]), axis=1)
+        np.testing.assert_array_equal(pairs, expected.reshape(-1))
+        np.testing.assert_array_equal(offsets, [0, live.size])
 
 
 def _reference_slots(kv_starts, positions, table, capacity, requests):

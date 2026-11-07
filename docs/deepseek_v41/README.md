@@ -89,6 +89,12 @@ expert count rather than the target's.
 
 ## Validation limits
 
+For the ongoing long-context output investigation, see the
+[DeepSWE mitigation and shared-server CI](deepswe_repetition_reproduction.md).
+It records the rollback/restoration evidence, the #2566 revert and five bounded
+long-context checks on the DP16 benchmark serve. The specific kernel defect
+and latest-config TPU validation remain open.
+
 Tuning measurements in the kernel tables identify the runtime they were measured
 on. The epic upgrade to JAX 0.11.2 / libtpu 0.0.50 / TorchTPU 0.2.0rc1 requires
 fresh accelerator validation; old measurements are not evidence for these pins.

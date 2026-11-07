@@ -3,65 +3,6 @@
 
 import jax
 import numpy as np
-import pytest
-
-
-@pytest.mark.cpu_test
-@pytest.mark.parametrize("capacity", [8, 16])
-@pytest.mark.parametrize("mode", ["auto", "off"])
-@pytest.mark.parametrize("region", ["compressor_state", "compressor_addresses"])
-def test_compressor_admission_fullgraph(monkeypatch, caplog, capacity, mode, region):
-    """Include the AUTO fallback diagnostic, not just the layout comparison."""
-    from types import SimpleNamespace
-
-    import torch
-
-    from vllm_torchtpu.kernels.experimental import decode_preparation as prep
-    from vllm_torchtpu.models.vllm.deepseek_v41.v2.attention import (
-        DeepseekV41Attention,
-    )
-
-    monkeypatch.setattr(prep, "_mode", prep.FusionMode(mode))
-    monkeypatch.setattr(prep, "_mode_used", False)
-    monkeypatch.setattr(prep, "_reported", set())
-    torch._dynamo.reset()
-    owner = SimpleNamespace(window_size=128)
-
-    class Cache:
-        def __init__(self, shape, stride, offset=0):
-            self.shape = shape
-            self.page_stride = stride
-            self.row_offset = offset
-
-    def forward(x, raw):
-        # Match cache properties that construct a fresh view during forward.
-        state = Cache(raw.shape, capacity)
-        main = Cache((1, 128), 128)
-        index = Cache((1, 256), 256)
-        admitted = DeepseekV41Attention._compressor_layout_admitted(
-            owner, region, state, main, index
-        )
-        return x + (1 if admitted else 2)
-
-    graphs = []
-
-    def backend(graph, inputs):
-        graphs.append(graph)
-        return graph.forward
-
-    compiled = torch.compile(forward, backend=backend, fullgraph=True, dynamic=False)
-    raw = torch.zeros((1, capacity))
-    with caplog.at_level("WARNING"):
-        for tokens in (96, 288, 2048):
-            x = torch.zeros(tokens)
-            torch._dynamo.mark_dynamic(x, 0)
-            expected = x + (1 if capacity == 16 and mode == "auto" else 2)
-            torch.testing.assert_close(compiled(x, raw), expected)
-    assert len(graphs) == 1  # Token count must remain dynamic.
-    warnings = [r for r in caplog.records if "falls back" in r.message]
-    assert len(warnings) == (1 if capacity == 8 and mode == "auto" else 0)
-    if warnings:
-        assert "state_capacity=8" in warnings[0].message
 
 
 def test_csa2_bridge_registration(monkeypatch):
