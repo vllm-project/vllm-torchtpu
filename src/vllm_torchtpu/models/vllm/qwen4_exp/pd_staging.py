@@ -504,6 +504,62 @@ def _untyped(elems, rows: int, itemsize: int):
     return jnp.transpose(raw, (0, 1, 3, 2)).reshape(rows, ROW_SUBLANES, ROW_LANES)
 
 
+def dma_row_gather(stage, flat, *, tile: int = REPACK_TILE, interpret: bool = False):
+    """``stage[flat]`` (``stage``: ``[rows, 4, 256]`` of the carrier's dtype), byte-exact.
+
+    One DMA per row, HBM to the output block: no vector unit and no XLA op ever
+    holds the bytes as FP8 values. An XLA gather of the FP8-typed carrier on
+    TPU canonicalised NaN encodings (0xFF -> 0x7F; the served rowdump riders
+    j-48e7faaf / j-0b7ee68f, lane_xfer section 11.29). The carrier holds BF16
+    compressed keys and FP32 GDN state, not FP8 values, so that flip halved
+    real values. ``interpret`` runs the kernel in Pallas TPU interpret mode
+    (CPU tests).
+    """
+    import jax
+    import jax.numpy as jnp
+    from jax.experimental import pallas as pl
+    from jax.experimental.pallas import tpu as pltpu
+
+    n = int(flat.shape[0])
+    if n == 0:
+        return jnp.zeros((0, *stage.shape[1:]), stage.dtype)
+    pad = -n % tile
+    idx = jnp.pad(flat.astype(jnp.int32), (0, pad))  # padding reads row 0, then dropped
+
+    def kernel(idx_ref, stage_ref, out_ref, semaphore):
+        first = pl.program_id(0) * tile
+
+        def row_copy(lane):
+            return pltpu.make_async_copy(
+                stage_ref.at[pl.ds(idx_ref[first + lane], 1)],
+                out_ref.at[pl.ds(lane, 1)],
+                semaphore,
+            )
+
+        for lane in range(tile):
+            row_copy(lane).start()
+        for lane in range(tile):
+            row_copy(lane).wait()
+
+    out = pl.pallas_call(
+        kernel,
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=1,
+            grid=((n + pad) // tile,),
+            in_specs=[pl.BlockSpec(memory_space=pltpu.HBM)],
+            out_specs=pl.BlockSpec(
+                (tile, *stage.shape[1:]),
+                lambda program, *_: (program,) + (0,) * (stage.ndim - 1),
+            ),
+            scratch_shapes=[pltpu.SemaphoreType.DMA],
+        ),
+        out_shape=jax.ShapeDtypeStruct((n + pad, *stage.shape[1:]), stage.dtype),
+        name="qwen4_pd_staged_row_gather",
+        **({"interpret": pltpu.InterpretParams()} if interpret else {}),
+    )(idx, stage)
+    return out[:n]
+
+
 def make_repack(
     *,
     src_block: int,
@@ -515,6 +571,7 @@ def make_repack(
     channels: Sequence[int],
     write=None,
     compact_gdn: tuple[int, int] | None = None,
+    gather=None,
 ):
     """``fn(pool, staging, main_src, main_dst, copy_src, copy_dst, gdn_src, gdn_dst)``.
 
@@ -531,6 +588,11 @@ def make_repack(
     ``fn.rows(staging, main_src, copy_src, gdn_src)`` returns only the rows to
     write (uint8 ``[n, 4, 256]`` each).
 
+    ``gather(stage, flat)`` reads staging rows ``stage[flat]`` byte for byte; by
+    default the DMA row gather (``dma_row_gather``) on TPU, where an XLA gather
+    of the FP8-typed carrier canonicalised NaN bytes, and a plain gather
+    elsewhere (bit-exact on CPU).
+
     ``write(pool, rows, page, logical, valid)`` stores ``rows`` at
     ``pool[page, logical % pool.shape[1]]``; by default the forward's aliased
     Pallas DMA scatter, which writes the pool in place (an XLA scatter on the
@@ -546,6 +608,9 @@ def make_repack(
     # kernel-page shape (the pools hold one kernel page per manager page).
     def rows_of(rows, flat):
         return rows[flat]
+
+    if gather is None:
+        gather = dma_row_gather if jax.default_backend() == "tpu" else rows_of
 
     if write is None:
         import functools
@@ -600,28 +665,28 @@ def make_repack(
         # bitcast of the whole carrier materialized a copy of it per call.
         stage = staging.reshape(-1, ROW_SUBLANES, ROW_LANES)
 
-        def gather(flat):
-            return jax.lax.bitcast_convert_type(rows_of(stage, flat), jnp.uint8)
+        def gather_u8(flat):
+            return jax.lax.bitcast_convert_type(gather(stage, flat), jnp.uint8)
 
         # Main KV: the rank's head pair to slot 0, the other slots zero.
-        pair = gather(main_src)[:, 2 * kv_head : 2 * kv_head + 2]
+        pair = gather_u8(main_src)[:, 2 * kv_head : 2 * kv_head + 2]
         main = jnp.concatenate([pair, jnp.zeros_like(pair)], axis=1)
         # Compressed keys, rings + tags, PLE state: bytes unchanged.
-        copies = gather(copy_src)
+        copies = gather_u8(copy_src)
         if has_gdn and compact_gdn is not None:
             s, d = src_gdn, dst_gdn
             stage_rows, _ = compact_gdn
             c_rows = d.ssm_tokens + s.conv_tokens
             flat = gdn_src[:, :, None] * stage_rows + jnp.arange(stage_rows)
             src_flat = flat.reshape(gdn_src.shape[0], -1)[:, :c_rows].reshape(-1)
-            region = gather(src_flat).reshape(-1, c_rows, ROW_SUBLANES, ROW_LANES)
+            region = gather_u8(src_flat).reshape(-1, c_rows, ROW_SUBLANES, ROW_LANES)
             gdn = jax.vmap(lambda page: gdn_page_compact(page, s, d))(region)
             gdn = gdn.reshape(-1, ROW_SUBLANES, ROW_LANES)
         elif has_gdn:
             s, d = src_gdn, dst_gdn
             s_rows = s.ssm_tokens + s.conv_tokens
             src_flat = (gdn_src[:, None] * src_block + jnp.arange(s_rows)).reshape(-1)
-            region = gather(src_flat).reshape(-1, s_rows, ROW_SUBLANES, ROW_LANES)
+            region = gather_u8(src_flat).reshape(-1, s_rows, ROW_SUBLANES, ROW_LANES)
             gdn = jax.vmap(lambda page: gdn_page(page, s, d))(region)
             gdn = gdn.reshape(-1, ROW_SUBLANES, ROW_LANES)
         else:
