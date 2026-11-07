@@ -1362,6 +1362,37 @@ def dynamic_validate_inputs(
                 )
 
 
+def validate_block_sizes(
+    block_sizes: tuple[int, int, int, int] | dict[str, int] | None,
+    page_size: int,
+    prefix: str = "block_sizes",
+) -> None:
+    """Validate that RPA block sizes satisfy hardware divisibility constraints."""
+    if block_sizes is None:
+        return
+    if isinstance(block_sizes, dict):
+        bq_sz = block_sizes["bq_sz"]
+        bkv_sz = block_sizes["bkv_sz"]
+        bq_csz = block_sizes["bq_csz"]
+        bkv_csz = block_sizes["bkv_csz"]
+    else:
+        bq_sz, bkv_sz, bq_csz, bkv_csz = block_sizes
+    if not (bq_csz > 0 and bq_sz % bq_csz == 0):
+        raise ValueError(
+            f"{prefix} {bq_csz=} and {bq_sz=} must satisfy (0 < bq_csz and bq_sz"
+            " % bq_csz == 0)."
+        )
+    if not (bkv_csz > 0 and bkv_sz % bkv_csz == 0):
+        raise ValueError(
+            f"{prefix} {bkv_csz=} and {bkv_sz=} must satisfy (0 < bkv_csz and"
+            " bkv_sz % bkv_csz == 0)."
+        )
+    if bkv_sz % page_size != 0:
+        raise ValueError(f"{prefix} {bkv_sz=} must be divisible by {page_size=}.")
+    if bkv_csz % page_size != 0:
+        raise ValueError(f"{prefix} {bkv_csz=} must be divisible by {page_size=}.")
+
+
 # Expect to run this validation during compile time.
 def static_validate_inputs(
     queries: jax.Array,  # [max_num_tokens, actual_num_q_heads, actual_head_dim]
@@ -1503,28 +1534,9 @@ def static_validate_inputs(
     if chunk_prefill_size is not None and chunk_prefill_size <= 0:
         raise ValueError(f"{chunk_prefill_size=} must be positive.")
 
-    def _validate_block_sizes(block_sizes, prefix):
-        if block_sizes is None:
-            return
-        bq_sz, bkv_sz, bq_csz, bkv_csz = block_sizes
-        if not (bq_csz > 0 and bq_sz % bq_csz == 0):
-            raise ValueError(
-                f"{prefix} {bq_csz=} and {bq_sz=} must satisfy (0 < bq_csz and bq_sz"
-                " % bq_csz == 0)."
-            )
-        if not (bkv_csz > 0 and bkv_sz % bkv_csz == 0):
-            raise ValueError(
-                f"{prefix} {bkv_csz=} and {bkv_sz=} must satisfy (0 < bkv_csz and"
-                " bkv_sz % bkv_csz == 0)."
-            )
-        if bkv_sz % page_size != 0:
-            raise ValueError(f"{prefix} {bkv_sz=} must be divisible by {page_size=}.")
-        if bkv_csz % page_size != 0:
-            raise ValueError(f"{prefix} {bkv_csz=} must be divisible by {page_size=}.")
-
-    _validate_block_sizes(d_block_sizes, "decode")
-    _validate_block_sizes(p_block_sizes, "prefill")
-    _validate_block_sizes(m_block_sizes, "mixed")
+    validate_block_sizes(d_block_sizes, page_size, "decode")
+    validate_block_sizes(p_block_sizes, page_size, "prefill")
+    validate_block_sizes(m_block_sizes, page_size, "mixed")
 
     if vmem_limit_bytes is not None and vmem_limit_bytes <= 0:
         raise ValueError(f"{vmem_limit_bytes=} must be positive.")
@@ -1595,15 +1607,22 @@ def get_default_block_sizes(
         case _:
             raise NotImplementedError(f"Unsupported {tpu_version=}.")
 
+    # Align bkv_csz to page_size, then align bkv_sz to bkv_csz so that
+    # bkv_sz % bkv_csz == 0 is guaranteed even for non-power-of-two page sizes.
+    bkv_csz = align_to(bkv_csz, page_size)
+    bkv_sz = align_to(align_to(bkv_sz, page_size), bkv_csz)
+
     # The query compute block should never exceed the query fetch block.
     bq_csz = min(bq_csz, bq_sz)
 
-    return {
+    block_sizes = {
         "bq_sz": max(1, bq_sz),
-        "bkv_sz": align_to(bkv_sz, page_size),
+        "bkv_sz": bkv_sz,
         "bq_csz": max(1, bq_csz),
-        "bkv_csz": align_to(bkv_csz, page_size),
+        "bkv_csz": bkv_csz,
     }
+    validate_block_sizes(block_sizes, page_size, f"default_{case.name.lower()}")
+    return block_sizes
 
 
 @jax.jit(
@@ -1940,12 +1959,14 @@ def ragged_paged_attention(
                 pages_per_seq,
                 case=case,
             )
-        return {
+        resolved = {
             "bq_sz": block_sizes[0],
             "bkv_sz": block_sizes[1],
             "bq_csz": block_sizes[2],
             "bkv_csz": block_sizes[3],
         }
+        validate_block_sizes(resolved, page_size, case.name.lower())
+        return resolved
 
     # Decode-only
     q, kv_cache = run_rpa_kernel(
