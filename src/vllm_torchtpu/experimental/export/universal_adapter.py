@@ -632,7 +632,7 @@ def _share_embedding_and_lm_head(draft: nn.Module, target: nn.Module) -> None:
 
 
 def _share_target_kv_cache(
-    draft: nn.Module, target: nn.Module, target_attn_layer_names: set[str]
+    draft: Any, target: Any, target_attn_layer_names: set[str]
 ) -> None:
     """Wires the draft's Q-only attention layers to read the target's KV cache.
 
