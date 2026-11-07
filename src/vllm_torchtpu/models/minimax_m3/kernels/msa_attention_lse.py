@@ -147,6 +147,7 @@ def _attention_call(
     local_limit,
     page_table,
     head,
+    work=None,
     *,
     sm_scale,
     block_q,
@@ -158,15 +159,16 @@ def _attention_call(
     """One kernel call over a token count that is a multiple of block_q.
 
     ``head`` (``int32[1]``) is a scalar-prefetch input, not a static, so one
-    kernel serves every KV head of the cache rows."""
+    kernel serves every KV head of the cache rows. `work` is this call's
+    precomputed `msa_attention._work_list` (`_work_lists`), else built here."""
     num_tokens, num_heads, head_dim = q.shape
     _, rows_per_page, packing, _ = kv_cache.shape
     # One KV head's [K | V] slice of each row.
     row_width = 2 * head_dim
     topk = selected.shape[1]
-    pages, meta, num_groups = msa_attention._work_list(
-        selected, block_q, pages_per_step
-    )
+    if work is None:
+        work = msa_attention._work_list(selected, block_q, pages_per_step)
+    pages, meta, num_groups = work
 
     def tile_block(w, pages, meta, *_):
         return (meta[w] >> msa_attention._TILE_SHIFT, 0)
@@ -240,6 +242,34 @@ def _attention_call(
     return out.transpose(1, 0, 2), lse[:, :, 0].T
 
 
+def _chunk_len(num_tokens: int, block_q: int) -> tuple[int, int]:
+    """(tokens per kernel call, number of calls) for `_chunked_call`; a
+    single call takes the tokens as they are, unpadded."""
+    limit = msa_attention.MAX_TOKENS_PER_CALL
+    step = max(block_q, limit - limit % block_q)
+    num_chunks = -(-num_tokens // step)
+    return (num_tokens if num_chunks == 1 else step), num_chunks
+
+
+def _work_lists(selected, block_q, pages_per_step):
+    """The work lists of every kernel call of ``selected [..., T, K]`` (any
+    leading batch, e.g. KV heads), built in one batched computation rather
+    than one per call inside the calls' `lax.map`: a work list is a per-tile
+    sort and searches that cost more than the kernel itself when built per
+    call (0.44 vs 0.31 ms per 2048-token call at DCP8). Returns arrays with
+    leading ``[..., num_calls]``."""
+    *batch, num_tokens, topk = selected.shape
+    step, num_chunks = _chunk_len(num_tokens, block_q)
+    pad = num_chunks * step - num_tokens
+    selected = jnp.pad(
+        selected, [(0, 0)] * len(batch) + [(0, pad), (0, 0)], constant_values=-1
+    ).reshape(-1, step, topk)
+    build = jax.vmap(lambda s: msa_attention._work_list(s, block_q, pages_per_step))
+    return jax.tree.map(
+        lambda x: x.reshape(*batch, num_chunks, *x.shape[1:]), build(selected)
+    )
+
+
 def _chunked_call(
     q,
     kv_cache,
@@ -248,6 +278,7 @@ def _chunked_call(
     local_limit,
     page_table,
     head,
+    works=None,
     *,
     sm_scale,
     block_q,
@@ -269,11 +300,20 @@ def _chunked_call(
         scale_cache=scale_cache,
         scale_rows=scale_rows,
     )
-    limit = msa_attention.MAX_TOKENS_PER_CALL
-    step = max(block_q, limit - limit % block_q)
-    num_chunks = -(-num_tokens // step)
+    step, num_chunks = _chunk_len(num_tokens, block_q)
+    if works is None:
+        works = _work_lists(selected, block_q, pages_per_step)
     if num_chunks == 1:
-        return call(q, kv_cache, selected, local_page, local_limit, page_table, head)
+        return call(
+            q,
+            kv_cache,
+            selected,
+            local_page,
+            local_limit,
+            page_table,
+            head,
+            jax.tree.map(lambda x: x[0], works),
+        )
     pad = num_chunks * step - num_tokens
     q = jnp.pad(q, ((0, pad), (0, 0), (0, 0)))
     selected = jnp.pad(selected, ((0, pad), (0, 0)), constant_values=-1)
@@ -281,8 +321,8 @@ def _chunked_call(
     local_limit = jnp.pad(local_limit, (0, pad))
 
     def chunk(xs):
-        q_c, sel_c, page_c, limit_c = xs
-        return call(q_c, kv_cache, sel_c, page_c, limit_c, page_table, head)
+        q_c, sel_c, page_c, limit_c, work_c = xs
+        return call(q_c, kv_cache, sel_c, page_c, limit_c, page_table, head, work_c)
 
     out, lse = jax.lax.map(
         chunk,
@@ -291,6 +331,7 @@ def _chunked_call(
             selected.reshape(num_chunks, step, -1),
             local_page.reshape(num_chunks, step),
             local_limit.reshape(num_chunks, step),
+            works,
         ),
     )
     out = out.reshape(num_chunks * step, *out.shape[2:])[:num_tokens]
@@ -430,8 +471,11 @@ def msa_sparse_attention_lse_heads(
     q_per_head = num_q_heads // num_heads
     q_heads = q.reshape(padded, num_heads, q_per_head, head_dim).transpose(1, 0, 2, 3)
 
+    selected_heads = selected.transpose(1, 0, 2)  # [G, T, K]
+    works = _work_lists(selected_heads, block_q, pages_per_step)
+
     def one_head(xs):
-        q_h, sel_h, h = xs
+        q_h, sel_h, h, works_h = xs
         return _chunked_call(
             q_h,
             kv_cache,
@@ -440,6 +484,7 @@ def msa_sparse_attention_lse_heads(
             local_limit,
             page_table,
             h.reshape(1),
+            works_h,
             sm_scale=sm_scale,
             block_q=block_q,
             pages_per_step=pages_per_step,
@@ -450,7 +495,7 @@ def msa_sparse_attention_lse_heads(
 
     out, lse = jax.lax.map(
         one_head,
-        (q_heads, selected.transpose(1, 0, 2), jnp.arange(num_heads, dtype=jnp.int32)),
+        (q_heads, selected_heads, jnp.arange(num_heads, dtype=jnp.int32), works),
     )  # [G, T, Hg, D], [G, T, Hg]
     out = out.transpose(1, 0, 2, 3).reshape(padded, num_q_heads, head_dim)
     lse = lse.transpose(1, 0, 2).reshape(padded, num_q_heads)
