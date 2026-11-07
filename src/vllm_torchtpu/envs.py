@@ -308,6 +308,14 @@ def env_float(env_name: str, default: float) -> Callable[[], float]:
     return _get_float_env
 
 
+def _a2a_capacity(env_name: str, default: float) -> float:
+    """A ragged all-to-all capacity factor: 2 by default when an expert
+    placement file is set, else ``default``."""
+    if os.getenv("TPU_MOE_EXPERT_PLACEMENT", "").strip():
+        default = 2.0
+    return env_float(env_name, default)()
+
+
 def env_str(env_name: str, default: str) -> Callable[[], str]:
     """String knob with a default, surrounding whitespace stripped."""
 
@@ -820,12 +828,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_MOE_RAGGED_A2A": env_bool("TPU_MOE_RAGGED_A2A"),
     # Ragged all-to-all exchange: size the per-rank token rows and local routes
     # at this many times their uniform-routing mean (exact: a step that does
-    # not fit runs the full-size exchange). 0 = always full size.
-    "TPU_MOE_A2A_CAPACITY": env_float("TPU_MOE_A2A_CAPACITY", 2.5),
+    # not fit runs the full-size exchange). 0 = always full size. Default 2.5,
+    # or 2 with TPU_MOE_EXPERT_PLACEMENT (a placement balanced on routing
+    # counts keeps the busiest rank near the mean).
+    "TPU_MOE_A2A_CAPACITY": lambda: _a2a_capacity("TPU_MOE_A2A_CAPACITY", 2.5),
     # The local routes' factor (0 = TPU_MOE_A2A_CAPACITY): real routing skews
     # routes more than rows. Both factors are capped at 2 where the full-size
-    # exchange stays on the one-hot path (its rerun is cheap there).
-    "TPU_MOE_A2A_ROUTE_CAPACITY": env_float("TPU_MOE_A2A_ROUTE_CAPACITY", 3.0),
+    # exchange stays on the one-hot path (its rerun is cheap there). Default 3,
+    # or 2 with TPU_MOE_EXPERT_PLACEMENT.
+    "TPU_MOE_A2A_ROUTE_CAPACITY": lambda: _a2a_capacity(
+        "TPU_MOE_A2A_ROUTE_CAPACITY", 3.0
+    ),
     # Ragged all-to-all exchange: the fused expert kernel sends each expert
     # output row to its home rank as soon as it is computed, and the home rank
     # sums them, instead of a combine and a second exchange after the experts.
