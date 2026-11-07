@@ -30,12 +30,13 @@ kernels reject sliding windows):
    window's blocks it holds and returns the partial output and its
    log-sum-exp; the caller merges the ranks' partials
    (`dcp_comm.cp_lse_ag_out_rs`) back to its own heads.
-3. `attend_block`: the query block over its own new K/V (causal, within the
-   window), on every rank with its own heads; merged with step 2 by LSE.
+3. `attend_block`: the query block over its own new K/V (causal or not, as
+   the layer; the block is shorter than the window), on every rank with its
+   own heads; merged with step 2 by LSE.
 
-Together they equal causal sliding-window attention over the full context
-(`ragged_paged_attention` with ``sliding_window``), with the block written
-to the cache as the drafter's next context write would.
+Together they equal the RPA kernel's sliding-window attention over the full
+context (``q - k < window``, plus ``q >= k`` if causal; DSpark's query block
+is non-causal), with the block written to the cache.
 
 Cache rows use the RPA page layout ``[pages, S, 2G' / p, p, D]`` (``G'``
 the KV heads padded to the packing), K and V of head ``h`` interleaved.
@@ -208,10 +209,11 @@ def attend_block(
     *,
     max_query_len: int,
     sm_scale: float,
+    causal: bool = True,
 ) -> tuple[jax.Array, jax.Array]:
-    """Causal attention of each request's query tokens (``q [T, H, D]``)
-    over its own new K/V (``[T, G, D]``). The block is shorter than the
-    window, so causality is the only mask. Returns ``(out, lse)``."""
+    """Attention of each request's query tokens (``q [T, H, D]``) over its
+    own new K/V (``[T, G, D]``), causal or over the whole block. The block is
+    shorter than the window. Returns ``(out, lse)``."""
     num_tokens, num_heads, head_dim = q.shape
     kv_heads = key.shape[1]
     max_seqs = seq_lens.shape[0]
@@ -224,8 +226,10 @@ def attend_block(
     k = key[tok].astype(jnp.float32)  # [R, Q, G, D]
     v = value[tok].astype(jnp.float32)
     s = jnp.einsum("rqgxd,rkgd->rqgxk", qr, k) * sm_scale
-    causal = (slot[None, :, None] >= slot[None, None, :]) & tok_valid[:, None, :]
-    s = jnp.where(causal[:, :, None, None, :], s, _NEG_INF)
+    visible = tok_valid[:, None, :] & tok_valid[:, :, None]
+    if causal:
+        visible = visible & (slot[None, :, None] >= slot[None, None, :])
+    s = jnp.where(visible[:, :, None, None, :], s, _NEG_INF)
     m = jnp.max(s, axis=-1, keepdims=True)
     m_safe = jnp.where(jnp.isfinite(m), m, 0.0)
     p = jnp.exp(s - m_safe)
@@ -344,7 +348,7 @@ def _attend_op(
 
 
 @functools.cache
-def _block_op(max_query_len: int, sm_scale: float):
+def _block_op(max_query_len: int, sm_scale: float, causal: bool):
     from torch_tpu._internal import pallas
 
     def _block(
@@ -358,11 +362,13 @@ def _block_op(max_query_len: int, sm_scale: float):
     ) -> jax.Array:
         out, lse = attend_block(
             q, key, value, seq_lens, query_start_loc,
-            max_query_len=max_query_len, sm_scale=sm_scale,
+            max_query_len=max_query_len, sm_scale=sm_scale, causal=causal,
         )
         return merge(ctx_out.astype(out.dtype), ctx_lse, out, lse)[0]
 
-    name = f"pallas::dcp_draft_block_q{max_query_len}_s{sm_scale:.8f}".replace(".", "p")
+    name = f"pallas::dcp_draft_block_q{max_query_len}_s{sm_scale:.8f}_c{int(causal)}".replace(
+        ".", "p"
+    )
     op = pallas.jax_op(name, _block)
     op.register_fake(lambda q, *args: torch.empty_like(q))
     return op
@@ -439,6 +445,7 @@ def forward_with_dcp(
     max_query_len: int,
     sliding_window: int,
     sm_scale: float,
+    causal: bool,
     k_scale: float | None,
     v_scale: float | None,
 ) -> torch.Tensor:
@@ -465,7 +472,7 @@ def forward_with_dcp(
     if kv_cache.dtype != key.dtype and k_scale is not None:
         key = (key.float() / k_scale).to(kv_cache.dtype).float() * k_scale
         value = (value.float() / v_scale).to(kv_cache.dtype).float() * v_scale
-    return _block_op(max_query_len, sm_scale)(
+    return _block_op(max_query_len, sm_scale, causal)(
         query,
         key.to(query.dtype),
         value.to(query.dtype),

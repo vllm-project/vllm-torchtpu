@@ -1198,6 +1198,7 @@ class PallasAttentionBackendImpl(AttentionImpl):
             dcp_rank=layer.draft_dcp_rank,
             sliding_window=self.sliding_window,
             sm_scale=self.scale,
+            causal=self.use_causal_mask,
             k_scale=layer._k_scale_float if quantized else None,
             v_scale=layer._v_scale_float if quantized else None,
             **self.sharded_draft_dcp,

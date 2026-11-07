@@ -30,9 +30,32 @@ def _cache(pages, kv_heads, dtype):
     return jnp.zeros((pages, PAGE, words, packing, HEAD_DIM), dtype)
 
 
+def _dense_reference(q, keys, values, total, cu_q, window, sm_scale, causal):
+    """The RPA kernel's mask (`ragged_paged_attention` v3): keys below the
+    sequence length within the window, plus q >= k if causal."""
+    out = np.zeros(q.shape, np.float32)
+    q_heads, kv_heads = q.shape[1], keys[0].shape[1]
+    for r, (k, v) in enumerate(zip(keys, values)):
+        lo, hi = int(cu_q[r]), int(cu_q[r + 1])
+        q_pos = int(total[r]) - (hi - lo) + np.arange(hi - lo)
+        k_pos = np.arange(k.shape[0])
+        mask = q_pos[:, None] - k_pos[None, :] < window
+        if causal:
+            mask &= q_pos[:, None] >= k_pos[None, :]
+        kk = np.repeat(k, q_heads // kv_heads, axis=1)
+        vv = np.repeat(v, q_heads // kv_heads, axis=1)
+        s = np.einsum("qhd,khd->hqk", q[lo:hi].astype(np.float32), kk) * sm_scale
+        s = np.where(mask[None], s, -np.inf)
+        p = np.exp(s - s.max(-1, keepdims=True))
+        p /= p.sum(-1, keepdims=True)
+        out[lo:hi] = np.einsum("hqk,khd->qhd", p, vv)
+    return out
+
+
+@pytest.mark.parametrize("causal", [True, False])
 @pytest.mark.parametrize("dtype", [jnp.bfloat16, jnp.float8_e4m3fn])
 @pytest.mark.parametrize("dcp,kv_heads,q_heads", [(1, 1, 8), (2, 1, 16), (8, 4, 64)])
-def test_sharded_matches_replicated(dcp, kv_heads, q_heads, dtype):
+def test_sharded_matches_replicated(dcp, kv_heads, q_heads, dtype, causal):
     rng = np.random.default_rng(dcp * 10 + kv_heads)
     ctx = np.array([1000, 37, 600, 0], np.int32)[:MAX_SEQS]  # 0: empty context
     q_len = np.array([7, 7, 3, 7], np.int32)
@@ -109,9 +132,26 @@ def test_sharded_matches_replicated(dcp, kv_heads, q_heads, dtype):
         blk_k = blk_k.astype(dtype).astype(jnp.float32)
         blk_v = blk_v.astype(dtype).astype(jnp.float32)
     b_out, b_lse = cda.attend_block(
-        q, blk_k, blk_v, jnp.asarray(total), cu_q, max_query_len=max_q, sm_scale=sm_scale
+        q, blk_k, blk_v, jnp.asarray(total), cu_q, max_query_len=max_q,
+        sm_scale=sm_scale, causal=causal,
     )
     out, _ = cda.merge(out, lse, b_out, b_lse)
+    if not causal:
+        # `ref_ragged_paged_attention` drops the window when not causal; the
+        # kernel keeps it. Compare against the kernel's mask.
+        def stored_np(x):
+            if scale is None:
+                return np.asarray(x.astype(dtype).astype(jnp.float32))
+            return np.asarray((x / scale).astype(dtype).astype(jnp.float32) * scale)
+
+        keys = [np.concatenate([stored_np(ck), stored_np(new_k[a:b])]) for ck, a, b in
+                zip(ctx_k, np.asarray(cu_q[:-1]), np.asarray(cu_q[1:]))]
+        values = [np.concatenate([stored_np(cv), stored_np(new_v[a:b])]) for cv, a, b in
+                  zip(ctx_v, np.asarray(cu_q[:-1]), np.asarray(cu_q[1:]))]
+        ref_out = _dense_reference(
+            np.asarray(q, np.float32), keys, values, total, np.asarray(cu_q), WINDOW,
+            sm_scale, causal=False,
+        )
 
     np.testing.assert_allclose(
         np.asarray(out, np.float32), np.asarray(ref_out, np.float32), rtol=3e-2, atol=3e-2

@@ -288,13 +288,9 @@ class DFlashProposer:
     def _shards_draft_kv_over_dcp(self, attn_impl: PallasAttentionBackendImpl) -> bool:
         """Whether this draft layer keeps its KV DCP-sharded like the target's
         (`cp_draft_attention`): drafters opt in (`shards_draft_kv_over_dcp`),
-        for causal sliding-window layers."""
+        for sliding-window layers (causal or not)."""
         opted_in = getattr(self.draft_model, "shards_draft_kv_over_dcp", False)
-        shard = (
-            opted_in
-            and attn_impl.sliding_window is not None
-            and attn_impl.use_causal_mask
-        )
+        shard = opted_in and attn_impl.sliding_window is not None
         logger.info_once(
             "Draft KV under DCP: %s (opt-in=%s, draft=%s, sliding_window=%s, causal=%s)",
             "sharded" if shard else "replicated",
