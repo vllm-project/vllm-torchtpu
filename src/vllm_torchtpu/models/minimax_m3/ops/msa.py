@@ -22,6 +22,7 @@ import torch
 from torch_tpu._internal import pallas
 from vllm.distributed import get_tp_group
 
+from vllm_torchtpu.distributed.dcp import split_group_heads as _split_group_heads
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
 from vllm_torchtpu.models.minimax_m3.kernels import msa, msa_dcp, msa_indexer
 
@@ -361,19 +362,11 @@ def split_group_heads(
     """Split the DCP all-gather of every rank's ``[q | k | v | index_q]``
     (``[T, dcp * (q_heads + 3), D]``, rank-major) into the group's query
     heads ``[T, dcp * q_heads, D]`` and the ``k``/``v``/``index_q
-    [T, dcp // kv_head_replicas, D]`` of its KV heads: rank ``i`` of the
-    group holds KV head ``i // kv_head_replicas``, so every
-    ``kv_head_replicas``-th rank supplies the next head."""
-    num_tokens, _, head_dim = gathered.shape
-    gathered = gathered.view(num_tokens, dcp, q_heads + 3, head_dim)
-    q_all = gathered[:, :, :q_heads].reshape(num_tokens, dcp * q_heads, head_dim)
-    per_head = gathered[:, ::kv_head_replicas, q_heads:]
-    return (
-        q_all,
-        per_head[:, :, 0].contiguous(),
-        per_head[:, :, 1].contiguous(),
-        per_head[:, :, 2].contiguous(),
+    [T, dcp // kv_head_replicas, D]`` of its KV heads (`dcp.split_group_heads`)."""
+    q_all, (k, v, index_q) = _split_group_heads(
+        gathered, dcp, q_heads, kv_head_replicas, per_kv_head=3
     )
+    return q_all, k, v, index_q
 
 
 @functools.cache

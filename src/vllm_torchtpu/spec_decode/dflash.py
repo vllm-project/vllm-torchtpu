@@ -26,6 +26,7 @@ from vllm.forward_context import set_forward_context
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.model_loader import get_model_loader
 
+from vllm_torchtpu.distributed.dcp import get_dcp_group
 from vllm_torchtpu.layers.adapter import token_padding
 from vllm_torchtpu.layers.adapter.attention import PallasAttentionBackendImpl
 from vllm_torchtpu.layers.core.attention_metadata import (
@@ -274,7 +275,31 @@ class DFlashProposer:
                     attn_impl.layer_idx = i
                     attn_impl.use_causal_mask = layer_causal_list[i]
                     attn_impl.kv_replicated_over_dcp = dcp > 1
+                    if dcp > 1 and self._shards_draft_kv_over_dcp(attn_impl):
+                        attn_impl.enable_sharded_draft_dcp(
+                            attn_obj,
+                            dcp=dcp,
+                            dcp_rank=get_dcp_group().rank_in_group,
+                            kv_head_replicas=self._draft_kv_head_replicas(),
+                            max_query_len=self.block_size,
+                        )
                     attn_impl.initialize_kernel(attn_obj)
+
+    def _shards_draft_kv_over_dcp(self, attn_impl: PallasAttentionBackendImpl) -> bool:
+        """Whether this draft layer keeps its KV DCP-sharded like the target's
+        (`cp_draft_attention`): drafters opt in (`shards_draft_kv_over_dcp`),
+        for causal sliding-window layers."""
+        return (
+            getattr(self.draft_model, "shards_draft_kv_over_dcp", False)
+            and attn_impl.sliding_window is not None
+            and attn_impl.use_causal_mask
+        )
+
+    def _draft_kv_head_replicas(self) -> int:
+        """Tensor-parallel ranks per draft KV head."""
+        tp = self.vllm_config.parallel_config.tensor_parallel_size
+        kv_heads = self.speculative_config.draft_model_config.get_total_num_kv_heads()
+        return max(1, tp // kv_heads)
 
     def _load_draft_model(self) -> None:
         logger.info("Loading DFlash draft model...")

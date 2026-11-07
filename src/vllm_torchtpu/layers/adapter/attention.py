@@ -78,6 +78,7 @@ from vllm_torchtpu.kernels.mla.kv_cache_utils import (
     SparseMLAKVCacheSpec,
 )
 from vllm_torchtpu.kernels.mla.v2 import kernel as mla_v2_kernel
+from vllm_torchtpu.layers.adapter import cp_draft_attention as _cp_draft_attention
 from vllm_torchtpu.layers.adapter import cp_mla_attention as _cp_mla_attention
 from vllm_torchtpu.layers.adapter.cp_attention import (
     build_dcp_kernels as _build_dcp_kernels,
@@ -911,6 +912,10 @@ class PallasAttentionBackendImpl(AttentionImpl):
         # attends like a non-DCP layer, over pages of block_size * dcp tokens
         # that line up with the DCP-sharded layers' logical blocks.
         self.kv_replicated_over_dcp = False
+        # Set (with kv_replicated_over_dcp, which keeps the plain kernel) by a
+        # drafter whose sliding-window KV is DCP-sharded like the target's
+        # (`enable_sharded_draft_dcp`); routes forward to `cp_draft_attention`.
+        self.sharded_draft_dcp: dict[str, Any] | None = None
         self.rpa_dcp_cache_kernel = None  # CACHE_ONLY pass, returns (out, lse)
         self.rpa_dcp_new_kernel = None  # NEW_TOKENS_ONLY pass, returns (out, lse)
         # Block-major bundled kernel and pre-allocated layer index. Initialized by
@@ -1159,6 +1164,66 @@ class PallasAttentionBackendImpl(AttentionImpl):
         self._kernel_registry[registry_key] = rpa_kernel_impl
         self._kernel_config_cache[config_key] = rpa_kernel_impl
         return rpa_kernel_impl
+
+    def enable_sharded_draft_dcp(
+        self,
+        layer: AttentionLayer,
+        *,
+        dcp: int,
+        dcp_rank: int,
+        kv_head_replicas: int,
+        max_query_len: int,
+    ) -> None:
+        """Keep this (drafter, sliding-window) layer's KV DCP-sharded like the
+        target's (`cp_draft_attention`) instead of whole on every rank.
+
+        The rank is a buffer of `layer`, so every rank traces one program.
+        """
+        if self.sliding_window is None:
+            raise NotImplementedError("sharded draft DCP needs a sliding-window layer")
+        self.kv_replicated_over_dcp = True
+        layer.register_buffer(
+            "draft_dcp_rank",
+            torch.tensor([dcp_rank], dtype=torch.int32, device=layer._k_scale.device),
+            persistent=False,
+        )
+        self.sharded_draft_dcp = dict(
+            dcp=dcp, kv_head_replicas=kv_head_replicas, max_query_len=max_query_len
+        )
+
+    def _sharded_draft_dcp_args(self, layer: AttentionLayer) -> dict[str, Any]:
+        assert self.sharded_draft_dcp is not None and self.sliding_window is not None
+        quantized = bool(self.kv_cache_quantized_dtype)
+        return dict(
+            dcp_rank=layer.draft_dcp_rank,
+            sliding_window=self.sliding_window,
+            sm_scale=self.scale,
+            k_scale=layer._k_scale_float if quantized else None,
+            v_scale=layer._v_scale_float if quantized else None,
+            **self.sharded_draft_dcp,
+        )
+
+    def write_sharded_draft_kv(
+        self,
+        layer: AttentionLayer,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        kv_cache: torch.Tensor,
+        attn_metadata: AttentionMetadata,
+    ) -> None:
+        """Write the drafter's context K/V into its DCP-sharded cache."""
+        args = self._sharded_draft_dcp_args(layer)
+        _cp_draft_attention.write_with_dcp(
+            key=key.view(key.shape[0], self.num_kv_heads, self.head_size),
+            value=value.view(value.shape[0], self.num_kv_heads, self.head_size),
+            kv_cache=kv_cache,
+            attn_metadata=attn_metadata,
+            dcp_rank=args["dcp_rank"],
+            dcp=args["dcp"],
+            kv_head_replicas=args["kv_head_replicas"],
+            k_scale=args["k_scale"],
+            v_scale=args["v_scale"],
+        )
 
     def _run_dcp_forward(
         self,
@@ -1532,6 +1597,20 @@ class PallasAttentionBackendImpl(AttentionImpl):
             query = torch.nn.functional.pad(query, (0, pad_size))
             key = torch.nn.functional.pad(key, (0, pad_size))
             value = torch.nn.functional.pad(value, (0, pad_size))
+        if self.sharded_draft_dcp is not None:
+            outputs = _cp_draft_attention.forward_with_dcp(
+                query=query,
+                key=key,
+                value=value,
+                kv_cache=kv_cache,
+                attn_metadata=attn_metadata,
+                **self._sharded_draft_dcp_args(layer),
+            )
+            if query_dim == 2:
+                outputs = outputs.reshape(q_len, self.num_heads * self.head_size)
+            if output is not None:
+                output.copy_(outputs)
+            return outputs
         if self.kv_cache_quantized_dtype:
             k_scale_value = layer._k_scale_float
             v_scale_value = layer._v_scale_float

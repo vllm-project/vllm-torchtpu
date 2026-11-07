@@ -166,7 +166,11 @@ def dcp_replicated_page_tokens(
     """
     dcp = vllm_config.parallel_config.decode_context_parallel_size
     impl = getattr(attn_module, "impl", None)
-    if dcp > 1 and getattr(impl, "kv_replicated_over_dcp", False):
+    if (
+        dcp > 1
+        and getattr(impl, "kv_replicated_over_dcp", False)
+        and getattr(impl, "sharded_draft_dcp", None) is None
+    ):
         return block_size * dcp
     return block_size
 
@@ -388,6 +392,33 @@ class KVCacheManager:
                         attn_module.head_size,
                         self.runner.kv_cache_dtype,
                     )
+                    sharded_draft = getattr(attn_module.impl, "sharded_draft_dcp", None)
+                    if sharded_draft is not None:
+                        # A drafter's sliding-window KV sharded over DCP like
+                        # the target's (`cp_draft_attention`): block_size-token
+                        # pages holding every KV head of the DCP group. Exact
+                        # spec; full attention as vLLM's sliding-window
+                        # manager rejects DCP (the window is applied on read).
+                        kv_heads = max(
+                            1, sharded_draft["dcp"] // sharded_draft["kv_head_replicas"]
+                        )
+                        kv_cache_spec[layer_name] = FullAttentionSpec(
+                            block_size=block_size,
+                            num_kv_heads=kv_heads,
+                            head_size=attn_module.head_size,
+                            dtype=self.runner.kv_cache_dtype,
+                            page_size_padded=cast(
+                                "type[_TpuKVCacheBackend]", backend_cls
+                            ).get_kv_cache_page_size_bytes(
+                                block_size,
+                                kv_heads,
+                                attn_module.head_size,
+                                self.runner.kv_cache_dtype,
+                            ),
+                            sliding_window=attn_module.sliding_window,
+                        )
+                        dcp_replicated_layers.add(layer_name)
+                        continue
                     page_tokens = dcp_replicated_page_tokens(
                         attn_module, block_size, self.runner.vllm_config
                     )

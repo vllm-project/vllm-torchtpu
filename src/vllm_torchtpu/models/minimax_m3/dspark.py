@@ -237,6 +237,13 @@ class MiniMaxM3DSparkModel(Qwen3DSparkModel):
             k, v = qkv[:, attn.q_size :].split([attn.kv_size, attn.kv_size], dim=-1)
             k = _per_head_norm(k, attn.k_norm, attn.head_dim)
             k, _ = attn.rotary_emb(positions, k, None)
+            impl = attn.attn.impl
+            if impl.sharded_draft_dcp is not None:
+                # DCP-sharded draft KV (`cp_draft_attention`): owner ranks write.
+                impl.write_sharded_draft_kv(
+                    attn.attn, k, v, attn.attn.kv_cache, layer_metadata
+                )
+                continue
             # The cache write rides the attention kernel; its output (for an
             # all-zero query) is discarded.
             query = torch.zeros(
@@ -244,7 +251,7 @@ class MiniMaxM3DSparkModel(Qwen3DSparkModel):
                 dtype=context.dtype,
                 device=context.device,
             )
-            attn.attn.impl.forward(
+            impl.forward(
                 layer=attn.attn,
                 query=query,
                 key=k.reshape(num_tokens, attn.num_kv_heads, attn.head_dim),
@@ -257,6 +264,10 @@ class MiniMaxM3DSparkModel(Qwen3DSparkModel):
 
 class MiniMaxM3DSparkForCausalLM(Qwen3DSparkForCausalLM):
     """Registry entry for ``architectures=DSparkMiniMaxDraftModel``."""
+
+    # Under DCP the draft's sliding-window KV is sharded over the group like
+    # the target's (`layers/adapter/cp_draft_attention`), not whole per rank.
+    shards_draft_kv_over_dcp = True
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         nn.Module.__init__(self)

@@ -41,8 +41,12 @@ Cache rows use the RPA page layout ``[pages, S, 2G' / p, p, D]`` (``G'``
 the KV heads padded to the packing), K and V of head ``h`` interleaved.
 """
 
+import functools
+from typing import Any
+
 import jax
 import jax.numpy as jnp
+import torch
 
 _NEG_INF = float("-inf")
 
@@ -250,3 +254,223 @@ def merge(out_a, lse_a, out_b, lse_b):
     ) / norm_safe[..., None]
     lse = jnp.where(norm > 0, m_safe + jnp.log(norm_safe), _NEG_INF)
     return out.astype(out_a.dtype), lse
+
+
+# ---------------------------------------------------------------------------
+# Torch entry points (one jax_op per static configuration)
+# ---------------------------------------------------------------------------
+
+
+@functools.cache
+def _write_op(dcp: int, k_scale: float | None, v_scale: float | None):
+    from torch_tpu._internal import pallas
+
+    def _write(
+        kv_cache: jax.Array,
+        key: jax.Array,
+        value: jax.Array,
+        seq_lens: jax.Array,
+        block_tables: jax.Array,
+        query_start_loc: jax.Array,
+        dcp_rank: jax.Array,
+    ) -> jax.Array:
+        return write_kv(
+            kv_cache,
+            key,
+            value,
+            seq_lens,
+            block_tables,
+            query_start_loc,
+            dcp=dcp,
+            rank=dcp_rank[0],
+            k_scale=k_scale,
+            v_scale=v_scale,
+        )
+
+    name = f"pallas::dcp_draft_write_d{dcp}_k{k_scale}_v{v_scale}".replace(".", "p")
+    op = pallas.jax_op(name, _write, donate_argnums=(0,))
+    op.register_fake(lambda kv_cache, *args: torch.empty_like(kv_cache))
+    return op
+
+
+@functools.cache
+def _attend_op(
+    kv_heads: int,
+    max_query_len: int,
+    sliding_window: int,
+    sm_scale: float,
+    dcp: int,
+    k_scale: float | None,
+    v_scale: float | None,
+):
+    from torch_tpu._internal import pallas
+
+    def _attend(
+        q_all: jax.Array,
+        kv_cache: jax.Array,
+        seq_lens: jax.Array,
+        block_tables: jax.Array,
+        query_start_loc: jax.Array,
+        dcp_rank: jax.Array,
+    ) -> tuple[jax.Array, jax.Array]:
+        return attend_cached(
+            q_all,
+            kv_cache,
+            seq_lens,
+            block_tables,
+            query_start_loc,
+            kv_heads=kv_heads,
+            max_query_len=max_query_len,
+            sliding_window=sliding_window,
+            sm_scale=sm_scale,
+            dcp=dcp,
+            rank=dcp_rank[0],
+            k_scale=k_scale,
+            v_scale=v_scale,
+        )
+
+    name = (
+        f"pallas::dcp_draft_attend_g{kv_heads}_q{max_query_len}_w{sliding_window}"
+        f"_s{sm_scale:.8f}_d{dcp}_k{k_scale}_v{v_scale}"
+    ).replace(".", "p")
+    op = pallas.jax_op(name, _attend)
+    op.register_fake(
+        lambda q, *args: (
+            torch.empty_like(q),
+            torch.empty(q.shape[:2], dtype=torch.float32, device=q.device),
+        )
+    )
+    return op
+
+
+@functools.cache
+def _block_op(max_query_len: int, sm_scale: float):
+    from torch_tpu._internal import pallas
+
+    def _block(
+        q: jax.Array,
+        key: jax.Array,
+        value: jax.Array,
+        seq_lens: jax.Array,
+        query_start_loc: jax.Array,
+        ctx_out: jax.Array,
+        ctx_lse: jax.Array,
+    ) -> jax.Array:
+        out, lse = attend_block(
+            q, key, value, seq_lens, query_start_loc,
+            max_query_len=max_query_len, sm_scale=sm_scale,
+        )
+        return merge(ctx_out.astype(out.dtype), ctx_lse, out, lse)[0]
+
+    name = f"pallas::dcp_draft_block_q{max_query_len}_s{sm_scale:.8f}".replace(".", "p")
+    op = pallas.jax_op(name, _block)
+    op.register_fake(lambda q, *args: torch.empty_like(q))
+    return op
+
+
+def gather_group(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    group: Any,
+    dcp: int,
+    kv_head_replicas: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Every rank's query heads, and the K/V of the group's KV heads.
+
+    A group no wider than a KV head's replicas shares one KV head, so only
+    the queries are gathered; a wider one gathers ``[q | k | v]`` once.
+    """
+    from vllm_torchtpu.distributed.dcp import split_group_heads
+
+    if dcp <= kv_head_replicas:
+        return group.all_gather(query.contiguous(), dim=1), key, value
+    gathered = group.all_gather(torch.cat([query, key, value], dim=1).contiguous(), dim=1)
+    q_all, (k_all, v_all) = split_group_heads(
+        gathered, dcp, query.shape[1], kv_head_replicas, per_kv_head=2
+    )
+    return q_all, k_all, v_all
+
+
+def write_with_dcp(
+    *,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    kv_cache: torch.Tensor,
+    attn_metadata: Any,
+    dcp_rank: torch.Tensor,
+    dcp: int,
+    kv_head_replicas: int,
+    k_scale: float | None,
+    v_scale: float | None,
+) -> None:
+    """Write the drafter's context K/V (own KV head per rank) into the
+    DCP-sharded cache: each rank keeps the tokens of its blocks."""
+    from vllm_torchtpu.distributed.dcp import get_dcp_group
+
+    group = get_dcp_group()
+    if dcp > kv_head_replicas:
+        gathered = group.all_gather(torch.cat([key, value], dim=1).contiguous(), dim=1)
+        num_tokens, _, head_dim = gathered.shape
+        per_rank = gathered.view(num_tokens, dcp, 2, head_dim)[:, ::kv_head_replicas]
+        key, value = per_rank[:, :, 0].contiguous(), per_rank[:, :, 1].contiguous()
+    new_cache = _write_op(dcp, k_scale, v_scale)(
+        kv_cache,
+        key,
+        value,
+        attn_metadata.seq_lens,
+        attn_metadata.block_tables,
+        attn_metadata.query_start_loc,
+        dcp_rank,
+    )
+    kv_cache.copy_(new_cache)
+
+
+def forward_with_dcp(
+    *,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    kv_cache: torch.Tensor,
+    attn_metadata: Any,
+    dcp_rank: torch.Tensor,
+    dcp: int,
+    kv_head_replicas: int,
+    max_query_len: int,
+    sliding_window: int,
+    sm_scale: float,
+    k_scale: float | None,
+    v_scale: float | None,
+) -> torch.Tensor:
+    """The drafter's attention of its query block (``query [T, H, D]``, own
+    heads; ``key``/``value [T, 1, D]``, own KV head) over the window of a
+    DCP-sharded cache plus the block itself. The block is not written."""
+    from vllm_torchtpu.distributed.dcp import get_dcp_group
+    from vllm_torchtpu.distributed.dcp_comm import cp_lse_ag_out_rs
+
+    group = get_dcp_group()
+    q_all, k_all, _ = gather_group(query, key, value, group, dcp, kv_head_replicas)
+    ctx_out, ctx_lse = _attend_op(
+        k_all.shape[1], max_query_len, sliding_window, sm_scale, dcp, k_scale, v_scale
+    )(
+        q_all,
+        kv_cache,
+        attn_metadata.seq_lens,
+        attn_metadata.block_tables,
+        attn_metadata.query_start_loc,
+        dcp_rank,
+    )
+    ctx_out, ctx_lse = cp_lse_ag_out_rs(ctx_out, ctx_lse, group, return_lse=True)
+    # The block's K/V as the cache would hold them (quantized), own KV head.
+    if kv_cache.dtype != key.dtype and k_scale is not None:
+        key = (key.float() / k_scale).to(kv_cache.dtype).float() * k_scale
+        value = (value.float() / v_scale).to(kv_cache.dtype).float() * v_scale
+    return _block_op(max_query_len, sm_scale)(
+        query,
+        key.to(query.dtype),
+        value.to(query.dtype),
+        attn_metadata.seq_lens,
+        attn_metadata.query_start_loc,
+        ctx_out,
+        ctx_lse,
+    )
