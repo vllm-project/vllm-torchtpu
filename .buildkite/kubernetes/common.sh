@@ -46,8 +46,11 @@ export WORKLOAD_IMAGE
 # The image the Kimi-K3 AgentX pair's engines run (kimi-k3-agentx-1p1d.yaml
 # substitutes it; no pod reads it from here): the step's, else the one the build
 # published from build_k3_engine_image.sh, else the build's own.
-if [[ -z "${K3_ENGINE_IMAGE:-}" ]]; then
-  K3_ENGINE_IMAGE=$(buildkite-agent meta-data get K3_ENGINE_IMAGE --default "" 2>/dev/null || true)
+# With K3_ENGINE_VLLM_RS the published image (the given one plus vllm-rs) wins.
+if [[ -z "${K3_ENGINE_IMAGE:-}" || -n "${K3_ENGINE_VLLM_RS:-}" ]]; then
+  _published=$(buildkite-agent meta-data get K3_ENGINE_IMAGE --default "" 2>/dev/null || true)
+  K3_ENGINE_IMAGE="${_published:-${K3_ENGINE_IMAGE:-}}"
+  unset _published
 fi
 export K3_ENGINE_IMAGE="${K3_ENGINE_IMAGE:-$WORKLOAD_IMAGE}"
 
@@ -59,7 +62,7 @@ export K3_ENGINE_IMAGE="${K3_ENGINE_IMAGE:-$WORKLOAD_IMAGE}"
 # setting it empty.
 if [[ -z "${K3_FLEET_CACHES+set}" ]]; then
   case "${K3_PD_CONFIG:-}" in
-    kimi-k3-megakernel*/*) K3_FLEET_CACHES=none ;;
+    kimi-k3-megakernel*/*|kimi-k31-megakernel*/*) K3_FLEET_CACHES=none ;;
     *) K3_FLEET_CACHES="" ;;
   esac
 fi
@@ -125,6 +128,8 @@ FORWARD=(
   # The config both engines of the pair and its client read, when a step serves
   # another than the manifest's default (a Kimi-K3 megakernel recipe point).
   K3_PD_CONFIG
+  # The Kimi-K3.1 lane's code overlay and frontend switch (k3_code_overlay.sh).
+  K3_CODE_OVERLAY K31_RUST_FRONTEND
   # The Kimi-K3 kernel bench's commands and switches (k3_bench_pod.sh).
   K3_BENCH_COMMANDS K3_BENCH_LIBTPU K3_BENCH_FRESH K3_BENCH_TRACE_ALL K3_BENCH_LLO
 )

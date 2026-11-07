@@ -202,7 +202,7 @@ steps:
 
   - label: ":tpu: Perf: Kimi-K3 AgentX 1P1D ${K3_PD_CONFIG} (TPU v7x 2x2x4 x2)"
     key: k3_mk_agentx_1p1d
-    if: 'build.env("K3_PD_CONFIG") != null && build.env("K3_PD_CONFIG") !~ /^kimi-k3-megakernel-agg\// && build.env("K3_BENCH_COMMANDS") == null'
+    if: 'build.env("K3_PD_CONFIG") != null && build.env("K3_PD_CONFIG") !~ /^kimi-k3-megakernel-agg\// && build.env("K3_PD_CONFIG") !~ /^kimi-k31-/ && build.env("K3_BENCH_COMMANDS") == null'
     depends_on:
       - build_docker
       - k3_engine_image
@@ -259,6 +259,59 @@ steps:
         test -f "scripts/vllm/benchmarking/configs/$${K3_PD_CONFIG}.sh" \
           || { echo "no such config: $${K3_PD_CONFIG}" >&2; exit 2; }
       - .buildkite/kubernetes/run_multihost.sh --manifest kimi-k3-agentx-agg.yaml
+
+  # -----------------------------------------------------------------
+  # Kimi-K3.1-Pro megakernel AgentX, on a build that sets a kimi-k31-* K3_PD_CONFIG
+  # The K3.1 engine code is not in this repository: K3_CODE_OVERLAY names a
+  # directory of gs://tpu-ci-models-60b4c3c7/k31-overlays/ whose code.tar holds
+  # the engine's src/vllm_torchtpu, tools/megakernel and the kimi-k31-* configs
+  # (k3_code_overlay.sh). The engines run it over K3_ENGINE_IMAGE, an image
+  # with the same vLLM and jax pins; K3_ENGINE_VLLM_RS=<vLLM ref> adds vllm-rs
+  # built from that ref to it (build_k3_engine_image.sh). Build env:
+  #   K3_PD_CONFIG      kimi-k31-megakernel-agg/<point> (one 2x2x4 slice) or
+  #                     kimi-k31-megakernel/<point> (1P1D, two slices)
+  #   K3_CODE_OVERLAY   the overlay directory
+  #   K3_ENGINE_IMAGE   the base engine image
+  #   K3_ENGINE_VLLM_RS optional, e.g. v0.32.0
+  #   K31_RUST_FRONTEND 1: serve through vllm-rs (needs K3_ENGINE_VLLM_RS)
+  # -----------------------------------------------------------------
+  - label: ":tpu: Perf: Kimi-K3.1 AgentX aggregate ${K3_PD_CONFIG} (TPU v7x 2x2x4)"
+    key: k31_mk_agentx_agg
+    if: 'build.env("K3_PD_CONFIG") =~ /^kimi-k31-megakernel-agg\// && build.env("K3_BENCH_COMMANDS") == null'
+    depends_on:
+      - build_docker
+      - k3_engine_image
+    timeout_in_minutes: 1440
+    env:
+      ARTIFACTS_DIR: "perf_eval_results"
+      WORKLOAD_PRIORITY: "post-merge"
+    agents:
+      queue: "kube"
+    plugins:
+      - kubernetes:
+          podTemplate: tpu-launcher
+    commands:
+      - test -n "$${K3_CODE_OVERLAY:-}" || { echo "K3_CODE_OVERLAY is unset" >&2; exit 2; }
+      - .buildkite/kubernetes/run_multihost.sh --manifest kimi-k31-agentx-agg.yaml
+
+  - label: ":tpu: Perf: Kimi-K3.1 AgentX 1P1D ${K3_PD_CONFIG} (TPU v7x 2x2x4 x2)"
+    key: k31_mk_agentx_1p1d
+    if: 'build.env("K3_PD_CONFIG") =~ /^kimi-k31-megakernel\// && build.env("K3_BENCH_COMMANDS") == null'
+    depends_on:
+      - build_docker
+      - k3_engine_image
+    timeout_in_minutes: 1440
+    env:
+      ARTIFACTS_DIR: "perf_eval_results"
+      WORKLOAD_PRIORITY: "post-merge"
+    agents:
+      queue: "kube"
+    plugins:
+      - kubernetes:
+          podTemplate: tpu-launcher
+    commands:
+      - test -n "$${K3_CODE_OVERLAY:-}" || { echo "K3_CODE_OVERLAY is unset" >&2; exit 2; }
+      - .buildkite/kubernetes/run_multihost.sh --manifest kimi-k31-agentx-1p1d.yaml
 
   # -----------------------------------------------------------------
   # Kimi-K3 megakernel kernel bench, on a build that sets K3_BENCH_COMMANDS

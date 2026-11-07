@@ -106,6 +106,13 @@ source "$IX_DIR/sweep_lib.sh"
 log() { echo "[k3-agentx-client-pod] $*"; }
 
 cd "$REPO_DIR" || { log "FATAL: no repo at $REPO_DIR"; exit 1; }
+# A K3_CODE_OVERLAY build brings the configs from GCS.
+if [ -n "${K3_CODE_OVERLAY:-}" ]; then
+    # shellcheck source=.buildkite/kubernetes/k3_code_overlay.sh
+    # shellcheck disable=SC1091
+    source "$REPO_DIR/.buildkite/kubernetes/k3_code_overlay.sh"
+    apply_code_overlay client || { log "FATAL: code overlay ${K3_CODE_OVERLAY}"; exit 2; }
+fi
 ARTIFACTS_DIR="${ARTIFACTS_DIR:-perf_eval_results}"
 EVAL_ONLY="${AGENTX_EVAL_JOB:-0}"
 case "$EVAL_ONLY" in 0|1) ;; *) log "FATAL: AGENTX_EVAL_JOB must be 0 or 1, not '$EVAL_ONLY'"; exit 2 ;; esac

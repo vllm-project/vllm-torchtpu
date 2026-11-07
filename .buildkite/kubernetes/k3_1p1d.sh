@@ -62,6 +62,14 @@ esac
 : "${NUM_HOSTS:?}"
 INDEX="${JOB_COMPLETION_INDEX:-0}"
 
+# A K3_CODE_OVERLAY build brings the engine code and its configs from GCS.
+if [[ -n "${K3_CODE_OVERLAY:-}" ]]; then
+  # shellcheck source=.buildkite/kubernetes/k3_code_overlay.sh
+  # shellcheck disable=SC1091
+  source "${HERE}/k3_code_overlay.sh"
+  apply_code_overlay engine || exit 2
+fi
+
 # shellcheck source=.buildkite/kubernetes/multihost_lib.sh
 # shellcheck disable=SC1091
 source "${HERE}/multihost_lib.sh"

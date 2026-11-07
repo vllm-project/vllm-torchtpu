@@ -1,0 +1,48 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# BASE_IMAGE plus vLLM's Rust frontend (vllm-rs) built from VLLM_REF, for an
+# engine image that has none (build_k3_engine_image.sh, K3_ENGINE_VLLM_RS).
+# The build stage is the one the Kimi-K3 megakernel engine images used.
+ARG BASE_IMAGE
+FROM python:3.12-slim-bookworm AS rust-build
+
+# perl (not slim's perl-base) for the vendored OpenSSL build.
+RUN apt-get update && apt-get install -y curl git build-essential perl && rm -rf /var/lib/apt/lists/*
+
+ENV RUSTUP_HOME=/opt/rustup CARGO_HOME=/opt/cargo PATH=/opt/cargo/bin:$PATH
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --no-modify-path --profile minimal --default-toolchain none
+
+ARG VLLM_REF
+WORKDIR /build/vllm
+RUN test -n "${VLLM_REF}" || { echo "VLLM_REF is required" >&2; exit 1; } && \
+    git clone --quiet --filter=blob:none --no-checkout https://github.com/vllm-project/vllm.git . && \
+    git sparse-checkout set rust && \
+    git checkout --quiet "${VLLM_REF}" && \
+    rustup toolchain install --profile minimal "$(sed -n 's/^channel *= *"\(.*\)"/\1/p' rust-toolchain.toml)"
+
+# The soft open-file limit of a BuildKit RUN step (1024) is too low for one
+# rustc per core.
+RUN --mount=type=cache,target=/opt/cargo/registry \
+    --mount=type=cache,target=/opt/cargo/git \
+    ulimit -n "$(ulimit -Hn)" && \
+    version="$(git describe --tags --exact-match 2>/dev/null || git rev-parse --short HEAD)" && \
+    VLLM_RS_BUILD_VERSION="${version#v}" CARGO_TARGET_DIR=/build/target \
+    cargo build --release --locked --manifest-path rust/src/cmd/Cargo.toml --bin vllm-rs --features native-tls-vendored && \
+    install -m 0755 /build/target/release/vllm-rs /usr/local/bin/vllm-rs && \
+    vllm-rs --version
+
+FROM ${BASE_IMAGE}
+COPY --from=rust-build /usr/local/bin/vllm-rs /usr/local/bin/vllm-rs
+ENV VLLM_RUST_FRONTEND_PATH=/usr/local/bin/vllm-rs
