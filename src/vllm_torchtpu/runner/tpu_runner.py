@@ -472,7 +472,6 @@ def _spec_logprob_row_tokens(
     return out[:num_rows, None]
 
 
-@torch.compile(backend="tpu", fullgraph=True, dynamic=False)
 def mtp_prefill_warmup_block_ids(
     kv_cache_groups, vllm_config, max_pos: int, max_model_len: int, top: int
 ) -> tuple[list[list[int]], int]:
@@ -498,6 +497,7 @@ def mtp_prefill_warmup_block_ids(
     return ids, most
 
 
+@torch.compile(backend="tpu", fullgraph=True, dynamic=False)
 def _substitute_placeholder_token(
     input_ids: torch.Tensor,
     token_in_tpu_cur_input_indices: torch.Tensor,

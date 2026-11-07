@@ -599,6 +599,16 @@ def test_mtp_prefill_warmup_block_ids_fit_every_producer_group(monkeypatch):
     assert old_overruns  # the old count does overrun a Qwen4Exp producer row (the smoke's failure mode)
 
 
+def test_the_warmup_helper_is_plain_python_and_the_placeholder_substitution_stays_compiled():
+    """f20d0ee5f inserted the warmup helper between `@torch.compile(backend="tpu", ...)` and
+    `_substitute_placeholder_token`, so the helper was compiled (dmk20 CPU job j-ce237c1f: "Dynamo
+    recompile limit exceeded") and the async scheduler's placeholder substitution ran eager."""
+    from vllm_torchtpu.runner import tpu_runner
+
+    assert hasattr(tpu_runner._substitute_placeholder_token, "_torchdynamo_orig_callable")
+    assert not hasattr(tpu_runner.mtp_prefill_warmup_block_ids, "_torchdynamo_orig_callable")
+
+
 def test_producer_refuses_a_draft_that_changes_the_grouping(monkeypatch):
     """check_producer_draft_grouping (pooled_cache, the producer): draft specs that merge into the
     target's buckets (here: the draft built as ordinary cacheable QSA specs) are refused with the
