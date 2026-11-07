@@ -742,11 +742,17 @@ class SharedLanding:
 
     def _scatter_fn(self):
         if self._scatter is None:
+            import jax
             from torch_tpu._internal import pallas
 
             fn = make_shared_scatter()
 
-            def scatter_fn(pool, gathered, src, dst):
+            # pallas.jax_op verifies that every argument is annotated (the
+            # repack op below does the same); an unannotated function is
+            # refused at registration (q38-xfer-tputest-s4-i1, j-56405f1a).
+            def scatter_fn(
+                pool: jax.Array, gathered: jax.Array, src: jax.Array, dst: jax.Array
+            ) -> tuple[jax.Array, jax.Array]:
                 return fn(pool, gathered, src, dst), src[0]
 
             op = pallas.jax_op("pallas::qwen4_pd_shared_scatter", scatter_fn, donate_argnums=(0,))

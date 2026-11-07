@@ -465,3 +465,17 @@ def test_admission_snapshot_restores_load_tokens():
     w._staging.tokens[2] = 9000
     w._stage3_admission_restore(saved)
     assert w._staging.tokens == {1: 4096} and set(w._staging.reservations) == {1}
+
+
+def test_shared_scatter_passes_jax_op_registration():
+    """The landing scatter must pass torch_tpu's jax_op registration checks
+    (every argument annotated): q38-xfer-tputest-s4-i1 (j-56405f1a) failed at
+    register_runner's self-test with 'Missing argument type annotation for JAX
+    function: (pool, gathered, src, dst)'. Needs the real torch_tpu (CPU is
+    fine); skipped where only the stub is installed."""
+    pytest.importorskip("torch_tpu._internal.pallas")
+    from vllm_torchtpu.models.vllm.qwen4_exp import pd_staging
+
+    landing = object.__new__(pd_staging.SharedLanding)
+    landing._scatter = None
+    assert callable(landing._scatter_fn())
