@@ -35,6 +35,9 @@ from .states import (
     rec_in,
 )
 
+_CONV_KERNEL = 4
+_CONV_TAPS = _CONV_KERNEL - 1
+
 
 def gdn_in(ctx: Any, gp: GDNParams, o: Any, slot: Any) -> Any:
     """Start layer `o`'s state reads (after the previous writes), project `lin_in`."""
@@ -133,19 +136,24 @@ def conv_step(ctx: Any, gp: GDNParams, o: Any, slot: Any, ybuf: Any) -> Any:
                             )
                         raw_hr = raw_hr[:hr_rows_128, :].reshape(gp.HR, QKV).astype(F32)
                     keep = jnp.logical_and(
-                        has_gpr_input(ctx, gp, o, s_), conv_row_iota < 3
+                        has_gpr_input(ctx, gp, o, s_), conv_row_iota < _CONV_TAPS
                     )
                     convb[s_] = jnp.where(keep, raw_hr, 0.0)
             else:
                 pltpu.make_async_copy(ST["conv"].at[o], convb, sem.at[0]).wait()
         ow, _ = stream.sp.lay["conv"]
-        taps = [scr["sm"][slot, :, ow + t * QKV : ow + (t + 1) * QKV] for t in range(4)]
+        taps = [
+            scr["sm"][slot, :, ow + t * QKV : ow + (t + 1) * QKV]
+            for t in range(_CONV_KERNEL)
+        ]
         u = None
         if VER:
             us = []
             for s in range(NS):
-                convb[s, 3 : 3 + T, :] = ybuf[s * T : (s + 1) * T, 0:QKV]
-                w = [convb[s, k : k + T, :] for k in range(4)]
+                convb[s, _CONV_TAPS : _CONV_TAPS + T, :] = ybuf[
+                    s * T : (s + 1) * T, 0:QKV
+                ]
+                w = [convb[s, k : k + T, :] for k in range(_CONV_KERNEL)]
                 u_ = round_bf16(
                     jax.nn.silu(
                         w[0] * taps[0]
@@ -179,7 +187,7 @@ def conv_step(ctx: Any, gp: GDNParams, o: Any, slot: Any, ybuf: Any) -> Any:
                 O[conv_out_key].at[o],
                 sem.at[2],
             ).start()
-        if GCH:
+        if GCH and u is not None:
             b_pad = round_up(B, 8)
             u_pad = jnp.pad(u, ((0, b_pad - B), (0, 0))) if b_pad > B else u
             ybuf[0:b_pad, 0:QKV] = u_pad

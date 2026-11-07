@@ -79,19 +79,35 @@ def gdn_accept(
     lead = r_ckpt.shape[:-3]
     KD, VD = r_ckpt.shape[-2], r_ckpt.shape[-1]
     r_unflat = r_ckpt.reshape((*lead, NS, T, vh, KD, VD))
-    r_sel = jax.vmap(
-        lambda r_seq, a_s: lax.dynamic_index_in_dim(
-            r_seq, a_s - 1, axis=-4, keepdims=False
-        ),
-        in_axes=(-5, 0),
-        out_axes=-4,
-    )(r_unflat, acc_arr)
+    rec_prev = states.get("rec")
+    if rec_prev is not None:
+        r_prev_unflat = rec_prev.reshape((*lead, NS, vh, KD, VD))
+        r_sel = jax.vmap(
+            lambda r_seq, r_prev_s, a_s: jnp.where(
+                a_s > 0,
+                lax.dynamic_index_in_dim(
+                    r_seq, jnp.maximum(a_s - 1, 0), axis=-4, keepdims=False
+                ),
+                r_prev_s,
+            ),
+            in_axes=(-5, -4, 0),
+            out_axes=-4,
+        )(r_unflat, r_prev_unflat, acc_arr)
+    else:
+        r_sel = jax.vmap(
+            lambda r_seq, a_s: lax.dynamic_index_in_dim(
+                r_seq, jnp.maximum(a_s - 1, 0), axis=-4, keepdims=False
+            ),
+            in_axes=(-5, 0),
+            out_axes=-4,
+        )(r_unflat, acc_arr)
     out["conv"] = conv_next
     out["rec"] = r_sel.reshape((*lead, NS * vh, KD, VD))
     return out
 
 
 def is_seq_active(ctx: Any, gp: GDNParams, s: Any) -> Any:
+    """Return whether sequence `s` is active for in-kernel pool I/O."""
     ex, ST = ctx.ex, ctx.ST
     if cache_exec(ex).act_mode == "all":
         return jnp.bool_(True)
@@ -105,11 +121,13 @@ def is_seq_active(ctx: Any, gp: GDNParams, s: Any) -> Any:
 
 
 def gdn_roff(ctx: Any, gp: GDNParams, sub: Any, s: Any) -> Any:
+    """Return the checkpoint read offset for sub-layer `sub` and sequence `s`."""
     ST = ctx.ST
     return ST["read_offsets"][sub, s] if gp.roff_is_2d else ST["read_offsets"][s]
 
 
 def has_gpr_input(ctx: Any, gp: GDNParams, o: Any, s: Any) -> Any:
+    """Return whether sequence `s` has a valid checkpoint slot on layer `o`."""
     sub = lax.rem(o, gp.G_PER_ATT)
     return jnp.logical_and(
         is_seq_active(ctx, gp, s),
@@ -118,6 +136,7 @@ def has_gpr_input(ctx: Any, gp: GDNParams, o: Any, s: Any) -> Any:
 
 
 def gdn_pb_in(ctx: Any, gp: GDNParams, sub: Any, s: Any) -> Any:
+    """Return the validated pool page base for sequence `s` at sub-layer `sub`."""
     ex, ST = ctx.ex, ctx.ST
     GDN_PAGES = gp.GDN_PAGES
     raw_roff = gdn_roff(ctx, gp, sub, s)
@@ -149,6 +168,7 @@ def gpr_start(
     first: int,
     npages: int,
 ) -> None:
+    """Start async pool-to-VMEM checkpoint gathers for `seqs` into `dsts`."""
     raw_refs = ctx.raw_refs
     sub = lax.rem(o, gp.G_PER_ATT)
     g_pool = lax.div(o, gp.G_PER_ATT)
@@ -173,6 +193,7 @@ def gpr_wait(
     sem: Any,
     npages: int,
 ) -> None:
+    """Wait for sequence `sq`'s in-flight pool-to-VMEM checkpoint gather into `dst`."""
     raw_refs = ctx.raw_refs
 
     @pl.when(has_gpr_input(ctx, gp, o, sq))
@@ -181,6 +202,7 @@ def gpr_wait(
 
 
 def gpr_conv_copy(ctx: Any, gp: GDNParams, r: Any, sq: int, pb: Any, sem: Any) -> Any:
+    """Build the async DMA descriptor(s) copying `sq`'s conv page from pool `r`."""
     if gp.GCONV_ROWS <= 64:
         return pltpu.make_async_copy(
             r.at[pb, 0, pl.ds(0, gp.GCONV_ROWS)], ctx.scr["gpr_conv"].at[sq], sem
@@ -201,6 +223,7 @@ def gpr_conv_copy(ctx: Any, gp: GDNParams, r: Any, sq: int, pb: Any, sem: Any) -
 
 
 def gpr_conv_start(ctx: Any, gp: GDNParams, o: Any) -> None:
+    """Start async conv-state checkpoint gathers for active sequences on layer `o`."""
     raw_refs = ctx.raw_refs
     sub = lax.rem(o, gp.G_PER_ATT)
     g_pool = lax.div(o, gp.G_PER_ATT)
@@ -228,6 +251,7 @@ def gpr_conv_start(ctx: Any, gp: GDNParams, o: Any) -> None:
 
 
 def conv_out_src(ctx: Any, gp: GDNParams) -> Any:
+    """Return the VMEM source buffer (`convb16` or `convb`) for conv write-back."""
     return ctx.scr["convb16"] if (gp.GPR and not gp.conv_is_f32) else ctx.scr["convb"]
 
 
