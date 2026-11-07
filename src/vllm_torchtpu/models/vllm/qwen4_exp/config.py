@@ -79,17 +79,18 @@ def non_prefix_cacheable(spec):
     so the hybrid hit Hp comes from the target groups only and the draft
     gets fresh blocks; ``core/divergent_hybrid_hits._token_groups``).
 
-    PENDING the CPU probe (scratch/dmk/vm/q38_f2_vllm_probe.py): vLLM is not
-    installed on the Mac, and how the pinned fork defines
-    ``prefix_cacheable`` is unknown. Best guess, in order: a dataclass field
-    (replaced), else a read-only property (a subclass reporting False,
-    registered at import, ``_NON_PREFIX_CACHEABLE``). A spec that already
-    reports False (the raw ring) comes back as it is. Whether vLLM's group
-    merge keeps the result is checked where the groups are built
-    (pd_staging.draft_group_problems).
+    The pinned vLLM defines ``prefix_cacheable`` as a property (KVCacheSpec:
+    True; CircularBufferSpec: False; probe in CPU job j-ea7903ad), so the
+    result is a subclass reporting False, registered at import
+    (``_NON_PREFIX_CACHEABLE``). It is a distinct type even for a spec that
+    already reports False (the raw ring): the draft's specs must never join
+    the target's same-type buckets, or the TPU group-size rule (the GCD of
+    the multi-layer buckets, kv_group_size) sees 13-layer buckets against
+    36 GDN layers and falls to one layer per group. On a pipeline every stage
+    then backs every group's block IDs (one shared slot): F2 smoke attempt 2
+    (j-8622bde7) needed a 136.7 GB pool on a stage with 77.4 GB. The producer
+    refuses such a plan (check_producer_draft_grouping).
     """
-    if not getattr(spec, "prefix_cacheable", True):
-        return spec
     import dataclasses
 
     if "prefix_cacheable" in getattr(spec, "__dataclass_fields__", {}):
@@ -131,9 +132,9 @@ def _non_prefix_cacheable_type(cls: type) -> type:
 def _register_non_prefix_cacheable_types() -> None:
     import inspect
 
-    from vllm.v1.kv_cache_interface import FullAttentionSpec, MLAAttentionSpec
+    from vllm.v1.kv_cache_interface import CircularBufferSpec, FullAttentionSpec, MLAAttentionSpec
 
-    for cls in (FullAttentionSpec, MLAAttentionSpec):
+    for cls in (FullAttentionSpec, MLAAttentionSpec, CircularBufferSpec):
         # Not a field: a property or a class attribute (the subclass path).
         if "prefix_cacheable" not in getattr(cls, "__dataclass_fields__", {}) and (
             inspect.getattr_static(cls, "prefix_cacheable", None) is not None
@@ -285,6 +286,39 @@ def native_cache_specs(
     for prefix in mtp_layer_prefixes(cfg):
         add_qsa(prefix, cacheable=draft_prefix_cacheable)
     return specs
+
+
+def check_producer_draft_grouping(cfg, model_specs, model_groups) -> None:
+    """q38 F2: the producer's MTP draft must not change the target's KV-cache grouping.
+
+    The draft's owners sit in groups of their own (draft names only), and the
+    target's groups keep the size they have without the draft. Otherwise the
+    unified pool of a pipeline stage grows several-fold (one layer per group:
+    every stage backs every group's block IDs; F2 smoke attempt 2, j-8622bde7,
+    136.7 GB needed on a 77.4 GB stage). Raises with the numbers."""
+    from vllm.v1.core.kv_cache_utils import get_kv_cache_groups
+
+    mixed = [
+        list(g.layer_names)
+        for g in model_groups
+        if any(n.startswith("mtp.") for n in g.layer_names)
+        and not all(n.startswith("mtp.") for n in g.layer_names)
+    ]
+    target_specs = {n: s for n, s in model_specs.items() if not n.startswith("mtp.")}
+    without = get_kv_cache_groups(cfg, dict(target_specs))
+    size_without = max(len(g.layer_names) for g in without)
+    size_with = max(
+        len(g.layer_names)
+        for g in model_groups
+        if not any(n.startswith("mtp.") for n in g.layer_names)
+    )
+    if mixed or size_with != size_without:
+        raise ValueError(
+            "q38 F2: the producer's MTP draft changed the KV-cache grouping "
+            f"(target group size {size_without} -> {size_with}; groups mixing draft and "
+            f"target owners: {mixed[:2]}); the unified pool would grow several-fold. "
+            "The draft's specs must be distinct types (config.non_prefix_cacheable)"
+        )
 
 
 def ensure_kv_group_size_rule() -> None:

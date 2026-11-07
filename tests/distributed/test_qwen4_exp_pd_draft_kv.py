@@ -92,6 +92,21 @@ def producer_config(k=1, tp=1, pp=8, prefix_caching=False, role="kv_producer"):
     return cfg
 
 
+def real_cache_config(cfg):
+    """Give a test config a real vLLM CacheConfig: get_kv_cache_groups reads
+    get_resolved_kv_cache_layout (as the decode harness's pool_config does)."""
+    from vllm.config import CacheConfig
+
+    old = cfg.cache_config
+    real = CacheConfig(
+        block_size=128, cache_dtype="fp8", enable_prefix_caching=old.enable_prefix_caching,
+        mamba_cache_mode=old.mamba_cache_mode, mamba_ssm_cache_dtype="float32",
+    )
+    real.kv_cache_layout = "BLHNC"
+    cfg.cache_config = real
+    return cfg
+
+
 def connector_config(k=1, tp=1, pp=8, producer=True, method="mtp"):
     """The connector's view: the TPU connector tests' engine config with an MTP
     speculative config (by default the PP8 x TP1 producer)."""
@@ -445,18 +460,8 @@ def test_producer_draft_specs_are_non_prefix_cacheable_on_both_legs(monkeypatch)
     ensure_kv_group_size_rule()
     producer = producer_config()
     decode = producer_config(k=3, tp=8, pp=1, role="kv_consumer")
-    # vLLM's get_kv_cache_groups reads a real CacheConfig (get_resolved_kv_cache_layout):
-    # replace the offload helper's namespace with one, as the decode harness's pool_config does.
-    from vllm.config import CacheConfig
-
     for cfg in (producer, decode):
-        old = cfg.cache_config
-        real = CacheConfig(
-            block_size=128, cache_dtype="fp8", enable_prefix_caching=old.enable_prefix_caching,
-            mamba_cache_mode=old.mamba_cache_mode, mamba_ssm_cache_dtype="float32",
-        )
-        real.kv_cache_layout = "BLHNC"
-        cfg.cache_config = real
+        real_cache_config(cfg)
     assert pd_prefill_mtp_producer(producer) and not pd_prefill_mtp_producer(decode)
     _, own = pooled_cache_specs(producer)
     layout_cfg, tp, dcp, pack, cacheable = pd_staging.producer_geometry(decode)
@@ -490,3 +495,65 @@ def test_the_mtp_draft_satisfies_supports_pp():
     assert supports_pp(Qwen4ExpMTP)
     with pytest.raises(NotImplementedError, match="runs whole on the last pipeline stage"):
         Qwen4ExpMTP.make_empty_intermediate_tensors(object(), 1, None, None)
+
+
+def _target_group_size(groups) -> int:
+    return max(len(g.layer_names) for g in groups if not any(n.startswith("mtp.") for n in g.layer_names))
+
+
+def test_producer_draft_keeps_the_target_grouping_and_pool_size(monkeypatch):
+    """F2 smoke attempt 2 (j-8622bde7): the producer's draft ring (a CircularBufferSpec like the
+    target's) joined the target ring bucket, 13 layers against 36 GDN, so the TPU group-size rule
+    (the GCD of multi-layer buckets) fell to one layer per group and a PP8 stage's unified pool
+    needed 136.7 GB of 77.4 GB. With the draft on, the target keeps its group size and the minimal
+    static pool grows only by the draft's own groups."""
+    from vllm.v1.core.kv_cache_utils import get_kv_cache_groups
+
+    from vllm_torchtpu.models.vllm.qwen4_exp import config as qconfig
+    from vllm_torchtpu.models.vllm.qwen4_exp.pool_layout import pooled_cache_specs
+
+    monkeypatch.setenv("QWEN4_EXP_PD_DRAFT_KV", "1")
+    monkeypatch.delenv("QWEN4_EXP_STATIC_POOL_FILL", raising=False)
+    monkeypatch.setenv("QWEN4_EXP_MAX_POOL_BYTES", str(1 << 50))  # uncapped: the minimal plan
+    qconfig.ensure_kv_group_size_rule()
+    producer = real_cache_config(producer_config())
+    _, on = pooled_cache_specs(producer)
+    off = {n: s for n, s in on.items() if not n.startswith("mtp.")}
+    assert any(n.startswith("mtp.") for n in on)
+    g_on = get_kv_cache_groups(producer, dict(on))
+    g_off = get_kv_cache_groups(producer, dict(off))
+    assert _target_group_size(g_on) == _target_group_size(g_off) > 1
+    qconfig.check_producer_draft_grouping(producer, on, g_on)  # no raise
+    draft_groups = [g for g in g_on if all(n.startswith("mtp.") for n in g.layer_names)]
+    assert len(draft_groups) == 3  # main KV, compressed keys, raw ring: groups of their own
+    pages_on = qconfig.native_cache_capacity(producer, on)
+    pages_off = qconfig.native_cache_capacity(producer, off)
+    bpb_on = qconfig._stage_bytes_per_block(producer, g_on, on)
+    bpb_off = qconfig._stage_bytes_per_block(producer, g_off, off)
+    max_len = producer.model_config.max_model_len
+    draft_blocks = sum(g.kv_cache_spec.max_num_blocks_per_req(producer, max_len) for g in draft_groups)
+    page = max(g.kv_cache_spec.page_size_bytes for g in draft_groups)
+    print(f"producer minimal static pool: off {pages_off} pages x {bpb_off} B = {pages_off * bpb_off} B; "
+          f"on {pages_on} pages x {bpb_on} B = {pages_on * bpb_on} B (draft blocks/request {draft_blocks})")
+    # The draft adds exactly its own groups' blocks per request; the busiest stage's bytes per
+    # block grow by at most one page (a slot the draft's groups add on the last stage).
+    assert pages_on - pages_off == producer.scheduler_config.max_num_seqs * draft_blocks
+    assert bpb_off <= bpb_on <= bpb_off + page
+
+
+def test_producer_refuses_a_draft_that_changes_the_grouping(monkeypatch):
+    """check_producer_draft_grouping (pooled_cache, the producer): draft specs that merge into the
+    target's buckets (here: the draft built as ordinary cacheable QSA specs) are refused with the
+    numbers, not left to fail later as an over-sized pool."""
+    from vllm.v1.core.kv_cache_utils import get_kv_cache_groups
+
+    from vllm_torchtpu.models.vllm.qwen4_exp import config as qconfig
+    from vllm_torchtpu.models.vllm.qwen4_exp.pool_layout import pooled_cache_specs
+
+    monkeypatch.setenv("QWEN4_EXP_PD_DRAFT_KV", "1")
+    qconfig.ensure_kv_group_size_rule()
+    producer = real_cache_config(producer_config())
+    _, merged = pooled_cache_specs(producer, draft_prefix_cacheable=True)
+    groups = get_kv_cache_groups(producer, dict(merged))
+    with pytest.raises(ValueError, match="changed the KV-cache grouping"):
+        qconfig.check_producer_draft_grouping(producer, merged, groups)

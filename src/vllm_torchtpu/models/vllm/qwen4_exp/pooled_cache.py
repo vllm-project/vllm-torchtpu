@@ -25,6 +25,7 @@ from vllm_torchtpu.utils import compute_hbm_budget, synchronize_tensors
 
 from .cache import TEMP_HEADROOM, logger
 from .config import (
+    check_producer_draft_grouping,
     hbm_pool_sizing,
     mtp_layer_prefixes,
     native_cache_capacity,
@@ -32,6 +33,7 @@ from .config import (
     pool_graph_copies,
     pool_headroom_bytes,
     pooled_pool_blocks,
+    pd_prefill_mtp_producer,
 )
 from .pd import TransferGroup, build_transfer_groups
 from .pool_layout import check_packed_compressed_groups, pooled_cache_specs
@@ -77,6 +79,8 @@ class Qwen4ExpPooledCache:
             }
             model_groups = get_kv_cache_groups(cfg, dict(model_specs))
             check_packed_compressed_groups(self.layout, model_groups)
+            if pd_prefill_mtp_producer(cfg):
+                check_producer_draft_grouping(cfg, model_specs, model_groups)
             self.groups = _project_kv_cache_groups_to_worker(model_groups, self.specs)
         self.block_bytes = _get_kv_cache_bytes_per_block(self.groups)
         self.hbm_sizing = hbm_pool_sizing(cfg)
