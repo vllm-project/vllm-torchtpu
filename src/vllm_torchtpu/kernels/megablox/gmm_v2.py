@@ -147,6 +147,11 @@ def get_packing_factor(storage_dtype: jnp.dtype, quant_dtype: jnp.dtype | None) 
     return packing_factor
 
 
+# Largest lhs bucket fed to the MXU as fp8 (see fp8_rhs_feed_dtype). Its
+# matmuls per 128-deep quant block re-stream the lhs rows, which binds from
+# 64 rows on (a tie with bf16 there). Crossover measured on tpu7x MXU timings.
+FP8_RHS_MAX_BUCKET_M = 48
+
 # Define data classes.
 
 
@@ -272,6 +277,31 @@ class InputConfigs:
         return self.quant_dtype != self.dtype
 
 
+def fp8_rhs_feed_dtype(
+    lhs_cfgs: InputConfigs, rhs_cfgs: InputConfigs
+) -> jnp.dtype | None:
+    """fp8 dtype that holds fp4 rhs exactly and multiplies bf16 lhs natively.
+
+    Feeding it to the MXU (scale applied after the matmul) halves the weight
+    pushes of the bf16 dequantize-before-matmul path, which bind at skinny m.
+    """
+    fp8 = jnp.float8_e4m3fn.dtype
+    rhs_q = rhs_cfgs.quant_dtype
+    tpu_info = pltpu.get_tpu_info()
+    if (
+        rhs_cfgs.should_dequantize_before_matmul
+        # Lane-aligned blocks only: narrower ones would mean tiny-K matmuls.
+        and rhs_cfgs.quant_block_size % tpu_info.num_lanes == 0
+        and not lhs_cfgs.should_quantize
+        and rhs_q is not None
+        and jnp.issubdtype(rhs_q, jnp.floating)
+        and jax.dtypes.itemsize_bits(rhs_q) == 4
+        and tpu_info.is_matmul_supported(lhs_cfgs.dtype, fp8)
+    ):
+        return fp8
+    return None
+
+
 @dataclasses.dataclass(frozen=True)
 class GmmConfigs:
     tiles: TileSizes
@@ -286,6 +316,12 @@ class GmmConfigs:
     @property
     def num_quant_blocks_per_tile_k(self) -> int:
         return pl.cdiv(self.tiles.tile_k, self.rhs_cfgs.quant_block_size)
+
+    def fp8_rhs_dtype(self, bucket_m: int) -> jnp.dtype | None:
+        """fp8 dtype to feed the MXU this bucket's rhs in, or None for bf16."""
+        if bucket_m > FP8_RHS_MAX_BUCKET_M:
+            return None
+        return fp8_rhs_feed_dtype(self.lhs_cfgs, self.rhs_cfgs)
 
     @property
     def out_size_n(self) -> int:
@@ -449,7 +485,13 @@ def inner_kernel(
         # contracting dimmensions
         rhs_tile_n = tiled_rhs.shape[1]
         rhs_qbs = cfgs.rhs_cfgs.quant_block_size
-        if cfgs.rhs_cfgs.should_dequantize_before_matmul:
+        dequant_after = cfgs.rhs_cfgs.should_dequantize_after_matmul
+        fp8_rhs = cfgs.fp8_rhs_dtype(bucket_m)
+        if fp8_rhs is not None:
+            # Skinny m: the MXU weight push binds, and fp8 halves it.
+            tiled_rhs = tiled_rhs.astype(fp8_rhs)
+            dequant_after = True
+        elif cfgs.rhs_cfgs.should_dequantize_before_matmul:
             tiled_rhs_scale = tiled_rhs_ref.get_scale(replicate_size=rhs_qbs).astype(
                 cfgs.lhs_cfgs.dtype
             )
@@ -484,7 +526,7 @@ def inner_kernel(
                         preferred_element_type=jnp.float32,
                     ).astype(acc_ref.dtype)
 
-                    if cfgs.rhs_cfgs.should_dequantize_after_matmul:
+                    if dequant_after:
                         b_id = start_k // rhs_qbs
                         rhs_scale_replicated = tiled_rhs_ref.get_scale(
                             replicate_size=bucket_m
@@ -649,7 +691,8 @@ def inner_kernel(
     branches = []
     for bucket_idx in range(cfgs.tiles.tile_m // cfgs.tiles.bucket_base):
         branches.append(functools.partial(run_matmul_step, bucket_idx=bucket_idx))
-    bucket_idx = m_end_local // cfgs.tiles.bucket_base
+    # Smallest bucket covering rows [0, m_end_local); m_end_local >= 1.
+    bucket_idx = (m_end_local - 1) // cfgs.tiles.bucket_base
     lax.switch(bucket_idx, branches)
 
 
@@ -1049,6 +1092,19 @@ def calculate_tiling(
         if _gmm_vmem_estimate(new_tile_m, tile_n, tile_k) > vmem_limit_bytes:
             break
         tile_m = new_tile_m
+
+    # A single bucket makes every decode group pay for tile_m rows. Where rows
+    # cost MXU time (the fp8 rhs feed), bucket by the lhs sublane tile instead.
+    sublane = _get_lhs_sublane_size(lhs_dtype, dims.size_m)
+    fine_base = max(sublane, tile_m // max_num_buckets)
+    # Partial buckets assume a single k tile (run_matmul_step).
+    if (
+        bucket_base == tile_m
+        and num_k_tiles == 1
+        and tile_m % fine_base == 0
+        and fp8_rhs_feed_dtype(lhs_cfgs, rhs_cfgs) is not None
+    ):
+        bucket_base = fine_base
 
     return TileSizes(
         tile_m=tile_m, tile_k=tile_k, tile_n=tile_n, bucket_base=bucket_base

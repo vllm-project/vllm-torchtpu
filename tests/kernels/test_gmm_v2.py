@@ -462,3 +462,54 @@ def test_gmm_v2_int4_packed_matches_reference():
 
     assert actual.shape == (batch_size, out_size)
     _assert_allclose(actual, expected, atol=3e-1, rtol=3e-1)
+
+
+@pytest.mark.tpu_test
+@pytest.mark.parametrize(
+    "batch_size, group_sizes, block_size",
+    [
+        # Decode: few rows per expert (fp8 rhs feed, 16-row buckets).
+        (32, [0, 2, 0, 1, 0, 0, 3, 0, 0, 0, 2, 0, 0, 1, 0, 0], 128),
+        # Groups past 48 rows of a tile take the bf16 dequantize-before-matmul bucket.
+        (96, [2, 0, 17, 0, 1, 0, 0, 30, 0, 0, 0, 40, 0, 0, 0, 2], 128),
+        # tile_m 40 is not a multiple of 16: one bucket.
+        (40, [0, 2, 0, 1, 0, 0, 3, 0, 0, 0, 2, 0, 0, 1, 0, 25], 128),
+        # Sub-lane blocks keep the bf16 dequantize-before-matmul path.
+        (32, [0, 2, 0, 1, 0, 0, 3, 0, 0, 0, 2, 0, 0, 1, 0, 0], 32),
+    ],
+)
+def test_gmm_fp4_block_matches_reference(batch_size, group_sizes, block_size):
+    _require_tpu()
+
+    in_size = 1024
+    out_size = 512
+    num_groups = 16
+    key = jax.random.key(0)
+    lhs_key, rhs_key, sign_key, scale_key = jax.random.split(key, 4)
+
+    lhs = jax.random.normal(lhs_key, (batch_size, in_size), jnp.bfloat16)
+    fp4_values = jnp.asarray([0, 0.5, 1, 1.5, 2, 3, 4, 6], jnp.float32)
+    rhs = fp4_values[
+        jax.random.randint(rhs_key, (num_groups, in_size, out_size), 0, 8)
+    ] * jnp.where(jax.random.bernoulli(sign_key, 0.5, (1, in_size, out_size)), 1, -1)
+    rhs_fp4 = rhs.astype(jnp.float4_e2m1fn)
+    rhs_scale = jax.random.uniform(
+        scale_key, (num_groups, in_size // block_size, 1, out_size), jnp.float32, 0.5, 2
+    )
+    group_sizes = jnp.asarray(group_sizes, dtype=jnp.int32)
+    num_rows = int(group_sizes.sum())
+
+    expected = reference_gmm(lhs, rhs_fp4, group_sizes, rhs_scale=rhs_scale)
+    actual = gmm_v2(
+        lhs,
+        rhs_fp4,
+        group_sizes,
+        rhs_scale=rhs_scale,
+        maybe_quantize_lhs=False,
+    )
+
+    np.testing.assert_allclose(
+        np.asarray(actual[:num_rows].astype(jnp.float32)),
+        np.asarray(expected[:num_rows].astype(jnp.float32)),
+        atol=2e-2 * float(jnp.abs(expected).max()),
+    )
