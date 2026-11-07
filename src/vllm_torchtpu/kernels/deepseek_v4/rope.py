@@ -27,7 +27,7 @@ from vllm_torchtpu.utils import largest_divisor
 # Native lane count; the roped channels are the tail of the last lane block.
 LANE = 128
 
-DEFAULT_VMEM_LIMIT_BYTES = 100 * 1024 * 1024
+DEFAULT_VMEM_LIMIT_BYTES = 60 * 1024 * 1024
 
 
 @jax.tree_util.register_dataclass
