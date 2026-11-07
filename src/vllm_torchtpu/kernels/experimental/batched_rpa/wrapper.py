@@ -385,11 +385,7 @@ def calculate_block_sizes(
             # TODO(kyuyeunk): Reduce granularity to lane size.
             bkv_default = utils.align_to(bkv_default, serve_cfgs.page_size)
         bkv_sz = bkv_stride = bkv_default
-        if fixed_bq_sz is None:
-            bq_sz = bq_stride = bkv_sz
-        else:
-            bq_sz = fixed_bq_sz
-            bq_stride = 0
+        bq_sz = bkv_sz if fixed_bq_sz is None else fixed_bq_sz
         batch_size = max_batch_size
 
         # Step 1: Lower batch_size if even the smallest bq and bkv size can trigger
@@ -412,30 +408,62 @@ def calculate_block_sizes(
 
         # Step 2: Increase block sizes until the kernel is unable to fit into VMEM.
         max_seq_len = serve_cfgs.pages_per_seq * serve_cfgs.page_size
-        while (
-            calculate_vmem_usage(batch_size, bq_sz, bkv_sz) < capped_vmem_limit_bytes
-            and bkv_sz <= max_seq_len
-            and bkv_sz <= 4096  # TEMP PATCH
-        ):
-            # Unless bq is a fixed value, we want to ensure bq size is the same as bkv
-            # size. When using causal masking, if bq size is larger than bkv size,
-            # entire kv tile can be masked out for some query tokens. Similarly, if
-            # bkv size is larger than bq size, entire query tile can be masked out for
-            # some kv tokens.
-            bkv_sz += bkv_stride
-            bq_sz += bq_stride
+        if fixed_bq_sz is None:
+            # Step prefill bq_sz and bkv_sz by powers of 2 so tiles always evenly
+            # divide power-of-2 serving token budgets and chunk sizes (512, 1024,
+            # 2048, 4096, 8192) without partial-tile tail padding.
+            if (
+                calculate_vmem_usage(batch_size, bq_sz, bkv_sz)
+                < capped_vmem_limit_bytes
+            ):
+                while (
+                    bkv_sz * 2 <= max_seq_len
+                    and bkv_sz * 2 <= 4096  # TEMP PATCH
+                    and calculate_vmem_usage(batch_size, bq_sz * 2, bkv_sz * 2)
+                    < capped_vmem_limit_bytes
+                ):
+                    bkv_sz *= 2
+                    bq_sz *= 2
 
-        # Rollback one step since the last attempted value triggered OOM.
-        if bkv_sz > bkv_stride:
-            bkv_sz -= bkv_stride
-            if fixed_bq_sz is None:
-                bq_sz -= bq_stride
+                # At high query-head counts (e.g., 32q/2kv or 24q/4kv under PP/DP
+                # with TP=1) where Q/O buffers cap lockstep growth at bkv_default,
+                # or at low KV-head counts where the KV tile holds < 1024 KV
+                # vectors, double bkv_sz once to 2 * bq_sz if VMEM permits.
+                # Capping bkv_sz <= 2 * bq_sz bounds causal-diagonal masked work
+                # while halving KV loop iterations and Q re-reads.
+                if (
+                    (bq_sz == bkv_default or bkv_sz * model_cfgs.num_kv_heads < 1024)
+                    and bkv_sz * 2 <= max_seq_len
+                    and bkv_sz * 2 <= 4096
+                    and calculate_vmem_usage(batch_size, bq_sz, bkv_sz * 2)
+                    < capped_vmem_limit_bytes
+                ):
+                    bkv_sz *= 2
+        else:
+            while (
+                calculate_vmem_usage(batch_size, bq_sz, bkv_sz)
+                < capped_vmem_limit_bytes
+                and bkv_sz <= max_seq_len
+                and bkv_sz <= 4096  # TEMP PATCH
+            ):
+                bkv_sz += bkv_stride
+
+            # Rollback one step since the last attempted value triggered OOM.
+            if bkv_sz > bkv_stride:
+                bkv_sz -= bkv_stride
 
         # Indicates OOM was triggered from the starting bkv size.
         if bkv_sz == 0:
             raise ValueError("Cannot find block sizes that fit within VMEM limit.")
 
         # Step 3: Given current tile size, calculate compute tile size.
+        if fixed_bq_sz is not None:
+            return configs.BlockSizes(
+                bq_sz=bq_sz,
+                bq_c_sz=bq_sz,
+                bkv_sz=bkv_sz,
+                batch_size=batch_size,
+            )
 
         # Threshold value based on hardware generation and precision.
         tpu_info = pltpu.get_tpu_info()
@@ -453,6 +481,7 @@ def calculate_block_sizes(
         if is_8bit:
             flops_ratio = tpu_info.fp8_ops_per_second // tpu_info.bf16_ops_per_second
             threshold *= flops_ratio
+
         num_bq_c = 1
         last_valid_bq_c_sz = bq_c_sz = bq_sz
         bq_c_rem = 0
@@ -460,8 +489,9 @@ def calculate_block_sizes(
         while (
             calculate_compute_buffer_time(batch_size, bq_c_sz, bkv_sz) > threshold
             or bq_c_rem != 0
+            or ((bq_c_sz & (bq_c_sz - 1)) != 0 and bq_c_sz != bq_sz)
         ) and num_bq_c < bq_sz:
-            if bq_c_rem == 0:
+            if bq_c_rem == 0 and ((bq_c_sz & (bq_c_sz - 1)) == 0 or bq_c_sz == bq_sz):
                 last_valid_bq_c_sz = bq_c_sz
             num_bq_c += 1
             bq_c_sz, bq_c_rem = divmod(bq_sz, num_bq_c)
@@ -475,7 +505,11 @@ def calculate_block_sizes(
 
     # Fixed value based on experimental results.
     decode_batch_size = 8
-    prefill_batch_size = 2
+    # One cell for prefill, not two. The kernel walks cells serially inside the
+    # body, so a second cell adds no parallel compute -- only DMA overlap, which
+    # prefill is not waiting on. What it does cost is half the VMEM per cell,
+    # and that VMEM buys more as tile.
+    prefill_batch_size = 1
 
     decode_block_sizes = find_best_block_sizes(decode_batch_size, decode_query_size)
     prefill_block_sizes = find_best_block_sizes(prefill_batch_size)
