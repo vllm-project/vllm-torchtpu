@@ -227,3 +227,67 @@ def test_workbench_vmem_slider_bounded_by_chip_usable_ceiling(
     )
     assert vmem_tag in html_text
     assert 'max="96"' not in html_text
+
+
+def test_workbench_phase_map_and_calibration_dropzone_markup() -> None:
+    """Verify 2D phase map tab, local FileReader dropzone, and bucket copy UI."""
+    sweep_report = advisor.advise_regimes("qwen3.5-397b", "tpu7x")
+    html_text = advisor.render_advisor_html(sweep_report)
+    for required_snippet in (
+        'id="btn-stage-phase"',
+        'id="wb-stage-phase"',
+        'id="wb-phase-map-svg"',
+        'id="wb-cal-dropzone"',
+        'id="cal-file-input"',
+        'id="wb-bucket-schedule-pre"',
+        "wbFocusedTopicCard",
+        "Selected VMEM:",
+        "Waterfall:",
+        "Copied!",
+        "new FileReader()",
+        "new DecompressionStream('gzip')",
+        "traceEventsToMeas",
+        "minHop.toFixed(3)",
+        "advisor.measurements.v1",
+        "advisor.bucket_schedule.v1",
+        "advisory_offline_v1",
+    ):
+        assert required_snippet in html_text
+    assert _DENYLIST_RE.search(html_text) is None
+
+
+def test_build_bucket_schedule_and_cli_export(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Verify build_bucket_schedule coalescing and --bucket-schedule CLI export."""
+    sweep_report = advisor.advise_regimes("qwen3.5-397b", "tpu7x")
+    schedule = advisor.build_bucket_schedule(sweep_report)
+    distinct_phases = {reg.phase for reg in sweep_report.regimes}
+    assert schedule.schema == "advisor.bucket_schedule.v1"
+    assert schedule.consumer_status == "advisory_offline_v1"
+    assert schedule.model == "qwen3.5-397b"
+    assert len(distinct_phases) <= len(schedule.buckets) <= len(sweep_report.regimes)
+    for rule in schedule.buckets:
+        assert rule.min_active_tokens <= rule.max_active_tokens
+        assert rule.recommended_scope in {
+            "whole_step",
+            "layer_group",
+            "single_layer",
+            "per_op",
+        }
+
+    out_file = tmp_path / "bucket_schedule.json"
+    exit_code = advisor.main(
+        ["--model", "qwen3.5-397b", "--bucket-schedule", str(out_file)]
+    )
+    assert exit_code == 0
+    assert out_file.is_file()
+    captured = capsys.readouterr()
+    assert captured.out == ""
+
+    exit_stdout = advisor.main(["--model", "qwen3.5-397b", "--bucket-schedule", "-"])
+    assert exit_stdout == 0
+    stdout_json = capsys.readouterr().out
+    assert '"schema": "advisor.bucket_schedule.v1"' in stdout_json
+    assert '"consumer_status": "advisory_offline_v1"' in stdout_json

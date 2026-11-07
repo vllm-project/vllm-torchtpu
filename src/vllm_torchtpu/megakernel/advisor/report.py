@@ -18,7 +18,7 @@ from __future__ import annotations
 import html
 import json
 import math
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -1440,4 +1440,122 @@ def write_advisor_html(sweep: AdvisorSweepReport, path: str | Path) -> Path:
     dest = Path(path)
     dest.parent.mkdir(parents=True, exist_ok=True)
     dest.write_text(render_advisor_html(sweep), encoding="utf-8")
+    return dest
+
+
+BUCKET_SCHEDULE_SCHEMA = "advisor.bucket_schedule.v1"
+BUCKET_CONSUMER_STATUS = "advisory_offline_v1"
+_PHASE_SORT_ORDER: dict[str, int] = {
+    "decode": 0,
+    "verify": 1,
+    "mixed": 2,
+    "prefill": 3,
+}
+
+
+@dataclass(frozen=True)
+class BucketScheduleRule:
+    """Contiguous active-token interval sharing one scope and MoE grouping mode."""
+
+    phase: str
+    layout: str
+    min_active_tokens: int
+    max_active_tokens: int
+    effective_context: int
+    recommended_scope: str
+    recommended_moe_mode: str
+    max_vmem_tokens: int
+    num_vmem_splits: int
+    step_bound_us: float
+    verdict: str
+
+
+@dataclass(frozen=True)
+class BucketSchedulePayload:
+    """Offline advisory token-bucket schedule derived from a regime sweep."""
+
+    schema: str
+    consumer_status: str
+    model: str
+    chip: str
+    default_layout: str
+    vmem_budget_mib: float
+    max_vmem_tokens: int
+    ridge_tokens: int
+    buckets: tuple[BucketScheduleRule, ...]
+
+    def to_dict(self) -> dict[str, object]:
+        """Serialize BucketSchedulePayload to a JSON-compatible dictionary."""
+        return asdict(self)
+
+
+def build_bucket_schedule(sweep: AdvisorSweepReport) -> BucketSchedulePayload:
+    """Coalesce contiguous sweep regimes into an offline bucket-schedule payload."""
+    ordered = sorted(
+        sweep.regimes,
+        key=lambda reg: (
+            _PHASE_SORT_ORDER.get(reg.phase, 99),
+            reg.layout,
+            reg.active_tokens,
+            reg.effective_context,
+        ),
+    )
+    rules: list[BucketScheduleRule] = []
+    for entry in ordered:
+        if (
+            rules
+            and rules[-1].phase == entry.phase
+            and rules[-1].layout == entry.layout
+            and rules[-1].recommended_scope == entry.recommended_scope
+            and rules[-1].recommended_moe_mode == entry.recommended_moe_mode
+        ):
+            prev = rules[-1]
+            rules[-1] = BucketScheduleRule(
+                phase=prev.phase,
+                layout=prev.layout,
+                min_active_tokens=prev.min_active_tokens,
+                max_active_tokens=max(prev.max_active_tokens, entry.active_tokens),
+                effective_context=max(prev.effective_context, entry.effective_context),
+                recommended_scope=prev.recommended_scope,
+                recommended_moe_mode=prev.recommended_moe_mode,
+                max_vmem_tokens=entry.max_vmem_tokens,
+                num_vmem_splits=entry.num_vmem_splits,
+                step_bound_us=entry.step_bound_us,
+                verdict=entry.verdict,
+            )
+        else:
+            rules.append(
+                BucketScheduleRule(
+                    phase=entry.phase,
+                    layout=entry.layout,
+                    min_active_tokens=entry.active_tokens,
+                    max_active_tokens=entry.active_tokens,
+                    effective_context=entry.effective_context,
+                    recommended_scope=entry.recommended_scope,
+                    recommended_moe_mode=entry.recommended_moe_mode,
+                    max_vmem_tokens=entry.max_vmem_tokens,
+                    num_vmem_splits=entry.num_vmem_splits,
+                    step_bound_us=entry.step_bound_us,
+                    verdict=entry.verdict,
+                )
+            )
+    return BucketSchedulePayload(
+        schema=BUCKET_SCHEDULE_SCHEMA,
+        consumer_status=BUCKET_CONSUMER_STATUS,
+        model=sweep.model,
+        chip=sweep.chip,
+        default_layout=sweep.parallelism.label(),
+        vmem_budget_mib=sweep.vmem_budget_mib,
+        max_vmem_tokens=sweep.max_vmem_tokens,
+        ridge_tokens=sweep.ridge_tokens,
+        buckets=tuple(rules),
+    )
+
+
+def write_bucket_schedule(sweep: AdvisorSweepReport, path: str | Path) -> Path:
+    """Write `advisor.bucket_schedule.v1` JSON schedule to disk."""
+    dest = Path(path)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    payload_json = json.dumps(build_bucket_schedule(sweep).to_dict(), indent=2) + "\n"
+    dest.write_text(payload_json, encoding="utf-8")
     return dest

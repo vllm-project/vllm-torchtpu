@@ -52,10 +52,14 @@ from .chips import (
     verify_chip_spec_against_jax,
 )
 from .report import (
+    BucketSchedulePayload,
+    BucketScheduleRule,
+    build_bucket_schedule,
     format_advisor_summary,
     format_regime_table,
     render_advisor_html,
     write_advisor_html,
+    write_bucket_schedule,
 )
 
 if TYPE_CHECKING:
@@ -3002,6 +3006,8 @@ __all__ = [
     "VERIFIED_MEGAKERNEL_MODEL_TYPES",
     "AdvisorReport",
     "AdvisorSweepReport",
+    "BucketSchedulePayload",
+    "BucketScheduleRule",
     "ChipSpec",
     "DeploymentPreset",
     "DisaggHandoffSpec",
@@ -3025,6 +3031,7 @@ __all__ = [
     "advise_from_spec",
     "advise_regimes",
     "build_arg_parser",
+    "build_bucket_schedule",
     "calibrate_trace",
     "compare_parallelism_candidates",
     "compute_all_reduce_transfer_cost",
@@ -3044,4 +3051,5 @@ __all__ = [
     "supports_hf_config",
     "verify_chip_spec_against_jax",
     "write_advisor_html",
+    "write_bucket_schedule",
 ]
