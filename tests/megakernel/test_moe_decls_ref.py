@@ -52,6 +52,7 @@ from vllm_torchtpu.megakernel.modules.moe.params import (
     derive_moe_params,
 )
 from vllm_torchtpu.megakernel.modules.moe.reference import moe_reference
+from vllm_torchtpu.megakernel.modules.transforms import apply_hf_transforms
 from vllm_torchtpu.megakernel.ops import BF16, F32, FP8, round_bf16
 from vllm_torchtpu.megakernel.planner import plan
 from vllm_torchtpu.megakernel.spec import LayerType, ModelSpec
@@ -299,6 +300,143 @@ def test_moe_decls_options_binding_and_hf_params():
     )
     names_bf16 = {d.name for d in decls_bf16}
     assert "e_gate_proj_s" not in names_bf16 and "sh2_s" not in names_bf16
+
+    # End-to-end check on `moe_hf_params` -> `apply_hf_transforms` -> `moe_reference`
+    # against the dense unsharded oracle for `moe_tp` and `fp8`/`bf16`.
+    R_d, B_d, H_d, E_d, TOPK_d, IR_d, ISR_d = 2, 4, 128, 16, 2, 128, 128
+    ER_d = E_d // R_d
+    IS_d = ISR_d * R_d
+    ex_d = ExecSpec(B=B_d, T=1, R=R_d, ctx=128, tiles=TINY_TILES)
+    x_d = jax.random.normal(jax.random.PRNGKey(201), (B_d, H_d), dtype=BF16) * 0.3
+    for moe_tp_case in (True, False):
+        I_d = IR_d * R_d if moe_tp_case else IR_d
+        binding_d = ModuleBinding(
+            module_cls=FakeFFNModule,
+            prefix="mlp",
+            options={"moe_tp": moe_tp_case, "e_slots": 0},
+            rename={"router": "gate_router"},
+        )
+        raw_d = ResolvedModuleGeometry(
+            module_cls=FakeFFNModule,
+            prefix="mlp",
+            values={
+                "hidden": H_d,
+                "experts": E_d,
+                "top_k": TOPK_d,
+                "inter": I_d,
+                "shared_inter": IS_d,
+                "eps": 1e-6,
+            },
+            options=binding_d.options,
+            rename=binding_d.rename,
+        )
+        res_d = resolve_moe_binding(FakeFFNModule, binding_d, raw_d)
+        for w_dtype in ("fp8", "bf16"):
+            is_fp8 = w_dtype == "fp8"
+            decls_case = moe_hf_params(
+                "mlp",
+                res_d,
+                moe_tp=moe_tp_case,
+                weight_dtypes={k: w_dtype for k in MOE_WEIGHT_NAMES},
+            )
+            canon_case: dict[str, jax.Array] = {}
+            for idx_d, d in enumerate(decls_case):
+                key_d = jax.random.PRNGKey(220 + idx_d + 20 * int(moe_tp_case))
+                if d.name.endswith("_s"):
+                    canon_case[d.name] = jax.random.uniform(
+                        key_d, d.shape, dtype=F32, minval=0.05, maxval=0.15
+                    )
+                else:
+                    canon_case[d.name] = (
+                        jax.random.normal(key_d, d.shape, dtype=F32) * 0.25
+                    ).astype(d.dtype)
+            transformed_case = apply_hf_transforms(decls_case, canon_case, R=R_d)
+            ref_d, _ = moe_reference(
+                transformed_case, x_d, state=None, g=res_d, ex=ex_d, layer_idx=0
+            )
+            # Compare against the dense unsharded oracle built from `canon_case`
+            x_f32 = x_d.astype(F32)
+            xb_f32 = x_f32.astype(BF16).astype(F32)
+            probs = jax.nn.softmax(
+                xb_f32 @ canon_case["gate_router"].astype(F32), axis=-1
+            )
+            top_vals, top_idx = lax.top_k(probs, TOPK_d)
+            top_w = top_vals / jnp.sum(top_vals, axis=-1, keepdims=True)
+            sg = jax.nn.sigmoid(
+                jnp.sum(x_f32 * canon_case["sh_gate"][None, :], axis=-1, keepdims=True)
+            )
+            w_sh_g = canon_case["sh_gate_proj"].astype(F32) * (
+                canon_case["sh_gate_proj_s"][None, :] if is_fp8 else 1.0
+            )
+            w_sh_u = canon_case["sh_up_proj"].astype(F32) * (
+                canon_case["sh_up_proj_s"][None, :] if is_fp8 else 1.0
+            )
+            mid_sh_full = (
+                round_bf16(
+                    round_bf16(jax.nn.silu(round_bf16(xb_f32 @ w_sh_g)))
+                    * round_bf16(xb_f32 @ w_sh_u)
+                )
+                .astype(BF16)
+                .astype(F32)
+            )
+            w_sh2_full = canon_case["sh2"].astype(F32) * (
+                canon_case["sh2_s"][None, :] if is_fp8 else 1.0
+            )
+            w_eg_full = canon_case["e_gate_proj"].astype(F32) * (
+                canon_case["e_gate_proj_s"][:, None, :] if is_fp8 else 1.0
+            )
+            w_eu_full = canon_case["e_up_proj"].astype(F32) * (
+                canon_case["e_up_proj_s"][:, None, :] if is_fp8 else 1.0
+            )
+            w_e2_full = canon_case["e2"].astype(F32) * (
+                canon_case["e2_s"][:, None, :] if is_fp8 else 1.0
+            )
+            mid_e_all = (
+                round_bf16(
+                    round_bf16(
+                        jax.nn.silu(
+                            round_bf16(jnp.einsum("bh,ehi->bei", xb_f32, w_eg_full))
+                        )
+                    )
+                    * round_bf16(jnp.einsum("bh,ehi->bei", xb_f32, w_eu_full))
+                )
+                .astype(BF16)
+                .astype(F32)
+            )
+            rank_totals = []
+            for r in range(R_d):
+                c0, c1 = r * ISR_d, (r + 1) * ISR_d
+                ysh_r = (mid_sh_full[:, c0:c1] @ w_sh2_full[c0:c1, :]) * sg
+                if moe_tp_case:
+                    ic0, ic1 = r * IR_d, (r + 1) * IR_d
+                    ye_all_r = round_bf16(
+                        jnp.einsum(
+                            "bei,eih->beh",
+                            mid_e_all[:, :, ic0:ic1],
+                            w_e2_full[:, ic0:ic1, :],
+                        )
+                    )
+                    ye_topk_r = jnp.take_along_axis(
+                        ye_all_r, top_idx[:, :, None], axis=1
+                    )
+                    yexp_r = jnp.sum(top_w[:, :, None] * ye_topk_r, axis=1)
+                else:
+                    ye_all_full = round_bf16(
+                        jnp.einsum("bei,eih->beh", mid_e_all, w_e2_full)
+                    )
+                    ye_topk = jnp.take_along_axis(
+                        ye_all_full, top_idx[:, :, None], axis=1
+                    )
+                    in_rank = (top_idx // ER_d) == r
+                    yexp_r = jnp.sum(
+                        jnp.where(
+                            in_rank[:, :, None], top_w[:, :, None] * ye_topk, 0.0
+                        ),
+                        axis=1,
+                    )
+                rank_totals.append((ysh_r + yexp_r).astype(BF16).astype(F32))
+            expected_d = jnp.sum(jnp.stack(rank_totals, axis=0), axis=0)
+            np.testing.assert_allclose(ref_d, expected_d, rtol=1e-5, atol=1e-5)
 
 
 @pytest.mark.parametrize(
