@@ -102,6 +102,9 @@ if TYPE_CHECKING:
     TPU_ROPE_CACHE_ROW_MAJOR: bool = False
     TPU_LM_HEAD_HIDDEN_MAJOR: bool = False
     TPU_EMBED_EP_SHARD: bool = False
+    TPU_TP4_HIER_ALL_REDUCE: bool = False
+    TPU_TP4_HIER_ALL_REDUCE_BLOCKS: int = 4
+    TPU_TP4_HIER_ALL_REDUCE_MAX_ROWS: int = 256
     TPU_CANDIDATE_SAMPLING: bool = True
     TPU_MOE_HASH_TABLE_ROW_MAJOR: bool = False
     TPU_PARALLEL_PRECOMPILE: bool = False
@@ -764,6 +767,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # table per rank for one DP reduce-scatter per lookup. Bitwise the
     # vocab-parallel lookup; needs the rank-aligned DP x TP layout.
     "TPU_EMBED_EP_SHARD": env_bool("TPU_EMBED_EP_SHARD", default=False),
+    # Row-parallel linears of a TP group of four cores on two chips reduce
+    # through one Pallas kernel (kernels/collectives/tp4_all_reduce.py) that
+    # sums each chip's pair over the die-to-die link first. Fixed summation
+    # order (P0+P1)+(P2+P3), not XLA's ring order, hence opt-in. BLOCKS =
+    # column blocks per quarter; partials above MAX_ROWS rows use XLA.
+    "TPU_TP4_HIER_ALL_REDUCE": env_bool("TPU_TP4_HIER_ALL_REDUCE", default=False),
+    "TPU_TP4_HIER_ALL_REDUCE_BLOCKS": env_int("TPU_TP4_HIER_ALL_REDUCE_BLOCKS", 4),
+    "TPU_TP4_HIER_ALL_REDUCE_MAX_ROWS": env_int(
+        "TPU_TP4_HIER_ALL_REDUCE_MAX_ROWS", 256
+    ),
     # Non-greedy spec-decode verify steps whose requests all keep at most 48
     # tokens (top_k) sample from per-vocab-shard top-k candidates instead of
     # all-gathered logits (layers/core/candidate_sampling.py). Same
