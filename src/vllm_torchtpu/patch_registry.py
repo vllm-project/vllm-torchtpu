@@ -108,6 +108,9 @@ PATCHES = (
         "vllm_torchtpu.core.divergent_hybrid_hits:patch_divergent_hybrid_hits",
         _ENGINE,
     ),
+    # Victim host-tier policy hooks (inert unless the policy is on), after the
+    # LIFO free patch and retention so they wrap the final free paths.
+    Patch("vllm_torchtpu.offload.victim:patch_block_pool_victims", _ENGINE),
     Patch("vllm_torchtpu:_patch_vllm_kimi_kda_layer_counts", _ACTIVE),
     # Process setup and runner selection.
     Patch("vllm_torchtpu:_patch_multiproc_worker_global_rank_env", _ACTIVE),

@@ -87,6 +87,7 @@ from vllm.v1.outputs import KVConnectorOutput
 
 from vllm_torchtpu import envs as tpu_envs
 from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.offload import victim
 from vllm_torchtpu.offload.raiden_store import (
     AdmissionOp,
     RaidenLoadStoreSpec,
@@ -270,6 +271,66 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
         assert isinstance(self.manager, RaidenOffloadingManager)
         self._raiden_manager: RaidenOffloadingManager = self.manager
         self._fence_pending: dict[int, _ParkedStore] = {}
+        if victim.host_tier_policy() == "victim":
+            self._enable_victim_policy(spec, vllm_config)
+
+    # -- victim policy (QWEN4_EXP_HOST_TIER_POLICY=victim; offload/victim.py) --
+
+    def _enable_victim_policy(self, spec, vllm_config) -> None:
+        if int(getattr(spec, "blocks_per_chunk", 1)) != 1:
+            raise ValueError(
+                f"{victim.POLICY_ENV}=victim stores evicted blocks one key per "
+                f"block; blocks_per_chunk={spec.blocks_per_chunk} is not supported"
+            )
+        pp = int(getattr(vllm_config.parallel_config, "pipeline_parallel_size", 1) or 1)
+        # Young-block guard: the scheduler keeps at most PP batches in flight
+        # (plus one under async scheduling), so a block freed this many steps
+        # ago has no write pending on any stage.
+        self._victim_min_age = pp + 2
+        self._victim_groups = {g.group_idx for g in self.config.kv_group_configs}
+        self._victim_tap = victim.VictimTap()
+        victim.patch_block_pool_victims()
+        victim.activate(self._victim_tap)
+        self._raiden_manager.set_victim_mode(True)
+        self._victim = True
+        logger.info(
+            "TPURaidenOffloadingConnector: host-tier policy victim (store on HBM "
+            "eviction, keep on load); groups %s, young-block guard %d steps",
+            sorted(self._victim_groups),
+            self._victim_min_age,
+        )
+
+    def _store_victims(self) -> None:
+        """Store this step's evicted blocks and drain them before the step's
+        metadata ships, so the new owners' forward passes cannot overwrite a
+        block before its bytes reach the host."""
+        tap = self._victim_tap
+        keep, counts = victim.select_victims(
+            tap.take(), tap.step, self._victim_min_age, self._victim_groups
+        )
+        tel = self.telemetry
+        for name, n in counts.items():
+            tel[name] = tel.get(name, 0) + n
+        if keep:
+            manager = self._raiden_manager
+            source = dict(keep)
+            keys = manager.prepare_victim_store([k for k, _ in keep])
+            tel["victim_resident"] = tel.get("victim_resident", 0) + len(keep) - len(keys)
+            if keys:
+                job_id = self._generate_job_id()
+                t0 = time.perf_counter()
+                manager.submit_store_job(job_id, keys, [source[k] for k in keys])
+                done = manager.drain_jobs({job_id})
+                tel["victim_drain_us"] = tel.get("victim_drain_us", 0) + int(
+                    (time.perf_counter() - t0) * 1e6
+                )
+                ok = any(f.job_id == job_id and f.success for f in done)
+                tel["victim_stores" if ok else "victim_store_failed"] = (
+                    tel.get("victim_stores" if ok else "victim_store_failed", 0) + 1
+                )
+                if ok:
+                    tel["victim_store_keys"] = tel.get("victim_store_keys", 0) + len(keys)
+        tap.advance()
 
     # Cumulative host-tier counters, logged every VLLM_TPU_OFFLOAD_TELEMETRY_S
     # seconds (60 by default; <= 0 turns the line off) with the container's
@@ -311,6 +372,10 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
     ) -> KVConnectorMetadata:
         meta = super().build_connector_meta(scheduler_output)
         assert isinstance(meta, OffloadingConnectorMetadata)
+        if self.__dict__.get("_victim", False):
+            # Before anything else ships: this step's allocations may reuse
+            # the victims' blocks.
+            self._store_victims()
 
         manager = self._raiden_manager
 
@@ -422,6 +487,12 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
                     self.telemetry["stores"] += 1
                     self.telemetry["store_keys"] += len(parked.keys)
         super().update_connector_output(connector_output)
+
+    def shutdown(self) -> None:
+        tap = self.__dict__.get("_victim_tap")
+        if tap is not None:
+            victim.deactivate(tap)
+        super().shutdown()
 
 
 class TPURaidenOffloadingConnector(OffloadingConnector):

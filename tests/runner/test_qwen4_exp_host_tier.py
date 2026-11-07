@@ -420,7 +420,7 @@ def _pp8_offloading_config(scheduler_kvc, stages, cpu_bytes):
     )
 
 
-def _pp8_scheduler(monkeypatch, scheduler_kvc, stages, cpu_bytes=64 * GiB):
+def _pp8_scheduler(monkeypatch, scheduler_kvc, stages, cpu_bytes=64 * GiB, store=None):
     from tests.offload.test_raiden_store_offload import FakeKVCacheStore, make_manager
     from vllm_torchtpu.offload import raiden_store
     from vllm_torchtpu.offload.raiden_connector import TPURaidenOffloadingScheduler
@@ -435,7 +435,7 @@ def _pp8_scheduler(monkeypatch, scheduler_kvc, stages, cpu_bytes=64 * GiB):
                         prefix_cache_retention_interval=None),
         parallel_config=NS(world_size=STAGES, decode_context_parallel_size=1,
                            data_parallel_rank=0, data_parallel_rank_local=0,
-                           cp_kv_cache_interleave_size=1),
+                           cp_kv_cache_interleave_size=1, pipeline_parallel_size=STAGES),
         speculative_config=None,
         kv_events_config=None,
     )
@@ -445,7 +445,7 @@ def _pp8_scheduler(monkeypatch, scheduler_kvc, stages, cpu_bytes=64 * GiB):
     assert spec.device_block_size_factor == 1
     # Capacity from the sum over the stages' regions, not one stage x 8.
     assert spec.offload_logical_blocks_capacity == cpu_bytes // per_key
-    store = FakeKVCacheStore()
+    store = FakeKVCacheStore() if store is None else store
     spec._manager = make_manager(
         store, device_block_size_factor=1, num_blocks=spec.offload_logical_blocks_capacity,
         world_size=STAGES, key_namespace=spec.key_namespace,
@@ -591,6 +591,120 @@ def test_pp8_host_hit_restores_every_group_at_the_mamba_boundary(monkeypatch):
     third = _request("r3", first.prompt_token_ids + _tokens(300, 2))
     sched.on_new_request(third)
     assert sched.get_num_new_matched_tokens(third, 0) == (0, False)
+
+
+def _auto_save_store():
+    """FakeKVCacheStore whose saves land at once (a victim store is drained in the same step)."""
+    from tests.offload.test_raiden_store_offload import FakeKVCacheStore
+
+    class AutoSave(FakeKVCacheStore):
+        def save(self, block_hashes, dst_raiden_id=None):
+            ok = super().save(block_hashes, dst_raiden_id)
+            if ok:
+                self.complete_save(list(block_hashes))
+            return ok
+
+    return AutoSave()
+
+
+def test_victim_policy_stores_evicted_blocks_before_reuse_and_they_hit(monkeypatch):
+    """QWEN4_EXP_HOST_TIER_POLICY=victim on the served PP8 groups: computing stores nothing; blocks evicted for
+    reuse are stored under the keys a later lookup asks for, drained within the step, never echoed to the
+    workers; a block freed too recently is not stored; and a turn-2 request host-hits the stored blocks."""
+    from vllm.v1.core.kv_cache_utils import make_block_hash_with_group_id
+    from vllm.v1.core.sched.output import KVConnectorBlockState, SchedulerOutput
+
+    from vllm_torchtpu.offload import victim
+
+    monkeypatch.setenv(victim.POLICY_ENV, "victim")
+    victim.deactivate()
+    _, layout, stages, kvc = pp8_pool(monkeypatch)
+    store = _auto_save_store()
+    sched, _ = _pp8_scheduler(monkeypatch, kvc, stages, store=store)
+    try:
+        tap = victim.active_tap()
+        assert tap is sched._victim_tap and sched._victim_min_age == STAGES + 2
+        cacheable = set(kvc.prefix_cacheable_group_ids)
+        is_mamba = lambda gid: isinstance(kvc.kv_cache_groups[gid].kv_cache_spec, MambaSpec)
+        ring = {gid for gid, g in enumerate(kvc.kv_cache_groups)
+                if isinstance(g.kv_cache_spec, CircularBufferSpec)}
+        mamba = [g for g in sorted(cacheable) if is_mamba(g)]
+        attention = [g for g in sorted(cacheable) if not is_mamba(g)]
+
+        # turn 1, prefilled as in the write-through test: nothing is stored on compute
+        prompt = 3 * BLOCK + 5
+        first = _request("r1", _tokens(prompt, 0))
+        sched.on_new_request(first)
+        blocks = _Blocks()
+        table, checkpoints = [], {}
+        for gid in range(len(kvc.kv_cache_groups)):
+            if gid in ring:
+                table.append(blocks.take(1))
+            elif is_mamba(gid):
+                ckpt, running = blocks.take(2)
+                checkpoints[gid] = ckpt
+                table.append([0, 0, ckpt, running])
+            else:
+                table.append(blocks.take(4))
+        output = SchedulerOutput.make_empty()
+        output.scheduled_new_reqs = [NS(req_id="r1", block_ids=tuple(table))]
+        output.num_scheduled_tokens = {"r1": prompt}
+        output.total_num_scheduled_tokens = prompt
+        output.kv_connector_block_state = KVConnectorBlockState(
+            req_ids={"r1"}, resolve_block_ids=lambda req_id: tuple(table),
+            boundary_state_offloads={"r1": [(g, checkpoints[g], 3 * BLOCK) for g in mamba]},
+        )
+        meta = sched.build_connector_meta(output)
+        assert not meta.fence_job_ids and not sched._fence_pending
+        assert not store.calls_named("insert") and not store.calls_named("save")
+
+        # HBM evicts turn 1's blocks for reuse (what BlockPool.get_new_blocks reports through the tap), freed
+        # long ago; plus one block freed in this very step (young: a batch in flight may still write it).
+        old = tap.step
+        evicted = {(g, c): table[g][c] for g in attention for c in range(3)}
+        evicted.update({(g, 2): checkpoints[g] for g in mamba})
+        for (g, c), block_id in evicted.items():
+            tap.on_freed([block_id])
+        tap.step = old + sched._victim_min_age
+        young = table[attention[0]][3]
+        tap.on_freed([young])
+        for (g, c), block_id in evicted.items():
+            tap.pending.append(victim.Victim(block_id, make_block_hash_with_group_id(first.block_hashes[c], g),
+                                             tap.freed_at[block_id]))
+        young_hash = make_block_hash_with_group_id(_request("rx", _tokens(BLOCK, 9)).block_hashes[0],
+                                                   attention[0])
+        tap.pending.append(victim.Victim(young, young_hash, tap.freed_at[young]))
+        done = sched.build_connector_meta(SchedulerOutput.make_empty())
+
+        (save,) = store.calls_named("save")
+        namespace = sched._raiden_manager._key_namespace
+        chunk_of = {bytes(h): i for i, h in enumerate(first.block_hashes)}
+        saved = {}
+        for sub_hash in save.args[0]:
+            key, g = _key_group_of_sub_hash(sub_hash, namespace)
+            saved[(g, chunk_of[bytes(key[:-4])])] = store.entries[sub_hash].device_block_id
+        assert saved == evicted                      # every victim, from its own block, under its lookup key
+        assert young not in saved.values()
+        assert not sched._raiden_manager._admissions  # drained before the metadata shipped
+        assert not done.finished_store_job_ids        # never echoed to the workers
+        tel = sched.telemetry
+        assert tel["victim_stores"] == 1 and tel["victim_store_keys"] == len(evicted)
+        assert tel["victim_young"] == 1 and tel["victim_seen"] == len(evicted) + 1
+
+        # turn 2 extends turn 1: a host hit on the stored blocks, up to the checkpoint boundary
+        second = _request("r2", first.prompt_token_ids + _tokens(2000, 1))
+        sched.on_new_request(second)
+        assert sched.get_num_new_matched_tokens(second, 0) == (3 * BLOCK, True)
+
+        # evicted again later: already on the host, so not stored twice
+        for (g, c), block_id in evicted.items():
+            tap.pending.append(victim.Victim(block_id, make_block_hash_with_group_id(first.block_hashes[c], g),
+                                             old))
+        sched.build_connector_meta(SchedulerOutput.make_empty())
+        assert len(store.calls_named("save")) == 1
+        assert sched.telemetry["victim_resident"] == len(evicted)
+    finally:
+        victim.deactivate()
 
 
 # -- the multi connector's contracts for a PD producer with a host tier ----------
