@@ -259,6 +259,19 @@ def test_resolve_head_owner_refuses_unsupported_models():
         )
 
 
+def test_resolve_head_owner_takes_tpu_models_whose_logits_are_the_lm_head():
+    class TpuHeadModel(_Owner):
+        logits_from_lm_head = True
+
+        def compute_logits(self, hidden_states):
+            return self.logits_processor(self.lm_head, hidden_states)
+
+    TpuHeadModel.compute_logits.__module__ = "vllm_torchtpu.models.fake"
+    owner = TpuHeadModel(_shards(torch.zeros(8, 2), 1)[0])
+
+    assert greedy_top_tokens.resolve_head_owner(owner) is owner
+
+
 def _runner(weight, speculative_config=None):
     owner = _Owner(_shards(weight, 1)[0])
     runner = object.__new__(TPUModelRunner)

@@ -42,6 +42,10 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+# A TPU model whose compute_logits is only ``logits_processor(lm_head, h)``
+# sets this class attribute to True; get_top_tokens reproduces that.
+LOGITS_FROM_LM_HEAD_ATTR = "logits_from_lm_head"
+
 
 def resolve_head_owner(model: torch.nn.Module) -> torch.nn.Module:
     """The module holding ``lm_head`` and its ``logits_processor``.
@@ -50,7 +54,9 @@ def resolve_head_owner(model: torch.nn.Module) -> torch.nn.Module:
     cannot be served by the vocabulary-parallel argmax.
     """
     compute_logits = getattr(type(model), "compute_logits", None)
-    if getattr(compute_logits, "__module__", "").startswith("vllm_torchtpu."):
+    if getattr(compute_logits, "__module__", "").startswith(
+        "vllm_torchtpu."
+    ) and not getattr(type(model), LOGITS_FROM_LM_HEAD_ATTR, False):
         raise NotImplementedError(
             f"TPU_GREEDY_TOP_TOKENS: {type(model).__name__} computes its logits "
             "in a TPU-specific compute_logits that get_top_tokens does not "

@@ -199,6 +199,9 @@ class MiniMaxM3Model(nn.Module):
 class MiniMaxM3SparseForCausalLM(nn.Module):
     """Text-only MiniMax M3; also serves the vision-language architecture."""
 
+    # compute_logits is the LM head alone (runner/greedy_top_tokens.py).
+    logits_from_lm_head = True
+
     packed_modules_mapping = {
         "qkv_proj": ["q_proj", "k_proj", "v_proj", "index_q_proj", "index_k_proj"],
         "gate_up_proj": ["gate_proj", "up_proj"],
