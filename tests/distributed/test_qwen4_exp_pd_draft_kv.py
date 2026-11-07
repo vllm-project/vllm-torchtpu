@@ -79,6 +79,9 @@ def producer_config(k=1, tp=1, pp=8, prefix_caching=False, role="kv_producer"):
     cfg.cache_config.enable_prefix_caching = prefix_caching
     cfg.cache_config.mamba_cache_mode = "align" if prefix_caching else "none"
     cfg.cache_config.mamba_ssm_cache_dtype = "float32"
+    # The layout tests build real cache specs (gdn_cache_spec reads it); vLLM's CacheConfig default.
+    if not hasattr(cfg.cache_config, "mamba_cache_dtype"):
+        cfg.cache_config.mamba_cache_dtype = "auto"
     cfg.speculative_config = spec_config(k)
     cfg.kv_transfer_config = NS(
         kv_connector=qconfig.PD_CONNECTOR,
