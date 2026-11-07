@@ -603,6 +603,41 @@ def patch_default_loader_ep_weight_filter() -> None:
     )
 
 
+def patch_default_loader_sync_weight_writes() -> None:
+    """Flush the device queue after each tensor ``DefaultModelLoader`` yields.
+
+    Under TorchTPU's deferred eager mode a weight loader's write into one
+    shard of a fused parameter (q/k/v into ``qkv_proj``, gate/up into
+    ``gate_up_proj``) is a queued program that rewrites the whole parameter,
+    and every earlier version of it stays allocated until the queue flushes.
+    Left alone, a dense model holds ~10% of its weight bytes on top of the
+    weights by the end of loading, and one whose weights nearly fill HBM
+    runs out of memory in its first post-load transform. Syncing once the
+    model has consumed each tensor bounds the extra memory to the parameters
+    that one tensor rewrites.
+    """
+    from vllm.model_executor.model_loader import default_loader
+
+    loader_cls = default_loader.DefaultModelLoader
+    if getattr(loader_cls, "_tpu_load_sync_patch", False):
+        return
+    original_get_all_weights = loader_cls.get_all_weights
+
+    @functools.wraps(original_get_all_weights)
+    def get_all_weights(self, model_config, model):
+        for weight in original_get_all_weights(self, model_config, model):
+            yield weight
+            torch.accelerator.synchronize()
+
+    loader_cls.get_all_weights = get_all_weights
+    loader_cls._tpu_load_sync_patch = True
+    logger.info(
+        "Applied TPU patch: DefaultModelLoader syncs the device after each "
+        "checkpoint tensor, so superseded fused-parameter versions are freed "
+        "during loading."
+    )
+
+
 def _local_tensor_ranges(
     path: str, local_expert_ids: set[int]
 ) -> list[tuple[int, int]]:
