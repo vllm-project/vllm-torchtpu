@@ -29,6 +29,8 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from vllm_torchtpu.models.minimax_m3.kernels import msa_fp4
+
 _UINT_BY_BITS = {16: jnp.uint16, 8: jnp.uint8}
 
 
@@ -43,9 +45,12 @@ def _kernel(
     page_ref,  # [1, S / p, p, W] the page before the write
     # Out
     o_ref,  # [1, S / p, p, W] aliased with the cache
-    *,
+    *refs,  # with folded scales: [1, 1, W] uint32 scale bits by slot, then o_ref
     bits: int,
 ):
+    scale_ref = None
+    if refs:  # folded scales: the scale input precedes the output
+        scale_ref, o_ref = o_ref, refs[0]
     run = pl.program_id(0)
     active = run < num_runs_ref[0]
 
@@ -62,6 +67,10 @@ def _kernel(
             keep = jnp.uint32(~(((1 << bits) - 1) << (bits * j)) & 0xFFFFFFFF)
             merged = (words & keep) | (new_ref[0, j] << jnp.uint32(bits * j))
             words = jnp.where(take, merged, words)
+        if scale_ref is not None:  # last word row: one f32 scale per slot (lane)
+            lane = jax.lax.broadcasted_iota(jnp.int32, (rows, width), 1)
+            take = (row == rows - 1) & (lane >= lo) & (lane < hi)
+            words = jnp.where(take, scale_ref[0], words)
         o_ref.bitcast(jnp.uint32)[0, :, 0, :] = words
 
     # With no run at all the single output page must still be written back
@@ -106,6 +115,7 @@ def write_rows(
     *,
     max_runs: int,
     bits: int | None = None,
+    scales: jax.Array | None = None,
     interpret: bool = False,
 ) -> jax.Array:
     """Write ``rows [T, W]`` (cache dtype) at ``(pages[t], slots[t])``.
@@ -117,13 +127,22 @@ def write_rows(
 
     `bits` per slot defaults to the cache dtype's width. With ``bits=4`` (the
     uint8 4-bit caches of `msa_fp4`) `rows` are uint8 values below 16, and
-    each 32-bit word holds 8 slots.
+    each 32-bit word holds 8 slots. `scales` (f32 ``[T]``) go to the last word
+    row of a page with folded scales (`msa_fp4.scales_in_page`), lane = slot.
     """
     num_pages, rows_per_page, word_bytes, width = cache.shape
     if bits is None:
         bits = 32 // word_bytes
     packing = 32 // bits
-    page_size = rows_per_page * packing
+    folded = scales is not None
+    if folded and not (
+        bits == 4 and msa_fp4.scales_in_page(rows_per_page, cache.dtype)
+    ):
+        raise ValueError(
+            f"scales need a 4-bit cache with a scale row, got {cache.shape}"
+        )
+    data_rows = rows_per_page - 1 if folded else rows_per_page
+    page_size = data_rows * packing
     num_tokens = rows.shape[0]
     num_runs, run_page, run_lo, run_hi, run_tok0 = _runs(
         pages, slots, num_pages, max_runs
@@ -137,8 +156,16 @@ def write_rows(
             jnp.uint32
         )
     src = run_tok0[:, None] + jnp.arange(page_size, dtype=jnp.int32) - run_lo[:, None]
-    new = word_bits[jnp.clip(src, 0, num_tokens - 1)]
-    new = new.reshape(max_runs, rows_per_page, packing, width).transpose(0, 2, 1, 3)
+    src = jnp.clip(src, 0, num_tokens - 1)
+    new = word_bits[src]
+    new = new.reshape(max_runs, data_rows, packing, width).transpose(0, 2, 1, 3)
+    extra = []
+    if folded:
+        new = jnp.pad(new, ((0, 0), (0, 0), (0, rows_per_page - data_rows), (0, 0)))
+        bits_by_slot = jax.lax.bitcast_convert_type(
+            scales.astype(jnp.float32), jnp.uint32
+        )[src]  # [runs, S]
+        extra = [jnp.pad(bits_by_slot, ((0, 0), (0, width - page_size)))[:, None, :]]
 
     page_block = pl.BlockSpec(
         (1, rows_per_page, word_bytes, width),
@@ -154,6 +181,11 @@ def write_rows(
                     (1, packing, rows_per_page, width), lambda r, *_: (r, 0, 0, 0)
                 ),
                 page_block,
+                *(
+                    [pl.BlockSpec((1, 1, width), lambda r, *_: (r, 0, 0))]
+                    if folded
+                    else []
+                ),
             ],
             out_specs=page_block,
         ),
@@ -163,7 +195,7 @@ def write_rows(
         compiler_params=pltpu.CompilerParams(dimension_semantics=("arbitrary",)),
         interpret=interpret,
         name="minimax_m3_msa_write_rows",
-    )(num_runs[None], run_page, run_lo, run_hi, new, cache)
+    )(num_runs[None], run_page, run_lo, run_hi, new, cache, *extra)
 
 
 def max_write_runs(num_tokens: int, max_num_seqs: int, page_size: int) -> int:

@@ -104,15 +104,29 @@ def is_fp4(cache: jax.Array) -> bool:
     return cache.dtype == jnp.uint8
 
 
+def scales_in_page(rows_per_page: int, dtype) -> bool:
+    """Whether a 4-bit page carries its per-slot scales in an extra 32-bit word
+    row: ``[pages, S / 8 + 1, 4, W]``, the last row ``W`` f32 lanes, lane ``s``
+    the scale of slot ``s`` (index caches: one DMA per page instead of a page
+    plus a scale page). S / 8 is even, so an odd row count means folded."""
+    return dtype == jnp.uint8 and rows_per_page % 2 == 1
+
+
+def data_rows(rows_per_page: int) -> int:
+    """Word rows of a 4-bit page that hold tokens."""
+    return rows_per_page - rows_per_page % 2
+
+
 def page_tokens(cache: jax.Array) -> int:
-    """Tokens per page of a uint8 ``[pages, S / 8, 4, W]`` 4-bit cache."""
-    return cache.shape[1] * TOKENS_PER_WORD
+    """Tokens per page of a uint8 ``[pages, S / 8 (+ 1), 4, W]`` 4-bit cache."""
+    return data_rows(cache.shape[1]) * TOKENS_PER_WORD
 
 
 def scale_rows(kv_heads: int) -> int:
     """Rows of the scale page for `kv_heads` KV heads per rank: K and V rows of
-    every head plus the index row, rounded up to the 8-row f32 tile."""
-    return -(-(2 * kv_heads + 1) // SCALE_ROWS) * SCALE_ROWS
+    every head, rounded up to the 8-row f32 tile (the index-key scales live
+    in the index pages, `scales_in_page`)."""
+    return -(-(2 * kv_heads) // SCALE_ROWS) * SCALE_ROWS
 
 
 def index_scale_row(kv_heads: int) -> int:
@@ -120,8 +134,16 @@ def index_scale_row(kv_heads: int) -> int:
     return 2 * kv_heads
 
 
+def folded_scales(cache: jax.Array) -> jax.Array:
+    """``[pages, S / 8 + 1, 4, W]`` folded page -> f32 ``[pages, W]`` slot
+    scales of its last word row (XLA reference)."""
+    words = jax.lax.bitcast_convert_type(cache[:, -1].transpose(0, 2, 1), jnp.uint32)
+    return jax.lax.bitcast_convert_type(words, jnp.float32)
+
+
 def unpack_rows(cache: jax.Array) -> jax.Array:
     """``[pages, S / 8, 4, W]`` uint8 -> ``[pages, S, W]`` nibbles in slot order (XLA reference)."""
+    cache = cache[:, : data_rows(cache.shape[1])]
     pages, rows, _, width = cache.shape
     words = jax.lax.bitcast_convert_type(
         cache.transpose(0, 1, 3, 2), jnp.uint32
@@ -131,10 +153,17 @@ def unpack_rows(cache: jax.Array) -> jax.Array:
     return nib.reshape(pages, rows * TOKENS_PER_WORD, width).astype(jnp.uint8)
 
 
-def pack_rows(nibbles: jax.Array) -> jax.Array:
+def pack_rows(nibbles: jax.Array, scales: jax.Array | None = None) -> jax.Array:
     """Inverse of `unpack_rows`: ``[pages, S, W]`` nibbles -> uint8 ``[pages, S / 8, 4, W]``."""
     pages, tokens, width = nibbles.shape
-    nib = nibbles.astype(jnp.uint32).reshape(pages, tokens // TOKENS_PER_WORD, TOKENS_PER_WORD, width)
+    nib = nibbles.astype(jnp.uint32).reshape(
+        pages, tokens // TOKENS_PER_WORD, TOKENS_PER_WORD, width
+    )
     shifts = jnp.arange(TOKENS_PER_WORD, dtype=jnp.uint32) * 4
     words = jnp.bitwise_or.reduce(nib << shifts[None, None, :, None], axis=2)
+    if scales is not None:  # fold [pages, W] f32 slot scales in as the last row
+        scale_words = jax.lax.bitcast_convert_type(
+            scales.astype(jnp.float32), jnp.uint32
+        )
+        words = jnp.concatenate([words, scale_words[:, None, :]], axis=1)
     return jax.lax.bitcast_convert_type(words, jnp.uint8).transpose(0, 1, 3, 2)

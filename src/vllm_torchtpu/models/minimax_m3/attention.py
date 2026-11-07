@@ -62,10 +62,18 @@ class MiniMaxM3Cache(nn.Module, TpuOwnedKVCache):
     """
 
     def __init__(
-        self, row_width: int, dtype: torch.dtype, prefix: str, token_shards: int = 1
+        self,
+        row_width: int,
+        dtype: torch.dtype,
+        prefix: str,
+        token_shards: int = 1,
+        scales_in_page: bool = False,
     ) -> None:
         super().__init__()
         self.row_width = row_width
+        # 4-bit pages that carry their per-slot f32 scales in one extra word
+        # row (`kernels.msa_fp4.scales_in_page`); needs row_width == block size.
+        self.scales_in_page = scales_in_page and dtype == torch.uint8
         self.dtype = dtype
         self.prefix = prefix
         self.token_shards = token_shards
@@ -88,6 +96,8 @@ class MiniMaxM3Cache(nn.Module, TpuOwnedKVCache):
         # stores 1 / token_shards of the rows, budgeted as a narrower row.
         # A 4-bit (uint8) row takes row_width / 2 bytes.
         width = self.row_width // 2 if self.dtype == torch.uint8 else self.row_width
+        if self.scales_in_page:  # + one f32 scale per token
+            width += 4
         return MLAAttentionSpec(
             block_size=vllm_config.cache_config.block_size,
             num_kv_heads=1,
@@ -98,8 +108,13 @@ class MiniMaxM3Cache(nn.Module, TpuOwnedKVCache):
     def kv_cache_shape(self, num_blocks: int) -> tuple[int, ...] | None:
         tokens = self.block_size // self.token_shards
         if self.dtype == torch.uint8:
-            # 4-bit: 8 tokens per 32-bit word of 4 bytes (`kernels.msa_fp4`).
-            return (num_blocks, tokens // 8, 4, self.row_width)
+            # 4-bit: 8 tokens per 32-bit word of 4 bytes (`kernels.msa_fp4`),
+            # plus the scale row when the page carries its scales.
+            if self.scales_in_page and self.row_width != tokens:
+                raise NotImplementedError(
+                    f"folded scales need a {tokens}-wide row, got {self.row_width}"
+                )
+            return (num_blocks, tokens // 8 + self.scales_in_page, 4, self.row_width)
         if self.token_shards == 1:
             return None
         packing = 32 // (8 * self.dtype.itemsize)
@@ -309,6 +324,8 @@ class MiniMaxM3SparseAttention(nn.Module):
             dtype,
             prefix=f"{prefix}.attn.index_cache",
             token_shards=self.index_shards,
+            # One DMA per page in the indexer instead of a page plus a scale page.
+            scales_in_page=True,
         )
         self.fp4 = dtype == torch.uint8
         self.scale_cache = None

@@ -100,6 +100,7 @@ def write_rows(
     pos: jax.Array,
     *,
     max_num_seqs: int | None = None,
+    scales: jax.Array | None = None,
     interpret: bool = False,
 ) -> jax.Array:
     """Write one row per token into a packed ``[pages, S / p, p, W]`` cache.
@@ -123,6 +124,7 @@ def write_rows(
         max_runs=max_runs,
         bits=4 if fp4 else None,
         interpret=interpret,
+        **({} if scales is None else {"scales": scales}),
     )
 
 
@@ -140,9 +142,10 @@ def write_fp4(
     """Rotate, quantize and write one step's K/V (``[T, G, D]``) and index keys
     (``[T, D]``) into 4-bit caches and their scale page (`msa_fp4`).
 
-    `write(cache, nibble_rows)` writes 4-bit rows at the step's slots
-    (`write_rows` bound to `pages` and `pos`). Scale-page rows: ``2h`` / ``2h + 1``
-    the K / V scales of head ``h``, ``2G`` the index-key scales.
+    `write(cache, nibble_rows, scales=None)` writes 4-bit rows at the step's
+    slots (`write_rows` bound to `pages` and `pos`). Scale-page rows ``2h`` /
+    ``2h + 1`` hold the K / V scales of head ``h``; the index-key scales are
+    folded into the index pages' last word row (`msa_fp4.scales_in_page`).
     """
     num_tokens, num_heads, _ = k.shape
     k_nib, k_scale = msa_fp4.quantize(msa_fp4.rotate_keys(k))
@@ -151,15 +154,11 @@ def write_fp4(
     kv_cache = write(
         kv_cache, jnp.concatenate([k_nib, v_nib], axis=-1).reshape(num_tokens, -1)
     )
-    index_cache = write(index_cache, i_nib)
-    row = msa_fp4.index_scale_row(num_heads)
-    scales = jnp.concatenate(
-        [jnp.stack([k_scale, v_scale], axis=-1).reshape(num_tokens, -1), i_scale[:, None]],
-        axis=1,
-    )  # [T, 2G + 1]
+    index_cache = write(index_cache, i_nib, scales=i_scale)
+    scales = jnp.stack([k_scale, v_scale], axis=-1).reshape(num_tokens, -1)  # [T, 2G]
     slot = pos % page_size(kv_cache)
     scale_cache = scale_cache.at[
-        pages[:, None], jnp.arange(row + 1)[None, :], slot[:, None]
+        pages[:, None], jnp.arange(2 * num_heads)[None, :], slot[:, None]
     ].set(scales, mode="drop")
     return kv_cache, index_cache, scale_cache
 
