@@ -34,10 +34,11 @@ import torch
 import vllm_torchtpu
 import vllm_torchtpu.megakernel_runtime.agreement as agreement_mod
 import vllm_torchtpu.megakernel_runtime.driver as driver_mod
+from tests.megakernel_runtime import toy_plugin
 from vllm_torchtpu.megakernel_runtime import config as cfg_mod
 from vllm_torchtpu.megakernel_runtime import plugin as plugin_mod
 from vllm_torchtpu.megakernel_runtime import salt as salt_mod
-from vllm_torchtpu.megakernel_runtime import testing, testkit
+from vllm_torchtpu.megakernel_runtime import testing
 from vllm_torchtpu.megakernel_runtime.salt import compile_cache_salt
 
 _SRC = Path(vllm_torchtpu.__file__).resolve().parent.parent
@@ -234,7 +235,7 @@ def test_salt_imports_without_torch_jax_or_vllm() -> None:
     assert out.returncode == 0 and out.stdout.strip() == "OK", out.stderr
 
 
-mk_toy_plugin = testkit.mk_toy_plugin
+mk_toy_plugin = toy_plugin.mk_toy_plugin
 
 
 def test_driver_and_salt_resolve_the_same_plugin(

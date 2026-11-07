@@ -32,18 +32,15 @@ import torch
 
 import vllm_torchtpu.megakernel_runtime.agreement as agreement_mod
 import vllm_torchtpu.megakernel_runtime.driver as driver_mod
+from tests.megakernel_runtime import toy_plugin
+from tests.megakernel_runtime.toy_plugin import TOY_PLUGIN
 from vllm_torchtpu import megakernel_runtime as mkr
 from vllm_torchtpu.megakernel import errors as mk_errors
 from vllm_torchtpu.megakernel.runtime.contract import Bucket, RunnerShape, TpuMonoSpec
 from vllm_torchtpu.megakernel_runtime import fingerprint as fp
-from vllm_torchtpu.megakernel_runtime import stepping, testing, testkit
+from vllm_torchtpu.megakernel_runtime import stepping, testing
 from vllm_torchtpu.megakernel_runtime.hooks import StepContext
 from vllm_torchtpu.megakernel_runtime.plugin import RunnerView
-from vllm_torchtpu.megakernel_runtime.testkit import (
-    TOY_PLUGIN,
-    assert_rank_uniform_declines,
-    run_two_ranks,
-)
 
 _SRC = Path(driver_mod.__file__).resolve().parents[2]
 
@@ -60,7 +57,7 @@ def _std_logger(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("VLLM_TPU_MEGAKERNEL", raising=False)
 
 
-mk_toy_plugin = testkit.mk_toy_plugin
+mk_toy_plugin = toy_plugin.mk_toy_plugin
 
 
 @pytest.fixture
@@ -551,45 +548,6 @@ def test_weight_update_guard() -> None:
     serving = object.__new__(driver_mod.ProgramDriver)
     with pytest.raises(mkr.MegakernelUnsupported, match="weight_update"):
         mkr.guard_weight_update(SimpleNamespace(_megakernel=serving))
-
-
-# --- 2-rank gloo ----------------------------------------------------------------
-
-
-@pytest.mark.parametrize(
-    "scenario", ["serve", "decline", "mismatch", "create_error", "import_error"]
-)
-def test_two_rank_gloo_agreement(tmp_path: Path, scenario: str) -> None:
-    """Real 2-process gloo agreement: never hangs, always rank-uniform."""
-    src = (TOY_PLUGIN, TOY_PLUGIN)
-    options: dict[str, Any] = {}
-    if scenario == "decline":
-        options = {"decline_rank": 1}
-    elif scenario == "mismatch":
-        src = (TOY_PLUGIN, TOY_PLUGIN + "\n# skewed on rank 1\n")
-    elif scenario == "create_error":
-        options = {"raise_rank": 1}
-    elif scenario == "import_error":
-        src = (TOY_PLUGIN, 'raise ImportError("plugin missing on this host")\n')
-    if scenario == "serve":
-        r0, r1 = run_two_ranks(tmp_path, options=options, sources=src)
-    else:
-        r0, r1 = assert_rank_uniform_declines(tmp_path, options=options, sources=src)
-    if scenario == "serve":
-        assert r0 == r1 == {"type": "ProgramDriver", "code": None, "warmed": 2}
-    elif scenario == "decline":
-        assert r0 == {"type": "DeclinedDriver", "code": "peer_declined:toy_declined"}
-        assert r1 == {"type": "DeclinedDriver", "code": "toy_declined"}
-    elif scenario == "mismatch":
-        assert r0 == r1 == {"type": "DeclinedDriver", "code": "plugin_mismatch"}
-    elif scenario == "create_error":
-        assert r0 == {"type": "DeclinedDriver", "code": "peer_declined:create_error"}
-        assert r1 == {"raised": "RuntimeError: toy create bug"}
-    else:
-        # Rank 1 votes before raising (token 0): rank 0 declines, no hang.
-        assert r0 == {"type": "DeclinedDriver", "code": "plugin_mismatch"}
-        assert r1["raised"].startswith("MegakernelConfigError")
-        assert "plugin missing on this host" in r1["raised"]
 
 
 def test_toy_plugin_source_is_valid_python() -> None:

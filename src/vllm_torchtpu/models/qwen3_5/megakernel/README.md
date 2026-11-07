@@ -69,8 +69,8 @@ The folder's test uses the runtime's plugin test kit,
   driver, the per-step outputs and the step mix;
 - `run_two_ranks(...)` / `assert_rank_uniform_declines(...)`: startup on two
   gloo ranks (a decline on one rank declines both);
-- fixtures `mk_fake_runner` (the `testing.fake_runner` factory) and
-  `mk_toy_plugin`, imported into `tests/conftest.py`.
+- the fixture `mk_fake_runner` (the `testing.fake_runner` factory), imported
+  into `tests/conftest.py`.
 
 A program whose steps are JAX functions can build each with
 `megakernel_runtime.jax_bridge.build_jax_step_op(fn, mesh=..., in_specs=...,

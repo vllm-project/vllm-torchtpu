@@ -24,10 +24,9 @@
   and nothing hangs.
 - `route_lazy_loggers(monkeypatch, *packages)`: route the runtime's (and a
   folder's) lazy vLLM loggers to `logging` when vLLM is absent.
-- `TOY_PLUGIN` / `write_plugin`: a single-file toy plugin (pure torch).
-- Fixtures `mk_fake_runner` (the `testing.fake_runner` factory) and
-  `mk_toy_plugin` (the toy plugin importable as `toy_mk_plugin`); import them
-  into a `conftest.py` to use them.
+- `write_plugin`: write a single-file plugin module (e.g. one skewed per rank).
+- Fixture `mk_fake_runner` (the `testing.fake_runner` factory); import it
+  into a `conftest.py` to use it.
 """
 
 from __future__ import annotations
@@ -56,87 +55,8 @@ _RUNTIME_PREFIX = "vllm_torchtpu.megakernel_runtime."
 # Top-level packages a plugin module must not load at import.
 HEAVY_IMPORTS = ("jax", "torch", "vllm")
 
-TOY_PLUGIN = '''
-"""A toy megakernel plugin: y = x * scale + B, in pure torch."""
-from vllm_torchtpu.megakernel.runtime.contract import (
-    Bucket,
-    Decline,
-    TpuMonoSpec,
-    WarmupCase,
-)
 
-
-class ToyProgram:
-    display_name = "Toy"
-
-    def __init__(self, view, options):
-        self.scale = float(options.get("scale", 2.0))
-        self.mesh = "unloaded"
-        self.warmed = []
-        self.events = []
-
-    def buckets(self, token_paddings):
-        self.events.append(("buckets", tuple(token_paddings)))
-        return [Bucket(1, 4), Bucket(1, 8, out_rows=8)]
-
-    def load(self, mesh):
-        self.mesh = mesh
-        self.events.append("load")
-
-    def bind(self, view):
-        self.events.append("bind")
-        return None
-
-    def build(self, bucket):
-        scale, b = self.scale, bucket.B
-
-        def step(x):
-            return x * scale + b
-
-        return step
-
-    def warmup_inputs(self, bucket, shape):
-        import torch
-
-        def check(out):
-            self.warmed.append((bucket.key, shape, float(out[0])))
-
-        return WarmupCase((torch.ones(shape.tok_pad),), check)
-
-    def decide(self, ctx, fwd):
-        from vllm_torchtpu.megakernel.runtime.contract import StepDecision
-
-        n = int(ctx.input_ids.shape[0])
-        b = next((b for b in (4, 8) if b >= n), None)
-        if b is None:
-            return StepDecision(False, "stock_big", n, 1)
-        return StepDecision(True, f"mk_t1_b{b}", n, 1, b)
-
-    def forward(self, decision, ctx, fwd):
-        step = fwd.steps[(1, decision.bucket_t)]
-        return step(ctx.input_ids.float())[: fwd.num_tokens]
-
-    def on_warmup_done(self):
-        self.events.append("warm")
-
-
-def create(view, options):
-    rank = view.tp_rank
-    if options.get("decline") or options.get("decline_rank") == rank:
-        return Decline("toy_declined", "toy says no")
-    if options.get("raise_rank") == rank:
-        raise RuntimeError("toy create bug")
-    return ToyProgram(view, options)
-
-
-SPEC = TpuMonoSpec(
-    "toy", "1", create=create, decline_codes=("toy_declined",)
-)
-'''
-TOY_MODULE = "toy_mk_plugin"
-
-
-def write_plugin(directory: Path, source: str, module: str = TOY_MODULE) -> Path:
+def write_plugin(directory: Path, source: str, module: str) -> Path:
     """Write a single-file plugin `module` into `directory`; returns its path."""
     path = Path(directory) / f"{module}.py"
     path.write_text(source, encoding="utf-8")
@@ -376,7 +296,7 @@ def _subprocess_env(paths: Sequence[str] = ()) -> dict[str, str]:
 def run_two_ranks(
     tmp_path: Path,
     *,
-    plugin: str = TOY_MODULE,
+    plugin: str,
     options: Mapping[str, Any] | None = None,
     sources: Sequence[str] | None = None,
     runner_kwargs: Mapping[str, Any] | None = None,
@@ -459,31 +379,12 @@ def mk_fake_runner(monkeypatch: pytest.MonkeyPatch) -> Callable[..., Any]:
     return fake_runner
 
 
-@pytest.fixture
-def mk_toy_plugin(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Path]:
-    """`TOY_PLUGIN` as the single-file module `toy_mk_plugin` on `sys.path`;
-    yields its path (edit it to change the plugin source)."""
-    from . import fingerprint
-
-    path = write_plugin(tmp_path, TOY_PLUGIN)
-    monkeypatch.syspath_prepend(str(tmp_path))
-    sys.modules.pop(TOY_MODULE, None)
-    importlib.invalidate_caches()
-    fingerprint.clear_caches()
-    yield path
-    sys.modules.pop(TOY_MODULE, None)
-    fingerprint.clear_caches()
-
-
 __all__ = [
     "HEAVY_IMPORTS",
-    "TOY_MODULE",
-    "TOY_PLUGIN",
     "CpuE2EResult",
     "assert_rank_uniform_declines",
     "check_plugin_spec",
     "mk_fake_runner",
-    "mk_toy_plugin",
     "route_lazy_loggers",
     "run_cpu_e2e",
     "run_two_ranks",
