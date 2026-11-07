@@ -331,3 +331,25 @@ def test_route_env_takes_commas_or_colons():
     assert rt.parse_route_env("") is None
     with pytest.raises(ValueError):
         rt.parse_route_env("8:4")
+
+
+def test_a_consumer_built_without_init_takes_the_broadcast_path():
+    """D-MK's admission tests assemble StagedConsumer with object.__new__ and
+    drive reserve/release: nothing routed may be required (INT trial, 20:19Z)."""
+    import types
+
+    import torch
+
+    from vllm_torchtpu.models.vllm.qwen4_exp import pd_staging
+    from vllm_torchtpu.models.vllm.qwen4_exp.pd import TransferExtent, TransferGroup
+
+    s = object.__new__(pd_staging.StagedConsumer)
+    assert s.route is None
+    s.src_groups = [TransferGroup(0, ("fa",), 16, TransferExtent.TOKEN_PAGES),
+                    TransferGroup(1, ("gdn",), 16, TransferExtent.REQUEST_STATE)]
+    s.manifest = types.SimpleNamespace(pools=[types.SimpleNamespace(layer_name=n) for n in ("fa0", "gdn0")])
+    s._src_owner = {"fa0": 0, "gdn0": 1}
+    s.free = torch.tensor([0] + [1] * 15, dtype=torch.int32)
+    s.reservations, s.skips = {}, {}
+    assert s.reserve(7, 40)
+    assert s.release(7) is not None and int(s.free.sum()) == 15

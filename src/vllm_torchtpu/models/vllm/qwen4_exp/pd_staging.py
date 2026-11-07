@@ -672,6 +672,11 @@ def gdn_geometry(cfg, tp: int, layout_token_bytes: int) -> GdnGeometry:
 class StagedConsumer:
     """One TP-T decode rank's staging carrier for TP1 pipeline-producer pages."""
 
+    # QWEN4_EXP_PD_ROUTED_DST geometry (pd_route), set by __init__; None keeps
+    # the broadcast path. A class default, so a consumer assembled without
+    # __init__ (tests, tools) takes today's path instead of failing.
+    route = None
+
     def __init__(self, cfg, decode_layout, decode_groups, pool, rank: RankSlice, staging_bytes: int):
         from vllm.v1.core.kv_cache_utils import get_kv_cache_groups
 
