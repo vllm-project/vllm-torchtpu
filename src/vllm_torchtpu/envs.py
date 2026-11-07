@@ -47,6 +47,7 @@ if TYPE_CHECKING:
     REQUANTIZE_BLOCK_SIZE: int | None = None
     REQUANTIZE_WEIGHT_DTYPE: str = "float8_e4m3fn"
     TPU_FP8_LINEAR_W8A16_MAX_ROWS: int = 0
+    TPU_ACT_QUANT_SCALE_DTYPE: str | None = None
     MOE_REQUANTIZE_WEIGHT_DTYPE: str = "float8_e4m3fn"
     MOE_REQUANTIZE_BLOCK_SIZE: int | None = None
     TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL: bool | None = None
@@ -390,6 +391,32 @@ def env_optional_bool(env_name: str) -> Callable[[], bool | None]:
     return _get_optional_bool_env
 
 
+def env_optional_choices(
+    env_name: str,
+    choices: list[str],
+    case_sensitive: bool = False,
+) -> Callable[[], str | None]:
+    """Validated string knob where unset or empty reads as ``None`` (default)."""
+
+    def _get_optional_choice_env() -> str | None:
+        value = os.getenv(env_name)
+        if value is None or value.strip() == "":
+            return None
+        stripped = value.strip()
+        for choice in choices:
+            if (
+                stripped == choice
+                if case_sensitive
+                else stripped.lower() == choice.lower()
+            ):
+                return choice
+        raise ValueError(
+            f"Invalid value '{value}' for {env_name}. Valid options: {choices}."
+        )
+
+    return _get_optional_choice_env
+
+
 def env_nonnegative_int_or_auto(env_name: str) -> Callable[[], int | None]:
     """Size knob where unset, empty or ``auto`` (any case) reads as ``None``,
     meaning the caller picks the value itself. Anything else must parse as
@@ -583,6 +610,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # 0 (default) keeps W8A8 everywhere.
     "TPU_FP8_LINEAR_W8A16_MAX_ROWS": env_nonnegative_int(
         "TPU_FP8_LINEAR_W8A16_MAX_ROWS", 0
+    ),
+    # Scale dtype for dynamic activation quantization on the per-channel
+    # dense-linear path (xla_quantized_matmul). Unset or empty uses the
+    # quantization method's default ("bfloat16" for FP8 weights with bfloat16
+    # activations, keeping the [M, K] division in bfloat16 and returning the
+    # exact bfloat16 divisor widened to float32); set to "float32" to force
+    # float32 division. The blockwise gmm_v2 path and int8/float16 activations
+    # always divide in float32.
+    "TPU_ACT_QUANT_SCALE_DTYPE": env_optional_choices(
+        "TPU_ACT_QUANT_SCALE_DTYPE", ["bfloat16", "float32"]
     ),
     # Specify dtype for quantized MoE weights
     "MOE_REQUANTIZE_WEIGHT_DTYPE": lambda: os.getenv(

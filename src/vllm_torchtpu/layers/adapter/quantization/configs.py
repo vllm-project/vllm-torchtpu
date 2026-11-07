@@ -91,16 +91,17 @@ class VllmQuantLinearConfig:
 
     def __init__(
         self,
-        vllm_config: VllmConfig | None,
-        layer: LinearBase,
+        vllm_config: VllmConfig | None = None,
+        layer: LinearBase | None = None,
     ):
-        assert isinstance(layer, LinearBase)
+        assert layer is None or isinstance(layer, LinearBase)
         self.vllm_config = vllm_config
-        self.output_sizes = [layer.output_size]
+        self.output_sizes = [layer.output_size] if layer is not None else []
         self.enable_quantized_matmul_kernel = envs.ENABLE_QUANTIZED_MATMUL_KERNEL
         self.requant_block_size = envs.REQUANTIZE_BLOCK_SIZE
         self.requant_weight_dtype = envs.REQUANTIZE_WEIGHT_DTYPE
         self.w8a16_max_rows = envs.TPU_FP8_LINEAR_W8A16_MAX_ROWS
+        self.act_quant_scale_dtype = envs.TPU_ACT_QUANT_SCALE_DTYPE
 
         # TODO: Implement proper sharding configuration for TPU
         # This should determine weight/bias sharding based on layer type

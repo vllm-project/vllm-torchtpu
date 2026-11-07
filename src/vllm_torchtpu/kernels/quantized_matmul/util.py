@@ -45,7 +45,12 @@ def unfold_args(
 
 
 def quantize_tensor(
-    x: jax.Array, dtype: jnp.dtype, dim: int = -1, block_size: int | None = None
+    x: jax.Array,
+    dtype: jnp.dtype,
+    dim: int = -1,
+    block_size: int | None = None,
+    *,
+    scale_dtype: Any = None,
 ):
     if block_size is not None:
         # Flatten all leading dims into a single batch dim for block
@@ -55,12 +60,16 @@ def quantize_tensor(
         x_flat = x.reshape(-1, k_dim)
         n_dim = x_flat.shape[0]
         x_reshaped = x_flat.reshape(n_dim, -1, block_size)
-        x_q, scale = quantize_block(x_reshaped, axis=-1, target_dtype=dtype)
+        x_q, scale = quantize_block(
+            x_reshaped, axis=-1, target_dtype=dtype, scale_dtype=scale_dtype
+        )
 
         x_q = x_q.reshape(orig_shape)
 
         return x_q, scale.transpose(1, 2, 0).astype(jnp.float32)
-    data_q, scale = quantize_block(x, axis=dim, target_dtype=dtype)
+    data_q, scale = quantize_block(
+        x, axis=dim, target_dtype=dtype, scale_dtype=scale_dtype
+    )
     return data_q, scale.astype(jnp.float32)
 
 
@@ -82,6 +91,8 @@ def xla_quantized_matmul(
     w_q: jax.Array,
     w_scale: jax.Array,
     quantize_activation=True,
+    *,
+    act_quant_scale_dtype: Any = None,
 ) -> jax.Array:
     """
     Reference (pure JAX) implementation of the quantized matmul kernel.
@@ -105,7 +116,7 @@ def xla_quantized_matmul(
         if quantize_activation and jnp.issubdtype(w_q.dtype, jnp.integer):
             acc_dtype = jnp.int32
 
-        x_q, x_scale = quantize_tensor(x, w_q.dtype)
+        x_q, x_scale = quantize_tensor(x, w_q.dtype, scale_dtype=act_quant_scale_dtype)
         out = jax.lax.dot_general(
             x_q,
             w_q,
@@ -300,14 +311,44 @@ def get_max_min(target_dtype):
         return jnp.iinfo(target_dtype).max, jnp.iinfo(target_dtype).min
 
 
-def quantize_block(data, axis, target_dtype):
+def quantize_block(
+    data: jax.Array,
+    axis: int,
+    target_dtype: Any,
+    *,
+    scale_dtype: Any = None,
+):
     """Calculates scale and quantizes a block of data."""
+    if scale_dtype is None:
+        use_bf16_scale = False
+    elif scale_dtype in ("bfloat16", jnp.bfloat16, jnp.dtype(jnp.bfloat16)):
+        use_bf16_scale = True
+    elif scale_dtype in ("float32", jnp.float32, jnp.dtype(jnp.float32)):
+        use_bf16_scale = False
+    else:
+        raise ValueError(
+            f"Unsupported scale_dtype={scale_dtype!r}. "
+            "Expected None, 'bfloat16', or 'float32'."
+        )
+
     abs_max = jnp.max(
         jnp.abs(data),
         axis=axis,
         keepdims=True,
     )
     dtype_max, dtype_min = get_max_min(target_dtype)
+    if (
+        use_bf16_scale
+        and data.dtype == jnp.bfloat16
+        and jnp.issubdtype(target_dtype, jnp.floating)
+    ):
+        # bf16 shares float32's 8-bit exponent range; keep the [M, K] division
+        # in bf16 and return the exact bf16 divisor widened to float32.
+        scale = (abs_max / dtype_max).astype(jnp.bfloat16)
+        scale = jnp.where(scale == 0, jnp.ones_like(scale), scale)
+        data_q = (data / scale).clip(float(dtype_min), float(dtype_max))
+        return data_q.astype(target_dtype), scale.astype(jnp.float32)
+
     scale = abs_max / dtype_max
     scale = jnp.where(scale == 0, 1.0, scale)
 
