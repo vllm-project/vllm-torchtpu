@@ -473,6 +473,31 @@ def _spec_logprob_row_tokens(
 
 
 @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+def mtp_prefill_warmup_block_ids(
+    kv_cache_groups, vllm_config, max_pos: int, max_model_len: int, top: int
+) -> tuple[list[list[int]], int]:
+    """Per-group block IDs of the MTP prefill warmup's synthetic request of
+    ``max_pos`` tokens, from the top of the pool, and the largest count.
+
+    Each group counts in its own block-table units
+    (``KVCacheSpec.max_num_blocks_per_req``), as the spec-decode warmups do:
+    a ring (``CircularBufferSpec``) holds one block per request, and a
+    DCP-sharded spec a share. Counting ``cdiv(max_pos, block_size)`` instead
+    overran a group's block-table row at P=128 the first time a Qwen4Exp
+    producer ran this warmup (q38 F2 smoke attempt 4, j-b6a2e002: "could not
+    broadcast input array from shape (33,) into shape (32,)")."""
+    ids, most = [], 0
+    for group in kv_cache_groups:
+        spec = group.kv_cache_spec
+        n = min(
+            int(spec.max_num_blocks_per_req(vllm_config, max_pos)),
+            int(spec.max_num_blocks_per_req(vllm_config, max_model_len)),
+        )
+        ids.append(list(range(top - n, top)))
+        most = max(most, n)
+    return ids, most
+
+
 def _substitute_placeholder_token(
     input_ids: torch.Tensor,
     token_in_tpu_cur_input_indices: torch.Tensor,
@@ -7221,16 +7246,9 @@ class TPUModelRunner(GPUModelRunner):
         max_pos = min(self.max_model_len, P + 1)
         assert self.kv_cache_config is not None
         top = int(self.kv_cache_config.num_blocks)
-        block_ids_per_group = []
-        max_nblk = 0
-        for group in self.kv_cache_config.kv_cache_groups:
-            group_block_size = int(group.kv_cache_spec.block_size)
-            group_num_blocks = min(
-                cdiv(max_pos, group_block_size),
-                cdiv(self.max_model_len, group_block_size),
-            )
-            block_ids_per_group.append(list(range(top - group_num_blocks, top)))
-            max_nblk = max(max_nblk, group_num_blocks)
+        block_ids_per_group, max_nblk = mtp_prefill_warmup_block_ids(
+            self.kv_cache_config.kv_cache_groups, self.vllm_config, max_pos, self.max_model_len, top
+        )
         if top <= max_nblk + 1:
             raise RuntimeError(
                 "MTP prefill warmup has not enough KV blocks for its "

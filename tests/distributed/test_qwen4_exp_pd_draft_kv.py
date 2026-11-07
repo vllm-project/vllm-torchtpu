@@ -548,6 +548,57 @@ def test_producer_draft_keeps_the_target_grouping_and_pool_size(monkeypatch):
     assert bpb_off <= bpb_on <= bpb_off + page
 
 
+def test_mtp_prefill_warmup_block_ids_fit_every_producer_group(monkeypatch):
+    """F2 smoke attempt 4 (j-b6a2e002, both engine attempts): the producer's MTP prefill warmup, which
+    no Qwen4Exp producer ran before F2, counted every group's blocks as cdiv(P + 1, block_size) and
+    failed at P=128 writing 33 block IDs into a 32-wide block-table row. Each group now counts in its
+    own block-table units (KVCacheSpec.max_num_blocks_per_req), which fit the row vLLM sizes for it
+    (MultiGroupBlockTable: get_block_table_width of the same count at max_model_len)."""
+    from vllm.utils.math_utils import cdiv
+    from vllm.v1.core.kv_cache_utils import get_kv_cache_groups
+    from vllm.v1.kv_cache_interface import MambaSpec
+
+    from vllm_torchtpu.models.vllm.qwen4_exp import config as qconfig
+    from vllm_torchtpu.models.vllm.qwen4_exp.pool_layout import pooled_cache_specs
+    from vllm_torchtpu.runner.tpu_runner import mtp_prefill_warmup_block_ids
+
+    try:
+        from vllm.v1.worker.block_table import get_block_table_width
+    except ImportError:  # an older vLLM: rows are the unaligned count
+        get_block_table_width = None
+
+    monkeypatch.setenv("QWEN4_EXP_PD_DRAFT_KV", "1")
+    qconfig.ensure_kv_group_size_rule()
+    producer = real_cache_config(producer_config())
+    _, specs = pooled_cache_specs(producer)
+    groups = get_kv_cache_groups(producer, dict(specs))
+    max_len = producer.model_config.max_model_len
+
+    def row_width(spec):
+        n = spec.max_num_blocks_per_req(producer, max_len)
+        if get_block_table_width is None:
+            return n
+        return get_block_table_width(n, spec.block_size, token_alignment=None if isinstance(spec, MambaSpec) else 128)
+
+    top, old_overruns = 100_000, []
+    for P in (16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384):
+        max_pos = min(max_len, P + 1)
+        ids, most = mtp_prefill_warmup_block_ids(groups, producer, max_pos, max_len, top)
+        assert len(ids) == len(groups) and most == max(len(r) for r in ids)
+        for g, row in zip(groups, ids):
+            spec = g.kv_cache_spec
+            assert len(row) == spec.max_num_blocks_per_req(producer, max_pos), (P, g.layer_names[:1])
+            assert len(row) <= row_width(spec), (P, g.layer_names[:1])
+            assert row == list(range(top - len(row), top))
+            old = min(cdiv(max_pos, spec.block_size), cdiv(max_len, spec.block_size))
+            if old > row_width(spec):
+                old_overruns.append((P, type(spec).__name__, g.layer_names[0], spec.block_size, old, row_width(spec)))
+    print("groups (type, block_size, row width):",
+          [(type(g.kv_cache_spec).__name__, g.kv_cache_spec.block_size, row_width(g.kv_cache_spec)) for g in groups])
+    print("the old cdiv count overran these rows (P, type, first layer, block_size, count, width):", old_overruns[:12])
+    assert old_overruns  # the old count does overrun a Qwen4Exp producer row (the smoke's failure mode)
+
+
 def test_producer_refuses_a_draft_that_changes_the_grouping(monkeypatch):
     """check_producer_draft_grouping (pooled_cache, the producer): draft specs that merge into the
     target's buckets (here: the draft built as ordinary cacheable QSA specs) are refused with the
