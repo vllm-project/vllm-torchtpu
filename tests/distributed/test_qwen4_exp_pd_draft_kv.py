@@ -524,6 +524,13 @@ def test_producer_draft_keeps_the_target_grouping_and_pool_size(monkeypatch):
     g_off = get_kv_cache_groups(producer, dict(off))
     assert _target_group_size(g_on) == _target_group_size(g_off) > 1
     qconfig.check_producer_draft_grouping(producer, on, g_on)  # no raise
+    # The exact bucketing the engine's grouping uses (vllm_torchtpu._patch_vllm_kv_cache_group_size).
+    from vllm_torchtpu.kv_group_size import kv_cache_layer_buckets
+
+    sizes_on = sorted(len(b) for b in kv_cache_layer_buckets(dict(on)))
+    sizes_off = sorted(len(b) for b in kv_cache_layer_buckets(dict(off)))
+    print(f"producer layer buckets: off {sizes_off}, on {sizes_on}")
+    assert sizes_on == sorted(sizes_off + [1, 1, 1])  # the draft's 3 owners in buckets of their own
     draft_groups = [g for g in g_on if all(n.startswith("mtp.") for n in g.layer_names)]
     assert len(draft_groups) == 3  # main KV, compressed keys, raw ring: groups of their own
     pages_on = qconfig.native_cache_capacity(producer, on)

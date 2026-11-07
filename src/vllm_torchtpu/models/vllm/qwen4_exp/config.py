@@ -120,6 +120,8 @@ def _non_prefix_cacheable_type(cls: type) -> type:
         (cls,),
         {
             "prefix_cacheable": property(lambda self: False),
+            # Never share a bucket with the target's specs (kv_group_size.kv_cache_layer_buckets).
+            "q38_kv_bucket": "q38-f2-producer-draft",
             "__module__": __name__,
             "__qualname__": name,
         },

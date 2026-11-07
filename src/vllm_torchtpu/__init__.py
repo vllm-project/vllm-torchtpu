@@ -1933,33 +1933,17 @@ def _patch_vllm_kv_cache_group_size() -> None:
     same bucketing and strided split, sizing groups by kv_cache_group_size.
     """
     import vllm.v1.core.kv_cache_utils as kcu
-    from collections import defaultdict
 
     from vllm_torchtpu import envs
-    from vllm_torchtpu.kv_group_size import kv_cache_group_size
+    from vllm_torchtpu.kv_group_size import kv_cache_group_size, kv_cache_layer_buckets
 
     if getattr(kcu, "_tpu_group_size_patch", False):
         return
     rule = envs.TPU_KV_CACHE_GROUP_SIZE_RULE
 
     def _get_kv_cache_groups_uniform_page_size(kv_cache_spec):
-        same_type_layers = defaultdict(list)
-        for layer_name, layer_spec in kv_cache_spec.items():
-            same_type_layers[layer_spec].append(layer_name)
-        layer_buckets: list[list[str]] = []
-        spec_buckets: list[list] = []
-        for layer_spec, layer_names in same_type_layers.items():
-            for names, specs in zip(layer_buckets, spec_buckets):
-                try:
-                    type(specs[0]).merge([*specs, layer_spec])
-                except (AssertionError, ValueError):
-                    continue
-                names.extend(layer_names)
-                specs.append(layer_spec)
-                break
-            else:
-                layer_buckets.append(list(layer_names))
-                spec_buckets.append([layer_spec])
+        # Same bucketing as upstream, plus the q38_kv_bucket boundary (kv_cache_layer_buckets).
+        layer_buckets = kv_cache_layer_buckets(kv_cache_spec)
         group_size = kv_cache_group_size([len(b) for b in layer_buckets], rule)
         grouped_layers = []
         for layers in layer_buckets:

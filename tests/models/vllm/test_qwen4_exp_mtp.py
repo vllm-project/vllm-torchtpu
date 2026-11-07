@@ -849,6 +849,7 @@ def _tiny_draft(monkeypatch, *, pp: int, first_rank: bool):
     return draft, [(name, tensor(name)) for name in CHECKPOINT_MTP_TENSORS]
 
 
+@pytest.mark.usefixtures("cpu_vllm_config")
 def test_draft_on_a_later_pipeline_stage_loads_its_own_embedding(monkeypatch):
     """q38 F2 smoke j-274c19fe: on the producer's last stage the target's embed_tokens is a
     PPMissingLayer, so the draft must load the shared checkpoint embedding itself, bit-exactly,
@@ -864,6 +865,7 @@ def test_draft_on_a_later_pipeline_stage_loads_its_own_embedding(monkeypatch):
 
 
 @pytest.mark.parametrize("pp,first_rank", [(1, True), (8, True)])
+@pytest.mark.usefixtures("cpu_vllm_config")
 def test_draft_on_a_stage_with_the_target_embedding_borrows_it(monkeypatch, pp, first_rank):
     """A PP1 engine (the decode) or a pipeline's first stage keeps borrowing the target's
     embedding: the checkpoint embedding is not loaded into the draft."""
