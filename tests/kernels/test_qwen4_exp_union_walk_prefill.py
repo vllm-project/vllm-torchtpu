@@ -307,7 +307,7 @@ def test_flag_on_dispatch_takes_the_walk(kernels, monkeypatch):
     assert calls == [dict(kv_heads=2, ratio=RATIO, k_scale=1.0, v_scale=1.0, group=128, kv_tile=1024,
                           union_cap=CAP, min_context=1000, lean=True, listed=None, share_bits=False,
                           union_alpha=0.0, qk16=False, run_tables=False, lazy_share=False, gathered=None,
-                          gather_chunks=4, gather_growth=1.0)]
+                          gather_chunks=4, gather_growth=1.0, compact_reqs=0)]
     jax.clear_caches()
     want = _walk(step, union_cap=CAP, min_context=1000, lean=True)
     np.testing.assert_array_equal(_bits(got), _bits(want))
@@ -829,6 +829,144 @@ def test_gathered_dispatch(kernels, monkeypatch):
                                                          listed="reference", gathered="reference", gather_chunks=2)))
 
 
+# --- the per-step compact pool (compact_reqs): the SparseCore takes at most 16 GiB per tensor --------------------------
+
+COMPACT = dict(group=64, listed="reference", gathered="reference", gather_chunks=2)
+
+
+def _record_compact_copies(monkeypatch):
+    """Runtime record of the compact copies that ran (count of pages per run): a lax.cond branch's copy shows up only
+    when that branch executes."""
+    ran = []
+    original = ud.compact_copy
+
+    def recording(pool, pairs, count, **kw):
+        out = original(pool, pairs, count, **kw)
+        jax.debug.callback(lambda c: ran.append(int(c)), count)
+        return out
+
+    monkeypatch.setattr(ud, "compact_copy", recording)
+    return ran
+
+
+@pytest.mark.parametrize("layout", [SPARE, WORST, A64])
+def test_compact_walk_is_the_gathered_walk(kernels, monkeypatch, layout):
+    """With every request inside compact_reqs, the gathered walk reads the per-step compact pool (the copy runs, the
+    gather's pool is the compact one) and is the plain gathered walk bit for bit."""
+    rows, cached = layout
+    tokens = 2048 if sum(-(-n // 256) * 256 for n in rows) > 1024 else 1024
+    step = _packed_step(211 + len(rows), rows, cached, tokens=tokens)
+    want = _walk(step, **COMPACT)
+    ran = _record_compact_copies(monkeypatch)
+    jax.clear_caches()
+    got = _walk(step, compact_reqs=8, **COMPACT)
+    jax.effects_barrier()
+    np.testing.assert_array_equal(_bits(got), _bits(want))
+    assert not np.array_equal(_bits(want), _bits(_served(step)))  # the walk ran
+    # each request's pages up to its longest row, copied once per walk
+    need = sum(-(-(c + n) // PAGE) for n, c in zip(rows, cached))
+    assert ran and set(ran) == {need}, (ran, need)
+
+
+def test_compact_overflow_takes_the_listed_walk(kernels, monkeypatch):
+    """A step with more requests than compact_reqs takes the listed walk on the full pool (no copy runs), which is
+    the gathered walk bit for bit."""
+    rows, cached = SPARE  # five requests
+    step = _packed_step(221, rows, cached)
+    want = _walk(step, **COMPACT)
+    ran = _record_compact_copies(monkeypatch)
+    jax.clear_caches()
+    got = _walk(step, compact_reqs=2, **COMPACT)
+    jax.effects_barrier()
+    np.testing.assert_array_equal(_bits(got), _bits(want))
+    assert ran == [], ran
+
+
+def test_compact_plan_pages(kernels):
+    """compact_plan: each live request's first pages (its longest row's reach) copied from its page row, live pairs
+    first; each live group's compact row is its request's slot; overflow is reported."""
+    rows, cached = SPARE
+    q, gate, blocks, lengths, table, pool, starts = _packed_step(223, rows, cached)
+    pairs, count, compact_rows, fits = ud.compact_plan(lengths, table, starts, group=1, reqs=8, tokens_per_entry=PAGE)
+    pairs, table_np, starts_np = np.asarray(pairs), np.asarray(table), np.asarray(starts)
+    width = table_np.shape[1]
+    need = [-(-(c + n) // PAGE) for n, c in zip(rows, cached)]
+    assert int(count) == sum(need) and bool(fits)
+    want = {(int(table_np[starts_np[r], j]), r * width + j) for r in range(len(rows)) for j in range(need[r])}
+    assert {tuple(x) for x in pairs[:int(count)].tolist()} == want
+    for r in range(len(rows)):
+        lo, hi = starts_np[r], starts_np[r + 1]
+        np.testing.assert_array_equal(np.asarray(compact_rows)[lo:hi], r * width + np.arange(width)[None, :].repeat(hi - lo, 0))
+    _, _, _, fits2 = ud.compact_plan(lengths, table, starts, group=1, reqs=3, tokens_per_entry=PAGE)
+    assert not bool(fits2)
+
+
+def test_compact_copy_moves_whole_pages(kernels):
+    rows, cached = SPARE
+    q, gate, blocks, lengths, table, pool, starts = _packed_step(225, rows, cached)
+    pairs, count, _, _ = ud.compact_plan(lengths, table, starts, group=1, reqs=8, tokens_per_entry=PAGE)
+    out = ud.compact_copy(pool, pairs, count, inflight=2)
+    p, n = np.asarray(pairs), int(count)
+    raw = lambda x: np.asarray(jax.lax.bitcast_convert_type(x, jnp.uint8))  # noqa: E731
+    np.testing.assert_array_equal(raw(out)[p[:n, 1]], raw(pool)[p[:n, 0]])
+
+
+def _sc_operand_bytes(jaxpr, out):
+    """Bytes of every array operand of every SparseCore kernel (mpmd_map) in a traced program, with its name."""
+    for eqn in jaxpr.eqns:
+        if eqn.primitive.name == "mpmd_map":
+            name = str(eqn.params.get("name", ""))
+            for v in eqn.invars:
+                aval = v.aval
+                if hasattr(aval, "shape") and hasattr(aval, "dtype"):
+                    out.append((name, int(np.prod(aval.shape)) * jnp.dtype(aval.dtype).itemsize))
+        for param in eqn.params.values():
+            for sub in param if isinstance(param, (tuple, list)) else (param,):
+                sub = getattr(sub, "jaxpr", sub)
+                if hasattr(sub, "eqns"):
+                    _sc_operand_bytes(sub, out)
+    return out
+
+
+def test_compact_sparsecore_operands_fit_16gib(kernels):
+    """On FR4's pool tensor (f8[9830, 3200, 1, 4, 256] = 32.2 GB, abstract), every SparseCore operand of the
+    compact gathered walk is at most 16 GiB; without compact_reqs the gather takes the 32.2 GB pool (FR4's failure)."""
+    q, gate, blocks, lengths, table, _, starts = _packed_step(227, *SPARE)
+    big = jax.ShapeDtypeStruct((9830, PAGE, 1, 4, 256), jnp.float8_e4m3fn)
+    limit = 16 * 1024**3
+
+    def traced(**options):
+        fn = lambda pool_: ud.union_walk_prefill(  # noqa: E731
+            q, gate, blocks, lengths, table, pool_, starts, kv_heads=2, ratio=RATIO, group=64, kv_tile=1024,
+            union_cap=CAP, min_context=0, lean=True, listed="sparsecore", gathered="sparsecore", gather_chunks=2,
+            **options)[0]
+        return _sc_operand_bytes(jax.make_jaxpr(fn)(big).jaxpr, [])
+
+    compact = traced(compact_reqs=8)
+    assert any("sc_gather" in n for n, _ in compact) and max(b for _, b in compact) <= limit, compact
+    plain = traced()
+    assert max(b for n, b in plain if "sc_gather" in n) > limit, plain
+
+
+def test_compact_args_and_dispatch(kernels, monkeypatch):
+    with pytest.raises(ValueError, match="compact_reqs"):
+        _walk(_packed_step(229, *SPARE), group=64, listed="reference", compact_reqs=4)
+    rows, cached = A64
+    step = _packed_step(231, rows, cached)
+    for name, value in (("VLLM_TPU_QSA_PREFILL_UNION_WALK", "64"), ("VLLM_TPU_QSA_PREFILL_UNION_MIN_CONTEXT", "0"),
+                        ("VLLM_TPU_QSA_PREFILL_UNION_LISTED", "reference"),
+                        ("VLLM_TPU_QSA_PREFILL_UNION_GATHERED", "reference"),
+                        ("VLLM_TPU_QSA_PREFILL_UNION_GATHER_CHUNKS", "2"),
+                        ("VLLM_TPU_QSA_PREFILL_UNION_COMPACT_REQS", "4")):
+        monkeypatch.setenv(name, value)
+    calls = _spy(monkeypatch)
+    got = _dispatch(step)
+    assert calls[0]["compact_reqs"] == 4, calls
+    jax.clear_caches()
+    np.testing.assert_array_equal(_bits(got), _bits(_walk(step, group=64, union_cap=calls[0]["union_cap"],
+                                                         listed="reference", gathered="reference", gather_chunks=2)))
+
+
 def test_full_stack_dispatch(kernels, monkeypatch):
     """The int-2 flags (G64, listed, share_bits, alpha 0.9, cap 16,384, qk16) reach union_walk_prefill and give the
     direct call's bits; without alpha and qk16 the stack is the plain G64 walk bit for bit (qk16 itself is gated
@@ -845,7 +983,7 @@ def test_full_stack_dispatch(kernels, monkeypatch):
     assert calls == [dict(kv_heads=2, ratio=RATIO, k_scale=1.0, v_scale=1.0, group=64, kv_tile=1024,
                           union_cap=16384, min_context=0, lean=True, listed="reference", share_bits=True,
                           union_alpha=0.9, qk16=False, run_tables=False, lazy_share=False, gathered=None,
-                          gather_chunks=4, gather_growth=1.0)]
+                          gather_chunks=4, gather_growth=1.0, compact_reqs=0)]
     stack = dict(group=64, union_cap=16384, listed="reference", share_bits=True)
     jax.clear_caches()
     np.testing.assert_array_equal(_bits(got), _bits(_walk(step, union_alpha=0.9, **stack)))

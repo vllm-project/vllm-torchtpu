@@ -1829,7 +1829,7 @@ def union_walk_prefill(query, gate, blocks, lengths, table, cache, starts, *, kv
                        k_scale=1.0, v_scale=1.0, group=128, kv_tile=1024, union_cap, min_context,
                        lean, walk_runs=0, union_alpha=0.0, share_bits=False, qk16=False, listed=None,
                        run_tables=False, max_run=8, lazy_share=False, gathered=None, gather_chunks=4,
-                       gather_growth=1.0):
+                       gather_growth=1.0, compact_reqs=0):
     """D2 union-walk attention for a packed prefill step; ``(gated bf16 output, cache)``.
 
     Same contract as ``block_sparse_gqa_attention`` without ``return_lse``.
@@ -1911,6 +1911,8 @@ def union_walk_prefill(query, gate, blocks, lengths, table, cache, starts, *, kv
         raise ValueError("run_tables needs listed='reference' or 'sparsecore' (the builders' source)")
     if gathered not in (None, "reference", "sparsecore"):
         raise ValueError("gathered: None, 'reference' (XLA gather) or 'sparsecore' (union_sc_gather)")
+    if int(compact_reqs) < 0 or (compact_reqs and not gathered):
+        raise ValueError("compact_reqs (the per-step compact pool) needs gathered=")
     if gathered and (listed is None or run_tables or int(gather_chunks) < 1 or not float(gather_growth) >= 1.0):
         raise ValueError("gathered needs listed='reference' or 'sparsecore' (the list), no run_tables, chunks >= 1, "
                          "growth >= 1")
@@ -1985,6 +1987,8 @@ def union_walk_prefill(query, gate, blocks, lengths, table, cache, starts, *, kv
         page_rows = aligned_table.reshape(-1, group, aligned_table.shape[1])[:, 0]
 
         def kernel():
+            if compact_reqs:
+                return compact_or_listed()
             ids = None
             if listed == "reference":
                 rows, ids = union_gather_list_reference(ubits, usize, page_rows, ratio=ratio, page_size=page_size,
@@ -2027,6 +2031,44 @@ def union_walk_prefill(query, gate, blocks, lengths, table, cache, starts, *, kv
                 union_cap=union_cap, kv_tile=kv_tile, ratio=ratio, k_scale=k_scale,
                 v_scale=v_scale, lean=lean, fast_walk=True, walk_runs=walk_runs, qk16=qk16, listed=ids,
             )
+
+        def listing(rows_of_groups):
+            if listed == "reference":
+                return union_gather_list_reference(ubits, usize, rows_of_groups, ratio=ratio, page_size=page_size,
+                                                   union_cap=union_cap, kv_tile=kv_tile)
+            from vllm_torchtpu.kernels.qwen4_exp.qsa_union_sc_gather import union_sc_list_pages
+
+            return union_sc_list_pages(ubits, usize, rows_of_groups, ratio=ratio, page_size=page_size,
+                                       union_cap=union_cap, kv_tile=kv_tile)
+
+        def compact_or_listed():
+            # The SparseCore takes at most 16 GiB per tensor: gather from a per-step compact pool of the step's first
+            # compact_reqs requests' pages (whole-page copies); a step with more requests takes the listed walk on
+            # the full pool, which is the gathered walk bit for bit.
+            pairs, count, compact_rows, fits_c = compact_plan(
+                aligned_lengths, aligned_table, starts if max_tokens is None else offsets, group=group,
+                reqs=int(compact_reqs), tokens_per_entry=page_size)
+
+            def compact_branch():
+                _COMPACT_RAN.append(int(tokens))  # trace-time record (tests)
+                pool_c = compact_copy(cache, pairs, count)
+                rows, ids = listing(compact_rows)
+                return _gathered_chunks(
+                    aligned_query, bits, ubits, usize, vlengths, cache, page_rows, rows, ids, gathered=gathered,
+                    chunks=int(gather_chunks), growth=float(gather_growth), group=group, union_cap=union_cap,
+                    kv_tile=kv_tile, ratio=ratio, k_scale=k_scale, v_scale=v_scale, lean=lean, qk16=qk16,
+                    gather_pool=pool_c,
+                )
+
+            def listed_branch():
+                _, ids = listing(page_rows)
+                return union_walk_kernel(
+                    aligned_query, bits, ubits, usize, vlengths, cache, page_rows, group=group,
+                    union_cap=union_cap, kv_tile=kv_tile, ratio=ratio, k_scale=k_scale,
+                    v_scale=v_scale, lean=lean, fast_walk=True, qk16=qk16, listed=ids,
+                )
+
+            return lax.cond(fits_c, compact_branch, listed_branch)
 
         if lazy:
             def served_lazy():
@@ -2096,6 +2138,79 @@ _WALK_TRACED = {}  # step rows -> min_context, recorded when union_walk_prefill 
 _ENGAGEMENT = {"steps": 0, "eligible": 0}
 
 
+def compact_plan(aligned_lengths, aligned_table, bounds, *, group, reqs, tokens_per_entry):
+    """The per-step compact pool for the SparseCore gather (FR4: the SparseCore takes at most 16 GiB per tensor, and
+    a 60 GiB staging pool makes each pool tensor 32.2 GB).
+
+    Request r < ``reqs`` owns compact pages [r * P, r * P + P) (P = the page-table width); its first ``need_r`` pages
+    (enough for its longest row) are copied from its page row. Returns ``(pairs, count, compact_rows, fits)``:
+    ``pairs`` int32[reqs * P, 2] (source page, compact page), the ``count`` live copies first; ``compact_rows``
+    int32[ngroups, P], each query group's page row in the compact pool (dead groups: request 0's); ``fits``: every
+    live group belongs to a request below ``reqs`` (else the caller takes the listed walk on the full pool).
+    ``bounds`` int32[R + 1]: request starts in the layout's rows.
+    """
+    rows, width = aligned_table.shape
+    row_req = jnp.searchsorted(bounds[1:], jnp.arange(rows), side="right").astype(jnp.int32)
+    group_req = row_req.reshape(-1, group)[:, 0]
+    group_live = jnp.any((aligned_lengths > 0).reshape(-1, group), axis=1)
+    fits = jnp.all(~group_live | (group_req < reqs))
+    capped = jnp.where(row_req < reqs, row_req, reqs)
+    longest = jax.ops.segment_max(aligned_lengths.astype(jnp.int32), capped, num_segments=reqs + 1)[:reqs]
+    need = jnp.where(longest > 0, (jnp.maximum(longest, 0) + tokens_per_entry - 1) // tokens_per_entry, 0)
+    first = jnp.clip(jnp.pad(bounds, (0, max(0, reqs + 1 - bounds.shape[0])), mode="edge")[:reqs], 0, rows - 1)
+    src = aligned_table[first].astype(jnp.int32)  # [reqs, P]: each request's page row
+    live = (jnp.arange(width)[None, :] < need[:, None]).reshape(-1)
+    dst = jnp.arange(reqs * width, dtype=jnp.int32)
+    order = jnp.argsort(~live, stable=True)
+    pairs = jnp.stack([src.reshape(-1)[order], dst[order]], axis=1)
+    compact_rows = (jnp.where(group_live & (group_req < reqs), group_req, 0)[:, None] * width
+                    + jnp.arange(width, dtype=jnp.int32)[None, :])
+    return pairs, jnp.sum(live).astype(jnp.int32), compact_rows, fits
+
+
+def _compact_copy_kernel(pairs_ref, count_ref, pool_hbm, out_hbm, sem, *, inflight):
+    count = count_ref[0]
+
+    def copy(i):
+        return pltpu.make_async_copy(pool_hbm.at[pairs_ref[i, 0]], out_hbm.at[pairs_ref[i, 1]], sem)
+
+    def start(i, carry):
+        copy(i).start()
+
+        @pl.when(i >= inflight)
+        def _():
+            copy(i - inflight).wait()  # a same-size copy: the wait only counts bytes
+
+        return carry
+
+    lax.fori_loop(0, count, start, None)
+
+    def drain(i, carry):
+        copy(i).wait()
+        return carry
+
+    lax.fori_loop(jnp.maximum(count - inflight, 0), count, drain, None)
+
+
+def compact_copy(pool, pairs, count, *, inflight=8):
+    """The compact pool: ``pool[pairs[i, 0]]`` copied to page ``pairs[i, 1]`` for the first ``count`` pairs (whole-page
+    HBM DMAs, at most ``inflight`` in flight); other pages are left unwritten (the list never points at them)."""
+    pages, page_size, head_axis, packing, dim = pool.shape
+    slots = pairs.shape[0]
+    return pl.pallas_call(
+        functools.partial(_compact_copy_kernel, inflight=int(inflight)),
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=2,
+            grid=(1,),
+            in_specs=[pl.BlockSpec(memory_space=pltpu.HBM)],
+            out_specs=pl.BlockSpec(memory_space=pltpu.HBM),
+            scratch_shapes=[pltpu.SemaphoreType.DMA],
+        ),
+        out_shape=jax.ShapeDtypeStruct((slots, page_size, head_axis, packing, dim), pool.dtype),
+        name="qsa_union_compact_pool",
+    )(pairs.astype(jnp.int32), count.reshape(1).astype(jnp.int32), pool)
+
+
 def gather_chunk_bounds(ngroups, chunks, growth=1.0):
     """[(g0, g1)]: the gathered walk's chunks of whole query groups, in order, covering [0, ngroups) once.
 
@@ -2120,20 +2235,21 @@ def gather_chunk_bounds(ngroups, chunks, growth=1.0):
 
 
 def _gathered_chunks(query, bits, ubits, usize, vlengths, cache, page_rows, rows, ids, *, gathered, chunks, group,
-                     union_cap, kv_tile, ratio, k_scale, v_scale, lean, qk16, growth=1.0):
+                     union_cap, kv_tile, ratio, k_scale, v_scale, lean, qk16, growth=1.0, gather_pool=None):
     """``union_walk_prefill(gathered=...)``: per chunk of whole query groups, gather the chunk's union tiles from
     the list (``rows``/``ids``), then run the walk-free kernel on them; outputs concatenated in group order."""
     ngroups = ubits.shape[0]
+    source = cache if gather_pool is None else gather_pool  # the gather's pool (``rows`` index it); the kernel reads tiles
     outs = []
     for g0, g1 in gather_chunk_bounds(ngroups, chunks, growth):
         sl, rs = slice(g0, g1), slice(g0 * group, g1 * group)
         if gathered == "sparsecore":
             from vllm_torchtpu.kernels.qwen4_exp.qsa_union_sc_gather import union_sc_gather
 
-            tiles = union_sc_gather(cache, bits[sl], rows[sl], ids[sl], ratio=ratio, line_matmul=True,
+            tiles = union_sc_gather(source, bits[sl], rows[sl], ids[sl], ratio=ratio, line_matmul=True,
                                     usize=usize[sl], kv_tile=kv_tile)
         else:
-            tiles = union_gather_reference(cache, bits[sl], rows[sl], ids[sl], ratio=ratio, line_matmul=True)
+            tiles = union_gather_reference(source, bits[sl], rows[sl], ids[sl], ratio=ratio, line_matmul=True)
         outs.append(union_walk_kernel(
             query[rs], bits[sl], ubits[sl], usize[sl], vlengths[rs], cache, page_rows[sl], group=group,
             union_cap=union_cap, kv_tile=kv_tile, ratio=ratio, k_scale=k_scale, v_scale=v_scale, lean=lean,
@@ -2143,6 +2259,7 @@ def _gathered_chunks(query, bits, ubits, usize, vlengths, cache, page_rows, rows
 
 
 _WALK_ALIGN = {}  # step rows -> (walk layout alignment, lazy_share), recorded at trace time (tests)
+_COMPACT_RAN = []  # step rows of each compact-pool branch traced (tests)
 
 
 def _served_words(*, groups_cap, ratio, served_kt):
