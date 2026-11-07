@@ -1,0 +1,29 @@
+{
+  "schema": "advisor.measurements.v1",
+  "source": {
+    "kind": "xplane",
+    "file": "tpu7x_qwen3_30b_a3b_fp8_tp8_ep8",
+    "chip": "tpu7x",
+    "phase": "decode",
+    "model": "Qwen/Qwen3-30B-A3B-FP8",
+    "tp": 8,
+    "ep": 8,
+    "ranks": 8
+  },
+  "collectives": [
+    {
+      "op": "all-gather",
+      "group_size": 8,
+      "bytes": 0,
+      "latency_us": 24.2954,
+      "n": 416
+    },
+    {
+      "op": "all-reduce",
+      "group_size": 8,
+      "bytes": 0,
+      "latency_us": 11.7838,
+      "n": 40336
+    }
+  ]
+}

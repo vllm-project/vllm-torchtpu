@@ -33,6 +33,7 @@ from . import (
     advise,
     advise_regimes,
     calibrate_trace,
+    chips,
     recommend_parallelism,
     resolve_chip_spec,
 )
@@ -106,7 +107,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--measurements",
         type=str,
         default=None,
-        help="Path to calibrated advisor.measurements.v1 JSON file",
+        help=(
+            "Path to calibrated advisor.measurements.v1 JSON file, or "
+            "'bundled'/'auto' to load bundled public chip priors"
+        ),
     )
     parser.add_argument("--ici-bw-gbps", type=float, default=None)
     parser.add_argument("--collective-latency-us", type=float, default=None)
@@ -245,6 +249,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         tp_val = args.tp
         ep_val = args.ep if args.ep is not None else 1
 
+    measurements_val = args.measurements
+    if measurements_val in ("bundled", "auto"):
+        bundled_path = chips.public_calibration_path(chip_spec.name)
+        if bundled_path is None:
+            msg = (
+                f"No bundled public calibration available for chip '{chip_spec.name}'. "
+                "Specify a custom path to --measurements."
+            )
+            raise errors.MegakernelConfigError(msg)
+        measurements_val = str(bundled_path)
+
     if args.html or args.regime_sweep:
         sweep = advise_regimes(
             profile,
@@ -261,7 +276,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             vmem_budget_mib=args.vmem_budget_mib,
             dma_buffers=args.dma_buffers,
             deployment_preset=args.deployment_preset,
-            measurements=args.measurements,
+            measurements=measurements_val,
             objective=args.objective,
         )
         if args.html:
@@ -294,7 +309,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         profile,
         WorkloadSpec(**wl_kwargs),
         chip_spec,
-        measurements=args.measurements,
+        measurements=measurements_val,
     )
     if args.json is not None:
         _emit_json(report.to_dict(), args.json)
