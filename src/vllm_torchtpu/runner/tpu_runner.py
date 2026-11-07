@@ -3200,11 +3200,10 @@ class TPUModelRunner(GPUModelRunner):
         # requests have zero length instead of a negative q_len.
         self.query_start_loc_np[num_reqs + 1 :] = self.query_start_loc_np[num_reqs]
 
-        self.seq_lens_np[:num_reqs] = (
-            self.input_batch.num_computed_tokens_cpu[
-                start_index : start_index + num_reqs
-            ]
-            + num_scheduled_tokens_per_req
+        fill_step_seq_lens(
+            self.seq_lens_np,
+            self.input_batch.num_computed_tokens_cpu[start_index : start_index + num_reqs],
+            num_scheduled_tokens_per_req,
         )
         self._check_attention_schedule(
             num_reqs,
@@ -8598,6 +8597,19 @@ def _get_req_paddings(min_req_size: int, max_req_size: int) -> list[int]:
         logger.info("    %d", num)
         num = _get_padded_num_reqs_with_upper_limit(num + 1, max_req_size)
     return paddings
+
+
+def fill_step_seq_lens(seq_lens_np, num_computed, num_scheduled) -> None:
+    """This step's per-request sequence lengths, and zero for every padded slot.
+
+    The padded slots used to keep the lengths of earlier, longer steps. Kernels
+    mask them by their zero query length, but a batch-wide maximum (the QSA
+    indexer's short-context fast path, ``max(seq_lens) // ratio <= k``) read the
+    stale values and could take the scored path for a short step.
+    """
+    n = len(num_scheduled)
+    seq_lens_np[:n] = num_computed + num_scheduled
+    seq_lens_np[n:] = 0
 
 
 def _get_padded_num_reqs_with_upper_limit(x: int, upper_limit: int) -> int:
