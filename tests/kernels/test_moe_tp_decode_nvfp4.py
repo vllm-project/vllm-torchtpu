@@ -2190,15 +2190,6 @@ def _load_runtime_modules(monkeypatch):
         select_bias=lambda *_a, **_k: None,
     )
     _put_mod(
-        "vllm_torchtpu.kernels.experimental.fused_moe_prefill",
-        fused_moe_prefill=lambda *a, **_k: a[0],
-        plan_blocks=lambda *_a, **_k: None,
-    )
-    _put_mod(
-        "vllm_torchtpu.kernels.experimental.fused_moe_prefill.fused_moe_prefill_kernel_v2",
-        fused_moe_prefill_stage_a=lambda *a, **_k: a[0],
-    )
-    _put_mod(
         "vllm_torchtpu.layers.adapter.fused_moe",
         TpuMoEActivationMixin=_TpuMoEActivationMixin,
         fused_moe_gmm=lambda **_k: "gmm_out",
@@ -3105,15 +3096,6 @@ def _load_precedence_modules(monkeypatch):
         "vllm_torchtpu.kernels.router_topk",
         select=lambda *_a, **_k: None,
         select_bias=lambda *_a, **_k: None,
-    )
-    _put_mod(
-        "vllm_torchtpu.kernels.experimental.fused_moe_prefill",
-        fused_moe_prefill=lambda *a, **_k: a[0],
-        plan_blocks=lambda *_a, **_k: None,
-    )
-    _put_mod(
-        "vllm_torchtpu.kernels.experimental.fused_moe_prefill.fused_moe_prefill_kernel_v2",
-        fused_moe_prefill_stage_a=lambda *a, **_k: a[0],
     )
 
     linear_mod = sys.modules["vllm_torchtpu.layers.adapter.linear_common"]
