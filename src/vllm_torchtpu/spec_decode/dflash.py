@@ -295,9 +295,8 @@ class DFlashProposer:
 
         Drafters opt in (`shards_draft_kv_over_dcp`), for sliding-window
         layers. ``--additional-config '{"draft_kv_over_dcp": ...}'`` picks
-        ``"sharded"``, ``"replicated"`` or ``"auto"`` (default: sharded when
-        the DCP group is wider than a draft KV head's replicas, where a
-        replicated draft costs the most HBM).
+        ``"sharded"``, ``"replicated"`` or ``"auto"`` (default: sharded under
+        any DCP; v23 A/B at DCP 2: c16 neutral, c48 +17% tok/s/chip).
         """
         additional = self.vllm_config.additional_config
         mode = (additional if isinstance(additional, dict) else {}).get(
@@ -313,10 +312,8 @@ class DFlashProposer:
         shard = (
             opted_in
             and attn_impl.sliding_window is not None
-            and (
-                mode == "sharded"
-                or (mode == "auto" and dcp > self._draft_kv_head_replicas())
-            )
+            and dcp > 1
+            and mode != "replicated"
         )
         logger.info_once(
             "Draft KV under DCP: %s (%s=%s, opt-in=%s, draft=%s, sliding_window=%s, causal=%s)",
