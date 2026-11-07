@@ -16,7 +16,7 @@ import jax
 from jax.sharding import PartitionSpec as P
 
 from vllm_torchtpu import envs
-from vllm_torchtpu.kernels.gdn.v3.input_layout import Conv1DInput
+from vllm_torchtpu.kernels.gdn.v3.input_layout import Conv1DInput, QKVColumns
 from vllm_torchtpu.kernels.qwen4_exp.gdn_input import (
     compact_qkv_input,
     supports_compact_qkv,
@@ -30,8 +30,11 @@ _MODEL_AXIS = "model"
 
 
 def prepare_gdn_input(
-    qkv: jax.Array, request_capacity: int, mesh: jax.sharding.Mesh
-) -> jax.Array | Conv1DInput:
+    qkv: jax.Array,
+    request_capacity: int,
+    mesh: jax.sharding.Mesh,
+    qkv_cols: int | None = None,
+) -> jax.Array | Conv1DInput | QKVColumns:
     """Prepare chunked Qwen inputs without branching on device metadata.
 
     Buckets with at most one token per request slot keep the original input.
@@ -42,7 +45,15 @@ def prepare_gdn_input(
     input: the GDN v3 kernel streams the bf16 rows of buckets past the request
     capacity into its PER_SEQ tiles and casts them in VMEM, so no f32 copy is
     written here.
+
+    `qkv_cols`: the conv-input width when `qkv` is the whole qkvz projection
+    (VLLM_TPU_GDN_PREFILL_QKV_FROM_PROJ). Prefill buckets on the 2D path take it
+    as QKVColumns (the kernel DMAs the columns); every other bucket is sliced.
     """
+    if qkv_cols is not None and qkv.shape[-1] != qkv_cols:
+        if envs.VLLM_TPU_GDN_PREFILL_BF16_QKV_2D and qkv.shape[0] > request_capacity:
+            return QKVColumns(qkv, qkv_cols)
+        qkv = qkv[:, :qkv_cols]
     if envs.VLLM_TPU_GDN_PREFILL_BF16_QKV_2D:
         return qkv
     tokens, width = qkv.shape
@@ -64,6 +75,10 @@ def prepare_gdn_input(
 class Qwen4ExpGatedDeltaNetAttention(VllmGatedDeltaNetAttention):
     """Qwen input preparation with the shared GDN operator and state handling."""
 
+    # The pooled op may receive the whole in_proj_qkvz output
+    # (VLLM_TPU_GDN_PREFILL_QKV_FROM_PROJ); _prepare_pooled_gdn_input narrows it.
+    pooled_qkvz_input = True
+
     def _prepare_pooled_gdn_input(
         self,
         mixed_qkv: jax.Array,
@@ -73,6 +88,7 @@ class Qwen4ExpGatedDeltaNetAttention(VllmGatedDeltaNetAttention):
         # Speculative verify windows hold up to num_spec + 1 tokens per
         # request; keep them on the ordinary windowed-input layout, as the
         # shared GDN operator runs them for every other hybrid model.
+        qkv_cols = self.tp_head_geometry.local_conv_dim(self.head_k_dim, self.head_v_dim)
         return prepare_gdn_input(
-            mixed_qkv, seq_lens.shape[0] * (self.num_spec + 1), mesh
+            mixed_qkv, seq_lens.shape[0] * (self.num_spec + 1), mesh, qkv_cols
         )

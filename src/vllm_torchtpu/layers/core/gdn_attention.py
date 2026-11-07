@@ -38,7 +38,7 @@ from vllm_torchtpu.kernels.gdn.head_geometry import (
 )
 from vllm_torchtpu.kernels.gdn.v3 import pcp_wrapper as gdn_v3_pcp_wrapper
 from vllm_torchtpu.kernels.gdn.v3 import wrapper as gdn_v3_wrapper
-from vllm_torchtpu.kernels.gdn.v3.input_layout import Conv1DInput
+from vllm_torchtpu.kernels.gdn.v3.input_layout import Conv1DInput, QKVColumns
 from vllm_torchtpu.utils import get_mesh_shape_product
 
 _GDN_TP_AXIS_NAME = "tp"
@@ -924,7 +924,7 @@ def run_jax_gdn_attention_pooled_local(
     )
     num_rows = (
         mixed_qkv.values.shape[0]
-        if isinstance(mixed_qkv, Conv1DInput)
+        if isinstance(mixed_qkv, Conv1DInput | QKVColumns)
         else mixed_qkv.shape[0]
     )
     zero_initialize_out = pooled_gdn_zero_initialize_out(
@@ -1031,6 +1031,9 @@ def run_jax_gdn_attention_pooled(
         (
             jax.tree.map(lambda _: P(None, None, "model"), j_mixed_qkv)
             if isinstance(j_mixed_qkv, Conv1DInput)
+            # QKVColumns: the whole qkvz projection, only taken at TP1.
+            else jax.tree.map(lambda _: P(None, "model"), j_mixed_qkv)
+            if isinstance(j_mixed_qkv, QKVColumns)
             else P(None, "model")
         ),  # j_mixed_qkv
         P(None, "model"),  # j_b

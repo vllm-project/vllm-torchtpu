@@ -198,10 +198,16 @@ class InBufferedRef(BaseBufferedRef):
 
         if src_ref.ndim == 2:
             # 2D bf16 qkv rows (GDNConfig.qkv_2d): one aligned DMA per tile.
+            # A wider source (QKVColumns: the whole qkvz projection) gives up
+            # its first dim_size columns, a lane-tile aligned strided DMA.
+            cols = (
+                () if src_ref.shape[-1] == self.cfg.dim_size
+                else (pl.ds(0, self.cfg.dim_size),)
+            )
             for idx in range(self.cfg.seq_tile_size):
                 row0, dma_rows = qkv_2d_rows(self.metadata_ref, p_id, idx)
                 pltpu.make_async_copy(
-                    src_ref.at[pl.ds(row0, dma_rows)],
+                    src_ref.at[(pl.ds(row0, dma_rows),) + cols],
                     vmem_ref.at[idx, pl.ds(0, dma_rows)],
                     sem,
                 ).start()

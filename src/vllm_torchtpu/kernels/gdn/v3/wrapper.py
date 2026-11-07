@@ -32,7 +32,7 @@ from vllm_torchtpu.kernels.gdn.v3 import (
     tiling,
     vmem_ldst,
 )
-from vllm_torchtpu.kernels.gdn.v3.input_layout import Conv1DInput
+from vllm_torchtpu.kernels.gdn.v3.input_layout import Conv1DInput, QKVColumns
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
@@ -762,6 +762,15 @@ def fused_conv1d_gdn(
             source (aliased in place) instead of the state pair.
         out: Fused output tensor.
     """
+    # QKVColumns: the conv input is the first `cols` columns of a wider bf16
+    # projection. The 2D PER_SEQ kernel DMAs those columns in place; every
+    # other path slices them out below.
+    qkv_cols = None
+    if isinstance(qkv, QKVColumns):
+        qkv_cols = qkv.cols
+        qkv = qkv.values
+        if qkv.ndim != 2 or not 0 < qkv_cols <= qkv.shape[1]:
+            raise ValueError("QKVColumns requires [tokens, width >= cols]")
     # Conv1D consumes FP32 while outputs retain the projection activation dtype.
     prepared_qkv = isinstance(qkv, Conv1DInput)
     if isinstance(qkv, Conv1DInput):
@@ -796,7 +805,7 @@ def fused_conv1d_gdn(
     decode_capacity = state_indices.size * (num_spec_tokens + 1)
     qkv_2d = not prepared_qkv and bf16_qkv_2d_eligible(
         enabled=bf16_qkv_2d,
-        shape=qkv.shape,
+        shape=(qkv.shape[0], qkv_cols or qkv.shape[1]),
         dtype=qkv.dtype,
         decode_capacity=decode_capacity,
         mixed_tile_size=min(mixed_tile_size, qkv.shape[0]),
@@ -805,6 +814,9 @@ def fused_conv1d_gdn(
         batched_only=batched_only,
     )
 
+    if qkv_cols is not None and not qkv_2d:
+        qkv = qkv[:, :qkv_cols]
+        qkv_cols = None
     if not prepared_qkv and not qkv_2d:
         qkv = qkv.astype(jnp.float32)
     b = b.astype(jnp.float32)
@@ -830,7 +842,7 @@ def fused_conv1d_gdn(
             )
 
     num_seqs = state_indices.size
-    batch_size, dim = qkv.shape[0], qkv.shape[-1]
+    batch_size, dim = qkv.shape[0], (qkv_cols or qkv.shape[-1])
     if conv_weight_kmajor:
         # Already float32 in the kernel's [kernel_size, 1, dim] order.
         assert conv_weight.shape == (kernel_size, 1, dim)
@@ -899,7 +911,7 @@ def fused_conv1d_gdn(
             # The VMEM fit can cap the chunk below a multiple of 8, which 2D
             # rows do not take; the 16-padded tokens still suit f32 rows.
             qkv_2d = False
-            qkv = qkv.astype(jnp.float32)
+            qkv = qkv[:, :dim].astype(jnp.float32)
         logger.info_once(
             "GDN dynamic tiling: num_seqs=%d batch=%d window=%d -> T=%d C=%d",
             num_seqs,
@@ -956,7 +968,7 @@ def fused_conv1d_gdn(
     # so they all lie in the leading `decode_capacity` rows: cast only those.
     batched_qkv = qkv
     if qkv_2d and not prefill_only:
-        batched_qkv = qkv[:decode_capacity].astype(jnp.float32)
+        batched_qkv = qkv[:decode_capacity, :dim].astype(jnp.float32)
         batched_qkv = batched_qkv.reshape(decode_capacity, 1, dim)
 
     # Step 3: States and weights pre-processing.

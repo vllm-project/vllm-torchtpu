@@ -29,3 +29,16 @@ class Conv1DInput:
 
     values: jax.Array
     output_dtype: jnp.dtype = dataclasses.field(metadata={"static": True})
+
+
+@jax.tree_util.register_dataclass
+@dataclasses.dataclass(frozen=True)
+class QKVColumns:
+    """The bf16 [tokens, width] projection whose first `cols` columns are the
+    conv input (q | k | v of a fused qkvz projection; VLLM_TPU_GDN_PREFILL_QKV_
+    FROM_PROJ). With 2D bf16 rows the PER_SEQ kernel DMAs those columns straight
+    from it, so no [tokens, cols] copy is made; otherwise the wrapper slices.
+    """
+
+    values: jax.Array
+    cols: int = dataclasses.field(metadata={"static": True})

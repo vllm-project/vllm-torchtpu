@@ -111,6 +111,7 @@ if TYPE_CHECKING:
     VLLM_TPU_GDN_CONV_WEIGHT_KMAJOR: bool = False
     VLLM_TPU_GDN_PREFILL_BF16_QKV_2D: bool = False
     VLLM_TPU_GDN_PREFILL_DENSE_CONV: bool = False
+    VLLM_TPU_GDN_PREFILL_QKV_FROM_PROJ: bool = False
     TPU_ENABLE_GDN_DYNAMIC_TILING: bool = False
     VLLM_TPU_QSA_DECODE_QUERY_BLOCK: int = 0
     VLLM_TPU_QSA_TOPK_STATS: int = 0
@@ -572,6 +573,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # instead of on the one-row-per-vreg compact layout (Qwen3.5's
     # TPU_GDN_PREFILL_DENSE_CONV, translated to q38's pooled GDN v3).
     "VLLM_TPU_GDN_PREFILL_DENSE_CONV": env_bool("VLLM_TPU_GDN_PREFILL_DENSE_CONV"),
+    # With VLLM_TPU_GDN_PREFILL_BF16_QKV_2D, at TP1, for models that opt in
+    # (qwen4_exp): hand the pooled GDN op the whole in_proj_qkvz output and let
+    # the PER_SEQ kernel DMA the q|k|v columns from it, instead of copying the
+    # [tokens, qkv] slice out at the op boundary (as_strided.qkv_ref).
+    "VLLM_TPU_GDN_PREFILL_QKV_FROM_PROJ": env_bool("VLLM_TPU_GDN_PREFILL_QKV_FROM_PROJ"),
     # Size GDN v3 decode tiles and prefill chunks from per-rank heads, active
     # sequences and the VMEM estimate (kernels/gdn/v3/tiling.py) instead of
     # the fixed defaults.

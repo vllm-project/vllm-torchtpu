@@ -673,3 +673,70 @@ def test_dense_conv_matches_compact_rows_bitwise(
             np.testing.assert_array_equal(
                 g.view(np.uint8), e.view(np.uint8), err_msg=f"dense vs {ref_name}: {name} differs"
             )
+
+
+# --------------------------------------------------------------------------
+# q|k|v columns straight from the qkvz projection (VLLM_TPU_GDN_PREFILL_QKV_FROM_PROJ).
+
+from vllm_torchtpu.kernels.gdn.v3.input_layout import QKVColumns  # noqa: E402
+
+
+def _with_z(args, extra=256, seed=9):
+    """args with qkv widened by `extra` z columns; returns (qkvz args, qkv width)."""
+    qkv = args["qkv"]
+    z = jax.random.normal(jax.random.key(seed), (qkv.shape[0], extra), jnp.float32).astype(qkv.dtype)
+    return dict(args, qkv=QKVColumns(jnp.concatenate([qkv, z], axis=1), qkv.shape[1])), qkv.shape[1]
+
+
+def test_qkv_columns_route_whole_projection_to_per_seq():
+    """Under 2D rows the PER_SEQ kernel takes the whole [T, qkv + z] bf16
+    projection (strided DMA of its q|k|v columns, no copy); off the 2D path the
+    wrapper slices, so the kernels see today's operands."""
+    args, states, static = _small_case(_Q_LOC, 2, _T, _SLOTS)
+    wide, _ = _with_z(args)
+    kw = dict(decode_tile_size=2, mixed_tile_size=16)
+    routes = _routes(wide, states, static, bf16_qkv_2d=True, **kw)
+    assert routes[-1] == ("per", ("bfloat16", (_T_2D, _DIM + 256))), routes
+    assert routes[:-1] == _routes(args, states, static, bf16_qkv_2d=True, **kw)[:-1]
+    assert _routes(wide, states, static, bf16_qkv_2d=False, **kw) == _routes(
+        args, states, static, bf16_qkv_2d=False, **kw
+    )
+
+
+@pytest.mark.parametrize("dense", [False, True])
+@pytest.mark.parametrize(
+    "q_loc,num_decode,tokens,slots,chunk,fresh",
+    [(_Q_LOC, 2, _T, _SLOTS, 16, ()), ((0, 15, 47, 81), 0, 96, 4, 32, (0,))],
+)
+def test_qkv_columns_match_sliced_qkv_bitwise(monkeypatch, dense, q_loc, num_decode, tokens, slots, chunk, fresh):
+    monkeypatch.setattr(vmem_ldst, "load_strided_heads", _strided_heads_by_value)
+    monkeypatch.setattr(vmem_ldst, "load_compact_to_large", _compact_to_large_by_value)
+    args, states, static = _small_case(q_loc, num_decode, tokens, slots, fresh, seed=11)
+    wide, _ = _with_z(args)
+    kw = dict(decode_tile_size=2, mixed_tile_size=chunk, dense_conv=dense)
+    for two_d in (True, False):
+        ref = _interpret(args, states, static, bf16_qkv_2d=two_d, **kw)
+        got = _interpret(wide, states, static, bf16_qkv_2d=two_d, **kw)
+        (rc, rr), ro = ref
+        (gc, gr), go = got
+        for name, g, e in (("out", go, ro), ("conv_state", gc, rc), ("recurrent_state", gr, rr)):
+            np.testing.assert_array_equal(g.view(np.uint8), e.view(np.uint8), err_msg=f"2d={two_d}: {name}")
+
+
+def test_prepare_gdn_input_qkv_columns(monkeypatch):
+    from vllm_torchtpu.models.vllm.qwen4_exp.gdn import prepare_gdn_input
+
+    mesh = jax.sharding.Mesh(np.array(jax.devices()[:1]), ("model",))
+    qkvz = jnp.zeros((256, 16384), jnp.bfloat16)
+    monkeypatch.setattr(envs, "VLLM_TPU_GDN_PREFILL_BF16_QKV_2D", True)
+    got = prepare_gdn_input(qkvz, 4, mesh, 10240)
+    assert isinstance(got, QKVColumns) and got.values is qkvz and got.cols == 10240
+    # Decode-sized buckets are sliced to the conv width.
+    assert prepare_gdn_input(qkvz, 256, mesh, 10240).shape == (256, 10240)
+    monkeypatch.setattr(envs, "VLLM_TPU_GDN_PREFILL_BF16_QKV_2D", False)
+    prepared = jax.eval_shape(lambda x: prepare_gdn_input(x, 4, mesh, 10240), qkvz)
+    assert isinstance(prepared, Conv1DInput) and prepared.values.shape == (256, 1, 10240)
+    # Already the conv width: unchanged behaviour.
+    qkv = jnp.zeros((256, 10240), jnp.bfloat16)
+    monkeypatch.setattr(envs, "VLLM_TPU_GDN_PREFILL_BF16_QKV_2D", True)
+    assert prepare_gdn_input(qkv, 4, mesh, 10240) is qkv

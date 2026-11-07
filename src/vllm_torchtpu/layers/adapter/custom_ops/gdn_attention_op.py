@@ -373,6 +373,11 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
     # Class-level defaults support test/mock instances constructed without `__init__`.
     _bm_kernel: bool = False
     _pooled_conv_state_dtype: torch.dtype = torch.bfloat16
+    # Subclasses whose _prepare_pooled_gdn_input narrows a whole qkvz
+    # projection set this; VLLM_TPU_GDN_PREFILL_QKV_FROM_PROJ then hands the
+    # pooled op in_proj_qkvz's output instead of a copied q|k|v slice.
+    pooled_qkvz_input: bool = False
+    _pooled_pass_qkvz: bool = False
     _bm_region: tuple[int, BlockMajorPoolLayout] | None = None
 
     # Narrowed to the layer that _create_conv1d installs.
@@ -407,6 +412,12 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         )
         self.gdn_op = self._build_gdn_op()
         self.gdn_pooled_op = self._build_pooled_gdn_op(block_major=self._bm_kernel)
+        self._pooled_pass_qkvz = bool(
+            envs.VLLM_TPU_GDN_PREFILL_QKV_FROM_PROJ
+            and type(self).pooled_qkvz_input
+            and self.tp_size == 1
+            and hasattr(self, "in_proj_qkvz")
+        )
         pcp_enabled = self._pcp_streaming_enabled()
         self._pcp_streaming_configured = pcp_enabled
         self.gdn_pcp_op = (
@@ -1270,7 +1281,9 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                     )
                 ckpt_indices = getattr(attn_metadata, "mamba_ckpt_indices", None)
                 core_attn_out = self.gdn_pooled_op(
-                    mixed_qkv,
+                    # The contiguous projection: no q|k|v slice copy at the op
+                    # boundary (the op narrows it; see pooled_qkvz_input).
+                    mixed_qkvz if self._pooled_pass_qkvz else mixed_qkv,
                     b,
                     a,
                     recurrent_state,
