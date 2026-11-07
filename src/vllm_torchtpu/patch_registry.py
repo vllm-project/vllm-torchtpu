@@ -136,6 +136,14 @@ PATCHES = (
     Patch("vllm_torchtpu.segment_tokenize:patch_renderer_segment_tokenize", _ACTIVE),
     # API-server output detokenization (VLLM_TPU_DETOK_SUFFIX_PRIME).
     Patch("vllm_torchtpu.detokenizer_suffix:patch_detokenizer_suffix_prime", _ACTIVE),
+    # Engine-core prompt block hashing (VLLM_TPU_BLOCK_HASH_REUSE_PROMPTS).
+    Patch("vllm_torchtpu.core.block_hash_reuse:patch_block_hash_reuse", ("engine_core",)),
+    # API-server prompt id range check (VLLM_TPU_SKIP_TOKENIZER_ID_RANGE_CHECK).
+    Patch(
+        "vllm_torchtpu.input_range_check:patch_skip_tokenizer_id_range_check", _ACTIVE
+    ),
+    # Prompt ids sent from the API server to the engine core (VLLM_TPU_SEND_NEW_PROMPT_IDS).
+    Patch("vllm_torchtpu.core.send_new_prompt_ids:patch_send_new_prompt_ids", _ENGINE),
     # Model-specific patches.
     # Append patches for new models here with
     # stages=("platform_activation", "model_load") and model_config=True.

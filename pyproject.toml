@@ -57,6 +57,9 @@ dependencies = [
     # cpu.txt, ...) except tpu.txt, so it's missing
     # when installing vllm as a plain PyPI dependency for our TPU platform.
     "numba==0.65.0",
+    # Encodes the pieces segment_tokenize.py misses under
+    # VLLM_TPU_SEGMENT_TOKENIZE_FASTOKENS=1, with the same ids as the HF tokenizer.
+    "fastokens==0.3.5",
     # See the JAX fori-loop lowering monkey-patch in
     # src/vllm_torchtpu/env_override.py; it works around a Pallas remainder-loop
     # bloat this JAX pin regresses on (validated on Qwen3.5-397B DP=8 EP).

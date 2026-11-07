@@ -7,6 +7,7 @@ The piecewise path must return the same ids as the backend's own
 
 import os
 import random
+import sys
 
 import pytest
 import tokenizers
@@ -98,10 +99,18 @@ def _random_text(rng, n_parts):
     return "".join(out)
 
 
-def test_toy_tokenizer_matches_full_encode():
+def _needs_fastokens(fast):
+    if fast:
+        pytest.importorskip("fastokens")
+
+
+@pytest.mark.parametrize("fast", [False, True])
+def test_toy_tokenizer_matches_full_encode(fast):
+    _needs_fastokens(fast)
     tok = _toy_tokenizer()
     assert SegmentTokenizer.eligible(tok) is None
-    seg = SegmentTokenizer(tok, max_cached_tokens=10_000)
+    seg = SegmentTokenizer(tok, max_cached_tokens=10_000, use_fastokens=fast)
+    assert (seg._miss_encoder is not seg._backend) == fast
     rng = random.Random(0)
     for i in range(3000):
         text = _random_text(rng, rng.randrange(1, 40))
@@ -112,9 +121,11 @@ def test_toy_tokenizer_matches_full_encode():
     assert seg.hits > 0 and seg.misses > 0
 
 
-def test_edge_inputs():
+@pytest.mark.parametrize("fast", [False, True])
+def test_edge_inputs(fast):
+    _needs_fastokens(fast)
     tok = _toy_tokenizer()
-    seg = SegmentTokenizer(tok, max_cached_tokens=10_000)
+    seg = SegmentTokenizer(tok, max_cached_tokens=10_000, use_fastokens=fast)
     for text in [
         "",
         "<|user|>",
@@ -150,6 +161,15 @@ def test_shared_backend_truncation_does_not_leak():
     want = tok.encode(text, add_special_tokens=False).ids
     tok.enable_truncation(max_length=3)
     assert seg.encode(text) == want
+
+
+def test_fastokens_load_failure_keeps_hf_encoder(monkeypatch):
+    monkeypatch.setitem(sys.modules, "fastokens", None)
+    tok = _toy_tokenizer()
+    seg = SegmentTokenizer(tok, max_cached_tokens=10_000, use_fastokens=True)
+    assert seg._miss_encoder is seg._backend
+    text = "<|user|>" + CORPUS
+    assert seg.encode(text) == tok.encode(text, add_special_tokens=False).ids
 
 
 @pytest.mark.parametrize("flag", ["lstrip", "rstrip", "single_word", "normalized"])
@@ -199,11 +219,14 @@ def _conversation(rng, n_msgs, words):
     return msgs
 
 
-def test_glm_chat_prompts_match_full_encode():
+@pytest.mark.parametrize("fast", [False, True])
+def test_glm_chat_prompts_match_full_encode(fast):
+    _needs_fastokens(fast)
     hf = _glm_tokenizer()
     backend = hf.backend_tokenizer
     assert SegmentTokenizer.eligible(backend) is None
-    seg = SegmentTokenizer(backend, max_cached_tokens=1 << 22)
+    seg = SegmentTokenizer(backend, max_cached_tokens=1 << 22, use_fastokens=fast)
+    assert (seg._miss_encoder is not seg._backend) == fast
     rng = random.Random(2)
     for _ in range(40):
         msgs = _conversation(rng, rng.randrange(1, 30), 300)
