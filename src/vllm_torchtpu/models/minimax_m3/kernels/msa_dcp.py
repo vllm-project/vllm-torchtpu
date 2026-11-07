@@ -219,25 +219,29 @@ def pack_candidates(scores: jax.Array, blocks: jax.Array) -> jax.Array:
     return jnp.concatenate([scores, blocks.astype(jnp.float32)], axis=-1)
 
 
-def _flat_candidates(candidates: jax.Array, topk: int) -> tuple[jax.Array, jax.Array]:
-    """Every rank's candidates of a row side by side: ``(scores, blocks)``
-    ``[T, dcp * topk]``."""
+def merge_candidates_legacy(candidates: jax.Array, topk: int) -> jax.Array:
+    """The original merge, kept as the reference: ``topk`` rounds of max /
+    min / mask over ``[T, dcp * topk]`` rows flattened from ``[dcp, T, 2 *
+    topk]``.
+
+    Served (via `merge_head_candidates` on ``[dcp, T, G * 2 * topk]``), XLA
+    keeps the rows in their gathered ``[dcp, T * G, 2 * topk]`` shape: the
+    16- and 32-wide minor dims fill 16 or 32 of 128 lanes, every round
+    rematerializes the mask from all earlier picks, and each of its ~33
+    fusions reads ~64 MB at 2048 tokens (j-adc17a5e: 26-31 us each, ~1 ms
+    per layer).
+    """
     dcp, num_tokens, _ = candidates.shape
     scores = candidates[..., :topk]
     blocks = candidates[..., topk:].astype(jnp.int32)
     s = scores.transpose(1, 0, 2).reshape(num_tokens, dcp * topk)
     b = blocks.transpose(1, 0, 2).reshape(num_tokens, dcp * topk)
-    return s, b
+    return _merge_rounds(s, b, topk)
 
 
-def merge_candidates_serial(candidates: jax.Array, topk: int) -> jax.Array:
-    """`merge_candidates` as ``topk`` rounds of max / min / mask.
-
-    The reference the sort-based merge is tested and benchmarked against;
-    each round is a dependent pass over the row (two XLA fusions), so it
-    costs ``2 * topk`` serial fusions per layer.
-    """
-    s, b = _flat_candidates(candidates, topk)
+def _merge_rounds(s: jax.Array, b: jax.Array, topk: int) -> jax.Array:
+    """``topk`` rounds of: the best score, the lowest block holding it, then
+    every copy of that block masked out. ``s, b [R, W]`` -> ``[R, topk]``."""
     no_block = jnp.iinfo(jnp.int32).max
     picked = []
     for _ in range(topk):
@@ -248,21 +252,43 @@ def merge_candidates_serial(candidates: jax.Array, topk: int) -> jax.Array:
     return jnp.concatenate(picked, axis=1)
 
 
-def merge_candidates(candidates: jax.Array, topk: int) -> jax.Array:
-    """Global selection ``[T, topk]`` (``-1`` padded) from every rank's
-    packed candidates ``[dcp, T, 2 * topk]``, in `msa_select.select_blocks`'s
-    order: score descending, ties to the lower block.
+def head_rows(candidates: jax.Array, topk: int) -> tuple[jax.Array, jax.Array]:
+    """Every rank's candidates of a (KV head, token) side by side, lane
+    dense: ``[dcp, T, G * 2 * topk]`` -> ``(scores, blocks) [G * T, dcp *
+    topk]``, row ``g * T + t``, column ``rank * topk + i``.
 
-    A block listed more than once counts once, at its highest score, and
-    blocks scored ``-inf`` are never picked: exactly
-    `merge_candidates_serial`, as two row sorts instead of ``topk``
-    dependent rounds. Sort by (block, score descending) and drop every copy
-    but a block's first, then sort by (score descending, block).
-
-    A NaN score is never picked (as ``-inf``); the serial merge's result
-    there depends on whether the backend's max propagates NaN.
+    The rows of `merge_candidates_legacy`, head-major, built by
+    concatenating lane slices of the gathered layout: one pass, where a
+    reshape to ``[dcp, T * G, 2 * topk]`` first spreads 32 values over 128
+    lanes.
     """
-    s, b = _flat_candidates(candidates, topk)
+    dcp, num_tokens, width = candidates.shape
+    num_heads = width // (2 * topk)
+
+    def part(offset):
+        return jnp.concatenate(
+            [
+                jnp.concatenate(
+                    [
+                        candidates[
+                            r, :, h * 2 * topk + offset : h * 2 * topk + offset + topk
+                        ]
+                        for r in range(dcp)
+                    ],
+                    axis=1,
+                )
+                for h in range(num_heads)
+            ],
+            axis=0,
+        )
+
+    return part(0), part(topk).astype(jnp.int32)
+
+
+def _merge_sort(s: jax.Array, b: jax.Array, topk: int) -> jax.Array:
+    """`_merge_rounds` as two row sorts: by (block, score descending), drop
+    every copy of a block but its first, then by (score descending, block).
+    A NaN score is never picked (as ``-inf``)."""
     # Sort keys ascend; the sort canonicalizes -0 to +0.
     neg = jnp.where(jnp.isnan(s), jnp.inf, -s)
     b, neg = jax.lax.sort((b, neg), dimension=1, num_keys=2)
@@ -274,40 +300,125 @@ def merge_candidates(candidates: jax.Array, topk: int) -> jax.Array:
     return jnp.where(neg[:, :topk] < jnp.inf, b[:, :topk], -1)
 
 
-def merge_candidates_pairwise(candidates: jax.Array, topk: int) -> jax.Array:
-    """`merge_candidates` by all-pairs comparison instead of sorting.
-
-    Entry ``j`` is ahead of ``i`` when it has a higher score, or the same
-    score and a lower block, or the same both and a lower position. An entry
-    is kept unless an entry ahead of it holds the same block, or its score is
-    ``-inf``; a kept entry's output slot is the number of kept entries ahead
-    of it. ``O((dcp * topk)**2)`` element-wise work per row with no sort and
-    no serial dependence; bit-exact with `merge_candidates`.
-    """
-    s, b = _flat_candidates(candidates, topk)
+def _merge_kernel(s_ref, b_ref, out_ref, *, topk):
+    """`_merge_rounds` on a tile of rows held in VMEM."""
+    s = s_ref[...]
     s = jnp.where(jnp.isnan(s), _NEG_INF, s)
-    width = s.shape[1]
-    pos = jnp.arange(width, dtype=jnp.int32)
-    si, sj = s[:, :, None], s[:, None, :]
-    bi, bj = b[:, :, None], b[:, None, :]
-    ahead = (sj > si) | (
-        (sj == si) & ((bj < bi) | ((bj == bi) & (pos[None, :] < pos[:, None])))
-    )  # [rows, i, j]: j ahead of i
-    kept = ~jnp.any(ahead & (bj == bi), axis=2) & (s > _NEG_INF)
-    slot = jnp.sum(ahead & kept[:, None, :], axis=2, dtype=jnp.int32)
-    slot = jnp.where(kept, slot, topk)  # [rows, width]
-    hit = slot[:, :, None] == jnp.arange(topk, dtype=jnp.int32)
-    return jnp.sum(jnp.where(hit, b[:, :, None] + 1, 0), axis=1) - 1
+    out_ref[...] = _merge_rounds(s, b_ref[...], topk)
 
 
-def merge_head_candidates(candidates: jax.Array, topk: int) -> jax.Array:
-    """`merge_candidates` per KV head: ``[dcp, T, G * 2 * topk]`` (each
-    rank's `pack_candidates` of its ``G`` heads, head-major) -> selection
-    ``[T, G, topk]``."""
+def _merge_pallas(
+    s: jax.Array,
+    b: jax.Array,
+    topk: int,
+    *,
+    block_rows: int = msa_select.DEFAULT_BLOCK_ROWS,
+    interpret: bool = False,
+) -> jax.Array:
+    """`_merge_rounds` as one kernel: every round on a VMEM tile, the rows
+    read once. A NaN score is never picked (as ``-inf``)."""
+    rows, width = s.shape
+    pad = -rows % block_rows
+    s = jnp.pad(s, ((0, pad), (0, 0)), constant_values=_NEG_INF)
+    b = jnp.pad(b, ((0, pad), (0, 0)), constant_values=-1)
+    in_spec = pl.BlockSpec((block_rows, width), lambda i: (i, 0))
+    out = pl.pallas_call(
+        functools.partial(_merge_kernel, topk=topk),
+        grid=((rows + pad) // block_rows,),
+        in_specs=[in_spec, in_spec],
+        out_specs=pl.BlockSpec((block_rows, topk), lambda i: (i, 0)),
+        out_shape=jax.ShapeDtypeStruct((rows + pad, topk), jnp.int32),
+        compiler_params=pltpu.CompilerParams(dimension_semantics=("parallel",)),
+        interpret=interpret,
+        name="minimax_m3_msa_dcp_merge",
+    )(s, b)
+    return out[:rows]
+
+
+MERGE_IMPLS = ("legacy", "serial", "sort", "pallas")
+# The served merge. "legacy" until a TPU run of
+# scripts/benchmark_msa_dcp_merge_candidates.py picks another.
+DEFAULT_MERGE_IMPL = "legacy"
+
+
+def merge_head_candidates(
+    candidates: jax.Array,
+    topk: int,
+    *,
+    impl: str = DEFAULT_MERGE_IMPL,
+    interpret: bool = False,
+) -> jax.Array:
+    """Global selection per KV head from every rank's candidates ``[dcp, T,
+    G * 2 * topk]`` (each rank's `pack_candidates` of its ``G`` heads,
+    head-major) -> ``[T, G, topk]`` (``-1`` padded), in
+    `msa_select.select_blocks`'s order: score descending, ties to the lower
+    block. A block listed more than once counts once, at its highest score.
+
+    Every `impl` returns the same blocks: "legacy" (the original rounds),
+    "serial" (the same rounds on lane-dense `head_rows`), "sort" (two row
+    sorts) and "pallas" (the rounds in one kernel). On a NaN score "sort"
+    and "pallas" never pick it; the rounds follow the backend's max.
+    """
     dcp, num_tokens, width = candidates.shape
     num_heads = width // (2 * topk)
-    rows = candidates.reshape(dcp, num_tokens * num_heads, 2 * topk)
-    return merge_candidates(rows, topk).reshape(num_tokens, num_heads, topk)
+    if impl == "legacy":
+        rows = candidates.reshape(dcp, num_tokens * num_heads, 2 * topk)
+        selected = merge_candidates_legacy(rows, topk)
+        return selected.reshape(num_tokens, num_heads, topk)
+    s, b = head_rows(candidates, topk)
+    if impl == "serial":
+        selected = _merge_rounds(s, b, topk)
+    elif impl == "sort":
+        selected = _merge_sort(s, b, topk)
+    elif impl == "pallas":
+        selected = _merge_pallas(s, b, topk, interpret=interpret)
+    else:
+        raise ValueError(f"Unknown merge impl {impl!r}; expected {MERGE_IMPLS}.")
+    return selected.reshape(num_heads, num_tokens, topk).transpose(1, 0, 2)
+
+
+def merge_candidates(
+    candidates: jax.Array,
+    topk: int,
+    *,
+    impl: str = DEFAULT_MERGE_IMPL,
+    interpret: bool = False,
+) -> jax.Array:
+    """`merge_head_candidates` of one KV head: ``[dcp, T, 2 * topk]`` ->
+    ``[T, topk]``."""
+    return merge_head_candidates(candidates, topk, impl=impl, interpret=interpret)[:, 0]
+
+
+def selected_page_keys(
+    candidates: jax.Array,
+    seq_id: jax.Array,
+    pos: jax.Array,
+    valid: jax.Array,
+    *,
+    topk: int,
+    block_size: int,
+    pages_per_seq: int,
+    rank: jax.Array,
+    dcp: int,
+    merge_impl: str = DEFAULT_MERGE_IMPL,
+    interpret: bool = False,
+) -> tuple[jax.Array, jax.Array]:
+    """`msa_attend_dcp`'s inputs to the attention kernel: ``(local_key [T],
+    keys [T, G, topk])``, the page keys (seq * pages_per_seq + logical
+    block, as `msa.sparse_attention`) of the token's own block and of the
+    merged selection's blocks this rank holds, ``-1`` elsewhere."""
+    selected = merge_head_candidates(
+        candidates, topk, impl=merge_impl, interpret=interpret
+    )
+    own_block = pos // block_size
+    local_key = jnp.where(
+        valid & (own_block % dcp == rank),
+        seq_id * pages_per_seq + own_block // dcp,
+        -1,
+    )
+    mine = (selected >= 0) & (selected % dcp == rank) & valid[:, None, None]
+    keys = jnp.where(mine, seq_id[:, None, None] * pages_per_seq + selected // dcp, -1)
+    return local_key, keys
 
 
 def msa_write_and_candidates_dcp(
@@ -456,18 +567,18 @@ def msa_attend_dcp(
     block_tables_2d = block_tables.reshape(max_num_seqs, -1)
     pages_per_seq = block_tables_2d.shape[1]
     seq_id, pos, valid = msa.token_positions(num_tokens, seq_lens, cu_q_lens)
-    selected = merge_head_candidates(candidates, topk)  # [T, G, topk]
-    num_heads = selected.shape[1]
-    own_block = pos // block_size
-    local_key = jnp.where(
-        valid & (own_block % dcp == rank),
-        seq_id * pages_per_seq + own_block // dcp,
-        -1,
-    )
-    # Page keys (seq * pages_per_seq + logical block) of the selected blocks
-    # this rank holds, as `msa.sparse_attention`; [T, G, topk].
-    mine = (selected >= 0) & (selected % dcp == rank) & valid[:, None, None]
-    keys = jnp.where(mine, seq_id[:, None, None] * pages_per_seq + selected // dcp, -1)
+    local_key, keys = selected_page_keys(
+        candidates,
+        seq_id,
+        pos,
+        valid,
+        topk=topk,
+        block_size=block_size,
+        pages_per_seq=pages_per_seq,
+        rank=rank,
+        dcp=dcp,
+    )  # keys [T, G, topk]
+    num_heads = keys.shape[1]
     common = dict(
         sm_scale=sm_scale,
         block_q=msa_attention.DEFAULT_BLOCK_Q,

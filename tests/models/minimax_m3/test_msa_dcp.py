@@ -295,38 +295,53 @@ def _rank_candidates(rng, dcp, rows, topk, *, num_blocks, ties):
     return scores, blocks
 
 
-def _assert_merge_matches_serial(scores, blocks, topk):
-    """Bit-exact against the serial merge; NaN scores count as -inf (the
-    serial merge's NaN handling follows the backend's max)."""
+_FAST_MERGES = ("serial", "sort", "pallas")
+
+
+def _assert_merges_match_legacy(scores, blocks, topk, num_heads=1):
+    """Every merge impl bit-exact against the original rounds. Rows ``[dcp,
+    T * G, topk]`` are packed as ``G`` heads per token. NaN scores count as
+    -inf for the reference (the rounds' NaN handling follows the backend's
+    max; "sort" and "pallas" never pick a NaN)."""
+    dcp, rows, _ = scores.shape
     pack = jax.vmap(msa_dcp.pack_candidates)
-    packed = pack(jnp.asarray(scores), jnp.asarray(blocks))
-    ref_scores = np.where(np.isnan(scores), -np.inf, scores)
-    ref_packed = pack(jnp.asarray(ref_scores), jnp.asarray(blocks))
-    serial = jax.jit(msa_dcp.merge_candidates_serial, static_argnums=1)
-    want = np.asarray(serial(ref_packed, topk))
-    got = np.asarray(jax.jit(msa_dcp.merge_candidates, static_argnums=1)(packed, topk))
-    assert got.dtype == want.dtype and got.shape == want.shape
-    np.testing.assert_array_equal(got, want)
-    pairwise = jax.jit(msa_dcp.merge_candidates_pairwise, static_argnums=1)
-    np.testing.assert_array_equal(np.asarray(pairwise(packed, topk)), want)
-    return got
+
+    def heads(s):
+        packed = pack(jnp.asarray(s), jnp.asarray(blocks))
+        return packed.reshape(dcp, rows // num_heads, num_heads * 2 * topk)
+
+    def merge(c, impl):
+        fn = functools.partial(
+            msa_dcp.merge_head_candidates, topk=topk, impl=impl, interpret=True
+        )
+        return np.asarray(jax.jit(fn)(c))
+
+    want = merge(heads(np.where(np.isnan(scores), -np.inf, scores)), "legacy")
+    assert want.shape == (rows // num_heads, num_heads, topk)
+    for impl in _FAST_MERGES:
+        got = merge(heads(scores), impl)
+        assert got.dtype == want.dtype and got.shape == want.shape, impl
+        np.testing.assert_array_equal(got, want, err_msg=impl)
+    return want.reshape(rows, topk)
 
 
 # rows = tokens * KV heads per rank: DCP 8 at TP 8 spans 4 KV heads, DCP 2
 # one. Decode is c64 with 8 tokens per request (DSpark k=7).
 _MERGE_SHAPES = [
-    pytest.param(8, 4 * 512, id="dcp8-decode"),
-    pytest.param(8, 4 * 2048, id="dcp8-prefill2048"),
-    pytest.param(8, 4 * 8192, id="dcp8-prefill8192"),
-    pytest.param(2, 512, id="dcp2-decode"),
-    pytest.param(2, 2048, id="dcp2-prefill2048"),
+    pytest.param(8, 4, 512, id="dcp8-decode"),
+    pytest.param(8, 4, 2048, id="dcp8-prefill2048"),
+    pytest.param(8, 4, 8192, id="dcp8-prefill8192"),
+    pytest.param(2, 1, 512, id="dcp2-decode"),
+    pytest.param(2, 1, 2048, id="dcp2-prefill2048"),
+    pytest.param(8, 4, 300, id="dcp8-ragged"),  # not a multiple of the tile
 ]
 
 
 @pytest.mark.parametrize("ties", [False, True], ids=["distinct", "ties"])
-@pytest.mark.parametrize("dcp,rows", _MERGE_SHAPES)
-def test_merge_candidates_matches_serial_merge(dcp, rows, ties):
-    """The sort-based merge picks the serial merge's blocks in its order."""
+@pytest.mark.parametrize("dcp,num_heads,num_tokens", _MERGE_SHAPES)
+def test_merge_impls_match_legacy(dcp, num_heads, num_tokens, ties):
+    """Every merge picks the original rounds' blocks in their order."""
+    rows = num_heads * num_tokens
     rng = np.random.default_rng(dcp * 1000 + rows + ties)
     topk = 16
     # Per-row generation is slow in Python: generate a pool and tile it.
@@ -342,13 +357,13 @@ def test_merge_candidates_matches_serial_merge(dcp, rows, ties):
     scores[0, ::7, 3:], blocks[0, ::7, 3:] = -np.inf, -1
     # Permute rows so neighbouring rows differ in every tile.
     perm = rng.permutation(rows)
-    got = _assert_merge_matches_serial(scores[:, perm], blocks[:, perm], topk)
+    got = _assert_merges_match_legacy(scores[:, perm], blocks[:, perm], topk, num_heads)
     assert np.any(got == -1) and np.any(got >= 0)
 
 
-@pytest.mark.parametrize("dcp", [2, 8])
-def test_merge_candidates_matches_serial_merge_adversarial(dcp):
-    """Inputs no rank emits, for which the two merges still agree: a block
+@pytest.mark.parametrize("dcp,num_heads", [(2, 1), (8, 4)])
+def test_merge_impls_match_legacy_adversarial(dcp, num_heads):
+    """Inputs no rank emits, for which every merge still agrees: a block
     listed by several ranks (at different and equal scores), all scores
     equal, -0 vs +0, +inf, finite scores on block -1, blocks out of rank
     order, a NaN, fewer candidates than k, and no candidate at all."""
@@ -377,7 +392,7 @@ def test_merge_candidates_matches_serial_merge_adversarial(dcp):
     scores[:, kind == 10] = np.float32(1.0) + np.float32(2**-23) * rng.integers(
         0, 2, (dcp, (kind == 10).sum(), topk)
     )
-    got = _assert_merge_matches_serial(scores, blocks, topk)
+    got = _assert_merges_match_legacy(scores, blocks, topk, num_heads)
     assert np.all(got[kind == 5] == -1)
     nan_rows = np.isnan(scores).any(axis=(0, 2))
     assert nan_rows.any() and np.any(got[nan_rows] >= 0)
