@@ -56,6 +56,9 @@ POOLED_GDN_ARCHITECTURES = QWEN_GDN_ARCHITECTURES | frozenset(
         # pool.
         "KimiLinearForCausalLM",
         "KimiK3ForConditionalGeneration",
+        # Ling 3.x: its TPU KDA layer (models/vllm/bailing_moe_v3.py) runs the
+        # same pooled op.
+        "BailingMoeV3ForCausalLM",
     }
 )
 
