@@ -504,6 +504,9 @@ def _untyped(elems, rows: int, itemsize: int):
     return jnp.transpose(raw, (0, 1, 3, 2)).reshape(rows, ROW_SUBLANES, ROW_LANES)
 
 
+_GATHER_MARK: dict = {}
+
+
 def dma_row_gather(stage, flat, *, tile: int = REPACK_TILE, interpret: bool = False):
     """``stage[flat]`` (``stage``: ``[rows, 4, 256]`` of the carrier's dtype), byte-exact.
 
@@ -521,6 +524,10 @@ def dma_row_gather(stage, flat, *, tile: int = REPACK_TILE, interpret: bool = Fa
     from jax.experimental.pallas import tpu as pltpu
 
     n = int(flat.shape[0])
+    if not _GATHER_MARK.get("dma"):  # engagement marker, once per process, at trace time
+        _GATHER_MARK["dma"] = True
+        print("Qwen PD staged repack gather: DMA row gather traced (dtype %s, backend %s)"
+              % (stage.dtype, jax.default_backend()), flush=True)
     if n == 0:
         return jnp.zeros((0, *stage.shape[1:]), stage.dtype)
     pad = -n % tile
@@ -611,6 +618,8 @@ def make_repack(
 
     if gather is None:
         gather = dma_row_gather if jax.default_backend() == "tpu" else rows_of
+    print("Qwen PD staged repack gather selected: %s (jax backend %s)"
+          % (getattr(gather, "__name__", "custom"), jax.default_backend()), flush=True)
 
     if write is None:
         import functools
