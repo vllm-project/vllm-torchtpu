@@ -55,6 +55,7 @@ def test_all2all_probe_manager(monkeypatch, use_all2all):
 def test_dispatch_and_combine_use_dp_group(
     monkeypatch, communicator, method, count, dp_size
 ):
+    monkeypatch.setattr(comm, "PACKED_DISPATCH_MAX_TOKENS", 0)
     group = Mock(world_size=dp_size)
     monkeypatch.setattr(comm, "get_dp_group", lambda: group)
     tensors = [torch.tensor([[i, i + 1]]) for i in range(count)]
@@ -122,6 +123,7 @@ def test_moe_group_without_sequence_parallel(monkeypatch, communicator):
 def test_dispatch_and_combine_with_sequence_parallel(
     monkeypatch, communicator, method, count
 ):
+    monkeypatch.setattr(comm, "PACKED_DISPATCH_MAX_TOKENS", 0)
     ep_group = Mock(world_size=8)
     monkeypatch.setattr(comm, "get_ep_group", lambda: ep_group)
     tensors = [torch.tensor([[i, i + 1]]) for i in range(count)]
@@ -143,3 +145,76 @@ def test_dispatch_and_combine_with_sequence_parallel(
             assert invocation.kwargs == {"dim": 0}
         assert ep_group.all_gather.call_count == count
         ep_group.reduce_scatter.assert_not_called()
+
+
+def _dispatch_tensors(method, num_tokens):
+    """Hidden states, then top-k or router logits, with every bit pattern
+    (NaN payloads and denormals included) in the 32-bit words."""
+    gen = torch.Generator().manual_seed(0)
+
+    def words(*shape):
+        return torch.randint(-(2**31), 2**31, shape, generator=gen, dtype=torch.int64)
+
+    hidden = words(num_tokens, 64).to(torch.int16).view(torch.bfloat16)
+    if method == "dispatch_router_logits":
+        return [hidden, words(num_tokens, 8).to(torch.int32).view(torch.float32)]
+    return [
+        hidden,
+        words(num_tokens, 4).to(torch.int32).view(torch.float32),
+        words(num_tokens, 4).to(torch.int32),
+    ]
+
+
+def _two_rank_gather(x, dim):
+    # The peer's rows: any row permutation keeps the gather row-aligned.
+    return torch.cat([x, x.flip(0)], dim=dim)
+
+
+def _bits(x):
+    return x.view({2: torch.int16, 4: torch.int32}[x.element_size()])
+
+
+@pytest.mark.parametrize("method", ["dispatch", "dispatch_router_logits"])
+def test_decode_sized_dispatch_gathers_once_bit_exact(
+    monkeypatch, communicator, method
+):
+    group = Mock(world_size=2)
+    monkeypatch.setattr(comm, "get_dp_group", lambda: group)
+    group.all_gather.side_effect = _two_rank_gather
+    tensors = _dispatch_tensors(method, comm.PACKED_DISPATCH_MAX_TOKENS)
+    result = getattr(communicator, method)(*tensors)
+    group.all_gather.assert_called_once()
+    assert group.all_gather.call_args.args[0].dtype == torch.bfloat16
+    assert len(result) == len(tensors)
+    for actual, expected in zip(result, tensors):
+        assert actual.dtype == expected.dtype
+        assert torch.equal(_bits(actual), _bits(_two_rank_gather(expected, 0)))
+
+
+@pytest.mark.parametrize(
+    "method,count", [("dispatch", 3), ("dispatch_router_logits", 2)]
+)
+def test_prefill_sized_dispatch_gathers_each_tensor(
+    monkeypatch, communicator, method, count
+):
+    group = Mock(world_size=2)
+    monkeypatch.setattr(comm, "get_dp_group", lambda: group)
+    group.all_gather.side_effect = _two_rank_gather
+    tensors = _dispatch_tensors(method, comm.PACKED_DISPATCH_MAX_TOKENS + 1)
+    getattr(communicator, method)(*tensors)
+    calls = group.all_gather.call_args_list
+    assert len(calls) == count
+    assert all(c.args[0] is t for c, t in zip(calls, tensors))
+
+
+@pytest.mark.parametrize(
+    "method,count", [("dispatch", 3), ("dispatch_router_logits", 2)]
+)
+def test_drafter_dispatch_gathers_each_tensor(monkeypatch, communicator, method, count):
+    group = Mock(world_size=2)
+    monkeypatch.setattr(comm, "get_dp_group", lambda: group)
+    monkeypatch.setattr(comm.vllm_compilation_backends, "model_tag", "eagle_head")
+    group.all_gather.side_effect = _two_rank_gather
+    tensors = _dispatch_tensors(method, 8)
+    getattr(communicator, method)(*tensors)
+    assert group.all_gather.call_count == count
