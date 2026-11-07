@@ -594,10 +594,13 @@ def msa_attend_dcp(
         interpret=interpret,
     )  # keys [T, G, topk]
     num_heads = keys.shape[1]
+    prefill = num_tokens > msa_attention.SMALL_BATCH_TOKENS
     common = dict(
         sm_scale=sm_scale,
         block_q=msa_attention.DEFAULT_BLOCK_Q,
         pages_per_step=msa_attention.DEFAULT_PAGES_PER_STEP,
+        # Prefill tiles read their page unions directly (`_work_tiles`).
+        tiles=prefill,
         interpret=interpret,
     )
     args = (local_key, pos % block_size + 1, block_tables.reshape(-1))

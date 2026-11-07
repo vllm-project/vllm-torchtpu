@@ -439,3 +439,59 @@ def test_multi_head_dcp_lowers_for_tpu(dtype):
         ):
             lowered = jax.jit(fn).trace(*args).lower(lowering_platforms=("tpu",))
             assert "tpu_custom_call" in lowered.as_text()
+
+
+@pytest.mark.parametrize("chunk_tokens", [2048, 64])
+@pytest.mark.parametrize("block_q,pages_per_step", [(16, 16), (64, 8), (16, 2)])
+def test_lse_heads_tile_grid_matches_flat_work_list(monkeypatch, chunk_tokens, block_q, pages_per_step):
+    """The (tile, group) grid over each tile's page union (`tiles=True`)
+    equals the flat work list, including tiles that need several groups."""
+    dtype = jnp.float8_e4m3fn
+    rng = np.random.default_rng(29)
+    num_tokens, pages, topk, heads, hd, q_per_head = 136, 12, 4, 2, 128, 2
+    q = jnp.asarray(rng.standard_normal((num_tokens, heads * q_per_head, hd))).astype(jnp.bfloat16)
+    rows = pack(rounded(rng.standard_normal((pages, PAGE, heads * 2 * hd)), dtype), dtype)
+    selected = np.full((num_tokens, heads, topk), -1, np.int32)
+    for t in range(num_tokens):
+        for h in range(heads):
+            chosen = rng.choice(pages, rng.integers(0, topk + 1), replace=False)
+            selected[t, h, : len(chosen)] = chosen
+    rest = (
+        jnp.asarray(selected[:, 0, 0]),
+        jnp.asarray(rng.integers(1, PAGE + 1, num_tokens), jnp.int32),
+        jnp.arange(pages, dtype=jnp.int32),
+    )
+    monkeypatch.setattr(msa_attention, "MAX_TOKENS_PER_CALL", chunk_tokens)
+    jax.clear_caches()
+    kw = dict(sm_scale=hd**-0.5, block_q=block_q, pages_per_step=pages_per_step, interpret=True)
+    flat = msa_attention_lse.msa_sparse_attention_lse_heads(q, rows, jnp.asarray(selected), *rest, **kw)
+    tiled = msa_attention_lse.msa_sparse_attention_lse_heads(
+        q, rows, jnp.asarray(selected), *rest, tiles=True, **kw
+    )
+    np.testing.assert_array_equal(np.asarray(tiled[0]), np.asarray(flat[0]))
+    np.testing.assert_array_equal(np.asarray(tiled[1]), np.asarray(flat[1]))
+
+
+def test_lse_heads_tile_grid_lowers_for_tpu():
+    from jax.sharding import AbstractDevice, AbstractMesh, use_abstract_mesh
+
+    tpu7x = AbstractMesh((), (), (), abstract_device=AbstractDevice("TPU7x", 1, "tpu"))
+    args = (
+        jax.ShapeDtypeStruct((2048, 64, 128), jnp.bfloat16),
+        jax.ShapeDtypeStruct((4096, PAGE // 8, 4, 4 * 2 * 128), jnp.uint8),
+        jax.ShapeDtypeStruct((2048, 4, 16), jnp.int32),
+        jax.ShapeDtypeStruct((2048,), jnp.int32),
+        jax.ShapeDtypeStruct((2048,), jnp.int32),
+        jax.ShapeDtypeStruct((4096,), jnp.int32),
+        jax.ShapeDtypeStruct((4096, 16, PAGE), jnp.float32),
+    )
+
+    def f(q, kv, sel, lp, ll, table, sc):
+        return msa_attention_lse.msa_sparse_attention_lse_heads(
+            q, kv, sel, lp, ll, table, sm_scale=0.088, block_q=64, pages_per_step=8,
+            scale_cache=sc, tiles=True,
+        )
+
+    with use_abstract_mesh(tpu7x):
+        lowered = jax.jit(f).trace(*args).lower(lowering_platforms=("tpu",))
+    assert "tpu_custom_call" in lowered.as_text()
