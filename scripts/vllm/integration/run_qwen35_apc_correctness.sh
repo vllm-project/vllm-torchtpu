@@ -77,9 +77,12 @@ python3 "$HERE/smoke_prefix_cache_correctness.py" \
   --host localhost --port "$PORT" --model "$MODEL"
 # The one above repeat a single prompt, so a resumed request gets back a slot
 # holding that same prompt's state and a missing restore stays invisible. This
-# interleaves two prefixes so the slot always carries the wrong one.
+# interleaves two prefixes so the slot always carries the wrong one. Take each
+# reference from an immediate same-slot hit so the GDN prefill-checkpoint
+# chunking difference above does not flip near-tied greedy tokens against cold.
 python3 "$HERE/smoke_mamba_state_contamination.py" \
-  --host localhost --port "$PORT" --model "$MODEL"
+  --host localhost --port "$PORT" --model "$MODEL" \
+  --warm-reference
 
 # A run that never hit the cache would pass both smokes vacuously.
 hits=$(curl -sf "localhost:$PORT/metrics" |
