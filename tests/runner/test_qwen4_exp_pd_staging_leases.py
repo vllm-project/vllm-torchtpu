@@ -214,9 +214,39 @@ def manifest(stage=1):
     return SimpleNamespace(pools=pools, pool_dicts=lambda: dicts)
 
 
+def pc():
+    return pytest.importorskip("vllm_torchtpu.models.vllm.qwen4_exp.pd_connector")
+
+
 def register(w, engine, m):
-    pc = pytest.importorskip("vllm_torchtpu.models.vllm.qwen4_exp.pd_connector")
-    return pc.Qwen4ExpRaidenWorker._register_qwen_pools(w, engine, m, BLOCK)
+    """register_runner's registration step, line for line (its source is checked below)."""
+    W = pc().Qwen4ExpRaidenWorker
+    staging_kwargs = W._qwen_staging_kwargs(w, m, BLOCK)
+    try:
+        summary = dict(engine.register_pools(m.pool_dicts(), **staging_kwargs))
+    except TypeError as exc:
+        if not staging_kwargs:
+            raise
+        summary = W._qwen_staging_fallback(w, engine, m, exc)
+    W._log_qwen_host_staging(w, summary, staging_kwargs)
+    return summary
+
+
+def test_register_runner_registers_through_the_staging_kwargs():
+    """The step above is register_runner's own, before _after_native_registration."""
+    import inspect
+
+    src = inspect.getsource(pc().Qwen4ExpRaidenWorker.register_runner)
+    for line in (
+        "staging_kwargs = self._qwen_staging_kwargs(manifest, int(cache.layout.block_size))",
+        "summary = dict(engine.register_pools(manifest.pool_dicts(), **staging_kwargs))",
+        "except TypeError as exc:",
+        "if not staging_kwargs:",
+        "summary = self._qwen_staging_fallback(engine, manifest, exc)",
+        "self._log_qwen_host_staging(summary, staging_kwargs)",
+    ):
+        assert line in src, line
+    assert src.index("engine.register_pools(") < src.index("self._after_native_registration()")
 
 
 def test_off_by_default_registers_exactly_as_before(monkeypatch):
