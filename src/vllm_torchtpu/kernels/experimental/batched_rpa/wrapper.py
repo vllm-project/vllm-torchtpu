@@ -593,7 +593,8 @@ def ragged_paged_attention(
             size of the hardware.
         debug_mode: Not used.
         out_dtype: Dtype of output. Defaults to dtype of queries.
-        use_causal_mask: Not used.
+        use_causal_mask: Whether to apply lower-triangular causal masking.
+            If False, queries attend to all valid tokens in the sequence.
         skip_kv_update: If True, don't write keys/values back to kv_cache
             (KV-share). All kv, including this step's tokens, is read from kv_cache.
         update_kv_cache: If set, overrides skip_kv_update (update_kv_cache=False
@@ -624,8 +625,6 @@ def ragged_paged_attention(
             needed for merging partial attention results in CP.
     """
 
-    if not use_causal_mask:
-        raise ValueError("Only causal attention is supported.")
     if chunk_prefill_size is not None:
         raise ValueError("Specifying chunk prefill size is not supported.")
     if debug_mode:
@@ -661,6 +660,7 @@ def ragged_paged_attention(
         sm_scale=sm_scale,
         soft_cap=soft_cap,
         mask_value=mask_value,
+        use_causal_mask=use_causal_mask,
     )
 
     if k_scale is not None and dynamic_k_scale is not None:

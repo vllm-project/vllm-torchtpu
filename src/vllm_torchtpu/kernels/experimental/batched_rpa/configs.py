@@ -53,6 +53,7 @@ class ModelConfigs:
         sm_scale: Softmax scaling factor.
         soft_cap: Soft-capping threshold for attention logits.
         sliding_window: Size of the sliding attention window.
+        use_causal_mask: Whether to apply lower-triangular causal masking.
     """
 
     num_q_heads: int
@@ -62,6 +63,7 @@ class ModelConfigs:
     sm_scale: float = 1.0
     soft_cap: float | None = None
     sliding_window: int | None = None
+    use_causal_mask: bool = True
 
     @property
     def num_q_heads_per_kv_head(self) -> int:
