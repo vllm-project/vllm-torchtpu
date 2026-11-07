@@ -821,6 +821,9 @@ def _tiny_draft(monkeypatch, *, pp: int, first_rank: bool):
         device_config=NS(device="cpu"),
         compilation_config=NS(mode=CompilationMode.NONE, static_forward_context={}),
         parallel_config=NS(pipeline_parallel_size=pp),
+        # Qwen4ExpDecoderLayer reads max_num_seqs (Qwen4ExpQSA): j-d58754a2 failed without it,
+        # as do this file's two stale base tests whose harness this copies.
+        scheduler_config=NS(max_num_seqs=8),
         additional_config={},
         quant_config=NS(ignored_layers=["mtp.layers.0.mlp.gate"]),
         speculative_config=spec_config(1),
