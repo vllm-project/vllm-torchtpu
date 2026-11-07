@@ -209,6 +209,8 @@ if TYPE_CHECKING:
     VLLM_TPU_SRPT_MAX_CONSECUTIVE_HOLDS: int = 8
     VLLM_TPU_SRPT_ATTN_WORK_CAP: int = 0
     VLLM_TPU_SRPT_ATTN_TILE_TOKENS: int = 32
+    VLLM_TPU_AGENTIC_TELEMETRY: bool = False
+    VLLM_TPU_AGENTIC_SPAN_LOG: str = ""
 
 
 def env_with_choices(
@@ -1282,6 +1284,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_TPU_SRPT_ATTN_TILE_TOKENS": env_nonnegative_int(
         "VLLM_TPU_SRPT_ATTN_TILE_TOKENS", 32
     ),
+    # Host-side agentic serving telemetry (6-category prefill token breakdown,
+    # HBM eviction age, and KV transfer/padding span attributes). Off by default.
+    "VLLM_TPU_AGENTIC_TELEMETRY": env_bool("VLLM_TPU_AGENTIC_TELEMETRY", default=False),
+    # Optional JSONL file path where each completed request's CUJ-2 span
+    # attributes are appended (useful for local inspection without an OTel collector).
+    "VLLM_TPU_AGENTIC_SPAN_LOG": env_str("VLLM_TPU_AGENTIC_SPAN_LOG", default=""),
 }
 
 
