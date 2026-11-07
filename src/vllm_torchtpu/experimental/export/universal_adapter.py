@@ -30,6 +30,7 @@ import torch.nn as nn
 from vllm_torchtpu import rope_patch
 from vllm_torchtpu.experimental.export import (
     api,
+    draft_model,
     sampling,
     tpu_lowering,
     weight_mapper,
@@ -537,6 +538,7 @@ def load_vllm_model(vllm_config: Any, *, load_format: str) -> nn.Module:
 
             model = run_model_loader(vllm_config)
             draft = _load_mtp_draft(vllm_config, model)
+            separate_draft = draft_model.load_draft_model(vllm_config, model, mesh)
             # Same step vLLM's executors run right after `load_model`: it picks
             # the KV block size from the model's attention backend, which serving
             # uses and which keeps the block table within SMEM.
@@ -561,6 +563,8 @@ def load_vllm_model(vllm_config: Any, *, load_format: str) -> nn.Module:
                 # Kept off the target's module tree, so its parameters are not
                 # the target's.
                 object.__setattr__(model, MTP_DRAFT_ATTR, draft)
+            if separate_draft is not None:
+                object.__setattr__(model, draft_model.DRAFT_MODEL_ATTR, separate_draft)
             return model
 
 
@@ -633,7 +637,22 @@ def mtp_draft_names(model: nn.Module) -> dict[str, str]:
     own are named as in the checkpoint, `mtp.` for the draft's `model.`. Empty
     for a model without a draft.
     """
-    draft = getattr(model, MTP_DRAFT_ATTR, None)
+    return _draft_export_names(model, MTP_DRAFT_ATTR, "mtp.")
+
+
+def draft_model_names(model: nn.Module) -> dict[str, str]:
+    """The export name of each parameter and buffer of `model`'s separate draft
+    model: the target's names for weights it shares, else `draft.` for its
+    `model.`. Empty for a model without one."""
+    return _draft_export_names(
+        model, draft_model.DRAFT_MODEL_ATTR, draft_model.DRAFT_PARAM_PREFIX
+    )
+
+
+def _draft_export_names(model: nn.Module, attr: str, prefix: str) -> dict[str, str]:
+    """The export names of the draft at `model.<attr>`: shared tensors keep the
+    target's names, its own are `prefix` for its `model.`."""
+    draft = getattr(model, attr, None)
     if draft is None:
         return {}
     # A tensor the target holds under two names (a tied LM head) keeps the first.
@@ -648,20 +667,31 @@ def mtp_draft_names(model: nn.Module) -> dict[str, str]:
         draft.named_parameters(remove_duplicate=False),
         draft.named_buffers(remove_duplicate=False),
     ):
-        own = "mtp." + n.removeprefix("model.")
+        own = prefix + n.removeprefix("model.")
         names[n] = target.get(id(t), own)
     return names
 
 
 def mtp_draft_tensors(model: nn.Module) -> dict[str, Any]:
     """The MTP draft's own parameters and buffers by export name."""
-    draft = getattr(model, MTP_DRAFT_ATTR, None)
+    return _draft_own_tensors(model, MTP_DRAFT_ATTR, "mtp.")
+
+
+def draft_model_tensors(model: nn.Module) -> dict[str, Any]:
+    """The separate draft model's own parameters and buffers by export name."""
+    return _draft_own_tensors(
+        model, draft_model.DRAFT_MODEL_ATTR, draft_model.DRAFT_PARAM_PREFIX
+    )
+
+
+def _draft_own_tensors(model: nn.Module, attr: str, prefix: str) -> dict[str, Any]:
+    draft = getattr(model, attr, None)
     if draft is None:
         return {}
     tensors = dict(draft.named_buffers())
     tensors.update(draft.named_parameters())
-    names = mtp_draft_names(model)
-    return {names[n]: t for n, t in tensors.items() if names[n].startswith("mtp.")}
+    names = _draft_export_names(model, attr, prefix)
+    return {names[n]: t for n, t in tensors.items() if names[n].startswith(prefix)}
 
 
 # Constant values are gathered from every rank to lay them out, so only small
@@ -897,6 +927,9 @@ class UniversalVllmExportableLLM(api.ExportableTextOnlyLLM):
 
     # The MTP draft the target was loaded with (`MTP_DRAFT_ATTR`), if any.
     _mtp_draft: nn.Module | None = None
+    # The separate draft model (DSpark) the target was loaded with
+    # (`draft_model.DRAFT_MODEL_ATTR`), if any.
+    _draft_model: nn.Module | None = None
     # `kv_cache_groups()`, computed on first use.
     _kv_cache_groups: list[api.KvCacheGroup] | None = None
 
@@ -924,17 +957,20 @@ class UniversalVllmExportableLLM(api.ExportableTextOnlyLLM):
         self._export_config = export_config
         self._model = model
         self._mtp_draft = getattr(model, MTP_DRAFT_ATTR, None)
+        self._draft_model = getattr(model, draft_model.DRAFT_MODEL_ATTR, None)
         self._patched_rope_modules = rope_patch.patch_in_graph_rotary_embedding(
             self._model
         )
-        if self._mtp_draft is not None:
-            self._patched_rope_modules += rope_patch.patch_in_graph_rotary_embedding(
-                self._mtp_draft
-            )
+        for draft in (self._mtp_draft, self._draft_model):
+            if draft is not None:
+                self._patched_rope_modules += (
+                    rope_patch.patch_in_graph_rotary_embedding(draft)
+                )
         _patch_row_parallel_input_split(self._model)
-        if self._mtp_draft is not None:
-            # Kept off the target's module tree, like the RoPE patch above.
-            _patch_row_parallel_input_split(self._mtp_draft)
+        for draft in (self._mtp_draft, self._draft_model):
+            if draft is not None:
+                # Kept off the target's module tree, like the RoPE patch above.
+                _patch_row_parallel_input_split(draft)
         if not self._export_config.uses_mrope and any(
             getattr(m, "_in_graph_rope_dim_modalities", None) is not None
             or rope_patch.compute_mrope_dim_modalities(m) is not None
@@ -1030,6 +1066,8 @@ class UniversalVllmExportableLLM(api.ExportableTextOnlyLLM):
             states = list(self.abstract_states())
             if self._drafts_with_mtp():
                 states += self.mtp_abstract_states()
+            if self._drafts_with_draft_model():
+                states += self.dspark_abstract_states()
             return sum(
                 math.prod(s.shape) * tpu_lowering.torch_dtype(s.dtype).itemsize
                 for s in states
@@ -1084,19 +1122,37 @@ class UniversalVllmExportableLLM(api.ExportableTextOnlyLLM):
                 dtype=emb_spec.dtype,
                 sharding=emb_spec.sharding,
             )
-        params.update(self._mtp_abstract_params(tp_size, has_ep))
+        params.update(
+            self._draft_abstract_params(
+                self._mtp_draft, mtp_draft_names(self._model), "mtp.", tp_size, has_ep
+            )
+        )
+        params.update(
+            self._draft_abstract_params(
+                self._draft_model,
+                draft_model_names(self._model),
+                draft_model.DRAFT_PARAM_PREFIX,
+                tp_size,
+                has_ep,
+            )
+        )
         return params
 
-    def _mtp_abstract_params(
-        self, tp_size: int, has_ep: bool
+    @staticmethod
+    def _draft_abstract_params(
+        draft: nn.Module | None,
+        names: Mapping[str, str],
+        prefix: str,
+        tp_size: int,
+        has_ep: bool,
     ) -> dict[str, api.ShapeDtypeStruct]:
-        """The MTP draft's own parameters and buffers, by their `mtp.` names."""
-        if self._mtp_draft is None:
+        """A draft's own parameters and buffers, by their export `names` (those
+        starting with `prefix`); the ones it shares are the target's."""
+        if draft is None:
             return {}
-        names = mtp_draft_names(self._model)
         params: dict[str, api.ShapeDtypeStruct] = {}
-        for name, param in self._mtp_draft.named_parameters():
-            if not names[name].startswith("mtp."):
+        for name, param in draft.named_parameters():
+            if not names[name].startswith(prefix):
                 continue
             shape = tuple(int(d) for d in param.shape)
             params[names[name]] = api.ShapeDtypeStruct(
@@ -1105,13 +1161,13 @@ class UniversalVllmExportableLLM(api.ExportableTextOnlyLLM):
                 sharding=weight_mapper.infer_weight_sharding(
                     name,
                     shape,
-                    model=self._mtp_draft,
+                    model=draft,
                     tp_size_hint=tp_size,
                     has_ep_hint=has_ep,
                 ),
             )
-        for name, buf in self._mtp_draft.named_buffers():
-            if names[name].startswith("mtp."):
+        for name, buf in draft.named_buffers():
+            if names[name].startswith(prefix):
                 params.setdefault(
                     names[name],
                     api.ShapeDtypeStruct(
@@ -1122,12 +1178,15 @@ class UniversalVllmExportableLLM(api.ExportableTextOnlyLLM):
         return params
 
     def _buffers(self) -> dict[str, Any]:
-        """The target's buffers and the MTP draft's own, by export name."""
+        """The target's buffers and its drafts' own, by export name."""
         bufs = dict(self._model.named_buffers())
-        if self._mtp_draft is not None:
-            names = mtp_draft_names(self._model)
-            for name, buf in self._mtp_draft.named_buffers():
-                bufs.setdefault(names[name], buf)
+        for draft, names in (
+            (self._mtp_draft, mtp_draft_names(self._model)),
+            (self._draft_model, draft_model_names(self._model)),
+        ):
+            if draft is not None:
+                for name, buf in draft.named_buffers():
+                    bufs.setdefault(names[name], buf)
         return bufs
 
     def constant_names(self) -> set[str]:
@@ -1157,9 +1216,22 @@ class UniversalVllmExportableLLM(api.ExportableTextOnlyLLM):
 
     def _named_attention_layers(self) -> list[tuple[str, Any]]:
         """Returns the ordered `(layer name, layer)` attention layers of the
-        target, without the MTP draft's."""
-        draft = {id(m) for m in self._mtp_draft.modules()} if self._mtp_draft else set()
+        target, without its drafts'."""
+        draft = {
+            id(m)
+            for d in (self._mtp_draft, self._draft_model)
+            if d is not None
+            for m in d.modules()
+        }
         return [(n, m) for n, m in self._all_attention_layers() if id(m) not in draft]
+
+    def _draft_model_attention_layers(self) -> list[tuple[str, Any]]:
+        """The ordered `(layer name, layer)` attention layers of the separate
+        draft model."""
+        if self._draft_model is None:
+            return []
+        draft = {id(m) for m in self._draft_model.modules()}
+        return [(n, m) for n, m in self._all_attention_layers() if id(m) in draft]
 
     def _mtp_attention_layers(self) -> list[tuple[str, Any]]:
         """The ordered `(layer name, layer)` attention layers of the MTP draft."""
@@ -1209,9 +1281,13 @@ class UniversalVllmExportableLLM(api.ExportableTextOnlyLLM):
         return self._kv_cache_groups
 
     def _compute_kv_cache_groups(self) -> list[api.KvCacheGroup]:
-        # `mtp_draft` takes one page table, so a drafting model keeps every layer
+        # A drafter takes one page table, so a drafting model keeps every layer
         # on `block_tables`, as it exported before groups existed.
-        if self._vllm_config is None or self._drafts_with_mtp():
+        if (
+            self._vllm_config is None
+            or self._drafts_with_mtp()
+            or self._drafts_with_draft_model()
+        ):
             return []
         from vllm.model_executor.layers.attention import Attention
         from vllm.v1.attention.backend import AttentionType
@@ -1463,6 +1539,225 @@ class UniversalVllmExportableLLM(api.ExportableTextOnlyLLM):
             specs.append(per_layer[0][0])
         return specs
 
+    def _drafts_with_draft_model(self) -> bool:
+        if self._draft_model is None:
+            return False
+        spec = self._export_config.speculative_config
+        return bool(spec) and spec.get("method") in draft_model.DRAFT_MODEL_METHODS
+
+    def _require_draft_model(self) -> nn.Module:
+        if self._draft_model is None:
+            raise ValueError(
+                "the model has no draft model: load it with a vLLM "
+                "speculative_config whose method is one of "
+                f"{', '.join(draft_model.DRAFT_MODEL_METHODS)}"
+            )
+        return self._draft_model
+
+    def forward_extra_outputs(self) -> list[tuple[str, int]]:
+        """`(name, width)` of the `[B, width]` intermediates `forward` returns
+        after `hidden_states`: with a separate draft model,
+        `aux_hidden_states`, the residual stream entering each of the draft's
+        target layers (after layer `target_layer_ids[i]`), concatenated, as
+        wide as the draft's `fc` input."""
+        if not self._drafts_with_draft_model():
+            return []
+        fc = getattr(self._require_draft_model().model, "fc", None)
+        if fc is None:
+            raise NotImplementedError(
+                "a draft model that reads no target hidden states "
+                "(use_aux_hidden_state=False) is not supported by export"
+            )
+        return [(draft_model.AUX_HIDDEN_STATES, int(fc.input_size))]
+
+    def dspark_abstract_states(self) -> Sequence[api.ShapeDtypeStruct]:
+        """The paged KV of each attention layer of the draft model, in layer
+        order, paged like the target's (`num_blocks` of `block_size`)."""
+        self._require_draft_model()
+        specs = []
+        for _, layer in self._draft_model_attention_layers():
+            per_layer = self._layer_state_specs([layer])
+            if per_layer is None or len(per_layer[0]) != 1:
+                raise NotImplementedError(
+                    f"draft model attention layer {type(layer).__name__} keeps no "
+                    "paged KV cache export can bind"
+                )
+            specs.append(per_layer[0][0])
+        return specs
+
+    def dspark_draft(
+        self,
+        weights: Mapping[str, Any],
+        kv_caches: Sequence[Any],
+        *,
+        input_ids: Any,
+        positions: Any,
+        kv_lens: Any,
+        block_tables: Any,
+        query_start_loc: Any,
+        req_dist: Any,
+        last_token_indices: Any,
+        aux_hidden_states: Any,
+    ) -> tuple[Sequence[Any], Any]:
+        """Drafts `K` tokens per request with the separate draft model.
+
+        Every row of the step writes its context keys and values, projected from
+        its `aux_hidden_states`, to the draft's paged KV at its position, through
+        the step's own attention metadata. Then each request drafts one block:
+        its anchor, `input_ids[last_token_indices[r]]` (the token sampled after
+        its last accepted one), at the next position, followed by mask tokens,
+        attending to its context and, non-causally, to the block. The block's
+        own keys and values land past the request's accepted tokens, where the
+        next step's context rows overwrite them. A step of `B` tokens holds at
+        most `min(B, max_num_seqs)` requests, so only those draft;
+        `draft_tokens` rows past them are 0.
+        """
+        draft: Any = self._require_draft_model()
+        cfg = self._export_config
+        k = int(cfg.speculative_config["num_speculative_tokens"])  # type: ignore[index]
+        from_anchor = draft_model.sample_from_anchor(draft)
+        block = draft_model.query_block_size(k, from_anchor)
+        mask_token_id = int(draft.config.dflash_config["mask_token_id"])
+        names = draft_model_names(self._model)
+        call_weights = {d: weights[e] for d, e in names.items() if e in weights}
+        layers = self._draft_model_attention_layers()
+        for (_, layer), kv in zip(layers, kv_caches, strict=True):
+            layer.kv_cache = kv
+        if positions.dim() > 1:
+            positions = positions[0]
+
+        attention_dist, _ = _split_req_dist(req_dist)
+        context_metadata = make_attention_metadata(
+            input_positions=positions,
+            block_tables=block_tables,
+            seq_lens=kv_lens,
+            query_start_loc=query_start_loc,
+            request_distribution=attention_dist,
+        )
+        rows = min(int(input_ids.shape[0]), cfg.max_num_seqs)
+        block_ids, block_positions, block_metadata = self._draft_block_inputs(
+            input_ids=input_ids,
+            positions=positions,
+            block_tables=block_tables,
+            num_seqs=attention_dist[2],
+            last_token_indices=last_token_indices[:rows],
+            block=block,
+            mask_token_id=mask_token_id,
+        )
+
+        with contextlib.ExitStack() as stack:
+            if self._vllm_config is not None:
+                mesh = getattr(self._model, "_export_tpu_mesh", None)
+                if mesh is not None:
+                    from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (  # noqa: E501
+                        set_vllm_model_wrapper_context,
+                    )
+
+                    stack.enter_context(
+                        set_vllm_model_wrapper_context(
+                            mesh=mesh, vllm_config=self._vllm_config
+                        )
+                    )
+            from torch.nn.utils.stateless import _reparametrize_module
+
+            stack.enter_context(_weights_bound_in_place(draft, call_weights))
+            stack.enter_context(_reparametrize_module(draft, call_weights))
+            draft_model.bind_fused_kv_weight(draft)
+            draft_model.precompute_context_kv(
+                draft,
+                aux_hidden_states,
+                positions,
+                [context_metadata] * len(layers),
+            )
+            with self._draft_forward_context(layers, block_metadata, block_ids):
+                tokens = draft_model.dspark_forward_and_sample(
+                    draft, block_ids, block_positions, block, from_anchor
+                )
+        updated = [
+            layer.kv_cache[0] if isinstance(layer.kv_cache, list) else layer.kv_cache
+            for _, layer in layers
+        ]
+        tokens = tokens.to(torch.int32)
+        if rows < cfg.max_num_seqs:
+            tokens = torch.cat(
+                [tokens, tokens.new_zeros((cfg.max_num_seqs - rows, k))], dim=0
+            )
+        return updated, tokens
+
+    def _draft_block_inputs(
+        self,
+        *,
+        input_ids: Any,
+        positions: Any,
+        block_tables: Any,
+        num_seqs: Any,
+        last_token_indices: Any,
+        block: int,
+        mask_token_id: int,
+    ) -> tuple[Any, Any, Any]:
+        """The draft block of each of `len(last_token_indices)` request rows:
+        `(input_ids, positions, attention metadata)`.
+
+        Request `r`'s block is its anchor `input_ids[last_token_indices[r]]` at
+        `positions[last_token_indices[r]] + 1`, then mask tokens, laid out by
+        `draft_model.layout_draft_block`. Requests past `num_seqs` attend to
+        nothing (`seq_lens` 0) and are outside `query_start_loc`'s live range.
+        """
+        cfg = self._export_config
+        rows = int(last_token_indices.shape[0])
+        idx = last_token_indices.to(torch.int64)
+        live = torch.arange(rows, device=idx.device) < num_seqs
+        base_tokens = torch.where(live, input_ids[idx], mask_token_id).to(torch.int32)
+        base_pos = torch.where(live, positions[idx] + 1, 0).to(torch.int32)
+        block_ids, block_positions, seq_lens = draft_model.layout_draft_block(
+            base_tokens,
+            base_pos.unsqueeze(1),
+            block,
+            rows * block,
+            mask_token_id,
+            cfg.max_model_len,
+        )
+        query_start_loc = (
+            torch.clamp(torch.arange(rows + 1, device=idx.device), max=num_seqs) * block
+        ).to(torch.int32)
+        if rows < cfg.max_num_seqs:
+            pad = cfg.max_num_seqs - rows
+            seq_lens = torch.cat([seq_lens, seq_lens.new_zeros(pad)])
+            query_start_loc = torch.cat(
+                [query_start_loc, query_start_loc[-1:].expand(pad)]
+            )
+        seq_lens = torch.where(
+            torch.arange(cfg.max_num_seqs, device=idx.device) < num_seqs, seq_lens, 0
+        ).to(torch.int32)
+        zero = torch.zeros((), dtype=torch.int32, device=idx.device)
+        metadata = make_attention_metadata(
+            input_positions=block_positions,
+            block_tables=block_tables,
+            seq_lens=seq_lens,
+            query_start_loc=query_start_loc,
+            request_distribution=torch.stack(
+                [zero, zero, torch.as_tensor(num_seqs).to(torch.int32)]
+            ),
+        )
+        return block_ids, block_positions, metadata
+
+    @contextlib.contextmanager
+    def _draft_forward_context(
+        self, layers: Sequence[tuple[str, Any]], metadata: Any, input_ids: Any
+    ) -> Any:
+        """The forward context a draft model pass reads its layers' metadata from."""
+        if self._vllm_config is None:
+            yield
+            return
+        from vllm.forward_context import set_forward_context
+
+        with set_forward_context(
+            {name: metadata for name, _ in layers},
+            self._vllm_config,
+            num_tokens=int(input_ids.shape[0]),
+        ):
+            yield
+
     def _lm_head_weight_name(self) -> str:
         """The `abstract_params` name `compute_logits` projects with."""
         names = [n for n, _ in self._model.named_parameters()]
@@ -1603,8 +1898,13 @@ class UniversalVllmExportableLLM(api.ExportableTextOnlyLLM):
         req_dist: Any,
         block_tables: Any = None,
         **extra_controls: Any,
-    ) -> tuple[Sequence[Any], Any]:
+    ) -> tuple[Any, ...]:
         """Executes one flattened continuous-batching forward pass.
+
+        Returns the updated states and `hidden_states`, then the
+        `forward_extra_outputs()`: with a separate draft model,
+        `aux_hidden_states`, the target layers' residual stream concatenated
+        per row.
 
         A 6-element `req_dist` is the attention kernel's distribution, then the
         recurrent kernels', whose windowed segment takes the verify windows too.
@@ -1683,7 +1983,7 @@ class UniversalVllmExportableLLM(api.ExportableTextOnlyLLM):
             # runner's per-layer metadata provides it.
             forward_metadata = {name: attn_metadata for name, _ in named_layers}
 
-        def _invoke_backbone() -> tuple[Sequence[Any], Any]:
+        def _invoke_backbone() -> tuple[Any, ...]:
             use_func = bool(call_weights) and all(
                 isinstance(v, torch.Tensor) for v in call_weights.values()
             )
@@ -1739,15 +2039,35 @@ class UniversalVllmExportableLLM(api.ExportableTextOnlyLLM):
                 ]
             else:
                 updated_kvs = working_kvs
+            aux = None
+            if (
+                isinstance(out, tuple)
+                and len(out) == 2
+                and isinstance(out[0], torch.Tensor)
+                and isinstance(out[1], (list, tuple))
+            ):
+                # A target tagged with a draft model's target layers
+                # (`set_aux_hidden_state_layers`) also returns their residual
+                # stream.
+                out, aux = out[0], list(out[1])
             if (
                 isinstance(out, tuple)
                 and len(out) == 2
                 and isinstance(out[0], (list, tuple))
             ):
-                return list(out[0]), out[1]
-            if isinstance(out, tuple):
-                return updated_kvs, out[0]
-            return updated_kvs, out
+                kvs, hidden = list(out[0]), out[1]
+            elif isinstance(out, tuple):
+                kvs, hidden = updated_kvs, out[0]
+            else:
+                kvs, hidden = updated_kvs, out
+            if not self.forward_extra_outputs():
+                return kvs, hidden
+            if not aux:
+                raise ValueError(
+                    f"{type(backbone).__name__} returned no residual stream of the "
+                    "draft model's target layers"
+                )
+            return kvs, hidden, torch.cat(aux, dim=-1)
 
         if self._vllm_config is not None:
             from vllm.forward_context import set_forward_context
