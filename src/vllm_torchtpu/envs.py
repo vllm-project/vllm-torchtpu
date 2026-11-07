@@ -61,6 +61,7 @@ if TYPE_CHECKING:
     TPU_QWEN4_HC_PREFILL_ODD_TILES: bool = False
     TPU_QWEN4_HC_PREFILL_FUSED_MIX: bool = False
     TPU_QWEN4_HC_PREFILL_PARTIAL_TILE: bool = False
+    TPU_QWEN4_HC_PREFILL_NORM: str = "vpu"
     VLLM_TPU_GDN_PREFILL_NO_ZERO_INIT: bool = False
     QWEN4_EXP_PREFILL_SP: bool = False
     QWEN4_EXP_PD_STAGING_BYTES: int = 8 << 30
@@ -1088,6 +1089,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # tile (any multiple of 32 rows, at least two tiles), so every served step
     # size runs 256-row tiles (3,200 = 12 x 256 + 128). Implies odd counts.
     "TPU_QWEN4_HC_PREFILL_PARTIAL_TILE": env_bool("TPU_QWEN4_HC_PREFILL_PARTIAL_TILE"),
+    # qwen4_exp prefill fused HC mixes (hc_full, the fused mix): the per-branch
+    # RMS norm's sum of squares and loop step. vpu (default, today); rows64
+    # (64-row steps, bitwise); gram / gram64 (sum of squares as the diagonal of
+    # x x^T on the MXU; not bitwise, only the f32 summation order changes).
+    "TPU_QWEN4_HC_PREFILL_NORM": env_with_choices(
+        "TPU_QWEN4_HC_PREFILL_NORM", "vpu", ["vpu", "rows64", "gram", "gram64"],
+        case_sensitive=False,
+    ),
     # Pooled GDN: skip zero-filling the [T, n_v, d_v] output before the
     # decode (BATCHED) and prefill (PER_SEQ) kernels write it. Rows no request
     # owns (bucket padding) are then left unwritten; the decoder layer masks

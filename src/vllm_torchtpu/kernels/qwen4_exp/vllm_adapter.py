@@ -35,7 +35,12 @@ def build_gated_residual_op(
 
 @functools.cache
 def build_full_mix_op(
-    branches: int, hidden: int, eps: float, token_tile: int, partial: bool = False
+    branches: int,
+    hidden: int,
+    eps: float,
+    token_tile: int,
+    partial: bool = False,
+    norm_impl: str = "vpu",
 ):
     eps_tag = hashlib.sha1(repr(eps).encode()).hexdigest()[:8]
 
@@ -52,11 +57,12 @@ def build_full_mix_op(
             eps=eps,
             token_tile=token_tile,
             partial=partial,
+            norm_impl=norm_impl,
         )
 
     op = pallas.jax_op(
         f"qwen4_exp::hc_full_c{branches}_h{hidden}_m{token_tile}_e{eps_tag}"
-        f"{'_p' if partial else ''}_v1",
+        f"{'_p' if partial else ''}{'' if norm_impl == 'vpu' else '_n' + norm_impl}_v1",
         core,
     )
 
@@ -218,7 +224,12 @@ def build_decode_combine_mix_op(branches: int, hidden: int, eps: float):
 
 @functools.cache
 def build_prefill_inj_mix_op(
-    branches: int, hidden: int, eps: float, token_tile: int, partial: bool = False
+    branches: int,
+    hidden: int,
+    eps: float,
+    token_tile: int,
+    partial: bool = False,
+    norm_impl: str = "vpu",
 ):
     """TPU_QWEN4_HC_PREFILL_FUSED_MIX: prefill HC mix returning ``(mixed,
     injection)``; ``norm`` stays on chip. Callers gate it to whole tiles."""
@@ -242,11 +253,12 @@ def build_prefill_inj_mix_op(
             eps=eps,
             token_tile=token_tile,
             partial=partial,
+            norm_impl=norm_impl,
         )
 
     op = pallas.jax_op(
         f"qwen4_exp::hc_prefill_inj_c{branches}_h{hidden}_m{token_tile}_e{eps_tag}"
-        f"{'_p' if partial else ''}_v1",
+        f"{'_p' if partial else ''}{'' if norm_impl == 'vpu' else '_n' + norm_impl}_v1",
         core,
     )
 
@@ -262,7 +274,12 @@ def build_prefill_inj_mix_op(
 
 @functools.cache
 def build_prefill_combine_mix_op(
-    branches: int, hidden: int, eps: float, token_tile: int, partial: bool = False
+    branches: int,
+    hidden: int,
+    eps: float,
+    token_tile: int,
+    partial: bool = False,
+    norm_impl: str = "vpu",
 ):
     """The previous HC's combine fused ahead of this HC's prefill mix.
 
@@ -293,11 +310,13 @@ def build_prefill_combine_mix_op(
             block=block,
             prev_injection=prev_injection,
             partial=partial,
+            norm_impl=norm_impl,
         )
 
     op = pallas.jax_op(
         f"qwen4_exp::hc_prefill_combine_c{branches}_h{hidden}_m{token_tile}"
-        f"_e{eps_tag}{'_p' if partial else ''}_v1",
+        f"_e{eps_tag}{'_p' if partial else ''}"
+        f"{'' if norm_impl == 'vpu' else '_n' + norm_impl}_v1",
         core,
     )
 

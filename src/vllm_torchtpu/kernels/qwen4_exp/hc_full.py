@@ -13,6 +13,12 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from vllm_torchtpu.kernels.qwen4_exp.hc_prefill_fused import (
+    NORM_IMPLS,
+    branch_variance,
+    norm_rows_per_step,
+)
+
 
 def _kernel(
     x_hbm,
@@ -39,6 +45,7 @@ def _kernel(
     hidden,
     branches,
     eps,
+    norm_impl="vpu",
 ):
     weight_dma = pltpu.make_async_copy(weight_hbm, weight_vm, weight_sem)
     down_dma = pltpu.make_async_copy(down_hbm, down_vm, down_sem)
@@ -96,15 +103,16 @@ def _kernel(
                     norm_vm.at[parity], norm_vm.at[parity], norm_sems.at[parity]
                 ).wait()
 
+            step_rows = norm_rows_per_step(norm_impl, rows)
+
             def normalize_rows(index, carry):
-                offset = index * 32
+                offset = index * step_rows
                 weight = weight_vm[...].astype(jnp.float32)
                 for branch in range(branches):
                     start = branch * hidden
-                    values = x_vm[
-                        parity, pl.ds(offset, 32), pl.ds(start, hidden)
-                    ].astype(jnp.float32)
-                    variance = jnp.mean(values * values, axis=-1, keepdims=True)
+                    xb = x_vm[parity, pl.ds(offset, step_rows), pl.ds(start, hidden)]
+                    values = xb.astype(jnp.float32)
+                    variance = branch_variance(values, xb, hidden, norm_impl)
                     normalized = (
                         (values * jax.lax.rsqrt(variance + eps))
                         .astype(jnp.bfloat16)
@@ -115,12 +123,12 @@ def _kernel(
                         .astype(jnp.bfloat16)
                         .astype(jnp.float32)
                     )
-                    norm_vm[parity, pl.ds(offset, 32), pl.ds(start, hidden)] = (
+                    norm_vm[parity, pl.ds(offset, step_rows), pl.ds(start, hidden)] = (
                         normalized + scaled
                     ).astype(jnp.bfloat16)
                 return carry
 
-            jax.lax.fori_loop(0, rows // 32, normalize_rows, jnp.int32(0))
+            jax.lax.fori_loop(0, rows // step_rows, normalize_rows, jnp.int32(0))
             norm = norm_vm[parity] if rows == token_tile else norm_vm[parity, pl.ds(0, rows)]
         else:
             x = x_vm[parity].astype(jnp.float32)
@@ -243,12 +251,27 @@ def _kernel(
 
 @functools.partial(
     jax.jit,
-    static_argnames=("branches", "hidden", "eps", "token_tile", "interpret", "partial"),
+    static_argnames=(
+        "branches", "hidden", "eps", "token_tile", "interpret", "partial", "norm_impl"
+    ),
 )
 def _full_mix(
-    x, weight, down, up, *, branches, hidden, eps, token_tile, interpret=False, partial=False
+    x,
+    weight,
+    down,
+    up,
+    *,
+    branches,
+    hidden,
+    eps,
+    token_tile,
+    interpret=False,
+    partial=False,
+    norm_impl="vpu",
 ):
     tokens, width = x.shape
+    if norm_impl not in NORM_IMPLS:
+        raise ValueError(f"unknown HC norm_impl {norm_impl!r}")
     lowrank = down.shape[0]
     # At least two whole tiles: the drain below waits on both parities. With
     # `partial`, a last tile of any multiple of 32 rows.
@@ -271,6 +294,7 @@ def _full_mix(
             hidden=hidden,
             branches=branches,
             eps=eps,
+            norm_impl=norm_impl,
         ),
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=0,

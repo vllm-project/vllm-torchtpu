@@ -40,6 +40,36 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 _ROW_CHUNK = 32
+# TPU_QWEN4_HC_PREFILL_NORM: how the per-branch RMS norm forms its sum of
+# squares and how many rows one loop step normalizes.
+#   vpu     (default) VPU square + lane reduction, 32-row steps
+#   rows64  the same math in 64-row steps (bitwise equal to vpu)
+#   gram    sum of squares from the MXU: the diagonal of x x^T of a row
+#           block (exact bf16 products, f32 accumulation), 32-row steps;
+#           NOT bitwise: only the f32 summation order differs
+#   gram64  gram in 64-row steps
+NORM_IMPLS = ("vpu", "rows64", "gram", "gram64")
+
+
+def norm_rows_per_step(norm_impl: str, rows: int) -> int:
+    """Rows one norm loop step covers (64 for the *64 variants when it divides)."""
+    return 64 if norm_impl.endswith("64") and rows % 64 == 0 else _ROW_CHUNK
+
+
+def branch_variance(values, xb, hidden: int, norm_impl: str):
+    """mean(x^2) over one branch's rows: values f32 [r, hidden], xb the same
+    rows in bf16. vpu/rows64 keep today's jnp.mean (bitwise); gram/gram64 take
+    the sum of squares from the MXU (diag of xb xb^T)."""
+    if not norm_impl.startswith("gram"):
+        return jnp.mean(values * values, axis=-1, keepdims=True)
+    gram = jax.lax.dot_general(
+        xb, xb, (((1,), (1,)), ((), ())), preferred_element_type=jnp.float32
+    )
+    r = gram.shape[0]
+    eye = jax.lax.broadcasted_iota(jnp.int32, (r, r), 0) == jax.lax.broadcasted_iota(
+        jnp.int32, (r, r), 1
+    )
+    return jnp.sum(jnp.where(eye, gram, 0.0), axis=1, keepdims=True) / hidden
 
 
 def prefill_token_tile_ok(tokens: int, token_tile: int, partial: bool = False) -> bool:
@@ -50,7 +80,7 @@ def prefill_token_tile_ok(tokens: int, token_tile: int, partial: bool = False) -
     return tokens >= token_tile and tokens % token_tile == 0
 
 
-def _kernel(*refs, branches, hidden, eps, lowrank, prologue, scopes=0):
+def _kernel(*refs, branches, hidden, eps, lowrank, prologue, scopes=0, norm_impl="vpu"):
     def scope(name):
         # Region-trace scopes (with --xla_enable_custom_call_region_trace=true
         # they appear on the "XLA TraceMe" line). Off by default; a scoped
@@ -111,12 +141,12 @@ def _kernel(*refs, branches, hidden, eps, lowrank, prologue, scopes=0):
                 )
                 h = (residual + block * gates[:, b : b + 1]).astype(jnp.bfloat16)
                 h_ref[pl.ds(offset, rows), pl.ds(start, hidden)] = h
+                xb = h
                 values = h.astype(jnp.float32)
             else:
-                values = x_ref[pl.ds(offset, rows), pl.ds(start, hidden)].astype(
-                    jnp.float32
-                )
-            variance = jnp.mean(values * values, axis=-1, keepdims=True)
+                xb = x_ref[pl.ds(offset, rows), pl.ds(start, hidden)]
+                values = xb.astype(jnp.float32)
+            variance = branch_variance(values, xb, hidden, norm_impl)
             normalized = (
                 (values * jax.lax.rsqrt(variance + eps))
                 .astype(jnp.bfloat16)
@@ -132,14 +162,15 @@ def _kernel(*refs, branches, hidden, eps, lowrank, prologue, scopes=0):
             ).astype(jnp.bfloat16)
 
     tile = norm_vm.shape[0]
+    step_rows = norm_rows_per_step(norm_impl, tile)
     with scope("hcp_norm"):
-        if tile >= 2 * _ROW_CHUNK and tile % _ROW_CHUNK == 0:
+        if tile >= 2 * step_rows and tile % step_rows == 0:
             # Bound the live FP32 row working set like hc_full's 32-row loop.
             def chunk(index, carry):
-                normalize_rows(pl.multiple_of(index * _ROW_CHUNK, _ROW_CHUNK), _ROW_CHUNK)
+                normalize_rows(pl.multiple_of(index * step_rows, step_rows), step_rows)
                 return carry
 
-            jax.lax.fori_loop(0, tile // _ROW_CHUNK, chunk, jnp.int32(0))
+            jax.lax.fori_loop(0, tile // step_rows, chunk, jnp.int32(0))
         else:
             normalize_rows(0, tile)
 
@@ -215,6 +246,7 @@ def hc_prefill_mix(
     interpret=False,
     partial=False,
     scopes=0,
+    norm_impl="vpu",
 ):
     """Fused prefill HC mix with the injection gate, optionally after the
     previous HC's combine. ``partial`` admits a partial last tile (any multiple
@@ -241,12 +273,15 @@ def hc_prefill_mix(
         interpret=interpret,
         partial=partial,
         scopes=scopes,
+        norm_impl=norm_impl,
     )
 
 
 @functools.partial(
     jax.jit,
-    static_argnames=("branches", "hidden", "eps", "token_tile", "interpret", "partial", "scopes"),
+    static_argnames=(
+        "branches", "hidden", "eps", "token_tile", "interpret", "partial", "scopes", "norm_impl"
+    ),
 )
 def _hc_prefill_mix(
     x,
@@ -264,8 +299,11 @@ def _hc_prefill_mix(
     interpret,
     partial=False,
     scopes=0,
+    norm_impl="vpu",
 ):
     tokens, width = x.shape
+    if norm_impl not in NORM_IMPLS:
+        raise ValueError(f"unknown HC norm_impl {norm_impl!r}")
     lowrank = down.shape[0]
     prologue = block is not None
     if (
@@ -322,6 +360,7 @@ def _hc_prefill_mix(
             lowrank=lowrank,
             prologue=prologue,
             scopes=scopes,
+            norm_impl=norm_impl,
         ),
         grid=(pl.cdiv(tokens, token_tile),),
         in_specs=in_specs,

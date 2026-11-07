@@ -57,6 +57,7 @@ class GatedResidual(common_hc.GatedResidual):
             envs.TPU_QWEN4_HC_PREFILL_PARTIAL_TILE and prefill_full_tile
         )
         partial = self._prefill_partial
+        norm_impl = envs.TPU_QWEN4_HC_PREFILL_NORM.lower()
         self._prefill_inj_mix_op = None
         self._prefill_combine_mix_op = None
         if (
@@ -74,11 +75,11 @@ class GatedResidual(common_hc.GatedResidual):
 
             eps = self.hc_norm.variance_epsilon
             self._prefill_inj_mix_op = build_prefill_inj_mix_op(
-                self.hc_count, self.hidden_size, eps, prefill_full_tile, partial
+                self.hc_count, self.hidden_size, eps, prefill_full_tile, partial, norm_impl
             )
             # Used by the preceding HC's combine_mix (attn -> mlp).
             self._prefill_combine_mix_op = build_prefill_combine_mix_op(
-                self.hc_count, self.hidden_size, eps, prefill_full_tile, partial
+                self.hc_count, self.hidden_size, eps, prefill_full_tile, partial, norm_impl
             )
         if (
             prefill_full_tile
@@ -105,6 +106,7 @@ class GatedResidual(common_hc.GatedResidual):
                 self.hc_norm.variance_epsilon,
                 prefill_full_tile,
                 partial,
+                norm_impl,
             )
         if prefill_norm_tile and self.config.hc_per_branch_norm:
             from vllm_torchtpu.kernels.qwen4_exp.vllm_adapter import build_norm_op

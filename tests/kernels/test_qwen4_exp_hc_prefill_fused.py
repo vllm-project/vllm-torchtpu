@@ -439,3 +439,85 @@ def test_gdn_zero_init_policy(monkeypatch):
     assert not G.pooled_gdn_zero_initialize_out(3200, 1, 0)
     assert G.pooled_gdn_zero_initialize_out(8, 8, 0)  # decode bucket
     assert G.pooled_gdn_zero_initialize_out(32, 8, 3)  # MTP verify windows
+
+
+# ---- norm variants (TPU_QWEN4_HC_PREFILL_NORM): rows64 bitwise; gram not bitwise (f32 sum order only)
+
+
+def _count_dots(jaxpr):
+    n = 0
+    for eqn in jaxpr.eqns:
+        if eqn.primitive.name == "dot_general":
+            n += 1
+        for param in eqn.params.values():
+            for sub in (param if isinstance(param, (list, tuple)) else [param]):
+                inner = getattr(sub, "jaxpr", sub)
+                if hasattr(inner, "eqns"):
+                    n += _count_dots(inner)
+    return n
+
+
+@pytest.mark.parametrize("rows", [4 * TILE, 3 * TILE + 64])
+def test_norm_rows64_is_bitwise(rows):
+    x, weight, down, up, inject = _arrays(4 * TILE, seed=41)
+    x = x[:rows]
+    part = dict(partial=True) if rows % TILE else {}
+    for kernel, args in ((full, (x, weight, down, up)), (fused, (x, weight, down, up, inject))):
+        base = kernel(*args, **part)
+        r64 = kernel(*args, norm_impl="rows64", **part)
+        for a, b in zip(r64, base):
+            np.testing.assert_array_equal(_bits(a), _bits(b))
+
+
+def test_norm_gram_float64_rule_and_engagement():
+    """gram changes only the summation order of the sum of squares: outputs stay
+    within the float64 2x rule of the vpu path, and its kernel holds more MXU
+    dots (the x x^T per branch per step)."""
+    x, weight, down, up, inject = _arrays(4 * TILE, seed=43)
+    ref_mixed, _, _ = _reference(x, weight, down, up, inject)
+
+    def f64_mixed():
+        v = np.asarray(x, np.float64).reshape(-1, BRANCHES, HIDDEN)
+        n = v / np.sqrt(np.mean(v * v, -1, keepdims=True) + EPS)
+        norm = (n * (1 + np.asarray(weight, np.float64).reshape(BRANCHES, HIDDEN))).reshape(len(v), -1)
+        g = norm @ np.asarray(down, np.float64).T / BRANCHES
+        g = g / (1 + np.exp(-g))
+        lg = g @ np.asarray(up, np.float64).T
+        return ((1 / (1 + np.exp(-lg))) * norm).reshape(len(v), BRANCHES, HIDDEN).sum(1) / BRANCHES
+
+    exact = f64_mixed()
+    for kernel, args in ((full, (x, weight, down, up)), (fused, (x, weight, down, up, inject))):
+        for impl in ("gram", "gram64"):
+            got = np.asarray(kernel(*args, norm_impl=impl)[0], np.float64)
+            base = np.asarray(kernel(*args)[0], np.float64)
+            e_got, e_base = np.abs(got - exact), np.abs(base - exact)
+            assert np.sqrt((e_got ** 2).mean()) <= 2 * np.sqrt((e_base ** 2).mean()), impl
+            assert e_got.max() <= 2 * e_base.max() + 1e-3, impl
+            _close_bf16(got, ref_mixed, impl)
+            jx = jax.make_jaxpr(functools.partial(kernel, norm_impl=impl))(*args)
+            jv = jax.make_jaxpr(kernel)(*args)
+            assert _count_dots(jx.jaxpr) > _count_dots(jv.jaxpr), impl
+
+
+def test_norm_impl_rejects_unknown():
+    x, weight, down, up, inject = _arrays(2 * TILE)
+    with pytest.raises(ValueError, match="norm_impl"):
+        jax.eval_shape(functools.partial(full, norm_impl="bogus"), x, weight, down, up)
+    with pytest.raises(ValueError, match="norm_impl"):
+        jax.eval_shape(functools.partial(fused, norm_impl="bogus"), x, weight, down, up, inject)
+
+
+def test_norm_env_reaches_builders(monkeypatch, fake_adapter):
+    import sys
+
+    seen = []
+    fake = sys.modules["vllm_torchtpu.kernels.qwen4_exp.vllm_adapter"]
+
+    def record(*args):
+        seen.append(args)
+        return lambda *a: None
+
+    monkeypatch.setattr(fake, "build_full_mix_op", record)
+    monkeypatch.setattr(envs, "TPU_QWEN4_HC_PREFILL_NORM", "gram64")
+    GatedResidual(_module(3).config, prefill_full_tile=256)
+    assert seen and seen[-1][-1] == "gram64", seen
