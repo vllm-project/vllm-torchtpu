@@ -109,6 +109,7 @@ if TYPE_CHECKING:
     TPU_GDN_CONV_QK_PAIR_LAYOUT: bool = False
     VLLM_TPU_GDN_CONV_WEIGHT_KMAJOR: bool = False
     VLLM_TPU_GDN_PREFILL_BF16_QKV_2D: bool = False
+    VLLM_TPU_GDN_PREFILL_DENSE_CONV: bool = False
     TPU_ENABLE_GDN_DYNAMIC_TILING: bool = False
     VLLM_TPU_QSA_DECODE_QUERY_BLOCK: int = 0
     VLLM_TPU_QSA_TOPK_STATS: int = 0
@@ -564,6 +565,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_TPU_GDN_CONV_WEIGHT_KMAJOR": env_bool("VLLM_TPU_GDN_CONV_WEIGHT_KMAJOR"),
     # GDN v3 prefill: DMA bf16 qkv rows into PER_SEQ and cast in VMEM, not in HBM.
     "VLLM_TPU_GDN_PREFILL_BF16_QKV_2D": env_bool("VLLM_TPU_GDN_PREFILL_BF16_QKV_2D"),
+    # With VLLM_TPU_GDN_PREFILL_BF16_QKV_2D: the PER_SEQ chunked tile unpacks
+    # its bf16 rows token-dense ([rows, dim] f32) and runs the causal conv,
+    # SiLU and head split there (a tap is a sublane shift of dense rows),
+    # instead of on the one-row-per-vreg compact layout (Qwen3.5's
+    # TPU_GDN_PREFILL_DENSE_CONV, translated to q38's pooled GDN v3).
+    "VLLM_TPU_GDN_PREFILL_DENSE_CONV": env_bool("VLLM_TPU_GDN_PREFILL_DENSE_CONV"),
     # Size GDN v3 decode tiles and prefill chunks from per-rank heads, active
     # sequences and the VMEM estimate (kernels/gdn/v3/tiling.py) instead of
     # the fixed defaults.

@@ -593,3 +593,83 @@ def test_q38_pooled_prefill_2d_rows_bitwise(
     assert np.abs(out_off[:live].astype(np.float32)).max() > 0
     np.testing.assert_array_equal(out_on.view(np.uint16), out_off.view(np.uint16))
     np.testing.assert_array_equal(pool_on.view(np.uint8), pool_off.view(np.uint8))
+
+
+# --------------------------------------------------------------------------
+# Token-dense conv (VLLM_TPU_GDN_PREFILL_DENSE_CONV) over the 2D bf16 rows.
+
+
+def _metadata_of(args, states, static, **kwargs):
+    """GDNConfig metadata strings of each GDN v3 pallas_call in the program."""
+    text = _lowered(args, states, static, **kwargs)
+    return text.count("dense_conv")
+
+
+def test_dense_conv_flag_off_program_unchanged(monkeypatch):
+    """dense_conv=None reads the env (off) and lowers exactly as False; on, the
+    PER_SEQ kernel's metadata carries dense_conv and the program changes; the
+    f32 path (no 2D rows) ignores the flag; dense_conv never appears off."""
+    args, states, static = _small_case(_Q_LOC, 2, _T, _SLOTS)
+    kw = dict(decode_tile_size=2, mixed_tile_size=16, bf16_qkv_2d=True)
+    monkeypatch.setattr(envs, "VLLM_TPU_GDN_PREFILL_DENSE_CONV", False)
+    off = _lowered(args, states, static, dense_conv=False, **kw)
+    assert _lowered(args, states, static, dense_conv=None, **kw) == off
+    assert "dense_conv" not in off
+    on = _lowered(args, states, static, dense_conv=True, **kw)
+    assert on != off and "dense_conv" in on
+    f32 = dict(kw, bf16_qkv_2d=False)
+    assert _lowered(args, states, static, dense_conv=True, **f32) == _lowered(
+        args, states, static, dense_conv=False, **f32
+    )
+    # Ineligible chunk (12, not a multiple of 8): exactly the compact 2D program.
+    kw12 = dict(kw, mixed_tile_size=12)
+    assert _lowered(args, states, static, dense_conv=True, **kw12) == _lowered(
+        args, states, static, dense_conv=False, **kw12
+    )
+
+
+def test_dense_conv_reads_env(monkeypatch):
+    args, states, static = _small_case(_Q_LOC, 2, _T, _SLOTS)
+    kw = dict(decode_tile_size=2, mixed_tile_size=16, bf16_qkv_2d=True)
+    monkeypatch.setattr(envs, "VLLM_TPU_GDN_PREFILL_DENSE_CONV", True)
+    # The env is read at trace time; a trace cached by an earlier test under the
+    # same static arguments would be reused (a serving process reads it once).
+    jax.clear_caches()
+    assert "dense_conv" in _lowered(args, states, static, dense_conv=None, **kw)
+    monkeypatch.setattr(envs, "VLLM_TPU_GDN_PREFILL_DENSE_CONV", False)
+    jax.clear_caches()
+
+
+@pytest.mark.parametrize(
+    "q_loc,num_decode,tokens,slots,chunk,fresh",
+    [
+        # Unaligned starts 2, 23, 61; partial last tiles; padding rows; decodes.
+        (_Q_LOC, 2, _T, _SLOTS, 16, ()),
+        # Chunk 8 and a sequence without initial state.
+        (_Q_LOC, 2, _T, _SLOTS, 8, (3,)),
+        # Starts one row before and one past a 16-row tile boundary; chunk 32.
+        ((0, 15, 47, 81), 0, 96, 4, 32, (0,)),
+    ],
+)
+def test_dense_conv_matches_compact_rows_bitwise(
+    monkeypatch, q_loc, num_decode, tokens, slots, chunk, fresh
+):
+    """The dense path's outputs, conv states and recurrent states equal the
+    compact 2D path's and the f32 path's bit for bit (same arithmetic, op for
+    op; only the VMEM layout differs)."""
+    monkeypatch.setattr(vmem_ldst, "load_strided_heads", _strided_heads_by_value)
+    monkeypatch.setattr(vmem_ldst, "load_compact_to_large", _compact_to_large_by_value)
+    args, states, static = _small_case(q_loc, num_decode, tokens, slots, fresh, seed=5)
+    kw = dict(decode_tile_size=2, mixed_tile_size=chunk)
+    f32 = _interpret(args, states, static, bf16_qkv_2d=False, dense_conv=False, **kw)
+    compact = _interpret(args, states, static, bf16_qkv_2d=True, dense_conv=False, **kw)
+    dense = _interpret(args, states, static, bf16_qkv_2d=True, dense_conv=True, **kw)
+    assert np.abs(f32[1][: q_loc[-1]].astype(np.float32)).max() > 0
+    for ref_name, ref in (("f32", f32), ("compact2d", compact)):
+        (rc, rr), ro = ref
+        (dc, dr), do = dense
+        for name, g, e in (("out", do, ro), ("conv_state", dc, rc), ("recurrent_state", dr, rr)):
+            assert g.shape == e.shape and g.dtype == e.dtype, name
+            np.testing.assert_array_equal(
+                g.view(np.uint8), e.view(np.uint8), err_msg=f"dense vs {ref_name}: {name} differs"
+            )

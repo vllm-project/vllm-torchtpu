@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import dataclasses
 import functools
 from typing import cast
 
@@ -128,6 +129,26 @@ def inner_kernel(
 
     if p_id is None:
         p_id = pl.program_id(0)
+
+    if cfg.dense_conv:
+        _dense_inner_kernel(
+            qkv_slot_ref=qkv_slot_ref,
+            b_slot_ref=b_slot_ref,
+            a_slot_ref=a_slot_ref,
+            conv_state_in_slot_ref=conv_state_in_slot_ref,
+            recurrent_in_slot_ref=recurrent_in_slot_ref,
+            out_slot_ref=out_slot_ref,
+            conv_state_out_slot_ref=conv_state_out_slot_ref,
+            recurrent_out_slot_ref=recurrent_out_slot_ref,
+            metadata_ref=metadata_ref,
+            weights_ref=weights_ref,
+            carry_conv_scratch_ref=carry_conv_scratch_ref,
+            carry_recurrent_scratch_ref=carry_recurrent_scratch_ref,
+            dense_ref=act_scratch_ref,
+            cfg=cfg,
+            p_id=p_id,
+        )
+        return
 
     qkv_work_ref = qkv_slot_ref
     if cfg.qkv_2d:
@@ -293,6 +314,152 @@ def inner_kernel(
 
     if carry_recurrent_scratch_ref is not None:
         carry_recurrent_scratch_ref[...] = new_recurrent_state[:, -1]
+
+
+def _dense_inner_kernel(
+    *,
+    qkv_slot_ref: jax.Ref,  # [1, aligned_chunk + 16, dim] bf16
+    b_slot_ref: jax.Ref,
+    a_slot_ref: jax.Ref,
+    conv_state_in_slot_ref: jax.Ref,
+    recurrent_in_slot_ref: jax.Ref,
+    out_slot_ref: jax.Ref,
+    conv_state_out_slot_ref: jax.Ref,
+    recurrent_out_slot_ref: jax.Ref,
+    metadata_ref: memory_ref.MetadataRef,
+    weights_ref: memory_ref.WeightRefs,
+    carry_conv_scratch_ref: jax.Ref,
+    carry_recurrent_scratch_ref: jax.Ref,
+    dense_ref: jax.Ref,  # [8 + aligned_chunk, dim] f32
+    cfg: config.GDNConfig,
+    p_id: jax.Array,
+) -> None:
+    """PER_SEQ chunked tile over 2D bf16 rows on token-dense rows
+    (VLLM_TPU_GDN_PREFILL_DENSE_CONV; Qwen3.5's TPU_GDN_PREFILL_DENSE_CONV).
+
+    The compact path keeps one token row per vreg (one of eight sublanes in
+    use), so each conv tap is a whole-vreg op per 128 lanes per token, and it
+    stages the activations through VMEM for strided head loads. Here the
+    tile's rows are unpacked dense, a tap is a sublane shift of one load, and
+    each head is a lane range of the activated rows. The arithmetic is the
+    compact path's, op for op: the conv accumulates from zero in tap order,
+    then the bias, then SiLU; the conv state is the same masked row pick.
+    """
+    chunk, kprev, dim = cfg.chunk_size, cfg.prev_kernel_size, cfg.dim_size
+    align = config.QKV_2D_ROW_ALIGN
+    aligned_chunk = cfg.qkv_2d_aligned_chunk
+
+    # Unpack the tile's rows out of their 16-row aligned DMA window (before the
+    # states are selected, as the compact 2D path does, to keep the VMEM peak).
+    r_prefix = jax.lax.rem(metadata_ref.p_id_to_r_base[p_id, 0], align)
+    for prefix in range(align):
+
+        @pl.when(r_prefix == prefix)
+        def _unpack(prefix=prefix):
+            load_rows = pl.cdiv(prefix + aligned_chunk, align) * align
+            rows = qkv_slot_ref[0, :load_rows, :]
+            dense_ref[8 : 8 + aligned_chunk, :] = rows[
+                prefix : prefix + aligned_chunk, :
+            ].astype(jnp.float32)
+
+    real_sizes, prev_conv, prev_recurrent = vmem_ldst.load_and_select_states(
+        metadata_ref=metadata_ref,
+        p_id=p_id,
+        conv_state_in_slot_ref=conv_state_in_slot_ref,
+        recurrent_in_slot_ref=recurrent_in_slot_ref,
+        carry_conv_scratch_ref=carry_conv_scratch_ref,
+        carry_recurrent_scratch_ref=carry_recurrent_scratch_ref,
+        cfg=cfg,
+    )
+    for k in range(kprev):
+        dense_ref[8 - kprev + k : 9 - kprev + k, :] = prev_conv[0, k]
+
+    conv_weight = weights_ref.conv.weight[...].astype(jnp.float32)
+    conv_bias = None
+    if weights_ref.conv.bias is not None:
+        conv_bias = weights_ref.conv.bias[...].astype(jnp.float32)
+
+    # x row `base + t` is row t of the compact path's concat(prev_conv, chunk).
+    x = dense_ref[0 : 8 + chunk, :]
+    base = 8 - kprev
+    y = jnp.zeros((chunk, dim), jnp.float32)
+    for k in range(cfg.kernel_size):
+        y += x[base + k : base + k + chunk] * conv_weight[k]
+    if conv_bias is not None:
+        y += conv_bias.reshape(1, dim)
+
+    # Conv state: the compact path's checkpoint (window 1), the
+    # prev_kernel_size rows ending at the tile's last real token.
+    rs = real_sizes[0]
+    state = x[base + chunk : base + chunk + kprev]
+    for c in range(1, chunk):
+        state = jnp.where(c == rs, x[base + c : base + c + kprev], state)
+    state3 = state.reshape(kprev, 1, dim)
+    if cfg.state_plan is None:
+        conv_state_out_slot_ref[0, 0] = state3
+    else:
+        pl.when(metadata_ref.p_id_is_last_tile[p_id, 0])(
+            functools.partial(
+                vmem_ldst.store_state_region,
+                conv_state_out_slot_ref.at[0, 0],
+                cfg.state_plan.conv,
+                state3,
+            )
+        )
+    carry_conv_scratch_ref[0] = state3
+
+    act = jax.nn.silu(y)
+
+    padding_size = cfg.aligned_num_v_heads - cfg.num_v_heads
+    a_log = jnp.pad(weights_ref.gdn.a_log[...], ((0, padding_size)))
+    dt_bias = jnp.pad(weights_ref.gdn.dt_bias[...], ((0, padding_size)))
+
+    # Heads are lane ranges of the activated rows, q | k | v as
+    # load_activation_as_large reads them.
+    dk, dv = cfg.kq_head_dim, cfg.v_head_dim
+    k_off = cfg.num_kq_heads * dk
+    v_off = 2 * k_off
+
+    def heads(offset, num, width):
+        return jnp.stack(
+            [act[:, offset + h * width : offset + (h + 1) * width] for h in range(num)],
+            axis=0,
+        )[None]
+
+    q_large = heads(0, cfg.num_kq_heads, dk)
+    k_large = heads(k_off, cfg.num_kq_heads, dk)
+    v_large = heads(v_off, cfg.num_v_heads, dv)
+    b_large = jnp.expand_dims(vmem_ldst.load_compact_to_large(b_slot_ref), axis=1)
+    a_large = jnp.expand_dims(vmem_ldst.load_compact_to_large(a_slot_ref), axis=1)
+
+    out, new_recurrent_state = compute_gdn.chunked_gdn(
+        q_large=q_large,
+        k_large=k_large,
+        v_large=v_large,
+        b_large=b_large,
+        a_large=a_large,
+        state_prev=prev_recurrent,
+        a_log=a_log,
+        dt_bias=dt_bias,
+        cfg=cfg,
+        real_sizes=real_sizes,
+    )
+
+    out_slot_ref[...] = out.astype(out_slot_ref.dtype)
+    if cfg.state_plan is None:
+        recurrent_out_slot_ref[...] = new_recurrent_state.astype(
+            recurrent_out_slot_ref.dtype
+        )
+    else:
+        pl.when(metadata_ref.p_id_is_last_tile[p_id, 0])(
+            functools.partial(
+                vmem_ldst.store_state_region,
+                recurrent_out_slot_ref.at[0, 0],
+                cfg.state_plan.recurrent,
+                new_recurrent_state[0, 0],
+            )
+        )
+    carry_recurrent_scratch_ref[...] = new_recurrent_state[:, -1]
 
 
 def outer_kernel(
@@ -468,6 +635,7 @@ def bf16_qkv_2d_eligible(
         "attention_mode",
         "gate_lower_bound",
         "bf16_qkv_2d",
+        "dense_conv",
     ),
 )
 def fused_conv1d_gdn(
@@ -506,6 +674,7 @@ def fused_conv1d_gdn(
     decode_tile_size: int = 4,
     mixed_tile_size: int = 64,
     bf16_qkv_2d: bool | None = None,
+    dense_conv: bool | None = None,
 ) -> tuple[tuple[jax.Array, jax.Array], jax.Array] | tuple[jax.Array, jax.Array]:
     """Perform conv1d and gdn in a single fused kernel.
 
@@ -621,6 +790,9 @@ def fused_conv1d_gdn(
     # 2D bf16 rows skip the HBM f32 cast; see `bf16_qkv_2d_eligible`.
     if bf16_qkv_2d is None:
         bf16_qkv_2d = envs.VLLM_TPU_GDN_PREFILL_BF16_QKV_2D
+    # Token-dense conv of the PER_SEQ tile over those rows; see `_dense_inner_kernel`.
+    if dense_conv is None:
+        dense_conv = envs.VLLM_TPU_GDN_PREFILL_DENSE_CONV
     decode_capacity = state_indices.size * (num_spec_tokens + 1)
     qkv_2d = not prepared_qkv and bf16_qkv_2d_eligible(
         enabled=bf16_qkv_2d,
@@ -853,6 +1025,17 @@ def fused_conv1d_gdn(
             ),
             state_plan=state_plan,
         )
+        if (
+            dense_conv
+            and cfg.qkv_2d
+            and mode == config.GDNMode.PER_SEQ
+            and not cfg.use_recurrent
+            and not cfg.is_kda
+            and cfg.seq_tile_size == 1
+            and cfg.window_size == 1
+            and cfg.chunk_size % 8 == 0
+        ):
+            cfg = dataclasses.replace(cfg, dense_conv=True)
 
         # Step 6: Metadata preprocessing. Will be executed multiple times per-layer
         # but will be CSEed by compiler.

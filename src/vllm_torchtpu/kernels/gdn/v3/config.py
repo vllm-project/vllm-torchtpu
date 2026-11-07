@@ -127,6 +127,10 @@ class GDNConfig:
     # shapes and loops can be sized off it unconditionally and the extra axis
     # / iterations fold away in the non-speculative paths.
     window_size: int = 1
+    # Token-dense conv path of a PER_SEQ chunked tile over 2D bf16 rows
+    # (VLLM_TPU_GDN_PREFILL_DENSE_CONV); resolved by the wrapper. Left out of
+    # the kernel metadata while False, so other kernels' metadata is unchanged.
+    dense_conv: bool = False
 
     @property
     def chunk_size(self) -> int:
@@ -247,6 +251,8 @@ class GDNConfig:
 
     def get_metadata(self) -> dict[str, str | int | float]:
         cfgs_dict = dataclasses.asdict(self)
+        if not cfgs_dict.get("dense_conv"):
+            cfgs_dict.pop("dense_conv", None)
         ret = {}
         for path, val in jax.tree_util.tree_leaves_with_path(cfgs_dict):
             key = jax.tree_util.keystr(path, simple=True, separator=".")
@@ -296,7 +302,14 @@ class GDNConfig:
             carry_conv_scratch_ref=carry_conv_scratch,
             carry_recurrent_scratch_ref=carry_recurrent_scratch,
         )
-        if self.qkv_2d:
+        if self.dense_conv:
+            # Token-dense f32 rows of the tile: rows [8 - prev_kernel_size, 8)
+            # hold the carried conv rows, rows [8, 8 + chunk) the chunk, so
+            # every tap is a sublane shift of one 8-row-aligned load.
+            scratches["act_scratch_ref"] = pltpu.VMEM(
+                (8 + self.qkv_2d_aligned_chunk, self.dim_size), jnp.float32
+            )
+        elif self.qkv_2d:
             # f32 rows of the chunk, cast from the 2D bf16 tile; also where
             # the post-conv activations are staged for the head loads.
             scratches["act_scratch_ref"] = pltpu.VMEM(
