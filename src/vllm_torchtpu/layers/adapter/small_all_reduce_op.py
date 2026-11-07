@@ -1,0 +1,154 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Small TP all-reduces through the Pallas kernel in
+``kernels/experimental/small_collectives``.
+
+``prebuild`` builds the op over the expert-parallel mesh at model load. The
+device communicator then hands a 2-D bf16 block of at most ``max_rows()`` rows
+to the kernel and anything else to vLLM's collective.
+
+The choice reads the token count, so it is taken only in a trace that the
+backbone warmup forks per token bucket (``compilation.shape_variants``). Any
+other trace -- the MTP drafter, eager mode, the profiling run -- keeps vLLM's
+collective. Both sides of the fork lift the same rank buffer, as the warmup
+requires to hand a bucket's executable from one trace to the other.
+"""
+
+import jax
+import torch
+from jax.sharding import PartitionSpec
+
+from vllm_torchtpu import envs
+from vllm_torchtpu.compilation import shape_variants
+from vllm_torchtpu.distributed.ep_mesh import (
+    EP_AXIS_NAME,
+    build_ep_mesh,
+    ep_mesh_index,
+    get_ep_group,
+)
+from vllm_torchtpu.distributed.sharded_jax_op import sharded_jax_op
+from vllm_torchtpu.kernels.experimental.small_collectives import all_reduce
+from vllm_torchtpu.kernels.experimental.small_collectives.common import LANES
+from vllm_torchtpu.logger import init_logger
+
+logger = init_logger(__name__)
+
+# Largest TP all-reduce, in rows, the kernel takes by default: at H=4096 bf16
+# on 8 cores two-shot beats XLA through 96 rows and loses from 128.
+MAX_ROWS = 96
+
+
+def max_rows() -> int:
+    """The all-reduce row cap: TPU_SMALL_ALL_REDUCE_MAX_ROWS, else MAX_ROWS."""
+    return envs.TPU_SMALL_ALL_REDUCE_MAX_ROWS or MAX_ROWS
+
+
+_AR_OP = None
+# This core's mesh index as an int32 [1] device tensor: the kernel takes it as
+# data (see small_collectives/common.py).
+_RANK = None
+_CORES = 0
+_MESH_RANKS: tuple[int, ...] = ()
+
+
+def _build_all_reduce(mesh):
+    n = mesh.shape[EP_AXIS_NAME]
+    spec = PartitionSpec(EP_AXIS_NAME)
+
+    def body(block, rank):
+        return all_reduce.small_all_reduce(
+            block, num_cores=n, axis=EP_AXIS_NAME, rank=rank
+        )
+
+    def fn(x: jax.Array, rank: jax.Array) -> jax.Array:
+        return jax.shard_map(
+            body, mesh=mesh, in_specs=(spec, spec), out_specs=spec, check_vma=False
+        )(x, rank)
+
+    def fake(x, rank):
+        return torch.empty_like(x)
+
+    return sharded_jax_op(
+        "pallas::small_all_reduce",
+        fn,
+        mesh=mesh,
+        input_partition_specs=(spec, spec),
+        output_partition_specs=spec,
+        fake=fake,
+    )
+
+
+def prebuild() -> None:
+    """Build the op and this core's rank tensor, outside any traced region:
+    the mesh comes from a collective. A no-op unless TPU_SMALL_ALL_REDUCE."""
+    global _AR_OP, _RANK, _CORES, _MESH_RANKS
+    if not envs.TPU_SMALL_ALL_REDUCE or _AR_OP is not None:
+        return
+    mesh = build_ep_mesh()
+    if mesh is None:
+        raise NotImplementedError(
+            "TPU_SMALL_ALL_REDUCE=1 builds its kernel over the expert-parallel "
+            "mesh, and this deployment has no expert-parallel group (a dense "
+            "model or one core). Unset TPU_SMALL_ALL_REDUCE."
+        )
+    from vllm.distributed.parallel_state import get_tp_group
+
+    _CORES = mesh.shape[EP_AXIS_NAME]
+    ep_group = get_ep_group()
+    assert ep_group is not None  # build_ep_mesh() returned a mesh over it
+    _MESH_RANKS = tuple(int(r) for r in ep_group.ranks)
+    _RANK = torch.tensor([ep_mesh_index()], dtype=torch.int32, device="tpu")
+    _AR_OP = _build_all_reduce(mesh)
+    tp_all_reduce = tuple(int(r) for r in get_tp_group().ranks) == _MESH_RANKS
+    logger.info(
+        "Small all-reduce armed | cores=%d | max_rows=%d | one_shot_max_bytes=%d "
+        "| tp_all_reduce=%s | backbone warmup traces only; the MTP drafter and "
+        "eager steps keep vLLM's all-reduce",
+        _CORES,
+        max_rows(),
+        all_reduce.ONE_SHOT_MAX_BYTES,
+        tp_all_reduce,
+    )
+
+
+def _fits(x: torch.Tensor) -> bool:
+    """Static checks: whether this call site can take the kernel at all."""
+    return (
+        torch.compiler.is_compiling()
+        and shape_variants.in_warmup()
+        and x.dim() == 2
+        and x.dtype == torch.bfloat16
+        and x.shape[1] % (_CORES * LANES) == 0
+    )
+
+
+def retain(out: torch.Tensor) -> torch.Tensor:
+    """``out`` plus a zero read from the rank buffer, for a token-count branch
+    that skips the kernel while its other side calls it: the warmup hands a
+    bucket over only between traces that lift the same buffers. A read whose
+    result is dead would be eliminated, so the zero rides on ``out``."""
+    if _RANK is None or not shape_variants.in_warmup():
+        return out
+    value = _RANK[0].to(out.dtype)
+    return out + (value - value)
+
+
+def all_reduce_or(x: torch.Tensor, ranks, fallback) -> torch.Tensor:
+    """The sum of ``x`` over the group ``ranks``: the kernel for a small block
+    when the group is the mesh, ``fallback(x)`` otherwise."""
+    if _AR_OP is None or tuple(ranks) != _MESH_RANKS or not _fits(x):
+        return fallback(x)
+    if x.shape[0] <= max_rows():
+        return _AR_OP(x, _RANK)
+    return retain(fallback(x))
