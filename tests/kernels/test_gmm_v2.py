@@ -87,6 +87,28 @@ def test_apply_act_fn_dispatches_situ(monkeypatch, linear_beta):
     _assert_allclose(actual, expected)
 
 
+@pytest.mark.parametrize(
+    "fuse_act,limit",
+    [("silu_and_mul_with_clamp", 10.0), ("silu_and_mul_with_clamp:4.0", 4.0)],
+)
+def test_apply_act_fn_dispatches_clamped_silu(monkeypatch, fuse_act, limit):
+    monkeypatch.setattr(
+        "vllm_torchtpu.kernels.megablox.gmm_v2.pltpu.get_tpu_info",
+        lambda: SimpleNamespace(num_lanes=1),
+    )
+    # Both halves cross both limits, and gate goes below -limit, so a
+    # dropped clamp, a wrong limit, or clamping gate from below all show.
+    gate = jnp.asarray([-30.0, -3.0, 0.5, 7.0, 30.0])
+    up = jnp.asarray([5.0, -30.0, 2.0, 9.0, 40.0])
+    expected = jax.nn.silu(jnp.minimum(gate, limit)) * jnp.clip(up, -limit, limit)
+
+    actual = apply_act_fn(interleave_lane(gate, up), fuse_act)
+    _assert_allclose(actual, expected)
+    assert not jnp.allclose(actual, jax.nn.silu(gate) * up)
+    two_sided = jax.nn.silu(jnp.clip(gate, -limit, limit)) * jnp.clip(up, -limit, limit)
+    assert not jnp.allclose(actual, two_sided)
+
+
 def get_group_sizes(batch_size: int, num_groups: int) -> jax.Array:
     distribution = jax.random.uniform(
         jax.random.key(0), (num_groups - 1,), dtype=jnp.float32
@@ -256,7 +278,15 @@ def test_gmm_weight_quantized_matches_reference(weight_dtype, block_size):
 
 
 @pytest.mark.tpu_test
-@pytest.mark.parametrize("fuse_act", ["silu", "swigluoai"])
+@pytest.mark.parametrize(
+    "fuse_act",
+    [
+        "silu",
+        "swigluoai",
+        "silu_and_mul_with_clamp",
+        "silu_and_mul_with_clamp:4.0",
+    ],
+)
 def test_gmm_fused_activation_matches_reference(fuse_act):
     _require_tpu()
 
