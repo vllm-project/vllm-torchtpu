@@ -10,6 +10,8 @@
 #   WHEEL_URL   optional torch_tpu wheel installed over the image's (empty = keep the image's)
 #   REPLAY_URL  optional .npz of captured expert ids, fetched to /root/real_routes.npz (replay arms set
 #               TPU_MOE_ROUTING_REPLAY=/root/real_routes.npz)
+#   DATA_URL    optional .tgz extracted into /root/data (e.g. expert placement files: arms set
+#               TPU_MOE_EXPERT_PLACEMENT=/root/data/<file>)
 # ARMS='name:overlay:seqs:kv[:VAR=val+VAR=val]' (space-separated, run in order); seqs = GLOBAL_SEQS (all engines);
 #   kv = KV_BYTES per worker (bytes or auto). The arm env reaches the launcher and the client (BENCH_TEMPERATURE /
 #   BENCH_TOP_P / BENCH_TOP_K = request sampling, BENCH_SAVE_IDS=1 = token-id digest); MTP_K=<k> in it overrides K=3.
@@ -80,6 +82,7 @@ spec:
                     MODEL_URL='{{ .MODEL_URL | default "" }}'
                     WHEEL_URL='{{ .WHEEL_URL | default "" }}'
                     REPLAY_URL='{{ .REPLAY_URL | default "" }}'
+                    DATA_URL='{{ .DATA_URL | default "" }}'
                     TRACE='{{ .TRACE | default "1" }}'
                     TRACE_S='{{ .TRACE_S | default "2.5" }}'
                     TRACE_RANKS='{{ .TRACE_RANKS | default "auto" }}'
@@ -110,6 +113,10 @@ spec:
                     fetch "${MODEL_URL%/}" "$MODEL_PATH" dir || fatal "model config fetch failed"
                     [ -f "$MODEL_PATH/config.json" ] || fatal "no config.json under $MODEL_PATH"
                     if [ -n "$REPLAY_URL" ]; then fetch "$REPLAY_URL" /root/real_routes.npz || fatal "replay table fetch failed"; fi
+                    if [ -n "$DATA_URL" ]; then
+                      mkdir -p /root/data && fetch "$DATA_URL" /tmp/data.tgz && tar -xzf /tmp/data.tgz -C /root/data || fatal "data fetch failed"
+                      log "DATA sha=$(sha256sum /tmp/data.tgz | cut -c1-12) $(ls /root/data | tr '\n' ' ')"
+                    fi
                     ver() { pip show "$1" 2>/dev/null | awk '/^Version:/{print $2}'; }
                     VERS="vllm=$(ver vllm) torch_tpu=$(ver torch_tpu) torch=$(ver torch) libtpu=$(ver libtpu) jax=$(ver jax) transformers=$(ver transformers) python=$(python3 -V 2>&1 | cut -d' ' -f2)"
                     log "VERSIONS $VERS"; echo "$VERS" > "$OUT/versions-h$H.txt"
