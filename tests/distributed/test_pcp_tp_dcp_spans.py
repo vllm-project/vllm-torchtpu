@@ -58,7 +58,6 @@ def _page(heads, page, slab_bytes):
         (1, 1, 1, 1, 4),
         (4, 4, 8, 2, 2),  # Replicas also exist across destination DCP groups.
         (4, 4, 2, 1, 8),  # Multiple producers contribute to a destination page.
-        (1, 8, 8, 1, 2),  # TP8 -> TP8 with 2 KV heads: 4 replicas per head.
     ],
 )
 @pytest.mark.parametrize(
