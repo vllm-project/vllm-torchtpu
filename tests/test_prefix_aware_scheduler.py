@@ -16,6 +16,7 @@ import time
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+import pytest
 from vllm.v1.core.sched.request_queue import FCFSRequestQueue, SchedulingPolicy
 
 from vllm_torchtpu.core.prefix_aware_scheduler import PrefixAwareScheduler
@@ -88,6 +89,7 @@ def _make_scheduler(
 _CHUNK_TOKENS = 4096
 _HASHES_PER_CHUNK = 16
 _HASH_TOKENS = _CHUNK_TOKENS // _HASHES_PER_CHUNK
+_CAP_ENV = "TPU_PREFIX_AWARE_TIER_PROBE_MAX_CHUNKS"
 
 
 def _hashed_request(request_id: str, num_tokens: int, arrival_time: float):
@@ -158,18 +160,10 @@ def _offload_connector(
     return SimpleNamespace(_connectors=[SimpleNamespace(), offload])
 
 
-def test_default_knobs():
+def test_default_knobs(monkeypatch):
+    monkeypatch.delenv(_CAP_ENV, raising=False)
     assert PrefixAwareScheduler.WINDOW == 64
-    assert PrefixAwareScheduler.TIER_PROBE_MAX_CHUNKS == 64
-
-
-def test_env_knob(monkeypatch):
-    from vllm_torchtpu import envs
-
-    monkeypatch.delenv("TPU_PREFIX_AWARE_TIER_PROBE_MAX_CHUNKS", raising=False)
-    assert envs.TPU_PREFIX_AWARE_TIER_PROBE_MAX_CHUNKS == 64
-    monkeypatch.setenv("TPU_PREFIX_AWARE_TIER_PROBE_MAX_CHUNKS", "256")
-    assert envs.TPU_PREFIX_AWARE_TIER_PROBE_MAX_CHUNKS == 256
+    assert _make_scheduler([], {})._tier_probe_max_chunks == 256
 
 
 def test_promotes_warmest_within_window():
@@ -463,32 +457,39 @@ def test_tier_probe_accounts_for_flagged_eagle_group_tail_pop():
     assert s_one._prefix_warmth(r) == 0
 
 
-def test_tier_probe_caps_chunks_in_one_store_probe():
+def test_tier_probe_caps_chunks_in_one_store_probe(monkeypatch):
+    monkeypatch.delenv(_CAP_ENV, raising=False)
     now = time.time()
-    r = _hashed_request("r", num_tokens=100 * 4096, arrival_time=now)
-    manager = _FakeTierManager(keys=[_chunk_key(r, c) for c in range(100)])
+    r = _hashed_request("r", num_tokens=300 * 4096, arrival_time=now)
+    manager = _FakeTierManager(keys=[_chunk_key(r, c) for c in range(300)])
     s = _make_scheduler(
         [r], {"r": 0}, tier_warmth=True, connector=_offload_connector(manager)
     )
-    assert s._prefix_warmth(r) == s.TIER_PROBE_MAX_CHUNKS * 4096
+    assert s._prefix_warmth(r) == 256 * 4096
     # One probe per request covers the whole capped run, not one per chunk.
     assert manager.calls == 1
-    assert manager.probed == [
-        [_chunk_key(r, c) for c in range(s.TIER_PROBE_MAX_CHUNKS)]
-    ]
+    assert manager.probed == [[_chunk_key(r, c) for c in range(256)]]
 
 
-def test_tier_probe_cap_follows_the_instance_setting():
+@pytest.mark.parametrize("cap", [1, 160])
+def test_tier_probe_cap_follows_the_env_knob(monkeypatch, cap):
+    monkeypatch.setenv(_CAP_ENV, str(cap))
     now = time.time()
     r = _hashed_request("r", num_tokens=200 * 4096, arrival_time=now)
     manager = _FakeTierManager(keys=[_chunk_key(r, c) for c in range(200)])
     s = _make_scheduler(
         [r], {"r": 0}, tier_warmth=True, connector=_offload_connector(manager)
     )
-    s.TIER_PROBE_MAX_CHUNKS = 160
-    assert s._prefix_warmth(r) == 160 * 4096
-    assert manager.calls == 1
-    assert len(manager.probed[0]) == 160
+    assert s._prefix_warmth(r) == cap * 4096
+    assert manager.probed == [[_chunk_key(r, c) for c in range(cap)]]
+
+
+@pytest.mark.parametrize("value", ["0", "-1"])
+def test_tier_probe_cap_must_be_positive(monkeypatch, value):
+    # A cap of 0 would silently turn the probe off with tier warmth on.
+    monkeypatch.setenv(_CAP_ENV, value)
+    with pytest.raises(ValueError, match=f"{_CAP_ENV}: must be > 0"):
+        _make_scheduler([], {}, tier_warmth=True)
 
 
 def test_tier_probe_asks_for_the_chunks_past_the_hbm_hit():

@@ -233,7 +233,7 @@ if TYPE_CHECKING:
     TPU_SCHED_KV_PREFETCH_WAITING: int = 0
     TPU_SCHED_KV_PREFETCH_RESERVE_BLOCKS: int = 64
     TPU_PREFIX_AWARE_TIER_WARMTH: bool = False
-    TPU_PREFIX_AWARE_TIER_PROBE_MAX_CHUNKS: int = 64
+    TPU_PREFIX_AWARE_TIER_PROBE_MAX_CHUNKS: int = 256
     TPU_OFFLOAD_KEEP_EAGLE_TAIL: bool = False
     TPU_RAIDEN_INLINE_LOAD: bool = False
     QUANTIZE_ON_LOAD_PREFIXES: list[str] = []
@@ -1730,11 +1730,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_PREFIX_AWARE_TIER_WARMTH": env_bool(
         "TPU_PREFIX_AWARE_TIER_WARMTH", default=False
     ),
-    # PrefixAwareScheduler: most offload-tier chunks probed per request for tier
-    # warmth (64 chunks x 4096 tokens = 256K). Past the cap, the rest of a long
-    # prompt the tier holds still ranks as cold.
-    "TPU_PREFIX_AWARE_TIER_PROBE_MAX_CHUNKS": env_nonnegative_int(
-        "TPU_PREFIX_AWARE_TIER_PROBE_MAX_CHUNKS", 64
+    # PrefixAwareScheduler: most offload-tier chunks the tier-warmth probe asks
+    # about per request. Past the cap, the rest of a long prompt the tier holds
+    # still ranks as cold. Must be > 0; TPU_PREFIX_AWARE_TIER_WARMTH=0 turns the
+    # probe off. 256 chunks is 1M tokens at 4096 tokens/chunk, which covers whole
+    # prompts at GLM-5.2's max model length. On a GLM-5.2 P/D multi-turn coding
+    # replay at concurrency 80, 256 gave 8.4% more tokens per dollar than 64 at
+    # flat requests/s: long sessions the tier held stopped waiting behind
+    # shorter requests. Cost: one batched store lookup per probed request (split
+    # only around chunks with a save in flight), cached for TIER_PROBE_TTL_S
+    # while the request's HBM hit is unchanged. Operators lower it only if
+    # scheduler step time shows the probe's cost.
+    "TPU_PREFIX_AWARE_TIER_PROBE_MAX_CHUNKS": env_positive_int_or_none(
+        "TPU_PREFIX_AWARE_TIER_PROBE_MAX_CHUNKS", default=256
     ),
     # Offload tier: serve the whole tier hit when no KV cache group is
     # annotated as an MTP/EAGLE drafter group. The pinned vLLM then flags every
