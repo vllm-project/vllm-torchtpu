@@ -468,7 +468,7 @@ def test_gmm_v2_int4_packed_matches_reference():
 @pytest.mark.parametrize(
     "batch_size, group_sizes, block_size",
     [
-        # Decode: few rows per expert (fp8 rhs feed).
+        # Decode: few rows per expert (fp8 rhs feed, 16/32-row buckets).
         (32, [0, 2, 0, 1, 0, 0, 3, 0, 0, 0, 2, 0, 0, 1, 0, 0], 128),
         # tile_m 64 -> 32-row fp8 tiles; groups past 32 rows span tiles.
         (96, [2, 0, 17, 0, 1, 0, 0, 30, 0, 0, 0, 40, 0, 0, 0, 2], 128),

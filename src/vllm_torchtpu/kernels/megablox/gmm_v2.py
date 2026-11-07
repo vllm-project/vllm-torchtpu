@@ -1096,18 +1096,21 @@ def calculate_tiling(
             break
         tile_m = new_tile_m
 
-    # An untiled-up (decode) tile_m makes every group pay for tile_m rows, and
-    # rows cost MXU time on the fp8 rhs feed: use fp8-sized tiles instead.
-    # Two such tiles cost what one bf16 tile does, and more buckets would
-    # bloat the program (each bucket is a copy of the body).
+    # A small-size_m tile_m that did not grow makes every group pay for tile_m
+    # rows, and rows cost MXU time on the fp8 rhs feed: use fp8-sized tiles in
+    # two buckets. Two such tiles cost what one bf16 tile does, and more
+    # buckets would bloat the program (each bucket is a copy of the body).
+    sublane = _get_lhs_sublane_size(lhs_dtype, dims.size_m)
     if (
         bucket_base == tile_m
         and dims.size_m < 2 * tile_m  # growth stopped by size_m, not VMEM
-        and tile_m > FP8_RHS_MAX_BUCKET_M
-        and tile_m % FP8_RHS_TILE_M == 0
         and fp8_rhs_feed_dtype(lhs_cfgs, rhs_cfgs) is not None
     ):
-        tile_m = bucket_base = FP8_RHS_TILE_M
+        if tile_m > FP8_RHS_MAX_BUCKET_M and tile_m % FP8_RHS_TILE_M == 0:
+            tile_m = bucket_base = FP8_RHS_TILE_M
+        # Partial buckets assume a single k tile (run_matmul_step).
+        if num_k_tiles == 1 and tile_m == 2 * sublane:
+            bucket_base = sublane
 
     return TileSizes(
         tile_m=tile_m, tile_k=tile_k, tile_n=tile_n, bucket_base=bucket_base
