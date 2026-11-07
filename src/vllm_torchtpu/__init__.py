@@ -1129,20 +1129,30 @@ def _patch_vllm_hybrid_pcp_block_sizes() -> None:
                 _effective_block_size(group.kv_cache_spec, pcp) for group in groups
             ]
         scheduler_block_size = math.lcm(*group_block_sizes)
+        # Hash only over prefix-cacheable groups, as upstream's resolver does
+        # (Qwen4Exp's 4-token raw ring is not one); other models keep every
+        # group.
+        hashing_sizes = group_block_sizes
+        if is_qwen4_exp(vllm_config):
+            hashing_sizes = [
+                size
+                for group, size in zip(groups, group_block_sizes)
+                if getattr(group.kv_cache_spec, "prefix_cacheable", True)
+            ] or group_block_sizes
 
         connector_enabled = vllm_config.kv_transfer_config is not None
         if not (cache_config.enable_prefix_caching or connector_enabled):
             hash_block_size = scheduler_block_size
         elif cache_config.prefix_match_unit is None:
-            hash_block_size = math.gcd(*group_block_sizes)
+            hash_block_size = math.gcd(*hashing_sizes)
         else:
             hash_block_size = cache_config.prefix_match_unit
-            if any(bs % hash_block_size != 0 for bs in group_block_sizes):
+            if any(bs % hash_block_size != 0 for bs in hashing_sizes):
                 raise ValueError(
                     f"Invalid prefix_match_unit={hash_block_size}; all logical "
                     "PCP KV cache group block sizes must be divisible by "
                     "prefix_match_unit. Got "
-                    f"block sizes={group_block_sizes}."
+                    f"block sizes={hashing_sizes}."
                 )
 
         logger.info(
