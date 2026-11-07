@@ -784,6 +784,26 @@ class SharedLanding:
             self._gather_fn(p.bucket)(self.staging, dev(p.pack), send, gathered)
             self._scatter_fn()(self.pool, gathered, dev(p.scatter_src), dev(p.scatter_dst))
 
+    def warm(self) -> float:
+        """Compile the gather of every bucket for the staging carrier's own
+        shape; returns the seconds taken. Collective, read-only on the carrier.
+
+        The self-test compiles the gather for its scratch source, so the first
+        landing of each bucket would otherwise compile on the serving path
+        (1.5-1.7 s per shared request in q38-xfer-tputest-s4-i1 run 3,
+        j-de57096a, against about 6 ms for a routed load). Call it after the
+        native manager has registered the carrier: it only reads page 0 (the
+        null page), as every landing reads the carrier, and writes nothing but
+        the landing's own send and gathered buffers."""
+        import time
+
+        g, device = self.geo.group, self.pool.device
+        t0 = time.monotonic()
+        for bucket in pd_shared_compressed.GATHER_PAGE_BUCKETS:
+            pack = torch.zeros(bucket, dtype=torch.int32, device=device)
+            self._gather_fn(bucket)(self.staging, pack, self.send[:bucket], self.gathered[: g * bucket])
+        return time.monotonic() - t0
+
     def selftest(self, rank: int) -> list[int]:
         """Compile the gather and the scatter of every bucket and check the
         gather's bytes; returns the failing buckets. Collective.
@@ -1377,6 +1397,12 @@ class StagedConsumer:
                     f"QWEN4_EXP_PD_SHARED_COMPRESSED self-test: the TP all-gather "
                     f"returned wrong bytes for buckets {failures}"
                 )
+
+    def warm_shared(self) -> float | None:
+        """``SharedLanding.warm`` when shared compressed keys are on (else None)."""
+        if getattr(self, "landing", None) is None:
+            return None
+        return self.landing.warm()
 
     def plan_repack(self, uuid: int, dst_tables, num_tokens: int) -> RepackPlan:
         """Every index of one load's landing, in numpy, before any device work

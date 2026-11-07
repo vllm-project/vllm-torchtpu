@@ -534,3 +534,61 @@ def test_selftest_never_touches_the_staging_carrier():
     assert failures == []
     assert touched == [], f"the self-test touched the staging carrier: {sorted(set(touched))}"
     assert torch.equal(staging.view(torch.uint8), before)
+
+
+def _cpu_landing(G=2, pages=5):
+    import torch
+
+    from vllm_torchtpu.models.vllm.qwen4_exp import pd_staging
+
+    staging = torch.arange(pages * 8 * 4 * 16, dtype=torch.int64).remainder(251).to(torch.uint8)
+    staging = staging.view(torch.float8_e4m3fn).reshape(pages, 8, 1, 4, 16)
+    pool = torch.zeros(6, 8, 1, 4, 16, dtype=torch.float8_e4m3fn)
+    return pd_staging.SharedLanding(staging, pool, None, SimpleNamespace(group=G, page_rows=8)), staging
+
+
+def test_warm_compiles_every_bucket_for_the_carrier_and_only_reads_it():
+    """run 3 (j-de57096a): each shared request's first landing took 1.5-1.7 s,
+    the gather compiling for the carrier's shape (the self-test compiles its
+    scratch shape). warm() calls every bucket's gather with the carrier itself
+    and page 0, and writes nothing into it."""
+    import torch
+
+    from vllm_torchtpu.models.vllm.qwen4_exp import pd_shared_compressed as psc
+
+    landing, staging = _cpu_landing()
+    calls = []
+
+    def gather_fn(bucket):
+        def gather(src, pack, send, gathered):
+            calls.append((bucket, src is staging, tuple(pack.tolist()), send.shape[0], gathered.shape[0]))
+            send.copy_(src[pack])
+            return pack[0]
+        return gather
+
+    landing._gather_fn = gather_fn
+    before = staging.view(torch.uint8).clone()
+    landing.warm()
+    assert calls == [(b, True, (0,) * b, b, 2 * b) for b in psc.GATHER_PAGE_BUCKETS]
+    assert torch.equal(staging.view(torch.uint8), before)
+
+
+def test_warm_runs_after_native_registration_only_with_shared_on():
+    """register_runner ends with _after_native_registration (the native manager
+    already holds the carrier); it warms only a shared staged consumer."""
+    import inspect
+
+    src = inspect.getsource(pc.Qwen4ExpRaidenWorker.register_runner)
+    assert src.index("engine.register_pools(") < src.index("self._after_native_registration()")
+    w = object.__new__(pc.Qwen4ExpRaidenWorker)
+    w.tp_rank = 0
+    warmed = []
+    w._staging = SimpleNamespace(warm_shared=lambda: warmed.append(1) or 0.1)
+    w._qwen_shared = None
+    w._after_native_registration()
+    assert warmed == []
+    w._qwen_shared = object()
+    w._after_native_registration()
+    assert warmed == [1]
+    w._staging = None
+    w._after_native_registration()  # a producer: nothing to warm

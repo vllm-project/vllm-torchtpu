@@ -441,6 +441,26 @@ class Qwen4ExpRaidenWorker(TPURaidenConnectorWorker):
         self._raiden_manifest = manifest
         self._raiden_transfer_engine = engine
         self._raiden_admission_summary = summary
+        self._after_native_registration()
+
+    def _after_native_registration(self) -> None:
+        """Work that needs the native manager to hold the carrier already.
+
+        QWEN4_EXP_PD_SHARED_COMPRESSED: compile the landing gather for the
+        staging carrier's shape (read-only), so no served landing pays the
+        first-call compile. Collective, like the self-test: every TP worker
+        reaches the end of register_runner at the same point."""
+        staging = getattr(self, "_staging", None)
+        if staging is None or getattr(self, "_qwen_shared", None) is None:
+            return
+        seconds = staging.warm_shared()
+        if seconds is not None:
+            logger.info(
+                "Qwen PD shared compressed keys rank%d: landing gather warmed for the "
+                "carrier shape in %.1f s",
+                self.tp_rank,
+                seconds,
+            )
 
     def _producer_route(self, layout):
         """QWEN4_EXP_PD_ROUTED_DST on a TP1 pipeline producer: its staged
