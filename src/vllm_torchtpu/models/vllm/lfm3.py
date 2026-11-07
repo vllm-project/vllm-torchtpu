@@ -135,23 +135,17 @@ def _short_conv_core(
     )
 
 
-_SHORT_CONV_OP: Any = None
+# Registered at import, never from forward: the backbone forward is traced
+# fullgraph by Dynamo, which cannot trace torch.library registration. One op
+# serves every conv layer (same graph, one compile).
+_SHORT_CONV_OP = pallas.jax_op(
+    "pallas::lfm3_short_conv", _short_conv_core, donate_argnums=(1,)
+)
 
 
-def _short_conv_op():
-    """One op shared by every conv layer (same graph, one compile)."""
-    global _SHORT_CONV_OP
-    if _SHORT_CONV_OP is None:
-        op = pallas.jax_op(
-            "pallas::lfm3_short_conv", _short_conv_core, donate_argnums=(1,)
-        )
-
-        def _fake(bx, conv_state, *args, **kwargs):
-            return torch.empty_like(bx), torch.empty_like(conv_state)
-
-        op.register_fake(_fake)
-        _SHORT_CONV_OP = op
-    return _SHORT_CONV_OP
+@_SHORT_CONV_OP.register_fake
+def _short_conv_fake(bx, conv_state, *args, **kwargs):
+    return torch.empty_like(bx), torch.empty_like(conv_state)
 
 
 class Lfm3ShortConv(nn.Module, MambaBase):
@@ -249,7 +243,7 @@ class Lfm3ShortConv(nn.Module, MambaBase):
             if metadata.mamba_state_indices is None:
                 raise RuntimeError("LFM3 short conv needs mamba_state_indices")
             conv_state = self.kv_cache[0]
-            conv_out, new_state = _short_conv_op()(
+            conv_out, new_state = _SHORT_CONV_OP(
                 bx,
                 conv_state,
                 self.conv_weight_t,
