@@ -72,11 +72,16 @@ class TpuDeepseekV4Tokenizer(TokenizerLike):
 
 def register_tokenizers() -> None:
     from vllm_torchtpu import envs
+    from vllm_torchtpu.core.dp_prefix_affinity import (
+        install_if_enabled as install_dp_prefix_affinity,
+    )
     from vllm_torchtpu.core.dp_prompt_backlog import (
         install_if_enabled as install_dp_prompt_backlog,
     )
 
     install_dp_prompt_backlog()
+    # Second, so that the prefix choice falls back to the backlog choice.
+    install_dp_prefix_affinity()
     if not envs.TPU_DSV4_HONOR_CONTINUE_FINAL_MESSAGE:
         return
 
