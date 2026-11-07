@@ -48,7 +48,6 @@ retired. pytest lanes are out of scope too.
 schema: 1
 name: glm-5.2-fp8-dp16-ep
 server:
-  image: ci                       # this build's CI image, or a full image URI
   model:
     name: zai-org/GLM-5.2-FP8     # what clients call it (--served-model-name)
     path: gs://tpu-commons-ci/glm/GLM-5.2-FP8   # what the server loads (--model)
@@ -79,7 +78,22 @@ tasks:
     tolerance: 0.025
 ```
 
+[REFERENCE.md](REFERENCE.md) lists every field with its type, default and
+description, and the validation rules and reserved names. It and the JSON
+schemas in `schema/` are generated from the models. For completion and errors
+in an editor that uses the YAML language server, start a scenario file with
+this line, the path relative to the file (`defaults.yaml` takes
+`defaults.schema.json`):
+
+```yaml
+# yaml-language-server: $schema=<path>/tools/scenario/schema/scenario.schema.json
+```
+
 ### Server
+
+`image` is a full image URI. Left unset, the target supplies the image: the CI
+fleet target uses the build's own image, and the `kubectl` target, which has
+none, asks for `--set server.image=<image URI>`.
 
 `server` describes one role, or holds `roles` for P/D, where each role has its
 own hardware, args, env and KV role. Hardware is four fields with GKE's names,
@@ -109,12 +123,21 @@ error.
 | Task | What it runs |
 |---|---|
 | `perf` | `vllm bench serve` (or InferenceX's `benchmark_serving`) per ISL/OSL x concurrency cell |
-| `eval` | `lm_eval` per task, optionally once per concurrency |
-| `agentx` | InferenceX AgentX replay at one concurrency against a fresh server; a ladder is a sweep |
+| `eval` | `lm_eval` per task, optionally once per concurrency; or InferenceX's eval client, eval-only and alone on a fresh server, gated by InferenceX's score floor |
+| `agentx` | InferenceX AgentX replay (`infx.bench agentic`) at one concurrency against a fresh server; a ladder is a sweep |
 | `custom` | any command, given the server URLs and a results directory |
 
-Baselines sit next to the task they gate, and `scenario calibrate` (M2)
-rewrites them from a run.
+Perf and lm_eval baselines sit next to the task they gate, and `scenario
+calibrate` (M2) rewrites them from a run. AgentX and InferenceX evals have no
+baseline: InferenceX checks them itself.
+
+AgentX follows InferenceX's own runs. `tasks.inferencex` is the deployment's
+identity (model prefix, precision, framework, speculative decoding, KV
+offload, router), which its AgentX rows and InferenceX evals share. The AgentX
+task states only what InferenceX's matrix gives a point: concurrency,
+duration (InferenceX publishes 1h windows) and fast mode (bring-up only). Every
+other client setting is pass-through `env`, as an InferenceX recipe's
+`benchmark.env` is.
 
 ### Sweeps
 
