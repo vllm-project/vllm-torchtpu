@@ -29,6 +29,8 @@ from typing import TYPE_CHECKING, Any, Literal
 from ..exec_spec import NumericsClass
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from ..exec_spec import ExecSpec
     from .layout import PoolLayout
 
@@ -152,7 +154,9 @@ class PoolBackend:
     supports_pool_gather: bool = False
     # `layout -> PoolBackend` with the same callbacks and options (set by
     # `make_pool_backend`); see `with_layout`.
-    rebuild: Any = dataclasses.field(default=None, compare=False, repr=False)
+    rebuild: Callable[[PoolLayout], PoolBackend] | None = dataclasses.field(
+        default=None, compare=False, repr=False
+    )
 
     def with_layout(self, layout: PoolLayout) -> PoolBackend:
         """The same backend over `layout` (e.g. another conv storage dtype)."""
