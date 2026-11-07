@@ -1307,3 +1307,64 @@ def test_rejection_sampler_synthetic_recovers_rejected_rows_only(
             expected[req, length] = req
         row += length
     assert torch.equal(output, expected)
+
+
+@pytest.mark.parametrize("synthetic", [False, True])
+def test_rejection_sampler_skip_top_k_matches_full_path(device, synthetic):
+    """apply_top_k=False (no request sets top-k) gives the same tokens as the
+    full top-k + top-p path at the served bucket, synthetic or not."""
+    num_reqs, k, vocab_size = 64, 7, 128 * 64
+    rows = num_reqs * k
+    gen = torch.Generator().manual_seed(1)
+    logits = torch.randn(rows, vocab_size, generator=gen) * 4
+    drafts = torch.where(
+        torch.rand(rows, generator=gen) < 0.5,
+        logits.argmax(dim=-1),
+        torch.randint(0, vocab_size, (rows,), generator=gen),
+    )
+    temperatures = torch.ones((rows, 1))
+    temperatures[::9] = 0.0
+    segment_ids, group_indices = _segment_info([k] * num_reqs, device)
+    kwargs = dict(
+        draft_token_ids=drafts.to(torch.int32).to(device),
+        num_draft_tokens=torch.full((num_reqs,), k, dtype=torch.int32, device=device),
+        target_logits=logits.to(device),
+        bonus_token_ids=torch.arange(num_reqs, dtype=torch.int32, device=device),
+        segment_ids=segment_ids,
+        group_indices=group_indices,
+        max_draft_tokens=k,
+        temperatures=temperatures.to(device),
+        top_k=torch.zeros((rows, 1), dtype=torch.int32, device=device),
+        top_p=torch.full((rows, 1), 0.95, device=device),
+        accept_u=torch.rand(rows, generator=gen).to(device),
+        recover_u=torch.rand(rows, vocab_size, generator=gen).to(device),
+        do_sampling=True,
+    )
+    sampler = (
+        _synthetic_sampler([0.9, 0.75, 0.6, 0.5, 0.4, 0.3, 0.2], device)
+        if synthetic
+        else RejectionSampler()
+    )
+    expected = sampler(**kwargs)
+    result = sampler(**kwargs, apply_top_k=False)
+    assert torch.equal(result, expected)
+    # Positive control: the inputs reject and recover somewhere.
+    assert bool((expected[:, :k] != kwargs["draft_token_ids"].view(num_reqs, k)).any())
+
+
+def test_apply_top_k_top_p_skip_top_k_is_exact_without_top_k(device):
+    gen = torch.Generator().manual_seed(2)
+    logits = (torch.randn(16, 4096, generator=gen) * 4).to(device)
+    top_k = torch.zeros((16, 1), dtype=torch.int32, device=device)
+    top_p = torch.rand((16, 1), generator=gen).to(device)
+    top_p[::3] = 1.0
+    expected = apply_top_k_top_p(logits, top_k, top_p)
+    result = apply_top_k_top_p(logits, top_k, top_p, apply_top_k=False)
+    assert torch.equal(result, expected)
+    # With top-k set on a row the skip is not exact, so the caller must not
+    # take it then.
+    top_k[0] = 5
+    assert not torch.equal(
+        apply_top_k_top_p(logits, top_k, top_p),
+        apply_top_k_top_p(logits, top_k, top_p, apply_top_k=False),
+    )

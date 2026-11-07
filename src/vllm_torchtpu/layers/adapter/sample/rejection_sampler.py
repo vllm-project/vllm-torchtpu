@@ -73,6 +73,7 @@ class RejectionSampler:
         target_argmax: torch.Tensor | None = None,
         apply_topk_topp: bool = True,
         draft_probs: torch.Tensor | None = None,
+        apply_top_k: bool = True,
     ) -> torch.Tensor:
         return self.forward(
             draft_token_ids=draft_token_ids,
@@ -92,6 +93,7 @@ class RejectionSampler:
             target_argmax=target_argmax,
             apply_topk_topp=apply_topk_topp,
             draft_probs=draft_probs,
+            apply_top_k=apply_top_k,
         )
 
     def forward(
@@ -113,6 +115,7 @@ class RejectionSampler:
         target_argmax: torch.Tensor | None = None,
         apply_topk_topp: bool = True,
         draft_probs: torch.Tensor | None = None,
+        apply_top_k: bool = True,
     ) -> torch.Tensor:
         """Performs rejection sampling for speculative decoding.
 
@@ -146,6 +149,10 @@ class RejectionSampler:
             from (probabilistic drafting), shaped like target_logits. None
             treats the draft as one-hot (greedy drafting). Used by the
             non-greedy path; the greedy and synthetic decisions ignore it.
+          apply_top_k: False drops the top-k bisection from the non-greedy
+            path while keeping top-p. The caller passes False only when no
+            row sets top-k (top_k <= 0 everywhere), where top-k is the
+            identity. A separate graph.
 
         Returns:
           A tensor of shape [batch_size, max_draft_tokens + 1] containing the
@@ -201,6 +208,7 @@ class RejectionSampler:
                 topk_candidates,
                 apply_topk_topp,
                 draft_probs,
+                apply_top_k,
             )
         if draft_probs is not None:
             # As upstream, greedy verification is an argmax match; q plays no
@@ -470,13 +478,16 @@ def _target_probs(
     top_p: torch.Tensor,
     topk_candidates: int,
     apply_topk_topp: bool,
+    apply_top_k: bool = True,
 ) -> torch.Tensor:
     """Per-row target distribution after temperature, top-k and top-p."""
     scaled_logits = target_logits.to(torch.float32) / (
         temperatures.to(torch.float32) + TEMPERATURE_EPS
     )
     if apply_topk_topp:
-        masked_logits = apply_top_k_top_p(scaled_logits, top_k, top_p, topk_candidates)
+        masked_logits = apply_top_k_top_p(
+            scaled_logits, top_k, top_p, topk_candidates, apply_top_k
+        )
     else:
         masked_logits = scaled_logits
     return torch.softmax(masked_logits, dim=-1)
@@ -494,6 +505,7 @@ def _recover_tokens(
     draft_probs: torch.Tensor | None,
     target_probs: torch.Tensor | None = None,
     target_logits_argmax: torch.Tensor | None = None,
+    apply_top_k: bool = True,
 ) -> torch.Tensor:
     """Samples, per row, the token that replaces a rejected draft token.
 
@@ -505,7 +517,13 @@ def _recover_tokens(
         target_logits_argmax = torch.argmax(target_logits, dim=-1).to(torch.int32)
     if target_probs is None:
         target_probs = _target_probs(
-            target_logits, temperatures, top_k, top_p, topk_candidates, apply_topk_topp
+            target_logits,
+            temperatures,
+            top_k,
+            top_p,
+            topk_candidates,
+            apply_topk_topp,
+            apply_top_k,
         )
     is_greedy = temperatures.squeeze(-1) == 0
     valid_draft_token_ids = draft_token_ids >= 0
@@ -572,6 +590,7 @@ def _random_rejection_sample_with_segment(
     topk_candidates: int = 0,
     apply_topk_topp: bool = True,
     draft_probs: torch.Tensor | None = None,
+    apply_top_k: bool = True,
 ) -> torch.Tensor:
     """Vectorized non-greedy speculative decoding validation in Torch.
 
@@ -603,7 +622,13 @@ def _random_rejection_sample_with_segment(
         is_greedy = temperatures.squeeze(-1) == 0
         target_logits_argmax = torch.argmax(target_logits, dim=-1).to(torch.int32)
         target_probs = _target_probs(
-            target_logits, temperatures, top_k, top_p, topk_candidates, apply_topk_topp
+            target_logits,
+            temperatures,
+            top_k,
+            top_p,
+            topk_candidates,
+            apply_topk_topp,
+            apply_top_k,
         )
         # Accept test is the Leviathan ratio min(1, p(x) / q(x)).
         # Greedy drafting (draft_probs None) has q one-hot at the drafted
@@ -703,6 +728,7 @@ def _random_rejection_sample_with_segment(
                 topk_candidates,
                 apply_topk_topp,
                 rows_draft_probs,
+                apply_top_k=apply_top_k,
             )
             recovered_token_ids = recovered_per_request[safe_segment_ids]
         else:
