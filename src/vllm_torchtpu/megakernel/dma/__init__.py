@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""VMEM aliasing (pool_alias) and allocation (vmem)."""
+"""VMEM aliasing (pool_alias), allocation (vmem), and 2-slot DMA rings (stream)."""
 
 from __future__ import annotations
 
@@ -19,13 +19,14 @@ import importlib
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
-    from . import pool_alias, vmem
+    from . import pool_alias, stream, vmem
 
-_SUBMODULES = frozenset({"pool_alias", "vmem"})
+_SUBMODULES = frozenset({"pool_alias", "stream", "vmem"})
 _LAZY: dict[str, str] = {}
 
 __all__ = [
     "pool_alias",
+    "stream",
     "vmem",
 ]
 

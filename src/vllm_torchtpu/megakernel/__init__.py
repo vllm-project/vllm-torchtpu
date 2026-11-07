@@ -36,7 +36,9 @@ if TYPE_CHECKING:  # eager imports for type checkers and IDEs
     )
     from .collectives import AllReduceRing
     from .dma import (
+        TwoRing,
         pool_alias,
+        stream,
         vmem,
     )
     from .dma.vmem import fit_default_tiles, fitted_plan
@@ -184,9 +186,11 @@ _LAZY: dict[str, str] = {
     "SwitchSlot": ".spec",
     "VLLMAlias": ".spec",
     "WeightDecl": ".spec",
+    "TwoRing": ".dma.stream",
     "fit_default_tiles": ".dma.vmem",
     "fitted_plan": ".dma.vmem",
     "pool_alias": ".dma",
+    "stream": ".dma",
     "vmem": ".dma",
 }
 
@@ -226,6 +230,7 @@ __all__ = [
     "TileContext",
     "TileRule",
     "Tiles",
+    "TwoRing",
     "VLLMAlias",
     "WeightDecl",
     "allocate_test_layout",
@@ -262,6 +267,7 @@ __all__ = [
     "round_up",
     "spec",
     "ssm_to_raw_pages",
+    "stream",
     "vmem",
     "with_cache",
 ]
