@@ -557,6 +557,22 @@ class TpuCompilerAdaptor(CompilerInterface):
         the backend attached no `serialize`, which it skips for dynamic-symint
         graphs and in debug mode (see TpuBackend.__call__).
         """
+        # --- DEBUG: Simulate compile failure or hard crash on Rank 1 ---
+        rank = int(os.environ.get("RANK", 0))
+        if rank == 1:
+            if os.environ.get("CRASH_RANK1") == "1":
+                logger.error(
+                    "[DEBUG] Simulating intentional hard crash (os._exit) on Rank %d",
+                    rank)
+                os._exit(1)
+            elif os.environ.get("FAIL_RANK1") == "1":
+                logger.error(
+                    "[DEBUG] Simulating intentional compilation failure on Rank %d",
+                    rank)
+                raise RuntimeError(
+                    f"Intentional compilation failure on Rank {rank} for debugging!"
+                )
+        # ---------------------------------------------------------------
         # `_tpu_backend` calls detect_fake_mode(), which asserts a single
         # FakeTensorMode. The Dynamo tracing context's mode differs from the
         # example inputs' mode, so run under a context built from the example
