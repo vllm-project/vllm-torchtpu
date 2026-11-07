@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import dataclasses
+from typing import Any
 
 import jax.numpy as jnp
 import numpy as np
@@ -467,32 +468,43 @@ def test_switch_branch_and_pack_spec_logical_weights(stack_e: bool):
     qkv, z = 2 * kh * g.KD + vh * g.VD, vh * g.VD
     nli = qkv + z + 128
     isr = g.IS // R
-    logical = {
-        "in_norm": jnp.ones((g.L, g.H), dtype=F32),
-        "post_norm": jnp.ones((R, g.L, g.H), dtype=F32),
-        "final_norm": jnp.ones((g.H,), dtype=F32),
-        "in_s": jnp.ones((R, g.L, max(nai, nli)), dtype=F32),
-        "out_s": jnp.ones((g.L, g.H), dtype=F32),
-        "qn": jnp.ones((1, hd), dtype=F32),
-        "kn": jnp.ones((R, 1, hd), dtype=F32),
-        "conv": jnp.ones((R, 1, 4 * qkv), dtype=F32),
-        "gnorm": jnp.ones((1, g.VD), dtype=F32),
-        "sh13_s": jnp.ones((R, g.L, 2 * isr), dtype=F32),
-        "sh2_s": jnp.ones((R, g.L, g.H), dtype=F32),
-        "sh_gate": jnp.ones((g.L, g.H), dtype=F32),
+    in_s_w = max(nai, nli)
+    ew = g.EW(R)
+    logical: dict[str, Any] = {
+        "in_norm": jnp.arange(g.L * g.H, dtype=F32).reshape(g.L, g.H) + 1.0,
+        "post_norm": jnp.arange(R * g.L * g.H, dtype=F32).reshape(R, g.L, g.H) + 10.0,
+        "final_norm": jnp.arange(g.H, dtype=F32) + 20.0,
+        "in_s": jnp.arange(R * g.L * in_s_w, dtype=F32).reshape(R, g.L, in_s_w) + 30.0,
+        "out_s": jnp.arange(g.L * g.H, dtype=F32).reshape(g.L, g.H) + 40.0,
+        "qn": jnp.arange(hd, dtype=F32).reshape(1, hd) + 50.0,
+        "kn": jnp.arange(R * hd, dtype=F32).reshape(R, 1, hd) + 60.0,
+        "conv": jnp.arange(R * 4 * qkv, dtype=F32).reshape(R, 1, 4 * qkv) + 70.0,
+        "gnorm": jnp.arange(g.VD, dtype=F32).reshape(1, g.VD) + 80.0,
+        "sh13_s": jnp.arange(R * g.L * 2 * isr, dtype=F32).reshape(R, g.L, 2 * isr)
+        + 90.0,
+        "sh2_s": jnp.arange(R * g.L * g.H, dtype=F32).reshape(R, g.L, g.H) + 100.0,
+        "sh_gate": jnp.arange(g.L * g.H, dtype=F32).reshape(g.L, g.H) + 110.0,
         "e_cores": default_eplb_cores(g, R),
         "att_in": jnp.zeros((1, g.H, nai), dtype=FP8),
         "att_out": jnp.zeros((R, 1, nh * hd, g.H), dtype=FP8),
         "lin_in": jnp.zeros((R, 1, g.H, nli), dtype=FP8),
         "lin_out": jnp.zeros((R, 1, z, g.H), dtype=FP8),
-        "router": jnp.zeros((R, g.L, g.H, g.E), dtype=BF16),
-        "sh13": jnp.zeros((R, g.L, g.H, 2 * isr), dtype=FP8),
+        "router": jnp.arange(R * g.L * g.H * g.E, dtype=F32)
+        .reshape(R, g.L, g.H, g.E)
+        .astype(BF16),
+        "sh13": ((jnp.arange(R * g.L * g.H * 2 * isr, dtype=F32) % 7) - 3.0)
+        .reshape(R, g.L, g.H, 2 * isr)
+        .astype(FP8),
         "sh2": jnp.zeros((R, g.L, isr, g.H), dtype=FP8),
         # Omit the `R` axis on `e13` to test `R`-broadcasting on both `stacked`
         # and `per_layer` dynamic weights.
-        "e13": jnp.zeros((g.L, g.EW(R), g.H, 2 * g.I), dtype=FP8),
-        "e2": jnp.zeros((R, g.L, g.EW(R), g.I, g.H), dtype=FP8),
-        "es": jnp.zeros((R, g.L, g.EW(R), 1, 2 * g.I + g.H), dtype=F32),
+        "e13": ((jnp.arange(g.L * ew * g.H * 2 * g.I, dtype=F32) % 5) - 2.0)
+        .reshape(g.L, ew, g.H, 2 * g.I)
+        .astype(FP8),
+        "e2": jnp.zeros((R, g.L, ew, g.I, g.H), dtype=FP8),
+        "es": jnp.arange(R * g.L * ew * (2 * g.I + g.H), dtype=F32).reshape(
+            R, g.L, ew, 1, 2 * g.I + g.H
+        ),
     }
 
     packed = pack_spec_logical_weights(
@@ -517,6 +529,55 @@ def test_switch_branch_and_pack_spec_logical_weights(stack_e: bool):
                 expected[0],
             )
             assert packed[k].dtype == expected[1]
+
+    # Verify packed `smalls` values for a per-layer field (`post_norm`), `qn`,
+    # and a SwitchSlot field (`in_s`), with gdn (lyr=0) and gqa (lyr=1) differing.
+    o_pn, w_pn = p.smalls_layout["post_norm"]
+    o_qn, w_qn = p.smalls_layout["qn"]
+    o_ins, w_ins = p.smalls_layout["in_s"]
+    for r in range(R):
+        for lyr in range(g.L):
+            np.testing.assert_array_equal(
+                packed["smalls"][r, lyr, 0, o_pn : o_pn + w_pn],
+                logical["post_norm"][r, lyr],
+            )
+            np.testing.assert_array_equal(
+                packed["smalls"][r, lyr, 0, o_ins : o_ins + w_ins],
+                logical["in_s"][r, lyr, :w_ins],
+            )
+        assert not jnp.array_equal(
+            packed["smalls"][r, 0, 0, o_ins : o_ins + w_ins],
+            packed["smalls"][r, 1, 0, o_ins : o_ins + w_ins],
+        )
+        np.testing.assert_array_equal(
+            packed["smalls"][r, 1, 0, o_qn : o_qn + w_qn],
+            logical["qn"][0],
+        )
+        np.testing.assert_array_equal(
+            packed["smalls"][r, 0, 0, o_qn : o_qn + w_qn],
+            jnp.zeros((w_qn,), dtype=F32),
+        )
+        assert not jnp.array_equal(
+            packed["smalls"][r, 0, 0, o_qn : o_qn + w_qn],
+            packed["smalls"][r, 1, 0, o_qn : o_qn + w_qn],
+        )
+
+    # Verify stacked (`sh13`) and stacked/per_layer (`e13`) streamed weights.
+    np.testing.assert_array_equal(
+        packed["sh13"].reshape(R, g.L, g.H, 2 * isr), logical["sh13"]
+    )
+    if stack_e:
+        for r in range(R):
+            np.testing.assert_array_equal(
+                packed["e13"][r].reshape(g.L, ew, g.H, 2 * g.I), logical["e13"]
+            )
+    else:
+        for lyr in range(g.L):
+            for r in range(R):
+                np.testing.assert_array_equal(
+                    packed["e13"][lyr][r].reshape(ew, g.H, 2 * g.I),
+                    logical["e13"][lyr],
+                )
 
     packed_merged = pack_spec_logical_weights(
         ms,
