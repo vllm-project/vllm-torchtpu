@@ -32,6 +32,7 @@ import jax.numpy as jnp
 import torch
 from jax.sharding import PartitionSpec
 from torch_tpu._internal.pallas import jax_op
+from vllm.distributed.parallel_state import get_dp_group
 
 from vllm_torchtpu.distributed.ep_mesh import (
     EP_AXIS_NAME,
@@ -50,21 +51,21 @@ _BITS_DTYPE = {2: torch.int16, 4: torch.int32}
 _OP: Any = None
 
 
-def exchange_fn(mesh, dp_groups: tuple[tuple[int, int], ...]):
+def exchange_fn(mesh, dp_groups: tuple[tuple[int, int], ...], dp_rank: int):
     """The JAX body: each rank's [T, ...] block in, its DP pair's [2T, ...]
-    out, DP rank 0's rows first. ``dp_groups`` are mesh indices."""
+    out, DP rank 0's rows first. ``dp_groups`` are mesh indices.
+
+    The order is fixed by this process's ``dp_rank`` rather than read from
+    ``lax.axis_index``: that lowers to partition-id, which XLA refuses to
+    SPMD-partition in a torch_tpu module. Each rank builds its own op and runs
+    only its own device's shard of it.
+    """
     perm = [(a, b) for a, b in dp_groups] + [(b, a) for a, b in dp_groups]
-    first = [False] * mesh.size
-    for a, _ in dp_groups:
-        first[a] = True
     spec = PartitionSpec(EP_AXIS_NAME)
 
     def local(block: jax.Array) -> jax.Array:
         peer = jax.lax.ppermute(block, EP_AXIS_NAME, perm)
-        is_first = jnp.asarray(first)[jax.lax.axis_index(EP_AXIS_NAME)]
-        return jnp.concatenate(
-            [jnp.where(is_first, block, peer), jnp.where(is_first, peer, block)]
-        )
+        return jnp.concatenate([block, peer] if dp_rank == 0 else [peer, block])
 
     def exchange(x: jax.Array) -> jax.Array:
         return jax.shard_map(
@@ -103,13 +104,16 @@ def prepare_dp_pair_exchange(parallel_config: Any) -> None:
             mesh.size,
         )
         return
+    dp_rank = get_dp_group().rank_in_group
     spec = PartitionSpec(EP_AXIS_NAME)
     # torch_tpu types the partition specs as tuples of axis names, but takes
     # jax PartitionSpecs (see fused_moe_decode._build_op).
     # pyrefly: ignore[no-matching-overload]
     op = jax_op(
-        "vllm_torchtpu::dp_pair_exchange",
-        exchange_fn(mesh, dp_groups),
+        # The order is baked into the body, so name it into the graph: peer
+        # replay shares compiled graphs between ranks whose code matches.
+        f"vllm_torchtpu::dp_pair_exchange_dp{dp_rank}",
+        exchange_fn(mesh, dp_groups, dp_rank),
         mesh=mesh,
         input_partition_specs=(spec,),
         output_partition_specs=spec,

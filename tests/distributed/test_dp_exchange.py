@@ -35,14 +35,15 @@ groups = ((0, 6), (5, 1), (2, 4), (7, 3))
 rows, cols = 16, 128
 for dtype in (np.int16, np.int32):
     x = np.random.default_rng(0).integers(-30000, 30000, (8 * rows, cols)).astype(dtype)
-    out = jax.jit(exchange_fn(mesh, groups))(
-        jax.device_put(x, NamedSharding(mesh, PartitionSpec("d")))
-    )
-    out = np.asarray(out).reshape(8, 2 * rows, cols)
-    blocks = x.reshape(8, rows, cols)
-    for first, second in groups:
-        want = np.concatenate([blocks[first], blocks[second]])
-        assert np.array_equal(out[first], want) and np.array_equal(out[second], want)
+    x = jax.device_put(x, NamedSharding(mesh, PartitionSpec("d")))
+    blocks = np.asarray(x).reshape(8, rows, cols)
+    # Each DP rank's op is only run for its own devices: check those.
+    for dp_rank in (0, 1):
+        out = jax.jit(exchange_fn(mesh, groups, dp_rank))(x)
+        out = np.asarray(out).reshape(8, 2 * rows, cols)
+        for group in groups:
+            want = np.concatenate([blocks[group[0]], blocks[group[1]]])
+            assert np.array_equal(out[group[dp_rank]], want)
 print("OK")
 """
 
@@ -112,3 +113,24 @@ def test_prepare_builds_nothing_outside_an_ep_dp_pair(monkeypatch, config):
     dp_exchange.prepare_dp_pair_exchange(parallel_config)
     build.assert_not_called()
     assert not dp_exchange.dp_pair_exchange_ready()
+
+
+def test_each_dp_rank_registers_its_own_op(monkeypatch):
+    # Peer replay shares compiled graphs whose code matches, and each rank's
+    # op bakes its row order in, so the op names must differ.
+    parallel_config = SimpleNamespace(
+        enable_expert_parallel=True, data_parallel_size=2, pipeline_parallel_size=1
+    )
+    monkeypatch.setattr(dp_exchange, "get_ep_group", lambda: object())
+    monkeypatch.setattr(dp_exchange, "build_ep_mesh", lambda: SimpleNamespace(size=4))
+    monkeypatch.setattr(dp_exchange, "ep_dp_groups", lambda: ((0, 2), (1, 3)))
+    jax_op = Mock()
+    monkeypatch.setattr(dp_exchange, "jax_op", jax_op)
+    for dp_rank in (0, 1):
+        monkeypatch.setattr(dp_exchange, "_OP", None)
+        group = SimpleNamespace(rank_in_group=dp_rank)
+        monkeypatch.setattr(dp_exchange, "get_dp_group", lambda g=group: g)
+        dp_exchange.prepare_dp_pair_exchange(parallel_config)
+        assert dp_exchange.dp_pair_exchange_ready()
+    names = [c.args[0] for c in jax_op.call_args_list]
+    assert len(names) == 2 and names[0] != names[1]
