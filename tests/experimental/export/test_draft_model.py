@@ -242,10 +242,27 @@ def test_export_speculative_config_takes_a_dspark_draft_model() -> None:
     }
 
 
+def test_export_speculative_config_declares_a_dflash_draft_as_dspark() -> None:
+    # A DFlash draft is driven like a DSpark one (its own paged KV, the target's
+    # aux hidden states, one block per step), so the artifact declares the
+    # runtime protocol, dspark; vLLM still loads it as dflash.
+    raw = {
+        "method": "dflash",
+        "num_speculative_tokens": 15,
+        "model": "org/dflash-draft",
+        "draft_tensor_parallel_size": 1,
+    }
+    assert cli.export_speculative_config(raw) == {
+        "method": "dspark",
+        "num_speculative_tokens": 15,
+    }
+
+
 @pytest.mark.parametrize(
     "raw, error",
     [
         ({"method": "dspark", "num_speculative_tokens": 7}, "'model'"),
+        ({"method": "dflash", "num_speculative_tokens": 15}, "'model'"),
         (
             {
                 "method": "dspark",

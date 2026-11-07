@@ -11,14 +11,15 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""A separate draft model (DSpark) as the artifact's drafter.
+"""A separate draft model (DSpark, DFlash) as the artifact's drafter.
 
 A DSpark draft is a small decoder of its own, not a layer of the target. It
 reads the target's residual stream at a few layers (`aux_hidden_states`, which
 `forward` returns for every row), projects each row of it to the draft's
 context keys and values, and drafts a whole block in one non-causal pass: the
 anchor token (the one sampled after the last accepted token) followed by mask
-tokens. A Markov head then picks the block's tokens left to right.
+tokens. A DSpark draft's Markov head then picks the block's tokens left to
+right; a DFlash draft takes each mask slot's argmax.
 
 The steps below are copies of the TPU runner's DFlash / DSpark proposer
 (`vllm_torchtpu.spec_decode.dflash.DFlashProposer` and
@@ -48,8 +49,25 @@ DRAFT_PARAM_PREFIX = "draft."
 # The `forward` output a draft model reads: the target's residual stream at the
 # draft's target layers, concatenated per row.
 AUX_HIDDEN_STATES = "aux_hidden_states"
-# `speculative_config.method` values whose drafter is a separate draft model.
+# `speculative_config.method` values an artifact declares for a separate draft
+# model: the runtime drives DSpark and DFlash drafts alike, as `dspark`.
 DRAFT_MODEL_METHODS = ("dspark",)
+# vLLM's `speculative_config.method` values that load a separate draft model.
+VLLM_DRAFT_MODEL_METHODS = ("dspark", "dflash")
+
+
+def is_dspark(draft_model: Any) -> bool:
+    """Whether the draft picks its tokens with a DSpark Markov head."""
+    return callable(getattr(draft_model, "markov_embed", None))
+
+
+def draft_block_size(draft_model: Any, k: int) -> int:
+    """Query tokens per request of a draft drafting `k` tokens: a DSpark
+    draft's `query_block_size`, a DFlash draft's anchor and `k` mask slots
+    (`DFlashProposer._query_block_size`)."""
+    if is_dspark(draft_model):
+        return query_block_size(k, sample_from_anchor(draft_model))
+    return k + 1
 
 
 def sample_from_anchor(draft_model: Any) -> bool:
@@ -95,7 +113,8 @@ def load_draft_model(vllm_config: Any, target: Any, mesh: Any) -> nn.Module | No
     )
 
     spec = getattr(vllm_config, "speculative_config", None)
-    if spec is None or getattr(spec, "method", None) not in DRAFT_MODEL_METHODS:
+    method = getattr(spec, "method", None)
+    if spec is None or method not in VLLM_DRAFT_MODEL_METHODS:
         return None
     dflash_config = normalize_draft_config(spec.draft_model_config.hf_config)
     target_layer_ids = list(dflash_config.get("target_layer_ids", []))
@@ -147,16 +166,20 @@ def load_draft_model(vllm_config: Any, target: Any, mesh: Any) -> nn.Module | No
     for name in set(all_layers) - target_layer_names:
         all_layers[name].is_draft_layer = True  # type: ignore[attr-defined]
 
-    for attr in ("compute_draft_logits", "markov_embed", "markov_bias"):
-        if not hasattr(draft, attr):
-            raise ValueError(
-                f"DSpark draft model {type(draft).__name__} lacks {attr}(); "
-                "expected a Qwen3DSpark/Gemma4DSpark-family model"
-            )
-    # A reduced-vocabulary DSpark checkpoint carries its own LM head (and maybe
-    # embedding): share the target's only where the checkpoint has none.
-    maybe_share_embeddings(draft, target, True, force_share=False)
-    maybe_share_lm_head(draft, target, replicated, True, force_share=False)
+    dspark = method == "dspark"
+    if dspark:
+        for attr in ("compute_draft_logits", "markov_embed", "markov_bias"):
+            if not hasattr(draft, attr):
+                raise ValueError(
+                    f"DSpark draft model {type(draft).__name__} lacks {attr}(); "
+                    "expected a Qwen3DSpark/Gemma4DSpark-family model"
+                )
+    # A DFlash draft always predicts the target vocabulary with the target's
+    # embedding and LM head. A reduced-vocabulary DSpark checkpoint carries its
+    # own LM head (and maybe embedding): share the target's only where the
+    # checkpoint has none.
+    maybe_share_embeddings(draft, target, True, force_share=not dspark)
+    maybe_share_lm_head(draft, target, replicated, True, force_share=not dspark)
 
     # The caller builds every attention layer's kernel after loading, the draft's
     # with the causality set here.
@@ -380,3 +403,46 @@ def dspark_forward_and_sample(
         draft_tokens.append(step)
         prev = step
     return torch.stack(draft_tokens, dim=1)
+
+
+def dflash_forward_and_sample(
+    draft_model: Any,
+    input_ids: torch.Tensor,
+    positions: torch.Tensor,
+    block_size: int,
+) -> torch.Tensor:
+    """The draft block's tokens `[rows, block_size - 1]`: one backbone pass over
+    every block, then the argmax of each mask slot (slot 0 is the anchor).
+
+    A copy of `DFlashProposer._dflash_forward_and_sample`.
+    """
+    hidden = draft_model.model(input_ids=input_ids, positions=positions)
+
+    padded_num_reqs = hidden.shape[0] // block_size
+    valid_hidden = hidden[: padded_num_reqs * block_size]
+
+    hidden_reshaped = valid_hidden.view(padded_num_reqs, block_size, hidden.shape[-1])
+    draft_hidden = hidden_reshaped[:, 1:, :].reshape(-1, hidden.shape[-1])
+
+    logits = draft_model.compute_logits(draft_hidden)
+    logits_3d = logits.view(padded_num_reqs, block_size - 1, logits.shape[-1])
+    return logits_3d.argmax(dim=-1)
+
+
+def draft_forward_and_sample(
+    draft_model: Any,
+    input_ids: torch.Tensor,
+    positions: torch.Tensor,
+    block_size: int,
+) -> torch.Tensor:
+    """The draft block's tokens `[rows, k]`, picked as the draft's proposer
+    picks them: DSpark's Markov head or DFlash's argmax."""
+    if is_dspark(draft_model):
+        return dspark_forward_and_sample(
+            draft_model,
+            input_ids,
+            positions,
+            block_size,
+            sample_from_anchor(draft_model),
+        )
+    return dflash_forward_and_sample(draft_model, input_ids, positions, block_size)

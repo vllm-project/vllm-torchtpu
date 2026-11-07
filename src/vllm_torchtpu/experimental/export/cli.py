@@ -346,7 +346,14 @@ _SPECULATIVE_FIELDS = {
     "dspark": frozenset(
         {"method", "num_speculative_tokens", "model", "draft_tensor_parallel_size"}
     ),
+    "dflash": frozenset(
+        {"method", "num_speculative_tokens", "model", "draft_tensor_parallel_size"}
+    ),
 }
+# The method an artifact declares for each: the runtime protocol, not the
+# draft's name. A DFlash draft is driven exactly like a DSpark one (its own paged
+# KV, the target's aux hidden states, one block per step).
+_ARTIFACT_METHOD = {"dflash": "dspark"}
 SPECULATIVE_METHODS = tuple(_SPECULATIVE_FIELDS)
 
 
@@ -387,7 +394,7 @@ def export_speculative_config(
         return value
 
     out = {
-        "method": method,
+        "method": _ARTIFACT_METHOD.get(method, method),
         "num_speculative_tokens": positive("num_speculative_tokens"),
     }
     if method == "ngram":
@@ -395,10 +402,10 @@ def export_speculative_config(
         cfg.setdefault("prompt_lookup_min", lookup_max)
         out["prompt_lookup_max"] = lookup_max
         out["prompt_lookup_min"] = positive("prompt_lookup_min")
-    if method == "dspark":
+    if method in ("dspark", "dflash"):
         if not isinstance(cfg.get("model"), str) or not cfg["model"]:
             raise ValueError(
-                "--speculative-config method 'dspark' needs the draft model's "
+                f"--speculative-config method {method!r} needs the draft model's "
                 "checkpoint as 'model'"
             )
         draft_tp = cfg.get("draft_tensor_parallel_size", tensor_parallel_size)
@@ -469,9 +476,9 @@ def run_export_from_args(
             raw = json.loads(raw) if isinstance(raw, str) else dict(raw or {})
             args.speculative_config = verify_window_speculative_config(
                 max_verify_tokens,
-                # Keeps how vLLM loads a draft model (`model`), which the
-                # artifact's record leaves out.
-                {**raw, **speculative_config} if speculative_config else None,
+                # Keeps how vLLM loads a draft model (its method and `model`),
+                # which the artifact's record leaves out or renames.
+                {**speculative_config, **raw} if speculative_config else None,
             )
         vllm_config = create_vllm_config_from_args(args)
     if vllm_config is not None:
