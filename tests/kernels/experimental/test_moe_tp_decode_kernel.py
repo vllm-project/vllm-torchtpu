@@ -56,11 +56,14 @@ SMALL = dict(h=4096, e=8, i=128, fs=128, topk=4)
 ROUTED_SCALE = 2.5
 # (rows, n_valid) called directly: zero and full for 16 rows; fold, trim and
 # full for 32; fold (8, the most rows that fold), trim (16) and full with
-# padding (33, the fewest tokens only this bucket serves) for 64. Zero and
-# unpadded full run the same code at every row count, so 64 rows skip them
-# (the worker runs under a timeout); arming's all-reduce self-test runs both
-# at 64 rows on the device. The 16-row fold path runs through the adapter's
-# op body (BODY_CASE), which derives n_valid from a padding mask.
+# padding (33, the fewest tokens only this bucket serves) for 64; full with
+# padding for 80 and 96 (65 and 81, likewise). Zero and unpadded full run the
+# same code at every row count, so 64, 80 and 96 rows skip them (the worker
+# runs under a timeout), and fold and trim exchange the same 16 rows at every
+# bucket that has them, so 80 and 96 rows skip those too; arming's all-reduce
+# self-test runs zero, fold, trim and unpadded full at every bucket on the
+# device. The 16-row fold path runs through the adapter's op body (BODY_CASE),
+# which derives n_valid from a padding mask.
 CASES = (
     (16, 0),
     (16, 16),
@@ -70,6 +73,8 @@ CASES = (
     (64, 8),
     (64, 16),
     (64, 33),
+    (80, 65),
+    (96, 81),
 )
 BODY_CASE = (16, 7)
 # A token count the kernel does not admit: the op body's psum path.
@@ -119,7 +124,16 @@ def _glm52_shapes(rows, **kwargs):
 
 @pytest.mark.parametrize(
     "rows, admitted",
-    [(16, True), (32, True), (64, True), (8, False), (48, False), (128, False)],
+    [
+        (16, True),
+        (32, True),
+        (64, True),
+        (80, True),
+        (96, True),
+        (8, False),
+        (48, False),
+        (128, False),
+    ],
 )
 def test_admits_the_decode_buckets_at_glm52_shapes(monkeypatch, rows, admitted):
     monkeypatch.setattr(pltpu, "get_tpu_info", _tpu7x)
@@ -168,6 +182,9 @@ def test_row_paths_at_glm52_shapes(monkeypatch):
         16,
         0,
     ]
+    for rows in (80, 96):
+        spec = all_reduce.make_spec(16, rows, h)
+        assert all_reduce.selftest_row_counts(spec) == [rows, 5, 16, 0]
 
 
 def test_selftest_inputs_have_exact_sums_that_expose_a_wrong_chunk(monkeypatch):
@@ -236,9 +253,9 @@ def _run_worker(part):
 
 
 # Two worker processes, so that each stays well inside the timeouts: "a" runs
-# the race-detector control, the 16- and 32-row cases and the op body's kernel
-# case; "b" the 64-row cases, the outlier case, the op body's psum path and
-# the all-reduce self-test.
+# the race-detector control, the 16-, 32-, 80- and 96-row cases and the op
+# body's kernel case; "b" the 64-row cases, the outlier case, the op body's
+# psum path and the all-reduce self-test.
 @pytest.fixture(scope="module")
 def on_16_devices():
     return _run_worker("a")
