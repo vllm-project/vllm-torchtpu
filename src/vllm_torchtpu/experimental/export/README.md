@@ -132,6 +132,38 @@ under `mtp.` names and implements `mtp_abstract_states()` and `mtp_draft()`.
 The export finds the target weights the draft shares by lowering it once, as
 for the forward.
 
+### DSpark drafting
+
+With `--speculative-config '{"method": "dspark", "num_speculative_tokens": K,
+"model": "<draft checkpoint>"}'` the export loads the separate DSpark draft model
+vLLM builds for it (e.g. `Qwen3DSparkForCausalLM`) and exports it as the same
+drafter function `draft` / `draft_bucket{B}`. `draft_tensor_parallel_size`, if
+given, must equal `--tensor-parallel-size`. The artifact's
+`speculative_config` records only `method` and `num_speculative_tokens`; the
+draft checkpoint is how vLLM loads it, not something the runtime reads.
+
+- `forward` returns one more intermediate after `hidden_states`:
+  `aux_hidden_states` `[B, n * hidden_size]`, the residual stream entering
+  each of the draft's `n` target layers (after layer `target_layer_ids[i]`),
+  concatenated per row, as vLLM's `set_aux_hidden_state_layers` returns it.
+- `draft_bucket{B}` takes the drafter controls, the draft's weights (`draft.`
+  for its `model.`; an embedding or LM head the checkpoint does not carry binds
+  the target's slot), one paged KV state per draft layer (numbered after the
+  target's, paged like it: `num_blocks` of `block_size`, through the step's
+  `block_tables`) and `aux_hidden_states` in place of `hidden_states`.
+- Every row of the step writes its context keys and values, projected from its
+  `aux_hidden_states`, to the draft KV at its position. Then each request runs
+  one non-causal block: its anchor `input_ids[last_token_indices[r]]` at
+  `positions[last_token_indices[r]] + 1` followed by mask tokens (`K` tokens for
+  dense DSpark checkpoints, `1 + K` with `sample_from_anchor: false`), and the
+  Markov head picks the `K` drafts left to right. The block's own keys and
+  values land past the accepted tokens, where the next step's context rows
+  overwrite them.
+
+These steps are copies of the TPU runner's DFlash / DSpark proposer
+(`draft_model.py`), checked against it by `test_draft_model_parity.py`. The
+checkpoint's confidence head (adaptive verification) is not exported.
+
 ### Example: match a `vllm serve` run
 
 A `vllm serve` run of Qwen3-Coder-480B FP8 on a 2x2x1 v7x slice logged:

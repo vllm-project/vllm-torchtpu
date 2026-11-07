@@ -335,22 +335,31 @@ def artifact_model_name(model: str | None, served_model_name: Any = None) -> str
 
 # Speculative methods the artifact can declare, with the fields each takes: ngram
 # drafts on the host from the sequence itself; mtp drafts with the model's MTP
-# layer (the adapter's `mtp_draft()`), which the export lowers as the drafter
-# `draft` / `draft_bucket{B}`.
+# layer (the adapter's `mtp_draft()`) and dspark with a separate DSpark draft
+# model (`model`, the adapter's `dspark_draft()`), which the export lowers as
+# the drafter `draft` / `draft_bucket{B}`.
 _SPECULATIVE_FIELDS = {
     "ngram": frozenset(
         {"method", "num_speculative_tokens", "prompt_lookup_max", "prompt_lookup_min"}
     ),
     "mtp": frozenset({"method", "num_speculative_tokens"}),
+    "dspark": frozenset(
+        {"method", "num_speculative_tokens", "model", "draft_tensor_parallel_size"}
+    ),
 }
 SPECULATIVE_METHODS = tuple(_SPECULATIVE_FIELDS)
 
 
-def export_speculative_config(raw: Any) -> dict[str, Any] | None:
+def export_speculative_config(
+    raw: Any, *, tensor_parallel_size: int = 1
+) -> dict[str, Any] | None:
     """The `serving_config.speculative_config` for `--speculative-config`.
 
     Keeps vLLM's field names. Rejects methods whose drafts the export does not
-    lower (EAGLE, a draft model) and fields the runtime would not honor.
+    lower (EAGLE) and fields the runtime would not honor. A draft model's
+    checkpoint (`model`) and tensor parallelism are how vLLM loads it, not
+    what the runtime reads, so the record leaves them out; the drafter runs on
+    the target's tensor-parallel ranks.
     """
     if raw is None:
         return None
@@ -386,6 +395,19 @@ def export_speculative_config(raw: Any) -> dict[str, Any] | None:
         cfg.setdefault("prompt_lookup_min", lookup_max)
         out["prompt_lookup_max"] = lookup_max
         out["prompt_lookup_min"] = positive("prompt_lookup_min")
+    if method == "dspark":
+        if not isinstance(cfg.get("model"), str) or not cfg["model"]:
+            raise ValueError(
+                "--speculative-config method 'dspark' needs the draft model's "
+                "checkpoint as 'model'"
+            )
+        draft_tp = cfg.get("draft_tensor_parallel_size", tensor_parallel_size)
+        if draft_tp != tensor_parallel_size:
+            raise ValueError(
+                f"--speculative-config draft_tensor_parallel_size {draft_tp!r} must "
+                f"equal --tensor-parallel-size {tensor_parallel_size}: the drafter "
+                "runs on the target's ranks"
+            )
     return out
 
 
@@ -424,7 +446,8 @@ def run_export_from_args(
 ) -> api.TextOnlyLLMExportConfig:
     """Executes the AOT model export given parsed CLI arguments."""
     speculative_config = export_speculative_config(
-        getattr(args, "speculative_config", None)
+        getattr(args, "speculative_config", None),
+        tensor_parallel_size=int(getattr(args, "tensor_parallel_size", 1) or 1),
     )
     max_verify_tokens = int(getattr(args, "max_verify_tokens", 0) or 0)
     if max_verify_tokens < 0:
@@ -438,12 +461,17 @@ def run_export_from_args(
             f"num_speculative_tokens ({drafted}), which the window already covers"
         )
     # vLLM loads the model with the speculative config, so recurrent layers keep
-    # a checkpoint per draft token, and builds the MTP draft for `mtp`. ngram
-    # drafts on the host and exports nothing more.
+    # a checkpoint per draft token, and builds the MTP draft for `mtp` and the
+    # draft model for `dspark`. ngram drafts on the host and exports nothing more.
     if vllm_config is None and model is None:
         if max_verify_tokens:
+            raw = getattr(args, "speculative_config", None)
+            raw = json.loads(raw) if isinstance(raw, str) else dict(raw or {})
             args.speculative_config = verify_window_speculative_config(
-                max_verify_tokens, speculative_config
+                max_verify_tokens,
+                # Keeps how vLLM loads a draft model (`model`), which the
+                # artifact's record leaves out.
+                {**raw, **speculative_config} if speculative_config else None,
             )
         vllm_config = create_vllm_config_from_args(args)
     if vllm_config is not None:
