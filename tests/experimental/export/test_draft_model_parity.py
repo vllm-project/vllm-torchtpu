@@ -185,3 +185,56 @@ def test_dspark_forward_and_sample_matches_the_tpu_runner(
     )
     assert actual.shape == (2, 3)
     torch.testing.assert_close(actual, expected)
+
+
+def _batched_rpa_impl() -> Any:
+    """A `--attention-backend CUSTOM` attention impl, with its class's kernel."""
+    from vllm_torchtpu.layers.adapter.attention import (
+        PallasBatchedRPAAttentionBackendImpl,
+    )
+
+    impl = object.__new__(PallasBatchedRPAAttentionBackendImpl)
+    impl.decode_query_size = 8
+    impl.initialize_kernel = lambda *args, **kwargs: None
+    return impl
+
+
+def _runner_bound_draft_impl(draft_tp: int) -> Any:
+    """A draft attention impl after `TPUModelRunner._initialize_attention_kernels`."""
+    from unittest.mock import MagicMock, patch
+
+    from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
+
+    impl = _batched_rpa_impl()
+    runner = MagicMock(spec=TPUModelRunner)
+    runner._attention_kernels_initialized = False
+    runner.model = None
+    runner.mesh = MagicMock()
+    runner.vllm_config = MagicMock()
+    runner.drafter = SimpleNamespace(_draft_attn_layer_names={"draft.0"})
+    runner.speculative_config = SimpleNamespace(draft_tensor_parallel_size=draft_tp)
+    with (
+        patch(
+            "vllm_torchtpu.runner.tpu_runner.get_layers_from_vllm_config",
+            return_value={"draft.0": SimpleNamespace(impl=impl)},
+        ),
+        patch("vllm_torchtpu.runner.tpu_runner.set_vllm_model_wrapper_context"),
+    ):
+        TPUModelRunner._initialize_attention_kernels(runner)
+    return impl
+
+
+@pytest.mark.parametrize("draft_tp", [1, 2])
+def test_draft_attention_kernel_matches_the_tpu_runner(draft_tp: int) -> None:
+    """A tp=1 draft runs the local ragged paged attention kernel, as in the
+    runner, even under the batched-kernel backend, which rejects the
+    non-causal attention of DSpark and DFlash drafts."""
+    expected = _runner_bound_draft_impl(draft_tp)
+    actual = _batched_rpa_impl()
+    draft_model.bind_draft_attention_kernel(actual, draft_tp)
+
+    for attr in ("decode_query_size", "_kernel_entry", "_kernel_op_prefix"):
+        assert getattr(actual, attr) == getattr(expected, attr), attr
+    if draft_tp == 1:
+        assert "use_causal_mask" in inspect.signature(actual._kernel_entry).parameters
+        assert actual._kernel_entry.__name__ == "_pallas_rpa_kernel_local"

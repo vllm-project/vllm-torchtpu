@@ -170,7 +170,28 @@ def load_draft_model(vllm_config: Any, target: Any, mesh: Any) -> nn.Module | No
         if attn is not None and isinstance(attn.impl, PallasAttentionBackendImpl):
             attn.impl.layer_idx = i
             attn.impl.use_causal_mask = causal[i]
+            bind_draft_attention_kernel(attn.impl, draft_tp)
     return draft
+
+
+def bind_draft_attention_kernel(impl: Any, draft_tp: int) -> None:
+    """Points a draft attention layer at the kernel the TPU runner runs it with.
+
+    A copy of the draft branch of `TPUModelRunner._initialize_attention_kernels`:
+    a tp=1 draft runs the local (non-shard_map) ragged paged attention kernel
+    with a 1-token decode tile, whatever the attention backend. That kernel
+    takes non-causal layers (DSpark and DFlash in-block attention), which the
+    batched kernel of `--attention-backend CUSTOM` rejects. Must run before
+    `initialize_kernel`.
+    """
+    if draft_tp != 1:
+        return
+    from vllm_torchtpu.layers.adapter.attention import _pallas_rpa_kernel_local
+
+    impl.decode_query_size = 1
+    # Instance attributes shadow the class's, as the runner sets them.
+    impl._kernel_entry = _pallas_rpa_kernel_local
+    impl._kernel_op_prefix = "pallas::rpa_kernel_local"
 
 
 def bind_fused_kv_weight(draft_model: Any) -> None:
