@@ -768,3 +768,147 @@ def test_megakernel_paths_keep_the_sink_layer_on_attend():
         pytest.skip("megakernel runtime unavailable")
     for module in (qwen38_driver, qwen38_wholestep):  # no setter, on the class or in __init__
         assert "attention_rows" not in inspect.getsource(module), module.__name__
+
+
+def _tiny_draft(monkeypatch, *, pp: int, first_rank: bool):
+    """The stubbed tiny Qwen4ExpMTP of test_draft_loads_every_checkpoint_mtp_tensor, built
+    on a pipeline of ``pp`` stages (q38 F2: a prefill-only producer's last stage)."""
+    from torch import nn
+    from vllm.config import CompilationMode
+
+    from tests.models.vllm.qwen4_exp_test_utils import q4exp_text_config
+    from vllm_torchtpu.models.vllm.qwen4_exp import model, mtp
+
+    text = q4exp_text_config(
+        hidden_size=16, hc_count=4, hc_lowrank=4, vocab_size=32, num_attention_heads=4,
+        num_key_value_heads=1, head_dim=32, indexer_n_heads=1, indexer_head_dim=16,
+        num_hidden_layers=2, layer_types=["linear_attention", "full_attention"],
+        mtp_num_hidden_layers=1,
+    )
+
+    class MoE(nn.Module):
+        def __init__(self, vllm_config, prefix):
+            super().__init__()
+            self.prefix = prefix
+
+    class Loader:
+        def __init__(self, module):
+            self.module = module
+
+        def load_weights(self, weights, mapper):
+            list(weights)
+            return set()
+
+    monkeypatch.setattr(model, "Qwen3NextSparseMoeBlock", MoE)
+    monkeypatch.setattr(model, "get_tp_group", lambda: NS(rank_in_group=0, world_size=1))
+    monkeypatch.setattr(mtp, "AutoWeightsLoader", Loader)
+    monkeypatch.setattr(mtp, "verify_moe_checkpoint", lambda *args: None)
+    monkeypatch.setattr(mtp, "VocabParallelEmbedding", nn.Embedding)
+    monkeypatch.setattr(mtp, "ParallelLMHead", lambda v, h, prefix: nn.Embedding(v, h))
+    monkeypatch.setattr(mtp, "LogitsProcessor", lambda vocab: nn.Identity())
+    for module in ("parameter", "layers.linear"):
+        for name, value in (
+            ("get_tensor_model_parallel_rank", 0),
+            ("get_tensor_model_parallel_world_size", 1),
+        ):
+            monkeypatch.setattr(
+                f"vllm.model_executor.{module}.{name}", lambda value=value: value, raising=False
+            )
+    monkeypatch.setattr("vllm.distributed.get_pp_group", lambda: NS(is_first_rank=first_rank), raising=False)
+    cfg = NS(
+        model_config=NS(hf_text_config=text, max_model_len=256),
+        cache_config=NS(cache_dtype="auto"),
+        device_config=NS(device="cpu"),
+        compilation_config=NS(mode=CompilationMode.NONE, static_forward_context={}),
+        parallel_config=NS(pipeline_parallel_size=pp),
+        additional_config={},
+        quant_config=NS(ignored_layers=["mtp.layers.0.mlp.gate"]),
+        speculative_config=spec_config(1),
+    )
+    monkeypatch.setattr(model, "use_unified_pool", lambda: True)
+    with torch.device("cpu"):
+        draft = mtp.Qwen4ExpMTP(vllm_config=cfg, prefix="")
+    parameters = dict(draft.named_parameters())
+    qsa_shapes = {
+        "q_proj.weight": (2 * 4 * 32, 16), "k_proj.weight": (32, 16), "v_proj.weight": (32, 16),
+        "o_proj.weight": (16, 4 * 32), "q_norm.weight": (32,), "k_norm.weight": (32,),
+        "indexer.index_qk_proj.weight": (2 * 16, 16), "indexer.q_layernorm.weight": (16,),
+        "indexer.k_layernorm.weight": (16,),
+    }
+
+    def tensor(name):
+        relative = name.removeprefix("mtp.layers.0.self_attn.")
+        if relative in qsa_shapes:
+            shape = qsa_shapes[relative]
+        elif ".mlp." in name:
+            shape = (1,)
+        else:
+            shape = parameters[mtp.mtp_checkpoint_name(name)].shape
+        return torch.randn(shape).to(torch.bfloat16)
+
+    return draft, [(name, tensor(name)) for name in CHECKPOINT_MTP_TENSORS]
+
+
+def test_draft_on_a_later_pipeline_stage_loads_its_own_embedding(monkeypatch):
+    """q38 F2 smoke j-274c19fe: on the producer's last stage the target's embed_tokens is a
+    PPMissingLayer, so the draft must load the shared checkpoint embedding itself, bit-exactly,
+    and refuse a checkpoint without it."""
+    draft, mtp_tensors = _tiny_draft(monkeypatch, pp=8, first_rank=False)
+    assert draft.has_own_embed_tokens is True
+    embed = torch.randn(32, 16)
+    draft.load_weights(iter([("model.language_model.embed_tokens.weight", embed), ("lm_head.weight", torch.zeros(32, 16))]
+                            + mtp_tensors))
+    assert torch.equal(draft.model.embed_tokens.weight.detach(), embed)
+    with pytest.raises(ValueError, match="shared checkpoint embedding"):
+        draft.load_weights(iter(mtp_tensors))
+
+
+@pytest.mark.parametrize("pp,first_rank", [(1, True), (8, True)])
+def test_draft_on_a_stage_with_the_target_embedding_borrows_it(monkeypatch, pp, first_rank):
+    """A PP1 engine (the decode) or a pipeline's first stage keeps borrowing the target's
+    embedding: the checkpoint embedding is not loaded into the draft."""
+    draft, mtp_tensors = _tiny_draft(monkeypatch, pp=pp, first_rank=first_rank)
+    assert draft.has_own_embed_tokens is False
+    before = draft.model.embed_tokens.weight.detach().clone()
+    draft.load_weights(iter([("model.language_model.embed_tokens.weight", torch.randn(32, 16))] + mtp_tensors))
+    assert torch.equal(draft.model.embed_tokens.weight.detach(), before)
+
+
+def test_sharing_keeps_the_drafts_own_embedding_off_the_first_stage():
+    """maybe_share_embeddings on a target whose embed_tokens is a PPMissingLayer: a draft that
+    owns its embedding keeps it; one that borrows it still refuses (no embedding to borrow)."""
+    from torch import nn
+    from vllm.model_executor.models.utils import PPMissingLayer
+
+    from vllm_torchtpu.spec_decode.utils import maybe_share_embeddings
+
+    target = NS(model=NS(embed_tokens=PPMissingLayer()))
+    own = nn.Embedding(4, 2)
+    draft = NS(model=NS(embed_tokens=own), has_own_embed_tokens=True)
+    maybe_share_embeddings(draft, target, True)
+    assert draft.model.embed_tokens is own
+    draft.has_own_embed_tokens = False
+    with pytest.raises(RuntimeError, match="is not on this pipeline stage"):
+        maybe_share_embeddings(draft, target, True)
+
+
+def test_prefill_only_validation_accepts_the_qwen_drafts_ring():
+    """Upstream's prefill-only producer check required FullAttentionSpec for every draft cache;
+    the Qwen3.8 draft's QSA raw ring is a CircularBufferSpec. Qwen4ExpMTP declares it; a draft
+    that declares nothing keeps the FullAttentionSpec-only rule."""
+    from vllm.v1.kv_cache_interface import CircularBufferSpec, FullAttentionSpec, MLAAttentionSpec
+
+    from vllm_torchtpu.models.vllm.qwen4_exp.mtp import Qwen4ExpMTP
+    from vllm_torchtpu.spec_decode.eagle3 import Eagle3Proposer
+
+    assert Qwen4ExpMTP.prefill_only_kv_spec_types == (FullAttentionSpec, CircularBufferSpec)
+    p = "mtp.layers.48.self_attn"
+    specs = {p: object.__new__(FullAttentionSpec), p + ".compressed_k": object.__new__(MLAAttentionSpec),
+             p + ".raw_ring": object.__new__(CircularBufferSpec)}
+    proposer = Eagle3Proposer.__new__(Eagle3Proposer)
+    proposer.runner = NS(get_kv_cache_spec=lambda: specs)
+    proposer.draft_model = NS(prefill_only_kv_spec_types=Qwen4ExpMTP.prefill_only_kv_spec_types)
+    proposer._validate_prefill_only_draft_model(set(specs))
+    proposer.draft_model = NS()  # declares nothing: upstream's rule
+    with pytest.raises(NotImplementedError, match="raw_ring, got CircularBufferSpec"):
+        proposer._validate_prefill_only_draft_model(set(specs))

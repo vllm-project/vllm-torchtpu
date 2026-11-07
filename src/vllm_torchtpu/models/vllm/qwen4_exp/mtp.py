@@ -38,6 +38,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 )
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.utils import AutoWeightsLoader
+from vllm.v1.kv_cache_interface import CircularBufferSpec, FullAttentionSpec
 
 from vllm_torchtpu import envs as vllm_torchtpu_envs
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
@@ -103,6 +104,31 @@ def draft_additional_config(additional_config):
         if not k.startswith("hc_prefill_")
     }
     return {**additional_config, "qwen4_exp": qwen}
+
+
+# The target's embedding in the checkpoint (Qwen4ExpForCausalLM.hf_to_vllm_mapper maps
+# "model.language_model." to "model."); the draft shares it.
+TARGET_EMBED_CHECKPOINT_NAMES = (
+    "model.language_model.embed_tokens.weight",
+    "model.embed_tokens.weight",
+)
+
+
+def draft_needs_own_embedding(vllm_config) -> bool:
+    """Whether this engine's draft must hold its own copy of the shared embedding.
+
+    A pipeline builds the target's ``embed_tokens`` on its first stage only
+    (``Qwen4ExpModel``: ``PPMissingLayer`` elsewhere), while the draft runs on the
+    last stage (``tpu_runner._is_async_drafter``): q38 F2's prefill-only MTP
+    producer. There the draft loads the checkpoint embedding itself (vocab x
+    hidden bf16, 1.27 GB for Qwen3.8); everywhere else it borrows the target's.
+    """
+    parallel = getattr(vllm_config, "parallel_config", None)
+    if int(getattr(parallel, "pipeline_parallel_size", 1) or 1) <= 1:
+        return False
+    from vllm.distributed import get_pp_group
+
+    return not get_pp_group().is_first_rank
 
 
 def mtp_checkpoint_name(name):
@@ -275,8 +301,14 @@ class Qwen4ExpMTP(nn.Module):
     # Draft step 0 consumes the target's second output, the multi-stream
     # hidden state, rather than its LM-head input (see Eagle3Proposer).
     uses_target_aux_hidden_states = True
+    # Borrowed from the target, except on a pipeline stage without the target's
+    # embedding (draft_needs_own_embedding, set per instance in __init__).
     has_own_embed_tokens = False
     has_own_lm_head = False
+    # Draft cache specs a prefill-only producer may hold
+    # (Eagle3Proposer._validate_prefill_only_draft_model): the QSA main KV and
+    # compressed keys (FullAttentionSpec family) and the raw ring (request state).
+    prefill_only_kv_spec_types = (FullAttentionSpec, CircularBufferSpec)
     # Draft step 0 may pass `draft_rows` (each request's last token): the
     # draft then writes its QSA caches for every token but evaluates the
     # layer, and returns both outputs, at those rows only.
@@ -309,6 +341,7 @@ class Qwen4ExpMTP(nn.Module):
         )
         cfg.additional_config = draft_additional_config(vllm_config.additional_config)
         self.config = t
+        self.has_own_embed_tokens = draft_needs_own_embedding(vllm_config)
         self.model = Qwen4ExpMultiTokenPredictor(cfg, prefixes)
         self.lm_head = ParallelLMHead(t.vocab_size, t.hidden_size, prefix="lm_head")
         self.logits_processor = LogitsProcessor(t.vocab_size)
@@ -386,7 +419,15 @@ class Qwen4ExpMTP(nn.Module):
         moe_loaders = [AutoWeightsLoader(layer.mlp) for layer in layers]
         loaded: set[str] = set()
         source: set[str] = set()
+        own_embed = bool(self.has_own_embed_tokens)
         for original, weight in weights:
+            if own_embed and original in TARGET_EMBED_CHECKPOINT_NAMES:
+                if "model.embed_tokens.weight" in loaded:
+                    raise ValueError(f"Duplicate checkpoint embedding {original}")
+                param = parameters["model.embed_tokens.weight"]
+                getattr(param, "weight_loader", default_weight_loader)(param, weight)
+                loaded.add("model.embed_tokens.weight")
+                continue
             name = mtp_checkpoint_name(original)
             if name is None:
                 continue
@@ -439,6 +480,8 @@ class Qwen4ExpMTP(nn.Module):
             for name in ordinary - loaded
             if _parameter_storage_key(parameters[name]) not in loaded_storage
         }
+        if own_embed and "model.embed_tokens.weight" not in loaded:
+            missing.add("model.embed_tokens.weight (the shared checkpoint embedding)")
         if missing:
             raise ValueError(f"Incomplete Qwen4Exp MTP checkpoint: {sorted(missing)}")
         return set(parameters)

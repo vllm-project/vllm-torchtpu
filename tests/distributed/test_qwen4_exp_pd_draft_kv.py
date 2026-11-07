@@ -445,6 +445,18 @@ def test_producer_draft_specs_are_non_prefix_cacheable_on_both_legs(monkeypatch)
     ensure_kv_group_size_rule()
     producer = producer_config()
     decode = producer_config(k=3, tp=8, pp=1, role="kv_consumer")
+    # vLLM's get_kv_cache_groups reads a real CacheConfig (get_resolved_kv_cache_layout):
+    # replace the offload helper's namespace with one, as the decode harness's pool_config does.
+    from vllm.config import CacheConfig
+
+    for cfg in (producer, decode):
+        old = cfg.cache_config
+        real = CacheConfig(
+            block_size=128, cache_dtype="fp8", enable_prefix_caching=old.enable_prefix_caching,
+            mamba_cache_mode=old.mamba_cache_mode, mamba_ssm_cache_dtype="float32",
+        )
+        real.kv_cache_layout = "BLHNC"
+        cfg.cache_config = real
     assert pd_prefill_mtp_producer(producer) and not pd_prefill_mtp_producer(decode)
     _, own = pooled_cache_specs(producer)
     layout_cfg, tp, dcp, pack, cacheable = pd_staging.producer_geometry(decode)

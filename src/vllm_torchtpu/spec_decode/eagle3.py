@@ -1147,13 +1147,21 @@ class Eagle3Proposer:
     def _validate_prefill_only_draft_model(
         self, draft_attn_layer_names: set[str]
     ) -> None:
-        """Validate draft KV-cache capabilities known only after model load."""
+        """Validate draft KV-cache capabilities known only after model load.
+
+        A draft may widen the accepted spec types (``prefill_only_kv_spec_types``;
+        q38 F2: the Qwen3.8 draft's QSA raw ring is a ``CircularBufferSpec``);
+        every other draft keeps ``FullAttentionSpec`` only."""
         kv_cache_specs = self.runner.get_kv_cache_spec()
+        allowed = tuple(
+            getattr(self.draft_model, "prefill_only_kv_spec_types", None) or (FullAttentionSpec,)
+        )
         for layer_name in sorted(draft_attn_layer_names):
             spec = kv_cache_specs.get(layer_name)
-            if not isinstance(spec, FullAttentionSpec):
+            if not isinstance(spec, allowed):
                 raise NotImplementedError(
-                    "A prefill-only MTP draft requires FullAttentionSpec for layer "
+                    "A prefill-only MTP draft requires "
+                    f"{' or '.join(t.__name__ for t in allowed)} for layer "
                     f"{layer_name}, got {type(spec).__name__}"
                 )
 
