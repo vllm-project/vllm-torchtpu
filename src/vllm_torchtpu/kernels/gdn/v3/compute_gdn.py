@@ -43,6 +43,9 @@ def invert_triangular_matrix(t: jax.Array, block_size=16) -> jax.Array:
     out_dtype = t.dtype
     chunk = t.shape[-1]
     block_size = min(block_size, chunk)
+    if chunk % block_size != 0:
+        msg = f"chunk ({chunk}) must be divisible by block_size ({block_size})"
+        raise ValueError(msg)
     num_blocks = chunk // block_size
 
     def local_forward_sub(t_mat, b_mat):
