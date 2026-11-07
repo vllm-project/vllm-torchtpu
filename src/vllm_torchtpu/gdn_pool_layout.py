@@ -45,6 +45,9 @@ QWEN_GDN_ARCHITECTURES = frozenset(
         "Qwen3_5MoeForConditionalGeneration",
         "Qwen4ExpForCausalLM",
         "Qwen4ExpForConditionalGeneration",
+        # Upstream MiniCPM-V 4.7 wraps a Qwen3_5ForCausalLM language model, so
+        # its GDN layers are the same pooled-capable layers.
+        "MiniCPMV4_7ForConditionalGeneration",
     }
 )
 POOLED_GDN_ARCHITECTURES = QWEN_GDN_ARCHITECTURES | frozenset(
