@@ -465,6 +465,17 @@ def test_tworing_consumption_order_and_nesting_guards():
         ):
             ring_mismatch.dmatmul("w1", None, 256, g0=0, lazy=not seg_lazy)
 
+    # dmatmul(lazy=True) outside a segment raises ValueError
+    ring_outside = stream.TwoRing(sp, {}, {}, interpret=True)
+    with pytest.raises(
+        ValueError,
+        match=(
+            r"dmatmul\('w1', lazy=True\) requires an enclosing "
+            r"stream\.segment\(lazy=True\)"
+        ),
+    ):
+        ring_outside.dmatmul("w1", None, 256, g0=0, lazy=True)
+
 
 @pytest.mark.parametrize(
     "dense_acc_pair,dmm_unroll,rel_fetch",

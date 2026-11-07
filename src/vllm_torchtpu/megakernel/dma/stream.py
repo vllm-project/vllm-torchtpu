@@ -567,7 +567,12 @@ class TwoRing:
                 f"stream.segment(lazy={self._lazy})"
             )
         use_lazy = self._lazy if lazy is None else lazy
-        if use_lazy and self._in_segment:
+        if use_lazy and not self._in_segment:
+            raise ValueError(
+                f"dmatmul({kind!r}, lazy=True) requires an enclosing "
+                "stream.segment(lazy=True)"
+            )
+        if use_lazy:
             assert self._seg_tiles <= sp.NBD, (
                 f"Lazy stream.segment() exceeded ring depth on dmatmul({kind!r}): "
                 f"segment tiles {self._seg_tiles} > NBD={sp.NBD}"
