@@ -462,3 +462,51 @@ def test_gmm_v2_int4_packed_matches_reference():
 
     assert actual.shape == (batch_size, out_size)
     _assert_allclose(actual, expected, atol=3e-1, rtol=3e-1)
+
+
+def test_calculate_tiling_512_groups_ep1_prefill_chunk(monkeypatch):
+    from vllm_torchtpu.kernels.megablox import gmm_v2 as gmm_mod
+
+    monkeypatch.setattr(
+        gmm_mod.pltpu,
+        "get_tpu_info",
+        lambda: SimpleNamespace(
+            mxu_column_size=256,
+            vmem_capacity_bytes=64 * 1024 * 1024,
+            num_lanes=128,
+        ),
+    )
+    lhs_cfgs = gmm_mod.InputConfigs(
+        quant_dtype=jnp.float8_e4m3fn, quant_block_size=512, dtype=jnp.bfloat16
+    )
+    rhs_cfgs = gmm_mod.InputConfigs(
+        quant_dtype=jnp.float8_e4m3fn,
+        quant_block_size=128,
+        dtype=jnp.float8_e4m3fn,
+        has_scale=True,
+    )
+    dims_ep1 = gmm_mod.Dimensions(
+        size_m=20480,
+        size_k=4096,
+        size_n=2048,
+        size_group=512,
+        size_lhs_group=512,
+        size_lhs_sublane=8,
+    )
+    tiling_ep1 = gmm_mod.calculate_tiling(
+        dims_ep1, lhs_cfgs, rhs_cfgs, vmem_limit_bytes=64 * 1024 * 1024, fuse_act="silu"
+    )
+    assert (tiling_ep1.tile_m, tiling_ep1.bucket_base) == (256, 128)
+
+    dims_ep8 = gmm_mod.Dimensions(
+        size_m=20480,
+        size_k=4096,
+        size_n=2048,
+        size_group=64,
+        size_lhs_group=64,
+        size_lhs_sublane=8,
+    )
+    tiling_ep8 = gmm_mod.calculate_tiling(
+        dims_ep8, lhs_cfgs, rhs_cfgs, vmem_limit_bytes=64 * 1024 * 1024, fuse_act="silu"
+    )
+    assert (tiling_ep8.tile_m, tiling_ep8.bucket_base) == (512, 128)
