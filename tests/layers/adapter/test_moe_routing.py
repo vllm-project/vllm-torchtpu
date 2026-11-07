@@ -234,6 +234,76 @@ def test_route_scales_topk_weights_by_the_layer_factor(monkeypatch):
     torch.testing.assert_close(scaled_weights, unit_weights * 2.5)
 
 
+def _reference_noaux_tc(logits, bias, *, n_group, topk_group, topk, scale):
+    """DeepSeek-V3 ``noaux_tc`` routing, written out independently of vLLM.
+
+    The bias picks the groups and the experts; the weights are the unbiased
+    sigmoid scores of the picked experts, renormalized, then scaled.
+    """
+    import torch
+
+    scores = logits.sigmoid()
+    biased = scores + bias
+    n_tokens, n_experts = scores.shape
+    grouped = biased.view(n_tokens, n_group, n_experts // n_group)
+    group_scores = grouped.topk(2, dim=-1).values.sum(dim=-1)
+    groups = group_scores.topk(topk_group, dim=-1).indices
+    keep = torch.zeros(n_tokens, n_group, dtype=torch.bool)
+    keep.scatter_(1, groups, True)
+    keep = keep.repeat_interleave(n_experts // n_group, dim=1)
+    ids = biased.masked_fill(~keep, float("-inf")).topk(topk, dim=-1).indices
+    weights = scores.gather(1, ids)
+    return weights / weights.sum(dim=-1, keepdim=True) * scale, ids
+
+
+# 1.0 is the factor a Beam layer carries: with apply_routed_scale_to_output
+# vLLM sets the layer's factor to 1.0 and MoERunner scales the routed output
+# instead (MoERunner._maybe_apply_routed_scale_to_output). 2.5 covers models
+# that fold the factor into the routing weights.
+@pytest.mark.parametrize("scale", [1.0, 2.5])
+def test_select_experts_grouped_sigmoid_topk_matches_reference(monkeypatch, scale):
+    """Beam's router: 256 experts in 8 groups, top-4 groups, top-8 experts."""
+    import torch
+    from vllm.model_executor.layers.fused_moe.router import grouped_topk_router
+
+    # Platform activation strips upstream's @torch.compile(dynamic=True), which
+    # the TPU backend refuses (tpu_platform._DYNAMIC_COMPILE_TARGETS); strip it
+    # here too unless an engine started earlier in this process already did.
+    fn = grouped_topk_router.grouped_topk
+    monkeypatch.setattr(
+        grouped_topk_router, "grouped_topk", getattr(fn, "__wrapped__", fn)
+    )
+    torch.manual_seed(0)
+    n_experts, n_group, topk_group, topk = 256, 8, 4, 8
+    logits = torch.randn(128, n_experts)
+    bias = torch.randn(n_experts) * 0.5
+    layer = _routing_layer(topk=topk)
+    layer.use_grouped_topk = True
+    layer.num_expert_group = n_group
+    layer.topk_group = topk_group
+    layer.scoring_func = "sigmoid"
+    layer.e_score_correction_bias = bias
+    layer.routed_scaling_factor = scale
+
+    got_w, got_i = moe_routing.route(layer, torch.zeros(128, 16), logits)
+    ref_w, ref_i = _reference_noaux_tc(
+        logits, bias, n_group=n_group, topk_group=topk_group, topk=topk, scale=scale
+    )
+
+    # Neither side promises an order within a token's top-k: compare by id.
+    got_i, got_order = got_i.long().sort(dim=-1)
+    ref_i, ref_order = ref_i.sort(dim=-1)
+    assert torch.equal(got_i, ref_i)
+    torch.testing.assert_close(
+        got_w.gather(1, got_order), ref_w.gather(1, ref_order), rtol=1e-6, atol=1e-6
+    )
+    # The bias must change selection here, or this would not test its use.
+    _, unbiased_i = _reference_noaux_tc(
+        logits, 0 * bias, n_group=n_group, topk_group=topk_group, topk=topk, scale=1
+    )
+    assert not torch.equal(unbiased_i.sort(dim=-1).values, ref_i)
+
+
 def test_route_hash_table_scales_by_the_layer_factor():
     import torch
 

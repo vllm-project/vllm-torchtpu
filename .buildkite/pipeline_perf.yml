@@ -202,6 +202,24 @@ steps:
         commands:
           - .buildkite/kubernetes/run.sh bash ./scripts/vllm/benchmarking/run_eval_flow.sh --config kimik-2.6-w4a16-tp8-ep --run-lm-eval
 
+      - label: "Perf/Eval: Nightly beam-1.0-501b-fp8-tp8-ep (TPU v7x-8)"
+        <<: *perf_step
+        if: 'build.env("NIGHTLY") == "1"'
+        env:
+          SHAPE: *shape_8_core
+          TPU_ACCELERATOR_TYPE: "tpu7x"
+          VLLM_ENGINE_READY_TIMEOUT_S: "7200"
+          BENCHMARK_WARMUP_RUNS: "1"
+          TPU_MAX_RUNTIME_SECONDS: *eval_runtime
+          # No perf baseline yet, and the eval baseline is new: report, don't
+          # gate, until its run-to-run spread is known.
+          # TODO: drop EVAL_SOFT_FAIL once the baseline has a few runs.
+          EVAL_SOFT_FAIL: "1"
+        plugins:
+          - *kube_plugin
+        commands:
+          - .buildkite/kubernetes/run.sh bash ./scripts/vllm/benchmarking/run_eval_flow.sh --config beam-1.0-501b-fp8-tp8-ep --run-lm-eval
+
       # The v7x-16 step below is a two-host slice, so it goes through
       # run_multihost.sh and the JobSets in manifests/. It depends on nothing but
       # the image: the fleet places the JobSet in a 2x2x2 slice of its own, and
