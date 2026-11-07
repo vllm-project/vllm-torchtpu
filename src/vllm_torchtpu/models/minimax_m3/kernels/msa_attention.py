@@ -279,6 +279,58 @@ def _kernel_v2(
 _KERNELS = {"v1": _kernel_v1, "v2": _kernel_v2}
 
 
+# `_work_list` builds small batches' lists from dense compares when every
+# pairwise array (tiles x union^2, groups^2 x pages_per_step) is at most this.
+_DENSE_WORK_LIST_ELEMS = 1 << 20
+
+
+def _work_list_dense(per_tile: jax.Array, pages_per_step: int):
+    """`_work_list` from pairwise compares and one-hot selects only.
+
+    A decode batch has one to a few tiles, where `jnp.unique` (sort, scatter,
+    cumsums) and the table gathers are ~20 tiny XLA ops of fixed cost each
+    (~14 us per layer in the b1 decode twin, j-b312f26a); dense compares of
+    a few vregs each fuse into a handful.
+    """
+    num_tiles, union_size = per_tile.shape
+    lane = jnp.arange(union_size, dtype=jnp.int32)
+    x_i, x_j = per_tile[:, :, None], per_tile[:, None, :]
+    seen = jnp.any((x_j == x_i) & (lane[None, :] < lane[:, None]), axis=2)
+    first = (per_tile != _NO_PAGE) & ~seen
+    # Each distinct page's slot in the ascending union.
+    place = jnp.sum(first[:, None, :] & (x_j < x_i), axis=2, dtype=jnp.int32)
+    union = jnp.max(
+        jnp.where(first[:, :, None] & (place[:, :, None] == lane), x_i, -1), axis=1
+    )
+    pages_in_tile = jnp.sum(first, axis=1, dtype=jnp.int32)
+    groups_in_tile = jnp.maximum(-(-pages_in_tile // pages_per_step), 1)
+    tiles = jnp.arange(num_tiles, dtype=jnp.int32)
+    ends = jnp.sum(
+        jnp.where(tiles[None, :] <= tiles[:, None], groups_in_tile[None, :], 0), axis=1
+    )
+    max_groups_per_tile = -(-union_size // pages_per_step)
+    w = jnp.arange(num_tiles * max_groups_per_tile, dtype=jnp.int32)
+    tile = jnp.minimum(jnp.sum(ends[None, :] <= w[:, None], axis=1), num_tiles - 1)
+    in_tile = tile[:, None] == tiles[None, :]
+    tile_groups = jnp.sum(jnp.where(in_tile, groups_in_tile, 0), axis=1)
+    group = w - jnp.sum(jnp.where(in_tile, ends - groups_in_tile, 0), axis=1)
+    grouped = jnp.pad(
+        union,
+        ((0, 0), (0, max_groups_per_tile * pages_per_step - union_size)),
+        constant_values=-1,
+    ).reshape(num_tiles * max_groups_per_tile, pages_per_step)
+    row = tile * max_groups_per_tile + jnp.clip(group, 0, max_groups_per_tile - 1)
+    pages = jnp.max(
+        jnp.where((row[:, None] == w[None, :])[:, :, None], grouped[None], -1), axis=1
+    )
+    meta = (
+        (tile << _TILE_SHIFT)
+        | jnp.where(group == 0, _FIRST_BIT, 0)
+        | jnp.where(group == tile_groups - 1, _LAST_BIT, 0)
+    )
+    return pages.reshape(-1), meta.astype(jnp.int32), ends[-1]
+
+
 def _work_list(selected: jax.Array, block_q: int, pages_per_step: int):
     """Each tile's sorted page union, cut into groups of `pages_per_step`.
 
@@ -291,6 +343,12 @@ def _work_list(selected: jax.Array, block_q: int, pages_per_step: int):
     per_tile = jnp.where(selected < 0, _NO_PAGE, selected).reshape(
         num_tiles, union_size
     )
+    num_groups = num_tiles * -(-union_size // pages_per_step)
+    if (
+        max(num_tiles * union_size**2, num_groups**2 * pages_per_step)
+        <= _DENSE_WORK_LIST_ELEMS
+    ):
+        return _work_list_dense(per_tile, pages_per_step)
     union = jax.vmap(lambda x: jnp.unique(x, size=union_size, fill_value=_NO_PAGE))(
         per_tile
     )

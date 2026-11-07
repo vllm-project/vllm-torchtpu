@@ -236,3 +236,22 @@ def test_page_table_keys_match_physical_pages(dtype):
         np.asarray(by_page.astype(jnp.float32)),
         atol=2e-3,
     )
+
+
+@pytest.mark.parametrize(
+    "num_tokens,block_q,topk,pages_per_step",
+    [(16, 16, 16, 16), (16, 8, 16, 16), (64, 16, 16, 16), (48, 16, 4, 8)],
+)
+def test_dense_work_list_matches_unique(
+    monkeypatch, num_tokens, block_q, topk, pages_per_step
+):
+    """The dense small-batch work list equals the `jnp.unique` one."""
+    rng = np.random.default_rng(num_tokens * block_q + topk)
+    # Few distinct pages so tiles share and repeat them; some tokens pick none.
+    selected = rng.integers(-1, 40, size=(num_tokens, topk)).astype(np.int32)
+    selected[rng.random(num_tokens) < 0.2] = -1
+    dense = msa_attention._work_list(jnp.asarray(selected), block_q, pages_per_step)
+    monkeypatch.setattr(msa_attention, "_DENSE_WORK_LIST_ELEMS", 0)
+    unique = msa_attention._work_list(jnp.asarray(selected), block_q, pages_per_step)
+    for got, want in zip(dense, unique, strict=True):
+        np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
