@@ -909,6 +909,9 @@ class TPUModelRunner(GPUModelRunner):
         # Whether another DP rank ran a decode this step; SrptPrefillScheduler
         # applies VLLM_TPU_SRPT_ATTN_WORK_CAP only while some rank decodes.
         self._dp_step_other_decode = False
+        # Whether some DP rank's step needs the full logits, so that every
+        # rank gathers them instead of taking the greedy top tokens.
+        self._dp_step_full_logits = False
         self.check_recompilation = vllm_envs.VLLM_XLA_CHECK_RECOMPILATION
         self.use_spmd = vllm_envs.VLLM_XLA_USE_SPMD
 
@@ -3752,9 +3755,11 @@ class TPUModelRunner(GPUModelRunner):
         local_num_reqs: int = 0,
         has_encoder_inputs: bool = False,
         local_any_decode: bool = False,
+        local_needs_full_logits: bool = False,
     ) -> "tuple[int | None, int]":
         """Return the DP-wide padded token bucket and forward chunk count."""
         self._dp_step_other_decode = False
+        self._dp_step_full_logits = False
         if not self._dp_lockstep_enabled():
             return None, local_num_chunks
         from vllm.distributed.parallel_state import get_dp_group
@@ -3775,6 +3780,7 @@ class TPUModelRunner(GPUModelRunner):
                 # tell under a MAX reduction whether another one decodes.
                 int(local_any_decode) * (dp_rank + 1),
                 int(local_any_decode) * (dp_size - dp_rank),
+                int(local_needs_full_logits),
             ],
             dtype=torch.int64,
             device="cpu",
@@ -3789,6 +3795,10 @@ class TPUModelRunner(GPUModelRunner):
         # second collective.
         self._dp_step_max_reqs = int(t[2].item())
         self._dp_step_has_encoder_inputs = bool(t[3].item())
+        # The logits collective is in the lockstep trace, so one rank's
+        # full-logits step (logprobs, grammar, a sampled request) moves every
+        # rank off the greedy top tokens.
+        self._dp_step_full_logits = bool(t[6].item())
         highest, lowest = int(t[4].item()) - 1, dp_size - int(t[5].item())
         self._dp_step_other_decode = highest >= 0 and (
             highest != lowest or highest != dp_rank
@@ -3954,6 +3964,8 @@ class TPUModelRunner(GPUModelRunner):
             local_num_reqs=local_max_chunk_reqs,
             has_encoder_inputs=bool(scheduler_output.scheduled_encoder_inputs),
             local_any_decode=self._any_decode(scheduler_output),
+            local_needs_full_logits=self._greedy_head_owner is not None
+            and not self._greedy_top_tokens_eligible(),
         )
         self._dp_step_num_chunks = target_num_chunks
         if isinstance(self._pp_wave, PPRing) and not self._pp_is_first:
@@ -5582,9 +5594,7 @@ class TPUModelRunner(GPUModelRunner):
             and self._pp_is_last
             and not self.is_pooling_model
         ):
-            self._greedy_head_owner = greedy_top_tokens.resolve_head_owner(
-                self.model, self._dp_lockstep_enabled()
-            )
+            self._greedy_head_owner = greedy_top_tokens.resolve_head_owner(self.model)
 
         # If using eagle3/mtp or dflash speculative decoding, load the draft model and
         # share the target's embeddings / LM head (if the draft requires it).
@@ -6074,7 +6084,10 @@ class TPUModelRunner(GPUModelRunner):
                 # Idle DP engines must issue the same TP logits collective as
                 # busy engines before the next DP synchronization.
                 _idx = torch.zeros(num_reqs, dtype=torch.int32, device=out.device)
-                _ = self.compute_selected_logits(out, _idx)
+                if self._greedy_head_owner is None or self._dp_step_full_logits:
+                    _ = self.compute_selected_logits(out, _idx)
+                else:
+                    _ = self.compute_selected_top_tokens(out, _idx)
             if not dp_lockstep:
                 synchronize_tensors(out)
             elapsed_ms = (time.perf_counter() - started) * 1000.0
@@ -8400,13 +8413,17 @@ class TPUModelRunner(GPUModelRunner):
     ) -> torch.Tensor:
         return self.model.compute_logits(hidden_states)
 
-    def _greedy_top_tokens_this_step(self) -> bool:
+    def _greedy_top_tokens_eligible(self) -> bool:
         # A request below min_tokens needs the full logits to mask its stops.
         return (
             self._greedy_head_owner is not None
             and greedy_top_tokens.step_eligible(self.input_batch, self.requests)
             and not self._min_tokens.any_in(self.input_batch.req_id_to_index)
         )
+
+    def _greedy_top_tokens_this_step(self) -> bool:
+        # Under EP-DP lockstep every rank takes the same logits path.
+        return self._greedy_top_tokens_eligible() and not self._dp_step_full_logits
 
     @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
     def compute_selected_top_tokens(

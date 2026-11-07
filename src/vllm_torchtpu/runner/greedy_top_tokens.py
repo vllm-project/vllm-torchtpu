@@ -43,7 +43,7 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
-def resolve_head_owner(model: torch.nn.Module, dp_lockstep: bool) -> torch.nn.Module:
+def resolve_head_owner(model: torch.nn.Module) -> torch.nn.Module:
     """The module holding ``lm_head`` and its ``logits_processor``.
 
     Qwen3.5's wrapper keeps both on ``language_model``. Raises when the model
@@ -80,14 +80,6 @@ def resolve_head_owner(model: torch.nn.Module, dp_lockstep: bool) -> torch.nn.Mo
         raise NotImplementedError(
             "TPU_GREEDY_TOP_TOKENS: the argmax reduction needs a positive "
             f"logit scale, got {processor.scale}; unset TPU_GREEDY_TOP_TOKENS."
-        )
-    if dp_lockstep and head.tp_size > 1:
-        # An idle engine issues the full-logits collective in lockstep with
-        # its busy peers, which would be waiting in the pair exchange.
-        raise NotImplementedError(
-            "TPU_GREEDY_TOP_TOKENS with expert-parallel data parallelism and a "
-            "tensor-parallel LM head is not supported; unset "
-            "TPU_GREEDY_TOP_TOKENS or use tensor parallelism alone."
         )
     return module
 

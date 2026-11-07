@@ -24,6 +24,7 @@ import torch
 from vllm import SamplingParams
 from vllm import logger as vllm_logger
 from vllm.config import LoRAConfig
+from vllm.distributed import parallel_state
 from vllm.lora.layers import (
     BaseLayerWithLoRA,
     LogitsProcessorWithLoRA,
@@ -184,7 +185,7 @@ def test_top_tokens_include_the_lm_head_lora_delta(monkeypatch):
 def test_head_owner_resolves_through_the_lora_wrapper(monkeypatch):
     owner = _lora_owner(monkeypatch)
 
-    assert greedy_top_tokens.resolve_head_owner(owner, dp_lockstep=False) is owner
+    assert greedy_top_tokens.resolve_head_owner(owner) is owner
 
 
 def test_resolve_head_owner_refuses_other_logits_processor_wrappers():
@@ -201,7 +202,7 @@ def test_resolve_head_owner_refuses_other_logits_processor_wrappers():
     assert hasattr(owner.logits_processor, "get_top_tokens")
 
     with pytest.raises(NotImplementedError, match="no module with an lm_head"):
-        greedy_top_tokens.resolve_head_owner(owner, dp_lockstep=False)
+        greedy_top_tokens.resolve_head_owner(owner)
 
 
 def _batch(*params, max_num_logprobs=None):
@@ -240,16 +241,12 @@ def test_resolve_head_owner_finds_the_nested_language_model():
     model = torch.nn.Module()
     model.language_model = owner
 
-    assert greedy_top_tokens.resolve_head_owner(model, dp_lockstep=False) is owner
+    assert greedy_top_tokens.resolve_head_owner(model) is owner
 
 
 def test_resolve_head_owner_refuses_unsupported_models():
     with pytest.raises(NotImplementedError, match="no module with an lm_head"):
-        greedy_top_tokens.resolve_head_owner(torch.nn.Linear(2, 2), False)
-    with pytest.raises(NotImplementedError, match="expert-parallel data"):
-        greedy_top_tokens.resolve_head_owner(
-            _Owner(_shards(torch.zeros(8, 2), 2)[0]), dp_lockstep=True
-        )
+        greedy_top_tokens.resolve_head_owner(torch.nn.Linear(2, 2))
 
     class TpuLogitsModel(_Owner):
         def compute_logits(self, hidden_states):
@@ -258,7 +255,7 @@ def test_resolve_head_owner_refuses_unsupported_models():
     TpuLogitsModel.compute_logits.__module__ = "vllm_torchtpu.models.fake"
     with pytest.raises(NotImplementedError, match="TPU-specific compute_logits"):
         greedy_top_tokens.resolve_head_owner(
-            TpuLogitsModel(_shards(torch.zeros(8, 2), 1)[0]), False
+            TpuLogitsModel(_shards(torch.zeros(8, 2), 1)[0])
         )
 
 
@@ -270,6 +267,7 @@ def _runner(weight, speculative_config=None):
     runner._greedy_head_owner = owner
     runner.speculative_config = speculative_config
     runner._min_tokens = min_tokens.MinTokensTracker()
+    runner._dp_step_full_logits = False
     return runner
 
 
@@ -304,6 +302,43 @@ def test_runner_step_choice():
     # A mixed greedy / sampled batch verifies on the full logits.
     spec.input_batch, spec.requests = _batch(greedy, SamplingParams(temperature=0.6))
     assert not spec._greedy_top_tokens_this_step()
+
+
+def test_runner_step_follows_the_dp_ranks():
+    """Under EP-DP lockstep a rank whose own batch is greedy still gathers the
+    full logits when another rank's step needs them, and each rank reports
+    its own need on the coordinated all-reduce."""
+    greedy = SamplingParams(temperature=0)
+    sampled = SamplingParams(temperature=0.6)
+    runners = [_runner(torch.zeros(8, 2)) for _ in range(2)]
+    runners[0].input_batch, runners[0].requests = _batch(greedy)
+    runners[1].input_batch, runners[1].requests = _batch(greedy, sampled)
+    needs = [not r._greedy_top_tokens_eligible() for r in runners]
+    assert needs == [False, True]
+
+    group = SimpleNamespace(rank_in_group=0, world_size=2, cpu_group=None)
+    sent: list[torch.Tensor] = []
+    with (
+        patch.object(parallel_state, "get_dp_group", return_value=group),
+        patch.object(torch.distributed, "all_reduce", lambda t, **_: sent.append(t)),
+    ):
+        for runner, need in zip(runners, needs):
+            runner._dp_lockstep_enabled = lambda: True
+            runner.num_tokens_paddings = [16]
+            runner._dp_coordinated_step(8, 1, local_needs_full_logits=need)
+    reduced = torch.stack(sent).amax(dim=0)
+    with (
+        patch.object(parallel_state, "get_dp_group", return_value=group),
+        patch.object(torch.distributed, "all_reduce", lambda t, **_: t.copy_(reduced)),
+    ):
+        for runner, need in zip(runners, needs):
+            runner._dp_coordinated_step(8, 1, local_needs_full_logits=need)
+    assert [r._greedy_top_tokens_this_step() for r in runners] == [False, False]
+
+    runners[1].input_batch, runners[1].requests = _batch(greedy)
+    runners[1]._dp_lockstep_enabled = lambda: False
+    runners[1]._dp_coordinated_step(8, 1)
+    assert runners[1]._greedy_top_tokens_this_step()
 
 
 K = 3

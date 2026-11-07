@@ -546,6 +546,7 @@ def test_precompile_covers_the_mask_calls_serving_makes():
 def test_top_tokens_step_needs_the_full_logits_below_min_tokens():
     runner = object.__new__(TPUModelRunner)
     runner._greedy_head_owner = object()
+    runner._dp_step_full_logits = False
     params = SamplingParams(temperature=0)
     runner.requests = {"r0": SimpleNamespace(sampling_params=params)}
     runner._min_tokens = min_tokens.MinTokensTracker()
