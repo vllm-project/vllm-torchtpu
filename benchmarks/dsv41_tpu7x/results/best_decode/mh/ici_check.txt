@@ -1,0 +1,89 @@
+### 1. GKE slice facts
+NAME                    TOPO    HOSTS    ACC     ZONE
+gke-tpu-2ff35982-3xvp   2x2x2   <none>   tpu7x   us-central1-c
+gke-tpu-2ff35982-k2sn   2x2x2   <none>   tpu7x   us-central1-c
+--- chaitanyapk-dsv41-mh-mh1-0-dvmvc (pod-injected TPU env, before our launcher blanks it)
+TPU_ACCELERATOR_TYPE=tpu7x-16
+TPU_CHIPS_PER_HOST_BOUNDS=2,2,1
+TPU_HOST_BOUNDS=1,1,2
+TPU_LOG_DIR=/tmp/tpu_logs/tpu-worker
+TPU_PROCESS_ADDRESSES=chaitanyapk-dsv41-mh-mh1-0.chaitanyapk-dsv41-mh-mh1:8471,chaitanyapk-dsv41-mh-mh1-1.chaitanyapk-dsv41-mh-mh1:8471
+TPU_PROCESS_PORT=8471
+TPU_RUNTIME_METRICS_PORTS=8431,8432,8433,8434,8435,8436,8437,8438
+TPU_SKIP_MDS_QUERY=true
+TPU_TOPOLOGY=2x2x2
+TPU_TOPOLOGY_ALT=false
+TPU_TOPOLOGY_WRAP=false,false,false
+TPU_VISIBLE_CHIPS=0,1,2,3
+TPU_WORKER_HOSTNAMES=chaitanyapk-dsv41-mh-mh1-0.chaitanyapk-dsv41-mh-mh1,chaitanyapk-dsv41-mh-mh1-1.chaitanyapk-dsv41-mh-mh1
+TPU_WORKER_ID=0
+accel devices:
+/dev/vfio: 0 1 2 3 4 5 6 7 vfio 
+command terminated with exit code 1
+--- chaitanyapk-dsv41-mh-mh1-1-wbwlm (pod-injected TPU env, before our launcher blanks it)
+TPU_ACCELERATOR_TYPE=tpu7x-16
+TPU_CHIPS_PER_HOST_BOUNDS=2,2,1
+TPU_HOST_BOUNDS=1,1,2
+TPU_LOG_DIR=/tmp/tpu_logs/tpu-worker
+TPU_PROCESS_ADDRESSES=chaitanyapk-dsv41-mh-mh1-0.chaitanyapk-dsv41-mh-mh1:8471,chaitanyapk-dsv41-mh-mh1-1.chaitanyapk-dsv41-mh-mh1:8471
+TPU_PROCESS_PORT=8471
+TPU_RUNTIME_METRICS_PORTS=8431,8432,8433,8434,8435,8436,8437,8438
+TPU_SKIP_MDS_QUERY=true
+TPU_TOPOLOGY=2x2x2
+TPU_TOPOLOGY_ALT=false
+TPU_TOPOLOGY_WRAP=false,false,false
+TPU_VISIBLE_CHIPS=2,3,0,1
+TPU_WORKER_HOSTNAMES=chaitanyapk-dsv41-mh-mh1-0.chaitanyapk-dsv41-mh-mh1,chaitanyapk-dsv41-mh-mh1-1.chaitanyapk-dsv41-mh-mh1
+TPU_WORKER_ID=1
+accel devices:
+/dev/vfio: 0 1 2 3 4 5 6 7 vfio 
+command terminated with exit code 1
+
+### 2. Runtime topology lines (head)
+(ApiServer_0 pid=447) INFO 11-06 10:33:47 [__init__.py:395] Applied TPU patch: use explicit PCP collectives unless MoE chunk pipelining or an armed fused EP layer owns them.
+(ApiServer_0 pid=447) INFO 11-06 10:33:47 [patch_registry.py:214] Completed TPU patch callbacks at platform_activation: vllm_torchtpu.distributed.pallas_shapes:install_pallas_shape_conversion, vllm_torchtpu.layers.adapter.custom_ops:_register_custom_ops, vllm_torchtpu:_patch_vllm_aot_compile_cache_k
+(ApiServer_1 pid=448) INFO 11-06 10:33:47 [__init__.py:395] Applied TPU patch: use explicit PCP collectives unless MoE chunk pipelining or an armed fused EP layer owns them.
+(ApiServer_1 pid=448) INFO 11-06 10:33:47 [patch_registry.py:214] Completed TPU patch callbacks at platform_activation: vllm_torchtpu.distributed.pallas_shapes:install_pallas_shape_conversion, vllm_torchtpu.layers.adapter.custom_ops:_register_custom_ops, vllm_torchtpu:_patch_vllm_aot_compile_cache_k
+(ApiServer_2 pid=449) INFO 11-06 10:33:48 [__init__.py:395] Applied TPU patch: use explicit PCP collectives unless MoE chunk pipelining or an armed fused EP layer owns them.
+(ApiServer_2 pid=449) INFO 11-06 10:33:48 [patch_registry.py:214] Completed TPU patch callbacks at platform_activation: vllm_torchtpu.distributed.pallas_shapes:install_pallas_shape_conversion, vllm_torchtpu.layers.adapter.custom_ops:_register_custom_ops, vllm_torchtpu:_patch_vllm_aot_compile_cache_k
+(ApiServer_3 pid=450) (ApiServer_1 pid=448) INFO 11-06 10:33:47 [__init__.py:395] Applied TPU patch: use explicit PCP collectives unless MoE chunk pipelining or an armed fused EP layer owns them.
+(ApiServer_3 pid=450) INFO 11-06 10:33:47 [patch_registry.py:214] Completed TPU patch callbacks at platform_activation: vllm_torchtpu.distributed.pallas_shapes:install_pallas_shape_conversion, vllm_torchtpu.layers.adapter.custom_ops:_register_custom_ops, vllm_torchtpu:_patch_vllm_aot_compile_cache_k
+(ApiServer_4 pid=451) INFO 11-06 10:33:48 [__init__.py:395] Applied TPU patch: use explicit PCP collectives unless MoE chunk pipelining or an armed fused EP layer owns them.
+(ApiServer_4 pid=451) INFO 11-06 10:33:48 [patch_registry.py:214] Completed TPU patch callbacks at platform_activation: vllm_torchtpu.distributed.pallas_shapes:install_pallas_shape_conversion, vllm_torchtpu.layers.adapter.custom_ops:_register_custom_ops, vllm_torchtpu:_patch_vllm_aot_compile_cache_k
+(ApiServer_5 pid=452) INFO 11-06 10:33:47 [__init__.py:395] Applied TPU patch: use explicit PCP collectives unless MoE chunk pipelining or an armed fused EP layer owns them.
+(ApiServer_5 pid=452) INFO 11-06 10:33:47 [patch_registry.py:214] Completed TPU patch callbacks at platform_activation: vllm_torchtpu.distributed.pallas_shapes:install_pallas_shape_conversion, vllm_torchtpu.layers.adapter.custom_ops:_register_custom_ops, vllm_torchtpu:_patch_vllm_aot_compile_cache_k
+(ApiServer_6 pid=453) INFO 11-06 10:33:48 [__init__.py:395] Applied TPU patch: use explicit PCP collectives unless MoE chunk pipelining or an armed fused EP layer owns them.
+(ApiServer_6 pid=453) INFO 11-06 10:33:48 [patch_registry.py:214] Completed TPU patch callbacks at platform_activation: vllm_torchtpu.distributed.pallas_shapes:install_pallas_shape_conversion, vllm_torchtpu.layers.adapter.custom_ops:_register_custom_ops, vllm_torchtpu:_patch_vllm_aot_compile_cache_k
+(ApiServer_7 pid=454) INFO 11-06 10:33:48 [__init__.py:395] Applied TPU patch: use explicit PCP collectives unless MoE chunk pipelining or an armed fused EP layer owns them.
+(ApiServer_7 pid=454) INFO 11-06 10:33:48 [patch_registry.py:214] Completed TPU patch callbacks at platform_activation: vllm_torchtpu.distributed.pallas_shapes:install_pallas_shape_conversion, vllm_torchtpu.layers.adapter.custom_ops:_register_custom_ops, vllm_torchtpu:_patch_vllm_aot_compile_cache_k
+(EngineCore_DP0 pid=439) (EngineCore_DP7 pid=446) INFO 11-06 10:57:34 [__init__.py:395] Applied TPU patch: use explicit PCP collectives unless MoE chunk pipelining or an armed fused EP layer owns them.
+(EngineCore_DP0 pid=439) INFO 11-06 10:57:34 [patch_registry.py:214] Completed TPU patch callbacks at platform_activation: vllm_torchtpu.distributed.pallas_shapes:install_pallas_shape_conversion, vllm_torchtpu.layers.adapter.custom_ops:_register_custom_ops, vllm_torchtpu:_patch_vllm_aot_compile_cach
+(EngineCore_DP1 pid=440) INFO 11-06 10:57:34 [__init__.py:395] Applied TPU patch: use explicit PCP collectives unless MoE chunk pipelining or an armed fused EP layer owns them.
+(EngineCore_DP1 pid=440) INFO 11-06 10:57:34 [patch_registry.py:214] Completed TPU patch callbacks at platform_activation: vllm_torchtpu.distributed.pallas_shapes:install_pallas_shape_conversion, vllm_torchtpu.layers.adapter.custom_ops:_register_custom_ops, vllm_torchtpu:_patch_vllm_aot_compile_cach
+(EngineCore_DP2 pid=441) INFO 11-06 10:57:34 [__init__.py:395] Applied TPU patch: use explicit PCP collectives unless MoE chunk pipelining or an armed fused EP layer owns them.
+(EngineCore_DP2 pid=441) INFO 11-06 10:57:34 [patch_registry.py:214] Completed TPU patch callbacks at platform_activation: vllm_torchtpu.distributed.pallas_shapes:install_pallas_shape_conversion, vllm_torchtpu.layers.adapter.custom_ops:_register_custom_ops, vllm_torchtpu:_patch_vllm_aot_compile_cach
+(EngineCore_DP3 pid=442) INFO 11-06 10:57:34 [__init__.py:395] Applied TPU patch: use explicit PCP collectives unless MoE chunk pipelining or an armed fused EP layer owns them.
+(EngineCore_DP3 pid=442) INFO 11-06 10:57:34 [patch_registry.py:214] Completed TPU patch callbacks at platform_activation: vllm_torchtpu.distributed.pallas_shapes:install_pallas_shape_conversion, vllm_torchtpu.layers.adapter.custom_ops:_register_custom_ops, vllm_torchtpu:_patch_vllm_aot_compile_cach
+(EngineCore_DP4 pid=443) INFO 11-06 10:57:34 [__init__.py:395] Applied TPU patch: use explicit PCP collectives unless MoE chunk pipelining or an armed fused EP layer owns them.
+(EngineCore_DP4 pid=443) INFO 11-06 10:57:34 [patch_registry.py:214] Completed TPU patch callbacks at platform_activation: vllm_torchtpu.distributed.pallas_shapes:install_pallas_shape_conversion, vllm_torchtpu.layers.adapter.custom_ops:_register_custom_ops, vllm_torchtpu:_patch_vllm_aot_compile_cach
+(EngineCore_DP5 pid=444) INFO 11-06 10:57:34 [__init__.py:395] Applied TPU patch: use explicit PCP collectives unless MoE chunk pipelining or an armed fused EP layer owns them.
+(EngineCore_DP5 pid=444) INFO 11-06 10:57:34 [patch_registry.py:214] Completed TPU patch callbacks at platform_activation: vllm_torchtpu.distributed.pallas_shapes:install_pallas_shape_conversion, vllm_torchtpu.layers.adapter.custom_ops:_register_custom_ops, vllm_torchtpu:_patch_vllm_aot_compile_cach
+(EngineCore_DP6 pid=445) INFO 11-06 10:57:34 [__init__.py:395] Applied TPU patch: use explicit PCP collectives unless MoE chunk pipelining or an armed fused EP layer owns them.
+(EngineCore_DP6 pid=445) INFO 11-06 10:57:34 [patch_registry.py:214] Completed TPU patch callbacks at platform_activation: vllm_torchtpu.distributed.pallas_shapes:install_pallas_shape_conversion, vllm_torchtpu.layers.adapter.custom_ops:_register_custom_ops, vllm_torchtpu:_patch_vllm_aot_compile_cach
+(EngineCore_DP7 pid=446) INFO 11-06 10:57:34 [patch_registry.py:214] Completed TPU patch callbacks at platform_activation: vllm_torchtpu.distributed.pallas_shapes:install_pallas_shape_conversion, vllm_torchtpu.layers.adapter.custom_ops:_register_custom_ops, vllm_torchtpu:_patch_vllm_aot_compile_cach
+INFO 11-06 10:33:12 [__init__.py:395] Applied TPU patch: use explicit PCP collectives unless MoE chunk pipelining or an armed fused EP layer owns them.
+INFO 11-06 10:33:12 [patch_registry.py:214] Completed TPU patch callbacks at platform_activation: vllm_torchtpu.distributed.pallas_shapes:install_pallas_shape_conversion, vllm_torchtpu.layers.adapter.custom_ops:_register_custom_ops, vllm_torchtpu:_patch_vllm_aot_compile_cache_key, vllm_torchtpu:_pat
+INFO 11-06 10:33:12 [tpu_mp_multihost.py:242] TPU mp multihost DP: rendezvousing node_index=0/2 data_parallel_size_local=8 master_addr=10.11.0.92 rendezvous_port=29501
+INFO 11-06 10:33:31 [tpu_mp_multihost.py:282] TPU mp multihost DP: node_index=0 host_ips=['10.11.0.92', '10.11.0.95'] TORCH_TPU_SLICEBUILDER_ADDRESSES=10.11.0.92:8070,10.11.0.92:8071,10.11.0.92:8072,10.11.0.92:8073,10.11.0.92:8074,10.11.0.92:8075,10.11.0.92:8076,10.11.0.92:8077,10.11.0.95:8070,10.11
+INFO 11-06 10:33:59 [__init__.py:395] Applied TPU patch: use explicit PCP collectives unless MoE chunk pipelining or an armed fused EP layer owns them.
+INFO 11-06 10:33:59 [patch_registry.py:214] Completed TPU patch callbacks at worker_init: vllm_torchtpu.distributed.pallas_shapes:install_pallas_shape_conversion, vllm_torchtpu.layers.adapter.custom_ops:_register_custom_ops, vllm_torchtpu:_patch_vllm_aot_compile_cache_key, vllm_torchtpu:_patch_vllm_
+INFO 11-06 10:57:34 [__init__.py:395] Applied TPU patch: use explicit PCP collectives unless MoE chunk pipelining or an armed fused EP layer owns them.
+
+### 3. NIC counters idle vs load (host0 and host1), bytes/s
+-- idle (10 s)
+host0 {'cilium_host': (0.0, 0.0), 'cilium_net': (0.0, 0.0), 'docker0': (0.0, 0.0), 'eth0': (2.0, 0.1), 'eth1': (0.0, 0.0), 'lxc21430fc7d419': (0.0, 0.0), 'lxc3f6a4c66f8af': (0.0, 0.0), 'lxc8eef5e1a3c74': (0.1, 0.0), 'lxcad04c93c47b3': (0.0, 0.0)} MB/s (rx,tx)
+host1 {'cilium_host': (0.0, 0.0), 'cilium_net': (0.0, 0.0), 'docker0': (0.0, 0.0), 'eth0': (0.0, 0.1), 'eth1': (0.0, 0.0), 'lxc07940c805192': (0.1, 0.0), 'lxc1054fdf780f9': (0.0, 0.0), 'lxc6837c73a0cbf': (0.0, 0.0), 'lxc7e18ab2e7ea5': (0.0, 0.0)} MB/s (rx,tx)
+-- under load: c=512 (32 seqs/rank) ctx 2K, sampling 20 s in steady state
+host0 {'cilium_host': (0.0, 0.0), 'cilium_net': (0.0, 0.0), 'docker0': (0.0, 0.0), 'eth0': (0.0, 0.1), 'eth1': (0.0, 0.0), 'lxc21430fc7d419': (0.0, 0.0), 'lxc3f6a4c66f8af': (0.0, 0.0), 'lxc8eef5e1a3c74': (0.0, 0.0), 'lxcad04c93c47b3': (0.0, 0.0)} MB/s (rx,tx)
+host1 {'cilium_host': (0.0, 0.0), 'cilium_net': (0.0, 0.0), 'docker0': (0.0, 0.0), 'eth0': (0.0, 0.1), 'eth1': (0.0, 0.0), 'lxc07940c805192': (0.1, 0.0), 'lxc1054fdf780f9': (0.0, 0.0), 'lxc6837c73a0cbf': (0.0, 0.0), 'lxc7e18ab2e7ea5': (0.0, 0.0)} MB/s (rx,tx)
+(for reference: EP a2a at 192 tok/rank/step over DCN would be >= 1,000 MB/s per host; <= tens of MB/s means ICI)

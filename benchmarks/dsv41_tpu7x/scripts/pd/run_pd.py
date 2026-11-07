@@ -370,6 +370,11 @@ def main() -> None:
             if is_4x_tp2
             else f"--prefiller-hosts 127.0.0.1 --prefiller-ports {PORTS['prefill']} --prefiller-dp-size {a.proxy_dp_size}"
         )
+        # If the decode role was recreated (new pod IP) a surviving proxy on the prefill pod still
+        # points at the old decoder -> every decode call fails with ConnectError. Restart it.
+        if "decode" in relaunch and healthy(kp, PROXY_PORT, "/healthcheck"):
+            L.log("decode was relaunched; restarting proxy so it targets the new decoder IP")
+            kp.exec_sh("for p in $(pgrep -f toy_proxy_server); do kill -9 $p 2>/dev/null || true; done; sleep 2", timeout=60)
         if not healthy(kp, PROXY_PORT, "/healthcheck"):
             L.start_detached(kp, (
                 "cd /workspace/vllm-torchtpu && exec python3 examples/disagg/toy_proxy_server.py "

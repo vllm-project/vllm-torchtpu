@@ -300,6 +300,13 @@ def build_trunk_chat_payload(
     req_max_tokens = 1024
   else:
     req_max_tokens = bucket_orig_max_tokens
+  # Keep prompt + max_tokens inside --max-model-len (131072) on the decode node. The proxy sends
+  # max_tokens=1 to prefill, so an oversized request is only rejected by decode (HTTP 400) after
+  # the proxy has already flushed 200 headers -> client sees a 0-token TransferEncodingError.
+  # Observed: all n=128 failures were the longest 64K+ trunk (~90K+ ISL) with max_tokens=32768.
+  max_model_len = 131072
+  ctx_margin = 2048
+  req_max_tokens = max(64, min(req_max_tokens, max_model_len - ctx_margin - int(target_isl_tokens)))
   req_ignore_eos = ignore_eos
   if is_warmup:
     req_max_tokens = 1
@@ -780,6 +787,15 @@ async def run_single_n(
   w_all = w_stage1 + w_stage2
   w_ok = sum(1 for x in w_all if x["error"] is None)
   w_prompt_sum = sum(x["prompt_tokens"] for x in w_all if x["error"] is None)
+  # Measured prompt length per trunk (from the warm-up usage.prompt_tokens). Used to cap each
+  # request's max_tokens so prompt + max_tokens <= max_model_len on the decode node; otherwise
+  # decode returns HTTP 400 after the proxy has already streamed 200 headers.
+  trunk_prompt_tokens: dict[int, int] = {
+      int(x["trunk_id"]): int(x["prompt_tokens"] or 0) for x in w_all if x["error"] is None
+  }
+  oversized = {k: v for k, v in trunk_prompt_tokens.items() if v > 131072 - 4096 - 1024}
+  if oversized:
+    print(f"[n={num_sessions}] WARNING: trunks with prompt > ~126K tokens (max_tokens will be capped): {oversized}")
   print(
       f"[n={num_sessions}] Phase 0 Warmup complete: {w_ok}/{len(all_trunks)} distinct trunks populated "
       f"({w_prompt_sum:,} total prompt tokens) in {time.perf_counter() - t_w0:.2f}s. Starting measured benchmark..."
@@ -851,6 +867,14 @@ async def run_single_n(
           is_warmup=False,
           sampling_spec=samp_spec,
       )
+      # Per-trunk cap: the measured session prompt is the warm-up trunk prompt plus a unique
+      # suffix (<= ~5% of ISL + ~2K template tokens); keep prompt + max_tokens < max_model_len.
+      _tp = trunk_prompt_tokens.get(trunk_id)
+      if _tp:
+        _suffix_margin = int(_tp * 0.08) + 2048
+        _cap = 131072 - _tp - _suffix_margin
+        if payload["max_tokens"] > _cap:
+          payload["max_tokens"] = max(32, _cap)
       try:
         res = await send_chat_request(
             http_session,
@@ -929,12 +953,18 @@ async def run_single_n(
         window_uncached_tokens += uncached
 
   win_ok_results = [r for r in ok_results if duration_per_n <= 0 or r["t_end"] <= t_window_end]
-  eval_results = win_ok_results if len(win_ok_results) >= max(4, num_sessions // 2) else ok_results
+  # Headline latency/stream statistics are computed over ALL completed requests
+  # (including post-window drain completions) to avoid in-window selection bias;
+  # in-window-only statistics are kept alongside for continuity with earlier runs.
+  eval_results = ok_results
+  inwin_results = win_ok_results if win_ok_results else ok_results
 
   ttfts = [r["ttft"] for r in eval_results if r["ttft"] is not None]
+  ttfts_inwin = [r["ttft"] for r in inwin_results if r["ttft"] is not None]
   e2es = [r["e2e"] for r in eval_results if r["e2e"] is not None]
   per_tok_itls = [r["per_token_itl"] for r in eval_results if r.get("per_token_itl") is not None]
   decode_tps_list = [r["decode_tps"] for r in eval_results if r.get("decode_tps") is not None]
+  decode_tps_inwin = [r["decode_tps"] for r in inwin_results if r.get("decode_tps") is not None]
   all_chunk_itls = [itl for r in eval_results for itl in r["itls"]]
 
   total_prompt = sum(r["prompt_tokens"] for r in ok_results)
@@ -957,6 +987,7 @@ async def run_single_n(
     b_out = sum(r["completion_tokens"] for r in b_res)
     bucket_breakdown[b_name] = {
         "count": len(b_res),
+        "low_confidence_p90": len(b_res) < 50,
         "trunks_configured": bucket_trunk_counts[b_name],
         "mean_isl": (b_p / len(b_res)) if b_res else 0.0,
         "mean_osl": (b_out / len(b_res)) if b_res else 0.0,
@@ -985,6 +1016,37 @@ async def run_single_n(
 
   def _cost_per_1m(tps: float) -> float:
     return (sec_usd * 1e6 / tps) if tps > 0 else 0.0
+
+  # Per-chip normalisation (physical TPU7x chips; 1 chip = 2 TensorCores) and
+  # revenue at the production traffic shape (18:1 in:out, 71% prefix hit) at
+  # DeepSeek list prices: $0.15 uncached-in / $0.003 cached-in / $0.60 out per 1M.
+  num_d_chips = max(1, num_chips // 2)
+  num_p_chips = max(1, num_chips - num_d_chips)
+  prod_in_out_ratio, prod_hit = 18.0, 0.71
+  prod_usd_per_1m_out = (
+      prod_in_out_ratio * (1.0 - prod_hit) * 0.15
+      + prod_in_out_ratio * prod_hit * 0.003
+      + 0.60
+  )
+  per_total_chip_out = win_out_tps / num_chips
+  per_chip = {
+      "num_p_chips": num_p_chips,
+      "num_d_chips": num_d_chips,
+      "window_output_tok_per_s_per_d_chip": win_out_tps / num_d_chips,
+      "window_output_tok_per_s_per_total_chip": per_total_chip_out,
+      "window_uncached_prefill_tok_per_s_per_p_chip": win_uncached_tps / num_p_chips,
+      "prod_shape": {"in_out_ratio": prod_in_out_ratio, "hit": prod_hit,
+                     "usd_per_1m_out_at_list": prod_usd_per_1m_out},
+      "prod_revenue_usd_per_chip_hr_list_100pct_util": per_total_chip_out * 3600.0 / 1e6 * prod_usd_per_1m_out,
+      "prod_revenue_usd_per_chip_hr_50pct_list_70pct_util": per_total_chip_out * 3600.0 / 1e6 * prod_usd_per_1m_out * 0.5 * 0.7,
+      "rental_usd_per_chip_hr": chip_hourly_usd,
+  }
+
+  per_request_records = [
+      {k: v for k, v in r.items() if k not in ("itls", "chunk_times")}
+      | {"itl_chunks": len(r.get("itls") or [])}
+      for r in results
+  ]
 
   summary = {
       "num_sessions": num_sessions,
@@ -1043,11 +1105,29 @@ async def run_single_n(
           "p90": percentile(per_tok_itls, 90) * 1000.0,
       },
       "ttft_s": {
+          "scope": "all_completed_requests",
           "mean": statistics.mean(ttfts) if ttfts else 0.0,
           "median": statistics.median(ttfts) if ttfts else 0.0,
           "p90": percentile(ttfts, 90),
           "p99": percentile(ttfts, 99),
       },
+      "ttft_s_in_window": {
+          "scope": "in_window_completions_only",
+          "count": len(ttfts_inwin),
+          "median": statistics.median(ttfts_inwin) if ttfts_inwin else 0.0,
+          "p90": percentile(ttfts_inwin, 90),
+      },
+      "client_decode_tps_per_stream_in_window": {
+          "median": statistics.median(decode_tps_inwin) if decode_tps_inwin else 0.0,
+          "p10_low": percentile(decode_tps_inwin, 10),
+      },
+      "per_chip": per_chip,
+      "failed_request_records": [
+          {k: rec.get(k) for k in ("bucket", "dp_rank", "trunk_id", "session_id", "t_start", "t_end",
+                                   "e2e", "ttft", "completion_tokens", "prompt_tokens",
+                                   "finish_reason", "has_tool_calls", "status_code", "error")}
+          for rec in per_request_records if rec.get("error") is not None
+      ],
       "chunk_itl_ms": {
           "mean": statistics.mean(all_chunk_itls) * 1000.0 if all_chunk_itls else 0.0,
           "median": statistics.median(all_chunk_itls) * 1000.0 if all_chunk_itls else 0.0,
@@ -1076,6 +1156,7 @@ async def run_single_n(
       ),
       "spec_decode": spec_decode_info,
       "buckets": bucket_breakdown,
+      "_per_request_records": per_request_records,
   }
 
   mode_label = (
@@ -1125,16 +1206,27 @@ async def run_single_n(
       f"(StepChunk={summary['chunk_itl_ms']['median']:.2f}ms, Mean={summary['chunk_itl_ms']['mean']:.2f}ms)"
   )
   print(
-      f"  Latency                  : Median TTFT={summary['ttft_s']['median']:.2f}s (P90={summary['ttft_s']['p90']:.2f}s) | "
+      f"  Latency                  : Median TTFT={summary['ttft_s']['median']:.2f}s (P90={summary['ttft_s']['p90']:.2f}s) "
+      f"[all {len(ttfts)} completions; in-window only: med={summary['ttft_s_in_window']['median']:.2f}s "
+      f"P90={summary['ttft_s_in_window']['p90']:.2f}s n={summary['ttft_s_in_window']['count']}] | "
       f"Median E2E={summary['e2e_s']['median']:.2f}s"
+  )
+  print(
+      f"  Per-Chip ({num_p_chips}P+{num_d_chips}D)      : Out/D-chip={per_chip['window_output_tok_per_s_per_d_chip']:,.0f} tok/s | "
+      f"Out/total-chip={per_chip['window_output_tok_per_s_per_total_chip']:,.0f} tok/s | "
+      f"Uncached/P-chip={per_chip['window_uncached_prefill_tok_per_s_per_p_chip']:,.0f} tok/s | "
+      f"Rev@18:1/71% list 100%={per_chip['prod_revenue_usd_per_chip_hr_list_100pct_util']:.2f} $/chip/hr, "
+      f"50%list 70%util={per_chip['prod_revenue_usd_per_chip_hr_50pct_list_70pct_util']:.2f} (rental ${chip_hourly_usd:.2f})"
   )
   print("  Per-Bucket Breakdown:")
   for b_name, b_stat in bucket_breakdown.items():
+    lc = " (low-confidence P90: <50 reqs)" if b_stat["low_confidence_p90"] else ""
     print(
         f"    {b_name:8s} (trunks={b_stat['trunks_configured']:2d}): reqs={b_stat['count']:3d} | "
         f"Mean ISL={b_stat['mean_isl']:7,.0f} | Mean OSL={b_stat['mean_osl']:6,.1f} | "
         f"Hit={b_stat['cache_hit_pct']:5.1f}% | Med TTFT={b_stat['median_ttft_s']:6.2f}s | "
-        f"P90 TTFT={b_stat['p90_ttft_s']:6.2f}s | Med TPS/strm={b_stat['median_decode_tps']:5.1f}"
+        f"P90 TTFT={b_stat['p90_ttft_s']:6.2f}s | Med TPS/strm={b_stat['median_decode_tps']:5.1f} "
+        f"(P90_low={b_stat['p90_low_decode_tps']:5.1f}){lc}"
     )
   print("=" * 108)
   return summary
@@ -1234,12 +1326,20 @@ async def main_async(args: argparse.Namespace) -> None:
           chip_hourly_usd=args.chip_hourly_usd,
       )
       s["pass"] = f"measured_{int(args.duration_per_n)}s_5_or_n_trunks_exact_temps"
+      per_req = s.pop("_per_request_records", None)
       all_summaries.append(s)
       if args.output_json:
         out_p = Path(args.output_json)
         out_p.parent.mkdir(parents=True, exist_ok=True)
         with open(out_p, "w", encoding="utf-8") as f:
           json.dump(all_summaries, f, indent=2)
+        if per_req is not None:
+          # Per-request records (successes AND failures) for post-hoc analysis
+          # of TTFT scope, per-rank balance, and stream-failure root cause.
+          req_p = out_p.with_name(f"{out_p.stem}_n{s['num_sessions']}_requests.jsonl")
+          with open(req_p, "w", encoding="utf-8") as f:
+            for rec in per_req:
+              f.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
   if args.output_json:
     print(f"\nSaved full 5-or-N trunks exact-temps sweep summary to {args.output_json}")

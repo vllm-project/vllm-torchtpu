@@ -1,0 +1,5 @@
+[X1] conc=1024 seqs/rank= 64 tok/step/rank=  64 | step=39.34 ms tau=1.0 | interior=26030.45 tok/s (3254/chip, 25.4/user) | @3.5=91106.57 | tpot=53.545 ms ttft_p50=6.9632 s
+[X1] conc=2048 seqs/rank=128 tok/step/rank= 128 | step=None ms tau=1.0 | interior=None tok/s (0/chip, 0.0/user) | @3.5=None | tpot=70.207 ms ttft_p50=14.2482 s
+[X1] conc=3072 seqs/rank=192 tok/step/rank= 192 | step=None ms tau=1.0 | interior=None tok/s (0/chip, 0.0/user) | @3.5=None | tpot=75.073 ms ttft_p50=22.1524 s
+[X1] conc=4096 seqs/rank=256 tok/step/rank= 256 | step=None ms tau=1.0 | interior=None tok/s (0/chip, 0.0/user) | @3.5=None | tpot=76.416 ms ttft_p50=29.3355 s
+[X1] conc=6144 seqs/rank=384 tok/step/rank= 384 | step=None ms tau=1.0 | interior=None tok/s (0/chip, 0.0/user) | @3.5=None | tpot=78.064 ms ttft_p50=46.6334 s
