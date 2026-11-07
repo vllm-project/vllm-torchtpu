@@ -292,6 +292,7 @@ def test_runner_execute_model_and_sample_tokens_forward_step_nan_check(
             maybe_select_logits_hidden_states=lambda hs, _plan, _idx: hs[:1]
         ),
         compute_logits_from_hidden_states=lambda _hs: torch.zeros(1, 8),
+        _dp_vocab_logits=False,
         _attn_metadata_builder_ctx=SimpleNamespace(
             mamba_state_indices=None, unified_mamba_state_indices=None
         ),
@@ -337,6 +338,7 @@ def test_runner_execute_model_and_sample_tokens_forward_step_nan_check(
         "_sample_tokens_pp_intermediate_stage",
         "sample_tokens",
         "execute_model",
+        "_logits_at_dp_vocab_rows",
     ):
         setattr(runner, name, getattr(TPUModelRunner, name).__get__(runner))
 
