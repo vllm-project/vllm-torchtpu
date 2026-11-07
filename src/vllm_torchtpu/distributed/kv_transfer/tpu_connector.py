@@ -2700,16 +2700,22 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
                 )
         elif _engine_is_pipeline(self.vllm_config):
             pp_size = _pipeline_parallel_size(self.vllm_config)
-            if src_parallelism != pp_size * pcp_size:
+            # Transfer units are ranks: every PCP rank of a stage ships its
+            # own units, whatever the scheduler's token layout.
+            unit_pcp = _pipeline_stage_pcp_size(self.vllm_config)
+            if src_parallelism != pp_size * unit_pcp:
                 raise ValueError(
                     "Stage-3 pipeline producer transfer parallelism must "
                     f"equal PP * PCP size: parallelism={src_parallelism}, "
-                    f"pp_size={pp_size}, pcp_size={pcp_size}"
+                    f"pp_size={pp_size}, pcp_size={unit_pcp}"
                 )
-        elif src_parallelism != pcp_size * int(parallel_config.tensor_parallel_size):
+        elif src_parallelism != int(
+            parallel_config.prefill_context_parallel_size or 1
+        ) * int(parallel_config.tensor_parallel_size):
             raise ValueError(
                 "Stage-3 producer transfer parallelism must equal PCP * TP size: "
-                f"parallelism={src_parallelism}, pcp_size={pcp_size}"
+                f"parallelism={src_parallelism}, "
+                f"pcp_size={parallel_config.prefill_context_parallel_size}"
             )
         if src_data_replica_idx < 0:
             raise ValueError("Producer data-parallel rank must be non-negative")
