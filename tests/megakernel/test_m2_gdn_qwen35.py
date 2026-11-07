@@ -147,17 +147,17 @@ def test_m2_gdn_module_invariants_and_layout():
     # vh > 64 violates 64-lane b|a packing in ybuf[:, BA:BA+128]
     g_vh_over_64 = dataclasses.replace(g, KH=64, VH=128)
     ex_r1 = ExecSpec(B=4, T=1, R=1, ctx=256, tiles=Tiles(bank=8 << 20))
-    with pytest.raises(AssertionError, match="vh <= 64"):
+    with pytest.raises(mk.MegakernelConfigError, match="vh <= 64"):
         planner.plan(qwen35.qwen35_spec(g_vh_over_64), ex_r1)
 
     # VH % KH != 0 violates grouped-query GDN expansion
     g_bad_ratio = dataclasses.replace(g, KH=24, VH=32)
-    with pytest.raises(AssertionError):
+    with pytest.raises(mk.MegakernelConfigError):
         planner.plan(qwen35.qwen35_spec(g_bad_ratio), ex)
 
     # KD not a multiple of 128 violates TPU 8x128 tile alignment
     g_bad_kd = dataclasses.replace(g, KD=64)
-    with pytest.raises(AssertionError):
+    with pytest.raises(mk.MegakernelConfigError):
         planner.plan(qwen35.qwen35_spec(g_bad_kd), ex)
 
 
