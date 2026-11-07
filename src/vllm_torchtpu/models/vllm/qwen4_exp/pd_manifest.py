@@ -66,6 +66,55 @@ def pool_tag(group_index: int, name: str, *, pcp_rank: int = 0, split: bool = Fa
     return tag
 
 
+def qwen_staging_hints(
+    pools, block_tokens: int, max_model_len: int, compressed_slots: int = 1
+) -> list[int]:
+    """Bounded host staging hints for a Qwen PD producer's pools, in pool order.
+
+    tpu_sync sizes each storage's host arena as ``leases x max(hint)`` slots of
+    one storage page, and a transfer leases one slot per distinct source block
+    id it touches on that storage. The i-th layer of every cache group shares
+    carrier i, and each group has its own block table, so a max-length
+    transfer touches, per storage, ceil(max_model_len / block_tokens) pages of
+    each main-KV and compressed-key group there and one page of each ring,
+    PLE and GDN group. (Compressed-key sub-pages, ``compressed_slots`` > 1,
+    pack that many blocks per physical page.)
+
+    Every pool then reports the manager's largest storage sum (uniform):
+    tpu_sync grows every host layer to the largest arena anyway, so a smaller
+    hint saves no host memory, while a storage holding only GDN layers would
+    otherwise get an arena of N x 2 slots and admit only N transfers at once.
+    A pool of unknown kind gives all zeros, which keeps the full mirror.
+    """
+    from .pd_staging import owner_kind
+
+    pools = list(pools)
+    if not pools:
+        return []
+    if block_tokens <= 0 or max_model_len <= 0 or compressed_slots <= 0:
+        raise ValueError("staging hints need positive block, length and slots")
+    pages = math.ceil(max_model_len / block_tokens)
+    per_kind = {
+        "main": pages,
+        "compressed": math.ceil(pages / compressed_slots),
+        "ring": 1,
+        "ple": 1,
+        "gdn": 1,
+    }
+    # storage -> {group: pages}; a group's layers sit on distinct storages
+    by_storage: dict[int, dict[str, int]] = {}
+    for pool in pools:
+        try:
+            kind = owner_kind(str(pool.layer_name))
+        except ValueError:
+            return [0] * len(pools)
+        group = str(pool.tag).split(".", 2)[1] if str(pool.tag).startswith("qwen4.") else str(pool.tag)
+        groups = by_storage.setdefault(int(pool.storage_index), {})
+        groups[group] = max(groups.get(group, 0), per_kind[kind])
+    hint = max(sum(groups.values()) for groups in by_storage.values())
+    return [hint] * len(pools)
+
+
 def page_regions(name: str, page_bytes: int, compressed_live: int | None):
     """A pool's live region: whole pages, or a compressed-key page's keys."""
     if compressed_live is not None and name.endswith(".compressed_k"):

@@ -458,7 +458,7 @@ class Qwen4ExpRaidenWorker(TPURaidenConnectorWorker):
         engine = self._construct_raiden_transfer_engine(
             list(manifest.storages), num_slots=1
         )
-        summary = dict(engine.register_pools(manifest.pool_dicts()))
+        summary = self._register_qwen_pools(engine, manifest, int(cache.layout.block_size))
         summary["stage3_registration"] = self._register_raiden_stage3_work_unit(
             engine=engine, manifest=manifest, controller_address=address
         )
@@ -466,6 +466,54 @@ class Qwen4ExpRaidenWorker(TPURaidenConnectorWorker):
         self._raiden_transfer_engine = engine
         self._raiden_admission_summary = summary
         self._after_native_registration()
+
+    def _register_qwen_pools(self, engine, manifest, block_tokens: int) -> dict:
+        """Registers the manifest's pools with the native manager.
+
+        QWEN4_EXP_PD_STAGING_LEASES=N > 0 on a producer: bounded host staging
+        (an arena of N max-length transfers' source pages per storage,
+        pd_manifest.qwen_staging_hints) instead of tpu_sync's full host mirror
+        of every pool. The staged consumer and N = 0 register as before."""
+        pool_dicts = manifest.pool_dicts()
+        leases = int(envs.QWEN4_EXP_PD_STAGING_LEASES)
+        if leases <= 0 or not self.is_producer or getattr(self, "_staging", None) is not None:
+            return dict(engine.register_pools(pool_dicts))
+        from .pd_manifest import qwen_staging_hints
+
+        hints = qwen_staging_hints(
+            manifest.pools,
+            block_tokens,
+            int(self.vllm_config.model_config.max_model_len),
+        )
+        try:
+            summary = dict(
+                engine.register_pools(
+                    pool_dicts, staging_leases=leases, staging_blocks_per_pool=hints
+                )
+            )
+        except TypeError as exc:
+            # A tpu_sync without bounded staging.
+            logger.warning(
+                "Qwen PD producer rank%d: bounded host staging unavailable in the "
+                "installed tpu_sync (%s); keeping the full host mirror",
+                self.tp_rank,
+                exc,
+            )
+            return dict(engine.register_pools(pool_dicts))
+        staging = summary.get("host_staging")
+        staging = staging if isinstance(staging, dict) else {}
+        logger.info(
+            "Qwen PD producer host staging rank%d: mode=%s leases=%s hint=%s "
+            "bounded_bytes_per_shard=%s full_mirror_bytes_per_shard=%s storages=%d",
+            self.tp_rank,
+            staging.get("mode", "unreported"),
+            staging.get("leases", leases),
+            hints[0] if hints else 0,
+            staging.get("bounded_storage_bytes_per_shard"),
+            staging.get("full_storage_bytes_per_shard"),
+            len(staging.get("storages") or ()),
+        )
+        return summary
 
     def _after_native_registration(self) -> None:
         """Work that needs the native manager to hold the carrier already.

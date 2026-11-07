@@ -252,6 +252,8 @@ _TPU_COMPILE_ENV_IGNORED = {
     "TPU_P2P_WAIT_PULL_TIMEOUT",
     "TPU_RAIDEN_INLINE_LOAD",
     "TPU_RAIDEN_POOL_STAGING_LEASES",
+    # Host staging arena size on a Qwen PD producer (host memory only).
+    "QWEN4_EXP_PD_STAGING_LEASES",
     # When a staged Qwen PD decode runs its (unchanged) repack program.
     "QWEN4_EXP_PD_SYNC_REPACK",
     "QWEN4_EXP_PD_SYNC_REPACK_AB_S",
