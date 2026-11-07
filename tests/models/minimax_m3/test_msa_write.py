@@ -52,6 +52,7 @@ def _batch(q_lens, ctx_lens, rng, pad_tokens):
     "q_lens,ctx_lens,pad_tokens",
     [
         ([1, 1, 1], [5, 130, 255], 2),  # decode: mid-page, page start, last slot
+        ([8, 8, 8], [124, 40, 250], 8),  # verify windows, two crossing a page edge
         ([300], [70], 0),  # prefill from mid-page across three pages
         ([1, 200, 3], [127, 0, 125], 4),  # mixed, a run ending at a page edge
         ([], [], 3),  # nothing to write

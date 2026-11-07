@@ -70,6 +70,56 @@ def _kernel(
         o_ref[...] = page_ref[...]
 
 
+def _kernel_by_token(
+    # Scalar prefetch
+    num_runs_ref,  # [1]
+    run_page_ref,  # [R] page of each run (padding runs repeat the last one)
+    run_lo_ref,  # [R] first slot of each run within its page
+    run_hi_ref,  # [R] one past the last slot
+    run_tok0_ref,  # [R] first token of each run
+    # In
+    rows_ref,  # [T, W] uint32: every token's row, one value per word
+    page_ref,  # [1, S / p, p, W] the page before the write
+    # Out
+    o_ref,  # [1, S / p, p, W] aliased with the cache
+):
+    """`_kernel` that merges a run's tokens one by one from the batch's rows,
+    so no per-run page of rows is gathered first."""
+    run = pl.program_id(0)
+    active = run < num_runs_ref[0]
+
+    @pl.when(active)
+    def _():
+        rows, packing, width = page_ref.shape[1:]
+        bits = 32 // packing
+        lo, tok0 = run_lo_ref[run], run_tok0_ref[run]
+        row = jax.lax.broadcasted_iota(jnp.int32, (rows, width), 0)
+
+        def put(i, words):
+            slot = lo + i
+            shift = (slot % packing * bits).astype(jnp.uint32)
+            keep = ~(jnp.uint32((1 << bits) - 1) << shift)
+            new = rows_ref[pl.ds(tok0 + i, 1), :]
+            return jnp.where(
+                row == slot // packing, (words & keep) | (new << shift), words
+            )
+
+        words = page_ref.bitcast(jnp.uint32)[0, :, 0, :]
+        words = jax.lax.fori_loop(0, run_hi_ref[run] - lo, put, words)
+        o_ref.bitcast(jnp.uint32)[0, :, 0, :] = words
+
+    @pl.when(jnp.logical_and(jnp.logical_not(active), run == 0))
+    def _():
+        o_ref[...] = page_ref[...]
+
+
+# Batches of at most this many tokens (decode, MTP verify) write token by token
+# (`_kernel_by_token`): gathering max_runs x page_size rows per layer cost
+# 6 us per layer for 8 tokens in the b1 decode twin (j-3847708e), whatever
+# their width. A run then costs one merge per token instead of one per page.
+_BY_TOKEN_MAX_TOKENS = 64
+
+
 def _runs(pages: jax.Array, slots: jax.Array, num_pages: int, max_runs: int):
     """Token runs: maximal spans of consecutive tokens writing one page."""
     num_tokens = pages.shape[0]
@@ -119,19 +169,37 @@ def write_rows(
     num_runs, run_page, run_lo, run_hi, run_tok0 = _runs(
         pages, slots, num_pages, max_runs
     )
-    # Each run's rows laid out by slot ([run, j, r] = slot r * p + j), so the
-    # kernel merges whole packing slots without strided loads.
     word_bits = jax.lax.bitcast_convert_type(rows, _UINT_BY_BITS[bits]).astype(
         jnp.uint32
     )
-    src = run_tok0[:, None] + jnp.arange(page_size, dtype=jnp.int32) - run_lo[:, None]
-    new = word_bits[jnp.clip(src, 0, num_tokens - 1)]
-    new = new.reshape(max_runs, rows_per_page, packing, width).transpose(0, 2, 1, 3)
-
     page_block = pl.BlockSpec(
         (1, rows_per_page, packing, width),
         lambda r, n, run_page, *_: (run_page[r], 0, 0, 0),
     )
+    if num_tokens <= _BY_TOKEN_MAX_TOKENS:
+        return pl.pallas_call(
+            _kernel_by_token,
+            grid_spec=pltpu.PrefetchScalarGridSpec(
+                num_scalar_prefetch=5,
+                grid=(max_runs,),
+                in_specs=[
+                    pl.BlockSpec((num_tokens, width), lambda r, *_: (0, 0)),
+                    page_block,
+                ],
+                out_specs=page_block,
+            ),
+            out_shape=jax.ShapeDtypeStruct(cache.shape, cache.dtype),
+            # Operand 6 = the cache (after 5 scalar-prefetch operands and rows).
+            input_output_aliases={6: 0},
+            compiler_params=pltpu.CompilerParams(dimension_semantics=("arbitrary",)),
+            interpret=interpret,
+            name="minimax_m3_msa_write_rows",
+        )(num_runs[None], run_page, run_lo, run_hi, run_tok0, word_bits, cache)
+    # Each run's rows laid out by slot ([run, j, r] = slot r * p + j), so the
+    # kernel merges whole packing slots without strided loads.
+    src = run_tok0[:, None] + jnp.arange(page_size, dtype=jnp.int32) - run_lo[:, None]
+    new = word_bits[jnp.clip(src, 0, num_tokens - 1)]
+    new = new.reshape(max_runs, rows_per_page, packing, width).transpose(0, 2, 1, 3)
     return pl.pallas_call(
         _kernel,
         grid_spec=pltpu.PrefetchScalarGridSpec(
