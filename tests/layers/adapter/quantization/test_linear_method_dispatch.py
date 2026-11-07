@@ -89,6 +89,17 @@ class TestUnquantizedFallbackDispatch:
         method = cfg.get_quant_method(linear_layer, prefix=SKIPPED)
         assert isinstance(method, VllmUnquantizedLinearMethod)
 
+    def test_modelopt_mxfp8_excluded_layer(self, linear_layer):
+        from vllm_torchtpu.layers.adapter.quantization.mxfp8 import (
+            VllmModelOptMxfp8Config,
+        )
+
+        cfg = VllmModelOptMxfp8Config.from_config({"quant_algo": "MXFP8"})
+        cfg.exclude_modules = [SKIPPED]
+        assert cfg.is_layer_excluded(SKIPPED), "fixture must hit the excluded path"
+        method = cfg.get_quant_method(linear_layer, prefix=SKIPPED)
+        assert isinstance(method, VllmUnquantizedLinearMethod)
+
     def test_mxfp4_uses_kn_for_every_linear_layer(self, linear_layer):
         """MXFP4 quantizes only MoE, so all linear layers take this path."""
         from vllm_torchtpu.layers.adapter.quantization.mxfp4 import VllmMxfp4Config
