@@ -727,14 +727,21 @@ def validate_config(cfg):
     elif transfer is not None:
         connector_module = PD_CONNECTOR_MODULE
         if (
-            # One host per leg: TP x DP x PP covers its 8 cores. TP and DP
-            # engines spread experts (EP); a pipeline stage holds all of its
-            # layers' experts. Producer TP ranks or PP stages are the
-            # transfer units (TPU_RAIDEN_TRANSFER_PARALLELISM).
-            p.tensor_parallel_size * p.data_parallel_size * p.pipeline_parallel_size
+            # One host per leg: TP x DP x PP x PCP covers its 8 cores. TP, DP
+            # and PCP spread experts (EP); a pipeline stage without PCP holds
+            # all of its layers' experts. Producer TP ranks, PP stages or a
+            # stage's PCP ranks are the transfer units
+            # (TPU_RAIDEN_TRANSFER_PARALLELISM).
+            p.tensor_parallel_size
+            * p.data_parallel_size
+            * p.pipeline_parallel_size
+            * p.prefill_context_parallel_size
             != 8
             or (
-                p.tensor_parallel_size * p.data_parallel_size > 1
+                p.tensor_parallel_size
+                * p.data_parallel_size
+                * p.prefill_context_parallel_size
+                > 1
                 and not p.enable_expert_parallel
             )
             or transfer.kv_connector != PD_CONNECTOR
@@ -755,7 +762,8 @@ def validate_config(cfg):
         ):
             raise ValueError(
                 "Qwen4Exp PD requires its model-owned Raiden connector, a producer "
-                "or consumer role, TP x DP x PP = 8 (EP across TP x DP), unified FP8 pages "
+                "or consumer role, TP x DP x PP x PCP = 8 (EP across TP x DP x PCP), "
+                "unified FP8 pages "
                 "and BF16/FP32 SSM"
             )
         # Prefix caching is admitted on either leg (align-mode state tables,
