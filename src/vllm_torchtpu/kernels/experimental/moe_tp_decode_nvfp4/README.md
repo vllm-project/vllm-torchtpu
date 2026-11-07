@@ -1,6 +1,13 @@
-# NVFP4 W4A8 Fused TP Decode MoE Kernel
+# FP4-block512 W4A8 Fused TP Decode MoE Kernel (for NVFP4 Checkpoints)
 
-One Pallas call per rank that runs an NVFP4 MoE layer's router top-k, its
+The routed experts arrive as NVFP4 (FP4 e2m1, block-16 scales) and are
+requantized once at load to FP4 with one `f32` scale per 512 elements
+(`MOE_REQUANTIZE_BLOCK_SIZE=512`, clamped per matrix). The kernel computes in
+that FP4-block512 format, the same as it would for an offline-converted or
+directly quantized block-512 checkpoint; block 16 is not used (it would force
+W4A16 and does not fit 4-chip HBM).
+
+One Pallas call per rank that runs a MoE layer's router top-k, its
 online-FP8 shared expert, its W4A8 block-scaled routed experts, and the
 in-kernel cross-rank all-reduce for decode batches (`n <= 64`). Opt-in with
 `USE_MOE_TP_DECODE_NVFP4_KERNEL=1` (default `0`) and
