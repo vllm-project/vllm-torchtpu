@@ -28,6 +28,17 @@ from vllm.distributed.device_communicators.base_device_communicator import (
 )
 from vllm.distributed.parallel_state import GroupCoordinator, get_dp_group, get_ep_group
 
+from vllm_torchtpu.distributed.dp_exchange import (
+    dp_pair_all_gather,
+    dp_pair_exchange_ready,
+)
+
+# A DP pair exchanges dispatch tensors by async collective-permute up to this
+# many tokens per rank, so decode overlaps the exchange with routing and the
+# shared expert; prefill-sized dispatch keeps the all-gathers. Like
+# PACKED_DISPATCH_MAX_TOKENS below, it is compared per traced backbone bucket.
+DP_PAIR_EXCHANGE_MAX_TOKENS = 256
+
 # Dispatch gathers its tensors as one collective up to this many tokens per
 # rank. At 256 tokens of hidden size 6144 the pack and split copies move about
 # 20 MB of HBM (~5 us), under the ~10 us fixed latency of the saved all-gather.
@@ -88,6 +99,20 @@ def _gathers_packed(tensors: tuple[torch.Tensor, ...]) -> bool:
     )
 
 
+def _exchanges_dp_pair(
+    tensors: tuple[torch.Tensor, ...], is_sequence_parallel: bool
+) -> bool:
+    # The op is built only when the DP group is a pair (see
+    # prepare_dp_pair_exchange). The tag guards the token count as above.
+    return (
+        not is_sequence_parallel
+        and dp_pair_exchange_ready()
+        and vllm_compilation_backends.model_tag == "backbone"
+        and 0 < tensors[0].shape[0] <= DP_PAIR_EXCHANGE_MAX_TOKENS
+        and all(t.element_size() in (2, 4) for t in tensors)
+    )
+
+
 class TpuNullAll2AllManager(All2AllManagerBase):
     """Probe-only stub; TPU EP dispatch/combine never goes through it."""
 
@@ -120,6 +145,8 @@ class TpuDeviceCommunicator(DeviceCommunicatorBase):
         group = self._moe_group(is_sequence_parallel)
         if group is None:
             return hidden_states, router_logits
+        if _exchanges_dp_pair((hidden_states, router_logits), is_sequence_parallel):
+            return dp_pair_all_gather(hidden_states), dp_pair_all_gather(router_logits)
         if _gathers_packed((hidden_states, router_logits)):
             return _all_gather_packed(group, (hidden_states, router_logits))
         hidden_states = group.all_gather(hidden_states, dim=0)
@@ -141,6 +168,9 @@ class TpuDeviceCommunicator(DeviceCommunicatorBase):
         group = self._moe_group(is_sequence_parallel)
         if group is None:
             return hidden_states, topk_weights, topk_ids
+        tensors = (hidden_states, topk_weights, topk_ids)
+        if _exchanges_dp_pair(tensors, is_sequence_parallel):
+            return tuple(dp_pair_all_gather(t) for t in tensors)
         if _gathers_packed((hidden_states, topk_weights, topk_ids)):
             return _all_gather_packed(group, (hidden_states, topk_weights, topk_ids))
         hidden_states = group.all_gather(hidden_states, dim=0)

@@ -5611,6 +5611,12 @@ class TPUModelRunner(GPUModelRunner):
         # Ensure attention custom ops exist before any compile/inference path,
         self._initialize_pallas_kernels()
 
+        # Collective over the EP group, so every rank builds it here, before
+        # anything is traced.
+        from vllm_torchtpu.distributed.dp_exchange import prepare_dp_pair_exchange
+
+        prepare_dp_pair_exchange(self.parallel_config)
+
         from vllm_torchtpu.layers.adapter.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w4an_mxfp4 import (  # noqa: E501
             VllmCompressedTensorsW4ANMxfp4MoEMethod,
         )
