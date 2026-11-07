@@ -156,22 +156,24 @@ class MaskedDenseTestBase(parameterized.TestCase):
         return jnp.asarray(q, dtype=jnp.bfloat16)
 
     def _topk_rows(self, num_tokens, seq_of_token, seq_lens, topk, num_selected):
-        """Random KV subsets per token, `-1` padded, always including self.
+        """Random causal KV subsets per token, `-1` padded, always including self.
 
         `num_selected(seq_len)` says how many rows that sequence's tokens
-        select. Rows beyond a sequence's `kv_len` are never selected: the
-        kernel zeroes those cache rows, so selecting one would add a zero
-        value vector to the softmax rather than being excluded.
+        select. Like the indexer, a token only selects keys at or before its
+        own position (`kv_len - q_len + local index`): the indexer scores
+        non-causal positions -inf and maps them to -1, and the kernel relies
+        on that to stop each query block at its last causal KV block.
         """
         rows = np.full((num_tokens, topk), -1, np.int32)
         for t in range(num_tokens):
             s = seq_of_token[t]
             if s < 0:
                 continue
-            kv_len = seq_lens[s]
-            n = min(num_selected(kv_len), kv_len, topk)
-            sel = self.rng.choice(kv_len, size=n, replace=False)
-            rows[t, :n] = np.sort(sel)
+            tokens = np.flatnonzero(seq_of_token == s)
+            pos = seq_lens[s] - tokens.size + int(np.searchsorted(tokens, t))
+            n = min(num_selected(seq_lens[s]), pos + 1, topk)
+            others = self.rng.choice(pos, size=n - 1, replace=False)
+            rows[t, :n] = np.sort(np.append(others, pos))
         return rows
 
     # ------------------------------------------------------------ reference
@@ -282,6 +284,58 @@ class MaskedDenseCacheSetupTest(parameterized.TestCase):
                     np.asarray(values[page, :length, :dim]), expected[seq]
                 )
                 np.testing.assert_array_equal(np.asarray(rows[page, length:]), 0)
+
+
+@pytest.mark.tpu_test
+class CausalKvBoundTest(MaskedDenseTestBase):
+    """Each query block stops its KV loop at its last causal KV block.
+
+    The KV blocks past that bound hold only keys after every real row of the
+    query block, so the kernel must not read them at all. Poisoning them with
+    fp8 NaN bytes tells the two apart: a kernel that still streams them gets
+    p == 0 times NaN in the PV product, while one that stops at the bound
+    returns the same bits as with a clean cache.
+    """
+
+    @parameterized.named_parameters(
+        # q_len == kv_len == max_kv_len: a fresh prompt. topk 128 >= max_kv_len
+        # takes the analytic mask; topk 64 < max_kv_len reads the CSA bitmap.
+        dict(testcase_name="analytic", q_len=128, topk=128),
+        dict(testcase_name="bitmap", q_len=128, topk=64),
+    )
+    def test_kv_blocks_past_the_causal_bound_are_not_read(self, q_len, topk):
+        k_scale, bq_sz, bkv_p = 1.0, 8, 1
+        seq_lens = [q_len]
+        num_tokens = math.ceil(q_len / TOKEN_PAD) * TOKEN_PAD
+        cu_q_lens = np.asarray([0, q_len], np.int32)
+        block_tables = self._block_tables(1)
+        caches, kv_c_deq, k_pe_deq = self._fill_cache(seq_lens, block_tables, k_scale)
+        seq_of_token = np.full(num_tokens, -1, np.int32)
+        seq_of_token[:q_len] = 0
+        topk_rows = self._topk_rows(
+            num_tokens, seq_of_token, seq_lens, topk, lambda kv_len: topk
+        )
+        q = self._random_queries(num_tokens)
+        args = (q, caches, seq_lens, topk_rows, block_tables, cu_q_lens, [0, 0, 1])
+        kw = dict(k_scale=k_scale, bkv_p=bkv_p, bq_sz=bq_sz, max_kv_len=q_len)
+
+        clean = np.asarray(self._run(*args, **kw).astype(jnp.float32))
+        expected, valid = self._reference(
+            q, topk_rows, seq_of_token, kv_c_deq, k_pe_deq, k_scale
+        )
+        self._check(clean, expected, valid)
+
+        # Query block 0 holds positions [0, bq_sz), so it only needs KV block 0.
+        # Poison every later KV block of the sequence and check its rows.
+        bkv_sz = bkv_p * PAGE_SIZE
+        nope = np.asarray(caches[0]).copy()
+        for blk in range(1, math.ceil(q_len / bkv_sz)):
+            nope[int(block_tables[blk])] = 0x7F  # float8_e4m3fn NaN
+        poisoned = (jnp.asarray(nope), caches[1])
+        out = self._run(q, poisoned, *args[2:], **kw)
+        rows = np.asarray(out.astype(jnp.float32))[:bq_sz]
+        self.assertTrue(np.isfinite(rows).all())
+        np.testing.assert_array_equal(rows, clean[:bq_sz])
 
 
 @pytest.mark.tpu_test

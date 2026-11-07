@@ -425,6 +425,27 @@ def _mla_ragged_paged_attention_kernel(
         else:
             num_bq = jnp.maximum(1, cdiv(static_q_len, bq_sz))
 
+        def bkv_bound(bq_idx):
+            """KV blocks that query block `bq_idx` attends: up to the block
+            holding its last query's position, clamped to [1, num_bkv].
+
+            Every real row of the block sits at a position below `last_kv`
+            (see `causal_mask`), so a KV block starting at or after `last_kv`
+            holds only keys that are masked for all of them, by the analytic
+            mask and by the CSA bitmap alike (the indexer maps non-causal
+            positions to -1). By then each real row's `m` holds a real score
+            (it has at least one causal key, in an earlier block), so such a
+            block gives p == 0 and exp(m_prev - m_curr) == 1 and leaves l and
+            acc unchanged: skipping it is bit-identical. Padding rows past
+            `q_len` are not covered, but their output is never written back.
+            A decode row (q_len == 1) gets `num_bkv`. The loop and
+            `get_next_bkv_ids` share the bound so the prefetch chain fetches
+            exactly the blocks the loop waits on.
+            """
+            q_hi = jnp.minimum((bq_idx + 1) * bq_sz, q_len)
+            last_kv = kv_len - q_len + q_hi
+            return jnp.maximum(1, jnp.minimum(num_bkv, cdiv(last_kv, bkv_sz)))
+
         def get_next_bq_ids(seq_idx, bq_idx, bq_sem_idx):
             next_bq_idx = bq_idx + 1
             is_last_bq = next_bq_idx == num_bq
@@ -435,7 +456,7 @@ def _mla_ragged_paged_attention_kernel(
 
         def get_next_bkv_ids(seq_idx, bq_idx, bkv_idx, bkv_sem_idx):
             next_bkv_idx = bkv_idx + 1
-            is_last_bkv = next_bkv_idx == num_bkv
+            is_last_bkv = next_bkv_idx == bkv_bound(bq_idx)
             next_bkv_idx = lax.select(is_last_bkv, 0, next_bkv_idx)
             next_bq_idx = lax.select(is_last_bkv, bq_idx + 1, bq_idx)
             is_last_bq = next_bq_idx == num_bq
@@ -503,7 +524,7 @@ def _mla_ragged_paged_attention_kernel(
 
             jax.lax.fori_loop(
                 0,
-                num_bkv,
+                bkv_bound(bq_idx),
                 compute_with_bkv,
                 None,
                 unroll=False,
