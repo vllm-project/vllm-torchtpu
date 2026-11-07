@@ -60,6 +60,7 @@ if TYPE_CHECKING:
     TPU_QWEN4_HC_DECODE_FUSED: bool = False
     TPU_QWEN4_HC_PREFILL_ODD_TILES: bool = False
     TPU_QWEN4_HC_PREFILL_FUSED_MIX: bool = False
+    TPU_QWEN4_HC_PREFILL_PARTIAL_TILE: bool = False
     VLLM_TPU_GDN_PREFILL_NO_ZERO_INIT: bool = False
     QWEN4_EXP_PREFILL_SP: bool = False
     QWEN4_EXP_PD_STAGING_BYTES: int = 8 << 30
@@ -1075,6 +1076,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # combine's injection gate (norm never reaches HBM), with the attn combine
     # fused ahead of the mlp mix; whole hc_prefill_full_tile tiles only.
     "TPU_QWEN4_HC_PREFILL_FUSED_MIX": env_bool("TPU_QWEN4_HC_PREFILL_FUSED_MIX"),
+    # qwen4_exp prefill: the fused HC kernels (hc_full, the fused mix, the
+    # gated_residual combine) also take a partial last hc_prefill_full_tile
+    # tile (any multiple of 32 rows, at least two tiles), so every served step
+    # size runs 256-row tiles (3,200 = 12 x 256 + 128). Implies odd counts.
+    "TPU_QWEN4_HC_PREFILL_PARTIAL_TILE": env_bool("TPU_QWEN4_HC_PREFILL_PARTIAL_TILE"),
     # Pooled GDN: skip zero-filling the [T, n_v, d_v] output before the
     # decode (BATCHED) and prefill (PER_SEQ) kernels write it. Rows no request
     # owns (bucket padding) are then left unwritten; the decoder layer masks

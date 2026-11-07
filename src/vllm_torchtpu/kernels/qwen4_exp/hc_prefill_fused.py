@@ -41,8 +41,11 @@ from jax.experimental.pallas import tpu as pltpu
 _ROW_CHUNK = 32
 
 
-def prefill_token_tile_ok(tokens: int, token_tile: int) -> bool:
-    """Whether ``tokens`` rows run in whole ``token_tile`` tiles."""
+def prefill_token_tile_ok(tokens: int, token_tile: int, partial: bool = False) -> bool:
+    """Whether ``tokens`` rows run in whole ``token_tile`` tiles, or with
+    ``partial`` in tiles whose last one holds any multiple of 16 rows."""
+    if partial:
+        return tokens >= token_tile and tokens % 16 == 0
     return tokens >= token_tile and tokens % token_tile == 0
 
 
@@ -199,9 +202,12 @@ def hc_prefill_mix(
     block=None,
     prev_injection=None,
     interpret=False,
+    partial=False,
 ):
     """Fused prefill HC mix with the injection gate, optionally after the
-    previous HC's combine.
+    previous HC's combine. ``partial`` admits a partial last tile (any multiple
+    of 16 rows): the grid covers it and its out-of-range rows are dropped on
+    write; rows are independent, so they never reach real rows.
 
     ``x`` is the [T, hc*H] hyper input, or with ``block``/``prev_injection``
     the previous HC's residual that is combined first. Returns
@@ -221,11 +227,13 @@ def hc_prefill_mix(
         eps=eps,
         token_tile=token_tile,
         interpret=interpret,
+        partial=partial,
     )
 
 
 @functools.partial(
-    jax.jit, static_argnames=("branches", "hidden", "eps", "token_tile", "interpret")
+    jax.jit,
+    static_argnames=("branches", "hidden", "eps", "token_tile", "interpret", "partial"),
 )
 def _hc_prefill_mix(
     x,
@@ -241,12 +249,13 @@ def _hc_prefill_mix(
     eps,
     token_tile,
     interpret,
+    partial=False,
 ):
     tokens, width = x.shape
     lowrank = down.shape[0]
     prologue = block is not None
     if (
-        not prefill_token_tile_ok(tokens, token_tile)
+        not prefill_token_tile_ok(tokens, token_tile, partial)
         or token_tile % 8
         or width != branches * hidden
         or hidden % 128
@@ -299,7 +308,7 @@ def _hc_prefill_mix(
             lowrank=lowrank,
             prologue=prologue,
         ),
-        grid=(tokens // token_tile,),
+        grid=(pl.cdiv(tokens, token_tile),),
         in_specs=in_specs,
         out_specs=out_specs,
         out_shape=out_shape,

@@ -51,6 +51,12 @@ class GatedResidual(common_hc.GatedResidual):
             or envs.TPU_QWEN4_HC_PREFILL_FUSED_MIX
             else 2 * prefill_full_tile
         )
+        # TPU_QWEN4_HC_PREFILL_PARTIAL_TILE: any multiple of 32 rows (at least
+        # two tiles) runs whole tiles plus one partial last tile.
+        self._prefill_partial = bool(
+            envs.TPU_QWEN4_HC_PREFILL_PARTIAL_TILE and prefill_full_tile
+        )
+        partial = self._prefill_partial
         self._prefill_inj_mix_op = None
         self._prefill_combine_mix_op = None
         if (
@@ -68,11 +74,11 @@ class GatedResidual(common_hc.GatedResidual):
 
             eps = self.hc_norm.variance_epsilon
             self._prefill_inj_mix_op = build_prefill_inj_mix_op(
-                self.hc_count, self.hidden_size, eps, prefill_full_tile
+                self.hc_count, self.hidden_size, eps, prefill_full_tile, partial
             )
             # Used by the preceding HC's combine_mix (attn -> mlp).
             self._prefill_combine_mix_op = build_prefill_combine_mix_op(
-                self.hc_count, self.hidden_size, eps, prefill_full_tile
+                self.hc_count, self.hidden_size, eps, prefill_full_tile, partial
             )
         if (
             prefill_full_tile
@@ -84,7 +90,7 @@ class GatedResidual(common_hc.GatedResidual):
             )
 
             self._prefill_combine_op = build_gated_residual_op(
-                self.hc_count, self.hidden_size, prefill_full_tile
+                self.hc_count, self.hidden_size, prefill_full_tile, partial
             )
         if (
             prefill_full_tile
@@ -98,6 +104,7 @@ class GatedResidual(common_hc.GatedResidual):
                 self.hidden_size,
                 self.hc_norm.variance_epsilon,
                 prefill_full_tile,
+                partial,
             )
         if prefill_norm_tile and self.config.hc_per_branch_norm:
             from vllm_torchtpu.kernels.qwen4_exp.vllm_adapter import build_norm_op
@@ -202,6 +209,8 @@ class GatedResidual(common_hc.GatedResidual):
     def _prefill_full_rows(self, tokens: int) -> bool:
         """Whole fused-prefill tiles: at least two, and an even count unless
         TPU_QWEN4_HC_PREFILL_ODD_TILES / ..._FUSED_MIX allow any count."""
+        if self._prefill_partial:
+            return tokens >= 2 * self.prefill_full_tile and tokens % 32 == 0
         return (
             tokens >= 2 * self.prefill_full_tile
             and tokens % self._prefill_tile_step == 0

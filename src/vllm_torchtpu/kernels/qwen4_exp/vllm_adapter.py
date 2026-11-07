@@ -17,10 +17,13 @@ from vllm_torchtpu.kernels.qwen4_exp.hc_up import _up_epilogue
 
 
 @functools.cache
-def build_gated_residual_op(branches: int, hidden: int, token_tile: int):
+def build_gated_residual_op(
+    branches: int, hidden: int, token_tile: int, partial: bool = False
+):
     op = pallas.jax_op(
-        f"qwen4_exp::gated_residual_b{branches}_h{hidden}_m{token_tile}_v1",
-        gated_residual_fn(branches, hidden, token_tile),
+        f"qwen4_exp::gated_residual_b{branches}_h{hidden}_m{token_tile}"
+        f"{'_p' if partial else ''}_v1",
+        gated_residual_fn(branches, hidden, token_tile, partial),
     )
 
     @op.register_fake
@@ -31,7 +34,9 @@ def build_gated_residual_op(branches: int, hidden: int, token_tile: int):
 
 
 @functools.cache
-def build_full_mix_op(branches: int, hidden: int, eps: float, token_tile: int):
+def build_full_mix_op(
+    branches: int, hidden: int, eps: float, token_tile: int, partial: bool = False
+):
     eps_tag = hashlib.sha1(repr(eps).encode()).hexdigest()[:8]
 
     def core(
@@ -46,10 +51,12 @@ def build_full_mix_op(branches: int, hidden: int, eps: float, token_tile: int):
             hidden=hidden,
             eps=eps,
             token_tile=token_tile,
+            partial=partial,
         )
 
     op = pallas.jax_op(
-        f"qwen4_exp::hc_full_c{branches}_h{hidden}_m{token_tile}_e{eps_tag}_v1",
+        f"qwen4_exp::hc_full_c{branches}_h{hidden}_m{token_tile}_e{eps_tag}"
+        f"{'_p' if partial else ''}_v1",
         core,
     )
 
@@ -210,7 +217,9 @@ def build_decode_combine_mix_op(branches: int, hidden: int, eps: float):
 
 
 @functools.cache
-def build_prefill_inj_mix_op(branches: int, hidden: int, eps: float, token_tile: int):
+def build_prefill_inj_mix_op(
+    branches: int, hidden: int, eps: float, token_tile: int, partial: bool = False
+):
     """TPU_QWEN4_HC_PREFILL_FUSED_MIX: prefill HC mix returning ``(mixed,
     injection)``; ``norm`` stays on chip. Callers gate it to whole tiles."""
     eps_tag = hashlib.sha1(repr(eps).encode()).hexdigest()[:8]
@@ -232,10 +241,12 @@ def build_prefill_inj_mix_op(branches: int, hidden: int, eps: float, token_tile:
             hidden=hidden,
             eps=eps,
             token_tile=token_tile,
+            partial=partial,
         )
 
     op = pallas.jax_op(
-        f"qwen4_exp::hc_prefill_inj_c{branches}_h{hidden}_m{token_tile}_e{eps_tag}_v1",
+        f"qwen4_exp::hc_prefill_inj_c{branches}_h{hidden}_m{token_tile}_e{eps_tag}"
+        f"{'_p' if partial else ''}_v1",
         core,
     )
 
@@ -251,7 +262,7 @@ def build_prefill_inj_mix_op(branches: int, hidden: int, eps: float, token_tile:
 
 @functools.cache
 def build_prefill_combine_mix_op(
-    branches: int, hidden: int, eps: float, token_tile: int
+    branches: int, hidden: int, eps: float, token_tile: int, partial: bool = False
 ):
     """The previous HC's combine fused ahead of this HC's prefill mix.
 
@@ -281,11 +292,12 @@ def build_prefill_combine_mix_op(
             token_tile=token_tile,
             block=block,
             prev_injection=prev_injection,
+            partial=partial,
         )
 
     op = pallas.jax_op(
         f"qwen4_exp::hc_prefill_combine_c{branches}_h{hidden}_m{token_tile}"
-        f"_e{eps_tag}_v1",
+        f"_e{eps_tag}{'_p' if partial else ''}_v1",
         core,
     )
 

@@ -12,6 +12,7 @@ import torch
 from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu import envs
+from vllm_torchtpu.kernels.qwen4_exp.gated_residual import gated_residual_fn
 from vllm_torchtpu.kernels.qwen4_exp.hc_full import _full_mix
 from vllm_torchtpu.kernels.qwen4_exp.hc_prefill_fused import (
     extend_down,
@@ -180,6 +181,66 @@ def test_fused_mix_rejects_partial_tiles():
     assert not prefill_token_tile_ok(3200, 256) and not prefill_token_tile_ok(64, 128)
 
 
+# ---- partial last tile (TPU_QWEN4_HC_PREFILL_PARTIAL_TILE): 3,200 = 12 x 256 + 128
+
+
+@pytest.mark.parametrize("rows", [2 * TILE + 32, 3 * TILE + 64, 3 * TILE + 96])
+def test_full_mix_partial_last_tile_matches_whole_tile_rows(rows):
+    """The partial step copies, computes and drains only its rows: every row
+    equals the same row of a whole-tile call."""
+    x, weight, down, up, _ = _arrays(4 * TILE, seed=21)
+    mixed_w, norm_w = full(x, weight, down, up)
+    mixed_p, norm_p = full(x[:rows], weight, down, up, partial=True)
+    np.testing.assert_array_equal(_bits(mixed_p), _bits(mixed_w[:rows]))
+    np.testing.assert_array_equal(_bits(norm_p), _bits(norm_w[:rows]))
+
+
+def test_full_mix_partial_needs_flag_and_32_row_multiple():
+    shape = jax.ShapeDtypeStruct
+    width = BRANCHES * HIDDEN
+
+    def args(tokens):
+        return (shape((tokens, width), jnp.bfloat16), shape((width,), jnp.bfloat16),
+                shape((LOWRANK, width), jnp.bfloat16), shape((width, LOWRANK), jnp.bfloat16))
+
+    with pytest.raises(ValueError, match="token tiles"):
+        jax.eval_shape(full, *args(3 * TILE + 64))  # no partial flag
+    with pytest.raises(ValueError, match="token tiles"):
+        jax.eval_shape(functools.partial(full, partial=True), *args(3 * TILE + 48))  # not % 32
+    jax.eval_shape(functools.partial(full, partial=True), *args(3 * TILE + 64))
+
+
+@pytest.mark.parametrize("rows", [TILE + 64, 3 * TILE + 64])
+def test_fused_mix_partial_last_tile_matches_whole_tile_rows(rows):
+    x, weight, down, up, inject = _arrays(4 * TILE, seed=23)
+    mixed_w, inj_w = fused(x, weight, down, up, inject)
+    mixed_p, inj_p = fused(x[:rows], weight, down, up, inject, partial=True)
+    np.testing.assert_array_equal(_bits(mixed_p), _bits(mixed_w[:rows]))
+    np.testing.assert_array_equal(_bits(inj_p), _bits(inj_w[:rows]))
+    rng = np.random.default_rng(29)
+    block = jnp.asarray(rng.normal(size=(4 * TILE, HIDDEN)), jnp.bfloat16)
+    gates = jnp.asarray(rng.random((4 * TILE, BRANCHES)) * 2, jnp.float32)
+    w = fused(x, weight, down, up, inject, block=block, prev_injection=gates)
+    p = fused(x[:rows], weight, down, up, inject, block=block[:rows], prev_injection=gates[:rows], partial=True)
+    for a, b in zip(p, w):
+        np.testing.assert_array_equal(_bits(a), _bits(b[:rows]))
+    with pytest.raises(ValueError, match="token tiles"):
+        jax.eval_shape(fused, x[:rows], weight, down, up, inject)  # no partial flag
+
+
+@pytest.mark.parametrize("rows", [2 * TILE + 32, 3 * TILE + 64])
+def test_gated_residual_partial_last_tile(rows):
+    rng = np.random.default_rng(31)
+    x = jnp.asarray(rng.normal(size=(4 * TILE, BRANCHES * HIDDEN)), jnp.bfloat16)
+    block = jnp.asarray(rng.normal(size=(4 * TILE, HIDDEN)), jnp.bfloat16)
+    gates = jnp.asarray(rng.random((4 * TILE, BRANCHES)) * 2, jnp.float32)
+    whole = gated_residual_fn(BRANCHES, HIDDEN, TILE, False, INTERPRET)(x, block, gates)
+    part = gated_residual_fn(BRANCHES, HIDDEN, TILE, True, INTERPRET)(x[:rows], block[:rows], gates[:rows])
+    np.testing.assert_array_equal(_bits(part), _bits(whole[:rows]))
+    with pytest.raises(ValueError, match="full BF16 tiles"):
+        gated_residual_fn(BRANCHES, HIDDEN, TILE, False, INTERPRET)(x[:rows], block[:rows], gates[:rows])
+
+
 # ---- GatedResidual plumbing (the decoder layer's mix -> combine_mix -> combine)
 
 
@@ -216,15 +277,16 @@ def _to_torch(a):
     return torch.from_numpy(np.array(a))
 
 
-def _install_fused(module, calls, odd_tiles):
+def _install_fused(module, calls, odd_tiles, partial=False):
     """Interpret-mode stand-ins for the registered prefill ops (the torch op
     boundary needs torch_tpu); gated_residual's combine is its torch formula."""
     module.prefill_full_tile = TILE
     module._prefill_tile_step = TILE if odd_tiles else 2 * TILE
+    module._prefill_partial = partial
 
     def inj_mix(x, *weights):
         calls.append("mix")
-        return tuple(map(_to_torch, fused(*map(_to_jax, (x, *weights)))))
+        return tuple(map(_to_torch, fused(*map(_to_jax, (x, *weights)), partial=partial)))
 
     def combine_mix(residual, block, gate, *weights):
         calls.append("combine_mix")
@@ -232,6 +294,7 @@ def _install_fused(module, calls, odd_tiles):
             *map(_to_jax, (residual, *weights)),
             block=_to_jax(block),
             prev_injection=_to_jax(gate),
+            partial=partial,
         )
         return tuple(map(_to_torch, outs))
 
@@ -246,15 +309,16 @@ def _install_fused(module, calls, odd_tiles):
     return module
 
 
-def _install_full(module, calls):
+def _install_full(module, calls, partial=False):
     """The TPU_QWEN4_HC_PREFILL_ODD_TILES path: hc_full (interpret mode), the
     XLA-style injection from ``norm`` (torch), the gated_residual formula."""
     module.prefill_full_tile = TILE
     module._prefill_tile_step = TILE
+    module._prefill_partial = partial
 
     def full_mix(x, *weights):
         calls.append("full")
-        return tuple(map(_to_torch, full(*map(_to_jax, (x, *weights)))))
+        return tuple(map(_to_torch, full(*map(_to_jax, (x, *weights)), partial=partial)))
 
     def combine(residual, block, gates):
         calls.append("combine")
@@ -266,16 +330,17 @@ def _install_full(module, calls):
     return module
 
 
-@pytest.mark.parametrize("tiles", [3, 4])
-def test_layer_plumbing_fused_prefill_matches_odd_tile_path(tiles):
+@pytest.mark.parametrize("tokens", [3 * TILE, 4 * TILE, 3 * TILE + 64])
+def test_layer_plumbing_fused_prefill_matches_odd_tile_path(tokens):
     """attn mix -> combine_mix -> mlp combine, as Qwen4ExpDecoderLayer runs,
-    with the fused prefill ops against the hc_full path at the same step."""
-    tokens = tiles * TILE
+    with the fused prefill ops against the hc_full path at the same step; a
+    partial last tile (3 x 128 + 64) takes both paths only under the flag."""
+    partial = bool(tokens % TILE)
     calls, ref_calls = [], []
-    attn = _install_full(_module(11), ref_calls)
-    mlp = _install_full(_module(12), ref_calls)
-    f_attn = _install_fused(_module(11), calls, odd_tiles=True)
-    f_mlp = _install_fused(_module(12), calls, odd_tiles=True)
+    attn = _install_full(_module(11), ref_calls, partial)
+    mlp = _install_full(_module(12), ref_calls, partial)
+    f_attn = _install_fused(_module(11), calls, odd_tiles=True, partial=partial)
+    f_mlp = _install_fused(_module(12), calls, odd_tiles=True, partial=partial)
     torch.manual_seed(13)
     hyper = torch.randn(tokens, BRANCHES * HIDDEN).to(torch.bfloat16)
     attn_out = torch.randn(tokens, HIDDEN).to(torch.bfloat16)
@@ -321,7 +386,8 @@ def fake_adapter(monkeypatch):
                  "build_prefill_inj_mix_op", "build_prefill_combine_mix_op"):
         setattr(fake, name, builder(name))
     monkeypatch.setitem(sys.modules, fake.__name__, fake)
-    for name in ("TPU_QWEN4_HC_PREFILL_ODD_TILES", "TPU_QWEN4_HC_PREFILL_FUSED_MIX", "TPU_QWEN4_HC_DECODE_FUSED"):
+    for name in ("TPU_QWEN4_HC_PREFILL_ODD_TILES", "TPU_QWEN4_HC_PREFILL_FUSED_MIX", "TPU_QWEN4_HC_DECODE_FUSED",
+                 "TPU_QWEN4_HC_PREFILL_PARTIAL_TILE"):
         monkeypatch.setattr(envs, name, False)
     return built
 
@@ -334,6 +400,8 @@ def fake_adapter(monkeypatch):
         ("TPU_QWEN4_HC_PREFILL_ODD_TILES", 256, (True, True, False, False)),
         ("TPU_QWEN4_HC_PREFILL_ODD_TILES", 128, (True, True, True, False)),
         ("TPU_QWEN4_HC_PREFILL_FUSED_MIX", 128, (True, True, True, False)),
+        # partial last tile: 3,200 at 256-row tiles (12 + a 128-row tile)
+        ("TPU_QWEN4_HC_PREFILL_PARTIAL_TILE", 256, (True, True, True, False)),
     ],
 )
 def test_prefill_tile_gate(monkeypatch, fake_adapter, flag, tile, expected):
@@ -342,6 +410,10 @@ def test_prefill_tile_gate(monkeypatch, fake_adapter, flag, tile, expected):
     m = GatedResidual(_module(1).config, prefill_full_tile=tile)
     got = tuple(m._prefill_full_rows(t) for t in (6400, 8192, 3200, tile))
     assert got == expected, (flag, tile, got)
+    if flag == "TPU_QWEN4_HC_PREFILL_PARTIAL_TILE":
+        assert m._prefill_partial and not m._prefill_full_rows(3216)  # 32-row multiples only
+    else:
+        assert not m._prefill_partial
     fused_built = "build_prefill_inj_mix_op" in fake_adapter
     assert fused_built == (flag == "TPU_QWEN4_HC_PREFILL_FUSED_MIX")
     assert (m._prefill_inj_mix_op is not None) == fused_built

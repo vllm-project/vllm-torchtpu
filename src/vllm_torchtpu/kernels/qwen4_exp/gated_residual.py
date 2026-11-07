@@ -22,7 +22,7 @@ def _kernel(residual_ref, block_ref, gates_ref, output_ref, *, branches, hidden)
 
 @functools.cache
 def gated_residual_fn(
-    branches: int, hidden: int, token_tile: int
+    branches: int, hidden: int, token_tile: int, partial: bool = False, interpret=False
 ) -> Callable[[jax.Array, jax.Array, jax.Array], jax.Array]:
     """Build a tiled residual merge with BF16 inputs/output and FP32 gates.
 
@@ -30,6 +30,10 @@ def gated_residual_fn(
         branches: Number of contiguous residual branches.
         hidden: Width of each branch, aligned to 128 TPU vector lanes.
         token_tile: Token rows per tile, a positive multiple of 128.
+        partial: Accept a partial last tile (any multiple of 16 rows); the
+            grid covers it and out-of-range rows of that block are dropped on
+            write (TPU_QWEN4_HC_PREFILL_PARTIAL_TILE).
+        interpret: Pallas interpret mode (CPU tests).
 
     Returns:
         A JAX function taking residual, block output, and scalar gates.
@@ -46,7 +50,7 @@ def gated_residual_fn(
         tokens = residual.shape[0]
         if (
             tokens == 0
-            or tokens % token_tile
+            or (tokens % 16 if partial else tokens % token_tile)
             or residual.shape != (tokens, branches * hidden)
             or block.shape != (tokens, hidden)
             or gates.shape != (tokens, branches)
@@ -57,7 +61,7 @@ def gated_residual_fn(
             raise ValueError("Residual merge requires full BF16 tiles and FP32 gates")
         return pl.pallas_call(
             functools.partial(_kernel, branches=branches, hidden=hidden),
-            grid=(tokens // token_tile,),
+            grid=(pl.cdiv(tokens, token_tile),),
             in_specs=(
                 pl.BlockSpec((token_tile, branches * hidden), lambda i: (i, 0)),
                 pl.BlockSpec((token_tile, hidden), lambda i: (i, 0)),
@@ -65,6 +69,7 @@ def gated_residual_fn(
             ),
             out_specs=pl.BlockSpec((token_tile, branches * hidden), lambda i: (i, 0)),
             out_shape=jax.ShapeDtypeStruct(residual.shape, residual.dtype),
+            interpret=interpret,
             name=f"gated_residual_b{branches}_h{hidden}_m{token_tile}",
         )(residual, block, gates)
 
