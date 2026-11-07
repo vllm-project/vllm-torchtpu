@@ -203,6 +203,7 @@ ignore = [
 "torch".msg = "kernels/ is JAX and Pallas only. Put torch code in a vllm_adapter.py."
 "torch_tpu".msg = "kernels/ is JAX and Pallas only. Use it in a vllm_adapter.py."
 "vllm".msg = "kernels/ does not import vLLM. Pass the values in as arguments."
+"vllm_torchtpu.megakernel_runtime".msg = "kernels/ and megakernel/ do not import the megakernel runtime bridge (megakernel_runtime imports megakernel, not the reverse)."
 
 [tool.ruff.lint.per-file-ignores]
 # Kernels must not import torch, torch_tpu or vLLM directly. Adapter files

@@ -179,6 +179,10 @@
 /src/vllm_torchtpu/megakernel/ @caojx-google @annyan09023 @weinan1997 @hhb @brianseung-google
 /tests/megakernel/ @caojx-google @annyan09023 @weinan1997 @hhb @brianseung-google
 
+# Megakernel runtime (PyTorch/vLLM bridge)
+/src/vllm_torchtpu/megakernel_runtime/ @caojx-google @annyan09023 @weinan1997 @hhb @brianseung-google @qizzzh @Nanfang-Li
+/tests/megakernel_runtime/ @caojx-google @annyan09023 @weinan1997 @hhb @brianseung-google @qizzzh @Nanfang-Li
+
 # Speculative Decoding
 /src/vllm_torchtpu/spec_decode/ @Lumosis @junyanxu @gxd3 @jyj0w0 @maxwillzq
 /tests/spec_decode/ @Lumosis @junyanxu @gxd3 @jyj0w0 @maxwillzq
