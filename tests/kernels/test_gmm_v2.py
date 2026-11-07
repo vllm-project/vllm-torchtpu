@@ -30,6 +30,7 @@ from vllm_torchtpu.kernels.megablox.gmm_v2 import (
     TileSizes,
     apply_act_fn,
     gmm_v2,
+    gmm_v2_mlp,
     interleave_lane,
     situ_and_mul,
 )
@@ -512,4 +513,76 @@ def test_gmm_fp4_block_matches_reference(batch_size, group_sizes, block_size):
         np.asarray(actual[:num_rows].astype(jnp.float32)),
         np.asarray(expected[:num_rows].astype(jnp.float32)),
         atol=2e-2 * float(jnp.abs(expected).max()),
+    )
+
+
+@pytest.mark.tpu_test
+@pytest.mark.parametrize(
+    "batch_size, group_sizes",
+    [
+        (32, [0, 2, 0, 1, 0, 0, 3, 0, 0, 0, 20, 0, 0, 1, 0, 0]),
+        (96, [0, 2, 0, 1, 0, 0, 3, 0, 0, 0, 20, 0, 0, 1, 0, 0]),
+        # No local rows: the prefetch is never started nor waited on.
+        (32, [0] * 16),
+    ],
+)
+def test_gmm_v2_mlp_matches_two_gmms(batch_size, group_sizes):
+    """The fused expert MLP (one kernel, down's first block prefetched) must
+    equal gate_up gmm followed by down gmm bit for bit."""
+    _require_tpu()
+
+    hidden, inter, num_groups, block_size = 1024, 512, 16, 128
+    keys = jax.random.split(jax.random.key(0), 5)
+    fp4_values = jnp.asarray(
+        [0, 0.5, 1, 1.5, 2, 3, 4, 6, -0.5, -1, -1.5, -2, -3, -4, -6, 0], jnp.float32
+    )
+
+    def fp4_weight(key, k, n):
+        idx = jax.random.randint(key, (num_groups, k, n), 0, 16)
+        return fp4_values[idx].astype(jnp.float4_e2m1fn)
+
+    w1 = fp4_weight(keys[0], hidden, 2 * inter)
+    w2 = fp4_weight(keys[1], inter, hidden)
+    s1 = jax.random.uniform(
+        keys[2], (num_groups, hidden // block_size, 1, 2 * inter), jnp.float32, 0.5, 2
+    )
+    s2 = jax.random.uniform(
+        keys[3], (num_groups, inter // block_size, 1, hidden), jnp.float32, 0.5, 2
+    )
+    lhs = jax.random.normal(keys[4], (batch_size, hidden), jnp.bfloat16)
+    group_sizes = jnp.asarray(group_sizes, dtype=jnp.int32)
+    num_rows = int(group_sizes.sum())
+
+    h = gmm_v2(
+        lhs,
+        w1,
+        group_sizes,
+        rhs_scale=s1,
+        zero_initialize=False,
+        fuse_act="swigluoai",
+        maybe_quantize_lhs=False,
+    )
+    expected = gmm_v2(
+        h,
+        w2,
+        group_sizes,
+        rhs_scale=s2,
+        zero_initialize=False,
+        preferred_element_type=jnp.bfloat16,
+        maybe_quantize_lhs=False,
+    )
+    actual = gmm_v2_mlp(
+        lhs,
+        w1,
+        w2,
+        group_sizes,
+        rhs1_scale=s1,
+        rhs2_scale=s2,
+        fuse_act="swigluoai",
+        preferred_element_type=jnp.bfloat16,
+        maybe_quantize_lhs=False,
+    )
+    np.testing.assert_array_equal(
+        np.asarray(actual[:num_rows].astype(jnp.float32)),
+        np.asarray(expected[:num_rows].astype(jnp.float32)),
     )

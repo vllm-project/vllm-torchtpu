@@ -14,6 +14,7 @@
 
 import dataclasses
 import functools
+import math
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 from typing import Any, cast
@@ -910,13 +911,6 @@ def kernel_main(
         cfgs: GmmConfigs.
     """
 
-    num_k = pl.cdiv(cfgs.dims.size_k, cfgs.tiles.tile_k)
-    num_n = pl.cdiv(cfgs.out_size_n, cfgs.tiles.tile_n)
-
-    if cfgs.rhs_cfgs.should_unpack:
-        rhs_weight = rhs_ref.weight.bitcast(cfgs.rhs_cfgs.quant_dtype)
-        rhs_ref = dataclasses.replace(rhs_ref, weight=rhs_weight)
-
     # Fill metadata buffer and return number of group & m interations.
     num_gm = fill_metadata(
         lhs_group_sizes_ref,
@@ -935,6 +929,50 @@ def kernel_main(
             dims=cfgs.dims,
         )
 
+    run_gmm_pipeline(
+        lhs_ref,
+        rhs_ref,
+        out_ref,
+        partial_out_ref,
+        acc_ref,
+        metadata_ref,
+        num_gm,
+        cfgs=cfgs,
+    )
+
+    if cfgs.zero_init:
+        zero_out_end(out_ref, cast(jax.Array, semaphore_ref), zero_size, dims=cfgs.dims)
+
+
+def run_gmm_pipeline(
+    lhs_ref: jax.Array,  # [size_m, size_k]
+    rhs_ref: WeightsRef,  # [size_group, size_k, size_n]
+    out_ref: jax.Array,  # [size_m, size_n]
+    partial_out_ref: jax.Array,  # [size_lhs_sublane, tile_n]
+    acc_ref: jax.Array,  # [tile_m, tile_n]
+    metadata_ref: MetadataRef,
+    num_gm: jax.Array,
+    *,
+    cfgs: GmmConfigs,
+    rhs_weight_window: jax.Array | None = None,
+    last_step_hook: Callable[[], None] | None = None,
+):
+    """Runs the grouped matmul over the gm tiles that fill_metadata laid out.
+
+    last_step_hook runs at the start of the last grid step, when the pipeline
+    fetches nothing more (kernel_mlp issues the next gmm's first DMA there).
+
+    rhs_weight_window: [2, tile_k, tile_n] VMEM whose slot 0 already holds the
+    first grid step's rhs weight block (see kernel_mlp); the pipeline then
+    double-buffers rhs weights in it instead of fetching that block itself.
+    """
+    num_k = pl.cdiv(cfgs.dims.size_k, cfgs.tiles.tile_k)
+    num_n = pl.cdiv(cfgs.out_size_n, cfgs.tiles.tile_n)
+
+    if cfgs.rhs_cfgs.should_unpack:
+        rhs_weight = rhs_ref.weight.bitcast(cfgs.rhs_cfgs.quant_dtype)
+        rhs_ref = dataclasses.replace(rhs_ref, weight=rhs_weight)
+
     (lhs_spec, rhs_spec), out_spec = generate_block_specs(metadata_ref, cfgs)
 
     if cfgs.fuse_act is not None:
@@ -946,23 +984,184 @@ def kernel_main(
             up=rhs_spec,
         )
 
-    # Execute the inner kernel.
-    pipeline_fn = pltpu.emit_pipeline(
-        functools.partial(inner_kernel, cfgs=cfgs),
-        grid=(num_n, num_gm, num_k),
-        in_specs=(lhs_spec, rhs_spec),
-        out_specs=out_spec,
-    )
-
     # Bounded slice requires second last dim to be aligned to the sublane size.
     # rhs_ref uses static tiling thus reshape is not needed.
     lhs_in = lhs_ref.reshape(-1, cfgs.dims.size_lhs_sublane, lhs_ref.shape[-1])
     out_in = out_ref.reshape(-1, cfgs.dims.size_lhs_sublane, out_ref.shape[-1])
     scratches = [partial_out_ref, acc_ref, metadata_ref]
-    pipeline_fn(lhs_in, rhs_ref, out_in, scratches=scratches)
+    grid = (num_n, num_gm, num_k)
+    body = functools.partial(inner_kernel, cfgs=cfgs)
+    if last_step_hook is not None:
+        inner_body = body
 
-    if cfgs.zero_init:
-        zero_out_end(out_ref, cast(jax.Array, semaphore_ref), zero_size, dims=cfgs.dims)
+        def body(*refs):
+            is_last = functools.reduce(
+                jnp.logical_and,
+                [pl.program_id(i) == pl.num_programs(i) - 1 for i in range(3)],
+            )
+            pl.when(is_last)(last_step_hook)
+            inner_body(*refs)
+
+    if rhs_weight_window is None:
+        pltpu.emit_pipeline(
+            body, grid=grid, in_specs=(lhs_spec, rhs_spec), out_specs=out_spec
+        )(lhs_in, rhs_ref, out_in, scratches=scratches)
+        return
+
+    assert cfgs.fuse_act is None
+    rhs_spec = dataclasses.replace(
+        rhs_spec,
+        weight=dataclasses.replace(
+            rhs_spec.weight,
+            pipeline_mode=pl.Buffered(
+                buffer_count=rhs_weight_window.shape[0], prefetched_count=1
+            ),
+        ),
+    )
+    pipeline_fn, make_allocations = pltpu.emit_pipeline_with_allocations(
+        body, grid=grid, in_specs=(lhs_spec, rhs_spec), out_specs=out_spec
+    )
+
+    def run(allocations):
+        lhs_bref, rhs_bref, *out_brefs = allocations
+        rhs_bref = dataclasses.replace(
+            rhs_bref, weight=rhs_bref.weight.with_window_ref(rhs_weight_window)
+        )
+        pipeline_fn(
+            lhs_in,
+            rhs_ref,
+            out_in,
+            scratches=scratches,
+            allocations=[lhs_bref, rhs_bref, *out_brefs],
+        )
+
+    pl.run_scoped(run, make_allocations(lhs_in, rhs_ref, out_in))
+
+
+def kernel_mlp(
+    # Scalar prefetch
+    lhs_group_sizes_ref: jax.Array,  # int32[size_lhs_group]
+    group_offset_ref: jax.Array,  # int32[1]
+    # In
+    lhs_ref: jax.Array,  # [size_m, size_k]
+    rhs1_ref: WeightsRef,  # [size_group, size_k, size_n1]
+    rhs2_ref: WeightsRef,  # [size_group, size_n1 out, size_n2]
+    # Out
+    out_ref: jax.Array,  # [size_m, size_n2]
+    h_ref: jax.Array,  # [size_m, out size_n1]; the first gmm's output
+    # Scratch memory
+    partial_out1_ref: jax.Array,
+    acc1_ref: jax.Array,
+    partial_out2_ref: jax.Array,
+    acc2_ref: jax.Array,
+    metadata_ref: MetadataRef,
+    *,
+    cfgs1: GmmConfigs,
+    cfgs2: GmmConfigs,
+):
+    """Two chained gmms over the same groups in one call (see gmm_v2_mlp)."""
+    num_gm = fill_metadata(
+        lhs_group_sizes_ref, group_offset_ref, metadata_ref, cfgs=cfgs1
+    )
+
+    # The second gmm's first rhs block (a whole expert, see _mlp_fusable)
+    # streams in under the first gmm's last compute step instead of after it.
+    def run(window_ref, sem_ref):
+        first = pltpu.make_async_copy(
+            rhs2_ref.weight.at[metadata_ref.gm_id_to_group_id[0]],
+            window_ref.at[0],
+            sem_ref,
+        )
+        has_work = num_gm > 0
+        # Started on the first gmm's last step: HBM is idle there, while
+        # earlier it would slow the first gmm's own weight stream.
+        run_gmm_pipeline(
+            lhs_ref,
+            rhs1_ref,
+            h_ref,
+            partial_out1_ref,
+            acc1_ref,
+            metadata_ref,
+            num_gm,
+            cfgs=cfgs1,
+            last_step_hook=first.start,
+        )
+
+        @pl.when(has_work)
+        def _():
+            first.wait()
+
+        run_gmm_pipeline(
+            h_ref,
+            rhs2_ref,
+            out_ref,
+            partial_out2_ref,
+            acc2_ref,
+            metadata_ref,
+            num_gm,
+            cfgs=cfgs2,
+            rhs_weight_window=window_ref,
+        )
+
+    tiles2 = cfgs2.tiles
+    pl.run_scoped(
+        run,
+        pltpu.VMEM((2, tiles2.tile_k, tiles2.tile_n), rhs2_ref.weight.dtype),
+        pltpu.SemaphoreType.DMA(()),
+    )
+
+
+def rhs_weight_block_bytes(tk: int, tn: int, rhs_cfgs: InputConfigs) -> int:
+    rhs_dtype = rhs_cfgs.quant_dtype or rhs_cfgs.dtype
+    return tk * tn * jax.dtypes.itemsize_bits(rhs_dtype) // 8
+
+
+def gmm_vmem_estimate(
+    tm: int,
+    tn: int,
+    tk: int,
+    *,
+    lhs_cfgs: InputConfigs,
+    rhs_cfgs: InputConfigs,
+    fuse_act: str | None,
+) -> int:
+    """VMEM a gmm_v2 pipeline with these tiles needs."""
+    lhs_bits = jax.dtypes.itemsize_bits(lhs_cfgs.dtype)
+    fuse_act_factor = 1 if fuse_act is None else 2
+    # 1. LHS tile (double-buffered HBM load)
+    lhs_tile_bytes = lhs_bits // 8
+    lhs_vmem = 2 * tm * tk * lhs_tile_bytes
+    # If LHS is quantized on-the-fly, we need an extra single-buffered cast
+    # buffer in VMEM.
+    if lhs_cfgs.should_quantize:
+        lhs_quant_bits = jax.dtypes.itemsize_bits(cast(jnp.dtype, lhs_cfgs.quant_dtype))
+        lhs_vmem += tm * tk * (lhs_quant_bits // 8)
+
+    # 2. RHS tile (triple-buffered, includes scale and bias if present)
+    # If fuse_act is enabled, we have both gate and up weights,
+    # so RHS memory is doubled.
+    rhs_weight_vmem = rhs_weight_block_bytes(tk, tn, rhs_cfgs)
+    rhs_scale_vmem = 0
+    if rhs_cfgs.has_scale and rhs_cfgs.quant_block_size is not None:
+        num_quant_blocks_per_tile_k = pl.cdiv(tk, rhs_cfgs.quant_block_size)
+        rhs_scale_vmem = num_quant_blocks_per_tile_k * tn * 4
+    rhs_bias_vmem = 0
+    if rhs_cfgs.has_bias:
+        rhs_bias_vmem = tn * 4
+    rhs_vmem = fuse_act_factor * (
+        3 * rhs_weight_vmem + 2 * rhs_scale_vmem + 2 * rhs_bias_vmem
+    )
+
+    # 3. Accumulator
+    acc_cols = fuse_act_factor * tn
+    acc_dtype_bytes = 2 if lhs_cfgs.quant_dtype is not None else 4
+    acc_vmem = tm * acc_cols * acc_dtype_bytes
+
+    # 4. Output tile (double-buffered)
+    out_dtype_bytes = jax.dtypes.itemsize_bits(lhs_cfgs.dtype) // 8
+    out_vmem = 2 * tm * tn * out_dtype_bytes
+
+    return lhs_vmem + rhs_vmem + acc_vmem + out_vmem
 
 
 def calculate_tiling(
@@ -974,10 +1173,7 @@ def calculate_tiling(
 ) -> TileSizes:
     """Calculate optimal tile sizes for GMM kernel."""
 
-    lhs_dtype = lhs_cfgs.dtype
     rhs_dtype = rhs_cfgs.quant_dtype or rhs_cfgs.dtype
-
-    lhs_bits = jax.dtypes.itemsize_bits(lhs_dtype)
     rhs_bits = jax.dtypes.itemsize_bits(rhs_dtype)
 
     # When using bf16 for lhs and rhs, 128 is the largest tile_m value that is
@@ -1015,43 +1211,9 @@ def calculate_tiling(
     tile_k = align_to(dims.size_k, num_lanes)
     tile_n = align_to(size_n_per_rhs, num_lanes)
 
-    def _gmm_vmem_estimate(tm: int, tn: int, tk: int) -> int:
-        # 1. LHS tile (double-buffered HBM load)
-        lhs_tile_bytes = lhs_bits // 8
-        lhs_vmem = 2 * tm * tk * lhs_tile_bytes
-        # If LHS is quantized on-the-fly, we need an extra single-buffered cast
-        # buffer in VMEM.
-        if lhs_cfgs.should_quantize:
-            lhs_quant_bits = jax.dtypes.itemsize_bits(
-                cast(jnp.dtype, lhs_cfgs.quant_dtype)
-            )
-            lhs_vmem += tm * tk * (lhs_quant_bits // 8)
-
-        # 2. RHS tile (triple-buffered, includes scale and bias if present)
-        # If fuse_act is enabled, we have both gate and up weights,
-        # so RHS memory is doubled.
-        rhs_weight_vmem = tk * tn * rhs_bits // 8
-        rhs_scale_vmem = 0
-        if rhs_cfgs.has_scale and rhs_cfgs.quant_block_size is not None:
-            num_quant_blocks_per_tile_k = pl.cdiv(tk, rhs_cfgs.quant_block_size)
-            rhs_scale_vmem = num_quant_blocks_per_tile_k * tn * 4
-        rhs_bias_vmem = 0
-        if rhs_cfgs.has_bias:
-            rhs_bias_vmem = tn * 4
-        rhs_vmem = fuse_act_factor * (
-            3 * rhs_weight_vmem + 2 * rhs_scale_vmem + 2 * rhs_bias_vmem
-        )
-
-        # 3. Accumulator
-        acc_cols = fuse_act_factor * tn
-        acc_dtype_bytes = 2 if lhs_cfgs.quant_dtype is not None else 4
-        acc_vmem = tm * acc_cols * acc_dtype_bytes
-
-        # 4. Output tile (double-buffered)
-        out_dtype_bytes = jax.dtypes.itemsize_bits(lhs_cfgs.dtype) // 8
-        out_vmem = 2 * tm * tn * out_dtype_bytes
-
-        return lhs_vmem + rhs_vmem + acc_vmem + out_vmem
+    _gmm_vmem_estimate = functools.partial(
+        gmm_vmem_estimate, lhs_cfgs=lhs_cfgs, rhs_cfgs=rhs_cfgs, fuse_act=fuse_act
+    )
 
     # Multiple k tiles will introduce accumulation overhead. Thus, we first try
     # to fit the tensors into vmem by only adjusting tile_n.
@@ -1100,7 +1262,7 @@ def calculate_tiling(
     # rows, and rows cost MXU time on the fp8 rhs feed: use fp8-sized tiles in
     # two buckets. Two such tiles cost what one bf16 tile does, and more
     # buckets would bloat the program (each bucket is a copy of the body).
-    sublane = _get_lhs_sublane_size(lhs_dtype, dims.size_m)
+    sublane = _get_lhs_sublane_size(lhs_cfgs.dtype, dims.size_m)
     if (
         bucket_base == tile_m
         and dims.size_m < 2 * tile_m  # growth stopped by size_m, not VMEM
@@ -1326,6 +1488,25 @@ def get_metadata(cfgs: GmmConfigs) -> dict[str, str | int | float]:
     return ret
 
 
+def pipeline_scratch_shapes(cfgs: GmmConfigs) -> list:
+    """VMEM scratch of run_gmm_pipeline: partial_out_ref, acc_ref."""
+    tiles = cfgs.tiles
+    acc_cols = 2 * tiles.tile_n if cfgs.fuse_act is not None else tiles.tile_n
+    return [
+        pltpu.VMEM((cfgs.dims.size_lhs_sublane, tiles.tile_n), cfgs.out_dtype),
+        pltpu.VMEM((tiles.tile_m, acc_cols), cfgs.acc_dtype),
+    ]
+
+
+def metadata_scratch_shape(cfgs: GmmConfigs) -> MetadataRef:
+    dims = cfgs.dims
+    max_num_gm = dims.size_group + pl.cdiv(dims.size_m, cfgs.tiles.tile_m) - 1
+    return MetadataRef(
+        gm_id_to_group_id=pltpu.SMEM((max_num_gm,), jnp.int32),
+        gm_id_to_m_offset=pltpu.SMEM((max_num_gm + 1,), jnp.int32),
+    )
+
+
 @jax.jit(
     static_argnames=[
         "tile_info",
@@ -1423,7 +1604,6 @@ def gmm_v2(
         rhs_quant_dtype=rhs_quant_dtype,
     )
     dims = cfgs.dims
-    tiles = cfgs.tiles
 
     # Prepare block specs.
     rhs_scale_spec = rhs_bias_spec = None
@@ -1435,19 +1615,7 @@ def gmm_v2(
         rhs_bias_spec = pl.BlockSpec(memory_space=pltpu.HBM)
 
     # Initialize scratch shapes.
-    max_num_gm = dims.size_group + pl.cdiv(dims.size_m, tiles.tile_m) - 1
-    acc_cols = 2 * tiles.tile_n if cfgs.fuse_act is not None else tiles.tile_n
-    scratch_shapes = [
-        # partial_out_ref
-        pltpu.VMEM((dims.size_lhs_sublane, tiles.tile_n), cfgs.out_dtype),
-        # acc_ref
-        pltpu.VMEM((tiles.tile_m, acc_cols), cfgs.acc_dtype),
-        # metadata_ref
-        MetadataRef(
-            gm_id_to_group_id=pltpu.SMEM((max_num_gm,), jnp.int32),
-            gm_id_to_m_offset=pltpu.SMEM((max_num_gm + 1,), jnp.int32),
-        ),
-    ]
+    scratch_shapes = [*pipeline_scratch_shapes(cfgs), metadata_scratch_shape(cfgs)]
 
     num_lanes = pltpu.get_tpu_info().num_lanes
     if cfgs.zero_init:
@@ -1503,3 +1671,201 @@ def gmm_v2(
         cost_estimate=get_cost_estimate(cfgs),
         metadata=get_metadata(cfgs),
     )(group_sizes, group_offset, lhs, rhs_weights)[:size_m, : cfgs.out_size_n]
+
+
+# kernel_mlp hands down's pipeline a prefetched block (newer Pallas TPU API).
+_HAS_PIPELINE_PREFETCH = "prefetched_count" in {
+    f.name for f in dataclasses.fields(pl.Buffered)
+} and hasattr(pltpu, "emit_pipeline_with_allocations")
+
+
+def _mlp_fusable(cfgs1: GmmConfigs, cfgs2: GmmConfigs, vmem_limit_bytes: int) -> bool:
+    """Whether kernel_mlp can run both gmms on one fill_metadata layout."""
+
+    def vmem(cfgs):
+        t = cfgs.tiles
+        return gmm_vmem_estimate(
+            t.tile_m,
+            t.tile_n,
+            t.tile_k,
+            lhs_cfgs=cfgs.lhs_cfgs,
+            rhs_cfgs=cfgs.rhs_cfgs,
+            fuse_act=cfgs.fuse_act,
+        )
+
+    # The prefetch window (2 down weight blocks) lives through both pipelines;
+    # down's pipeline double-buffers its weights in it.
+    t2 = cfgs2.tiles
+    block2 = rhs_weight_block_bytes(t2.tile_k, t2.tile_n, cfgs2.rhs_cfgs)
+    window = 2 * block2
+
+    # kernel_mlp's scratch keeps both pipelines' partial_out and acc resident.
+    def scratch(cfgs):
+        return sum(
+            math.prod(x.shape) * jnp.dtype(x.dtype).itemsize
+            for x in pipeline_scratch_shapes(cfgs)
+        )
+
+    fits = (
+        vmem(cfgs1) + scratch(cfgs2) + window <= vmem_limit_bytes
+        and vmem(cfgs2) - 3 * block2 + scratch(cfgs1) + window <= vmem_limit_bytes
+    )
+    return (
+        fits
+        and
+        # Decode-sized (fp8 rhs feed) tiles only: the fused program holds both
+        # gmms' bucket bodies, and large ones would bloat it.
+        cfgs1.fp8_rhs_dtype(cfgs1.tiles.tile_m) is not None
+        and cfgs2.fp8_rhs_dtype(cfgs2.tiles.tile_m) is not None
+        and not cfgs1.zero_init
+        and not cfgs2.zero_init
+        and cfgs1.tiles.tile_m == cfgs2.tiles.tile_m
+        and cfgs1.dims.size_lhs_sublane == cfgs2.dims.size_lhs_sublane
+        and cfgs1.dims.size_group == cfgs2.dims.size_group
+        and cfgs1.out_size_n == cfgs2.dims.size_k
+        # kernel_mlp prefetches one whole expert of the second rhs.
+        and cfgs2.fuse_act is None
+        and not cfgs2.rhs_cfgs.should_unpack
+        and cfgs2.tiles.tile_k == cfgs2.dims.size_k
+        and cfgs2.tiles.tile_n == cfgs2.dims.size_n
+        and cfgs1.out_size_n % pltpu.get_tpu_info().num_lanes == 0
+    )
+
+
+@jax.jit(static_argnames=["fuse_act", "preferred_element_type", "maybe_quantize_lhs"])
+def gmm_v2_mlp(
+    lhs: jax.Array,  # [size_m, size_k]
+    rhs1: jax.Array,  # [size_group, size_k, size_n1]
+    rhs2: jax.Array,  # [size_group, size_n1 // (2 if fuse_act else 1), size_n2]
+    group_sizes: jax.Array,  # int32[size_lhs_group]
+    rhs1_scale: jax.Array | None = None,
+    rhs2_scale: jax.Array | None = None,
+    group_offset: jax.Array | None = None,  # int32[1]
+    *,
+    fuse_act: str | None = None,
+    preferred_element_type: jnp.dtype | None = None,
+    maybe_quantize_lhs: bool = True,
+) -> jax.Array:
+    """gmm_v2(gmm_v2(lhs, rhs1, fuse_act), rhs2) for an MoE expert MLP.
+
+    For decode-sized tiles the two run in one kernel (kernel_mlp), which loads
+    the second gmm's first weight block under the first gmm's compute: as two
+    calls, each exposes its first block's DMA. Otherwise it is two gmm_v2 calls.
+    """
+
+    def two_calls():
+        h = gmm_v2(
+            lhs,
+            rhs1,
+            group_sizes,
+            rhs_scale=rhs1_scale,
+            group_offset=group_offset,
+            zero_initialize=False,
+            fuse_act=fuse_act,
+            maybe_quantize_lhs=maybe_quantize_lhs,
+        )
+        return gmm_v2(
+            h[:, : rhs2.shape[1]],
+            rhs2,
+            group_sizes,
+            rhs_scale=rhs2_scale,
+            group_offset=group_offset,
+            zero_initialize=False,
+            preferred_element_type=preferred_element_type,
+            maybe_quantize_lhs=maybe_quantize_lhs,
+        )
+
+    size_m = lhs.shape[0]
+    padded_size_m = align_to(size_m, _get_lhs_sublane_size(lhs.dtype, size_m))
+    if padded_size_m != size_m:
+        lhs = jnp.pad(lhs, ((0, padded_size_m - size_m), (0, 0)))
+    if group_offset is None:
+        group_offset = jnp.array([0], dtype=jnp.int32)
+    elif jnp.isscalar(group_offset):
+        group_offset = group_offset[None]
+    vmem_limit_bytes = int(pltpu.get_tpu_info().vmem_capacity_bytes * 0.9)
+
+    common = dict(
+        tile_info=calculate_tiling,
+        vmem_limit_bytes=vmem_limit_bytes,
+        acc_dtype=None,
+        maybe_quantize_lhs=maybe_quantize_lhs,
+        zero_initialize=False,
+    )
+    cfgs1 = make_gmm_configs(
+        lhs,
+        rhs1,
+        rhs1_scale,
+        None,
+        group_sizes,
+        group_offset,
+        out_dtype=None,
+        fuse_act=fuse_act,
+        **common,
+    )
+    if cfgs1.out_size_n != rhs2.shape[1] or not _HAS_PIPELINE_PREFETCH:
+        return two_calls()[:size_m]
+    h_shape = jax.ShapeDtypeStruct((padded_size_m, cfgs1.out_size_n), cfgs1.out_dtype)
+    cfgs2 = make_gmm_configs(
+        h_shape,
+        rhs2,
+        rhs2_scale,
+        None,
+        group_sizes,
+        group_offset,
+        out_dtype=preferred_element_type,
+        **common,
+    )
+    if not _mlp_fusable(cfgs1, cfgs2, vmem_limit_bytes):
+        return two_calls()[:size_m]
+
+    def weights_ref(rhs, rhs_scale):
+        if rhs_scale is not None:
+            rhs_scale = rhs_scale.astype(jnp.float32)
+        spec = WeightsRef(
+            weight=pl.BlockSpec(memory_space=pltpu.HBM),
+            scale=None if rhs_scale is None else pl.BlockSpec(memory_space=pltpu.HBM),
+            bias=None,
+        )
+        return WeightsRef(weight=rhs, scale=rhs_scale, bias=None), spec
+
+    rhs1_ref, rhs1_spec = weights_ref(rhs1, rhs1_scale)
+    rhs2_ref, rhs2_spec = weights_ref(rhs2, rhs2_scale)
+    num_lanes = pltpu.get_tpu_info().num_lanes
+    hbm = pl.BlockSpec(memory_space=pltpu.HBM)
+    cost1, cost2 = get_cost_estimate(cfgs1), get_cost_estimate(cfgs2)
+    out, _ = pl.pallas_call(
+        functools.partial(kernel_mlp, cfgs1=cfgs1, cfgs2=cfgs2),
+        out_shape=(
+            jax.ShapeDtypeStruct(
+                (padded_size_m, align_to(cfgs2.out_size_n, num_lanes)),
+                cfgs2.out_dtype,
+            ),
+            h_shape,
+        ),
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=2,
+            in_specs=[hbm, rhs1_spec, rhs2_spec],
+            out_specs=[hbm, hbm],
+            scratch_shapes=[
+                *pipeline_scratch_shapes(cfgs1),
+                *pipeline_scratch_shapes(cfgs2),
+                metadata_scratch_shape(cfgs1),
+            ],
+        ),
+        compiler_params=pltpu.CompilerParams(
+            vmem_limit_bytes=vmem_limit_bytes,
+            disable_bounds_checks=True,
+        ),
+        name=f"mlp-{get_scope_name(cfgs1)}-{get_scope_name(cfgs2)}",
+        cost_estimate=pl.CostEstimate(
+            flops=cost1.flops + cost2.flops,
+            bytes_accessed=cost1.bytes_accessed + cost2.bytes_accessed,
+            transcendentals=0,
+        ),
+        metadata={
+            **{f"gmm1.{k}": v for k, v in get_metadata(cfgs1).items()},
+            **{f"gmm2.{k}": v for k, v in get_metadata(cfgs2).items()},
+        },
+    )(group_sizes, group_offset, lhs, rhs1_ref, rhs2_ref)
+    return out[:size_m, : cfgs2.out_size_n]
