@@ -292,7 +292,7 @@ def supervise_worker(args, worker_id: str, bench: subprocess.Popen) -> str | Non
     base = f"http://{args.head}:{args.port}"
     query = f"?worker={worker_id}"
     head_run: str | None = None
-    ready_sent = launched = False
+    ready_sent = launched = stop_sent = False
     stop_deadline: float | None = None
     lost_since: float | None = None
     connect_deadline = time.monotonic() + args.connect_timeout
@@ -329,15 +329,28 @@ def supervise_worker(args, worker_id: str, bench: subprocess.Popen) -> str | Non
             (results / "launch-permitted").touch()
             launched = True
         if state["stop"] and stop_deadline is None:
+            stop_deadline = now + args.stop_timeout
+        if stop_deadline is not None and not stop_sent:
             # run.py's worker treats SIGTERM as the orderly shutdown request
-            # and records shutdown_requested, which the audit requires.
+            # and records shutdown_requested, which the audit requires. It
+            # writes launcher.pid only once it starts, after the launch; a
+            # stop that arrives first waits for it, within the stop timeout.
+            pid_file = results / "benchmark/launcher.pid"
             try:
-                pid = int((results / "benchmark/launcher.pid").read_text())
-                os.kill(pid, signal.SIGTERM)
+                pid = int(pid_file.read_text())
+            except FileNotFoundError:
+                pid = None
             except (OSError, ValueError) as error:
                 return f"cannot stop the launcher: {error}"
-            stop_deadline = now + args.stop_timeout
+            if pid is not None:
+                try:
+                    os.kill(pid, signal.SIGTERM)
+                except OSError as error:
+                    return f"cannot stop the launcher: {error}"
+                stop_sent = True
         if stop_deadline is not None and now >= stop_deadline:
+            if not stop_sent:
+                return "launcher.pid did not appear within the stop timeout"
             return f"benchmark did not stop within {args.stop_timeout:.0f} seconds"
         time.sleep(args.poll)
     if stop_deadline is None:
