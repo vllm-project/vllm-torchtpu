@@ -386,9 +386,11 @@ class Qwen4ExpDecoderLayer(nn.Module):
         block = torch.where(valid_tokens[:, None], block, 0)
         if sequence_parallel:
             moe = self._sequence_parallel_moe(block, num_tokens)
-        elif sp.pcp_world_size() > 1:
+        elif sp.pcp_world_size() > 1 and not self._moe_owns_pcp:
             # PCP: experts are split over the group, whose MoE runner takes
-            # each rank's own rows (sequence_parallel.pcp_shard).
+            # each rank's own rows (sequence_parallel.pcp_shard). A fused EP
+            # kernel instead takes the replicated step, as under TP (its
+            # token replica groups span the PCP group, ep_mesh).
             moe = sp.pcp_gather(self.mlp(sp.pcp_shard(block)), block.shape[0])
         else:
             moe = self.mlp(block)
@@ -437,6 +439,23 @@ class Qwen4ExpDecoderLayer(nn.Module):
             sequence_parallel=sequence_parallel,
         )
         return hidden + sp.pad_shard(addend, sp_pad)
+
+    @property
+    def _moe_owns_pcp(self) -> bool:
+        """Whether this layer's routed experts run a fused EP kernel (armed
+        per layer at weight loading), which takes the step replicated over
+        the PCP group and owns the exchange; vLLM's runner then skips its
+        explicit PCP all-gather / reduce-scatter."""
+        routed = getattr(getattr(self.mlp, "experts", None), "routed_experts", None)
+        method = getattr(routed, "quant_method", None)
+        if method is None:
+            return False
+        from vllm_torchtpu.kernels.experimental.adaptive_fused_moe.vllm_adapter import (
+            adaptive_fused_moe_supported,
+        )
+        from vllm_torchtpu.layers.adapter.fused_moe_ep import fused_moe_ep_supported
+
+        return fused_moe_ep_supported(method) or adaptive_fused_moe_supported(method)
 
     def _sequence_parallel_moe(self, block, num_tokens):
         """The MoE block's output at this rank's rows of a sharded step.

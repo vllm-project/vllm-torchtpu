@@ -80,6 +80,12 @@ def ep_token_replica_groups(
         if is_sequence_parallel
         else tuple(int(r) for r in parallel_state.get_tp_group().ranks)
     )
+    if not is_sequence_parallel and _pcp_replicates_tokens():
+        # A model that keeps whole steps under PCP (qwen4_exp) holds the same
+        # tokens on every rank of the TP x PCP block, which is the EP group
+        # when DP is 1.
+        replicas = ranks
+        logger.info_once("EP token replicas span the PCP group: %s", replicas)
     device_ids = ep_device_ids()
     assert device_ids is not None
     key = (ranks, device_ids, replicas)
@@ -114,6 +120,22 @@ def ep_token_replica_groups(
     )
     _TOKEN_GROUP_CACHE[key] = groups
     return groups
+
+
+def _pcp_replicates_tokens() -> bool:
+    """Whether PCP ranks hold identical step tokens (``pcp_splits_tokens``
+    false) and the EP group is exactly the TP x PCP block (DP 1)."""
+    from vllm.config import get_current_vllm_config
+
+    from vllm_torchtpu.distributed.pcp import pcp_splits_tokens
+
+    config = get_current_vllm_config()
+    parallel = config.parallel_config
+    return (
+        parallel.prefill_context_parallel_size > 1
+        and parallel.data_parallel_size == 1
+        and not pcp_splits_tokens(config)
+    )
 
 
 def get_ep_group() -> Any | None:
