@@ -233,6 +233,7 @@ if TYPE_CHECKING:
     TPU_SCHED_KV_PREFETCH_WAITING: int = 0
     TPU_SCHED_KV_PREFETCH_RESERVE_BLOCKS: int = 64
     TPU_PREFIX_AWARE_TIER_WARMTH: bool = False
+    TPU_PREFIX_AWARE_TIER_PROBE_MAX_CHUNKS: int = 64
     TPU_OFFLOAD_KEEP_EAGLE_TAIL: bool = False
     TPU_RAIDEN_INLINE_LOAD: bool = False
     QUANTIZE_ON_LOAD_PREFIXES: list[str] = []
@@ -1728,6 +1729,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # so a session HBM evicted but the tier kept is not ranked fully cold.
     "TPU_PREFIX_AWARE_TIER_WARMTH": env_bool(
         "TPU_PREFIX_AWARE_TIER_WARMTH", default=False
+    ),
+    # PrefixAwareScheduler: most offload-tier chunks probed per request for tier
+    # warmth (64 chunks x 4096 tokens = 256K). Past the cap, the rest of a long
+    # prompt the tier holds still ranks as cold.
+    "TPU_PREFIX_AWARE_TIER_PROBE_MAX_CHUNKS": env_nonnegative_int(
+        "TPU_PREFIX_AWARE_TIER_PROBE_MAX_CHUNKS", 64
     ),
     # Offload tier: serve the whole tier hit when no KV cache group is
     # annotated as an MTP/EAGLE drafter group. The pinned vLLM then flags every

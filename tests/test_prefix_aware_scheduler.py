@@ -160,6 +160,16 @@ def _offload_connector(
 
 def test_default_knobs():
     assert PrefixAwareScheduler.WINDOW == 64
+    assert PrefixAwareScheduler.TIER_PROBE_MAX_CHUNKS == 64
+
+
+def test_env_knob(monkeypatch):
+    from vllm_torchtpu import envs
+
+    monkeypatch.delenv("TPU_PREFIX_AWARE_TIER_PROBE_MAX_CHUNKS", raising=False)
+    assert envs.TPU_PREFIX_AWARE_TIER_PROBE_MAX_CHUNKS == 64
+    monkeypatch.setenv("TPU_PREFIX_AWARE_TIER_PROBE_MAX_CHUNKS", "256")
+    assert envs.TPU_PREFIX_AWARE_TIER_PROBE_MAX_CHUNKS == 256
 
 
 def test_promotes_warmest_within_window():
@@ -466,6 +476,19 @@ def test_tier_probe_caps_chunks_in_one_store_probe():
     assert manager.probed == [
         [_chunk_key(r, c) for c in range(s.TIER_PROBE_MAX_CHUNKS)]
     ]
+
+
+def test_tier_probe_cap_follows_the_instance_setting():
+    now = time.time()
+    r = _hashed_request("r", num_tokens=200 * 4096, arrival_time=now)
+    manager = _FakeTierManager(keys=[_chunk_key(r, c) for c in range(200)])
+    s = _make_scheduler(
+        [r], {"r": 0}, tier_warmth=True, connector=_offload_connector(manager)
+    )
+    s.TIER_PROBE_MAX_CHUNKS = 160
+    assert s._prefix_warmth(r) == 160 * 4096
+    assert manager.calls == 1
+    assert len(manager.probed[0]) == 160
 
 
 def test_tier_probe_asks_for_the_chunks_past_the_hbm_hit():

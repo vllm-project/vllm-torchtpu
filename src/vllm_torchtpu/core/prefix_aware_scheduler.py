@@ -75,7 +75,8 @@ class PrefixAwareScheduler(AsyncScheduler):
     #: are not probed: they already rank as warm.
     TIER_PROBE_MIN_CHUNKS = 2
     #: Maximum tier chunks probed per request (~256K tokens at 4096 tokens/chunk),
-    #: bounding per-step store lookups on very long prompts.
+    #: bounding per-step store lookups on very long prompts. Overridden by
+    #: TPU_PREFIX_AWARE_TIER_PROBE_MAX_CHUNKS.
     TIER_PROBE_MAX_CHUNKS = 64
 
     def __init__(self, *args, **kwargs) -> None:
@@ -85,11 +86,14 @@ class PrefixAwareScheduler(AsyncScheduler):
         self._paw_prompt_tokens = 0
         self._paw_scoring_broken = False
         self._init_tier_warmth(envs.TPU_PREFIX_AWARE_TIER_WARMTH)
+        self.TIER_PROBE_MAX_CHUNKS = envs.TPU_PREFIX_AWARE_TIER_PROBE_MAX_CHUNKS
 
         logger.info(
-            "PrefixAwareScheduler ACTIVE (window=%d, tier_warmth=%s)",
+            "PrefixAwareScheduler ACTIVE (window=%d, tier_warmth=%s, "
+            "tier_probe_max_chunks=%d)",
             self.WINDOW,
             self._tier_warmth,
+            self.TIER_PROBE_MAX_CHUNKS,
         )
 
     def _init_tier_warmth(self, enabled: bool) -> None:
