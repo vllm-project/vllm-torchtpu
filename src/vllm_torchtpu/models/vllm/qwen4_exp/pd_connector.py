@@ -695,11 +695,14 @@ class QwenPagePlan:
         }
         names = [pool.layer_name for pool in self.manifest.pools]
         tags = [pool.tag for pool in self.manifest.pools]
-        if (
-            len(names) != len(set(names))
-            or len(tags) != len(set(tags))
-            or set(names) != set(owners)
-        ):
+        from vllm_torchtpu.distributed.pcp import get_pcp_rank
+
+        # A PCP rank past 0 lists only its split main-KV owners
+        # (pd_manifest.build_transfer_manifest); every other unit lists all.
+        covered = (
+            set(names) <= set(owners) if get_pcp_rank() > 0 else set(names) == set(owners)
+        )
+        if len(names) != len(set(names)) or len(tags) != len(set(tags)) or not covered:
             raise ValueError("Qwen PD page plan must cover every owner exactly once")
         return tuple((pool, owners[pool.layer_name]) for pool in self.manifest.pools)
 
