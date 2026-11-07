@@ -110,6 +110,7 @@ if TYPE_CHECKING:
     TPU_MOE_RAGGED_A2A: bool = False
     TPU_MOE_A2A_CAPACITY: float = 2.5
     TPU_MOE_A2A_ROUTE_CAPACITY: float = 3.0
+    TPU_MOE_A2A_DIRECT_COMBINE: bool = False
     PCP_FA_KERNEL_BLOCK_SIZE: int | None = None
     PCP_GDN_COMM_CHUNK_SIZE: int | None = None
     TPU_PCP_TOPOLOGY_AWARE_MESH: bool = True
@@ -810,6 +811,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # routes more than rows. Both factors are capped at 2 where the full-size
     # exchange stays on the one-hot path (its rerun is cheap there).
     "TPU_MOE_A2A_ROUTE_CAPACITY": env_float("TPU_MOE_A2A_ROUTE_CAPACITY", 3.0),
+    # Ragged all-to-all exchange: the fused expert kernel sends each expert
+    # output row to its home rank as soon as it is computed, and the home rank
+    # sums them, instead of a combine and a second exchange after the experts.
+    "TPU_MOE_A2A_DIRECT_COMBINE": env_bool("TPU_MOE_A2A_DIRECT_COMBINE"),
     # Override the PCP full-attention kernel page without changing KV manager pages.
     "PCP_FA_KERNEL_BLOCK_SIZE": env_positive_int_or_none("PCP_FA_KERNEL_BLOCK_SIZE"),
     # GDN stage/projection budget; token ownership still follows PCP interleave.

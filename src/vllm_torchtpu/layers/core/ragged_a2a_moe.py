@@ -49,9 +49,15 @@ import math
 
 import jax
 import jax.numpy as jnp
+from jax.experimental import pallas as pl
+from jax.experimental.pallas import tpu as pltpu
 from jax.sharding import PartitionSpec as P
 
-from vllm_torchtpu.layers.core.fused_moe_gmm import fused_moe_func
+from vllm_torchtpu.layers.core.fused_moe_gmm import (
+    fused_moe_func,
+    fused_moe_scatter,
+    scatter_moe_supported,
+)
 
 DP_AXIS = "dp"
 TP_AXIS = "tp"
@@ -236,6 +242,177 @@ def _exclusive_cumsum(a: jax.Array, axis: int) -> jax.Array:
     return jnp.cumsum(a, axis=axis, dtype=jnp.int32) - a
 
 
+def route_order(ids: jax.Array, in_group: jax.Array) -> jax.Array:
+    """Position of each route among its token's routes: the routes to experts of
+    this TP rank's DP group first, by expert id (so grouped by member in DP
+    order, each member's routes in its expert order), then the others.
+
+    ``ids``/``in_group`` [N, K]; returns int32 [N, K], a permutation of 0..K-1
+    per row. Expert and home ranks compute it from the same routing.
+    """
+    topk = ids.shape[-1]
+    k = jnp.arange(topk, dtype=jnp.int32)
+    key = jnp.where(in_group, ids, (1 << 20) + k)
+    before = (key[..., None, :] < key[..., :, None]) | (
+        (key[..., None, :] == key[..., :, None]) & (k[None, :] < k[:, None])
+    )
+    return before.sum(axis=-1, dtype=jnp.int32)
+
+
+def _home_routes(
+    topk_ids, topk_weights, *, member_index, dp_size, skip_padded_tokens, dtype
+):
+    """This rank's routes by position in ``route_order``, each [K, S]: the
+    member serving it (``dp_size``: none of this group), whether an output
+    comes back for it, and its routing weight in f32."""
+    topk = topk_ids.shape[1]
+    member = member_index(topk_ids)
+    weights = topk_weights.astype(dtype)
+    weights = jnp.where(jnp.isfinite(weights), weights, 0)
+    valid = member < dp_size
+    if skip_padded_tokens:
+        valid = valid & (weights != 0)
+    order = route_order(topk_ids, member < dp_size)
+    pick = order[:, :, None] == jnp.arange(topk, dtype=jnp.int32)  # [S, k, j]
+    member_s = jnp.where(pick, member[:, :, None], 0).sum(axis=1).T
+    valid_s = (pick & valid[:, :, None]).any(axis=1).T
+    weight_s = jnp.where(pick, weights[:, :, None].astype(jnp.float32), 0).sum(axis=1).T
+    return member_s, valid_s, weight_s
+
+
+def _home_sum(
+    recv,
+    topk_ids,
+    topk_weights,
+    *,
+    member_index,
+    dp_size,
+    skip_padded_tokens,
+    dtype,
+):
+    """This rank's [S, H] sum of the expert outputs its tokens' routes got back.
+
+    ``recv`` [K * S, 16, H / 16] holds route ``j`` of token ``t`` (in
+    ``route_order``) at row ``j * S + t``, unweighted. As the combine of the
+    returned partials: per member, its routes weighted and summed in f32 in its
+    expert order and rounded once to the activation dtype; then the members'
+    partials summed in f32 in DP order and rounded once.
+    """
+    num_tokens, topk = topk_ids.shape
+    member_s, valid_s, weight_s = _home_routes(
+        topk_ids,
+        topk_weights,
+        member_index=member_index,
+        dp_size=dp_size,
+        skip_padded_tokens=skip_padded_tokens,
+        dtype=dtype,
+    )
+    rows = recv.reshape(topk, num_tokens, *recv.shape[1:])
+    shape = (num_tokens,) + recv.shape[1:]
+    info = jnp.finfo(dtype)
+
+    def round_to(a):
+        # The rounding a returned partial gets in memory. A convert pair to
+        # ``dtype`` and back may be folded away by XLA; reduce_precision is not.
+        return jax.lax.reduce_precision(
+            a, exponent_bits=info.nexp, mantissa_bits=info.nmant
+        )
+
+    bcast = (slice(None),) + (None,) * (len(shape) - 1)
+    acc = jnp.zeros(shape, jnp.float32)
+    out = jnp.zeros(shape, jnp.float32)
+    for j in range(topk):
+        prod = jnp.where(
+            valid_s[j][bcast],
+            weight_s[j][bcast] * rows[j].astype(jnp.float32),
+            0.0,
+        )
+        if j:
+            acc = jnp.where((member_s[j] == member_s[j - 1])[bcast], acc, 0.0)
+        acc = acc + prod
+        end = member_s[j] < dp_size
+        if j + 1 < topk:
+            end = end & (member_s[j + 1] != member_s[j])
+        out = out + jnp.where(end[bcast], round_to(acc), 0.0)
+    return out.astype(dtype).reshape(num_tokens, -1)
+
+
+def _home_sum_tokens(num_tokens: int) -> int:
+    """Tokens per grid step of the owner-side sum kernel: a divisor of the
+    token count, at most 8."""
+    return max(d for d in range(1, 9) if num_tokens % d == 0)
+
+
+def home_sum_kernel(
+    recv,
+    topk_ids,
+    topk_weights,
+    *,
+    member_index,
+    dp_size,
+    skip_padded_tokens,
+    dtype,
+):
+    """`_home_sum` as one Pallas kernel (same arithmetic and order).
+
+    XLA splits the position loop into several fusions with f32 intermediates
+    and relayouts; here each token's rows stream through VMEM once.
+    """
+    num_tokens, topk = topk_ids.shape
+    member_s, valid_s, weight_s = _home_routes(
+        topk_ids,
+        topk_weights,
+        member_index=member_index,
+        dp_size=dp_size,
+        skip_padded_tokens=skip_padded_tokens,
+        dtype=dtype,
+    )
+    valid_s = valid_s.astype(jnp.int32)
+    rows = recv.reshape(topk, num_tokens, *recv.shape[1:])
+    tb = _home_sum_tokens(num_tokens)
+    row_shape = recv.shape[1:]
+
+    def kernel(member_ref, valid_ref, weight_ref, rows_ref, out_ref):
+        base = pl.program_id(0) * tb
+        for i in range(tb):
+            t = base + i
+            acc = jnp.zeros(row_shape, jnp.float32)
+            out = jnp.zeros(row_shape, jnp.float32)
+            for j in range(topk):
+                m = member_ref[j, t]
+                w = weight_ref[j, t]
+                row = rows_ref[j, i].astype(jnp.float32)
+                prod = jnp.where(valid_ref[j, t] != 0, w * row, 0.0)
+                if j:
+                    acc = jnp.where(m == member_ref[j - 1, t], acc, 0.0)
+                acc = acc + prod
+                end = m < dp_size
+                if j + 1 < topk:
+                    end = jnp.logical_and(end, member_ref[j + 1, t] != m)
+                # The rounding a returned partial gets in memory.
+                out = out + jnp.where(end, acc.astype(dtype).astype(jnp.float32), 0.0)
+            out_ref[i] = out.astype(out_ref.dtype)
+
+    out = pl.pallas_call(
+        kernel,
+        out_shape=jax.ShapeDtypeStruct((num_tokens,) + row_shape, dtype),
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=3,
+            grid=(num_tokens // tb,),
+            in_specs=[
+                pl.BlockSpec(
+                    (topk, tb) + row_shape, lambda g, *_: (0, g) + (0,) * len(row_shape)
+                )
+            ],
+            out_specs=pl.BlockSpec(
+                (tb,) + row_shape, lambda g, *_: (g,) + (0,) * len(row_shape)
+            ),
+        ),
+        name="ragged_a2a_home_sum",
+    )(member_s, valid_s, weight_s, rows)
+    return out.reshape(num_tokens, -1)
+
+
 def _full_exchange(
     x,
     w1,
@@ -247,8 +424,12 @@ def _full_exchange(
     tp_size,
     dp_size,
     moe,
+    direct=None,
 ):
-    """One receive region per DP member, sized for all of its tokens."""
+    """One receive region per DP member, sized for all of its tokens.
+
+    With ``direct`` (see ``_direct_combine``), the expert outputs go straight
+    to their home ranks instead of the return exchange."""
     num_tokens, hidden = x.shape
     local_num_experts = w1.shape[0]
     ep_rank = experts_start[0] // local_num_experts
@@ -303,6 +484,18 @@ def _full_exchange(
         axis_name=DP_AXIS,
     ).reshape(slots, hidden)
 
+    if direct is not None:
+        home = jnp.where(source_row < slots, source_row, 0)
+        return direct(
+            received,
+            recv_weights,
+            recv_ids,
+            home // num_tokens,
+            home % num_tokens,
+            dp_pos,
+            jnp.bool_(True),
+        )
+
     partial = moe(received, recv_weights, recv_ids)
 
     # Return path: the rows received from s go back to s, which finds member
@@ -338,6 +531,7 @@ def _capacity_exchange(
     dp_size,
     rows,
     moe,
+    direct=None,
 ):
     """Send and receive buffers of ``rows`` rows, filled without gaps.
 
@@ -393,6 +587,9 @@ def _capacity_exchange(
     in_row = jnp.where(need_in, in_row, rows)  # [D, S]
     in_hit = in_row[None] == row[:, None, None]  # [rows, D, S]
     filled = in_hit.any(axis=(1, 2))
+    # The home rank of each received row, for the direct combine.
+    home_member = jnp.where(in_hit, member[None, :, None], 0).sum(axis=(1, 2))
+    home_token = jnp.where(in_hit, token[None, None, :], 0).sum(axis=(1, 2))
     if packed_routes is None:
         source = (member[:, None] * num_tokens + token[None, :])[None]
         source_row = jnp.where(
@@ -418,6 +615,11 @@ def _capacity_exchange(
         axis_name=DP_AXIS,
     ).reshape(rows, hidden)
 
+    if direct is not None:
+        return direct(
+            received, recv_weights, recv_ids, home_member, home_token, dp_pos, fits
+        )
+
     partial = moe(received, recv_weights, recv_ids)
 
     # Every row the home rank reads below is written by this exchange, so the
@@ -434,6 +636,84 @@ def _capacity_exchange(
     back = jnp.concatenate([back, jnp.zeros((1, hidden), back.dtype)], axis=0)
     partials = back[out_row.T]  # [D, S, H]; tokens that skipped d read the zero row
     return partials.astype(jnp.float32).sum(axis=0).astype(x.dtype)
+
+
+def _direct_combine(
+    received,
+    recv_weights,
+    recv_ids,
+    home_member,
+    home_token,
+    dp_pos,
+    fits,
+    *,
+    x,
+    w1,
+    w2,
+    w1_scale,
+    w2_scale,
+    topk_ids,
+    topk_weights,
+    experts_start,
+    member_index,
+    dp_size,
+    topk,
+    activation,
+    rhs_quant_dtype,
+    skip_padded_tokens,
+    max_local_routes,
+    collective_id,
+):
+    """Expert outputs written to their home ranks from the expert kernel.
+
+    Received row ``r`` came from token ``home_token[r]`` of member
+    ``home_member[r]``; its route ``k`` lands at row ``route_order * S +
+    home_token`` of that member's receive buffer, which holds K rows per token
+    of this rank's engine. ``fits`` false: nothing was dispatched (the caller
+    discards the result), so nothing is expected either.
+    """
+    num_tokens = x.shape[0]
+    in_group = member_index(recv_ids) < dp_size
+    row_dest = route_order(recv_ids, in_group) * num_tokens + home_token[:, None]
+    member = member_index(topk_ids)
+    weights = topk_weights.astype(x.dtype)
+    weights = jnp.where(jnp.isfinite(weights), weights, 0)
+    remote = (member < dp_size) & (member != dp_pos)
+    if skip_padded_tokens:
+        remote = remote & (weights != 0)
+    expected = jnp.where(fits, remote.sum(dtype=jnp.int32), 0)
+    recv = fused_moe_scatter(
+        received,
+        w1,
+        w2,
+        w1_scale,
+        w2_scale,
+        recv_weights,
+        recv_ids,
+        experts_start[0],
+        home_member.astype(jnp.int32),
+        row_dest.astype(jnp.int32),
+        jnp.asarray(dp_pos, jnp.int32)[None],
+        expected[None],
+        topk=topk,
+        activation=activation,
+        rhs_quant_dtype=rhs_quant_dtype,
+        skip_padded_tokens=skip_padded_tokens,
+        max_local_routes=max_local_routes,
+        num_recv_rows=num_tokens * topk,
+        axis=DP_AXIS,
+        num_members=dp_size,
+        collective_id=collective_id,
+    )
+    return home_sum_kernel(
+        recv,
+        topk_ids,
+        topk_weights,
+        member_index=member_index,
+        dp_size=dp_size,
+        skip_padded_tokens=skip_padded_tokens,
+        dtype=x.dtype,
+    )
 
 
 def ragged_a2a_moe_local(
@@ -456,6 +736,7 @@ def ragged_a2a_moe_local(
     skip_padded_tokens: bool = False,
     capacity_factor: float = 0.0,
     route_factor: float = 0.0,
+    direct_combine: bool = False,
 ) -> jax.Array:
     """Per-rank body (inside shard_map over the (dp, tp) mesh).
 
@@ -468,11 +749,63 @@ def ragged_a2a_moe_local(
     routes by ``route_factor`` when it is > 0); a step
     whose routing exceeds those sizes on any rank runs the full-size exchange
     instead. Both give the same result.
+
+    With ``direct_combine``, an exchange whose local MoE runs the local-routes
+    one-hot path with the fused expert kernel sends each expert output row
+    straight to its home rank from the kernel, as soon as the row is computed
+    (see ``_direct_combine``), instead of combining here and returning partials
+    with a second exchange. The sum differs from the returned-partials path only
+    in the order of a member's f32 accumulation of three or more routes of one
+    token (``_home_sum``).
     """
     num_tokens = x.shape[0]
     local_num_experts = w1.shape[0]
     slots = dp_size * num_tokens
     gathered_ids, read_routes, packed_routes = _gather_routing(topk_ids, topk_weights)
+    ep_rank = experts_start[0] // local_num_experts
+    member_index = functools.partial(
+        _member_index,
+        ep_rank=ep_rank,
+        dp_size=dp_size,
+        tp_size=tp_size,
+        local_num_experts=local_num_experts,
+    )
+
+    def direct(recv_rows, max_local_routes, collective_id):
+        """None when the exchange's local MoE does not take the fused kernel."""
+        if not direct_combine or not scatter_moe_supported(
+            jax.ShapeDtypeStruct((recv_rows, x.shape[1]), x.dtype),
+            w1,
+            w2,
+            w1_scale,
+            w2_scale,
+            num_routes=max_local_routes,
+            max_local_routes=max_local_routes,
+            activation=activation,
+            use_sparse_core=use_sparse_core,
+            onehot_moe_permute_threshold=onehot_moe_permute_threshold,
+            rhs_quant_dtype=rhs_quant_dtype,
+        ):
+            return None
+        return functools.partial(
+            _direct_combine,
+            x=x,
+            w1=w1,
+            w2=w2,
+            w1_scale=w1_scale,
+            w2_scale=w2_scale,
+            topk_ids=topk_ids,
+            topk_weights=topk_weights,
+            experts_start=experts_start,
+            member_index=member_index,
+            dp_size=dp_size,
+            topk=topk,
+            activation=activation,
+            rhs_quant_dtype=rhs_quant_dtype,
+            skip_padded_tokens=skip_padded_tokens,
+            max_local_routes=max_local_routes,
+            collective_id=collective_id,
+        )
 
     def moe(max_local_routes):
         def run(received, recv_weights, recv_ids):
@@ -510,6 +843,7 @@ def ragged_a2a_moe_local(
             tp_size=tp_size,
             dp_size=dp_size,
             moe=moe(slots * topk),
+            direct=direct(slots, slots * topk, 1),
         )
 
     rows, routes = exchange_capacity(
@@ -550,6 +884,7 @@ def ragged_a2a_moe_local(
         dp_size=dp_size,
         rows=rows,
         moe=moe(routes),
+        direct=direct(rows, routes, 2),
     )
     return jax.lax.cond(overflow, full, lambda: out)
 
@@ -573,6 +908,7 @@ def ragged_a2a_moe(
     skip_padded_tokens: bool = False,
     capacity_factor: float = 0.0,
     route_factor: float = 0.0,
+    direct_combine: bool = False,
 ) -> jax.Array:
     """Global-view entry: every operand is the ranks' local arrays stacked on
     two leading axes [dp, tp, ...], and so is the result [dp, tp, S, H]."""
@@ -589,6 +925,7 @@ def ragged_a2a_moe(
         skip_padded_tokens=skip_padded_tokens,
         capacity_factor=capacity_factor,
         route_factor=route_factor,
+        direct_combine=direct_combine,
     )
 
     def body(*args):
