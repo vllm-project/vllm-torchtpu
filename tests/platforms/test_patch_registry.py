@@ -139,6 +139,18 @@ def test_nonmatching_model_does_not_consume_patch(registry):
     callbacks.model.assert_called_with(model_config=config)
 
 
+def test_od_config_reaches_only_diffusion_patches(registry):
+    reg, callbacks = registry
+    callbacks.diffusion = Mock(return_value=None)
+    callbacks.shared = Mock(return_value=None)
+    _patch(reg, callbacks, "diffusion", ("diffusion_model_load",), od_config=True)
+    _patch(reg, callbacks, "shared", ("diffusion_model_load",))
+    od_config = SimpleNamespace(model_class_name="WanPipeline")
+    reg.apply("diffusion_model_load", od_config=od_config)
+    callbacks.diffusion.assert_called_once_with(od_config=od_config)
+    callbacks.shared.assert_called_once_with()
+
+
 def test_refreshes_late_bindings_without_reinstalling(registry):
     reg, callbacks = registry
     callbacks.install = Mock()
@@ -209,6 +221,21 @@ def test_invalid_stage_is_rejected(registry):
         reg.apply("worker")
 
 
+def test_has_entered_reports_applied_stages(registry):
+    reg, callbacks = registry
+    callbacks.flaky = Mock(side_effect=[RuntimeError("boom"), None])
+    _patch(reg, callbacks, "flaky", ("diffusion_worker",))
+    with pytest.raises(RuntimeError, match="boom"):
+        reg.apply("diffusion_worker")
+    assert reg.has_entered("diffusion_worker") is False
+    reg.apply("diffusion_worker")
+    with pytest.raises(ValueError, match="Unknown TPU patch stage"):
+        reg.apply("worker")
+    assert reg.has_entered("diffusion_worker") is True
+    assert reg.has_entered("diffusion_model_load") is False
+    assert reg.has_entered("worker") is False
+
+
 def test_manifest_preserves_lifecycle_dependencies():
     reg = _load_registry()
     targets = [p.target for p in reg.PATCHES]
@@ -221,6 +248,9 @@ def test_manifest_preserves_lifecycle_dependencies():
             "engine_core",
             "worker_init",
             "model_load",
+            "omni_platform",
+            "diffusion_worker",
+            "diffusion_model_load",
         )
     }
     assert stages["import"] == ["_patch_jax_pallas_fori_lowering"]
@@ -245,6 +275,10 @@ def test_manifest_preserves_lifecycle_dependencies():
         "maybe_patch_qwen3_next",
         "maybe_patch_qwen2",
         "maybe_patch_qwen3_5_attn_moe_overlap",
+    ]
+    assert "_configure_torchtpu_eager_mode" in stages["diffusion_worker"]
+    assert [p.target for p in reg.PATCHES if p.od_config] == [
+        p.target for p in reg.PATCHES if "diffusion_model_load" in p.stages
     ]
     assert "patch_moe_expert_write_staging" in stages["worker_init"]
 
