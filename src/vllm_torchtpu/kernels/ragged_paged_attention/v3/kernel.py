@@ -1367,7 +1367,7 @@ def validate_block_sizes(
     page_size: int,
     prefix: str = "block_sizes",
 ) -> None:
-    """Validate that RPA block sizes satisfy hardware divisibility constraints."""
+    """Validate RPA block sizes satisfy kernel indexing divisibility constraints."""
     if block_sizes is None:
         return
     if isinstance(block_sizes, dict):
@@ -1959,14 +1959,13 @@ def ragged_paged_attention(
                 pages_per_seq,
                 case=case,
             )
-        resolved = {
+        # User overrides are statically validated upfront in static_validate_inputs.
+        return {
             "bq_sz": block_sizes[0],
             "bkv_sz": block_sizes[1],
             "bq_csz": block_sizes[2],
             "bkv_csz": block_sizes[3],
         }
-        validate_block_sizes(resolved, page_size, case.name.lower())
-        return resolved
 
     # Decode-only
     q, kv_cache = run_rpa_kernel(

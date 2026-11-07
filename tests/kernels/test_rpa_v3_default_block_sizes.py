@@ -146,3 +146,40 @@ def test_get_default_block_sizes_power_of_two_parity(tpu_version):
             )
             assert res["bkv_sz"] == 1024
             assert res["bkv_csz"] == 512
+
+
+@pytest.mark.parametrize("page_size", [16, 32, 64, 128, 256, 392, 400, 448, 512, 784])
+@pytest.mark.parametrize("kv_block_cap", [256, 512, 1024, 1176, 1200, 1500, 2048])
+def test_speculative_decoding_draft_cap_divisibility(page_size, kv_block_cap):
+    """Verify speculative decoding draft capping guarantees bkv % bkv_csz == 0."""
+    with patch(
+        "vllm_torchtpu.kernels.ragged_paged_attention.v3.kernel.get_tpu_version",
+        return_value=6,
+    ):
+        bs = get_default_block_sizes(
+            q_dtype=jnp.bfloat16,
+            kv_dtype=jnp.bfloat16,
+            actual_num_q_heads=8,
+            actual_num_kv_heads=2,
+            head_dim=256,
+            page_size=page_size,
+            max_num_tokens=16384,
+            max_num_seqs=32,
+            pages_per_seq=500,
+            case=RpaCase.MIXED,
+        )
+        cap_tokens = max(page_size, (kv_block_cap // page_size) * page_size)
+        bkv_csz = bs["bkv_csz"]
+        if cap_tokens < bkv_csz:
+            bkv_csz = cap_tokens
+            bkv = cap_tokens
+        else:
+            bkv = min(bs["bkv_sz"], (cap_tokens // bkv_csz) * bkv_csz)
+
+        # Validate capped block sizes pass static validation without raising ValueError
+        validate_block_sizes(
+            (bs["bq_sz"], bkv, bs["bq_csz"], bkv_csz), page_size=page_size
+        )
+        assert bkv % bkv_csz == 0
+        assert bkv % page_size == 0
+        assert bkv_csz % page_size == 0
