@@ -262,7 +262,32 @@ def merge(out_a, lse_a, out_b, lse_b):
 
 # ---------------------------------------------------------------------------
 # Torch entry points (one jax_op per static configuration)
+#
+# Build them eagerly with `build_ops` (from module setup): `pallas.jax_op`
+# inspects the function signature, which Dynamo cannot trace inside a
+# compiled forward.
 # ---------------------------------------------------------------------------
+
+
+def build_ops(
+    *,
+    dcp: int,
+    kv_heads: int,
+    max_query_len: int,
+    sliding_window: int,
+    sm_scale: float,
+    causal: bool,
+    k_scale: float | None,
+    v_scale: float | None,
+) -> dict[str, Any]:
+    """The write, cached-attention and block ops of one draft layer."""
+    return dict(
+        write=_write_op(dcp, k_scale, v_scale),
+        attend=_attend_op(
+            kv_heads, max_query_len, sliding_window, sm_scale, dcp, k_scale, v_scale
+        ),
+        block=_block_op(max_query_len, sm_scale, causal),
+    )
 
 
 @functools.cache
@@ -407,8 +432,7 @@ def write_with_dcp(
     dcp_rank: torch.Tensor,
     dcp: int,
     kv_head_replicas: int,
-    k_scale: float | None,
-    v_scale: float | None,
+    ops: dict[str, Any],
 ) -> None:
     """Write the drafter's context K/V (own KV head per rank) into the
     DCP-sharded cache: each rank keeps the tokens of its blocks."""
@@ -420,7 +444,7 @@ def write_with_dcp(
         num_tokens, _, head_dim = gathered.shape
         per_rank = gathered.view(num_tokens, dcp, 2, head_dim)[:, ::kv_head_replicas]
         key, value = per_rank[:, :, 0].contiguous(), per_rank[:, :, 1].contiguous()
-    new_cache = _write_op(dcp, k_scale, v_scale)(
+    new_cache = ops["write"](
         kv_cache,
         key,
         value,
@@ -442,12 +466,9 @@ def forward_with_dcp(
     dcp_rank: torch.Tensor,
     dcp: int,
     kv_head_replicas: int,
-    max_query_len: int,
-    sliding_window: int,
-    sm_scale: float,
-    causal: bool,
     k_scale: float | None,
     v_scale: float | None,
+    ops: dict[str, Any],
 ) -> torch.Tensor:
     """The drafter's attention of its query block (``query [T, H, D]``, own
     heads; ``key``/``value [T, 1, D]``, own KV head) over the window of a
@@ -457,9 +478,7 @@ def forward_with_dcp(
 
     group = get_dcp_group()
     q_all, k_all, _ = gather_group(query, key, value, group, dcp, kv_head_replicas)
-    ctx_out, ctx_lse = _attend_op(
-        k_all.shape[1], max_query_len, sliding_window, sm_scale, dcp, k_scale, v_scale
-    )(
+    ctx_out, ctx_lse = ops["attend"](
         q_all,
         kv_cache,
         attn_metadata.seq_lens,
@@ -472,7 +491,7 @@ def forward_with_dcp(
     if kv_cache.dtype != key.dtype and k_scale is not None:
         key = (key.float() / k_scale).to(kv_cache.dtype).float() * k_scale
         value = (value.float() / v_scale).to(kv_cache.dtype).float() * v_scale
-    return _block_op(max_query_len, sm_scale, causal)(
+    return ops["block"](
         query,
         key.to(query.dtype),
         value.to(query.dtype),

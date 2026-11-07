@@ -1187,22 +1187,30 @@ class PallasAttentionBackendImpl(AttentionImpl):
             torch.tensor([dcp_rank], dtype=torch.int32, device=layer._k_scale.device),
             persistent=False,
         )
+        quantized = bool(self.kv_cache_quantized_dtype)
+        k_scale = layer._k_scale_float if quantized else None
+        v_scale = layer._v_scale_float if quantized else None
         self.sharded_draft_dcp = dict(
-            dcp=dcp, kv_head_replicas=kv_head_replicas, max_query_len=max_query_len
+            dcp=dcp,
+            kv_head_replicas=kv_head_replicas,
+            k_scale=k_scale,
+            v_scale=v_scale,
+            # Built here, outside any compiled forward (see `build_ops`).
+            ops=_cp_draft_attention.build_ops(
+                dcp=dcp,
+                kv_heads=max(1, dcp // kv_head_replicas),
+                max_query_len=max_query_len,
+                sliding_window=self.sliding_window,
+                sm_scale=self.scale,
+                causal=self.use_causal_mask,
+                k_scale=k_scale,
+                v_scale=v_scale,
+            ),
         )
 
     def _sharded_draft_dcp_args(self, layer: AttentionLayer) -> dict[str, Any]:
-        assert self.sharded_draft_dcp is not None and self.sliding_window is not None
-        quantized = bool(self.kv_cache_quantized_dtype)
-        return dict(
-            dcp_rank=layer.draft_dcp_rank,
-            sliding_window=self.sliding_window,
-            sm_scale=self.scale,
-            causal=self.use_causal_mask,
-            k_scale=layer._k_scale_float if quantized else None,
-            v_scale=layer._v_scale_float if quantized else None,
-            **self.sharded_draft_dcp,
-        )
+        assert self.sharded_draft_dcp is not None
+        return dict(dcp_rank=layer.draft_dcp_rank, **self.sharded_draft_dcp)
 
     def write_sharded_draft_kv(
         self,
@@ -1222,8 +1230,7 @@ class PallasAttentionBackendImpl(AttentionImpl):
             dcp_rank=args["dcp_rank"],
             dcp=args["dcp"],
             kv_head_replicas=args["kv_head_replicas"],
-            k_scale=args["k_scale"],
-            v_scale=args["v_scale"],
+            ops=args["ops"],
         )
 
     def _run_dcp_forward(
