@@ -33,12 +33,13 @@ them into the runtime FP8 layout consumed by the Pallas matmul bridge in
 `vllm_torchtpu/layers/adapter/linear_common.py`. Activations are quantized
 dynamically inside the bridge, except that TPU_FP8_LINEAR_W8A16_MAX_ROWS (off
 by default) keeps bf16 activations (W8A16) for small token buckets on the
-per-channel path with FP8 weights, and VLLM_TPU_FP8_FAST_BF16_ACT_QUANT (off by
-default) keeps the per-channel activation quantization division in bfloat16
-instead of promoting [M, K] activations to float32. By default the bridge
-dispatches to a pure-JAX `dot_general`-based per-channel FP8 matmul
-(`xla_quantized_matmul`); setting ENABLE_QUANTIZED_MATMUL_KERNEL=1 together
-with REQUANTIZE_BLOCK_SIZE selects the blockwise Pallas kernel path instead.
+per-channel path with FP8 weights, and TPU_ACT_QUANT_SCALE_DTYPE (defaulting to
+"bfloat16" for FP8 weights) keeps the per-channel activation quantization
+division in bfloat16 instead of promoting [M, K] activations to float32. By
+default the bridge dispatches to a pure-JAX `dot_general`-based per-channel FP8
+matmul (`xla_quantized_matmul`); setting ENABLE_QUANTIZED_MATMUL_KERNEL=1
+together with REQUANTIZE_BLOCK_SIZE selects the blockwise Pallas kernel path
+instead.
 """
 
 from __future__ import annotations
@@ -1346,9 +1347,9 @@ class VllmFp8LinearMethodTPU(Fp8LinearMethod):
     """
     TPU FP8 linear method that keeps weights in FP8 at runtime and quantizes
     activations dynamically inside a Pallas matmul bridge, unless
-    TPU_FP8_LINEAR_W8A16_MAX_ROWS is opted in for small token buckets (and
-    with optional bfloat16 activation division via
-    VLLM_TPU_FP8_FAST_BF16_ACT_QUANT).
+    TPU_FP8_LINEAR_W8A16_MAX_ROWS is opted in for small token buckets (with
+    activation quantization scale dtype controlled by
+    TPU_ACT_QUANT_SCALE_DTYPE, defaulting to "bfloat16").
 
     Reuses vLLM's Fp8LinearMethod.create_weights() for correct FP8 weight and
     scale parameter allocation (needed by the weight loader). After loading,
@@ -1389,17 +1390,11 @@ class VllmFp8LinearMethodTPU(Fp8LinearMethod):
         self.input_dtype = torch.get_default_dtype()
         self.out_dtype = torch.get_default_dtype()
         vllm_fp8.init_fp8_linear_kernel = lambda *args, **kwargs: None
+        if linear_config is None:
+            linear_config = VllmQuantLinearConfig()
         self.linear_config = linear_config
-        self.w8a16_max_rows = (
-            linear_config.w8a16_max_rows
-            if linear_config is not None
-            else envs.TPU_FP8_LINEAR_W8A16_MAX_ROWS
-        )
-        self.bf16_act_quant = (
-            linear_config.bf16_act_quant
-            if linear_config is not None
-            else envs.VLLM_TPU_FP8_FAST_BF16_ACT_QUANT
-        )
+        self.w8a16_max_rows = linear_config.w8a16_max_rows
+        self.act_quant_scale_dtype = linear_config.act_quant_scale_dtype or "bfloat16"
 
         if quant_config.is_checkpoint_fp8_serialized:
             self._linear_quant_config = _get_linear_quant_config(self.linear_config)
@@ -1693,7 +1688,7 @@ class VllmFp8LinearMethodTPU(Fp8LinearMethod):
                 weight,
                 layer.weight_scale,
                 w8a16_max_rows=self.w8a16_max_rows,
-                bf16_act_quant=self.bf16_act_quant,
+                act_quant_scale_dtype=self.act_quant_scale_dtype,
             )
         if bias is not None:
             out = out + bias
@@ -1738,7 +1733,9 @@ def resolve_online_fp8(
         activation_scheme="dynamic",
         weight_block_size=None,
     )
-    method = VllmFp8LinearMethodTPU(online_config, prefix=prefix)
+    method = VllmFp8LinearMethodTPU(
+        online_config, config.get_linear_config(layer), prefix=prefix
+    )
     method.online_fp8 = True
     method.online_fp8_policy = policy
     policy.selected[prefix] = aliases

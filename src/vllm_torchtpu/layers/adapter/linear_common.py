@@ -71,7 +71,7 @@ def _quantized_matmul_jax(
     w_q: jax.Array,
     w_s: jax.Array,
     w8a16_max_rows: int = 0,
-    bf16_act_quant: bool = False,
+    act_quant_scale_dtype: str | None = None,
 ) -> jax.Array:
     """FP8 dense matmul on the canonical (k, n) weight layout.
 
@@ -131,7 +131,7 @@ def _quantized_matmul_jax(
         w_q,
         w_s,
         quantize_activation=not use_w8a16,
-        bf16_act_quant=bf16_act_quant,
+        act_quant_scale_dtype=act_quant_scale_dtype,
     )
 
 
@@ -155,9 +155,9 @@ def _get_quantized_matmul_op() -> Callable:
             w_q: torch.Tensor,
             w_s: torch.Tensor,
             w8a16_max_rows: int = 0,
-            bf16_act_quant: bool = False,
+            act_quant_scale_dtype: str | None = None,
         ):
-            del w_s, w8a16_max_rows, bf16_act_quant
+            del w_s, w8a16_max_rows, act_quant_scale_dtype
             return torch.empty(
                 x.shape[0], w_q.shape[-1], dtype=x.dtype, device=x.device
             )
@@ -172,7 +172,7 @@ def quantized_matmul(
     w_q: torch.Tensor,
     w_s: torch.Tensor,
     w8a16_max_rows: int = 0,
-    bf16_act_quant: bool = False,
+    act_quant_scale_dtype: str | None = None,
 ) -> torch.Tensor:
     """Torch entry point for the runtime FP8 dense-linear matmul.
 
@@ -190,7 +190,9 @@ def quantized_matmul(
 
     orig_out_shape = (*x.shape[:-1], w_q.shape[-1])
     x_2d = x.reshape(-1, x.shape[-1])
-    out_2d = _get_quantized_matmul_op()(x_2d, w_q, w_s, w8a16_max_rows, bf16_act_quant)
+    out_2d = _get_quantized_matmul_op()(
+        x_2d, w_q, w_s, w8a16_max_rows, act_quant_scale_dtype
+    )
     return out_2d.reshape(orig_out_shape)
 
 
