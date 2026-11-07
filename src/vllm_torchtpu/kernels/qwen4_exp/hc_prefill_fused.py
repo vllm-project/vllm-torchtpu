@@ -31,6 +31,7 @@ the injection logits differs from the XLA matmul (ulp level, before the bf16
 rounding).
 """
 
+import contextlib
 import functools
 
 import jax
@@ -49,7 +50,13 @@ def prefill_token_tile_ok(tokens: int, token_tile: int, partial: bool = False) -
     return tokens >= token_tile and tokens % token_tile == 0
 
 
-def _kernel(*refs, branches, hidden, eps, lowrank, prologue):
+def _kernel(*refs, branches, hidden, eps, lowrank, prologue, scopes=0):
+    def scope(name):
+        # Region-trace scopes (with --xla_enable_custom_call_region_trace=true
+        # they appear on the "XLA TraceMe" line). Off by default; a scoped
+        # build is for timing splits only, never a numerics reference.
+        return jax.named_scope(name) if scopes else contextlib.nullcontext()
+
     refs = list(refs)
     if prologue:
         prev_ref, block_ref, prev_inj_ref = refs[:3]
@@ -125,58 +132,62 @@ def _kernel(*refs, branches, hidden, eps, lowrank, prologue):
             ).astype(jnp.bfloat16)
 
     tile = norm_vm.shape[0]
-    if tile >= 2 * _ROW_CHUNK and tile % _ROW_CHUNK == 0:
-        # Bound the live FP32 row working set like hc_full's 32-row loop.
-        def chunk(index, carry):
-            normalize_rows(pl.multiple_of(index * _ROW_CHUNK, _ROW_CHUNK), _ROW_CHUNK)
-            return carry
+    with scope("hcp_norm"):
+        if tile >= 2 * _ROW_CHUNK and tile % _ROW_CHUNK == 0:
+            # Bound the live FP32 row working set like hc_full's 32-row loop.
+            def chunk(index, carry):
+                normalize_rows(pl.multiple_of(index * _ROW_CHUNK, _ROW_CHUNK), _ROW_CHUNK)
+                return carry
 
-        jax.lax.fori_loop(0, tile // _ROW_CHUNK, chunk, jnp.int32(0))
-    else:
-        normalize_rows(0, tile)
+            jax.lax.fori_loop(0, tile // _ROW_CHUNK, chunk, jnp.int32(0))
+        else:
+            normalize_rows(0, tile)
 
     nt = (((1,), (1,)), ((), ()))
     wait_first(down_copy)
-    down = jax.lax.dot_general(
-        norm_vm[...], down_vm[...], dimension_numbers=nt, preferred_element_type=jnp.float32
-    ).astype(jnp.bfloat16)
+    with scope("hcp_down"):
+        down = jax.lax.dot_general(
+            norm_vm[...], down_vm[...], dimension_numbers=nt, preferred_element_type=jnp.float32
+        ).astype(jnp.bfloat16)
 
     # Injection gate from the appended inject rows: one exact masked lane
     # reduction per branch (a single non-zero term), as hc_decode extracts a
     # lane column without an unaligned lane slice.
-    down32 = down.astype(jnp.float32)
-    lanes = jax.lax.broadcasted_iota(jnp.int32, down32.shape, 1)
-    inj_shape = (tile, branches)
-    inj_lanes = jax.lax.broadcasted_iota(jnp.int32, inj_shape, 1)
-    logits_inj = jnp.zeros(inj_shape, jnp.float32)
-    for j in range(branches):
-        column = jnp.sum(
-            jnp.where(lanes == lowrank + j, down32, 0.0), axis=1, keepdims=True
-        )
-        logits_inj = jnp.where(inj_lanes == j, column, logits_inj)
-    inj_ref[...] = 2.0 * jax.nn.sigmoid(logits_inj / branches)
-
-    gate = (down[:, :lowrank] / branches).astype(jnp.bfloat16)
-    gate = jax.nn.silu(gate.astype(jnp.float32)).astype(jnp.bfloat16)
-    mixed = None
-    for b in range(branches):
-        start = b * hidden
-        wait_first(up_copies[b])
-        logits = (
-            jax.lax.dot_general(
-                gate,
-                up_vm[pl.ds(start, hidden), :],
-                dimension_numbers=nt,
-                preferred_element_type=jnp.float32,
+    with scope("hcp_inj"):
+        down32 = down.astype(jnp.float32)
+        lanes = jax.lax.broadcasted_iota(jnp.int32, down32.shape, 1)
+        inj_shape = (tile, branches)
+        inj_lanes = jax.lax.broadcasted_iota(jnp.int32, inj_shape, 1)
+        logits_inj = jnp.zeros(inj_shape, jnp.float32)
+        for j in range(branches):
+            column = jnp.sum(
+                jnp.where(lanes == lowrank + j, down32, 0.0), axis=1, keepdims=True
             )
-            .astype(jnp.bfloat16)
-            .astype(jnp.float32)
-        )
-        weighted = jax.nn.sigmoid(logits) * norm_vm[:, pl.ds(start, hidden)].astype(
-            jnp.float32
-        )
-        mixed = weighted if mixed is None else mixed + weighted
-    mixed_ref[...] = (mixed / branches).astype(jnp.bfloat16)
+            logits_inj = jnp.where(inj_lanes == j, column, logits_inj)
+        inj_ref[...] = 2.0 * jax.nn.sigmoid(logits_inj / branches)
+
+    with scope("hcp_up"):
+        gate = (down[:, :lowrank] / branches).astype(jnp.bfloat16)
+        gate = jax.nn.silu(gate.astype(jnp.float32)).astype(jnp.bfloat16)
+        mixed = None
+        for b in range(branches):
+            start = b * hidden
+            wait_first(up_copies[b])
+            logits = (
+                jax.lax.dot_general(
+                    gate,
+                    up_vm[pl.ds(start, hidden), :],
+                    dimension_numbers=nt,
+                    preferred_element_type=jnp.float32,
+                )
+                .astype(jnp.bfloat16)
+                .astype(jnp.float32)
+            )
+            weighted = jax.nn.sigmoid(logits) * norm_vm[:, pl.ds(start, hidden)].astype(
+                jnp.float32
+            )
+            mixed = weighted if mixed is None else mixed + weighted
+        mixed_ref[...] = (mixed / branches).astype(jnp.bfloat16)
 
 
 def extend_down(down: jax.Array, inject: jax.Array) -> jax.Array:
@@ -203,6 +214,7 @@ def hc_prefill_mix(
     prev_injection=None,
     interpret=False,
     partial=False,
+    scopes=0,
 ):
     """Fused prefill HC mix with the injection gate, optionally after the
     previous HC's combine. ``partial`` admits a partial last tile (any multiple
@@ -228,12 +240,13 @@ def hc_prefill_mix(
         token_tile=token_tile,
         interpret=interpret,
         partial=partial,
+        scopes=scopes,
     )
 
 
 @functools.partial(
     jax.jit,
-    static_argnames=("branches", "hidden", "eps", "token_tile", "interpret", "partial"),
+    static_argnames=("branches", "hidden", "eps", "token_tile", "interpret", "partial", "scopes"),
 )
 def _hc_prefill_mix(
     x,
@@ -250,6 +263,7 @@ def _hc_prefill_mix(
     token_tile,
     interpret,
     partial=False,
+    scopes=0,
 ):
     tokens, width = x.shape
     lowrank = down.shape[0]
@@ -307,6 +321,7 @@ def _hc_prefill_mix(
             eps=eps,
             lowrank=lowrank,
             prologue=prologue,
+            scopes=scopes,
         ),
         grid=(pl.cdiv(tokens, token_tile),),
         in_specs=in_specs,
