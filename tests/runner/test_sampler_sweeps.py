@@ -16,6 +16,7 @@ structured_decoding's num_reqs sweep): shape order with and without
 TPU_PARALLEL_PRECOMPILE, and why rotating them is safe."""
 
 import contextlib
+import functools
 import types
 from types import SimpleNamespace
 
@@ -128,7 +129,7 @@ def test_rotated_sweeps_hold_no_collective():
     """Rotation lets ranks reach each shape at different times, so a
     collective in any of these graphs would deadlock them. Trace the real
     functions the sweeps warm, with the variants they warm (greedy, sampling
-    with and without top-k/top-p, and top-k candidate sampling), using the
+    with and without top-k/top-p, top-p only, and top-k candidate sampling), using the
     check whose positive controls are in test_rejection_sampler_sweep.py."""
     vocab, n = 2 * CANDIDATE_BLOCK, 8
     logits = torch.randn(n, vocab)
@@ -137,11 +138,12 @@ def test_rotated_sweeps_hold_no_collective():
         runner, lg, t
     )
     graphs = []
-    for all_greedy, topk_candidates, apply_topk_topp in [
-        (False, 0, True),
-        (False, 0, False),
-        (True, 0, True),
-        (False, 2, True),
+    for all_greedy, topk_candidates, apply_topk_topp, apply_top_k in [
+        (False, 0, True, True),
+        (False, 0, False, True),
+        (False, 0, True, False),
+        (True, 0, True, True),
+        (False, 2, True, True),
     ]:
         graphs += _trace(
             TPUModelRunner.sample_from_logits,
@@ -154,6 +156,7 @@ def test_rotated_sweeps_hold_no_collective():
             all_greedy=all_greedy,
             topk_candidates=topk_candidates,
             apply_topk_topp=apply_topk_topp,
+            apply_top_k=apply_top_k,
         )
     graphs += _trace(
         TPUModelRunner.gather_logprobs,
@@ -177,3 +180,52 @@ def test_rotated_sweeps_hold_no_collective():
         torch.arange(32, dtype=torch.int32),
     )
     assert [op for gm in graphs for op in _ops_outside_aten(gm)] == []
+
+
+@pytest.mark.parametrize("top_k_set", [False, True])
+def test_sample_from_logits_skips_top_k_only_when_no_request_sets_it(top_k_set):
+    """The bonus sampler's top-p-only graph matches the full one when no
+    request sets top-k, and the runner selects it only then."""
+    n, vocab = 64, 2 * CANDIDATE_BLOCK * 16
+    gen = torch.Generator().manual_seed(0)
+    logits = torch.randn(n, vocab, generator=gen) * 4
+    u = torch.rand(n, vocab, generator=gen)
+    top_k = torch.zeros(n, 1, dtype=torch.int32)
+    if top_k_set:
+        top_k[::4] = 2
+    top_p = torch.full((n, 1), 0.95)
+    temperatures = torch.ones(n, 1)
+    runner = SimpleNamespace(
+        speculative_config=SimpleNamespace(num_speculative_tokens=7),
+        input_batch=SimpleNamespace(no_top_k=not top_k_set, no_top_p=False),
+    )
+    runner._apply_temperature = lambda lg, t: TPUModelRunner._apply_temperature(
+        runner, lg, t
+    )
+    runner._sampler_applies_topk_topp = functools.partial(
+        TPUModelRunner._sampler_applies_topk_topp, runner
+    )
+    apply_top_k = TPUModelRunner._sampler_applies_top_k(runner)
+    assert apply_top_k == top_k_set
+    sample = functools.partial(
+        TPUModelRunner.sample_from_logits,
+        runner,
+        logits,
+        temperatures,
+        u,
+        top_k,
+        top_p,
+    )
+    with torch.compiler.set_stance("force_eager"):
+        expected = sample()
+        assert torch.equal(sample(apply_top_k=apply_top_k), expected)
+        if top_k_set:
+            # Positive control: skipping top-k here would change tokens.
+            assert not torch.equal(sample(apply_top_k=False), expected)
+    # Without speculative decoding, or with top-k/top-p skipped altogether,
+    # the existing graphs are kept.
+    runner.speculative_config = None
+    assert TPUModelRunner._sampler_applies_top_k(runner)
+    runner.speculative_config = SimpleNamespace(num_speculative_tokens=7)
+    runner.input_batch = SimpleNamespace(no_top_k=True, no_top_p=True)
+    assert TPUModelRunner._sampler_applies_top_k(runner)
