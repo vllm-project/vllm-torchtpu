@@ -163,6 +163,7 @@ if TYPE_CHECKING:
     VLLM_TPU_QSA_PREFILL_UNION_LAZY_SHARE: bool = False
     VLLM_TPU_QSA_PREFILL_UNION_GATHERED: str = ""
     VLLM_TPU_QSA_PREFILL_UNION_GATHER_CHUNKS: int = 4
+    VLLM_TPU_QSA_PREFILL_UNION_GATHER_GROWTH: float = 1.0
     VLLM_TPU_QSA_MAIN_KV_DCP: int = 0
     VLLM_TPU_QSA_MTP_KV_DCP: bool = False
     VLLM_TPU_QSA_COMPRESSED_DCP: bool = False
@@ -873,6 +874,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # GATHERED ("", "reference", "sparsecore"; with LISTED): the walk-free kernel on chunked gathered tiles.
     "VLLM_TPU_QSA_PREFILL_UNION_GATHERED": env_str("VLLM_TPU_QSA_PREFILL_UNION_GATHERED", ""),
     "VLLM_TPU_QSA_PREFILL_UNION_GATHER_CHUNKS": env_int("VLLM_TPU_QSA_PREFILL_UNION_GATHER_CHUNKS", 4),
+    # GATHER_GROWTH (>= 1; 1 = even chunks): chunk k of the gathered walk holds about growth**k as many query groups
+    # as chunk 0, so the first gather (the one the TensorCore waits on) is small. Same outputs (bitwise).
+    "VLLM_TPU_QSA_PREFILL_UNION_GATHER_GROWTH": env_float("VLLM_TPU_QSA_PREFILL_UNION_GATHER_GROWTH", 1.0),
     # Main KV of the target QSA layers split over TP rank pairs that share a
     # KV head (2; 0/1 = off): each rank stores and attends half the tokens,
     # the pair's partial attention is LSE-combined.

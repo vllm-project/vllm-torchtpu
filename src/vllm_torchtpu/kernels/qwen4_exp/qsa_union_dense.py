@@ -1828,7 +1828,8 @@ def _served_prefill(query, gate, blocks, lengths, table, cache, starts, *, kv_he
 def union_walk_prefill(query, gate, blocks, lengths, table, cache, starts, *, kv_heads, ratio,
                        k_scale=1.0, v_scale=1.0, group=128, kv_tile=1024, union_cap, min_context,
                        lean, walk_runs=0, union_alpha=0.0, share_bits=False, qk16=False, listed=None,
-                       run_tables=False, max_run=8, lazy_share=False, gathered=None, gather_chunks=4):
+                       run_tables=False, max_run=8, lazy_share=False, gathered=None, gather_chunks=4,
+                       gather_growth=1.0):
     """D2 union-walk attention for a packed prefill step; ``(gated bf16 output, cache)``.
 
     Same contract as ``block_sparse_gqa_attention`` without ``return_lse``.
@@ -1910,8 +1911,9 @@ def union_walk_prefill(query, gate, blocks, lengths, table, cache, starts, *, kv
         raise ValueError("run_tables needs listed='reference' or 'sparsecore' (the builders' source)")
     if gathered not in (None, "reference", "sparsecore"):
         raise ValueError("gathered: None, 'reference' (XLA gather) or 'sparsecore' (union_sc_gather)")
-    if gathered and (listed is None or run_tables or int(gather_chunks) < 1):
-        raise ValueError("gathered needs listed='reference' or 'sparsecore' (the list), no run_tables, chunks >= 1")
+    if gathered and (listed is None or run_tables or int(gather_chunks) < 1 or not float(gather_growth) >= 1.0):
+        raise ValueError("gathered needs listed='reference' or 'sparsecore' (the list), no run_tables, chunks >= 1, "
+                         "growth >= 1")
     groups_cap = table.shape[1] * page_size // ratio
     served_options = dict(kv_heads=kv_heads, ratio=ratio, k_scale=k_scale, v_scale=v_scale)
     # Trace-time record for the host-side D2 engagement count (VLLM_TPU_QSA_PREFILL_UNION_COUNT): the walk is
@@ -1995,8 +1997,8 @@ def union_walk_prefill(query, gate, blocks, lengths, table, cache, starts, *, kv
             if gathered:
                 return _gathered_chunks(
                     aligned_query, bits, ubits, usize, vlengths, cache, page_rows, rows, ids, gathered=gathered,
-                    chunks=int(gather_chunks), group=group, union_cap=union_cap, kv_tile=kv_tile, ratio=ratio,
-                    k_scale=k_scale, v_scale=v_scale, lean=lean, qk16=qk16,
+                    chunks=int(gather_chunks), growth=float(gather_growth), group=group, union_cap=union_cap,
+                    kv_tile=kv_tile, ratio=ratio, k_scale=k_scale, v_scale=v_scale, lean=lean, qk16=qk16,
                 )
             if run_tables:
                 # Step 4: run tables + precomputed lines (XLA builders, or the SparseCore kernels).
@@ -2094,17 +2096,36 @@ _WALK_TRACED = {}  # step rows -> min_context, recorded when union_walk_prefill 
 _ENGAGEMENT = {"steps": 0, "eligible": 0}
 
 
+def gather_chunk_bounds(ngroups, chunks, growth=1.0):
+    """[(g0, g1)]: the gathered walk's chunks of whole query groups, in order, covering [0, ngroups) once.
+
+    ``growth`` 1 (default): ``ceil(ngroups / chunks)`` groups per chunk (the last ones may be shorter or absent).
+    ``growth`` > 1: ``min(chunks, ngroups)`` chunks, chunk k about ``growth**k`` times chunk 0 (at least 1 group each),
+    so the first gather, which the TensorCore waits for, is small, and each later gather hides under the walk of
+    the chunk before it while ``growth`` stays below the walk-to-gather time ratio per group (i1x xprof at TP1:
+    1.085 ms walk against about 0.6 ms gather per K = 8 chunk, so about 1.8).
+    """
+    if growth == 1.0:
+        per = -(-ngroups // chunks)
+        return [(k * per, min(ngroups, (k + 1) * per)) for k in range(chunks) if k * per < ngroups]
+    n = min(chunks, ngroups)
+    weights = [growth**k for k in range(n)]
+    total = sum(weights)
+    cuts, acc = [0], 0.0
+    for k in range(n - 1):
+        acc += weights[k]
+        cuts.append(min(max(int(round(ngroups * acc / total)), cuts[-1] + 1), ngroups - (n - 1 - k)))
+    cuts.append(ngroups)
+    return list(zip(cuts[:-1], cuts[1:]))
+
+
 def _gathered_chunks(query, bits, ubits, usize, vlengths, cache, page_rows, rows, ids, *, gathered, chunks, group,
-                     union_cap, kv_tile, ratio, k_scale, v_scale, lean, qk16):
+                     union_cap, kv_tile, ratio, k_scale, v_scale, lean, qk16, growth=1.0):
     """``union_walk_prefill(gathered=...)``: per chunk of whole query groups, gather the chunk's union tiles from
     the list (``rows``/``ids``), then run the walk-free kernel on them; outputs concatenated in group order."""
     ngroups = ubits.shape[0]
-    per = -(-ngroups // chunks)
     outs = []
-    for k in range(chunks):
-        g0, g1 = k * per, min(ngroups, (k + 1) * per)
-        if g0 >= g1:
-            break
+    for g0, g1 in gather_chunk_bounds(ngroups, chunks, growth):
         sl, rs = slice(g0, g1), slice(g0 * group, g1 * group)
         if gathered == "sparsecore":
             from vllm_torchtpu.kernels.qwen4_exp.qsa_union_sc_gather import union_sc_gather

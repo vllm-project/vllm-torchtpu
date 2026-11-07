@@ -307,7 +307,7 @@ def test_flag_on_dispatch_takes_the_walk(kernels, monkeypatch):
     assert calls == [dict(kv_heads=2, ratio=RATIO, k_scale=1.0, v_scale=1.0, group=128, kv_tile=1024,
                           union_cap=CAP, min_context=1000, lean=True, listed=None, share_bits=False,
                           union_alpha=0.0, qk16=False, run_tables=False, lazy_share=False, gathered=None,
-                          gather_chunks=4)]
+                          gather_chunks=4, gather_growth=1.0)]
     jax.clear_caches()
     want = _walk(step, union_cap=CAP, min_context=1000, lean=True)
     np.testing.assert_array_equal(_bits(got), _bits(want))
@@ -742,8 +742,9 @@ def test_lazy_share_dispatch(kernels, monkeypatch):
 # --- the chunked gathered walk on the served path (gathered=...; SparseCore gather on TPU) --------------------------
 
 
-@pytest.mark.parametrize("layout,chunks", [(SPARE, 1), (SPARE, 4), (WORST, 3), (A64, 4)])
-def test_gathered_prefill_is_the_walk(kernels, layout, chunks):
+@pytest.mark.parametrize("layout,chunks,growth", [(SPARE, 1, 1.0), (SPARE, 4, 1.0), (WORST, 3, 1.0), (A64, 4, 1.0),
+                                                 (A64, 8, 1.5), (WORST, 8, 1.8)])
+def test_gathered_prefill_is_the_walk(kernels, monkeypatch, layout, chunks, growth):
     """gathered="reference": the walk-free kernel on gathered tiles, in chunks of whole query groups, is the G64 walk bit
     for bit on packed unaligned steps, and it is what runs (gathered kernels traced, no listed walk)."""
     rows, cached = layout
@@ -751,11 +752,39 @@ def test_gathered_prefill_is_the_walk(kernels, layout, chunks):
     step = _packed_step(91 + chunks + len(rows), rows, cached, tokens=tokens)
     walk = _walk(step, group=64)
     jax.clear_caches()
-    got = _walk(step, group=64, listed="reference", gathered="reference", gather_chunks=chunks)
+    got = _walk(step, group=64, listed="reference", gathered="reference", gather_chunks=chunks, gather_growth=growth)
     np.testing.assert_array_equal(_bits(got), _bits(walk))
     assert not np.array_equal(_bits(walk), _bits(_served(step)))  # the walk ran
-    names = _traced_names(step, group=64, listed="reference", gathered="reference", gather_chunks=chunks)
+    names = _traced_names(step, group=64, listed="reference", gathered="reference", gather_chunks=chunks,
+                          gather_growth=growth)
     assert any("_gathered" in n for n in names) and not any(n.endswith("_listed") for n in names), names
+    seen = []  # the schedule the chunked walk used (the walk's output alone cannot show it: bitwise either way)
+    original = ud.gather_chunk_bounds
+    monkeypatch.setattr(ud, "gather_chunk_bounds", lambda n, k, g=1.0: seen.append((k, g)) or original(n, k, g))
+    jax.clear_caches()
+    _walk(step, group=64, listed="reference", gathered="reference", gather_chunks=chunks, gather_growth=growth)
+    assert seen and set(seen) == {(chunks, growth)}, seen
+
+
+@pytest.mark.parametrize("ngroups,chunks,growth", [(100, 8, 1.0), (100, 8, 1.5), (100, 8, 1.8), (32, 8, 1.5),
+                                                   (5, 8, 1.5), (3, 8, 1.0), (100, 1, 1.5), (7, 3, 2.0)])
+def test_gather_chunk_bounds(ngroups, chunks, growth):
+    """The chunks cover [0, ngroups) once, in order, never empty; growth 1 is ceil(n / chunks) per chunk (the
+    pre-growth schedule); growth > 1 gives min(chunks, n) chunks, each at least as large as the one before, with a
+    first chunk no larger than an even split's."""
+    bounds = ud.gather_chunk_bounds(ngroups, chunks, growth)
+    assert bounds[0][0] == 0 and bounds[-1][1] == ngroups
+    assert all(a < b for a, b in bounds) and all(b0[1] == b1[0] for b0, b1 in zip(bounds, bounds[1:]))
+    sizes = [b - a for a, b in bounds]
+    if growth == 1.0:
+        per = -(-ngroups // chunks)
+        assert sizes[:-1] == [per] * (len(sizes) - 1) and 0 < sizes[-1] <= per
+    else:
+        assert len(sizes) == min(chunks, ngroups)
+        assert all(x <= y for x, y in zip(sizes, sizes[1:])), sizes
+        assert sizes[0] <= -(-ngroups // len(sizes))
+        if ngroups >= 4 * chunks and len(sizes) > 1:
+            assert sizes[0] * 2 <= ngroups // len(sizes), sizes  # the point: a small first gather
 
 
 def test_gathered_with_lazy_share_and_fallback(kernels):
@@ -788,11 +817,13 @@ def test_gathered_dispatch(kernels, monkeypatch):
     for name, value in (("VLLM_TPU_QSA_PREFILL_UNION_WALK", "64"), ("VLLM_TPU_QSA_PREFILL_UNION_MIN_CONTEXT", "0"),
                         ("VLLM_TPU_QSA_PREFILL_UNION_LISTED", "reference"),
                         ("VLLM_TPU_QSA_PREFILL_UNION_GATHERED", "reference"),
-                        ("VLLM_TPU_QSA_PREFILL_UNION_GATHER_CHUNKS", "2")):
+                        ("VLLM_TPU_QSA_PREFILL_UNION_GATHER_CHUNKS", "2"),
+                        ("VLLM_TPU_QSA_PREFILL_UNION_GATHER_GROWTH", "1.5")):
         monkeypatch.setenv(name, value)
     calls = _spy(monkeypatch)
     got = _dispatch(step)
     assert calls[0]["gathered"] == "reference" and calls[0]["gather_chunks"] == 2, calls
+    assert calls[0]["gather_growth"] == 1.5, calls
     jax.clear_caches()
     np.testing.assert_array_equal(_bits(got), _bits(_walk(step, group=64, union_cap=calls[0]["union_cap"],
                                                          listed="reference", gathered="reference", gather_chunks=2)))
@@ -814,7 +845,7 @@ def test_full_stack_dispatch(kernels, monkeypatch):
     assert calls == [dict(kv_heads=2, ratio=RATIO, k_scale=1.0, v_scale=1.0, group=64, kv_tile=1024,
                           union_cap=16384, min_context=0, lean=True, listed="reference", share_bits=True,
                           union_alpha=0.9, qk16=False, run_tables=False, lazy_share=False, gathered=None,
-                          gather_chunks=4)]
+                          gather_chunks=4, gather_growth=1.0)]
     stack = dict(group=64, union_cap=16384, listed="reference", share_bits=True)
     jax.clear_caches()
     np.testing.assert_array_equal(_bits(got), _bits(_walk(step, union_alpha=0.9, **stack)))

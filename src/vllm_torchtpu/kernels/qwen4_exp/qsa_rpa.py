@@ -608,6 +608,7 @@ def _prefill_attention(
             lazy_share=envs.VLLM_TPU_QSA_PREFILL_UNION_LAZY_SHARE,
             gathered=envs.VLLM_TPU_QSA_PREFILL_UNION_GATHERED or None,
             gather_chunks=envs.VLLM_TPU_QSA_PREFILL_UNION_GATHER_CHUNKS,
+            gather_growth=envs.VLLM_TPU_QSA_PREFILL_UNION_GATHER_GROWTH,
         )
     from vllm_torchtpu.kernels.qwen4_exp.block_sparse_gqa_prefill import (
         block_sparse_gqa_attention,
