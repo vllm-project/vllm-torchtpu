@@ -198,8 +198,11 @@ def test_hook_accepts_dspark(wrapped: bool) -> None:
     assert draft.hf_config.quantization_config["quant_method"] == "mxfp8"
     assert draft.quantization == "tpu-mxfp8"
     assert spec.arch_updates == 1
-    # Non-causal, sliding-window draft layers.
-    assert qwen3_dflash._resolve_layer_attention(draft.hf_config, 0) == (256, False)
+    # Non-causal, sliding-window draft layers. Checked through the unpatched
+    # pieces: once another module activates the TPU platform, its DFlash
+    # bypass wraps _resolve_layer_attention and needs a real current config.
+    assert draft.hf_config.sliding_window == 256
+    assert qwen3_dflash._dflash_layer_causal(draft.hf_config, 0) is False
 
     # The engine core reruns the hook on the already-fixed config.
     configure_dspark_draft(spec)
