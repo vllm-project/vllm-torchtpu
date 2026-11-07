@@ -40,7 +40,10 @@ from jax.experimental.pallas import tpu
 
 from ..config import active as _config
 from . import mla_dcp
-from .decode_megakernel import MLA_LAYERS, decode_local
+from .decode_megakernel import (
+    MLA_LAYERS,
+    decode_local,
+)
 
 
 def latent_rows_from_handoff(new_keys):
@@ -219,8 +222,12 @@ def _commit_kda_states(conv_slots, recurrent_slots, conv, recurrent, slots, sour
         ),
     )(slots, *((source_rows,) if selected else ()), conv_slots, recurrent_slots, conv, recurrent)
 
+
+commit_kda_states = _commit_kda_states
+
 def decode_paged(weights, conv_slots, recurrent_slots, pool, tokens, positions, block_tables,
                  slots, *, batch_size, dcp_pool_map, dcp_owner_table=None, state_row=None,
+                 return_hidden: bool = False,
                  defer_kda_commit=False, **decode_options):
     """One decode step on this rank (inside a ``tp`` shard_map).
 
@@ -275,7 +282,7 @@ def decode_paged(weights, conv_slots, recurrent_slots, pool, tokens, positions, 
         weights, (conv, recurrent, *pools), tokens, positions, batch_size=batch_size,
         block_tables=block_tables, dcp_pool_map=dcp_pool_map, dcp_owner_table=dcp_owner_table,
         state_row=state_row, state_slots=state_index if in_place else None,
-        live_rows=slots != 0, **decode_options)
+        live_rows=slots != 0, return_hidden=return_hidden, **decode_options)
     aux = None
     if decode_options.get("aux_hidden_layers"):
         logits, aux, (conv, recurrent, new_keys, new_values) = result
@@ -288,7 +295,7 @@ def decode_paged(weights, conv_slots, recurrent_slots, pool, tokens, positions, 
         # post-states without touching persistent slots or gathering rows.
         conv_slots, recurrent_slots = conv, recurrent
     elif batch_size > 16 and dp in (1, 2, 4):
-        conv_slots, recurrent_slots = _commit_kda_states(
+        conv_slots, recurrent_slots = commit_kda_states(
             conv_slots, recurrent_slots, conv, recurrent, state_index)
     else:
         conv_slots = conv_slots.at[state_index].set(conv)
@@ -298,8 +305,17 @@ def decode_paged(weights, conv_slots, recurrent_slots, pool, tokens, positions, 
         # The handoff holds the group's rows first; only their owners commit.
         latents, block_tables, positions = (
             latents[: group_rows.shape[0]], block_tables[group_rows], positions[group_rows])
-    pool = commit_latent_rows(pools, latents, block_tables, positions,
-                              dcp_pool_map, owner_table=dcp_owner_table)
+    dcp_group = 32 // dp if dp > 1 else mla_dcp.GROUP
+    pool = commit_latent_rows(
+        pools,
+        latents,
+        block_tables,
+        positions,
+        dcp_pool_map,
+        group=dcp_group,
+        owner_table=dcp_owner_table,
+    )
+    primary_out = logits if return_hidden else logits[0]
     if aux is not None:
-        return logits[0], aux, conv_slots, recurrent_slots, pool
-    return logits[0], conv_slots, recurrent_slots, pool
+        return primary_out, aux, conv_slots, recurrent_slots, pool
+    return primary_out, conv_slots, recurrent_slots, pool

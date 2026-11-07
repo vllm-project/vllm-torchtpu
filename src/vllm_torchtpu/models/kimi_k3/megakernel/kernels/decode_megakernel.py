@@ -29,10 +29,8 @@ from jax import typing as jax_typing
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu
 
-from ..common import pool_alias
-
 from .. import kernels as kimi
-from ..common import collectives32
+from ..common import collectives32, pool_alias
 from ..common.vmem_pool import VmemPool
 from ..config import active as _config
 from ..layout import CONV_HEAD_ROWS, cache_layout
@@ -5847,9 +5845,19 @@ def _mla_scoped_scratch(
         tpu.VMEM((batch_size, 3, 128), jnp.float32),
         # The DCP page buffers by batch (mla_dcp.page_plan; DcpAttention
         # reads the span and the buffers from the shape).
-        *mla_dcp.scoped_scratch(batch_size, heads=dcp_heads,
-                                cache_dtype=dcp_dtype, page_tokens=dcp_page_tokens, sequence_rows=sequence_rows,
-                                **mla_dcp.page_plan(batch_size, dcp_heads, sequence_rows, dcp_dtype)),
+        *mla_dcp.scoped_scratch(
+            batch_size,
+            heads=dcp_heads,
+            group=(
+                (32 * mla_dcp.HEADS_PER_RANK) // dcp_heads
+                if dcp_heads > mla_dcp.HEADS_PER_RANK
+                else mla_dcp.GROUP
+            ),
+            cache_dtype=dcp_dtype,
+            page_tokens=dcp_page_tokens,
+            sequence_rows=sequence_rows,
+            **mla_dcp.page_plan(batch_size, dcp_heads, sequence_rows, dcp_dtype),
+        ),
     )
 
 
@@ -6013,10 +6021,16 @@ def stack(
         raise ValueError(f"unified pools must match {layout.block_shape} {layout.dtype}")
     if block_tables.shape[0] != batch_size or block_tables.ndim != 2:
         raise ValueError("block_tables must be [batch_size, pages]")
-    if attention_dp != 1 and mla_dcp.GROUP * attention_dp != 32:
-        raise ValueError(
-            "Attention DP needs DCP over each DP group (KernelConfig.dcp_group = 32 / dp)"
-        )
+    tp_ranks = 32
+    active_cfg = _config()
+    if (
+        attention_dp != 1
+        and active_cfg.attention_dp == attention_dp
+        and mla_dcp.GROUP * attention_dp != tp_ranks
+    ):
+        msg = "Attention DP needs DCP over each DP group (KernelConfig.dcp_group = 32 / dp)"
+        raise ValueError(msg)
+    dcp_group = tp_ranks // attention_dp if attention_dp > 1 else mla_dcp.GROUP
     # Attention DP always runs with DP row ownership: a rank's residual stream
     # holds only its own rows of its DP group.
     attention_dp_ownership = attention_dp > 1
@@ -7735,10 +7749,20 @@ def stack(
                             streams=mla_streams,
                             communication_workspace=communication_workspace,
                             dcp=(
-                                mla_dcp.DcpCache(pool_ref, table_ref, paged_pages, state_index,
-                                                 owner=(None if dcp_owner_table is None
-                                                        else mla_dcp.owner_index(dcp_owner_table) % mla_dcp.GROUP),
-                                                 table_row=group_table_row),
+                                mla_dcp.DcpCache(
+                                    pool_ref,
+                                    table_ref,
+                                    paged_pages,
+                                    state_index,
+                                    group=dcp_group,
+                                    owner=(
+                                        None
+                                        if dcp_owner_table is None
+                                        else mla_dcp.owner_index(dcp_owner_table)
+                                        % dcp_group
+                                    ),
+                                    table_row=group_table_row,
+                                ),
                                 mla_dcp.DcpWorkspace(*dcp_persistent, *dcp_scoped),
                             ),
                             epsilon=eps,
@@ -8589,8 +8613,13 @@ def stack(
             else ()
         ),
         # DCP: buffers group peers' remote copies land in.
-        *mla_dcp.persistent_scratch(group_rows, heads=3 * attention_dp,
-                                    cache_dtype=states[2].dtype, sequence_rows=sequence_rows),
+        *mla_dcp.persistent_scratch(
+            group_rows,
+            group=dcp_group,
+            heads=3 * attention_dp,
+            cache_dtype=states[2].dtype,
+            sequence_rows=sequence_rows,
+        ),
         *communication_scratch(batch_size, attention_dp)[:-1],
         tpu.VMEM((batch_size, 4096), jnp.bfloat16),
         *projection_staging_scratch(batch_size, attention_dp),
@@ -8837,6 +8866,7 @@ def decode_local(
     dcp_owner_table: tuple[int, ...] | None = None,
     state_slots=None,
     live_rows=None,
+    return_hidden: bool = False,
 ):
     """Decode one native batch tile with local TP32 weights and caches.
 
@@ -8962,24 +8992,54 @@ def decode_local(
         )
     )
 
-    if sequence_parallel_pre_attention and batched_decoder_boundaries:
-        logits = jnp.dot(
-            prefix, weights["lm_head"], preferred_element_type=jnp.float32
-        )
-    elif sequence_parallel_pre_attention:
-        def project_decoder_row(_, hidden_row):
-            logits_row = jnp.dot(
-                hidden_row[None],
-                weights["lm_head"],
-                preferred_element_type=jnp.float32,
-            )
-            return (), logits_row[0]
+    new_states = (
+        convolution_states,
+        recurrent_states,
+        new_keys,
+        new_values,
+    )
+    primary = finish_decoder_outputs(
+        prefix,
+        blocks,
+        weights,
+        return_hidden=return_hidden,
+        options=(
+            layers,
+            eps,
+            sequence_parallel_pre_attention,
+            batched_decoder_boundaries,
+        ),
+    )
+    out_val = primary if return_hidden else primary[None]
+    if aux_hidden_layers:
+        return out_val, aux_hidden, new_states
+    return out_val, new_states
 
-        _, logits = jax.lax.scan(project_decoder_row, (), prefix)
-    else:
+
+def finish_decoder_outputs(
+    prefix: jax.Array,
+    blocks: jax.Array,
+    weights: dict[str, jax.Array],
+    *,
+    return_hidden: bool = False,
+    options: tuple[int, float, bool, bool] = (81, 1e-5, False, False),
+) -> jax.Array:
+    """Compute post-norm BF16 hidden states or vocab-sharded logits after `stack`."""
+    (
+        layers,
+        eps,
+        sequence_parallel_pre_attention,
+        batched_decoder_boundaries,
+    ) = options
+    if return_hidden:
+        if sequence_parallel_pre_attention:
+            return prefix.astype(jnp.bfloat16)
         active_block_count = (layers - 1) // 12 + 1
 
-        def finish_decoder(_, inputs):
+        def finish_decoder_hidden(
+            _: object, inputs: tuple[jax.Array, jax.Array]
+        ) -> tuple[tuple[()], jax.Array]:
+            """Apply output attention-residual and final RMSNorm per row."""
             prefix_row, block_rows = inputs
             hidden_row = kimi.attention_residual(
                 prefix_row,
@@ -8988,20 +9048,52 @@ def decode_local(
                 eps,
             )[None]
             hidden_row = kimi.rms(hidden_row, weights["final_norm"], eps)
+            return (), hidden_row[0].astype(jnp.bfloat16)
+
+        _, hidden_out = jax.lax.scan(
+            finish_decoder_hidden, (), (prefix, blocks)
+        )
+        return hidden_out
+
+    if sequence_parallel_pre_attention and batched_decoder_boundaries:
+        return jnp.dot(
+            prefix, weights["lm_head"], preferred_element_type=jnp.float32
+        )
+    if sequence_parallel_pre_attention:
+        def project_decoder_row(
+            _: object, hidden_row: jax.Array
+        ) -> tuple[tuple[()], jax.Array]:
+            """Project one sequence-parallel post-norm row onto `lm_head`."""
             logits_row = jnp.dot(
-                hidden_row,
+                hidden_row[None],
                 weights["lm_head"],
                 preferred_element_type=jnp.float32,
             )
             return (), logits_row[0]
 
-        _, logits = jax.lax.scan(finish_decoder, (), (prefix, blocks))
-    new_states = (
-        convolution_states,
-        recurrent_states,
-        new_keys,
-        new_values,
-    )
-    if aux_hidden_layers:
-        return logits[None], aux_hidden, new_states
-    return logits[None], new_states
+        _, logits = jax.lax.scan(project_decoder_row, (), prefix)
+        return logits
+
+    active_block_count = (layers - 1) // 12 + 1
+
+    def finish_decoder(
+        _: object, inputs: tuple[jax.Array, jax.Array]
+    ) -> tuple[tuple[()], jax.Array]:
+        """Apply output residual, final RMSNorm, and `lm_head` projection per row."""
+        prefix_row, block_rows = inputs
+        hidden_row = kimi.attention_residual(
+            prefix_row,
+            block_rows[:active_block_count],
+            weights["output_res"][0],
+            eps,
+        )[None]
+        hidden_row = kimi.rms(hidden_row, weights["final_norm"], eps)
+        logits_row = jnp.dot(
+            hidden_row,
+            weights["lm_head"],
+            preferred_element_type=jnp.float32,
+        )
+        return (), logits_row[0]
+
+    _, logits = jax.lax.scan(finish_decoder, (), (prefix, blocks))
+    return logits
