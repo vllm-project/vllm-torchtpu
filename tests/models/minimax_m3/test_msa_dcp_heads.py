@@ -45,8 +45,8 @@ PAGES = 64  # physical pages per rank
 SCALE = 0.3
 
 
-def _xla_write_rows(cache, rows, pages, slots, *, max_runs, interpret=False):
-    del max_runs, interpret
+def _xla_write_rows(cache, rows, pages, slots, *, max_runs, bits=None, interpret=False):
+    del max_runs, bits, interpret
     packing = cache.shape[2]
     return cache.at[pages, slots // packing, slots % packing].set(rows, mode="drop")
 
@@ -56,11 +56,19 @@ def _rows(cache):
 
 
 def _jnp_block_scores(
-    index_q, index_cache, seq_lens, block_tables, cu_q_lens, num_seqs, interpret
+    index_q,
+    index_cache,
+    seq_lens,
+    block_tables,
+    cu_q_lens,
+    num_seqs,
+    interpret,
+    scale_cache=None,
+    scale_row=None,
 ):
     """`msa_indexer.block_scores` in jnp; pages past a request's end hold NaN
-    (the kernel leaves them unwritten)."""
-    del num_seqs, interpret
+    (the kernel leaves them unwritten). bf16 / fp8 caches only."""
+    del num_seqs, interpret, scale_cache, scale_row
     num_tokens = index_q.shape[0]
     max_seqs = seq_lens.shape[0]
     pages_per_seq = block_tables.shape[0] // max_seqs

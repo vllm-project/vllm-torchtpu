@@ -40,9 +40,9 @@ PAGES = 24  # physical pages per rank
 SCALE = HEAD_DIM**-0.5
 
 
-def _xla_write_rows(cache, rows, pages, slots, *, max_runs, interpret=False):
+def _xla_write_rows(cache, rows, pages, slots, *, max_runs, bits=None, interpret=False):
     """`msa_write.write_rows` as an XLA scatter (covered by test_msa_write)."""
-    del max_runs, interpret
+    del max_runs, bits, interpret
     packing = cache.shape[2]
     return cache.at[pages, slots // packing, slots % packing].set(rows, mode="drop")
 
