@@ -7,6 +7,7 @@ layout and compare peer fingerprints before registering these descriptors.
 
 import importlib.metadata
 import math
+import os
 from collections.abc import Callable
 from typing import Any
 
@@ -238,10 +239,27 @@ def measure_transfer_layout(
         p.storage_index < 0 or p.storage_index >= len(carriers) for p in manifest.pools
     ):
         raise ManifestError("Qwen PD pool references an unknown carrier")
+    # TPU_RAIDEN_FINGERPRINT_VERSION_OVERRIDE=torch_tpu=X,libtpu=Y states the
+    # runtime versions a peer on another runtime build reports, for legs that
+    # run different torch_tpu builds over the same page encoding (a PP x PCP
+    # producer needs a torch_tpu with stage meshes; its decode may not).
+    versions = {
+        "torch_tpu": package_version("torch_tpu"),
+        "libtpu": package_version("libtpu"),
+    }
+    override = os.environ.get("TPU_RAIDEN_FINGERPRINT_VERSION_OVERRIDE", "")
+    for item in filter(None, (part.strip() for part in override.split(","))):
+        name, _, value = item.partition("=")
+        if name not in versions or not value:
+            raise ManifestError(
+                f"TPU_RAIDEN_FINGERPRINT_VERSION_OVERRIDE entry {item!r}: "
+                "expected torch_tpu=<version> or libtpu=<version>"
+            )
+        versions[name] = value
     payload = dict(
         schema="qwen4-whole-fp8-page-layout-v1",
-        torch_tpu=package_version("torch_tpu"),
-        libtpu=package_version("libtpu"),
+        torch_tpu=versions["torch_tpu"],
+        libtpu=versions["libtpu"],
         carriers=carriers,
         pools=[
             dict(
