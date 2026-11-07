@@ -55,6 +55,25 @@ curl -X POST http://localhost:8000/start_profile
 curl -X POST http://localhost:8000/stop_profile
 ```
 
+You can also pass a JSON body to `/start_profile` to scope the session's phase
+subdirectories under `profile_prefix`, override `delay_iterations` or
+`max_iterations` for that session, or pass per-session tracer/SparseCore/firmware
+options via `profiler_kwargs` (see
+[Dynamic profiling options](server.md#dynamic-profiling-options-profiler_kwargs-and-profile_prefix)):
+
+```bash
+curl -X POST http://localhost:8000/start_profile \
+  -H "Content-Type: application/json" \
+  -d '{
+    "profile_prefix": "run1",
+    "max_iterations": 5,
+    "profiler_kwargs": {
+      "host_tracer_level": 3,
+      "tpu_trace_mode": "TRACE_COMPUTE_AND_SYNC"
+    }
+  }'
+```
+
 `USE_PHASED_PROFILER` must be exported into the server's own environment — it is
 read by the TPU workers, so setting it only in the shell that runs `curl` has no
 effect.
