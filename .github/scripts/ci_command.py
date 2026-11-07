@@ -44,7 +44,8 @@ HELP_TEXT = (
     "bottom of the GitHub PR page).\n"
     "- `/ci merge precheck-only`: queue for merge with prechecks only "
     "(no TPU; not on `releases/*`).\n"
-    "- `/ci cancel`: stop this PR's running builds.\n"
+    "- `/ci cancel`: stop this PR's running builds, take it out of the merge "
+    "queue, and turn off auto-merge.\n"
     "- `/ci help`.\n\n"
     "`/ci` commands except help need write access."
 )
@@ -62,6 +63,18 @@ GITHUB_GRAPHQL_URL = "https://api.github.com/graphql"
 _AUTO_MERGE_MUTATION = (
     "mutation($id: ID!) { "
     "enablePullRequestAutoMerge(input: {pullRequestId: $id, mergeMethod: SQUASH}) "
+    "{ pullRequest { number } } }"
+)
+_MERGE_STATE_QUERY = (
+    "query($id: ID!) { node(id: $id) { ... on PullRequest { "
+    "isInMergeQueue autoMergeRequest { enabledAt } } } }"
+)
+_DEQUEUE_MUTATION = (
+    "mutation($id: ID!) { dequeuePullRequest(input: {id: $id}) "
+    "{ mergeQueueEntry { state } } }"
+)
+_DISABLE_AUTO_MERGE_MUTATION = (
+    "mutation($id: ID!) { disablePullRequestAutoMerge(input: {pullRequestId: $id}) "
     "{ pullRequest { number } } }"
 )
 _CI_LINE_RE = re.compile(r"^/ci(?:\s|$)")
@@ -327,6 +340,32 @@ def _cancel_pr_builds(
     return sorted(cancelled)
 
 
+def _leave_merge(pr: dict[str, Any], gh_token: str) -> list[str]:
+    """Take the PR out of the merge queue and turn off auto-merge; say what was done."""
+
+    def gql(query: str) -> dict[str, Any]:
+        data = _api_json(
+            GITHUB_GRAPHQL_URL,
+            gh_token,
+            method="POST",
+            payload={"query": query, "variables": {"id": pr["node_id"]}},
+        )
+        if data.get("errors"):
+            raise RuntimeError(data["errors"][0].get("message", "GraphQL error"))
+        return (data.get("data") or {}).get("node") or {}
+
+    done: list[str] = []
+    state = gql(_MERGE_STATE_QUERY)
+    if state.get("isInMergeQueue"):
+        gql(_DEQUEUE_MUTATION)
+        done.append("Took the PR out of the merge queue.")
+        state = gql(_MERGE_STATE_QUERY)
+    if state.get("autoMergeRequest"):
+        gql(_DISABLE_AUTO_MERGE_MUTATION)
+        done.append("Turned off auto-merge.")
+    return done
+
+
 def handle_pr_info(
     repo: str,
     pr_number: int,
@@ -362,7 +401,8 @@ def handle_pr_info(
             "(same as the button when no extras are given).\n"
             "- `/ci merge precheck-only`: queue for merge with prechecks only "
             "(no TPU; not on `releases/*`).\n"
-            "- `/ci cancel` stops running builds; `/ci help` lists commands."
+            "- `/ci cancel` stops running builds and takes the PR out of the merge "
+            "queue; `/ci help` lists commands."
         )
     else:
         guidance = (
@@ -376,7 +416,8 @@ def handle_pr_info(
             "button at the bottom of the GitHub PR page).\n"
             "  - `/ci merge precheck-only`: queue for merge with prechecks only "
             "(no TPU; not on `releases/*`).\n"
-            "  - `/ci cancel`: stop this PR's running builds."
+            "  - `/ci cancel`: stop this PR's running builds and take it out of the "
+            "merge queue."
         )
     body = (
         f"✅ @{author}, thanks for the PR. How CI works here:\n\n"
@@ -439,21 +480,27 @@ def handle_comment(
         return reply(err or "")
     pr = _api_json(f"https://api.github.com/repos/{repo}/pulls/{pr_number}", gh_token)
     if subcmd == "cancel":
+        # Cancel undoes everything: builds, the queue entry, auto-merge, and extras.
+        # Leaving the queue destroys the merge group, which cancels its build.
+        parts: list[str] = []
         try:
             cancelled = _cancel_pr_builds(pr, repo, pr_number, bk_token)
+            if cancelled:
+                nums = ", ".join(f"#{n}" for n in cancelled)
+                noun = "build" if len(cancelled) == 1 else "builds"
+                parts.append(f"Cancelled {noun} {nums}.")
+            else:
+                parts.append("No running CI builds for this PR.")
         except Exception as exc:
-            return reply(f"@{author}, could not cancel builds ({_err_summary(exc)}).")
-        if not cancelled:
-            return reply(
-                "No running CI builds for this PR.\n\n<!-- ci-merge-extras: -->"
+            parts.append(f"@{author}, could not cancel builds ({_err_summary(exc)}).")
+        try:
+            parts += _leave_merge(pr, gh_token)
+        except Exception as exc:
+            parts.append(
+                f"Could not leave the merge queue ({_err_summary(exc)}); click "
+                "**Remove from queue** on the GitHub PR page."
             )
-        nums = ", ".join(f"#{n}" for n in cancelled)
-        noun = "build" if len(cancelled) == 1 else "builds"
-        return reply(
-            f"Cancelled {noun} {nums}. To leave the merge queue, click "
-            "**Disable auto-merge** or **Remove from queue** on the GitHub PR page."
-            "\n\n<!-- ci-merge-extras: -->"
-        )
+        return reply(" ".join(parts) + "\n\n<!-- ci-merge-extras: -->")
     if pr.get("state") != "open":
         return reply(
             f"PR #{pr_number} is closed; reopen it before running `/ci {subcmd}`."

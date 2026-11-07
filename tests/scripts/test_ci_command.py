@@ -57,10 +57,11 @@ class TestCiCommand(unittest.TestCase):
         fail_approve_ids: set[int] | None = None,
         gql_error: str | None = None,
         bk_error: int | None = None,
+        in_queue: bool = False,
     ) -> tuple[Any, list[tuple[str, str, dict[str, Any] | None]]]:
         calls: list[tuple[str, str, dict[str, Any] | None]] = []
         comments: list[dict[str, str]] = []
-        state = {"auto_merge": auto_merge}
+        state: dict[str, Any] = {"auto_merge": auto_merge, "in_queue": in_queue}
         pr_head = head or {
             "sha": "abcdef1234567890",
             "ref": "feat/example",
@@ -119,6 +120,20 @@ class TestCiCommand(unittest.TestCase):
                         )
                 return {}
             if url == GQL_URL:
+                query = (payload or {}).get("query", "")
+                if "isInMergeQueue" in query:
+                    auto = {"enabledAt": "t"} if state["auto_merge"] else None
+                    node = {
+                        "isInMergeQueue": state["in_queue"],
+                        "autoMergeRequest": auto,
+                    }
+                    return {"data": {"node": node}}
+                if "dequeuePullRequest" in query:
+                    state["in_queue"] = False
+                    return {"data": {"node": {}}}
+                if "disablePullRequestAutoMerge" in query:
+                    state["auto_merge"] = None
+                    return {"data": {"node": {}}}
                 if gql_error is not None:
                     return {"errors": [{"message": gql_error}]}
                 state["auto_merge"] = {"merge_method": "squash"}
@@ -203,7 +218,8 @@ class TestCiCommand(unittest.TestCase):
                 "`/ci merge [perf-eval] [nightly-suite]`",
                 "`/ci merge precheck-only`",
                 "**Merge when ready** button at the bottom of the GitHub PR page",
-                "`/ci cancel`: stop this PR's running builds.",
+                "`/ci cancel`: stop this PR's running builds, take it out of the "
+                "merge queue, and turn off auto-merge.",
                 "`/ci help`.",
                 "`/ci` commands except help need write access.",
             ):
@@ -602,9 +618,7 @@ class TestCiCommand(unittest.TestCase):
         reply, calls = self._run("/ci cancel", head=fork_head, active_builds=builds)
         self.assertEqual(
             reply,
-            "Cancelled builds #901, #902. To leave the merge queue, click "
-            "**Disable auto-merge** or **Remove from queue** on the GitHub PR page."
-            "\n\n<!-- ci-merge-extras: -->",
+            "Cancelled builds #901, #902.\n\n<!-- ci-merge-extras: -->",
         )
         list_urls = [u for m, u, _ in calls if m == "GET" and u.startswith(BK_URL)]
         self.assertEqual(len(list_urls), 1)
@@ -680,7 +694,11 @@ class TestCiCommand(unittest.TestCase):
         # reply instead of a crashed workflow and a silent PR.
         for cmd, expected in (
             ("/ci run", "@alice, could not start `/ci run` (HTTP 403)."),
-            ("/ci cancel", "@alice, could not cancel builds (HTTP 403)."),
+            (
+                "/ci cancel",
+                "@alice, could not cancel builds (HTTP 403).\n\n"
+                "<!-- ci-merge-extras: -->",
+            ),
         ):
             reply, calls = self._run(cmd, bk_error=403)
             self.assertEqual(reply, expected)
@@ -697,6 +715,38 @@ class TestCiCommand(unittest.TestCase):
             "@alice, could not start `/ci run` "
             "(BUILDKITE_API_TOKEN is required to trigger builds).",
         )
+
+    def test_ci_cancel_takes_pr_out_of_queue_and_turns_off_auto_merge(self) -> None:
+        def gql_queries(calls: list[tuple[str, str, dict[str, Any] | None]]) -> str:
+            return " ".join(p["query"] for _, u, p in calls if u == GQL_URL and p)
+
+        fake_api, calls = self._mock_api(
+            in_queue=True, auto_merge={"merge_method": "squash"}, active_builds=[]
+        )
+        with mock.patch.object(ci_command, "_api_json", side_effect=fake_api):
+            reply = ci_command.handle_comment(
+                REPO, 42, "alice", "/ci cancel", "gh-tok", "bk-tok"
+            )
+        self.assertEqual(
+            reply,
+            "No running CI builds for this PR. Took the PR out of the merge queue. "
+            "Turned off auto-merge.\n\n<!-- ci-merge-extras: -->",
+        )
+        self.assertIn("dequeuePullRequest", gql_queries(calls))
+        self.assertIn("disablePullRequestAutoMerge", gql_queries(calls))
+
+        # A Buildkite failure still leaves the queue.
+        fake_bk, bk_calls = self._mock_api(in_queue=True, bk_error=403)
+        with mock.patch.object(ci_command, "_api_json", side_effect=fake_bk):
+            bk_reply = ci_command.handle_comment(
+                REPO, 42, "alice", "/ci cancel", "gh-tok", "bk-tok"
+            )
+        self.assertEqual(
+            bk_reply,
+            "@alice, could not cancel builds (HTTP 403). Took the PR out of the merge "
+            "queue.\n\n<!-- ci-merge-extras: -->",
+        )
+        self.assertNotIn("disablePullRequestAutoMerge", gql_queries(bk_calls))
 
     def test_closed_pr_does_not_trigger_build_or_merge(self) -> None:
         for cmd in ("/ci precheck", "/ci run", "/ci merge"):
