@@ -1,6 +1,13 @@
-# NVFP4 Fused MoE Prefill Kernel (`fused_moe_prefill_nvfp4`)
+# FP4-block512 Fused MoE Prefill Kernel (W4A16 / W4A8; for NVFP4 Checkpoints)
 
-NVFP4 counterpart of `fused_moe_prefill_kernel_v2` (Stage A) for prefill and
+The routed experts arrive as NVFP4 (FP4 e2m1, block-16 scales) and are
+requantized once at load to FP4 with one `f32` scale per 512 elements
+(`MOE_REQUANTIZE_BLOCK_SIZE=512`, clamped per matrix). The kernel
+(`fused_moe_prefill_nvfp4`) computes in that FP4-block512 format, the same as it
+would for an offline-converted or directly quantized block-512 checkpoint;
+block 16 is not used (block-16 scales do not fit 4-chip HBM).
+
+FP4-block512 counterpart of `fused_moe_prefill_kernel_v2` (Stage A) for prefill and
 mixed-step MoE blocks whose routed weights are K-major `float4_e2m1fn` with
 block `float32` scales and whose shared expert weights are per-channel
 `float8_e4m3fn`.
