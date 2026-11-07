@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Standalone unit tests for slice L-7a (`modules/gdn` params, decls, and reference)."""
+"""Unit tests for `modules/gdn` gate helpers, parameters, decls, and reference."""
 
 from __future__ import annotations
 
@@ -36,6 +36,7 @@ from vllm_torchtpu.megakernel.decls import (
 )
 from vllm_torchtpu.megakernel.errors import MegakernelConfigError
 from vllm_torchtpu.megakernel.exec_spec import ExecSpec
+from vllm_torchtpu.megakernel.module import Module
 from vllm_torchtpu.megakernel.modules.gdn.decls import (
     GDN_FIELD_ALIASES,
     GDN_GEOMETRY_FIELDS,
@@ -43,6 +44,7 @@ from vllm_torchtpu.megakernel.modules.gdn.decls import (
     GDN_OPTIONS,
     GDN_PARAM_NAMES,
     GDN_WEIGHT_NAMES,
+    bind_gdn_module,
     gdn_cache_decl,
     gdn_hf_params,
     resolve_gdn_binding,
@@ -60,7 +62,7 @@ from vllm_torchtpu.megakernel.modules.gdn.params import (
     gdn_lin_in_layout,
 )
 from vllm_torchtpu.megakernel.modules.gdn.reference import gdn_reference
-from vllm_torchtpu.megakernel.ops import BF16, F32, round_bf16
+from vllm_torchtpu.megakernel.ops import BF16, F32, FP8, round_bf16
 from vllm_torchtpu.megakernel.planner import plan
 from vllm_torchtpu.megakernel.pool import CacheExec, PoolBackend, PoolLayout
 from vllm_torchtpu.megakernel.spec import LayerType, ModelSpec
@@ -122,12 +124,27 @@ def test_gdn_tunables_lin_in_layout_and_derive_params():
         derive_params(g, ex_v, p_v, GDNTunables(gdn_rows=8, gdn_bufs=1), "fake_gqa")
     with pytest.raises(MegakernelConfigError, match="'silu' or 'sigmoid'"):
         derive_params(g, ex, p, GDNTunables(), "fake_gqa", gate="bad_gate")
+    with pytest.raises(MegakernelConfigError, match="gdn_rows must be a multiple of 8"):
+        derive_params(g, ex_v, p_v, GDNTunables(gdn_rows=12, gdn_bufs=2), "fake_gqa")
+    ex_v3 = ExecSpec(B=12, T=3, R=2, ctx=256, stack_e=True, tiles=tiles)
+    p_v3 = plan(ms, ex_v3)
+    with pytest.raises(MegakernelConfigError, match="must be a multiple of T"):
+        derive_params(g, ex_v3, p_v3, GDNTunables(gdn_rows=8, gdn_bufs=2), "fake_gqa")
+    g_bad_kh = dataclasses.replace(g, KH=3)
+    with pytest.raises(MegakernelConfigError, match="divisible by R"):
+        derive_params(g_bad_kh, ex, p, GDNTunables(), "fake_gqa")
+    g_bad_vh = dataclasses.replace(g, KH=2, VH=256)
+    with pytest.raises(MegakernelConfigError, match="vh <= 64"):
+        derive_params(g_bad_vh, ex, p, GDNTunables(), "fake_gqa")
+    g_bad_h = dataclasses.replace(g, H=192)
+    with pytest.raises(MegakernelConfigError, match="multiple of 128"):
+        derive_params(g_bad_h, ex, p, GDNTunables(), "fake_gqa")
 
-    # checked_pool_layout validation
+    # checked_pool_layout validation and derive_params pool-I/O branch (FUSED & GPR)
     with pytest.raises(MegakernelConfigError, match="needs a pool backend"):
         checked_pool_layout(p, ex, g_per_att=1, ssm_u32_rows=256)
 
-    pl_ok = PoolLayout(
+    pl_bf16 = PoolLayout(
         num_pools=1,
         slots_per_pool=1,
         kh=2,
@@ -137,6 +154,16 @@ def test_gdn_tunables_lin_in_layout_and_derive_params():
         conv_taps=3,
         conv_dtype=BF16,
     )
+    pl_f32 = PoolLayout(
+        num_pools=1,
+        slots_per_pool=1,
+        kh=2,
+        vh=4,
+        rec_pages_per_slot=4,
+        conv_pages_per_slot=1,
+        conv_taps=3,
+        conv_dtype=F32,
+    )
     ex_pool = ExecSpec(
         B=4,
         T=1,
@@ -144,18 +171,67 @@ def test_gdn_tunables_lin_in_layout_and_derive_params():
         ctx=256,
         stack_e=True,
         tiles=tiles,
-        cache=CacheExec(paged_kv=True, page_size=128, num_pages=32),
+        cache=CacheExec(paged_kv=True, page_size=128, num_pages=32, fused_pool_io=True),
     )
-    ms_pool = dataclasses.replace(
+    ms_pool_bf16 = dataclasses.replace(
         ms,
-        cache_backend=PoolBackend(layout=pl_ok, kernel_names=("kv_pool_0",)),
+        cache_backend=PoolBackend(layout=pl_bf16, kernel_names=("kv_pool_0",)),
     )
-    p_pool = plan(ms_pool, ex_pool)
-    assert checked_pool_layout(p_pool, ex_pool, 1, 256) is pl_ok
+    p_pool_bf16 = plan(ms_pool_bf16, ex_pool)
+    assert checked_pool_layout(p_pool_bf16, ex_pool, 1, 256) is pl_bf16
     with pytest.raises(MegakernelConfigError, match="slots_per_pool"):
-        checked_pool_layout(p_pool, ex_pool, 2, 256)
+        checked_pool_layout(p_pool_bf16, ex_pool, 2, 256)
     with pytest.raises(MegakernelConfigError, match="exceeds the pool layout"):
-        checked_pool_layout(p_pool, ex_pool, 1, 1024)
+        checked_pool_layout(p_pool_bf16, ex_pool, 1, 1024)
+
+    gp_fused_bf16 = derive_params(g, ex_pool, p_pool_bf16, GDNTunables(), "fake_gqa")
+    assert gp_fused_bf16.pool_layout is pl_bf16
+    assert gp_fused_bf16.REC_PAGES == 4 and gp_fused_bf16.GDN_PAGES == 5
+    assert gp_fused_bf16.SSM_U32_CAP == 512 and gp_fused_bf16.G_PER_ATT == 1
+    assert gp_fused_bf16.conv_is_f32 is False and gp_fused_bf16.A_conv == 16
+    assert gp_fused_bf16.NGI == 4 and gp_fused_bf16.NGO == 2
+
+    ms_pool_f32 = dataclasses.replace(
+        ms,
+        cache_backend=PoolBackend(layout=pl_f32, kernel_names=("kv_pool_0",)),
+    )
+    p_pool_f32 = plan(ms_pool_f32, ex_pool)
+    gp_fused_f32 = derive_params(g, ex_pool, p_pool_f32, GDNTunables(), "fake_gqa")
+    assert gp_fused_f32.pool_layout is pl_f32
+    assert gp_fused_f32.REC_PAGES == 4 and gp_fused_f32.GDN_PAGES == 5
+    assert gp_fused_f32.conv_is_f32 is True and gp_fused_f32.A_conv == 8
+    assert gp_fused_f32.GCONV_ROWS == 2 * gp_fused_bf16.GCONV_ROWS
+
+    # GPR requires verify (T > 1)
+    ex_bad_gpr = dataclasses.replace(
+        ex_pool,
+        cache=CacheExec(paged_kv=True, page_size=128, num_pages=32, pool_gather=True),
+    )
+    with pytest.raises(MegakernelConfigError, match="paged chunked verify path"):
+        derive_params(g, ex_bad_gpr, p_pool_bf16, GDNTunables(), "fake_gqa")
+
+
+class _BoundGDNModule(Module):
+    name = "gdn_test_bind"
+    GEOMETRY_FIELDS = GDN_GEOMETRY_FIELDS
+    FIELD_ALIASES = GDN_FIELD_ALIASES
+    OPTIONS = GDN_OPTIONS
+    PARAM_NAMES = GDN_PARAM_NAMES
+    GEOMETRY_METHODS = GDN_GEOMETRY_METHODS
+
+    @classmethod
+    def _validate_options(cls, options):
+        validate_gdn_options(options)
+
+    @classmethod
+    def bind(cls, prefix: str = "", **hf_fields_or_options):
+        return bind_gdn_module(cls, prefix, **hf_fields_or_options)
+
+    @classmethod
+    def _resolve_binding(cls, binding, hf_config):
+        return resolve_gdn_binding(
+            cls, binding, super()._resolve_binding(binding, hf_config)
+        )
 
 
 def test_gdn_decls_options_binding_and_hf_params():
@@ -173,6 +249,29 @@ def test_gdn_decls_options_binding_and_hf_params():
     with pytest.raises(MegakernelConfigError, match="weight_dtypes"):
         validate_gdn_options({"weight_dtypes": {"bad": "bf16"}})
 
+    # bind(gate=...) routes gate as an option and validates at bind() time
+    with pytest.raises(MegakernelConfigError, match="gate"):
+        _BoundGDNModule.bind("linear_attn", gate="bad")
+
+    bound_sig = _BoundGDNModule.bind(
+        "linear_attn",
+        hidden="hidden_size",
+        k_heads="linear_num_key_heads",
+        v_heads="linear_num_value_heads",
+        gate="sigmoid",
+    )
+    assert bound_sig.options["gate"] == "sigmoid"
+    assert "gate" not in bound_sig.explicit_fields
+    res_from_bind = bound_sig.resolve(
+        {
+            "hidden_size": 256,
+            "linear_num_key_heads": 4,
+            "linear_num_value_heads": 8,
+        }
+    )
+    assert res_from_bind.gate == "sigmoid" and res_from_bind.gdn_gate == "sigmoid"
+
+    # Explicit option in ModuleBinding beats the geometry default ("silu")
     binding = ModuleBinding(
         module_cls=FakeMixerModule,
         prefix="linear_attn",
@@ -191,7 +290,7 @@ def test_gdn_decls_options_binding_and_hf_params():
             "conv_kernel": 4,
             "eps": 1e-6,
             "gdn_l2_eps": 1e-6,
-            "gate": "sigmoid",
+            "gdn_gate": "silu",
         },
         options=binding.options,
         rename=binding.rename,
@@ -199,6 +298,7 @@ def test_gdn_decls_options_binding_and_hf_params():
     res = resolve_gdn_binding(FakeMixerModule, binding, raw_res)
     assert res.H == 256 and res.KH == 4 and res.VH == 8 and res.conv_taps == 3
     assert res.gate == "sigmoid" and res.gdn_gate == "sigmoid"
+    assert res.options["gate"] == "sigmoid"
     assert GDN_GEOMETRY_METHODS["kh"](res, 2) == 2
     assert GDN_GEOMETRY_METHODS["vh"](res, 2) == 4
 
@@ -220,7 +320,7 @@ def test_gdn_decls_options_binding_and_hf_params():
     assert cdecl.kh == 4 and cdecl.vh == 8 and cdecl.conv_taps == 3
 
 
-@pytest.mark.parametrize(("T", "gate"), [(1, "silu"), (2, "sigmoid")])
+@pytest.mark.parametrize(("T", "gate"), [(1, "silu"), (2, "sigmoid"), (4, "silu")])
 def test_gdn_reference_matches_direct_computation(T: int, gate: str):
     """Compare `gdn_reference` against direct causal conv + gated delta rule."""
     B = 4
@@ -249,6 +349,25 @@ def test_gdn_reference_matches_direct_computation(T: int, gate: str):
         "dtb": dtb,
         "gnorm": gnorm,
     }
+    if T == 1:
+        with pytest.raises(MegakernelConfigError, match="FP8 'lin_in' requires"):
+            gdn_reference(
+                {**params, "lin_in": w_in.astype(FP8)},
+                x,
+                {"conv": conv_st, "rec": rec_st},
+                g=g,
+                ex=ex,
+                multi_layer=False,
+            )
+        with pytest.raises(MegakernelConfigError, match="FP8 'lin_out' requires"):
+            gdn_reference(
+                {**params, "lin_out": w_out.astype(FP8)},
+                x,
+                {"conv": conv_st, "rec": rec_st},
+                g=g,
+                ex=ex,
+                multi_layer=False,
+            )
     ref_out, ref_st = gdn_reference(
         params,
         x,

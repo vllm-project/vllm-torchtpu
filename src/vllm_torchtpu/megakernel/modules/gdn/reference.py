@@ -11,7 +11,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""`GDNModule` pure-JAX reference forward pass (`gdn_reference`)."""
+"""`GDNModule` pure-JAX reference forward pass (`gdn_reference`).
+
+Implements the GatedDeltaNet causal `conv1d` and recurrent gated delta rule
+(`torch_recurrent_gated_delta_rule` in HuggingFace `transformers`) with
+megakernel BF16/F32 rounding semantics across `R` tensor-parallel ranks.
+"""
 
 from __future__ import annotations
 
@@ -68,9 +73,7 @@ def gdn_reference(
     eps = float(getattr(g, "eps", 1e-6))
     l2_eps = float(getattr(g, "gdn_l2_eps", 1e-6))
     eff_gate = validate_gdn_gate(
-        gate
-        if gate is not None
-        else getattr(g, "gdn_gate", getattr(g, "gate", "silu")),
+        gate if gate is not None else getattr(g, "gdn_gate", "silu"),
         MegakernelConfigError,
     )
     g_act = gdn_gate_act(eff_gate)
@@ -90,16 +93,22 @@ def gdn_reference(
 
     in_scaled = jnp.dtype(w_lin_in_all.dtype) == jnp.dtype(FP8)
     out_scaled = jnp.dtype(w_lin_out_all.dtype) == jnp.dtype(FP8)
-    has_in_s = in_scaled and ("lin_in_s" in params or "in_s" in params)
-    has_out_s = out_scaled and ("lin_out_s" in params or "out_s" in params)
+    if in_scaled and "lin_in_s" not in params and "in_s" not in params:
+        raise MegakernelConfigError(
+            "gdn_reference: FP8 'lin_in' requires 'lin_in_s' or 'in_s' scale"
+        )
+    if out_scaled and "lin_out_s" not in params and "out_s" not in params:
+        raise MegakernelConfigError(
+            "gdn_reference: FP8 'lin_out' requires 'lin_out_s' or 'out_s' scale"
+        )
     lin_in_s_l = (
         _slice_sm(params["lin_in_s"] if "lin_in_s" in params else params["in_s"])
-        if has_in_s
+        if in_scaled
         else None
     )
     lin_out_s_l = (
         _slice_sm(params["lin_out_s"] if "lin_out_s" in params else params["out_s"])
-        if has_out_s
+        if out_scaled
         else None
     )
     conv_w_l = _slice_sm(params["conv"])

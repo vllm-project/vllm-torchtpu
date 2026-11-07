@@ -21,7 +21,7 @@ from typing import Any, ClassVar
 import jax.numpy as jnp
 
 from ...errors import MegakernelConfigError
-from ...exec_spec import ExecSpec, NumericsClass
+from ...exec_spec import ExecSpec, NumericsClass, register_tunables
 from ...ops import F32, round_up
 from ...pool.config import cache_exec
 from .gate import validate_gdn_gate
@@ -119,6 +119,9 @@ class GDNTunables:
     }
 
 
+register_tunables("gdn", GDNTunables)
+
+
 def gdn_lin_in_layout(g: Any, ex_or_r: ExecSpec | int) -> GDNLinInLayout:
     """Return shared column offsets for `lin_in` (`[qkv | z | b | a]`)."""
     R = ex_or_r.R if isinstance(ex_or_r, ExecSpec) else int(ex_or_r)
@@ -156,20 +159,26 @@ def derive_params(
 ) -> GDNParams:
     """`GDNParams` for geometry `g` under `ex` and the module's tunables `tt`."""
     eff_gate = validate_gdn_gate(
-        gate
-        if gate is not None
-        else getattr(g, "gdn_gate", getattr(g, "gate", "silu")),
+        gate if gate is not None else getattr(g, "gdn_gate", "silu"),
         MegakernelConfigError,
     )
     tiles = ex.resolve_tiles(g)
     R, B, T = ex.R, ex.B, ex.T
-    assert not (ex.VER and tiles.inplace), (
-        "verify returns per-token checkpoints: no aliasing"
-    )
-    assert g.KH % R == 0 and g.VH % R == 0, (g.KH, g.VH, R)
-    assert g.VH % g.KH == 0, (g.VH, g.KH)
+    if ex.VER and tiles.inplace:
+        raise MegakernelConfigError(
+            "GDN verify returns per-token checkpoints: inplace=True is not supported"
+        )
+    if g.KH % R != 0 or g.VH % R != 0:
+        raise MegakernelConfigError(
+            f"GDN KH ({g.KH}) and VH ({g.VH}) must be divisible by R ({R})"
+        )
+    if g.VH % g.KH != 0:
+        raise MegakernelConfigError(f"GDN VH ({g.VH}) must be divisible by KH ({g.KH})")
     lay = gdn_lin_in_layout(g, ex)
-    assert lay.vh <= 64, ("b|a gate lanes require vh <= 64", lay.vh)
+    if lay.vh > 64:
+        raise MegakernelConfigError(
+            f"GDN b|a gate lanes require vh <= 64, got vh={lay.vh} (VH={g.VH}, R={R})"
+        )
     for dim_name, dim_val in (
         ("H", g.H),
         ("KD", lay.KD),
@@ -177,10 +186,10 @@ def derive_params(
         ("QKV", lay.QKV),
         ("Z", lay.Z),
     ):
-        assert dim_val % 128 == 0, (
-            f"GDN {dim_name} must be a multiple of 128",
-            dim_val,
-        )
+        if dim_val % 128 != 0:
+            raise MegakernelConfigError(
+                f"GDN {dim_name} must be a multiple of 128, got {dim_name}={dim_val}"
+            )
 
     CR = round_up(3 * B, 8)
     HR = round_up(3 + T, 8)
@@ -193,15 +202,14 @@ def derive_params(
         and not cache_exec(ex).FUSED
     )
     CB = tt.gdn_rows if GCH else B
-    assert not GCH or CB % 8 == 0, (
-        "gdn_rows must be a multiple of 8",
-        tt.gdn_rows,
-    )
-    assert not (GCH and ex.VER) or CB % T == 0, (
-        "gdn_rows must be a multiple of T",
-        CB,
-        T,
-    )
+    if GCH and CB % 8 != 0:
+        raise MegakernelConfigError(
+            f"GDN gdn_rows must be a multiple of 8, got gdn_rows={tt.gdn_rows}"
+        )
+    if GCH and ex.VER and CB % T != 0:
+        raise MegakernelConfigError(
+            f"GDN gdn_rows ({CB}) must be a multiple of T ({T})"
+        )
     NF, TR = divmod(B, CB)
     NCH = NF + int(TR > 0)
     NRB = min(tt.gdn_bufs, NCH)
@@ -212,11 +220,12 @@ def derive_params(
     CBV = CB * lay.vh
 
     GPR = bool(cache_exec(ex).GPR and GCH and ex.VER)
-    assert not cache_exec(ex).GPR or GPR, (
-        "pool_gather needs the paged chunked verify path",
-        B,
-        T,
-    )
+    if cache_exec(ex).GPR and not GPR:
+        raise MegakernelConfigError(
+            f"GDN pool_gather=True requires the paged chunked verify path "
+            f"(T > 1, GCH=True, fused_pool_io=False), got B={B}, T={T}, "
+            f"gdn_rows={tt.gdn_rows}, fused_pool_io={cache_exec(ex).FUSED}"
+        )
 
     g_per_att = max(0, getattr(g, "att_every", 1) - 1)
     ssm_u32_rows = (lay.vh * lay.KD) // 2
@@ -236,14 +245,21 @@ def derive_params(
     ) == jnp.dtype(F32)
     conv_itemsize = 4 if conv_is_f32 else 2
     gconv_rows = (HR * lay.QKV * conv_itemsize) // (4 * 128)
-    assert not GPR or cache_exec(ex).page_size == 128, cache_exec(ex).page_size
-    assert not GPR or (HR * lay.QKV * conv_itemsize) % (4 * 128) == 0, (
-        HR,
-        lay.QKV,
-    )
-    assert not GPR or gconv_rows <= (
-        pool_layout.gpr_conv_row_limit if pool_layout is not None else 64
-    ), gconv_rows
+    if GPR and cache_exec(ex).page_size != 128:
+        raise MegakernelConfigError(
+            "GDN GPR requires page_size == 128, got "
+            f"page_size={cache_exec(ex).page_size}"
+        )
+    if GPR and (HR * lay.QKV * conv_itemsize) % (4 * 128) != 0:
+        raise MegakernelConfigError(
+            f"GDN GPR conv byte size ({HR * lay.QKV * conv_itemsize}) must be "
+            f"divisible by 512 (HR={HR}, QKV={lay.QKV}, itemsize={conv_itemsize})"
+        )
+    gpr_limit = pool_layout.gpr_conv_row_limit if pool_layout is not None else 64
+    if GPR and gconv_rows > gpr_limit:
+        raise MegakernelConfigError(
+            f"GDN GPR gconv_rows={gconv_rows} exceeds limit {gpr_limit}"
+        )
 
     qkv_128 = lay.QKV // 128
     A_conv = round_up(3 + T, 8) if conv_is_f32 else max(16, round_up(3 + T, 8))

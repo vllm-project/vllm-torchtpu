@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 from collections.abc import Mapping
 from typing import Any
 
@@ -128,13 +129,41 @@ def validate_gdn_options(options: Mapping[str, Any]) -> None:
     )
 
 
+def bind_gdn_module(
+    cls: Any, prefix: str = "", **hf_fields_or_options: Any
+) -> ModuleBinding:
+    """Bind a GDN module class, routing literal `gate=` to `options['gate']`."""
+    kw = dict(hf_fields_or_options)
+    for k in ("gate", "gdn_gate"):
+        if k in kw and not (
+            isinstance(kw[k], tuple) and len(kw[k]) == 2 and isinstance(kw[k][0], str)
+        ):
+            gate_lit = validate_gdn_gate(kw.pop(k))
+            b = super(cls, cls).bind(prefix, **kw)
+            return dataclasses.replace(
+                b,
+                fields={**b.fields, "gate": ("gdn_gate", gate_lit)},
+                options={**b.options, "gate": gate_lit},
+            )
+    return super(cls, cls).bind(prefix, **kw)
+
+
 def resolve_gdn_binding(
     cls: Any, binding: ModuleBinding, resolved: ResolvedModuleGeometry
 ) -> ResolvedModuleGeometry:
     vals = dict(resolved.values)
     opts = {k: v for k, v in binding.options.items() if v is not None}
     conv_k = _check_conv_kernel(int(vals.get("conv_kernel", 4)))
-    raw_gate = vals.get("gate", opts.get("gate", "silu"))
+    opt_gate = opts.get("gate")
+    if (
+        opt_gate is not None
+        and "gate" not in binding.explicit_fields
+        and "gdn_gate" not in binding.explicit_fields
+        and binding.fields.get("gate") != ("gdn_gate", opt_gate)
+    ):
+        raw_gate = opt_gate
+    else:
+        raw_gate = vals.get("gate", vals.get("gdn_gate", opt_gate or "silu"))
     gate = validate_gdn_gate(raw_gate)
     if gate != "silu" or "gate" in opts:
         opts["gate"] = gate
