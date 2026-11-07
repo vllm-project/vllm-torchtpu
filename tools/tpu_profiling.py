@@ -18,9 +18,9 @@
 # Please see docs/developers_guide/profiling/ for more details, including how
 # to view the resulting traces and how to profile a running server instead.
 # Usage example for prefilling 1 request of 1024 tokens:
-# python3 examples/tpu_profiling.py --input-len 1024 --output-len 1   --batch-size 1
+# python3 tools/tpu_profiling.py --input-len 1024 --output-len 1   --batch-size 1
 # Usage example for decoding 256 requests of 1 token each:
-# python3 examples/tpu_profiling.py --input-len 1 --output-len 1 --batch-size=256
+# python3 tools/tpu_profiling.py --input-len 1 --output-len 1 --batch-size=256
 
 import argparse
 import dataclasses

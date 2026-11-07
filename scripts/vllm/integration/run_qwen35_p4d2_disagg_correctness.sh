@@ -158,7 +158,7 @@ export RUN_PREFIX_CACHE_E2E_DIVERGENCE="${RUN_PREFIX_CACHE_E2E_DIVERGENCE:-1}"
 
 cd "${repo_root}"
 
-bash examples/disagg/launch_qwen35_p4d2_v2_baseline.sh \
+bash tools/disagg/launch_qwen35_p4d2_v2_baseline.sh \
   2>&1 | tee "${RUN_DIR}/logs/launch.log"
 
 if ! grep -Fqx \

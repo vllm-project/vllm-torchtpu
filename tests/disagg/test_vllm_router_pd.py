@@ -15,7 +15,7 @@
 """vllm-router's prefill/decode mode speaks the toy proxy's two-hop protocol.
 
 The image ships vllm-router (docker/Dockerfile, stage `router-build`) and
-k3_agentx_client_pod.sh starts it in place of examples/disagg/toy_proxy_server.py
+k3_agentx_client_pod.sh starts it in place of tools/disagg/toy_proxy_server.py
 when a config sets AGENTX_PROXY=router. The engines see the same two hops
 either way: the prefill request with max_tokens=1 and no streaming, then the
 decode request carrying the kv_transfer_params the prefill answered with.

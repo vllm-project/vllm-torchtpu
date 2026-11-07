@@ -1,12 +1,12 @@
-# Offline profiling with `examples/tpu_profiling.py`
+# Offline profiling with `tools/tpu_profiling.py`
 
-[`examples/tpu_profiling.py`](https://github.com/vllm-project/vllm-torchtpu/blob/main/examples/tpu_profiling.py) drives the offline
+[`tools/tpu_profiling.py`](https://github.com/vllm-project/vllm-torchtpu/blob/main/tools/tpu_profiling.py) drives the offline
 `LLM` API with a synthetic batch, warms up, and then captures a trace of
 `--num-iters` generate calls. Use it when you want a clean trace of one shape
 with no scheduler noise.
 
 ```bash
-python3 examples/tpu_profiling.py --model <model> [OPTIONS]
+python3 tools/tpu_profiling.py --model <model> [OPTIONS]
 ```
 
 Key arguments:
@@ -24,7 +24,7 @@ Key arguments:
 **Profile a prefill.** Long prompt, one output token, small batch:
 
 ```bash
-python3 examples/tpu_profiling.py \
+python3 tools/tpu_profiling.py \
   --model Qwen/Qwen3-30B-A3B-FP8 \
   --tensor-parallel-size 4 \
   --enable-expert-parallel \
@@ -37,7 +37,7 @@ python3 examples/tpu_profiling.py \
 **Profile a decode.** Single-token requests, large batch:
 
 ```bash
-python3 examples/tpu_profiling.py \
+python3 tools/tpu_profiling.py \
   --model Qwen/Qwen3-30B-A3B-FP8 \
   --tensor-parallel-size 4 \
   --enable-expert-parallel \
@@ -47,5 +47,5 @@ python3 examples/tpu_profiling.py \
   --profile-result-dir profiles/decode_bs256
 ```
 
-[`examples/run_profiling_suite.sh`](https://github.com/vllm-project/vllm-torchtpu/blob/main/examples/run_profiling_suite.sh) sweeps a
+[`tools/run_profiling_suite.sh`](https://github.com/vllm-project/vllm-torchtpu/blob/main/tools/run_profiling_suite.sh) sweeps a
 matrix of these; uncomment the experiments you want and run it.

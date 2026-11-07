@@ -5,7 +5,7 @@ Prefill/Decode (P/D) disaggregation separates compute-bound **Prefill** (`kv_pro
 `vllm-torchtpu` supports two KV cache transfer connectors:
 
 1. **Raiden KV Connector (`TpuRaidenConnector`)**: High-bandwidth PJRT DMA/RDMA engine powered by `tpu-sync-torch` (`tpu_sync`) with a central coordinator (`run_raiden_controller.py`) and support for **heterogeneous P/D resharding** (e.g., Prefill with `PCP=4, TP=2` transferring KV cache into Decode with `DP=8, TP=1`).
-2. **Host TCP/Side-Channel Connector (`TPUConnector`)**: Lightweight single-host or multi-host connector for functional testing and local disaggregation (`examples/disagg/run_disagg_single_host.sh`).
+2. **Host TCP/Side-Channel Connector (`TPUConnector`)**: Lightweight single-host or multi-host connector for functional testing and local disaggregation (`tools/disagg/run_disagg_single_host.sh`).
 
 ---
 
@@ -13,26 +13,26 @@ Prefill/Decode (P/D) disaggregation separates compute-bound **Prefill** (`kv_pro
 
 A production Raiden P/D deployment consists of four components:
 
-1. **Raiden Controller (`examples/disagg/run_raiden_controller.py`)**: Coordinates KV transfer metadata and pool registration across Prefill and Decode workers.
+1. **Raiden Controller (`tools/disagg/run_raiden_controller.py`)**: Coordinates KV transfer metadata and pool registration across Prefill and Decode workers.
 2. **Prefill Engine Pool (`kv_role="kv_producer"`)**: Computes prompt prefill, writes KV blocks into the unified/Raiden block pool, and streams KV blocks to the Decode pool.
 3. **Decode Engine Pool (`kv_role="kv_consumer"`)**: Receives KV blocks into its local HBM KV cache (resharding on the fly if P and D meshes differ) and generates output tokens.
-4. **Disaggregated Proxy Router (`examples/disagg/toy_proxy_server.py`)**: Accepts client OpenAI HTTP requests, routes a `max_tokens=1` prefill request to a Prefill instance, and forwards the request with KV transfer parameters to a Decode instance.
+4. **Disaggregated Proxy Router (`tools/disagg/toy_proxy_server.py`)**: Accepts client OpenAI HTTP requests, routes a `max_tokens=1` prefill request to a Prefill instance, and forwards the request with KV transfer parameters to a Decode instance.
 
 ---
 
 ## 2. Single-Host Disaggregated Serving Quickstart
 
-On an 8-device TPU host, you can launch a complete Prefill + Decode + Proxy pipeline using `examples/disagg/run_disagg_single_host.sh`:
+On an 8-device TPU host, you can launch a complete Prefill + Decode + Proxy pipeline using `tools/disagg/run_disagg_single_host.sh`:
 
 ```bash
 MODEL="Qwen/Qwen3-0.6B" \
 INPUT_LEN=512 \
 OUTPUT_LEN=128 \
 NUM_PROMPTS=200 \
-bash examples/disagg/run_disagg_single_host.sh
+bash tools/disagg/run_disagg_single_host.sh
 ```
 
-The script pins separate `/dev/vfio/<N>` devices to the Prefill (`kv_producer`) and Decode (`kv_consumer`) `vllm serve` processes, starts `examples/disagg/toy_proxy_server.py` on port `8000`, and runs `vllm bench serve` against the proxy.
+The script pins separate `/dev/vfio/<N>` devices to the Prefill (`kv_producer`) and Decode (`kv_consumer`) `vllm serve` processes, starts `tools/disagg/toy_proxy_server.py` on port `8000`, and runs `vllm bench serve` against the proxy.
 
 ---
 
@@ -45,7 +45,7 @@ For large models such as `Qwen/Qwen3.5-397B-A17B`, `Qwen/Qwen3.5-35B-A3B-FP8`, `
 Run the Raiden controller on a reachable host/port (default `50055`):
 
 ```bash
-python examples/disagg/run_raiden_controller.py \
+python tools/disagg/run_raiden_controller.py \
   --host 0.0.0.0 \
   --port 50055
 ```
@@ -101,7 +101,7 @@ vllm serve Qwen/Qwen3.5-35B-A3B-FP8 \
 ### Step 4: Launch the Disaggregated Proxy Server
 
 ```bash
-python examples/disagg/toy_proxy_server.py \
+python tools/disagg/toy_proxy_server.py \
   --host 0.0.0.0 \
   --port 8000 \
   --prefiller-hosts <PREFILL_HOST_IP> \
@@ -154,9 +154,9 @@ Capacity-preemption abort follows `kv_load_failure_policy` by default (`"fail"` 
 
 | Script / Manifest | Description |
 | :--- | :--- |
-| `examples/disagg/launch_qwen35_disagg_multihost.sh` | Turnkey launcher for Qwen3.5 P/D disaggregation supporting `ROLE=controller\|prefill\|decode\|proxy\|all`. |
-| `examples/disagg/launch_dsv4_disagg_multihost.sh` | Turnkey launcher for DeepSeek-V4 multi-host P/D disaggregation. |
-| `examples/disagg/run_qwen35_raiden_pcp8_dp8_live_pair.sh` | Live pair script demonstrating heterogeneous resharding from Prefill (`PCP=8`) to Decode (`DP=8`). |
+| `tools/disagg/launch_qwen35_disagg_multihost.sh` | Turnkey launcher for Qwen3.5 P/D disaggregation supporting `ROLE=controller\|prefill\|decode\|proxy\|all`. |
+| `tools/disagg/launch_dsv4_disagg_multihost.sh` | Turnkey launcher for DeepSeek-V4 multi-host P/D disaggregation. |
+| `tools/disagg/run_qwen35_raiden_pcp8_dp8_live_pair.sh` | Live pair script demonstrating heterogeneous resharding from Prefill (`PCP=8`) to Decode (`DP=8`). |
 | `.buildkite/kubernetes/manifests/workloads/qwen3.5-397b-1p1d.yaml` | GKE JobSet manifest for `Qwen3.5-397B-A17B` 1P1D disaggregated serving. |
 | `.buildkite/kubernetes/manifests/workloads/kimi-k3-1p1d-4dp8tp.yaml` | GKE JobSet manifest for `Kimi-K3` 1P1D disaggregated serving. |
 
