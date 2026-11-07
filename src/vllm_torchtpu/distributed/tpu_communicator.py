@@ -33,40 +33,58 @@ from vllm.distributed.parallel_state import GroupCoordinator, get_dp_group, get_
 # 20 MB of HBM (~5 us), under the ~10 us fixed latency of the saved all-gather.
 PACKED_DISPATCH_MAX_TOKENS = 256
 
-_INT_DTYPE_BY_SIZE = {1: torch.int8, 2: torch.int16, 4: torch.int32, 8: torch.int64}
+
+def _to_int16_columns(t: torch.Tensor) -> torch.Tensor:
+    """[N, ...] 16- or 32-bit tensor as [N, k] int16 holding its bits.
+
+    A 32-bit word is split into its high and low halves with shifts rather
+    than a size-changing ``view(dtype)``, whose element order on the device
+    need not match PyTorch's.
+    """
+    rows = t.contiguous().reshape(t.shape[0], -1)
+    if t.element_size() == 2:
+        return rows.view(torch.int16)
+    words = rows.view(torch.int32)
+    hi = (words >> 16).to(torch.int16)
+    lo = ((words << 16) >> 16).to(torch.int16)
+    return torch.stack((hi, lo), dim=-1).reshape(t.shape[0], -1)
+
+
+def _from_int16_columns(columns: torch.Tensor, like: torch.Tensor) -> torch.Tensor:
+    """Inverse of ``_to_int16_columns`` for rows shaped like ``like``'s."""
+    if like.element_size() == 2:
+        rows = columns.contiguous().view(like.dtype)
+    else:
+        halves = columns.reshape(columns.shape[0], -1, 2).to(torch.int32)
+        words = (halves[..., 0] << 16) | (halves[..., 1] & 0xFFFF)
+        rows = words.view(like.dtype)
+    return rows.reshape(-1, *like.shape[1:])
 
 
 def _all_gather_packed(
     group: GroupCoordinator, tensors: tuple[torch.Tensor, ...]
 ) -> tuple[torch.Tensor, ...]:
-    """All-gather row-aligned tensors along dim 0 in one collective.
+    """All-gather row-aligned tensors along dim 0 in one int16 collective.
 
-    Rows are reinterpreted as integers of the first tensor's element size and
-    concatenated on the last dim, then gathered in the first tensor's dtype.
-    The concatenation is integer: XLA lowers a float one as pad(-inf) + max,
-    which need not keep NaN or denormal bit patterns of the reinterpreted
-    words. Every output is bit-identical to gathering its tensor alone.
+    Every output is bit-identical to gathering its tensor alone: only integer
+    ops touch the bits. A float concatenation (lowered by XLA as pad(-inf) +
+    max) or a float collective need not keep the NaN, denormal or signed-zero
+    patterns that reinterpreted words take.
     """
-    int_dtype = _INT_DTYPE_BY_SIZE[tensors[0].element_size()]
-    rows = [t.contiguous().view(int_dtype).reshape(t.shape[0], -1) for t in tensors]
-    packed = torch.cat(rows, dim=-1).view(tensors[0].dtype)
-    gathered = group.all_gather(packed, dim=0).view(int_dtype)
-    parts = torch.split(gathered, [r.shape[-1] for r in rows], dim=-1)
-    return tuple(
-        part.contiguous().view(t.dtype).reshape(-1, *t.shape[1:])
-        for part, t in zip(parts, tensors)
-    )
+    columns = [_to_int16_columns(t) for t in tensors]
+    gathered = group.all_gather(torch.cat(columns, dim=-1), dim=0)
+    parts = torch.split(gathered, [c.shape[-1] for c in columns], dim=-1)
+    return tuple(_from_int16_columns(p, t) for p, t in zip(parts, tensors))
 
 
 def _gathers_packed(tensors: tuple[torch.Tensor, ...]) -> bool:
     # Decided while tracing. Only the backbone is traced per token bucket
     # group (vllm_torchtpu.compilation.shape_variants), so a drafter graph must
     # not compare its token count; the tag is checked first.
-    first = tensors[0]
     return (
         vllm_compilation_backends.model_tag == "backbone"
-        and 0 < first.shape[0] <= PACKED_DISPATCH_MAX_TOKENS
-        and all(t.element_size() % first.element_size() == 0 for t in tensors)
+        and 0 < tensors[0].shape[0] <= PACKED_DISPATCH_MAX_TOKENS
+        and all(t.element_size() in (2, 4) for t in tensors)
     )
 
 

@@ -184,7 +184,7 @@ def test_decode_sized_dispatch_gathers_once_bit_exact(
     tensors = _dispatch_tensors(method, comm.PACKED_DISPATCH_MAX_TOKENS)
     result = getattr(communicator, method)(*tensors)
     group.all_gather.assert_called_once()
-    assert group.all_gather.call_args.args[0].dtype == torch.bfloat16
+    assert group.all_gather.call_args.args[0].dtype == torch.int16
     assert len(result) == len(tensors)
     for actual, expected in zip(result, tensors):
         assert actual.dtype == expected.dtype
