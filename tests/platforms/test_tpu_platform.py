@@ -916,6 +916,44 @@ class TestTpuPlatform:
 
         assert vllm_config.scheduler_config.disable_chunked_mm_input is False
 
+    @patch("vllm_torchtpu.patch_registry.apply")
+    @patch(
+        "vllm_torchtpu.platforms.tpu_platform.TpuPlatform._prepare_singlehost_tpu_env"
+    )
+    def test_check_and_update_config_resolves_auto_worker_cls(
+        self, mock_prepare_env, mock_apply_patches, vllm_config
+    ):
+        vllm_config.cache_config.block_size = 16
+        vllm_config.parallel_config.worker_cls = "auto"
+
+        TpuPlatform.check_and_update_config(vllm_config)
+
+        assert (
+            vllm_config.parallel_config.worker_cls
+            == "vllm_torchtpu.worker.tpu_worker.TPUWorker"
+        )
+
+    @patch("vllm_torchtpu.patch_registry.apply")
+    @patch(
+        "vllm_torchtpu.platforms.tpu_platform.TpuPlatform._prepare_singlehost_tpu_env"
+    )
+    def test_check_and_update_config_keeps_explicit_worker_cls(
+        self, mock_prepare_env, mock_apply_patches, vllm_config
+    ):
+        # vllm-omni resolves each stage's worker (e.g. the Omni AR worker)
+        # before this hook runs; the hook must not clobber that choice.
+        vllm_config.cache_config.block_size = 16
+        vllm_config.parallel_config.worker_cls = (
+            "vllm_torchtpu.omni.worker.tpu_ar_worker.TPUARWorker"
+        )
+
+        TpuPlatform.check_and_update_config(vllm_config)
+
+        assert (
+            vllm_config.parallel_config.worker_cls
+            == "vllm_torchtpu.omni.worker.tpu_ar_worker.TPUARWorker"
+        )
+
     @pytest.mark.parametrize(
         ("initial_cls", "expected_cls"),
         [
@@ -1250,11 +1288,17 @@ def test_qwen_wrappers_are_installed_once_across_model_loads(
     originals = [getattr(target, name) for target, name in targets]
     for (target, name), original in zip(targets, originals):
         monkeypatch.setattr(target, name, original)
+    # Every model-gated callback runs against these, so they carry the fields
+    # a real ModelConfig has: hf_config, model and architectures.
     other_model = SimpleNamespace(
-        hf_config=SimpleNamespace(model_type="llama"), model="llama"
+        hf_config=SimpleNamespace(model_type="llama"),
+        model="llama",
+        architectures=["LlamaForCausalLM"],
     )
     qwen_model = SimpleNamespace(
-        hf_config=SimpleNamespace(model_type="qwen3_vl"), model="Qwen/Qwen3-VL-4B"
+        hf_config=SimpleNamespace(model_type="qwen3_vl"),
+        model="Qwen/Qwen3-VL-4B",
+        architectures=["Qwen3VLForConditionalGeneration"],
     )
     reg.apply("platform_activation", model_config=other_model)
     assert [getattr(target, name) for target, name in targets] == originals

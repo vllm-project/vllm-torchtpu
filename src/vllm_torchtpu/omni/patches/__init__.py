@@ -20,6 +20,11 @@ itself: apply_omni_tpu_patches() when the platform is constructed, and
 apply_omni_model_specific_patches() at attention backend selection
 (get_diffusion_attn_backend_cls). Tracked in #1862 for unification with
 patch_registry.py.
+
+Patches for stages that do run through TPUWorker, the autoregressive stages
+served by TPUARWorker, live in one submodule per model of this package and
+are installed through patch_registry.PATCHES like every other model patch;
+see qwen3omni_thinker.py.
 """
 
 from functools import cache as run_once
