@@ -151,6 +151,9 @@ def get_packing_factor(storage_dtype: jnp.dtype, quant_dtype: jnp.dtype | None) 
 # matmuls per 128-deep quant block re-stream the lhs rows, which binds from
 # 64 rows on (a tie with bf16 there). Crossover measured on tpu7x MXU timings.
 FP8_RHS_MAX_BUCKET_M = 48
+# Decode tile_m on the fp8 rhs feed (replaces tile_m 64): on tpu7x, rows up to
+# it cost no more than one row.
+FP8_RHS_TILE_M = 32
 
 # Define data classes.
 
@@ -1093,18 +1096,18 @@ def calculate_tiling(
             break
         tile_m = new_tile_m
 
-    # A single bucket makes every decode group pay for tile_m rows. Where rows
-    # cost MXU time (the fp8 rhs feed), bucket by the lhs sublane tile instead.
-    sublane = _get_lhs_sublane_size(lhs_dtype, dims.size_m)
-    fine_base = max(sublane, tile_m // max_num_buckets)
-    # Partial buckets assume a single k tile (run_matmul_step).
+    # An untiled-up (decode) tile_m makes every group pay for tile_m rows, and
+    # rows cost MXU time on the fp8 rhs feed: use fp8-sized tiles instead.
+    # Two such tiles cost what one bf16 tile does, and more buckets would
+    # bloat the program (each bucket is a copy of the body).
     if (
         bucket_base == tile_m
-        and num_k_tiles == 1
-        and tile_m % fine_base == 0
+        and dims.size_m < 2 * tile_m  # growth stopped by size_m, not VMEM
+        and tile_m > FP8_RHS_MAX_BUCKET_M
+        and tile_m % FP8_RHS_TILE_M == 0
         and fp8_rhs_feed_dtype(lhs_cfgs, rhs_cfgs) is not None
     ):
-        bucket_base = fine_base
+        tile_m = bucket_base = FP8_RHS_TILE_M
 
     return TileSizes(
         tile_m=tile_m, tile_k=tile_k, tile_n=tile_n, bucket_base=bucket_base
