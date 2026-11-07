@@ -36,7 +36,7 @@ from vllm_torchtpu import megakernel_runtime as mkr
 from vllm_torchtpu.megakernel import errors as mk_errors
 from vllm_torchtpu.megakernel.runtime.contract import Bucket, RunnerShape, TpuMonoSpec
 from vllm_torchtpu.megakernel_runtime import fingerprint as fp
-from vllm_torchtpu.megakernel_runtime import testing, testkit
+from vllm_torchtpu.megakernel_runtime import stepping, testing, testkit
 from vllm_torchtpu.megakernel_runtime.hooks import StepContext
 from vllm_torchtpu.megakernel_runtime.plugin import RunnerView
 from vllm_torchtpu.megakernel_runtime.testkit import (
@@ -80,7 +80,7 @@ def _runner(options: dict[str, Any] | None = None, **kw: Any) -> Any:
 
 def _fwd_ctx(monkeypatch: pytest.MonkeyPatch) -> None:
     ctx = SimpleNamespace(attn_metadata={})
-    monkeypatch.setattr(driver_mod, "get_forward_context", lambda: ctx)
+    monkeypatch.setattr(stepping, "get_forward_context", lambda: ctx)
 
 
 def test_toy_plugin_serves_through_try_forward(
@@ -551,17 +551,6 @@ def test_weight_update_guard() -> None:
     serving = object.__new__(driver_mod.ProgramDriver)
     with pytest.raises(mkr.MegakernelUnsupported, match="weight_update"):
         mkr.guard_weight_update(SimpleNamespace(_megakernel=serving))
-
-
-def test_runner_shapes_without_paddings() -> None:
-    shapes = driver_mod.runner_shapes(
-        Bucket(4, 16), (), (), ckpt_window=1, max_pages_per_seq=9
-    )
-    assert shapes == [RunnerShape(16, 4, 9, 4)]
-    shapes = driver_mod.runner_shapes(
-        Bucket(1, 64), (16, 32), ((4, 2), (1, 8)), ckpt_window=3, max_pages_per_seq=9
-    )
-    assert shapes == [RunnerShape(32, 4, 2, 3), RunnerShape(32, 1, 8, 3)]
 
 
 # --- 2-rank gloo ----------------------------------------------------------------

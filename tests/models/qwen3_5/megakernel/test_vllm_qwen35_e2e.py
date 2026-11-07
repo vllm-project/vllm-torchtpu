@@ -32,6 +32,7 @@ from jax.sharding import PartitionSpec as P
 import vllm_torchtpu.megakernel as mk
 import vllm_torchtpu.megakernel_runtime.driver as driver_mod
 import vllm_torchtpu.megakernel_runtime.guards as guards_mod
+import vllm_torchtpu.megakernel_runtime.stepping as stepping_mod
 from tests.models.qwen3_5.megakernel.test_weight_collector import (
     _jax_to_torch,
     make_synthetic_qwen35_backbone,
@@ -2163,7 +2164,7 @@ def test_can_run_real_tpu_runner_metadata(monkeypatch: pytest.MonkeyPatch) -> No
         md_dict[name] = m_md
 
     monkeypatch.setattr(
-        driver_mod,
+        stepping_mod,
         "get_forward_context",
         lambda: SimpleNamespace(attn_metadata=md_dict),
     )
@@ -2499,7 +2500,7 @@ def test_megakernel_driver_e2e_decode_verify_and_spec_accept(
         md_dict[name] = m_md
 
     monkeypatch.setattr(
-        driver_mod,
+        stepping_mod,
         "get_forward_context",
         lambda: SimpleNamespace(attn_metadata=md_dict),
     )
@@ -3062,7 +3063,7 @@ def test_driver_inspect_step_detail_differential_and_unprepared_call(
     for name, m_md in zip(driver.program.mamba_layer_names, m_mds_call, strict=True):
         md_dict[name] = m_md
     monkeypatch.setattr(
-        driver_mod,
+        stepping_mod,
         "get_forward_context",
         lambda: SimpleNamespace(attn_metadata=md_dict),
     )

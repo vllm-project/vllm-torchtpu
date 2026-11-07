@@ -32,6 +32,7 @@ import torch
 
 import vllm_torchtpu.megakernel_runtime.agreement as agreement_mod
 import vllm_torchtpu.megakernel_runtime.driver as driver_mod
+import vllm_torchtpu.megakernel_runtime.stepping as stepping_mod
 from tests.models.qwen3_5.megakernel.test_vllm_qwen35_e2e import (
     _allocate_aliased_pools,
     _cpu_mesh,
@@ -354,7 +355,7 @@ def test_shorthand_and_plugin_key_serve_identical_steps(
         keys.append(sorted(drv._steps))
         md = _md_dict(drv)
         monkeypatch.setattr(
-            driver_mod,
+            stepping_mod,
             "get_forward_context",
             lambda md=md: SimpleNamespace(attn_metadata=md),
         )

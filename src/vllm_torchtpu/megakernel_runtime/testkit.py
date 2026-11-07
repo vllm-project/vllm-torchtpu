@@ -291,8 +291,7 @@ def run_cpu_e2e(
     forward context's attention metadata during the steps. Raises
     `AssertionError` if the megakernel doesn't serve after startup or bind.
     """
-    from . import driver as driver_mod
-    from . import maybe_create
+    from . import maybe_create, stepping
 
     if not hasattr(runner, "vllm_config") and callable(runner):
         runner = runner()
@@ -313,7 +312,7 @@ def run_cpu_e2e(
     hits: list[bool] = []
     outputs: list[Any] = []
     fwd_ctx = SimpleNamespace(attn_metadata=md)
-    with mock.patch.object(driver_mod, "get_forward_context", lambda: fwd_ctx):
+    with mock.patch.object(stepping, "get_forward_context", lambda: fwd_ctx):
         for ctx in _step_contexts(ctxs):
             hit, out = drv.try_forward(runner, ctx)
             hits.append(bool(hit))
@@ -333,7 +332,8 @@ import torch.distributed as dist
 dist.init_process_group("gloo", init_method=init, rank=rank, world_size=2,
                         timeout=datetime.timedelta(seconds=60))
 from vllm_torchtpu.megakernel_runtime import agreement as a, driver as d, testing
-for lazy in (d.logger, a.logger):
+from vllm_torchtpu.megakernel_runtime import stepping as st
+for lazy in (d.logger, a.logger, st.logger):
     try:
         lazy._resolve()
     except ModuleNotFoundError:
