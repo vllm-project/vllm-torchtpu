@@ -255,6 +255,8 @@ _TPU_COMPILE_ENV_IGNORED = {
     # When a staged Qwen PD decode runs its (unchanged) repack program.
     "QWEN4_EXP_PD_SYNC_REPACK",
     "QWEN4_EXP_PD_SYNC_REPACK_AB_S",
+    # When a staged decode's released staging pages may be reused (host-only).
+    "QWEN4_EXP_PD_STAGING_QUARANTINE_STEPS",
     # Where a staged decode's compressed keys land (once per host, then a
     # landing all-gather): adds shape-keyed landing programs, changes none.
     "QWEN4_EXP_PD_SHARED_COMPRESSED",

@@ -121,6 +121,18 @@ def _live_page_bytes(pool) -> int:
     return int(pool.block_stride_bytes)
 
 
+def quarantine_steps() -> int:
+    """QWEN4_EXP_PD_STAGING_QUARANTINE_STEPS (envs; read directly when this
+    module is loaded by path, without the package)."""
+    try:
+        from vllm_torchtpu import envs
+    except ImportError:
+        import os
+
+        return max(0, int(os.environ.get("QWEN4_EXP_PD_STAGING_QUARANTINE_STEPS", "3")))
+    return int(envs.QWEN4_EXP_PD_STAGING_QUARANTINE_STEPS)
+
+
 def owner_kind(name: str) -> str:
     if name.endswith(".compressed_k"):
         return "compressed"
@@ -1249,13 +1261,46 @@ class StagedConsumer:
         ]
 
     def release(self, uuid: int) -> dict[str, list[int]] | None:
+        """Drop a load's reservation. Its pages return to the free map only
+        after QWEN4_EXP_PD_STAGING_QUARANTINE_STEPS engine steps
+        (``advance_quarantine``): the repack and the S4 landing gather that read
+        them are only enqueued on the device when this runs, and the next
+        load's bytes land through raw host-to-device copies that do not wait
+        for those reads."""
         self.skips.pop(uuid, None)
         getattr(self, "tokens", {}).pop(uuid, None)
         pages = self.reservations.pop(uuid, None)
         if pages is not None:
-            for owner_pages in pages.values():
-                self.free[owner_pages] = 1
+            held = [int(p) for owner_pages in pages.values() for p in owner_pages]
+            steps = quarantine_steps()
+            if steps > 0 and held:
+                # Created on first use (consumers assembled without __init__).
+                self.__dict__.setdefault("quarantine", []).append([steps, held])
+            elif held:
+                self.free[held] = 1
         return pages
+
+    def advance_quarantine(self) -> int:
+        """Once per engine step on every rank, before the step's repacks and
+        admission: count every quarantined release down by one and return the
+        pages whose count reaches zero to the free map. Every rank releases
+        the same loads in the same named steps (L1), and reserve allocates only
+        pages free on every rank either way. Returns the pages freed."""
+        held = self.__dict__.get("quarantine")
+        if not held:
+            return 0
+        freed = []
+        for entry in held:
+            entry[0] -= 1
+            if entry[0] <= 0:
+                freed.extend(entry[1])
+        if freed:
+            self.free[freed] = 1
+            held[:] = [entry for entry in held if entry[0] > 0]
+        return len(freed)
+
+    def quarantined_pages(self) -> int:
+        return sum(len(entry[1]) for entry in self.__dict__.get("quarantine", ()))
 
     # --- the repack ---
 

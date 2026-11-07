@@ -251,6 +251,12 @@ class Qwen4ExpRaidenConnector(TPURaidenConnector):
 
     def start_load_kv(self, *args, **kwargs) -> None:
         worker = self.connector_worker
+        staging = getattr(worker, "_staging", None) if worker is not None else None
+        advance = getattr(staging, "advance_quarantine", None)
+        if advance is not None:
+            # Staging pages released QWEN4_EXP_PD_STAGING_QUARANTINE_STEPS steps
+            # ago are free again, before this step's repacks and admission.
+            advance()
         if self._sync_repack and worker is not None:
             # Before this step's forward, so a request admitted in this step
             # reads its repacked pages.

@@ -352,4 +352,8 @@ def test_a_consumer_built_without_init_takes_the_broadcast_path():
     s.free = torch.tensor([0] + [1] * 15, dtype=torch.int32)
     s.reservations, s.skips = {}, {}
     assert s.reserve(7, 40)
-    assert s.release(7) is not None and int(s.free.sum()) == 15
+    assert s.release(7) is not None
+    # Released pages return after the staging quarantine (M1, lane_xfer §11.21).
+    for _ in range(pd_staging.quarantine_steps()):
+        s.advance_quarantine()
+    assert int(s.free.sum()) == 15

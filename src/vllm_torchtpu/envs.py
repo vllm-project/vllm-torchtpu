@@ -65,6 +65,7 @@ if TYPE_CHECKING:
     VLLM_TPU_GDN_PREFILL_NO_ZERO_INIT: bool = False
     QWEN4_EXP_PREFILL_SP: bool = False
     QWEN4_EXP_PD_STAGING_BYTES: int = 8 << 30
+    QWEN4_EXP_PD_STAGING_QUARANTINE_STEPS: int = 3
     QWEN4_EXP_PD_ROUTED_DST: str = ""
     QWEN4_EXP_PD_SYNC_REPACK: bool = False
     QWEN4_EXP_PD_SYNC_REPACK_AB_S: int = 0
@@ -1131,6 +1132,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # (models/vllm/qwen4_exp/pd_staging.py). Bytes of that carrier per rank;
     # a load that does not fit recomputes on the decode.
     "QWEN4_EXP_PD_STAGING_BYTES": env_int("QWEN4_EXP_PD_STAGING_BYTES", 8 << 30),
+    # Engine steps a staged decode holds a load's staging pages after its
+    # repack is enqueued, before another load may reuse them. The repack (and
+    # S4's landing gather) run asynchronously on the device, while the next
+    # load's bytes land through tpu_sync's raw host-to-device copies, which do
+    # not wait for queued device reads: freeing the pages at once lets a new
+    # load overwrite them before the old repack reads them (one request then
+    # repacks another's KV). Pages released in step N return to the free map
+    # at the start of step N + steps; 3 covers a repack enqueued after step
+    # N's forward with step results read one step late
+    # (VLLM_TPU_DEFER_PREV_RESULTS_WAIT). 0 frees at once (the old behaviour).
+    "QWEN4_EXP_PD_STAGING_QUARANTINE_STEPS": env_nonnegative_int(
+        "QWEN4_EXP_PD_STAGING_QUARANTINE_STEPS", 3
+    ),
     # "<decode tp>,<decode dcp>,<decode block>" on BOTH legs of a TP1 pipeline
     # producer -> staged TP>1 Qwen4Exp decode: the producer routes each decode
     # rank only its slice (main-KV DCP runs, its GDN heads; compressed keys,
