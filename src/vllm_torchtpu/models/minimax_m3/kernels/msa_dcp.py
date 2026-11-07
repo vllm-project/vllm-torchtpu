@@ -305,9 +305,8 @@ def msa_write_and_candidates_dcp(
         interpret=interpret,
     )
     fp4 = scale_cache is not None
+    scale_row = msa_fp4.index_scale_row(num_heads) if fp4 else None
     if fp4:
-        if num_heads != 1:
-            raise NotImplementedError("4-bit MSA caches under DCP hold one KV head per rank")
         kv_cache, index_cache, scale_cache = msa.write_fp4(
             kv_cache, index_cache, scale_cache, k, v, index_k, write, pages, pos
         )
@@ -327,7 +326,7 @@ def msa_write_and_candidates_dcp(
             distribution[2],
             interpret,
             scale_cache,
-            msa_fp4.index_scale_row(1) if fp4 else None,
+            scale_row,
         )
     else:
         # All heads in one pass over this rank's index pages: [G, T, P],
@@ -341,6 +340,8 @@ def msa_write_and_candidates_dcp(
             distribution[2],
             shards=1,
             interpret=interpret,
+            scale_cache=scale_cache,
+            scale_row=scale_row,
         ).reshape(num_heads * num_tokens, 1, -1)
     cand_scores, cand_blocks = local_candidates(
         scores,
@@ -413,17 +414,22 @@ def msa_attend_dcp(
     )
     args = (local_key, pos % block_size + 1, block_tables.reshape(-1))
     if scale_cache is not None:
-        if num_heads != 1:
-            raise NotImplementedError("4-bit MSA caches under DCP hold one KV head per rank")
-        out, lse = msa_attention_lse.msa_sparse_attention_lse(
-            msa_fp4.rotate_queries(q),
-            kv_cache,
-            keys[:, 0],
-            *args,
-            head=0,
-            **common,
-            **msa._fp4_attention_kwargs(scale_cache),
-        )
+        q = msa_fp4.rotate_queries(q)
+        if num_heads == 1:
+            out, lse = msa_attention_lse.msa_sparse_attention_lse(
+                q,
+                kv_cache,
+                keys[:, 0],
+                *args,
+                head=0,
+                **common,
+                **msa._fp4_attention_kwargs(scale_cache),
+            )
+        else:
+            # KV head h's K / V scales are scale-page rows 2h / 2h + 1.
+            out, lse = msa_attention_lse.msa_sparse_attention_lse_heads(
+                q, kv_cache, keys, *args, **common, scale_cache=scale_cache
+            )
         return msa_fp4.unrotate_output(out), lse
     if num_heads == 1:
         return msa_attention_lse.msa_sparse_attention_lse(

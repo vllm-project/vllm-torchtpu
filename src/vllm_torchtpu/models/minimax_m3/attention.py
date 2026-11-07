@@ -110,11 +110,11 @@ class MiniMaxM3Cache(nn.Module, TpuOwnedKVCache):
 
 
 class MiniMaxM3ScaleCache(MiniMaxM3Cache):
-    """Scale pages of a layer's 4-bit caches: ``[pages, 8, 128]`` f32, one
+    """Scale pages of a layer's 4-bit caches: ``[pages, R, 128]`` f32, one
     page per KV block, lanes = the block's tokens (`kernels.msa_fp4`)."""
 
-    def __init__(self, prefix: str) -> None:
-        super().__init__(msa_fp4.SCALE_ROWS, torch.float32, prefix)
+    def __init__(self, kv_heads: int, prefix: str) -> None:
+        super().__init__(msa_fp4.scale_rows(kv_heads), torch.float32, prefix)
         if self.block_size != msa_fp4.SCALE_LANES:
             raise NotImplementedError(
                 f"4-bit MSA caches need block size {msa_fp4.SCALE_LANES}, "
@@ -122,16 +122,16 @@ class MiniMaxM3ScaleCache(MiniMaxM3Cache):
             )
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
-        # 8 f32 per token = one [8, 128] page per block.
+        # R f32 per token = one [R, 128] page per block.
         return MLAAttentionSpec(
             block_size=vllm_config.cache_config.block_size,
             num_kv_heads=1,
-            head_size=msa_fp4.SCALE_ROWS,
+            head_size=self.row_width,
             dtype=torch.float32,
         )
 
     def kv_cache_shape(self, num_blocks: int) -> tuple[int, ...] | None:
-        return (num_blocks, msa_fp4.SCALE_ROWS, msa_fp4.SCALE_LANES)
+        return (num_blocks, self.row_width, msa_fp4.SCALE_LANES)
 
 
 # --additional-config key: shard the MSA index-K cache over the TP group
@@ -313,13 +313,14 @@ class MiniMaxM3SparseAttention(nn.Module):
         self.fp4 = dtype == torch.uint8
         self.scale_cache = None
         if self.fp4:
-            if self.index_shards > 1 or self.dcp_kv_heads > 1:
+            if self.index_shards > 1:
                 raise NotImplementedError(
-                    "--kv-cache-dtype int4_per_token_head needs one KV head per "
-                    f"rank and an unsharded index cache; got {self.dcp_kv_heads} "
-                    f"KV heads per rank, {self.index_shards} index shards."
+                    "--kv-cache-dtype int4_per_token_head needs an unsharded "
+                    f"index cache; got {self.index_shards} index shards."
                 )
-            self.scale_cache = MiniMaxM3ScaleCache(prefix=f"{prefix}.attn.scale_cache")
+            self.scale_cache = MiniMaxM3ScaleCache(
+                self.dcp_kv_heads, prefix=f"{prefix}.attn.scale_cache"
+            )
         msa_config = (
             scaling,
             sparse_cfg["sparse_topk_blocks"],

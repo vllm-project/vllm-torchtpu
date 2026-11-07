@@ -436,10 +436,13 @@ def partial_block_scores(
     *,
     shards: int,
     interpret: bool = False,
+    scale_cache: jax.Array | None = None,
+    scale_row: int | None = None,
 ) -> jax.Array:
     """``[H, T, P]`` per-page maxima of all ``H`` index heads over this
     rank's keys (``index_q [T, H, D]``; the cache holds ``1 / shards`` of
-    each page's tokens).
+    each page's tokens). A 4-bit cache (unsharded) takes its scale cache and
+    rotated `index_q`.
 
     The heads are folded into each request's query rows (request ``s`` owns
     rows ``[H * cu[s], H * cu[s + 1])`` in (head, token) order), so one
@@ -475,6 +478,8 @@ def partial_block_scores(
         num_heads * cu_q_lens,
         num_seqs,
         interpret,
+        scale_cache,
+        scale_row,
     )
     return scores[rows, 0]
 

@@ -4,7 +4,6 @@
 import jax
 import jax.numpy as jnp
 import numpy as np
-import pytest
 
 from vllm_torchtpu.models.minimax_m3.kernels import msa_fp4
 
@@ -58,11 +57,10 @@ def test_pack_unpack_round_trip_and_bit_positions():
     assert (int(words[1, r, w]) >> (4 * j)) & 0xF == int(nib[1, r * 8 + j, w])
 
 
-def test_index_scale_row_bounds():
+def test_scale_page_rows():
     assert msa_fp4.index_scale_row(1) == 2
-    assert msa_fp4.index_scale_row(3) == 6
-    with pytest.raises(NotImplementedError):
-        msa_fp4.index_scale_row(4)
+    assert msa_fp4.index_scale_row(4) == 8
+    assert [msa_fp4.scale_rows(g) for g in (1, 2, 3, 4, 7)] == [8, 8, 8, 16, 16]
 
 
 def test_write_fp4_stores_rotated_quantized_rows_and_scales():
@@ -115,5 +113,39 @@ def test_cache_specs_match_allocated_shapes():
         cache.token_shards, cache.block_size = 1, 128
         assert cache.kv_cache_shape(7) == expected
     scale = object.__new__(attn.MiniMaxM3ScaleCache)
-    scale.block_size = 128
-    assert scale.kv_cache_shape(7) == (7, 8, 128)
+    scale.block_size, scale.row_width = 128, msa_fp4.scale_rows(4)
+    assert scale.kv_cache_shape(7) == (7, 16, 128)
+
+
+def test_write_fp4_multi_head_rows_and_scale_rows():
+    """G = 4 KV heads per rank (DCP wider than a head's replicas): rows
+    [K_0 | V_0 | ... | K_3 | V_3], scale rows 2h / 2h + 1, index row 8."""
+    import functools
+
+    from vllm_torchtpu.models.minimax_m3.kernels import msa
+
+    rng = np.random.default_rng(5)
+    g, d, t = 4, 128, 3
+    kv_cache = msa_fp4.pack_rows(jnp.zeros((2, 128, 2 * d * g), jnp.uint8))
+    index_cache = msa_fp4.pack_rows(jnp.zeros((2, 128, d), jnp.uint8))
+    scale_cache = jnp.zeros((2, msa_fp4.scale_rows(g), 128), jnp.float32)
+    k = jnp.asarray(rng.standard_normal((t, g, d)), jnp.float32)
+    v = jnp.asarray(rng.standard_normal((t, g, d)), jnp.float32)
+    ik = jnp.asarray(rng.standard_normal((t, d)), jnp.float32)
+    pages = jnp.asarray([1, 1, 1], jnp.int32)
+    pos = jnp.asarray([10, 11, 12], jnp.int32)
+    write = functools.partial(msa.write_rows, pages=pages, pos=pos, max_num_seqs=1, interpret=True)
+    kv_cache, _, scale_cache = msa.write_fp4(
+        kv_cache, index_cache, scale_cache, k, v, ik, write, pages, pos
+    )
+    kv = np.asarray(msa_fp4.unpack_rows(kv_cache))
+    sc = np.asarray(scale_cache)
+    for h in range(g):
+        k_nib, k_s = msa_fp4.quantize(msa_fp4.rotate_keys(k[:, h]))
+        v_nib, v_s = msa_fp4.quantize(msa_fp4.rotate_keys(v[:, h]))
+        np.testing.assert_array_equal(kv[1, 10:13, 2 * h * d : (2 * h + 1) * d], k_nib)
+        np.testing.assert_array_equal(kv[1, 10:13, (2 * h + 1) * d : (2 * h + 2) * d], v_nib)
+        np.testing.assert_allclose(sc[1, 2 * h, 10:13], k_s, rtol=1e-6)
+        np.testing.assert_allclose(sc[1, 2 * h + 1, 10:13], v_s, rtol=1e-6)
+    _, i_s = msa_fp4.quantize(msa_fp4.rotate_keys(ik))
+    np.testing.assert_allclose(sc[1, msa_fp4.index_scale_row(g), 10:13], i_s, rtol=1e-6)

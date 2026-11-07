@@ -21,7 +21,8 @@ page's ``S`` rows in slot order. A value is a signed int4 ``q`` in
 ``[-7, 7]``, read as ``q * scale``.
 
 Scales. One f32 scale per token per head vector, in a per-layer scale page
-``[pages, 8, 128]`` f32 whose lanes are the page's slots: row ``2h`` holds
+``[pages, R, 128]`` f32 (`scale_rows`: R = 8, or 16 past three KV heads per
+rank) whose lanes are the page's slots: row ``2h`` holds
 the K scales of KV head ``h``, row ``2h + 1`` its V scales, row
 `index_scale_row` the index-key scales. With one scale per vector the
 kernels fold it out of the dot products: a K scale multiplies a score
@@ -108,15 +109,15 @@ def page_tokens(cache: jax.Array) -> int:
     return cache.shape[1] * TOKENS_PER_WORD
 
 
+def scale_rows(kv_heads: int) -> int:
+    """Rows of the scale page for `kv_heads` KV heads per rank: K and V rows of
+    every head plus the index row, rounded up to the 8-row f32 tile."""
+    return -(-(2 * kv_heads + 1) // SCALE_ROWS) * SCALE_ROWS
+
+
 def index_scale_row(kv_heads: int) -> int:
     """Scale-page row of the index-key scales, after the K and V rows of every head."""
-    row = 2 * kv_heads
-    if row >= SCALE_ROWS:
-        raise NotImplementedError(
-            f"4-bit MSA caches hold the scales of up to {(SCALE_ROWS - 1) // 2} KV heads "
-            f"per rank, got {kv_heads}."
-        )
-    return row
+    return 2 * kv_heads
 
 
 def unpack_rows(cache: jax.Array) -> jax.Array:

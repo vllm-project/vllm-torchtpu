@@ -402,7 +402,7 @@ def _class_scores(
     def scale_block(g):
         page_map = page_block(g).index_map
         return pl.BlockSpec(
-            (1, msa_fp4.SCALE_ROWS, msa_fp4.SCALE_LANES),
+            (1, scale_cache.shape[1], msa_fp4.SCALE_LANES),
             lambda *args: page_map(*args)[:3],
         )
 
@@ -439,7 +439,7 @@ def _class_scores(
         operands = [index_cache]
         if fp4:
             scale_buf = pltpu.VMEM(
-                (pages_per_step, msa_fp4.SCALE_ROWS, msa_fp4.SCALE_LANES), jnp.float32
+                (pages_per_step, scale_cache.shape[1], msa_fp4.SCALE_LANES), jnp.float32
             )
             scratch += [scale_buf, scale_buf, pltpu.SemaphoreType.DMA((2, pages_per_step))]
             hbm.append(pl.BlockSpec(memory_space=pl.ANY))

@@ -113,13 +113,14 @@ def test_lowers_for_tpu(dtype, kernel):
     assert "tpu_custom_call" in lowered.as_text()
 
 
+@pytest.mark.parametrize("kv_heads", [1, 4])
 @pytest.mark.parametrize("kernel", ["v2", "v3"])
 @pytest.mark.parametrize(
     "q_lens,ctx_lens,block_q,large_block_q,pages_per_step",
     [([1, 130, 3], [300, 200, 0], 64, 48, 4), ([1, 1], [1000, 5], 128, 512, 2)],
 )
 def test_fp4_matches_dequantized_reference(
-    q_lens, ctx_lens, block_q, large_block_q, pages_per_step, kernel
+    q_lens, ctx_lens, block_q, large_block_q, pages_per_step, kernel, kv_heads
 ):
     """4-bit index cache: scores equal rotated queries against the dequantized
     rotated keys; the other scale-page rows are never read."""
@@ -140,8 +141,10 @@ def test_fp4_matches_dequantized_reference(
     raw = rng.standard_normal((NUM_PAGES, PAGE, HEAD_DIM)) * rng.uniform(0.1, 5, (1, 1, HEAD_DIM))
     nib, scale = msa_fp4.quantize(msa_fp4.rotate_keys(jnp.asarray(raw, jnp.float32)))
     cache = msa_fp4.pack_rows(nib)
-    row = msa_fp4.index_scale_row(1)
-    scale_cache = np.full((NUM_PAGES, msa_fp4.SCALE_ROWS, msa_fp4.SCALE_LANES), np.nan, np.float32)
+    row = msa_fp4.index_scale_row(kv_heads)
+    scale_cache = np.full(
+        (NUM_PAGES, msa_fp4.scale_rows(kv_heads), msa_fp4.SCALE_LANES), np.nan, np.float32
+    )
     scale_cache[:, row] = np.asarray(scale)
     keys = np.asarray(msa_fp4.dequantize(nib, scale))
     index_q = jnp.asarray(rng.standard_normal((num_tokens, 1, HEAD_DIM))).astype(jnp.bfloat16)

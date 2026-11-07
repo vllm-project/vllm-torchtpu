@@ -422,12 +422,9 @@ def get_msa_dcp_op(
         )
     kv_heads = max(1, dcp // kv_head_replicas)
     if fp4:
-        if kv_heads != 1:
-            raise NotImplementedError(
-                "4-bit MSA caches under DCP hold one KV head per rank; got "
-                f"{kv_heads} (DCP {dcp}, {kv_head_replicas} replicas per KV head)."
-            )
-        return _get_msa_dcp_fp4_op(sm_scale, topk, init_blocks, local_blocks, dcp)
+        return _get_msa_dcp_fp4_op(
+            sm_scale, topk, init_blocks, local_blocks, dcp, kv_head_replicas
+        )
 
     def _score_jax(
         k: jax.Array,
@@ -572,9 +569,15 @@ def get_msa_dcp_op(
 
 
 def _get_msa_dcp_fp4_op(
-    sm_scale: float, topk: int, init_blocks: int, local_blocks: int, dcp: int
+    sm_scale: float,
+    topk: int,
+    init_blocks: int,
+    local_blocks: int,
+    dcp: int,
+    kv_head_replicas: int,
 ) -> Callable[..., torch.Tensor]:
-    """`get_msa_dcp_op` for 4-bit caches with one KV head per rank."""
+    """`get_msa_dcp_op` for 4-bit caches."""
+    kv_heads = max(1, dcp // kv_head_replicas)
     from vllm_torchtpu.distributed.dcp import get_dcp_group
     from vllm_torchtpu.layers.adapter.cp_mla_attention import (
         all_gather_heads,
@@ -639,7 +642,7 @@ def _get_msa_dcp_fp4_op(
         )
 
     suffix = (
-        f"t{topk}_i{init_blocks}_l{local_blocks}_s{sm_scale:.8f}_dcp{dcp}_g1"
+        f"t{topk}_i{init_blocks}_l{local_blocks}_s{sm_scale:.8f}_dcp{dcp}_g{kv_heads}"
     ).replace(".", "p")
     score_op = pallas.jax_op(
         f"pallas::minimax_m3_msa_dcp_fp4_score_{suffix}",
@@ -690,7 +693,16 @@ def _get_msa_dcp_fp4_op(
     ) -> torch.Tensor:
         group = get_dcp_group()
         assert group is not None, "DCP group is not initialized"
-        q_all = all_gather_heads(q)
+        if kv_heads == 1:
+            q_all = all_gather_heads(q)
+        else:
+            # As `get_msa_dcp_op`: one gather of [q | k | v | index_q].
+            gathered = group.all_gather(
+                torch.cat([q, k, v, index_q], dim=1).contiguous(), dim=1
+            )
+            q_all, k, v, index_q = split_group_heads(
+                gathered, dcp, q.shape[1], kv_head_replicas
+            )
         new_kv_cache, new_index_cache, new_scale_cache, candidates = score_op(
             k,
             v,
