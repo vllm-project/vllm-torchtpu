@@ -723,10 +723,6 @@ class TPUModelRunner(GPUModelRunner):
             and dist_utils.get_stage3_register_ahead_enabled()
         )
 
-    _repetition_penalty: repetition_penalty_ops.RepetitionPenaltyTracker = (
-        repetition_penalty_ops.EMPTY_TRACKER
-    )
-
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -2839,12 +2835,17 @@ class TPUModelRunner(GPUModelRunner):
             else scheduler_output
         )
         result = super()._update_states(base_output)
-        if self._repetition_penalty is repetition_penalty_ops.EMPTY_TRACKER:
-            self._repetition_penalty = repetition_penalty_ops.RepetitionPenaltyTracker()
         self._min_tokens.discard(scheduler_output.finished_req_ids)
         self._repetition_penalty.discard(scheduler_output.finished_req_ids)
         for new_req in scheduler_output.scheduled_new_reqs:
             self._min_tokens.add(new_req.req_id, new_req.sampling_params)
+            self._repetition_penalty.discard((new_req.req_id,))
+            params = new_req.sampling_params
+            if params is None or params.repetition_penalty == 1.0:
+                continue
+            if not self._repetition_penalty_supported():
+                self._warn_repetition_penalty_unsupported()
+                continue
             req_state = self.requests.get(new_req.req_id)
             prompt_ids = (
                 req_state.prompt_token_ids
@@ -2855,9 +2856,7 @@ class TPUModelRunner(GPUModelRunner):
                     else None
                 )
             )
-            self._repetition_penalty.add(
-                new_req.req_id, new_req.sampling_params, prompt_ids
-            )
+            self._repetition_penalty.add(new_req.req_id, params, prompt_ids)
         # Copy after the base zeroes new blocks (the CoW dst is one of them).
         if use_page_local_copy:
             self._apply_kv_cache_block_copies(copies)
@@ -4979,24 +4978,43 @@ class TPUModelRunner(GPUModelRunner):
             return logits
         return min_tokens_mask.apply_stop_table(logits, *table)
 
+    def _warn_repetition_penalty_unsupported(self) -> None:
+        logger.warning_once(
+            "repetition_penalty is not yet applied on TPU with "
+            "async_scheduling or speculative decoding; requests run without "
+            "it. Run with async_scheduling=False and no speculative_config "
+            "to apply it."
+        )
+
     def _repetition_penalty_batch_state(
         self,
+        scheduler_output: "SchedulerOutput | None" = None,
     ) -> repetition_penalty_ops.RepetitionPenaltyState:
         """This step's batch rows with ``repetition_penalty != 1.0``."""
         if not self._repetition_penalty:
             return {}
         if not self._repetition_penalty_supported():
-            logger.warning_once(
-                "repetition_penalty is not yet applied on TPU with "
-                "async_scheduling or speculative decoding; requests run without "
-                "it. Run with async_scheduling=False and no speculative_config "
-                "to apply it."
-            )
+            self._warn_repetition_penalty_unsupported()
             return {}
-        return self._repetition_penalty.batch_state(
+        state = self._repetition_penalty.batch_state(
             self.input_batch.req_id_to_index,
             self._lookup_repetition_penalty_output,
         )
+        if scheduler_output is not None and state:
+            num_scheduled = scheduler_output.num_scheduled_tokens
+            for req_id in self._repetition_penalty.requests:
+                idx = self.input_batch.req_id_to_index.get(req_id)
+                if idx is None or idx not in state:
+                    continue
+                req_state = self.requests.get(req_id)
+                sched = num_scheduled.get(req_id)
+                if (
+                    req_state is not None
+                    and sched is not None
+                    and req_state.num_computed_tokens + sched < req_state.num_tokens
+                ):
+                    del state[idx]
+        return state
 
     def _repetition_penalty_supported(self) -> bool:
         """Whether this runner mode applies ``repetition_penalty``."""
@@ -5020,7 +5038,7 @@ class TPUModelRunner(GPUModelRunner):
     ) -> torch.Tensor:
         if not rep_pen:
             return logits
-        inputs = repetition_penalty_ops.build_plain_inputs(
+        inputs = self._repetition_penalty.build_plain_inputs(
             rep_pen, start, end, logits.shape[0], logits.shape[1]
         )
         if inputs is None:
@@ -5215,7 +5233,7 @@ class TPUModelRunner(GPUModelRunner):
         state = self.execute_model_state
         scheduler_output = state.scheduler_output
         self.execute_model_state = None
-        rep_pen = self._repetition_penalty_batch_state()
+        rep_pen = self._repetition_penalty_batch_state(scheduler_output)
         min_toks = self._min_tokens_batch_state()
 
         # Used to keep rand draws consistent across TP ranks.
@@ -5348,10 +5366,6 @@ class TPUModelRunner(GPUModelRunner):
                                 min_toks, cur_start_idx, cur_end_idx
                             ),
                             min_toks,
-                        )
-                    if rep_pen and not state.top_tokens:
-                        logits = self._apply_repetition_penalty_plain(
-                            logits, cur_start_idx, cur_end_idx, rep_pen
                         )
                     with self._stage_timing.stage("sample"):
                         if state.top_tokens:
@@ -6903,17 +6917,25 @@ class TPUModelRunner(GPUModelRunner):
     def _precompile_repetition_penalty(self) -> None:
         if not self._repetition_penalty_supported():
             return
+        head_dtype = getattr(
+            getattr(self, "model_config", None), "head_dtype", None
+        )
         with self._precompile_timed("repetition_penalty"):
-            for num_rows in self.num_reqs_paddings:
+            for num_rows in _rotate_precompile_sweep(
+                self.num_reqs_paddings, "repetition_penalty"
+            ):
                 logits = self._dummy_logits(num_rows)
-                seen_mask = torch.zeros(
-                    (num_rows, logits.shape[1]), dtype=torch.bool, device=self.device
+                if isinstance(head_dtype, torch.dtype) and logits.dtype != head_dtype:
+                    logits = logits.to(head_dtype)
+                num_words = repetition_penalty_ops.num_bitmask_words(logits.shape[1])
+                seen_bitmask = torch.zeros(
+                    (num_rows, num_words), dtype=torch.int32, device=self.device
                 )
                 penalties = torch.ones(
                     (num_rows, 1), dtype=torch.float32, device=self.device
                 )
                 out = repetition_penalty_ops.apply_repetition_penalty(
-                    logits, seen_mask, penalties
+                    logits, seen_bitmask, penalties
                 )
                 synchronize_tensors(out)
                 logger.info("  -- num_rows: %d", num_rows)
