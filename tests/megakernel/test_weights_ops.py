@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Standalone unit tests for slice L-10a1 (`weights/{eplb,ops,spec_pack}`)."""
+"""Unit tests for `weights/{eplb,ops,spec_pack}`."""
 
 from __future__ import annotations
 
@@ -135,6 +135,15 @@ def test_jax_array_ops_and_decl_helpers():
     )
     assert target_axis_widths(d_kv, R=4, split_axis=-1) == (16, 8)
     assert target_axis_widths(d_kv, R=4, split_axis=0) == (16, 16)
+    with pytest.raises(ValueError, match="kv_repeat nkv=2 does not divide R=3"):
+        target_axis_widths(d_kv, R=3, split_axis=-1)
+    d_kv6 = HFParamDecl(
+        "k6", "hf.k6", (6, 16, 8), FP8, transform=ParamTransform(kv_repeat=True)
+    )
+    with pytest.raises(ValueError, match="kv_repeat nkv=6 is not divisible by R=4"):
+        target_axis_widths(d_kv6, R=4, split_axis=-1)
+    with pytest.raises(ValueError, match="exceeds target_width=24"):
+        apply_decl_pad(ops, jnp.zeros((16, 28), FP8), d_sh)
 
 
 def test_slice_alias_targets_quant_fastpath_and_dequant():
@@ -307,8 +316,122 @@ def test_slice_alias_targets_quant_fastpath_and_dequant():
     ):
         target_axis_widths(odd_emb_decl, R=2, split_axis=0)
 
+    # 5. Unsharded `channel_splits` and positive trailing `shard_axis=1`
+    d_cs = HFParamDecl(
+        "qkvz",
+        "hf.qkvz",
+        (8, 24),
+        FP8,
+        transform=ParamTransform(channel_splits=(8, 16)),
+    )
+    s_cs = HFParamDecl(
+        "qkvz_s",
+        "hf.qkvz_s",
+        (24,),
+        F32,
+        transform=ParamTransform(scale_for="qkvz", channel_splits=(8, 16)),
+    )
+    alias_cs = VLLMAlias(
+        "in_proj_qkvz",
+        ("qkvz",),
+        scale_targets=("qkvz_s",),
+        scale_source="in_proj_qkvz_s",
+        shard_axis=1,
+        already_sharded=False,
+        already_fp8=True,
+    )
+    w_cs = jnp.arange(8 * 24, dtype=F32).reshape(8, 24).astype(FP8)
+    s_cs_buf = jnp.arange(24, dtype=F32)
+    for r in range(2):
+        res_cs = slice_alias_targets(
+            ops,
+            alias_cs,
+            w_cs,
+            s_cs_buf,
+            (d_cs,),
+            {"qkvz_s": s_cs},
+            R=2,
+            tp_rank=r,
+        )
+        exp_w = jnp.concatenate(
+            [w_cs[:, r * 4 : (r + 1) * 4], w_cs[:, 8 + r * 8 : 8 + (r + 1) * 8]],
+            axis=1,
+        )
+        exp_s = jnp.concatenate(
+            [s_cs_buf[r * 4 : (r + 1) * 4], s_cs_buf[8 + r * 8 : 8 + (r + 1) * 8]],
+            axis=0,
+        )
+        np.testing.assert_array_equal(res_cs["qkvz"], exp_w)
+        np.testing.assert_array_equal(res_cs["qkvz_s"], exp_s)
 
-def test_switch_branch_and_pack_spec_logical_weights():
+
+@pytest.mark.parametrize(
+    ("nkv", "R"),
+    [(2, 2), (2, 4), (2, 8), (4, 2)],
+    ids=["nkv2_r2", "nkv2_r4_rep", "nkv2_r8_tp8_rep", "nkv4_r2_shard"],
+)
+def test_slice_alias_targets_kv_repeat_replication_and_sharding(nkv: int, R: int):
+    """Verify `slice_alias_targets` replicates/shards `kv_repeat` heads across `R`."""
+    ops = JaxArrayOps()
+    H, HD = 8, 4
+    NH = R * 2
+    d_q = HFParamDecl(
+        "q",
+        "hf.q",
+        (H, NH * HD),
+        BF16,
+        transform=ParamTransform(shard_axis=1),
+    )
+    d_k = HFParamDecl(
+        "k",
+        "hf.k",
+        (nkv, H, HD),
+        BF16,
+        transform=ParamTransform(kv_repeat=True),
+    )
+    d_v = HFParamDecl(
+        "v",
+        "hf.v",
+        (nkv, H, HD),
+        BF16,
+        transform=ParamTransform(kv_repeat=True),
+    )
+    alias_qkv = VLLMAlias(
+        "qkv_proj",
+        ("q", "k", "v"),
+        shard_axis=-1,
+        already_sharded=False,
+        already_fp8=False,
+    )
+    q_full = jnp.arange(H * NH * HD, dtype=BF16).reshape(H, NH * HD)
+    k_heads = [jnp.full((H, HD), float(10 + h), dtype=BF16) for h in range(nkv)]
+    v_heads = [jnp.full((H, HD), float(20 + h), dtype=BF16) for h in range(nkv)]
+    k_full = jnp.concatenate(k_heads, axis=-1)
+    v_full = jnp.concatenate(v_heads, axis=-1)
+    w_qkv = jnp.concatenate([q_full, k_full, v_full], axis=-1)
+
+    for r in range(R):
+        res = slice_alias_targets(
+            ops, alias_qkv, w_qkv, None, (d_q, d_k, d_v), {}, R=R, tp_rank=r
+        )
+        if nkv <= R:
+            kv_head = r // (R // nkv)
+            np.testing.assert_array_equal(res["k"], k_heads[kv_head])
+            np.testing.assert_array_equal(res["v"], v_heads[kv_head])
+        else:
+            heads_per_r = nkv // R
+            exp_k = jnp.concatenate(
+                k_heads[r * heads_per_r : (r + 1) * heads_per_r], axis=-1
+            )
+            exp_v = jnp.concatenate(
+                v_heads[r * heads_per_r : (r + 1) * heads_per_r], axis=-1
+            )
+            np.testing.assert_array_equal(res["k"], exp_k)
+            np.testing.assert_array_equal(res["v"], exp_v)
+
+
+@pytest.mark.parametrize("stack_e", [True, False], ids=["stacked_e", "per_layer_e"])
+def test_switch_branch_and_pack_spec_logical_weights(stack_e: bool):
     """Verify `switch_branch_for_layer` and `pack_spec_logical_weights`."""
     gdn = FakeAltMixerModule()
     gqa = FakeMixerModule()
@@ -334,7 +457,7 @@ def test_switch_branch_and_pack_spec_logical_weights():
         config=g,
         layer_type=LayerType("lt", slots=(sw, ffn)),
     )
-    ex = ExecSpec(R=R, B=4, T=1, stack_e=True, tiles=TINY_TILES)
+    ex = ExecSpec(R=R, B=4, T=1, stack_e=stack_e, tiles=TINY_TILES)
     p = plan(ms, ex)
     wsh = weight_shapes(ms, ex, p)
 
@@ -365,7 +488,9 @@ def test_switch_branch_and_pack_spec_logical_weights():
         "router": jnp.zeros((R, g.L, g.H, g.E), dtype=BF16),
         "sh13": jnp.zeros((R, g.L, g.H, 2 * isr), dtype=FP8),
         "sh2": jnp.zeros((R, g.L, isr, g.H), dtype=FP8),
-        "e13": jnp.zeros((R, g.L, g.EW(R), g.H, 2 * g.I), dtype=FP8),
+        # Omit the `R` axis on `e13` to test `R`-broadcasting on both `stacked`
+        # and `per_layer` dynamic weights.
+        "e13": jnp.zeros((g.L, g.EW(R), g.H, 2 * g.I), dtype=FP8),
         "e2": jnp.zeros((R, g.L, g.EW(R), g.I, g.H), dtype=FP8),
         "es": jnp.zeros((R, g.L, g.EW(R), 1, 2 * g.I + g.H), dtype=F32),
     }
@@ -379,8 +504,19 @@ def test_switch_branch_and_pack_spec_logical_weights():
         final_norm=final_norm,
     )
     for k in p.w_names:
-        assert packed[k].shape == (R, *wsh[k][0]), (k, packed[k].shape, wsh[k][0])
-        assert packed[k].dtype == wsh[k][1]
+        expected = wsh[k]
+        if isinstance(expected, tuple) and hasattr(expected[0], "shape"):
+            assert isinstance(packed[k], tuple) and len(packed[k]) == len(expected)
+            for l_arr, spec_l in zip(packed[k], expected, strict=True):
+                assert l_arr.shape == (R, *spec_l.shape)
+                assert l_arr.dtype == spec_l.dtype
+        else:
+            assert packed[k].shape == (R, *expected[0]), (
+                k,
+                packed[k].shape,
+                expected[0],
+            )
+            assert packed[k].dtype == expected[1]
 
     packed_merged = pack_spec_logical_weights(
         ms,
@@ -398,4 +534,18 @@ def test_switch_branch_and_pack_spec_logical_weights():
     with pytest.raises(ValueError, match="Missing logical weight 'sh_gate'"):
         pack_spec_logical_weights(
             ms, ex, bad_logical, pre_norm=pre_norm, post_norm=post_norm
+        )
+
+    no_fn_logical = dict(logical)
+    no_fn_logical.pop("final_norm")
+    with pytest.raises(
+        ValueError, match="Missing logical weight 'final_norm' for 'final_norm'"
+    ):
+        pack_spec_logical_weights(
+            ms,
+            ex,
+            no_fn_logical,
+            pre_norm=pre_norm,
+            post_norm=post_norm,
+            final_norm=final_norm,
         )

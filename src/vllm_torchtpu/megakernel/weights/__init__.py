@@ -11,7 +11,15 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Generic declarative weight loaders (`megakernel.weights`)."""
+"""Generic declarative weight loaders and packers (`megakernel.weights`).
+
+Sublayers:
+- `ops`, `eplb`, `spec_pack`: `ArrayOps`/`WeightSource` protocols, alias
+  slicing, EPLB `ecopy` encoding, and `ModelSpec` logical-to-kernel packing;
+- `logical`, `synthetic`, `vllm_synth`: HuggingFace/logical weight loading and
+  synthetic weight/input generation;
+- `loader`: unified `load_weights` entry point over any `WeightSource`.
+"""
 
 from __future__ import annotations
 

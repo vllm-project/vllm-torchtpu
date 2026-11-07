@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import math
 from collections.abc import Mapping
 from typing import Any
 
@@ -161,19 +162,53 @@ def pack_spec_logical_weights(
                         raw = jnp.stack(raw, axis=1)
                     if raw.ndim == 1 + len(wd.lead_dims) + 2:
                         sh = (R, *raw.shape)
-                        raw = jnp.broadcast_to(raw[None, ...], sh).astype(wd.dtype)
-                    weights_mk[wd.name] = tile_w(raw, wd.name)
+                        raw = jnp.broadcast_to(raw[None, ...], sh)
+                    weights_mk[wd.name] = tile_w(raw.astype(wd.dtype), wd.name)
                 else:
-                    is_seq = isinstance(raw, (tuple, list))
-                    src = raw if is_seq else [raw[:, i] for i in range(n_layers)]
-                    weights_mk[wd.name] = tuple(tile_w(x, wd.name) for x in src)
+                    if isinstance(raw, (tuple, list)):
+                        src = list(raw)
+                    elif raw.ndim == 1 + len(wd.lead_dims) + 2:
+                        src = [raw[i] for i in range(n_layers)]
+                    else:
+                        src = [raw[:, i] for i in range(n_layers)]
+                    per_l = []
+                    for x in src:
+                        if x.ndim == len(wd.lead_dims) + 2:
+                            x = jnp.broadcast_to(x[None, ...], (R, *x.shape))
+                        per_l.append(tile_w(x.astype(wd.dtype), wd.name))
+                    weights_mk[wd.name] = tuple(per_l)
             else:
-                sh = (
-                    (R, n_layers, *wd.lead_dims, wd.K * wd.N)
+                tail_sh = (
+                    (wd.K * wd.N,)
                     if (merged_tiles and wd.K == 1 and len(wd.lead_dims) >= 1)
-                    else (R, n_layers, *wd.lead_dims, wd.K, wd.N)
+                    else (wd.K, wd.N)
                 )
-                weights_mk[wd.name] = raw.reshape(sh).astype(wd.dtype)
+                per_layer_elems = math.prod(wd.lead_dims) * wd.K * wd.N
+                if wd.layout == "per_layer":
+                    if isinstance(raw, (tuple, list)):
+                        src = list(raw)
+                    elif math.prod(raw.shape) == n_layers * per_layer_elems:
+                        src = [raw[i] for i in range(n_layers)]
+                    else:
+                        src = [raw[:, i] for i in range(n_layers)]
+                    per_l = []
+                    for x in src:
+                        if math.prod(x.shape) == per_layer_elems:
+                            x = jnp.broadcast_to(x[None, ...], (R, *x.shape))
+                        per_l.append(
+                            x.reshape((R, *wd.lead_dims, *tail_sh)).astype(wd.dtype)
+                        )
+                    weights_mk[wd.name] = tuple(per_l)
+                else:
+                    if isinstance(raw, (tuple, list)):
+                        raw = jnp.stack(
+                            raw,
+                            axis=0 if math.prod(raw[0].shape) == per_layer_elems else 1,
+                        )
+                    if math.prod(raw.shape) == n_layers * per_layer_elems:
+                        raw = jnp.broadcast_to(raw[None, ...], (R, *raw.shape))
+                    sh = (R, n_layers, *wd.lead_dims, *tail_sh)
+                    weights_mk[wd.name] = raw.reshape(sh).astype(wd.dtype)
 
     if "smalls" in p.w_names:
         weights_mk["smalls"] = sm
@@ -184,16 +219,17 @@ def pack_spec_logical_weights(
             fn_dt = fn_decl.dtype
         else:
             fn_key, fn_dt = "final_norm", F32
-        if fn_key in logical_weights:
-            fn_raw = logical_weights[fn_key]
-            fn_3d = (
-                fn_raw[None, None, :]
-                if fn_raw.ndim == 1
-                else (fn_raw[:, None, :] if fn_raw.ndim == 2 else fn_raw)
-            )
-            weights_mk["final_norm"] = jnp.broadcast_to(
-                fn_3d, (R, 1, int(geom.H))
-            ).astype(fn_dt)
+        if fn_key not in logical_weights:
+            raise ValueError(f"Missing logical weight {fn_key!r} for 'final_norm'")
+        fn_raw = logical_weights[fn_key]
+        fn_3d = (
+            fn_raw[None, None, :]
+            if fn_raw.ndim == 1
+            else (fn_raw[:, None, :] if fn_raw.ndim == 2 else fn_raw)
+        )
+        weights_mk["final_norm"] = jnp.broadcast_to(fn_3d, (R, 1, int(geom.H))).astype(
+            fn_dt
+        )
     return weights_mk
 
 

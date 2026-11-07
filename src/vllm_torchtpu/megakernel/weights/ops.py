@@ -37,67 +37,26 @@ from ..ops import F32, FP8
 class ArrayOps(Protocol):
     """Minimal array-operations interface used by the generic weight loader."""
 
-    def slice_axis(self, x: Any, axis: int, start: int, stop: int) -> Any:
-        """Slice `x` along `axis` over `[start, stop)`."""
-        ...
-
-    def concat(self, xs: Sequence[Any], axis: int) -> Any:
-        """Concatenate `xs` along `axis`."""
-        ...
-
-    def reshape(self, x: Any, shape: tuple[int, ...]) -> Any:
-        """Reshape `x` to `shape`."""
-        ...
-
-    def transpose(self, x: Any, perm: tuple[int, ...]) -> Any:
-        """Permute axes of `x` by `perm`."""
-        ...
-
-    def pad(self, x: Any, pad_widths: Sequence[tuple[int, int]]) -> Any:
-        """Zero-pad trailing axes of `x` with `(before, after)` widths."""
-        ...
-
-    def cast(self, x: Any, dtype: Any) -> Any:
-        """Cast `x` to canonical `dtype` (`FP8`, `BF16`, `F32`, `I32`)."""
-        ...
-
-    def is_fp8(self, x: Any) -> bool:
-        """Return whether `x` has an FP8 (`float8_e4m3fn`) dtype."""
-        ...
-
-    def dequantize(self, x: Any, scale: Any, dtype: Any) -> Any:
-        """Dequantize `x` by `scale` in `F32` and cast to `dtype`."""
-        ...
-
-    def quantize_fp8(self, x: Any) -> tuple[Any, Any]:
-        """Quantize `[K, N]` `x` per column to `(w_fp8 [K, N], scale [N] f32)`."""
-        ...
-
-    def zeros(self, shape: tuple[int, ...], dtype: Any) -> Any:
-        """Return a zero-filled tensor of `shape` and `dtype`."""
-        ...
-
-    def stack_layers(self, xs: Sequence[Any]) -> Any:
-        """Stack per-layer arrays along axis `0` into an owned base buffer."""
-        ...
-
-    def own(self, x: Any) -> Any:
-        """Return `x` as a contiguous base buffer (`storage_offset == 0`)."""
-        ...
+    def slice_axis(self, x: Any, axis: int, start: int, stop: int) -> Any: ...
+    def concat(self, xs: Sequence[Any], axis: int) -> Any: ...
+    def reshape(self, x: Any, shape: tuple[int, ...]) -> Any: ...
+    def transpose(self, x: Any, perm: tuple[int, ...]) -> Any: ...
+    def pad(self, x: Any, pad_widths: Sequence[tuple[int, int]]) -> Any: ...
+    def cast(self, x: Any, dtype: Any) -> Any: ...
+    def is_fp8(self, x: Any) -> bool: ...
+    def dequantize(self, x: Any, scale: Any, dtype: Any) -> Any: ...
+    def quantize_fp8(self, x: Any) -> tuple[Any, Any]: ...
+    def zeros(self, shape: tuple[int, ...], dtype: Any) -> Any: ...
+    def stack_layers(self, xs: Sequence[Any]) -> Any: ...
+    def own(self, x: Any) -> Any: ...
 
 
 class WeightSource(Protocol):
     """Source-agnostic weight provider for a single rank (`tp_rank`)."""
 
     @property
-    def ops(self) -> ArrayOps:
-        """Return the `ArrayOps` implementation for tensors from this source."""
-        ...
-
-    def has_layer_alias(self, lyr: int, ord_idx: int, source_name: str) -> bool:
-        """Return whether `source_name` exists on layer `lyr` (`ord_idx`)."""
-        ...
-
+    def ops(self) -> ArrayOps: ...
+    def has_layer_alias(self, lyr: int, ord_idx: int, source_name: str) -> bool: ...
     def resolve_alias(
         self,
         lyr: int,
@@ -109,14 +68,8 @@ class WeightSource(Protocol):
         R: int,
         tp_rank: int,
         fuse_groups: Mapping[str, tuple[str, ...]] | None = None,
-    ) -> dict[str, Any]:
-        """Extract and slice `alias` on layer `lyr` into `target_decls`."""
-        ...
-
-    def read_model_param(self, decl: HFParamDecl, *, R: int, tp_rank: int) -> Any:
-        """Extract a model-level parameter (`final_norm`, `embed_tokens`, `lm_head`)."""
-        ...
-
+    ) -> dict[str, Any]: ...
+    def read_model_param(self, decl: HFParamDecl, *, R: int, tp_rank: int) -> Any: ...
     def read_layer_ecopy(
         self,
         lyr: int,
@@ -125,13 +78,8 @@ class WeightSource(Protocol):
         *,
         expert_placement: Any = None,
         experts_path: str = "mlp.experts",
-    ) -> Any | None:
-        """Return `[E]` `f32` `ecopy` vector for layer `lyr`, or `None` if inactive."""
-        ...
-
-    def supports_passthrough(self) -> bool:
-        """Return whether dynamic per-layer 3D base buffers can be passed through."""
-        ...
+    ) -> Any | None: ...
+    def supports_passthrough(self) -> bool: ...
 
 
 class JaxArrayOps:
@@ -190,12 +138,31 @@ class JaxArrayOps:
 def target_axis_widths(decl: HFParamDecl, R: int, split_axis: int) -> tuple[int, int]:
     """Return `(full_width, sharded_width)` of `decl` along `split_axis`."""
     if len(decl.shape) == 3 and decl.transform.kv_repeat:
-        full_kv = int(decl.shape[0] * decl.shape[-1])
-        shard_kv = int(max(1, decl.shape[0] // R) * decl.shape[-1])
+        nkv = int(decl.shape[0])
+        if nkv < R and R % nkv != 0:
+            raise ValueError(
+                f"HFParamDecl {decl.name!r} kv_repeat nkv={nkv} does not divide R={R}"
+            )
+        if nkv > R and nkv % R != 0:
+            raise ValueError(
+                f"HFParamDecl {decl.name!r} kv_repeat nkv={nkv} "
+                f"is not divisible by R={R}"
+            )
+        full_kv = int(nkv * decl.shape[-1])
+        shard_kv = int(max(1, nkv // R) * decl.shape[-1])
         return (full_kv, shard_kv) if split_axis != 0 else (int(decl.shape[1]),) * 2
     dim_ax = split_axis % len(decl.shape)
     full_w = int(decl.shape[dim_ax])
     tf = decl.transform
+    if tf.channel_splits is not None and dim_ax == len(decl.shape) - 1:
+        if sum(tf.channel_splits) != full_w or any(
+            w <= 0 or w % R != 0 for w in tf.channel_splits
+        ):
+            raise ValueError(
+                f"HFParamDecl {decl.name!r} channel_splits={tf.channel_splits!r} "
+                f"must sum to {full_w} with each split divisible by R={R}"
+            )
+        return full_w, full_w // R
     if tf.shard_axis is not None and (tf.shard_axis % len(decl.shape)) == dim_ax:
         if full_w % R != 0:
             raise ValueError(
@@ -212,10 +179,19 @@ def apply_decl_pad(ops: ArrayOps, x: Any, decl: HFParamDecl) -> Any:
         return x
     shape = tuple(int(d) for d in x.shape)
     offset = len(shape) - len(decl.transform.pad)
-    widths = [
-        (before, max(0, target_w - shape[offset + idx] - before))
-        for idx, (before, target_w) in enumerate(decl.transform.pad)
-    ]
+    widths: list[tuple[int, int]] = []
+    for idx, (before, target_w) in enumerate(decl.transform.pad):
+        if before == 0 and target_w == 0:
+            widths.append((0, 0))
+            continue
+        cur = shape[offset + idx]
+        after = target_w - cur - before
+        if before < 0 or after < 0:
+            raise ValueError(
+                f"HFParamDecl {decl.name!r} axis {offset + idx} width {cur} "
+                f"with pad before={before} exceeds target_width={target_w}"
+            )
+        widths.append((before, after))
     return ops.pad(x, widths)
 
 
@@ -263,7 +239,9 @@ def slice_alias_targets(
     total_sharded = sum(sw for _, sw in widths)
     expected_w = total_sharded if alias.already_sharded else total_full
     w_shape = tuple(int(d) for d in w_buf.shape)
-    actual_w = w_shape[split_axis % len(w_shape)]
+    norm_split_axis = split_axis % len(w_shape)
+    is_trailing_split = norm_split_axis == len(w_shape) - 1
+    actual_w = w_shape[norm_split_axis]
     if actual_w != expected_w:
         raise ValueError(
             f"Alias {alias.source!r} (already_sharded={alias.already_sharded}) "
@@ -271,7 +249,7 @@ def slice_alias_targets(
             f"(sharded={total_sharded}, unsharded={total_full})"
         )
 
-    expected_s_w = expected_w if split_axis == -1 else int(d0.shape[-1])
+    expected_s_w = expected_w if is_trailing_split else int(d0.shape[-1])
     if s_buf is not None:
         s_len = int(s_buf.shape[-1])
         if s_len != expected_s_w:
@@ -321,30 +299,59 @@ def slice_alias_targets(
     out = {}
     off = 0
     for d, (full_w, sharded_w) in zip(target_decls, widths, strict=True):
-        if not alias.already_sharded:
-            if d.transform.shard_axis is not None and full_w != sharded_w:
-                start = off + tp_rank * sharded_w
-                stop = start + sharded_w
-            else:
-                start, stop = off, off + full_w
-            off += full_w
-        else:
-            start, stop = off, off + sharded_w
-            off += sharded_w
-
-        w_t = (
-            w_buf
-            if len(target_decls) == 1 and start == 0 and stop == actual_w
-            else ops.slice_axis(w_buf, split_axis, start, stop)
+        tf = d.transform
+        has_unsharded_cs = (
+            not alias.already_sharded
+            and tf.channel_splits is not None
+            and is_trailing_split
+            and full_w != sharded_w
         )
-        if s_buf is None:
-            s_t = None
-        elif split_axis != -1 or (
-            len(target_decls) == 1 and start == 0 and stop == expected_s_w
-        ):
-            s_t = s_buf
+        if has_unsharded_cs:
+            assert tf.channel_splits is not None
+            w_parts = []
+            s_parts = []
+            cs_off = off
+            for cw in tf.channel_splits:
+                cw_r = cw // R
+                cs_start = cs_off + tp_rank * cw_r
+                cs_stop = cs_start + cw_r
+                w_parts.append(ops.slice_axis(w_buf, split_axis, cs_start, cs_stop))
+                if s_buf is not None:
+                    s_parts.append(ops.slice_axis(s_buf, -1, cs_start, cs_stop))
+                cs_off += cw
+            off += full_w
+            w_t = ops.concat(w_parts, axis=norm_split_axis)
+            s_t = ops.concat(s_parts, axis=-1) if s_buf is not None else None
         else:
-            s_t = ops.slice_axis(s_buf, -1, start, stop)
+            if not alias.already_sharded:
+                if tf.kv_repeat and len(d.shape) == 3 and full_w != sharded_w:
+                    nkv = int(d.shape[0])
+                    kv_head = tp_rank // (R // nkv) if nkv < R else tp_rank
+                    start = off + kv_head * sharded_w
+                    stop = start + sharded_w
+                elif tf.shard_axis is not None and full_w != sharded_w:
+                    start = off + tp_rank * sharded_w
+                    stop = start + sharded_w
+                else:
+                    start, stop = off, off + full_w
+                off += full_w
+            else:
+                start, stop = off, off + sharded_w
+                off += sharded_w
+
+            w_t = (
+                w_buf
+                if len(target_decls) == 1 and start == 0 and stop == actual_w
+                else ops.slice_axis(w_buf, split_axis, start, stop)
+            )
+            if s_buf is None:
+                s_t = None
+            elif not is_trailing_split or (
+                len(target_decls) == 1 and start == 0 and stop == expected_s_w
+            ):
+                s_t = s_buf
+            else:
+                s_t = ops.slice_axis(s_buf, -1, start, stop)
 
         want_fp8 = jnp.dtype(d.dtype) == jnp.dtype(FP8)
         if is_w_fp8 and not want_fp8:
