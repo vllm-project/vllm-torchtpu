@@ -15,12 +15,15 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
+import jax
 import jax.numpy as jnp
 from jax import lax
 
+from ...exec_spec import ExecSpec
 from ...ops import F32, I32
 from .params import MoEDebug, MoEParams
 
@@ -35,20 +38,20 @@ class MoEEmit:
     """
 
     ctx: Any
-    ex: Any
+    ex: ExecSpec
     mp: MoEParams
     dbg: MoEDebug
-    W: Any
-    scr: Any
+    W: Mapping[str, Any]
+    scr: Mapping[str, Any]
     stream: Any
     me: Any
-    skip: Any
-    sc: Any
+    skip: frozenset[str]
+    sc: Callable[..., Any]
     sp: Any
-    tk: Any
-    lane_e8: Any
-    lane128: Any
-    row8: Any
+    tk: Mapping[str, int]
+    lane_e8: jax.Array
+    lane128: jax.Array
+    row8: jax.Array
     EM: int
     FLT_MIN: float
 

@@ -11,27 +11,31 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Standalone unit tests for slice L-8b (`modules/moe` routing and ring helpers)."""
+"""Unit tests for `modules/moe/{context,topk,dedup,ring,routing}` helpers."""
 
 from __future__ import annotations
 
 import dataclasses
 from types import SimpleNamespace
+from typing import Any
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
 from jax import lax
+from jax.experimental import pallas as pl
+from jax.experimental.pallas import tpu as pltpu
 
 from tests.megakernel.megakernel_fakes import (
     TINY_TILES,
     FakeFFNModule,
     FakeGeometry,
     FakeMixerModule,
+    MiniCtx,
 )
 from vllm_torchtpu.megakernel.exec_spec import ExecSpec
-from vllm_torchtpu.megakernel.modules.moe import dedup, ring, topk
+from vllm_torchtpu.megakernel.modules.moe import ring, topk
 from vllm_torchtpu.megakernel.modules.moe.context import MoEEmit
 from vllm_torchtpu.megakernel.modules.moe.params import (
     MoEDebug,
@@ -40,7 +44,7 @@ from vllm_torchtpu.megakernel.modules.moe.params import (
     derive_moe_params,
 )
 from vllm_torchtpu.megakernel.modules.moe.routing import route
-from vllm_torchtpu.megakernel.ops import F32, I32
+from vllm_torchtpu.megakernel.ops import BF16, F32, I32, round_up
 from vllm_torchtpu.megakernel.planner import plan
 from vllm_torchtpu.megakernel.spec import LayerType, ModelSpec
 
@@ -279,4 +283,388 @@ def test_moe_emit_build_and_ring_unit_meta():
     assert m.EM == 127 and m.lane_e8.shape == (ex.MR, 128)
     i, w, bank, t_out, td = ring._unit_meta(m, 3, None)
     assert i == 3 // mp.TE and bank == 3 % mp.NBE and t_out == 3 % mp.TE and td is None
-    assert callable(route) and callable(dedup.po2c)
+
+
+class _FakeMoEStream:
+    """Minimal stream stub for exercising `route` and `ring` helpers in Pallas."""
+
+    def __init__(self, ebuf: dict[str, Any], esem: dict[str, Any], E: int) -> None:
+        self._ebuf = ebuf
+        self._esem = esem
+        self.sp = SimpleNamespace(
+            L=1,
+            tk={"e13": 1, "e2": 1},
+            lay={"ecopy": (0, E)},
+        )
+
+    def mm(self, a: Any, b: Any, dims: Any) -> Any:
+        return lax.dot_general(a, b, dims, preferred_element_type=F32)
+
+    def ecopy(self, kind: str, src: Any, bank: Any) -> Any:
+        return pltpu.make_async_copy(
+            src, self._ebuf[kind].at[bank], self._esem[kind].at[bank]
+        )
+
+    def eview(self, kind: str, bank: Any) -> Any:
+        return self._ebuf[kind].at[bank]
+
+
+def _run_moe_route_and_ring_pallas(
+    *,
+    moe_tp: bool,
+    e_slots: int,
+    ecopy_opt: int,
+    route_vec: bool,
+    interpret: bool = True,
+) -> None:
+    R = 2
+    B = 8
+    E = 128
+    TOPK = 4
+    H = 256
+    I = 128 * R if moe_tp else 128  # noqa: E741
+    IS = 256
+    ER = E // R
+    tiles = dataclasses.replace(TINY_TILES, bank=512 << 10, ebank=256 << 10, nbe=4)
+    g = FakeGeometry(
+        L=1,
+        att_every=1,
+        H=H,
+        NH=4,
+        NKV=2,
+        I=I,
+        IS=IS,
+        E=E,
+        TOPK=TOPK,
+        moe_tp=moe_tp,
+        e_slots=e_slots,
+    )
+    ex = ExecSpec(
+        R=R, B=B, T=1, ctx=128, stack_e=True, tiles=tiles, interpret=interpret
+    )
+    ms = ModelSpec(
+        "moe_route_pallas",
+        config=g,
+        layer_type=LayerType("lt", slots=(FakeMixerModule(), FakeFFNModule())),
+    )
+    p = plan(ms, ex)
+    tt = MoETunables(
+        topk=True,
+        ecopy_opt=ecopy_opt,
+        route_vec=route_vec,
+    )
+    mp = derive_moe_params(
+        g,
+        ex,
+        p,
+        tt,
+        MoEDebug(),
+        moe_tp=moe_tp,
+        e_slots=e_slots,
+        module_name="fake_moe",
+    )
+    assert mp.route_vec is route_vec
+    assert mp.ECOPY is (not moe_tp and e_slots > ER)
+
+    nb_picks = round_up(ex.B * mp.TOPK, 128)
+    scr_shapes: dict[str, Any] = {
+        "wn": pltpu.VMEM((ex.MR, mp.E), F32),
+        "hitv": pltpu.VMEM((ex.MR, 128), I32),
+        "hits": pltpu.SMEM((ex.MR, 128), I32),
+        "elist": pltpu.SMEM((nb_picks,), I32),
+        "seen": pltpu.SMEM((8, 128), I32),
+        "misc_sem": pltpu.SemaphoreType.DMA(()),
+        "st": pltpu.SMEM((1,), I32),
+        "es": pltpu.VMEM((mp.NSS, 1, 2 * mp.IR + mp.H), F32),
+        "es_sem": pltpu.SemaphoreType.DMA((mp.NSS,)),
+        "sm": pltpu.VMEM((2, 1, mp.E), F32),
+        "ebuf_e13": pltpu.VMEM((mp.NBE, mp.H, 2 * mp.IR), BF16),
+        "ebuf_e2": pltpu.VMEM((mp.NBE, mp.IR, mp.H), BF16),
+        "esem_e13": pltpu.SemaphoreType.DMA((mp.NBE,)),
+        "esem_e2": pltpu.SemaphoreType.DMA((mp.NBE,)),
+    }
+    if mp.ECOPY:
+        scr_shapes.update(
+            {
+                "ecopy": pltpu.SMEM((2, 1, mp.E), F32),
+                "wlist": pltpu.SMEM((nb_picks,), I32),
+                "cplist": pltpu.SMEM((nb_picks,), I32),
+                "cpchoice": pltpu.SMEM((nb_picks,), I32),
+                "rload": pltpu.SMEM((ex.R,), I32),
+            }
+        )
+        if mp.ecopy_opt == 1:
+            scr_shapes["ulist"] = pltpu.SMEM((nb_picks,), I32)
+    s_names = list(scr_shapes.keys())
+
+    def kernel_body(
+        p8_ref,
+        ecopy_in_ref,
+        w_e13_ref,
+        w_e2_ref,
+        w_es_ref,
+        wn_out_ref,
+        meta_out_ref,
+        e13_0_out_ref,
+        es_0_out_ref,
+        *scr_refs,
+    ):
+        scr = dict(zip(s_names, scr_refs))
+        for hi in range(8):
+            for lo in range(128):
+                scr["seen"][hi, lo] = jnp.int32(0)
+        for idx in range(nb_picks):
+            scr["elist"][idx] = jnp.int32(-1)
+            if mp.ECOPY:
+                scr["wlist"][idx] = jnp.int32(-1)
+        scr["sm"][0] = ecopy_in_ref[...]
+        scr["sm"][1] = ecopy_in_ref[...]
+        if mp.ECOPY:
+            for e_i in range(mp.E):
+                val = ecopy_in_ref[0, e_i]
+                scr["ecopy"][0, 0, e_i] = val
+                scr["ecopy"][1, 0, e_i] = val
+        ebuf = {"e13": scr["ebuf_e13"], "e2": scr["ebuf_e2"]}
+        esem = {"e13": scr["esem_e13"], "e2": scr["esem_e2"]}
+        fake_stream = _FakeMoEStream(ebuf, esem, mp.E)
+        W = {"e13": w_e13_ref, "e2": w_e2_ref, "es": w_es_ref}
+        ctx = MiniCtx(
+            g=g,
+            ex=ex,
+            core_plan=SimpleNamespace(plan=p, stream=fake_stream.sp, comm=None),
+            pos_ref=None,
+            W=W,
+            ST={},
+            O={},
+            scr=scr,
+            me=jnp.int32(0),
+            stream=fake_stream,
+            comm=None,
+        )
+        m = MoEEmit.build(ctx, mp, MoEDebug())
+        n_hit = route(m, jnp.int32(0), p8_ref[...])
+
+        # Wait on the first prefetched expert's e13, e2, and scale via `ring`
+        # helpers, then release bank 0/1 via `egive` and drain remaining units.
+        e13_0_out_ref[...] = jnp.zeros_like(e13_0_out_ref[...])
+        es_0_out_ref[...] = jnp.zeros_like(es_0_out_ref[...])
+
+        @pl.when(n_hit > 0)
+        def _():
+            v13 = ring.etake(m, "e13", 0)
+            v2 = ring.etake(m, "e2", 1)
+            ring.es_wait(m, 0)
+            e13_0_out_ref[...] = v13[...]
+            es_0_out_ref[...] = scr["es"][0, ...]
+            _ = v2[...]
+            ring.egive(m, 0, jnp.int32(0), 0)
+            ring.egive(m, 1, jnp.int32(0), 1)
+
+            def drain_rest(u_idx, _):
+                k_bank = lax.rem(u_idx, jnp.int32(mp.NBE))
+                t_tile = lax.rem(u_idx, jnp.int32(mp.TE))
+
+                @pl.when(t_tile < mp.T13)
+                def _():
+                    fake_stream.ecopy("e13", W["e13"].at[0, 0, 0], k_bank).wait()
+
+                @pl.when(t_tile >= mp.T13)
+                def _():
+                    fake_stream.ecopy("e2", W["e2"].at[0, 0, 0], k_bank).wait()
+
+                @pl.when(t_tile == 0)
+                def _():
+                    s_slot = lax.rem(
+                        lax.div(u_idx, jnp.int32(mp.TE)), jnp.int32(mp.NSS)
+                    )
+                    pltpu.make_async_copy(
+                        W["es"].at[0, 0],
+                        scr["es"].at[s_slot],
+                        scr["es_sem"].at[s_slot],
+                    ).wait()
+
+                return 0
+
+            nf_total = jnp.minimum(jnp.int32(mp.NBE + 2), n_hit * jnp.int32(mp.TE))
+            lax.fori_loop(2, nf_total, drain_rest, 0)
+
+        wn_out_ref[...] = scr["wn"][...]
+        meta_out_ref[0] = n_hit
+        meta_out_ref[1] = scr["st"][0]
+        for idx in range(32):
+            meta_out_ref[2 + idx] = scr["elist"][idx]
+            meta_out_ref[34 + idx] = (
+                scr["wlist"][idx] if mp.ECOPY else scr["elist"][idx]
+            )
+
+    call = pl.pallas_call(
+        kernel_body,
+        out_shape=[
+            jax.ShapeDtypeStruct((ex.MR, mp.E), F32),
+            jax.ShapeDtypeStruct((66,), I32),
+            jax.ShapeDtypeStruct((mp.H, 2 * mp.IR), BF16),
+            jax.ShapeDtypeStruct((1, 2 * mp.IR + mp.H), F32),
+        ],
+        in_specs=[
+            pl.BlockSpec(memory_space=pltpu.VMEM),
+            pl.BlockSpec(memory_space=pltpu.VMEM),
+            pl.BlockSpec(memory_space=pltpu.HBM),
+            pl.BlockSpec(memory_space=pltpu.HBM),
+            pl.BlockSpec(memory_space=pltpu.HBM),
+        ],
+        out_specs=[
+            pl.BlockSpec(memory_space=pltpu.VMEM),
+            pl.BlockSpec(memory_space=pltpu.SMEM),
+            pl.BlockSpec(memory_space=pltpu.VMEM),
+            pl.BlockSpec(memory_space=pltpu.VMEM),
+        ],
+        scratch_shapes=[scr_shapes[k] for k in s_names],
+        interpret=pltpu.InterpretParams() if interpret else False,
+    )
+
+    rng = np.random.default_rng(42 + int(moe_tp) + 2 * ecopy_opt + 4 * int(route_vec))
+    p8_np = rng.uniform(0.05, 1.0, size=(ex.MR, mp.E)).astype(np.float32)
+    # Ensure distinct probabilities per row and force hits on both rank 0 and rank 1
+    for b in range(B):
+        top_e = [b, (b + 1) % ER, ER + (b % ER), ER + ((b + 2) % ER)]
+        for k_i, e_id in enumerate(top_e):
+            p8_np[b, e_id] = 10.0 - k_i * 1.5
+
+    ecopy_np = np.zeros((1, mp.E), dtype=np.float32)
+    if mp.ECOPY:
+        # Replicate expert 0 (on rank 0) onto rank 1's extra slot 0 (`code = EXTRA + 1`)
+        # and expert ER (on rank 1) onto rank 0's extra slot 0 (`code = 1`).
+        ecopy_np[0, 0] = float(mp.EXTRA + 1)
+        ecopy_np[0, ER] = 1.0
+
+    w_e13_np = (
+        np.arange(mp.EW * mp.H * (2 * mp.IR), dtype=np.float32).reshape(
+            1, mp.EW, 1, mp.H, 2 * mp.IR
+        )
+        * 1e-3
+    )
+    w_e2_np = np.ones((1, mp.EW, 1, mp.IR, mp.H), dtype=np.float32) * 0.1
+    w_es_np = (
+        np.arange(mp.EW * (2 * mp.IR + mp.H), dtype=np.float32).reshape(
+            1, mp.EW, 1, 2 * mp.IR + mp.H
+        )
+        * 1e-2
+    )
+
+    wn_out, meta_out, e13_0_out, es_0_out = jax.jit(call)(
+        jnp.asarray(p8_np, dtype=F32),
+        jnp.asarray(ecopy_np, dtype=F32),
+        jnp.asarray(w_e13_np, dtype=BF16),
+        jnp.asarray(w_e2_np, dtype=BF16),
+        jnp.asarray(w_es_np, dtype=F32),
+    )
+
+    # 1. Verify normalized top-k weights `wn[:B]` against NumPy
+    wn_ref = np.zeros((B, mp.E), dtype=np.float32)
+    uniq_picks: list[int] = []
+    for b in range(B):
+        picks_b = np.argsort(-p8_np[b], kind="stable")[:TOPK]
+        w_b = p8_np[b, picks_b]
+        wn_ref[b, picks_b] = w_b / np.sum(w_b)
+        for e_id in picks_b:
+            if int(e_id) not in uniq_picks:
+                uniq_picks.append(int(e_id))
+    np.testing.assert_allclose(np.asarray(wn_out[:B]), wn_ref, rtol=1e-5, atol=1e-5)
+    np.testing.assert_array_equal(np.asarray(wn_out[B:]), 0.0)
+
+    # 2. Verify `n_hit`, `st[0] == n_hit * TE`, `elist[:n_hit]`, and `wlist[:n_hit]`
+    meta = np.asarray(meta_out)
+    n_hit = int(meta[0])
+    assert int(meta[1]) == n_hit * mp.TE
+    elist = [int(x) for x in meta[2 : 2 + n_hit]]
+    wlist = [int(x) for x in meta[34 : 34 + n_hit]]
+    assert len(elist) == len(set(elist)), f"duplicate experts in elist: {elist}"
+    if moe_tp:
+        assert elist == uniq_picks
+    elif not mp.ECOPY:
+        expected_r0 = [e for e in uniq_picks if (e // ER) == 0]
+        assert elist == expected_r0
+    else:
+        # Fixed rank-0 experts must always appear in `elist`, and every entry in
+        # `wlist` must match either primary slot `e` (`e < ER`) or replica slot
+        # `ER + (c0 - 0 * EXTRA)` for rank 0.
+        fixed_r0 = {e for e in uniq_picks if (e // ER) == 0 and ecopy_np[0, e] == 0.0}
+        assert fixed_r0.issubset(set(elist))
+        for e_id, w_slot in zip(elist, wlist):
+            assert e_id in uniq_picks
+            if e_id < ER and ecopy_np[0, e_id] == 0.0 or e_id < ER:
+                assert w_slot == e_id
+            else:
+                c0 = int(ecopy_np[0, e_id]) - 1
+                assert c0 // mp.EXTRA == 0
+                assert w_slot == ER + (c0 % mp.EXTRA)
+
+    # 3. Verify `ring.etake` / `ring.es_wait` fetched slot `w0` for expert 0
+    assert n_hit > 0
+    w0 = wlist[0] if mp.ECOPY else elist[0]
+    np.testing.assert_array_equal(
+        np.asarray(e13_0_out), np.asarray(jnp.asarray(w_e13_np[0, w0, 0], dtype=BF16))
+    )
+    np.testing.assert_allclose(
+        np.asarray(es_0_out), w_es_np[0, w0], rtol=1e-6, atol=1e-6
+    )
+
+
+@pytest.mark.parametrize(
+    ("moe_tp", "e_slots", "ecopy_opt", "route_vec"),
+    [
+        (True, 0, 0, False),
+        (False, 0, 0, False),
+        (False, 72, 0, False),
+        (False, 72, 1, False),
+        (False, 72, 0, True),
+    ],
+    ids=[
+        "tp_local",
+        "ep_local",
+        "ep_ecopy_opt0_po2c",
+        "ep_ecopy_opt1_po2c",
+        "ep_route_vec_po2c",
+    ],
+)
+def test_moe_route_topk_dedup_po2c_and_ring_in_pallas(
+    moe_tp: bool, e_slots: int, ecopy_opt: int, route_vec: bool
+):
+    """Execute `route` (`route_topk`, `dedup_*`, `po2c`) and `ring` in Pallas."""
+    _run_moe_route_and_ring_pallas(
+        moe_tp=moe_tp,
+        e_slots=e_slots,
+        ecopy_opt=ecopy_opt,
+        route_vec=route_vec,
+        interpret=True,
+    )
+
+
+@pytest.mark.tpu_test
+@pytest.mark.parametrize(
+    ("moe_tp", "e_slots", "ecopy_opt", "route_vec"),
+    [
+        (False, 72, 0, False),
+        (False, 72, 1, False),
+        (False, 72, 0, True),
+    ],
+    ids=["tpu_ecopy_opt0", "tpu_ecopy_opt1", "tpu_route_vec"],
+)
+def test_moe_route_and_ring_on_tpu(
+    moe_tp: bool, e_slots: int, ecopy_opt: int, route_vec: bool
+):
+    """Execute `route` and `ring` helpers on TPU (`interpret=False`)."""
+    try:
+        tpu_devs = jax.devices("tpu")
+    except RuntimeError:
+        tpu_devs = []
+    if not tpu_devs:
+        pytest.skip("TPU device required for interpret=False Pallas execution")
+    with jax.default_device(tpu_devs[0]):
+        _run_moe_route_and_ring_pallas(
+            moe_tp=moe_tp,
+            e_slots=e_slots,
+            ecopy_opt=ecopy_opt,
+            route_vec=route_vec,
+            interpret=False,
+        )

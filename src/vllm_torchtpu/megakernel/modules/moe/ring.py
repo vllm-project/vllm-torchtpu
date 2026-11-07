@@ -98,6 +98,7 @@ def fetch_e(m: MoEEmit, u, l_idx, t=None):
 
 
 def etake(m: MoEEmit, kind: str, u):
+    """Wait for expert weight unit `u` in dynamic bank `u % NBE` and return its view."""
     W, mp, sc, stream = m.W, m.mp, m.sc, m.stream
     NBE = mp.NBE
     bank = u % NBE
@@ -108,6 +109,7 @@ def etake(m: MoEEmit, kind: str, u):
 
 
 def egive(m: MoEEmit, u, l_idx, t=None):
+    """Release dynamic bank `u % NBE` by issuing unit `u + NBE` if within `st[0]`."""
     mp, scr = m.mp, m.scr
     NBE, TE = mp.NBE, mp.TE
     nu = u + NBE
@@ -183,6 +185,7 @@ def _arm_issue(m: MoEEmit, r13, r2, w, bank, t, td, gate):
 
 
 def egive_group(m: MoEEmit, items, l_idx):
+    """Release a batch of expert units together under a single per-layer `bswitch`."""
     W, mp, scr = m.W, m.mp, m.scr
     NBE, TE = mp.NBE, mp.TE
     if mp.stack_e:
@@ -215,12 +218,13 @@ def egive_group(m: MoEEmit, items, l_idx):
 
 
 def fetch_loop(m: MoEEmit, nf, l_idx):
+    """Prefetch the first `nf` (`<= NBE`) expert units for unstacked layer `l_idx`."""
     W = m.W
 
     def arm(r13, r2):
         def body(k, carry):
-            i, w, _, t, td = _unit_meta(m, k, None)
-            _arm_issue(m, r13, r2, w, k, t, td, None)
+            i, w, bank, t, td = _unit_meta(m, k, None)
+            _arm_issue(m, r13, r2, w, bank, t, td, None)
             pl.when(td == 0)(lambda: _es_start(m, i, w, l_idx))
             return carry
 
@@ -233,6 +237,7 @@ def fetch_loop(m: MoEEmit, nf, l_idx):
 
 
 def es_wait(m: MoEEmit, i):
+    """Wait for routed expert `i`'s scale DMA into slot `i % NSS`."""
     W, mp, sc, scr = m.W, m.mp, m.sc, m.scr
     if "es" not in W:
         return

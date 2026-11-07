@@ -35,6 +35,8 @@ def route(m: MoEEmit, l_idx: Any, p8: Any) -> Any:
     E, ECOPY, EXTRA, NBE, TE = mp.E, mp.ECOPY, mp.EXTRA, mp.NBE, mp.TE
     choice = p8
     if m.dbg.forced_routing:
+        # `MoEModule.prologue` issues the initial `rbias[0] -> rb[0]` DMA;
+        # `wait()` only consumes the destination shape and `rb_sem[rs]`.
         rs = l_idx % 2
         pltpu.make_async_copy(
             ctx.extra["rbias"].at[0], scr["rb"].at[rs], scr["rb_sem"].at[rs]
@@ -69,6 +71,8 @@ def route(m: MoEEmit, l_idx: Any, p8: Any) -> Any:
         cp = pltpu.make_async_copy(scr["hitv"], scr["hits"], scr["misc_sem"])
         cp.start()
         cp.wait()
+    # `MoEModule.prologue` / `init_buffers` zeroes `scr["seen"]` before layer 0
+    # of every step, so `stamp = l_idx + 1` (`1..L`) is unique per layer.
     stamp = l_idx + 1
     n_tot: Any = jnp.int32(0)
     n_hit: Any = jnp.int32(0)

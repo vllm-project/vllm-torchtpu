@@ -185,7 +185,12 @@ def po2c(m: MoEEmit, slot_ec: Any, n_tot: Any, n_hit: Any, n_cp: Any) -> Any:
     scr, sc, me = m.scr, m.sc, m.me
     R, ER, EXTRA = m.ex.R, m.mp.ER, m.mp.EXTRA
     with sc("route_dedup", 3):
-
+        # Pass 1 greedily assigns each replicated expert while `rload` is still
+        # accumulating, shifting on a 1-expert gap when either `r0` is above or
+        # `r1` is below the mean load. Pass 2 refines against the completed
+        # `rload` vector, so on a 1-expert gap it flips only when `cur` is
+        # strictly above AND `alt` is strictly below the mean (avoiding a no-op
+        # load swap `(k, k-1) -> (k-1, k)`).
         def po2c_pass1(j, _):
             e = scr["cplist"][j]
             r0 = lax.div(e, ER)
