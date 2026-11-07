@@ -40,6 +40,7 @@ Run with:
 
 from __future__ import annotations
 
+import difflib
 import multiprocessing
 import os
 import queue as queue_lib
@@ -541,15 +542,13 @@ def _assert_bit_exact(
     # greedy decoding encounters a near-tie between synonyms (e.g. " reading" vs
     # " holding"), argmax can flip at that token while the surrounding generation
     # remains semantically equivalent. Allow minor divergence if the prefix
-    # before divergence is substantial (>= 6 tokens) and token agreement over the
-    # common length is high (>= 80%).
-    min_len = min(len(reference.token_ids), len(chunked.token_ids))
-    matching_tokens = sum(
-        1
-        for r, c in zip(reference.token_ids[:min_len], chunked.token_ids[:min_len])
-        if r == c
-    )
-    token_sim = matching_tokens / max(1, min_len)
+    # before divergence is substantial (>= 6 tokens) and the two sequences are
+    # still >= 80% similar. The synonyms can differ in length (" turning the
+    # pages" vs " reading it"), which shifts every later token, so compare by
+    # sequence alignment rather than position.
+    token_sim = difflib.SequenceMatcher(
+        None, reference.token_ids, chunked.token_ids, autojunk=False
+    ).ratio()
     if first_diff >= 6 and token_sim >= 0.8:
         return
 
