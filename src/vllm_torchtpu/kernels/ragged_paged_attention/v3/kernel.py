@@ -81,6 +81,7 @@ def ref_ragged_paged_attention(
     page_indices: jax.Array,  # i32[max_num_seqs * pages_per_seq]
     cu_q_lens: jax.Array,  # i32[max_num_seqs + 1]
     distribution: jax.Array,  # i32[3]
+    attention_sink: jax.Array | None = None,  # f32[actual_num_q_heads]
     *,
     use_causal_mask: bool = True,
     skip_kv_mask: bool = False,
@@ -202,7 +203,16 @@ def ref_ragged_paged_attention(
             if sliding_window is not None:
                 mask = jnp.logical_and(mask, q_span < kv_span + sliding_window)
             attn = jnp.where(mask, attn, mask_value)
-        attn = jax.nn.softmax(attn, axis=-1).astype(v.dtype)
+        if attention_sink is not None:
+            # Each head's sink is one extra softmax logit with no value row.
+            sink = jnp.broadcast_to(
+                attention_sink.astype(attn.dtype).reshape(-1, 1, 1),
+                (*attn.shape[:2], 1),
+            )
+            attn = jax.nn.softmax(jnp.concat([attn, sink], axis=-1), axis=-1)
+            attn = attn[..., :-1].astype(v.dtype)
+        else:
+            attn = jax.nn.softmax(attn, axis=-1).astype(v.dtype)
 
         out = jnp.einsum("hqk,khd->qhd", attn, v).astype(out_dtype)
         if v_scale is not None:
@@ -326,6 +336,8 @@ def _ragged_paged_attention_kernel_loop(
     kv_hbm_ref,  # [max_num_tokens, num_kv_heads_x2 // kv_packing, kv_packing, head_dim]
     # [total_num_pages, page_size, num_kv_heads_x2 // kv_packing, kv_packing, head_dim]
     kv_cache_hbm_ref,
+    # None, or f32[actual_num_kv_heads, num_q_heads_per_kv_head, 128]
+    attention_sink_ref,
     # Output
     # [actual_num_kv_heads, max_num_tokens, num_q_heads_per_kv_head // q_packing,
     #     q_packing, head_dim]
@@ -935,8 +947,18 @@ def _ragged_paged_attention_kernel_loop(
         @pl.loop(0, num_bq, unroll=False)
         def compute_with_bq(bq_idx):
             # Re-initialize l, m, acc to 0 before bkv loop.
-            l_ref[...] = jnp.full_like(l_ref, 0.0)
-            m_ref[...] = jnp.full_like(m_ref, -jnp.inf)
+            if attention_sink_ref is None:
+                l_ref[...] = jnp.full_like(l_ref, 0.0)
+                m_ref[...] = jnp.full_like(m_ref, -jnp.inf)
+            else:
+                # A sink is a logit with no value: start each row's running max
+                # at its head's sink, so its running sum starts at exp(0) = 1.
+                # Rows are (token, head) token-major, as in step1's q_span.
+                l_ref[...] = jnp.full_like(l_ref, 1.0)
+                for kv_head_idx in range(actual_num_kv_heads):
+                    m_ref[kv_head_idx] = jnp.concat(
+                        [attention_sink_ref[kv_head_idx]] * bq_sz, axis=0
+                    ).astype(m_ref.dtype)
             acc_ref[...] = jnp.full_like(acc_ref, 0.0)
 
             bq_sem_idx = sem_ids_ref[0]
@@ -1640,6 +1662,7 @@ def ragged_paged_attention(
     page_indices: jax.Array,  # i32[max_num_seqs * pages_per_seq]
     cu_q_lens: jax.Array,  # i32[max_num_seqs + 1]
     distribution: jax.Array,  # i32[3]
+    attention_sink: jax.Array | None = None,  # f32[actual_num_q_heads]
     *,
     use_causal_mask: bool = True,
     skip_kv_mask: bool = False,
@@ -1683,6 +1706,8 @@ def ragged_paged_attention(
       distribution: (i, j, k) represents that sequences[0:i] are decode-only,
         sequences[i:j] are chunked-prefill-only, and sequences[j:k] are mixed. The
         k is also the total number of sequences.
+      attention_sink: optional f32 sink logit per q head: an extra softmax term
+        exp(sink) in each row's denominator with no value contribution.
       use_causal_mask: if true, use causal mask.
       skip_kv_mask: only set to true if use_causal_mask=False and each dynamic
         kv_len % bkv_csz == 0. Set to true can improve performance.
@@ -1756,6 +1781,25 @@ def ragged_paged_attention(
 
     actual_num_q_heads_per_kv_head = actual_num_q_heads // actual_num_kv_heads
     q, kv = prepare_inputs(q, k, v, fuse_non_tiling_axis_swap=False)
+    if attention_sink is not None:
+        if attention_sink.shape != (actual_num_q_heads,):
+            raise ValueError(f"{attention_sink.shape=} must be ({actual_num_q_heads},)")
+        if attention_sink.dtype != jnp.float32:
+            raise ValueError(f"{attention_sink.dtype=} must be float32.")
+        # [kv heads, padded q heads per kv head, 128 lanes] to match l/m rows.
+        attention_sink = jnp.repeat(
+            jnp.pad(
+                attention_sink.reshape(
+                    actual_num_kv_heads, actual_num_q_heads_per_kv_head
+                ),
+                (
+                    (0, 0),
+                    (0, q.shape[2] * q.shape[3] - actual_num_q_heads_per_kv_head),
+                ),
+            )[..., None],
+            128,
+            axis=-1,
+        )
     (
         _,
         max_num_tokens,
@@ -1794,6 +1838,7 @@ def ragged_paged_attention(
             pl.BlockSpec(memory_space=pltpu.HBM),
             pl.BlockSpec(memory_space=pltpu.HBM),
             pl.BlockSpec(memory_space=pltpu.HBM),
+            None if attention_sink is None else pl.BlockSpec(memory_space=pltpu.VMEM),
         ]
 
         out_specs = [
@@ -1912,19 +1957,20 @@ def ragged_paged_attention(
         if tpu_version >= 7:
             # jit to color the memory since the q, kv are just preprocessed.
             @jax.jit
-            def run(scalar_prefetches, q, kv, kv_cache):
+            def run(scalar_prefetches, q, kv, kv_cache, attention_sink):
                 return kernel(
                     *scalar_prefetches,
                     pltpu.with_memory_space_constraint(q, pltpu.HBM),
                     pltpu.with_memory_space_constraint(kv, pltpu.HBM),
                     pltpu.with_memory_space_constraint(kv_cache, pltpu.HBM),
+                    attention_sink,
                 )
         else:
             # TODO: v6 has issues with pinning aliased memory.
-            def run(scalar_prefetches, q, kv, kv_cache):
-                return kernel(*scalar_prefetches, q, kv, kv_cache)
+            def run(scalar_prefetches, q, kv, kv_cache, attention_sink):
+                return kernel(*scalar_prefetches, q, kv, kv_cache, attention_sink)
 
-        return run(scalar_prefetches, q, kv, kv_cache)
+        return run(scalar_prefetches, q, kv, kv_cache, attention_sink)
 
     def _prepare_block_sizes(block_sizes, case):
         if block_sizes is None:

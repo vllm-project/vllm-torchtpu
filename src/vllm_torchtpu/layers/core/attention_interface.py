@@ -427,9 +427,12 @@ def sharded_ragged_paged_attention(
         func = rpa_func
 
     if attention_sink is not None:
-        if not use_hd64:
+        # The default head_dim-128 RPA v3 kernel takes sinks too; the batched
+        # and bundled variants do not.
+        if not use_hd64 and rpa_func is not ragged_paged_attention:
             raise NotImplementedError(
-                "Attention sink support is only available when head_dim==64"
+                "Attention sinks need RPA v3 (head_dim 64, or the default "
+                "head_dim-128 kernel)"
             )
 
         in_specs += (P("model"),)
