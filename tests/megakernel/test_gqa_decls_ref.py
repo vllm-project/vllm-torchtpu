@@ -250,16 +250,29 @@ def test_gqa_reference_matches_direct_computation(
     R, B, ctx = 2, 2 * T, 128
     L = 2 if use_fp8 else 1
     att_idx = 1 if use_fp8 else 0
-    g = FakeGeometry(L=L, att_every=1, H=256, NH=4, NKV=2, HD=128, ROT=32)
+    zc = not use_fp8
+    g = FakeGeometry(
+        L=L,
+        att_every=1,
+        H=256,
+        NH=4,
+        NKV=2,
+        HD=128,
+        ROT=32,
+        zero_centered_norm=zc,
+    )
     # "gqa" is registered by `gqa/params.py`; also test isolated custom name.
     assert TINY_TILES.module("gqa") == GQATunables()
     monkeypatch.setitem(module_options._TUNABLES, "custom_gqa_test", GQATunables)
+    mod_name = "custom_gqa_test" if use_fp8 else "gqa"
+    tiles = TINY_TILES.with_modules({mod_name: GQATunables(rope_fp32=paged_kv)})
+    rope_round = not paged_kv
     cache = (
         CacheExec(paged_kv=True, page_size=128, num_pages=16)
         if paged_kv
         else CacheExec()
     )
-    ex = ExecSpec(B=B, T=T, R=R, ctx=ctx, tiles=TINY_TILES, cache=cache)
+    ex = ExecSpec(B=B, T=T, R=R, ctx=ctx, tiles=tiles, cache=cache)
     nh = g.NH // R
     nai = (2 * nh + 2) * g.HD
     koff = nh * 2 * g.HD
@@ -272,7 +285,7 @@ def test_gqa_reference_matches_direct_computation(
     kn = jax.random.normal(keys[4], (R, L, g.HD), dtype=F32) * 0.2 + 1.0
     kc = jax.random.normal(keys[5], (R, L, ex.NS, ctx, g.HD), dtype=BF16) * 0.4
     vc = jax.random.normal(keys[6], (R, L, ex.NS, ctx, g.HD), dtype=BF16) * 0.4
-    pos = jnp.array([4 + (b % T) for b in range(B)], dtype=I32)
+    pos = jnp.array([4 + 5 * (b // T) + (b % T) for b in range(B)], dtype=I32)
 
     if use_fp8:
         w_in = jax.random.normal(keys[1], (R, L, g.H, nai), dtype=BF16).astype(FP8)
@@ -312,75 +325,114 @@ def test_gqa_reference_matches_direct_computation(
         pos=pos,
         att_idx=att_idx,
         layer_idx=att_idx,
+        module_name=mod_name,
     )
     assert delta.shape == (B, g.H)
     assert new_state["kc"].shape == kc.shape
 
-    # Independent computation of token 0 (`b=0`, `sq=0`, `tb=0`) across all ranks `r`.
-    xb0 = x[0:1].astype(BF16).astype(F32)
+    # Independent computation across every row `b in range(B)` (including `tb=1`
+    # for `T=2` causal in-chunk attention) and all ranks `r`.
+    xb = x[:B].astype(BF16).astype(F32)
     half = g.ROT // 2
     inv = 1.0 / (g.theta ** (jnp.arange(half, dtype=F32)[None, :] * 2.0 / g.ROT))
-    ang0 = pos[0].astype(F32) * inv
-    cos0, sin0 = round_bf16(jnp.cos(ang0)), round_bf16(jnp.sin(ang0))
-    plen0 = int(pos[0])
 
-    expected_delta0 = jnp.zeros((g.H,), dtype=F32)
+    expected_delta = jnp.zeros((B, g.H), dtype=F32)
     for r in range(R):
         w_in_r = (w_in[r, att_idx] if use_fp8 else w_in[r]).astype(F32)
         w_out_r = (w_out[r, att_idx] if use_fp8 else w_out[r]).astype(F32)
         qn_r = qn[r, att_idx]
         kn_r = kn[r, att_idx]
-        y_raw = xb0 @ w_in_r
-        y0 = round_bf16(y_raw * in_s[r, att_idx] if in_s is not None else y_raw)
-        qg0 = y0[0, :koff].reshape(nh, 2 * g.HD)
-        gate0 = round_bf16(jax.nn.sigmoid(qg0[:, g.HD :].reshape(nh * g.HD)))
-        q0 = round_bf16(
-            rope_partial(
-                rmsnorm(qg0[:, : g.HD], qn_r, g.eps, zero_centered=True),
-                cos0,
-                sin0,
-                g.ROT,
-                round_intermediates=True,
+        y_raw = xb @ w_in_r
+        y_r = round_bf16(y_raw * in_s[r, att_idx] if in_s is not None else y_raw)
+        qg_r = y_r[:, :koff].reshape(B, nh, 2 * g.HD)
+
+        q_rows = []
+        k_rows = []
+        v_rows = []
+        gate_rows = []
+        for b in range(B):
+            ang_b = pos[b].astype(F32) * inv
+            cos_b, sin_b = round_bf16(jnp.cos(ang_b)), round_bf16(jnp.sin(ang_b))
+            gate_rows.append(
+                round_bf16(jax.nn.sigmoid(qg_r[b, :, g.HD :].reshape(nh * g.HD)))
             )
-            * (g.HD**-0.5)
-        )
-        k0 = rope_partial(
-            rmsnorm(y0[:, koff : koff + g.HD], kn_r, g.eps, zero_centered=True),
-            cos0,
-            sin0,
-            g.ROT,
-            round_intermediates=True,
-        )[0]
-        v0 = y0[0, koff + g.HD : koff + 2 * g.HD]
-        if paged_kv:
-            k0 = jnp.clip(k0, -448.0, 448.0).astype(FP8).astype(F32)
-            v0 = jnp.clip(v0, -448.0, 448.0).astype(FP8).astype(F32)
-        kc_r0 = kc[r, att_idx, 0] if use_fp8 else kc[r, 0]
-        vc_r0 = vc[r, att_idx, 0] if use_fp8 else vc[r, 0]
-        if paged_kv:
-            kc_r0 = jnp.clip(kc_r0.astype(F32), -448.0, 448.0).astype(FP8).astype(BF16)
-            vc_r0 = jnp.clip(vc_r0.astype(F32), -448.0, 448.0).astype(FP8).astype(BF16)
-        kc_out_r0 = new_state["kc"][r, att_idx, 0] if use_fp8 else new_state["kc"][r, 0]
-        vc_out_r0 = new_state["vc"][r, att_idx, 0] if use_fp8 else new_state["vc"][r, 0]
-        np.testing.assert_allclose(kc_out_r0[plen0], k0.astype(BF16))
-        np.testing.assert_allclose(vc_out_r0[plen0], v0.astype(BF16))
+            q_b = round_bf16(
+                rope_partial(
+                    rmsnorm(qg_r[b, :, : g.HD], qn_r, g.eps, zero_centered=zc),
+                    cos_b,
+                    sin_b,
+                    g.ROT,
+                    round_intermediates=rope_round,
+                )
+                * (g.HD**-0.5)
+            )
+            k_b = rope_partial(
+                rmsnorm(
+                    y_r[b : b + 1, koff : koff + g.HD],
+                    kn_r,
+                    g.eps,
+                    zero_centered=zc,
+                ),
+                cos_b,
+                sin_b,
+                g.ROT,
+                round_intermediates=rope_round,
+            )[0]
+            v_b = y_r[b, koff + g.HD : koff + 2 * g.HD]
+            if paged_kv:
+                k_b = jnp.clip(k_b, -448.0, 448.0).astype(FP8).astype(F32)
+                v_b = jnp.clip(v_b, -448.0, 448.0).astype(FP8).astype(F32)
+            q_rows.append(q_b)
+            k_rows.append(k_b)
+            v_rows.append(v_b)
 
-        k_valid = jnp.concatenate([kc_r0[:plen0].astype(F32), k0[None, :]], axis=0)
-        v_valid = jnp.concatenate([vc_r0[:plen0].astype(F32), v0[None, :]], axis=0)
-        scores0 = q0.astype(BF16).astype(F32) @ k_valid.T
-        probs0 = jax.nn.softmax(scores0, axis=-1)
-        att0 = round_bf16(probs0 @ v_valid).reshape(nh * g.HD)
-        mix0 = round_bf16(att0 * gate0).astype(BF16).astype(F32)
-        yo_raw = mix0 @ w_out_r
-        yo0 = (
-            (yo_raw * out_s[r, att_idx] if out_s is not None else yo_raw)
-            .astype(BF16)
-            .astype(F32)
-        )
-        expected_delta0 = expected_delta0 + yo0
+        kc_r = kc[r, att_idx] if use_fp8 else kc[r]
+        vc_r = vc[r, att_idx] if use_fp8 else vc[r]
+        if paged_kv:
+            kc_r = jnp.clip(kc_r.astype(F32), -448.0, 448.0).astype(FP8).astype(BF16)
+            vc_r = jnp.clip(vc_r.astype(F32), -448.0, 448.0).astype(FP8).astype(BF16)
+        kc_out_r = new_state["kc"][r, att_idx] if use_fp8 else new_state["kc"][r]
+        vc_out_r = new_state["vc"][r, att_idx] if use_fp8 else new_state["vc"][r]
 
-    np.testing.assert_allclose(delta[0], expected_delta0, rtol=1e-2, atol=1e-2)
+        for sq in range(ex.NS):
+            b0 = sq * T
+            plen = int(pos[b0])
+            exp_k_chunk = jnp.stack(k_rows[b0 : b0 + T], axis=0).astype(BF16)
+            exp_v_chunk = jnp.stack(v_rows[b0 : b0 + T], axis=0).astype(BF16)
+            np.testing.assert_allclose(kc_out_r[sq, plen : plen + T], exp_k_chunk)
+            np.testing.assert_allclose(vc_out_r[sq, plen : plen + T], exp_v_chunk)
+
+        yo_rows = []
+        for b in range(B):
+            sq, tb = divmod(b, T)
+            plen = int(pos[sq * T])
+            k_valid = jnp.concatenate(
+                [
+                    kc_r[sq, :plen].astype(F32),
+                    jnp.stack(k_rows[sq * T : sq * T + tb + 1], axis=0),
+                ],
+                axis=0,
+            )
+            v_valid = jnp.concatenate(
+                [
+                    vc_r[sq, :plen].astype(F32),
+                    jnp.stack(v_rows[sq * T : sq * T + tb + 1], axis=0),
+                ],
+                axis=0,
+            )
+            scores_b = q_rows[b].astype(BF16).astype(F32) @ k_valid.T
+            probs_b = jax.nn.softmax(scores_b, axis=-1)
+            att_b = round_bf16(probs_b @ v_valid).reshape(nh * g.HD)
+            mix_b = round_bf16(att_b * gate_rows[b]).astype(BF16).astype(F32)
+            yo_raw = mix_b @ w_out_r
+            yo_b = (
+                (yo_raw * out_s[r, att_idx] if out_s is not None else yo_raw)
+                .astype(BF16)
+                .astype(F32)
+            )
+            yo_rows.append(yo_b)
+        expected_delta = expected_delta + jnp.stack(yo_rows, axis=0)
+
+    np.testing.assert_allclose(delta, expected_delta, rtol=1e-2, atol=1e-2)
     with pytest.raises(AssertionError):
-        np.testing.assert_allclose(
-            delta[0] + 0.1, expected_delta0, rtol=1e-5, atol=1e-5
-        )
+        np.testing.assert_allclose(delta + 0.5, expected_delta, rtol=1e-2, atol=1e-2)
