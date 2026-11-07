@@ -114,6 +114,7 @@ def _get_op(*, topk, activation, rhs_quant_dtype, skip_padded_tokens, shared=Fal
         skip_padded_tokens=skip_padded_tokens,
         capacity_factor=capacity_factor,
         route_factor=envs.TPU_MOE_A2A_ROUTE_CAPACITY,
+        capacity_row_tile=envs.TPU_MOE_A2A_ROW_TILE,
         direct_combine=envs.TPU_MOE_A2A_DIRECT_COMBINE,
         owner_combine=envs.TPU_MOE_A2A_OWNER_COMBINE,
         sorted_plan=envs.TPU_MOE_A2A_SORTED_PLAN,
@@ -209,6 +210,7 @@ def _log_capacity(mesh, topk, onehot_threshold, decode_routed_rows) -> None:
         onehot_moe_permute_threshold=onehot_threshold,
         use_sparse_core=envs.USE_MOE_SPARSE_CORE,
         route_factor=envs.TPU_MOE_A2A_ROUTE_CAPACITY or None,
+        row_tile=envs.TPU_MOE_A2A_ROW_TILE,
     )
     if rows >= dp_size * decode_tokens:
         logger.info(

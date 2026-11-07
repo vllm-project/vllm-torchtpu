@@ -476,6 +476,14 @@ def test_exchange_capacity_sizes():
         400,
         512,
     )
+    # At 24 requests per engine x2 is 432 rows in 16-row tiles, 448 in 32-row.
+    assert ra_capacity(dp_size=8, tp_size=4, num_tokens=96, factor=2.0, **kw) == (
+        432,
+        512,
+    )
+    assert ra_capacity(
+        dp_size=8, tp_size=4, num_tokens=96, factor=2.0, row_tile=32, **kw
+    ) == (448, 512)
     # Bounded routes above the one-hot threshold are not bounded.
     kw = dict(topk=10, local_num_experts=64, onehot_moe_permute_threshold=255)
     assert ra_capacity(dp_size=2, tp_size=4, num_tokens=48, factor=2.0, **kw) == (

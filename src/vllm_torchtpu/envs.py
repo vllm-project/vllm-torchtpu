@@ -113,6 +113,7 @@ if TYPE_CHECKING:
     TPU_MOE_RAGGED_A2A: bool = False
     TPU_MOE_A2A_CAPACITY: float = 2.5
     TPU_MOE_A2A_ROUTE_CAPACITY: float = 3.0
+    TPU_MOE_A2A_ROW_TILE: int = 16
     TPU_MOE_A2A_DIRECT_COMBINE: bool = False
     TPU_MOE_A2A_OWNER_COMBINE: bool = False
     TPU_MOE_A2A_SORTED_PLAN: bool = False
@@ -840,6 +841,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_MOE_A2A_ROUTE_CAPACITY": lambda: _a2a_capacity(
         "TPU_MOE_A2A_ROUTE_CAPACITY", 3.0
     ),
+    # Ragged all-to-all exchange: the capacity rows grow in tiles of this many
+    # rows (16 or 32; at 32 ranks and 96 tokens per engine, x2 gives 432 rows
+    # in 16-row tiles and 448 in 32-row tiles, whose relayouts cost less).
+    "TPU_MOE_A2A_ROW_TILE": lambda: int(os.getenv("TPU_MOE_A2A_ROW_TILE", "16")),
     # Ragged all-to-all exchange: the fused expert kernel sends each expert
     # output row to its home rank as soon as it is computed, and the home rank
     # sums them, instead of a combine and a second exchange after the experts.

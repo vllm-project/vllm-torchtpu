@@ -176,17 +176,18 @@ def exchange_capacity(
     onehot_moe_permute_threshold: int,
     use_sparse_core: bool,
     route_factor: float | None = None,
+    row_tile: int = _ROW_TILE,
 ) -> tuple[int, int]:
     """Static sizes of the capacity exchange: ``(rows, routes)``.
 
     ``rows`` bounds the token rows each rank sends and receives, ``routes``
     the routes hitting its local experts: ``factor`` (``route_factor`` for
     the routes, when given) times their mean under uniform routing, rounded
-    up to whole tiles and capped at the sizes that always fit (``dp_size *
-    num_tokens`` rows, ``topk`` routes per row). The route bound only applies
-    where the bounded routes fit the one-hot path. Where the full-size
-    exchange's routes fit it too, both factors are capped at
-    ``_ONEHOT_FALLBACK_FACTOR``.
+    up to whole tiles (rows in ``row_tile``-row tiles) and capped at the
+    sizes that always fit (``dp_size * num_tokens`` rows, ``topk`` routes
+    per row). The route bound only applies where the bounded routes fit the
+    one-hot path. Where the full-size exchange's routes fit it too, both
+    factors are capped at ``_ONEHOT_FALLBACK_FACTOR``.
     """
     slots = dp_size * num_tokens
     if factor <= 0:
@@ -199,7 +200,7 @@ def exchange_capacity(
     miss = 1.0  # a token's topk distinct experts all on other ranks
     for i in range(topk):
         miss *= max(num_experts - local_num_experts - i, 0) / (num_experts - i)
-    rows = -(-math.ceil(factor * slots * (1 - miss)) // _ROW_TILE) * _ROW_TILE
+    rows = -(-math.ceil(factor * slots * (1 - miss)) // row_tile) * row_tile
     rows = min(rows, slots)
     routes = math.ceil((route_factor or factor) * slots * topk / num_ranks)
     routes = min(-(-routes // _ROUTE_TILE) * _ROUTE_TILE, rows * topk)
@@ -1326,6 +1327,7 @@ def ragged_a2a_moe_local(
     skip_padded_tokens: bool = False,
     capacity_factor: float = 0.0,
     route_factor: float = 0.0,
+    capacity_row_tile: int = _ROW_TILE,
     direct_combine: bool = False,
     owner_combine: bool = False,
     sorted_plan: bool = False,
@@ -1517,6 +1519,7 @@ def ragged_a2a_moe_local(
         onehot_moe_permute_threshold=onehot_moe_permute_threshold,
         use_sparse_core=use_sparse_core,
         route_factor=route_factor or None,
+        row_tile=capacity_row_tile,
     )
     if rows >= slots:
         # Bounding the routes alone saves less than the conditional costs
@@ -1573,6 +1576,7 @@ def ragged_a2a_moe(
     skip_padded_tokens: bool = False,
     capacity_factor: float = 0.0,
     route_factor: float = 0.0,
+    capacity_row_tile: int = _ROW_TILE,
     direct_combine: bool = False,
     owner_combine: bool = False,
     sorted_plan: bool = False,
@@ -1594,6 +1598,7 @@ def ragged_a2a_moe(
         skip_padded_tokens=skip_padded_tokens,
         capacity_factor=capacity_factor,
         route_factor=route_factor,
+        capacity_row_tile=capacity_row_tile,
         direct_combine=direct_combine,
         owner_combine=owner_combine,
         sorted_plan=sorted_plan,
