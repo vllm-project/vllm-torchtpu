@@ -46,13 +46,19 @@ import time
 from collections.abc import Iterable, Mapping, Sequence
 from typing import TYPE_CHECKING, Any
 
+import jax.numpy as jnp
 import numpy as np
 import torch
 from jax.sharding import PartitionSpec as P
 
 from vllm_torchtpu.logger import init_logger
 
-from .decode_ops import GREEDY, Control, DecodeOps, dp_row_owners
+from .decode_ops import (
+    GREEDY,
+    Control,
+    DecodeOps,
+    dp_row_owners,
+)
 from .pools import (
     KDA_LAYERS,
     KdaImporter,
@@ -69,13 +75,27 @@ from .program import (
     spec_tokens_per_batch,
     supports_spec_tokens,
 )
-from .runtime_shim.bridge import hbm, materialize, register_global_op
+from .runtime_shim.bridge import (
+    hbm,
+    materialize,
+    register_global_op,
+)
 from .runtime_shim.compilation import compile_ops
 from .runtime_shim.export_cache import prepare_distributed
-from .runtime_shim.program import KVGroup, RequestInput, StepInput, StepOutput
+from .runtime_shim.program import (
+    KVGroup,
+    RequestInput,
+    StepInput,
+    StepOutput,
+)
 
 if TYPE_CHECKING:
     from .runtime_shim.config import MegakernelEngineConfig
+
+try:
+    from torch_tpu._internal.sync import synchronize as _tpu_synchronize
+except (ModuleNotFoundError, AttributeError):
+    _tpu_synchronize = None
 
 logger = init_logger(__name__)
 
@@ -382,8 +402,6 @@ class KimiDecoder:
         key = ("splice", layout.key())
 
         def build():
-            import jax.numpy as jnp
-
             def fn(control, plan):
                 return (jnp.concatenate((control[: layout.plan_start], plan)),)
 
@@ -409,8 +427,6 @@ class KimiDecoder:
         key = ("enter", layout.key(), sub_base)
 
         def build():
-            import jax.numpy as jnp
-
             rows = self.WIDTH
             (dspark,) = kernel_modules("dspark")
 
@@ -462,8 +478,6 @@ class KimiDecoder:
         key = ("enter_batched", layout.key(), requests, k)
 
         def build():
-            import jax.numpy as jnp
-
             (dspark,) = kernel_modules("dspark")
             R = requests
 
@@ -925,13 +939,14 @@ class KimiDecoder:
             return emitted
 
         if self._compiled_layout != self.layout.key():
-            from torch_tpu._internal.sync import synchronize
-
             # The first step compiles its own variant (its state buffers come
             # from allocation, not from an op), which the precompiled graphs
             # do not cover: start it first so that compile overlaps theirs.
             first = plain_step(self.ops.batch_sizes[0], False)
-            synchronize(
+            if _tpu_synchronize is None:
+                msg = "KimiDecoder precompilation requires torch_tpu synchronization"
+                raise RuntimeError(msg)
+            _tpu_synchronize(
                 [first, self.control, *self.ops.slots, *self.ops.unified_pools],
                 wait=False,
             )
@@ -953,7 +968,6 @@ class KimiDecoder:
             calls.sort(key=lambda call: call.priority, reverse=True)
             # These builders capture the same static kernel/configuration
             # on every rank; weights and state are dynamic operands.
-
             prepare_distributed(calls)
             compile_ops(calls)
             materialize(first)

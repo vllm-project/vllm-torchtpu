@@ -28,6 +28,14 @@ from vllm_torchtpu.megakernel.runtime.contract import (
     TpuMonoSpec,
 )
 
+from .layout import CONV_HEAD_ROWS, LAYOUT, NUM_LAYERS
+
+KDA_LAYERS: int = len(LAYOUT.state_layers)
+MLA_LAYERS: int = len(LAYOUT.attention_layers)
+RECURRENT_HEAD_ROWS: int = LAYOUT.region("recurrent").rows
+HIDDEN_SIZE: int = 7168
+VERIFY_TOKENS: tuple[int, ...] = (8,)
+
 SPEC = TpuMonoSpec(
     name="kimi_k3",
     version="1",
@@ -66,7 +74,17 @@ SPEC = TpuMonoSpec(
         "unaligned_cache_layout",
         "missing_mxfp4_weights",
         "empty_buckets",
+        "verify_commit_hook_unwired",
     ),
 )
 
-__all__ = ["SPEC"]
+__all__ = [
+    "CONV_HEAD_ROWS",
+    "HIDDEN_SIZE",
+    "KDA_LAYERS",
+    "MLA_LAYERS",
+    "NUM_LAYERS",
+    "RECURRENT_HEAD_ROWS",
+    "SPEC",
+    "VERIFY_TOKENS",
+]

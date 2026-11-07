@@ -44,6 +44,8 @@ import time
 from pathlib import Path
 from typing import Any
 
+import jax
+import jax.numpy as jnp
 import numpy as np
 import torch
 from jax.sharding import PartitionSpec as P
@@ -52,14 +54,29 @@ from vllm_torchtpu.logger import init_logger
 
 from . import config as kernel_config
 from .program import TP_SIZE, kernel_modules
-from .runtime_shim.bridge import hbm, kernel_mesh, materialize, register_op, upload
-from .runtime_shim.compilation import CompileCall
+
+try:
+    from .runtime_shim import bridge as _bridge
+except (ModuleNotFoundError, AttributeError):
+    _bridge = None
+
+try:
+    from .runtime_shim.compilation import CompileCall as _CompileCall
+except (ModuleNotFoundError, AttributeError):
+    _CompileCall = None
+
+try:
+    from torch_tpu._internal.sync import synchronize as _tpu_synchronize
+except (ModuleNotFoundError, AttributeError):
+    _tpu_synchronize = None
 
 logger = init_logger(__name__)
 
 AXIS = "tp"
 TARGET_WEIGHTS = {"lm_head": "lm_head", "embed": "embedding"}
 MAX_ROWS = 64
+DRAFT_VECTOR_LEN = 128
+_NO_BRIDGE_MSG = "MlaDsparkDraft TPU bridge requires torch_tpu"
 
 
 @dataclasses.dataclass
@@ -71,10 +88,31 @@ class MlaDraftState:
 
 
 def _settled(state: MlaDraftState) -> MlaDraftState:
-    from torch_tpu._internal.sync import synchronize
-
-    synchronize([state.vector], wait=False)
+    """Synchronize `state.vector` asynchronously on TPU devices and return `state`."""
+    if state.vector.device.type == "tpu":
+        if _tpu_synchronize is None:
+            raise RuntimeError(_NO_BRIDGE_MSG)
+        _tpu_synchronize([state.vector], wait=False)
     return state
+
+
+def make_draft_state(
+    anchor: int | torch.Tensor,
+    *,
+    device: torch.device | str = "cpu",
+) -> MlaDraftState:
+    """Construct an initial `MlaDraftState` seeded with `anchor` on `device`."""
+    (dspark,) = kernel_modules("dspark")
+    dev = torch.device(device)
+    vector = torch.full((1, DRAFT_VECTOR_LEN), -1, dtype=torch.int32, device=dev)
+    anchor_t = (
+        anchor.reshape(1).to(dtype=torch.int32, device=dev)
+        if isinstance(anchor, torch.Tensor)
+        else torch.tensor([int(anchor)], dtype=torch.int32, device=dev)
+    )
+    vector[0, : dspark.ROWS - 1] = anchor_t
+    vector[0, dspark.OUT_BONUS] = anchor_t[0]
+    return _settled(MlaDraftState(vector.clone()))
 
 
 def _batched_fn(
@@ -102,8 +140,6 @@ def _batched_fn(
     rows = (picked[:, None] * k + np.arange(k, dtype=np.int32)[None, :]).reshape(-1)
 
     def fn(*args):
-        import jax.numpy as jnp
-
         weights = {name: args[i][0] for i, name in enumerate(names)}
         pools = args[count : count + layers]
         previous = jnp.concatenate(
@@ -208,7 +244,9 @@ class MlaDsparkDraft:
         self.synthetic_rates = synthetic_rates
         self.synthetic_rates_by_width = synthetic_rates_by_width
         self.config = self.mla.MlaDraftConfig.from_checkpoint(Path(checkpoint))
-        self.mesh, self.rank = kernel_mesh(AXIS, TP_SIZE)
+        if _bridge is None:
+            raise RuntimeError(_NO_BRIDGE_MSG)
+        self.mesh, self.rank = _bridge.kernel_mesh(AXIS, TP_SIZE)
         self.attention_dp = kernel_config.active().attention_dp
         if self.attention_dp not in (1, 2):
             raise ValueError("the MLA DSpark draft runs on TP32 or under attention DP2")
@@ -255,12 +293,14 @@ class MlaDsparkDraft:
         shards["qkv_tile"], shards["context_tile"] = self.mla.qkv_tiles(
             shards.pop("qkv_a"), self.rank
         )
+        if _bridge is None:
+            raise RuntimeError(_NO_BRIDGE_MSG)
         for name, value in shards.items():
-            self.weights[name] = upload(np.ascontiguousarray(value))
-        self.weights["rope"] = upload(
+            self.weights[name] = _bridge.upload(np.ascontiguousarray(value))
+        self.weights["rope"] = _bridge.upload(
             self.mla.rope_table(self.config, self.max_position + 96)
         )
-        materialize(self.weights["rope"])
+        _bridge.materialize(self.weights["rope"])
         wall = time.perf_counter() - started
         if self.rank == 0:
             gib = (
@@ -272,28 +312,27 @@ class MlaDsparkDraft:
                 gib,
                 self.max_position,
                 wall,
-                hbm(self.rank),
+                _bridge.hbm(self.rank),
             )
         return wall
 
     def attach_target(self, target_weights: dict[str, torch.Tensor]) -> None:
         """The target's LM head and embedding (the decoder's), and the mask
         token's embedding row from it."""
+        if _bridge is None:
+            raise RuntimeError(_NO_BRIDGE_MSG)
         for name, target in TARGET_WEIGHTS.items():
             self.weights[name] = target_weights[target]
         mask, vocab = self.config.mask_token, self.config.vocab // TP_SIZE
 
         def body(embedding):
-            import jax
-            import jax.numpy as jnp
-
             rank = jax.lax.axis_index(AXIS)
             local = mask - rank * vocab
             row = embedding[0][jnp.clip(local, 0, vocab - 1)].astype(jnp.float32)
             row = jnp.where((local >= 0) & (local < vocab), row, 0.0)
             return (jax.lax.psum(row, AXIS).astype(jnp.bfloat16)[None, None],)
 
-        op = register_op(
+        op = _bridge.register_op(
             "pallas::k3_dspark_mla_mask_embed",
             self.mesh,
             body,
@@ -323,24 +362,21 @@ class MlaDsparkDraft:
         elif not (self.pools and self.pools[0].shape == template.shape):
             self.pools = [torch.zeros_like(template) for _ in range(self.config.layers)]
         if self.rank == 0:
+            if _bridge is None:
+                raise RuntimeError(_NO_BRIDGE_MSG)
             logger.info(
                 "K3 DSpark (MLA): %d draft pools %s %s; HBM %s",
                 len(self.pools),
                 tuple(template.shape),
                 template.dtype,
-                hbm(self.rank),
+                _bridge.hbm(self.rank),
             )
 
     # ------------------------------------------------------------ state
     def new_state(self, anchor: int | torch.Tensor) -> MlaDraftState:
         """A state whose next verify is ``anchor`` with placeholder drafts."""
-        vector = torch.full((1, 128), -1, dtype=torch.int32).to("tpu")
-        if not isinstance(anchor, torch.Tensor):
-            anchor = torch.tensor([int(anchor)], dtype=torch.int32).to("tpu")
-        anchor = anchor.reshape(1).to(torch.int32)
-        vector[0, : self.dspark.ROWS - 1] = anchor
-        vector[0, self.dspark.OUT_BONUS] = anchor[0]
-        return _settled(MlaDraftState(vector.clone()))
+        dev = self.pools[0].device if self.pools else torch.device("tpu")
+        return make_draft_state(anchor, device=dev)
 
     def from_ring(
         self, *args
@@ -361,8 +397,6 @@ class MlaDsparkDraft:
         groups' block ids."""
         dp = self.attention_dp
         if dp > 1:
-            import jax
-
             group = jax.lax.axis_index(AXIS) // (TP_SIZE // dp)
             size = positions.shape[0] // dp
             latents = jax.lax.dynamic_slice_in_dim(latents, group * size, size, 1)
@@ -389,8 +423,6 @@ class MlaDsparkDraft:
         )
 
         def body(*args):
-            import jax.numpy as jnp
-
             weights = {name: args[i][0] for i, name in enumerate(names)}
             pools = args[count : count + layers]
             aux, logits, previous, ids, state, decisions = args[count + layers :]
@@ -442,7 +474,9 @@ class MlaDsparkDraft:
 
         in_specs = (P(AXIS),) * (count + layers) + (P(), P(AXIS), P(), P(), P(), P())
         out_specs = (P(),) + (P(AXIS),) * layers + (P(), P(), P())
-        self._ops[key] = register_op(
+        if _bridge is None:
+            raise RuntimeError(_NO_BRIDGE_MSG)
+        self._ops[key] = _bridge.register_op(
             "pallas::k3_dspark_mla_draft_single",
             self.mesh,
             body,
@@ -505,7 +539,9 @@ class MlaDsparkDraft:
         )
         out_specs = (P(),) * R + (P(AXIS),) * layers + (P(), P())
         part = "" if whole else f"_part{index[0]}of{verified}"
-        self._ops[key] = register_op(
+        if _bridge is None:
+            raise RuntimeError(_NO_BRIDGE_MSG)
+        self._ops[key] = _bridge.register_op(
             f"pallas::k3_dspark_mla_draft_r{R}x{k}{part}",
             self.mesh,
             body,
@@ -587,12 +623,16 @@ class MlaDsparkDraft:
         """The row of each request in the parts' concatenated tokens."""
         key = ("rows", order)
         if key not in self._ops:
+            dev = self.pools[0].device if self.pools else torch.device("tpu")
             self._ops[key] = torch.tensor(
-                np.argsort(np.asarray(order)), dtype=torch.int64
-            ).to("tpu")
+                np.argsort(np.asarray(order)), dtype=torch.int64, device=dev
+            )
         return self._ops[key]
 
     def compilation_calls(self, control: Any, spec_alone: bool, spec_shapes) -> list:
+        if _CompileCall is None:
+            msg = "MlaDsparkDraft compilation_calls requires torch_tpu"
+            raise RuntimeError(msg)
         c = self.config
         operands = self._operands()
         vector = torch.empty((1, 128), dtype=torch.int32)
@@ -616,7 +656,7 @@ class MlaDsparkDraft:
                 rows, 3 * rows + 1 + rows * control.pages, 1
             )
             calls.append(
-                CompileCall(
+                _CompileCall(
                     self._build_single(control),
                     (
                         *operands,
@@ -636,7 +676,7 @@ class MlaDsparkDraft:
             rows = requests * spec_rows
             for index in self.parts(requests, self.attention_dp, spec_rows):
                 calls.append(
-                    CompileCall(
+                    _CompileCall(
                         self._build_batched(control, index, requests, spec_rows),
                         (
                             *operands,
