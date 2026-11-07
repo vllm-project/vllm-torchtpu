@@ -1599,7 +1599,8 @@ class UniversalVllmExportableLLM(api.ExportableTextOnlyLLM):
         last_token_indices: Any,
         aux_hidden_states: Any,
     ) -> tuple[Sequence[Any], Any]:
-        """Drafts `K` tokens per request with the separate draft model.
+        """Drafts `K` tokens per request with the separate draft model (DSpark or
+        DFlash).
 
         Every row of the step writes its context keys and values, projected from
         its `aux_hidden_states`, to the draft's paged KV at its position, through
@@ -1615,8 +1616,7 @@ class UniversalVllmExportableLLM(api.ExportableTextOnlyLLM):
         draft: Any = self._require_draft_model()
         cfg = self._export_config
         k = int(cfg.speculative_config["num_speculative_tokens"])  # type: ignore[index]
-        from_anchor = draft_model.sample_from_anchor(draft)
-        block = draft_model.query_block_size(k, from_anchor)
+        block = draft_model.draft_block_size(draft, k)
         mask_token_id = int(draft.config.dflash_config["mask_token_id"])
         names = draft_model_names(self._model)
         call_weights = {d: weights[e] for d, e in names.items() if e in weights}
@@ -1670,8 +1670,8 @@ class UniversalVllmExportableLLM(api.ExportableTextOnlyLLM):
                 [context_metadata] * len(layers),
             )
             with self._draft_forward_context(layers, block_metadata, block_ids):
-                tokens = draft_model.dspark_forward_and_sample(
-                    draft, block_ids, block_positions, block, from_anchor
+                tokens = draft_model.draft_forward_and_sample(
+                    draft, block_ids, block_positions, block
                 )
         updated = [
             layer.kv_cache[0] if isinstance(layer.kv_cache, list) else layer.kv_cache
