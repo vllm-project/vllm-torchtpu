@@ -234,6 +234,13 @@ class ComputeMetadata:
     causal_offset: list[jax.Array]
     local_k_start: list[jax.Array] | None = None
     local_k_end: list[jax.Array] | None = None
+    # Non-causal only: the sequence's KV length minus this KV tile's start, i.e.
+    # how many of its KV tokens remain from this tile onward. It can exceed
+    # bkv_sz (the whole tile is valid); in the last tile it marks where real KV
+    # ends. The causal mask bounds keys by each query's position, which also
+    # stops at the sequence's end; this bound replaces it so non-causal queries
+    # never attend to the stale tail of a partial tile.
+    kv_len_in_tile: list[jax.Array] | None = None
 
 
 def _compute_valid_kv_mask(
@@ -316,6 +323,7 @@ def fetch_compute_metadata(
     schedule_ref: schedule.RpaSchedule,
     q_offsets_ref: jax.Ref,
     kv_cache_lens_ref: jax.Ref,
+    kv_new_lens_ref: jax.Ref,
     *,
     cfgs: configs.RpaConfigs,
 ) -> ComputeMetadata:
@@ -326,7 +334,9 @@ def fetch_compute_metadata(
         schedule_ref: Per-step sequence, query, and KV block indices.
         q_offsets_ref: Query offset per sequence.
         kv_cache_lens_ref: Cached KV length per sequence. Only read when the
-            attention scope needs `local_k_end`.
+            attention scope needs `local_k_end`, or for non-causal attention.
+        kv_new_lens_ref: Newly arrived KV length per sequence. Only read for
+            non-causal attention.
         cfgs: Kernel configs.
 
     Returns:
@@ -341,6 +351,7 @@ def fetch_compute_metadata(
     local_k_end_list = (
         [] if cfgs.serve.attention_scope == configs.AttentionScope.CACHE_ONLY else None
     )
+    kv_len_in_tile_list = None if cfgs.model.causal else []
 
     for b_idx in range(cfgs.batch_size):
         s_idx = schedule_ref.s_idx[step, b_idx]
@@ -360,11 +371,17 @@ def fetch_compute_metadata(
         if local_k_end_list is not None:
             kv_cache_len_val = jnp.where(is_valid, kv_cache_lens_ref[s_idx], 0)
             local_k_end_list.append(kv_cache_len_val - k_id)
+        if kv_len_in_tile_list is not None:
+            # Same total as `fetch_stitch_metadata`.
+            kv_cache_len_val = jnp.where(is_valid, kv_cache_lens_ref[s_idx], 0)
+            kv_new_len_val = jnp.where(is_valid, kv_new_lens_ref[s_idx], 0)
+            kv_len_in_tile_list.append(kv_cache_len_val + kv_new_len_val - k_id)
 
     return ComputeMetadata(
         causal_offset=causal_offset_list,
         local_k_start=local_k_start_list,
         local_k_end=local_k_end_list,
+        kv_len_in_tile=kv_len_in_tile_list,
     )
 
 
@@ -379,6 +396,12 @@ def generate_mask(
     b, k_heads, tq, s = shape
 
     kv_iota = lax.broadcasted_iota(jnp.int32, (k_heads, tq, s), 2)
+    if not cfgs.model.causal:
+        # Every query sees its sequence's whole KV range. Sliding window and
+        # attention scopes are rejected for non-causal in `validate_inputs`.
+        assert step_meta.kv_len_in_tile is not None
+        return [kv_iota < step_meta.kv_len_in_tile[b_idx] for b_idx in range(b)]
+
     q_iota = lax.broadcasted_iota(jnp.int32, (k_heads, tq, s), 1)
     q_iota //= cfgs.aligned_num_q_heads_per_kv_head
     q_kv_diff = q_iota - kv_iota
@@ -496,6 +519,7 @@ def rpa_body(
         schedule_ref,
         q_offsets_ref,
         kv_cache_lens_ref,
+        kv_new_lens_ref,
         cfgs=cfgs,
     )
 
@@ -802,6 +826,8 @@ def get_kernel_name(cfgs: configs.RpaConfigs) -> str:
     name += f"-b{cfgs.batch_size}-q{cfgs.bq_sz}-k{cfgs.bkv_sz}"
     if cfgs.model.sliding_window:
         name += f"-sw{cfgs.model.sliding_window}"
+    if not cfgs.model.causal:
+        name += "-nc"
     return name
 
 
