@@ -78,6 +78,7 @@ if TYPE_CHECKING:
     TPU_MOE_SINGLE_SORT: bool = True
     TPU_MOE_COUNTING_SORT: bool = True
     USE_MOE_TP_DECODE_KERNEL: bool = False
+    TPU_TP_PALLAS_ALL_REDUCE_MAX_BYTES: int = 0
     RAGGED_GATHER_REDUCE_VERSION: str = "v2"
     USE_PHASED_PROFILER: bool = False
     TPU_KERNEL_ITER_MODE: bool = False
@@ -729,6 +730,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # once the path is the default for these layers or is replaced by another
     # fused TP MoE path.
     "USE_MOE_TP_DECODE_KERNEL": env_bool("USE_MOE_TP_DECODE_KERNEL"),
+    # All-reduce the TP group's bf16 [tokens, hidden] activations with one
+    # Pallas call (reduce-scatter + all-gather, distributed/pallas_all_reduce.py)
+    # when the kernel's view of the tensor is at most this many bytes; XLA's
+    # all-reduce above it. Needs the EP group to span the TP group and the
+    # world. 0 (default) keeps XLA's all-reduce everywhere; capped at 4 MiB
+    # (VMEM). At 8 x 6144 bf16 on tpu7x TP8 the kernel takes 8.3 us against
+    # 14.6 us; 524288 covers decode buckets up to 42 rows of 6144, where the
+    # two still differ.
+    "TPU_TP_PALLAS_ALL_REDUCE_MAX_BYTES": env_int(
+        "TPU_TP_PALLAS_ALL_REDUCE_MAX_BYTES", 0
+    ),
     # SparseCore MoE gather-reduce (combine) kernel version used by
     # fused_moe_gmm. "v2" is the default; "v1" selects the legacy kernel and
     # "v3" selects the destination-major prototype.
