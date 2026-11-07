@@ -18,6 +18,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (  # noqa: E402
     UnquantizedEmbeddingMethod,
 )
 
+from vllm_torchtpu.kernels import lm_head_hbm as lh  # noqa: E402
 from vllm_torchtpu.layers.adapter import lm_head_hbm as adapter  # noqa: E402
 
 H, V = 256, 512
@@ -195,7 +196,7 @@ def _ulps(a, b):
 def test_method_vs_flinear_on_tpu(compiled):
     torch.manual_seed(0)
     head = _TpuHead()
-    rows = (1, 4, 8, 12, 16, 64, 65, 128)
+    rows = (1, 4, 8, 12, 16, lh.MAX_M, lh.MAX_M + 1, 128)
     xs = {t: torch.randn(t, KH).to(torch.bfloat16).to("tpu") for t in rows}
     torch._dynamo.reset()
     run = torch.compile(head, fullgraph=True, dynamic=False) if compiled else head
@@ -214,7 +215,7 @@ def test_method_vs_flinear_on_tpu(compiled):
             f"LMHEADPIN t={t} compiled={compiled} off={n}/{d.numel()} "
             f"max_ulp_floored={d_rel:.1f}"
         )
-        if t > 64:
+        if t > lh.MAX_M:
             assert n == 0  # XLA's dot inside the op: same bits as F.linear
         else:
             assert d_rel <= 8 and n <= max(1, t * KV // 1000)

@@ -1623,6 +1623,70 @@ def test_decode_pack_is_bitwise(T_list, S_list, cp_size, cp_rank, bkv_p):
 
 
 # fmt: off
+@pytest.mark.parametrize("decode_ring", [2, 6, 8])
+@pytest.mark.parametrize(
+    "T_list,S_list,cp_size,cp_rank,bkv_p,chunk",
+    [
+        # Every visible key is in the top-k (k = 2048), so every score of the
+        # pass is compared; one-page blocks give more steps than ring slots.
+        pytest.param((4, 4, 4), (2000, 1537, 260), 1, 0, 1, None, id="all_keys_b3"),
+        pytest.param(
+            (4, 4, 4, 4, 4), (8 * 1900 + 3, 8 * 1500 + 1, 8 * 300, 9, 8 * 2047),
+            8, 3, 1, None, id="all_keys_dcp8_rank3",
+        ),
+        # Long contexts at the served block sizes.
+        pytest.param((4, 4, 4), (9001, 2052, 260), 1, 0, 16, None, id="b3_bkvp16"),
+        pytest.param(
+            (4, 4), (8 * 9000 + 3, 8 * 2047 + 1), 8, 3, 32, None, id="dcp8_rank3_bkvp32"
+        ),
+        # q_len not a multiple of 4, and requests cut by chunks.
+        pytest.param((4, 21), (5003, 3021), 1, 0, 16, None, id="partial_q_blocks"),
+        pytest.param(
+            (4, 4, 20, 36), (9001, 2052, 5003, 3021), 1, 0, 8, 16, id="chunked"
+        ),
+    ],
+)
+# fmt: on
+def test_decode_ring_is_bitwise(T_list, S_list, cp_size, cp_rank, bkv_p, chunk,
+                                decode_ring):
+    """TPU_STREAMIDX_DECODE_RING (manual KV ring, resident q and weights) is exact.
+
+    Indices and scores bitwise against the packed page-major emit_pipeline
+    pass on the same inputs. The kernel name in the HLO is the positive
+    control: the ring kernel must be the one that ran, or the comparison is
+    vacuous.
+    """
+    B = len(T_list)
+    page_size, H_I, D = 256, 32, 128
+    pages_per_seq = 40
+    inputs = _chunk_inputs(
+        T_list, _fragmented_pages(B, pages_per_seq), page_size, H_I, D
+    )
+    kwargs = _chunk_call_kwargs(
+        inputs, T_list, S_list, 2048, 1, 4, bkv_p, _SAL, chunk, return_scores=True
+    )
+    kwargs["q"] = kwargs["q"].astype(jnp.float8_e4m3fn)
+    kwargs["distribution"] = jnp.array([0, 0, B], jnp.int32)
+    kwargs.update(skip_empty_decode=True, decode_pack=True)
+    if cp_size > 1:
+        kwargs.update(cp_size=cp_size, cp_rank=cp_rank, interleave_size=4)
+    tag = f"-pk-pm-rg{decode_ring}"
+    off_hlo = streamindex_topk.lower(**kwargs).as_text()
+    on_hlo = streamindex_topk.lower(**kwargs, decode_ring=decode_ring).as_text()
+    assert tag in on_hlo and "-rg" not in off_hlo, "ring kernel not built"
+
+    off_idx, off_scores = streamindex_topk(**kwargs)
+    on_idx, on_scores = streamindex_topk(**kwargs, decode_ring=decode_ring)
+    n_tok = sum(T_list)
+    assert (np.array(off_idx)[:n_tok] >= 0).any(), "vacuous: no index selected"
+    np.testing.assert_array_equal(
+        np.array(on_idx), np.array(off_idx), err_msg="decode_ring changed indices")
+    np.testing.assert_array_equal(
+        np.array(on_scores).view(np.int32), np.array(off_scores).view(np.int32),
+        err_msg="decode_ring changed scores")
+
+
+# fmt: off
 @pytest.mark.parametrize(
     "T_list,S_list,cp_size,cp_rank,bkv_p,chunk",
     [

@@ -181,9 +181,11 @@ def _runner(weight, speculative_config=None):
     runner.model = SimpleNamespace(compute_logits=lambda h: h @ weight.T)
     runner._greedy_head_owner = owner
     runner.speculative_config = speculative_config
-    # Set in __init__ from TPU_SAMPLER_FUSED_CHAIN; these batches are greedy,
-    # so the fused verify program never runs.
+    # Set in __init__ from TPU_SAMPLER_FUSED_CHAIN and
+    # TPU_SAMPLER_VERIFY_TRIM_ROWS; these batches are greedy, so the fused
+    # verify program never runs and no verify rows are trimmed.
     runner._sampler_fused_chain = False
+    runner._sampler_verify_trim_rows = ()
     return runner
 
 
