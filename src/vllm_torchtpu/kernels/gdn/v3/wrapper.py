@@ -436,6 +436,43 @@ def outer_kernel(
     _run()
 
 
+def _both_segments_kernel(
+    metadata_refs: tuple[memory_ref.MetadataRef, memory_ref.MetadataRef],
+    qkv_ref: jax.Array,
+    b_ref: jax.Array,
+    a_ref: jax.Array,
+    source_ref: jax.Array,
+    in_act_ref: jax.Array | None,
+    weights_ref: memory_ref.WeightRefs,
+    out_ref: jax.Array,
+    source_out_ref: jax.Array,
+    *,
+    cfgs: tuple[config.GDNConfig, config.GDNConfig],
+):
+    """outer_kernel of the batched segment, then of the per-sequence one,
+    on the same activations, output and state source."""
+    for metadata_ref, cfg in zip(metadata_refs, cfgs, strict=True):
+
+        def segment(metadata_ref=metadata_ref, cfg=cfg, **scratch_refs):
+            outer_kernel(
+                metadata_ref,
+                qkv_ref,
+                b_ref,
+                a_ref,
+                source_ref,
+                None,
+                in_act_ref,
+                weights_ref,
+                out_ref,
+                source_out_ref,
+                None,
+                **scratch_refs,
+                cfg=cfg,
+            )
+
+        pl.run_scoped(segment, **cfg.get_scratch_shape_dict())
+
+
 def _state_region_tile_bytes(
     state_source: jax.Array, region: config.StateRegion, whole_block_dma: bool
 ) -> int:
@@ -505,6 +542,7 @@ def windowed_decode_tile_size(
         "attention_mode",
         "gate_lower_bound",
         "packed_tokens",
+        "single_launch",
     ),
 )
 def fused_conv1d_gdn(
@@ -542,6 +580,7 @@ def fused_conv1d_gdn(
     decode_tile_size: int = 4,
     mixed_tile_size: int = 64,
     packed_tokens: bool = False,
+    single_launch: bool = False,
 ) -> tuple[tuple[jax.Array, jax.Array], jax.Array] | tuple[jax.Array, jax.Array]:
     """Perform conv1d and gdn in a single fused kernel.
 
@@ -617,6 +656,9 @@ def fused_conv1d_gdn(
             dim / 128 + 2, 128] array (GDNConfig.packed_tokens) where the
             verify windows run window_tile, instead of one [tokens, 1, width]
             array each.
+        single_launch: With a state source, run the batched and the
+            per-sequence segments in one kernel instead of two, so a step
+            without prefill does not launch an empty per-sequence kernel.
 
     Returns:
         (new_conv_state, new_recurrent_state): Updated convolution state cache and
@@ -828,6 +870,73 @@ def fused_conv1d_gdn(
     hbm_spec = pl.BlockSpec(memory_space=pltpu.HBM)
     weights_spec = jax.tree.map(lambda _: vmem_spec, weights)
 
+    def make_metadata(cfg: config.GDNConfig) -> memory_ref.MetadataRef:
+        if cfg.mode != config.GDNMode.PER_SEQ:
+            return metadata.compute_batched_seq_metadata(
+                cfg=cfg,
+                seq_lens=seq_lens,
+                query_start_loc=query_start_loc,
+                state_indices=state_indices,
+                read_offsets=read_offsets,
+                end_seq=distribution[0],
+                ckpt_indices=ckpt_indices,
+            )
+        return metadata.compute_per_seq_metadata(
+            cfg=cfg,
+            seq_lens=seq_lens,
+            query_start_loc=query_start_loc,
+            state_indices=state_indices,
+            read_offsets=read_offsets,
+            start_seq=distribution[0],
+            end_seq=distribution[-1],
+            ckpt_indices=ckpt_indices,
+        )
+
+    def call_both(source: jax.Array) -> tuple[jax.Array, jax.Array]:
+        # Pooled batched and per-sequence segments in one kernel, one after
+        # the other, each with the scratch of its own configuration.
+        cfgs = (
+            make_cfg(config.GDNMode.BATCHED, packed),
+            make_cfg(config.GDNMode.PER_SEQ, packed),
+        )
+        metas = tuple(make_metadata(cfg) for cfg in cfgs)
+        in_act = cfgs[0].get_out_shape()
+        if zero_initialize_out:
+            in_act = jnp.zeros_like(in_act)
+        num_meta = sum(len(m) for m in metas)
+        aliases = {num_meta + 3: 1}
+        if zero_initialize_out:
+            aliases[num_meta + 4] = 0
+        return pl.pallas_call(
+            functools.partial(_both_segments_kernel, cfgs=cfgs),
+            out_shape=(in_act, source),
+            in_specs=(
+                jax.tree.map(lambda _: smem_spec, metas),
+                hbm_spec,
+                hbm_spec,
+                hbm_spec,
+                hbm_spec,
+                hbm_spec if zero_initialize_out else None,
+                weights_spec,
+            ),
+            out_specs=(hbm_spec, hbm_spec),
+            input_output_aliases=aliases,
+            compiler_params=pltpu.CompilerParams(
+                disable_bounds_checks=True,
+                vmem_limit_bytes=max(cfg.get_vmem_limit_bytes() for cfg in cfgs),
+            ),
+            name=f"{cfgs[0].get_kernel_name()}_and_per_seq",
+            metadata=cfgs[0].get_metadata(),
+        )(
+            metas,
+            qkv,
+            b,
+            a,
+            source,
+            in_act if zero_initialize_out else None,
+            weights,
+        )
+
     def call_kernel(
         in_conv_state: jax.Array,
         in_recurrent_state: jax.Array | None,
@@ -840,27 +949,7 @@ def fused_conv1d_gdn(
 
         # Step 6: Metadata preprocessing. Will be executed multiple times per-layer
         # but will be CSEed by compiler.
-        if mode != config.GDNMode.PER_SEQ:
-            metadata_obj = metadata.compute_batched_seq_metadata(
-                cfg=cfg,
-                seq_lens=seq_lens,
-                query_start_loc=query_start_loc,
-                state_indices=state_indices,
-                read_offsets=read_offsets,
-                end_seq=distribution[0],
-                ckpt_indices=ckpt_indices,
-            )
-        else:
-            metadata_obj = metadata.compute_per_seq_metadata(
-                cfg=cfg,
-                seq_lens=seq_lens,
-                query_start_loc=query_start_loc,
-                state_indices=state_indices,
-                read_offsets=read_offsets,
-                start_seq=distribution[0],
-                end_seq=distribution[-1],
-                ckpt_indices=ckpt_indices,
-            )
+        metadata_obj = make_metadata(cfg)
 
         metadata_spec = jax.tree.map(lambda _: smem_spec, metadata_obj)
 
@@ -916,6 +1005,11 @@ def fused_conv1d_gdn(
 
     if batched_only and prefill_only:
         raise ValueError("batched_only and prefill_only are mutually exclusive")
+
+    if pooled and single_launch and not (prefill_only or batched_only):
+        out_act, out_source = call_both(state_source)
+        out_act = out_act.reshape(padded_batch_size, -1)[:batch_size]
+        return out_source, out_act
 
     if pooled:
         out_act, out_source = None, state_source

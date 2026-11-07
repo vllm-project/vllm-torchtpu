@@ -925,6 +925,7 @@ def run_jax_gdn_attention_pooled_local(
         state_plan=plan,
         num_spec_tokens=num_spec_tokens,
         packed_tokens=tpu_envs.TPU_GDN_PACKED_TOKENS,
+        single_launch=tpu_envs.TPU_GDN_SINGLE_LAUNCH,
     )
     return recurrent_state, output
 

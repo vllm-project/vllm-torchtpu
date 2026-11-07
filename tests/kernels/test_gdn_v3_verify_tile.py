@@ -362,3 +362,19 @@ def test_packed_tokens_match_per_token_tiles(schedule):
         pool, out = _pooled_call(pool, dict(step, packed_tokens=True), weights)
         ref_pool, ref_out = _pooled_call(ref_pool, step, weights)
         _assert_same((out, pool), (ref_out, ref_pool), f"{schedule} step {i}")
+
+
+@pytest.mark.parametrize("packed", [False, True])
+@pytest.mark.parametrize("schedule", sorted(WINDOW_SCHEDULES))
+def test_single_launch_matches_two_launches(schedule, packed):
+    # One kernel running both segments keeps every bit of the two calls.
+    num_spec, steps = WINDOW_SCHEDULES[schedule]
+    seqs = len(steps[0]["lens"])
+    weights = _weights(9)
+    pool = _pool(10, 1 + seqs * (num_spec + 1) + 1)
+    ref_pool = jnp.array(pool, copy=True)
+    for i, spec in enumerate(steps):
+        step = dict(_step(50 + i, num_spec, **spec), packed_tokens=packed)
+        pool, out = _pooled_call(pool, dict(step, single_launch=True), weights)
+        ref_pool, ref_out = _pooled_call(ref_pool, step, weights)
+        _assert_same((out, pool), (ref_out, ref_pool), f"{schedule} step {i}")
