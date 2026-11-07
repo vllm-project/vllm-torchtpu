@@ -93,6 +93,8 @@ class _Draft(nn.Module):
     def __init__(self) -> None:
         super().__init__()
         self.writes: list[tuple[Any, ...]] = []
+        # A dense DSpark checkpoint's config: no `sample_from_anchor`.
+        self.config = SimpleNamespace(to_dict=dict)
         self.model = _Backbone(self.writes)
         self.head = nn.Linear(_H, _V, bias=False)
         self.markov_w1 = nn.Embedding(_V, _R)
@@ -113,6 +115,19 @@ class _Draft(nn.Module):
 
     def map_draft_to_target(self, ids):
         return ids
+
+
+class _DFlashDraft(_Draft):
+    """A DFlash-shaped draft: target-vocab logits, no Markov head."""
+
+    markov_embed = None  # type: ignore[assignment]
+
+    def __init__(self) -> None:
+        super().__init__()
+        del self.markov_w1, self.markov_w2
+
+    def compute_logits(self, hidden):
+        return self.head(hidden)
 
 
 @pytest.fixture
@@ -238,3 +253,40 @@ def test_draft_attention_kernel_matches_the_tpu_runner(draft_tp: int) -> None:
     if draft_tp == 1:
         assert "use_causal_mask" in inspect.signature(actual._kernel_entry).parameters
         assert actual._kernel_entry.__name__ == "_pallas_rpa_kernel_local"
+
+
+def test_dflash_forward_and_sample_matches_the_tpu_runner() -> None:
+    torch.manual_seed(0)
+    draft = _DFlashDraft()
+    block = draft_model.draft_block_size(draft, 3)
+    assert block == 4  # the anchor, then K mask slots
+    ids, positions, _ = draft_model.layout_draft_block(
+        torch.tensor([5, 9], dtype=torch.int32),
+        torch.tensor([[3], [7]], dtype=torch.int32),
+        block,
+        2 * block,
+        mask_token_id=39,
+        max_model_len=64,
+    )
+    runner_fn = inspect.unwrap(DFlashProposer._dflash_forward_and_sample)
+    expected, _ = runner_fn(SimpleNamespace(draft_model=draft), ids, positions, block)
+    actual = draft_model.draft_forward_and_sample(draft, ids, positions, block)
+    assert actual.shape == (2, 3)
+    torch.testing.assert_close(actual, expected)
+
+
+def test_a_dspark_draft_samples_with_its_markov_head(draft: _Draft) -> None:
+    block = draft_model.draft_block_size(draft, 3)
+    assert block == 3  # a dense DSpark block starts at its anchor
+    ids, positions, _ = draft_model.layout_draft_block(
+        torch.tensor([5, 9], dtype=torch.int32),
+        torch.tensor([[3], [7]], dtype=torch.int32),
+        block,
+        2 * block,
+        mask_token_id=39,
+        max_model_len=64,
+    )
+    torch.testing.assert_close(
+        draft_model.draft_forward_and_sample(draft, ids, positions, block),
+        draft_model.dspark_forward_and_sample(draft, ids, positions, block, True),
+    )
