@@ -570,6 +570,7 @@ class TPUWorker(WorkerBase):
                 self.cache_config.num_gpu_blocks_override,
             )
         else:
+            set_torch_threads_for_runtime()
             self.model_runner.profile_run(self.model_runner.max_num_tokens)
 
         # VLLM directive of the percentage of HBM memory the model executor can use
@@ -849,14 +850,12 @@ class TPUWorker(WorkerBase):
 
     def compile_or_warm_up_model(self) -> CompilationTimes:
         start = time.perf_counter()
-        if getattr(self, "speculative_config", None) is not None:
-            # Record the warm-up traces under the serving thread count. Other
-            # models keep upstream's warm-up at the startup count.
-            set_torch_threads_for_runtime()
+        # Record the warm-up traces under the serving thread count so Dynamo's
+        # GLOBAL_STATE guard matches at runtime.
+        set_torch_threads_for_runtime()
         self.model_runner.capture_model()
         compilation_time = time.perf_counter() - start
         self.compilation_config.compilation_time = compilation_time
-        set_torch_threads_for_runtime()
         # torch records every compile artifact for save_cache_artifacts(), which
         # vLLM never calls; drop the record so its memory can be freed.
         CacheArtifactManager.clear()
@@ -928,6 +927,9 @@ class TPUWorker(WorkerBase):
     def initialize_from_config(self, kv_cache_config: KVCacheConfig) -> None:
         self.cache_config.num_gpu_blocks = kv_cache_config.num_blocks
         ensure_kv_transfer_initialized(self.vllm_config, kv_cache_config)
+        # initialize_kv_cache precompiles helper graphs (e.g. placeholder token
+        # substitution); record their traces under the serving thread count.
+        set_torch_threads_for_runtime()
         self.model_runner.initialize_kv_cache(kv_cache_config)
 
     def get_node_kv_ip_port(self) -> tuple[int, str, int]:

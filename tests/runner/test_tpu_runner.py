@@ -3939,3 +3939,13 @@ def test_truncate_rope_caches_keeps_speculative_slack(monkeypatch):
         draft_model["draft_rope"].cos_sin_cache[draft_positions],
         untruncated[draft_positions],
     )
+
+
+def test_precompile_timed_runs_under_no_grad():
+    """_precompile_timed must run under torch.no_grad() so Dynamo GLOBAL_STATE
+    (grad_mode) guards recorded during capture_model() match serving."""
+    runner = SimpleNamespace(_update_num_xla_graphs=lambda _name: None)
+    with torch.enable_grad():
+        assert torch.is_grad_enabled()
+        with TPUModelRunner._precompile_timed(runner, "test_pass"):
+            assert not torch.is_grad_enabled()
