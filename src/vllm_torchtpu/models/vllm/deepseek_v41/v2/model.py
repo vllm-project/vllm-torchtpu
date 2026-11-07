@@ -193,7 +193,12 @@ class _StageBase(torch.nn.Module):
 
 
 @support_torch_compile(
-    dynamic_arg_dims={"input_ids": 0, "positions": 0, "inputs_embeds": 0}
+    dynamic_arg_dims={
+        "input_ids": 0,
+        "positions": 0,
+        "inputs_embeds": 0,
+        "engram_hashes": 0,
+    }
 )
 class DeepseekV41FullStage(_StageBase):
     def forward(
@@ -203,6 +208,7 @@ class DeepseekV41FullStage(_StageBase):
         intermediate_tensors=None,
         inputs_embeds=None,
         lookback_token_ids=None,
+        engram_hashes=None,
     ):
         return self.owner._forward_stage(
             input_ids,
@@ -211,11 +217,17 @@ class DeepseekV41FullStage(_StageBase):
             inputs_embeds,
             lookback_token_ids,
             stage="full",
+            engram_hashes=engram_hashes,
         )
 
 
 @support_torch_compile(
-    dynamic_arg_dims={"input_ids": 0, "positions": 0, "inputs_embeds": 0}
+    dynamic_arg_dims={
+        "input_ids": 0,
+        "positions": 0,
+        "inputs_embeds": 0,
+        "engram_hashes": 0,
+    }
 )
 class DeepseekV41EncoderStage(_StageBase):
     def forward(
@@ -225,6 +237,7 @@ class DeepseekV41EncoderStage(_StageBase):
         intermediate_tensors=None,
         inputs_embeds=None,
         lookback_token_ids=None,
+        engram_hashes=None,
     ):
         return self.owner._forward_stage(
             input_ids,
@@ -233,11 +246,17 @@ class DeepseekV41EncoderStage(_StageBase):
             inputs_embeds,
             lookback_token_ids,
             stage="encoder",
+            engram_hashes=engram_hashes,
         )
 
 
 @support_torch_compile(
-    dynamic_arg_dims={"input_ids": 0, "positions": 0, "inputs_embeds": 0}
+    dynamic_arg_dims={
+        "input_ids": 0,
+        "positions": 0,
+        "inputs_embeds": 0,
+        "engram_hashes": 0,
+    }
 )
 class DeepseekV41EncoderHeadStage(_StageBase):
     """Encoder layers before the split Engram layer (see ``_engram_split_layer``)."""
@@ -249,6 +268,7 @@ class DeepseekV41EncoderHeadStage(_StageBase):
         intermediate_tensors=None,
         inputs_embeds=None,
         lookback_token_ids=None,
+        engram_hashes=None,
     ):
         return self.owner._forward_stage(
             input_ids,
@@ -257,6 +277,7 @@ class DeepseekV41EncoderHeadStage(_StageBase):
             inputs_embeds,
             lookback_token_ids,
             stage="encoder_head",
+            engram_hashes=engram_hashes,
         )
 
 
@@ -352,6 +373,20 @@ class DeepseekV41DecoderStage(_StageBase):
         )
 
 
+def _stages_engram_on_host(layer) -> bool:
+    """Whether ``layer``'s Engram rows are prepared on the host each step.
+
+    HBM-lookup layers (``TPU_DEEPSEEK_V41_ENGRAM_HBM``) keep the host table
+    only as the source of their HBM copy; their per-step lookup is one device
+    op with nothing for an encoder split to overlap.
+    """
+    engram = getattr(layer, "engram", None)
+    return bool(
+        getattr(getattr(engram, "embed_tokens", None), "host_offload", False)
+        and not getattr(engram, "uses_hbm_lookup", False)
+    )
+
+
 class _StepHashes:
     """A step's Engram hashes: device hashes for HBM layers, the host path's
     downloaded and gathered ones for the rest. With `eager` (no HBM layer) the
@@ -384,6 +419,8 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
     _current_host_inputs: HostEngramInputs | None = None
     _prefetched_uploads: dict[int, "PreparedEngramUpload"] | None = None
     _hbm_engram_cached: bool | None = None
+    # Device hashes handed to the stage that runs the HBM Engram layer.
+    _stage_engram_hashes: torch.Tensor | None = None
 
     @cached_property
     def _window_starts_upload(self) -> dict:
@@ -409,6 +446,21 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
         if self._hbm_engram_cached is None:
             self._hbm_engram_cached = bool(self._hbm_engrams())
         return self._hbm_engram_cached
+
+    def _hbm_stage_hashes(
+        self, hashes: torch.Tensor | None, input_ids: torch.Tensor | None
+    ) -> torch.Tensor | None:
+        """Device hashes for the stage's in-graph HBM lookup, or None.
+
+        Only HBM layers need them; host hashes (host-hashed prompts) are
+        uploaded once here, as the out-of-graph lookup used to do. Under
+        DP+EP lockstep the token dim is the DP-wide bucket on every rank.
+        """
+        if hashes is None or not self._uses_hbm_engram():
+            return None
+        if input_ids is not None and hashes.device != input_ids.device:
+            hashes = hashes.to(input_ids.device)
+        return hashes.to(torch.int32)
 
     def _has_cpu_offloaded_engram(self) -> bool:
         for layer in islice(self.layers, self.start_layer, self.end_layer):
@@ -810,13 +862,16 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
                 and input_ids.device.type == "cpu"
                 else input_ids
             )
-            self._prepare_engram(
+            prepared_hashes, _ = self._prepare_engram(
                 input_ids_prep,
                 positions,
                 lookback_token_ids,
                 stage="encoder" if self._ced_enabled else "full",
             )
             self._engram_prepared_outside_stage = True
+            self._stage_engram_hashes = self._hbm_stage_hashes(
+                prepared_hashes, input_ids
+            )
         try:
             if not self._ced_enabled and not getattr(self, "_prefix_replay", False):
                 return self.full_stage(
@@ -825,6 +880,7 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
                     intermediate_tensors,
                     inputs_embeds,
                     lookback_token_ids,
+                    engram_hashes=self._stage_engram_hashes,
                 )
             if not self._ced_enabled:
                 # Full forward uses the same bounded-replay window upload.
@@ -836,6 +892,7 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
                         intermediate_tensors,
                         inputs_embeds,
                         lookback_token_ids,
+                        engram_hashes=self._stage_engram_hashes,
                     )
             # CED/replay locals are initialized before Engram preparation.
             # pyrefly: ignore[unbound-name]
@@ -847,6 +904,7 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
                         intermediate_tensors,
                         inputs_embeds,
                         lookback_token_ids,
+                        engram_hashes=self._stage_engram_hashes,
                     )
                 else:
                     encoded = self._forward_split_encoder(
@@ -861,6 +919,7 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
             self._engram_prepared_outside_stage = False
             self._gathered_engram_hashes = None
             self._pending_engram_hashes = None
+            self._stage_engram_hashes = None
         # Match the runner's convention for compiled backends that wrap the
         # model result in a single-element output list.
         if isinstance(encoded, (list, tuple)) and len(encoded) == 1:
@@ -1031,8 +1090,12 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
         inputs_embeds,
         lookback_token_ids,
     ):
-        """Enqueue each encoder segment before staging the next Engram layer."""
-        first_split = cast(int, self._engram_first_split_layer)
+        """Enqueue each encoder segment before staging the next Engram layer.
+
+        Without an early split (no host-staged Engram before the tail split,
+        e.g. layer 1 served from HBM) the head runs straight to the tail split.
+        """
+        first_split = self._engram_first_split_layer
         split = cast(int, self._engram_split_layer)
         carry = self.encoder_head_stage(
             input_ids,
@@ -1040,18 +1103,22 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
             intermediate_tensors,
             inputs_embeds,
             lookback_token_ids,
+            engram_hashes=self._stage_engram_hashes,
         )
         synchronize_tensors(carry, wait=False)
-        self._record_engram_consumers(self.start_layer, first_split, carry)
+        self._record_engram_consumers(
+            self.start_layer, split if first_split is None else first_split, carry
+        )
         if self._pending_engram_hashes is not None:
             self._gathered_engram_hashes = self._gather_engram_hashes(
                 self._pending_engram_hashes
             )
             self._pending_engram_hashes = None
-        self._stage_engram_layers(first_split, split, self._gathered_engram_hashes)
-        carry = self.encoder_middle_stage(input_ids, positions, *carry)
-        synchronize_tensors(carry, wait=False)
-        self._record_engram_consumers(first_split, split, carry)
+        if first_split is not None:
+            self._stage_engram_layers(first_split, split, self._gathered_engram_hashes)
+            carry = self.encoder_middle_stage(input_ids, positions, *carry)
+            synchronize_tensors(carry, wait=False)
+            self._record_engram_consumers(first_split, split, carry)
         hidden, residual, post_mix, res_mix, pre_mix = carry
         self._stage_engram_layers(
             split, self._ced_boundary, self._gathered_engram_hashes
@@ -1073,8 +1140,7 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
         if self._engram_split_layer is None:
             return None
         for i in range(self.start_layer, self._engram_split_layer):
-            engram = self.layers[i].engram
-            if engram is not None and engram.embed_tokens.host_offload:
+            if _stages_engram_on_host(self.layers[i]):
                 return i if i > self.start_layer else None
         return None
 
@@ -1093,11 +1159,7 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
         layers = [
             i
             for i in range(self.start_layer + 1, self._ced_boundary)
-            if getattr(
-                getattr(getattr(self.layers[i], "engram", None), "embed_tokens", None),
-                "host_offload",
-                False,
-            )
+            if _stages_engram_on_host(self.layers[i])
         ]
         return layers[-1] if layers else None
 
@@ -1119,6 +1181,7 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
         encoder_pre_mix: torch.Tensor | None = None,
         encoder_carry: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
         stage: str = "full",
+        engram_hashes: torch.Tensor | None = None,
     ) -> torch.Tensor | upstream.IntermediateTensors | tuple[torch.Tensor, ...]:
         split = getattr(self, "_engram_split_layer", None)
         start_layer: int = self.start_layer
@@ -1156,6 +1219,7 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
         skip_lookup = getattr(self, "_engram_prepared_outside_stage", False) or (
             torch.compiler.is_compiling() and self._has_cpu_offloaded_engram()
         )
+        stage_hashes = engram_hashes
         engram_hashes, engram_mask = self._prepare_engram(
             input_ids,
             positions,
@@ -1163,6 +1227,11 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
             stage=stage,
             skip_lookup=skip_lookup,
         )
+        if stage_hashes is not None and engram_hashes is not None:
+            # TPU_DEEPSEEK_V41_ENGRAM_HBM: the real hashes, prepared outside
+            # the stage, feed the in-graph HBM lookup; host layers only read
+            # their token count.
+            engram_hashes = stage_hashes
 
         full_num_tokens = positions.shape[0]
         if stage_sp and carry_stage:
@@ -1418,16 +1487,24 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
             self._tp_size = vllm_config.parallel_config.tensor_parallel_size
             self._engram_split_layer = self._select_engram_split_layer()
             self._engram_first_split_layer = self._select_engram_first_split_layer()
-            if self._engram_first_split_layer is None:
-                self._engram_split_layer = None
-            if self._engram_split_layer is not None:
-                assert self._engram_first_split_layer is not None
+            split = self._engram_split_layer
+            first_split = self._engram_first_split_layer
+            if (
+                split is not None
+                and first_split is None
+                and _stages_engram_on_host(self.layers[self.start_layer])
+            ):
+                # The start layer stages host Engram rows, so no head can be
+                # enqueued ahead of that staging.
+                self._engram_split_layer = split = None
+            if split is not None:
                 assert (
                     self.start_layer
-                    < self._engram_first_split_layer
-                    < self._engram_split_layer
+                    < (first_split if first_split is not None else split)
+                    <= split
                     < self._ced_boundary
                 )
+            if split is not None and first_split is not None:
                 with set_model_tag("v41_encoder_middle"):
                     self.encoder_middle_stage = DeepseekV41EncoderMiddleStage(
                         owner=self,
@@ -1439,10 +1516,11 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
                 logger.info(
                     "Engram early split: head [%d, %d), middle [%d, %d)",
                     self.start_layer,
-                    self._engram_first_split_layer,
-                    self._engram_first_split_layer,
-                    self._engram_split_layer,
+                    first_split,
+                    first_split,
+                    split,
                 )
+            if split is not None:
                 with set_model_tag("v41_encoder_head"):
                     self.encoder_head_stage = DeepseekV41EncoderHeadStage(
                         owner=self,
