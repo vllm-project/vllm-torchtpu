@@ -784,6 +784,9 @@ class TPUWorker(WorkerBase):
             # models keep upstream's warm-up at the startup count.
             set_torch_threads_for_runtime()
         self.model_runner.capture_model()
+        # After the stock precompile too: the megakernel's once-per-bind hook.
+        if self.model_runner._megakernel is not None:
+            self.model_runner._megakernel.on_warmup_done(self.model_runner)
         compilation_time = time.perf_counter() - start
         self.compilation_config.compilation_time = compilation_time
         set_torch_threads_for_runtime()

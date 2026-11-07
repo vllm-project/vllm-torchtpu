@@ -12,8 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """The runner and worker call sites: the dummy-run suppression scope, the
-megakernel step inside `forward_model` and the weight-update guard in
-`sync_weights`."""
+megakernel step inside `forward_model`, the weight-update guard in
+`sync_weights` and the post-warmup hook in `compile_or_warm_up_model`."""
 
 from __future__ import annotations
 
@@ -222,3 +222,61 @@ def test_worker_sync_weights_runs_the_weight_update_guard() -> None:
     )
     first = ast.unparse(fn.body[0])
     assert first == "megakernel_runtime.guard_weight_update(self.model_runner)"
+
+
+def _worker_compile_or_warm_up_model() -> Any:
+    """`TPUWorker.compile_or_warm_up_model`; compiled from source with stand-ins
+    for the thread, cache and GC helpers it calls."""
+    import ast
+    import textwrap
+    import time
+    from pathlib import Path
+    from types import SimpleNamespace
+
+    import vllm_torchtpu
+
+    path = Path(vllm_torchtpu.__file__).parent / "worker" / "tpu_worker.py"
+    src = path.read_text(encoding="utf-8")
+    fn = next(
+        n
+        for n in ast.walk(ast.parse(src))
+        if isinstance(n, ast.FunctionDef) and n.name == "compile_or_warm_up_model"
+    )
+    fn_src = textwrap.dedent(ast.get_source_segment(src, fn) or "")
+    ns: dict[str, Any] = {
+        "time": time,
+        "CompilationTimes": lambda **kw: SimpleNamespace(**kw),
+        "CacheArtifactManager": SimpleNamespace(clear=lambda: None),
+        "set_torch_threads_for_runtime": lambda: None,
+        "freeze_gc_heap": lambda: None,
+        "maybe_attach_gc_debug_callback": lambda: None,
+        "_release_free_host_heap": lambda: None,
+    }
+    exec(compile(fn_src, str(path), "exec"), ns)
+    return ns["compile_or_warm_up_model"]
+
+
+@pytest.mark.parametrize("with_megakernel", [False, True])
+def test_worker_warmup_calls_on_warmup_done_after_capture_model(
+    with_megakernel: bool,
+) -> None:
+    """`TPUWorker.compile_or_warm_up_model` calls the megakernel's
+    `on_warmup_done(runner)` once, after `capture_model()`."""
+    from types import SimpleNamespace
+
+    events: list[Any] = []
+    runner = SimpleNamespace(capture_model=lambda: events.append("capture"))
+    runner._megakernel = (
+        SimpleNamespace(on_warmup_done=lambda r: events.append(("done", r)))
+        if with_megakernel
+        else None
+    )
+    worker = SimpleNamespace(
+        model_runner=runner,
+        compilation_config=SimpleNamespace(compilation_time=0.0),
+        speculative_config=None,
+    )
+
+    _worker_compile_or_warm_up_model()(worker)
+
+    assert events == (["capture", ("done", runner)] if with_megakernel else ["capture"])
