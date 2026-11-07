@@ -134,9 +134,19 @@ def test_ltx2_seed_determinism_tpu(omni_runner: OmniRunner) -> None:
     )
 
 
-# NOTE: To regenerate the golden or recalibrate LTX2_GOLDEN_LIMITS, use the
-# generator script and commands in the description of
-# https://github.com/vllm-project/vllm-torchtpu/pull/2464.
+# NOTE: How the golden was generated (outside pytest, on 4 chips).
+# 1. Omni model launch, with the tests_omni/conftest.py env defaults:
+#        omni = Omni(model=get_ltx2_model(), dtype="float32",
+#                    tensor_parallel_size=4)
+# 2. Request, the same as this test's:
+#        request = build_ltx2_request(num_inference_steps=LTX2_GOLDEN_STEPS,
+#                                     extra_args=LTX2_GOLDEN_EXTRA_ARGS)
+#        out = extract_ltx2_outputs(list(omni.generate(LTX2_PROMPT, request)))
+# 3. Output saving, with meta the dict that load_and_verify_ltx2_golden() checks:
+#        np.savez_compressed(path, video=out.video, audio=out.audio,
+#                            meta=json.dumps(meta))
+# LTX2_GOLDEN_LIMITS are calibrated on the same request with the default
+# (bf16, 1 chip) Omni.
 @pytest.mark.parametrize(
     "omni_runner",
     [get_ltx2_model()],
