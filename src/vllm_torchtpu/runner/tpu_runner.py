@@ -7738,7 +7738,6 @@ class TPUModelRunner(GPUModelRunner):
         positions,
         inputs_embeds=None,
         intermediate_tensors=None,
-        model_kwargs=None,
         megakernel_token_ids=None,
     ):
         hit, out = False, None
@@ -7752,7 +7751,6 @@ class TPUModelRunner(GPUModelRunner):
                     positions=positions,
                     inputs_embeds=inputs_embeds,
                     intermediate_tensors=intermediate_tensors,
-                    model_kwargs=model_kwargs,
                     token_ids=megakernel_token_ids,
                 ),
             )
@@ -7760,7 +7758,7 @@ class TPUModelRunner(GPUModelRunner):
         if not hit:
             # @support_torch_compile annotations will be put on the vLLM model
             # if it supports torch.compile
-            kwargs = dict(model_kwargs) if model_kwargs else {}
+            kwargs = {}
             if intermediate_tensors is not None:
                 kwargs["intermediate_tensors"] = intermediate_tensors
             out = self.model(

@@ -163,12 +163,17 @@ def test_runner_normalizes_megakernel_output_like_stock(raw_idx: int) -> None:
     assert mk[1] is stock[1]
 
 
-def test_runner_declined_step_passes_model_kwargs_to_stock() -> None:
+def test_runner_declined_step_runs_the_stock_forward_unchanged() -> None:
+    """A declined step calls the stock model exactly as without a megakernel:
+    the runner passes no extra model kwargs (`StepContext.model_kwargs` stays
+    `None`), only the intermediate tensors."""
+    import inspect
     from types import SimpleNamespace
 
     import torch
 
     forward_model = _runner_forward_model()
+    assert "model_kwargs" not in inspect.signature(forward_model).parameters
     stock_calls: list[dict[str, Any]] = []
     h = torch.zeros(2, 2)
 
@@ -188,20 +193,12 @@ def test_runner_declined_step_passes_model_kwargs_to_stock() -> None:
     ids = torch.zeros((2,), dtype=torch.int32)
     pos = torch.zeros((2,), dtype=torch.int32)
     it = object()
-    out = forward_model(
-        runner, ids, pos, intermediate_tensors=it, model_kwargs={"extra": 1}
-    )
+    out = forward_model(runner, ids, pos, intermediate_tensors=it)
     assert out[0] is h and out[1] is None
-    assert drv.ctx.model_kwargs == {"extra": 1}
+    assert drv.ctx.model_kwargs is None
     assert drv.ctx.intermediate_tensors is it
     assert stock_calls == [
-        dict(
-            input_ids=ids,
-            positions=pos,
-            inputs_embeds=None,
-            extra=1,
-            intermediate_tensors=it,
-        )
+        dict(input_ids=ids, positions=pos, inputs_embeds=None, intermediate_tensors=it)
     ]
 
 
