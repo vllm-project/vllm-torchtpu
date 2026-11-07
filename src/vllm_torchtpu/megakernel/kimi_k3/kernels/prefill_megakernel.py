@@ -53,6 +53,7 @@ from __future__ import annotations
 
 import dataclasses
 import functools
+import math
 from abc import ABC, abstractmethod
 from collections import namedtuple
 from collections.abc import Callable
@@ -3553,6 +3554,10 @@ def mixture_norm_tiled_body(
 ):
     """Run residual mixture plus RMSNorm with caller-owned refs and scratch."""
     tokens, hidden = prefix_ref.shape
+    if tokens <= 0 or tile <= 0 or tokens % tile:
+        raise ValueError(
+            f"tokens ({tokens}) must be a positive multiple of tile ({tile})"
+        )
     n_tiles = tokens // tile
     active_count = active_ref[0] if getattr(active_ref, "shape", ()) != () else active_ref
 
@@ -3719,13 +3724,18 @@ def make_mixture_norm_tiled(*, seq_len, tile=256, eps=1e-5, interpret=False):
     return run
 
 
+def _mixture_tile(rows: int) -> int:
+    """Largest tile <= 128 dividing ``rows`` (64 for 6K/10K/14K, 128 for 4K/8K/12K/16K)."""
+    return math.gcd(128, rows)
+
+
 def make_mixture_norm_sp(mesh, *, seq_len, eps=1e-5):
     """Apply the tiled mixture/RMSNorm to each rank's T/32 local rows."""
     if mesh.size != 32 or len(mesh.axis_names) != 1 or seq_len % 32:
         raise ValueError("mixture SP requires a flat TP32 mesh and T divisible by 32")
     axis_name = mesh.axis_names[0]
     local_tokens = seq_len // 32
-    tile = min(128, local_tokens)
+    tile = _mixture_tile(local_tokens)
     if local_tokens % tile:
         raise ValueError("local token count must be divisible by the mixture tile")
     op = make_mixture_norm_tiled(seq_len=local_tokens, tile=tile, eps=eps)
@@ -3974,103 +3984,124 @@ def kda_prefill_tiled_body(
         def prefetch_next_tile():
             load_tile(t + 1, 1 - buf).start()
 
-        # The weights are read here: a value live across the loop would be a
-        # VMEM copy (22.75 MiB for the projection).
-        conv_filter = conv_w_vmem[...].astype(jnp.float32)
-        a_log = jnp.exp(alog_vmem[...])  # [3, 1] FP32
-        dt_bias = dt_vmem[...]  # [3, 128] FP32
-        norm = norm_vmem[0]
-        hidden_tile = hidden_bufs.at[buf][...]  # [tile, hidden]
-        # ---- projections ----
-        gate_features = _dot(hidden_tile, gate_w_vmem[...]).astype(jnp.bfloat16)  # [tile, 128]
-        raw_gate = _dot(gate_features, fb_w_vmem[...]).astype(jnp.bfloat16).reshape(
-            tile, head_count, channels
-        )  # [tile, 3, 128]
-        projected = _dot(hidden_tile, proj_w_vmem[...]).astype(
-            jnp.bfloat16
-        )  # [tile, 1664]
-        qkv = projected[:, : 3 * width].reshape(tile, 3, head_count, channels)
-        out_gate_sig = jax.nn.sigmoid(
-            projected[:, 3 * width : 4 * width].astype(jnp.float32)
-        ).astype(jnp.bfloat16)
-        update_rate = projected[:, 4 * width : 4 * width + head_count]  # [tile, 3]
-        real_rows = jnp.arange(tile, dtype=jnp.int32) + t * tile < row_end
-        raw_gate = _row_where(real_rows, raw_gate, -1e30)
-        update_rate = _row_where(real_rows, update_rate, -1e30)
-
-        # ---- 4-tap causal conv (carrying the 3-token history) ----
-        window = jnp.concatenate((conv_hist_vmem[...], qkv), axis=0)  # [tile+3, 3,3,128]
-        convolved = jnp.zeros((tile, 3, head_count, channels), jnp.float32)
-        for tap in range(4):
-            convolved = (
-                convolved
-                + window[tap : tap + tile].astype(jnp.float32) * conv_filter[tap]
-            )
-        filtered = jax.nn.silu(convolved).astype(jnp.bfloat16)
-        filtered = _row_where(real_rows, filtered)
-        query, key = kda_normalize_query_key(
-            filtered[:, 0].astype(jnp.float32),
-            filtered[:, 1].astype(jnp.float32),
-            channels,
-        )
-        value = filtered[:, 2].astype(jnp.float32)
-        decay = kda_decay(decay_lower_bound, a_log[None], raw_gate, dt_bias[None])  # [tile, 3, 128] FP32
-        beta = jax.nn.sigmoid(update_rate.astype(jnp.float32))  # [tile, 3] FP32
-
-        # ---- chunked delta rule over this tile's 64-token chunks ----
-        outputs = []
-        for c in range(tile // _KDA_CHUNK):
-            s0, s1 = c * _KDA_CHUNK, (c + 1) * _KDA_CHUNK
-            chunk_out, new_state = kda_chunk(
-                query[s0:s1].transpose(1, 0, 2),
-                key[s0:s1].transpose(1, 0, 2),
-                value[s0:s1].transpose(1, 0, 2),
-                decay[s0:s1].transpose(1, 0, 2),
-                beta[s0:s1].transpose(1, 0),
-                rec_state_vmem[...],
-            )
-            rec_state_vmem[...] = new_state
-            chunk_att = chunk_out.astype(jnp.bfloat16).astype(jnp.float32)
-            chunk_att *= jax.lax.rsqrt(
-                jnp.mean(chunk_att * chunk_att, axis=-1, keepdims=True) + epsilon
-            )
-            chunk_att = (
-                (chunk_att * norm)
-                .astype(jnp.bfloat16)
-                .transpose(1, 0, 2)
-                .reshape(_KDA_CHUNK, width)
-                * out_gate_sig[s0:s1]
-            )
-            outputs.append(chunk_att)
-
-        attended = jnp.concatenate(outputs, axis=0)
-        if out_bufs is not None:
-            out_bufs.at[buf][...] = attended
-        if projection is not None:
-            columns = weight_vmem.shape[1] // 14
-            for c in range(14):  # in 512-column panels: fits in 64 FP32 VREGs
-                partial_bufs.at[buf, :, pl.ds(c * columns, columns)][...] = _dot(
-                    attended, weight_vmem[:, pl.ds(c * columns, columns)]
-                ).astype(jnp.bfloat16)
-
-        # Defer @pl.when conv-history carry until after the entire compute +
-        # projection chain so Mosaic keeps all tile intermediates in VREGs
-        # without flushing across @pl.when basic-block boundaries.
         real_count = jnp.clip(row_end - t * tile, 0, tile)
 
-        @pl.when(real_count == tile)
-        def carry_full_tile():
-            conv_hist_vmem[...] = window[tile : tile + 3]
-
-        @pl.when((real_count > 0) & (real_count < tile))
-        def carry_partial_tile():
-            rows = jnp.arange(tile + 3, dtype=jnp.int32)
-            picked = []
-            for i in range(3):
-                picked.append(
-                    jnp.sum(_row_where(rows == real_count + i, window), axis=0)
+        @pl.when(real_count == 0)
+        def zero_dead_tile():
+            if out_bufs is not None:
+                out_bufs.at[buf][...] = jnp.zeros(
+                    out_bufs.at[buf].shape, out_bufs.dtype
                 )
-            conv_hist_vmem[...] = jnp.stack(picked)
+            if projection is not None:
+                partial_bufs.at[buf][...] = jnp.zeros(
+                    partial_bufs.at[buf].shape, partial_bufs.dtype
+                )
+
+        @pl.when(real_count > 0)
+        def compute_active_tile():
+            # The weights are read here: a value live across the loop would be a
+            # VMEM copy (22.75 MiB for the projection).
+            conv_filter = conv_w_vmem[...].astype(jnp.float32)
+            a_log = jnp.exp(alog_vmem[...])  # [3, 1] FP32
+            dt_bias = dt_vmem[...]  # [3, 128] FP32
+            norm = norm_vmem[0]
+            hidden_tile = hidden_bufs.at[buf][...]  # [tile, hidden]
+            # ---- projections ----
+            gate_features = _dot(hidden_tile, gate_w_vmem[...]).astype(
+                jnp.bfloat16
+            )  # [tile, 128]
+            raw_gate = (
+                _dot(gate_features, fb_w_vmem[...])
+                .astype(jnp.bfloat16)
+                .reshape(tile, head_count, channels)
+            )  # [tile, 3, 128]
+            projected = _dot(hidden_tile, proj_w_vmem[...]).astype(
+                jnp.bfloat16
+            )  # [tile, 1664]
+            qkv = projected[:, : 3 * width].reshape(tile, 3, head_count, channels)
+            out_gate_sig = jax.nn.sigmoid(
+                projected[:, 3 * width : 4 * width].astype(jnp.float32)
+            ).astype(jnp.bfloat16)
+            update_rate = projected[:, 4 * width : 4 * width + head_count]  # [tile, 3]
+            real_rows = jnp.arange(tile, dtype=jnp.int32) + t * tile < row_end
+            raw_gate = _row_where(real_rows, raw_gate, -1e30)
+            update_rate = _row_where(real_rows, update_rate, -1e30)
+
+            # ---- 4-tap causal conv (carrying the 3-token history) ----
+            window = jnp.concatenate(
+                (conv_hist_vmem[...], qkv), axis=0
+            )  # [tile+3, 3,3,128]
+            convolved = jnp.zeros((tile, 3, head_count, channels), jnp.float32)
+            for tap in range(4):
+                convolved = (
+                    convolved
+                    + window[tap : tap + tile].astype(jnp.float32) * conv_filter[tap]
+                )
+            filtered = jax.nn.silu(convolved).astype(jnp.bfloat16)
+            filtered = _row_where(real_rows, filtered)
+            query, key = kda_normalize_query_key(
+                filtered[:, 0].astype(jnp.float32),
+                filtered[:, 1].astype(jnp.float32),
+                channels,
+            )
+            value = filtered[:, 2].astype(jnp.float32)
+            decay = kda_decay(
+                decay_lower_bound, a_log[None], raw_gate, dt_bias[None]
+            )  # [tile, 3, 128] FP32
+            beta = jax.nn.sigmoid(update_rate.astype(jnp.float32))  # [tile, 3] FP32
+
+            # ---- chunked delta rule over this tile's 64-token chunks ----
+            outputs = []
+            for c in range(tile // _KDA_CHUNK):
+                s0, s1 = c * _KDA_CHUNK, (c + 1) * _KDA_CHUNK
+                chunk_out, new_state = kda_chunk(
+                    query[s0:s1].transpose(1, 0, 2),
+                    key[s0:s1].transpose(1, 0, 2),
+                    value[s0:s1].transpose(1, 0, 2),
+                    decay[s0:s1].transpose(1, 0, 2),
+                    beta[s0:s1].transpose(1, 0),
+                    rec_state_vmem[...],
+                )
+                rec_state_vmem[...] = new_state
+                chunk_att = chunk_out.astype(jnp.bfloat16).astype(jnp.float32)
+                chunk_att *= jax.lax.rsqrt(
+                    jnp.mean(chunk_att * chunk_att, axis=-1, keepdims=True) + epsilon
+                )
+                chunk_att = (
+                    (chunk_att * norm)
+                    .astype(jnp.bfloat16)
+                    .transpose(1, 0, 2)
+                    .reshape(_KDA_CHUNK, width)
+                    * out_gate_sig[s0:s1]
+                )
+                outputs.append(chunk_att)
+
+            attended = jnp.concatenate(outputs, axis=0)
+            if out_bufs is not None:
+                out_bufs.at[buf][...] = attended
+            if projection is not None:
+                columns = weight_vmem.shape[1] // 14
+                for c in range(14):  # in 512-column panels: fits in 64 FP32 VREGs
+                    partial_bufs.at[buf, :, pl.ds(c * columns, columns)][...] = _dot(
+                        attended, weight_vmem[:, pl.ds(c * columns, columns)]
+                    ).astype(jnp.bfloat16)
+
+            # Defer @pl.when conv-history carry until after the entire compute +
+            # projection chain so Mosaic keeps all tile intermediates in VREGs
+            # without flushing across @pl.when basic-block boundaries.
+            @pl.when(real_count == tile)
+            def carry_full_tile():
+                conv_hist_vmem[...] = window[tile : tile + 3]
+
+            @pl.when(real_count < tile)
+            def carry_partial_tile():
+                rows = jnp.arange(tile + 3, dtype=jnp.int32)
+                picked = []
+                for i in range(3):
+                    picked.append(
+                        jnp.sum(_row_where(rows == real_count + i, window), axis=0)
+                    )
+                conv_hist_vmem[...] = jnp.stack(picked)
 
         if tile_segment is not None:
             segment, segment_end, current, offset, position = tile_segment
@@ -5049,12 +5080,14 @@ def _half_gather_step(tables_ref, local_ref, window_ref, send_sems, recv_sems, o
         owner = tables_ref[family, 2, tables_ref[family, 1, position % 32]]
         return pl.ds(block * 32 * stripe + owner * stripe, stripe)
 
+    async_own = local_ref.shape[0] % 16 == 0 and local_ref.shape[0] <= 512
+
     @pl.when(step == 0)
     def own_rows():
         copy = pltpu.make_async_copy(
             local_ref.at[local_rows], window_ref.at[window_rows(0, positions[0])], own_sem)
         copy.start()
-        if local_ref.shape[0] not in (16, 32, 64, 128, 256, 512):
+        if not async_own:
             copy.wait()
 
     for stream, (family, direction, col, width) in enumerate(_half_ring_streams(local_ref.shape[1])):
@@ -5087,7 +5120,7 @@ def _half_gather_step(tables_ref, local_ref, window_ref, send_sems, recv_sems, o
     # The local destination is disjoint from every remote stripe. Let the
     # copy run while the half rings progress, then join before KDA consumes
     # this block and before own_sem is reused for the next block.
-    if local_ref.shape[0] in (16, 32, 64, 128, 256, 512):
+    if async_own:
         @pl.when(step == HALF_STEPS - 1)
         def finish_local():
             pltpu.make_async_copy(
@@ -6114,7 +6147,7 @@ def make_indexed_moe_sp_ring(mesh, *, seq_len=8192):
     if (
         cfg.prefill_fused_moe
         and cfg.prefill_expert_parallel in (8, 16)
-        and seq_len in (512, 1024, 2048, 4096, 8192, 16384)
+        and seq_len in (512, 1024, 2048, 4096, 6144, 8192, 10240, 12288, 14336, 16384)
     ):
         from .prefill_moe.fused import make_indexed_moe_sp_ring as make_packed_moe
         return make_packed_moe(mesh, seq_len=seq_len)
@@ -6129,7 +6162,7 @@ def make_indexed_mixture_moe_sp_ring(mesh, *, seq_len=8192):
     if (
         cfg.prefill_fused_moe
         and cfg.prefill_expert_parallel in (8, 16)
-        and seq_len in (512, 1024, 2048, 4096, 8192, 16384)
+        and seq_len in (512, 1024, 2048, 4096, 6144, 8192, 10240, 12288, 14336, 16384)
     ):
         from .prefill_moe.fused import (
             make_indexed_mixture_moe_sp_ring as make_packed_mix_moe,
@@ -6257,7 +6290,7 @@ def make_norm_gather_sp(mesh, *, seq_len, token_ranks=None,
     rows, width = seq_len // 32, 7168
     tile_rows = rows
     num_tiles = 1
-    mix_tile = min(128, rows)
+    mix_tile = _mixture_tile(rows)
     if token_ranks is None:
         token_ranks = tuple(range(32))
     tables = jnp.asarray(
@@ -6810,7 +6843,7 @@ def make_norm_latent_gather_sp(
     check_window(seq_len, "fused norm/latent/gather")
     rows, width = seq_len // 32, 7168
     pad_width = 768 if rows >= 64 else 1536
-    mix_tile = min(128, rows)
+    mix_tile = _mixture_tile(rows)
     if token_ranks is None:
         token_ranks = tuple(range(32))
     tables = jnp.asarray(

@@ -15,7 +15,23 @@ from vllm_torchtpu.megakernel.kimi_k3.kernels.prefill_moe.moe_down_valu import (
 pytestmark = pytest.mark.cpu_test
 
 
-@pytest.mark.parametrize("window", [512, 1024, 2048, 4096, 6144, 8192, 16384])
+_SUPPORTED_FUSED_WINDOWS = (
+    512,
+    1024,
+    2048,
+    4096,
+    6144,
+    8192,
+    10240,
+    12288,
+    14336,
+    16384,
+)
+
+
+@pytest.mark.parametrize(
+    "window", [512, 1024, 2048, 3072, 4096, 6144, 8192, 10240, 12288, 14336, 16384]
+)
 @pytest.mark.parametrize("ep", [8, 16, 32])
 @pytest.mark.parametrize("enabled", [False, True])
 def test_factory_preserves_unsupported_shapes(monkeypatch, window, ep, enabled):
@@ -36,12 +52,14 @@ def test_factory_preserves_unsupported_shapes(monkeypatch, window, ep, enabled):
     )
     result = kernels.make_indexed_moe_sp_ring(None, seq_len=window)
     expected = "reference"
-    if enabled and ep in (8, 16) and window in (512, 1024, 2048, 4096, 8192, 16384):
+    if enabled and ep in (8, 16) and window in _SUPPORTED_FUSED_WINDOWS:
         expected = "fused"
     assert result == (expected, window)
 
 
-@pytest.mark.parametrize("window", [512, 1024, 2048, 4096, 6144, 8192, 16384])
+@pytest.mark.parametrize(
+    "window", [512, 1024, 2048, 3072, 4096, 6144, 8192, 10240, 12288, 14336, 16384]
+)
 @pytest.mark.parametrize("ep", [8, 16, 32])
 @pytest.mark.parametrize("enabled", [False, True])
 def test_mixture_moe_factory_preserves_unsupported_shapes(
@@ -68,7 +86,7 @@ def test_mixture_moe_factory_preserves_unsupported_shapes(
         lambda mesh, *, seq_len: ("fused_mix", seq_len),
     )
     result = kernels.make_indexed_mixture_moe_sp_ring(None, seq_len=window)
-    if enabled and ep in (8, 16) and window in (512, 1024, 2048, 4096, 8192, 16384):
+    if enabled and ep in (8, 16) and window in _SUPPORTED_FUSED_WINDOWS:
         assert result == ("fused_mix", window)
     else:
         assert callable(result)
@@ -147,51 +165,148 @@ def test_fused_validity_matches_sequence_parallel_ownership(tokens):
             np.testing.assert_array_equal(actual, owned < live)
 
 
+class _ArrayRef:
+    """Lightweight Pallas-style ref view for CPU unit tests on larger windows."""
+
+    def __init__(self, array: np.ndarray, sl: tuple | None = None):
+        self._buf = array
+        self._sl = sl
+
+    @staticmethod
+    def _norm(idx) -> tuple:
+        if not isinstance(idx, tuple):
+            idx = (idx,)
+        return tuple(
+            slice(int(s.start), int(s.start) + int(s.size))
+            if hasattr(s, "start") and hasattr(s, "size") and not isinstance(s, slice)
+            else s
+            for s in idx
+        )
+
+    @property
+    def shape(self) -> tuple[int, ...]:
+        return self._buf[self._sl].shape if self._sl is not None else self._buf.shape
+
+    @property
+    def at(self):
+        parent = self
+
+        class _At:
+            def __getitem__(self, idx):
+                assert parent._sl is None
+                return _ArrayRef(parent._buf, parent._norm(idx))
+
+        return _At()
+
+    def __getitem__(self, idx):
+        view = self._buf[self._sl] if self._sl is not None else self._buf
+        if idx is Ellipsis:
+            return jnp.asarray(view)
+        return jnp.asarray(view[self._norm(idx)])
+
+    def __setitem__(self, idx, val):
+        arr = np.asarray(val)
+        if self._sl is not None:
+            assert idx is Ellipsis
+            self._buf[self._sl] = arr
+        elif idx is Ellipsis:
+            self._buf[...] = arr
+        else:
+            self._buf[self._norm(idx)] = arr
+
+
+@pytest.mark.parametrize("tokens", [512, 2048, 4096])
 @pytest.mark.parametrize("local_experts", [56, 112])
-def test_metadata_steps_ep16_and_ep8(local_experts):
+def test_metadata_steps_ep16_and_ep8(tokens, local_experts):
     import jax
     from jax.experimental import pallas as pl
 
-    tokens = 512
     rows = tokens // 32
-    rng = np.random.default_rng(1030 + local_experts)
-    ids_all = rng.integers(0, 896, size=(tokens, 16), dtype=np.int32)
-    probs_all = rng.uniform(0.01, 1.0, size=(tokens, 16)).astype(np.float32)
-    probs_all[-5:, :] = 0.0
-    wire_np = np.concatenate([ids_all, probs_all.view(np.int32)], axis=1).reshape(
-        rows * 8, 128
-    )
-    wire = jnp.asarray(wire_np)
+    rng = np.random.default_rng(1030 + local_experts + tokens)
+    ids_by_rank = rng.integers(0, 896, size=(32, rows, 16), dtype=np.int32)
+    probs_by_rank = rng.uniform(0.01, 1.0, size=(32, rows, 16)).astype(np.float32)
+    probs_by_rank[-1, -5:, :] = 0.0
+    ids_all = ids_by_rank.reshape(tokens, 16)
+    probs_all = probs_by_rank.reshape(tokens, 16)
+    payloads = []
+    for r in range(32):
+        ids_r, probs_r = ids_by_rank[r], probs_by_rank[r]
+        if rows < 128:
+            w = np.concatenate([ids_r, probs_r.view(np.int32)], axis=1)
+        else:
+            w = np.concatenate(
+                [
+                    ids_r.reshape(rows // 8, 128),
+                    probs_r.view(np.int32).reshape(rows // 8, 128),
+                ],
+                axis=0,
+            )
+        payloads.append(w.reshape(rows // 4, 128))
+    wire_np = np.concatenate(payloads, axis=0)
     expert_tp = 32 // (896 // local_experts)
     live_mask = probs_all != 0
     hist_896 = np.bincount(ids_all[live_mask], minlength=896)
-
-    def kern(wire_ref, rank_ref, keys_ref, probs_ref, tids_ref, counts_ref):
-        for _ in fused._metadata_steps(
-            wire_ref,
-            keys_ref,
-            probs_ref,
-            tids_ref,
-            counts_ref,
-            None,
-            tokens=tokens,
-            rank=rank_ref[0],
-            counts_ready=lambda: None,
-            local_experts=local_experts,
-        ):
-            pass
-
-    out_shapes = (
-        jax.ShapeDtypeStruct((rows * 4, 128), jnp.int32),
-        jax.ShapeDtypeStruct((tokens // 8, 128), jnp.float32),
-        jax.ShapeDtypeStruct((tokens // 8, 128), jnp.int32),
-        jax.ShapeDtypeStruct((local_experts,), jnp.int32),
+    expected_max_group = max(
+        int(hist_896[g * local_experts : (g + 1) * local_experts].sum())
+        for g in range(896 // local_experts)
     )
-    fn = jax.jit(pl.pallas_call(kern, out_shape=out_shapes, interpret=True))
-    for rank in (0, 3, 4, 17, 31):
-        _, probs_out, tids_out, counts_out = fn(
-            wire, jnp.array([rank], dtype=jnp.int32)
+
+    if tokens == 512:
+        wire = jnp.asarray(wire_np)
+
+        def kern(wire_ref, rank_ref, keys_ref, probs_ref, tids_ref, counts_ref):
+            for _ in fused._metadata_steps(
+                wire_ref,
+                keys_ref,
+                probs_ref,
+                tids_ref,
+                counts_ref,
+                None,
+                tokens=tokens,
+                rank=rank_ref[0],
+                counts_ready=lambda: None,
+                local_experts=local_experts,
+            ):
+                pass
+
+        out_shapes = (
+            jax.ShapeDtypeStruct((rows * 4, 128), jnp.int32),
+            jax.ShapeDtypeStruct((tokens // 8, 128), jnp.float32),
+            jax.ShapeDtypeStruct((tokens // 8, 128), jnp.int32),
+            jax.ShapeDtypeStruct((local_experts,), jnp.int32),
         )
+        fn = jax.jit(pl.pallas_call(kern, out_shape=out_shapes, interpret=True))
+        ranks_to_check = (0, 3, 4, 17, 31)
+    else:
+        fn = None
+        ranks_to_check = (0, 17, 31)
+
+    for rank in ranks_to_check:
+        if fn is not None:
+            _, probs_out, tids_out, counts_out = fn(
+                wire, jnp.array([rank], dtype=jnp.int32)
+            )
+        else:
+            keys_buf = np.zeros((rows * 4, 128), dtype=np.int32)
+            probs_buf = np.zeros((tokens // 8, 128), dtype=np.float32)
+            tids_buf = np.zeros((tokens // 8, 128), dtype=np.int32)
+            counts_buf = np.zeros((local_experts,), dtype=np.int32)
+            max_buf = np.zeros((1,), dtype=np.int32)
+            for _ in fused._metadata_steps(
+                _ArrayRef(wire_np),
+                _ArrayRef(keys_buf),
+                _ArrayRef(probs_buf),
+                _ArrayRef(tids_buf),
+                _ArrayRef(counts_buf),
+                _ArrayRef(max_buf),
+                tokens=tokens,
+                rank=jnp.int32(rank),
+                counts_ready=lambda: None,
+                local_experts=local_experts,
+            ):
+                pass
+            assert int(max_buf[0]) == expected_max_group
+            probs_out, tids_out, counts_out = probs_buf, tids_buf, counts_buf
         first_exp = (rank // expert_tp) * local_experts
         expected_counts = hist_896[first_exp : first_exp + local_experts]
         np.testing.assert_array_equal(np.asarray(counts_out), expected_counts)
@@ -361,3 +476,98 @@ def test_intermediate_window_elides_logits_and_sampler():
     assert done_set == {0}
     assert set(logits_map.keys()) == {0}
     assert out2.tokens.tolist() == [[100], [-1]]
+
+
+def test_intermediate_windows_and_two_slot_packing():
+    from vllm_torchtpu.megakernel.kimi_k3 import prefill
+
+    assert prefill.SERIAL_SLOTS == 2
+    assert prefill.WINDOWS == (
+        512,
+        1024,
+        2048,
+        4096,
+        6144,
+        8192,
+        10240,
+        12288,
+        14336,
+        16384,
+    )
+    wins = prefill.prefill_windows(16448, 163840)
+    assert wins == prefill.WINDOWS
+    for length, expected_win in (
+        (5375, 6144),
+        (9983, 10240),
+        (11519, 12288),
+        (13055, 14336),
+        (14591, 16384),
+    ):
+        packed = prefill.pack_windows(
+            [prefill.Piece(0, 0, length, None, 512)], wins, slots=2, capacity=163840
+        )
+        assert len(packed) == 1
+        assert packed[0][0] == expected_win
+    # Two-slot tail-packing fits 14592 (rows=14848) + 1536 into one 16384 window.
+    packed_pair = prefill.pack_windows(
+        [
+            prefill.Piece(0, 65536, 80128, None, 512),
+            prefill.Piece(1, 0, 1536, None, 512),
+        ],
+        wins,
+        slots=2,
+        capacity=163840,
+    )
+    assert len(packed_pair) == 1
+    assert packed_pair[0][0] == 16384
+    assert [(m[0].row, m[1]) for m in packed_pair[0][1]] == [(0, 0), (1, 14848)]
+
+
+def test_mixture_tile_divides_all_serving_windows():
+    import types
+
+    from vllm_torchtpu.megakernel.kimi_k3 import prefill
+
+    expected_tiles = {
+        512: 16,
+        1024: 32,
+        2048: 64,
+        4096: 128,
+        6144: 64,
+        8192: 128,
+        10240: 64,
+        12288: 128,
+        14336: 64,
+        16384: 128,
+    }
+    for w in prefill.WINDOWS:
+        rows = w // 32
+        tile = kernels._mixture_tile(rows)
+        assert tile == expected_tiles[w]
+        assert rows % tile == 0
+
+    dummy_prefix = types.SimpleNamespace(shape=(192, 7168))
+    dummy_blocks = types.SimpleNamespace(shape=(8, 192, 7168))
+    with pytest.raises(ValueError, match="multiple of tile"):
+        kernels.mixture_norm_tiled_body(
+            None,
+            dummy_prefix,
+            dummy_blocks,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            tile=128,
+            eps=1e-5,
+        )

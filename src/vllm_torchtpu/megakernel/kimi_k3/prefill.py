@@ -79,9 +79,10 @@ from vllm_torchtpu.megakernel.program import (
 logger = init_logger(__name__)
 
 AXIS = "k3_sp"
-WINDOWS = (512, 1024, 2048, 4096, 8192, 16384)
+WINDOWS = (512, 1024, 2048, 4096, 6144, 8192, 10240, 12288, 14336, 16384)
 PAGE_TOKENS = 256
 SLOTS = 16  # sequences per window, at most (and at most one per page)
+SERIAL_SLOTS = 2  # tail-packing slots under K3_SERIAL_PREFILL
 GROUP_PAIRS = 11  # regular 8-layer groups: layers 4..91
 COPY_PAIRS = 8  # copy-on-write block copies per PoolWriter.copy_blocks call
 
@@ -710,7 +711,7 @@ class PrefillProgram:
         fused_moe = (
             cfg.prefill_fused_moe
             and cfg.prefill_expert_parallel in (8, 16)
-            and window in (512, 1024, 2048, 4096, 8192, 16384)
+            and window in WINDOWS
         )
         return repr(
             (
@@ -1362,7 +1363,9 @@ class KimiPrefiller:
         # multiple of 4096), and a rank's share of them: 1/32 plus a page of
         # rounding slack per sequence, in multiples of 1024.
         capacity = max(windows[-1], -(-config.max_model_len // 4096) * 4096)
-        self.slots = 1 if envs.K3_SERIAL_PREFILL else min(config.max_num_seqs, SLOTS)
+        self.slots = min(
+            config.max_num_seqs, SERIAL_SLOTS if envs.K3_SERIAL_PREFILL else SLOTS
+        )
         self.cp_capacity = (
             -(-(capacity // DCP_SIZE + self.slots * self.page_tokens) // 1024) * 1024
         )

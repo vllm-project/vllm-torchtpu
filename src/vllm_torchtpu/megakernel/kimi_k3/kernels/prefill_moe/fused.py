@@ -742,7 +742,7 @@ def _prologue(
             )
         else:
             latent_products = _dense_panels(
-                hx, latent_weight, gate_buffers, gate_sems, columns=4096
+                hx, latent_weight, gate_buffers, gate_sems, columns=3584
             )
         first_half = None
         for col, product in latent_products:
@@ -797,7 +797,7 @@ def _prologue(
             pass
         start_metadata()
         if rows <= 128:
-            s["latent_payload"][...] = s["latent"][:, :3584].reshape(rows, 2, 1792)
+            s["latent_payload"][...] = s["latent"][...].reshape(rows, 2, 1792)
         latent_steps = _latent_gather_steps(
             tables,
             s["latent_payload"],
@@ -944,7 +944,7 @@ def _prologue(
         peer_send=dma,
         peer_recv=dma,
         peer_credit=pltpu.SemaphoreType.REGULAR,
-        latent=vmem((rows, 4096), jnp.bfloat16) if rows <= 128 else None,
+        latent=vmem((rows, 3584), jnp.bfloat16) if rows <= 128 else None,
         route_payload=vmem((rows // 4, 128), jnp.int32),
         route_wire=vmem((rows * 8, 128), jnp.int32),
         route_send=dma((5,)),
@@ -1073,7 +1073,6 @@ def _routed_experts(
         metadata,
         packed,
         sums,
-        cast,
         sends,
         receives,
         credits,
@@ -1162,8 +1161,9 @@ def _routed_experts(
                 values = sums[pl.ds(b * store_tile, store_tile)].reshape(
                     store_tile, 2 * packed_half
                 )
-                cast[...] = values[:, :tn].astype(jnp.bfloat16)
-                subtotal_vmem.at[pl.ds(b * store_tile, store_tile)][...] = cast[...]
+                subtotal_vmem.at[pl.ds(b * store_tile, store_tile)][...] = values[
+                    :, :tn
+                ].astype(jnp.bfloat16)
 
         def route(i):
             return (destinations[i], probabilities[i])
@@ -1371,7 +1371,7 @@ def _routed_experts(
 
             def start(g, bank):
                 raw_start, first, n_active = active_bounds(g)
-                unroll = 8
+                unroll = 16 if tokens == 8192 else 8
                 full = (n_active // unroll) * unroll
 
                 @pl.loop(0, n_active // unroll)
@@ -1547,7 +1547,6 @@ def _routed_experts(
         ),
         packed=pltpu.VMEM((2, tm, 2, packed_half), x.dtype),
         sums=pltpu.VMEM((tokens + _RMW_DUMMY_SLOTS, 2, packed_half), jnp.float32),
-        cast=pltpu.VMEM((store_tile, tn), x.dtype),
         sends=pltpu.SemaphoreType.DMA((streams,)),
         receives=pltpu.SemaphoreType.DMA((2, streams)),
         credits=pltpu.SemaphoreType.REGULAR((streams,)),
@@ -1614,9 +1613,11 @@ def _expert_product(lhs, rhs, *, cfgs, bucket_rows, overlap_work):
         else rhs.weight.shape[-1]
     )
     block = cfgs.rhs_cfgs.quant_block_size
-    # The 8K window uses a 256-row tile. Smaller windows use 128 rows;
-    # their whole-tile conversion schedules better than panel-local loads.
-    panel_local = cfgs.tiles.tile_m == 256
+    # Smaller windows (128-row tile) and the compact EP8 8K down tile ([768, 896])
+    # convert the whole weight tile once; larger 256-row tiles convert per panel.
+    panel_local = cfgs.tiles.tile_m == 256 and (
+        cfgs.tiles.tile_k > 768 or width > 896
+    )
     weights = None
     if not panel_local:
         weights = rhs.get_weight()
@@ -1689,7 +1690,12 @@ def _gu_inner(lhs, rhs, output, partial, metadata, *, cfgs, overlap_work):
         functools.partial(product, bucket_index=i)
         for i in range(first_bucket, cfgs.tiles.tile_m // cfgs.tiles.bucket_base)
     ]
-    lax.switch(jnp.maximum(last // cfgs.tiles.bucket_base - first_bucket, 0), branches)
+    lax.switch(
+        jnp.maximum(
+            jnp.maximum(last - 1, 0) // cfgs.tiles.bucket_base - first_bucket, 0
+        ),
+        branches,
+    )
 
 
 def _down_inner(lhs, rhs, output, metadata, *, cfgs, overlap_work):
@@ -1733,7 +1739,7 @@ def _down_inner(lhs, rhs, output, metadata, *, cfgs, overlap_work):
         functools.partial(product, bucket_index=i)
         for i in range(cfgs.tiles.tile_m // cfgs.tiles.bucket_base)
     ]
-    lax.switch(last // cfgs.tiles.bucket_base, branches)
+    lax.switch(jnp.maximum(last - 1, 0) // cfgs.tiles.bucket_base, branches)
 
 
 def _reduce_step(
@@ -2332,6 +2338,15 @@ def _layer_kernel(
     )
 
 
+_COMPOUND_PARTS: dict[int, tuple[int, ...]] = {
+    6144: (4096, 2048),
+    10240: (8192, 2048),
+    12288: (8192, 4096),
+    14336: (8192, 4096, 2048),
+    16384: (8192, 8192),
+}
+
+
 def make_indexed_moe_sp_ring(mesh, *, seq_len=8192):
     """Build the fused prefill MoE for a supported serving window."""
     return _build_indexed_moe_sp_ring(mesh, seq_len=seq_len, with_mixture=False)
@@ -2348,13 +2363,16 @@ def _build_indexed_moe_sp_ring(mesh, *, seq_len=8192, with_mixture=False):
     Inputs follow the prefill layer interface: rank-sharded normalized hidden
     states (or residual blocks + mixture/norm weights when ``with_mixture`` is
     True), residual prefix, resident weight families, valid length and family
-    index. All fast-path operations execute in one Pallas kernel per 8K half.
+    index. Compound windows > 4K (except direct 8K) chain 8K/4K/2K in-place
+    launches over contiguous 64-row SP stripe slices.
     """
-    if seq_len == 16384:
-        return _make_moe_16k(mesh, with_mixture=with_mixture)
+    if seq_len in _COMPOUND_PARTS:
+        return _make_moe_compound(
+            mesh, seq_len, _COMPOUND_PARTS[seq_len], with_mixture=with_mixture
+        )
     if seq_len not in (512, 1024, 2048, 4096, 8192):
         raise ValueError(
-            "Fused prefill MoE supports 512, 1024, 2048, 4096, 8192 and 16384 token windows"
+            "Fused prefill MoE supports 512, 1024, and multiples of 2048 up to 16384"
         )
     if mesh.size != 32 or tuple(mesh.axis_names) != ("k3_sp",):
         raise ValueError("Fused prefill MoE requires a flat 32-rank k3_sp mesh")
@@ -2534,62 +2552,81 @@ def _build_indexed_moe_sp_ring(mesh, *, seq_len=8192, with_mixture=False):
     return jax.jit(local)
 
 
-def _make_moe_16k(mesh, *, with_mixture=False):
-    """The 16K window as two 8K fused launches over the full rank rows.
+def _make_moe_compound(
+    mesh, seq_len: int, part_tokens: tuple[int, ...], *, with_mixture: bool = False
+):
+    """Compound window (6K, 10K, 12K, 14K, 16K) as in-place 8K/4K/2K launches.
 
-    Each launch reads and writes its 256-row half of the [512, 7168] hidden
-    (or [8, 512, 7168] blocks when ``with_mixture`` is True), residual and
-    output in place (the second aliases the first's output), so the window is
-    never split or concatenated in HBM. Routes that overflow the compact 8K
-    capacity fall back per half, as in the 8K op.
+    Every 2048-token SP block corresponds to a contiguous 64-row slice on each
+    rank. Each launch reads and writes its ``part_rows`` slice of the
+    ``[window_rows, 7168]`` stream (and ``[8, window_rows, 7168]`` blocks when
+    ``with_mixture`` is True) in place by aliasing the output buffer, avoiding
+    any HBM split or concatenation.
     """
     if mesh.size != 32 or tuple(mesh.axis_names) != ("k3_sp",):
         raise ValueError("Fused prefill MoE requires a flat 32-rank k3_sp mesh")
     ep = k._config().prefill_expert_parallel
     if ep not in (8, 16):
         raise ValueError("Fused prefill MoE requires prefill_expert_parallel in (8, 16)")
+    if sum(part_tokens) != seq_len:
+        raise ValueError(f"Compound MoE parts {part_tokens} do not sum to {seq_len}")
     from .layer import routed_experts_prepared
 
-    tokens, rows, window_rows = 8192, 256, 512
+    window_rows = seq_len // 32
     local_experts = 896 // ep
     mid_width = 3072 // (32 // ep)
     tables = k.ring_tables(list(mesh.devices.flat), tuple(range(32)))
     hbm = pl.BlockSpec(memory_space=pltpu.HBM)
-    shape = (tokens // 8, 128)
     bf16 = jnp.bfloat16
-    workspace_shapes = [
-        ((window_rows, 7168), bf16),
-        ((tokens, 2, 1792), bf16),
-        ((tokens * 16, mid_width), bf16),
-    ]
-    output_specs = [hbm] * 3
-    can_overflow = ep > 8
-    if can_overflow:
-        workspace_shapes += [
-            (shape, jnp.int32),
-            (shape, jnp.float32),
-            ((local_experts,), jnp.int32),
-            ((rows, 7168), bf16),
-            ((1,), jnp.int32),
-        ]
-        output_specs += [hbm] * 4 + [pl.BlockSpec()]
     counting = k._config().prefill_route_counts
-    if counting:
-        workspace_shapes += [((local_experts,), jnp.int32)]
-        output_specs += [pl.BlockSpec(memory_space=pltpu.SMEM)]
     inputs = 15 if with_mixture else 13  # after the two scalar-prefetch operands
-    kernel_name = (
-        "fused_mixture_moe_pallas_8192" if with_mixture else "fused_moe_pallas_8192"
-    )
 
-    def make_kernel(half):
-        aliased = half == 1
+    tok_offsets: list[int] = []
+    row_offsets: list[int] = []
+    acc_tok = 0
+    for p_tok in part_tokens:
+        tok_offsets.append(acc_tok)
+        row_offsets.append(acc_tok // 32)
+        acc_tok += p_tok
+    part_rows = tuple(p_tok // 32 for p_tok in part_tokens)
+    can_overflow_parts = tuple(p_tok == 8192 and ep > 8 for p_tok in part_tokens)
+
+    def make_kernel(part_idx: int):
+        p_tok = part_tokens[part_idx]
+        p_rows = part_rows[part_idx]
+        r_off = row_offsets[part_idx]
+        aliased = part_idx > 0
+        can_overflow_part = can_overflow_parts[part_idx]
+        p_shape = (p_tok // 8, 128)
+        workspace_shapes = [
+            ((window_rows, 7168), bf16),
+            ((p_tok, 2, 1792), bf16),
+            ((p_tok * 16, mid_width), bf16),
+        ]
+        output_specs = [hbm] * 3
+        if can_overflow_part:
+            workspace_shapes += [
+                (p_shape, jnp.int32),
+                (p_shape, jnp.float32),
+                ((local_experts,), jnp.int32),
+                ((p_rows, 7168), bf16),
+                ((1,), jnp.int32),
+            ]
+            output_specs += [hbm] * 4 + [pl.BlockSpec()]
+        if counting:
+            workspace_shapes += [((local_experts,), jnp.int32)]
+            output_specs += [pl.BlockSpec(memory_space=pltpu.SMEM)]
+        kernel_name = (
+            f"fused_mixture_moe_pallas_{p_tok}"
+            if with_mixture
+            else f"fused_moe_pallas_{p_tok}"
+        )
 
         def body(*refs):
             refs = list(refs)
             if aliased:
-                del refs[2 + inputs]  # the first launch's output, aliased below
-            own = pl.ds(half * rows, rows)
+                del refs[2 + inputs]  # previous launch's output, aliased below
+            own = pl.ds(r_off, p_rows)
             for idx in (8, 9, 10, 11):  # expert_gu, expert_gus, expert_down, expert_ds
                 if refs[idx].shape[1] != local_experts:
                     refs[idx] = refs[idx].at[:, pl.ds(0, local_experts)]
@@ -2629,7 +2666,7 @@ def _make_moe_16k(mesh, *, with_mixture=False):
             name=kernel_name,
         )
 
-    kernels = (make_kernel(0), make_kernel(1))
+    kernels = tuple(make_kernel(i) for i in range(len(part_tokens)))
     in_specs = (
         (
             P("k3_sp"),
@@ -2679,31 +2716,35 @@ def _make_moe_16k(mesh, *, with_mixture=False):
             prefix[0],
             *tail_args,
         )
-        lengths = (jnp.minimum(length, tokens), jnp.maximum(length - tokens, 0))
-        halves, routes, previous = [], None, ()
-        for half, kernel in enumerate(kernels):
+        lengths = tuple(
+            jnp.clip(length - t_off, 0, p_tok)
+            for p_tok, t_off in zip(part_tokens, tok_offsets, strict=True)
+        )
+        parts_out, routes, previous = [], None, ()
+        for idx, kernel in enumerate(kernels):
             if with_mixture:
                 assert active is not None
                 control = jnp.concatenate(
-                    (lengths[half].reshape(1), slot.reshape(1), active.reshape(1))
+                    (lengths[idx].reshape(1), slot.reshape(1), active.reshape(1))
                 )
             else:
-                control = jnp.concatenate((lengths[half].reshape(1), slot.reshape(1)))
+                control = jnp.concatenate((lengths[idx].reshape(1), slot.reshape(1)))
             outputs = kernel(jnp.asarray(tables), control, *operands, *previous)
             if counting:
                 *outputs, counted = outputs
                 routes = counted if routes is None else routes + counted
-            halves.append(outputs)
+            parts_out.append(outputs)
             previous = (outputs[0],)
-        final = halves[1][0]
-        if not can_overflow:
+        final = parts_out[-1][0]
+        if not any(can_overflow_parts):
             if counting:
                 assert routes is not None
                 return final[None], routes[None]
             return final[None]
 
-        def overflow(half):
-            _, latent, _, ids, probs, counts, shared, maximum = halves[half]
+        def overflow(idx: int):
+            r_off, p_rows = row_offsets[idx], part_rows[idx]
+            _, latent, _, ids, probs, counts, shared, maximum = parts_out[idx]
             extra_slots = w["expert_gu"].shape[1] - local_experts
             counts_for_prep = (
                 jnp.pad(counts, (0, extra_slots)) if extra_slots > 0 else counts
@@ -2725,28 +2766,38 @@ def _make_moe_16k(mesh, *, with_mixture=False):
             return k._moe_sp_tail(
                 reduced,
                 shared,
-                prefix[0][half * rows : (half + 1) * rows],
-                lengths[half],
+                prefix[0][r_off : r_off + p_rows],
+                lengths[idx],
                 selected,
                 axis_name="k3_sp",
                 eps=1e-5,
                 shared_reduced=True,
             )
 
-        fits = [h[7][0] <= _COMPACT_8K_CAPACITY for h in halves]
+        fits = [
+            (parts_out[i][7][0] <= _COMPACT_8K_CAPACITY)
+            if can_overflow_parts[i]
+            else jnp.bool_(True)
+            for i in range(len(part_tokens))
+        ]
+        all_fit = fits[0]
+        for fit in fits[1:]:
+            all_fit = all_fit & fit
 
         def fallback():
-            parts = [
+            slices = [
                 jax.lax.cond(
-                    fits[half],
-                    lambda half=half: final[half * rows : (half + 1) * rows],
-                    lambda half=half: overflow(half),
+                    fits[i],
+                    lambda r=row_offsets[i], pr=part_rows[i]: final[r : r + pr],
+                    lambda i=i: overflow(i),
                 )
-                for half in range(2)
+                if can_overflow_parts[i]
+                else final[row_offsets[i] : row_offsets[i] + part_rows[i]]
+                for i in range(len(part_tokens))
             ]
-            return jnp.concatenate(parts, axis=0)
+            return jnp.concatenate(slices, axis=0)
 
-        result = jax.lax.cond(fits[0] & fits[1], lambda: final, fallback)[None]
+        result = jax.lax.cond(all_fit, lambda: final, fallback)[None]
         if counting:
             assert routes is not None
             return result, routes[None]

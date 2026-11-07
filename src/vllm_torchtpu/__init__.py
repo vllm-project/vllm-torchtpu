@@ -137,6 +137,18 @@ def _cache_only_prefill_tokens(scheduler) -> bool:
     return True
 
 
+def _megakernel_prefill_target(
+    req, *, is_aggregate: bool, decoding_ids: set[str]
+) -> int:
+    """Return the token index where megakernel prefill work ends for ``req``."""
+    if is_aggregate:
+        req_id = getattr(req, "request_id", None)
+        if req_id in decoding_ids and req.num_computed_tokens >= req.num_prompt_tokens:
+            return 0
+        return max(req.num_tokens - 1, 0)
+    return max(req.num_prompt_tokens, req.num_tokens - 1)
+
+
 def _patch_vllm_megakernel_prefix_hits() -> None:
     """Apply ``_disable_partial_hits_without_block_copies`` and
     ``_cache_only_prefill_tokens`` to every scheduler."""
@@ -163,19 +175,40 @@ def _patch_vllm_megakernel_prefix_hits() -> None:
                 "aggregate decoder writes no KDA state blocks."
             )
         if _model_needs_page_aligned_chunks(self.vllm_config):
+            from vllm_torchtpu.megakernel import backend
+
             self.need_mamba_block_aligned_split = True
-            self._tpu_step_prefill_req_id = None
+            self._tpu_is_aggregate = backend.role(self.vllm_config) == "aggregate"
+            self._tpu_decoding_ids = set()
+            self._tpu_unfinished_prefill_ids = set()
+            self._tpu_step_prefill_info = {}
+            self._tpu_effective_start = {}
             original_schedule = self.schedule
 
             @wraps(original_schedule)
             def _schedule_with_prefill_tracking(*s_args, **s_kwargs):
-                active_req_id = None
-                for req in getattr(self, "running", ()):
-                    prefill_end = max(req.num_prompt_tokens, req.num_tokens - 1)
-                    if req.num_computed_tokens < prefill_end:
-                        active_req_id = req.request_id
-                        break
-                self._tpu_step_prefill_req_id = active_req_id
+                running_reqs = getattr(self, "running", ())
+                running_ids = {req.request_id for req in running_reqs}
+                decoding_ids = (
+                    getattr(self, "_tpu_decoding_ids", None) or set()
+                ) & running_ids
+                self._tpu_decoding_ids = decoding_ids
+                is_agg = bool(getattr(self, "_tpu_is_aggregate", False))
+                unfinished = set()
+                for req in running_reqs:
+                    pf_target = _megakernel_prefill_target(
+                        req, is_aggregate=is_agg, decoding_ids=decoding_ids
+                    )
+                    if req.num_computed_tokens < pf_target:
+                        unfinished.add(req.request_id)
+                self._tpu_unfinished_prefill_ids = unfinished
+                self._tpu_step_prefill_info = {}
+                eff = getattr(self, "_tpu_effective_start", None)
+                self._tpu_effective_start = (
+                    {rid: pos for rid, pos in eff.items() if rid in unfinished}
+                    if eff
+                    else {}
+                )
                 return original_schedule(*s_args, **s_kwargs)
 
             self.schedule = _schedule_with_prefill_tracking
@@ -260,36 +293,122 @@ def _patch_vllm_mamba_split_scheduler_block_size() -> None:
             + num_external_computed_tokens
         )
         prefill_end = max(request.num_prompt_tokens, request.num_tokens - 1)
+        physical_cache_config = self.cache_config
+        page = physical_cache_config.block_size
+        req_id = getattr(request, "request_id", None)
+        orig_max_sched = self.max_num_scheduled_tokens
+        max_step = envs.K3_MAX_PREFILL_STEP_TOKENS
+        is_agg = False
+        pf_target = prefill_end
+        largest_window = orig_max_sched
+        step_info = None
+        eff_map = None
+        prior_rows = 0
+        max_for_req = None
+        eff_start = start if start % page == 0 else 0
+        if needs_pages:
+            is_agg_attr = getattr(self, "_tpu_is_aggregate", None)
+            if is_agg_attr is None:
+                from vllm_torchtpu.megakernel import backend
+
+                is_agg = backend.role(self.vllm_config) == "aggregate"
+                self._tpu_is_aggregate = is_agg
+            else:
+                is_agg = bool(is_agg_attr)
+            decoding_ids = getattr(self, "_tpu_decoding_ids", None) or set()
+            pf_target = _megakernel_prefill_target(
+                request, is_aggregate=is_agg, decoding_ids=decoding_ids
+            )
         if needs_pages and start < prefill_end:
-            if envs.K3_SERIAL_PREFILL:
-                active_id = getattr(self, "_tpu_step_prefill_req_id", None)
-                req_id = getattr(request, "request_id", None)
-                if active_id is not None and active_id != req_id:
+            if envs.K3_SERIAL_PREFILL and req_id is not None and start < pf_target:
+                from vllm_torchtpu.megakernel.kimi_k3.prefill import prefill_windows
+                from vllm_torchtpu.megakernel.kimi_k3.program import MAX_STEP_TOKENS
+
+                raw_engine_budget = (
+                    min(orig_max_sched, MAX_STEP_TOKENS) if is_agg else orig_max_sched
+                )
+                model_cfg = getattr(self.vllm_config, "model_config", None)
+                max_model_len = (
+                    getattr(model_cfg, "max_model_len", raw_engine_budget)
+                    or raw_engine_budget
+                )
+                largest_window = prefill_windows(raw_engine_budget, max_model_len)[-1]
+                prefix_cap = max(largest_window, -(-max_model_len // 4096) * 4096)
+                step_cap = (
+                    min(orig_max_sched, max_step) if max_step > 0 else orig_max_sched
+                )
+                step_info = getattr(self, "_tpu_step_prefill_info", None)
+                if step_info is None:
+                    step_info = self._tpu_step_prefill_info = {}
+                eff_map = getattr(self, "_tpu_effective_start", None)
+                if eff_map is None:
+                    eff_map = self._tpu_effective_start = {}
+                unfinished = getattr(self, "_tpu_unfinished_prefill_ids", ())
+                eff_start = eff_map.get(req_id, eff_start)
+                sched_cfg = getattr(self, "scheduler_config", None)
+                max_slots = min(2, getattr(sched_cfg, "max_num_seqs", 2) or 2)
+                active_ids = set(unfinished) | set(step_info) | {req_id}
+                step_ids = set(step_info) | {req_id}
+                any_skipped = any(
+                    rows_u == 0
+                    for rid, (rows_u, _) in step_info.items()
+                    if rid != req_id
+                )
+                if (
+                    len(active_ids) > max_slots
+                    or len(step_ids) > max_slots
+                    or any_skipped
+                ):
                     return 0
-            max_step = envs.K3_MAX_PREFILL_STEP_TOKENS
-            if max_step > 0:
-                num_new_tokens = min(num_new_tokens, max_step)
+                prior_rows = sum(
+                    rows_u for rid, (rows_u, _) in step_info.items() if rid != req_id
+                )
+                prior_prefix = sum(
+                    pref_u for rid, (_, pref_u) in step_info.items() if rid != req_id
+                )
+                already_skipped = start - eff_start
+                rem_rows = largest_window - prior_rows
+                if prior_rows > 0:
+                    req_prefix = -(-eff_start // page) * page
+                    if (
+                        rem_rows - already_skipped < page
+                        or prior_prefix + req_prefix > prefix_cap
+                        or rem_rows < pf_target - eff_start <= largest_window
+                    ):
+                        return 0
+                max_for_req = min(step_cap, rem_rows - already_skipped)
+                if max_for_req <= 0:
+                    return 0
+                num_new_tokens = min(num_new_tokens, max_for_req)
+            elif max_step > 0 and not (envs.K3_SERIAL_PREFILL and req_id is not None):
+                max_for_req = min(orig_max_sched, max_step)
+                num_new_tokens = min(num_new_tokens, max_for_req)
         args = (
             request,
             num_new_tokens,
             num_new_local_computed_tokens,
             num_external_computed_tokens,
         )
-        physical_cache_config = self.cache_config
-        if physical_cache_config.block_size == self.block_size:
+        cap_sched_budget = max_for_req is not None and max_for_req < orig_max_sched
+        if physical_cache_config.block_size == self.block_size and not cap_sched_budget:
             if not needs_pages:
                 return original_split(self, *args)
             num_new_tokens = original_split(self, *args)
         else:
-            scheduler_cache_config = copy.copy(physical_cache_config)
-            scheduler_cache_config.block_size = self.block_size
+            if physical_cache_config.block_size != self.block_size:
+                scheduler_cache_config = copy.copy(physical_cache_config)
+                scheduler_cache_config.block_size = self.block_size
+                self.cache_config = scheduler_cache_config
+            if cap_sched_budget:
+                assert max_for_req is not None
+                self.max_num_scheduled_tokens = min(orig_max_sched, max_for_req)
             # schedule() calls this method synchronously on the EngineCore thread,
             # and the upstream implementation contains no callback or await point.
-            self.cache_config = scheduler_cache_config
             try:
                 num_new_tokens = original_split(self, *args)
             finally:
                 self.cache_config = physical_cache_config
+                self.max_num_scheduled_tokens = orig_max_sched
         # A scheduler block wider than the prefill budget (DCP/PCP: 256 x
         # ranks tokens) leaves chunks inside it wherever the shared token
         # budget cuts them. A program that declares ``page_aligned_chunks``
@@ -297,7 +416,6 @@ def _patch_vllm_mamba_split_scheduler_block_size() -> None:
         # exempt, as upstream.
         if not needs_pages:
             return num_new_tokens
-        page = physical_cache_config.block_size
         end = start + num_new_tokens
         if start < prefill_end and end < prefill_end and end % page:
             aligned = end // page * page
@@ -305,10 +423,53 @@ def _patch_vllm_mamba_split_scheduler_block_size() -> None:
                 num_new_tokens = aligned - start
             elif start % page == 0:
                 num_new_tokens = 0  # less than a page of budget left: next step
-        if num_new_tokens > 0 and start < prefill_end and envs.K3_SERIAL_PREFILL:
-            req_id = getattr(request, "request_id", None)
-            if req_id is not None:
-                self._tpu_step_prefill_req_id = req_id
+        end = start + num_new_tokens
+        if (
+            is_agg
+            and num_new_tokens > 0
+            and req_id is not None
+            and end >= request.num_tokens
+        ):
+            dec_set = getattr(self, "_tpu_decoding_ids", None)
+            if dec_set is None:
+                dec_set = self._tpu_decoding_ids = set()
+            dec_set.add(req_id)
+        if (
+            num_new_tokens > 0
+            and start < pf_target
+            and envs.K3_SERIAL_PREFILL
+            and req_id is not None
+            and step_info is not None
+        ):
+            pf_end = min(end, pf_target)
+            will_skip = (
+                pf_end < pf_target
+                and pf_target - eff_start <= largest_window
+                and pf_end // self.block_size == start // self.block_size
+            )
+            prior_rows = sum(
+                rows_u for rid, (rows_u, _) in step_info.items() if rid != req_id
+            )
+            if prior_rows > 0 and will_skip:
+                if is_agg and end >= request.num_tokens:
+                    dec_set = getattr(self, "_tpu_decoding_ids", None)
+                    if dec_set is not None:
+                        dec_set.discard(req_id)
+                return 0
+            if will_skip:
+                step_info[req_id] = (0, 0)
+                if eff_map is not None:
+                    eff_map[req_id] = eff_start
+            else:
+                piece_len = pf_end - eff_start
+                rows_used = -(-piece_len // page) * page
+                prefix_used = -(-eff_start // page) * page
+                step_info[req_id] = (rows_used, prefix_used)
+                if eff_map is not None:
+                    if pf_end >= pf_target:
+                        eff_map.pop(req_id, None)
+                    else:
+                        eff_map[req_id] = pf_end
         return num_new_tokens
 
     split_with_scheduler_block_size._tpu_scheduler_block_size_patch = True
