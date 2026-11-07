@@ -56,7 +56,7 @@ logger = init_logger(__name__)
 EP_AXIS_NAME = "d"
 
 _MESH_CACHE: dict[tuple[str, tuple[int, ...]], Any] = {}
-_TOKEN_GROUP_CACHE: dict[tuple, tuple[tuple[int, ...], ...]] = {}
+_GROUP_CACHE: dict[tuple, tuple[tuple[int, ...], ...]] = {}
 _SORTED_GATHER_CACHE: dict[tuple, tuple[Any, tuple[int, ...]]] = {}
 
 
@@ -70,41 +70,60 @@ def ep_token_replica_groups(
     arithmetic: vLLM ranks and mesh positions may differ (see `_ep_mesh_order`).
     Called during weight loading, never inside the compiled forward.
     """
-    group = get_ep_group()
-    if group is None:
-        raise RuntimeError("Token replica groups require an initialized EP group")
-    rank = _get_current_global_rank()
-    ranks = tuple(int(r) for r in group.ranks)
     replicas = (
-        (rank,)
+        (_get_current_global_rank(),)
         if is_sequence_parallel
         else tuple(int(r) for r in parallel_state.get_tp_group().ranks)
     )
+    return _ep_mesh_groups(replicas, "token replica")
+
+
+def ep_dp_groups() -> tuple[tuple[int, ...], ...]:
+    """The DP groups expressed in the EP mesh's coordinates, each in DP-rank
+    order, so that position ``k`` of a group is DP rank ``k``.
+
+    Collective over the EP group like `ep_token_replica_groups`: call it on
+    every rank outside any traced region.
+    """
+    dp_ranks = tuple(int(r) for r in parallel_state.get_dp_group().ranks)
+    return _ep_mesh_groups(dp_ranks, "DP")
+
+
+def _ep_mesh_groups(
+    this_group: tuple[int, ...], what: str
+) -> tuple[tuple[int, ...], ...]:
+    """Every EP rank's group as mesh indices, from each rank's ``this_group``
+    (its own group's global ranks), keeping the order the ranks give."""
+    group = get_ep_group()
+    if group is None:
+        raise RuntimeError(f"EP {what} groups require an initialized EP group")
+    rank = _get_current_global_rank()
+    ranks = tuple(int(r) for r in group.ranks)
     device_ids = ep_device_ids()
     assert device_ids is not None
-    key = (ranks, device_ids, replicas)
-    cached = _TOKEN_GROUP_CACHE.get(key)
+    key = (ranks, device_ids, this_group)
+    cached = _GROUP_CACHE.get(key)
     if cached is not None:
         return cached
 
     gathered: list[Any] = [None] * len(ranks)
     torch.distributed.all_gather_object(
-        gathered, (rank, replicas), group=group.cpu_group
+        gathered, (rank, this_group), group=group.cpu_group
     )
     if any(item is None for item in gathered):
-        raise RuntimeError("EP token replica gather returned an empty entry")
+        raise RuntimeError(f"EP {what} gather returned an empty entry")
     reported = {int(r): tuple(int(p) for p in members) for r, members in gathered}
     if set(reported) != set(ranks):
-        raise RuntimeError("EP token replica gather does not cover the EP ranks")
+        raise RuntimeError(f"EP {what} gather does not cover the EP ranks")
     for r, members in reported.items():
         if (
             r not in members
             or len(set(members)) != len(members)
             or any(reported.get(peer) != members for peer in members)
         ):
-            raise RuntimeError(f"Inconsistent token replica group: {r}: {members}")
+            raise RuntimeError(f"Inconsistent {what} group: {r}: {members}")
     if len({len(members) for members in reported.values()}) != 1:
-        raise RuntimeError("EP token replica groups must have equal sizes")
+        raise RuntimeError(f"EP {what} groups must have equal sizes")
     mesh_index = {ranks[e]: i for i, e in enumerate(_ep_mesh_order(device_ids))}
     groups = tuple(
         sorted(
@@ -112,7 +131,7 @@ def ep_token_replica_groups(
             key=min,
         )
     )
-    _TOKEN_GROUP_CACHE[key] = groups
+    _GROUP_CACHE[key] = groups
     return groups
 
 

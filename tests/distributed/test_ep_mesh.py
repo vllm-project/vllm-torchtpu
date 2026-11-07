@@ -26,7 +26,7 @@ from vllm_torchtpu.distributed import ep_mesh as ep
 @pytest.fixture(autouse=True)
 def mesh_cache(monkeypatch):
     monkeypatch.setattr(ep, "_MESH_CACHE", {})
-    monkeypatch.setattr(ep, "_TOKEN_GROUP_CACHE", {})
+    monkeypatch.setattr(ep, "_GROUP_CACHE", {})
     monkeypatch.setattr(ep, "get_pcp_world_size", lambda: 1)
     monkeypatch.setattr(ep, "get_dcp_world_size", lambda: 1)
 
@@ -311,6 +311,23 @@ def test_token_groups_use_native_membership_and_mesh_order(
         ep.ep_token_replica_groups(is_sequence_parallel=sequence_parallel) == expected
     )
     assert collect.call_count == 1
+
+
+def test_dp_groups_keep_dp_rank_order_in_mesh_coordinates(monkeypatch, group):
+    group.cpu_group = object()
+    monkeypatch.setattr(ep, "ep_device_ids", lambda: (40, 20, 10, 30))
+    monkeypatch.setattr(
+        parallel_state, "get_dp_group", lambda: SimpleNamespace(ranks=[2, 6])
+    )
+    reports = [(2, (2, 6)), (4, (4, 8)), (6, (2, 6)), (8, (4, 8))]
+
+    def gather(output, value, *, group):
+        assert value == (6, (2, 6))
+        output[:] = reports
+
+    monkeypatch.setattr(ep.torch.distributed, "all_gather_object", gather)
+    # Global ranks 6, 4, 8, 2 sit at mesh indices 0..3; DP rank 0 stays first.
+    assert ep.ep_dp_groups() == ((3, 0), (1, 2))
 
 
 @pytest.mark.parametrize(
