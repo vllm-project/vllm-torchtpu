@@ -25,6 +25,9 @@ _DSV4_DSPARK_MODEL = (
 _QWEN35_MTP_MODEL = "vllm_torchtpu.models.vllm.qwen3_5_mtp:Qwen3_5MTP"
 _QWEN35_MOE_MTP_MODEL = "vllm_torchtpu.models.vllm.qwen3_5_mtp:Qwen3_5MoeMTP"
 _QWEN4_EXP_MODEL = "vllm_torchtpu.models.vllm.qwen4_exp.model:Qwen4ExpForCausalLM"
+_SENSENOVA_LOOP_MODEL = (
+    "vllm_torchtpu.models.vllm.sensenova_loop:SenseNovaLoopForConditionalGeneration"
+)
 
 
 class _TPUKimiK3Config(VerifyAndUpdateConfig):
@@ -47,6 +50,7 @@ def register_models() -> None:
     from vllm.model_executor.models.config import MODELS_CONFIG_MAP
 
     from vllm_torchtpu.models.vllm.qwen4_exp.config import TPUQwen4ExpConfig
+    from vllm_torchtpu.models.vllm.sensenova_loop_config import SenseNovaLoopConfig
 
     ModelRegistry.register_model("KimiLinearForCausalLM", _KIMI_MODEL)
     ModelRegistry.register_model("KimiK3ForConditionalGeneration", _KIMI_K3_MODEL)
@@ -60,7 +64,13 @@ def register_models() -> None:
     # The released checkpoint declares the vision-language arch; serve it with
     # the text-only model.
     ModelRegistry.register_model("Qwen4ExpForConditionalGeneration", _QWEN4_EXP_MODEL)
+    # No upstream SenseNova-Loop; its config is the checkpoint's remote code.
+    # Served text-only, like the Qwen4Exp vision-language arch above.
+    ModelRegistry.register_model(
+        "SenseNovaLoopForConditionalGeneration", _SENSENOVA_LOOP_MODEL
+    )
     MODELS_CONFIG_MAP["KimiK3ForConditionalGeneration"] = _TPUKimiK3Config
     MODELS_CONFIG_MAP["Qwen4ExpForCausalLM"] = TPUQwen4ExpConfig
     MODELS_CONFIG_MAP["Qwen4ExpForConditionalGeneration"] = TPUQwen4ExpConfig
     MODELS_CONFIG_MAP["Qwen2ForCausalLM"] = _TPUQwen2Config
+    MODELS_CONFIG_MAP["SenseNovaLoopForConditionalGeneration"] = SenseNovaLoopConfig
