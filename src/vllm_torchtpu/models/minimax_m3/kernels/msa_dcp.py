@@ -336,9 +336,9 @@ def _merge_pallas(
 
 
 MERGE_IMPLS = ("legacy", "serial", "sort", "pallas")
-# The served merge. "legacy" until a TPU run of
-# scripts/benchmark_msa_dcp_merge_candidates.py picks another.
-DEFAULT_MERGE_IMPL = "legacy"
+# The served merge: "pallas" won the served-shape TPU microbench
+# (scripts/benchmark_msa_dcp_merge_candidates.py), 3.0-3.5x over legacy.
+DEFAULT_MERGE_IMPL = "pallas"
 
 
 def merge_head_candidates(
@@ -358,6 +358,8 @@ def merge_head_candidates(
     "serial" (the same rounds on lane-dense `head_rows`), "sort" (two row
     sorts) and "pallas" (the rounds in one kernel). On a NaN score "sort"
     and "pallas" never pick it; the rounds follow the backend's max.
+    "pallas" runs its kernel when lowered for TPU (or with `interpret`)
+    and the same rounds in XLA on other platforms.
     """
     dcp, num_tokens, width = candidates.shape
     num_heads = width // (2 * topk)
@@ -371,7 +373,19 @@ def merge_head_candidates(
     elif impl == "sort":
         selected = _merge_sort(s, b, topk)
     elif impl == "pallas":
-        selected = _merge_pallas(s, b, topk, interpret=interpret)
+        if interpret:
+            selected = _merge_pallas(s, b, topk, interpret=True)
+        else:
+            # Mosaic lowers for TPU only; elsewhere the same rounds in XLA
+            # (bit-exact: `_merge_rounds` with NaN read as -inf).
+            selected = jax.lax.platform_dependent(
+                s,
+                b,
+                tpu=functools.partial(_merge_pallas, topk=topk),
+                default=lambda s, b: _merge_rounds(
+                    jnp.where(jnp.isnan(s), _NEG_INF, s), b, topk
+                ),
+            )
     else:
         raise ValueError(f"Unknown merge impl {impl!r}; expected {MERGE_IMPLS}.")
     return selected.reshape(num_heads, num_tokens, topk).transpose(1, 0, 2)
@@ -577,6 +591,7 @@ def msa_attend_dcp(
         pages_per_seq=pages_per_seq,
         rank=rank,
         dcp=dcp,
+        interpret=interpret,
     )  # keys [T, G, topk]
     num_heads = keys.shape[1]
     common = dict(
