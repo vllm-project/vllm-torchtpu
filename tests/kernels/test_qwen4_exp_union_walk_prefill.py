@@ -67,7 +67,7 @@ def kernels(monkeypatch):
                  "VLLM_TPU_QSA_PREFILL_UNION_SHARE_BITS", "VLLM_TPU_QSA_PREFILL_UNION_ALPHA",
                  "VLLM_TPU_QSA_PREFILL_UNION_QK16", "VLLM_TPU_QSA_PREFILL_UNION_RUN_TABLES",
                  "VLLM_TPU_QSA_PREFILL_UNION_LAZY_SHARE", "VLLM_TPU_QSA_PREFILL_UNION_GATHERED",
-                 "VLLM_TPU_QSA_PREFILL_UNION_GATHER_CHUNKS"):
+                 "VLLM_TPU_QSA_PREFILL_UNION_GATHER_CHUNKS", "VLLM_TPU_QSA_PREFILL_UNION_SC_BITSET"):
         monkeypatch.delenv(name, raising=False)
     yield
     jax.clear_caches()
@@ -307,7 +307,8 @@ def test_flag_on_dispatch_takes_the_walk(kernels, monkeypatch):
     assert calls == [dict(kv_heads=2, ratio=RATIO, k_scale=1.0, v_scale=1.0, group=128, kv_tile=1024,
                           union_cap=CAP, min_context=1000, lean=True, listed=None, share_bits=False,
                           union_alpha=0.0, qk16=False, run_tables=False, lazy_share=False, gathered=None,
-                          gather_chunks=4, gather_growth=1.0, compact_reqs=0, compact_copy_method="vmem")]
+                          gather_chunks=4, gather_growth=1.0, compact_reqs=0, compact_copy_method="vmem",
+                          sc_bitset=False)]
     jax.clear_caches()
     want = _walk(step, union_cap=CAP, min_context=1000, lean=True)
     np.testing.assert_array_equal(_bits(got), _bits(want))
@@ -1004,6 +1005,44 @@ def test_compact_args_and_dispatch(kernels, monkeypatch):
                                                          listed="reference", gathered="reference", gather_chunks=2)))
 
 
+# --- the plan's bitset on the SparseCore (sc_bitset; emulated off TPU) ---------------------------------------------
+
+
+@pytest.mark.parametrize("layout,gathered", [(SPARE, None), (A64, "reference")])
+def test_sc_bitset_prefill_is_the_walk(kernels, monkeypatch, layout, gathered):
+    """sc_bitset=True: the walk (and the gathered walk) on the SparseCore-built bitset (emulated) is the walk bit for bit,
+    and the SparseCore build is what the plan calls."""
+    import test_qwen4_exp_union_sc_gather as tsc
+    from vllm_torchtpu.kernels.qwen4_exp import qsa_union_sc_gather as sg
+
+    rows, cached = layout
+    step = _packed_step(101 + len(rows), rows, cached, tokens=2048)
+    walk = _walk(step, group=64)
+    calls = []
+    monkeypatch.setattr(sg, "union_sc_bits", tsc._bits_callback(calls))
+    jax.clear_caches()
+    opts = dict(group=64, sc_bitset=True)
+    if gathered:
+        opts.update(listed="reference", gathered=gathered, gather_chunks=2)
+    np.testing.assert_array_equal(_bits(_walk(step, **opts)), _bits(walk))
+    assert calls and all(c["group"] == 64 for c in calls), calls
+
+
+def test_sc_bitset_dispatch(kernels, monkeypatch):
+    rows, cached = A64
+    step = _packed_step(102, rows, cached)
+    for name, value in (("VLLM_TPU_QSA_PREFILL_UNION_WALK", "64"), ("VLLM_TPU_QSA_PREFILL_UNION_MIN_CONTEXT", "0"),
+                        ("VLLM_TPU_QSA_PREFILL_UNION_SC_BITSET", "1")):
+        monkeypatch.setenv(name, value)
+    import test_qwen4_exp_union_sc_gather as tsc
+    from vllm_torchtpu.kernels.qwen4_exp import qsa_union_sc_gather as sg
+
+    monkeypatch.setattr(sg, "union_sc_bits", tsc._bits_callback([]))
+    calls = _spy(monkeypatch)
+    _dispatch(step)
+    assert calls[0]["sc_bitset"] is True, calls
+
+
 def test_full_stack_dispatch(kernels, monkeypatch):
     """The int-2 flags (G64, listed, share_bits, alpha 0.9, cap 16,384, qk16) reach union_walk_prefill and give the
     direct call's bits; without alpha and qk16 the stack is the plain G64 walk bit for bit (qk16 itself is gated
@@ -1020,7 +1059,8 @@ def test_full_stack_dispatch(kernels, monkeypatch):
     assert calls == [dict(kv_heads=2, ratio=RATIO, k_scale=1.0, v_scale=1.0, group=64, kv_tile=1024,
                           union_cap=16384, min_context=0, lean=True, listed="reference", share_bits=True,
                           union_alpha=0.9, qk16=False, run_tables=False, lazy_share=False, gathered=None,
-                          gather_chunks=4, gather_growth=1.0, compact_reqs=0, compact_copy_method="vmem")]
+                          gather_chunks=4, gather_growth=1.0, compact_reqs=0, compact_copy_method="vmem",
+                          sc_bitset=False)]
     stack = dict(group=64, union_cap=16384, listed="reference", share_bits=True)
     jax.clear_caches()
     np.testing.assert_array_equal(_bits(got), _bits(_walk(step, union_alpha=0.9, **stack)))

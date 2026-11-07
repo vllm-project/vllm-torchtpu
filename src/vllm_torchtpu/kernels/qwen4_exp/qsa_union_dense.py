@@ -1829,7 +1829,7 @@ def union_walk_prefill(query, gate, blocks, lengths, table, cache, starts, *, kv
                        k_scale=1.0, v_scale=1.0, group=128, kv_tile=1024, union_cap, min_context,
                        lean, walk_runs=0, union_alpha=0.0, share_bits=False, qk16=False, listed=None,
                        run_tables=False, max_run=8, lazy_share=False, gathered=None, gather_chunks=4,
-                       gather_growth=1.0, compact_reqs=0, compact_copy_method="vmem"):
+                       gather_growth=1.0, compact_reqs=0, compact_copy_method="vmem", sc_bitset=False):
     """D2 union-walk attention for a packed prefill step; ``(gated bf16 output, cache)``.
 
     Same contract as ``block_sparse_gqa_attention`` without ``return_lse``.
@@ -1888,6 +1888,9 @@ def union_walk_prefill(query, gate, blocks, lengths, table, cache, starts, *, kv
     attended; a chunk's gather does not depend on the previous chunk's attention, so the SparseCore gather overlaps
     TensorCore attention (i1s, M: 74% of the gather hidden). i1t (M): 0.755-0.803x the int-2 stack on 8 packed
     steps, bitwise. Bitwise the walk.
+
+    ``sc_bitset``: the plan's per-row bitset built on the SparseCore (``union_bits_plan(bitset="sparsecore")``,
+    the same bits; TPU only) instead of the TensorCore. The rest of the plan is unchanged.
 
     ``qk16``: ``union_walk_kernel``'s single-pass BF16 QK (exact operands;
     power-of-two score scales only). Bitwise identity with the FP32 dot
@@ -1977,7 +1980,7 @@ def union_walk_prefill(query, gate, blocks, lengths, table, cache, starts, *, kv
         aligned_query, aligned_blocks, aligned_lengths, aligned_table = layout
         bits, ubits, usize, vlengths = union_bits_plan(
             aligned_blocks, aligned_lengths, group=group, union_cap=union_cap,
-            groups_cap=groups_cap, ratio=ratio,
+            groups_cap=groups_cap, ratio=ratio, bitset="sparsecore" if sc_bitset else "tensorcore",
         )
         fits = jnp.max(usize) <= union_cap
         if union_alpha:

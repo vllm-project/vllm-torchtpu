@@ -336,6 +336,14 @@ class _NumpyOps:
         return jnp.asarray(ref[index])
 
     @staticmethod
+    def addupdate_scatter(ref, index, x, mask):
+        index, x, mask = np.asarray(index), np.asarray(x), np.asarray(mask)
+        live = index[mask]
+        assert (live >= 0).all() and (live < ref.size).all(), live
+        assert len(set(live.tolist())) == len(live), "a scatter's lanes collide"
+        np.add.at(ref, live, x[mask])
+
+    @staticmethod
     def cumsum(x):
         return jnp.cumsum(x, dtype=jnp.int32)
 
@@ -1305,3 +1313,146 @@ def test_padding_bits_rows_spread_over_word_rows():
     live = np.asarray(ids[1]) >= 0
     np.testing.assert_array_equal(rows[1][live], 1000 + (np.asarray(ids[1])[live] >> 5))
     assert len(set(rows[0].tolist())) == 8
+
+
+# --- the SparseCore selection bitset (union_sc_bits; option A) -------------------------------------------------------
+
+
+def _emulate_bits(sel, bit_lengths, *, ratio, groups, words, group):
+    """``union_sc_bits`` on CPU: every 16-row slab through ``sg.bits_slab`` (output blocks start as garbage)."""
+    sel = np.asarray(sel, np.int32)
+    lengths = np.asarray(bit_lengths, np.int32)
+    tokens, k = sel.shape
+    ops = _NumpyOps()
+    out = np.full(tokens // LANES * words * LANES, GARBAGE, np.int32)
+    for item in range(tokens // LANES):
+        rows = slice(item * LANES, (item + 1) * LANES)
+        block = np.full(words * LANES, GARBAGE, np.int32)
+        sg.bits_slab(ops, sel[rows].reshape(-1).copy(), lengths[rows].copy(), block, k=k, words=words, ratio=ratio,
+                     groups=groups)
+        out[item * words * LANES:(item + 1) * words * LANES] = block
+    return sg.bits_slabs_to_plan(jnp.asarray(out), tokens=tokens, group=group, words=words)
+
+
+@pytest.mark.parametrize("group", [64, 32, 128])
+def test_sc_bits_emulation_is_the_tensorcore_plan(plan_kernels, group):
+    """bits_slab over every slab gives union_bits_plan's TensorCore bits exactly: tails (selected or not), ids past the
+    table's reach, dead rows; output blocks start as garbage, so every word must be written."""
+    from vllm_torchtpu.kernels.qwen4_exp.qsa_union_plan import plan_selections, union_bits_plan
+
+    rng = np.random.default_rng(7 + group)
+    tokens, context, pages, page = 256, 6000, 3, 3200
+    groups_cap = pages * page // RATIO
+    lengths = (context + np.arange(1, tokens + 1)).astype(np.int32)
+    lengths[::7] += 1  # partial tails everywhere
+    lengths[-3:] = 0  # dead rows
+    blocks = np.full((tokens, 512), -1, np.int32)
+    for i, length in enumerate(lengths):
+        complete = int(length) // RATIO
+        if complete:
+            pick = rng.permutation(complete)[:300]
+            blocks[i, :len(pick)] = pick
+    blocks[::5, 400] = groups_cap + 3  # out of the table's reach: dropped
+    blocks[::9, 401] = lengths[::9] // RATIO  # the row's own tail group, already selected
+    blocks, lengths = jnp.asarray(blocks), jnp.asarray(lengths)
+    words = -(-(-(-groups_cap // 32)) // 8) * 8
+    want = union_bits_plan(blocks, lengths, group=group, union_cap=8192, groups_cap=groups_cap)[0]
+    sel, bit_lengths = plan_selections(blocks, lengths, groups_cap=groups_cap, ratio=RATIO)
+    got = _emulate_bits(sel, bit_lengths, ratio=RATIO, groups=groups_cap, words=words, group=group)
+    np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
+    assert np.asarray(want).any()
+
+
+def test_sc_bits_plan_is_the_tensorcore_plan(plan_kernels, monkeypatch):
+    """union_bits_plan(bitset="sparsecore") (the SparseCore build emulated) returns the TensorCore plan's bits, union
+    bits, sizes and virtual lengths bit for bit, and it is what runs."""
+    from vllm_torchtpu.kernels.qwen4_exp import qsa_union_plan as qp
+
+    calls = []
+
+    monkeypatch.setattr(sg, "union_sc_bits", _bits_callback(calls))
+    blocks, lengths = _plan_inputs_blocks(11)
+    groups_cap = 3 * 3200 // RATIO
+    want = qp.union_bits_plan(blocks, lengths, group=64, union_cap=8192, groups_cap=groups_cap)
+    got = qp.union_bits_plan(blocks, lengths, group=64, union_cap=8192, groups_cap=groups_cap, bitset="sparsecore")
+    assert calls and calls[0]["group"] == 64 and calls[0]["groups"] == groups_cap
+    for a, b in zip(got, want):
+        np.testing.assert_array_equal(np.asarray(a), np.asarray(b))
+
+
+def _bits_callback(calls):
+    """A union_sc_bits stand-in usable under jit: the CPU emulation through a host callback."""
+
+    def emulated(sel, bit_lengths, **kw):
+        calls.append(kw)
+        shape = jax.ShapeDtypeStruct((sel.shape[0] // kw["group"], kw["words"], 128), jnp.int32)
+        return jax.pure_callback(lambda a, b: np.asarray(_emulate_bits(a, b, **kw)), shape, sel, bit_lengths)
+
+    return emulated
+
+
+def _plan_inputs_blocks(seed, tokens=256, context=6000, topk=512, picks=40):
+    """The (blocks, lengths) ``_plan_inputs`` builds for ``seed`` (same generator calls)."""
+    rng = np.random.default_rng(seed)
+    lengths = (context + np.arange(1, tokens + 1)).astype(np.int32)
+    lengths[-3:] = 0
+    blocks = np.full((tokens, topk), -1, np.int32)
+    spans = rng.integers(0, context // RATIO - 64, size=64)
+    for i, length in enumerate(lengths):
+        complete = int(length) // RATIO
+        if not complete:
+            continue
+        chosen = set(range(max(0, complete - 48), complete))
+        for s in spans[(i // 8) % 56 : (i // 8) % 56 + 8]:
+            chosen |= set(range(int(s), min(int(s) + 12, complete)))
+        chosen |= set(rng.integers(0, complete, size=picks).tolist())
+        pick = rng.permutation(sorted(chosen))[:topk]
+        blocks[i, : len(pick)] = pick
+    return jnp.asarray(blocks), jnp.asarray(lengths)
+
+
+def test_sc_bits_args_are_checked():
+    sel = jnp.zeros((256, 512), jnp.int32)
+    with pytest.raises(ValueError, match="16-row slabs"):
+        sg.union_sc_bits(sel, jnp.zeros((256,), jnp.int32), ratio=RATIO, groups=1000, words=32, group=8)
+    with pytest.raises(ValueError, match="multiple of 8"):
+        sg.union_sc_bits(sel, jnp.zeros((256,), jnp.int32), ratio=RATIO, groups=1000, words=30, group=64)
+
+
+def test_sc_bits_lower_to_mosaic_for_tpu7x(tpu7x_abstract):
+    """The SparseCore bitset lowers to Mosaic at a realistic size (6,400 rows, 512 selections, 160K context)."""
+    spec = jax.ShapeDtypeStruct
+    fn = jax.jit(functools.partial(sg.union_sc_bits, ratio=RATIO, groups=40960, words=1280, group=64))
+    lowered = fn.trace(spec((6400, 512), jnp.int32), spec((6400,), jnp.int32)).lower(
+        lowering_platforms=("tpu",)).as_text()
+    assert "tpu_custom_call" in lowered
+
+
+@tpu_only
+@pytest.mark.parametrize("group", [64, 128])
+def test_sc_bits_is_the_tensorcore_plan_on_tpu(group):
+    """On the SparseCore: union_bits_plan(bitset="sparsecore") is the TensorCore plan, bit for bit (realistic size)."""
+    from vllm_torchtpu.kernels.qwen4_exp import qsa_union_plan as qp
+
+    blocks, lengths = _plan_inputs_blocks(41 + group, tokens=50 * group, context=60000, picks=16000 // group)
+    groups_cap = 21 * 3200 // RATIO
+    want = qp.union_bits_plan(blocks, lengths, group=group, union_cap=16384, groups_cap=groups_cap)
+    got = qp.union_bits_plan(blocks, lengths, group=group, union_cap=16384, groups_cap=groups_cap, bitset="sparsecore")
+    for a, b in zip(got, want):
+        np.testing.assert_array_equal(np.asarray(a), np.asarray(b))
+
+
+def test_sc_bits_drop_ids_past_groups():
+    """Raw selections (not through plan_selections) with ids past ``groups`` but inside the words: no bit, as in the
+    TensorCore reference (``bsp._scatter_bitset``)."""
+    from vllm_torchtpu.kernels.qwen4_exp import block_sparse_gqa_prefill as bsp
+
+    rng = np.random.default_rng(5)
+    tokens, k, groups, words = 64, 32, 900, 32  # words cover 1,024 groups; ids 900-1,023 are past the reach
+    sel = np.stack([rng.permutation(words * 32)[:k] for _ in range(tokens)]).astype(np.int32)  # distinct per row
+    sel[rng.random(sel.shape) < 0.2] = -1
+    lengths = rng.integers(1, groups * RATIO, size=tokens).astype(np.int32)
+    assert (sel >= groups).any()
+    want = bsp._scatter_bitset(jnp.asarray(sel), jnp.asarray(lengths), ratio=RATIO, groups=groups, words=words)
+    got = _emulate_bits(sel, lengths, ratio=RATIO, groups=groups, words=words, group=64)
+    np.testing.assert_array_equal(np.asarray(got)[:, :, :64].transpose(0, 2, 1).reshape(tokens, words), np.asarray(want))

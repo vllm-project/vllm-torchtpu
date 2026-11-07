@@ -161,6 +161,7 @@ if TYPE_CHECKING:
     VLLM_TPU_QSA_PREFILL_UNION_QK16: bool = False
     VLLM_TPU_QSA_PREFILL_UNION_RUN_TABLES: bool = False
     VLLM_TPU_QSA_PREFILL_UNION_LAZY_SHARE: bool = False
+    VLLM_TPU_QSA_PREFILL_UNION_SC_BITSET: bool = False
     VLLM_TPU_QSA_PREFILL_UNION_GATHERED: str = ""
     VLLM_TPU_QSA_PREFILL_UNION_GATHER_CHUNKS: int = 4
     VLLM_TPU_QSA_PREFILL_UNION_GATHER_GROWTH: float = 1.0
@@ -873,6 +874,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_TPU_QSA_PREFILL_UNION_RUN_TABLES": env_bool("VLLM_TPU_QSA_PREFILL_UNION_RUN_TABLES"),
     # LAZY_SHARE (with SHARE_BITS): walk on group-aligned rows; only a fallback builds the served layout.
     "VLLM_TPU_QSA_PREFILL_UNION_LAZY_SHARE": env_bool("VLLM_TPU_QSA_PREFILL_UNION_LAZY_SHARE"),
+    # SC_BITSET: the union plan's per-row bitset built on the SparseCore (the same bits), off the TensorCore.
+    "VLLM_TPU_QSA_PREFILL_UNION_SC_BITSET": env_bool("VLLM_TPU_QSA_PREFILL_UNION_SC_BITSET"),
     # GATHERED ("", "reference", "sparsecore"; with LISTED): the walk-free kernel on chunked gathered tiles.
     "VLLM_TPU_QSA_PREFILL_UNION_GATHERED": env_str("VLLM_TPU_QSA_PREFILL_UNION_GATHERED", ""),
     "VLLM_TPU_QSA_PREFILL_UNION_GATHER_CHUNKS": env_int("VLLM_TPU_QSA_PREFILL_UNION_GATHER_CHUNKS", 4),

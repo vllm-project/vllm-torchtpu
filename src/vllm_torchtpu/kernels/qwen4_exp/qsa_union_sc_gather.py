@@ -961,6 +961,10 @@ class ScOps:
         return plsc.load_gather(ref, [index])
 
     @staticmethod
+    def addupdate_scatter(ref, index, x, mask):
+        plsc.addupdate_scatter(ref, [index], x, mask=mask)
+
+    @staticmethod
     def cumsum(x):
         return plsc.cumsum(x)
 
@@ -1235,3 +1239,106 @@ def union_sc_run_tables(rows, ids, *, ratio, kv_tile, max_run=8, tiles_per_step=
     )(rows.astype(jnp.int32).reshape(-1), ids.astype(jnp.int32).reshape(-1))
     counts = counts.reshape(plan.total, LANES)[:, :nsizes]
     return counts.reshape(ngroups, tiles, nsizes), entries.reshape(ngroups, cap_ranks)
+
+
+# SparseCore selection bitset (lane_attn.md option A): union_bits_plan's per-row bitset built on the SparseCore, off
+# the TensorCore (i1u2 xprof, M: the TensorCore bitset was 1.15 ms of an 11.85 ms FA call, serial before attention).
+
+
+def bits_slab(ops, sel, lengths, out, *, k, words, ratio, groups):
+    """One 16-row slab's selection bitset, as ``bsp._selection_bitset`` builds it for those rows.
+
+    ``sel`` [16 * k] (the slab's rows of the plan's selections, row-major, invalid -1), ``lengths`` [16] (the plan's
+    bit lengths), ``out`` [words * 16] (word-major, a row per lane). Each row adds bit ``g % 32`` of word ``g // 32``
+    for every selected group ``g`` below ``groups`` and for its partial tail group (``lengths // ratio`` when
+    ``lengths % ratio != 0``). Adds, not ORs, so duplicates give the TensorCore kernel's bits exactly. A scatter's
+    16 lanes are 16 different rows, so its addresses never collide.
+    """
+    lane = ops.lane()
+    zeros = jnp.zeros((LANES,), jnp.int32)
+    log_ratio = _log2(ratio)
+
+    def clear(i):
+        ops.store(out, i * LANES, zeros)
+
+    ops.loop(0, words, unroll=4)(clear)
+
+    def add(value, valid):
+        safe = jnp.maximum(value, 0)
+        word = lax.shift_right_logical(safe, 5)
+        bit = lax.shift_left(jnp.ones_like(safe), jnp.bitwise_and(safe, 31))
+        ops.addupdate_scatter(out, word * LANES + lane, bit, valid)
+
+    def column(j):
+        value = ops.gather(sel, lane * k + j)
+        add(value, (value >= 0) & (value < groups))
+
+    ops.loop(0, k, unroll=2)(column)
+    length = ops.load(lengths, 0)
+    tail = lax.shift_right_logical(jnp.maximum(length, 0), log_ratio)
+    add(tail, (length > 0) & (jnp.bitwise_and(length, ratio - 1) != 0) & (tail < groups))
+
+
+def bits_vmem_bytes(k, words):
+    """VMEM per subcore: double-buffered selection, length and output blocks."""
+    return 2 * 4 * (LANES * k + LANES + words * LANES)
+
+
+def _bits_kernel(sel_hbm, len_hbm, out_hbm, *, items, k, words, ratio, groups, workers):
+    worker = lax.axis_index(("core", "subcore"))
+    per = -(-items // workers)
+    first = worker * per
+    count = jnp.clip(items - first, 0, per)
+
+    def step(sel_b, len_b, out_b):
+        bits_slab(ScOps, sel_b, len_b, out_b, k=k, words=words, ratio=ratio, groups=groups)
+
+    def block(i):
+        return (first + i,)
+
+    @pl.when(count > 0)
+    def _():
+        pltpu.emit_pipeline(
+            step,
+            grid=(count,),
+            in_specs=(pl.BlockSpec((LANES * k,), block), pl.BlockSpec((LANES,), block)),
+            out_specs=pl.BlockSpec((words * LANES,), block),
+        )(sel_hbm, len_hbm, out_hbm)
+
+
+def bits_slabs_to_plan(flat, *, tokens, group, words):
+    """[items * words * 16] slab-major SparseCore output -> ``union_bits_plan``'s ``bits`` [T // group, words, 128]."""
+    nslab = group // LANES
+    bits = flat.reshape(tokens // group, nslab, words, LANES).transpose(0, 2, 1, 3)
+    return jnp.pad(bits.reshape(tokens // group, words, group), ((0, 0), (0, 0), (0, 128 - group)))
+
+
+def union_sc_bits(sel, bit_lengths, *, ratio, groups, words, group):
+    """SparseCore build of ``union_bits_plan``'s ``bits``: int32[T // group, words, 128], bit for bit.
+
+    ``sel`` int32[T, k] (the plan's selections: invalid entries -1, ids below ``groups``), ``bit_lengths`` int32[T]
+    (the plan's lengths, tail dropped where the tail is already selected). One work item per 16-row slab, a
+    contiguous run of items per vector subcore; the slab-major output is regrouped by XLA as the TensorCore plan
+    regroups its own.
+    """
+    tokens, k = sel.shape
+    if group % LANES or 128 % group or tokens % group:
+        raise ValueError(f"the SparseCore bitset needs groups of whole 16-row slabs that split the {tokens} rows")
+    if words % 8 or groups > words * WORD_BITS:
+        raise ValueError("words must be a multiple of 8 covering every group")
+    _log2(ratio)
+    need = bits_vmem_bytes(k, words)
+    if need > _GATHER_VMEM_BUDGET:
+        raise ValueError(f"the SparseCore bitset needs {need} bytes of VMEM per subcore")
+    sc = _sc_geometry()
+    workers = sc.num_cores * sc.num_subcores
+    items = tokens // LANES
+    flat = core_map_helper.kernel(
+        functools.partial(_bits_kernel, items=items, k=k, words=words, ratio=ratio, groups=groups, workers=workers),
+        out_type=jax.ShapeDtypeStruct((items * words * LANES,), jnp.int32),
+        mesh=_mesh(sc),
+        scratch_types=(),
+        compiler_params=pltpu.CompilerParams(disable_bounds_checks=True, needs_layout_passes=False),
+        name=f"qsa_union_sc_bits_k{k}_w{words}",
+    )(sel.astype(jnp.int32).reshape(-1), bit_lengths.astype(jnp.int32))
+    return bits_slabs_to_plan(flat, tokens=tokens, group=group, words=words)
