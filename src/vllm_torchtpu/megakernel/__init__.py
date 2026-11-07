@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:  # eager imports for type checkers and IDEs
     from . import (
+        advisor,
         decls,
         dma,
         errors,
@@ -102,6 +103,7 @@ if TYPE_CHECKING:  # eager imports for type checkers and IDEs
 # (e.g. `runtime.contract`) doesn't import jax through this package.
 _SUBMODULES = frozenset(
     {
+        "advisor",
         "decls",
         "dma",
         "errors",
@@ -204,6 +206,7 @@ __all__ = [
     "Tiles",
     "VLLMAlias",
     "WeightDecl",
+    "advisor",
     "allocate_test_layout",
     "cache_exec",
     "col_chunk",

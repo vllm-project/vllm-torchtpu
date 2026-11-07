@@ -1,0 +1,66 @@
+{
+  "schema": "advisor.presets.deployments.v1",
+  "deployments": {
+    "kimi-k3": {
+      "source": "Kimi-K3 TP32 x DCP32 decode with DSpark 8-row verify, DP2 x TP16 x DCP16 decode at high concurrency, and TP32 x PCP32 x EP16 13-call prefill",
+      "decode": {
+        "tp": 32,
+        "ep": 32,
+        "dcp": 32,
+        "spec_tokens": 7
+      },
+      "prefill": {
+        "tp": 32,
+        "ep": 16,
+        "pcp": 32,
+        "layer_groups": [
+          4,
+          8,
+          8,
+          8,
+          8,
+          8,
+          8,
+          8,
+          8,
+          8,
+          8,
+          8,
+          1
+        ]
+      },
+      "prefill_windows": [
+        2048,
+        8192
+      ],
+      "saturation": {
+        "tp": 16,
+        "ep": 32,
+        "dp": 2,
+        "dcp": 16
+      }
+    },
+    "qwen3.5-397b": {
+      "source": "Qwen3.5-397B 1P1D serving layout: TP8 x DCP4 x EP8 MTP-3 decode, PP8 x TP1 prefill, DP4 x TP2 x EP8 saturation",
+      "decode": {
+        "tp": 8,
+        "ep": 8,
+        "dcp": 4,
+        "spec_tokens": 3
+      },
+      "prefill": {
+        "tp": 1,
+        "ep": 1,
+        "pp": 8
+      },
+      "saturation": {
+        "tp": 2,
+        "ep": 8,
+        "dp": 4
+      },
+      "prefill_windows": [
+        2176
+      ]
+    }
+  }
+}
