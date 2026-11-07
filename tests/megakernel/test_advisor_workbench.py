@@ -134,3 +134,96 @@ def test_custom_chip_spec_preserves_explicit_vmem_usable_bytes(
             chip="custom_xpu",
             chip_spec_path=spec_file,
         )
+
+
+class _UniqueIdCollector:
+    """Collect HTML id attributes from rendered HTML markup."""
+
+    def __init__(self) -> None:
+        """Initialize empty id list."""
+        self.ids: list[str] = []
+
+    def feed_markup(self, html_text: str) -> list[str]:
+        """Extract all id attribute values via regex over static tags."""
+        self.ids = re.findall(r'\bid="([^"]+)"', html_text)
+        return self.ids
+
+
+@pytest.mark.parametrize("model_name", ["qwen3.5-397b", "kimi-k3", "qwen3.8-2.4t"])
+def test_workbench_html_three_pane_landmarks_and_unique_ids(model_name: str) -> None:
+    """Verify 3-pane Fusion Workbench landmarks, unique DOM IDs, and zero CDN links."""
+    sweep_report = advisor.advise_regimes(model_name, "tpu7x")
+    html_text = advisor.render_advisor_html(sweep_report)
+
+    for required_id in (
+        "wb-topbar",
+        "view-workbench",
+        "wb-left-rail",
+        "wb-center-stage",
+        "wb-right-inspector",
+        "wb-vmem-arena-svg",
+        "wb-scope-timeline-svg",
+        "wb-waterfall-svg",
+        "wb-deriv-drawer",
+        "view-audit",
+        "btn-swap-ab",
+        "btn-vs-perop",
+        "btn-reset-all",
+        "wb-ab-status",
+        "ctl-phase",
+        "ctl-batch",
+        "ctl-seq-tokens",
+        "ctl-context",
+        "ctl-vmem",
+        "ctl-dma",
+        "ctl-alias",
+        "ctl-launch-gap",
+        "ctl-coll-hop",
+        "advisor-data",
+    ):
+        assert f'id="{required_id}"' in html_text
+
+    collector = _UniqueIdCollector()
+    all_ids = collector.feed_markup(html_text)
+    assert len(all_ids) == len(set(all_ids))
+    assert "ph === 'decode' ? 1" in html_text
+    assert "phase === 'decode' ? 1" in html_text
+    assert "wbOnHwControl()" in html_text
+    assert "wbOnPhaseChange()" in html_text
+    assert "wbOnSeqChange()" in html_text
+    assert "max-height:164px" in html_text
+    assert "wb-knob-pair" in html_text
+    assert "overflow-wrap:anywhere" in html_text
+    assert 'max="1024"' in html_text
+    assert 'max="8192"' in html_text
+    assert 'step="0.01"' in html_text
+    assert 'step="0.001"' in html_text
+    assert _DENYLIST_RE.search(html_text) is None
+    assert "https://" not in html_text
+    assert 'href="http://' not in html_text
+    assert 'src="http://' not in html_text
+
+
+@pytest.mark.parametrize(
+    ("chip_name", "expected_max_mib"),
+    [
+        ("tpu7x", "62.0"),
+        ("v6e", "126.0"),
+        ("v5p_megacore", "124.0"),
+        ("v4", "14.0"),
+        ("v4_megacore", "28.0"),
+    ],
+)
+def test_workbench_vmem_slider_bounded_by_chip_usable_ceiling(
+    chip_name: str,
+    expected_max_mib: str,
+) -> None:
+    """Verify #ctl-vmem range slider min/max reflects each chip's usable VMEM."""
+    sweep_report = advisor.advise_regimes("qwen3.5-397b", chip_name)
+    html_text = advisor.render_advisor_html(sweep_report)
+    vmem_tag = (
+        f'<input id="ctl-vmem" type="range" min="2.0" max="{expected_max_mib}" '
+        f'step="0.5" value="{expected_max_mib}" oninput="wbOnHwControl()"/>'
+    )
+    assert vmem_tag in html_text
+    assert 'max="96"' not in html_text
