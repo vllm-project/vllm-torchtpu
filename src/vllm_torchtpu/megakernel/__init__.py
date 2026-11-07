@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:  # eager imports for type checkers and IDEs
     from . import (
+        collectives,
         decls,
         dma,
         errors,
@@ -33,6 +34,7 @@ if TYPE_CHECKING:  # eager imports for type checkers and IDEs
         profiles,
         spec,
     )
+    from .collectives import AllReduceRing
     from .dma import pool_alias
     from .errors import (
         MegakernelConfigError,
@@ -106,6 +108,7 @@ if TYPE_CHECKING:  # eager imports for type checkers and IDEs
 # (e.g. `runtime.contract`) doesn't import jax through this package.
 _SUBMODULES = frozenset(
     {
+        "collectives",
         "decls",
         "dma",
         "errors",
@@ -121,6 +124,7 @@ _SUBMODULES = frozenset(
     }
 )
 _LAZY: dict[str, str] = {
+    "AllReduceRing": ".collectives",
     "MegakernelConfigError": ".errors",
     "MegakernelLayoutError": ".errors",
     "DebugOptions": ".exec_spec",
@@ -183,6 +187,7 @@ __all__ = [
     "DEFAULT_PROFILE",
     "POOL_STATE_NAME",
     "REQUIRED",
+    "AllReduceRing",
     "Baseline",
     "CacheExec",
     "CompareMode",
@@ -219,6 +224,7 @@ __all__ = [
     "allocate_test_layout",
     "cache_exec",
     "col_chunk",
+    "collectives",
     "conv_to_raw_page",
     "decls",
     "default_tiles",
