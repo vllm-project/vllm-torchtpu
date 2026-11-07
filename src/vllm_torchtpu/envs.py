@@ -115,6 +115,7 @@ if TYPE_CHECKING:
     TPU_MOE_A2A_ROUTE_CAPACITY: float = 3.0
     TPU_MOE_A2A_DIRECT_COMBINE: bool = False
     TPU_MOE_A2A_OWNER_COMBINE: bool = False
+    TPU_MOE_EXPERT_PLACEMENT: str = ""
     PCP_FA_KERNEL_BLOCK_SIZE: int | None = None
     PCP_GDN_COMM_CHUNK_SIZE: int | None = None
     TPU_PCP_TOPOLOGY_AWARE_MESH: bool = True
@@ -834,6 +835,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # expert's partials; the owner sums them and the engine all-gathers, so the
     # MoE output needs no TP all-reduce.
     "TPU_MOE_A2A_OWNER_COMBINE": env_bool("TPU_MOE_A2A_OWNER_COMBINE"),
+    # Place each named MoE layer's experts by this .npz (logical expert ->
+    # physical slot, e.g. balanced on routing counts; see
+    # layers/core/expert_permutation.py). Unset = linear placement.
+    "TPU_MOE_EXPERT_PLACEMENT": lambda: os.getenv("TPU_MOE_EXPERT_PLACEMENT", ""),
     # Override the PCP full-attention kernel page without changing KV manager pages.
     "PCP_FA_KERNEL_BLOCK_SIZE": env_positive_int_or_none("PCP_FA_KERNEL_BLOCK_SIZE"),
     # GDN stage/projection budget; token ownership still follows PCP interleave.

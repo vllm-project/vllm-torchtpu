@@ -17,6 +17,7 @@ import torch
 import vllm.envs as vllm_envs
 
 import vllm_torchtpu.envs as envs
+from vllm_torchtpu.layers.adapter import expert_permutation
 from vllm_torchtpu.layers.adapter.router_topk import rowmax_select
 from vllm_torchtpu.logger import init_logger
 
@@ -148,7 +149,22 @@ def route(
     present, else our own ``select_experts``. That decision was previously
     duplicated in each quant method; centralizing it here means the simulation
     hook -- and any future routing-path change -- lives in exactly one place.
+
+    For a layer whose experts ``TPU_MOE_EXPERT_PLACEMENT`` placed, the ids
+    come back as the experts' physical slots.
     """
+    topk_weights, topk_ids = _route_logical(
+        layer, hidden_states, router_logits, input_ids
+    )
+    return topk_weights, expert_permutation.to_slots(layer, topk_ids)
+
+
+def _route_logical(
+    layer,
+    hidden_states: torch.Tensor,
+    router_logits: torch.Tensor,
+    input_ids: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
     topk = layer.moe_config.experts_per_token
     simulated = maybe_simulate_routing(hidden_states, router_logits, topk)
     if simulated is not None:
@@ -348,6 +364,7 @@ def register_experts_start_buffer(layer, *, device: torch.device) -> None:
         else None
     )
     layer.register_buffer("_experts_start", buffer, persistent=False)
+    expert_permutation.register_slots_buffer(layer, device=device)
 
 
 def validate_linear_ep_placement(layer) -> None:
