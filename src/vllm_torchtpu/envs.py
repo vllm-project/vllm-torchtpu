@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the tpu-inference project
 
 import functools
+import math
 import os
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
@@ -215,6 +216,8 @@ if TYPE_CHECKING:
     TPU_GC_COLLECT_EVERY: int = 500
     TPU_GC_TRACE: bool = False
     VLLM_TPU_SRPT_MAX_CONSECUTIVE_HOLDS: int = 8
+    VLLM_TPU_DP_PROMPT_BACKLOG: bool = False
+    VLLM_TPU_DP_PROMPT_BACKLOG_MARGIN: float = 1.0
 
 
 def env_with_choices(
@@ -345,6 +348,21 @@ def env_float(env_name: str, default: float) -> Callable[[], float]:
             ) from exc
 
     return _get_float_env
+
+
+def env_nonnegative_float(env_name: str, default: float) -> Callable[[], float]:
+    """Float knob that must be finite and not negative."""
+    parse = env_float(env_name, default)
+
+    def _get_nonnegative_float_env() -> float:
+        value = parse()
+        if not math.isfinite(value) or value < 0:
+            raise ValueError(
+                f"Invalid value '{value}' for {env_name}: must be finite and >= 0."
+            )
+        return value
+
+    return _get_nonnegative_float_env
 
 
 def env_str(env_name: str, default: str) -> Callable[[], str]:
@@ -1383,6 +1401,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # copies it automatically to DP/Ray engine-core actors.
     "VLLM_TPU_SRPT_MAX_CONSECUTIVE_HOLDS": env_nonnegative_int(
         "VLLM_TPU_SRPT_MAX_CONSECUTIVE_HOLDS", 8
+    ),
+    # Data-parallel engine choice (core/dp_prompt_backlog.py): engines
+    # publish their pending prompt tokens, and the front end moves a request
+    # off vLLM's choice when that engine's pending prompt tokens exceed the
+    # least backlogged engine's by more than MARGIN times the prompt.
+    "VLLM_TPU_DP_PROMPT_BACKLOG": env_bool("VLLM_TPU_DP_PROMPT_BACKLOG", default=False),
+    "VLLM_TPU_DP_PROMPT_BACKLOG_MARGIN": env_nonnegative_float(
+        "VLLM_TPU_DP_PROMPT_BACKLOG_MARGIN", 1.0
     ),
 }
 

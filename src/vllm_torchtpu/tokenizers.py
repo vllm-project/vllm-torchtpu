@@ -72,7 +72,11 @@ class TpuDeepseekV4Tokenizer(TokenizerLike):
 
 def register_tokenizers() -> None:
     from vllm_torchtpu import envs
+    from vllm_torchtpu.core.dp_prompt_backlog import (
+        install_if_enabled as install_dp_prompt_backlog,
+    )
 
+    install_dp_prompt_backlog()
     if not envs.TPU_DSV4_HONOR_CONTINUE_FINAL_MESSAGE:
         return
 
