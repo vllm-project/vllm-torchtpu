@@ -29,7 +29,7 @@ def main() -> None:
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     assert args.samples > 0
-    # CI images exclude .git; run_in_docker.sh forwards the image's build SHA.
+    # CI images exclude .git; the pod inherits the build's BUILDKITE_COMMIT.
     git_sha = (
         os.environ.get("BUILDKITE_COMMIT")
         or subprocess.check_output(

@@ -37,7 +37,7 @@ All configs target TPU v7x-8 (TP=8). KV cache is forced to fp8 in `run_benchmark
 
 Configs are shell files in `configs/`. Add your own by copying an existing one.
 
-CI (`.buildkite/pipeline_perf.yml`) runs `check_regression.py` three times against
+CI on main (`.buildkite/pipeline_perf.yml`) runs `check_regression.py` three times against
 the same live server:
 
 - `--mode perf` compares benchmark JSON to `baselines/perf/<config>.baseline.json`
@@ -164,10 +164,10 @@ removed. The ordinary
 C4/C8/C16 decode and smoke/GSM8K steps remain separate. Related: #1794, #1890
 and #1912; #1891 improves priming for the superseded TP8/DP1 C64 recipe.
 
-`run_dsv41_benchmark.sh` mounts checkpoint metadata read-only through
-GCSFuse and prepares scenario-specific LongBench-v2 inputs with the existing
-dataset SHA check. The target and DSpark models stream weights directly from
-the GCS URI; tokenization uses the mount. The wrapper uses the shared CI image's
+`run_dsv41_benchmark.sh` copies the checkpoint's non-weight files (config,
+tokenizer, custom code) to scratch and prepares scenario-specific LongBench-v2
+inputs with the existing dataset SHA check. The target and DSpark models stream
+weights directly from the GCS URI; tokenization uses the local copy. The wrapper uses the shared CI image's
 dependencies and records their versions. `server_steps/run.py` disables
 persistent compilation caches through environment variables and retains the
 compiler's default serialization path.
@@ -181,11 +181,11 @@ logs and `benchmark/fixed/round-*-summary.json` under:
 Each job also publishes a native GitHub Check with global and per-chip
 throughput, the median across formal rounds, benchmark duration and commit.
 Open the PR's **Checks** tab and select **DeepSeek-V4.1 DP8 Prefill throughput**
-or **DeepSeek-V4.1 DP8 Decode throughput**; reading the summary requires no
+or **DeepSeek-V4.1 DP16 Decode throughput**; reading the summary requires no
 Buildkite account. Duration runs from server launch through shutdown and
 excludes CI queueing, image setup and input preparation. Failed commands or
-incomplete results report no valid throughput. The host `post-command` hook
-updates `notify.github_check.output.summary` after Docker copies results back;
+incomplete results report no valid throughput. `dsv41_publish_check.sh` runs in
+the pod after the benchmark and updates `notify.github_check.output.summary`;
 this requires Buildkite's GitHub App integration. Publication errors fail the
 step, while an existing command failure keeps its original exit code.
 
@@ -220,5 +220,5 @@ Results are saved to `benchmark_runs/` (gitignored). Each run creates a director
 |----------|---------|-------------|
 | `PORT` | `8000` | Server port |
 | `BENCHMARK_WARMUP_RUNS` | `0` | Full benchmark passes to discard before writing each gated result |
-| `EVAL_SOFT_FAIL` | `0` | `1` downgrades an eval regression to a `::warning` instead of failing the step. Perf regressions still fail. For a config whose eval baseline is new and whose run-to-run spread is not yet known — prefer it to `soft_fail` on the Buildkite step, which would mask the perf gate too. Forwarded into the container by `run_in_docker.sh` |
+| `EVAL_SOFT_FAIL` | `0` | `1` downgrades an eval regression to a `::warning` instead of failing the step. Perf regressions still fail. For a config whose eval baseline is new and whose run-to-run spread is not yet known — prefer it to `soft_fail` on the Buildkite step, which would mask the perf gate too. Forwarded into the pod by `.buildkite/kubernetes/common.sh` |
 | `RANGE_RATIO_STYLE` (config var) | `symmetric` | How `RANDOM_RANGE_RATIO` is interpreted: `symmetric` = vllm bench serve native `[(1-r)L, (1+r)L]`; `min` = benchmark_serving.py-style `[rL, L]`, translated for vllm bench serve |

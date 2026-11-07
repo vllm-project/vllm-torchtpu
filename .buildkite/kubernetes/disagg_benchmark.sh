@@ -31,7 +31,7 @@ prefill_host=${WORKLOAD_NAME}-prefill-0-0.${WORKLOAD_NAME}
 decode_host=${WORKLOAD_NAME}-decode-0-0.${WORKLOAD_NAME}
 
 echo "Starting proxy server..."
-python3 /root/torchtpu-vllm/examples/disagg/toy_proxy_server.py \
+python3 /workspace/vllm-torchtpu/examples/disagg/toy_proxy_server.py \
   --host 0.0.0.0 \
   --port 10000 \
   --prefiller-host "$prefill_host" \
@@ -100,14 +100,14 @@ publish_result() {
     exit 1
   fi
 
-  if [ "${BQ_UPLOAD:-0}" != "1" ]; then
+  if [ "${BQ_UPLOAD:-0}" != "1" ] || { [ -n "${BUILDKITE_BRANCH:-}" ] && { [ "$BUILDKITE_BRANCH" != "main" ] || [ "${BUILDKITE_PULL_REQUEST:-false}" != "false" ]; }; }; then
     echo "BigQuery upload is off for this lane; $name is an artifact only."
     return 0
   fi
   # Not fatal on its own - the artifact is already up - but
   # the step goes red at the end so a silent gap in the
   # table cannot pass.
-  python3 /root/torchtpu-vllm/.buildkite/scripts/parse_gke_results.py \
+  python3 /workspace/vllm-torchtpu/.buildkite/scripts/parse_gke_results.py \
     "$path" "${record_base}-${name%.json}" \
     || { echo "WARNING: BigQuery insert failed for $name"; publish_failed=1; }
 }

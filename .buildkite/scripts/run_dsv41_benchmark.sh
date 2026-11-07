@@ -1,5 +1,11 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: Apache-2.0
+#
+#   run_dsv41_benchmark.sh <scenario> <gs://bucket/model-prefix> <results-dir>
+#
+# Runs inside a CI pod (or any container of the CI image), from the checkout.
+# decode_dp16 is one host of two; see run_dsv41_dp16_pod.sh, which starts it on
+# both hosts under coordinate_multihost.py.
 set -Eeuo pipefail
 ulimit -c 0
 
@@ -14,9 +20,14 @@ if [[ "$model_uri" != gs://*/* ]]; then
   echo "Expected gs://bucket/model-prefix, got: $model_uri" >&2
   exit 2
 fi
+model_uri="${model_uri%/}"
 
-export TMPDIR=/tmp/tpu_logs/tmp
-export PIP_CACHE_DIR=/tmp/tpu_logs/pip-cache UV_CACHE_DIR=/tmp/tpu_logs/uv-cache
+# Under the step's TMPDIR, which the serving steps point at /dev/shm: run.py
+# puts the compiler scratch here, tens of GB that would evict the pod from its
+# ephemeral storage.
+scratch_root="${TMPDIR:-/tmp}/dsv41-bench"
+export TMPDIR="$scratch_root/tmp"
+export PIP_CACHE_DIR="$scratch_root/pip-cache" UV_CACHE_DIR="$scratch_root/uv-cache"
 export PYTHONUNBUFFERED=1 PYTHONNOUSERSITE=1
 # The shared CI image preloads tcmalloc; heap trimming requires glibc malloc.
 export TPU_RECLAIM_COMPILE_MEMORY=0
@@ -32,14 +43,8 @@ fi
 mkdir -p "$TMPDIR" "$results"
 exec > >(tee "$results/task.log") 2>&1
 scratch=$(mktemp -d "$TMPDIR/dsv41-bench.XXXXXX")
-model_mount="$scratch/model"
-mkdir -p "$model_mount"
-cleanup() {
-  if mountpoint -q "$model_mount"; then
-    umount "$model_mount" || true
-  fi
-}
-trap cleanup EXIT
+# /dev/shm is memory: give it back however this exits.
+trap 'rm -rf "$scratch"' EXIT
 
 uv pip freeze --system > "$results/pip-freeze.txt"
 
@@ -48,12 +53,16 @@ if [[ "$scenario" == decode ]]; then
   bash .buildkite/scripts/run_dsv41_decode_kernel_checks.sh "$results"
 fi
 
-# Input preparation uses the mount; serving streams weights from the GCS URI.
-model_path="${model_uri#gs://}"
-bucket="${model_path%%/*}"
-prefix="${model_path#*/}"
-gcsfuse --implicit-dirs --only-dir "$prefix" -o ro "$bucket" "$model_mount"
-export MODEL_PATH="$model_mount" MODEL_URI="$model_uri"
+# Serving streams weights from the GCS URI. The tokenizer, config.json (whose
+# hash run.py records) and custom code are read from a local directory, so copy
+# the checkpoint's top-level files except the weights. A copy rather than a
+# gcsfuse mount: a pod is not privileged and has no /dev/fuse.
+model_dir="$scratch/model"
+mkdir -p "$model_dir"
+gcloud storage ls "$model_uri/" \
+  | grep -Ev '/$|\.(safetensors|bin|pt|pth|gguf)$' \
+  | gcloud storage cp -I "$model_dir/"
+export MODEL_PATH="$model_dir" MODEL_URI="$model_uri"
 test -f "$MODEL_PATH/config.json"
 
 if [[ "${DSV41_HOST_RANK:-0}" == 0 ]]; then
@@ -69,7 +78,7 @@ fi
 
 if [[ "$scenario" == decode_dp16 ]]; then
   # Do not spend the MP rendezvous timeout preparing 768 long prompts or
-  # pulling the peer image. The host coordinator releases both ready hosts.
+  # pulling the peer image. coordinate_multihost.py releases both ready hosts.
   touch "$results/ready-to-launch"
   deadline=$((SECONDS + 7200))
   until [[ -f "$results/launch-permitted" ]]; do

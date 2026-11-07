@@ -1,5 +1,5 @@
 # Coverage configuration for the unit-test coverage measurement pipeline
-# (.buildkite/pipeline_coverage.yml).
+# (main's .buildkite/pipeline_coverage.yml; epic/dsv41 does not run it).
 #
 # parallel/concurrency/sigterm make coverage follow the engine-core and
 # worker processes vLLM spawns during E2E tests and flush their data on
