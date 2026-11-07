@@ -18,6 +18,10 @@ from __future__ import annotations
 import html
 
 from .workbench_engine import render_workbench_engine_js
+from .workbench_phase import (
+    render_phase_extension_js,
+    render_phase_stage_tab_button,
+)
 
 
 def _esc_attr(value: object) -> str:
@@ -122,7 +126,7 @@ def render_workbench_body(
     vmem_bounds_mib: tuple[float, float] = (62.0, 62.0),
 ) -> str:
     """Render the 3-pane Fusion Workbench HTML shell."""
-    tabs_html = ""
+    tabs_html = render_phase_stage_tab_button()
     vmem_init, vmem_max = vmem_bounds_mib
     m_e, c_e = _esc_attr(model_name), _esc_attr(chip_name)
     l_e, s_e = _esc_attr(layout_label), _esc_attr(mode_source)
@@ -553,4 +557,9 @@ w_step = ${sc.w_step_gb} GB | act = ` +
   currentWorkloadA, regimeToWorkload, syncControlsFromRegime }; initPresets();
   if (REGIMES.length > 0) syncControlsFromRegime(0);
   document.body.classList.add('wb-mode-active');"""
-    return render_workbench_engine_js() + ui_js + "\n  window.wbRenderAll();\n})();\n"
+    return (
+        render_workbench_engine_js()
+        + ui_js
+        + render_phase_extension_js()
+        + "\n  window.wbRenderAll();\n})();\n"
+    )
