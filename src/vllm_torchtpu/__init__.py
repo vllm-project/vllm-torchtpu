@@ -1926,23 +1926,37 @@ def _patch_vllm_same_step_prefix_hits() -> None:
     unwritten and attends over stale KV. Identical prompts admitted together
     (n > 1 sampling, a repeated prompt) then decode garbage.
 
-    Blocks hashed during the current `schedule()` therefore count as misses,
-    and a request that would have hit one recomputes that prefix itself.
-    From the next `schedule()` on they hit normally: the worker runs the
-    steps' forwards in order, so the step that fills a block has run before
-    any later step reads it, with or without async scheduling.
+    Blocks hashed during the current step therefore count as misses, and a
+    request that would have hit one recomputes that prefix itself. From the
+    next step on they hit normally: the worker runs the steps' forwards in
+    order, so the step that fills a block has run before any later step reads
+    it, with or without async scheduling. That relies on blocks being hashed
+    only in the step whose forward fills them, which is what `allocate_slots`
+    does: it caches up to the tokens computed so far plus this step's new
+    tokens, never caches lookahead slots, and defers anything filled later
+    under `delay_cache_blocks`.
+
+    The step boundary is `KVCacheManager.new_step_starts`. `Scheduler.schedule`
+    calls it once per step before it looks anything up or allocates, so `vllm
+    serve` sees no change; and vLLM's Mamba manager already relies on it to
+    keep same-step hits off blocks other requests are filling. Hooking it
+    there, rather than on `Scheduler.schedule`, keeps the guard working for an
+    engine that drives `KVCacheManager` without vLLM's scheduler: it must call
+    `new_step_starts()` each step anyway. Reset only from the scheduler, the
+    set would never be cleared for such an engine, and every block it
+    published would stay unhittable.
     """
     import functools
 
     from vllm.v1.core.block_pool import BlockPool
-    from vllm.v1.core.sched.scheduler import Scheduler
+    from vllm.v1.core.kv_cache_manager import KVCacheManager
 
     if getattr(BlockPool.get_cached_block, "_tpu_same_step_prefix_hit_patch", False):
         return
 
     original_insert_block_hash = BlockPool._insert_block_hash
     original_get_cached_block = BlockPool.get_cached_block
-    original_schedule = Scheduler.schedule
+    original_new_step_starts = KVCacheManager.new_step_starts
 
     def unwritten_block_ids(pool) -> set[int]:
         return pool.__dict__.setdefault("_tpu_unwritten_block_ids", set())
@@ -1966,16 +1980,16 @@ def _patch_vllm_same_step_prefix_hits() -> None:
             return None
         return blocks
 
-    @functools.wraps(original_schedule)
-    def schedule(self, *args, **kwargs):
-        unwritten_block_ids(self.kv_cache_manager.block_pool).clear()
-        return original_schedule(self, *args, **kwargs)
+    @functools.wraps(original_new_step_starts)
+    def new_step_starts(self, *args, **kwargs):
+        unwritten_block_ids(self.block_pool).clear()
+        return original_new_step_starts(self, *args, **kwargs)
 
-    for wrapper in (_insert_block_hash, get_cached_block, schedule):
+    for wrapper in (_insert_block_hash, get_cached_block, new_step_starts):
         wrapper._tpu_same_step_prefix_hit_patch = True
     BlockPool._insert_block_hash = _insert_block_hash
     BlockPool.get_cached_block = get_cached_block
-    Scheduler.schedule = schedule
+    KVCacheManager.new_step_starts = new_step_starts
     logger.info(
         "Applied TPU patch: no prefix-cache hits on blocks the "
         "current step has not written."
