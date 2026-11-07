@@ -132,7 +132,7 @@ under `mtp.` names and implements `mtp_abstract_states()` and `mtp_draft()`.
 The export finds the target weights the draft shares by lowering it once, as
 for the forward.
 
-### DSpark drafting
+### DSpark and DFlash drafting
 
 With `--speculative-config '{"method": "dspark", "num_speculative_tokens": K,
 "model": "<draft checkpoint>"}'` the export loads the separate DSpark draft model
@@ -159,6 +159,13 @@ draft checkpoint is how vLLM loads it, not something the runtime reads.
   Markov head picks the `K` drafts left to right. The block's own keys and
   values land past the accepted tokens, where the next step's context rows
   overwrite them.
+
+A DFlash draft (`"method": "dflash"` with its `model`) is driven exactly like
+a DSpark one, so the artifact declares the runtime protocol, `dspark`: the same
+`aux_hidden_states`, paged KV and block per step. Its block is the anchor and
+`K` mask slots (`1 + K` tokens, `K` fixed by the checkpoint's block size), each
+mask slot's draft is its argmax over the target vocabulary, and it always uses
+the target's embedding and LM head.
 
 These steps are copies of the TPU runner's DFlash / DSpark proposer
 (`draft_model.py`), checked against it by `test_draft_model_parity.py`. The
