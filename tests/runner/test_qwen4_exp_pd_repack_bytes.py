@@ -42,6 +42,10 @@ def _dma(stage, flat):
     return st.dma_row_gather(stage, flat, interpret=True)
 
 
+def _dma_u8(stage, flat):
+    return st.dma_row_gather(stage, flat, interpret=True, out_dtype=jnp.uint8)
+
+
 @pytest.mark.parametrize("n", [1, 63, 64, 130])
 def test_dma_row_gather_is_byte_exact(n):
     u8, carrier = _carrier(3, 64)
@@ -51,6 +55,10 @@ def test_dma_row_gather_is_byte_exact(n):
     want = u8.reshape(-1, 4, 256)[np.asarray(flat)]
     assert got.shape == want.shape
     assert np.array_equal(got, want)
+    # uint8 straight out of the kernel (no XLA FP8 -> uint8 bitcast, which canonicalised NaNs on TPU)
+    got_u8 = _dma_u8(stage, flat)
+    assert got_u8.dtype == jnp.uint8
+    assert np.array_equal(np.asarray(got_u8), want)
 
 
 def _repack_rows(gather):
@@ -66,8 +74,9 @@ def _repack_rows(gather):
     return flat_u8, np.asarray(main), np.asarray(copies), np.asarray(copy_src), np.asarray(main_src)
 
 
-def test_repack_copies_every_byte_with_the_dma_gather():
-    flat_u8, main, copies, copy_src, main_src = _repack_rows(_dma)
+@pytest.mark.parametrize("gather", [_dma, _dma_u8], ids=["fp8_out", "u8_out"])
+def test_repack_copies_every_byte_with_the_dma_gather(gather):
+    flat_u8, main, copies, copy_src, main_src = _repack_rows(gather)
     assert np.array_equal(copies, flat_u8[copy_src])  # compressed keys, rings, PLE: bytes unchanged
     assert np.array_equal(main[:, :2], flat_u8[main_src][:, 0:2])  # main KV head pair (kv_head 0)
 
@@ -87,7 +96,8 @@ def test_default_gather_is_the_dma_kernel_on_tpu(monkeypatch):
 
     def spy(stage, flat, **kw):
         seen["called"] = True
-        return real(stage, flat, interpret=True)
+        seen["out_dtype"] = kw.get("out_dtype")
+        return real(stage, flat, interpret=True, out_dtype=kw.get("out_dtype"))
 
     monkeypatch.setattr(st, "dma_row_gather", spy)
     fn = st.make_repack(
@@ -97,3 +107,32 @@ def test_default_gather_is_the_dma_kernel_on_tpu(monkeypatch):
     _, carrier = _carrier(2, 64)
     fn.rows(carrier, jnp.arange(3, dtype=jnp.int32), jnp.arange(4, dtype=jnp.int32), jnp.zeros((0,), jnp.int32))
     assert seen.get("called")
+    assert seen.get("out_dtype") == jnp.uint8  # the TPU default must return uint8 rows from the kernel
+
+
+def test_tpu_default_path_never_bitcasts_fp8_to_an_integer_in_xla(monkeypatch):
+    """On TPU an XLA FP8 -> uint8 bitcast canonicalised NaNs (nanprobe j-5a9f82e0 step g1). With the TPU default
+    gather, no bitcast_convert_type issued by pd_staging may take an FP8 input (uint8 -> FP8, exact, is allowed)."""
+    monkeypatch.setattr(jax, "default_backend", lambda: "tpu")
+    real_dma = st.dma_row_gather
+    monkeypatch.setattr(st, "dma_row_gather", lambda stage, flat, **kw: real_dma(stage, flat, interpret=True, **kw))
+    real_bc = jax.lax.bitcast_convert_type
+    seen = []
+
+    def spy(x, dtype):
+        import sys
+
+        if sys._getframe(1).f_globals.get("__name__") == st.__name__:
+            seen.append((str(jnp.asarray(x).dtype), str(jnp.dtype(dtype))))
+        return real_bc(x, dtype)
+
+    monkeypatch.setattr(jax.lax, "bitcast_convert_type", spy)
+    fn = st.make_repack(
+        src_block=64, dst_block=64, src_gdn=None, dst_gdn=None, kv_head=0, v_head_start=0,
+        channels=[0], write=lambda pool, rows, page, logical, valid: pool,
+    )
+    u8, carrier = _carrier(2, 64)
+    _, copies, _ = fn.rows(carrier, jnp.arange(5, dtype=jnp.int32), jnp.arange(7, dtype=jnp.int32),
+                           jnp.zeros((0,), jnp.int32))
+    assert np.array_equal(np.asarray(copies), u8.reshape(-1, 4, 256)[:7])
+    assert not [c for c in seen if "float8" in c[0]], seen

@@ -507,8 +507,15 @@ def _untyped(elems, rows: int, itemsize: int):
 _GATHER_MARK: dict = {}
 
 
-def dma_row_gather(stage, flat, *, tile: int = REPACK_TILE, interpret: bool = False):
+def dma_row_gather(stage, flat, *, tile: int = REPACK_TILE, interpret: bool = False, out_dtype=None):
     """``stage[flat]`` (``stage``: ``[rows, 4, 256]`` of the carrier's dtype), byte-exact.
+
+    ``out_dtype`` (same element width, e.g. uint8) returns the rows already reinterpreted: the rows land by DMA
+    in a VMEM scratch block of the carrier dtype, and the block is stored to the ``out_dtype`` output through a
+    Mosaic vreg bitcast (``pltpu.bitcast``), a register reinterpretation. A uint8-typed ``stage`` (the carrier
+    passed as a uint8 view) needs neither.
+    On TPU an XLA FP8 -> uint8 ``bitcast_convert_type`` also canonicalised NaNs (nanprobe j-5a9f82e0 step g1),
+    so the repack must never bitcast FP8 values to an integer type in XLA.
 
     One DMA per row, HBM to the output block: no vector unit and no XLA op ever
     holds the bytes as FP8 values. An XLA gather of the FP8-typed carrier on
@@ -529,17 +536,24 @@ def dma_row_gather(stage, flat, *, tile: int = REPACK_TILE, interpret: bool = Fa
         print("Qwen PD staged repack gather: DMA row gather traced (dtype %s, backend %s)"
               % (stage.dtype, jax.default_backend()), flush=True)
     if n == 0:
-        return jnp.zeros((0, *stage.shape[1:]), stage.dtype)
+        return jnp.zeros((0, *stage.shape[1:]), stage.dtype if out_dtype is None else out_dtype)
     pad = -n % tile
     idx = jnp.pad(flat.astype(jnp.int32), (0, pad))  # padding reads row 0, then dropped
 
-    def kernel(idx_ref, stage_ref, out_ref, semaphore):
+    out_dtype = stage.dtype if out_dtype is None else jnp.dtype(out_dtype)
+    if jnp.dtype(out_dtype).itemsize != jnp.dtype(stage.dtype).itemsize:
+        raise ValueError("dma_row_gather reinterprets rows only between same-width dtypes")
+
+    same = jnp.dtype(out_dtype) == jnp.dtype(stage.dtype)
+
+    def kernel(idx_ref, stage_ref, out_ref, semaphore, *scratch):
         first = pl.program_id(0) * tile
+        dst = out_ref if same else scratch[0]
 
         def row_copy(lane):
             return pltpu.make_async_copy(
                 stage_ref.at[pl.ds(idx_ref[first + lane], 1)],
-                out_ref.at[pl.ds(lane, 1)],
+                dst.at[pl.ds(lane, 1)],
                 semaphore,
             )
 
@@ -547,6 +561,8 @@ def dma_row_gather(stage, flat, *, tile: int = REPACK_TILE, interpret: bool = Fa
             row_copy(lane).start()
         for lane in range(tile):
             row_copy(lane).wait()
+        if not same:
+            out_ref[...] = pltpu.bitcast(scratch[0][...], out_dtype)
 
     out = pl.pallas_call(
         kernel,
@@ -558,9 +574,10 @@ def dma_row_gather(stage, flat, *, tile: int = REPACK_TILE, interpret: bool = Fa
                 (tile, *stage.shape[1:]),
                 lambda program, *_: (program,) + (0,) * (stage.ndim - 1),
             ),
-            scratch_shapes=[pltpu.SemaphoreType.DMA],
+            scratch_shapes=[pltpu.SemaphoreType.DMA]
+            + ([] if same else [pltpu.VMEM((tile, *stage.shape[1:]), stage.dtype)]),
         ),
-        out_shape=jax.ShapeDtypeStruct((n + pad, *stage.shape[1:]), stage.dtype),
+        out_shape=jax.ShapeDtypeStruct((n + pad, *stage.shape[1:]), out_dtype),
         name="qwen4_pd_staged_row_gather",
         **({"interpret": pltpu.InterpretParams()} if interpret else {}),
     )(idx, stage)
@@ -617,7 +634,13 @@ def make_repack(
         return rows[flat]
 
     if gather is None:
-        gather = dma_row_gather if jax.default_backend() == "tpu" else rows_of
+        if jax.default_backend() == "tpu":
+            import functools
+
+            gather = functools.partial(dma_row_gather, out_dtype=jnp.uint8)
+            gather.__name__ = "dma_row_gather_u8"
+        else:
+            gather = rows_of
     print("Qwen PD staged repack gather selected: %s (jax backend %s)"
           % (getattr(gather, "__name__", "custom"), jax.default_backend()), flush=True)
 
@@ -675,7 +698,10 @@ def make_repack(
         stage = staging.reshape(-1, ROW_SUBLANES, ROW_LANES)
 
         def gather_u8(flat):
-            return jax.lax.bitcast_convert_type(gather(stage, flat), jnp.uint8)
+            # The DMA gather returns uint8 rows itself (no FP8 -> uint8 XLA bitcast: it canonicalised NaNs on
+            # TPU); a gather that returns the carrier dtype (the plain CPU gather, tests) is bitcast here.
+            rows = gather(stage, flat)
+            return rows if rows.dtype == jnp.uint8 else jax.lax.bitcast_convert_type(rows, jnp.uint8)
 
         # Main KV: the rank's head pair to slot 0, the other slots zero.
         pair = gather_u8(main_src)[:, 2 * kv_head : 2 * kv_head + 2]
