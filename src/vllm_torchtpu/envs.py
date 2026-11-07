@@ -117,6 +117,7 @@ if TYPE_CHECKING:
     TPU_MOE_TP_DECODE_FAST: bool = True
     TPU_MOE_TP_DECODE_SPLIT_META: bool = True
     TPU_MOE_TP_DECODE_SHARED_META: bool = True
+    USE_MOE_TP_DECODE_NVFP4_KERNEL: bool = False
     RAGGED_GATHER_REDUCE_VERSION: str = "v2"
     USE_PHASED_PROFILER: bool = False
     TPU_KERNEL_ITER_MODE: bool = False
@@ -1195,6 +1196,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     )
     .strip()
     .lower(),
+    # Serve eligible NVFP4 TP or EP x TP (TPU_MOE_EP_TP_SIZE) MoE layers
+    # (sigmoid + correction-bias top-k with renormalization, one FP8 shared
+    # expert, W4A8 block-quantized routed weights) with one op covering
+    # routing, the shared expert, the routed experts and the all-reduce up to
+    # 64 tokens, and the GMM path plus a psum above that
+    # (layers/adapter/moe_tp_decode_nvfp4.py). Also clamps
+    # MOE_REQUANTIZE_BLOCK_SIZE per matrix on non-EP-fused NVFP4 MoE layers
+    # (b13=512, b2=min(512, I_rank): 512/512 at EP2xTP4, 512/256 at TP8) so TP
+    # slices narrower than the block stay unpadded. Needs
+    # TPU_MOE_SKIP_PADDED_TOKENS=1. Remove once the path is the default for
+    # these layers or is folded into moe_tp_decode.
+    "USE_MOE_TP_DECODE_NVFP4_KERNEL": env_bool("USE_MOE_TP_DECODE_NVFP4_KERNEL"),
     # SparseCore MoE gather-reduce (combine) kernel version used by
     # fused_moe_gmm. "v2" is the default; "v1" selects the legacy kernel and
     # "v3" selects the destination-major prototype.
