@@ -167,6 +167,7 @@ from vllm_torchtpu.runner.speculative_decoding_manager import (
     SpecDecodeMetadata,
     SpeculativeDecodingManager,
 )
+from vllm_torchtpu.runner.bucket_stats import BucketStats
 from vllm_torchtpu.runner.stage_timing import RunnerStageTiming
 from vllm_torchtpu.runner.tpu_pooling import (
     StaticPoolerChunkOutput,
@@ -1172,6 +1173,7 @@ class TPUModelRunner(GPUModelRunner):
 
         self._init_phased_profiling()
         self._stage_timing = RunnerStageTiming(profiler_rank)
+        self._bucket_stats = BucketStats(enabled=profiler_rank == 0)
 
     def _init_phased_profiling(self) -> None:
         """Resolves whether USE_PHASED_PROFILER is set and where its traces go.
@@ -3241,6 +3243,10 @@ class TPUModelRunner(GPUModelRunner):
             )
         local_total_num_scheduled_tokens = layout_plan.local_num_tokens
         local_padded_total_num_scheduled_tokens = layout_plan.local_padded_num_tokens
+        if (bucket_stats := getattr(self, "_bucket_stats", None)) is not None:
+            bucket_stats.record(
+                local_padded_total_num_scheduled_tokens, local_total_num_scheduled_tokens
+            )
         local_token_slice = layout_plan.token_slice
         if layout_plan.kind is SequenceLayoutKind.ALL:
             # Zero out to avoid spurious values from prev iteration.
