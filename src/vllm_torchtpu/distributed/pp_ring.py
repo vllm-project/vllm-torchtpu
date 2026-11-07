@@ -89,7 +89,6 @@ from typing import TYPE_CHECKING
 import torch
 from vllm.sequence import IntermediateTensors
 
-from vllm_torchtpu.distributed.pp_push import ring_extra_steps
 from vllm_torchtpu.distributed.pp_wave import HIDDEN_STATES, RESIDUAL, _fence, _flush
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.tracing.annotation import TraceAnnotation
@@ -116,26 +115,13 @@ _MAX_RECEIVES = 7
 
 
 def ring_receives_posted(stages: int, depth: int, carried: int = 1) -> int:
-    """The most receive calls a device of a ``stages``-stage ring of
-    ``depth`` can have posted whose data has not landed, with one forward
-    per step and ``carried`` tensors per forward.
+    """Conservative receive budget including the prepare-ahead input.
 
-    A stage posts a step's receives when it begins the step. The last stage
-    holds no others: it waits for each step's sampled tokens before it
-    takes the next. A stage that sends also holds the receives of at most
-    ``depth`` earlier forwards: end_forward waits while that many are
-    unsent, and a forward is sent only after it has run on the data it
-    received. No stage holds more than the steps the engine keeps in
-    flight: ``stages`` plus ``pp_push.ring_extra_steps``.
-
-    At run time every device holds its posted receives to _MAX_RECEIVES,
-    whether a step queues them ahead or a forward posts its own, so a step
-    of more forwards, or a deeper ring, waits there instead.
+    A stage may retain depth + 1 outgoing forwards and prepare one more
+    input. The last stage can now overlap output completion too, so the
+    former synchronous two-stage shortcut does not apply.
     """
-    if stages < 2:
-        return 0
-    held = 1 if stages == 2 else min(stages + ring_extra_steps(stages), depth + 1)
-    return carried * held
+    return carried * (depth + 2) if stages >= 2 else 0
 
 
 def check_ring_receives(stages: int, depth: int, carried: int = 1) -> None:
@@ -274,6 +260,9 @@ class PPRing:
         # 64 MiB for buckets of 16 to 8192 rows of 2048 bfloat16 values. The
         # KV-cache budget reserves them (hbm_reserve_bytes).
         self._zero_residuals: dict[int, torch.Tensor] = {}
+        from vllm_torchtpu.distributed.pp_prepare_ahead import create
+
+        self._prepare_ahead = create(self)
         logger.info(
             "PP ring: rank %d/%d column %d/%d (global rank %d, from %s, to %s), "
             "depth %d, hand-off carries %s",
@@ -497,6 +486,8 @@ class PPRing:
         the incoming activations (None on the first stage)."""
         self._raise_send_failure()
         self._raise_post_failure()
+        if self._prepare_ahead is not None:
+            self._prepare_ahead.wait()
         self.transfers += 1
         self.forwards += 1
         self._current = self.transfers
@@ -578,13 +569,12 @@ class PPRing:
                 target=self._send_loop, name="pp-ring-send", daemon=True
             )
             self._thread.start()
+        if self._prepare_ahead is not None:
+            self._prepare_ahead.enqueue(transfer, outgoing, fence)
+            return
         with self._cv:
-            # A fence alone holds no outputs and waits for no room.
-            if outgoing and len(self._sends) >= self.depth and self._error is None:
-                with TraceAnnotation("PP:RingFull"):
-                    self._cv.wait_for(
-                        lambda: len(self._sends) < self.depth or self._error is not None
-                    )
+            # Only the last stage queues a fence without outgoing activations.
+            assert not outgoing, "Outgoing activations require prepare-ahead"
             self._raise_send_failure_locked()
             self._sends.append((transfer, outgoing, fence))
             self._cv.notify_all()

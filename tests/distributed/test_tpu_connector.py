@@ -3558,6 +3558,23 @@ class TestTPURaidenConnectorWorker:
         assert ssm.declared_bytes == 4096
         assert ssm.spans == (PoolByteSpan(0, 0, 0, transfer_rank * 4096, 4096),)
 
+        # Geometry reuse is limited to one call: different request block IDs
+        # and a subsequently changed manifest must never reuse stale results.
+        import dataclasses
+
+        from vllm_torchtpu.distributed.kv_transfer.raiden.pool_manifest import (
+            ManifestError,
+        )
+
+        following = worker._stage3_state_pool_spans([19], transfer_rank, 8)
+        assert following == [
+            dataclasses.replace(registration, block_ids=(19,))
+            for registration in registrations
+        ]
+        manifest.pools.append(dataclasses.replace(manifest.pools[0], num_blocks=33))
+        with pytest.raises(ManifestError, match="geometry diverges"):
+            worker._stage3_state_pool_spans([19], transfer_rank, 8)
+
     @pytest.mark.parametrize(
         ("minor_to_major", "kv_layout", "admitted"),
         [
