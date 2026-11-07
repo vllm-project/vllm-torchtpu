@@ -151,6 +151,7 @@ def _owned(width: int, prefix: str) -> MiniMaxM3Cache:
     torch.nn.Module.__init__(cache)
     cache.row_width, cache.dtype, cache.prefix = width, DTYPE, prefix
     cache.token_shards, cache.block_size = 1, BLOCK
+    cache.scales_in_page = False
     return cache
 
 

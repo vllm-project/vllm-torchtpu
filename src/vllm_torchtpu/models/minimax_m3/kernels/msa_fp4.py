@@ -58,10 +58,24 @@ def hadamard(n: int = 128) -> np.ndarray:
     return h
 
 
+def _hadamard_dot(x: jax.Array, h: np.ndarray) -> jax.Array:
+    """``x @ h`` in f32 for a +-1 matrix ``h``. A bf16 `x` takes one bf16 MXU
+    pass with f32 accumulation, which is exact here (every product is a
+    signed bf16 value); only wider inputs need the 6-pass HIGHEST f32 dot."""
+    if x.dtype == jnp.bfloat16:
+        return jnp.dot(
+            x, jnp.asarray(h, jnp.bfloat16), preferred_element_type=jnp.float32
+        )
+    return jnp.dot(
+        x.astype(jnp.float32),
+        jnp.asarray(h, jnp.float32),
+        precision=jax.lax.Precision.HIGHEST,
+    )
+
+
 def rotate_keys(x: jax.Array) -> jax.Array:
     """``x @ H`` over the last (head) axis, for keys and values."""
-    h = jnp.asarray(hadamard(x.shape[-1]), jnp.float32)
-    return jnp.dot(x.astype(jnp.float32), h, precision=jax.lax.Precision.HIGHEST)
+    return _hadamard_dot(x, hadamard(x.shape[-1]))
 
 
 def rotate_queries(x: jax.Array) -> jax.Array:
@@ -73,9 +87,7 @@ def rotate_queries(x: jax.Array) -> jax.Array:
 def unrotate_output(x: jax.Array) -> jax.Array:
     """``x @ H^T / n``: undoes `rotate_keys` on an attention output over rotated values."""
     n = x.shape[-1]
-    h = jnp.asarray(hadamard(n).T, jnp.float32)
-    out = jnp.dot(x.astype(jnp.float32), h, precision=jax.lax.Precision.HIGHEST)
-    return (out * (1.0 / n)).astype(x.dtype)
+    return (_hadamard_dot(x, hadamard(n).T) * (1.0 / n)).astype(x.dtype)
 
 
 def quantize(x: jax.Array) -> tuple[jax.Array, jax.Array]:
