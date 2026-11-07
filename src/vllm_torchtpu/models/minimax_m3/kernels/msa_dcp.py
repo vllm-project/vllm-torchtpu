@@ -172,6 +172,10 @@ def local_candidates(
         raise NotImplementedError(
             f"MSA block selection expects one index head per rank, got {num_heads}."
         )
+    # A decode batch fills one block of its own (sublane-rounded) size, not
+    # `block_rows` rows mostly of padding: the kernel's topk passes scan every
+    # row of the block.
+    block_rows = min(block_rows, max(8, -(-num_tokens // 8) * 8))
     pad = -num_tokens % block_rows
     s = jnp.pad(scores[:, 0], ((0, pad), (0, 0)))
     p = jnp.pad(pos, (0, pad))[:, None]
