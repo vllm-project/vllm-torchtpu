@@ -13,14 +13,19 @@
 # limitations under the License.
 """Shared helpers for the LTX-2 nightly test suite."""
 
+import hashlib
+import json
 import os
 from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
 import torch
+from vllm_omni.diffusion.models.ltx2.ltx2_recipes import LTX_DEFAULT_NEGATIVE_PROMPT
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
+
+from tests_omni.omni_test_utils import compare_video_to_golden
 
 LTX2_MODEL_ID = "Lightricks/LTX-2"
 LTX2_PROMPT = (
@@ -139,3 +144,122 @@ def extract_ltx2_outputs(
         audio=audio,
         sample_rate=sample_rate,
     )
+
+
+# Guidance of the golden request: vllm-omni's default 4-pass guidance (CFG, STG
+# at block 29, modality isolation, rescale), sent explicitly so the golden does
+# not depend on vllm-omni's defaults.
+LTX2_GOLDEN_VARIANT = "full_default"
+LTX2_GOLDEN_EXTRA_ARGS = {
+    "video_cfg_scale": 3.0,
+    "audio_cfg_scale": 7.0,
+    "video_stg_scale": 1.0,
+    "audio_stg_scale": 1.0,
+    "video_modality_scale": 3.0,
+    "audio_modality_scale": 3.0,
+    "video_rescale_scale": 0.7,
+    "audio_rescale_scale": 0.7,
+}
+LTX2_GOLDEN_STEPS = 40
+# Metric -> (min, max), TPU bf16 vs the TPU fp32 golden. Observed (bitwise
+# identical on two images): MAE 0.0221, SSIM 0.9322, mean shift 0.0046,
+# log-spectrogram L1 0.335. MAE, 1 - SSIM and log-spectrogram L1 allow 2x,
+# mean shift +0.015. Caught: 30 steps (SSIM 0.843), another prompt, other seeds.
+LTX2_GOLDEN_LIMITS = {
+    "video_mae": (0.0, 0.045),
+    "video_ssim": (0.864, 1.0),
+    "video_mean_shift": (0.0, 0.020),
+    "video_hf_ratio": (0.70, 1.40),
+    "video_motion_ratio": (0.80, 1.40),
+    "audio_logspec_l1": (0.0, 0.67),
+    "audio_rms_ratio": (0.75, 1.35),
+}
+
+
+def get_ltx2_golden_path() -> Path:
+    """Path of the TPU fp32 golden for ``LTX2_GOLDEN_VARIANT``.
+
+    CI stages gs://tpu-commons-ci/golden/ into $HF_HOME/golden, so the default
+    directory is $HF_HOME/golden/ltx2. Set LTX2_GOLDEN_DIR to override it.
+    """
+    golden_dir = os.environ.get("LTX2_GOLDEN_DIR") or os.path.join(
+        os.environ.get("HF_HOME", "/local_hf_cache"), "golden", "ltx2"
+    )
+    return (
+        Path(golden_dir)
+        / f"ltx2_t2v_{LTX2_GOLDEN_VARIANT}_{LTX2_GOLDEN_STEPS}step_tpu_fp32_golden.npz"
+    )
+
+
+def load_and_verify_ltx2_golden() -> tuple[np.ndarray, np.ndarray]:
+    """Load the golden video and audio and check its metadata matches the test."""
+    with np.load(get_ltx2_golden_path()) as data:
+        video, audio = data["video"], data["audio"]
+        meta = json.loads(str(data["meta"]))
+    expected_meta = {
+        "model_id": LTX2_MODEL_ID,
+        "variant": LTX2_GOLDEN_VARIANT,
+        "omni_extra_args": LTX2_GOLDEN_EXTRA_ARGS,
+        "prompt": LTX2_PROMPT,
+        "negative_prompt_sha256": hashlib.sha256(
+            LTX_DEFAULT_NEGATIVE_PROMPT.encode()
+        ).hexdigest(),
+        "seed": LTX2_DEFAULT_SEED,
+        "generator_device": "cpu",
+        "height": LTX2_DEFAULT_HEIGHT,
+        "width": LTX2_DEFAULT_WIDTH,
+        "num_frames": LTX2_DEFAULT_FRAMES,
+        "frame_rate": LTX2_DEFAULT_FRAME_RATE,
+        "steps": LTX2_GOLDEN_STEPS,
+    }
+    for key, expected_val in expected_meta.items():
+        assert meta[key] == expected_val, (
+            f"Golden was generated with {key}={meta[key]!r}; "
+            f"the test runs {key}={expected_val!r}. Regenerate the golden."
+        )
+    return video, audio
+
+
+def compare_ltx2_to_golden(
+    out: LTX2Outputs, golden_video: np.ndarray, golden_audio: np.ndarray
+) -> dict[str, float]:
+    """Compare LTX-2 outputs with a golden video and audio.
+
+    Video: the shared ``compare_video_to_golden`` metrics, prefixed ``video_``.
+    Audio (float32 [2, N]): mean absolute log-spectrogram difference and RMS
+    ratio. No waveform metrics: bf16 alone drops the waveform cosine vs fp32 to
+    0.70-0.89.
+    """
+    assert out.audio.shape == golden_audio.shape, (out.audio.shape, golden_audio.shape)
+    video_metrics = compare_video_to_golden(out.video, golden_video)
+    logspec_x, logspec_y = (_log_spectrogram(a) for a in (out.audio, golden_audio))
+    rms_x, rms_y = (
+        np.sqrt(np.mean(a.astype(np.float64) ** 2)) for a in (out.audio, golden_audio)
+    )
+    return {
+        **{f"video_{name}": value for name, value in video_metrics.items()},
+        "audio_logspec_l1": float((logspec_x - logspec_y).abs().mean()),
+        "audio_rms_ratio": float(rms_x / max(rms_y, 1e-12)),
+    }
+
+
+def _log_spectrogram(audio: np.ndarray) -> torch.Tensor:
+    """Per-channel log-magnitude STFT (1024-sample Hann window, hop 256)."""
+    spec = torch.stft(
+        torch.from_numpy(audio).double(),
+        n_fft=1024,
+        hop_length=256,
+        window=torch.hann_window(1024, dtype=torch.float64),
+        return_complex=True,
+    )
+    return torch.log(spec.abs() + 1e-5)
+
+
+def assert_ltx2_golden_parity(out: LTX2Outputs) -> None:
+    """Assert every golden metric of ``out`` is within ``LTX2_GOLDEN_LIMITS``."""
+    golden_video, golden_audio = load_and_verify_ltx2_golden()
+    results = compare_ltx2_to_golden(out, golden_video, golden_audio)
+    for name, (low, high) in LTX2_GOLDEN_LIMITS.items():
+        assert low <= results[name] <= high, (
+            f"{name}={results[name]:.4f} outside [{low}, {high}]; metrics: {results}"
+        )
