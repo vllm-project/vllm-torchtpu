@@ -75,6 +75,7 @@ from vllm_torchtpu.layers.adapter.fused_moe import (
 from vllm_torchtpu.layers.adapter.pipelined_fused_moe import (
     enable_pipelined_collective_and_compute,
     pipelined_fused_moe_gmm,
+    sequence_parallel_moe,
 )
 from vllm_torchtpu.layers.adapter.quantization.configs import VllmQuantConfig
 from vllm_torchtpu.layers.core.quant_methods import MXFP4, get_tpu_quant_method
@@ -357,7 +358,8 @@ class VllmMxfp4MoEMethod(TpuMoEActivationMixin, Mxfp4MoEMethod):
             "rhs_quant_dtype": self.rhs_quant_dtype,
         }
         if enable_pipelined_collective_and_compute():
-            return pipelined_fused_moe_gmm(**kwargs)
+            with sequence_parallel_moe(layer):
+                return pipelined_fused_moe_gmm(**kwargs)
 
         return fused_moe_gmm(**kwargs)
 
