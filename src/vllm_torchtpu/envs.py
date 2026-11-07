@@ -127,6 +127,7 @@ if TYPE_CHECKING:
     TPU_MOE_PREFILL_TILE_MIN: int = 0
     TPU_MOE_PREFILL_ROW_TOKENS_RESIDENT_MAX_TOKENS: int = 0
     TPU_MOE_SINGLE_SORT: bool = True
+    TPU_MOE_GMM_ONE_STREAM: bool = False
     USE_MOE_TP_DECODE_KERNEL: bool = False
     TPU_MOE_TP_DECODE_FAST: bool = True
     TPU_MOE_TP_DECODE_SPLIT_META: bool = True
@@ -1398,6 +1399,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Build the MoE permutation, its inverse, and the sorted token ids from
     # one packed sort instead of three. The ragged (counting sort) path ignores it.
     "TPU_MOE_SINGLE_SORT": env_bool("TPU_MOE_SINGLE_SORT", True),
+    # Run the gate·up and down expert matmuls of a MoE layer as one kernel
+    # (gmm_fused_moe) that streams both matmuls' weights as one pipeline and
+    # keeps the activation rows in VMEM, instead of 2 gmm_v2 calls. fp8
+    # weights with one scale per column only; the same bits as gmm_v2.
+    "TPU_MOE_GMM_ONE_STREAM": env_bool("TPU_MOE_GMM_ONE_STREAM", False),
     # Serve eligible tensor-parallel MoE layers (sigmoid + correction-bias
     # top-k with renormalization, one shared expert, FP8 per-channel weights)
     # with one op that also covers the shared expert and the TP all-reduce:
