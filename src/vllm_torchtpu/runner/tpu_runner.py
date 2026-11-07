@@ -483,6 +483,9 @@ def _build_kv_connector_output(
 
 # Smallest output size
 MIN_NUM_SEQS = 8
+# VLLM_TPU_DEFER_LOGPROBS=0 restores the blocking per-step logprob copy in
+# sample_tokens.
+_DEFER_PLAIN_LOGPROBS = envs.VLLM_TPU_DEFER_LOGPROBS
 SAMPLING_EPS = 1e-5
 
 
@@ -4677,6 +4680,11 @@ class TPUModelRunner(GPUModelRunner):
         next_token_indices: dict[int, int] = {}
         next_tokens_tpu_offset = 0
         combined_logprobs: list[Any] = []
+        # Non-spec chunks: bucketed device logprobs and their real row counts,
+        # copied to the host with the sampled tokens and materialized in
+        # AsyncTPUModelRunnerOutput.get_output instead of a blocking .tolists().
+        defer_plain_logprobs = needs_logprobs and _DEFER_PLAIN_LOGPROBS
+        deferred_plain_logprobs: list[tuple[LogprobsTensors, int]] = []
         # Spec step only: per-chunk logprobs, filtered to the accepted tokens
         # once they reach the host (AsyncTPUModelRunnerOutput.get_output).
         spec_logprobs_chunks: list[SpecLogprobsChunk] = []
@@ -4876,7 +4884,10 @@ class TPUModelRunner(GPUModelRunner):
                             next_tokens_tpu_offset + req_idx - cur_start_idx
                         )
                     next_tokens_tpu_offset += selected_token_ids.shape[0]
-                if needs_logprobs:
+                if needs_logprobs and defer_plain_logprobs:
+                    assert logprobs is not None
+                    deferred_plain_logprobs.append((logprobs, num_reqs))
+                elif needs_logprobs:
                     assert logprobs is not None
                     sliced_logprobs = LogprobsTensors(
                         logprobs.logprob_token_ids[:num_reqs],
@@ -4949,6 +4960,7 @@ class TPUModelRunner(GPUModelRunner):
                     combined_selected_tokens,
                     combined_selected_tokens_real_lens,
                     spec_logprobs=spec_logprobs_chunks,
+                    plain_logprobs=deferred_plain_logprobs or None,
                 )
 
         if self.scheduler_config.async_scheduling:

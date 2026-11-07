@@ -188,6 +188,7 @@ if TYPE_CHECKING:
     TORCH_TPU_BASE_PORT: int = 8070
     TORCH_TPU_MP_RENDEZVOUS_PORT: int | None = None
     VLLM_TPU_FAST_TOKEN_SUBSTITUTION: bool = False
+    VLLM_TPU_DEFER_LOGPROBS: bool = True
     VLLM_TPU_FUSED_DRAFT_LOOP: bool = False
     TPU_SAMPLER_TOPK_CANDIDATES: int = 0
     MM_ENCODER_FRAME_CHUNK_PATCH_SIZE: int = 0
@@ -1109,6 +1110,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Enables steady-state fast path token substitution (direct device slicing
     # and persistent index caching) in TPUModelRunner._apply_async_token_substitution.
     "VLLM_TPU_FAST_TOKEN_SUBSTITUTION": env_bool("VLLM_TPU_FAST_TOKEN_SUBSTITUTION"),
+    # Copy the sampled tokens' logprobs of a non-speculative step with the
+    # asynchronous output copy (AsyncTPUModelRunnerOutput.get_output) instead
+    # of a blocking read in TPUModelRunner.sample_tokens. Off restores the
+    # blocking per-step copy. Read once, when tpu_runner is imported.
+    "VLLM_TPU_DEFER_LOGPROBS": env_bool("VLLM_TPU_DEFER_LOGPROBS", default=True),
     # Run an MTP draft's loop steps 1..K-1 as one compiled program
     # (spec_decode/mtp_fused_loop.py). Off by default: one program per step.
     # TODO: support the two cases that still take the per-step loop:

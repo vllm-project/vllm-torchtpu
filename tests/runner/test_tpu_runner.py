@@ -3555,6 +3555,126 @@ def test_skipping_topk_topp_is_exact_at_the_default_sampling_params(dtype):
     assert not (flat_logits.float().gather(-1, skip.long()) >= fifth).all()
 
 
+@pytest.mark.parametrize("max_logprobs", [0, 3])
+def test_sample_tokens_deferred_logprobs_match_the_blocking_copy(
+    monkeypatch, max_logprobs
+):
+    """The sampled-token logprobs that ride the async output copy equal the
+    ones the blocking per-step copy returns (two decode chunks, padded rows,
+    a discarded request), and VLLM_TPU_DEFER_LOGPROBS=0's path is still the
+    blocking one."""
+    monkeypatch.setattr(
+        torch, "tpu", SimpleNamespace(Event=_FakeTpuEvent), raising=False
+    )
+    monkeypatch.setattr(tpu_runner, "synchronize_tensors", lambda *a, **k: None)
+    monkeypatch.setattr(
+        tpu_runner, "has_kv_transfer_group", lambda: False, raising=False
+    )
+    captured = []
+    from_device_chunks = tpu_runner.AsyncTPUCopyState.from_device_chunks
+
+    def capture_from_device_chunks(*args, **kwargs):
+        captured.append(kwargs.get("plain_logprobs"))
+        return from_device_chunks(*args, **kwargs)
+
+    monkeypatch.setattr(
+        tpu_runner.AsyncTPUCopyState,
+        "from_device_chunks",
+        capture_from_device_chunks,
+    )
+    torch.manual_seed(0)
+    logits_list = [torch.randn(4, 64), torch.randn(4, 64)]
+    num_reqs_list = [4, 2]
+    req_ids = [f"r{i}" for i in range(6)]
+
+    def run(defer):
+        monkeypatch.setattr(tpu_runner, "_DEFER_PLAIN_LOGPROBS", defer)
+        scheduler_output = SimpleNamespace(
+            num_scheduled_tokens={r: 1 for r in req_ids},
+            finished_req_ids=set(),
+            has_structured_output_requests=False,
+        )
+        requests = {
+            r: SimpleNamespace(num_computed_tokens=0, num_tokens=1, output_token_ids=[])
+            for r in req_ids
+        }
+        requests["r1"].num_tokens = 2  # A partial prefill: its token is discarded.
+        runner = SimpleNamespace(
+            _pp_wave=None,
+            execute_model_state=SimpleNamespace(
+                scheduler_output=scheduler_output,
+                draft_chunks=[],
+                logits_list=list(logits_list),
+                num_reqs_list=list(num_reqs_list),
+                spec_decode_metadata_list=[None, None],
+                mamba_state_indices_list=None,
+                pooler_output_list=[],
+                top_tokens=False,
+                kv_save_nan_check=None,
+            ),
+            input_batch=SimpleNamespace(
+                max_num_logprobs=max_logprobs,
+                num_reqs=6,
+                req_ids=list(req_ids),
+                req_id_to_index={r: i for i, r in enumerate(req_ids)},
+                all_greedy=False,
+                num_tokens_no_spec=[1] * 6,
+                token_ids_cpu=np.zeros((6, 8), dtype=np.int32),
+                generators={},
+            ),
+            requests=requests,
+            speculative_config=None,
+            scheduler_config=SimpleNamespace(async_scheduling=False),
+            model_config=SimpleNamespace(max_logprobs=max_logprobs),
+            _is_async_drafter=False,
+            _is_dspark_pd_producer=False,
+            _fence_spec_kv_under_token_copy=False,
+            is_pooling_model=False,
+            drafter=SimpleNamespace(),
+            spec_decode_manager=SimpleNamespace(
+                propose_draft_token_ids=lambda **kw: None
+            ),
+            _get_sampling_generator=lambda: None,
+            # Temperature 0: every row samples its argmax, whatever the noise.
+            _build_padded_sampling_params=lambda start, end, logits: (
+                torch.zeros((logits.shape[0], 1)),
+                torch.zeros((logits.shape[0], 1), dtype=torch.int32),
+                torch.ones((logits.shape[0], 1)),
+            ),
+            _sampler_topk_candidates=lambda start, end, grammar: 0,
+            _sampler_applies_topk_topp=lambda: False,
+            _update_mamba_slot_read_offsets=lambda *_args: None,
+            _update_num_xla_graphs=lambda *_args: None,
+            _stage_timing=MagicMock(),
+        )
+        runner._apply_temperature = TPUModelRunner._apply_temperature.__get__(runner)
+        runner.sample_from_logits_func = (
+            TPUModelRunner.sample_from_logits.__wrapped__.__get__(runner)
+        )
+        runner.gather_logprobs = TPUModelRunner.gather_logprobs.__wrapped__.__get__(
+            runner
+        )
+        runner._stage_timing.take_samples.return_value = ([], [])
+        for name in ("maybe_wait_for_kv_save", "get_finished_kv_transfers"):
+            setattr(runner, name, getattr(TPUModelRunner, name).__get__(runner))
+        return TPUModelRunner.sample_tokens(runner, None)
+
+    blocking = run(defer=False)
+    assert captured.pop() is None
+    deferred = run(defer=True)
+    plain = captured.pop()
+    assert [n for _, n in plain] == num_reqs_list
+    assert deferred.sampled_token_ids == blocking.sampled_token_ids
+    assert deferred.sampled_token_ids[1] == []
+    assert blocking.logprobs.logprob_token_ids.shape == (6, max_logprobs + 1)
+    for field in ("logprob_token_ids", "logprobs", "sampled_token_ranks"):
+        actual = getattr(deferred.logprobs, field)
+        expected = getattr(blocking.logprobs, field)
+        assert actual.dtype == expected.dtype, field
+        assert np.array_equal(actual, expected), field
+    assert deferred.logprobs.cu_num_generated_tokens is None
+
+
 def test_runner_sampling_paths_draw_float32_uniform_noise(monkeypatch):
     """All TPUModelRunner call sites into sample_from_logits_func must draw
     uniform random noise `u` in float32 even when logits are bfloat16."""
