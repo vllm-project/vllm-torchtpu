@@ -27,7 +27,7 @@ from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
 from vllm_torchtpu.layers.adapter.sample.rejection_sampler import RejectionSampler
-from vllm_torchtpu.runner import min_tokens
+from vllm_torchtpu.runner import min_tokens, repetition_penalty
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 from vllm_torchtpu.runner.tpu_runner_async_output import (
     AsyncPreResults,
@@ -413,6 +413,7 @@ def test_settle_uses_the_real_rollback_with_a_moved_request():
 def test_update_states_tracks_new_requests_and_forgets_finished_ones():
     runner = object.__new__(TPUModelRunner)
     runner._min_tokens = min_tokens.MinTokensTracker()
+    runner._repetition_penalty = repetition_penalty.RepetitionPenaltyTracker()
     runner._min_tokens.add("old", SamplingParams(min_tokens=3, stop_token_ids=[9]))
     runner._mamba_state_pos, runner._mamba_slot_by_req_id = {}, {}
     runner._free_mamba_slots, runner._mamba_offset_seeded = [], set()
@@ -446,6 +447,7 @@ def test_update_states_keeps_preempted_and_resumed_requests():
     one, so nothing would re-add it."""
     runner = object.__new__(TPUModelRunner)
     runner._min_tokens = min_tokens.MinTokensTracker()
+    runner._repetition_penalty = repetition_penalty.RepetitionPenaltyTracker()
     runner._min_tokens.add("p", SamplingParams(min_tokens=10, stop_token_ids=[9]))
     runner._mamba_state_pos, runner._mamba_slot_by_req_id = {}, {}
     runner._free_mamba_slots, runner._mamba_offset_seeded = [], set()
@@ -552,6 +554,7 @@ def test_top_tokens_step_needs_the_full_logits_below_min_tokens():
     params = SamplingParams(temperature=0)
     runner.requests = {"r0": SimpleNamespace(sampling_params=params)}
     runner._min_tokens = min_tokens.MinTokensTracker()
+    runner._repetition_penalty = repetition_penalty.RepetitionPenaltyTracker()
     batch = SimpleNamespace(
         all_greedy=True,
         max_num_logprobs=None,
@@ -609,6 +612,7 @@ def _plain_step_runner(num_output, logits, req_id="r0"):
         _pp_wave=None,
         _dp_step_other_decode=False,
         _min_tokens=min_tokens.MinTokensTracker(),
+        _repetition_penalty_batch_state=lambda *_args: {},
         speculative_config=None,
         scheduler_config=SimpleNamespace(async_scheduling=False),
         _is_async_drafter=False,

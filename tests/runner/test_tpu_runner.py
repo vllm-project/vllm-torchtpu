@@ -3705,6 +3705,7 @@ def test_runner_sampling_paths_draw_float32_uniform_noise(monkeypatch):
             _fence_spec_kv_under_token_copy=False,
             _min_tokens_batch_state=lambda: {},
             _adaptive_verification=None,
+            _repetition_penalty_batch_state=lambda *_args: {},
             is_pooling_model=False,
             drafter=SimpleNamespace(),
             spec_decode_manager=SimpleNamespace(
