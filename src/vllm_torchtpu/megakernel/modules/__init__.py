@@ -15,11 +15,13 @@
 
 from __future__ import annotations
 
+from .gqa import GQAParams
 from .norm import Embedding, EmbeddingModule, Norm, NormModule
 
 __all__ = [
     "Embedding",
     "EmbeddingModule",
+    "GQAParams",
     "Norm",
     "NormModule",
 ]
