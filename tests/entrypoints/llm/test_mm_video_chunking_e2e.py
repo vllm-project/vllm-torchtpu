@@ -543,11 +543,15 @@ def _assert_bit_exact(
     # " holding"), argmax can flip at that token while the surrounding generation
     # remains semantically equivalent. Allow minor divergence if the prefix
     # before divergence is substantial (>= 6 tokens) and the two sequences are
-    # still >= 80% similar. The synonyms can differ in length (" turning the
-    # pages" vs " reading it"), which shifts every later token, so compare by
-    # sequence alignment rather than position.
+    # still >= 80% similar over their common length. The synonyms can differ in
+    # length (" turning the pages" vs " reading it"), which shifts every later
+    # token, so compare by sequence alignment rather than position.
+    min_len = min(len(reference.token_ids), len(chunked.token_ids))
     token_sim = difflib.SequenceMatcher(
-        None, reference.token_ids, chunked.token_ids, autojunk=False
+        None,
+        reference.token_ids[:min_len],
+        chunked.token_ids[:min_len],
+        autojunk=False,
     ).ratio()
     if first_diff >= 6 and token_sim >= 0.8:
         return
