@@ -36,11 +36,50 @@ takes the cached tokens through the normal admission path, which skips blocks
 hashed in the same step. A cached block holds the same KV the request would
 compute, so every token stays the same.
 
+A long prompt in mid-prefill counts as running, and vLLM schedules running
+requests before waiting ones, so its chunks fill the step and a short waiting
+prompt gets no tokens until that prefill ends. With
+TPU_PREFIX_AWARE_SHORT_PROMPTS=first, each step first reserves budget for
+short waiting prompts (in the same fewest-uncached-first order, while they
+fit the step and a free sequence slot) and for running prefills of such
+prompts, and caps the chunks of running longer prefills at the budget left.
+The step budget, the chunk limit and every request's tokens stay the same;
+only the order of prompt chunks changes.
+
+A prompt is short when its uncached tokens fit in step // chunk full steps
+(_short_prompt_limit says what this bounds and how it was set). The oldest
+running long prefill keeps its full chunk, so a lone long prompt is never
+slowed down and short prompts take tokens only from later long prefills;
+capping every long prefill keeps long prompts in flight longer, and short
+prompts then meet more of them. ShortPrefillFirstScheduler is the standalone
+form of this (core/short_prompts_first.py says when to use which).
+
+A waiting prompt whose first uncached block is a block a running prefill has
+not cached yet would compute that shared prefix a second time. With
+TPU_PREFIX_AWARE_HOLD_SHARED_PREFIX set, such a prompt, short or long, waits
+until the running prefill has cached the block, and with short prompts first
+that prefill keeps its full chunk.
+
+With TPU_PREFIX_AWARE_SHORT_PROMPTS=first-short-step, a step that starts a
+short waiting prompt beside a running long prefill holds fewer tokens: short
+prompts' chunks first, then running long prefills in admission order; in such
+a step the oldest long prefill does not keep its full chunk, so a lone long
+prompt is slowed down too. A step's time grows with its tokens, so the smaller
+step reaches the short prompt's first token sooner. Its size is the smallest
+compiled step size (compilation_config.compile_sizes) that holds one full
+chunk (long_prefill_token_threshold) and is smaller than the full step, so a
+short prompt's first chunk fits and the step pads to no larger size. The chunk
+limit and every request's tokens stay the same; only the order and grouping of
+prompt chunks change.
+
 Enable with:
     --scheduler-cls vllm_torchtpu.core.prefix_aware_scheduler.PrefixAwareScheduler
     VLLM_TPU_FOLLOW_SHARED_PREFIX=1 (optional)
+    TPU_PREFIX_AWARE_SHORT_PROMPTS=first or first-short-step (optional)
+    TPU_PREFIX_AWARE_HOLD_SHARED_PREFIX=1 (optional)
 """
 
+import enum
 import time
 from dataclasses import dataclass
 from itertools import islice
@@ -48,7 +87,6 @@ from typing import cast
 
 from vllm.logger import init_logger
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
-from vllm.v1.core.sched.async_scheduler import AsyncScheduler
 from vllm.v1.core.sched.interface import PauseState
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.request_queue import (
@@ -60,6 +98,11 @@ from vllm.v1.request import Request, RequestStatus
 
 from vllm_torchtpu import envs
 from vllm_torchtpu.block_pool_marks import BLOCKS_HASHED_THIS_STEP
+from vllm_torchtpu.core.short_prompts_first import (
+    ADMITTABLE_STATUSES,
+    ShortPromptsFirstScheduler,
+    fit_short_prompts,
+)
 
 logger = init_logger("vllm." + __name__)
 
@@ -68,6 +111,15 @@ _LOG_EVERY = 1000
 # Priority tiers: lower values admit earlier.
 _TIER_PREEMPTED = 1
 _TIER_NORMAL = 2
+
+
+class ShortPrompts(enum.StrEnum):
+    """TPU_PREFIX_AWARE_SHORT_PROMPTS: how PrefixAwareScheduler serves short
+    prompts beside running long prefills."""
+
+    OFF = "off"
+    FIRST = "first"
+    FIRST_SHORT_STEP = "first-short-step"
 
 
 @dataclass
@@ -88,7 +140,7 @@ class _Rejoin:
     followed_steps: int = 0
 
 
-class PrefixAwareScheduler(AsyncScheduler):
+class PrefixAwareScheduler(ShortPromptsFirstScheduler):
     """Admit ready requests prioritizing fewest uncached prompt tokens."""
 
     #: Lookahead window of ready requests to evaluate for cached prefix length.
@@ -99,7 +151,6 @@ class PrefixAwareScheduler(AsyncScheduler):
         self._paw_n = 0
         self._paw_cold_tokens = 0
         self._paw_prompt_tokens = 0
-        self._paw_scoring_broken = False
 
         self.follow_shared_prefix = envs.VLLM_TPU_FOLLOW_SHARED_PREFIX
         self._followers: dict[str, _Follower] = {}
@@ -109,27 +160,225 @@ class PrefixAwareScheduler(AsyncScheduler):
         self._num_rejoins = 0
         self._num_followed_tokens = 0
 
+        short_prompts = ShortPrompts(envs.TPU_PREFIX_AWARE_SHORT_PROMPTS)
+        self.short_prompt_tokens = (
+            None if short_prompts == ShortPrompts.OFF else self._short_prompt_limit()
+        )
+        self._uncached_admitted: dict[str, int] = {}
+        self.hold_shared_prefix = envs.TPU_PREFIX_AWARE_HOLD_SHARED_PREFIX
+        self.short_step_tokens = (
+            self._smallest_step_below_the_full_step()
+            if short_prompts == ShortPrompts.FIRST_SHORT_STEP
+            else None
+        )
+        self._short_step = False
+        self._carriers: set[str] = set()
+
+        if self.policy != SchedulingPolicy.FCFS and (
+            self.short_prompt_tokens is not None or self.hold_shared_prefix
+        ):
+            raise NotImplementedError(
+                "Short prompts first and the shared-prefix hold need the FCFS "
+                "scheduling policy; use --scheduling-policy fcfs, or turn off "
+                "TPU_PREFIX_AWARE_SHORT_PROMPTS and "
+                "TPU_PREFIX_AWARE_HOLD_SHARED_PREFIX."
+            )
+        if self.hold_shared_prefix and not self.kv_cache_manager.enable_caching:
+            raise NotImplementedError(
+                "TPU_PREFIX_AWARE_HOLD_SHARED_PREFIX needs prefix caching; use "
+                "--enable-prefix-caching or unset it."
+            )
+
         logger.info(
-            "PrefixAwareScheduler ACTIVE (window=%d, follow shared prefix: %s)",
+            "PrefixAwareScheduler ACTIVE (window=%d, follow shared prefix: %s, "
+            "short prompts first: %s; hold shared prefix: %s; short step: %s)",
             self.WINDOW,
             "on" if self.follow_shared_prefix else "off",
+            "off"
+            if self.short_prompt_tokens is None
+            else f"at most {self.short_prompt_tokens} uncached tokens",
+            "on" if self.hold_shared_prefix else "off",
+            "off"
+            if self.short_step_tokens is None
+            else f"{self.short_step_tokens} tokens",
         )
 
+    def _short_prompt_limit(self) -> int:
+        """Uncached tokens up to which a waiting prompt is short: step // chunk
+        full steps of tokens (8,192 at a 4,096-token step and 2,048-token
+        chunks).
+
+        A short prompt computes one chunk per step like any prompt, and in
+        each of its steps it takes up to one chunk from the long prefills
+        after the oldest. One short prompt holds them back by at most
+        (step // chunk) ** 2 steps; short prompts that keep arriving can hold
+        them back longer. The limit trades that delay against the short
+        prompts' first-token time. It scales with the step and chunk sizes;
+        the factor is tuned, on an agent workload of 1k to over 100k-token
+        prompts at 32 concurrent requests, where 8,192 tokens gave a lower
+        TTFT p90 than 4,096 or 16,384. Re-tune it when the prompt-length mix
+        changes. The oldest long prefill keeps its chunk and short prompts
+        take tokens from the others, so a step must hold 2 chunks or more.
+        """
+        step = self.max_num_scheduled_tokens
+        chunk = self.scheduler_config.long_prefill_token_threshold
+        if not 0 < chunk <= step // 2:
+            raise NotImplementedError(
+                "TPU_PREFIX_AWARE_SHORT_PROMPTS needs a step of 2 chunks or "
+                "more; set --long-prefill-token-threshold between 1 and half "
+                f"of the {step}-token step."
+            )
+        return step // chunk * step
+
+    def _smallest_step_below_the_full_step(self) -> int:
+        """The smallest compiled step size that holds one full chunk and is
+        smaller than the full step."""
+        step = self.max_num_scheduled_tokens
+        chunk = self.scheduler_config.long_prefill_token_threshold
+        compile_sizes = self.vllm_config.compilation_config.compile_sizes
+        assert compile_sizes is not None, "the TPU platform sets compile_sizes"
+        sizes = [int(size) for size in compile_sizes if chunk <= int(size) < step]
+        if not sizes:
+            raise NotImplementedError(
+                "TPU_PREFIX_AWARE_SHORT_PROMPTS=first-short-step needs a "
+                f"compiled step size of at least the {chunk}-token chunk and "
+                f"below the {step}-token step; add one to compile_sizes or use "
+                "TPU_PREFIX_AWARE_SHORT_PROMPTS=first."
+            )
+        return min(sizes)
+
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
-        if not self.follow_shared_prefix:
-            return super().schedule(throttle_prefills)
-        self._update_followers()
-        output = super().schedule(throttle_prefills)
-        self._restore_rejoined_places()
+        self._forget_blocks_hashed_last_step()
+        if self.follow_shared_prefix:
+            self._update_followers()
+        held = (
+            self._hold_prompts_behind_running_prefixes()
+            if self.hold_shared_prefix
+            else []
+        )
+        try:
+            if self.short_prompt_tokens is not None:
+                output = self._schedule_short_prompts_first(throttle_prefills)
+            else:
+                output = super().schedule(throttle_prefills)
+        finally:
+            self._carriers = set()
+            for request in reversed(held):
+                self.waiting.prepend_request(request)
+        if self.short_prompt_tokens is not None:
+            self._note_admitted_prompts(output)
+        if self.follow_shared_prefix:
+            self._restore_rejoined_places()
         return output
 
-    def _reserve_prefill_lookahead(
-        self,
-        request: Request,
-        num_computed_tokens: int,
-        num_new_tokens: int,
+    def _forget_blocks_hashed_last_step(self) -> None:
+        """Let this step's lookups hit the blocks the last step hashed.
+
+        The forward of the last step writes them before this step's forward
+        runs. Scheduler.schedule forgets them the same way, but the hold and
+        the short-prompt lookups run before it and would count them as
+        misses.
+        """
+        pool_state = self.kv_cache_manager.block_pool.__dict__
+        hashed_last_step = pool_state.get(BLOCKS_HASHED_THIS_STEP)
+        if hashed_last_step:
+            hashed_last_step.clear()
+
+    def _schedule_short_prompts_first(self, throttle_prefills: bool) -> SchedulerOutput:
+        full_step = self.max_num_scheduled_tokens
+        self._short_step = self._starts_short_step()
+        if self._short_step:
+            assert self.short_step_tokens is not None
+            self.max_num_scheduled_tokens = self.short_step_tokens
+        reserved = self._reserve_for_short_prompts()
+        if reserved:
+            self._running_prefill_budget = max(
+                self.max_num_scheduled_tokens
+                - self._decode_tokens()
+                - reserved
+                - self._full_chunk_tokens(),
+                0,
+            )
+        try:
+            output = super().schedule(throttle_prefills)
+        finally:
+            self.max_num_scheduled_tokens = full_step
+            self._short_step = False
+            self._running_prefill_budget = None
+        return output
+
+    def _starts_short_step(self) -> bool:
+        """Whether this step holds at most the short step's tokens: a long
+        prefill is running and a short waiting prompt's first chunk fits in
+        the short step beside the chunks of running short prefills."""
+        if (
+            self.short_step_tokens is None
+            or self._pause_state != PauseState.UNPAUSED
+            or self._decode_tokens() > 0
+        ):
+            return False
+        prefills = [r for r in self.running if r.is_prefill_chunk]
+        if all(self._is_short_prompt(r) for r in prefills):
+            return False
+        running_short = sum(
+            self._chunk(r.num_tokens - r.num_computed_tokens)
+            for r in prefills
+            if self._is_short_prompt(r)
+        )
+        _, started = fit_short_prompts(
+            ((None, chunk) for chunk in self._short_waiting_chunks()),
+            running_short,
+            self.short_step_tokens,
+            self._free_sequence_slots(),
+        )
+        return bool(started)
+
+    def _hold_prompts_behind_running_prefixes(self) -> list[Request]:
+        """Take out of the waiting queue, for this step, every prompt whose
+        first uncached block a running prefill has still to compute, and mark
+        those prefills as carriers."""
+        if self._pause_state != PauseState.UNPAUSED:
+            return []
+        prefills = [r for r in self.running if r.is_prefill_chunk]
+        if not prefills:
+            return []
+        held = []
+        for request in islice(self.waiting, self.WINDOW):
+            carrier = self._carrier_of(request, prefills)
+            if carrier is not None:
+                held.append(request)
+                self._carriers.add(carrier)
+        if held:
+            waiting = self.waiting
+            assert isinstance(waiting, FCFSRequestQueue)
+            waiting.remove_requests(held)
+        return held
+
+    def _carrier_of(self, request: Request, prefills: list[Request]) -> str | None:
+        """The running prefill whose prompt holds this waiting prompt's first
+        uncached block, which it has not cached yet, or None."""
+        if (
+            request.status != RequestStatus.WAITING
+            or request.num_computed_tokens > 0
+            or request.skip_reading_prefix_cache
+        ):
+            return None
+        index = self._cached_prefix_tokens(request) // self.hash_block_size
+        if index >= len(request.block_hashes):
+            return None
+        block = request.block_hashes[index]
+        for prefill in prefills:
+            if (
+                index < len(prefill.block_hashes)
+                and prefill.block_hashes[index] == block
+            ):
+                return prefill.request_id
+        return None
+
+    def _lookahead_within_cap(
+        self, request: Request, num_computed_tokens: int, num_new_tokens: int
     ) -> int:
-        num_new_tokens = super()._reserve_prefill_lookahead(
+        num_new_tokens = super()._lookahead_within_cap(
             request, num_computed_tokens, num_new_tokens
         )
         if (
@@ -139,6 +388,113 @@ class PrefixAwareScheduler(AsyncScheduler):
         ):
             return 0
         return num_new_tokens
+
+    def _is_capped(self, request: Request) -> bool:
+        """Whether short prompts cap this running long prefill's chunk."""
+        return (
+            super()._is_capped(request)
+            and not self._is_short_prompt(request)
+            and not self._keeps_full_chunk(request)
+        )
+
+    def _keeps_full_chunk(self, request: Request) -> bool:
+        if self._short_step:
+            return False
+        longs = (
+            r
+            for r in self.running
+            if r.is_prefill_chunk and not self._is_short_prompt(r)
+        )
+        return request is next(longs, None) or request.request_id in self._carriers
+
+    def _full_chunk_tokens(self) -> int:
+        return sum(
+            self._chunk(r.num_tokens - r.num_computed_tokens)
+            for r in self.running
+            if r.is_prefill_chunk
+            and not self._is_short_prompt(r)
+            and self._keeps_full_chunk(r)
+        )
+
+    def _reserve_for_short_prompts(self) -> int:
+        """Tokens this step keeps for short prompts' chunks while a longer
+        prefill is running, or 0 when no running prefill is longer. The oldest
+        running long prefill keeps its full chunk, so short prompts take budget
+        only from the long prefills admitted after it."""
+        if self._pause_state != PauseState.UNPAUSED:
+            return 0
+        prefills = [r for r in self.running if r.is_prefill_chunk]
+        if all(self._is_short_prompt(r) for r in prefills):
+            return 0
+        free_tokens = (
+            self.max_num_scheduled_tokens
+            - self._decode_tokens()
+            - self._full_chunk_tokens()
+        )
+        if free_tokens <= 0:
+            return 0
+        reserved = sum(
+            self._chunk(r.num_tokens - r.num_computed_tokens)
+            for r in prefills
+            if self._is_short_prompt(r)
+        )
+        reserved, _ = fit_short_prompts(
+            ((None, chunk) for chunk in self._short_waiting_chunks()),
+            reserved,
+            free_tokens,
+            self._free_sequence_slots(),
+        )
+        return min(reserved, free_tokens)
+
+    def _short_waiting_chunks(self) -> list[int]:
+        """First-step chunks of the short waiting prompts, in admission order."""
+        limit = self.short_prompt_tokens
+        assert limit is not None
+        ranked = []
+        for request in islice(self.waiting, self.WINDOW):
+            uncached = self._uncached_waiting_tokens(request)
+            if uncached is not None and 0 < uncached <= limit:
+                ranked.append((self._rank_key(request, uncached), uncached))
+        ranked.sort(key=lambda item: item[0])
+        return [self._chunk(uncached) for _, uncached in ranked]
+
+    def _uncached_waiting_tokens(self, request: Request) -> int | None:
+        """Prompt tokens a waiting request still has to prefill, or None when
+        the waiting loop would not schedule it now. A first lookup is kept for
+        the request's stay in the waiting queue."""
+        if request.status not in ADMITTABLE_STATUSES:
+            return None
+        if request.num_computed_tokens > 0:
+            return request.num_tokens - request.num_computed_tokens
+        return self._uncached_once(request)
+
+    def _is_short_prompt(self, request: Request) -> bool:
+        """Whether this running prefill had at most short_prompt_tokens
+        uncached tokens when it was first admitted."""
+        uncached = self._uncached_admitted.get(request.request_id)
+        assert uncached is not None, f"{request.request_id} was never admitted"
+        assert self.short_prompt_tokens is not None
+        return uncached <= self.short_prompt_tokens
+
+    def _chunk(self, tokens: int) -> int:
+        return min(tokens, self.scheduler_config.long_prefill_token_threshold)
+
+    def _note_admitted_prompts(self, output: SchedulerOutput) -> None:
+        """Record each newly admitted prompt's uncached tokens. A preempted
+        request keeps its entry, so it is resumed (with the V2 model runner,
+        among the new requests) as short or long as it was admitted."""
+        for new in output.scheduled_new_reqs:
+            request = self.requests[new.req_id]
+            self._uncached_admitted.setdefault(
+                new.req_id, request.num_prompt_tokens - new.num_computed_tokens
+            )
+            self._uncached_by_request.pop(new.req_id, None)
+        self._forget_requests_that_left()
+
+    def _forget_requests_that_left(self) -> None:
+        for request_id in self._uncached_admitted.keys() - self.requests.keys():
+            del self._uncached_admitted[request_id]
+        self._forget_requests_that_left_waiting()
 
     def _get_local_prefix_cache_hit(
         self, request: Request
@@ -282,33 +638,27 @@ class PrefixAwareScheduler(AsyncScheduler):
         )
 
     def _prefix_warmth(self, request: Request) -> int:
-        """Prompt tokens of ``request`` resident in the KV cache."""
-        kvm = self.kv_cache_manager
-        if not kvm.enable_caching or request.skip_reading_prefix_cache:
+        """Prompt tokens of ``request`` resident in the KV cache: those it has
+        computed, or else its cached prefix."""
+        if not self.kv_cache_manager.prefix_cache_lookup_enabled(request):
             return 0
         if request.num_computed_tokens > 0:
             return request.num_computed_tokens
-        try:
-            result = kvm.coordinator.find_longest_cache_hit(
-                request.block_hashes, max(request.num_tokens - 1, 0)
-            )
-            return int(result[1])
-        except Exception:
-            if not self._paw_scoring_broken:
-                self._paw_scoring_broken = True
-                logger.exception(
-                    "PrefixAwareScheduler: warmth scoring failed; falling back to FCFS."
-                )
-            return 0
+        return self._cached_prefix_tokens(request)
 
     def _rank_and_warmth(
         self, request: Request
     ) -> tuple[tuple[int, float, float], int]:
         """Return (sort_key, warmth). Lower sort_key is admitted first."""
         warmth = self._prefix_warmth(request)
-        cold_tokens = float(request.num_tokens - warmth)
+        return self._rank_key(request, request.num_tokens - warmth), warmth
+
+    @staticmethod
+    def _rank_key(request: Request, uncached: float) -> tuple[int, float, float]:
+        """Admission order: preempted requests first, then fewest uncached
+        tokens, then arrival."""
         tier = _TIER_PREEMPTED if request.num_preemptions > 0 else _TIER_NORMAL
-        return (tier, cold_tokens, request.arrival_time), warmth
+        return (tier, float(uncached), request.arrival_time)
 
     def _select_waiting_queue_for_scheduling(self) -> RequestQueue | None:
         queue = super()._select_waiting_queue_for_scheduling()
