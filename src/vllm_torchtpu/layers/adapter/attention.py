@@ -1509,12 +1509,22 @@ class PallasAttentionBackendImpl(AttentionImpl):
         else:
             q_len, q_compute_dim = query.shape
 
-        if key is None:
+        key_is_placeholder = key is None
+        if key_is_placeholder:
             # KV-shared layers get no K/V from vLLM. The kernel runs with
             # skip_kv_update and reads all K/V from the target layer's cache,
             # so zeros only fill the operand slots.
             assert value is None and self.kv_sharing_target_layer_name is not None
-            key = query.new_zeros(q_len, self.num_kv_heads * self.head_size)
+            kv_placeholder_dtype = (
+                self.kv_cache_quantized_dtype
+                if self.kv_cache_quantized_dtype is not None
+                else query.dtype
+            )
+            key = torch.zeros(
+                (q_len, self.num_kv_heads * self.head_size),
+                dtype=kv_placeholder_dtype,
+                device=query.device,
+            )
             value = key
 
         if key.dim() == 3:
@@ -1526,9 +1536,10 @@ class PallasAttentionBackendImpl(AttentionImpl):
         assert q_compute_dim == self.head_size * self.num_heads
         assert k_compute_dim == self.head_size * self.num_kv_heads
 
+        same_kv = value is key
         query = query.view(q_len, self.num_heads, self.head_size)
         key = key.view(k_len, self.num_kv_heads, self.head_size)
-        value = value.view(k_len, self.num_kv_heads, self.head_size)
+        value = key if same_kv else value.view(k_len, self.num_kv_heads, self.head_size)
         assert key.shape == value.shape
 
         # A layer whose head_size is narrower than the page it writes into —
@@ -1564,8 +1575,8 @@ class PallasAttentionBackendImpl(AttentionImpl):
         if pad_size:
             query = torch.nn.functional.pad(query, (0, pad_size))
             key = torch.nn.functional.pad(key, (0, pad_size))
-            value = torch.nn.functional.pad(value, (0, pad_size))
-        if self.kv_cache_quantized_dtype:
+            value = key if same_kv else torch.nn.functional.pad(value, (0, pad_size))
+        if self.kv_cache_quantized_dtype and not key_is_placeholder:
             k_scale_value = layer._k_scale_float
             v_scale_value = layer._v_scale_float
             if k_scale_value == 0.0 or v_scale_value == 0.0:
