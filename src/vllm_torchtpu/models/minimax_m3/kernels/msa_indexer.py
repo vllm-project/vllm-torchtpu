@@ -326,7 +326,13 @@ def _class_scores(
         ),
         max_tiles - 1,
     )
-    work_group = w - (group_ends[work_tile] - groups_per_tile[work_tile])
+    # A one-hot lookup: gathers from these max_tiles-entry tables lowered to
+    # compare/select chains over max_tiles HBM scalar operands each, ~0.6 us
+    # per operand (20 us for this fusion in the decode twin, j-b312f26a).
+    in_tile = work_tile[:, None] == jnp.arange(max_tiles, dtype=jnp.int32)[None, :]
+    work_group = w - jnp.sum(
+        jnp.where(in_tile, (group_ends - groups_per_tile)[None, :], 0), axis=1
+    )
     work = (work_tile << _TILE_SHIFT) | jnp.clip(work_group, 0, _GROUP_MASK)
 
     def page_block(g):
