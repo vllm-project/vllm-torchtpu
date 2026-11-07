@@ -62,7 +62,15 @@ def test_invalid_spec_fields_raise(kw: dict[str, Any], match: str) -> None:
 
 
 @pytest.mark.parametrize(
-    "field", ["chips", "tp_sizes", "parallelism", "features", "decline_codes"]
+    "field",
+    [
+        "chips",
+        "tp_sizes",
+        "parallelism",
+        "features",
+        "decline_codes",
+        "top_level_options",
+    ],
 )
 def test_bare_string_for_a_tuple_field_raises(field: str) -> None:
     # "TPU7x" must not split into characters ("T" would match every TPU).
@@ -70,6 +78,12 @@ def test_bare_string_for_a_tuple_field_raises(field: str) -> None:
         _spec(**{field: "TPU7x"})
     with pytest.raises(errors.MegakernelConfigError, match=f"{field} must be a tuple"):
         _spec(**{field: 4})
+
+
+def test_top_level_options_is_a_frozenset_of_names() -> None:
+    spec = _spec(top_level_options=["mode", "buckets"])
+    assert spec.top_level_options == frozenset({"mode", "buckets"})
+    assert _spec().top_level_options == frozenset()
 
 
 def test_tuple_fields_keep_whole_items() -> None:

@@ -15,10 +15,11 @@
 
 from __future__ import annotations
 
-from .errors import MegakernelUnsupported
+from .errors import MegakernelPluginError, MegakernelUnsupported
 from .hooks import StepContext, is_suppressed, suppressed
 
 __all__ = [
+    "MegakernelPluginError",
     "MegakernelUnsupported",
     "StepContext",
     "is_suppressed",

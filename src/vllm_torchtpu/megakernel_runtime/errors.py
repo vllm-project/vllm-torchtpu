@@ -17,9 +17,13 @@ library's `megakernel.errors.MegakernelConfigError`."""
 from __future__ import annotations
 
 
+class MegakernelPluginError(RuntimeError):
+    """A plugin can't be fingerprinted (e.g. `plugin_source_unhashable:<why>`)."""
+
+
 class MegakernelUnsupported(RuntimeError):
     """A framework feature was used that a serving megakernel can't follow
     (e.g. `weight_update`: the packed weights would go stale)."""
 
 
-__all__ = ["MegakernelUnsupported"]
+__all__ = ["MegakernelPluginError", "MegakernelUnsupported"]
