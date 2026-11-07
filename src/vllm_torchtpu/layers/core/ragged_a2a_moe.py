@@ -278,30 +278,33 @@ def route_plan(
     ``gathered_ids`` [D, S, K]: the group's expert ids by DP position;
     ``in_row`` [D, S]: the receive row of token ``t`` of member ``s`` when it
     reaches this rank (rows hold the sources in DP order, each in its token
-    order); ``dests(gathered_ids)`` -> (member [D, S], row [D, S, K], number
-    of members, receive rows): where each route's output goes.
-    ``gathered_weights`` [D, S, K] (skipping padded tokens): a route with
-    weight 0 is not computed.
+    order); ``dests(ids)`` with ``ids`` [K, D, S] -> (member [D, S], row
+    [K, D, S], number of members, receive rows): where each route's output
+    goes. ``gathered_weights`` [D, S, K] (skipping padded tokens): a route
+    with weight 0 is not computed.
 
     Returns (token_sorted, group_sizes, dest_member, dest_row) over the first
     ``routes`` routes in (local expert, source, token, k) order. A receive row
     holds the tokens of its source in token order, so this is the order of
     sorting the received rows' routes by (local expert, row, k), as
     `fused_moe_scatter` does. ``fits`` false: no local routes.
+
+    The routes are laid out k-major ([K, D, S], tokens along the minor axis),
+    where per-route work over K is cheap; the sort does not depend on it.
     """
     num_members, num_tokens, topk = gathered_ids.shape
-    local = gathered_ids - experts_start[0]
+    ids = jnp.moveaxis(gathered_ids, -1, 0)
+    local = ids - experts_start[0]
     valid = (local >= 0) & (local < local_num_experts) & fits
     if gathered_weights is not None:
-        weights = jnp.where(jnp.isfinite(gathered_weights), gathered_weights, 0)
+        weights = jnp.moveaxis(gathered_weights, -1, 0)
+        weights = jnp.where(jnp.isfinite(weights), weights, 0)
         valid = valid & (weights != 0)
-    member, row, total_members, recv_rows = dests(gathered_ids)
+    member, row, total_members, recv_rows = dests(ids)
     expert = jnp.where(valid, local, local_num_experts)
-    member = jnp.broadcast_to(member[:, :, None], gathered_ids.shape)
-    group_sizes = jax.nn.one_hot(
-        jnp.where(valid, local, 0), local_num_experts, dtype=jnp.int32
-    ) * valid[..., None].astype(jnp.int32)
-    group_sizes = group_sizes.sum(axis=(0, 1, 2))
+    member = jnp.broadcast_to(member[None], ids.shape)
+    experts = jnp.arange(local_num_experts, dtype=jnp.int32)[:, None, None, None]
+    group_sizes = (expert[None] == experts).sum(axis=(1, 2, 3), dtype=jnp.int32)
     expert_bits = local_num_experts.bit_length()
     token_bits = max(1, (rows - 1).bit_length())
     member_bits = max(1, (total_members - 1).bit_length())
@@ -312,7 +315,7 @@ def route_plan(
         # token's routes name distinct experts, so the computed routes' keys
         # are distinct and in (local expert, row) order; the receive row
         # stands for (source, token).
-        token = jnp.where(valid, in_row[:, :, None], 0)
+        token = jnp.where(valid, in_row[None], 0)
         key = (
             jnp.left_shift(expert, token_bits + dest_bits)
             | jnp.left_shift(token, dest_bits)
@@ -330,10 +333,17 @@ def route_plan(
     num_routes = num_members * num_tokens * topk
     route_bits = max(1, (num_routes - 1).bit_length())
     assert expert_bits + route_bits < 32
-    route = jnp.arange(num_routes, dtype=jnp.int32).reshape(gathered_ids.shape)
+    # Route index in (source, token, k) order.
+    route = (
+        jnp.arange(num_members * num_tokens, dtype=jnp.int32).reshape(
+            1, num_members, num_tokens
+        )
+        * topk
+        + jnp.arange(topk, dtype=jnp.int32)[:, None, None]
+    )
     key = jnp.left_shift(expert, route_bits) | route
     # Routes that are not computed read a zero row.
-    token = jnp.where(valid, in_row[:, :, None], rows)
+    token = jnp.where(valid, in_row[None], rows)
     if max(1, rows.bit_length()) + dest_bits < 32:
         payload = (
             jnp.left_shift(token, dest_bits) | jnp.left_shift(member, row_bits) | row
@@ -353,35 +363,46 @@ def route_plan(
     return token_sorted, group_sizes, dest_member, dest_row
 
 
-def direct_dests(gathered_ids, *, member_index, dp_size):
-    """`route_plan` destinations of `_direct_combine`: token ``t`` of member
-    ``s`` gets its routes back at rows ``route_order * S + t`` of ``s``."""
-    _, num_tokens, topk = gathered_ids.shape
+def _rank_along_k(key):
+    """[K, ...] distinct keys per route column -> each key's rank among its
+    column (the number of smaller keys), the reduction running over the major
+    axis."""
+    return (key[:, None] < key[None, :]).sum(axis=0, dtype=jnp.int32)
+
+
+def direct_dests(ids, *, member_index, dp_size):
+    """`route_plan` destinations of `_direct_combine` (``ids`` [K, D, S]):
+    token ``t`` of member ``s`` gets its routes back at rows ``route_order *
+    S + t`` of ``s``."""
+    topk, _, num_tokens = ids.shape
     t = jnp.arange(num_tokens, dtype=jnp.int32)
     member = jnp.broadcast_to(
-        jnp.arange(dp_size, dtype=jnp.int32)[:, None], gathered_ids.shape[:2]
+        jnp.arange(dp_size, dtype=jnp.int32)[:, None], ids.shape[1:]
     )
-    in_group = member_index(gathered_ids) < dp_size
-    row = route_order(gathered_ids, in_group) * num_tokens + t[None, :, None]
+    # route_order, k-major: routes of this TP rank's group first by expert id,
+    # then the others by k (keys distinct per token).
+    k = jnp.arange(topk, dtype=jnp.int32)[:, None, None]
+    key = jnp.where(member_index(ids) < dp_size, ids, (1 << 20) + k)
+    row = _rank_along_k(key) * num_tokens + t
     return member, row, dp_size, num_tokens * topk
 
 
-def owner_dests(gathered_ids, *, dp_size, tp_size, local_num_experts):
-    """`route_plan` destinations of `_owner_combine`: token ``t`` of member
-    ``s`` is owned by TP rank ``t // blk`` of engine ``s``, which gets its
-    routes at rows ``owner_order * blk + t % blk``."""
-    _, num_tokens, topk = gathered_ids.shape
+def owner_dests(ids, *, dp_size, tp_size, local_num_experts):
+    """`route_plan` destinations of `_owner_combine` (``ids`` [K, D, S]):
+    token ``t`` of member ``s`` is owned by TP rank ``t // blk`` of engine
+    ``s``, which gets its routes at rows ``owner_order * blk + t % blk``."""
+    topk, _, num_tokens = ids.shape
     blk = -(-num_tokens // tp_size)
     s = jnp.arange(dp_size, dtype=jnp.int32)[:, None]
     t = jnp.arange(num_tokens, dtype=jnp.int32)[None, :]
     member = s * tp_size + t // blk
-    order = owner_order(
-        gathered_ids,
-        dp_size=dp_size,
-        tp_size=tp_size,
-        local_num_experts=local_num_experts,
+    # owner_order, k-major.
+    valid, key, _, _ = owner_route_key(
+        ids, dp_size=dp_size, tp_size=tp_size, local_num_experts=local_num_experts
     )
-    row = order * blk + (t % blk)[:, :, None]
+    k = jnp.arange(topk, dtype=jnp.int32)[:, None, None]
+    order = _rank_along_k(jnp.where(valid, key, (1 << 24) + k))
+    row = order * blk + t % blk
     return member, row, dp_size * tp_size, blk * topk
 
 
