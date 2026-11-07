@@ -689,6 +689,31 @@ def fp8_prefill_block_sizes(
         bq = utils.align_to(max(bq // 2, bq_c), bq_c)
 
 
+def schedule_size_multiplier(cfgs: configs.RpaConfigs, num_q_tokens: int) -> int:
+    """HBM schedule multiplier large enough for every step of one call.
+
+    A query block visits at most cdiv(kv_len, bkv_sz) KV blocks, and each
+    sequence adds at most one partial query block, so a call has at most
+    (cdiv(num_q_tokens, bq_sz) + num_seqs) * kv_blocks steps over
+    `batch_size` lanes. The schedule kernel flushes whole chunks of
+    `max_steps_ub` steps, so one more chunk covers the last flush. Never
+    returns less than the configured multiplier.
+    """
+    kv_blocks = pl.cdiv(cfgs.serve.pages_per_seq * cfgs.serve.page_size, cfgs.bkv_sz)
+    if cfgs.model.sliding_window is not None:
+        kv_blocks = min(
+            kv_blocks, pl.cdiv(cfgs.model.sliding_window + cfgs.bq_sz, cfgs.bkv_sz) + 1
+        )
+    q_blocks = pl.cdiv(num_q_tokens, cfgs.bq_sz) + cfgs.serve.num_seqs
+    if cfgs.mode == configs.RpaCase.DECODE:
+        q_blocks = min(
+            q_blocks,
+            cfgs.serve.num_seqs * pl.cdiv(cfgs.serve.decode_query_size, cfgs.bq_sz),
+        )
+    steps = pl.cdiv(q_blocks * kv_blocks, cfgs.batch_size) + cfgs.max_steps_ub
+    return max(cfgs.max_schedule_size_multiplier, pl.cdiv(steps, cfgs.max_steps_ub))
+
+
 def fp8_prefill_vmem_bytes(cfgs: configs.RpaConfigs) -> int:
     """VMEM of the mixed kernel's pipeline buffers and softmax scratch."""
 
@@ -1152,6 +1177,14 @@ def ragged_paged_attention(
             vmem_limit_bytes=vmem_limit_bytes,
             mode=mode,
         )
+        multiplier = schedule_size_multiplier(cfgs, queries.shape[0])
+        if multiplier != cfgs.max_schedule_size_multiplier:
+            cfgs = dataclasses.replace(
+                cfgs,
+                serve=dataclasses.replace(
+                    cfgs.serve, max_schedule_size_multiplier=multiplier
+                ),
+            )
         cfgs.validate_inputs(
             q=queries,
             k=keys,
