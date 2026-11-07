@@ -210,6 +210,15 @@
 # Tools, Linting & Benchmark Scripts
 /src/vllm_torchtpu/tools/ @theminghuang @yunyao-gg @yiw-wang @maxwillzq @QiliangCui @Nanfang-Li
 /tools/ @theminghuang @yunyao-gg @yiw-wang @maxwillzq @QiliangCui @Nanfang-Li
+# Preserve ownership of tools relocated from examples.
+/tools/disagg/ @bvrockwell @RobMulla @qizzzh @maxwillzq @Nanfang-Li @wdhongtw
+/tools/tpu_profiling.py @bvrockwell @RobMulla @qizzzh @maxwillzq @Nanfang-Li @wdhongtw
+/tools/run_profiling_suite.sh @bvrockwell @RobMulla @qizzzh @maxwillzq @Nanfang-Li @wdhongtw
+/tools/prefix_cache_correctness.py @bvrockwell @RobMulla @qizzzh @maxwillzq @Nanfang-Li @wdhongtw
+/tools/hybrid_pool_e2e.py @bvrockwell @RobMulla @qizzzh @maxwillzq @Nanfang-Li @wdhongtw
+/tools/workload_script.sh @bvrockwell @RobMulla @qizzzh @maxwillzq @Nanfang-Li @wdhongtw
+/tools/run_dsv4_inference.py @bvrockwell @RobMulla @qizzzh @maxwillzq @Nanfang-Li @wdhongtw
+/tools/offline_inference.py @bvrockwell @RobMulla @qizzzh @maxwillzq @Nanfang-Li @wdhongtw
 /scripts/ @theminghuang @yunyao-gg @yiw-wang @maxwillzq @QiliangCui @Nanfang-Li
 /tests/tools/ @theminghuang @yunyao-gg @yiw-wang @maxwillzq @QiliangCui @Nanfang-Li
 /tests/scripts/ @theminghuang @yunyao-gg @yiw-wang @maxwillzq @QiliangCui @Nanfang-Li

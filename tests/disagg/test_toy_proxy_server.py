@@ -19,10 +19,7 @@ from pathlib import Path
 
 def _load_toy_proxy_server():
     path = (
-        Path(__file__).resolve().parents[2]
-        / "examples"
-        / "disagg"
-        / "toy_proxy_server.py"
+        Path(__file__).resolve().parents[2] / "tools" / "disagg" / "toy_proxy_server.py"
     )
     spec = importlib.util.spec_from_file_location("toy_proxy_server", path)
     assert spec is not None
