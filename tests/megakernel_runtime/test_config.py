@@ -69,6 +69,9 @@ def mod_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 def _write(path: Path, text: str) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(textwrap.dedent(text), encoding="utf-8")
+    # A module written next to one already imported from the same directory is
+    # invisible to the cached path finder until the caches are dropped.
+    importlib.invalidate_caches()
     return path
 
 
