@@ -13,6 +13,8 @@
 # limitations under the License.
 """MiniMax Sparse Attention layer on TPU."""
 
+import functools
+
 import torch
 from torch import nn
 from transformers import PreTrainedConfig
@@ -116,6 +118,19 @@ def shard_index_cache_enabled(vllm_config: VllmConfig) -> bool:
     if not isinstance(enabled, bool):
         raise ValueError(f"additional_config.{SHARD_INDEX_CACHE_KEY} must be a bool")
     return enabled
+
+
+@functools.cache
+def _dcp_rank_tensor(rank: int, device: str) -> torch.Tensor:
+    """One ``int32[1]`` rank tensor shared by every MSA layer's buffer.
+
+    Dynamo lifts a tensor shared by several modules as one graph input, so
+    XLA can CSE the rank-dependent step metadata (KV-write runs, indexer work
+    list) across layers instead of recomputing it in every layer. The sharing
+    holds because the model is built on the target device: a later
+    ``Module.to`` would give each layer its own copy again.
+    """
+    return torch.tensor([rank], dtype=torch.int32, device=device)
 
 
 def cache_dtype(cache_config: CacheConfig | None) -> torch.dtype:
@@ -297,7 +312,7 @@ class MiniMaxM3SparseAttention(nn.Module):
             # every DCP rank compiles the same program (see get_msa_dcp_op).
             self.register_buffer(
                 "dcp_rank",
-                torch.tensor([get_dcp_rank()], dtype=torch.int32),
+                _dcp_rank_tensor(get_dcp_rank(), str(torch.get_default_device())),
                 persistent=False,
             )
         elif self.index_shards > 1:
