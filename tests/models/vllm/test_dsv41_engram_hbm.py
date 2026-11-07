@@ -79,9 +79,7 @@ def _check_lookup():
     hashes[3, 1, 5] = -1  # a dead n-gram reads as zeros
 
     mesh = Mesh(np.array(jax.devices()[:WORLD]), (engram_hbm._AXIS,))
-    lookup = engram_hbm.make_lookup(
-        mesh, TOKENS, COLS, PART_COLS, rows, DIM, BLOCK, NODE, meta
-    )
+    lookup = engram_hbm.make_lookup(mesh, COLS, PART_COLS, rows, DIM, BLOCK, NODE, meta)
     out = lookup(
         jnp.asarray(hashes.reshape(WORLD * TOKENS, COLS)),
         jnp.asarray(table),
@@ -172,82 +170,85 @@ def test_upload_table_pads_with_invalid_scale():
     assert (table_scales[3:] == 255).all()
 
 
-def _hbm_engram(monkeypatch, *, capacity: int = 8):
-    """A host-offload Engram with HBM state preset and the lookup op faked."""
+def _hbm_engram():
+    """A host-offload Engram served from HBM, with its lookup op faked."""
     from vllm_torchtpu.models.vllm.deepseek_v41.common import engram as common
 
-    seen: list[torch.Tensor] = []
+    seen: list[tuple] = []
 
-    def build_lookup_op(layer, num_tokens, n_cols, part_cols, rows, dim, *rest):
-        def op(hashes, table, scales, rank):
-            seen.append(hashes)
-            # Row t of token t, so slicing back to local tokens is visible.
-            return (
-                torch.arange(num_tokens, dtype=torch.bfloat16)
-                .reshape(-1, 1, 1)
-                .expand(num_tokens, part_cols * NODE, dim)
-                .clone()
-            )
+    def op(hashes, table, scales, rank):
+        seen.append((hashes, table, scales, rank))
+        # Row t carries t, so slicing and column trimming are visible.
+        num_tokens = hashes.shape[0]
+        return (
+            torch.arange(num_tokens, dtype=torch.bfloat16)
+            .reshape(-1, 1, 1)
+            .expand(num_tokens, COLS + 2, DIM)
+            .clone()
+        )
 
-        return op
-
-    monkeypatch.setattr(engram_hbm, "build_lookup_op", build_lookup_op)
-    monkeypatch.setattr("vllm_torchtpu.distributed.ep_mesh.ep_mesh_index", lambda: 0)
     e = common.Engram.__new__(common.Engram)
     torch.nn.Module.__init__(e)
     e.layer_hash_index = 0
     e.embed_tokens = SimpleNamespace(
-        n_hash_cols=COLS, part_n_hash_cols=PART_COLS, block_size=BLOCK, dp_size=NODE
+        n_hash_cols=COLS,
+        part_n_hash_cols=PART_COLS,
+        block_size=BLOCK,
+        dp_size=NODE,
+        tp_size=1,
     )
+    e.use_sequence_parallel = False
     e._staged_raw = torch.zeros(1)
-    e._host_raw = torch.zeros((capacity, COLS, DIM), dtype=torch.uint8)
-    e._active_upload = None
     e._uses_hbm = True
-    e._hbm_rank = None
-    e._hbm_rows = None
-    table = torch.zeros((HEAD_ROWS, DIM), dtype=torch.uint8)
-    e._hbm_table = (table, table, (), HEAD_ROWS)
+    e._hbm_op = op
+    e.register_buffer(
+        "_hbm_raw_table", torch.zeros((HEAD_ROWS, DIM), dtype=torch.uint8)
+    )
+    e.register_buffer("_hbm_scale_table", torch.ones((HEAD_ROWS, 2), dtype=torch.uint8))
+    e.register_buffer("_hbm_rank_index", torch.tensor([[3]], dtype=torch.int32))
     return e, seen
 
 
-def _dp_sizes(monkeypatch, sizes):
-    import vllm.forward_context as fc
-
-    monkeypatch.setattr(fc, "is_forward_context_available", lambda: True)
-    monkeypatch.setattr(
-        fc,
-        "get_forward_context",
-        lambda: SimpleNamespace(
-            additional_kwargs={"tpu_num_tokens_across_dp_cpu": tuple(sizes)}
-        ),
-    )
+def test_hbm_prepare_embeddings_leaves_the_lookup_to_the_stage():
+    e, seen = _hbm_engram()
+    e.prepare_embeddings(torch.ones((4, COLS), dtype=torch.int32))
+    assert not seen  # no device program is launched outside the stage
 
 
-def test_hbm_prepare_pads_to_dp_max_and_slices_back(monkeypatch):
-    from vllm.models.deepseek_v41.common.engram import DEAD_ID
-
-    e, seen = _hbm_engram(monkeypatch)
-    _dp_sizes(monkeypatch, (3, 5, 1, 2))
-    e._hbm_prepare(torch.ones((3, COLS), dtype=torch.int32))
-    (hashes,) = seen
-    assert hashes.shape == (5, COLS)  # every rank runs the DP-wide max
-    assert (hashes[:3] == 1).all() and (hashes[3:] == DEAD_ID).all()
-    rows = e._ready_rows(3)
-    assert rows.shape == (3, COLS, DIM)
-    assert torch.equal(rows[:, 0, 0], torch.arange(3, dtype=torch.bfloat16))
+def test_hbm_embed_looks_up_the_stage_hashes():
+    e, seen = _hbm_engram()
+    hashes = torch.arange(5 * COLS, dtype=torch.int64).reshape(5, COLS)
+    rows = e.embed(hashes)
+    ((got, table, scales, rank),) = seen
+    assert got.dtype == torch.int32 and torch.equal(got, hashes.to(torch.int32))
+    assert table is e._hbm_raw_table and scales is e._hbm_scale_table
+    assert rank is e._hbm_rank_index
+    assert rows.shape == (5, COLS, DIM)  # trimmed to the real hash columns
+    assert torch.equal(rows[:, 0, 0], torch.arange(5, dtype=torch.bfloat16))
 
 
-def test_hbm_prepare_idle_rank_still_joins_lookup(monkeypatch):
-    e, seen = _hbm_engram(monkeypatch)
-    _dp_sizes(monkeypatch, (0, 4, 0, 0))
-    e._hbm_prepare(torch.ones((0, COLS), dtype=torch.int32))
-    assert seen[0].shape == (4, COLS)  # the collective needs every rank
-    assert e._ready_rows(0).shape == (0, COLS, DIM)
+def test_hbm_embed_rows_follow_the_hash_token_dim():
+    # One op serves every bucket: the token dim comes from the hashes.
+    e, seen = _hbm_engram()
+    for tokens in (1, 3, 8):
+        assert (
+            e.embed(torch.zeros((tokens, COLS), dtype=torch.int32)).shape[0] == tokens
+        )
+    assert [h.shape[0] for h, *_ in seen] == [1, 3, 8]
 
-    seen.clear()
-    _dp_sizes(monkeypatch, (0, 0, 0, 0))
-    e._hbm_prepare(torch.ones((0, COLS), dtype=torch.int32))
-    assert not seen and e._ready_rows(0).shape == (0, COLS, DIM)
+
+def test_stage_hashes_only_with_hbm_layers():
+    from vllm_torchtpu.models.vllm.deepseek_v41.v2.model import DeepseekV41Model
+
+    model = DeepseekV41Model.__new__(DeepseekV41Model)
+    torch.nn.Module.__init__(model)
+    hashes = torch.ones((4, 2, COLS), dtype=torch.int64)
+    model._hbm_engram_cached = False
+    assert model._hbm_stage_hashes(hashes, torch.zeros(4)) is None
+    model._hbm_engram_cached = True
+    assert model._hbm_stage_hashes(None, torch.zeros(4)) is None
+    staged = model._hbm_stage_hashes(hashes, torch.zeros(4))
+    assert staged.dtype == torch.int32 and torch.equal(staged, hashes.to(torch.int32))
 
 
 def test_step_hashes_gathers_host_layers_once():

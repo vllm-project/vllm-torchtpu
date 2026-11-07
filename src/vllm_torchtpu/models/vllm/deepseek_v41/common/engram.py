@@ -911,7 +911,8 @@ def _gather_engram_rows(rows, dim):
 class Engram(upstream.Engram):
     """Inherit projections, staging and collective head gather from upstream."""
 
-    embed = bind_device_ops(
+    # Upstream's embed with the TPU row gather; ``embed`` adds the HBM path.
+    _device_embed = bind_device_ops(
         upstream.Engram.embed, tensor_model_parallel_all_gather=_gather_engram_rows
     )
 
@@ -957,8 +958,9 @@ class Engram(upstream.Engram):
         # TPU_DEEPSEEK_V41_ENGRAM_HBM state (``engram_hbm``), set on first use.
         self._uses_hbm: bool | None = None
         self._hbm_table: tuple | None = None
-        self._hbm_rank: torch.Tensor | None = None
-        self._hbm_rows: torch.Tensor | None = None
+        # The lookup op, built with the table (it builds the EP mesh, a
+        # collective that must not run first inside a trace).
+        self._hbm_op = None
         if getattr(self.embed_tokens, "host_offload", False):
             # Host DRAM tables: the host only gathers raw FP8 bytes and scale
             # bytes (a memcpy-bound index_select); dequantization runs inside
@@ -1072,7 +1074,7 @@ class Engram(upstream.Engram):
             super().prepare_embeddings(hash_ids)
             return
         if self.uses_hbm_lookup:
-            self._hbm_prepare(hash_ids)
+            # Rows are looked up inside the compiled stage (``embed``).
             return
         dp_size = self.embed_tokens.dp_size
         num_tokens, remainder = divmod(hash_ids.shape[0], dp_size)
@@ -1148,7 +1150,9 @@ class Engram(upstream.Engram):
         (table, scales, shard metadata, rows per rank)."""
         if self._hbm_table is not None:
             return self._hbm_table
-        from .engram_hbm import gather_shard_meta, upload_table
+        from vllm_torchtpu.distributed.ep_mesh import ep_mesh_index
+
+        from .engram_hbm import build_lookup_op, gather_shard_meta, upload_table
 
         emb = self.embed_tokens
         weight, scales = emb._storage()
@@ -1162,52 +1166,19 @@ class Engram(upstream.Engram):
         device = cast(torch.Tensor, self._staged_raw).device
         table, table_scales = upload_table(weight, scales, device, rows)
         self._hbm_table = (table, table_scales, meta, rows)
-        logger.info(
-            "[DSV41] Engram HBM table: layer=%d rows/rank=%d bytes=%d",
-            self.layer_hash_index,
-            rows,
-            table.numel() + table_scales.numel(),
+        # Buffers, so the compiled stage that calls the lookup takes them as
+        # module state; non-persistent, so they never enter the state dict.
+        self.register_buffer("_hbm_raw_table", table, persistent=False)
+        self.register_buffer("_hbm_scale_table", table_scales, persistent=False)
+        self.register_buffer(
+            "_hbm_rank_index",
+            torch.tensor(
+                [[cast(int, ep_mesh_index())]], dtype=torch.int32, device=device
+            ),
+            persistent=False,
         )
-        return self._hbm_table
-
-    def _hbm_prepare(self, hash_ids: torch.Tensor) -> None:
-        """Look this rank's tokens up on device; ``_ready_rows`` returns them."""
-        from vllm.forward_context import (
-            get_forward_context,
-            is_forward_context_available,
-        )
-        from vllm.models.deepseek_v41.common.engram import DEAD_ID
-
-        from vllm_torchtpu.distributed.ep_mesh import ep_mesh_index
-
-        from .engram_hbm import build_lookup_op
-
-        table, table_scales, meta, rows = self.upload_hbm_table()
-        emb = self.embed_tokens
-        num_tokens = int(hash_ids.shape[0])
-        if is_forward_context_available():
-            sizes = get_forward_context().additional_kwargs.get(
-                "tpu_num_tokens_across_dp_cpu"
-            )
-            if sizes:
-                num_tokens = max(num_tokens, *(int(s) for s in sizes))
-        if num_tokens > self._host_raw.shape[0]:
-            raise ValueError("Engram hashes exceed the configured staging capacity")
-        if not num_tokens:
-            cols = int(emb.part_n_hash_cols) * int(emb.dp_size)
-            self._active_upload = None
-            self._hbm_rows = table.new_empty(
-                (0, cols, int(self._host_raw.shape[-1])), dtype=torch.bfloat16
-            )
-            return
-        if hash_ids.shape[0] < num_tokens:
-            pad = hash_ids.new_full(
-                (num_tokens - hash_ids.shape[0], *hash_ids.shape[1:]), DEAD_ID
-            )
-            hash_ids = torch.cat((hash_ids, pad), dim=0)
-        op = build_lookup_op(
+        self._hbm_op = build_lookup_op(
             int(self.layer_hash_index),
-            num_tokens,
             int(emb.n_hash_cols),
             int(emb.part_n_hash_cols),
             rows,
@@ -1216,28 +1187,42 @@ class Engram(upstream.Engram):
             int(emb.dp_size),
             meta,
         )
-        if self._hbm_rank is None:
-            self._hbm_rank = torch.tensor(
-                [[cast(int, ep_mesh_index())]], dtype=torch.int32, device=table.device
-            )
-        rank = self._hbm_rank
-        hashes = hash_ids.to(device=table.device, dtype=torch.int32)
-        embedded = op(hashes, table, table_scales, rank)
-        if num_tokens >= 2:
-            torch._dynamo.mark_dynamic(embedded, 0)
-        self._active_upload = None
-        self._hbm_rows = embedded
+        logger.info(
+            "[DSV41] Engram HBM table: layer=%d rows/rank=%d bytes=%d",
+            self.layer_hash_index,
+            rows,
+            table.numel() + table_scales.numel(),
+        )
+        return self._hbm_table
+
+    def _hbm_lookup(self, hash_ids: torch.Tensor) -> torch.Tensor:
+        """This step's rows, looked up from HBM inside the compiled stage.
+
+        ``hash_ids`` [T, C] are the real device hashes the model passes into
+        the stage. Under DP+EP lockstep every rank runs the same token bucket,
+        so ``T`` is already the DP-wide size the lookup's collectives need.
+        """
+        assert self._hbm_op is not None, "upload_hbm_table() runs at load"
+        return self._hbm_op(
+            hash_ids.to(torch.int32),
+            self._hbm_raw_table,
+            self._hbm_scale_table,
+            self._hbm_rank_index,
+        )
+
+    def _rows_for(self, hash_ids: torch.Tensor) -> torch.Tensor:
+        if self._staged_raw is not None and self.uses_hbm_lookup:
+            return self._hbm_lookup(hash_ids)
+        return self._ready_rows(hash_ids.shape[0])
+
+    def embed(self, hash_ids: torch.Tensor) -> torch.Tensor:
+        if self._staged_raw is not None and self.uses_hbm_lookup:
+            return self._hbm_lookup(hash_ids)[:, : self.embed_tokens.n_hash_cols]
+        return self._device_embed(hash_ids)
 
     def _ready_rows(self, num_tokens: int) -> torch.Tensor:
         if self._staged_raw is None:
             return super()._ready_rows(num_tokens)
-        # Set only by ``_hbm_prepare``; a plain attribute read keeps the gating
-        # out of the compiled stage. getattr: the packed-scale parity test calls
-        # this on a bare holder without HBM state.
-        hbm_rows = getattr(self, "_hbm_rows", None)
-        if hbm_rows is not None:
-            # The device lookup already dequantized this step's rows.
-            return hbm_rows[:num_tokens]
         local_num_tokens = num_tokens
         assert self._active_raw is not None
         num_tokens = self._active_raw.shape[0]
@@ -1264,7 +1249,7 @@ class Engram(upstream.Engram):
         token-axis all-gather yields ``[tp, T_pad, local_heads, dim]`` whose
         rank-major head order matches upstream's non-SP ``dim=1`` gather.
         """
-        rows = self._ready_rows(hash_ids.shape[0])
+        rows = self._rows_for(hash_ids)
         cols = self.embed_tokens.n_hash_cols
         tp = self.embed_tokens.tp_size
         num_tokens = rows.shape[0]

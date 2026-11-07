@@ -444,7 +444,9 @@ class TestStageClasses:
             1, 2, intermediate_tensors=3, inputs_embeds=4, lookback_token_ids=5
         )
         assert res == "full_res"
-        owner._forward_stage.assert_called_once_with(1, 2, 3, 4, 5, stage="full")
+        owner._forward_stage.assert_called_once_with(
+            1, 2, 3, 4, 5, stage="full", engram_hashes=None
+        )
 
     def test_encoder_stage_forward(self) -> None:
         owner = SimpleNamespace(_forward_stage=MagicMock(return_value="enc_res"))
@@ -456,7 +458,9 @@ class TestStageClasses:
             1, 2, intermediate_tensors=3, inputs_embeds=4, lookback_token_ids=5
         )
         assert res == "enc_res"
-        owner._forward_stage.assert_called_once_with(1, 2, 3, 4, 5, stage="encoder")
+        owner._forward_stage.assert_called_once_with(
+            1, 2, 3, 4, 5, stage="encoder", engram_hashes=None
+        )
 
     def test_decoder_stage_forward(self) -> None:
         owner = SimpleNamespace(_forward_stage=MagicMock(return_value="dec_res"))
@@ -1995,9 +1999,11 @@ def test_dp_embeddings_materialized_before_stage(monkeypatch, dp_size, supplied)
         assert values[0] is embeddings and wait is False
         events.append("enqueue")
 
-    def stage(tokens, pos, intermediate, inputs_embeds, history):
+    def stage(tokens, pos, intermediate, inputs_embeds, history, engram_hashes=None):
         assert tokens is ids and pos is positions and history is lookback
         assert intermediate is None
+        # No HBM Engram layer here, so no hashes are handed to the stage.
+        assert engram_hashes is None
         assert inputs_embeds is (embeddings if supplied or dp_size > 1 else None)
         events.append("stage")
         return inputs_embeds

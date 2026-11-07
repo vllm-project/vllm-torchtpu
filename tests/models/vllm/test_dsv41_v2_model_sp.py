@@ -426,7 +426,7 @@ def test_ced_dispatches_encoder_before_host_bucket_coordination(monkeypatch):
     mix = torch.ones(4, 4).as_subclass(TpuTensor)
     auxiliary = torch.ones(4, 16).as_subclass(TpuTensor)
 
-    def encoder(*args):
+    def encoder(*args, **kwargs):
         order.append("encoder")
         return hidden, mix, [auxiliary]
 
@@ -1112,7 +1112,7 @@ def test_split_encoder_stages_tail_engram_after_head_dispatch(monkeypatch):
     order = []
     carry = tuple(torch.ones(4, 16).as_subclass(TpuTensor) for _ in range(5))
 
-    def head(*args):
+    def head(*args, **kwargs):
         order.append("head")
         return carry
 
@@ -1181,7 +1181,7 @@ def test_split_encoder_downloads_deferred_hashes_after_head_dispatch(monkeypatch
     pending, gathered = object(), object()
 
     def stage(name):
-        def call(*args):
+        def call(*args, **kwargs):
             order.append(name)
             return "encoded" if name == "tail" else carry
 
@@ -1439,7 +1439,7 @@ def test_early_split_enqueues_before_host_lookup(monkeypatch):
     carry = tuple(torch.ones(2, 4).as_subclass(TpuTensor) for _ in range(5))
 
     def stage(name):
-        def call(*args):
+        def call(*args, **kwargs):
             order.append(name)
             return carry
 
@@ -1483,3 +1483,81 @@ def test_early_split_enqueues_before_host_lookup(monkeypatch):
         "l14 lookup",
         "tail",
     ]
+
+
+@pytest.mark.parametrize(
+    ("host_layers", "hbm_layers", "tail", "first"),
+    [
+        ((1, 4), (), 4, 1),
+        # Layer 1 served from HBM: no early split, the tail split stays.
+        ((1, 4), (1,), 4, None),
+        ((1, 4), (1, 4), None, None),
+    ],
+)
+def test_engram_split_skips_hbm_lookup_layers(host_layers, hbm_layers, tail, first):
+    model = _model_stub(
+        start_layer=0,
+        _ced_boundary=6,
+        _tp_size=1,
+        use_sequence_parallel=False,
+        aux_hidden_state_layers=(),
+        layers=[
+            SimpleNamespace(
+                engram=SimpleNamespace(
+                    embed_tokens=SimpleNamespace(host_offload=True),
+                    uses_hbm_lookup=i in hbm_layers,
+                )
+                if i in host_layers
+                else None
+            )
+            for i in range(7)
+        ],
+    )
+    model._engram_split_layer = model._select_engram_split_layer()
+    assert model._engram_split_layer == tail
+    assert model._select_engram_first_split_layer() == first
+
+
+def test_tail_only_split_stages_tail_engram_after_head_dispatch(monkeypatch):
+    # Layer 1 on HBM: the head runs layers [0, 14) and only layer 14's host
+    # staging remains, still after the head is enqueued.
+    order = []
+    carry = tuple(torch.ones(4, 16).as_subclass(_TpuTensor) for _ in range(5))
+    hashes = object()
+
+    def stage(name):
+        def call(*args, **kwargs):
+            order.append(name)
+            return "encoded" if name == "tail" else carry
+
+        return call
+
+    def stage_engram(start, end, gathered):
+        assert gathered is hashes
+        order.append((start, end))
+
+    def no_middle(*args):
+        raise AssertionError("no middle stage without an early split")
+
+    monkeypatch.setattr(
+        v2_model, "synchronize_tensors", lambda tensors, wait: order.append("dispatch")
+    )
+    model = _model_stub(
+        start_layer=0,
+        _engram_first_split_layer=None,
+        _engram_split_layer=14,
+        _ced_boundary=20,
+        _engram_prepared_outside_stage=True,
+        encoder_head_stage=stage("head"),
+        encoder_middle_stage=no_middle,
+        encoder_tail_stage=stage("tail"),
+        _pending_engram_hashes=None,
+        _gathered_engram_hashes=hashes,
+        _stage_engram_layers=stage_engram,
+        _record_engram_consumers=lambda *args: None,
+    )
+    out = v2_model.DeepseekV41Model._forward_split_encoder(
+        model, torch.arange(4), torch.arange(4), None, None, None
+    )
+    assert out == "encoded"
+    assert order == ["head", "dispatch", (14, 20), "tail"]
