@@ -63,3 +63,57 @@ def test_index_scale_row_bounds():
     assert msa_fp4.index_scale_row(3) == 6
     with pytest.raises(NotImplementedError):
         msa_fp4.index_scale_row(4)
+
+
+def test_write_fp4_stores_rotated_quantized_rows_and_scales():
+    import functools
+
+    from vllm_torchtpu.models.minimax_m3.kernels import msa
+
+    rng = np.random.default_rng(4)
+    num_pages, page, d = 5, 128, 128
+    kv_cache = msa_fp4.pack_rows(jnp.zeros((num_pages, page, 2 * d), jnp.uint8))
+    index_cache = msa_fp4.pack_rows(jnp.zeros((num_pages, page, d), jnp.uint8))
+    scale_cache = jnp.full((num_pages, 8, 128), jnp.nan, jnp.float32)
+    t = 6
+    k = jnp.asarray(rng.standard_normal((t, 1, d)), jnp.float32)
+    v = jnp.asarray(rng.standard_normal((t, 1, d)), jnp.float32)
+    ik = jnp.asarray(rng.standard_normal((t, d)), jnp.float32)
+    pages = jnp.asarray([3, 3, 3, 1, 1, 2**30], jnp.int32)  # last token dropped
+    pos = jnp.asarray([126, 127, 128 + 0, 5, 6, 0], jnp.int32) % 256
+    pages = pages.at[2].set(4)
+    write = functools.partial(msa.write_rows, pages=pages, pos=pos, max_num_seqs=3, interpret=True)
+    kv_cache, index_cache, scale_cache = msa.write_fp4(
+        kv_cache, index_cache, scale_cache, k, v, ik, write, pages, pos
+    )
+    kv = np.asarray(msa_fp4.unpack_rows(kv_cache))
+    ix = np.asarray(msa_fp4.unpack_rows(index_cache))
+    sc = np.asarray(scale_cache)
+    k_nib, k_s = msa_fp4.quantize(msa_fp4.rotate_keys(k[:, 0]))
+    v_nib, v_s = msa_fp4.quantize(msa_fp4.rotate_keys(v[:, 0]))
+    i_nib, i_s = msa_fp4.quantize(msa_fp4.rotate_keys(ik))
+    for i in range(t - 1):
+        p, s = int(pages[i]), int(pos[i]) % page
+        np.testing.assert_array_equal(kv[p, s, :d], k_nib[i])
+        np.testing.assert_array_equal(kv[p, s, d:], v_nib[i])
+        np.testing.assert_array_equal(ix[p, s], i_nib[i])
+        np.testing.assert_allclose(sc[p, :3, s], [k_s[i], v_s[i], i_s[i]], rtol=1e-6)
+    assert np.isnan(sc[0]).all()  # untouched page
+
+
+def test_cache_specs_match_allocated_shapes():
+    import torch
+
+    from vllm_torchtpu.models.minimax_m3 import attention as attn
+
+    for cls_args, expected in [
+        ((256, torch.uint8, "l.attn"), (7, 16, 4, 256)),
+        ((128, torch.uint8, "l.attn.index_cache"), (7, 16, 4, 128)),
+    ]:
+        cache = object.__new__(attn.MiniMaxM3Cache)
+        cache.row_width, cache.dtype, cache.prefix = cls_args
+        cache.token_shards, cache.block_size = 1, 128
+        assert cache.kv_cache_shape(7) == expected
+    scale = object.__new__(attn.MiniMaxM3ScaleCache)
+    scale.block_size = 128
+    assert scale.kv_cache_shape(7) == (7, 8, 128)

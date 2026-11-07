@@ -25,6 +25,7 @@ Served by the TPU `DSparkProposer`; the context K/V write is model-owned
 RMSNorm and an unquantized fused K/V weight.
 """
 
+import copy
 from collections.abc import Iterable
 from typing import TYPE_CHECKING
 
@@ -138,6 +139,10 @@ class MiniMaxM3DSparkAttention(DFlashQwen3Attention):
         quant_config: QuantizationConfig | None,
         prefix: str,
     ) -> None:
+        if cache_config is not None and cache_config.cache_dtype == "int4_per_token_head":
+            # Only the target's MSA caches are 4-bit; the draft's KV stays fp8.
+            cache_config = copy.copy(cache_config)
+            cache_config.cache_dtype = "fp8"
         super().__init__(
             hidden_size=config.hidden_size,
             num_heads=config.num_attention_heads,

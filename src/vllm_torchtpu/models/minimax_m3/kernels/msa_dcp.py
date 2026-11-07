@@ -51,6 +51,7 @@ from vllm_torchtpu.models.minimax_m3.kernels import (
     msa,
     msa_attention,
     msa_attention_lse,
+    msa_fp4,
     msa_select,
 )
 
@@ -264,10 +265,14 @@ def msa_write_and_candidates_dcp(
     local_blocks: int,
     rank: int | jax.Array,
     dcp: int,
+    scale_cache: jax.Array | None = None,
     interpret: bool = False,
-) -> tuple[jax.Array, jax.Array, jax.Array]:
+) -> tuple[jax.Array, ...]:
     """First half of the DCP forward: write this rank's tokens, score its
     blocks and pick its candidates.
+
+    With 4-bit caches (`msa_fp4`, one KV head per rank) pass `scale_cache`;
+    it is returned updated after `index_cache`.
 
     Shapes as `msa.msa_forward`, except that a rank may hold ``G >= 1`` KV
     heads (DCP wider than a KV head's replicas): ``k``/``v``/``index_q
@@ -299,9 +304,18 @@ def msa_write_and_candidates_dcp(
         max_num_seqs=max_num_seqs,
         interpret=interpret,
     )
-    kv_rows = jnp.concatenate([k, v], axis=-1).reshape(num_tokens, -1)
-    kv_cache = write(kv_cache, kv_rows)
-    index_cache = write(index_cache, index_k)
+    fp4 = scale_cache is not None
+    if fp4:
+        if num_heads != 1:
+            raise NotImplementedError("4-bit MSA caches under DCP hold one KV head per rank")
+        kv_cache, index_cache, scale_cache = msa.write_fp4(
+            kv_cache, index_cache, scale_cache, k, v, index_k, write, pages, pos
+        )
+        index_q = msa_fp4.rotate_queries(index_q)
+    else:
+        kv_rows = jnp.concatenate([k, v], axis=-1).reshape(num_tokens, -1)
+        kv_cache = write(kv_cache, kv_rows)
+        index_cache = write(index_cache, index_k)
     local_lens = local_seq_lens(seq_lens, block_size=block_size, rank=rank, dcp=dcp)
     if num_heads == 1:
         scores = msa._block_scores(
@@ -312,6 +326,8 @@ def msa_write_and_candidates_dcp(
             cu_q_lens,
             distribution[2],
             interpret,
+            scale_cache,
+            msa_fp4.index_scale_row(1) if fp4 else None,
         )
     else:
         # All heads in one pass over this rank's index pages: [G, T, P],
@@ -339,6 +355,8 @@ def msa_write_and_candidates_dcp(
     )
     packed = pack_candidates(cand_scores, cand_blocks)  # [G * T, 2 * topk]
     packed = packed.reshape(num_heads, num_tokens, -1).transpose(1, 0, 2)
+    if fp4:
+        return kv_cache, index_cache, scale_cache, packed.reshape(num_tokens, -1)
     return kv_cache, index_cache, packed.reshape(num_tokens, -1)
 
 
@@ -354,10 +372,14 @@ def msa_attend_dcp(
     topk: int,
     rank: int | jax.Array,
     dcp: int,
+    scale_cache: jax.Array | None = None,
     interpret: bool = False,
 ) -> tuple[jax.Array, jax.Array]:
     """Second half of the DCP forward: attend over the selected blocks this
     rank holds.
+
+    With a 4-bit `kv_cache` pass its `scale_cache`: queries are rotated here
+    and the partial output rotated back, so callers see plain heads.
 
     ``q [T, G * Hg, D]`` holds every query head of the group's ``G`` KV heads
     (KV head ``h`` owns query heads ``[h * Hg, (h + 1) * Hg)``);
@@ -390,6 +412,19 @@ def msa_attend_dcp(
         interpret=interpret,
     )
     args = (local_key, pos % block_size + 1, block_tables.reshape(-1))
+    if scale_cache is not None:
+        if num_heads != 1:
+            raise NotImplementedError("4-bit MSA caches under DCP hold one KV head per rank")
+        out, lse = msa_attention_lse.msa_sparse_attention_lse(
+            msa_fp4.rotate_queries(q),
+            kv_cache,
+            keys[:, 0],
+            *args,
+            head=0,
+            **common,
+            **msa._fp4_attention_kwargs(scale_cache),
+        )
+        return msa_fp4.unrotate_output(out), lse
     if num_heads == 1:
         return msa_attention_lse.msa_sparse_attention_lse(
             q, kv_cache, keys[:, 0], *args, head=0, **common

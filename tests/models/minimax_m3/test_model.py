@@ -381,7 +381,7 @@ def tiny_model(request, monkeypatch):
     monkeypatch.setattr(current_platform, "device_type", "cpu")
     request.getfixturevalue("dist_ctx")
     # The MSA op is a Pallas op; it needs the worker's TPU runtime.
-    monkeypatch.setattr(attention_mod, "get_msa_op", lambda *args: None)
+    monkeypatch.setattr(attention_mod, "get_msa_op", lambda *args, **kwargs: None)
     text_config = _text_config()
     quant_config = MiniMaxM3QuantConfig.from_config(_quant_dict())
     configure_quant_config(quant_config, MiniMaxM3SparseForCausalLM)

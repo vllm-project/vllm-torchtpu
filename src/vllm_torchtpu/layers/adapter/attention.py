@@ -149,6 +149,10 @@ TPU_STR_DTYPE_TO_TORCH_DTYPE = {
     "fp8_ds_mla": torch.uint8,
     "int8": torch.int8,
     "uint8": torch.uint8,
+    # MiniMax-M3 only: its MSA caches are 4-bit (`models/minimax_m3/kernels/
+    # msa_fp4`); every other attention cache of the model (the DSpark draft's)
+    # stores fp8.
+    "int4_per_token_head": torch.float8_e4m3fn,
 }
 
 

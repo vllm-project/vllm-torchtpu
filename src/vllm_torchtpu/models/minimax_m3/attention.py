@@ -37,6 +37,7 @@ from vllm.v1.kv_cache_interface import KVCacheSpec, MLAAttentionSpec
 from vllm_torchtpu.layers.adapter.attention import PallasMLAttentionBackend
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
 from vllm_torchtpu.layers.core.owned_kv_cache import TpuOwnedKVCache
+from vllm_torchtpu.models.minimax_m3.kernels import msa_fp4
 from vllm_torchtpu.models.minimax_m3.ops.msa import (
     get_msa_dcp_op,
     get_msa_op,
@@ -85,22 +86,52 @@ class MiniMaxM3Cache(nn.Module, TpuOwnedKVCache):
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
         # MLAAttentionSpec budgets one row of row_width per token; a shard
         # stores 1 / token_shards of the rows, budgeted as a narrower row.
+        # A 4-bit (uint8) row takes row_width / 2 bytes.
+        width = self.row_width // 2 if self.dtype == torch.uint8 else self.row_width
         return MLAAttentionSpec(
             block_size=vllm_config.cache_config.block_size,
             num_kv_heads=1,
-            head_size=self.row_width // self.token_shards,
+            head_size=width // self.token_shards,
             dtype=self.dtype,
         )
 
     def kv_cache_shape(self, num_blocks: int) -> tuple[int, ...] | None:
+        tokens = self.block_size // self.token_shards
+        if self.dtype == torch.uint8:
+            # 4-bit: 8 tokens per 32-bit word of 4 bytes (`kernels.msa_fp4`).
+            return (num_blocks, tokens // 8, 4, self.row_width)
         if self.token_shards == 1:
             return None
         packing = 32 // (8 * self.dtype.itemsize)
-        tokens = self.block_size // self.token_shards
         return (num_blocks, tokens // packing, packing, self.row_width)
 
     def get_attn_backend(self) -> type[AttentionBackend]:
         return PallasMLAttentionBackend
+
+
+class MiniMaxM3ScaleCache(MiniMaxM3Cache):
+    """Scale pages of a layer's 4-bit caches: ``[pages, 8, 128]`` f32, one
+    page per KV block, lanes = the block's tokens (`kernels.msa_fp4`)."""
+
+    def __init__(self, prefix: str) -> None:
+        super().__init__(msa_fp4.SCALE_ROWS, torch.float32, prefix)
+        if self.block_size != msa_fp4.SCALE_LANES:
+            raise NotImplementedError(
+                f"4-bit MSA caches need block size {msa_fp4.SCALE_LANES}, "
+                f"got {self.block_size}."
+            )
+
+    def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
+        # 8 f32 per token = one [8, 128] page per block.
+        return MLAAttentionSpec(
+            block_size=vllm_config.cache_config.block_size,
+            num_kv_heads=1,
+            head_size=msa_fp4.SCALE_ROWS,
+            dtype=torch.float32,
+        )
+
+    def kv_cache_shape(self, num_blocks: int) -> tuple[int, ...] | None:
+        return (num_blocks, msa_fp4.SCALE_ROWS, msa_fp4.SCALE_LANES)
 
 
 # --additional-config key: shard the MSA index-K cache over the TP group
@@ -125,9 +156,12 @@ def cache_dtype(cache_config: CacheConfig | None) -> torch.dtype:
         return torch.bfloat16
     if name in ("fp8", "fp8_e4m3"):
         return torch.float8_e4m3fn
+    if name == "int4_per_token_head":
+        # 4-bit caches with per-token-head scales (`kernels.msa_fp4`).
+        return torch.uint8
     raise NotImplementedError(
-        f"MiniMax M3 on TPU supports --kv-cache-dtype auto, bfloat16 or fp8, "
-        f"got {name!r}."
+        f"MiniMax M3 on TPU supports --kv-cache-dtype auto, bfloat16, fp8 or "
+        f"int4_per_token_head, got {name!r}."
     )
 
 
@@ -276,6 +310,16 @@ class MiniMaxM3SparseAttention(nn.Module):
             prefix=f"{prefix}.attn.index_cache",
             token_shards=self.index_shards,
         )
+        self.fp4 = dtype == torch.uint8
+        self.scale_cache = None
+        if self.fp4:
+            if self.index_shards > 1 or self.dcp_kv_heads > 1:
+                raise NotImplementedError(
+                    "--kv-cache-dtype int4_per_token_head needs one KV head per "
+                    f"rank and an unsharded index cache; got {self.dcp_kv_heads} "
+                    f"KV heads per rank, {self.index_shards} index shards."
+                )
+            self.scale_cache = MiniMaxM3ScaleCache(prefix=f"{prefix}.attn.scale_cache")
         msa_config = (
             scaling,
             sparse_cfg["sparse_topk_blocks"],
@@ -291,7 +335,7 @@ class MiniMaxM3SparseAttention(nn.Module):
                     f"{self.dcp_size}."
                 )
             self.msa_op = get_msa_dcp_op(
-                *msa_config, self.dcp_size, self.kv_head_replicas
+                *msa_config, self.dcp_size, self.kv_head_replicas, fp4=self.fp4
             )
             # A buffer, not a Python int, so the rank is a graph input and
             # every DCP rank compiles the same program (see get_msa_dcp_op).
@@ -305,7 +349,7 @@ class MiniMaxM3SparseAttention(nn.Module):
                 *msa_config, get_tensor_model_parallel_rank(), self.index_shards
             )
         else:
-            self.msa_op = get_msa_op(*msa_config)
+            self.msa_op = get_msa_op(*msa_config, fp4=self.fp4)
 
     def forward(
         self, positions: torch.Tensor, hidden_states: torch.Tensor
@@ -335,6 +379,8 @@ class MiniMaxM3SparseAttention(nn.Module):
                 # Every rank scores all index heads on its share of the keys.
                 index_q = get_tp_group().all_gather(index_q.contiguous(), dim=1)
             extra = {"dcp_rank": self.dcp_rank} if self.dcp_size > 1 else {}
+            if self.scale_cache is not None:
+                extra["scale_cache"] = self.scale_cache.kv_cache
             attn_output = self.msa_op(
                 q.view(num_tokens, self.num_heads, self.head_dim),
                 k.view(num_tokens, self.num_kv_heads, self.head_dim),
