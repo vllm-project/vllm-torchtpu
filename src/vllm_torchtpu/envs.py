@@ -109,6 +109,7 @@ if TYPE_CHECKING:
     TPU_MOE_EPLB_MOVER_STEP_BUDGET_MB: int = 256
     MOE_FUSED_EP_PUSH_SC_PREPUSH: int = 2
     MOE_FUSED_EP_PUSH_TC_EXCHANGE: bool = False
+    TPU_EXPERT_PLACEMENT: str = ""
     TPU_LATENT_PROJ_INTRA_CHIP_TP: bool = False
     TPU_TOKEN_BUCKET_EXTRA: list[int] = []
     TPU_PP_DYNAMIC_CHUNKS: bool = True
@@ -823,6 +824,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # weight-bandwidth bound and the per-device expert load is badly
     # imbalanced. See K3_HIERARCHICAL_EP_PLAN.md.
     "TPU_MOE_HIERARCHICAL_EP": env_bool("TPU_MOE_HIERARCHICAL_EP"),
+    # A static expert layout for the fused EP MoE kernel (expert_placement.py):
+    # a shipped layout's name, a path or a gs:// URI naming, per MoE layer,
+    # which global experts each EP rank holds and in what slot order, with
+    # spare slots holding replicas. Harness alias of
+    # additional_config.deepseek_v41.expert_layout. Empty: the checkpoint's
+    # contiguous blocks.
+    "TPU_EXPERT_PLACEMENT": env_str("TPU_EXPERT_PLACEMENT", ""),
     # Dynamic expert re-layout (expert_relayout.py): on every clean window of
     # WINDOW_STEPS coordinated steps, re-solve the layout from the kernel's
     # load counts, re-lay a layer only when its slowest rank's rows drop by at
@@ -898,6 +906,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # TensorCore remote-DMA kernel instead of XLA's (SparseCore-offloaded)
     # all-gather, keeping it off the SparseCore queue.
     "MOE_FUSED_EP_PUSH_TC_EXCHANGE": env_bool("MOE_FUSED_EP_PUSH_TC_EXCHANGE"),
+    # MOE_FUSED_EP_KERNEL_IMPL=push with an expert layout: map each selected
+    # expert to its replica slot with a one-hot matmul instead of two gathers.
     # Shard Kimi K3's latent-MoE down/up projections across the cores of a
     # chip instead of replicating them. They are unquantized [7168, 3584] and
     # [3584, 7168] matmuls run at full HBM bandwidth, ~22% of decode device

@@ -48,7 +48,8 @@ SCENARIOS["decode_dp16"] = Scenario(
 
 
 def require_dp16_recipe() -> None:
-    """Check push and dynamic EPLB in every worker before measuring decode."""
+    """Check push and the expert placement (dynamic EPLB or a static layout)
+    in every worker before measuring decode."""
     from vllm_torchtpu.distributed.ep_mesh import build_ep_mesh
     from vllm_torchtpu.envs import (
         MOE_FUSED_EP_KERNEL_IMPL,
@@ -69,7 +70,15 @@ def require_dp16_recipe() -> None:
             "DP16 decode CI requires push with SC_PREPUSH=2, TC_EXCHANGE=1"
         )
     if not TPU_MOE_EPLB_DYNAMIC:
-        raise ValueError("DP16 decode CI requires TPU_MOE_EPLB_DYNAMIC=1")
+        from vllm_torchtpu import expert_placement
+
+        # A static expert layout (expert_layout / TPU_EXPERT_PLACEMENT) is the
+        # other admitted placement; the CI itself always runs dynamic EPLB.
+        if expert_placement.configured_value() is None:
+            raise ValueError(
+                "DP16 decode CI requires TPU_MOE_EPLB_DYNAMIC=1 or a static "
+                "expert layout"
+            )
 
 
 def classify_rows(starts: list[int], ends: list[int], prompts: list[int]) -> str:

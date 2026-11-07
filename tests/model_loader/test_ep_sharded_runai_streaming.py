@@ -614,3 +614,43 @@ def test_fetch_filter_is_the_linear_one_until_a_layer_applies(monkeypatch):
     name = "model.layers.3.ffn.experts.{}.w1.weight"
     assert _should_skip(name.format(5), _LOCAL)
     assert not _should_skip(name.format(27), _LOCAL)
+
+
+@pytest.mark.cpu_test
+def test_fetch_filter_follows_a_static_layout_for_placed_layers(monkeypatch):
+    """Without Dynamic EPLB a static layout drives the filter layer by layer,
+    drafter group included; unlisted layers keep the linear set."""
+    from vllm_torchtpu import expert_placement, model_loader_patches
+
+    monkeypatch.setattr(expert_placement, "_GROUP", None)
+    monkeypatch.setattr(
+        expert_placement, "_APPLIED_LAYERS", {("target", 3), ("draft", 1)}
+    )
+    placement = expert_placement.parse(
+        {
+            "experts": 8,
+            "shards": 2,
+            "layers": {"3": [[7, 0, 5, 2, 1], [1, 6, 3, 4, 7]]},
+            "draft": {"experts": 4, "layers": {"1": [[0, 1, 2], [2, 3, 1]]}},
+        }
+    )
+    monkeypatch.setattr(
+        expert_placement, "static_placement", lambda vllm_config=None: placement
+    )
+    monkeypatch.setattr(model_loader_patches, "_ep_rank", lambda: 1)
+    linear = {4, 5, 6, 7}
+    target = "model.layers.3.ffn.experts.{}.w1.weight"
+    # Rank 1 holds 1, 6, 3, 4 and a replica of 7: the linear block would be 4-7.
+    assert not _should_skip(target.format(1), linear)
+    assert not _should_skip(target.format(7), linear)
+    assert _should_skip(target.format(5), linear)
+    assert _should_skip(target.format(0), linear)
+    # An unlisted layer keeps the linear set.
+    other = "model.layers.4.ffn.experts.{}.w1.weight"
+    assert _should_skip(other.format(1), linear)
+    assert not _should_skip(other.format(5), linear)
+    # The drafter's mtp tensors follow the draft group.
+    draft = "mtp.1.ffn.experts.{}.w1.weight"
+    assert not _should_skip(draft.format(2), {0, 1})
+    assert not _should_skip(draft.format(3), {0, 1})
+    assert _should_skip(draft.format(0), {0, 1})
