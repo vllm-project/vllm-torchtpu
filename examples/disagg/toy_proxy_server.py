@@ -5,6 +5,7 @@ import argparse
 import asyncio
 import codecs
 import itertools
+import json
 import logging
 import os
 import threading
@@ -498,6 +499,13 @@ async def _stream_from_decode_once(
                     # Streaming responses are not read on entry, so pull the
                     # body first or the raised error carries no vLLM detail.
                     await response.aread()
+                    print(
+                        f"[DECODE-HTTP-{response.status_code}] req_id={request_id} "
+                        f"prompt_len_hint={len(json.dumps(req_data.get('messages', ''))) if isinstance(req_data, dict) else -1} "
+                        f"max_tokens={req_data.get('max_tokens') if isinstance(req_data, dict) else None} "
+                        f"body={response.text[:600]!r}",
+                        flush=True,
+                    )
                 response.raise_for_status()
                 encoder = _AsciiSafeStreamEncoder()
                 async for chunk in response.aiter_bytes():

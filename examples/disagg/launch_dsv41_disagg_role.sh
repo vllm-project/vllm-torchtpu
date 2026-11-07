@@ -437,6 +437,11 @@ args=(
   --compilation-config "{\"compile_sizes\": ${COMPILE_SIZES}}"
 )
 
+# Optional passthrough of extra `vllm serve` args (e.g. --profiler-config for xprof captures).
+if [[ -n "${DSV41_EXTRA_SERVE_ARGS:-}" ]]; then
+  eval "args+=(${DSV41_EXTRA_SERVE_ARGS})"
+fi
+
 if [[ "${ENABLE_DSPARK}" == "1" ]]; then
   export VLLM_SPEC_DECODE_TOKENS="${DSPARK_TOKENS}"
   args+=(--speculative-config "{\"method\": \"dspark\", \"num_speculative_tokens\": ${DSPARK_TOKENS}}")
