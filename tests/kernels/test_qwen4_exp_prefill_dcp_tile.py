@@ -114,3 +114,93 @@ def test_interleaved_pcp_ranks_merge_to_the_replicated_prefill(kv_heads, query_h
     total = weight.sum(0)
     merged = np.einsum("rth,rthd->thd", weight, np.stack(outs)) / np.where(total > 0, total, 1)[..., None]
     np.testing.assert_allclose(merged, np.asarray(expect, np.float32), rtol=2e-2, atol=2e-2)
+
+
+@pytest.mark.parametrize(
+    "query_lens,contexts",
+    [
+        # A decode step: four one-token requests deep in their contexts, in a
+        # 16-token bucket.
+        ([1, 1, 1, 1], [4100, 9000, 12000, 6500]),
+        # A prefill step holding two requests' chunks.
+        ([256, 128], [3000, 7000]),
+    ],
+)
+def test_interleaved_pcp_multi_request_steps(query_lens, contexts):
+    """Several requests in one step through ``block_sparse_gqa_attention``
+    (the request-aligning wrapper the served model calls), each with its own
+    page table: merging both interleaved PCP ranks equals the replicated
+    attention for every request's rows."""
+    from vllm_torchtpu.kernels.qwen4_exp.block_sparse_gqa_prefill import (
+        block_sparse_gqa_attention,
+    )
+    from vllm_torchtpu.kernels.qwen4_exp.qsa_rpa import dcp_owner_row
+
+    page, world, interleave, heads, kv_heads = 3200, 2, 128, 12, 1
+    rng = np.random.default_rng(11)
+    reqs = len(query_lens)
+    real = sum(query_lens)
+    bucket = max(16, -(-real // 16) * 16)
+    totals = [c + q for c, q in zip(contexts, query_lens)]
+    # Replicated: request r's logical token t at page rep[r][t // page].
+    rep_pages = [-(-n // page) for n in totals]
+    rep_base = np.concatenate([[1], 1 + np.cumsum(rep_pages)])
+    width = max(rep_pages)
+    # PCP: a table entry covers world * page tokens; one local page per entry.
+    loc_entries = [-(-n // (world * page)) for n in totals]
+    loc_base = np.concatenate([[1], 1 + np.cumsum(loc_entries)])
+    loc_width = max(loc_entries)
+    replicated = np.zeros((rep_base[-1], page, 1, 4, 256), np.float32)
+    locals_ = [np.zeros((loc_base[-1], page, 1, 4, 256), np.float32) for _ in range(world)]
+    query = np.zeros((bucket, heads, 256), np.float32)
+    blocks = np.full((bucket, 512), -1, np.int32)
+    lengths = np.zeros((bucket,), np.int32)
+    rep_table = np.zeros((bucket, width), np.int32)
+    loc_table = np.zeros((bucket, loc_width), np.int32)
+    starts = np.zeros((reqs + 1,), np.int32)
+    row = 0
+    for r, (q, c, n) in enumerate(zip(query_lens, contexts, totals)):
+        starts[r + 1] = starts[r] + q
+        kv = rng.normal(size=(n, 1, 4, 256)).astype(np.float32)
+        t = np.arange(n)
+        replicated[rep_base[r] + t // page, t % page] = kv
+        owner, local_row = (np.asarray(x) for x in dcp_owner_row(t, page, world, interleave))
+        for rank in range(world):
+            mine = owner == rank
+            locals_[rank][loc_base[r] + t[mine] // (world * page), local_row[mine]] = kv[mine]
+        for i in range(q):
+            position = c + i
+            query[row] = rng.normal(size=(heads, 256))
+            lengths[row] = position + 1
+            pick = rng.permutation(-(-(position + 1) // RATIO))[:512]
+            blocks[row, : len(pick)] = pick
+            rep_table[row, : rep_pages[r]] = rep_base[r] + np.arange(rep_pages[r])
+            loc_table[row, : loc_entries[r]] = loc_base[r] + np.arange(loc_entries[r])
+            row += 1
+    gate = jnp.zeros((bucket, heads, 256), jnp.bfloat16)
+    common = dict(ratio=RATIO, kv_heads=kv_heads, query_block=256, return_lse=True)
+    q = jnp.asarray(query, jnp.bfloat16)
+    expect, expect_lse, _ = block_sparse_gqa_attention(
+        q, gate, jnp.asarray(blocks), jnp.asarray(lengths), jnp.asarray(rep_table),
+        jnp.asarray(replicated, jnp.float8_e4m3fn), jnp.asarray(starts),
+        kv_tile=256, **common,
+    )
+    outs, lses = [], []
+    for rank in range(world):
+        out, lse, _ = block_sparse_gqa_attention(
+            q, gate, jnp.asarray(blocks), jnp.asarray(lengths), jnp.asarray(loc_table),
+            jnp.asarray(locals_[rank], jnp.float8_e4m3fn), jnp.asarray(starts),
+            kv_tile=world * interleave,
+            dcp=(jnp.asarray([rank], jnp.int32), world, interleave), **common,
+        )
+        outs.append(np.asarray(out, np.float32))
+        lses.append(np.asarray(lse, np.float32))
+    lse = np.stack(lses)
+    top = np.max(lse, axis=0)
+    weight = np.where(np.isneginf(lse), 0.0, np.exp(lse - np.where(np.isneginf(top), 0, top)))
+    total = weight.sum(0)
+    merged = np.einsum("rth,rthd->thd", weight, np.stack(outs)) / np.where(total > 0, total, 1)[..., None]
+    live = lengths > 0
+    np.testing.assert_allclose(
+        merged[live], np.asarray(expect, np.float32)[live], rtol=2e-2, atol=2e-2
+    )
