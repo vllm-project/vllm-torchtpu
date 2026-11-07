@@ -635,6 +635,11 @@ class VllmNvfp4MoEMethod(TpuMoEActivationMixin, FusedMoEMethodBase):
             "activation": activation_str,
         }
         if ragged_a2a_enabled():
+            # Set by the MoE runner when the owner combine takes the shared
+            # expert's partial into the routed op.
+            shared_output = getattr(layer, "_tpu_owner_shared_output", None)
+            if shared_output is not None:
+                kwargs["shared_output"] = shared_output
             return ragged_a2a_fused_moe_gmm(**kwargs)
         if enable_pipelined_collective_and_compute():
             return pipelined_fused_moe_gmm(**kwargs)

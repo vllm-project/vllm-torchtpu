@@ -779,6 +779,7 @@ def scatter_moe_supported(
         "skip_padded_tokens",
         "max_local_routes",
         "num_recv_rows",
+        "num_extra_recv_rows",
         "axis",
         "num_members",
         "collective_id",
@@ -797,6 +798,7 @@ def fused_moe_scatter(
     row_dest: jax.Array,
     me: jax.Array,
     expected: jax.Array,
+    extra=None,
     *,
     topk: int,
     activation: str,
@@ -804,10 +806,11 @@ def fused_moe_scatter(
     skip_padded_tokens: bool = False,
     max_local_routes: int,
     num_recv_rows: int,
-    axis: str,
-    num_members: int,
+    num_extra_recv_rows: int = 0,
+    axis,
+    num_members,
     collective_id: int,
-) -> jax.Array:
+):
     """The EP local-routes path of `fused_moe_func` up to the expert outputs,
     which go to their owners instead of being combined here.
 
@@ -866,7 +869,9 @@ def fused_moe_scatter(
         dest_row,
         me,
         expected,
+        extra,
         num_recv_rows=num_recv_rows,
+        num_extra_recv_rows=num_extra_recv_rows,
         axis=axis,
         num_members=num_members,
         collective_id=collective_id,

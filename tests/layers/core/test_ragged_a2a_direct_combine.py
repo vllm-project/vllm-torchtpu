@@ -408,3 +408,115 @@ def test_home_sum_kernel_matches_reference(num_tokens, skip_padded):
     np.testing.assert_array_equal(
         np.asarray(got).view(np.uint16), np.asarray(want).view(np.uint16)
     )
+
+
+def _tp_sum_f32(partials):
+    """Sum over the TP axis (axis 1) in f32 in rank order, one rounding."""
+    acc = partials[:, 0].astype(np.float32)
+    for r in range(1, partials.shape[1]):
+        acc = acc + partials[:, r].astype(np.float32)
+    return acc.astype(BF16)
+
+
+@pytest.mark.multichip
+@pytest.mark.parametrize("with_shared", [False, True])
+@pytest.mark.parametrize(
+    "dp_size,tp_size,num_tokens,topk,factor",
+    [
+        (2, 4, 24, 10, 0.0),  # proxy layout: full-size exchange
+        (4, 2, 24, 10, 2.0),
+        (4, 2, 24, 2, 0.5),  # overflows into the full-size exchange
+        (2, 4, 22, 10, 0.0),  # tokens not a multiple of tp: padded owner blocks
+        (2, 4, 12, 10, 0.0),  # proxy K=0 decode: three owned tokens per core
+        (2, 4, 4, 10, 0.0),  # one owned token per core
+        (2, 4, 13, 10, 0.0),
+        (2, 4, 92, 10, 0.0),  # proxy K=3 decode at 23 requests per engine
+    ],
+)
+def test_owner_combine_matches_tp_sum(
+    dp_size, tp_size, num_tokens, topk, factor, with_shared
+):
+    """Owner mode returns every TP rank the engine's tokens summed over TP,
+    bitwise the returned-partials path plus (the shared partial, rounded per
+    rank, and) an f32 rank-order TP sum."""
+    devices = _require_eight_tpu_devices()
+    mesh = Mesh(np.asarray(devices).reshape(dp_size, tp_size), (DP_AXIS, TP_AXIS))
+    x, w1, w2, s1, s2, weights, ids, es = _inputs(
+        8, tp_size, num_tokens, 64, topk=topk, skew=False
+    )
+    stacked = tuple(
+        a.reshape(dp_size, tp_size, -1, *a.shape[1:])
+        for a in (x, w1, w2, s1, s2, weights, ids, es)
+    )
+    common = dict(
+        mesh=mesh,
+        topk=topk,
+        activation="silu",
+        use_sparse_core=True,
+        onehot_moe_permute_threshold=resolve_onehot_permute_threshold(
+            dp_size * num_tokens * topk
+        ),
+        capacity_factor=factor,
+    )
+    shared = None
+    if with_shared:
+        rng = np.random.default_rng(3)
+        shared = jnp.asarray(
+            rng.standard_normal((dp_size, tp_size, num_tokens, HIDDEN)) / 8,
+            jnp.bfloat16,
+        )
+    base = np.asarray(jax.jit(functools.partial(ragged_a2a_moe, **common))(*stacked))
+    if shared is not None:
+        base = (base.astype(np.float32) + np.asarray(shared).astype(np.float32)).astype(
+            BF16
+        )
+    want = _tp_sum_f32(base)
+    got = np.asarray(
+        jax.jit(functools.partial(ragged_a2a_moe, owner_combine=True, **common))(
+            *stacked, shared=shared
+        )
+    )
+    for r in range(tp_size):
+        np.testing.assert_array_equal(got[:, r].view(np.uint16), want.view(np.uint16))
+
+
+@pytest.mark.multichip
+@pytest.mark.parametrize("num_tokens", [24, 22, 96])
+def test_owner_combine_without_fused_kernel_adds_shared_and_tp_sum(num_tokens):
+    """Paths that do not take the fused kernel (prefill-size steps) return the
+    returned-partials result plus the shared partial, summed over TP with the
+    owner cores' arithmetic (f32, rank order, one rounding)."""
+    devices = _require_eight_tpu_devices()
+    dp_size, tp_size, topk = 2, 4, 10
+    mesh = Mesh(np.asarray(devices).reshape(dp_size, tp_size), (DP_AXIS, TP_AXIS))
+    x, w1, w2, s1, s2, weights, ids, es = _inputs(
+        8, tp_size, num_tokens, 64, topk=topk, skew=False
+    )
+    stacked = tuple(
+        a.reshape(dp_size, tp_size, -1, *a.shape[1:])
+        for a in (x, w1, w2, s1, s2, weights, ids, es)
+    )
+    # Threshold 0: every step takes the SparseCore path, never the fused kernel.
+    common = dict(
+        mesh=mesh,
+        topk=topk,
+        activation="silu",
+        use_sparse_core=True,
+        onehot_moe_permute_threshold=0,
+    )
+    rng = np.random.default_rng(4)
+    shared = jnp.asarray(
+        rng.standard_normal((dp_size, tp_size, num_tokens, HIDDEN)) / 8, jnp.bfloat16
+    )
+    base = np.asarray(jax.jit(functools.partial(ragged_a2a_moe, **common))(*stacked))
+    base = (base.astype(np.float32) + np.asarray(shared).astype(np.float32)).astype(
+        BF16
+    )
+    want = _tp_sum_f32(base)
+    got = np.asarray(
+        jax.jit(functools.partial(ragged_a2a_moe, owner_combine=True, **common))(
+            *stacked, shared=shared
+        )
+    )
+    for r in range(tp_size):
+        np.testing.assert_array_equal(got[:, r].view(np.uint16), want.view(np.uint16))

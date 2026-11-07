@@ -91,8 +91,8 @@ def get_dp_tp_mesh():
     return _MESH
 
 
-def _get_op(*, topk, activation, rhs_quant_dtype, skip_padded_tokens):
-    key = (topk, activation, rhs_quant_dtype, skip_padded_tokens)
+def _get_op(*, topk, activation, rhs_quant_dtype, skip_padded_tokens, shared=False):
+    key = (topk, activation, rhs_quant_dtype, skip_padded_tokens, shared)
     op = _OPS.get(key)
     if op is not None:
         return op
@@ -115,6 +115,7 @@ def _get_op(*, topk, activation, rhs_quant_dtype, skip_padded_tokens):
         capacity_factor=capacity_factor,
         route_factor=envs.TPU_MOE_A2A_ROUTE_CAPACITY,
         direct_combine=envs.TPU_MOE_A2A_DIRECT_COMBINE,
+        owner_combine=envs.TPU_MOE_A2A_OWNER_COMBINE,
     )
 
     # torch_tpu infers static argnums from annotations: every operand is jax.Array.
@@ -130,13 +131,36 @@ def _get_op(*, topk, activation, rhs_quant_dtype, skip_padded_tokens):
     ) -> jax.Array:
         return run(x, w1, w2, w1_scale, w2_scale, topk_weights, topk_ids, experts_start)
 
+    def fn_shared(
+        x: jax.Array,
+        w1: jax.Array,
+        w2: jax.Array,
+        w1_scale: jax.Array,
+        w2_scale: jax.Array,
+        topk_weights: jax.Array,
+        topk_ids: jax.Array,
+        experts_start: jax.Array,
+        shared_output: jax.Array,
+    ) -> jax.Array:
+        return run(
+            x,
+            w1,
+            w2,
+            w1_scale,
+            w2_scale,
+            topk_weights,
+            topk_ids,
+            experts_start,
+            shared=shared_output,
+        )
+
     # One mesh axis per dimension: the operands carry two leading unit axes.
     spec = PartitionSpec(DP_AXIS, TP_AXIS)
     op = pallas.jax_op(
         f"pallas::ragged_a2a_moe_{len(_OPS)}",
-        fn,
+        fn_shared if shared else fn,
         mesh=mesh,
-        input_partition_specs=(spec,) * 8,
+        input_partition_specs=(spec,) * (9 if shared else 8),
         # A tuple of per-output specs: a bare PartitionSpec is not a tuple, so
         # torch_tpu would read its first axis name as the whole spec.
         output_partition_specs=(spec,),
@@ -147,7 +171,7 @@ def _get_op(*, topk, activation, rhs_quant_dtype, skip_padded_tokens):
     logger.info_once(
         "Ragged A2A MoE armed | topk=%d activation=%s dp=%d tp=%d | one-hot "
         "permute threshold %d routed rows (full decode step: %d routed rows) | "
-        "direct combine %s",
+        "direct combine %s, owner combine %s",
         topk,
         activation,
         mesh.shape[DP_AXIS],
@@ -155,6 +179,7 @@ def _get_op(*, topk, activation, rhs_quant_dtype, skip_padded_tokens):
         onehot_threshold,
         decode_routed_rows,
         "on" if envs.TPU_MOE_A2A_DIRECT_COMBINE else "off",
+        "on" if envs.TPU_MOE_A2A_OWNER_COMBINE else "off",
     )
     _log_capacity(mesh, topk, onehot_threshold, decode_routed_rows)
     return op
@@ -207,12 +232,14 @@ def _log_capacity(mesh, topk, onehot_threshold, decode_routed_rows) -> None:
 
 def prebuild_ragged_a2a_moe(*, topk, activation, rhs_quant_dtype=None) -> None:
     """Build the mesh and op at weight load, outside the traced forward."""
-    _get_op(
-        topk=topk,
-        activation=activation,
-        rhs_quant_dtype=rhs_quant_dtype,
-        skip_padded_tokens=envs.TPU_MOE_SKIP_PADDED_TOKENS,
-    )
+    for shared in (False, True) if envs.TPU_MOE_A2A_OWNER_COMBINE else (False,):
+        _get_op(
+            topk=topk,
+            activation=activation,
+            rhs_quant_dtype=rhs_quant_dtype,
+            skip_padded_tokens=envs.TPU_MOE_SKIP_PADDED_TOKENS,
+            shared=shared,
+        )
 
 
 def ragged_a2a_fused_moe_gmm(
@@ -230,20 +257,26 @@ def ragged_a2a_fused_moe_gmm(
     activation: str,
     rhs_quant_dtype=None,
     skip_padded_tokens: bool | None = None,
+    shared_output: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Same contract as ``fused_moe_gmm`` with local tokens in and out; the
-    result still needs vLLM's TP all-reduce."""
+    result still needs vLLM's TP all-reduce, except with
+    TPU_MOE_A2A_OWNER_COMBINE, where it is already summed over TP and includes
+    ``shared_output`` (this rank's shared-expert partial) when given."""
     if w1_bias is not None or w2_bias is not None:
         raise NotImplementedError("TPU_MOE_RAGGED_A2A does not take expert biases")
     if w1_scale is None or w2_scale is None or experts_start is None:
         raise NotImplementedError("TPU_MOE_RAGGED_A2A needs scaled EP weights")
     if skip_padded_tokens is None:
         skip_padded_tokens = envs.TPU_MOE_SKIP_PADDED_TOKENS
+    if shared_output is not None and not envs.TPU_MOE_A2A_OWNER_COMBINE:
+        raise ValueError("shared_output needs TPU_MOE_A2A_OWNER_COMBINE")
     op = _get_op(
         topk=topk,
         activation=activation,
         rhs_quant_dtype=rhs_quant_dtype,
         skip_padded_tokens=skip_padded_tokens,
+        shared=shared_output is not None,
     )
     stacked = (
         hidden_states,
@@ -255,5 +288,7 @@ def ragged_a2a_fused_moe_gmm(
         topk_ids.to(torch.int32),
         experts_start.reshape(1),
     )
+    if shared_output is not None:
+        stacked += (shared_output.to(hidden_states.dtype),)
     out = op(*(t.reshape(1, 1, *t.shape) for t in stacked))
     return out.reshape(hidden_states.shape)

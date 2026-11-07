@@ -15,8 +15,14 @@
 
 from collections.abc import Callable
 
+from vllm.model_executor.layers.fused_moe.router.zero_expert_router import (
+    ZeroExpertRouter,
+)
 from vllm.model_executor.layers.fused_moe.runner import moe_runner as _moe_runner
 from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner
+from vllm.model_executor.layers.fused_moe.runner.shared_experts import (
+    SharedExpertsOrder,
+)
 
 from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.experimental.adaptive_fused_moe.vllm_adapter import (
@@ -101,6 +107,11 @@ class VllmMoERunner(MoERunner):
         # Not super()._fused_output_is_reduced: under torch.compile dynamo
         # reads that as truthy, and the routed output then skips its TP
         # all-reduce.
+        #
+        # The ragged all-to-all owner combine returns the final sum, shared
+        # expert included.
+        if self._owner_combine_armed():
+            return True
         if not envs.USE_MOE_FUSED_EP_KERNEL or getattr(
             self.moe_config, "skip_final_all_reduce", False
         ):
@@ -142,4 +153,61 @@ class VllmMoERunner(MoERunner):
             if self.shared_experts is not None:
                 return shared_output, hidden_states
             return hidden_states
+        if self._owner_combine_armed():
+            # The routed op returned the final sum, shared expert included.
+            if self.shared_experts is not None:
+                return None, hidden_states
+            return hidden_states
         return super()._maybe_combine(shared_output, hidden_states)
+
+    def _owner_combine_armed(self) -> bool:
+        """Whether the ragged all-to-all op returns this rank's tokens summed
+        over TP, shared expert included (TPU_MOE_A2A_OWNER_COMBINE)."""
+        if not (envs.TPU_MOE_A2A_OWNER_COMBINE and envs.TPU_MOE_RAGGED_A2A):
+            return False
+        config = self.moe_config
+        return (
+            not config.is_sequence_parallel
+            and config.pcp_size == 1
+            and not getattr(config, "skip_final_all_reduce", False)
+            and self.routed_output_transform is None
+            and self.routed_scaling_factor == 1.0
+            and not isinstance(self.router, ZeroExpertRouter)
+            and self.routed_experts.quant_method.is_monolithic
+            and self._quant_method.supports_internal_mk
+        )
+
+    def _apply_quant_method(
+        self,
+        hidden_states,
+        router_logits,
+        shared_experts_input,
+        input_ids=None,
+        **kwargs,
+    ):
+        if not self._owner_combine_armed():
+            return super()._apply_quant_method(
+                hidden_states, router_logits, shared_experts_input, input_ids, **kwargs
+            )
+        # Shared experts first, so the routed op can add their partial before
+        # its TP sum.
+        self._maybe_apply_shared_experts(
+            shared_experts_input, SharedExpertsOrder.NO_OVERLAP
+        )
+        if (
+            kwargs.get("shared_experts_overlapping")
+            and self._shared_experts is not None
+        ):
+            self._shared_experts.wait()
+        shared = (
+            self._shared_experts.output if self._shared_experts is not None else None
+        )
+        routed = self.routed_experts
+        routed._tpu_owner_shared_output = shared
+        try:
+            fused_out = routed.forward_monolithic(
+                x=hidden_states, router_logits=router_logits, input_ids=input_ids
+            )
+        finally:
+            routed._tpu_owner_shared_output = None
+        return None, fused_out

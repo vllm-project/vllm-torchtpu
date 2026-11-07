@@ -1642,6 +1642,19 @@ def mlp_kernel_main(
 
 
 @dataclasses.dataclass(frozen=True)
+class ExtraRowRefs:
+    """Refs of the rows `gmm_v2_mlp_scatter` sends once at entry (its `extra`)."""
+
+    rows: jax.Array  # HBM [num_extra, row_sublanes, L]
+    member: jax.Array  # SMEM int32[num_extra]
+    row: jax.Array  # SMEM int32[num_extra]
+    expected: jax.Array  # SMEM int32[2]: landing here, to send
+    recv: jax.Array  # HBM [num_extra_recv, row_sublanes, L]
+    sems: jax.Array  # DMA[3]: send, local, receive
+    counts: jax.Array  # SMEM int32[2]: remote, local sent
+
+
+@dataclasses.dataclass(frozen=True)
 class ScatterRefs:
     """Refs of `gmm_v2_mlp_scatter`'s row sends (see there)."""
 
@@ -1654,30 +1667,54 @@ class ScatterRefs:
     send_sems: jax.Array  # DMA[2]
     local_sems: jax.Array  # DMA[2]
     recv_sem: jax.Array  # DMA[1]
-    in_flight: (
-        jax.Array
-    )  # SMEM int32[4]: remote, remote, local, local rows per stage slot
-    axis: str
-    num_members: int
+    in_flight: jax.Array  # SMEM int32[4]: rows in flight (remote x2, local x2)
+    axis: str | tuple[str, ...]
+    num_members: int | tuple[int, ...]
+    extra: ExtraRowRefs | None = None
 
 
-def _signal_all(sem, axis: str, n: int) -> None:
-    for i in range(n):
+def _axes(axis, num_members):
+    if isinstance(axis, str):
+        return (axis,), (num_members,)
+    return tuple(axis), tuple(num_members)
+
+
+def member_device(index, axis, num_members) -> dict:
+    """Mesh coordinates of member `index`, members numbered row-major over the
+    given axes (other mesh axes keep the caller's coordinate)."""
+    axes, sizes = _axes(axis, num_members)
+    coords = {}
+    for a, n in zip(reversed(axes[1:]), reversed(sizes[1:])):
+        coords[a] = lax.rem(index, n)
+        index = index // n
+    coords[axes[0]] = index
+    return coords
+
+
+def _signal_all(sem, axis, num_members) -> None:
+    axes, sizes = _axes(axis, num_members)
+    total = 1
+    for n in sizes:
+        total *= n
+    for i in range(total):
+        coords, rest = {}, i
+        for a, n in zip(reversed(axes), reversed(sizes)):
+            coords[a] = rest % n
+            rest //= n
         pl.semaphore_signal(
-            sem, 1, device_id={axis: i}, device_id_type=pl.DeviceIdType.MESH
+            sem, 1, device_id=coords, device_id_type=pl.DeviceIdType.MESH
         )
-    pl.semaphore_wait(sem, n)
+    pl.semaphore_wait(sem, total)
 
 
-def member_barrier(axis: str, n: int) -> None:
-    """Every member of `axis` has entered the kernel. A second round on a
-    scoped semaphore keeps back-to-back kernels from consuming each other's
-    signals."""
-    _signal_all(pltpu.get_barrier_semaphore(), axis, n)
+def member_barrier(axis, num_members) -> None:
+    """Every member has entered the kernel. A second round on a scoped
+    semaphore keeps back-to-back kernels from consuming each other's signals."""
+    _signal_all(pltpu.get_barrier_semaphore(), axis, num_members)
 
     @functools.partial(pl.run_scoped, second=pltpu.SemaphoreType.REGULAR)
     def _(second):
-        _signal_all(second, axis, n)
+        _signal_all(second, axis, num_members)
 
 
 # Rows of one semaphore wait: a wait names a row-sized block of the receive
@@ -1836,6 +1873,41 @@ def _mlp_kernel(
             acc_list.append(acc_n)
         return jnp.concatenate(acc_list, axis=1)
 
+    def send_extra_rows(sc: ScatterRefs, ex: ExtraRowRefs):
+        """Send every `extra` row to its member's second receive buffer now;
+        the transfers overlap the expert compute."""
+        me = sc.me[0]
+
+        def send(i, counts):
+            member = ex.member[i]
+            src = ex.rows.at[pl.ds(i, 1)]
+            dst = ex.recv.at[pl.ds(ex.row[i], 1)]
+            is_local = member == me
+
+            @pl.when(is_local)
+            def _():
+                pltpu.make_async_copy(src, dst, ex.sems.at[1]).start()
+
+            @pl.when(jnp.logical_not(is_local))
+            def _():
+                pltpu.make_async_remote_copy(
+                    src,
+                    dst,
+                    ex.sems.at[0],
+                    ex.sems.at[2],
+                    device_id=member_device(member, sc.axis, sc.num_members),
+                    device_id_type=pl.DeviceIdType.MESH,
+                ).start()
+
+            local = is_local.astype(jnp.int32)
+            return counts[0] + 1 - local, counts[1] + local
+
+        remote, local = lax.fori_loop(
+            0, ex.expected[1], send, (jnp.int32(0), jnp.int32(0))
+        )
+        ex.counts[0] = remote
+        ex.counts[1] = local
+
     def send_tile_rows(slot, m_offset, m_start_local, m_end_local):
         """Send the tile's rows from stage `slot`: row `i` of the block is row
         `m_offset + i` of lhs, bound for row `dest_row` of member
@@ -1862,7 +1934,7 @@ def _mlp_kernel(
                     dst,
                     sc.send_sems.at[slot],
                     sc.recv_sem.at[0],
-                    device_id={sc.axis: member},
+                    device_id=member_device(member, sc.axis, sc.num_members),
                     device_id_type=pl.DeviceIdType.MESH,
                 ).start()
 
@@ -2029,6 +2101,8 @@ def _mlp_kernel(
     lhs_spec = pl.BlockSpec((bounded, sub, size_k), index_maps.lhs_index_map)
     lhs_in = lhs_ref.reshape(-1, sub, lhs_ref.shape[-1])
     if scatter is not None:
+        if scatter.extra is not None:
+            send_extra_rows(scatter, scatter.extra)
         pipeline_fn = pltpu.emit_pipeline(body, grid=(num_gm,), in_specs=(lhs_spec,))
         pipeline_fn(lhs_in)
         # Every row sent from here has left, and every row bound here has landed.
@@ -2036,6 +2110,11 @@ def _mlp_kernel(
             wait_rows(scatter.send_sems.at[i], scatter.recv, scatter.in_flight[i])
             wait_rows(scatter.local_sems.at[i], scatter.recv, scatter.in_flight[2 + i])
         wait_rows(scatter.recv_sem.at[0], scatter.recv, scatter.expected[0])
+        ex = scatter.extra
+        if ex is not None:
+            wait_rows(ex.sems.at[0], ex.recv, ex.counts[0])
+            wait_rows(ex.sems.at[1], ex.recv, ex.counts[1])
+            wait_rows(ex.sems.at[2], ex.recv, ex.expected[0])
         return
     out_spec = pl.BlockSpec((bounded, sub, size_n), index_maps.out_index_map)
     pipeline_fn = pltpu.emit_pipeline(
@@ -2250,48 +2329,64 @@ def gmm_v2_mlp(
     )(group_sizes, group_offset, lhs, w1, w1_scale, w2, w2_scale)[:size_m, :size_n]
 
 
-def mlp_scatter_kernel_main(
-    lhs_group_sizes_ref,
-    group_offset_ref,
-    dest_member_ref,
-    dest_row_ref,
-    me_ref,
-    expected_ref,
-    lhs_ref,
-    w1_ref,
-    s1_ref,
-    w2_ref,
-    s2_ref,
-    recv_ref,
-    w1_gate_slots,
-    w1_up_slots,
-    s1_gate_slots,
-    s1_up_slots,
-    w2_slots,
-    s2_slots,
-    inter_ref,
-    metadata_ref,
-    group_start_ref,
-    sems,
-    stage_ref,
-    send_sems,
-    local_sems,
-    recv_sem,
-    in_flight_ref,
-    *,
-    cfgs: MlpConfigs,
-    axis: str,
-    num_members: int,
-):
-    """Entry point of `gmm_v2_mlp_scatter`."""
+def mlp_scatter_kernel_main(*refs, cfgs: MlpConfigs, axis, num_members, extra: bool):
+    """Entry point of `gmm_v2_mlp_scatter` (refs: scalar prefetch, inputs,
+    outputs, scratch; the `extra` ones present when `extra`)."""
+    refs = list(refs)
+
+    def take(n):
+        out = refs[:n]
+        del refs[:n]
+        return out
+
+    group_sizes, group_offset, dest_member, dest_row, me, expected = take(6)
+    extra_prefetch = take(3) if extra else []
+    lhs, w1, s1, w2, s2 = take(5)
+    extra_inputs = take(1) if extra else []
+    recv = take(1)[0]
+    extra_outputs = take(1) if extra else []
+    (
+        w1_gate_slots,
+        w1_up_slots,
+        s1_gate_slots,
+        s1_up_slots,
+        w2_slots,
+        s2_slots,
+        inter_ref,
+        metadata_ref,
+        group_start_ref,
+        sems,
+        stage_ref,
+        send_sems,
+        local_sems,
+        recv_sem,
+        in_flight_ref,
+    ) = take(15)
+    extra_scratch = take(2) if extra else []
+    assert not refs
+    extra_refs = None
+    if extra:
+        extra_member, extra_row, extra_expected = extra_prefetch
+        (extra_rows,) = extra_inputs
+        (extra_recv,) = extra_outputs
+        extra_sems, extra_counts = extra_scratch
+        extra_refs = ExtraRowRefs(
+            rows=extra_rows,
+            member=extra_member,
+            row=extra_row,
+            expected=extra_expected,
+            recv=extra_recv,
+            sems=extra_sems,
+            counts=extra_counts,
+        )
     _mlp_kernel(
-        lhs_group_sizes_ref,
-        group_offset_ref,
-        lhs_ref,
-        w1_ref,
-        s1_ref,
-        w2_ref,
-        s2_ref,
+        group_sizes,
+        group_offset,
+        lhs,
+        w1,
+        s1,
+        w2,
+        s2,
         w1_gate_slots,
         w1_up_slots,
         s1_gate_slots,
@@ -2306,11 +2401,11 @@ def mlp_scatter_kernel_main(
         out_ref=None,
         partial_out_ref=None,
         scatter=ScatterRefs(
-            dest_member=dest_member_ref,
-            dest_row=dest_row_ref,
-            me=me_ref,
-            expected=expected_ref,
-            recv=recv_ref,
+            dest_member=dest_member,
+            dest_row=dest_row,
+            me=me,
+            expected=expected,
+            recv=recv,
             stage=stage_ref,
             send_sems=send_sems,
             local_sems=local_sems,
@@ -2318,6 +2413,7 @@ def mlp_scatter_kernel_main(
             in_flight=in_flight_ref,
             axis=axis,
             num_members=num_members,
+            extra=extra_refs,
         ),
     )
 
@@ -2336,6 +2432,7 @@ def scatter_rows_supported(dtype, size_n: int) -> bool:
 @jax.jit(
     static_argnames=[
         "num_recv_rows",
+        "num_extra_recv_rows",
         "axis",
         "num_members",
         "collective_id",
@@ -2360,10 +2457,12 @@ def gmm_v2_mlp_scatter(
     dest_row: jax.Array,  # int32[size_m]
     me: jax.Array,  # int32[1]
     expected: jax.Array,  # int32[1]
+    extra: tuple[jax.Array, ...] | None = None,
     *,
     num_recv_rows: int,
-    axis: str,
-    num_members: int,
+    num_extra_recv_rows: int = 0,
+    axis: str | tuple[str, ...],
+    num_members: int | tuple[int, ...],
     collective_id: int,
     fuse_act: str,
     num_parts: int = 2,
@@ -2376,7 +2475,8 @@ def gmm_v2_mlp_scatter(
     """`gmm_v2_mlp` whose output rows go to their owners as they are computed.
 
     A collective kernel over the `num_members` members of mesh axis `axis`
-    (other mesh axes keep the caller's coordinate). Output row `j` (a routed
+    (other mesh axes keep the caller's coordinate), or over the members of
+    several axes given as tuples, numbered row-major. Output row `j` (a routed
     row of lhs) is sent to row `dest_row[j]` of member `dest_member[j]`'s
     receive buffer as soon as its tile's down projection is done, while the
     following experts compute; rows for this member (`me`) are local copies.
@@ -2384,6 +2484,12 @@ def gmm_v2_mlp_scatter(
     once its own rows have left and `expected` rows sent by the other members
     have landed. Rows nobody writes keep stale data. Row values are the ones
     `gmm_v2_mlp` returns.
+
+    `extra` = (rows [n, 16, size_n / 16], member [n], row [n], counts [2]):
+    the first `counts[1]` rows are sent once at entry to row `row` of member
+    `member`'s second receive buffer `[num_extra_recv_rows, ...]`, overlapping
+    the expert compute; `counts[0]` rows land here. Then the result is
+    (receive, second receive).
     """
 
     size_m = lhs.shape[0]
@@ -2448,6 +2554,8 @@ def gmm_v2_mlp_scatter(
         pltpu.SemaphoreType.DMA((1,)),
         pltpu.SMEM((4,), jnp.int32),
     ]
+    if extra is not None:
+        scratch_shapes += [pltpu.SemaphoreType.DMA((3,)), pltpu.SMEM((2,), jnp.int32)]
     cost_up = get_cost_estimate(up)
     cost_down = get_cost_estimate(down)
     cost = pl.CostEstimate(
@@ -2461,16 +2569,35 @@ def gmm_v2_mlp_scatter(
         f"-bm_{'_'.join(map(str, cfgs.bucket_ms))}-p_{num_parts}-c{collective_id}"
     )
     hbm = pl.BlockSpec(memory_space=pltpu.HBM)
-    # The receive buffer is pinned to HBM: other members write into it.
+    recv_shape = pltpu.HBM((num_recv_rows, row_sub, size_n // row_sub), lhs.dtype)
+    prefetch = [group_sizes, group_offset, dest_member, dest_row, me, expected]
+    inputs = [lhs, w1, w1_scale, w2, w2_scale]
+    out_shape = recv_shape
+    out_specs = hbm
+    if extra is not None:
+        extra_rows, extra_member, extra_row, extra_expected = extra
+        prefetch += [extra_member, extra_row, extra_expected]
+        inputs += [pltpu.with_memory_space_constraint(extra_rows, pltpu.HBM)]
+        out_shape = (
+            recv_shape,
+            pltpu.HBM((num_extra_recv_rows,) + extra_rows.shape[1:], extra_rows.dtype),
+        )
+        out_specs = (hbm, hbm)
+        name += "-x"
+    # The receive buffers are pinned to HBM: other members write into them.
     return pl.pallas_call(
         functools.partial(
-            mlp_scatter_kernel_main, cfgs=cfgs, axis=axis, num_members=num_members
+            mlp_scatter_kernel_main,
+            cfgs=cfgs,
+            axis=axis,
+            num_members=num_members,
+            extra=extra is not None,
         ),
-        out_shape=pltpu.HBM((num_recv_rows, row_sub, size_n // row_sub), lhs.dtype),
+        out_shape=out_shape,
         grid_spec=pltpu.PrefetchScalarGridSpec(
-            num_scalar_prefetch=6,
-            in_specs=[hbm] * 5,
-            out_specs=hbm,
+            num_scalar_prefetch=len(prefetch),
+            in_specs=[hbm] * len(inputs),
+            out_specs=out_specs,
             scratch_shapes=scratch_shapes,
         ),
         compiler_params=pltpu.CompilerParams(
@@ -2480,16 +2607,4 @@ def gmm_v2_mlp_scatter(
         ),
         name=name,
         cost_estimate=cost,
-    )(
-        group_sizes,
-        group_offset,
-        dest_member,
-        dest_row,
-        me,
-        expected,
-        lhs,
-        w1,
-        w1_scale,
-        w2,
-        w2_scale,
-    )
+    )(*prefetch, *inputs)
