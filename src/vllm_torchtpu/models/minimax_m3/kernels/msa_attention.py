@@ -187,15 +187,20 @@ def _bitcast_slots(rows_per_page: int, packing: int) -> jax.Array:
     return slots[:, :1]  # [S, 1]
 
 
-def _fp4_page(kv_ref, scale_ref, k_row: int, v_row: int):
+def _fp4_page(kv_ref, scale_ref, k_row, v_row):
     """4-bit page (uint8 ``[1, S / 8, 4, 2D]``, `msa_fp4`) -> unscaled bf16
-    rows ``[S, 2D]`` in slot order, and its K / V scales as ``[1, S]`` lane
+    rows ``[S, 2D]`` in slot order, and its K / V scales (scale-page rows
+    `k_row` / `v_row`, static ints or run-time scalars) as ``[1, S]`` lane
     vectors. An unwritten slot's scale may be any bits: non-finite reads 0
     (int4 data itself has no NaN code)."""
     words = kv_ref.bitcast(jnp.uint32)[0, :, 0, :]
     rows = pltpu.bitcast(words, jnp.int4).astype(jnp.bfloat16)
-    page = scale_ref[0]  # [8, S]
-    sk, sv = page[k_row : k_row + 1], page[v_row : v_row + 1]
+    if isinstance(k_row, int):  # static rows
+        page = scale_ref[0]  # [R, S]
+        sk, sv = page[k_row : k_row + 1], page[v_row : v_row + 1]
+    else:  # rows picked at run time (one kernel for every KV head)
+        sk = scale_ref[0, pl.ds(k_row, 1), :]
+        sv = scale_ref[0, pl.ds(v_row, 1), :]
     return (
         rows,
         jnp.where(jnp.isfinite(sk), sk, 0.0),

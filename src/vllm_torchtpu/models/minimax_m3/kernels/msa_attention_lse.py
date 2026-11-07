@@ -27,7 +27,6 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.models.minimax_m3.kernels import msa_attention
-from vllm_torchtpu.models.minimax_m3.kernels.packed_page import check_page_dtype
 
 
 def _kernel(
@@ -43,7 +42,7 @@ def _kernel(
     local_limit_ref,  # [Bq, 1] visible slots of the local page
     *refs,  # G KV pages, [G scale pages (4-bit)], out, lse, scratch
     sm_scale: float,
-    fp4_rows: tuple[int, int] | None = None,
+    fp4_rows: tuple[int, int] | str | None = None,
 ):
     """`msa_attention._kernel_v2` that also writes ``lse = m + log(l)``
     (``-inf`` for a row that sees no slot; its output is 0)."""
@@ -84,7 +83,13 @@ def _kernel(
         limit = jnp.where(page >= 0, limit * is_selected, 0)  # [Bq, 1]
         seen = jnp.max(limit)
         if fp4:
-            rows, sk, sv = msa_attention._fp4_page(kv_ref, scale_refs[g], *fp4_rows)
+            if fp4_rows == "head":  # rows 2h, 2h + 1 of the scale page
+                k_row = 2 * head_ref[0]
+                rows, sk, sv = msa_attention._fp4_page(
+                    kv_ref, scale_refs[g], k_row, k_row + 1
+                )
+            else:
+                rows, sk, sv = msa_attention._fp4_page(kv_ref, scale_refs[g], *fp4_rows)
             values.append(rows[:, head_dim:])
             k_scales.append(sk)
             v_scales.append(sv)
@@ -392,6 +397,7 @@ def msa_sparse_attention_lse_heads(
     sm_scale: float,
     block_q: int = msa_attention.DEFAULT_BLOCK_Q,
     pages_per_step: int = msa_attention.DEFAULT_PAGES_PER_STEP,
+    scale_cache: jax.Array | None = None,
     interpret: bool = False,
 ) -> tuple[jax.Array, jax.Array]:
     """`msa_sparse_attention_lse` for every KV head of the cache rows at once.
@@ -401,10 +407,17 @@ def msa_sparse_attention_lse_heads(
     over a single kernel whose KV head is an input, so the program carries
     one copy of the kernel instead of one per head. Returns ``(out
     [T, G * Hg, D], lse [T, G * Hg] f32)``.
+
+    With a 4-bit cache, `scale_cache` ``[pages, R, S]`` holds head ``h``'s K / V
+    scales in rows ``2h`` / ``2h + 1``.
     """
     num_tokens, num_q_heads, head_dim = q.shape
     num_heads = selected.shape[1]
-    check_page_dtype(kv_cache.shape[2], kv_cache.dtype)
+    msa_attention.check_cache(kv_cache, scale_cache)
+    if scale_cache is not None and scale_cache.shape[1] < 2 * num_heads:
+        raise ValueError(
+            f"scale pages {scale_cache.shape} miss K/V rows of {num_heads} heads."
+        )
     if _check_rows(kv_cache, head_dim) < num_heads or num_q_heads % num_heads:
         raise ValueError(
             f"{num_heads} KV heads of {num_q_heads} query heads do not fit cache "
@@ -431,6 +444,8 @@ def msa_sparse_attention_lse_heads(
             block_q=block_q,
             pages_per_step=pages_per_step,
             interpret=interpret,
+            scale_cache=scale_cache,
+            scale_rows=None if scale_cache is None else "head",
         )
 
     out, lse = jax.lax.map(

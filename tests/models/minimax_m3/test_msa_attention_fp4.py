@@ -27,6 +27,7 @@ from vllm_torchtpu.models.minimax_m3.kernels import msa_fp4
 from vllm_torchtpu.models.minimax_m3.kernels.msa_attention import msa_sparse_attention
 from vllm_torchtpu.models.minimax_m3.kernels.msa_attention_lse import (
     msa_sparse_attention_lse,
+    msa_sparse_attention_lse_heads,
 )
 
 HEADS = 16
@@ -171,3 +172,66 @@ def test_lowers_for_tpu():
             .lower(lowering_platforms=("tpu",))
         )
     assert "tpu_custom_call" in lowered.as_text()
+
+
+@pytest.mark.parametrize("kv_heads,scale_rows", [(2, 8), (4, 16)])
+def test_lse_heads_matches_each_head(kv_heads, scale_rows):
+    """G KV heads per rank (DCP): rows [K_0 | V_0 | K_1 | V_1 ...], head h's
+    scales in scale-page rows 2h / 2h + 1, one kernel for all heads."""
+    rng = np.random.default_rng(kv_heads)
+    q_per_head = 4
+    kq, ks, vs, deq = [], [], [], []
+    for _ in range(kv_heads):
+        k = jnp.asarray(rng.standard_normal((PAGES, PAGE, HEAD_DIM)), jnp.float32)
+        v = jnp.asarray(rng.standard_normal((PAGES, PAGE, HEAD_DIM)), jnp.float32)
+        (a, sa), (b, sb) = msa_fp4.quantize(k), msa_fp4.quantize(v)
+        kq += [a, b]
+        ks.append(sa)
+        vs.append(sb)
+        deq.append(
+            np.concatenate(
+                [
+                    np.asarray(msa_fp4.dequantize(a, sa)),
+                    np.asarray(msa_fp4.dequantize(b, sb)),
+                ],
+                axis=-1,
+            )
+        )
+    cache = msa_fp4.pack_rows(jnp.concatenate(kq, axis=-1))
+    scales = np.full((PAGES, scale_rows, PAGE), np.nan, np.float32)
+    for h in range(kv_heads):
+        scales[:, 2 * h], scales[:, 2 * h + 1] = np.asarray(ks[h]), np.asarray(vs[h])
+    num_tokens, num_real = 24, 21
+    selected = np.full((num_tokens, kv_heads, TOPK), -1, np.int32)
+    local_page = np.full(num_tokens, -1, np.int32)
+    local_limit = np.zeros(num_tokens, np.int32)
+    for t in range(num_real):
+        local_page[t] = rng.integers(PAGES)
+        local_limit[t] = rng.integers(1, PAGE + 1)
+        for h in range(kv_heads):
+            others = [p for p in range(PAGES) if p != local_page[t]]
+            more = rng.choice(others, rng.integers(0, TOPK), replace=False)
+            selected[t, h, : 1 + len(more)] = [local_page[t], *more]
+    q = jnp.asarray(
+        rng.standard_normal((num_tokens, kv_heads * q_per_head, HEAD_DIM))
+    ).astype(jnp.bfloat16)
+    out, lse = msa_sparse_attention_lse_heads(
+        q,
+        cache,
+        jnp.asarray(selected),
+        jnp.asarray(local_page),
+        jnp.asarray(local_limit),
+        jnp.arange(PAGES, dtype=jnp.int32),
+        sm_scale=HEAD_DIM**-0.5,
+        block_q=16,
+        scale_cache=jnp.asarray(scales),
+        interpret=True,
+    )
+    qf = np.asarray(q.astype(jnp.float32))
+    got = np.asarray(out.astype(jnp.float32))
+    assert np.isfinite(got).all()
+    for h in range(kv_heads):
+        heads = slice(h * q_per_head, (h + 1) * q_per_head)
+        want = _reference(qf[:, heads], deq[h], selected[:, h], local_page, local_limit)
+        np.testing.assert_allclose(got[:, heads], want, atol=3e-2)
+    assert np.all(np.isneginf(np.asarray(lse[num_real:])))
