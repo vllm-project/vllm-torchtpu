@@ -54,9 +54,13 @@ def _fused_kernel(
     # leaving VMEM headroom for the pipeline to prefetch the next block.
     # bf16 -> f32 casts are exact, so results are unchanged.
     x_bf = x_ref[...]  # (tb, hidden) bf16
-    old_bf = [
-        res_ref[:, i * hidden_size : (i + 1) * hidden_size] for i in range(hc_mult)
-    ]
+    old_bf = (
+        [res_ref[...]] * hc_mult
+        if res_ref.shape[1] == hidden_size
+        else [
+            res_ref[:, i * hidden_size : (i + 1) * hidden_size] for i in range(hc_mult)
+        ]
+    )
 
     streams_bf = []
     for j in range(hc_mult):
@@ -158,11 +162,14 @@ def fused_post_pre_mixes(
     assert fn.dtype == jnp.float32, fn.dtype
 
     num_tokens, hidden_size = x2d.shape
-    hc_hidden = res2d.shape[1]
+    hc_mult3, hc_hidden = fn.shape
     hc_mult = hc_hidden // hidden_size
-    hc_mult3 = fn.shape[0]
-    assert res2d.shape == (num_tokens, hc_mult * hidden_size)
-    assert fn.shape == (hc_mult3, hc_hidden), (fn.shape, res2d.shape)
+    assert hc_mult * (hc_mult + 2) == hc_mult3, (fn.shape, x2d.shape)
+    res_width = res2d.shape[1]
+    assert res2d.shape[0] == num_tokens and res_width in (hc_hidden, hidden_size), (
+        fn.shape,
+        res2d.shape,
+    )
     assert gemm_precision in ("highest", "default"), gemm_precision
 
     # This kernel keeps a fixed block: its default (32) already fits the
@@ -193,7 +200,7 @@ def fused_post_pre_mixes(
         grid=(padded_tokens // tb,),
         in_specs=[
             pl.BlockSpec((tb, hidden_size), lambda i: (i, 0)),
-            pl.BlockSpec((tb, hc_hidden), lambda i: (i, 0)),
+            pl.BlockSpec((tb, res_width), lambda i: (i, 0)),
             pl.BlockSpec((tb, hc_mult), lambda i: (i, 0)),
             pl.BlockSpec((tb, hc_mult * hc_mult), lambda i: (i, 0)),
             resident,
@@ -246,11 +253,12 @@ def mhc_fused_post_pre(
     """
     assert residual.dtype == jnp.bfloat16
 
-    outer_shape = residual.shape[:-2]
-    hc_mult, hidden_size = residual.shape[-2:]
+    hidden_size = x.shape[-1]
+    outer_shape = x.shape[:-1]
+    hc_mult = fn.shape[1] // hidden_size
 
     x2d = x.reshape(-1, hidden_size).astype(jnp.bfloat16)
-    res2d = residual.reshape(-1, hc_mult * hidden_size)
+    res2d = residual.reshape(x2d.shape[0], -1)
     post2d = post_layer_mix.reshape(-1, hc_mult)
     comb2d = comb_res_mix.reshape(-1, hc_mult * hc_mult)
 

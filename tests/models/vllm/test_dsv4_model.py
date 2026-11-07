@@ -118,7 +118,10 @@ class _StubDecoderLayer(nn.Module):
     def forward(
         self, x, positions, input_ids=None, post_mix=None, res_mix=None, residual=None
     ):
-        del positions, input_ids, post_mix, res_mix, residual
+        del positions, input_ids, post_mix, res_mix
+        if residual is None and x.dim() == 2:
+            # The chain starts on the one embedding stream (see the real layer).
+            x = x.unsqueeze(-2).expand(x.shape[0], HC, x.shape[-1])
         residual = x
         x = x * (self.idx + 2) + 1.0
         post_mix = torch.full_like(x, 0.5 * (self.idx + 1))

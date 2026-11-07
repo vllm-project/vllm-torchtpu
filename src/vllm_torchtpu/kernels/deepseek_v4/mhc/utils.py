@@ -130,4 +130,7 @@ def mhc_pre_gates(
         comb_mix = comb_mix / (
             jnp.sum(comb_mix, axis=-2, keepdims=True) + hc_sinkhorn_eps
         )
+    # Keep the consumer's row-major relayout out of the final divide: fused
+    # into it, XLA copies every broadcast Sinkhorn normalizer to that layout.
+    comb_mix = jax.lax.optimization_barrier(comb_mix)
     return pre_mix, post_mix, comb_mix
