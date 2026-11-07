@@ -95,6 +95,7 @@ if TYPE_CHECKING:
     TPU_MOE_NONEP_GMM2_RHS_SPLIT: str = "1"
     TPU_MOE_NONEP_GMM_EXPERTS_PER_VISIT: str = "1"
     TPU_MOE_NONEP_GMM2_EXPERTS_PER_VISIT: str = "0"
+    TPU_MOE_NONEP_FUSED_MLP: bool = False
     TPU_SC_COMBINE_DENSE: str = ""
     TPU_MOE_NONEP_COMBINE_PACKED: bool = False
     TPU_MOE_NONEP_GMM_BUCKET: str = "0"
@@ -1346,6 +1347,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_MOE_NONEP_GMM2_EXPERTS_PER_VISIT": env_with_choices(
         "TPU_MOE_NONEP_GMM2_EXPERTS_PER_VISIT", "0", ["0", "1", "2", "4"]
     ),
+    # Both non-EP expert GMMs as one fused expert-MLP kernel (gmm_v2
+    # gmm_mlp_v2): one weight step of w1 + w2 per expert visit, gmm1's output
+    # kept in VMEM. Needs gmm2's experts per visit equal to gmm1's and no
+    # combine split; falls back to two kernels elsewhere. Bitwise the same output.
+    "TPU_MOE_NONEP_FUSED_MLP": env_bool("TPU_MOE_NONEP_FUSED_MLP"),
     # SparseCore combine accumulation for all-valid blocks: "reg" (run table,
     # register sums), "addupdate" (run table, contiguous memory adds) or unset
     # (indexed scatter-add). Read at trace time by ragged_gather_reduce_v3;

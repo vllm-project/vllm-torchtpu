@@ -345,6 +345,83 @@ def test_gmm2_experts_per_visit_overrides_gmm2_only(monkeypatch, use_ep, split, 
     assert epvs == ([1] * (1 + split) if use_ep else [e1] + [want2] * split)
 
 
+def _fused_mlp_case(monkeypatch, *, use_ep=False, split=1, e1=2, e2=0, fused=True, raise_value_error=False):
+    experts, hidden, inter, topk, tokens = 16, 512, 128, 4, 640
+    k1, k2, k3 = jax.random.split(jax.random.key(5), 3)
+    w1, s1 = _fp8_per_channel(k1, (experts, hidden, 2 * inter))
+    w2, s2 = _fp8_per_channel(k2, (experts, inter, hidden))
+    x = (jax.random.normal(k3, (tokens, hidden), jnp.float32) / 4).astype(jnp.bfloat16)
+    rng = np.random.default_rng(7)
+    ids = jnp.asarray(np.stack([rng.choice(experts, topk, replace=False) for _ in range(tokens)]), jnp.int32)
+    w = jnp.asarray(rng.random((tokens, topk)), jnp.bfloat16)
+    calls, epvs = [], []
+    ref_gmm = _ref_gmm(calls, epvs=epvs)
+    monkeypatch.setattr(fused_moe_gmm, "gmm_wrapper", ref_gmm)
+    mlp_calls = []
+
+    def mlp(x_, w1_, s1_, w2_, s2_, gs_, *, fuse_act, rhs_quant_dtype=None, tile_m=0, bucket=0,
+            experts_per_visit=1, pack_out=False):
+        mlp_calls.append(dict(e=experts_per_visit, pack=pack_out, act=fuse_act))
+        if raise_value_error:
+            raise ValueError("tilings differ")
+        inner = _ref_gmm([], epvs=[])  # the fused stand-in: not counted as gmm_wrapper calls
+        h = inner(x_, w1_, s1_, None, gs_, jnp.array([0], jnp.int32), fuse_act=fuse_act)[:, : w2_.shape[1]]
+        return inner(h, w2_, s2_, None, gs_, jnp.array([0], jnp.int32), preferred_element_type=x_.dtype,
+                     pack_out=pack_out)
+
+    monkeypatch.setattr(fused_moe_gmm, "mlp_wrapper", mlp)
+    log_lines = []
+
+    class _Log:  # the engine logger needs vLLM; record the once-lines instead
+        def info_once(self, msg, *args):
+            log_lines.append(msg % args if args else msg)
+
+    monkeypatch.setattr(fused_moe_gmm, "logger", _Log())
+    monkeypatch.setattr(fused_moe_gmm, "_local_ragged_combine_eligible", lambda *a, **k: True)
+    monkeypatch.setattr(fused_moe_gmm, "ragged_gather_reduce_v3",
+                        lambda rows, rev, wts, valid, reduce_group_size: _ref_combine(
+                            rows, rev, wts, valid, reduce_group_size))
+    xs, gs, rev, wf, valid, tok = prepare_routed_gmm_inputs(
+        x, ids, w, local_num_experts=experts, topk=topk, use_ep=False, use_sparse_core=False
+    )
+    out = fused_moe_gmm.moe_gmm(
+        xs, w1, s1, None, w2, s2, None, gs, rev, wf, valid, tok, activation="silu",
+        num_tokens=tokens, topk=topk, use_ep=use_ep, use_sparse_core=False,
+        nonep_combine_split=split, nonep_gmm_experts_per_visit=e1, nonep_gmm2_experts_per_visit=e2,
+        nonep_fused_mlp=fused,
+    )
+    return out, mlp_calls, epvs
+
+
+def test_fused_mlp_replaces_both_gmms_when_eligible(monkeypatch):
+    out_f, mlp_calls, epvs = _fused_mlp_case(monkeypatch, fused=True)
+    assert mlp_calls == [dict(e=2, pack=False, act="silu")] and epvs == [], (mlp_calls, epvs)
+    out_t, mlp_calls2, epvs2 = _fused_mlp_case(monkeypatch, fused=False)
+    assert mlp_calls2 == [] and epvs2 == [2, 2]
+    assert jnp.array_equal(out_f, out_t)
+
+
+@pytest.mark.parametrize("kw", [dict(use_ep=True), dict(split=2), dict(e1=2, e2=4)])
+def test_fused_mlp_stays_off_where_it_does_not_apply(monkeypatch, kw):
+    _, mlp_calls, epvs = _fused_mlp_case(monkeypatch, fused=True, **kw)
+    assert mlp_calls == [] and len(epvs) >= 2
+
+
+def test_fused_mlp_falls_back_to_two_kernels_on_value_error(monkeypatch):
+    out_f, mlp_calls, epvs = _fused_mlp_case(monkeypatch, fused=True, raise_value_error=True)
+    assert len(mlp_calls) == 1 and epvs == [2, 2]
+    out_t, _, _ = _fused_mlp_case(monkeypatch, fused=False)
+    assert jnp.array_equal(out_f, out_t)
+
+
+def test_fused_mlp_env(monkeypatch):
+    from vllm_torchtpu import envs
+    monkeypatch.delenv("TPU_MOE_NONEP_FUSED_MLP", raising=False)
+    assert envs.TPU_MOE_NONEP_FUSED_MLP is False
+    monkeypatch.setenv("TPU_MOE_NONEP_FUSED_MLP", "1")
+    assert envs.TPU_MOE_NONEP_FUSED_MLP is True
+
+
 def test_gmm2_experts_per_visit_env_reaches_the_bridge(monkeypatch):
     from vllm_torchtpu import envs
     monkeypatch.setenv("TPU_MOE_NONEP_GMM2_EXPERTS_PER_VISIT", "4")

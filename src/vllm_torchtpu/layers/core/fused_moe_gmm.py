@@ -27,6 +27,7 @@ from vllm_torchtpu.kernels.experimental.moe_dense_expert import (
 from vllm_torchtpu.kernels.megablox.gmm_v2 import (
     calculate_tiling,
     get_packing_factor,
+    gmm_mlp_v2,
     gmm_v2,
 )
 from vllm_torchtpu.kernels.megablox.moe_onehot_unpermute import (
@@ -286,6 +287,40 @@ def gmm_wrapper(
         **({"rhs_split": rhs_split} if rhs_split > 1 else {}),
         **({"experts_per_visit": experts_per_visit} if experts_per_visit > 1 else {}),
         **({"pack_out": True} if pack_out else {}),
+    )
+
+
+def mlp_wrapper(
+    x,
+    w1,
+    w1_scale,
+    w2,
+    w2_scale,
+    group_sizes,
+    *,
+    fuse_act,
+    rhs_quant_dtype=None,
+    tile_m=0,
+    bucket=0,
+    experts_per_visit=1,
+    pack_out=False,
+):
+    """Both non-EP GMMs as one fused expert-MLP kernel (gmm_v2.gmm_mlp_v2,
+    TPU_MOE_NONEP_FUSED_MLP): bit-identical to gmm_wrapper(gmm_wrapper(x, w1,
+    fuse_act), w2) with the same tiling. Raises ValueError where the two GMMs'
+    tilings cannot share one pipeline (the caller falls back)."""
+    tile_info = (
+        tiling_with_bucket(tile_m, bucket) if bucket
+        else tiling_with_tile_m(tile_m) if tile_m else None
+    )
+    return gmm_mlp_v2(
+        x, w1, w2, group_sizes, w1_scale, w2_scale,
+        fuse_act=fuse_act,
+        tile_info1=tile_info,
+        tile_info2=tile_info,
+        rhs_quant_dtype=rhs_quant_dtype,
+        pack_out=pack_out,
+        experts_per_visit=experts_per_visit,
     )
 
 
@@ -663,6 +698,7 @@ def moe_gmm(
     nonep_combine_packed: bool = False,
     nonep_gmm_bucket: int = 0,
     nonep_gmm2_experts_per_visit: int = 0,
+    nonep_fused_mlp: bool = False,
 ) -> jax.Array:
     """Run grouped GEMM for routed tokens and reduce back to tokens.
 
@@ -691,23 +727,43 @@ def moe_gmm(
     # Finer row buckets for both non-EP GMMs (TPU_MOE_NONEP_GMM_BUCKET); 0 = default.
     bucket = 0 if use_ep else nonep_gmm_bucket
 
-    gmm1_res = gmm_wrapper(
-        x,
-        w1,
-        w1_scale,
-        w1_bias,
-        group_sizes,
-        group_offset,
-        zero_initialize=False,
-        fuse_act=activation,
-        rhs_quant_dtype=rhs_quant_dtype,
-        tile_m=tile_m,
-        hoist_lhs_quant=hoist,
-        experts_per_visit=epv,
-        bucket=bucket,
+    # TPU_MOE_NONEP_FUSED_MLP: both GMMs in one kernel (one weight step of w1 +
+    # w2 per expert visit), bit-identical to the two calls below.
+    fused_mlp = (
+        nonep_fused_mlp
+        and not use_ep
+        and activation is not None
+        and w1_bias is None
+        and w2_bias is None
+        and rhs_split == 1
+        and not hoist
+        and nonep_combine_split == 1
+        and epv2 == epv
+        and get_packing_factor(w1.dtype, rhs_quant_dtype) == 1
+        and get_packing_factor(w2.dtype, rhs_quant_dtype) == 1
+        and jax.dtypes.itemsize_bits(w1.dtype) == 8
     )
-    packing_factor = get_packing_factor(w2.dtype, rhs_quant_dtype)
-    gmm1_res = gmm1_res[:, : w2.shape[1] * packing_factor]
+    if fused_mlp:
+        # shapes only; gmm2 below runs both GMMs from x
+        gmm1_res = jax.ShapeDtypeStruct((x.shape[0], w2.shape[1]), x.dtype)
+    else:
+        gmm1_res = gmm_wrapper(
+            x,
+            w1,
+            w1_scale,
+            w1_bias,
+            group_sizes,
+            group_offset,
+            zero_initialize=False,
+            fuse_act=activation,
+            rhs_quant_dtype=rhs_quant_dtype,
+            tile_m=tile_m,
+            hoist_lhs_quant=hoist,
+            experts_per_visit=epv,
+            bucket=bucket,
+        )
+        packing_factor = get_packing_factor(w2.dtype, rhs_quant_dtype)
+        gmm1_res = gmm1_res[:, : w2.shape[1] * packing_factor]
 
     topk_weights = topk_weights_flat.reshape((num_tokens, topk))
     valid_mask = valid_mask_flat.reshape((num_tokens, topk))
@@ -777,23 +833,45 @@ def moe_gmm(
             gmm1_res.shape[0], size_n, x.dtype, packed=True, **combine_kw
         )
     )
-    gmm2_res = gmm_wrapper(
-        gmm1_res,
-        w2,
-        w2_scale,
-        w2_bias,
-        group_sizes,
-        group_offset,
-        zero_initialize=False,
-        preferred_element_type=x.dtype,
-        rhs_quant_dtype=rhs_quant_dtype,
-        tile_m=tile_m,
-        hoist_lhs_quant=hoist,
-        rhs_split=rhs_split,
-        experts_per_visit=epv2,
-        pack_out=packed,
-        bucket=bucket,
-    )
+    gmm2_res = None
+    if fused_mlp:
+        try:
+            gmm2_res = mlp_wrapper(
+                x, w1, w1_scale, w2, w2_scale, group_sizes,
+                fuse_act=activation,
+                rhs_quant_dtype=rhs_quant_dtype,
+                tile_m=tile_m,
+                bucket=bucket,
+                experts_per_visit=epv,
+                pack_out=packed,
+            )
+            logger.info_once("MoE expert GMMs run as one fused expert-MLP kernel.")
+        except ValueError as e:
+            # e.g. small batches whose two GMM tilings differ: the two-kernel path
+            logger.info_once("Fused expert MLP not applicable here (%s); two GMM kernels.", e)
+            gmm1_res = gmm_wrapper(
+                x, w1, w1_scale, w1_bias, group_sizes, group_offset,
+                zero_initialize=False, fuse_act=activation, rhs_quant_dtype=rhs_quant_dtype,
+                tile_m=tile_m, hoist_lhs_quant=hoist, experts_per_visit=epv, bucket=bucket,
+            )[:, : w2.shape[1] * get_packing_factor(w2.dtype, rhs_quant_dtype)]
+    if gmm2_res is None:
+        gmm2_res = gmm_wrapper(
+            gmm1_res,
+            w2,
+            w2_scale,
+            w2_bias,
+            group_sizes,
+            group_offset,
+            zero_initialize=False,
+            preferred_element_type=x.dtype,
+            rhs_quant_dtype=rhs_quant_dtype,
+            tile_m=tile_m,
+            hoist_lhs_quant=hoist,
+            rhs_split=rhs_split,
+            experts_per_visit=epv2,
+            pack_out=packed,
+            bucket=bucket,
+        )
     if packed:
         return ragged_gather_reduce_v3(
             gmm2_res,
@@ -904,6 +982,7 @@ def moe_gmm(
         "nonep_combine_packed",
         "nonep_gmm_bucket",
         "nonep_gmm2_experts_per_visit",
+        "nonep_fused_mlp",
     ),
 )
 def fused_moe_func(
@@ -936,6 +1015,7 @@ def fused_moe_func(
     nonep_combine_packed: bool = False,
     nonep_gmm_bucket: int = 0,
     nonep_gmm2_experts_per_visit: int = 0,
+    nonep_fused_mlp: bool = False,
 ) -> jax.Array:
     """Run MoE with precomputed expert ids and weights.
 
@@ -1065,5 +1145,6 @@ def fused_moe_func(
         nonep_combine_packed=nonep_combine_packed,
         nonep_gmm_bucket=nonep_gmm_bucket,
         nonep_gmm2_experts_per_visit=nonep_gmm2_experts_per_visit,
+        nonep_fused_mlp=nonep_fused_mlp,
     )
     return x[:num_tokens, :hidden_size]
