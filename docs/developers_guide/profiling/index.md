@@ -13,7 +13,7 @@ There are four ways to profile a workload:
 
 | Approach | Also called | Best for |
 |---|---|---|
-| [`examples/tpu_profiling.py`](offline.md) | non-phased, on-demand profiling | Isolating a single shape — one prefill or one decode batch, offline |
+| [`tools/tpu_profiling.py`](offline.md) | non-phased, on-demand profiling | Isolating a single shape — one prefill or one decode batch, offline |
 | [Server-side capture](server.md) | end-to-end (e2e) profiling | A real serving window under `vllm bench serve` or your own client |
 | [Phased profiling](phased.md) | phased profiling | One trace per inference phase from a single mixed benchmark run |
 | [Disaggregated serving (Raiden3)](disaggregated.md) | PD disagg / KV cache transfer profiling | Correlating Prefill (`kv_producer`) and Decode (`kv_consumer`) traces across pods |

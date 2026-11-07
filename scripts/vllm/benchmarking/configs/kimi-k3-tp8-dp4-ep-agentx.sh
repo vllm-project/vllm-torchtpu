@@ -59,7 +59,7 @@ AGENTX_PRECISION=fp4
 # agentic row gets as a separate eval-only job, is not the config's to name.
 AGENTX_POST_EVAL_SUITES="kimi_tool_call_schema_full"
 
-# What the client pod puts in front of the pair: "toy" (examples/disagg/
+# What the client pod puts in front of the pair: "toy" (tools/disagg/
 # toy_proxy_server.py, the default) or "router" (vllm-router in its
 # prefill/decode mode, built into the image). Same two-hop protocol.
 AGENTX_PROXY=toy

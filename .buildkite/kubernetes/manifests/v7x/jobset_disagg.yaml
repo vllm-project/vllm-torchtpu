@@ -524,7 +524,7 @@ spec:
                     # Remove it so vLLM falls back to the CPU platform.
                     pip uninstall -y libtpu libtpu-nightly >/dev/null 2>&1 || true
                     echo "Starting proxy server..."
-                    python3 /workspace/vllm-torchtpu/examples/disagg/toy_proxy_server.py \
+                    python3 /workspace/vllm-torchtpu/tools/disagg/toy_proxy_server.py \
                       --host 0.0.0.0 \
                       --port 10000 \
                       --prefiller-host vllm-service-prefill \
