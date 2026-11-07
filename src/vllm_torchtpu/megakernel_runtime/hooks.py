@@ -22,7 +22,12 @@ from __future__ import annotations
 import contextlib
 import dataclasses
 from collections.abc import Iterator, Mapping
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+from .salt import resolve_plugin_hook
+
+if TYPE_CHECKING:
+    from collections.abc import Callable, Iterable
 
 _SUPPRESS_ATTR = "_megakernel_suppress_depth"
 
@@ -76,3 +81,118 @@ def _suppress_depth(runner: Any) -> int:
 def is_suppressed(runner: Any) -> bool:
     """Whether `runner` is inside a `suppressed(runner)` scope."""
     return runner is not None and _suppress_depth(runner) > 0
+
+
+@contextlib.contextmanager
+def _temporary_attr(target: object, name: str, value: object) -> Iterator[None]:
+    """Temporarily set instance attribute `name` on `target` and restore on exit."""
+    inst_vars = vars(target)
+    had_own = name in inst_vars
+    previous = inst_vars.get(name)
+    inst_vars[name] = value
+    try:
+        yield
+    finally:
+        if had_own:
+            inst_vars[name] = previous
+        else:
+            inst_vars.pop(name, None)
+
+
+def _observe_weights[TensorT](
+    weights: Iterable[tuple[str, TensorT]],
+    fn: Callable[..., object],
+    options: dict[str, object],
+) -> Iterator[tuple[str, TensorT]]:
+    """Pass each `(name, tensor)` pair to `fn` before yielding it unchanged."""
+    for name, tensor in weights:
+        fn(name, tensor, options)
+        yield name, tensor
+
+
+def load_tensor_stream[TensorT](
+    vllm_config: object,
+    weights: Iterable[tuple[str, TensorT]],
+) -> Iterator[tuple[str, TensorT]]:
+    """Stream `weights` through `plugin.load_tensor` when enabled."""
+    resolved = resolve_plugin_hook(vllm_config, "load_tensor")
+    if resolved is None:
+        yield from weights
+        return
+    fn, options = resolved
+    yield from _observe_weights(weights, fn, options)
+
+
+def _wrap_load_weights(
+    orig_load_weights: Callable[..., object],
+    fn: Callable[..., object],
+    options: dict[str, object],
+) -> Callable[..., object]:
+    """Wrap `model_loader.load_weights` so `model.load_weights` sees each tensor."""
+
+    def observed_loader_lw(model: object, *args: object, **kwargs: object) -> object:
+        """Intercept outer `model.load_weights` stream once per call."""
+        orig_model_lw = getattr(model, "load_weights", None)
+        if not callable(orig_model_lw):
+            return orig_load_weights(model, *args, **kwargs)
+        active = False
+
+        def observed_model_lw(
+            weights: Iterable[tuple[str, object]],
+            *w_args: object,
+            **w_kwargs: object,
+        ) -> object:
+            """Stream outer `weights` through `_observe_weights`."""
+            nonlocal active
+            if active:
+                return orig_model_lw(weights, *w_args, **w_kwargs)
+            active = True
+            try:
+                return orig_model_lw(
+                    _observe_weights(weights, fn, options), *w_args, **w_kwargs
+                )
+            finally:
+                active = False
+
+        with _temporary_attr(model, "load_weights", observed_model_lw):
+            return orig_load_weights(model, *args, **kwargs)
+
+    return observed_loader_lw
+
+
+@contextlib.contextmanager
+def observe_model_loader(vllm_config: object, model_loader: object) -> Iterator[None]:
+    """Show each streamed checkpoint tensor to `plugin.load_tensor` during load."""
+    resolved = resolve_plugin_hook(vllm_config, "load_tensor")
+    if resolved is None:
+        yield
+        return
+    fn, options = resolved
+    orig_get_all = getattr(model_loader, "get_all_weights", None)
+    if callable(orig_get_all):
+
+        def observed_get_all(
+            *args: object, **kwargs: object
+        ) -> Iterator[tuple[str, object]]:
+            """Stream `get_all_weights` pairs through `_observe_weights`."""
+            return _observe_weights(orig_get_all(*args, **kwargs), fn, options)
+
+        with _temporary_attr(model_loader, "get_all_weights", observed_get_all):
+            yield
+        return
+    orig_load_weights = getattr(model_loader, "load_weights", None)
+    if callable(orig_load_weights):
+        wrapped_lw = _wrap_load_weights(orig_load_weights, fn, options)
+        with _temporary_attr(model_loader, "load_weights", wrapped_lw):
+            yield
+        return
+    yield
+
+
+__all__ = [
+    "StepContext",
+    "is_suppressed",
+    "load_tensor_stream",
+    "observe_model_loader",
+    "suppressed",
+]

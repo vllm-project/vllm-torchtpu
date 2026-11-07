@@ -261,6 +261,9 @@ class TpuMonoSpec:
     relative to the folder's package), imported lazily, so importing the
     folder imports nothing heavy. `create(view, options)` returns a program or
     a `Decline`; it runs no collective and loads no weights.
+    `layout_request(vllm_config, options)` returns cache-layout settings for
+    the compile-cache salt, and `load_tensor(name, tensor, options)` observes
+    each checkpoint tensor before vLLM loads it (its return value is ignored).
 
     The runtime enforces, before `create` (config and local device facts
     only, no collective): `chips` (device_kind prefixes; `()` = any),
@@ -291,6 +294,7 @@ class TpuMonoSpec:
     numerics: str = "exact"
     collective_domain: str = DOMAIN_TP
     layout_request: str | Callable[..., Any] | None = None
+    load_tensor: str | Callable[..., object] | None = None
     decline_codes: tuple[str, ...] = ()
     source_root: str | None = None
     api_version: int = API_VERSION

@@ -18,7 +18,7 @@ from __future__ import annotations
 from typing import Any
 
 from .errors import MegakernelPluginError, MegakernelUnsupported
-from .hooks import StepContext, is_suppressed, suppressed
+from .hooks import StepContext, is_suppressed, observe_model_loader, suppressed
 
 _DRIVER_EXPORTS = frozenset({"ProgramDriver"})
 _JAX_BRIDGE_EXPORTS = frozenset(
@@ -79,6 +79,7 @@ __all__ = [
     "is_suppressed",
     "make_typed_step_wrapper",
     "maybe_create",
+    "observe_model_loader",
     "sharded_jax_callable",
     "suppressed",
 ]
