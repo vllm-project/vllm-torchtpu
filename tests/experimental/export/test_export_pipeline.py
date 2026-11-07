@@ -2746,6 +2746,31 @@ def test_mtp_draft_follows_the_contract(tmp_path) -> None:
     assert draft[0]["shape"] == [8, 1] and draft[0]["dtype"] == "i32"
 
 
+class _KvSharingMtpExportableLLM(_TinyMtpExportableLLM):
+    """The tiny MTP model whose draft reads the target's KV (Gemma 4's
+    assistant) instead of keeping its own."""
+
+    def mtp_state_indices(self) -> list[int]:
+        return [0]
+
+
+def test_a_kv_sharing_mtp_draft_takes_the_target_kv_state(tmp_path) -> None:
+    out_dir = _export_mtp(tmp_path, _KvSharingMtpExportableLLM)
+    functions = json.loads(Path(out_dir, "metadata.json").read_text())["functions"]
+    forward_state = next(
+        i for i in functions["forward"]["16"]["inputs"] if i["argument_type"] == "state"
+    )
+    variant = functions["draft"]["16"]
+    states = [i for i in variant["inputs"] if i["argument_type"] == "state"]
+    # One buffer: the forward's state, under its name and index, donated and
+    # returned as the forward returns it.
+    assert [(s["name"], s["index"]) for s in states] == [("kv_cache_layer_0", 0)]
+    for key in ("shape", "dtype", "sharding", "buffer_donor"):
+        assert states[0].get(key) == forward_state.get(key), key
+    out = [o for o in variant["outputs"] if o["argument_type"] == "state"]
+    assert [(o["name"], o["index"]) for o in out] == [("kv_cache_out_layer_0", 0)]
+
+
 class _TappableMtpExportableLLM(_TinyMtpExportableLLM):
     """`_TinyMtpExportableLLM` whose forward and draft run modules a debug tap
     can hook: the target's `final` and the draft's `fc_act`, which the chain
