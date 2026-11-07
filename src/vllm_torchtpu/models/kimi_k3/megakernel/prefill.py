@@ -12,7 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Source provenance: inferact/k3-megakernel@30c9ba966b src/vllm_torchtpu/megakernel/kimi_k3/prefill.py
+# Source provenance: inferact/k3-megakernel@30c9ba966b
+# src/vllm_torchtpu/megakernel/kimi_k3/prefill.py
 """Kimi-K3 prefill: the sequence-parallel prefill stack over vLLM's unified pools.
 
 :class:`KimiPrefiller` (the prefill role's :class:`MegakernelProgram`) computes
@@ -39,9 +40,8 @@ from __future__ import annotations
 
 import dataclasses
 import time
-from collections.abc import Mapping, Sequence
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING
 
 import jax
 import jax.numpy as jnp
@@ -49,8 +49,14 @@ import numpy as np
 import torch
 from jax.sharding import PartitionSpec as P
 
+from vllm_torchtpu.kernels import pool_adapters
 from vllm_torchtpu.logger import init_logger
-from vllm_torchtpu.models.kimi_k3.megakernel.layout import NUM_LAYERS
+from vllm_torchtpu.models.kimi_k3.megakernel import sampling
+from vllm_torchtpu.models.kimi_k3.megakernel.draft_mla_prefill import (
+    PrefillDraftLatents,
+)
+from vllm_torchtpu.models.kimi_k3.megakernel.draft_ring import PrefillRing
+from vllm_torchtpu.models.kimi_k3.megakernel.layout import NUM_LAYERS, cache_layout
 from vllm_torchtpu.models.kimi_k3.megakernel.pools import (
     CONV_ROWS,
     KDA_LAYERS,
@@ -72,6 +78,7 @@ from vllm_torchtpu.models.kimi_k3.megakernel.program import (
     kernel_modules,
 )
 from vllm_torchtpu.models.kimi_k3.megakernel.runtime_shim.bridge import (
+    OpRegistrationSpec,
     hbm,
     kernel_mesh,
     materialize,
@@ -80,8 +87,12 @@ from vllm_torchtpu.models.kimi_k3.megakernel.runtime_shim.bridge import (
     report_load_stats,
     stream_to_device,
 )
-from vllm_torchtpu.models.kimi_k3.megakernel.runtime_shim.config import (
-    MegakernelEngineConfig,
+from vllm_torchtpu.models.kimi_k3.megakernel.runtime_shim.compilation import (
+    CompileCall,
+    compile_ops,
+)
+from vllm_torchtpu.models.kimi_k3.megakernel.runtime_shim.export_cache import (
+    prepare_distributed,
 )
 from vllm_torchtpu.models.kimi_k3.megakernel.runtime_shim.program import (
     KVGroup,
@@ -89,6 +100,18 @@ from vllm_torchtpu.models.kimi_k3.megakernel.runtime_shim.program import (
     StepInput,
     StepOutput,
 )
+
+if TYPE_CHECKING:
+    from collections.abc import Callable, Iterator, Mapping, Sequence
+
+    from jax.sharding import Mesh
+
+    from vllm_torchtpu.models.kimi_k3.megakernel.runtime_shim.config import (
+        MegakernelEngineConfig,
+    )
+
+    type CustomOp = Callable[..., tuple[torch.Tensor, ...]]
+    type RingPair = tuple[torch.Tensor, torch.Tensor]
 
 logger = init_logger(__name__)
 
@@ -99,38 +122,58 @@ SLOTS = 16  # sequences per window, at most (and at most one per page)
 GROUP_PAIRS = 11  # regular 8-layer groups: layers 4..91
 COPY_PAIRS = 8  # copy-on-write block copies per PoolWriter.copy_blocks call
 
+_MIN_SPLITS_FOR_EARLY_STOP = 2
+_FIRST_STACK_DEPTH = 4
+_FIRST_TAP_LAYER = 3
+_MLA_FLASH_TILE = 256
+_MLA_LATENT_DIM = 576
+_MLA_PAD_COLS = 64
+_KDA_HEADS = 3
+_KDA_HEAD_DIM = 128
+_KDA_CONV_TAPS = 3
+_GROUP_RUN_HEADER_ARGS = 10
+_FINAL_EXPERT_BANK = 12
+_PREFIX_ALIGN_TOKENS = 4096
+_CP_ALIGN_TOKENS = 1024
+_SAMPLING_PARAM_COLS = 5
+_POSITIVE_INT32_MASK = 0x7FFFFFFF
+_SEGMENT_DESC_FIELDS = 5
+_RING_META_ELEMENTS = 2
+_STATE_SPEC_COUNT = 7
+
 
 def live_slots(used: int, slots: int) -> int:
-    """The sequence slots a window's pool writes cover: ``used`` rounded up
-    to a power of two, at most the window's ``slots`` (one compiled write
-    per size; slots past it are unused and their states are not written)."""
+    """Return ``used`` rounded up to a power of two, capped at ``slots``."""
     return min(slots, 1 << max(used - 1, 0).bit_length())
 
 
 def write_sizes(slots: int) -> tuple[int, ...]:
-    """Every :func:`live_slots` size of a window with ``slots`` slots."""
+    """Return every distinct :func:`live_slots` count for ``slots`` sequences."""
     return tuple(sorted({live_slots(n, slots) for n in range(1, slots + 1)}))
 
 
-def _device_i32(values) -> torch.Tensor:
+def _device_i32(values: Sequence[int] | Sequence[Sequence[int]]) -> torch.Tensor:
+    """Create an int32 tensor from ``values`` and place it on the TPU device."""
     return torch.tensor(values, dtype=torch.int32).to("tpu")
 
 
 def _zeros_i32(n: int) -> torch.Tensor:
+    """Allocate a 1D int32 zero tensor of length ``n`` on the TPU device."""
     return torch.zeros(n, dtype=torch.int32).to("tpu")
 
 
 def _rank_zeros_i32(n: int) -> torch.Tensor:
+    """Allocate a rank-leading ``[1, n]`` int32 zero tensor on the TPU device."""
     return torch.zeros((1, n), dtype=torch.int32).to("tpu")
 
 
-def _as_float(bits):
+def _as_float(bits: jax.Array) -> jax.Array:
+    """Bitcast int32 parameter words ``bits`` back to float32 values."""
     return jax.lax.bitcast_convert_type(bits, jnp.float32)
 
 
 def prefill_windows(max_num_batched_tokens: int, max_model_len: int) -> tuple[int, ...]:
-    """The windows to compile: those up to the step budget (at least the
-    smallest), up to the smallest one holding ``--max-model-len``."""
+    """Return compiled prefill windows covering step budget and model length."""
     windows = [w for w in WINDOWS if w <= max(WINDOWS[0], max_num_batched_tokens)]
     holding = [w for w in windows if w >= max_model_len]
     return tuple(w for w in windows if w < max_model_len) + (
@@ -140,9 +183,11 @@ def prefill_windows(max_num_batched_tokens: int, max_model_len: int) -> tuple[in
 
 @dataclasses.dataclass(frozen=True)
 class Piece:
-    """Tokens ``[start, end)`` of one request computed in one packed window;
+    """Tokens ``[start, end)`` of one request computed in one packed window.
+
     ``stop`` (a skipped step's end in ``(start, end]``) is where the window
-    also checkpoints the KDA state, ``None`` for no checkpoint."""
+    also checkpoints the KDA state, or ``None`` when no checkpoint is needed.
+    """
 
     row: int
     start: int
@@ -152,23 +197,29 @@ class Piece:
 
     @property
     def length(self) -> int:
+        """Return the unpadded token count ``end - start`` in this piece."""
         return self.end - self.start
 
     @property
-    def rows(self) -> int:  # window rows taken, padding to the next sequence included
+    def rows(self) -> int:
+        """Return the page-padded window row count occupied by this piece."""
         return -(-self.length // self.page_tokens) * self.page_tokens
 
 
 def skips_step(
-    computed: int, end: int, prompt: int, start: int, largest: int, block: int
+    computed: int,
+    end: int,
+    prompt: int,
+    start: int,
+    *window_and_block: int,
 ) -> bool:
-    """Whether a step scheduling a request's tokens ``[computed, end)`` of
-    ``prompt`` is skipped (no token): its state is at ``start`` and the rest
-    of the prompt fits the ``largest`` window. Never when the step completes
-    a ``block``-token logical block: vLLM's KV offloading stores that block
-    (its pages and the boundary KDA state) behind this step's device work,
-    so a later computing step would write them after the host copy was
-    taken, and a hit restores the stale bytes."""
+    """Return True when a partial prefill step ``[computed, end)`` can be deferred.
+
+    A step is deferred when ``end < prompt``, the remaining suffix from ``start``
+    fits the largest window, and ``[computed, end)`` does not cross a logical
+    offloading block boundary.
+    """
+    largest, block = window_and_block
     if end >= prompt or prompt - start > largest:
         return False
     return end // block == computed // block
@@ -178,20 +229,26 @@ def plan_pieces(
     row: int,
     start: int,
     end: int,
-    stops: list[int],
-    largest: int,
-    page_tokens: int = PAGE_TOKENS,
+    stops: Sequence[int],
+    *window_and_page: int,
 ) -> list[Piece]:
-    """Split a request's tokens ``[start, end)`` (``start`` block-aligned)
-    into pieces of at most ``largest`` tokens, each with at most one
-    checkpoint: a piece holding more than one of ``stops`` ends at the first.
-    Consecutive pieces must run in consecutive windows (each reads the pages
-    and state the previous one wrote)."""
-    pieces, stops = [], sorted(e for e in stops if start < e < end)
+    """Split a request's token range ``[start, end)`` into window-sized pieces.
+
+    Each piece holds at most ``largest`` tokens and at most one checkpoint from
+    ``stops`` so consecutive pieces run in consecutive prefill waves.
+    """
+    largest = window_and_page[0]
+    page_tokens = (
+        window_and_page[1]
+        if len(window_and_page) >= _MIN_SPLITS_FOR_EARLY_STOP
+        else PAGE_TOKENS
+    )
+    pieces: list[Piece] = []
+    ordered_stops = sorted(e for e in stops if start < e < end)
     while start < end:
         stop = min(start + largest, end)
-        inside = [e for e in stops if start < e <= stop]
-        if len(inside) > 1:
+        inside = [e for e in ordered_stops if start < e <= stop]
+        if len(inside) >= _MIN_SPLITS_FOR_EARLY_STOP:
             stop = inside[0]
         checkpoint = next((e for e in inside if e <= stop), None)
         pieces.append(Piece(row, start, stop, checkpoint, page_tokens))
@@ -200,25 +257,34 @@ def plan_pieces(
 
 
 def pack_windows(
-    pieces: list[Piece], windows: tuple[int, ...], slots: int, capacity: int
+    pieces: list[Piece],
+    windows: tuple[int, ...],
+    slots: int,
+    capacity: int,
 ) -> list[tuple[int, list[tuple[Piece, int]]]]:
-    """Greedy, in order: ``pieces`` (at most one per request, each at most
-    the largest window) into windows of at most ``slots`` sequences, each at
-    a page-aligned offset, whose cached prefixes (the tokens before each
-    piece) fit ``capacity``. Returns ``(window size, [(piece, offset)])`` per
-    window, the size the smallest compiled one holding its last sequence."""
-    largest, packed, members, offset, prefix = windows[-1], [], [], 0, 0
+    """Greedily pack ``pieces`` in order into windows with page-aligned offsets.
 
-    def close():
+    Returns ``(window_size, [(piece, offset)])`` per packed window, choosing the
+    smallest compiled window in ``windows`` that fits the last member's extent.
+    """
+    largest = windows[-1]
+    packed: list[tuple[int, list[tuple[Piece, int]]]] = []
+    members: list[tuple[Piece, int]] = []
+    offset = 0
+    prefix = 0
+
+    def close() -> None:
+        """Append the current packed window using the smallest fitting window size."""
         extent = members[-1][1] + members[-1][0].length
         packed.append((min(w for w in windows if w >= extent), list(members)))
 
     for piece in pieces:
         if piece.length > largest:
-            raise ValueError(
+            msg = (
                 f"piece of {piece.length} tokens is longer than "
                 f"the {largest}-token window"
             )
+            raise ValueError(msg)
         cached = -(-piece.start // piece.page_tokens) * piece.page_tokens
         if members and (
             len(members) == slots
@@ -242,44 +308,83 @@ _EXPERT_FAMILIES = ("expert_gu", "expert_gus", "expert_down", "expert_ds")
 _EXPERT_BANK_SIZES = (3,) + (8,) * 11 + (1,)
 
 
-def _bank_expert_weights(iterator):
-    """Stream checkpoint parts into exactly one resident copy of each expert."""
-    state: dict[str, list[Any]] = {}
+@dataclasses.dataclass
+class _ExpertBankCursor:
+    """Streaming accumulator state for one MoE expert weight family across banks."""
+
+    expected_part: int = 0
+    bank: int = 0
+    used: int = 0
+    buffer: np.ndarray | None = None
+
+
+def _bank_expert_weights(
+    iterator: Iterator[tuple[str, str, np.ndarray]],
+) -> Iterator[tuple[str, str, np.ndarray]]:
+    """Stream checkpoint parts into resident per-bank expert weight arrays."""
+    state: dict[str, _ExpertBankCursor] = {}
     for group, name, value in iterator:
         family, marker, suffix = name.partition("@")
         if group != "moe" or family not in _EXPERT_FAMILIES:
             yield group, name, value
             continue
         part, parts = map(int, suffix.split("/")) if marker else (0, 1)
-        entry = state.setdefault(family, [0, 0, 0, None])
-        expected_part, bank, used, buffer = entry
-        if part != expected_part:
-            raise ValueError(f"Out-of-order expert checkpoint part: {name}")
+        cursor = state.setdefault(family, _ExpertBankCursor())
+        if part != cursor.expected_part:
+            msg = f"Out-of-order expert checkpoint part: {name}"
+            raise ValueError(msg)
         offset = 0
         while offset < value.shape[0]:
-            if bank == len(_EXPERT_BANK_SIZES):
-                raise ValueError(f"Too many expert layers for {family}")
-            capacity = _EXPERT_BANK_SIZES[bank]
-            if buffer is None:
-                buffer = np.empty((capacity, *value.shape[1:]), dtype=value.dtype)
-            count = min(capacity - used, value.shape[0] - offset)
-            buffer[used : used + count] = value[offset : offset + count]
-            used += count
+            if cursor.bank == len(_EXPERT_BANK_SIZES):
+                msg = f"Too many expert layers for {family}"
+                raise ValueError(msg)
+            capacity = _EXPERT_BANK_SIZES[cursor.bank]
+            if cursor.buffer is None:
+                cursor.buffer = np.empty(
+                    (capacity, *value.shape[1:]),
+                    dtype=value.dtype,
+                )
+            count = min(capacity - cursor.used, value.shape[0] - offset)
+            cursor.buffer[cursor.used : cursor.used + count] = value[
+                offset : offset + count
+            ]
+            cursor.used += count
             offset += count
-            if used == capacity:
-                yield group, f"{family}#bank{bank}", buffer
-                bank, used, buffer = bank + 1, 0, None
-        state[family] = [part + 1, bank, used, buffer]
-        if part + 1 == parts and (bank != len(_EXPERT_BANK_SIZES) or used):
-            raise ValueError(f"Incomplete expert checkpoint: {family}")
+            if cursor.used == capacity:
+                yield group, f"{family}#bank{cursor.bank}", cursor.buffer
+                cursor.bank += 1
+                cursor.used = 0
+                cursor.buffer = None
+        cursor.expected_part = part + 1
+        if part + 1 == parts and (
+            cursor.bank != len(_EXPERT_BANK_SIZES) or cursor.used != 0
+        ):
+            msg = f"Incomplete expert checkpoint: {family}"
+            raise ValueError(msg)
     if set(state) != set(_EXPERT_FAMILIES) or any(
-        bank != len(_EXPERT_BANK_SIZES) or used for _, bank, used, _ in state.values()
+        c.bank != len(_EXPERT_BANK_SIZES) or c.used != 0 for c in state.values()
     ):
-        raise ValueError("Missing expert checkpoint parts")
+        msg = "Missing expert checkpoint parts"
+        raise ValueError(msg)
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class _PackedWindowInputs:
+    """Device operands for a single packed prefill window execution."""
+
+    shard: torch.Tensor
+    extent: torch.Tensor
+    segments: torch.Tensor
+    recurrent: torch.Tensor
+    conv: torch.Tensor
+    pools: list[torch.Tensor]
+    ids: torch.Tensor
+    local: torch.Tensor
+    ring: Callable[..., None] | None = None
 
 
 class PrefillProgram:
-    """The prefill stack's device weights and packed-window ops.
+    """The prefill stack's device weights and packed-window custom ops.
 
     :meth:`run_packed` prefills a window of up to :meth:`window_slots`
     sequences, each continuing a prefix whose pages are spread over the
@@ -294,41 +399,42 @@ class PrefillProgram:
         slots: int,
         page_tokens: int = PAGE_TOKENS,
     ) -> None:
+        """Initialize prefill program for ``windows``, ``capacity``, and ``slots``."""
         self.windows = tuple(sorted(int(w) for w in windows))
         self.capacity, self.slots = int(capacity), int(slots)
         self.page_tokens = int(page_tokens)
         self._kernels, self._rank_loader = kernel_modules(
-            "prefill_megakernel", "rank_loader"
+            "prefill_megakernel",
+            "rank_loader",
         )
         self.mesh, self.rank = kernel_mesh(AXIS, TP_SIZE)
         loader = self._rank_loader
-        self.names = {
-            "io": loader.PREFILL_IO,
-            "common": loader.PREFILL_COMMON,
-            "kda": loader.PREFILL_KDA,
-            "mla": loader.PREFILL_MLA,
+        self.names: dict[str, tuple[str, ...]] = {
+            "io": tuple(loader.PREFILL_IO),
+            "common": tuple(loader.PREFILL_COMMON),
+            "kda": tuple(loader.PREFILL_KDA),
+            "mla": tuple(loader.PREFILL_MLA),
             "moe": tuple(self._kernels.MOE_FAMILIES),
         }
         self.weights: dict[str, dict[str, torch.Tensor]] = {}
         self._expert_banks: list[dict[str, torch.Tensor]] = []
-        self._ops: dict[Any, dict[str, Any]] = {}
+        self._ops: dict[int, dict[str, CustomOp]] = {}
         self._pairs: list[torch.Tensor] = []
-        self._state_ops: dict[tuple[str, int], Any] = {}
+        self._state_ops: dict[tuple[str, int], CustomOp] = {}
 
-    # ------------------------------------------------------------ weights
-    def load_weights(self, presharded) -> None:
+    def load_weights(self, presharded: Path) -> None:
+        """Stream this rank's presharded weights and expert banks onto the TPU."""
         cache = presharded / "prefill-sp-cache"
-        iterator = self._rank_loader.iter_prefill_rank(presharded, cache, self.rank)
+        raw_iter = self._rank_loader.iter_prefill_rank(presharded, cache, self.rank)
         self._expert_banks = [{} for _ in _EXPERT_BANK_SIZES]
-        iterator = _bank_expert_weights(iterator)
+        iterator = _bank_expert_weights(raw_iter)
 
-        def store(group, name, tensor):
+        def store(group: str, name: str, tensor: torch.Tensor) -> None:
+            """Store one streamed weight tensor into its bank or group table."""
             family, marker, index = name.partition("#bank")
             if marker:
                 bank = int(index)
                 self._expert_banks[bank][family] = tensor
-                # The default dictionary retains handles to bank zero so common
-                # shape/introspection code still sees every named family.
                 if bank != 0:
                     return
                 name = family
@@ -338,11 +444,13 @@ class PrefillProgram:
         if self._expert_banks and any(
             set(bank) != set(_EXPERT_FAMILIES) for bank in self._expert_banks
         ):
-            raise RuntimeError("K3 prefill: incomplete resident expert banks")
+            msg = "K3 prefill: incomplete resident expert banks"
+            raise RuntimeError(msg)
         for group, names in self.names.items():
             missing = [n for n in names if n not in self.weights.get(group, {})]
             if missing:
-                raise RuntimeError(f"K3 prefill: missing {group} weights {missing}")
+                msg = f"K3 prefill: missing {group} weights {missing}"
+                raise RuntimeError(msg)
         materialize(
             self._expert_banks[-1]["expert_ds"]
             if self._expert_banks
@@ -359,7 +467,8 @@ class PrefillProgram:
             )
         report_load_stats("prefill", self.rank, stats)
 
-    def _flat(self, *groups: str, expert_bank: int = 0) -> list[torch.Tensor]:
+    def flat_weights(self, *groups: str, expert_bank: int = 0) -> list[torch.Tensor]:
+        """Flatten the named weight ``groups`` into a positional operand list."""
         experts = self._expert_banks[expert_bank] if self._expert_banks else {}
         return [
             experts[n] if g == "moe" and n in experts else self.weights[g][n]
@@ -367,95 +476,101 @@ class PrefillProgram:
             for n in self.names[g]
         ]
 
-    def _unflat(self, args, *groups: str) -> tuple[dict, list]:
-        out, index = {}, 0
+    def _unflat(
+        self,
+        args: Sequence[jax.Array],
+        *groups: str,
+    ) -> tuple[dict[str, dict[str, jax.Array]], list[jax.Array]]:
+        """Reconstruct nested weight dictionaries for ``groups`` from ``args``."""
+        out: dict[str, dict[str, jax.Array]] = {}
+        index = 0
         for group in groups:
             out[group] = {n: args[index + i] for i, n in enumerate(self.names[group])}
             index += len(self.names[group])
         return out, list(args[index:])
 
     def _count(self, *groups: str) -> int:
+        """Return the total number of weight tensors across ``groups``."""
         return sum(len(self.names[g]) for g in groups)
 
     def window_slots(self, window: int) -> int:
-        """The sequence slots a window's ops are compiled for: ``slots``, or
-        fewer when the window holds fewer pages (each sequence starts a
-        page), so a small window carries no state for slots it never fills."""
+        """Return the compiled sequence slot count for ``window``."""
         return max(1, min(self.slots, window // self.page_tokens))
 
-    # ------------------------------------------------------------ ops
-    #
-    # Sequence s of a window occupies rows [offset_s, offset_s + length_s),
-    # offsets ascending multiples of the page size; other rows carry token
-    # id -1. The int32 [5 * slots] descriptor is offsets | lengths |
-    # checkpoint positions (relative to each sequence's start, multiples of
-    # 128) | prefix bases | prefix lengths (the whole prefixes laid end to
-    # end; each rank's share travels in the CP operands, see
-    # prefill_megakernel.CpPrefix).
+    def _zeros_sharded(
+        self,
+        shape: tuple[int, ...],
+        dtype: jax.typing.DTypeLike,
+    ) -> jax.Array:
+        """Allocate a rank-leading zero state array constrained to ``AXIS``."""
+        state_sharding = jax.sharding.NamedSharding(self.mesh, P(AXIS))
+        return jax.lax.with_sharding_constraint(
+            jnp.zeros((TP_SIZE, *shape), dtype),
+            state_sharding,
+        )
 
-    def _build(self, window: int) -> dict[str, Any]:
-        if window in self._ops:
-            return self._ops[window]
-        if window not in self.windows:
-            raise ValueError(f"K3 prefill: window {window} is not among {self.windows}")
-        mesh, ops, kernels = self.mesh, {}, self._kernels
-        count = self.window_slots(window)
+    def _split_cp_prefix(
+        self,
+        args: Sequence[jax.Array],
+        pools: int,
+    ) -> tuple[object, Sequence[jax.Array]]:
+        """Split ``args`` into a ``CpPrefix`` arena over ``pools`` and weights."""
+        return (
+            self._kernels.CpPrefix(
+                tuple(args[:pools]),
+                args[pools],
+                args[pools + 1],
+            ),
+            args[pools + 2 :],
+        )
+
+    def _register_first_op(self, window: int, count: int, name: str) -> CustomOp:
+        """Build and register the embedding + layers 0..3 custom op for ``window``."""
         sharded, replicated = P(AXIS), P()
-        embedding = self._kernels.make_embedding_sp(mesh, seq_len=window)
+        embedding = self._kernels.make_embedding_sp(self.mesh, seq_len=window)
         first = self._kernels.make_prefill_stack_sp_indexed(
-            mesh,
+            self.mesh,
             seq_len=window,
-            depth=4,
-            mla_flash_tile=256,
+            depth=_FIRST_STACK_DEPTH,
+            mla_flash_tile=_MLA_FLASH_TILE,
             unroll=True,
             segments=count,
             prefix_capacity=self.capacity,
-            tap_layer=3,  # the MLA DSpark draft's aux layer 3
-        )
-        regular = self._kernels.make_regular_group8_sp_indexed(
-            mesh,
-            seq_len=window,
-            mla_flash_tile=256,
-            segments=count,
-            prefix_capacity=self.capacity,
-        )
-        final = self._kernels.make_final_mla_sp_indexed(
-            mesh,
-            seq_len=window,
-            mla_flash_tile=256,
-            segments=count,
-            prefix_capacity=self.capacity,
-        )
-        logits_op = self._kernels.make_prefill_logits_sp(
-            mesh, seq_len=window, layers=NUM_LAYERS, segments=count
+            tap_layer=_FIRST_TAP_LAYER,
         )
         weight_groups = ("common", "kda", "mla", "moe")
-        state_sharding = jax.sharding.NamedSharding(mesh, sharded)
 
-        def zeros(shape, dtype):
-            # Rank-leading states: shard them, or XLA may replicate them.
-            return jax.lax.with_sharding_constraint(
-                jnp.zeros((32, *shape), dtype), state_sharding
-            )
-
-        def prefix_specs(pools: int):
-            """Specs of an op's prefix operands: its MLA layers' pools, then
-            this rank's prefix ids and the local bases/counts."""
-            return (sharded,) * (pools + 2)
-
-        def split(args, pools: int):
-            return (
-                kernels.CpPrefix(tuple(args[:pools]), args[pools], args[pools + 1]),
-                args[pools + 2 :],
-            )
-
-        def run_first(tokens, length, segments, rec, hist, *args):
-            arena, args = split(args, 1)
-            w, _ = self._unflat(args, "io", *weight_groups)
+        def run_first(
+            tokens: jax.Array,
+            length: jax.Array,
+            segments: jax.Array,
+            rec: jax.Array,
+            *hist_and_weights: jax.Array,
+        ) -> tuple[jax.Array, ...]:
+            """Embed ``tokens`` and run the first four layers with layer-3 tap."""
+            hist = hist_and_weights[0]
+            arena, weight_args = self._split_cp_prefix(hist_and_weights[1:], 1)
+            w, _ = self._unflat(weight_args, "io", *weight_groups)
             hidden = embedding(tokens, w["io"]["embedding"], length)
-            latents = zeros((MLA_LAYERS, window, 576), jnp.bfloat16)
-            rec_at = zeros((KDA_LAYERS, count, 3, 128, 128), jnp.float32)
-            hist_at = zeros((KDA_LAYERS, count, 3, 3, 3, 128), jnp.bfloat16)
+            latents = self._zeros_sharded(
+                (MLA_LAYERS, window, _MLA_LATENT_DIM),
+                jnp.bfloat16,
+            )
+            rec_at = self._zeros_sharded(
+                (KDA_LAYERS, count, _KDA_HEADS, _KDA_HEAD_DIM, _KDA_HEAD_DIM),
+                jnp.float32,
+            )
+            hist_at = self._zeros_sharded(
+                (
+                    KDA_LAYERS,
+                    count,
+                    _KDA_CONV_TAPS,
+                    _KDA_HEADS,
+                    _KDA_HEADS,
+                    _KDA_HEAD_DIM,
+                ),
+                jnp.bfloat16,
+            )
             prefix, blocks, kda_state, mla_state, tap = first(
                 hidden,
                 w["common"],
@@ -470,38 +585,54 @@ class PrefillProgram:
             )
             return (prefix, blocks, *kda_state, *mla_state, tap)
 
-        # prefix, blocks, rec, hist, rec_at, hist_at, latents
-        state_specs = (sharded,) * 7
-        name = f"k3_prefill_packed{count}c"
-        ops["first"] = register_global_op(
+        state_specs = (sharded,) * _STATE_SPEC_COUNT
+        return register_global_op(
             self._op_name(f"{name}_first", window),
-            mesh,
+            self.mesh,
             run_first,
-            (sharded,)
-            + (replicated,) * 2
-            + (sharded,) * 2
-            + prefix_specs(1)
-            + (sharded,) * self._count("io", *weight_groups),
-            state_specs + (sharded,),  # then the stream entering layer 3
-            donate_argnums=(3, 4),
-            export_key=self._export_key(f"{name}_first", window),
+            OpRegistrationSpec(
+                in_specs=(sharded,)
+                + (replicated,) * 2
+                + (sharded,) * 2
+                + (sharded,) * 3
+                + (sharded,) * self._count("io", *weight_groups),
+                out_specs=(*state_specs, sharded),
+                donate_argnums=(3, 4),
+                export_key=self._export_key(f"{name}_first", window),
+            ),
         )
 
-        def run_group(
-            prefix,
-            blocks,
-            rec,
-            hist,
-            rec_at,
-            hist_at,
-            latents,
-            length,
-            pair,
-            segments,
-            *args,
-        ):
-            arena, args = split(args, 2)
-            w, _ = self._unflat(args, *weight_groups)
+    def _register_group_op(self, window: int, count: int, name: str) -> CustomOp:
+        """Build and register the 8-layer regular group custom op for ``window``."""
+        sharded, replicated = P(AXIS), P()
+        regular = self._kernels.make_regular_group8_sp_indexed(
+            self.mesh,
+            seq_len=window,
+            mla_flash_tile=_MLA_FLASH_TILE,
+            segments=count,
+            prefix_capacity=self.capacity,
+        )
+        weight_groups = ("common", "kda", "mla", "moe")
+
+        def run_group(*state_and_weights: jax.Array) -> tuple[jax.Array, ...]:
+            """Advance packed residual streams and states across an 8-layer group."""
+            (
+                prefix,
+                blocks,
+                rec,
+                hist,
+                rec_at,
+                hist_at,
+                latents,
+                length,
+                pair,
+                segments,
+            ) = state_and_weights[:_GROUP_RUN_HEADER_ARGS]
+            arena, weight_args = self._split_cp_prefix(
+                state_and_weights[_GROUP_RUN_HEADER_ARGS:],
+                2,
+            )
+            w, _ = self._unflat(weight_args, *weight_groups)
             prefix, blocks, kda_state, mla_state, middle, tap = regular(
                 prefix,
                 blocks,
@@ -518,24 +649,50 @@ class PrefillProgram:
             )
             return (prefix, blocks, *kda_state, *mla_state, middle, tap)
 
-        ops["group"] = register_global_op(
+        state_specs = (sharded,) * _STATE_SPEC_COUNT
+        return register_global_op(
             self._op_name(f"{name}_group8", window),
-            mesh,
+            self.mesh,
             run_group,
-            state_specs
-            + (replicated,) * 3
-            + prefix_specs(2)
-            + (sharded,) * self._count(*weight_groups),
-            # then the streams between its two groups and entering its last
-            # group's third layer
-            state_specs + (sharded,) * 2,
-            donate_argnums=tuple(range(7)),
-            export_key=self._export_key(f"{name}_group", window),
+            OpRegistrationSpec(
+                in_specs=state_specs
+                + (replicated,) * 3
+                + (sharded,) * 4
+                + (sharded,) * self._count(*weight_groups),
+                out_specs=state_specs + (sharded,) * 2,
+                donate_argnums=tuple(range(_STATE_SPEC_COUNT)),
+                export_key=self._export_key(f"{name}_group", window),
+            ),
         )
 
-        def run_final(prefix, blocks, latents, length, segments, *args):
-            arena, args = split(args, 1)
-            w, _ = self._unflat(args, "io", "common", "mla", "moe")
+    def _register_final_op(self, window: int, count: int, name: str) -> CustomOp:
+        """Build and register the final MLA layer 92 + logits op for ``window``."""
+        sharded, replicated = P(AXIS), P()
+        final = self._kernels.make_final_mla_sp_indexed(
+            self.mesh,
+            seq_len=window,
+            mla_flash_tile=_MLA_FLASH_TILE,
+            segments=count,
+            prefix_capacity=self.capacity,
+        )
+        logits_op = self._kernels.make_prefill_logits_sp(
+            self.mesh,
+            seq_len=window,
+            layers=NUM_LAYERS,
+            segments=count,
+        )
+
+        def run_final(
+            prefix: jax.Array,
+            blocks: jax.Array,
+            latents: jax.Array,
+            length: jax.Array,
+            *segments_and_weights: jax.Array,
+        ) -> tuple[jax.Array, jax.Array]:
+            """Compute final MLA layer 92 and all-gather vocabulary logits."""
+            segments = segments_and_weights[0]
+            arena, weight_args = self._split_cp_prefix(segments_and_weights[1:], 1)
+            w, _ = self._unflat(weight_args, "io", "common", "mla", "moe")
             prefix, blocks, (latents,) = final(
                 prefix,
                 blocks,
@@ -555,28 +712,44 @@ class PrefillProgram:
                 w["io"]["lm_head"],
                 segments,
             )
-            # Full vocabulary on every rank, gathered in a manual region.
             logits = jax.shard_map(
                 lambda part: jax.lax.all_gather(part[0], AXIS, axis=1, tiled=True),
-                mesh=mesh,
+                mesh=self.mesh,
                 in_specs=(sharded,),
                 out_specs=replicated,
                 check_vma=False,
             )(logits)
             return logits, latents
 
-        ops["final"] = register_global_op(
+        return register_global_op(
             self._op_name(f"{name}_final", window),
-            mesh,
+            self.mesh,
             run_final,
-            (sharded,) * 3
-            + (replicated,) * 2
-            + prefix_specs(1)
-            + (sharded,) * self._count("io", "common", "mla", "moe"),
-            (replicated, sharded),
-            donate_argnums=(0, 1, 2),
-            export_key=self._export_key(f"{name}_final", window),
+            OpRegistrationSpec(
+                in_specs=(sharded,) * 3
+                + (replicated,) * 2
+                + (sharded,) * 3
+                + (sharded,) * self._count("io", "common", "mla", "moe"),
+                out_specs=(replicated, sharded),
+                donate_argnums=(0, 1, 2),
+                export_key=self._export_key(f"{name}_final", window),
+            ),
         )
+
+    def build_window_ops(self, window: int) -> dict[str, CustomOp]:
+        """Build or return cached ``first``, ``group``, and ``final`` window ops."""
+        if window in self._ops:
+            return self._ops[window]
+        if window not in self.windows:
+            msg = f"K3 prefill: window {window} is not among {self.windows}"
+            raise ValueError(msg)
+        count = self.window_slots(window)
+        name = f"k3_prefill_packed{count}c"
+        ops: dict[str, CustomOp] = {
+            "first": self._register_first_op(window, count, name),
+            "group": self._register_group_op(window, count, name),
+            "final": self._register_final_op(window, count, name),
+        }
         if not self._pairs:
             self._pairs = [
                 torch.tensor([pair], dtype=torch.int32).to("tpu")
@@ -586,10 +759,11 @@ class PrefillProgram:
         return ops
 
     def _op_name(self, base: str, window: int) -> str:
+        """Format the custom-call op name for ``base`` at ``window`` and capacity."""
         return f"pallas::{base}_w{window}_c{self.capacity}"
 
     def _export_key(self, op: str, window: int) -> str:
-        """The static configuration a window op's trace bakes in (export cache)."""
+        """Return the export-cache key baking in the static configuration of ``op``."""
         return repr(
             (
                 "prefill",
@@ -603,143 +777,183 @@ class PrefillProgram:
 
     def run_packed(
         self,
-        shard: torch.Tensor,
-        extent: torch.Tensor,
-        segments: torch.Tensor,
-        recurrent: torch.Tensor,
-        conv: torch.Tensor,
-        pools: list[torch.Tensor],
-        ids: torch.Tensor,
-        local: torch.Tensor,
-        ring: Any = None,
-    ):
-        """Prefill a packed window: ``shard`` [1, W/32] this rank's token
-        ids (its SP stripes, :meth:`sp_order`), ``extent`` [1] the end of
-        the last sequence, ``segments`` the descriptor,
-        ``recurrent``/``conv`` [1, 69, slots, ...] the incoming KDA states
-        (donated; ``slots`` the window's :meth:`window_slots`), ``pools`` the
-        24 MLA layers' unified pools (MLA layer m's at m), ``ids`` [1, 1 +
-        ...] this rank's prefix page count then its prefix pages end to end
-        and ``local`` [1, 2 * slots] each sequence's base and token count in
-        them. Returns ``(logits [slots, VOCAB], latents [1, 24, W, 576],
-        recurrent, conv, recurrent_at, conv_at)`` (the states after each
-        sequence and at its checkpoint).
-        ``ring(blocks, prefix, middle)`` (the DSpark ring's update, if any)
-        runs on the residual streams before the final op consumes them."""
-        ops = self._build(int(shard.shape[-1]) * 32)
-        tail = (ids, local)
+        inputs: _PackedWindowInputs,
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]:
+        """Prefill one packed window and return logits, MLA latents, and KDA states."""
+        ops = self.build_window_ops(int(inputs.shard.shape[-1]) * TP_SIZE)
+        tail = (inputs.ids, inputs.local)
         *state, tap3 = ops["first"](
-            shard,
-            extent,
-            segments,
-            recurrent,
-            conv,
-            pools[0],
+            inputs.shard,
+            inputs.extent,
+            inputs.segments,
+            inputs.recurrent,
+            inputs.conv,
+            inputs.pools[0],
             *tail,
-            *self._flat("io", "common", "kda", "mla", "moe"),
+            *self.flat_weights("io", "common", "kda", "mla", "moe"),
         )
-        middle = tap90 = None
+        middle = tap90 = inputs.shard
         for p, pair in enumerate(self._pairs):
             *state, middle, tap90 = ops["group"](
                 *state,
-                extent,
+                inputs.extent,
                 pair,
-                segments,
-                pools[2 * p + 1],
-                pools[2 * p + 2],
+                inputs.segments,
+                inputs.pools[2 * p + 1],
+                inputs.pools[2 * p + 2],
                 *tail,
-                *self._flat("common", "kda", "mla", "moe", expert_bank=p + 1),
+                *self.flat_weights("common", "kda", "mla", "moe", expert_bank=p + 1),
             )
         prefix, blocks, rec, hist, rec_at, hist_at, latents = state
-        if ring is not None:
-            # The last pair's middle: entering layer 88; its tap: entering 90.
-            ring(blocks, prefix, middle, tap3, tap90)
+        if inputs.ring is not None:
+            inputs.ring(blocks, prefix, middle, tap3, tap90)
         logits, latents = ops["final"](
             prefix,
             blocks,
             latents,
-            extent,
-            segments,
-            pools[MLA_LAYERS - 1],
+            inputs.extent,
+            inputs.segments,
+            inputs.pools[MLA_LAYERS - 1],
             *tail,
-            *self._flat("io", "common", "mla", "moe", expert_bank=12),
+            *self.flat_weights(
+                "io",
+                "common",
+                "mla",
+                "moe",
+                expert_bank=_FINAL_EXPERT_BANK,
+            ),
         )
         return logits, latents, rec, hist, rec_at, hist_at
 
     def zero_state(self) -> tuple[torch.Tensor, torch.Tensor]:
-        """One sequence's zero KDA states, ``[1, 69, ...]``."""
+        """Allocate one sequence's zero KDA recurrent and conv states on TPU."""
         return (
             torch.zeros(
-                (1, KDA_LAYERS, 3, 128, 128), dtype=torch.float32, device="tpu"
+                (1, KDA_LAYERS, _KDA_HEADS, _KDA_HEAD_DIM, _KDA_HEAD_DIM),
+                dtype=torch.float32,
+                device="tpu",
             ),
             torch.zeros(
-                (1, KDA_LAYERS, 3, 3, 3, 128), dtype=torch.bfloat16, device="tpu"
+                (
+                    1,
+                    KDA_LAYERS,
+                    _KDA_CONV_TAPS,
+                    _KDA_HEADS,
+                    _KDA_HEADS,
+                    _KDA_HEAD_DIM,
+                ),
+                dtype=torch.bfloat16,
+                device="tpu",
             ),
         )
 
-    def _state_op(self, kind: str, count: int):
+    def state_op(self, kind: str, count: int) -> CustomOp:
+        """Build or return the cached KDA state ``stack`` or ``split`` custom op."""
         key = (kind, count)
         if key not in self._state_ops:
             if kind == "stack":
 
-                def body(*states):
+                def stack_body(*states: jax.Array) -> tuple[jax.Array, jax.Array]:
+                    """Stack ``count`` per-sequence recurrent and conv states."""
                     return (
                         jnp.stack(states[:count], axis=2),
                         jnp.stack(states[count:], axis=2),
                     )
 
-                specs = ((P(AXIS),) * 2 * count, (P(AXIS),) * 2)
+                body_fn: Callable[..., tuple[jax.Array, ...]] = stack_body
+                in_specs = (P(AXIS),) * (2 * count)
+                out_specs = (P(AXIS),) * 2
             else:
 
-                def body(recurrent, conv):
+                def split_body(
+                    recurrent: jax.Array,
+                    conv: jax.Array,
+                ) -> tuple[jax.Array, ...]:
+                    """Split packed recurrent and conv tensors into ``count`` pairs."""
                     return (
                         *(recurrent[:, :, s] for s in range(count)),
                         *(conv[:, :, s] for s in range(count)),
                     )
 
-                specs = ((P(AXIS),) * 2, (P(AXIS),) * 2 * count)
+                body_fn = split_body
+                in_specs = (P(AXIS),) * 2
+                out_specs = (P(AXIS),) * (2 * count)
+
             self._state_ops[key] = register_op(
                 f"pallas::k3_prefill_{kind}_states_{count}",
                 self.mesh,
-                body,
-                *specs,
-                export_key=repr(("states", kind, count)),
+                body_fn,
+                OpRegistrationSpec(
+                    in_specs=in_specs,
+                    out_specs=out_specs,
+                    export_key=repr(("states", kind, count)),
+                ),
             )
         return self._state_ops[key]
 
     def sp_order(self, window: int) -> np.ndarray:
-        """The window's token indices in rank-major SP ownership order (each
-        rank holds 64-row stripes of every 2048-token block; one window / 32-row
-        stripe under 2048 tokens)."""
-        return self._kernels.sp_order(window)
+        """Return ``window`` token indices in rank-major sequence-parallel order."""
+        order: np.ndarray = np.asarray(self._kernels.sp_order(window), dtype=np.int32)
+        return order
 
     def stack_states(
-        self, states: list[tuple[torch.Tensor, torch.Tensor]]
+        self,
+        states: Sequence[tuple[torch.Tensor, torch.Tensor]],
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Sequences' ``[1, 69, ...]`` KDA states -> the packed ``[1, 69, n,
-        ...]`` incoming states of :meth:`run_packed` (new tensors: only op
-        outputs reach an op, as torch views would compile new executables)."""
-        return tuple(
-            self._state_op("stack", len(states))(
-                *(r for r, _ in states), *(c for _, c in states)
-            )
+        """Pack per-sequence KDA state pairs into ``[1, 69, n, ...]`` tensors."""
+        out = self.state_op("stack", len(states))(
+            *(r for r, _ in states),
+            *(c for _, c in states),
         )
+        return out[0], out[1]
 
     def split_states(
-        self, recurrent: torch.Tensor, conv: torch.Tensor
+        self,
+        recurrent: torch.Tensor,
+        conv: torch.Tensor,
     ) -> list[tuple[torch.Tensor, torch.Tensor]]:
-        """The inverse of :meth:`stack_states`."""
+        """Split packed ``[1, 69, n, ...]`` KDA states into per-sequence pairs."""
         count = int(recurrent.shape[2])
-        out = self._state_op("split", count)(recurrent, conv)
-        return list(zip(out[:count], out[count:]))
+        out = self.state_op("split", count)(recurrent, conv)
+        return list(zip(out[:count], out[count:], strict=True))
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class _BoundPoolIndices:
+    """Layer-to-pool index mappings and TP-rank KDA head permutation."""
+
+    mla_raw: Sequence[int]
+    kda_raw: Sequence[int]
+    state_perm: Sequence[tuple[int, int]] | None
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class _PackedPoolWrite:
+    """Window outputs and target block tables for a packed pool write."""
+
+    latents: torch.Tensor
+    recurrent: torch.Tensor
+    conv: torch.Tensor
+    recurrent_at: torch.Tensor
+    conv_at: torch.Tensor
+    table: torch.Tensor
+    kda_blocks: torch.Tensor
+    blocks_at: torch.Tensor
+    rings: tuple[list[RingPair], list[RingPair]] | None = None
 
 
 class PoolWriter:
-    """Writes packed windows' latent pages and KDA states into vLLM's unified
-    pools, and reads KDA states back (a prefix hit's).
+    """Writes packed windows' latent pages and KDA states into vLLM's unified pools.
 
     ``raw_pools`` are the distinct pool tensors (``layout.cache_layout()``);
-    ``mla_raw[m]`` / ``kda_raw[k]`` index them for MLA layer ``m`` and KDA
+    ``mla_raw[m]`` and ``kda_raw[k]`` index them for MLA layer ``m`` and KDA
     layer ``k`` (``pools.bind_raw_pools``). KDA heads are written in
     vLLM TP-rank order (``state_perm``, from the kernel's mesh order) and
     read back in mesh order.
@@ -747,43 +961,42 @@ class PoolWriter:
 
     def __init__(
         self,
-        mesh,
+        mesh: Mesh,
         rank: int,
         raw_pools: list[torch.Tensor],
-        mla_raw: list[int],
-        kda_raw: list[int],
-        state_perm: list[tuple[int, int]] | None,
+        indices: _BoundPoolIndices,
     ) -> None:
+        """Initialize pool writer over ``raw_pools`` with ``indices`` mappings."""
         self.mesh, self.rank = mesh, rank
         self.raw_pools = raw_pools
-        from vllm_torchtpu.models.kimi_k3.megakernel.layout import cache_layout
-
         self.layout = cache_layout(str(raw_pools[0].dtype))
-        self.mla_raw, self._kda_raw = tuple(mla_raw), tuple(kda_raw)
+        self.mla_raw = tuple(indices.mla_raw)
+        self._kda_raw = tuple(indices.kda_raw)
         self._perm = (
             None
-            if state_perm is None
-            else tuple((int(a), int(b)) for a, b in state_perm)
+            if indices.state_perm is None
+            else tuple((int(a), int(b)) for a, b in indices.state_perm)
         )
-        self._ops: dict[Any, Any] = {}
+        self._ops: dict[tuple[object, ...], CustomOp] = {}
 
     def mla_pools(self) -> list[torch.Tensor]:
-        """The 24 MLA layers' pools, MLA layer m's at m."""
+        """Return the 24 MLA layers' pool tensors in layer order ``0..23``."""
         return [self.raw_pools[self.mla_raw[m]] for m in range(MLA_LAYERS)]
 
-    def _adopt(self, new) -> list[torch.Tensor]:
-        new = [new] if isinstance(new, torch.Tensor) else list(new)
-        for old, fresh in zip(self.raw_pools, new, strict=True):
+    def _adopt(
+        self,
+        new: torch.Tensor | Sequence[torch.Tensor],
+    ) -> list[torch.Tensor]:
+        """Update ``raw_pools`` storage in place from donated op outputs ``new``."""
+        updated = [new] if isinstance(new, torch.Tensor) else list(new)
+        attr_name = "set_"
+        for old, fresh in zip(self.raw_pools, updated, strict=True):
             if fresh is not old:
-                # Donated in place: keep the connector's tensor identity.
-                old.set_(fresh)
+                getattr(old, attr_name)(fresh)
         return self.raw_pools
 
-    def copy_blocks(self, pairs: list[tuple[int, int]]) -> list[torch.Tensor]:
-        """Block ``dst`` of every pool becomes a copy of block ``src``: vLLM's
-        copy-on-write for a prefix hit ending inside a cached block (each rank
-        copies its own slice of the shared block id). ``COPY_PAIRS`` pairs
-        per call; spare slots copy the null block onto itself."""
+    def copy_blocks(self, pairs: Sequence[tuple[int, int]]) -> list[torch.Tensor]:
+        """Copy source blocks to destination blocks across all raw pools."""
         for first in range(0, len(pairs), COPY_PAIRS):
             chunk = list(pairs[first : first + COPY_PAIRS])
             chunk += [(0, 0)] * (COPY_PAIRS - len(chunk))
@@ -791,14 +1004,17 @@ class PoolWriter:
             destination = torch.tensor([b for _, b in chunk], dtype=torch.int32).to(
                 "tpu"
             )
-            self._adopt(self._copy_op()(*self.raw_pools, source, destination))
+            self._adopt(self.copy_op()(*self.raw_pools, source, destination))
         return self.raw_pools
 
-    def _copy_op(self) -> Any:
-        if "copy" not in self._ops:
+    def copy_op(self) -> CustomOp:
+        """Build or return the cached copy-on-write block-copy custom op."""
+        key = ("copy",)
+        if key not in self._ops:
             num_raw = len(self.raw_pools)
 
-            def body(*args):
+            def body(*args: jax.Array) -> tuple[jax.Array, ...]:
+                """Scatter ``source`` blocks into ``destination`` across raw pools."""
                 raws, source, destination = (
                     args[:num_raw],
                     args[num_raw],
@@ -806,49 +1022,63 @@ class PoolWriter:
                 )
                 return tuple(raw.at[destination].set(raw[source]) for raw in raws)
 
-            self._ops["copy"] = register_op(
+            self._ops[key] = register_op(
                 f"pallas::k3_prefill_copy_blocks_r{num_raw}",
                 self.mesh,
                 body,
-                (P(AXIS),) * num_raw + (P(), P()),
-                (P(AXIS),) * num_raw,
-                donate_argnums=tuple(range(num_raw)),
-                export_key=repr(("copy_blocks", num_raw, COPY_PAIRS)),
+                OpRegistrationSpec(
+                    in_specs=(P(AXIS),) * num_raw + (P(), P()),
+                    out_specs=(P(AXIS),) * num_raw,
+                    donate_argnums=tuple(range(num_raw)),
+                    export_key=repr(("copy_blocks", num_raw, COPY_PAIRS)),
+                ),
             )
-        return self._ops["copy"]
+        return self._ops[key]
 
-    def _write_kda(self, raws: list, recurrent, conv, kda_blocks, count: int) -> list:
-        """(inside an op) ``count`` sequences' KDA states, ``[69, count,
-        ...]``, into ``kda_blocks`` ``[count * 69]`` (each sequence's 69
-        blocks in turn; unused sequences aim at the null block)."""
-        from vllm_torchtpu.kernels import pool_adapters
-
+    def _write_kda(
+        self,
+        raws: list[jax.Array],
+        states: tuple[jax.Array, jax.Array],
+        kda_blocks: jax.Array,
+        count: int,
+    ) -> list[jax.Array]:
+        """Scatter ``count`` sequences' KDA states into ``kda_blocks`` across layers."""
+        recurrent, conv = states
         blocks = kda_blocks.reshape(count, KDA_LAYERS)
         for k in range(KDA_LAYERS):
             index, ids = self._kda_raw[k], blocks[:, k]
             ssm_shape = jax.eval_shape(
-                lambda raw=raws[index], ids=ids: pool_adapters.gather_region(
+                lambda raw=raws[index], block_ids=ids: pool_adapters.gather_region(
                     raw,
-                    ids,
+                    block_ids,
                     tok0=0,
                     ntok=SSM_ROWS,
                     out_dtype=jnp.float32,
-                    out_lanes=128,
+                    out_lanes=_KDA_HEAD_DIM,
                 )
             ).shape
-            ssm = recurrent[k].reshape(count, -1, 128)
+            ssm = recurrent[k].reshape(count, -1, _KDA_HEAD_DIM)
             ssm = jnp.pad(ssm, ((0, 0), (0, ssm_shape[1] - ssm.shape[1]), (0, 0)))
             raws[index] = pool_adapters.scatter_region(
-                raws[index], ssm, ids, tok0=0, ntok=SSM_ROWS
+                raws[index],
+                ssm,
+                ids,
+                tok0=0,
+                ntok=SSM_ROWS,
             )
             conv_shape = jax.eval_shape(
-                lambda raw=raws[index], ids=ids: pool_adapters.gather_region(
-                    raw, ids, tok0=SSM_ROWS, ntok=CONV_ROWS, out_dtype=jnp.bfloat16
+                lambda raw=raws[index], block_ids=ids: pool_adapters.gather_region(
+                    raw,
+                    block_ids,
+                    tok0=SSM_ROWS,
+                    ntok=CONV_ROWS,
+                    out_dtype=jnp.bfloat16,
                 )
             ).shape
             taps = conv[k].reshape(count, -1).astype(jnp.bfloat16)
             taps = jnp.pad(
-                taps, ((0, 0), (0, int(np.prod(conv_shape[1:])) - taps.shape[1]))
+                taps,
+                ((0, 0), (0, int(np.prod(conv_shape[1:])) - taps.shape[1])),
             )
             raws[index] = pool_adapters.scatter_region(
                 raws[index],
@@ -859,53 +1089,32 @@ class PoolWriter:
             )
         return raws
 
-    def write_packed(
-        self,
-        latents,
-        recurrent,
-        conv,
-        recurrent_at,
-        conv_at,
-        table: torch.Tensor,
-        kda_blocks: torch.Tensor,
-        blocks_at: torch.Tensor,
-        rings: tuple[list, list] | None = None,
-    ) -> list[torch.Tensor]:
-        """A packed window's writes (:meth:`PrefillProgram.run_packed`'s
-        outputs): window page ``p``'s latent rows into block ``table[0, p]``
-        (``[1, W / page]``, this rank's own table: the null block for pages it
-        does not own or not to write), then sequence ``s``'s KDA states at its
-        checkpoint into ``blocks_at[s * 69:(s + 1) * 69]`` and its final ones
-        into ``kda_blocks[s * 69:...]``. Only the first ``len(kda_blocks) //
-        69`` slots' states are written (:func:`live_slots`: the window's used
-        ones, rounded up); the rest of the window's slots are unused. ``rings``:
-        each of those sequences' DSpark ring ``(cache, meta)`` after the
-        window and at its checkpoint (:meth:`PrefillRing.update`), written
-        with the states."""
-        window, slots = int(latents.shape[2]), int(recurrent.shape[2])
-        count = int(kda_blocks.shape[0]) // KDA_LAYERS
+    def write_packed(self, batch: _PackedPoolWrite) -> list[torch.Tensor]:
+        """Write a packed window's MLA latent pages, KDA states, and DSpark rings."""
+        window = int(batch.latents.shape[2])
+        slots = int(batch.recurrent.shape[2])
+        count = int(batch.kda_blocks.shape[0]) // KDA_LAYERS
         self._adopt(
-            self._write_op(window, slots, count)(
-                latents,
-                recurrent,
-                conv,
-                recurrent_at,
-                conv_at,
+            self.write_op(window, slots, count)(
+                batch.latents,
+                batch.recurrent,
+                batch.conv,
+                batch.recurrent_at,
+                batch.conv_at,
                 *self.raw_pools,
-                table,
-                kda_blocks,
-                blocks_at,
+                batch.table,
+                batch.kda_blocks,
+                batch.blocks_at,
             )
         )
-        if rings is not None:
-            after, at = rings
-            self._write_rings(at[:count], blocks_at)
-            self._write_rings(after[:count], kda_blocks)
+        if batch.rings is not None:
+            after, at = batch.rings
+            self._write_rings(at[:count], batch.blocks_at)
+            self._write_rings(after[:count], batch.kda_blocks)
         return self.raw_pools
 
-    def _write_op(self, window: int, slots: int, count: int) -> Any:
-        """:meth:`write_packed`'s op for a ``window`` of ``slots`` sequence
-        slots writing the first ``count`` of them."""
+    def write_op(self, window: int, slots: int, count: int) -> CustomOp:
+        """Build or return cached packed-window pool write op for ``count`` slots."""
         key = ("write", window, slots, count)
         if key not in self._ops:
             num_raw, mla_raw, perm, pages = (
@@ -915,71 +1124,103 @@ class PoolWriter:
                 window // self.layout.tokens_per_block,
             )
 
-            def body(latents, recurrent, conv, recurrent_at, conv_at, *rest):
-                raws = list(rest[:num_raw])
-                table, kda_blocks, blocks_at = rest[num_raw:]
-                table = table[0]
-                latents = latents[0]
-                # The live slots only: unused ones would go to the null block.
-                recurrent, conv, recurrent_at, conv_at = (
+            def body(
+                latents: jax.Array,
+                recurrent: jax.Array,
+                conv: jax.Array,
+                *states_and_pools: jax.Array,
+            ) -> tuple[jax.Array, ...]:
+                """Write MLA latent pages and checkpoint/final KDA states into pools."""
+                recurrent_at, conv_at = states_and_pools[0], states_and_pools[1]
+                raws = list(states_and_pools[2 : 2 + num_raw])
+                table, kda_blocks, blocks_at = states_and_pools[2 + num_raw :]
+                table_row = table[0]
+                latents_row = latents[0]
+                rec_live, conv_live, rec_at_live, conv_at_live = (
                     x[0, :, :count] for x in (recurrent, conv, recurrent_at, conv_at)
                 )
                 if perm is not None:
-                    recurrent, conv, recurrent_at, conv_at = (
+                    rec_live, conv_live, rec_at_live, conv_at_live = (
                         jax.lax.ppermute(x, AXIS, perm)
-                        for x in (recurrent, conv, recurrent_at, conv_at)
+                        for x in (rec_live, conv_live, rec_at_live, conv_at_live)
                     )
                 for m in range(MLA_LAYERS):
                     index = mla_raw[m]
                     rows = (
-                        jnp.pad(latents[m], ((0, 0), (0, 64)))
+                        jnp.pad(latents_row[m], ((0, 0), (0, _MLA_PAD_COLS)))
                         .astype(raws[index].dtype)
                         .reshape(pages, *self.layout.block_shape)
                     )
 
-                    def write_page(p, pool, rows=rows):
+                    def write_page(
+                        page_idx: int,
+                        pool: jax.Array,
+                        *,
+                        layer_rows: jax.Array = rows,
+                    ) -> jax.Array:
+                        """Write ``page_idx`` of ``layer_rows`` into ``pool``."""
                         return jax.lax.dynamic_update_index_in_dim(
                             pool,
-                            jax.lax.dynamic_index_in_dim(rows, p, keepdims=False),
-                            table[p],
+                            jax.lax.dynamic_index_in_dim(
+                                layer_rows,
+                                page_idx,
+                                keepdims=False,
+                            ),
+                            table_row[page_idx],
                             axis=0,
                         )
 
                     raws[index] = jax.lax.fori_loop(0, pages, write_page, raws[index])
-                # Checkpoints first (a sequence without one aims it at the null block).
-                raws = self._write_kda(raws, recurrent_at, conv_at, blocks_at, count)
-                raws = self._write_kda(raws, recurrent, conv, kda_blocks, count)
+                raws = self._write_kda(
+                    raws,
+                    (rec_at_live, conv_at_live),
+                    blocks_at,
+                    count,
+                )
+                raws = self._write_kda(
+                    raws,
+                    (rec_live, conv_live),
+                    kda_blocks,
+                    count,
+                )
                 return tuple(raws)
 
+            op_name = (
+                f"pallas::k3_prefill_write_pool_packed{slots}_{count}"
+                f"_r{num_raw}_w{window}_ranked"
+            )
             self._ops[key] = register_op(
-                f"pallas::k3_prefill_write_pool_packed{slots}_{count}_r{num_raw}_w{window}_ranked",
+                op_name,
                 self.mesh,
                 body,
-                (P(AXIS),) * (6 + num_raw) + (P(),) * 2,
-                (P(AXIS),) * num_raw,
-                donate_argnums=tuple(range(5, 5 + num_raw)),
-                export_key=repr(
-                    (
-                        "write_pool_packed",
-                        self.layout,
-                        window,
-                        slots,
-                        count,
-                        self.mla_raw,
-                        self._kda_raw,
-                        self._perm,
-                    )
+                OpRegistrationSpec(
+                    in_specs=(P(AXIS),) * (6 + num_raw) + (P(),) * 2,
+                    out_specs=(P(AXIS),) * num_raw,
+                    donate_argnums=tuple(range(5, 5 + num_raw)),
+                    export_key=repr(
+                        (
+                            "write_pool_packed",
+                            self.layout,
+                            window,
+                            slots,
+                            count,
+                            self.mla_raw,
+                            self._kda_raw,
+                            self._perm,
+                        )
+                    ),
                 ),
             )
         return self._ops[key]
 
-    def _write_rings(self, rings: list, blocks: torch.Tensor) -> list[torch.Tensor]:
-        """Each sequence's DSpark ring ``(cache, meta)`` into the draft rows of
-        its 69 state blocks (``blocks`` ``[n * 69]``). Its own op: with the
-        window's other writes, 16 sequences' rings would exceed the 64
-        arguments a torch op takes."""
+    def _write_rings(
+        self,
+        rings: Sequence[RingPair],
+        blocks: torch.Tensor,
+    ) -> list[torch.Tensor]:
+        """Write each sequence's DSpark ring ``(cache, meta)`` into ``blocks``."""
         return self._adopt(
-            self._rings_op(len(rings))(
+            self.rings_op(len(rings))(
                 *self.raw_pools,
                 blocks,
                 *(cache for cache, _ in rings),
@@ -987,24 +1228,29 @@ class PoolWriter:
             )
         )
 
-    def _rings_op(self, count: int) -> Any:
+    def rings_op(self, count: int) -> CustomOp:
+        """Build or return cached DSpark ring-write custom op for ``count`` slots."""
         key = ("write_rings", count)
         if key not in self._ops:
             num_raw, perm = len(self.raw_pools), self._perm
             (dspark,) = kernel_modules("dspark")
 
-            def body(*args):
+            def body(*args: jax.Array) -> tuple[jax.Array, ...]:
+                """Pack and scatter ``count`` sequences' DSpark rings into raw pools."""
                 raws = list(args[:num_raw])
                 blocks = args[num_raw]
                 caches = args[num_raw + 1 : num_raw + 1 + count]
                 metas = args[num_raw + 1 + count :]
-                caches = jnp.stack([cache[0] for cache in caches])
+                stacked_caches = jnp.stack([cache[0] for cache in caches])
                 if perm is not None:
-                    caches = jax.lax.ppermute(caches, AXIS, perm)
-                packed = dspark.pack_ring(caches, jnp.stack(metas), KDA_LAYERS)
+                    stacked_caches = jax.lax.ppermute(stacked_caches, AXIS, perm)
+                packed = dspark.pack_ring(stacked_caches, jnp.stack(metas), KDA_LAYERS)
                 return tuple(
                     write_draft_rings(
-                        raws, self._kda_raw, packed, blocks.reshape(count, KDA_LAYERS)
+                        raws,
+                        self._kda_raw,
+                        packed,
+                        blocks.reshape(count, KDA_LAYERS),
                     )
                 )
 
@@ -1012,43 +1258,54 @@ class PoolWriter:
                 f"pallas::k3_prefill_write_rings{count}_r{num_raw}_ranked",
                 self.mesh,
                 body,
-                (P(AXIS),) * num_raw + (P(),) + (P(AXIS),) * count + (P(),) * count,
-                (P(AXIS),) * num_raw,
-                donate_argnums=tuple(range(num_raw)),
-                export_key=repr(
-                    ("write_rings", self.layout, count, self._kda_raw, self._perm)
+                OpRegistrationSpec(
+                    in_specs=(P(AXIS),) * num_raw
+                    + (P(),)
+                    + (P(AXIS),) * count
+                    + (P(),) * count,
+                    out_specs=(P(AXIS),) * num_raw,
+                    donate_argnums=tuple(range(num_raw)),
+                    export_key=repr(
+                        ("write_rings", self.layout, count, self._kda_raw, self._perm)
+                    ),
                 ),
             )
         return self._ops[key]
 
     def read_rings(
-        self, draft_config: Any, kda_blocks: torch.Tensor, lengths: list[int]
-    ) -> list[tuple[torch.Tensor, torch.Tensor]]:
-        """The DSpark rings in the draft rows of ``kda_blocks`` (``[n *
-        69]``, a prefix hit's state blocks per sequence) for ``lengths``
-        tokens, in mesh order: ``(cache, meta)`` per sequence -- an empty ring
-        covering the length where the blocks hold none for it."""
+        self,
+        draft_config: object,
+        kda_blocks: torch.Tensor,
+        lengths: Sequence[int],
+    ) -> list[RingPair]:
+        """Read DSpark rings from ``kda_blocks`` for ``lengths`` in mesh order."""
         sequences = len(lengths)
-        out = self._read_rings_op(draft_config, sequences)(
+        out = self.read_rings_op(draft_config, sequences)(
             *self.raw_pools,
             kda_blocks,
-            torch.tensor(lengths, dtype=torch.int32).to("tpu"),
+            torch.tensor(list(lengths), dtype=torch.int32).to("tpu"),
         )
         return list(zip(out[:sequences], out[sequences:], strict=True))
 
-    def _read_rings_op(self, draft_config: Any, sequences: int) -> Any:
+    def read_rings_op(self, draft_config: object, sequences: int) -> CustomOp:
+        """Build or return cached DSpark ring-read custom op for ``sequences``."""
         key = ("read_rings", sequences)
         if key not in self._ops:
             (dspark,) = kernel_modules("dspark")
-            num_raw, kda_raw, c = len(self.raw_pools), self._kda_raw, draft_config
+            num_raw, kda_raw, cfg = len(self.raw_pools), self._kda_raw, draft_config
             perm = (
                 None
                 if self._perm is None
                 else tuple((dst, src) for src, dst in self._perm)
             )
 
-            def body(*args):
-                raws, blocks, lengths = args[:num_raw], args[num_raw], args[num_raw + 1]
+            def body(*args: jax.Array) -> tuple[jax.Array, ...]:
+                """Gather and unpack ``sequences`` DSpark rings from raw pools."""
+                raws, blocks, lengths = (
+                    args[:num_raw],
+                    args[num_raw],
+                    args[num_raw + 1],
+                )
                 packed = read_draft_rings(
                     raws,
                     kda_raw,
@@ -1056,7 +1313,7 @@ class PoolWriter:
                     dspark.RING_ROW_LANES,
                 )
                 out = [
-                    dspark.unpack_ring(c, packed[s], lengths[s])
+                    dspark.unpack_ring(cfg, packed[s], lengths[s])
                     for s in range(sequences)
                 ]
                 caches = jnp.stack([cache for cache, _ in out])
@@ -1067,31 +1324,36 @@ class PoolWriter:
                     *(meta for _, meta in out),
                 )
 
+            cfg_tuple = (
+                dataclasses.astuple(cfg)
+                if dataclasses.is_dataclass(cfg) and not isinstance(cfg, type)
+                else repr(cfg)
+            )
             self._ops[key] = register_op(
                 f"pallas::k3_prefill_read_rings_r{num_raw}_s{sequences}",
                 self.mesh,
                 body,
-                (P(AXIS),) * num_raw + (P(), P()),
-                (P(AXIS),) * sequences + (P(),) * sequences,
-                export_key=repr(
-                    ("read_rings", sequences, kda_raw, perm, dataclasses.astuple(c))
+                OpRegistrationSpec(
+                    in_specs=(P(AXIS),) * num_raw + (P(), P()),
+                    out_specs=(P(AXIS),) * sequences + (P(),) * sequences,
+                    export_key=repr(
+                        ("read_rings", sequences, kda_raw, perm, cfg_tuple)
+                    ),
                 ),
             )
         return self._ops[key]
 
     def read_states(
-        self, kda_blocks: torch.Tensor
+        self,
+        kda_blocks: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """KDA states: ``kda_blocks`` ``[n * 69]`` (each sequence's 69 blocks
-        in turn) -> ``[1, 69, n, ...]`` recurrent and conv states in mesh
-        order."""
+        """Read ``kda_blocks`` into ``[1, 69, n, ...]`` recurrent and conv states."""
         sequences = int(kda_blocks.shape[0]) // KDA_LAYERS
-        recurrent, conv = self._read_states_op(sequences)(*self.raw_pools, kda_blocks)
-        return recurrent, conv
+        out = self.read_states_op(sequences)(*self.raw_pools, kda_blocks)
+        return out[0], out[1]
 
-    def _read_states_op(self, sequences: int) -> Any:
-        from vllm_torchtpu.kernels import pool_adapters
-
+    def read_states_op(self, sequences: int) -> CustomOp:
+        """Build or return cached KDA state-read custom op for ``sequences``."""
         key = ("read", sequences)
         if key not in self._ops:
             num_raw, kda_raw = len(self.raw_pools), self._kda_raw
@@ -1100,13 +1362,17 @@ class PoolWriter:
                 if self._perm is None
                 else tuple((dst, src) for src, dst in self._perm)
             )
+            ssm_elements = _KDA_HEADS * _KDA_HEAD_DIM
+            conv_elements = _KDA_CONV_TAPS * _KDA_HEADS * _KDA_HEADS * _KDA_HEAD_DIM
 
-            def body(*args):
+            def body(*args: jax.Array) -> tuple[jax.Array, jax.Array]:
+                """Gather recurrent and conv states for ``sequences`` from raw pools."""
                 raws, blocks = (
                     args[:num_raw],
                     args[num_raw].reshape(sequences, KDA_LAYERS),
                 )
-                recurrent, conv = [], []
+                recurrent_list: list[jax.Array] = []
+                conv_list: list[jax.Array] = []
                 for k in range(KDA_LAYERS):
                     raw, ids = raws[kda_raw[k]], blocks[:, k]
                     ssm = pool_adapters.gather_region(
@@ -1115,18 +1381,34 @@ class PoolWriter:
                         tok0=0,
                         ntok=SSM_ROWS,
                         out_dtype=jnp.float32,
-                        out_lanes=128,
+                        out_lanes=_KDA_HEAD_DIM,
                     )
-                    recurrent.append(ssm[:, : 3 * 128].reshape(-1, 3, 128, 128))
-                    taps = pool_adapters.gather_region(
-                        raw, ids, tok0=SSM_ROWS, ntok=CONV_ROWS, out_dtype=jnp.bfloat16
-                    )
-                    conv.append(
-                        taps.reshape(sequences, -1)[:, : 3 * 3 * 3 * 128].reshape(
-                            -1, 3, 3, 3, 128
+                    recurrent_list.append(
+                        ssm[:, :ssm_elements].reshape(
+                            -1,
+                            _KDA_HEADS,
+                            _KDA_HEAD_DIM,
+                            _KDA_HEAD_DIM,
                         )
                     )
-                recurrent, conv = jnp.stack(recurrent), jnp.stack(conv)
+                    taps = pool_adapters.gather_region(
+                        raw,
+                        ids,
+                        tok0=SSM_ROWS,
+                        ntok=CONV_ROWS,
+                        out_dtype=jnp.bfloat16,
+                    )
+                    conv_list.append(
+                        taps.reshape(sequences, -1)[:, :conv_elements].reshape(
+                            -1,
+                            _KDA_CONV_TAPS,
+                            _KDA_HEADS,
+                            _KDA_HEADS,
+                            _KDA_HEAD_DIM,
+                        )
+                    )
+                recurrent = jnp.stack(recurrent_list)
+                conv = jnp.stack(conv_list)
                 if perm is not None:
                     recurrent = jax.lax.ppermute(recurrent, AXIS, perm)
                     conv = jax.lax.ppermute(conv, AXIS, perm)
@@ -1136,36 +1418,52 @@ class PoolWriter:
                 f"pallas::k3_prefill_read_states_r{num_raw}_s{sequences}",
                 self.mesh,
                 body,
-                (P(AXIS),) * num_raw + (P(),),
-                (P(AXIS),) * 2,
-                export_key=repr(("read_states", sequences, self._kda_raw, perm)),
+                OpRegistrationSpec(
+                    in_specs=(P(AXIS),) * num_raw + (P(),),
+                    out_specs=(P(AXIS),) * 2,
+                    export_key=repr(("read_states", sequences, self._kda_raw, perm)),
+                ),
             )
         return self._ops[key]
 
 
 @dataclasses.dataclass
 class _Request:
-    """A request between its scheduler steps. Its earlier tokens' MLA pages
-    are in the pool (the request owns them for its life); its KDA state is
-    kept here -- vLLM's ``align`` mode frees a step's state block two steps
-    later, before a skipped step's successor would read it."""
+    """In-flight prefill request state retained across scheduler steps."""
 
     req_id: str
-    # tokens computed before its first step: their pages are in the pool already
     first_cached: int
-    start: int  # tokens computed so far (block-aligned until the prompt is done)
-    # KDA state after ``start``, [1, 69, ...]; None: zero.
+    start: int
     state: tuple[torch.Tensor, torch.Tensor] | None = None
-    # Skipped partial steps: (end, KDA state blocks vLLM assigned the state after
-    # ``end``).
-    skipped: list = dataclasses.field(default_factory=list)
-    # The DSpark ring after ``start`` (draft_ring.PrefillRing): (cache, meta).
-    ring: tuple[torch.Tensor, torch.Tensor] | None = None
+    skipped: list[tuple[int, torch.Tensor]] = dataclasses.field(default_factory=list)
+    ring: RingPair | None = None
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class _ScheduledWork:
+    """Per-request piece plan and checkpoint map scheduled in the current step."""
+
+    row_index: int
+    state: _Request
+    pieces: list[Piece]
+    stops: dict[int, torch.Tensor]
+    finishes: bool
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class _WindowPackPlan:
+    """Prepared token array, segment descriptors, and state blocks for a window."""
+
+    tokens: np.ndarray
+    descriptor: list[int]
+    states: list[tuple[torch.Tensor, torch.Tensor]]
+    finals: list[torch.Tensor]
+    ats: list[torch.Tensor]
+    unused: int
 
 
 class KimiPrefiller:
-    """The prefill role's program (:class:`MegakernelProgram`; see the module
-    docstring)."""
+    """Sequence-parallel prefill program (:class:`MegakernelProgram`) over pools."""
 
     def __init__(
         self,
@@ -1175,18 +1473,20 @@ class KimiPrefiller:
         *,
         tp_rank: int,
     ) -> None:
+        """Initialize the Kimi-K3 prefiller for ``config`` and ``tp_rank``."""
         self.config = config
         self.page_tokens = config.block_size
         self.presharded = Path(presharded)
         self.cp_rank = tp_rank % config.decode_context_parallel_size
         budget = config.max_num_batched_tokens
         windows = prefill_windows(budget, config.max_model_len)
-        # The most prefix tokens a window's sequences may hold in all (a
-        # multiple of 4096), and a rank's share of them: 1/32 plus a page of
-        # rounding slack per sequence, in multiples of 1024.
-        capacity = max(windows[-1], -(-config.max_model_len // 4096) * 4096)
+        capacity = max(
+            windows[-1],
+            -(-config.max_model_len // _PREFIX_ALIGN_TOKENS) * _PREFIX_ALIGN_TOKENS,
+        )
         self.cp_capacity = (
-            -(-(capacity // DCP_SIZE + SLOTS * self.page_tokens) // 1024) * 1024
+            -(-(capacity // DCP_SIZE + SLOTS * self.page_tokens) // _CP_ALIGN_TOKENS)
+            * _CP_ALIGN_TOKENS
         )
         self.slots = min(config.max_num_seqs, SLOTS)
         self.program = PrefillProgram(windows, capacity, self.slots, self.page_tokens)
@@ -1194,27 +1494,18 @@ class KimiPrefiller:
         self._requests: dict[str, _Request] = {}
         self._zero_pair: tuple[torch.Tensor, torch.Tensor] | None = None
         self._writer: PoolWriter | None = None
-        # The pool on the device of TP rank q must hold kernel rank q's KDA
-        # heads: the inverse of the decode importer's permutation.
         perm = tp_rank_permutation(tp_rank, self.rank)
         self._state_perm = None if perm is None else [(dst, src) for src, dst in perm]
         self._mla_group = 0
         self._kda_groups: list[tuple[int, int]] = []
         self._zero_logits: torch.Tensor | None = None
+        self._sampler_ops: dict[bool, CustomOp] = {}
         self._loaded = False
-        # With the DSpark speculator: each request's draft ring, computed from
-        # the windows' residual streams and written with its KDA state.
-        self.ring = None
-        # With the MLA DSpark draft (Inferact/Kimi-K3-DSpark): each window's
-        # draft context latents, written to the draft's KV cache layers.
-        self.draft_latents = None
+        self.ring: PrefillRing | None = None
+        self.draft_latents: PrefillDraftLatents | None = None
         if draft_checkpoint is not None:
             (mla,) = kernel_modules("dspark_mla")
             if mla.is_mla_draft(Path(draft_checkpoint)):
-                from vllm_torchtpu.models.kimi_k3.megakernel.draft_mla_prefill import (
-                    PrefillDraftLatents,
-                )
-
                 self.draft_latents = PrefillDraftLatents(
                     self.program.mesh,
                     self.rank,
@@ -1224,10 +1515,6 @@ class KimiPrefiller:
                     config.max_model_len,
                 )
             else:
-                from vllm_torchtpu.models.kimi_k3.megakernel.draft_ring import (
-                    PrefillRing,
-                )
-
                 self.ring = PrefillRing(
                     self.program.mesh,
                     self.rank,
@@ -1237,6 +1524,7 @@ class KimiPrefiller:
                 )
 
     def load_weights(self) -> None:
+        """Load target and draft prefill weights onto the TPU if not yet resident."""
         if self._loaded:
             return
         started = time.perf_counter()
@@ -1253,61 +1541,53 @@ class KimiPrefiller:
             )
 
     def bind_kv_caches(
-        self, caches: Mapping[str, torch.Tensor], groups: Sequence[KVGroup]
+        self,
+        caches: Mapping[str, torch.Tensor],
+        groups: Sequence[KVGroup],
     ) -> None:
-        """Write vLLM's unified pools; ``groups`` say which block-table row
-        holds a request's MLA pages and where each KDA layer's state blocks
-        are."""
+        """Bind vLLM's unified KV pool tensors and record MLA/KDA group indices."""
         self.load_weights()
         raw_pools, mla_raw, kda_raw, mla_names, kda_names = bind_raw_pools(
-            caches, self.config.kv_cache_dtype
+            caches,
+            self.config.kv_cache_dtype,
         )
         self._writer = PoolWriter(
-            self.program.mesh, self.rank, raw_pools, mla_raw, kda_raw, self._state_perm
+            self.program.mesh,
+            self.rank,
+            raw_pools,
+            _BoundPoolIndices(mla_raw, kda_raw, self._state_perm),
         )
         if self.draft_latents is not None:
             self.draft_latents.bind(draft_raw_pools(caches))
         of = {name: g for g, group in enumerate(groups) for name in group.layer_names}
         mla_groups = {of[n] for n in mla_names if n in of}
         if len(mla_groups) != 1:
-            raise RuntimeError(
+            msg = (
                 "K3 prefill: the MLA layers are in "
                 f"KV cache groups {sorted(mla_groups)}"
             )
+            raise RuntimeError(msg)
         self._mla_group = mla_groups.pop()
         missing = [n for n in kda_names if n not in of]
         if missing:
-            raise RuntimeError(
-                f"K3 prefill: KDA layers {missing[:3]}... are in no KV cache group"
-            )
+            msg = f"K3 prefill: KDA layers {missing[:3]}... are in no KV cache group"
+            raise RuntimeError(msg)
         self._kda_groups = [(of[n], int(groups[of[n]].block_size)) for n in kda_names]
 
     def _zeros(self) -> torch.Tensor:
+        """Return a cached ``[1, VOCAB]`` float32 zero logit row on the TPU."""
         if self._zero_logits is None:
             self._zero_logits = torch.zeros((1, VOCAB), dtype=torch.float32).to("tpu")
         return self._zero_logits
 
-    # ------------------------------------------------------------ steps
-    def step(self, step_input: StepInput) -> StepOutput:
-        """One prefill step. Requests that finish their prompt get their first
-        token, chosen in the op (``[requests, 1]``; -1 for the others)."""
-        if self._writer is None:
-            raise RuntimeError(
-                "K3 prefill: a request arrived before the KV pools were bound"
-            )
-        rows, copies = step_input.requests, step_input.copies
-        if copies:
-            # vLLM's copy-on-write block copies (a prefix hit ending inside a
-            # cached block gets a private copy of it), before the windows that
-            # read the copies as their prefix.
-            pairs = [(int(src), int(dst)) for src, dst in copies]
-            self._writer.copy_blocks(pairs)
-            if self.draft_latents is not None:
-                self.draft_latents.copy_blocks(pairs, COPY_PAIRS)
-        for req in step_input.finished:
-            self._requests.pop(req, None)
-        largest = self.program.windows[-1]
-        work, hits = [], []
+    def _collect_step_work(
+        self,
+        rows: Sequence[RequestInput],
+        largest: int,
+    ) -> tuple[list[_ScheduledWork], list[tuple[int, _Request]]]:
+        """Classify scheduled requests into runnable piece plans and cache-hit reads."""
+        work: list[_ScheduledWork] = []
+        hits: list[tuple[int, _Request]] = []
         for i, row in enumerate(rows):
             if row.scheduled <= 0:
                 continue
@@ -1324,23 +1604,30 @@ class KimiPrefiller:
                 else (state.skipped[-1][0] if state.skipped else state.start)
             )
             if state is None or cached != expected:
-                # New (or resumed after preemption): from a block-aligned hit, else
-                # from token 0.
                 state = _Request(
-                    req, cached, cached if cached % self.page_tokens == 0 else 0
+                    req,
+                    cached,
+                    cached if cached % self.page_tokens == 0 else 0,
                 )
                 self._requests[req] = state
                 if state.start:
                     hits.append((i, state))
             if skips_step(
-                cached, total, prompt, state.start, largest, self.page_tokens * DCP_SIZE
+                cached,
+                total,
+                prompt,
+                state.start,
+                largest,
+                self.page_tokens * DCP_SIZE,
             ):
                 state.skipped.append(
                     (
                         total,
                         self._blocks(
                             kda_blocks_at_length(
-                                row.block_tables, self._kda_groups, total
+                                row.block_tables,
+                                self._kda_groups,
+                                total,
                             )
                         ),
                     )
@@ -1349,36 +1636,72 @@ class KimiPrefiller:
             stops = dict(state.skipped)
             state.skipped = []
             work.append(
-                (
-                    i,
-                    state,
-                    plan_pieces(
-                        i, state.start, total, list(stops), largest, self.page_tokens
+                _ScheduledWork(
+                    row_index=i,
+                    state=state,
+                    pieces=plan_pieces(
+                        i,
+                        state.start,
+                        total,
+                        list(stops),
+                        largest,
+                        self.page_tokens,
                     ),
-                    stops,
-                    total >= prompt,
+                    stops=stops,
+                    finishes=total >= prompt,
                 )
             )
-        self._read_hit_states(rows, hits)
+        return work, hits
+
+    def _execute_waves(
+        self,
+        rows: Sequence[RequestInput],
+        work: Sequence[_ScheduledWork],
+    ) -> dict[int, torch.Tensor]:
+        """Pack and run prefill window waves across ``work`` and collect logits."""
         logits: dict[int, torch.Tensor] = {}
-        by_row = {i: (state, stops) for i, state, _, stops, _ in work}
-        for wave in range(max((len(pieces) for _, _, pieces, _, _ in work), default=0)):
-            pieces = [p[wave] for _, _, p, _, _ in work if len(p) > wave]
-            last = {i for i, _, p, _, _ in work if len(p) == wave + 1}
+        by_row = {item.row_index: (item.state, item.stops) for item in work}
+        waves = max((len(item.pieces) for item in work), default=0)
+        for wave in range(waves):
+            pieces = [item.pieces[wave] for item in work if len(item.pieces) > wave]
+            last = {item.row_index for item in work if len(item.pieces) == wave + 1}
             for window, members in pack_windows(
-                pieces, self.program.windows, self.slots, self.program.capacity
+                pieces,
+                self.program.windows,
+                self.slots,
+                self.program.capacity,
             ):
                 out = self._run_window(rows, by_row, window, members)
                 for s, (piece, _) in enumerate(members):
                     if piece.row in last:
                         logits[piece.row] = out[s : s + 1]
-        done = {i for i, _, _, _, finishes in work if finishes}
-        for i, state, _, _, finishes in work:
-            if finishes:
-                del self._requests[state.req_id]
+        return logits
+
+    def step(self, step_input: StepInput) -> StepOutput:
+        """Run one prefill step and return sampled first tokens for finished prompts."""
+        if self._writer is None:
+            msg = "K3 prefill: a request arrived before the KV pools were bound"
+            raise RuntimeError(msg)
+        rows, copies = step_input.requests, step_input.copies
+        if copies:
+            pairs = [(int(src), int(dst)) for src, dst in copies]
+            self._writer.copy_blocks(pairs)
+            if self.draft_latents is not None:
+                self.draft_latents.copy_blocks(pairs, COPY_PAIRS)
+        for req in step_input.finished:
+            self._requests.pop(req, None)
+        largest = self.program.windows[-1]
+        work, hits = self._collect_step_work(rows, largest)
+        self._read_hit_states(rows, hits)
+        logits = self._execute_waves(rows, work)
+        done = {item.row_index for item in work if item.finishes}
+        for item in work:
+            if item.finishes:
+                del self._requests[item.state.req_id]
         return StepOutput(self._first_tokens(rows, logits, done))
 
     def _blocks(self, values: np.ndarray) -> torch.Tensor:
+        """Upload int32 block-index array ``values`` onto the TPU device."""
         return torch.from_numpy(np.ascontiguousarray(values, np.int32)).to("tpu")
 
     def _first_tokens(
@@ -1387,19 +1710,16 @@ class KimiPrefiller:
         logits: dict[int, torch.Tensor],
         done: set[int],
     ) -> torch.Tensor:
-        """The first token of each row that finished its prompt (``[rows,
-        1]``, -1 elsewhere), chosen by :meth:`_sampler_op` on the rows'
-        logits (padded to ``max_num_seqs`` rows: one compiled op)."""
+        """Sample first tokens for rows in ``done`` into ``[rows, 1]`` int32 IDs."""
         count = self.config.max_num_seqs
         if len(rows) > count:
-            raise RuntimeError(
-                f"K3 prefill: {len(rows)} rows exceed max_num_seqs {count}"
-            )
+            msg = f"K3 prefill: {len(rows)} rows exceed max_num_seqs {count}"
+            raise RuntimeError(msg)
         stacked = torch.cat(
             [logits.get(i, self._zeros()) for i in range(len(rows))]
             + [self._zeros()] * (count - len(rows))
         )
-        params = np.zeros((count, 5), np.int32)
+        params = np.zeros((count, _SAMPLING_PARAM_COLS), np.int32)
         params[:, 1] = np.float32(1).view(np.int32)
         for i, row in enumerate(rows):
             temperature, top_p, top_k, seed = row.sampling.as_tuple()
@@ -1407,38 +1727,36 @@ class KimiPrefiller:
                 np.float32(temperature).view(np.int32),
                 np.float32(top_p).view(np.int32),
                 top_k,
-                seed & 0x7FFFFFFF,
+                seed & _POSITIVE_INT32_MASK,
                 max(row.end - 1, 0),
             )
         sampled = any(row.sampling.temperature > 0 for row in rows)
-        (tokens,) = self._sampler_op(sampled)(
-            stacked, torch.from_numpy(params).to("tpu")
+        (tokens,) = self._sampler_op(sampled=sampled)(
+            stacked,
+            torch.from_numpy(params).to("tpu"),
         )
         keep = torch.tensor([i in done for i in range(count)], dtype=torch.bool).to(
             "tpu"
         )
         return torch.where(keep, tokens, torch.full_like(tokens, -1))[
-            : max(len(rows), 1), None
+            : max(len(rows), 1),
+            None,
         ]
 
-    def _sampler_op(self, sampled: bool) -> Any:
-        """``(logits [n, VOCAB] replicated, params [n, 5]) -> tokens [n]``:
-        greedy, or with ``sampled`` each row with a temperature drawn from
-        its distribution (the decoder's in-op sampling, :mod:`sampling`, on
-        its ``tp`` mesh: the same devices in the same order)."""
-        key = ("sampler", sampled)
-        if key in self.program._ops:
-            return self.program._ops[key]
-        from vllm_torchtpu.models.kimi_k3.megakernel import sampling
-
+    def _sampler_op(self, *, sampled: bool) -> CustomOp:
+        """Build or return the first-token greedy or stochastic sampling custom op."""
+        if sampled in self._sampler_ops:
+            return self._sampler_ops[sampled]
         width = VOCAB // TP_SIZE
 
-        def body(logits, params):
+        def body(logits: jax.Array, params: jax.Array) -> tuple[jax.Array]:
+            """Choose first tokens across rows on the TP vocabulary mesh."""
             rank = jax.lax.axis_index(sampling.AXIS)
             local = jax.lax.dynamic_slice_in_dim(logits, rank * width, width, axis=1)
             chosen = sampling.greedy(local)
             if sampled:
-                temperature, top_p = _as_float(params[:, 0]), _as_float(params[:, 1])
+                temperature = _as_float(params[:, 0])
+                top_p = _as_float(params[:, 1])
                 draws = sampling.sample_rows(
                     local,
                     jnp.where(temperature > 0, temperature, 1.0),
@@ -1450,20 +1768,29 @@ class KimiPrefiller:
                 chosen = jnp.where(temperature > 0, draws, chosen)
             return (chosen.astype(jnp.int32),)
 
+        key = ("sampler", sampled)
         name = f"pallas::k3_prefill_first_token{'_sampled' if sampled else ''}"
-        self.program._ops[key] = register_op(
+        self._sampler_ops[sampled] = register_op(
             name,
             kernel_mesh(sampling.AXIS, TP_SIZE)[0],
             body,
-            (P(), P()),
-            (P(),),
-            export_key=repr(key),
+            OpRegistrationSpec(
+                in_specs=(P(), P()), out_specs=(P(),), export_key=repr(key)
+            ),
         )
-        return self.program._ops[key]
+        return self._sampler_ops[sampled]
 
-    def _read_hit_states(self, rows: Sequence[RequestInput], hits: list) -> None:
-        """The KDA states at new requests' prefix-cache hits, from the blocks
-        vLLM's ``align`` mode keeps for them (up to ``slots`` per read)."""
+    def _read_hit_states(
+        self,
+        rows: Sequence[RequestInput],
+        hits: Sequence[tuple[int, _Request]],
+    ) -> None:
+        """Populate KDA states and DSpark rings for new prefix-cache hit requests."""
+        if not hits:
+            return
+        if self._writer is None:
+            msg = "K3 prefill: pool writer must be bound before reading hit states"
+            raise RuntimeError(msg)
         for first in range(0, len(hits), self.slots):
             chunk = hits[first : first + self.slots]
             blocks = [
@@ -1479,52 +1806,64 @@ class KimiPrefiller:
             blocks += [self._zero_blocks()] * (self.slots - len(chunk))
             recurrent, conv = self._writer.read_states(torch.cat(blocks))
             for (_, state), pair in zip(
-                chunk, self.program.split_states(recurrent, conv)
+                chunk,
+                self.program.split_states(recurrent, conv),
+                strict=False,
             ):
                 state.state = pair
             if self.ring is not None:
-                assert self._writer is not None
                 lengths = [state.start for _, state in chunk]
                 lengths += [0] * (self.slots - len(chunk))
                 rings = self._writer.read_rings(
-                    self.ring.config, torch.cat(blocks), lengths
+                    self.ring.config,
+                    torch.cat(blocks),
+                    lengths,
                 )
                 for (_, state), ring in zip(chunk, rings, strict=False):
                     state.ring = ring
 
     def _zero_blocks(self) -> torch.Tensor:
+        """Allocate a ``[KDA_LAYERS]`` int32 zero block-index vector on the TPU."""
         return torch.zeros(KDA_LAYERS, dtype=torch.int32).to("tpu")
 
     def _zero_state(self) -> tuple[torch.Tensor, torch.Tensor]:
-        # Only ever an input of stack_states (not donated): one pair serves all.
+        """Return the shared single-sequence zero KDA state pair on the TPU."""
         if self._zero_pair is None:
             self._zero_pair = self.program.zero_state()
         return self._zero_pair
 
-    def _run_window(
-        self, rows: Sequence[RequestInput], by_row, window: int, members
-    ) -> torch.Tensor:
-        """One packed window: run it on the members' prefixes, write each
-        member's pages (from its first uncached one) and KDA states (final,
-        and at its checkpoint), keep its state. Returns the ``[slots,
-        VOCAB]`` logits (the window's slots)."""
-        count, local = self.program.window_slots(window), window // 32
+    def _pack_window_members(
+        self,
+        rows: Sequence[RequestInput],
+        by_row: Mapping[int, tuple[_Request, dict[int, torch.Tensor]]],
+        window: int,
+        members: Sequence[tuple[Piece, int]],
+    ) -> _WindowPackPlan:
+        """Assemble token IDs, segment descriptors, and KDA blocks for ``members``."""
+        count = self.program.window_slots(window)
         tokens = np.full(window, -1, np.int32)
-        offsets, lengths, checkpoints, bases, cached = [], [], [], [], []
-        states, finals, ats = [], [], []
+        offsets: list[int] = []
+        lengths: list[int] = []
+        checkpoints: list[int] = []
+        bases: list[int] = []
+        cached: list[int] = []
+        states: list[tuple[torch.Tensor, torch.Tensor]] = []
+        finals: list[torch.Tensor] = []
+        ats: list[torch.Tensor] = []
         base = 0
         for piece, offset in members:
             state, stops = by_row[piece.row]
             if piece.start % self.page_tokens:
-                # Its window pages would land shifted in the pool: corrupt caches.
-                raise RuntimeError(
+                msg = (
                     f"K3 prefill: request {state.req_id} continues mid-page at "
                     f"token {piece.start}; windows need page-aligned chunks "
                     "(vllm_torchtpu's Mamba split patch aligns them)"
                 )
+                raise RuntimeError(msg)
             row = rows[piece.row]
             tokens[offset : offset + piece.length] = np.asarray(
-                row.token_ids[piece.start : piece.end], np.int32
+                row.token_ids[piece.start : piece.end],
+                np.int32,
             )
             offsets.append(offset)
             lengths.append(piece.length)
@@ -1548,95 +1887,186 @@ class KimiPrefiller:
         bases += [base] * unused
         cached += [0] * unused
         states += [self._zero_state()] * unused
-        # The pool writes cover the live slots only (live_slots).
         live = live_slots(len(members), count)
         finals += [self._zero_blocks()] * (live - len(members))
         ats += [self._zero_blocks()] * (live - len(members))
-        ids, local_bases, write_table = self._cp_operands(rows, by_row, window, members)
-        order = self.program.sp_order(window)  # the ranks' rows, rank-major
-        ring_hook, ring_out = None, {}
+        return _WindowPackPlan(
+            tokens=tokens,
+            descriptor=offsets + lengths + checkpoints + bases + cached,
+            states=states,
+            finals=finals,
+            ats=ats,
+            unused=unused,
+        )
+
+    def _build_window_ring_hook(
+        self,
+        window: int,
+        members: Sequence[tuple[Piece, int]],
+        by_row: Mapping[int, tuple[_Request, dict[int, torch.Tensor]]],
+        order: np.ndarray,
+    ) -> tuple[
+        Callable[..., None] | None,
+        dict[str, tuple[list[RingPair], list[RingPair]]],
+        dict[str, torch.Tensor],
+    ]:
+        """Build the optional draft-latent or DSpark-ring hook for ``_run_window``."""
+        ring_out: dict[str, tuple[list[RingPair], list[RingPair]]] = {}
+        draft_out: dict[str, torch.Tensor] = {}
+        ring_hook: Callable[..., None] | None = None
         if self.draft_latents is not None:
+            draft_latents = self.draft_latents
             draft_positions = np.full(window, -1, np.int32)
             for piece, offset in members:
                 draft_positions[offset : offset + piece.length] = np.arange(
-                    piece.start, piece.end
+                    piece.start,
+                    piece.end,
                 )
 
-            def ring_hook(blocks, prefix, middle, tap3, tap90):
-                assert self.draft_latents is not None
-                ring_out["draft"] = self.draft_latents.latents(
-                    window, blocks, tap3, tap90, draft_positions, order
+            def draft_hook(
+                blocks: torch.Tensor,
+                _prefix: torch.Tensor,
+                _middle: torch.Tensor,
+                tap3: torch.Tensor,
+                tap90: torch.Tensor,
+            ) -> None:
+                """Project MLA draft latents from auxiliary residual stream taps."""
+                draft_out["draft"] = draft_latents.latents(
+                    window,
+                    blocks,
+                    tap3,
+                    tap90,
+                    draft_positions,
+                    order,
                 )
+
+            ring_hook = draft_hook
 
         if self.ring is not None:
+            ring_model = self.ring
+            unused = self.program.window_slots(window) - len(members)
             positions = np.full(window, -1, np.int32)
             sequences = np.full(window, -1, np.int32)
-            ends, stops, rings = [], [], []
+            ends: list[int] = []
+            stops: list[int] = []
+            rings: list[RingPair] = []
             for s, (piece, offset) in enumerate(members):
                 state, _ = by_row[piece.row]
                 positions[offset : offset + piece.length] = np.arange(
-                    piece.start, piece.end
+                    piece.start,
+                    piece.end,
                 )
                 sequences[offset : offset + piece.length] = s
                 ends.append(piece.end)
                 stops.append(-1 if piece.stop is None else piece.stop)
                 if state.ring is None:
-                    state.ring = self.ring.empty(piece.start)
+                    state.ring = ring_model.empty(piece.start)
                 rings.append(state.ring)
             ends += [-1] * unused
             stops += [-1] * unused
-            rings += [self.ring.zero()] * unused
-            # The ring update takes rows in ownership order.
-            positions, sequences = positions[order], sequences[order]
+            rings += [ring_model.zero()] * unused
+            ordered_pos = positions[order]
+            ordered_seq = sequences[order]
 
-            def ring_hook(blocks, prefix, middle, *taps):
-                ring_out["after"], ring_out["at"] = self.ring.update(
-                    blocks, prefix, middle, positions, sequences, ends, stops, rings
+            def dspark_hook(
+                blocks: torch.Tensor,
+                prefix: torch.Tensor,
+                middle: torch.Tensor,
+                _tap3: torch.Tensor,
+                _tap90: torch.Tensor,
+            ) -> None:
+                """Update per-sequence DSpark rings from window residual streams."""
+                ring_out["rings"] = ring_model.update(
+                    blocks,
+                    prefix,
+                    middle,
+                    ordered_pos,
+                    ordered_seq,
+                    ends,
+                    stops,
+                    rings,
                 )
 
-        recurrent, conv = self.program.stack_states(states)
+            ring_hook = dspark_hook
+
+        return ring_hook, ring_out, draft_out
+
+    def _run_window(
+        self,
+        rows: Sequence[RequestInput],
+        by_row: Mapping[int, tuple[_Request, dict[int, torch.Tensor]]],
+        window: int,
+        members: Sequence[tuple[Piece, int]],
+    ) -> torch.Tensor:
+        """Run one packed window, write pools and KDA states, and return logits."""
+        if self._writer is None:
+            msg = "K3 prefill: pool writer must be bound before running windows"
+            raise RuntimeError(msg)
+        local = window // TP_SIZE
+        pack_plan = self._pack_window_members(rows, by_row, window, members)
+        ids, local_bases, write_table = self._cp_operands(
+            rows,
+            by_row,
+            window,
+            members,
+        )
+        order = self.program.sp_order(window)
+        ring_hook, ring_out, draft_out = self._build_window_ring_hook(
+            window,
+            members,
+            by_row,
+            order,
+        )
+        recurrent, conv = self.program.stack_states(pack_plan.states)
         shard = (
-            torch.from_numpy(tokens[order[self.rank * local : (self.rank + 1) * local]])
+            torch.from_numpy(
+                pack_plan.tokens[order[self.rank * local : (self.rank + 1) * local]]
+            )
             .unsqueeze(0)
             .to("tpu")
         )
         extent = members[-1][1] + members[-1][0].length
         logits, latents, recurrent, conv, recurrent_at, conv_at = (
             self.program.run_packed(
-                shard,
-                _device_i32([extent]),
-                _device_i32(offsets + lengths + checkpoints + bases + cached),
-                recurrent,
-                conv,
-                self._writer.mla_pools(),
-                ids,
-                local_bases,
-                ring_hook,
+                _PackedWindowInputs(
+                    shard=shard,
+                    extent=_device_i32([extent]),
+                    segments=_device_i32(pack_plan.descriptor),
+                    recurrent=recurrent,
+                    conv=conv,
+                    pools=self._writer.mla_pools(),
+                    ids=ids,
+                    local=local_bases,
+                    ring=ring_hook,
+                )
             )
         )
         self._writer.write_packed(
-            latents,
-            recurrent,
-            conv,
-            recurrent_at,
-            conv_at,
-            write_table,
-            torch.cat(finals),
-            torch.cat(ats),
-            (ring_out["after"], ring_out["at"]) if "after" in ring_out else None,
+            _PackedPoolWrite(
+                latents=latents,
+                recurrent=recurrent,
+                conv=conv,
+                recurrent_at=recurrent_at,
+                conv_at=conv_at,
+                table=write_table,
+                kda_blocks=torch.cat(pack_plan.finals),
+                blocks_at=torch.cat(pack_plan.ats),
+                rings=ring_out.get("rings"),
+            )
         )
-        if "draft" in ring_out:
-            assert self.draft_latents is not None and self._writer is not None
+        if "draft" in draft_out and self.draft_latents is not None:
             self.draft_latents.write(
-                ring_out["draft"], write_table, self._writer.layout.block_shape
+                draft_out["draft"],
+                write_table,
+                self._writer.layout.block_shape,
             )
         for s, ((piece, _), pair) in enumerate(
-            zip(members, self.program.split_states(recurrent, conv))
+            zip(members, self.program.split_states(recurrent, conv), strict=False)
         ):
             state, _ = by_row[piece.row]
             state.state, state.start = pair, piece.end
-            if "after" in ring_out:
-                state.ring = ring_out["after"][s]
+            if "rings" in ring_out:
+                state.ring = ring_out["rings"][0][s]
         if self.rank == 0:
             logger.info(
                 "K3 prefill: packed %d-token window: %s",
@@ -1650,152 +2080,189 @@ class KimiPrefiller:
         return logits
 
     def _cp_operands(
-        self, rows: Sequence[RequestInput], by_row, window: int, members
+        self,
+        rows: Sequence[RequestInput],
+        by_row: Mapping[int, tuple[_Request, dict[int, torch.Tensor]]],
+        window: int,
+        members: Sequence[tuple[Piece, int]],
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """This rank's context parallel operands for a packed window: its own
-        prefix pages end to end (``[1, 1 + cp_capacity / page]``: count, then
-        the block ids of global pages k with ``k % 32 == cp_rank``, at logical
-        block ``k // 32``), each sequence's base and token count in that list
-        (``[1, 2 * slots]``, the window's slots), and its page table for the
-        window's writes (``[1, W / page]``: the pages it owns, the null block
-        elsewhere)."""
+        """Build this rank's context-parallel prefix page IDs and write table."""
         cp, rank = DCP_SIZE, self.cp_rank
-        own, bases, counts, cursor = [], [], [], 0
+        own: list[int] = []
+        bases: list[int] = []
+        counts: list[int] = []
+        cursor = 0
         table = [0] * (window // self.page_tokens)
         for piece, offset in members:
             state, _ = by_row[piece.row]
             row = rows[piece.row].block_tables[self._mla_group]
             first = piece.start // self.page_tokens
-            # Prefix pages: all whole.
             owned = [int(row[k // cp]) for k in range(rank, first, cp)]
             bases.append(cursor)
             counts.append(len(owned) * self.page_tokens)
             own += owned
             cursor += len(owned) * self.page_tokens
-            # Cached pages: not rewritten.
             skip = max(state.first_cached - piece.start, 0) // self.page_tokens
             for p in range(skip, piece.rows // self.page_tokens):
                 if (first + p) % cp == rank:
                     table[offset // self.page_tokens + p] = int(row[(first + p) // cp])
         unused = self.program.window_slots(window) - len(members)
         if cursor > self.cp_capacity:
-            raise RuntimeError(
+            msg = (
                 f"K3 prefill: this rank's prefix share {cursor} "
                 f"exceeds {self.cp_capacity}"
             )
+            raise RuntimeError(msg)
         ids = [len(own)] + own + [0] * (self.cp_capacity // self.page_tokens - len(own))
         local = bases + [cursor] * unused + counts + [0] * unused
-        # [1, n]: the rank axis the op bodies strip
         return _device_i32([ids]), _device_i32([local]), _device_i32([table])
 
-    def compilation_calls(self) -> list:
-        """The programs :meth:`warmup` runs, on shape-only operands (the
-        weights and pools as they are): every window's stack ops, state
-        stack/split, draft-ring update and pool writes, then the hit-state
-        and ring reads, the block copy and the first-token samplers."""
-        from vllm_torchtpu.models.kimi_k3.megakernel.runtime_shim.compilation import (
-            CompileCall,
-        )
-
+    def _compile_window_calls(
+        self,
+        window: int,
+        calls: list[CompileCall],
+        ring_writes: set[int],
+        cache: torch.Tensor | None,
+    ) -> None:
+        """Append ``CompileCall`` entries for one prefill ``window`` onto ``calls``."""
+        if self._writer is None:
+            msg = "K3 prefill: pool writer must be bound before compilation_calls"
+            raise RuntimeError(msg)
         program, writer, ring = self.program, self._writer, self.ring
-        assert writer is not None
         pools, mla = tuple(writer.raw_pools), writer.mla_pools()
-        calls, ring_writes = [], set()
-
-        def i32(*shape):
-            return torch.empty(shape, dtype=torch.int32)
-
-        def add(op, operands, priority=0):
-            calls.append(CompileCall(op, tuple(operands), {}, priority=priority))
-
-        cache = None  # a draft ring's cache, [1, layers, window, 128] per rank
-        if ring is not None:
-            c = ring.config
-            cache = torch.empty(
-                (1, c.layers, c.window, 2 * c.head_dim), dtype=torch.bfloat16
-            )
-        for window in program.windows:
-            count, rows = program.window_slots(window), window // 32
-            ops = program._build(window)
-            # Per rank: the residual streams, the packed KDA states and latents.
-            stream = torch.empty((1, rows, HIDDEN_SIZE), dtype=torch.bfloat16)
-            blocks = torch.empty((1, 8, rows, HIDDEN_SIZE), dtype=torch.bfloat16)
-            recurrent = torch.empty(
-                (1, KDA_LAYERS, count, 3, 128, 128), dtype=torch.float32
-            )
-            conv = torch.empty(
-                (1, KDA_LAYERS, count, 3, 3, 3, 128), dtype=torch.bfloat16
-            )
-            latents = torch.empty((1, MLA_LAYERS, window, 576), dtype=torch.bfloat16)
-            state = (stream, blocks, recurrent, conv, recurrent, conv, latents)
-            extent, segments = i32(1), i32(5 * count)
-            tail = (i32(1, 1 + self.cp_capacity // self.page_tokens), i32(1, 2 * count))
-            add(
-                ops["first"],
-                (
-                    i32(1, rows),
-                    extent,
-                    segments,
-                    recurrent,
-                    conv,
-                    mla[0],
-                    *tail,
-                    *program._flat("io", "common", "kda", "mla", "moe"),
+        count, rows = program.window_slots(window), window // TP_SIZE
+        ops = program.build_window_ops(window)
+        stream = torch.empty((1, rows, HIDDEN_SIZE), dtype=torch.bfloat16)
+        blocks = torch.empty((1, 8, rows, HIDDEN_SIZE), dtype=torch.bfloat16)
+        recurrent = torch.empty(
+            (1, KDA_LAYERS, count, _KDA_HEADS, _KDA_HEAD_DIM, _KDA_HEAD_DIM),
+            dtype=torch.float32,
+        )
+        conv = torch.empty(
+            (
+                1,
+                KDA_LAYERS,
+                count,
+                _KDA_CONV_TAPS,
+                _KDA_HEADS,
+                _KDA_HEADS,
+                _KDA_HEAD_DIM,
+            ),
+            dtype=torch.bfloat16,
+        )
+        latents = torch.empty(
+            (1, MLA_LAYERS, window, _MLA_LATENT_DIM),
+            dtype=torch.bfloat16,
+        )
+        state = (stream, blocks, recurrent, conv, recurrent, conv, latents)
+        extent = torch.empty((1,), dtype=torch.int32)
+        segments = torch.empty((_SEGMENT_DESC_FIELDS * count,), dtype=torch.int32)
+        tail = (
+            torch.empty(
+                (1, 1 + self.cp_capacity // self.page_tokens), dtype=torch.int32
+            ),
+            torch.empty((1, 2 * count), dtype=torch.int32),
+        )
+        calls.extend(
+            (
+                CompileCall(
+                    ops["first"],
+                    (
+                        torch.empty((1, rows), dtype=torch.int32),
+                        extent,
+                        segments,
+                        recurrent,
+                        conv,
+                        mla[0],
+                        *tail,
+                        *program.flat_weights("io", "common", "kda", "mla", "moe"),
+                    ),
+                    {},
+                    priority=window,
                 ),
-                priority=window,
-            )
-            add(
-                ops["group"],
-                (
-                    *state,
-                    extent,
-                    i32(1),
-                    segments,
-                    mla[1],
-                    mla[2],
-                    *tail,
-                    *program._flat("common", "kda", "mla", "moe", expert_bank=1),
+                CompileCall(
+                    ops["group"],
+                    (
+                        *state,
+                        extent,
+                        torch.empty((1,), dtype=torch.int32),
+                        segments,
+                        mla[1],
+                        mla[2],
+                        *tail,
+                        *program.flat_weights(
+                            "common",
+                            "kda",
+                            "mla",
+                            "moe",
+                            expert_bank=1,
+                        ),
+                    ),
+                    {},
+                    priority=window,
                 ),
-                priority=window,
-            )
-            add(
-                ops["final"],
-                (
-                    stream,
-                    blocks,
-                    latents,
-                    extent,
-                    segments,
-                    mla[MLA_LAYERS - 1],
-                    *tail,
-                    *program._flat("io", "common", "mla", "moe", expert_bank=12),
+                CompileCall(
+                    ops["final"],
+                    (
+                        stream,
+                        blocks,
+                        latents,
+                        extent,
+                        segments,
+                        mla[MLA_LAYERS - 1],
+                        *tail,
+                        *program.flat_weights(
+                            "io",
+                            "common",
+                            "mla",
+                            "moe",
+                            expert_bank=_FINAL_EXPERT_BANK,
+                        ),
+                    ),
+                    {},
+                    priority=window,
                 ),
-                priority=window,
             )
-            one = (recurrent[:, :, 0], conv[:, :, 0])
-            add(
-                program._state_op("stack", count), (one[0],) * count + (one[1],) * count
+        )
+        one = (recurrent[:, :, 0], conv[:, :, 0])
+        calls.append(
+            CompileCall(
+                program.state_op("stack", count),
+                (one[0],) * count + (one[1],) * count,
+                {},
             )
-            add(program._state_op("split", count), (recurrent, conv))
-            if ring is not None:
-                add(
-                    ring._update_op(window, count),
+        )
+        calls.append(
+            CompileCall(
+                program.state_op("split", count),
+                (recurrent, conv),
+                {},
+            )
+        )
+        if ring is not None and cache is not None:
+            calls.append(
+                CompileCall(
+                    ring.update_op(window, count),
                     (
                         blocks,
                         stream,
                         stream,
-                        i32(window),
-                        i32(window),
-                        i32(count),
-                        i32(count),
+                        torch.empty((window,), dtype=torch.int32),
+                        torch.empty((window,), dtype=torch.int32),
+                        torch.empty((count,), dtype=torch.int32),
+                        torch.empty((count,), dtype=torch.int32),
                         *ring.weights,
                         *(cache,) * count,
-                        *(i32(2),) * count,
+                        *(torch.empty((_RING_META_ELEMENTS,), dtype=torch.int32),)
+                        * count,
                     ),
+                    {},
                 )
-            for live in write_sizes(count):
-                add(
-                    writer._write_op(window, count, live),
+            )
+        for live in write_sizes(count):
+            calls.append(
+                CompileCall(
+                    writer.write_op(window, count, live),
                     (
                         latents,
                         recurrent,
@@ -1803,46 +2270,87 @@ class KimiPrefiller:
                         recurrent,
                         conv,
                         *pools,
-                        i32(1, window // self.page_tokens),
-                        i32(live * KDA_LAYERS),
-                        i32(live * KDA_LAYERS),
+                        torch.empty((1, window // self.page_tokens), dtype=torch.int32),
+                        torch.empty((live * KDA_LAYERS,), dtype=torch.int32),
+                        torch.empty((live * KDA_LAYERS,), dtype=torch.int32),
                     ),
+                    {},
                 )
-                if ring is not None and live not in ring_writes:  # shared by windows
-                    ring_writes.add(live)
-                    add(
-                        writer._rings_op(live),
+            )
+            if ring is not None and cache is not None and live not in ring_writes:
+                ring_writes.add(live)
+                calls.append(
+                    CompileCall(
+                        writer.rings_op(live),
                         (
                             *pools,
-                            i32(live * KDA_LAYERS),
+                            torch.empty((live * KDA_LAYERS,), dtype=torch.int32),
                             *(cache,) * live,
-                            *(i32(2),) * live,
+                            *(torch.empty((_RING_META_ELEMENTS,), dtype=torch.int32),)
+                            * live,
                         ),
+                        {},
                     )
-        hit = i32(self.slots * KDA_LAYERS)
-        add(writer._read_states_op(self.slots), (*pools, hit))
+                )
+
+    def compilation_calls(self) -> list[CompileCall]:
+        """Build shape-only ``CompileCall`` descriptors for every warmup custom op."""
+        writer, ring = self._writer, self.ring
+        if writer is None:
+            msg = "K3 prefill: pool writer must be bound before compilation_calls"
+            raise RuntimeError(msg)
+        pools = tuple(writer.raw_pools)
+        calls: list[CompileCall] = []
+        ring_writes: set[int] = set()
+        cache: torch.Tensor | None = None
         if ring is not None:
-            add(
-                writer._read_rings_op(ring.config, self.slots),
-                (*pools, hit, i32(self.slots)),
+            c = ring.config
+            cache = torch.empty(
+                (1, c.layers, c.window, 2 * c.head_dim),
+                dtype=torch.bfloat16,
             )
-        add(writer._copy_op(), (*pools, i32(COPY_PAIRS), i32(COPY_PAIRS)))
+        for window in self.program.windows:
+            self._compile_window_calls(window, calls, ring_writes, cache)
+        hit = torch.empty((self.slots * KDA_LAYERS,), dtype=torch.int32)
+        calls.append(CompileCall(writer.read_states_op(self.slots), (*pools, hit), {}))
+        if ring is not None:
+            calls.append(
+                CompileCall(
+                    writer.read_rings_op(ring.config, self.slots),
+                    (*pools, hit, torch.empty((self.slots,), dtype=torch.int32)),
+                    {},
+                )
+            )
+        calls.append(
+            CompileCall(
+                writer.copy_op(),
+                (
+                    *pools,
+                    torch.empty((COPY_PAIRS,), dtype=torch.int32),
+                    torch.empty((COPY_PAIRS,), dtype=torch.int32),
+                ),
+                {},
+            )
+        )
         logits = torch.empty((self.config.max_num_seqs, VOCAB), dtype=torch.float32)
-        for sampled in (False, True):
-            add(self._sampler_op(sampled), (logits, i32(self.config.max_num_seqs, 5)))
+        calls.extend(
+            CompileCall(
+                self._sampler_op(sampled=sampled),
+                (
+                    logits,
+                    torch.empty(
+                        (self.config.max_num_seqs, _SAMPLING_PARAM_COLS),
+                        dtype=torch.int32,
+                    ),
+                ),
+                {},
+            )
+            for sampled in (False, True)
+        )
         return calls
 
     def _precompile(self) -> None:
-        """Trace :meth:`compilation_calls` spread over the workers and compile
-        them concurrently (``megakernel.compilation``), so the warmup that
-        follows only runs them."""
-        from vllm_torchtpu.models.kimi_k3.megakernel.runtime_shim.compilation import (
-            compile_ops,
-        )
-        from vllm_torchtpu.models.kimi_k3.megakernel.runtime_shim.export_cache import (
-            prepare_distributed,
-        )
-
+        """Trace and compile :meth:`compilation_calls` concurrently across workers."""
         started = time.perf_counter()
         calls = self.compilation_calls()
         calls.sort(key=lambda call: call.priority, reverse=True)
@@ -1855,125 +2363,141 @@ class KimiPrefiller:
                 time.perf_counter() - started,
             )
 
-    def warmup(self) -> None:
-        """Compile every window's program and write, the hit-state read, the
-        state stack/split, the block copy and the first-token samplers
-        (:meth:`_precompile`), then run each once (the issue order is the same
-        on every rank, which the communicating kernels need)."""
-        writer = self._writer
-        if writer is None:
-            raise RuntimeError("K3 prefill: bind the KV caches before warming up")
-        started = time.perf_counter()
-        self._precompile()
-        outputs = []
-        for window in self.program.windows:
-            count = self.program.window_slots(window)
-            desc = (
-                [0] + [window] * (count - 1) + [1] + [0] * (count - 1) + [0] * 3 * count
-            )
-            recurrent, conv = self.program.stack_states(
-                [self.program.zero_state() for _ in range(count)]
-            )
-            ring_hook, ring_out = None, {}
-            if self.ring is not None:
-                none = np.full(window, -1, np.int32)
+    def _warm_window(self, window: int, writer: PoolWriter) -> list[torch.Tensor]:
+        """Run one warmup pass for ``window`` and its pool writes on device."""
+        count = self.program.window_slots(window)
+        desc = [0] + [window] * (count - 1) + [1] + [0] * (count - 1) + [0] * 3 * count
+        recurrent, conv = self.program.stack_states(
+            [self.program.zero_state() for _ in range(count)]
+        )
+        ring_hook: Callable[..., None] | None = None
+        ring_out: dict[str, tuple[list[RingPair], list[RingPair]]] = {}
+        draft_out: dict[str, torch.Tensor] = {}
+        if self.ring is not None:
+            ring_model = self.ring
+            none = np.full(window, -1, np.int32)
 
-                def ring_hook(
+            def warm_ring(
+                blocks: torch.Tensor,
+                prefix: torch.Tensor,
+                middle: torch.Tensor,
+                _tap3: torch.Tensor,
+                _tap90: torch.Tensor,
+            ) -> None:
+                """Warm up DSpark ring update for ``window``."""
+                ring_out["rings"] = ring_model.update(
                     blocks,
                     prefix,
                     middle,
-                    *taps,
-                    none=none,
-                    ring_out=ring_out,
-                    count=count,
-                ):
-                    ring_out["after"], ring_out["at"] = self.ring.update(
-                        blocks,
-                        prefix,
-                        middle,
-                        none,
-                        none,
-                        [-1] * count,
-                        [-1] * count,
-                        [self.ring.zero()] * count,
-                    )
+                    none,
+                    none,
+                    [-1] * count,
+                    [-1] * count,
+                    [ring_model.zero()] * count,
+                )
 
-            if self.draft_latents is not None:
-                order = self.program.sp_order(window)
+            ring_hook = warm_ring
 
-                def ring_hook(
+        if self.draft_latents is not None:
+            draft_latents = self.draft_latents
+            order = self.program.sp_order(window)
+
+            def warm_draft(
+                blocks: torch.Tensor,
+                _prefix: torch.Tensor,
+                _middle: torch.Tensor,
+                tap3: torch.Tensor,
+                tap90: torch.Tensor,
+            ) -> None:
+                """Warm up MLA DSpark draft latent projection for ``window``."""
+                draft_out["draft"] = draft_latents.latents(
+                    window,
                     blocks,
-                    prefix,
-                    middle,
                     tap3,
                     tap90,
-                    window=window,
-                    order=order,
-                    ring_out=ring_out,
-                ):
-                    assert self.draft_latents is not None
-                    ring_out["draft"] = self.draft_latents.latents(
-                        window,
-                        blocks,
-                        tap3,
-                        tap90,
-                        np.full(window, -1, np.int32),
-                        order,
-                    )
+                    np.full(window, -1, np.int32),
+                    order,
+                )
 
-            logits, latents, recurrent, conv, recurrent_at, conv_at = (
-                self.program.run_packed(
-                    torch.zeros((1, window // 32), dtype=torch.int32).to("tpu"),
-                    _device_i32([1]),
-                    _device_i32(desc),
-                    recurrent,
-                    conv,
-                    writer.mla_pools(),
-                    _rank_zeros_i32(1 + self.cp_capacity // self.page_tokens),
-                    _rank_zeros_i32(2 * count),
-                    ring_hook,
+            ring_hook = warm_draft
+
+        logits, latents, recurrent, conv, recurrent_at, conv_at = (
+            self.program.run_packed(
+                _PackedWindowInputs(
+                    shard=torch.zeros(
+                        (1, window // TP_SIZE),
+                        dtype=torch.int32,
+                    ).to("tpu"),
+                    extent=_device_i32([1]),
+                    segments=_device_i32(desc),
+                    recurrent=recurrent,
+                    conv=conv,
+                    pools=writer.mla_pools(),
+                    ids=_rank_zeros_i32(1 + self.cp_capacity // self.page_tokens),
+                    local=_rank_zeros_i32(2 * count),
+                    ring=ring_hook,
                 )
             )
-            outputs += [logits, self.program.split_states(recurrent, conv)[0][0]]
-            for live in write_sizes(count):
-                writer.write_packed(
-                    latents,
-                    recurrent,
-                    conv,
-                    recurrent_at,
-                    conv_at,
-                    _rank_zeros_i32(window // self.page_tokens),
-                    _zeros_i32(live * KDA_LAYERS),
-                    _zeros_i32(live * KDA_LAYERS),
-                    (ring_out["after"], ring_out["at"])
-                    if "after" in ring_out
-                    else None,
+        )
+        outputs = [logits, self.program.split_states(recurrent, conv)[0][0]]
+        for live in write_sizes(count):
+            writer.write_packed(
+                _PackedPoolWrite(
+                    latents=latents,
+                    recurrent=recurrent,
+                    conv=conv,
+                    recurrent_at=recurrent_at,
+                    conv_at=recurrent_at if conv_at is None else conv_at,
+                    table=_rank_zeros_i32(window // self.page_tokens),
+                    kda_blocks=_zeros_i32(live * KDA_LAYERS),
+                    blocks_at=_zeros_i32(live * KDA_LAYERS),
+                    rings=ring_out.get("rings"),
                 )
-            if "draft" in ring_out:
-                assert self.draft_latents is not None
-                self.draft_latents.write(
-                    ring_out["draft"],
-                    _rank_zeros_i32(window // self.page_tokens),
-                    writer.layout.block_shape,
-                )
-        count = self.slots  # a hit-state read's sequences (_read_hit_states)
+            )
+        if "draft" in draft_out and self.draft_latents is not None:
+            self.draft_latents.write(
+                draft_out["draft"],
+                _rank_zeros_i32(window // self.page_tokens),
+                writer.layout.block_shape,
+            )
+        return outputs
+
+    def warmup(self) -> None:
+        """Precompile and execute every prefill window, pool op, and sampler once."""
+        writer = self._writer
+        if writer is None:
+            msg = "K3 prefill: bind the KV caches before warming up"
+            raise RuntimeError(msg)
+        started = time.perf_counter()
+        self._precompile()
+        outputs: list[torch.Tensor] = []
+        for window in self.program.windows:
+            outputs.extend(self._warm_window(window, writer))
+        count = self.slots
         outputs.append(writer.read_states(_zeros_i32(count * KDA_LAYERS))[0])
         if self.ring is not None:
             outputs.append(
                 writer.read_rings(
-                    self.ring.config, _zeros_i32(count * KDA_LAYERS), [0] * count
+                    self.ring.config,
+                    _zeros_i32(count * KDA_LAYERS),
+                    [0] * count,
                 )[0][0]
             )
-        # Copy-on-write prefix hits (the null block onto itself).
         writer.copy_blocks([(0, 0)])
         if self.draft_latents is not None:
             self.draft_latents.copy_blocks([(0, 0)], COPY_PAIRS)
         stacked = torch.zeros(
-            (self.config.max_num_seqs, VOCAB), dtype=torch.float32
+            (self.config.max_num_seqs, VOCAB),
+            dtype=torch.float32,
         ).to("tpu")
-        params = torch.zeros((self.config.max_num_seqs, 5), dtype=torch.int32).to("tpu")
-        for sampled in (False, True):
-            outputs.append(self._sampler_op(sampled)(stacked, params)[0])
+        params = torch.zeros(
+            (self.config.max_num_seqs, _SAMPLING_PARAM_COLS),
+            dtype=torch.int32,
+        ).to("tpu")
+        outputs.extend(
+            self._sampler_op(sampled=sampled)(stacked, params)[0]
+            for sampled in (False, True)
+        )
         for tensor in outputs:
             materialize(tensor)
         materialize(writer.raw_pools[0])
