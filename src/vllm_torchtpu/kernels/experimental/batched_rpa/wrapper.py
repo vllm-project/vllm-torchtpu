@@ -625,6 +625,10 @@ def ragged_paged_attention(
             needed for merging partial attention results in CP.
     """
 
+    if not use_causal_mask and sliding_window is not None:
+        raise ValueError(
+            "Sliding window attention is only supported with causal masking."
+        )
     if chunk_prefill_size is not None:
         raise ValueError("Specifying chunk prefill size is not supported.")
     if debug_mode:

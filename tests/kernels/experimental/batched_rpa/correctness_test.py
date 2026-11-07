@@ -223,6 +223,7 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
         nan_kv_seq_idx: int | None = None,
         nan_new_seq_idx: int | None = None,
         mask_invalid_v: bool | None = None,
+        use_causal_mask: bool = True,
     ):
         if kv_layout == configs.KVLayout.SEQ_ALONG_LANE:
             # Tokens live on the lane dim, so page_size must be a multiple of 128.
@@ -348,6 +349,7 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
             "q_scale": q_scale,
             "k_scale": k_scale,
             "v_scale": v_scale,
+            "use_causal_mask": use_causal_mask,
         }
 
         expected, expected_kv_cache = ref_ragged_paged_attention(
@@ -514,6 +516,41 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
             bq_sz=bq_sz,
             bq_csz=bq_sz,
             kv_layout=configs.KVLayout.SEQ_ALONG_LANE,
+        )
+
+    @parameterized.product(
+        kv_layout=[
+            configs.KVLayout.HEAD_ALONG_SUBLANE,
+            configs.KVLayout.SEQ_ALONG_LANE,
+        ],
+        page_size=[16, 256],
+        decode_query_size=[1, 15],
+    )
+    def test_ragged_paged_attention_non_causal(
+        self, kv_layout, page_size, decode_query_size
+    ):
+        # Multi-sequence mixed batch testing non-causal attention across partial
+        # last KV blocks, multi-block sequences, cached tokens, and speculative
+        # draft shapes (decode_query_size=15).
+        seq_lens = [
+            (decode_query_size, 328),
+            (decode_query_size, 180),
+            (32, 255),
+        ]
+        self._test_ragged_paged_attention(
+            seq_lens,
+            (32, 8),
+            128,
+            page_size,
+            jnp.bfloat16,
+            jnp.bfloat16,
+            100,
+            bq_sz=64,
+            bkv_sz=256,
+            bq_csz=32,
+            kv_layout=kv_layout,
+            decode_query_size=decode_query_size,
+            use_causal_mask=False,
         )
 
     @parameterized.product(
