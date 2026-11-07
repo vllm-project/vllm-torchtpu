@@ -72,6 +72,7 @@ from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec
 from vllm.v1.request import RequestStatus
 
+from vllm_torchtpu.distributed.pcp import pcp_splits_tokens
 from vllm_torchtpu.tracing.annotation import TraceAnnotation
 
 if TYPE_CHECKING:
@@ -667,6 +668,15 @@ def _engine_is_pipeline(vllm_config: VllmConfig) -> bool:
     """A pipeline-parallel engine: each stage transfers its own layers, so
     the transfer ranks are the pipeline stages (or their PCP ranks)."""
     return _pipeline_parallel_size(vllm_config) > 1
+
+
+def _token_pcp_size(vllm_config: VllmConfig) -> int:
+    """PCP size as the scheduler's token layout sees it, from the config: the
+    configured size, or 1 for a model that keeps whole steps under PCP
+    (qwen4_exp, ``pcp.pcp_splits_tokens``)."""
+    if not pcp_splits_tokens(vllm_config):
+        return 1
+    return int(vllm_config.parallel_config.prefill_context_parallel_size or 1)
 
 
 def _pipeline_stage_pcp_size(vllm_config: VllmConfig) -> int:
@@ -2543,7 +2553,10 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
         returns the consumer-facing transfer parameters. ``ahead`` marks a
         send published in the prompt-completing step, before the finish."""
         parallel_config = self.vllm_config.parallel_config
-        pcp_size = int(parallel_config.prefill_context_parallel_size or 1)
+        # PCP as the scheduler sees it: a model that keeps whole steps under
+        # PCP (qwen4_exp) publishes logical group tables, split per rank only
+        # in its transfer units.
+        pcp_size = _token_pcp_size(self.vllm_config)
         request_state_groups = any(
             group.request_state for group in self._stage3_transfer_groups
         )
@@ -4335,7 +4348,8 @@ class TPURaidenConnectorWorker:
     def _gdn_head_geometry(self) -> GdnHeadGeometry:
         """Use the compute path's QK replication and V-head ownership."""
         parallel_config = self.vllm_config.parallel_config
-        degree = int(parallel_config.prefill_context_parallel_size or 1) * int(
+        # PCP splits GDN heads only where it splits tokens (not qwen4_exp).
+        degree = _token_pcp_size(self.vllm_config) * int(
             parallel_config.tensor_parallel_size or self.tp_size
         )
         return derive_gdn_head_geometry(
@@ -7503,7 +7517,8 @@ class TPURaidenConnectorWorker:
         # the same context axis, so one logical page spans all CP ranks.
         # Their supported configurations use at most one of PCP/DCP > 1.
         parallel = self.vllm_config.parallel_config
-        pcp_size = parallel.prefill_context_parallel_size
+        # A model that keeps whole steps under PCP addresses scheduler pages.
+        pcp_size = _token_pcp_size(self.vllm_config)
         dcp_size = parallel.decode_context_parallel_size
         if pcp_size > 1 and dcp_size > 1:
             raise ValueError(
