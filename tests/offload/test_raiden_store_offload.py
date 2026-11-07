@@ -3814,5 +3814,267 @@ class TestLazyOffload(unittest.TestCase):
         )
 
 
+class TestLazyPartialBlocks(unittest.TestCase):
+    """Partly filled last blocks in the lazy tier: the scan stores them under
+    the hash of their valid tokens, and vLLM's partial-tail lookup and load
+    serve them, on a request whose prompt continues the stored one."""
+
+    TPC = 4  # tokens per block; one hash per token, so 4 hash boundaries
+    NUM_WORKERS = 2
+
+    def _make(self, partial=True, hashes_per_chunk=4):
+        helper = TestLazyOffload()
+        helper.TPC = self.TPC
+        sched = helper._make(
+            num_blocks=8,
+            window=8,
+            config=helper._config(
+                tokens_per_chunk=self.TPC, hashes_per_chunk=hashes_per_chunk
+            ),
+        )
+        self.helper, self.store, self.manager = helper, helper.store, helper.manager
+        if partial:
+            sched._enable_partial_blocks()
+        return sched
+
+    def _okey(self, name):
+        return self.helper._okey(name)
+
+    def _hashes(self, num_tokens):
+        return [b"t%03d" % i for i in range(num_tokens)]
+
+    def _cache_previous_turn(self):
+        """HBM's free queue after a 10-token turn finished: its two whole
+        blocks and its partly filled last block (2 of 4 tokens)."""
+        hashes = self._hashes(10)
+        self.helper._cache(1, hashes[3], 4)
+        self.helper._cache(2, hashes[7], 8)
+        self.helper._cache(3, hashes[9], 10)
+
+    def _parked(self, sched):
+        return {p.device_block_ids[0]: p.keys[0] for p in sched._fence_pending.values()}
+
+    def _request(self, sched, num_tokens):
+        from vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler import (  # noqa: E501
+            RequestOffloadState,
+        )
+        from vllm.v1.kv_offload.base import RequestOffloadingContext
+
+        req = SimpleNamespace(
+            request_id="next",
+            block_hashes=self._hashes(num_tokens),
+            kv_transfer_params=None,
+            num_tokens=num_tokens,
+            num_prompt_tokens=num_tokens,
+            skip_reading_prefix_cache=False,
+        )
+        sched._req_status["next"] = RequestOffloadState(
+            config=sched.config,
+            req=req,
+            req_context=_ctx("next"),
+            offloading_context=RequestOffloadingContext(),
+        )
+        return req
+
+    def _store_previous_turn(self):
+        """The tier after the scan's three stores of the previous turn landed."""
+        hashes = self._hashes(10)
+        for name in (hashes[3], hashes[7], hashes[9]):
+            seed_host_entries(self.store, self._okey(name))
+        self.store.calls.clear()
+
+    def test_scan_stores_the_partial_block_under_its_valid_tokens_hash(self):
+        sched = self._make()
+        self._cache_previous_turn()
+
+        self.helper._step(sched)
+
+        hashes = self._hashes(10)
+        self.assertEqual(
+            self._parked(sched),
+            {
+                1: self._okey(hashes[3]),
+                2: self._okey(hashes[7]),
+                3: self._okey(hashes[9]),
+            },
+        )
+        self.assertEqual(sched._lazy.stats["stored"], 3)
+        self.assertEqual(sched._lazy.stats["partial"], 1)
+
+    def test_switch_off_scan_skips_the_partial_block(self):
+        sched = self._make(partial=False)
+        self._cache_previous_turn()
+
+        self.helper._step(sched)
+
+        self.assertEqual(sorted(self._parked(sched)), [1, 2])
+        self.assertEqual(sched._lazy.stats["partial"], 0)
+
+    def test_scan_skips_a_partial_block_off_the_hash_boundaries(self):
+        sched = self._make(hashes_per_chunk=2)
+        self.helper._cache(1, b"odd", 5)
+        self.helper._cache(2, b"even", 6)
+
+        self.helper._step(sched)
+
+        self.assertEqual(self._parked(sched), {2: self._okey(b"even")})
+
+    def test_next_turn_loads_the_partial_block_as_its_tail(self):
+        from vllm.v1.core.kv_cache_utils import KVCacheBlock
+
+        sched = self._make()
+        self._store_previous_turn()
+        req = self._request(sched, 20)
+
+        hit, load_async = sched.get_num_new_matched_tokens(req, 0)
+
+        self.assertEqual((hit, load_async), (10, True))
+        fresh = [KVCacheBlock(block_id=i) for i in (5, 6, 7)]
+        sched.update_state_after_alloc(req, SimpleNamespace(blocks=(fresh,)), hit)
+        ((job_id, job),) = sched._current_batch_load_jobs.items()
+        hashes = self._hashes(10)
+        self.assertEqual(
+            list(job.src_spec.keys),
+            [self._okey(hashes[3]), self._okey(hashes[7]), self._okey(hashes[9])],
+        )
+        self.assertEqual(job.dst_spec.block_ids.tolist(), [5, 6, 7])
+        self.assertIsNone(sched._req_status["next"].partial_tail_boundary)
+
+    def test_switch_off_next_turn_recomputes_the_partial_block(self):
+        sched = self._make(partial=False)
+        self._store_previous_turn()
+        req = self._request(sched, 20)
+
+        hit, _ = sched.get_num_new_matched_tokens(req, 0)
+
+        self.assertEqual(hit, 8)
+
+    def test_partial_tail_after_a_whole_hbm_hit_refreshes_only_its_key(self):
+        sched = self._make()
+        self._store_previous_turn()
+        req = self._request(sched, 20)
+
+        hit, _ = sched.get_num_new_matched_tokens(req, 8)
+
+        self.assertEqual(hit, 2)
+        released = [list(c.args[0]) for c in self.store.calls_named("release")]
+        self.assertEqual(released, [sub_hashes(self._okey(self._hashes(10)[9]))])
+
+    def test_partial_hit_never_covers_the_last_prompt_token(self):
+        sched = self._make()
+        self._store_previous_turn()
+        req = self._request(sched, 10)
+
+        hit, _ = sched.get_num_new_matched_tokens(req, 0)
+
+        self.assertEqual(hit, 8)
+
+    def test_enable_refuses_without_lazy_offload_or_with_draft_groups(self):
+        sched = self._make(partial=False)
+        draft = sched.config._replace(
+            kv_group_configs=tuple(
+                g._replace(is_eagle_group=True) for g in sched.config.kv_group_configs
+            )
+        )
+        sched.config = draft
+        with self.assertRaises(ValueError):
+            sched._enable_partial_blocks()
+        sched.config = draft._replace(
+            kv_group_configs=tuple(
+                g._replace(is_eagle_group=False) for g in draft.kv_group_configs
+            )
+        )
+        sched._lazy = None
+        with self.assertRaises(ValueError):
+            sched._enable_partial_blocks()
+        self.assertFalse(sched.config.supports_partial_tail)
+
+    def test_enable_refuses_mixed_block_sizes(self):
+        sched = self._make(partial=False)
+        (group,) = sched.config.kv_group_configs
+        sched.config = sched.config._replace(
+            kv_group_configs=(
+                group,
+                group._replace(group_idx=1, tokens_per_block=2 * self.TPC),
+            )
+        )
+        with self.assertRaisesRegex(ValueError, "one block size"):
+            sched._enable_partial_blocks()
+        self.assertFalse(sched.config.supports_partial_tail)
+
+    def test_enable_turns_on_the_partial_tail_lookup(self):
+        sched = self._make()
+        self.assertTrue(sched.config.supports_partial_tail)
+        self.assertEqual(sched._partial_tail_block_size, self.TPC)
+        self.assertTrue(sched._lazy.partial_blocks)
+
+    def _init_scheduler(self, env):
+        from vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler import (  # noqa: E501
+            OffloadingConnectorScheduler,
+        )
+
+        from vllm_torchtpu.offload.raiden_connector import (
+            TPURaidenOffloadingScheduler,
+        )
+
+        helper = TestLazyOffload()
+
+        def base_init(self, spec, vllm_config, kv_cache_config):
+            self.config = helper._config(tokens_per_chunk=4096, hashes_per_chunk=16)
+            self.config = self.config._replace(
+                kv_group_configs=tuple(
+                    g._replace(is_eagle_group=True)
+                    for g in self.config.kv_group_configs
+                )
+            )
+            self.manager = make_manager(FakeKVCacheStore())
+            self._partial_tail_block_size = 0
+
+        with (
+            patch.dict(os.environ, env),
+            patch.object(OffloadingConnectorScheduler, "__init__", base_init),
+        ):
+            return TPURaidenOffloadingScheduler(
+                SimpleNamespace(extra_config={"lazy_offload": True}),
+                SimpleNamespace(
+                    parallel_config=SimpleNamespace(
+                        decode_context_parallel_size=16,
+                        prefill_context_parallel_size=1,
+                    )
+                ),
+                SimpleNamespace(
+                    kv_cache_groups=[
+                        SimpleNamespace(kv_cache_spec=SimpleNamespace(block_size=256))
+                    ]
+                ),
+            )
+
+    def test_switches_at_init(self):
+        both = {
+            "VLLM_TPU_OFFLOAD_DISABLE_EAGLE_BLOCK_DROP": "1",
+            "VLLM_TPU_OFFLOAD_STORE_PARTIAL_BLOCKS": "1",
+        }
+        sched = self._init_scheduler(both)
+        self.assertTrue(sched.config.supports_partial_tail)
+        self.assertEqual(sched._partial_tail_block_size, 4096)
+
+        off = dict(both, VLLM_TPU_OFFLOAD_STORE_PARTIAL_BLOCKS="0")
+        sched = self._init_scheduler(off)
+        self.assertFalse(sched.config.supports_partial_tail)
+        self.assertFalse(sched._lazy.partial_blocks)
+
+        with self.assertRaises(ValueError):
+            self._init_scheduler(
+                dict(both, VLLM_TPU_OFFLOAD_DISABLE_EAGLE_BLOCK_DROP="0")
+            )
+
+    def test_switch_is_off_by_default(self):
+        from vllm_torchtpu import envs
+
+        with patch.dict(os.environ):
+            os.environ.pop("VLLM_TPU_OFFLOAD_STORE_PARTIAL_BLOCKS", None)
+            self.assertIs(envs.VLLM_TPU_OFFLOAD_STORE_PARTIAL_BLOCKS, False)
+
+
 if __name__ == "__main__":
     unittest.main()

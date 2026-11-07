@@ -55,6 +55,17 @@ Core mechanisms:
   HBM hit on the same block would. A lookup refreshes only the tier's copies
   past the request's HBM hit, so the tier's LRU order follows what HBM
   dropped.
+
+- Partial blocks (`VLLM_TPU_OFFLOAD_STORE_PARTIAL_BLOCKS=1`, lazy offload
+  only): a finished request frees its blocks last block first, so its partly
+  filled last block is the first to leave HBM. The lazy scan also stores such
+  a block, under the hash of its valid tokens, which is the key vLLM's
+  partial-tail lookup probes. A lookup past its last whole-block hit then
+  probes those keys at each hash boundary of the next block, and a hit is
+  loaded into a fresh block with only its valid tokens counted as computed;
+  the request computes the rest of the block. It needs
+  `VLLM_TPU_OFFLOAD_DISABLE_EAGLE_BLOCK_DROP=1`, because a lookup that drops
+  its last hit chunk would drop the partial entry too.
 """
 
 from __future__ import annotations
@@ -105,6 +116,7 @@ from vllm.v1.kv_offload.base import (
 from vllm.v1.outputs import KVConnectorOutput
 
 from vllm_torchtpu import envs as tpu_envs
+from vllm_torchtpu.core.eagle_block_drop import offload_config_without_eagle_groups
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.offload.raiden_store import (
     AdmissionOp,
@@ -233,6 +245,8 @@ class _LazyOffload:
     window_blocks: int
     # Tokens per offload chunk (one HBM block) by KV cache group id.
     chunk_tokens: dict[int, int]
+    # Also store partly filled blocks, keyed by the hash of their valid tokens.
+    partial_blocks: bool = False
     gpu_block_pool: BlockPool | None = None
     # In-flight lazy store jobs; they belong to no request.
     jobs: set[int] = field(default_factory=set)
@@ -263,11 +277,62 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
         kv_cache_config: KVCacheConfig,
     ):
         super().__init__(spec, vllm_config, kv_cache_config)
+        if tpu_envs.VLLM_TPU_OFFLOAD_DISABLE_EAGLE_BLOCK_DROP:
+            self.config = offload_config_without_eagle_groups(self.config)
+            logger.info(
+                "VLLM_TPU_OFFLOAD_DISABLE_EAGLE_BLOCK_DROP: tier lookups keep "
+                "their last hit chunk (EAGLE/MTP drop disabled)."
+            )
         assert isinstance(self.manager, RaidenOffloadingManager)
         self._raiden_manager: RaidenOffloadingManager = self.manager
         self._fence_pending: dict[int, _ParkedStore] = {}
         if _as_bool(spec.extra_config.get("lazy_offload", False)):
             self._lazy = self._init_lazy_offload(spec, vllm_config, kv_cache_config)
+        if tpu_envs.VLLM_TPU_OFFLOAD_STORE_PARTIAL_BLOCKS:
+            self._enable_partial_blocks()
+
+    def _enable_partial_blocks(self) -> None:
+        """Turn on vLLM's partial-tail lookup and load for lazily stored
+        partial blocks.
+
+        vLLM enables partial tails only for hybrid recurrent models, whose
+        copy-on-write hand-off supplies the partial entries. Here the lazy
+        scan supplies them from whole cached HBM blocks, so the lookup and the
+        load need only uniform full-attention groups, one block per chunk
+        (both checked by lazy offload), and no group dropping its last hit.
+        Context parallelism needs no hand-off either: a lazy entry copies the
+        whole scheduler block, every rank's interleaved share of it, so a load
+        restores the block as HBM held it, and the request writes its
+        remaining tokens into it as into any partly filled block.
+        """
+        if self._lazy is None:
+            raise ValueError(
+                "VLLM_TPU_OFFLOAD_STORE_PARTIAL_BLOCKS needs lazy_offload: only "
+                "the lazy scan stores partial blocks"
+            )
+        groups = self.config.kv_group_configs
+        if any(group.is_eagle_group for group in groups):
+            raise ValueError(
+                "VLLM_TPU_OFFLOAD_STORE_PARTIAL_BLOCKS needs "
+                "VLLM_TPU_OFFLOAD_DISABLE_EAGLE_BLOCK_DROP: a lookup that drops "
+                "its last hit chunk drops the partial entry too"
+            )
+        block_tokens = {group.tokens_per_block for group in groups}
+        if len(block_tokens) != 1:
+            raise ValueError(
+                "VLLM_TPU_OFFLOAD_STORE_PARTIAL_BLOCKS needs one block size "
+                f"across KV cache groups, got {sorted(block_tokens)}"
+            )
+        self.config = self.config._replace(supports_partial_tail=True)
+        self._partial_tail_block_size = block_tokens.pop()
+        self._lazy.partial_blocks = True
+        logger.info(
+            "VLLM_TPU_OFFLOAD_STORE_PARTIAL_BLOCKS: the tier stores partly "
+            "filled HBM blocks and loads them as partial tails (%d-token hash "
+            "boundaries in %d-token blocks).",
+            self.config.tokens_per_hash,
+            self._partial_tail_block_size,
+        )
 
     def _init_lazy_offload(
         self,
@@ -330,8 +395,8 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
         included. A lazy tier holds what HBM dropped, so refreshing its copies
         of blocks HBM still serves would keep them at the Most Recently Used
         end, and the tier would evict the blocks HBM actually dropped first.
-        The tier holds no partial-tail entries in lazy mode (request stores
-        are off), so there is no boundary key to refresh either.
+        A partial entry the lookup hit lies past the HBM hit, so it is
+        refreshed too.
         """
         if self._lazy is None:
             super()._touch(req_status)
@@ -345,13 +410,23 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
             self.manager.touch(
                 group_state.offload_keys[served:], req_status.req_context
             )
+        boundary = req_status.partial_tail_boundary
+        if boundary is not None:
+            self.manager.touch(
+                tuple(
+                    self._make_boundary_key(req_status.req, group.group_idx, boundary)
+                    for group in self.config.kv_group_configs
+                ),
+                req_status.req_context,
+            )
 
     def _schedule_lazy_stores(self) -> set[int]:
         """Park store jobs for the cached HBM blocks the allocator takes next.
 
         Scans the first `window_blocks` blocks of the free queue in eviction
         order and parks one store job per whole cached block the tier does
-        not hold yet. The block is left in place: a store job is watched
+        not hold yet, and per partly filled one when partial blocks are on.
+        The block is left in place: a store job is watched
         through `_block_id_to_pending_jobs`, so when the allocator takes the
         block, `build_connector_meta` cancels the job if it has not launched
         and drains it if it has, before the block is written.
@@ -364,6 +439,7 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
         keys: list[OffloadKey] = []
         block_ids: list[int] = []
         seen: set[OffloadKey] = set()
+        partial_keys: set[OffloadKey] = set()
         for position, block in enumerate(pool.free_block_queue.iter_blocks_after(None)):
             if position >= lazy.window_blocks:
                 break
@@ -376,9 +452,12 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
                 continue
             chunk_tokens = lazy.chunk_tokens.get(get_group_id(block_hash))
             num_tokens = block.block_hash_num_tokens
-            # A partial entry (a fine prefix hit ending inside the block) is
-            # no whole chunk; neither the lookup nor a load can use it.
-            if chunk_tokens is None or not num_tokens or num_tokens % chunk_tokens:
+            if chunk_tokens is None or not num_tokens:
+                continue
+            is_partial = bool(num_tokens % chunk_tokens)
+            if is_partial and not (
+                lazy.partial_blocks and num_tokens % self.config.tokens_per_hash == 0
+            ):
                 continue
             key = make_offload_key(get_block_hash(block_hash), get_group_id(block_hash))
             if key in lazy.failed_keys or key in seen:
@@ -386,6 +465,8 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
             seen.add(key)
             keys.append(key)
             block_ids.append(block.block_id)
+            if is_partial:
+                partial_keys.add(key)
         if not keys:
             return set()
         store_output = self._raiden_manager.prepare_evicting_store(keys)
@@ -396,6 +477,8 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
         for key, block_id in zip(keys, block_ids):
             if key not in accepted:
                 continue
+            if key in partial_keys:
+                lazy.stats["partial"] += 1
             job_id = self._generate_job_id()
             self._jobs[job_id] = TransferJobStatus(
                 req_id=_LAZY_JOB_OWNER,
@@ -456,8 +539,9 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
         lazy.logged_stats = Counter(lazy.stats)
         logger.info(
             "TPURaidenOffloadingConnector: lazy offload totals: stored=%d "
-            "cancelled=%d drained=%d failed=%d in_flight=%d",
+            "partial=%d cancelled=%d drained=%d failed=%d in_flight=%d",
             lazy.stats["stored"],
+            lazy.stats["partial"],
             lazy.stats["cancelled"],
             lazy.stats["drained"],
             lazy.stats["failed"],

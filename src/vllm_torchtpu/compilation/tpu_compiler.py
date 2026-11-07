@@ -279,6 +279,9 @@ _TPU_COMPILE_ENV_IGNORED = {
     "VLLM_TPU_OFFLOAD_WAIT_TIMEOUT_S",
     # Scheduler prefix-cache hit length only.
     "VLLM_TPU_DISABLE_EAGLE_BLOCK_DROP",
+    # Offloading tier hit length only.
+    "VLLM_TPU_OFFLOAD_DISABLE_EAGLE_BLOCK_DROP",
+    "VLLM_TPU_OFFLOAD_STORE_PARTIAL_BLOCKS",
     "TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT",
     # Only changes LIBTPU_INIT_ARGS, which is hashed on its own.
     "SC_ALLREDUCE_ALLGATHER_OFFLOAD_MIN_BYTES",

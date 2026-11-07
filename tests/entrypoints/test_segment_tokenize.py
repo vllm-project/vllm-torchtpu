@@ -5,15 +5,21 @@ The piecewise path must return the same ids as the backend's own
 ``encode(text, add_special_tokens=False)`` for every input, cold or cached.
 """
 
+import multiprocessing
 import os
 import random
+import struct
 import sys
 
 import pytest
 import tokenizers
 from tokenizers import AddedToken, Tokenizer, decoders, models, pre_tokenizers, trainers
 
-from vllm_torchtpu.segment_tokenize import SegmentTokenizer
+from vllm_torchtpu.segment_tokenize import (
+    SegmentTokenizer,
+    SharedPieceStore,
+    tokenizer_digest,
+)
 
 SPECIALS = [
     "<|user|>",
@@ -334,3 +340,150 @@ def test_renderer_patch_routes_and_falls_back(monkeypatch):
         cls._tokenize_prompt = saved
         cls._tpu_segment_tokenize = False
         assert envs.VLLM_TPU_SEGMENT_TOKENIZE is True
+
+
+def _long_text(rng, n_parts):
+    """Texts whose pieces between added tokens are mostly long enough to cache."""
+    out = []
+    for _ in range(n_parts):
+        out.append(rng.choice(SPECIALS))
+        s = rng.randrange(len(CORPUS))
+        out.append((CORPUS * 4)[s : s + rng.randrange(60, 300)])
+    return "".join(out)
+
+
+def _shared_seg(tok, root, max_written=1 << 20, max_prompts=0):
+    store = SharedPieceStore(root, tokenizer_digest(tok), max_written)
+    return SegmentTokenizer(
+        tok, max_cached_tokens=1 << 20, max_prompts=max_prompts, shared=store
+    )
+
+
+def test_shared_pieces_across_tokenizers_match_full_encode(tmp_path):
+    tok = _toy_tokenizer()
+    segs = [_shared_seg(tok, str(tmp_path)) for _ in range(4)]
+    rng = random.Random(4)
+    history = [_long_text(rng, 4) for _ in range(30)]
+    for _ in range(600):
+        i = rng.randrange(len(history))
+        history[i] += _long_text(rng, 1)
+        text = history[i]
+        seg = rng.choice(segs)
+        assert seg.encode(text) == tok.encode(text, add_special_tokens=False).ids
+    assert sum(s.shared_hits for s in segs) > 0
+    assert all(s.hits > 0 and s.misses > 0 for s in segs)
+
+
+@pytest.mark.parametrize("max_prompts", [0, 8])
+def test_shared_pieces_with_prefix_reuse_match_full_encode(tmp_path, max_prompts):
+    tok = _toy_tokenizer()
+    segs = [_shared_seg(tok, str(tmp_path), max_prompts=max_prompts) for _ in range(8)]
+    rng = random.Random(9)
+    system = _long_text(rng, 3)
+    history = [system + _long_text(rng, 3) for _ in range(20)]
+    for _ in range(500):
+        i = rng.randrange(len(history))
+        history[i] += _long_text(rng, 1) + rng.choice(["", "<|user|>", "<a", "b"])
+        text = history[i]
+        assert (
+            rng.choice(segs).encode(text)
+            == tok.encode(text, add_special_tokens=False).ids
+        )
+    assert sum(s.shared_hits for s in segs) > 0
+
+
+def _encode_in_child(root, texts, queue):
+    tok = _toy_tokenizer()
+    seg = _shared_seg(tok, root)
+    queue.put(([seg.encode(t) for t in texts], seg.shared_hits))
+
+
+def test_shared_pieces_reach_another_process(tmp_path):
+    tok = _toy_tokenizer()
+    rng = random.Random(5)
+    texts = [_long_text(rng, 6) for _ in range(20)]
+    writer = _shared_seg(tok, str(tmp_path))
+    for t in texts:
+        writer.encode(t)
+    ctx = multiprocessing.get_context("spawn")
+    queue = ctx.Queue()
+    child = ctx.Process(target=_encode_in_child, args=(str(tmp_path), texts, queue))
+    child.start()
+    ids, shared_hits = queue.get(timeout=120)
+    child.join(timeout=60)
+    assert ids == [tok.encode(t, add_special_tokens=False).ids for t in texts]
+    assert shared_hits > 0
+
+
+def test_shared_file_with_other_text_is_not_used(tmp_path):
+    tok = _toy_tokenizer()
+    seg = _shared_seg(tok, str(tmp_path))
+    store = seg._shared
+    piece = CORPUS[:100]
+    other = CORPUS[1:101].encode()
+    path = store._path(piece.encode())
+    with open(path, "wb") as f:
+        f.write(SharedPieceStore._HEADER.pack(SharedPieceStore._MAGIC, len(other)))
+        f.write(other)
+        f.write(struct.pack("=3I", 1, 2, 3))
+    assert seg.encode(piece) == tok.encode(piece, add_special_tokens=False).ids
+    assert seg.shared_hits == 0
+
+
+@pytest.mark.parametrize("cut", [0, 3, 11, 50])
+def test_truncated_shared_file_is_not_used(tmp_path, cut):
+    tok = _toy_tokenizer()
+    writer = _shared_seg(tok, str(tmp_path))
+    piece = CORPUS[:150]
+    writer.encode(piece)
+    path = writer._shared._path(piece.encode())
+    with open(path, "rb") as f:
+        data = f.read()
+    with open(path, "wb") as f:
+        f.write(data[: len(data) - 1] if cut == 0 else data[:cut])
+    reader = _shared_seg(tok, str(tmp_path))
+    assert reader.encode(piece) == tok.encode(piece, add_special_tokens=False).ids
+    assert reader.shared_hits == 0
+
+
+def test_shared_writes_are_bounded(tmp_path):
+    tok = _toy_tokenizer()
+    seg = _shared_seg(tok, str(tmp_path), max_written=2000)
+    rng = random.Random(6)
+    for _ in range(300):
+        seg.encode(_long_text(rng, 3))
+    store = seg._shared
+    assert 0 < store._written_tokens <= 2000
+    assert sorted(os.listdir(store.dir)) == sorted(
+        os.path.basename(path) for path, _ in store._written
+    )
+
+
+def test_other_tokenizer_reads_none_of_the_pieces(tmp_path):
+    tok = _toy_tokenizer()
+    other = _toy_tokenizer(extra_added=[AddedToken("zzqq", normalized=False)])
+    assert tokenizer_digest(tok) != tokenizer_digest(other)
+    rng = random.Random(7)
+    texts = [_long_text(rng, 5) for _ in range(10)]
+    first = _shared_seg(tok, str(tmp_path))
+    for t in texts:
+        first.encode(t)
+    second = _shared_seg(other, str(tmp_path))
+    for t in texts:
+        assert second.encode(t) == other.encode(t, add_special_tokens=False).ids
+    assert second.shared_hits == 0
+
+
+def test_unwritable_shared_dir_keeps_encoding(tmp_path):
+    tok = _toy_tokenizer()
+    seg = _shared_seg(tok, str(tmp_path))
+    not_a_dir = tmp_path / "file"
+    not_a_dir.write_bytes(b"")
+    seg._shared.dir = str(not_a_dir)
+    rng = random.Random(8)
+    for _ in range(20):
+        text = _long_text(rng, 3)
+        assert seg.encode(text) == tok.encode(text, add_special_tokens=False).ids
+    assert seg._shared._write_failed
+    assert seg.shared_hits == 0
+    assert not seg._shared._written
