@@ -129,8 +129,12 @@ def test_vmem_phase_overlay_and_conflict(fake_ex: ExecSpec):
     cp_reused, _ = vmem.build_scratch(custom_ms, ex_unset, fp)
     assert cp_reused.plan == fp
 
-    # 1D VMEM buffer is counted with (1, n) tiled storage_size; unknown scratch raises.
+    # 1D VMEM buffer is counted with (1, n) tiled storage_size; unmarked 3D bf16
+    # with shape[-2] == 2 is NOT guessed packed, while packed=True folds sublane words;
+    # unknown scratch raises.
     assert vmem._vmem_storage_bytes((128,), F32) == 8 * 128 * 4
+    assert vmem._vmem_storage_bytes((3, 2, 128), jnp.bfloat16) == 3 * 16 * 128 * 2
+    assert vmem._vmem_storage_bytes((2, 64, 4, 128), FP8, packed=True) == 2 * 256 * 128
     with pytest.raises(MegakernelConfigError, match="Unsupported scratch spec"):
         vmem._merge_scratch({}, {}, [ScratchReq("bad", object(), phase="persistent")])
 
@@ -141,8 +145,8 @@ def test_fit_default_tiles_on_fake_model_spec(monkeypatch, caplog):
 
     monkeypatch.setattr(vmem, "_LOGGED_FIT_KEYS", set())
     ms_large = make_fake_model_spec(L=60, att_every=4, H=4096, moe_tp=False)
-    default_64 = dataclasses.replace(exec_spec_mod.default_tiles(64, R=2), vmem_mib=24)
-    monkeypatch.setattr(exec_spec_mod, "default_tiles", lambda B, **kw: default_64)
+    default_32 = dataclasses.replace(exec_spec_mod.default_tiles(64, R=2), vmem_mib=32)
+    monkeypatch.setattr(exec_spec_mod, "default_tiles", lambda B, **kw: default_32)
     ex_64 = ExecSpec(B=64, T=1, R=2, ctx=4096)
     with caplog.at_level(logging.INFO, logger=vmem.__name__):
         fitted = vmem.fit_default_tiles(ms_large, ex_64)
@@ -150,22 +154,62 @@ def test_fit_default_tiles_on_fake_model_spec(monkeypatch, caplog):
     assert len(caplog.records) == 1
     assert "fit_default_tiles shrunk ring depths" in caplog.records[0].getMessage()
     assert fitted.tiles is not None
-    assert (fitted.tiles.nbd, fitted.tiles.nbe) != (default_64.nbd, default_64.nbe)
-    assert fitted.tiles.nbd <= default_64.nbd and fitted.tiles.nbe <= default_64.nbe
+    assert (fitted.tiles.nbd, fitted.tiles.nbe) != (default_32.nbd, default_32.nbe)
+    assert fitted.tiles.nbd <= default_32.nbd and fitted.tiles.nbe <= default_32.nbe
     cp, _ = vmem.build_scratch(ms_large, fitted)
     assert cp.vmem_bytes <= vmem.fit_vmem_budget_bytes(fitted.tiles)
 
-    # Every bucket of the same model gets the same `nbe` (the minimum over its
-    # buckets), while `nbd` can stay deeper on smaller buckets.
+    # Every bucket of the same model — including small decode (B=4, T=1) and
+    # max-batch MTP verify (B=128 > 64, T=4 > 2) — gets the exact same `nbe`,
+    # while `nbd` can stay deeper on smaller buckets.
     fitted_4 = vmem.fit_default_tiles(ms_large, ExecSpec(B=4, T=1, R=2, ctx=4096))
-    assert fitted_4.tiles is not None
-    assert fitted_4.tiles.nbe == fitted.tiles.nbe
-    assert fitted_4.tiles.nbd >= fitted.tiles.nbd
+    fitted_128_t4 = vmem.fit_default_tiles(
+        ms_large, ExecSpec(B=128, T=4, R=2, ctx=4096)
+    )
+    assert fitted_4.tiles is not None and fitted_128_t4.tiles is not None
+    assert fitted_4.tiles.nbe == fitted.tiles.nbe == fitted_128_t4.tiles.nbe
+    assert fitted_4.tiles.nbd >= fitted.tiles.nbd >= fitted_128_t4.tiles.nbd
 
-    ex_explicit = ExecSpec(B=64, T=1, R=2, ctx=4096, tiles=default_64)
+    # Even when the worst-case B=128 probe does not fit at (nbd=2, nbe=2),
+    # `model_nbe` is still pinned to `MIN_RING_DEPTH` across all buckets that fit,
+    # and `shrink_nbe=False` never lowers `nbe`.
+    default_24 = dataclasses.replace(default_32, vmem_mib=24)
+    monkeypatch.setattr(exec_spec_mod, "default_tiles", lambda B, **kw: default_24)
+    fit_b4_24 = vmem.fit_default_tiles(ms_large, ExecSpec(B=4, T=1, R=2, ctx=4096))
+    fit_b64_24 = vmem.fit_default_tiles(ms_large, ExecSpec(B=64, T=4, R=2, ctx=4096))
+    assert fit_b4_24.tiles is not None and fit_b64_24.tiles is not None
+    assert fit_b4_24.tiles.nbe == fit_b64_24.tiles.nbe == vmem.MIN_RING_DEPTH
+    t_no_shrink, _, t_last_no_shrink = vmem._fit_ring_depths(
+        ms_large,
+        ExecSpec(B=64, T=1, R=2, ctx=4096),
+        default_24,
+        vmem.fit_vmem_budget_bytes(default_24),
+        shrink_nbe=False,
+    )
+    assert t_no_shrink is None
+    assert t_last_no_shrink.nbe == default_24.nbe
+    assert t_last_no_shrink.nbd == vmem.MIN_RING_DEPTH
+
+    ex_explicit = ExecSpec(B=64, T=1, R=2, ctx=4096, tiles=default_32)
     assert vmem.fit_default_tiles(ms_large, ex_explicit) is ex_explicit
 
-    tight = dataclasses.replace(default_64, vmem_mib=4)
+    tight = dataclasses.replace(default_32, vmem_mib=8)
     monkeypatch.setattr(exec_spec_mod, "default_tiles", lambda B, **kw: tight)
-    with pytest.raises(MegakernelConfigError, match="do not fit"):
+    with pytest.raises(
+        MegakernelConfigError,
+        match=(
+            r"do not fit the 2\.00 MiB VMEM scratch budget "
+            r"\(8 MiB limit - 6 MiB headroom\)"
+        ),
+    ):
         vmem.fit_default_tiles(ms_large, ExecSpec(B=4, T=1, R=2, ctx=4096))
+
+    # A TypeError raised inside build_scratch propagates rather than being
+    # caught by the cache-key hashability check.
+    def _bad_build_scratch(*args, **kwargs):
+        raise TypeError("internal build_scratch bug")
+
+    monkeypatch.setattr(vmem, "build_scratch", _bad_build_scratch)
+    vmem._fit_ring_depths_cached.cache_clear()
+    with pytest.raises(TypeError, match="internal build_scratch bug"):
+        vmem._fit_ring_depths(ms_large, ex_64, default_32, 1 << 20, shrink_nbe=False)

@@ -39,13 +39,32 @@ logger = logging.getLogger(__name__)
 U8 = jnp.uint8
 
 
-def _vmem_storage_bytes(shape: tuple[int, ...], dtype: Any) -> int:
+# VMEM scratch buffers whose 3D+ FP8 shape `(..., rows_u32, 4, cols)` packs 4
+# fp8 bytes per 32-bit sublane word along `shape[-3]` (paged KV / pool pages).
+_PACKED_FP8_PAGE_BUFFERS: frozenset[str] = frozenset(
+    {
+        "epool",
+        "kvbuf",
+        "gpr_rec",
+        "gpr_conv",
+        "gdn_in_page",
+        "gdn_out_page",
+        "kv_scat_page",
+    }
+)
+
+
+def _vmem_storage_bytes(
+    shape: tuple[int, ...], dtype: Any, *, packed: bool = False
+) -> int:
     """Return `(8 * packing, 128)`-tiled VMEM storage bytes for `shape`/`dtype`.
 
-    Sublane-packed 32-bit word layouts `(..., rows_u32, packing, cols)` (such as
-    paged KV `(..., HD // 4, 4, BLK)` fp8) already pack `packing` elements per
-    32-bit sublane word along `shape[-3]`, so their physical row extent is
-    `rows_u32 * packing`.
+    When `packed=True` (set for `_PACKED_FP8_PAGE_BUFFERS` or specs with
+    `packed=True`), sublane-packed 32-bit word layouts `(..., rows_u32, packing, cols)`
+    (such as paged KV `(..., HD // 4, 4, BLK)` fp8) already pack `packing`
+    elements per 32-bit sublane word along `shape[-3]`, so their physical row
+    extent is `rows_u32 * packing`. Unmarked buffers are never guessed packed
+    from their shape.
     """
     dt = jnp.dtype(dtype)
     packing = 32 // (dt.itemsize * 8)
@@ -53,7 +72,7 @@ def _vmem_storage_bytes(shape: tuple[int, ...], dtype: Any) -> int:
         sh2: tuple[int, ...] = (1, 1)
     elif len(shape) == 1:
         sh2 = (1, shape[0])
-    elif len(shape) >= 3 and packing > 1 and shape[-2] == packing:
+    elif packed and len(shape) >= 3 and packing > 1 and shape[-2] == packing:
         sh2 = (*shape[:-3], shape[-3] * shape[-2], shape[-1])
     else:
         sh2 = shape
@@ -330,7 +349,10 @@ def build_scratch(
         ms = getattr(v, "memory_space", None)
         if ms == pltpu.MemorySpace.VMEM:
             sh = tuple(v.shape)
-            vmem_bytes += _vmem_storage_bytes(sh, v.dtype)
+            is_packed = k in _PACKED_FP8_PAGE_BUFFERS or bool(
+                getattr(v, "packed", False)
+            )
+            vmem_bytes += _vmem_storage_bytes(sh, v.dtype, packed=is_packed)
             vmem_shapes[k] = (sh, v.dtype)
         elif ms == pltpu.MemorySpace.SMEM:
             sh = tuple(v.shape)
@@ -345,7 +367,12 @@ def build_scratch(
     if vmem_bytes > vmem_limit_bytes:
         breakdown = sorted(
             (
-                (_vmem_storage_bytes(sh, dt), k, sh, dt)
+                (
+                    _vmem_storage_bytes(sh, dt, packed=(k in _PACKED_FP8_PAGE_BUFFERS)),
+                    k,
+                    sh,
+                    dt,
+                )
                 for k, (sh, dt) in vmem_shapes.items()
             ),
             reverse=True,
@@ -444,7 +471,7 @@ def _ring_bytes(core_plan: CorePlan) -> tuple[int, int]:
     """Allocated `(dense, expert)` weight-ring VMEM bytes of `core_plan`."""
     dense = expert = 0
     for k, (sh, dt) in core_plan.vmem_shapes.items():
-        nbytes = _vmem_storage_bytes(sh, dt)
+        nbytes = _vmem_storage_bytes(sh, dt, packed=(k in _PACKED_FP8_PAGE_BUFFERS))
         if k == "dpool" or k.startswith("dring_"):
             dense += nbytes
         elif k == "epool" or k.startswith("ering_"):
@@ -453,10 +480,11 @@ def _ring_bytes(core_plan: CorePlan) -> tuple[int, int]:
 
 
 _LOGGED_FIT_KEYS: set[tuple[str, int, int, int, int, int, int]] = set()
-# Default bucket row ceiling across which `fit_default_tiles` pins one
-# model-wide `nbe` (the minimum over the model's buckets, since `nbe` is
-# `approx` in `TILE_NUMERICS` and gates module pipelining paths).
-DEFAULT_FIT_MAX_ROWS = 64
+# Bucket row ceiling and token-per-sequence grid across which `fit_default_tiles`
+# pins one model-wide `nbe` (the minimum over the model's buckets, since `nbe`
+# is `approx` in `TILE_NUMERICS` and gates module pipelining paths).
+DEFAULT_FIT_MAX_ROWS = exec_spec.MAX_BATCH_ROWS
+DEFAULT_FIT_T: tuple[int, ...] = (1, 2, 4, 8)
 
 
 def _fit_ring_depths_uncached(
@@ -480,8 +508,6 @@ def _fit_ring_depths_uncached(
             t = dataclasses.replace(t, nbe=t.nbe - 1)
         elif can_d:
             t = dataclasses.replace(t, nbd=t.nbd - 1)
-        elif expert > 0 and t.nbe > MIN_RING_DEPTH:
-            t = dataclasses.replace(t, nbe=t.nbe - 1)
         else:
             return None, core_plan.vmem_bytes, t
 
@@ -506,37 +532,46 @@ def _fit_ring_depths(
     shrink_nbe: bool = True,
 ) -> tuple[exec_spec.Tiles | None, int, exec_spec.Tiles]:
     try:
-        return _fit_ring_depths_cached(model_spec, probe_ex, t, budget, shrink_nbe)
+        hash((model_spec, probe_ex, t, budget, shrink_nbe))
     except TypeError:
         return _fit_ring_depths_uncached(model_spec, probe_ex, t, budget, shrink_nbe)
+    return _fit_ring_depths_cached(model_spec, probe_ex, t, budget, shrink_nbe)
 
 
-def fit_default_tiles(model_spec: ModelSpec, ex: ExecSpec) -> ExecSpec:
+def fit_default_tiles(
+    model_spec: ModelSpec,
+    ex: ExecSpec,
+    *,
+    max_rows: int = DEFAULT_FIT_MAX_ROWS,
+) -> ExecSpec:
     """Return `ex` with explicit tiles: the default rule fitted to its VMEM budget.
 
     No-op when `ex.tiles` is set (explicit and profile tiles are never changed;
     an over-budget plan raises in `build_scratch`). Otherwise starts from
     `default_tiles(B, R)` sized for the device's chip (`chip_budget()`), pins
-    one model-wide `nbe` (the minimum fitted `nbe` over the model's buckets up
-    to `max(ex.B, DEFAULT_FIT_MAX_ROWS)` across `T in (1, 2, ex.T)`, so `nbe`
-    never varies across buckets of a model and cannot flip module pipelining
-    paths), and then shrinks `nbd` (down to `MIN_RING_DEPTH`) until the bucket's
-    planned VMEM scratch fits `fit_vmem_budget_bytes(t)`
-    (`vmem_mib - FIT_VMEM_HEADROOM_MIB`). Raises `MegakernelConfigError` if the
-    plan does not fit even then.
+    one model-wide `nbe` (the minimum fitted `nbe` at `max_rows`
+    (`MAX_BATCH_ROWS`) across every `T` in `DEFAULT_FIT_T` the model serves, so
+    `nbe` never varies across buckets of a model and cannot flip module
+    pipelining paths), and then shrinks only `nbd` (down to `MIN_RING_DEPTH`,
+    with `shrink_nbe=False`) until the bucket's planned VMEM scratch fits
+    `fit_vmem_budget_bytes(t)` (`vmem_mib - FIT_VMEM_HEADROOM_MIB`). Raises
+    `MegakernelConfigError` if the plan does not fit with that `nbe`.
     """
     if ex.tiles is not None:
         return ex
     t0 = exec_spec.default_tiles(ex.B, R=ex.R, chip=chip_budget())
     budget = fit_vmem_budget_bytes(t0)
-    max_rows = max(ex.B, DEFAULT_FIT_MAX_ROWS)
     model_nbe = t0.nbe
-    for tw in dict.fromkeys((1, 2, ex.T)):
+    for tw in DEFAULT_FIT_T:
         bw = round_up(max_rows, tw)
         w_ex = dataclasses.replace(ex, B=bw, T=tw)
-        t_w, _, _ = _fit_ring_depths(model_spec, w_ex, t0, budget, shrink_nbe=True)
-        if t_w is not None:
-            model_nbe = min(model_nbe, t_w.nbe)
+        try:
+            t_w, _, t_w_last = _fit_ring_depths(
+                model_spec, w_ex, t0, budget, shrink_nbe=True
+            )
+        except MegakernelConfigError:
+            continue
+        model_nbe = min(model_nbe, (t_w or t_w_last).nbe)
     t_fit, vmem_bytes, t_last = _fit_ring_depths(
         model_spec,
         ex,
@@ -546,8 +581,10 @@ def fit_default_tiles(model_spec: ModelSpec, ex: ExecSpec) -> ExecSpec:
     )
     if t_fit is None:
         need = vmem_bytes / (1024 * 1024)
+        budget_mib = budget / (1024 * 1024)
         raise MegakernelConfigError(
-            f"default tiles do not fit the {t_last.vmem_mib} MiB VMEM budget for "
+            f"default tiles do not fit the {budget_mib:.2f} MiB VMEM scratch budget "
+            f"({t_last.vmem_mib} MiB limit - {FIT_VMEM_HEADROOM_MIB} MiB headroom) for "
             f"ModelSpec {model_spec.name!r} (B={ex.B}, T={ex.T}, R={ex.R}): "
             f"{need:.2f} MiB with ring depths nbd={t_last.nbd}, nbe={t_last.nbe}; "
             "pass explicit tiles or a named profile"
