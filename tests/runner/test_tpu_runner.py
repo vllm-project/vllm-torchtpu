@@ -2736,6 +2736,7 @@ def test_runner_sampling_paths_draw_float32_uniform_noise(monkeypatch):
         _sampler_graph_rng=False,
         _sampler_kwargs=lambda: {},
         _verify_trim_rows=lambda padded_len, draft_lengths: 0,
+        _sampler_verify_trim_rows=(),
         sample_from_logits_func=fake_sample_from_logits,
         speculative_config=SimpleNamespace(num_speculative_tokens=1),
     )

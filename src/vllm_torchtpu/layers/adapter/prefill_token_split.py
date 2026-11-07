@@ -1,0 +1,818 @@
+# Copyright 2026 Google LLC
+# SPDX-License-Identifier: Apache-2.0
+"""TPU_PREFILL_SEQ_PARALLEL: the residual stream of a prefill step split by
+tokens across the TP cores, for DeepSeek-V3.2-style models (GLM-5.2).
+
+Today every TP core holds every token of the residual stream: o_proj ends in an
+all-reduce, the fused MoE prefill kernel ends in a reduce-scatter and an
+all-gather, and each core then runs the add + RMSNorm, the q / kv latent
+projection (``fused_qkv_a_proj``) and the indexer key projection
+(``wk_weights_proj``) on all tokens, though they work on each token alone and
+their weights are replicated.
+
+In a bucket of at least TPU_PREFILL_SEQ_PARALLEL_MIN_TOKENS tokens, from the
+first MoE layer on, each core keeps only its rows: its block of each combine
+chunk of the MoE kernel's reduce-scatter (``fused_moe_prefill_kernel_v2.
+own_rows``), so the MoE output needs no reordering. Per layer:
+
+- the add + RMSNorm and both projections run on the core's rows, and their
+  outputs (2,784 columns on GLM-5.2) are all-gathered for attention and the
+  indexer;
+- o_proj runs without its reduction, and a reduce-scatter leaves the core its
+  rows of the sum;
+- the post-attention add + RMSNorm runs on the core's rows; the MoE op routes
+  and quantizes them, all-gathers the fp8 rows, scales and routes, and drops
+  the all-gather after its reduce-scatter (moe_tp_decode._split_body).
+
+The final norm's output is all-gathered once for the LM head and the drafter.
+The layers before the first MoE layer, smaller buckets and the drafter keep
+today's path. Every sum adds the same terms; o_proj's reduce-scatter and the
+norms' kernel (fewer rows per core) may round in another order.
+
+With TPU_PREFILL_ROTATED_COLLECTIVES on a 2x2x2 slice of 2-core chips,
+o_proj's reduce-scatter and the latents' all-gather run as rotated
+halving-doubling (kernels/experimental/rotated_collectives.py), one kernel per
+combine chunk, over the same rows; the final norm's all-gather keeps XLA's.
+
+``maybe_patch_deepseek_v2`` installs the model forward at platform activation;
+it runs today's forward until ``arm`` (end of TPUModelRunner.load_model, after
+moe_tp_decode and its prequant pairing) has checked the model and given it a
+``TokenSplit``.
+"""
+
+from typing import Any, cast
+
+import jax
+import jax.numpy as jnp
+import torch
+from jax.sharding import NamedSharding
+from jax.sharding import PartitionSpec as P
+from torch_tpu._internal import pallas
+
+import vllm_torchtpu.envs as envs
+from vllm_torchtpu.kernels.experimental import rotated_collectives
+from vllm_torchtpu.kernels.experimental.fused_moe_prefill.fused_moe_prefill_kernel_v2 import (  # noqa: E501
+    gather_rows,
+    own_rows,
+    scatter_rows,
+    token_chunks,
+)
+from vllm_torchtpu.layers.adapter import rmsnorm, small_all_reduce_op
+from vllm_torchtpu.layers.adapter.linear_common import PrequantSlot
+from vllm_torchtpu.logger import init_logger
+
+logger = init_logger(__name__)
+
+TOKEN_SPLIT_ATTR = "_tpu_token_split"
+
+
+def token_fn(mesh, kind: str):
+    """The JAX function of `kind` ("own", "gather" or "scatter") over the MoE
+    op's mesh, its operands' partition specs and its output row count, so the
+    split follows the MoE kernel's reduce-scatter exactly. "own" takes the
+    core's mesh index as data, an int32 [1, 1] per core (moe_tp_decode's rank
+    operand): `lax.axis_index` lowers to a partition-id, which XLA's SPMD
+    partitioner refuses in the model's whole-graph compile."""
+    axis = mesh.axis_names[0]
+    ranks = int(mesh.size)
+    local, rows, specs = {
+        "own": (
+            lambda x, rank: own_rows(x, rank.reshape(()), ranks),
+            lambda n: n // ranks,
+            (P(axis), P(axis)),
+        ),
+        "gather": (lambda x: gather_rows(x, axis), lambda n: n * ranks, (P(axis),)),
+        "scatter": (
+            lambda x: scatter_rows(x, axis),
+            lambda n: n // ranks,
+            (P(axis),),
+        ),
+    }[kind]
+    sharded = jax.shard_map(
+        local, mesh=mesh, in_specs=specs, out_specs=P(axis), check_vma=False
+    )
+
+    def fn(*args: jax.Array) -> jax.Array:
+        return sharded(
+            *(jax.device_put(a, NamedSharding(mesh, s)) for a, s in zip(args, specs))
+        )
+
+    return fn, specs, rows
+
+
+def _rotated_gather(x, rank, table, axis, ranks):
+    """This core's rows x of every core, one rotated all-gather per combine
+    chunk; a shape the kernel does not take keeps XLA's all-gather."""
+    chunk = x.shape[0] // token_chunks(x.shape[0] * ranks)
+    if not rotated_collectives.all_gather_supports(chunk, x.shape[1]):
+        return gather_rows(x, axis)
+    return rotated_collectives.all_gather_chunks(
+        x, rank, jnp.asarray(table), axis=axis, chunk=chunk
+    )
+
+
+def rotated_fn(mesh, kind: str, places):
+    """The JAX function of the rotated `kind` ("scatter" or "gather") over the
+    MoE op's mesh: (x, rank) with the core's mesh index as data, one kernel
+    per combine chunk, the rows `scatter_rows` and `gather_rows` give. A shape
+    the kernel does not take keeps XLA's collective."""
+    axis = mesh.axis_names[0]
+    ranks = int(mesh.size)
+    table = rotated_collectives.peer_table(
+        places, "reduce_scatter" if kind == "scatter" else "all_gather"
+    )
+
+    def scatter(x, rank):
+        chunk = x.shape[0] // token_chunks(x.shape[0])
+        if not rotated_collectives.reduce_scatter_supports(chunk, x.shape[1]):
+            return scatter_rows(x, axis)
+        return rotated_collectives.reduce_scatter_chunks(
+            x, rank, jnp.asarray(table), axis=axis, chunk=chunk
+        )
+
+    def gather(x, rank):
+        return _rotated_gather(x, rank, table, axis, ranks)
+
+    local, rows = {
+        "scatter": (scatter, lambda n: n // ranks),
+        "gather": (gather, lambda n: n * ranks),
+    }[kind]
+    specs = (P(axis), P(axis))
+    sharded = jax.shard_map(
+        local, mesh=mesh, in_specs=specs, out_specs=P(axis), check_vma=False
+    )
+
+    def fn(x: jax.Array, rank: jax.Array) -> jax.Array:
+        return sharded(
+            *(
+                jax.device_put(a, NamedSharding(mesh, s))
+                for a, s in zip((x, rank), specs)
+            )
+        )
+
+    return fn, specs, rows
+
+
+def _bf16_parts(x):
+    """x f32 [rows, 1] as 2 bf16 columns holding its high and low 16 bits."""
+    bits = jax.lax.bitcast_convert_type(x, jnp.uint32)
+    halves = [(bits >> 16).astype(jnp.uint16), (bits & 0xFFFF).astype(jnp.uint16)]
+    return jnp.concatenate(
+        [jax.lax.bitcast_convert_type(h, jnp.bfloat16) for h in halves], axis=1
+    )
+
+
+def _from_bf16_parts(parts):
+    """The f32 column whose bits `_bf16_parts` split."""
+    halves = jax.lax.bitcast_convert_type(parts, jnp.uint16).astype(jnp.uint32)
+    bits = (halves[:, 0:1] << 16) | halves[:, 1:2]
+    return jax.lax.bitcast_convert_type(bits, jnp.float32)
+
+
+def quantized_gather_fn(mesh, places, projections: int = 1):
+    """TPU_PREFILL_LATENT_GATHER_FP8: the JAX function (q, rest, w_q_1, w_s_1,
+    ..., rank) over the MoE op's mesh -> every core's rows of
+    (``xla_quantized_matmul(q, w_q_i, w_s_i)`` for each of the `projections`
+    weights, rest). Each core quantizes its own rows of q (``quantize_tensor``
+    works on each row alone), and one rotated all-gather per combine chunk
+    moves the fp8 rows in their own type beside a bf16 block of rest and the
+    fp32 row scales' bits in 2 bf16 columns. Several chunks are joined into one
+    buffer before the projections, so each matmul reads its fp8 tiles as they
+    are. A chunk whose rows are not whole fp8 tiles gathers q in bf16 and
+    quantizes it after the gather, as today."""
+    from vllm_torchtpu.kernels.quantized_matmul.util import (
+        quantize_tensor,
+        xla_prequantized_matmul,
+        xla_quantized_matmul,
+    )
+
+    axis = mesh.axis_names[0]
+    ranks = int(mesh.size)
+    table = rotated_collectives.peer_table(places, "all_gather")
+
+    def padded(columns, rows):
+        used = sum(c.shape[1] for c in columns)
+        pad = -used % rotated_collectives.LANES
+        if pad:
+            columns = [*columns, jnp.zeros((rows, pad), jnp.bfloat16)]
+        return jnp.concatenate(columns, axis=1)
+
+    def local(q, rest, *operands):
+        weights, rank = list(zip(operands[:-1:2], operands[1:-1:2])), operands[-1]
+        rows, width = q.shape
+        rest_width = rest.shape[1]
+        chunk = rows // token_chunks(rows * ranks)
+        block_width = rest_width + 2 + (-(rest_width + 2) % rotated_collectives.LANES)
+        if not (
+            rotated_collectives.all_gather_supports(chunk, width, weights[0][0].dtype)
+            and rotated_collectives.all_gather_supports(chunk, block_width)
+        ):
+            block = _rotated_gather(padded([q, rest], rows), rank, table, axis, ranks)
+            return (
+                *(
+                    xla_quantized_matmul(block[:, :width], w_q, w_s)
+                    for w_q, w_s in weights
+                ),
+                block[:, width : width + rest_width],
+            )
+        q_q, q_scale = quantize_tensor(q, weights[0][0].dtype)
+        block = padded([rest, _bf16_parts(q_scale)], rows)
+        gathered_q, block = rotated_collectives.all_gather_many_chunks(
+            (q_q, block), rank, jnp.asarray(table), axis=axis, chunk=chunk
+        )
+        scale = _from_bf16_parts(block[:, rest_width : rest_width + 2])
+        if chunk < rows:
+            gathered_q, scale = jax.lax.optimization_barrier((gathered_q, scale))
+        return (
+            *(
+                xla_prequantized_matmul(gathered_q, scale, w_q, w_s, jnp.bfloat16)
+                for w_q, w_s in weights
+            ),
+            block[:, :rest_width],
+        )
+
+    specs = (P(axis),) * (3 + 2 * projections)
+    sharded = jax.shard_map(
+        local,
+        mesh=mesh,
+        in_specs=specs,
+        out_specs=(P(axis),) * (projections + 1),
+        check_vma=False,
+    )
+
+    def fn(*args: jax.Array) -> tuple[jax.Array, ...]:
+        return sharded(
+            *(jax.device_put(a, NamedSharding(mesh, s)) for a, s in zip(args, specs))
+        )
+
+    return fn, specs, lambda n: n * ranks
+
+
+def _quantized_gather_op(mesh, places, projections: int):
+    """The torch op of `quantized_gather_fn(mesh, places, projections)`."""
+    run, specs, rows = quantized_gather_fn(mesh, places, projections)
+    axis = mesh.axis_names[0]
+
+    # torch_tpu reads the operand types from these annotations; torch custom-op
+    # schemas take no varargs, so each projection count has its own signature.
+    if projections == 1:
+
+        def fn(
+            q: jax.Array,
+            rest: jax.Array,
+            w_q: jax.Array,
+            w_s: jax.Array,
+            rank: jax.Array,
+        ) -> tuple[jax.Array, jax.Array]:
+            return cast(tuple[jax.Array, jax.Array], run(q, rest, w_q, w_s, rank))
+
+        name = "pallas::prefill_token_split_quantized_gather"
+    else:
+        assert projections == 2
+
+        def fn(
+            q: jax.Array,
+            rest: jax.Array,
+            w_q: jax.Array,
+            w_s: jax.Array,
+            w_q_2: jax.Array,
+            w_s_2: jax.Array,
+            rank: jax.Array,
+        ) -> tuple[jax.Array, jax.Array, jax.Array]:
+            return cast(
+                tuple[jax.Array, jax.Array, jax.Array],
+                run(q, rest, w_q, w_s, w_q_2, w_s_2, rank),
+            )
+
+        name = "pallas::prefill_token_split_quantized_gather_2"
+
+    # pyrefly: ignore[no-matching-overload]
+    op = pallas.jax_op(
+        name,
+        fn,
+        mesh=mesh,
+        input_partition_specs=specs,
+        output_partition_specs=(P(axis),) * (projections + 1),
+    )
+    op.register_fake(
+        lambda q, rest, *operands: (
+            *(q.new_empty((rows(q.shape[0]), w_q.shape[1])) for w_q in operands[:-1:2]),
+            rest.new_empty((rows(rest.shape[0]), rest.shape[1])),
+        )
+    )
+    return op
+
+
+def fused_projection_fn(mesh, places):
+    """TPU_PREFILL_FUSED_OPROJ_RS: the JAX function (x, w_q, w_s, rank) over
+    the MoE op's mesh -> this core's rows of the sum over the cores of the
+    per-channel fp8 projection of x (``xla_quantized_matmul``), the projection
+    computed block by block inside the rotated reduce-scatter, one kernel per
+    combine chunk. A shape the kernel does not take runs today's projection
+    and the rotated (or XLA's) reduce-scatter."""
+    from vllm_torchtpu.kernels.quantized_matmul.util import (
+        quantize_tensor,
+        xla_quantized_matmul,
+    )
+
+    axis = mesh.axis_names[0]
+    ranks = int(mesh.size)
+    table = rotated_collectives.peer_table(places, "reduce_scatter")
+
+    def local(x, w_q, w_s, rank):
+        chunk = x.shape[0] // token_chunks(x.shape[0])
+        if chunk < envs.TPU_PREFILL_FUSED_OPROJ_RS_MIN_ROWS or not (
+            rotated_collectives.matmul_reduce_scatter_supports(
+                chunk, x.shape[1], w_q.shape[1], w_q.dtype
+            )
+        ):
+            partial = xla_quantized_matmul(x, w_q, w_s)
+            if rotated_collectives.reduce_scatter_supports(chunk, partial.shape[1]):
+                return rotated_collectives.reduce_scatter_chunks(
+                    partial, rank, jnp.asarray(table), axis=axis, chunk=chunk
+                )
+            return scatter_rows(partial, axis)
+        x_q, x_scale = quantize_tensor(x, w_q.dtype)
+        return rotated_collectives.matmul_reduce_scatter_chunks(
+            x_q, x_scale, w_q, w_s, rank, jnp.asarray(table), axis=axis, chunk=chunk
+        )
+
+    specs = (P(axis), P(axis), P(axis), P(axis))
+    sharded = jax.shard_map(
+        local, mesh=mesh, in_specs=specs, out_specs=P(axis), check_vma=False
+    )
+
+    def fn(x: jax.Array, w_q: jax.Array, w_s: jax.Array, rank: jax.Array) -> jax.Array:
+        return sharded(
+            *(
+                jax.device_put(a, NamedSharding(mesh, s))
+                for a, s in zip((x, w_q, w_s, rank), specs)
+            )
+        )
+
+    return fn, specs, lambda n: n // ranks
+
+
+def _fused_projection_op(mesh, places):
+    """The torch op of `fused_projection_fn(mesh, places)`."""
+    run, specs, rows = fused_projection_fn(mesh, places)
+    axis = mesh.axis_names[0]
+
+    # torch_tpu reads the operand types from these annotations.
+    def fn(x: jax.Array, w_q: jax.Array, w_s: jax.Array, rank: jax.Array) -> jax.Array:
+        return run(x, w_q, w_s, rank)
+
+    # pyrefly: ignore[no-matching-overload]
+    op = pallas.jax_op(
+        "pallas::prefill_token_split_fused_projection_scatter",
+        fn,
+        mesh=mesh,
+        input_partition_specs=specs,
+        output_partition_specs=P(axis),
+    )
+    op.register_fake(
+        lambda x, w_q, w_s, rank: x.new_empty((rows(x.shape[0]), w_q.shape[1]))
+    )
+    return op
+
+
+def _fused_projection_weights(projection, x: torch.Tensor):
+    """(w_q, w_s) of `projection` when its forward on x is
+    ``xla_quantized_matmul(x, weight, weight_scale)``: a per-channel fp8
+    weight in (k, n) layout, no bias, no activation prequantized upstream,
+    bf16 rows. None otherwise."""
+    from vllm_torchtpu.layers.adapter.linear_common import (
+        PREQUANT_ATTR,
+        is_xla_fp8_projection,
+    )
+
+    if not is_xla_fp8_projection(projection):
+        return None
+    weight, scale = projection.weight, projection.weight_scale
+    if (
+        scale.shape[0] != weight.shape[1]
+        or weight.shape[0] != x.shape[-1]
+        or x.dim() != 2
+        or x.dtype != torch.bfloat16
+        or getattr(projection, PREQUANT_ATTR, None) is not None
+    ):
+        return None
+    return weight, scale
+
+
+def _rotated_op(mesh, kind: str, places):
+    """The torch op of `rotated_fn(mesh, kind, places)`."""
+    run, specs, rows = rotated_fn(mesh, kind, places)
+    axis = mesh.axis_names[0]
+
+    # torch_tpu reads the operand types from these annotations.
+    def fn(x: jax.Array, rank: jax.Array) -> jax.Array:
+        return run(x, rank)
+
+    # pyrefly: ignore[no-matching-overload]
+    op = pallas.jax_op(
+        f"pallas::prefill_token_split_rotated_{kind}",
+        fn,
+        mesh=mesh,
+        input_partition_specs=specs,
+        output_partition_specs=P(axis),
+    )
+    op.register_fake(lambda x, rank: x.new_empty((rows(x.shape[0]), *x.shape[1:])))
+    return op
+
+
+def _token_op(mesh, kind: str):
+    """The torch op of `token_fn(mesh, kind)`."""
+    run, specs, rows = token_fn(mesh, kind)
+    axis = mesh.axis_names[0]
+
+    # torch_tpu reads the operand types from these annotations.
+    def fn_own(x: jax.Array, rank: jax.Array) -> jax.Array:
+        return run(x, rank)
+
+    def fn(x: jax.Array) -> jax.Array:
+        return run(x)
+
+    # pyrefly: ignore[no-matching-overload]
+    op = pallas.jax_op(
+        f"pallas::prefill_token_split_{kind}",
+        fn_own if kind == "own" else fn,
+        mesh=mesh,
+        input_partition_specs=specs,
+        output_partition_specs=P(axis),
+    )
+    op.register_fake(lambda x, *rest: x.new_empty((rows(x.shape[0]), *x.shape[1:])))
+    return op
+
+
+class TokenSplit:
+    """The split of a model's residual stream; holds no module."""
+
+    def __init__(
+        self,
+        mesh,
+        first_layer: int,
+        edge: int,
+        moe_slot: PrequantSlot,
+        rank_path: str,
+        places=None,
+    ):
+        """`rank_path`: the attribute path from the first split layer to the
+        MoE stage that holds this core's index in `mesh` as int32 [1, 1] data
+        (the MoE op's rank operand). The split reads the buffer through that
+        path, so the graph lifts it under the name the MoE layer gives it and
+        buckets with and without the split share their compiled pieces.
+        `places` ((chip coords, core on chip) per mesh index) turns on the
+        rotated reduce-scatter and all-gather; they read the core's index from
+        small_all_reduce_op's rank buffer, which o_proj's path already lifts."""
+        self.ranks = int(mesh.size)
+        self.rank_path = rank_path
+        self.first_layer = first_layer
+        self.edge = edge
+        self.moe_slot = moe_slot
+        self._own = _token_op(mesh, "own")
+        self._gather = _token_op(mesh, "gather")
+        self._scatter = _token_op(mesh, "scatter")
+        self.rotated = places is not None
+        if self.rotated:
+            self._rotated_scatter = _rotated_op(mesh, "scatter", places)
+            self._rotated_gather = _rotated_op(mesh, "gather", places)
+        self.fused_projection = self.rotated and envs.TPU_PREFILL_FUSED_OPROJ_RS
+        self.quantized_gather = self.rotated and envs.TPU_PREFILL_LATENT_GATHER_FP8
+        if self.quantized_gather:
+            self._quantized_gather = {
+                n: _quantized_gather_op(mesh, places, n) for n in (1, 2)
+            }
+        if self.fused_projection:
+            self._fused_projection = _fused_projection_op(mesh, places)
+
+    def applies(self, tokens: int) -> bool:
+        return tokens > self.edge and tokens % self.ranks == 0
+
+    def rank_of(self, layer) -> torch.Tensor:
+        stage = layer
+        for name in self.rank_path.split("."):
+            stage = getattr(stage, name)
+        return stage._moe_tp_decode_rank
+
+    def own_rows(self, x: torch.Tensor, rank: torch.Tensor) -> torch.Tensor:
+        return self._own(x, rank)
+
+    def gather(self, x: torch.Tensor, tokens: int) -> torch.Tensor:
+        return self._gather(x).narrow(0, 0, tokens)
+
+    def gather_columns(self, tokens: int, *parts: torch.Tensor):
+        """Every core's rows of `parts`, side by side in one all-gather. The
+        rotated all-gather moves whole 128-lane tiles: zero columns pad the
+        block to a tile and are dropped after it."""
+        widths = [part.shape[-1] for part in parts]
+        if not self.rotated:
+            gathered = self.gather(torch.cat(parts, dim=-1), tokens)
+            return gathered.split(widths, dim=-1)
+        pad = -sum(widths) % rotated_collectives.LANES
+        if pad:
+            parts = (*parts, parts[0].new_zeros((parts[0].shape[0], pad)))
+        block = torch.cat(parts, dim=-1)
+        gathered = self._rotated_gather(block, small_all_reduce_op._RANK)
+        gathered = gathered.narrow(0, 0, tokens)
+        return gathered.split([*widths, pad] if pad else widths, dim=-1)[: len(widths)]
+
+    def gather_quantized_columns(
+        self, tokens: int, projections, q: torch.Tensor, *parts
+    ) -> tuple[torch.Tensor, ...]:
+        """Every core's rows of (projection(q) for each per-channel fp8
+        projection, *parts), in one all-gather that moves q as fp8 rows with
+        an fp32 scale per row (``quantize_tensor``) beside the bf16 `parts`."""
+        widths = [part.shape[-1] for part in parts]
+        *projected, rest = self._quantized_gather[len(projections)](
+            q,
+            torch.cat(parts, dim=-1),
+            *(w for p in projections for w in (p.weight, p.weight_scale)),
+            small_all_reduce_op._RANK,
+        )
+        rest = rest.narrow(0, 0, tokens)
+        return (
+            *(p.narrow(0, 0, tokens) for p in projected),
+            *rest.split(widths, dim=-1),
+        )
+
+    def project_reduce_scatter(self, x: torch.Tensor, projection) -> torch.Tensor:
+        """This core's rows of the row-parallel `projection` of x, summed
+        over the cores. `retain` lifts the buffers today's all-reduce lifts."""
+        weights = None
+        if self.fused_projection:
+            weights = _fused_projection_weights(projection, x)
+        if weights is not None:
+            return self._fused_projection(
+                small_all_reduce_op.retain(x), *weights, small_all_reduce_op._RANK
+            )
+        partial = projection.quant_method.apply(projection, x, None)
+        if self.rotated:
+            return self._rotated_scatter(
+                small_all_reduce_op.retain(partial), small_all_reduce_op._RANK
+            )
+        return self._scatter(small_all_reduce_op.retain(partial))
+
+    def moe(self, mlp, x: torch.Tensor) -> torch.Tensor:
+        self.moe_slot.value = True
+        return mlp(x)
+
+
+def _layer_forward(layer, positions, hidden_states, residual, split: TokenSplit):
+    """DeepseekV2DecoderLayer.forward on this core's rows (bf16, no llama-4
+    scaling, a MoE layer)."""
+    if residual is None:
+        residual = hidden_states
+        hidden_states = layer.input_layernorm(hidden_states)
+    else:
+        hidden_states, residual = layer.input_layernorm(hidden_states, residual)
+    hidden_states = layer.self_attn.mla_attn(
+        positions, hidden_states, None, token_split=split
+    )
+    hidden_states, residual = layer.post_attention_layernorm(hidden_states, residual)
+    return split.moe(layer.mlp, hidden_states), residual
+
+
+def split_model_forward(model, positions, hidden_states, split: TokenSplit):
+    """DeepseekV2Model.forward's layers and final norm from the embedding,
+    with the residual stream split from `split.first_layer` on."""
+    tokens = positions.shape[0]
+    torch._check(tokens % split.ranks == 0)
+    residual = None
+    with rmsnorm.norm_qkva_off():
+        for index, layer in enumerate(model.layers):
+            if index < split.first_layer:
+                hidden_states, residual = layer(
+                    positions, hidden_states, residual, None
+                )
+                continue
+            if index == split.first_layer:
+                rank = split.rank_of(layer)
+                hidden_states = split.own_rows(hidden_states, rank)
+                if residual is not None:
+                    residual = split.own_rows(residual, rank)
+            hidden_states, residual = _layer_forward(
+                layer, positions, hidden_states, residual, split
+            )
+        hidden_states, _ = model.norm(hidden_states, residual)
+    return split.gather(hidden_states, tokens)
+
+
+_UPSTREAM_MODEL_FORWARD: Any = None
+
+
+def _model_forward(
+    self,
+    input_ids: torch.Tensor | None,
+    positions: torch.Tensor,
+    intermediate_tensors,
+    inputs_embeds: torch.Tensor | None = None,
+):
+    split = getattr(self, TOKEN_SPLIT_ATTR, None)
+    if (
+        split is None
+        or self.aux_hidden_state_layers
+        or not split.applies(positions.shape[0])
+    ):
+        return _UPSTREAM_MODEL_FORWARD(
+            self, input_ids, positions, intermediate_tensors, inputs_embeds
+        )
+    if inputs_embeds is None:
+        assert input_ids is not None
+        inputs_embeds = self.embed_input_ids(input_ids)
+    return split_model_forward(self, positions, inputs_embeds, split)
+
+
+def maybe_patch_deepseek_v2(*args: object, **kwargs: object) -> None:
+    """Install the split-aware DeepseekV2Model.forward under
+    TPU_PREFILL_SEQ_PARALLEL; it is today's forward until `arm` runs."""
+    global _UPSTREAM_MODEL_FORWARD
+    if not envs.TPU_PREFILL_SEQ_PARALLEL or _UPSTREAM_MODEL_FORWARD is not None:
+        return None
+    from vllm.model_executor.models import deepseek_v2
+
+    _UPSTREAM_MODEL_FORWARD = deepseek_v2.DeepseekV2Model.forward
+    deepseek_v2.DeepseekV2Model.forward = _model_forward
+    logger.info("Applied TPU patch: DeepseekV2Model prefill token split forward.")
+    return None
+
+
+def _first_moe_layer(model) -> int | None:
+    from vllm.model_executor.models.deepseek_v2 import DeepseekV2MoE
+
+    moe = [isinstance(layer.mlp, DeepseekV2MoE) for layer in model.layers]
+    return moe.index(True) if True in moe else None
+
+
+def _refusal(model, mesh_size: int | None = None) -> str | None:
+    """Why `model` (a DeepseekV2Model) cannot run split, or None."""
+    from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
+    from vllm.model_executor.models.deepseek_v2 import (
+        DeepseekV2MLAAttention,
+        DeepseekV2MoE,
+    )
+
+    from vllm_torchtpu.layers.adapter.custom_ops.mla_attention_op import (
+        VllmTPUMultiHeadLatentAttentionWrapper,
+    )
+
+    if _UPSTREAM_MODEL_FORWARD is None:
+        return "the model forward is not patched"
+    if get_pp_group().world_size != 1:
+        return "pipeline parallelism"
+    if get_tensor_model_parallel_world_size() < 2:
+        return "no tensor parallelism"
+    if getattr(model.config, "llama_4_scaling", None) is not None:
+        return "llama-4 attention scaling"
+    if (model.start_layer, model.end_layer) != (0, len(model.layers)):
+        return "the model holds a slice of the layers"
+    first = _first_moe_layer(model)
+    if first is None or not all(
+        isinstance(layer.mlp, DeepseekV2MoE) for layer in model.layers[first:]
+    ):
+        return "the MoE layers are not the last layers"
+    if mesh_size is not None and mesh_size != get_tensor_model_parallel_world_size():
+        return f"the MoE ops' mesh has {mesh_size} cores, not the TP group's"
+    for layer in model.layers[first:]:
+        attn = getattr(layer.self_attn, "mla_attn", None)
+        if not isinstance(layer.self_attn, DeepseekV2MLAAttention) or not isinstance(
+            attn, VllmTPUMultiHeadLatentAttentionWrapper
+        ):
+            return f"layer {layer.layer_idx} is not TPU MLA"
+        if (
+            attn.q_lora_rank is None
+            or attn.kimi_preprocess is not None
+            or attn.g_proj is not None
+            or attn.fused_qkv_a_proj is None
+        ):
+            return f"layer {layer.layer_idx}'s MLA projections are not q-LoRA only"
+        o_proj = attn.o_proj
+        if getattr(o_proj, "bias", None) is not None or not o_proj.input_is_parallel:
+            return f"layer {layer.layer_idx}'s o_proj has a bias or full input"
+    return None
+
+
+def _rotated_places(mesh):
+    """(chip coords, core on chip) per index of `mesh` when the rotated
+    collectives can run over it, else None with the reason logged. Collective
+    (every rank gathers every rank's device); the same answer on every rank."""
+    from vllm_torchtpu.distributed.ep_mesh import ep_mesh_index
+
+    if small_all_reduce_op._RANK is None:
+        logger.warning(
+            "TPU_PREFILL_ROTATED_COLLECTIVES: the small collectives hold no rank "
+            "buffer (TPU_SMALL_ALL_REDUCE off); XLA's collectives"
+        )
+        return None
+    return small_all_reduce_op.rotated_places(
+        mesh,
+        ep_mesh_index(),
+        "TPU_PREFILL_ROTATED_COLLECTIVES",
+        "o_proj's reduce-scatter and the latents' all-gather (halving-doubling)",
+    )
+
+
+def _arm_quantized_gather(backbone) -> None:
+    """TPU_PREFILL_LATENT_GATHER_FP8: give each MLA wrapper the number of
+    projections that read its normed q latent when its split buckets can
+    gather the latent in fp8; the decision is made here, at load, outside
+    Dynamo."""
+    from vllm_torchtpu.layers.adapter.custom_ops.mla_attention_op import (
+        VllmTPUMultiHeadLatentAttentionWrapper,
+    )
+
+    wrappers = [
+        m
+        for m in backbone.modules()
+        if isinstance(m, VllmTPUMultiHeadLatentAttentionWrapper)
+    ]
+    for wrapper in wrappers:
+        wrapper.fp8_q_latent_projections = wrapper.q_latent_projections()
+    logger.info(
+        "TPU_PREFILL_LATENT_GATHER_FP8: %d of %d MLA layers gather the q latent "
+        "in fp8, %d of them with their own indexer's projection",
+        sum(w.fp8_q_latent_projections > 0 for w in wrappers),
+        len(wrappers),
+        sum(w.fp8_q_latent_projections == 2 for w in wrappers),
+    )
+
+
+def arm(model: torch.nn.Module, token_buckets: list[int]) -> bool:
+    """Give the target model's DeepseekV2Model a TokenSplit when every MoE
+    layer runs moe_tp_decode's stage-A prefill kernel, the attention is the
+    TPU MLA wrapper and every bucket the split serves divides into the MoE's
+    chunk blocks; otherwise log why and keep today's path. Same decision on
+    every rank (it reads only the model and the config)."""
+    from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner
+    from vllm.model_executor.models.deepseek_v2 import DeepseekV2Model
+
+    from vllm_torchtpu.layers.adapter.moe_tp_decode import arm_token_split_op
+
+    backbones = [m for m in model.modules() if isinstance(m, DeepseekV2Model)]
+    if len(backbones) != 1:
+        logger.warning("TPU_PREFILL_SEQ_PARALLEL: no single DeepseekV2Model; off")
+        return False
+    backbone = backbones[0]
+    reason = _refusal(backbone)
+    runners = []
+    if reason is None:
+        for layer in backbone.layers[_first_moe_layer(backbone) :]:
+            mlp = cast(torch.nn.Module, layer.mlp)
+            found = [m for m in mlp.modules() if isinstance(m, MoERunner)]
+            if len(found) != 1:
+                reason = f"layer {layer.layer_idx} has no single MoE runner"
+                break
+            runners.append(found[0])
+    slot = PrequantSlot()
+    armed = []
+    if reason is None:
+        for runner in runners:
+            op = arm_token_split_op(runner.routed_experts, slot)
+            if op is None:
+                reason = "a MoE layer has no moe_tp_decode stage-A prefill kernel"
+                break
+            armed.append(op)
+    if reason is None and len({id(mesh) for mesh, _, _ in armed}) != 1:
+        reason = "the MoE layers' ops use different meshes"
+    if reason is None:
+        reason = _refusal(backbone, int(armed[0][0].size))
+    if reason is not None:
+        logger.warning("TPU_PREFILL_SEQ_PARALLEL: %s; off", reason)
+        return False
+    mesh = armed[0][0]
+    ranks = int(mesh.size)
+    prefill_above = max(above for _, above, _ in armed)
+    edge = max(
+        envs.bucket_gate_edge(envs.TPU_PREFILL_SEQ_PARALLEL_MIN_TOKENS), prefill_above
+    )
+    uneven = [
+        n
+        for n in token_buckets
+        if n > edge and n % ranks == 0 and n % (token_chunks(n) * ranks)
+    ]
+    if uneven:
+        logger.warning(
+            "TPU_PREFILL_SEQ_PARALLEL: buckets %s do not split into the MoE's "
+            "chunk blocks over %d cores; off",
+            uneven,
+            ranks,
+        )
+        return False
+    first = _first_moe_layer(backbone)
+    assert first is not None
+    stage = runners[0].routed_experts
+    rank_path = next(n for n, m in backbone.layers[first].named_modules() if m is stage)
+    places = _rotated_places(mesh) if envs.TPU_PREFILL_ROTATED_COLLECTIVES else None
+    split = TokenSplit(mesh, first, edge, slot, rank_path, places)
+    setattr(backbone, TOKEN_SPLIT_ATTR, split)
+    if split.quantized_gather:
+        _arm_quantized_gather(backbone)
+    logger.info(
+        "TPU_PREFILL_SEQ_PARALLEL: buckets above %d tokens split the residual "
+        "stream over %d cores from layer %d of %d",
+        edge,
+        ranks,
+        first,
+        len(backbone.layers),
+    )
+    return True

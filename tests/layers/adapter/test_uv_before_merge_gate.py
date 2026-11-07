@@ -16,8 +16,12 @@ the DCP merge.
 
 0 keeps every bucket (backbone and MTP drafter). m > 0 takes the backbone's
 buckets of at least m tokens on the power-of-2 ladder (`T > m // 2`) and never
-the drafter, whose one graph serves every bucket.
+the drafter, whose one graph serves every bucket. `uv_before_merge_runs` adds the
+layer and query-replication terms; TPU_FUSED_UV_OPROJ takes a bucket only where
+it is False.
 """
+
+from types import SimpleNamespace
 
 import pytest
 
@@ -82,3 +86,98 @@ def test_retain_buffers_reads_each_buffer_in_warmup_only(monkeypatch):
     assert torch.equal(got, out)
     assert w.reads == [(0, 0, 0)]
     assert scale.reads == [(0,)]
+
+
+# Every row count the fused W_UV + o_proj kernel takes (fp8_oproj_all_reduce.LIMIT_M).
+_FUSED_ROWS = [1, 4, 8, 16, 32, 64]
+_W_UV_LAYER = SimpleNamespace(W_UV_dcp_qrep=object())
+
+
+def _uv_runs(
+    monkeypatch,
+    tokens,
+    *,
+    min_tokens=0,
+    sized=False,
+    tag="backbone",
+    layer=_W_UV_LAYER,
+    use_qrep=True,
+):
+    monkeypatch.setattr(envs, "TPU_DCP_MLA_UV_BEFORE_MERGE_MIN_TOKENS", min_tokens)
+    monkeypatch.setattr(envs, "TPU_MTP_DCP_MERGE_SIZED", sized)
+    monkeypatch.setattr(attention.vllm_compilation_backends, "model_tag", tag)
+    return attention.uv_before_merge_runs(layer, tokens, use_qrep)
+
+
+@pytest.mark.parametrize("tokens", _FUSED_ROWS)
+def test_uv_before_merge_runs_on_fused_rows_with_min_tokens_zero(monkeypatch, tokens):
+    """The fused kernel must not ask for the latent here: the backend returns
+    the projected rows and the kernel raised on their width at warmup."""
+    assert _uv_runs(monkeypatch, tokens)
+
+
+@pytest.mark.parametrize("tokens", _FUSED_ROWS)
+def test_uv_before_merge_skips_fused_rows_below_min_tokens(monkeypatch, tokens):
+    """With MIN_TOKENS=1024 the decode buckets keep the latent merge, so the
+    fused kernel must keep taking them."""
+    assert not _uv_runs(monkeypatch, tokens, min_tokens=1024)
+
+
+@pytest.mark.parametrize(
+    "layer", [SimpleNamespace(), SimpleNamespace(W_UV_dcp_qrep=None)]
+)
+def test_uv_before_merge_needs_the_replicated_w_uv(monkeypatch, layer):
+    """A layer built without TPU_DCP_MLA_UV_BEFORE_MERGE projects after the
+    merge."""
+    assert not _uv_runs(monkeypatch, 16, layer=layer)
+
+
+def test_uv_before_merge_needs_query_replication(monkeypatch):
+    """Without qrep the backend attends this rank's heads and projects after the
+    merge, even when the layer holds the replicated W_UV."""
+    assert not _uv_runs(monkeypatch, 16, use_qrep=False)
+
+
+@pytest.mark.parametrize(
+    "tag,sized,runs",
+    [
+        ("eagle_head", True, False),
+        ("eagle_head", False, True),
+        ("backbone", True, True),
+    ],
+)
+def test_sized_mtp_merge_keeps_the_drafter_latent(monkeypatch, tag, sized, runs):
+    """TPU_MTP_DCP_MERGE_SIZED takes only a 2-byte partial, so the drafter must
+    not project its f32 partial first; the backbone is unaffected."""
+    assert _uv_runs(monkeypatch, 16, sized=sized, tag=tag) == runs
+
+
+@pytest.mark.parametrize(
+    "dcp_size,replicated,topk,runs",
+    [
+        (4, True, True, True),
+        (1, True, True, False),
+        (4, False, True, False),
+        (4, True, False, False),
+    ],
+)
+def test_the_wrapper_asks_with_the_backend_s_dcp_size(
+    monkeypatch, dcp_size, replicated, topk, runs
+):
+    """TPU_FUSED_UV_OPROJ's gate in the attention wrapper asks the backend's
+    question with the backend's `dcp_size`; the wrapper has none of its own."""
+    from vllm_torchtpu.layers.adapter.custom_ops.mla_attention_op import (
+        VllmTPUMultiHeadLatentAttentionWrapper as Wrapper,
+    )
+
+    monkeypatch.setattr(envs, "TPU_DCP_MLA_UV_BEFORE_MERGE_MIN_TOKENS", 0)
+    monkeypatch.setattr(envs, "TPU_MTP_DCP_MERGE_SIZED", False)
+    monkeypatch.setattr(attention.vllm_compilation_backends, "model_tag", "backbone")
+    mla_attn = SimpleNamespace(
+        W_UV_dcp_qrep=object(), impl=SimpleNamespace(dcp_size=dcp_size)
+    )
+    wrapper = SimpleNamespace(mla_attn=mla_attn)
+    got = Wrapper._uv_before_merge(
+        wrapper, 16, object() if replicated else None, object() if topk else None
+    )
+    assert got == runs
