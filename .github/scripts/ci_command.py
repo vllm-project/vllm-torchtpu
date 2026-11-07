@@ -196,7 +196,7 @@ def _trigger_build(
         "message": message,
         "ignore_pipeline_branch_filters": True,
         "pull_request_id": pr_number,
-        "pull_request_base_branch": (pr.get("base") or {}).get("ref", "main"),
+        "pull_request_base_branch": _base_ref(pr) or "main",
         "env": env,
     }
     commit_author_name, commit_author_email = "", ""
@@ -300,7 +300,7 @@ def _cancel_pr_builds(
     head_repo = head.get("repo") or {}
     is_fork = bool(head_repo.get("full_name") and head_repo["full_name"] != repo)
     target_branch = head.get("label") if is_fork else head.get("ref")
-    base_ref = (pr.get("base") or {}).get("ref", "main")
+    base_ref = _base_ref(pr) or "main"
     query = "state[]=scheduled&state[]=running&state[]=failing&per_page=100"
     builds_url = _builds_url(pr)
     builds = _api_json(f"{builds_url}?{query}", bk_token)
@@ -439,7 +439,10 @@ def handle_comment(
         return reply(err or "")
     pr = _api_json(f"https://api.github.com/repos/{repo}/pulls/{pr_number}", gh_token)
     if subcmd == "cancel":
-        cancelled = _cancel_pr_builds(pr, repo, pr_number, bk_token)
+        try:
+            cancelled = _cancel_pr_builds(pr, repo, pr_number, bk_token)
+        except Exception as exc:
+            return reply(f"@{author}, could not cancel builds ({_err_summary(exc)}).")
         if not cancelled:
             return reply(
                 "No running CI builds for this PR.\n\n<!-- ci-merge-extras: -->"
@@ -456,7 +459,7 @@ def handle_comment(
             f"PR #{pr_number} is closed; reopen it before running `/ci {subcmd}`."
         )
     if subcmd == "merge":
-        base_ref = (pr.get("base") or {}).get("ref") or ""
+        base_ref = _base_ref(pr)
         if "precheck-only" in extras and base_ref.startswith("releases/"):
             return reply("`releases/*` merges always run the full gate.")
         extras_csv = ",".join(extras)
@@ -527,15 +530,18 @@ def handle_comment(
             return reply(f"Started prechecks on `{sha7}`: " + ", ".join(notes))
         return reply(f"Prechecks on `{sha7}` (partial): " + "; ".join(notes))
     cmd_text = "/ci run" + (f" {' '.join(extras)}" if extras else "")
-    build = _trigger_build(
-        pr,
-        repo,
-        pr_number,
-        f"{cmd_text} (PR #{pr_number} by @{author})",
-        {"CI_RUN_TPU": "1", "CI_EXTRAS": ",".join(extras)},
-        bk_token,
-        gh_token,
-    )
+    try:
+        build = _trigger_build(
+            pr,
+            repo,
+            pr_number,
+            f"{cmd_text} (PR #{pr_number} by @{author})",
+            {"CI_RUN_TPU": "1", "CI_EXTRAS": ",".join(extras)},
+            bk_token,
+            gh_token,
+        )
+    except Exception as exc:
+        return reply(f"@{author}, could not start `{cmd_text}` ({_err_summary(exc)}).")
     extras_label = ", ".join(extras) if extras else "none"
     return reply(
         f"Started `{cmd_text}` on `{pr['head']['sha'][:7]}` "

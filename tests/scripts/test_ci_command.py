@@ -56,6 +56,7 @@ class TestCiCommand(unittest.TestCase):
         workflow_runs: list[dict[str, Any]] | None = None,
         fail_approve_ids: set[int] | None = None,
         gql_error: str | None = None,
+        bk_error: int | None = None,
     ) -> tuple[Any, list[tuple[str, str, dict[str, Any] | None]]]:
         calls: list[tuple[str, str, dict[str, Any] | None]] = []
         comments: list[dict[str, str]] = []
@@ -123,6 +124,10 @@ class TestCiCommand(unittest.TestCase):
                 state["auto_merge"] = {"merge_method": "squash"}
                 return {"data": {"enablePullRequestAutoMerge": {"pullRequest": {}}}}
             bk = next((b for b in (BK_URL, CANARY_URL) if url.startswith(b)), None)
+            if bk is not None and bk_error is not None:
+                raise urllib.error.HTTPError(
+                    url, bk_error, "Forbidden", http.client.HTTPMessage(), io.BytesIO()
+                )
             if bk is not None and url.startswith(f"{bk}?"):
                 return list(active_builds or [])
             if bk is not None and url.startswith(f"{bk}/") and url.endswith("/cancel"):
@@ -154,6 +159,7 @@ class TestCiCommand(unittest.TestCase):
         active_builds: list[dict[str, Any]] | None = None,
         workflow_runs: list[dict[str, Any]] | None = None,
         fail_approve_ids: set[int] | None = None,
+        bk_error: int | None = None,
     ) -> tuple[str | None, list[tuple[str, str, dict[str, Any] | None]]]:
         fake_api, calls = self._mock_api(
             role=role,
@@ -167,6 +173,7 @@ class TestCiCommand(unittest.TestCase):
             active_builds=active_builds,
             workflow_runs=workflow_runs,
             fail_approve_ids=fail_approve_ids,
+            bk_error=bk_error,
         )
         with mock.patch.object(ci_command, "_api_json", side_effect=fake_api):
             reply = ci_command.handle_comment(
@@ -667,6 +674,29 @@ class TestCiCommand(unittest.TestCase):
             bk_urls = [u for _, u, _ in calls if "api.buildkite.com" in u]
             self.assertTrue(bk_urls)
             self.assertTrue(all(u.startswith(CANARY_URL) for u in bk_urls))
+
+    def test_run_and_cancel_reply_when_buildkite_fails(self) -> None:
+        # A Buildkite error (say, the token's team can't build the pipeline) gets a
+        # reply instead of a crashed workflow and a silent PR.
+        for cmd, expected in (
+            ("/ci run", "@alice, could not start `/ci run` (HTTP 403)."),
+            ("/ci cancel", "@alice, could not cancel builds (HTTP 403)."),
+        ):
+            reply, calls = self._run(cmd, bk_error=403)
+            self.assertEqual(reply, expected)
+            self.assertEqual(
+                sum(1 for m, u, _ in calls if m == "POST" and "/issues/" in u), 1
+            )
+        fake_api, _ = self._mock_api()
+        with mock.patch.object(ci_command, "_api_json", side_effect=fake_api):
+            no_token = ci_command.handle_comment(
+                REPO, 42, "alice", "/ci run", "gh-tok", ""
+            )
+        self.assertEqual(
+            no_token,
+            "@alice, could not start `/ci run` "
+            "(BUILDKITE_API_TOKEN is required to trigger builds).",
+        )
 
     def test_closed_pr_does_not_trigger_build_or_merge(self) -> None:
         for cmd in ("/ci precheck", "/ci run", "/ci merge"):
