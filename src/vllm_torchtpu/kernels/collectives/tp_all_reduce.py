@@ -142,4 +142,7 @@ def all_reduce(x: jax.Array, rank: jax.Array, n: int) -> jax.Array:
     padded, m, w = view_shape(rows, hidden, n)
     xp = jnp.pad(x, ((0, padded - rows), (0, 0))) if padded != rows else x
     out = _call(n, m, w)(rank.reshape(1).astype(jnp.int32), xp.reshape(m, w))
-    return out.reshape(padded, hidden)[:rows]
+    # Relayout to [rows, hidden] here: left to XLA, the reshape sinks into the
+    # consumer (the residual add + RMSNorm), which then runs on the [16, w] view
+    # at 0.78 us instead of 0.15 us.
+    return lax.optimization_barrier(out.reshape(padded, hidden)[:rows])
