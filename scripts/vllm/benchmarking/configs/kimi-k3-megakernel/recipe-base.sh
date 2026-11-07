@@ -39,6 +39,10 @@
 #   RECIPE_STORE_SERVERS          1: the decode-host store servers (oct13, oct16)
 #   RECIPE_STORE_NODE_BYTES       each store server's DRAM; optional
 #
+# xPyD: K3_PD_REPLICA (default 0) is this engine's replica index within its
+# role. Replica 0 of each role is the 1P1D engine; the others get their own
+# Raiden ids and store names, and the global registry stays on prefill 0.
+#
 # Two readers:
 #   k3_agentx_client_pod.sh  sources it with K3_1P1D_ROLE=decode for the shape,
 #                            MAX_NUM_SEQS and the AGENTX_* cases and labels, and
@@ -198,10 +202,12 @@ done
 NODE_RANK="$INDEX"
 NODE_IP="$POD_IP"
 HEAD_IP="$DP_ADDRESS"
+_replica="${K3_PD_REPLICA:-0}"
+case "$_replica" in ''|*[!0-9]*) echo "ERROR: kimi-k3-megakernel: K3_PD_REPLICA='$_replica'" >&2; return 2 ;; esac
 # The prefill head, where the store servers' global registry runs: this
-# role's head on the prefill, PREFILL_HOST resolved on the decode.
+# role's head on prefill 0, PREFILL_HOST resolved elsewhere.
 if [ -n "${RECIPE_STORE_SERVERS:-}" ]; then
-  if [ "$_role" = prefill ]; then
+  if [ "$_role" = prefill ] && [ "$_replica" = 0 ]; then
     PREFILL_HEAD_IP="$HEAD_IP"
   else
     PREFILL_HEAD_IP=$(resolve "${PREFILL_HOST:?the manifest names the prefill head}" 1800) || return 2
@@ -310,8 +316,8 @@ fi
 # The doc's ${USER} cache names; a pod has no USER.
 _cache_user="${USER:-k3}"
 export HF_MODULES_CACHE="$HF_HOME_DIR/modules-$_role"
-export TPU_RAIDEN_JOB_NAME="k3-mk-0-$_role"
-export TPU_RAIDEN_ENGINE_ID="k3-mk-0-$_role-engine"
+export TPU_RAIDEN_JOB_NAME="k3-mk-$_replica-$_role"
+export TPU_RAIDEN_ENGINE_ID="k3-mk-$_replica-$_role-engine"
 export VLLM_XLA_CACHE_PATH="$CACHE_ROOT/$_role"
 export VLLM_CACHE_ROOT="$CACHE_ROOT/$_role/vllm-runtime"
 export VLLM_CONFIG_ROOT="$CACHE_ROOT/$_role/vllm-config"
@@ -384,7 +390,7 @@ if [ -n "${RECIPE_STORE_SERVERS:-}" ]; then
   _registry=$(printf ',"global_registry_address":"%s:%s","kv_pool_group":"%s"' "$PREFILL_HEAD_IP" "$_registry_port" "$_pool_group")
 fi
 _offload_connector() {  # _offload_connector <raiden_controller_port>
-  printf '{"kv_connector":"TPURaidenOffloadingConnector","kv_connector_module_path":"vllm_torchtpu.offload.raiden_connector","kv_role":"kv_both","kv_connector_extra_config":{"cpu_bytes_to_use":%s,"raiden_controller_port":%s,"raiden_job_name":"k3-mk-offload-0","store_server_ip":"%s"%s}}' "$_offload_bytes" "$1" "$HEAD_IP" "$_registry"
+  printf '{"kv_connector":"TPURaidenOffloadingConnector","kv_connector_module_path":"vllm_torchtpu.offload.raiden_connector","kv_role":"kv_both","kv_connector_extra_config":{"cpu_bytes_to_use":%s,"raiden_controller_port":%s,"raiden_job_name":"k3-mk-offload-%s","store_server_ip":"%s"%s}}' "$_offload_bytes" "$1" "$_replica" "$HEAD_IP" "$_registry"
 }
 _multi_connector() {  # _multi_connector <kv_role> <raiden connector json> <offload connector json>
   printf '{"kv_connector":"TPUMultiConnector","kv_connector_module_path":"vllm_torchtpu.distributed.kv_transfer.tpu_multi_connector","kv_role":"%s","kv_connector_extra_config":{"connectors":[%s,%s]}}' "$1" "$2" "$3"
@@ -519,14 +525,14 @@ SERVE_ARGS=("$MODEL_DIR" "${COMMON_ARGS[@]}" "${ROLE_ARGS[@]}")
 if [ -n "${RECIPE_STORE_SERVERS:-}" ]; then
   K3_1P1D_REGISTRY_ADDRESS="$PREFILL_HEAD_IP:$_registry_port"
   if [ "$_role" = prefill ]; then
-    K3_1P1D_REGISTRY_ARGS=(--port="$_registry_port")
+    [ "$_replica" != 0 ] || K3_1P1D_REGISTRY_ARGS=(--port="$_registry_port")
   else
     K3_1P1D_STORE_NODE_ARGS=(
       --dram_budget_bytes="${RECIPE_STORE_NODE_BYTES:-549755813888}"
       --global_registry_address="$K3_1P1D_REGISTRY_ADDRESS"
       --kv_pool_group="$_pool_group"
       --store_server_ip="$NODE_IP"
-      --job_name=k3-host-store-node --job_replica_id="$NODE_RANK"
+      --job_name=k3-host-store-node --job_replica_id="$((_replica * ${NUM_HOSTS:-4} + NODE_RANK))"
       --parallelism=16
     )
   fi
@@ -544,5 +550,5 @@ if [ "${RECIPE_SET:-}" = oct16 ] && [ "$_no_spec" = 0 ]; then
 fi
 unset _v _role _cache_user _offload_bytes _raiden _loader _kv _kv_cache_bytes _spec
 unset _registry _registry_port _pool_group _retention _no_spec _synthetic _acceptance _drafts _eval_job
-unset _dp2 _long _loader_dp _lengths _dcp
+unset _dp2 _long _loader_dp _lengths _dcp _replica
 unset -f _offload_connector _multi_connector
